@@ -1,29 +1,54 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { StrictMode } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import {
+  AVAILABLE_GENERATION_CAPABILITY,
+  pendingGenerationCapability,
+} from '../../src/core/interaction-capability'
 import type { Message } from '../../src/core/types'
-import { getStreamClientId } from '../../src/store/stream-leases'
-import { useStreamStore } from '../../src/store/zustand/streamStore'
+import { attemptController } from '../../src/store/attempt-controller'
+import type {
+  CompletedGeneration,
+  GenerationStartResult,
+  PreparedGeneration,
+} from '../../src/store/generation-engine'
+import type { WorkspaceFence } from '../../src/store/presentation-contracts'
+import { reconcileWorkspaceTabSessionStorage } from '../../src/store/workspace-tab-session'
 import {
   BranchTreeInspector as BranchTreeInspectorComponent,
   type BranchTreeInspectorProps,
+  observeBranchTreeInspectorComputations,
 } from '../../src/ui/chat/BranchTreeInspector'
+import {
+  clearTestLiveProjection,
+  observeTestAttempt,
+  publishTestLiveProjection,
+  removeTestAttempt,
+  resetAttemptControllerForTests,
+} from '../helpers/attempt-controller'
+import {
+  createInteractionSettlementHarness,
+  succeededInteractionSettlement,
+} from '../helpers/presentation-interactions'
+import {
+  liveReasoningFromDetailsForTest,
+  reasoningEnvelopeFromDetailsForTest,
+} from '../helpers/reasoning-events'
 
-const BranchTreeInspector = Object.assign(
-  function TestBranchTreeInspector(
-    props: Omit<BranchTreeInspectorProps, 'bodyVersion'> & { bodyVersion?: number },
-  ) {
-    return (
-      <BranchTreeInspectorComponent
-        {...props}
-        bodyVersion={props.bodyVersion ?? props.message.nodeVersion}
-      />
-    )
+function BranchTreeInspector(
+  props: Omit<BranchTreeInspectorProps, 'bodyVersion' | 'presentationFence'> & {
+    bodyVersion?: number
+    presentationFence?: WorkspaceFence
   },
-  {
-    __setComputationProbeForTests: BranchTreeInspectorComponent.__setComputationProbeForTests,
-  },
-)
+) {
+  return (
+    <BranchTreeInspectorComponent
+      {...props}
+      presentationFence={props.presentationFence ?? presentationFence}
+      bodyVersion={props.bodyVersion ?? props.message.nodeVersion}
+    />
+  )
+}
 
 const SEARCH_MATCH_HIGHLIGHT = 'branch-tree-inspector-search-match'
 const SEARCH_CURRENT_HIGHLIGHT = 'branch-tree-inspector-search-current'
@@ -44,6 +69,36 @@ let scrollIntoViewDescriptor: PropertyDescriptor | undefined
 let clipboardDescriptor: PropertyDescriptor | undefined
 let scrollIntoView: ReturnType<typeof vi.fn>
 let writeText: ReturnType<typeof vi.fn>
+let presentationFence: WorkspaceFence
+
+function registerTestTargetHandoff(streamId: string, bodyVersion: number): void {
+  const attempt = attemptController.get(streamId)
+  if (!attempt?.messageId) throw new Error(`Expected active attempt:${streamId}`)
+  attemptController.registerTargetCommitHandoff({
+    ...presentationFence,
+    streamId,
+    chatId: attempt.chatId,
+    messageId: attempt.messageId,
+    attemptKind: attempt.kind,
+    admissionSequence: attempt.admissionSequence,
+    leaseRevision: attempt.leaseRevision + 1,
+    bodyVersion,
+  })
+}
+
+function publishTestExactTarget(streamId: string, bodyVersion: number): void {
+  const attempt = attemptController.get(streamId)
+  if (!attempt?.messageId) throw new Error(`Expected active attempt:${streamId}`)
+  attemptController.publishExactTargetPresentations([
+    {
+      ...presentationFence,
+      streamId,
+      chatId: attempt.chatId,
+      messageId: attempt.messageId,
+      bodyVersion,
+    },
+  ])
+}
 
 function restoreProperty(
   target: object,
@@ -58,6 +113,8 @@ function restoreProperty(
 }
 
 beforeEach(() => {
+  presentationFence = resetAttemptControllerForTests()
+  reconcileWorkspaceTabSessionStorage(presentationFence)
   highlightRegistry.clear()
   cssDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'CSS')
   highlightDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'Highlight')
@@ -90,8 +147,8 @@ beforeEach(() => {
 })
 
 afterEach(() => {
-  useStreamStore.getState().reset()
-  BranchTreeInspector.__setComputationProbeForTests(undefined)
+  resetAttemptControllerForTests()
+  observeBranchTreeInspectorComputations(undefined)
   restoreProperty(globalThis, 'CSS', cssDescriptor)
   restoreProperty(globalThis, 'Highlight', highlightDescriptor)
   restoreProperty(HTMLElement.prototype, 'scrollIntoView', scrollIntoViewDescriptor)
@@ -125,6 +182,8 @@ function message(overrides: Partial<Message> = {}): Message {
       costSource: 'stream',
       startedAt: 1_700_000_000_000,
       finishedAt: 1_700_000_001_000,
+      reasoningCarryForward: 'none',
+      reasoningVisibility: { disclosure: 'unknown' },
     },
     nodeVersion: 1,
     deleted: false,
@@ -132,15 +191,39 @@ function message(overrides: Partial<Message> = {}): Message {
   }
 }
 
+function startedGeneration(preparationError?: Error): GenerationStartResult {
+  const prepared: PreparedGeneration = {
+    streamId: 'test-stream',
+    chatId: 'chat-1',
+    assistantMessageId: 'assistant-message',
+  }
+  const completed: CompletedGeneration = {
+    ...prepared,
+    outcome: preparationError ? 'error' : 'done',
+  }
+  return {
+    kind: 'started',
+    handle: {
+      streamId: prepared.streamId,
+      chatId: prepared.chatId,
+      prepared: preparationError ? Promise.reject(preparationError) : Promise.resolve(prepared),
+      completed: Promise.resolve(completed),
+    },
+  }
+}
+
 describe('BranchTreeInspector', () => {
-  it('renders Markdown and media, and toggles metadata like the transcript action row', () => {
+  it('renders Markdown and media carriers, and toggles metadata like the transcript action row', () => {
     const onActivate = vi.fn()
     const onClose = vi.fn()
-    const imageUrl = 'data:image/png;base64,aW5zcGVjdG9y'
     const row = message({
       content: [
         { type: 'output_text', text: '# Rendered heading\n\nInspector body.' },
-        { type: 'output_image', url: imageUrl, prompt: 'Inspector image' },
+        {
+          type: 'output_image',
+          attachmentId: 'attachment-inspector',
+          prompt: 'Inspector image',
+        },
       ],
     })
     const { container } = render(
@@ -149,7 +232,8 @@ describe('BranchTreeInspector', () => {
 
     expect(screen.getByRole('heading', { level: 1, name: 'Rendered heading' })).toBeInTheDocument()
     expect(screen.getByRole('heading', { level: 2, name: 'Assistant message' })).toBeInTheDocument()
-    expect(screen.getByRole('img', { name: 'Inspector image' })).toHaveAttribute('src', imageUrl)
+    expect(container.querySelector('[data-ui="message-output-image"]')).toBeInTheDocument()
+    expect(container.querySelector('[data-ui="message-output-image-missing"]')).toBeInTheDocument()
     expect(container.querySelector('[data-ui="message-info"]')).not.toBeInTheDocument()
     const info = screen.getByRole('button', { name: 'Show message info' })
     expect(info).toHaveAttribute('aria-expanded', 'false')
@@ -168,7 +252,7 @@ describe('BranchTreeInspector', () => {
   })
 
   it('copies plaintext and exposes the supplied delete action', async () => {
-    const onDelete = vi.fn().mockResolvedValue(undefined)
+    const onDelete = vi.fn(() => succeededInteractionSettlement())
     render(
       <BranchTreeInspector
         message={message({
@@ -194,13 +278,16 @@ describe('BranchTreeInspector', () => {
   })
 
   it('renders structured reasoning while keeping in-place edits strictly text-only', async () => {
-    const reasoningDetails = [
-      {
-        type: 'reasoning.summary' as const,
-        summary: 'A concise reasoning summary.',
-        format: 'openai-responses-v1' as const,
-      },
-    ]
+    const reasoningEnvelope = reasoningEnvelopeFromDetailsForTest(
+      [
+        {
+          type: 'reasoning.summary' as const,
+          summary: 'A concise reasoning summary.',
+          format: 'openai-responses-v1' as const,
+        },
+      ],
+      'openai-responses',
+    )
     const attachmentRefs = [
       {
         refId: 'ref-1',
@@ -219,8 +306,8 @@ describe('BranchTreeInspector', () => {
         item: { type: 'reasoning', id: 'reasoning-1', encrypted_content: 'sealed' },
       },
     ]
-    const row = message({ reasoningDetails, attachmentRefs, providerOutputItems })
-    const onEdit = vi.fn().mockResolvedValue(undefined)
+    const row = message({ reasoningEnvelope, attachmentRefs, providerOutputItems })
+    const onEdit = vi.fn(() => succeededInteractionSettlement())
     const { container } = render(
       <BranchTreeInspector message={row} onClose={() => undefined} onEdit={onEdit} />,
     )
@@ -233,12 +320,6 @@ describe('BranchTreeInspector', () => {
     expect(container.querySelector('[data-ui="reasoning"]')).toHaveTextContent(
       'A concise reasoning summary.',
     )
-    await waitFor(() => {
-      const chip = container.querySelector('[data-ui="attachment-chip"]')
-      expect(chip).toHaveAttribute('data-storage', 'missing')
-      expect(chip).toHaveTextContent('missing')
-    })
-
     fireEvent.click(screen.getByRole('button', { name: 'Edit message' }))
     const editor = screen.getByRole('textbox', { name: 'Edit assistant message' })
     expect(screen.queryByRole('button', { name: 'Upload attachment' })).not.toBeInTheDocument()
@@ -256,20 +337,26 @@ describe('BranchTreeInspector', () => {
   })
 
   it('exposes generation, fork, context, reasoning, and provider-tool actions', async () => {
-    const onRegenerate = vi.fn().mockResolvedValue(undefined)
-    const onContinue = vi.fn().mockResolvedValue(undefined)
-    const onForkChat = vi.fn().mockResolvedValue(undefined)
-    const onToggleContextVisibility = vi.fn().mockResolvedValue(undefined)
-    const onToggleReasoningDetailHidden = vi.fn().mockResolvedValue(undefined)
-    const onToggleProviderOutputItemHidden = vi.fn().mockResolvedValue(undefined)
-    const row = message({
-      reasoningDetails: [
+    const onRegenerate = vi.fn(() => startedGeneration())
+    const onContinue = vi.fn(() => startedGeneration())
+    const onForkChat = vi.fn(() => succeededInteractionSettlement())
+    const onToggleContextVisibility = vi.fn(() => succeededInteractionSettlement())
+    const onToggleReasoningDetailHidden = vi.fn(() => succeededInteractionSettlement())
+    const onToggleProviderOutputItemHidden = vi.fn(() => succeededInteractionSettlement())
+    const reasoningEnvelope = reasoningEnvelopeFromDetailsForTest(
+      [
         {
           type: 'reasoning.text',
           text: 'Inspect this reasoning.',
           format: 'anthropic-claude-v1',
         },
       ],
+      'anthropic-messages',
+    )
+    const reasoningMember = reasoningEnvelope.visible[0]
+    if (!reasoningMember) throw new Error('Expected reasoning member')
+    const row = message({
+      reasoningEnvelope,
       providerOutputItems: [
         {
           dialect: 'openai-responses',
@@ -294,7 +381,8 @@ describe('BranchTreeInspector', () => {
         onToggleContextVisibility={onToggleContextVisibility}
         onToggleReasoningDetailHidden={onToggleReasoningDetailHidden}
         onToggleProviderOutputItemHidden={onToggleProviderOutputItemHidden}
-        hasConnection
+        regenerateCapability={AVAILABLE_GENERATION_CAPABILITY}
+        continueCapability={AVAILABLE_GENERATION_CAPABILITY}
       />,
     )
 
@@ -311,14 +399,24 @@ describe('BranchTreeInspector', () => {
 
     const toolEvidence = container.querySelector<HTMLDetailsElement>('[data-ui="tool-evidence"]')
     expect(toolEvidence).toBeInTheDocument()
+    if (!toolEvidence) throw new Error('Tool evidence disclosure missing')
+    toolEvidence.open = true
+    fireEvent(toolEvidence, new Event('toggle'))
     fireEvent.click(screen.getByRole('button', { name: 'Hide tool call' }))
 
     await waitFor(() => expect(onRegenerate).toHaveBeenCalledOnce())
     expect(onContinue).toHaveBeenCalledOnce()
     expect(onForkChat).toHaveBeenCalledOnce()
     expect(onToggleContextVisibility).toHaveBeenCalledOnce()
-    expect(onToggleReasoningDetailHidden).toHaveBeenCalledWith(0)
-    expect(onToggleProviderOutputItemHidden).toHaveBeenCalledWith(0)
+    expect(onToggleReasoningDetailHidden).toHaveBeenCalledWith({
+      owner: { kind: 'generation' },
+      kind: 'visible',
+      id: reasoningMember.id,
+    })
+    expect(onToggleProviderOutputItemHidden).toHaveBeenCalledWith({
+      owner: { kind: 'generation' },
+      itemIndex: 0,
+    })
   })
 
   it('shows persisted message, reasoning, and tool visibility states', () => {
@@ -326,13 +424,17 @@ describe('BranchTreeInspector', () => {
       <BranchTreeInspector
         message={message({
           hiddenFromContext: true,
-          reasoningDetails: [
-            {
-              type: 'reasoning.text',
-              text: 'Hidden reasoning.',
-              hidden: true,
-            },
-          ],
+          reasoningEnvelope: reasoningEnvelopeFromDetailsForTest(
+            [
+              {
+                type: 'reasoning.text',
+                text: 'Hidden reasoning.',
+                hidden: true,
+                format: 'unknown',
+              },
+            ],
+            'unknown',
+          ),
           providerOutputItems: [
             {
               dialect: 'openai-responses',
@@ -344,9 +446,9 @@ describe('BranchTreeInspector', () => {
           ],
         })}
         onClose={() => undefined}
-        onToggleContextVisibility={() => undefined}
-        onToggleReasoningDetailHidden={() => undefined}
-        onToggleProviderOutputItemHidden={() => undefined}
+        onToggleContextVisibility={succeededInteractionSettlement}
+        onToggleReasoningDetailHidden={succeededInteractionSettlement}
+        onToggleProviderOutputItemHidden={succeededInteractionSettlement}
       />,
     )
 
@@ -363,6 +465,10 @@ describe('BranchTreeInspector', () => {
       'data-hidden',
       'true',
     )
+    const toolEvidence = container.querySelector<HTMLDetailsElement>('[data-ui="tool-evidence"]')
+    if (!toolEvidence) throw new Error('Tool evidence disclosure missing')
+    toolEvidence.open = true
+    fireEvent(toolEvidence, new Event('toggle'))
     expect(screen.getByRole('button', { name: 'Unhide tool call' })).toBeInTheDocument()
     expect(container.querySelector('[data-ui="tool-evidence-section"]')).toHaveAttribute(
       'data-hidden',
@@ -377,16 +483,16 @@ describe('BranchTreeInspector', () => {
       content: [{ type: 'text', text: 'Original prompt' }],
     })
     const onEditAndSend = vi
-      .fn()
-      .mockRejectedValueOnce(new Error('Temporary send failure'))
-      .mockResolvedValueOnce(undefined)
+      .fn<() => GenerationStartResult>()
+      .mockImplementationOnce(() => startedGeneration(new Error('Temporary send failure')))
+      .mockImplementationOnce(() => startedGeneration())
     render(
       <BranchTreeInspector
         message={userMessage}
         onClose={() => undefined}
-        onEdit={() => undefined}
+        onEdit={succeededInteractionSettlement}
         onEditAndSend={onEditAndSend}
-        hasConnection
+        editResendCapability={AVAILABLE_GENERATION_CAPABILITY}
       />,
     )
 
@@ -405,8 +511,39 @@ describe('BranchTreeInspector', () => {
     )
   })
 
+  it('preserves an edit draft when a ready action synchronously does not start', () => {
+    const userMessage = message({
+      role: 'user',
+      origin: 'user',
+      content: [{ type: 'text', text: 'Original prompt' }],
+    })
+    const onEditAndSend = vi.fn(
+      (): GenerationStartResult => ({
+        kind: 'not-started',
+        capability: pendingGenerationCapability('prompt-path'),
+      }),
+    )
+    render(
+      <BranchTreeInspector
+        message={userMessage}
+        onClose={() => undefined}
+        onEdit={succeededInteractionSettlement}
+        onEditAndSend={onEditAndSend}
+        editResendCapability={AVAILABLE_GENERATION_CAPABILITY}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Edit message' }))
+    const editor = screen.getByRole('textbox', { name: 'Edit user message' })
+    fireEvent.change(editor, { target: { value: 'Still local' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save & Send' }))
+
+    expect(onEditAndSend).toHaveBeenCalledWith(userMessage, 'Still local')
+    expect(screen.getByRole('textbox', { name: 'Edit user message' })).toHaveValue('Still local')
+  })
+
   it('preserves an active edit draft when a newer body snapshot arrives', () => {
-    const onEdit = vi.fn().mockResolvedValue(undefined)
+    const onEdit = vi.fn(() => succeededInteractionSettlement())
     const view = render(
       <BranchTreeInspector message={message()} onClose={() => undefined} onEdit={onEdit} />,
     )
@@ -432,9 +569,83 @@ describe('BranchTreeInspector', () => {
     expect(screen.getByText('New persisted body')).toBeInTheDocument()
   })
 
+  it('does not let an older Save settlement dismiss a reopened editor for the same message', async () => {
+    const settlements = createInteractionSettlementHarness()
+    let resolveFirst!: () => void
+    const firstSave = new Promise<void>((resolve) => {
+      resolveFirst = resolve
+    })
+    const editedMessage = message({ id: 'message-reopened' })
+    const interveningMessage = message({
+      id: 'message-second',
+      content: [{ type: 'output_text', text: 'Second message body.' }],
+    })
+    const onEdit = vi.fn((_row: Message) => settlements.run(() => firstSave))
+    const view = render(
+      <BranchTreeInspector message={editedMessage} onClose={() => undefined} onEdit={onEdit} />,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Edit message' }))
+    fireEvent.change(screen.getByRole('textbox', { name: 'Edit assistant message' }), {
+      target: { value: 'First pending edit.' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    view.rerender(
+      <BranchTreeInspector
+        message={interveningMessage}
+        onClose={() => undefined}
+        onEdit={onEdit}
+      />,
+    )
+    expect(
+      screen.queryByRole('textbox', { name: 'Edit assistant message' }),
+    ).not.toBeInTheDocument()
+    view.rerender(
+      <BranchTreeInspector message={editedMessage} onClose={() => undefined} onEdit={onEdit} />,
+    )
+    const reopenedEditor = screen.getByRole('textbox', { name: 'Edit assistant message' })
+    fireEvent.change(reopenedEditor, { target: { value: 'Reopened active edit.' } })
+
+    resolveFirst()
+    await waitFor(() => expect(onEdit).toHaveBeenCalledWith(editedMessage, 'First pending edit.'))
+    expect(screen.getByRole('textbox', { name: 'Edit assistant message' })).toHaveValue(
+      'Reopened active edit.',
+    )
+  })
+
+  it('updates an exact body version without remounting the inspector body', () => {
+    const view = render(<BranchTreeInspector message={message()} onClose={() => undefined} />)
+    const body = view.container.querySelector<HTMLElement>('[data-ui="message-body"]')
+    const markdown = body?.querySelector<HTMLElement>('[data-ui="markdown"]')
+    if (!body || !markdown) throw new Error('Inspector body did not mount')
+    body.dataset.retainedAcrossBodyVersion = 'true'
+    markdown.dataset.retainedAcrossBodyVersion = 'true'
+
+    view.rerender(
+      <BranchTreeInspector
+        message={message({
+          nodeVersion: 2,
+          content: [{ type: 'output_text', text: 'Updated exact inspector body.' }],
+        })}
+        onClose={() => undefined}
+      />,
+    )
+
+    const updatedBody = view.container.querySelector<HTMLElement>('[data-ui="message-body"]')
+    expect(updatedBody).toBe(body)
+    expect(updatedBody).toHaveAttribute('data-retained-across-body-version', 'true')
+    expect(updatedBody?.querySelector('[data-ui="markdown"]')).toBe(markdown)
+    expect(markdown).toHaveAttribute('data-retained-across-body-version', 'true')
+    expect(updatedBody).toHaveTextContent('Updated exact inspector body.')
+  })
+
   it('keeps header-only controls available but disables body-row actions while streaming', async () => {
     const row = message({
-      reasoningDetails: [{ type: 'reasoning.text', text: 'Persisted reasoning.' }],
+      reasoningEnvelope: reasoningEnvelopeFromDetailsForTest(
+        [{ type: 'reasoning.text', text: 'Persisted reasoning.', format: 'unknown' }],
+        'unknown',
+      ),
       providerOutputItems: [
         {
           dialect: 'openai-responses',
@@ -448,43 +659,45 @@ describe('BranchTreeInspector', () => {
         },
       ],
     })
-    useStreamStore.getState().setActive({
+    observeTestAttempt({
       streamId: 'stream-1',
-      replacementEpoch: 0,
       chatId: row.chatId,
       messageId: row.id,
-      attemptKind: 'continuation',
-      startedAt: 1,
-      ownerClientId: 'client-1',
-    })
-    useStreamStore.getState().setLiveSnapshot({
-      streamId: 'stream-1',
-      replacementEpoch: 0,
-      chatId: row.chatId,
-      messageId: row.id,
-      content: [{ type: 'output_text', text: 'Live inspector output.' }],
-      reasoningRows: [{ detail: { type: 'reasoning.text', text: 'Live reasoning.' } }],
-      textLength: 22,
-      reasoningLength: 15,
-      updatedAt: 2,
+      kind: 'continuation',
     })
 
     const view = render(
       <BranchTreeInspector
         message={row}
         onClose={() => undefined}
-        onEdit={() => undefined}
-        onDelete={() => undefined}
-        onRegenerate={() => undefined}
-        onContinue={() => undefined}
-        onForkChat={() => undefined}
-        onToggleContextVisibility={() => undefined}
-        onToggleReasoningDetailHidden={() => undefined}
-        onToggleProviderOutputItemHidden={() => undefined}
-        hasConnection
+        onEdit={succeededInteractionSettlement}
+        onDelete={succeededInteractionSettlement}
+        onRegenerate={() => startedGeneration()}
+        onContinue={() => startedGeneration()}
+        onForkChat={succeededInteractionSettlement}
+        onToggleContextVisibility={succeededInteractionSettlement}
+        onToggleReasoningDetailHidden={succeededInteractionSettlement}
+        onToggleProviderOutputItemHidden={succeededInteractionSettlement}
+        regenerateCapability={AVAILABLE_GENERATION_CAPABILITY}
+        continueCapability={AVAILABLE_GENERATION_CAPABILITY}
       />,
     )
     const { container } = view
+    act(() => {
+      publishTestLiveProjection({
+        streamId: 'stream-1',
+        chatId: row.chatId,
+        messageId: row.id,
+        content: [{ type: 'output_text', text: 'Live inspector output.' }],
+        reasoning: liveReasoningFromDetailsForTest(
+          [{ type: 'reasoning.text', format: 'unknown', text: 'Live reasoning.' }],
+          'unknown',
+        ),
+        textLength: 22,
+        reasoningLength: 15,
+        updatedAt: 2,
+      })
+    })
 
     expect(container.querySelector('[data-ui="markdown"]')).toHaveTextContent(
       'Live inspector output.',
@@ -503,13 +716,17 @@ describe('BranchTreeInspector', () => {
     expect(reasoning).toHaveTextContent('Live reasoning.')
     expect(reasoning).not.toHaveTextContent('Persisted reasoning.')
     expect(screen.getByRole('button', { name: 'Hide this reasoning block' })).toBeDisabled()
+    const toolEvidence = container.querySelector<HTMLDetailsElement>('[data-ui="tool-evidence"]')
+    if (!toolEvidence) throw new Error('Tool evidence disclosure missing')
+    toolEvidence.open = true
+    fireEvent(toolEvidence, new Event('toggle'))
     expect(screen.getByRole('button', { name: 'Hide tool call' })).toBeDisabled()
     expect(screen.getByRole('button', { name: 'Regenerate response' })).toBeDisabled()
     expect(screen.getByRole('button', { name: 'Branch this chat from here' })).toBeEnabled()
 
-    useStreamStore.getState().clearLiveSnapshot(row.id, 'stream-1', 0)
+    clearTestLiveProjection('stream-1')
     expect(screen.getByRole('button', { name: 'Hide this reasoning block' })).toBeDisabled()
-    useStreamStore.getState().clearActive('stream-1', 0)
+    removeTestAttempt('stream-1')
     await waitFor(() => expect(screen.queryByRole('status')).not.toBeInTheDocument())
     expect(screen.getByRole('button', { name: 'Hide this reasoning block' })).toBeEnabled()
     expect(screen.getByRole('button', { name: 'Hide tool call' })).toBeEnabled()
@@ -520,18 +737,22 @@ describe('BranchTreeInspector', () => {
           ...row,
           nodeVersion: row.nodeVersion + 1,
           content: [{ type: 'output_text', text: 'Live inspector output.' }],
-          reasoningDetails: [{ type: 'reasoning.text', text: 'Live reasoning.' }],
+          reasoningEnvelope: reasoningEnvelopeFromDetailsForTest(
+            [{ type: 'reasoning.text', text: 'Live reasoning.', format: 'unknown' }],
+            'unknown',
+          ),
         }}
         onClose={() => undefined}
-        onEdit={() => undefined}
-        onDelete={() => undefined}
-        onRegenerate={() => undefined}
-        onContinue={() => undefined}
-        onForkChat={() => undefined}
-        onToggleContextVisibility={() => undefined}
-        onToggleReasoningDetailHidden={() => undefined}
-        onToggleProviderOutputItemHidden={() => undefined}
-        hasConnection
+        onEdit={succeededInteractionSettlement}
+        onDelete={succeededInteractionSettlement}
+        onRegenerate={() => startedGeneration()}
+        onContinue={() => startedGeneration()}
+        onForkChat={succeededInteractionSettlement}
+        onToggleContextVisibility={succeededInteractionSettlement}
+        onToggleReasoningDetailHidden={succeededInteractionSettlement}
+        onToggleProviderOutputItemHidden={succeededInteractionSettlement}
+        regenerateCapability={AVAILABLE_GENERATION_CAPABILITY}
+        continueCapability={AVAILABLE_GENERATION_CAPABILITY}
       />,
     )
     await waitFor(() =>
@@ -543,14 +764,11 @@ describe('BranchTreeInspector', () => {
   it('distinguishes local waiting, local streaming, off-path, and remote stream states', async () => {
     const row = message()
     act(() => {
-      useStreamStore.getState().setActive({
+      observeTestAttempt({
         streamId: 'status-stream',
-        replacementEpoch: 0,
         chatId: row.chatId,
         messageId: row.id,
-        attemptKind: 'continuation',
-        startedAt: 1,
-        ownerClientId: getStreamClientId(),
+        kind: 'continuation',
       })
     })
     const view = render(
@@ -560,14 +778,11 @@ describe('BranchTreeInspector', () => {
     expect(screen.getByRole('status')).toHaveTextContent('Waiting for response…')
 
     act(() => {
-      useStreamStore.getState().setLiveSnapshot({
+      publishTestLiveProjection({
         streamId: 'status-stream',
-        replacementEpoch: 0,
         chatId: row.chatId,
         messageId: row.id,
         content: [{ type: 'output_text', text: 'Live status content.' }],
-        textLength: 20,
-        reasoningLength: 0,
         updatedAt: 2,
       })
     })
@@ -581,14 +796,12 @@ describe('BranchTreeInspector', () => {
     )
 
     act(() => {
-      useStreamStore.getState().setActive({
+      observeTestAttempt({
         streamId: 'status-stream',
-        replacementEpoch: 0,
         chatId: row.chatId,
         messageId: row.id,
-        attemptKind: 'continuation',
-        startedAt: 1,
-        ownerClientId: 'different-tab-client',
+        kind: 'continuation',
+        local: false,
       })
     })
     await waitFor(() =>
@@ -602,37 +815,34 @@ describe('BranchTreeInspector', () => {
     )
   })
 
-  it('uses the canonical terminal body before the current generation snapshot clears', async () => {
+  it('keeps the last live body until the exact canonical terminal body publishes', async () => {
     const completedGeneration = message().generation
     if (!completedGeneration) throw new Error('Expected generated message metadata')
     const { finishedAt: _finishedAt, ...pendingGeneration } = completedGeneration
     const row = message({ generation: { ...pendingGeneration, status: 'streaming' } })
     act(() => {
-      useStreamStore.getState().setActive({
+      observeTestAttempt({
         streamId: 'commit-gap-stream',
-        replacementEpoch: 0,
         chatId: row.chatId,
         messageId: row.id,
-        attemptKind: 'generation',
-        startedAt: 1,
-        ownerClientId: getStreamClientId(),
-      })
-      useStreamStore.getState().setLiveSnapshot({
-        streamId: 'commit-gap-stream',
-        replacementEpoch: 0,
-        chatId: row.chatId,
-        messageId: row.id,
-        content: [{ type: 'output_text', text: 'Last complete live snapshot.' }],
-        textLength: 28,
-        reasoningLength: 0,
-        updatedAt: 2,
+        kind: 'generation',
       })
     })
     const view = render(
       <BranchTreeInspector message={row} onClose={() => undefined} streamOnActivePath />,
     )
+    act(() => {
+      publishTestLiveProjection({
+        streamId: 'commit-gap-stream',
+        chatId: row.chatId,
+        messageId: row.id,
+        content: [{ type: 'output_text', text: 'Last complete live snapshot.' }],
+        updatedAt: 2,
+      })
+    })
     expect(screen.getByText('Last complete live snapshot.')).toBeInTheDocument()
 
+    act(() => registerTestTargetHandoff('commit-gap-stream', 2))
     view.rerender(
       <BranchTreeInspector
         message={message({
@@ -649,13 +859,11 @@ describe('BranchTreeInspector', () => {
       />,
     )
 
+    expect(screen.getByText('Last complete live snapshot.')).toBeInTheDocument()
+
+    act(() => publishTestExactTarget('commit-gap-stream', 2))
     await waitFor(() => expect(screen.getByText('Committed snapshot content.')).toBeInTheDocument())
     expect(screen.queryByText('Last complete live snapshot.')).not.toBeInTheDocument()
-
-    act(() => {
-      useStreamStore.getState().clearLiveSnapshot(row.id, 'commit-gap-stream', 0)
-      useStreamStore.getState().clearActive('commit-gap-stream', 0)
-    })
     expect(screen.getByText('Committed snapshot content.')).toBeInTheDocument()
   })
 
@@ -665,33 +873,34 @@ describe('BranchTreeInspector', () => {
     const { finishedAt: _finishedAt, ...pendingGeneration } = completedGeneration
     const pending = message({ generation: { ...pendingGeneration, status: 'streaming' } })
     act(() => {
-      useStreamStore.getState().setActive({
+      observeTestAttempt({
         streamId: 'commit-first-stream',
-        replacementEpoch: 0,
         chatId: pending.chatId,
         messageId: pending.id,
-        attemptKind: 'generation',
-        startedAt: 1,
-        ownerClientId: getStreamClientId(),
-      })
-      useStreamStore.getState().setLiveSnapshot({
-        streamId: 'commit-first-stream',
-        replacementEpoch: 0,
-        chatId: pending.chatId,
-        messageId: pending.id,
-        content: [{ type: 'output_text', text: 'Commit-first live snapshot.' }],
-        textLength: 27,
-        reasoningLength: 0,
-        updatedAt: 2,
+        kind: 'generation',
       })
     })
     const view = render(
       <StrictMode>
-        <BranchTreeInspector message={pending} onClose={() => undefined} onEdit={() => undefined} />
+        <BranchTreeInspector
+          message={pending}
+          onClose={() => undefined}
+          onEdit={succeededInteractionSettlement}
+        />
       </StrictMode>,
     )
+    act(() => {
+      publishTestLiveProjection({
+        streamId: 'commit-first-stream',
+        chatId: pending.chatId,
+        messageId: pending.id,
+        content: [{ type: 'output_text', text: 'Commit-first live snapshot.' }],
+        updatedAt: 2,
+      })
+    })
     expect(screen.getByText('Commit-first live snapshot.')).toBeInTheDocument()
 
+    act(() => registerTestTargetHandoff('commit-first-stream', 2))
     view.rerender(
       <StrictMode>
         <BranchTreeInspector
@@ -705,16 +914,14 @@ describe('BranchTreeInspector', () => {
             },
           })}
           onClose={() => undefined}
-          onEdit={() => undefined}
+          onEdit={succeededInteractionSettlement}
         />
       </StrictMode>,
     )
-    expect(screen.getByText('Commit-first persisted snapshot.')).toBeInTheDocument()
+    expect(screen.getByText('Commit-first live snapshot.')).toBeInTheDocument()
 
-    act(() => {
-      useStreamStore.getState().clearActive('commit-first-stream', 0)
-      useStreamStore.getState().clearLiveSnapshot(pending.id, 'commit-first-stream', 0)
-    })
+    act(() => publishTestExactTarget('commit-first-stream', 2))
+    expect(screen.getByText('Commit-first persisted snapshot.')).toBeInTheDocument()
     await waitFor(() => expect(screen.queryByText('Finishing response…')).not.toBeInTheDocument())
     expect(screen.getByRole('button', { name: 'Edit message' })).toBeEnabled()
   })
@@ -724,36 +931,39 @@ describe('BranchTreeInspector', () => {
     if (!completedGeneration) throw new Error('Expected generated message metadata')
     const { finishedAt: _finishedAt, ...pendingGeneration } = completedGeneration
     const pending = message({ generation: { ...pendingGeneration, status: 'streaming' } })
-    act(() => {
-      useStreamStore.getState().setActive({
+    const requestLiveProjection = vi.fn(async () => {
+      publishTestLiveProjection({
         streamId: 'cross-view-stream',
-        replacementEpoch: 0,
-        chatId: pending.chatId,
-        messageId: pending.id,
-        attemptKind: 'generation',
-        startedAt: 1,
-        ownerClientId: getStreamClientId(),
-      })
-      useStreamStore.getState().setLiveSnapshot({
-        streamId: 'cross-view-stream',
-        replacementEpoch: 0,
         chatId: pending.chatId,
         messageId: pending.id,
         content: [{ type: 'output_text', text: 'Visible before changing views.' }],
-        textLength: 30,
-        reasoningLength: 0,
         updatedAt: 2,
       })
     })
+    act(() => {
+      observeTestAttempt({
+        streamId: 'cross-view-stream',
+        chatId: pending.chatId,
+        messageId: pending.id,
+        kind: 'generation',
+        requestLiveProjection,
+      })
+    })
     const firstView = render(<BranchTreeInspector message={pending} onClose={() => undefined} />)
-    expect(screen.getByText('Visible before changing views.')).toBeInTheDocument()
+    await waitFor(() =>
+      expect(screen.getByText('Visible before changing views.')).toBeInTheDocument(),
+    )
     firstView.unmount()
 
     const nextView = render(<BranchTreeInspector message={pending} onClose={() => undefined} />)
-    expect(screen.getByText('Visible before changing views.')).toBeInTheDocument()
+    await waitFor(() =>
+      expect(screen.getByText('Visible before changing views.')).toBeInTheDocument(),
+    )
+    expect(requestLiveProjection).toHaveBeenCalledTimes(2)
     expect(screen.queryByText('Inspector body.')).not.toBeInTheDocument()
     expect(screen.getByRole('status')).toHaveTextContent('Streaming response…')
 
+    act(() => registerTestTargetHandoff('cross-view-stream', 2))
     nextView.rerender(
       <BranchTreeInspector
         message={message({
@@ -768,19 +978,17 @@ describe('BranchTreeInspector', () => {
         onClose={() => undefined}
       />,
     )
+    expect(screen.getByText('Visible before changing views.')).toBeInTheDocument()
+
+    act(() => publishTestExactTarget('cross-view-stream', 2))
     await waitFor(() =>
       expect(screen.getByText('Committed after changing views.')).toBeInTheDocument(),
     )
     expect(screen.queryByText('Visible before changing views.')).not.toBeInTheDocument()
-
-    act(() => {
-      useStreamStore.getState().clearLiveSnapshot(pending.id, 'cross-view-stream', 0)
-      useStreamStore.getState().clearActive('cross-view-stream', 0)
-    })
     expect(screen.getByText('Committed after changing views.')).toBeInTheDocument()
   })
 
-  it('treats persisted streaming generation state as target-busy without an active lease', () => {
+  it('treats persisted streaming generation state as history without an execution lease', () => {
     const row = message()
     if (!row.generation) throw new Error('Expected generated message metadata')
     const { finishedAt: _finishedAt, ...pendingGeneration } = row.generation
@@ -793,17 +1001,17 @@ describe('BranchTreeInspector', () => {
           },
         })}
         onClose={() => undefined}
-        onEdit={() => undefined}
-        onDelete={() => undefined}
-        onContinue={() => undefined}
-        hasConnection
+        onEdit={succeededInteractionSettlement}
+        onDelete={succeededInteractionSettlement}
+        onContinue={() => startedGeneration()}
+        continueCapability={AVAILABLE_GENERATION_CAPABILITY}
       />,
     )
 
-    expect(screen.getByRole('status')).toHaveTextContent('Finishing response…')
-    expect(screen.getByRole('button', { name: 'Edit message' })).toBeDisabled()
-    expect(screen.getByRole('button', { name: 'Delete message' })).toBeDisabled()
-    expect(screen.getByRole('button', { name: 'Continue from here' })).toBeDisabled()
+    expect(screen.queryByRole('status')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Edit message' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Delete message' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Continue from here' })).toBeEnabled()
   })
 
   it('surfaces committed provider errors and aborts after streaming ends', () => {
@@ -848,17 +1056,14 @@ describe('BranchTreeInspector', () => {
   })
 
   it('keeps model-request actions available while another message is streaming', () => {
-    const onRegenerate = vi.fn()
-    const onContinue = vi.fn()
+    const onRegenerate = vi.fn(() => startedGeneration())
+    const onContinue = vi.fn(() => startedGeneration())
     const row = message()
     act(() => {
-      useStreamStore.getState().setActive({
+      observeTestAttempt({
         streamId: 'other-message-stream',
-        replacementEpoch: 0,
         chatId: row.chatId,
         messageId: 'other-message',
-        startedAt: 1,
-        ownerClientId: getStreamClientId(),
       })
     })
     const assistant = render(
@@ -867,7 +1072,8 @@ describe('BranchTreeInspector', () => {
         onClose={() => undefined}
         onRegenerate={onRegenerate}
         onContinue={onContinue}
-        hasConnection
+        regenerateCapability={AVAILABLE_GENERATION_CAPABILITY}
+        continueCapability={AVAILABLE_GENERATION_CAPABILITY}
       />,
     )
 
@@ -883,9 +1089,9 @@ describe('BranchTreeInspector', () => {
       <BranchTreeInspector
         message={message({ role: 'user', origin: 'user' })}
         onClose={() => undefined}
-        onEdit={() => undefined}
-        onEditAndSend={() => undefined}
-        hasConnection
+        onEdit={succeededInteractionSettlement}
+        onEditAndSend={() => startedGeneration()}
+        editResendCapability={AVAILABLE_GENERATION_CAPABILITY}
       />,
     )
     fireEvent.click(screen.getByRole('button', { name: 'Edit message' }))
@@ -895,35 +1101,29 @@ describe('BranchTreeInspector', () => {
 
   it('does not rebuild bounded prefixes or search ranges for cumulative streaming snapshots', () => {
     const operations: string[] = []
-    BranchTreeInspector.__setComputationProbeForTests((operation) => operations.push(operation))
+    observeBranchTreeInspectorComputations((operation) => operations.push(operation))
     const row = message()
-    useStreamStore.getState().setActive({
+    observeTestAttempt({
       streamId: 'stream-projection',
-      replacementEpoch: 0,
       chatId: row.chatId,
       messageId: row.id,
-      attemptKind: 'continuation',
-      startedAt: 1,
-      ownerClientId: 'client-1',
+      kind: 'continuation',
     })
     const publish = (length: number, updatedAt: number) => {
       const text = `needle ${'x'.repeat(length - 7)}`
-      useStreamStore.getState().setLiveSnapshot({
+      publishTestLiveProjection({
         streamId: 'stream-projection',
-        replacementEpoch: 0,
         chatId: row.chatId,
         messageId: row.id,
         content: [{ type: 'output_text', text }],
-        textLength: text.length,
-        reasoningLength: 0,
         updatedAt,
       })
     }
-    publish(110_000, 2)
 
     const { container } = render(
       <BranchTreeInspector message={row} searchQuery="needle" onClose={() => undefined} />,
     )
+    act(() => publish(110_000, 2))
     expect(operations.filter((operation) => operation === 'bounded-projection')).toHaveLength(0)
     expect(operations.filter((operation) => operation === 'search-scan')).toHaveLength(0)
     expect(container).toHaveTextContent('110,000 text characters')
@@ -942,7 +1142,8 @@ describe('BranchTreeInspector', () => {
   })
 
   it('cancels without saving and keeps the editor open when saving fails', async () => {
-    const onEdit = vi.fn().mockRejectedValue(new Error('workspace write failed'))
+    const settlements = createInteractionSettlementHarness()
+    const onEdit = vi.fn(() => settlements.fail(new Error('workspace write failed')))
     render(<BranchTreeInspector message={message()} onClose={() => undefined} onEdit={onEdit} />)
 
     fireEvent.click(screen.getByRole('button', { name: 'Edit message' }))
@@ -951,9 +1152,8 @@ describe('BranchTreeInspector', () => {
     })
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
 
-    expect(await screen.findByRole('alert')).toHaveTextContent(
-      'Edit failed: workspace write failed',
-    )
+    await waitFor(() => expect(settlements.presented).toHaveLength(1))
+    expect(settlements.presented[0]?.message).toContain('workspace write failed')
     expect(screen.getByRole('textbox', { name: 'Edit assistant message' })).toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
@@ -965,7 +1165,7 @@ describe('BranchTreeInspector', () => {
   })
 
   it('restores the rendered message when an edit is cancelled', () => {
-    const onEdit = vi.fn()
+    const onEdit = vi.fn(() => succeededInteractionSettlement())
     render(<BranchTreeInspector message={message()} onClose={() => undefined} onEdit={onEdit} />)
 
     fireEvent.click(screen.getByRole('button', { name: 'Edit message' }))

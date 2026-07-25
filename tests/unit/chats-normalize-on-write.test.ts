@@ -1,17 +1,24 @@
+import { createChat } from '../helpers/chats'
 import 'fake-indexeddb/auto'
 import Dexie from 'dexie'
 import { IDBFactory } from 'fake-indexeddb'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import type { ChatSettings } from '../../src/core/types'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
-import { createChat, getChat, touchLastViewed, updateChatSettings } from '../../src/store/chats'
-import { __resetDbForTests, openDb } from '../../src/store/db'
-import type { WorkspaceRepository } from '../../src/store/repository'
 import {
-  __resetWorkspaceRepositoryForTests,
-  __setWorkspaceRepositoryForTests,
-} from '../../src/store/workspace-repository'
+  openBrowserWorkspace,
+  shutdownBrowserWorkspace,
+} from '../../src/store/browser-workspace-lifecycle'
+import { getChat, touchLastViewed } from '../../src/store/chats'
+import { configurationApplication } from '../../src/store/configuration-application'
+import { __resetDbForTests } from '../../src/store/db'
+import {
+  subscribeWorkspaceEffects,
+  WORKSPACE_EFFECT_RECOVERY_OWNED,
+  type WorkspaceEffect,
+} from '../../src/store/workspace-effect-hub'
+import { __resetWorkspaceRepositoryForTests } from '../../src/store/workspace-repository'
 
 const DB_NAME = 'natter'
 
@@ -25,14 +32,15 @@ async function resetAll() {
 beforeEach(async () => {
   ;(globalThis as unknown as { indexedDB: IDBFactory }).indexedDB = new IDBFactory()
   await resetAll()
-  await openDb()
+  await openBrowserWorkspace()
 })
 
 afterEach(async () => {
+  await shutdownBrowserWorkspace()
   await resetAll()
 })
 
-describe('createChat / updateChatSettings — reasoning normalization', () => {
+describe('chat configuration reasoning normalization', () => {
   it('applies stable organization defaults to new chats', async () => {
     const chat = await createChat({ title: 'New chat', now: 123 })
     expect(chat).toMatchObject({
@@ -67,13 +75,13 @@ describe('createChat / updateChatSettings — reasoning normalization', () => {
     expect(reread?.settings.reasoning.include).toBeDefined()
   })
 
-  it("backfills include when an updateChatSettings patch carries a reasoning object that doesn't have it", async () => {
+  it("backfills include when a settings patch carries a reasoning object that doesn't have it", async () => {
     const chat = await createChat()
     // A caller updates only `mode` via the full reasoning object — common
     // pattern when copy-pasting settings between chats. The reasoning slot
     // gets replaced wholesale; without normalization the include block
     // would vanish.
-    await updateChatSettings(chat.id, {
+    await configurationApplication.patchChatSettings(chat.id, {
       reasoning: {
         mode: 'effort',
         effort: 'high',
@@ -91,43 +99,28 @@ describe('createChat / updateChatSettings — reasoning normalization', () => {
     expect(updated?.settings.reasoning.effort).toBe('high')
   })
 
-  it('routes last-viewed writes through the workspace repository abstraction', async () => {
-    const patched: Array<{
-      chatId: string
-      patch: unknown
-      options: unknown
-    }> = []
-    const runMutation = vi.fn(
-      async (_scopes: unknown, fn: (ctx: never) => Promise<void> | void) => {
-        await fn({
-          getChat: async () => ({ id: 'chat-1', lastViewedAt: 1 }),
-          patchChatMeta: (chatId: string, patch: unknown, options: unknown) => {
-            patched.push({ chatId, patch, options })
-          },
-        } as never)
-        return {
-          value: undefined,
-          affectedChatIds: [],
-          affectedMessageIds: [],
-          chatVersions: {},
-        }
-      },
-    )
-    const repo = { runMutation } as unknown as WorkspaceRepository
-    __setWorkspaceRepositoryForTests(repo)
+  it('publishes last-viewed writes through the workspace repository effect boundary', async () => {
+    const chat = await createChat({ id: 'chat-1', now: 1 })
+    const effects: WorkspaceEffect[] = []
+    const unsubscribe = subscribeWorkspaceEffects({
+      owner: 'chat-viewed-write-test',
+      sources: ['local'],
+      factKinds: ['sidebar-row-changed'],
+      replacements: false,
+      apply: (effect) => effects.push(effect),
+      recover: () => WORKSPACE_EFFECT_RECOVERY_OWNED,
+    })
 
     await touchLastViewed('chat-1', 50)
 
-    expect(runMutation).toHaveBeenCalledWith(
-      [{ kind: 'chat-meta', chatId: 'chat-1' }],
-      expect.any(Function),
-    )
-    expect(patched).toEqual([
-      {
-        chatId: 'chat-1',
-        patch: { lastViewedAt: 50 },
-        options: { touchVisibleState: false, broadcast: false },
-      },
-    ])
+    expect(effects).toHaveLength(1)
+    expect(effects[0]).toMatchObject({
+      kind: 'changed',
+      source: 'local',
+      cause: 'commit',
+      facts: [{ kind: 'sidebar-row-changed', chatId: chat.id }],
+    })
+    expect((await getChat(chat.id))?.lastViewedAt).toBe(50)
+    unsubscribe()
   })
 })

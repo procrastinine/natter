@@ -1,8 +1,16 @@
 import { act, render, waitFor } from '@testing-library/react'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Message } from '../../src/core/types'
 import { useMessageStreamProjection } from '../../src/hooks/useMessageStreamProjection'
-import { useStreamStore } from '../../src/store/zustand/streamStore'
+import { attemptController } from '../../src/store/attempt-controller'
+import type { WorkspaceFence } from '../../src/store/presentation-contracts'
+import {
+  clearTestLiveProjection,
+  observeTestAttempt,
+  publishTestLiveProjection,
+  removeTestAttempt,
+  resetAttemptControllerForTests,
+} from '../helpers/attempt-controller'
 
 const pendingMessage: Message = {
   id: 'projection-message',
@@ -25,47 +33,85 @@ const pendingMessage: Message = {
     delivery: 'streaming',
     status: 'streaming',
     costSource: 'stream',
+    reasoningCarryForward: 'none',
+    reasoningVisibility: { disclosure: 'unknown' },
     startedAt: 1,
   },
 }
 
+let workspaceFence: WorkspaceFence
+
 function ProjectionProbe({ message = pendingMessage }: { message?: Message }) {
-  const [, snapshot] = useMessageStreamProjection(message)
-  const content = snapshot?.content ?? message.content
+  const { execution, presentation, liveProjection } = useMessageStreamProjection(
+    message,
+    workspaceFence,
+  )
+  const content = liveProjection?.content ?? message.content
   const text = content
     .filter((item) => item.type === 'text' || item.type === 'output_text')
     .map((item) => item.text)
     .join('')
-  return <output>{text}</output>
+  return (
+    <output
+      data-execution={execution?.streamId ?? 'none'}
+      data-presentation={presentation?.streamId ?? 'none'}
+    >
+      {text}
+    </output>
+  )
 }
 
 function setActiveStream(attemptKind: 'generation' | 'continuation'): void {
-  useStreamStore.getState().setActive({
+  observeTestAttempt({
     streamId: 'projection-stream',
-    replacementEpoch: 0,
     chatId: pendingMessage.chatId,
     messageId: pendingMessage.id,
-    attemptKind,
-    startedAt: 1,
-    ownerClientId: 'projection-client',
+    kind: attemptKind,
   })
 }
 
 function setLiveSnapshot(text: string): void {
-  useStreamStore.getState().setLiveSnapshot({
+  publishTestLiveProjection({
     streamId: 'projection-stream',
-    replacementEpoch: 0,
     chatId: pendingMessage.chatId,
     messageId: pendingMessage.id,
     content: [{ type: 'output_text', text }],
-    textLength: text.length,
-    reasoningLength: 0,
-    updatedAt: 2,
   })
 }
 
+function registerTargetCommitHandoff(bodyVersion: number): void {
+  const attempt = attemptController.get('projection-stream')
+  if (!attempt?.messageId) throw new Error('Expected active projection attempt')
+  attemptController.registerTargetCommitHandoff({
+    ...workspaceFence,
+    streamId: attempt.streamId,
+    chatId: attempt.chatId,
+    messageId: attempt.messageId,
+    attemptKind: attempt.kind,
+    admissionSequence: attempt.admissionSequence,
+    leaseRevision: attempt.leaseRevision + 1,
+    bodyVersion,
+  })
+}
+
+function publishExactTarget(bodyVersion: number): void {
+  attemptController.publishExactTargetPresentations([
+    {
+      ...workspaceFence,
+      streamId: 'projection-stream',
+      chatId: pendingMessage.chatId,
+      messageId: pendingMessage.id,
+      bodyVersion,
+    },
+  ])
+}
+
+beforeEach(() => {
+  workspaceFence = resetAttemptControllerForTests()
+})
+
 afterEach(() => {
-  useStreamStore.getState().reset()
+  resetAttemptControllerForTests()
   vi.restoreAllMocks()
 })
 
@@ -73,10 +119,10 @@ describe('message stream projection', () => {
   it('shows the current snapshot for an active generation placeholder', () => {
     act(() => {
       setActiveStream('generation')
-      setLiveSnapshot('Generation live output.')
     })
 
     const view = render(<ProjectionProbe />)
+    act(() => setLiveSnapshot('Generation live output.'))
 
     expect(view.getByText('Generation live output.')).toBeInTheDocument()
     expect(view.queryByText('Persisted before streaming.')).not.toBeInTheDocument()
@@ -85,21 +131,18 @@ describe('message stream projection', () => {
   it('does not revive an older snapshot while a replacement waits for its first byte', () => {
     act(() => {
       setActiveStream('generation')
-      setLiveSnapshot('Superseded live output.')
     })
     const view = render(<ProjectionProbe />)
+    act(() => setLiveSnapshot('Superseded live output.'))
     expect(view.getByText('Superseded live output.')).toBeInTheDocument()
 
     act(() => {
-      useStreamStore.getState().clearActive('projection-stream', 0)
-      useStreamStore.getState().setActive({
+      removeTestAttempt('projection-stream')
+      observeTestAttempt({
         streamId: 'replacement-stream',
-        replacementEpoch: 0,
         chatId: pendingMessage.chatId,
         messageId: pendingMessage.id,
-        attemptKind: 'generation',
-        startedAt: 3,
-        ownerClientId: 'projection-client',
+        kind: 'generation',
       })
     })
 
@@ -107,12 +150,11 @@ describe('message stream projection', () => {
     expect(view.queryByText('Superseded live output.')).not.toBeInTheDocument()
   })
 
-  it('uses canonical content when first observing a generation after its body committed', () => {
+  it('keeps live generation output until the exact committed body is published', () => {
     const generation = pendingMessage.generation
     if (!generation) throw new Error('Expected generation metadata')
     act(() => {
       setActiveStream('generation')
-      setLiveSnapshot('Stale terminal live output.')
     })
     const committed: Message = {
       ...pendingMessage,
@@ -126,7 +168,16 @@ describe('message stream projection', () => {
     }
 
     const view = render(<ProjectionProbe message={committed} />)
+    act(() => setLiveSnapshot('Stale terminal live output.'))
 
+    expect(view.getByText('Stale terminal live output.')).toBeInTheDocument()
+    act(() => registerTargetCommitHandoff(4))
+    expect(view.getByText('Stale terminal live output.')).toHaveAttribute(
+      'data-presentation',
+      'projection-stream',
+    )
+    expect(view.getByText('Stale terminal live output.')).toHaveAttribute('data-execution', 'none')
+    act(() => publishExactTarget(4))
     expect(view.getByText('Canonical terminal output.')).toBeInTheDocument()
     expect(view.queryByText('Stale terminal live output.')).not.toBeInTheDocument()
   })
@@ -144,9 +195,9 @@ describe('message stream projection', () => {
     }
     act(() => {
       setActiveStream('continuation')
-      setLiveSnapshot('Persisted before streaming. Continued live output.')
     })
     const view = render(<ProjectionProbe message={completed} />)
+    act(() => setLiveSnapshot('Persisted before streaming. Continued live output.'))
     expect(view.getByText('Persisted before streaming. Continued live output.')).toBeInTheDocument()
 
     const committed: Message = {
@@ -160,6 +211,9 @@ describe('message stream projection', () => {
           streamId: 'projection-stream',
           strategy: 'prompt',
           status: 'done',
+          reasoningCarryForward: 'none',
+          reasoningVisibility: { disclosure: 'unknown' },
+          application: { kind: 'applied' },
           startedAt: 1,
           finishedAt: 3,
         },
@@ -167,6 +221,10 @@ describe('message stream projection', () => {
     }
     view.rerender(<ProjectionProbe message={committed} />)
 
+    expect(view.getByText('Persisted before streaming. Continued live output.')).toBeInTheDocument()
+    act(() => registerTargetCommitHandoff(5))
+    expect(view.getByText('Persisted before streaming. Continued live output.')).toBeInTheDocument()
+    act(() => publishExactTarget(5))
     expect(
       view.getByText('Persisted before streaming. Canonical continuation.'),
     ).toBeInTheDocument()
@@ -178,13 +236,13 @@ describe('message stream projection', () => {
   it('falls back to canonical content as soon as the current snapshot clears', () => {
     act(() => {
       setActiveStream('generation')
-      setLiveSnapshot('Transient live output.')
     })
     const view = render(<ProjectionProbe />)
+    act(() => setLiveSnapshot('Transient live output.'))
     expect(view.getByText('Transient live output.')).toBeInTheDocument()
 
     act(() => {
-      useStreamStore.getState().clearLiveSnapshot(pendingMessage.id, 'projection-stream', 0)
+      clearTestLiveProjection('projection-stream')
     })
 
     expect(view.getByText('Persisted before streaming.')).toBeInTheDocument()
@@ -203,18 +261,20 @@ describe('message stream projection', () => {
     expect(requestLiveSnapshot).not.toHaveBeenCalled()
 
     act(() => {
-      useStreamStore
-        .getState()
-        .setLiveSnapshotRequester('projection-stream', 0, requestLiveSnapshot)
+      attemptController.setLiveProjectionRequester('projection-stream', requestLiveSnapshot)
     })
     await waitFor(() => expect(requestLiveSnapshot).toHaveBeenCalledTimes(1))
 
     visibility = 'hidden'
-    act(() => document.dispatchEvent(new Event('visibilitychange')))
+    await act(async () => {
+      document.dispatchEvent(new Event('visibilitychange'))
+    })
     expect(requestLiveSnapshot).toHaveBeenCalledTimes(1)
 
     visibility = 'visible'
-    act(() => document.dispatchEvent(new Event('visibilitychange')))
+    await act(async () => {
+      document.dispatchEvent(new Event('visibilitychange'))
+    })
     await waitFor(() => expect(requestLiveSnapshot).toHaveBeenCalledTimes(2))
   })
 })

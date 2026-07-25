@@ -1,23 +1,25 @@
 import { type ReactNode, useEffect, useMemo, useState } from 'react'
 import type { LlamaServerProps } from '../../api/probe'
+import {
+  configurationWriteInteraction,
+  configurationWriteTarget,
+  definePresentationInteraction,
+} from '../../app/presentation-interactions'
 import { textCompletionsNeedsReasoningOffFor } from '../../core/quirks'
 import {
   BUILTIN_TEXT_TEMPLATE_ORDER,
-  createSavedTextTemplate,
-  deleteSavedTextTemplate,
   EMPTY_TEXT_TEMPLATE,
   editableTextTemplateConfig,
-  readSavedTextTemplates,
-  SAVED_TEXT_TEMPLATES_KEY,
-  type SavedTextTemplate,
+  isStaticTextTemplateId,
   TEXT_TEMPLATES,
   templateSourceForConfig,
-  updateSavedTextTemplate,
 } from '../../core/text-templates'
 import type { Chat, TextTemplateConfig, TextTemplateId } from '../../core/types'
-import { updateChatSettings } from '../../store/chats'
-import { primaryKeys } from '../../store/reactive-dependencies'
-import { useRepositoryQuery } from '../../store/reactive-query'
+import { usePresentationInteraction } from '../../hooks/usePresentationInteraction'
+import { useSettledConfigurationEdit } from '../../hooks/useSettledConfigurationEdit'
+import { useTextTemplateLibrary } from '../../hooks/useTextTemplateLibrary'
+import { configurationApplication } from '../../store/configuration-application'
+import { configurationController } from '../../store/configuration-controller'
 import { Button } from '../primitives/Button'
 import { InfoDisclosure } from './InfoDisclosure'
 
@@ -29,6 +31,13 @@ interface TextTemplateSectionProps {
   requestStopControl?: ReactNode
 }
 
+const textTemplateLibraryInteraction = definePresentationInteraction<'library'>({
+  id: 'text-template-library.mutate',
+  label: 'Text template update',
+  concurrency: 'reject',
+  lifetime: 'workspace-tab',
+})
+
 export function TextTemplateSection({
   chat,
   mode,
@@ -36,16 +45,13 @@ export function TextTemplateSection({
   heading = 'Text completions template',
   requestStopControl = null,
 }: TextTemplateSectionProps) {
-  const saved = useRepositoryQuery(
-    'saved-text-templates',
-    () => readSavedTextTemplates(),
-    [] as SavedTextTemplate[],
-    primaryKeys('settings', SAVED_TEXT_TEMPLATES_KEY),
-  )
   const allowServerDefault = mode === 'llama-server'
   const selectedRaw = chat.settings.textTemplate ?? 'chatml'
   const selected = !allowServerDefault && selectedRaw === 'default' ? 'chatml' : selectedRaw
-  const selectedSaved = saved.find((row) => row.id === selected) ?? null
+  const selectedSavedId = isStaticTextTemplateId(selected) ? null : selected
+  const { catalog: saved, selected: selectedSavedValue } = useTextTemplateLibrary(selectedSavedId)
+  const selectedSavedCatalogRow = saved.find((row) => row.id === selectedSavedId) ?? null
+  const selectedSaved = selectedSavedValue ?? null
   const selectedBuiltin = TEXT_TEMPLATES[selected] ?? null
   const selectedIsPerChatCustom = selected === 'custom'
   const selectedConfig =
@@ -53,6 +59,10 @@ export function TextTemplateSection({
     selectedBuiltin ??
     (selectedIsPerChatCustom ? (chat.settings.customTextTemplate ?? EMPTY_TEXT_TEMPLATE) : null)
   const canEdit = selectedSaved !== null || selectedIsPerChatCustom
+  const editableConfig = useMemo(
+    () => (selectedConfig ? editableTextTemplateConfig(selectedConfig) : null),
+    [selectedConfig],
+  )
   const helper = useMemo(
     () => describeTemplate(selected, mode, llamaProps, selectedSaved?.config),
     [selected, mode, llamaProps, selectedSaved?.config],
@@ -61,42 +71,49 @@ export function TextTemplateSection({
     mode === 'openrouter' &&
     textCompletionsNeedsReasoningOffFor(chat.settings.model) &&
     chat.settings.reasoning.mode !== 'off'
+  const libraryInteraction = usePresentationInteraction(textTemplateLibraryInteraction)
+  const { run: runConfigurationWrite } = usePresentationInteraction(configurationWriteInteraction, {
+    observePending: false,
+  })
 
   const setTemplate = (next: TextTemplateId) => {
-    void updateChatSettings(chat.id, { textTemplate: next })
-  }
-
-  const createBlank = async () => {
-    const row = await createSavedTextTemplate({
-      name: 'New text template',
-      config: { ...EMPTY_TEXT_TEMPLATE, includeSystemPrompt: true },
+    runConfigurationWrite({
+      target: configurationWriteTarget(chat.id, 'textTemplate'),
+      action: () => configurationApplication.patchChatSettings(chat.id, { textTemplate: next }),
     })
-    await updateChatSettings(chat.id, { textTemplate: row.id })
   }
 
-  const saveAsNew = async () => {
+  const createBlank = () => {
+    libraryInteraction.run({
+      target: 'library',
+      action: () =>
+        configurationApplication.createAndSelectTextTemplate({
+          chatId: chat.id,
+          name: 'New text template',
+          config: { ...EMPTY_TEXT_TEMPLATE, includeSystemPrompt: true },
+        }),
+    })
+  }
+
+  const saveAsNew = () => {
     const base = selectedConfig ?? EMPTY_TEXT_TEMPLATE
-    const row = await createSavedTextTemplate({
-      name: `${labelFor(selected, selectedSaved?.name)} copy`,
-      config: editableTextTemplateConfig(base),
+    libraryInteraction.run({
+      target: 'library',
+      action: () =>
+        configurationApplication.createAndSelectTextTemplate({
+          chatId: chat.id,
+          name: `${labelFor(selected, selectedSaved?.name)} copy`,
+          config: editableTextTemplateConfig(base),
+        }),
     })
-    await updateChatSettings(chat.id, { textTemplate: row.id })
   }
 
-  const deleteCurrent = async () => {
+  const deleteCurrent = () => {
     if (!selectedSaved) return
-    await deleteSavedTextTemplate(selectedSaved.id)
-    await updateChatSettings(chat.id, { textTemplate: 'chatml' })
-  }
-
-  const updateSelectedConfig = (config: TextTemplateConfig) => {
-    if (selectedSaved) {
-      void updateSavedTextTemplate(selectedSaved.id, { config })
-      return
-    }
-    if (selectedIsPerChatCustom) {
-      void updateChatSettings(chat.id, { customTextTemplate: config })
-    }
+    libraryInteraction.run({
+      target: 'library',
+      action: () => configurationApplication.deleteTextTemplate(selectedSaved.id),
+    })
   }
 
   return (
@@ -130,6 +147,11 @@ export function TextTemplateSection({
               ))}
             </optgroup>
           ) : null}
+          {selectedSavedId && !selectedSavedCatalogRow ? (
+            <option value={selectedSavedId}>
+              {selectedSaved?.name ?? 'Loading saved template…'}
+            </option>
+          ) : null}
           {selectedIsPerChatCustom ? <option value="custom">Per-chat custom</option> : null}
         </select>
         <span data-ui="helper">{helper}</span>
@@ -143,16 +165,31 @@ export function TextTemplateSection({
         </div>
       ) : null}
       <div data-ui="inline-actions">
-        <Button type="button" data-ui="secondary-button" onClick={() => void createBlank()}>
+        <Button
+          type="button"
+          data-ui="secondary-button"
+          disabled={libraryInteraction.isPending('library')}
+          onClick={createBlank}
+        >
           New template
         </Button>
         {selectedConfig ? (
-          <Button type="button" data-ui="secondary-button" onClick={() => void saveAsNew()}>
+          <Button
+            type="button"
+            data-ui="secondary-button"
+            disabled={libraryInteraction.isPending('library')}
+            onClick={saveAsNew}
+          >
             Save as new
           </Button>
         ) : null}
         {selectedSaved ? (
-          <Button type="button" data-ui="secondary-button" onClick={() => void deleteCurrent()}>
+          <Button
+            type="button"
+            data-ui="secondary-button"
+            disabled={libraryInteraction.isPending('library')}
+            onClick={deleteCurrent}
+          >
             Delete saved
           </Button>
         ) : null}
@@ -160,11 +197,13 @@ export function TextTemplateSection({
       {selectedSaved ? (
         <TemplateNameEditor templateId={selectedSaved.id} name={selectedSaved.name} />
       ) : null}
-      {selectedConfig ? (
+      {editableConfig ? (
         <TemplateConfigEditor
-          config={editableTextTemplateConfig(selectedConfig)}
+          key={selectedSaved?.id ?? selected}
+          chatId={chat.id}
+          {...(selectedSaved ? { templateId: selectedSaved.id } : {})}
+          config={editableConfig}
           readOnly={!canEdit}
-          onChange={updateSelectedConfig}
         />
       ) : null}
       {requestStopControl}
@@ -205,53 +244,94 @@ function describeTemplate(
 }
 
 function TemplateNameEditor({ templateId, name }: { templateId: TextTemplateId; name: string }) {
-  const [draft, setDraft] = useState(name)
-  useEffect(() => {
-    setDraft(name)
-  }, [name])
+  const edit = useSettledConfigurationEdit({
+    ownerKey: `text-template:${templateId}`,
+    fieldKey: `text-template.${templateId}.name`,
+    storedValue: name,
+    commit: (next) => configurationApplication.updateTextTemplate(templateId, { name: next }),
+  })
   return (
     <div data-ui="field-group">
       <label htmlFor={`${templateId}-name`}>Template name</label>
       <input
         id={`${templateId}-name`}
         type="text"
-        value={draft}
-        onChange={(e) => setDraft(e.target.value)}
-        onBlur={() => {
-          if (draft !== name) void updateSavedTextTemplate(templateId, { name: draft })
-        }}
+        value={edit.value}
+        onChange={(e) => edit.setValue(e.target.value)}
+        onBlur={edit.onBlur}
       />
     </div>
   )
 }
 
 function TemplateConfigEditor({
+  chatId,
+  templateId,
   config,
   readOnly,
-  onChange,
 }: {
+  chatId: Chat['id']
+  templateId?: TextTemplateId
   config: TextTemplateConfig
   readOnly: boolean
-  onChange: (next: TextTemplateConfig) => void
 }) {
-  const patch = (next: Partial<TextTemplateConfig>) => onChange({ ...config, ...next })
+  const edit = useSettledConfigurationEdit({
+    ...(templateId
+      ? { ownerKey: `text-template:${templateId}` }
+      : readOnly
+        ? {}
+        : { ownerChatId: chatId }),
+    fieldKey: templateId ? `text-template.${templateId}.config` : 'customTextTemplate',
+    storedValue: config,
+    equal: sameTextTemplateConfig,
+    stage(next) {
+      if (templateId) {
+        configurationController.stageTextTemplateConfig(templateId, next)
+      } else if (!readOnly) {
+        configurationController.stageChatSettingsFields(chatId, [
+          { path: ['customTextTemplate'], value: next },
+        ])
+      }
+    },
+    async commit(next) {
+      if (templateId) {
+        await configurationApplication.updateTextTemplate(templateId, { config: next })
+      } else if (!readOnly) {
+        await configurationApplication.patchChatSettingsFields(chatId, [
+          { path: ['customTextTemplate'], value: next },
+        ])
+      }
+    },
+  })
+  const patch = (next: Partial<TextTemplateConfig>) => {
+    edit.setValue({ ...edit.value, ...next })
+  }
   return (
     <div data-ui="text-template-editor">
       <TemplateSourceField
-        value={templateSourceForConfig(config)}
+        value={templateSourceForConfig(edit.value)}
         readOnly={readOnly}
         onChange={(template) => patch({ template })}
+        onBlur={edit.onBlur}
       />
       <label data-ui="reasoning-checkbox" data-disabled={readOnly ? 'true' : undefined}>
         <input
           type="checkbox"
-          checked={config.includeSystemPrompt !== false}
+          checked={edit.value.includeSystemPrompt !== false}
           disabled={readOnly}
-          onChange={(e) => patch({ includeSystemPrompt: e.target.checked })}
+          onChange={(e) => {
+            patch({ includeSystemPrompt: e.target.checked })
+            edit.onBlur()
+          }}
         />
         <span>Include chat system prompt</span>
       </label>
-      <StopField value={config.stop} readOnly={readOnly} onChange={(stop) => patch({ stop })} />
+      <StopField
+        value={config.stop}
+        readOnly={readOnly}
+        onChange={(stop) => patch({ stop })}
+        onBlur={edit.onBlur}
+      />
     </div>
   )
 }
@@ -260,15 +340,13 @@ function TemplateSourceField({
   value,
   readOnly,
   onChange,
+  onBlur,
 }: {
   value: string
   readOnly: boolean
   onChange: (next: string) => void
+  onBlur: () => void
 }) {
-  const [draft, setDraft] = useState(value)
-  useEffect(() => {
-    setDraft(value)
-  }, [value])
   const id = 'text-template-source'
   return (
     <div data-ui="field-group">
@@ -277,12 +355,10 @@ function TemplateSourceField({
         id={id}
         data-ui="text-template-source"
         rows={14}
-        value={draft}
+        value={value}
         readOnly={readOnly}
-        onChange={(e) => setDraft(e.target.value)}
-        onBlur={() => {
-          if (!readOnly && draft !== value) onChange(draft)
-        }}
+        onChange={(e) => onChange(e.target.value)}
+        onBlur={onBlur}
       />
     </div>
   )
@@ -292,10 +368,12 @@ function StopField({
   value,
   readOnly,
   onChange,
+  onBlur,
 }: {
   value: readonly string[]
   readOnly: boolean
   onChange: (next: string[]) => void
+  onBlur: () => void
 }) {
   const text = value.join('\n')
   const [draft, setDraft] = useState(text)
@@ -311,18 +389,40 @@ function StopField({
         rows={4}
         value={draft}
         readOnly={readOnly}
-        onChange={(e) => setDraft(e.target.value)}
+        onChange={(e) => {
+          const next = e.target.value
+          setDraft(next)
+          onChange(sanitizeTemplateStops(next))
+        }}
         onBlur={() => {
-          if (readOnly || draft === text) return
-          onChange(
-            draft
-              .split('\n')
-              .map((s) => s.trim())
-              .filter((s) => s.length > 0),
-          )
+          if (!readOnly && draft !== text) onChange(sanitizeTemplateStops(draft))
+          onBlur()
         }}
       />
       <span data-ui="helper">Saved with this template and merged into the request stop list.</span>
     </div>
+  )
+}
+
+function sanitizeTemplateStops(text: string): string[] {
+  return text
+    .split('\n')
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0)
+}
+
+function sameTextTemplateConfig(left: TextTemplateConfig, right: TextTemplateConfig): boolean {
+  return (
+    left.template === right.template &&
+    left.includeSystemPrompt === right.includeSystemPrompt &&
+    left.userPrefix === right.userPrefix &&
+    left.userSuffix === right.userSuffix &&
+    left.assistantPrefix === right.assistantPrefix &&
+    left.assistantSuffix === right.assistantSuffix &&
+    left.systemPrefix === right.systemPrefix &&
+    left.systemSuffix === right.systemSuffix &&
+    left.bos === right.bos &&
+    left.stop.length === right.stop.length &&
+    left.stop.every((value, index) => value === right.stop[index])
   )
 }

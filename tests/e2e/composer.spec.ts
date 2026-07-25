@@ -1,8 +1,10 @@
-import { expect, test } from './fixtures'
+import { configureWorkspaceThroughUi } from '../../scripts/workspace-provider-fixture.mjs'
+import { createChatUiJourneyProfile, expect, test } from './fixtures'
 import {
   buildSseBody,
   clearIndexedDb,
   createChatAndOpen,
+  holdIndexedDbStoreGate,
   mockChatCompletions,
   seedFirstRun,
 } from './helpers'
@@ -38,23 +40,8 @@ test.describe('retina composer sizing', () => {
     context,
     page,
   }) => {
-    await page.evaluate(async () => {
-      const db = await new Promise<IDBDatabase>((resolve, reject) => {
-        const request = indexedDB.open('natter')
-        request.onsuccess = () => resolve(request.result)
-        request.onerror = () => reject(request.error)
-      })
-      try {
-        await new Promise<void>((resolve, reject) => {
-          const transaction = db.transaction('settings', 'readwrite')
-          transaction.objectStore('settings').put({ key: 'global:base-font-size', value: 18 })
-          transaction.oncomplete = () => resolve()
-          transaction.onerror = () => reject(transaction.error)
-          transaction.onabort = () => reject(transaction.error)
-        })
-      } finally {
-        db.close()
-      }
+    await configureWorkspaceThroughUi(page, {
+      workspaceSettings: { 'global:base-font-size': 18 },
     })
     const freshPage = await context.newPage()
     await freshPage.goto('/#/new')
@@ -353,6 +340,97 @@ test('input clears after a successful send', async ({ page }) => {
   await page.locator('[data-ui="send"]').click()
   await expect(page.locator('[data-ui="message"][data-role="assistant"]')).toBeVisible()
   expect(await input.inputValue()).toBe('')
+})
+
+test('one new-chat Enter waits for configuration and clears only after admission', async ({
+  context,
+  page,
+  uiJourney,
+}) => {
+  const releaseConfiguration = await holdIndexedDbStoreGate(page, ['profiles'])
+  const freshPage = await context.newPage()
+  let requestCount = 0
+  await freshPage.route('**/api/v1/chat/completions', async (route) => {
+    requestCount += 1
+    await route.fulfill({
+      status: 200,
+      contentType: 'text/event-stream',
+      body: buildSseBody([
+        { id: 'pending-configuration-submit', content: 'configured answer' },
+        { finish: 'stop' },
+      ]),
+    })
+  })
+  try {
+    await freshPage.goto('/#/new')
+    const input = freshPage.locator('[data-ui="composer-input"]')
+    await input.waitFor({ state: 'visible' })
+    await uiJourney.start(
+      freshPage,
+      createChatUiJourneyProfile({ chatHeader: false }),
+      'new-chat-configuration-settlement',
+    )
+    await input.fill('send after configuration settles')
+    await uiJourney.intent(freshPage, {
+      kind: 'gesture',
+      id: 'new-chat-pending-configuration-enter',
+      targetSelector: '[data-ui="composer-input"]',
+      eventType: 'keydown',
+      expectedDeliveries: 1,
+      expectedRoute: { kind: 'prefix', value: '/#/chat/' },
+    })
+    await input.press('Enter')
+
+    expect(requestCount).toBe(0)
+    expect(await freshPage.evaluate(() => window.location.hash)).toBe('#/new')
+    await expect(input).toHaveValue('send after configuration settles')
+
+    await releaseConfiguration()
+    await expect.poll(() => requestCount).toBe(1)
+    await expect(freshPage.locator('[data-ui="message"][data-role="user"]')).toHaveCount(1)
+    await expect.poll(() => freshPage.evaluate(() => window.location.hash)).toMatch(/^#\/chat\//u)
+    await expect(input).toHaveValue('')
+    await uiJourney.checkpoint(freshPage, 'new-chat-configuration-admitted')
+    await uiJourney.finish(freshPage, 'new-chat-configuration-finished')
+  } finally {
+    await releaseConfiguration()
+    await freshPage.close()
+  }
+})
+
+test('a successful send stays cleared after leaving and returning to the chat', async ({
+  page,
+}) => {
+  await mockChatCompletions(page, {
+    body: buildSseBody([{ id: 'draft-clear', content: 'ok', finish: 'stop' }]),
+  })
+  const input = page.locator('[data-ui="composer-input"]')
+  await input.fill('establish the chat')
+  await page.locator('[data-ui="send"]').click()
+  await page.waitForFunction(() => window.location.hash.startsWith('#/chat/'))
+  await expect(page.locator('[data-ui="message"][data-role="assistant"]')).toHaveCount(1)
+
+  const chatId = page.url().match(/#\/chat\/([^/]+)/)?.[1]
+  if (!chatId) throw new Error('Expected an active chat route')
+  const storageKey = `natter:composer-draft:${encodeURIComponent(`chat:${chatId}`)}`
+  const sentText = 'do not resurrect this sent draft'
+
+  await input.fill(sentText)
+  await page.waitForFunction(({ key, value }) => sessionStorage.getItem(key) === value, {
+    key: storageKey,
+    value: sentText,
+  })
+  await page.locator('[data-ui="send"]').click()
+  await expect(page.locator('[data-ui="message"][data-role="assistant"]')).toHaveCount(2)
+  await expect(input).toHaveValue('')
+
+  await page.locator('[data-role="new-chat"]').click()
+  await page.waitForFunction(() => window.location.hash === '#/new')
+  await page.locator(`[data-ui="chat-row-link"][href="#/chat/${chatId}"]`).click()
+  await expect(input).toHaveValue('')
+  await expect
+    .poll(() => page.evaluate((key) => sessionStorage.getItem(key), storageKey))
+    .toBeNull()
 })
 
 test('the composer swaps Send for Abort while a stream owns the active placeholder', async ({

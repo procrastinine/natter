@@ -1,7 +1,454 @@
-import type { ReasoningDetail, ReasoningFormat, ReasoningInclude, ReasoningSettings } from './types'
+import type {
+  ChatSettings,
+  InboundReasoningVisibility,
+  KnownReasoningFormat,
+  Message,
+  OpaqueReasoningCarrierV2,
+  PersistedInboundReasoningVisibility,
+  PersistedReasoningCarryForward,
+  ProviderOutputItem,
+  ReasoningCarryForwardEvidence,
+  ReasoningEnvelopeV2,
+  ReasoningFormat,
+  ReasoningInclude,
+  ReasoningOriginDialect,
+  ReasoningProducerBridge,
+  ReasoningSettings,
+  ReasoningVisibleKind,
+  SealedReasoningCarryForward,
+} from './types'
+
+export type { InboundReasoningVisibility } from './types'
+
+import { type AppliedMessageView, createAppliedMessageView } from './continuation-content'
 
 type ReasoningSettingsInput = Omit<Partial<ReasoningSettings>, 'include'> & {
   include?: Partial<ReasoningInclude> | null
+}
+
+export interface ReasoningPolicy {
+  readonly include: Readonly<ReasoningInclude>
+  readonly echoAsThinkTags: boolean
+  readonly acceptsAnthropicRedactedThinking: boolean
+}
+
+export type ReasoningVisibilityPolicy =
+  | Readonly<{ kind: 'uniform'; visibleKind: ReasoningVisibleKind }>
+  | Readonly<{
+      kind: 'hidden-on-chat'
+      otherwise: ReasoningVisibleKind
+    }>
+  | Readonly<{
+      kind: 'anthropic-summary'
+      directDefault: 'summarized' | 'omitted'
+    }>
+
+export type ReasoningCarrier =
+  | 'plaintext-only'
+  | 'openrouter-reasoning-details'
+  | 'responses-items'
+  | 'anthropic-blocks'
+  | 'gemini-parts'
+
+export interface ReasoningReplayContract<
+  TargetFormat extends KnownReasoningFormat | null = KnownReasoningFormat | null,
+  Carrier extends ReasoningCarrier = ReasoningCarrier,
+> extends ReasoningPolicy {
+  readonly targetFormat: TargetFormat
+  readonly carrier: Carrier
+  readonly producerBridge: ReasoningProducerBridge
+}
+
+export interface RoutedReasoningContract<
+  TargetFormat extends KnownReasoningFormat | null = KnownReasoningFormat | null,
+  Carrier extends ReasoningCarrier = ReasoningCarrier,
+  OriginDialect extends ReasoningOriginDialect = ReasoningOriginDialect,
+> extends ReasoningReplayContract<TargetFormat, Carrier> {
+  readonly originDialect: OriginDialect
+  readonly visibilityPolicy: ReasoningVisibilityPolicy
+}
+
+export interface AttemptReasoningContract<
+  TargetFormat extends KnownReasoningFormat | null = KnownReasoningFormat | null,
+  Carrier extends ReasoningCarrier = ReasoningCarrier,
+  OriginDialect extends ReasoningOriginDialect = ReasoningOriginDialect,
+> extends RoutedReasoningContract<TargetFormat, Carrier, OriginDialect> {
+  readonly inboundVisibility: InboundReasoningVisibility
+}
+
+export type TextReasoningContract = ReasoningReplayContract<null, 'plaintext-only'>
+export type ChatReasoningContract = ReasoningReplayContract<
+  KnownReasoningFormat | null,
+  'plaintext-only' | 'openrouter-reasoning-details'
+>
+export type ResponsesReasoningContract = ReasoningReplayContract<
+  'openai-responses-v1' | 'azure-openai-responses-v1' | 'xai-responses-v1',
+  'responses-items'
+>
+export type AnthropicReasoningContract = ReasoningReplayContract<
+  'anthropic-claude-v1',
+  'anthropic-blocks'
+>
+export type GeminiReasoningContract = ReasoningReplayContract<'google-gemini-v1', 'gemini-parts'>
+
+export type AttemptTextReasoningContract = AttemptReasoningContract<
+  null,
+  'plaintext-only',
+  'inline'
+>
+export type AttemptChatReasoningContract =
+  | AttemptReasoningContract<KnownReasoningFormat | null, 'plaintext-only', 'openai-chat'>
+  | AttemptReasoningContract<
+      KnownReasoningFormat | null,
+      'openrouter-reasoning-details',
+      'openrouter-chat'
+    >
+export type AttemptResponsesReasoningContract = AttemptReasoningContract<
+  'openai-responses-v1' | 'azure-openai-responses-v1' | 'xai-responses-v1',
+  'responses-items',
+  'openai-responses' | 'openrouter-responses'
+>
+export type AttemptAnthropicReasoningContract = AttemptReasoningContract<
+  'anthropic-claude-v1',
+  'anthropic-blocks',
+  'anthropic-messages'
+>
+export type AttemptGeminiReasoningContract = AttemptReasoningContract<
+  'google-gemini-v1',
+  'gemini-parts',
+  'gemini-native'
+>
+
+export const UNKNOWN_INBOUND_REASONING_VISIBILITY = Object.freeze({
+  disclosure: 'unknown',
+} as const)
+
+export function isInboundReasoningVisibility(value: unknown): value is InboundReasoningVisibility {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const visibility = value as Record<string, unknown>
+  if (visibility.disclosure === 'visible') {
+    return visibility.visibleKind === 'text' || visibility.visibleKind === 'summary'
+  }
+  return (
+    visibility.disclosure === 'absent' &&
+    (visibility.unexpectedVisibleKind === 'text' ||
+      visibility.unexpectedVisibleKind === 'summary') &&
+    (visibility.reason === 'api-mode' ||
+      visibility.reason === 'request-display' ||
+      visibility.reason === 'provider-default' ||
+      visibility.reason === 'disabled')
+  )
+}
+
+export function isPersistedInboundReasoningVisibility(
+  value: unknown,
+): value is PersistedInboundReasoningVisibility {
+  return (
+    isInboundReasoningVisibility(value) ||
+    (value !== null &&
+      typeof value === 'object' &&
+      !Array.isArray(value) &&
+      (value as { disclosure?: unknown }).disclosure === 'unknown')
+  )
+}
+
+export function messageReasoningVisibility(
+  view: AppliedMessageView,
+): PersistedInboundReasoningVisibility {
+  return view.latestAttempt.reasoningVisibility
+}
+
+const REASONING_FORMATS: ReadonlySet<ReasoningFormat> = new Set([
+  'unknown',
+  'openai-responses-v1',
+  'azure-openai-responses-v1',
+  'xai-responses-v1',
+  'anthropic-claude-v1',
+  'google-gemini-v1',
+])
+
+export function isReasoningFormat(value: unknown): value is ReasoningFormat {
+  return typeof value === 'string' && REASONING_FORMATS.has(value as ReasoningFormat)
+}
+
+export interface MessageContextRouteFacts {
+  readonly reasoningCarriers: readonly ReasoningCarrierRouteFact[]
+  readonly hasOpenAiResponsesProviderOutput: boolean
+}
+
+export interface ReasoningCarrierRouteFact {
+  readonly kind: OpaqueReasoningCarrierV2['kind']
+  readonly format: ReasoningFormat
+  readonly originDialect: ReasoningOriginDialect
+  readonly producerBridge: ReasoningProducerBridge
+  readonly binding: 'not-required' | 'unbound' | 'resolved' | 'missing'
+}
+
+export interface ReasoningEnvelopeReplayTopology {
+  readonly visibleById: ReadonlyMap<string, ReasoningEnvelopeV2['visible'][number]>
+  readonly visibleByGroup: ReadonlyMap<string, readonly ReasoningEnvelopeV2['visible'][number][]>
+  readonly duplicateCarrierIds: ReadonlySet<string>
+  readonly ambiguousCarrierIds: ReadonlySet<string>
+  readonly ambiguousVisiblePartIds: ReadonlySet<string>
+}
+
+export type ReasoningCarrierTopologyOmissionReason =
+  | 'duplicate'
+  | 'hidden'
+  | 'empty-payload'
+  | 'ambiguous-binding'
+
+export const EMPTY_MESSAGE_CONTEXT_ROUTE_FACTS: MessageContextRouteFacts = Object.freeze({
+  reasoningCarriers: Object.freeze([]),
+  hasOpenAiResponsesProviderOutput: false,
+})
+
+export function reasoningPolicyForSettings(
+  settings: Pick<ChatSettings, 'reasoning'>,
+  options: { acceptsAnthropicRedactedThinking?: boolean } = {},
+): ReasoningPolicy {
+  const reasoning = normalizeReasoningSettings(settings.reasoning)
+  return Object.freeze({
+    include: Object.freeze({ ...reasoning.include }),
+    echoAsThinkTags: reasoning.echoAsThinkTags === true,
+    acceptsAnthropicRedactedThinking: options.acceptsAnthropicRedactedThinking === true,
+  })
+}
+
+export function sealAttemptReasoningContract<
+  TargetFormat extends KnownReasoningFormat | null,
+  Carrier extends ReasoningCarrier,
+  OriginDialect extends ReasoningOriginDialect,
+>(
+  routed: RoutedReasoningContract<TargetFormat, Carrier, OriginDialect>,
+  inboundVisibility: InboundReasoningVisibility,
+): AttemptReasoningContract<TargetFormat, Carrier, OriginDialect> {
+  return Object.freeze({
+    ...routed,
+    inboundVisibility,
+  })
+}
+
+export function visibleKindForInboundReasoning(
+  visibility: InboundReasoningVisibility,
+): 'text' | 'summary' {
+  return visibility.disclosure === 'visible'
+    ? visibility.visibleKind
+    : visibility.unexpectedVisibleKind
+}
+
+export function sealReasoningReplayContract(
+  policy: ReasoningPolicy,
+  targetFormat: ReasoningFormat | null | undefined,
+  carrier: ReasoningCarrier,
+  producerBridge: ReasoningProducerBridge,
+): ReasoningReplayContract {
+  return Object.freeze({
+    ...policy,
+    targetFormat:
+      targetFormat === undefined || targetFormat === null || targetFormat === 'unknown'
+        ? null
+        : targetFormat,
+    carrier,
+    producerBridge,
+  })
+}
+
+export type ReasoningVisibilityEvidence =
+  | (Readonly<{
+      kind: 'openai-family'
+      dialect: 'openai-chat' | 'openrouter-chat' | 'openai-responses' | 'openrouter-responses'
+    }> &
+      (
+        | Readonly<{
+            activation: 'active'
+            display: 'available' | 'request-omitted' | 'provider-default-omitted'
+          }>
+        | Readonly<{ activation: 'disabled' }>
+        | Readonly<{ activation: 'excluded' }>
+      ))
+  | Readonly<{
+      kind: 'anthropic'
+      display: 'summarized' | 'omitted' | 'provider-default' | 'disabled'
+    }>
+  | Readonly<{
+      kind: 'gemini'
+      thoughts: 'included' | 'omitted'
+      omittedReason: 'request-display' | 'provider-default' | 'disabled'
+    }>
+  | Readonly<{ kind: 'inline'; activation: 'active' | 'disabled' | 'excluded' }>
+  | Readonly<{ kind: 'unavailable' }>
+
+export function resolveAttemptInboundReasoningVisibility(
+  policy: ReasoningVisibilityPolicy,
+  evidence: ReasoningVisibilityEvidence,
+): InboundReasoningVisibility {
+  if (evidence.kind === 'inline') {
+    if (evidence.activation === 'disabled') return absentReasoning('text', 'disabled')
+    if (evidence.activation === 'excluded') return absentReasoning('text', 'request-display')
+    return visibleReasoning('text')
+  }
+  if (evidence.kind === 'unavailable') return absentReasoning('text', 'api-mode')
+  if (evidence.kind === 'gemini') {
+    return evidence.thoughts === 'included'
+      ? visibleReasoning('summary')
+      : absentReasoning('summary', evidence.omittedReason)
+  }
+  if (evidence.kind === 'anthropic') {
+    if (evidence.display === 'disabled') return absentReasoning('summary', 'disabled')
+    if (evidence.display === 'summarized') return visibleReasoning('summary')
+    if (evidence.display === 'omitted') {
+      return absentReasoning('summary', 'request-display')
+    }
+    if (policy.kind === 'anthropic-summary' && policy.directDefault === 'omitted') {
+      return absentReasoning('summary', 'provider-default')
+    }
+    return visibleReasoning(reasoningVisibleKindForPolicy(policy))
+  }
+  if (evidence.activation === 'disabled') {
+    return absentReasoning(reasoningVisibleKindForPolicy(policy), 'disabled')
+  }
+  if (evidence.activation === 'excluded') {
+    return absentReasoning(reasoningVisibleKindForPolicy(policy), 'request-display')
+  }
+  const expectedVisibleKind = reasoningVisibleKindForPolicy(policy)
+  if (
+    evidence.dialect === 'openai-chat' &&
+    (policy.kind === 'hidden-on-chat' || expectedVisibleKind === 'summary')
+  ) {
+    return absentReasoning(expectedVisibleKind, 'api-mode')
+  }
+  if (expectedVisibleKind === 'summary' && evidence.display === 'request-omitted') {
+    return absentReasoning(expectedVisibleKind, 'request-display')
+  }
+  if (expectedVisibleKind === 'summary' && evidence.display === 'provider-default-omitted') {
+    return absentReasoning(expectedVisibleKind, 'provider-default')
+  }
+  return visibleReasoning(expectedVisibleKind)
+}
+
+function reasoningVisibleKindForPolicy(policy: ReasoningVisibilityPolicy): ReasoningVisibleKind {
+  if (policy.kind === 'uniform') return policy.visibleKind
+  if (policy.kind === 'hidden-on-chat') return policy.otherwise
+  return 'summary'
+}
+
+function visibleReasoning(visibleKind: ReasoningVisibleKind): InboundReasoningVisibility {
+  return Object.freeze({ disclosure: 'visible', visibleKind })
+}
+
+function absentReasoning(
+  unexpectedVisibleKind: ReasoningVisibleKind,
+  reason: Extract<InboundReasoningVisibility, { disclosure: 'absent' }>['reason'],
+): InboundReasoningVisibility {
+  return Object.freeze({ disclosure: 'absent', unexpectedVisibleKind, reason })
+}
+
+export function messageContextRouteFacts(input: {
+  content: Message['content']
+  generation?: Message['generation']
+  reasoningEnvelope?: ReasoningEnvelopeV2
+  providerOutputItems?: readonly ProviderOutputItem[]
+  toolCalls?: Message['toolCalls']
+  phase?: Message['phase']
+  continuationAttempts?: Message['continuationAttempts']
+}): MessageContextRouteFacts {
+  return messageContextRouteFactsFromView(createAppliedMessageView(input))
+}
+
+export function messageContextRouteFactsFromView(
+  view: AppliedMessageView,
+): MessageContextRouteFacts {
+  return collectMessageContextRouteFacts(view.attempts)
+}
+
+function collectMessageContextRouteFacts(
+  inputs: Iterable<{
+    reasoningEnvelope?: ReasoningEnvelopeV2
+    providerOutputItems?: readonly ProviderOutputItem[]
+  }>,
+): MessageContextRouteFacts {
+  const carriers = new Map<string, ReasoningCarrierRouteFact>()
+  let hasOpenAiResponsesProviderOutput = false
+  for (const input of inputs) {
+    const envelope = input.reasoningEnvelope
+    if (envelope) {
+      const topology = analyzeReasoningEnvelopeReplayTopology(envelope)
+      for (const carrier of envelope.carriers) {
+        if (reasoningCarrierTopologyOmission(carrier, topology) !== null) continue
+        const fact = Object.freeze(reasoningCarrierReplayFact(carrier, topology.visibleById))
+        carriers.set(reasoningCarrierRouteFactKey(fact), fact)
+      }
+    }
+    for (const item of input.providerOutputItems ?? []) {
+      if (item.hidden !== true && item.dialect === 'openai-responses') {
+        hasOpenAiResponsesProviderOutput = true
+      }
+    }
+  }
+  if (carriers.size === 0 && !hasOpenAiResponsesProviderOutput) {
+    return EMPTY_MESSAGE_CONTEXT_ROUTE_FACTS
+  }
+  return Object.freeze({
+    reasoningCarriers: Object.freeze(
+      [...carriers.values()].sort((left, right) =>
+        reasoningCarrierRouteFactKey(left).localeCompare(reasoningCarrierRouteFactKey(right)),
+      ),
+    ),
+    hasOpenAiResponsesProviderOutput,
+  })
+}
+
+export function mergeMessageContextRouteFacts(
+  values: readonly MessageContextRouteFacts[],
+): MessageContextRouteFacts {
+  if (values.length === 0) return EMPTY_MESSAGE_CONTEXT_ROUTE_FACTS
+  const carriers = new Map<string, ReasoningCarrierRouteFact>()
+  let hasOpenAiResponsesProviderOutput = false
+  for (const value of values) {
+    for (const fact of value.reasoningCarriers) {
+      carriers.set(reasoningCarrierRouteFactKey(fact), fact)
+    }
+    hasOpenAiResponsesProviderOutput ||= value.hasOpenAiResponsesProviderOutput
+  }
+  if (carriers.size === 0 && !hasOpenAiResponsesProviderOutput) {
+    return EMPTY_MESSAGE_CONTEXT_ROUTE_FACTS
+  }
+  return Object.freeze({
+    reasoningCarriers: Object.freeze(
+      [...carriers.values()].sort((left, right) =>
+        reasoningCarrierRouteFactKey(left).localeCompare(reasoningCarrierRouteFactKey(right)),
+      ),
+    ),
+    hasOpenAiResponsesProviderOutput,
+  })
+}
+
+function reasoningCarrierRouteFactKey(fact: ReasoningCarrierRouteFact): string {
+  return `${fact.kind}\u0000${fact.format}\u0000${fact.originDialect}\u0000${fact.producerBridge}\u0000${fact.binding}`
+}
+
+export function contextRouteFactsFromMessages(
+  messages: readonly Pick<
+    Message,
+    | 'content'
+    | 'generation'
+    | 'reasoningEnvelope'
+    | 'providerOutputItems'
+    | 'toolCalls'
+    | 'phase'
+    | 'continuationAttempts'
+  >[],
+): MessageContextRouteFacts {
+  return collectMessageContextRouteFacts(appliedAttemptsFromMessages(messages))
+}
+
+function* appliedAttemptsFromMessages(
+  messages: Parameters<typeof contextRouteFactsFromMessages>[0],
+) {
+  for (const message of messages) {
+    yield* createAppliedMessageView(message).attempts
+  }
 }
 
 // Three-checkbox `ReasoningInclude` policy.
@@ -45,10 +492,13 @@ export function normalizeReasoningSettings(
       include: defaultReasoningInclude(undefined),
     }
   }
+  const defaults = defaultReasoningInclude(undefined)
   const needsInclude =
     input.include === undefined ||
     input.include === null ||
-    typeof input.include.encrypted !== 'boolean'
+    typeof input.include.encrypted !== 'boolean' ||
+    typeof input.include.summary !== 'boolean' ||
+    typeof input.include.text !== 'boolean'
   const needsMode = input.mode === undefined
   const needsExclude = input.exclude === undefined
   if (!needsInclude && !needsMode && !needsExclude) {
@@ -59,38 +509,18 @@ export function normalizeReasoningSettings(
     mode: input.mode ?? 'default',
     exclude: input.exclude ?? false,
     include: needsInclude
-      ? defaultReasoningInclude(undefined)
+      ? {
+          encrypted:
+            typeof input.include?.encrypted === 'boolean'
+              ? input.include.encrypted
+              : defaults.encrypted,
+          summary:
+            typeof input.include?.summary === 'boolean' ? input.include.summary : defaults.summary,
+          text: typeof input.include?.text === 'boolean' ? input.include.text : defaults.text,
+        }
       : (input.include as ReasoningInclude),
   }
   return next
-}
-
-// Per-turn filter. Drops:
-//   1. `id?.startsWith('tool_')` entries (OpenRouter mixes tool-call signatures
-//      into `reasoning_details` — they are NOT reasoning carriers).
-//   2. `reasoning.encrypted` entries when `include.encrypted === false` OR the
-//      current route can't round-trip the carrier (`preservationFormat` is
-//      undefined / `'unknown'` / mismatched against the stored `format`).
-//      Extra Anthropic scope: `reasoning.encrypted + format anthropic-claude-v1`
-//      is an Anthropic `redacted_thinking` block. Only Claude 3.7 Sonnet
-//      accepts these; when the target model's `acceptsAnthropicRedactedThinking`
-//      flag is false, drop them so Claude-3.7 safety-redactions are not
-//      leaked to Claude 4+.
-//   3. `reasoning.summary` entries when `include.summary === false`.
-//   4. `reasoning.text` entries:
-//      - When they carry a `.signature` (Anthropic's carrier lives here),
-//        they're encrypted-gated: kept iff `include.encrypted === true` AND
-//        the stored `format` matches the current route's preservation format.
-//      - Otherwise plaintext reasoning (DeepSeek inline `<think>` / OpenRouter-
-//        repackaged Gemini summary): kept iff `include.text === true`.
-// Returns the kept subset; never mutates the input.
-interface FilterReasoningOptions {
-  // Only meaningful when the target route is Anthropic. When `true`, the
-  // filter keeps `reasoning.encrypted` entries with
-  // `format: 'anthropic-claude-v1'` (Claude 3.7 Sonnet redacted_thinking).
-  // When `false`/`undefined`, it drops them — Claude 4+ doesn't produce or
-  // reliably accept redacted blocks.
-  acceptsAnthropicRedactedThinking?: boolean
 }
 
 // OpenAI direct emits `openai-responses-v1`; OpenRouter's `/responses` proxy
@@ -114,221 +544,260 @@ function formatsCompatible(stored: ReasoningFormat, target: ReasoningFormat): bo
   return false
 }
 
-export function filterReasoningForInclude(
-  details: readonly ReasoningDetail[],
-  include: ReasoningInclude,
-  preservationFormat: ReasoningFormat | undefined,
-  opts: FilterReasoningOptions = {},
-): ReasoningDetail[] {
-  // `tool_`-prefixed ids are tool-call signatures mixed into
-  // `reasoning_details` by OR, not carriers. Drop before gating.
-  // `hidden: true` entries are user-soft-hidden from echo (eye icon in
-  // InlineEditor); preserved on disk, never sent back.
-  const clean = details.filter((d) => !d.id?.startsWith('tool_') && d.hidden !== true)
-  return clean.filter((d) => {
-    if (d.type === 'reasoning.encrypted') {
-      if (!include.encrypted) return false
-      if (!preservationFormat || preservationFormat === 'unknown') return false
-      if (d.format && !formatsCompatible(d.format, preservationFormat)) {
-        warnIncompatibleFormat(d.format, preservationFormat)
-        return false
-      }
-      // Anthropic redacted_thinking block — gate on the target model flag.
-      if (preservationFormat === 'anthropic-claude-v1' && !opts.acceptsAnthropicRedactedThinking) {
-        return false
-      }
-      return true
-    }
-    if (d.type === 'reasoning.summary') return include.summary
-    // Anthropic case: `reasoning.text` with a `.signature` IS the
-    // encrypted carrier. Gate by `include.encrypted` + format check.
-    if (typeof d.signature === 'string' && d.signature.length > 0) {
-      if (!include.encrypted) return false
-      if (!preservationFormat || preservationFormat === 'unknown') return false
-      if (d.format && !formatsCompatible(d.format, preservationFormat)) {
-        warnIncompatibleFormat(d.format, preservationFormat)
-        return false
-      }
-      return true
-    }
-    return include.text
-  })
+export function mergeSealedReasoningCarryForward(
+  left: SealedReasoningCarryForward,
+  right: SealedReasoningCarryForward,
+): SealedReasoningCarryForward {
+  if (left === 'carrier' || right === 'carrier') return 'carrier'
+  if (left === 'visible-only' || right === 'visible-only') return 'visible-only'
+  return 'none'
 }
 
-// Console-only surface for "an encrypted reasoning blob was dropped because
-// the target route doesn't accept its family tag." No UI banner — the drop
-// is silent per user directive. Gated on dev so prod consoles stay quiet.
-function warnIncompatibleFormat(stored: ReasoningFormat, target: ReasoningFormat): void {
-  if (typeof console === 'undefined') return
-
-  console.warn(
-    `[reasoning] dropping encrypted reasoning — stored format ${stored} is not compatible with target ${target}. Switching providers / bridges mid-chat invalidates opaque carriers.`,
-  )
+export function sealedReasoningCarryForwardEvidence(
+  value: SealedReasoningCarryForward,
+): ReasoningCarryForwardEvidence {
+  return { certainty: 'sealed', value }
 }
 
-function endsWithBlankLine(s: string | null | undefined): boolean {
-  return typeof s === 'string' && /\n\s*$/.test(s)
+export function persistedReasoningCarryForwardFromEvidence(
+  evidence: ReasoningCarryForwardEvidence,
+): PersistedReasoningCarryForward {
+  return evidence.certainty === 'sealed' ? evidence.value : 'unknown'
 }
 
-function startsWithBlankLine(s: string | null | undefined): boolean {
-  return typeof s === 'string' && /^\s*\n/.test(s)
+export function isPersistedReasoningCarryForward(
+  value: unknown,
+): value is PersistedReasoningCarryForward {
+  return value === 'none' || value === 'visible-only' || value === 'carrier' || value === 'unknown'
 }
 
-export function mergeReasoningText(
-  existingRaw: string | null | undefined,
-  incomingRaw: string | null | undefined,
-): string {
-  const existing = existingRaw ?? ''
-  const incoming = incomingRaw ?? ''
-  if (incoming.length === 0) return existing
-  if (existing.length === 0) return incoming
-  if (incoming === existing) return existing
-  if (incoming.startsWith(existing)) return incoming
-  return existing + incoming
-}
+export type ReasoningCarrierReplayOmissionReason =
+  | 'encrypted-disabled'
+  | 'target-format-absent'
+  | 'format-incompatible'
+  | 'producer-bridge-incompatible'
+  | 'binding-missing'
+  | 'carrier-unsupported'
 
-export function mergeReasoningDetail(
-  existing: ReasoningDetail | undefined,
-  incoming: ReasoningDetail,
-): ReasoningDetail {
-  if (!existing) return incoming
-  if (existing.type === 'reasoning.text' && incoming.type === 'reasoning.text') {
-    return {
-      ...existing,
-      ...incoming,
-      text: mergeReasoningText(existing.text, incoming.text),
-    }
+export type ReasoningCarrierReplayDecision =
+  | Readonly<{ kind: 'replay' }>
+  | Readonly<{ kind: 'omit'; reason: ReasoningCarrierReplayOmissionReason }>
+
+const REPLAY_REASONING_CARRIER = Object.freeze({ kind: 'replay' } as const)
+
+export function reasoningCarrierReplayDecision(
+  fact: ReasoningCarrierRouteFact,
+  contract: ReasoningReplayContract,
+): ReasoningCarrierReplayDecision {
+  if (!contract.include.encrypted) return { kind: 'omit', reason: 'encrypted-disabled' }
+  if (contract.targetFormat === null) return { kind: 'omit', reason: 'target-format-absent' }
+  if (!formatsCompatible(fact.format, contract.targetFormat)) {
+    return { kind: 'omit', reason: 'format-incompatible' }
   }
-  if (existing.type === 'reasoning.summary' && incoming.type === 'reasoning.summary') {
-    // Incremental: Responses API sends `summary_text.delta` events that
-    // append to a single summary row. Exact repeats and explicit cumulative
-    // prefix growth are idempotent; other boundary overlaps append verbatim.
-    //
-    // Gemini-family summaries: each thinking section arrives as its own
-    // entry (one per OpenRouter `reasoning_details[]` element OR one per
-    // native `thought:true` part), and they coalesce into a single
-    // continuous Summary block. Inject a `\n\n` separator when both sides
-    // have content and neither already provides one — keeps section breaks
-    // visible even when the wire didn't include trailing newlines.
-    const isGeminiCoalesce =
-      existing.format === 'google-gemini-v1' && incoming.format === 'google-gemini-v1'
-    let mergedSummary = mergeReasoningText(existing.summary, incoming.summary)
-    if (
-      isGeminiCoalesce &&
-      mergedSummary === `${existing.summary}${incoming.summary}` &&
-      existing.summary.length > 0 &&
-      incoming.summary.length > 0 &&
-      !endsWithBlankLine(existing.summary) &&
-      !startsWithBlankLine(incoming.summary)
-    ) {
-      mergedSummary = `${existing.summary}\n\n${incoming.summary}`
-    }
-    return {
-      ...existing,
-      ...incoming,
-      summary: mergedSummary,
-    }
+  if (!producerBridgeCanReplay(fact, contract.producerBridge)) {
+    return { kind: 'omit', reason: 'producer-bridge-incompatible' }
   }
-  if (existing.type === 'reasoning.encrypted' && incoming.type === 'reasoning.encrypted') {
-    return { ...existing, ...incoming }
-  }
-  return incoming
-}
-
-export function normalizeReasoningDetails(details: ReasoningDetail[]): ReasoningDetail[] {
-  // Persisted rows are already stream-reduced. Keep their order, identity,
-  // metadata, and payload bytes; only apply provider-specific relabeling to
-  // each row independently. Ambiguous deduplication cannot be repaired after
-  // it guesses wrong, and this helper is also used by rendering and budgets.
-  return details.map(normalizeIncomingReasoningDetail)
-}
-
-// On-ingest relabel: OpenRouter returns Gemini 3 thought SUMMARIES tagged
-// `type: "reasoning.text"` (format `google-gemini-v1`). Gemini 3 never emits
-// raw chain-of-thought, only summaries, so the `.text` label is misleading
-// and makes the Include-controls inconsistent (gating on `include.text`
-// instead of `include.summary`). Re-tag on the way in.
-//
-// Guards:
-//   - Only when format is `google-gemini-v1` (Anthropic signed reasoning.text
-//     also uses `.text` and MUST be preserved verbatim — the `.signature`
-//     IS the encrypted carrier).
-//   - Skip entries that carry a `.signature` for the same reason.
-export function normalizeIncomingReasoningDetail(detail: ReasoningDetail): ReasoningDetail {
-  if (
-    detail.type === 'reasoning.text' &&
-    detail.format === 'google-gemini-v1' &&
-    !detail.signature
-  ) {
-    const { text, ...rest } = detail
-    return {
-      ...rest,
-      type: 'reasoning.summary',
-      summary: text ?? '',
-    }
-  }
-  return detail
-}
-
-export function findMergeTargetIndex(
-  details: ReasoningDetail[],
-  incoming: ReasoningDetail,
-): number {
-  for (let index = details.length - 1; index >= 0; index -= 1) {
-    const existing = details[index]
-    if (!existing || existing.type !== incoming.type) continue
-    if ((existing.id || incoming.id) && existing.id !== incoming.id) continue
-    if (shareIdentity(existing, incoming)) return index
-    if (incoming.type === 'reasoning.summary' && existing.type === 'reasoning.summary') {
-      // Two Gemini-family summaries belong to the same logical reasoning
-      // row regardless of index: Gemini emits each thinking section as its
-      // own atomic part, and the UI wants one continuous Summary, not
-      // one block per section. OpenRouter's Gemini path reuses index=0
-      // across all thought summaries; native-Gemini's path also keys
-      // everything under summaryIndex=0 (see splitGeminiPart). Either way
-      // these all coalesce.
-      if (existing.format === 'google-gemini-v1' && incoming.format === 'google-gemini-v1') {
-        return index
+  if (fact.binding === 'missing') return { kind: 'omit', reason: 'binding-missing' }
+  switch (contract.carrier) {
+    case 'plaintext-only':
+      return { kind: 'omit', reason: 'carrier-unsupported' }
+    case 'responses-items':
+      return fact.kind === 'responses-encrypted'
+        ? REPLAY_REASONING_CARRIER
+        : { kind: 'omit', reason: 'carrier-unsupported' }
+    case 'anthropic-blocks':
+      if (fact.kind === 'anthropic-signature') {
+        return fact.binding === 'resolved'
+          ? REPLAY_REASONING_CARRIER
+          : { kind: 'omit', reason: 'binding-missing' }
       }
-      // Backcompat: some older streams persisted successive snapshots of the
-      // SAME OpenAI/OpenRouter summary as separate rows without a stable id.
-      // Collapse only strict prefix growth when both rows sit on the same index.
-      if (
-        existing.index !== undefined &&
-        incoming.index !== undefined &&
-        existing.index === incoming.index
-      ) {
-        if (
-          isOpenAiResponsesFamilyFormat(existing.format) &&
-          isOpenAiResponsesFamilyFormat(incoming.format)
-        ) {
-          return index
+      return fact.kind === 'anthropic-redacted' && contract.acceptsAnthropicRedactedThinking
+        ? REPLAY_REASONING_CARRIER
+        : { kind: 'omit', reason: 'carrier-unsupported' }
+    case 'gemini-parts':
+      return fact.kind === 'gemini-thought-signature'
+        ? REPLAY_REASONING_CARRIER
+        : { kind: 'omit', reason: 'carrier-unsupported' }
+    case 'openrouter-reasoning-details':
+      switch (fact.kind) {
+        case 'responses-encrypted':
+        case 'gemini-thought-signature':
+          return REPLAY_REASONING_CARRIER
+        case 'anthropic-signature':
+          return fact.binding === 'resolved'
+            ? REPLAY_REASONING_CARRIER
+            : { kind: 'omit', reason: 'binding-missing' }
+        case 'anthropic-redacted':
+          return contract.acceptsAnthropicRedactedThinking
+            ? REPLAY_REASONING_CARRIER
+            : { kind: 'omit', reason: 'carrier-unsupported' }
+        case 'unknown':
+          return { kind: 'omit', reason: 'carrier-unsupported' }
+        default: {
+          const unreachable: never = fact.kind
+          return unreachable
         }
-        const merged = mergeReasoningText(existing.summary, incoming.summary)
-        const appended = `${existing.summary}${incoming.summary}`
-        if (merged !== appended) return index
       }
+    default: {
+      const unreachable: never = contract.carrier
+      return unreachable
+    }
+  }
+}
+
+function reasoningCarrierIsIndependentlyHidden(carrier: OpaqueReasoningCarrierV2): boolean {
+  return carrier.kind !== 'anthropic-signature' && carrier.hidden === true
+}
+
+export function reasoningCarrierReplayFact(
+  carrier: OpaqueReasoningCarrierV2,
+  visibleById: ReadonlyMap<string, ReasoningEnvelopeV2['visible'][number]>,
+): ReasoningCarrierRouteFact {
+  return {
+    kind: carrier.kind,
+    format: carrier.format,
+    originDialect: carrier.source.dialect,
+    producerBridge: carrier.source.bridge,
+    binding: reasoningCarrierBinding(carrier, visibleById),
+  }
+}
+
+export function analyzeReasoningEnvelopeReplayTopology(
+  envelope: ReasoningEnvelopeV2,
+): ReasoningEnvelopeReplayTopology {
+  const visibleById = new Map(envelope.visible.map((part) => [part.id, part] as const))
+  const visibleByGroup = new Map<string, ReasoningEnvelopeV2['visible'][number][]>()
+  for (const part of envelope.visible) {
+    const group = visibleByGroup.get(part.groupId)
+    if (group) group.push(part)
+    else visibleByGroup.set(part.groupId, [part])
+  }
+  const duplicateCarrierIds = new Set<string>()
+  const ambiguousCarrierIds = new Set<string>()
+  const ambiguousVisiblePartIds = new Set<string>()
+  const bindingGroups = new Map<string, OpaqueReasoningCarrierV2[]>()
+  for (const carrier of envelope.carriers) {
+    const key = carrierTopologyGroupKey(carrier)
+    if (key === null) continue
+    const group = bindingGroups.get(key)
+    if (group) group.push(carrier)
+    else bindingGroups.set(key, [carrier])
+  }
+  for (const [key, groupedCarriers] of bindingGroups) {
+    const first = groupedCarriers[0]
+    if (!first) continue
+    if (
+      first.kind === 'gemini-thought-signature' &&
+      first.bindsVisiblePartId === undefined &&
+      eligibleVisibleParts(visibleByGroup.get(first.groupId) ?? []).length > 1
+    ) {
+      for (const carrier of groupedCarriers) ambiguousCarrierIds.add(carrier.id)
       continue
     }
-    if (incoming.type === 'reasoning.encrypted' && existing.type === 'reasoning.encrypted') {
-      if (existing.data === incoming.data) return index
+    if (groupedCarriers.length < 2) continue
+    const firstIdentity = replayCarrierIdentity(first)
+    if (groupedCarriers.every((carrier) => replayCarrierIdentity(carrier) === firstIdentity)) {
+      for (const carrier of groupedCarriers.slice(1)) duplicateCarrierIds.add(carrier.id)
+      continue
+    }
+    for (const carrier of groupedCarriers) ambiguousCarrierIds.add(carrier.id)
+    if (key.startsWith('anthropic:') && first.kind === 'anthropic-signature') {
+      ambiguousVisiblePartIds.add(first.bindsVisiblePartId)
     }
   }
-  return -1
+  return {
+    visibleById,
+    visibleByGroup,
+    duplicateCarrierIds,
+    ambiguousCarrierIds,
+    ambiguousVisiblePartIds,
+  }
 }
 
-function shareIdentity(existing: ReasoningDetail, incoming: ReasoningDetail): boolean {
-  if (existing.type !== incoming.type) return false
-  if (existing.id || incoming.id) return existing.id === incoming.id
-  // Summaries are content-addressed: each summary part is its own row.
-  // Two summaries that happen to carry the same `index` (OpenRouter's
-  // Gemini path reuses index=0 across all thought summaries) are NOT the
-  // same block. `findMergeTargetIndex` falls through to a content-equality
-  // check below, and distinct summaries end up as distinct rows.
-  if (existing.type === 'reasoning.summary') return false
+export function reasoningCarrierTopologyOmission(
+  carrier: OpaqueReasoningCarrierV2,
+  topology: ReasoningEnvelopeReplayTopology,
+): ReasoningCarrierTopologyOmissionReason | null {
+  if (topology.duplicateCarrierIds.has(carrier.id)) return 'duplicate'
+  if (topology.ambiguousCarrierIds.has(carrier.id)) return 'ambiguous-binding'
+  if (reasoningCarrierIsIndependentlyHidden(carrier)) return 'hidden'
+  return reasoningCarrierPayload(carrier).length === 0 ? 'empty-payload' : null
+}
+
+function carrierTopologyGroupKey(carrier: OpaqueReasoningCarrierV2): string | null {
+  if (carrier.kind === 'anthropic-signature') {
+    return `anthropic:${carrier.bindsVisiblePartId}`
+  }
+  if (carrier.kind === 'gemini-thought-signature') {
+    return `gemini:${carrier.bindsVisiblePartId ?? `group:${carrier.groupId}`}`
+  }
+  if (carrier.kind === 'responses-encrypted') {
+    if (carrier.source.itemId) return `responses:item:${carrier.source.itemId}`
+    const outputIndex = carrier.source.outputIndex ?? carrier.source.detailIndex
+    return outputIndex === undefined ? null : `responses:output:${outputIndex}`
+  }
+  return null
+}
+
+function eligibleVisibleParts(
+  parts: readonly ReasoningEnvelopeV2['visible'][number][],
+): readonly ReasoningEnvelopeV2['visible'][number][] {
+  return parts.filter((part) => part.hidden !== true && part.text.length > 0)
+}
+
+function replayCarrierIdentity(carrier: OpaqueReasoningCarrierV2): string {
+  const binding =
+    carrier.kind === 'anthropic-signature' || carrier.kind === 'gemini-thought-signature'
+      ? (carrier.bindsVisiblePartId ?? '')
+      : ''
+  return [
+    carrier.kind,
+    carrier.format,
+    carrier.groupId,
+    carrier.source.dialect,
+    carrier.source.bridge,
+    binding,
+    reasoningCarrierPayload(carrier),
+  ].join('\u0000')
+}
+
+function reasoningCarrierPayload(carrier: OpaqueReasoningCarrierV2): string {
+  return carrier.kind === 'anthropic-signature' ? carrier.signature : carrier.data
+}
+
+function producerBridgeCanReplay(
+  fact: ReasoningCarrierRouteFact,
+  target: ReasoningProducerBridge,
+): boolean {
+  if (
+    fact.producerBridge === target &&
+    (target === 'openrouter' ||
+      target === 'openai-direct' ||
+      target === 'anthropic-direct' ||
+      target === 'google-direct')
+  ) {
+    return true
+  }
   return (
-    existing.index !== undefined &&
-    incoming.index !== undefined &&
-    existing.index === incoming.index
+    fact.producerBridge === 'google-direct' &&
+    target === 'openrouter' &&
+    fact.kind === 'gemini-thought-signature' &&
+    fact.format === 'google-gemini-v1'
   )
+}
+
+function reasoningCarrierBinding(
+  carrier: OpaqueReasoningCarrierV2,
+  visibleById: ReadonlyMap<string, ReasoningEnvelopeV2['visible'][number]>,
+): ReasoningCarrierRouteFact['binding'] {
+  if (carrier.kind === 'anthropic-signature') {
+    const visible = visibleById.get(carrier.bindsVisiblePartId)
+    return visible && visible.hidden !== true && visible.text.length > 0 ? 'resolved' : 'missing'
+  }
+  if (carrier.kind === 'gemini-thought-signature') {
+    if (carrier.bindsVisiblePartId === undefined) return 'unbound'
+    const visible = visibleById.get(carrier.bindsVisiblePartId)
+    return visible && visible.hidden !== true && visible.text.length > 0 ? 'resolved' : 'missing'
+  }
+  return 'not-required'
 }

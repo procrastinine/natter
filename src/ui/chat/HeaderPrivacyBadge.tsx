@@ -4,14 +4,11 @@
 // popover listing the kept providers and their policies. Hidden for
 // non-OpenRouter connections and for free models.
 
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { PrivacyTier } from '../../core/privacy-filter'
-import { providerDisplayLabel, providerEndpointKey } from '../../core/provider-identity'
-import type { Chat, ChatId } from '../../core/types'
-import { usePrivacyRouting } from '../../hooks/usePrivacyRouting'
-import { getChat } from '../../store/chats'
-import { chatRowDependencies } from '../../store/reactive-dependencies'
-import { useRepositoryQuery } from '../../store/reactive-query'
+import { ProviderEndpointIndex, providerEndpointKey } from '../../core/provider-identity'
+import type { Chat } from '../../core/types'
+import type { UsePrivacyRoutingResult } from '../../hooks/useModelCatalog'
 import { CloseIcon, LockIcon, LockOpenIcon } from '../icons/Icon'
 import { IconButton } from '../primitives/Button'
 import {
@@ -22,26 +19,18 @@ import {
 } from '../settings/provider-picker-rows'
 
 interface HeaderPrivacyBadgeProps {
-  chatId: ChatId
+  chat: Chat
+  routing: UsePrivacyRoutingResult
 }
 
-export function HeaderPrivacyBadge({ chatId }: HeaderPrivacyBadgeProps) {
-  const chat = useRepositoryQuery(
-    JSON.stringify(['chat', chatId]),
-    () => getChat(chatId),
-    undefined,
-    chatRowDependencies(chatId),
-  )
-  if (!chat) return null
-  return <Inner chat={chat} />
-}
-
-function Inner({ chat }: { chat: Chat }) {
-  const routing = usePrivacyRouting(chat)
-  const { filter, endpoints, scrapeApplicable, isFreeModel, loading } = routing
+export function HeaderPrivacyBadge({ chat, routing }: HeaderPrivacyBadgeProps) {
+  const { loading, privacyPresentation } = routing
+  const { filter, endpoints, scrapeApplicable, isFreeModel, retained, settings } =
+    privacyPresentation
   const [open, setOpen] = useState(false)
   const btnRef = useRef<HTMLButtonElement | null>(null)
   const popRef = useRef<HTMLDivElement | null>(null)
+  const endpointIndex = useMemo(() => new ProviderEndpointIndex(endpoints), [endpoints])
 
   // Dismiss on outside-click / Escape — standard popover behavior so the
   // badge doesn't swallow keyboard focus or trap clicks when the user
@@ -74,7 +63,9 @@ function Inner({ chat }: { chat: Chat }) {
         data-ui="icon-button"
         data-ui-surface="header-privacy-badge"
         data-privacy-tier="open"
+        data-routing-presentation={retained ? 'retained' : 'current'}
         aria-label="Privacy: free model (routing unfiltered)"
+        aria-busy={loading}
         title="Privacy routing is disabled on :free models"
         disabled
       >
@@ -93,8 +84,8 @@ function Inner({ chat }: { chat: Chat }) {
   // from "unavailable" to real tier on arrival.
   const rows = filter
     ? buildPickerRows(endpoints, filter, {
-        providerPrefs: chat.settings.providerPrefs,
-        privacy: chat.settings.privacy,
+        providerPrefs: settings?.providerPrefs ?? chat.settings.providerPrefs,
+        privacy: settings?.privacy ?? chat.settings.privacy,
       })
     : []
   const kept = rows.filter((r) => r.state === 'kept')
@@ -102,7 +93,10 @@ function Inner({ chat }: { chat: Chat }) {
   const label = kept.length === 0 && !loading ? 'No eligible providers' : tierToLockLabel(badgeTier)
 
   return (
-    <div data-ui="header-privacy-badge">
+    <div
+      data-ui="header-privacy-badge"
+      data-routing-presentation={retained ? 'retained' : 'current'}
+    >
       <IconButton
         ref={btnRef}
         type="button"
@@ -110,7 +104,9 @@ function Inner({ chat }: { chat: Chat }) {
         data-privacy-tier={badgeTier}
         aria-label={`Privacy: ${label}`}
         aria-expanded={open}
+        aria-busy={loading}
         title={label}
+        disabled={retained}
         onClick={() => setOpen((v) => !v)}
       >
         <LockIcon size={18} />
@@ -119,8 +115,10 @@ function Inner({ chat }: { chat: Chat }) {
         <div
           ref={popRef}
           data-ui="header-privacy-popover"
+          data-routing-presentation={retained ? 'retained' : 'current'}
           role="dialog"
           aria-label="Privacy summary"
+          aria-busy={loading || retained}
         >
           <div data-ui="header-privacy-popover-header">
             <span>Privacy</span>
@@ -140,7 +138,11 @@ function Inner({ chat }: { chat: Chat }) {
             ) : (
               <ul data-ui="header-privacy-list">
                 {rows.map((r) => (
-                  <PopoverRow key={providerEndpointKey(r.endpoint)} row={r} endpoints={endpoints} />
+                  <PopoverRow
+                    key={providerEndpointKey(r.endpoint)}
+                    row={r}
+                    endpointIndex={endpointIndex}
+                  />
                 ))}
               </ul>
             )}
@@ -153,10 +155,10 @@ function Inner({ chat }: { chat: Chat }) {
 
 function PopoverRow({
   row,
-  endpoints,
+  endpointIndex,
 }: {
   row: PickerRow
-  endpoints: readonly PickerRow['endpoint'][]
+  endpointIndex: ProviderEndpointIndex
 }) {
   const isKept = row.state === 'kept'
   const tip = isKept
@@ -174,7 +176,7 @@ function PopoverRow({
       <span data-ui="header-privacy-row-lock" data-privacy-tier={row.tier}>
         <LockIcon size={12} />
       </span>
-      <span data-ui="header-privacy-row-name">{providerDisplayLabel(row.endpoint, endpoints)}</span>
+      <span data-ui="header-privacy-row-name">{endpointIndex.displayLabel(row.endpoint)}</span>
       <span data-ui="header-privacy-row-state">{isKept ? 'in use' : 'excluded'}</span>
     </li>
   )

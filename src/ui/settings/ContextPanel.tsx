@@ -18,21 +18,27 @@
 //   Overflow never fails, trimming is always done locally; middle-out is
 //   additive (server-side compression of what remains).
 //
-// All values are pinned to the effective capability; `validateChatSettings`
-// re-clamps when the model changes.
+// Visible values are pinned to the effective capability. Request planning
+// derives a clamped snapshot without rewriting stored preferences on mount.
 
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useEffect, useState } from 'react'
+import {
+  configurationWriteInteraction,
+  configurationWriteTarget,
+} from '../../app/presentation-interactions'
 import type { EffectiveCapability } from '../../core/capabilities'
+import type { ChatSettingsFieldPatch } from '../../core/chat-metadata'
 import { type PromptSizeEstimate, UNLIMITED_CONTEXT } from '../../core/prompt-size'
-import type { Chat } from '../../core/types'
-import { updateChatSettings } from '../../store/chats'
+import type { Chat, ChatId } from '../../core/types'
+import { usePresentationInteraction } from '../../hooks/usePresentationInteraction'
+import { useSettledChatSettingsEdit } from '../../hooks/useSettledConfigurationEdit'
+import { configurationApplication } from '../../store/configuration-application'
 import { Button } from '../primitives/Button'
 import { InfoDisclosure } from './InfoDisclosure'
 
 interface ContextPanelProps {
   chat: Chat
   capability: EffectiveCapability | null
-  endpointTokenizer: string | null | undefined
   estimateOverride: PromptSizeEstimate | null
   // Middle-out is an OpenRouter plugin (`plugins:[{id:'context-compression'}]`);
   // the checkbox only makes sense on an OpenRouter connection.
@@ -45,7 +51,22 @@ export function ContextPanel({
   estimateOverride,
   showMiddleOut = false,
 }: ContextPanelProps) {
+  const { run: runConfigurationWrite } = usePresentationInteraction(configurationWriteInteraction, {
+    observePending: false,
+  })
   const estimate = estimateOverride
+  const keepFirstPairsEdit = useSettledChatSettingsEdit({
+    chatId: chat.id,
+    fieldKey: 'contextStrategy.keepFirstPairs',
+    storedValue: chat.settings.contextStrategy.keepFirstPairs ?? 0,
+    patches: (value) => [{ path: ['contextStrategy', 'keepFirstPairs'], value }],
+  })
+  const mediaEchoEdit = useSettledChatSettingsEdit({
+    chatId: chat.id,
+    fieldKey: 'mediaEchoN',
+    storedValue: chat.settings.mediaEchoN ?? 5,
+    patches: (value) => [{ path: ['mediaEchoN'], value }],
+  })
 
   if (!chat.settings.model) {
     return (
@@ -111,7 +132,7 @@ export function ContextPanel({
       ? 0
       : (storedMaxCompletionRaw ?? Math.min(4096, modelCompletionCap))
   const strategy = chat.settings.contextStrategy
-  const keepFirstPairs = strategy.keepFirstPairs ?? 0
+  const keepFirstPairs = keepFirstPairsEdit.value
   const useMiddleOut = strategy.useOpenRouterMiddleOut === true
   const effectivePromptBudget = Number.isFinite(effectiveMax)
     ? Math.max(0, effectiveMax - storedMaxCompletion)
@@ -131,8 +152,26 @@ export function ContextPanel({
         ? 'warn'
         : 'ok'
 
-  const updateStrategy = (patch: Partial<typeof strategy>) =>
-    void updateChatSettings(chat.id, { contextStrategy: { ...strategy, ...patch } })
+  const updateStrategy = (patch: Partial<typeof strategy>) => {
+    const fields = Object.entries(patch)
+    runConfigurationWrite({
+      target: configurationWriteTarget(
+        chat.id,
+        fields
+          .map(([key]) => `contextStrategy.${key}`)
+          .sort()
+          .join('+'),
+      ),
+      action: () =>
+        configurationApplication.patchChatSettingsFields(
+          chat.id,
+          fields.map(([key, value]) => ({
+            path: ['contextStrategy', key],
+            value,
+          })),
+        ),
+    })
+  }
 
   return (
     <section data-ui="settings-section" data-ui-section="context-control">
@@ -145,7 +184,7 @@ export function ContextPanel({
         aria-valuemin={0}
         aria-valuemax={effectivePromptBudget}
         aria-label="Estimated prompt tokens used"
-        title="Approximate: history may use provider-reported usage; draft text and media use tokenizer-family heuristics."
+        title="Approximate persisted-branch estimate: history may use provider-reported usage and media uses tokenizer-family heuristics. The complete current composer payload is included in fresh request planning when sent."
       >
         <div
           data-ui="context-gauge-fill"
@@ -193,43 +232,35 @@ export function ContextPanel({
             <em>tools</em> {estimate.toolCallTokens.toLocaleString()}
           </span>
         ) : null}
-        {estimate.draftTokens > 0 ? (
-          <span>
-            <em>draft</em> {estimate.draftTokens.toLocaleString()}
-          </span>
-        ) : null}
         <span data-ui="context-model-cap">
           <em>cap</em> {modelCap.toLocaleString()}
         </span>
       </div>
 
       <NumberSlider
+        chatId={chat.id}
+        fieldKey="customMaxContext"
         label="Max context"
         value={customMaxUnlimited ? UNLIMITED_CONTEXT : customMax}
         min={1024}
         max={modelPromptCap}
         allowUnlimited
         unlimitedHint="Typing -1 disables the local cap (provider limits still apply; pair with middle-out compression for long chats)."
-        onCommit={(v) => {
+        patches={(v) => {
           if (v === UNLIMITED_CONTEXT) {
-            void updateChatSettings(chat.id, { customMaxContext: UNLIMITED_CONTEXT })
-            return
+            return [{ path: ['customMaxContext'], value: UNLIMITED_CONTEXT }]
           }
           const next = Math.min(Math.max(1024, v), modelPromptCap)
           if (next >= modelPromptCap) {
-            // Removing customMaxContext (rather than clamping to modelPromptCap)
-            // lets the chat follow the model cap on future model swaps.
-            // exactOptionalPropertyTypes rejects `undefined` as a value here,
-            // so a cast is required to write the deleted key.
-            const patch = { customMaxContext: undefined } as unknown as Partial<Chat['settings']>
-            void updateChatSettings(chat.id, patch)
-          } else {
-            void updateChatSettings(chat.id, { customMaxContext: next })
+            return [{ path: ['customMaxContext'] }]
           }
+          return [{ path: ['customMaxContext'], value: next }]
         }}
       />
 
       <NumberSlider
+        chatId={chat.id}
+        fieldKey="maxCompletionTokens"
         label="Max completion"
         value={
           storedMaxCompletionRaw === UNLIMITED_CONTEXT ? UNLIMITED_CONTEXT : storedMaxCompletion
@@ -238,13 +269,12 @@ export function ContextPanel({
         max={modelCompletionCap}
         allowUnlimited
         unlimitedHint="Typing -1 removes the local completion cap (provider limits still apply)."
-        onCommit={(v) => {
+        patches={(v) => {
           if (v === UNLIMITED_CONTEXT) {
-            void updateChatSettings(chat.id, { maxCompletionTokens: UNLIMITED_CONTEXT })
-            return
+            return [{ path: ['maxCompletionTokens'], value: UNLIMITED_CONTEXT }]
           }
           const next = Math.min(Math.max(1, v), modelCompletionCap)
-          void updateChatSettings(chat.id, { maxCompletionTokens: next })
+          return [{ path: ['maxCompletionTokens'], value: next }]
         }}
       />
 
@@ -260,8 +290,9 @@ export function ContextPanel({
           step={1}
           onChange={(e) => {
             const n = Number(e.target.value)
-            if (Number.isFinite(n) && n >= 0) updateStrategy({ keepFirstPairs: Math.floor(n) })
+            if (Number.isFinite(n) && n >= 0) keepFirstPairsEdit.setValue(Math.floor(n))
           }}
+          onBlur={keepFirstPairsEdit.onBlur}
         />
       </label>
 
@@ -301,8 +332,12 @@ export function ContextPanel({
               data-ui="segmented-option"
               aria-pressed={chat.settings.mediaContextStrategy === value}
               onClick={() =>
-                void updateChatSettings(chat.id, {
-                  mediaContextStrategy: value,
+                runConfigurationWrite({
+                  target: configurationWriteTarget(chat.id, 'mediaContextStrategy'),
+                  action: () =>
+                    configurationApplication.patchChatSettings(chat.id, {
+                      mediaContextStrategy: value,
+                    }),
                 })
               }
             >
@@ -320,12 +355,13 @@ export function ContextPanel({
               type="number"
               min={1}
               step={1}
-              value={chat.settings.mediaEchoN ?? 5}
+              value={mediaEchoEdit.value}
               onChange={(event) => {
                 const value = Number(event.target.value)
                 if (!Number.isFinite(value) || value < 1) return
-                void updateChatSettings(chat.id, { mediaEchoN: Math.floor(value) })
+                mediaEchoEdit.setValue(Math.floor(value))
               }}
+              onBlur={mediaEchoEdit.onBlur}
             />
           </label>
         ) : null}
@@ -335,85 +371,58 @@ export function ContextPanel({
 }
 
 function NumberSlider({
+  chatId,
+  fieldKey,
   label,
   value,
   min,
   max,
-  onCommit,
+  patches,
   allowUnlimited = false,
   unlimitedHint,
 }: {
+  chatId: ChatId
+  fieldKey: string
   label: string
   value: number
   min: number
   max: number
-  onCommit: (v: number) => void
+  patches: (v: number) => readonly ChatSettingsFieldPatch[]
   // When true, the numeric input accepts `-1` as a sentinel for "no local
   // cap" (`UNLIMITED_CONTEXT`). The slider visually sits at max but the
   // stored value stays at -1 so preset round-trip preserves intent.
   allowUnlimited?: boolean
   unlimitedHint?: string
 }) {
-  const isUnlimited = allowUnlimited && value === UNLIMITED_CONTEXT
-  const committedSliderValue = isUnlimited ? max : Math.min(max, Math.max(min, value))
-  const [draft, setDraft] = useState(isUnlimited ? '-1' : String(value))
-  const [sliderValue, setSliderValue] = useState(committedSliderValue)
-  const lastRequestedValueRef = useRef(value)
-  const lastRequestedSliderValueRef = useRef(committedSliderValue)
+  const edit = useSettledChatSettingsEdit({
+    chatId,
+    fieldKey,
+    storedValue: value,
+    patches,
+  })
+  const isUnlimited = allowUnlimited && edit.value === UNLIMITED_CONTEXT
+  const sliderValue = isUnlimited ? max : Math.min(max, Math.max(min, edit.value))
+  const [draft, setDraft] = useState(isUnlimited ? '-1' : String(edit.value))
   useEffect(() => {
-    setDraft(isUnlimited ? '-1' : String(value))
-    setSliderValue(committedSliderValue)
-    lastRequestedValueRef.current = value
-    lastRequestedSliderValueRef.current = committedSliderValue
-  }, [isUnlimited, value, committedSliderValue])
-
-  const commitSliderDraft = useCallback(() => {
-    const clamped = Math.min(Math.max(sliderValue, min), max)
-    if (clamped === lastRequestedSliderValueRef.current) return
-    lastRequestedValueRef.current = clamped
-    lastRequestedSliderValueRef.current = clamped
-    onCommit(clamped)
-  }, [sliderValue, min, max, onCommit])
-  const unmountCommitRef = useRef(commitSliderDraft)
-  unmountCommitRef.current = commitSliderDraft
-
-  useEffect(() => {
-    return () => unmountCommitRef.current()
-  }, [])
-
-  useEffect(() => {
-    if (sliderValue === committedSliderValue) return
-    const id = window.setTimeout(() => {
-      commitSliderDraft()
-    }, SLIDER_COMMIT_DEBOUNCE_MS)
-    return () => window.clearTimeout(id)
-  }, [sliderValue, committedSliderValue, commitSliderDraft])
+    setDraft(isUnlimited ? '-1' : String(edit.value))
+  }, [edit.value, isUnlimited])
 
   const commitFromDraft = () => {
     const n = Number(draft)
     if (!Number.isFinite(n)) {
-      setDraft(isUnlimited ? '-1' : String(value))
-      setSliderValue(committedSliderValue)
+      setDraft(isUnlimited ? '-1' : String(edit.value))
       return
     }
     if (allowUnlimited && n <= UNLIMITED_CONTEXT) {
-      if (lastRequestedValueRef.current !== UNLIMITED_CONTEXT) {
-        lastRequestedValueRef.current = UNLIMITED_CONTEXT
-        lastRequestedSliderValueRef.current = max
-        onCommit(UNLIMITED_CONTEXT)
-      }
+      edit.setValue(UNLIMITED_CONTEXT)
       setDraft('-1')
-      setSliderValue(max)
+      edit.onBlur()
       return
     }
     const clamped = Math.min(Math.max(n, min), max)
-    if (clamped !== lastRequestedValueRef.current) {
-      lastRequestedValueRef.current = clamped
-      lastRequestedSliderValueRef.current = clamped
-      onCommit(clamped)
-    }
+    edit.setValue(clamped)
     setDraft(String(clamped))
-    setSliderValue(clamped)
+    edit.onBlur()
   }
   // Step of 1 guarantees the slider hits both endpoints. Previous
   // implementation used `floor((max-min)/1000)` which left the top ~step
@@ -439,11 +448,11 @@ function NumberSlider({
         value={sliderValue}
         onChange={(e) => {
           const next = Number(e.target.value)
-          setSliderValue(next)
+          edit.setValue(next)
           setDraft(String(next))
         }}
-        onPointerUp={commitSliderDraft}
-        onBlur={commitSliderDraft}
+        onPointerUp={edit.onPointerUp}
+        onBlur={edit.onBlur}
         {...(isUnlimited ? { 'data-unlimited': 'true' } : {})}
       />
       <input
@@ -459,7 +468,7 @@ function NumberSlider({
         onKeyDown={(e) => {
           if (e.key === 'Enter') (e.target as HTMLInputElement).blur()
           if (e.key === 'Escape') {
-            setDraft(isUnlimited ? '-1' : String(value))
+            setDraft(isUnlimited ? '-1' : String(edit.value))
             ;(e.target as HTMLInputElement).blur()
           }
         }}
@@ -468,5 +477,3 @@ function NumberSlider({
     </div>
   )
 }
-
-const SLIDER_COMMIT_DEBOUNCE_MS = 200

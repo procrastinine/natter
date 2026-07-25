@@ -1,27 +1,110 @@
-import { describe, expect, it, vi } from 'vitest'
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import { splitAssistantStream } from '../../src/api/assistant-lanes'
 import type { AssistantStreamChunk } from '../../src/api/assistant-stream'
 import { ApiError } from '../../src/api/errors'
 import {
-  CONTINUE_GENERATION_ATTEMPT_ERROR_POLICY,
-  type GenerationAttemptResult,
-  type GenerationAttemptRunnerInput,
-  runGenerationAttempt,
-  SEND_GENERATION_ATTEMPT_ERROR_POLICY,
-} from '../../src/core/generation-attempt-runner'
+  type AttemptTerminalDecision,
+  type AttemptTerminalReceipt,
+  isAttemptTerminalReceipt,
+} from '../../src/core/attempt-outcome'
 import {
   createStreamAccumulator,
   projectStreamAccumulatorFinal,
   type StreamAccumulator,
   streamAccumulatorText,
 } from '../../src/core/stream-accumulator'
-import type { StreamChunkRow } from '../../src/store/repository'
 import {
-  createStreamChunkWriter,
-  type StreamChunkWriter,
+  CONTINUE_GENERATION_ATTEMPT_ERROR_POLICY,
+  type GenerationAttemptRunnerInput,
+  runGenerationAttempt,
+  SEND_GENERATION_ATTEMPT_ERROR_POLICY,
+} from '../../src/store/generation-attempt-runner'
+import {
+  createStreamJournalWriter,
+  type StreamJournalWriter,
 } from '../../src/store/stream-chunk-writer'
+import {
+  reserveWorkspaceChild,
+  runWorkspaceAction,
+  type WorkspaceWritePermit,
+  workspaceRuntimeInternal,
+} from '../../src/store/workspace-runtime'
+import {
+  anthropicRouteContract,
+  chatRouteContract,
+  geminiRouteContract,
+  responsesRouteContract,
+} from '../helpers/reasoning-contracts'
+import {
+  createLogicalStreamJournalAppendAdapter,
+  type TestSemanticJournalRow,
+} from '../helpers/stream-journal'
 
-type GenerationAttemptFinalizationInput = Parameters<GenerationAttemptRunnerInput['finalize']>[0]
+type GenerationAttemptFinalizationInput = Parameters<
+  GenerationAttemptRunnerInput['terminal']['complete']
+>[0]
+
+function runTestGenerationAttempt(
+  input: Omit<GenerationAttemptRunnerInput, 'streamContract'> &
+    Partial<Pick<GenerationAttemptRunnerInput, 'streamContract'>>,
+) {
+  return runGenerationAttempt({
+    ...input,
+    streamContract: input.streamContract ?? chatRouteContract(),
+  })
+}
+
+function terminalDouble(
+  overrides: {
+    complete?: (
+      input: GenerationAttemptFinalizationInput,
+    ) => undefined | AttemptTerminalReceipt | Promise<undefined | AttemptTerminalReceipt>
+  } = {},
+): GenerationAttemptRunnerInput['terminal'] {
+  const complete = overrides.complete
+  return {
+    complete: async (input) => {
+      const result = await complete?.(input)
+      return isAttemptTerminalReceipt(result) ? result : terminalReceipt(input)
+    },
+  }
+}
+
+function terminalReceipt(input: GenerationAttemptFinalizationInput): AttemptTerminalReceipt {
+  return {
+    version: 1,
+    finishedAt: input.finishedAt,
+    journalMaxSeq: -1,
+    journalCompleteness: 'settled',
+    decision: input.decision,
+  }
+}
+
+let writerRootPermit: WorkspaceWritePermit | undefined
+const writerRootLifetime = deferred<void>()
+let writerRootTask: Promise<void> | undefined
+
+beforeAll(async () => {
+  const fence = { workspaceId: 'generation-attempt-runner-tests', replacementEpoch: 0 }
+  workspaceRuntimeInternal.beginReconciliation(fence)
+  workspaceRuntimeInternal.finishReconciliation(fence)
+  const ready = deferred<void>()
+  writerRootTask = runWorkspaceAction('conversation-generation', async (permit) => {
+    writerRootPermit = permit
+    ready.resolve(undefined)
+    await writerRootLifetime.promise
+  })
+  await ready.promise
+})
+
+afterAll(async () => {
+  writerRootLifetime.resolve(undefined)
+  await writerRootTask
+  workspaceRuntimeInternal.beginQuiesce()
+  await workspaceRuntimeInternal.awaitDrain()
+  workspaceRuntimeInternal.markQuiesced()
+  workspaceRuntimeInternal.seal()
+})
 
 describe('generation attempt runner', () => {
   it('opens once and orders reduction, journaling, gated publishing, finalization, and cleanup', async () => {
@@ -48,16 +131,13 @@ describe('generation attempt runner', () => {
         log.push('durable')
       },
       scheduledFlush: () => log.push('schedule'),
-      settle: () => {
-        log.push('settle')
-      },
       release: () => log.push('release'),
     })
     const publishLive = vi.fn(() => {
       log.push('publish')
       expect(streamAccumulatorText(accumulator)).toHaveLength(2_048)
     })
-    const finalize = vi.fn(async () => {
+    const finalize = vi.fn(async (_input: GenerationAttemptFinalizationInput) => {
       log.push('finalize')
       expect(projectStreamAccumulatorFinal(accumulator).content).toEqual([
         { type: 'output_text', text: `prefill-${'x'.repeat(2_048)}` },
@@ -70,16 +150,21 @@ describe('generation attempt runner', () => {
       log.push('cleanup')
     })
 
-    const result = await runGenerationAttempt({
+    const result = await runTestGenerationAttempt({
       open,
       accumulator,
       journal,
       errorPolicy: SEND_GENERATION_ATTEMPT_ERROR_POLICY,
       now: () => 1,
       prepareLive: prepareLiveCallback(publishLive),
-      finalize,
-      cleanupJournal,
-      cleanup,
+      terminal: terminalDouble({
+        complete: async (input) => {
+          await journal.settle()
+          await finalize(input)
+          await cleanupJournal()
+          cleanup()
+        },
+      }),
     })
 
     expect(result).toEqual({ outcome: 'done', finishReason: 'stop' })
@@ -97,10 +182,9 @@ describe('generation attempt runner', () => {
       'append:finish',
       'schedule',
       'finalize',
-      'settle',
       'cleanup-journal',
-      'release',
       'cleanup',
+      'release',
     ])
     expect(accumulator.textSections).toEqual([])
     expect(accumulator.initialContent).toEqual([])
@@ -110,7 +194,7 @@ describe('generation attempt runner', () => {
     const accumulator = createStreamAccumulator({ initialContent: [], now: 0 })
     const publishLive = vi.fn()
 
-    await runGenerationAttempt({
+    await runTestGenerationAttempt({
       open: () =>
         chunks(
           { type: 'delta', chunk: { choices: [{ delta: { content: 'a'.repeat(2_047) } }] } },
@@ -122,9 +206,7 @@ describe('generation attempt runner', () => {
       errorPolicy: SEND_GENERATION_ATTEMPT_ERROR_POLICY,
       now: () => 0,
       prepareLive: prepareLiveCallback(publishLive),
-      finalize: async () => {},
-      cleanupJournal: async () => {},
-      cleanup: () => {},
+      terminal: terminalDouble(),
     })
 
     expect(publishLive).toHaveBeenCalledTimes(2)
@@ -156,11 +238,11 @@ describe('generation attempt runner', () => {
         return terminalDurability.promise
       },
     })
-    const finalize = vi.fn(async () => {
+    const finalize = vi.fn(async (_input: GenerationAttemptFinalizationInput) => {
       order.push('finalize')
     })
     let completed = false
-    const attempt = runGenerationAttempt({
+    const attempt = runTestGenerationAttempt({
       open: () =>
         chunks(
           { type: 'delta', chunk: { choices: [{ delta: { content: 'visible' } }] } },
@@ -170,10 +252,13 @@ describe('generation attempt runner', () => {
       journal,
       errorPolicy: SEND_GENERATION_ATTEMPT_ERROR_POLICY,
       prepareLive: prepareLiveCallback(publishLive),
-      finalize,
-      onCanonicalCommitted: () => order.push('canonical-committed'),
-      cleanupJournal: async () => {},
-      cleanup: () => {},
+      terminal: terminalDouble({
+        complete: async (input) => {
+          await journal.settle()
+          await finalize(input)
+          order.push('canonical-committed')
+        },
+      }),
     }).finally(() => {
       completed = true
     })
@@ -186,20 +271,22 @@ describe('generation attempt runner', () => {
     visiblePrefixDurable.resolve()
     await settleStarted.promise
     expect(publishLive).toHaveBeenCalled()
-    expect(finalize).toHaveBeenCalledTimes(1)
-    expect(order).toEqual(['flush:1', 'finalize', 'canonical-committed', 'settle'])
+    expect(finalize).not.toHaveBeenCalled()
+    expect(order).toEqual(['flush:1', 'settle'])
     expect(completed).toBe(false)
     expect(journal.checkpoint).toHaveBeenCalledTimes(1)
 
     terminalDurability.resolve()
     await expect(attempt).resolves.toMatchObject({ outcome: 'done' })
+    expect(finalize).toHaveBeenCalledTimes(1)
+    expect(order).toEqual(['flush:1', 'settle', 'finalize', 'canonical-committed'])
   })
 
   it('does not force publication flushes when the target chat is not visible', async () => {
     const journal = journalDouble()
     const prepareLive = vi.fn(() => undefined)
 
-    await runGenerationAttempt({
+    await runTestGenerationAttempt({
       open: () =>
         chunks(
           { type: 'delta', chunk: { choices: [{ delta: { content: 'offscreen' } }] } },
@@ -209,9 +296,7 @@ describe('generation attempt runner', () => {
       journal,
       errorPolicy: SEND_GENERATION_ATTEMPT_ERROR_POLICY,
       prepareLive,
-      finalize: async () => {},
-      cleanupJournal: async () => {},
-      cleanup: () => {},
+      terminal: terminalDouble(),
     })
 
     expect(prepareLive).toHaveBeenCalled()
@@ -232,7 +317,7 @@ describe('generation attempt runner', () => {
       yield { type: 'delta', chunk: { choices: [{ delta: {}, finish_reason: 'stop' }] } }
     }
 
-    const attempt = runGenerationAttempt({
+    const attempt = runTestGenerationAttempt({
       open: () => source(),
       accumulator: createStreamAccumulator({ initialContent: [], now: 0 }),
       journal,
@@ -247,9 +332,7 @@ describe('generation attempt runner', () => {
       registerLiveProjectionRequester: (next) => {
         if (next) requester = next
       },
-      finalize: async () => {},
-      cleanupJournal: async () => {},
-      cleanup: () => {},
+      terminal: terminalDouble(),
     })
 
     await paused.promise
@@ -302,7 +385,7 @@ describe('generation attempt runner', () => {
           published.push(text)
         }
       })
-      const attempt = runGenerationAttempt({
+      const attempt = runTestGenerationAttempt({
         open: () => source(),
         accumulator: createStreamAccumulator({ initialContent: [], now: 0 }),
         journal,
@@ -312,9 +395,7 @@ describe('generation attempt runner', () => {
         registerLiveProjectionRequester: (next) => {
           if (next) requester = next
         },
-        finalize: async () => {},
-        cleanupJournal: async () => {},
-        cleanup: () => {},
+        terminal: terminalDouble(),
       })
 
       await firstMiss.promise
@@ -375,7 +456,7 @@ describe('generation attempt runner', () => {
         yield { type: 'delta', chunk: { choices: [{ delta: {}, finish_reason: 'stop' }] } }
       }
       const journal = journalDouble()
-      const attempt = runGenerationAttempt({
+      const attempt = runTestGenerationAttempt({
         open: () => source(),
         accumulator: createStreamAccumulator({ initialContent: [], now: 0 }),
         journal,
@@ -394,9 +475,7 @@ describe('generation attempt runner', () => {
         registerLiveProjectionRequester: (next) => {
           if (next) requester = next
         },
-        finalize: async () => {},
-        cleanupJournal: async () => {},
-        cleanup: () => {},
+        terminal: terminalDouble(),
       })
 
       await secondChunkConsumed.promise
@@ -431,7 +510,7 @@ describe('generation attempt runner', () => {
     let visible = false
     let requester: (() => Promise<void>) | undefined
     const published: string[] = []
-    const attempt = runGenerationAttempt({
+    const attempt = runTestGenerationAttempt({
       open: () =>
         chunks(
           { type: 'delta', chunk: { choices: [{ delta: { content: 'terminal-prefix' } }] } },
@@ -450,12 +529,12 @@ describe('generation attempt runner', () => {
       registerLiveProjectionRequester: (next) => {
         if (next) requester = next
       },
-      finalize: async () => {
-        finalizeStarted.resolve()
-        await releaseFinalize.promise
-      },
-      cleanupJournal: async () => {},
-      cleanup: () => {},
+      terminal: terminalDouble({
+        complete: async () => {
+          finalizeStarted.resolve()
+          await releaseFinalize.promise
+        },
+      }),
     })
 
     await finalizeStarted.promise
@@ -472,27 +551,28 @@ describe('generation attempt runner', () => {
 
   it('does not publish an undurable snapshot and classifies the failure as storage', async () => {
     const publishLive = vi.fn()
-    const finalized = vi.fn()
+    const finalized = vi.fn<(input: GenerationAttemptFinalizationInput) => void>()
 
-    const result = await runGenerationAttempt({
+    const result = await runTestGenerationAttempt({
       open: () =>
         chunks({ type: 'delta', chunk: { choices: [{ delta: { content: 'not-durable' } }] } }),
       accumulator: createStreamAccumulator({ initialContent: [], now: 0 }),
       journal: journalDouble({ immediateFlushError: new Error('indexeddb unavailable') }),
       errorPolicy: SEND_GENERATION_ATTEMPT_ERROR_POLICY,
       prepareLive: prepareLiveCallback(publishLive),
-      finalize: async (input) => finalized(input),
-      cleanupJournal: async () => {},
-      cleanup: () => {},
+      terminal: terminalDouble({
+        complete: async (input) => {
+          finalized(input)
+        },
+      }),
     })
 
     expect(publishLive).not.toHaveBeenCalled()
-    expect(finalized).toHaveBeenCalledWith(
-      expect.objectContaining({
-        outcome: 'error',
-        error: expect.objectContaining({ kind: 'storage', code: 'STORAGE' }),
-      }),
-    )
+    const finalization = finalized.mock.calls[0]?.[0]
+    expect(finalization?.decision.outcome).toBe('error')
+    if (finalization?.decision.outcome !== 'error') throw new Error('ExpectedErrorFinalization')
+    expect(finalization.decision.error.kind).toBe('storage')
+    expect(finalization.decision.error.code).toBe('STORAGE')
     expect(result).toMatchObject({
       outcome: 'error',
       error: { kind: 'storage', code: 'STORAGE' },
@@ -503,7 +583,7 @@ describe('generation attempt runner', () => {
     const controller = new AbortController()
     const onLiveProjectionFailure = vi.fn(() => controller.abort())
 
-    const result = await runGenerationAttempt({
+    const result = await runTestGenerationAttempt({
       open: () =>
         chunks({ type: 'delta', chunk: { choices: [{ delta: { content: 'not-durable' } }] } }),
       accumulator: createStreamAccumulator({ initialContent: [], now: 0 }),
@@ -512,9 +592,7 @@ describe('generation attempt runner', () => {
       signal: controller.signal,
       prepareLive: prepareLiveCallback(vi.fn()),
       onLiveProjectionFailure,
-      finalize: async () => {},
-      cleanupJournal: async () => {},
-      cleanup: () => {},
+      terminal: terminalDouble(),
     })
 
     expect(controller.signal.aborted).toBe(true)
@@ -527,18 +605,24 @@ describe('generation attempt runner', () => {
   })
 
   it('coalesces burst durability writes at the shared 128 KiB publication budget', async () => {
-    const committed: StreamChunkRow[][] = []
-    const journal = createStreamChunkWriter({
-      port: {
-        appendStreamChunks: async (rows) => {
+    const committed: TestSemanticJournalRow[][] = []
+    const journal = createStreamJournalWriter({
+      permit: reserveWorkspaceChild(requireWriterRootPermit(), 'stream-writer'),
+      port: createLogicalStreamJournalAppendAdapter({
+        append: async (rows) => {
           committed.push(structuredClone([...rows]))
         },
-      },
+      }),
       chatId: 'chat-burst',
       streamId: 'stream-burst',
       messageId: 'message-burst',
       now: 0,
-      fence: { ownerClientId: 'owner-burst', fenceToken: 'fence-burst', replacementEpoch: 0 },
+      fence: {
+        ownerClientId: 'owner-burst',
+        fenceToken: 'fence-burst',
+        replacementEpoch: 0,
+        admissionSequence: 1,
+      },
     })
     const piece = 'x'.repeat(2_048)
     const values: AssistantStreamChunk[] = Array.from({ length: 512 }, () => ({
@@ -551,16 +635,14 @@ describe('generation attempt runner', () => {
     })
     const publishLive = vi.fn()
 
-    await runGenerationAttempt({
+    await runTestGenerationAttempt({
       open: () => chunks(...values),
       accumulator: createStreamAccumulator({ initialContent: [], now: 0 }),
       journal,
       errorPolicy: SEND_GENERATION_ATTEMPT_ERROR_POLICY,
       now: () => 0,
       prepareLive: prepareLiveCallback(publishLive),
-      finalize: async () => {},
-      cleanupJournal: async () => {},
-      cleanup: () => {},
+      terminal: terminalDouble(),
     })
 
     expect(publishLive.mock.calls.length).toBeLessThanOrEqual(10)
@@ -582,26 +664,26 @@ describe('generation attempt runner', () => {
     const journal = journalDouble()
     let finalizedText: string | undefined
 
-    const result = await runGenerationAttempt({
+    const result = await runTestGenerationAttempt({
       open: () => chunks(...source),
       accumulator,
       journal,
       errorPolicy: SEND_GENERATION_ATTEMPT_ERROR_POLICY,
-      finalize: async ({ outcome, error }) => {
-        expect(outcome).toBe('error')
-        expect(error).toMatchObject({
-          kind: 'protocol',
-          code: 'STREAM_TRUNCATED',
-          midStream: true,
-          retryable: true,
-        })
-        finalizedText = projectStreamAccumulatorFinal(accumulator)
-          .content.filter((item) => item.type === 'output_text')
-          .map((item) => item.text)
-          .join('')
-      },
-      cleanupJournal: async () => {},
-      cleanup: () => {},
+      terminal: terminalDouble({
+        complete: async ({ decision: { outcome, error } }) => {
+          expect(outcome).toBe('error')
+          expect(error).toMatchObject({
+            kind: 'protocol',
+            code: 'STREAM_TRUNCATED',
+            midStream: true,
+            retryable: true,
+          })
+          finalizedText = projectStreamAccumulatorFinal(accumulator)
+            .content.filter((item) => item.type === 'output_text')
+            .map((item) => item.text)
+            .join('')
+        },
+      }),
     })
 
     expect(result).toMatchObject({
@@ -624,14 +706,17 @@ describe('generation attempt runner', () => {
   })
 
   it('accepts explicit chat [DONE] terminal evidence without inventing a finish reason', async () => {
-    const result = await runGenerationAttempt({
+    const result = await runTestGenerationAttempt({
       open: () => chunks({ type: 'transport_terminal', evidence: 'done-sentinel' }),
       accumulator: createStreamAccumulator({ initialContent: [], now: 0 }),
       journal: journalDouble(),
       errorPolicy: SEND_GENERATION_ATTEMPT_ERROR_POLICY,
-      finalize: async ({ outcome }) => expect(outcome).toBe('done'),
-      cleanupJournal: async () => {},
-      cleanup: () => {},
+      terminal: terminalDouble({
+        complete: async ({ decision }) => {
+          expect(decision.outcome).toBe('done')
+          return undefined
+        },
+      }),
     })
 
     expect(result).toEqual({ outcome: 'done' })
@@ -640,6 +725,7 @@ describe('generation attempt runner', () => {
   it.each([
     {
       name: 'Responses response.completed',
+      streamContract: responsesRouteContract(),
       chunk: {
         type: 'event',
         event: { type: 'response.completed', response: { status: 'completed' } },
@@ -647,6 +733,7 @@ describe('generation attempt runner', () => {
     },
     {
       name: 'Anthropic message_stop',
+      streamContract: anthropicRouteContract(),
       chunk: {
         type: 'anthropic_event',
         event: { type: 'message_stop' },
@@ -654,6 +741,7 @@ describe('generation attempt runner', () => {
     },
     {
       name: 'Gemini finishReason',
+      streamContract: geminiRouteContract(),
       chunk: {
         type: 'chunk',
         chunk: {
@@ -663,16 +751,21 @@ describe('generation attempt runner', () => {
     },
   ] satisfies ReadonlyArray<{
     name: string
+    streamContract: NonNullable<GenerationAttemptRunnerInput['streamContract']>
     chunk: AssistantStreamChunk
-  }>)('accepts $name as clean protocol terminal evidence', async ({ chunk }) => {
-    const result = await runGenerationAttempt({
+  }>)('accepts $name as clean protocol terminal evidence', async ({ chunk, streamContract }) => {
+    const result = await runTestGenerationAttempt({
       open: () => chunks(chunk),
+      streamContract,
       accumulator: createStreamAccumulator({ initialContent: [], now: 0 }),
       journal: journalDouble(),
       errorPolicy: SEND_GENERATION_ATTEMPT_ERROR_POLICY,
-      finalize: async ({ outcome }) => expect(outcome).toBe('done'),
-      cleanupJournal: async () => {},
-      cleanup: () => {},
+      terminal: terminalDouble({
+        complete: async ({ decision }) => {
+          expect(decision.outcome).toBe('done')
+          return undefined
+        },
+      }),
     })
 
     expect(result).toEqual({ outcome: 'done', finishReason: 'stop' })
@@ -692,14 +785,18 @@ describe('generation attempt runner', () => {
     }
     const journal = journalDouble()
 
-    const result = await runGenerationAttempt({
+    const result = await runTestGenerationAttempt({
       open: () => source(),
+      streamContract: anthropicRouteContract(),
       accumulator: createStreamAccumulator({ initialContent: [], now: 0 }),
       journal,
       errorPolicy: SEND_GENERATION_ATTEMPT_ERROR_POLICY,
-      finalize: async ({ outcome }) => expect(outcome).toBe('done'),
-      cleanupJournal: async () => {},
-      cleanup: () => {},
+      terminal: terminalDouble({
+        complete: async ({ decision }) => {
+          expect(decision.outcome).toBe('done')
+          return undefined
+        },
+      }),
     })
 
     expect(result).toEqual({ outcome: 'done', finishReason: 'stop' })
@@ -715,6 +812,7 @@ describe('generation attempt runner', () => {
 
   it('pauses provider iteration only while journal backpressure is pending', async () => {
     const capacity = deferred<void>()
+    const firstAppend = deferred<void>()
     let produced = 0
     let checks = 0
     const source = async function* (): AsyncGenerator<AssistantStreamChunk> {
@@ -726,22 +824,21 @@ describe('generation attempt runner', () => {
       yield { type: 'delta', chunk: { choices: [{ delta: {}, finish_reason: 'stop' }] } }
     }
     const journal = journalDouble({
+      append: () => firstAppend.resolve(),
       backpressure: () => {
         checks += 1
         return checks === 1 ? capacity.promise : undefined
       },
     })
-    const attempt = runGenerationAttempt({
+    const attempt = runTestGenerationAttempt({
       open: () => source(),
       accumulator: createStreamAccumulator({ initialContent: [], now: 0 }),
       journal,
       errorPolicy: SEND_GENERATION_ATTEMPT_ERROR_POLICY,
-      finalize: async () => {},
-      cleanupJournal: async () => {},
-      cleanup: () => {},
+      terminal: terminalDouble(),
     })
 
-    await drainMicrotasks()
+    await firstAppend.promise
     expect(produced).toBe(1)
     expect(journal.append).toHaveBeenCalledTimes(1)
 
@@ -767,7 +864,7 @@ describe('generation attempt runner', () => {
       }
       const accumulator = createStreamAccumulator({ initialContent: [], now: 0 })
       const published: string[] = []
-      const attempt = runGenerationAttempt({
+      const attempt = runTestGenerationAttempt({
         open: () => source(),
         accumulator,
         journal: journalDouble(),
@@ -780,9 +877,7 @@ describe('generation attempt runner', () => {
             if (published.length === 1) firstPublished.resolve()
           }
         },
-        finalize: async () => {},
-        cleanupJournal: async () => {},
-        cleanup: () => {},
+        terminal: terminalDouble(),
       })
 
       await firstPublished.promise
@@ -824,7 +919,7 @@ describe('generation attempt runner', () => {
         yield { type: 'delta', chunk: { choices: [{ delta: {}, finish_reason: 'stop' }] } }
       }
       const published: string[] = []
-      const attempt = runGenerationAttempt({
+      const attempt = runTestGenerationAttempt({
         open: () => source(),
         accumulator: createStreamAccumulator({ initialContent: [], now: 0 }),
         journal: journalDouble(),
@@ -842,9 +937,7 @@ describe('generation attempt runner', () => {
             if (published.length === 2) secondPublished.resolve()
           }
         },
-        finalize: async () => {},
-        cleanupJournal: async () => {},
-        cleanup: () => {},
+        terminal: terminalDouble(),
       })
 
       await firstPublished.promise
@@ -886,7 +979,7 @@ describe('generation attempt runner', () => {
       const accumulator = createStreamAccumulator({ initialContent: [], now: 0 })
       const published: string[] = []
       let publications = 0
-      const attempt = runGenerationAttempt({
+      const attempt = runTestGenerationAttempt({
         open: () => source(),
         accumulator,
         journal: journalDouble(),
@@ -903,9 +996,7 @@ describe('generation attempt runner', () => {
             return releasePublication.promise
           }
         },
-        finalize: async () => {},
-        cleanupJournal: async () => {},
-        cleanup: () => {},
+        terminal: terminalDouble(),
       })
 
       await firstPublished.promise
@@ -925,21 +1016,27 @@ describe('generation attempt runner', () => {
   })
 
   it('continues through a transient journal failure when real backpressure retries it', async () => {
-    const committed: StreamChunkRow[] = []
+    const committed: TestSemanticJournalRow[] = []
     let writes = 0
-    const journal = createStreamChunkWriter({
-      port: {
-        appendStreamChunks: async (rows) => {
+    const journal = createStreamJournalWriter({
+      permit: reserveWorkspaceChild(requireWriterRootPermit(), 'stream-writer'),
+      port: createLogicalStreamJournalAppendAdapter({
+        append: async (rows) => {
           writes += 1
           if (writes === 1) throw new Error('transient IndexedDB failure')
           committed.push(...structuredClone([...rows]))
         },
-      },
+      }),
       chatId: 'chat-1',
       streamId: 'stream-1',
       messageId: 'message-1',
       now: 0,
-      fence: { ownerClientId: 'owner-1', fenceToken: 'fence-1', replacementEpoch: 0 },
+      fence: {
+        ownerClientId: 'owner-1',
+        fenceToken: 'fence-1',
+        replacementEpoch: 0,
+        admissionSequence: 1,
+      },
     })
     const values: AssistantStreamChunk[] = Array.from({ length: 600 }, () => ({
       type: 'delta',
@@ -951,17 +1048,17 @@ describe('generation attempt runner', () => {
     })
     const accumulator = createStreamAccumulator({ initialContent: [], now: 0 })
 
-    const result = await runGenerationAttempt({
+    const result = await runTestGenerationAttempt({
       open: () => chunks(...values),
       accumulator,
       journal,
       errorPolicy: SEND_GENERATION_ATTEMPT_ERROR_POLICY,
-      finalize: async ({ outcome }) => {
-        expect(outcome).toBe('done')
-        expect(streamAccumulatorText(accumulator)).toBe('x'.repeat(600))
-      },
-      cleanupJournal: async () => {},
-      cleanup: () => {},
+      terminal: terminalDouble({
+        complete: async ({ decision }) => {
+          expect(decision.outcome).toBe('done')
+          expect(streamAccumulatorText(accumulator)).toBe('x'.repeat(600))
+        },
+      }),
     })
 
     expect(result).toMatchObject({ outcome: 'done', finishReason: 'stop' })
@@ -969,14 +1066,14 @@ describe('generation attempt runner', () => {
     expect(committed.length).toBeGreaterThan(0)
   })
 
-  it('runs the final dispatch guard immediately before opening and rethrows a guard failure after cleanup', async () => {
+  it('runs the final dispatch guard immediately before opening and preserves its canonical error', async () => {
     const stale = new Error('stale send context')
     const log: string[] = []
     const open = vi.fn(() => {
       log.push('open')
       return chunks()
     })
-    const attempt = runGenerationAttempt({
+    const attempt = runTestGenerationAttempt({
       beforeDispatch: async () => {
         log.push('guard')
         throw stale
@@ -985,26 +1082,18 @@ describe('generation attempt runner', () => {
       accumulator: createStreamAccumulator({ initialContent: [], now: 0 }),
       journal: journalDouble({ release: () => log.push('release') }),
       errorPolicy: SEND_GENERATION_ATTEMPT_ERROR_POLICY,
-      finalize: async ({ outcome, error }) => {
-        log.push(`finalize:${outcome}:${error?.code}`)
-      },
-      cleanupJournal: async () => {
-        log.push('cleanup-journal')
-      },
-      cleanup: ({ outcome }) => {
-        log.push(`cleanup:${outcome}`)
-      },
+      terminal: terminalDouble({
+        complete: async ({ decision }) => {
+          log.push(
+            `finalize:${decision.outcome}:${decision.outcome === 'error' ? decision.error.code : ''}`,
+          )
+        },
+      }),
     })
 
-    await expect(attempt).rejects.toBe(stale)
+    await expect(attempt).resolves.toMatchObject({ outcome: 'error', error: { code: 'INTERNAL' } })
     expect(open).not.toHaveBeenCalled()
-    expect(log).toEqual([
-      'guard',
-      'finalize:error:INTERNAL',
-      'cleanup-journal',
-      'release',
-      'cleanup:error',
-    ])
+    expect(log).toEqual(['guard', 'finalize:error:INTERNAL', 'release'])
   })
 
   it('abort-races a never-settling dispatch guard and finalizes it as an abort', async () => {
@@ -1014,9 +1103,8 @@ describe('generation attempt runner', () => {
       markGuardStarted = resolve
     })
     const open = vi.fn(() => chunks())
-    const finalize = vi.fn(async () => {})
-    const cleanup = vi.fn()
-    const attempt = runGenerationAttempt({
+    const finalize = vi.fn(async (_input: GenerationAttemptFinalizationInput) => undefined)
+    const attempt = runTestGenerationAttempt({
       beforeDispatch: () => {
         markGuardStarted?.()
         return new Promise<never>(() => {})
@@ -1027,19 +1115,38 @@ describe('generation attempt runner', () => {
       accumulator: createStreamAccumulator({ initialContent: [], now: 0 }),
       journal: journalDouble(),
       errorPolicy: CONTINUE_GENERATION_ATTEMPT_ERROR_POLICY,
-      finalize,
-      cleanupJournal: async () => {},
-      cleanup,
+      terminal: terminalDouble({ complete: finalize }),
     })
 
     await guardStarted
     controller.abort()
     await expect(attempt).resolves.toEqual({ outcome: 'abort', abortReason: 'user' })
     expect(open).not.toHaveBeenCalled()
-    expect(finalize).toHaveBeenCalledWith(
-      expect.objectContaining({ outcome: 'abort', abortReason: 'user' }),
-    )
-    expect(cleanup).toHaveBeenCalledWith({ outcome: 'abort', abortReason: 'user' })
+    const finalization = finalize.mock.calls[0]?.[0]
+    expect(finalization?.decision).toEqual({ outcome: 'abort', abortReason: 'user' })
+  })
+
+  it('rejects a buffered frame delivered after the exact Stop intent', async () => {
+    const controller = new AbortController()
+    const journal = journalDouble()
+    const result = await runTestGenerationAttempt({
+      open: async function* () {
+        controller.abort()
+        yield {
+          type: 'delta',
+          chunk: { choices: [{ delta: { content: 'too late' }, finish_reason: 'stop' }] },
+        }
+      },
+      signal: controller.signal,
+      isAborted: () => controller.signal.aborted,
+      accumulator: createStreamAccumulator({ initialContent: [], now: 0 }),
+      journal,
+      errorPolicy: SEND_GENERATION_ATTEMPT_ERROR_POLICY,
+      terminal: terminalDouble(),
+    })
+
+    expect(result).toEqual({ outcome: 'abort', abortReason: 'user' })
+    expect(journal.append).not.toHaveBeenCalled()
   })
 
   it.each([
@@ -1062,22 +1169,18 @@ describe('generation attempt runner', () => {
       expected: { outcome: 'error', errorKind: 'provider_error' },
     },
   ])('classifies a thrown ApiError for $name', async ({ policy, error, expected }) => {
-    const finalized: GenerationAttemptResult[] = []
+    const finalized: AttemptTerminalDecision[] = []
     const journal = journalDouble()
-    const result = await runGenerationAttempt({
+    const result = await runTestGenerationAttempt({
       open: () => failedStream(error),
       accumulator: createStreamAccumulator({ initialContent: [], now: 0 }),
       journal,
       errorPolicy: policy,
-      finalize: async (input) => {
-        finalized.push({
-          outcome: input.outcome,
-          ...(input.abortReason ? { abortReason: input.abortReason } : {}),
-          ...(input.error ? { error: input.error } : {}),
-        })
-      },
-      cleanupJournal: async () => {},
-      cleanup: () => {},
+      terminal: terminalDouble({
+        complete: async (input) => {
+          finalized.push(input.decision)
+        },
+      }),
     })
 
     expect(result.outcome).toBe(expected.outcome)
@@ -1089,75 +1192,66 @@ describe('generation attempt runner', () => {
   })
 
   it('classifies an aborted stream before applying the unknown-error policy', async () => {
-    const result = await runGenerationAttempt({
+    const result = await runTestGenerationAttempt({
       open: () => failedStream(new Error('abort transport detail')),
       accumulator: createStreamAccumulator({ initialContent: [], now: 0 }),
       journal: journalDouble(),
       errorPolicy: CONTINUE_GENERATION_ATTEMPT_ERROR_POLICY,
       isAborted: () => true,
       abortReason: () => 'tab-close',
-      finalize: async () => {},
-      cleanupJournal: async () => {},
-      cleanup: () => {},
+      terminal: terminalDouble(),
     })
 
     expect(result).toEqual({ outcome: 'abort', abortReason: 'tab-close' })
   })
 
-  it('normalizes unknown stream failures and preserves Continue rethrow semantics', async () => {
+  it('normalizes unknown stream failures into one canonical result for send and Continue', async () => {
     const sendError = new Error('send parser failed')
     const sendLog: string[] = []
-    const sendResult = await runGenerationAttempt({
+    const sendResult = await runTestGenerationAttempt({
       open: () => failedStream(sendError),
       accumulator: createStreamAccumulator({ initialContent: [], now: 0 }),
       journal: journalDouble(),
       errorPolicy: SEND_GENERATION_ATTEMPT_ERROR_POLICY,
-      finalize: async ({ outcome, error }) => {
-        sendLog.push(`finalize:${outcome}:${String(error)}`)
-      },
-      cleanupJournal: async () => {
-        sendLog.push('cleanup-journal')
-      },
-      cleanup: ({ outcome }) => {
-        sendLog.push(`cleanup:${outcome}`)
-      },
+      terminal: terminalDouble({
+        complete: async ({ decision }) => {
+          sendLog.push(
+            `finalize:${decision.outcome}:${decision.outcome === 'error' ? decision.error.message : ''}`,
+          )
+        },
+      }),
     })
 
     expect(sendResult).toMatchObject({
       outcome: 'error',
       error: { kind: 'protocol', code: 'PROTOCOL', message: sendError.message },
     })
-    expect(sendLog).toEqual([
-      'finalize:error:ApiError: send parser failed',
-      'cleanup-journal',
-      'cleanup:error',
-    ])
+    expect(sendLog).toEqual(['finalize:error:send parser failed'])
 
     const continueError = new Error('continue parser failed')
     const continueLog: string[] = []
-    const continuing = runGenerationAttempt({
+    const continuing = runTestGenerationAttempt({
       open: () => failedStream(continueError),
       accumulator: createStreamAccumulator({ initialContent: [], now: 0 }),
       journal: journalDouble(),
       errorPolicy: CONTINUE_GENERATION_ATTEMPT_ERROR_POLICY,
-      finalize: async ({ outcome }) => {
-        continueLog.push(`finalize:${outcome}`)
-      },
-      cleanupJournal: async () => {
-        continueLog.push('cleanup-journal')
-      },
-      cleanup: ({ outcome }) => {
-        continueLog.push(`cleanup:${outcome}`)
-      },
+      terminal: terminalDouble({
+        complete: async ({ decision }) => {
+          continueLog.push(`finalize:${decision.outcome}`)
+        },
+      }),
     })
 
-    await expect(continuing).rejects.toMatchObject({
-      name: 'ApiError',
-      kind: 'protocol',
-      code: 'PROTOCOL',
-      message: continueError.message,
+    await expect(continuing).resolves.toMatchObject({
+      outcome: 'error',
+      error: {
+        name: 'ApiError',
+        kind: 'protocol',
+        code: 'PROTOCOL',
+        message: continueError.message,
+      },
     })
-    expect(continueLog).toEqual(['finalize:error', 'cleanup-journal', 'cleanup:error'])
+    expect(continueLog).toEqual(['finalize:error'])
   })
 
   it('returns a mid-stream error-lane ApiError and stops consuming the provider', async () => {
@@ -1182,14 +1276,17 @@ describe('generation attempt runner', () => {
     }
     const finalized = vi.fn<(input: GenerationAttemptFinalizationInput) => void>()
 
-    const result = await runGenerationAttempt({
+    const result = await runTestGenerationAttempt({
       open: () => source(),
       accumulator: createStreamAccumulator({ initialContent: [], now: 0 }),
       journal: journalDouble(),
       errorPolicy: SEND_GENERATION_ATTEMPT_ERROR_POLICY,
-      finalize: async (input) => finalized(input),
-      cleanupJournal: async () => {},
-      cleanup: () => {},
+      terminal: terminalDouble({
+        complete: async (input) => {
+          finalized(input)
+          return undefined
+        },
+      }),
     })
 
     expect(result.outcome).toBe('error')
@@ -1198,7 +1295,10 @@ describe('generation attempt runner', () => {
     expect(result.error?.midStream).toBe(true)
     expect(produced).toBe(2)
     expect(upstreamClosed).toHaveBeenCalledTimes(1)
-    expect(finalized.mock.calls[0]?.[0].error).toBe(result.error)
+    expect(finalized.mock.calls[0]?.[0].decision).toMatchObject({
+      outcome: 'error',
+      error: { kind: result.error?.kind, code: result.error?.code },
+    })
   })
 
   it('surfaces an upstream close failure when no primary failure exists', async () => {
@@ -1212,7 +1312,7 @@ describe('generation attempt runner', () => {
         await Promise.reject(closeError)
       }
     }
-    const iterator = splitAssistantStream(source())[Symbol.asyncIterator]()
+    const iterator = splitAssistantStream(source(), chatRouteContract())[Symbol.asyncIterator]()
 
     await expect(iterator.next()).resolves.toMatchObject({
       done: false,
@@ -1238,7 +1338,7 @@ describe('generation attempt runner', () => {
     }
     const finalized = vi.fn<(input: GenerationAttemptFinalizationInput) => void>()
 
-    const result = await runGenerationAttempt({
+    const result = await runTestGenerationAttempt({
       open: () => source(),
       accumulator: createStreamAccumulator({ initialContent: [], now: 0 }),
       journal: journalDouble({
@@ -1247,9 +1347,12 @@ describe('generation attempt runner', () => {
         },
       }),
       errorPolicy: SEND_GENERATION_ATTEMPT_ERROR_POLICY,
-      finalize: async (input) => finalized(input),
-      cleanupJournal: async () => {},
-      cleanup: () => {},
+      terminal: terminalDouble({
+        complete: async (input) => {
+          finalized(input)
+          return undefined
+        },
+      }),
     })
 
     expect(result).toMatchObject({
@@ -1258,42 +1361,54 @@ describe('generation attempt runner', () => {
     })
     expect(produced).toBe(1)
     expect(upstreamClosed).toHaveBeenCalledTimes(1)
-    expect(finalized.mock.calls[0]?.[0]).toMatchObject(result)
+    expect(finalized.mock.calls[0]?.[0]).toMatchObject({
+      decision: {
+        outcome: result.outcome,
+        ...(result.outcome === 'error'
+          ? { error: { kind: result.error.kind, code: result.error.code } }
+          : {}),
+      },
+    })
   })
 
-  it('keeps the committed provider outcome and recovery anchor when journal settlement fails', async () => {
+  it('leaves journal settlement to the terminal custodian', async () => {
     const settleError = new Error('journal settlement failed')
     const finalized = vi.fn<(input: GenerationAttemptFinalizationInput) => void>()
-    const cleaned = vi.fn<(input: GenerationAttemptResult) => void>()
-    const cleanupJournal = vi.fn(async () => {})
+    const completed = vi.fn<GenerationAttemptRunnerInput['terminal']['complete']>()
 
-    const result = await runGenerationAttempt({
+    const journal = journalDouble({ settleError })
+    const result = await runTestGenerationAttempt({
       open: () =>
         chunks(
           { type: 'delta', chunk: { choices: [{ delta: { content: 'complete' } }] } },
           { type: 'transport_terminal', evidence: 'done-sentinel' },
         ),
       accumulator: createStreamAccumulator({ initialContent: [], now: 0 }),
-      journal: journalDouble({ settleError }),
+      journal,
       errorPolicy: SEND_GENERATION_ATTEMPT_ERROR_POLICY,
-      finalize: async (input) => finalized(input),
-      cleanupJournal,
-      cleanup: (input) => cleaned(input),
+      terminal: terminalDouble({
+        complete: async (input) => {
+          finalized(input)
+          await completed(input)
+        },
+      }),
     })
 
-    expect(result).toEqual({ outcome: 'done', journalCleanupPending: true })
+    expect(result).toEqual({ outcome: 'done' })
     expect(finalized).toHaveBeenCalledTimes(1)
-    expect(finalized.mock.calls[0]?.[0]).toMatchObject({ outcome: 'done' })
-    expect(finalized.mock.calls[0]?.[0]).not.toHaveProperty('journalCleanupPending')
-    expect(cleanupJournal).not.toHaveBeenCalled()
-    expect(cleaned).toHaveBeenCalledWith(result)
+    expect(finalized.mock.calls[0]?.[0]).toMatchObject({ decision: { outcome: 'done' } })
+    expect(completed).toHaveBeenCalledWith(
+      expect.objectContaining({
+        decision: { outcome: 'done' },
+      }),
+    )
+    expect(journal.settle).not.toHaveBeenCalled()
   })
 
-  it('returns a cleanup token without rewriting an already committed outcome', async () => {
-    const cleanupError = new Error('chunk cleanup failed')
-    const cleaned = vi.fn<(input: GenerationAttemptResult) => void>()
+  it('keeps housekeeping internal to the terminal custodian', async () => {
+    const completed = vi.fn<GenerationAttemptRunnerInput['terminal']['complete']>()
 
-    const result = await runGenerationAttempt({
+    const result = await runTestGenerationAttempt({
       open: () =>
         chunks(
           { type: 'delta', chunk: { choices: [{ delta: { content: 'done' } }] } },
@@ -1302,21 +1417,15 @@ describe('generation attempt runner', () => {
       accumulator: createStreamAccumulator({ initialContent: [], now: 0 }),
       journal: journalDouble(),
       errorPolicy: SEND_GENERATION_ATTEMPT_ERROR_POLICY,
-      finalize: async () => {},
-      cleanupJournal: async () => {
-        throw cleanupError
-      },
-      cleanup: (input) => cleaned(input),
+      terminal: terminalDouble({ complete: async (input) => completed(input) }),
     })
 
-    expect(result).toEqual({ outcome: 'done', journalCleanupPending: true })
-    expect(cleaned).toHaveBeenCalledWith(result)
+    expect(result).toEqual({ outcome: 'done' })
+    expect(completed).toHaveBeenCalledOnce()
   })
 
-  it('rejects a canonical finalizer failure after settling recovery and preserving its anchor', async () => {
+  it('rejects a canonical finalizer failure without duplicating custodian settlement', async () => {
     const finalizerError = new Error('canonical write failed')
-    const cleanupJournal = vi.fn(async () => {})
-    const cleaned: GenerationAttemptResult[] = []
     const order: string[] = []
     const journal = journalDouble({
       settle: () => {
@@ -1325,20 +1434,18 @@ describe('generation attempt runner', () => {
     })
     const accumulator = createStreamAccumulator({ initialContent: [], now: 0 })
 
-    const attempt = runGenerationAttempt({
+    const attempt = runTestGenerationAttempt({
       open: () =>
         chunks({ type: 'delta', chunk: { choices: [{ delta: { content: 'retained' } }] } }),
       accumulator,
       journal,
       errorPolicy: SEND_GENERATION_ATTEMPT_ERROR_POLICY,
-      finalize: async () => {
-        order.push('finalize')
-        throw finalizerError
-      },
-      cleanupJournal,
-      cleanup: (result) => {
-        cleaned.push(result)
-      },
+      terminal: terminalDouble({
+        complete: async () => {
+          order.push('finalize')
+          throw finalizerError
+        },
+      }),
     })
 
     await expect(attempt).rejects.toMatchObject({
@@ -1347,25 +1454,17 @@ describe('generation attempt runner', () => {
       code: 'STORAGE',
       message: finalizerError.message,
     })
-    expect(journal.settle).toHaveBeenCalledTimes(1)
+    expect(journal.settle).not.toHaveBeenCalled()
     expect(journal.flush).not.toHaveBeenCalledWith({ mode: 'immediate' })
-    expect(order).toEqual(['finalize', 'settle'])
-    expect(cleanupJournal).not.toHaveBeenCalled()
+    expect(order).toEqual(['finalize'])
     expect(journal.release).toHaveBeenCalledTimes(1)
-    expect(cleaned).toHaveLength(1)
-    expect(cleaned[0]).toMatchObject({
-      outcome: 'error',
-      error: { kind: 'storage', code: 'STORAGE', message: finalizerError.message },
-      journalCleanupPending: true,
-    })
     expect(accumulator.textSections).toEqual([])
   })
 
-  it('keeps the canonical failure primary when recovery settlement and fallback flush fail', async () => {
+  it('keeps the canonical failure primary without a second runner-owned recovery path', async () => {
     const finalizerError = new Error('canonical write failed')
     const settleError = new Error('journal settlement failed')
     const flushError = new Error('journal fallback flush failed')
-    const cleanupJournal = vi.fn(async () => {})
     const order: string[] = []
     const journal = journalDouble({
       settle: async () => {
@@ -1378,18 +1477,18 @@ describe('generation attempt runner', () => {
       },
     })
 
-    const attempt = runGenerationAttempt({
+    const attempt = runTestGenerationAttempt({
       open: () =>
         chunks({ type: 'delta', chunk: { choices: [{ delta: { content: 'retained' } }] } }),
       accumulator: createStreamAccumulator({ initialContent: [], now: 0 }),
       journal,
       errorPolicy: SEND_GENERATION_ATTEMPT_ERROR_POLICY,
-      finalize: async () => {
-        order.push('finalize')
-        throw finalizerError
-      },
-      cleanupJournal,
-      cleanup: () => {},
+      terminal: terminalDouble({
+        complete: async () => {
+          order.push('finalize')
+          throw finalizerError
+        },
+      }),
     })
 
     await expect(attempt).rejects.toMatchObject({
@@ -1398,16 +1497,15 @@ describe('generation attempt runner', () => {
       code: 'STORAGE',
       message: finalizerError.message,
     })
-    expect(journal.settle).toHaveBeenCalledTimes(1)
-    expect(journal.flush).toHaveBeenCalledWith({ mode: 'immediate' })
-    expect(cleanupJournal).not.toHaveBeenCalled()
-    expect(order).toEqual(['finalize', 'settle', 'flush'])
+    expect(journal.settle).not.toHaveBeenCalled()
+    expect(journal.flush).not.toHaveBeenCalledWith({ mode: 'immediate' })
+    expect(order).toEqual(['finalize'])
   })
 })
 
 function journalDouble(
   options: {
-    append?: (event: Parameters<StreamChunkWriter['append']>[0]) => void
+    append?: (event: Parameters<StreamJournalWriter['append']>[0]) => void
     scheduledFlush?: () => void
     settle?: () => void | Promise<void>
     backpressure?: () => Promise<void> | undefined
@@ -1419,8 +1517,8 @@ function journalDouble(
 ) {
   const append = vi.fn(
     (
-      event: Parameters<StreamChunkWriter['append']>[0],
-      _now: Parameters<StreamChunkWriter['append']>[1],
+      event: Parameters<StreamJournalWriter['append']>[0],
+      _now: Parameters<StreamJournalWriter['append']>[1],
     ) => {
       options.append?.(event)
     },
@@ -1456,7 +1554,7 @@ function journalDouble(
     backpressure,
     settle,
     release,
-  } as unknown as StreamChunkWriter & {
+  } as unknown as StreamJournalWriter & {
     append: typeof append
     flush: typeof flush
     checkpoint: typeof checkpoint
@@ -1502,6 +1600,11 @@ function deferred<T>(): {
     resolve = resolvePromise
   })
   return { promise, resolve }
+}
+
+function requireWriterRootPermit(): WorkspaceWritePermit {
+  if (!writerRootPermit) throw new Error('GenerationAttemptRunnerTestRuntimeNotReady')
+  return writerRootPermit
 }
 
 async function drainMicrotasks(): Promise<void> {

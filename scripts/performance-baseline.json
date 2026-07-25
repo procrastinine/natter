@@ -89,14 +89,6 @@
           "gzipBytes": 1100
         }
       },
-      "global-settings": {
-        "prefix": "GlobalSettingsModal",
-        "extension": ".js",
-        "maximums": {
-          "bytes": 19000,
-          "gzipBytes": 5450
-        }
-      },
       "storage-view": {
         "prefix": "StorageView",
         "extension": ".js",
@@ -128,7 +120,6 @@
       "BranchTreeInspectorSearch",
       "BranchTreePreview",
       "BranchTreeView",
-      "GlobalSettingsModal",
       "ImportModal",
       "MessageList",
       "StorageView",

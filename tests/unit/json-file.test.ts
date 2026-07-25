@@ -3,10 +3,16 @@
 import { strFromU8, strToU8, unzipSync, zipSync } from 'fflate'
 import { describe, expect, it, vi } from 'vitest'
 import {
+  WorkspaceReplacementCommittedRecoveryRequiredError,
+  WorkspaceReplacementOutcomeUnknownError,
+  WorkspaceReplacementUncommittedRecoveryRequiredError,
+} from '../../src/core/import-export/errors'
+import {
   __jsonDocumentChunksForTests,
   __jsonIoMaterializationMetricsForTests,
   __resetJsonIoMaterializationMetricsForTests,
   forEachJsonOrZipFile,
+  importExportErrorMessage,
   jsonDocumentBlob,
   jsonEntriesZipBlob,
   readJsonFile,
@@ -24,6 +30,29 @@ function nativeSerialized(value: unknown): string {
 function parseJson(value: string): unknown {
   return JSON.parse(value) as unknown
 }
+
+describe('workspace replacement recovery diagnostics', () => {
+  it('distinguishes committed, uncommitted, and unknown recovery states', () => {
+    expect(
+      importExportErrorMessage(
+        new WorkspaceReplacementCommittedRecoveryRequiredError(
+          { workspaceId: 'after', replacementEpoch: 2 },
+          [new Error('reopen failed')],
+        ),
+      ),
+    ).toContain('committed')
+    expect(
+      importExportErrorMessage(
+        new WorkspaceReplacementUncommittedRecoveryRequiredError([new Error('reopen failed')]),
+      ),
+    ).toContain('did not commit')
+    expect(
+      importExportErrorMessage(
+        new WorkspaceReplacementOutcomeUnknownError([new Error('inspection failed')]),
+      ),
+    ).toContain('could not be confirmed')
+  })
+})
 
 describe('incremental JSON export', () => {
   it('round-trips nested export-shaped values with native property order and formatting', () => {

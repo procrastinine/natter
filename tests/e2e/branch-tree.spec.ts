@@ -1,19 +1,24 @@
-import type { Message } from '../../src/core/types'
-import {
-  previewTextFromStoredProjection,
-  splitMessageForStorage,
-} from '../../src/store/message-storage'
+import { importPortableChatThroughUi } from '../../scripts/workspace-provider-fixture.mjs'
 import { expect, type Page, test } from './fixtures'
 import {
+  activeWorkspaceDatabaseName,
   buildSseBody,
   clearIndexedDb,
   createChatAndOpen,
   mockChatCompletions,
   readMessages,
-  rebuildSidebarProjection,
   seedFirstRun,
   sendMessage,
 } from './helpers'
+
+interface BranchTreeFixture {
+  readonly chatId: string
+  readonly root: string
+  readonly A1: string
+  readonly A2: string
+  readonly B1: string
+  readonly B2: string
+}
 
 test.beforeEach(async ({ page }) => {
   await clearIndexedDb(page)
@@ -24,19 +29,21 @@ test('middle-click opens the newest descendant branch in a background tab', asyn
   context,
   page,
 }) => {
-  const chatId = await seedBranchTreeChat(page)
-  await page.goto(`/#/chat/${chatId}/message/A2`)
+  const fixture = await seedBranchTreeChat(page)
+  await page.goto(`/#/chat/${fixture.chatId}/message/${fixture.A2}`)
   await page.locator('[data-role="chat-branch-tree"]').click()
 
   const popupPromise = context.waitForEvent('page')
-  await page.locator('[data-ui="branch-tree-node"][data-message-id="root"]').click({
+  await page.locator(`[data-ui="branch-tree-node"][data-message-id="${fixture.root}"]`).click({
     button: 'middle',
   })
   const popup = await popupPromise
 
   await expect(page.locator('[data-ui="branch-tree-view"]')).toBeVisible()
-  await expect.poll(() => page.evaluate(() => window.location.hash)).toContain('/message/A2')
-  await expect(popup).toHaveURL(/\/message\/B2/)
+  await expect
+    .poll(() => page.evaluate(() => window.location.hash))
+    .toContain(`/message/${fixture.A2}`)
+  await expect(popup).toHaveURL(new RegExp(`/message/${fixture.B2}$`, 'u'))
   await expect(popup.locator('[data-ui="message-list"]')).toContainText('branch B assistant')
   await expect(popup.locator('[data-ui="message-list"]')).not.toContainText('branch A assistant')
 })
@@ -44,8 +51,8 @@ test('middle-click opens the newest descendant branch in a background tab', asyn
 test('tree view replaces the transcript, searches all branches, and changes the active branch', async ({
   page,
 }) => {
-  const chatId = await seedBranchTreeChat(page)
-  await page.goto(`/#/chat/${chatId}/message/B2`)
+  const fixture = await seedBranchTreeChat(page)
+  await page.goto(`/#/chat/${fixture.chatId}/message/${fixture.B2}`)
   await expect(page.locator('[data-ui="message-list"]')).toContainText('branch B assistant')
 
   await page.locator('[data-role="chat-branch-tree"]').click()
@@ -61,7 +68,7 @@ test('tree view replaces the transcript, searches all branches, and changes the 
   ).toHaveCount(2)
 
   const densityToggle = page.locator('[data-ui="tree-density-toggle"]')
-  const geometryNode = page.locator('[data-ui="branch-tree-node"][data-message-id="A2"]')
+  const geometryNode = page.locator(`[data-ui="branch-tree-node"][data-message-id="${fixture.A2}"]`)
   const compactBefore = await geometryNode.boundingBox()
   await densityToggle.click()
   await expect(page.locator('[data-ui="branch-tree-view"]')).toHaveAttribute(
@@ -163,10 +170,13 @@ test('tree view replaces the transcript, searches all branches, and changes the 
   expect(searchGeometry.inputShadow).toBe('none')
   expect(searchGeometry.outerShadow).not.toBe('none')
   await page.getByRole('button', { name: 'Next matching message' }).click()
-  await expect(page.locator('[data-current-match="true"]')).toHaveAttribute('data-message-id', 'A2')
+  await expect(page.locator('[data-current-match="true"]')).toHaveAttribute(
+    'data-message-id',
+    fixture.A2,
+  )
   await expect(page.locator('[data-ui="branch-tree-inspector"]')).toHaveAttribute(
     'data-message-id',
-    'A2',
+    fixture.A2,
   )
   await expect(page.locator('[data-ui="branch-tree-inspector-search-status"]')).toHaveText('1 / 3')
   await expect(
@@ -196,17 +206,15 @@ test('tree view replaces the transcript, searches all branches, and changes the 
   await page.getByRole('button', { name: 'Previous occurrence in message' }).click()
   await expect(page.locator('[data-ui="branch-tree-inspector-search-status"]')).toHaveText('1 / 3')
 
-  await page.locator('[data-ui="branch-tree-node"][data-message-id="A2"]').click()
-  await expect(page.locator('[data-ui="branch-tree-node"][data-message-id="A2"]')).toHaveAttribute(
-    'data-selected',
-    'true',
-  )
-  await expect(page.locator('[data-ui="branch-tree-node"][data-message-id="B2"]')).toHaveAttribute(
-    'data-current-leaf',
-    'true',
-  )
+  const branchANode = page.locator(`[data-ui="branch-tree-node"][data-message-id="${fixture.A2}"]`)
+  const branchBNode = page.locator(`[data-ui="branch-tree-node"][data-message-id="${fixture.B2}"]`)
+  await branchANode.click()
+  await expect(branchANode).toHaveAttribute('data-selected', 'true')
+  await expect(branchBNode).toHaveAttribute('data-current-leaf', 'true')
   await expect(page.locator('[data-ui="branch-tree-inspector"]')).toBeVisible()
-  await expect.poll(() => page.evaluate(() => window.location.hash)).toContain('/message/B2')
+  await expect
+    .poll(() => page.evaluate(() => window.location.hash))
+    .toContain(`/message/${fixture.B2}`)
 
   const inspectorBefore = await page.locator('[data-ui="branch-tree-inspector"]').boundingBox()
   await page.getByRole('separator', { name: 'Resize message details' }).focus()
@@ -215,10 +223,14 @@ test('tree view replaces the transcript, searches all branches, and changes the 
   expect(inspectorAfter?.width ?? 0).toBeGreaterThan(inspectorBefore?.width ?? 0)
 
   await page.getByRole('button', { name: 'Open this branch' }).click()
-  await expect.poll(() => page.evaluate(() => window.location.hash)).toContain('/message/A2')
+  await expect
+    .poll(() => page.evaluate(() => window.location.hash))
+    .toContain(`/message/${fixture.A2}`)
   await page.locator('[data-ui="branch-tree-scroll"]').click({ position: { x: 8, y: 8 } })
   await expect(page.locator('[data-ui="branch-tree-inspector"]')).toHaveCount(0)
-  await expect.poll(() => page.evaluate(() => window.location.hash)).toContain('/message/A2')
+  await expect
+    .poll(() => page.evaluate(() => window.location.hash))
+    .toContain(`/message/${fixture.A2}`)
   await page.locator('[data-role="chat-branch-tree"]').click()
   await expect(page.locator('[data-ui="branch-tree-view"]')).not.toBeVisible()
   await expect(page.locator('[data-ui="message-list"]')).toContainText('branch A assistant')
@@ -228,24 +240,42 @@ test('tree view replaces the transcript, searches all branches, and changes the 
 test('switching views preserves the active branch and retained tree workspace state', async ({
   page,
 }) => {
-  const chatId = await seedBranchTreeChat(page)
-  await page.goto(`/#/chat/${chatId}/message/B2`)
+  const fixture = await seedBranchTreeChat(page)
+  await page.goto(`/#/chat/${fixture.chatId}/message/${fixture.B2}`)
   await expect(page.locator('[data-ui="message-list"]')).toContainText('branch B assistant')
 
   const treeToggle = page.locator('[data-role="chat-branch-tree"]')
   await treeToggle.click()
   const tree = page.locator('[data-ui="branch-tree-view"]')
-  const search = page.getByRole('searchbox', { name: 'Search messages in this chat' })
-  const inspectedNode = page.locator('[data-ui="branch-tree-node"][data-message-id="A2"]')
-  const currentLeaf = page.locator('[data-ui="branch-tree-node"][data-message-id="B2"]')
+  const search = page.locator('[data-ui="branch-tree-search-input"]')
+  const inspectedNode = page.locator(
+    `[data-ui="branch-tree-node"][data-message-id="${fixture.A2}"]`,
+  )
+  const currentLeaf = page.locator(`[data-ui="branch-tree-node"][data-message-id="${fixture.B2}"]`)
   const inspector = page.locator('[data-ui="branch-tree-inspector"]')
+  const inspectorBody = page.locator('[data-ui="branch-tree-inspector-content"]')
+  const treeNodes = page.locator('[data-ui="branch-tree-node"]')
+  const nodePreviews = page.locator('[data-ui="branch-tree-node-preview"]')
+  const treeRoot = await tree.elementHandle()
+  if (!treeRoot) throw new Error('Tree root is not mounted')
+
+  await expect(tree).toBeVisible()
+  await page.locator('[data-ui="tree-density-toggle"]').click()
+  await expect(tree).toHaveAttribute('data-expanded', 'true')
+  await expect(treeNodes).toHaveCount(5)
+  await expect(nodePreviews).toHaveCount(5)
 
   await search.fill('branch A')
   await inspectedNode.click()
   await expect(inspectedNode).toHaveAttribute('data-selected', 'true')
   await expect(currentLeaf).toHaveAttribute('data-current-leaf', 'true')
-  await expect(inspector).toHaveAttribute('data-message-id', 'A2')
-  await expect.poll(() => page.evaluate(() => window.location.hash)).toContain('/message/B2')
+  await expect(inspector).toHaveAttribute('data-message-id', fixture.A2)
+  await expect(inspectorBody).toContainText('branch A assistant')
+  const inspectorRoot = await inspector.elementHandle()
+  if (!inspectorRoot) throw new Error('Inspector root is not mounted')
+  await expect
+    .poll(() => page.evaluate(() => window.location.hash))
+    .toContain(`/message/${fixture.B2}`)
 
   await page.getByRole('separator', { name: 'Resize message details' }).focus()
   await page.keyboard.press('ArrowLeft')
@@ -257,37 +287,62 @@ test('switching views preserves the active branch and retained tree workspace st
   await expect(page.locator('[data-ui="message-list"]')).toBeVisible()
   await expect(page.locator('[data-ui="message-list"]')).toContainText('branch B assistant')
   await expect(page.locator('[data-ui="message-list"]')).not.toContainText('branch A assistant')
-  await expect.poll(() => page.evaluate(() => window.location.hash)).toContain('/message/B2')
+  await expect
+    .poll(() => page.evaluate(() => window.location.hash))
+    .toContain(`/message/${fixture.B2}`)
+  expect(await tree.evaluate((element, retainedRoot) => element === retainedRoot, treeRoot)).toBe(
+    true,
+  )
+  await expect(search).toHaveValue('branch A')
+  await expect(tree).toHaveAttribute('data-expanded', 'true')
+  await expect(treeNodes).toHaveCount(0)
+  await expect(nodePreviews).toHaveCount(0)
+  expect(
+    await inspector.evaluate((element, retainedRoot) => element === retainedRoot, inspectorRoot),
+  ).toBe(true)
+  await expect(inspectorBody).toContainText('branch A assistant')
+  await expect(tree).toHaveAttribute('data-presentation-only', 'true')
 
   await treeToggle.click()
   await expect(tree).toBeVisible()
+  expect(await tree.evaluate((element, retainedRoot) => element === retainedRoot, treeRoot)).toBe(
+    true,
+  )
+  expect(
+    await inspector.evaluate((element, retainedRoot) => element === retainedRoot, inspectorRoot),
+  ).toBe(true)
+  await expect(treeNodes).toHaveCount(5)
+  await expect(nodePreviews).toHaveCount(5)
   await expect(search).toHaveValue('branch A')
   await expect(page.locator('[data-search-match="true"]')).toHaveCount(2)
   await expect(inspectedNode).toHaveAttribute('data-selected', 'true')
   await expect(currentLeaf).toHaveAttribute('data-current-leaf', 'true')
-  await expect(inspector).toHaveAttribute('data-message-id', 'A2')
+  await expect(inspector).toHaveAttribute('data-message-id', fixture.A2)
+  await expect(inspectorBody).toContainText('branch A assistant')
   await expect
     .poll(async () => (await inspector.boundingBox())?.width ?? 0)
     .toBeCloseTo(inspectorWidth, 0)
-  await expect.poll(() => page.evaluate(() => window.location.hash)).toContain('/message/B2')
+  await expect
+    .poll(() => page.evaluate(() => window.location.hash))
+    .toContain(`/message/${fixture.B2}`)
 })
 
 test('tree inspector stays bounded across viewport sizes and drag panning preserves it', async ({
   page,
 }) => {
   await page.setViewportSize({ width: 2560, height: 900 })
-  const chatId = await seedBranchTreeChat(page)
-  await page.goto(`/#/chat/${chatId}/message/B2`)
+  const fixture = await seedBranchTreeChat(page)
+  await page.goto(`/#/chat/${fixture.chatId}/message/${fixture.B2}`)
   await page.locator('[data-role="chat-branch-tree"]').click()
   const canvas = page.locator('[data-ui="branch-tree-scroll"]')
   const scrollBeforeSelection = await canvas.evaluate((element) => ({
     left: element.scrollLeft,
     top: element.scrollTop,
   }))
-  await page.locator('[data-ui="branch-tree-node"][data-message-id="A2"]').click()
+  await page.locator(`[data-ui="branch-tree-node"][data-message-id="${fixture.A2}"]`).click()
   await expect(page.locator('[data-ui="branch-tree-inspector"]')).toHaveAttribute(
     'data-message-id',
-    'A2',
+    fixture.A2,
   )
   await expect
     .poll(() =>
@@ -436,26 +491,28 @@ test('tree inspector stays bounded across viewport sizes and drag panning preser
   await expect.poll(() => canvas.evaluate((element) => element.scrollTop)).toBeGreaterThan(20)
   await expect(page.locator('[data-ui="branch-tree-inspector"]')).toHaveAttribute(
     'data-message-id',
-    'A2',
+    fixture.A2,
   )
 })
 
 test('shared and child connector targets remain distinct and shared insertion moves all children', async ({
   page,
 }) => {
-  const chatId = await seedBranchTreeChat(page)
-  await page.goto(`/#/chat/${chatId}/message/B2`)
+  const fixture = await seedBranchTreeChat(page)
+  await page.goto(`/#/chat/${fixture.chatId}/message/${fixture.B2}`)
   await page.locator('[data-role="chat-branch-tree"]').click()
   await expect(page.locator('[data-ui="branch-tree-view"]')).toBeVisible()
   await expect(page.locator('[data-ui="edit-tree-toolbar"]')).toHaveCount(0)
   await expect(page.locator('[data-connector-hit]')).not.toHaveCount(0)
-  await expect(page.locator('[data-connector-hit][data-parent-id="root"]')).toHaveCount(3)
-  await expect(page.locator('[data-connector-hit][data-parent-id="A1"]')).toHaveCount(1)
-  await expect(page.locator('[data-connector-hit][data-child-id="A2"]')).toHaveCount(0)
+  await expect(page.locator(`[data-connector-hit][data-parent-id="${fixture.root}"]`)).toHaveCount(
+    3,
+  )
+  await expect(page.locator(`[data-connector-hit][data-parent-id="${fixture.A1}"]`)).toHaveCount(1)
+  await expect(page.locator(`[data-connector-hit][data-child-id="${fixture.A2}"]`)).toHaveCount(0)
 
   await page
     .locator(
-      '[data-connector-hit="child-leg"][data-child-id="A1"][aria-label="Insert before this child only"]',
+      `[data-connector-hit="child-leg"][data-child-id="${fixture.A1}"][aria-label="Insert before this child only"]`,
     )
     .click()
   await expect(page.locator('[data-ui="import-modal-slot"]')).toContainText('before this message')
@@ -463,7 +520,7 @@ test('shared and child connector targets remain distinct and shared insertion mo
 
   await page
     .locator(
-      '[data-connector-hit="shared-trunk"][data-parent-id="root"][aria-label="Insert after this parent before all of its children"]',
+      `[data-connector-hit="shared-trunk"][data-parent-id="${fixture.root}"][aria-label="Insert after this parent before all of its children"]`,
     )
     .click()
   await expect(page.locator('[data-ui="import-modal-slot"]')).toContainText(
@@ -473,32 +530,37 @@ test('shared and child connector targets remain distinct and shared insertion mo
   await page.getByRole('button', { name: 'Import', exact: true }).click()
 
   await expect(page.locator('[data-ui="branch-tree-node"]')).toHaveCount(6)
-  const topology = await page.evaluate(async () => {
-    const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const request = indexedDB.open('natter')
-      request.onsuccess = () => resolve(request.result)
-      request.onerror = () => reject(request.error)
-    })
-    try {
-      return await new Promise<Array<Record<string, unknown>>>((resolve, reject) => {
-        const tx = db.transaction(['messages'], 'readonly')
-        const request = tx.objectStore('messages').getAll()
-        request.onsuccess = () =>
-          resolve(
-            (request.result as Array<Record<string, unknown>>).filter(
-              (row) => row.chatId === 'branch-tree-chat',
-            ),
-          )
+  const databaseName = await activeWorkspaceDatabaseName(page)
+  const topology = await page.evaluate(
+    async ({ chatId, databaseName }) => {
+      const db = await new Promise<IDBDatabase>((resolve, reject) => {
+        const request = indexedDB.open(databaseName)
+        request.onsuccess = () => resolve(request.result)
         request.onerror = () => reject(request.error)
       })
-    } finally {
-      db.close()
-    }
-  })
-  const inserted = topology.find((row) => row.origin === 'imported')
-  expect(inserted?.parentId).toBe('root')
-  expect(topology.find((row) => row.id === 'A1')?.parentId).toBe(inserted?.id)
-  expect(topology.find((row) => row.id === 'B1')?.parentId).toBe(inserted?.id)
+      try {
+        return await new Promise<Array<Record<string, unknown>>>((resolve, reject) => {
+          const tx = db.transaction(['messages'], 'readonly')
+          const request = tx.objectStore('messages').getAll()
+          request.onsuccess = () =>
+            resolve(
+              (request.result as Array<Record<string, unknown>>).filter(
+                (row) => row.chatId === chatId,
+              ),
+            )
+          request.onerror = () => reject(request.error)
+        })
+      } finally {
+        db.close()
+      }
+    },
+    { chatId: fixture.chatId, databaseName },
+  )
+  const sourceIds = new Set([fixture.root, fixture.A1, fixture.A2, fixture.B1, fixture.B2])
+  const inserted = topology.find((row) => typeof row.id === 'string' && !sourceIds.has(row.id))
+  expect(inserted?.parentId).toBe(fixture.root)
+  expect(topology.find((row) => row.id === fixture.A1)?.parentId).toBe(inserted?.id)
+  expect(topology.find((row) => row.id === fixture.B1)?.parentId).toBe(inserted?.id)
   if (typeof inserted?.id !== 'string') throw new Error('Inserted node missing')
 
   await expect(page.locator('[data-role="chat-edit-tree"]')).toBeDisabled()
@@ -517,48 +579,60 @@ test('shared and child connector targets remain distinct and shared insertion mo
   )
   await page.getByRole('button', { name: 'Delete message' }).click()
   await expect(page.locator('[data-ui="branch-tree-node"]')).toHaveCount(5)
-  await expect(page.locator('[data-ui="toast-text"]')).toHaveText('Deleted message.')
-  await page.locator('[data-ui="toast-undo"]').click()
+  const deletedToast = page.locator('[data-ui="toast"]').filter({ hasText: 'Deleted message.' })
+  await expect(deletedToast.locator('[data-ui="toast-text"]')).toHaveText('Deleted message.')
+  await deletedToast.locator('[data-ui="toast-undo"]').click()
   await expect(page.locator('[data-ui="branch-tree-node"]')).toHaveCount(6)
 })
 
 test('every leaf exposes an append target that inserts a child after it', async ({ page }) => {
-  const chatId = await seedBranchTreeChat(page)
-  await page.goto(`/#/chat/${chatId}/message/B2`)
+  const fixture = await seedBranchTreeChat(page)
+  await page.goto(`/#/chat/${fixture.chatId}/message/${fixture.B2}`)
   await page.locator('[data-role="chat-branch-tree"]').click()
 
   const leafTargets = page.getByRole('button', { name: 'Add message after this leaf' })
   await expect(leafTargets).toHaveCount(2)
-  await page.locator('[data-connector-hit="leaf-append"][data-parent-id="A2"]').click()
+  await page.locator(`[data-connector-hit="leaf-append"][data-parent-id="${fixture.A2}"]`).click()
   await expect(page.locator('[data-ui="import-modal"]')).toBeVisible()
   await page.locator('[data-ui="import-modal-text"]').fill('child appended after A2')
   await page.getByRole('button', { name: 'Import', exact: true }).click()
 
   await expect(page.locator('[data-ui="branch-tree-node"]')).toHaveCount(6)
   await expect(leafTargets).toHaveCount(2)
-  const inserted = await page.evaluate(async () => {
-    const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const request = indexedDB.open('natter')
-      request.onsuccess = () => resolve(request.result)
-      request.onerror = () => reject(request.error)
-    })
-    try {
-      return await new Promise<Record<string, unknown> | undefined>((resolve, reject) => {
-        const tx = db.transaction(['messages'], 'readonly')
-        const request = tx.objectStore('messages').getAll()
-        request.onsuccess = () =>
-          resolve(
-            (request.result as Array<Record<string, unknown>>).find(
-              (row) => row.chatId === 'branch-tree-chat' && row.origin === 'imported',
-            ),
-          )
+  const databaseName = await activeWorkspaceDatabaseName(page)
+  const inserted = await page.evaluate(
+    async ({ chatId, databaseName, sourceIds }) => {
+      const db = await new Promise<IDBDatabase>((resolve, reject) => {
+        const request = indexedDB.open(databaseName)
+        request.onsuccess = () => resolve(request.result)
         request.onerror = () => reject(request.error)
       })
-    } finally {
-      db.close()
-    }
-  })
-  expect(inserted?.parentId).toBe('A2')
+      try {
+        return await new Promise<Record<string, unknown> | undefined>((resolve, reject) => {
+          const tx = db.transaction(['messages'], 'readonly')
+          const request = tx.objectStore('messages').getAll()
+          request.onsuccess = () =>
+            resolve(
+              (request.result as Array<Record<string, unknown>>).find(
+                (row) =>
+                  row.chatId === chatId &&
+                  typeof row.id === 'string' &&
+                  !sourceIds.includes(row.id),
+              ),
+            )
+          request.onerror = () => reject(request.error)
+        })
+      } finally {
+        db.close()
+      }
+    },
+    {
+      chatId: fixture.chatId,
+      databaseName,
+      sourceIds: [fixture.root, fixture.A1, fixture.A2, fixture.B1, fixture.B2],
+    },
+  )
+  expect(inserted?.parentId).toBe(fixture.A2)
   expect(inserted?.role).toBe('user')
   expect(typeof inserted?.id).toBe('string')
   const insertedId = String(inserted?.id)
@@ -585,10 +659,11 @@ test('tree inspector exposes generation, fork, context, reasoning, and tool acti
       { finish: 'stop' },
     ]),
   })
-  const chatId = await seedBranchTreeChat(page)
-  await page.goto(`/#/chat/${chatId}/message/B2`)
+  const fixture = await seedBranchTreeChat(page)
+  await page.goto(`/#/chat/${fixture.chatId}/message/${fixture.B2}`)
   await page.locator('[data-role="chat-branch-tree"]').click()
-  await page.locator('[data-ui="branch-tree-node"][data-message-id="A2"]').click()
+  const branchANode = page.locator(`[data-ui="branch-tree-node"][data-message-id="${fixture.A2}"]`)
+  await branchANode.click()
 
   await expect(page.getByRole('button', { name: 'Regenerate response' })).toBeEnabled()
   await expect(page.getByRole('button', { name: 'Continue from here' })).toBeEnabled()
@@ -597,16 +672,13 @@ test('tree inspector exposes generation, fork, context, reasoning, and tool acti
   const hideContext = page.getByRole('button', { name: 'Hide from context (never send to model)' })
   await hideContext.click()
   await expect(page.getByRole('button', { name: 'Show in context (send to model)' })).toBeVisible()
-  await expect(page.locator('[data-ui="branch-tree-node"][data-message-id="A2"]')).toHaveAttribute(
-    'data-hidden-from-context',
-    'true',
-  )
+  await expect(branchANode).toHaveAttribute('data-hidden-from-context', 'true')
   await expect(
     page.locator(
-      '[data-ui="branch-tree-node"][data-message-id="A2"] [data-ui="branch-tree-node-visibility"]',
+      `[data-ui="branch-tree-node"][data-message-id="${fixture.A2}"] [data-ui="branch-tree-node-visibility"]`,
     ),
   ).toBeVisible()
-  await expect.poll(() => readStoredMessageHidden(page, 'A2')).toBe(true)
+  await expect.poll(() => readStoredMessageHidden(page, fixture.A2)).toBe(true)
 
   await page.locator('[data-ui="branch-tree-inspector"] [data-ui="reasoning-summary"]').click()
   await page.getByRole('button', { name: 'Hide this reasoning block' }).click()
@@ -617,24 +689,26 @@ test('tree inspector exposes generation, fork, context, reasoning, and tool acti
   await expect(page.getByRole('button', { name: 'Unhide tool call' })).toBeVisible()
 
   await page.getByRole('button', { name: 'Show in context (send to model)' }).click()
-  await expect(
-    page.locator('[data-ui="branch-tree-node"][data-message-id="A2"]'),
-  ).not.toHaveAttribute('data-hidden-from-context')
+  await expect(branchANode).not.toHaveAttribute('data-hidden-from-context')
   await page.getByRole('button', { name: 'Unhide this reasoning block' }).click()
   await page.getByRole('button', { name: 'Unhide tool call' }).click()
 
   await page.getByRole('button', { name: 'Continue from here' }).click()
-  await expect.poll(() => readStoredMessageText(page, 'A2')).toContain('continued from tree')
-  await expect.poll(() => page.evaluate(() => window.location.hash)).toContain('/message/A2')
-  await expect(page.locator('[data-ui="branch-tree-node"][data-message-id="A2"]')).toHaveAttribute(
-    'data-current-leaf',
-    'true',
-  )
+  await expect.poll(() => readStoredMessageText(page, fixture.A2)).toContain('continued from tree')
+  await expect
+    .poll(() => page.evaluate(() => window.location.hash))
+    .toContain(`/message/${fixture.B2}`)
+  await expect(branchANode).toHaveAttribute('data-selected', 'true')
+  await expect(branchANode).not.toHaveAttribute('data-current-leaf')
 
   await page.getByRole('button', { name: 'Regenerate response' }).click()
   await expect(page.locator('[data-ui="branch-tree-node"]')).toHaveCount(6)
-  await expect.poll(() => readRegeneratedSiblingText(page)).toContain('continued from tree')
-  await expect.poll(() => page.evaluate(() => window.location.hash)).not.toContain('/message/B2')
+  await expect
+    .poll(() => readRegeneratedSiblingText(page, fixture.chatId, fixture.A1, fixture.A2))
+    .toContain('continued from tree')
+  await expect
+    .poll(() => page.evaluate(() => window.location.hash))
+    .not.toContain(`/message/${fixture.B2}`)
   const regeneratedLeaf = page.locator('[data-ui="branch-tree-node"][data-current-leaf="true"]')
   await expect(regeneratedLeaf).toHaveAttribute('data-selected', 'true')
   const regeneratedLeafId = await regeneratedLeaf.getAttribute('data-message-id')
@@ -678,10 +752,10 @@ test('Save & Send from an off-branch tree node hands its live stream to the tran
     })
   })
 
-  const chatId = await seedBranchTreeChat(page)
-  await page.goto(`/#/chat/${chatId}/message/B2`)
+  const fixture = await seedBranchTreeChat(page)
+  await page.goto(`/#/chat/${fixture.chatId}/message/${fixture.B2}`)
   await page.locator('[data-role="chat-branch-tree"]').click()
-  await page.locator('[data-ui="branch-tree-node"][data-message-id="A1"]').click()
+  await page.locator(`[data-ui="branch-tree-node"][data-message-id="${fixture.A1}"]`).click()
   await page.getByRole('button', { name: 'Edit message' }).click()
   await page
     .locator('[data-ui="branch-tree-inspector"] [data-ui="inline-editor-input"]')
@@ -753,22 +827,22 @@ test('tree inspector keeps header controls live and guards body actions during a
     })
   })
 
-  const chatId = await seedBranchTreeChat(page)
-  await page.goto(`/#/chat/${chatId}/message/B2`)
+  const fixture = await seedBranchTreeChat(page)
+  await page.goto(`/#/chat/${fixture.chatId}/message/${fixture.B2}`)
   await page.locator('[data-role="chat-branch-tree"]').click()
-  await page.locator('[data-ui="branch-tree-node"][data-message-id="A2"]').click()
+  const branchANode = page.locator(`[data-ui="branch-tree-node"][data-message-id="${fixture.A2}"]`)
+  await branchANode.click()
 
   try {
     await page.getByRole('button', { name: 'Continue from here' }).click()
     await requestSeen
     await expect(page.locator('[data-ui="branch-tree-stop"]')).toBeVisible()
 
-    await expect(
-      page.locator('[data-ui="branch-tree-node"][data-message-id="A2"]'),
-    ).toHaveAttribute('data-current-leaf', 'true')
+    await expect(branchANode).toHaveAttribute('data-selected', 'true')
+    await expect(branchANode).not.toHaveAttribute('data-current-leaf')
     await expect(page.locator('[data-ui="branch-tree-inspector"]')).toHaveAttribute(
       'data-message-id',
-      'A2',
+      fixture.A2,
     )
 
     await page.locator('[data-ui="branch-tree-inspector"] [data-ui="reasoning-summary"]').click()
@@ -782,15 +856,17 @@ test('tree inspector keeps header controls live and guards body actions during a
     await expect(
       page.getByRole('button', { name: 'Show in context (send to model)' }),
     ).toBeVisible()
-    await expect.poll(() => readStoredMessageHidden(page, 'A2')).toBe(true)
+    await expect.poll(() => readStoredMessageHidden(page, fixture.A2)).toBe(true)
 
     await page.locator('[data-role="chat-branch-tree"]').click()
-    await expect(page.locator('[data-ui="message"][data-message-id="A2"]')).toBeVisible()
-    await expect(page.getByRole('button', { name: 'Stop generating' })).toBeVisible()
+    await expect(page.locator(`[data-ui="message"][data-message-id="${fixture.B2}"]`)).toBeVisible()
+    await expect(page.locator(`[data-ui="message"][data-message-id="${fixture.A2}"]`)).toHaveCount(
+      0,
+    )
+    await expect(page.getByRole('button', { name: 'Stop generating' })).toHaveCount(0)
     await page.locator('[data-role="chat-branch-tree"]').click()
-    await expect(
-      page.locator('[data-ui="branch-tree-node"][data-message-id="A2"]'),
-    ).toHaveAttribute('data-selected', 'true')
+    await expect(branchANode).toHaveAttribute('data-selected', 'true')
+    await expect(page.locator('[data-ui="branch-tree-stop"]')).toBeVisible()
     await expect(page.getByRole('button', { name: 'Hide this reasoning block' })).toBeDisabled()
     await expect(page.getByRole('button', { name: 'Hide tool call' })).toBeDisabled()
   } finally {
@@ -798,8 +874,8 @@ test('tree inspector keeps header controls live and guards body actions during a
   }
 
   await expect(page.locator('[data-ui="branch-tree-stop"]')).toHaveCount(0)
-  await expect.poll(() => readStoredMessageText(page, 'A2')).toContain('guarded continuation')
-  await waitForMessageGenerationFinished(page, 'A2')
+  await expect.poll(() => readStoredMessageText(page, fixture.A2)).toContain('guarded continuation')
+  await waitForMessageGenerationFinished(page, fixture.A2)
   await expect(page.getByRole('button', { name: 'Hide this reasoning block' })).toBeEnabled()
   await expect(page.getByRole('button', { name: 'Hide tool call' })).toBeEnabled()
 })
@@ -896,10 +972,47 @@ test('tree shows and follows a pending response before the first byte arrives', 
   }
 })
 
-async function seedBranchTreeChat(page: Page): Promise<string> {
+async function seedBranchTreeChat(page: Page): Promise<BranchTreeFixture> {
   const now = Date.now()
   const chatId = 'branch-tree-chat'
-  const sourceMessages: Message[] = [
+  const modelId = 'google/gemini-3.1-flash-lite-preview:free'
+  await page.route('https://openrouter.ai/api/v1/models/**/endpoints', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        data: {
+          id: modelId,
+          name: modelId,
+          context_length: 131_072,
+          architecture: {
+            tokenizer: 'Gemini',
+            input_modalities: ['text'],
+            output_modalities: ['text'],
+          },
+          endpoints: [
+            {
+              provider_name: 'Natter Test Provider',
+              provider_slug: 'natter-test-provider',
+              supported_parameters: ['reasoning'],
+              context_length: 131_072,
+              max_prompt_tokens: 131_072,
+              max_completion_tokens: 4096,
+              pricing: { prompt: '0', completion: '0' },
+              data_policy: {
+                training: false,
+                trainingOpenRouter: false,
+                retainsPrompts: false,
+                canPublish: false,
+                requiresUserIDs: false,
+              },
+            },
+          ],
+        },
+      }),
+    })
+  })
+  const sourceMessages: Array<Record<string, unknown>> = [
     {
       id: 'root',
       chatId,
@@ -996,74 +1109,31 @@ async function seedBranchTreeChat(page: Page): Promise<string> {
       deleted: false,
     },
   ]
-  const storedMessages = sourceMessages.map((message) => splitMessageForStorage(message))
-  const wordCount = storedMessages.reduce((total, stored) => total + stored.header.bodyWordCount, 0)
-  const previewText = previewTextFromStoredProjection(
-    storedMessages.find((stored) => stored.header.id === 'A1')?.header.textPreview ?? '',
-  )
-
-  await page.evaluate(
-    async (seed) => {
-      const db = await new Promise<IDBDatabase>((resolve, reject) => {
-        const request = indexedDB.open('natter')
-        request.onsuccess = () => resolve(request.result)
-        request.onerror = () => reject(request.error)
-      })
-      try {
-        await new Promise<void>((resolve, reject) => {
-          const tx = db.transaction(['presets', 'chats', 'messages', 'messageBodies'], 'readwrite')
-          const presets = tx.objectStore('presets')
-          const chats = tx.objectStore('chats')
-          const messages = tx.objectStore('messages')
-          const messageBodies = tx.objectStore('messageBodies')
-          const presetsRequest = presets.getAll()
-          presetsRequest.onsuccess = () => {
-            const preset = (
-              presetsRequest.result as Array<{ id?: string; settings?: Record<string, unknown> }>
-            )[0]
-            if (!preset?.id || !preset.settings) {
-              reject(new Error('missing seed preset'))
-              return
-            }
-            chats.put({
-              id: seed.chatId,
-              title: 'Branch tree chat',
-              titleStatus: 'manual',
-              createdAt: seed.now,
-              updatedAt: seed.now + seed.storedMessages.length - 1,
-              lastViewedAt: seed.now + seed.storedMessages.length - 1,
-              wordCount: seed.wordCount,
-              totalCostUsd: 0,
-              metaVersion: 0,
-              summaryVersion: 0,
-              settings: structuredClone(preset.settings),
-              presetId: preset.id,
-              lastUpdatedLeafId: 'B2',
-              lastBranchUpdatedAt: seed.now + seed.storedMessages.length - 1,
-              archived: false,
-              pinned: false,
-              folderId: null,
-              tags: [],
-              previewText: seed.previewText,
-            })
-            for (const stored of seed.storedMessages) {
-              messages.put(stored.header)
-              messageBodies.put(stored.body)
-            }
-          }
-          presetsRequest.onerror = () => reject(presetsRequest.error)
-          tx.oncomplete = () => resolve()
-          tx.onerror = () => reject(tx.error)
-          tx.onabort = () => reject(tx.error)
-        })
-      } finally {
-        db.close()
-      }
+  const imported = await importPortableChatThroughUi(page, {
+    sourceChatId: chatId,
+    title: 'Branch tree chat',
+    createdAt: now,
+    messages: sourceMessages,
+    settings: {
+      api: 'chat',
+      model: modelId,
     },
-    { chatId, now, previewText, storedMessages, wordCount },
-  )
-  await rebuildSidebarProjection(page)
-  return chatId
+    captureMessageIds: true,
+  })
+  if (!imported.messageIdMap) throw new Error('Branch tree fixture message ids were not captured')
+  const id = (sourceId: string): string => {
+    const importedId = imported.messageIdMap?.[sourceId]
+    if (!importedId) throw new Error(`Branch tree fixture message id missing: ${sourceId}`)
+    return importedId
+  }
+  return {
+    chatId: imported.chatId,
+    root: id('root'),
+    A1: id('A1'),
+    A2: id('A2'),
+    B1: id('B1'),
+    B2: id('B2'),
+  }
 }
 
 async function readStoredMessageText(page: Page, messageId: string): Promise<string> {
@@ -1077,9 +1147,16 @@ async function readStoredMessageHidden(page: Page, messageId: string): Promise<b
   return (await readStoredMessage(page, messageId))?.hiddenFromContext === true
 }
 
-async function readRegeneratedSiblingText(page: Page): Promise<string> {
-  const messages = await readMessages(page, 'branch-tree-chat')
-  const regenerated = messages.find((message) => message.parentId === 'A1' && message.id !== 'A2')
+async function readRegeneratedSiblingText(
+  page: Page,
+  chatId: string,
+  parentId: string,
+  originalId: string,
+): Promise<string> {
+  const messages = await readMessages(page, chatId)
+  const regenerated = messages.find(
+    (message) => message.parentId === parentId && message.id !== originalId,
+  )
   return ((regenerated?.content ?? []) as Array<{ text?: string }>)
     .map((item) => item.text ?? '')
     .join('')
@@ -1105,33 +1182,37 @@ async function readStoredMessage(
   page: Page,
   messageId: string,
 ): Promise<Record<string, unknown> | undefined> {
-  return page.evaluate(async (id) => {
-    const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const request = indexedDB.open('natter')
-      request.onsuccess = () => resolve(request.result)
-      request.onerror = () => reject(request.error)
-    })
-    try {
-      return await new Promise<Record<string, unknown> | undefined>((resolve, reject) => {
-        const tx = db.transaction(['messages', 'messageBodies'], 'readonly')
-        const headerRequest = tx.objectStore('messages').get(id)
-        headerRequest.onsuccess = () => {
-          const header = headerRequest.result as Record<string, unknown> | undefined
-          if (!header) {
-            resolve(undefined)
-            return
-          }
-          const bodyRequest = tx.objectStore('messageBodies').get(id)
-          bodyRequest.onsuccess = () => {
-            const body = bodyRequest.result as Record<string, unknown> | undefined
-            resolve(body ? { ...header, ...body, nodeVersion: header.nodeVersion } : header)
-          }
-          bodyRequest.onerror = () => reject(bodyRequest.error)
-        }
-        headerRequest.onerror = () => reject(headerRequest.error)
+  const databaseName = await activeWorkspaceDatabaseName(page)
+  return page.evaluate(
+    async ({ databaseName, id }) => {
+      const db = await new Promise<IDBDatabase>((resolve, reject) => {
+        const request = indexedDB.open(databaseName)
+        request.onsuccess = () => resolve(request.result)
+        request.onerror = () => reject(request.error)
       })
-    } finally {
-      db.close()
-    }
-  }, messageId)
+      try {
+        return await new Promise<Record<string, unknown> | undefined>((resolve, reject) => {
+          const tx = db.transaction(['messages', 'messageBodies'], 'readonly')
+          const headerRequest = tx.objectStore('messages').get(id)
+          headerRequest.onsuccess = () => {
+            const header = headerRequest.result as Record<string, unknown> | undefined
+            if (!header) {
+              resolve(undefined)
+              return
+            }
+            const bodyRequest = tx.objectStore('messageBodies').get(id)
+            bodyRequest.onsuccess = () => {
+              const body = bodyRequest.result as Record<string, unknown> | undefined
+              resolve(body ? { ...header, ...body, nodeVersion: header.nodeVersion } : header)
+            }
+            bodyRequest.onerror = () => reject(bodyRequest.error)
+          }
+          headerRequest.onerror = () => reject(headerRequest.error)
+        })
+      } finally {
+        db.close()
+      }
+    },
+    { databaseName, id: messageId },
+  )
 }

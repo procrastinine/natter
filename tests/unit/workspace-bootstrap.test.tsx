@@ -1,7 +1,14 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { StrictMode } from 'react'
+import { StrictMode, useEffect, useLayoutEffect } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { WorkspaceBootstrap, type WorkspaceOpenOptions } from '../../src/app/WorkspaceBootstrap'
+import { DEFAULT_SEARCH_FILTERS, useChatCatalogSearch } from '../../src/hooks/useCatalogApplication'
+import { StorageAdministration } from '../../src/store/storage-administration'
+import { suspendWorkspacePresentation } from '../../src/store/workspace-presentation-lifecycle'
+import {
+  disposeLoadedWorkspaceSessionOwners,
+  resetLoadedWorkspaceSessionOwnersForTests,
+} from '../../src/store/workspace-session-owner'
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void
@@ -18,19 +25,97 @@ afterEach(() => {
 })
 
 describe('WorkspaceBootstrap', () => {
-  it('renders a boot shell immediately and mounts the app after the workspace opens', async () => {
+  it('acknowledges readiness only after the opened presentation commits', async () => {
+    const events: string[] = []
+    function Presentation() {
+      useLayoutEffect(() => {
+        events.push('presentation-committed')
+      }, [])
+      return <div>Ready presentation</div>
+    }
+
+    render(
+      <WorkspaceBootstrap
+        openWorkspace={() => Promise.resolve()}
+        onReady={() => events.push('workspace-ready')}
+      >
+        <Presentation />
+      </WorkspaceBootstrap>,
+    )
+
+    expect(await screen.findByText('Ready presentation')).toBeVisible()
+    await waitFor(() => expect(events).toEqual(['presentation-committed', 'workspace-ready']))
+  })
+
+  it('keeps the application shell mounted and interactive while the workspace opens', async () => {
     const opening = deferred<void>()
+    const onClick = vi.fn()
     render(
       <WorkspaceBootstrap openWorkspace={() => opening.promise}>
-        <div>Ready workspace</div>
+        <button type="button" onClick={onClick}>
+          Application control
+        </button>
       </WorkspaceBootstrap>,
     )
 
     expect(screen.getByRole('status')).toHaveTextContent('Opening local workspace')
-    expect(screen.queryByText('Ready workspace')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Application control' }))
+    expect(onClick).toHaveBeenCalledTimes(1)
 
     await act(async () => opening.resolve())
-    expect(await screen.findByText('Ready workspace')).toBeVisible()
+    expect(screen.queryByRole('status')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Application control' })).toBeVisible()
+  })
+
+  it('reports the exact opening owner and bounded migration progress without polling', async () => {
+    const opening = deferred<void>()
+    let onProgress: WorkspaceOpenOptions['onProgress']
+    render(
+      <WorkspaceBootstrap
+        openWorkspace={(options) => {
+          onProgress = options.onProgress
+          return opening.promise
+        }}
+      >
+        <div>Progress workspace</div>
+      </WorkspaceBootstrap>,
+    )
+
+    await waitFor(() => expect(onProgress).toBeTypeOf('function'))
+    act(() => {
+      onProgress?.({
+        kind: 'database-selection',
+        operation: 'acquire-active-slot',
+        databaseName: 'natter-workspace-b',
+      })
+    })
+    const bootstrap = screen.getByRole('status').closest('[data-ui="workspace-bootstrap"]')
+    expect(bootstrap).toHaveAttribute('data-open-stage', 'database-selection')
+    expect(bootstrap).toHaveAttribute('data-open-operation', 'acquire-active-slot')
+    expect(
+      screen.getByText(/Opening the active workspace slot \(natter-workspace-b\)/u),
+    ).toBeVisible()
+
+    act(() => {
+      onProgress?.({
+        kind: 'database-upgrade',
+        databaseName: 'natter-workspace-b',
+        fromVersion: 94,
+        targetVersion: 95,
+        phase: 'messages-and-attachments',
+        operation: 'normalize-message-pairs',
+        processedRows: 4096,
+        processedBytes: 8_388_608,
+      })
+    })
+    expect(screen.getByText(/Processed 4,096 rows/u)).toBeVisible()
+    expect(screen.getByLabelText('Opening diagnostics')).toHaveTextContent(
+      '"phase": "messages-and-attachments"',
+    )
+    expect(screen.getByLabelText('Opening diagnostics')).toHaveTextContent('"processedRows": 4096')
+
+    await act(async () => opening.resolve())
+    expect(screen.queryByRole('status')).not.toBeInTheDocument()
   })
 
   it('shares one open attempt across StrictMode effect replay', async () => {
@@ -47,14 +132,84 @@ describe('WorkspaceBootstrap', () => {
     expect(openWorkspace).toHaveBeenCalledTimes(1)
   })
 
+  it('unmounts mounted catalog consumers before clear disposes terminal session owners', async () => {
+    const events: string[] = []
+    function CatalogConsumer() {
+      useChatCatalogSearch({
+        surface: 'sidebar',
+        query: '',
+        scope: 'last-updated-branch',
+        filters: DEFAULT_SEARCH_FILTERS,
+        enabled: false,
+      })
+      useEffect(
+        () => () => {
+          events.push('catalog-consumer-cleanup')
+        },
+        [],
+      )
+      return <div>Mounted catalog consumer</div>
+    }
+    render(
+      <StrictMode>
+        <WorkspaceBootstrap openWorkspace={() => Promise.resolve()}>
+          <CatalogConsumer />
+        </WorkspaceBootstrap>
+      </StrictMode>,
+    )
+
+    expect(await screen.findByText('Mounted catalog consumer')).toBeVisible()
+    events.length = 0
+    const administration = new StorageAdministration({
+      clientId: 'strict-mode-tab',
+      transport: { subscribe: () => () => {}, post: () => {} },
+      barrier: {
+        ready: async () => {},
+        releasePresence: async () => {},
+        runExclusive: async (operation) => operation(),
+      },
+      quiesce: async () => {},
+      terminalize: async () => {
+        await suspendWorkspacePresentation()
+        events.push('presentation-suspended')
+        disposeLoadedWorkspaceSessionOwners()
+        events.push('session-owners-disposed')
+      },
+      resume: async () => {},
+      wipe: async () => ({
+        deletedDatabaseNames: [],
+        deletedCacheNames: [],
+        deletedOpfsEntryNames: [],
+        deletedStorageBucketNames: [],
+        unregisteredServiceWorkerScopes: [],
+      }),
+      recreateAndVerify: async () => {},
+      clearSessionStorage: () => {},
+      reload: () => {},
+    })
+    let clearing!: Promise<unknown>
+    act(() => {
+      clearing = administration.clearAll({ skipReload: true })
+    })
+
+    expect(await screen.findByRole('heading', { name: 'Closing local workspace…' })).toBeVisible()
+    await act(async () => clearing)
+    expect(screen.queryByText('Mounted catalog consumer')).not.toBeInTheDocument()
+    expect(events).toEqual([
+      'catalog-consumer-cleanup',
+      'presentation-suspended',
+      'session-owners-disposed',
+    ])
+    resetLoadedWorkspaceSessionOwnersForTests()
+  })
+
   it('shows a non-destructive recovery view and retries a rejected open', async () => {
-    const beforeRetry = vi.fn()
     const openWorkspace = vi
       .fn<(options: WorkspaceOpenOptions) => Promise<void>>()
       .mockRejectedValueOnce(Object.assign(new Error('private detail'), { name: 'VersionError' }))
       .mockResolvedValueOnce()
     render(
-      <WorkspaceBootstrap openWorkspace={openWorkspace} beforeRetry={beforeRetry}>
+      <WorkspaceBootstrap openWorkspace={openWorkspace}>
         <div>Recovered workspace</div>
       </WorkspaceBootstrap>,
     )
@@ -66,7 +221,6 @@ describe('WorkspaceBootstrap', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Try again' }))
     expect(await screen.findByText('Recovered workspace')).toBeVisible()
-    expect(beforeRetry).toHaveBeenCalledTimes(1)
     expect(openWorkspace).toHaveBeenCalledTimes(2)
   })
 

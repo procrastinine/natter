@@ -1,32 +1,46 @@
-import { buildBranchCacheRow, messageRenderableText } from '../core/branch-flatten'
 import {
+  type CompiledSearchText,
+  compileSearchText,
+  findLiteralSearchRanges,
+  IncrementalSearchTextScanner,
+  type MessageCorpusSearchResult,
   parseSearchQuery,
   type SearchNameClause,
   type SearchQuery,
   type SearchQueryParseError,
   type SearchTextClause,
+  scanSearchTextSegments,
+  searchClauseHitsMatch,
 } from '../core/search-query'
 import type {
-  Chat,
-  ChatBranchCache,
   ChatFolder,
   ChatId,
+  ChatSidebarRow,
   ChatTag,
   FolderId,
-  Message,
   MessageId,
   TagId,
 } from '../core/types'
-import { isChatBranchCacheFresh } from './branch-cache'
-import {
-  chatMatchesBranchCacheWriteGuard,
-  readChatBranchCacheSource,
-  type WorkspaceRepository,
-} from './repository'
+import { yieldToEventLoop } from '../lib/yield-to-event-loop'
+import { consumeLastUpdatedBranchText } from './branch-text'
+import { searchMessageCorpus } from './message-search-service'
+import type {
+  WorkspaceQuery,
+  WorkspaceQueryResult,
+  WorkspaceReadAuthority,
+  WorkspaceRepository,
+} from './workspace-protocol'
 import { getWorkspaceRepository } from './workspace-repository'
+import { runWorkspaceRead } from './workspace-runtime'
 
 export type SearchScope = 'last-updated-branch' | 'all-branches'
-type SearchResultSource = 'title' | 'branch-cache' | 'all-branches' | 'folder' | 'tag' | 'preview'
+type SearchResultSource =
+  | 'title'
+  | 'last-updated-branch'
+  | 'all-branches'
+  | 'folder'
+  | 'tag'
+  | 'preview'
 
 export interface SearchFilters {
   includeFolderIds: FolderId[]
@@ -45,7 +59,7 @@ interface SearchHighlightRange {
 export interface SearchResult {
   id: string
   chatId: ChatId
-  chat: Chat
+  chat: ChatSidebarRow
   branchLeafId?: MessageId | null
   messageId?: MessageId
   source: SearchResultSource
@@ -61,6 +75,7 @@ interface ChatSearchStartedUpdate {
   kind: 'started'
   queryId: string
   candidateCount: number
+  candidateChatIds: readonly ChatId[]
 }
 
 interface ChatSearchHitUpdate {
@@ -95,12 +110,19 @@ interface ChatSearchDoneUpdate {
   candidateCount: number
 }
 
+interface ChatSearchExcludedUpdate {
+  kind: 'excluded'
+  queryId: string
+  chatId: ChatId
+}
+
 export type ChatSearchUpdate =
   | ChatSearchStartedUpdate
   | ChatSearchHitUpdate
   | ChatSearchMissUpdate
   | ChatSearchTaskErrorUpdate
   | ChatSearchDoneUpdate
+  | ChatSearchExcludedUpdate
 
 interface ChatSearchOutput {
   queryId: string
@@ -117,8 +139,10 @@ interface SearchChatsInput {
   filters?: SearchFilters
   chatIds?: readonly ChatId[]
   repo?: WorkspaceRepository
+  authority?: WorkspaceReadAuthority
   signal?: AbortSignal
   concurrency?: number
+  collectResults?: boolean
   onUpdate?: (update: ChatSearchUpdate) => void
 }
 
@@ -133,23 +157,16 @@ interface SearchField {
   source: SearchResultSource
   text: string
   messageId?: MessageId
-  normalizedText?: string
 }
 
-interface NormalizedSearchField extends SearchField {
-  normalizedText: string
+interface SearchSidebarPage {
+  readonly rows: readonly ChatSidebarRow[]
+  readonly requestedChatIds?: readonly ChatId[]
 }
 
-interface NormalizedSearchTextClause {
-  clause: SearchTextClause
-  needle: string
-}
-
-interface NormalizedSearchText {
-  clauses: NormalizedSearchTextClause[]
-  hasPositive: boolean
-  hasNegative: boolean
-}
+type SearchSidebarPageRead =
+  | { readonly ok: true; readonly result: IteratorResult<SearchSidebarPage> }
+  | { readonly ok: false; readonly error: unknown }
 
 interface FieldMatch {
   source: SearchResultSource
@@ -157,16 +174,23 @@ interface FieldMatch {
   matchIndex: number | null
   matchLength: number
   messageId?: MessageId
+  prefixTruncated?: boolean
+  suffixTruncated?: boolean
 }
 
 interface ScanContext {
   queryId: string
   parsed: SearchQuery
-  normalizedText: NormalizedSearchText
+  compiledText: CompiledSearchText
   catalog: SearchCatalog
   filters: SearchFilters
+  includeFolderIds: ReadonlySet<FolderId>
+  excludeFolderIds: ReadonlySet<FolderId>
+  includeTagIds: ReadonlySet<TagId>
+  excludeTagIds: ReadonlySet<TagId>
   scope: SearchScope
   repo: WorkspaceRepository
+  authority: WorkspaceReadAuthority
   signal?: AbortSignal
 }
 
@@ -200,6 +224,132 @@ const SNIPPET_BEFORE = 60
 const SNIPPET_AFTER = 120
 const FALLBACK_SNIPPET_CHARS = 180
 const SEARCH_YIELD_BUDGET_MS = 12
+const SEARCH_SIDEBAR_PAGE_SIZE = 500
+const SEARCH_EXCERPT_FEED_CHARS = 2 * 1024
+
+class BranchSearchCollector {
+  private readonly compiled: CompiledSearchText
+  private readonly signal: AbortSignal | undefined
+  private readonly scanner: IncrementalSearchTextScanner
+  private readonly tailLimit: number
+  private readonly tailChunks: string[] = []
+  private readonly capturedParts: string[] = []
+  private tailLength = 0
+  private capturedStart = 0
+  private capturedEnd = 0
+  private captureTargetEnd = 0
+  private firstPositive: { readonly index: number; readonly length: number } | null = null
+
+  constructor(compiled: CompiledSearchText, signal?: AbortSignal) {
+    this.compiled = compiled
+    this.signal = signal
+    this.scanner = new IncrementalSearchTextScanner(compiled)
+    this.tailLimit =
+      SNIPPET_BEFORE +
+      compiled.clauses.reduce((longest, clause) => Math.max(longest, clause.needle.length), 0) +
+      1
+  }
+
+  reset(prefixSegments: readonly string[]): void {
+    this.scanner.reset()
+    this.tailChunks.length = 0
+    this.capturedParts.length = 0
+    this.tailLength = 0
+    this.capturedStart = 0
+    this.capturedEnd = 0
+    this.captureTargetEnd = 0
+    this.firstPositive = null
+    for (let index = 0; index < prefixSegments.length; index += 1) {
+      if (index > 0) this.push('\n')
+      this.push(prefixSegments[index] ?? '')
+    }
+  }
+
+  push(text: string): void {
+    for (let offset = 0; offset < text.length; offset += SEARCH_EXCERPT_FEED_CHARS) {
+      this.pushChunk(text.slice(offset, offset + SEARCH_EXCERPT_FEED_CHARS))
+    }
+  }
+
+  fieldMatch(fields: readonly SearchField[]): FieldMatch | null {
+    const scan = this.scanner.snapshot()
+    if (!scan.matches) return null
+
+    const metadataMatch = matchFields(fields, this.compiled)
+    if (metadataMatch) return metadataMatch
+    if (!this.compiled.hasPositive || !this.firstPositive) {
+      const fallback = fields.find((field) => field.text.trim().length > 0)
+      return {
+        source: fallback?.source ?? 'preview',
+        text: fallback?.text ?? '',
+        matchIndex: null,
+        matchLength: 0,
+      }
+    }
+
+    return {
+      source: 'last-updated-branch',
+      text: this.capturedParts.join(''),
+      matchIndex: this.firstPositive.index - this.capturedStart,
+      matchLength: this.firstPositive.length,
+      prefixTruncated: this.capturedStart > 0,
+      suffixTruncated: this.capturedEnd < scan.length,
+    }
+  }
+
+  private pushChunk(chunk: string): void {
+    const chunkStart = this.scanner.summary().length
+    this.scanner.push(chunk, this.signal)
+    if (!this.firstPositive) {
+      const firstPositive = this.scanner.summary().firstPositive
+      if (!firstPositive) {
+        this.appendTail(chunk)
+        return
+      }
+      const tail = this.tailChunks.join('')
+      const combinedStart = chunkStart - this.tailLength
+      const combined = tail + chunk
+      const desiredStart = Math.max(0, firstPositive.index - SNIPPET_BEFORE)
+      this.captureTargetEnd = firstPositive.index + firstPositive.length + SNIPPET_AFTER
+      const localStart = Math.max(0, desiredStart - combinedStart)
+      const localEnd = Math.min(combined.length, this.captureTargetEnd - combinedStart)
+      const captured = combined.slice(localStart, Math.max(localStart, localEnd))
+      if (captured.length > 0) this.capturedParts.push(captured)
+      this.capturedStart = combinedStart + localStart
+      this.capturedEnd = this.capturedStart + captured.length
+      this.firstPositive = firstPositive
+      this.tailChunks.length = 0
+      this.tailLength = 0
+      return
+    }
+
+    if (this.capturedEnd >= this.captureTargetEnd) return
+    const localStart = Math.max(0, this.capturedEnd - chunkStart)
+    const localEnd = Math.min(chunk.length, this.captureTargetEnd - chunkStart)
+    if (localEnd <= localStart) return
+    const captured = chunk.slice(localStart, localEnd)
+    this.capturedParts.push(captured)
+    this.capturedEnd += captured.length
+  }
+
+  private appendTail(chunk: string): void {
+    if (this.tailLimit === 0 || chunk.length === 0) return
+    this.tailChunks.push(chunk)
+    this.tailLength += chunk.length
+    while (this.tailLength > this.tailLimit) {
+      const first = this.tailChunks[0]
+      if (first === undefined) break
+      const excess = this.tailLength - this.tailLimit
+      if (first.length <= excess) {
+        this.tailChunks.shift()
+        this.tailLength -= first.length
+      } else {
+        this.tailChunks[0] = first.slice(excess)
+        this.tailLength -= excess
+      }
+    }
+  }
+}
 
 export function cloneSearchFilters(filters: SearchFilters = DEFAULT_SEARCH_FILTERS): SearchFilters {
   return {
@@ -228,145 +378,245 @@ export function hasSearchWork(query: string, filters: SearchFilters): boolean {
 }
 
 export async function searchChats(input: SearchChatsInput): Promise<ChatSearchOutput> {
+  const authority = input.authority
+  if (!authority) {
+    return runWorkspaceRead(
+      'search-session',
+      (authority) => searchChats({ ...input, authority }),
+      input.signal ? { signal: input.signal } : {},
+    )
+  }
   const filters = cloneSearchFilters(input.filters)
   const parseResult = parseSearchQuery(input.query)
   if (!parseResult.ok) throw new ChatSearchParseError(parseResult.error)
 
   const repo = input.repo ?? getWorkspaceRepository()
   const scope = input.scope ?? 'last-updated-branch'
-  const [chats, folders, tags] = await Promise.all([
-    repo.listChats(),
-    repo.listFolders(),
-    repo.listTags(),
-  ])
-  throwIfAborted(input.signal)
+  const linkedAbort = createLinkedSearchAbortController(authority.signal, input.signal)
+  const signal = linkedAbort.controller.signal
+  const pageIterator = iterateSearchSidebarPages(
+    repo,
+    authority,
+    input.chatIds,
+    filters.archived,
+    signal,
+  )[Symbol.asyncIterator]()
+  const [firstPage, folders, tags] = await Promise.all([
+    pageIterator.next(),
+    queryWorkspace(repo, authority, { kind: 'folder.list' }, signal),
+    queryWorkspace(repo, authority, { kind: 'tag.list' }, signal),
+  ]).catch((error: unknown) => {
+    linkedAbort.controller.abort()
+    linkedAbort.dispose()
+    throw error
+  })
+  if (signal.aborted) {
+    linkedAbort.controller.abort()
+    linkedAbort.dispose()
+    throw new ChatSearchAbortedError()
+  }
 
   const catalog = buildCatalog(folders, tags)
   const context: ScanContext = {
     queryId: input.queryId,
     parsed: parseResult.query,
-    normalizedText: normalizeSearchText(parseResult.query.text),
+    compiledText: compileSearchText(parseResult.query.text),
     catalog,
     filters,
+    includeFolderIds: new Set(filters.includeFolderIds),
+    excludeFolderIds: new Set(filters.excludeFolderIds),
+    includeTagIds: new Set(filters.includeTagIds),
+    excludeTagIds: new Set(filters.excludeTagIds),
     scope,
     repo,
+    authority,
   }
-  if (input.signal) context.signal = input.signal
+  context.signal = signal
 
-  const chatIdFilter = input.chatIds ? new Set(input.chatIds) : null
-  const candidates = chats.filter(
-    (chat) =>
-      (!chatIdFilter || chatIdFilter.has(chat.id)) && chatPassesStaticFilters(chat, context),
-  )
   let completedCount = 0
-  const resultsByChat = new Map<ChatId, SearchResult>()
-  const remaining: Chat[] = []
+  let candidateCount = 0
+  const resultsByChat = input.collectResults === false ? null : new Map<ChatId, SearchResult>()
   const yieldController = createSearchYieldController()
+  const bodyPool = new BoundedSearchTaskPool(boundedConcurrency(input.concurrency))
 
-  input.onUpdate?.({
-    kind: 'started',
-    queryId: input.queryId,
-    candidateCount: candidates.length,
-  })
-
-  for (let index = 0; index < candidates.length; index += 1) {
-    throwIfAborted(input.signal)
-    const chat = candidates[index]
-    if (!chat) continue
-    const immediate = matchImmediateChat(chat, context)
-    if (immediate) {
+  const scanCandidateBody = async (chat: ChatSidebarRow): Promise<void> => {
+    throwIfAborted(signal)
+    try {
+      const result =
+        scope === 'all-branches'
+          ? await scanAllBranchesChat(chat, context)
+          : await scanLastUpdatedBranchChat(chat, context)
       completedCount += 1
-      resultsByChat.set(chat.id, immediate)
-      input.onUpdate?.({
-        kind: 'hit',
-        queryId: input.queryId,
-        result: immediate,
-        completedCount,
-        candidateCount: candidates.length,
-      })
-    } else if (filters.titleOnly) {
+      if (result) {
+        resultsByChat?.set(chat.id, result)
+        input.onUpdate?.({
+          kind: 'hit',
+          queryId: input.queryId,
+          result,
+          completedCount,
+          candidateCount,
+        })
+      } else {
+        input.onUpdate?.({
+          kind: 'miss',
+          queryId: input.queryId,
+          chatId: chat.id,
+          completedCount,
+          candidateCount,
+        })
+      }
+    } catch (error) {
+      if (isAbortError(error)) throw error
       completedCount += 1
       input.onUpdate?.({
-        kind: 'miss',
+        kind: 'task-error',
         queryId: input.queryId,
         chatId: chat.id,
+        message: error instanceof Error ? error.message : String(error),
         completedCount,
-        candidateCount: candidates.length,
+        candidateCount,
       })
-    } else {
-      remaining.push(chat)
     }
     await yieldController.maybeYield()
   }
 
-  const concurrency = boundedConcurrency(input.concurrency)
-  let nextIndex = 0
-  async function scanNext(): Promise<void> {
-    for (;;) {
-      throwIfAborted(input.signal)
-      const index = nextIndex
-      nextIndex += 1
-      const chat = remaining[index]
-      if (!chat) return
-      try {
-        const result =
-          scope === 'all-branches'
-            ? await scanAllBranchesChat(chat, context)
-            : await scanLastUpdatedBranchChat(chat, context)
-        completedCount += 1
-        if (result) {
-          resultsByChat.set(chat.id, result)
+  try {
+    let pageResult = firstPage
+    while (!pageResult.done) {
+      throwIfAborted(signal)
+      const nextPage = observeSearchSidebarPageRead(pageIterator.next())
+      const page = pageResult.value
+      const candidates = page.rows.filter((chat) => chatPassesStaticFilters(chat, context))
+      candidateCount += candidates.length
+      const candidateChatIds = candidates.map((chat) => chat.id)
+      input.onUpdate?.({
+        kind: 'started',
+        queryId: input.queryId,
+        candidateCount,
+        candidateChatIds,
+      })
+      if (page.requestedChatIds) {
+        const included = new Set(candidateChatIds)
+        for (const chatId of page.requestedChatIds) {
+          if (included.has(chatId)) continue
+          input.onUpdate?.({ kind: 'excluded', queryId: input.queryId, chatId })
+        }
+      }
+      for (const chat of candidates) {
+        throwIfAborted(signal)
+        const immediate = matchImmediateChat(chat, context)
+        if (immediate) {
+          completedCount += 1
+          resultsByChat?.set(chat.id, immediate)
           input.onUpdate?.({
             kind: 'hit',
             queryId: input.queryId,
-            result,
+            result: immediate,
             completedCount,
-            candidateCount: candidates.length,
+            candidateCount,
           })
-        } else {
+        } else if (filters.titleOnly) {
+          completedCount += 1
           input.onUpdate?.({
             kind: 'miss',
             queryId: input.queryId,
             chatId: chat.id,
             completedCount,
-            candidateCount: candidates.length,
+            candidateCount,
           })
+        } else {
+          await bodyPool.add(() => scanCandidateBody(chat))
         }
-      } catch (error) {
-        if (isAbortError(error)) throw error
-        completedCount += 1
-        input.onUpdate?.({
-          kind: 'task-error',
-          queryId: input.queryId,
-          chatId: chat.id,
-          message: error instanceof Error ? error.message : String(error),
-          completedCount,
-          candidateCount: candidates.length,
-        })
+        await yieldController.maybeYield()
       }
-      await yieldController.maybeYield()
+      const next = await nextPage
+      if (!next.ok) throw next.error
+      pageResult = next.result
     }
-  }
+    await bodyPool.drain()
+    throwIfAborted(signal)
+    input.onUpdate?.({
+      kind: 'done',
+      queryId: input.queryId,
+      completedCount,
+      candidateCount,
+    })
 
-  await Promise.all(Array.from({ length: Math.min(concurrency, remaining.length) }, scanNext))
-  throwIfAborted(input.signal)
-  input.onUpdate?.({
-    kind: 'done',
-    queryId: input.queryId,
-    completedCount,
-    candidateCount: candidates.length,
-  })
-
-  return {
-    queryId: input.queryId,
-    results: [...resultsByChat.values()],
-    candidateCount: candidates.length,
-    completedCount,
-    warnings: parseResult.query.warnings,
+    return {
+      queryId: input.queryId,
+      results: resultsByChat ? [...resultsByChat.values()] : [],
+      candidateCount,
+      completedCount,
+      warnings: parseResult.query.warnings,
+    }
+  } finally {
+    linkedAbort.controller.abort()
+    linkedAbort.dispose()
+    await bodyPool.settle()
   }
 }
 
-function matchImmediateChat(chat: Chat, context: ScanContext): SearchResult | null {
+async function* iterateSearchSidebarPages(
+  repo: WorkspaceRepository,
+  authority: WorkspaceReadAuthority,
+  chatIds: readonly ChatId[] | undefined,
+  archived: SearchFilters['archived'],
+  signal: AbortSignal,
+): AsyncGenerator<SearchSidebarPage> {
+  if (chatIds) {
+    const uniqueIds = [...new Set(chatIds)]
+    for (let offset = 0; offset < uniqueIds.length; offset += SEARCH_SIDEBAR_PAGE_SIZE) {
+      throwIfAborted(signal)
+      const requestedChatIds = uniqueIds.slice(offset, offset + SEARCH_SIDEBAR_PAGE_SIZE)
+      const page = await queryWorkspace(
+        repo,
+        authority,
+        { kind: 'sidebar.rows-by-id', chatIds: requestedChatIds },
+        signal,
+      )
+      yield {
+        rows: page.filter((row): row is ChatSidebarRow => row !== undefined),
+        requestedChatIds,
+      }
+    }
+    return
+  }
+
+  let cursor: string | undefined
+  for (;;) {
+    throwIfAborted(signal)
+    const page = await queryWorkspace(
+      repo,
+      authority,
+      {
+        kind: 'sidebar.catalog-page',
+        request: {
+          archived,
+          orderBy: 'updatedAt',
+          direction: 'desc',
+          pageDirection: 'forward',
+          limit: SEARCH_SIDEBAR_PAGE_SIZE,
+          ...(cursor ? { cursor } : {}),
+        },
+      },
+      signal,
+    )
+    yield { rows: page.rows }
+    if (!page.nextCursor) return
+    cursor = page.nextCursor
+  }
+}
+
+function observeSearchSidebarPageRead(
+  read: Promise<IteratorResult<SearchSidebarPage>>,
+): Promise<SearchSidebarPageRead> {
+  return read.then(
+    (result) => ({ ok: true, result }),
+    (error: unknown) => ({ ok: false, error }),
+  )
+}
+
+function matchImmediateChat(chat: ChatSidebarRow, context: ScanContext): SearchResult | null {
   if (context.parsed.text.length === 0) {
     return buildResult({
       chat,
@@ -375,64 +625,68 @@ function matchImmediateChat(chat: Chat, context: ScanContext): SearchResult | nu
     })
   }
 
-  if (context.normalizedText.hasNegative && !context.filters.titleOnly) return null
+  if (context.compiledText.hasNegative && !context.filters.titleOnly) return null
 
-  const metadataMatch = matchFields(metadataFields(chat, context), context.normalizedText)
+  const metadataMatch = matchFields(metadataFields(chat, context), context.compiledText)
   if (!metadataMatch) return null
   return buildResult({ chat, match: metadataMatch, parsed: context.parsed })
 }
 
 async function scanLastUpdatedBranchChat(
-  chat: Chat,
+  chat: ChatSidebarRow,
   context: ScanContext,
 ): Promise<SearchResult | null> {
   throwIfAborted(context.signal)
-  const cache = await readFreshBranchCache(context.repo, chat, context.signal)
+  const branch = await scanFreshLastUpdatedBranch(context, chat)
   throwIfAborted(context.signal)
-  const fields = [...metadataFields(chat, context)]
-  if (cache?.textContent) {
-    fields.push({ source: 'branch-cache', text: cache.textContent })
-  }
-  const match = matchFields(fields, context.normalizedText)
-  if (!match) return null
+  if (!branch?.match) return null
   const resultInput: Parameters<typeof buildResult>[0] = {
     chat,
-    match,
+    match: branch.match,
     parsed: context.parsed,
   }
-  if (cache) resultInput.branchLeafId = cache.branchLeafId
+  resultInput.branchLeafId = branch.branchLeafId
   return buildResult(resultInput)
 }
 
-async function scanAllBranchesChat(chat: Chat, context: ScanContext): Promise<SearchResult | null> {
+async function scanAllBranchesChat(
+  chat: ChatSidebarRow,
+  context: ScanContext,
+): Promise<SearchResult | null> {
   throwIfAborted(context.signal)
-  const messages = await context.repo.listMessages(chat.id)
+  const fields = metadataFields(chat, context)
+  const corpus = await searchMessageCorpus(
+    {
+      chatId: chat.id,
+      clauses: context.parsed.text,
+      prefixFields: fields.map((field) => ({ key: field.source, text: field.text })),
+    },
+    {
+      repository: context.repo,
+      authority: context.authority,
+      ...(context.signal ? { signal: context.signal } : {}),
+    },
+  )
   throwIfAborted(context.signal)
-  const corpus = buildAllBranchesCorpus(messages, context.signal)
-  const fields = [...metadataFields(chat, context)]
-  if (corpus.text.length > 0) {
-    fields.push({
-      source: 'all-branches',
-      text: corpus.text,
-      normalizedText: corpus.normalizedText,
-    })
-  }
+  if (!searchClauseHitsMatch(context.compiledText, corpus.clauseHits)) return null
 
-  const match = matchFields(fields, context.normalizedText)
-  if (!match) return null
+  const match = allBranchesFieldMatch(fields, corpus, context.compiledText)
 
   let messageId =
-    latestMatchingMessageId(corpus.messages, corpus.normalizedText, context.normalizedText) ??
-    match.messageId
+    corpus.newestMatchingMessageId ?? corpus.newestPositiveMessageId ?? match.messageId
   let branchLeafId: MessageId | null | undefined
   if (messageId && (await freshLastUpdatedBranchMatches(chat, context))) {
     messageId = undefined
     branchLeafId = chat.lastUpdatedLeafId
   }
 
+  const resultMatch = { ...match }
+  if (branchLeafId !== undefined) delete resultMatch.messageId
+  else if (messageId) resultMatch.messageId = messageId
+
   const resultInput: Parameters<typeof buildResult>[0] = {
     chat,
-    match: { ...match, ...(messageId ? { messageId } : {}) },
+    match: resultMatch,
     parsed: context.parsed,
   }
   if (messageId) resultInput.messageId = messageId
@@ -440,25 +694,22 @@ async function scanAllBranchesChat(chat: Chat, context: ScanContext): Promise<Se
   return buildResult(resultInput)
 }
 
-function chatPassesStaticFilters(chat: Chat, context: ScanContext): boolean {
+function chatPassesStaticFilters(chat: ChatSidebarRow, context: ScanContext): boolean {
   if (context.filters.archived === 'exclude' && chat.archived) return false
   if (context.filters.archived === 'only' && !chat.archived) return false
 
-  if (
-    context.filters.includeFolderIds.length > 0 &&
-    !context.filters.includeFolderIds.includes(chat.folderId ?? '')
-  ) {
+  if (context.includeFolderIds.size > 0 && !context.includeFolderIds.has(chat.folderId ?? '')) {
     return false
   }
-  if (chat.folderId && context.filters.excludeFolderIds.includes(chat.folderId)) return false
+  if (chat.folderId && context.excludeFolderIds.has(chat.folderId)) return false
 
   if (
-    context.filters.includeTagIds.length > 0 &&
-    !chat.tags.some((tagId) => context.filters.includeTagIds.includes(tagId))
+    context.includeTagIds.size > 0 &&
+    !chat.tags.some((tagId) => context.includeTagIds.has(tagId))
   ) {
     return false
   }
-  if (chat.tags.some((tagId) => context.filters.excludeTagIds.includes(tagId))) return false
+  if (chat.tags.some((tagId) => context.excludeTagIds.has(tagId))) return false
 
   if (!nameClausesPass(chat.tags, context.parsed.tags, context.catalog.tagIdsByName)) return false
   if (!folderClausesPass(chat.folderId, context.parsed.folders, context.catalog.folderIdsByName)) {
@@ -493,7 +744,7 @@ function folderClausesPass(
   return true
 }
 
-function isClausesPass(chat: Chat, parsed: SearchQuery): boolean {
+function isClausesPass(chat: ChatSidebarRow, parsed: SearchQuery): boolean {
   for (const clause of parsed.is) {
     const hit =
       clause.value === 'pinned'
@@ -508,12 +759,15 @@ function isClausesPass(chat: Chat, parsed: SearchQuery): boolean {
 
 function matchFields(
   fields: readonly SearchField[],
-  normalizedSearch: NormalizedSearchText,
+  compiledText: CompiledSearchText,
 ): FieldMatch | null {
-  const normalizedFields = fields.map(normalizeSearchField)
-  if (!normalizedFieldsMatchClauses(normalizedFields, normalizedSearch.clauses)) return null
+  const fieldScan = scanSearchTextSegments(
+    fields.map((field) => field.text),
+    compiledText,
+  )
+  if (!fieldScan.matches) return null
 
-  if (!normalizedSearch.hasPositive) {
+  if (!compiledText.hasPositive) {
     const fallback = fields.find((field) => field.text.trim().length > 0)
     if (!fallback) return { source: 'preview', text: '', matchIndex: null, matchLength: 0 }
     return {
@@ -525,23 +779,10 @@ function matchFields(
     }
   }
 
-  let best: FieldMatch | null = null
-  for (const field of normalizedFields) {
-    const hit = firstPositiveNormalizedMatch(field.normalizedText, normalizedSearch.clauses)
-    if (!hit) continue
-    if (!best || hit.index < (best.matchIndex ?? Number.POSITIVE_INFINITY)) {
-      best = {
-        source: field.source,
-        text: field.text,
-        matchIndex: hit.index,
-        matchLength: hit.length,
-        ...(field.messageId ? { messageId: field.messageId } : {}),
-      }
-    }
-  }
+  const best = bestPositiveFieldMatch(fields, compiledText)?.match ?? null
   if (best) return best
 
-  const fallback = normalizedFields.find((field) => field.text.trim().length > 0)
+  const fallback = fields.find((field) => field.text.trim().length > 0)
   if (!fallback) return { source: 'preview', text: '', matchIndex: null, matchLength: 0 }
   return {
     source: fallback.source,
@@ -552,91 +793,67 @@ function matchFields(
   }
 }
 
-function normalizeSearchText(clauses: readonly SearchTextClause[]): NormalizedSearchText {
+function allBranchesFieldMatch(
+  fields: readonly SearchField[],
+  corpus: MessageCorpusSearchResult,
+  compiledText: CompiledSearchText,
+): FieldMatch {
+  if (!compiledText.hasPositive) {
+    const fallback = fields.find((field) => field.text.trim().length > 0)
+    return {
+      source: fallback?.source ?? 'preview',
+      text: fallback?.text ?? '',
+      matchIndex: null,
+      matchLength: 0,
+    }
+  }
+
+  const metadata = bestPositiveFieldMatch(fields, compiledText)
+  const excerpt = corpus.firstPositiveExcerpt
+  if (!excerpt || (metadata && metadata.offset <= excerpt.messageMatchIndex)) {
+    return (
+      metadata?.match ?? {
+        source: fields[0]?.source ?? 'preview',
+        text: fields[0]?.text ?? '',
+        matchIndex: null,
+        matchLength: 0,
+      }
+    )
+  }
   return {
-    clauses: clauses.map((clause) => ({
-      clause,
-      needle: clause.value.toLocaleLowerCase(),
-    })),
-    hasPositive: clauses.some((clause) => !clause.negated),
-    hasNegative: clauses.some((clause) => clause.negated),
+    source: 'all-branches',
+    text: excerpt.text,
+    matchIndex: excerpt.matchIndex,
+    matchLength: excerpt.matchLength,
+    messageId: excerpt.messageId,
+    prefixTruncated: excerpt.prefixTruncated,
+    suffixTruncated: excerpt.suffixTruncated,
   }
 }
 
-function normalizeSearchField(field: SearchField): NormalizedSearchField {
-  return {
-    ...field,
-    normalizedText: field.normalizedText ?? field.text.toLocaleLowerCase(),
-  }
-}
-
-function normalizedFieldsMatchClauses(
-  fields: readonly NormalizedSearchField[],
-  clauses: readonly NormalizedSearchTextClause[],
-): boolean {
-  for (const { clause, needle } of clauses) {
-    const hit = normalizedFieldsInclude(fields, needle)
-    if (clause.negated ? hit : !hit) return false
-  }
-  return true
-}
-
-function normalizedFieldsInclude(
-  fields: readonly NormalizedSearchField[],
-  needle: string,
-): boolean {
-  if (needle.length === 0) return true
-  const retainedLength = needle.length - 1
-  let trailing = ''
-
-  const scanSegment = (segment: string): boolean => {
-    if (segment.includes(needle)) return true
-    if (retainedLength === 0) return false
-    const boundary = `${trailing}${segment.slice(0, retainedLength)}`
-    if (boundary.includes(needle)) return true
-    trailing =
-      segment.length >= retainedLength
-        ? segment.slice(-retainedLength)
-        : `${trailing}${segment}`.slice(-retainedLength)
-    return false
-  }
-
-  for (let index = 0; index < fields.length; index += 1) {
-    if (index > 0 && scanSegment('\n')) return true
-    const field = fields[index]
-    if (field && scanSegment(field.normalizedText)) return true
-  }
-  return false
-}
-
-function normalizedTextMatchesClauses(
-  normalizedText: string,
-  clauses: readonly NormalizedSearchTextClause[],
-): boolean {
-  for (const { clause, needle } of clauses) {
-    const hit = normalizedText.includes(needle)
-    if (clause.negated ? hit : !hit) return false
-  }
-  return true
-}
-
-function firstPositiveNormalizedMatch(
-  normalizedText: string,
-  clauses: readonly NormalizedSearchTextClause[],
-): { index: number; length: number } | null {
-  let best: { index: number; length: number } | null = null
-  for (const { clause, needle } of clauses) {
-    if (clause.negated) continue
-    const index = normalizedText.indexOf(needle)
-    if (index < 0) continue
-    if (!best || index < best.index) {
-      best = { index, length: clause.value.length }
+function bestPositiveFieldMatch(
+  fields: readonly SearchField[],
+  compiledText: CompiledSearchText,
+): { match: FieldMatch; offset: number } | null {
+  let best: { match: FieldMatch; offset: number } | null = null
+  for (const field of fields) {
+    const hit = scanSearchTextSegments([field.text], compiledText).firstPositive
+    if (!hit || (best && hit.index >= best.offset)) continue
+    best = {
+      offset: hit.index,
+      match: {
+        source: field.source,
+        text: field.text,
+        matchIndex: hit.index,
+        matchLength: hit.length,
+        ...(field.messageId ? { messageId: field.messageId } : {}),
+      },
     }
   }
   return best
 }
 
-function metadataFields(chat: Chat, context: ScanContext): SearchField[] {
+function metadataFields(chat: ChatSidebarRow, context: ScanContext): SearchField[] {
   const fields: SearchField[] = [{ source: 'title', text: displayTitle(chat) }]
   if (context.filters.titleOnly) return fields
 
@@ -650,7 +867,7 @@ function metadataFields(chat: Chat, context: ScanContext): SearchField[] {
   return fields
 }
 
-function fallbackMatch(chat: Chat, context: ScanContext): FieldMatch {
+function fallbackMatch(chat: ChatSidebarRow, context: ScanContext): FieldMatch {
   const preview = chat.previewText?.trim()
   if (preview) return { source: 'preview', text: preview, matchIndex: null, matchLength: 0 }
   const metadata = metadataFields(chat, context).find((field) => field.text.trim().length > 0)
@@ -663,7 +880,7 @@ function fallbackMatch(chat: Chat, context: ScanContext): FieldMatch {
 }
 
 function buildResult(input: {
-  chat: Chat
+  chat: ChatSidebarRow
   match: FieldMatch
   parsed: SearchQuery
   branchLeafId?: MessageId | null
@@ -690,7 +907,7 @@ function buildResult(input: {
 
 function buildSnippet(
   text: string,
-  match: Pick<FieldMatch, 'matchIndex' | 'matchLength'>,
+  match: Pick<FieldMatch, 'matchIndex' | 'matchLength' | 'prefixTruncated' | 'suffixTruncated'>,
   clauses: readonly SearchTextClause[],
 ): {
   text: string
@@ -709,8 +926,8 @@ function buildSnippet(
     return {
       text: snippet,
       highlightRanges: [],
-      prefixTruncated: false,
-      suffixTruncated: text.length > snippet.length,
+      prefixTruncated: match.prefixTruncated === true,
+      suffixTruncated: match.suffixTruncated === true || text.length > snippet.length,
     }
   }
 
@@ -722,8 +939,8 @@ function buildSnippet(
   return {
     text: snippet,
     highlightRanges: highlightRanges(snippet, clauses),
-    prefixTruncated: start > 0,
-    suffixTruncated: end < text.length,
+    prefixTruncated: match.prefixTruncated === true || start > 0,
+    suffixTruncated: match.suffixTruncated === true || end < text.length,
   }
 }
 
@@ -732,15 +949,9 @@ function highlightRanges(
   clauses: readonly SearchTextClause[],
 ): SearchHighlightRange[] {
   const ranges: SearchHighlightRange[] = []
-  const lowered = text.toLocaleLowerCase()
   for (const clause of clauses) {
     if (clause.negated || clause.value.length === 0) continue
-    const needle = clause.value.toLocaleLowerCase()
-    let index = lowered.indexOf(needle)
-    while (index >= 0) {
-      ranges.push({ start: index, end: index + clause.value.length })
-      index = lowered.indexOf(needle, index + Math.max(needle.length, 1))
-    }
+    ranges.push(...findLiteralSearchRanges(text, clause.value).ranges)
   }
   return mergeHighlightRanges(ranges)
 }
@@ -761,196 +972,63 @@ function mergeHighlightRanges(ranges: SearchHighlightRange[]): SearchHighlightRa
   return merged
 }
 
-async function readFreshBranchCache(
+async function scanFreshLastUpdatedBranch(
+  context: ScanContext,
+  chat: ChatSidebarRow,
+): Promise<
+  | {
+      readonly branchLeafId: MessageId | null
+      readonly match: FieldMatch | null
+    }
+  | undefined
+> {
+  throwIfAborted(context.signal)
+  const fields = metadataFields(chat, context)
+  const collector = new BranchSearchCollector(context.compiledText, context.signal)
+  let branchSeparatorPending = fields.length > 0
+  const fresh = await consumeLastUpdatedBranchText(
+    context.repo,
+    context.authority,
+    chat.id,
+    {
+      reset: () => {
+        collector.reset(fields.map((field) => field.text))
+        branchSeparatorPending = fields.length > 0
+      },
+      push: (segment) => {
+        if (branchSeparatorPending) {
+          collector.push('\n')
+          branchSeparatorPending = false
+        }
+        collector.push(segment)
+      },
+    },
+    context.signal,
+  )
+  if (!fresh) return undefined
+  return {
+    branchLeafId: fresh.branchLeafId,
+    match: collector.fieldMatch(fields),
+  }
+}
+
+async function freshLastUpdatedBranchMatches(
+  chat: ChatSidebarRow,
+  context: ScanContext,
+): Promise<boolean> {
+  const fresh = await scanFreshLastUpdatedBranch(context, chat)
+  return fresh?.branchLeafId === chat.lastUpdatedLeafId && fresh.match !== null
+}
+
+function queryWorkspace<Q extends WorkspaceQuery>(
   repo: WorkspaceRepository,
-  chat: Chat,
+  authority: WorkspaceReadAuthority,
+  query: Q,
   signal?: AbortSignal,
-): Promise<ChatBranchCache | undefined> {
-  for (;;) {
-    throwIfAborted(signal)
-    const { chat: current, expected } = await readChatBranchCacheSource(repo, chat.id)
-    if (!current) {
-      await repo.deleteChatBranchCache(chat.id, expected)
-      const afterDelete = await readChatBranchCacheSource(repo, chat.id)
-      if (
-        afterDelete.expected.replacementEpoch !== expected.replacementEpoch ||
-        afterDelete.chat !== undefined
-      ) {
-        continue
-      }
-      return undefined
-    }
-    const existing = await repo.getChatBranchCache(chat.id)
-    if ((await repo.getWorkspaceMeta()).replacementEpoch !== expected.replacementEpoch) continue
-    if (existing && isChatBranchCacheFresh(current, existing)) return existing
-    if (current.lastUpdatedLeafId === null) {
-      if (existing) await repo.deleteChatBranchCache(chat.id, expected)
-      const afterDelete = await readChatBranchCacheSource(repo, chat.id)
-      if (
-        afterDelete.expected.replacementEpoch !== expected.replacementEpoch ||
-        !afterDelete.chat ||
-        !chatMatchesBranchCacheWriteGuard(afterDelete.chat, expected)
-      ) {
-        continue
-      }
-      return undefined
-    }
-    const messages = await repo.getBranchByLeaf(chat.id, current.lastUpdatedLeafId)
-    throwIfAborted(signal)
-    const written = await repo.putChatBranchCache(
-      buildBranchCacheRow({
-        chatId: chat.id,
-        branchLeafId: current.lastUpdatedLeafId,
-        messages,
-        generatedAt: Math.max(Date.now(), current.lastBranchUpdatedAt),
-      }),
-      expected,
-    )
-    if (written) return written
-  }
-}
-
-async function freshLastUpdatedBranchMatches(chat: Chat, context: ScanContext): Promise<boolean> {
-  for (;;) {
-    const { chat: current, expected } = await readChatBranchCacheSource(context.repo, chat.id)
-    if (!current || current.lastUpdatedLeafId !== chat.lastUpdatedLeafId) return false
-    const cache = await context.repo.getChatBranchCache(chat.id)
-    if ((await context.repo.getWorkspaceMeta()).replacementEpoch !== expected.replacementEpoch) {
-      continue
-    }
-    if (!cache || !isChatBranchCacheFresh(current, cache)) return false
-    return normalizedTextMatchesClauses(
-      cache.textContent.toLocaleLowerCase(),
-      context.normalizedText.clauses,
-    )
-  }
-}
-
-function buildAllBranchesCorpus(
-  messages: readonly Message[],
-  signal?: AbortSignal,
-): {
-  text: string
-  normalizedText: string
-  messages: Array<{
-    message: Message
-    normalizedStart: number
-    normalizedEnd: number
-  }>
-} {
-  const liveMessages = messages
-    .filter((message) => !message.deleted)
-    .sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id))
-  const chunks: string[] = []
-  const indexed: Array<{
-    message: Message
-    text: string
-    normalizedStart: number
-    normalizedEnd: number
-  }> = []
-
-  for (const message of liveMessages) {
-    throwIfAborted(signal)
-    const text = messageRenderableText(message)
-    if (text.length === 0) continue
-    if (chunks.length > 0) chunks.push('\n\n')
-    chunks.push(text)
-    indexed.push({ message, text, normalizedStart: 0, normalizedEnd: 0 })
-  }
-
-  const text = chunks.join('')
-  chunks.length = 0
-  const normalizedChunks: string[] = []
-  let normalizedOffset = 0
-  for (let index = 0; index < indexed.length; index += 1) {
-    const row = indexed[index]
-    if (!row) continue
-    if (index > 0) {
-      normalizedChunks.push('\n\n')
-      normalizedOffset += 2
-    }
-    const normalizedMessage = row.text.toLocaleLowerCase()
-    row.text = ''
-    row.normalizedStart = normalizedOffset
-    normalizedChunks.push(normalizedMessage)
-    normalizedOffset += normalizedMessage.length
-    row.normalizedEnd = normalizedOffset
-  }
-
-  return { text, normalizedText: normalizedChunks.join(''), messages: indexed }
-}
-
-function latestMatchingMessageId(
-  messages: readonly {
-    message: Message
-    normalizedStart: number
-    normalizedEnd: number
-  }[],
-  normalizedCorpus: string,
-  normalizedSearch: NormalizedSearchText,
-): MessageId | undefined {
-  let fallback: Message | undefined
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const row = messages[index]
-    if (!row) continue
-    if (
-      normalizedRangeMatchesClauses(
-        normalizedCorpus,
-        row.normalizedStart,
-        row.normalizedEnd,
-        normalizedSearch.clauses,
-      )
-    ) {
-      return row.message.id
-    }
-    if (
-      !fallback &&
-      firstPositiveNormalizedMatchInRange(
-        normalizedCorpus,
-        row.normalizedStart,
-        row.normalizedEnd,
-        normalizedSearch.clauses,
-      )
-    ) {
-      fallback = row.message
-    }
-  }
-  return fallback?.id
-}
-
-function normalizedRangeMatchesClauses(
-  normalizedText: string,
-  start: number,
-  end: number,
-  clauses: readonly NormalizedSearchTextClause[],
-): boolean {
-  for (const { clause, needle } of clauses) {
-    const hit = normalizedRangeIncludes(normalizedText, start, end, needle)
-    if (clause.negated ? hit : !hit) return false
-  }
-  return true
-}
-
-function firstPositiveNormalizedMatchInRange(
-  normalizedText: string,
-  start: number,
-  end: number,
-  clauses: readonly NormalizedSearchTextClause[],
-): boolean {
-  for (const { clause, needle } of clauses) {
-    if (!clause.negated && normalizedRangeIncludes(normalizedText, start, end, needle)) return true
-  }
-  return false
-}
-
-function normalizedRangeIncludes(
-  normalizedText: string,
-  start: number,
-  end: number,
-  needle: string,
-): boolean {
-  const index = normalizedText.indexOf(needle, start)
-  return index >= start && index + needle.length <= end
+): Promise<WorkspaceQueryResult<Q>> {
+  return repo
+    .query(authority, query, { signal: signal ?? authority.signal })
+    .then((envelope) => envelope.value)
 }
 
 function buildCatalog(folders: readonly ChatFolder[], tags: readonly ChatTag[]): SearchCatalog {
@@ -986,12 +1064,12 @@ function normalizeName(value: string): string {
   return value.trim().toLocaleLowerCase()
 }
 
-function displayTitle(chat: Pick<Chat, 'title'>): string {
+function displayTitle(chat: Pick<ChatSidebarRow, 'title'>): string {
   const title = chat.title.trim()
   return title.length > 0 ? title : 'Untitled chat'
 }
 
-function isUntitledChat(chat: Chat): boolean {
+function isUntitledChat(chat: ChatSidebarRow): boolean {
   return (
     chat.titleStatus === 'untitled' ||
     chat.titleStatus === 'auto-failed' ||
@@ -1020,6 +1098,72 @@ function findNextWhitespace(text: string, start: number): number {
   return -1
 }
 
+class BoundedSearchTaskPool {
+  private readonly limit: number
+  private readonly active = new Set<Promise<void>>()
+  private failure: unknown
+
+  constructor(limit: number) {
+    this.limit = limit
+  }
+
+  async add(task: () => Promise<void>): Promise<void> {
+    while (this.active.size >= this.limit) {
+      await Promise.race(this.active)
+      this.throwFailure()
+    }
+    this.throwFailure()
+    const running: Promise<void> = Promise.resolve()
+      .then(task)
+      .catch((error: unknown) => {
+        this.failure ??= error
+      })
+      .finally(() => this.active.delete(running))
+    this.active.add(running)
+  }
+
+  async drain(): Promise<void> {
+    await this.settle()
+    this.throwFailure()
+  }
+
+  async settle(): Promise<void> {
+    await Promise.all([...this.active])
+  }
+
+  private throwFailure(): void {
+    if (this.failure !== undefined) {
+      throw this.failure instanceof Error
+        ? this.failure
+        : new Error('ChatSearchTaskFailed', { cause: this.failure })
+    }
+  }
+}
+
+function createLinkedSearchAbortController(...signals: readonly (AbortSignal | undefined)[]): {
+  readonly controller: AbortController
+  readonly dispose: () => void
+} {
+  const controller = new AbortController()
+  const linked: AbortSignal[] = []
+  const abort = () => controller.abort()
+  for (const signal of signals) {
+    if (!signal) continue
+    if (signal.aborted) {
+      controller.abort()
+      break
+    }
+    signal.addEventListener('abort', abort, { once: true })
+    linked.push(signal)
+  }
+  return {
+    controller,
+    dispose: () => {
+      for (const signal of linked) signal.removeEventListener('abort', abort)
+    },
+  }
+}
+
 function boundedConcurrency(value: number | undefined): number {
   if (typeof value === 'number' && Number.isFinite(value)) {
     return Math.max(1, Math.min(8, Math.floor(value)))
@@ -1045,28 +1189,6 @@ function createSearchYieldController(): { maybeYield: () => Promise<void> } {
       lastYieldAt = searchNowMs()
     },
   }
-}
-
-async function yieldToEventLoop(): Promise<void> {
-  const scheduler = (globalThis as unknown as { scheduler?: { yield?: () => Promise<void> } })
-    .scheduler
-  if (typeof scheduler?.yield === 'function') {
-    await scheduler.yield()
-    return
-  }
-  if (typeof MessageChannel !== 'undefined') {
-    await new Promise<void>((resolve) => {
-      const channel = new MessageChannel()
-      channel.port1.onmessage = () => {
-        channel.port1.close()
-        channel.port2.close()
-        resolve()
-      }
-      channel.port2.postMessage(undefined)
-    })
-    return
-  }
-  await Promise.resolve()
 }
 
 function throwIfAborted(signal: AbortSignal | undefined): void {

@@ -1,11 +1,24 @@
 import {
+  type Browser,
+  type BrowserContext,
   test as base,
   type ConsoleMessage,
+  chromium,
   expect,
   type Page,
-  type WebSocket as PlaywrightWebSocket,
   type TestInfo,
 } from '@playwright/test'
+import {
+  armUiJourneyInvariantRecorder,
+  formatUiJourneyViolations,
+  installUiJourneyInvariantRecorder,
+  markUiJourneyIntent,
+  snapshotUiJourneyInvariants,
+  stopUiJourneyInvariantRecorder,
+  type UiJourneyIntent,
+  type UiJourneyInvariantRecorderConfig,
+  type UiJourneyInvariantReport,
+} from './ui-journey-invariant-recorder'
 
 export type { CDPSession, Locator, Page } from '@playwright/test'
 export { expect }
@@ -18,7 +31,7 @@ type RuntimeDiagnosticCategory =
   | 'react-cross-component-update'
   | 'console-other'
 
-type RuntimeDiagnosticSource = 'console' | 'pageerror' | 'vite-forward-console'
+type RuntimeDiagnosticSource = 'console' | 'pageerror'
 
 export interface RuntimeDiagnosticAllowance {
   category: RuntimeDiagnosticCategory | readonly RuntimeDiagnosticCategory[]
@@ -48,9 +61,168 @@ interface RuntimeDiagnosticFixtures {
   runtimeDiagnosticExpectations: RuntimeDiagnosticExpectation[]
   expectRuntimeDiagnostic: (expectation: RuntimeDiagnosticExpectation) => void
   runtimeDiagnosticGate: undefined
+  uiJourney: UiJourneyFixture
 }
 
-export const test = base.extend<RuntimeDiagnosticFixtures>({
+type NativeCdpConnect = (options: {
+  endpointURL: string
+  noDefaults: true
+  artifactsDir: string
+}) => Promise<Browser>
+
+interface NativeCdpWorkerFixtures {
+  nativeCdpBrowser: Browser
+}
+
+const nativeCdpEndpoint = process.env.E2E_NATIVE_CDP_ENDPOINT
+const nativeCdpArtifactsDir = process.env.E2E_NATIVE_CDP_ARTIFACTS_DIR
+const fixtureBase = nativeCdpEndpoint
+  ? base.extend<object, NativeCdpWorkerFixtures>({
+      nativeCdpBrowser: [
+        async ({ browserName: _browserName }, use) => {
+          if (!nativeCdpArtifactsDir) throw new Error('HeadedVisibilityArtifactsDirectoryMissing')
+          const connectNative = chromium.connectOverCDP.bind(
+            chromium,
+          ) as unknown as NativeCdpConnect
+          const browser = await connectNative({
+            endpointURL: nativeCdpEndpoint,
+            noDefaults: true,
+            artifactsDir: nativeCdpArtifactsDir,
+          })
+          const browserSession = await browser.newBrowserCDPSession()
+          await browserSession.send('Browser.setDownloadBehavior', {
+            behavior: 'allowAndName',
+            downloadPath: nativeCdpArtifactsDir,
+            eventsEnabled: true,
+          })
+          try {
+            await use(browser)
+          } finally {
+            await browserSession.detach().catch(() => undefined)
+          }
+        },
+        { scope: 'worker' },
+      ],
+      context: async ({ nativeCdpBrowser }, use) => {
+        const context = nativeCdpBrowser.contexts()[0]
+        if (!context) throw new Error('HeadedVisibilityDefaultContextMissing')
+        await use(context)
+      },
+      page: async (
+        { context, baseURL }: { context: BrowserContext; baseURL: string | undefined },
+        use,
+      ) => {
+        if (!baseURL) throw new Error('HeadedVisibilityBaseUrlMissing')
+        const page = context.pages()[0] ?? (await context.newPage())
+        await page.goto(baseURL)
+        await use(page)
+      },
+    })
+  : base
+
+export interface UiJourneyFixture {
+  start(
+    page: Page,
+    config: UiJourneyInvariantRecorderConfig,
+    label?: string,
+  ): Promise<UiJourneyInvariantReport>
+  intent(page: Page, intent: UiJourneyIntent): Promise<void>
+  checkpoint(page: Page, label?: string): Promise<UiJourneyInvariantReport>
+  finish(page: Page, label?: string): Promise<UiJourneyInvariantReport>
+}
+
+export function createChatUiJourneyProfile(
+  options: { activeSurfaceReady?: boolean; chatHeader?: boolean } = {},
+): UiJourneyInvariantRecorderConfig {
+  const semanticNodes = [
+    ...(options.activeSurfaceReady === false ? [] : [activeSurfaceReadinessNode]),
+    ...(options.chatHeader === false
+      ? []
+      : [
+          {
+            id: 'branch-tree-toggle',
+            selector: '[data-role="chat-branch-tree"]',
+            activeWhenSelector:
+              '[data-ui="chat-title-bar"][data-chat-id]:not([data-presentation-only])',
+            requireInteractive: true,
+            resetOnRouteChange: false,
+          },
+          {
+            id: 'chat-download',
+            selector: '[data-role="chat-download"]',
+            activeWhenSelector:
+              '[data-ui="chat-title-bar"][data-chat-id]:not([data-presentation-only])',
+            resetOnRouteChange: false,
+          },
+          {
+            id: 'chat-export',
+            selector: '[data-role="chat-export"]',
+            activeWhenSelector:
+              '[data-ui="chat-title-bar"][data-chat-id]:not([data-presentation-only])',
+            requireInteractive: true,
+            resetOnRouteChange: false,
+          },
+          {
+            id: 'retained-chat-header',
+            selector: '[data-ui="chat-title-bar"][data-presentation-only="true"]',
+            required: false,
+            resetOnRouteChange: false,
+          },
+          {
+            id: 'composer-slot',
+            selector: '[data-ui="composer"]',
+            activeWhenSelector: '[data-ui="message-list"]',
+            requireVisible: false,
+            preserveIdentity: false,
+            resetOnRouteChange: false,
+          },
+        ]),
+  ]
+  return {
+    sampleLimit: 320,
+    transitionLimit: 240,
+    violationLimit: 80,
+    shell: {
+      selector: '[data-ui="app-shell"]',
+      contentSelectors: [
+        '[data-ui="empty-state"]',
+        '[data-ui="message-list"]',
+        '[data-ui="branch-tree-view"]',
+      ],
+      loadingSelectors: ['[data-ui="surface-loading"]'],
+    },
+    semanticNodes,
+    countSurfaces: [
+      {
+        id: 'mounted-messages',
+        rootSelector: '[data-ui="message-list"]',
+        itemSelector: '[data-ui="message"][data-message-id]',
+        activeWhenSelector: '[data-ui="message-list"]',
+        monotonic: 'nondecreasing',
+      },
+    ],
+    transcript: {
+      rootSelector: '[data-ui="message-list"]',
+      itemSelector: '[data-ui="message"][data-message-id]',
+      idAttribute: 'data-message-id',
+      maxTrackedItems: 256,
+      scrollSelector: '[data-ui="scroll-region"]',
+      boundedPrefixEviction: {
+        countSurfaceId: 'mounted-messages',
+        renderedCountAttribute: 'data-rendered-count',
+        totalCountAttribute: 'data-total-count',
+      },
+    },
+  }
+}
+
+const activeSurfaceReadinessNode = Object.freeze({
+  id: 'active-surface-present',
+  selector: '[data-ui="main-pane"]',
+  resetOnRouteChange: false,
+})
+
+export const test = fixtureBase.extend<RuntimeDiagnosticFixtures>({
   runtimeDiagnosticAllowances: [[], { option: true }],
   runtimeDiagnosticExpectations: async ({ context: _context }, use) => {
     await use([])
@@ -72,6 +244,45 @@ export const test = base.extend<RuntimeDiagnosticFixtures>({
           contentType: 'application/json',
           headers: { 'access-control-allow-origin': '*' },
           body: JSON.stringify({ data: [] }),
+        }),
+      )
+      await context.route('**/_or_scrape/**', (route) =>
+        route.fulfill({
+          contentType: 'text/html',
+          body: `<script id="__NEXT_DATA__" type="application/json">${JSON.stringify({
+            props: {
+              pageProps: {
+                providers: [
+                  {
+                    provider_display_name: 'Natter',
+                    provider_slug: 'natter',
+                    data_policy: {
+                      training: false,
+                      trainingOpenRouter: false,
+                      retainsPrompts: false,
+                      canPublish: false,
+                      requiresUserIDs: false,
+                    },
+                  },
+                ],
+              },
+            },
+          })}</script>`,
+        }),
+      )
+      await context.route('https://openrouter.ai/api/v1/models*', (route) =>
+        route.fulfill({
+          contentType: 'application/json',
+          headers: { 'access-control-allow-origin': '*' },
+          body: JSON.stringify({
+            data: [
+              {
+                id: 'anthropic/claude-opus-4.8',
+                name: 'Claude Opus 4.8',
+                supported_parameters: ['tools'],
+              },
+            ],
+          }),
         }),
       )
       const onConsole = (message: ConsoleMessage) => {
@@ -109,46 +320,6 @@ export const test = base.extend<RuntimeDiagnosticFixtures>({
         pendingConsoleDetails.add(detailTask)
         void detailTask.finally(() => pendingConsoleDetails.delete(detailTask))
       }
-      const webSocketHandlers = new Map<
-        PlaywrightWebSocket,
-        (frame: { payload: string | Buffer }) => void
-      >()
-      const onWebSocket = (webSocket: PlaywrightWebSocket) => {
-        const onFrameSent = (frame: { payload: string | Buffer }) => {
-          const error = parseViteForwardedError(frame.payload)
-          if (!error) return
-          if (error.consoleLog) {
-            const matchingConsole = findMatchingConsoleDiagnostic(diagnostics, error.message)
-            if (matchingConsole) {
-              matchingConsole.detail = error.message
-              matchingConsole.category =
-                classifyConsoleDiagnostic(error.message) ?? matchingConsole.category
-              matchingConsole.allowed = classifyAllowance(
-                matchingConsole,
-                runtimeDiagnosticAllowances,
-                runtimeDiagnosticExpectations,
-              ).allowed
-              return
-            }
-          }
-          diagnostics.push(
-            classifyAllowance(
-              {
-                category: classifyConsoleDiagnostic(error.message) ?? 'page-error',
-                source: 'vite-forward-console',
-                level: 'error',
-                message: error.message,
-                ...(error.stack ? { stack: error.stack } : {}),
-                allowed: false,
-              },
-              runtimeDiagnosticAllowances,
-              runtimeDiagnosticExpectations,
-            ),
-          )
-        }
-        webSocketHandlers.set(webSocket, onFrameSent)
-        webSocket.on('framesent', onFrameSent)
-      }
       const pageErrorHandlers = new Map<Page, (error: Error) => void>()
       const attachPage = (page: Page) => {
         if (pageErrorHandlers.has(page)) return
@@ -172,7 +343,6 @@ export const test = base.extend<RuntimeDiagnosticFixtures>({
         pageErrorHandlers.set(page, onPageError)
         page.on('console', onConsole)
         page.on('pageerror', onPageError)
-        page.on('websocket', onWebSocket)
       }
       const detachPage = (page: Page) => {
         const onPageError = pageErrorHandlers.get(page)
@@ -180,14 +350,14 @@ export const test = base.extend<RuntimeDiagnosticFixtures>({
         pageErrorHandlers.delete(page)
         page.off('console', onConsole)
         page.off('pageerror', onPageError)
-        page.off('websocket', onWebSocket)
       }
       context.on('page', attachPage)
       for (const page of context.pages()) attachPage(page)
       try {
         await use(undefined)
       } finally {
-        const pages = context.pages()
+        const keeperPage = nativeCdpEndpoint ? await context.newPage() : undefined
+        const pages = context.pages().filter((page) => page !== keeperPage)
         await drainRuntimeTasks(pages)
         await waitForRuntimeNetworkIdle(pages)
         lifecycleDrainStarted = true
@@ -200,10 +370,6 @@ export const test = base.extend<RuntimeDiagnosticFixtures>({
         await drainPendingConsoleDetails(pendingConsoleDetails)
         context.off('page', attachPage)
         for (const page of [...pageErrorHandlers.keys()]) detachPage(page)
-        for (const [webSocket, onFrameSent] of webSocketHandlers) {
-          webSocket.off('framesent', onFrameSent)
-        }
-        webSocketHandlers.clear()
         const expectationResults = evaluateDiagnosticExpectations(
           diagnostics,
           runtimeDiagnosticExpectations,
@@ -219,6 +385,125 @@ export const test = base.extend<RuntimeDiagnosticFixtures>({
     },
     { auto: true },
   ],
+  uiJourney: async ({ runtimeDiagnosticGate: _runtimeDiagnosticGate }, use, testInfo) => {
+    interface Session {
+      page: Page
+      label: string
+      startedAt: number
+      report?: UiJourneyInvariantReport
+      lifecycleError?: string
+    }
+    const sessions = new Map<Page, Session>()
+    const finish = async (page: Page, label = 'journey-finish') => {
+      const session = sessions.get(page)
+      if (!session) throw new Error('UiJourneySessionNotStarted')
+      if (session.report) return session.report
+      const report = await stopUiJourneyInvariantRecorder(page, label)
+      session.report = report
+      return report
+    }
+    const fixture: UiJourneyFixture = {
+      async start(page, config, label = 'journey-start') {
+        if (sessions.has(page)) throw new Error('UiJourneySessionAlreadyStarted')
+        await installUiJourneyInvariantRecorder(page, config)
+        const session: Session = {
+          page,
+          label,
+          startedAt: performance.now(),
+        }
+        sessions.set(page, session)
+        return armUiJourneyInvariantRecorder(page, label)
+      },
+      intent: markUiJourneyIntent,
+      checkpoint(page, label = 'journey-checkpoint') {
+        if (!sessions.has(page)) throw new Error('UiJourneySessionNotStarted')
+        return snapshotUiJourneyInvariants(page, label, { completeIntents: true })
+      },
+      finish,
+    }
+    try {
+      await use(fixture)
+    } finally {
+      for (const session of sessions.values()) {
+        if (session.report) continue
+        if (session.page.isClosed()) {
+          session.lifecycleError = 'page closed before the journey recorder stopped'
+          continue
+        }
+        try {
+          session.report = await finish(session.page)
+        } catch (error) {
+          session.lifecycleError = error instanceof Error ? error.message : String(error)
+        }
+      }
+      const failures = [...sessions.values()].flatMap((session) => {
+        const report = session.report
+        if (!report) return [`${session.label}: ${session.lifecycleError ?? 'missing report'}`]
+        return [
+          ...report.violations.map(
+            (violation) =>
+              `${session.label}: ${violation.code}/${violation.subject}: ${violation.detail}`,
+          ),
+          ...(report.droppedSamples === 0
+            ? []
+            : [`${session.label}: dropped ${report.droppedSamples} samples`]),
+          ...(report.droppedTransitions === 0
+            ? []
+            : [`${session.label}: dropped ${report.droppedTransitions} transitions`]),
+          ...(report.droppedViolations === 0
+            ? []
+            : [`${session.label}: dropped ${report.droppedViolations} violations`]),
+        ]
+      })
+      if (failures.length > 0 || testInfo.status !== testInfo.expectedStatus) {
+        await testInfo.attach('ui-journey-invariants', {
+          body: JSON.stringify(
+            {
+              summary: {
+                sessions: sessions.size,
+                failures: failures.length,
+              },
+              sessions: [...sessions.values()].map((session) => ({
+                label: session.label,
+                durationMs: Math.round(performance.now() - session.startedAt),
+                url: safePageUrl(session.page),
+                lifecycleError: session.lifecycleError,
+                ...(session.report
+                  ? {
+                      counts: {
+                        samples: session.report.samples.length,
+                        transitions: session.report.transitions.length,
+                        violations: session.report.violations.length,
+                        droppedSamples: session.report.droppedSamples,
+                        droppedTransitions: session.report.droppedTransitions,
+                        droppedViolations: session.report.droppedViolations,
+                      },
+                      violations: session.report.violations,
+                      samples: session.report.samples.slice(-12),
+                      transitions: session.report.transitions.slice(-12),
+                    }
+                  : {}),
+              })),
+            },
+            null,
+            2,
+          ),
+          contentType: 'application/json',
+        })
+      }
+      expect(
+        failures,
+        failures.length > 0
+          ? failures.join('\n')
+          : [...sessions.values()]
+              .map((session) =>
+                session.report ? formatUiJourneyViolations(session.report) : session.lifecycleError,
+              )
+              .filter(Boolean)
+              .join('\n'),
+      ).toEqual([])
+    }
+  },
 })
 
 function classifyConsoleDiagnostic(message: string): RuntimeDiagnosticCategory | null {
@@ -295,59 +580,6 @@ async function inspectConsoleErrorArguments(message: ConsoleMessage): Promise<st
 
 async function drainPendingConsoleDetails(pending: Set<Promise<void>>): Promise<void> {
   while (pending.size > 0) await Promise.allSettled([...pending])
-}
-
-function parseViteForwardedError(
-  payload: string | Buffer,
-): { message: string; stack?: string; consoleLog?: boolean } | null {
-  try {
-    const frame: unknown = JSON.parse(payload.toString())
-    if (!isRecord(frame) || frame.type !== 'custom' || frame.event !== 'vite:forward-console') {
-      return null
-    }
-    const forwarded = frame.data
-    if (!isRecord(forwarded) || !isRecord(forwarded.data)) return null
-    const consoleLog = forwarded.type === 'log' && forwarded.data.level === 'error'
-    if (!consoleLog && forwarded.type !== 'error' && forwarded.type !== 'unhandled-rejection') {
-      return null
-    }
-    const message = forwarded.data.message
-    if (typeof message !== 'string') return null
-    const stack = forwarded.data.stack
-    return {
-      message,
-      ...(typeof stack === 'string' ? { stack } : {}),
-      ...(consoleLog ? { consoleLog: true } : {}),
-    }
-  } catch {
-    return null
-  }
-}
-
-function forwardedLogMatchesConsole(forwarded: string, consoleMessage: string): boolean {
-  const base = consoleMessage.replace(/\s+JSHandle@\w+.*$/u, '').trim()
-  return base.length > 0 && forwarded.includes(base)
-}
-
-function findMatchingConsoleDiagnostic(
-  diagnostics: readonly RuntimeDiagnostic[],
-  forwarded: string,
-): RuntimeDiagnostic | undefined {
-  for (let index = diagnostics.length - 1; index >= 0; index -= 1) {
-    const diagnostic = diagnostics[index]
-    if (
-      diagnostic?.source === 'console' &&
-      diagnostic.level === 'error' &&
-      forwardedLogMatchesConsole(forwarded, diagnostic.message)
-    ) {
-      return diagnostic
-    }
-  }
-  return undefined
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null
 }
 
 function isFixtureLifecycleNavigationWarning(message: ConsoleMessage): boolean {

@@ -2,12 +2,14 @@
 // themes. Collects everything that changes how the chat LOOKS — split
 // from General, which now houses only composer + continue behavior.
 
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect } from 'react'
+import { workspaceConfigurationWriteInteraction } from '../../app/presentation-interactions'
 import {
   applyBaseFontSizeToDocument,
   applyChatMaxWidthToDocument,
   applyFontFamilyToDocument,
   applyThemeToDocument,
+  BASE_FONT_SIZE_KEY,
   BASE_FONT_SIZE_OPTIONS,
   type BaseFontSize,
   CHAT_MAX_WIDTH_FULL_POSITION,
@@ -16,19 +18,24 @@ import {
   CHAT_MAX_WIDTH_STEP,
   type ChatMaxWidth,
   DEFAULT_GLOBAL_PREFERENCES,
+  FONT_FAMILY_KEY,
   FONT_FAMILY_OPTIONS,
   type FontFamilyChoice,
+  LONG_MESSAGE_DISPLAY_MODE_KEY,
   type LongMessageDisplayMode,
-  readGlobalPreferences,
+  THEME_KEY,
   type ThemePreference,
+} from '../../core/global-settings'
+import { useConfigurationPreferences } from '../../hooks/useConfigurationPreferences'
+import { usePresentationInteraction } from '../../hooks/usePresentationInteraction'
+import { useSettledConfigurationEdit } from '../../hooks/useSettledConfigurationEdit'
+import {
   writeBaseFontSize,
   writeChatMaxWidth,
   writeFontFamily,
   writeLongMessageDisplayMode,
   writeTheme,
-} from '../../core/global-settings'
-import { GLOBAL_PREFERENCES_DEPENDENCIES } from '../../store/reactive-dependencies'
-import { useRepositoryQueryState } from '../../store/reactive-query'
+} from '../../store/preferences-application'
 import { InfoDisclosure } from './InfoDisclosure'
 import { RenderingSettings } from './RenderingSettings'
 
@@ -63,78 +70,78 @@ function chatMaxWidthLabel(value: ChatMaxWidth): string {
 }
 
 export function AppearanceSettings() {
-  const preferencesQuery = useRepositoryQueryState(
-    'global-preferences',
-    readGlobalPreferences,
-    DEFAULT_GLOBAL_PREFERENCES,
-    GLOBAL_PREFERENCES_DEPENDENCIES,
+  const { run: runWorkspaceConfigurationWrite } = usePresentationInteraction(
+    workspaceConfigurationWriteInteraction,
+    { observePending: false },
   )
-  if (preferencesQuery.status === 'error') throw preferencesQuery.error
-  const loadedPrefs = preferencesQuery.status === 'ready' ? preferencesQuery.value : undefined
-  const prefs = preferencesQuery.value
+  const preferences = useConfigurationPreferences()
+  const loadedPrefs = preferences?.global
+  const prefs = loadedPrefs ?? DEFAULT_GLOBAL_PREFERENCES
 
-  const onTheme = useCallback(async (value: ThemePreference) => {
-    applyThemeToDocument(value)
-    await writeTheme(value)
-  }, [])
+  const onTheme = useCallback(
+    (value: ThemePreference) =>
+      runWorkspaceConfigurationWrite({
+        target: THEME_KEY,
+        action: async () => {
+          applyThemeToDocument(value)
+          await writeTheme(value)
+        },
+      }),
+    [runWorkspaceConfigurationWrite],
+  )
 
-  const onFontFamily = useCallback(async (value: FontFamilyChoice) => {
-    applyFontFamilyToDocument(value)
-    await writeFontFamily(value)
-  }, [])
+  const onFontFamily = useCallback(
+    (value: FontFamilyChoice) =>
+      runWorkspaceConfigurationWrite({
+        target: FONT_FAMILY_KEY,
+        action: async () => {
+          applyFontFamilyToDocument(value)
+          await writeFontFamily(value)
+        },
+      }),
+    [runWorkspaceConfigurationWrite],
+  )
 
-  const onBaseFontSize = useCallback(async (value: BaseFontSize) => {
-    applyBaseFontSizeToDocument(value)
-    await writeBaseFontSize(value)
-  }, [])
+  const onBaseFontSize = useCallback(
+    (value: BaseFontSize) =>
+      runWorkspaceConfigurationWrite({
+        target: BASE_FONT_SIZE_KEY,
+        action: async () => {
+          applyBaseFontSizeToDocument(value)
+          await writeBaseFontSize(value)
+        },
+      }),
+    [runWorkspaceConfigurationWrite],
+  )
 
-  const onLongMessageDisplayMode = useCallback(async (value: LongMessageDisplayMode) => {
-    await writeLongMessageDisplayMode(value)
-  }, [])
+  const onLongMessageDisplayMode = useCallback(
+    (value: LongMessageDisplayMode) =>
+      runWorkspaceConfigurationWrite({
+        target: LONG_MESSAGE_DISPLAY_MODE_KEY,
+        action: () => writeLongMessageDisplayMode(value),
+      }),
+    [runWorkspaceConfigurationWrite],
+  )
 
-  const [position, setPosition] = useState<number>(() => sliderPositionFromPref(prefs.chatMaxWidth))
-  const writeQueueRef = useRef<Promise<void>>(Promise.resolve())
-  const pendingChatMaxWidthRef = useRef<ChatMaxWidth | null>(null)
-  const loadedChatMaxWidth = loadedPrefs?.chatMaxWidth
+  const chatMaxWidthEdit = useSettledConfigurationEdit({
+    fieldKey: 'global.chatMaxWidth',
+    storedValue: prefs.chatMaxWidth,
+    stage: applyChatMaxWidthToDocument,
+    commit: writeChatMaxWidth,
+  })
   useEffect(() => {
-    if (loadedChatMaxWidth === undefined) return
-    if (
-      pendingChatMaxWidthRef.current !== null &&
-      loadedChatMaxWidth !== pendingChatMaxWidthRef.current
-    ) {
-      return
-    }
-    pendingChatMaxWidthRef.current = null
-    setPosition(sliderPositionFromPref(loadedChatMaxWidth))
-    applyChatMaxWidthToDocument(loadedChatMaxWidth)
-  }, [loadedChatMaxWidth])
-  const onChatMaxWidth = useCallback((raw: string) => {
-    const next = Number.parseInt(raw, 10)
-    if (!Number.isFinite(next)) return
-    setPosition(next)
-    const value = prefFromSliderPosition(next)
-    pendingChatMaxWidthRef.current = value
-    applyChatMaxWidthToDocument(value)
-    writeQueueRef.current = writeQueueRef.current
-      .catch(() => undefined)
-      .then(() => writeChatMaxWidth(value))
-      .then(
-        () => {
-          if (pendingChatMaxWidthRef.current === value) {
-            pendingChatMaxWidthRef.current = null
-          }
-        },
-        () => {
-          if (pendingChatMaxWidthRef.current === value) {
-            pendingChatMaxWidthRef.current = null
-          }
-        },
-      )
-  }, [])
-  const renderedPosition =
-    loadedPrefs && pendingChatMaxWidthRef.current === null
-      ? sliderPositionFromPref(loadedPrefs.chatMaxWidth)
-      : position
+    if (!loadedPrefs) return
+    applyChatMaxWidthToDocument(chatMaxWidthEdit.value)
+  }, [chatMaxWidthEdit.value, loadedPrefs])
+  const onChatMaxWidth = useCallback(
+    (raw: string) => {
+      const next = Number.parseInt(raw, 10)
+      if (!Number.isFinite(next)) return
+      chatMaxWidthEdit.setValue(prefFromSliderPosition(next))
+    },
+    [chatMaxWidthEdit],
+  )
+  const renderedPosition = sliderPositionFromPref(chatMaxWidthEdit.value)
 
   if (!loadedPrefs) {
     return <div data-ui="settings-section" data-loading="true" aria-busy="true" />
@@ -181,6 +188,8 @@ export function AppearanceSettings() {
             step={CHAT_MAX_WIDTH_STEP}
             value={renderedPosition}
             onChange={(e) => onChatMaxWidth(e.target.value)}
+            onPointerUp={chatMaxWidthEdit.onPointerUp}
+            onBlur={chatMaxWidthEdit.onBlur}
           />
         </div>
         <div data-ui="field-group">

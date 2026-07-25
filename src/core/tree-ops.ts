@@ -2,9 +2,21 @@
 // transactions of their own, do not broadcast, and do not write cursor state.
 // They return the data the caller needs to apply those side effects.
 
-import type { MessageHeaderRow } from '../store/message-storage'
-import type { MutationContext } from '../store/repository'
 import type { ChatId, Message, MessageId } from './types'
+
+type TreeMutationHeader = Pick<
+  Message,
+  'id' | 'chatId' | 'parentId' | 'siblingIndex' | 'createdAt' | 'deleted'
+>
+
+export interface TreeMutationPort {
+  getMessageHeader(messageId: MessageId): Promise<TreeMutationHeader | undefined>
+  listChildHeaders(chatId: ChatId, parentId: MessageId | null): Promise<TreeMutationHeader[]>
+  patchMessageStructure(
+    messageId: MessageId,
+    patch: Partial<Pick<TreeMutationHeader, 'deleted' | 'parentId' | 'siblingIndex'>>,
+  ): Promise<void>
+}
 
 export class TreeChangedError extends Error {
   readonly chatId: ChatId
@@ -15,22 +27,6 @@ export class TreeChangedError extends Error {
     this.chatId = chatId
     this.detail = detail
   }
-}
-
-// `max(siblingIndex) + 1` across live AND tombstoned children. The uniqueness
-// invariant in §2.3.1 requires staying above tombstones too. Returns 0 when
-// the parent has no children at all.
-export function nextSiblingIndex<T extends Pick<Message, 'siblingIndex'>>(
-  byParent: Map<MessageId | null, T[]>,
-  parentId: MessageId | null,
-): number {
-  const kids = byParent.get(parentId)
-  if (!kids || kids.length === 0) return 0
-  let max = -1
-  for (const k of kids) {
-    if (k.siblingIndex > max) max = k.siblingIndex
-  }
-  return max + 1
 }
 
 type MessageTreeRow = Pick<Message, 'id' | 'parentId'>
@@ -50,7 +46,7 @@ export function createAncestorOutsideSetResolver<T extends MessageTreeRow>(
         ancestor = resolved.get(current.id) ?? null
         break
       }
-      if (import.meta.env.MODE === 'test') onVisit?.()
+      onVisit?.()
       path.push(current.id)
       const parentId = current.parentId
       if (parentId === null || !excluded.has(parentId)) {
@@ -68,24 +64,12 @@ export function createAncestorOutsideSetResolver<T extends MessageTreeRow>(
   }
 }
 
-function groupTreeRowsByParent(
-  messages: readonly MessageTreeRow[],
-): Map<MessageId | null, MessageTreeRow[]> {
-  const buckets = new Map<MessageId | null, MessageTreeRow[]>()
-  for (const message of messages) {
-    const bucket = buckets.get(message.parentId)
-    if (bucket) bucket.push(message)
-    else buckets.set(message.parentId, [message])
-  }
-  return buckets
-}
-
 // Re-number all children (live + tombstoned) of `parentId` so they form a
 // unique, dense, ascending `siblingIndex` list ordered by `createdAt`. Used
 // after splice-up and insert-between reparenting. Caller must have already
 // persisted any new/changed children under this parent before calling.
 async function renumberSiblingsByCreatedAt(
-  ctx: MutationContext,
+  ctx: TreeMutationPort,
   chatId: ChatId,
   parentId: MessageId | null,
 ): Promise<void> {
@@ -95,7 +79,7 @@ async function renumberSiblingsByCreatedAt(
     return a.id < b.id ? -1 : a.id > b.id ? 1 : 0
   })
   for (let i = 0; i < rows.length; i++) {
-    const row = rows[i] as MessageHeaderRow
+    const row = rows[i] as TreeMutationHeader
     if (row.siblingIndex !== i) {
       await ctx.patchMessageStructure(row.id, { siblingIndex: i })
     }
@@ -118,7 +102,7 @@ interface SoftDeleteResult {
 // the plan for the correctness argument around walking through chains of
 // deleted ancestors instead of naively splicing one level up.
 export async function softDeleteWithSplice(
-  ctx: MutationContext,
+  ctx: TreeMutationPort,
   chatId: ChatId,
   nodeIdsToDelete: readonly MessageId[],
 ): Promise<SoftDeleteResult> {
@@ -126,9 +110,9 @@ export async function softDeleteWithSplice(
     return { tombstoned: [], reparented: [] }
   }
   const deletedSet = new Set<MessageId>(nodeIdsToDelete)
-  const deletedById = new Map<MessageId, MessageHeaderRow>()
+  const deletedById = new Map<MessageId, TreeMutationHeader>()
 
-  const deletedNodes: MessageHeaderRow[] = []
+  const deletedNodes: TreeMutationHeader[] = []
   for (const id of nodeIdsToDelete) {
     const row = await ctx.getMessageHeader(id)
     if (!row) continue
@@ -184,74 +168,40 @@ export async function softDeleteWithSplice(
 // Cascade variant: tombstone every descendant of the requested nodes; do NOT
 // splice. The "Also delete descendants" checkbox (§8.4.10) uses this.
 export async function cascadeSoftDelete(
-  ctx: MutationContext,
+  ctx: TreeMutationPort,
   chatId: ChatId,
   nodeIdsToDelete: readonly MessageId[],
 ): Promise<MessageId[]> {
   if (nodeIdsToDelete.length === 0) return []
-  const byParent = groupTreeRowsByParent(await ctx.listMessageHeaders(chatId))
-  const toTombstone = new Set<MessageId>(nodeIdsToDelete)
-  const stack: MessageId[] = [...nodeIdsToDelete]
+  const discovered = new Map<MessageId, TreeMutationHeader>()
+  const stack: TreeMutationHeader[] = []
+  for (const messageId of new Set(nodeIdsToDelete)) {
+    const row = await ctx.getMessageHeader(messageId)
+    if (!row) continue
+    if (row.chatId !== chatId) {
+      throw new TreeChangedError(chatId, `node ${messageId} belongs to another chat`)
+    }
+    discovered.set(row.id, row)
+    stack.push(row)
+  }
   while (stack.length > 0) {
-    const id = stack.pop() as MessageId
-    const kids = byParent.get(id)
-    if (!kids) continue
+    const row = stack.pop() as TreeMutationHeader
+    const kids = await ctx.listChildHeaders(chatId, row.id)
     for (const kid of kids) {
-      if (toTombstone.has(kid.id)) continue
-      toTombstone.add(kid.id)
-      stack.push(kid.id)
+      if (kid.chatId !== chatId) {
+        throw new TreeChangedError(chatId, `node ${kid.id} belongs to another chat`)
+      }
+      if (discovered.has(kid.id)) continue
+      discovered.set(kid.id, kid)
+      stack.push(kid)
     }
   }
   const tombstoned: MessageId[] = []
-  for (const id of toTombstone) {
-    const row = await ctx.getMessageHeader(id)
-    if (!row) continue
+  for (const row of discovered.values()) {
     if (!row.deleted) {
       await ctx.patchMessageStructure(row.id, { deleted: true })
-      tombstoned.push(id)
+      tombstoned.push(row.id)
     }
   }
   return tombstoned
-}
-
-// Collect every message in the same turn chain as `headId`. The head (the
-// `turnIndex: 0` message of the turn) plus every descendant whose `turnId`
-// matches. Pure in-memory walk.
-type MessageTurnRow = Pick<Message, 'id' | 'parentId' | 'turnId' | 'turnIndex'>
-
-export function collectTurnChain<T extends MessageTurnRow>(
-  head: T,
-  byParent: Map<MessageId | null, T[]>,
-): T[] {
-  const result: T[] = [head]
-  const stack: MessageId[] = [head.id]
-  while (stack.length > 0) {
-    const parentId = stack.pop() as MessageId
-    const kids = byParent.get(parentId)
-    if (!kids) continue
-    for (const kid of kids) {
-      if (kid.turnId === head.turnId) {
-        result.push(kid)
-        stack.push(kid.id)
-      }
-    }
-  }
-  return result
-}
-
-// Find the `turnIndex: 0` ancestor of a message: the head of its turn chain.
-// The walk goes up via `parentId`, following `turnId === node.turnId`. The
-// data model guarantees a turn chain is strictly parent→child under a shared
-// `turnId`, so at most one such ancestor exists.
-export function turnHeadOf<T extends MessageTurnRow>(message: T, byId: Map<MessageId, T>): T {
-  let cur: T = message
-  while (cur.turnIndex !== 0) {
-    const parent = cur.parentId ? byId.get(cur.parentId) : undefined
-    if (!parent || parent.turnId !== cur.turnId) {
-      // No matching parent in the same turn; treat `cur` as the head.
-      return cur
-    }
-    cur = parent
-  }
-  return cur
 }

@@ -36,6 +36,9 @@ const moduleEntryCount = [...indexHtml.matchAll(/<script\b(?=[^>]*\btype=["']mod
 if (moduleEntryCount !== 1) {
   problems.push(`expected one module entry script, found ${moduleEntryCount}`)
 }
+for (const [name, artifact] of Object.entries(delivery.namedAssets)) {
+  if (!artifact) problems.push(`missing named distribution asset: ${name}`)
+}
 
 for (const file of files) {
   const relativePath = relative(dist, file)

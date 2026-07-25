@@ -12,32 +12,70 @@
 // single use (never written back to storage). Wrong-passphrase attempts throw
 // `WrongPassphraseError` and must not fall through to an unauthenticated request.
 
+import {
+  type KeyDispatchProof,
+  keyDispatchProof,
+  keyDispatchProofsEqual,
+} from '../core/key-dispatch-proof'
 import type { KeyId, KeyRecord } from '../core/types'
 import { newId } from '../lib/ulid'
-import { runAuthoritativeTransaction } from './authoritative-write'
-import { onEvent, postEvent } from './broadcast'
-import { getDb } from './db'
-import { getSetting, updateSetting } from './settings'
+import { executeConfigurationCommand } from './configuration-command-client'
+import type { CreateKeyInput, PreparedEncryptedKey } from './key-preparation-contract'
+import type { WorkspaceEffect } from './workspace-effect-hub'
+import type { WorkspaceReadAuthority, WorkspaceWriteAuthority } from './workspace-protocol'
+import { workspaceDependenciesOverlap } from './workspace-protocol'
+import { getWorkspaceRepository } from './workspace-repository'
+import { runWorkspaceAction, runWorkspaceRead } from './workspace-runtime'
 
-const INSTALL_SECRET_SETTING_KEY = 'install-secret'
 const KDF_ITERATIONS = 200_000
 const AES_LENGTH_BITS = 256
+const DERIVED_KEY_CACHE_LIMIT = 64
 
 // Cache of per-key derived wrapper CryptoKey objects. Session-scoped (per tab,
-// per process). Cleared on `key-rotated` broadcast. Never persisted.
-const derivedKeyCache = new Map<KeyId, CryptoKey>()
+// per process). Cleared on exact key-material changes. Never persisted.
+interface CachedDerivedKey {
+  readonly proof: Readonly<KeyDispatchProof>
+  readonly wrapperKey: CryptoKey
+}
 
-let broadcastHookAttached = false
+const derivedKeyCache = new Map<KeyId, CachedDerivedKey>()
 
-function ensureBroadcastHook(): void {
-  if (broadcastHookAttached) return
-  broadcastHookAttached = true
-  onEvent((event) => {
-    if (event.kind === 'key-rotated') derivedKeyCache.delete(event.keyId)
-    if (event.kind === 'workspace-invalidated' || event.kind === 'workspace-replaced') {
+export function resetKeyMaterialWorkspaceCache(): void {
+  derivedKeyCache.clear()
+}
+
+export function observeKeyMaterialWorkspaceEffect(effect: WorkspaceEffect): void {
+  if (effect.kind === 'replace') {
+    derivedKeyCache.clear()
+    return
+  }
+  const dependencies = effect.impact
+  if (
+    !workspaceDependenciesOverlap([{ kind: 'key', facets: ['request-material'] }], dependencies)
+  ) {
+    return
+  }
+  if (dependencies === 'all') {
+    derivedKeyCache.clear()
+    return
+  }
+  for (const dependency of dependencies) {
+    if (dependency.kind === 'workspace') {
       derivedKeyCache.clear()
+      return
     }
-  })
+    if (
+      dependency.kind !== 'key' ||
+      (dependency.facets !== undefined && !dependency.facets.includes('request-material'))
+    ) {
+      continue
+    }
+    if (!dependency.keyIds) {
+      derivedKeyCache.clear()
+      return
+    }
+    for (const keyId of dependency.keyIds) derivedKeyCache.delete(keyId)
+  }
 }
 
 export class WrongPassphraseError extends Error {
@@ -88,16 +126,21 @@ function randomBytes(length: number): Uint8Array {
 
 // Gets the per-install random secret used when no passphrase is set. Creates
 // it on first call and persists in `settings['install-secret']`. See §9.3.1.
-export async function getOrCreateInstallSecret(): Promise<string> {
-  const existing = await getSetting<string>(INSTALL_SECRET_SETTING_KEY)
-  if (existing) return existing
-  const fresh = bytesToBase64(randomBytes(32))
-  const winning = await updateSetting<string>(
-    INSTALL_SECRET_SETTING_KEY,
-    (current) => current || fresh,
-  )
-  if (!winning) throw new Error('InstallSecretInitializationFailed')
-  return winning
+export async function getOrCreateInstallSecret(
+  authority?: WorkspaceWriteAuthority,
+): Promise<string> {
+  const initialize = async (permit: WorkspaceWriteAuthority) => {
+    const fresh = bytesToBase64(randomBytes(32))
+    const result = await executeConfigurationCommand(
+      { kind: 'install-secret.ensure', fresh, now: Date.now() },
+      permit,
+    )
+    if (result.kind !== 'workspace-setting-saved' || typeof result.value !== 'string') {
+      throw new Error('InstallSecretInitializationFailed')
+    }
+    return result.value
+  }
+  return authority ? initialize(authority) : runWorkspaceAction('configuration', initialize)
 }
 
 async function deriveWrapperKey(passphraseOrSecret: string, salt: Uint8Array): Promise<CryptoKey> {
@@ -133,149 +176,254 @@ export function obscurePreview(plaintext: string): string {
   return `${prefix}…${tail}`
 }
 
-interface CreateKeyInput {
-  name: string
-  plaintextKey: string
-  passphrase?: string
-  passphraseHint?: string
-  id?: KeyId
-  now?: number
+export type { CreateKeyInput, PreparedEncryptedKey } from './key-preparation-contract'
+
+export async function prepareEncryptedKey(
+  input: CreateKeyInput,
+  authority?: WorkspaceWriteAuthority,
+): Promise<PreparedEncryptedKey> {
+  const prepare = async (permit: WorkspaceWriteAuthority): Promise<PreparedEncryptedKey> => {
+    const salt = randomBytes(16)
+    const iv = randomBytes(12)
+    const wrapperSecret = input.passphrase ?? (await getOrCreateInstallSecret(permit))
+    const wrapperKey = await deriveWrapperKey(wrapperSecret, salt)
+    const ciphertextBuffer = await crypto.subtle.encrypt(
+      { name: 'AES-GCM', iv: iv as BufferSource },
+      wrapperKey,
+      new TextEncoder().encode(input.plaintextKey),
+    )
+    const now = input.now ?? Date.now()
+    const record: KeyRecord = {
+      id: input.id ?? newId(),
+      name: input.name,
+      ciphertext: bytesToBase64(new Uint8Array(ciphertextBuffer)),
+      iv: bytesToBase64(iv),
+      salt: bytesToBase64(salt),
+      algorithm: 'AES-GCM-256',
+      kdf: { name: 'PBKDF2', iterations: KDF_ITERATIONS, hash: 'SHA-256' },
+      obscuredPreview: obscurePreview(input.plaintextKey),
+      materialRevision: input.materialRevision ?? 0,
+      createdAt: now,
+    }
+    if (input.passphrase !== undefined) record.passphraseHint = input.passphraseHint ?? ''
+    return Object.freeze({
+      record,
+      retainWrapperKey: () => cacheDerivedKey(keyDispatchProof(record), wrapperKey),
+    })
+  }
+  return authority ? prepare(authority) : runWorkspaceAction('configuration', prepare)
 }
 
 // Encrypts `plaintextKey` and persists a KeyRecord. When `passphrase` is
 // omitted, the install secret is used as the wrapper-key source. Returns the
 // stored record (ciphertext + metadata) — plaintext stays in memory only.
-export async function createKey(input: CreateKeyInput): Promise<KeyRecord> {
-  ensureBroadcastHook()
-  const salt = randomBytes(16)
-  const iv = randomBytes(12)
-  const wrapperSecret = input.passphrase ?? (await getOrCreateInstallSecret())
-  const wrapperKey = await deriveWrapperKey(wrapperSecret, salt)
-  const ciphertextBuffer = await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv: iv as BufferSource },
-    wrapperKey,
-    new TextEncoder().encode(input.plaintextKey),
-  )
-  const now = input.now ?? Date.now()
-  const record: KeyRecord = {
-    id: input.id ?? newId(),
-    name: input.name,
-    ciphertext: bytesToBase64(new Uint8Array(ciphertextBuffer)),
-    iv: bytesToBase64(iv),
-    salt: bytesToBase64(salt),
-    algorithm: 'AES-GCM-256',
-    kdf: { name: 'PBKDF2', iterations: KDF_ITERATIONS, hash: 'SHA-256' },
-    obscuredPreview: obscurePreview(input.plaintextKey),
-    createdAt: now,
+export async function createKey(
+  input: CreateKeyInput,
+  authority?: WorkspaceWriteAuthority,
+): Promise<KeyRecord> {
+  const create = async (permit: WorkspaceWriteAuthority) => {
+    const now = input.now ?? Date.now()
+    const existing =
+      input.id && input.materialRevision === undefined ? await getKey(input.id, permit) : undefined
+    const prepared = await prepareEncryptedKey(
+      {
+        ...input,
+        materialRevision:
+          input.materialRevision ?? (existing ? (existing.materialRevision ?? 0) + 1 : 0),
+        now,
+      },
+      permit,
+    )
+    const result = await executeConfigurationCommand(
+      {
+        kind: 'key.put',
+        key: prepared.record,
+        expectedMaterialRevision: existing?.materialRevision ?? null,
+        now,
+      },
+      permit,
+    )
+    if (result.kind === 'conflict') throw new Error(`KeyChanged:${prepared.record.id}`)
+    if (result.kind !== 'key-saved' || !result.key) {
+      throw new Error(`KeyCreateFailed:${prepared.record.id}`)
+    }
+    prepared.retainWrapperKey()
+    return result.key
   }
-  // Mode discriminator: `passphraseHint` present ↔ passphrase-protected. When
-  // the user supplied a passphrase without a hint, set it to an empty
-  // string so the invariant holds (§9.3.1).
-  if (input.passphrase !== undefined) {
-    record.passphraseHint = input.passphraseHint ?? ''
-  }
-  const db = getDb()
-  await runAuthoritativeTransaction({
-    db,
-    lockNames: [`key:${record.id}`],
-    tables: [db.keys, db.settings],
-    now,
-    write: async (tx) => {
-      await tx.table('keys').put(record)
-      return { value: undefined, changed: true }
-    },
-  })
-  derivedKeyCache.set(record.id, wrapperKey)
-  return record
+  return authority ? create(authority) : runWorkspaceAction('configuration', create)
 }
 
-export async function getKey(keyId: KeyId): Promise<KeyRecord | undefined> {
-  return getDb().keys.get(keyId)
+export async function getKey(
+  keyId: KeyId,
+  authority?: WorkspaceReadAuthority,
+): Promise<KeyRecord | undefined> {
+  const read = (permit: WorkspaceReadAuthority) =>
+    getWorkspaceRepository()
+      .query(permit, { kind: 'key.get', keyId })
+      .then((envelope) => envelope.value)
+  return authority ? read(authority) : runWorkspaceRead('repository-query', read)
 }
 
-interface ResolveKeyOptions {
+export interface ResolveKeyOptions {
   passphrase?: string
+}
+
+export interface CapturedKeyForDispatch {
+  readonly proof: Readonly<KeyDispatchProof>
+  readonly resolve: (
+    opts?: ResolveKeyOptions,
+    authority?: WorkspaceWriteAuthority,
+  ) => Promise<string>
+}
+
+export function captureKeyForDispatch(record: KeyRecord): CapturedKeyForDispatch {
+  return captureKeyProofForDispatch(keyDispatchProof(record))
+}
+
+export function captureKeyProofForDispatch(
+  proof: Readonly<KeyDispatchProof>,
+): CapturedKeyForDispatch {
+  const capturedProof = Object.freeze({
+    ...proof,
+    kdf: Object.freeze({ ...proof.kdf }),
+  })
+  const captured = {} as CapturedKeyForDispatch
+  Object.defineProperty(captured, 'proof', {
+    configurable: false,
+    enumerable: false,
+    value: capturedProof,
+    writable: false,
+  })
+  Object.defineProperty(captured, 'resolve', {
+    configurable: false,
+    enumerable: false,
+    value: (opts: ResolveKeyOptions = {}, authority?: WorkspaceWriteAuthority) =>
+      resolveCapturedKeyForDispatch(capturedProof, opts, authority),
+    writable: false,
+  })
+  return Object.freeze(captured)
+}
+
+async function resolveCapturedKeyForDispatch(
+  proof: KeyDispatchProof,
+  opts: ResolveKeyOptions = {},
+  authority?: WorkspaceWriteAuthority,
+): Promise<string> {
+  const resolve = (permit: WorkspaceWriteAuthority) =>
+    resolveCapturedKeyForDispatchWithAuthority(proof, opts, permit)
+  return authority ? resolve(authority) : runWorkspaceAction('configuration', resolve)
+}
+
+export async function resolveCapturedKeyProofForUse(
+  proof: Readonly<KeyDispatchProof>,
+  opts: ResolveKeyOptions = {},
+  authority?: WorkspaceWriteAuthority,
+): Promise<string> {
+  const resolve = async (permit: WorkspaceWriteAuthority) => {
+    const plaintext = await resolveCapturedKeyForDispatchWithAuthority(proof, opts, permit)
+    await touchLastUsedAt(proof.keyId, Date.now(), permit)
+    return plaintext
+  }
+  return authority ? resolve(authority) : runWorkspaceAction('configuration', resolve)
 }
 
 // Returns the plaintext API key. Never cached on disk; the caller hands it to
 // fetch() and drops the reference. For install-secret keys, no passphrase
 // prompt is needed. For passphrase keys, `opts.passphrase` is required on the
 // FIRST decrypt per tab; subsequent calls reuse the in-memory derived wrapper.
-export async function resolveKey(keyId: KeyId, opts: ResolveKeyOptions = {}): Promise<string> {
-  const plaintext = await resolveKeyForDispatch(keyId, opts)
-  await markKeyUsed(keyId)
-  return plaintext
+export async function resolveKey(
+  keyId: KeyId,
+  opts: ResolveKeyOptions = {},
+  authority?: WorkspaceWriteAuthority,
+): Promise<string> {
+  const resolve = async (permit: WorkspaceWriteAuthority) => {
+    const plaintext = await resolveKeyForDispatchWithAuthority(keyId, opts, permit)
+    await touchLastUsedAt(keyId, Date.now(), permit)
+    return plaintext
+  }
+  return authority ? resolve(authority) : runWorkspaceAction('configuration', resolve)
 }
 
 export async function resolveKeyForDispatch(
   keyId: KeyId,
   opts: ResolveKeyOptions = {},
+  authority?: WorkspaceWriteAuthority,
 ): Promise<string> {
-  ensureBroadcastHook()
-  const record = await getKey(keyId)
+  const resolve = (permit: WorkspaceWriteAuthority) =>
+    resolveKeyForDispatchWithAuthority(keyId, opts, permit)
+  return authority ? resolve(authority) : runWorkspaceAction('configuration', resolve)
+}
+
+async function resolveKeyForDispatchWithAuthority(
+  keyId: KeyId,
+  opts: ResolveKeyOptions,
+  authority: WorkspaceWriteAuthority,
+): Promise<string> {
+  const record = await getKey(keyId, authority)
   if (!record) throw new KeyMissingError(keyId)
-  const wrapperKey = await resolveWrapperKey(record, opts)
-  const plaintextBuffer = await decryptWith(record, wrapperKey, keyId)
-  derivedKeyCache.set(keyId, wrapperKey)
+  return resolveCapturedKeyForDispatchWithAuthority(keyDispatchProof(record), opts, authority)
+}
+
+async function resolveCapturedKeyForDispatchWithAuthority(
+  proof: KeyDispatchProof,
+  opts: ResolveKeyOptions,
+  authority: WorkspaceWriteAuthority,
+): Promise<string> {
+  const wrapperKey = await resolveWrapperKey(proof, opts, authority)
+  const plaintextBuffer = await decryptWith(proof, wrapperKey)
+  cacheDerivedKey(proof, wrapperKey)
   return new TextDecoder().decode(plaintextBuffer)
 }
 
-export async function markKeyUsed(keyId: KeyId, now = Date.now()): Promise<void> {
-  await touchLastUsedAt(keyId, now)
-}
-
-export async function resolveKeyIfPresent(
-  keyId: KeyId,
-  opts: ResolveKeyOptions = {},
-): Promise<string | null> {
-  const record = await getKey(keyId)
-  if (!record) return null
-  return resolveKey(keyId, opts)
-}
-
-async function resolveWrapperKey(record: KeyRecord, opts: ResolveKeyOptions): Promise<CryptoKey> {
-  const cached = derivedKeyCache.get(record.id)
-  if (cached) return cached
-  const salt = base64ToBytes(record.salt)
-  if (record.passphraseHint !== undefined) {
-    if (opts.passphrase === undefined) throw new PassphraseRequiredError(record.id)
+async function resolveWrapperKey(
+  proof: KeyDispatchProof,
+  opts: ResolveKeyOptions,
+  authority: WorkspaceWriteAuthority,
+): Promise<CryptoKey> {
+  const cached = derivedKeyCache.get(proof.keyId)
+  if (cached && keyDispatchProofsEqual(cached.proof, proof)) {
+    derivedKeyCache.delete(proof.keyId)
+    derivedKeyCache.set(proof.keyId, cached)
+    return cached.wrapperKey
+  }
+  if (cached) derivedKeyCache.delete(proof.keyId)
+  const salt = base64ToBytes(proof.salt)
+  if (proof.passphraseProtected) {
+    if (opts.passphrase === undefined) throw new PassphraseRequiredError(proof.keyId)
     return deriveWrapperKey(opts.passphrase, salt)
   }
-  const installSecret = await getOrCreateInstallSecret()
+  const installSecret = await getOrCreateInstallSecret(authority)
   return deriveWrapperKey(installSecret, salt)
 }
 
-async function decryptWith(
-  record: KeyRecord,
-  wrapperKey: CryptoKey,
-  keyId: KeyId,
-): Promise<ArrayBuffer> {
+async function decryptWith(proof: KeyDispatchProof, wrapperKey: CryptoKey): Promise<ArrayBuffer> {
   try {
     return await crypto.subtle.decrypt(
-      { name: 'AES-GCM', iv: base64ToBytes(record.iv) as BufferSource },
+      { name: 'AES-GCM', iv: base64ToBytes(proof.iv) as BufferSource },
       wrapperKey,
-      base64ToBytes(record.ciphertext) as BufferSource,
+      base64ToBytes(proof.ciphertext) as BufferSource,
     )
   } catch {
-    throw new WrongPassphraseError(keyId)
+    throw new WrongPassphraseError(proof.keyId)
   }
 }
 
-async function touchLastUsedAt(keyId: KeyId, now = Date.now()): Promise<void> {
-  const db = getDb()
-  await runAuthoritativeTransaction({
-    db,
-    lockNames: [`key:${keyId}`],
-    tables: [db.keys, db.settings],
-    now,
-    write: async (tx) => {
-      const table = tx.table<KeyRecord, KeyId>('keys')
-      const row = await table.get(keyId)
-      if (!row) return { value: undefined, changed: false }
-      await table.put({ ...row, lastUsedAt: now })
-      return { value: undefined, changed: true }
-    },
-  })
+function cacheDerivedKey(proof: KeyDispatchProof, wrapperKey: CryptoKey): void {
+  derivedKeyCache.delete(proof.keyId)
+  derivedKeyCache.set(proof.keyId, { proof, wrapperKey })
+  while (derivedKeyCache.size > DERIVED_KEY_CACHE_LIMIT) {
+    const oldestKeyId = derivedKeyCache.keys().next().value
+    if (oldestKeyId === undefined) break
+    derivedKeyCache.delete(oldestKeyId)
+  }
+}
+
+async function touchLastUsedAt(
+  keyId: KeyId,
+  now: number,
+  authority: WorkspaceWriteAuthority,
+): Promise<void> {
+  await executeConfigurationCommand({ kind: 'key.touch', keyId, now }, authority)
 }
 
 interface ChangePassphraseInput {
@@ -288,86 +436,78 @@ interface ChangePassphraseInput {
 
 // Re-encrypts the key under a new passphrase (or switches to/from
 // install-secret mode). Unlock the old ciphertext first; derive a fresh salt;
-// re-encrypt; write back; broadcast `key-rotated` so other tabs drop cached
-// wrappers per §9.3.4.
-export async function changePassphrase(input: ChangePassphraseInput): Promise<KeyRecord> {
-  ensureBroadcastHook()
-  const plaintext = await resolveKey(input.keyId, {
-    ...(input.oldPassphrase !== undefined ? { passphrase: input.oldPassphrase } : {}),
-  })
-  const existing = await getKey(input.keyId)
-  if (!existing) throw new KeyMissingError(input.keyId)
-  const salt = randomBytes(16)
-  const iv = randomBytes(12)
-  const wrapperSecret = input.newPassphrase ?? (await getOrCreateInstallSecret())
-  const wrapperKey = await deriveWrapperKey(wrapperSecret, salt)
-  const ciphertextBuffer = await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv: iv as BufferSource },
-    wrapperKey,
-    new TextEncoder().encode(plaintext),
-  )
-  const db = getDb()
-  const now = input.now ?? Date.now()
-  const { value: next } = await runAuthoritativeTransaction({
-    db,
-    lockNames: [`key:${input.keyId}`],
-    tables: [db.keys, db.settings],
-    now,
-    write: async (tx) => {
-      const table = tx.table<KeyRecord, KeyId>('keys')
-      const current = await table.get(input.keyId)
-      if (!current) throw new KeyMissingError(input.keyId)
-      if (
-        current.ciphertext !== existing.ciphertext ||
-        current.iv !== existing.iv ||
-        current.salt !== existing.salt
-      ) {
-        throw new Error(`KeyChanged:${input.keyId}`)
-      }
-      const row: KeyRecord = {
-        ...current,
-        ciphertext: bytesToBase64(new Uint8Array(ciphertextBuffer)),
-        iv: bytesToBase64(iv),
-        salt: bytesToBase64(salt),
-      }
-      if (input.newPassphrase !== undefined) {
-        row.passphraseHint = input.newPassphraseHint ?? current.passphraseHint ?? ''
-      } else {
-        delete row.passphraseHint
-      }
-      await table.put(row)
-      return { value: row, changed: true }
-    },
-  })
-  derivedKeyCache.set(input.keyId, wrapperKey)
-  postEvent({ kind: 'key-rotated', keyId: input.keyId })
-  return next
+// re-encrypt; write back; publish an exact material-change delta so other tabs
+// drop cached wrappers per §9.3.4.
+export async function changePassphrase(
+  input: ChangePassphraseInput,
+  authority?: WorkspaceWriteAuthority,
+): Promise<KeyRecord> {
+  const change = async (permit: WorkspaceWriteAuthority) => {
+    const existing = await getKey(input.keyId, permit)
+    if (!existing) throw new KeyMissingError(input.keyId)
+    const existingProof = keyDispatchProof(existing)
+    const oldWrapperKey = await resolveWrapperKey(
+      existingProof,
+      {
+        ...(input.oldPassphrase === undefined ? {} : { passphrase: input.oldPassphrase }),
+      },
+      permit,
+    )
+    const plaintextBuffer = await decryptWith(existingProof, oldWrapperKey)
+    const salt = randomBytes(16)
+    const iv = randomBytes(12)
+    const wrapperSecret = input.newPassphrase ?? (await getOrCreateInstallSecret(permit))
+    const wrapperKey = await deriveWrapperKey(wrapperSecret, salt)
+    const ciphertextBuffer = await crypto.subtle.encrypt(
+      { name: 'AES-GCM', iv: iv as BufferSource },
+      wrapperKey,
+      plaintextBuffer,
+    )
+    const now = input.now ?? Date.now()
+    const next: KeyRecord = {
+      ...existing,
+      ciphertext: bytesToBase64(new Uint8Array(ciphertextBuffer)),
+      iv: bytesToBase64(iv),
+      salt: bytesToBase64(salt),
+      materialRevision: (existing.materialRevision ?? 0) + 1,
+      lastUsedAt: Math.max(existing.lastUsedAt ?? 0, now),
+    }
+    if (input.newPassphrase !== undefined) {
+      next.passphraseHint = input.newPassphraseHint ?? existing.passphraseHint ?? ''
+    } else {
+      delete next.passphraseHint
+    }
+    const result = await executeConfigurationCommand(
+      {
+        kind: 'key.material-replace',
+        key: next,
+        expectedMaterialRevision: existing.materialRevision ?? 0,
+        now,
+      },
+      permit,
+    )
+    if (result.kind === 'missing') throw new KeyMissingError(input.keyId)
+    if (result.kind === 'conflict') throw new Error(`KeyChanged:${input.keyId}`)
+    if (!result.key) throw new Error(`KeyReplaceFailed:${input.keyId}`)
+    cacheDerivedKey(keyDispatchProof(result.key), wrapperKey)
+    return result.key
+  }
+  return authority ? change(authority) : runWorkspaceAction('configuration', change)
 }
 
-// Delete a key. Broadcasts `key-rotated` because listeners' required action is
-// the same as passphrase rotation: drop cached wrappers and re-read on next
-// use (the next `resolveKey` call will throw `KeyMissingError`). See §9.3.5.
-export async function deleteKey(keyId: KeyId): Promise<void> {
-  ensureBroadcastHook()
-  const db = getDb()
-  await runAuthoritativeTransaction({
-    db,
-    lockNames: [`key:${keyId}`],
-    tables: [db.keys, db.settings],
-    now: Date.now(),
-    write: async (tx) => {
-      const table = tx.table<KeyRecord, KeyId>('keys')
-      const existing = await table.get(keyId)
-      if (!existing) return { value: undefined, changed: false }
-      await table.delete(keyId)
-      return { value: undefined, changed: true }
-    },
-  })
-  derivedKeyCache.delete(keyId)
-  postEvent({ kind: 'key-rotated', keyId })
+// Delete a key. The exact deletion delta drops cached wrappers; the next
+// `resolveKey` call throws `KeyMissingError`. See §9.3.5.
+export async function deleteKey(keyId: KeyId, authority?: WorkspaceWriteAuthority): Promise<void> {
+  const remove = async (permit: WorkspaceWriteAuthority) => {
+    const result = await executeConfigurationCommand(
+      { kind: 'key.delete', keyId, now: Date.now() },
+      permit,
+    )
+    if (result.kind === 'key-saved') derivedKeyCache.delete(keyId)
+  }
+  await (authority ? remove(authority) : runWorkspaceAction('configuration', remove))
 }
 
 export function __resetKeyCacheForTests(): void {
-  derivedKeyCache.clear()
-  broadcastHookAttached = false
+  resetKeyMaterialWorkspaceCache()
 }

@@ -1,98 +1,97 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
+import { reduceAttemptAvailability } from '../../src/store/attempt-availability'
+import { requestAttemptStop } from '../../src/store/attempt-control-application'
+import { attemptController, attemptStopCapability } from '../../src/store/attempt-controller'
 import {
-  __resetBroadcastForTests,
-  type BroadcastEvent,
-  onEvent,
-  postEvent,
-} from '../../src/store/broadcast'
-import type { StreamLeaseRow, WorkspaceRepository } from '../../src/store/repository'
+  isStreamLeaseRow,
+  type StreamLeaseRow,
+  type WriterStreamLeaseRow,
+} from '../../src/store/repository'
 import {
-  __flushStreamLeaseWritesForTests,
-  __flushStreamOwnershipForTests,
+  classifyStreamLeaseWallClockFreshness,
+  isFreshStreamLease,
+  observeStreamLeaseFreshness,
+  streamLeaseRecoveryAuthority,
+} from '../../src/store/stream-lease-policy'
+import {
   __resetStreamLeasesForTests,
   __runStreamLeaseHeartbeatSchedulerForTests,
   __setStreamLockManagerForTests,
-  __streamLeaseHeartbeatSchedulerStateForTests,
-  announceStreamEnded,
+  adoptPreparedStreamLease,
+  awaitStreamLeaseRuntimeIdle,
+  disposeStreamLeaseRuntime,
   getStreamClientId,
-  indexStreamLeasesForRecovery,
-  installStreamLeaseListener,
-  onRemoteStreamLeasesExpired,
-  onRemoteStreamOwnershipReleased,
-  requestAbortForChat,
-  requestAbortForStream,
-  startStreamLease,
-  stopStreamLease,
+  isRecoveryClaimedStreamLease,
+  observeStreamOwnershipLock,
+  releaseStreamOwnershipReservation,
+  reserveStreamOwnership,
+  resumeStreamLeaseRuntime,
+  runWithStreamRecoveryCoordinatorLock,
+  streamWriteFenceForLease,
+  waitForStreamOwnershipRelease,
   withStreamRecoveryLocks,
 } from '../../src/store/stream-leases'
+import {
+  prepareLocalWorkspaceChange,
+  publishPreparedWorkspaceEffect,
+} from '../../src/store/workspace-effect-hub'
+import type {
+  ReadEnvelope,
+  WorkspaceCommand,
+  WorkspaceQuery,
+  WorkspaceQueryResult,
+  WorkspaceRepository,
+} from '../../src/store/workspace-protocol'
 import {
   __resetWorkspaceRepositoryForTests,
   __setWorkspaceRepositoryForTests,
 } from '../../src/store/workspace-repository'
-import { useStreamStore } from '../../src/store/zustand/streamStore'
+import {
+  reserveWorkspaceChild,
+  runWorkspaceAction,
+  subscribeWorkspaceRuntimeIdle,
+  tryRunWorkspaceActionIfIdle,
+  workspaceRuntimeInternal,
+} from '../../src/store/workspace-runtime'
+import {
+  type TestGenerationLeaseInput,
+  testContinuationLease,
+  testGenerationLease,
+  testRecoveryPendingLease,
+  testStreamLeaseAdmission,
+} from '../helpers/stream-leases'
 
-beforeEach(() => {
-  __resetBroadcastForTests()
-  __resetStreamLeasesForTests()
-  __resetWorkspaceRepositoryForTests()
-  useStreamStore.getState().reset()
-})
-
-afterEach(async () => {
-  __resetStreamLeasesForTests()
-  await Promise.all([__flushStreamLeaseWritesForTests(), __flushStreamOwnershipForTests()])
-  __resetBroadcastForTests()
-  __resetWorkspaceRepositoryForTests()
-  useStreamStore.getState().reset()
-  vi.useRealTimers()
-})
-
-function deferred(): { promise: Promise<void>; resolve: () => void } {
-  let resolve!: () => void
-  const promise = new Promise<void>((done) => {
-    resolve = done
-  })
-  return { promise, resolve }
-}
-
-async function drainMicrotasks(): Promise<void> {
-  for (let index = 0; index < 8; index += 1) await Promise.resolve()
-}
-
-function leaseInput(streamId: string) {
-  return {
-    streamId,
-    chatId: 'C1',
-    messageId: `M-${streamId}`,
-    startedAt: 1,
-  }
-}
-
-function persistedLease(lease: StreamLeaseRow): StreamLeaseRow {
-  return {
-    ...lease,
-    fenceToken: lease.fenceToken ?? `fence:${lease.streamId}`,
-    replacementEpoch: lease.replacementEpoch ?? 0,
-  }
+const FENCE = Object.freeze({ workspaceId: 'stream-lease-workspace', replacementEpoch: 0 })
+const LOCAL_APPLICATIONS = {
+  postCommitMetadata: () => 'applied' as const,
+  cleanup: () => 'applied' as const,
+  handoff: () => 'applied' as const,
 }
 
 class TestStreamLockManager {
   private readonly held = new Set<string>()
   private readonly queues = new Map<string, Array<() => void>>()
+  readonly requested: string[] = []
 
   request<T>(
     name: string,
     optionsOrCallback: LockOptions | ((lock: Lock | null) => T | PromiseLike<T>),
     maybeCallback?: (lock: Lock | null) => T | PromiseLike<T>,
   ): Promise<T> {
+    this.requested.push(name)
     const options = typeof optionsOrCallback === 'function' ? {} : optionsOrCallback
     const callback =
       typeof optionsOrCallback === 'function'
         ? optionsOrCallback
         : (maybeCallback as NonNullable<typeof maybeCallback>)
+    if (options.signal?.aborted) return Promise.reject(options.signal.reason)
     if (options.ifAvailable && this.held.has(name)) return Promise.resolve(callback(null))
     return new Promise<T>((resolve, reject) => {
       const acquire = () => {
+        if (options.signal?.aborted) {
+          reject(options.signal.reason)
+          return
+        }
         if (this.held.has(name)) {
           const queue = this.queues.get(name) ?? []
           queue.push(acquire)
@@ -103,13 +102,11 @@ class TestStreamLockManager {
         const lock = { name, mode: options.mode ?? 'exclusive' } as Lock
         void Promise.resolve(callback(lock)).then(
           (value) => {
-            this.held.delete(name)
-            this.queues.get(name)?.shift()?.()
+            this.release(name)
             resolve(value)
           },
           (error) => {
-            this.held.delete(name)
-            this.queues.get(name)?.shift()?.()
+            this.release(name)
             reject(error)
           },
         )
@@ -121,1481 +118,981 @@ class TestStreamLockManager {
   isHeld(name: string): boolean {
     return this.held.has(name)
   }
+
+  private release(name: string): void {
+    this.held.delete(name)
+    const queue = this.queues.get(name)
+    const next = queue?.shift()
+    if (queue?.length === 0) this.queues.delete(name)
+    next?.()
+  }
 }
 
-describe('stream leases', () => {
-  it('indexes the orphan-recovery lease snapshot in one pass', () => {
-    let messageIdReads = 0
-    const leases = Array.from({ length: 256 }, (_, index) => {
-      const messageId = index % 4 === 0 ? undefined : `M-${index % 16}`
-      return Object.defineProperty(
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void
+  const promise = new Promise<void>((done) => {
+    resolve = done
+  })
+  return { promise, resolve }
+}
+
+function lease(overrides: Omit<TestGenerationLeaseInput, 'phase'> = {}) {
+  return testGenerationLease({
+    streamId: 'stream-1',
+    chatId: 'chat-1',
+    messageId: 'message-1',
+    ownerClientId: getStreamClientId(),
+    fenceToken: 'fence-1',
+    replacementEpoch: FENCE.replacementEpoch,
+    startedAt: 1,
+    heartbeatAt: 1,
+    admissionSequence: 1,
+    revision: 1,
+    targetCommittedAt: 1,
+    ...overrides,
+  })
+}
+
+async function reserveLeaseOwnership(
+  currentLease: ReturnType<typeof lease>,
+  abortTransport: () => void = () => undefined,
+) {
+  return runWorkspaceAction('conversation-generation', (permit) =>
+    reserveStreamOwnership(
+      reserveWorkspaceChild(permit, 'stream-lease'),
+      testStreamLeaseAdmission(currentLease),
+      abortTransport,
+    ),
+  )
+}
+
+async function adoptLeaseOwnership(
+  currentLease: ReturnType<typeof lease>,
+  abortTransport: () => void = () => undefined,
+) {
+  const reservation = await reserveLeaseOwnership(currentLease, abortTransport)
+  return adoptPreparedStreamLease(reservation, currentLease, LOCAL_APPLICATIONS)
+}
+
+function publishStopRequested(input: {
+  streamId?: string
+  chatId?: string
+  messageId?: string
+  attemptKind?: 'generation' | 'continuation'
+  admissionSequence?: number
+  controlRevision?: number
+  workspaceId?: string
+  replacementEpoch?: number
+}) {
+  const workspaceId = input.workspaceId ?? FENCE.workspaceId
+  const replacementEpoch = input.replacementEpoch ?? FENCE.replacementEpoch
+  const prepared = prepareLocalWorkspaceChange({
+    kind: 'commit',
+    stamp: {
+      workspaceId,
+      replacementEpoch,
+      commitId: `stop:${input.streamId ?? 'stream-1'}`,
+    },
+    delta: {
+      facts: [
         {
-          streamId: `S-${index}`,
-          chatId: `C-${index % 8}`,
-          ownerClientId: 'owner',
-          startedAt: 1,
-          heartbeatAt: 1,
-          attemptKind: index % 2 === 0 ? 'generation' : 'continuation',
-        } satisfies StreamLeaseRow,
-        'messageId',
-        {
-          enumerable: true,
-          get: () => {
-            messageIdReads += 1
-            return messageId
-          },
+          kind: 'attempt-stop-requested',
+          streamId: input.streamId ?? 'stream-1',
+          chatId: input.chatId ?? 'chat-1',
+          messageId: input.messageId ?? 'message-1',
+          attemptKind: input.attemptKind ?? 'generation',
+          admissionSequence: input.admissionSequence ?? 1,
+          controlRevision: input.controlRevision ?? 1,
+          requestId: 'stop-request-1',
+          requestedBy: 'remote-tab',
+          requestedAt: 2,
+          reason: 'user',
         },
-      )
-    })
+      ],
+      invalidations: [],
+    },
+  })
+  publishPreparedWorkspaceEffect(prepared.effect)
+}
 
-    const indexed = indexStreamLeasesForRecovery(leases)
+function commit<T>(value: T) {
+  return {
+    ...FENCE,
+    commitId: 'commit-1',
+    effectScope: 'none',
+    value,
+    receipt: { chats: [], constructions: [], messageRevisions: [], childSlots: [] },
+    delta: { facts: [], invalidations: [] },
+  }
+}
 
-    expect(messageIdReads).toBe(leases.length)
-    expect(indexed.byMessageId.get('M-1')).toHaveLength(16)
-    expect(indexed.byMessageId.get('M-1')?.[0]?.streamId).toBe('S-1')
-    expect(indexed.byMessageId.get('M-1')?.at(-1)?.streamId).toBe('S-241')
+function observeLocalLease(lease: StreamLeaseRow): void {
+  attemptController.observeLease(lease, {
+    workspaceId: FENCE.workspaceId,
+    localAuthority: {
+      kind: 'writer',
+      workspaceId: FENCE.workspaceId,
+      lease: lease as WriterStreamLeaseRow,
+    },
+  })
+}
+
+function repositoryWithExecute(
+  execute: (command: WorkspaceCommand) => Promise<ReturnType<typeof commit>>,
+  readLease?: (streamId: string) => StreamLeaseRow | undefined,
+): WorkspaceRepository {
+  return {
+    query: async <Q extends WorkspaceQuery>(
+      _permit: unknown,
+      query: Q,
+    ): Promise<ReadEnvelope<WorkspaceQueryResult<Q>>> => {
+      if (query.kind !== 'stream.lease' || !readLease) {
+        throw new Error(`UnexpectedQuery:${query.kind}`)
+      }
+      return { ...FENCE, value: readLease(query.streamId) } as ReadEnvelope<WorkspaceQueryResult<Q>>
+    },
+    execute: (_permit: unknown, command: WorkspaceCommand) => execute(command),
+    replace: vi.fn(),
+    subscribeChanges: () => () => {},
+  } as unknown as WorkspaceRepository
+}
+
+beforeAll(() => {
+  if (workspaceRuntimeInternal.snapshot().state === 'STARTING') {
+    workspaceRuntimeInternal.beginReconciliation(FENCE)
+    workspaceRuntimeInternal.finishReconciliation(FENCE)
+  }
+})
+
+beforeEach(() => {
+  for (const attempt of attemptController.listRecords()) {
+    attemptController.remove(attempt.streamId, attempt)
+  }
+  attemptController.replaceWorkspace(FENCE)
+  __resetStreamLeasesForTests({ admissionsOpen: true })
+  resumeStreamLeaseRuntime()
+  __resetWorkspaceRepositoryForTests()
+})
+
+afterEach(async () => {
+  __resetStreamLeasesForTests({ admissionsOpen: true })
+  await awaitStreamLeaseRuntimeIdle()
+  __resetWorkspaceRepositoryForTests()
+  vi.useRealTimers()
+})
+
+describe('stream lease value and recovery-lock contracts', () => {
+  it('accepts the complete lifecycle cross-product and rejects one-field contradictions', () => {
+    const phases = [
+      'reserved',
+      'active',
+      'terminal-decided',
+      'canonical',
+      'metadata-committed',
+    ] as const
+    const attempts = ['generation', 'continuation'] as const
+    const custodies = ['writer', 'recovery', 'recovery-pending'] as const
+    let legalShapeCount = 0
+    let rejectedShapeCount = 0
+
+    for (const attemptKind of attempts) {
+      for (const phase of phases) {
+        for (const custody of custodies) {
+          const variants: StreamLeaseRow[] = [
+            custody === 'recovery-pending'
+              ? testRecoveryPendingLease({ attemptKind, phase })
+              : attemptKind === 'generation'
+                ? testGenerationLease({ phase, custody })
+                : testContinuationLease({ phase, custody }),
+          ]
+          if (
+            phase === 'terminal-decided' ||
+            phase === 'canonical' ||
+            phase === 'metadata-committed'
+          ) {
+            variants.push(
+              custody === 'recovery-pending'
+                ? testRecoveryPendingLease({ attemptKind, phase, dispatched: false })
+                : attemptKind === 'generation'
+                  ? testGenerationLease({ phase, custody, dispatched: false })
+                  : testContinuationLease({ phase, custody, dispatched: false }),
+            )
+          }
+
+          for (const legal of variants) {
+            const label = JSON.stringify({ attemptKind, phase, custody, dispatch: legal.dispatch })
+            expect(isStreamLeaseRow(legal), label).toBe(true)
+            legalShapeCount += 1
+            const stopped = {
+              ...legal,
+              controlRevision: 1,
+              stopControl: {
+                requestId: 'request-1',
+                requestedBy: 'tab-a',
+                requestedAt: 2,
+                reason: 'user' as const,
+              },
+            }
+            expect(isStreamLeaseRow(stopped), label).toBe(true)
+            legalShapeCount += 1
+            const contradictions: Array<Record<string, unknown>> = [
+              { ...legal, streamId: '' },
+              { ...legal, revision: -1 },
+              legal.custody === 'recovery-pending'
+                ? { ...legal, ownerClientId: 'forbidden-owner' }
+                : { ...legal, fenceToken: undefined },
+              phase === 'reserved'
+                ? { ...legal, dispatch: null }
+                : phase === 'active'
+                  ? { ...legal, dispatch: null }
+                  : phase === 'terminal-decided'
+                    ? { ...legal, terminal: undefined }
+                    : phase === 'canonical'
+                      ? { ...legal, canonicalAt: undefined }
+                      : { ...legal, metadataCommittedAt: undefined },
+              phase === 'canonical' || phase === 'metadata-committed'
+                ? { ...legal, postCommit: { ...legal.postCommit, final: undefined } }
+                : {
+                    ...legal,
+                    postCommit: {
+                      ...legal.postCommit,
+                      final: { completionAllowed: false },
+                    },
+                  },
+              { ...legal, controlRevision: 1 },
+              { ...legal, stopControl: stopped.stopControl },
+              { ...stopped, controlRevision: 0 },
+              { ...stopped, stopControl: undefined },
+              phase === 'reserved' || phase === 'active' || phase === 'terminal-decided'
+                ? { ...legal, targetOwnerKey: undefined }
+                : { ...legal, targetOwnerKey: legal.messageId },
+            ]
+            if (legal.phase !== 'reserved' && legal.dispatch !== null) {
+              contradictions.push(
+                legal.attemptKind === 'generation'
+                  ? {
+                      ...legal,
+                      dispatch: {
+                        ...legal.dispatch,
+                        continuationStrategy: 'prompt',
+                        baseNodeVersion: 1,
+                        baseBodyVersion: 1,
+                      },
+                    }
+                  : {
+                      ...legal,
+                      dispatch: { ...legal.dispatch, baseBodyVersion: undefined },
+                    },
+              )
+            }
+            for (const contradiction of contradictions) {
+              expect(isStreamLeaseRow(contradiction), label).toBe(false)
+              rejectedShapeCount += 1
+            }
+          }
+        }
+      }
+    }
+
+    expect(legalShapeCount).toBe(96)
+    expect(rejectedShapeCount).toBe(504)
+  })
+
+  it('never treats an arbitrary future heartbeat as durable freshness', () => {
+    const future = lease({ heartbeatAt: 1_000_000, revision: 1 })
+    expect(classifyStreamLeaseWallClockFreshness(future, 1_000)).toBe('future')
+    expect(isFreshStreamLease(future, 1_000)).toBe(false)
     expect(
-      [...(indexed.messageLessGenerationByChatId.get('C-0') ?? [])].map((lease) => lease.streamId),
-    ).toHaveLength(32)
-  })
+      reduceAttemptAvailability(undefined, {
+        workspace: FENCE,
+        lease: { kind: 'present', lease: future },
+        localAuthority: { kind: 'none' },
+        ownershipLock: { kind: 'unsupported' },
+        wallNow: 1_000,
+        schedulerNow: 1_000,
+      }).blocksReplacement,
+    ).toBe(true)
 
-  it('awaits message-less admission and retargets the same owned lease', async () => {
-    const manager = new TestStreamLockManager()
-    __setStreamLockManagerForTests(manager)
-    const firstPutStarted = deferred()
-    const releaseFirstPut = deferred()
-    const written: StreamLeaseRow[] = []
-    const writeLease = async (lease: StreamLeaseRow) => {
-      if (written.length === 0) {
-        firstPutStarted.resolve()
-        await releaseFirstPut.promise
-      }
-      const stored = persistedLease(lease)
-      written.push(stored)
-      return stored
-    }
-    __setWorkspaceRepositoryForTests({
-      upsertStreamLease: writeLease,
-      renewStreamLease: writeLease,
-      deleteStreamLease: async () => true,
-      deleteOwnedStreamLease: async () => true,
-    } as unknown as WorkspaceRepository)
-
-    let admitted = false
-    const admission = startStreamLease({ streamId: 'S-admit', chatId: 'C1', startedAt: 1 }).then(
-      () => {
-        admitted = true
-      },
+    const first = observeStreamLeaseFreshness(future, 1_000, 100)
+    const unchanged = observeStreamLeaseFreshness(future, 500, 1_000, first)
+    const expired = observeStreamLeaseFreshness(future, 500, first.deadline, unchanged)
+    const renewed = observeStreamLeaseFreshness(
+      { ...future, revision: 2, heartbeatAt: 500 },
+      500,
+      first.deadline,
+      expired,
     )
-    await firstPutStarted.promise
-    expect(admitted).toBe(false)
-    expect(manager.isHeld('stream-owner:S-admit')).toBe(true)
 
-    releaseFirstPut.resolve()
-    await admission
-    expect(written).toHaveLength(1)
-    expect(written[0]).not.toHaveProperty('messageId')
-
-    await startStreamLease({
-      streamId: 'S-admit',
-      chatId: 'C1',
-      messageId: 'M-target',
-      startedAt: 2,
-      attemptKind: 'generation',
-      baseBodyVersion: 7,
-    })
-    expect(manager.isHeld('stream-owner:S-admit')).toBe(true)
-    expect(written.at(-1)).toMatchObject({
-      streamId: 'S-admit',
-      messageId: 'M-target',
-      attemptKind: 'generation',
-      baseBodyVersion: 7,
-      startedAt: 1,
-    })
-
-    void stopStreamLease('S-admit')
-    await Promise.all([__flushStreamLeaseWritesForTests(), __flushStreamOwnershipForTests()])
-    expect(manager.isHeld('stream-owner:S-admit')).toBe(false)
+    expect(unchanged.deadline).toBe(first.deadline)
+    expect(expired.fresh).toBe(false)
+    expect(renewed.fresh).toBe(true)
+    expect(renewed.epoch).not.toBe(expired.epoch)
   })
 
-  it('releases ownership and admission state when the first lease write fails', async () => {
-    const manager = new TestStreamLockManager()
-    __setStreamLockManagerForTests(manager)
-    let attempts = 0
-    __setWorkspaceRepositoryForTests({
-      upsertStreamLease: async (lease: StreamLeaseRow) => {
-        attempts += 1
-        if (attempts === 1) throw new Error('temporary lease write failure')
-        return persistedLease(lease)
-      },
-      renewStreamLease: async (lease: StreamLeaseRow) => persistedLease(lease),
-      deleteStreamLease: async () => true,
-      deleteOwnedStreamLease: async () => true,
-    } as unknown as WorkspaceRepository)
+  it('derives recovery authority only from ownership release or freshness expiry', () => {
+    const progressStates = [
+      'reserved',
+      'active',
+      'terminal-decided',
+      'canonical',
+      'metadata-committed',
+    ] as const
 
-    await expect(startStreamLease(leaseInput('S-retry-admission'))).rejects.toThrow(
-      'temporary lease write failure',
-    )
-    await Promise.all([__flushStreamLeaseWritesForTests(), __flushStreamOwnershipForTests()])
-    expect(manager.isHeld('stream-owner:S-retry-admission')).toBe(false)
-
-    await expect(startStreamLease(leaseInput('S-retry-admission'))).resolves.toMatchObject({
-      replacementEpoch: 0,
-    })
-    expect(manager.isHeld('stream-owner:S-retry-admission')).toBe(true)
-    void stopStreamLease('S-retry-admission')
-    await Promise.all([__flushStreamLeaseWritesForTests(), __flushStreamOwnershipForTests()])
-  })
-
-  it('mirrors fresh remote leases into stream status and clears on stream end', () => {
-    installStreamLeaseListener()
-    const setActive = vi.spyOn(useStreamStore.getState(), 'setActive')
-
-    postEvent({
-      kind: 'stream-heartbeat',
-      lease: {
-        streamId: 'S-remote',
-        replacementEpoch: 0,
-        chatId: 'C1',
-        messageId: 'M1',
-        ownerClientId: 'other-tab',
-        startedAt: 1,
-        heartbeatAt: Date.now(),
-      },
-    })
-
-    expect(useStreamStore.getState().isTargetActive('C1', 'M1')).toBe(true)
-    expect(useStreamStore.getState().hasStreamForChat('C1')).toBe(true)
-    postEvent({
-      kind: 'stream-heartbeat',
-      lease: {
-        streamId: 'S-remote',
-        replacementEpoch: 0,
-        chatId: 'C1',
-        messageId: 'M1',
-        ownerClientId: 'other-tab',
-        startedAt: 1,
-        heartbeatAt: Date.now() + 1,
-      },
-    })
-    expect(setActive).toHaveBeenCalledTimes(1)
-
-    postEvent({
-      kind: 'stream-ended',
-      replacementEpoch: 0,
-      chatId: 'C1',
-      streamId: 'S-remote',
-      messageId: 'M1',
-      outcome: 'done',
-    })
-
-    expect(useStreamStore.getState().isTargetActive('C1', 'M1')).toBe(false)
-    setActive.mockRestore()
-  })
-
-  it('locally tombstones before announcing a recovered stream end', () => {
-    installStreamLeaseListener()
-    const seen: BroadcastEvent[] = []
-    const stopListening = onEvent((event) => {
-      if (event.kind === 'stream-ended') seen.push(event)
-    })
-    postEvent({
-      kind: 'stream-heartbeat',
-      lease: {
-        streamId: 'S-announced-end',
-        replacementEpoch: 0,
-        chatId: 'C1',
-        messageId: 'M-announced-end',
-        ownerClientId: 'other-tab',
-        startedAt: 1,
-        heartbeatAt: Date.now(),
-      },
-    })
-
-    announceStreamEnded({
-      chatId: 'C1',
-      streamId: 'S-announced-end',
-      messageId: 'M-announced-end',
-      outcome: 'abort',
-      replacementEpoch: 0,
-    })
-    postEvent({
-      kind: 'stream-heartbeat',
-      lease: {
-        streamId: 'S-announced-end',
-        replacementEpoch: 0,
-        chatId: 'C1',
-        messageId: 'M-announced-end',
-        ownerClientId: 'other-tab',
-        startedAt: 1,
-        heartbeatAt: Date.now() + 1,
-      },
-    })
-
-    expect(useStreamStore.getState().isTargetActive('C1', 'M-announced-end')).toBe(false)
-    expect(seen).toEqual([
-      {
-        kind: 'stream-ended',
-        replacementEpoch: 0,
-        chatId: 'C1',
-        streamId: 'S-announced-end',
-        messageId: 'M-announced-end',
-        outcome: 'abort',
-      },
-    ])
-    stopListening()
-  })
-
-  it('does not run idle lease discovery polling while BroadcastChannel is available', async () => {
-    vi.useFakeTimers()
-    __setWorkspaceRepositoryForTests({
-      listStreamLeases: async () => [],
-    } as unknown as WorkspaceRepository)
-
-    installStreamLeaseListener()
-    await Promise.resolve()
-
-    expect(vi.getTimerCount()).toBe(0)
-  })
-
-  it('moves the expiry timer earlier when an older fresh lease is observed', async () => {
-    vi.useFakeTimers()
-    vi.setSystemTime(100_000)
-    const listStreamLeases = vi.fn(async () => [])
-    __setWorkspaceRepositoryForTests({ listStreamLeases } as unknown as WorkspaceRepository)
-    installStreamLeaseListener()
-    await drainMicrotasks()
-    expect(listStreamLeases).toHaveBeenCalledTimes(1)
-
-    postEvent({
-      kind: 'stream-heartbeat',
-      lease: {
-        streamId: 'S-later-expiry',
-        replacementEpoch: 0,
-        chatId: 'C1',
-        ownerClientId: 'other-tab',
-        startedAt: 1,
-        heartbeatAt: 100_000,
-      },
-    })
-    postEvent({
-      kind: 'stream-heartbeat',
-      lease: {
-        streamId: 'S-earlier-expiry',
-        replacementEpoch: 0,
-        chatId: 'C2',
-        ownerClientId: 'other-tab',
-        startedAt: 1,
-        heartbeatAt: 90_001,
-      },
-    })
-
-    await vi.advanceTimersByTimeAsync(5_001)
-    expect(listStreamLeases).toHaveBeenCalledTimes(1)
-    await vi.advanceTimersByTimeAsync(1)
-    expect(listStreamLeases).toHaveBeenCalledTimes(2)
-  })
-
-  it('backs off a failed expiry refresh instead of retrying in a hot loop', async () => {
-    vi.useFakeTimers()
-    vi.setSystemTime(100_000)
-    let fail = false
-    const listStreamLeases = vi.fn(async () => {
-      if (fail) throw new Error('temporary lease read failure')
-      return []
-    })
-    __setWorkspaceRepositoryForTests({ listStreamLeases } as unknown as WorkspaceRepository)
-    installStreamLeaseListener()
-    await drainMicrotasks()
-    fail = true
-    postEvent({
-      kind: 'stream-heartbeat',
-      lease: {
-        streamId: 'S-refresh-backoff',
-        replacementEpoch: 0,
-        chatId: 'C1',
-        ownerClientId: 'other-tab',
-        startedAt: 1,
-        heartbeatAt: 85_000,
-      },
-    })
-
-    await vi.advanceTimersByTimeAsync(1)
-    expect(listStreamLeases).toHaveBeenCalledTimes(2)
-    await vi.advanceTimersByTimeAsync(1_999)
-    expect(listStreamLeases).toHaveBeenCalledTimes(2)
-    await vi.advanceTimersByTimeAsync(1)
-    expect(listStreamLeases).toHaveBeenCalledTimes(3)
-    expect(vi.getTimerCount()).toBe(1)
-  })
-
-  it('notifies once when a persisted remote lease actually expires', async () => {
-    vi.useFakeTimers()
-    vi.setSystemTime(100_000)
-    const lease: StreamLeaseRow = {
-      streamId: 'S-expired-notification',
-      replacementEpoch: 0,
-      chatId: 'C1',
-      messageId: 'M-expired-notification',
-      ownerClientId: 'other-tab',
-      startedAt: 1,
-      heartbeatAt: 100_000,
-    }
-    __setWorkspaceRepositoryForTests({
-      listStreamLeases: async () => [lease],
-    } as unknown as WorkspaceRepository)
-    const expired = vi.fn()
-    const unsubscribeExpired = onRemoteStreamLeasesExpired(expired)
-    await drainMicrotasks()
-
-    expect(useStreamStore.getState().isTargetActive('C1', 'M-expired-notification')).toBe(true)
-    await vi.advanceTimersByTimeAsync(15_001)
-    expect(expired).toHaveBeenCalledTimes(1)
-    expect(expired).toHaveBeenCalledWith([lease])
-    expect(useStreamStore.getState().isTargetActive('C1', 'M-expired-notification')).toBe(false)
-    expect(vi.getTimerCount()).toBe(0)
-    unsubscribeExpired()
-  })
-
-  it('wakes after remote ownership releases and lets recovery reacquire exclusively', async () => {
-    const manager = new TestStreamLockManager()
-    __setStreamLockManagerForTests(manager)
-    const lease: StreamLeaseRow = {
-      streamId: 'S-reload-release',
-      replacementEpoch: 0,
-      chatId: 'C1',
-      messageId: 'M-reload-release',
-      ownerClientId: 'old-page',
-      startedAt: 1,
-      heartbeatAt: Date.now(),
-    }
-    __setWorkspaceRepositoryForTests({
-      listStreamLeases: async () => [lease],
-    } as unknown as WorkspaceRepository)
-    const ownerReady = deferred()
-    const releaseOwner = deferred()
-    const owner = manager.request('stream-owner:S-reload-release', async () => {
-      ownerReady.resolve()
-      await releaseOwner.promise
-    })
-    await ownerReady.promise
-
-    const recoveryFinished = deferred()
-    let recoveryResult: Awaited<ReturnType<typeof withStreamRecoveryLocks>> | undefined
-    const stopObserving = onRemoteStreamOwnershipReleased('C1', () => {
-      void withStreamRecoveryLocks(
-        ['S-reload-release'],
-        async (ownershipVerified) => ownershipVerified,
-      ).then((result) => {
-        recoveryResult = result
-        recoveryFinished.resolve()
-      })
-    })
-    await drainMicrotasks()
-    expect(recoveryResult).toBeUndefined()
-
-    releaseOwner.resolve()
-    await owner
-    await recoveryFinished.promise
-    expect(recoveryResult).toEqual({ acquired: true, value: true })
-    stopObserving()
-  })
-
-  it('aborts a queued ownership-release observation when its chat subscription stops', async () => {
-    const lease: StreamLeaseRow = {
-      streamId: 'S-observer-teardown',
-      replacementEpoch: 0,
-      chatId: 'C1',
-      ownerClientId: 'other-page',
-      startedAt: 1,
-      heartbeatAt: Date.now(),
-    }
-    __setWorkspaceRepositoryForTests({
-      listStreamLeases: async () => [lease],
-    } as unknown as WorkspaceRepository)
-    let observedSignal: AbortSignal | undefined
-    const manager = {
-      request: vi.fn(
-        (_name: string, options: LockOptions, _callback: (lock: Lock | null) => unknown) => {
-          observedSignal = options.signal
-          return new Promise<unknown>((_resolve, reject) => {
-            options.signal?.addEventListener(
-              'abort',
-              () => reject(new DOMException('aborted', 'AbortError')),
-              { once: true },
+    for (const progress of progressStates) {
+      for (const custody of ['writer', 'recovery'] as const) {
+        for (const ownershipVerified of [false, true]) {
+          for (const freshnessProtected of [false, true]) {
+            expect(
+              streamLeaseRecoveryAuthority({ custody, ownershipVerified, freshnessProtected }),
+              JSON.stringify({ progress, custody, ownershipVerified, freshnessProtected }),
+            ).toBe(
+              custody === 'recovery' || ownershipVerified || !freshnessProtected
+                ? 'recover'
+                : 'defer',
             )
-          })
-        },
-      ),
-    }
-    __setStreamLockManagerForTests(manager as unknown as Pick<LockManager, 'request'>)
-
-    const stopObserving = onRemoteStreamOwnershipReleased('C1', vi.fn())
-    await drainMicrotasks()
-    expect(observedSignal?.aborted).toBe(false)
-    stopObserving()
-    expect(observedSignal?.aborted).toBe(true)
-  })
-
-  it('does not resurrect an ended remote stream from a late heartbeat or start event', () => {
-    installStreamLeaseListener()
-    const clearLiveSnapshot = vi.spyOn(useStreamStore.getState(), 'clearLiveSnapshot')
-    postEvent({
-      kind: 'stream-ended',
-      replacementEpoch: 0,
-      chatId: 'C1',
-      streamId: 'S-ended',
-      messageId: 'M-ended',
-      outcome: 'done',
-    })
-
-    postEvent({
-      kind: 'stream-heartbeat',
-      lease: {
-        streamId: 'S-ended',
-        replacementEpoch: 0,
-        chatId: 'C1',
-        messageId: 'M-ended',
-        ownerClientId: 'other-tab',
-        startedAt: 1,
-        heartbeatAt: Date.now(),
-      },
-    })
-    postEvent({
-      kind: 'stream-started',
-      replacementEpoch: 0,
-      chatId: 'C1',
-      streamId: 'S-ended',
-      messageId: 'M-ended',
-      ownerClientId: 'other-tab',
-    })
-
-    expect(useStreamStore.getState().isTargetActive('C1', 'M-ended')).toBe(false)
-    expect(clearLiveSnapshot).not.toHaveBeenCalled()
-  })
-
-  it('does not let an older stream-ended event clear a newer snapshot for the same message', () => {
-    installStreamLeaseListener()
-    useStreamStore.getState().setActive({
-      streamId: 'S-new',
-      replacementEpoch: 0,
-      chatId: 'C1',
-      messageId: 'M-shared',
-      ownerClientId: 'other-tab',
-      startedAt: 2,
-    })
-    useStreamStore.getState().setLiveSnapshot({
-      streamId: 'S-new',
-      replacementEpoch: 0,
-      chatId: 'C1',
-      messageId: 'M-shared',
-      content: [{ type: 'output_text', text: 'new reasoning' }],
-      textLength: 13,
-      reasoningLength: 0,
-      updatedAt: 3,
-    })
-
-    postEvent({
-      kind: 'stream-ended',
-      replacementEpoch: 0,
-      chatId: 'C1',
-      streamId: 'S-old',
-      messageId: 'M-shared',
-      outcome: 'done',
-    })
-
-    expect(useStreamStore.getState().getActive('S-new')).toBeDefined()
-    expect(useStreamStore.getState().getLiveSnapshot('C1', 'M-shared')?.streamId).toBe('S-new')
-  })
-
-  it('fences same-id late events across workspace replacement', () => {
-    __setWorkspaceRepositoryForTests({
-      listStreamLeases: async () => [],
-    } as unknown as WorkspaceRepository)
-    installStreamLeaseListener()
-    const oldAbort = vi.fn()
-    useStreamStore.getState().setActive({
-      streamId: 'S-same',
-      replacementEpoch: 0,
-      chatId: 'C-same',
-      messageId: 'M-same',
-      ownerClientId: getStreamClientId(),
-      startedAt: 1,
-      abort: oldAbort,
-    })
-    useStreamStore.getState().setLiveSnapshot({
-      streamId: 'S-same',
-      replacementEpoch: 0,
-      chatId: 'C-same',
-      messageId: 'M-same',
-      content: [{ type: 'output_text', text: 'old workspace' }],
-      textLength: 13,
-      reasoningLength: 0,
-      updatedAt: 1,
-    })
-
-    postEvent({ kind: 'workspace-replaced', replacementEpoch: 1 })
-    expect(oldAbort).toHaveBeenCalledTimes(1)
-    expect(useStreamStore.getState().listActive()).toEqual([])
-    expect(useStreamStore.getState().listLiveSnapshots()).toEqual([])
-
-    postEvent({
-      kind: 'stream-started',
-      replacementEpoch: 0,
-      chatId: 'C-same',
-      streamId: 'S-same',
-      messageId: 'M-same',
-      ownerClientId: 'old-remote-tab',
-    })
-    postEvent({
-      kind: 'stream-heartbeat',
-      lease: {
-        streamId: 'S-same',
-        replacementEpoch: 0,
-        chatId: 'C-same',
-        messageId: 'M-same',
-        ownerClientId: 'old-remote-tab',
-        startedAt: 1,
-        heartbeatAt: Date.now(),
-      },
-    })
-    postEvent({
-      kind: 'stream-ended',
-      replacementEpoch: 0,
-      chatId: 'C-same',
-      streamId: 'S-same',
-      messageId: 'M-same',
-      outcome: 'done',
-    })
-    expect(useStreamStore.getState().listActive()).toEqual([])
-
-    postEvent({
-      kind: 'stream-started',
-      replacementEpoch: 1,
-      chatId: 'C-same',
-      streamId: 'S-same',
-      messageId: 'M-same',
-      ownerClientId: 'new-remote-tab',
-    })
-    useStreamStore.getState().setLiveSnapshot({
-      streamId: 'S-same',
-      replacementEpoch: 1,
-      chatId: 'C-same',
-      messageId: 'M-same',
-      content: [{ type: 'output_text', text: 'new workspace' }],
-      textLength: 13,
-      reasoningLength: 0,
-      updatedAt: 2,
-    })
-    postEvent({ kind: 'workspace-replaced', replacementEpoch: 1 })
-    postEvent({
-      kind: 'stream-ended',
-      replacementEpoch: 0,
-      chatId: 'C-same',
-      streamId: 'S-same',
-      messageId: 'M-same',
-      outcome: 'done',
-    })
-
-    expect(useStreamStore.getState().getActive('S-same')).toMatchObject({
-      replacementEpoch: 1,
-      ownerClientId: 'new-remote-tab',
-    })
-    expect(useStreamStore.getState().getLiveSnapshot('C-same', 'M-same')?.content).toEqual([
-      { type: 'output_text', text: 'new workspace' },
-    ])
-  })
-
-  it('hydrates only leases from the current workspace epoch', async () => {
-    const listStreamLeases = vi.fn(async () => [
-      {
-        streamId: 'S-old-epoch',
-        replacementEpoch: 0,
-        chatId: 'C1',
-        messageId: 'M-old-epoch',
-        ownerClientId: 'old-tab',
-        startedAt: 1,
-        heartbeatAt: Date.now(),
-      },
-      {
-        streamId: 'S-current-epoch',
-        replacementEpoch: 1,
-        chatId: 'C1',
-        messageId: 'M-current-epoch',
-        ownerClientId: 'current-tab',
-        startedAt: 2,
-        heartbeatAt: Date.now(),
-      },
-    ])
-    __setWorkspaceRepositoryForTests({ listStreamLeases } as unknown as WorkspaceRepository)
-    installStreamLeaseListener()
-    await drainMicrotasks()
-    expect(useStreamStore.getState().isTargetActive('C1', 'M-old-epoch')).toBe(true)
-    expect(useStreamStore.getState().isTargetActive('C1', 'M-current-epoch')).toBe(false)
-
-    postEvent({ kind: 'workspace-replaced', replacementEpoch: 1 })
-    await drainMicrotasks()
-
-    expect(useStreamStore.getState().isTargetActive('C1', 'M-old-epoch')).toBe(false)
-    expect(useStreamStore.getState().isTargetActive('C1', 'M-current-epoch')).toBe(true)
-  })
-
-  it('releases local lease ownership and its shared heartbeat scheduler on replacement', async () => {
-    const manager = new TestStreamLockManager()
-    __setStreamLockManagerForTests(manager)
-    __setWorkspaceRepositoryForTests({
-      upsertStreamLease: async (lease: StreamLeaseRow) => persistedLease(lease),
-      renewStreamLease: async (lease: StreamLeaseRow) => persistedLease(lease),
-      deleteStreamLease: async () => true,
-      deleteOwnedStreamLease: async () => true,
-      listStreamLeases: async () => [],
-    } as unknown as WorkspaceRepository)
-    installStreamLeaseListener()
-    await startStreamLease(leaseInput('S-replaced-owner'))
-
-    expect(manager.isHeld('stream-owner:S-replaced-owner')).toBe(true)
-    expect(__streamLeaseHeartbeatSchedulerStateForTests()).toMatchObject({
-      activeWriters: 1,
-      timerScheduled: true,
-    })
-
-    postEvent({ kind: 'workspace-replaced', replacementEpoch: 1 })
-
-    expect(__streamLeaseHeartbeatSchedulerStateForTests()).toMatchObject({
-      activeWriters: 0,
-      timerScheduled: false,
-      deadline: null,
-    })
-    await __flushStreamOwnershipForTests()
-    expect(manager.isHeld('stream-owner:S-replaced-owner')).toBe(false)
-  })
-
-  it('cancels old-workspace ownership watches on replacement', async () => {
-    const lease: StreamLeaseRow = {
-      streamId: 'S-replaced-watch',
-      replacementEpoch: 0,
-      chatId: 'C1',
-      ownerClientId: 'other-page',
-      startedAt: 1,
-      heartbeatAt: Date.now(),
-    }
-    __setWorkspaceRepositoryForTests({
-      listStreamLeases: async () => [lease],
-    } as unknown as WorkspaceRepository)
-    let observedSignal: AbortSignal | undefined
-    __setStreamLockManagerForTests({
-      request: vi.fn(
-        (_name: string, options: LockOptions, _callback: (lock: Lock | null) => unknown) => {
-          observedSignal = options.signal
-          return new Promise<unknown>((_resolve, reject) => {
-            options.signal?.addEventListener(
-              'abort',
-              () => reject(new DOMException('aborted', 'AbortError')),
-              { once: true },
-            )
-          })
-        },
-      ),
-    } as unknown as Pick<LockManager, 'request'>)
-    installStreamLeaseListener()
-    const stopObserving = onRemoteStreamOwnershipReleased('C1', vi.fn())
-    await drainMicrotasks()
-    expect(observedSignal?.aborted).toBe(false)
-
-    postEvent({ kind: 'workspace-replaced', replacementEpoch: 1 })
-
-    expect(observedSignal?.aborted).toBe(true)
-    stopObserving()
-  })
-
-  it('does not resurrect an ended stream from an older lease refresh result', async () => {
-    let releaseList!: (leases: StreamLeaseRow[]) => void
-    const listStarted = deferred()
-    const leases = new Promise<StreamLeaseRow[]>((resolve) => {
-      releaseList = resolve
-    })
-    __setWorkspaceRepositoryForTests({
-      listStreamLeases: async () => {
-        listStarted.resolve()
-        return leases
-      },
-    } as unknown as WorkspaceRepository)
-
-    installStreamLeaseListener()
-    await listStarted.promise
-    postEvent({
-      kind: 'stream-ended',
-      replacementEpoch: 0,
-      chatId: 'C1',
-      streamId: 'S-refresh-race',
-      messageId: 'M-refresh-race',
-      outcome: 'done',
-    })
-    releaseList([
-      {
-        streamId: 'S-refresh-race',
-        replacementEpoch: 0,
-        chatId: 'C1',
-        messageId: 'M-refresh-race',
-        ownerClientId: 'other-tab',
-        startedAt: 1,
-        heartbeatAt: Date.now(),
-      },
-    ])
-    await leases
-    await Promise.resolve()
-
-    expect(useStreamStore.getState().isTargetActive('C1', 'M-refresh-race')).toBe(false)
-  })
-
-  it('does not regress a newer targeted heartbeat with an older paused refresh row', async () => {
-    let releaseList!: (leases: StreamLeaseRow[]) => void
-    const listStarted = deferred()
-    const leases = new Promise<StreamLeaseRow[]>((resolve) => {
-      releaseList = resolve
-    })
-    __setWorkspaceRepositoryForTests({
-      listStreamLeases: async () => {
-        listStarted.resolve()
-        return leases
-      },
-    } as unknown as WorkspaceRepository)
-    installStreamLeaseListener()
-    await listStarted.promise
-    postEvent({
-      kind: 'stream-heartbeat',
-      lease: {
-        streamId: 'S-retarget-refresh-race',
-        replacementEpoch: 0,
-        chatId: 'C1',
-        messageId: 'M-new-target',
-        ownerClientId: 'other-tab',
-        startedAt: 1,
-        heartbeatAt: Date.now(),
-      },
-    })
-    releaseList([
-      {
-        streamId: 'S-retarget-refresh-race',
-        replacementEpoch: 0,
-        chatId: 'C1',
-        ownerClientId: 'other-tab',
-        startedAt: 1,
-        heartbeatAt: Date.now() - 1,
-      },
-    ])
-    await leases
-    await drainMicrotasks()
-
-    expect(useStreamStore.getState().getActive('S-retarget-refresh-race')).toMatchObject({
-      messageId: 'M-new-target',
-    })
-  })
-
-  it('does not clear a stream observed after a paused refresh began', async () => {
-    let releaseList!: (leases: StreamLeaseRow[]) => void
-    const listStarted = deferred()
-    const leases = new Promise<StreamLeaseRow[]>((resolve) => {
-      releaseList = resolve
-    })
-    __setWorkspaceRepositoryForTests({
-      listStreamLeases: async () => {
-        listStarted.resolve()
-        return leases
-      },
-    } as unknown as WorkspaceRepository)
-    installStreamLeaseListener()
-    await listStarted.promise
-    postEvent({
-      kind: 'stream-started',
-      replacementEpoch: 0,
-      chatId: 'C1',
-      streamId: 'S-new-during-refresh',
-      messageId: 'M-new-during-refresh',
-      ownerClientId: 'other-tab',
-    })
-    releaseList([])
-    await leases
-    await drainMicrotasks()
-
-    expect(useStreamStore.getState().isTargetActive('C1', 'M-new-during-refresh')).toBe(true)
-  })
-
-  it('preserves a fresh start observed before a refresh whose snapshot is still missing it', async () => {
-    vi.useFakeTimers()
-    vi.setSystemTime(100_000)
-    const listStreamLeases = vi.fn(async () => [])
-    __setWorkspaceRepositoryForTests({ listStreamLeases } as unknown as WorkspaceRepository)
-    installStreamLeaseListener()
-    await drainMicrotasks()
-    postEvent({
-      kind: 'stream-started',
-      replacementEpoch: 0,
-      chatId: 'C1',
-      streamId: 'S-start-before-refresh',
-      messageId: 'M-start-before-refresh',
-      ownerClientId: 'other-tab',
-    })
-    postEvent({ kind: 'workspace-invalidated', mutationCounter: 1 })
-    await drainMicrotasks()
-
-    expect(listStreamLeases).toHaveBeenCalledTimes(2)
-    expect(useStreamStore.getState().isTargetActive('C1', 'M-start-before-refresh')).toBe(true)
-
-    await vi.advanceTimersByTimeAsync(15_001)
-    expect(useStreamStore.getState().isTargetActive('C1', 'M-start-before-refresh')).toBe(false)
-  })
-
-  it('keeps heartbeat and target observations monotonic', async () => {
-    vi.useFakeTimers()
-    vi.setSystemTime(100_000)
-    const listStreamLeases = vi.fn(async () => [])
-    __setWorkspaceRepositoryForTests({ listStreamLeases } as unknown as WorkspaceRepository)
-    installStreamLeaseListener()
-    await drainMicrotasks()
-    postEvent({
-      kind: 'stream-heartbeat',
-      lease: {
-        streamId: 'S-monotonic',
-        replacementEpoch: 0,
-        chatId: 'C1',
-        messageId: 'M-monotonic',
-        ownerClientId: 'other-tab',
-        startedAt: 1,
-        heartbeatAt: 100_000,
-        attemptKind: 'generation',
-      },
-    })
-    postEvent({
-      kind: 'stream-heartbeat',
-      lease: {
-        streamId: 'S-monotonic',
-        replacementEpoch: 0,
-        chatId: 'C1',
-        ownerClientId: 'other-tab',
-        startedAt: 1,
-        heartbeatAt: 90_000,
-      },
-    })
-
-    expect(useStreamStore.getState().getActive('S-monotonic')).toMatchObject({
-      messageId: 'M-monotonic',
-      attemptKind: 'generation',
-    })
-    await vi.advanceTimersByTimeAsync(5_002)
-    expect(listStreamLeases).toHaveBeenCalledTimes(1)
-  })
-
-  it('routes remote abort requests without pretending a remote stream has a local abort', () => {
-    installStreamLeaseListener()
-    const seen: BroadcastEvent[] = []
-    const unsubscribe = onEvent((event) => {
-      if (event.kind === 'stream-abort-requested') seen.push(event)
-    })
-
-    useStreamStore.getState().setActive({
-      streamId: 'S-remote',
-      replacementEpoch: 0,
-      chatId: 'C1',
-      messageId: 'M1',
-      startedAt: 1,
-      heartbeatAt: 2,
-      ownerClientId: 'other-tab',
-    })
-
-    expect(requestAbortForChat('C1')).toBe(1)
-    expect(seen).toEqual([
-      {
-        kind: 'stream-abort-requested',
-        replacementEpoch: 0,
-        chatId: 'C1',
-        streamId: 'S-remote',
-        ownerClientId: 'other-tab',
-      },
-    ])
-    unsubscribe()
-  })
-
-  it('routes one exact remote abort request and leaves its sibling untouched', () => {
-    installStreamLeaseListener()
-    const seen: BroadcastEvent[] = []
-    const unsubscribe = onEvent((event) => {
-      if (event.kind === 'stream-abort-requested') seen.push(event)
-    })
-    const misleadingRemoteCallback = vi.fn()
-    useStreamStore.getState().setActive({
-      streamId: 'S-remote-target',
-      replacementEpoch: 0,
-      chatId: 'C1',
-      messageId: 'M-target',
-      startedAt: 1,
-      ownerClientId: 'other-tab',
-      abort: misleadingRemoteCallback,
-    })
-    useStreamStore.getState().setActive({
-      streamId: 'S-remote-sibling',
-      replacementEpoch: 0,
-      chatId: 'C1',
-      messageId: 'M-sibling',
-      startedAt: 2,
-      ownerClientId: 'other-tab',
-    })
-
-    expect(requestAbortForStream('S-remote-target')).toBe(true)
-    expect(misleadingRemoteCallback).not.toHaveBeenCalled()
-    expect(seen).toEqual([
-      {
-        kind: 'stream-abort-requested',
-        replacementEpoch: 0,
-        chatId: 'C1',
-        streamId: 'S-remote-target',
-        ownerClientId: 'other-tab',
-      },
-    ])
-    expect(useStreamStore.getState().getActive('S-remote-sibling')).toBeDefined()
-    expect(requestAbortForStream('missing-stream')).toBe(false)
-    unsubscribe()
-  })
-
-  it('aborts local streams directly', () => {
-    installStreamLeaseListener()
-    const abort = vi.fn()
-    useStreamStore.getState().setActive({
-      streamId: 'S-local',
-      replacementEpoch: 0,
-      chatId: 'C1',
-      messageId: 'M1',
-      startedAt: 1,
-      ownerClientId: getStreamClientId(),
-      abort,
-    })
-
-    expect(requestAbortForChat('C1')).toBe(1)
-    expect(abort).toHaveBeenCalledTimes(1)
-  })
-
-  it('aborts one exact local stream and leaves its sibling callback untouched', () => {
-    installStreamLeaseListener()
-    const abortTarget = vi.fn()
-    const abortSibling = vi.fn()
-    const seen: BroadcastEvent[] = []
-    const unsubscribe = onEvent((event) => {
-      if (event.kind === 'stream-abort-requested') seen.push(event)
-    })
-    useStreamStore.getState().setActive({
-      streamId: 'S-local-target',
-      replacementEpoch: 0,
-      chatId: 'C1',
-      messageId: 'M-target',
-      startedAt: 1,
-      ownerClientId: getStreamClientId(),
-      abort: abortTarget,
-    })
-    useStreamStore.getState().setActive({
-      streamId: 'S-local-sibling',
-      replacementEpoch: 0,
-      chatId: 'C1',
-      messageId: 'M-sibling',
-      startedAt: 2,
-      ownerClientId: getStreamClientId(),
-      abort: abortSibling,
-    })
-
-    expect(requestAbortForStream('S-local-target')).toBe(true)
-    expect(abortTarget).toHaveBeenCalledTimes(1)
-    expect(abortSibling).not.toHaveBeenCalled()
-    expect(seen).toEqual([])
-    unsubscribe()
-  })
-
-  it('orders deletion after an in-flight heartbeat so a stopped lease cannot reappear', async () => {
-    const manager = new TestStreamLockManager()
-    __setStreamLockManagerForTests(manager)
-    const putStarted = deferred()
-    const releasePut = deferred()
-    const operations: string[] = []
-    let stored: StreamLeaseRow | undefined
-    const writeLease = async (lease: StreamLeaseRow) => {
-      operations.push('put:start')
-      putStarted.resolve()
-      await releasePut.promise
-      stored = persistedLease(lease)
-      operations.push('put:commit')
-      return stored
-    }
-    const deleteLease = async () => {
-      operations.push('delete')
-      stored = undefined
-      return true
-    }
-    __setWorkspaceRepositoryForTests({
-      upsertStreamLease: writeLease,
-      renewStreamLease: writeLease,
-      deleteStreamLease: deleteLease,
-      deleteOwnedStreamLease: deleteLease,
-    } as unknown as WorkspaceRepository)
-
-    void startStreamLease(leaseInput('S-race'))
-    await putStarted.promise
-    const stopped = stopStreamLease('S-race')
-
-    expect(operations).toEqual(['put:start'])
-    expect(manager.isHeld('stream-owner:S-race')).toBe(true)
-    releasePut.resolve()
-    await stopped
-    await Promise.all([__flushStreamLeaseWritesForTests(), __flushStreamOwnershipForTests()])
-
-    expect(operations).toEqual(['put:start', 'put:commit', 'delete'])
-    expect(stored).toBeUndefined()
-    expect(manager.isHeld('stream-owner:S-race')).toBe(false)
-  })
-
-  it('retries one transient owned-lease deletion before releasing ownership', async () => {
-    const manager = new TestStreamLockManager()
-    __setStreamLockManagerForTests(manager)
-    let deleteAttempts = 0
-    __setWorkspaceRepositoryForTests({
-      upsertStreamLease: async (lease: StreamLeaseRow) => persistedLease(lease),
-      renewStreamLease: async (lease: StreamLeaseRow) => persistedLease(lease),
-      deleteStreamLease: async () => true,
-      deleteOwnedStreamLease: async () => {
-        deleteAttempts += 1
-        expect(manager.isHeld('stream-owner:S-delete-retry')).toBe(true)
-        if (deleteAttempts === 1) throw new Error('temporary delete failure')
-        return true
-      },
-    } as unknown as WorkspaceRepository)
-    await startStreamLease(leaseInput('S-delete-retry'))
-
-    await stopStreamLease('S-delete-retry')
-    await Promise.all([__flushStreamLeaseWritesForTests(), __flushStreamOwnershipForTests()])
-
-    expect(deleteAttempts).toBe(2)
-    expect(manager.isHeld('stream-owner:S-delete-retry')).toBe(false)
-  })
-
-  it('reports a permanent owned-lease deletion failure after releasing ownership', async () => {
-    const manager = new TestStreamLockManager()
-    __setStreamLockManagerForTests(manager)
-    const deleteError = new Error('persistent delete failure')
-    let deleteAttempts = 0
-    __setWorkspaceRepositoryForTests({
-      upsertStreamLease: async (lease: StreamLeaseRow) => persistedLease(lease),
-      renewStreamLease: async (lease: StreamLeaseRow) => persistedLease(lease),
-      deleteStreamLease: async () => true,
-      deleteOwnedStreamLease: async () => {
-        deleteAttempts += 1
-        throw deleteError
-      },
-    } as unknown as WorkspaceRepository)
-    await startStreamLease(leaseInput('S-delete-failure'))
-
-    await expect(stopStreamLease('S-delete-failure')).rejects.toBe(deleteError)
-    await __flushStreamOwnershipForTests()
-
-    expect(deleteAttempts).toBe(2)
-    expect(manager.isHeld('stream-owner:S-delete-failure')).toBe(false)
-  })
-
-  it('coalesces timer ticks while a heartbeat write is pending', async () => {
-    vi.useFakeTimers()
-    const firstPutStarted = deferred()
-    const releaseFirstPut = deferred()
-    let upserts = 0
-    let concurrent = 0
-    let maxConcurrent = 0
-    const writeLease = async (lease: StreamLeaseRow) => {
-      upserts += 1
-      concurrent += 1
-      maxConcurrent = Math.max(maxConcurrent, concurrent)
-      if (upserts === 1) {
-        firstPutStarted.resolve()
-        await releaseFirstPut.promise
+          }
+        }
       }
-      concurrent -= 1
-      return persistedLease(lease)
     }
-    __setWorkspaceRepositoryForTests({
-      upsertStreamLease: writeLease,
-      renewStreamLease: writeLease,
-      deleteStreamLease: async () => true,
-      deleteOwnedStreamLease: async () => true,
-    } as unknown as WorkspaceRepository)
-
-    void startStreamLease(leaseInput('S-coalesced'))
-    await firstPutStarted.promise
-    vi.advanceTimersByTime(8_000)
-    await Promise.resolve()
-
-    expect(upserts).toBe(1)
-    expect(maxConcurrent).toBe(1)
-
-    releaseFirstPut.resolve()
-    await __flushStreamLeaseWritesForTests()
-    vi.advanceTimersByTime(2_000)
-    await __flushStreamLeaseWritesForTests()
-
-    expect(upserts).toBe(2)
-    expect(maxConcurrent).toBe(1)
-    void stopStreamLease('S-coalesced')
-    await __flushStreamLeaseWritesForTests()
   })
 
-  it('renews 100 leases from one shared wakeup with an individual fence per stream', async () => {
-    vi.useFakeTimers()
+  it('projects the complete durable write fence', () => {
+    expect(streamWriteFenceForLease(lease())).toEqual({
+      ownerClientId: getStreamClientId(),
+      fenceToken: 'fence-1',
+      replacementEpoch: 0,
+      admissionSequence: 1,
+    })
+  })
+
+  it('recognizes only explicit recovery owners', () => {
+    expect(isRecoveryClaimedStreamLease(lease({ custody: 'recovery' }))).toBe(true)
+    expect(isRecoveryClaimedStreamLease(testRecoveryPendingLease())).toBe(true)
+    expect(isRecoveryClaimedStreamLease(lease({ custody: 'writer' }))).toBe(false)
+  })
+
+  it('runs recovery without verification when Web Locks are unavailable', async () => {
     __setStreamLockManagerForTests(null)
-    const admitted = new Map<string, StreamLeaseRow>()
-    const renewals: Array<{ lease: StreamLeaseRow; targetChanged: boolean }> = []
-    __setWorkspaceRepositoryForTests({
-      upsertStreamLease: async (lease: StreamLeaseRow) => {
-        const stored = persistedLease(lease)
-        admitted.set(lease.streamId, stored)
-        return stored
-      },
-      renewStreamLease: async (lease: StreamLeaseRow, options: { targetChanged: boolean }) => {
-        const original = admitted.get(lease.streamId)
-        expect(original).toBeDefined()
-        expect(lease.ownerClientId).toBe(original?.ownerClientId)
-        expect(lease.fenceToken).toBe(original?.fenceToken)
-        expect(lease.replacementEpoch).toBe(original?.replacementEpoch)
-        renewals.push({ lease: structuredClone(lease), targetChanged: options.targetChanged })
-        const stored = persistedLease(lease)
-        admitted.set(lease.streamId, stored)
-        return stored
-      },
-      deleteStreamLease: async () => true,
-      deleteOwnedStreamLease: async () => true,
-    } as unknown as WorkspaceRepository)
+    const recover = vi.fn(async (verified: boolean) => verified)
 
-    await Promise.all(
-      Array.from({ length: 100 }, (_, index) => startStreamLease(leaseInput(`S-shared-${index}`))),
-    )
-
-    expect(__streamLeaseHeartbeatSchedulerStateForTests()).toMatchObject({
-      activeWriters: 100,
-      timerScheduled: true,
-      wakeups: 0,
+    await expect(withStreamRecoveryLocks(['stream-1'], recover)).resolves.toEqual({
+      acquired: true,
+      value: false,
     })
-    expect(vi.getTimerCount()).toBe(1)
-
-    await vi.advanceTimersByTimeAsync(2_000)
-    await __flushStreamLeaseWritesForTests()
-
-    expect(renewals).toHaveLength(100)
-    expect(renewals.every((renewal) => renewal.targetChanged === false)).toBe(true)
-    expect(new Set(renewals.map((renewal) => renewal.lease.streamId)).size).toBe(100)
-    expect(__streamLeaseHeartbeatSchedulerStateForTests()).toMatchObject({
-      activeWriters: 100,
-      timerScheduled: true,
-      wakeups: 1,
-    })
-    expect(vi.getTimerCount()).toBe(1)
-
-    await Promise.all(
-      Array.from({ length: 100 }, (_, index) =>
-        stopStreamLease(`S-shared-${index}`, { deleteRow: false }),
-      ),
-    )
-    expect(__streamLeaseHeartbeatSchedulerStateForTests()).toEqual({
-      activeWriters: 0,
-      timerScheduled: false,
-      deadline: null,
-      wakeups: 1,
-    })
-    expect(vi.getTimerCount()).toBe(0)
+    expect(recover).toHaveBeenCalledWith(false)
   })
 
-  it('starts all due renewals concurrently from the shared scheduler', async () => {
-    vi.useFakeTimers()
-    __setStreamLockManagerForTests(null)
-    const allRenewalsStarted = deferred()
-    const releaseRenewals = deferred()
-    let concurrent = 0
-    let maxConcurrent = 0
-    let renewals = 0
-    __setWorkspaceRepositoryForTests({
-      upsertStreamLease: async (lease: StreamLeaseRow) => persistedLease(lease),
-      renewStreamLease: async (lease: StreamLeaseRow) => {
-        renewals += 1
-        concurrent += 1
-        maxConcurrent = Math.max(maxConcurrent, concurrent)
-        if (renewals === 3) allRenewalsStarted.resolve()
-        await releaseRenewals.promise
-        concurrent -= 1
-        return persistedLease(lease)
-      },
-      deleteStreamLease: async () => true,
-      deleteOwnedStreamLease: async () => true,
-    } as unknown as WorkspaceRepository)
-    await Promise.all(['left', 'middle', 'right'].map((id) => startStreamLease(leaseInput(id))))
-    const deadline = __streamLeaseHeartbeatSchedulerStateForTests().deadline
-    expect(deadline).not.toBeNull()
-
-    __runStreamLeaseHeartbeatSchedulerForTests(deadline as number)
-    await allRenewalsStarted.promise
-
-    expect(renewals).toBe(3)
-    expect(maxConcurrent).toBe(3)
-    expect(__streamLeaseHeartbeatSchedulerStateForTests()).toMatchObject({
-      timerScheduled: true,
-      wakeups: 1,
-    })
-
-    releaseRenewals.resolve()
-    await __flushStreamLeaseWritesForTests()
-    await Promise.all(
-      ['left', 'middle', 'right'].map((id) => stopStreamLease(id, { deleteRow: false })),
-    )
-  })
-
-  it('joins later writers to the existing heartbeat deadline instead of adding wakeups', async () => {
-    vi.useFakeTimers()
-    __setStreamLockManagerForTests(null)
-    const renewStreamLease = vi.fn(async (lease: StreamLeaseRow) => persistedLease(lease))
-    __setWorkspaceRepositoryForTests({
-      upsertStreamLease: async (lease: StreamLeaseRow) => persistedLease(lease),
-      renewStreamLease,
-      deleteStreamLease: async () => true,
-      deleteOwnedStreamLease: async () => true,
-    } as unknown as WorkspaceRepository)
-
-    await startStreamLease(leaseInput('early'))
-    const sharedDeadline = __streamLeaseHeartbeatSchedulerStateForTests().deadline
-    await vi.advanceTimersByTimeAsync(1_500)
-    await startStreamLease(leaseInput('late'))
-
-    expect(__streamLeaseHeartbeatSchedulerStateForTests()).toMatchObject({
-      activeWriters: 2,
-      timerScheduled: true,
-      deadline: sharedDeadline,
-      wakeups: 0,
-    })
-    expect(vi.getTimerCount()).toBe(1)
-
-    await vi.advanceTimersByTimeAsync(500)
-    await __flushStreamLeaseWritesForTests()
-
-    expect(renewStreamLease).toHaveBeenCalledTimes(2)
-    expect(__streamLeaseHeartbeatSchedulerStateForTests()).toMatchObject({ wakeups: 1 })
-    await Promise.all(['early', 'late'].map((id) => stopStreamLease(id, { deleteRow: false })))
-  })
-
-  it('processes overdue heartbeats once and reschedules from the delayed wake time', async () => {
-    vi.useFakeTimers()
-    __setStreamLockManagerForTests(null)
-    const renewStreamLease = vi.fn(async (lease: StreamLeaseRow) => persistedLease(lease))
-    __setWorkspaceRepositoryForTests({
-      upsertStreamLease: async (lease: StreamLeaseRow) => persistedLease(lease),
-      renewStreamLease,
-      deleteStreamLease: async () => true,
-      deleteOwnedStreamLease: async () => true,
-    } as unknown as WorkspaceRepository)
-    await Promise.all(['one', 'two', 'three'].map((id) => startStreamLease(leaseInput(id))))
-    const initialDeadline = __streamLeaseHeartbeatSchedulerStateForTests().deadline
-    expect(initialDeadline).not.toBeNull()
-    const delayedNow = (initialDeadline as number) + 30_000
-
-    __runStreamLeaseHeartbeatSchedulerForTests(delayedNow)
-    await __flushStreamLeaseWritesForTests()
-
-    expect(renewStreamLease).toHaveBeenCalledTimes(3)
-    expect(__streamLeaseHeartbeatSchedulerStateForTests()).toEqual({
-      activeWriters: 3,
-      timerScheduled: true,
-      deadline: delayedNow + 2_000,
-      wakeups: 1,
-    })
-    __runStreamLeaseHeartbeatSchedulerForTests(delayedNow + 1_999)
-    await __flushStreamLeaseWritesForTests()
-    expect(renewStreamLease).toHaveBeenCalledTimes(3)
-
-    await Promise.all(
-      ['one', 'two', 'three'].map((id) => stopStreamLease(id, { deleteRow: false })),
-    )
-  })
-
-  it('keeps Web Lock ownership through a renewal failure and disposes the shared timer', async () => {
-    vi.useFakeTimers()
+  it('deduplicates and orders exclusive ownership checks before recovery', async () => {
     const manager = new TestStreamLockManager()
     __setStreamLockManagerForTests(manager)
-    let renewalAttempts = 0
-    __setWorkspaceRepositoryForTests({
-      upsertStreamLease: async (lease: StreamLeaseRow) => persistedLease(lease),
-      renewStreamLease: async (lease: StreamLeaseRow) => {
-        renewalAttempts += 1
-        if (renewalAttempts === 1) throw new Error('renewal failed')
-        return persistedLease(lease)
-      },
-      deleteStreamLease: async () => true,
-      deleteOwnedStreamLease: async () => true,
-    } as unknown as WorkspaceRepository)
-    await startStreamLease(leaseInput('S-renewal-failure'))
-    expect(manager.isHeld('stream-owner:S-renewal-failure')).toBe(true)
-    const firstDeadline = __streamLeaseHeartbeatSchedulerStateForTests().deadline as number
+    const recover = vi.fn(async (verified: boolean) => verified)
 
-    __runStreamLeaseHeartbeatSchedulerForTests(firstDeadline)
-    await __flushStreamLeaseWritesForTests()
-    expect(renewalAttempts).toBe(1)
-    expect(manager.isHeld('stream-owner:S-renewal-failure')).toBe(true)
-
-    const retryDeadline = __streamLeaseHeartbeatSchedulerStateForTests().deadline as number
-    __runStreamLeaseHeartbeatSchedulerForTests(retryDeadline)
-    await __flushStreamLeaseWritesForTests()
-    expect(renewalAttempts).toBe(2)
-    expect(manager.isHeld('stream-owner:S-renewal-failure')).toBe(true)
-
-    __resetStreamLeasesForTests()
-    expect(__streamLeaseHeartbeatSchedulerStateForTests()).toEqual({
-      activeWriters: 0,
-      timerScheduled: false,
-      deadline: null,
-      wakeups: 0,
-    })
-    expect(vi.getTimerCount()).toBe(0)
-    await __flushStreamOwnershipForTests()
-    expect(manager.isHeld('stream-owner:S-renewal-failure')).toBe(false)
+    await expect(
+      withStreamRecoveryLocks(['stream-b', 'stream-a', 'stream-b'], recover),
+    ).resolves.toEqual({ acquired: true, value: true })
+    expect(manager.requested).toEqual(['stream-owner:stream-a', 'stream-owner:stream-b'])
+    expect(recover).toHaveBeenCalledWith(true)
   })
 
-  it('finishes a preserved lease write before releasing ownership', async () => {
+  it('does not run recovery when any ownership lock is unavailable', async () => {
     const manager = new TestStreamLockManager()
     __setStreamLockManagerForTests(manager)
-    const putStarted = deferred()
-    const releasePut = deferred()
-    let stored: StreamLeaseRow | undefined
-    const deleteStreamLease = vi.fn(async () => true)
-    const writeLease = async (lease: StreamLeaseRow) => {
-      putStarted.resolve()
-      await releasePut.promise
-      stored = persistedLease(lease)
-      return stored
-    }
-    __setWorkspaceRepositoryForTests({
-      upsertStreamLease: writeLease,
-      renewStreamLease: writeLease,
-      deleteStreamLease,
-      deleteOwnedStreamLease: deleteStreamLease,
-    } as unknown as WorkspaceRepository)
+    const release = deferred()
+    const owner = manager.request('stream-owner:stream-b', async () => release.promise)
+    const recover = vi.fn(async () => true)
 
-    void startStreamLease(leaseInput('S-preserved'))
-    await putStarted.promise
-    void stopStreamLease('S-preserved', { deleteRow: false })
-
-    expect(manager.isHeld('stream-owner:S-preserved')).toBe(true)
-    releasePut.resolve()
-    await Promise.all([__flushStreamLeaseWritesForTests(), __flushStreamOwnershipForTests()])
-
-    expect(stored?.streamId).toBe('S-preserved')
-    expect(deleteStreamLease).not.toHaveBeenCalled()
-    expect(manager.isHeld('stream-owner:S-preserved')).toBe(false)
-  })
-
-  it('does not serialize heartbeat writes for different streams', async () => {
-    const bothStarted = deferred()
-    const releaseWrites = deferred()
-    let concurrent = 0
-    let maxConcurrent = 0
-    const writeLease = async (lease: StreamLeaseRow) => {
-      concurrent += 1
-      maxConcurrent = Math.max(maxConcurrent, concurrent)
-      if (concurrent === 2) bothStarted.resolve()
-      await releaseWrites.promise
-      concurrent -= 1
-      return persistedLease(lease)
-    }
-    __setWorkspaceRepositoryForTests({
-      upsertStreamLease: writeLease,
-      renewStreamLease: writeLease,
-      deleteStreamLease: async () => true,
-      deleteOwnedStreamLease: async () => true,
-    } as unknown as WorkspaceRepository)
-
-    void startStreamLease(leaseInput('S-left'))
-    void startStreamLease(leaseInput('S-right'))
-    await bothStarted.promise
-
-    expect(maxConcurrent).toBe(2)
-    void stopStreamLease('S-left')
-    void stopStreamLease('S-right')
-    releaseWrites.resolve()
-    await __flushStreamLeaseWritesForTests()
-  })
-
-  it('holds a per-stream ownership lock and blocks recovery until the stream stops', async () => {
-    const manager = new TestStreamLockManager()
-    __setStreamLockManagerForTests(manager)
-    __setWorkspaceRepositoryForTests({
-      upsertStreamLease: async (lease: StreamLeaseRow) => persistedLease(lease),
-      renewStreamLease: async (lease: StreamLeaseRow) => persistedLease(lease),
-      deleteStreamLease: async () => true,
-      deleteOwnedStreamLease: async () => true,
-    } as unknown as WorkspaceRepository)
-    const recover = vi.fn(async (ownershipVerified: boolean) => {
-      expect(ownershipVerified).toBe(true)
-      return 'recovered'
-    })
-
-    void startStreamLease(leaseInput('S-owned'))
-    expect(manager.isHeld('stream-owner:S-owned')).toBe(true)
-
-    await expect(withStreamRecoveryLocks(['S-owned'], recover)).resolves.toEqual({
+    await expect(withStreamRecoveryLocks(['stream-a', 'stream-b'], recover)).resolves.toEqual({
       acquired: false,
     })
     expect(recover).not.toHaveBeenCalled()
-
-    void stopStreamLease('S-owned', { deleteRow: false })
-    await __flushStreamOwnershipForTests()
-    await expect(withStreamRecoveryLocks(['S-owned'], recover)).resolves.toEqual({
-      acquired: true,
-      value: 'recovered',
-    })
-    expect(recover).toHaveBeenCalledTimes(1)
+    release.resolve()
+    await owner
   })
 
-  it('acquires recovery locks as one sorted guard and releases partial acquisition', async () => {
+  it('reports exact ownership-lock evidence without retaining the probe lock', async () => {
     const manager = new TestStreamLockManager()
     __setStreamLockManagerForTests(manager)
-    __setWorkspaceRepositoryForTests({
-      upsertStreamLease: async (lease: StreamLeaseRow) => persistedLease(lease),
-      renewStreamLease: async (lease: StreamLeaseRow) => persistedLease(lease),
-      deleteStreamLease: async () => true,
-      deleteOwnedStreamLease: async () => true,
-    } as unknown as WorkspaceRepository)
-    void startStreamLease(leaseInput('S-right'))
-    const recover = vi.fn(async () => undefined)
+    const release = deferred()
+    const owner = manager.request('stream-owner:stream-1', async () => release.promise)
 
-    await expect(
-      withStreamRecoveryLocks(['S-right', 'S-left', 'S-left'], recover),
-    ).resolves.toEqual({ acquired: false })
-    expect(recover).not.toHaveBeenCalled()
-    await expect(withStreamRecoveryLocks(['S-left'], recover)).resolves.toEqual({
-      acquired: true,
-      value: undefined,
+    await expect(observeStreamOwnershipLock('stream-1')).resolves.toMatchObject({
+      kind: 'held-by-other',
+      streamId: 'stream-1',
     })
-    expect(recover).toHaveBeenCalledTimes(1)
 
-    void stopStreamLease('S-right', { deleteRow: false })
-    await __flushStreamOwnershipForTests()
+    release.resolve()
+    await owner
+    await expect(observeStreamOwnershipLock('stream-1')).resolves.toEqual({
+      kind: 'acquired-for-recovery',
+      streamId: 'stream-1',
+    })
+    expect(manager.isHeld('stream-owner:stream-1')).toBe(false)
   })
 
-  it("allows the caller's TTL-based recovery fallback when Web Locks are unavailable", async () => {
-    __setStreamLockManagerForTests(null)
-
-    await expect(
-      withStreamRecoveryLocks(['S-fallback'], async (ownershipVerified) => {
-        expect(ownershipVerified).toBe(false)
-        return 42
-      }),
-    ).resolves.toEqual({ acquired: true, value: 42 })
-  })
-
-  it('propagates recovery failures after ownership is acquired', async () => {
+  it('waits for ownership release and respects cancellation', async () => {
     const manager = new TestStreamLockManager()
     __setStreamLockManagerForTests(manager)
+    const release = deferred()
+    const owner = manager.request('stream-owner:stream-1', async () => release.promise)
+    const controller = new AbortController()
+    const waiting = waitForStreamOwnershipRelease('stream-1', controller.signal)
+
+    release.resolve()
+    await owner
+    await expect(waiting).resolves.toBe(true)
+
+    const cancelled = new AbortController()
+    cancelled.abort()
+    await expect(waitForStreamOwnershipRelease('stream-1', cancelled.signal)).resolves.toBe(false)
+  })
+
+  it('serializes recovery coordination per workspace', async () => {
+    const manager = new TestStreamLockManager()
+    __setStreamLockManagerForTests(manager)
+    const release = deferred()
+    const firstStarted = deferred()
+    const first = runWithStreamRecoveryCoordinatorLock(
+      FENCE.workspaceId,
+      new AbortController().signal,
+      async () => {
+        firstStarted.resolve()
+        await release.promise
+      },
+    )
+    await firstStarted.promise
+    let secondRan = false
+    const second = runWithStreamRecoveryCoordinatorLock(
+      FENCE.workspaceId,
+      new AbortController().signal,
+      async () => {
+        secondRan = true
+      },
+    )
+    await Promise.resolve()
+    expect(secondRan).toBe(false)
+
+    release.resolve()
+    await Promise.all([first, second])
+    expect(secondRan).toBe(true)
+  })
+})
+
+describe('owned stream lease lifetime', () => {
+  it('releases the workspace child when ownership reservation is rejected', async () => {
+    const onIdle = vi.fn()
+    const unsubscribe = subscribeWorkspaceRuntimeIdle(onIdle)
+    const failure = await runWorkspaceAction('conversation-generation', async (permit) => {
+      const currentLease = lease({ ownerClientId: 'another-stream-client' })
+      return reserveStreamOwnership(
+        reserveWorkspaceChild(permit, 'stream-lease'),
+        testStreamLeaseAdmission(currentLease),
+        () => undefined,
+      ).catch((error: unknown) => error)
+    })
+
+    expect(failure).toEqual(new Error('StreamOwnershipReservationFenceMismatch:stream-1'))
+    expect(onIdle).toHaveBeenCalledOnce()
+    const next = tryRunWorkspaceActionIfIdle('maintenance', async () => undefined)
+    expect(next).not.toBeNull()
+    await next
+    unsubscribe()
+  })
+
+  it('releases the workspace child when stream-lock acquisition fails', async () => {
+    const lockFailure = new Error('StreamLockAcquisitionFailed')
+    __setStreamLockManagerForTests({
+      request: () => Promise.reject(lockFailure),
+    })
+    const onIdle = vi.fn()
+    const unsubscribe = subscribeWorkspaceRuntimeIdle(onIdle)
+    const failure = await runWorkspaceAction('conversation-generation', async (permit) =>
+      reserveStreamOwnership(
+        reserveWorkspaceChild(permit, 'stream-lease'),
+        testStreamLeaseAdmission(lease()),
+        () => undefined,
+      ).catch((error: unknown) => error),
+    )
+
+    expect(failure).toBe(lockFailure)
+    expect(onIdle).toHaveBeenCalledOnce()
+    const next = tryRunWorkspaceActionIfIdle('maintenance', async () => undefined)
+    expect(next).not.toBeNull()
+    await next
+    unsubscribe()
+  })
+
+  it('holds stream ownership while the durable lease is still only reserved', async () => {
+    const manager = new TestStreamLockManager()
+    __setStreamLockManagerForTests(manager)
+    const reservation = await reserveLeaseOwnership(lease())
+
+    expect(manager.isHeld('stream-owner:stream-1')).toBe(true)
+    expect(() => disposeStreamLeaseRuntime()).toThrow(
+      'StreamLeaseWriterLifetimeViolation:runtime-disposal:0:1',
+    )
+
+    await releaseStreamOwnershipReservation(reservation)
+  })
+
+  it('authenticates pre-adoption Stop evidence against the durable lease before aborting once', async () => {
+    let currentLease = lease()
+    const abortTransport = vi.fn()
+    __setWorkspaceRepositoryForTests(
+      repositoryWithExecute(
+        async (command) => {
+          if (command.kind === 'stream.handoff-recovery') return commit(currentLease)
+          throw new Error(`UnexpectedCommand:${command.kind}`)
+        },
+        () => currentLease,
+      ),
+    )
+    const reservation = await reserveLeaseOwnership(currentLease, abortTransport)
+
+    publishStopRequested({ admissionSequence: 2 })
+    publishStopRequested({ chatId: 'other-chat' })
+    publishStopRequested({ messageId: 'other-message' })
+    publishStopRequested({ attemptKind: 'continuation' })
+    publishStopRequested({ replacementEpoch: 1 })
+    publishStopRequested({ workspaceId: 'other-workspace' })
+    expect(abortTransport).not.toHaveBeenCalled()
+    publishStopRequested({})
+    publishStopRequested({})
+    publishStopRequested({ streamId: 'sibling-stream' })
+    expect(abortTransport).not.toHaveBeenCalled()
+
+    currentLease = lease({
+      revision: currentLease.revision + 1,
+      controlRevision: 1,
+      stopControl: {
+        requestId: 'stop-request-1',
+        requestedBy: 'remote-tab',
+        requestedAt: 2,
+        reason: 'user',
+      },
+    })
+    const handle = await adoptPreparedStreamLease(reservation, lease(), LOCAL_APPLICATIONS)
+
+    expect(abortTransport).toHaveBeenCalledOnce()
+    publishStopRequested({})
+    expect(abortTransport).toHaveBeenCalledOnce()
+    await handle.retire({ mode: 'handoff', reason: 'finalize-failed' })
+  })
+
+  it('does not let stale pre-adoption Stop evidence abort the current admission', async () => {
+    const currentLease = lease()
+    const abortTransport = vi.fn()
+    __setWorkspaceRepositoryForTests(
+      repositoryWithExecute(
+        async (command) => {
+          if (command.kind === 'stream.handoff-recovery') return commit(currentLease)
+          throw new Error(`UnexpectedCommand:${command.kind}`)
+        },
+        () => currentLease,
+      ),
+    )
+    const reservation = await reserveLeaseOwnership(currentLease, abortTransport)
+    publishStopRequested({ admissionSequence: 2 })
+
+    const handle = await adoptPreparedStreamLease(reservation, currentLease, LOCAL_APPLICATIONS)
+
+    expect(abortTransport).not.toHaveBeenCalled()
+    await handle.retire({ mode: 'handoff', reason: 'finalize-failed' })
+  })
+
+  it('claims one exact Stop intent synchronously and commits it without blocking a sibling', async () => {
+    attemptController.replaceWorkspace(FENCE)
+    const currentLease = lease()
+    const siblingLease = lease({
+      streamId: 'stream-2',
+      messageId: 'message-2',
+      fenceToken: 'fence-2',
+      admissionSequence: 2,
+    })
+    observeLocalLease(currentLease)
+    observeLocalLease(siblingLease)
+    const releaseCommit = deferred()
+    const execute = vi.fn(async (command: WorkspaceCommand) => {
+      if (command.kind !== 'attempt.request-stop') {
+        throw new Error(`UnexpectedCommand:${command.kind}`)
+      }
+      await releaseCommit.promise
+      return commit({
+        outcome: 'accepted' as const,
+        lease: lease({
+          revision: 2,
+          controlRevision: 1,
+          stopControl: {
+            requestId: command.input.requestId,
+            requestedBy: command.input.requestedBy,
+            requestedAt: command.input.requestedAt,
+            reason: 'user',
+          },
+        }),
+      })
+    })
+    __setWorkspaceRepositoryForTests(repositoryWithExecute(execute))
+    const capability = attemptStopCapability(attemptController.getExecution('stream-1'))
+    if (!capability || capability.kind !== 'requestable') {
+      throw new Error('ExpectedRequestableStopCapability')
+    }
+
+    const request = requestAttemptStop(capability, 2)
+
+    expect(request.claimed).toBe(true)
+    expect(attemptStopCapability(attemptController.getExecution('stream-1'))?.kind).toBe(
+      'requesting',
+    )
+    expect(attemptStopCapability(attemptController.getExecution('stream-2'))?.kind).toBe(
+      'requestable',
+    )
+    const duplicate = requestAttemptStop(capability, 3)
+    expect(duplicate.claimed).toBe(false)
+    await expect(duplicate.completed).resolves.toEqual({ outcome: 'stale' })
+    expect(execute).toHaveBeenCalledOnce()
+
+    releaseCommit.resolve()
+    await expect(request.completed).resolves.toMatchObject({ outcome: 'accepted' })
+    expect(attemptStopCapability(attemptController.getExecution('stream-1'))?.kind).toBe(
+      'requested',
+    )
+    expect(attemptStopCapability(attemptController.getExecution('stream-2'))?.kind).toBe(
+      'requestable',
+    )
+  })
+
+  it('interrupts the matching local transport when the Stop intent is claimed', async () => {
+    const currentLease = lease()
+    const abortTransport = vi.fn()
+    const releaseCommit = deferred()
+    __setWorkspaceRepositoryForTests(
+      repositoryWithExecute(async (command) => {
+        if (command.kind === 'stream.handoff-recovery') return commit(currentLease)
+        if (command.kind !== 'attempt.request-stop') {
+          throw new Error(`UnexpectedCommand:${command.kind}`)
+        }
+        await releaseCommit.promise
+        return commit({
+          outcome: 'accepted' as const,
+          lease: lease({
+            revision: 2,
+            controlRevision: 1,
+            stopControl: {
+              requestId: command.input.requestId,
+              requestedBy: command.input.requestedBy,
+              requestedAt: command.input.requestedAt,
+              reason: 'user',
+            },
+          }),
+        })
+      }),
+    )
+    const handle = await adoptLeaseOwnership(currentLease, abortTransport)
+    observeLocalLease(currentLease)
+    const capability = attemptStopCapability(attemptController.getExecution('stream-1'))
+    if (!capability || capability.kind !== 'requestable') {
+      throw new Error('ExpectedRequestableStopCapability')
+    }
+
+    const request = requestAttemptStop(capability, 2)
+
+    expect(request.claimed).toBe(true)
+    expect(abortTransport).toHaveBeenCalledOnce()
+    releaseCommit.resolve()
+    await expect(request.completed).resolves.toMatchObject({ outcome: 'accepted' })
+    publishStopRequested({})
+    expect(abortTransport).toHaveBeenCalledOnce()
+    await handle.retire({ mode: 'handoff', reason: 'finalize-failed' })
+  })
+
+  it('retains its exact level-triggered Stop intent when the durable command fails', async () => {
+    attemptController.replaceWorkspace(FENCE)
+    const currentLease = lease()
+    observeLocalLease(currentLease)
+    const failure = new Error('durable Stop failed')
+    __setWorkspaceRepositoryForTests(
+      repositoryWithExecute(async (command) => {
+        if (command.kind !== 'attempt.request-stop') {
+          throw new Error(`UnexpectedCommand:${command.kind}`)
+        }
+        throw failure
+      }),
+    )
+    const capability = attemptStopCapability(attemptController.getExecution('stream-1'))
+    if (!capability || capability.kind !== 'requestable') {
+      throw new Error('ExpectedRequestableStopCapability')
+    }
+
+    const request = requestAttemptStop(capability, 2)
+
+    expect(attemptStopCapability(attemptController.getExecution('stream-1'))?.kind).toBe(
+      'requesting',
+    )
+    await expect(request.completed).rejects.toBe(failure)
+    expect(attemptStopCapability(attemptController.getExecution('stream-1'))?.kind).toBe(
+      'requesting',
+    )
+  })
+
+  it('delivers an exact durable Stop fact to the active writer once', async () => {
+    const currentLease = lease()
+    const abortTransport = vi.fn()
+    __setWorkspaceRepositoryForTests(
+      repositoryWithExecute(async (command) => {
+        if (command.kind === 'stream.handoff-recovery') return commit(currentLease)
+        throw new Error(`UnexpectedCommand:${command.kind}`)
+      }),
+    )
+    const handle = await adoptLeaseOwnership(currentLease, abortTransport)
+
+    publishStopRequested({})
+    publishStopRequested({})
+    publishStopRequested({ admissionSequence: 2, controlRevision: 2 })
+
+    expect(abortTransport).toHaveBeenCalledOnce()
+    await handle.retire({ mode: 'handoff', reason: 'finalize-failed' })
+  })
+
+  it('observes missed durable Stop delivery on the existing heartbeat write', async () => {
+    const abortTransport = vi.fn()
+    let currentLease = lease()
+    __setWorkspaceRepositoryForTests(
+      repositoryWithExecute(async (command) => {
+        if (command.kind === 'stream.renew') {
+          currentLease = lease({
+            revision: currentLease.revision + 1,
+            heartbeatAt: command.heartbeat.heartbeatAt,
+            controlRevision: 1,
+            stopControl: {
+              requestId: 'missed-stop',
+              requestedBy: 'remote-tab',
+              requestedAt: 2,
+              reason: 'user',
+            },
+          })
+          return commit(currentLease)
+        }
+        if (command.kind === 'stream.handoff-recovery') return commit(currentLease)
+        throw new Error(`UnexpectedCommand:${command.kind}`)
+      }),
+    )
+    const handle = await adoptLeaseOwnership(currentLease, abortTransport)
+
+    __runStreamLeaseHeartbeatSchedulerForTests(25_000)
+    await vi.waitFor(() => expect(abortTransport).toHaveBeenCalledOnce())
+    await handle.retire({ mode: 'handoff', reason: 'finalize-failed' })
+  })
+
+  it('rejects contended ownership before the second durable lease can be adopted', async () => {
+    const manager = new TestStreamLockManager()
+    __setStreamLockManagerForTests(manager)
+    const currentLease = lease()
+    const first = await reserveLeaseOwnership(currentLease)
+
+    await expect(reserveLeaseOwnership(currentLease)).rejects.toThrow(
+      'StreamLeaseAlreadyOwned:stream-1',
+    )
+    expect(manager.isHeld('stream-owner:stream-1')).toBe(true)
+
+    await releaseStreamOwnershipReservation(first)
+  })
+
+  it('releases both stream ownership and its workspace permit before returning', async () => {
+    const manager = new TestStreamLockManager()
+    __setStreamLockManagerForTests(manager)
+    const onIdle = vi.fn()
+    const unsubscribe = subscribeWorkspaceRuntimeIdle(onIdle)
+    const reservation = await reserveLeaseOwnership(lease())
+
+    expect(manager.isHeld('stream-owner:stream-1')).toBe(true)
+    expect(tryRunWorkspaceActionIfIdle('maintenance', async () => undefined)).toBeNull()
+    expect(onIdle).not.toHaveBeenCalled()
+
+    await releaseStreamOwnershipReservation(reservation)
+
+    expect(manager.isHeld('stream-owner:stream-1')).toBe(false)
+    expect(onIdle).toHaveBeenCalledTimes(1)
+    const next = tryRunWorkspaceActionIfIdle('maintenance', async () => undefined)
+    expect(next).not.toBeNull()
+    await next
+    unsubscribe()
+  })
+
+  it('rejects a mismatched committed lease and releases its reservation resources', async () => {
+    const manager = new TestStreamLockManager()
+    __setStreamLockManagerForTests(manager)
+    const reservation = await reserveLeaseOwnership(lease())
 
     await expect(
-      withStreamRecoveryLocks(['S-failing-recovery'], async () => {
-        throw new Error('recovery failed')
+      adoptPreparedStreamLease(
+        reservation,
+        lease({ fenceToken: 'different-durable-fence' }),
+        LOCAL_APPLICATIONS,
+      ),
+    ).rejects.toThrow('PreparedStreamLeaseFenceMismatch:stream-1')
+
+    expect(manager.isHeld('stream-owner:stream-1')).toBe(false)
+    const next = tryRunWorkspaceActionIfIdle('maintenance', async () => undefined)
+    expect(next).not.toBeNull()
+    await next
+  })
+
+  it('keeps the shared heartbeat scheduler live across wall-clock rollback', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(10_000)
+    __setStreamLockManagerForTests(new TestStreamLockManager())
+    let currentLease = lease()
+    const heartbeats: number[] = []
+    __setWorkspaceRepositoryForTests(
+      repositoryWithExecute(async (command) => {
+        if (command.kind === 'stream.renew') {
+          heartbeats.push(command.heartbeat.heartbeatAt)
+          currentLease = {
+            ...currentLease,
+            heartbeatAt: command.heartbeat.heartbeatAt,
+            revision: currentLease.revision + 1,
+          }
+          return commit(currentLease)
+        }
+        if (command.kind === 'stream.handoff-recovery') return commit(currentLease)
+        throw new Error(`UnexpectedCommand:${command.kind}`)
       }),
-    ).rejects.toThrow('recovery failed')
+    )
+    const handle = await adoptLeaseOwnership(currentLease)
+
+    vi.setSystemTime(1_000)
+    await vi.advanceTimersByTimeAsync(2_000)
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(heartbeats).toEqual([3_000])
+    await handle.retire({ mode: 'handoff', reason: 'finalize-failed' })
+  })
+
+  it('holds ownership, renews on one shared scheduler, and cleans up once', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(10_000)
+    const manager = new TestStreamLockManager()
+    __setStreamLockManagerForTests(manager)
+    let currentLease = lease()
+    const commands: WorkspaceCommand[] = []
+    __setWorkspaceRepositoryForTests(
+      repositoryWithExecute(async (command) => {
+        commands.push(command)
+        if (command.kind === 'stream.renew') {
+          currentLease = {
+            ...currentLease,
+            heartbeatAt: command.heartbeat.heartbeatAt,
+            revision: currentLease.revision + 1,
+          }
+          return commit(currentLease)
+        }
+        if (command.kind === 'stream.note-selected-key') {
+          currentLease = {
+            ...currentLease,
+            postCommit: {
+              usedAt: 1,
+              profileId: 'profile-1',
+              selectedKeyId: command.input.selectedKeyId,
+            },
+            revision: currentLease.revision + 1,
+          }
+          return commit(currentLease)
+        }
+        if (command.kind === 'stream.handoff-recovery') {
+          return commit(currentLease)
+        }
+        throw new Error(`UnexpectedCommand:${command.kind}`)
+      }),
+    )
+
+    const handle = await adoptLeaseOwnership(currentLease)
+
+    expect(manager.isHeld('stream-owner:stream-1')).toBe(true)
+    expect(commands.map((command) => command.kind)).toEqual([])
+
+    await handle.noteSelectedKey('key-1')
+    __runStreamLeaseHeartbeatSchedulerForTests(25_000)
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(commands.map((command) => command.kind)).toEqual([
+      'stream.note-selected-key',
+      'stream.renew',
+    ])
+
+    await handle.retire({ mode: 'handoff', reason: 'finalize-failed' })
+    expect(commands.map((command) => command.kind)).toEqual([
+      'stream.note-selected-key',
+      'stream.renew',
+      'stream.handoff-recovery',
+    ])
+    expect(manager.isHeld('stream-owner:stream-1')).toBe(false)
+    __runStreamLeaseHeartbeatSchedulerForTests(40_000)
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(commands.map((command) => command.kind)).toEqual([
+      'stream.note-selected-key',
+      'stream.renew',
+      'stream.handoff-recovery',
+    ])
+  })
+
+  it('rejects duplicate ownership before a second writer can renew', async () => {
+    const manager = new TestStreamLockManager()
+    __setStreamLockManagerForTests(manager)
+    let currentLease = lease()
+    __setWorkspaceRepositoryForTests(
+      repositoryWithExecute(async (command) => {
+        if (command.kind === 'stream.renew') {
+          currentLease = { ...currentLease, revision: currentLease.revision + 1 }
+          return commit(currentLease)
+        }
+        if (command.kind === 'stream.handoff-recovery') return commit(currentLease)
+        throw new Error(`UnexpectedCommand:${command.kind}`)
+      }),
+    )
+    const first = await adoptLeaseOwnership(currentLease)
+
+    await expect(reserveLeaseOwnership(currentLease)).rejects.toThrow(
+      'StreamLeaseAlreadyOwned:stream-1',
+    )
+
+    await first.retire({ mode: 'handoff', reason: 'finalize-failed' })
+  })
+
+  it('closes admission while disposed and resumes only after runtime work drains', async () => {
+    disposeStreamLeaseRuntime()
+    await expect(withStreamRecoveryLocks([], async () => true)).rejects.toThrow(
+      'StreamLeaseRuntimeDisposed',
+    )
+    await awaitStreamLeaseRuntimeIdle()
+    resumeStreamLeaseRuntime()
+    await expect(withStreamRecoveryLocks([], async () => true)).resolves.toEqual({
+      acquired: true,
+      value: true,
+    })
+  })
+
+  it('refuses runtime disposal until the terminal owner releases every writer', async () => {
+    const manager = new TestStreamLockManager()
+    __setStreamLockManagerForTests(manager)
+    const currentLease = lease()
+    __setWorkspaceRepositoryForTests(
+      repositoryWithExecute(async (command) => {
+        if (command.kind === 'stream.handoff-recovery') return commit(currentLease)
+        throw new Error(`UnexpectedCommand:${command.kind}`)
+      }),
+    )
+    const handle = await adoptLeaseOwnership(currentLease)
+
+    expect(() => disposeStreamLeaseRuntime()).toThrow(
+      'StreamLeaseWriterLifetimeViolation:runtime-disposal:1',
+    )
+    expect(manager.isHeld('stream-owner:stream-1')).toBe(true)
+
+    await handle.retire({ mode: 'handoff', reason: 'finalize-failed' })
+    disposeStreamLeaseRuntime()
+    await awaitStreamLeaseRuntimeIdle()
+    expect(manager.isHeld('stream-owner:stream-1')).toBe(false)
+    resumeStreamLeaseRuntime()
   })
 })

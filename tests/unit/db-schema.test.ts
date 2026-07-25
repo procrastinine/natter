@@ -1,40 +1,93 @@
 import Dexie from 'dexie'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   AttachmentReferenceEdgeMigrationError,
   rebuildAttachmentReferenceEdges,
 } from '../../src/backcompat/attachment-reference-edges'
 import { forEachTableBatch } from '../../src/backcompat/batched-table'
-import { assertNoInlineMessageBodies } from '../../src/backcompat/message-body-split'
-import { migrateProviderOutputItemRows } from '../../src/backcompat/provider-output-items'
-import { canonicalizeTokenCalibrationRows } from '../../src/backcompat/token-calibration-global'
+import { backfillChatPreviewProjection } from '../../src/backcompat/chat-preview-projection'
+import {
+  migrateGlobalSettingsRows,
+  migratePinnedModelDefault,
+} from '../../src/backcompat/global-settings'
+import {
+  assertNoInlineMessageBodies,
+  backfillMissingMessageBodies,
+} from '../../src/backcompat/message-body-split'
+import {
+  migrateProviderOutputItemRows,
+  providerOutputItemsBackfillMarker,
+} from '../../src/backcompat/provider-output-items'
+import { migrateProviderToolSettingsRows } from '../../src/backcompat/provider-tools'
+import { runOnceBackfill } from '../../src/backcompat/run-once'
+import { migrateStreamLeaseLifecycleState } from '../../src/backcompat/stream-lease-attempts'
+import {
+  canonicalizeTokenCalibrationRows,
+  rebuildTokenCalibrationGlobalRows,
+} from '../../src/backcompat/token-calibration-global'
+import { migrateWaveADerivedRowsV94 } from '../../src/backcompat/wave-a-derived-storage-v94'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
+import { PINNED_MODELS_KEY } from '../../src/core/global-settings'
+import { LATEST_OPENROUTER_MODEL_IDS } from '../../src/core/latest-models'
 import { tokenCalibrationKey } from '../../src/core/model-ids'
+import { isReasoningEnvelope } from '../../src/core/reasoning-envelope'
+import { replayStreamAccumulator } from '../../src/core/stream-accumulator'
+import {
+  EMPTY_TEXT_TEMPLATE,
+  LEGACY_SAVED_TEXT_TEMPLATES_KEY,
+  type SavedTextTemplate,
+} from '../../src/core/text-templates'
 import type {
   Attachment,
   AttachmentArtifact,
   AttachmentReferenceEdge,
   Chat,
+  ConnectionProfile,
   GlobalTokenCalibration,
   Message,
   MessageAttachmentRef,
 } from '../../src/core/types'
-import {
-  attachmentHeaderFromStoredRow,
-  hydrateAttachment,
-} from '../../src/store/attachment-storage'
+import { hydrateAttachment } from '../../src/store/attachment-storage'
 import { BROWSER_WRITER_LOCK_NAME, type BrowserLockRow } from '../../src/store/browser-lock-record'
-import { putChatSidebarProjection } from '../../src/store/chat-sidebar-projection'
+import {
+  CHAT_SIDEBAR_PROJECTION_BACKFILL_KEY,
+  CHAT_SIDEBAR_PROJECTION_MARKER_VERSION,
+  CHAT_SIDEBAR_PROJECTION_ROW_VERSION,
+  chatSidebarProjectionRow,
+  emptyChatSidebarAggregateRow,
+} from '../../src/store/chat-sidebar-projection'
+import { buildChat } from '../../src/store/chats'
 import type { NatterDb } from '../../src/store/db'
 import {
   __resetDbForTests,
-  backfillOrganizationFields,
+  CURRENT_DB_VERSION,
   createDbForTests,
   openDb,
+  prepareBrowserWorkspaceSchema,
   registerSchema,
 } from '../../src/store/db'
-import { hydrateMessage, splitMessageForStorage } from '../../src/store/message-storage'
+import {
+  hydrateMessage,
+  MESSAGE_TEXT_PREVIEW_MAX_CHARS,
+  type MessageBodyRow,
+  type MessageHeaderRow,
+  splitMessageForStorage,
+} from '../../src/store/message-storage'
+import { persistedStreamEventV2FromUnknown } from '../../src/store/persisted-stream-event'
+import { readPresetOrderIds } from '../../src/store/preset-order'
 import type { StreamLeaseRow } from '../../src/store/repository'
+import { estimateStreamJournalFrameStorageBytes } from '../../src/store/storage-size-estimate'
+import {
+  requireCanonicalStreamJournalFrame,
+  streamJournalFrameId,
+} from '../../src/store/stream-journal-codec'
+import { STREAM_JOURNAL_INTEGRITY_SETTING_KEY } from '../../src/store/stream-journal-integrity'
+import {
+  decodeTestStreamJournalFrames,
+  encodeTestStreamJournalEntries,
+} from '../helpers/stream-journal'
+import { testContinuationLease, testGenerationLease } from '../helpers/stream-leases'
+import { observedWaveAStoreSpec } from '../helpers/wave-a-observed-storage-v25-v93'
 
 // Unique DB name per test so migrations start from a clean slate. Pre-existing
 // data is deleted at the top of each test so repeated runs don't pick up stale
@@ -45,73 +98,200 @@ async function freshDb(name: string): Promise<NatterDb> {
 }
 
 afterEach(() => {
-  __resetDbForTests()
+  __resetDbForTests({ admissionsOpen: true })
 })
 
 describe('Dexie schema', () => {
   beforeEach(async () => {
+    __resetDbForTests({ admissionsOpen: true })
     await Dexie.delete('natter')
   })
 
   it('opens on a fresh IndexedDB with all declared tables', async () => {
     const db = await openDb()
     expect(db.isOpen()).toBe(true)
-    expect(db.verno).toBe(25)
+    expect(db.verno).toBe(CURRENT_DB_VERSION)
+    expect(await db.attachmentIntegrityState.get('workspace')).toEqual(
+      expect.objectContaining({ repairVersion: 1, phase: 'complete' }),
+    )
     const names = db.tables.map((t) => t.name).sort()
     expect(names).toEqual(
       [
         'attachmentArtifacts',
         'attachmentBlobs',
+        'attachmentCatalogAggregate',
+        'attachmentCatalogRows',
         'attachmentJobs',
+        'attachmentIntegrityState',
         'attachmentRefEdges',
         'attachments',
         'browserLocks',
-        'chatBranchCache',
+        'chatSidebarAggregates',
         'chatSidebarRows',
         'chats',
         'childLists',
+        'childSlotMembers',
+        'configurationCatalogAggregates',
+        'configurationLinks',
+        'configurationPresetCatalogRows',
+        'configurationProfileCatalogRows',
+        'configurationProfileUsageRows',
+        'configurationPromptPresetCatalogRows',
+        'discoveryCacheState',
+        'discoveryPayloadMetadata',
+        'discoveryPayloads',
         'drafts',
         'endpoints',
         'folders',
-        'generations',
         'keys',
         'messageBodies',
+        'messagePreviews',
         'messages',
         'models',
         'presets',
-        'presetResolutions',
         'privacyPolicies',
         'profiles',
+        'presetOrderBlocks',
+        'presetOrderMembership',
+        'presetOrderState',
         'promptPresets',
-        'providers',
         'settings',
+        'storageRetentionState',
         'streamChunks',
         'streamLeases',
         'tags',
+        'textTemplates',
+        'workspaceFence',
       ].sort(),
     )
+    const physicalNames = [...db.backendDB().objectStoreNames]
+    expect(physicalNames).not.toEqual(
+      expect.arrayContaining(['chatBranchCache', 'generations', 'presetResolutions', 'providers']),
+    )
     expect(db.attachmentRefEdges.schema.primKey.src).toBe('[ownerKind+ownerId+refId]')
+    expect(db.attachments.schema.indexes.map((index) => index.src)).toContain(
+      '[refCount+unreferencedAt+id]',
+    )
+    expect(db.chats.schema.indexes.map((index) => index.src)).toContain('[archivedKey+id]')
+    expect(db.chats.schema.indexes.map((index) => index.src)).toContain(
+      '[temporaryKey+temporaryRetentionAt+id]',
+    )
     expect(db.attachmentRefEdges.schema.indexes.map((index) => index.src)).toEqual([
       'attachmentId',
       '[attachmentId+ownerKind]',
+      '[attachmentId+chatId]',
       '[ownerKind+ownerId]',
       'chatId',
     ])
-    expect(db.streamLeases.schema.indexes.map((index) => index.src)).toContain('messageId')
+    expect(db.streamLeases.schema.indexes.map((index) => index.src)).toContain('&targetOwnerKey')
+    expect(db.streamLeases.schema.indexes.map((index) => index.src)).toContain(
+      '[terminalRetentionAt+streamId]',
+    )
     expect(db.messageBodies.schema.indexes.map((index) => index.src)).toEqual([
       'chatId',
       'updatedAt',
       'bodyVersion',
     ])
+    expect(db.messagePreviews.schema.primKey.src).toBe('id')
+    expect(db.messagePreviews.schema.indexes.map((index) => index.src)).toEqual(['chatId'])
+    expect(db.childSlotMembers.schema.primKey.src).toBe('id')
+    expect(db.childSlotMembers.schema.indexes.map((index) => index.src)).toEqual([
+      'parentKey',
+      '[chatId+parentKey+position]',
+    ])
+    expect(db.configurationProfileCatalogRows.schema.indexes.map((index) => index.src)).toEqual([
+      'archived',
+      'activeKey',
+      'managerTier',
+      'lastUsedAt',
+      '[activeKey+mruSortKey+nameSortKey+id]',
+      '[managerTier+nameSortKey+id]',
+    ])
+    expect(db.configurationLinks.schema.indexes.map((index) => index.src)).toEqual([
+      'ownerKey',
+      'targetKey',
+    ])
+    expect(db.textTemplates.schema.indexes.map((index) => index.src)).toEqual([
+      '[createdAt+id+name+updatedAt]',
+    ])
+    expect(db.configurationPresetCatalogRows.schema.indexes.map((index) => index.src)).toEqual([
+      'archived',
+      'activeKey',
+      'connectionProfileId',
+      '[activeKey+defaultTier+defaultTime+id]',
+      '[connectionProfileId+activeKey+defaultTier+defaultTime+id]',
+    ])
+    expect(
+      db.configurationPromptPresetCatalogRows.schema.indexes.map((index) => index.src),
+    ).toEqual(['kind', 'lastUsedAt', '[kind+lastUsedAt+id]', '[kind+nameSortKey+id]'])
+    expect(db.configurationCatalogAggregates.schema.primKey.src).toBe('id')
+    expect(db.configurationProfileUsageRows.schema.primKey.src).toBe('id')
+    expect(db.presetOrderState.schema.primKey.src).toBe('id')
+    expect(db.presetOrderBlocks.schema.primKey.src).toBe('id')
+    expect(db.presetOrderMembership.schema.primKey.src).toBe('presetId')
+    expect(db.presetOrderMembership.schema.indexes.map((index) => index.src)).toEqual(['blockId'])
+    expect(db.storageRetentionState.schema.primKey.src).toBe('task')
+    expect(db.workspaceFence.schema.primKey.src).toBe('id')
+    expect(db.attachmentCatalogRows.schema.indexes.map((index) => index.src)).toEqual(
+      expect.arrayContaining([
+        '[createdAt+id]',
+        '[updatedAt+id]',
+        '[sizeBytes+id]',
+        '[origin+sizeBytes+id]',
+        '[storageKind+sizeBytes+id]',
+        '[kind+sizeBytes+id]',
+        '[refCount+sizeBytes+id]',
+      ]),
+    )
+    expect(db.attachmentCatalogAggregate.schema.primKey.src).toBe('id')
+    expect(db.chatSidebarAggregates.schema.primKey.src).toBe('id')
+    expect(db.models.schema.indexes.map((index) => index.src)).toEqual([
+      'profileId',
+      'fetchedAt',
+      '[profileId+fetchedAt]',
+      'payloadId',
+    ])
+    expect(db.endpoints.schema.indexes.map((index) => index.src)).toEqual([
+      'profileId',
+      'fetchedAt',
+      '[profileId+fetchedAt]',
+      'payloadId',
+    ])
+    expect(db.privacyPolicies.schema.indexes.map((index) => index.src)).toEqual([
+      'profileId',
+      'fetchedAt',
+      '[profileId+fetchedAt]',
+      'payloadId',
+    ])
+    expect(db.discoveryPayloads.schema.primKey.src).toBe('id')
+    expect(db.discoveryPayloads.schema.indexes.map((index) => index.src)).toEqual(['byteLength'])
+    expect(db.discoveryPayloadMetadata.schema.indexes.map((index) => index.src)).toEqual([
+      'referenceCount',
+      'lastReferencedAt',
+      'byteLength',
+    ])
+    expect(await db.discoveryCacheState.get('global')).toEqual({
+      id: 'global',
+      formatVersion: 1,
+      valid: true,
+      headerCounts: { models: 0, endpoints: 0, privacyPolicies: 0 },
+      payloadCount: 0,
+      payloadByteLength: 0,
+    })
     expect(await db.attachmentRefEdges.count()).toBe(0)
     expect(await db.chatSidebarRows.count()).toBe(0)
     expect((await db.settings.get('backfill:attachment-refs-v1'))?.value).toBe(1)
     expect((await db.settings.get('backfill:chat-preview-projection-v1'))?.value).toBe(1)
-    expect((await db.settings.get('backfill:chat-sidebar-projection-v1'))?.value).toBe(1)
-    expect((await db.settings.get('projection:chat-sidebar-v1'))?.value).toEqual({
-      projectionVersion: 1,
-      expectedCount: 0,
+    expect((await db.settings.get(CHAT_SIDEBAR_PROJECTION_BACKFILL_KEY))?.value).toBe(
+      CHAT_SIDEBAR_PROJECTION_MARKER_VERSION,
+    )
+    expect(await db.settings.get('backfill:chat-sidebar-projection-v1')).toBeUndefined()
+    expect(await db.settings.get('projection:chat-sidebar-v1')).toBeUndefined()
+    expect(await db.settings.get(STREAM_JOURNAL_INTEGRITY_SETTING_KEY)).toEqual({
+      key: STREAM_JOURNAL_INTEGRITY_SETTING_KEY,
+      value: { version: 1, phase: 'complete' },
     })
+    expect(await db.chatSidebarAggregates.count()).toBe(1)
     expect(await db.browserLocks.get(BROWSER_WRITER_LOCK_NAME)).toEqual({
       name: BROWSER_WRITER_LOCK_NAME,
       ownerClientId: null,
@@ -123,7 +303,416 @@ describe('Dexie schema', () => {
     })
   })
 
-  it('runs the composed v23 message and attachment projection migration exactly once', async () => {
+  it('keeps the physical archive cursor indexed while exposing only the public chat shape', async () => {
+    const db = await openDb()
+    const chat = {
+      ...buildChat({ id: 'archive-codec', temporary: true, now: 1 }),
+      archived: true,
+    }
+    await db.chats.put(chat)
+
+    expect(await db.chats.get(chat.id)).toEqual(chat)
+    expect(await db.chats.get(chat.id)).not.toHaveProperty('archivedKey')
+    expect(await db.chats.get(chat.id)).not.toHaveProperty('temporaryKey')
+    expect(await db.chats.get(chat.id)).not.toHaveProperty('temporaryRetentionAt')
+    expect(await db.chats.where('[archivedKey+id]').equals([1, chat.id]).primaryKeys()).toEqual([
+      chat.id,
+    ])
+    expect(
+      await db.chats
+        .where('[temporaryKey+temporaryRetentionAt+id]')
+        .equals([1, 1, chat.id])
+        .count(),
+    ).toBe(1)
+
+    const replacement = {
+      ...chat,
+      archived: false,
+      temporary: false,
+      title: 'Materialized by put',
+      titleStatus: 'manual' as const,
+    }
+    await db.chats.put(replacement)
+    expect(replacement).not.toHaveProperty('archivedKey')
+    expect(replacement).not.toHaveProperty('temporaryKey')
+    expect(replacement).not.toHaveProperty('temporaryRetentionAt')
+    expect(await db.chats.get(chat.id)).toEqual(replacement)
+
+    await db.chats.update(chat.id, {
+      archived: false,
+      temporary: false,
+      title: 'Materialized',
+      titleStatus: 'manual',
+    })
+    expect(await db.chats.where('[archivedKey+id]').equals([1, chat.id]).count()).toBe(0)
+    expect(await db.chats.where('[archivedKey+id]').equals([0, chat.id]).count()).toBe(1)
+    expect(
+      await db.chats
+        .where('[temporaryKey+temporaryRetentionAt+id]')
+        .equals([1, 1, chat.id])
+        .count(),
+    ).toBe(0)
+    expect(
+      await db.chats
+        .where('[temporaryKey+temporaryRetentionAt+id]')
+        .equals([0, 1, chat.id])
+        .count(),
+    ).toBe(1)
+  })
+
+  it('replaces only the exact retired pinned-model default in the versioned backfill', async () => {
+    const db = await openDb()
+    const markerKey = 'backfill:pinned-model-default-v2'
+    const previousDefault = [
+      'openai/gpt-5.4',
+      'anthropic/claude-opus-4.7',
+      'deepseek/deepseek-v4-pro',
+      'google/gemini-3.1-pro-preview',
+      'google/gemini-3.1-flash-lite-preview',
+    ]
+    await db.settings.bulkPut([
+      { key: PINNED_MODELS_KEY, value: previousDefault },
+      { key: markerKey, value: 0 },
+    ])
+    await db.transaction('rw', db.settings, (tx) => migratePinnedModelDefault(tx))
+    expect((await db.settings.get(PINNED_MODELS_KEY))?.value).toEqual(LATEST_OPENROUTER_MODEL_IDS)
+
+    const customized = [...previousDefault, 'custom/private-model']
+    await db.settings.bulkPut([
+      { key: PINNED_MODELS_KEY, value: customized },
+      { key: markerKey, value: 0 },
+    ])
+    await db.transaction('rw', db.settings, (tx) => migratePinnedModelDefault(tx))
+    expect((await db.settings.get(PINNED_MODELS_KEY))?.value).toEqual(customized)
+  })
+
+  it('upgrades the observed attachment-only v56 shape to the archive cursor schema', async () => {
+    const name = `natter-test-v56-archive-cursor-${Math.random().toString(36).slice(2)}`
+    await Dexie.delete(name)
+    const legacy = new Dexie(name)
+    legacy.version(56).stores({
+      chats:
+        'id, updatedAt, createdAt, lastViewedAt, lastUpdatedLeafId, lastBranchUpdatedAt, wordCount, totalCostUsd, archived, pinned, presetId, folderId, *tags',
+      attachments:
+        'id, contentHash, kind, mime, origin, refCount, createdAt, updatedAt, deletedAt, [refCount+createdAt], [refCount+createdAt+id]',
+    })
+    await legacy.open()
+    const archived = { ...buildChat({ id: 'v56-archived-chat', now: 1 }), archived: true }
+    await legacy.table('chats').put(archived)
+    legacy.close()
+
+    const migrated = createDbForTests(name)
+    await migrated.open()
+
+    expect(migrated.verno).toBe(CURRENT_DB_VERSION)
+    expect(await migrated.chats.get(archived.id)).toEqual(archived)
+    expect(
+      await migrated.chats.where('[archivedKey+id]').equals([1, archived.id]).primaryKeys(),
+    ).toEqual([archived.id])
+    expect(migrated.attachments.schema.indexes.map((index) => index.src)).toContain(
+      '[refCount+unreferencedAt+id]',
+    )
+    await migrated.delete()
+  })
+
+  it('upgrades the observed v57 archive cursor to the indexed temporary candidate schema', async () => {
+    const name = `natter-test-v57-temporary-cursor-${Math.random().toString(36).slice(2)}`
+    await Dexie.delete(name)
+    const legacy = new Dexie(name)
+    legacy.version(57).stores({
+      chats:
+        'id, updatedAt, createdAt, lastViewedAt, lastUpdatedLeafId, lastBranchUpdatedAt, wordCount, totalCostUsd, archived, pinned, presetId, folderId, *tags, [archivedKey+id]',
+      attachments:
+        'id, contentHash, kind, mime, origin, refCount, createdAt, updatedAt, deletedAt, [refCount+createdAt], [refCount+createdAt+id]',
+    })
+    await legacy.open()
+    const temporary = {
+      ...buildChat({ id: 'v57-temporary-chat', temporary: true, now: 1 }),
+      archivedKey: 0,
+    }
+    await legacy.table('chats').put(temporary)
+    legacy.close()
+
+    const migrated = createDbForTests(name)
+    await migrated.open()
+
+    expect(migrated.verno).toBe(CURRENT_DB_VERSION)
+    const publicTemporary = await migrated.chats.get(temporary.id)
+    expect(publicTemporary).toMatchObject({ id: temporary.id, temporary: true })
+    expect(publicTemporary).not.toHaveProperty('archivedKey')
+    expect(publicTemporary).not.toHaveProperty('temporaryKey')
+    expect(publicTemporary).not.toHaveProperty('temporaryRetentionAt')
+    expect(
+      await migrated.chats
+        .where('[temporaryKey+temporaryRetentionAt+id]')
+        .equals([1, 1, temporary.id])
+        .primaryKeys(),
+    ).toEqual([temporary.id])
+    expect(await migrated.settings.get(STREAM_JOURNAL_INTEGRITY_SETTING_KEY)).toEqual({
+      key: STREAM_JOURNAL_INTEGRITY_SETTING_KEY,
+      value: { version: 1, phase: 'complete' },
+    })
+    await migrated.delete()
+  })
+
+  it('upgrades the observed v58 temporary cursor to bounded discovery cache storage', async () => {
+    const name = `natter-test-v58-discovery-retention-${Math.random().toString(36).slice(2)}`
+    await Dexie.delete(name)
+    const legacy = new Dexie(name)
+    legacy.version(58).stores({
+      chats:
+        'id, updatedAt, createdAt, lastViewedAt, lastUpdatedLeafId, lastBranchUpdatedAt, wordCount, totalCostUsd, archived, pinned, presetId, folderId, *tags, [archivedKey+id], [temporaryKey+id]',
+      models: '&[profileId+queryKey], profileId, fetchedAt, [profileId+fetchedAt], payloadId',
+      endpoints: '&[profileId+modelId], profileId, fetchedAt, [profileId+fetchedAt], payloadId',
+      privacyPolicies:
+        '&[profileId+modelId], profileId, fetchedAt, [profileId+fetchedAt], payloadId',
+      discoveryPayloads: '&id, byteLength',
+    })
+    await legacy.open()
+    const chat = buildChat({ id: 'v58-chat', temporary: true, now: 1 })
+    await legacy.table('chats').put({ ...chat, archivedKey: 0, temporaryKey: 1 })
+    await legacy.table('discoveryPayloads').put({
+      id: 'old-payload',
+      canonicalJson: JSON.stringify({ data: ['disposable'] }),
+      byteLength: 23,
+    })
+    await legacy.table('models').put({
+      profileId: 'old-profile',
+      queryKey: 'all',
+      fetchedAt: 1,
+      payloadId: 'old-payload',
+      payloadByteLength: 23,
+    })
+    legacy.close()
+
+    const migrated = createDbForTests(name)
+    await migrated.open()
+
+    expect(migrated.verno).toBe(CURRENT_DB_VERSION)
+    expect(await migrated.chats.get(chat.id)).toMatchObject({ id: chat.id, temporary: true })
+    expect(await migrated.models.count()).toBe(0)
+    expect(await migrated.discoveryPayloads.count()).toBe(0)
+    expect(await migrated.discoveryPayloadMetadata.count()).toBe(0)
+    expect(await migrated.discoveryCacheState.get('global')).toMatchObject({
+      valid: true,
+      payloadCount: 0,
+      payloadByteLength: 0,
+    })
+    await migrated.delete()
+  })
+
+  it('adds the structural chat revision in v79 exactly once', async () => {
+    const name = `natter-test-v78-chat-structural-revision-${Math.random().toString(36).slice(2)}`
+    await Dexie.delete(name)
+    const legacy = new Dexie(name)
+    legacy.version(78).stores({ chats: 'id' })
+    await legacy.open()
+    const current = buildChat({ id: 'v78-chat', title: 'Structural revision', now: 1 })
+    const { structuralVersion: _structuralVersion, ...withoutStructuralVersion } = current
+    await legacy.table('chats').put(withoutStructuralVersion)
+    legacy.close()
+
+    const migrated = createDbForTests(name)
+    await migrated.open()
+    expect(migrated.verno).toBe(CURRENT_DB_VERSION)
+    expect((await migrated.chats.get('v78-chat'))?.structuralVersion).toBe(0)
+    await migrated.chats.update('v78-chat', { structuralVersion: 7 })
+    migrated.close()
+
+    const reopened = createDbForTests(name)
+    await reopened.open()
+    expect((await reopened.chats.get('v78-chat'))?.structuralVersion).toBe(7)
+    await reopened.delete()
+  })
+
+  it('moves and deduplicates the legacy text-template setting into canonical v61 rows', async () => {
+    const name = `natter-test-v60-text-template-rows-${Math.random().toString(36).slice(2)}`
+    await Dexie.delete(name)
+    const legacy = new Dexie(name)
+    legacy.version(60).stores({ settings: '&key' })
+    await legacy.open()
+    const original: SavedTextTemplate = {
+      id: 'user:legacy-template',
+      name: 'Legacy template',
+      config: { ...EMPTY_TEXT_TEMPLATE, template: 'older source' },
+      createdAt: 10,
+      updatedAt: 20,
+    }
+    await legacy.table('settings').put({
+      key: LEGACY_SAVED_TEXT_TEMPLATES_KEY,
+      value: [
+        original,
+        {
+          ...original,
+          config: { ...original.config, template: 'newer source' },
+          updatedAt: 30,
+        },
+      ],
+    })
+    legacy.close()
+
+    const migrated = createDbForTests(name)
+    await migrated.open()
+
+    expect(migrated.verno).toBe(CURRENT_DB_VERSION)
+    expect(await migrated.settings.get(LEGACY_SAVED_TEXT_TEMPLATES_KEY)).toBeUndefined()
+    expect(await migrated.textTemplates.toArray()).toEqual([
+      {
+        ...original,
+        config: { ...original.config, template: 'newer source' },
+        updatedAt: 30,
+      },
+    ])
+    expect(await migrated.attachmentIntegrityState.get('workspace')).toEqual(
+      expect.objectContaining({ repairVersion: 1, phase: 'complete' }),
+    )
+    await migrated.delete()
+  })
+
+  it('rolls back canonical template rows and preserves the legacy setting when v61 fails', async () => {
+    const name = `natter-test-v60-text-template-rollback-${Math.random().toString(36).slice(2)}`
+    await Dexie.delete(name)
+    const legacy = new Dexie(name)
+    legacy.version(60).stores({ settings: '&key' })
+    await legacy.open()
+    const template: SavedTextTemplate = {
+      id: 'user:rollback-template',
+      name: 'Rollback template',
+      config: { ...EMPTY_TEXT_TEMPLATE, template: 'must survive' },
+      createdAt: 10,
+      updatedAt: 10,
+    }
+    await legacy.table('settings').put({
+      key: LEGACY_SAVED_TEXT_TEMPLATES_KEY,
+      value: [template],
+    })
+    legacy.close()
+
+    const migrated = createDbForTests(name)
+    const failCreate = () => {
+      throw new Error('injected text-template migration failure')
+    }
+    migrated.textTemplates.hook.creating.subscribe(failCreate)
+    await expect(migrated.open()).rejects.toThrow('injected text-template migration failure')
+    migrated.close()
+
+    const inspector = new Dexie(name)
+    inspector.version(60).stores({ settings: '&key' })
+    await inspector.open()
+    expect(inspector.verno).toBe(60)
+    expect(await inspector.table('settings').get(LEGACY_SAVED_TEXT_TEMPLATES_KEY)).toEqual({
+      key: LEGACY_SAVED_TEXT_TEMPLATES_KEY,
+      value: [template],
+    })
+    expect([...inspector.backendDB().objectStoreNames]).not.toContain('textTemplates')
+    inspector.close()
+
+    migrated.textTemplates.hook.creating.unsubscribe(failCreate)
+    await migrated.open()
+    expect(await migrated.textTemplates.get(template.id)).toEqual(template)
+    expect(await migrated.settings.get(LEGACY_SAVED_TEXT_TEMPLATES_KEY)).toBeUndefined()
+    await migrated.delete()
+  })
+
+  it('drops v54 branch caches and disposable discovery payloads without losing canonical rows', async () => {
+    const name = `natter-test-v55-retired-storage-${Math.random().toString(36).slice(2)}`
+    await Dexie.delete(name)
+    const legacy = new Dexie(name)
+    legacy.version(54).stores({
+      chats: 'id',
+      messages: 'id, chatId',
+      messageBodies: '&id, chatId',
+      chatBranchCache: '&chatId, branchLeafId, generatedAt',
+      attachments: 'id',
+      attachmentBlobs: 'id, attachmentId',
+      attachmentArtifacts: 'artifactId, attachmentId',
+      attachmentJobs: 'id, attachmentId',
+      models: '&[profileId+queryKey], payloadId',
+      endpoints: '&[profileId+modelId], payloadId',
+      privacyPolicies: '&[profileId+modelId], payloadId',
+      discoveryPayloads: '&id, byteLength',
+      streamLeases: '&streamId, &messageId, [chatId+streamId]',
+      streamChunks: '&id, streamId, chatId, [streamId+seq]',
+    })
+    await legacy.open()
+    const chat = {
+      ...buildChat({ id: 'canonical-chat', title: 'Canonical chat', now: 1 }),
+      archived: true,
+    }
+    const message: Message = {
+      id: 'canonical-message',
+      chatId: chat.id,
+      parentId: null,
+      siblingIndex: 0,
+      turnId: 'canonical-turn',
+      turnIndex: 0,
+      createdAt: 1,
+      role: 'user',
+      origin: 'user',
+      content: [{ type: 'text', text: 'canonical' }],
+      nodeVersion: 0,
+      deleted: false,
+    }
+    const storedMessage = splitMessageForStorage(message)
+    await legacy.table('chats').put(chat)
+    await legacy.table('messages').put(storedMessage.header)
+    await legacy.table('messageBodies').put(storedMessage.body)
+    await legacy.table('chatBranchCache').put({
+      chatId: chat.id,
+      branchLeafId: message.id,
+      generatedAt: 1,
+    })
+    await legacy.table('discoveryPayloads').put({
+      id: 'payload-1',
+      byteLength: 10_000_000,
+      payload: 'disposable',
+    })
+    await legacy.table('models').put({
+      profileId: 'profile-1',
+      queryKey: 'all',
+      payloadId: 'payload-1',
+    })
+    await legacy.table('endpoints').put({
+      profileId: 'profile-1',
+      modelId: 'model-1',
+      payloadId: 'payload-1',
+    })
+    await legacy.table('privacyPolicies').put({
+      profileId: 'profile-1',
+      modelId: 'model-1',
+      payloadId: 'payload-1',
+    })
+    legacy.close()
+
+    const migrated = createDbForTests(name)
+    await migrated.open()
+
+    expect(migrated.verno).toBe(CURRENT_DB_VERSION)
+    expect([...migrated.backendDB().objectStoreNames]).not.toContain('chatBranchCache')
+    expect(await migrated.chats.get(chat.id)).toEqual({
+      ...chat,
+      wordCount: 1,
+      lastUpdatedLeafId: message.id,
+      lastBranchUpdatedAt: message.createdAt,
+      previewText: 'canonical',
+    })
+    expect(
+      await migrated.chats.where('[archivedKey+id]').equals([1, chat.id]).primaryKeys(),
+    ).toEqual([chat.id])
+    expect(await migrated.messages.get(message.id)).toMatchObject({
+      ...storedMessage.header,
+      treeLive: 1,
+      treeParentKey: '__root__',
+    })
+    expect(await migrated.messageBodies.get(message.id)).toMatchObject(storedMessage.body)
+    expect(await migrated.discoveryPayloads.count()).toBe(0)
+    expect(await migrated.models.count()).toBe(0)
+    expect(await migrated.endpoints.count()).toBe(0)
+    expect(await migrated.privacyPolicies.count()).toBe(0)
+    await migrated.delete()
+  })
+
+  it('carries the composed v23 message and attachment projections through the full upgrade', async () => {
     const name = `natter-test-projections-v23-${Math.random().toString(36).slice(2)}`
     await Dexie.delete(name)
     const legacy = new Dexie(name)
@@ -152,12 +741,14 @@ describe('Dexie schema', () => {
         apiUsed: 'responses',
         delivery: 'streaming',
         costSource: 'stream',
+        reasoningCarryForward: 'none',
+        reasoningVisibility: { disclosure: 'unknown' },
         startedAt: 1,
         serverTools: [
           {
             type: 'web_search_call',
             source: 'responses-output',
-            output: { text: 'large tool output' },
+            outputIndex: 0,
           },
         ],
       },
@@ -166,11 +757,24 @@ describe('Dexie schema', () => {
       deleted: false,
     }
     const split = splitMessageForStorage(message)
-    const legacyHeader = structuredClone(split.header) as Record<string, unknown>
+    const legacyHeader = structuredClone(split.header) as unknown as Record<string, unknown>
     delete legacyHeader.bodyVersion
     delete legacyHeader.bodyWordCount
     delete legacyHeader.textPreview
-    legacyHeader.generation = structuredClone(message.generation)
+    const legacyGeneration = structuredClone(message.generation) as unknown as Record<
+      string,
+      unknown
+    >
+    const legacyServerTools = legacyGeneration.serverTools as Record<string, unknown>[]
+    const legacyServerTool = legacyServerTools[0]
+    if (!legacyServerTool) throw new Error('ExpectedLegacyServerTool')
+    legacyServerTool.output = {
+      id: 'ws_projection',
+      type: 'web_search_call',
+      status: 'completed',
+      action: { type: 'search', query: 'projection query' },
+    }
+    legacyHeader.generation = legacyGeneration
     const legacyBody = structuredClone(split.body) as unknown as Record<string, unknown>
     legacyBody.nodeVersion = split.body.bodyVersion
     delete legacyBody.bodyVersion
@@ -205,44 +809,73 @@ describe('Dexie schema', () => {
 
     const migrated = createDbForTests(name)
     await migrated.open()
-    expect(migrated.verno).toBe(25)
-    const [header, body, storedAttachment, storedArtifact] = await Promise.all([
+    expect(migrated.verno).toBe(CURRENT_DB_VERSION)
+    expect(await migrated.settings.get('workspace-meta')).toBeUndefined()
+    expect(await migrated.workspaceFence.get('global')).toMatchObject({
+      id: 'global',
+      replacementEpoch: 0,
+    })
+    const [header, body, preview, storedAttachment, storedArtifact] = await Promise.all([
       migrated.messages.get(message.id),
       migrated.messageBodies.get(message.id),
+      migrated.messagePreviews.get(message.id),
       migrated.attachments.get(attachment.id),
       migrated.attachmentArtifacts.get(artifact.artifactId),
     ])
-    expect(header?.textPreview).toHaveLength(4_096)
-    expect(header?.bodyVersion).toBe(message.nodeVersion)
+    expect(header).not.toHaveProperty('textPreview')
+    expect(preview).toMatchObject({
+      id: message.id,
+      chatId: message.chatId,
+    })
+    expect(preview?.text).toHaveLength(MESSAGE_TEXT_PREVIEW_MAX_CHARS)
+    expect(header?.nodeVersion).toBe(message.nodeVersion + 1)
+    expect(header?.bodyVersion).toBe(message.nodeVersion + 1)
     expect(header?.bodyWordCount).toBe(1_000)
-    expect(body?.bodyVersion).toBe(message.nodeVersion)
+    expect(body?.bodyVersion).toBe(header?.bodyVersion)
+    expect(preview?.bodyVersion).toBe(header?.bodyVersion)
     expect(body).not.toHaveProperty('nodeVersion')
     expect(header?.generation?.serverTools?.[0]).not.toHaveProperty('output')
-    expect(body?.generationServerToolOutputs).toEqual([
-      { index: 0, output: { text: 'large tool output' } },
-    ])
-    expect(header && body ? hydrateMessage(header, body) : undefined).toEqual(message)
+    const expectedProviderOutputItems = [
+      {
+        dialect: 'openai-responses' as const,
+        type: 'web_search_call',
+        outputIndex: 0,
+        item: {
+          id: 'ws_projection',
+          type: 'web_search_call',
+          status: 'completed',
+          action: { type: 'search', query: 'projection query' },
+        },
+      },
+    ]
+    expect(body).not.toHaveProperty('generationServerToolOutputs')
+    expect(body?.providerOutputItems).toEqual(expectedProviderOutputItems)
+    const expectedHydratedMessage = structuredClone(message)
+    expectedHydratedMessage.nodeVersion = message.nodeVersion + 1
+    expectedHydratedMessage.providerOutputItems = expectedProviderOutputItems
+    expect(header && body ? hydrateMessage(header, body) : undefined).toMatchObject(
+      expectedHydratedMessage,
+    )
     expect(storedAttachment).not.toHaveProperty('artifacts')
     expect(storedAttachment).toHaveProperty('artifactIds', [artifact.artifactId])
+    expect(storedAttachment).toHaveProperty('unreferencedAt', expect.any(Number))
     expect(storedArtifact).toEqual(artifact)
     expect(
-      storedAttachment
-        ? hydrateAttachment(attachmentHeaderFromStoredRow(storedAttachment), [storedArtifact])
-        : undefined,
+      storedAttachment ? hydrateAttachment(storedAttachment, [storedArtifact]) : undefined,
     ).toEqual(attachment)
     migrated.close()
 
     const reopened = createDbForTests(name)
     await reopened.open()
-    expect(reopened.verno).toBe(25)
-    expect(
-      (await reopened.messageBodies.get(message.id))?.generationServerToolOutputs,
-    ).toHaveLength(1)
+    expect(reopened.verno).toBe(CURRENT_DB_VERSION)
+    expect((await reopened.messageBodies.get(message.id))?.providerOutputItems).toEqual(
+      expectedProviderOutputItems,
+    )
     expect(await reopened.attachmentArtifacts.count()).toBe(1)
     await reopened.delete()
   })
 
-  it('adds a request-context revision without reading or rewriting cold bodies', async () => {
+  it('carries the v25 request-context revision and cold body through the full upgrade', async () => {
     const name = `natter-test-request-context-v25-${Math.random().toString(36).slice(2)}`
     await Dexie.delete(name)
     const legacy = new Dexie(name)
@@ -267,15 +900,16 @@ describe('Dexie schema', () => {
       deleted: false,
     }
     const split = splitMessageForStorage(message, { bodyVersion: 3 })
-    const legacyHeader = structuredClone(split.header) as Record<string, unknown>
+    const legacyHeader = structuredClone(split.header) as unknown as Record<string, unknown>
     delete legacyHeader.requestContextVersion
+    legacyHeader.textPreview = 'unchanged cold body'
     await legacy.table('messages').put(legacyHeader)
     await legacy.table('messageBodies').put(split.body)
     legacy.close()
 
     const migrated = createDbForTests(name)
     await migrated.open()
-    expect(migrated.verno).toBe(25)
+    expect(migrated.verno).toBe(CURRENT_DB_VERSION)
     expect(await migrated.messages.get(message.id)).toMatchObject({
       nodeVersion: 7,
       bodyVersion: 3,
@@ -289,6 +923,25 @@ describe('Dexie schema', () => {
     expect((await reopened.messages.get(message.id))?.requestContextVersion).toBe(0)
     expect(await reopened.messageBodies.get(message.id)).toEqual(split.body)
     await reopened.delete()
+  })
+
+  it('seeds missing legacy workspace metadata before the v26 lease migration requires it', async () => {
+    const name = `natter-test-workspace-meta-missing-v25-${Math.random().toString(36).slice(2)}`
+    await Dexie.delete(name)
+    const legacy = new Dexie(name)
+    legacy.version(25).stores({ settings: '&key' })
+    await legacy.open()
+    expect(await legacy.table('settings').get('workspace-meta')).toBeUndefined()
+    legacy.close()
+
+    const migrated = createDbForTests(name)
+    await migrated.open()
+    const value = await migrated.workspaceFence.get('global')
+    expect(migrated.verno).toBe(CURRENT_DB_VERSION)
+    expect(value).toMatchObject({ id: 'global', replacementEpoch: 0 })
+    expect(value?.workspaceId).toMatch(/^browser-idb:[0-9A-HJKMNP-TV-Z]{26}$/)
+    expect(await migrated.settings.get('workspace-meta')).toBeUndefined()
+    await migrated.delete()
   })
 
   it('cursor-pages large tables in deterministic bounded batches', async () => {
@@ -342,7 +995,7 @@ describe('Dexie schema', () => {
 
     const migrated = createDbForTests(name)
     await migrated.open()
-    expect(migrated.verno).toBe(25)
+    expect(migrated.verno).toBe(CURRENT_DB_VERSION)
     const seeded = await migrated.browserLocks.get(BROWSER_WRITER_LOCK_NAME)
     expect(seeded?.fencingToken).toBe(0)
     await migrated.browserLocks.put({
@@ -385,6 +1038,7 @@ describe('Dexie schema', () => {
       totalCostUsd: 0,
       metaVersion: 0,
       summaryVersion: 0,
+      structuralVersion: 0,
       settings: cloneDefaultChatSettings(),
       lastUpdatedLeafId: 'preview-v22-message',
       lastBranchUpdatedAt: 1,
@@ -422,13 +1076,16 @@ describe('Dexie schema', () => {
         id: chat.id,
         title: chat.title,
         previewText: 'migrated preview',
-        projectionVersion: 1,
+        projectionVersion: CHAT_SIDEBAR_PROJECTION_ROW_VERSION,
       }),
     )
     expect((await migrated.settings.get('backfill:chat-preview-projection-v1'))?.value).toBe(1)
+    expect((await migrated.settings.get(CHAT_SIDEBAR_PROJECTION_BACKFILL_KEY))?.value).toBe(
+      CHAT_SIDEBAR_PROJECTION_MARKER_VERSION,
+    )
     expect((await migrated.settings.get('backfill:chat-sidebar-projection-v1'))?.value).toBe(1)
-    expect((await migrated.settings.get('projection:chat-sidebar-v1'))?.value).toEqual({
-      projectionVersion: 1,
+    expect((await migrated.settings.get('projection:chat-sidebar-v1'))?.value).toMatchObject({
+      projectionVersion: 3,
       expectedCount: 1,
     })
     migrated.close()
@@ -448,7 +1105,235 @@ describe('Dexie schema', () => {
     expect(a.isOpen()).toBe(true)
   })
 
-  it('repairs stale chat previews once and marks the repair complete', async () => {
+  it('gives one concurrent connection ownership of a run-once backfill transaction', async () => {
+    const name = `natter-test-run-once-owner-${Math.random().toString(36).slice(2)}`
+    const first = await freshDb(name)
+    await first.open()
+    const second = createDbForTests(name)
+    await second.open()
+    const marker = { key: 'backfill:test-concurrent-owner-v1', value: 1 }
+    let owners = 0
+    const run = (db: NatterDb) =>
+      runOnceBackfill(db, {
+        marker,
+        tables: [],
+        run: async (tx) => {
+          owners += 1
+          await tx.table('settings').put({ key: 'test:concurrent-owner-result', value: 'complete' })
+        },
+      })
+
+    const results = await Promise.all([run(first), run(second)])
+
+    expect(results.filter(Boolean)).toHaveLength(1)
+    expect(owners).toBe(1)
+    expect(await first.settings.get(marker.key)).toEqual(marker)
+    expect((await second.settings.get('test:concurrent-owner-result'))?.value).toBe('complete')
+    second.close()
+    await first.delete()
+  })
+
+  it('keeps every current-schema backfill complete across concurrent connections', async () => {
+    const name = `natter-test-concurrent-current-backfills-${Math.random().toString(36).slice(2)}`
+    const first = await freshDb(name)
+    await first.open()
+    const second = createDbForTests(name)
+    await second.open()
+
+    const legacySettings = structuredClone(cloneDefaultChatSettings()) as unknown as Record<
+      string,
+      unknown
+    >
+    delete legacySettings.tools
+    delete legacySettings.toolCallContext
+    legacySettings.enabledServerToolIds = ['web']
+    const chat = {
+      ...buildChat({ id: 'concurrent-backfill-chat', title: 'Legacy', now: 1 }),
+      settings: legacySettings,
+      tokenCalibration: {
+        'anthropic:anthropic:claude-fable-5': {
+          totalTextChars: 300,
+          totalTextTokens: 100,
+          sampleCount: 1,
+          lastRatio: 3,
+          updatedAt: 10,
+        },
+      },
+    } as unknown as Record<string, unknown>
+    delete chat.folderId
+    delete chat.tags
+    delete chat.titleStatus
+    delete chat.lastViewedAt
+    delete chat.lastUpdatedLeafId
+    delete chat.lastBranchUpdatedAt
+    delete chat.previewText
+    await first.table<Record<string, unknown>>('chats').put(chat)
+    await first.presets.put({
+      id: 'concurrent-backfill-preset',
+      name: 'Legacy preset',
+      connectionProfileId: 'profile',
+      settings: structuredClone(legacySettings) as unknown as Chat['settings'],
+      createdAt: 1,
+      updatedAt: 1,
+    })
+
+    const user = splitMessageForStorage({
+      id: 'concurrent-backfill-user',
+      chatId: 'concurrent-backfill-chat',
+      parentId: null,
+      siblingIndex: 0,
+      turnId: 'concurrent-backfill-turn',
+      turnIndex: 0,
+      createdAt: 1,
+      role: 'user',
+      origin: 'user',
+      content: [{ type: 'text', text: 'legacy preview' }],
+      nodeVersion: 0,
+      deleted: false,
+    })
+    await first.table<Record<string, unknown>>('messages').put({
+      ...user.header,
+      ...user.body,
+    })
+    const assistant = splitMessageForStorage({
+      id: 'concurrent-backfill-assistant',
+      chatId: 'concurrent-backfill-chat',
+      parentId: 'concurrent-backfill-user',
+      siblingIndex: 0,
+      turnId: 'concurrent-backfill-turn',
+      turnIndex: 1,
+      createdAt: 2,
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_text', text: 'done' }],
+      generation: {
+        id: 'concurrent-backfill-generation',
+        model: 'openai/gpt-5.6-luna',
+        requestedModel: 'openai/gpt-5.6-luna',
+        apiUsed: 'responses',
+        delivery: 'streaming',
+        costSource: 'stream',
+        reasoningCarryForward: 'none',
+        reasoningVisibility: { disclosure: 'unknown' },
+        cost: 0.25,
+        startedAt: 1,
+        finishedAt: 2,
+        serverTools: [
+          {
+            type: 'code_interpreter_call',
+            source: 'responses-output',
+            id: 'ci_concurrent',
+            status: 'completed',
+            outputIndex: 0,
+          },
+        ],
+      },
+      nodeVersion: 0,
+      deleted: false,
+    })
+    delete assistant.body.providerOutputItems
+    const legacyAssistantHeader = structuredClone(assistant.header) as unknown as Record<
+      string,
+      unknown
+    >
+    const legacyAssistantGeneration = legacyAssistantHeader.generation as Record<string, unknown>
+    const legacyAssistantServerTools = legacyAssistantGeneration.serverTools as Record<
+      string,
+      unknown
+    >[]
+    const legacyAssistantServerTool = legacyAssistantServerTools[0]
+    if (!legacyAssistantServerTool) throw new Error('ExpectedLegacyAssistantServerTool')
+    legacyAssistantServerTool.output = {
+      id: 'ci_concurrent',
+      type: 'code_interpreter_call',
+      status: 'completed',
+      code: '1 + 1',
+      outputs: [{ type: 'logs', logs: '2' }],
+    }
+    await first.table<Record<string, unknown>>('messages').put(legacyAssistantHeader)
+    await first.messageBodies.put(assistant.body)
+    await first.settings.bulkPut([
+      { key: 'global:auto-scroll', value: true },
+      { key: 'sidebar:sort-key', value: 'updated-desc' },
+    ])
+    await first.settings.bulkDelete([
+      'backfill:message-body-split-v1',
+      'backfill:chat-preview-projection-v1',
+      'backfill:organization-fields-v1',
+      'backfill:global-settings-v1',
+      'backfill:provider-output-items-v1',
+      'backfill:provider-tool-settings-v2',
+      'backfill:token-calibration-global-v1',
+      'backfill:token-calibration-canonicalize-v1',
+    ])
+
+    await Promise.all([
+      runAuditedCurrentSchemaBackfills(first),
+      runAuditedCurrentSchemaBackfills(second),
+    ])
+
+    const canonicalCalibrationKey = tokenCalibrationKey('anthropic/claude-fable-5')
+    const storedChat = await first.chats.get('concurrent-backfill-chat')
+    expect(storedChat).toMatchObject({
+      folderId: null,
+      tags: [],
+      titleStatus: 'auto',
+      lastViewedAt: 1,
+      lastUpdatedLeafId: 'concurrent-backfill-assistant',
+      lastBranchUpdatedAt: 0,
+      previewText: 'legacy preview',
+      wordCount: 3,
+      totalCostUsd: 0.25,
+    })
+    expect(storedChat?.settings.tools.openrouter.enabledServerToolIds).toEqual(['web'])
+    expect(storedChat?.tokenCalibration?.[canonicalCalibrationKey]?.sampleCount).toBe(1)
+    expect(
+      (await second.presets.get('concurrent-backfill-preset'))?.settings.tools.openrouter
+        .enabledServerToolIds,
+    ).toEqual(['web'])
+    expect(await first.messageBodies.get('concurrent-backfill-user')).toMatchObject({
+      content: [{ type: 'text', text: 'legacy preview' }],
+    })
+    expect(
+      await first.table<Record<string, unknown>>('messages').get('concurrent-backfill-user'),
+    ).not.toHaveProperty('content')
+    expect(
+      (await second.messageBodies.get('concurrent-backfill-assistant'))?.providerOutputItems,
+    ).toHaveLength(1)
+    expect((await first.settings.get('global:auto-scroll-stream'))?.value).toBe(true)
+    expect(await first.settings.get('global:auto-scroll')).toBeUndefined()
+    expect((await first.settings.get('sidebar:sort-key'))?.value).toBe('updatedAt-desc')
+    const globalCalibration = (await first.settings.get('global:token-calibration'))
+      ?.value as GlobalTokenCalibration
+    expect(globalCalibration.byModel[canonicalCalibrationKey]).toMatchObject({ sampleCount: 1 })
+    expect(await first.chatSidebarRows.get('concurrent-backfill-chat')).toMatchObject({
+      previewText: 'legacy preview',
+      projectionVersion: CHAT_SIDEBAR_PROJECTION_ROW_VERSION,
+    })
+    expect(await first.chatSidebarAggregates.get('workspace')).toMatchObject({ totalCount: 1 })
+    const markerKeys = [
+      'backfill:message-body-split-v1',
+      'backfill:chat-preview-projection-v1',
+      'backfill:organization-fields-v1',
+      'backfill:global-settings-v1',
+      'backfill:provider-output-items-v1',
+      'backfill:provider-tool-settings-v2',
+      'backfill:token-calibration-global-v1',
+      'backfill:token-calibration-canonicalize-v1',
+    ]
+    const providerOutputMarker = providerOutputItemsBackfillMarker()
+    expect((await first.settings.bulkGet(markerKeys)).map((row) => row?.value)).toEqual(
+      markerKeys.map((key) => (key === providerOutputMarker.key ? providerOutputMarker.value : 1)),
+    )
+    expect((await first.settings.get(CHAT_SIDEBAR_PROJECTION_BACKFILL_KEY))?.value).toBe(
+      CHAT_SIDEBAR_PROJECTION_MARKER_VERSION,
+    )
+
+    second.close()
+    await first.delete()
+  })
+
+  it('does not rerun preview compatibility work after the current schema is open', async () => {
     let db = await openDb()
     const chat: Chat = {
       id: 'preview-backfill-chat',
@@ -461,6 +1346,7 @@ describe('Dexie schema', () => {
       totalCostUsd: 0,
       metaVersion: 0,
       summaryVersion: 0,
+      structuralVersion: 0,
       settings: cloneDefaultChatSettings(),
       lastUpdatedLeafId: 'preview-backfill-message',
       lastBranchUpdatedAt: 1,
@@ -485,29 +1371,45 @@ describe('Dexie schema', () => {
       deleted: false,
     }
     const split = splitMessageForStorage(message)
-    await db.transaction('rw', db.chats, db.chatSidebarRows, db.settings, async (tx) => {
-      await db.chats.put(chat)
-      await putChatSidebarProjection(tx, chat, true)
-    })
+    await db.transaction(
+      'rw',
+      [db.chats, db.chatSidebarAggregates, db.chatSidebarRows, db.settings],
+      async () => {
+        await db.chats.put(chat)
+        await db.chatSidebarRows.put(chatSidebarProjectionRow(chat))
+        await db.chatSidebarAggregates.put({
+          ...emptyChatSidebarAggregateRow(),
+          totalCount: 1,
+          activeCount: 1,
+          visibleCount: 1,
+          rootCount: 1,
+          rootVisibleCount: 1,
+        })
+      },
+    )
     await db.messages.put(split.header)
     await db.messageBodies.put(split.body)
     await db.settings.delete('backfill:chat-preview-projection-v1')
-    expect((await db.settings.get('projection:chat-sidebar-v1'))?.value).toEqual({
-      projectionVersion: 1,
-      expectedCount: 1,
-    })
+    await db.settings.delete('backfill:current-schema-manifest-v1')
+    expect((await db.settings.get(CHAT_SIDEBAR_PROJECTION_BACKFILL_KEY))?.value).toBe(
+      CHAT_SIDEBAR_PROJECTION_MARKER_VERSION,
+    )
     expect((await db.chatSidebarRows.get(chat.id))?.previewText).toBe('stale')
 
-    __resetDbForTests()
+    __resetDbForTests({ admissionsOpen: true })
     db = await openDb()
-    expect((await db.chats.get(chat.id))?.previewText).toBe('repaired preview')
-    expect((await db.chatSidebarRows.get(chat.id))?.previewText).toBe('repaired preview')
-    expect((await db.settings.get('backfill:chat-preview-projection-v1'))?.value).toBe(1)
+    expect((await db.chats.get(chat.id))?.previewText).toBe('stale')
+    expect((await db.chatSidebarRows.get(chat.id))?.previewText).toBe('stale')
+    expect(await db.settings.get('backfill:chat-preview-projection-v1')).toBeUndefined()
 
-    await db.chats.update(chat.id, { previewText: 'marker prevents repeat scans' })
-    __resetDbForTests()
+    await db.chats.update(chat.id, { previewText: 'current manifest prevents repeat scans' })
+    await db.settings.delete('backfill:chat-preview-projection-v1')
+    __resetDbForTests({ admissionsOpen: true })
     db = await openDb()
-    expect((await db.chats.get(chat.id))?.previewText).toBe('marker prevents repeat scans')
+    expect((await db.chats.get(chat.id))?.previewText).toBe(
+      'current manifest prevents repeat scans',
+    )
+    expect(await db.settings.get('backfill:chat-preview-projection-v1')).toBeUndefined()
   })
 
   it('reopens a previously-written DB and reads existing rows', async () => {
@@ -539,6 +1441,48 @@ interface MinimalProfile {
 interface MinimalSetting {
   key: string
   value: unknown
+}
+
+interface LegacyStreamLeaseV20 {
+  streamId: string
+  chatId: string
+  messageId: string
+  ownerClientId: string
+  startedAt: number
+  heartbeatAt: number
+  attemptKind?: 'generation' | 'continuation'
+  requestedModel?: string
+  apiUsed?: 'responses'
+}
+
+interface LegacyAttachmentV21 {
+  id: string
+  kind: 'other'
+  mime: 'application/octet-stream'
+  filename: string
+  origin: 'import'
+  createdAt: number
+  updatedAt: number
+  storage: { kind: 'missing'; reason: 'import-missing'; missingSince: number }
+  artifacts: []
+  processing: []
+  refCount: number
+}
+
+function legacyAttachmentV21(id: string, refCount: number): LegacyAttachmentV21 {
+  return {
+    id,
+    kind: 'other',
+    mime: 'application/octet-stream',
+    filename: `${id}.bin`,
+    origin: 'import',
+    createdAt: 1,
+    updatedAt: 1,
+    storage: { kind: 'missing', reason: 'import-missing', missingSince: 1 },
+    artifacts: [],
+    processing: [],
+    refCount,
+  }
 }
 
 const SYNTHETIC_PROFILE_BACKFILL_VERSION = 1000
@@ -632,6 +1576,8 @@ function registerLegacyChatSettingsV14(db: Dexie): void {
 
 function registerLegacyStreamLeasesV20(db: Dexie): void {
   db.version(20).stores({
+    chats:
+      'id, updatedAt, createdAt, lastViewedAt, lastUpdatedLeafId, lastBranchUpdatedAt, wordCount, totalCostUsd, archived, pinned, presetId, folderId, *tags',
     settings: '&key',
     messages:
       'id, chatId, parentId, turnId, [chatId+parentId], [chatId+createdAt], [chatId+turnId], [chatId+deleted]',
@@ -639,6 +1585,148 @@ function registerLegacyStreamLeasesV20(db: Dexie): void {
     streamLeases: '&streamId, chatId, ownerClientId, heartbeatAt',
     streamChunks: '&id, streamId, chatId, messageId, [streamId+seq], createdAt',
   })
+}
+
+function registerLegacyStreamLeaseLifecycleV66(db: Dexie): void {
+  db.version(66).stores({
+    chats: 'id',
+    messages: 'id, chatId',
+    streamLeases: '&streamId, &messageId, [chatId+streamId], [canonicalAt+streamId]',
+    streamChunks: '&id, streamId, chatId, [streamId+seq]',
+  })
+}
+
+function registerStreamLeaseLifecycleV67(db: Dexie): void {
+  registerLegacyStreamLeaseLifecycleV66(db)
+  db.version(67)
+    .stores({
+      streamLeases: '&streamId, &messageId, [chatId+streamId], [canonicalAt+streamId]',
+    })
+    .upgrade(migrateStreamLeaseLifecycleState)
+}
+
+function legacyLeaseChat(id: string): Chat {
+  return {
+    id,
+    title: 'Legacy lease chat',
+    titleStatus: 'manual',
+    createdAt: 1,
+    updatedAt: 1,
+    lastViewedAt: 1,
+    wordCount: 0,
+    totalCostUsd: 0,
+    metaVersion: 0,
+    summaryVersion: 0,
+    structuralVersion: 0,
+    settings: { ...cloneDefaultChatSettings(), profileId: 'legacy-profile' },
+    lastUpdatedLeafId: null,
+    lastBranchUpdatedAt: 0,
+    archived: false,
+    pinned: false,
+    folderId: null,
+    tags: [],
+  }
+}
+
+function legacyAssistantHeaderV20(
+  id: string,
+  nodeVersion: number,
+  siblingIndex: number,
+  generation?: Record<string, unknown>,
+): Record<string, unknown> {
+  return {
+    id,
+    chatId: 'chat-1',
+    parentId: null,
+    siblingIndex,
+    turnId: `turn-${id}`,
+    turnIndex: siblingIndex,
+    createdAt: siblingIndex + 1,
+    role: 'assistant',
+    origin: 'generated',
+    nodeVersion,
+    deleted: false,
+    ...(generation
+      ? {
+          generation: {
+            model: 'legacy-model',
+            requestedModel: 'legacy-model',
+            ...generation,
+          },
+        }
+      : {}),
+  }
+}
+
+function legacyLeaseLifecycleHeader(
+  id: string,
+  options: {
+    chatId?: string
+    role?: string
+    deleted?: boolean
+    finished?: boolean
+    nodeVersion?: number
+    bodyVersion?: number
+  } = {},
+): Record<string, unknown> {
+  const nodeVersion = options.nodeVersion ?? 3
+  const bodyVersion = options.bodyVersion ?? 4
+  return {
+    ...legacyAssistantHeaderV20(
+      id,
+      nodeVersion,
+      nodeVersion,
+      options.finished ? { startedAt: 1, finishedAt: 2 } : { startedAt: 1 },
+    ),
+    chatId: options.chatId ?? 'chat-1',
+    role: options.role ?? 'assistant',
+    deleted: options.deleted ?? false,
+    bodyVersion,
+  }
+}
+
+function legacyLeaseLifecycleRow(
+  streamId: unknown,
+  messageId: unknown,
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    streamId,
+    chatId: 'chat-1',
+    messageId,
+    ownerClientId: `writer:${String(streamId)}`,
+    fenceToken: `fence:${String(streamId)}`,
+    replacementEpoch: 2,
+    startedAt: 10,
+    heartbeatAt: 11,
+    admissionSequence: 12,
+    revision: 13,
+    attemptKind: 'generation',
+    postCommit: { usedAt: 14, profileId: 'legacy-profile' },
+    ...overrides,
+  }
+}
+
+function legacyLeaseLifecycleChunk(
+  streamId: unknown,
+  messageId: unknown,
+  suffix = '0',
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    id: `${String(streamId)}:${suffix}`,
+    streamId,
+    chatId: 'chat-1',
+    messageId,
+    seq: Number(suffix),
+    createdAt: 15,
+    event: { lane: 'text', text: String(streamId) },
+    ownerClientId: `writer:${String(streamId)}`,
+    fenceToken: `fence:${String(streamId)}`,
+    replacementEpoch: 2,
+    admissionSequence: 12,
+    ...overrides,
+  }
 }
 
 function registerLegacyAttemptOutcomesV21(db: Dexie): void {
@@ -680,6 +1768,39 @@ function canonicalAttachmentRef(
   }
 }
 
+function legacyAttachmentMessageRows(
+  id: string,
+  chatId: string,
+  createdAt: number,
+  attachmentRefs: unknown,
+  deleted = false,
+): Readonly<{
+  header: Record<string, unknown>
+  body: Record<string, unknown>
+}> {
+  const stored = splitMessageForStorage({
+    id,
+    chatId,
+    parentId: null,
+    siblingIndex: 0,
+    turnId: `turn-${id}`,
+    turnIndex: 0,
+    createdAt,
+    role: 'user',
+    origin: 'user',
+    content: [],
+    nodeVersion: 0,
+    deleted,
+  })
+  return {
+    header: {
+      ...stored.header,
+      attachmentRefs: structuredClone(attachmentRefs),
+    },
+    body: stored.body as unknown as Record<string, unknown>,
+  }
+}
+
 function findAttachmentReferenceEdgeMigrationError(
   input: unknown,
 ): AttachmentReferenceEdgeMigrationError | undefined {
@@ -695,6 +1816,317 @@ function findAttachmentReferenceEdgeMigrationError(
 }
 
 describe('Dexie migrations', () => {
+  it('upgrades every valid v66 stream lease lifecycle phase exactly once in v67', async () => {
+    const name = `natter-test-stream-lifecycle-v67-${Math.random().toString(36).slice(2)}`
+    await Dexie.delete(name)
+    const legacy = new Dexie(name)
+    registerLegacyStreamLeaseLifecycleV66(legacy)
+    await legacy.open()
+    await legacy.table<Chat>('chats').put(legacyLeaseChat('chat-1'))
+    await legacy
+      .table<Record<string, unknown>>('messages')
+      .bulkPut([
+        legacyLeaseLifecycleHeader('message-reserved', { nodeVersion: 1, bodyVersion: 2 }),
+        legacyLeaseLifecycleHeader('message-active', { nodeVersion: 5, bodyVersion: 6 }),
+        legacyLeaseLifecycleHeader('message-canonical', { nodeVersion: 7, bodyVersion: 8 }),
+        legacyLeaseLifecycleHeader('message-metadata', { nodeVersion: 9, bodyVersion: 10 }),
+      ])
+    const legacyRows = [
+      legacyLeaseLifecycleRow('reserved-stream', 'message-reserved'),
+      legacyLeaseLifecycleRow('active-stream', 'message-active', {
+        ownerClientId: 'recovery:active-stream',
+        attemptKind: 'continuation',
+        targetCommittedAt: 20,
+        requestedModel: 'legacy/active',
+        apiUsed: 'responses',
+        continuationStrategy: 'prefill',
+        baseNodeVersion: 5,
+        baseBodyVersion: 6,
+      }),
+      legacyLeaseLifecycleRow('canonical-stream', 'message-canonical', {
+        canonicalAt: 30,
+      }),
+      legacyLeaseLifecycleRow('metadata-stream', 'message-metadata', {
+        ownerClientId: 'recovery:metadata-stream',
+        targetCommittedAt: 21,
+        requestedModel: 'legacy/metadata',
+        apiUsed: 'anthropic-messages',
+        canonicalAt: 31,
+        metadataCommittedAt: 32,
+        journalStorageBytes: 400,
+        journalMaxSeq: 0,
+        postCommit: {
+          usedAt: 14,
+          profileId: 'legacy-profile',
+          selectedKeyId: 'legacy-key',
+          final: {
+            selectedKeyId: 'legacy-key',
+            usage: { promptTokens: 3, completionTokens: 4 },
+            completionAllowed: true,
+            expectedNodeVersion: 9,
+            expectedBodyVersion: 10,
+          },
+        },
+      }),
+    ]
+    const retainedChunk = legacyLeaseLifecycleChunk('metadata-stream', 'message-metadata', '0', {
+      ownerClientId: 'recovery:metadata-stream',
+    })
+    await legacy.table<Record<string, unknown>>('streamLeases').bulkPut(legacyRows)
+    await legacy.table<Record<string, unknown>>('streamChunks').put(retainedChunk)
+    legacy.close()
+
+    const migrated = new Dexie(name)
+    registerStreamLeaseLifecycleV67(migrated)
+    await migrated.open()
+    const rows = await migrated
+      .table<StreamLeaseRow, string>('streamLeases')
+      .bulkGet(['reserved-stream', 'active-stream', 'canonical-stream', 'metadata-stream'])
+    expect(rows).toEqual([
+      {
+        streamId: 'reserved-stream',
+        chatId: 'chat-1',
+        messageId: 'message-reserved',
+        custody: 'writer',
+        ownerClientId: 'writer:reserved-stream',
+        fenceToken: 'fence:reserved-stream',
+        replacementEpoch: 2,
+        startedAt: 10,
+        heartbeatAt: 11,
+        admissionSequence: 12,
+        revision: 13,
+        attemptKind: 'generation',
+        phase: 'reserved',
+        targetOwnerKey: 'message-reserved',
+        postCommit: { usedAt: 14, profileId: 'legacy-profile' },
+      },
+      {
+        streamId: 'active-stream',
+        chatId: 'chat-1',
+        messageId: 'message-active',
+        custody: 'recovery',
+        ownerClientId: 'recovery:active-stream',
+        fenceToken: 'fence:active-stream',
+        replacementEpoch: 2,
+        startedAt: 10,
+        heartbeatAt: 11,
+        admissionSequence: 12,
+        revision: 13,
+        attemptKind: 'continuation',
+        phase: 'active',
+        targetOwnerKey: 'message-active',
+        dispatch: {
+          targetCommittedAt: 20,
+          requestedModel: 'legacy/active',
+          apiUsed: 'responses',
+          continuationStrategy: 'prefill',
+          baseNodeVersion: 5,
+          baseBodyVersion: 6,
+        },
+        postCommit: { usedAt: 14, profileId: 'legacy-profile' },
+      },
+      {
+        streamId: 'canonical-stream',
+        chatId: 'chat-1',
+        messageId: 'message-canonical',
+        custody: 'writer',
+        ownerClientId: 'writer:canonical-stream',
+        fenceToken: 'fence:canonical-stream',
+        replacementEpoch: 2,
+        startedAt: 10,
+        heartbeatAt: 11,
+        admissionSequence: 12,
+        revision: 13,
+        attemptKind: 'generation',
+        phase: 'canonical',
+        targetOwnerKey: 'message-canonical',
+        dispatch: null,
+        canonicalAt: 30,
+        postCommit: {
+          usedAt: 14,
+          profileId: 'legacy-profile',
+          final: {
+            completionAllowed: false,
+            expectedNodeVersion: 7,
+            expectedBodyVersion: 8,
+          },
+        },
+      },
+      {
+        streamId: 'metadata-stream',
+        chatId: 'chat-1',
+        messageId: 'message-metadata',
+        custody: 'recovery',
+        ownerClientId: 'recovery:metadata-stream',
+        fenceToken: 'fence:metadata-stream',
+        replacementEpoch: 2,
+        startedAt: 10,
+        heartbeatAt: 11,
+        admissionSequence: 12,
+        revision: 13,
+        journalStorageBytes: 400,
+        journalMaxSeq: 0,
+        attemptKind: 'generation',
+        phase: 'metadata-committed',
+        dispatch: {
+          targetCommittedAt: 21,
+          requestedModel: 'legacy/metadata',
+          apiUsed: 'anthropic-messages',
+        },
+        canonicalAt: 31,
+        metadataCommittedAt: 32,
+        terminalRetentionAt: 31,
+        postCommit: {
+          usedAt: 14,
+          profileId: 'legacy-profile',
+          selectedKeyId: 'legacy-key',
+          final: {
+            selectedKeyId: 'legacy-key',
+            usage: { promptTokens: 3, completionTokens: 4 },
+            completionAllowed: true,
+            expectedNodeVersion: 9,
+            expectedBodyVersion: 10,
+          },
+        },
+      },
+    ])
+    for (const row of rows) {
+      expect(row).not.toHaveProperty('targetCommittedAt')
+      expect(row).not.toHaveProperty('requestedModel')
+      expect(row).not.toHaveProperty('apiUsed')
+      expect(row).not.toHaveProperty('continuationStrategy')
+      expect(row).not.toHaveProperty('baseNodeVersion')
+      expect(row).not.toHaveProperty('baseBodyVersion')
+    }
+    expect(await migrated.table('streamChunks').get('metadata-stream:0')).toEqual(retainedChunk)
+
+    const firstRow = rows[0]
+    if (!firstRow) throw new Error('expected migrated stream lease')
+    const changed = { ...firstRow, revision: firstRow.revision + 1 }
+    await migrated.table<StreamLeaseRow, string>('streamLeases').put(changed)
+    migrated.close()
+    const reopened = new Dexie(name)
+    registerStreamLeaseLifecycleV67(reopened)
+    await reopened.open()
+    expect(await reopened.table('streamLeases').get('reserved-stream')).toEqual(changed)
+    await reopened.delete()
+  })
+
+  it('retires malformed v66 stream lifecycle rows and their chunks without disturbing valid rows', async () => {
+    const name = `natter-test-stream-lifecycle-invalid-v67-${Math.random().toString(36).slice(2)}`
+    await Dexie.delete(name)
+    const legacy = new Dexie(name)
+    registerLegacyStreamLeaseLifecycleV66(legacy)
+    await legacy.open()
+    await legacy.table<Chat>('chats').put(legacyLeaseChat('chat-1'))
+    await legacy
+      .table<Record<string, unknown>>('messages')
+      .bulkPut([
+        legacyLeaseLifecycleHeader('message-control'),
+        legacyLeaseLifecycleHeader('message-numeric-chat'),
+        legacyLeaseLifecycleHeader('message-user', { role: 'user' }),
+        legacyLeaseLifecycleHeader('message-deleted', { deleted: true }),
+        legacyLeaseLifecycleHeader('message-wrong-chat', { chatId: 'chat-2' }),
+        legacyLeaseLifecycleHeader('message-ambiguous-continuation'),
+        legacyLeaseLifecycleHeader('message-metadata-without-canonical'),
+        legacyLeaseLifecycleHeader('message-final-without-canonical'),
+        legacyLeaseLifecycleHeader('message-missing-post-commit'),
+        legacyLeaseLifecycleHeader('message-finished-generation', { finished: true }),
+        legacyLeaseLifecycleHeader('message-invalid-target-time'),
+        legacyLeaseLifecycleHeader('message-invalid-canonical-time'),
+        legacyLeaseLifecycleHeader('message-invalid-metadata-time'),
+        legacyLeaseLifecycleHeader('message-invalid-journal-bytes'),
+        legacyLeaseLifecycleHeader('message-invalid-journal-seq'),
+      ])
+    const missingPostCommit = legacyLeaseLifecycleRow(
+      'missing-post-commit',
+      'message-missing-post-commit',
+    )
+    delete missingPostCommit.postCommit
+    const invalidRows: Record<string, unknown>[] = [
+      legacyLeaseLifecycleRow(42, 99),
+      legacyLeaseLifecycleRow('numeric-chat', 'message-numeric-chat', { chatId: 42 }),
+      legacyLeaseLifecycleRow('user-target', 'message-user'),
+      legacyLeaseLifecycleRow('deleted-target', 'message-deleted'),
+      legacyLeaseLifecycleRow('wrong-chat-target', 'message-wrong-chat'),
+      legacyLeaseLifecycleRow('ambiguous-continuation', 'message-ambiguous-continuation', {
+        attemptKind: 'continuation',
+        targetCommittedAt: 20,
+        requestedModel: 'legacy/ambiguous',
+        apiUsed: 'chat',
+        continuationStrategy: 'prompt',
+        baseNodeVersion: 3,
+      }),
+      legacyLeaseLifecycleRow('metadata-without-canonical', 'message-metadata-without-canonical', {
+        metadataCommittedAt: 30,
+      }),
+      legacyLeaseLifecycleRow('final-without-canonical', 'message-final-without-canonical', {
+        postCommit: {
+          usedAt: 14,
+          profileId: 'legacy-profile',
+          final: { completionAllowed: false },
+        },
+      }),
+      missingPostCommit,
+      legacyLeaseLifecycleRow('finished-generation', 'message-finished-generation', {
+        targetCommittedAt: 20,
+        requestedModel: 'legacy/finished',
+        apiUsed: 'chat',
+      }),
+      legacyLeaseLifecycleRow('invalid-target-time', 'message-invalid-target-time', {
+        targetCommittedAt: -1,
+      }),
+      legacyLeaseLifecycleRow('invalid-canonical-time', 'message-invalid-canonical-time', {
+        canonicalAt: -1,
+      }),
+      legacyLeaseLifecycleRow('invalid-metadata-time', 'message-invalid-metadata-time', {
+        canonicalAt: 30,
+        metadataCommittedAt: -1,
+      }),
+      legacyLeaseLifecycleRow('invalid-journal-bytes', 'message-invalid-journal-bytes', {
+        journalStorageBytes: -1,
+      }),
+      legacyLeaseLifecycleRow('invalid-journal-seq', 'message-invalid-journal-seq', {
+        journalMaxSeq: -1,
+      }),
+    ]
+    const control = legacyLeaseLifecycleRow('control-stream', 'message-control')
+    const allRows = [control, ...invalidRows]
+    const chunks = allRows.map((row) => legacyLeaseLifecycleChunk(row.streamId, row.messageId))
+    await legacy.table<Record<string, unknown>>('streamLeases').bulkPut(allRows)
+    await legacy.table<Record<string, unknown>>('streamChunks').bulkPut(chunks)
+    legacy.close()
+
+    const migrated = new Dexie(name)
+    registerStreamLeaseLifecycleV67(migrated)
+    await migrated.open()
+    expect(await migrated.table('streamLeases').get('control-stream')).toEqual({
+      streamId: 'control-stream',
+      chatId: 'chat-1',
+      messageId: 'message-control',
+      custody: 'writer',
+      ownerClientId: 'writer:control-stream',
+      fenceToken: 'fence:control-stream',
+      replacementEpoch: 2,
+      startedAt: 10,
+      heartbeatAt: 11,
+      admissionSequence: 12,
+      revision: 13,
+      attemptKind: 'generation',
+      phase: 'reserved',
+      targetOwnerKey: 'message-control',
+      postCommit: { usedAt: 14, profileId: 'legacy-profile' },
+    })
+    expect(await migrated.table('streamChunks').get('control-stream:0')).toEqual(chunks[0])
+    for (const row of invalidRows) {
+      expect(await migrated.table('streamLeases').get(row.streamId as never)).toBeUndefined()
+      expect(await migrated.table('streamChunks').get(`${String(row.streamId)}:0`)).toBeUndefined()
+    }
+    expect(await migrated.table('streamLeases').count()).toBe(1)
+    expect(await migrated.table('streamChunks').count()).toBe(1)
+    await migrated.delete()
+  })
+
   it('rebuilds normalized attachment edges and exact refcounts once in v22', async () => {
     const name = `natter-test-attachment-edges-v22-${Math.random().toString(36).slice(2)}`
     await Dexie.delete(name)
@@ -712,23 +2144,23 @@ describe('Dexie migrations', () => {
     const legacy = new Dexie(name)
     registerLegacyAttachmentReferenceEdgesV21(legacy)
     await legacy.open()
-    await legacy.table<Record<string, unknown>>('attachments').bulkPut([
-      { id: 'attachment-a', refCount: 91 },
-      { id: 'attachment-b', refCount: 92 },
-      { id: 'attachment-unreferenced', refCount: 93 },
+    const messageRow = legacyAttachmentMessageRows('message-1', 'chat-1', 1, messageRefs, true)
+    const legacyStringRow = legacyAttachmentMessageRows('message-legacy-strings', 'chat-1', 12, [
+      'attachment-b',
     ])
-    await legacy.table<Record<string, unknown>>('messages').put({
-      id: 'message-1',
-      chatId: 'chat-1',
-      deleted: true,
-      attachmentRefs: structuredClone(messageRefs),
-    })
-    await legacy.table<Record<string, unknown>>('messages').put({
-      id: 'message-legacy-strings',
-      chatId: 'chat-1',
-      createdAt: 12,
-      attachmentRefs: ['attachment-b'],
-    })
+    await legacy
+      .table<LegacyAttachmentV21>('attachments')
+      .bulkPut([
+        legacyAttachmentV21('attachment-a', 91),
+        legacyAttachmentV21('attachment-b', 92),
+        legacyAttachmentV21('attachment-unreferenced', 93),
+      ])
+    await legacy
+      .table<Record<string, unknown>>('messages')
+      .bulkPut([messageRow.header, legacyStringRow.header])
+    await legacy
+      .table<Record<string, unknown>>('messageBodies')
+      .bulkPut([messageRow.body, legacyStringRow.body])
     await legacy.table<Record<string, unknown>>('drafts').put({
       chatId: 'chat-1',
       attachmentRefs: structuredClone(draftRefs),
@@ -737,7 +2169,7 @@ describe('Dexie migrations', () => {
 
     const migrated = createDbForTests(name)
     await migrated.open()
-    expect(migrated.verno).toBe(25)
+    expect(migrated.verno).toBe(CURRENT_DB_VERSION)
     expect(await migrated.attachmentRefEdges.toArray()).toEqual(
       expect.arrayContaining<AttachmentReferenceEdge>([
         {
@@ -747,6 +2179,8 @@ describe('Dexie migrations', () => {
           refId: 'message-a-1',
           attachmentId: 'attachment-a',
           ordinal: 0,
+          includeInContext: false,
+          refUpdatedAt: 1,
         },
         {
           ownerKind: 'message',
@@ -755,6 +2189,8 @@ describe('Dexie migrations', () => {
           refId: 'message-a-2',
           attachmentId: 'attachment-a',
           ordinal: 2,
+          includeInContext: true,
+          refUpdatedAt: 1,
         },
         {
           ownerKind: 'draft',
@@ -763,6 +2199,8 @@ describe('Dexie migrations', () => {
           refId: 'draft-b',
           attachmentId: 'attachment-b',
           ordinal: 0,
+          includeInContext: true,
+          refUpdatedAt: 1,
         },
         {
           ownerKind: 'message',
@@ -771,6 +2209,8 @@ describe('Dexie migrations', () => {
           refId: 'legacy:message-legacy-strings:0',
           attachmentId: 'attachment-b',
           ordinal: 0,
+          includeInContext: true,
+          refUpdatedAt: 12,
         },
       ]),
     )
@@ -937,15 +2377,12 @@ describe('Dexie migrations', () => {
     const legacy = new Dexie(name)
     registerLegacyAttachmentReferenceEdgesV21(legacy)
     await legacy.open()
-    await legacy.table<Record<string, unknown>>('attachments').put({
-      id: 'attachment-a',
-      refCount: 77,
-    })
-    await legacy.table<Record<string, unknown>>('messages').put({
-      id: 'message-poison',
-      chatId: 'chat-poison',
-      attachmentRefs: structuredClone(refs),
-    })
+    const poisonRow = legacyAttachmentMessageRows('message-poison', 'chat-poison', 1, refs)
+    await legacy
+      .table<LegacyAttachmentV21>('attachments')
+      .put(legacyAttachmentV21('attachment-a', 77))
+    await legacy.table<Record<string, unknown>>('messages').put(poisonRow.header)
+    await legacy.table<Record<string, unknown>>('messageBodies').put(poisonRow.body)
     legacy.close()
 
     const attempted = createDbForTests(name)
@@ -980,16 +2417,15 @@ describe('Dexie migrations', () => {
         attachmentRefs: [structuredClone(refs[0])],
       })
     } else {
-      await inspection.table<Record<string, unknown>>('attachments').put({
-        id: 'attachment-missing',
-        refCount: 0,
-      })
+      await inspection
+        .table<LegacyAttachmentV21>('attachments')
+        .put(legacyAttachmentV21('attachment-missing', 0))
     }
     inspection.close()
 
     const retried = createDbForTests(name)
     await retried.open()
-    expect(retried.verno).toBe(25)
+    expect(retried.verno).toBe(CURRENT_DB_VERSION)
     expect(await retried.attachmentRefEdges.count()).toBe(1)
     expect((await retried.settings.get('backfill:attachment-refs-v1'))?.value).toBe(1)
     await retried.delete()
@@ -1090,33 +2526,29 @@ describe('Dexie migrations', () => {
     await up.delete()
   })
 
-  it('classifies and fences legacy stream leases in the single v20 to v22 upgrade', async () => {
+  it('carries a valid v20 lease through classification while retiring ambiguous attempts', async () => {
     const name = `natter-test-stream-lease-v21-${Math.random().toString(36).slice(2)}`
     await Dexie.delete(name)
 
     const legacy = new Dexie(name)
     registerLegacyStreamLeasesV20(legacy)
     await legacy.open()
-    await legacy.table<Record<string, unknown>>('messages').bulkPut([
-      {
-        id: 'message-generating',
-        chatId: 'chat-1',
-        nodeVersion: 4,
-        generation: { startedAt: 1 },
-      },
-      {
-        id: 'message-complete',
-        chatId: 'chat-1',
-        nodeVersion: 7,
-        generation: { startedAt: 1, finishedAt: 2 },
-      },
-      {
-        id: 'message-without-generation',
-        chatId: 'chat-1',
-        nodeVersion: 9,
-      },
-    ])
-    const legacyLeases: StreamLeaseRow[] = [
+    await legacy.table<Chat>('chats').put(legacyLeaseChat('chat-1'))
+    await legacy
+      .table<Record<string, unknown>>('messages')
+      .bulkPut([
+        legacyAssistantHeaderV20('message-generating', 4, 0, { startedAt: 1 }),
+        legacyAssistantHeaderV20('message-complete', 7, 1, { startedAt: 1, finishedAt: 2 }),
+        legacyAssistantHeaderV20('message-without-generation', 9, 2),
+      ])
+    await legacy
+      .table<Record<string, unknown>>('messageBodies')
+      .bulkPut([
+        legacyEmptyMessageBody('message-generating', 'chat-1', 4),
+        legacyEmptyMessageBody('message-complete', 'chat-1', 7),
+        legacyEmptyMessageBody('message-without-generation', 'chat-1', 9),
+      ])
+    const legacyLeases: LegacyStreamLeaseV20[] = [
       {
         streamId: 'original-stream',
         chatId: 'chat-1',
@@ -1161,68 +2593,66 @@ describe('Dexie migrations', () => {
         apiUsed: 'responses',
       },
     ]
-    await legacy.table<StreamLeaseRow>('streamLeases').bulkPut(legacyLeases)
+    await legacy.table<LegacyStreamLeaseV20>('streamLeases').bulkPut(legacyLeases)
     legacy.close()
 
     const migrated = createDbForTests(name)
     await migrated.open()
-    expect(migrated.verno).toBe(25)
-    expect(await migrated.streamLeases.get('original-stream')).toEqual({
-      ...legacyLeases[0],
+    expect(migrated.verno).toBe(CURRENT_DB_VERSION)
+    const survivingLease = await migrated.streamLeases.get('original-stream')
+    expect(survivingLease).toMatchObject({
+      streamId: 'original-stream',
+      chatId: 'chat-1',
+      messageId: 'message-generating',
+      startedAt: 1,
       attemptKind: 'generation',
-      fenceToken: 'legacy:original-stream',
+      custody: 'recovery-pending',
+      phase: 'active',
       replacementEpoch: 0,
+      revision: 1,
+      controlRevision: 0,
+      journalEventVersion: 2,
+      handoffReason: 'owner-unavailable',
+      dispatch: {
+        targetCommittedAt: 1,
+        apiUsed: 'chat',
+        reasoningCarryForward: 'unknown',
+        reasoningVisibility: { disclosure: 'unknown' },
+      },
+      postCommit: { usedAt: 1, profileId: 'legacy-profile' },
     })
-    expect(await migrated.streamLeases.get('continue-stream')).toEqual({
-      ...legacyLeases[1],
-      attemptKind: 'continuation',
-      baseNodeVersion: 7,
-      fenceToken: 'legacy:continue-stream',
-      replacementEpoch: 0,
-    })
-    expect(await migrated.streamLeases.get('continue-without-generation')).toEqual({
-      ...legacyLeases[2],
-      attemptKind: 'continuation',
-      baseNodeVersion: 9,
-      fenceToken: 'legacy:continue-without-generation',
-      replacementEpoch: 0,
-    })
-    expect(await migrated.streamLeases.get('continue-without-header')).toEqual({
-      ...legacyLeases[3],
-      attemptKind: 'continuation',
-      fenceToken: 'legacy:continue-without-header',
-      replacementEpoch: 0,
-    })
-    expect(await migrated.streamLeases.get('already-classified')).toEqual({
-      ...legacyLeases[4],
-      fenceToken: 'legacy:already-classified',
-      replacementEpoch: 0,
-    })
-    expect(await migrated.streamLeases.get('continue-stream')).not.toHaveProperty('requestedModel')
-    expect(await migrated.streamLeases.get('continue-stream')).not.toHaveProperty('apiUsed')
-    expect(await migrated.streamLeases.get('continue-stream')).not.toHaveProperty(
-      'continuationStrategy',
-    )
+    expect(typeof survivingLease?.admissionSequence).toBe('number')
+    expect(survivingLease?.handoffId).toMatch(/^migration:0:original-stream:\d+$/)
+    expect(typeof survivingLease?.handedOffAt).toBe('number')
+    expect(typeof survivingLease?.dispatch?.requestedModel).toBe('string')
+    expect(survivingLease).not.toHaveProperty('targetCommittedAt')
+    expect(survivingLease).not.toHaveProperty('ownerClientId')
+    expect(survivingLease).not.toHaveProperty('heartbeatAt')
+    expect(survivingLease).not.toHaveProperty('fenceToken')
+    expect(
+      await migrated.streamLeases.bulkGet(legacyLeases.slice(1).map((row) => row.streamId)),
+    ).toEqual([undefined, undefined, undefined, undefined])
     await migrated.delete()
   })
 
-  it('does not rerun the lease classifier or fence migration after v22 is current', async () => {
+  it('does not rerun legacy lease migrations after the full upgrade is current', async () => {
     const name = `natter-test-stream-lease-v21-idempotent-${Math.random().toString(36).slice(2)}`
     await Dexie.delete(name)
 
     const legacy = new Dexie(name)
     registerLegacyStreamLeasesV20(legacy)
     await legacy.open()
-    await legacy.table<Record<string, unknown>>('messages').put({
-      id: 'message-complete',
+    await legacy.table<Chat>('chats').put(legacyLeaseChat('chat-1'))
+    await legacy
+      .table<Record<string, unknown>>('messages')
+      .put(legacyAssistantHeaderV20('message-generating', 7, 0, { startedAt: 1 }))
+    await legacy
+      .table<Record<string, unknown>>('messageBodies')
+      .put(legacyEmptyMessageBody('message-generating', 'chat-1', 7))
+    await legacy.table<LegacyStreamLeaseV20>('streamLeases').put({
+      streamId: 'generation-stream',
       chatId: 'chat-1',
-      nodeVersion: 7,
-      generation: { startedAt: 1, finishedAt: 2 },
-    })
-    await legacy.table<StreamLeaseRow>('streamLeases').put({
-      streamId: 'continue-stream',
-      chatId: 'chat-1',
-      messageId: 'message-complete',
+      messageId: 'message-generating',
       ownerClientId: 'tab-1',
       startedAt: 3,
       heartbeatAt: 4,
@@ -1231,23 +2661,22 @@ describe('Dexie migrations', () => {
 
     const migrated = createDbForTests(name)
     await migrated.open()
-    const classified = await migrated.streamLeases.get('continue-stream')
-    expect(classified).toMatchObject({ attemptKind: 'continuation', baseNodeVersion: 7 })
+    const classified = await migrated.streamLeases.get('generation-stream')
+    expect(classified).toMatchObject({ attemptKind: 'generation' })
     if (!classified) throw new Error('expected migrated stream lease')
-    const manuallyChanged: StreamLeaseRow = { ...classified, attemptKind: 'generation' }
-    delete manuallyChanged.baseNodeVersion
+    const manuallyChanged: StreamLeaseRow = { ...classified, revision: classified.revision + 1 }
     await migrated.streamLeases.put(manuallyChanged)
     migrated.close()
 
     const reopened = createDbForTests(name)
     await reopened.open()
-    expect(await reopened.streamLeases.get('continue-stream')).toEqual(manuallyChanged)
+    expect(await reopened.streamLeases.get('generation-stream')).toEqual(manuallyChanged)
     await reopened.delete()
   })
 
   it.each([
     20, 21,
-  ])('adds the workspace replacement epoch once when upgrading v%i to v22', async (legacyVersion) => {
+  ])('upgrades v%i workspace metadata through replacement epoch and incarnation migrations', async (legacyVersion) => {
     const name = `natter-test-workspace-meta-v${legacyVersion}-v22-${Math.random()
       .toString(36)
       .slice(2)}`
@@ -1268,26 +2697,27 @@ describe('Dexie migrations', () => {
 
     const migrated = createDbForTests(name)
     await migrated.open()
-    expect((await migrated.settings.get('workspace-meta'))?.value).toEqual({
-      ...legacyValue,
+    const upgradedValue = await migrated.workspaceFence.get('global')
+    expect(upgradedValue).toMatchObject({
+      id: 'global',
       replacementEpoch: 0,
     })
-    await migrated.settings.put({
-      key: 'workspace-meta',
-      value: { ...legacyValue, replacementEpoch: 9 },
-    })
+    expect(upgradedValue?.workspaceId).toMatch(/^browser-idb:[0-9A-HJKMNP-TV-Z]{26}$/)
+    expect(await migrated.settings.get('workspace-meta')).toBeUndefined()
+    if (!upgradedValue) throw new Error('expected migrated workspace fence')
+    await migrated.workspaceFence.put({ ...upgradedValue, replacementEpoch: 9 })
     migrated.close()
 
     const reopened = createDbForTests(name)
     await reopened.open()
-    expect((await reopened.settings.get('workspace-meta'))?.value).toEqual({
-      ...legacyValue,
+    expect(await reopened.workspaceFence.get('global')).toEqual({
+      ...upgradedValue,
       replacementEpoch: 9,
     })
     await reopened.delete()
   })
 
-  it('migrates v21 attempt outcomes once and strips raw failure payloads in v22', async () => {
+  it('carries v21 attempt outcomes through orphan recovery and strips raw failure payloads', async () => {
     const name = `natter-test-attempt-outcomes-v22-${Math.random().toString(36).slice(2)}`
     await Dexie.delete(name)
 
@@ -1295,35 +2725,30 @@ describe('Dexie migrations', () => {
     registerLegacyAttemptOutcomesV21(legacy)
     await legacy.open()
     await legacy.table<Record<string, unknown>>('messages').bulkPut([
-      {
-        id: 'streaming',
-        chatId: 'chat-1',
-        generation: { startedAt: 1 },
-      },
-      {
-        id: 'failed',
-        chatId: 'chat-1',
-        generation: {
-          startedAt: 1,
-          finishedAt: 2,
-          error: {
-            code: 'NETWORK',
-            message: 'connection lost',
-            raw: { kind: 'network', metadata: { authorization: 'raw-secret' } },
-          },
+      legacyAssistantHeaderV20('streaming', 0, 0, { startedAt: 1 }),
+      legacyAssistantHeaderV20('failed', 0, 1, {
+        startedAt: 1,
+        finishedAt: 2,
+        error: {
+          code: 'NETWORK',
+          message: 'connection lost',
+          raw: { kind: 'network', metadata: { authorization: 'raw-secret' } },
         },
-      },
-      {
-        id: 'interrupted',
-        chatId: 'chat-1',
-        generation: { startedAt: 1, finishedAt: 2, abortReason: 'tab-close' },
-      },
-      {
-        id: 'done',
-        chatId: 'chat-1',
-        generation: { startedAt: 1, finishedAt: 2 },
-      },
+      }),
+      legacyAssistantHeaderV20('interrupted', 0, 2, {
+        startedAt: 1,
+        finishedAt: 2,
+        abortReason: 'tab-close',
+      }),
+      legacyAssistantHeaderV20('done', 0, 3, { startedAt: 1, finishedAt: 2 }),
     ])
+    await legacy
+      .table<Record<string, unknown>>('messageBodies')
+      .bulkPut([
+        legacyEmptyMessageBody('streaming', 'chat-1'),
+        legacyEmptyMessageBody('interrupted', 'chat-1'),
+        legacyEmptyMessageBody('done', 'chat-1'),
+      ])
     await legacy.table<Record<string, unknown>>('messageBodies').put({
       id: 'failed',
       chatId: 'chat-1',
@@ -1368,10 +2793,11 @@ describe('Dexie migrations', () => {
 
     const migrated = createDbForTests(name)
     await migrated.open()
-    expect(migrated.verno).toBe(25)
+    expect(migrated.verno).toBe(CURRENT_DB_VERSION)
     expect((await migrated.messages.get('streaming'))?.generation).toMatchObject({
-      status: 'streaming',
+      status: 'interrupted',
       integrity: 'clean',
+      abortReason: 'tab-close',
     })
     expect((await migrated.messages.get('failed'))?.generation).toMatchObject({
       status: 'error',
@@ -1401,16 +2827,7 @@ describe('Dexie migrations', () => {
       },
     })
     const chunk = await migrated.streamChunks.get('stream-1:0')
-    expect(chunk?.event).toEqual({
-      lane: 'error',
-      error: {
-        kind: 'provider_error',
-        code: '502',
-        message: 'provider failed',
-        midStream: true,
-        retryable: true,
-      },
-    })
+    expect(chunk).toBeUndefined()
     expect(
       JSON.stringify({ failed: await migrated.messages.get('failed'), body, chunk }),
     ).not.toContain('raw-secret')
@@ -1493,7 +2910,7 @@ describe('Dexie migrations', () => {
 
     const migrated = createDbForTests(name)
     await migrated.open()
-    expect(migrated.verno).toBe(25)
+    expect(migrated.verno).toBe(CURRENT_DB_VERSION)
     const migratedHeader = (await migrated.messages.get('continued-message')) as unknown as Record<
       string,
       unknown
@@ -1544,6 +2961,9 @@ describe('Dexie migrations', () => {
           status: 'error' as const,
           startedAt: 10,
           finishedAt: 20,
+          reasoningCarryForward: 'none' as const,
+          reasoningVisibility: { disclosure: 'unknown' as const },
+          application: { kind: 'applied' as const },
         }),
         model: 'manual-model',
       },
@@ -1576,27 +2996,32 @@ describe('Dexie migrations', () => {
     await reopened.delete()
   })
 
-  it('populates a fresh v22 database without requiring a legacy lease pass', async () => {
+  it('populates a fresh current database without requiring a legacy lease pass', async () => {
     const name = `natter-test-stream-lease-v21-fresh-${Math.random().toString(36).slice(2)}`
     const db = await freshDb(name)
     await db.open()
 
-    expect(db.verno).toBe(25)
+    expect(db.verno).toBe(CURRENT_DB_VERSION)
     expect(await db.streamLeases.count()).toBe(0)
     expect((await db.settings.get('backfill:message-body-split-v1'))?.value).toBe(1)
-    const lease: StreamLeaseRow = {
+    const lease: StreamLeaseRow = testContinuationLease({
       streamId: 'continue-stream',
       chatId: 'chat-1',
       messageId: 'message-1',
       ownerClientId: 'tab-1',
+      fenceToken: 'current-fence',
+      replacementEpoch: 0,
       startedAt: 1,
       heartbeatAt: 2,
-      attemptKind: 'continuation',
+      admissionSequence: 1,
+      revision: 0,
       continuationStrategy: 'prefill',
       baseNodeVersion: 3,
+      baseBodyVersion: 3,
       requestedModel: 'model-a',
       apiUsed: 'responses',
-    }
+      postCommit: { usedAt: 1, profileId: 'profile-a' },
+    })
     await db.streamLeases.put(lease)
     expect(await db.streamLeases.get(lease.streamId)).toEqual(lease)
     await db.delete()
@@ -1636,7 +3061,7 @@ describe('Dexie migrations', () => {
 
     const migrated = createDbForTests(name)
     await migrated.open()
-    expect(migrated.verno).toBe(25)
+    expect(migrated.verno).toBe(CURRENT_DB_VERSION)
     expect((await migrated.settings.get('global:message-render-window-size'))?.value).toBe(33)
     expect((await migrated.settings.get('global:sidebar-render-window-size'))?.value).toBe(50)
     expect((await migrated.settings.get('global:message-render-window-load-mode'))?.value).toBe(
@@ -1693,6 +3118,7 @@ describe('Dexie migrations', () => {
       totalCostUsd: 0,
       metaVersion: 0,
       summaryVersion: 0,
+      structuralVersion: 0,
       settings: structuredClone(baseSettings),
       lastUpdatedLeafId: null,
       lastBranchUpdatedAt: 1,
@@ -1793,6 +3219,7 @@ describe('Dexie migrations', () => {
         totalCostUsd: 0,
         metaVersion: 0,
         summaryVersion: 0,
+        structuralVersion: 0,
         settings: structuredClone(baseSettings),
         lastUpdatedLeafId: null,
         lastBranchUpdatedAt: 1,
@@ -1812,6 +3239,7 @@ describe('Dexie migrations', () => {
         totalCostUsd: 0,
         metaVersion: 0,
         summaryVersion: 0,
+        structuralVersion: 0,
         settings: structuredClone(directSettings),
         lastUpdatedLeafId: null,
         lastBranchUpdatedAt: 1,
@@ -1887,6 +3315,7 @@ describe('Dexie migrations', () => {
       totalCostUsd: 0,
       metaVersion: 0,
       summaryVersion: 0,
+      structuralVersion: 0,
       settings: structuredClone(legacySettings),
       lastUpdatedLeafId: null,
       lastBranchUpdatedAt: 1,
@@ -1994,6 +3423,7 @@ describe('Dexie migrations', () => {
       totalCostUsd: 0,
       metaVersion: 0,
       summaryVersion: 0,
+      structuralVersion: 0,
       settings: structuredClone(legacySettings),
       lastUpdatedLeafId: null,
       lastBranchUpdatedAt: 1,
@@ -2016,7 +3446,7 @@ describe('Dexie migrations', () => {
 
     const migrated = createDbForTests(name)
     await migrated.open()
-    expect(migrated.verno).toBe(25)
+    expect(migrated.verno).toBe(CURRENT_DB_VERSION)
     const chat = await migrated.chats.get('chat-settings-snapshot')
     const preset = await migrated.presets.get('preset-settings-snapshot')
     for (const settings of [chat?.settings, preset?.settings]) {
@@ -2138,6 +3568,7 @@ describe('Dexie migrations', () => {
       totalCostUsd: 0,
       metaVersion: 0,
       summaryVersion: 0,
+      structuralVersion: 0,
       lastUpdatedLeafId: null,
       lastBranchUpdatedAt: 1,
       archived: false,
@@ -2162,7 +3593,7 @@ describe('Dexie migrations', () => {
 
     const migrated = createDbForTests(name)
     await migrated.open()
-    expect(migrated.verno).toBe(25)
+    expect(migrated.verno).toBe(CURRENT_DB_VERSION)
     const openaiChat = await migrated.chats.get('chat-openai')
     const googleChat = await migrated.chats.get('chat-google')
     const anthropicChat = await migrated.chats.get('chat-anthropic')
@@ -2188,7 +3619,7 @@ describe('Dexie migrations', () => {
     await migrated.delete()
   })
 
-  it('migrates chat preset picker order into dense sortIndex values', async () => {
+  it('migrates chat preset picker order into typed order blocks and removes legacy ranks', async () => {
     const name = `natter-test-preset-sort-index-mig-${Math.random().toString(36).slice(2)}`
     await Dexie.delete(name)
     const settings = cloneDefaultChatSettings()
@@ -2220,18 +3651,21 @@ describe('Dexie migrations', () => {
 
     const migrated = createDbForTests(name)
     await migrated.open()
-    expect(migrated.verno).toBe(25)
-    const rows = (await migrated.presets.toArray()).sort(
-      (left, right) => left.sortIndex - right.sortIndex,
+    expect(migrated.verno).toBe(CURRENT_DB_VERSION)
+    const orderedIds = await migrated.transaction(
+      'r',
+      migrated.presetOrderState,
+      migrated.presetOrderBlocks,
+      (tx) => readPresetOrderIds(tx),
     )
-    expect(rows.map((row) => [row.id, row.sortIndex])).toEqual([
-      ['preset-first', 0],
-      ['preset-second', 1],
-    ])
+    expect(orderedIds).toEqual(['preset-first', 'preset-second'])
+    const rows = await migrated.presets.toArray()
+    expect(rows.map((row) => row.id).sort()).toEqual(['preset-first', 'preset-second'])
     expect(
-      rows.every(
-        (row) => !('migrationV19SortValue' in (row as unknown as Record<string, unknown>)),
-      ),
+      rows.every((row) => {
+        const stored = row as unknown as Record<string, unknown>
+        return !('sortIndex' in stored) && !('migrationV19SortValue' in stored)
+      }),
     ).toBe(true)
     expect(migrated.presets.schema.indexes.map((index) => index.src)).not.toContain(
       '[migrationV19SortValue+createdAt+id]',
@@ -2258,7 +3692,7 @@ describe('Dexie migrations', () => {
 
     const migrated = createDbForTests(name)
     await migrated.open()
-    expect(migrated.verno).toBe(25)
+    expect(migrated.verno).toBe(CURRENT_DB_VERSION)
     expect((await migrated.settings.get('rendering-preferences'))?.value).toEqual({
       shikiLight: 'tokyo-night',
       shikiDark: 'dracula',
@@ -2285,6 +3719,7 @@ describe('Dexie migrations', () => {
       totalCostUsd: 0,
       metaVersion: 0,
       summaryVersion: 0,
+      structuralVersion: 0,
       settings: cloneDefaultChatSettings(),
       lastUpdatedLeafId: 'a1',
       lastBranchUpdatedAt: 1,
@@ -2293,7 +3728,7 @@ describe('Dexie migrations', () => {
       folderId: null,
       tags: [],
     })
-    await legacy.table<Message>('messages').put({
+    await legacy.table<Record<string, unknown>>('messages').put({
       id: 'a1',
       chatId: 'chat-provider-output',
       parentId: null,
@@ -2311,6 +3746,7 @@ describe('Dexie migrations', () => {
         apiUsed: 'responses',
         delivery: 'streaming',
         costSource: 'stream',
+        reasoningCarryForward: 'none',
         startedAt: 1,
         finishedAt: 2,
         serverTools: [
@@ -2359,7 +3795,7 @@ describe('Dexie migrations', () => {
     const name = `natter-test-provider-output-items-backfill-${Math.random().toString(36).slice(2)}`
     const db = await freshDb(name)
     await db.open()
-    const message = {
+    const message: Message = {
       id: 'a1',
       chatId: 'chat-provider-output',
       parentId: null,
@@ -2377,6 +3813,8 @@ describe('Dexie migrations', () => {
         apiUsed: 'responses',
         delivery: 'streaming',
         costSource: 'stream',
+        reasoningCarryForward: 'none',
+        reasoningVisibility: { disclosure: 'unknown' },
         startedAt: 1,
         finishedAt: 2,
         serverTools: [
@@ -2386,30 +3824,42 @@ describe('Dexie migrations', () => {
             id: 'ci_1',
             status: 'completed',
             outputIndex: 0,
-            output: {
-              id: 'ci_1',
-              type: 'code_interpreter_call',
-              status: 'completed',
-              code: 'sum(i*i for i in range(6))',
-              outputs: [{ type: 'logs', logs: '55' }],
-            },
           },
         ],
       },
       nodeVersion: 0,
       deleted: false,
-    } as Message
-    const { header, body } = splitMessageForStorage(message)
+    }
+    const { header, body, preview } = splitMessageForStorage(message)
     delete body.providerOutputItems
-    await db.messages.put(header)
+    const legacyHeader = structuredClone(header) as unknown as Record<string, unknown>
+    const legacyGeneration = legacyHeader.generation as Record<string, unknown>
+    const legacyServerTools = legacyGeneration.serverTools as Record<string, unknown>[]
+    const legacyServerTool = legacyServerTools[0]
+    if (!legacyServerTool) throw new Error('ExpectedLegacyProviderOutputTool')
+    legacyServerTool.output = {
+      id: 'ci_1',
+      type: 'code_interpreter_call',
+      status: 'completed',
+      code: 'sum(i*i for i in range(6))',
+      outputs: [{ type: 'logs', logs: '55' }],
+    }
+    await db.table<Record<string, unknown>>('messages').put(legacyHeader)
     await db.messageBodies.put(body)
-    await db.settings.delete('backfill:provider-output-items-v1')
+    await db.messagePreviews.put(preview)
+    const providerOutputMarker = providerOutputItemsBackfillMarker()
+    await db.settings.put({ ...providerOutputMarker, value: 3 })
 
     await migrateProviderOutputItemRows(db)
     await migrateProviderOutputItemRows(db)
 
-    expect((await db.settings.get('backfill:provider-output-items-v1'))?.value).toBe(1)
-    expect((await db.messageBodies.get('a1'))?.providerOutputItems).toEqual([
+    expect(await db.settings.get(providerOutputMarker.key)).toEqual(providerOutputMarker)
+    const [storedHeader, storedBody, storedPreview] = await Promise.all([
+      db.messages.get('a1'),
+      db.messageBodies.get('a1'),
+      db.messagePreviews.get('a1'),
+    ])
+    expect(storedBody?.providerOutputItems).toEqual([
       {
         dialect: 'openai-responses',
         type: 'code_interpreter_call',
@@ -2423,6 +3873,10 @@ describe('Dexie migrations', () => {
         },
       },
     ])
+    expect(storedHeader?.bodyVersion).toBe(1)
+    expect(storedBody?.bodyVersion).toBe(storedHeader?.bodyVersion)
+    expect(storedPreview?.bodyVersion).toBe(storedHeader?.bodyVersion)
+    expect(storedPreview?.text).toBe('55')
     await db.delete()
   })
 
@@ -2442,6 +3896,7 @@ describe('Dexie migrations', () => {
       totalCostUsd: 0,
       metaVersion: 0,
       summaryVersion: 0,
+      structuralVersion: 0,
       settings: cloneDefaultChatSettings(),
       lastUpdatedLeafId: 'm1',
       lastBranchUpdatedAt: 1,
@@ -2547,6 +4002,7 @@ describe('Dexie migrations', () => {
       totalCostUsd: 0,
       metaVersion: 0,
       summaryVersion: 0,
+      structuralVersion: 0,
       settings: cloneDefaultChatSettings(),
       lastUpdatedLeafId: 'msg-proto',
       lastBranchUpdatedAt: 1,
@@ -2824,8 +4280,8 @@ describe('Dexie migrations', () => {
     await db.messageBodies.delete('old-leaf')
     await db.settings.delete('backfill:organization-fields-v1')
 
-    await backfillOrganizationFields(db)
-    await backfillOrganizationFields(db)
+    await runWaveADerivedRowsForTest(db)
+    await runWaveADerivedRowsForTest(db)
 
     const empty = await db.chats.get('empty')
     expect(empty).toMatchObject({
@@ -2851,15 +4307,15 @@ describe('Dexie migrations', () => {
     expect(branchy).toMatchObject({
       lastUpdatedLeafId: 'new-leaf',
       wordCount: 4,
-      totalCostUsd: 0.6,
     })
+    expect(branchy?.totalCostUsd).toBeCloseTo(0.6)
     expect(await db.chats.get('tombstoned-descendants')).toMatchObject({
       lastUpdatedLeafId: 'tomb-root',
       wordCount: 2,
       totalCostUsd: 0.4,
     })
     expect((await db.settings.get('backfill:organization-fields-v1'))?.value).toBe(1)
-    expect(await db.chatBranchCache.count()).toBe(0)
+    expect(db.tables.map((table) => table.name)).not.toContain('chatBranchCache')
     await db.delete()
   })
 
@@ -2868,7 +4324,7 @@ describe('Dexie migrations', () => {
     await Dexie.delete(emptyName)
     const empty = await freshDb(emptyName)
     await empty.open()
-    await backfillOrganizationFields(empty)
+    await runWaveADerivedRowsForTest(empty)
     expect(await empty.chats.count()).toBe(0)
     expect((await empty.settings.get('backfill:organization-fields-v1'))?.value).toBe(1)
     await empty.delete()
@@ -2892,7 +4348,9 @@ describe('Dexie migrations', () => {
     )
     await db.settings.delete('backfill:organization-fields-v1')
 
-    await backfillOrganizationFields(db)
+    expect(await db.chatSidebarRows.count()).toBe(0)
+    expect(await db.chatSidebarAggregates.toArray()).toEqual([emptyChatSidebarAggregateRow()])
+    await runWaveADerivedRowsForTest(db)
 
     expect(await db.chats.count()).toBe(1000)
     expect(await db.chats.get('bulk-0')).toMatchObject({
@@ -2912,11 +4370,1319 @@ describe('Dexie migrations', () => {
       archived: true,
       pinned: false,
     })
-    expect(await db.chatBranchCache.count()).toBe(0)
+    expect(db.tables.map((table) => table.name)).not.toContain('chatBranchCache')
     expect((await db.settings.get('backfill:organization-fields-v1'))?.value).toBe(1)
+    const chats = (await db.chats.toArray()).sort((left, right) => left.id.localeCompare(right.id))
+    expect(
+      (await db.chatSidebarRows.toArray()).sort((left, right) => left.id.localeCompare(right.id)),
+    ).toEqual(chats.map(chatSidebarProjectionRow))
+    expect(await db.chatSidebarAggregates.toArray()).toEqual([
+      {
+        ...emptyChatSidebarAggregateRow(),
+        totalCount: 1000,
+        activeCount: 666,
+        archivedCount: 334,
+        pinnedCount: 200,
+        rootCount: 1000,
+      },
+    ])
+
+    const stableChats = await db.chats.toArray()
+    const stableRows = await db.chatSidebarRows.toArray()
+    const stableAggregates = await db.chatSidebarAggregates.toArray()
+    await runWaveADerivedRowsForTest(db)
+    expect(await db.chats.toArray()).toEqual(stableChats)
+    expect(await db.chatSidebarRows.toArray()).toEqual(stableRows)
+    expect(await db.chatSidebarAggregates.toArray()).toEqual(stableAggregates)
     await db.delete()
   }, 15_000)
+
+  it('upgrades observed v88 journals and reasoning bodies atomically through v94 and does not rerun', async () => {
+    const name = `natter-test-v89-reasoning-${Math.random().toString(36).slice(2)}`
+    await Dexie.delete(name)
+
+    const legacy = await openObservedWaveAFixture(name, 88)
+
+    const profile: ConnectionProfile = {
+      id: 'google-profile',
+      name: 'Google',
+      kind: 'google',
+      baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+      defaultHeaders: {},
+      appTitle: 'Natter',
+      appUrl: '',
+      supportsEndpointsApi: false,
+      supportsGenerationApi: false,
+      supportsPrivacyScrape: false,
+      createdAt: 1,
+      updatedAt: 1,
+    }
+    const stored = splitMessageForStorage(
+      {
+        id: 'assistant-1',
+        chatId: 'chat-1',
+        parentId: null,
+        siblingIndex: 0,
+        turnId: 'turn-1',
+        turnIndex: 0,
+        createdAt: 2,
+        role: 'assistant',
+        origin: 'generated',
+        generation: {
+          model: 'anthropic/claude-sonnet-4.6',
+          requestedModel: 'anthropic/claude-sonnet-4.6',
+          apiUsed: 'anthropic-messages',
+          startedAt: 2,
+          status: 'done',
+          reasoningCarryForward: 'none',
+          reasoningVisibility: { disclosure: 'unknown' },
+        },
+        content: [{ type: 'output_text', text: 'stored answer' }],
+        nodeVersion: 2,
+        deleted: false,
+      },
+      { bodyVersion: 2 },
+    )
+    const legacyBody = {
+      ...stored.body,
+      reasoningEnvelope: {
+        schemaVersion: 1,
+        visible: [
+          {
+            id: 'stored-gemini-summary',
+            groupId: 'stored-gemini-group',
+            kind: 'summary',
+            text: 'stored Gemini summary',
+            format: 'google-gemini-v1',
+            source: {
+              dialect: 'gemini-native',
+              itemId: 'stored-gemini-thought',
+              candidateIndex: 0,
+              summaryIndex: 0,
+              partIndex: 0,
+              detailId: 'stored-gemini-summary-detail',
+            },
+          },
+        ],
+        carriers: [
+          {
+            id: 'stored-gemini-carrier',
+            groupId: 'stored-gemini-group',
+            kind: 'gemini-thought-signature',
+            data: 'stored-gemini-signature',
+            format: 'google-gemini-v1',
+            bindsVisiblePartId: 'stored-gemini-summary',
+            source: {
+              dialect: 'gemini-native',
+              itemId: 'stored-gemini-thought',
+              candidateIndex: 0,
+              partIndex: 1,
+              detailId: 'stored-gemini-carrier-detail',
+            },
+          },
+        ],
+      },
+      reasoningDetails: [
+        {
+          type: 'reasoning.text',
+          format: 'anthropic-claude-v1',
+          text: 'stored thought',
+          signature: 'stored-signature',
+          id: 'stored-thought-0',
+          index: 0,
+        },
+      ],
+    }
+
+    const leaseIdentity = {
+      streamId: 'gemini-stream',
+      chatId: 'chat-1',
+      messageId: 'assistant-1',
+      ownerClientId: 'tab-a',
+      fenceToken: 'fence-a',
+      replacementEpoch: 3,
+      admissionSequence: 7,
+    } as const
+    const frames = await encodeTestStreamJournalEntries({
+      ...leaseIdentity,
+      fence: {
+        ownerClientId: leaseIdentity.ownerClientId,
+        fenceToken: leaseIdentity.fenceToken,
+        replacementEpoch: leaseIdentity.replacementEpoch,
+        admissionSequence: leaseIdentity.admissionSequence,
+      },
+      entries: [
+        { createdAt: 10, event: { lane: 'text', text: 'live answer' } },
+        {
+          createdAt: 11,
+          event: {
+            lane: 'reasoning',
+            detailsMode: 'snapshot',
+            details: [
+              {
+                type: 'reasoning.summary',
+                format: 'google-gemini-v1',
+                summary: 'live summary',
+                id: 'summary-0',
+                providerItemId: 'thought-0',
+                providerOutputIndex: 0,
+                providerSummaryIndex: 0,
+              },
+              {
+                type: 'reasoning.encrypted',
+                format: 'google-gemini-v1',
+                data: 'live-thought-signature',
+                id: 'carrier-0',
+                providerItemId: 'thought-0',
+                providerOutputIndex: 0,
+              },
+            ],
+          },
+        },
+        { createdAt: 12, event: { lane: 'finish', finishReason: 'stop' } },
+      ],
+    })
+    const currentLease = testContinuationLease({
+      ...leaseIdentity,
+      startedAt: 9,
+      heartbeatAt: 12,
+      revision: 2,
+      journalMaxSeq: lastJournalSeq(frames),
+      journalStorageBytes: streamFrameStorageBytes(frames),
+      continuationStrategy: 'prefill',
+      baseNodeVersion: 2,
+      baseBodyVersion: 2,
+      requestedModel: 'google/gemini-3.5-flash',
+      apiUsed: 'gemini-native',
+      postCommit: { usedAt: 9, profileId: profile.id },
+    })
+    const legacyLease = leaseWithoutJournalVersion(currentLease)
+
+    await legacy.table('profiles').put(profile)
+    await legacy.table('chats').put({
+      ...buildChat({ id: 'chat-1', title: 'Reasoning migration', now: 1 }),
+      settings: { ...cloneDefaultChatSettings(), profileId: profile.id },
+      lastUpdatedLeafId: stored.header.id,
+    })
+    await legacy.table('messages').put(messageHeaderWithoutReasoningCarryForward(stored.header))
+    await legacy.table('messageBodies').put(legacyBody)
+    await legacy.table('messagePreviews').put(stored.preview)
+    await legacy.table('streamChunks').bulkPut(frames)
+    await legacy.table('streamLeases').put(legacyLease)
+    legacy.close()
+
+    const migrated = await openProductionV94Fixture(name)
+    expect(migrated.verno).toBe(CURRENT_DB_VERSION)
+
+    const entries = await currentJournalEvents(migrated, leaseIdentity.streamId)
+    const replayed = replayStreamAccumulator({ initialContent: [], now: 9, entries })
+    expect(replayed.finishedCleanly, JSON.stringify(entries.map(({ event }) => event))).toBe(true)
+    expect(replayed.final.content).toEqual([{ type: 'output_text', text: 'live answer' }])
+    expect(replayed.final.reasoningEnvelope).toEqual(
+      expect.objectContaining({
+        schemaVersion: 2,
+        visible: [expect.objectContaining({ kind: 'summary', text: 'live summary' })],
+        carriers: [
+          expect.objectContaining({
+            kind: 'gemini-thought-signature',
+            data: 'live-thought-signature',
+          }),
+        ],
+      }),
+    )
+    expect(isReasoningEnvelope(replayed.final.reasoningEnvelope)).toBe(true)
+
+    const migratedHeader = await migrated.messages.get(stored.header.id)
+    const migratedBody = await migrated.messageBodies.get(stored.body.id)
+    const migratedPreview = await migrated.messagePreviews.get(stored.preview.id)
+    const migratedLease = await migrated.streamLeases.get(leaseIdentity.streamId)
+    expect(migratedHeader).toMatchObject({
+      nodeVersion: 2,
+      bodyVersion: 2,
+      requestContextVersion: 2,
+      generation: { reasoningCarryForward: 'unknown' },
+    })
+    expect(migratedBody).toMatchObject({ bodyVersion: 2 })
+    expect(migratedPreview).toMatchObject({ bodyVersion: 2 })
+    const migratedEnvelope = migratedBody?.reasoningEnvelope
+    expect(isReasoningEnvelope(migratedEnvelope)).toBe(true)
+    if (!isReasoningEnvelope(migratedEnvelope)) throw new Error('ExpectedReasoningEnvelope')
+    expect(
+      migratedEnvelope.visible.some(
+        (part) => part.kind === 'summary' && part.text === 'stored Gemini summary',
+      ),
+    ).toBe(true)
+    expect(
+      migratedEnvelope.visible.some(
+        (part) => part.kind === 'text' && part.text === 'stored thought',
+      ),
+    ).toBe(true)
+    expect(
+      migratedEnvelope.carriers.some(
+        (carrier) =>
+          carrier.kind === 'gemini-thought-signature' &&
+          carrier.data === 'stored-gemini-signature' &&
+          carrier.bindsVisiblePartId === 'stored-gemini-summary',
+      ),
+    ).toBe(true)
+    expect(
+      migratedEnvelope.carriers.some(
+        (carrier) =>
+          carrier.kind === 'anthropic-signature' && carrier.signature === 'stored-signature',
+      ),
+    ).toBe(true)
+    expect(migratedBody).not.toHaveProperty('reasoningDetails')
+    const migratedFrames = await migrated.streamChunks
+      .where('streamId')
+      .equals(leaseIdentity.streamId)
+      .sortBy('seq')
+    expect(migratedLease).toMatchObject({
+      journalEventVersion: 2,
+      dispatch: {
+        baseNodeVersion: 2,
+        baseBodyVersion: 2,
+        reasoningCarryForward: 'unknown',
+      },
+      journalMaxSeq: migratedFrames.at(-1)?.seq,
+    })
+    expect(migratedLease?.journalStorageBytes).toBe(streamFrameStorageBytes(migratedFrames))
+    const firstSnapshot = structuredClone({
+      header: migratedHeader,
+      body: migratedBody,
+      preview: migratedPreview,
+      lease: migratedLease,
+      frames: migratedFrames,
+    })
+
+    migrated.close()
+    const reopened = await openProductionV94Fixture(name)
+    expect({
+      header: await reopened.messages.get(stored.header.id),
+      body: await reopened.messageBodies.get(stored.body.id),
+      preview: await reopened.messagePreviews.get(stored.preview.id),
+      lease: await reopened.streamLeases.get(leaseIdentity.streamId),
+      frames: await reopened.streamChunks
+        .where('streamId')
+        .equals(leaseIdentity.streamId)
+        .sortBy('seq'),
+    }).toEqual(firstSnapshot)
+    await reopened.delete()
+  })
+
+  it('converges every v88 lease phase and preserves only valid journal prefixes', async () => {
+    const name = `natter-test-v89-journal-phases-${Math.random().toString(36).slice(2)}`
+    await Dexie.delete(name)
+    const legacy = await openObservedWaveAFixture(name, 88)
+
+    async function framesFor(streamId: string, events: readonly unknown[]) {
+      return encodeTestStreamJournalEntries({
+        streamId,
+        chatId: 'chat-1',
+        messageId: `message:${streamId}`,
+        fence: {
+          ownerClientId: 'tab-a',
+          fenceToken: `fence:${streamId}`,
+          replacementEpoch: 0,
+          admissionSequence: 1,
+        },
+        entries: events.map((event, index) => ({ createdAt: index + 1, event })),
+      })
+    }
+
+    const terminalFrames = await framesFor('terminal-cutoff', [
+      { lane: 'text', text: 'kept' },
+      { lane: 'text', text: 'must be cut' },
+      { lane: 'finish', finishReason: 'stop' },
+    ])
+    const terminalCutoff = terminalFrames[0]?.seq ?? -1
+    const terminalLease = testGenerationLease({
+      phase: 'terminal-decided',
+      streamId: 'terminal-cutoff',
+      chatId: 'chat-1',
+      messageId: 'message:terminal-cutoff',
+      ownerClientId: 'tab-a',
+      fenceToken: 'fence:terminal-cutoff',
+      journalMaxSeq: terminalCutoff,
+      journalStorageBytes: streamFrameStorageBytes(terminalFrames.slice(0, 1)),
+      terminal: {
+        version: 1,
+        finishedAt: 4,
+        journalMaxSeq: terminalCutoff,
+        journalCompleteness: 'settled',
+        decision: { outcome: 'done' },
+      },
+    })
+
+    const canonicalFrames = await framesFor('canonical', [{ lane: 'text', text: 'obsolete' }])
+    const canonicalLease = {
+      ...testGenerationLease({
+        phase: 'canonical',
+        streamId: 'canonical',
+        chatId: 'chat-1',
+        messageId: 'message:canonical',
+        ownerClientId: 'tab-a',
+        fenceToken: 'fence:canonical',
+        journalMaxSeq: lastJournalSeq(canonicalFrames),
+        journalStorageBytes: streamFrameStorageBytes(canonicalFrames),
+      }),
+      targetOwnerKey: 'message:canonical',
+    }
+    const metadataFrames = await framesFor('metadata', [{ lane: 'text', text: 'obsolete' }])
+    const metadataLease = testGenerationLease({
+      phase: 'metadata-committed',
+      streamId: 'metadata',
+      chatId: 'chat-1',
+      messageId: 'message:metadata',
+      ownerClientId: 'tab-a',
+      fenceToken: 'fence:metadata',
+      journalMaxSeq: lastJournalSeq(metadataFrames),
+      journalStorageBytes: streamFrameStorageBytes(metadataFrames),
+    })
+
+    const gapFrames = await framesFor('gap', [
+      { lane: 'text', text: 'valid prefix' },
+      { lane: 'text', text: 'missing middle' },
+      { lane: 'text', text: 'unreachable tail' },
+    ])
+    const gapLease = testGenerationLease({
+      streamId: 'gap',
+      chatId: 'chat-1',
+      messageId: 'message:gap',
+      ownerClientId: 'tab-a',
+      fenceToken: 'fence:gap',
+      journalMaxSeq: lastJournalSeq(gapFrames),
+      journalStorageBytes: streamFrameStorageBytes(gapFrames),
+    })
+
+    const malformedFrames = await framesFor('malformed-tail', [
+      { lane: 'text', text: 'valid prefix' },
+      { lane: 'text', text: 'will lose its required field' },
+    ])
+    expect(malformedFrames.every((frame) => frame.frameKind === 'inline')).toBe(true)
+    const malformedRows = malformedFrames.map((frame, index) =>
+      index === 1 ? { ...frame, event: { lane: 'text' } } : frame,
+    )
+    const malformedLease = testGenerationLease({
+      streamId: 'malformed-tail',
+      chatId: 'chat-1',
+      messageId: 'message:malformed-tail',
+      ownerClientId: 'tab-a',
+      fenceToken: 'fence:malformed-tail',
+      journalMaxSeq: lastJournalSeq(malformedFrames),
+      journalStorageBytes: streamFrameStorageBytes(malformedFrames),
+    })
+
+    const badKeyFrames = await framesFor('bad-key', [{ lane: 'text', text: 'invalid key' }])
+    const badKeyRows = badKeyFrames.map((frame) => ({ ...frame, id: '' }))
+    const badKeyLease = testGenerationLease({
+      streamId: 'bad-key',
+      chatId: 'chat-1',
+      messageId: 'message:bad-key',
+      ownerClientId: 'tab-a',
+      fenceToken: 'fence:bad-key',
+      journalMaxSeq: lastJournalSeq(badKeyFrames),
+      journalStorageBytes: streamFrameStorageBytes(badKeyFrames),
+    })
+
+    await seedLegacyGenerationTargets(
+      legacy,
+      ['terminal-cutoff', 'canonical', 'metadata', 'gap', 'malformed-tail', 'bad-key'],
+      new Set(['canonical', 'metadata']),
+    )
+
+    await legacy
+      .table('streamLeases')
+      .bulkPut(
+        [terminalLease, canonicalLease, metadataLease, gapLease, malformedLease, badKeyLease].map(
+          (lease) => leaseWithoutJournalVersion(lease as unknown as StreamLeaseRow),
+        ),
+      )
+    await legacy
+      .table('streamChunks')
+      .bulkPut([
+        ...terminalFrames,
+        ...canonicalFrames,
+        ...metadataFrames,
+        ...gapFrames.filter((frame) => frame.seq !== 1),
+        ...malformedRows,
+        ...badKeyRows,
+      ])
+    legacy.close()
+
+    const migrated = await openProductionV94Fixture(name)
+
+    const terminalEvents = await currentJournalEvents(migrated, 'terminal-cutoff')
+    expect(terminalEvents.map(({ event }) => event)).toEqual([{ lane: 'text', text: 'kept' }])
+    expect(await migrated.streamLeases.get('terminal-cutoff')).toMatchObject({
+      journalEventVersion: 2,
+      journalMaxSeq: 0,
+      terminal: { journalMaxSeq: 0 },
+    })
+
+    expect(await migrated.streamChunks.where('streamId').equals('canonical').count()).toBe(0)
+    expect(await migrated.streamLeases.get('canonical')).toEqual(
+      expect.objectContaining({ journalEventVersion: 2, phase: 'canonical' }),
+    )
+    expect(await migrated.streamLeases.get('canonical')).not.toHaveProperty('journalMaxSeq')
+    expect(await migrated.streamLeases.get('canonical')).not.toHaveProperty('journalStorageBytes')
+    expect(await migrated.streamLeases.get('canonical')).not.toHaveProperty('targetOwnerKey')
+    expect(await migrated.streamChunks.where('streamId').equals('metadata').count()).toBe(0)
+    expect(await migrated.streamLeases.get('metadata')).toMatchObject({
+      streamId: 'metadata',
+      phase: 'metadata-committed',
+      journalEventVersion: 2,
+    })
+    expect(await migrated.streamLeases.get('metadata')).not.toHaveProperty('journalMaxSeq')
+    expect(await migrated.streamLeases.get('metadata')).not.toHaveProperty('journalStorageBytes')
+
+    const gapEvents = await currentJournalEvents(migrated, 'gap')
+    expect(gapEvents.map(({ event }) => event.lane)).toEqual(['text', 'integrity'])
+    expect(gapEvents[0]?.event).toEqual({ lane: 'text', text: 'valid prefix' })
+    expect(gapEvents[1]?.event).toMatchObject({
+      lane: 'integrity',
+      integrity: { category: 'malformed-event-shape', eventType: 'stream-journal-v89' },
+    })
+
+    const malformedEvents = await currentJournalEvents(migrated, 'malformed-tail')
+    expect(malformedEvents.map(({ event }) => event.lane)).toEqual(['text', 'integrity'])
+    expect(malformedEvents[0]?.event).toEqual({ lane: 'text', text: 'valid prefix' })
+    const badKeyEvents = await currentJournalEvents(migrated, 'bad-key')
+    expect(badKeyEvents).toHaveLength(1)
+    expect(badKeyEvents[0]?.event).toEqual({ lane: 'text', text: 'invalid key' })
+
+    const allRows = await migrated.streamChunks.toArray()
+    expect(allRows.every((row) => row.id === streamJournalFrameId(row.streamId, row.seq))).toBe(
+      true,
+    )
+    expect(allRows.every((row) => !row.streamId.startsWith('backcompat:v94:temporary:'))).toBe(true)
+    for (const streamId of ['gap', 'malformed-tail', 'bad-key']) {
+      const lease = await migrated.streamLeases.get(streamId)
+      const rows = await migrated.streamChunks.where('streamId').equals(streamId).sortBy('seq')
+      expect(lease).toMatchObject({
+        journalEventVersion: 2,
+        journalMaxSeq: rows.at(-1)?.seq,
+        journalStorageBytes: streamFrameStorageBytes(rows),
+      })
+    }
+
+    await migrated.delete()
+  })
+
+  it('migrates 49 reasoning bodies without advancing semantic versions or target leases', async () => {
+    const name = `natter-test-v89-reasoning-pages-${Math.random().toString(36).slice(2)}`
+    await Dexie.delete(name)
+    const legacy = await openObservedWaveAFixture(name, 88)
+
+    const ids = Array.from({ length: 49 }, (_, index) => `assistant-${index}`)
+    const storedRows = ids.map((id, index) =>
+      splitMessageForStorage(
+        {
+          id,
+          chatId: 'chat-1',
+          parentId: index === 0 ? null : (ids[index - 1] ?? null),
+          siblingIndex: 0,
+          turnId: `turn-${index}`,
+          turnIndex: 0,
+          createdAt: index + 1,
+          role: 'assistant',
+          origin: 'generated',
+          generation: {
+            model: 'test/model',
+            requestedModel: 'test/model',
+            apiUsed: 'chat',
+            startedAt: index + 1,
+            finishedAt: index + 1,
+            status: 'done',
+            reasoningCarryForward: 'none',
+            reasoningVisibility: { disclosure: 'unknown' },
+          },
+          content: [{ type: 'output_text', text: `answer ${index}` }],
+          nodeVersion: 1,
+          deleted: false,
+        },
+        { bodyVersion: 1 },
+      ),
+    )
+    await legacy.table('chats').put({
+      ...buildChat({ id: 'chat-1', title: 'Reasoning pages', now: 1 }),
+      lastUpdatedLeafId: ids.at(-1) ?? null,
+    })
+    await legacy
+      .table('messages')
+      .bulkPut(storedRows.map(({ header }) => messageHeaderWithoutReasoningCarryForward(header)))
+    await legacy.table('messagePreviews').bulkPut(storedRows.map(({ preview }) => preview))
+    await legacy.table('messageBodies').bulkPut(
+      storedRows.map(({ body }, index) => ({
+        ...body,
+        reasoningDetails: [
+          {
+            type: 'reasoning.text',
+            format: 'unknown',
+            text: `thought ${index}`,
+            id: `thought-${index}`,
+          },
+        ],
+      })),
+    )
+    await legacy.table('streamLeases').bulkPut(
+      ids.map((messageId, index) =>
+        leaseWithoutJournalVersion(
+          testContinuationLease({
+            streamId: `stream-${index}`,
+            chatId: 'chat-1',
+            messageId,
+            ownerClientId: 'tab-a',
+            fenceToken: `fence-${index}`,
+            admissionSequence: index + 1,
+            baseNodeVersion: 1,
+            baseBodyVersion: 1,
+          }),
+        ),
+      ),
+    )
+    legacy.close()
+
+    const migrated = await prepareProductionV94Fixture(name)
+    const whereSpy = vi.spyOn(migrated.Table.prototype, 'where')
+    await migrated.open()
+    const targetLeaseQueries = whereSpy.mock.calls.filter(
+      ([index]) => typeof index === 'string' && index === 'targetOwnerKey',
+    )
+    whereSpy.mockRestore()
+
+    expect(targetLeaseQueries).toHaveLength(0)
+    const [headers, bodies, leases] = await Promise.all([
+      migrated.messages.bulkGet(ids),
+      migrated.messageBodies.bulkGet(ids),
+      migrated.streamLeases.bulkGet(ids.map((_id, index) => `stream-${index}`)),
+    ])
+    for (let index = 0; index < ids.length; index += 1) {
+      expect(headers[index]).toMatchObject({
+        id: ids[index],
+        nodeVersion: 1,
+        bodyVersion: 1,
+        requestContextVersion: 1,
+        generation: { reasoningCarryForward: 'unknown' },
+      })
+      expect(bodies[index]).toMatchObject({ id: ids[index], bodyVersion: 1 })
+      expect(isReasoningEnvelope(bodies[index]?.reasoningEnvelope)).toBe(true)
+      expect(bodies[index]).not.toHaveProperty('reasoningDetails')
+      expect(leases[index]).toMatchObject({
+        journalEventVersion: 2,
+        dispatch: {
+          baseNodeVersion: 1,
+          baseBodyVersion: 1,
+          reasoningCarryForward: 'unknown',
+        },
+      })
+    }
+    await migrated.delete()
+  })
+
+  it('rolls back the whole v94 cutover and cleanly retries after a later upgrade fails', async () => {
+    const name = `natter-test-v89-rollback-${Math.random().toString(36).slice(2)}`
+    await Dexie.delete(name)
+    const legacy = await openObservedWaveAFixture(name, 88)
+    const stored = splitMessageForStorage(
+      {
+        id: 'assistant-rollback',
+        chatId: 'chat-1',
+        parentId: null,
+        siblingIndex: 0,
+        turnId: 'turn-1',
+        turnIndex: 0,
+        createdAt: 1,
+        role: 'assistant',
+        origin: 'generated',
+        generation: {
+          model: 'anthropic/claude-sonnet-4.6',
+          requestedModel: 'anthropic/claude-sonnet-4.6',
+          apiUsed: 'anthropic-messages',
+          startedAt: 1,
+          status: 'done',
+          reasoningCarryForward: 'none',
+          reasoningVisibility: { disclosure: 'unknown' },
+        },
+        content: [{ type: 'output_text', text: 'answer' }],
+        nodeVersion: 4,
+        deleted: false,
+      },
+      { bodyVersion: 4 },
+    )
+    const legacyBody = {
+      ...stored.body,
+      reasoningDetails: [
+        {
+          type: 'reasoning.text',
+          format: 'anthropic-claude-v1',
+          text: 'rollback thought',
+          signature: 'rollback signature',
+        },
+      ],
+    }
+    await legacy.table('messages').put(messageHeaderWithoutReasoningCarryForward(stored.header))
+    await legacy.table('messageBodies').put(legacyBody)
+    await legacy.table('messagePreviews').put(stored.preview)
+    legacy.close()
+
+    const attempted = await prepareProductionV94Fixture(name)
+    attempted.version(CURRENT_DB_VERSION + 1).upgrade(() => {
+      throw new Error('InjectedPostV94Failure')
+    })
+    await expect(attempted.open()).rejects.toThrow('InjectedPostV94Failure')
+    attempted.close()
+
+    const stillV88 = await openObservedWaveAFixture(name, 88)
+    expect(stillV88.verno).toBe(88)
+    expect(await stillV88.table('messages').get(stored.header.id)).toMatchObject({
+      nodeVersion: 4,
+      bodyVersion: 4,
+    })
+    expect(await stillV88.table('messageBodies').get(stored.body.id)).toMatchObject({
+      bodyVersion: 4,
+      reasoningDetails: legacyBody.reasoningDetails,
+    })
+    expect(await stillV88.table('messageBodies').get(stored.body.id)).not.toHaveProperty(
+      'reasoningEnvelope',
+    )
+    stillV88.close()
+
+    const retried = await openProductionV94Fixture(name)
+    expect(retried.verno).toBe(CURRENT_DB_VERSION)
+    expect(await retried.messages.get(stored.header.id)).toMatchObject({
+      nodeVersion: 4,
+      bodyVersion: 4,
+      generation: { reasoningCarryForward: 'unknown' },
+    })
+    const body = await retried.messageBodies.get(stored.body.id)
+    expect(body).toMatchObject({ bodyVersion: 4 })
+    expect(body).not.toHaveProperty('reasoningDetails')
+    expect(isReasoningEnvelope(body?.reasoningEnvelope)).toBe(true)
+    await retried.delete()
+  })
+
+  it('migrates one semantic journal event larger than the 4 MiB output batch intact', async () => {
+    const name = `natter-test-v89-large-event-${Math.random().toString(36).slice(2)}`
+    await Dexie.delete(name)
+    const legacy = await openObservedWaveAFixture(name, 88)
+
+    const streamId = 'large-event'
+    const hugeText = `${'x'.repeat(4 * 1024 * 1024)}:exact-tail`
+    const frames = await encodeTestStreamJournalEntries({
+      streamId,
+      chatId: 'chat-1',
+      messageId: 'message:large-event',
+      fence: {
+        ownerClientId: 'tab-a',
+        fenceToken: 'fence:large-event',
+        replacementEpoch: 0,
+        admissionSequence: 1,
+      },
+      entries: [{ createdAt: 1, event: { lane: 'text', text: hugeText } }],
+    })
+    const lease = testGenerationLease({
+      streamId,
+      chatId: 'chat-1',
+      messageId: 'message:large-event',
+      ownerClientId: 'tab-a',
+      fenceToken: 'fence:large-event',
+      journalMaxSeq: lastJournalSeq(frames),
+      journalStorageBytes: streamFrameStorageBytes(frames),
+    })
+    await seedLegacyGenerationTargets(legacy, [streamId], new Set())
+    await legacy.table('streamChunks').bulkPut(frames)
+    await legacy.table('streamLeases').put(leaseWithoutJournalVersion(lease))
+    legacy.close()
+
+    const migrated = await openProductionV94Fixture(name)
+    const events = await currentJournalEvents(migrated, streamId)
+    expect(events).toHaveLength(1)
+    expect(events[0]?.event.lane).toBe('text')
+    if (events[0]?.event.lane !== 'text') throw new Error('ExpectedLargeTextEvent')
+    expect(events[0].event.text.length).toBe(hugeText.length)
+    expect(events[0].event.text).toBe(hugeText)
+    const migratedFrames = await migrated.streamChunks
+      .where('streamId')
+      .equals(streamId)
+      .sortBy('seq')
+    expect(await migrated.streamLeases.get(streamId)).toMatchObject({
+      journalEventVersion: 2,
+      journalMaxSeq: migratedFrames.at(-1)?.seq,
+      journalStorageBytes: streamFrameStorageBytes(migratedFrames),
+    })
+    await migrated.delete()
+  }, 30_000)
+
+  it('migrates 2,048 legacy reasoning bodies through one constant-memory cursor', async () => {
+    const name = `natter-test-v89-body-stress-${Math.random().toString(36).slice(2)}`
+    await Dexie.delete(name)
+    const legacy = await openObservedWaveAFixture(name, 88)
+
+    const rowCount = 2_048
+    const storedRows = Array.from({ length: rowCount }, (_, index) =>
+      splitMessageForStorage(
+        {
+          id: `stress-message-${index}`,
+          chatId: `stress-chat-${Math.floor(index / 64)}`,
+          parentId: null,
+          siblingIndex: 0,
+          turnId: `stress-turn-${index}`,
+          turnIndex: 0,
+          createdAt: index + 1,
+          role: 'assistant',
+          origin: 'generated',
+          generation: {
+            model: 'test/model',
+            requestedModel: 'test/model',
+            apiUsed: 'chat',
+            startedAt: index + 1,
+            finishedAt: index + 1,
+            status: 'done',
+            reasoningCarryForward: 'none',
+            reasoningVisibility: { disclosure: 'unknown' },
+          },
+          content: [{ type: 'output_text', text: `answer ${index}` }],
+          nodeVersion: 1,
+          deleted: false,
+        },
+        { bodyVersion: 1 },
+      ),
+    )
+    await legacy.table('messages').bulkPut(storedRows.map(({ header }) => header))
+    await legacy.table('messagePreviews').bulkPut(storedRows.map(({ preview }) => preview))
+    await legacy.table('messageBodies').bulkPut(
+      storedRows.map(({ body }, index) => ({
+        ...body,
+        reasoningDetails: [
+          {
+            type: 'reasoning.text',
+            format: 'unknown',
+            text: `thought ${index}`,
+          },
+        ],
+      })),
+    )
+    legacy.close()
+
+    const migrated = await prepareProductionV94Fixture(name)
+    const whereSpy = vi.spyOn(migrated.Table.prototype, 'where')
+    const openCursorSpy = vi.spyOn(IDBObjectStore.prototype, 'openCursor')
+    await migrated.open()
+    const targetLeaseQueries = whereSpy.mock.calls.filter(
+      ([index]) => typeof index === 'string' && index === 'targetOwnerKey',
+    )
+    const messageBodyCursorCalls = openCursorSpy.mock.contexts.filter(
+      (context) => context instanceof IDBObjectStore && context.name === 'messageBodies',
+    )
+    whereSpy.mockRestore()
+    openCursorSpy.mockRestore()
+
+    expect(targetLeaseQueries).toHaveLength(0)
+    expect(messageBodyCursorCalls).toHaveLength(1)
+    const [headers, bodies, previews] = await Promise.all([
+      migrated.messages.toArray(),
+      migrated.messageBodies.toArray(),
+      migrated.messagePreviews.toArray(),
+    ])
+    expect(headers).toHaveLength(rowCount)
+    expect(bodies).toHaveLength(rowCount)
+    expect(previews).toHaveLength(rowCount)
+    expect(
+      headers.every(
+        (header) =>
+          header.nodeVersion === 1 &&
+          header.bodyVersion === 1 &&
+          header.requestContextVersion === 1,
+      ),
+    ).toBe(true)
+    expect(
+      bodies.every(
+        (body) =>
+          body.bodyVersion === 1 &&
+          isReasoningEnvelope(body.reasoningEnvelope) &&
+          !Object.hasOwn(body, 'reasoningDetails'),
+      ),
+    ).toBe(true)
+    expect(previews.every((preview) => preview.bodyVersion === 1)).toBe(true)
+    await migrated.delete()
+  }, 30_000)
+
+  it('upgrades observed v89 carry-forward evidence through bounded v94 cursor passes', async () => {
+    const name = `natter-test-v90-carry-forward-${Math.random().toString(36).slice(2)}`
+    await Dexie.delete(name)
+    const legacy = await openObservedWaveAFixture(name, 89)
+
+    const hugeTail = `${'x'.repeat(1024 * 1024)}:v90-tail`
+    const stored = splitMessageForStorage(
+      {
+        id: 'assistant-v90',
+        chatId: 'chat-v90',
+        parentId: null,
+        siblingIndex: 0,
+        turnId: 'turn-v90',
+        turnIndex: 0,
+        createdAt: 11,
+        role: 'assistant',
+        origin: 'generated',
+        generation: {
+          model: 'test/model',
+          requestedModel: 'test/model',
+          apiUsed: 'chat',
+          status: 'done',
+          startedAt: 11,
+          finishedAt: 12,
+          reasoningCarryForward: 'none',
+          reasoningVisibility: { disclosure: 'unknown' },
+        },
+        content: [{ type: 'output_text', text: hugeTail }],
+        continuationAttempts: [
+          {
+            streamId: 'continuation-v90-a',
+            strategy: 'prompt',
+            status: 'done',
+            startedAt: 13,
+            finishedAt: 14,
+            reasoningCarryForward: 'none',
+            reasoningVisibility: { disclosure: 'unknown' },
+            application: { kind: 'applied' },
+          },
+          {
+            streamId: 'continuation-v90-b',
+            strategy: 'prefill',
+            status: 'error',
+            startedAt: 15,
+            finishedAt: 16,
+            reasoningCarryForward: 'none',
+            reasoningVisibility: { disclosure: 'unknown' },
+            application: { kind: 'applied' },
+          },
+        ],
+        nodeVersion: 7,
+        deleted: false,
+      },
+      { bodyVersion: 9, updatedAt: 17 },
+    )
+    const legacyHeader = messageHeaderWithoutReasoningCarryForward(stored.header)
+    const legacyBody = messageBodyWithoutReasoningCarryForward(stored.body, 'invalid')
+    const targetRows = [
+      splitMessageForStorage(
+        {
+          id: 'assistant-v90-generation',
+          chatId: 'chat-v90',
+          parentId: null,
+          siblingIndex: 1,
+          turnId: 'turn-v90-generation',
+          turnIndex: 0,
+          createdAt: 20,
+          role: 'assistant',
+          origin: 'generated',
+          generation: {
+            model: 'test/model',
+            requestedModel: 'test/model',
+            apiUsed: 'chat',
+            status: 'streaming',
+            startedAt: 20,
+            reasoningCarryForward: 'none',
+            reasoningVisibility: { disclosure: 'unknown' },
+          },
+          content: [],
+          nodeVersion: 1,
+          deleted: false,
+        },
+        { bodyVersion: 1 },
+      ),
+      splitMessageForStorage(
+        {
+          id: 'assistant-v90-continuation',
+          chatId: 'chat-v90',
+          parentId: null,
+          siblingIndex: 2,
+          turnId: 'turn-v90-continuation',
+          turnIndex: 0,
+          createdAt: 21,
+          role: 'assistant',
+          origin: 'generated',
+          generation: {
+            model: 'test/model',
+            requestedModel: 'test/model',
+            apiUsed: 'chat',
+            status: 'done',
+            startedAt: 21,
+            finishedAt: 22,
+            reasoningCarryForward: 'none',
+            reasoningVisibility: { disclosure: 'unknown' },
+          },
+          content: [{ type: 'output_text', text: 'continuation target' }],
+          nodeVersion: 7,
+          deleted: false,
+        },
+        { bodyVersion: 9 },
+      ),
+      splitMessageForStorage(
+        {
+          id: 'reserved-target-v90',
+          chatId: 'chat-v90',
+          parentId: null,
+          siblingIndex: 3,
+          turnId: 'turn-v90-reserved',
+          turnIndex: 0,
+          createdAt: 23,
+          role: 'assistant',
+          origin: 'generated',
+          generation: {
+            model: 'test/model',
+            requestedModel: 'test/model',
+            apiUsed: 'chat',
+            status: 'streaming',
+            startedAt: 23,
+            reasoningCarryForward: 'none',
+            reasoningVisibility: { disclosure: 'unknown' },
+          },
+          content: [],
+          nodeVersion: 1,
+          deleted: false,
+        },
+        { bodyVersion: 1 },
+      ),
+      splitMessageForStorage(
+        {
+          id: 'null-target-v90',
+          chatId: 'chat-v90',
+          parentId: null,
+          siblingIndex: 4,
+          turnId: 'turn-v90-null',
+          turnIndex: 0,
+          createdAt: 24,
+          role: 'assistant',
+          origin: 'generated',
+          generation: {
+            model: 'test/model',
+            requestedModel: 'test/model',
+            apiUsed: 'chat',
+            status: 'done',
+            startedAt: 24,
+            finishedAt: 25,
+            reasoningCarryForward: 'none',
+            reasoningVisibility: { disclosure: 'unknown' },
+          },
+          content: [{ type: 'output_text', text: 'terminal target' }],
+          nodeVersion: 1,
+          deleted: false,
+        },
+        { bodyVersion: 1 },
+      ),
+    ]
+    const generationLease = {
+      ...leaseWithoutReasoningCarryForward(
+        testGenerationLease({
+          streamId: 'generation-v90',
+          chatId: 'chat-v90',
+          messageId: 'assistant-v90-generation',
+          revision: 4,
+          controlRevision: 0,
+        }),
+      ),
+      journalEventVersion: 1,
+    }
+    const continuationLease = {
+      ...leaseWithoutReasoningCarryForward(
+        testContinuationLease({
+          streamId: 'continuation-v90',
+          chatId: 'chat-v90',
+          messageId: 'assistant-v90-continuation',
+          revision: 5,
+          baseNodeVersion: 7,
+          baseBodyVersion: 9,
+        }),
+      ),
+      journalEventVersion: 1,
+    }
+    const reservedLease = testGenerationLease({
+      phase: 'reserved',
+      streamId: 'reserved-v90',
+      chatId: 'chat-v90',
+      messageId: 'reserved-target-v90',
+      revision: 6,
+    })
+    const nullDispatchLease = testGenerationLease({
+      phase: 'canonical',
+      dispatched: false,
+      streamId: 'null-dispatch-v90',
+      chatId: 'chat-v90',
+      messageId: 'null-target-v90',
+      revision: 7,
+    })
+
+    await legacy.table('chats').put({
+      ...buildChat({ id: 'chat-v90', title: 'Carry forward', now: 1 }),
+      lastUpdatedLeafId: stored.header.id,
+    })
+    await legacy
+      .table('messages')
+      .bulkPut([
+        legacyHeader,
+        ...targetRows.map(({ header }) => messageHeaderWithoutReasoningCarryForward(header)),
+      ])
+    await legacy
+      .table('messageBodies')
+      .bulkPut([
+        legacyBody,
+        ...targetRows.map(({ body }) => messageBodyWithoutReasoningCarryForward(body)),
+      ])
+    await legacy
+      .table('messagePreviews')
+      .bulkPut([stored.preview, ...targetRows.map(({ preview }) => preview)])
+    await legacy
+      .table('streamLeases')
+      .bulkPut([generationLease, continuationLease, reservedLease, nullDispatchLease])
+    legacy.close()
+
+    const migrated = await prepareProductionV94Fixture(name)
+    const openCursorSpy = vi.spyOn(IDBObjectStore.prototype, 'openCursor')
+    const toArraySpy = vi.spyOn(migrated.Table.prototype, 'toArray')
+    const whereSpy = vi.spyOn(migrated.Table.prototype, 'where')
+    await migrated.open()
+    const migrationCursorNames = openCursorSpy.mock.contexts
+      .filter((context): context is IDBObjectStore => context instanceof IDBObjectStore)
+      .map((context) => context.name)
+      .filter(
+        (table) => table === 'messages' || table === 'messageBodies' || table === 'streamLeases',
+      )
+    const migrationToArrayCalls = toArraySpy.mock.calls.length
+    const targetOwnerQueries = whereSpy.mock.calls.filter(
+      ([index]) => typeof index === 'string' && index === 'targetOwnerKey',
+    )
+    openCursorSpy.mockRestore()
+    toArraySpy.mockRestore()
+    whereSpy.mockRestore()
+
+    expect(migrationToArrayCalls).toBe(0)
+    expect(targetOwnerQueries).toHaveLength(0)
+    expect(migrationCursorNames.filter((table) => table === 'messages').length).toBeLessThanOrEqual(
+      4,
+    )
+    expect(
+      migrationCursorNames.filter((table) => table === 'messageBodies').length,
+    ).toBeLessThanOrEqual(2)
+    expect(
+      migrationCursorNames.filter((table) => table === 'streamLeases').length,
+    ).toBeLessThanOrEqual(4)
+
+    const [header, body, leases] = await Promise.all([
+      migrated.messages.get(stored.header.id),
+      migrated.messageBodies.get(stored.body.id),
+      migrated.streamLeases.bulkGet([
+        'generation-v90',
+        'continuation-v90',
+        'reserved-v90',
+        'null-dispatch-v90',
+      ]),
+    ])
+    expect(header).toMatchObject({
+      nodeVersion: 7,
+      bodyVersion: 9,
+      requestContextVersion: stored.header.requestContextVersion,
+      generation: { reasoningCarryForward: 'unknown' },
+    })
+    expect(body).toMatchObject({ bodyVersion: 9, updatedAt: 17 })
+    expect(body?.content[0]).toEqual({ type: 'output_text', text: hugeTail })
+    expect(body?.continuationAttempts?.map((attempt) => attempt.reasoningCarryForward)).toEqual([
+      'unknown',
+      'unknown',
+    ])
+    expect(leases[0]).toMatchObject({
+      custody: 'recovery-pending',
+      revision: 5,
+      controlRevision: 0,
+      dispatch: { reasoningCarryForward: 'unknown' },
+      handoffReason: 'owner-unavailable',
+    })
+    expect(leases[1]).toMatchObject({
+      custody: 'recovery-pending',
+      revision: 6,
+      dispatch: {
+        baseNodeVersion: 7,
+        baseBodyVersion: 9,
+        reasoningCarryForward: 'unknown',
+      },
+      handoffReason: 'owner-unavailable',
+    })
+    expect(leases[2]).toMatchObject({
+      custody: 'recovery-pending',
+      revision: 7,
+      handoffReason: 'owner-unavailable',
+    })
+    expect(leases[3]).toEqual(nullDispatchLease)
+    const migratedSnapshot = { header, body, leases }
+    migrated.close()
+
+    const reopened = await prepareProductionV94Fixture(name)
+    const reopenCursorSpy = vi.spyOn(IDBObjectStore.prototype, 'openCursor')
+    await reopened.open()
+    const reopenedMigrationCursors = reopenCursorSpy.mock.contexts.filter(
+      (context) =>
+        context instanceof IDBObjectStore &&
+        (context.name === 'messages' ||
+          context.name === 'messageBodies' ||
+          context.name === 'streamLeases'),
+    )
+    reopenCursorSpy.mockRestore()
+    expect(reopenedMigrationCursors).toHaveLength(0)
+    expect({
+      header: await reopened.messages.get(stored.header.id),
+      body: await reopened.messageBodies.get(stored.body.id),
+      leases: await reopened.streamLeases.bulkGet([
+        'generation-v90',
+        'continuation-v90',
+        'reserved-v90',
+        'null-dispatch-v90',
+      ]),
+    }).toEqual(migratedSnapshot)
+    await reopened.delete()
+  }, 30_000)
 })
+
+type ObservedWaveAFixtureVersion = 88 | 89
+
+async function openObservedWaveAFixture(
+  name: string,
+  version: ObservedWaveAFixtureVersion,
+): Promise<Dexie> {
+  const db = new Dexie(name)
+  db.version(version).stores(observedWaveAStoreSpec(version))
+  await db.open()
+  if (db.verno !== version) {
+    db.close()
+    throw new Error(`ObservedWaveAFixtureVersionMismatch:${version}:${db.verno}`)
+  }
+  return db
+}
+
+async function prepareProductionV94Fixture(name: string): Promise<NatterDb> {
+  const db = createDbForTests(name)
+  await prepareBrowserWorkspaceSchema(db)
+  return db
+}
+
+async function openProductionV94Fixture(name: string): Promise<NatterDb> {
+  const db = await prepareProductionV94Fixture(name)
+  await db.open()
+  return db
+}
+
+function streamFrameStorageBytes(frames: readonly unknown[]): number {
+  return frames.reduce<number>(
+    (sum, frame) =>
+      sum + estimateStreamJournalFrameStorageBytes(requireCanonicalStreamJournalFrame(frame)),
+    0,
+  )
+}
+
+function canonicalJournalFrames(frames: readonly unknown[]) {
+  return frames.map(requireCanonicalStreamJournalFrame)
+}
+
+function lastJournalSeq(frames: readonly { readonly seq: number }[]): number {
+  const last = frames.at(-1)
+  if (!last) throw new Error('ExpectedNonEmptyJournalFrames')
+  return last.seq
+}
+
+function leaseWithoutJournalVersion(lease: StreamLeaseRow): Record<string, unknown> {
+  const { journalEventVersion: _journalEventVersion, ...legacy } = lease
+  return leaseWithoutReasoningCarryForward(legacy)
+}
+
+function leaseWithoutReasoningCarryForward(
+  lease: Omit<StreamLeaseRow, 'journalEventVersion'> | StreamLeaseRow,
+): Record<string, unknown> {
+  if (lease.phase === 'reserved' || lease.dispatch === null) return { ...lease }
+  const dispatch = { ...lease.dispatch } as Record<string, unknown>
+  delete dispatch.reasoningCarryForward
+  delete dispatch.reasoningVisibility
+  return { ...lease, dispatch }
+}
+
+function messageHeaderWithoutReasoningCarryForward(
+  header: MessageHeaderRow,
+): Record<string, unknown> {
+  if (!header.generation) return { ...header }
+  const {
+    reasoningCarryForward: _reasoningCarryForward,
+    reasoningVisibility: _reasoningVisibility,
+    ...generation
+  } = header.generation
+  return { ...header, generation }
+}
+
+function messageBodyWithoutReasoningCarryForward(
+  body: MessageBodyRow,
+  secondAttemptFact: unknown = undefined,
+): Record<string, unknown> {
+  if (!body.continuationAttempts) return { ...body }
+  return {
+    ...body,
+    continuationAttempts: body.continuationAttempts.map((attempt, index) => {
+      const {
+        application: _application,
+        reasoningCarryForward: _reasoningCarryForward,
+        reasoningVisibility: _reasoningVisibility,
+        ...legacy
+      } = attempt
+      return index === 1 && secondAttemptFact !== undefined
+        ? { ...legacy, reasoningCarryForward: secondAttemptFact }
+        : legacy
+    }),
+  }
+}
+
+async function currentJournalEvents(db: NatterDb, streamId: string) {
+  const frames = await db.streamChunks.where('streamId').equals(streamId).sortBy('seq')
+  if (frames.length === 0) return []
+  const first = frames[0]
+  if (!first) return []
+  const decoded = await decodeTestStreamJournalFrames(canonicalJournalFrames(frames), {
+    streamId,
+    chatId: first.chatId,
+    messageId: first.messageId,
+    replacementEpoch: first.replacementEpoch,
+    admissionSequence: first.admissionSequence,
+  })
+  return decoded.map((entry) => {
+    const persisted = persistedStreamEventV2FromUnknown(entry.event)
+    if (!persisted) {
+      const raw =
+        entry.event && typeof entry.event === 'object'
+          ? (entry.event as Record<string, unknown>)
+          : undefined
+      throw new Error(
+        `ExpectedPersistedStreamEventV2:${raw ? Object.keys(raw).join(',') : typeof entry.event}:${first.ownerClientId}:${first.fenceToken}:${frames.length}`,
+      )
+    }
+    return { createdAt: entry.createdAt, event: persisted.event }
+  })
+}
+
+async function runAuditedCurrentSchemaBackfills(db: NatterDb): Promise<void> {
+  await backfillMissingMessageBodies(db)
+  await runWaveADerivedRowsForTest(db)
+  await backfillChatPreviewProjection(db)
+  await migrateGlobalSettingsRows(db)
+  await migrateProviderOutputItemRows(db)
+  await migrateProviderToolSettingsRows(db)
+  await rebuildTokenCalibrationGlobalRows(db)
+  await canonicalizeTokenCalibrationRows(db)
+}
+
+async function runWaveADerivedRowsForTest(db: NatterDb): Promise<void> {
+  await db.transaction('rw', db.tables, (tx) =>
+    migrateWaveADerivedRowsV94(tx, {
+      observedAt: 1,
+      recordObsoleteBytes: () => {},
+    }),
+  )
+  await db.settings.put({ key: 'backfill:organization-fields-v1', value: 1 })
+}
 
 function legacyEndpoint(
   provider_name: string,
@@ -2973,6 +5739,8 @@ function legacyMessage(input: {
             delivery: 'buffered' as const,
             cost: input.cost,
             costSource: 'estimated' as const,
+            reasoningCarryForward: 'none' as const,
+            reasoningVisibility: { disclosure: 'unknown' as const },
             startedAt: 1,
           },
         }
@@ -2980,4 +5748,62 @@ function legacyMessage(input: {
     nodeVersion: 0,
     deleted: input.deleted ?? false,
   }
+}
+
+function legacyEmptyMessageBody(
+  id: string,
+  chatId: string,
+  nodeVersion = 0,
+): Record<string, unknown> {
+  return {
+    id,
+    chatId,
+    nodeVersion,
+    updatedAt: 1,
+    content: [],
+  }
+}
+
+async function seedLegacyGenerationTargets(
+  db: Dexie,
+  streamIds: readonly string[],
+  finishedStreamIds: ReadonlySet<string>,
+): Promise<void> {
+  const chat = {
+    ...buildChat({ id: 'chat-1', title: 'Stream migration', now: 1 }),
+    lastUpdatedLeafId: streamIds.at(-1) ? `message:${streamIds.at(-1)}` : null,
+  }
+  const stored = streamIds.map((streamId, index) =>
+    splitMessageForStorage({
+      id: `message:${streamId}`,
+      chatId: chat.id,
+      parentId: null,
+      siblingIndex: index,
+      turnId: `turn:${streamId}`,
+      turnIndex: index,
+      createdAt: index + 1,
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_text', text: '' }],
+      generation: {
+        id: `generation:${streamId}`,
+        model: 'test/model',
+        requestedModel: 'test/model',
+        apiUsed: 'chat',
+        delivery: 'streaming',
+        status: finishedStreamIds.has(streamId) ? 'done' : 'streaming',
+        costSource: 'stream',
+        reasoningCarryForward: 'none',
+        reasoningVisibility: { disclosure: 'unknown' },
+        startedAt: 1,
+        ...(finishedStreamIds.has(streamId) ? { finishedAt: 2 } : {}),
+      },
+      nodeVersion: 0,
+      deleted: false,
+    }),
+  )
+  await db.table('chats').put(chat)
+  await db.table('messages').bulkPut(stored.map(({ header }) => header))
+  await db.table('messageBodies').bulkPut(stored.map(({ body }) => body))
+  await db.table('messagePreviews').bulkPut(stored.map(({ preview }) => preview))
 }

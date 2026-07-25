@@ -6,9 +6,20 @@ import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { beforeAll, describe, expect, it } from 'vitest'
 import { type ResponsesContext, responses, responsesOnce } from '../../src/api/responses'
-import { type StreamLaneEvent, splitResponsesStream } from '../../src/api/stream-transforms'
+import { splitResponsesStream as splitResponsesStreamWithContract } from '../../src/api/stream-transforms'
 import type { ResponsesEventWire, ResponsesInputItem } from '../../src/api/types'
+import type { StreamLaneEvent } from '../../src/core/generation-stream-live-events'
+import { OPENAI_RESPONSES_PROVIDER_OUTPUT_CONTRACT } from '../../src/core/provider-tool-context'
 import type { ConnectionProfile } from '../../src/core/types'
+import { responsesReasoningContract } from '../helpers/reasoning-contracts'
+
+function splitResponsesStream(source: Parameters<typeof splitResponsesStreamWithContract>[0]) {
+  return splitResponsesStreamWithContract(
+    source,
+    responsesReasoningContract(),
+    OPENAI_RESPONSES_PROVIDER_OUTPUT_CONTRACT,
+  )
+}
 
 const LIVE = process.env.LIVE === '1'
 
@@ -305,10 +316,13 @@ describe.skipIf(!LIVE)('live — OpenAI direct Responses (gpt-5.4-nano)', () => 
     expect(phaseEvent).toBeDefined()
     const finish = lanes.find((l) => l.lane === 'finish')
     expect(finish).toBeDefined()
-    const encryptedLane = lanes.filter(
-      (l): l is Extract<StreamLaneEvent, { lane: 'reasoning' }> =>
-        l.lane === 'reasoning' && l.encryptedDelta !== undefined,
-    )
+    const encryptedLane = lanes
+      .filter((lane) => lane.lane === 'reasoning-observation')
+      .flatMap((lane) => lane.batch.observations)
+      .filter(
+        (observation) =>
+          observation.kind === 'carrier' && observation.carrierKind === 'responses-encrypted',
+      )
     // OpenAI direct DOES emit reasoning output_item events (unlike OpenRouter).
     expect(encryptedLane.length).toBeGreaterThanOrEqual(1)
   }, 90_000)

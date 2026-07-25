@@ -12,13 +12,20 @@ import { existsSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import type { GeminiStreamChunk, GenerateContentResponseWire } from '../../src/api/gemini-types'
-import { type StreamLaneEvent, splitGeminiStream } from '../../src/api/stream-transforms'
-import {
-  applyStreamAccumulatorEvent,
-  createStreamAccumulator,
-  projectStreamAccumulatorFinal,
-} from '../../src/core/stream-accumulator'
+import { splitGeminiStream as splitGeminiStreamWithContract } from '../../src/api/stream-transforms'
+import type { StreamLaneEvent } from '../../src/core/generation-stream-live-events'
+import { GOOGLE_PROVIDER_OUTPUT_CONTRACT } from '../../src/core/provider-tool-context'
 import { geminiBufferedResult, geminiStreamSse } from '../helpers/protocol-fixtures'
+import { geminiReasoningContract } from '../helpers/reasoning-contracts'
+import { collectReasoningObservations, foldStreamLaneEvents } from '../helpers/reasoning-events'
+
+function splitGeminiStream(source: Parameters<typeof splitGeminiStreamWithContract>[0]) {
+  return splitGeminiStreamWithContract(
+    source,
+    geminiReasoningContract(),
+    GOOGLE_PROVIDER_OUTPUT_CONTRACT,
+  )
+}
 
 const PROBE8 = resolve(__dirname, '../../../plan/phase11-probes/08-gemini-native-stream.sse')
 const PROBE3 = resolve(__dirname, '../../../plan/phase11-probes/03-gemini-native.json')
@@ -50,7 +57,7 @@ function sseToChunks(body: string): GeminiStreamChunk[] {
 }
 
 describe('splitGeminiStream — representative native stream', () => {
-  it('emits meta + text + one replaceEncrypted reasoning event + finish', async () => {
+  it('emits meta, text, one source-stable thought-signature carrier, and finish', async () => {
     const lanes = await collect(splitGeminiStream(asAsync(sseToChunks(geminiStreamSse))))
 
     const firstMeta = lanes.find((l) => l.lane === 'meta')
@@ -62,13 +69,19 @@ describe('splitGeminiStream — representative native stream', () => {
     )
     expect(texts.length).toBeGreaterThan(0)
 
-    const reasoning = lanes.filter(
-      (l): l is Extract<StreamLaneEvent, { lane: 'reasoning' }> => l.lane === 'reasoning',
+    const encrypted = collectReasoningObservations(lanes).filter(
+      (operation) =>
+        operation.kind === 'carrier' && operation.carrierKind === 'gemini-thought-signature',
     )
-    const encrypted = reasoning.filter((r) => r.encryptedDelta !== undefined)
     expect(encrypted.length).toBe(1)
-    expect(encrypted[0]?.replaceEncrypted).toBe(true)
-    expect(encrypted[0]?.encryptedDelta?.length).toBeGreaterThan(100)
+    expect(encrypted[0]?.update).toBe('set')
+    expect(encrypted[0]?.value.length).toBeGreaterThan(100)
+    expect(encrypted[0]?.source).toMatchObject({
+      dialect: 'gemini-native',
+      candidateIndex: 0,
+    })
+    expect(typeof encrypted[0]?.source.frameIndex).toBe('number')
+    expect(typeof encrypted[0]?.source.partIndex).toBe('number')
 
     expect(lanes.some((l) => l.lane === 'usage')).toBe(true)
     const finish = lanes.find((l) => l.lane === 'finish')
@@ -76,17 +89,8 @@ describe('splitGeminiStream — representative native stream', () => {
   })
 })
 
-describe('splitGeminiStream — coalesces thought:true parts into one summary row', () => {
-  it('all thought:true parts share summaryIndex: 0 with `\\n\\n` separators', async () => {
-    // Gemini emits each thinking section as its own atomic `thought: true`
-    // part. Earlier behavior assigned each a unique summaryIndex, which
-    // produced one reasoning.summary row per section in storage and one
-    // visual block per section in the UI. The user-facing complaint:
-    // separate paragraphs of the same logical reasoning got rendered as
-    // distinct blocks. Fix: coalesce to ONE row by sharing summaryIndex
-    // across all parts; the accumulator's mergeReasoningText concatenates
-    // them (with the `\n\n` prepended on non-first parts) into a single
-    // continuous summary.
+describe('splitGeminiStream — preserves atomic thought:true provider parts', () => {
+  it('retains every thought part with exact candidate/frame/part coordinates', async () => {
     const frames: GenerateContentResponseWire[] = [
       {
         candidates: [{ content: { role: 'model', parts: [{ text: 'Thought A', thought: true }] } }],
@@ -105,21 +109,43 @@ describe('splitGeminiStream — coalesces thought:true parts into one summary ro
     ]
     const chunks: GeminiStreamChunk[] = frames.map((f) => ({ type: 'chunk', chunk: f }))
     const lanes = await collect(splitGeminiStream(asAsync(chunks)))
-    const summaries = lanes.filter(
-      (l): l is Extract<StreamLaneEvent, { lane: 'reasoning' }> =>
-        l.lane === 'reasoning' && l.summaryDelta !== undefined,
+    const summaries = collectReasoningObservations(lanes).filter(
+      (operation) => operation.kind === 'visible' && operation.visibleKind === 'summary',
     )
-    // All parts coalesce into summaryIndex: 0.
-    expect(summaries.map((s) => s.summaryIndex)).toEqual([0, 0, 0])
-    // First emits as-is; subsequent prepend `\n\n` so the merged row has
-    // section breaks even when the wire text didn't include trailing
-    // newlines (real Gemini sections often end with `\n\n\n` already, in
-    // which case the result is just extra blank lines — fine in markdown).
-    expect(summaries.map((s) => s.summaryDelta)).toEqual([
+    expect(summaries.map((operation) => operation.value)).toEqual([
       'Thought A',
-      '\n\nThought B',
-      '\n\nThought C',
+      'Thought B',
+      'Thought C',
     ])
+    expect(summaries.map((operation) => operation.source)).toEqual([
+      {
+        dialect: 'gemini-native',
+        bridge: 'google-direct',
+        candidateIndex: 0,
+        frameIndex: 0,
+        partIndex: 0,
+      },
+      {
+        dialect: 'gemini-native',
+        bridge: 'google-direct',
+        candidateIndex: 0,
+        frameIndex: 1,
+        partIndex: 0,
+      },
+      {
+        dialect: 'gemini-native',
+        bridge: 'google-direct',
+        candidateIndex: 0,
+        frameIndex: 2,
+        partIndex: 0,
+      },
+    ])
+    expect(
+      new Set(summaries.map((operation) => JSON.stringify(operation.memberAliases))).size,
+    ).toBe(3)
+    expect(
+      foldStreamLaneEvents(lanes).final.reasoningEnvelope?.visible.map((part) => part.text),
+    ).toEqual(['Thought A', 'Thought B', 'Thought C'])
   })
   it('preserves two identical thinking sections', async () => {
     const chunks: GeminiStreamChunk[] = [
@@ -132,25 +158,64 @@ describe('splitGeminiStream — coalesces thought:true parts into one summary ro
         chunk: { candidates: [{ content: { parts: [{ text: 'ha', thought: true }] } }] },
       },
     ]
-    const accumulator = createStreamAccumulator({ initialContent: [], now: 0 })
-    for (const [index, event] of (await collect(splitGeminiStream(asAsync(chunks)))).entries()) {
-      applyStreamAccumulatorEvent(accumulator, event, index + 1)
-    }
-
-    expect(projectStreamAccumulatorFinal(accumulator).reasoningDetails).toEqual([
-      {
-        type: 'reasoning.summary',
-        id: 'summary#0',
-        index: 0,
-        format: 'google-gemini-v1',
-        summary: 'ha\n\nha',
-      },
+    const lanes = await collect(splitGeminiStream(asAsync(chunks)))
+    expect(foldStreamLaneEvents(lanes).final.reasoningEnvelope?.visible).toEqual([
+      expect.objectContaining({ kind: 'summary', text: 'ha' }),
+      expect.objectContaining({ kind: 'summary', text: 'ha' }),
     ])
+  })
+
+  it('keeps same-position summaries and signatures isolated across candidates', async () => {
+    const lanes = await collect(
+      splitGeminiStream(
+        asAsync([
+          {
+            type: 'chunk',
+            chunk: {
+              candidates: [
+                {
+                  index: 3,
+                  content: {
+                    parts: [
+                      { text: 'candidate three', thought: true, thoughtSignature: 'sig-three' },
+                    ],
+                  },
+                },
+                {
+                  index: 7,
+                  content: {
+                    parts: [
+                      { text: 'candidate seven', thought: true, thoughtSignature: 'sig-seven' },
+                    ],
+                  },
+                },
+              ],
+            },
+          },
+        ]),
+      ),
+    )
+    const envelope = foldStreamLaneEvents(lanes).final.reasoningEnvelope
+    expect(envelope?.visible.map((part) => [part.source.candidateIndex, part.text])).toEqual([
+      [3, 'candidate three'],
+      [7, 'candidate seven'],
+    ])
+    expect(
+      envelope?.carriers.map((carrier) => [
+        carrier.source.candidateIndex,
+        carrier.kind === 'anthropic-signature' ? carrier.signature : carrier.data,
+      ]),
+    ).toEqual([
+      [3, 'sig-three'],
+      [7, 'sig-seven'],
+    ])
+    expect(new Set(envelope?.visible.map((part) => part.id)).size).toBe(2)
+    expect(new Set(envelope?.carriers.map((carrier) => carrier.id)).size).toBe(2)
   })
 })
 
 describe('splitGeminiStream — both summary + signature in one stream', () => {
-  it('emits summaryDelta for thought:true parts AND encryptedDelta for thoughtSignature', async () => {
+  it('preserves visible summary parts and the opaque thought-signature independently', async () => {
     // Synthetic: mimics the live-probed Gemini 3 high-thinking response.
     const frames: GenerateContentResponseWire[] = [
       {
@@ -188,16 +253,16 @@ describe('splitGeminiStream — both summary + signature in one stream', () => {
     const lanes = await collect(splitGeminiStream(asAsync(chunks)))
 
     // 2 thought summaries + 1 visible text + 1 signature
-    const summaries = lanes.filter(
-      (l): l is Extract<StreamLaneEvent, { lane: 'reasoning' }> =>
-        l.lane === 'reasoning' && l.summaryDelta !== undefined,
+    const operations = collectReasoningObservations(lanes)
+    const summaries = operations.filter(
+      (operation) => operation.kind === 'visible' && operation.visibleKind === 'summary',
     )
     expect(summaries).toHaveLength(2)
-    expect(summaries.map((s) => s.summaryDelta)).toEqual([
+    expect(summaries.map((operation) => operation.value)).toEqual([
       '**Thinking step 1**',
-      '\n\n**Thinking step 2**',
+      '**Thinking step 2**',
     ])
-    expect(summaries.every((s) => s.summaryIndex === 0)).toBe(true)
+    expect(summaries.every((operation) => operation.source.dialect === 'gemini-native')).toBe(true)
 
     const texts = lanes.filter(
       (l): l is Extract<StreamLaneEvent, { lane: 'text' }> => l.lane === 'text',
@@ -205,13 +270,25 @@ describe('splitGeminiStream — both summary + signature in one stream', () => {
     expect(texts).toHaveLength(1)
     expect(texts[0]?.text).toBe('The answer is 10. ')
 
-    const encryptedEvents = lanes.filter(
-      (l): l is Extract<StreamLaneEvent, { lane: 'reasoning' }> =>
-        l.lane === 'reasoning' && l.encryptedDelta !== undefined,
+    const encryptedEvents = operations.filter(
+      (operation) =>
+        operation.kind === 'carrier' && operation.carrierKind === 'gemini-thought-signature',
     )
     expect(encryptedEvents).toHaveLength(1)
-    expect(encryptedEvents[0]?.encryptedDelta).toBe('SIG_FINAL_BLOB')
-    expect(encryptedEvents[0]?.replaceEncrypted).toBe(true)
+    expect(encryptedEvents[0]?.value).toBe('SIG_FINAL_BLOB')
+    expect(encryptedEvents[0]?.update).toBe('set')
+
+    const envelope = foldStreamLaneEvents(lanes).final.reasoningEnvelope
+    expect(envelope?.visible.map((part) => part.text)).toEqual([
+      '**Thinking step 1**',
+      '**Thinking step 2**',
+    ])
+    expect(envelope?.carriers).toEqual([
+      expect.objectContaining({
+        kind: 'gemini-thought-signature',
+        data: 'SIG_FINAL_BLOB',
+      }),
+    ])
 
     // usage maps thoughtsTokenCount → completion_tokens_details.reasoning_tokens
     const usage = lanes.find((l) => l.lane === 'usage')
@@ -224,6 +301,53 @@ describe('splitGeminiStream — both summary + signature in one stream', () => {
 
     const finish = lanes.find((l) => l.lane === 'finish')
     expect(finish).toEqual({ lane: 'finish', finishReason: 'stop' })
+  })
+})
+
+describe('splitGeminiStream — one owner for Gemini thoughtSignature', () => {
+  it('keeps the signature in reasoning and removes it from code-execution provider output', async () => {
+    const chunks: GeminiStreamChunk[] = [
+      {
+        type: 'chunk',
+        chunk: {
+          candidates: [
+            {
+              content: {
+                role: 'model',
+                parts: [
+                  {
+                    executableCode: { language: 'PYTHON', code: 'print(42)' },
+                    thoughtSignature: 'CODE_SIGNATURE',
+                  },
+                ],
+              },
+              finishReason: 'STOP',
+            },
+          ],
+        },
+      },
+    ]
+
+    const lanes = await collect(splitGeminiStream(asAsync(chunks)))
+
+    expect(collectReasoningObservations(lanes)).toEqual([
+      expect.objectContaining({
+        kind: 'carrier',
+        update: 'set',
+        value: 'CODE_SIGNATURE',
+        carrierKind: 'gemini-thought-signature',
+        format: 'google-gemini-v1',
+      }),
+    ])
+    expect(foldStreamLaneEvents(lanes).final.providerOutputItems).toEqual([
+      expect.objectContaining({
+        dialect: 'google-gemini',
+        type: 'google:code_execution',
+        item: {
+          executableCode: { language: 'PYTHON', code: 'print(42)' },
+        },
+      }),
+    ])
   })
 })
 
@@ -261,6 +385,30 @@ describe('splitGeminiStream — buffered result', () => {
     expect(lanes.some((l) => l.lane === 'text')).toBe(true)
     expect(lanes.some((l) => l.lane === 'finish')).toBe(true)
   })
+
+  it('projects the same native response identically from streaming and buffered transports', async () => {
+    const result: GenerateContentResponseWire = {
+      candidates: [
+        {
+          index: 0,
+          content: {
+            parts: [
+              { text: 'same summary', thought: true },
+              { text: '', thoughtSignature: 'same-signature' },
+            ],
+          },
+          finishReason: 'STOP',
+        },
+      ],
+    }
+    const streamed = await collect(splitGeminiStream(asAsync([{ type: 'chunk', chunk: result }])))
+    const buffered = await collect(
+      splitGeminiStream(asAsync([{ type: 'buffered_result', result }])),
+    )
+    expect(foldStreamLaneEvents(streamed).final.reasoningEnvelope).toEqual(
+      foldStreamLaneEvents(buffered).final.reasoningEnvelope,
+    )
+  })
 })
 
 if (existsSync(PROBE8)) {
@@ -271,11 +419,11 @@ if (existsSync(PROBE8)) {
       )
       expect(lanes.some((lane) => lane.lane === 'text')).toBe(true)
       expect(
-        lanes.some(
-          (lane) =>
-            lane.lane === 'reasoning' &&
-            lane.replaceEncrypted === true &&
-            Boolean(lane.encryptedDelta),
+        collectReasoningObservations(lanes).some(
+          (operation) =>
+            operation.kind === 'carrier' &&
+            operation.carrierKind === 'gemini-thought-signature' &&
+            operation.value.length > 0,
         ),
       ).toBe(true)
       expect(lanes.some((lane) => lane.lane === 'finish')).toBe(true)

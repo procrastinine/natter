@@ -1,10 +1,12 @@
-import type { Message } from '../../src/core/types'
-import { splitMessageForStorage } from '../../src/store/message-storage'
+import {
+  appendChatCatalogFixturesThroughUi,
+  configureWorkspaceThroughUi,
+  importPortableChatThroughUi,
+} from '../../scripts/workspace-provider-fixture.mjs'
 import { expect, type Locator, type Page, test } from './fixtures'
 import {
   buildSseBody,
   clearIndexedDb,
-  rebuildSidebarProjection,
   seedFirstRun,
   seedLinearChat,
   sendMessage,
@@ -23,30 +25,14 @@ test('global settings exposes render-window controls on the Performance tab', as
 
   await expect(page.locator('[data-ui="message-render-window-load-mode"]')).toHaveValue('auto')
   await expect(page.locator('[data-ui="sidebar-render-window-load-mode"]')).toHaveValue('auto')
-  await expect(page.getByLabel('Newest messages')).toHaveValue('10')
+  await expect(page.getByLabel('Initial render work')).toHaveValue('10')
   await expect(page.getByLabel('First rows')).toHaveValue('50')
 })
 
 test('opening Appearance settings does not reapply the default chat width', async ({ page }) => {
-  await page.evaluate(async () => {
-    const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const req = indexedDB.open('natter')
-      req.onsuccess = () => resolve(req.result)
-      req.onerror = () => reject(req.error)
-    })
-    try {
-      await new Promise<void>((resolve, reject) => {
-        const tx = db.transaction(['settings'], 'readwrite')
-        tx.objectStore('settings').put({ key: 'global:chat-max-width', value: 1280 })
-        tx.oncomplete = () => resolve()
-        tx.onerror = () => reject(tx.error)
-        tx.onabort = () => reject(tx.error)
-      })
-    } finally {
-      db.close()
-    }
+  await configureWorkspaceThroughUi(page, {
+    workspaceSettings: { 'global:chat-max-width': 1280 },
   })
-  await page.reload()
   await page.waitForFunction(
     () => document.documentElement.style.getPropertyValue('--message-max-width') === '1280px',
   )
@@ -93,6 +79,14 @@ test('send and regenerate keep the transcript mounted while the branch window re
   page,
 }) => {
   let requestCount = 0
+  let releaseSend: () => void = () => undefined
+  const sendGate = new Promise<void>((resolve) => {
+    releaseSend = resolve
+  })
+  let markSendRequested: () => void = () => undefined
+  const sendRequested = new Promise<void>((resolve) => {
+    markSendRequested = resolve
+  })
   let releaseRegenerate: () => void = () => undefined
   const regenerateGate = new Promise<void>((resolve) => {
     releaseRegenerate = resolve
@@ -103,11 +97,12 @@ test('send and regenerate keep the transcript mounted while the branch window re
   })
   await page.route('**/api/v1/chat/completions', async (route) => {
     requestCount += 1
-    if (requestCount === 2) {
+    if (requestCount === 1) {
+      markSendRequested()
+      await sendGate
+    } else if (requestCount === 2) {
       markRegenerateRequested()
       await regenerateGate
-    } else {
-      await new Promise((resolve) => setTimeout(resolve, 120))
     }
     const text = requestCount === 1 ? 'sent answer' : 'regenerated answer'
     await route.fulfill({
@@ -124,26 +119,78 @@ test('send and regenerate keep the transcript mounted while the branch window re
     title: 'Render window chat',
     textPrefix: 'window message',
     settings: {
-      'global:message-render-window-size': 10,
+      'global:message-initial-render-work': 10,
       'global:message-render-window-load-mode': 'manual',
     },
   })
 
   await page.goto(`/#/chat/${chatId}`)
   await page.reload()
-  await expect(page.locator('[data-ui="message"]')).toHaveCount(10)
+  await expect.poll(() => page.locator('[data-ui="message"]').count()).toBeGreaterThanOrEqual(10)
 
   await startMessageCountRecorder(page)
   await sendMessage(page, 'new prompt')
+  await sendRequested
+  let appendedUserId: string
+  let appendedAssistantId: string
+  try {
+    const appendedUser = page.locator('[data-ui="message"][data-role="user"]').last()
+    const appendedAssistant = page.locator('[data-ui="message"][data-role="assistant"]').last()
+    await expect(appendedUser).toContainText('new prompt')
+    await expect(appendedAssistant).toBeVisible()
+    const userId = await appendedUser.getAttribute('data-message-id')
+    const assistantId = await appendedAssistant.getAttribute('data-message-id')
+    if (!userId || !assistantId) throw new Error('Send target has no message id')
+    appendedUserId = userId
+    appendedAssistantId = assistantId
+    await page.evaluate(
+      ({ userId: currentUserId, assistantId: currentAssistantId }) => {
+        const win = window as typeof window & {
+          __appendedMessageNodes?: Record<string, Element>
+        }
+        const user = document.querySelector(
+          `[data-ui="message"][data-message-id="${currentUserId}"]`,
+        )
+        const assistant = document.querySelector(
+          `[data-ui="message"][data-message-id="${currentAssistantId}"]`,
+        )
+        if (!user || !assistant) throw new Error('Appended send rows are not mounted')
+        win.__appendedMessageNodes = { user, assistant }
+      },
+      { userId, assistantId },
+    )
+  } finally {
+    releaseSend()
+  }
   await expect(
     page.locator('[data-ui="message"]').last().locator('[data-ui="message-body"]'),
   ).toContainText('sent answer')
+  expect(
+    await page.evaluate(
+      ({ userId, assistantId }) => {
+        const win = window as typeof window & {
+          __appendedMessageNodes?: Record<string, Element>
+        }
+        return {
+          user:
+            document.querySelector(`[data-ui="message"][data-message-id="${userId}"]`) ===
+            win.__appendedMessageNodes?.user,
+          assistant:
+            document.querySelector(`[data-ui="message"][data-message-id="${assistantId}"]`) ===
+            win.__appendedMessageNodes?.assistant,
+        }
+      },
+      { userId: appendedUserId, assistantId: appendedAssistantId },
+    ),
+  ).toEqual({ user: true, assistant: true })
   expect(await stopMessageCountRecorder(page)).toEqual({
     anchorRemoved: false,
     listRemoved: false,
     listReplaced: false,
     loadingSeen: false,
+    messageCountDecreased: false,
     messageCountsIncludeZero: false,
+    minimumMessageCount: expect.any(Number),
   })
 
   const previousAssistantId = await page
@@ -185,6 +232,12 @@ test('send and regenerate keep the transcript mounted while the branch window re
     const activeRegeneratedId = await regeneratedMessage.getAttribute('data-message-id')
     if (!activeRegeneratedId) throw new Error('Regenerate stream has no target message')
     regeneratedId = activeRegeneratedId
+    await page.evaluate((messageId) => {
+      const win = window as typeof window & { __regeneratedMessageNode?: Element }
+      const message = document.querySelector(`[data-ui="message"][data-message-id="${messageId}"]`)
+      if (!message) throw new Error('Regenerated row is not mounted')
+      win.__regeneratedMessageNode = message
+    }, regeneratedId)
     await expect(
       page.locator(`[data-ui="message"][data-message-id="${regeneratedId}"]`),
     ).toBeVisible()
@@ -222,6 +275,15 @@ test('send and regenerate keep the transcript mounted while the branch window re
       `[data-ui="message"][data-message-id="${regeneratedId}"] [data-ui="message-body"]`,
     ),
   ).toContainText('regenerated answer')
+  expect(
+    await page.evaluate((messageId) => {
+      const win = window as typeof window & { __regeneratedMessageNode?: Element }
+      return (
+        document.querySelector(`[data-ui="message"][data-message-id="${messageId}"]`) ===
+        win.__regeneratedMessageNode
+      )
+    }, regeneratedId),
+  ).toBe(true)
   await expect(
     page.locator(
       `[data-ui="message"][data-message-id="${regeneratedId}"] [data-ui="branch-count"]`,
@@ -246,15 +308,135 @@ test('send and regenerate keep the transcript mounted while the branch window re
     listRemoved: false,
     listReplaced: false,
     loadingSeen: false,
+    messageCountDecreased: false,
     messageCountsIncludeZero: false,
+    minimumMessageCount: expect.any(Number),
   })
 })
 
-test('switching message variants re-renders the selected branch window', async ({ page }) => {
-  const chatId = await seedBranchedChat(page)
-  await rebuildSidebarProjection(page)
+test('trailing-user Reply appends without replacing the mounted transcript prefix', async ({
+  page,
+}) => {
+  await page.route('**/api/v1/chat/completions', (route) =>
+    route.fulfill({
+      contentType: 'text/event-stream',
+      body: buildSseBody([
+        { id: 'continuity-reply', content: 'reply continuity answer' },
+        { finish: 'stop' },
+      ]),
+    }),
+  )
+  const chatId = await seedLinearChat(page, {
+    messageCount: 5,
+    chatId: 'trailing-reply-continuity-chat',
+    title: 'Trailing reply continuity chat',
+    textPrefix: 'reply continuity message',
+    settings: {
+      'global:message-initial-render-work': 5,
+      'global:message-render-window-load-mode': 'manual',
+    },
+  })
+  await page.goto(`/#/chat/${chatId}`)
+  await page.reload()
+  const messages = page.locator('[data-ui="message"][data-message-id]')
+  await expect(messages).toHaveCount(5)
+  const commonPrefixMessageIds = await mountedMessageIds(messages)
 
-  await page.goto(`/#/chat/${chatId}/message/A2`)
+  await startMessageCountRecorder(page, { commonPrefixMessageIds })
+  const reply = page.locator('[data-ui="send"]')
+  await expect(reply).toContainText('Reply')
+  await reply.click()
+  await expect(
+    page.locator('[data-ui="message"][data-role="assistant"] [data-ui="message-body"]').last(),
+  ).toHaveText('reply continuity answer')
+
+  const continuity = await stopMessageCountRecorder(page)
+  expectCommonPrefixContinuity(continuity, commonPrefixMessageIds.length)
+  expect(continuity.messageCountDecreased).toBe(false)
+  await expect(messages).toHaveCount(6)
+})
+
+test('Save & Send preserves common-prefix DOM identity while replacing only the suffix', async ({
+  page,
+}) => {
+  await page.route('**/api/v1/chat/completions', (route) =>
+    route.fulfill({
+      contentType: 'text/event-stream',
+      body: buildSseBody([
+        { id: 'continuity-save-send', content: 'save-send continuity answer' },
+        { finish: 'stop' },
+      ]),
+    }),
+  )
+  const chatId = await seedLinearChat(page, {
+    messageCount: 8,
+    chatId: 'save-send-continuity-chat',
+    title: 'Save and send continuity chat',
+    textPrefix: 'save-send continuity message',
+    settings: {
+      'global:message-initial-render-work': 8,
+      'global:message-render-window-load-mode': 'manual',
+    },
+  })
+  await page.goto(`/#/chat/${chatId}`)
+  await page.reload()
+  const messages = page.locator('[data-ui="message"][data-message-id]')
+  await expect(messages).toHaveCount(8)
+  const initialMessageIds = await mountedMessageIds(messages)
+  const commonPrefixMessageIds = initialMessageIds.slice(0, 4)
+  const replacedSuffixMessageIds = initialMessageIds.slice(4)
+  const editedUser = messages.nth(4)
+  await editedUser.locator('[data-action="edit"]').click()
+  await editedUser.locator('[data-ui="inline-editor-input"]').fill('save-send replacement user')
+
+  await startMessageCountRecorder(page, { commonPrefixMessageIds })
+  await editedUser.locator('[data-role="save-send"]').click()
+  await expect(
+    page.locator('[data-ui="message"][data-role="assistant"] [data-ui="message-body"]').last(),
+  ).toHaveText('save-send continuity answer')
+
+  const continuity = await stopMessageCountRecorder(page)
+  expectCommonPrefixContinuity(continuity, commonPrefixMessageIds.length)
+  for (const messageId of replacedSuffixMessageIds) {
+    await expect(page.locator(`[data-ui="message"][data-message-id="${messageId}"]`)).toHaveCount(0)
+  }
+  await expect(messages).toHaveCount(6)
+  await expect(messages.nth(4).locator('[data-ui="message-body"]')).toHaveText(
+    'save-send replacement user',
+  )
+})
+
+test('branch swipe preserves common-prefix DOM identity without loading or blank frames', async ({
+  page,
+}) => {
+  const fixture = await seedBranchedChat(page)
+  await page.goto(`/#/chat/${fixture.chatId}/message/${fixture.messageIdMap.A2}`)
+  await page.reload()
+  const messages = page.locator('[data-ui="message"][data-message-id]')
+  await expect(messages).toHaveCount(3)
+  const commonPrefixMessageIds = [fixture.messageIdMap.root as string]
+  const selectedUserText = await messages.nth(1).textContent()
+  const selectedBranchIsA = selectedUserText?.includes('branch A user') === true
+  const selectedUser = selectedBranchIsA ? 'branch A user' : 'branch B user'
+  const destinationUser = selectedBranchIsA ? 'branch B user' : 'branch A user'
+  const destinationAssistant = selectedBranchIsA ? 'branch B assistant' : 'branch A assistant'
+  const swipeLabel = selectedBranchIsA ? 'Next variant' : 'First variant'
+
+  await startMessageCountRecorder(page, { commonPrefixMessageIds })
+  await messages.filter({ hasText: selectedUser }).getByLabel(swipeLabel).click()
+  await expect(messages.nth(1)).toContainText(destinationUser)
+  await expect(messages.nth(2)).toContainText(destinationAssistant)
+
+  const continuity = await stopMessageCountRecorder(page)
+  expectCommonPrefixContinuity(continuity, commonPrefixMessageIds.length)
+  expect(continuity.messageCountsIncludeZero).toBe(false)
+  await expect(messages).toHaveCount(3)
+})
+
+test('switching message variants re-renders the selected branch window', async ({ page }) => {
+  const fixture = await seedBranchedChat(page)
+
+  await page.goto(`/#/chat/${fixture.chatId}/message/${fixture.messageIdMap.A2}`)
   await page.reload()
   await expect(page.locator('[data-ui="message"]')).toHaveCount(3)
   await expect(page.locator('[data-ui="message"]').nth(1)).toContainText('branch A user')
@@ -274,9 +456,8 @@ test('switching message variants re-renders the selected branch window', async (
 })
 
 test('cached leaves share one live sibling count revision', async ({ context, page }) => {
-  const chatId = await seedBranchedChat(page)
-  await rebuildSidebarProjection(page)
-  await page.goto(`/#/chat/${chatId}/message/A2`)
+  const fixture = await seedBranchedChat(page)
+  await page.goto(`/#/chat/${fixture.chatId}/message/${fixture.messageIdMap.A2}`)
   await expect(page.locator('[data-ui="message"]').last()).toContainText('branch A assistant')
 
   await page
@@ -302,7 +483,7 @@ test('cached leaves share one live sibling count revision', async ({ context, pa
         ]),
       })
     })
-    await otherTab.goto(`/#/chat/${chatId}/message/B2`)
+    await otherTab.goto(`/#/chat/${fixture.chatId}/message/${fixture.messageIdMap.B2}`)
     const branchBUser = otherTab
       .locator('[data-ui="message"][data-role="user"]')
       .filter({ hasText: 'branch B user' })
@@ -371,7 +552,6 @@ test('sidebar mounts only the first row window and loads more rows manually', as
       'global:sidebar-render-window-load-mode': 'manual',
     },
   })
-  await rebuildSidebarProjection(page)
   await page.goto('/')
   await page.reload()
 
@@ -394,31 +574,97 @@ test('sidebar keeps scroll position when auto-load crosses virtualization thresh
       'global:sidebar-render-window-load-mode': 'auto',
     },
   })
-  await rebuildSidebarProjection(page)
   await page.goto('/')
   await page.reload()
 
   const list = page.locator('[data-ui="chat-list"]')
-  await expect(list).not.toHaveAttribute('data-virtualized', 'true')
+  await expect(list).toHaveAttribute('data-total-count', '230')
+  await expect(list).toHaveAttribute('data-rendered-count', '75')
+  await expect(list).toHaveAttribute('data-virtualized', 'true')
   await scrollSidebarToAutoLoadedVirtualRows(page)
 
   const metrics = await list.evaluate((node) => ({
+    mountedCount: node.querySelectorAll('[data-sidebar-row-key]').length,
     renderedCount: Number(node.dataset.renderedCount ?? 0),
     scrollTop: node.scrollTop,
   }))
+  expect(metrics.mountedCount).toBeLessThanOrEqual(80)
   expect(metrics.renderedCount).toBeGreaterThan(200)
   expect(metrics.scrollTop).toBeGreaterThan(500)
 })
 
-test('virtualized sidebar bottom tracks mixed folder and tag row heights', async ({ page }) => {
-  await seedMixedHeightSidebarRows(page)
-  await rebuildSidebarProjection(page)
+test('a folder larger than one page expands gap-free without stealing the top-first viewport', async ({
+  page,
+}) => {
+  test.setTimeout(60_000)
+  const folderChatCount = 513
+  const movedChatId = 'large-folder-drop-source'
+  const expectedChatIds = new Set([
+    movedChatId,
+    ...Array.from(
+      { length: folderChatCount },
+      (_, index) => `large-folder-chat-${String(index).padStart(3, '0')}`,
+    ),
+  ])
+  await installMessageBodyReadCounter(page)
+  await seedLargeFolderRows(page, { folderChatCount, movedChatId })
   await page.goto('/')
   await page.reload()
 
   const list = page.locator('[data-ui="chat-list"]')
+  const folder = page
+    .locator('[data-ui="folder-section"]')
+    .filter({ hasText: 'Large exact folder' })
+  const folderHeader = folder.locator('[data-ui="folder-header"]')
+  const folderButton = folder.locator('[data-ui="folder-main"]')
+  const source = page.locator(`[data-ui="chat-row"]:has([href="#/chat/${movedChatId}"])`)
+  await expect(source).toBeVisible()
+  await expect(folderButton).toBeVisible()
+  await expect(folderButton).toHaveAttribute('aria-expanded', 'false')
+  await expect.poll(() => list.evaluate((node) => node.scrollTop)).toBe(0)
+
+  await resetMessageBodyReadCounter(page)
+  await startFolderMoveRecorder(page, movedChatId)
+  await source.dragTo(folderHeader)
+  await expect(folder.locator('[data-ui="folder-count"]')).toHaveText(String(folderChatCount + 1))
+  await expect(folderButton).toHaveAttribute('aria-expanded', 'true')
+  const moveLatency = await finishFolderMoveRecorder(page)
+  expect(moveLatency).toBeLessThan(250)
+  await expect.poll(() => list.evaluate((node) => node.scrollTop)).toBeLessThanOrEqual(2)
+
+  const collected = new Set<string>()
+  let maximumMountedRows = 0
+  await expect
+    .poll(
+      async () => {
+        const sample = await collectFolderViewportSample(list)
+        maximumMountedRows = Math.max(maximumMountedRows, sample.mountedRows)
+        expect(sample.duplicateChatIds).toEqual([])
+        for (const id of sample.folderChatIds) collected.add(id)
+        return collected.size
+      },
+      { timeout: 20_000, intervals: [0] },
+    )
+    .toBe(expectedChatIds.size)
+  expect([...collected].sort()).toEqual([...expectedChatIds].sort())
+  expect(maximumMountedRows).toBeLessThanOrEqual(80)
+  expect(await readMessageBodyReadCounter(page)).toBe(0)
+})
+
+test('virtualized sidebar bottom tracks mixed folder and tag row heights', async ({ page }) => {
+  await seedMixedHeightSidebarRows(page)
+  await page.goto('/')
+  await page.reload()
+  await expect(page.locator('[data-ui="app-shell"]')).toHaveAttribute(
+    'data-workspace-runtime-state',
+    'RUNNING',
+    { timeout: 10_000 },
+  )
+
+  const list = page.locator('[data-ui="chat-list"]')
   await expect(list).toHaveAttribute('data-virtualized', 'true')
   await expect(page.locator('[data-ui="chat-row-tag"]').first()).toBeVisible()
+  await expect.poll(() => list.evaluate((node) => node.scrollTop)).toBe(0)
 
   await assertSidebarBottomHasNoBlankTail(page, 'expanded folder')
 
@@ -436,19 +682,28 @@ test('virtualized sidebar bottom tracks mixed folder and tag row heights', async
   await folderButton.click()
   await expect(folderButton).toHaveAttribute('aria-expanded', 'true')
   await assertSidebarBottomHasNoBlankTail(page, 're-expanded folder')
+
+  const bottomFolderButton = page
+    .locator('[data-ui="folder-section"]')
+    .filter({ hasText: 'Bottom height folder' })
+    .locator('[data-ui="folder-main"]')
+  await expect(bottomFolderButton).toBeVisible()
+  await expect(bottomFolderButton).toHaveAttribute('aria-expanded', 'true')
+  await bottomFolderButton.click()
+  await expect(bottomFolderButton).toHaveAttribute('aria-expanded', 'false')
+  await assertSidebarBottomHasNoBlankTail(page, 'folder toggled while already at bottom')
 })
 
 test('sidebar keeps a loaded row anchored when folders toggle and tag rows grow', async ({
   page,
 }) => {
   await seedSidebarScrollMutationFixture(page)
-  await rebuildSidebarProjection(page)
   await page.goto('/')
   await page.reload()
 
-  await page.locator('[data-ui="load-more-sidebar"]').click()
-  await page.locator('[data-ui="load-more-sidebar"]').click()
-  await page.locator('[data-ui="load-more-sidebar"]').click()
+  await loadNextSidebarPage(page)
+  await loadNextSidebarPage(page)
+  await expect(page.locator('[data-ui="load-more-sidebar"]')).toHaveCount(0)
   await expect(page.locator('[data-ui="chat-list"]')).toHaveAttribute('data-virtualized', 'true')
   await scrollSidebarUntilText(page, 'Far folder')
 
@@ -458,7 +713,11 @@ test('sidebar keeps a loaded row anchored when folders toggle and tag rows grow'
   await alignSidebarRowNearTop(farFolder)
 
   const beforeExpand = await sidebarRowMetrics(farFolder)
-  await farFolderButton.click()
+  const expandLatency = await measureAttributeChangeFromPointerDown(
+    farFolderButton,
+    'aria-expanded',
+  )
+  expect(expandLatency).toBeLessThan(100)
   await expect(farFolderButton).toHaveAttribute('aria-expanded', 'true')
   await page.waitForTimeout(80)
   const afterExpand = await sidebarRowMetrics(farFolder)
@@ -466,7 +725,11 @@ test('sidebar keeps a loaded row anchored when folders toggle and tag rows grow'
   expect(afterExpand.scrollTop).toBeGreaterThan(1000)
   expect(Math.abs(afterExpand.top - beforeExpand.top)).toBeLessThan(6)
 
-  await farFolderButton.click()
+  const collapseLatency = await measureAttributeChangeFromPointerDown(
+    farFolderButton,
+    'aria-expanded',
+  )
+  expect(collapseLatency).toBeLessThan(100)
   await expect(farFolderButton).toHaveAttribute('aria-expanded', 'false')
   await page.waitForTimeout(80)
   const afterCollapse = await sidebarRowMetrics(farFolder)
@@ -520,6 +783,15 @@ async function assertSidebarBottomHasNoBlankTail(page: Page, label: string): Pro
   expect(metrics.blankTail, label).toBeLessThan(12)
 }
 
+async function loadNextSidebarPage(page: Page): Promise<void> {
+  const list = page.locator('[data-ui="chat-list"]')
+  const before = Number((await list.getAttribute('data-rendered-count')) ?? 0)
+  await page.locator('[data-ui="load-more-sidebar"]').click()
+  await expect
+    .poll(async () => Number((await list.getAttribute('data-rendered-count')) ?? 0))
+    .toBeGreaterThan(before)
+}
+
 async function scrollSidebarToAutoLoadedVirtualRows(page: Page): Promise<void> {
   const list = page.locator('[data-ui="chat-list"]')
   for (let attempt = 0; attempt < 10; attempt += 1) {
@@ -527,9 +799,10 @@ async function scrollSidebarToAutoLoadedVirtualRows(page: Page): Promise<void> {
       node.scrollTop = Math.max(0, node.scrollHeight - node.clientHeight)
     })
     await page.waitForTimeout(120)
-    if ((await list.getAttribute('data-virtualized')) === 'true') return
+    const renderedCount = Number((await list.getAttribute('data-rendered-count')) ?? 0)
+    if (renderedCount > 200) return
   }
-  throw new Error('Sidebar did not auto-load into virtualized mode')
+  throw new Error('Sidebar did not progressively auto-load its virtualized rows')
 }
 
 async function alignSidebarRowNearTop(row: Locator): Promise<void> {
@@ -593,10 +866,71 @@ async function sidebarRowMetrics(row: Locator): Promise<{
   })
 }
 
-async function seedBranchedChat(page: Page): Promise<string> {
+async function measureAttributeChangeFromPointerDown(
+  element: Locator,
+  attribute: string,
+): Promise<number> {
+  await element.evaluate((node, attributeName) => {
+    const owner = window as typeof window & {
+      __sidebarAttributeLatency?: {
+        startedAt: number | null
+        elapsed: number | null
+        observer: MutationObserver
+      }
+    }
+    owner.__sidebarAttributeLatency?.observer.disconnect()
+    const measurement = {
+      startedAt: null as number | null,
+      elapsed: null as number | null,
+      observer: new MutationObserver(() => undefined),
+    }
+    measurement.observer = new MutationObserver(() => {
+      if (measurement.startedAt === null) return
+      measurement.elapsed = performance.now() - measurement.startedAt
+      measurement.observer.disconnect()
+    })
+    measurement.observer.observe(node, {
+      attributes: true,
+      attributeFilter: [attributeName],
+    })
+    node.addEventListener(
+      'pointerdown',
+      () => {
+        measurement.startedAt = performance.now()
+      },
+      { once: true },
+    )
+    owner.__sidebarAttributeLatency = measurement
+  }, attribute)
+  await element.click()
+  await expect
+    .poll(() =>
+      element.page().evaluate(() => {
+        const owner = window as typeof window & {
+          __sidebarAttributeLatency?: { elapsed: number | null }
+        }
+        return owner.__sidebarAttributeLatency?.elapsed ?? null
+      }),
+    )
+    .not.toBeNull()
+  return element.page().evaluate(() => {
+    const owner = window as typeof window & {
+      __sidebarAttributeLatency?: { elapsed: number | null }
+    }
+    const elapsed = owner.__sidebarAttributeLatency?.elapsed
+    if (elapsed === null || elapsed === undefined) {
+      throw new Error('SidebarAttributeLatencyMissing')
+    }
+    return elapsed
+  })
+}
+
+async function seedBranchedChat(
+  page: Page,
+): Promise<{ chatId: string; messageIdMap: Record<string, string> }> {
   const now = Date.now()
   const chatId = 'render-window-branch-chat'
-  const sourceMessages: Message[] = [
+  const sourceMessages = [
     {
       id: 'root',
       chatId,
@@ -668,70 +1002,41 @@ async function seedBranchedChat(page: Page): Promise<string> {
       deleted: false,
     },
   ]
-  const storedRows = sourceMessages.map((message) => splitMessageForStorage(message))
-  const wordCount = storedRows.reduce((total, stored) => total + stored.header.bodyWordCount, 0)
-
-  await page.evaluate(
-    async (seed) => {
-      const db = await new Promise<IDBDatabase>((resolve, reject) => {
-        const req = indexedDB.open('natter')
-        req.onsuccess = () => resolve(req.result)
-        req.onerror = () => reject(req.error)
-      })
-      try {
-        await new Promise<void>((resolve, reject) => {
-          const tx = db.transaction(
-            ['presets', 'settings', 'chats', 'messages', 'messageBodies'],
-            'readwrite',
-          )
-          const presets = tx.objectStore('presets')
-          const settingsStore = tx.objectStore('settings')
-          const chats = tx.objectStore('chats')
-          const messages = tx.objectStore('messages')
-          const messageBodies = tx.objectStore('messageBodies')
-          const presetsReq = presets.getAll()
-          presetsReq.onsuccess = () => {
-            const preset = (presetsReq.result as Array<{ id?: string; settings?: unknown }>)[0]
-            const chatSettings = structuredClone(preset?.settings ?? {})
-            settingsStore.put({ key: 'global:message-render-window-size', value: 3 })
-            settingsStore.put({ key: 'global:message-render-window-load-mode', value: 'manual' })
-            chats.put({
-              id: seed.chatId,
-              title: 'Render branch window chat',
-              titleStatus: 'manual',
-              createdAt: seed.now,
-              updatedAt: seed.now + 4,
-              lastViewedAt: seed.now + 4,
-              wordCount: seed.wordCount,
-              totalCostUsd: 0,
-              metaVersion: 0,
-              summaryVersion: 0,
-              settings: chatSettings,
-              presetId: preset?.id,
-              lastUpdatedLeafId: 'B2',
-              lastBranchUpdatedAt: seed.now + 4,
-              archived: false,
-              pinned: false,
-              folderId: null,
-              tags: [],
-              previewText: 'branch A user',
-            })
-            for (const stored of seed.storedRows) {
-              messages.put(stored.header)
-              messageBodies.put(stored.body)
-            }
-          }
-          tx.oncomplete = () => resolve()
-          tx.onerror = () => reject(tx.error)
-          tx.onabort = () => reject(tx.error)
-        })
-      } finally {
-        db.close()
-      }
+  const imported = await importPortableChatThroughUi(page, {
+    sourceChatId: chatId,
+    title: 'Render branch window chat',
+    createdAt: now,
+    messages: sourceMessages,
+    workspaceSettings: {
+      'global:message-initial-render-work': 3,
+      'global:message-render-window-load-mode': 'manual',
     },
-    { chatId, now, storedRows, wordCount },
+    captureMessageIds: true,
+  })
+  if (!imported.messageIdMap) throw new Error('Branched fixture message ids were not captured')
+  return { chatId: imported.chatId, messageIdMap: imported.messageIdMap }
+}
+
+async function mountedMessageIds(messages: Locator): Promise<string[]> {
+  return messages.evaluateAll((nodes) =>
+    nodes.map((node) => node.getAttribute('data-message-id')).filter((id): id is string => !!id),
   )
-  return chatId
+}
+
+function expectCommonPrefixContinuity(
+  continuity: Awaited<ReturnType<typeof stopMessageCountRecorder>>,
+  expectedCommonPrefixCount: number,
+): void {
+  expect(continuity).toMatchObject({
+    commonPrefixDisconnectedIds: [],
+    commonPrefixReplacedIds: [],
+    listRemoved: false,
+    listReplaced: false,
+    loadingSeen: false,
+    messageCountBelowExpectedCommonPrefix: false,
+    messageCountsIncludeZero: false,
+  })
+  expect(continuity.minimumMessageCount).toBeGreaterThanOrEqual(expectedCommonPrefixCount)
 }
 
 async function seedSidebarChats(
@@ -741,247 +1046,351 @@ async function seedSidebarChats(
     settings?: Record<string, unknown>
   },
 ): Promise<void> {
-  await page.evaluate(async ({ chatCount, settings }) => {
-    const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const req = indexedDB.open('natter')
-      req.onsuccess = () => resolve(req.result)
-      req.onerror = () => reject(req.error)
-    })
-    const now = Date.now()
-    try {
-      await new Promise<void>((resolve, reject) => {
-        const tx = db.transaction(['presets', 'settings', 'chats'], 'readwrite')
-        const presets = tx.objectStore('presets')
-        const settingsStore = tx.objectStore('settings')
-        const chats = tx.objectStore('chats')
-        const presetsReq = presets.getAll()
-        presetsReq.onsuccess = () => {
-          const preset = (presetsReq.result as Array<{ id?: string; settings?: unknown }>)[0]
-          const chatSettings = structuredClone(preset?.settings ?? {})
-          for (const [key, value] of Object.entries(settings ?? {})) {
-            settingsStore.put({ key, value })
-          }
-          for (let i = 0; i < chatCount; i += 1) {
-            chats.put({
-              id: `sidebar-window-chat-${String(i).padStart(3, '0')}`,
-              title: `Sidebar window chat ${String(i).padStart(2, '0')}`,
-              titleStatus: 'manual',
-              createdAt: now - i,
-              updatedAt: now - i,
-              lastViewedAt: now - i,
-              wordCount: 10,
-              totalCostUsd: 0,
-              metaVersion: 0,
-              summaryVersion: 0,
-              settings: chatSettings,
-              presetId: preset?.id,
-              lastUpdatedLeafId: null,
-              lastBranchUpdatedAt: now - i,
-              archived: false,
-              pinned: false,
-              folderId: null,
-              tags: [],
-              previewText: `sidebar preview ${i}`,
-            })
-          }
-        }
-        tx.oncomplete = () => resolve()
-        tx.onerror = () => reject(tx.error)
-        tx.onabort = () => reject(tx.error)
-      })
-    } finally {
-      db.close()
-    }
-  }, input)
+  const now = Date.now()
+  await appendChatCatalogFixturesThroughUi(page, {
+    now,
+    ...(input.settings === undefined ? {} : { workspaceSettings: input.settings }),
+    chats: Array.from({ length: input.chatCount }, (_, index) => ({
+      id: `sidebar-window-chat-${String(index).padStart(3, '0')}`,
+      title: `Sidebar window chat ${String(index).padStart(2, '0')}`,
+      createdAt: now - index,
+      updatedAt: now - index,
+      lastViewedAt: now - index,
+      wordCount: 10,
+      previewText: `sidebar preview ${index}`,
+    })),
+  })
 }
 
 async function seedMixedHeightSidebarRows(page: Page): Promise<void> {
-  await page.evaluate(async () => {
-    const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const req = indexedDB.open('natter')
-      req.onsuccess = () => resolve(req.result)
-      req.onerror = () => reject(req.error)
-    })
-    const now = Date.now()
-    try {
-      await new Promise<void>((resolve, reject) => {
-        const tx = db.transaction(['presets', 'settings', 'folders', 'tags', 'chats'], 'readwrite')
-        const presets = tx.objectStore('presets')
-        const settingsStore = tx.objectStore('settings')
-        const folders = tx.objectStore('folders')
-        const tags = tx.objectStore('tags')
-        const chats = tx.objectStore('chats')
-        const presetsReq = presets.getAll()
-        presetsReq.onsuccess = () => {
-          const preset = (presetsReq.result as Array<{ id?: string; settings?: unknown }>)[0]
-          const chatSettings = structuredClone(preset?.settings ?? {})
-          settingsStore.put({ key: 'global:sidebar-render-window-size', value: 320 })
-          settingsStore.put({ key: 'global:sidebar-render-window-load-mode', value: 'manual' })
-          folders.put({
-            id: 'height-check-folder',
-            name: 'Height check folder',
-            sortIndex: 0,
-            createdAt: now - 100,
-            updatedAt: now - 100,
-            lastUsedAt: now - 100,
-          })
-          const tagRows = [
-            { id: 'height-tag-alpha', name: 'Alpha' },
-            { id: 'height-tag-beta', name: 'Beta' },
-            { id: 'height-tag-gamma', name: 'Gamma' },
-            { id: 'height-tag-delta', name: 'Delta' },
-          ]
-          for (const [index, tag] of tagRows.entries()) {
-            tags.put({
-              id: tag.id,
-              name: tag.name,
-              nameLower: tag.name.toLowerCase(),
-              createdAt: now + index,
-              updatedAt: now + index,
-              lastUsedAt: now + index,
-            })
-          }
-          const tagIds = tagRows.map((tag) => tag.id)
-          for (let i = 0; i < 210; i += 1) {
-            chats.put({
-              id: `mixed-height-root-chat-${String(i).padStart(3, '0')}`,
-              title: `Mixed height root ${String(i).padStart(3, '0')}`,
-              titleStatus: 'manual',
-              createdAt: now - i,
-              updatedAt: now - i,
-              lastViewedAt: now - i,
-              wordCount: 10,
-              totalCostUsd: 0,
-              metaVersion: 0,
-              summaryVersion: 0,
-              settings: structuredClone(chatSettings),
-              presetId: preset?.id,
-              lastUpdatedLeafId: null,
-              lastBranchUpdatedAt: now - i,
-              archived: false,
-              pinned: false,
-              folderId: null,
-              tags: i % 4 === 0 ? tagIds : i % 5 === 0 ? [tagIds[0]] : [],
-              previewText: `mixed root preview ${i}`,
-            })
-          }
-          for (let i = 0; i < 40; i += 1) {
-            chats.put({
-              id: `mixed-height-folder-chat-${String(i).padStart(3, '0')}`,
-              title: `Mixed height folder ${String(i).padStart(3, '0')}`,
-              titleStatus: 'manual',
-              createdAt: now - 90 - i,
-              updatedAt: now - 90 - i,
-              lastViewedAt: now - 90 - i,
-              wordCount: 10,
-              totalCostUsd: 0,
-              metaVersion: 0,
-              summaryVersion: 0,
-              settings: structuredClone(chatSettings),
-              presetId: preset?.id,
-              lastUpdatedLeafId: null,
-              lastBranchUpdatedAt: now - 90 - i,
-              archived: false,
-              pinned: false,
-              folderId: 'height-check-folder',
-              tags: i % 3 === 0 ? tagIds.slice(0, 3) : [],
-              previewText: `mixed folder preview ${i}`,
-            })
-          }
-        }
-        tx.oncomplete = () => resolve()
-        tx.onerror = () => reject(tx.error)
-        tx.onabort = () => reject(tx.error)
-      })
-    } finally {
-      db.close()
-    }
+  const now = Date.now()
+  const tags = [
+    { id: 'height-tag-alpha', name: 'Alpha' },
+    { id: 'height-tag-beta', name: 'Beta' },
+    { id: 'height-tag-gamma', name: 'Gamma' },
+    { id: 'height-tag-delta', name: 'Delta' },
+  ].map((tag, index) => ({
+    ...tag,
+    createdAt: now + index,
+    updatedAt: now + index,
+    lastUsedAt: now + index,
+  }))
+  const tagIds = tags.map((tag) => tag.id)
+  await appendChatCatalogFixturesThroughUi(page, {
+    now,
+    workspaceSettings: {
+      'global:sidebar-render-window-size': 320,
+      'global:sidebar-render-window-load-mode': 'manual',
+    },
+    folders: [
+      {
+        id: 'height-check-folder',
+        name: 'Height check folder',
+        createdAt: now - 100,
+        updatedAt: now - 100,
+        lastUsedAt: now - 100,
+      },
+      {
+        id: 'bottom-height-folder',
+        name: 'Bottom height folder',
+        createdAt: now - 500,
+        updatedAt: now - 500,
+        lastUsedAt: now - 500,
+      },
+    ],
+    tags,
+    chats: [
+      ...Array.from({ length: 210 }, (_, index) => ({
+        id: `mixed-height-root-chat-${String(index).padStart(3, '0')}`,
+        title: `Mixed height root ${String(index).padStart(3, '0')}`,
+        createdAt: now - index,
+        updatedAt: now - index,
+        lastViewedAt: now - index,
+        wordCount: 10,
+        tags: index % 4 === 0 ? tagIds : index % 5 === 0 ? [tagIds[0] as string] : [],
+        previewText: `mixed root preview ${index}`,
+      })),
+      ...Array.from({ length: 40 }, (_, index) => ({
+        id: `mixed-height-folder-chat-${String(index).padStart(3, '0')}`,
+        title: `Mixed height folder ${String(index).padStart(3, '0')}`,
+        createdAt: now - 90 - index,
+        updatedAt: now - 90 - index,
+        lastViewedAt: now - 90 - index,
+        wordCount: 10,
+        folderId: 'height-check-folder',
+        tags: index % 3 === 0 ? tagIds.slice(0, 3) : [],
+        previewText: `mixed folder preview ${index}`,
+      })),
+      ...Array.from({ length: 4 }, (_, index) => ({
+        id: `bottom-height-folder-chat-${String(index).padStart(3, '0')}`,
+        title: `Bottom height folder chat ${String(index).padStart(3, '0')}`,
+        createdAt: now - 500 - index,
+        updatedAt: now - 500 - index,
+        lastViewedAt: now - 500 - index,
+        wordCount: 10,
+        folderId: 'bottom-height-folder',
+        tags: index % 2 === 0 ? tagIds.slice(0, 2) : [],
+        previewText: `bottom height folder preview ${index}`,
+      })),
+    ],
   })
 }
 
 async function seedSidebarScrollMutationFixture(page: Page): Promise<void> {
-  await page.evaluate(async () => {
-    const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const req = indexedDB.open('natter')
-      req.onsuccess = () => resolve(req.result)
-      req.onerror = () => reject(req.error)
-    })
-    const now = Date.now()
-    try {
-      await new Promise<void>((resolve, reject) => {
-        const tx = db.transaction(['presets', 'settings', 'folders', 'chats'], 'readwrite')
-        const presets = tx.objectStore('presets')
-        const settingsStore = tx.objectStore('settings')
-        const folders = tx.objectStore('folders')
-        const chats = tx.objectStore('chats')
-        const presetsReq = presets.getAll()
-        presetsReq.onsuccess = () => {
-          const preset = (presetsReq.result as Array<{ id?: string; settings?: unknown }>)[0]
-          const chatSettings = structuredClone(preset?.settings ?? {})
-          settingsStore.put({ key: 'global:sidebar-render-window-size', value: 75 })
-          settingsStore.put({ key: 'global:sidebar-render-window-load-mode', value: 'manual' })
-          settingsStore.put({ key: 'sidebar:collapsed-folders', value: ['far-folder'] })
-          folders.put({
-            id: 'far-folder',
-            name: 'Far folder',
-            sortIndex: 0,
-            createdAt: now + 795,
-            updatedAt: now + 795,
-            lastUsedAt: now + 795,
-          })
-          for (let i = 0; i < 230; i += 1) {
-            chats.put({
-              id: `sidebar-scroll-chat-${String(i).padStart(3, '0')}`,
-              title: i === 210 ? 'Tag target chat' : `Sidebar scroll chat ${String(i)}`,
-              titleStatus: 'manual',
-              createdAt: now + 1000 - i,
-              updatedAt: now + 1000 - i,
-              lastViewedAt: now + 1000 - i,
-              wordCount: 10,
-              totalCostUsd: 0,
-              metaVersion: 0,
-              summaryVersion: 0,
-              settings: structuredClone(chatSettings),
-              presetId: preset?.id,
-              lastUpdatedLeafId: null,
-              lastBranchUpdatedAt: now + 1000 - i,
-              archived: false,
-              pinned: false,
-              folderId: null,
-              tags: [],
-              previewText: `sidebar scroll preview ${i}`,
-            })
-          }
-          for (let i = 0; i < 6; i += 1) {
-            chats.put({
-              id: `far-folder-chat-${i}`,
-              title: `Far folder chat ${i}`,
-              titleStatus: 'manual',
-              createdAt: now + 795 - i,
-              updatedAt: now + 795 - i,
-              lastViewedAt: now + 795 - i,
-              wordCount: 10,
-              totalCostUsd: 0,
-              metaVersion: 0,
-              summaryVersion: 0,
-              settings: structuredClone(chatSettings),
-              presetId: preset?.id,
-              lastUpdatedLeafId: null,
-              lastBranchUpdatedAt: now + 795 - i,
-              archived: false,
-              pinned: false,
-              folderId: 'far-folder',
-              tags: [],
-              previewText: `far folder preview ${i}`,
-            })
-          }
-        }
-        tx.oncomplete = () => resolve()
-        tx.onerror = () => reject(tx.error)
-        tx.onabort = () => reject(tx.error)
-      })
-    } finally {
-      db.close()
+  const now = Date.now()
+  await appendChatCatalogFixturesThroughUi(page, {
+    now,
+    workspaceSettings: {
+      'global:sidebar-render-window-size': 75,
+      'global:sidebar-render-window-load-mode': 'manual',
+      'sidebar:collapsed-folders': ['far-folder'],
+    },
+    folders: [
+      {
+        id: 'far-folder',
+        name: 'Far folder',
+        createdAt: now + 795,
+        updatedAt: now + 795,
+        lastUsedAt: now + 795,
+      },
+    ],
+    chats: [
+      ...Array.from({ length: 230 }, (_, index) => ({
+        id: `sidebar-scroll-chat-${String(index).padStart(3, '0')}`,
+        title: index === 210 ? 'Tag target chat' : `Sidebar scroll chat ${String(index)}`,
+        createdAt: now + 1000 - index,
+        updatedAt: now + 1000 - index,
+        lastViewedAt: now + 1000 - index,
+        wordCount: 10,
+        previewText: `sidebar scroll preview ${index}`,
+      })),
+      ...Array.from({ length: 6 }, (_, index) => ({
+        id: `far-folder-chat-${index}`,
+        title: `Far folder chat ${index}`,
+        createdAt: now + 795 - index,
+        updatedAt: now + 795 - index,
+        lastViewedAt: now + 795 - index,
+        wordCount: 10,
+        folderId: 'far-folder',
+        previewText: `far folder preview ${index}`,
+      })),
+    ],
+  })
+}
+
+async function seedLargeFolderRows(
+  page: Page,
+  input: { readonly folderChatCount: number; readonly movedChatId: string },
+): Promise<void> {
+  const now = Date.now()
+  await appendChatCatalogFixturesThroughUi(page, {
+    now,
+    workspaceSettings: {
+      'global:sidebar-render-window-size': 75,
+      'global:sidebar-render-window-load-mode': 'auto',
+      'sidebar:collapsed-folders': ['large-exact-folder'],
+    },
+    folders: [
+      {
+        id: 'large-exact-folder',
+        name: 'Large exact folder',
+        createdAt: now + 10_000,
+        updatedAt: now + 10_000,
+        lastUsedAt: now + 10_000,
+      },
+    ],
+    chats: [
+      {
+        id: input.movedChatId,
+        title: 'Large folder drop source',
+        createdAt: now + 10_001,
+        updatedAt: now + 10_001,
+        lastViewedAt: now + 10_001,
+        wordCount: 10,
+        previewText: 'large folder drop source preview',
+      },
+      ...Array.from({ length: input.folderChatCount }, (_, index) => ({
+        id: `large-folder-chat-${String(index).padStart(3, '0')}`,
+        title: `Large folder chat ${String(index).padStart(3, '0')}`,
+        createdAt: now + 9_999 - index,
+        updatedAt: now + 9_999 - index,
+        lastViewedAt: now + 9_999 - index,
+        wordCount: 10,
+        folderId: 'large-exact-folder',
+        previewText: `large folder preview ${index}`,
+      })),
+    ],
+  })
+}
+
+async function installMessageBodyReadCounter(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    type CounterWindow = Window & {
+      __messageBodyReadCounter?: { reads: number }
     }
+    const counter = { reads: 0 }
+    ;(window as CounterWindow).__messageBodyReadCounter = counter
+    const wrap = (
+      prototype: object,
+      storeName: (receiver: IDBObjectStore | IDBIndex) => string,
+    ) => {
+      for (const method of [
+        'get',
+        'getKey',
+        'getAll',
+        'getAllKeys',
+        'count',
+        'openCursor',
+        'openKeyCursor',
+      ]) {
+        const descriptor = Object.getOwnPropertyDescriptor(prototype, method)
+        const implementation: unknown = descriptor?.value
+        if (!descriptor || typeof implementation !== 'function') continue
+        Object.defineProperty(prototype, method, {
+          ...descriptor,
+          value: function (
+            this: IDBObjectStore | IDBIndex,
+            ...args: unknown[]
+          ): IDBRequest<unknown> {
+            if (storeName(this) === 'messageBodies') counter.reads += 1
+            return Reflect.apply(implementation, this, args) as IDBRequest<unknown>
+          },
+        })
+      }
+    }
+    wrap(IDBObjectStore.prototype, (store) => (store as IDBObjectStore).name)
+    wrap(IDBIndex.prototype, (index) => (index as IDBIndex).objectStore.name)
+  })
+}
+
+async function resetMessageBodyReadCounter(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const counter = (
+      window as Window & {
+        __messageBodyReadCounter?: { reads: number }
+      }
+    ).__messageBodyReadCounter
+    if (!counter) throw new Error('MessageBodyReadCounterMissing')
+    counter.reads = 0
+  })
+}
+
+async function readMessageBodyReadCounter(page: Page): Promise<number> {
+  return page.evaluate(() => {
+    const counter = (
+      window as Window & {
+        __messageBodyReadCounter?: { reads: number }
+      }
+    ).__messageBodyReadCounter
+    if (!counter) throw new Error('MessageBodyReadCounterMissing')
+    return counter.reads
+  })
+}
+
+async function startFolderMoveRecorder(page: Page, chatId: string): Promise<void> {
+  await page.evaluate((id) => {
+    type MoveRecord = {
+      droppedAt: number | null
+      committedAt: number | null
+      folderHeader: Element
+      onDrop: () => void
+      observer: MutationObserver
+    }
+    const folder = [...document.querySelectorAll('[data-ui="folder-section"]')].find((node) =>
+      node.textContent.includes('Large exact folder'),
+    )
+    const folderHeader = folder?.querySelector('[data-ui="folder-header"]')
+    if (!folderHeader) throw new Error('FolderMoveRecordTargetMissing')
+    const record: MoveRecord = {
+      droppedAt: null,
+      committedAt: null,
+      folderHeader,
+      onDrop: () => {
+        record.droppedAt ??= performance.now()
+      },
+      observer: null as unknown as MutationObserver,
+    }
+    folderHeader.addEventListener('drop', record.onDrop, { capture: true })
+    const sample = () => {
+      const folder = [...document.querySelectorAll('[data-ui="folder-section"]')].find((node) =>
+        node.textContent.includes('Large exact folder'),
+      )
+      const source = document
+        .querySelector(`[data-ui="chat-row"] [href="#/chat/${id}"]`)
+        ?.closest<HTMLElement>('[data-ui="chat-row"]')
+      if (
+        record.committedAt === null &&
+        (source?.dataset.sidebarDepth === 'folder' ||
+          folder?.querySelector('[data-ui="folder-count"]')?.textContent === '514')
+      ) {
+        record.committedAt = performance.now()
+      }
+    }
+    record.observer = new MutationObserver(sample)
+    record.observer.observe(document.querySelector('[data-ui="chat-list"]') ?? document.body, {
+      attributes: true,
+      childList: true,
+      subtree: true,
+    })
+    ;(window as typeof window & { __folderMoveRecord?: MoveRecord }).__folderMoveRecord = record
+    sample()
+  }, chatId)
+}
+
+async function finishFolderMoveRecorder(page: Page): Promise<number> {
+  return page.evaluate(() => {
+    const record = (
+      window as typeof window & {
+        __folderMoveRecord?: {
+          droppedAt: number | null
+          committedAt: number | null
+          folderHeader: Element
+          onDrop: () => void
+          observer: MutationObserver
+        }
+      }
+    ).__folderMoveRecord
+    if (!record || record.droppedAt === null || record.committedAt === null) {
+      throw new Error('FolderMoveRecordIncomplete')
+    }
+    record.observer.disconnect()
+    record.folderHeader.removeEventListener('drop', record.onDrop, { capture: true })
+    return record.committedAt - record.droppedAt
+  })
+}
+
+async function collectFolderViewportSample(list: Locator): Promise<{
+  readonly folderChatIds: readonly string[]
+  readonly duplicateChatIds: readonly string[]
+  readonly mountedRows: number
+}> {
+  return list.evaluate(async (node) => {
+    const folderChatIds = [
+      ...node.querySelectorAll<HTMLElement>(
+        '[data-ui="chat-row"][data-sidebar-depth="folder"] [data-ui="chat-row-link"][href^="#/chat/"]',
+      ),
+    ]
+      .map((link) => link.getAttribute('href')?.slice('#/chat/'.length) ?? '')
+      .filter(Boolean)
+    const duplicateChatIds = folderChatIds.filter(
+      (id, index) => folderChatIds.indexOf(id) !== index,
+    )
+    const mountedRows = node.querySelectorAll('[data-sidebar-row-key]').length
+    const maximum = Math.max(0, node.scrollHeight - node.clientHeight)
+    if (node.scrollTop < maximum - 1) {
+      node.dispatchEvent(
+        new WheelEvent('wheel', {
+          bubbles: true,
+          cancelable: true,
+          deltaY: Math.max(1, node.clientHeight * 0.8),
+        }),
+      )
+      node.scrollTop = Math.min(maximum, node.scrollTop + Math.max(1, node.clientHeight * 0.8))
+      node.dispatchEvent(new Event('scroll', { bubbles: true }))
+    }
+    await new Promise<void>((resolve) =>
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+    )
+    return { folderChatIds, duplicateChatIds, mountedRows }
   })
 }

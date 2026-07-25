@@ -16,60 +16,49 @@ import {
   useRef,
   useState,
 } from 'react'
+import type { CommittedConversationImport } from '../../app/conversation-actions'
+import {
+  type ConversationActions,
+  loadConversationActions,
+} from '../../app/conversation-actions-capability'
+import { definePresentationInteraction } from '../../app/presentation-interactions'
 import {
   beginRouteIntent,
   cancelRouteIntent,
   chatHref,
   homeHref,
+  isRouteIntentCurrent,
   makeAnchorClickHandler,
   navigateForIntent,
+  navigateToChatForIntent,
+  routeIntentOwner,
 } from '../../app/router'
-import { exportLastUpdatedChatAsTxt, triggerBrowserDownload } from '../../core/chat-export'
-import { DEFAULT_GLOBAL_PREFERENCES, readGlobalPreferences } from '../../core/global-settings'
+import { DEFAULT_GLOBAL_PREFERENCES } from '../../core/global-settings'
 import {
-  DEFAULT_SIDEBAR_SORT_MODE,
   SIDEBAR_SORT_OPTIONS,
   type SidebarSortMode,
   sidebarSortOption,
 } from '../../core/sidebar-sort'
 import type { ChatFolder, ChatId, ChatSidebarRow, ChatTag, FolderId } from '../../core/types'
-import { isPageHidingAbortError } from '../../lib/page-lifecycle'
 import {
+  catalogApplication,
+  catalogChatPresentation,
+  catalogCollapsedFolderIds,
+  catalogSidebarSortMode,
   DEFAULT_SEARCH_FILTERS,
   hasActiveSearchFilters,
   hasSearchWork,
   type SearchFilters,
   type SearchResult,
-} from '../../store/chat-search'
-import {
-  archiveChat,
-  listChatSidebarRows,
-  moveChatToFolder,
-  setChatTagsFromNames,
-} from '../../store/chats'
-import { createFolder, deleteFolder, listFolders, updateFolder } from '../../store/folders'
-import { exportChat, importChat } from '../../store/import-export'
-import {
-  GLOBAL_PREFERENCES_DEPENDENCIES,
-  primaryKeys,
-  SIDEBAR_MODEL_DEPENDENCIES,
-} from '../../store/reactive-dependencies'
-import { useRepositoryQuery, useRepositoryQueryState } from '../../store/reactive-query'
-import { abortSearchSession, requestSearchSession } from '../../store/search-session'
-import {
-  readCollapsedSidebarFolderIds,
-  readSidebarSortMode,
-  SIDEBAR_COLLAPSED_FOLDERS_SETTING_KEY,
-  SIDEBAR_SORT_SETTING_KEY,
-  updateCollapsedSidebarFolderIds,
-  writeSidebarSortMode,
-} from '../../store/sidebar-preferences'
-import { listTags } from '../../store/tags'
-import {
-  orderedSearchResults,
-  startSearchStoreBroadcastListener,
-  useSearchStore,
-} from '../../store/zustand/searchStore'
+  useCatalogTab,
+  useChatCatalogSearch,
+  useSidebarCatalogApplication,
+} from '../../hooks/useCatalogApplication'
+import { useConfigurationPreferences } from '../../hooks/useConfigurationPreferences'
+import { usePresentationInteraction } from '../../hooks/usePresentationInteraction'
+import { assertNever } from '../../lib/assert'
+import { isPageHidingAbortError } from '../../lib/page-lifecycle'
+import { interchangeApplication } from '../../store/interchange-application'
 import { useToastStore } from '../../store/zustand/toastStore'
 import {
   ChevronIcon,
@@ -86,6 +75,15 @@ import {
   TrashIcon,
   UploadIcon,
 } from '../icons/Icon'
+
+const sidebarArchiveInteraction = definePresentationInteraction<ChatId>({
+  id: 'sidebar-chat.archive',
+  label: 'Move chat to trash',
+  concurrency: 'reject',
+  lifetime: 'workspace-tab',
+})
+
+import { exportLastUpdatedChatAsTxt, triggerBrowserDownload } from '../import-export/chat-download'
 import {
   forEachJsonOrZipFile,
   importExportErrorMessage,
@@ -93,14 +91,7 @@ import {
   triggerJsonDownload,
 } from '../import-export/json-file'
 import { Button, IconButton } from '../primitives/Button'
-import {
-  buildCreatedAtGroups,
-  buildSidebarEntries,
-  formatSidebarRowMeta,
-  isEmptySidebarDraft,
-  shouldRenderCreatedAtGroups,
-  sortChats,
-} from './chat-organization'
+import { createdAtGroupBoundaries, formatSidebarRowMeta, sortChats } from './chat-organization'
 
 interface ChatListProps {
   activeChatId: ChatId | null
@@ -108,7 +99,6 @@ interface ChatListProps {
   onChatIntent?: () => void
 }
 
-const EMPTY_COLLAPSED_FOLDER_IDS: FolderId[] = []
 const SIDEBAR_VIRTUALIZE_THRESHOLD = 200
 const SIDEBAR_INITIAL_VIRTUAL_ROWS = 18
 
@@ -126,7 +116,7 @@ type SidebarVirtualRow =
       kind: 'folder'
       key: string
       folder: ChatFolder
-      chats: ChatSidebarRow[]
+      exactChatCount: number
     }
   | {
       kind: 'time-group'
@@ -157,20 +147,29 @@ interface SidebarVirtualMount {
   measureElement: (node: HTMLLIElement | null) => void
 }
 
-interface SidebarScrollAnchor {
-  key: string
-  top: number
-}
+type SidebarScrollAnchor =
+  | Readonly<{ kind: 'top' }>
+  | Readonly<{ kind: 'bottom' }>
+  | Readonly<{
+      kind: 'row'
+      key: string
+      top: number
+    }>
 
-function captureSidebarScrollAnchor(
-  root: HTMLElement,
-  source?: Element | null,
-): SidebarScrollAnchor | null {
-  const sourceRow = source ? source.closest<HTMLElement>('[data-sidebar-row-key]') : null
-  const row = sourceRow ?? firstVisibleSidebarRow(root)
+type SidebarAnchorRestoration = 'missing' | 'adjusted' | 'stable'
+
+function captureSidebarScrollAnchor(root: HTMLElement): SidebarScrollAnchor | null {
+  if (root.scrollTop <= 1 && root.scrollHeight <= root.clientHeight + 1) {
+    return { kind: 'top' }
+  }
+  if (root.scrollHeight - root.clientHeight - root.scrollTop <= 1) {
+    return { kind: 'bottom' }
+  }
+  const row = firstVisibleSidebarRow(root)
   const key = row?.dataset.sidebarRowKey
   if (!row || !key) return null
   return {
+    kind: 'row',
     key,
     top: row.getBoundingClientRect().top - root.getBoundingClientRect().top,
   }
@@ -182,13 +181,24 @@ function firstVisibleSidebarRow(root: HTMLElement): HTMLElement | null {
   let lastBeforeViewport: HTMLElement | null = null
   for (const row of rows) {
     const rowRect = row.getBoundingClientRect()
-    if (rowRect.bottom < rootRect.top) {
+    if (rowRect.bottom <= rootRect.top) {
       lastBeforeViewport = row
       continue
     }
     if (rowRect.top <= rootRect.bottom) return row
   }
   return lastBeforeViewport ?? rows[0] ?? null
+}
+
+function captureSidebarVisibleRowAnchor(root: HTMLElement): SidebarScrollAnchor | null {
+  const row = firstVisibleSidebarRow(root)
+  const key = row?.dataset.sidebarRowKey
+  if (!row || !key) return null
+  return {
+    kind: 'row',
+    key,
+    top: row.getBoundingClientRect().top - root.getBoundingClientRect().top,
+  }
 }
 
 function findSidebarRowByKey(root: HTMLElement, key: string): HTMLElement | null {
@@ -198,78 +208,28 @@ function findSidebarRowByKey(root: HTMLElement, key: string): HTMLElement | null
   return null
 }
 
-function restoreSidebarScrollAnchor(root: HTMLElement, anchor: SidebarScrollAnchor): boolean {
+function restoreSidebarScrollAnchor(
+  root: HTMLElement,
+  anchor: SidebarScrollAnchor,
+): SidebarAnchorRestoration {
+  if (anchor.kind === 'top') {
+    if (root.scrollTop < 1) return 'stable'
+    root.scrollTop = 0
+    return 'adjusted'
+  }
+  if (anchor.kind === 'bottom') {
+    const target = Math.max(0, root.scrollHeight - root.clientHeight)
+    if (Math.abs(root.scrollTop - target) < 1) return 'stable'
+    root.scrollTop = target
+    return 'adjusted'
+  }
   const row = findSidebarRowByKey(root, anchor.key)
-  if (!row) return false
-  const delta = row.getBoundingClientRect().top - root.getBoundingClientRect().top - anchor.top
-  if (Math.abs(delta) < 1) return true
+  if (!row) return 'missing'
+  const rootRect = root.getBoundingClientRect()
+  const delta = row.getBoundingClientRect().top - rootRect.top - anchor.top
+  if (Math.abs(delta) < 1) return 'stable'
   root.scrollTop += delta
-  return true
-}
-
-// Loads the chat-row list only — never touches the `messages` table.
-// `chat.previewText` is maintained in the authoritative message transaction,
-// so the sidebar stays
-// cheap even with thousands of chats. The daemon-mode equivalent will
-// implement the same read via the repository boundary; this module
-// doesn't couple its read path to Dexie semantics.
-async function loadSidebarModel(): Promise<{
-  chats: ChatSidebarRow[]
-  folders: ChatFolder[]
-  tags: ChatTag[]
-}> {
-  try {
-    const [chats, folders, tags] = await Promise.all([
-      listChatSidebarRows(),
-      listFolders(),
-      listTags(),
-    ])
-    return { chats, folders, tags }
-  } catch (error) {
-    if (error instanceof Error && error.name === 'DatabaseClosedError') {
-      return { chats: [], folders: [], tags: [] }
-    }
-    throw error
-  }
-}
-
-function buildChatVirtualRows(
-  chats: readonly ChatSidebarRow[],
-  options: {
-    keyPrefix: string
-    depth: SidebarRowDepth
-    sortMode: SidebarSortMode
-    searchResultsByChatId?: ReadonlyMap<ChatId, SearchResult>
-  },
-): SidebarVirtualRow[] {
-  const chatRow = (chat: ChatSidebarRow): SidebarVirtualRow => {
-    const row: SidebarVirtualRow = {
-      kind: 'chat',
-      key: `${options.keyPrefix}:chat:${chat.id}`,
-      chat,
-      depth: options.depth,
-    }
-    const searchResult = options.searchResultsByChatId?.get(chat.id)
-    if (searchResult) row.searchResult = searchResult
-    return row
-  }
-  if (!shouldRenderCreatedAtGroups(options.sortMode)) {
-    return chats.map(chatRow)
-  }
-
-  const rows: SidebarVirtualRow[] = []
-  for (const group of buildCreatedAtGroups(chats, options.sortMode)) {
-    rows.push({
-      kind: 'time-group',
-      key: `${options.keyPrefix}:time:${group.key}`,
-      label: group.label,
-      depth: options.depth,
-    })
-    for (const chat of group.chats) {
-      rows.push(chatRow(chat))
-    }
-  }
-  return rows
+  return 'adjusted'
 }
 
 function estimateSidebarVirtualRowSize(
@@ -337,44 +297,32 @@ export const ChatList = memo(function ChatList({
   collapsed,
   onChatIntent,
 }: ChatListProps) {
-  const model = useRepositoryQuery(
-    'sidebar-model',
-    loadSidebarModel,
-    {
-      chats: [],
-      folders: [],
-      tags: [],
-    },
-    SIDEBAR_MODEL_DEPENDENCIES,
-  )
-  const preferencesQuery = useRepositoryQueryState(
-    'global-preferences',
-    readGlobalPreferences,
-    DEFAULT_GLOBAL_PREFERENCES,
-    GLOBAL_PREFERENCES_DEPENDENCIES,
-  )
-  if (preferencesQuery.status === 'error') throw preferencesQuery.error
-  const loadedPrefs = preferencesQuery.status === 'ready' ? preferencesQuery.value : undefined
-  const prefs = preferencesQuery.value
-  const persistedSortMode = useRepositoryQuery(
-    'sidebar-sort-mode',
-    readSidebarSortMode,
-    DEFAULT_SIDEBAR_SORT_MODE,
-    primaryKeys('settings', SIDEBAR_SORT_SETTING_KEY),
-  )
-  const persistedCollapsedFolderIds = useRepositoryQuery(
-    'sidebar-collapsed-folder-ids',
-    readCollapsedSidebarFolderIds,
-    EMPTY_COLLAPSED_FOLDER_IDS,
-    primaryKeys('settings', SIDEBAR_COLLAPSED_FOLDERS_SETTING_KEY),
-  )
-  const [sortMode, setSortMode] = useState<SidebarSortMode>(DEFAULT_SIDEBAR_SORT_MODE)
+  const tab = useCatalogTab()
+  const configurationPreferences = useConfigurationPreferences()
+  const prefs = configurationPreferences?.global ?? DEFAULT_GLOBAL_PREFERENCES
+  const loadedPrefs = configurationPreferences?.global
+  const sortMode = catalogSidebarSortMode(tab, configurationPreferences)
+  const rowMetaNow = Date.now()
+  const createdAtBoundariesRef = useRef(createdAtGroupBoundaries(rowMetaNow))
   const [sortMenuOpen, setSortMenuOpen] = useState(false)
   const [openActionChatId, setOpenActionChatId] = useState<ChatId | null>(null)
   const [importingChat, setImportingChat] = useState(false)
-  const [collapsedFolderIds, setCollapsedFolderIds] = useState<ReadonlySet<FolderId>>(
-    () => new Set(),
+  const collapsedFolderIds = useMemo<ReadonlySet<FolderId>>(
+    () => new Set(catalogCollapsedFolderIds(tab, configurationPreferences)),
+    [configurationPreferences, tab],
   )
+  const collapsedFolderIdList = useMemo(
+    () => Object.freeze([...collapsedFolderIds].sort()),
+    [collapsedFolderIds],
+  )
+  const { model, loadMore: loadMoreSidebarCatalog } = useSidebarCatalogApplication({
+    enabled: configurationPreferences !== null,
+    mode: collapsed ? 'collapsed' : 'expanded',
+    sort: sortMode,
+    collapsedFolderIds: collapsedFolderIdList,
+    pageSize: prefs.sidebarRenderWindowSize,
+    createdAtGroupBoundaries: createdAtBoundariesRef.current,
+  })
   const [dragOverFolderId, setDragOverFolderId] = useState<FolderId | null>(null)
   const [recentMove, setRecentMove] = useState<{ chatId: ChatId; folderId: FolderId } | null>(null)
   const [folderDeleteTarget, setFolderDeleteTarget] = useState<ChatFolder | null>(null)
@@ -397,31 +345,14 @@ export const ChatList = memo(function ChatList({
   const sidebarWindowLoadRef = useRef<HTMLLIElement | null>(null)
   const preserveSearchExpansionRef = useRef(false)
   const rowMenuButtonRefs = useRef(new Map<ChatId, HTMLButtonElement>())
-  const searchSession = useSearchStore((state) => state.session)
   const pushToast = useToastStore((s) => s.push)
-  const sortLocale = useMemo(
-    () => (typeof navigator === 'undefined' ? 'en-US' : navigator.language),
-    [],
-  )
-  const sortOptions = useMemo(() => ({ locale: sortLocale }), [sortLocale])
+  const archiveInteraction = usePresentationInteraction(sidebarArchiveInteraction)
+  const runArchiveInteraction = archiveInteraction.run
   const activeSortOption = sidebarSortOption(sortMode)
   const tagById = useMemo(() => new Map(model.tags.map((tag) => [tag.id, tag])), [model.tags])
   const folderById = useMemo(
     () => new Map(model.folders.map((folder) => [folder.id, folder])),
     [model.folders],
-  )
-  const flatRows = useMemo(
-    () =>
-      sortChats(
-        model.chats.filter((chat) => !chat.archived && !isEmptySidebarDraft(chat)),
-        sortMode,
-        sortOptions,
-      ),
-    [model.chats, sortMode, sortOptions],
-  )
-  const entries = useMemo(
-    () => buildSidebarEntries(model.chats, model.folders, sortMode, sortOptions),
-    [model.chats, model.folders, sortMode, sortOptions],
   )
   const searchFilters = useMemo<SearchFilters>(
     () => ({
@@ -443,39 +374,49 @@ export const ChatList = memo(function ChatList({
   )
   const searchHasFilters = hasActiveSearchFilters(searchFilters) || searchAllBranches
   const searchActive = hasSearchWork(searchQuery, searchFilters)
+  const { session: searchSession, orderedResults: catalogSearchResults } = useChatCatalogSearch({
+    surface: 'sidebar',
+    query: searchQuery,
+    scope: searchAllBranches ? 'all-branches' : 'last-updated-branch',
+    filters: searchFilters,
+  })
+  const searchRowsInteractive = !searchActive || searchSession?.interactive === true
   const searchControlsExpanded = searchExpanded || searchActive || searchHasFilters
   const sortedSearchResults = useMemo(() => {
-    const results = orderedSearchResults(searchSession?.results)
-    const byChatId = new Map(results.map((result) => [result.chatId, result]))
+    const results = catalogSearchResults
     return sortChats(
       results.map((result) => result.chat),
       sortMode,
-      sortOptions,
     )
-      .map((chat) => byChatId.get(chat.id))
+      .map((chat) => searchSession?.results.byChatId.get(chat.id))
       .filter((result): result is SearchResult => Boolean(result))
-  }, [searchSession?.results, sortMode, sortOptions])
-  const rowMetaNow = Date.now()
+  }, [catalogSearchResults, searchSession?.results, sortMode])
   const sidebarListRef = useRef<HTMLUListElement | null>(null)
   const pendingSidebarScrollAnchorRef = useRef<SidebarScrollAnchor | null>(null)
-  const [renderedSidebarRowCount, setRenderedSidebarRowCount] = useState(
-    prefs.sidebarRenderWindowSize,
-  )
-  const queueSidebarScrollAnchor = useCallback((source?: Element | null) => {
+  const paintedSidebarScrollAnchorRef = useRef<SidebarScrollAnchor | null>(null)
+  const paintedSidebarVisibleRowAnchorRef = useRef<SidebarScrollAnchor | null>(null)
+  const availableSidebarRowsRef = useRef<readonly SidebarVirtualRow[]>([])
+  const sidebarRowsRefreshingRef = useRef(false)
+  const rememberPaintedSidebarScrollAnchor = useCallback(() => {
     const root = sidebarListRef.current
     if (!root) return
-    const anchor = captureSidebarScrollAnchor(root, source)
-    if (anchor) pendingSidebarScrollAnchorRef.current = anchor
+    const anchor = captureSidebarScrollAnchor(root)
+    if (!anchor) return
+    paintedSidebarScrollAnchorRef.current = anchor
+    paintedSidebarVisibleRowAnchorRef.current = captureSidebarVisibleRowAnchor(root)
+  }, [])
+  const handleSidebarScroll = useCallback(() => {
+    const root = sidebarListRef.current
+    if (!root) return
+    const anchor = captureSidebarScrollAnchor(root)
+    if (!anchor) return
+    paintedSidebarScrollAnchorRef.current = anchor
+    paintedSidebarVisibleRowAnchorRef.current = captureSidebarVisibleRowAnchor(root)
+  }, [])
+  const handleSidebarUserScrollIntent = useCallback(() => {
+    pendingSidebarScrollAnchorRef.current = null
   }, [])
   const virtualRows = useMemo<SidebarVirtualRow[]>(() => {
-    if (collapsed) {
-      return flatRows.map((chat) => ({
-        kind: 'chat',
-        key: `collapsed:chat:${chat.id}`,
-        chat,
-        depth: 'root',
-      }))
-    }
     if (searchActive) {
       if (sortedSearchResults.length === 0) {
         const status = searchSession?.status ?? 'idle'
@@ -490,70 +431,37 @@ export const ChatList = memo(function ChatList({
       return sortedSearchResults.map((result) => ({
         kind: 'chat',
         key: `search:chat:${result.chat.id}:${result.messageId ?? result.branchLeafId ?? 'row'}`,
-        chat: result.chat,
+        chat: catalogChatPresentation(tab, result.chat),
         depth: 'root',
         searchResult: result,
       }))
     }
 
-    const rows: SidebarVirtualRow[] = []
-    for (const entry of entries) {
-      if (entry.kind === 'chat') {
-        rows.push({
-          kind: 'chat',
-          key: `entry:chat:${entry.chat.id}`,
-          chat: entry.chat,
-          depth: 'root',
-        })
-        continue
+    return model.presentationRows.map((row): SidebarVirtualRow => {
+      switch (row.kind) {
+        case 'chat':
+          return { ...row, chat: catalogChatPresentation(tab, row.chat) }
+        case 'folder':
+          return { ...row }
+        case 'time-group':
+          return { ...row }
+        case 'folder-empty':
+          return { ...row }
       }
-      rows.push({
-        kind: 'folder',
-        key: `entry:folder:${entry.folder.id}`,
-        folder: entry.folder,
-        chats: entry.chats,
-      })
-      if (collapsedFolderIds.has(entry.folder.id)) continue
-      if (entry.chats.length === 0) {
-        rows.push({
-          kind: 'folder-empty',
-          key: `entry:folder:${entry.folder.id}:empty`,
-          depth: 'folder',
-        })
-        continue
-      }
-      rows.push(
-        ...buildChatVirtualRows(entry.chats, {
-          keyPrefix: `entry:folder:${entry.folder.id}`,
-          depth: 'folder',
-          sortMode,
-        }),
-      )
-    }
-    return rows
-  }, [
-    collapsed,
-    collapsedFolderIds,
-    entries,
-    flatRows,
-    searchActive,
-    searchSession?.status,
-    sortMode,
-    sortedSearchResults,
-  ])
-  const visibleVirtualRows = useMemo(
-    () => virtualRows.slice(0, Math.min(virtualRows.length, renderedSidebarRowCount)),
-    [renderedSidebarRowCount, virtualRows],
-  )
-  const sidebarAnchorRestoreKey = useMemo(
-    () =>
-      visibleVirtualRows
-        .map((row) => (row.kind === 'chat' ? `${row.key}:${row.chat.tags.join(',')}` : row.key))
-        .join('\n'),
-    [visibleVirtualRows],
-  )
-  const hiddenSidebarRowCount = Math.max(0, virtualRows.length - visibleVirtualRows.length)
-  const shouldVirtualizeSidebar = visibleVirtualRows.length > SIDEBAR_VIRTUALIZE_THRESHOLD
+      return assertNever(row)
+    })
+  }, [model.presentationRows, searchActive, searchSession?.status, sortedSearchResults, tab])
+  const exactSidebarRowCount = searchActive ? virtualRows.length : model.exactTotalRows
+  const visibleVirtualRows = virtualRows
+  useLayoutEffect(() => {
+    availableSidebarRowsRef.current = visibleVirtualRows
+    sidebarRowsRefreshingRef.current =
+      searchActive &&
+      (searchSession?.status === 'debouncing' || searchSession?.status === 'scanning')
+  }, [searchActive, searchSession?.status, visibleVirtualRows])
+  const previousVirtualRowsRef = useRef(virtualRows)
+  const hiddenSidebarRowCount = Math.max(0, exactSidebarRowCount - visibleVirtualRows.length)
+  const shouldVirtualizeSidebar = exactSidebarRowCount > SIDEBAR_VIRTUALIZE_THRESHOLD
   const sidebarVirtualizer = useVirtualizer<HTMLUListElement, HTMLLIElement>({
     count: visibleVirtualRows.length,
     getScrollElement: () => sidebarListRef.current,
@@ -564,87 +472,62 @@ export const ChatList = memo(function ChatList({
     initialRect: { width: 260, height: 720 },
     rangeExtractor: sidebarRangeExtractor,
     enabled: shouldVirtualizeSidebar,
+    anchorTo: 'start',
   })
-  const sidebarWindowResetKey = useMemo(
-    () =>
-      JSON.stringify({
-        collapsed: collapsed === true,
-        mode: searchActive ? 'search' : 'browse',
-        sortMode,
-        searchQuery,
-        searchAllBranches,
-        searchIncludeArchived,
-        searchTitleOnly,
-        includeFolderIds,
-        excludeFolderIds,
-        includeTagIds,
-        excludeTagIds,
-      }),
-    [
-      collapsed,
-      excludeFolderIds,
-      excludeTagIds,
-      includeFolderIds,
-      includeTagIds,
-      searchActive,
-      searchAllBranches,
-      searchIncludeArchived,
-      searchQuery,
-      searchTitleOnly,
-      sortMode,
-    ],
-  )
-  const loadMoreSidebarRows = useCallback(
-    (source?: Element | null) => {
-      queueSidebarScrollAnchor(source)
-      setRenderedSidebarRowCount(
-        Math.min(virtualRows.length, renderedSidebarRowCount + prefs.sidebarRenderWindowSize),
-      )
-    },
-    [
-      prefs.sidebarRenderWindowSize,
-      queueSidebarScrollAnchor,
-      renderedSidebarRowCount,
-      virtualRows.length,
-    ],
-  )
-  useEffect(() => {
-    startSearchStoreBroadcastListener()
-  }, [])
-  useEffect(() => {
-    void sidebarWindowResetKey
-    setRenderedSidebarRowCount(prefs.sidebarRenderWindowSize)
-  }, [prefs.sidebarRenderWindowSize, sidebarWindowResetKey])
+  const loadMoreSidebarRows = useCallback(() => {
+    const root = sidebarListRef.current
+    if (root) {
+      pendingSidebarScrollAnchorRef.current = captureSidebarVisibleRowAnchor(root)
+    }
+    loadMoreSidebarCatalog()
+  }, [loadMoreSidebarCatalog])
   useLayoutEffect(() => {
-    void sidebarAnchorRestoreKey
+    const previous = previousVirtualRowsRef.current
+    previousVirtualRowsRef.current = virtualRows
+    if (previous === virtualRows || pendingSidebarScrollAnchorRef.current) return
+    const appendedAtTail =
+      previous.length < virtualRows.length &&
+      previous.every((row, index) => row.key === virtualRows[index]?.key)
+    pendingSidebarScrollAnchorRef.current = appendedAtTail
+      ? paintedSidebarVisibleRowAnchorRef.current
+      : paintedSidebarScrollAnchorRef.current
+  }, [virtualRows])
+  useLayoutEffect(() => {
     const anchor = pendingSidebarScrollAnchorRef.current
     const root = sidebarListRef.current
-    if (!anchor || !root) return
-
-    if (!restoreSidebarScrollAnchor(root, anchor) && shouldVirtualizeSidebar) {
-      const anchorIndex = visibleVirtualRows.findIndex((row) => row.key === anchor.key)
-      if (anchorIndex >= 0) sidebarVirtualizer.scrollToIndex(anchorIndex, { align: 'start' })
-    }
-    if (typeof window.requestAnimationFrame !== 'function') {
-      pendingSidebarScrollAnchorRef.current = null
+    if (!anchor || !root) {
+      rememberPaintedSidebarScrollAnchor()
       return
     }
 
-    let secondFrame = 0
-    const firstFrame = window.requestAnimationFrame(() => {
-      restoreSidebarScrollAnchor(root, anchor)
-      secondFrame = window.requestAnimationFrame(() => {
-        restoreSidebarScrollAnchor(root, anchor)
-        if (pendingSidebarScrollAnchorRef.current === anchor) {
-          pendingSidebarScrollAnchorRef.current = null
-        }
-      })
-    })
-    return () => {
-      window.cancelAnimationFrame(firstFrame)
-      if (secondFrame) window.cancelAnimationFrame(secondFrame)
+    const restoration = restoreSidebarScrollAnchor(root, anchor)
+    const stillAvailable =
+      anchor.kind === 'top' ||
+      anchor.kind === 'bottom' ||
+      availableSidebarRowsRef.current.some((row) => row.key === anchor.key)
+    if (
+      anchor.kind === 'row' &&
+      restoration === 'missing' &&
+      shouldVirtualizeSidebar &&
+      stillAvailable
+    ) {
+      const anchorIndex = visibleVirtualRows.findIndex((row) => row.key === anchor.key)
+      const offset =
+        anchorIndex >= 0
+          ? sidebarVirtualizer.getOffsetForIndex(anchorIndex, 'start')?.[0]
+          : undefined
+      if (offset !== undefined) {
+        sidebarVirtualizer.scrollToOffset(offset - anchor.top + root.clientTop, { align: 'start' })
+        return
+      }
     }
-  }, [shouldVirtualizeSidebar, sidebarAnchorRestoreKey, sidebarVirtualizer, visibleVirtualRows])
+    const restorationComplete =
+      restoration === 'stable' || (restoration === 'missing' && !stillAvailable)
+    if (!sidebarRowsRefreshingRef.current && restorationComplete) {
+      pendingSidebarScrollAnchorRef.current = null
+      rememberPaintedSidebarScrollAnchor()
+    }
+  })
   useEffect(() => {
     if (!loadedPrefs || prefs.sidebarRenderWindowLoadMode !== 'auto') return
     if (hiddenSidebarRowCount <= 0) return
@@ -654,7 +537,7 @@ export const ChatList = memo(function ChatList({
     if (!root || !target) return
     const observer = new IntersectionObserver(
       (entries) => {
-        if (entries.some((entry) => entry.isIntersecting)) loadMoreSidebarRows(target)
+        if (entries.some((entry) => entry.isIntersecting)) loadMoreSidebarRows()
       },
       { root, rootMargin: '0px 0px 240px 0px', threshold: 0 },
     )
@@ -667,19 +550,6 @@ export const ChatList = memo(function ChatList({
       return
     setOpenActionChatId(null)
   }, [openActionChatId, visibleVirtualRows])
-  useEffect(() => {
-    requestSearchSession({
-      query: searchQuery,
-      scope: searchAllBranches ? 'all-branches' : 'last-updated-branch',
-      filters: searchFilters,
-    })
-  }, [searchAllBranches, searchFilters, searchQuery])
-  useEffect(() => () => abortSearchSession(), [])
-  useEffect(() => setSortMode(persistedSortMode), [persistedSortMode])
-  useEffect(
-    () => setCollapsedFolderIds(new Set(persistedCollapsedFolderIds)),
-    [persistedCollapsedFolderIds],
-  )
   useEffect(
     () => () => {
       if (recentMoveTimerRef.current) window.clearTimeout(recentMoveTimerRef.current)
@@ -718,23 +588,28 @@ export const ChatList = memo(function ChatList({
   // exist after /new send/import/settings starts, but the sidebar should stay
   // quiet until the user actually creates a message.
   const handleDelete = useCallback(
-    async (chat: ChatSidebarRow) => {
-      const routeIntent = activeChatId === chat.id ? beginRouteIntent() : null
-      try {
-        await archiveChat(chat.id)
-        if (routeIntent) navigateForIntent(routeIntent, homeHref())
-      } finally {
-        if (routeIntent) cancelRouteIntent(routeIntent)
-      }
+    (chat: ChatSidebarRow) => {
+      return runArchiveInteraction({
+        target: chat.id,
+        action: async ({ signal }) => {
+          const routeIntent = activeChatId === chat.id ? beginRouteIntent() : null
+          try {
+            await catalogApplication.chat.archive(chat.id)
+            if (routeIntent && !signal.aborted) navigateForIntent(routeIntent, homeHref())
+          } finally {
+            if (routeIntent) cancelRouteIntent(routeIntent)
+          }
+        },
+      })
     },
-    [activeChatId],
+    [activeChatId, runArchiveInteraction],
   )
   const handleDownload = useCallback(async (chat: ChatSidebarRow) => {
     const { filename, content } = await exportLastUpdatedChatAsTxt(chat.id)
     triggerBrowserDownload(filename, content)
   }, [])
   const handleExportJson = useCallback(async (chat: ChatSidebarRow) => {
-    const envelope = await exportChat(chat.id)
+    const envelope = await interchangeApplication.exportChat(chat.id)
     triggerJsonDownload(natterJsonFilename('chat', chat.title, chat.id), envelope)
   }, [])
   const handleImportChatFile = useCallback(
@@ -746,24 +621,67 @@ export const ChatList = memo(function ChatList({
       const routeIntent = beginRouteIntent()
       setImportingChat(true)
       try {
-        let importedCount = 0
-        const imported = { lastChatId: null as ChatId | null }
-        await forEachJsonOrZipFile(file, async (value) => {
-          const result = await importChat(value)
-          importedCount += 1
-          imported.lastChatId = result.chatId
-        })
-        pushToast({
-          level: 'success',
-          text: importedCount === 1 ? 'Imported chat.' : `Imported ${importedCount} chats.`,
-          durationMs: 2500,
-        })
-        if (imported.lastChatId) {
-          navigateForIntent(routeIntent, chatHref(imported.lastChatId))
+        const imported = {
+          count: 0,
+          last: null as CommittedConversationImport | null,
         }
-      } catch (error) {
-        console.error('Failed to import chat JSON/ZIP', error)
-        pushToast({ level: 'danger', text: importExportErrorMessage(error) })
+        let conversationActions: ConversationActions | null = null
+        let importError: unknown
+        try {
+          const actions = await loadConversationActions()
+          conversationActions = actions
+          await forEachJsonOrZipFile(file, async (value) => {
+            const committed = await actions.commitConversationImport(
+              value,
+              routeIntentOwner(routeIntent),
+            )
+            if (imported.last?.routeDelivery.kind === 'handoff') {
+              imported.last.routeDelivery.handoff.cancel()
+            }
+            imported.last = committed
+            imported.count += 1
+          })
+        } catch (error) {
+          importError = error
+        }
+        if (imported.count === 0) {
+          if (importError !== undefined) {
+            console.error('Failed to import chat JSON/ZIP', importError)
+            pushToast({ level: 'danger', text: importExportErrorMessage(importError) })
+          }
+          return
+        }
+        if (importError === undefined) {
+          pushToast({
+            level: 'success',
+            text: imported.count === 1 ? 'Imported chat.' : `Imported ${imported.count} chats.`,
+            durationMs: 2500,
+          })
+        } else {
+          console.error('Chat import stopped after committed entries', importError)
+          pushToast({
+            level: 'danger',
+            text: `Imported ${imported.count} before another file failed: ${importExportErrorMessage(importError)}`,
+          })
+        }
+        if (imported.last && conversationActions && isRouteIntentCurrent(routeIntent)) {
+          try {
+            const delivery = conversationActions.acceptCommittedConversationImport(imported.last)
+            if (delivery.kind === 'handoff') {
+              navigateToChatForIntent(routeIntent, imported.last.result.chatId, delivery.handoff)
+            }
+          } catch (error) {
+            console.error('Chat import committed but its local navigation handoff failed', error)
+            pushToast({
+              level: 'danger',
+              text: 'The chat was imported, but could not be opened automatically.',
+            })
+          }
+        } else {
+          if (imported.last?.routeDelivery.kind === 'handoff') {
+            imported.last.routeDelivery.handoff.cancel()
+          }
+        }
       } finally {
         cancelRouteIntent(routeIntent)
         setImportingChat(false)
@@ -774,12 +692,11 @@ export const ChatList = memo(function ChatList({
   const handleCreateFolder = useCallback(async () => {
     const name = window.prompt('Folder name')
     if (!name?.trim()) return
-    await createFolder({ name })
+    await catalogApplication.folder.create({ name })
   }, [])
   const handleSelectSortMode = useCallback((mode: SidebarSortMode) => {
-    setSortMode(mode)
     setSortMenuOpen(false)
-    void writeSidebarSortMode(mode).catch((error: unknown) => {
+    void catalogApplication.tab.setSidebarSortMode(mode).catch((error: unknown) => {
       if (isPageHidingAbortError(error)) return
       console.error('Failed to persist sidebar sort mode', error)
     })
@@ -787,7 +704,7 @@ export const ChatList = memo(function ChatList({
   const handleRenameFolder = useCallback(async (folder: ChatFolder) => {
     const name = window.prompt('Rename folder', folder.name)
     if (!name?.trim() || name.trim() === folder.name) return
-    await updateFolder(folder.id, { name })
+    await catalogApplication.folder.update(folder.id, { name })
   }, [])
   const beginDeleteFolder = useCallback((folder: ChatFolder) => {
     setFolderDeleteTarget(folder)
@@ -796,25 +713,21 @@ export const ChatList = memo(function ChatList({
   const commitDeleteFolder = useCallback(async () => {
     const folder = folderDeleteTarget
     if (!folder) return
-    const chatsInFolder = model.chats.filter((chat) => chat.folderId === folder.id)
-    const routeIntent =
-      deleteFolderChats && activeChatId && chatsInFolder.some((chat) => chat.id === activeChatId)
-        ? beginRouteIntent()
-        : null
+    const routeIntent = deleteFolderChats && activeChatId ? beginRouteIntent() : null
     try {
-      if (deleteFolderChats) {
-        await Promise.all(
-          chatsInFolder.filter((chat) => !chat.archived).map((chat) => archiveChat(chat.id)),
-        )
+      const result = await catalogApplication.folder.deleteWithDisposition(
+        folder.id,
+        deleteFolderChats ? 'archive' : 'move-top-level',
+      )
+      if (routeIntent && activeChatId && result.affectedChatIds.includes(activeChatId)) {
+        navigateForIntent(routeIntent, homeHref())
       }
-      await deleteFolder(folder.id)
-      if (routeIntent) navigateForIntent(routeIntent, homeHref())
       setFolderDeleteTarget(null)
       setDeleteFolderChats(false)
     } finally {
       if (routeIntent) cancelRouteIntent(routeIntent)
     }
-  }, [activeChatId, deleteFolderChats, folderDeleteTarget, model.chats])
+  }, [activeChatId, deleteFolderChats, folderDeleteTarget])
   const markRecentMove = useCallback((chatId: ChatId, folderId: FolderId) => {
     if (recentMoveTimerRef.current) window.clearTimeout(recentMoveTimerRef.current)
     setRecentMove({ chatId, folderId })
@@ -824,37 +737,34 @@ export const ChatList = memo(function ChatList({
     }, 1400)
   }, [])
   const handleMoveChat = useCallback(
-    async (chat: ChatSidebarRow, source?: Element | null) => {
-      queueSidebarScrollAnchor(source)
+    async (chat: ChatSidebarRow) => {
       const currentFolder = chat.folderId ? folderById.get(chat.folderId)?.name : ''
       const name = window.prompt('Move to folder (blank removes folder)', currentFolder ?? '')
       if (name === null) return
       const trimmed = name.trim()
       if (trimmed.length === 0) {
-        await moveChatToFolder(chat.id, null)
+        await catalogApplication.chat.moveToFolder(chat.id, null)
         return
       }
-      const existing = model.folders.find(
-        (folder) => folder.name.toLocaleLowerCase() === trimmed.toLocaleLowerCase(),
-      )
-      const folder = existing ?? (await createFolder({ name: trimmed }))
-      const changed = await moveChatToFolder(chat.id, folder.id)
-      if (changed) markRecentMove(chat.id, folder.id)
+      const result = await catalogApplication.folder.ensureAndMoveChats({
+        name: trimmed,
+        chatIds: [chat.id],
+      })
+      if (result.affectedChatIds.includes(chat.id)) markRecentMove(chat.id, result.folder.id)
     },
-    [folderById, markRecentMove, model.folders, queueSidebarScrollAnchor],
+    [folderById, markRecentMove],
   )
   const handleSetTags = useCallback(
-    async (chat: ChatSidebarRow, source?: Element | null) => {
-      queueSidebarScrollAnchor(source)
+    async (chat: ChatSidebarRow) => {
       const currentNames = chat.tags
         .map((tagId) => tagById.get(tagId)?.name)
         .filter((name): name is string => Boolean(name))
         .join(', ')
       const value = window.prompt('Tags, comma-separated', currentNames)
       if (value === null) return
-      await setChatTagsFromNames(chat.id, tagNamesFromPrompt(value))
+      await catalogApplication.chat.setTagsFromNames(chat.id, tagNamesFromPrompt(value))
     },
-    [queueSidebarScrollAnchor, tagById],
+    [tagById],
   )
   const handleClearSearch = useCallback(() => {
     setSearchQuery('')
@@ -915,46 +825,29 @@ export const ChatList = memo(function ChatList({
   const handleDropOnFolder = useCallback(
     async (event: DragEvent, folderId: FolderId) => {
       event.preventDefault()
-      queueSidebarScrollAnchor(event.currentTarget)
       setDragOverFolderId(null)
       const chatId = event.dataTransfer.getData('application/x-natter-chat-id')
       if (!chatId) return
-      const changed = await moveChatToFolder(chatId, folderId)
-      setCollapsedFolderIds((current) => {
-        const next = new Set(current)
-        next.delete(folderId)
-        return next
-      })
-      void updateCollapsedSidebarFolderIds((current) =>
-        current.filter((id) => id !== folderId),
-      ).catch((error: unknown) => {
+      const changed = await catalogApplication.chat.moveToFolder(chatId, folderId)
+      void catalogApplication.tab.setFolderCollapsed(folderId, false).catch((error: unknown) => {
         if (isPageHidingAbortError(error)) return
         console.error('Failed to persist sidebar folder state', error)
       })
       if (changed) markRecentMove(chatId, folderId)
     },
-    [markRecentMove, queueSidebarScrollAnchor],
+    [markRecentMove],
   )
   const toggleFolder = useCallback(
-    (folderId: FolderId, source?: Element | null) => {
-      queueSidebarScrollAnchor(source)
-      setCollapsedFolderIds((current) => {
-        const next = new Set(current)
-        if (next.has(folderId)) next.delete(folderId)
-        else next.add(folderId)
-        return next
-      })
-      void updateCollapsedSidebarFolderIds((current) => {
-        const next = new Set(current)
-        if (next.has(folderId)) next.delete(folderId)
-        else next.add(folderId)
-        return [...next]
-      }).catch((error: unknown) => {
-        if (isPageHidingAbortError(error)) return
-        console.error('Failed to persist sidebar folder state', error)
-      })
+    (folderId: FolderId) => {
+      const collapsed = !collapsedFolderIds.has(folderId)
+      void catalogApplication.tab
+        .setFolderCollapsed(folderId, collapsed)
+        .catch((error: unknown) => {
+          if (isPageHidingAbortError(error)) return
+          console.error('Failed to persist sidebar folder state', error)
+        })
     },
-    [queueSidebarScrollAnchor],
+    [collapsedFolderIds],
   )
   const renderChatRow = (
     chat: ChatSidebarRow,
@@ -965,6 +858,8 @@ export const ChatList = memo(function ChatList({
     const preview = chat.previewText ?? ''
     const searchTargetId = searchResult?.messageId ?? searchResult?.branchLeafId ?? undefined
     const href = chatHref(chat.id, searchTargetId)
+    const rowInteractive = searchResult ? searchRowsInteractive : model.interactive
+    const rowNavigable = searchResult ? searchRowsInteractive : true
     const meta = formatSidebarRowMeta(chat, sortMode, rowMetaNow)
     const visibleTags = chat.tags
       .map((tagId) => tagById.get(tagId))
@@ -976,7 +871,9 @@ export const ChatList = memo(function ChatList({
         data-sidebar-row-key={options.key ?? chat.id}
         data-sidebar-depth={options.depth === 'folder' ? 'folder' : undefined}
         data-active={chat.id === activeChatId}
-        data-menu-open={openActionChatId === chat.id ? 'true' : undefined}
+        data-menu-open={openActionChatId === chat.id && rowInteractive ? 'true' : undefined}
+        data-interactive={rowInteractive ? 'true' : 'false'}
+        data-navigable={rowNavigable ? 'true' : 'false'}
         data-moved={recentMove?.chatId === chat.id ? 'true' : undefined}
         data-title-status={chat.titleStatus}
         data-index={options.virtual?.index}
@@ -985,8 +882,12 @@ export const ChatList = memo(function ChatList({
             ? (node) => bindSidebarVirtualRow(node, options.virtual as SidebarVirtualMount)
             : undefined
         }
-        draggable={!collapsed}
+        draggable={!collapsed && rowInteractive}
         onDragStart={(event) => {
+          if (!rowInteractive) {
+            event.preventDefault()
+            return
+          }
           event.dataTransfer.effectAllowed = 'move'
           event.dataTransfer.setData('application/x-natter-chat-id', chat.id)
         }}
@@ -994,12 +895,14 @@ export const ChatList = memo(function ChatList({
       >
         <a
           data-ui="chat-row-link"
-          href={href}
+          href={rowNavigable ? href : undefined}
           rel="noopener"
-          onPointerEnter={onChatIntent}
-          onPointerDown={onChatIntent}
-          onFocus={onChatIntent}
-          onClick={makeAnchorClickHandler(href)}
+          aria-disabled={!rowNavigable || undefined}
+          tabIndex={rowNavigable ? undefined : -1}
+          onPointerEnter={rowNavigable ? onChatIntent : undefined}
+          onPointerDown={rowNavigable ? onChatIntent : undefined}
+          onFocus={rowNavigable ? onChatIntent : undefined}
+          onClick={rowNavigable ? makeAnchorClickHandler(href) : undefined}
         >
           <span data-ui="chat-row-head">
             <span data-ui="chat-row-title">
@@ -1023,9 +926,11 @@ export const ChatList = memo(function ChatList({
           <span data-ui="chat-row-tags">
             <a
               data-ui="chat-row-tags-link"
-              href={href}
+              href={rowNavigable ? href : undefined}
               rel="noopener"
-              onClick={makeAnchorClickHandler(href)}
+              aria-disabled={!rowNavigable || undefined}
+              tabIndex={rowNavigable ? undefined : -1}
+              onClick={rowNavigable ? makeAnchorClickHandler(href) : undefined}
               aria-label={`Open ${displayTitle}`}
             >
               <span data-ui="visually-hidden">Open {displayTitle}</span>
@@ -1036,9 +941,9 @@ export const ChatList = memo(function ChatList({
                   key={tag.id}
                   type="button"
                   data-ui="chat-row-tag"
+                  disabled={!rowInteractive}
                   title={`Search tag ${tag.name}`}
-                  onClick={(event) => {
-                    queueSidebarScrollAnchor(event.currentTarget)
+                  onClick={() => {
                     handleTagSearch(tag.id)
                   }}
                 >
@@ -1067,8 +972,9 @@ export const ChatList = memo(function ChatList({
               data-ui="chat-row-menu-button"
               aria-label={`Open actions for ${displayTitle}`}
               aria-haspopup="menu"
-              aria-expanded={openActionChatId === chat.id}
+              aria-expanded={rowInteractive && openActionChatId === chat.id}
               title="Actions"
+              disabled={!rowInteractive}
               onClick={(e) => {
                 e.preventDefault()
                 e.stopPropagation()
@@ -1077,7 +983,7 @@ export const ChatList = memo(function ChatList({
             >
               <MoreVerticalIcon size={15} />
             </IconButton>
-            {openActionChatId === chat.id ? (
+            {openActionChatId === chat.id && rowInteractive ? (
               <div
                 data-ui="chat-row-menu"
                 role="menu"
@@ -1094,10 +1000,9 @@ export const ChatList = memo(function ChatList({
                   type="button"
                   role="menuitem"
                   data-ui="chat-row-folder"
-                  onClick={(event) => {
-                    const source = event.currentTarget
+                  onClick={() => {
                     setOpenActionChatId(null)
-                    void handleMoveChat(chat, source)
+                    void handleMoveChat(chat)
                   }}
                 >
                   <FolderIcon size={14} />
@@ -1107,10 +1012,9 @@ export const ChatList = memo(function ChatList({
                   type="button"
                   role="menuitem"
                   data-ui="chat-row-tags-button"
-                  onClick={(event) => {
-                    const source = event.currentTarget
+                  onClick={() => {
                     setOpenActionChatId(null)
-                    void handleSetTags(chat, source)
+                    void handleSetTags(chat)
                   }}
                 >
                   <TagIcon size={14} />
@@ -1145,9 +1049,10 @@ export const ChatList = memo(function ChatList({
                   role="menuitem"
                   data-ui="chat-row-delete"
                   tone="danger"
+                  disabled={archiveInteraction.isPending(chat.id)}
                   onClick={() => {
                     setOpenActionChatId(null)
-                    void handleDelete(chat)
+                    handleDelete(chat)
                   }}
                 >
                   <TrashIcon size={14} />
@@ -1195,12 +1100,12 @@ export const ChatList = memo(function ChatList({
           data-ui="folder-main"
           title={row.folder.name}
           aria-expanded={!folderCollapsed}
-          onClick={(event) => toggleFolder(row.folder.id, event.currentTarget)}
+          onClick={() => toggleFolder(row.folder.id)}
         >
           <ChevronIcon size={13} rotate={folderCollapsed ? 0 : 90} />
           <FolderIcon size={14} />
           <span>{row.folder.name}</span>
-          <span data-ui="folder-count">{row.chats.length}</span>
+          <span data-ui="folder-count">{row.exactChatCount}</span>
         </Button>
         <span data-ui="folder-actions">
           <Button
@@ -1228,11 +1133,7 @@ export const ChatList = memo(function ChatList({
     if (hiddenSidebarRowCount <= 0) return null
     return (
       <li ref={sidebarWindowLoadRef} data-ui="sidebar-window-load">
-        <Button
-          type="button"
-          data-ui="load-more-sidebar"
-          onClick={(event) => loadMoreSidebarRows(event.currentTarget)}
-        >
+        <Button type="button" data-ui="load-more-sidebar" onClick={loadMoreSidebarRows}>
           Load more
         </Button>
         <span>{hiddenSidebarRowCount} more</span>
@@ -1365,13 +1266,18 @@ export const ChatList = memo(function ChatList({
     return (
       <ul
         ref={sidebarListRef}
+        onScroll={handleSidebarScroll}
+        onWheel={handleSidebarUserScrollIntent}
+        onKeyDown={handleSidebarUserScrollIntent}
+        onPointerDown={handleSidebarUserScrollIntent}
+        onTouchStart={handleSidebarUserScrollIntent}
         data-ui="chat-list"
         data-sort-key={sortMode}
         data-search-mode={searchActive ? 'true' : undefined}
         data-virtualized="true"
         data-render-window-size={prefs.sidebarRenderWindowSize}
         data-rendered-count={visibleVirtualRows.length}
-        data-total-count={virtualRows.length}
+        data-total-count={exactSidebarRowCount}
       >
         <li
           data-ui="sidebar-virtual-spacer"
@@ -1539,12 +1445,13 @@ export const ChatList = memo(function ChatList({
     return (
       <ul
         ref={sidebarListRef}
+        onScroll={handleSidebarScroll}
         data-ui="chat-list"
         data-sort-key={sortMode}
         data-search-mode={searchActive ? 'true' : undefined}
         data-render-window-size={prefs.sidebarRenderWindowSize}
         data-rendered-count={visibleVirtualRows.length}
-        data-total-count={virtualRows.length}
+        data-total-count={exactSidebarRowCount}
       >
         {visibleVirtualRows.map(renderStaticSidebarRow)}
         {renderSidebarWindowLoad()}
@@ -1562,12 +1469,15 @@ export const ChatList = memo(function ChatList({
       ref={sidebarOrganizerRef}
       data-ui="sidebar-organizer"
       data-sort-key={sortMode}
-      onMouseDownCapture={() => {
+      onPointerDownCapture={() => {
         if (!searchControlsExpanded) return
         preserveSearchExpansionRef.current = true
-        window.setTimeout(() => {
-          preserveSearchExpansionRef.current = false
-        }, 0)
+      }}
+      onPointerUpCapture={() => {
+        preserveSearchExpansionRef.current = false
+      }}
+      onPointerCancelCapture={() => {
+        preserveSearchExpansionRef.current = false
       }}
     >
       <div
@@ -1576,7 +1486,10 @@ export const ChatList = memo(function ChatList({
         onBlurCapture={(event) => {
           const nextTarget = event.relatedTarget
           if (nextTarget instanceof Node && event.currentTarget.contains(nextTarget)) return
-          if (preserveSearchExpansionRef.current) return
+          if (preserveSearchExpansionRef.current) {
+            preserveSearchExpansionRef.current = false
+            return
+          }
           if (!searchActive && !searchHasFilters) setSearchExpanded(false)
         }}
       >

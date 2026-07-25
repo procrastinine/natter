@@ -1,39 +1,43 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { DEFAULT_GLOBAL_PREFERENCES } from '../../src/core/global-settings'
+import {
+  DEFAULT_RENDERING_PREFS,
+  type RenderingPreferences,
+} from '../../src/core/rendering-preferences'
 import { RenderingSettings } from '../../src/ui/settings/RenderingSettings'
+import { installPresentationWorkspaceFence } from '../helpers/presentation-interactions'
 
-vi.mock('../../src/store/settings', () => {
-  const state = new Map<string, unknown>()
-  return {
-    async getSetting<T>(key: string): Promise<T | undefined> {
-      return state.get(key) as T | undefined
-    },
-    async setSetting<T>(key: string, value: T): Promise<void> {
-      state.set(key, value)
-    },
-    __get(key: string): unknown {
-      return state.get(key)
-    },
-    __reset(): void {
-      state.clear()
-    },
-  }
-})
+const preferenceState = vi.hoisted<{
+  rendering: RenderingPreferences | null
+  writes: Partial<RenderingPreferences>
+}>(() => ({ rendering: null, writes: {} }))
 
-vi.mock('../../src/store/reactive-query', () => {
+vi.mock('../../src/hooks/useConfigurationPreferences', () => {
   return {
-    useRepositoryQuery: <T,>(_key: string, _query: () => Promise<T>, initial: T): T => initial,
-    useRepositoryQueryState: <T,>(_key: string, _query: () => Promise<T>, initial: T) => ({
-      status: 'ready',
-      value: initial,
-      error: null,
+    useConfigurationPreferences: () => ({
+      global: DEFAULT_GLOBAL_PREFERENCES,
+      rendering: preferenceState.rendering,
     }),
   }
 })
 
-beforeEach(async () => {
-  const mod = (await import('../../src/store/settings')) as unknown as { __reset(): void }
-  mod.__reset()
+vi.mock('../../src/store/configuration-application', () => ({
+  configurationApplication: {
+    async patchRenderingPreferences(patch: Partial<RenderingPreferences>) {
+      Object.assign(preferenceState.writes, patch)
+      preferenceState.rendering = {
+        ...(preferenceState.rendering ?? DEFAULT_RENDERING_PREFS),
+        ...patch,
+      }
+    },
+  },
+}))
+
+beforeEach(() => {
+  installPresentationWorkspaceFence('rendering-settings')
+  preferenceState.rendering = { ...DEFAULT_RENDERING_PREFS }
+  preferenceState.writes = {}
 })
 
 describe('RenderingSettings', () => {
@@ -50,11 +54,8 @@ describe('RenderingSettings', () => {
   it('writes the single-dollar math preference when toggled', async () => {
     render(<RenderingSettings />)
     fireEvent.click(screen.getByLabelText('Single-dollar LaTeX markdown'))
-    const mod = (await import('../../src/store/settings')) as unknown as {
-      __get(key: string): unknown
-    }
     await waitFor(() => {
-      expect(mod.__get('rendering-preferences')).toMatchObject({
+      expect(preferenceState.writes).toMatchObject({
         singleDollarTextMath: true,
       })
     })
@@ -63,11 +64,8 @@ describe('RenderingSettings', () => {
   it('writes the single-newline hard-break preference when toggled', async () => {
     render(<RenderingSettings />)
     fireEvent.click(screen.getByLabelText('Single newline as line break'))
-    const mod = (await import('../../src/store/settings')) as unknown as {
-      __get(key: string): unknown
-    }
     await waitFor(() => {
-      expect(mod.__get('rendering-preferences')).toMatchObject({
+      expect(preferenceState.writes).toMatchObject({
         singleNewlineHardBreaks: true,
       })
     })

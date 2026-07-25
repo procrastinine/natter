@@ -1,27 +1,37 @@
 import {
+  createContext,
   forwardRef,
   type ReactNode,
   useCallback,
+  useContext,
   useEffect,
   useImperativeHandle,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
 } from 'react'
 import { hasScrollDebugSink, logScrollDebug } from '../../lib/debug-scroll'
 import { scheduleReactPublication } from '../../lib/react-publication'
+import type {
+  ConversationViewportPreparation,
+  ConversationViewportTransition,
+} from '../../store/presentation-contracts'
 
 export type ScrollState = 'follow' | 'pinned'
 
 interface ScrollRegionProps {
   children: ReactNode
+  // Hidden retained views keep their DOM and state, but they cannot consume
+  // open/follow claims until this viewport becomes visible again.
+  viewportActive?: boolean
   pinThresholdPx?: number
   // Notified whenever the follow/pinned state changes. Lets a sibling render
   // a "Jump to latest" affordance anchored to the main-pane viewport bottom
   // (rather than scrolling with the content inside the region).
   onStateChange?: (state: ScrollState) => void
-  // While `streamActive` is true AND the sentinel is currently visible
-  // (user hasn't scrolled up), follow new tokens into view as they arrive.
+  // While `streamActive` is true AND follow has not been cancelled by the
+  // user, keep the exact streamed message's end in view as tokens arrive.
   // When false, streams never move the viewport — user stays wherever they
   // are. Chat open always lands at the branch leaf regardless of this setting.
   autoScrollOnStream?: boolean
@@ -30,33 +40,57 @@ interface ScrollRegionProps {
   // window; outside it, content changes never move the scroll position
   // through the streaming path.
   streamActive?: boolean
+  workspaceEpoch?: number
   // Identity that resets the open-latch. When this value changes (e.g. the
   // user switches chats via sidebar), the next content-load triggers
   // another one-shot open-scroll.
   resetKey?: string | number | null
-  // Identity of the currently rendered branch tail. A stream can become
-  // active before the new streamed row is mounted; this lets bottom-follow
-  // attach when that row actually appears.
+  // Identity of the selected branch tail. Unlike stream identity, this changes
+  // only when the tab selects a different path, so stream completion cannot
+  // accidentally cancel exact-target ownership.
+  selectionKey?: string | number | null
+  viewportRevision?: number
+  // Identity of the selected path's active stream. A stream can become active
+  // before its row is mounted; this lets target-follow attach when it appears.
   streamFollowKey?: string | number | null
+  streamFollowTargetMessageId?: string | null
   // A non-null key grants one stream-start follow claim. The caller must only
-  // provide it for a request started by this tab. It intentionally supersedes
-  // an earlier pin, while later user scrolling still pins.
-  streamFollowClaimKey?: string | number | null
+  // provide it for a path operation started by this tab. The claim persists
+  // independently of stream lifetime until its exact target is rendered.
+  revealClaimKey?: string | number | null
+  revealClaimTargetMessageId?: string | null
+  onRevealClaimConsumed?: () => void
 }
 
 export interface ScrollRegionHandle {
   scrollToBottom: (opts?: { smooth?: boolean }) => void
   getState: () => ScrollState
+  prepareLayoutChange: (
+    transition: ConversationViewportTransition,
+  ) => ConversationViewportPreparation
+}
+
+export interface ScrollRegionCommands {
+  captureLayoutAnchor(input?: { element?: HTMLElement; edge?: 'top' | 'bottom' }): boolean
+  revealNearest(element: HTMLElement): boolean
+}
+
+const ScrollRegionCommandsContext = createContext<ScrollRegionCommands | null>(null)
+const ScrollRegionStateContext = createContext<ScrollState | undefined>(undefined)
+
+export function useScrollRegionCommands(): ScrollRegionCommands | null {
+  return useContext(ScrollRegionCommandsContext)
+}
+
+export function useScrollRegionState(): ScrollState | undefined {
+  return useContext(ScrollRegionStateContext)
 }
 
 const DEFAULT_THRESHOLD_PX = 48
-const USER_SCROLL_INTENT_MS = 750
 const PROGRAMMATIC_SCROLL_TOLERANCE_PX = 4
-const SETTLE_REQUIRED_STABLE_FRAMES = 2
-const SETTLE_MAX_FRAME_CHECKS = 8
+const MAX_INSTANT_SCROLL_INTENTS = 32
 
 interface InstantScrollIntent {
-  sequence: number
   top: number
 }
 
@@ -65,6 +99,72 @@ interface SmoothScrollIntent {
   last: number
   direction: -1 | 1
 }
+
+interface MessageFollowTarget {
+  messageId: string
+  element: HTMLElement | null
+}
+
+type ViewportDisplacement =
+  | {
+      readonly kind: 'element'
+      readonly element: HTMLElement
+      readonly messageId: string | null
+      readonly edge: 'top' | 'bottom'
+      readonly coordinate: number
+    }
+  | {
+      readonly kind: 'bottom'
+      readonly distance: number
+    }
+
+interface ViewportContinuityLeaseBase {
+  readonly revision: number
+  readonly workspaceEpoch: number
+  readonly chatKey: string | number | null
+  readonly selectionKey: string | number | null
+  readonly viewportRevision: number
+  readonly source: 'content' | 'prepend' | 'open' | 'reveal' | 'stream' | 'manual'
+}
+
+type ViewportContinuityLease =
+  | (ViewportContinuityLeaseBase & {
+      readonly mode: 'follow'
+      readonly claim: SemanticFollowClaim
+      readonly displacement: ViewportDisplacement | null
+    })
+  | (ViewportContinuityLeaseBase & {
+      readonly mode: 'preserve'
+      readonly displacement: ViewportDisplacement
+    })
+
+type SemanticFollowClaim =
+  | {
+      readonly source: 'open' | 'reveal' | 'stream' | 'manual'
+      readonly kind: 'bottom'
+    }
+  | {
+      readonly source: 'open' | 'reveal' | 'stream'
+      readonly kind: 'message'
+      readonly target: MessageFollowTarget
+    }
+
+interface RevealClaimLifecycle {
+  readonly key: string | number
+  status: 'active' | 'cancelled' | 'consumed'
+}
+
+function semanticFollowClaimForTarget(
+  source: Exclude<SemanticFollowClaim['source'], 'manual'>,
+  messageId: string | null | undefined,
+  selectedTailKey: string | number | null,
+): SemanticFollowClaim {
+  return messageId && !Object.is(messageId, selectedTailKey)
+    ? { source, kind: 'message', target: { messageId, element: null } }
+    : { source, kind: 'bottom' }
+}
+
+const LAYOUT_ANCHOR_TOLERANCE_PX = 0.5
 
 function consumeInstantScrollIntent(intents: InstantScrollIntent[], top: number): boolean {
   for (let index = intents.length - 1; index >= 0; index -= 1) {
@@ -98,8 +198,6 @@ type PositionSource = 'layout' | 'observer' | 'resize' | 'scroll'
 type ScrollDebugEvent =
   | 'state'
   | 'scroll.to-bottom'
-  | 'follow.settle.start'
-  | 'follow.settle.tick'
   | 'follow.schedule'
   | 'follow.scheduled-scroll'
   | 'position'
@@ -113,10 +211,7 @@ type ScrollDebugEvent =
   | 'touchmove'
   | 'native-scroll'
   | 'stream-start'
-  | 'stream-tail'
-  | 'stream-settle-start'
   | 'user-follow-cancel'
-  | 'visibility'
 
 function scrollStateFromPosition(container: HTMLDivElement, threshold: number): ScrollState {
   const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight
@@ -127,39 +222,91 @@ function bottomScrollTop(container: HTMLDivElement): number {
   return Math.max(0, container.scrollHeight - container.clientHeight)
 }
 
-function nowMs(): number {
-  return typeof performance === 'undefined' ? Date.now() : performance.now()
+function messageFollowScrollTop(
+  container: HTMLDivElement,
+  element: HTMLElement,
+  threshold: number,
+): number {
+  const containerRect = container.getBoundingClientRect()
+  const elementRect = element.getBoundingClientRect()
+  const targetTop = container.scrollTop + elementRect.bottom - containerRect.bottom
+  const bottomTop = bottomScrollTop(container)
+  return Math.max(
+    0,
+    Math.min(bottomTop, bottomTop - targetTop <= threshold ? bottomTop : targetTop),
+  )
 }
 
-// A scroll container with two independent auto-scroll behaviors:
-//
-//   - Opening a chat always positions at the bottom before paint. The chat
-//     appears at the branch leaf with no animated jump.
-//
-//   - autoScrollOnStream + streamActive: while a stream is in flight and
-//     the user is already at the bottom, keep new tokens in view as they
-//     arrive. Scrolling up mid-stream flips to `pinned` and the stream
-//     stops chasing. The stream setting never blocks the open-time leaf jump.
-//
-// ResizeObserver tracks content-growth changes from child-only stream renders,
-// while a bottom sentinel and direct scroll listener keep wheel-driven scrolls
-// honest when the container position changes before observers report.
+function visibleMessageAnchor(
+  container: HTMLDivElement,
+  content: HTMLDivElement,
+): HTMLElement | undefined {
+  const containerRect = container.getBoundingClientRect()
+  const x = containerRect.left + containerRect.width / 2
+  const yCandidates = [
+    containerRect.top + 1,
+    containerRect.top + containerRect.height / 2,
+    containerRect.bottom - 1,
+  ]
+  const hitTestDocument = container.ownerDocument as unknown as {
+    elementFromPoint?: (x: number, y: number) => Element | null
+  }
+  for (const y of yCandidates) {
+    const hit = hitTestDocument.elementFromPoint?.call(container.ownerDocument, x, y)
+    const message = hit?.closest<HTMLElement>('[data-ui="message"][data-message-id]')
+    if (message && content.contains(message)) return message
+  }
+  for (const message of content.querySelectorAll<HTMLElement>(
+    '[data-ui="message"][data-message-id]',
+  )) {
+    const rect = message.getBoundingClientRect()
+    if (rect.bottom > containerRect.top && rect.top < containerRect.bottom) return message
+  }
+  return undefined
+}
+
+// Open, reveal, stream, publication, and manual intents all replace one
+// revisioned continuity lease. User input cancels semantic follow but rebases
+// an already-prepared structural transition; the ResizeObserver reconciles
+// delayed geometry through that same authority.
 export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(function ScrollRegion(
   {
     children,
+    viewportActive = true,
     pinThresholdPx,
     onStateChange,
     autoScrollOnStream = true,
     streamActive = false,
+    workspaceEpoch = 0,
     resetKey = null,
+    selectionKey = null,
+    viewportRevision = 0,
     streamFollowKey = null,
-    streamFollowClaimKey = null,
+    streamFollowTargetMessageId = null,
+    revealClaimKey = null,
+    revealClaimTargetMessageId = null,
+    onRevealClaimConsumed,
   },
   ref,
 ) {
   const containerRef = useRef<HTMLDivElement | null>(null)
   const contentRef = useRef<HTMLDivElement | null>(null)
   const sentinelRef = useRef<HTMLDivElement | null>(null)
+  const continuityLeaseRef = useRef<ViewportContinuityLease | null>({
+    mode: 'follow',
+    revision: 0,
+    workspaceEpoch,
+    chatKey: resetKey,
+    selectionKey,
+    viewportRevision,
+    source: 'open',
+    claim: { source: 'open', kind: 'bottom' },
+    displacement: null,
+  })
+  const continuityRevisionRef = useRef(0)
+  const lastPreparedTransitionRevisionRef = useRef(0)
+  const pendingPreparedTransitionRef = useRef<ConversationViewportTransition | null>(null)
+  const committedViewportRevisionRef = useRef(viewportRevision)
   // Start in `follow`: an empty or non-overflowing transcript is already
   // at its leaf. Overflow measurement below flips to `pinned` when needed.
   const [state, setState] = useState<ScrollState>('follow')
@@ -167,32 +314,26 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
   const pendingStateRef = useRef<ScrollState | null>(null)
   const statePublicationScheduledRef = useRef(false)
   const mountedRef = useRef(true)
-  stateRef.current = state
-  const followIntentRef = useRef(true)
   const didOpenRef = useRef(false)
+  const finiteAcquisitionRef = useRef<{ leaseRevision: number } | null>(null)
   const resetKeyRef = useRef(resetKey)
-  const followFrameRef = useRef<number | null>(null)
-  const observerFrameRef = useRef<number | null>(null)
-  const observerSignalsRef = useRef({ resize: false, mutation: false })
-  const settleCheckFrameRef = useRef<number | null>(null)
-  const settleFollowPendingRef = useRef(false)
-  const settleLastHeightRef = useRef<number | null>(null)
-  const settleStableFramesRef = useRef(0)
-  const settleFrameChecksRef = useRef(0)
-  const userScrollIntentUntilRef = useRef(0)
+  const workspaceEpochRef = useRef(workspaceEpoch)
+  const selectionKeyRef = useRef(selectionKey)
+  const documentVisibleRef = useRef(
+    typeof document === 'undefined' || document.visibilityState !== 'hidden',
+  )
   const lastNativeScrollTopRef = useRef<number | null>(null)
   const instantScrollIntentsRef = useRef<InstantScrollIntent[]>([])
-  const instantScrollSequenceRef = useRef(0)
-  const instantScrollRevisionRef = useRef(0)
-  const instantScrollCleanupFrameRef = useRef<number | null>(null)
-  const streamTailLayoutScrollAllowanceRef = useRef(false)
+  const layoutCorrectionPendingRef = useRef(false)
   const smoothScrollIntentRef = useRef<SmoothScrollIntent | null>(null)
   const thresholdRef = useRef(pinThresholdPx ?? DEFAULT_THRESHOLD_PX)
   const autoScrollOnStreamRef = useRef(autoScrollOnStream)
+  const previousAutoScrollOnStreamRef = useRef(autoScrollOnStream)
   const streamActiveRef = useRef(streamActive)
-  const previousStreamActiveRef = useRef(streamActive)
   const streamFollowKeyRef = useRef(streamFollowKey)
-  const streamFollowClaimKeyRef = useRef(streamFollowClaimKey)
+  const streamFollowTargetMessageIdRef = useRef(streamFollowTargetMessageId)
+  const previousStreamActiveRef = useRef(false)
+  const revealClaimLifecycleRef = useRef<RevealClaimLifecycle | null>(null)
   thresholdRef.current = pinThresholdPx ?? DEFAULT_THRESHOLD_PX
   autoScrollOnStreamRef.current = autoScrollOnStream
   streamActiveRef.current = streamActive
@@ -201,19 +342,19 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
     (event: ScrollDebugEvent, details: Record<string, unknown> = {}) => {
       if (!hasScrollDebugSink()) return
       const container = containerRef.current
-      const timestamp = nowMs()
-      logScrollDebug(event, {
+      const lease = continuityLeaseRef.current
+      const claim = lease?.mode === 'follow' ? lease.claim : null
+      const payload = {
         resetKey,
         state: stateRef.current,
-        followIntent: followIntentRef.current,
+        semanticClaim: claim ? `${claim.source}:${claim.kind}` : null,
         didOpen: didOpenRef.current,
         streamActive: streamActiveRef.current,
         autoScrollOnStream: autoScrollOnStreamRef.current,
-        userScrollIntentMsRemaining: Math.max(0, userScrollIntentUntilRef.current - timestamp),
         instantScrollIntents: instantScrollIntentsRef.current.length,
-        streamTailLayoutScrollAllowance: streamTailLayoutScrollAllowanceRef.current,
+        layoutCorrectionPending: layoutCorrectionPendingRef.current,
+        followTargetMessageId: claim?.kind === 'message' ? claim.target.messageId : null,
         smoothScrollIntent: smoothScrollIntentRef.current,
-        settlePending: settleFollowPendingRef.current,
         metrics: container
           ? {
               scrollTop: container.scrollTop,
@@ -224,7 +365,8 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
             }
           : null,
         ...details,
-      })
+      }
+      logScrollDebug(event, payload)
     },
     [resetKey],
   )
@@ -245,7 +387,9 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
     (next: ScrollState, reason = 'unknown') => {
       const previous = stateRef.current
       stateRef.current = next
-      if (previous !== next) debugScroll('state', { from: previous, to: next, reason })
+      if (hasScrollDebugSink() && previous !== next) {
+        debugScroll('state', { from: previous, to: next, reason })
+      }
       pendingStateRef.current = next
       if (statePublicationScheduledRef.current) return
       statePublicationScheduledRef.current = true
@@ -262,44 +406,354 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
 
   const clearInstantScrollIntents = useCallback(() => {
     instantScrollIntentsRef.current = []
-    instantScrollRevisionRef.current += 1
-    if (instantScrollCleanupFrameRef.current !== null) {
-      cancelAnimationFrame(instantScrollCleanupFrameRef.current)
-      instantScrollCleanupFrameRef.current = null
-    }
   }, [])
 
   const clearProgrammaticScrollIntents = useCallback(() => {
     clearInstantScrollIntents()
-    streamTailLayoutScrollAllowanceRef.current = false
     smoothScrollIntentRef.current = null
   }, [clearInstantScrollIntents])
 
-  const scheduleInstantScrollIntentCleanup: () => void = useCallback(() => {
-    if (instantScrollCleanupFrameRef.current !== null) return
-    const scheduledRevision = instantScrollRevisionRef.current
-    instantScrollCleanupFrameRef.current = requestAnimationFrame(() => {
-      instantScrollCleanupFrameRef.current = null
-      if (
-        scheduledRevision !== instantScrollRevisionRef.current &&
-        instantScrollIntentsRef.current.length > 0
-      ) {
-        scheduleInstantScrollIntentCleanup()
-        return
-      }
-      instantScrollIntentsRef.current = []
-    })
+  const recordInstantScrollIntent = useCallback((top: number) => {
+    const intents = instantScrollIntentsRef.current
+    intents.push({ top })
+    if (intents.length > MAX_INSTANT_SCROLL_INTENTS) {
+      intents.splice(0, intents.length - MAX_INSTANT_SCROLL_INTENTS)
+    }
   }, [])
 
-  const recordInstantScrollIntent = useCallback(
-    (top: number) => {
-      const sequence = instantScrollSequenceRef.current + 1
-      instantScrollSequenceRef.current = sequence
-      instantScrollIntentsRef.current.push({ sequence, top })
-      instantScrollRevisionRef.current += 1
-      scheduleInstantScrollIntentCleanup()
+  const releaseSemanticClaim = useCallback(() => {
+    const lease = continuityLeaseRef.current
+    if (lease?.mode !== 'follow') return
+    continuityLeaseRef.current = lease.displacement
+      ? { ...lease, mode: 'preserve', displacement: lease.displacement }
+      : null
+  }, [])
+
+  const cancelContinuityLease = useCallback(() => {
+    continuityLeaseRef.current = null
+    finiteAcquisitionRef.current = null
+    pendingPreparedTransitionRef.current = null
+    layoutCorrectionPendingRef.current = false
+  }, [])
+
+  const cancelViewportOwnership = useCallback(() => {
+    cancelContinuityLease()
+  }, [cancelContinuityLease])
+
+  const acquireFollowLease = useCallback((claim: SemanticFollowClaim) => {
+    finiteAcquisitionRef.current = null
+    continuityLeaseRef.current = {
+      mode: 'follow',
+      revision: ++continuityRevisionRef.current,
+      workspaceEpoch: workspaceEpochRef.current,
+      chatKey: resetKeyRef.current,
+      selectionKey: selectionKeyRef.current,
+      viewportRevision: committedViewportRevisionRef.current,
+      source: claim.source,
+      claim,
+      displacement: null,
+    }
+  }, [])
+
+  const installContinuityLease = useCallback(
+    (
+      source: ViewportContinuityLease['source'],
+      displacement: ViewportDisplacement,
+      prepared?: ConversationViewportTransition,
+    ) => {
+      finiteAcquisitionRef.current = null
+      continuityLeaseRef.current = {
+        mode: 'preserve',
+        revision: ++continuityRevisionRef.current,
+        workspaceEpoch: workspaceEpochRef.current,
+        chatKey: resetKeyRef.current,
+        selectionKey: selectionKeyRef.current,
+        viewportRevision: prepared?.revision ?? committedViewportRevisionRef.current,
+        source,
+        displacement,
+      }
     },
-    [scheduleInstantScrollIntentCleanup],
+    [],
+  )
+
+  const writeScrollTopNow = useCallback(
+    (top: number, reason: string): number => {
+      const container = containerRef.current
+      if (!container) return 0
+      smoothScrollIntentRef.current = null
+      const boundedTop = Math.max(0, Math.min(bottomScrollTop(container), top))
+      const before = container.scrollTop
+      container.scrollTop = boundedTop
+      const actual = container.scrollTop
+      lastNativeScrollTopRef.current = actual
+      if (Math.abs(actual - before) > 0.5) recordInstantScrollIntent(actual)
+      if (hasScrollDebugSink()) {
+        debugScroll('position', { source: reason, targetTop: boundedTop })
+      }
+      return actual
+    },
+    [debugScroll, recordInstantScrollIntent],
+  )
+
+  const capturePinnedLayoutAnchor = useCallback(
+    (
+      input?: { element?: HTMLElement; edge?: 'top' | 'bottom' },
+      prepared?: ConversationViewportTransition,
+    ): boolean => {
+      const container = containerRef.current
+      const content = contentRef.current
+      if (!container || !content || continuityLeaseRef.current?.mode === 'follow') {
+        return false
+      }
+      let element = input?.element
+      let edge = input?.edge ?? 'top'
+      if (!element || !content.contains(element)) {
+        element = visibleMessageAnchor(container, content)
+        edge = 'top'
+      }
+      if (!element || !content.contains(element)) return false
+      const message = element.closest<HTMLElement>('[data-ui="message"][data-message-id]')
+      const anchorElement = message ?? element
+      const rect = anchorElement.getBoundingClientRect()
+      installContinuityLease(
+        prepared?.kind ?? 'manual',
+        {
+          kind: 'element',
+          element: anchorElement,
+          messageId: message?.getAttribute('data-message-id') ?? null,
+          edge,
+          coordinate: edge === 'bottom' ? rect.bottom : rect.top,
+        },
+        prepared,
+      )
+      return true
+    },
+    [installContinuityLease],
+  )
+
+  const rebasePreparedTransitionToUser = useCallback(
+    (transition: ConversationViewportTransition): void => {
+      finiteAcquisitionRef.current = null
+      releaseSemanticClaim()
+      if (capturePinnedLayoutAnchor(undefined, transition)) return
+      const container = containerRef.current
+      if (!container) return
+      installContinuityLease(
+        transition.kind,
+        {
+          kind: 'bottom',
+          distance: container.scrollHeight - container.scrollTop - container.clientHeight,
+        },
+        transition,
+      )
+    },
+    [capturePinnedLayoutAnchor, installContinuityLease, releaseSemanticClaim],
+  )
+
+  const correctContinuityLease = useCallback((): boolean => {
+    const container = containerRef.current
+    const lease = continuityLeaseRef.current
+    if (!container || !lease) return false
+    if (
+      !Object.is(lease.selectionKey, selectionKeyRef.current) ||
+      lease.workspaceEpoch !== workspaceEpochRef.current ||
+      !Object.is(lease.chatKey, resetKeyRef.current) ||
+      lease.viewportRevision > committedViewportRevisionRef.current
+    ) {
+      continuityLeaseRef.current = null
+      return false
+    }
+    const anchor = lease.displacement
+    if (!anchor) return false
+    if (anchor.kind === 'bottom') {
+      const distance = container.scrollHeight - container.scrollTop - container.clientHeight
+      const delta = distance - anchor.distance
+      if (Math.abs(delta) <= LAYOUT_ANCHOR_TOLERANCE_PX) return false
+      writeScrollTopNow(container.scrollTop + delta, 'layout-anchor')
+      return true
+    }
+    let element = anchor.element
+    if (!element.isConnected || !contentRef.current?.contains(element)) {
+      if (!anchor.messageId) {
+        continuityLeaseRef.current = null
+        return false
+      }
+      element =
+        contentRef.current?.querySelector<HTMLElement>(
+          `[data-ui="message"][data-message-id="${CSS.escape(anchor.messageId)}"]`,
+        ) ?? element
+      if (!element.isConnected || !contentRef.current?.contains(element)) return false
+    }
+    const rect = element.getBoundingClientRect()
+    const current = anchor.edge === 'bottom' ? rect.bottom : rect.top
+    const delta = current - anchor.coordinate
+    if (Math.abs(delta) <= LAYOUT_ANCHOR_TOLERANCE_PX) return false
+    writeScrollTopNow(container.scrollTop + delta, 'layout-anchor')
+    return true
+  }, [writeScrollTopNow])
+
+  const resolveFollowTargetElement = useCallback(
+    (target: MessageFollowTarget): HTMLElement | null => {
+      if (
+        target.element?.isConnected &&
+        target.element.getAttribute('data-message-id') === target.messageId
+      ) {
+        return target.element
+      }
+      const content = contentRef.current
+      if (!content) return null
+      for (const element of content.querySelectorAll<HTMLElement>(
+        '[data-ui="message"][data-message-id]',
+      )) {
+        if (element.getAttribute('data-message-id') !== target.messageId) continue
+        target.element = element
+        return element
+      }
+      target.element = null
+      return null
+    },
+    [],
+  )
+
+  const scrollToFollowTargetNow = useCallback(
+    (reason: string): boolean => {
+      const container = containerRef.current
+      const lease = continuityLeaseRef.current
+      const claim = lease?.mode === 'follow' ? lease.claim : null
+      if (!container || claim?.kind !== 'message') return false
+      const target = claim.target
+      const element = resolveFollowTargetElement(target)
+      if (!element) return false
+      writeScrollTopNow(messageFollowScrollTop(container, element, thresholdRef.current), reason)
+      return true
+    },
+    [resolveFollowTargetElement, writeScrollTopNow],
+  )
+
+  const captureFollowDisplacement = useCallback(
+    (prepared?: ConversationViewportTransition) => {
+      const container = containerRef.current
+      const lease = continuityLeaseRef.current
+      if (!container || lease?.mode !== 'follow') return
+      const claim = lease.claim
+      if ((claim.source === 'open' && !didOpenRef.current) || claim.source === 'reveal') {
+        finiteAcquisitionRef.current = null
+        continuityLeaseRef.current = {
+          ...lease,
+          viewportRevision: prepared?.revision ?? lease.viewportRevision,
+          displacement: null,
+        }
+        return
+      }
+      if (claim.kind === 'bottom') {
+        continuityLeaseRef.current = {
+          ...lease,
+          viewportRevision: prepared?.revision ?? lease.viewportRevision,
+          displacement: {
+            kind: 'bottom',
+            distance: container.scrollHeight - container.scrollTop - container.clientHeight,
+          },
+        }
+        return
+      }
+      const element = resolveFollowTargetElement(claim.target)
+      if (!element) {
+        continuityLeaseRef.current = {
+          ...lease,
+          viewportRevision: prepared?.revision ?? lease.viewportRevision,
+          displacement: {
+            kind: 'bottom',
+            distance: container.scrollHeight - container.scrollTop - container.clientHeight,
+          },
+        }
+        return
+      }
+      continuityLeaseRef.current = {
+        ...lease,
+        viewportRevision: prepared?.revision ?? lease.viewportRevision,
+        displacement: {
+          kind: 'element',
+          element,
+          messageId: claim.target.messageId,
+          edge: 'bottom',
+          coordinate: element.getBoundingClientRect().bottom,
+        },
+      }
+    },
+    [resolveFollowTargetElement],
+  )
+
+  const prepareLayoutChange = useCallback(
+    (transition: ConversationViewportTransition): ConversationViewportPreparation => {
+      if (!viewportActive) return { kind: 'unavailable' }
+      if (transition.revision <= lastPreparedTransitionRevisionRef.current) {
+        return { kind: 'prepared' }
+      }
+      if (
+        transition.workspaceEpoch !== workspaceEpochRef.current ||
+        !Object.is(transition.chatId, resetKeyRef.current)
+      ) {
+        return { kind: 'unavailable' }
+      }
+      if (!Object.is(transition.fromSelectionKey, selectionKeyRef.current)) {
+        return { kind: 'unavailable' }
+      }
+      const container = containerRef.current
+      if (!container) return { kind: 'unavailable' }
+      const lease = continuityLeaseRef.current
+      if (transition.kind === 'reveal') {
+        acquireFollowLease(
+          semanticFollowClaimForTarget(
+            'reveal',
+            transition.revealTargetMessageId,
+            transition.toSelectionKey,
+          ),
+        )
+        const acquired = continuityLeaseRef.current
+        if (acquired?.mode !== 'follow') return { kind: 'unavailable' }
+        continuityLeaseRef.current = {
+          ...acquired,
+          viewportRevision: transition.revision,
+          source: 'reveal',
+        }
+      } else if (lease?.mode === 'follow') {
+        captureFollowDisplacement(transition)
+      } else if (
+        lease?.mode === 'preserve' &&
+        lease.workspaceEpoch === transition.workspaceEpoch &&
+        Object.is(lease.chatKey, transition.chatId) &&
+        Object.is(lease.selectionKey, transition.fromSelectionKey)
+      ) {
+        continuityLeaseRef.current = {
+          ...lease,
+          revision: ++continuityRevisionRef.current,
+          viewportRevision: transition.revision,
+          source: transition.kind,
+        }
+      } else if (stateRef.current === 'follow') {
+        installContinuityLease(
+          transition.kind,
+          {
+            kind: 'bottom',
+            distance: container.scrollHeight - container.scrollTop - container.clientHeight,
+          },
+          transition,
+        )
+      } else if (!capturePinnedLayoutAnchor(undefined, transition)) {
+        return { kind: 'unavailable' }
+      }
+      lastPreparedTransitionRevisionRef.current = transition.revision
+      pendingPreparedTransitionRef.current = transition
+      layoutCorrectionPendingRef.current = true
+      return { kind: 'prepared' }
+    },
+    [
+      acquireFollowLease,
+      captureFollowDisplacement,
+      capturePinnedLayoutAnchor,
+      installContinuityLease,
+      viewportActive,
+    ],
   )
 
   const scrollToBottomNow = useCallback(
@@ -308,11 +762,13 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
       if (!container) return
       const smooth = opts?.smooth ?? false
       const top = bottomScrollTop(container)
-      debugScroll('scroll.to-bottom', {
-        reason: opts?.reason ?? 'unknown',
-        smooth,
-        targetTop: top,
-      })
+      if (hasScrollDebugSink()) {
+        debugScroll('scroll.to-bottom', {
+          reason: opts?.reason ?? 'unknown',
+          smooth,
+          targetTop: top,
+        })
+      }
       if (smooth && Math.abs(container.scrollTop - top) > PROGRAMMATIC_SCROLL_TOLERANCE_PX) {
         clearInstantScrollIntents()
         smoothScrollIntentRef.current = {
@@ -325,97 +781,127 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
           behavior: 'smooth',
         })
       } else if (!smooth) {
-        smoothScrollIntentRef.current = null
-        const before = container.scrollTop
-        container.scrollTop = top
-        const actual = container.scrollTop
-        lastNativeScrollTopRef.current = actual
-        if (Math.abs(actual - before) > 0.5) recordInstantScrollIntent(actual)
+        writeScrollTopNow(top, opts?.reason ?? 'scroll.to-bottom')
       } else {
         smoothScrollIntentRef.current = null
       }
-      followIntentRef.current = true
       setScrollStateNow('follow', opts?.reason ?? 'scroll.to-bottom')
     },
-    [clearInstantScrollIntents, debugScroll, recordInstantScrollIntent, setScrollStateNow],
+    [clearInstantScrollIntents, debugScroll, setScrollStateNow, writeScrollTopNow],
   )
 
-  const shouldFollowContentGrowth = useCallback(() => {
-    if (!followIntentRef.current) return false
-    if (streamActiveRef.current) return autoScrollOnStreamRef.current
-    return settleFollowPendingRef.current || stateRef.current === 'follow'
-  }, [])
-
-  const clearFollowSettle = useCallback(() => {
-    settleFollowPendingRef.current = false
-    streamTailLayoutScrollAllowanceRef.current = false
-    settleLastHeightRef.current = null
-    settleStableFramesRef.current = 0
-    settleFrameChecksRef.current = 0
-    if (settleCheckFrameRef.current !== null) {
-      cancelAnimationFrame(settleCheckFrameRef.current)
-      settleCheckFrameRef.current = null
-    }
-  }, [])
-
-  const scheduleFollowScroll = useCallback(() => {
-    if (followFrameRef.current !== null) return
-    debugScroll('follow.schedule')
-    followFrameRef.current = requestAnimationFrame(() => {
-      followFrameRef.current = null
-      if (!shouldFollowContentGrowth()) return
-      debugScroll('follow.scheduled-scroll')
-      scrollToBottomNow({ smooth: false, reason: 'scheduled-follow' })
-    })
-  }, [debugScroll, scrollToBottomNow, shouldFollowContentGrowth])
-
-  const scheduleSettleCheck = useCallback(
-    (reason = 'stream') => {
-      if (settleCheckFrameRef.current !== null) return
-      const check = () => {
-        settleCheckFrameRef.current = null
-        if (!settleFollowPendingRef.current) return
-        const container = containerRef.current
-        if (!container) {
-          clearFollowSettle()
-          return
-        }
-        const height = container.scrollHeight
-        const stable = settleLastHeightRef.current === height
-        settleLastHeightRef.current = height
-        settleStableFramesRef.current = stable ? settleStableFramesRef.current + 1 : 0
-        settleFrameChecksRef.current += 1
-        debugScroll('follow.settle.tick', {
-          reason,
-          height,
-          stableFrames: settleStableFramesRef.current,
-          frameChecks: settleFrameChecksRef.current,
-        })
-        if (
-          settleStableFramesRef.current >= SETTLE_REQUIRED_STABLE_FRAMES ||
-          settleFrameChecksRef.current >= SETTLE_MAX_FRAME_CHECKS
-        ) {
-          clearFollowSettle()
-          return
-        }
-        scheduleFollowScroll()
-        settleCheckFrameRef.current = requestAnimationFrame(check)
+  const scrollToFollowPositionNow = useCallback(
+    (reason: string) => {
+      if (!scrollToFollowTargetNow(reason)) {
+        scrollToBottomNow({ smooth: false, reason })
       }
-      settleCheckFrameRef.current = requestAnimationFrame(check)
+      captureFollowDisplacement()
     },
-    [clearFollowSettle, debugScroll, scheduleFollowScroll],
+    [captureFollowDisplacement, scrollToBottomNow, scrollToFollowTargetNow],
   )
 
-  const startFollowSettle = useCallback(
-    (reason = 'stream') => {
-      clearFollowSettle()
-      settleFollowPendingRef.current = true
-      debugScroll('follow.settle.start', { reason })
-      scheduleFollowScroll()
-      scheduleSettleCheck(reason)
+  const followClaimIsAcquired = useCallback(
+    (claim: SemanticFollowClaim): boolean => {
+      const container = containerRef.current
+      if (!container) return false
+      const targetTop =
+        claim.kind === 'bottom'
+          ? bottomScrollTop(container)
+          : (() => {
+              const element = resolveFollowTargetElement(claim.target)
+              return element
+                ? messageFollowScrollTop(container, element, thresholdRef.current)
+                : null
+            })()
+      return (
+        targetTop !== null &&
+        Math.abs(container.scrollTop - targetTop) <= LAYOUT_ANCHOR_TOLERANCE_PX
+      )
     },
-    [clearFollowSettle, debugScroll, scheduleFollowScroll, scheduleSettleCheck],
+    [resolveFollowTargetElement],
   )
+
+  const preserveAcquiredFollowClaim = useCallback(
+    (claim: SemanticFollowClaim) => {
+      const container = containerRef.current
+      if (!container) return false
+      if (claim.source === 'open') didOpenRef.current = true
+      if (
+        claim.kind === 'bottom' ||
+        Math.abs(container.scrollTop - bottomScrollTop(container)) <= LAYOUT_ANCHOR_TOLERANCE_PX
+      ) {
+        installContinuityLease(claim.source, { kind: 'bottom', distance: 0 })
+        return true
+      }
+      const element = resolveFollowTargetElement(claim.target)
+      if (!element) return false
+      installContinuityLease(claim.source, {
+        kind: 'element',
+        element,
+        messageId: claim.target.messageId,
+        edge: 'bottom',
+        coordinate: element.getBoundingClientRect().bottom,
+      })
+      return true
+    },
+    [installContinuityLease, resolveFollowTargetElement],
+  )
+
+  const settleAcquiredFiniteFollowClaim = useCallback((): boolean => {
+    const lease = continuityLeaseRef.current
+    if (lease?.mode !== 'follow' || lease.claim.source === 'stream') return false
+    if (!followClaimIsAcquired(lease.claim)) return false
+    finiteAcquisitionRef.current = null
+    return preserveAcquiredFollowClaim(lease.claim)
+  }, [followClaimIsAcquired, preserveAcquiredFollowClaim])
+
+  const reconcileFiniteFollowClaim = useCallback(
+    (reason: string): 'none' | 'pending' | 'settled' => {
+      const lease = continuityLeaseRef.current
+      if (lease?.mode !== 'follow' || lease.claim.source === 'stream') return 'none'
+      if (
+        lease.claim.source === 'reveal' &&
+        revealClaimLifecycleRef.current?.status !== 'consumed'
+      ) {
+        return 'none'
+      }
+      if (
+        finiteAcquisitionRef.current?.leaseRevision === lease.revision &&
+        followClaimIsAcquired(lease.claim)
+      ) {
+        finiteAcquisitionRef.current = null
+        return preserveAcquiredFollowClaim(lease.claim) ? 'settled' : 'pending'
+      }
+      finiteAcquisitionRef.current = null
+      scrollToFollowPositionNow(reason)
+      const current = continuityLeaseRef.current
+      if (
+        current?.mode === 'follow' &&
+        current.revision === lease.revision &&
+        followClaimIsAcquired(current.claim)
+      ) {
+        finiteAcquisitionRef.current = { leaseRevision: current.revision }
+      }
+      setScrollStateNow('follow', `${reason}.acquire`)
+      return 'pending'
+    },
+    [
+      followClaimIsAcquired,
+      preserveAcquiredFollowClaim,
+      scrollToFollowPositionNow,
+      setScrollStateNow,
+    ],
+  )
+
+  const semanticClaimFollowsGrowth = useCallback(() => {
+    const lease = continuityLeaseRef.current
+    if (lease?.mode !== 'follow') return false
+    const claim = lease.claim
+    if (claim.source === 'stream') {
+      return streamActiveRef.current && autoScrollOnStreamRef.current
+    }
+    return true
+  }, [])
 
   const updateFromScrollPosition = useCallback(
     (source: PositionSource) => {
@@ -428,7 +914,9 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
         previousNativeScrollTop !== null &&
         Math.abs(previousNativeScrollTop - container.scrollTop) <= 0.5
       if (source === 'scroll') lastNativeScrollTopRef.current = container.scrollTop
-      debugScroll('position', { source, next, stationaryNativeScroll })
+      if (hasScrollDebugSink()) {
+        debugScroll('position', { source, next, stationaryNativeScroll })
+      }
       let programmaticScroll = false
       if (source === 'scroll') {
         const instantMatched = consumeInstantScrollIntent(
@@ -436,7 +924,6 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
           container.scrollTop,
         )
         if (instantMatched) {
-          instantScrollRevisionRef.current += 1
           programmaticScroll = true
         } else if (smoothScrollIntentRef.current) {
           const smooth = advanceSmoothScrollIntent(
@@ -447,53 +934,40 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
           programmaticScroll = smooth.programmatic
         }
       }
+      const preparedTransition =
+        source === 'scroll' && !programmaticScroll ? pendingPreparedTransitionRef.current : null
+      if (preparedTransition) rebasePreparedTransitionToUser(preparedTransition)
       if (next === 'follow') {
-        followIntentRef.current = true
         setScrollStateNow('follow', source)
         return
       }
-      const timestamp = nowMs()
-      const userScrollIntentActive = timestamp <= userScrollIntentUntilRef.current
-      const streamTailLayoutScroll =
-        source === 'scroll' &&
-        !programmaticScroll &&
-        streamTailLayoutScrollAllowanceRef.current &&
-        streamActiveRef.current &&
-        settleFollowPendingRef.current &&
-        previousNativeScrollTop !== null &&
-        container.scrollTop < previousNativeScrollTop - PROGRAMMATIC_SCROLL_TOLERANCE_PX &&
-        !userScrollIntentActive
-      if (streamTailLayoutScroll) streamTailLayoutScrollAllowanceRef.current = false
       if (
         programmaticScroll ||
-        streamTailLayoutScroll ||
-        (stationaryNativeScroll && !userScrollIntentActive)
+        (layoutCorrectionPendingRef.current && continuityLeaseRef.current?.mode === 'follow') ||
+        (stationaryNativeScroll && continuityLeaseRef.current?.mode === 'follow')
       ) {
-        if (shouldFollowContentGrowth() && !userScrollIntentActive) scheduleFollowScroll()
         return
       }
       if (source === 'scroll') {
-        followIntentRef.current = false
+        if (!preparedTransition) cancelViewportOwnership()
         clearProgrammaticScrollIntents()
-        clearFollowSettle()
-        debugScroll('user-follow-cancel', { event: 'native-scroll' })
         setScrollStateNow('pinned', source)
+        if (!preparedTransition) capturePinnedLayoutAnchor()
         return
       }
-      if (shouldFollowContentGrowth() && !userScrollIntentActive) {
-        scheduleFollowScroll()
+      if (continuityLeaseRef.current?.mode === 'follow') {
+        setScrollStateNow('follow', source)
         return
       }
-      followIntentRef.current = false
       setScrollStateNow('pinned', source)
     },
     [
-      clearFollowSettle,
+      cancelViewportOwnership,
+      capturePinnedLayoutAnchor,
       clearProgrammaticScrollIntents,
       debugScroll,
-      scheduleFollowScroll,
+      rebasePreparedTransitionToUser,
       setScrollStateNow,
-      shouldFollowContentGrowth,
     ],
   )
 
@@ -503,39 +977,198 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
     // No overflow yet (empty, still loading, or short transcript). Keep the
     // latch open so the first real overflow can still land at the leaf.
     if (container.scrollHeight <= container.clientHeight) {
-      followIntentRef.current = true
-      debugScroll('open.wait')
+      finiteAcquisitionRef.current = null
+      if (!continuityLeaseRef.current) {
+        acquireFollowLease({ source: 'open', kind: 'bottom' })
+      }
+      if (hasScrollDebugSink()) debugScroll('open.wait')
       setScrollStateNow('follow', 'open.wait')
       return false
     }
-    didOpenRef.current = true
-    debugScroll('open.bottom')
-    scrollToBottomNow({ smooth: false, reason: 'open' })
-    startFollowSettle('open')
+    const lease = continuityLeaseRef.current
+    const claim = lease?.mode === 'follow' ? lease.claim : null
+    if (!claim || claim.source === 'open') {
+      if (!claim) acquireFollowLease({ source: 'open', kind: 'bottom' })
+      const result = reconcileFiniteFollowClaim('open')
+      if (result !== 'settled') return false
+      if (hasScrollDebugSink()) debugScroll('open.bottom')
+    } else {
+      finiteAcquisitionRef.current = null
+      didOpenRef.current = true
+      scrollToFollowPositionNow('open-claimed')
+    }
     return true
-  }, [debugScroll, scrollToBottomNow, setScrollStateNow, startFollowSettle])
+  }, [
+    acquireFollowLease,
+    debugScroll,
+    reconcileFiniteFollowClaim,
+    scrollToFollowPositionNow,
+    setScrollStateNow,
+  ])
+
+  const scheduleFollowReconciliation = useCallback(
+    (source?: 'resize') => {
+      if (source) layoutCorrectionPendingRef.current = true
+      if (!viewportActive || !documentVisibleRef.current) return
+      const pendingTransition = pendingPreparedTransitionRef.current
+      if (
+        pendingTransition !== null &&
+        pendingTransition.revision !== committedViewportRevisionRef.current
+      ) {
+        return
+      }
+      if (hasScrollDebugSink()) debugScroll('follow.schedule')
+      if (source && hasScrollDebugSink()) debugScroll('resize')
+      if (completeOpenScrollIfReady()) {
+        layoutCorrectionPendingRef.current = false
+        return
+      }
+      const finiteClaim = continuityLeaseRef.current
+      if (
+        didOpenRef.current &&
+        finiteClaim?.mode === 'follow' &&
+        finiteClaim.claim.source === 'reveal'
+      ) {
+        reconcileFiniteFollowClaim('reveal')
+        layoutCorrectionPendingRef.current = false
+        return
+      }
+      if (semanticClaimFollowsGrowth()) {
+        if (hasScrollDebugSink()) debugScroll('follow.scheduled-scroll')
+        scrollToFollowPositionNow('scheduled-follow')
+      } else if (source) {
+        correctContinuityLease()
+        updateFromScrollPosition('resize')
+      }
+      layoutCorrectionPendingRef.current = false
+    },
+    [
+      completeOpenScrollIfReady,
+      correctContinuityLease,
+      debugScroll,
+      reconcileFiniteFollowClaim,
+      scrollToFollowPositionNow,
+      semanticClaimFollowsGrowth,
+      updateFromScrollPosition,
+      viewportActive,
+    ],
+  )
+
+  const commands = useMemo<ScrollRegionCommands>(
+    () => ({
+      captureLayoutAnchor: capturePinnedLayoutAnchor,
+      revealNearest(element) {
+        const container = containerRef.current
+        if (!container?.contains(element)) return false
+        clearProgrammaticScrollIntents()
+        cancelViewportOwnership()
+        const containerRect = container.getBoundingClientRect()
+        const elementRect = element.getBoundingClientRect()
+        if (elementRect.top < containerRect.top) {
+          writeScrollTopNow(
+            container.scrollTop + elementRect.top - containerRect.top,
+            'reveal-nearest',
+          )
+        } else if (elementRect.bottom > containerRect.bottom) {
+          writeScrollTopNow(
+            container.scrollTop + elementRect.bottom - containerRect.bottom,
+            'reveal-nearest',
+          )
+        }
+        const next = scrollStateFromPosition(container, thresholdRef.current)
+        setScrollStateNow(next, 'reveal-nearest')
+        if (next === 'pinned') {
+          capturePinnedLayoutAnchor()
+        } else {
+          installContinuityLease('manual', {
+            kind: 'bottom',
+            distance: container.scrollHeight - container.scrollTop - container.clientHeight,
+          })
+        }
+        return true
+      },
+    }),
+    [
+      cancelViewportOwnership,
+      capturePinnedLayoutAnchor,
+      clearProgrammaticScrollIntents,
+      installContinuityLease,
+      setScrollStateNow,
+      writeScrollTopNow,
+    ],
+  )
+
+  useLayoutEffect(() => {
+    if (!viewportActive) return
+    committedViewportRevisionRef.current = viewportRevision
+    const pendingTransition = pendingPreparedTransitionRef.current
+    if (pendingTransition === null || pendingTransition.revision !== viewportRevision) return
+    const lease = continuityLeaseRef.current
+    if (
+      lease &&
+      Object.is(lease.selectionKey, pendingTransition.fromSelectionKey) &&
+      Object.is(selectionKey, pendingTransition.toSelectionKey)
+    ) {
+      continuityLeaseRef.current = {
+        ...lease,
+        selectionKey: pendingTransition.toSelectionKey,
+        viewportRevision,
+      }
+      selectionKeyRef.current = pendingTransition.toSelectionKey
+    }
+    if (pendingTransition.kind === 'reveal') {
+      scrollToFollowPositionNow('prepared-reveal')
+      setScrollStateNow('follow', 'prepared-reveal')
+    } else {
+      correctContinuityLease()
+    }
+    updateFromScrollPosition('layout')
+    pendingPreparedTransitionRef.current = null
+    layoutCorrectionPendingRef.current = false
+  }, [
+    correctContinuityLease,
+    selectionKey,
+    scrollToFollowPositionNow,
+    setScrollStateNow,
+    updateFromScrollPosition,
+    viewportActive,
+    viewportRevision,
+  ])
 
   // Open-time jump. The reset happens in the same layout pass as the
   // measurement, so a reused scroll container can't carry the previous chat's
   // "already opened" latch into the new chat.
   useLayoutEffect(() => {
-    if (!Object.is(resetKeyRef.current, resetKey)) {
-      debugScroll('reset-key', { from: resetKeyRef.current, to: resetKey })
+    if (!viewportActive) return
+    const chatChanged = !Object.is(resetKeyRef.current, resetKey)
+    const epochChanged = workspaceEpochRef.current !== workspaceEpoch
+    if (chatChanged) {
+      if (hasScrollDebugSink()) {
+        debugScroll('reset-key', { from: resetKeyRef.current, to: resetKey })
+      }
       resetKeyRef.current = resetKey
+      workspaceEpochRef.current = workspaceEpoch
       didOpenRef.current = false
-      followIntentRef.current = true
+      finiteAcquisitionRef.current = null
       clearProgrammaticScrollIntents()
-      clearFollowSettle()
+      cancelViewportOwnership()
+      acquireFollowLease({ source: 'open', kind: 'bottom' })
+    } else if (epochChanged) {
+      workspaceEpochRef.current = workspaceEpoch
+      const lease = continuityLeaseRef.current
+      if (lease) continuityLeaseRef.current = { ...lease, workspaceEpoch }
+      pendingPreparedTransitionRef.current = null
+      layoutCorrectionPendingRef.current = false
     }
     if (completeOpenScrollIfReady()) return
+    if (!Object.is(selectionKeyRef.current, selectionKey)) return
     updateFromScrollPosition('layout')
   })
 
-  // IntersectionObserver tracks whether the sentinel is visible.
-  // Settings don't filter the signal — `state` always reflects actual
-  // scroll position, so the sibling "Jump to latest" chip stays
-  // accurate regardless of auto-scroll prefs.
+  // IntersectionObserver keeps the ordinary branch-bottom state accurate.
+  // Exact-target ownership may intentionally remain above that sentinel.
   useEffect(() => {
+    if (!viewportActive) return
     if (typeof IntersectionObserver === 'undefined') return
     const container = containerRef.current
     const sentinel = sentinelRef.current
@@ -543,7 +1176,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
     const threshold = pinThresholdPx ?? DEFAULT_THRESHOLD_PX
     const observer = new IntersectionObserver(
       () => {
-        debugScroll('observer')
+        if (hasScrollDebugSink()) debugScroll('observer')
         if (completeOpenScrollIfReady()) return
         updateFromScrollPosition('observer')
       },
@@ -555,158 +1188,377 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
     )
     observer.observe(sentinel)
     return () => observer.disconnect()
-  }, [pinThresholdPx, completeOpenScrollIfReady, debugScroll, updateFromScrollPosition])
+  }, [
+    viewportActive,
+    pinThresholdPx,
+    completeOpenScrollIfReady,
+    debugScroll,
+    updateFromScrollPosition,
+  ])
 
   // Live stream snapshots rerender individual Message rows through Zustand;
-  // the ScrollRegion parent does not necessarily rerender per token. Resize
-  // and mutation signals cover different browser/layout paths, but both feed
-  // one reconciliation per animation frame.
-  useEffect(() => {
+  // the ScrollRegion parent does not necessarily rerender per token. The
+  // One ResizeObserver owns delayed content and viewport geometry and corrects
+  // in its delivery rather than deferring ownership to another frame.
+  useLayoutEffect(() => {
+    if (!viewportActive) return
+    const container = containerRef.current
     const content = contentRef.current
-    if (!content) return
-    const scheduleReconciliation = (source: 'resize' | 'mutation') => {
-      observerSignalsRef.current[source] = true
-      if (observerFrameRef.current !== null) return
-      observerFrameRef.current = requestAnimationFrame(() => {
-        observerFrameRef.current = null
-        const signals = observerSignalsRef.current
-        observerSignalsRef.current = { resize: false, mutation: false }
-        if (signals.resize) debugScroll('resize')
-        if (signals.mutation) debugScroll('mutation')
-        if (completeOpenScrollIfReady()) return
-        if (shouldFollowContentGrowth()) {
-          scheduleFollowScroll()
-          return
-        }
-        updateFromScrollPosition('resize')
-      })
-    }
-
+    if (!container || !content) return
     const resizeObserver =
       typeof ResizeObserver === 'undefined'
         ? undefined
-        : new ResizeObserver(() => scheduleReconciliation('resize'))
+        : new ResizeObserver(() => scheduleFollowReconciliation('resize'))
     resizeObserver?.observe(content)
-    const mutationObserver =
-      typeof MutationObserver === 'undefined'
-        ? undefined
-        : new MutationObserver(() => scheduleReconciliation('mutation'))
-    mutationObserver?.observe(content, {
-      childList: true,
-      characterData: true,
-      subtree: true,
-    })
+    resizeObserver?.observe(container)
+    scheduleFollowReconciliation('resize')
 
     return () => {
       resizeObserver?.disconnect()
-      mutationObserver?.disconnect()
-      observerSignalsRef.current = { resize: false, mutation: false }
-      if (observerFrameRef.current !== null) {
-        cancelAnimationFrame(observerFrameRef.current)
-        observerFrameRef.current = null
-      }
     }
-  }, [
-    completeOpenScrollIfReady,
-    debugScroll,
-    scheduleFollowScroll,
-    shouldFollowContentGrowth,
-    updateFromScrollPosition,
-  ])
+  }, [viewportActive, scheduleFollowReconciliation])
+
+  useEffect(() => {
+    const onVisibilityChange = () => {
+      documentVisibleRef.current = document.visibilityState !== 'hidden'
+      if (documentVisibleRef.current) scheduleFollowReconciliation('resize')
+    }
+    document.addEventListener('visibilitychange', onVisibilityChange)
+    return () => document.removeEventListener('visibilitychange', onVisibilityChange)
+  }, [scheduleFollowReconciliation])
 
   useEffect(() => {
     const container = containerRef.current
     if (!container) return
-    const markUserScrollIntent = (event: 'wheel' | 'touchmove') => {
-      userScrollIntentUntilRef.current = nowMs() + USER_SCROLL_INTENT_MS
+    const markUserScrollIntent = (event: 'wheel' | 'touchmove' | 'scrollbar' | 'keyboard') => {
       clearProgrammaticScrollIntents()
-      if (followIntentRef.current) {
-        followIntentRef.current = false
-        clearFollowSettle()
+      const lease = continuityLeaseRef.current
+      if (lease?.mode === 'follow') {
+        if (lease.claim.source === 'open') {
+          didOpenRef.current = true
+          finiteAcquisitionRef.current = null
+        }
+        const lifecycle = revealClaimLifecycleRef.current
+        if (lease.claim.source === 'reveal' && lifecycle?.status === 'active') {
+          lifecycle.status = 'cancelled'
+        }
+      }
+      const owned = continuityLeaseRef.current !== null
+      const preparedTransition = pendingPreparedTransitionRef.current
+      if (preparedTransition) {
+        rebasePreparedTransitionToUser(preparedTransition)
+      } else {
+        cancelViewportOwnership()
+      }
+      if (owned && hasScrollDebugSink()) {
         debugScroll('user-follow-cancel', { event })
       }
-      debugScroll(event)
+      if (hasScrollDebugSink() && (event === 'wheel' || event === 'touchmove')) {
+        debugScroll(event)
+      }
     }
     const onScroll = () => {
-      debugScroll('native-scroll')
+      if (hasScrollDebugSink()) debugScroll('native-scroll')
+      const lease = continuityLeaseRef.current
+      if (
+        lease?.mode === 'follow' &&
+        ((!didOpenRef.current && lease.claim.source === 'open') ||
+          (lease.claim.source === 'reveal' &&
+            revealClaimLifecycleRef.current?.status === 'consumed'))
+      ) {
+        scheduleFollowReconciliation()
+      }
       updateFromScrollPosition('scroll')
+      settleAcquiredFiniteFollowClaim()
     }
     const onScrollEnd = () => {
       smoothScrollIntentRef.current = null
+      settleAcquiredFiniteFollowClaim()
     }
     const onWheel = () => markUserScrollIntent('wheel')
     const onTouchMove = () => markUserScrollIntent('touchmove')
+    const onPointerDown = (event: PointerEvent) => {
+      if (event.target === container) markUserScrollIntent('scrollbar')
+    }
+    const onKeyDown = (event: KeyboardEvent) => {
+      const target = event.target instanceof HTMLElement ? event.target : null
+      if (
+        !['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(event.key) ||
+        target?.closest(
+          'button, a, input, textarea, select, [contenteditable="true"], [role="button"]',
+        )
+      ) {
+        return
+      }
+      markUserScrollIntent('keyboard')
+    }
     container.addEventListener('wheel', onWheel, { passive: true })
     container.addEventListener('touchmove', onTouchMove, { passive: true })
+    container.addEventListener('pointerdown', onPointerDown, { passive: true })
+    container.addEventListener('keydown', onKeyDown)
     container.addEventListener('scroll', onScroll, { passive: true })
     container.addEventListener('scrollend', onScrollEnd, { passive: true })
     return () => {
       container.removeEventListener('wheel', onWheel)
       container.removeEventListener('touchmove', onTouchMove)
+      container.removeEventListener('pointerdown', onPointerDown)
+      container.removeEventListener('keydown', onKeyDown)
       container.removeEventListener('scroll', onScroll)
       container.removeEventListener('scrollend', onScrollEnd)
     }
-  }, [clearFollowSettle, clearProgrammaticScrollIntents, debugScroll, updateFromScrollPosition])
-
-  useLayoutEffect(() => {
-    if (!autoScrollOnStream || !streamActive || !followIntentRef.current) return
-    debugScroll('stream-start')
-    scrollToBottomNow({ smooth: false, reason: 'stream-start' })
-  }, [autoScrollOnStream, debugScroll, streamActive, scrollToBottomNow])
-
-  useLayoutEffect(() => {
-    const followKeyChanged = !Object.is(streamFollowKeyRef.current, streamFollowKey)
-    const followClaimChanged = !Object.is(streamFollowClaimKeyRef.current, streamFollowClaimKey)
-    if (!followKeyChanged && !followClaimChanged) return
-    const claimFollow = followClaimChanged && streamFollowClaimKey !== null
-    debugScroll('stream-tail', {
-      from: streamFollowKeyRef.current,
-      to: streamFollowKey,
-      claimFollow,
-    })
-    streamFollowKeyRef.current = streamFollowKey
-    streamFollowClaimKeyRef.current = streamFollowClaimKey
-    if (!autoScrollOnStream || !streamActive) return
-    if (claimFollow) {
-      userScrollIntentUntilRef.current = 0
-      clearProgrammaticScrollIntents()
-      clearFollowSettle()
-      followIntentRef.current = true
-      setScrollStateNow('follow', 'stream-claim')
-    }
-    if (!followIntentRef.current) return
-    scrollToBottomNow({ smooth: false, reason: 'stream-tail' })
-    startFollowSettle('stream-tail')
-    streamTailLayoutScrollAllowanceRef.current = true
   }, [
-    autoScrollOnStream,
-    clearFollowSettle,
+    cancelViewportOwnership,
     clearProgrammaticScrollIntents,
     debugScroll,
-    scrollToBottomNow,
-    setScrollStateNow,
-    startFollowSettle,
-    streamActive,
-    streamFollowClaimKey,
-    streamFollowKey,
+    rebasePreparedTransitionToUser,
+    scheduleFollowReconciliation,
+    settleAcquiredFiniteFollowClaim,
+    updateFromScrollPosition,
   ])
 
   useLayoutEffect(() => {
-    const wasActive = previousStreamActiveRef.current
+    const previous = previousAutoScrollOnStreamRef.current
+    previousAutoScrollOnStreamRef.current = autoScrollOnStream
+    if (!previous || autoScrollOnStream) return
+    const container = containerRef.current
+    clearProgrammaticScrollIntents()
+    const lease = continuityLeaseRef.current
+    if (lease?.mode === 'follow' && lease.claim.source === 'stream') {
+      captureFollowDisplacement()
+      releaseSemanticClaim()
+    }
+    if (!container) return
+    const next = scrollStateFromPosition(container, thresholdRef.current)
+    setScrollStateNow(next, 'auto-scroll-mode')
+    if (next === 'pinned') capturePinnedLayoutAnchor()
+  }, [
+    autoScrollOnStream,
+    captureFollowDisplacement,
+    capturePinnedLayoutAnchor,
+    clearProgrammaticScrollIntents,
+    releaseSemanticClaim,
+    setScrollStateNow,
+  ])
+
+  useLayoutEffect(() => {
+    if (!viewportActive) return
+    const container = containerRef.current
+    const streamWasActive = previousStreamActiveRef.current
+    const streamStarted = !streamWasActive && streamActive
+    const streamEnded = streamWasActive && !streamActive
     previousStreamActiveRef.current = streamActive
-    if (streamActive || !wasActive) return
-    streamTailLayoutScrollAllowanceRef.current = false
-    if (!autoScrollOnStream) return
-    if (!followIntentRef.current) return
-    debugScroll('stream-settle-start')
-    startFollowSettle('stream')
-  }, [autoScrollOnStream, debugScroll, streamActive, startFollowSettle])
+
+    const selectionChanged = !Object.is(selectionKeyRef.current, selectionKey)
+    const selectionIdentityChanged = selectionChanged
+    const followKeyChanged = !Object.is(streamFollowKeyRef.current, streamFollowKey)
+    const targetChanged = !Object.is(
+      streamFollowTargetMessageIdRef.current,
+      streamFollowTargetMessageId,
+    )
+    streamFollowKeyRef.current = streamFollowKey
+    streamFollowTargetMessageIdRef.current = streamFollowTargetMessageId
+
+    const previousLease = continuityLeaseRef.current
+    if (
+      streamEnded &&
+      previousLease?.mode === 'follow' &&
+      previousLease.claim.source === 'stream'
+    ) {
+      correctContinuityLease()
+      releaseSemanticClaim()
+      layoutCorrectionPendingRef.current = false
+      if (container) setScrollStateNow('follow', 'stream-terminal')
+    }
+    const carriedClaim =
+      continuityLeaseRef.current?.mode === 'follow'
+        ? continuityLeaseRef.current.claim
+        : previousLease?.mode === 'follow'
+          ? previousLease.claim
+          : null
+    const carriedDisplacement =
+      previousLease?.mode === 'preserve' ? previousLease.displacement : null
+    if (selectionIdentityChanged) cancelContinuityLease()
+    selectionKeyRef.current = selectionKey
+
+    const lifecycle = revealClaimLifecycleRef.current
+    const revealArrived =
+      revealClaimKey !== null && (!lifecycle || !Object.is(lifecycle.key, revealClaimKey))
+    if (revealArrived) {
+      revealClaimLifecycleRef.current = { key: revealClaimKey, status: 'active' }
+      didOpenRef.current = true
+      clearProgrammaticScrollIntents()
+      cancelViewportOwnership()
+      acquireFollowLease(
+        semanticFollowClaimForTarget(
+          'reveal',
+          revealClaimTargetMessageId ?? streamFollowTargetMessageId,
+          selectionKeyRef.current,
+        ),
+      )
+      setScrollStateNow('follow', 'reveal-acquire')
+      scrollToFollowPositionNow('reveal-acquire')
+      layoutCorrectionPendingRef.current = true
+      scheduleFollowReconciliation()
+    }
+
+    if (selectionIdentityChanged) {
+      clearProgrammaticScrollIntents()
+      const currentLease = continuityLeaseRef.current
+      const claim = currentLease?.mode === 'follow' ? currentLease.claim : carriedClaim
+      if (claim) {
+        if (claim.source === 'stream') {
+          acquireFollowLease(
+            semanticFollowClaimForTarget(
+              'stream',
+              streamFollowTargetMessageId,
+              selectionKeyRef.current,
+            ),
+          )
+        } else if (claim.source === 'reveal') {
+          acquireFollowLease(
+            semanticFollowClaimForTarget(
+              'reveal',
+              revealClaimTargetMessageId ?? streamFollowTargetMessageId,
+              selectionKeyRef.current,
+            ),
+          )
+        } else {
+          acquireFollowLease({ source: 'open', kind: 'bottom' })
+        }
+        setScrollStateNow('follow', 'selection-claim')
+        scrollToFollowPositionNow('selection-claim')
+        layoutCorrectionPendingRef.current = true
+        scheduleFollowReconciliation()
+      } else if (stateRef.current === 'follow') {
+        scrollToBottomNow({ smooth: false, reason: 'selection' })
+        if (container) {
+          installContinuityLease('manual', {
+            kind: 'bottom',
+            distance: container.scrollHeight - container.scrollTop - container.clientHeight,
+          })
+        }
+      } else if (
+        carriedDisplacement?.kind === 'element' &&
+        carriedDisplacement.element.isConnected &&
+        contentRef.current?.contains(carriedDisplacement.element)
+      ) {
+        installContinuityLease('manual', carriedDisplacement)
+        correctContinuityLease()
+      }
+    }
+
+    const activeLifecycle = revealClaimLifecycleRef.current
+    const revealStillPending =
+      revealClaimKey !== null &&
+      activeLifecycle?.status === 'active' &&
+      Object.is(activeLifecycle.key, revealClaimKey)
+    if (
+      streamActive &&
+      autoScrollOnStream &&
+      (streamStarted || followKeyChanged || targetChanged) &&
+      !revealStillPending &&
+      (stateRef.current === 'follow' ||
+        (continuityLeaseRef.current?.mode === 'follow' &&
+          continuityLeaseRef.current.claim.source === 'stream'))
+    ) {
+      if (hasScrollDebugSink()) debugScroll('stream-start')
+      acquireFollowLease(
+        semanticFollowClaimForTarget(
+          'stream',
+          streamFollowTargetMessageId,
+          selectionKeyRef.current,
+        ),
+      )
+      setScrollStateNow('follow', 'stream')
+      scrollToFollowPositionNow('stream')
+      layoutCorrectionPendingRef.current = true
+      scheduleFollowReconciliation()
+    }
+
+    const readyLifecycle = revealClaimLifecycleRef.current
+    if (
+      revealClaimKey !== null &&
+      readyLifecycle !== null &&
+      readyLifecycle.status !== 'consumed' &&
+      Object.is(readyLifecycle.key, revealClaimKey)
+    ) {
+      const revealClaim = semanticFollowClaimForTarget(
+        'reveal',
+        revealClaimTargetMessageId ?? streamFollowTargetMessageId,
+        selectionKeyRef.current,
+      )
+      const acquired =
+        revealClaim.kind === 'bottom'
+          ? container !== null
+          : resolveFollowTargetElement(revealClaim.target) !== null
+      if (!acquired) return
+      const accepted = readyLifecycle.status === 'active'
+      readyLifecycle.status = 'consumed'
+      if (accepted) {
+        acquireFollowLease(revealClaim)
+        setScrollStateNow('follow', 'reveal-ready')
+        if (streamActive && autoScrollOnStream) {
+          acquireFollowLease(
+            semanticFollowClaimForTarget(
+              'stream',
+              streamFollowTargetMessageId ?? revealClaimTargetMessageId,
+              selectionKeyRef.current,
+            ),
+          )
+        }
+        layoutCorrectionPendingRef.current = true
+        scheduleFollowReconciliation()
+      }
+      onRevealClaimConsumed?.()
+    }
+  }, [
+    viewportActive,
+    acquireFollowLease,
+    autoScrollOnStream,
+    cancelContinuityLease,
+    cancelViewportOwnership,
+    clearProgrammaticScrollIntents,
+    correctContinuityLease,
+    debugScroll,
+    installContinuityLease,
+    onRevealClaimConsumed,
+    revealClaimKey,
+    revealClaimTargetMessageId,
+    releaseSemanticClaim,
+    resolveFollowTargetElement,
+    scheduleFollowReconciliation,
+    scrollToBottomNow,
+    scrollToFollowPositionNow,
+    selectionKey,
+    setScrollStateNow,
+    streamActive,
+    streamFollowKey,
+    streamFollowTargetMessageId,
+  ])
 
   const scrollToBottom = useCallback(
     (opts?: { smooth?: boolean }) => {
+      cancelViewportOwnership()
+      if (streamActiveRef.current && autoScrollOnStreamRef.current) {
+        acquireFollowLease(
+          semanticFollowClaimForTarget(
+            'stream',
+            streamFollowTargetMessageIdRef.current,
+            selectionKeyRef.current,
+          ),
+        )
+      } else {
+        acquireFollowLease({ source: 'manual', kind: 'bottom' })
+      }
       scrollToBottomNow({ smooth: opts?.smooth ?? true })
+      settleAcquiredFiniteFollowClaim()
     },
-    [scrollToBottomNow],
+    [
+      acquireFollowLease,
+      cancelViewportOwnership,
+      scrollToBottomNow,
+      settleAcquiredFiniteFollowClaim,
+    ],
   )
 
   useImperativeHandle(
@@ -714,36 +1566,25 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
     () => ({
       scrollToBottom,
       getState: () => stateRef.current,
+      prepareLayoutChange,
     }),
-    [scrollToBottom],
+    [prepareLayoutChange, scrollToBottom],
   )
-
-  // On tab-hide/tab-show, snap to bottom (no animation) if the
-  // sentinel was visible before, keeps long streams legible when the
-  // user returns.
-  useEffect(() => {
-    const onVisibility = () => {
-      if (document.visibilityState !== 'visible') return
-      if (!followIntentRef.current) return
-      debugScroll('visibility')
-      scrollToBottom({ smooth: false })
-    }
-    document.addEventListener('visibilitychange', onVisibility)
-    return () => document.removeEventListener('visibilitychange', onVisibility)
-  }, [debugScroll, scrollToBottom])
 
   useEffect(() => {
     return () => {
-      if (followFrameRef.current !== null) cancelAnimationFrame(followFrameRef.current)
       clearProgrammaticScrollIntents()
-      clearFollowSettle()
     }
-  }, [clearFollowSettle, clearProgrammaticScrollIntents])
+  }, [clearProgrammaticScrollIntents])
 
   return (
     <div ref={containerRef} data-ui="scroll-region" data-scroll-state={state}>
       <div ref={contentRef} data-ui="scroll-content">
-        {children}
+        <ScrollRegionStateContext.Provider value={state}>
+          <ScrollRegionCommandsContext.Provider value={commands}>
+            {children}
+          </ScrollRegionCommandsContext.Provider>
+        </ScrollRegionStateContext.Provider>
         <div ref={sentinelRef} data-ui="scroll-sentinel" aria-hidden="true" />
       </div>
     </div>

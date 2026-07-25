@@ -1,7 +1,37 @@
 import { describe, expect, it } from 'vitest'
+import { toAnthropicMessages as toAnthropicMessagesWithContract } from '../../src/api/request-transforms'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
-import { toAnthropicMessages } from '../../src/core/transforms'
-import type { ChatSettings, Message } from '../../src/core/types'
+import { ANTHROPIC_PROVIDER_OUTPUT_CONTRACT } from '../../src/core/provider-tool-context'
+import { reasoningVisibilityPolicyFor } from '../../src/core/quirks'
+import { resolveAttemptInboundReasoningVisibility } from '../../src/core/reasoning'
+import type { ChatSettings, Message, ReasoningDetail } from '../../src/core/types'
+import {
+  anthropicReasoningContractForSettings,
+  TEST_ASSISTANT_TAIL_PREFILL_PLAN,
+} from '../helpers/reasoning-contracts'
+import { reasoningEnvelopeFromDetailsForTest } from '../helpers/reasoning-events'
+
+type AnthropicOptions = Omit<
+  Parameters<typeof toAnthropicMessagesWithContract>[2],
+  'reasoning' | 'providerOutput' | 'prefillPlan'
+> & {
+  reasoning?: Parameters<typeof toAnthropicMessagesWithContract>[2]['reasoning']
+  providerOutput?: Parameters<typeof toAnthropicMessagesWithContract>[2]['providerOutput']
+  prefillPlan?: Parameters<typeof toAnthropicMessagesWithContract>[2]['prefillPlan']
+}
+
+function toAnthropicMessages(
+  settings: Parameters<typeof toAnthropicMessagesWithContract>[0],
+  path: Parameters<typeof toAnthropicMessagesWithContract>[1],
+  options: AnthropicOptions = {},
+) {
+  return toAnthropicMessagesWithContract(settings, path, {
+    ...options,
+    reasoning: options.reasoning ?? anthropicReasoningContractForSettings(settings),
+    providerOutput: options.providerOutput ?? ANTHROPIC_PROVIDER_OUTPUT_CONTRACT,
+    prefillPlan: options.prefillPlan ?? TEST_ASSISTANT_TAIL_PREFILL_PLAN,
+  })
+}
 
 function settings(overrides: Partial<ChatSettings> = {}): ChatSettings {
   const s = cloneDefaultChatSettings()
@@ -41,7 +71,12 @@ function user(id: string, text: string): Message {
   }
 }
 
-function assistant(id: string, text: string, opts: Partial<Message> = {}): Message {
+type AssistantOptions = Partial<Message> & {
+  reasoningDetails?: readonly ReasoningDetail[]
+}
+
+function assistant(id: string, text: string, opts: AssistantOptions = {}): Message {
+  const { reasoningDetails, ...messageOptions } = opts
   return {
     id,
     chatId: 'c',
@@ -55,7 +90,15 @@ function assistant(id: string, text: string, opts: Partial<Message> = {}): Messa
     content: [{ type: 'output_text', text }],
     nodeVersion: 0,
     deleted: false,
-    ...opts,
+    ...messageOptions,
+    ...(reasoningDetails
+      ? {
+          reasoningEnvelope: reasoningEnvelopeFromDetailsForTest(
+            reasoningDetails,
+            'anthropic-messages',
+          ),
+        }
+      : {}),
   }
 }
 
@@ -65,6 +108,74 @@ describe('toAnthropicMessages', () => {
     expect(modelId).toBe('claude-haiku-4-5')
     expect(requestedModel).toBe('anthropic/claude-haiku-4.5')
     expect(wire.model).toBe('claude-haiku-4-5')
+  })
+
+  it('returns visibility evidence from the exact thinking block', () => {
+    const base = settings({ model: 'anthropic/claude-opus-4.6' })
+    expect(
+      toAnthropicMessages({ ...base, reasoning: { ...base.reasoning, mode: 'default' } }, [
+        user('u1', 'hi'),
+      ]).reasoningVisibilityEvidence,
+    ).toEqual({ kind: 'anthropic', display: 'provider-default' })
+    expect(toAnthropicMessages(base, [user('u1', 'hi')]).reasoningVisibilityEvidence).toEqual({
+      kind: 'anthropic',
+      display: 'disabled',
+    })
+    expect(
+      toAnthropicMessages(
+        { ...base, reasoning: { ...base.reasoning, mode: 'enabled', summary: 'auto' } },
+        [user('u1', 'hi')],
+      ).reasoningVisibilityEvidence,
+    ).toEqual({ kind: 'anthropic', display: 'provider-default' })
+    expect(
+      toAnthropicMessages(
+        { ...base, reasoning: { ...base.reasoning, mode: 'enabled', summary: 'off' } },
+        [user('u1', 'hi')],
+      ).reasoningVisibilityEvidence,
+    ).toEqual({ kind: 'anthropic', display: 'provider-default' })
+  })
+
+  it('seals Claude 4.6 plaintext and Claude 4.7 summary from their exact thinking wire', () => {
+    const claude46 = settings({
+      model: 'anthropic/claude-opus-4.6',
+      reasoning: { ...settings().reasoning, mode: 'enabled', summary: 'auto' },
+    })
+    const claude46Result = toAnthropicMessages(claude46, [user('u1', 'hi')])
+    expect(claude46Result.wire.thinking).toEqual({ type: 'adaptive' })
+    expect(
+      resolveAttemptInboundReasoningVisibility(
+        reasoningVisibilityPolicyFor(claude46.model),
+        claude46Result.reasoningVisibilityEvidence,
+      ),
+    ).toEqual({ disclosure: 'visible', visibleKind: 'text' })
+
+    const claude47 = settings({
+      model: 'anthropic/claude-opus-4.7',
+      reasoning: { ...settings().reasoning, mode: 'enabled', summary: 'auto' },
+    })
+    const claude47Result = toAnthropicMessages(claude47, [user('u1', 'hi')])
+    expect(claude47Result.wire.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
+    expect(
+      resolveAttemptInboundReasoningVisibility(
+        reasoningVisibilityPolicyFor(claude47.model),
+        claude47Result.reasoningVisibilityEvidence,
+      ),
+    ).toEqual({ disclosure: 'visible', visibleKind: 'summary' })
+
+    const omitted = toAnthropicMessages(
+      {
+        ...claude47,
+        reasoning: { ...claude47.reasoning, exclude: true },
+      },
+      [user('u1', 'hi')],
+    )
+    expect(omitted.wire.thinking).toEqual({ type: 'adaptive', display: 'omitted' })
+    expect(
+      resolveAttemptInboundReasoningVisibility(
+        reasoningVisibilityPolicyFor(claude47.model),
+        omitted.reasoningVisibilityEvidence,
+      ),
+    ).toMatchObject({ disclosure: 'absent', reason: 'request-display' })
   })
 
   it('uses adaptive thinking and output_config effort for Claude 4.7', () => {
@@ -111,7 +222,6 @@ describe('toAnthropicMessages', () => {
     expect(wire.thinking).toEqual({
       type: 'enabled',
       budget_tokens: 4096,
-      display: 'summarized',
     })
   })
 
@@ -134,11 +244,85 @@ describe('toAnthropicMessages', () => {
     expect(wire.thinking).toEqual({ type: 'adaptive', display: 'summarized' })
   })
 
+  it('does not claim disabled thinking when capabilities kept it off the wire', () => {
+    const s = settings({ reasoning: { ...settings().reasoning, mode: 'off' } })
+    const result = toAnthropicMessages(s, [user('u1', 'hi')], {
+      capabilities: {
+        supportedParameters: ['max_tokens'],
+        streaming: 'supported',
+      },
+    })
+    expect(result.wire.thinking).toBeUndefined()
+    expect(result.reasoningVisibilityEvidence).toEqual({
+      kind: 'anthropic',
+      display: 'provider-default',
+    })
+  })
+
   it('moves system/developer text to top-level system and serializes user content blocks', () => {
     const system = { ...user('s1', 'Be terse.'), role: 'system' as const }
     const { wire } = toAnthropicMessages(settings(), [system, user('u1', 'Hello')])
     expect(wire.system).toBe('Be terse.')
     expect(wire.messages).toEqual([{ role: 'user', content: [{ type: 'text', text: 'Hello' }] }])
+  })
+
+  it('keeps native Anthropic citations on their exact text block only', () => {
+    const prior = assistant('a1', '', {
+      content: [
+        {
+          type: 'output_text',
+          text: 'Claude source',
+          annotations: [
+            {
+              type: 'url_citation',
+              url: 'https://anthropic.example/source',
+              startIndex: 7,
+              endIndex: 13,
+              source: 'anthropic-messages',
+              providerPayload: {
+                type: 'web_search_result_location',
+                cited_text: 'source',
+                url: 'https://anthropic.example/source',
+                encrypted_index: 'opaque',
+              },
+            },
+          ],
+        },
+        {
+          type: 'output_text',
+          text: 'OpenAI source',
+          annotations: [
+            {
+              type: 'url_citation',
+              url: 'https://openai.example/source',
+              startIndex: 7,
+              endIndex: 13,
+              source: 'openai-responses',
+              providerPayload: {
+                type: 'url_citation',
+                url: 'https://openai.example/source',
+              },
+            },
+          ],
+        },
+      ],
+    })
+    const { wire } = toAnthropicMessages(settings(), [prior])
+    expect(wire.messages[0]?.content).toEqual([
+      {
+        type: 'text',
+        text: 'Claude source',
+        citations: [
+          {
+            type: 'web_search_result_location',
+            cited_text: 'source',
+            url: 'https://anthropic.example/source',
+            encrypted_index: 'opaque',
+          },
+        ],
+      },
+      { type: 'text', text: 'OpenAI source' },
+    ])
   })
 
   it('emits Anthropic hosted tool definitions only for the Anthropic provider', () => {
@@ -199,9 +383,7 @@ describe('toAnthropicMessages', () => {
       ],
     })
 
-    const { wire } = toAnthropicMessages(settings(), [prior, user('u2', 'continue')], {
-      reasoningPreservationFormat: 'anthropic-claude-v1',
-    })
+    const { wire } = toAnthropicMessages(settings(), [prior, user('u2', 'continue')])
     const firstMessage = wire.messages[0]
     expect(firstMessage?.role).toBe('assistant')
     const content = firstMessage?.content
@@ -236,9 +418,7 @@ describe('toAnthropicMessages', () => {
       ],
     })
 
-    const { wire } = toAnthropicMessages(settings(), [prior, user('u2', 'continue')], {
-      reasoningPreservationFormat: 'anthropic-claude-v1',
-    })
+    const { wire } = toAnthropicMessages(settings(), [prior, user('u2', 'continue')])
     expect(wire.messages[0]).toMatchObject({
       role: 'assistant',
       content: [
@@ -265,9 +445,7 @@ describe('toAnthropicMessages', () => {
         },
       ],
     })
-    const { wire } = toAnthropicMessages(settings(), [prior], {
-      reasoningPreservationFormat: 'anthropic-claude-v1',
-    })
+    const { wire } = toAnthropicMessages(settings(), [prior])
     expect(wire.messages[0]?.content).toEqual([
       { type: 'thinking', thinking: 'signed thought', signature: 'sig-blob' },
       { type: 'text', text: 'Answer.' },

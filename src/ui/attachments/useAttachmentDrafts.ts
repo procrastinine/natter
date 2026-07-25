@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { createAttachmentRef, normalizeAttachmentRefs } from '../../core/attachment-refs'
 import type { Attachment, AttachmentRef, MessageAttachmentRef } from '../../core/types'
 import { newId } from '../../lib/ulid'
-import { createAttachmentRef, normalizeAttachmentRefs } from '../../store/attachment-refs'
-import { ingestAttachmentBytes } from '../../store/attachments'
-import { getWorkspaceRepository } from '../../store/workspace-repository'
+import { ingestAttachmentBytes } from '../../store/attachment-application'
+import type { AttachmentDisplayRow } from './format'
+import { useAttachmentCatalogRows } from './useAttachmentCatalogRows'
 
 export interface AttachmentUploadItem {
   id: string
@@ -20,34 +21,39 @@ export function useAttachmentDrafts(initialRefs?: readonly AttachmentRef[]) {
   const [attachmentRefs, setAttachmentRefs] = useState<MessageAttachmentRef[]>(
     initialRefsRef.current,
   )
-  const [attachmentRows, setAttachmentRows] = useState<Map<string, Attachment>>(() => new Map())
+  const [optimisticRows, setOptimisticRows] = useState<Map<string, AttachmentDisplayRow>>(
+    () => new Map(),
+  )
   const [uploads, setUploads] = useState<AttachmentUploadItem[]>([])
+  const attachmentIds = useMemo(
+    () => [...new Set(attachmentRefs.map((ref) => ref.attachmentId))],
+    [attachmentRefs],
+  )
+  const catalog = useAttachmentCatalogRows(attachmentIds)
+  const attachmentRows = useMemo(() => {
+    const rows = new Map<string, AttachmentDisplayRow>()
+    for (const attachmentId of attachmentIds) {
+      const row = catalog.rowsById.get(attachmentId) ?? optimisticRows.get(attachmentId)
+      if (row) rows.set(attachmentId, row)
+    }
+    return rows
+  }, [attachmentIds, catalog.rowsById, optimisticRows])
 
   useEffect(() => {
-    let cancelled = false
-    const ids = [...new Set(attachmentRefs.map((ref) => ref.attachmentId))]
-    if (ids.length === 0) return
-    void Promise.all(
-      ids.map(async (id) => [id, await getWorkspaceRepository().getAttachment(id)] as const),
-    )
-      .then((rows) => {
-        if (cancelled) return
-        setAttachmentRows((current) => {
-          const next = new Map(current)
-          for (const [id, row] of rows) {
-            if (row) next.set(id, row)
-          }
-          return next
-        })
-      })
-      .catch((err) => console.error('attachment metadata load failed', err))
-    return () => {
-      cancelled = true
-    }
-  }, [attachmentRefs])
+    setOptimisticRows((current) => {
+      let next: Map<string, AttachmentDisplayRow> | null = null
+      const demanded = new Set(attachmentIds)
+      for (const attachmentId of current.keys()) {
+        if (demanded.has(attachmentId) && !catalog.rowsById.has(attachmentId)) continue
+        next ??= new Map(current)
+        next.delete(attachmentId)
+      }
+      return next ?? current
+    })
+  }, [attachmentIds, catalog.rowsById])
 
   const addAttachment = useCallback((attachment: Attachment) => {
-    setAttachmentRows((current) => {
+    setOptimisticRows((current) => {
       const next = new Map(current)
       next.set(attachment.id, attachment)
       return next
@@ -56,7 +62,7 @@ export function useAttachmentDrafts(initialRefs?: readonly AttachmentRef[]) {
   }, [])
 
   const replaceAttachment = useCallback((refId: string, attachment: Attachment) => {
-    setAttachmentRows((current) => {
+    setOptimisticRows((current) => {
       const next = new Map(current)
       next.set(attachment.id, attachment)
       return next
@@ -125,14 +131,19 @@ export function useAttachmentDrafts(initialRefs?: readonly AttachmentRef[]) {
 
   const clear = useCallback(() => {
     setAttachmentRefs([])
-    setAttachmentRows(new Map())
+    setOptimisticRows(new Map())
     setUploads([])
   }, [])
 
+  const consume = useCallback((refs: readonly MessageAttachmentRef[]) => {
+    const submitted = new Set(refs)
+    setAttachmentRefs((current) => current.filter((ref) => !submitted.has(ref)))
+  }, [])
+
   const restore = useCallback(
-    (refs: readonly MessageAttachmentRef[], rows?: Map<string, Attachment>) => {
+    (refs: readonly MessageAttachmentRef[], rows?: Map<string, AttachmentDisplayRow>) => {
       setAttachmentRefs([...refs])
-      setAttachmentRows(rows ? new Map(rows) : new Map())
+      setOptimisticRows(rows ? new Map(rows) : new Map())
       setUploads([])
     },
     [],
@@ -150,6 +161,7 @@ export function useAttachmentDrafts(initialRefs?: readonly AttachmentRef[]) {
     ingestFiles,
     dismissUpload,
     clear,
+    consume,
     restore,
   }
 }

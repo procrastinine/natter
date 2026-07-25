@@ -30,7 +30,6 @@
 // repository; the global rollup goes through the settings-store boundary,
 // which can map to the daemon settings bag unchanged.
 
-import { getSetting, updateSetting } from '../store/settings'
 import {
   bestGuessTokenizerFamilyKey,
   structuralModelSlug,
@@ -390,8 +389,8 @@ export function applyValidatedSample(
   sample.totalTextChars += chars
   sample.totalTextTokens += tokens
   sample.sampleCount += 1
-  sample.lastRatio = chars / tokens
-  sample.updatedAt = now
+  if (now >= sample.updatedAt) sample.lastRatio = chars / tokens
+  sample.updatedAt = Math.max(sample.updatedAt, now)
 }
 
 // Apply a sample to the per-chat map in memory. Pure (no IO). Mutates
@@ -421,7 +420,7 @@ export function addSampleToChat(
   return { accepted: true }
 }
 
-function normalizeGlobalPayload(stored: unknown): GlobalTokenCalibration {
+export function normalizeGlobalTokenCalibration(stored: unknown): GlobalTokenCalibration {
   if (!stored || typeof stored !== 'object') return emptyGlobal()
   const row = stored as Partial<GlobalTokenCalibration>
   if (row.version !== 1) return emptyGlobal()
@@ -436,6 +435,39 @@ function normalizeGlobalPayload(stored: unknown): GlobalTokenCalibration {
         ? (normalizedCalibrationSamples(row.byModel) ?? {})
         : {},
   }
+}
+
+export function relevantGlobalTokenCalibration(
+  stored: unknown,
+  modelId: string,
+): GlobalTokenCalibration {
+  const global = normalizeGlobalTokenCalibration(stored)
+  const calibrationKey = tokenCalibrationKey(modelId)
+  const sample = aggregateSamplesForCalibrationKey(global.byModel, calibrationKey)
+  return {
+    version: 1,
+    updatedAt: global.updatedAt,
+    ...(global.clearGeneration === undefined ? {} : { clearGeneration: global.clearGeneration }),
+    byModel: sample ? { [calibrationKey]: sample } : {},
+  }
+}
+
+export function applyAcceptedSamplesToGlobalRecord(
+  stored: unknown,
+  modelId: string,
+  samples: readonly { chars: number; tokens: number }[],
+  now: number,
+): GlobalTokenCalibration {
+  const global = normalizeGlobalTokenCalibration(stored)
+  const calibrationKey = tokenCalibrationKey(modelId)
+  let sample = aggregateSamplesForCalibrationKey(global.byModel, calibrationKey)
+  if (!sample) sample = emptySample()
+  for (const accepted of samples) {
+    applyValidatedSample(sample, accepted.chars, accepted.tokens, now)
+  }
+  global.byModel[calibrationKey] = sample
+  global.updatedAt = Math.max(global.updatedAt, now)
+  return global
 }
 
 function validCalibrationGeneration(value: unknown): value is number {
@@ -473,151 +505,54 @@ function subtractValidatedSample(
   return next
 }
 
-// Call after `addSampleToChat()` accepts the same observation. The global
-// settings row is a materialized rollup of per-chat samples, so this path
-// adds exactly the accepted per-chat delta instead of running an independent
-// global outlier gate that could make the rollup drift.
-export async function addAcceptedSampleToGlobal(
-  modelId: string,
-  chars: number,
-  tokens: number,
-  now: number = Date.now(),
-): Promise<void> {
-  await addAcceptedSamplesToGlobal(modelId, [{ chars, tokens }], now)
-}
-
-export async function addAcceptedSamplesToGlobal(
-  modelId: string,
-  samples: readonly { chars: number; tokens: number }[],
-  now: number = Date.now(),
-  options: {
-    expectedClearGeneration?: number
-    expectedReplacementEpoch?: number
-  } = {},
-): Promise<boolean> {
-  let applied = false
-  try {
-    const accepted: Array<{ chars: number; tokens: number }> = []
-    for (const sample of samples) {
-      const validatedTokens = safeServerTokens(sample.tokens)
-      if (
-        typeof sample.chars !== 'number' ||
-        !Number.isFinite(sample.chars) ||
-        sample.chars <= 0 ||
-        validatedTokens === undefined ||
-        validatedTokens <= 0
-      ) {
-        continue
-      }
-      accepted.push({ chars: sample.chars, tokens: validatedTokens })
-    }
-    if (accepted.length === 0) return false
-    const calibrationKey = tokenCalibrationKey(modelId)
-    await updateSetting<GlobalTokenCalibration>(
-      GLOBAL_TOKEN_CALIBRATION_KEY,
-      (stored) => {
-        const global = normalizeGlobalPayload(stored)
-        if (
-          options.expectedClearGeneration !== undefined &&
-          tokenCalibrationClearGeneration(global) !== options.expectedClearGeneration
-        ) {
-          return global
-        }
-        let globalSample = global.byModel[calibrationKey]
-        if (!globalSample) {
-          globalSample = emptySample()
-          global.byModel[calibrationKey] = globalSample
-        }
-        for (const sample of accepted) {
-          applyValidatedSample(globalSample, sample.chars, sample.tokens, now)
-        }
-        global.updatedAt = now
-        applied = true
-        return global
-      },
-      options.expectedReplacementEpoch === undefined
-        ? {}
-        : { expectedReplacementEpoch: options.expectedReplacementEpoch },
-    )
-  } catch {
-    // Non-fatal: per-chat sample remains the source of truth.
-  }
-  return applied
-}
-
-export async function subtractSamplesFromTokenCalibrationGlobal(
+export function subtractCalibrationSamplesFromGlobalRecord(
+  stored: unknown,
   samples: Record<string, TokenCalibrationSample> | undefined,
-  now: number = Date.now(),
-): Promise<void> {
+  now: number,
+): GlobalTokenCalibration {
+  const global = normalizeGlobalTokenCalibration(stored)
   const removedByFamily = aggregateCalibrationSamples(samples)
-  try {
-    await updateSetting<GlobalTokenCalibration>(GLOBAL_TOKEN_CALIBRATION_KEY, (stored) => {
-      const global = normalizeGlobalPayload(stored)
-      global.clearGeneration = nextCalibrationGeneration(tokenCalibrationClearGeneration(global))
-      let changed = false
-      for (const [calibrationKey, removed] of Object.entries(removedByFamily)) {
-        const current = aggregateSamplesForCalibrationKey(global.byModel, calibrationKey)
-        if (!current) continue
-        const next = subtractValidatedSample(current, removed, now)
-        if (next) global.byModel[calibrationKey] = next
-        else delete global.byModel[calibrationKey]
-        changed = true
-      }
-      if (changed || Object.keys(removedByFamily).length === 0) global.updatedAt = now
-      return global
-    })
-  } catch {
-    // Non-fatal: estimation falls back through remaining per-chat samples.
+  global.clearGeneration = nextCalibrationGeneration(tokenCalibrationClearGeneration(global))
+  let changed = false
+  for (const [calibrationKey, removed] of Object.entries(removedByFamily)) {
+    const current = aggregateSamplesForCalibrationKey(global.byModel, calibrationKey)
+    if (!current) continue
+    const next = subtractValidatedSample(current, removed, now)
+    if (next) global.byModel[calibrationKey] = next
+    else delete global.byModel[calibrationKey]
+    changed = true
   }
+  if (changed || Object.keys(removedByFamily).length === 0) global.updatedAt = now
+  return global
 }
 
-export async function clearTokenCalibrationGlobalFamily(
+export function clearCalibrationFamilyFromGlobalRecord(
+  stored: unknown,
   calibrationKey: string,
-  now: number = Date.now(),
-): Promise<boolean> {
+  now: number,
+): { value: GlobalTokenCalibration; changed: boolean } {
+  const value = normalizeGlobalTokenCalibration(stored)
   let changed = false
-  await updateSetting<GlobalTokenCalibration>(GLOBAL_TOKEN_CALIBRATION_KEY, (stored) => {
-    const global = normalizeGlobalPayload(stored)
-    for (const storedKey of Object.keys(global.byModel)) {
-      if (tokenCalibrationKeyForStoredRecordKey(storedKey) !== calibrationKey) continue
-      delete global.byModel[storedKey]
-      changed = true
-    }
-    global.clearGeneration = nextCalibrationGeneration(tokenCalibrationClearGeneration(global))
-    global.updatedAt = now
-    return global
-  })
-  return changed
-}
-
-export async function clearAllTokenCalibrationGlobal(now: number = Date.now()): Promise<boolean> {
-  let changed = false
-  await updateSetting<GlobalTokenCalibration>(GLOBAL_TOKEN_CALIBRATION_KEY, (stored) => {
-    const global = normalizeGlobalPayload(stored)
-    changed = Object.keys(global.byModel).length > 0
-    global.byModel = {}
-    global.clearGeneration = nextCalibrationGeneration(tokenCalibrationClearGeneration(global))
-    global.updatedAt = now
-    return global
-  })
-  return changed
-}
-
-// Convenience: apply a sample to both the per-chat map AND the global
-// rollup. The per-chat apply is synchronous (in-memory); the global
-// rollup is awaited. Caller is responsible for persisting the chat row.
-export async function addSampleToChatAndGlobal(
-  chat: { tokenCalibration?: Record<string, TokenCalibrationSample> | undefined },
-  modelId: string,
-  chars: number,
-  tokens: number,
-  now: number = Date.now(),
-): Promise<SampleIngestOutcome> {
-  const outcome = addSampleToChat(chat, modelId, chars, tokens, now)
-  if (outcome.accepted) {
-    await addAcceptedSampleToGlobal(modelId, chars, tokens, now)
+  for (const storedKey of Object.keys(value.byModel)) {
+    if (tokenCalibrationKeyForStoredRecordKey(storedKey) !== calibrationKey) continue
+    delete value.byModel[storedKey]
+    changed = true
   }
-  return outcome
+  value.clearGeneration = nextCalibrationGeneration(tokenCalibrationClearGeneration(value))
+  value.updatedAt = now
+  return { value, changed }
+}
+
+export function clearAllCalibrationFromGlobalRecord(
+  stored: unknown,
+  now: number,
+): { value: GlobalTokenCalibration; changed: boolean } {
+  const value = normalizeGlobalTokenCalibration(stored)
+  const changed = Object.keys(value.byModel).length > 0
+  value.byModel = {}
+  value.clearGeneration = nextCalibrationGeneration(tokenCalibrationClearGeneration(value))
+  value.updatedAt = now
+  return { value, changed }
 }
 
 // ---------------------------------------------------------------------------
@@ -630,8 +565,7 @@ function emptyGlobal(): GlobalTokenCalibration {
   return { version: 1, updatedAt: 0, byModel: {} }
 }
 
-export async function readTokenCalibrationGlobal(): Promise<GlobalTokenCalibration> {
-  const raw = await getSetting<unknown>(GLOBAL_TOKEN_CALIBRATION_KEY)
+export function globalTokenCalibrationFromStored(raw: unknown): GlobalTokenCalibration {
   if (!raw || typeof raw !== 'object') return emptyGlobal()
   // Minimal validation — version check only; individual samples are
   // consumed through `ratioFromSample` which already guards against bad
@@ -649,23 +583,6 @@ export async function readTokenCalibrationGlobal(): Promise<GlobalTokenCalibrati
         ? (normalizedCalibrationSamples(row.byModel) ?? {})
         : {},
   }
-}
-
-export async function writeTokenCalibrationGlobal(
-  value: GlobalTokenCalibration,
-  options: { invalidatePending?: boolean } = {},
-): Promise<void> {
-  await updateSetting<GlobalTokenCalibration>(GLOBAL_TOKEN_CALIBRATION_KEY, (stored) => {
-    const current = normalizeGlobalPayload(stored)
-    const clearGeneration = options.invalidatePending
-      ? nextCalibrationGeneration(tokenCalibrationClearGeneration(current))
-      : tokenCalibrationClearGeneration(current)
-    return {
-      ...value,
-      ...(clearGeneration > 0 ? { clearGeneration } : {}),
-      byModel: normalizedCalibrationSamples(value.byModel) ?? {},
-    }
-  })
 }
 
 // ---------------------------------------------------------------------------
@@ -837,7 +754,25 @@ export function calibrationFieldsForCreate(
   global: GlobalTokenCalibration | null | undefined,
   mode: CalibrationMode | undefined = 'adaptive',
 ): CalibrationFieldsForCreate {
-  const chars = messageTextCharCount(content)
+  return calibrationFieldsForCreateFromTextCharCount(
+    messageTextCharCount(content),
+    modelId,
+    chat,
+    global,
+    mode,
+  )
+}
+
+export function calibrationFieldsForCreateFromTextCharCount(
+  chars: number,
+  modelId: string,
+  chat:
+    | { tokenCalibration?: Record<string, TokenCalibrationSample> | undefined }
+    | null
+    | undefined,
+  global: GlobalTokenCalibration | null | undefined,
+  mode: CalibrationMode | undefined = 'adaptive',
+): CalibrationFieldsForCreate {
   const ratio = charsPerToken(modelId, chat, global, mode)
   const tokens = freshTokenEstimate(chars, ratio)
   return {
@@ -921,19 +856,14 @@ function hasNonTextContent(content: unknown): boolean {
   return false
 }
 
-// Total char count across `reasoningDetails[]` EXCLUDING encrypted blobs.
+// Total visible reasoning char count. Opaque carrier bytes are excluded.
 // See plan §`<think>`-tag models — inline reasoning chars ride with
 // completion chars when billed as completion_tokens.
-function reasoningDetailsChars(message: Message): number {
-  const details = message.reasoningDetails
-  if (!details || details.length === 0) return 0
+function reasoningEnvelopeChars(message: Pick<Message, 'reasoningEnvelope'>): number {
+  const envelope = message.reasoningEnvelope
+  if (!envelope) return 0
   let total = 0
-  for (const d of details) {
-    if (d.id?.startsWith('tool_')) continue
-    if (d.type === 'reasoning.text') total += safeLen(d.text)
-    else if (d.type === 'reasoning.summary') total += safeLen(d.summary)
-    // reasoning.encrypted is opaque bytes — never contributes to char count.
-  }
+  for (const part of envelope.visible) total += safeLen(part.text)
   return total
 }
 
@@ -1000,7 +930,7 @@ export function derivePromptSample(input: DerivePromptSampleInput): SamplePair |
 }
 
 interface DeriveCompletionSampleInput {
-  assistantMessage: Message
+  assistantMessage: Pick<Message, 'content' | 'reasoningEnvelope'>
   usage: ChatUsage
   family: TokenizerFamily
 }
@@ -1010,7 +940,7 @@ interface DeriveCompletionSampleInput {
 //
 //   - `reasoning_tokens > 0` → out-of-band reasoning. Exclude both chars
 //     (content only) and tokens (completion − reasoning_tokens).
-//   - Otherwise, if the assistant message has reasoningDetails[] chars,
+//   - Otherwise, if the assistant message has visible reasoning-envelope chars,
 //     reasoning was billed inline. Include reasoning chars; don't subtract
 //     from tokens.
 //   - No reasoning at all → straight text completion.
@@ -1023,7 +953,7 @@ export function deriveCompletionSample(input: DeriveCompletionSampleInput): Samp
   if (completionTokens === undefined || completionTokens <= 0) return null
 
   const contentChars = messageTextChars(input.assistantMessage.content)
-  const reasonChars = reasoningDetailsChars(input.assistantMessage)
+  const reasonChars = reasoningEnvelopeChars(input.assistantMessage)
   const reasoningTokensOfThisTurn =
     safeServerTokens(input.usage.completion_tokens_details?.reasoning_tokens) ?? 0
 

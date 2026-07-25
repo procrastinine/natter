@@ -3,17 +3,153 @@
 // Neither path burns live quota. Live-API specs live in `*.live.spec.ts` and gate
 // on `process.env.RUN_LIVE === '1'`.
 
-import type { Message } from '../../src/core/types'
 import {
-  previewTextFromStoredProjection,
-  splitMessageForStorage,
-} from '../../src/store/message-storage'
+  configureWorkspaceThroughUi,
+  importPortableChatThroughUi,
+  waitForWorkspaceRunning as waitForWorkspaceFixtureRunning,
+} from '../../scripts/workspace-provider-fixture.mjs'
 import { expect, type Page } from './fixtures'
 
 export interface IndexedDbDump {
   dbName: string
   exportedAt?: string
   stores: Record<string, unknown[]>
+}
+
+export async function waitForWorkspaceRunning(page: Page): Promise<void> {
+  await waitForWorkspaceFixtureRunning(page)
+}
+
+export async function activeWorkspaceDatabaseName(page: Page): Promise<string> {
+  return page.evaluate(async () => {
+    const knownNames =
+      typeof indexedDB.databases === 'function'
+        ? (await indexedDB.databases()).flatMap((database) =>
+            database.name === undefined ? [] : [database.name],
+          )
+        : []
+    if (!knownNames.includes('natter-control')) return 'natter'
+    const control = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open('natter-control')
+      request.onsuccess = () => resolve(request.result)
+      request.onerror = () => reject(request.error)
+    })
+    try {
+      return await new Promise<string>((resolve, reject) => {
+        const request = control
+          .transaction('manifests', 'readonly')
+          .objectStore('manifests')
+          .get('workspace')
+        request.onsuccess = () => {
+          const name = (request.result as { activeDatabaseName?: unknown } | undefined)
+            ?.activeDatabaseName
+          if (typeof name !== 'string') {
+            reject(new Error('BrowserWorkspaceControlManifestInvalid'))
+            return
+          }
+          resolve(name)
+        }
+        request.onerror = () => reject(request.error)
+      })
+    } finally {
+      control.close()
+    }
+  })
+}
+
+export async function holdIndexedDbStoreGate(
+  page: Page,
+  storeNames: readonly string[],
+): Promise<() => Promise<void>> {
+  if (storeNames.length === 0) throw new Error('IndexedDbStoreGateRequiresStore')
+  const databaseName = await activeWorkspaceDatabaseName(page)
+  const gateId = `indexeddb-store-gate:${Date.now()}:${Math.random()}`
+  await page.evaluate(
+    async ({ databaseName, gateId, storeNames }) => {
+      type Gate = { release(): void; readonly complete: Promise<void> }
+      const scope = window as typeof window & {
+        __e2eIndexedDbStoreGates?: Map<string, Gate>
+      }
+      const gates = scope.__e2eIndexedDbStoreGates ?? new Map<string, Gate>()
+      scope.__e2eIndexedDbStoreGates = gates
+      const database = await new Promise<IDBDatabase>((resolve, reject) => {
+        const request = indexedDB.open(databaseName)
+        request.onsuccess = () => resolve(request.result)
+        request.onerror = () => reject(request.error)
+      })
+      let released = false
+      let readySettled = false
+      let resolveReady: () => void = () => undefined
+      let rejectReady: (error: unknown) => void = () => undefined
+      const ready = new Promise<void>((resolve, reject) => {
+        resolveReady = resolve
+        rejectReady = reject
+      })
+      let resolveComplete: () => void = () => undefined
+      let rejectComplete: (error: unknown) => void = () => undefined
+      const complete = new Promise<void>((resolve, reject) => {
+        resolveComplete = resolve
+        rejectComplete = reject
+      })
+      const transaction = database.transaction(storeNames, 'readwrite')
+      const fail = (error: unknown) => {
+        if (!readySettled) {
+          readySettled = true
+          rejectReady(error)
+        }
+        rejectComplete(error)
+        database.close()
+      }
+      transaction.oncomplete = () => {
+        resolveComplete()
+        database.close()
+      }
+      transaction.onerror = () => fail(transaction.error ?? new Error('IndexedDbStoreGateError'))
+      transaction.onabort = () => fail(transaction.error ?? new Error('IndexedDbStoreGateAbort'))
+      const store = transaction.objectStore(storeNames[0] as string)
+      const keepAlive = () => {
+        const request = store.get('__e2e_gate__')
+        request.onsuccess = () => {
+          if (!readySettled) {
+            readySettled = true
+            resolveReady()
+          }
+          if (!released) keepAlive()
+        }
+        request.onerror = () => fail(request.error ?? new Error('IndexedDbStoreGateReadError'))
+      }
+      gates.set(gateId, {
+        release: () => {
+          released = true
+        },
+        complete,
+      })
+      keepAlive()
+      await ready
+    },
+    { databaseName, gateId, storeNames: [...storeNames] },
+  )
+  let released = false
+  return async () => {
+    if (released) return
+    released = true
+    await page.evaluate(async (gateId) => {
+      const scope = window as typeof window & {
+        __e2eIndexedDbStoreGates?: Map<
+          string,
+          { release(): void; readonly complete: Promise<void> }
+        >
+      }
+      const gate = scope.__e2eIndexedDbStoreGates?.get(gateId)
+      if (!gate) throw new Error(`IndexedDbStoreGateMissing:${gateId}`)
+      gate.release()
+      try {
+        await gate.complete
+      } finally {
+        scope.__e2eIndexedDbStoreGates?.delete(gateId)
+      }
+    }, gateId)
+  }
 }
 
 interface SeedOptions {
@@ -23,7 +159,7 @@ interface SeedOptions {
   corsProxyUrl?: string
 }
 
-const DEFAULT_E2E_MODEL = 'google/gemini-3.1-flash-lite-preview:free'
+const DEFAULT_E2E_MODEL = 'google/gemini-3.5-flash'
 
 // Open the first-run Add connection action and submit a stub key. `apiKey`
 // defaults to a harmless placeholder because the route-mocked specs never hit
@@ -45,101 +181,14 @@ export async function seedFirstRun(page: Page, opts: SeedOptions = {}): Promise<
   await page.locator('[data-ui="connection-empty-action"]').waitFor({
     state: 'detached',
   })
-  if (opts.corsProxyUrl !== undefined) {
-    await page.evaluate(async (corsProxyUrl) => {
-      const db = await new Promise<IDBDatabase>((resolve, reject) => {
-        const req = indexedDB.open('natter')
-        req.onsuccess = () => resolve(req.result)
-        req.onerror = () => reject(req.error)
-      })
-      try {
-        await new Promise<void>((resolve, reject) => {
-          const tx = db.transaction('settings', 'readwrite')
-          tx.objectStore('settings').put({ key: 'global:cors-proxy-url', value: corsProxyUrl })
-          tx.oncomplete = () => resolve()
-          tx.onerror = () => reject(tx.error)
-          tx.onabort = () => reject(tx.error)
-        })
-      } finally {
-        db.close()
-      }
-    }, opts.corsProxyUrl)
-    await page.reload()
-    await page.locator('[data-role="new-chat"]').waitFor({ state: 'visible' })
-  }
-  if (opts.disablePrivacyFilter === false) return
-  await page.evaluate(
-    async ({ model }) => {
-      const db = await new Promise<IDBDatabase>((resolve, reject) => {
-        const req = indexedDB.open('natter')
-        req.onsuccess = () => resolve(req.result)
-        req.onerror = () => reject(req.error)
-      })
-      try {
-        await new Promise<void>((resolve, reject) => {
-          const tx = db.transaction(['presets', 'chats'], 'readwrite')
-          const presets = tx.objectStore('presets')
-          const chats = tx.objectStore('chats')
-          const presetsReq = presets.getAll()
-          presetsReq.onsuccess = () => {
-            for (const preset of presetsReq.result as Array<Record<string, unknown>>) {
-              const settings = (preset.settings ?? {}) as Record<string, unknown>
-              const privacy = (settings.privacy ?? {}) as Record<string, unknown>
-              preset.settings = {
-                ...settings,
-                ...(model ? { model } : {}),
-                privacy: { ...privacy, paretoFilter: false },
-              }
-              presets.put(preset)
-            }
-            const chatsReq = chats.getAll()
-            chatsReq.onsuccess = () => {
-              for (const chat of chatsReq.result as Array<Record<string, unknown>>) {
-                const settings = (chat.settings ?? {}) as Record<string, unknown>
-                const privacy = (settings.privacy ?? {}) as Record<string, unknown>
-                chat.settings = {
-                  ...settings,
-                  ...(model ? { model } : {}),
-                  privacy: { ...privacy, paretoFilter: false },
-                }
-                chats.put(chat)
-              }
-            }
-          }
-          tx.oncomplete = () => resolve()
-          tx.onerror = () => reject(tx.error)
-          tx.onabort = () => reject(tx.error)
-        })
-      } finally {
-        db.close()
-      }
-      const raw = window.sessionStorage.getItem('natter:active-seed')
-      if (!raw) return
-      try {
-        const parsed = JSON.parse(raw) as {
-          profileId?: string | null
-          presetId?: string | null
-          settings?: Record<string, unknown> | null
-        }
-        const settings = parsed.settings ?? {}
-        const privacy = (settings.privacy ?? {}) as Record<string, unknown>
-        window.sessionStorage.setItem(
-          'natter:active-seed',
-          JSON.stringify({
-            ...parsed,
-            settings: {
-              ...settings,
-              ...(model ? { model } : {}),
-              privacy: { ...privacy, paretoFilter: false },
-            },
-          }),
-        )
-      } catch {
-        // Ignore malformed session state in tests; IDB preset updates above are sufficient.
-      }
-    },
-    { model },
-  )
+  await configureWorkspaceThroughUi(page, {
+    model,
+    ...(opts.disablePrivacyFilter === false ? {} : { paretoFilter: false }),
+    ...(opts.corsProxyUrl === undefined
+      ? {}
+      : { workspaceSettings: { 'global:cors-proxy-url': opts.corsProxyUrl } }),
+  })
+  await createChatAndOpen(page)
 }
 
 // Navigate to the blank-chat surface (`#/new`) and wait for the composer.
@@ -152,8 +201,14 @@ export async function createChatAndOpen(page: Page): Promise<void> {
 }
 
 export async function sendMessage(page: Page, text: string): Promise<void> {
-  await page.locator('[data-ui="composer-input"]').fill(text)
-  await page.locator('[data-ui="send"]').click()
+  const composer = interactiveComposer(page)
+  await expect(composer).toBeVisible()
+  await composer.locator('[data-ui="composer-input"]').fill(text)
+  await composer.locator('[data-ui="send"]').click()
+}
+
+export function interactiveComposer(page: Page) {
+  return page.locator('form[data-ui="composer"]:not([data-presentation-only])')
 }
 
 // Goes through the full new-chat-then-send flow: navigates to `#/new`, fills
@@ -254,6 +309,7 @@ export async function seedLinearChat(
     chatId?: string
     title?: string
     textPrefix?: string
+    textForIndex?: (index: number) => string
     assistantContentType?: 'text' | 'output_text'
   },
 ): Promise<string> {
@@ -266,10 +322,10 @@ export async function seedLinearChat(
   const textPrefix = input.textPrefix ?? 'window message'
   const assistantContentType = input.assistantContentType ?? 'text'
   let parentId: string | null = null
-  const storedMessages = Array.from({ length: input.messageCount }, (_, index) => {
+  const messages = Array.from({ length: input.messageCount }, (_, index) => {
     const id = `msg-${String(index).padStart(3, '0')}`
     const role = index % 2 === 0 ? 'user' : 'assistant'
-    const message: Message = {
+    const message = {
       id,
       chatId,
       parentId,
@@ -284,225 +340,122 @@ export async function seedLinearChat(
       content: [
         {
           type: role === 'assistant' ? assistantContentType : 'text',
-          text: `${textPrefix} ${index}`,
+          text: input.textForIndex?.(index) ?? `${textPrefix} ${index}`,
         },
       ],
     }
     parentId = id
-    return splitMessageForStorage(message)
+    return message
   })
-  const chatWordCount = storedMessages.reduce(
-    (total, stored) => total + stored.header.bodyWordCount,
-    0,
-  )
-  const firstHeader = storedMessages[0]?.header
-  if (!firstHeader) throw new Error('seedLinearChat did not construct a first message')
-  const lastMessageId = storedMessages.at(-1)?.header.id
-  if (!lastMessageId) throw new Error('seedLinearChat did not construct a last message')
+  const imported = await importPortableChatThroughUi(page, {
+    sourceChatId: chatId,
+    title,
+    createdAt: now,
+    updatedAt: now + messages.length,
+    messages,
+    ...(input.settings === undefined ? {} : { workspaceSettings: input.settings }),
+  })
+  return imported.chatId
+}
 
-  await page.evaluate(
-    async (seed) => {
+// Read a chat's messages table via the page's IndexedDB and reconstruct
+// deterministic tree order; a non-unique IDB index has no conversational order.
+export async function readMessages(
+  page: Page,
+  chatId: string,
+): Promise<Array<Record<string, unknown>>> {
+  const databaseName = await activeWorkspaceDatabaseName(page)
+  const rows = await page.evaluate(
+    async ({ databaseName, id }) => {
       const db = await new Promise<IDBDatabase>((resolve, reject) => {
-        const req = indexedDB.open('natter')
+        const req = indexedDB.open(databaseName)
         req.onsuccess = () => resolve(req.result)
         req.onerror = () => reject(req.error)
       })
       try {
-        await new Promise<void>((resolve, reject) => {
-          const tx = db.transaction(
-            ['presets', 'settings', 'chats', 'messages', 'messageBodies'],
-            'readwrite',
-          )
-          const presets = tx.objectStore('presets')
-          const settingsStore = tx.objectStore('settings')
-          const chats = tx.objectStore('chats')
-          const messages = tx.objectStore('messages')
-          const messageBodies = tx.objectStore('messageBodies')
-          const presetsReq = presets.getAll()
-          presetsReq.onsuccess = () => {
-            const preset = (presetsReq.result as Array<{ id?: string; settings?: unknown }>)[0]
-            const chatSettings = structuredClone(preset?.settings ?? {})
-            for (const [key, value] of Object.entries(seed.settings)) {
-              settingsStore.put({ key, value })
+        return await new Promise<Array<Record<string, unknown>>>((resolve, reject) => {
+          const tx = db.transaction(['messages', 'messageBodies'], 'readonly')
+          const messageStore = tx.objectStore('messages')
+          const bodyStore = tx.objectStore('messageBodies')
+          const index = messageStore.index('chatId')
+          const req = index.getAll(id)
+          req.onsuccess = () => {
+            const headers = req.result as Array<Record<string, unknown>>
+            if (headers.length === 0) {
+              resolve([])
+              return
             }
-            chats.put({
-              id: seed.chatId,
-              title: seed.title,
-              titleStatus: 'manual',
-              createdAt: seed.now,
-              updatedAt: seed.now + seed.storedMessages.length,
-              lastViewedAt: seed.now + seed.storedMessages.length,
-              wordCount: seed.chatWordCount,
-              totalCostUsd: 0,
-              metaVersion: 0,
-              summaryVersion: 0,
-              settings: chatSettings,
-              presetId: preset?.id,
-              lastUpdatedLeafId: seed.lastMessageId,
-              lastBranchUpdatedAt: seed.now + seed.storedMessages.length,
-              archived: false,
-              pinned: false,
-              folderId: null,
-              tags: [],
-              previewText: seed.previewText,
-            })
-            for (const stored of seed.storedMessages) {
-              messages.put(stored.header)
-              messageBodies.put(stored.body)
+            const bodyReq = bodyStore.getAll()
+            bodyReq.onsuccess = () => {
+              const byId = new Map(
+                (bodyReq.result as Array<Record<string, unknown>>).map((row) => [row.id, row]),
+              )
+              resolve(
+                headers.map((header) => {
+                  const body = byId.get(header.id)
+                  return body ? { ...header, ...body, nodeVersion: header.nodeVersion } : header
+                }),
+              )
             }
+            bodyReq.onerror = () => reject(bodyReq.error)
           }
-          tx.oncomplete = () => resolve()
-          tx.onerror = () => reject(tx.error)
-          tx.onabort = () => reject(tx.error)
+          req.onerror = () => reject(req.error)
         })
       } finally {
         db.close()
       }
     },
-    {
-      chatId,
-      chatWordCount,
-      lastMessageId,
-      now,
-      previewText: previewTextFromStoredProjection(firstHeader.textPreview),
-      settings: input.settings ?? {},
-      storedMessages,
-      title,
-    },
+    { databaseName, id: chatId },
   )
-  await rebuildSidebarProjection(page)
-  return chatId
+  return orderStoredMessageRows(rows)
 }
 
-export async function rebuildSidebarProjection(page: Page): Promise<void> {
-  await page.evaluate(async () => {
-    const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const request = indexedDB.open('natter')
-      request.onsuccess = () => resolve(request.result)
-      request.onerror = () => reject(request.error)
-    })
-    try {
-      await new Promise<void>((resolve, reject) => {
-        const transaction = db.transaction(['chats', 'chatSidebarRows', 'settings'], 'readwrite')
-        const rows = transaction.objectStore('chatSidebarRows')
-        const settings = transaction.objectStore('settings')
-        rows.clear()
-        const chatsRequest = transaction.objectStore('chats').getAll()
-        chatsRequest.onsuccess = () => {
-          const chats = chatsRequest.result as Array<Record<string, unknown>>
-          for (const chat of chats) {
-            const row: Record<string, unknown> = {
-              id: chat.id,
-              title: chat.title,
-              titleStatus: chat.titleStatus,
-              createdAt: chat.createdAt,
-              updatedAt: chat.updatedAt,
-              lastViewedAt: chat.lastViewedAt,
-              wordCount: chat.wordCount,
-              totalCostUsd: chat.totalCostUsd,
-              lastUpdatedLeafId: chat.lastUpdatedLeafId,
-              lastBranchUpdatedAt: chat.lastBranchUpdatedAt,
-              archived: chat.archived,
-              pinned: chat.pinned,
-              folderId: chat.folderId,
-              tags: structuredClone(chat.tags),
-              ...(chat.previewText === undefined ? {} : { previewText: chat.previewText }),
-            }
-            const serialized = JSON.stringify([
-              row.id,
-              row.title,
-              row.titleStatus,
-              row.createdAt,
-              row.updatedAt,
-              row.lastViewedAt,
-              row.wordCount,
-              row.totalCostUsd,
-              row.lastUpdatedLeafId,
-              row.lastBranchUpdatedAt,
-              row.archived,
-              row.pinned,
-              row.folderId,
-              row.tags,
-              row.previewText ?? null,
-            ])
-            let hash = 0x811c9dc5
-            for (let index = 0; index < serialized.length; index += 1) {
-              hash ^= serialized.charCodeAt(index)
-              hash = Math.imul(hash, 0x01000193)
-            }
-            rows.put({
-              ...row,
-              projectionVersion: 1,
-              checksum: (hash >>> 0).toString(16).padStart(8, '0'),
-            })
-          }
-          settings.put({ key: 'backfill:chat-sidebar-projection-v1', value: 1 })
-          settings.put({
-            key: 'projection:chat-sidebar-v1',
-            value: { projectionVersion: 1, expectedCount: chats.length },
-          })
-        }
-        transaction.oncomplete = () => resolve()
-        transaction.onerror = () => reject(transaction.error)
-        transaction.onabort = () => reject(transaction.error)
-      })
-    } finally {
-      db.close()
-    }
-  })
+function orderStoredMessageRows(
+  rows: Array<Record<string, unknown>>,
+): Array<Record<string, unknown>> {
+  const byParent = new Map<string | null, Array<Record<string, unknown>>>()
+  for (const row of rows) {
+    const parentId = typeof row.parentId === 'string' ? row.parentId : null
+    const siblings = byParent.get(parentId)
+    if (siblings) siblings.push(row)
+    else byParent.set(parentId, [row])
+  }
+  const compare = (left: Record<string, unknown>, right: Record<string, unknown>) =>
+    numericRowField(left.siblingIndex) - numericRowField(right.siblingIndex) ||
+    numericRowField(left.createdAt) - numericRowField(right.createdAt) ||
+    (typeof left.id === 'string' ? left.id : '').localeCompare(
+      typeof right.id === 'string' ? right.id : '',
+    )
+  for (const siblings of byParent.values()) siblings.sort(compare)
+
+  const ordered: Array<Record<string, unknown>> = []
+  const visited = new Set<string>()
+  const visit = (row: Record<string, unknown>) => {
+    const id = typeof row.id === 'string' ? row.id : null
+    if (id && visited.has(id)) return
+    if (id) visited.add(id)
+    ordered.push(row)
+    if (id) for (const child of byParent.get(id) ?? []) visit(child)
+  }
+  for (const root of byParent.get(null) ?? []) visit(root)
+  for (const row of [...rows].sort(compare)) {
+    if (typeof row.id !== 'string' || !visited.has(row.id)) visit(row)
+  }
+  return ordered
 }
 
-// Read a chat's messages table via the page's IndexedDB. Returns the
-// promoted-to-top-of-type array so tests can filter / assert by role.
-export async function readMessages(
-  page: Page,
-  chatId: string,
-): Promise<Array<Record<string, unknown>>> {
-  return page.evaluate(async (id) => {
-    const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const req = indexedDB.open('natter')
-      req.onsuccess = () => resolve(req.result)
-      req.onerror = () => reject(req.error)
-    })
-    try {
-      return await new Promise<Array<Record<string, unknown>>>((resolve, reject) => {
-        const tx = db.transaction(['messages', 'messageBodies'], 'readonly')
-        const messageStore = tx.objectStore('messages')
-        const bodyStore = tx.objectStore('messageBodies')
-        const index = messageStore.index('chatId')
-        const req = index.getAll(id)
-        req.onsuccess = () => {
-          const headers = req.result as Array<Record<string, unknown>>
-          if (headers.length === 0) {
-            resolve([])
-            return
-          }
-          const bodyReq = bodyStore.getAll()
-          bodyReq.onsuccess = () => {
-            const byId = new Map(
-              (bodyReq.result as Array<Record<string, unknown>>).map((row) => [row.id, row]),
-            )
-            resolve(
-              headers.map((header) => {
-                const body = byId.get(header.id)
-                return body ? { ...header, ...body, nodeVersion: header.nodeVersion } : header
-              }),
-            )
-          }
-          bodyReq.onerror = () => reject(bodyReq.error)
-        }
-        req.onerror = () => reject(req.error)
-      })
-    } finally {
-      db.close()
-    }
-  }, chatId)
+function numericRowField(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0
 }
 
 interface TranscriptContinuityState {
   anchor: Element
   anchorRemoved: boolean
+  commonPrefix: Array<{ element: Element; messageId: string }>
+  commonPrefixDisconnectedIds: Set<string>
+  commonPrefixReplacedIds: Set<string>
   content: Element
+  expectedCommonPrefixCount: number | null
   list: Element
   listRemoved: boolean
   listReplaced: boolean
@@ -520,21 +473,40 @@ export interface TranscriptContinuityResult {
   listRemoved: boolean
   listReplaced: boolean
   loadingSeen: boolean
+  messageCountDecreased: boolean
   messageCountsIncludeZero: boolean
+  minimumMessageCount: number
+  commonPrefixDisconnectedIds?: string[]
+  commonPrefixReplacedIds?: string[]
+  messageCountBelowExpectedCommonPrefix?: boolean
 }
 
-export async function startMessageCountRecorder(page: Page): Promise<void> {
-  await page.evaluate(() => {
+export async function startMessageCountRecorder(
+  page: Page,
+  options: { commonPrefixMessageIds?: readonly string[] } = {},
+): Promise<void> {
+  await page.evaluate((input) => {
     const win = window as TranscriptContinuityWindow
     win.__stopMessageCountSamples?.()
     const content = document.querySelector('[data-ui="scroll-content"]')
     const list = content?.querySelector('[data-ui="message-list"]')
     if (!content || !list) throw new Error('Mounted transcript not found')
     const messages = list.querySelectorAll('[data-ui="message"]')
+    const commonPrefix = (input.commonPrefixMessageIds ?? []).map((messageId) => {
+      const element = Array.from(messages).find(
+        (message) => message.getAttribute('data-message-id') === messageId,
+      )
+      if (!element) throw new Error(`Common-prefix message is not mounted: ${messageId}`)
+      return { element, messageId }
+    })
     const state: TranscriptContinuityState = {
-      anchor: messages.item(Math.max(0, messages.length - 2)),
+      anchor: commonPrefix.at(-1)?.element ?? messages.item(Math.max(0, messages.length - 2)),
       anchorRemoved: false,
+      commonPrefix,
+      commonPrefixDisconnectedIds: new Set(),
+      commonPrefixReplacedIds: new Set(),
       content,
+      expectedCommonPrefixCount: commonPrefix.length > 0 ? commonPrefix.length : null,
       list,
       listRemoved: false,
       listReplaced: false,
@@ -543,18 +515,45 @@ export async function startMessageCountRecorder(page: Page): Promise<void> {
     }
     const sample = () => {
       const currentList = state.content.querySelector('[data-ui="message-list"]')
-      state.messageCounts.push(currentList?.querySelectorAll('[data-ui="message"]').length ?? 0)
+      const currentMessages = Array.from(
+        currentList?.querySelectorAll('[data-ui="message"][data-message-id]') ?? [],
+      )
+      const currentMessagesById = new Map(
+        currentMessages.map((message) => [message.getAttribute('data-message-id'), message]),
+      )
+      state.messageCounts.push(currentMessages.length)
       state.listRemoved ||= !state.list.isConnected
       state.listReplaced ||= currentList !== state.list
       state.anchorRemoved ||= !state.anchor.isConnected
       state.loadingSeen ||= state.content.querySelector('[data-ui="surface-loading"]') !== null
+      for (const tracked of state.commonPrefix) {
+        if (!tracked.element.isConnected) {
+          state.commonPrefixDisconnectedIds.add(tracked.messageId)
+        }
+        const current = currentMessagesById.get(tracked.messageId)
+        if (current !== tracked.element) state.commonPrefixReplacedIds.add(tracked.messageId)
+      }
     }
-    const observer = new MutationObserver(sample)
+    const observer = new MutationObserver((records) => {
+      for (const record of records) {
+        for (const removed of record.removedNodes) {
+          for (const tracked of state.commonPrefix) {
+            if (
+              removed === tracked.element ||
+              (removed instanceof Element && removed.contains(tracked.element))
+            ) {
+              state.commonPrefixDisconnectedIds.add(tracked.messageId)
+            }
+          }
+        }
+      }
+      sample()
+    })
     observer.observe(content, { childList: true, subtree: true })
     sample()
     win.__messageCountSamples = state
     win.__stopMessageCountSamples = () => observer.disconnect()
-  })
+  }, options)
 }
 
 export async function stopMessageCountRecorder(page: Page): Promise<TranscriptContinuityResult> {
@@ -571,12 +570,25 @@ export async function stopMessageCountRecorder(page: Page): Promise<TranscriptCo
     win.__stopMessageCountSamples?.()
     delete win.__messageCountSamples
     delete win.__stopMessageCountSamples
+    const initialMessageCount = state.messageCounts[0] ?? 0
+    const expectedCommonPrefixCount = state.expectedCommonPrefixCount
     return {
       anchorRemoved: state.anchorRemoved,
       listRemoved: state.listRemoved,
       listReplaced: state.listReplaced,
       loadingSeen: state.loadingSeen,
+      messageCountDecreased: state.messageCounts.some((count) => count < initialMessageCount),
       messageCountsIncludeZero: state.messageCounts.includes(0),
+      minimumMessageCount: Math.min(...state.messageCounts),
+      ...(expectedCommonPrefixCount === null
+        ? {}
+        : {
+            commonPrefixDisconnectedIds: [...state.commonPrefixDisconnectedIds],
+            commonPrefixReplacedIds: [...state.commonPrefixReplacedIds],
+            messageCountBelowExpectedCommonPrefix: state.messageCounts.some(
+              (count) => count < expectedCommonPrefixCount,
+            ),
+          }),
     }
   })
 }
@@ -600,29 +612,60 @@ export async function waitForAssistantGenerationFinished(
 }
 
 export async function firstChatId(page: Page): Promise<string> {
-  return page.evaluate(async () => {
-    const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const req = indexedDB.open('natter')
-      req.onsuccess = () => resolve(req.result)
-      req.onerror = () => reject(req.error)
-    })
-    try {
-      return await new Promise<string>((resolve, reject) => {
-        const tx = db.transaction('chats', 'readonly')
-        const store = tx.objectStore('chats')
-        const req = store.getAll()
-        req.onsuccess = () => {
-          const rows = (req.result as Array<{ id: string; updatedAt: number }>).sort(
-            (a, b) => b.updatedAt - a.updatedAt,
-          )
-          resolve(rows[0]?.id ?? '')
+  const databaseName = await activeWorkspaceDatabaseName(page)
+  let chatId = ''
+  await expect
+    .poll(async () => {
+      chatId = await page.evaluate(async (databaseName) => {
+        const db = await new Promise<IDBDatabase>((resolve, reject) => {
+          const req = indexedDB.open(databaseName)
+          req.onsuccess = () => resolve(req.result)
+          req.onerror = () => reject(req.error)
+        })
+        try {
+          return await new Promise<string>((resolve, reject) => {
+            const tx = db.transaction('chats', 'readonly')
+            const store = tx.objectStore('chats')
+            const req = store.getAll()
+            req.onsuccess = () => {
+              const rows = (req.result as Array<{ id: string; updatedAt: number }>).sort(
+                (a, b) => b.updatedAt - a.updatedAt,
+              )
+              resolve(rows[0]?.id ?? '')
+            }
+            req.onerror = () => reject(req.error)
+          })
+        } finally {
+          db.close()
         }
-        req.onerror = () => reject(req.error)
+      }, databaseName)
+      return chatId
+    })
+    .not.toBe('')
+  return chatId
+}
+
+export async function readChatRow(page: Page, chatId: string): Promise<Record<string, unknown>> {
+  const databaseName = await activeWorkspaceDatabaseName(page)
+  return page.evaluate(
+    async ({ chatId, databaseName }) => {
+      const db = await new Promise<IDBDatabase>((resolve, reject) => {
+        const request = indexedDB.open(databaseName)
+        request.onsuccess = () => resolve(request.result)
+        request.onerror = () => reject(request.error)
       })
-    } finally {
-      db.close()
-    }
-  })
+      try {
+        return await new Promise<Record<string, unknown>>((resolve, reject) => {
+          const request = db.transaction('chats', 'readonly').objectStore('chats').get(chatId)
+          request.onsuccess = () => resolve(request.result as Record<string, unknown>)
+          request.onerror = () => reject(request.error)
+        })
+      } finally {
+        db.close()
+      }
+    },
+    { chatId, databaseName },
+  )
 }
 
 export async function clearIndexedDb(page: Page): Promise<void> {
@@ -631,50 +674,68 @@ export async function clearIndexedDb(page: Page): Promise<void> {
     route.fulfill({ contentType: 'text/html', body: '<!doctype html><title>Reset</title>' }),
   )
   try {
-    await page.goto('/__e2e-reset__')
+    await page.goto(absolutePageUrl(page, '/__e2e-reset__'))
   } finally {
     await page.unroute(resetRoute)
   }
   await page.evaluate(async () => {
-    window.sessionStorage.removeItem('natter:active-seed')
-    await new Promise<void>((resolve, reject) => {
-      const req = indexedDB.deleteDatabase('natter')
-      req.onsuccess = () => resolve()
-      req.onerror = () => reject(req.error)
-      req.onblocked = () => reject(new Error('IndexedDBDeleteBlocked:natter'))
-    })
+    window.localStorage.clear()
+    window.sessionStorage.clear()
+    const names = new Set(['natter', 'natter-control', 'natter-workspace-a', 'natter-workspace-b'])
+    if (typeof indexedDB.databases === 'function') {
+      for (const database of await indexedDB.databases()) {
+        if (database.name) names.add(database.name)
+      }
+    }
+    for (const name of [...names].sort()) {
+      await new Promise<void>((resolve, reject) => {
+        const req = indexedDB.deleteDatabase(name)
+        req.onsuccess = () => resolve()
+        req.onerror = () => reject(req.error)
+        req.onblocked = () => reject(new Error(`IndexedDBDeleteBlocked:${name}`))
+      })
+    }
   })
-  await page.goto('/')
+  await page.goto(absolutePageUrl(page, '/'))
   await page.locator('#root > *').first().waitFor()
 }
 
 export async function importIndexedDbDump(page: Page, dump: IndexedDbDump): Promise<void> {
-  await page.goto('/')
-  await page.evaluate(async (dump) => {
-    const req = indexedDB.open(dump.dbName || 'natter')
-    const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      req.onsuccess = () => resolve(req.result)
-      req.onerror = () => reject(req.error)
-    })
-    try {
-      const storeNames = Array.from(db.objectStoreNames)
-      const writableStores = Object.keys(dump.stores).filter((name) => storeNames.includes(name))
-      if (writableStores.length === 0) return
-      await new Promise<void>((resolve, reject) => {
-        const tx = db.transaction(writableStores, 'readwrite')
-        for (const storeName of writableStores) {
-          const store = tx.objectStore(storeName)
-          store.clear()
-          const rows = dump.stores[storeName] ?? []
-          for (const row of rows) store.put(row)
-        }
-        tx.oncomplete = () => resolve()
-        tx.onerror = () => reject(tx.error)
-        tx.onabort = () => reject(tx.error)
+  await page.goto(absolutePageUrl(page, '/'))
+  const databaseName = await activeWorkspaceDatabaseName(page)
+  await page.evaluate(
+    async ({ databaseName, dump }) => {
+      const req = indexedDB.open(databaseName)
+      const db = await new Promise<IDBDatabase>((resolve, reject) => {
+        req.onsuccess = () => resolve(req.result)
+        req.onerror = () => reject(req.error)
       })
-    } finally {
-      db.close()
-    }
-  }, dump)
+      try {
+        const storeNames = Array.from(db.objectStoreNames)
+        const writableStores = Object.keys(dump.stores).filter((name) => storeNames.includes(name))
+        if (writableStores.length === 0) return
+        await new Promise<void>((resolve, reject) => {
+          const tx = db.transaction(writableStores, 'readwrite')
+          for (const storeName of writableStores) {
+            const store = tx.objectStore(storeName)
+            store.clear()
+            const rows = dump.stores[storeName] ?? []
+            for (const row of rows) store.put(row)
+          }
+          tx.oncomplete = () => resolve()
+          tx.onerror = () => reject(tx.error)
+          tx.onabort = () => reject(tx.error)
+        })
+      } finally {
+        db.close()
+      }
+    },
+    { databaseName, dump },
+  )
   await page.reload()
+}
+
+function absolutePageUrl(page: Page, path: string): string {
+  if (page.url() === 'about:blank') return path
+  return new URL(path, page.url()).href
 }

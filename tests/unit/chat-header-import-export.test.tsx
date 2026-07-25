@@ -1,23 +1,64 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { createChat } from '../helpers/chats'
 import 'fake-indexeddb/auto'
 import Dexie from 'dexie'
 import { IDBFactory } from 'fake-indexeddb'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
+import type { UsePrivacyRoutingResult } from '../../src/hooks/useModelCatalog'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
 import { __resetBrowserRepositoryForTests } from '../../src/store/browser-repo'
-import { createChat } from '../../src/store/chats'
+
 import { __resetDbForTests, openDb } from '../../src/store/db'
-import { useChatStore } from '../../src/store/zustand/chatStore'
+import { readBrowserWorkspaceMeta } from '../../src/store/workspace-meta'
+import { workspaceRuntimeInternal } from '../../src/store/workspace-runtime'
 import { useToastStore } from '../../src/store/zustand/toastStore'
 import { ChatHeader } from '../../src/ui/chat/ChatHeader'
 
 const DB_NAME = 'natter'
+const PRIVACY_ROUTING: UsePrivacyRoutingResult = {
+  filter: null,
+  wire: null,
+  effectiveRouting: null,
+  endpoints: [],
+  descriptor: null,
+  capability: null,
+  modelAvailable: null,
+  loading: false,
+  offline: false,
+  error: null,
+  scrapeApplicable: false,
+  liveScrapeEnabled: false,
+  isFreeModel: false,
+  capabilityPresentation: {
+    profileId: null,
+    profile: null,
+    modelId: null,
+    settings: null,
+    endpoints: [],
+    descriptor: null,
+    capability: null,
+    effectiveRouting: null,
+    modelAvailable: null,
+    retained: false,
+  },
+  privacyPresentation: {
+    profileId: null,
+    profile: null,
+    modelId: null,
+    settings: null,
+    filter: null,
+    endpoints: [],
+    scrapeApplicable: false,
+    isFreeModel: false,
+    retained: false,
+  },
+  refresh: () => {},
+}
 
 async function resetAll() {
   __resetBrowserRepositoryForTests()
-  __resetBroadcastForTests()
-  __resetDbForTests()
-  useChatStore.getState().reset()
+  __resetBroadcastForTests({ admissionsOpen: true })
+  __resetDbForTests({ admissionsOpen: true })
   useToastStore.getState().reset()
   await Dexie.delete(DB_NAME)
 }
@@ -56,15 +97,24 @@ function mockBlobDownloads() {
 }
 
 describe('ChatHeader import/export controls', () => {
-  beforeEach(async () => {
+  beforeAll(async () => {
     ;(globalThis as unknown as { indexedDB: IDBFactory }).indexedDB = new IDBFactory()
     await resetAll()
-    await openDb()
+    const db = await openDb()
+    const fence = await readBrowserWorkspaceMeta(db)
+    if (workspaceRuntimeInternal.snapshot().state === 'STARTING') {
+      workspaceRuntimeInternal.beginReconciliation(fence)
+      workspaceRuntimeInternal.finishReconciliation(fence)
+    }
   })
 
-  afterEach(async () => {
+  afterEach(() => {
     cleanup()
     vi.restoreAllMocks()
+    useToastStore.getState().reset()
+  })
+
+  afterAll(async () => {
     await resetAll()
   })
 
@@ -73,7 +123,13 @@ describe('ChatHeader import/export controls', () => {
     const downloads = mockBlobDownloads()
     try {
       render(
-        <ChatHeader chatId={chat.id} settingsOpen={false} onToggleSettings={() => undefined} />,
+        <ChatHeader
+          chat={chat}
+          paintedBranchLeafId={null}
+          privacyRouting={PRIVACY_ROUTING}
+          settingsOpen={false}
+          onToggleSettings={() => undefined}
+        />,
       )
 
       fireEvent.click(await screen.findByRole('button', { name: 'Export chat JSON' }))
@@ -97,7 +153,9 @@ describe('ChatHeader import/export controls', () => {
     const onToggleTreeView = vi.fn()
     const { container, rerender } = render(
       <ChatHeader
-        chatId={chat.id}
+        chat={chat}
+        paintedBranchLeafId={null}
+        privacyRouting={PRIVACY_ROUTING}
         settingsOpen={false}
         onToggleSettings={() => undefined}
         editTreeActive={false}
@@ -132,7 +190,9 @@ describe('ChatHeader import/export controls', () => {
 
     rerender(
       <ChatHeader
-        chatId={chat.id}
+        chat={chat}
+        paintedBranchLeafId={null}
+        privacyRouting={PRIVACY_ROUTING}
         settingsOpen={false}
         onToggleSettings={() => undefined}
         editTreeActive={false}

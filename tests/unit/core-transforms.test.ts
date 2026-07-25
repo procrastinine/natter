@@ -1,7 +1,77 @@
 import { describe, expect, it } from 'vitest'
+import {
+  buildChatMessages as buildChatMessagesWithContract,
+  toChatCompletions as toChatCompletionsWithContract,
+} from '../../src/api/request-transforms'
+import { resolveBundledCapability } from '../../src/capabilities'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
-import { buildChatMessages, toChatCompletions } from '../../src/core/transforms'
-import type { CapabilityDescriptor, ChatSettings, Message, MessageRole } from '../../src/core/types'
+import {
+  type PrefillPlan,
+  resolveEffectiveEndpointRouting,
+} from '../../src/core/effective-endpoint-routing'
+import { TEXT_PROVIDER_OUTPUT_CONTRACT } from '../../src/core/provider-tool-context'
+import { EMPTY_MESSAGE_CONTEXT_ROUTE_FACTS } from '../../src/core/reasoning'
+import type {
+  CapabilityDescriptor,
+  ChatSettings,
+  ConnectionProfile,
+  Message,
+  MessageRole,
+} from '../../src/core/types'
+import { chatReasoningContractForSettings } from '../helpers/reasoning-contracts'
+
+type ChatOptions = Omit<
+  Parameters<typeof toChatCompletionsWithContract>[2],
+  'reasoning' | 'providerOutput' | 'prefillPlan'
+> & {
+  reasoning?: Parameters<typeof toChatCompletionsWithContract>[2]['reasoning']
+  providerOutput?: Parameters<typeof toChatCompletionsWithContract>[2]['providerOutput']
+  prefillPlan?: PrefillPlan
+}
+
+const OPENROUTER_PREFILL_PLAN: PrefillPlan = {
+  availability: 'supported',
+  continueStrategy: 'prefill',
+  request: 'send-once',
+  semanticRetry: 'never',
+  serialization: { kind: 'assistant-tail', marker: 'none' },
+  basis: 'transport',
+}
+
+function toChatCompletions(
+  settings: Parameters<typeof toChatCompletionsWithContract>[0],
+  path: Parameters<typeof toChatCompletionsWithContract>[1],
+  options: ChatOptions = {},
+) {
+  return toChatCompletionsWithContract(settings, path, {
+    ...options,
+    reasoning: options.reasoning ?? chatReasoningContractForSettings(settings),
+    providerOutput: options.providerOutput ?? TEXT_PROVIDER_OUTPUT_CONTRACT,
+    prefillPlan: options.prefillPlan ?? OPENROUTER_PREFILL_PLAN,
+  })
+}
+
+type BuildMessagesOptions = Omit<
+  Parameters<typeof buildChatMessagesWithContract>[2],
+  'reasoning' | 'providerOutput' | 'prefillPlan'
+> & {
+  reasoning?: Parameters<typeof buildChatMessagesWithContract>[2]['reasoning']
+  providerOutput?: Parameters<typeof buildChatMessagesWithContract>[2]['providerOutput']
+  prefillPlan?: PrefillPlan
+}
+
+function buildChatMessages(
+  settings: Parameters<typeof buildChatMessagesWithContract>[0],
+  path: Parameters<typeof buildChatMessagesWithContract>[1],
+  options: BuildMessagesOptions = {},
+) {
+  return buildChatMessagesWithContract(settings, path, {
+    ...options,
+    reasoning: options.reasoning ?? chatReasoningContractForSettings(settings),
+    providerOutput: options.providerOutput ?? TEXT_PROVIDER_OUTPUT_CONTRACT,
+    prefillPlan: options.prefillPlan ?? OPENROUTER_PREFILL_PLAN,
+  })
+}
 
 function textMessage(
   overrides: Partial<Message> & { id: string; role: MessageRole; text: string },
@@ -347,6 +417,69 @@ describe('toChatCompletions', () => {
     expect(wire.messages).toEqual([
       { role: 'user', content: 'hi' },
       { role: 'assistant', content: 'Sure,' },
+    ])
+  })
+
+  it.each([
+    'partial',
+    'prefix',
+  ] as const)('serializes only the sealed direct-provider %s marker', (marker) => {
+    const path = [
+      textMessage({ id: 'u1', role: 'user', text: 'hi' }),
+      textMessage({ id: 'a1', role: 'assistant', text: 'Sure,', origin: 'prefill' }),
+    ]
+    const { wire } = toChatCompletions(settings(), path, {
+      prefillPlan: {
+        availability: 'supported',
+        continueStrategy: 'prefill',
+        request: 'send-once',
+        semanticRetry: 'never',
+        serialization: { kind: 'assistant-tail', marker },
+        basis: 'endpoint-capability',
+      },
+    })
+    expect(wire.messages).toEqual([
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', content: 'Sure,', [marker]: true },
+    ])
+  })
+
+  it('carries a saved per-model connection capability through routing to the wire', () => {
+    const chatSettings = settings({ model: 'z-ai/glm-5.1' })
+    const profile: ConnectionProfile = {
+      id: 'prof',
+      name: 'Custom',
+      kind: 'custom',
+      baseUrl: 'https://example.test/v1',
+      defaultHeaders: {},
+      appTitle: '',
+      appUrl: '',
+      supportsEndpointsApi: false,
+      supportsGenerationApi: false,
+      supportsPrivacyScrape: false,
+      capabilityOverrides: {
+        [chatSettings.model]: { prefill: { kind: 'assistant-tail', marker: 'partial' } },
+      },
+      createdAt: 0,
+      updatedAt: 0,
+    }
+    const capability = resolveBundledCapability(profile, chatSettings.model)
+    const routing = resolveEffectiveEndpointRouting({
+      profile,
+      settings: chatSettings,
+      contextFacts: EMPTY_MESSAGE_CONTEXT_ROUTE_FACTS,
+      capability,
+    })
+    const path = [
+      textMessage({ id: 'u1', role: 'user', text: 'hi' }),
+      textMessage({ id: 'a1', role: 'assistant', text: 'Sure,', origin: 'prefill' }),
+    ]
+    const { wire } = toChatCompletions(chatSettings, path, {
+      prefillPlan: routing.prefillPlan,
+    })
+    expect(wire.messages).toEqual([
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', content: 'Sure,', partial: true },
     ])
   })
 

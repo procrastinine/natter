@@ -8,26 +8,25 @@
 // chat only" is the default); the preset picker offers load / overwrite /
 // save-as-new / rename / delete.
 import type { ReactNode } from 'react'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import { estimateTokensByTokenizer } from '../../core/tokens'
-import type { Chat, ChatSettings, PromptPreset, PromptPresetKind } from '../../core/types'
-import { updateChatSettings } from '../../store/chats'
+import type { Chat, ChatSettings, PromptPresetKind } from '../../core/types'
+import { usePromptPresetCatalog } from '../../hooks/useConfigurationCatalog'
+import { useSettledConfigurationEdit } from '../../hooks/useSettledConfigurationEdit'
+import { configurationApplication } from '../../store/configuration-application'
 import {
-  bumpPromptPresetLastUsedAt,
-  createPromptPreset,
-  deletePromptPreset,
-  listPromptPresets,
-  registerPromptSettingSaveFlusher,
-  trackPendingPromptSettingSave,
-  updatePromptPreset,
-} from '../../store/prompt-presets'
-import { allTable } from '../../store/reactive-dependencies'
-import { useRepositoryQuery } from '../../store/reactive-query'
+  configurationController,
+  currentActiveConfigurationSelection,
+} from '../../store/configuration-controller'
+import type { ConfigurationPromptPresetCatalogRow } from '../../store/presentation-contracts'
+import { claimWorkspaceTabOneShotNotice } from '../../store/workspace-tab-session'
 import { useToastStore } from '../../store/zustand/toastStore'
 import { Button, IconButton } from '../primitives/Button'
 import { InfoDisclosure } from './InfoDisclosure'
 
 const SAVE_DEBOUNCE_MS = 300
+const EMPTY_PROMPT_PRESET_ROWS: readonly ConfigurationPromptPresetCatalogRow[] = Object.freeze([])
+const EMPTY_PROMPT_PRESET_IDS: readonly string[] = Object.freeze([])
 
 interface Slot<K extends PromptPresetKind> {
   kind: K
@@ -38,8 +37,13 @@ interface Slot<K extends PromptPresetKind> {
 interface SlotState {
   draft: string
   setDraft: (v: string) => void
-  pinnedPreset: PromptPreset | null
-  presets: readonly PromptPreset[]
+  pinnedPreset: ConfigurationPromptPresetCatalogRow | null
+  presets: readonly ConfigurationPromptPresetCatalogRow[]
+  presetsLoading: boolean
+  presetsHavePrevious: boolean
+  presetsHaveMore: boolean
+  loadPreviousPresets: () => void
+  loadMorePresets: () => void
   tokens: number
   toastVisible: boolean
   pickerOpen: boolean
@@ -55,7 +59,7 @@ interface SlotState {
 interface UsePromptSlotOpts {
   showTokens: boolean
   // When set, a one-off toast fires the first time the user commits a local
-  // edit in this browser session. Keyed in sessionStorage by this string.
+  // edit in this browser session. Claimed by the tab-session owner.
   firstEditToastKey?: string
 }
 
@@ -64,58 +68,38 @@ function usePromptSlot(
   slot: Slot<PromptPresetKind>,
   opts: UsePromptSlotOpts,
 ): SlotState {
-  const { kind, textKey, pinKey } = slot
+  const { kind } = slot
   const storedText = (chat.settings[slot.textKey] as string | undefined) ?? ''
   const pinnedId = chat.settings[slot.pinKey] as string | undefined
 
-  const [draft, setDraft] = useState(storedText)
-  const draftRef = useRef(storedText)
-  const lastPersistedRef = useRef(storedText)
-  const saveTailRef = useRef<Promise<void>>(Promise.resolve())
-  const lastScheduledRef = useRef<{
-    text: string
-    pinnedId: string | undefined
-    promise: Promise<boolean>
-  } | null>(null)
-  const scheduledSaveCountRef = useRef(0)
   const mountedRef = useRef(true)
   const [estimateText, setEstimateText] = useState(storedText)
   const [pickerOpen, setPickerOpen] = useState(false)
   const [toastVisible, setToastVisible] = useState(false)
   const toastTimerRef = useRef<number | null>(null)
 
-  const presets = useRepositoryQuery(
-    JSON.stringify(['prompt-presets', slot.kind]),
-    () => listPromptPresets(slot.kind),
-    [] as PromptPreset[],
-    allTable('promptPresets'),
+  const configuration = useSyncExternalStore(
+    configurationController.subscribe,
+    configurationController.getSnapshot,
+    configurationController.getSnapshot,
   )
+  const addressedPresetIds = useMemo(
+    () => (pinnedId ? [pinnedId] : EMPTY_PROMPT_PRESET_IDS),
+    [pinnedId],
+  )
+  const presetCatalogResult = usePromptPresetCatalog(kind, pickerOpen, addressedPresetIds)
+  const presetCatalog = presetCatalogResult.snapshot
+  const presets = presetCatalog?.page.rows ?? EMPTY_PROMPT_PRESET_ROWS
+  const presetsLoading = pickerOpen && presetCatalog?.interactive !== true
+  const activeSelection = currentActiveConfigurationSelection(configuration.frame)
+  const pinnedSummaries =
+    activeSelection?.target.kind === 'chat' && activeSelection.target.chatId === chat.id
+      ? activeSelection.value.promptPresets
+      : EMPTY_PROMPT_PRESET_ROWS
   const pushToast = useToastStore((s) => s.push)
 
-  const setDraftValue = useCallback((value: string) => {
-    draftRef.current = value
-    setDraft(value)
-  }, [])
-
-  useEffect(() => {
-    if (storedText === lastPersistedRef.current) return
-    if (draftRef.current !== lastPersistedRef.current) return
-    if (scheduledSaveCountRef.current > 0) return
-    lastPersistedRef.current = storedText
-    setDraftValue(storedText)
-    setEstimateText(storedText)
-  }, [setDraftValue, storedText])
-
-  useEffect(() => {
-    if (!opts.showTokens) return
-    const id = window.setTimeout(() => setEstimateText(draft), 120)
-    return () => window.clearTimeout(id)
-  }, [draft, opts.showTokens])
-
   const showFirstEditToast = useCallback(() => {
-    if (!opts.firstEditToastKey || typeof window === 'undefined') return
-    if (window.sessionStorage.getItem(opts.firstEditToastKey)) return
-    window.sessionStorage.setItem(opts.firstEditToastKey, '1')
+    if (!opts.firstEditToastKey || !claimWorkspaceTabOneShotNotice(opts.firstEditToastKey)) return
     if (!mountedRef.current) return
     setToastVisible(true)
     if (toastTimerRef.current !== null) window.clearTimeout(toastTimerRef.current)
@@ -125,79 +109,44 @@ function usePromptSlot(
     }, 4000)
   }, [opts.firstEditToastKey])
 
-  const enqueueChatSave = useCallback(
-    (text: string, targetPinnedId: string | undefined, localEdit: boolean): Promise<boolean> => {
-      const scheduled = lastScheduledRef.current
-      if (scheduled?.text === text && scheduled.pinnedId === targetPinnedId) {
-        return scheduled.promise
-      }
-
-      scheduledSaveCountRef.current += 1
-      const operation = saveTailRef.current
-        .catch(() => undefined)
-        .then(async () => {
-          const saved = await updateChatSettings(chat.id, {
-            [textKey]: text,
-            [pinKey]: targetPinnedId,
-          })
-          lastPersistedRef.current = text
-          if (saved && localEdit) showFirstEditToast()
-          return saved
-        })
-      const tracked = trackPendingPromptSettingSave(chat.id, operation)
-      lastScheduledRef.current = { text, pinnedId: targetPinnedId, promise: tracked }
-      saveTailRef.current = tracked.then(
-        () => undefined,
-        () => undefined,
-      )
-      const settle = () => {
-        scheduledSaveCountRef.current -= 1
-        if (lastScheduledRef.current?.promise === tracked) lastScheduledRef.current = null
-      }
-      void tracked.then(settle, settle)
-      return tracked
+  const edit = useSettledConfigurationEdit({
+    ownerChatId: chat.id,
+    fieldKey: `prompt.${kind}`,
+    storedValue: storedText,
+    settleMs: SAVE_DEBOUNCE_MS,
+    stage: (text) => configurationController.stagePromptField(chat.id, kind, text),
+    async commit(text) {
+      const result = await configurationApplication.commitPromptText(chat.id, kind, text)
+      if (result.kind === 'prompt-preset-saved') showFirstEditToast()
     },
-    [chat.id, pinKey, showFirstEditToast, textKey],
-  )
+  })
+  const draft = edit.value
 
-  const flushDraft = useCallback(async () => {
-    const text = draftRef.current
-    const scheduled = lastScheduledRef.current
-    if (scheduled?.text === text && scheduled.pinnedId === undefined) {
-      await scheduled.promise
-      return
-    }
-    if (!scheduled && text === lastPersistedRef.current) return
-    await enqueueChatSave(text, undefined, true)
-  }, [enqueueChatSave])
+  useEffect(() => {
+    if (!opts.showTokens) return
+    const id = window.setTimeout(() => setEstimateText(draft), 120)
+    return () => window.clearTimeout(id)
+  }, [draft, opts.showTokens])
 
-  const flushDraftRef = useRef(flushDraft)
-  flushDraftRef.current = flushDraft
+  const flushDraft = edit.flush
 
   useEffect(() => {
     mountedRef.current = true
-    const unregister = registerPromptSettingSaveFlusher(chat.id, () => flushDraftRef.current())
     return () => {
       mountedRef.current = false
       if (toastTimerRef.current !== null) window.clearTimeout(toastTimerRef.current)
-      void flushDraftRef
-        .current()
-        .catch(() => undefined)
-        .finally(unregister)
     }
-  }, [chat.id])
-
-  useEffect(() => {
-    if (draft === lastPersistedRef.current && !lastScheduledRef.current) return
-    const id = window.setTimeout(() => {
-      void flushDraft().catch(() => undefined)
-    }, SAVE_DEBOUNCE_MS)
-    return () => window.clearTimeout(id)
-  }, [draft, flushDraft])
+  }, [])
 
   const pinnedPreset = useMemo(
-    () => (pinnedId ? (presets.find((p) => p.id === pinnedId) ?? null) : null),
-    [pinnedId, presets],
+    () =>
+      pinnedId
+        ? (pinnedSummaries.find((preset) => preset.id === pinnedId) ??
+          presetCatalog?.page.addressedRows.find((preset) => preset.id === pinnedId)?.row ??
+          presets.find((preset) => preset.id === pinnedId) ??
+          null)
+        : null,
+    [pinnedId, pinnedSummaries, presetCatalog?.page.addressedRows, presets],
   )
 
   const tokens = useMemo(
@@ -216,28 +165,26 @@ function usePromptSlot(
 
   const loadPreset = useCallback(
     async (targetId: string) => {
-      const target = presets.find((p) => p.id === targetId)
-      if (!target) return
+      if (!presets.some((preset) => preset.id === targetId)) return
       if (!(await flushDraftBeforeAction())) return
       try {
-        await enqueueChatSave(target.text, target.id, false)
+        const result = await configurationApplication.loadPromptPreset(chat.id, targetId)
+        if (result.kind !== 'prompt-preset-saved' || !result.preset) return
+        edit.acceptValue(result.preset.text)
+        setEstimateText(result.preset.text)
+        setPickerOpen(false)
       } catch {
         return
       }
-      setDraftValue(target.text)
-      setEstimateText(target.text)
-      await bumpPromptPresetLastUsedAt(target.id)
-      setPickerOpen(false)
     },
-    [enqueueChatSave, flushDraftBeforeAction, presets, setDraftValue],
+    [chat.id, edit, flushDraftBeforeAction, presets],
   )
 
   const saveToExisting = useCallback(
     async (targetId: string, presetName: string) => {
       if (!(await flushDraftBeforeAction())) return
       try {
-        await updatePromptPreset(targetId, { text: draftRef.current })
-        await updateChatSettings(chat.id, { [pinKey]: targetId })
+        await configurationApplication.overwriteAndPinPromptPreset(chat.id, targetId, edit.value)
         pushToast({
           level: 'info',
           text: `Saved to "${presetName}".`,
@@ -248,7 +195,7 @@ function usePromptSlot(
         return
       }
     },
-    [chat.id, flushDraftBeforeAction, pinKey, pushToast],
+    [chat.id, edit.value, flushDraftBeforeAction, pushToast],
   )
 
   const saveAsNew = useCallback(
@@ -257,13 +204,15 @@ function usePromptSlot(
       const name = window.prompt(`Name for new ${promptTitle.toLowerCase()} preset:`)
       if (!name?.trim()) return
       try {
-        const created = await createPromptPreset({
+        const result = await configurationApplication.createAndPinPromptPreset({
+          chatId: chat.id,
           kind,
           name: name.trim(),
-          text: draftRef.current,
-          lastUsedAt: Date.now(),
+          text: edit.value,
         })
-        await updateChatSettings(chat.id, { [pinKey]: created.id })
+        if (result.kind !== 'prompt-preset-saved') return
+        const created = result.preset
+        if (!created) return
         pushToast({
           level: 'info',
           text: `Created preset "${created.name}".`,
@@ -274,14 +223,14 @@ function usePromptSlot(
         return
       }
     },
-    [chat.id, flushDraftBeforeAction, kind, pinKey, pushToast],
+    [chat.id, edit.value, flushDraftBeforeAction, kind, pushToast],
   )
 
   const renamePreset = useCallback(async (targetId: string, currentName: string) => {
     const name = window.prompt('Rename preset:', currentName)
     if (!name?.trim() || name === currentName) return
     try {
-      await updatePromptPreset(targetId, { name: name.trim() })
+      await configurationApplication.renamePromptPreset(targetId, name.trim())
     } catch {
       return
     }
@@ -292,7 +241,7 @@ function usePromptSlot(
       return
     }
     try {
-      await deletePromptPreset(targetId)
+      await configurationApplication.deletePromptPreset(targetId)
     } catch {
       return
     }
@@ -300,9 +249,14 @@ function usePromptSlot(
 
   return {
     draft,
-    setDraft: setDraftValue,
+    setDraft: edit.setValue,
     pinnedPreset,
     presets,
+    presetsLoading,
+    presetsHavePrevious: Boolean(presetCatalog?.page.previousCursor),
+    presetsHaveMore: Boolean(presetCatalog?.page.nextCursor),
+    loadPreviousPresets: presetCatalogResult.demandBefore,
+    loadMorePresets: presetCatalogResult.demandAfter,
     tokens,
     toastVisible,
     pickerOpen,
@@ -366,6 +320,11 @@ export function SystemPromptEditor({
             setOpen={s.setPickerOpen}
             pinnedPreset={s.pinnedPreset}
             presets={s.presets}
+            loading={s.presetsLoading}
+            hasPrevious={s.presetsHavePrevious}
+            hasMore={s.presetsHaveMore}
+            onLoadPrevious={s.loadPreviousPresets}
+            onLoadMore={s.loadMorePresets}
             onLoad={(id) => void s.loadPreset(id)}
             onSaveToExisting={(id, name) => void s.saveToExisting(id, name)}
             onSaveAsNew={() => void s.saveAsNew('system prompt')}
@@ -454,6 +413,11 @@ export function AppendPromptEditor({
             setOpen={s.setPickerOpen}
             pinnedPreset={s.pinnedPreset}
             presets={s.presets}
+            loading={s.presetsLoading}
+            hasPrevious={s.presetsHavePrevious}
+            hasMore={s.presetsHaveMore}
+            onLoadPrevious={s.loadPreviousPresets}
+            onLoadMore={s.loadMorePresets}
             onLoad={(id) => void s.loadPreset(id)}
             onSaveToExisting={(id, name) => void s.saveToExisting(id, name)}
             onSaveAsNew={() => void s.saveAsNew('append prompt')}
@@ -537,6 +501,11 @@ export function PrefillPromptEditor({
             setOpen={s.setPickerOpen}
             pinnedPreset={s.pinnedPreset}
             presets={s.presets}
+            loading={s.presetsLoading}
+            hasPrevious={s.presetsHavePrevious}
+            hasMore={s.presetsHaveMore}
+            onLoadPrevious={s.loadPreviousPresets}
+            onLoadMore={s.loadMorePresets}
             onLoad={(id) => void s.loadPreset(id)}
             onSaveToExisting={(id, name) => void s.saveToExisting(id, name)}
             onSaveAsNew={() => void s.saveAsNew('default prefill')}
@@ -617,6 +586,11 @@ export function ContinueSystemPromptEditor({
             setOpen={s.setPickerOpen}
             pinnedPreset={s.pinnedPreset}
             presets={s.presets}
+            loading={s.presetsLoading}
+            hasPrevious={s.presetsHavePrevious}
+            hasMore={s.presetsHaveMore}
+            onLoadPrevious={s.loadPreviousPresets}
+            onLoadMore={s.loadMorePresets}
             onLoad={(id) => void s.loadPreset(id)}
             onSaveToExisting={(id, name) => void s.saveToExisting(id, name)}
             onSaveAsNew={() => void s.saveAsNew('continue system prompt')}
@@ -692,6 +666,11 @@ export function ContinueUserPromptEditor({
             setOpen={s.setPickerOpen}
             pinnedPreset={s.pinnedPreset}
             presets={s.presets}
+            loading={s.presetsLoading}
+            hasPrevious={s.presetsHavePrevious}
+            hasMore={s.presetsHaveMore}
+            onLoadPrevious={s.loadPreviousPresets}
+            onLoadMore={s.loadMorePresets}
             onLoad={(id) => void s.loadPreset(id)}
             onSaveToExisting={(id, name) => void s.saveToExisting(id, name)}
             onSaveAsNew={() => void s.saveAsNew('continue user prompt')}
@@ -727,8 +706,13 @@ export function ContinueUserPromptEditor({
 interface PickerProps {
   open: boolean
   setOpen: (v: boolean) => void
-  pinnedPreset: PromptPreset | null
-  presets: readonly PromptPreset[]
+  pinnedPreset: ConfigurationPromptPresetCatalogRow | null
+  presets: readonly ConfigurationPromptPresetCatalogRow[]
+  loading: boolean
+  hasPrevious: boolean
+  hasMore: boolean
+  onLoadPrevious: () => void
+  onLoadMore: () => void
   onLoad: (id: string) => void
   onSaveToExisting: (id: string, name: string) => void
   onSaveAsNew: () => void
@@ -741,6 +725,11 @@ function PromptPresetPicker({
   setOpen,
   pinnedPreset,
   presets,
+  loading,
+  hasPrevious,
+  hasMore,
+  onLoadPrevious,
+  onLoadMore,
   onLoad,
   onSaveToExisting,
   onSaveAsNew,
@@ -765,9 +754,16 @@ function PromptPresetPicker({
       {open ? (
         <div data-ui="prompt-preset-picker-menu" role="menu">
           {presets.length === 0 ? (
-            <p data-ui="helper">No presets of this kind yet.</p>
+            <p data-ui="helper">{loading ? 'Loading presets…' : 'No presets of this kind yet.'}</p>
           ) : (
             <ul>
+              {hasPrevious ? (
+                <li data-ui="configuration-catalog-boundary">
+                  <Button type="button" data-ui="field-inline-action" onClick={onLoadPrevious}>
+                    Earlier presets…
+                  </Button>
+                </li>
+              ) : null}
               {presets.map((p) => {
                 const isCurrent = pinnedPreset?.id === p.id
                 return (
@@ -812,6 +808,13 @@ function PromptPresetPicker({
                   </li>
                 )
               })}
+              {hasMore ? (
+                <li data-ui="configuration-catalog-boundary">
+                  <Button type="button" data-ui="field-inline-action" onClick={onLoadMore}>
+                    More presets…
+                  </Button>
+                </li>
+              ) : null}
             </ul>
           )}
           <div data-ui="preset-menu-footer">

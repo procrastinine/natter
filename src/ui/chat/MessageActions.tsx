@@ -15,23 +15,16 @@
 // content block for a textarea cleanly.
 
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { cursorKeyOf } from '../../core/active-path'
-import { hasAppliedSuccessfulContinuation } from '../../core/continuation-content'
-import { structuralEffectsCursorPatch, structuralEffectsUndoCursorPatch } from '../../core/messages'
-import type { Message } from '../../core/types'
-import { applyStructuralSnapshot } from '../../core/undo'
+import type { ConversationDeleteMode } from '../../app/conversation-actions'
+import type { ConversationMutationSettlement } from '../../app/presentation-interactions'
+import type { AppliedMessageView } from '../../core/continuation-content'
 import {
-  deletePairOp,
-  deleteSingleOp,
-  deleteTurnOp,
-  deleteVariantOp,
-} from '../../hooks/useMessageOps'
-// The type imports above are used by the props interface even when the
-// runtime references shrink; leaving them here keeps the component's
-// public contract readable from a single file.
-import { useChatStore } from '../../store/zustand/chatStore'
-import { useToastStore } from '../../store/zustand/toastStore'
-import { useUiStore } from '../../store/zustand/uiStore'
+  type GenerationCapability,
+  generationCapabilityAvailable,
+  generationCapabilityBlockedReason,
+} from '../../core/interaction-capability'
+import type { Message } from '../../core/types'
+import type { GenerationStartResult } from '../../store/presentation-contracts'
 import {
   BranchIcon,
   CheckIcon,
@@ -53,6 +46,7 @@ const COPY_CONFIRM_MS = 2500
 
 interface MessageActionsProps {
   message: Message
+  appliedView: AppliedMessageView
   showInfo: boolean
   onToggleInfo: () => void
   // In-tab editing swap: <Message> renders InlineEditor when `isEditing` is
@@ -63,167 +57,57 @@ interface MessageActionsProps {
   // Permission flags. The buttons stay VISIBLE (discoverable) but
   // disabled with a tooltip so the user understands why the action
   // can't run right now.
-  hasConnection: boolean
+  regenerateCapability: GenerationCapability
+  continueCapability: GenerationCapability
   generationBusy?: boolean
   streamTargetBusy?: boolean
+  mutationDisabled?: boolean
+  structuralDisabled?: boolean
   disabledReason?: string
   // Structural ops.
-  onRegenerate?: () => void | Promise<void>
-  onContinue?: () => void | Promise<void>
+  onRegenerate?: () => GenerationStartResult
+  onContinue?: () => GenerationStartResult
   // The per-message branch action forks the chat from this node into a
-  // brand-new chat row (core/chat-fork.ts). There is NO separate in-tree
+  // brand-new chat row (store/chat-fork.ts). There is NO separate in-tree
   // branch-sibling button — alternate siblings come from regenerate /
   // edit-&-send / insert-sibling (in edit-tree mode).
-  onForkChat?: () => void | Promise<void>
-  onToggleContextVisibility?: () => void | Promise<void>
+  onForkChat?: () => ConversationMutationSettlement
+  onToggleContextVisibility?: () => ConversationMutationSettlement
   // Copy override — if unset, falls back to a navigator.clipboard write
   // of the plaintext content.
   onCopy?: () => void | Promise<void>
-  // Chat-scoped deletion context. Passed through from the list because
-  // the delete helpers need the active chat to compute the pair / turn chain.
-  chatId: string
+  onDelete: (mode: ConversationDeleteMode) => ConversationMutationSettlement
   roleMismatch?: boolean
-}
-
-// Shared delete workflow: execute with atomic pre-image → toast w/ undo. Used by
-// both the default row (pair/single via confirm dialog) and the edit-tree
-// structural row (variant/turn direct).
-function useRunDelete(chatId: string, message: Message, roleMismatch: boolean | undefined) {
-  const cascadeDelete = useUiStore((s) => s.cascadeDelete)
-  const pushToast = useToastStore((s) => s.push)
-  return useCallback(
-    async (kind: 'pair' | 'variant' | 'turn' | 'single') => {
-      const chatStore = useChatStore.getState()
-      const navigationIntent = chatStore.beginNavigationIntent(chatId)
-      const committedPathProducer = chatStore.registerCommittedPathProducer(
-        chatId,
-        navigationIntent,
-      )
-      if (!committedPathProducer) return
-      // Role-mismatched adjacencies almost always want a single-node
-      // delete: the user is cleaning up the one stray turn that
-      // delete-splice produced. Pair-delete would eat the NEIGHBORING
-      // valid message too, which is the opposite of the user's intent.
-      const effectiveKind: 'pair' | 'variant' | 'turn' | 'single' =
-        kind === 'pair' && roleMismatch ? 'single' : kind
-      const op =
-        effectiveKind === 'pair'
-          ? deletePairOp
-          : effectiveKind === 'turn'
-            ? deleteTurnOp
-            : effectiveKind === 'variant'
-              ? deleteVariantOp
-              : deleteSingleOp
-      const priorCursor = useChatStore.getState().getCursor(chatId) ?? {}
-      let result: Awaited<ReturnType<typeof op>> | undefined
-      try {
-        result = await op({
-          chatId,
-          messageId: message.id,
-          cursor: priorCursor,
-          ...(cascadeDelete ? { cascade: true } : {}),
-        })
-      } catch (err) {
-        pushToast({
-          level: 'danger',
-          text: `Delete failed: ${err instanceof Error ? err.message : 'unknown error'}`,
-        })
-        return
-      } finally {
-        if (!result) {
-          chatStore.sealCommittedPathProducer(chatId, committedPathProducer)
-        }
-      }
-      chatStore.selectCommittedPathForProducer(
-        chatId,
-        committedPathProducer,
-        Object.fromEntries(
-          result.selectedPathHeaders.map((header) => [cursorKeyOf(header.parentId), header.id]),
-        ),
-        {
-          phase: 'terminal',
-          pathHeaders: result.selectedPathHeaders,
-          structuralHeaders: result.structuralHeaders,
-          presentations: result.presentations,
-        },
-        structuralEffectsCursorPatch(result.effects),
-      )
-      chatStore.sealCommittedPathProducer(chatId, committedPathProducer)
-      pushToast({
-        level: 'info',
-        text:
-          effectiveKind === 'pair'
-            ? 'Deleted pair.'
-            : effectiveKind === 'variant'
-              ? 'Deleted variant.'
-              : effectiveKind === 'turn'
-                ? 'Deleted turn.'
-                : 'Deleted message.',
-        undo: async () => {
-          const undoStore = useChatStore.getState()
-          const undoIntent = undoStore.beginNavigationIntent(chatId)
-          const undoProducer = undoStore.registerCommittedPathProducer(chatId, undoIntent)
-          if (!undoProducer) return
-          try {
-            const restored = await applyStructuralSnapshot(result.preImage, {
-              cursor: priorCursor,
-              presentationWindowLimit: 10,
-            })
-            if (!restored) return
-            const state = useChatStore.getState()
-            const selections: Record<string, string> = {}
-            for (const header of restored.selectedPathHeaders) {
-              selections[cursorKeyOf(header.parentId)] = header.id
-            }
-            state.selectCommittedPathForProducer(
-              chatId,
-              undoProducer,
-              selections,
-              {
-                phase: 'terminal',
-                pathHeaders: restored.selectedPathHeaders,
-                structuralHeaders: restored.structuralHeaders,
-                presentations: restored.presentations,
-              },
-              structuralEffectsUndoCursorPatch(priorCursor, result.effects),
-            )
-          } finally {
-            useChatStore.getState().sealCommittedPathProducer(chatId, undoProducer)
-          }
-        },
-      })
-    },
-    [chatId, cascadeDelete, message.id, pushToast, roleMismatch],
-  )
 }
 
 export function MessageActions(props: MessageActionsProps) {
   const {
     message,
+    appliedView,
     showInfo,
     onToggleInfo,
     isEditing,
     onBeginEdit,
-    hasConnection,
+    regenerateCapability,
+    continueCapability,
     generationBusy = false,
     streamTargetBusy = false,
+    mutationDisabled = false,
+    structuralDisabled = false,
     disabledReason,
     onRegenerate,
     onContinue,
     onForkChat,
     onToggleContextVisibility,
     onCopy,
-    chatId,
+    onDelete,
     roleMismatch,
   } = props
   const [copied, setCopied] = useState(false)
   const [confirmOpen, setConfirmOpen] = useState(false)
   const copyTimerRef = useRef<number | null>(null)
   const isAssistant = message.role === 'assistant'
-  const abortReason = hasAppliedSuccessfulContinuation(message)
-    ? undefined
-    : message.generation?.abortReason
-  const runDelete = useRunDelete(chatId, message, roleMismatch)
+  const abortReason = appliedView.latestAttempt.metadata?.abortReason
 
   const previewText =
     message.content
@@ -252,6 +136,10 @@ export function MessageActions(props: MessageActionsProps) {
     [],
   )
 
+  useEffect(() => {
+    if (structuralDisabled) setConfirmOpen(false)
+  }, [structuralDisabled])
+
   const handleCopy = useCallback(async () => {
     if (onCopy) {
       await onCopy()
@@ -271,15 +159,27 @@ export function MessageActions(props: MessageActionsProps) {
     }
   }, [markCopied, message.content, onCopy])
 
-  const disabledTitle = disabledReason ?? 'Add a connection to send messages.'
-  const generationDisabled = !hasConnection || generationBusy
-  const continuationDisabled = generationDisabled || streamTargetBusy
-  const generationDisabledTitle = !hasConnection
-    ? disabledTitle
-    : 'A request is already running for this chat.'
+  const regenerationDisabled =
+    mutationDisabled ||
+    !generationCapabilityAvailable(regenerateCapability) ||
+    generationBusy ||
+    streamTargetBusy
+  const continuationDisabled =
+    mutationDisabled ||
+    !generationCapabilityAvailable(continueCapability) ||
+    generationBusy ||
+    streamTargetBusy
+  const regenerationDisabledTitle = mutationDisabled
+    ? 'Refreshing this message before editing or generation.'
+    : streamTargetBusy
+      ? "Can't regenerate while this message is streaming."
+      : (disabledReason ??
+        generationCapabilityBlockedReason(regenerateCapability, 'regenerate') ??
+        (generationBusy ? 'A request is already running for this chat.' : undefined))
   const continuationDisabledTitle = streamTargetBusy
     ? "Can't continue while streaming."
-    : generationDisabledTitle
+    : (generationCapabilityBlockedReason(continueCapability, 'continue') ??
+      (generationBusy ? 'A request is already running for this chat.' : undefined))
   const deleteLabel = 'Delete message'
   const deleteTooltip = 'Delete this message…'
 
@@ -314,9 +214,15 @@ export function MessageActions(props: MessageActionsProps) {
         data-action="edit"
         aria-pressed={isEditing}
         onClick={onBeginEdit}
-        disabled={isEditing || streamTargetBusy}
+        disabled={mutationDisabled || isEditing || streamTargetBusy}
         aria-label="Edit message"
-        title={streamTargetBusy ? "Can't edit while streaming." : 'Edit (Enter)'}
+        title={
+          mutationDisabled
+            ? 'Refreshing this message before editing.'
+            : streamTargetBusy
+              ? "Can't edit while streaming."
+              : 'Edit (Enter)'
+        }
       >
         <PencilIcon size={14} />
       </IconButton>
@@ -327,10 +233,12 @@ export function MessageActions(props: MessageActionsProps) {
           data-size="sm"
           data-role="message-action"
           data-action="regenerate"
-          onClick={() => void onRegenerate()}
-          disabled={generationDisabled}
+          onClick={() => {
+            onRegenerate()
+          }}
+          disabled={regenerationDisabled}
           aria-label="Regenerate response"
-          title={!generationDisabled ? 'Regenerate (⇧⌘R)' : generationDisabledTitle}
+          title={!regenerationDisabled ? 'Regenerate (⇧⌘R)' : regenerationDisabledTitle}
         >
           <ReloadIcon size={14} />
         </IconButton>
@@ -342,7 +250,9 @@ export function MessageActions(props: MessageActionsProps) {
           data-size="sm"
           data-role="message-action"
           data-action="continue"
-          onClick={() => void onContinue()}
+          onClick={() => {
+            onContinue()
+          }}
           disabled={continuationDisabled}
           aria-label={abortReason ? 'Continue partial response' : 'Continue from here'}
           title={
@@ -364,8 +274,13 @@ export function MessageActions(props: MessageActionsProps) {
           data-role="message-action"
           data-action="fork-chat"
           onClick={() => void onForkChat()}
+          disabled={structuralDisabled}
           aria-label="Branch this chat from here"
-          title="Branch this chat from here — opens in a new chat"
+          title={
+            structuralDisabled
+              ? 'Resolving this branch before structural changes.'
+              : 'Branch this chat from here — opens in a new chat'
+          }
         >
           <BranchIcon size={14} />
         </IconButton>
@@ -378,16 +293,18 @@ export function MessageActions(props: MessageActionsProps) {
         data-action="toggle-visible"
         aria-pressed={Boolean(message.hiddenFromContext)}
         onClick={() => void onToggleContextVisibility?.()}
-        disabled={onToggleContextVisibility === undefined}
+        disabled={mutationDisabled || onToggleContextVisibility === undefined}
         aria-label={
           message.hiddenFromContext
             ? 'Show in context (send to model)'
             : 'Hide from context (never send to model)'
         }
         title={
-          message.hiddenFromContext
-            ? 'Hidden from context — click to include again'
-            : 'Hide from context — keep visible here but never send to the model'
+          mutationDisabled
+            ? 'Refreshing this message before changing context visibility.'
+            : message.hiddenFromContext
+              ? 'Hidden from context — click to include again'
+              : 'Hide from context — keep visible here but never send to the model'
         }
       >
         {message.hiddenFromContext ? <EyeOffIcon size={14} /> : <EyeIcon size={14} />}
@@ -399,9 +316,15 @@ export function MessageActions(props: MessageActionsProps) {
         data-role="message-action"
         data-action="delete-pair"
         onClick={() => setConfirmOpen(true)}
-        disabled={streamTargetBusy}
+        disabled={streamTargetBusy || structuralDisabled}
         aria-label={deleteLabel}
-        title={streamTargetBusy ? "Can't delete while streaming." : deleteTooltip}
+        title={
+          structuralDisabled
+            ? 'Resolving this branch before structural changes.'
+            : streamTargetBusy
+              ? "Can't delete while streaming."
+              : deleteTooltip
+        }
       >
         <TrashIcon size={14} />
       </IconButton>
@@ -425,8 +348,9 @@ export function MessageActions(props: MessageActionsProps) {
           pairDefault={!roleMismatch}
           onCancel={() => setConfirmOpen(false)}
           onConfirm={async (deletePair) => {
-            setConfirmOpen(false)
-            await runDelete(deletePair ? 'pair' : 'single')
+            if (structuralDisabled) return
+            const outcome = await onDelete(deletePair ? 'pair' : 'single')
+            if (outcome.kind === 'succeeded') setConfirmOpen(false)
           }}
         />
       ) : null}
@@ -435,10 +359,8 @@ export function MessageActions(props: MessageActionsProps) {
 }
 
 interface MessageEditTreeActionsProps {
-  message: Message
-  chatId: string
   onInsert?: (slot: InsertSlot) => void | Promise<void>
-  roleMismatch?: boolean
+  onDelete: (mode: ConversationDeleteMode) => ConversationMutationSettlement
   streamTargetBusy?: boolean
 }
 
@@ -448,13 +370,10 @@ interface MessageEditTreeActionsProps {
 // hug the leading edge; deletes hug the trailing edge so destructive
 // actions are physically separated from additive ones.
 export function MessageEditTreeActions({
-  message,
-  chatId,
   onInsert,
-  roleMismatch,
+  onDelete,
   streamTargetBusy = false,
 }: MessageEditTreeActionsProps) {
-  const runDelete = useRunDelete(chatId, message, roleMismatch)
   return (
     <div data-ui="message-edit-tree-row">
       <div data-ui="edit-tree-group" data-side="inserts">
@@ -503,7 +422,7 @@ export function MessageEditTreeActions({
           appearance="soft"
           size="xs"
           data-action="delete-variant"
-          onClick={() => void runDelete('variant')}
+          onClick={() => void onDelete('variant')}
           disabled={streamTargetBusy}
         >
           Delete variant
@@ -514,7 +433,7 @@ export function MessageEditTreeActions({
           appearance="soft"
           size="xs"
           data-action="delete-turn"
-          onClick={() => void runDelete('turn')}
+          onClick={() => void onDelete('turn')}
           disabled={streamTargetBusy}
         >
           Delete turn

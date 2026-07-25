@@ -1,42 +1,64 @@
 import Dexie from 'dexie'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { createChat } from '../helpers/chats'
+import 'fake-indexeddb/auto'
+import { IDBFactory } from 'fake-indexeddb'
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
+import { promptPresetSlotForKind } from '../../src/core/chat-metadata'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
-import type { Chat, ChatSettings, ProfileId } from '../../src/core/types'
+import type {
+  ChatPreset,
+  ChatSettings,
+  ProfileId,
+  PromptPreset,
+  PromptPresetId,
+  PromptPresetKind,
+} from '../../src/core/types'
 import { newId } from '../../src/lib/ulid'
-import { __resetBroadcastForTests, type BroadcastEvent, onEvent } from '../../src/store/broadcast'
-import { getBrowserRepository } from '../../src/store/browser-repo'
-import { updateChatSettings } from '../../src/store/chats'
-import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
-import { __resetKeyCacheForTests, createKey } from '../../src/store/keys'
-import { createPreset } from '../../src/store/presets'
-import { createProfile } from '../../src/store/profiles'
+import { __resetBroadcastForTests, subscribeWorkspaceChanges } from '../../src/store/broadcast'
+import { __resetBrowserRepositoryForTests } from '../../src/store/browser-repo'
 import {
-  __promptSettingSaveRegistrySizeForTests,
-  createPromptPreset,
-  deletePromptPreset,
-  flushPendingPromptSettingSaves,
-  getPromptPreset,
-  listPromptPresets,
-  PromptPresetMissingError,
-  registerPromptSettingSaveFlusher,
-  slotFor,
-  trackPendingPromptSettingSave,
-  updatePromptPreset,
-} from '../../src/store/prompt-presets'
-import { loadChatHeaderSnapshot } from '../../src/store/send-context'
+  openBrowserWorkspace,
+  shutdownBrowserWorkspace,
+} from '../../src/store/browser-workspace-lifecycle'
+import { getChat } from '../../src/store/chats'
+import { configurationApplication } from '../../src/store/configuration-application'
+import { configurationController } from '../../src/store/configuration-controller'
+import { __resetDbForTests, getDb } from '../../src/store/db'
+import { exportWorkspaceBackup, restoreWorkspaceBackup } from '../../src/store/import-export'
+import { __resetKeyCacheForTests, createKey } from '../../src/store/keys'
+import type { WorkspaceChange, WorkspaceDependency } from '../../src/store/workspace-protocol'
+import { __resetWorkspaceRepositoryForTests } from '../../src/store/workspace-repository'
+import { createConfigurationProfile } from '../helpers/configuration'
 
 const DB_NAME = 'natter'
 
-async function resetAll() {
+let emptyWorkspaceBackup: Awaited<ReturnType<typeof exportWorkspaceBackup>>
+
+beforeAll(async () => {
+  ;(globalThis as unknown as { indexedDB: IDBFactory }).indexedDB = new IDBFactory()
+  __resetWorkspaceRepositoryForTests()
+  __resetBrowserRepositoryForTests()
   __resetBroadcastForTests()
   __resetKeyCacheForTests()
   __resetDbForTests()
   await Dexie.delete(DB_NAME)
-}
+  await openBrowserWorkspace()
+  emptyWorkspaceBackup = await exportWorkspaceBackup()
+})
+
+beforeEach(async () => {
+  __resetKeyCacheForTests()
+  await restoreWorkspaceBackup(emptyWorkspaceBackup, { now: 1 })
+})
+
+afterAll(async () => {
+  await shutdownBrowserWorkspace()
+  __resetKeyCacheForTests()
+})
 
 async function fakeProfileId(name = 'P'): Promise<ProfileId> {
   const key = await createKey({ name, plaintextKey: 'sk-x' })
-  const profile = await createProfile({
+  const profile = await createConfigurationProfile({
     name,
     kind: 'openrouter',
     baseUrl: 'https://x',
@@ -46,165 +68,313 @@ async function fakeProfileId(name = 'P'): Promise<ProfileId> {
 }
 
 function chatSettingsFor(profileId: ProfileId): ChatSettings {
-  const s = cloneDefaultChatSettings()
-  s.profileId = profileId
-  s.model = 'anthropic/claude-opus-4.7'
-  return s
+  const settings = cloneDefaultChatSettings()
+  settings.profileId = profileId
+  settings.model = 'anthropic/claude-opus-4.7'
+  return settings
 }
 
-async function seedChat(profileId: ProfileId, patch: Partial<ChatSettings> = {}): Promise<Chat> {
-  const db = await openDb()
-  const chat: Chat = {
+async function createPromptPreset(input: {
+  kind: PromptPresetKind
+  name: string
+  text: string
+  now?: number
+}): Promise<PromptPreset> {
+  const now = input.now ?? Date.now()
+  const preset: PromptPreset = {
     id: newId(),
-    title: 'T',
-    titleStatus: 'untitled',
-    createdAt: 1,
-    updatedAt: 1,
-    lastViewedAt: 1,
-    wordCount: 0,
-    totalCostUsd: 0,
-    metaVersion: 0,
-    summaryVersion: 0,
-    settings: { ...chatSettingsFor(profileId), ...patch },
-    lastUpdatedLeafId: null,
-    lastBranchUpdatedAt: 1,
-    archived: false,
-    pinned: false,
-    folderId: null,
-    tags: [],
+    kind: input.kind,
+    name: input.name,
+    text: input.text,
+    createdAt: now,
+    updatedAt: now,
   }
-  await db.chats.put(chat)
-  return chat
+  const result = await configurationApplication.execute({
+    kind: 'prompt-preset.put',
+    preset,
+    now,
+  })
+  if (result.kind !== 'prompt-preset-saved' || !result.preset) {
+    throw new Error(`PromptPresetCreateFailed:${preset.id}`)
+  }
+  return result.preset
 }
 
-beforeEach(async () => {
-  await resetAll()
-  await openDb()
-})
+async function createChatPreset(input: {
+  profileId: ProfileId
+  settings: ChatSettings
+  name?: string
+  now?: number
+}): Promise<ChatPreset> {
+  const id = newId()
+  const result = await configurationApplication.execute({
+    kind: 'chat-preset.create',
+    preset: {
+      id,
+      name: input.name ?? 'bundle',
+      connectionProfileId: input.profileId,
+      settings: input.settings,
+    },
+    now: input.now ?? Date.now(),
+  })
+  if (result.kind !== 'chat-preset-saved') throw new Error(`ChatPresetCreateFailed:${id}`)
+  return result.preset
+}
 
-afterEach(async () => {
-  await resetAll()
-})
+function getPromptPreset(presetId: PromptPresetId): Promise<PromptPreset | undefined> {
+  return getDb().promptPresets.get(presetId)
+}
 
-describe('createPromptPreset', () => {
-  it('persists the preset with kind/name/text and broadcasts prompt-preset-mutated', async () => {
-    const seen: BroadcastEvent[] = []
-    const unsub = onEvent((ev) => seen.push(ev))
-    const p = await createPromptPreset({
+async function listPromptPresets(presetKind?: PromptPresetKind): Promise<PromptPreset[]> {
+  const presets = await getDb().promptPresets.toArray()
+  return presets
+    .filter((preset) => presetKind === undefined || preset.kind === presetKind)
+    .sort((left, right) => left.name.localeCompare(right.name) || left.id.localeCompare(right.id))
+}
+
+function getChatPreset(presetId: string): Promise<ChatPreset | undefined> {
+  return getDb().presets.get(presetId)
+}
+
+function changedDependencies(changes: readonly WorkspaceChange[]): WorkspaceDependency[] {
+  return changes.flatMap((change) => {
+    if (change.kind === 'replace') return [{ kind: 'workspace' } satisfies WorkspaceDependency]
+    if (change.kind === 'invalidate') {
+      return change.dependencies === 'all'
+        ? [{ kind: 'workspace' } satisfies WorkspaceDependency]
+        : [...change.dependencies]
+    }
+    return [...change.delta.invalidations]
+  })
+}
+
+function changedFacts(changes: readonly WorkspaceChange[]) {
+  return changes.flatMap((change) => (change.kind === 'commit' ? change.delta.facts : []))
+}
+
+describe('prompt preset catalog commands', () => {
+  it('creates a preset and publishes one compact prompt-preset invalidation', async () => {
+    const changes: WorkspaceChange[] = []
+    const unsubscribe = subscribeWorkspaceChanges((change) => changes.push(change))
+
+    const preset = await createPromptPreset({
       kind: 'system',
       name: 'My sysprompt',
       text: 'You are helpful.',
     })
-    unsub()
-    expect(p.kind).toBe('system')
-    expect(p.name).toBe('My sysprompt')
-    expect(p.text).toBe('You are helpful.')
-    expect(seen).toContainEqual({ kind: 'prompt-preset-mutated', promptPresetId: p.id })
-    const row = await getPromptPreset(p.id)
-    expect(row?.text).toBe('You are helpful.')
-  })
-})
+    unsubscribe()
 
-describe('listPromptPresets', () => {
-  it('filters by kind when requested', async () => {
-    const sys = await createPromptPreset({ kind: 'system', name: 's1', text: 's' })
+    const promptPresetDependency = changedDependencies(changes).find(
+      (dependency) => dependency.kind === 'prompt-preset',
+    )
+    expect(await getPromptPreset(preset.id)).toMatchObject({
+      kind: 'system',
+      name: 'My sysprompt',
+      text: 'You are helpful.',
+    })
+    expect(changes.filter((change) => change.kind === 'commit')).toHaveLength(1)
+    expect(promptPresetDependency?.presetIds).toEqual([preset.id])
+    expect(promptPresetDependency?.facets).toEqual(
+      expect.arrayContaining([
+        'selected-detail',
+        'catalog-membership',
+        'catalog-order',
+        'catalog-display',
+        'usage',
+      ]),
+    )
+  })
+
+  it('filters by kind and presents rows in name order', async () => {
+    const system = await createPromptPreset({ kind: 'system', name: 'Zed', text: 's' })
+    const alpha = await createPromptPreset({ kind: 'system', name: 'alpha', text: 'a' })
     await createPromptPreset({ kind: 'continue-system', name: 'c1', text: 'c' })
     await createPromptPreset({ kind: 'continue-user', name: 'u1', text: 'u' })
-    const onlySystem = await listPromptPresets('system')
-    expect(onlySystem.map((p) => p.id)).toEqual([sys.id])
-    const all = await listPromptPresets()
-    expect(all.length).toBe(3)
+
+    expect((await listPromptPresets('system')).map((preset) => preset.id)).toEqual([
+      alpha.id,
+      system.id,
+    ])
+    expect(await listPromptPresets()).toHaveLength(4)
   })
 
-  it('sorts by name case-insensitively', async () => {
-    await createPromptPreset({ kind: 'system', name: 'Zed', text: '' })
-    await createPromptPreset({ kind: 'system', name: 'alpha', text: '' })
-    const rows = await listPromptPresets('system')
-    expect(rows.map((p) => p.name.toLowerCase())).toEqual(['alpha', 'zed'])
+  it('rejects updates to a missing prompt preset', async () => {
+    await expect(
+      configurationApplication.execute({
+        kind: 'prompt-preset.update',
+        presetId: 'missing',
+        patch: { text: 'x' },
+        now: 100,
+      }),
+    ).rejects.toThrow('ConfigurationMissing:prompt-preset:missing')
   })
 })
 
-describe('updatePromptPreset', () => {
-  it('rejects an update to a missing preset', async () => {
-    await expect(updatePromptPreset('missing', { text: 'x' })).rejects.toBeInstanceOf(
-      PromptPresetMissingError,
-    )
-  })
-
-  it('rename does not propagate to pinned chats', async () => {
+describe('prompt preset pin propagation', () => {
+  it('renames metadata without changing pinned chat text', async () => {
     const profileId = await fakeProfileId()
     const preset = await createPromptPreset({ kind: 'system', name: 'name1', text: 'T1' })
-    const chat = await seedChat(profileId, { systemPrompt: 'T1', systemPromptPresetId: preset.id })
-    await updatePromptPreset(preset.id, { name: 'name2' })
-    const updatedChat = await getDb().chats.get(chat.id)
-    expect(updatedChat?.settings.systemPrompt).toBe('T1') // untouched
-    const updatedPreset = await getPromptPreset(preset.id)
-    expect(updatedPreset?.name).toBe('name2')
+    const chat = await createChat({
+      settings: {
+        ...chatSettingsFor(profileId),
+        systemPrompt: 'T1',
+        systemPromptPresetId: preset.id,
+      },
+      now: 100,
+    })
+
+    await configurationApplication.renamePromptPreset(preset.id, 'name2', 500)
+
+    expect((await getChat(chat.id))?.settings.systemPrompt).toBe('T1')
+    expect((await getPromptPreset(preset.id))?.name).toBe('name2')
   })
 
-  it('text change propagates eagerly to every chat pinned to the preset', async () => {
+  it('propagates text to every linked chat and chat preset in one compact commit', async () => {
     const profileId = await fakeProfileId()
     const preset = await createPromptPreset({ kind: 'system', name: 'n', text: 'old' })
-    const pinnedA = await seedChat(profileId, {
-      systemPrompt: 'old',
-      systemPromptPresetId: preset.id,
-    })
-    const pinnedB = await seedChat(profileId, {
-      systemPrompt: 'old',
-      systemPromptPresetId: preset.id,
-    })
-    const unrelated = await seedChat(profileId, { systemPrompt: 'old' }) // no pin
-    const seen: BroadcastEvent[] = []
-    const unsub = onEvent((ev) => seen.push(ev))
-    const repo = getBrowserRepository()
-    const beforeWorkspace = await repo.getWorkspaceMeta()
-    await updatePromptPreset(preset.id, { text: 'new' }, { now: 500 })
-    unsub()
-
-    const rowA = await getDb().chats.get(pinnedA.id)
-    const rowB = await getDb().chats.get(pinnedB.id)
-    const rowC = await getDb().chats.get(unrelated.id)
-    expect(rowA?.settings.systemPrompt).toBe('new')
-    expect(rowB?.settings.systemPrompt).toBe('new')
-    expect(rowC?.settings.systemPrompt).toBe('old') // unpinned: untouched
-    expect(rowA).toMatchObject({ metaVersion: 1, summaryVersion: 1, updatedAt: 500 })
-    expect(rowB).toMatchObject({ metaVersion: 1, summaryVersion: 1, updatedAt: 500 })
-    expect((await repo.getWorkspaceMeta()).mutationCounter).toBe(
-      beforeWorkspace.mutationCounter + 1,
-    )
-
-    // chat-mutated per touched chat; prompt-preset-mutated once.
-    expect(seen.filter((ev) => ev.kind === 'prompt-preset-mutated').length).toBe(1)
-    const touchedChats = seen.filter((ev) => ev.kind === 'chat-mutated').map((ev) => ev.chatId)
-    expect(new Set(touchedChats)).toEqual(new Set([pinnedA.id, pinnedB.id]))
-  })
-
-  it('rolls back prompt, chat, bundle, workspace version, and events on a middle failure', async () => {
-    const profileId = await fakeProfileId()
-    const preset = await createPromptPreset({ kind: 'system', name: 'n', text: 'old' })
-    const first = await seedChat(profileId, {
-      systemPrompt: 'old',
-      systemPromptPresetId: preset.id,
-    })
-    const second = await seedChat(profileId, {
-      systemPrompt: 'old',
-      systemPromptPresetId: preset.id,
-    })
-    const bundle = await createPreset({
-      name: 'bundle',
-      connectionProfileId: profileId,
+    const pinnedA = await createChat({
       settings: {
         ...chatSettingsFor(profileId),
         systemPrompt: 'old',
         systemPromptPresetId: preset.id,
       },
+      now: 100,
     })
-    const repo = getBrowserRepository()
-    const beforeWorkspace = await repo.getWorkspaceMeta()
-    const beforeChats = await getDb().chats.bulkGet([first.id, second.id])
-    const beforeBundle = await getDb().presets.get(bundle.id)
-    const seen: BroadcastEvent[] = []
-    const unsubscribe = onEvent((event) => seen.push(event))
+    const pinnedB = await createChat({
+      settings: {
+        ...chatSettingsFor(profileId),
+        systemPrompt: 'old',
+        systemPromptPresetId: preset.id,
+      },
+      now: 100,
+    })
+    const unrelated = await createChat({
+      settings: { ...chatSettingsFor(profileId), systemPrompt: 'old' },
+      now: 100,
+    })
+    const bundle = await createChatPreset({
+      profileId,
+      settings: {
+        ...chatSettingsFor(profileId),
+        systemPrompt: 'old',
+        systemPromptPresetId: preset.id,
+      },
+      now: 100,
+    })
+    const changes: WorkspaceChange[] = []
+    const unsubscribe = subscribeWorkspaceChanges((change) => changes.push(change))
+
+    await configurationApplication.execute({
+      kind: 'prompt-preset.update',
+      presetId: preset.id,
+      patch: { text: 'new' },
+      now: 500,
+    })
+    unsubscribe()
+
+    const rowA = await getChat(pinnedA.id)
+    const rowB = await getChat(pinnedB.id)
+    const rowC = await getChat(unrelated.id)
+    expect(rowA?.settings.systemPrompt).toBe('new')
+    expect(rowB?.settings.systemPrompt).toBe('new')
+    expect(rowC?.settings.systemPrompt).toBe('old')
+    expect(rowA).toMatchObject({
+      configurationVersion: 1,
+      metaVersion: 1,
+      summaryVersion: 1,
+    })
+    expect(rowB).toMatchObject({
+      configurationVersion: 1,
+      metaVersion: 1,
+      summaryVersion: 1,
+    })
+    expect([rowA?.updatedAt, rowB?.updatedAt].sort()).toEqual([500, 501])
+    expect((await getChatPreset(bundle.id))?.settings).toMatchObject({
+      systemPrompt: 'new',
+      systemPromptPresetId: preset.id,
+    })
+    expect(changes.filter((change) => change.kind === 'commit')).toHaveLength(1)
+    const dependencies = changedDependencies(changes)
+    const promptPresetDependency = dependencies.find(
+      (dependency) => dependency.kind === 'prompt-preset',
+    )
+    const presetDependency = dependencies.find((dependency) => dependency.kind === 'preset')
+    const chatDependency = dependencies.find((dependency) => dependency.kind === 'chat')
+    expect(promptPresetDependency?.presetIds).toEqual([preset.id])
+    expect(promptPresetDependency?.facets).toContain('selected-detail')
+    expect(presetDependency?.presetIds).toEqual([bundle.id])
+    expect(presetDependency?.facets).toContain('selected-detail')
+    expect(chatDependency?.chatIds).toEqual(expect.arrayContaining([pinnedA.id, pinnedB.id]))
+    expect(changedFacts(changes)).toEqual(
+      expect.arrayContaining([
+        { kind: 'sidebar-row-changed', chatId: pinnedA.id },
+        { kind: 'sidebar-row-changed', chatId: pinnedB.id },
+      ]),
+    )
+  })
+
+  it('updates only the slot belonging to the prompt preset kind', async () => {
+    const profileId = await fakeProfileId()
+    const preset = await createPromptPreset({
+      kind: 'continue-system',
+      name: 'n',
+      text: 'old continue',
+    })
+    const chat = await createChat({
+      settings: {
+        ...chatSettingsFor(profileId),
+        systemPrompt: 'original system',
+        continueSystemPrompt: 'old continue',
+        continueSystemPromptPresetId: preset.id,
+      },
+      now: 100,
+    })
+
+    await configurationApplication.execute({
+      kind: 'prompt-preset.update',
+      presetId: preset.id,
+      patch: { text: 'new continue' },
+      now: 500,
+    })
+
+    const updated = await getChat(chat.id)
+    expect(updated?.settings.continueSystemPrompt).toBe('new continue')
+    expect(updated?.settings.systemPrompt).toBe('original system')
+  })
+
+  it('rolls back prompt, chats, bundle, and publication when a linked write fails', async () => {
+    const profileId = await fakeProfileId()
+    const preset = await createPromptPreset({ kind: 'system', name: 'n', text: 'old' })
+    const first = await createChat({
+      settings: {
+        ...chatSettingsFor(profileId),
+        systemPrompt: 'old',
+        systemPromptPresetId: preset.id,
+      },
+      now: 100,
+    })
+    const second = await createChat({
+      settings: {
+        ...chatSettingsFor(profileId),
+        systemPrompt: 'old',
+        systemPromptPresetId: preset.id,
+      },
+      now: 100,
+    })
+    const bundle = await createChatPreset({
+      profileId,
+      settings: {
+        ...chatSettingsFor(profileId),
+        systemPrompt: 'old',
+        systemPromptPresetId: preset.id,
+      },
+      now: 100,
+    })
+    const beforePrompt = await getPromptPreset(preset.id)
+    const beforeChats = await Promise.all([getChat(first.id), getChat(second.id)])
+    const beforeBundle = await getChatPreset(bundle.id)
+    const changes: WorkspaceChange[] = []
+    const unsubscribe = subscribeWorkspaceChanges((change) => changes.push(change))
     let updates = 0
     const failSecondUpdate = () => {
       updates += 1
@@ -212,201 +382,174 @@ describe('updatePromptPreset', () => {
     }
     getDb().chats.hook.updating.subscribe(failSecondUpdate)
 
-    await expect(updatePromptPreset(preset.id, { text: 'new' }, { now: 500 })).rejects.toThrow(
-      'injected prompt cascade failure',
-    )
+    try {
+      await expect(
+        configurationApplication.execute({
+          kind: 'prompt-preset.update',
+          presetId: preset.id,
+          patch: { text: 'new' },
+          now: 500,
+        }),
+      ).rejects.toThrow('injected prompt cascade failure')
+    } finally {
+      getDb().chats.hook.updating.unsubscribe(failSecondUpdate)
+      unsubscribe()
+    }
 
-    getDb().chats.hook.updating.unsubscribe(failSecondUpdate)
-    unsubscribe()
-    expect(await getPromptPreset(preset.id)).toEqual(preset)
-    expect(await getDb().chats.bulkGet([first.id, second.id])).toEqual(beforeChats)
-    expect(await getDb().presets.get(bundle.id)).toEqual(beforeBundle)
-    expect((await repo.getWorkspaceMeta()).mutationCounter).toBe(beforeWorkspace.mutationCounter)
-    expect(seen).toEqual([])
+    expect(await getPromptPreset(preset.id)).toEqual(beforePrompt)
+    expect(await Promise.all([getChat(first.id), getChat(second.id)])).toEqual(beforeChats)
+    expect(await getChatPreset(bundle.id)).toEqual(beforeBundle)
+    expect(changes).toEqual([])
   })
 
-  it('propagates to every ChatPreset whose settings pin the prompt-preset', async () => {
-    const profileId = await fakeProfileId()
-    const preset = await createPromptPreset({
-      kind: 'continue-system',
-      name: 'n',
-      text: 'old',
-    })
-    const bundle = await createPreset({
-      name: 'bundle',
-      connectionProfileId: profileId,
-      settings: {
-        ...chatSettingsFor(profileId),
-        continueSystemPrompt: 'old',
-        continueSystemPromptPresetId: preset.id,
-      },
-    })
-    await updatePromptPreset(preset.id, { text: 'new' })
-    const refreshed = await getDb().presets.get(bundle.id)
-    expect(refreshed?.settings.continueSystemPrompt).toBe('new')
-    expect(refreshed?.settings.continueSystemPromptPresetId).toBe(preset.id) // pin intact
-  })
-
-  it('only propagates to the matching kind slot, not other slots', async () => {
-    const profileId = await fakeProfileId()
-    const contSys = await createPromptPreset({
-      kind: 'continue-system',
-      name: 'n',
-      text: 'old cs',
-    })
-    const chat = await seedChat(profileId, {
-      systemPrompt: 'original system',
-      continueSystemPrompt: 'old cs',
-      continueSystemPromptPresetId: contSys.id,
-    })
-    await updatePromptPreset(contSys.id, { text: 'new cs' })
-    const row = await getDb().chats.get(chat.id)
-    // Continue-system slot updated; plain systemPrompt untouched.
-    expect(row?.settings.continueSystemPrompt).toBe('new cs')
-    expect(row?.settings.systemPrompt).toBe('original system')
-  })
-})
-
-describe('deletePromptPreset', () => {
-  it('clears pins on chats + ChatPresets but preserves the denormalized text', async () => {
+  it('deletes a preset by clearing pins while retaining denormalized text', async () => {
     const profileId = await fakeProfileId()
     const preset = await createPromptPreset({ kind: 'system', name: 'p', text: 'canonical' })
-    const chat = await seedChat(profileId, {
-      systemPrompt: 'canonical',
-      systemPromptPresetId: preset.id,
-    })
-    const bundle = await createPreset({
-      name: 'b',
-      connectionProfileId: profileId,
+    const chat = await createChat({
       settings: {
         ...chatSettingsFor(profileId),
         systemPrompt: 'canonical',
         systemPromptPresetId: preset.id,
       },
+      now: 100,
     })
-    const seen: BroadcastEvent[] = []
-    const unsub = onEvent((ev) => seen.push(ev))
-    const repo = getBrowserRepository()
-    const beforeWorkspace = await repo.getWorkspaceMeta()
-    await deletePromptPreset(preset.id, { now: 500 })
-    unsub()
+    const bundle = await createChatPreset({
+      profileId,
+      settings: {
+        ...chatSettingsFor(profileId),
+        systemPrompt: 'canonical',
+        systemPromptPresetId: preset.id,
+      },
+      now: 100,
+    })
+    const changes: WorkspaceChange[] = []
+    const unsubscribe = subscribeWorkspaceChanges((change) => changes.push(change))
+
+    await configurationApplication.deletePromptPreset(preset.id, 500)
+    unsubscribe()
 
     expect(await getPromptPreset(preset.id)).toBeUndefined()
-    const rowChat = await getDb().chats.get(chat.id)
-    expect(rowChat?.settings.systemPromptPresetId).toBeUndefined() // pin cleared
-    expect(rowChat?.settings.systemPrompt).toBe('canonical') // text preserved
-    expect(rowChat).toMatchObject({ metaVersion: 1, summaryVersion: 1, updatedAt: 500 })
-    const rowBundle = await getDb().presets.get(bundle.id)
-    expect(rowBundle?.settings.systemPromptPresetId).toBeUndefined()
-    expect(rowBundle?.settings.systemPrompt).toBe('canonical')
-    expect(
-      seen.some((ev) => ev.kind === 'prompt-preset-deleted' && ev.promptPresetId === preset.id),
-    ).toBe(true)
-    expect((await repo.getWorkspaceMeta()).mutationCounter).toBe(
-      beforeWorkspace.mutationCounter + 1,
+    const chatRow = await getChat(chat.id)
+    expect(chatRow?.settings.systemPromptPresetId).toBeUndefined()
+    expect(chatRow?.settings.systemPrompt).toBe('canonical')
+    expect(chatRow).toMatchObject({
+      configurationVersion: 1,
+      metaVersion: 1,
+      summaryVersion: 1,
+      updatedAt: 500,
+    })
+    const bundleRow = await getChatPreset(bundle.id)
+    expect(bundleRow?.settings.systemPromptPresetId).toBeUndefined()
+    expect(bundleRow?.settings.systemPrompt).toBe('canonical')
+    const dependencies = changedDependencies(changes)
+    const promptPresetDependency = dependencies.find(
+      (dependency) => dependency.kind === 'prompt-preset',
     )
+    const presetDependency = dependencies.find((dependency) => dependency.kind === 'preset')
+    expect(promptPresetDependency?.presetIds).toEqual([preset.id])
+    expect(promptPresetDependency?.facets).toEqual(
+      expect.arrayContaining([
+        'selected-detail',
+        'catalog-membership',
+        'catalog-order',
+        'catalog-display',
+        'usage',
+      ]),
+    )
+    expect(presetDependency?.presetIds).toEqual([bundle.id])
+    expect(presetDependency?.facets).toContain('selected-detail')
+    expect(dependencies).toContainEqual({ kind: 'chat', chatIds: [chat.id] })
+    expect(dependencies).toContainEqual({ kind: 'sidebar', chatIds: [chat.id] })
+    expect(changedFacts(changes)).toContainEqual({
+      kind: 'sidebar-row-changed',
+      chatId: chat.id,
+    })
   })
 })
 
-describe('slotFor', () => {
-  it('maps kind → ChatSettings field names correctly', () => {
-    expect(slotFor('system')).toEqual({
+describe('prompt slot and pending edit ownership', () => {
+  it('maps every prompt kind onto its canonical text and pin fields', () => {
+    expect(promptPresetSlotForKind('system')).toEqual({
       textKey: 'systemPrompt',
       pinKey: 'systemPromptPresetId',
     })
-    expect(slotFor('continue-system')).toEqual({
+    expect(promptPresetSlotForKind('append')).toEqual({
+      textKey: 'appendPrompt',
+      pinKey: 'appendPromptPresetId',
+    })
+    expect(promptPresetSlotForKind('continue-system')).toEqual({
       textKey: 'continueSystemPrompt',
       pinKey: 'continueSystemPromptPresetId',
     })
-    expect(slotFor('continue-user')).toEqual({
+    expect(promptPresetSlotForKind('continue-user')).toEqual({
       textKey: 'continueUserPrompt',
       pinKey: 'continueUserPromptPresetId',
     })
+    expect(promptPresetSlotForKind('prefill')).toEqual({
+      textKey: 'defaultPrefill',
+      pinKey: 'defaultPrefillPresetId',
+    })
   })
-})
 
-describe('pending prompt setting saves', () => {
-  it('waits only for the requested chat and releases successful entries', async () => {
+  it('flushes mounted edits per chat and propagates the original failure', async () => {
     let releaseA: () => void = () => undefined
-    const pendingA = new Promise<void>((resolve) => {
+    const gateA = new Promise<void>((resolve) => {
       releaseA = resolve
     })
-    const trackedA = trackPendingPromptSettingSave('chat-a', pendingA)
-    await trackPendingPromptSettingSave('chat-b', Promise.resolve())
-
-    await flushPendingPromptSettingSaves('chat-b')
-    expect(__promptSettingSaveRegistrySizeForTests()).toMatchObject({
-      pendingChats: 1,
-      pendingSaves: 1,
+    const sessionA = configurationController.openEditSession({
+      chatId: 'chat-a',
+      fieldKey: 'system-prompt',
+      flush: () => gateA,
+    })
+    const sessionB = configurationController.openEditSession({
+      chatId: 'chat-b',
+      fieldKey: 'system-prompt',
+      flush: async () => undefined,
     })
 
-    releaseA()
-    await trackedA
-    await flushPendingPromptSettingSaves('chat-a')
-    expect(__promptSettingSaveRegistrySizeForTests()).toEqual({
-      pendingChats: 0,
-      pendingSaves: 0,
-      flusherChats: 0,
-      flushers: 0,
+    await configurationController.flushChatEdits('chat-b')
+    let flushedA = false
+    const pendingA = configurationController.flushChatEdits('chat-a').then(() => {
+      flushedA = true
     })
-  })
-
-  it('releases rejected entries and unregisters mounted flushers', async () => {
-    let rejectSave: (error: Error) => void = () => undefined
-    const save = new Promise<void>((_resolve, reject) => {
-      rejectSave = reject
-    })
-    void trackPendingPromptSettingSave('chat-a', save)
-    const unregister = registerPromptSettingSaveFlusher('chat-a', async () => undefined)
-    const barrier = flushPendingPromptSettingSaves('chat-a')
-    rejectSave(new Error('injected save failure'))
-    await expect(barrier).rejects.toThrow('injected save failure')
-    unregister()
-    expect(__promptSettingSaveRegistrySizeForTests()).toEqual({
-      pendingChats: 0,
-      pendingSaves: 0,
-      flusherChats: 0,
-      flushers: 0,
-    })
-  })
-
-  it("holds the generation snapshot until this chat's pending prompt save settles", async () => {
-    const profileId = await fakeProfileId()
-    const chat = await seedChat(profileId)
-    let releaseSave: () => void = () => undefined
-    const gate = new Promise<void>((resolve) => {
-      releaseSave = resolve
-    })
-    const save = gate.then(() => updateChatSettings(chat.id, { systemPrompt: 'fresh prompt' }))
-    void trackPendingPromptSettingSave(chat.id, save)
-    let loaded = false
-    const snapshotPromise = loadChatHeaderSnapshot(chat.id).then((snapshot) => {
-      loaded = true
-      return snapshot
-    })
-
     await Promise.resolve()
-    expect(loaded).toBe(false)
-    releaseSave()
+    expect(flushedA).toBe(false)
+    releaseA()
+    await pendingA
+    await Promise.all([sessionA.close('discard'), sessionB.close('discard')])
 
-    const snapshot = await snapshotPromise
-    expect(snapshot.chat.settings.systemPrompt).toBe('fresh prompt')
-    expect(__promptSettingSaveRegistrySizeForTests().pendingSaves).toBe(0)
+    const failure = new Error('prompt save failed before send')
+    const failedSession = configurationController.openEditSession({
+      chatId: 'chat-c',
+      fieldKey: 'system-prompt',
+      flush: () => Promise.reject(failure),
+    })
+    await expect(configurationController.flushChatEdits('chat-c')).rejects.toBe(failure)
+    await failedSession.close('discard')
   })
 
-  it('propagates the original prompt-save failure from the pre-send barrier', async () => {
-    const profileId = await fakeProfileId()
-    const chat = await seedChat(profileId)
-    let rejectSave: (error: Error) => void = () => undefined
-    const save = new Promise<void>((_resolve, reject) => {
-      rejectSave = reject
-    })
-    void trackPendingPromptSettingSave(chat.id, save)
-    const barrier = flushPendingPromptSettingSaves(chat.id)
-    const failure = new Error('prompt save failed before send')
-    rejectSave(failure)
+  it('projects a staged prompt edit immediately for its chat without waiting for persistence', async () => {
+    const chat = await createChat({ settings: cloneDefaultChatSettings(), now: 100 })
+    const [intent] = configurationController.stageChatSettingsFields(chat.id, [
+      { path: ['systemPrompt'], value: 'fresh prompt' },
+    ])
+    if (!intent) throw new Error('PendingIntentMissing')
 
-    await expect(barrier).rejects.toBe(failure)
-    expect(__promptSettingSaveRegistrySizeForTests().pendingSaves).toBe(0)
+    expect(configurationController.projectChatConfiguration(chat).settings.systemPrompt).toBe(
+      'fresh prompt',
+    )
+    expect(
+      configurationController.projectChatConfiguration({ ...chat, id: 'another-chat' }).settings
+        .systemPrompt,
+    ).toBe(chat.settings.systemPrompt)
+
+    configurationController.discardPendingChatSettingsField(
+      chat.id,
+      intent.fieldKey,
+      intent.revision,
+    )
+    expect(configurationController.projectChatConfiguration(chat).settings.systemPrompt).toBe(
+      chat.settings.systemPrompt,
+    )
   })
 })

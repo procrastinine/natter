@@ -11,6 +11,10 @@
   font-size: var(--font-size-md);
 }
 
+[data-ui="chat-header-content"] {
+  display: contents;
+}
+
 [data-ui="chat-title"] {
   display: inline-flex;
   align-items: center;

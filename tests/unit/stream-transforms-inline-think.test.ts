@@ -8,8 +8,24 @@
 // lane without losing ordering or finish semantics.
 
 import { describe, expect, it } from 'vitest'
-import { type StreamLaneEvent, splitChatStream } from '../../src/api/stream-transforms'
+import { splitChatStream as splitChatStreamWithContract } from '../../src/api/stream-transforms'
 import type { ChatStreamChunk } from '../../src/api/types'
+import type { StreamLaneEvent } from '../../src/core/generation-stream-live-events'
+import type { ReasoningObservation } from '../../src/core/reasoning-observation'
+import { chatReasoningContract } from '../helpers/reasoning-contracts'
+import { collectReasoningObservations } from '../helpers/reasoning-events'
+
+type ChatSplitOptions = Omit<Parameters<typeof splitChatStreamWithContract>[1], 'reasoning'>
+
+function splitChatStream(
+  source: Parameters<typeof splitChatStreamWithContract>[0],
+  options: ChatSplitOptions = {},
+) {
+  return splitChatStreamWithContract(source, {
+    ...options,
+    reasoning: chatReasoningContract({ carrier: 'openrouter-reasoning-details' }),
+  })
+}
 
 async function* fromChunks(chunks: ChatStreamChunk[]): AsyncGenerator<ChatStreamChunk> {
   for (const c of chunks) yield c
@@ -18,6 +34,20 @@ async function collect(iter: AsyncIterable<StreamLaneEvent>): Promise<StreamLane
   const out: StreamLaneEvent[] = []
   for await (const e of iter) out.push(e)
   return out
+}
+
+function visibleReasoning(events: readonly StreamLaneEvent[]) {
+  return collectReasoningObservations(events).filter(
+    (operation): operation is Extract<ReasoningObservation, { kind: 'visible' }> =>
+      operation.kind === 'visible',
+  )
+}
+
+function reasoningCarriers(events: readonly StreamLaneEvent[]) {
+  return collectReasoningObservations(events).filter(
+    (operation): operation is Extract<ReasoningObservation, { kind: 'carrier' }> =>
+      operation.kind === 'carrier',
+  )
 }
 
 describe('splitChatStream — inline <think> lifting', () => {
@@ -33,15 +63,17 @@ describe('splitChatStream — inline <think> lifting', () => {
       { type: 'delta', chunk: { id: 'g1', choices: [{ delta: {}, finish_reason: 'stop' }] } },
     ])
     const events = await collect(splitChatStream(source))
-    const reasoning = events
-      .filter((e): e is Extract<StreamLaneEvent, { lane: 'reasoning' }> => e.lane === 'reasoning')
-      .map((e) => e.textDelta ?? '')
+    const reasoning = visibleReasoning(events)
+      .map((operation) => operation.value)
       .join('')
     const text = events
       .filter((e): e is Extract<StreamLaneEvent, { lane: 'text' }> => e.lane === 'text')
       .map((e) => e.text)
       .join('')
     expect(reasoning).toBe('pondering...')
+    expect(
+      visibleReasoning(events).every((operation) => operation.source.dialect === 'inline'),
+    ).toBe(true)
     expect(text).toBe('The answer is 42.')
     expect(events.some((e) => e.lane === 'finish')).toBe(true)
   })
@@ -55,9 +87,8 @@ describe('splitChatStream — inline <think> lifting', () => {
       },
     ])
     const events = await collect(splitChatStream(source))
-    const reasoning = events
-      .filter((e): e is Extract<StreamLaneEvent, { lane: 'reasoning' }> => e.lane === 'reasoning')
-      .map((e) => e.textDelta ?? '')
+    const reasoning = visibleReasoning(events)
+      .map((operation) => operation.value)
       .join('')
     const text = events
       .filter((e): e is Extract<StreamLaneEvent, { lane: 'text' }> => e.lane === 'text')
@@ -78,14 +109,13 @@ describe('splitChatStream — inline <think> lifting', () => {
       },
     ])
     const events = await collect(splitChatStream(source))
-    const reasoningIdx = events.findIndex((e) => e.lane === 'reasoning')
+    const reasoningIdx = events.findIndex((e) => e.lane === 'reasoning-observation')
     const finishIdx = events.findIndex((e) => e.lane === 'finish')
     expect(reasoningIdx).toBeGreaterThanOrEqual(0)
     expect(finishIdx).toBeGreaterThan(reasoningIdx)
     expect(
-      events
-        .filter((e): e is Extract<StreamLaneEvent, { lane: 'reasoning' }> => e.lane === 'reasoning')
-        .map((e) => e.textDelta ?? '')
+      visibleReasoning(events)
+        .map((operation) => operation.value)
         .join(''),
     ).toBe('truncated mid-stream')
   })
@@ -104,9 +134,8 @@ describe('splitChatStream — inline <think> lifting', () => {
       .filter((e): e is Extract<StreamLaneEvent, { lane: 'text' }> => e.lane === 'text')
       .map((e) => e.text)
       .join('')
-    const reasoning = events
-      .filter((e): e is Extract<StreamLaneEvent, { lane: 'reasoning' }> => e.lane === 'reasoning')
-      .map((e) => e.textDelta ?? '')
+    const reasoning = visibleReasoning(events)
+      .map((operation) => operation.value)
       .join('')
     // The `<think>` appears mid-stream so the lifter does not activate —
     // it rides through as content.
@@ -144,9 +173,8 @@ describe('splitChatStream — inline <think> lifting', () => {
     const events = await collect(
       splitChatStream(source, { inlineReasoningTags: ['analysis'], forceInlineReasoning: true }),
     )
-    const reasoning = events
-      .filter((e): e is Extract<StreamLaneEvent, { lane: 'reasoning' }> => e.lane === 'reasoning')
-      .map((e) => e.textDelta ?? '')
+    const reasoning = visibleReasoning(events)
+      .map((operation) => operation.value)
       .join('')
     const text = events
       .filter((e): e is Extract<StreamLaneEvent, { lane: 'text' }> => e.lane === 'text')
@@ -165,9 +193,8 @@ describe('splitChatStream — inline <think> lifting', () => {
       { type: 'delta', chunk: { id: 'g', choices: [{ delta: {}, finish_reason: 'stop' }] } },
     ])
     const events = await collect(splitChatStream(source))
-    const reasoning = events
-      .filter((e): e is Extract<StreamLaneEvent, { lane: 'reasoning' }> => e.lane === 'reasoning')
-      .map((e) => e.textDelta ?? '')
+    const reasoning = visibleReasoning(events)
+      .map((operation) => operation.value)
       .join('')
     expect(reasoning).toBe('reflecting')
   })
@@ -201,13 +228,19 @@ describe('splitChatStream — inline <think> lifting', () => {
       { type: 'delta', chunk: { id: 'g', choices: [{ delta: {}, finish_reason: 'stop' }] } },
     ])
     const events = await collect(splitChatStream(source))
-    const reasoning = events.filter(
-      (e): e is Extract<StreamLaneEvent, { lane: 'reasoning' }> => e.lane === 'reasoning',
-    )
-    const hasSummary = reasoning.some((e) => e.textDelta === 'Visible summary of thinking.')
-    const hasDetails = reasoning.some((e) => Array.isArray(e.details) && e.details.length > 0)
-    expect(hasSummary).toBe(true)
-    expect(hasDetails).toBe(true)
+    const visible = visibleReasoning(events)
+    expect(visible).toHaveLength(1)
+    expect(visible[0]).toMatchObject({
+      value: 'Visible summary of thinking.',
+      visibleKind: 'text',
+    })
+    expect(visible[0]?.source).toMatchObject({ dialect: 'openrouter-chat', choiceIndex: 0 })
+    expect(reasoningCarriers(events)).toEqual([
+      expect.objectContaining({
+        value: 'base64-blob',
+        carrierKind: 'gemini-thought-signature',
+      }),
+    ])
   })
 
   it('drops scalar reasoning when it byte-mirrors reasoning.text detail (1390685 regression)', async () => {
@@ -241,13 +274,24 @@ describe('splitChatStream — inline <think> lifting', () => {
       { type: 'delta', chunk: { id: 'g', choices: [{ delta: {}, finish_reason: 'stop' }] } },
     ])
     const events = await collect(splitChatStream(source))
-    const reasoning = events.filter(
-      (e): e is Extract<StreamLaneEvent, { lane: 'reasoning' }> => e.lane === 'reasoning',
-    )
-    const scalarEmitted = reasoning.some((e) => e.textDelta !== undefined)
-    const detailsEmitted = reasoning.some((e) => Array.isArray(e.details) && e.details.length > 0)
-    expect(scalarEmitted).toBe(false)
-    expect(detailsEmitted).toBe(true)
+    const visible = visibleReasoning(events)
+    expect(visible).toHaveLength(1)
+    expect(visible[0]).toMatchObject({
+      value: scalarText,
+      visibleKind: 'text',
+      format: 'anthropic-claude-v1',
+    })
+    expect(visible[0]?.source).toMatchObject({
+      dialect: 'openrouter-chat',
+      choiceIndex: 0,
+      detailOrdinal: 0,
+    })
+    expect(reasoningCarriers(events)).toEqual([
+      expect.objectContaining({
+        value: 'sig-abc',
+        carrierKind: 'anthropic-signature',
+      }),
+    ])
   })
 
   it('keeps scalar reasoning when it does NOT mirror the concat of details text', async () => {
@@ -269,11 +313,10 @@ describe('splitChatStream — inline <think> lifting', () => {
       },
     ])
     const events = await collect(splitChatStream(source))
-    const reasoning = events.filter(
-      (e): e is Extract<StreamLaneEvent, { lane: 'reasoning' }> => e.lane === 'reasoning',
-    )
-    expect(reasoning.some((e) => e.textDelta === 'Scalar is different.')).toBe(true)
-    expect(reasoning.some((e) => Array.isArray(e.details))).toBe(true)
+    expect(visibleReasoning(events).map((operation) => operation.value)).toEqual([
+      'Scalar is different.',
+      'Details text.',
+    ])
   })
 
   it('lifter does not cross-contaminate content from the reasoning_details stream', async () => {
@@ -298,13 +341,40 @@ describe('splitChatStream — inline <think> lifting', () => {
       },
     ])
     const events = await collect(splitChatStream(source))
-    const reasoning = events.filter(
-      (e): e is Extract<StreamLaneEvent, { lane: 'reasoning' }> => e.lane === 'reasoning',
+    const visible = visibleReasoning(events)
+    expect(visible).toHaveLength(1)
+    expect(visible[0]?.value).toBe('<think>literal in details</think>')
+    expect(visible[0]?.source).toMatchObject({
+      dialect: 'openrouter-chat',
+      detailOrdinal: 0,
+    })
+  })
+
+  it('isolates inline lifters and reasoning identities across interleaved choices', async () => {
+    const source = fromChunks([
+      {
+        type: 'delta',
+        chunk: {
+          choices: [
+            { index: 0, delta: { content: '<think>choice zero</think>answer zero' } },
+            { index: 1, delta: { content: '<think>choice one</think>answer one' } },
+          ],
+        },
+      },
+    ])
+    const events = await collect(splitChatStream(source))
+    const visible = visibleReasoning(events)
+    expect(visible.map((operation) => operation.value)).toEqual(['choice zero', 'choice one'])
+    expect(visible.map((operation) => operation.source.choiceIndex)).toEqual([0, 1])
+    expect(new Set(visible.map((operation) => JSON.stringify(operation.memberAliases))).size).toBe(
+      2,
     )
-    const detail = reasoning.find((e) => Array.isArray(e.details))
-    expect(detail).toBeDefined()
-    expect((detail?.details?.[0] as { text?: string } | undefined)?.text).toBe(
-      '<think>literal in details</think>',
-    )
+    expect(
+      events
+        .filter(
+          (event): event is Extract<StreamLaneEvent, { lane: 'text' }> => event.lane === 'text',
+        )
+        .map((event) => event.text),
+    ).toEqual(['answer zero', 'answer one'])
   })
 })

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { ContinuationAttempt, Message } from '../../src/core/types'
 import {
-  contentIncludesCaseInsensitiveText,
+  canonicalMessageHeaderRow,
   hydrateMessage,
   hydrateMessages,
   MESSAGE_BODY_KEYS,
@@ -10,37 +10,10 @@ import {
   previewTextFromContent,
   previewTextFromStoredProjection,
   rebaseHydratedMessageHeader,
+  sameMessageHeaderValue,
   splitMessageForStorage,
 } from '../../src/store/message-storage'
-
-describe('contentIncludesCaseInsensitiveText', () => {
-  it('matches case-insensitively across text-item boundaries without joining the full body', () => {
-    expect(
-      contentIncludesCaseInsensitiveText(
-        [
-          { type: 'text', text: `${'x'.repeat(64 * 1024)}Needle` },
-          { type: 'output_text', text: 'Across Items' },
-        ],
-        'needle\nacross',
-      ),
-    ).toBe(true)
-  })
-
-  it('ignores non-text content and observes cancellation while scanning a large body', () => {
-    const controller = new AbortController()
-    controller.abort()
-    expect(() =>
-      contentIncludesCaseInsensitiveText(
-        [
-          { type: 'image_url', url: 'data:image/png;base64,needle' },
-          { type: 'text', text: 'x'.repeat(128 * 1024) },
-        ],
-        'needle',
-        controller.signal,
-      ),
-    ).toThrowError(/Search aborted/)
-  })
-})
+import { reasoningEnvelopeFromDetailsForTest } from '../helpers/reasoning-events'
 
 const continuationAttempts: ContinuationAttempt[] = [
   {
@@ -62,7 +35,16 @@ const continuationAttempts: ContinuationAttempt[] = [
     costSource: 'stream',
     finishReason: 'stop',
     nativeFinishReason: 'completed',
-    reasoningDetails: [{ type: 'reasoning.summary', summary: 'continuation thought' }],
+    reasoningEnvelope: reasoningEnvelopeFromDetailsForTest(
+      [
+        {
+          type: 'reasoning.summary',
+          format: 'openai-responses-v1',
+          summary: 'continuation thought',
+        },
+      ],
+      'openai-responses',
+    ),
     toolCalls: [
       {
         id: 'continuation-call-1',
@@ -71,6 +53,9 @@ const continuationAttempts: ContinuationAttempt[] = [
       },
     ],
     phase: 'final_answer',
+    reasoningCarryForward: 'none',
+    reasoningVisibility: { disclosure: 'unknown' },
+    application: { kind: 'applied' },
     providerOutputItems: [
       {
         dialect: 'openai-responses',
@@ -88,6 +73,9 @@ const continuationAttempts: ContinuationAttempt[] = [
     apiUsed: 'chat',
     startedAt: 7,
     finishedAt: 8,
+    reasoningCarryForward: 'none',
+    reasoningVisibility: { disclosure: 'unknown' },
+    application: { kind: 'applied' },
     error: {
       category: 'provider',
       code: 'provider_error',
@@ -103,6 +91,9 @@ const continuationAttempts: ContinuationAttempt[] = [
     apiUsed: 'gemini-native',
     startedAt: 9,
     finishedAt: 10,
+    reasoningCarryForward: 'none',
+    reasoningVisibility: { disclosure: 'unknown' },
+    application: { kind: 'applied' },
     abortReason: 'user',
   },
   {
@@ -111,6 +102,9 @@ const continuationAttempts: ContinuationAttempt[] = [
     status: 'interrupted',
     startedAt: 11,
     finishedAt: 12,
+    reasoningCarryForward: 'none',
+    reasoningVisibility: { disclosure: 'unknown' },
+    application: { kind: 'applied' },
   },
 ]
 
@@ -133,16 +127,28 @@ function message(overrides: Partial<Message> = {}): Message {
       apiUsed: 'chat',
       delivery: 'streaming',
       costSource: 'stream',
+      reasoningCarryForward: 'none',
+      reasoningVisibility: { disclosure: 'unknown' },
       startedAt: 1,
       finishedAt: 3,
       cost: 0.001,
     },
     content: [{ type: 'output_text', text: 'hello' }],
-    reasoningDetails: [{ type: 'reasoning.summary', summary: 'short thought' }],
+    reasoningEnvelope: reasoningEnvelopeFromDetailsForTest(
+      [{ type: 'reasoning.summary', format: 'unknown', summary: 'short thought' }],
+      'unknown',
+    ),
     toolCalls: [{ id: 'tool-1', type: 'function', function: { name: 'search', arguments: '{}' } }],
     refusal: 'no',
     phase: 'final_answer',
-    responsesEchoItem: { type: 'message', id: 'item-1', status: 'completed' },
+    providerOutputItems: [
+      {
+        dialect: 'openai-responses',
+        type: 'message',
+        outputIndex: 0,
+        item: { type: 'message', id: 'item-1', status: 'completed' },
+      },
+    ],
     continuationAttempts,
     attachmentRefs: [
       {
@@ -171,6 +177,20 @@ function message(overrides: Partial<Message> = {}): Message {
 }
 
 describe('message storage split', () => {
+  it('canonicalizes absent attachment refs at the storage split boundary', () => {
+    const source = message()
+    delete source.attachmentRefs
+    const { header } = splitMessageForStorage(source)
+    const rawHeader = { ...header }
+    delete rawHeader.attachmentRefs
+    const fromRawRow = canonicalMessageHeaderRow(rawHeader)
+    const fromProjectedRow = canonicalMessageHeaderRow({ ...header, attachmentRefs: [] })
+
+    expect(header.attachmentRefs).toEqual([])
+    expect(fromRawRow.attachmentRefs).toEqual([])
+    expect(sameMessageHeaderValue(fromRawRow, fromProjectedRow)).toBe(true)
+  })
+
   it('splits body fields away from header fields and hydrates the original domain shape', () => {
     const source = message()
     const { header, body } = splitMessageForStorage(source, { updatedAt: 9 })
@@ -194,11 +214,11 @@ describe('message storage split', () => {
       bodyVersion: source.nodeVersion,
       updatedAt: 9,
       content: source.content,
-      reasoningDetails: source.reasoningDetails,
+      reasoningEnvelope: source.reasoningEnvelope,
       toolCalls: source.toolCalls,
       refusal: source.refusal,
       phase: source.phase,
-      responsesEchoItem: source.responsesEchoItem,
+      providerOutputItems: source.providerOutputItems,
       continuationAttempts: source.continuationAttempts,
     })
     expect(hydrateMessage(header, body)).toEqual(source)
@@ -233,18 +253,18 @@ describe('message storage split', () => {
 
   it('keeps absent optional body fields absent', () => {
     const source = message({ content: [{ type: 'text', text: 'user text' }] })
-    delete source.reasoningDetails
+    delete source.reasoningEnvelope
     delete source.toolCalls
     delete source.refusal
     delete source.phase
-    delete source.responsesEchoItem
+    delete source.providerOutputItems
     delete source.continuationAttempts
     const { header, body } = splitMessageForStorage(source)
-    expect(body).not.toHaveProperty('reasoningDetails')
+    expect(body).not.toHaveProperty('reasoningEnvelope')
     expect(body).not.toHaveProperty('toolCalls')
     expect(body).not.toHaveProperty('refusal')
     expect(body).not.toHaveProperty('phase')
-    expect(body).not.toHaveProperty('responsesEchoItem')
+    expect(body).not.toHaveProperty('providerOutputItems')
     expect(body).not.toHaveProperty('continuationAttempts')
     expect(hydrateMessage(header, body)).toEqual(source)
   })
@@ -271,15 +291,15 @@ describe('message storage split', () => {
 
   it('stores a bounded text projection without cloning the cold body to read shorter previews', () => {
     const content = [{ type: 'output_text' as const, text: `  ${'x'.repeat(30_000)}  ` }]
-    const { header } = splitMessageForStorage(message({ content }))
+    const { preview } = splitMessageForStorage(message({ content }))
 
-    expect(header.textPreview).toHaveLength(MESSAGE_TEXT_PREVIEW_MAX_CHARS)
-    expect(header.textPreview).toBe(`${'x'.repeat(MESSAGE_TEXT_PREVIEW_MAX_CHARS - 1)}…`)
-    expect(previewTextFromStoredProjection(header.textPreview, 240)).toBe(`${'x'.repeat(239)}…`)
+    expect(preview.text).toHaveLength(MESSAGE_TEXT_PREVIEW_MAX_CHARS)
+    expect(preview.text).toBe(`${'x'.repeat(MESSAGE_TEXT_PREVIEW_MAX_CHARS - 1)}…`)
+    expect(previewTextFromStoredProjection(preview.text, 240)).toBe(`${'x'.repeat(239)}…`)
     expect(previewTextFromStoredProjection('short preview', 240)).toBe('short preview')
   })
 
-  it('moves server-tool outputs into the cold body and restores exact tool order and ownership', () => {
+  it('keeps bounded server-tool metadata hot and exact provider payloads in the cold body', () => {
     const baseGeneration = message().generation
     if (!baseGeneration) throw new Error('Expected generation fixture')
     const source = message({
@@ -291,15 +311,17 @@ describe('message storage split', () => {
             type: 'web_search_call',
             source: 'responses-output',
             id: 'search-1',
-            output: { results: [{ title: 'result' }] },
-          },
-          {
-            type: 'shell_call_output',
-            source: 'provider-output',
-            output: undefined,
           },
         ],
       },
+      providerOutputItems: [
+        {
+          dialect: 'openai-responses',
+          type: 'web_search_call',
+          outputIndex: 1,
+          item: { id: 'search-1', results: [{ title: 'result' }] },
+        },
+      ],
     })
     const { header, body } = splitMessageForStorage(source)
 
@@ -310,19 +332,20 @@ describe('message storage split', () => {
         source: 'responses-output',
         id: 'search-1',
       },
-      { type: 'shell_call_output', source: 'provider-output' },
     ])
-    expect(body.generationServerToolOutputs).toEqual([
-      { index: 1, output: { results: [{ title: 'result' }] } },
-      { index: 2, output: undefined },
+    expect(header).not.toHaveProperty('providerOutputItems')
+    expect(body.providerOutputItems).toEqual([
+      {
+        dialect: 'openai-responses',
+        type: 'web_search_call',
+        outputIndex: 1,
+        item: { id: 'search-1', results: [{ title: 'result' }] },
+      },
     ])
     expect(hydrateMessage(header, body)).toEqual(source)
-    expect(
-      Object.hasOwn(hydrateMessage(header, body).generation?.serverTools?.[2] ?? {}, 'output'),
-    ).toBe(true)
   })
 
-  it('rebases canonical header metadata without dropping cold server-tool outputs', () => {
+  it('rebases canonical header metadata without replacing cold provider payloads', () => {
     const baseGeneration = message().generation
     if (!baseGeneration) throw new Error('Expected generation fixture')
     const source = message({
@@ -333,14 +356,21 @@ describe('message storage split', () => {
             type: 'web_search_call',
             source: 'responses-output',
             id: 'search-1',
-            output: { results: [{ url: 'https://example.com/result' }] },
           },
         ],
       },
+      providerOutputItems: [
+        {
+          dialect: 'openai-responses',
+          type: 'web_search_call',
+          outputIndex: 0,
+          item: { id: 'search-1', results: [{ url: 'https://example.com/result' }] },
+        },
+      ],
     })
     const { header, body } = splitMessageForStorage(source)
     const hydrated = hydrateMessage(header, body)
-    const hydratedOutput = hydrated.generation?.serverTools?.[0]?.output
+    const hydratedProviderOutput = hydrated.providerOutputItems
     const canonicalGeneration = header.generation
     if (!canonicalGeneration) throw new Error('Expected canonical generation metadata')
     const canonicalHeader = {
@@ -360,16 +390,15 @@ describe('message storage split', () => {
       cachedTokenEstimate: 12,
       generation: {
         provider: 'canonical-provider',
-        serverTools: [
-          {
-            type: 'web_search_call',
-            output: { results: [{ url: 'https://example.com/result' }] },
-          },
-        ],
+        serverTools: [{ type: 'web_search_call' }],
       },
     })
-    expect(rebased.generation?.serverTools?.[0]?.output).toBe(hydratedOutput)
-    expect(canonicalHeader.generation.serverTools?.[0]).not.toHaveProperty('output')
+    expect(rebased.providerOutputItems).toBe(hydratedProviderOutput)
+    expect(rebased.providerOutputItems?.[0]?.item).toEqual({
+      id: 'search-1',
+      results: [{ url: 'https://example.com/result' }],
+    })
+    expect(canonicalHeader).not.toHaveProperty('providerOutputItems')
   })
 
   it('preserves the existing preview normalization and truncation semantics', () => {

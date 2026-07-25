@@ -50,6 +50,8 @@ function collectExpectedEdges(
     | readonly {
         refId: string
         attachmentId: AttachmentId
+        includeInContext: boolean
+        updatedAt: number
         deletedAt?: number
       }[]
     | undefined,
@@ -66,6 +68,8 @@ function collectExpectedEdges(
       refId: ref.refId,
       attachmentId: ref.attachmentId,
       ordinal,
+      includeInContext: ref.includeInContext,
+      refUpdatedAt: ref.updatedAt,
     })
   }
 }

@@ -1,13 +1,17 @@
-import { expect, type Page, test } from './fixtures'
-import { buildSseBody, clearIndexedDb, createChatAndOpen, seedFirstRun } from './helpers'
+import { importPortableChatThroughUi } from '../../scripts/workspace-provider-fixture.mjs'
+import { createChatUiJourneyProfile, expect, type Page, test } from './fixtures'
+import {
+  buildSseBody,
+  clearIndexedDb,
+  createChatAndOpen,
+  seedFirstRun,
+  seedLinearChat,
+} from './helpers'
 
 const OSS_MODEL = 'qwen/qwen3-4b'
 const OPENAI_MODEL = 'gpt-4o-mini'
 const VIDEO_MODEL = 'google/veo-3.1-lite'
 const LONG_OPENROUTER_DRAFT = `GUI OpenRouter route check ${'x'.repeat(2000)}`
-const OR_MODELS_QUERY_KEY =
-  '{"outputModalities":["audio","file","image","text","video"],"supportedParameters":[]}'
-const DIRECT_MODELS_QUERY_KEY = '{"outputModalities":[],"supportedParameters":[]}'
 
 type CapturedRequest = {
   url: string
@@ -26,9 +30,11 @@ test('GUI OpenRouter send, Continue, provider overrides, token-cap routing, and 
   await mockChatCompletions(page, requests, ['openrouter ok', ' continued'])
   await mockOpenRouterDiscovery(page)
 
-  await seedFirstRun(page, { model: OSS_MODEL, disablePrivacyFilter: false })
-  const profileId = await activeProfileId(page)
-  await seedOpenRouterDiscovery(page, profileId, OSS_MODEL)
+  await seedFirstRun(page, {
+    model: OSS_MODEL,
+    disablePrivacyFilter: false,
+    corsProxyUrl: '/_or_scrape',
+  })
 
   await createChatAndOpen(page)
   const composer = page.locator('[data-ui="composer-input"]')
@@ -38,7 +44,9 @@ test('GUI OpenRouter send, Continue, provider overrides, token-cap routing, and 
 
   await page.getByRole('tab', { name: 'Context' }).click()
   await expect(page.getByRole('meter', { name: 'Estimated prompt tokens used' })).toContainText('≈')
-  await expect(page.locator('[data-ui="context-gauge-breakdown-compact"]')).toContainText('draft')
+  await expect(page.locator('[data-ui="context-gauge-breakdown-compact"]')).not.toContainText(
+    'draft',
+  )
   await page.getByRole('tab', { name: 'Model' }).click()
 
   await expect(page.getByLabel('Use Tiny Context')).toBeVisible()
@@ -70,6 +78,7 @@ test('GUI OpenRouter send, Continue, provider overrides, token-cap routing, and 
   )
 
   expect(requests).toHaveLength(2)
+  expect(JSON.stringify(requests[0]?.body.messages)).toContain(LONG_OPENROUTER_DRAFT)
   for (const req of requests) {
     expect(req.url).toContain('/chat/completions')
     expect(req.body.model).toBe(OSS_MODEL)
@@ -93,6 +102,86 @@ test('GUI OpenRouter send, Continue, provider overrides, token-cap routing, and 
   expect(consoleLines.filter((line) => line.startsWith('error:'))).toEqual([])
 })
 
+test('Context resolves the complete long active branch without transcript scrolling', async ({
+  page,
+}) => {
+  await mockOpenRouterDiscovery(page)
+  await seedFirstRun(page, {
+    model: OSS_MODEL,
+    disablePrivacyFilter: false,
+    corsProxyUrl: '/_or_scrape',
+  })
+  const chatId = await seedLinearChat(page, {
+    messageCount: 160,
+    chatId: 'long-context-active-branch',
+    title: 'Long context active branch',
+    textForIndex: (index) =>
+      index === 17
+        ? `long context body ${'context unit '.repeat(18_000)}`
+        : `short context ${index}`,
+    settings: {
+      'global:message-initial-render-work': 10,
+      'global:message-render-window-load-mode': 'manual',
+    },
+  })
+
+  await expect(page).toHaveURL(new RegExp(`#/chat/${chatId}(?:/message/[^/]+)?$`, 'u'))
+  await expect(page.getByText('short context 159', { exact: true })).toBeVisible()
+  await page.locator('[data-role="settings-cog"]').click()
+  await page.getByRole('tab', { name: 'Context' }).click()
+
+  const meter = page.getByRole('meter', { name: 'Estimated prompt tokens used' })
+  await expect(meter).toBeVisible()
+  await expect
+    .poll(async () => Number(await meter.getAttribute('aria-valuenow')))
+    .toBeGreaterThan(10_000)
+})
+
+test('Context reopens from its exact estimate and follows the selected branch', async ({
+  page,
+}) => {
+  await mockOpenRouterDiscovery(page)
+  await seedFirstRun(page, {
+    model: OSS_MODEL,
+    disablePrivacyFilter: false,
+    corsProxyUrl: '/_or_scrape',
+  })
+  const fixture = await seedContextBranches(page)
+  await page.goto(`/#/chat/${fixture.chatId}/message/${fixture.branchALeafId}`)
+  await expect(page.getByText('context branch A assistant', { exact: true })).toBeVisible()
+
+  await openContextPanel(page)
+  const meter = page.getByRole('meter', { name: 'Estimated prompt tokens used' })
+  await expect(meter).toBeVisible()
+  await expect
+    .poll(async () => Number(await meter.getAttribute('aria-valuenow')))
+    .toBeGreaterThan(10_000)
+  const exactBranchAEstimate = Number(await meter.getAttribute('aria-valuenow'))
+
+  await page.locator('[data-role="settings-pane-close"]').click()
+  await expect(page.locator('[data-ui="chat-model-panel"]')).toHaveCount(0)
+  const volatileDraft = `volatile meter-independent draft ${'z'.repeat(20_000)}`
+  await page.locator('[data-ui="composer-input"]').fill(volatileDraft)
+  await openContextPanel(page)
+  await expect(meter).toHaveAttribute('aria-valuenow', String(exactBranchAEstimate))
+  await expect(page.getByText('Waiting for prompt estimate…', { exact: true })).toHaveCount(0)
+
+  await page.locator('[data-role="settings-pane-close"]').click()
+  await page.locator('[data-ui="composer-input"]').fill('')
+  const branchAUser = page
+    .locator('[data-ui="message"][data-role="user"]')
+    .filter({ hasText: 'context branch A user' })
+  await branchAUser.getByLabel('Next variant').click()
+  await expect(page.getByText('context branch B assistant', { exact: true })).toBeVisible()
+
+  await openContextPanel(page)
+  await expect(meter).toBeVisible()
+  await expect
+    .poll(async () => Number(await meter.getAttribute('aria-valuenow')))
+    .toBeLessThan(exactBranchAEstimate / 10)
+  await expect(page.getByText('Waiting for prompt estimate…', { exact: true })).toHaveCount(0)
+})
+
 test('GUI OpenAI-compatible send uses Responses and never carries OpenRouter provider/privacy wire', async ({
   page,
 }) => {
@@ -101,7 +190,12 @@ test('GUI OpenAI-compatible send uses Responses and never carries OpenRouter pro
   await mockOpenAiDirect(page, responsesRequests)
 
   await seedFirstRun(page, { model: OSS_MODEL, disablePrivacyFilter: false })
-  await createChatAndOpen(page)
+  await seedLinearChat(page, {
+    messageCount: 1,
+    chatId: 'openai-direct-routing-chat',
+    title: 'OpenAI direct routing chat',
+    textPrefix: 'existing public fixture message',
+  })
   await addOpenAiConnectionThroughGui(page)
 
   await page.locator('[data-role="settings-cog"]').click()
@@ -133,6 +227,7 @@ test('GUI OpenAI-compatible send uses Responses and never carries OpenRouter pro
 
 test('GUI OpenRouter video model uses parent /endpoints architecture for UI and send routing', async ({
   page,
+  uiJourney,
 }) => {
   const consoleLines = captureConsole(page)
   const videoRequests: CapturedRequest[] = []
@@ -144,11 +239,61 @@ test('GUI OpenRouter video model uses parent /endpoints architecture for UI and 
   await mockOpenRouterDiscovery(page, VIDEO_MODEL)
   await mockOpenRouterVideos(page, videoRequests, videoDownloads, videoDownloadGate)
 
-  await seedFirstRun(page, { model: VIDEO_MODEL, disablePrivacyFilter: false })
-  const profileId = await activeProfileId(page)
-  await seedOpenRouterDiscovery(page, profileId, VIDEO_MODEL)
+  await seedFirstRun(page, {
+    model: VIDEO_MODEL,
+    disablePrivacyFilter: false,
+    corsProxyUrl: '/_or_scrape',
+  })
+
+  const observerChatId = await seedLinearChat(page, {
+    messageCount: 2,
+    chatId: 'video-localization-observer',
+    title: 'Video localization observer',
+  })
 
   await createChatAndOpen(page)
+  const observer = await page.context().newPage()
+  await mockOpenRouterVideos(observer, videoRequests, videoDownloads, videoDownloadGate)
+  await observer.goto(`/#/chat/${observerChatId}`)
+  await expect(observer.locator('[data-ui="app-shell"]')).toHaveAttribute(
+    'data-workspace-runtime-state',
+    'RUNNING',
+  )
+  await expect(observer).toHaveURL(new RegExp(`#/chat/${observerChatId}/message/[^/]+$`, 'u'))
+  const observerComposerForm = observer.locator(
+    'form[data-ui="composer"]:not([data-presentation-only])',
+  )
+  await expect(observerComposerForm).toBeVisible()
+  const observerComposer = observerComposerForm.locator('[data-ui="composer-input"]')
+  await observerComposer.fill('local observer draft remains selected')
+  await observerComposer.focus()
+  const journeyProfile = createChatUiJourneyProfile()
+  await uiJourney.start(
+    observer,
+    {
+      ...journeyProfile,
+      semanticNodes: [
+        ...(journeyProfile.semanticNodes ?? []),
+        {
+          id: 'composer-draft',
+          selector: '[data-ui="composer-input"]',
+          properties: { value: { kind: 'stable' } },
+          resetOnRouteChange: false,
+        },
+      ],
+    },
+    'remote-generated-output-locality',
+  )
+  await uiJourney.intent(observer, {
+    kind: 'focus-continuity',
+    id: 'remote-generated-output-focus',
+    selector: '[data-ui="composer-input"]',
+    preserveSelection: true,
+  })
+  await uiJourney.intent(observer, {
+    kind: 'follow-bottom',
+    id: 'remote-generated-output-scroll',
+  })
   const composer = page.locator('[data-ui="composer-input"]')
   await composer.fill('GUI video route check')
   await page.locator('[data-role="settings-cog"]').click()
@@ -199,7 +344,7 @@ test('GUI OpenRouter video model uses parent /endpoints architecture for UI and 
     'https://openrouter.ai/api/v1/videos/video-gui-1/content?index=0',
     'https://openrouter.ai/api/v1/videos/video-gui-1/content?index=1',
   ]
-  await expect.poll(() => [...videoDownloads]).toEqual(expectedDownloads)
+  await expect.poll(() => [...videoDownloads].sort()).toEqual([...expectedDownloads].sort())
   await expect
     .poll(() =>
       videoElements.evaluateAll((nodes) =>
@@ -208,8 +353,110 @@ test('GUI OpenRouter video model uses parent /endpoints architecture for UI and 
     )
     .toEqual([true, true])
 
+  await expect(observerComposer).toHaveValue('local observer draft remains selected')
+  await uiJourney.finish(observer, 'remote-generated-output-localized')
+  await observer.close()
+
   expect(consoleLines.filter((line) => line.startsWith('error:'))).toEqual([])
 })
+
+async function seedContextBranches(page: Page): Promise<{ chatId: string; branchALeafId: string }> {
+  const now = Date.now()
+  const sourceChatId = 'context-branch-refresh-chat'
+  const imported = await importPortableChatThroughUi(page, {
+    sourceChatId,
+    title: 'Context branch refresh chat',
+    createdAt: now,
+    updatedAt: now + 5,
+    captureMessageIds: true,
+    messages: [
+      {
+        id: 'root',
+        chatId: sourceChatId,
+        parentId: null,
+        siblingIndex: 0,
+        turnId: 'turn-root',
+        turnIndex: 0,
+        createdAt: now,
+        role: 'system',
+        origin: 'imported',
+        content: [{ type: 'text', text: 'context root instruction' }],
+        nodeVersion: 0,
+        deleted: false,
+      },
+      {
+        id: 'A1',
+        chatId: sourceChatId,
+        parentId: 'root',
+        siblingIndex: 0,
+        turnId: 'turn-A1',
+        turnIndex: 1,
+        createdAt: now + 1,
+        role: 'user',
+        origin: 'user',
+        content: [
+          {
+            type: 'text',
+            text: `context branch A user ${'context unit '.repeat(18_000)}`,
+          },
+        ],
+        nodeVersion: 0,
+        deleted: false,
+      },
+      {
+        id: 'A2',
+        chatId: sourceChatId,
+        parentId: 'A1',
+        siblingIndex: 0,
+        turnId: 'turn-A2',
+        turnIndex: 2,
+        createdAt: now + 2,
+        role: 'assistant',
+        origin: 'generated',
+        content: [{ type: 'output_text', text: 'context branch A assistant' }],
+        nodeVersion: 0,
+        deleted: false,
+      },
+      {
+        id: 'B1',
+        chatId: sourceChatId,
+        parentId: 'root',
+        siblingIndex: 1,
+        turnId: 'turn-B1',
+        turnIndex: 1,
+        createdAt: now + 3,
+        role: 'user',
+        origin: 'user',
+        content: [{ type: 'text', text: 'context branch B user' }],
+        nodeVersion: 0,
+        deleted: false,
+      },
+      {
+        id: 'B2',
+        chatId: sourceChatId,
+        parentId: 'B1',
+        siblingIndex: 0,
+        turnId: 'turn-B2',
+        turnIndex: 2,
+        createdAt: now + 4,
+        role: 'assistant',
+        origin: 'generated',
+        content: [{ type: 'output_text', text: 'context branch B assistant' }],
+        nodeVersion: 0,
+        deleted: false,
+      },
+    ],
+  })
+  const branchALeafId = imported.messageIdMap?.A2
+  if (!branchALeafId) throw new Error('Context branch fixture message id missing')
+  return { chatId: imported.chatId, branchALeafId }
+}
+
+async function openContextPanel(page: Page): Promise<void> {
+  await page.locator('[data-role="settings-cog"]').click()
+  await expect(page.locator('[data-ui="chat-model-panel"]')).toBeVisible()
+  await page.getByRole('tab', { name: 'Context' }).click()
+}
 
 function captureConsole(page: Page): string[] {
   const lines: string[] = []
@@ -372,98 +619,6 @@ function stringField(record: Record<string, unknown>, key: string): string {
   return typeof value === 'string' ? value : ''
 }
 
-async function activeProfileId(page: Page): Promise<string> {
-  return page.evaluate(async () => {
-    const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const req = indexedDB.open('natter')
-      req.onsuccess = () => resolve(req.result)
-      req.onerror = () => reject(req.error)
-    })
-    try {
-      return await new Promise<string>((resolve, reject) => {
-        const tx = db.transaction('profiles', 'readonly')
-        const req = tx.objectStore('profiles').getAll()
-        req.onsuccess = () => {
-          const rows = (req.result as Array<{ id: string; lastUsedAt?: number }>).sort(
-            (a, b) => (b.lastUsedAt ?? 0) - (a.lastUsedAt ?? 0),
-          )
-          resolve(rows[0]?.id ?? '')
-        }
-        req.onerror = () => reject(req.error)
-      })
-    } finally {
-      db.close()
-    }
-  })
-}
-
-async function seedOpenRouterDiscovery(
-  page: Page,
-  profileId: string,
-  modelId: string,
-): Promise<void> {
-  const modelsPayload = openRouterModelsPayload(modelId)
-  const endpointsPayload = openRouterEndpointsPayload(modelId)
-  const privacyPayload = { policies: openRouterPolicies(modelId), fetchedAt: Date.now() }
-  await page.evaluate(
-    async ({
-      profileId,
-      modelId,
-      modelsQueryKey,
-      modelsPayload,
-      endpointsPayload,
-      privacyPayload,
-    }) => {
-      const now = Date.now()
-      const db = await openNatterDb()
-      try {
-        await new Promise<void>((resolve, reject) => {
-          const tx = db.transaction(['models', 'endpoints', 'privacyPolicies'], 'readwrite')
-          tx.objectStore('models').put({
-            profileId,
-            queryKey: modelsQueryKey,
-            fetchedAt: now,
-            payload: modelsPayload,
-          })
-          tx.objectStore('endpoints').put({
-            profileId,
-            modelId,
-            fetchedAt: now,
-            payload: endpointsPayload,
-          })
-          tx.objectStore('privacyPolicies').put({
-            profileId,
-            modelId,
-            fetchedAt: now,
-            payload: privacyPayload,
-          })
-          tx.oncomplete = () => resolve()
-          tx.onerror = () => reject(tx.error)
-          tx.onabort = () => reject(tx.error)
-        })
-      } finally {
-        db.close()
-      }
-
-      function openNatterDb(): Promise<IDBDatabase> {
-        return new Promise((resolve, reject) => {
-          const req = indexedDB.open('natter')
-          req.onsuccess = () => resolve(req.result)
-          req.onerror = () => reject(req.error)
-        })
-      }
-    },
-    {
-      profileId,
-      modelId,
-      modelsQueryKey: OR_MODELS_QUERY_KEY,
-      modelsPayload,
-      endpointsPayload,
-      privacyPayload,
-    },
-  )
-}
-
 function openRouterModelsPayload(modelId: string): Record<string, unknown> {
   if (modelId === VIDEO_MODEL) {
     return {
@@ -618,44 +773,4 @@ async function addOpenAiConnectionThroughGui(page: Page): Promise<void> {
   await page.locator('[data-ui="connection-setup-key"]').fill('sk-test-openai')
   await page.locator('[data-ui="connection-setup-submit"]').click()
   await page.locator('[data-ui="connection-setup-modal"]').waitFor({ state: 'detached' })
-  const profileId = await activeProfileId(page)
-  await seedDirectModels(page, profileId)
-}
-
-async function seedDirectModels(page: Page, profileId: string): Promise<void> {
-  await page.evaluate(
-    async ({ profileId, directQueryKey, autoselectQueryKey, modelId }) => {
-      const db = await new Promise<IDBDatabase>((resolve, reject) => {
-        const req = indexedDB.open('natter')
-        req.onsuccess = () => resolve(req.result)
-        req.onerror = () => reject(req.error)
-      })
-      try {
-        await new Promise<void>((resolve, reject) => {
-          const tx = db.transaction('models', 'readwrite')
-          for (const queryKey of [directQueryKey, autoselectQueryKey]) {
-            tx.objectStore('models').put({
-              profileId,
-              queryKey,
-              fetchedAt: Date.now(),
-              payload: {
-                data: [{ id: modelId, object: 'model', created: 0, owned_by: 'openai' }],
-              },
-            })
-          }
-          tx.oncomplete = () => resolve()
-          tx.onerror = () => reject(tx.error)
-          tx.onabort = () => reject(tx.error)
-        })
-      } finally {
-        db.close()
-      }
-    },
-    {
-      profileId,
-      directQueryKey: DIRECT_MODELS_QUERY_KEY,
-      autoselectQueryKey: OR_MODELS_QUERY_KEY,
-      modelId: OPENAI_MODEL,
-    },
-  )
 }

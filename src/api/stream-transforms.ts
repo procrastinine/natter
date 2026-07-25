@@ -9,12 +9,43 @@
 //
 // Phase 7 text chat uses the text / usage / finish / keepalive / error / meta
 // lanes. Reasoning + tool-call lanes are emitted for forward compatibility
-// (and exercised by unit tests) but not consumed by `useChat` until later
+// (and exercised by unit tests) but not consumed by the generation engine until later
 // phases.
 
-import { isOpenAiResponsesFamilyFormat } from '../core/reasoning'
+import {
+  normalizeContentAnnotations,
+  normalizeGeminiGroundingAnnotations,
+} from '../core/content-annotations'
+import type { StreamLaneEvent } from '../core/generation-stream-live-events'
+import {
+  type AttemptProviderOutputContract,
+  isKnownProviderToolOutputType,
+  providerOutputItemFromResponsesItem,
+  providerOutputItemIdentity,
+} from '../core/provider-tool-context'
+import {
+  type AttemptAnthropicReasoningContract,
+  type AttemptChatReasoningContract,
+  type AttemptGeminiReasoningContract,
+  type AttemptResponsesReasoningContract,
+  type AttemptTextReasoningContract,
+  isReasoningFormat,
+  visibleKindForInboundReasoning,
+} from '../core/reasoning'
 import { createInlineReasoningLifter, type InlineReasoningLifter } from '../core/reasoning-inline'
-import type { ContentItem, MessagePhase, ReasoningFormat } from '../core/types'
+import {
+  type ReasoningMemberAlias,
+  type ReasoningObservation,
+  type ReasoningVisibleBindingObservation,
+  reasoningObservationsFromDetails,
+} from '../core/reasoning-observation'
+import type {
+  ContentItem,
+  GenerationServerToolCall,
+  MessagePhase,
+  ProviderOutputItem,
+  ReasoningFormat,
+} from '../core/types'
 import type {
   AnthropicContentBlock,
   AnthropicEventWire,
@@ -22,14 +53,14 @@ import type {
   AnthropicStreamChunk,
   AnthropicUsageWire,
 } from './anthropic-types'
-import { type ApiError, normalizeError } from './errors'
+import { normalizeError } from './errors'
 import type {
   GeminiContent,
   GeminiPart,
   GeminiStreamChunk,
   GenerateContentResponseWire,
 } from './gemini-types'
-import type { StreamIntegrityEvent } from './stream-integrity'
+import { decodeProviderReasoningDetails } from './provider-json-boundary'
 import type {
   ChatCompletionChoiceWire,
   ChatCompletionChunkWire,
@@ -43,141 +74,12 @@ import type {
   ResponsesUsageWire,
 } from './types'
 
-// Lane-tagged events consumed by the message accumulator. Phase 7 defined the
-// chat-completions lanes (text / reasoning / tool-call / usage / finish / meta
-// / keepalive / error / buffered). Phase 11 adds:
-//   - `output-item-added` / `output-item-done` — one per Responses output item
-//     (reasoning | message | function_call | server-tool). The accumulator
-//     commits one `Message` row per item.
-//   - `server-tool` — typed status events for web_search_call et al.
-//   - `phase` — emitted on `output_item.done` when the item carries a `phase`
-//     field; accumulator pins it on the corresponding `Message`.
-//   - `reasoning` gains `summaryDelta`, `encryptedDelta`, `outputIndex`,
-//     and provider `itemId` when the upstream exposes one.
-//   - `text` gains `outputIndex` + `contentIndex`.
-export type StreamLaneEvent =
-  | { lane: 'text'; text: string; chunkId?: string; outputIndex?: number; contentIndex?: number }
-  | {
-      lane: 'reasoning'
-      textDelta?: string
-      summaryDelta?: string
-      encryptedDelta?: string
-      format?: ReasoningFormat
-      // When `replaceEncrypted` is true the accumulator overwrites the
-      // stored encrypted field instead of appending. Emitted on
-      // `output_item.done` because the final encrypted_content is authoritative.
-      replaceEncrypted?: boolean
-      details?: unknown[]
-      detailsMode?: 'delta' | 'snapshot' | 'cumulative'
-      chunkId?: string
-      outputIndex?: number
-      itemId?: string
-      // `summaryIndex` identifies which summary PART within a reasoning
-      // item a `summaryDelta` belongs to. Responses wire exposes this as
-      // `summary_index` on `reasoning_summary_text.delta`; Gemini native
-      // assigns a per-response counter to each `thought:true` part. The
-      // accumulator uses `(itemId, summaryIndex)` when available so
-      // incremental deltas and buffered-result fallbacks all converge on the
-      // same summary row.
-      summaryIndex?: number
-    }
-  | {
-      lane: 'tool-call'
-      index: number
-      id?: string
-      type?: 'function'
-      name?: string
-      argumentsDelta?: string
-      argumentsSnapshot?: string
-      chunkId?: string
-      outputIndex?: number
-    }
-  | {
-      lane: 'server-tool'
-      itemType:
-        | 'web_search_call'
-        | 'file_search_call'
-        | 'image_generation_call'
-        | 'code_interpreter_call'
-        | 'shell_call'
-        | 'shell_call_output'
-        | 'computer_call'
-        | 'mcp_tool_call'
-        | 'mcp_call'
-        | 'google:google_search'
-        | 'google:url_context'
-        | 'google:code_execution'
-        | 'google:google_maps'
-        | 'openrouter:datetime'
-        | 'openrouter:web_fetch'
-        | 'openrouter:web_search'
-        | 'server_tool_use'
-        | 'web_search_tool_result'
-        | 'web_fetch_tool_result'
-        | 'code_execution_tool_result'
-        | 'bash_code_execution_tool_result'
-        | 'text_editor_code_execution_tool_result'
-        | 'advisor_tool_result'
-      status: 'in_progress' | 'searching' | 'completed'
-      itemId: string
-      outputIndex: number
-      partialImageB64?: string
-    }
-  | {
-      lane: 'server-tool-output'
-      itemType: string
-      itemId: string
-      outputIndex: number
-      output: unknown
-      status?: string
-    }
-  | {
-      lane: 'content-item'
-      item: ContentItem
-      chunkId?: string
-      outputIndex?: number
-      itemId?: string
-    }
-  | {
-      lane: 'audio-output'
-      dataDelta?: string
-      transcriptDelta?: string
-      format?: 'wav' | 'mp3' | 'flac' | 'ogg' | 'm4a' | 'pcm16'
-      chunkId?: string
-    }
-  | {
-      lane: 'output-item-added'
-      outputIndex: number
-      item: ResponsesInputItem
-    }
-  | {
-      lane: 'output-item-done'
-      outputIndex: number
-      item: ResponsesInputItem
-    }
-  | {
-      lane: 'phase'
-      phase: MessagePhase | null
-      outputIndex: number
-    }
-  | {
-      lane: 'usage'
-      usage: ChatCompletionUsageWire | ResponsesUsageWire
-      chunkId?: string
-    }
-  | { lane: 'finish'; finishReason: string; chunkId?: string }
-  | { lane: 'terminal'; evidence: 'done-sentinel' }
-  | { lane: 'meta'; model?: string; provider?: string; generationId?: string }
-  | { lane: 'keepalive'; comment: string }
-  | { lane: 'integrity'; integrity: StreamIntegrityEvent }
-  | { lane: 'error'; error: ApiError }
-  | {
-      lane: 'buffered'
-      result: ChatCompletionResultWire | ResponsesResultWire | AnthropicMessagesResultWire
-      generationId?: string
-    }
+type AttemptChatStreamReasoningContract =
+  | AttemptChatReasoningContract
+  | AttemptTextReasoningContract
 
 interface SplitChatStreamOptions {
+  reasoning: AttemptChatStreamReasoningContract
   // Tag set the inline-reasoning lifter should look for. Pass `[]` to
   // disable (useful when callers know the model returns reasoning only
   // via `reasoning_details[]`). When `undefined`, the lifter auto-detects
@@ -188,6 +90,101 @@ interface SplitChatStreamOptions {
   // open tag to arm). Caller opts in when a quirks entry explicitly flags
   // the model as emitting inline tags.
   forceInlineReasoning?: boolean
+}
+
+interface ChatChoiceStreamState {
+  lifter: InlineReasoningLifter
+  annotationState: { text: string }
+}
+
+function createChatChoiceStreamState(opts: SplitChatStreamOptions): ChatChoiceStreamState {
+  return {
+    lifter: createInlineReasoningLifter({
+      ...(opts.inlineReasoningTags !== undefined ? { tags: opts.inlineReasoningTags } : {}),
+      ...(opts.forceInlineReasoning === true ? { autoDetect: false } : {}),
+    }),
+    annotationState: { text: '' },
+  }
+}
+
+function chatChoiceStreamState(
+  states: Map<number, ChatChoiceStreamState>,
+  choiceIndex: number,
+  opts: SplitChatStreamOptions,
+): ChatChoiceStreamState {
+  const current = states.get(choiceIndex)
+  if (current) return current
+  const created = createChatChoiceStreamState(opts)
+  states.set(choiceIndex, created)
+  return created
+}
+
+function inlineReasoningObservation(text: string, choiceIndex: number): ReasoningObservation {
+  return {
+    kind: 'visible',
+    visibleKind: 'text',
+    update: 'append',
+    value: text,
+    format: 'unknown',
+    source: { dialect: 'inline', bridge: 'inline', choiceIndex },
+    groupAliases: [{ kind: 'inline-choice', choiceIndex }],
+    memberAliases: [{ kind: 'inline', choiceIndex }],
+  }
+}
+
+function chatScalarReasoningObservation(
+  text: string,
+  choiceIndex: number,
+  reasoning: AttemptChatStreamReasoningContract,
+  update: 'append' | 'set' = 'append',
+): Extract<ReasoningObservation, { kind: 'visible' }> {
+  const visibleKind = visibleKindForInboundReasoning(reasoning.inboundVisibility)
+  return {
+    kind: 'visible',
+    visibleKind,
+    update,
+    value: text,
+    format: reasoning.targetFormat ?? 'unknown',
+    source: {
+      dialect: reasoning.originDialect,
+      bridge: reasoning.producerBridge,
+      choiceIndex,
+    },
+    groupAliases: [{ kind: 'chat-choice', choiceIndex, memberKind: visibleKind }],
+    memberAliases: [{ kind: 'chat-scalar', choiceIndex, visibleKind }],
+  }
+}
+
+function reasoningObservationEvent(
+  observations: readonly ReasoningObservation[],
+  chunkId?: string,
+): Extract<StreamLaneEvent, { lane: 'reasoning-observation' }> {
+  return {
+    lane: 'reasoning-observation',
+    batch: { observations },
+    ...(chunkId === undefined ? {} : { chunkId }),
+  }
+}
+
+function reasoningLaneIntegrity(
+  issues: readonly string[],
+): StreamLaneEvent & { lane: 'integrity' } {
+  const value = issues.join('|')
+  let hash = 0x811c9dc5
+  for (let index = 0; index < value.length; index += 1) {
+    hash = Math.imul(hash ^ value.charCodeAt(index), 0x01000193)
+  }
+  return {
+    lane: 'integrity',
+    integrity: {
+      category: 'malformed-event-shape',
+      adapter: 'chat-completions',
+      eventType: 'reasoning_details',
+      count: issues.length,
+      fingerprint: `fnv1a32:${(hash >>> 0).toString(16).padStart(8, '0')}`,
+      characterCount: value.length,
+    },
+  }
 }
 
 // Splits a source iterable of `ChatStreamChunk`s into lane-tagged events.
@@ -204,12 +201,9 @@ interface SplitChatStreamOptions {
 // no-op for non-thinking models.
 export async function* splitChatStream(
   source: AsyncIterable<ChatStreamChunk>,
-  opts: SplitChatStreamOptions = {},
+  opts: SplitChatStreamOptions,
 ): AsyncGenerator<StreamLaneEvent> {
-  const lifter = createInlineReasoningLifter({
-    ...(opts.inlineReasoningTags !== undefined ? { tags: opts.inlineReasoningTags } : {}),
-    ...(opts.forceInlineReasoning === true ? { autoDetect: false } : {}),
-  })
+  const choiceStates = new Map<number, ChatChoiceStreamState>()
   let transportTerminal: Extract<StreamLaneEvent, { lane: 'terminal' }> | undefined
   for await (const chunk of source) {
     if (chunk.type === 'integrity') {
@@ -225,18 +219,19 @@ export async function* splitChatStream(
       continue
     }
     if (chunk.type === 'buffered_result') {
-      yield* splitBufferedResult(chunk.result, chunk.generationId, lifter)
+      yield* splitBufferedResult(chunk.result, chunk.generationId, choiceStates, opts)
       continue
     }
-    yield* splitDelta(chunk.chunk, chunk.generationId, lifter)
+    yield* splitDelta(chunk.chunk, chunk.generationId, choiceStates, opts)
   }
 
-  // End-of-stream: flush any pending content buffered by the lifter.
-  for (const flushed of lifter.finish()) {
-    if (flushed.kind === 'text') {
-      yield { lane: 'text', text: flushed.text }
-    } else {
-      yield { lane: 'reasoning', textDelta: flushed.text }
+  for (const [choiceIndex, state] of choiceStates) {
+    for (const flushed of state.lifter.finish()) {
+      if (flushed.kind === 'text') {
+        yield { lane: 'text', text: flushed.text }
+      } else {
+        yield reasoningObservationEvent([inlineReasoningObservation(flushed.text, choiceIndex)])
+      }
     }
   }
   if (transportTerminal) yield transportTerminal
@@ -245,7 +240,8 @@ export async function* splitChatStream(
 function* splitDelta(
   chunk: ChatCompletionChunkWire,
   generationId: string | undefined,
-  lifter: InlineReasoningLifter,
+  choiceStates: Map<number, ChatChoiceStreamState>,
+  opts: SplitChatStreamOptions,
 ): Generator<StreamLaneEvent> {
   // Mid-stream error frame — §4.5: top-level `error` on a 200 response body.
   if (chunk.error) {
@@ -276,8 +272,29 @@ function* splitDelta(
   }
   if (metaDirty) yield meta
 
-  for (const choice of chunk.choices ?? []) {
-    yield* splitChoiceDelta(choice, typeof chunk.id === 'string' ? chunk.id : undefined, lifter)
+  for (const [choiceOrdinal, choice] of (chunk.choices ?? []).entries()) {
+    const choiceIndex = choice.index ?? choiceOrdinal
+    const state = chatChoiceStreamState(choiceStates, choiceIndex, opts)
+    yield* splitChoiceDelta(
+      choice,
+      choiceIndex,
+      typeof chunk.id === 'string' ? chunk.id : undefined,
+      state,
+      opts.reasoning,
+    )
+  }
+
+  const firstAnnotationState = choiceStates.values().next().value?.annotationState
+  const rootAnnotations = normalizeContentAnnotations(annotationValues(chunk.citations), {
+    source: 'openai-chat',
+    text: firstAnnotationState?.text ?? '',
+  })
+  if (rootAnnotations.length > 0) {
+    yield {
+      lane: 'text-annotations',
+      annotations: rootAnnotations,
+      ownerTextLength: firstAnnotationState?.text.length ?? 0,
+    }
   }
 
   if (chunk.usage) {
@@ -291,11 +308,15 @@ function* splitDelta(
 
 function* splitChoiceDelta(
   choice: ChatCompletionChoiceWire,
+  choiceIndex: number,
   chunkId: string | undefined,
-  lifter: InlineReasoningLifter,
+  state: ChatChoiceStreamState,
+  reasoning: AttemptChatStreamReasoningContract,
 ): Generator<StreamLaneEvent> {
+  const { lifter, annotationState } = state
   const delta = choice.delta
   if (delta) {
+    if (typeof delta.content === 'string') annotationState.text += delta.content
     if (typeof delta.content === 'string' && delta.content.length > 0) {
       for (const ev of lifter.feed(delta.content)) {
         if (ev.kind === 'text') {
@@ -306,11 +327,23 @@ function* splitChoiceDelta(
           }
         } else {
           yield {
-            lane: 'reasoning',
-            textDelta: ev.text,
-            ...(chunkId !== undefined ? { chunkId } : {}),
+            ...reasoningObservationEvent(
+              [inlineReasoningObservation(ev.text, choiceIndex)],
+              chunkId,
+            ),
           }
         }
+      }
+    }
+    const annotations = normalizeContentAnnotations(
+      annotationValues(delta.annotations, delta.citations),
+      { source: 'openai-chat', text: annotationState.text },
+    )
+    if (annotations.length > 0) {
+      yield {
+        lane: 'text-annotations',
+        annotations,
+        ownerTextLength: annotationState.text.length,
       }
     }
     const reasoningText =
@@ -321,21 +354,30 @@ function* splitChoiceDelta(
       ? delta.reasoning_details
       : undefined
     if (reasoningText !== undefined || reasoningDetails !== undefined) {
-      const event: StreamLaneEvent & { lane: 'reasoning' } = { lane: 'reasoning' }
-      const mirror =
-        reasoningText !== undefined
-          ? reasoningDetailsMirrorInfo(reasoningText, reasoningDetails)
-          : { kind: 'none' as const }
-      const detailsMirrorScalar = mirror.kind !== 'none'
-      if (reasoningText !== undefined && !detailsMirrorScalar) {
-        event.textDelta = reasoningText
-      }
+      let detailObservations: ReasoningObservation[] = []
       if (reasoningDetails !== undefined) {
-        event.details = reasoningDetails
-        event.detailsMode = mirror.kind === 'cumulative' ? 'cumulative' : 'delta'
+        const decoded = decodeProviderReasoningDetails(reasoningDetails, reasoning.targetFormat)
+        if (decoded.issues.length > 0) yield reasoningLaneIntegrity(decoded.issues)
+        if (decoded.details.length > 0) {
+          detailObservations = reasoningObservationsFromDetails({
+            details: decoded.details,
+            mode: 'delta',
+            dialect: reasoning.originDialect,
+            bridge: reasoning.producerBridge,
+            untypedVisibleKind: visibleKindForInboundReasoning(reasoning.inboundVisibility),
+            separateGeminiVisibleSections: reasoningText === undefined,
+            source: { choiceIndex },
+          })
+        }
       }
-      if (chunkId !== undefined) event.chunkId = chunkId
-      yield event
+      const observations = reconcileChatReasoningObservations(
+        reasoningText,
+        detailObservations,
+        choiceIndex,
+        reasoning,
+        'append',
+      )
+      if (observations.length > 0) yield reasoningObservationEvent(observations, chunkId)
     }
     if (Array.isArray(delta.tool_calls)) {
       for (const raw of delta.tool_calls) {
@@ -383,9 +425,10 @@ function* splitChoiceDelta(
         }
       } else {
         yield {
-          lane: 'reasoning',
-          textDelta: flushed.text,
-          ...(chunkId !== undefined ? { chunkId } : {}),
+          ...reasoningObservationEvent(
+            [inlineReasoningObservation(flushed.text, choiceIndex)],
+            chunkId,
+          ),
         }
       }
     }
@@ -430,7 +473,8 @@ function toToolCallEvent(
 function* splitBufferedResult(
   result: ChatCompletionResultWire,
   generationId: string | undefined,
-  lifter: InlineReasoningLifter,
+  choiceStates: Map<number, ChatChoiceStreamState>,
+  opts: SplitChatStreamOptions,
 ): Generator<StreamLaneEvent> {
   if (result.error) {
     yield {
@@ -459,12 +503,13 @@ function* splitBufferedResult(
   }
   if (metaDirty) yield meta
 
-  yield { lane: 'buffered', result, ...(generationId !== undefined ? { generationId } : {}) }
-
   // Synthesize the same lanes as the streaming path so downstream consumers
   // have one accumulation contract for buffered and incremental responses.
   const choice = result.choices?.[0]
+  const choiceIndex = choice?.index ?? 0
+  const state = chatChoiceStreamState(choiceStates, choiceIndex, opts)
   const messageText = typeof choice?.message?.content === 'string' ? choice.message.content : ''
+  state.annotationState.text = messageText
   const reasoningText =
     typeof choice?.message?.reasoning === 'string' && choice.message.reasoning.length > 0
       ? choice.message.reasoning
@@ -473,19 +518,31 @@ function* splitBufferedResult(
     ? choice.message.reasoning_details
     : undefined
   if (reasoningText !== undefined || reasoningDetails !== undefined) {
-    const event: StreamLaneEvent & { lane: 'reasoning' } = { lane: 'reasoning' }
-    if (
-      reasoningText !== undefined &&
-      !reasoningDetailsMirrorText(reasoningText, reasoningDetails)
-    ) {
-      event.textDelta = reasoningText
-    }
+    let detailObservations: ReasoningObservation[] = []
     if (reasoningDetails !== undefined) {
-      event.details = reasoningDetails
-      event.detailsMode = 'snapshot'
+      const decoded = decodeProviderReasoningDetails(reasoningDetails, opts.reasoning.targetFormat)
+      if (decoded.issues.length > 0) yield reasoningLaneIntegrity(decoded.issues)
+      if (decoded.details.length > 0) {
+        detailObservations = reasoningObservationsFromDetails({
+          details: decoded.details,
+          mode: 'snapshot',
+          dialect: opts.reasoning.originDialect,
+          bridge: opts.reasoning.producerBridge,
+          untypedVisibleKind: visibleKindForInboundReasoning(opts.reasoning.inboundVisibility),
+          source: { choiceIndex },
+        })
+      }
     }
-    if (typeof result.id === 'string') event.chunkId = result.id
-    yield event
+    const observations = reconcileChatReasoningObservations(
+      reasoningText,
+      detailObservations,
+      choiceIndex,
+      opts.reasoning,
+      'set',
+    )
+    if (observations.length > 0) {
+      yield reasoningObservationEvent(observations, result.id)
+    }
   }
   if (Array.isArray(choice?.message?.tool_calls)) {
     for (const [index, raw] of choice.message.tool_calls.entries()) {
@@ -494,7 +551,7 @@ function* splitBufferedResult(
     }
   }
   if (messageText.length > 0) {
-    for (const ev of lifter.feed(messageText)) {
+    for (const ev of state.lifter.feed(messageText)) {
       if (ev.kind === 'text') {
         yield {
           lane: 'text',
@@ -502,12 +559,22 @@ function* splitBufferedResult(
           ...(typeof result.id === 'string' ? { chunkId: result.id } : {}),
         }
       } else {
-        yield {
-          lane: 'reasoning',
-          textDelta: ev.text,
-          ...(typeof result.id === 'string' ? { chunkId: result.id } : {}),
-        }
+        yield reasoningObservationEvent(
+          [inlineReasoningObservation(ev.text, choiceIndex)],
+          result.id,
+        )
       }
+    }
+  }
+  const annotations = normalizeContentAnnotations(
+    annotationValues(choice?.message?.annotations, choice?.message?.citations, result.citations),
+    { source: 'openai-chat', text: messageText },
+  )
+  if (annotations.length > 0) {
+    yield {
+      lane: 'text-annotations',
+      annotations,
+      ownerTextLength: messageText.length,
     }
   }
   if (Array.isArray(choice?.message?.images)) {
@@ -554,60 +621,150 @@ function* splitBufferedResult(
   }
 }
 
-function reasoningDetailsMirrorText(
-  reasoningText: string,
-  details: unknown[] | undefined,
-): boolean {
-  return reasoningDetailsMirrorInfo(reasoningText, details).kind !== 'none'
+function reconcileChatReasoningObservations(
+  scalar: string | undefined,
+  observations: readonly ReasoningObservation[],
+  choiceIndex: number,
+  reasoning: AttemptChatStreamReasoningContract,
+  scalarUpdate: 'append' | 'set',
+): ReasoningObservation[] {
+  const reconciled = [...observations]
+  const visible = reconciled.filter(
+    (observation): observation is Extract<ReasoningObservation, { kind: 'visible' }> =>
+      observation.kind === 'visible',
+  )
+  const sameKindVisible = visible.filter(
+    (observation): observation is Extract<ReasoningObservation, { kind: 'visible' }> =>
+      observation.visibleKind === visibleKindForInboundReasoning(reasoning.inboundVisibility),
+  )
+  if (scalar === undefined) {
+    const terminalBindings = reconciled.filter(
+      (
+        observation,
+      ): observation is Extract<ReasoningObservation, { kind: 'carrier' }> & {
+        binding: NonNullable<Extract<ReasoningObservation, { kind: 'carrier' }>['binding']>
+      } =>
+        observation.kind === 'carrier' &&
+        observation.carrierKind === 'anthropic-signature' &&
+        observation.binding?.visibleKind ===
+          visibleKindForInboundReasoning(reasoning.inboundVisibility),
+    )
+    if (visible.length === 0 && terminalBindings.length === 1) {
+      return attachUnambiguousChatScalarAlias(
+        reconciled,
+        choiceIndex,
+        visibleKindForInboundReasoning(reasoning.inboundVisibility),
+      )
+    }
+    return reconciled
+  }
+  if (visible.length === 0) {
+    return [
+      chatScalarReasoningObservation(scalar, choiceIndex, reasoning, scalarUpdate),
+      ...reconciled,
+    ]
+  }
+  let scalarOffset = 0
+  let exactFrameMirror = true
+  for (const observation of visible) {
+    if (!scalar.startsWith(observation.value, scalarOffset)) exactFrameMirror = false
+    scalarOffset += observation.value.length
+  }
+  if (exactFrameMirror && scalarOffset === scalar.length) {
+    return attachUnambiguousChatScalarAlias(
+      reconciled,
+      choiceIndex,
+      visibleKindForInboundReasoning(reasoning.inboundVisibility),
+    )
+  }
+  const target = sameKindVisible.length === 1 ? sameKindVisible[0] : undefined
+  if (target?.format === 'anthropic-claude-v1' && target.value.endsWith(scalar)) {
+    const targetIndex = reconciled.indexOf(target)
+    return attachUnambiguousChatScalarAlias(
+      reconciled,
+      choiceIndex,
+      visibleKindForInboundReasoning(reasoning.inboundVisibility),
+    ).map((observation, index) =>
+      index === targetIndex && observation.kind === 'visible'
+        ? {
+            ...observation,
+            update: scalarUpdate === 'append' ? 'append-overlap' : 'set',
+          }
+        : observation,
+    )
+  }
+  return [
+    chatScalarReasoningObservation(scalar, choiceIndex, reasoning, scalarUpdate),
+    ...reconciled,
+  ]
 }
 
-function reasoningDetailsMirrorInfo(
-  reasoningText: string,
-  details: unknown[] | undefined,
-): { kind: 'none' | 'exact' | 'cumulative'; value?: string } {
-  if (!details || details.length === 0) return { kind: 'none' }
-  let merged = ''
-  let sawText = false
-  let anthropicTextOnly = true
-  let mergedSummary = ''
-  let sawOpenAiSummary = false
-  for (const raw of details) {
-    if (!raw || typeof raw !== 'object') continue
-    const detail = raw as {
-      id?: unknown
-      type?: unknown
-      text?: unknown
-      summary?: unknown
-      format?: unknown
+function attachUnambiguousChatScalarAlias(
+  observations: readonly ReasoningObservation[],
+  choiceIndex: number,
+  visibleKind: 'text' | 'summary',
+): ReasoningObservation[] {
+  const matchingGroups = new Set<string>()
+  for (const observation of observations) {
+    const binding = observation.kind === 'visible' ? observation : observation.binding
+    if (binding?.visibleKind === visibleKind) {
+      matchingGroups.add(JSON.stringify(binding.groupAliases))
     }
-    if (typeof detail.id === 'string' && detail.id.startsWith('tool_')) continue
-    if (detail.type === 'reasoning.text' && typeof detail.text === 'string') {
-      merged += detail.text
-      sawText = true
-      anthropicTextOnly &&= detail.format === 'anthropic-claude-v1'
-      continue
+  }
+  if (matchingGroups.size !== 1) return [...observations]
+  const [matchingGroup] = matchingGroups
+  return observations.map((observation) => {
+    if (observation.kind === 'visible') {
+      return observation.visibleKind === visibleKind &&
+        JSON.stringify(observation.groupAliases) === matchingGroup
+        ? withChatScalarAlias(observation, choiceIndex, visibleKind)
+        : observation
     }
+    const binding = observation.binding
     if (
-      detail.type === 'reasoning.summary' &&
-      typeof detail.summary === 'string' &&
-      typeof detail.format === 'string' &&
-      isOpenAiResponsesFamilyFormat(detail.format as ReasoningFormat)
+      binding?.visibleKind !== visibleKind ||
+      JSON.stringify(binding.groupAliases) !== matchingGroup
     ) {
-      mergedSummary += detail.summary
-      sawOpenAiSummary = true
+      return observation
+    }
+    return {
+      ...observation,
+      groupAliases: [
+        { kind: 'chat-choice', choiceIndex, memberKind: visibleKind },
+        ...observation.groupAliases,
+      ],
+      binding: withChatScalarAlias(binding, choiceIndex, visibleKind),
+    }
+  })
+}
+
+function withChatScalarAlias<Observation extends ReasoningVisibleBindingObservation>(
+  observation: Observation,
+  choiceIndex: number,
+  visibleKind: 'text' | 'summary',
+): Observation {
+  const scalarAlias: ReasoningMemberAlias = { kind: 'chat-scalar', choiceIndex, visibleKind }
+  return {
+    ...observation,
+    groupAliases: [
+      { kind: 'chat-choice', choiceIndex, memberKind: visibleKind },
+      ...observation.groupAliases,
+    ],
+    memberAliases: [scalarAlias, ...observation.memberAliases],
+  }
+}
+
+function annotationValues(...values: unknown[]): unknown[] {
+  const annotations: unknown[] = []
+  for (const value of values) {
+    if (!Array.isArray(value)) continue
+    for (const annotation of value) {
+      annotations.push(
+        typeof annotation === 'string' ? { type: 'url_citation', url: annotation } : annotation,
+      )
     }
   }
-  if (sawText && merged === reasoningText) return { kind: 'exact', value: merged }
-  if (sawText && anthropicTextOnly && merged.endsWith(reasoningText)) {
-    return { kind: 'cumulative', value: merged }
-  }
-  if (sawOpenAiSummary && mergedSummary === reasoningText) {
-    return { kind: 'exact', value: mergedSummary }
-  }
-  return {
-    kind: 'none',
-    ...(sawText ? { value: merged } : sawOpenAiSummary ? { value: mergedSummary } : {}),
-  }
+  return annotations
 }
 
 function contentItemsFromChatImages(images: readonly unknown[]): ContentItem[] {
@@ -738,30 +895,13 @@ function normalizeMediaUrl(value: string): string | null {
 // Phase 11: Responses-API splitter.
 // ---------------------------------------------------------------------------
 
-const SERVER_TOOL_ITEM_TYPES = new Set<string>([
-  'web_search_call',
-  'file_search_call',
-  'image_generation_call',
-  'code_interpreter_call',
-  'shell_call',
-  'shell_call_output',
-  'computer_call',
-  'mcp_tool_call',
-  'mcp_call',
-  'openrouter:datetime',
-  'openrouter:web_fetch',
-  'openrouter:web_search',
-  'server_tool_use',
-  'web_search_tool_result',
-  'web_fetch_tool_result',
-  'code_execution_tool_result',
-  'bash_code_execution_tool_result',
-  'text_editor_code_execution_tool_result',
-  'advisor_tool_result',
-])
-
 export async function* splitResponsesStream(
   source: AsyncIterable<ResponsesStreamChunk>,
+  reasoning: AttemptResponsesReasoningContract,
+  providerOutput: Extract<
+    AttemptProviderOutputContract,
+    { captureDialect: 'openai-responses' | 'openrouter-responses' }
+  >,
 ): AsyncGenerator<StreamLaneEvent> {
   let metaEmittedModel: string | undefined
   let metaEmittedGenerationId: string | undefined
@@ -776,8 +916,13 @@ export async function* splitResponsesStream(
       continue
     }
     if (chunk.type === 'buffered_result') {
-      yield* splitBufferedResponsesResult(chunk.result, chunk.generationId)
-      continue
+      yield* splitBufferedResponsesResult(
+        chunk.result,
+        chunk.generationId,
+        reasoning,
+        providerOutput.captureDialect,
+      )
+      return
     }
     const ev = chunk.event
     const maybeMeta = metaFromEvent(
@@ -791,7 +936,8 @@ export async function* splitResponsesStream(
       metaEmittedGenerationId = maybeMeta.generationId ?? metaEmittedGenerationId
       yield maybeMeta
     }
-    yield* splitResponsesEvent(ev)
+    yield* splitResponsesEvent(ev, reasoning, providerOutput.captureDialect)
+    if (ev.type === 'response.completed' || ev.type === 'response.failed') return
   }
 }
 
@@ -824,7 +970,58 @@ function metaFromEvent(
   return event.model !== undefined || event.generationId !== undefined ? event : null
 }
 
-function* splitResponsesEvent(ev: ResponsesEventWire): Generator<StreamLaneEvent> {
+function encryptedReasoningEventFromResponsesItem(
+  item: ResponsesInputItem,
+  outputIndex: number,
+  reasoning: AttemptResponsesReasoningContract,
+): StreamLaneEvent | null {
+  if (item.type !== 'reasoning' || typeof item.encrypted_content !== 'string') return null
+  const itemId = typeof item.id === 'string' ? item.id : undefined
+  return reasoningObservationEvent([
+    {
+      kind: 'carrier',
+      carrierKind: 'responses-encrypted',
+      update: 'set',
+      value: item.encrypted_content,
+      format: reasoning.targetFormat,
+      source: {
+        dialect: reasoning.originDialect,
+        bridge: reasoning.producerBridge,
+        outputIndex,
+        ...(itemId ? { itemId } : {}),
+      },
+      groupAliases: responsesReasoningGroupAliases(itemId, outputIndex),
+      memberAliases: responsesReasoningMemberAliases(itemId, outputIndex, 'encrypted'),
+    },
+  ])
+}
+
+function responsesReasoningGroupAliases(
+  itemId: string | undefined,
+  outputIndex: number,
+): ReasoningObservation['groupAliases'] {
+  return [
+    { kind: 'responses-output', outputIndex },
+    ...(itemId ? ([{ kind: 'responses-item', itemId }] as const) : []),
+  ]
+}
+
+function responsesReasoningMemberAliases(
+  itemId: string | undefined,
+  outputIndex: number,
+  member: Extract<ReasoningMemberAlias, { kind: 'responses-member' }>['member'],
+): ReasoningMemberAlias[] {
+  return [
+    { kind: 'responses-member', outputIndex, member },
+    ...(itemId ? ([{ kind: 'responses-member', outputIndex, itemId, member }] as const) : []),
+  ]
+}
+
+function* splitResponsesEvent(
+  ev: ResponsesEventWire,
+  reasoning: AttemptResponsesReasoningContract,
+  providerOutputDialect: 'openai-responses' | 'openrouter-responses',
+): Generator<StreamLaneEvent> {
   // Forward-compat: unknown event types are dropped silently (don't crash).
   const t = (ev as { type?: unknown }).type
   if (typeof t !== 'string') return
@@ -836,31 +1033,29 @@ function* splitResponsesEvent(ev: ResponsesEventWire): Generator<StreamLaneEvent
 
     case 'response.output_item.added': {
       const e = ev as Extract<ResponsesEventWire, { type: 'response.output_item.added' }>
-      yield { lane: 'output-item-added', outputIndex: e.output_index, item: e.item }
+      yield {
+        lane: 'output-item-added',
+        dialect: providerOutputDialect,
+        outputIndex: e.output_index,
+        item: e.item,
+      }
       const functionCall = toolCallEventFromResponsesItem(e.item, e.output_index, false)
       if (functionCall) yield functionCall
       // Auto-expand the reasoning lane when an encrypted reasoning item shows
       // up. We emit a reasoning event with the INITIAL encrypted_content so
       // UI shows a blob-sized hint immediately; `output_item.done` later
       // REPLACES the value with the final one.
-      if (e.item.type === 'reasoning' && typeof e.item.encrypted_content === 'string') {
-        yield {
-          lane: 'reasoning',
-          encryptedDelta: e.item.encrypted_content,
-          replaceEncrypted: true,
-          outputIndex: e.output_index,
-          ...(typeof e.item.id === 'string' ? { itemId: e.item.id } : {}),
-        }
-      }
+      const encryptedReasoning = encryptedReasoningEventFromResponsesItem(
+        e.item,
+        e.output_index,
+        reasoning,
+      )
+      if (encryptedReasoning) yield encryptedReasoning
       // Server-tool items get a `server-tool` event on add too.
-      if (SERVER_TOOL_ITEM_TYPES.has(e.item.type)) {
+      if (isKnownProviderToolOutputType(e.item.type)) {
         yield {
           lane: 'server-tool',
-          itemType: e.item.type as StreamLaneEvent & { lane: 'server-tool' } extends {
-            itemType: infer U
-          }
-            ? U
-            : never,
+          itemType: e.item.type,
           status: 'in_progress',
           itemId: e.item.id ?? '',
           outputIndex: e.output_index,
@@ -871,21 +1066,23 @@ function* splitResponsesEvent(ev: ResponsesEventWire): Generator<StreamLaneEvent
 
     case 'response.output_item.done': {
       const e = ev as Extract<ResponsesEventWire, { type: 'response.output_item.done' }>
-      yield { lane: 'output-item-done', outputIndex: e.output_index, item: e.item }
+      yield {
+        lane: 'output-item-done',
+        dialect: providerOutputDialect,
+        outputIndex: e.output_index,
+        item: e.item,
+      }
       const functionCall = toolCallEventFromResponsesItem(e.item, e.output_index, true)
       if (functionCall) yield functionCall
       // Reasoning item: emit the FINAL encrypted_content as a replacing
       // reasoning event so the accumulator overwrites the partial from
       // `added` (see §5 of phase11-implementation).
-      if (e.item.type === 'reasoning' && typeof e.item.encrypted_content === 'string') {
-        yield {
-          lane: 'reasoning',
-          encryptedDelta: e.item.encrypted_content,
-          replaceEncrypted: true,
-          outputIndex: e.output_index,
-          ...(typeof e.item.id === 'string' ? { itemId: e.item.id } : {}),
-        }
-      }
+      const encryptedReasoning = encryptedReasoningEventFromResponsesItem(
+        e.item,
+        e.output_index,
+        reasoning,
+      )
+      if (encryptedReasoning) yield encryptedReasoning
       // Phase metadata rides on message items. GPT-5.4 family REQUIRES
       // this field to round-trip verbatim.
       if (e.item.type === 'message' && e.item.phase !== undefined) {
@@ -895,6 +1092,7 @@ function* splitResponsesEvent(ev: ResponsesEventWire): Generator<StreamLaneEvent
           outputIndex: e.output_index,
         }
       }
+      yield* responsesTextAnnotationEvents(e.item, e.output_index)
       const contentItem = contentItemFromResponsesOutputItem(e.item)
       if (contentItem) {
         yield {
@@ -921,24 +1119,50 @@ function* splitResponsesEvent(ev: ResponsesEventWire): Generator<StreamLaneEvent
 
     case 'response.reasoning.delta': {
       const e = ev as Extract<ResponsesEventWire, { type: 'response.reasoning.delta' }>
-      yield {
-        lane: 'reasoning',
-        textDelta: e.delta,
-        outputIndex: e.output_index,
-        itemId: e.item_id,
-      }
+      yield reasoningObservationEvent([
+        {
+          kind: 'visible',
+          visibleKind: 'text',
+          update: 'append',
+          value: e.delta,
+          format: reasoning.targetFormat,
+          source: {
+            dialect: reasoning.originDialect,
+            bridge: reasoning.producerBridge,
+            itemId: e.item_id,
+            outputIndex: e.output_index,
+          },
+          groupAliases: responsesReasoningGroupAliases(e.item_id, e.output_index),
+          memberAliases: responsesReasoningMemberAliases(e.item_id, e.output_index, 'text'),
+        },
+      ])
       return
     }
 
     case 'response.reasoning_summary_text.delta': {
       const e = ev as Extract<ResponsesEventWire, { type: 'response.reasoning_summary_text.delta' }>
-      yield {
-        lane: 'reasoning',
-        summaryDelta: e.delta,
-        outputIndex: e.output_index,
-        itemId: e.item_id,
-        summaryIndex: e.summary_index,
-      }
+      yield reasoningObservationEvent([
+        {
+          kind: 'visible',
+          visibleKind: 'summary',
+          update: 'append',
+          value: e.delta,
+          format: reasoning.targetFormat,
+          source: {
+            dialect: reasoning.originDialect,
+            bridge: reasoning.producerBridge,
+            itemId: e.item_id,
+            outputIndex: e.output_index,
+            summaryIndex: e.summary_index,
+          },
+          groupAliases: responsesReasoningGroupAliases(e.item_id, e.output_index),
+          memberAliases: responsesReasoningMemberAliases(
+            e.item_id,
+            e.output_index,
+            `summary:${e.summary_index}`,
+          ),
+        },
+      ])
       return
     }
 
@@ -1026,35 +1250,13 @@ function* splitResponsesEvent(ev: ResponsesEventWire): Generator<StreamLaneEvent
 
     case 'response.completed': {
       const e = ev as Extract<ResponsesEventWire, { type: 'response.completed' }>
-      const resp = e.response
-      if (resp.usage) yield { lane: 'usage', usage: normalizeResponsesUsage(resp.usage) }
-      const finishReason =
-        resp.status === 'completed'
-          ? 'stop'
-          : resp.status === 'incomplete'
-            ? (resp.incomplete_details?.reason ?? 'length')
-            : (resp.status ?? 'stop')
-      yield { lane: 'finish', finishReason }
+      yield projectResponsesResultSnapshot(e.response, undefined, reasoning, providerOutputDialect)
       return
     }
 
     case 'response.failed': {
       const e = ev as Extract<ResponsesEventWire, { type: 'response.failed' }>
-      const response = (e as { response?: ResponsesResultWire }).response
-      const errorPayload = response?.error ?? { message: 'Responses API reported failure' }
-      yield {
-        lane: 'error',
-        error: normalizeError(
-          { error: errorPayload },
-          {
-            midStream: true,
-            ...(typeof errorPayload.code === 'number' ? { httpStatus: errorPayload.code } : {}),
-          },
-        ),
-      }
-      if (response?.usage) {
-        yield { lane: 'usage', usage: normalizeResponsesUsage(response.usage) }
-      }
+      yield projectResponsesResultSnapshot(e.response, undefined, reasoning, providerOutputDialect)
       return
     }
 
@@ -1075,11 +1277,13 @@ function* splitResponsesEvent(ev: ResponsesEventWire): Generator<StreamLaneEvent
       return
     }
 
-    // These non-delta events are deliberately dropped. The lane model
-    // tracks the `text.delta` / `output_item.done` flow; part-level events
-    // are redundant for the accumulator.
     case 'response.content_part.added':
-    case 'response.content_part.done':
+      return
+    case 'response.content_part.done': {
+      const e = ev as Extract<ResponsesEventWire, { type: 'response.content_part.done' }>
+      yield* responsePartAnnotationEvents(e.part, e.output_index, e.content_index)
+      return
+    }
     case 'response.output_text.done':
     case 'response.reasoning_summary_part.added':
     case 'response.reasoning_summary_part.done':
@@ -1109,100 +1313,311 @@ function* splitResponsesEvent(ev: ResponsesEventWire): Generator<StreamLaneEvent
 function* splitBufferedResponsesResult(
   result: ResponsesResultWire,
   generationId: string | undefined,
+  reasoning: AttemptResponsesReasoningContract,
+  providerOutputDialect: 'openai-responses' | 'openrouter-responses',
 ): Generator<StreamLaneEvent> {
-  if (result.error) {
-    yield {
-      lane: 'error',
+  yield projectResponsesResultSnapshot(result, generationId, reasoning, providerOutputDialect)
+}
+
+function projectResponsesResultSnapshot(
+  result: ResponsesResultWire,
+  generationId: string | undefined,
+  reasoning: AttemptResponsesReasoningContract,
+  providerOutputDialect: 'openai-responses' | 'openrouter-responses',
+): Extract<StreamLaneEvent, { lane: 'result-snapshot' }> {
+  const issues: string[] = []
+  const outcome = responsesResultOutcome(result)
+  const payload =
+    result.output === undefined
+      ? ({ kind: 'retain' } as const)
+      : projectResponsesResultPayload(result.output, reasoning, providerOutputDialect, issues)
+  const effectiveGenerationId = generationId ?? result.id
+  return {
+    lane: 'result-snapshot',
+    payload,
+    outcome,
+    ...(typeof result.model === 'string' ? { model: result.model } : {}),
+    ...(effectiveGenerationId !== undefined ? { generationId: effectiveGenerationId } : {}),
+    ...(result.usage ? { usage: normalizeResponsesUsage(result.usage) } : {}),
+    ...(issues.length > 0 ? { integrity: [responsesResultIntegrity(issues)] } : {}),
+  }
+}
+
+function projectResponsesResultPayload(
+  output: readonly ResponsesInputItem[],
+  reasoning: AttemptResponsesReasoningContract,
+  providerOutputDialect: 'openai-responses' | 'openrouter-responses',
+  issues: string[],
+): Extract<Extract<StreamLaneEvent, { lane: 'result-snapshot' }>['payload'], { kind: 'replace' }> {
+  const textParts: Array<{
+    text: string
+    outputIndex: number
+    contentIndex: number
+    annotations: ReturnType<typeof normalizeContentAnnotations>
+  }> = []
+  const reasoningObservations: ReasoningObservation[] = []
+  const toolCalls: Array<{
+    index: number
+    id?: string
+    type?: 'function'
+    name?: string
+    arguments: string
+  }> = []
+  const generatedContent: ContentItem[] = []
+  const serverTools: GenerationServerToolCall[] = []
+  const providerOutputItems: ProviderOutputItem[] = []
+  const providerOutputIdentities = new Set<string>()
+  let phase: MessagePhase | null = null
+
+  for (const [outputIndex, item] of output.entries()) {
+    if (item.type === 'message') {
+      if (item.phase !== undefined) phase = item.phase ?? null
+      for (const [contentIndex, rawPart] of (item.content ?? []).entries()) {
+        if (!rawPart || typeof rawPart !== 'object') continue
+        const part = rawPart as { type?: unknown; text?: unknown; annotations?: unknown }
+        if (part.type !== 'output_text' || typeof part.text !== 'string') continue
+        textParts.push({
+          text: part.text,
+          outputIndex,
+          contentIndex,
+          annotations: normalizeContentAnnotations(
+            Array.isArray(part.annotations) ? part.annotations : [],
+            { source: 'openai-responses', text: part.text },
+          ),
+        })
+      }
+    } else if (item.type === 'reasoning') {
+      appendResponsesReasoningSnapshot(reasoningObservations, item, outputIndex, reasoning, issues)
+    } else if (item.type === 'function_call') {
+      toolCalls.push({
+        index: outputIndex,
+        ...(typeof item.call_id === 'string' ? { id: item.call_id } : {}),
+        type: 'function',
+        ...(typeof item.name === 'string' ? { name: item.name } : {}),
+        arguments: typeof item.arguments === 'string' ? item.arguments : '',
+      })
+    }
+
+    const contentItem = contentItemFromResponsesOutputItem(item)
+    if (contentItem) generatedContent.push(contentItem)
+
+    const providerItem = providerOutputItemFromResponsesItem(
+      item,
+      providerOutputDialect,
+      outputIndex,
+    )
+    if (providerItem) {
+      const identity = providerOutputItemIdentity(providerItem, providerOutputItems.length)
+      if (!providerOutputIdentities.has(identity)) {
+        providerOutputIdentities.add(identity)
+        providerOutputItems.push(providerItem)
+      }
+      if (isKnownProviderToolOutputType(providerItem.type)) {
+        serverTools.push({
+          type: providerItem.type,
+          source: 'responses-output',
+          ...(typeof item.id === 'string' ? { id: item.id } : {}),
+          ...(typeof item.status === 'string' ? { status: item.status } : {}),
+          outputIndex,
+        })
+      }
+    }
+  }
+
+  return {
+    kind: 'replace',
+    textParts,
+    reasoning: {
+      observations: reasoningObservations,
+    },
+    toolCalls,
+    generatedContent,
+    serverTools,
+    providerOutputItems,
+    phase,
+  }
+}
+
+function appendResponsesReasoningSnapshot(
+  target: ReasoningObservation[],
+  item: ResponsesInputItem,
+  outputIndex: number,
+  reasoning: AttemptResponsesReasoningContract,
+  issues: string[],
+): void {
+  const providerItemId = typeof item.id === 'string' ? item.id : undefined
+  const itemFormat = responsesReasoningFormat(item.format, reasoning.targetFormat, issues)
+  const source = {
+    dialect: reasoning.originDialect,
+    bridge: reasoning.producerBridge,
+    outputIndex,
+    ...(providerItemId ? { itemId: providerItemId } : {}),
+  } as const
+  if (typeof item.encrypted_content === 'string') {
+    target.push({
+      kind: 'carrier',
+      carrierKind: 'responses-encrypted',
+      update: 'set',
+      value: item.encrypted_content,
+      format: itemFormat,
+      source,
+      groupAliases: responsesReasoningGroupAliases(providerItemId, outputIndex),
+      memberAliases: responsesReasoningMemberAliases(providerItemId, outputIndex, 'encrypted'),
+    })
+  }
+  for (const [summaryIndex, rawSummary] of (item.summary ?? []).entries()) {
+    if (!rawSummary || typeof rawSummary !== 'object') continue
+    const summary = rawSummary as { text?: unknown; format?: unknown }
+    if (typeof summary.text !== 'string') continue
+    const format = responsesReasoningFormat(summary.format, itemFormat, issues)
+    target.push({
+      kind: 'visible',
+      visibleKind: 'summary',
+      update: 'set',
+      value: summary.text,
+      format,
+      source: { ...source, summaryIndex },
+      groupAliases: responsesReasoningGroupAliases(providerItemId, outputIndex),
+      memberAliases: responsesReasoningMemberAliases(
+        providerItemId,
+        outputIndex,
+        `summary:${summaryIndex}`,
+      ),
+    })
+  }
+
+  for (const [contentIndex, rawPart] of (item.content ?? []).entries()) {
+    if (!rawPart || typeof rawPart !== 'object') continue
+    const part = rawPart as { type?: unknown; text?: unknown; format?: unknown }
+    if (part.type !== 'reasoning_text' || typeof part.text !== 'string') continue
+    const format = responsesReasoningFormat(part.format, itemFormat, issues)
+    target.push({
+      kind: 'visible',
+      visibleKind: 'text',
+      update: 'set',
+      value: (part as { text: string }).text,
+      format,
+      source: { ...source, contentIndex },
+      groupAliases: responsesReasoningGroupAliases(providerItemId, outputIndex),
+      memberAliases: responsesReasoningMemberAliases(
+        providerItemId,
+        outputIndex,
+        `content:${contentIndex}`,
+      ),
+    })
+  }
+
+  const rawDetails = (item as { reasoning_details?: unknown }).reasoning_details
+  if (Array.isArray(rawDetails)) {
+    const decoded = decodeProviderReasoningDetails(
+      rawDetails,
+      itemFormat === 'unknown' ? null : itemFormat,
+    )
+    issues.push(...decoded.issues)
+    if (decoded.details.length > 0) {
+      target.push(
+        ...reasoningObservationsFromDetails({
+          details: decoded.details,
+          mode: 'snapshot',
+          dialect: reasoning.originDialect,
+          bridge: reasoning.producerBridge,
+          untypedVisibleKind: visibleKindForInboundReasoning(reasoning.inboundVisibility),
+          source: {
+            outputIndex,
+            ...(providerItemId ? { itemId: providerItemId } : {}),
+          },
+        }),
+      )
+    }
+  }
+}
+
+function responsesReasoningFormat(
+  raw: unknown,
+  fallback: ReasoningFormat,
+  issues: string[],
+): ReasoningFormat {
+  if (raw === undefined) return fallback
+  if (isReasoningFormat(raw)) return raw
+  issues.push('responses-reasoning-format-unknown')
+  return 'unknown'
+}
+
+function responsesResultOutcome(
+  result: ResponsesResultWire,
+): Extract<StreamLaneEvent, { lane: 'result-snapshot' }>['outcome'] {
+  if (result.error || result.status === 'failed') {
+    const errorPayload = result.error ?? { message: 'Responses API reported failure' }
+    return {
+      kind: 'error',
       error: normalizeError(
-        { error: result.error },
+        { error: errorPayload },
         {
           midStream: true,
-          ...(typeof result.error.code === 'number' ? { httpStatus: result.error.code } : {}),
+          ...(typeof errorPayload.code === 'number' ? { httpStatus: errorPayload.code } : {}),
         },
       ),
     }
-    return
   }
-  const effectiveGenId = generationId ?? result.id
-  if (result.model !== undefined || effectiveGenId !== undefined) {
-    const meta: StreamLaneEvent & { lane: 'meta' } = { lane: 'meta' }
-    if (typeof result.model === 'string') meta.model = result.model
-    if (effectiveGenId !== undefined) meta.generationId = effectiveGenId
-    yield meta
+  return {
+    kind: 'finish',
+    finishReason:
+      result.status === 'completed'
+        ? 'stop'
+        : result.status === 'incomplete'
+          ? (result.incomplete_details?.reason ?? 'length')
+          : (result.status ?? 'stop'),
   }
+}
+
+function responsesResultIntegrity(
+  issues: readonly string[],
+): Extract<StreamLaneEvent, { lane: 'integrity' }>['integrity'] {
+  const value = issues.join('|')
+  let hash = 0x811c9dc5
+  for (let index = 0; index < value.length; index += 1) {
+    hash = Math.imul(hash ^ value.charCodeAt(index), 0x01000193)
+  }
+  return {
+    category: 'malformed-event-shape',
+    adapter: 'responses',
+    eventType: 'response.result',
+    count: issues.length,
+    fingerprint: `fnv1a32:${(hash >>> 0).toString(16).padStart(8, '0')}`,
+    characterCount: value.length,
+  }
+}
+
+function* responsesTextAnnotationEvents(
+  item: ResponsesInputItem,
+  outputIndex: number,
+): Generator<StreamLaneEvent> {
+  if (item.type !== 'message') return
+  for (const [contentIndex, part] of (item.content ?? []).entries()) {
+    yield* responsePartAnnotationEvents(part, outputIndex, contentIndex)
+  }
+}
+
+function* responsePartAnnotationEvents(
+  value: unknown,
+  outputIndex: number,
+  contentIndex: number,
+): Generator<StreamLaneEvent> {
+  if (!value || typeof value !== 'object') return
+  const part = value as { type?: unknown; text?: unknown; annotations?: unknown }
+  if (part.type !== 'output_text' || typeof part.text !== 'string') return
+  const annotations = normalizeContentAnnotations(
+    Array.isArray(part.annotations) ? part.annotations : [],
+    { source: 'openai-responses', text: part.text },
+  )
+  if (annotations.length === 0) return
   yield {
-    lane: 'buffered',
-    result,
-    ...(generationId !== undefined ? { generationId } : {}),
+    lane: 'text-annotations',
+    annotations,
+    ownerTextLength: part.text.length,
+    outputIndex,
+    contentIndex,
   }
-
-  // Walk the output[] in order; synthesize lane events so downstream
-  // accumulators don't need a separate buffered code path.
-  for (const [idx, item] of (result.output ?? []).entries()) {
-    yield { lane: 'output-item-added', outputIndex: idx, item }
-    if (item.type === 'reasoning') {
-      if (typeof item.encrypted_content === 'string') {
-        yield {
-          lane: 'reasoning',
-          encryptedDelta: item.encrypted_content,
-          replaceEncrypted: true,
-          outputIndex: idx,
-          ...(typeof item.id === 'string' ? { itemId: item.id } : {}),
-        }
-      }
-      if (Array.isArray(item.summary)) {
-        for (const [summaryIndex, s] of item.summary.entries()) {
-          if (
-            typeof s === 'object' &&
-            s !== null &&
-            typeof (s as { text?: unknown }).text === 'string'
-          ) {
-            yield {
-              lane: 'reasoning',
-              summaryDelta: (s as { text: string }).text,
-              outputIndex: idx,
-              ...(typeof item.id === 'string' ? { itemId: item.id } : {}),
-              summaryIndex,
-            }
-          }
-        }
-      }
-    }
-    if (item.type === 'message') {
-      const textContent = (item.content ?? [])
-        .filter((c): c is { type: string; text?: unknown } => !!c && typeof c === 'object')
-        .filter((c) => c.type === 'output_text' && typeof c.text === 'string')
-        .map((c) => c.text as string)
-        .join('')
-      if (textContent.length > 0) {
-        yield { lane: 'text', text: textContent, outputIndex: idx }
-      }
-      if (item.phase !== undefined) {
-        yield { lane: 'phase', phase: item.phase ?? null, outputIndex: idx }
-      }
-    }
-    const contentItem = contentItemFromResponsesOutputItem(item)
-    if (contentItem) {
-      yield {
-        lane: 'content-item',
-        item: contentItem,
-        outputIndex: idx,
-        ...(typeof item.id === 'string' ? { itemId: item.id } : {}),
-      }
-    }
-    yield { lane: 'output-item-done', outputIndex: idx, item }
-    const functionCall = toolCallEventFromResponsesItem(item, idx, true)
-    if (functionCall) yield functionCall
-  }
-
-  if (result.usage) yield { lane: 'usage', usage: normalizeResponsesUsage(result.usage) }
-  const finishReason =
-    result.status === 'completed'
-      ? 'stop'
-      : result.status === 'incomplete'
-        ? (result.incomplete_details?.reason ?? 'length')
-        : (result.status ?? 'stop')
-  yield { lane: 'finish', finishReason }
 }
 
 function toolCallEventFromResponsesItem(
@@ -1278,10 +1693,13 @@ interface AnthropicBlockState {
   signatureParts: string[]
   inputJsonParts: string[]
   citations: unknown[]
+  textParts: string[]
 }
 
 export async function* splitAnthropicStream(
   source: AsyncIterable<AnthropicStreamChunk>,
+  reasoning: AttemptAnthropicReasoningContract,
+  providerOutput: Extract<AttemptProviderOutputContract, { captureDialect: 'anthropic-claude' }>,
 ): AsyncGenerator<StreamLaneEvent> {
   const blocks = new Map<number, AnthropicBlockState>()
   let finishReason: string | undefined
@@ -1298,7 +1716,12 @@ export async function* splitAnthropicStream(
       continue
     }
     if (chunk.type === 'buffered_result') {
-      yield* splitBufferedAnthropicResult(chunk.result, chunk.generationId)
+      yield* splitBufferedAnthropicResult(
+        chunk.result,
+        chunk.generationId,
+        reasoning,
+        providerOutput.captureDialect,
+      )
       continue
     }
 
@@ -1332,7 +1755,7 @@ export async function* splitAnthropicStream(
         const e = ev as Extract<AnthropicEventWire, { type: 'content_block_start' }>
         const state = createAnthropicBlockState(e.index, e.content_block)
         blocks.set(e.index, state)
-        yield* emitAnthropicBlockStart(state)
+        yield* emitAnthropicBlockStart(state, reasoning)
         break
       }
 
@@ -1340,7 +1763,7 @@ export async function* splitAnthropicStream(
         const e = ev as Extract<AnthropicEventWire, { type: 'content_block_delta' }>
         const state = blocks.get(e.index) ?? createAnthropicBlockState(e.index, { type: 'unknown' })
         blocks.set(e.index, state)
-        yield* applyAnthropicBlockDelta(state, e.delta)
+        yield* applyAnthropicBlockDelta(state, e.delta, reasoning)
         break
       }
 
@@ -1348,7 +1771,7 @@ export async function* splitAnthropicStream(
         const e = ev as Extract<AnthropicEventWire, { type: 'content_block_stop' }>
         const state = blocks.get(e.index)
         if (state) {
-          yield* emitAnthropicBlockDone(state)
+          yield* emitAnthropicBlockDone(state, reasoning, providerOutput.captureDialect)
           blocks.delete(e.index)
         }
         break
@@ -1406,32 +1829,109 @@ function createAnthropicBlockState(
     signatureParts: typeof block.signature === 'string' ? [block.signature] : [],
     inputJsonParts: [],
     citations: Array.isArray(block.citations) ? structuredClone(block.citations) : [],
+    textParts: typeof block.text === 'string' ? [block.text] : [],
   }
 }
 
-function* emitAnthropicBlockStart(state: AnthropicBlockState): Generator<StreamLaneEvent> {
+function anthropicThinkingObservation(
+  state: AnthropicBlockState,
+  value: string,
+  reasoning: AttemptAnthropicReasoningContract,
+  update: 'append' | 'set' = 'append',
+): Extract<ReasoningObservation, { kind: 'visible' }> {
+  return {
+    kind: 'visible',
+    visibleKind: visibleKindForInboundReasoning(reasoning.inboundVisibility),
+    update,
+    value,
+    format: reasoning.targetFormat,
+    source: {
+      dialect: 'anthropic-messages',
+      bridge: reasoning.producerBridge,
+      blockIndex: state.index,
+      outputIndex: state.index,
+    },
+    groupAliases: [{ kind: 'anthropic-block', blockIndex: state.index }],
+    memberAliases: [{ kind: 'anthropic-member', blockIndex: state.index, member: 'thinking' }],
+  }
+}
+
+function anthropicSignatureObservation(
+  state: AnthropicBlockState,
+  value: string,
+  reasoning: AttemptAnthropicReasoningContract,
+  update: 'append' | 'set',
+): Extract<ReasoningObservation, { kind: 'carrier' }> {
+  const visible = anthropicThinkingObservation(state, '', reasoning)
+  return {
+    kind: 'carrier',
+    carrierKind: 'anthropic-signature',
+    update,
+    value,
+    format: reasoning.targetFormat,
+    source: {
+      dialect: 'anthropic-messages',
+      bridge: reasoning.producerBridge,
+      blockIndex: state.index,
+      outputIndex: state.index,
+    },
+    groupAliases: [{ kind: 'anthropic-block', blockIndex: state.index }],
+    memberAliases: [{ kind: 'anthropic-member', blockIndex: state.index, member: 'signature' }],
+    binding: {
+      visibleKind: visible.visibleKind,
+      format: visible.format,
+      source: visible.source,
+      groupAliases: visible.groupAliases,
+      memberAliases: visible.memberAliases,
+    },
+  }
+}
+
+function anthropicRedactedObservation(
+  state: AnthropicBlockState,
+  value: string,
+  reasoning: AttemptAnthropicReasoningContract,
+): Extract<ReasoningObservation, { kind: 'carrier' }> {
+  return {
+    kind: 'carrier',
+    carrierKind: 'anthropic-redacted',
+    update: 'set',
+    value,
+    format: reasoning.targetFormat,
+    source: {
+      dialect: 'anthropic-messages',
+      bridge: reasoning.producerBridge,
+      blockIndex: state.index,
+      outputIndex: state.index,
+    },
+    groupAliases: [{ kind: 'anthropic-block', blockIndex: state.index }],
+    memberAliases: [{ kind: 'anthropic-member', blockIndex: state.index, member: 'redacted' }],
+  }
+}
+
+function* emitAnthropicBlockStart(
+  state: AnthropicBlockState,
+  reasoning: AttemptAnthropicReasoningContract,
+): Generator<StreamLaneEvent> {
   const type = state.block.type
   const initialText = typeof state.block.text === 'string' ? state.block.text : ''
   const initialThinking = typeof state.block.thinking === 'string' ? state.block.thinking : ''
   if (type === 'text' && initialText.length > 0) {
     yield { lane: 'text', text: initialText, outputIndex: state.index, contentIndex: state.index }
-  } else if (type === 'thinking' && initialThinking.length > 0) {
-    yield {
-      lane: 'reasoning',
-      textDelta: initialThinking,
-      format: 'anthropic-claude-v1',
-      outputIndex: state.index,
-      itemId: anthropicReasoningId(state),
+  } else if (type === 'thinking') {
+    const observations: ReasoningObservation[] = []
+    if (initialThinking.length > 0) {
+      observations.push(anthropicThinkingObservation(state, initialThinking, reasoning))
     }
+    const signature = state.signatureParts.join('')
+    if (signature.length > 0) {
+      observations.push(anthropicSignatureObservation(state, signature, reasoning, 'set'))
+    }
+    if (observations.length > 0) yield reasoningObservationEvent(observations)
   } else if (type === 'redacted_thinking' && typeof state.block.data === 'string') {
-    yield {
-      lane: 'reasoning',
-      encryptedDelta: state.block.data,
-      format: 'anthropic-claude-v1',
-      replaceEncrypted: true,
-      outputIndex: state.index,
-      itemId: anthropicReasoningId(state),
-    }
+    yield reasoningObservationEvent([
+      anthropicRedactedObservation(state, state.block.data, reasoning),
+    ])
   } else if (type === 'tool_use') {
     const event: StreamLaneEvent & { lane: 'tool-call' } = {
       lane: 'tool-call',
@@ -1459,24 +1959,25 @@ function* emitAnthropicBlockStart(state: AnthropicBlockState): Generator<StreamL
 function* applyAnthropicBlockDelta(
   state: AnthropicBlockState,
   delta: AnthropicContentBlock,
+  reasoning: AttemptAnthropicReasoningContract,
 ): Generator<StreamLaneEvent> {
   const deltaType = delta.type
   if (deltaType === 'text_delta' && typeof delta.text === 'string') {
+    state.textParts.push(delta.text)
     yield { lane: 'text', text: delta.text, outputIndex: state.index, contentIndex: state.index }
     return
   }
   if (deltaType === 'thinking_delta' && typeof delta.thinking === 'string') {
-    yield {
-      lane: 'reasoning',
-      textDelta: delta.thinking,
-      format: 'anthropic-claude-v1',
-      outputIndex: state.index,
-      itemId: anthropicReasoningId(state),
-    }
+    yield reasoningObservationEvent([
+      anthropicThinkingObservation(state, delta.thinking, reasoning),
+    ])
     return
   }
   if (deltaType === 'signature_delta' && typeof delta.signature === 'string') {
     state.signatureParts.push(delta.signature)
+    yield reasoningObservationEvent([
+      anthropicSignatureObservation(state, delta.signature, reasoning, 'append'),
+    ])
     return
   }
   if (deltaType === 'input_json_delta' && typeof delta.partial_json === 'string') {
@@ -1495,41 +1996,42 @@ function* applyAnthropicBlockDelta(
   }
 }
 
-function* emitAnthropicBlockDone(state: AnthropicBlockState): Generator<StreamLaneEvent> {
+function* emitAnthropicBlockDone(
+  state: AnthropicBlockState,
+  reasoning: AttemptAnthropicReasoningContract,
+  providerOutputDialect: 'anthropic-claude',
+): Generator<StreamLaneEvent> {
   const type = state.block.type
+  if (type === 'text') {
+    const text = state.textParts.join('')
+    const annotations = normalizeContentAnnotations(state.citations, {
+      source: 'anthropic-messages',
+      text,
+    })
+    if (annotations.length > 0) {
+      yield {
+        lane: 'text-annotations',
+        annotations,
+        ownerTextLength: text.length,
+        outputIndex: state.index,
+        contentIndex: state.index,
+      }
+    }
+    return
+  }
   if (type === 'thinking') {
     const signature = state.signatureParts.join('')
-    yield {
-      lane: 'reasoning',
-      details: [
-        {
-          type: 'reasoning.text',
-          id: `text#${anthropicReasoningId(state)}`,
-          index: state.index,
-          format: 'anthropic-claude-v1',
-          ...(signature.length > 0 ? { signature } : {}),
-        },
-      ],
-      outputIndex: state.index,
-      itemId: anthropicReasoningId(state),
+    if (signature.length > 0) {
+      yield reasoningObservationEvent([
+        anthropicSignatureObservation(state, signature, reasoning, 'set'),
+      ])
     }
     return
   }
   if (type === 'redacted_thinking' && typeof state.block.data === 'string') {
-    yield {
-      lane: 'reasoning',
-      details: [
-        {
-          type: 'reasoning.encrypted',
-          id: anthropicReasoningId(state),
-          index: state.index,
-          format: 'anthropic-claude-v1',
-          data: state.block.data,
-        },
-      ],
-      outputIndex: state.index,
-      itemId: anthropicReasoningId(state),
-    }
+    yield reasoningObservationEvent([
+      anthropicRedactedObservation(state, state.block.data, reasoning),
+    ])
     return
   }
   if (type === 'tool_use') {
@@ -1561,6 +2063,7 @@ function* emitAnthropicBlockDone(state: AnthropicBlockState): Generator<StreamLa
   }
   yield {
     lane: 'server-tool-output',
+    dialect: providerOutputDialect,
     itemType: type,
     itemId,
     outputIndex: state.index,
@@ -1572,6 +2075,8 @@ function* emitAnthropicBlockDone(state: AnthropicBlockState): Generator<StreamLa
 function* splitBufferedAnthropicResult(
   result: AnthropicMessagesResultWire,
   generationId: string | undefined,
+  reasoning: AttemptAnthropicReasoningContract,
+  providerOutputDialect: 'anthropic-claude',
 ): Generator<StreamLaneEvent> {
   if (result.error) {
     yield {
@@ -1590,12 +2095,10 @@ function* splitBufferedAnthropicResult(
     if (effectiveGenId) meta.generationId = effectiveGenId
     yield meta
   }
-  yield { lane: 'buffered', result, ...(generationId !== undefined ? { generationId } : {}) }
-
   for (const [index, block] of (result.content ?? []).entries()) {
     const state = createAnthropicBlockState(index, block)
-    yield* emitAnthropicBlockStart(state)
-    yield* emitAnthropicBlockDone(state)
+    yield* emitAnthropicBlockStart(state, reasoning)
+    yield* emitAnthropicBlockDone(state, reasoning, providerOutputDialect)
   }
   if (result.usage) yield { lane: 'usage', usage: remapAnthropicUsage(result.usage) }
   if (result.stop_reason) {
@@ -1634,10 +2137,6 @@ function isAnthropicToolBlockType(type: string): boolean {
 function anthropicBlockId(state: AnthropicBlockState): string {
   const id = state.block.id ?? state.block.tool_use_id
   return typeof id === 'string' ? id : `anthropic-${state.block.type}-${state.index}`
-}
-
-function anthropicReasoningId(state: AnthropicBlockState): string {
-  return `anthropic-reasoning-${state.index}`
 }
 
 function remapAnthropicUsage(u: AnthropicUsageWire): ChatCompletionUsageWire {
@@ -1684,32 +2183,19 @@ function mapAnthropicFinishReason(raw: string): string {
 //   - `usageMetadata` (final chunk typically) with reasoning/thought token counts
 //   - `finishReason` (STOP / MAX_TOKENS / SAFETY / …)
 //
-// Splitter contract: emit one `reasoning` event per `thought: true` text
-// part with `summaryDelta`; emit one `reasoning { encryptedDelta,
-// replaceEncrypted: true }` for any part carrying a `thoughtSignature`,
-// "last wins" because the signature on the final part is the authoritative
-// one per `gemini_docs/guides/thought-signatures.md`. Emit one `text`
-// event per `thought:false` text part. `usageMetadata` → `usage`,
-// `finishReason` → `finish`.
+// Each provider part keeps its candidate/frame/part coordinates. Visible
+// thought summaries and opaque thought signatures share a group without
+// changing one another's display classification.
 
 export async function* splitGeminiStream(
   source: AsyncIterable<GeminiStreamChunk>,
+  reasoning: AttemptGeminiReasoningContract,
+  providerOutput: Extract<AttemptProviderOutputContract, { captureDialect: 'google-gemini' }>,
 ): AsyncGenerator<StreamLaneEvent> {
   let metaEmittedModel: string | undefined
   let metaEmittedGenerationId: string | undefined
-  // Gemini emits each thinking section as its own atomic `thought: true`
-  // part (one per SSE frame; verified against gemini-3-pro-preview live
-  // streams — sections like "**Defining the Core Idea**…" and
-  // "**Confirming the Transformation**…" arrive as separate parts).
-  //
-  // The splitter coalesces them into a SINGLE `reasoning.summary` row so the
-  // UI shows one continuous Summary block, not one row per section. The shared
-  // `summaryIndex: 0` makes the accumulator (`putReasoningDetail` + the
-  // synthetic id `summary#0`) merge each part into the same row via
-  // `mergeReasoningText`. Section count is tracked to prepend a `\n\n`
-  // separator on non-first parts so the joined text has clean breaks
-  // even on synthetic / probe inputs that don't already end with newlines.
-  const counter = { summary: 0, toolCalls: 0 }
+  const counter = { frame: 0, toolCalls: 0 }
+  const textByOutputIndex = new Map<number, string>()
 
   for await (const chunk of source) {
     if (chunk.type === 'integrity') {
@@ -1721,7 +2207,18 @@ export async function* splitGeminiStream(
       continue
     }
     if (chunk.type === 'buffered_result') {
-      for (const ev of splitGeminiResponse(chunk.result, counter)) yield ev
+      const frameIndex = counter.frame
+      counter.frame += 1
+      for (const ev of splitGeminiResponse(
+        chunk.result,
+        counter,
+        frameIndex,
+        textByOutputIndex,
+        reasoning,
+        providerOutput.captureDialect,
+      )) {
+        yield ev
+      }
       continue
     }
     // streaming `chunk` type
@@ -1732,7 +2229,18 @@ export async function* splitGeminiStream(
       metaEmittedGenerationId = meta.generationId ?? metaEmittedGenerationId
       yield meta
     }
-    for (const ev of splitGeminiResponse(resp, counter)) yield ev
+    const frameIndex = counter.frame
+    counter.frame += 1
+    for (const ev of splitGeminiResponse(
+      resp,
+      counter,
+      frameIndex,
+      textByOutputIndex,
+      reasoning,
+      providerOutput.captureDialect,
+    )) {
+      yield ev
+    }
   }
 }
 
@@ -1758,12 +2266,14 @@ function metaFromGemini(
   return dirty ? event : null
 }
 
-// One Gemini response body → lane events. Buffered and streaming are treated
-// identically here: each frame carries candidates[0].content.parts that map
-// to lane events, plus usageMetadata + finishReason.
+// One Gemini response body → lane events for every candidate and part.
 function* splitGeminiResponse(
   resp: GenerateContentResponseWire,
-  counter: { summary: number; toolCalls: number },
+  counter: { frame: number; toolCalls: number },
+  frameIndex: number,
+  textByOutputIndex: Map<number, string>,
+  reasoning: AttemptGeminiReasoningContract,
+  providerOutputDialect: 'google-gemini',
 ): Generator<StreamLaneEvent> {
   if (resp.error) {
     yield {
@@ -1778,14 +2288,40 @@ function* splitGeminiResponse(
     }
     return
   }
-  const candidate = resp.candidates?.[0]
-  const content: GeminiContent | undefined = candidate?.content
-  const parts: GeminiPart[] = content?.parts ?? []
+  for (const [candidateOrdinal, candidate] of (resp.candidates ?? []).entries()) {
+    const content: GeminiContent = candidate.content
+    const parts: GeminiPart[] = content.parts
+    const outputIndex = candidate.index ?? candidateOrdinal
 
-  for (const part of parts) {
-    yield* splitGeminiPart(part, counter)
+    for (const [contentIndex, part] of parts.entries()) {
+      if ('text' in part && typeof part.text === 'string' && part.thought !== true) {
+        textByOutputIndex.set(
+          outputIndex,
+          `${textByOutputIndex.get(outputIndex) ?? ''}${part.text}`,
+        )
+      }
+      yield* splitGeminiPart(
+        part,
+        counter,
+        outputIndex,
+        frameIndex,
+        contentIndex,
+        reasoning,
+        providerOutputDialect,
+      )
+    }
+    yield* splitGeminiProviderToolMetadata(
+      resp,
+      candidate,
+      outputIndex,
+      textByOutputIndex.get(outputIndex) ?? '',
+      providerOutputDialect,
+    )
+
+    if (candidate.finishReason) {
+      yield { lane: 'finish', finishReason: mapGeminiFinishReason(candidate.finishReason) }
+    }
   }
-  yield* splitGeminiProviderToolMetadata(resp, candidate?.index ?? 0)
 
   if (resp.usageMetadata) {
     yield {
@@ -1793,82 +2329,147 @@ function* splitGeminiResponse(
       usage: remapGeminiUsage(resp.usageMetadata),
     }
   }
-
-  if (candidate?.finishReason) {
-    yield { lane: 'finish', finishReason: mapGeminiFinishReason(candidate.finishReason) }
-  }
 }
 
 function* splitGeminiProviderToolMetadata(
   resp: GenerateContentResponseWire,
+  candidate: Record<string, unknown> | undefined,
   outputIndex: number,
+  text: string,
+  providerOutputDialect: 'google-gemini',
 ): Generator<StreamLaneEvent> {
   const record = resp as Record<string, unknown>
-  if (record.groundingMetadata !== undefined) {
+  const groundingMetadata = candidate?.groundingMetadata ?? record.groundingMetadata
+  if (groundingMetadata !== undefined) {
     yield {
       lane: 'server-tool-output',
+      dialect: providerOutputDialect,
       itemType: 'google:google_search',
       itemId: `google-search-${outputIndex}`,
       outputIndex,
       status: 'completed',
-      output: structuredClone(record.groundingMetadata),
+      output: structuredClone(groundingMetadata),
+    }
+    const annotations = normalizeGeminiGroundingAnnotations(groundingMetadata, text)
+    if (annotations.length > 0) {
+      yield {
+        lane: 'text-annotations',
+        annotations,
+        ownerTextLength: text.length,
+        outputIndex,
+      }
     }
   }
-  if (record.urlContextMetadata !== undefined) {
+  const urlContextMetadata = candidate?.urlContextMetadata ?? record.urlContextMetadata
+  if (urlContextMetadata !== undefined) {
     yield {
       lane: 'server-tool-output',
+      dialect: providerOutputDialect,
       itemType: 'google:url_context',
       itemId: `google-url-context-${outputIndex}`,
       outputIndex,
       status: 'completed',
-      output: structuredClone(record.urlContextMetadata),
+      output: structuredClone(urlContextMetadata),
     }
   }
-  if (record.googleMapsMetadata !== undefined) {
+  const googleMapsMetadata = candidate?.googleMapsMetadata ?? record.googleMapsMetadata
+  if (googleMapsMetadata !== undefined) {
     yield {
       lane: 'server-tool-output',
+      dialect: providerOutputDialect,
       itemType: 'google:google_maps',
       itemId: `google-maps-${outputIndex}`,
       outputIndex,
       status: 'completed',
-      output: structuredClone(record.googleMapsMetadata),
+      output: structuredClone(googleMapsMetadata),
     }
   }
 }
 
 function* splitGeminiPart(
   part: GeminiPart,
-  counter: { summary: number; toolCalls: number },
+  counter: { frame: number; toolCalls: number },
+  outputIndex: number,
+  frameIndex: number,
+  contentIndex: number,
+  reasoning: AttemptGeminiReasoningContract,
+  providerOutputDialect: 'google-gemini',
 ): Generator<StreamLaneEvent> {
-  // `thoughtSignature` can attach to ANY part type. Emit a reasoning event
-  // with replaceEncrypted:true so the accumulator overwrites (last-wins).
+  const source = {
+    dialect: 'gemini-native' as const,
+    bridge: reasoning.producerBridge,
+    candidateIndex: outputIndex,
+    frameIndex,
+    partIndex: contentIndex,
+  }
+  const groupAliases = [
+    {
+      kind: 'gemini-part' as const,
+      candidateIndex: outputIndex,
+      frameIndex,
+      partIndex: contentIndex,
+    },
+  ]
+  const observations: ReasoningObservation[] = []
+  const isThoughtText = 'text' in part && typeof part.text === 'string' && part.thought === true
+  const visible = isThoughtText
+    ? {
+        kind: 'visible' as const,
+        visibleKind: 'summary' as const,
+        update: 'set' as const,
+        value: (part as { text: string }).text,
+        format: reasoning.targetFormat,
+        source,
+        groupAliases,
+        memberAliases: [
+          {
+            kind: 'gemini-member' as const,
+            candidateIndex: outputIndex,
+            frameIndex,
+            partIndex: contentIndex,
+            member: 'summary' as const,
+          },
+        ],
+      }
+    : undefined
+  if (visible) observations.push(visible)
   const sig = (part as { thoughtSignature?: string }).thoughtSignature
   if (typeof sig === 'string' && sig.length > 0) {
-    yield {
-      lane: 'reasoning',
-      encryptedDelta: sig,
-      replaceEncrypted: true,
-      format: 'google-gemini-v1',
-    }
+    observations.push({
+      kind: 'carrier',
+      carrierKind: 'gemini-thought-signature',
+      update: 'set',
+      value: sig,
+      format: reasoning.targetFormat,
+      source,
+      groupAliases,
+      memberAliases: [
+        {
+          kind: 'gemini-member',
+          candidateIndex: outputIndex,
+          frameIndex,
+          partIndex: contentIndex,
+          member: 'signature',
+        },
+      ],
+      ...(visible
+        ? {
+            binding: {
+              visibleKind: visible.visibleKind,
+              format: visible.format,
+              source: visible.source,
+              groupAliases: visible.groupAliases,
+              memberAliases: visible.memberAliases,
+            },
+          }
+        : {}),
+    })
   }
+  if (observations.length > 0) yield reasoningObservationEvent(observations)
 
   if ('text' in part && typeof part.text === 'string') {
-    if (part.text.length === 0) return
-    if ((part as { thought?: boolean }).thought === true) {
-      // Coalesce all sections into one summary row (summaryIndex: 0). For
-      // sections after the first, prepend `\n\n` so the merged text has
-      // visible section breaks regardless of what the wire emitted.
-      const isFirst = counter.summary === 0
-      yield {
-        lane: 'reasoning',
-        summaryDelta: isFirst ? part.text : `\n\n${part.text}`,
-        summaryIndex: 0,
-        format: 'google-gemini-v1',
-      }
-      counter.summary += 1
-    } else {
-      yield { lane: 'text', text: part.text }
-    }
+    if (part.text.length === 0 || part.thought === true) return
+    yield { lane: 'text', text: part.text, outputIndex, contentIndex }
     return
   }
 
@@ -1893,11 +2494,12 @@ function* splitGeminiPart(
   if ('executableCode' in part) {
     yield {
       lane: 'server-tool-output',
+      dialect: providerOutputDialect,
       itemType: 'google:code_execution',
       itemId: 'google-code-executable',
       outputIndex: 0,
       status: 'in_progress',
-      output: structuredClone(part),
+      output: part,
     }
     return
   }
@@ -1905,11 +2507,12 @@ function* splitGeminiPart(
   if ('codeExecutionResult' in part) {
     yield {
       lane: 'server-tool-output',
+      dialect: providerOutputDialect,
       itemType: 'google:code_execution',
       itemId: 'google-code-result',
       outputIndex: 0,
       status: 'completed',
-      output: structuredClone(part),
+      output: part,
     }
     return
   }

@@ -15,15 +15,27 @@ import {
   type ChangeEvent,
   type PointerEvent,
   useCallback,
-  useDeferredValue,
   useEffect,
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
 } from 'react'
 import { type LlamaServerProps, probeLlamaServer } from '../../api/probe'
+import {
+  configurationWriteInteraction,
+  configurationWriteTarget,
+  definePresentationInteraction,
+} from '../../app/presentation-interactions'
+import {
+  attachmentContextIds,
+  attachmentContextPolicyForSettings,
+} from '../../core/attachments/context'
 import type { EffectiveCapability } from '../../core/capabilities'
-import { DEFAULT_GLOBAL_PREFERENCES, readGlobalPreferences } from '../../core/global-settings'
+import {
+  PREFILL_UNAVAILABLE_PLAN,
+  rebaseEffectiveEndpointRouting,
+} from '../../core/effective-endpoint-routing'
 import { modelLooksForeignForProfile } from '../../core/model-selection'
 import {
   buildSettingsPromptSizeEstimateInput,
@@ -33,42 +45,45 @@ import {
 } from '../../core/prompt-size'
 import { isOpenAiDirectProfile } from '../../core/provider-hosted-tools'
 import { isTextCompletionsSelectableFor } from '../../core/quirks'
-import { readTokenCalibrationGlobal } from '../../core/token-calibration'
+import {
+  EMPTY_MESSAGE_CONTEXT_ROUTE_FACTS,
+  mergeMessageContextRouteFacts,
+} from '../../core/reasoning'
+import { relevantGlobalTokenCalibration } from '../../core/token-calibration'
 import type {
   Chat,
   ChatPreset,
   ConnectionKind,
   ConnectionProfile,
   Message,
+  MessageId,
   PresetId,
 } from '../../core/types'
-import { usePrivacyRouting } from '../../hooks/usePrivacyRouting'
-import { useStreamStablePromptEstimate } from '../../hooks/useStreamStablePromptEstimate'
-import { applyChatPreset, setChatPreset, updateChatSettings } from '../../store/chats'
-import { exportChatPreset, importChatPreset } from '../../store/import-export'
+import { useChatPresetCatalog } from '../../hooks/useConfigurationCatalog'
+import { useConversationFrame } from '../../hooks/useConversationFrame'
+import type { UseModelCatalogResult } from '../../hooks/useModelCatalog'
+import { usePresentationInteraction } from '../../hooks/usePresentationInteraction'
+import { usePromptEstimateContext } from '../../hooks/usePromptEstimateContext'
 import {
-  createPreset,
-  deletePreset,
-  getPreset,
-  listPresets,
-  reorderPresets,
-  updatePreset,
-} from '../../store/presets'
-import { getProfile } from '../../store/profiles'
+  useDeferredStreamStablePromptEstimate,
+  useStreamStableBranchPath,
+} from '../../hooks/useStreamStablePromptEstimate'
+import { useAttemptExecutionsForChat } from '../../store/attempt-controller'
+import { configurationApplication } from '../../store/configuration-application'
 import {
-  allTable,
-  chatMessageDependencies,
-  GLOBAL_PREFERENCES_DEPENDENCIES,
-  GLOBAL_TOKEN_CALIBRATION_DEPENDENCIES,
-  primaryKeys,
-} from '../../store/reactive-dependencies'
-import { useRepositoryQuery } from '../../store/reactive-query'
-import { loadActiveBranchHeaderSnapshot, loadSendContextForBranch } from '../../store/send-context'
-import { useChatStore } from '../../store/zustand/chatStore'
-import { useActiveStreamsForChat } from '../../store/zustand/streamStore'
+  configurationController,
+  currentActiveConfigurationSelection,
+  previousActiveConfigurationSelection,
+} from '../../store/configuration-controller'
+import { currentConversationDestinationSpine } from '../../store/conversation-controller'
+import { interchangeApplication } from '../../store/interchange-application'
+import type {
+  ConfigurationPresetCatalogRow,
+  ConversationChatSnapshot,
+  MessageHeaderRow,
+} from '../../store/presentation-contracts'
 import { useToastStore } from '../../store/zustand/toastStore'
 import { useAttachmentResolverForContext } from '../attachments/useAttachmentResolver'
-import { useComposerContextDraft } from '../chat/composer-draft-state'
 import { CloseIcon, DownloadIcon, GripVerticalIcon, UploadIcon } from '../icons/Icon'
 import {
   importExportErrorMessage,
@@ -89,38 +104,51 @@ import { ProviderPicker } from './ProviderPicker'
 interface ChatModelPanelProps {
   chatSnapshot: Chat
   profileSnapshot?: ConnectionProfile | null
-  draftKey?: string | null
+  modelCatalog: UseModelCatalogResult
   onClose: () => void
 }
 
 type Tab = 'model' | 'context' | 'prompts' | 'generation'
-const EMPTY_CURSOR = Object.freeze({}) as Readonly<Record<string, string>>
-const EMPTY_MESSAGES: Message[] = []
+const EMPTY_MESSAGES: readonly Message[] = Object.freeze([])
+const EMPTY_MESSAGE_HEADERS: readonly MessageHeaderRow[] = Object.freeze([])
+const EMPTY_PRESET_CATALOG_ROWS: readonly ConfigurationPresetCatalogRow[] = Object.freeze([])
+
+export function acceptedSettingsContextPath(frame: ConversationChatSnapshot | null | undefined) {
+  if (!frame) return null
+  const spine = currentConversationDestinationSpine(frame.destination)
+  if (!spine) return null
+  if (frame.selectionTargetId && !spine.path.has(frame.selectionTargetId)) return null
+  return spine.path
+}
+
+export function settingsContextPathQueryIdentity(
+  pathAccepted: boolean,
+  messageIds: readonly string[],
+  attachmentIds: readonly string[],
+): string {
+  return pathAccepted ? JSON.stringify([messageIds, attachmentIds]) : 'pending'
+}
 
 export function ChatModelPanel({
   chatSnapshot,
   profileSnapshot = null,
-  draftKey = null,
+  modelCatalog,
   onClose,
 }: ChatModelPanelProps) {
   const chat = chatSnapshot
 
-  const snapshotProfile = profileSnapshot?.id === chat.settings.profileId ? profileSnapshot : null
-  const liveProfile = useRepositoryQuery(
-    JSON.stringify(['profile-fallback', chat.settings.profileId, snapshotProfile?.id]),
-    () => (!snapshotProfile ? getProfile(chat.settings.profileId) : Promise.resolve(undefined)),
-    undefined,
-    primaryKeys('profiles', !snapshotProfile ? chat.settings.profileId : undefined),
+  const profile = profileSnapshot?.id === chat.settings.profileId ? profileSnapshot : undefined
+  const configuration = useSyncExternalStore(
+    (listener) => configurationController.subscribe(listener),
+    () => configurationController.getSnapshot(),
+    () => configurationController.getSnapshot(),
   )
-  const profileCacheRef = useRef(new Map<string, ConnectionProfile>())
+  const [tab, setTab] = useState<Tab>('model')
   useEffect(() => {
-    if (!liveProfile) return
-    profileCacheRef.current.set(liveProfile.id, liveProfile)
-  }, [liveProfile])
-  const profile =
-    snapshotProfile ??
-    liveProfile ??
-    (chat.settings.profileId ? profileCacheRef.current.get(chat.settings.profileId) : undefined)
+    if (tab !== 'context') return
+    return configurationController.demandGlobalTokenCalibration()
+  }, [tab])
+  const pushToast = useToastStore((state) => state.push)
   const [llamaProps, setLlamaProps] = useState<LlamaServerProps | null>(null)
   useEffect(() => {
     if (profile?.kind !== 'llama-server') {
@@ -137,132 +165,220 @@ export function ChatModelPanel({
     }
   }, [profile?.kind, profile?.baseUrl])
 
-  const livePreset = useRepositoryQuery(
-    JSON.stringify(['preset', chat.presetId]),
-    () => (chat.presetId ? getPreset(chat.presetId) : Promise.resolve(undefined)),
-    undefined,
-    primaryKeys('presets', chat.presetId),
+  const currentSelection = currentActiveConfigurationSelection(configuration.frame)
+  const previousSelection = previousActiveConfigurationSelection(configuration.frame)
+  const calibrationEvidence = useMemo(() => {
+    const calibration = configuration.frame.globalTokenCalibration
+    const preferences = configuration.frame.shell?.preferences
+    return calibration && preferences
+      ? Object.freeze({
+          global: calibration,
+          mode: preferences.global.tokenCalibrationMode,
+        })
+      : null
+  }, [configuration.frame.globalTokenCalibration, configuration.frame.shell?.preferences])
+  const calibrationQueryIdentity = useMemo(
+    () =>
+      calibrationEvidence
+        ? JSON.stringify([
+            calibrationEvidence.mode,
+            relevantGlobalTokenCalibration(calibrationEvidence.global, chat.settings.model),
+          ])
+        : 'pending',
+    [calibrationEvidence, chat.settings.model],
   )
-  const presetCacheRef = useRef(new Map<string, ChatPreset>())
-  useEffect(() => {
-    if (!livePreset) return
-    presetCacheRef.current.set(livePreset.id, livePreset)
-  }, [livePreset])
-  const preset =
-    livePreset ?? (chat.presetId ? presetCacheRef.current.get(chat.presetId) : undefined)
-  const routing = usePrivacyRouting(chat)
-  const { capability, descriptor, modelAvailable } = routing
+  const selectedPreset =
+    currentSelection?.target.kind === 'chat' && currentSelection.target.chatId === chat.id
+      ? currentSelection.value.preset
+      : previousSelection?.value.preset
+  const preset = selectedPreset && selectedPreset.id === chat.presetId ? selectedPreset : undefined
+  const routing = modelCatalog.routing
+  const capabilityPresentation = routing.capabilityPresentation
+  const { capability, descriptor } = capabilityPresentation
+  const presentationProfile = capabilityPresentation.profile
+  const presentationChat = useMemo(
+    () =>
+      capabilityPresentation.settings && capabilityPresentation.settings !== chat.settings
+        ? { ...chat, settings: capabilityPresentation.settings }
+        : chat,
+    [capabilityPresentation.settings, chat],
+  )
+  const modelPresentationChat = useMemo(
+    () =>
+      modelCatalog.models.presentation.settings &&
+      modelCatalog.models.presentation.settings !== chat.settings
+        ? { ...chat, settings: modelCatalog.models.presentation.settings }
+        : chat,
+    [chat, modelCatalog.models.presentation.settings],
+  )
+  const modelPresentationProfile = modelCatalog.models.presentation.profile
+  const modelAvailable = modelCatalog.models.presentation.modelAvailable
+  const presentationIsOpenRouter = presentationProfile?.kind === 'openrouter'
+  const privacyPresentationIsOpenRouter = routing.privacyPresentation.profile?.kind === 'openrouter'
   const endpointTokenizer = descriptor?.architecture?.tokenizer ?? null
-  const [tab, setTab] = useState<Tab>('model')
   const needsPromptEstimate = tab === 'context'
+  const needsConversationPath = tab === 'model' || needsPromptEstimate
+  const routingReadyForChat =
+    !capabilityPresentation.retained && capabilityPresentation.modelId === chat.settings.model
   const canEstimatePrompt =
     needsPromptEstimate &&
+    routingReadyForChat &&
     !!capability &&
     (capability.contextLength !== undefined ||
       capability.maxPromptTokens !== undefined ||
       capability.maxCompletionTokens !== undefined)
-  const cursor = useChatStore((s) =>
-    canEstimatePrompt ? (s.getCursor(chat.id) ?? EMPTY_CURSOR) : EMPTY_CURSOR,
+  const conversationFrame = useConversationFrame({
+    chatId: needsConversationPath ? chat.id : null,
+  })
+  const currentAcceptedPath = acceptedSettingsContextPath(conversationFrame)
+  const activeChatAttempts = useAttemptExecutionsForChat(chat.id, needsConversationPath)
+  const activePathAttemptIds = useMemo(() => {
+    const messageIds = currentAcceptedPath?.messageIds
+    return activeChatAttempts
+      .map((attempt) => attempt.messageId)
+      .filter((messageId): messageId is MessageId =>
+        Boolean(messageId && messageIds?.has(messageId)),
+      )
+      .sort()
+  }, [activeChatAttempts, currentAcceptedPath?.messageIds])
+  const streamActivityKey = activePathAttemptIds.join('|')
+  const acceptedPath = useStreamStableBranchPath(currentAcceptedPath, streamActivityKey.length > 0)
+  const acceptedPathHeaders = useMemo(
+    () => acceptedPath?.materializeNodes() ?? EMPTY_MESSAGE_HEADERS,
+    [acceptedPath],
   )
-  const activeSendContext = useRepositoryQuery(
-    JSON.stringify([
-      'active-send-context',
-      chat.id,
-      chat.metaVersion,
-      chat.summaryVersion,
-      canEstimatePrompt,
-      cursor,
-      capability,
-    ]),
-    async () => {
-      if (!canEstimatePrompt) return null
-      const branch = await loadActiveBranchHeaderSnapshot(chat.id, cursor)
-      return loadSendContextForBranch({
-        chat,
-        branchHeaders: branch.branchHeaders,
-        capabilities: capability,
-      })
-    },
-    null,
-    canEstimatePrompt
-      ? [
-          ...chatMessageDependencies(chat.id),
-          ...GLOBAL_PREFERENCES_DEPENDENCIES,
-          ...GLOBAL_TOKEN_CALIBRATION_DEPENDENCIES,
-          ...allTable('attachments', 'attachmentArtifacts'),
-        ]
-      : [],
-  )
-  const prefs = useRepositoryQuery(
-    `global-preferences:context:${canEstimatePrompt ? 'enabled' : 'disabled'}`,
+  const acceptedPathMessageIds = useMemo(() => {
+    if (activePathAttemptIds.length === 0) {
+      return acceptedPathHeaders.map((header) => header.id)
+    }
+    const excluded = new Set(activePathAttemptIds)
+    return acceptedPathHeaders.flatMap((header) => (excluded.has(header.id) ? [] : [header.id]))
+  }, [acceptedPathHeaders, activePathAttemptIds])
+  const apiModeContextFacts = useMemo(() => {
+    if (!acceptedPath) return EMPTY_MESSAGE_CONTEXT_ROUTE_FACTS
+    const includedIds = new Set(acceptedPathMessageIds)
+    return mergeMessageContextRouteFacts(
+      acceptedPathHeaders.flatMap((header) =>
+        includedIds.has(header.id) && !header.deleted && header.hiddenFromContext !== true
+          ? [header.contextRouteFacts]
+          : [],
+      ),
+    )
+  }, [acceptedPath, acceptedPathHeaders, acceptedPathMessageIds])
+  const effectiveRouting = useMemo(() => {
+    if (capabilityPresentation.retained) return capabilityPresentation.effectiveRouting
+    return profile && routing.effectiveRouting
+      ? rebaseEffectiveEndpointRouting(routing.effectiveRouting, apiModeContextFacts)
+      : null
+  }, [
+    apiModeContextFacts,
+    profile,
+    routing.effectiveRouting,
+    capabilityPresentation.effectiveRouting,
+    capabilityPresentation.retained,
+  ])
+  const assistantRouting = effectiveRouting?.route ?? null
+  const prefillPlan = effectiveRouting?.prefillPlan ?? PREFILL_UNAVAILABLE_PLAN
+  const acceptedPathAttachmentIds = useMemo(() => {
+    const includedIds = new Set(acceptedPathMessageIds)
+    return attachmentContextIds({
+      messages: acceptedPathHeaders
+        .filter((header) => includedIds.has(header.id))
+        .map((header) => ({ ...header, content: [] })),
+      policy: attachmentContextPolicyForSettings(chat.settings),
+    })
+  }, [acceptedPathHeaders, acceptedPathMessageIds, chat.settings])
+  const acceptedPathQueryId = useMemo(
     () =>
-      canEstimatePrompt ? readGlobalPreferences() : Promise.resolve(DEFAULT_GLOBAL_PREFERENCES),
-    DEFAULT_GLOBAL_PREFERENCES,
-    canEstimatePrompt ? GLOBAL_PREFERENCES_DEPENDENCIES : [],
+      settingsContextPathQueryIdentity(
+        acceptedPath !== null,
+        acceptedPathMessageIds,
+        acceptedPathAttachmentIds,
+      ),
+    [acceptedPath, acceptedPathAttachmentIds, acceptedPathMessageIds],
   )
-  const globalCalibration = useRepositoryQuery(
-    `token-calibration-global:${canEstimatePrompt ? 'enabled' : 'disabled'}`,
-    () => (canEstimatePrompt ? readTokenCalibrationGlobal() : Promise.resolve(null)),
-    null,
-    canEstimatePrompt ? GLOBAL_TOKEN_CALIBRATION_DEPENDENCIES : [],
+  const activeSendContextTarget = useMemo(
+    () =>
+      canEstimatePrompt && acceptedPath && calibrationEvidence && assistantRouting
+        ? {
+            key: JSON.stringify([
+              chat.id,
+              chat.metaVersion,
+              chat.settings,
+              acceptedPathQueryId,
+              capability,
+              assistantRouting,
+              calibrationQueryIdentity,
+            ]),
+            chat,
+            branchHeaders: acceptedPathHeaders,
+            excludedMessageIds: activePathAttemptIds,
+            attachmentIds: acceptedPathAttachmentIds,
+            capabilities: capability,
+            routing: assistantRouting,
+            calibrationEvidence,
+          }
+        : null,
+    [
+      acceptedPath,
+      acceptedPathAttachmentIds,
+      acceptedPathHeaders,
+      acceptedPathQueryId,
+      activePathAttemptIds,
+      canEstimatePrompt,
+      calibrationEvidence,
+      calibrationQueryIdentity,
+      capability,
+      assistantRouting,
+      chat,
+    ],
   )
-  const activeChatStreams = useActiveStreamsForChat(chat.id, canEstimatePrompt)
-  const streamActivityKey = canEstimatePrompt
-    ? activeChatStreams
-        .map((stream) => (stream.messageId ? `m:${stream.messageId}` : `s:${stream.streamId}`))
-        .sort()
-        .join('|')
-    : ''
+  const activeSendContext = usePromptEstimateContext(activeSendContextTarget)
   const activePathMessages = canEstimatePrompt
     ? (activeSendContext?.pathMessages ?? EMPTY_MESSAGES)
     : EMPTY_MESSAGES
-  const composerDraft = useComposerContextDraft(draftKey)
-  const draftText = useMemo(
-    () => [composerDraft.text, composerDraft.prefillText].filter(Boolean).join('\n'),
-    [composerDraft],
-  )
-  const draftAttachmentRefs =
-    composerDraft.attachmentRefs.length > 0 ? composerDraft.attachmentRefs : undefined
   const attachmentResolver = useAttachmentResolverForContext({
     settings: chat.settings,
     messages: activePathMessages,
-    ...(draftAttachmentRefs ? { draftAttachmentRefs } : {}),
+    baseAttachments: activeSendContext?.attachmentTokenEvidence,
     enabled: canEstimatePrompt,
   })
   const promptEstimateInput = useMemo<PromptSizeEstimateInput | null>(() => {
-    if (!canEstimatePrompt) return null
+    if (!canEstimatePrompt || !acceptedPath || !activeSendContext) return null
     return buildSettingsPromptSizeEstimateInput(
       chat.settings,
       activePathMessages,
-      draftText,
+      '',
       endpointTokenizer,
       capability.maxPromptTokens ?? capability.contextLength ?? null,
       attachmentResolver,
       {
         chatTokenCalibration: chat.tokenCalibration,
-        globalCalibration,
-        mode: prefs.tokenCalibrationMode,
+        globalCalibration: activeSendContext.calibrationEvidence.global,
+        mode: activeSendContext.calibrationEvidence.mode,
       },
-      draftAttachmentRefs,
-      activeSendContext?.preCutAttachmentIds,
+      undefined,
+      activeSendContext.preCutAttachmentIds,
+      assistantRouting ?? undefined,
+      {
+        contextAlreadySelected: true,
+        reasoningResolver: activeSendContext.reasoningResolver,
+      },
     )
   }, [
     chat,
     canEstimatePrompt,
+    acceptedPath,
     activePathMessages,
-    draftText,
-    draftAttachmentRefs,
     endpointTokenizer,
     capability,
     attachmentResolver,
-    globalCalibration,
-    prefs,
     activeSendContext,
+    assistantRouting,
   ])
-  const deferredPromptEstimateInput = useDeferredValue(promptEstimateInput)
-  const promptEstimate = useStreamStablePromptEstimate(
+  const promptEstimate = useDeferredStreamStablePromptEstimate(
     chat.id,
-    deferredPromptEstimateInput,
+    promptEstimateInput,
     streamActivityKey,
   )
   const providerNeededTokens = useMemo(() => {
@@ -275,31 +391,40 @@ export function ChatModelPanel({
   const handleModelPick = useCallback(
     async (modelId: string) => {
       if (chat.settings.model === modelId) return
-      await updateChatSettings(chat.id, { model: modelId })
+      try {
+        await configurationApplication.patchChatSettings(chat.id, { model: modelId })
+      } catch (error) {
+        console.error('Failed to select model', error)
+        pushToast({ level: 'danger', text: 'Could not select that model. Try again.' })
+      }
     },
-    [chat],
+    [chat, pushToast],
   )
 
   const handleModelPickForPreset = useCallback(
     async (modelId: string) => {
       if (!chat.presetId) return
-      const p = await getPreset(chat.presetId)
-      if (!p) return
-      await updatePreset(p.id, {
-        settings: { ...p.settings, model: modelId, profileId: p.connectionProfileId },
+      if (!preset || preset.id !== chat.presetId) return
+      await configurationApplication.saveChatPreset({
+        presetId: preset.id,
+        settings: {
+          ...preset.settings,
+          model: modelId,
+          profileId: preset.connectionProfileId,
+        },
+        chatModel: { chatId: chat.id, modelId },
       })
-      await updateChatSettings(chat.id, { model: modelId })
     },
-    [chat],
+    [chat, preset],
   )
 
-  const isOpenRouter = profile?.kind === 'openrouter'
   const textTemplateMode =
-    isOpenRouter &&
-    chat.settings.api === 'text' &&
-    isTextCompletionsSelectableFor(chat.settings.model)
+    presentationIsOpenRouter &&
+    presentationChat.settings.api === 'text' &&
+    isTextCompletionsSelectableFor(presentationChat.settings.model)
       ? 'openrouter'
-      : profile?.kind === 'llama-server' && (chat.settings.protocol ?? 'chat') === 'text'
+      : presentationProfile?.kind === 'llama-server' &&
+          (presentationChat.settings.protocol ?? 'chat') === 'text'
         ? 'llama-server'
         : null
 
@@ -311,33 +436,36 @@ export function ChatModelPanel({
   // When `modelAvailable === null` /models is still loading and the
   // banner is suppressed to avoid flicker.
   const profileModelMismatch =
-    !!profile &&
-    !!chat.settings.model &&
-    modelLooksForeignForProfile(profile.kind, chat.settings.model)
+    !!modelPresentationProfile &&
+    !!modelPresentationChat.settings.model &&
+    modelLooksForeignForProfile(modelPresentationProfile.kind, modelPresentationChat.settings.model)
   const noModel =
-    !chat.settings.model ||
+    !modelPresentationChat.settings.model ||
     profileModelMismatch ||
-    (profile?.kind === 'llama-server' && modelAvailable === false)
+    (modelPresentationProfile?.kind === 'llama-server' && modelAvailable === false)
   const unavailableModel =
-    modelAvailable === false && !profileModelMismatch && profile?.kind !== 'llama-server'
-      ? chat.settings.model
+    modelAvailable === false &&
+    !profileModelMismatch &&
+    modelPresentationProfile?.kind !== 'llama-server'
+      ? modelPresentationChat.settings.model
       : null
 
   return (
     <aside data-ui="chat-model-panel" aria-label="Chat settings">
       <PanelHeader onClose={onClose} title="Chat settings" />
-      <PresetBreadcrumb chat={chat} preset={preset ?? undefined} />
+      <PresetBreadcrumb chat={chat} preset={preset} />
       {unavailableModel ? (
         <div data-ui="notice-banner" role="status" data-tone="warning">
           <span>
             <strong>{unavailableModel}</strong> isn't served on{' '}
-            <em>{profile?.name ?? 'this connection'}</em>. Pick a different model below.
+            <em>{modelPresentationProfile?.name ?? 'this connection'}</em>. Pick a different model
+            below.
           </span>
         </div>
       ) : noModel ? (
         <div data-ui="notice-banner" role="status" data-tone="info">
           <span>
-            Pick a model for <em>{profile?.name ?? 'this connection'}</em>.
+            Pick a model for <em>{modelPresentationProfile?.name ?? 'this connection'}</em>.
           </span>
         </div>
       ) : null}
@@ -366,55 +494,88 @@ export function ChatModelPanel({
       <div role="tabpanel" data-ui="settings-panel" data-active-tab={tab}>
         {tab === 'model' ? (
           <>
-            <ModelPicker
-              chat={chat}
-              profileKind={profile?.kind ?? 'custom'}
-              onPick={handleModelPick}
-              onPickForPreset={handleModelPickForPreset}
-            />
-            {capability ? (
-              <ApiModeSection
-                chat={chat}
-                capability={capability}
-                profile={profile ?? null}
-                activePathMessages={activePathMessages}
+            <div
+              data-model-presentation={
+                modelCatalog.models.presentation.retained ? 'retained' : 'current'
+              }
+              inert={modelCatalog.models.presentation.retained ? true : undefined}
+            >
+              <ModelPicker
+                chat={modelPresentationChat}
+                modelsResult={modelCatalog.models}
+                onPick={handleModelPick}
+                onPickForPreset={handleModelPickForPreset}
               />
-            ) : null}
+            </div>
+            <div
+              data-ui="model-routing-dependent"
+              data-routing-presentation={capabilityPresentation.retained ? 'retained' : 'current'}
+              aria-busy={routing.loading}
+              inert={capabilityPresentation.retained ? true : undefined}
+            >
+              {capability ? (
+                <ApiModeSection
+                  chat={presentationChat}
+                  capability={capability}
+                  profile={presentationProfile}
+                  routing={assistantRouting}
+                />
+              ) : null}
+            </div>
             {profile && isOpenAiDirectProfile(profile) ? (
               <OpenAiResponsesStoreSection chat={chat} />
             ) : null}
-            {isOpenRouter ? (
+            {privacyPresentationIsOpenRouter ? (
               <ProviderPicker chat={chat} routing={routing} neededTokens={providerNeededTokens} />
             ) : null}
-            {profile?.kind === 'llama-server' ? (
-              <LlamaServerSection chat={chat} profile={profile} />
+            {presentationProfile?.kind === 'llama-server' ? (
+              <LlamaServerSection chat={presentationChat} profile={presentationProfile} />
             ) : null}
           </>
         ) : null}
         {tab === 'context' ? (
-          <ContextTab
-            chat={chat}
-            capability={capability}
-            endpointTokenizer={endpointTokenizer}
-            promptEstimate={promptEstimate}
-            isOpenRouter={isOpenRouter}
-            connectionKind={profile?.kind ?? 'custom'}
-          />
+          <div
+            data-ui="context-routing-dependent"
+            data-routing-presentation={capabilityPresentation.retained ? 'retained' : 'current'}
+            aria-busy={routing.loading || capabilityPresentation.retained}
+            inert={capabilityPresentation.retained ? true : undefined}
+          >
+            <ContextTab
+              chat={presentationChat}
+              capability={capability}
+              promptEstimate={promptEstimate}
+              isOpenRouter={presentationIsOpenRouter}
+              connectionKind={presentationProfile?.kind ?? 'custom'}
+            />
+          </div>
         ) : null}
         {tab === 'prompts' ? (
-          <PromptsTab chat={chat} prefillRecommendationEndpoints={routing.endpoints} />
+          <div
+            data-routing-presentation={capabilityPresentation.retained ? 'retained' : 'current'}
+            inert={capabilityPresentation.retained ? true : undefined}
+          >
+            <PromptsTab
+              chat={presentationChat}
+              {...(presentationProfile ? { profile: presentationProfile } : {})}
+              prefillPlan={prefillPlan}
+            />
+          </div>
         ) : null}
         {tab === 'generation' ? (
-          <ParamForm
-            chat={chat}
-            capability={capability}
-            endpointTokenizer={endpointTokenizer}
-            textTemplateMode={textTemplateMode}
-            llamaProps={llamaProps}
-            connectionKind={profile?.kind ?? 'custom'}
-            connectionProfile={profile}
-            textCompletionsActive={textTemplateMode !== null}
-          />
+          <div
+            data-routing-presentation={capabilityPresentation.retained ? 'retained' : 'current'}
+            inert={capabilityPresentation.retained ? true : undefined}
+          >
+            <ParamForm
+              chat={presentationChat}
+              capability={capability}
+              textTemplateMode={textTemplateMode}
+              llamaProps={llamaProps}
+              connectionKind={presentationProfile?.kind ?? 'custom'}
+              connectionProfile={presentationProfile}
+              textCompletionsActive={textTemplateMode !== null}
+            />
+          </div>
         ) : null}
       </div>
     </aside>
@@ -422,6 +583,9 @@ export function ChatModelPanel({
 }
 
 function OpenAiResponsesStoreSection({ chat }: { chat: Chat }) {
+  const { run: runConfigurationWrite } = usePresentationInteraction(configurationWriteInteraction, {
+    observePending: false,
+  })
   const responses = chat.settings.responses ?? { store: false }
   return (
     <section data-ui="settings-section" data-ui-section="openai-responses-store">
@@ -430,8 +594,12 @@ function OpenAiResponsesStoreSection({ chat }: { chat: Chat }) {
           type="checkbox"
           checked={responses.store}
           onChange={(event) =>
-            void updateChatSettings(chat.id, {
-              responses: { ...responses, store: event.target.checked },
+            runConfigurationWrite({
+              target: configurationWriteTarget(chat.id, 'responses.store'),
+              action: () =>
+                configurationApplication.patchChatSettingsFields(chat.id, [
+                  { path: ['responses', 'store'], value: event.target.checked },
+                ]),
             })
           }
         />
@@ -465,24 +633,52 @@ function PanelHeader({ title, onClose }: { title: string; onClose: () => void })
 // rename / delete / new. Chat settings diverge freely; the preset is the
 // shared snapshot the user can write back to or swap from.
 interface PresetDragState {
-  draggedId: PresetId | null
-  orderedIds: PresetId[]
+  draggedId: PresetId
+  targetPrecedingId: PresetId | null | undefined
+  originPrecedingId: PresetId | null | undefined
+  commandCommitted: boolean
+  settleAfterSnapshotRevision?: number
   pointerId?: number
   status: 'dragging' | 'settling'
 }
 
+const createPresetInteractionCapability = definePresentationInteraction<string>({
+  id: 'chat-preset.create',
+  label: 'Create preset',
+  concurrency: 'reject',
+  lifetime: 'workspace-tab',
+})
+
 function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | undefined }) {
   const pushToast = useToastStore((s) => s.push)
-  const presets = useRepositoryQuery('presets:all', () => listPresets(), [], allTable('presets'))
+  const createPresetInteraction = usePresentationInteraction(createPresetInteractionCapability)
+  const runCreatePreset = createPresetInteraction.run
   const [dragState, setDragState] = useState<PresetDragState | null>(null)
   const dragStateRef = useRef<PresetDragState | null>(null)
   const presetItemRefs = useRef(new Map<PresetId, HTMLLIElement>())
+  const presetListRef = useRef<HTMLUListElement | null>(null)
   const [pickerOpen, setPickerOpen] = useState(false)
-  const importInputRef = useRef<HTMLInputElement | null>(null)
+  const addressedPresetIds = useMemo(() => {
+    const ids = [preset?.id, dragState?.draggedId].filter((id): id is PresetId => id !== undefined)
+    return [...new Set(ids)]
+  }, [dragState?.draggedId, preset?.id])
+  const presetCatalogResult = useChatPresetCatalog(pickerOpen, addressedPresetIds)
+  const presetCatalog = presetCatalogResult.snapshot
+  const presets = presetCatalog?.page.rows ?? EMPTY_PRESET_CATALOG_ROWS
+  const presetCatalogInteractive =
+    presetCatalog?.interactive === true && presetCatalog.status === 'ready'
+  const draggedPreset =
+    dragState === null
+      ? null
+      : (presets.find((candidate) => candidate.id === dragState.draggedId) ??
+        presetCatalog?.page.addressedRows.find((candidate) => candidate.id === dragState.draggedId)
+          ?.row ??
+        null)
   const visiblePresets = useMemo(
-    () => orderPresetsForDragPreview(presets, dragState?.orderedIds),
-    [presets, dragState?.orderedIds],
+    () => orderPresetsForDragPreview(presets, draggedPreset, dragState),
+    [dragState, draggedPreset, presets],
   )
+  const importInputRef = useRef<HTMLInputElement | null>(null)
 
   useEffect(() => {
     dragStateRef.current = dragState
@@ -490,16 +686,12 @@ function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | u
 
   useEffect(() => {
     if (dragState?.status !== 'settling') return
-    if (
-      !sameOrderedIds(
-        dragState.orderedIds,
-        presets.map((p) => p.id),
-      )
-    )
-      return
+    if (!dragState.commandCommitted) return
+    if (!presetCatalogInteractive) return
+    if (presetCatalog.revision <= (dragState.settleAfterSnapshotRevision ?? 0)) return
     dragStateRef.current = null
     setDragState(null)
-  }, [dragState, presets])
+  }, [dragState, presetCatalog?.revision, presetCatalogInteractive])
 
   const diverged = useMemo(() => {
     if (!preset) return true
@@ -510,12 +702,7 @@ function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | u
 
   const loadPreset = useCallback(
     async (targetId: string) => {
-      const target = await getPreset(targetId)
-      if (!target) return
-      await applyChatPreset(chat.id, target.id, {
-        ...target.settings,
-        profileId: target.connectionProfileId,
-      })
+      await configurationApplication.applyChatPreset(chat.id, targetId)
       closePicker()
     },
     [chat.id, closePicker],
@@ -523,9 +710,10 @@ function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | u
 
   const saveToExisting = useCallback(
     async (targetId: string) => {
-      const target = await getPreset(targetId)
+      const target = presets.find((candidate) => candidate.id === targetId)
       if (!target) return
-      await updatePreset(target.id, {
+      await configurationApplication.saveChatPreset({
+        presetId: target.id,
         settings: { ...chat.settings, profileId: target.connectionProfileId },
       })
       pushToast({
@@ -535,26 +723,35 @@ function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | u
       })
       closePicker()
     },
-    [chat.settings, pushToast, closePicker],
+    [chat.settings, presets, pushToast, closePicker],
   )
 
-  const saveAsNew = useCallback(async () => {
-    const name = window.prompt('Name for new preset:')
-    if (!name?.trim()) return
-    const p = await createPreset({
-      name: name.trim(),
-      connectionProfileId: chat.settings.profileId,
-      settings: { ...chat.settings },
+  const saveAsNew = useCallback(() => {
+    runCreatePreset({
+      target: chat.id,
+      action: async () => {
+        const name = window.prompt('Name for new preset:')
+        if (!name?.trim()) return null
+        return configurationApplication.createAndLinkChatPreset({
+          chatId: chat.id,
+          name: name.trim(),
+          profileId: chat.settings.profileId,
+          settings: { ...chat.settings },
+        })
+      },
+      commit: (result) => {
+        if (result?.kind !== 'chat-preset-saved') return
+        const preset = result.preset
+        pushToast({ level: 'info', text: `Created preset "${preset.name}".`, durationMs: 2500 })
+        closePicker()
+      },
     })
-    await setChatPreset(chat.id, p.id)
-    pushToast({ level: 'info', text: `Created preset "${p.name}".`, durationMs: 2500 })
-    closePicker()
-  }, [chat.id, chat.settings, pushToast, closePicker])
+  }, [chat.id, chat.settings, pushToast, closePicker, runCreatePreset])
 
   const exportPresetJson = useCallback(
     async (targetId: string, name: string) => {
       try {
-        const envelope = await exportChatPreset(targetId)
+        const envelope = await interchangeApplication.exportChatPreset(targetId)
         triggerJsonDownload(natterJsonFilename('chat-preset', name, targetId), envelope)
         pushToast({ level: 'success', text: 'Exported preset JSON.', durationMs: 2500 })
       } catch (error) {
@@ -573,7 +770,7 @@ function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | u
       if (!file) return
       try {
         const value = await readJsonFile(file)
-        const result = await importChatPreset(value)
+        const result = await interchangeApplication.importChatPreset(value)
         pushToast({
           level: 'success',
           text: result.profileMatched
@@ -593,81 +790,134 @@ function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | u
   const renamePreset = useCallback(async (targetId: string, currentName: string) => {
     const name = window.prompt('Rename preset:', currentName)
     if (!name?.trim() || name === currentName) return
-    await updatePreset(targetId, { name: name.trim() })
+    await configurationApplication.renameChatPreset(targetId, name.trim())
   }, [])
 
   const deletePresetWithConfirm = useCallback(async (targetId: string, name: string) => {
     if (!window.confirm(`Delete preset "${name}"? Chats stay; their preset link will clear.`)) {
       return
     }
-    await deletePreset(targetId)
+    await configurationApplication.deleteChatPreset(targetId)
   }, [])
 
   const beginPresetDrag = useCallback(
     (event: PointerEvent<HTMLButtonElement>, presetId: PresetId) => {
-      if (event.button !== 0) return
+      if (event.button !== 0 || !presetCatalogInteractive) return
       event.preventDefault()
       const captureTarget: Partial<Pick<HTMLButtonElement, 'setPointerCapture'>> =
         event.currentTarget
       captureTarget.setPointerCapture?.(event.pointerId)
+      const originIndex = presets.findIndex((candidate) => candidate.id === presetId)
+      const originPrecedingId =
+        originIndex > 0
+          ? presets[originIndex - 1]?.id
+          : presetCatalog.page.atStart === true
+            ? null
+            : undefined
       const nextState: PresetDragState = {
         draggedId: presetId,
-        orderedIds: visiblePresets.map((p) => p.id),
+        targetPrecedingId: originPrecedingId,
+        originPrecedingId,
+        commandCommitted: false,
         pointerId: event.pointerId,
         status: 'dragging',
       }
       dragStateRef.current = nextState
       setDragState(nextState)
     },
-    [visiblePresets],
+    [presetCatalog?.page.atStart, presetCatalogInteractive, presets],
   )
 
-  const updatePresetDragPosition = useCallback((event: PointerEvent<HTMLButtonElement>) => {
-    const current = dragStateRef.current
-    if (
-      current?.status !== 'dragging' ||
-      current.draggedId === null ||
-      current.pointerId !== event.pointerId
-    ) {
-      return
-    }
-    event.preventDefault()
-    const orderedIds = reorderPresetIdsForPointer(
-      current.orderedIds,
-      current.draggedId,
-      event.clientY,
-      presetItemRefs.current,
-    )
-    if (orderedIds === current.orderedIds) return
-    const nextState: PresetDragState = { ...current, orderedIds }
-    dragStateRef.current = nextState
-    setDragState(nextState)
-  }, [])
+  const updatePresetDragPosition = useCallback(
+    (event: PointerEvent<HTMLButtonElement>) => {
+      const current = dragStateRef.current
+      if (current?.status !== 'dragging' || current.pointerId !== event.pointerId) return
+      event.preventDefault()
+      const listRect = presetListRef.current?.getBoundingClientRect()
+      if (listRect && event.clientY <= listRect.top + 28 && presetCatalog?.page.previousCursor) {
+        const firstId = visiblePresets.find((candidate) => candidate.id !== current.draggedId)?.id
+        if (firstId !== undefined && current.targetPrecedingId !== firstId) {
+          const nextState = { ...current, targetPrecedingId: firstId }
+          dragStateRef.current = nextState
+          setDragState(nextState)
+        }
+        presetCatalogResult.demandBefore()
+        return
+      }
+      if (listRect && event.clientY >= listRect.bottom - 28 && presetCatalog?.page.nextCursor) {
+        let lastId: PresetId | undefined
+        for (let index = visiblePresets.length - 1; index >= 0; index -= 1) {
+          const candidate = visiblePresets[index]
+          if (candidate && candidate.id !== current.draggedId) {
+            lastId = candidate.id
+            break
+          }
+        }
+        if (lastId !== undefined && current.targetPrecedingId !== lastId) {
+          const nextState = { ...current, targetPrecedingId: lastId }
+          dragStateRef.current = nextState
+          setDragState(nextState)
+        }
+        presetCatalogResult.demandAfter()
+        return
+      }
+      const targetPrecedingId = precedingPresetIdForPointer(
+        visiblePresets.map((candidate) => candidate.id),
+        current.draggedId,
+        event.clientY,
+        presetItemRefs.current,
+        presetCatalog?.page.atStart === true,
+      )
+      if (targetPrecedingId === undefined || targetPrecedingId === current.targetPrecedingId) {
+        return
+      }
+      const nextState = { ...current, targetPrecedingId }
+      dragStateRef.current = nextState
+      setDragState(nextState)
+    },
+    [
+      presetCatalog?.page.nextCursor,
+      presetCatalog?.page.previousCursor,
+      presetCatalog?.page.atStart,
+      presetCatalogResult,
+      visiblePresets,
+    ],
+  )
 
   const commitPresetDrag = useCallback(async () => {
     const current = dragStateRef.current
     if (current?.status !== 'dragging') return
-    const liveIds = presets.map((p) => p.id)
-    const liveIdSet = new Set(liveIds)
-    const orderedIds = current.orderedIds.filter((id) => liveIdSet.has(id))
-    const unchanged = orderedIds.length !== liveIds.length || sameOrderedIds(orderedIds, liveIds)
-    if (unchanged) {
+    if (
+      current.targetPrecedingId === undefined ||
+      current.targetPrecedingId === current.originPrecedingId
+    ) {
       dragStateRef.current = null
       setDragState(null)
       return
     }
-    const settlingState: PresetDragState = { draggedId: null, orderedIds, status: 'settling' }
+    const settlingState: PresetDragState = {
+      ...current,
+      commandCommitted: false,
+      status: 'settling',
+    }
     dragStateRef.current = settlingState
     setDragState(settlingState)
     try {
-      await reorderPresets(orderedIds)
+      await configurationApplication.moveChatPreset(current.draggedId, current.targetPrecedingId)
+      const committedState: PresetDragState = {
+        ...settlingState,
+        commandCommitted: true,
+        settleAfterSnapshotRevision: presetCatalogResult.refresh(),
+      }
+      dragStateRef.current = committedState
+      setDragState(committedState)
     } catch (error) {
       dragStateRef.current = null
       setDragState(null)
       console.error('Failed to reorder presets', error)
       pushToast({ level: 'danger', text: 'Could not save preset order.' })
     }
-  }, [presets, pushToast])
+  }, [presetCatalogResult, pushToast])
 
   const endPresetDrag = useCallback(
     (event: PointerEvent<HTMLButtonElement>) => {
@@ -701,9 +951,23 @@ function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | u
       {pickerOpen ? (
         <div data-ui="preset-breadcrumb-menu" role="menu">
           {presets.length === 0 ? (
-            <p data-ui="helper">No presets yet.</p>
+            <p data-ui="helper">
+              {presetCatalog?.interactive === true ? 'No presets yet.' : 'Loading presets…'}
+            </p>
           ) : (
-            <ul>
+            <ul ref={presetListRef}>
+              {presetCatalog?.page.previousCursor ? (
+                <li data-ui="configuration-catalog-boundary">
+                  <Button
+                    type="button"
+                    data-ui="field-inline-action"
+                    disabled={!presetCatalogInteractive}
+                    onClick={presetCatalogResult.demandBefore}
+                  >
+                    Earlier presets…
+                  </Button>
+                </li>
+              ) : null}
               {visiblePresets.map((p) => {
                 const isCurrent = preset?.id === p.id
                 const isDragging = dragState?.draggedId === p.id
@@ -719,7 +983,7 @@ function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | u
                     data-current={isCurrent ? 'true' : undefined}
                     data-dragging={isDragging ? 'true' : undefined}
                     data-settling={
-                      dragState?.status === 'settling' && dragState.orderedIds.includes(p.id)
+                      dragState?.status === 'settling' && dragState.draggedId === p.id
                         ? 'true'
                         : undefined
                     }
@@ -728,7 +992,8 @@ function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | u
                       type="button"
                       data-ui="preset-drag-handle"
                       aria-label={`Drag preset "${p.name}" to reorder`}
-                      title="Drag to reorder"
+                      title={presetCatalogInteractive ? 'Drag to reorder' : 'Loading presets…'}
+                      disabled={!presetCatalogInteractive && !isDragging}
                       onClick={(event) => event.preventDefault()}
                       onPointerDown={(event) => beginPresetDrag(event, p.id)}
                       onPointerMove={updatePresetDragPosition}
@@ -793,11 +1058,28 @@ function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | u
                   </li>
                 )
               })}
+              {presetCatalog?.page.nextCursor ? (
+                <li data-ui="configuration-catalog-boundary">
+                  <Button
+                    type="button"
+                    data-ui="field-inline-action"
+                    disabled={!presetCatalogInteractive}
+                    onClick={presetCatalogResult.demandAfter}
+                  >
+                    More presets…
+                  </Button>
+                </li>
+              ) : null}
             </ul>
           )}
           <div data-ui="preset-menu-footer">
             <span data-ui="preset-menu-footer-primary">
-              <Button type="button" data-ui="field-inline-action" onClick={() => void saveAsNew()}>
+              <Button
+                type="button"
+                data-ui="field-inline-action"
+                disabled={createPresetInteraction.isPending(chat.id)}
+                onClick={saveAsNew}
+              >
                 + Save as new…
               </Button>
               <input
@@ -861,31 +1143,34 @@ function CloseGlyph() {
 }
 
 function orderPresetsForDragPreview(
-  presets: readonly ChatPreset[],
-  orderedIds: readonly PresetId[] | undefined,
-): ChatPreset[] {
-  if (!orderedIds) return [...presets]
-  const byId = new Map(presets.map((p) => [p.id, p]))
-  const ordered: ChatPreset[] = []
-  for (const id of orderedIds) {
-    const preset = byId.get(id)
-    if (preset) ordered.push(preset)
+  presets: readonly ConfigurationPresetCatalogRow[],
+  draggedPreset: ConfigurationPresetCatalogRow | null,
+  dragState: PresetDragState | null,
+): ConfigurationPresetCatalogRow[] {
+  if (!dragState || !draggedPreset || dragState.targetPrecedingId === undefined) {
+    return [...presets]
   }
-  const seen = new Set(ordered.map((p) => p.id))
-  for (const preset of presets) {
-    if (!seen.has(preset.id)) ordered.push(preset)
-  }
-  return ordered
+  const withoutDragged = presets.filter((preset) => preset.id !== dragState.draggedId)
+  if (dragState.targetPrecedingId === null) return [draggedPreset, ...withoutDragged]
+  const precedingIndex = withoutDragged.findIndex(
+    (preset) => preset.id === dragState.targetPrecedingId,
+  )
+  if (precedingIndex < 0) return [...presets]
+  return [
+    ...withoutDragged.slice(0, precedingIndex + 1),
+    draggedPreset,
+    ...withoutDragged.slice(precedingIndex + 1),
+  ]
 }
 
-function reorderPresetIdsForPointer(
-  orderedIds: readonly PresetId[],
+function precedingPresetIdForPointer(
+  visibleIds: readonly PresetId[],
   draggedId: PresetId,
   clientY: number,
   itemRefs: ReadonlyMap<PresetId, HTMLLIElement>,
-): PresetId[] {
-  const withoutDragged = orderedIds.filter((id) => id !== draggedId)
-  if (withoutDragged.length === orderedIds.length) return orderedIds as PresetId[]
+  atStart: boolean,
+): PresetId | null | undefined {
+  const withoutDragged = visibleIds.filter((id) => id !== draggedId)
   let insertAt = withoutDragged.length
   for (const [index, id] of withoutDragged.entries()) {
     const node = itemRefs.get(id)
@@ -896,13 +1181,8 @@ function reorderPresetIdsForPointer(
       break
     }
   }
-  const next = [...withoutDragged.slice(0, insertAt), draggedId, ...withoutDragged.slice(insertAt)]
-  return sameOrderedIds(next, orderedIds) ? (orderedIds as PresetId[]) : next
-}
-
-function sameOrderedIds(left: readonly PresetId[], right: readonly PresetId[]): boolean {
-  if (left.length !== right.length) return false
-  return left.every((id, index) => id === right[index])
+  if (insertAt === 0) return atStart ? null : undefined
+  return withoutDragged[insertAt - 1]
 }
 
 function settingsMatch(a: Chat['settings'], b: Chat['settings']): boolean {
@@ -936,14 +1216,12 @@ function sortObjectKeys(value: unknown): unknown {
 function ContextTab({
   chat,
   capability,
-  endpointTokenizer,
   promptEstimate,
   isOpenRouter,
   connectionKind,
 }: {
   chat: Chat
   capability: EffectiveCapability | null
-  endpointTokenizer: string | null
   promptEstimate: PromptSizeEstimate | null
   isOpenRouter: boolean
   connectionKind: ConnectionKind
@@ -953,7 +1231,6 @@ function ContextTab({
       <ContextPanel
         chat={chat}
         capability={capability}
-        endpointTokenizer={endpointTokenizer}
         estimateOverride={promptEstimate}
         showMiddleOut={isOpenRouter}
       />

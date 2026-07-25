@@ -10,6 +10,7 @@ import {
   ignoredProviderRefsAfterBulkDeselect,
   isLowQuantization,
   isUnknownQuantization,
+  pickerRowIsHardDenied,
   reasonLabel,
   reasonsToTooltip,
   tierToLockLabel,
@@ -58,6 +59,7 @@ describe('buildPickerRows', () => {
   it('maps kept endpoints to state=kept with tier derived from policy', () => {
     const azure = ep('Azure')
     const filter: PrivacyFilterResult = {
+      model: 'test/model',
       kept: [{ endpoint: azure, policy: POLICY_CLEAN, policySynthesized: false }],
       excluded: [],
       zeroEligible: false,
@@ -72,6 +74,7 @@ describe('buildPickerRows', () => {
   it('maps auto-excluded endpoints with their reasons + dominated tier', () => {
     const openai = ep('OpenAI')
     const filter: PrivacyFilterResult = {
+      model: 'test/model',
       kept: [],
       excluded: [
         {
@@ -95,6 +98,7 @@ describe('buildPickerRows', () => {
     const b = ep('Beta')
     const c = ep('Gamma')
     const filter: PrivacyFilterResult = {
+      model: 'test/model',
       kept: [
         { endpoint: c, policy: POLICY_CLEAN, policySynthesized: false },
         { endpoint: a, policy: POLICY_USER_IDS, policySynthesized: false },
@@ -112,6 +116,7 @@ describe('buildPickerRows', () => {
   it('flags synthesized-policy rows red and tags unknown-policy', () => {
     const mystery = ep('NewHost')
     const filter: PrivacyFilterResult = {
+      model: 'test/model',
       kept: [],
       excluded: [
         {
@@ -134,6 +139,7 @@ describe('buildPickerRows', () => {
     // the orphan as auto-excluded / unavailable rather than throwing.
     const ghost = ep('GhostHost')
     const filter: PrivacyFilterResult = {
+      model: 'test/model',
       kept: [],
       excluded: [],
       zeroEligible: false,
@@ -148,6 +154,7 @@ describe('buildPickerRows', () => {
   it('treats manually re-allowed dominated providers as kept while preserving their lower tier', () => {
     const fastRetain = ep('Fast Retain')
     const filter: PrivacyFilterResult = {
+      model: 'test/model',
       kept: [],
       excluded: [
         {
@@ -167,9 +174,10 @@ describe('buildPickerRows', () => {
     expect(row?.reasons).toEqual([])
   })
 
-  it('lets manual picker override even red privacy tiers', () => {
+  it('keeps mandatory training denial visible when the picker owns reversible exclusions', () => {
     const trainer = ep('Training Host')
     const filter: PrivacyFilterResult = {
+      model: 'test/model',
       kept: [],
       excluded: [
         {
@@ -184,15 +192,17 @@ describe('buildPickerRows', () => {
     const [row] = buildPickerRows([trainer], filter, {
       providerPrefs: { ignore: [], ignoreOverridesFilter: true },
     })
-    expect(row?.state).toBe('kept')
+    expect(row?.state).toBe('auto-excluded')
     expect(row?.tier).toBe('red')
-    expect(row?.reasons).toEqual([])
+    expect(row?.reasons).toEqual(['training'])
+    expect(row && pickerRowIsHardDenied(row)).toBe(true)
   })
 
   it('renders compatibility providerPrefs.only as a visible pinned set', () => {
     const kept = ep('Allowed', { provider_slug: 'allowed' })
     const outside = ep('Outside', { provider_slug: 'outside' })
     const filter: PrivacyFilterResult = {
+      model: 'test/model',
       kept: [
         { endpoint: kept, policy: POLICY_CLEAN, policySynthesized: false },
         { endpoint: outside, policy: POLICY_CLEAN, policySynthesized: false },
@@ -213,6 +223,7 @@ describe('buildPickerRows', () => {
     const kept = ep('Allowed', { provider_slug: 'allowed' })
     const outside = ep('Outside', { provider_slug: 'outside' })
     const filter: PrivacyFilterResult = {
+      model: 'test/model',
       kept: [
         { endpoint: kept, policy: POLICY_CLEAN, policySynthesized: false },
         { endpoint: outside, policy: POLICY_CLEAN, policySynthesized: false },
@@ -233,6 +244,7 @@ describe('buildPickerRows', () => {
     const anth2 = ep('Anthropic', { provider_slug: 'anthropic/2' })
     const anth = ep('Anthropic', { provider_slug: 'anthropic' })
     const filter: PrivacyFilterResult = {
+      model: 'test/model',
       kept: [{ endpoint: anth, policy: POLICY_CLEAN, policySynthesized: false }],
       excluded: [
         {
@@ -253,6 +265,7 @@ describe('buildPickerRows', () => {
     const anth2 = ep('Anthropic', { provider_slug: 'anthropic/2' })
     const anth = ep('Anthropic', { provider_slug: 'anthropic' })
     const filter: PrivacyFilterResult = {
+      model: 'test/model',
       kept: [
         { endpoint: anth2, policy: POLICY_CLEAN, policySynthesized: false },
         { endpoint: anth, policy: POLICY_CLEAN, policySynthesized: false },
@@ -299,6 +312,7 @@ describe('provider-picker bulk quantization helpers', () => {
     const deepinfra = ep('DeepInfra', { provider_slug: 'deepinfra/fp4', quantization: 'fp4' })
     const endpoints = [deepseek, streamlake, deepinfra]
     const filter: PrivacyFilterResult = {
+      model: 'test/model',
       kept: endpoints.map((endpoint) => ({
         endpoint,
         policy: POLICY_CLEAN,
@@ -325,6 +339,7 @@ describe('provider-picker bulk quantization helpers', () => {
     const atlas = ep('AtlasCloud', { provider_slug: 'atlas-cloud/fp4', quantization: 'fp4' })
     const endpoints = [deepseek, atlas]
     const filter: PrivacyFilterResult = {
+      model: 'test/model',
       kept: endpoints.map((endpoint) => ({
         endpoint,
         policy: POLICY_CLEAN,

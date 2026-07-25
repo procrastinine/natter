@@ -1,4 +1,9 @@
-import type { ConnectionProfile } from '../core/types'
+import { isReasoningEnvelope, projectReasoningPresentation } from '../core/reasoning-envelope'
+import type {
+  ConnectionProfile,
+  OpaqueReasoningCarrierDescriptor,
+  ReasoningVisiblePart,
+} from '../core/types'
 import { isSensitiveDiagnosticKey } from './diagnostic-redaction'
 
 const MAX_STRING_CHARS = 360
@@ -24,6 +29,8 @@ export interface RequestPlanDebugEvent {
   request?: unknown
 }
 
+export type DebugPayload = unknown
+
 let seq = 0
 let streamDebugSink: ((entry: StreamDebugEntry) => void) | undefined
 let requestPlanDebugSink: ((entry: RequestPlanDebugEvent) => void) | undefined
@@ -43,15 +50,23 @@ export function setRequestPlanDebugSink(
   requestPlanDebugSink = sink
 }
 
+export function requestPlanDebugEnabled(): boolean {
+  return requestPlanDebugSink !== undefined
+}
+
 export function streamDebugEnabled(profile?: Pick<ConnectionProfile, 'debugRequests'>): boolean {
   return profile?.debugRequests === true || streamDebugSink !== undefined
 }
 
 export function snapshotStreamDebugRequest(
   profile: Pick<ConnectionProfile, 'debugRequests'>,
-  request: unknown,
+  request: DebugPayload,
 ): unknown {
-  return streamDebugEnabled(profile) ? sanitize(request, 1) : null
+  return streamDebugEnabled(profile) ? sanitize(resolvePayload(request), 1) : null
+}
+
+function resolvePayload(payload: DebugPayload): unknown {
+  return typeof payload === 'function' ? (payload as () => unknown)() : payload
 }
 
 function redactHeaders(headers: Record<string, string>): Record<string, string> {
@@ -82,25 +97,6 @@ function compactTextLike(value: unknown): { length: number; preview: string } | 
   return { length: value.length, preview: compactString(value) }
 }
 
-function compactReasoningDetail(detail: unknown): unknown {
-  if (!detail || typeof detail !== 'object') return sanitize(detail)
-  const value = detail as Record<string, unknown>
-  const base: Record<string, unknown> = {}
-  if (typeof value.type === 'string') base.type = value.type
-  if (typeof value.id === 'string') base.id = value.id
-  if (typeof value.index === 'number') base.index = value.index
-  if (typeof value.format === 'string') base.format = value.format
-  const textLike = compactTextLike(value.text)
-  if (textLike) base.text = textLike
-  const summaryLike = compactTextLike(value.summary)
-  if (summaryLike) base.summary = summaryLike
-  const dataLike = compactTextLike(value.data)
-  if (dataLike) base.data = dataLike
-  const signatureLike = compactTextLike(value.signature)
-  if (signatureLike) base.signature = signatureLike
-  return base
-}
-
 function compactContentItem(item: unknown): unknown {
   if (!item || typeof item !== 'object') return sanitize(item)
   const value = item as Record<string, unknown>
@@ -111,36 +107,79 @@ function compactContentItem(item: unknown): unknown {
   return base
 }
 
-function compactReasoningEvent(event: unknown): unknown {
-  if (!event || typeof event !== 'object') return sanitize(event)
-  const value = event as Record<string, unknown>
-  const base: Record<string, unknown> = {
-    lane: value.lane,
-    chunkId: value.chunkId,
-    itemId: value.itemId,
-    outputIndex: value.outputIndex,
-    summaryIndex: value.summaryIndex,
+function compactReasoningEnvelope(value: unknown): unknown {
+  if (!isReasoningEnvelope(value)) return { invalid: true }
+  const presentation = projectReasoningPresentation({
+    kind: 'durable',
+    owner: { kind: 'generation' },
+    envelope: value,
+  })
+  const items: unknown[] = []
+  const pushVisible = (
+    entry: (typeof presentation.text)[number],
+    kind: ReasoningVisiblePart['kind'],
+  ) => {
+    if (items.length >= MAX_ARRAY_ITEMS) return
+    items.push({
+      lane: kind,
+      id: entry.part.id,
+      format: entry.part.format,
+      value: compactTextLike(entry.text),
+      ...(entry.part.hidden === true ? { hidden: true } : {}),
+    })
   }
-  const textDelta = compactTextLike(value.textDelta)
-  if (textDelta) base.textDelta = textDelta
-  const summaryDelta = compactTextLike(value.summaryDelta)
-  if (summaryDelta) base.summaryDelta = summaryDelta
-  const encryptedDelta = compactTextLike(value.encryptedDelta)
-  if (encryptedDelta) base.encryptedDelta = encryptedDelta
-  if (Array.isArray(value.details)) {
-    base.details = value.details.slice(0, MAX_ARRAY_ITEMS).map(compactReasoningDetail)
-    if (value.details.length > MAX_ARRAY_ITEMS) base.detailsTruncated = value.details.length
+  const pushCarrier = (
+    entry: (typeof presentation.opaque)[number],
+    role: 'opaque' | 'authentication',
+  ) => {
+    if (items.length >= MAX_ARRAY_ITEMS) return
+    items.push({
+      lane: role,
+      id: entry.carrier.id,
+      kind: entry.carrier.kind,
+      format: entry.carrier.format,
+      valueLength: entry.valueLength,
+      ...carrierBindingSummary(entry.carrier),
+      ...(entry.carrier.hidden === true ? { hidden: true } : {}),
+    })
   }
-  return base
+  for (const entry of presentation.text) pushVisible(entry, 'text')
+  for (const entry of presentation.summary) pushVisible(entry, 'summary')
+  for (const entry of presentation.opaque) pushCarrier(entry, 'opaque')
+  for (const entry of presentation.authentication) pushCarrier(entry, 'authentication')
+  const memberCount =
+    presentation.text.length +
+    presentation.summary.length +
+    presentation.opaque.length +
+    presentation.authentication.length
+  return {
+    kind: presentation.kind,
+    counts: {
+      text: presentation.text.length,
+      summary: presentation.summary.length,
+      opaque: presentation.opaque.length,
+      authentication: presentation.authentication.length,
+    },
+    lengths: {
+      text: presentation.textCharCount,
+      summary: presentation.summaryCharCount,
+      opaque: presentation.opaqueCarrierBytes,
+      authentication: presentation.authenticationCarrierBytes,
+    },
+    items,
+    ...(memberCount > items.length ? { truncated: memberCount - items.length } : {}),
+  }
 }
 
-function compactReasoningList(list: unknown): unknown {
-  if (!Array.isArray(list)) return sanitize(list)
-  return {
-    count: list.length,
-    items: list.slice(0, MAX_ARRAY_ITEMS).map(compactReasoningDetail),
-    ...(list.length > MAX_ARRAY_ITEMS ? { truncated: list.length - MAX_ARRAY_ITEMS } : {}),
+function carrierBindingSummary(
+  carrier: OpaqueReasoningCarrierDescriptor,
+): Record<string, string | true> {
+  if (carrier.kind !== 'anthropic-signature' && carrier.kind !== 'gemini-thought-signature') {
+    return {}
   }
+  return carrier.bindsVisiblePartId
+    ? { bindsVisiblePartId: carrier.bindsVisiblePartId }
+    : { unbound: true }
 }
 
 function compactMessagePayload(payload: unknown): unknown {
@@ -152,13 +191,33 @@ function compactMessagePayload(payload: unknown): unknown {
   if (Array.isArray(value.content)) {
     base.content = value.content.slice(0, MAX_ARRAY_ITEMS).map(compactContentItem)
   }
-  if (Array.isArray(value.reasoningDetails)) {
-    base.reasoningDetails = compactReasoningList(value.reasoningDetails)
+  if (value.reasoningEnvelope !== undefined) {
+    base.reasoningEnvelope = compactReasoningEnvelope(value.reasoningEnvelope)
+  }
+  if (Array.isArray(value.reasoningAttempts)) {
+    base.reasoningAttempts = value.reasoningAttempts
+      .slice(0, MAX_ARRAY_ITEMS)
+      .map(compactReasoningAttempt)
+    if (value.reasoningAttempts.length > MAX_ARRAY_ITEMS) {
+      base.reasoningAttemptsTruncated = value.reasoningAttempts.length - MAX_ARRAY_ITEMS
+    }
   }
   if (value.generation && typeof value.generation === 'object') {
     base.generation = sanitize(value.generation)
   }
   return base
+}
+
+function compactReasoningAttempt(value: unknown): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return sanitize(value)
+  const attempt = value as Record<string, unknown>
+  return {
+    owner: sanitize(attempt.owner),
+    visibility: sanitize(attempt.visibility),
+    ...(attempt.reasoningEnvelope === undefined
+      ? {}
+      : { reasoningEnvelope: compactReasoningEnvelope(attempt.reasoningEnvelope) }),
+  }
 }
 
 function compactSsePayload(payload: unknown): unknown {
@@ -199,37 +258,33 @@ function sanitize(value: unknown, depth = 0): unknown {
 
 function summarizePayload(stage: string, payload: unknown): unknown {
   switch (stage) {
-    case 'reasoning.apply':
-      if (!payload || typeof payload !== 'object') return sanitize(payload)
-      return {
-        event: compactReasoningEvent((payload as { event?: unknown }).event),
-        reasoningList: compactReasoningList((payload as { reasoningList?: unknown }).reasoningList),
-      }
-    case 'message.flush':
     case 'message.finalize':
       return compactMessagePayload(payload)
-    case 'sse.raw':
+    case 'frame-raw':
       return compactSsePayload(payload)
-    case 'sse.parsed':
-    case 'buffered_result':
-    case 'once.result':
+    case 'frame':
+    case 'frame-invalid':
+    case 'buffered-result':
+    case 'poll':
+    case 'response-head':
+    case 'terminal':
+    case 'error':
     case 'request':
-    case 'send.open':
       return sanitize(payload)
     default:
       return sanitize(payload)
   }
 }
 
-function emitDebug(label: string, stage: string, payload?: unknown): void {
-  const summarized = summarizePayload(stage, payload)
+function emitDebug(label: string, stage: string, payload?: DebugPayload): void {
+  const summarized = summarizePayload(stage, resolvePayload(payload))
   streamDebugSink?.({ label, payload: summarized })
   console.debug(label, summarized)
 }
 
-export function logRequestPlanDebug(label: string, payload?: unknown): void {
+export function logRequestPlanDebug(label: string, payload?: DebugPayload): void {
   if (!requestPlanDebugSink) return
-  const { request, summary } = summarizeRequestPlan(payload)
+  const { request, summary } = summarizeRequestPlan(resolvePayload(payload))
   const fullLabel = `[request-plan] ${label}`
   requestPlanDebugSink({
     label: fullLabel,
@@ -252,14 +307,16 @@ function summarizeRequestPlan(payload: unknown): { request?: unknown; summary: u
 
 export function startStreamDebug(args: {
   adapter: string
+  diagnosticId?: string
   profile: ConnectionProfile
   url: string
-  request: unknown
+  request: DebugPayload
   headers: Record<string, string>
+  attemptIndex?: number
 }): StreamDebugTrace | null {
   if (!streamDebugEnabled(args.profile)) return null
   const trace: StreamDebugTrace = {
-    id: nextTraceId(args.adapter),
+    id: args.diagnosticId ?? nextTraceId(args.adapter),
     adapter: args.adapter,
     startedAt: Date.now(),
   }
@@ -273,16 +330,35 @@ export function startStreamDebug(args: {
       debugRequests: args.profile.debugRequests === true,
     },
     url: args.url,
+    attemptIndex: args.attemptIndex ?? 0,
     headers: redactHeaders(args.headers),
-    request: args.request,
+    request: resolvePayload(args.request),
   })
   return trace
+}
+
+export function logStreamDebugRequestAttempt(
+  trace: StreamDebugTrace,
+  args: {
+    url: string
+    headers: Record<string, string>
+    attemptIndex: number
+    phase?: 'dispatch' | 'poll'
+  },
+): void {
+  emitDebug(`[stream-debug][${trace.id}] request`, 'request', {
+    adapter: trace.adapter,
+    url: args.url,
+    attemptIndex: args.attemptIndex,
+    ...(args.phase ? { phase: args.phase } : {}),
+    headers: redactHeaders(args.headers),
+  })
 }
 
 export function logStreamDebug(
   scope: StreamDebugTrace | string | null | undefined,
   stage: string,
-  payload?: unknown,
+  payload?: DebugPayload,
 ): void {
   if (scope === null || scope === undefined) {
     if (!streamDebugSink) return
@@ -295,4 +371,16 @@ export function logStreamDebug(
     return
   }
   emitDebug(`[stream-debug][${scope.id}] +${elapsedMs(scope)}ms ${stage}`, stage, payload)
+}
+
+export function logStreamDebugError(
+  trace: StreamDebugTrace,
+  error: unknown,
+  context?: Record<string, unknown>,
+): void {
+  logStreamDebug(trace, 'error', {
+    ...(context ?? {}),
+    name: error instanceof Error ? error.name : 'UnknownError',
+    message: error instanceof Error ? error.message : String(error),
+  })
 }

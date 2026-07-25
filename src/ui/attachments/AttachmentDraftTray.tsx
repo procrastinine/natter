@@ -5,7 +5,7 @@ import { CloseIcon, DatabaseIcon, EyeIcon, EyeOffIcon, TrashIcon, UploadIcon } f
 import { IconButton } from '../primitives/Button'
 import { AttachmentPicker } from './AttachmentPicker'
 import { AttachmentPreview } from './AttachmentPreview'
-import { formatBytes, kindLabel, shortId, storageLabel } from './format'
+import { type AttachmentDisplayRow, formatBytes, kindLabel, shortId, storageLabel } from './format'
 import type { AttachmentUploadItem } from './useAttachmentDrafts'
 
 export function AttachmentDraftTray({
@@ -19,7 +19,7 @@ export function AttachmentDraftTray({
   onDismissUpload,
 }: {
   refs: readonly MessageAttachmentRef[]
-  attachments: Map<string, Attachment>
+  attachments: Map<string, AttachmentDisplayRow>
   uploads: readonly AttachmentUploadItem[]
   disabled?: boolean | undefined
   onToggle: (refId: string) => void
@@ -142,11 +142,11 @@ export function AttachmentDraftTray({
       })}
       {replaceRefId ? (
         <AttachmentPicker
+          sessionSurface="picker-draft-tray"
           title="Relink attachment"
           onClose={() => setReplaceRefId(null)}
           onPick={(attachment) => {
             onReplace(replaceRefId, attachment)
-            setReplaceRefId(null)
           }}
         />
       ) : null}

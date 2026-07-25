@@ -17,6 +17,16 @@ interface ActivityPhase {
 const PlatformPromise = Promise
 let activePhase: ActivityPhase | null = null
 const queuedPhases: ActivityPhase[] = []
+let acceptingActivity = false
+let idlePromise: Promise<void> | null = null
+let resolveIdle: (() => void) | null = null
+
+export class LocalTransactionActivityClosedError extends Error {
+  constructor() {
+    super('LocalTransactionActivityClosed')
+    this.name = 'LocalTransactionActivityClosedError'
+  }
+}
 
 export function runWithLocalReadActivity<T>(run: () => T | PromiseLike<T>): Promise<T> {
   return admitActivity('read', run)
@@ -27,6 +37,9 @@ export function runWithLocalWriteActivity<T>(run: () => T | PromiseLike<T>): Pro
 }
 
 function admitActivity<T>(mode: ActivityMode, run: () => T | PromiseLike<T>): Promise<T> {
+  if (!acceptingActivity) {
+    return PlatformPromise.reject(new LocalTransactionActivityClosedError())
+  }
   if (activePhase === null) {
     const phase: ActivityPhase = { mode, active: 0, queued: [] }
     activePhase = phase
@@ -104,5 +117,60 @@ function finishActivity(phase: ActivityPhase): void {
   if (phase.active !== 0) return
   if (activePhase !== phase) throw new Error('LocalTransactionActivityPhaseMismatch')
   activePhase = queuedPhases.shift() ?? null
-  if (activePhase) startQueuedPhase(activePhase)
+  if (activePhase) {
+    startQueuedPhase(activePhase)
+    return
+  }
+  settleIdle()
+}
+
+export function stopLocalTransactionAdmissions(): void {
+  if (!acceptingActivity) return
+  acceptingActivity = false
+  const error = new LocalTransactionActivityClosedError()
+  for (const phase of queuedPhases.splice(0)) {
+    for (const activity of phase.queued.splice(0)) activity.reject(error)
+  }
+  if (activePhase === null) settleIdle()
+}
+
+export function waitForLocalTransactionIdle(): Promise<void> {
+  if (activePhase === null) return PlatformPromise.resolve()
+  if (idlePromise) return idlePromise
+  idlePromise = new PlatformPromise<void>((resolve) => {
+    resolveIdle = resolve
+  })
+  return idlePromise
+}
+
+export function resumeLocalTransactionAdmissions(): void {
+  if (activePhase !== null || queuedPhases.length > 0) {
+    throw new Error('LocalTransactionActivityStillRunning')
+  }
+  acceptingActivity = true
+  settleIdle()
+}
+
+export function localTransactionActivityStats(): {
+  accepting: boolean
+  active: number
+  queued: number
+} {
+  return {
+    accepting: acceptingActivity,
+    active: activePhase?.active ?? 0,
+    queued: queuedPhases.reduce((total, phase) => total + phase.queued.length, 0),
+  }
+}
+
+export function assertLocalTransactionAdmissionsClosed(): void {
+  if (acceptingActivity || activePhase || queuedPhases.length > 0) {
+    throw new Error('LocalTransactionAdmissionsNotClosed')
+  }
+}
+
+function settleIdle(): void {
+  resolveIdle?.()
+  resolveIdle = null
+  idlePromise = null
 }

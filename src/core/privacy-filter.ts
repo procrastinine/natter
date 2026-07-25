@@ -16,13 +16,12 @@
 // and produces a decision. The scraper and hook layers feed it; the
 // request composer consumes `buildWireProviderPrivacy`.
 
-import { dominates, synthesizeDataPolicy } from './privacy'
+import { privacyPolicyTierRank, synthesizeDataPolicy } from './privacy'
 import { fallbackDataPolicyForEndpoint } from './privacy-fallbacks'
 import {
-  endpointMatchesAnyProviderRef,
+  ProviderEndpointIndex,
   providerPolicyLookupKeys,
   providerRoutingRef,
-  resolveProviderRefsToRoutingRefs,
 } from './provider-identity'
 import type { DataPolicy, ModelEndpoint, PrivacyPrefs } from './types'
 
@@ -33,6 +32,14 @@ export type ExclusionReason =
   | 'unknown-policy'
   | 'user-ignored'
   | 'not-in-only-list'
+
+export function isHardPrivacyExclusionReason(reason: ExclusionReason): boolean {
+  return reason === 'training' || reason === 'training-openrouter'
+}
+
+export function hasHardPrivacyExclusion(reasons: readonly ExclusionReason[]): boolean {
+  return reasons.some(isHardPrivacyExclusionReason)
+}
 
 interface FilteredEndpoint {
   endpoint: ModelEndpoint
@@ -48,6 +55,7 @@ interface ExcludedEndpoint extends FilteredEndpoint {
 }
 
 export interface PrivacyFilterResult {
+  model: string
   kept: FilteredEndpoint[]
   excluded: ExcludedEndpoint[]
   // True when hard-deny + Pareto leaves zero providers.
@@ -115,16 +123,16 @@ export function filterEndpointsByPrivacy(input: PrivacyFilterInput): PrivacyFilt
   // endpoint is dominated iff some OTHER scoped endpoint dominates it.
   let kept = afterDeny
   if (privacy.paretoFilter) {
-    const undominated = afterDeny.filter((aug) => {
-      for (const other of afterDeny) {
-        if (other === aug) continue
-        if (!other.policy || !aug.policy) continue
-        if (dominates(other.policy, aug.policy)) return false
-      }
-      return true
-    })
+    let bestTier = Number.POSITIVE_INFINITY
     for (const aug of afterDeny) {
-      if (!undominated.includes(aug)) excludeWith(aug, 'dominated')
+      if (aug.policy) bestTier = Math.min(bestTier, privacyPolicyTierRank(aug.policy))
+    }
+    const undominated = afterDeny.filter(
+      (aug) => aug.policy && privacyPolicyTierRank(aug.policy) === bestTier,
+    )
+    const undominatedSet = new Set(undominated)
+    for (const aug of afterDeny) {
+      if (!undominatedSet.has(aug)) excludeWith(aug, 'dominated')
     }
     kept = undominated
   }
@@ -137,6 +145,7 @@ export function filterEndpointsByPrivacy(input: PrivacyFilterInput): PrivacyFilt
   }
 
   return {
+    model: input.model,
     kept,
     excluded,
     zeroEligible: kept.length === 0 && endpoints.length > 0,
@@ -211,44 +220,66 @@ export function buildWireProviderPrivacy(
     userTouchedPicker?: boolean
   } = {},
 ): WireProviderPrivacy {
-  // Unified "allowed vs disallowed" model: if the user has touched the
-  // picker, `existingIgnore` is the authoritative set of disallowed
-  // providers. The wire does NOT re-layer Pareto/dominated/training/
-  // unknown-policy auto-exclusion on top. When the user hasn't touched
-  // (default), fall back to `autoIgnore` so the request matches what the
-  // picker shows.
+  // Once the user touches the picker, its ignore list owns reversible
+  // exclusions. Training denial remains mandatory and is projected into
+  // the same visible/wire selection instead of being reapplied by a hidden
+  // request-only path.
   const userTookOver = opts.userTouchedPicker === true
   const allEndpoints = [
     ...result.kept.map((row) => row.endpoint),
     ...result.excluded.map((row) => row.endpoint),
   ]
+  const endpointIndex = new ProviderEndpointIndex(allEndpoints)
   const autoIgnore = result.excluded.map((e) => providerRoutingRef(e.endpoint))
-  const existingIgnore = resolveProviderRefsToRoutingRefs(allEndpoints, opts.existingIgnore, {
+  const hardDeniedEndpoints = new Set(
+    result.excluded
+      .filter((row) => hasHardPrivacyExclusion(row.reasons))
+      .map((row) => row.endpoint),
+  )
+  const hardDeniedRefs = [...hardDeniedEndpoints].map(providerRoutingRef)
+  const existingIgnore = endpointIndex.resolveRoutingRefs(opts.existingIgnore, {
     preserveUnknown: true,
   })
-  const existingOnly = resolveProviderRefsToRoutingRefs(allEndpoints, opts.existingOnly, {
+  const existingOnly = endpointIndex.resolveRoutingRefs(opts.existingOnly, {
     preserveUnknown: true,
   })
-  const existingOrder = resolveProviderRefsToRoutingRefs(allEndpoints, opts.existingOrder, {
+  const existingOrder = endpointIndex.resolveRoutingRefs(opts.existingOrder, {
     preserveUnknown: true,
   })
   const mergedIgnore = userTookOver
-    ? uniqueStrings([...existingIgnore])
+    ? uniqueStrings([...existingIgnore, ...hardDeniedRefs])
     : uniqueStrings([...autoIgnore])
-  const allowedAfterManualOverride = userTookOver
-    ? allEndpoints.some(
-        (endpoint) => !endpointMatchesAnyProviderRef(endpoint, mergedIgnore, allEndpoints),
-      )
-    : false
+  const manuallyIgnoredEndpoints = endpointIndex.endpointsForRefs(mergedIgnore)
+  const filteredOnly = existingOnly.filter(
+    (ref) =>
+      ![...endpointIndex.endpointsForRefs([ref])].some((endpoint) =>
+        hardDeniedEndpoints.has(endpoint),
+      ),
+  )
+  const filteredOrder = existingOrder.filter(
+    (ref) =>
+      ![...endpointIndex.endpointsForRefs([ref])].some((endpoint) =>
+        hardDeniedEndpoints.has(endpoint),
+      ),
+  )
+  const onlyEndpoints = endpointIndex.endpointsForRefs(filteredOnly)
+  const hasOnly = existingOnly.length > 0
+  const eligibleEndpoints = userTookOver
+    ? allEndpoints.filter((endpoint) => !hardDeniedEndpoints.has(endpoint))
+    : result.kept.map((row) => row.endpoint)
+  const allowedAfterSelection = eligibleEndpoints.some(
+    (endpoint) =>
+      !manuallyIgnoredEndpoints.has(endpoint) && (!hasOnly || onlyEndpoints.has(endpoint)),
+  )
   const wire: WireProviderPrivacy = {
-    zeroEligible: userTookOver && allowedAfterManualOverride ? false : result.zeroEligible,
+    zeroEligible: allEndpoints.length > 0 && !allowedAfterSelection,
   }
   if (mergedIgnore.length > 0) wire.ignore = mergedIgnore
-  if (existingOnly.length > 0) {
-    wire.only = existingOnly
+  if (filteredOnly.length > 0) {
+    wire.only = filteredOnly
   }
-  if (existingOrder.length > 0) {
-    wire.order = existingOrder
+  if (filteredOrder.length > 0) {
+    wire.order = filteredOrder
   }
   if (privacy.denyDataCollection) wire.data_collection = 'deny'
   if (privacy.zdrOnly) wire.zdr = true

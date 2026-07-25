@@ -1,4 +1,4 @@
-import type { AttachmentBundle } from '../../store/repository'
+import type { AssistantPlanningAttachmentBundle } from '../assistant-planning-resources'
 import type { Attachment, AttachmentArtifact } from '../types'
 import { buildOpenRouterContentPart, buildOpenRouterPdfPlugin } from './openrouter'
 import type {
@@ -13,7 +13,7 @@ interface StoredOpenRouterAttachmentWire {
 }
 
 export async function buildStoredOpenRouterAttachmentWire(
-  bundle: AttachmentBundle,
+  bundle: AssistantPlanningAttachmentBundle,
   options: { imageDetail?: 'auto' | 'low' | 'high' } = {},
 ): Promise<StoredOpenRouterAttachmentWire> {
   const original = bundle.blobs.find((blob) => blob.role === 'original')
@@ -32,7 +32,9 @@ export async function buildStoredOpenRouterAttachmentWire(
   return { parts: [{ type: 'text', text: label }, part], plugins: plugin ? [plugin] : [] }
 }
 
-function storedBundleToProcessResult(bundle: AttachmentBundle): ProcessAttachmentResult {
+function storedBundleToProcessResult(
+  bundle: AssistantPlanningAttachmentBundle,
+): ProcessAttachmentResult {
   const attachment = bundle.attachment
   const textArtifact = bundle.artifacts.some((artifact) => artifact.kind === 'text')
   return {
@@ -99,7 +101,7 @@ function toProcessedArtifact(artifact: AttachmentArtifact): ProcessedArtifact {
   }
 }
 
-function toProcessedState(job: AttachmentBundle['jobs'][number]): ProcessedState {
+function toProcessedState(job: AssistantPlanningAttachmentBundle['jobs'][number]): ProcessedState {
   return {
     processorId: job.processorId,
     status: job.status === 'succeeded' ? 'ready' : job.status === 'failed' ? 'failed' : 'skipped',

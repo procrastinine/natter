@@ -1,20 +1,33 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { createChat } from '../helpers/chats'
 import 'fake-indexeddb/auto'
 import Dexie from 'dexie'
 import { IDBFactory } from 'fake-indexeddb'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { resolveBundledCapability } from '../../src/capabilities'
 import { effectiveCapabilityFromEndpoints } from '../../src/core/capabilities'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
+import { resolveEffectiveEndpointRouting } from '../../src/core/effective-endpoint-routing'
+import { EMPTY_MESSAGE_CONTEXT_ROUTE_FACTS } from '../../src/core/reasoning'
 import type { ConnectionProfile, ModelEndpoint } from '../../src/core/types'
+import type { UseModelCatalogResult } from '../../src/hooks/useModelCatalog'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
-import { createChat, getChat } from '../../src/store/chats'
-import { __resetDbForTests, openDb } from '../../src/store/db'
+import {
+  openBrowserWorkspace,
+  shutdownBrowserWorkspace,
+} from '../../src/store/browser-workspace-lifecycle'
+import { getChat } from '../../src/store/chats'
+import { __resetDbForTests } from '../../src/store/db'
 import { exportChatPreset } from '../../src/store/import-export'
+import { createKey } from '../../src/store/keys'
 import { __resetLockTrackerForTests, withMutationLocks } from '../../src/store/locks'
-import { createPreset, listPresets } from '../../src/store/presets'
-import { createProfile } from '../../src/store/profiles'
 import { ChatModelPanel } from '../../src/ui/settings/ChatModelPanel'
 import { ParamForm } from '../../src/ui/settings/ParamForm'
+import {
+  createConfigurationChatPreset,
+  createConfigurationProfile,
+  listConfigurationChatPresets,
+} from '../helpers/configuration'
 
 const DB_NAME = 'natter'
 
@@ -80,6 +93,101 @@ function makeProfile(overrides: Partial<ConnectionProfile> = {}): ConnectionProf
   }
 }
 
+async function createStoredProfile(
+  input: Pick<ConnectionProfile, 'name' | 'kind' | 'baseUrl'>,
+): Promise<ConnectionProfile> {
+  const key = await createKey({ name: `${input.name} key`, plaintextKey: 'sk-test' })
+  return createConfigurationProfile({ ...input, apiKeyRef: key.id })
+}
+
+function modelCatalogFor(
+  chat: Awaited<ReturnType<typeof createChat>>,
+  profile: ConnectionProfile | null = null,
+): UseModelCatalogResult {
+  const modelId = chat.settings.model || null
+  const endpoints = modelId ? [makeEndpoint()] : []
+  const capability = modelId ? effectiveCapabilityFromEndpoints(modelId, endpoints) : null
+  const descriptor = modelId ? { modelId, endpoints } : null
+  const modelAvailable = modelId ? true : null
+  const effectiveRouting =
+    profile && modelId
+      ? resolveEffectiveEndpointRouting({
+          profile,
+          settings: chat.settings,
+          contextFacts: EMPTY_MESSAGE_CONTEXT_ROUTE_FACTS,
+          ...(profile.kind === 'openrouter'
+            ? { descriptor }
+            : { capability: resolveBundledCapability(profile, modelId) }),
+        })
+      : null
+  return {
+    chatId: chat.id,
+    profileId: chat.settings.profileId,
+    modelId,
+    models: {
+      models: modelId ? [{ id: modelId }] : [],
+      loading: false,
+      retained: false,
+      presentation: {
+        profileId: chat.settings.profileId,
+        profile,
+        modelId,
+        settings: chat.settings,
+        models: modelId ? [{ id: modelId }] : [],
+        modelAvailable,
+        fetchedAt: null,
+        retained: false,
+      },
+      fetchedAt: null,
+      offline: false,
+      error: null,
+      refresh: () => undefined,
+    },
+    routing: {
+      filter: null,
+      wire: null,
+      endpoints,
+      descriptor,
+      capability,
+      ...(effectiveRouting?.requestCapability
+        ? { requestCapability: effectiveRouting.requestCapability }
+        : {}),
+      effectiveRouting,
+      modelAvailable,
+      loading: false,
+      offline: false,
+      error: null,
+      scrapeApplicable: false,
+      liveScrapeEnabled: false,
+      isFreeModel: false,
+      capabilityPresentation: {
+        profileId: chat.settings.profileId,
+        profile,
+        modelId,
+        settings: chat.settings,
+        endpoints,
+        descriptor,
+        capability,
+        effectiveRouting,
+        modelAvailable,
+        retained: false,
+      },
+      privacyPresentation: {
+        profileId: chat.settings.profileId,
+        profile,
+        modelId,
+        settings: chat.settings,
+        filter: null,
+        endpoints,
+        scrapeApplicable: false,
+        isFreeModel: false,
+        retained: false,
+      },
+      refresh: () => undefined,
+    },
+  }
+}
+
 async function resetAll() {
   __resetBroadcastForTests()
   __resetLockTrackerForTests()
@@ -90,11 +198,13 @@ async function resetAll() {
 beforeEach(async () => {
   ;(globalThis as unknown as { indexedDB: IDBFactory }).indexedDB = new IDBFactory()
   await resetAll()
-  await openDb()
+  await openBrowserWorkspace()
 })
 
 afterEach(async () => {
+  cleanup()
   vi.restoreAllMocks()
+  await shutdownBrowserWorkspace()
   await resetAll()
 })
 
@@ -414,18 +524,24 @@ describe('ParamForm hosted tools', () => {
 
 describe('ChatModelPanel context tab', () => {
   it('renders the OpenAI Responses store toggle on the Model tab and persists it', async () => {
-    const profile = await createProfile({
+    const profile = await createStoredProfile({
       name: 'OpenAI',
       kind: 'openai-compatible',
       baseUrl: 'https://api.openai.com/v1',
-      apiKeyRef: 'key-1',
     })
     const settings = cloneDefaultChatSettings()
     settings.profileId = profile.id
     settings.model = 'gpt-5.4-nano'
     settings.api = 'responses'
     const chat = await createChat({ settings })
-    render(<ChatModelPanel chatSnapshot={chat} onClose={() => undefined} />)
+    render(
+      <ChatModelPanel
+        chatSnapshot={chat}
+        profileSnapshot={profile}
+        modelCatalog={modelCatalogFor(chat, profile)}
+        onClose={() => undefined}
+      />,
+    )
 
     const checkbox = await screen.findByLabelText(/Pass store: true upstream/)
     expect(checkbox).not.toBeChecked()
@@ -441,7 +557,13 @@ describe('ChatModelPanel context tab', () => {
     const settings = cloneDefaultChatSettings()
     settings.model = ''
     const chat = await createChat({ settings })
-    render(<ChatModelPanel chatSnapshot={chat} onClose={() => undefined} />)
+    render(
+      <ChatModelPanel
+        chatSnapshot={chat}
+        modelCatalog={modelCatalogFor(chat)}
+        onClose={() => undefined}
+      />,
+    )
 
     fireEvent.click(await screen.findByRole('tab', { name: 'Context' }))
 
@@ -450,16 +572,15 @@ describe('ChatModelPanel context tab', () => {
   })
 
   it('exports chat settings presets from the preset menu', async () => {
-    const profile = await createProfile({
+    const profile = await createStoredProfile({
       name: 'OpenRouter',
       kind: 'openrouter',
       baseUrl: 'https://openrouter.ai/api/v1',
-      apiKeyRef: 'key-1',
     })
     const settings = cloneDefaultChatSettings()
     settings.profileId = profile.id
     settings.model = 'openai/gpt-4o'
-    const preset = await createPreset({
+    const preset = await createConfigurationChatPreset({
       name: 'Portable',
       connectionProfileId: profile.id,
       settings,
@@ -467,7 +588,14 @@ describe('ChatModelPanel context tab', () => {
     const chat = await createChat({ settings, presetId: preset.id })
     const downloads = mockBlobDownloads()
     try {
-      render(<ChatModelPanel chatSnapshot={chat} onClose={() => undefined} />)
+      render(
+        <ChatModelPanel
+          chatSnapshot={chat}
+          profileSnapshot={profile}
+          modelCatalog={modelCatalogFor(chat, profile)}
+          onClose={() => undefined}
+        />,
+      )
 
       fireEvent.click(await screen.findByRole('button', { name: /Preset:/ }))
       fireEvent.click(await screen.findByRole('button', { name: 'Export preset "Portable" JSON' }))
@@ -486,35 +614,41 @@ describe('ChatModelPanel context tab', () => {
   })
 
   it('reorders chat settings presets by dragging rows in the preset menu', async () => {
-    const profile = await createProfile({
+    const profile = await createStoredProfile({
       name: 'OpenRouter',
       kind: 'openrouter',
       baseUrl: 'https://openrouter.ai/api/v1',
-      apiKeyRef: 'key-1',
     })
     const settings = cloneDefaultChatSettings()
     settings.profileId = profile.id
     settings.model = 'openai/gpt-4o'
-    const first = await createPreset({
+    const first = await createConfigurationChatPreset({
       name: 'First',
       connectionProfileId: profile.id,
       settings,
       now: 10,
     })
-    const second = await createPreset({
+    const second = await createConfigurationChatPreset({
       name: 'Second',
       connectionProfileId: profile.id,
       settings,
       now: 20,
     })
-    const third = await createPreset({
+    const third = await createConfigurationChatPreset({
       name: 'Third',
       connectionProfileId: profile.id,
       settings,
       now: 30,
     })
     const chat = await createChat({ settings, presetId: first.id })
-    const { container } = render(<ChatModelPanel chatSnapshot={chat} onClose={() => undefined} />)
+    const { container } = render(
+      <ChatModelPanel
+        chatSnapshot={chat}
+        profileSnapshot={profile}
+        modelCatalog={modelCatalogFor(chat, profile)}
+        onClose={() => undefined}
+      />,
+    )
     const presetNames = () =>
       Array.from(container.querySelectorAll<HTMLButtonElement>('[data-ui="preset-menu-load"]')).map(
         (button) => button.textContent.trim(),
@@ -560,28 +694,38 @@ describe('ChatModelPanel context tab', () => {
     expect(presetNames()).toEqual(['Third', 'First', 'Second'])
 
     await waitFor(async () => {
-      expect((await listPresets()).map((p) => p.id)).toEqual([third.id, first.id, second.id])
+      expect((await listConfigurationChatPresets()).map((p) => p.id)).toEqual([
+        third.id,
+        first.id,
+        second.id,
+      ])
     })
   })
 
   it('imports chat settings presets from the preset menu', async () => {
-    const profile = await createProfile({
+    const profile = await createStoredProfile({
       name: 'OpenRouter',
       kind: 'openrouter',
       baseUrl: 'https://openrouter.ai/api/v1',
-      apiKeyRef: 'key-1',
     })
     const settings = cloneDefaultChatSettings()
     settings.profileId = profile.id
     settings.model = 'openai/gpt-4o'
-    const preset = await createPreset({
+    const preset = await createConfigurationChatPreset({
       name: 'Portable',
       connectionProfileId: profile.id,
       settings,
     })
     const envelope = await exportChatPreset(preset.id)
     const chat = await createChat({ settings, presetId: preset.id })
-    const { container } = render(<ChatModelPanel chatSnapshot={chat} onClose={() => undefined} />)
+    const { container } = render(
+      <ChatModelPanel
+        chatSnapshot={chat}
+        profileSnapshot={profile}
+        modelCatalog={modelCatalogFor(chat, profile)}
+        onClose={() => undefined}
+      />,
+    )
 
     fireEvent.click(await screen.findByRole('button', { name: /Preset:/ }))
     const input = container.querySelector<HTMLInputElement>('[data-ui="preset-import-input"]')
@@ -593,7 +737,7 @@ describe('ChatModelPanel context tab', () => {
     })
 
     await waitFor(async () => {
-      const presets = await listPresets()
+      const presets = await listConfigurationChatPresets()
       expect(presets.map((row) => row.name).sort()).toEqual(['Portable', 'Portable (2)'])
     })
   })

@@ -1,6 +1,11 @@
 import type { ZipDeflate } from 'fflate'
-import { triggerBrowserBlobDownload } from '../../core/chat-export'
+import {
+  WorkspaceReplacementCommittedRecoveryRequiredError,
+  WorkspaceReplacementOutcomeUnknownError,
+  WorkspaceReplacementUncommittedRecoveryRequiredError,
+} from '../../core/import-export/errors'
 import { errorFromUnknown } from '../../lib/error'
+import { triggerBrowserBlobDownload } from './chat-download'
 
 interface JsonZipEntry {
   filename: string
@@ -165,6 +170,42 @@ export async function forEachJsonOrZipFile(
   return entries.length
 }
 
+export function natterJsonFilename(kind: string, label?: string, id?: string): string {
+  const timestamp = new Date().toISOString().replaceAll(/[:.]/g, '-')
+  const segment = sanitizeFilenameSegment(label ?? id ?? '')
+  return `${['natter', kind, segment, timestamp].filter(Boolean).join('-')}.json`
+}
+
+export function natterZipFilename(kind: string, label?: string): string {
+  const timestamp = new Date().toISOString().replaceAll(/[:.]/g, '-')
+  const segment = sanitizeFilenameSegment(label ?? '')
+  return `${['natter', kind, segment, timestamp].filter(Boolean).join('-')}.zip`
+}
+
+export function importExportErrorMessage(error: unknown): string {
+  if (error instanceof SyntaxError) return 'The selected file is not valid JSON.'
+  if (error instanceof WorkspaceReplacementCommittedRecoveryRequiredError) {
+    return 'Workspace import committed, but this tab could not finish recovery. Reload before continuing.'
+  }
+  if (error instanceof WorkspaceReplacementUncommittedRecoveryRequiredError) {
+    return 'Workspace import did not commit, and this tab could not finish recovery. Reload before retrying.'
+  }
+  if (error instanceof WorkspaceReplacementOutcomeUnknownError) {
+    return 'Workspace activation could not be confirmed. Reload to recover before attempting another import.'
+  }
+  if (error instanceof Error && error.message.trim()) return error.message
+  return 'Import/export failed.'
+}
+
+function sanitizeFilenameSegment(value: string): string {
+  return value
+    .trim()
+    .replaceAll(/[^\w.-]+/g, '-')
+    .replaceAll(/-+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 64)
+}
+
 interface ParsedJsonZipEntry {
   filename: string
   value?: unknown
@@ -233,33 +274,6 @@ async function* fileChunks(file: File): AsyncGenerator<Uint8Array> {
     const slice = file.slice(offset, offset + MAX_JSON_CHUNK_UTF8_BYTES)
     yield new Uint8Array(await slice.arrayBuffer())
   }
-}
-
-export function natterJsonFilename(kind: string, label?: string, id?: string): string {
-  const timestamp = new Date().toISOString().replaceAll(/[:.]/g, '-')
-  const segment = sanitizeFilenameSegment(label ?? id ?? '')
-  return `${['natter', kind, segment, timestamp].filter(Boolean).join('-')}.json`
-}
-
-export function natterZipFilename(kind: string, label?: string): string {
-  const timestamp = new Date().toISOString().replaceAll(/[:.]/g, '-')
-  const segment = sanitizeFilenameSegment(label ?? '')
-  return `${['natter', kind, segment, timestamp].filter(Boolean).join('-')}.zip`
-}
-
-export function importExportErrorMessage(error: unknown): string {
-  if (error instanceof SyntaxError) return 'The selected file is not valid JSON.'
-  if (error instanceof Error && error.message.trim()) return error.message
-  return 'Import/export failed.'
-}
-
-function sanitizeFilenameSegment(value: string): string {
-  return value
-    .trim()
-    .replaceAll(/[^\w.-]+/g, '-')
-    .replaceAll(/-+/g, '-')
-    .replace(/^-|-$/g, '')
-    .slice(0, 64)
 }
 
 function isZipFile(file: File): boolean {

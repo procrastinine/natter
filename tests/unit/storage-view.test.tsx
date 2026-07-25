@@ -1,55 +1,79 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { ownBrowserWorkspaceSuite } from '../helpers/browser-workspace-suite'
+import { createChat, putTestChats, updateChatForTest } from '../helpers/chats'
 import 'fake-indexeddb/auto'
 import Dexie from 'dexie'
 import { IDBFactory } from 'fake-indexeddb'
 import { strFromU8, unzipSync } from 'fflate'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { ComponentProps } from 'react'
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { tokenCalibrationKey } from '../../src/core/model-ids'
-import {
-  readTokenCalibrationGlobal,
-  writeTokenCalibrationGlobal,
-} from '../../src/core/token-calibration'
-import type { Chat } from '../../src/core/types'
+import { GLOBAL_TOKEN_CALIBRATION_KEY } from '../../src/core/token-calibration'
+import type { Chat, GlobalTokenCalibration } from '../../src/core/types'
+import { ConfigurationPreferencesProvider } from '../../src/hooks/useConfigurationPreferences'
 import {
   addExistingAttachmentRef,
   createRemoteAttachment,
   ingestAttachmentBytes,
 } from '../../src/store/attachments'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
+import { __resetBrowserRepositoryForTests } from '../../src/store/browser-repo'
 import {
-  __resetBrowserRepositoryForTests,
-  getBrowserRepository,
-} from '../../src/store/browser-repo'
-import { putChatSidebarProjection } from '../../src/store/chat-sidebar-projection'
+  CHAT_SIDEBAR_AGGREGATE_ID,
+  chatSidebarProjectionRow,
+  emptyChatSidebarAggregateRow,
+} from '../../src/store/chat-sidebar-projection'
 import {
   archiveChat,
-  createChat,
+  buildChat,
   deleteArchivedChatPermanently,
   emptyArchivedChats,
   setChatTagsFromNames,
 } from '../../src/store/chats'
+import { configurationLinksForChat } from '../../src/store/configuration-domain-contract'
+import {
+  CONFIGURATION_PROFILE_MANAGER_STATE_ID,
+  type ConfigurationProfileManagerStateRow,
+} from '../../src/store/configuration-profile-usage-projection'
 import { __resetDbForTests, getDb } from '../../src/store/db'
 import { createFolder } from '../../src/store/folders'
-import { exportChat, exportWorkspaceBackup } from '../../src/store/import-export'
-import type { WorkspaceRepository } from '../../src/store/repository'
-import { __resetSearchSessionRunnerForTests } from '../../src/store/search-session'
+import {
+  exportChat,
+  exportWorkspaceBackup,
+  restoreWorkspaceBackup,
+} from '../../src/store/import-export'
 import { listTags } from '../../src/store/tags'
+import { readTokenCalibrationGlobal } from '../../src/store/token-calibration'
+import type { WorkspaceRepository } from '../../src/store/workspace-protocol'
 import {
   __resetWorkspaceRepositoryForTests,
   __setWorkspaceRepositoryForTests,
 } from '../../src/store/workspace-repository'
-import { __resetSearchStoreForTests } from '../../src/store/zustand/searchStore'
 import { useToastStore } from '../../src/store/zustand/toastStore'
 import { jsonEntriesZipBlob } from '../../src/ui/import-export/json-file'
-import { deleteAttachmentForStorage, StorageView } from '../../src/ui/storage/StorageView'
+import {
+  deleteAttachmentForStorage,
+  StorageView as ProductionStorageView,
+} from '../../src/ui/storage/StorageView'
+
+function StorageView(props: Omit<ComponentProps<typeof ProductionStorageView>, 'onOpenSidebar'>) {
+  return (
+    <ConfigurationPreferencesProvider>
+      <ProductionStorageView {...props} onOpenSidebar={() => undefined} />
+    </ConfigurationPreferencesProvider>
+  )
+}
+
+import { testGenerationLease } from '../helpers/stream-leases'
 
 const storageWipeMocks = vi.hoisted(() => ({
-  wipeSiteStorage: vi.fn<() => Promise<void>>(),
+  clearLocalWorkspaceStorage: vi.fn<() => Promise<void>>(),
 }))
 
-vi.mock('../../src/lib/storage-wipe', () => storageWipeMocks)
+vi.mock('../../src/store/storage-administration', () => storageWipeMocks)
 
 const DB_NAME = 'natter'
+const workspaceSuite = ownBrowserWorkspaceSuite()
 const originalStorageDescriptor = Object.getOwnPropertyDescriptor(navigator, 'storage')
 const originalUserAgentDescriptor = Object.getOwnPropertyDescriptor(navigator, 'userAgent')
 const originalNotificationDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'Notification')
@@ -86,15 +110,50 @@ function setNotificationApi(
 }
 
 function setDaemonWorkspaceRepository(): WorkspaceRepository {
+  const fence = { workspaceId: 'daemon:natter', replacementEpoch: 0 }
   const repo = {
-    getWorkspaceMeta: vi.fn().mockResolvedValue({
-      workspaceId: 'daemon:natter',
-      backendKind: 'daemon',
-      lastMutationAt: 0,
-      mutationCounter: 0,
+    query: vi.fn(async (_permit: unknown, query: { kind: string }) => {
+      const value =
+        query.kind === 'workspace.meta'
+          ? { ...fence, backendKind: 'daemon' }
+          : query.kind === 'sidebar.aggregate'
+            ? {
+                totalCount: 0,
+                activeCount: 0,
+                archivedCount: 0,
+                pinnedCount: 0,
+                visibleCount: 0,
+                visiblePinnedCount: 0,
+                folderCounts: {},
+                folderAggregates: {},
+                rootCount: 0,
+                rootVisibleCount: 0,
+                rootVisiblePinnedCount: 0,
+              }
+            : query.kind === 'attachment.catalog-aggregate'
+              ? {
+                  totalCount: 0,
+                  activeCount: 0,
+                  deletedCount: 0,
+                  referencedCount: 0,
+                  unreferencedCount: 0,
+                  localCount: 0,
+                  remoteCount: 0,
+                  missingCount: 0,
+                  generatedCount: 0,
+                  totalSizeBytes: 0,
+                  localSizeBytes: 0,
+                }
+              : null
+      return { ...fence, value }
     }),
-    listChats: vi.fn().mockResolvedValue([]),
-    searchAttachments: vi.fn().mockResolvedValue({ rows: [] }),
+    execute: vi.fn(async () => {
+      throw new Error('UnexpectedDaemonStorageWrite')
+    }),
+    replace: vi.fn(async () => {
+      throw new Error('UnexpectedDaemonStorageReplacement')
+    }),
+    subscribeChanges: vi.fn(() => () => undefined),
   } as unknown as WorkspaceRepository
   __setWorkspaceRepositoryForTests(repo)
   return repo
@@ -102,6 +161,10 @@ function setDaemonWorkspaceRepository(): WorkspaceRepository {
 
 function bytes(content: string): Blob {
   return new Blob([new TextEncoder().encode(content)])
+}
+
+async function writeTokenCalibrationGlobal(value: GlobalTokenCalibration): Promise<void> {
+  await getDb().settings.put({ key: GLOBAL_TOKEN_CALIBRATION_KEY, value })
 }
 
 function mockBlobDownloads() {
@@ -137,34 +200,67 @@ function mockBlobDownloads() {
   }
 }
 
-async function resetAll() {
-  __resetWorkspaceRepositoryForTests()
-  __resetBrowserRepositoryForTests()
-  __resetBroadcastForTests()
-  __resetSearchSessionRunnerForTests()
-  __resetSearchStoreForTests()
-  useToastStore.getState().reset()
-  __resetDbForTests()
-  await Dexie.delete(DB_NAME)
+function storageChatTitles(container: HTMLElement): string[] {
+  return Array.from(
+    container.querySelectorAll<HTMLElement>('[data-ui="storage-chat-title-cell"] > a'),
+  ).map((element) => element.textContent)
 }
 
-async function updateChatForTest(chatId: string, patch: Partial<Chat>): Promise<void> {
-  const db = getDb()
-  await db.transaction('rw', db.chats, db.chatSidebarRows, db.settings, async (tx) => {
-    const chat = await db.chats.get(chatId)
-    if (!chat) throw new Error(`missing test chat ${chatId}`)
-    const next = { ...chat, ...patch }
-    await db.chats.put(next)
-    await putChatSidebarProjection(tx, next)
-  })
+function byId(left: { readonly id: string }, right: { readonly id: string }): number {
+  return left.id.localeCompare(right.id)
+}
+
+async function resetRuntimeBindings() {
+  __resetWorkspaceRepositoryForTests()
+  __resetBrowserRepositoryForTests()
+  useToastStore.getState().reset()
+}
+
+let emptyWorkspaceBackup: Awaited<ReturnType<typeof exportWorkspaceBackup>>
+
+async function restoreEmptyWorkspace(): Promise<void> {
+  await resetRuntimeBindings()
+  await getDb().streamLeases.clear()
+  await restoreWorkspaceBackup(emptyWorkspaceBackup, { now: 1 })
+}
+
+async function putActiveStreamLease(input: {
+  streamId: string
+  chatId: string
+  messageId: string
+}): Promise<void> {
+  await getDb().streamLeases.put(
+    testGenerationLease({
+      ...input,
+      ownerClientId: 'other-tab',
+      fenceToken: `fence-${input.streamId}`,
+      replacementEpoch: 0,
+      startedAt: 1,
+      heartbeatAt: 1,
+      admissionSequence: 1,
+      revision: 1,
+      targetCommittedAt: 1,
+      postCommit: { usedAt: 1, profileId: 'test-profile' },
+    }),
+  )
 }
 
 describe('StorageView', () => {
-  beforeEach(async () => {
+  beforeAll(async () => {
     ;(globalThis as unknown as { indexedDB: IDBFactory }).indexedDB = new IDBFactory()
-    await resetAll()
-    storageWipeMocks.wipeSiteStorage.mockReset()
-    storageWipeMocks.wipeSiteStorage.mockResolvedValue(undefined)
+    __resetWorkspaceRepositoryForTests()
+    __resetBrowserRepositoryForTests()
+    __resetBroadcastForTests()
+    __resetDbForTests()
+    await Dexie.delete(DB_NAME)
+    await workspaceSuite.open()
+    emptyWorkspaceBackup = await exportWorkspaceBackup()
+  })
+
+  beforeEach(async () => {
+    await restoreEmptyWorkspace()
+    storageWipeMocks.clearLocalWorkspaceStorage.mockReset()
+    storageWipeMocks.clearLocalWorkspaceStorage.mockResolvedValue(undefined)
     const estimate = {
       usage: 4096,
       quota: 8192,
@@ -195,7 +291,7 @@ describe('StorageView', () => {
     } else {
       Reflect.deleteProperty(globalThis, 'Notification')
     }
-    await resetAll()
+    await resetRuntimeBindings()
   })
 
   it('renders the overview as mode, space, chats, and attachments panels', async () => {
@@ -259,7 +355,9 @@ describe('StorageView', () => {
 
     render(<StorageView route={{ section: 'attachments', attachmentId: attachment.id }} />)
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Download note.txt' }))
+    const download = await screen.findByRole('button', { name: 'Download note.txt' })
+    await waitFor(() => expect(download).toBeEnabled())
+    fireEvent.click(download)
 
     await waitFor(() => expect(clickSpy).toHaveBeenCalled())
     const anchor = appendSpy.mock.calls
@@ -358,7 +456,7 @@ describe('StorageView', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Clear all' }))
 
     await waitFor(() => {
-      expect(storageWipeMocks.wipeSiteStorage).toHaveBeenCalledTimes(1)
+      expect(storageWipeMocks.clearLocalWorkspaceStorage).toHaveBeenCalledTimes(1)
     })
     expect(confirmSpy).toHaveBeenCalledWith(
       expect.stringContaining('Clear all local Natter data for this browser origin?'),
@@ -422,10 +520,17 @@ describe('StorageView', () => {
       },
     })
 
-    await waitFor(async () => {
-      const chats = await getDb().chats.toArray()
-      expect(chats.map((chat) => chat.id)).toEqual(['chat-alpha'])
-    })
+    await waitFor(
+      () => {
+        expect(useToastStore.getState().toasts.at(-1)).toMatchObject({
+          level: 'success',
+          text: 'Imported workspace backup (1 chats).',
+        })
+      },
+      { timeout: 5_000 },
+    )
+    const chats = await getDb().chats.toArray()
+    expect(chats.map((chat) => chat.id)).toEqual(['chat-alpha'])
     expect(confirmSpy).toHaveBeenCalled()
   })
 
@@ -675,11 +780,58 @@ describe('StorageView', () => {
     })
 
     fireEvent.change(screen.getByLabelText('Search chats'), { target: { value: 'needle' } })
+    expect(screen.getByText('Searching...')).toBeVisible()
 
     await waitFor(() => {
       expect(container).not.toHaveTextContent('Alpha')
       expect(container).toHaveTextContent('Needle beta')
     })
+  })
+
+  it('pushes Storage sort and folder/tag filters into the compact paged catalog', async () => {
+    const alpha = await createChat({ id: 'chat-alpha', title: 'Alpha', now: 1000 })
+    const beta = await createChat({ id: 'chat-beta', title: 'Beta', now: 2000 })
+    const gamma = await createChat({ id: 'chat-gamma', title: 'Gamma', now: 3000 })
+    const work = await createFolder({ name: 'Work' })
+    const home = await createFolder({ name: 'Home' })
+    const alphaTags = await setChatTagsFromNames(alpha.id, ['Red'], 4000)
+    const betaTags = await setChatTagsFromNames(beta.id, ['Blue'], 4000)
+    const gammaTags = await setChatTagsFromNames(gamma.id, ['Blue'], 4000)
+    await updateChatForTest(alpha.id, {
+      previewText: 'Alpha preview',
+      folderId: work.id,
+      tags: alphaTags,
+      totalCostUsd: 10,
+    })
+    await updateChatForTest(beta.id, {
+      previewText: 'Beta preview',
+      folderId: home.id,
+      tags: betaTags,
+      totalCostUsd: 1,
+    })
+    await updateChatForTest(gamma.id, {
+      previewText: 'Gamma preview',
+      folderId: work.id,
+      tags: gammaTags,
+      totalCostUsd: 5,
+    })
+
+    const { container } = render(<StorageView route={{ section: 'chats' }} />)
+    await waitFor(() => expect(storageChatTitles(container)).toEqual(['Gamma', 'Beta', 'Alpha']))
+
+    fireEvent.change(screen.getByLabelText(/^Sort:/), {
+      target: { value: 'totalCostUsd-desc' },
+    })
+    await waitFor(() => expect(storageChatTitles(container)).toEqual(['Alpha', 'Gamma', 'Beta']))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Work' }))
+    await waitFor(() => expect(storageChatTitles(container)).toEqual(['Alpha', 'Gamma']))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Blue' }))
+    await waitFor(() => expect(storageChatTitles(container)).toEqual(['Gamma']))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Work' }))
+    await waitFor(() => expect(storageChatTitles(container)).toEqual(['Beta']))
   })
 
   it('includes archived rows locally without starting an empty search loop', async () => {
@@ -716,13 +868,10 @@ describe('StorageView', () => {
   it('keeps an archived selection and explains when an active stream blocks bulk deletion', async () => {
     const archived = await createChat({ id: 'chat-streaming-bulk', title: 'Streaming bulk' })
     await updateChatForTest(archived.id, { archived: true, previewText: 'Streaming response' })
-    await getBrowserRepository().upsertStreamLease({
+    await putActiveStreamLease({
       streamId: 'streaming-bulk-lease',
       chatId: archived.id,
       messageId: 'reserved-assistant',
-      ownerClientId: 'other-tab',
-      startedAt: 1,
-      heartbeatAt: 1,
     })
     vi.spyOn(window, 'confirm').mockReturnValue(true)
 
@@ -748,16 +897,107 @@ describe('StorageView', () => {
     expect(await getDb().chats.get(archived.id)).toBeDefined()
   })
 
+  it('selects and applies a bulk action to every matching chat beyond the retained page', async () => {
+    const seed = buildChat({ id: 'chat-000', title: 'Chat 000', now: 1 })
+    const chats: Chat[] = Array.from({ length: 205 }, (_, index) => ({
+      ...seed,
+      id: `chat-${index.toString().padStart(3, '0')}`,
+      title: `Chat ${index.toString().padStart(3, '0')}`,
+      createdAt: index + 1,
+      updatedAt: index + 1,
+      lastViewedAt: index + 1,
+      lastBranchUpdatedAt: index + 1,
+      previewText: `Preview ${index}`,
+      settings: structuredClone(seed.settings),
+    }))
+    const db = getDb()
+    const managerBeforeSeed = (await db.configurationCatalogAggregates.get(
+      CONFIGURATION_PROFILE_MANAGER_STATE_ID,
+    )) as ConfigurationProfileManagerStateRow | undefined
+    await putTestChats(chats)
+    expect(await db.chats.count()).toBe(205)
+    expect(await db.chatSidebarRows.count()).toBe(205)
+    expect(await db.chatSidebarAggregates.get(CHAT_SIDEBAR_AGGREGATE_ID)).toEqual({
+      ...emptyChatSidebarAggregateRow(),
+      totalCount: 205,
+      activeCount: 205,
+      visibleCount: 205,
+      rootCount: 205,
+      rootVisibleCount: 205,
+    })
+    expect((await db.chatSidebarRows.toArray()).sort(byId)).toEqual(
+      chats.map(chatSidebarProjectionRow).sort(byId),
+    )
+    expect((await db.configurationLinks.toArray()).sort(byId)).toEqual(
+      chats.flatMap(configurationLinksForChat).sort(byId),
+    )
+    expect(await db.configurationProfileUsageRows.get(seed.settings.profileId)).toEqual({
+      id: seed.settings.profileId,
+      presetCount: 0,
+      activePresetCount: 0,
+      chatCount: 205,
+      activeChatCount: 205,
+    })
+    const managerAfterSeed = (await db.configurationCatalogAggregates.get(
+      CONFIGURATION_PROFILE_MANAGER_STATE_ID,
+    )) as ConfigurationProfileManagerStateRow | undefined
+    expect(managerAfterSeed?.revision).toBe((managerBeforeSeed?.revision ?? 0) + 1)
+
+    const { container } = render(<StorageView route={{ section: 'chats' }} />)
+    await waitFor(() => expect(container).toHaveTextContent('205 chats'))
+    fireEvent.click(screen.getByLabelText('Select all matching chats'))
+    await waitFor(() => expect(container).toHaveTextContent('205 selected'))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Archive' }))
+    await waitFor(
+      async () => {
+        expect((await db.chats.toArray()).filter((chat) => chat.archived)).toHaveLength(205)
+      },
+      { timeout: 10_000 },
+    )
+    const archivedChats = (await db.chats.toArray()).sort(byId)
+    expect(archivedChats).toHaveLength(205)
+    expect(archivedChats.every((chat) => chat.archived)).toBe(true)
+    expect(new Set(archivedChats.map((chat) => chat.updatedAt)).size).toBe(205)
+    for (let index = 0; index < archivedChats.length; index += 1) {
+      const archived = archivedChats[index] as Chat
+      const previous = chats[index] as Chat
+      expect(archived.updatedAt).toBeGreaterThan(previous.updatedAt)
+      expect(archived.metaVersion).toBe(previous.metaVersion + 1)
+      expect(archived.summaryVersion).toBe(previous.summaryVersion + 1)
+    }
+    expect((await db.chatSidebarRows.toArray()).sort(byId)).toEqual(
+      archivedChats.map(chatSidebarProjectionRow).sort(byId),
+    )
+    expect(await db.chatSidebarAggregates.get(CHAT_SIDEBAR_AGGREGATE_ID)).toEqual({
+      ...emptyChatSidebarAggregateRow(),
+      totalCount: 205,
+      archivedCount: 205,
+      rootCount: 205,
+    })
+    const archivedLinks = archivedChats.flatMap(configurationLinksForChat).sort(byId)
+    expect((await db.configurationLinks.toArray()).sort(byId)).toEqual(archivedLinks)
+    expect(archivedLinks.every((link) => link.ownerActive === false)).toBe(true)
+    expect(await db.configurationProfileUsageRows.get(seed.settings.profileId)).toEqual({
+      id: seed.settings.profileId,
+      presetCount: 0,
+      activePresetCount: 0,
+      chatCount: 205,
+      activeChatCount: 0,
+    })
+    const managerAfterArchive = (await db.configurationCatalogAggregates.get(
+      CONFIGURATION_PROFILE_MANAGER_STATE_ID,
+    )) as ConfigurationProfileManagerStateRow | undefined
+    expect(managerAfterArchive?.revision).toBe((managerAfterSeed?.revision ?? 0) + 1)
+  })
+
   it('explains when an active stream blocks permanent deletion from the archive', async () => {
     const archived = await createChat({ id: 'chat-streaming-archive', title: 'Streaming archive' })
     await updateChatForTest(archived.id, { archived: true })
-    await getBrowserRepository().upsertStreamLease({
+    await putActiveStreamLease({
       streamId: 'streaming-archive-lease',
       chatId: archived.id,
       messageId: 'reserved-assistant',
-      ownerClientId: 'other-tab',
-      startedAt: 1,
-      heartbeatAt: 1,
     })
     vi.spyOn(window, 'confirm').mockReturnValue(true)
 
@@ -1022,7 +1262,7 @@ describe('StorageView', () => {
       { filename: 'alpha.json', value: alphaEnvelope },
       { filename: 'beta.json', value: betaEnvelope },
     ])
-    await resetAll()
+    await restoreEmptyWorkspace()
 
     const { container } = render(<StorageView route={{ section: 'chats' }} />)
     const input = container.querySelector<HTMLInputElement>('[data-ui="storage-chat-import-input"]')

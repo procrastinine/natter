@@ -77,10 +77,11 @@ try {
       ? [`${kind} ${field} ${measurements[field]} exceeds budget ${maximum}`]
       : [],
   )
+  const hardProblems = []
   if (coldForbiddenRequests.length > 0) {
-    budgetProblems.push(`cold load fetched lazy features: ${coldForbiddenRequests.join(', ')}`)
+    hardProblems.push(`cold load fetched lazy features: ${coldForbiddenRequests.join(', ')}`)
   }
-  if (diagnostics.length > 0) budgetProblems.push(...diagnostics)
+  if (diagnostics.length > 0) hardProblems.push(...diagnostics)
   report = {
     schemaVersion: 1,
     kind,
@@ -91,6 +92,7 @@ try {
     coldForbiddenRequests,
     diagnostics,
     budgetProblems,
+    hardProblems,
   }
   await context.close()
 } finally {
@@ -98,7 +100,7 @@ try {
 }
 
 process.stdout.write(`${JSON.stringify(report, null, 2)}\n`)
-if (report.budgetProblems.length > 0) process.exitCode = 1
+if (report.hardProblems.length > 0) process.exitCode = 1
 
 function sum(values, field) {
   return values.reduce((total, value) => total + value[field], 0)

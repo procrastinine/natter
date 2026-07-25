@@ -1,4 +1,6 @@
+import type { GenerationFailureKindV2 } from './generation-stream-events'
 import type {
+  AbortReason,
   AttemptFailureCategory,
   AttemptIntegrityEntry,
   AttemptIntegritySummary,
@@ -9,12 +11,139 @@ const MAX_FAILURE_CODE_CHARS = 80
 const MAX_FAILURE_MESSAGE_CHARS = 240
 const MAX_PROVIDER_CHARS = 80
 const MAX_INTEGRITY_ENTRIES = 16
+const TERMINAL_RECEIPT_KEYS = new Set([
+  'version',
+  'finishedAt',
+  'journalMaxSeq',
+  'journalCompleteness',
+  'decision',
+])
+const TERMINAL_DECISION_KEYS = new Set(['outcome', 'finishReason', 'error', 'abortReason'])
+const TERMINAL_FAILURE_KEYS = new Set([
+  'kind',
+  'category',
+  'code',
+  'message',
+  'statusCode',
+  'provider',
+  'retryable',
+  'midStream',
+])
+
+export interface AttemptTerminalFailure extends PersistedAttemptFailure {
+  readonly kind: GenerationFailureKindV2
+}
+
+interface AttemptTerminalDecisionBase {
+  readonly finishReason?: string
+}
+
+export type AttemptTerminalDecision =
+  | (AttemptTerminalDecisionBase & {
+      readonly outcome: 'done'
+      readonly error?: never
+      readonly abortReason?: never
+    })
+  | (AttemptTerminalDecisionBase & {
+      readonly outcome: 'error'
+      readonly error: AttemptTerminalFailure
+      readonly abortReason?: never
+    })
+  | (AttemptTerminalDecisionBase & {
+      readonly outcome: 'abort'
+      readonly abortReason: AbortReason
+      readonly error?: never
+    })
+
+export interface AttemptTerminalReceipt {
+  readonly version: 1
+  readonly finishedAt: number
+  readonly journalMaxSeq: number
+  readonly journalCompleteness: 'settled'
+  readonly decision: AttemptTerminalDecision
+}
+
+export type AttemptTerminalDecisionInput =
+  | {
+      readonly outcome: 'done'
+      readonly finishReason?: string
+      readonly error?: never
+      readonly abortReason?: never
+    }
+  | {
+      readonly outcome: 'error'
+      readonly error: unknown
+      readonly finishReason?: string
+      readonly abortReason?: never
+    }
+  | {
+      readonly outcome: 'abort'
+      readonly abortReason: AbortReason
+      readonly finishReason?: string
+      readonly error?: never
+    }
+
+export function normalizeAttemptTerminalDecision(
+  input: AttemptTerminalDecisionInput,
+): AttemptTerminalDecision {
+  const finishReason = boundedPlainString(input.finishReason, 80)
+  if (input.outcome === 'done') {
+    return { outcome: 'done', ...(finishReason ? { finishReason } : {}) }
+  }
+  if (input.outcome === 'abort') {
+    return {
+      outcome: 'abort',
+      abortReason: input.abortReason,
+      ...(finishReason ? { finishReason } : {}),
+    }
+  }
+  const failure = toPersistedAttemptFailure(input.error)
+  return {
+    outcome: 'error',
+    error: {
+      ...failure,
+      kind: generationFailureKind(input.error, failure.category),
+    },
+    ...(finishReason ? { finishReason } : {}),
+  }
+}
+
+export function isAttemptTerminalReceipt(value: unknown): value is AttemptTerminalReceipt {
+  const receipt = objectRecord(value)
+  if (
+    !hasOnlyKeys(receipt, TERMINAL_RECEIPT_KEYS) ||
+    receipt.version !== 1 ||
+    !isNonNegativeSafeInteger(receipt.finishedAt) ||
+    !isSafeIntegerAtLeast(receipt.journalMaxSeq, -1) ||
+    receipt.journalCompleteness !== 'settled'
+  ) {
+    return false
+  }
+  return isAttemptTerminalDecision(receipt.decision)
+}
 
 const FAILURE_CATEGORIES = new Set<AttemptFailureCategory>([
   'abort',
   'network',
   'protocol',
   'provider',
+  'storage',
+  'integrity',
+  'internal',
+])
+const GENERATION_FAILURE_KINDS = new Set<GenerationFailureKindV2>([
+  'network',
+  'timeout',
+  'abort',
+  'bad_request',
+  'unauthorized',
+  'payment_required',
+  'moderation',
+  'rate_limited',
+  'provider_error',
+  'no_provider_available',
+  'validation',
+  'protocol',
   'storage',
   'integrity',
   'internal',
@@ -130,6 +259,77 @@ function categoryForKind(input: unknown): AttemptFailureCategory | undefined {
   }
 }
 
+function generationFailureKind(
+  input: unknown,
+  fallback: AttemptFailureCategory,
+): GenerationFailureKindV2 {
+  const kind = objectRecord(input)?.kind
+  if (typeof kind === 'string' && GENERATION_FAILURE_KINDS.has(kind as GenerationFailureKindV2)) {
+    return kind as GenerationFailureKindV2
+  }
+  switch (fallback) {
+    case 'abort':
+      return 'abort'
+    case 'network':
+      return 'network'
+    case 'protocol':
+      return 'protocol'
+    case 'provider':
+      return 'provider_error'
+    case 'storage':
+      return 'storage'
+    case 'integrity':
+      return 'integrity'
+    case 'internal':
+      return 'internal'
+  }
+}
+
+function isAttemptTerminalDecision(value: unknown): value is AttemptTerminalDecision {
+  const decision = objectRecord(value)
+  if (!hasOnlyKeys(decision, TERMINAL_DECISION_KEYS)) return false
+  if (decision.finishReason !== undefined && typeof decision.finishReason !== 'string') return false
+  if (decision.outcome === 'done') {
+    return decision.error === undefined && decision.abortReason === undefined
+  }
+  if (decision.outcome === 'abort') {
+    return isAbortReason(decision.abortReason) && decision.error === undefined
+  }
+  if (decision.outcome !== 'error' || decision.abortReason !== undefined) return false
+  const error = objectRecord(decision.error)
+  return (
+    hasOnlyKeys(error, TERMINAL_FAILURE_KEYS) &&
+    typeof error.kind === 'string' &&
+    GENERATION_FAILURE_KINDS.has(error.kind as GenerationFailureKindV2) &&
+    typeof error.category === 'string' &&
+    FAILURE_CATEGORIES.has(error.category as AttemptFailureCategory) &&
+    typeof error.code === 'string' &&
+    typeof error.message === 'string' &&
+    (error.statusCode === undefined || finiteStatus(error.statusCode) !== undefined) &&
+    (error.provider === undefined || typeof error.provider === 'string') &&
+    (error.retryable === undefined || typeof error.retryable === 'boolean') &&
+    (error.midStream === undefined || typeof error.midStream === 'boolean')
+  )
+}
+
+function isAbortReason(value: unknown): value is AbortReason {
+  return (
+    value === 'user' ||
+    value === 'tab-close' ||
+    value === 'error' ||
+    value === 'network' ||
+    value === 'quota'
+  )
+}
+
+function isSafeIntegerAtLeast(value: unknown, minimum: number): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= minimum
+}
+
+function isNonNegativeSafeInteger(value: unknown): value is number {
+  return isSafeIntegerAtLeast(value, 0)
+}
+
 function readFailureCategory(input: unknown): AttemptFailureCategory | undefined {
   return typeof input === 'string' && FAILURE_CATEGORIES.has(input as AttemptFailureCategory)
     ? (input as AttemptFailureCategory)
@@ -227,4 +427,12 @@ function objectRecord(input: unknown): Record<string, unknown> | undefined {
   return input !== null && typeof input === 'object'
     ? (input as Record<string, unknown>)
     : undefined
+}
+
+function hasOnlyKeys(
+  value: Record<string, unknown> | undefined,
+  allowed: ReadonlySet<string>,
+): value is Record<string, unknown> {
+  if (!value) return false
+  return Object.keys(value).every((key) => allowed.has(key))
 }

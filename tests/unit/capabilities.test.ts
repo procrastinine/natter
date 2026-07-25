@@ -171,6 +171,27 @@ describe('effectiveCapabilityFromEndpoints', () => {
     }
   })
 
+  it('subtracts deprecated sampling for only the two affected Gemini models', () => {
+    const endpoint = makeEndpoint({
+      supported_parameters: ['temperature', 'top_p', 'top_k', 'stop', 'thinking'],
+    })
+    for (const model of ['google/gemini-3.6-flash', 'google/gemini-3.5-flash-lite']) {
+      const cap = effectiveCapabilityFromEndpoints(model, [endpoint])
+      expect([...cap.supportedParameters].sort()).toEqual(['stop', 'thinking'])
+    }
+
+    for (const model of ['google/gemini-3.5-flash']) {
+      const cap = effectiveCapabilityFromEndpoints(model, [endpoint])
+      expect([...cap.supportedParameters].sort()).toEqual([
+        'stop',
+        'temperature',
+        'thinking',
+        'top_k',
+        'top_p',
+      ])
+    }
+  })
+
   it('aggregates pricing range from multiple endpoints', () => {
     const a = makeEndpoint({ pricing: { prompt: '0.001', completion: '0.003' } })
     const b = makeEndpoint({ pricing: { prompt: '0.002', completion: '0.004' } })
@@ -187,6 +208,26 @@ describe('effectiveCapabilityFromDescriptor', () => {
     expect(cap.supportedParameters.has('reasoning')).toBe(true)
     expect(cap.supportedParameters.has('tools')).toBe(true)
     expect(cap.outputModalities.has('text')).toBe(true)
+  })
+
+  it('subtracts deprecated Gemini sampling from direct and fallback descriptors', () => {
+    const descriptor = {
+      ...DEFAULT_CUSTOM_CAPABILITY,
+      supportedParameters: ['temperature', 'top_p', 'top_k', 'stop_sequences', 'thinking'],
+    }
+    for (const model of ['gemini-3.6-flash', 'gemini-3.5-flash-lite']) {
+      const cap = effectiveCapabilityFromDescriptor(model, descriptor)
+      expect([...cap.supportedParameters].sort()).toEqual(['stop_sequences', 'thinking'])
+    }
+
+    const unaffected = effectiveCapabilityFromDescriptor('gemini-3.5-flash', descriptor)
+    expect([...unaffected.supportedParameters].sort()).toEqual([
+      'stop_sequences',
+      'temperature',
+      'thinking',
+      'top_k',
+      'top_p',
+    ])
   })
 })
 
@@ -442,6 +483,31 @@ describe('validateChatSettings', () => {
     expect(result.issues.map((i) => i.field)).toEqual(
       expect.arrayContaining(['sampling.top_k', 'sampling.frequency_penalty']),
     )
+  })
+
+  it('projects deprecated Gemini sampling out without dropping unrelated settings', () => {
+    const s: ChatSettings = {
+      ...baseSettings(),
+      sampling: {
+        temperature: 0.7,
+        top_p: 0.9,
+        top_k: 40,
+        frequency_penalty: 0.1,
+      },
+    }
+    const cap = effectiveCapabilityFromEndpoints('google/gemini-3.6-flash', [
+      makeEndpoint({
+        supported_parameters: ['temperature', 'top_p', 'top_k', 'frequency_penalty'],
+      }),
+    ])
+    const result = validateChatSettings(s, cap)
+
+    expect(result.settings.sampling).toEqual({ frequency_penalty: 0.1 })
+    expect(result.issues.map((issue) => issue.field).sort()).toEqual([
+      'sampling.temperature',
+      'sampling.top_k',
+      'sampling.top_p',
+    ])
   })
 
   it('clamps reasoning.effort to the allowed subset, preferring the closest value', () => {

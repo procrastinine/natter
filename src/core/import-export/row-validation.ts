@@ -56,7 +56,32 @@ const GENERATION_APIS = new Set([
   'completion',
   'video-generation',
 ])
-const GENERATION_STATUSES = new Set(['streaming', 'done', 'error', 'abort', 'interrupted'])
+const GENERATION_STATUSES = new Set([
+  'preparing',
+  'streaming',
+  'done',
+  'error',
+  'abort',
+  'interrupted',
+])
+const MESSAGE_PHASES = new Set(['commentary', 'final_answer'])
+const STREAMING_CAPABILITIES = new Set(['supported', 'buffered-only', 'unsupported'])
+const PREFILL_CAPABILITY_KINDS = new Set([
+  'unsupported',
+  'assistant-tail',
+  'native-model-tail',
+  'text-prefix',
+])
+const PREFILL_MARKERS = new Set(['none', 'partial', 'prefix'])
+const INPUT_MODALITIES = new Set(['text', 'image', 'audio', 'video', 'file'])
+const OUTPUT_MODALITIES = new Set(['text', 'image', 'audio', 'video'])
+
+import {
+  isPersistedInboundReasoningVisibility,
+  isPersistedReasoningCarryForward,
+  isReasoningFormat,
+} from '../reasoning'
+import { isReasoningEnvelope } from '../reasoning-envelope'
 
 export function assertWorkspaceBackupRows(value: Record<string, unknown>): void {
   for (const row of array(value.chats, 'chats')) assertChat(row)
@@ -98,6 +123,14 @@ export function assertPortableChatRows(value: Record<string, unknown>): void {
   if (value.connectionSketch !== undefined) assertConnectionSketch(value.connectionSketch)
 }
 
+export function assertCurrentWorkspaceBackupRows(value: Record<string, unknown>): void {
+  for (const row of array(value.messages, 'messages')) assertMessage(row, true)
+}
+
+export function assertCurrentPortableChatRows(value: Record<string, unknown>): void {
+  for (const row of array(value.messages, 'portable chat.messages')) assertMessage(row, true)
+}
+
 export function assertPortableChatPresetRows(value: Record<string, unknown>): void {
   string(value.sourcePresetId, 'portable preset.sourcePresetId')
   string(value.name, 'portable preset.name')
@@ -105,6 +138,32 @@ export function assertPortableChatPresetRows(value: Record<string, unknown>): vo
   finite(value.createdAt, 'portable preset.createdAt')
   finite(value.updatedAt, 'portable preset.updatedAt')
   if (value.connectionSketch !== undefined) assertConnectionSketch(value.connectionSketch)
+}
+
+export function assertPortableConnectionProfileRows(value: Record<string, unknown>): void {
+  string(value.sourceProfileId, 'portable connection.sourceProfileId')
+  string(value.name, 'portable connection.name')
+  enumValue(value.kind, CONNECTION_KINDS, 'portable connection.kind')
+  string(value.baseUrl, 'portable connection.baseUrl')
+  stringRecord(
+    object(value.defaultHeaders, 'portable connection.defaultHeaders'),
+    'portable connection.defaultHeaders',
+  )
+  string(value.appTitle, 'portable connection.appTitle')
+  string(value.appUrl, 'portable connection.appUrl')
+  if (value.appCategories !== undefined)
+    strings(value.appCategories, 'portable connection.appCategories')
+  boolean(value.supportsEndpointsApi, 'portable connection.supportsEndpointsApi')
+  boolean(value.supportsGenerationApi, 'portable connection.supportsGenerationApi')
+  boolean(value.supportsPrivacyScrape, 'portable connection.supportsPrivacyScrape')
+  if (value.capabilityOverrides !== undefined) {
+    assertCapabilityOverrides(value.capabilityOverrides, 'portable connection.capabilityOverrides')
+  }
+  if (value.debugRequests !== undefined)
+    boolean(value.debugRequests, 'portable connection.debugRequests')
+  for (const field of ['apiKeyRef', 'apiKeyFallbackRefs', 'managementApiKeyRef'] as const) {
+    if (value[field] !== undefined) throw invalid(`portable connection.${field}`)
+  }
 }
 
 function assertPortableNamedSketch(value: unknown, label: string): void {
@@ -133,14 +192,35 @@ function assertChat(value: unknown): void {
   finite(row.totalCostUsd, 'chat.totalCostUsd')
   integer(row.metaVersion, 'chat.metaVersion')
   integer(row.summaryVersion, 'chat.summaryVersion')
+  integer(row.structuralVersion, 'chat.structuralVersion')
+  if ((row.structuralVersion as number) < 0) throw invalid('chat.structuralVersion')
+  optionalFinite(row.configurationVersion, 'chat.configurationVersion')
   assertChatSettings(row.settings, 'chat.settings')
   optionalString(row.presetId, 'chat.presetId')
+  if (row.modelResolution !== undefined) assertModelResolution(row.modelResolution)
   nullableString(row.lastUpdatedLeafId, 'chat.lastUpdatedLeafId')
   finite(row.lastBranchUpdatedAt, 'chat.lastBranchUpdatedAt')
   boolean(row.archived, 'chat.archived')
   boolean(row.pinned, 'chat.pinned')
   nullableString(row.folderId, 'chat.folderId')
   strings(row.tags, 'chat.tags')
+}
+
+function assertModelResolution(value: unknown): void {
+  const row = object(value, 'chat.modelResolution')
+  string(row.intentId, 'chat.modelResolution.intentId')
+  string(row.sourceModelId, 'chat.modelResolution.sourceModelId')
+  integer(row.expectedConfigurationVersion, 'chat.modelResolution.expectedConfigurationVersion')
+  const target = object(row.target, 'chat.modelResolution.target')
+  string(target.profileId, 'chat.modelResolution.target.profileId')
+  integer(target.requestRevision, 'chat.modelResolution.target.requestRevision')
+  const key = object(target.key, 'chat.modelResolution.target.key')
+  if (key.kind === 'material') {
+    string(key.keyId, 'chat.modelResolution.target.key.keyId')
+    integer(key.materialRevision, 'chat.modelResolution.target.key.materialRevision')
+  } else if (key.kind !== 'missing') {
+    throw invalid('chat.modelResolution.target.key.kind')
+  }
 }
 
 function assertChatSettings(value: unknown, label: string): void {
@@ -208,7 +288,7 @@ function assertChatSettings(value: unknown, label: string): void {
   }
 }
 
-function assertMessage(value: unknown): void {
+function assertMessage(value: unknown, current = false): void {
   const row = object(value, 'message')
   string(row.id, 'message.id')
   string(row.chatId, 'message.chatId')
@@ -219,18 +299,21 @@ function assertMessage(value: unknown): void {
   finite(row.createdAt, 'message.createdAt')
   enumValue(row.role, MESSAGE_ROLES, 'message.role')
   enumValue(row.origin, MESSAGE_ORIGINS, 'message.origin')
-  if (row.generation !== undefined) assertGeneration(row.generation)
+  if (row.generation !== undefined) assertGeneration(row.generation, current)
   for (const item of array(row.content, 'message.content')) assertContentItem(item)
-  if (row.reasoningDetails !== undefined) {
-    for (const detail of array(row.reasoningDetails, 'message.reasoningDetails')) {
-      const record = object(detail, 'reasoning detail')
-      const type = string(record.type, 'reasoning detail.type')
-      if (type === 'reasoning.text') optionalString(record.text, 'reasoning detail.text')
-      else if (type === 'reasoning.summary') string(record.summary, 'reasoning detail.summary')
-      else if (type === 'reasoning.encrypted') string(record.data, 'reasoning detail.data')
-      else throw invalid('reasoning detail.type')
-    }
+  if (
+    row.reasoningEnvelope !== undefined &&
+    current &&
+    !isReasoningEnvelope(row.reasoningEnvelope)
+  ) {
+    throw invalid('message.reasoningEnvelope')
   }
+  if (row.reasoningDetails !== undefined) {
+    if (current) throw invalid('message.reasoningDetails')
+    assertReasoningDetails(row.reasoningDetails, 'message.reasoningDetails', false)
+  }
+  if (current && 'responsesEchoItem' in row) throw invalid('message.responsesEchoItem')
+  if (row.phase !== undefined) enumValue(row.phase, MESSAGE_PHASES, 'message.phase')
   if (row.attachmentRefs !== undefined) {
     for (const ref of array(row.attachmentRefs, 'message.attachmentRefs')) assertAttachmentRef(ref)
   }
@@ -238,28 +321,122 @@ function assertMessage(value: unknown): void {
     assertToolCalls(row.toolCalls, 'message.toolCalls')
   }
   if (row.continuationAttempts !== undefined) {
+    const streamIds = new Set<string>()
     for (const attempt of array(row.continuationAttempts, 'message.continuationAttempts')) {
       const record = object(attempt, 'continuation attempt')
-      string(record.streamId, 'continuation attempt.streamId')
+      const streamId = string(record.streamId, 'continuation attempt.streamId')
+      if (current && streamIds.has(streamId)) {
+        throw invalid('continuation attempt.streamId')
+      }
+      streamIds.add(streamId)
       string(record.strategy, 'continuation attempt.strategy')
       string(record.status, 'continuation attempt.status')
       finite(record.startedAt, 'continuation attempt.startedAt')
       finite(record.finishedAt, 'continuation attempt.finishedAt')
+      if (current && !isPersistedReasoningCarryForward(record.reasoningCarryForward)) {
+        throw invalid('continuation attempt.reasoningCarryForward')
+      }
+      if (current && !isPersistedInboundReasoningVisibility(record.reasoningVisibility)) {
+        throw invalid('continuation attempt.reasoningVisibility')
+      }
+      if (current) assertContinuationApplication(record)
+      optionalString(record.unappliedText, 'continuation attempt.unappliedText')
+      if (record.unappliedAnnotations !== undefined) {
+        for (const annotation of array(
+          record.unappliedAnnotations,
+          'continuation attempt.unappliedAnnotations',
+        )) {
+          assertContentAnnotation(annotation)
+        }
+      }
       if (record.toolCalls !== undefined) {
         assertToolCalls(record.toolCalls, 'continuation attempt.toolCalls')
       }
+      if (
+        record.reasoningEnvelope !== undefined &&
+        current &&
+        !isReasoningEnvelope(record.reasoningEnvelope)
+      ) {
+        throw invalid('continuation attempt.reasoningEnvelope')
+      }
+      if (record.reasoningDetails !== undefined) {
+        if (current) throw invalid('continuation attempt.reasoningDetails')
+        assertReasoningDetails(
+          record.reasoningDetails,
+          'continuation attempt.reasoningDetails',
+          false,
+        )
+      }
+      if (record.providerOutputItems !== undefined) {
+        assertProviderOutputItems(
+          record.providerOutputItems,
+          'continuation attempt.providerOutputItems',
+          current,
+        )
+      }
+      if (record.phase !== undefined) {
+        enumValue(record.phase, MESSAGE_PHASES, 'continuation attempt.phase')
+      }
+      if (current && 'responsesEchoItem' in record) {
+        throw invalid('continuation attempt.responsesEchoItem')
+      }
     }
   }
-  if (row.providerOutputItems !== undefined) {
-    for (const item of array(row.providerOutputItems, 'message.providerOutputItems')) {
-      const record = object(item, 'provider output item')
-      string(record.dialect, 'provider output item.dialect')
-      string(record.type, 'provider output item.type')
-      if (!('item' in record)) throw invalid('provider output item.item')
-    }
-  }
+  if (row.providerOutputItems !== undefined)
+    assertProviderOutputItems(row.providerOutputItems, 'message.providerOutputItems', current)
   integer(row.nodeVersion, 'message.nodeVersion')
   boolean(row.deleted, 'message.deleted')
+}
+
+function assertReasoningDetails(value: unknown, label: string, current: boolean): void {
+  if (!current) {
+    array(value, label)
+    return
+  }
+  for (const detail of array(value, label)) {
+    const record = object(detail, 'reasoning detail')
+    const type = string(record.type, 'reasoning detail.type')
+    const format = record.format
+    if (format !== undefined && !isReasoningFormat(format)) {
+      throw invalid('reasoning detail.format')
+    }
+    if (format === undefined) throw invalid('reasoning detail.format')
+    optionalString(record.id, 'reasoning detail.id')
+    if (record.index !== undefined) integer(record.index, 'reasoning detail.index')
+    optionalBoolean(record.hidden, 'reasoning detail.hidden')
+    optionalString(record.providerItemId, 'reasoning detail.providerItemId')
+    if (record.providerOutputIndex !== undefined)
+      nonnegativeInteger(record.providerOutputIndex, 'reasoning detail.providerOutputIndex')
+    if (record.providerSummaryIndex !== undefined)
+      nonnegativeInteger(record.providerSummaryIndex, 'reasoning detail.providerSummaryIndex')
+    if (type === 'reasoning.text') {
+      optionalString(record.text, 'reasoning detail.text')
+      optionalString(record.signature, 'reasoning detail.signature')
+    } else if (type === 'reasoning.summary') {
+      string(record.summary, 'reasoning detail.summary')
+    } else if (type === 'reasoning.encrypted') {
+      string(record.data, 'reasoning detail.data')
+    } else {
+      throw invalid('reasoning detail.type')
+    }
+  }
+}
+
+function assertProviderOutputItems(value: unknown, label: string, current: boolean): void {
+  for (const item of array(value, label)) {
+    const record = object(item, 'provider output item')
+    string(record.dialect, 'provider output item.dialect')
+    if (current && !isProviderOutputDialect(record.dialect)) {
+      throw invalid('provider output item.dialect')
+    }
+    string(record.type, 'provider output item.type')
+    optionalString(record.captureId, 'provider output item.captureId')
+    if (record.outputIndex !== undefined)
+      nonnegativeInteger(record.outputIndex, 'provider output item.outputIndex')
+    optionalBoolean(record.hidden, 'provider output item.hidden')
+    optionalBoolean(record.edited, 'provider output item.edited')
+    if (!('item' in record)) throw invalid('provider output item.item')
+  }
 }
 
 function assertToolCalls(value: unknown, label: string): void {
@@ -273,33 +450,95 @@ function assertToolCalls(value: unknown, label: string): void {
   }
 }
 
-function assertGeneration(value: unknown): void {
+function assertGeneration(value: unknown, current: boolean): void {
   const row = object(value, 'generation')
-  string(row.id, 'generation.id')
-  string(row.model, 'generation.model')
-  string(row.requestedModel, 'generation.requestedModel')
-  enumValue(row.apiUsed, GENERATION_APIS, 'generation.apiUsed')
-  enumValue(row.delivery, new Set(['streaming', 'buffered']), 'generation.delivery')
+  const preparing = row.status === 'preparing'
+  optionalString(row.id, 'generation.id')
+  if (preparing) {
+    optionalString(row.model, 'generation.model')
+    optionalString(row.requestedModel, 'generation.requestedModel')
+    optionalEnumValue(row.apiUsed, GENERATION_APIS, 'generation.apiUsed')
+    optionalEnumValue(row.delivery, new Set(['streaming', 'buffered']), 'generation.delivery')
+  } else {
+    string(row.model, 'generation.model')
+    string(row.requestedModel, 'generation.requestedModel')
+    enumValue(row.apiUsed, GENERATION_APIS, 'generation.apiUsed')
+    enumValue(row.delivery, new Set(['streaming', 'buffered']), 'generation.delivery')
+  }
   if (row.status !== undefined) enumValue(row.status, GENERATION_STATUSES, 'generation.status')
   if (row.integrity !== undefined) {
     enumValue(row.integrity, new Set(['clean', 'degraded', 'failed']), 'generation.integrity')
   }
-  string(row.costSource, 'generation.costSource')
+  if (preparing) {
+    optionalEnumValue(
+      row.costSource,
+      new Set(['stream', 'generation-endpoint', 'estimated']),
+      'generation.costSource',
+    )
+  } else {
+    enumValue(
+      row.costSource,
+      new Set(['stream', 'generation-endpoint', 'estimated']),
+      'generation.costSource',
+    )
+  }
   finite(row.startedAt, 'generation.startedAt')
   optionalFinite(row.finishedAt, 'generation.finishedAt')
   optionalFinite(row.cost, 'generation.cost')
+  if (current && !isPersistedReasoningCarryForward(row.reasoningCarryForward)) {
+    throw invalid('generation.reasoningCarryForward')
+  }
+  if (current && !isPersistedInboundReasoningVisibility(row.reasoningVisibility)) {
+    throw invalid('generation.reasoningVisibility')
+  }
+}
+
+function assertContinuationApplication(record: Record<string, unknown>): void {
+  const application = object(record.application, 'continuation attempt.application')
+  if (application.kind === 'applied') {
+    if (
+      Object.keys(application).length !== 1 ||
+      Object.hasOwn(record, 'unappliedText') ||
+      Object.hasOwn(record, 'unappliedAnnotations')
+    ) {
+      throw invalid('continuation attempt.application')
+    }
+    return
+  }
+  if (
+    application.kind !== 'unapplied' ||
+    application.reason !== 'base-version-changed' ||
+    Object.keys(application).length !== 2
+  ) {
+    throw invalid('continuation attempt.application')
+  }
 }
 
 function assertContentItem(value: unknown): void {
   const row = object(value, 'content item')
   const type = enumValue(row.type, CONTENT_TYPES, 'content item.type')
   if (type === 'text' || type === 'output_text') string(row.text, `content item.${type}.text`)
+  if (type === 'output_text' && row.annotations !== undefined) {
+    for (const value of array(row.annotations, 'content item.output_text.annotations')) {
+      assertContentAnnotation(value)
+    }
+  }
   if (type === 'input_audio') string(row.format, 'content item.input_audio.format')
   if (type === 'file') {
     string(row.filename, 'content item.file.filename')
     string(row.mime, 'content item.file.mime')
   }
   optionalString(row.attachmentId, `content item.${type}.attachmentId`)
+}
+
+function assertContentAnnotation(value: unknown): void {
+  const annotation = object(value, 'content annotation')
+  string(annotation.type, 'content annotation.type')
+  if (annotation.source === undefined) return
+  string(annotation.source, 'content annotation.source')
+  integer(annotation.startIndex, 'content annotation.startIndex')
+  integer(annotation.endIndex, 'content annotation.endIndex')
+  object(annotation.providerPayload, 'content annotation.providerPayload')
 }
 
 function assertAttachmentRef(value: unknown): void {
@@ -409,6 +648,25 @@ function assertAttachmentJob(value: unknown): void {
   string(row.id, 'attachment job.id')
   string(row.attachmentId, 'attachment job.attachmentId')
   assertProcessingState(row, 'attachment job')
+  if (row.task !== undefined) {
+    const task = object(row.task, 'attachment job.task')
+    if (task.kind !== 'generated-output-localization-v1') {
+      throw invalid('attachment job.task.kind')
+    }
+    string(task.expectedSourceUrl, 'attachment job.task.expectedSourceUrl')
+    if (task.requestCredential !== undefined) {
+      const credential = object(task.requestCredential, 'attachment job.task.requestCredential')
+      string(credential.profileId, 'attachment job.task.requestCredential.profileId')
+      string(credential.selectedKeyId, 'attachment job.task.requestCredential.selectedKeyId')
+    }
+  }
+  if (row.attemptCount !== undefined) {
+    integer(row.attemptCount, 'attachment job.attemptCount')
+    if ((row.attemptCount as number) < 0) throw invalid('attachment job.attemptCount')
+  }
+  optionalFinite(row.nextAttemptAt, 'attachment job.nextAttemptAt')
+  optionalString(row.leaseId, 'attachment job.leaseId')
+  optionalFinite(row.leaseExpiresAt, 'attachment job.leaseExpiresAt')
   finite(row.updatedAt, 'attachment job.updatedAt')
 }
 
@@ -426,7 +684,7 @@ function assertProfile(value: unknown): void {
   string(row.name, 'profile.name')
   enumValue(row.kind, CONNECTION_KINDS, 'profile.kind')
   string(row.baseUrl, 'profile.baseUrl')
-  string(row.apiKeyRef, 'profile.apiKeyRef')
+  optionalString(row.apiKeyRef, 'profile.apiKeyRef')
   if (row.apiKeyFallbackRefs !== undefined)
     strings(row.apiKeyFallbackRefs, 'profile.apiKeyFallbackRefs')
   optionalString(row.managementApiKeyRef, 'profile.managementApiKeyRef')
@@ -437,8 +695,60 @@ function assertProfile(value: unknown): void {
   boolean(row.supportsEndpointsApi, 'profile.supportsEndpointsApi')
   boolean(row.supportsGenerationApi, 'profile.supportsGenerationApi')
   boolean(row.supportsPrivacyScrape, 'profile.supportsPrivacyScrape')
+  if (row.capabilityOverrides !== undefined) {
+    assertCapabilityOverrides(row.capabilityOverrides, 'profile.capabilityOverrides')
+  }
+  optionalFinite(row.requestRevision, 'profile.requestRevision')
   finite(row.createdAt, 'profile.createdAt')
   finite(row.updatedAt, 'profile.updatedAt')
+}
+
+function assertCapabilityOverrides(value: unknown, label: string): void {
+  for (const [modelId, override] of Object.entries(object(value, label))) {
+    if (modelId.length === 0) throw invalid(label)
+    assertCapabilityOverride(override, `${label}.${modelId}`)
+  }
+}
+
+function assertCapabilityOverride(value: unknown, label: string): void {
+  const row = object(value, label)
+  if (row.supportedParameters !== undefined) {
+    strings(row.supportedParameters, `${label}.supportedParameters`)
+  }
+  optionalEnumValue(row.streaming, STREAMING_CAPABILITIES, `${label}.streaming`)
+  optionalFinite(row.contextLength, `${label}.contextLength`)
+  optionalFinite(row.maxPromptTokens, `${label}.maxPromptTokens`)
+  optionalFinite(row.maxCompletionTokens, `${label}.maxCompletionTokens`)
+  if (row.pricing !== undefined) {
+    const pricing = object(row.pricing, `${label}.pricing`)
+    for (const key of ['prompt', 'completion', 'reasoning', 'image', 'audio'] as const) {
+      optionalString(pricing[key], `${label}.pricing.${key}`)
+    }
+  }
+  if (row.architecture !== undefined) {
+    const architecture = object(row.architecture, `${label}.architecture`)
+    optionalEnumValues(
+      architecture.inputModalities,
+      INPUT_MODALITIES,
+      `${label}.architecture.inputModalities`,
+    )
+    optionalEnumValues(
+      architecture.outputModalities,
+      OUTPUT_MODALITIES,
+      `${label}.architecture.outputModalities`,
+    )
+  }
+  if (row.prefill !== undefined) assertPrefillCapability(row.prefill, `${label}.prefill`)
+}
+
+function assertPrefillCapability(value: unknown, label: string): void {
+  const row = object(value, label)
+  const kind = enumValue(row.kind, PREFILL_CAPABILITY_KINDS, `${label}.kind`)
+  if (kind === 'assistant-tail') {
+    enumValue(row.marker, PREFILL_MARKERS, `${label}.marker`)
+  } else if (row.marker !== undefined) {
+    throw invalid(`${label}.marker`)
+  }
 }
 
 function assertPreset(value: unknown): void {
@@ -447,7 +757,6 @@ function assertPreset(value: unknown): void {
   string(row.name, 'preset.name')
   string(row.connectionProfileId, 'preset.connectionProfileId')
   assertChatSettings(row.settings, 'preset.settings')
-  finite(row.sortIndex, 'preset.sortIndex')
   finite(row.createdAt, 'preset.createdAt')
   finite(row.updatedAt, 'preset.updatedAt')
 }
@@ -500,7 +809,9 @@ function assertKey(value: unknown): void {
   if (kdf.name !== 'PBKDF2' || kdf.iterations !== 200_000 || kdf.hash !== 'SHA-256') {
     throw invalid('key.kdf')
   }
+  optionalString(row.passphraseHint, 'key.passphraseHint')
   string(row.obscuredPreview, 'key.obscuredPreview')
+  optionalFinite(row.materialRevision, 'key.materialRevision')
   finite(row.createdAt, 'key.createdAt')
 }
 
@@ -521,6 +832,15 @@ function string(value: unknown, label: string): string {
 
 function optionalString(value: unknown, label: string): void {
   if (value !== undefined) string(value, label)
+}
+
+function optionalEnumValue(value: unknown, allowed: ReadonlySet<string>, label: string): void {
+  if (value !== undefined) enumValue(value, allowed, label)
+}
+
+function optionalEnumValues(value: unknown, allowed: ReadonlySet<string>, label: string): void {
+  if (value === undefined) return
+  for (const entry of array(value, label)) enumValue(entry, allowed, label)
 }
 
 function nullableString(value: unknown, label: string): void {
@@ -547,6 +867,11 @@ function integer(value: unknown, label: string): void {
   if (!Number.isSafeInteger(value)) throw invalid(label)
 }
 
+function nonnegativeInteger(value: unknown, label: string): void {
+  integer(value, label)
+  if ((value as number) < 0) throw invalid(label)
+}
+
 function strings(value: unknown, label: string): void {
   for (const entry of array(value, label)) string(entry, label)
 }
@@ -564,3 +889,5 @@ function enumValue(value: unknown, allowed: ReadonlySet<string>, label: string):
 function invalid(label: string): Error {
   return new Error(`ImportRowInvalid:${label}`)
 }
+
+import { isProviderOutputDialect } from '../provider-tool-context'

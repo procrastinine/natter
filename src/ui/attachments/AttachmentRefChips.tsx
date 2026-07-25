@@ -1,21 +1,24 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
+import {
+  attachmentMutationInteraction,
+  attachmentMutationTarget,
+} from '../../app/presentation-interactions'
 import { attachmentHref, makeAnchorClickHandler } from '../../app/router'
+import { liveAttachmentRefs } from '../../core/attachment-refs'
 import type { AttachmentRef, ChatId, MessageId } from '../../core/types'
-import { liveAttachmentRefs } from '../../store/attachment-refs'
+import { usePresentationInteraction } from '../../hooks/usePresentationInteraction'
 import {
   detachAttachmentRef,
-  type MessageAttachmentRefMutation,
   relinkAttachmentRef,
   setAttachmentRefVisibility,
-} from '../../store/attachments'
-import { attachmentMapDependencies } from '../../store/reactive-dependencies'
-import { useRepositoryQuery } from '../../store/reactive-query'
-import { getWorkspaceRepository } from '../../store/workspace-repository'
+} from '../../store/attachment-application'
+import type { MessageAttachmentRefMutation } from '../../store/presentation-contracts'
 import { DatabaseIcon, EyeIcon, EyeOffIcon, TrashIcon } from '../icons/Icon'
 import { IconButton } from '../primitives/Button'
 import { AttachmentPicker } from './AttachmentPicker'
 import { AttachmentPreview } from './AttachmentPreview'
 import { formatBytes, kindLabel, shortId, storageLabel } from './format'
+import { useAttachmentCatalogRows } from './useAttachmentCatalogRows'
 
 interface AttachmentRefChipsProps {
   refs: readonly AttachmentRef[] | undefined
@@ -33,35 +36,29 @@ export function AttachmentRefChips({
   onMutateMessageRef,
 }: AttachmentRefChipsProps) {
   const liveRefs = liveAttachmentRefs(refs)
-  const attachmentIds = liveRefs.map((ref) => ref.attachmentId).join('|')
-  const attachments = useRepositoryQuery(
-    JSON.stringify(['attachment-map', attachmentIds]),
-    async () => {
-      const repo = getWorkspaceRepository()
-      const entries = await Promise.all(
-        liveRefs.map(
-          async (ref) => [ref.attachmentId, await repo.getAttachment(ref.attachmentId)] as const,
-        ),
-      )
-      return new Map(entries.flatMap(([id, row]) => (row ? [[id, row] as const] : [])))
-    },
-    undefined,
-    attachmentMapDependencies(liveRefs.map((ref) => ref.attachmentId)),
-  )
+  const attachments = useAttachmentCatalogRows(liveRefs.map((ref) => ref.attachmentId))
   const [replaceRefId, setReplaceRefId] = useState<string | null>(null)
+  const mutationInteraction = usePresentationInteraction(attachmentMutationInteraction)
+  useEffect(() => {
+    if (!attachments.interactive) setReplaceRefId(null)
+  }, [attachments.interactive])
   if (liveRefs.length === 0) return null
-  if (!attachments) return null
+  if (attachments.status === 'loading') return null
   const visibleRefs = liveRefs.filter(
-    (ref) => attachments.get(ref.attachmentId)?.origin !== 'generated-output',
+    (ref) => attachments.rowsById.get(ref.attachmentId)?.origin !== 'generated-output',
   )
   if (visibleRefs.length === 0) return null
 
   return (
-    <div data-ui="attachment-chip-row">
+    <div data-ui="attachment-chip-row" data-inert={!attachments.interactive || undefined}>
       {visibleRefs.map((ref) => {
-        const attachment = attachments.get(ref.attachmentId)
+        const attachment = attachments.rowsById.get(ref.attachmentId)
         const missing = attachment?.storage.kind === 'missing'
         const href = attachmentHref(ref.attachmentId)
+        const mutationTarget = attachmentMutationTarget({
+          refId: ref.refId,
+          ...(messageId ? { messageId } : { draftChatId: draftChatId as ChatId }),
+        })
         return (
           <span
             key={ref.refId}
@@ -72,7 +69,13 @@ export function AttachmentRefChips({
           >
             <a
               href={href}
-              onClick={makeAnchorClickHandler(href)}
+              aria-disabled={!attachments.interactive || undefined}
+              tabIndex={attachments.interactive ? undefined : -1}
+              onClick={
+                attachments.interactive
+                  ? makeAnchorClickHandler(href)
+                  : (event) => event.preventDefault()
+              }
               data-ui="attachment-chip-main"
               title={attachment ? `${attachment.id}\n${attachment.mime}` : ref.attachmentId}
             >
@@ -105,21 +108,29 @@ export function AttachmentRefChips({
                       : 'Include this attachment in future context'
                   }
                   onClick={() => {
-                    if (messageId) {
-                      void onMutateMessageRef?.({
-                        kind: 'visibility',
-                        refId: ref.refId,
-                        includeInContext: !ref.includeInContext,
-                      })
-                      return
-                    }
-                    void setAttachmentRefVisibility({
-                      draftChatId: draftChatId as ChatId,
-                      refId: ref.refId,
-                      includeInContext: !ref.includeInContext,
+                    mutationInteraction.run({
+                      target: mutationTarget,
+                      action: async () => {
+                        if (messageId) {
+                          return onMutateMessageRef?.({
+                            kind: 'visibility',
+                            refId: ref.refId,
+                            includeInContext: !ref.includeInContext,
+                          })
+                        }
+                        await setAttachmentRefVisibility({
+                          draftChatId: draftChatId as ChatId,
+                          refId: ref.refId,
+                          includeInContext: !ref.includeInContext,
+                        })
+                      },
                     })
                   }}
-                  disabled={messageId ? !onMutateMessageRef : !draftChatId}
+                  disabled={
+                    mutationInteraction.isPending(mutationTarget) ||
+                    !attachments.interactive ||
+                    (messageId ? !onMutateMessageRef : !draftChatId)
+                  }
                 >
                   {ref.includeInContext ? <EyeIcon size={13} /> : <EyeOffIcon size={13} />}
                 </IconButton>
@@ -130,7 +141,9 @@ export function AttachmentRefChips({
                   aria-label="Relink attachment reference"
                   title="Relink this reference to another stored attachment"
                   onClick={() => setReplaceRefId(ref.refId)}
-                  disabled={messageId ? !onMutateMessageRef : !draftChatId}
+                  disabled={
+                    !attachments.interactive || (messageId ? !onMutateMessageRef : !draftChatId)
+                  }
                 >
                   <DatabaseIcon size={13} />
                 </IconButton>
@@ -141,16 +154,24 @@ export function AttachmentRefChips({
                   aria-label="Detach attachment from this message"
                   title="Detach from this message; stored file remains"
                   onClick={() => {
-                    if (messageId) {
-                      void onMutateMessageRef?.({ kind: 'detach', refId: ref.refId })
-                      return
-                    }
-                    void detachAttachmentRef({
-                      draftChatId: draftChatId as ChatId,
-                      refId: ref.refId,
+                    mutationInteraction.run({
+                      target: mutationTarget,
+                      action: async () => {
+                        if (messageId) {
+                          return onMutateMessageRef?.({ kind: 'detach', refId: ref.refId })
+                        }
+                        await detachAttachmentRef({
+                          draftChatId: draftChatId as ChatId,
+                          refId: ref.refId,
+                        })
+                      },
                     })
                   }}
-                  disabled={messageId ? !onMutateMessageRef : !draftChatId}
+                  disabled={
+                    mutationInteraction.isPending(mutationTarget) ||
+                    !attachments.interactive ||
+                    (messageId ? !onMutateMessageRef : !draftChatId)
+                  }
                 >
                   <TrashIcon size={13} />
                 </IconButton>
@@ -159,10 +180,15 @@ export function AttachmentRefChips({
           </span>
         )
       })}
-      {replaceRefId ? (
+      {replaceRefId && attachments.interactive ? (
         <AttachmentPicker
+          sessionSurface="picker-message-reference"
           title="Relink reference"
           onClose={() => setReplaceRefId(null)}
+          interactionTarget={attachmentMutationTarget({
+            refId: replaceRefId,
+            ...(messageId ? { messageId } : { draftChatId: draftChatId as ChatId }),
+          })}
           onPick={async (attachment) => {
             if (messageId) {
               await onMutateMessageRef?.({
@@ -170,14 +196,13 @@ export function AttachmentRefChips({
                 refId: replaceRefId,
                 newAttachmentId: attachment.id,
               })
-            } else {
-              await relinkAttachmentRef({
-                draftChatId: draftChatId as ChatId,
-                refId: replaceRefId,
-                newAttachmentId: attachment.id,
-              })
+              return
             }
-            setReplaceRefId(null)
+            await relinkAttachmentRef({
+              draftChatId: draftChatId as ChatId,
+              refId: replaceRefId,
+              newAttachmentId: attachment.id,
+            })
           }}
         />
       ) : null}

@@ -1,59 +1,160 @@
 import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import type { AssistantStreamChunk } from '../../src/api/assistant-stream'
+import type { ChatCompletionUsageWire } from '../../src/api/types'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
-import type { Message } from '../../src/core/types'
+import type { ChatSettings, ConnectionProfile, Message } from '../../src/core/types'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
 import {
   __messageRequestContextChangedForTests,
   __resetBrowserRepositoryForTests,
   getBrowserRepository,
 } from '../../src/store/browser-repo'
-import { createChat } from '../../src/store/chats'
-import { __resetDbForTests, getDb } from '../../src/store/db'
-import { splitMessageForStorage } from '../../src/store/message-storage'
-import { WorkspaceReplacementFenceError } from '../../src/store/repository'
 import {
-  markBrowserWorkspaceReplaced,
-  readBrowserWorkspaceMeta,
-} from '../../src/store/workspace-meta'
+  openBrowserWorkspace,
+  shutdownBrowserWorkspace,
+} from '../../src/store/browser-workspace-lifecycle'
+import {
+  attachConversationWorkspace,
+  disposeConversationWorkspace,
+} from '../../src/store/conversation-workspace'
+import { __resetDbForTests, getDb } from '../../src/store/db'
+import type { GenerationTransportInput } from '../../src/store/generation-engine'
+import { readGlobalPreferences } from '../../src/store/global-settings'
+import {
+  type MessageBodyRow,
+  type MessageHeaderRow,
+  splitMessageForStorage,
+} from '../../src/store/message-storage'
+import type {
+  CommitEnvelope,
+  WorkspaceCommand,
+  WorkspaceCommandResult,
+  WorkspaceRepository,
+  WorkspaceWriteAuthority,
+} from '../../src/store/workspace-protocol'
+import {
+  __resetWorkspaceRepositoryForTests,
+  __setWorkspaceRepositoryForTests,
+} from '../../src/store/workspace-repository'
+import { getWorkspaceRuntimeControlSnapshot } from '../../src/store/workspace-runtime-control'
+import { createChat } from '../helpers/chats'
+import { putCachedEndpoints, putCachedPrivacyPolicy } from '../helpers/discovery-cache'
+import { installGenerationProfile, startControlledGeneration } from '../helpers/generation-engine'
 
 const DB_NAME = 'natter'
+const MODEL = 'openai/gpt-4o'
+
+type PostCommitCommand = Extract<WorkspaceCommand, { kind: 'generation.post-commit-metadata' }>
+type PostCommitEnvelope = CommitEnvelope<WorkspaceCommandResult<PostCommitCommand>>
+type ExecuteInterceptor = (
+  permit: WorkspaceWriteAuthority,
+  command: WorkspaceCommand,
+  next: WorkspaceRepository['execute'],
+) => Promise<unknown>
+
+interface PostCommitPhysicalCapture {
+  readonly beforeHeader: MessageHeaderRow
+  readonly beforeBody: MessageBodyRow
+  readonly afterHeader: MessageHeaderRow
+  readonly afterBody: MessageBodyRow
+  readonly commit: PostCommitEnvelope
+}
+
+let executeInterceptor: ExecuteInterceptor | undefined
+
+function profile(): ConnectionProfile {
+  return {
+    id: 'calibration-safety-profile',
+    name: 'Calibration safety profile',
+    kind: 'openrouter',
+    baseUrl: 'https://openrouter.ai/api/v1',
+    apiKeyRef: 'calibration-safety-key',
+    defaultHeaders: {},
+    appTitle: 'natter',
+    appUrl: '',
+    supportsEndpointsApi: true,
+    supportsGenerationApi: true,
+    supportsPrivacyScrape: true,
+    createdAt: 1,
+    updatedAt: 1,
+  }
+}
+
+function settings(): ChatSettings {
+  return {
+    ...cloneDefaultChatSettings(),
+    profileId: profile().id,
+    model: MODEL,
+    reasoning: {
+      mode: 'off',
+      exclude: false,
+      summary: 'off',
+      include: { encrypted: false, summary: false, text: false },
+    },
+  }
+}
 
 async function resetAll(): Promise<void> {
+  executeInterceptor = undefined
+  __resetWorkspaceRepositoryForTests()
   __resetBrowserRepositoryForTests()
   __resetBroadcastForTests()
   __resetDbForTests()
   await Dexie.delete(DB_NAME)
 }
 
-beforeEach(resetAll)
-afterEach(resetAll)
-
-async function seedMessage(): Promise<Message> {
-  const chat = await createChat({ id: 'chat-calibration', settings: cloneDefaultChatSettings() })
-  const message: Message = {
-    id: 'assistant-calibration',
-    chatId: chat.id,
-    parentId: null,
-    siblingIndex: 0,
-    turnId: 'turn-calibration',
-    turnIndex: 0,
-    createdAt: 1,
-    role: 'assistant',
-    origin: 'generated',
-    content: [{ type: 'output_text', text: 'canonical answer' }],
-    nodeVersion: 0,
-    deleted: false,
-  }
-  await getBrowserRepository().runMutation(
-    [
-      { kind: 'message', messageId: message.id },
-      { kind: 'children', chatId: chat.id, parentId: null },
-    ],
-    (ctx) => ctx.putMessage(message),
+beforeEach(async () => {
+  await resetAll()
+  await openBrowserWorkspace()
+  const target = getBrowserRepository()
+  const next = target.execute.bind(target)
+  __setWorkspaceRepositoryForTests(
+    repositoryProxy(target, (async (permit, command) => {
+      const interceptor = executeInterceptor
+      return interceptor ? interceptor(permit, command, next) : next(permit, command)
+    }) as WorkspaceRepository['execute']),
   )
-  return message
-}
+  await installGenerationProfile(profile(), { 'calibration-safety-key': 'sk-test' })
+  await putCachedEndpoints(profile().id, MODEL, {
+    id: MODEL,
+    endpoints: [
+      {
+        provider_name: 'Calibration provider',
+        provider_slug: 'calibration-provider',
+        supported_parameters: ['provider'],
+        context_length: 8_192,
+        pricing: {},
+        data_policy: {
+          training: false,
+          training_openrouter: false,
+          retains_prompts: false,
+          can_publish: false,
+        },
+      },
+    ],
+  })
+  await putCachedPrivacyPolicy(profile().id, MODEL, {
+    policies: {
+      'Calibration provider': {
+        training: false,
+        trainingOpenRouter: false,
+        retainsPrompts: false,
+        canPublish: false,
+        termsOfServiceURL: '',
+        privacyPolicyURL: '',
+      },
+    },
+    fetchedAt: Date.now(),
+  })
+})
+
+afterEach(async () => {
+  executeInterceptor = undefined
+  __resetWorkspaceRepositoryForTests()
+  await shutdownBrowserWorkspace()
+  await resetAll()
+})
 
 describe('calibration metadata commits', () => {
   it('partitions semantic and advisory storage revisions', () => {
@@ -138,132 +239,210 @@ describe('calibration metadata commits', () => {
             status: 'done',
             startedAt: 1,
             finishedAt: 2,
+            application: { kind: 'unapplied', reason: 'base-version-changed' },
+            reasoningCarryForward: 'unknown',
+            reasoningVisibility: { disclosure: 'unknown' },
           },
         ],
-        generationServerToolOutputs: [{ index: 0, output: { value: 'advisory' } }],
       }),
     ).toBe(false)
   })
 
-  it('updates only the header and leaves the canonical body row/version untouched', async () => {
-    const message = await seedMessage()
-    const beforeHeader = await getDb().messages.get(message.id)
-    const beforeBody = await getDb().messageBodies.get(message.id)
+  it('commits accepted generation calibration as a header-only public command', async () => {
+    const chat = await createChat({ settings: settings() })
+    let capture: PostCommitPhysicalCapture | undefined
+    let replay: PostCommitEnvelope | undefined
+    let postCommitCalls = 0
+    executeInterceptor = async (permit, command, next) => {
+      if (command.kind !== 'generation.post-commit-metadata') {
+        return next(permit, command)
+      }
+      postCommitCalls += 1
+      const lease = await getDb().streamLeases.get(command.input.streamId)
+      if (!lease) throw new Error(`PostCommitLeaseMissing:${command.input.streamId}`)
+      const beforeHeader = await getDb().messages.get(lease.messageId)
+      const beforeBody = await getDb().messageBodies.get(lease.messageId)
+      if (!beforeHeader || !beforeBody) {
+        throw new Error(`PostCommitMessageMissing:${lease.messageId}`)
+      }
+      const commit = await next(permit, command)
+      replay = await next(permit, command)
+      const afterHeader = await getDb().messages.get(lease.messageId)
+      const afterBody = await getDb().messageBodies.get(lease.messageId)
+      if (!afterHeader || !afterBody) {
+        throw new Error(`PostCommitMessageMissingAfterCommit:${lease.messageId}`)
+      }
+      capture = {
+        beforeHeader: structuredClone(beforeHeader),
+        beforeBody: structuredClone(beforeBody),
+        afterHeader: structuredClone(afterHeader),
+        afterBody: structuredClone(afterBody),
+        commit,
+      }
+      return commit
+    }
 
-    const result = await getBrowserRepository().runMutation(
-      [{ kind: 'message', messageId: message.id }],
-      (ctx) =>
-        ctx.patchMessageCalibration(message.id, {
-          originalCharCount: 16,
-          originalTokenEstimate: 4,
-          originalModelId: 'openai/gpt-4o',
-          originalCalibrationKey: 'family:gpt',
-          charCountDelta: 0,
-          cachedTokenEstimate: 4,
+    const handle = await startControlledGeneration(
+      {
+        kind: 'send',
+        chatId: chat.id,
+        expectedLeafId: null,
+        content: [{ type: 'text', text: 'a'.repeat(400) }],
+      },
+      {
+        profile: profile(),
+        keyMaterial: { 'calibration-safety-key': 'sk-test' },
+        openStream: streamText('b'.repeat(200), {
+          prompt_tokens: 100,
+          completion_tokens: 50,
+          total_tokens: 150,
         }),
+      },
     )
+    await handle.prepared
+    await expect(handle.completed).resolves.toMatchObject({ outcome: 'done' })
 
-    expect(result.value).toMatchObject({
-      nodeVersion: (beforeHeader?.nodeVersion ?? 0) + 1,
-      bodyVersion: beforeHeader?.bodyVersion,
-      requestContextVersion: beforeHeader?.requestContextVersion,
-      originalCharCount: 16,
+    expect(postCommitCalls).toBe(1)
+    expect(replay).toMatchObject({
+      effectScope: 'none',
+      value: { outcome: 'already-applied' },
     })
-    expect(await getDb().messageBodies.get(message.id)).toEqual(beforeBody)
+    const physical = required(capture, 'post-commit capture')
+    expect(physical.commit.effectScope).toBe('workspace')
+    expect(physical.commit.value).toMatchObject({
+      outcome: 'applied',
+      chatId: chat.id,
+      messageId: physical.beforeHeader.id,
+      calibration: {
+        attempted: true,
+        promptAccepted: true,
+        completionAccepted: true,
+      },
+    })
+    expect(physical.beforeHeader.generation?.tokenCalibration).toBeUndefined()
+    expect(physical.afterHeader).toMatchObject({
+      id: physical.beforeHeader.id,
+      nodeVersion: physical.beforeHeader.nodeVersion + 1,
+      bodyVersion: physical.beforeHeader.bodyVersion,
+      requestContextVersion: physical.beforeHeader.requestContextVersion,
+      originalCharCount: 200,
+      originalModelId: MODEL,
+      generation: {
+        tokenCalibration: {
+          promptSample: true,
+          completionSample: true,
+          sampleCount: 2,
+        },
+      },
+    })
+    expect(physical.afterBody).toEqual(physical.beforeBody)
+    if (
+      physical.commit.value.outcome !== 'applied' ||
+      !physical.commit.value.header ||
+      !physical.commit.value.chatVersions
+    ) {
+      throw new Error('Expected applied calibration header')
+    }
+    expect(physical.commit.value.header).toEqual(physical.afterHeader)
+    expect(physical.commit.receipt.messageRevisions).toEqual([
+      {
+        before: physical.beforeHeader,
+        header: physical.afterHeader,
+        structuralVersion: physical.commit.value.chatVersions.structuralVersion,
+        changed: { structure: false, body: false },
+      },
+    ])
+    expect(physical.commit.delta.facts).toContainEqual({
+      kind: 'message-revision',
+      chatId: chat.id,
+      structuralVersion: physical.commit.value.chatVersions.structuralVersion,
+      header: physical.afterHeader,
+      changed: { structure: false, body: false },
+    })
+    expect(physical.commit.delta.invalidations).not.toContainEqual(
+      expect.objectContaining({ kind: 'message-body', chatId: chat.id }),
+    )
   })
 
-  it('atomically rejects an old workspace epoch even when ids and versions still match', async () => {
-    const message = await seedMessage()
-    const db = getDb()
-    const before = await readBrowserWorkspaceMeta(db)
-    await db.transaction('rw', db.settings, async (tx) => {
-      await markBrowserWorkspaceReplaced(tx, 10, before)
+  it('does not publish model recency when dispatch fails after attempt preparation', async () => {
+    const chat = await createChat({ settings: settings() })
+    const beforeProfileLastUsedAt = (await getDb().profiles.get(profile().id))?.lastUsedAt
+    const beforeKeyLastUsedAt = (await getDb().keys.get('calibration-safety-key'))?.lastUsedAt
+    executeInterceptor = async (permit, command, next) => {
+      if (command.kind === 'attempt.dispatch') throw new Error('dispatch failed before admission')
+      return next(permit, command)
+    }
+    disposeConversationWorkspace()
+    const runtime = getWorkspaceRuntimeControlSnapshot()
+    if (!runtime.workspaceId) throw new Error('Expected open workspace')
+    attachConversationWorkspace({
+      workspaceId: runtime.workspaceId,
+      replacementEpoch: runtime.replacementEpoch,
     })
 
-    await expect(
-      getBrowserRepository().runMutation(
-        [{ kind: 'message', messageId: message.id }],
-        (ctx) => ctx.patchMessageCalibration(message.id, { originalCharCount: 99 }),
-        { workspaceFence: { replacementEpoch: before.replacementEpoch } },
-      ),
-    ).rejects.toBeInstanceOf(WorkspaceReplacementFenceError)
-    expect(await getDb().messages.get(message.id)).not.toHaveProperty('originalCharCount')
-  })
-
-  it('keeps a header-only semantic put on the existing cold body version', async () => {
-    const message = await seedMessage()
-    const repo = getBrowserRepository()
-    const current = await repo.getMessage(message.id)
-    const beforeHeader = await getDb().messages.get(message.id)
-    const beforeBody = await getDb().messageBodies.get(message.id)
-    if (!current || !beforeHeader || !beforeBody) throw new Error('seed rows missing')
-
-    await repo.runMutation([{ kind: 'message', messageId: message.id }], (ctx) =>
-      ctx.putMessage({ ...current, hiddenFromContext: true }),
+    const handle = await startControlledGeneration(
+      {
+        kind: 'send',
+        chatId: chat.id,
+        expectedLeafId: null,
+        content: [{ type: 'text', text: 'prepared but not dispatched' }],
+      },
+      {
+        profile: profile(),
+        keyMaterial: { 'calibration-safety-key': 'sk-test' },
+        openStream: () => {
+          throw new Error('transport must remain unopened')
+        },
+      },
     )
+    await expect(handle.prepared).resolves.toMatchObject({ chatId: chat.id })
+    await expect(handle.completed).resolves.toMatchObject({ outcome: 'error' })
 
-    const afterHeader = await getDb().messages.get(message.id)
-    expect(afterHeader).toMatchObject({
-      nodeVersion: beforeHeader.nodeVersion + 1,
-      bodyVersion: beforeHeader.bodyVersion,
-      requestContextVersion: beforeHeader.requestContextVersion + 1,
-      hiddenFromContext: true,
-    })
-    expect(await getDb().messageBodies.get(message.id)).toEqual(beforeBody)
-
-    if (!afterHeader) throw new Error('header-only put missing')
-    await repo.runMutation([{ kind: 'message', messageId: message.id }], (ctx) =>
-      ctx.patchMessageBody(message.id, {}, { headerPatch: { cachedMediaTokens: 12 } }),
+    expect((await readGlobalPreferences()).recentModels).toEqual([])
+    expect((await getDb().profiles.get(profile().id))?.lastUsedAt).toBe(beforeProfileLastUsedAt)
+    expect((await getDb().keys.get('calibration-safety-key'))?.lastUsedAt).toBe(beforeKeyLastUsedAt)
+    const assistant = (await getDb().messages.where('chatId').equals(chat.id).toArray()).find(
+      (message) => message.role === 'assistant',
     )
-    expect(await getDb().messages.get(message.id)).toMatchObject({
-      nodeVersion: afterHeader.nodeVersion + 1,
-      bodyVersion: afterHeader.bodyVersion,
-      requestContextVersion: afterHeader.requestContextVersion,
-      cachedMediaTokens: 12,
-    })
-    expect(await getDb().messageBodies.get(message.id)).toEqual(beforeBody)
-  })
-
-  it('advances physical and semantic versions independently for body puts', async () => {
-    const message = await seedMessage()
-    const repo = getBrowserRepository()
-    const first = await repo.getMessage(message.id)
-    const before = await getDb().messages.get(message.id)
-    if (!first || !before) throw new Error('seed rows missing')
-
-    await repo.runMutation([{ kind: 'message', messageId: message.id }], (ctx) =>
-      ctx.putMessage({
-        ...first,
-        continuationAttempts: [
-          {
-            streamId: 'completed-continuation',
-            strategy: 'prompt',
-            status: 'done',
-            startedAt: 1,
-            finishedAt: 2,
-          },
-        ],
-      }),
-    )
-    const attemptsOnly = await getDb().messages.get(message.id)
-    expect(attemptsOnly).toMatchObject({
-      nodeVersion: before.nodeVersion + 1,
-      bodyVersion: before.bodyVersion + 1,
-      requestContextVersion: before.requestContextVersion,
-    })
-
-    const second = await repo.getMessage(message.id)
-    if (!second || !attemptsOnly) throw new Error('intermediate message missing')
-    await repo.runMutation([{ kind: 'message', messageId: message.id }], (ctx) =>
-      ctx.putMessage({
-        ...second,
-        content: [{ type: 'output_text', text: 'changed canonical answer' }],
-      }),
-    )
-    expect(await getDb().messages.get(message.id)).toMatchObject({
-      nodeVersion: attemptsOnly.nodeVersion + 1,
-      bodyVersion: attemptsOnly.bodyVersion + 1,
-      requestContextVersion: attemptsOnly.requestContextVersion + 1,
-    })
+    expect(assistant?.generation?.status).toBe('error')
   })
 })
+
+function streamText(text: string, usage: ChatCompletionUsageWire) {
+  return async function* (_input: GenerationTransportInput): AsyncIterable<AssistantStreamChunk> {
+    yield {
+      type: 'delta',
+      chunk: {
+        id: 'calibration-safety-generation',
+        model: MODEL,
+        choices: [{ delta: { content: text } }],
+      },
+    }
+    yield {
+      type: 'delta',
+      chunk: {
+        id: 'calibration-safety-generation',
+        model: MODEL,
+        choices: [{ finish_reason: 'stop' }],
+        usage,
+      },
+    }
+  }
+}
+
+function repositoryProxy(
+  target: WorkspaceRepository,
+  execute: WorkspaceRepository['execute'],
+): WorkspaceRepository {
+  return {
+    query: target.query.bind(target),
+    execute,
+    replace: target.replace.bind(target),
+    subscribeChanges: target.subscribeChanges.bind(target),
+  }
+}
+
+function required<T>(value: T | undefined, label: string): T {
+  if (value === undefined) throw new Error(`Missing ${label}`)
+  return value
+}

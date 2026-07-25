@@ -1,14 +1,68 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import Dexie from 'dexie'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { StrictMode } from 'react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import {
+  AVAILABLE_GENERATION_CAPABILITY,
+  failedGenerationCapability,
+  type NonReadyGenerationCapability,
+  pendingGenerationCapability,
+  unavailableGenerationCapability,
+} from '../../src/core/interaction-capability'
+import type { MessageAttachmentRef } from '../../src/core/types'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
 import { __resetBrowserRepositoryForTests } from '../../src/store/browser-repo'
+import {
+  openBrowserWorkspace,
+  shutdownBrowserWorkspace,
+} from '../../src/store/browser-workspace-lifecycle'
 import { __resetDbForTests } from '../../src/store/db'
-import { Composer } from '../../src/ui/chat/Composer'
+import type { GenerationStartResult } from '../../src/store/generation-engine'
+import { COMPOSER_DRAFT_PREFIX } from '../../src/store/workspace-tab-session'
+import {
+  Composer,
+  type ComposerSubmission,
+  type ComposerSubmissionOutcome,
+} from '../../src/ui/chat/Composer'
 import { useComposerContextDraft } from '../../src/ui/chat/composer-draft-state'
 import { InlineEditor } from '../../src/ui/chat/InlineEditor'
+import {
+  createInteractionSettlementHarness,
+  succeededInteractionSettlement,
+} from '../helpers/presentation-interactions'
 
 const DB_NAME = 'natter'
+
+function started(completion: Promise<void> = Promise.resolve()): ComposerSubmission {
+  return Object.freeze({
+    kind: 'started',
+    completion: completion.then(
+      (): ComposerSubmissionOutcome => Object.freeze({ kind: 'prepared' }),
+    ),
+  })
+}
+
+function startedInlineGeneration(): GenerationStartResult {
+  const prepared = Object.freeze({
+    streamId: 'inline-stream',
+    chatId: 'chat-1',
+    assistantMessageId: 'assistant-1',
+  })
+  return Object.freeze({
+    kind: 'started',
+    handle: Object.freeze({
+      streamId: prepared.streamId,
+      chatId: prepared.chatId,
+      prepared: Promise.resolve(prepared),
+      completed: Promise.resolve(Object.freeze({ ...prepared, outcome: 'done' as const })),
+    }),
+  })
+}
+
+const BLOCKED_GENERATION_CASES = [
+  ['unavailable', unavailableGenerationCapability('connection-missing')],
+  ['failed', failedGenerationCapability('configuration')],
+] as const satisfies readonly (readonly [string, NonReadyGenerationCapability])[]
 
 async function resetDb() {
   __resetBrowserRepositoryForTests()
@@ -29,20 +83,83 @@ function ComposerContextProbe({ draftKey }: { draftKey: string }) {
   )
 }
 
+beforeEach(async () => {
+  await openBrowserWorkspace()
+})
+
 afterEach(async () => {
   vi.restoreAllMocks()
+  await shutdownBrowserWorkspace()
   await resetDb()
 })
 
 describe('Composer', () => {
+  it('keeps the committed composer mounted but inert while its target is retained', () => {
+    const onSubmit = vi.fn(() => started())
+    const view = render(<Composer draftKey="retained-composer" onSubmit={onSubmit} />)
+    const composer = view.container.querySelector('[data-ui="composer"]')
+    const input = screen.getByRole('textbox')
+    fireEvent.change(input, { target: { value: 'committed draft' } })
+
+    view.rerender(<Composer draftKey="retained-composer" onSubmit={onSubmit} presentationOnly />)
+
+    expect(view.container.querySelector('[data-ui="composer"]')).toBe(composer)
+    expect(screen.getByRole('textbox')).toBe(input)
+    expect(input).toHaveValue('committed draft')
+    expect(composer).toHaveAttribute('inert')
+    expect(composer).toHaveAttribute('data-presentation-only', 'true')
+    fireEvent.submit(composer as HTMLFormElement)
+    expect(onSubmit).not.toHaveBeenCalled()
+
+    view.rerender(<Composer draftKey="retained-composer" onSubmit={onSubmit} />)
+    expect(view.container.querySelector('[data-ui="composer"]')).toBe(composer)
+    expect(composer).not.toHaveAttribute('inert')
+    expect(input).toHaveValue('committed draft')
+  })
+
+  it('flushes a pending debounced draft when the page is hidden', () => {
+    const draftKey = 'pagehide-persistence'
+    const storageKey = `${COMPOSER_DRAFT_PREFIX}${encodeURIComponent(draftKey)}`
+    sessionStorage.removeItem(storageKey)
+    render(<Composer draftKey={draftKey} onSubmit={() => started()} />)
+
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'persist before leaving' } })
+    expect(sessionStorage.getItem(storageKey)).toBeNull()
+
+    try {
+      window.dispatchEvent(new Event('pagehide'))
+      expect(sessionStorage.getItem(storageKey)).toBe('persist before leaving')
+    } finally {
+      sessionStorage.removeItem(storageKey)
+      window.dispatchEvent(new Event('pageshow'))
+    }
+  })
+
+  it('makes a successful draft clear authoritative before the next read', async () => {
+    const draftKey = 'successful-clear-read-after-write'
+    const storageKey = `${COMPOSER_DRAFT_PREFIX}${encodeURIComponent(draftKey)}`
+    sessionStorage.removeItem(storageKey)
+    const mounted = render(<Composer draftKey={draftKey} onSubmit={() => started()} />)
+    const input = screen.getByRole('textbox')
+
+    fireEvent.change(input, { target: { value: 'already sent' } })
+    window.dispatchEvent(new Event('pagehide'))
+    expect(sessionStorage.getItem(storageKey)).toBe('already sent')
+    window.dispatchEvent(new Event('pageshow'))
+
+    fireEvent.submit(mounted.container.querySelector('[data-ui="composer"]') as HTMLFormElement)
+    await waitFor(() => expect(input).toHaveValue(''))
+    mounted.unmount()
+
+    render(<Composer draftKey={draftKey} onSubmit={() => started()} />)
+    expect(screen.getByRole('textbox')).toHaveValue('')
+    expect(sessionStorage.getItem(storageKey)).toBeNull()
+  })
+
   it('restores the submitted draft when onSubmit rejects', async () => {
     vi.spyOn(console, 'error').mockImplementation(() => {})
     const { container } = render(
-      <Composer
-        onSubmit={async () => {
-          throw new Error('preflight failed')
-        }}
-      />,
+      <Composer onSubmit={() => started(Promise.reject(new Error('preflight failed')))} />,
     )
     const input = screen.getByRole('textbox')
     fireEvent.change(input, { target: { value: 'keep this draft' } })
@@ -51,13 +168,144 @@ describe('Composer', () => {
     await waitFor(() => expect(input).toHaveValue('keep this draft'))
   })
 
+  it('does not clear a draft when synchronous admission is no longer current', () => {
+    const onSubmit = vi.fn(
+      (): ComposerSubmission => ({
+        kind: 'not-started',
+        capability: pendingGenerationCapability('prompt-path'),
+      }),
+    )
+    const { container } = render(<Composer onSubmit={onSubmit} />)
+    const input = screen.getByRole('textbox')
+    fireEvent.change(input, { target: { value: 'preserve without a flash' } })
+
+    fireEvent.submit(container.querySelector('[data-ui="composer"]') as HTMLFormElement)
+
+    expect(onSubmit).toHaveBeenCalledTimes(1)
+    expect(input).toHaveValue('preserve without a flash')
+  })
+
+  it('retains a draft when preparation settles as a typed rejection', async () => {
+    let settle: (outcome: ComposerSubmissionOutcome) => void = () => undefined
+    const completion = new Promise<ComposerSubmissionOutcome>((resolve) => {
+      settle = resolve
+    })
+    const { container } = render(
+      <Composer onSubmit={() => Object.freeze({ kind: 'started', completion })} />,
+    )
+    const input = screen.getByRole('textbox')
+    fireEvent.change(input, { target: { value: 'retain rejected submit' } })
+
+    fireEvent.submit(container.querySelector('[data-ui="composer"]') as HTMLFormElement)
+
+    const send = screen.getByRole('button', { name: 'Send ⏎' })
+    await waitFor(() => expect(send).toBeDisabled())
+    settle(Object.freeze({ kind: 'not-prepared', reason: 'failed' }))
+    await waitFor(() => expect(send).toBeEnabled())
+    expect(input).toHaveValue('retain rejected submit')
+  })
+
+  it('owns one pending first submit and clears only after preparation succeeds', async () => {
+    let resolvePreparation: () => void = () => undefined
+    const completion = new Promise<void>((resolve) => {
+      resolvePreparation = resolve
+    })
+    const onSubmit = vi.fn(() => started(completion))
+    const { container } = render(
+      <Composer
+        generationCapability={pendingGenerationCapability('prompt-path')}
+        onSubmit={onSubmit}
+      />,
+    )
+    const input = screen.getByRole('textbox')
+    fireEvent.change(input, { target: { value: 'retain until prepared' } })
+
+    const send = screen.getByRole('button', { name: 'Send ⏎' })
+    expect(send).toBeEnabled()
+    fireEvent.submit(container.querySelector('[data-ui="composer"]') as HTMLFormElement)
+
+    expect(onSubmit).toHaveBeenCalledOnce()
+    expect(input).toHaveValue('retain until prepared')
+    resolvePreparation()
+    await waitFor(() => expect(input).toHaveValue(''))
+  })
+
+  it('preserves a whitespace-only draft edit made while preparation is pending', async () => {
+    let resolvePreparation: () => void = () => undefined
+    const completion = new Promise<void>((resolve) => {
+      resolvePreparation = resolve
+    })
+    const onSubmit = vi.fn(() => started(completion))
+    const { container } = render(<Composer onSubmit={onSubmit} />)
+    const input = screen.getByRole('textbox')
+    fireEvent.change(input, { target: { value: 'exact draft' } })
+    fireEvent.submit(container.querySelector('[data-ui="composer"]') as HTMLFormElement)
+
+    fireEvent.change(input, { target: { value: ' exact draft ' } })
+    resolvePreparation()
+
+    await waitFor(() => expect(input).toHaveValue(' exact draft '))
+    expect(onSubmit).toHaveBeenCalledWith('exact draft', {})
+  })
+
+  it.each(
+    BLOCKED_GENERATION_CASES,
+  )('preserves the draft and does not invoke submit while generation is %s', (_state, capability) => {
+    const onSubmit = vi.fn(() => started())
+    const { container } = render(<Composer generationCapability={capability} onSubmit={onSubmit} />)
+    const input = screen.getByRole('textbox')
+    fireEvent.change(input, { target: { value: 'retain this exact draft' } })
+
+    const send = screen.getByRole('button', { name: 'Send ⏎' })
+    expect(send).toBeDisabled()
+    fireEvent.submit(container.querySelector('[data-ui="composer"]') as HTMLFormElement)
+
+    expect(onSubmit).not.toHaveBeenCalled()
+    expect(input).toHaveValue('retain this exact draft')
+  })
+
+  it('selects send and reply capability independently from the inactive action', async () => {
+    const onSubmit = vi.fn((_text: string) => started())
+    const onReplyToTrailingUser = vi.fn(() => started())
+    const replyView = render(
+      <Composer
+        trailingUserMessage
+        generationCapability={failedGenerationCapability('configuration')}
+        replyGenerationCapability={AVAILABLE_GENERATION_CAPABILITY}
+        onReplyToTrailingUser={onReplyToTrailingUser}
+        onSubmit={onSubmit}
+      />,
+    )
+
+    fireEvent.submit(replyView.container.querySelector('[data-ui="composer"]') as HTMLFormElement)
+    await waitFor(() => expect(onReplyToTrailingUser).toHaveBeenCalledOnce())
+    expect(onSubmit).not.toHaveBeenCalled()
+    replyView.unmount()
+
+    const sendView = render(
+      <Composer
+        generationCapability={AVAILABLE_GENERATION_CAPABILITY}
+        replyGenerationCapability={pendingGenerationCapability('prompt-path')}
+        trailingUserMessage
+        onReplyToTrailingUser={onReplyToTrailingUser}
+        onSubmit={onSubmit}
+      />,
+    )
+    const input = screen.getByRole('textbox')
+    fireEvent.change(input, { target: { value: 'ordinary send stays independent' } })
+    fireEvent.submit(sendView.container.querySelector('[data-ui="composer"]') as HTMLFormElement)
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledOnce())
+    expect(onReplyToTrailingUser).toHaveBeenCalledOnce()
+  })
+
   it('does not report or restore an aborted submit while the page is being replaced', async () => {
     const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
     const { container } = render(
       <Composer
-        onSubmit={async () => {
+        onSubmit={() => {
           window.dispatchEvent(new Event('pagehide'))
-          throw new Dexie.AbortError('page replacement')
+          return started(Promise.reject(new Dexie.AbortError('page replacement')))
         }}
       />,
     )
@@ -65,7 +313,7 @@ describe('Composer', () => {
     fireEvent.change(input, { target: { value: 'leaving page' } })
     try {
       fireEvent.submit(container.querySelector('[data-ui="composer"]') as HTMLFormElement)
-      await waitFor(() => expect(input).toHaveValue(''))
+      await waitFor(() => expect(input).toHaveValue('leaving page'))
       expect(consoleError).not.toHaveBeenCalled()
     } finally {
       window.dispatchEvent(new Event('pageshow'))
@@ -74,7 +322,7 @@ describe('Composer', () => {
 
   it('does not report an aborted trailing-user reply while the page is being replaced', async () => {
     const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
-    const onReplyToTrailingUser = vi.fn(async () => {
+    const onReplyToTrailingUser = vi.fn((): ComposerSubmission => {
       window.dispatchEvent(new Event('pagehide'))
       throw new Dexie.AbortError('page replacement')
     })
@@ -82,7 +330,7 @@ describe('Composer', () => {
       <Composer
         trailingUserMessage
         onReplyToTrailingUser={onReplyToTrailingUser}
-        onSubmit={() => {}}
+        onSubmit={() => started()}
       />,
     )
     try {
@@ -95,7 +343,7 @@ describe('Composer', () => {
   })
 
   it('uses exact zero and one labels before approximating longer drafts', () => {
-    render(<Composer onSubmit={() => {}} />)
+    render(<Composer onSubmit={() => started()} />)
     const input = screen.getByRole('textbox')
     const counter = screen.getByText('0 draft tokens')
 
@@ -116,7 +364,7 @@ describe('Composer', () => {
   it('publishes deferred text and prefill for the current tab context estimate', async () => {
     const { container } = render(
       <>
-        <Composer draftKey="context-probe" showPrefillButton onSubmit={() => {}} />
+        <Composer draftKey="context-probe" showPrefillButton onSubmit={() => started()} />
         <ComposerContextProbe draftKey="context-probe" />
       </>,
     )
@@ -143,7 +391,7 @@ describe('Composer', () => {
       get: () => 48,
     })
     try {
-      render(<Composer autoSize onSubmit={() => {}} />)
+      render(<Composer autoSize onSubmit={() => started()} />)
       const input = screen.getByRole('textbox')
 
       expect(input.style.height).toBe('48px')
@@ -182,7 +430,7 @@ describe('Composer', () => {
       },
     })
     try {
-      render(<Composer autoSize onSubmit={() => {}} />)
+      render(<Composer autoSize onSubmit={() => started()} />)
       const input = screen.getByRole('textbox')
       expect(input.style.height).toBe('47px')
 
@@ -203,7 +451,10 @@ describe('Composer', () => {
   })
 
   it('uploads selected files, shows a file tile, and sends attachment refs', async () => {
-    const onSubmit = vi.fn().mockResolvedValue(undefined)
+    const onSubmit = vi.fn(
+      (_text: string, _opts?: { prefillText?: string; attachmentRefs?: MessageAttachmentRef[] }) =>
+        started(),
+    )
     const { container } = render(
       <>
         <Composer draftKey="attachment-context-probe" onSubmit={onSubmit} />
@@ -241,10 +492,64 @@ describe('Composer', () => {
     expect(options?.attachmentRefs?.[0]).toMatchObject({ includeInContext: true })
   })
 
-  it('lets inline message edits add attachment refs', async () => {
-    const onSave = vi.fn().mockResolvedValue(undefined)
+  it('preserves attachment edits and additions made while preparation is pending', async () => {
+    let resolvePreparation: () => void = () => undefined
+    const completion = new Promise<void>((resolve) => {
+      resolvePreparation = resolve
+    })
+    const onSubmit = vi.fn(
+      (_text: string, _opts?: { prefillText?: string; attachmentRefs?: MessageAttachmentRef[] }) =>
+        started(completion),
+    )
+    const { container } = render(<Composer onSubmit={onSubmit} />)
+    const fileInput = container.querySelector(
+      '[data-ui="attachment-hidden-input"]',
+    ) as HTMLInputElement
+    fireEvent.change(fileInput, {
+      target: { files: [new File(['first'], 'first.txt', { type: 'text/plain' })] },
+    })
+    expect(await screen.findByText('first.txt')).toBeInTheDocument()
+    await waitFor(() =>
+      expect(
+        container.querySelector('[data-ui="attachment-file-card"][data-storage="local"]'),
+      ).toBeInTheDocument(),
+    )
+
+    fireEvent.submit(container.querySelector('[data-ui="composer"]') as HTMLFormElement)
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledOnce())
+    fireEvent.click(screen.getByRole('button', { name: 'Hide attachment from context' }))
+    fireEvent.change(fileInput, {
+      target: { files: [new File(['second'], 'second.txt', { type: 'text/plain' })] },
+    })
+    expect(await screen.findByText('second.txt')).toBeInTheDocument()
+    resolvePreparation()
+
+    await waitFor(() =>
+      expect(container.querySelectorAll('[data-ui="attachment-file-card"]')).toHaveLength(2),
+    )
+    expect(
+      screen.getByText('first.txt').closest('[data-ui="attachment-file-card"]'),
+    ).toHaveAttribute('data-context', 'excluded')
+    const submitted = onSubmit.mock.calls[0]?.[1]?.attachmentRefs
+    expect(submitted).toHaveLength(1)
+    expect(submitted?.[0]).toMatchObject({ includeInContext: true })
+  })
+
+  it('passes inline attachments only through Save & Send', async () => {
+    const onSave = vi.fn(() => succeededInteractionSettlement())
+    const onSaveAndSend = vi.fn(
+      (
+        _text: string,
+        _options?: { prefillText?: string; attachmentRefs?: MessageAttachmentRef[] },
+      ) => startedInlineGeneration(),
+    )
     const { container } = render(
-      <InlineEditor initial="existing message" onSave={onSave} onCancel={() => {}} />,
+      <InlineEditor
+        initial="existing message"
+        onSave={onSave}
+        onCancel={() => {}}
+        onSaveAndSend={onSaveAndSend}
+      />,
     )
     const fileInput = container.querySelector(
       '[data-ui="attachment-hidden-input"]',
@@ -261,91 +566,139 @@ describe('Composer', () => {
         container.querySelector('[data-ui="attachment-file-card"][data-storage="local"]'),
       ).toBeInTheDocument(),
     )
-    fireEvent.keyDown(screen.getByRole('textbox', { name: 'Edit message' }), {
-      key: 'Enter',
-      metaKey: true,
-    })
+    fireEvent.click(screen.getByRole('button', { name: 'Save & Send' }))
 
-    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1))
-    const attachmentRefs = onSave.mock.calls[0]?.[2] as
-      | Array<{ includeInContext: boolean }>
-      | undefined
-    expect(attachmentRefs).toHaveLength(1)
-    expect(attachmentRefs?.[0]).toMatchObject({ includeInContext: true })
+    await waitFor(() => expect(onSaveAndSend).toHaveBeenCalledTimes(1))
+    expect(onSave).not.toHaveBeenCalled()
+    const options = onSaveAndSend.mock.calls[0]?.[1]
+    expect(options?.attachmentRefs).toHaveLength(1)
+    expect(options?.attachmentRefs?.[0]).toMatchObject({ includeInContext: true })
   })
 
-  it('preserves provider sealed fields when editing tool-call JSON', async () => {
-    const onSave = vi.fn().mockResolvedValue(undefined)
-    render(
-      <InlineEditor
-        initial="existing message"
-        onSave={onSave}
-        onCancel={() => {}}
-        initialProviderOutputItems={[
-          {
-            dialect: 'anthropic-claude',
-            type: 'web_search_tool_result',
-            item: {
-              type: 'web_search_tool_result',
-              tool_use_id: 'srvtoolu_1',
-              content: [
-                {
-                  type: 'web_search_result',
-                  title: 'Original title',
-                  url: 'https://example.com',
-                  encrypted_content: 'sealed-result-payload',
-                },
-              ],
-            },
-          },
-        ]}
-      />,
+  it('keeps reasoning and provider output outside the content-only editor', async () => {
+    const onSave = vi.fn(() => succeededInteractionSettlement())
+    const { container } = render(
+      <InlineEditor initial="existing message" onSave={onSave} onCancel={() => {}} />,
     )
 
+    expect(container.querySelector('[data-ui="inline-editor-reasoning"]')).toBeNull()
+    expect(container.querySelector('[data-ui="inline-editor-tool-calls"]')).toBeNull()
     fireEvent.change(screen.getByRole('textbox', { name: 'Edit message' }), {
       target: { value: 'existing message updated' },
-    })
-    fireEvent.change(screen.getByLabelText('Edit tool call JSON or text'), {
-      target: {
-        value: JSON.stringify(
-          {
-            type: 'web_search_tool_result',
-            tool_use_id: 'srvtoolu_1',
-            content: [
-              {
-                type: 'web_search_result',
-                title: 'Edited title',
-                url: 'https://example.com',
-              },
-            ],
-          },
-          null,
-          2,
-        ),
-      },
     })
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
 
     await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1))
-    expect(onSave.mock.calls[0]?.[0]).toBe('existing message updated')
-    expect(onSave.mock.calls[0]?.[3]).toEqual([
-      {
-        dialect: 'anthropic-claude',
-        type: 'web_search_tool_result',
-        edited: true,
-        item: {
-          type: 'web_search_tool_result',
-          tool_use_id: 'srvtoolu_1',
-          content: [
-            {
-              type: 'web_search_result',
-              title: 'Edited title',
-              url: 'https://example.com',
-              encrypted_content: 'sealed-result-payload',
+    expect(onSave).toHaveBeenCalledWith('existing message updated')
+  })
+
+  it('lets only the mounted edit session dismiss after Save settles', async () => {
+    const settlements = createInteractionSettlementHarness()
+    let resolveOld!: () => void
+    const oldSave = new Promise<void>((resolve) => {
+      resolveOld = resolve
+    })
+    const oldCancel = vi.fn()
+    const oldView = render(
+      <StrictMode>
+        <InlineEditor
+          initial="same message"
+          onSave={() => settlements.run(() => oldSave)}
+          onCancel={oldCancel}
+        />
+      </StrictMode>,
+    )
+    fireEvent.change(screen.getByRole('textbox', { name: 'Edit message' }), {
+      target: { value: 'old pending edit' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    oldView.unmount()
+
+    const currentCancel = vi.fn()
+    render(
+      <StrictMode>
+        <InlineEditor
+          initial="same message"
+          onSave={() => settlements.succeed()}
+          onCancel={currentCancel}
+        />
+      </StrictMode>,
+    )
+    resolveOld()
+    await oldSave
+    await Promise.resolve()
+    expect(oldCancel).not.toHaveBeenCalled()
+    expect(currentCancel).not.toHaveBeenCalled()
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Edit message' }), {
+      target: { value: 'current edit' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    await waitFor(() => expect(currentCancel).toHaveBeenCalledOnce())
+  })
+
+  it('lets only the mounted edit session dismiss after Save & Send prepares', async () => {
+    let resolveOld!: (value: {
+      streamId: string
+      chatId: string
+      assistantMessageId: string
+    }) => void
+    const oldPrepared = new Promise<{
+      streamId: string
+      chatId: string
+      assistantMessageId: string
+    }>((resolve) => {
+      resolveOld = resolve
+    })
+    const oldCancel = vi.fn()
+    const oldView = render(
+      <StrictMode>
+        <InlineEditor
+          initial="same message"
+          onSave={succeededInteractionSettlement}
+          onCancel={oldCancel}
+          onSaveAndSend={() => ({
+            kind: 'started',
+            handle: {
+              streamId: 'old-stream',
+              chatId: 'chat-1',
+              prepared: oldPrepared,
+              completed: Promise.resolve({
+                streamId: 'old-stream',
+                chatId: 'chat-1',
+                assistantMessageId: 'assistant-old',
+                outcome: 'done',
+              }),
             },
-          ],
-        },
-      },
-    ])
+          })}
+        />
+      </StrictMode>,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Save & Send' }))
+    oldView.unmount()
+
+    const currentCancel = vi.fn()
+    render(
+      <StrictMode>
+        <InlineEditor
+          initial="same message"
+          onSave={succeededInteractionSettlement}
+          onCancel={currentCancel}
+          onSaveAndSend={startedInlineGeneration}
+        />
+      </StrictMode>,
+    )
+    resolveOld({
+      streamId: 'old-stream',
+      chatId: 'chat-1',
+      assistantMessageId: 'assistant-old',
+    })
+    await oldPrepared
+    await Promise.resolve()
+    expect(oldCancel).not.toHaveBeenCalled()
+    expect(currentCancel).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save & Send' }))
+    await waitFor(() => expect(currentCancel).toHaveBeenCalledOnce())
   })
 })

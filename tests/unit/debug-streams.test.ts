@@ -1,4 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { projectReasoningEnvelope } from '../../src/core/reasoning-envelope'
+import {
+  applyReasoningObservationBatch,
+  createReasoningObservationCodecState,
+  reasoningObservationsFromDetails,
+} from '../../src/core/reasoning-observation'
 import {
   logRequestPlanDebug,
   logStreamDebug,
@@ -140,6 +146,71 @@ describe('debug stream helpers', () => {
       maximumBytes: 1024 * 1024,
     })
     expect(JSON.stringify(window.__debugStreams?.lastPlan())).not.toContain('mutated-after-capture')
+  })
+
+  it('summarizes current reasoning envelopes without exposing opaque carriers', () => {
+    const details = [
+      ...Array.from({ length: 6 }, (_, index) => ({
+        type: 'reasoning.summary' as const,
+        format: 'unknown' as const,
+        id: `summary-${index}`,
+        summary: index === 0 ? 'v'.repeat(500) : `summary ${index}`,
+      })),
+      {
+        type: 'reasoning.text' as const,
+        format: 'anthropic-claude-v1' as const,
+        id: 'claude-thinking',
+        text: 'visible Claude thought',
+        signature: 'private-claude-signature',
+      },
+      {
+        type: 'reasoning.encrypted' as const,
+        format: 'google-gemini-v1' as const,
+        id: 'gemini-signature',
+        data: 'private-gemini-signature',
+      },
+    ]
+    const codec = createReasoningObservationCodecState()
+    applyReasoningObservationBatch(codec, {
+      observations: reasoningObservationsFromDetails({
+        details,
+        mode: 'snapshot',
+        dialect: 'openrouter-chat',
+        bridge: 'openrouter',
+        untypedVisibleKind: 'text',
+      }),
+    })
+    const entries: Array<{ label: string; payload: unknown }> = []
+    setStreamDebugSink((entry) => entries.push(entry))
+    vi.spyOn(console, 'debug').mockImplementation(() => {})
+
+    logStreamDebug('stream-1', 'message.finalize', {
+      messageId: 'assistant-1',
+      outcome: 'done',
+      reasoningEnvelope: projectReasoningEnvelope(codec.envelope),
+    })
+
+    expect(entries).toHaveLength(1)
+    expect(entries[0]?.payload).toMatchObject({
+      messageId: 'assistant-1',
+      reasoningEnvelope: {
+        kind: 'plaintext',
+        counts: { text: 1, summary: 6, opaque: 1, authentication: 1 },
+        lengths: {
+          text: 'visible Claude thought'.length,
+          summary: 500 + 'summary 1'.length * 5,
+          opaque: 'private-gemini-signature'.length,
+          authentication: 'private-claude-signature'.length,
+        },
+        truncated: 1,
+      },
+    })
+    const encoded = JSON.stringify(entries[0]?.payload)
+    expect(encoded).toContain('"kind":"gemini-thought-signature"')
+    expect(encoded).toContain(`"valueLength":${'private-gemini-signature'.length}`)
+    expect(encoded).not.toContain('private-gemini-signature')
+    expect(encoded).not.toContain('private-claude-signature')
+    expect(encoded).toContain('<500 chars>')
   })
 
   it('disable and clear release buffers, latest requests, and clipboard fallbacks', async () => {

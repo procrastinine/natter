@@ -1,30 +1,32 @@
 import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import type { AssistantStreamChunk } from '../../src/api/assistant-stream'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
-import type {
-  ChatSettings,
-  ConnectionProfile,
-  Message,
-  MessageRole,
-  ReasoningDetail,
-} from '../../src/core/types'
-import { sendFromMessage, sendText } from '../../src/hooks/useChat'
-import { continueAssistantInPlace } from '../../src/hooks/useContinue'
+import type { ChatSettings, ConnectionProfile, Message, MessageRole } from '../../src/core/types'
+import { attemptController } from '../../src/store/attempt-controller'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
+import { __resetBrowserRepositoryForTests } from '../../src/store/browser-repo'
 import {
-  __resetBrowserRepositoryForTests,
-  getBrowserRepository,
-} from '../../src/store/browser-repo'
-import { createChat } from '../../src/store/chats'
-import { __resetDbForTests, openDb } from '../../src/store/db'
-import { putCachedEndpoints } from '../../src/store/models-cache'
-import {
-  __resetPrivacyInFlightForTests,
-  putCachedPrivacyPolicy,
-} from '../../src/store/privacy-cache'
-import { useChatStore } from '../../src/store/zustand/chatStore'
-import { useStreamStore } from '../../src/store/zustand/streamStore'
+  openBrowserWorkspace,
+  shutdownBrowserWorkspace,
+} from '../../src/store/browser-workspace-lifecycle'
+import { getChat } from '../../src/store/chats'
+import { importMessagesOp } from '../../src/store/conversation-command-client'
+import { __resetDbForTests } from '../../src/store/db'
+import type { GenerationTransportInput } from '../../src/store/generation-engine'
+import { getCachedEndpoints } from '../../src/store/models-cache'
+import { getCachedPrivacyPolicy } from '../../src/store/privacy-cache'
+import { getWorkspaceRepository } from '../../src/store/workspace-repository'
+import { runWorkspaceRead } from '../../src/store/workspace-runtime'
 import { useUiStore } from '../../src/store/zustand/uiStore'
+import { createChat } from '../helpers/chats'
+import { putCachedEndpoints, putCachedPrivacyPolicy } from '../helpers/discovery-cache'
+import {
+  installGenerationProfile,
+  runControlledGeneration,
+  startControlledGeneration,
+} from '../helpers/generation-engine'
+import { readTestMessages } from '../helpers/message-storage'
 
 const DB_NAME = 'natter'
 
@@ -105,9 +107,6 @@ async function reset() {
   __resetBrowserRepositoryForTests()
   __resetDbForTests()
   __resetBroadcastForTests()
-  __resetPrivacyInFlightForTests()
-  useChatStore.getState().reset()
-  useStreamStore.getState().reset()
   useUiStore.getState().reset()
   await Dexie.delete(DB_NAME)
 }
@@ -116,8 +115,84 @@ async function* stream<T>(...chunks: T[]): AsyncGenerator<T> {
   for (const c of chunks) yield c
 }
 
+interface ConfiguredGenerationInput {
+  chatId: string
+  connection: ConnectionProfile
+  apiKey: string
+  openStream: (input: GenerationTransportInput) => AsyncIterable<AssistantStreamChunk>
+}
+
+interface ConfiguredSendInput extends ConfiguredGenerationInput {
+  content: Message['content']
+  prefillContent?: Message['content']
+}
+
+async function executeSend(input: ConfiguredSendInput) {
+  const chat = await getChat(input.chatId)
+  if (!chat) throw new Error(`chat ${input.chatId} missing`)
+  return runControlledGeneration(
+    {
+      kind: 'send',
+      chatId: input.chatId,
+      expectedLeafId: chat.lastUpdatedLeafId,
+      content: input.content,
+      ...(input.prefillContent ? { prefillContent: input.prefillContent } : {}),
+    },
+    {
+      profile: input.connection,
+      keyMaterial: input.connection.apiKeyRef ? { [input.connection.apiKeyRef]: input.apiKey } : {},
+      openStream: input.openStream,
+    },
+  )
+}
+
+async function executeReply(input: ConfiguredGenerationInput & { parentMessageId: string }) {
+  return runControlledGeneration(
+    { kind: 'reply', chatId: input.chatId, parentUserId: input.parentMessageId },
+    {
+      profile: input.connection,
+      keyMaterial: input.connection.apiKeyRef ? { [input.connection.apiKeyRef]: input.apiKey } : {},
+      openStream: input.openStream,
+    },
+  )
+}
+
+async function executeRegenerate(input: ConfiguredGenerationInput & { targetAssistantId: string }) {
+  return runControlledGeneration(
+    {
+      kind: 'regenerate',
+      chatId: input.chatId,
+      targetAssistantId: input.targetAssistantId,
+    },
+    {
+      profile: input.connection,
+      keyMaterial: input.connection.apiKeyRef ? { [input.connection.apiKeyRef]: input.apiKey } : {},
+      openStream: input.openStream,
+    },
+  )
+}
+
+async function executeContinue(input: ConfiguredGenerationInput & { targetMessageId: string }) {
+  return runControlledGeneration(
+    { kind: 'continue', chatId: input.chatId, targetAssistantId: input.targetMessageId },
+    {
+      profile: input.connection,
+      keyMaterial: input.connection.apiKeyRef ? { [input.connection.apiKeyRef]: input.apiKey } : {},
+      openStream: input.openStream,
+    },
+  )
+}
+
 async function messagesFor(chatId: string): Promise<Message[]> {
-  return getBrowserRepository().listMessages(chatId)
+  return readTestMessages(chatId)
+}
+
+async function messageFor(messageId: string): Promise<Message | undefined> {
+  return runWorkspaceRead('repository-query', (permit) =>
+    getWorkspaceRepository()
+      .query(permit, { kind: 'message.presentation', messageId })
+      .then((envelope) => envelope.value?.message),
+  )
 }
 
 function requireDefined<T>(value: T | undefined, label: string): T {
@@ -140,58 +215,34 @@ interface SeedMessage {
   id: string
   role: MessageRole
   text: string
-  origin?: Message['origin']
-  reasoningDetails?: ReasoningDetail[]
 }
 
 async function seedLinearMessages(
   chatId: string,
   specs: readonly SeedMessage[],
 ): Promise<Message[]> {
-  const repo = getBrowserRepository()
-  const rows: Message[] = []
-  let parentId: string | null = null
-  for (let i = 0; i < specs.length; i += 1) {
-    const spec = specs[i] as SeedMessage
-    const row: Message = {
-      id: spec.id,
-      chatId,
-      parentId,
-      siblingIndex: 0,
-      turnId: `seed-turn-${i}`,
-      turnIndex: i,
-      createdAt: 100 + i,
+  const imported = await importMessagesOp({
+    chatId,
+    slot: { kind: 'at-end' },
+    activeLeafId: null,
+    messages: specs.map((spec) => ({
       role: spec.role,
-      origin: spec.origin ?? (spec.role === 'assistant' ? 'generated' : 'user'),
-      content:
+      content: [
         spec.role === 'assistant'
-          ? [{ type: 'output_text', text: spec.text }]
-          : [{ type: 'text', text: spec.text }],
-      nodeVersion: 0,
-      deleted: false,
-      ...(spec.reasoningDetails ? { reasoningDetails: spec.reasoningDetails } : {}),
-    }
-    await repo.runMutation(
-      [
-        { kind: 'message', messageId: row.id },
-        { kind: 'children', chatId, parentId },
+          ? { type: 'output_text' as const, text: spec.text }
+          : { type: 'text' as const, text: spec.text },
       ],
-      async (ctx) => {
-        await ctx.putMessage(row)
-      },
-    )
-    rows.push(row)
-    parentId = row.id
-  }
-  return rows
+    })),
+  })
+  return imported.presentations.map((presentation) => presentation.message)
 }
 
 function captureChatDelta(
   capture: (wire: Record<string, unknown>) => void,
   text = 'ok',
-): NonNullable<Parameters<typeof sendText>[0]['openStream']> {
+): (input: GenerationTransportInput) => AsyncIterable<AssistantStreamChunk> {
   return (open) => {
-    capture(open.wireBody)
+    capture(open.requestPlan.wire)
     return stream({
       type: 'delta',
       chunk: {
@@ -246,10 +297,15 @@ async function warmOpenRouterPrivacy(modelId: string) {
 
 beforeEach(async () => {
   await reset()
-  await openDb()
+  await openBrowserWorkspace()
+  await installGenerationProfile(makeProfile(), { 'key-a': 'sk-test' })
+  await installGenerationProfile(makeOpenAiProfile(), { 'key-a': 'sk-test' })
+  await installGenerationProfile(makeGoogleNativeProfile(), { 'key-a': 'sk-test' })
+  await installGenerationProfile(makeAnthropicProfile(), { 'key-a': 'sk-test' })
 })
 
 afterEach(async () => {
+  await shutdownBrowserWorkspace()
   await reset()
 })
 
@@ -270,7 +326,7 @@ describe('almost-live request shape matrix', () => {
     ])
 
     let wire: Record<string, unknown> | undefined
-    await sendText({
+    await executeSend({
       chatId: chat.id,
       connection: makeProfile(),
       apiKey: 'sk-test',
@@ -293,7 +349,7 @@ describe('almost-live request shape matrix', () => {
     expect(wire?.provider).toMatchObject({ data_collection: 'deny' })
   })
 
-  it('sendFromMessage captures the same append/system shape without creating another user turn', async () => {
+  it('executeReply captures the same append/system shape without creating another user turn', async () => {
     const modelId = 'google/gemini-3.1-flash-lite-preview'
     await warmOpenRouterPrivacy(modelId)
     const chat = await createChat({
@@ -308,7 +364,7 @@ describe('almost-live request shape matrix', () => {
     ])
 
     let wire: Record<string, unknown> | undefined
-    await sendFromMessage({
+    await executeReply({
       chatId: chat.id,
       connection: makeProfile(),
       apiKey: 'sk-test',
@@ -343,13 +399,13 @@ describe('almost-live request shape matrix', () => {
     ])
 
     let wire: Record<string, unknown> | undefined
-    await continueAssistantInPlace({
+    await executeContinue({
       chatId: chat.id,
       targetMessageId: requireDefined(assistant, 'seeded assistant').id,
       connection: makeProfile(),
       apiKey: 'sk-test',
       openStream: (open) => {
-        wire = open.wireBody
+        wire = open.requestPlan.wire
         return stream({
           type: 'delta',
           chunk: {
@@ -391,28 +447,48 @@ describe('almost-live request shape matrix', () => {
         },
       }),
     })
-    const [, assistant] = await seedLinearMessages(chat.id, [
+    const [user] = await seedLinearMessages(chat.id, [
       { id: 'prefill-u1', role: 'user', text: LOREM_USER },
-      {
-        id: 'prefill-a1',
-        role: 'assistant',
-        text: LOREM_ASSISTANT,
-        reasoningDetails: [
-          { type: 'reasoning.text', text: 'Visible lorem reasoning.' },
-          { type: 'reasoning.text', text: 'Hidden lorem reasoning.', hidden: true },
-          { type: 'reasoning.encrypted', data: 'opaque-carrier' },
-        ],
-      },
     ])
+    await executeReply({
+      chatId: chat.id,
+      parentMessageId: requireDefined(user, 'seeded user').id,
+      connection: makeProfile(),
+      apiKey: 'sk-test',
+      openStream: () =>
+        stream({
+          type: 'delta',
+          chunk: {
+            id: 'prefill-seed-generation',
+            choices: [
+              {
+                delta: {
+                  content: LOREM_ASSISTANT,
+                  reasoning_details: [
+                    { type: 'reasoning.text', text: 'Visible lorem reasoning.' },
+                    { type: 'reasoning.text', text: 'Hidden lorem reasoning.', hidden: true },
+                    { type: 'reasoning.encrypted', data: 'opaque-carrier' },
+                  ],
+                },
+                finish_reason: 'stop',
+              },
+            ],
+          },
+        }),
+    })
+    const assistant = (await readTestMessages(chat.id)).find(
+      (message) => message.parentId === user?.id && message.role === 'assistant',
+    )
+    expect(assistant?.reasoningEnvelope?.visible).toHaveLength(2)
 
     let wire: Record<string, unknown> | undefined
-    await continueAssistantInPlace({
+    await executeContinue({
       chatId: chat.id,
       targetMessageId: requireDefined(assistant, 'seeded assistant').id,
       connection: makeProfile(),
       apiKey: 'sk-test',
       openStream: (open) => {
-        wire = open.wireBody
+        wire = open.requestPlan.wire
         return stream({
           type: 'delta',
           chunk: {
@@ -437,7 +513,7 @@ describe('almost-live request shape matrix', () => {
     expect(JSON.stringify(wire)).not.toContain('opaque-carrier')
   })
 
-  it('continueAssistantInPlace keeps large continuations out of the IndexedDB hot path', async () => {
+  it('executeContinue keeps large continuations out of the IndexedDB hot path', async () => {
     await warmOpenRouterPrivacy('openai/gpt-4o')
     const chat = await createChat({
       settings: chatSettings({
@@ -455,7 +531,7 @@ describe('almost-live request shape matrix', () => {
     )
     const expectedContinuation = chunks.join('')
 
-    await continueAssistantInPlace({
+    await executeContinue({
       chatId: chat.id,
       targetMessageId: target.id,
       connection: makeProfile(),
@@ -481,15 +557,12 @@ describe('almost-live request shape matrix', () => {
         })(),
     })
 
-    const updated = requireDefined(
-      await getBrowserRepository().getMessage(target.id),
-      'continued assistant',
-    )
+    const updated = requireDefined(await messageFor(target.id), 'continued assistant')
     expect(updated.nodeVersion).toBe(1)
     expect(updated.content).toEqual([
       { type: 'output_text', text: `${LOREM_ASSISTANT}${expectedContinuation}` },
     ])
-    expect(useStreamStore.getState().getLiveSnapshot(chat.id, target.id)).toBeUndefined()
+    expect(attemptController.getTargetSnapshot(chat.id, target.id).liveProjection).toBeUndefined()
   })
 
   it('Responses and Gemini native sends expose valid transport-specific request shapes', async () => {
@@ -508,7 +581,7 @@ describe('almost-live request shape matrix', () => {
     ])
 
     let responsesWire: Record<string, unknown> | undefined
-    await sendText({
+    await executeSend({
       chatId: openAiChat.id,
       connection: makeOpenAiProfile(),
       apiKey: 'sk-test',
@@ -544,7 +617,7 @@ describe('almost-live request shape matrix', () => {
     ])
 
     let geminiWire: Record<string, unknown> | undefined
-    await sendText({
+    await executeSend({
       chatId: geminiChat.id,
       connection: makeGoogleNativeProfile(),
       apiKey: 'sk-test',
@@ -597,16 +670,16 @@ describe('almost-live request shape matrix', () => {
       let route: string | undefined
       let transport: string | undefined
       let geminiModelId: string | undefined
-      await sendText({
+      await executeSend({
         chatId: chat.id,
         connection: input.profile,
         apiKey: 'sk-test',
         content: [{ type: 'text', text: LOREM_FOLLOWUP }],
         openStream: (open) => {
-          wire = open.wireBody
-          route = open.route?.kind
-          transport = open.route?.transport
-          geminiModelId = open.geminiModelId
+          wire = open.requestPlan.wire
+          route = open.requestPlan.kind
+          transport = open.requestPlan.transport
+          geminiModelId = open.requestPlan.geminiModelId
           return stream({
             type: 'delta',
             chunk: {
@@ -784,7 +857,7 @@ describe('almost-live request shape matrix', () => {
     ])
 
     let wire: Record<string, unknown> | undefined
-    await sendText({
+    await executeSend({
       chatId: chat.id,
       connection: makeProfile(),
       apiKey: 'sk-test',
@@ -811,17 +884,17 @@ function requireAt<T>(items: readonly T[], index: number): T {
 }
 
 describe('send action routing', () => {
-  it('sendFromMessage reuses the same privacy/provider selection workflow as normal sends', async () => {
+  it('executeReply reuses the same privacy/provider selection workflow as normal sends', async () => {
     await warmOpenRouterPrivacy('openai/gpt-4o')
     const chat = await createChat({ settings: chatSettings() })
     let initialWire: Record<string, unknown> | undefined
-    await sendText({
+    await executeSend({
       chatId: chat.id,
       connection: makeProfile(),
       apiKey: 'sk-test',
       content: [{ type: 'text', text: 'hello' }],
       openStream: (open) => {
-        initialWire = open.wireBody
+        initialWire = open.requestPlan.wire
         return stream({
           type: 'delta',
           chunk: {
@@ -839,15 +912,20 @@ describe('send action routing', () => {
       rows.find((m) => m.role === 'user'),
       'user message',
     )
+    const assistant = requireDefined(
+      rows.find((m) => m.role === 'assistant'),
+      'assistant message',
+    )
+    expect(assistant.parentId).toBe(user.id)
 
     let seenWire: Record<string, unknown> | undefined
-    await sendFromMessage({
+    await executeRegenerate({
       chatId: chat.id,
       connection: makeProfile(),
       apiKey: 'sk-test',
-      parentMessageId: user.id,
+      targetAssistantId: assistant.id,
       openStream: (open) => {
-        seenWire = open.wireBody
+        seenWire = open.requestPlan.wire
         return stream({
           type: 'delta',
           chunk: {
@@ -867,40 +945,70 @@ describe('send action routing', () => {
     )
   })
 
-  it('sendText applies zero-eligible provider selection before creating the user row', async () => {
+  it('executeSend applies zero-eligible provider selection before creating the user row', async () => {
     const modelId = 'openai/gpt-4o'
-    await putCachedEndpoints('prof', modelId, {
-      id: modelId,
-      endpoints: [
-        {
-          provider_name: 'Only Trainer',
-          supported_parameters: ['temperature'],
-          context_length: 200000,
-          pricing: {},
-        },
-      ],
-    })
-    await putCachedPrivacyPolicy('prof', modelId, {
-      policies: {
-        'Only Trainer': {
-          training: true,
-          trainingOpenRouter: false,
-          retainsPrompts: false,
-          canPublish: false,
-          termsOfServiceURL: '',
-          privacyPolicyURL: '',
-        },
+    const cachedAt = Date.now()
+    await putCachedEndpoints(
+      'prof',
+      modelId,
+      {
+        id: modelId,
+        endpoints: [
+          {
+            provider_name: 'Only Trainer',
+            supported_parameters: ['temperature'],
+            context_length: 200000,
+            pricing: {},
+          },
+        ],
       },
-      fetchedAt: 0,
-    })
+      cachedAt,
+    )
+    await putCachedPrivacyPolicy(
+      'prof',
+      modelId,
+      {
+        policies: {
+          'Only Trainer': {
+            training: true,
+            trainingOpenRouter: false,
+            retainsPrompts: false,
+            canPublish: false,
+            termsOfServiceURL: '',
+            privacyPolicyURL: '',
+          },
+        },
+        fetchedAt: cachedAt,
+      },
+      cachedAt,
+    )
     const chat = await createChat({ settings: chatSettings({ model: modelId }) })
+    const cachedEndpoints = await getCachedEndpoints('prof', modelId)
+    const cachedPrivacy = await getCachedPrivacyPolicy('prof', modelId)
+    expect(cachedEndpoints).toMatchObject({
+      profileId: 'prof',
+      modelId,
+      fetchedAt: cachedAt,
+      payload: { id: modelId, endpoints: [{ provider_name: 'Only Trainer' }] },
+    })
+    expect(cachedPrivacy).toMatchObject({
+      profileId: 'prof',
+      modelId,
+      fetchedAt: cachedAt,
+      payload: { policies: { 'Only Trainer': { training: true } } },
+    })
+    expect(cachedEndpoints?.profileRevision).toBe(cachedPrivacy?.profileRevision)
 
-    await expect(
-      sendText({
+    const handle = await startControlledGeneration(
+      {
+        kind: 'send',
         chatId: chat.id,
-        connection: makeProfile(),
-        apiKey: 'sk-test',
+        expectedLeafId: null,
         content: [{ type: 'text', text: 'hello' }],
+      },
+      {
+        profile: makeProfile(),
+        keyMaterial: { 'key-a': 'sk-test' },
         openStream: () =>
           stream({
             type: 'delta',
@@ -909,14 +1017,16 @@ describe('send action routing', () => {
               choices: [{ delta: { content: 'nope' }, finish_reason: 'stop' }],
             },
           }),
-      }),
-    ).rejects.toThrow('No eligible providers can serve this request.')
+      },
+    )
+    await expect(handle.prepared).rejects.toThrow('No eligible providers can serve this request.')
+    await expect(handle.completed).resolves.toMatchObject({ outcome: 'error' })
 
     expect(useUiStore.getState().zeroEligibleChatId).toBe(chat.id)
     expect(await messagesFor(chat.id)).toEqual([])
   })
 
-  it('continueAssistantInPlace does not add the original system prompt when the template has no placeholder in double-assistant mode', async () => {
+  it('executeContinue does not add the original system prompt when the template has no placeholder in double-assistant mode', async () => {
     await warmOpenRouterPrivacy('openai/gpt-4o')
     const chat = await createChat({
       settings: chatSettings({
@@ -925,7 +1035,7 @@ describe('send action routing', () => {
         continueUserPrompt: '',
       }),
     })
-    await sendText({
+    await executeSend({
       chatId: chat.id,
       connection: makeProfile(),
       apiKey: 'sk-test',
@@ -946,13 +1056,13 @@ describe('send action routing', () => {
     )
 
     let seenWire: Record<string, unknown> | undefined
-    await continueAssistantInPlace({
+    await executeContinue({
       chatId: chat.id,
       targetMessageId: assistant.id,
       connection: makeProfile(),
       apiKey: 'sk-test',
       openStream: (open) => {
-        seenWire = open.wireBody
+        seenWire = open.requestPlan.wire
         return stream({
           type: 'delta',
           chunk: {
@@ -1009,14 +1119,14 @@ describe('send action routing', () => {
       ])
     }
     expect(JSON.stringify(seenWire)).not.toContain('ORIGINAL SYSTEM PROMPT SHOULD NOT APPEAR')
-    const updated = await getBrowserRepository().getMessage(assistant.id)
+    const updated = await messageFor(assistant.id)
     expect(updated?.content).toEqual([{ type: 'output_text', text: 'partial more' }])
     expect(updated?.originalCharCount).toBe('partial'.length)
     expect(updated?.charCountDelta).toBe(' more'.length)
     expect(updated?.cachedTokenEstimate).toBeGreaterThan(0)
   })
 
-  it('continueAssistantInPlace expands [SYSTEM_PROMPT] verbatim inside the system template', async () => {
+  it('executeContinue expands [SYSTEM_PROMPT] verbatim inside the system template', async () => {
     await warmOpenRouterPrivacy('openai/gpt-4o')
     const chat = await createChat({
       settings: chatSettings({
@@ -1026,7 +1136,7 @@ describe('send action routing', () => {
         continueUserPrompt: '',
       }),
     })
-    await sendText({
+    await executeSend({
       chatId: chat.id,
       connection: makeProfile(),
       apiKey: 'sk-test',
@@ -1047,13 +1157,13 @@ describe('send action routing', () => {
     )
 
     let seenWire: Record<string, unknown> | undefined
-    await continueAssistantInPlace({
+    await executeContinue({
       chatId: chat.id,
       targetMessageId: assistant.id,
       connection: makeProfile(),
       apiKey: 'sk-test',
       openStream: (open) => {
-        seenWire = open.wireBody
+        seenWire = open.requestPlan.wire
         return stream({
           type: 'delta',
           chunk: {
@@ -1078,7 +1188,7 @@ describe('send action routing', () => {
     }
   })
 
-  it('continueAssistantInPlace supports a synthetic user prompt with no system prompt when the template is blank', async () => {
+  it('executeContinue supports a synthetic user prompt with no system prompt when the template is blank', async () => {
     await warmOpenRouterPrivacy('openai/gpt-4o')
     const chat = await createChat({
       settings: chatSettings({
@@ -1087,7 +1197,7 @@ describe('send action routing', () => {
         continueUserPrompt: 'Now only continue the last assistant message.',
       }),
     })
-    await sendText({
+    await executeSend({
       chatId: chat.id,
       connection: makeProfile(),
       apiKey: 'sk-test',
@@ -1108,13 +1218,13 @@ describe('send action routing', () => {
     )
 
     let seenWire: Record<string, unknown> | undefined
-    await continueAssistantInPlace({
+    await executeContinue({
       chatId: chat.id,
       targetMessageId: assistant.id,
       connection: makeProfile(),
       apiKey: 'sk-test',
       openStream: (open) => {
-        seenWire = open.wireBody
+        seenWire = open.requestPlan.wire
         return stream({
           type: 'delta',
           chunk: {
@@ -1174,11 +1284,11 @@ describe('send action routing', () => {
       'Continue exactly from the last assistant message.',
     )
     expect(JSON.stringify(seenWire)).not.toContain('ORIGINAL SYSTEM PROMPT SHOULD APPEAR')
-    const updated = await getBrowserRepository().getMessage(assistant.id)
+    const updated = await messageFor(assistant.id)
     expect(updated?.content).toEqual([{ type: 'output_text', text: 'partial more' }])
   })
 
-  it('continueAssistantInPlace prefill mode skips continue prompts without auto-configuring settings', async () => {
+  it('executeContinue prefill mode skips continue prompts without auto-configuring settings', async () => {
     const modelId = 'z-ai/glm-5.1'
     await putCachedEndpoints('prof', modelId, {
       id: modelId,
@@ -1229,7 +1339,7 @@ describe('send action routing', () => {
       }),
     })
 
-    await sendText({
+    await executeSend({
       chatId: chat.id,
       connection: makeProfile(),
       apiKey: 'sk-test',
@@ -1250,13 +1360,13 @@ describe('send action routing', () => {
     )
 
     let seenWire: Record<string, unknown> | undefined
-    await continueAssistantInPlace({
+    await executeContinue({
       chatId: chat.id,
       targetMessageId: assistant.id,
       connection: makeProfile(),
       apiKey: 'sk-test',
       openStream: (open) => {
-        seenWire = open.wireBody
+        seenWire = open.requestPlan.wire
         return stream({
           type: 'delta',
           chunk: {
@@ -1277,12 +1387,12 @@ describe('send action routing', () => {
     expect(JSON.stringify(seenWire)).not.toContain('CONTINUE USER PROMPT SHOULD NOT APPEAR')
     expect((seenWire as { reasoning?: unknown }).reasoning).toBeUndefined()
     expect((seenWire as { provider?: { only?: string[] } }).provider?.only).toBeUndefined()
-    const storedChat = await getBrowserRepository().getChat(chat.id)
+    const storedChat = await getChat(chat.id)
     expect(storedChat?.settings.reasoning.mode).toBe('default')
     expect(storedChat?.settings.providerPrefs?.only).toBeUndefined()
     const finalRows = await messagesFor(chat.id)
     expect(finalRows.filter((m) => m.role === 'assistant')).toHaveLength(1)
-    expect((await getBrowserRepository().getMessage(assistant.id))?.content).toEqual([
+    expect((await messageFor(assistant.id))?.content).toEqual([
       { type: 'output_text', text: 'partial more' },
     ])
   })

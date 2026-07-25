@@ -1,11 +1,7 @@
 import { useEffect, useState } from 'react'
-import {
-  type Announcement,
-  type AnnouncementPriority,
-  useAnnouncementStore,
-} from '../../store/zustand/announcementStore'
+import type { Announcement, AnnouncementPriority } from '../../store/presentation-contracts'
+import { useAnnouncementStore } from '../../store/zustand/announcementStore'
 
-const ANNOUNCEMENT_REVEAL_DELAY_MS = 40
 const ANNOUNCEMENT_DWELL_MS = 1_000
 
 function LiveRegionLane({
@@ -21,17 +17,20 @@ function LiveRegionLane({
   useEffect(() => {
     setSpokenText('')
     if (!announcement) return
-    const revealTimer = window.setTimeout(
-      () => setSpokenText(announcement.text),
-      ANNOUNCEMENT_REVEAL_DELAY_MS,
-    )
-    const consumeTimer = window.setTimeout(
-      () => consume(priority, announcement.id),
-      ANNOUNCEMENT_REVEAL_DELAY_MS + ANNOUNCEMENT_DWELL_MS,
-    )
+    let disposed = false
+    let consumeTimer: number | null = null
+    const revealFrame = window.requestAnimationFrame(() => {
+      if (disposed) return
+      setSpokenText(announcement.text)
+      consumeTimer = window.setTimeout(
+        () => consume(priority, announcement.id),
+        ANNOUNCEMENT_DWELL_MS,
+      )
+    })
     return () => {
-      window.clearTimeout(revealTimer)
-      window.clearTimeout(consumeTimer)
+      disposed = true
+      window.cancelAnimationFrame(revealFrame)
+      if (consumeTimer !== null) window.clearTimeout(consumeTimer)
     }
   }, [announcement, consume, priority])
 

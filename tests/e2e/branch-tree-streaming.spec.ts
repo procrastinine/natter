@@ -3,7 +3,7 @@ import {
   type FakeStreamScenarioSnapshot,
   retargetOnlyProfileToFakeProvider,
 } from './fake-stream-provider'
-import { expect, test } from './fixtures'
+import { createChatUiJourneyProfile, expect, test } from './fixtures'
 import {
   clearIndexedDb,
   createChatAndOpen,
@@ -21,6 +21,7 @@ test.beforeEach(async ({ page }) => {
 
 test('switching to the tree during a stream does not stop or lose the generation', async ({
   page,
+  uiJourney,
 }) => {
   const scenario = await createFakeStreamScenario({
     targetChars: 12_000,
@@ -43,8 +44,65 @@ test('switching to the tree during a stream does not stop or lose the generation
     if (!streamTargetId) throw new Error('Streaming assistant has no message id')
     await expect(page.getByRole('button', { name: 'Stop generating' })).toBeVisible()
 
+    const expectedUrl = page.url()
+    const transcriptScroll = page.locator('[data-ui="scroll-region"]')
+    const journeyProfile = createChatUiJourneyProfile()
+    await uiJourney.start(
+      page,
+      {
+        ...journeyProfile,
+        semanticNodes: [
+          ...(journeyProfile.semanticNodes ?? []),
+          {
+            id: 'retained-transcript-list',
+            selector: '[data-ui="message-list"]',
+            preserveIdentity: true,
+            requireVisible: false,
+            resetOnRouteChange: false,
+          },
+          {
+            id: 'retained-terminal-message',
+            selector: `[data-ui="message"][data-message-id="${streamTargetId}"]`,
+            preserveIdentity: true,
+            requireVisible: false,
+            attributes: {
+              'data-message-id': { kind: 'exact', value: streamTargetId },
+            },
+            resetOnRouteChange: false,
+          },
+        ],
+      },
+      'branch-tree-streaming',
+    )
+    await expect(transcriptScroll).toHaveAttribute('data-scroll-state', 'follow')
+    await expect
+      .poll(() =>
+        transcriptScroll.evaluate((node) => node.scrollHeight - node.scrollTop - node.clientHeight),
+      )
+      .toBeLessThanOrEqual(4)
+    await uiJourney.intent(page, {
+      kind: 'follow-bottom',
+      id: 'open-tree-first-scroll',
+      scrollSelector: '[data-ui="scroll-region"]',
+      tolerancePx: 4,
+    })
+    await uiJourney.intent(page, {
+      kind: 'gesture',
+      id: 'open-tree-first',
+      targetSelector: '[data-role="chat-branch-tree"]',
+      outcome: { selector: '[data-ui="branch-tree-view"]' },
+    })
     await page.locator('[data-role="chat-branch-tree"]').click()
     await expect(page.locator('[data-ui="branch-tree-view"]')).toBeVisible()
+    await uiJourney.checkpoint(page, 'tree-open-first')
+    await expect(page).toHaveURL(expectedUrl)
+    const treeScroll = page.locator('[data-ui="branch-tree-scroll"]')
+    const inspectorScroll = page.locator('[data-ui="branch-tree-inspector-scroll"]')
+    await expect(treeScroll).toHaveCSS('overflow-x', 'scroll')
+    await expect(treeScroll).toHaveCSS('overflow-y', 'scroll')
+    await expect(treeScroll).toHaveCSS('scrollbar-gutter', 'stable')
+    await expect(inspectorScroll).toHaveCSS('overflow-y', 'scroll')
+    await expect(inspectorScroll).toHaveCSS('scrollbar-gutter', 'stable')
     const streamingNode = page.locator(
       `[data-ui="branch-tree-node"][data-message-id="${streamTargetId}"]`,
     )
@@ -70,12 +128,44 @@ test('switching to the tree during a stream does not stop or lose the generation
     await expect(page.getByRole('button', { name: 'Delete message' })).toBeDisabled()
     await expect(page.locator('[data-connector-hit][data-stream-busy="true"]')).not.toHaveCount(0)
 
+    await uiJourney.intent(page, {
+      kind: 'acquire-bottom',
+      id: 'return-to-transcript-first-scroll',
+      scrollSelector: '[data-ui="scroll-region"]',
+      tolerancePx: 4,
+    })
+    await uiJourney.intent(page, {
+      kind: 'gesture',
+      id: 'return-to-transcript-first',
+      targetSelector: '[data-role="chat-branch-tree"]',
+      outcome: { selector: '[data-ui="message-list"]' },
+    })
     await page.locator('[data-role="chat-branch-tree"]').click()
     await expect(
       page.locator(`[data-ui="message"][data-message-id="${streamTargetId}"]`),
     ).toBeVisible()
     await expect(page.getByRole('button', { name: 'Stop generating' })).toBeVisible()
+    await expect(transcriptScroll).toHaveAttribute('data-scroll-state', 'follow')
+    await expect
+      .poll(() =>
+        transcriptScroll.evaluate((node) => node.scrollHeight - node.scrollTop - node.clientHeight),
+      )
+      .toBeLessThanOrEqual(4)
+    await uiJourney.checkpoint(page, 'transcript-return-first')
+    await expect(page).toHaveURL(expectedUrl)
 
+    await uiJourney.intent(page, {
+      kind: 'follow-bottom',
+      id: 'open-tree-second-scroll',
+      scrollSelector: '[data-ui="scroll-region"]',
+      tolerancePx: 4,
+    })
+    await uiJourney.intent(page, {
+      kind: 'gesture',
+      id: 'open-tree-second',
+      targetSelector: '[data-role="chat-branch-tree"]',
+      outcome: { selector: '[data-ui="branch-tree-view"]' },
+    })
     await page.locator('[data-role="chat-branch-tree"]').click()
     await expect(streamingNode).toHaveAttribute('data-selected', 'true')
     await expect(page.locator('[data-ui="branch-tree-inspector"]')).toHaveAttribute(
@@ -91,13 +181,38 @@ test('switching to the tree during a stream does not stop or lose the generation
       )
       .toBeGreaterThan(0)
     await expect(page.locator('[data-ui="branch-tree-stop"]')).toBeVisible()
+    await uiJourney.checkpoint(page, 'tree-open-second')
+    await expect(page).toHaveURL(expectedUrl)
 
     await waitForAssistantGenerationFinished(page, chatId)
     await expect.poll(() => scenario.snapshot().then((state) => state.activeStreams)).toBe(0)
     expect(generationRequests(await scenario.snapshot())).toHaveLength(1)
 
+    await uiJourney.intent(page, {
+      kind: 'acquire-bottom',
+      id: 'return-to-transcript-final-scroll',
+      scrollSelector: '[data-ui="scroll-region"]',
+      tolerancePx: 4,
+    })
+    await uiJourney.intent(page, {
+      kind: 'gesture',
+      id: 'return-to-transcript-final',
+      targetSelector: '[data-role="chat-branch-tree"]',
+      outcome: { selector: '[data-ui="message-list"]' },
+    })
     await page.locator('[data-role="chat-branch-tree"]').click()
     await expect(page.locator('[data-ui="message-list"]')).toBeVisible()
+    await expect(
+      page.locator(`[data-ui="message"][data-message-id="${streamTargetId}"]`),
+    ).toBeVisible()
+    await expect(transcriptScroll).toHaveAttribute('data-scroll-state', 'follow')
+    await expect
+      .poll(() =>
+        transcriptScroll.evaluate((node) => node.scrollHeight - node.scrollTop - node.clientHeight),
+      )
+      .toBeLessThanOrEqual(4)
+    await uiJourney.checkpoint(page, 'transcript-return-final')
+    await expect(page).toHaveURL(expectedUrl)
     const persisted = assistantLengths(await readMessages(page, chatId))
     expect(persisted).toEqual({ text: 12_000, reasoning: 12_000 })
   } finally {
@@ -120,17 +235,21 @@ function assistantLengths(rows: Array<Record<string, unknown>>): {
   const content = Array.isArray(assistant.content)
     ? (assistant.content as Array<{ text?: unknown }>)
     : []
-  const reasoningDetails = Array.isArray(assistant.reasoningDetails)
-    ? (assistant.reasoningDetails as Array<{ text?: unknown; summary?: unknown }>)
+  const reasoningEnvelope =
+    typeof assistant.reasoningEnvelope === 'object' && assistant.reasoningEnvelope !== null
+      ? (assistant.reasoningEnvelope as { visible?: unknown })
+      : null
+  const visibleReasoning = Array.isArray(reasoningEnvelope?.visible)
+    ? (reasoningEnvelope.visible as Array<{ text?: unknown }>)
     : []
   return {
     text: content.reduce(
       (sum, item) => sum + (typeof item.text === 'string' ? item.text.length : 0),
       0,
     ),
-    reasoning: reasoningDetails.reduce((sum, item) => {
-      const value = typeof item.text === 'string' ? item.text : item.summary
-      return sum + (typeof value === 'string' ? value.length : 0)
-    }, 0),
+    reasoning: visibleReasoning.reduce(
+      (sum, item) => sum + (typeof item.text === 'string' ? item.text.length : 0),
+      0,
+    ),
   }
 }

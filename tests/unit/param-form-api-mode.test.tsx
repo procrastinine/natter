@@ -1,19 +1,28 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { createChat } from '../helpers/chats'
 import 'fake-indexeddb/auto'
 import Dexie from 'dexie'
 import { IDBFactory } from 'fake-indexeddb'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { resolveBundledCapability } from '../../src/capabilities'
+import { resolveAssistantRouteContract } from '../../src/core/api-choice'
 import {
+  type EffectiveCapability,
   effectiveCapabilityFromDescriptor,
   effectiveCapabilityFromEndpoints,
 } from '../../src/core/capabilities'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
+import { mergeMessageContextRouteFacts, messageContextRouteFacts } from '../../src/core/reasoning'
 import type { ConnectionProfile, Message, ModelEndpoint } from '../../src/core/types'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
-import { createChat, getChat } from '../../src/store/chats'
-import { __resetDbForTests, openDb } from '../../src/store/db'
+import {
+  openBrowserWorkspace,
+  shutdownBrowserWorkspace,
+} from '../../src/store/browser-workspace-lifecycle'
+import { getChat } from '../../src/store/chats'
+import { __resetDbForTests } from '../../src/store/db'
 import { ApiModeSection, ReasoningIncludeControls } from '../../src/ui/settings/ParamForm'
+import { reasoningEnvelopeFromDetailsForTest } from '../helpers/reasoning-events'
 
 const DB_NAME = 'natter'
 
@@ -45,6 +54,20 @@ function makeProfile(kind: ConnectionProfile['kind']): ConnectionProfile {
   }
 }
 
+function routeFor(
+  chat: Awaited<ReturnType<typeof createChat>>,
+  capability: EffectiveCapability,
+  profile: ConnectionProfile,
+  messages: readonly Message[] = [],
+) {
+  return resolveAssistantRouteContract(
+    profile,
+    chat.settings,
+    mergeMessageContextRouteFacts(messages.map((message) => messageContextRouteFacts(message))),
+    capability,
+  )
+}
+
 async function resetAll() {
   __resetBroadcastForTests()
   __resetDbForTests()
@@ -54,10 +77,11 @@ async function resetAll() {
 beforeEach(async () => {
   ;(globalThis as unknown as { indexedDB: IDBFactory }).indexedDB = new IDBFactory()
   await resetAll()
-  await openDb()
+  await openBrowserWorkspace()
 })
 
 afterEach(async () => {
+  await shutdownBrowserWorkspace()
   await resetAll()
 })
 
@@ -69,8 +93,14 @@ describe('ApiModeSection — two-button toggle', () => {
     settings.model = 'openai/gpt-5.4-nano'
     const chat = await createChat({ settings })
     const capability = effectiveCapabilityFromEndpoints(settings.model, [makeEndpoint()])
+    const profile = makeProfile('openrouter')
     render(
-      <ApiModeSection chat={chat} capability={capability} profile={makeProfile('openrouter')} />,
+      <ApiModeSection
+        chat={chat}
+        capability={capability}
+        profile={profile}
+        routing={routeFor(chat, capability, profile)}
+      />,
     )
     const chatBtn = screen.getByRole('button', { name: 'Chat completions' })
     const responsesBtn = screen.getByRole('button', { name: 'Responses' })
@@ -90,8 +120,14 @@ describe('ApiModeSection — two-button toggle', () => {
     const capability = effectiveCapabilityFromEndpoints(settings.model, [
       makeEndpoint({ supported_parameters: ['reasoning'] }),
     ])
+    const profile = makeProfile('openrouter')
     const { container } = render(
-      <ApiModeSection chat={chat} capability={capability} profile={makeProfile('openrouter')} />,
+      <ApiModeSection
+        chat={chat}
+        capability={capability}
+        profile={profile}
+        routing={routeFor(chat, capability, profile)}
+      />,
     )
     expect(container.querySelector('[data-ui-section="api-mode"]')).toBeNull()
     expect(screen.queryByRole('button', { name: 'Text completions' })).toBeNull()
@@ -104,8 +140,14 @@ describe('ApiModeSection — two-button toggle', () => {
     const capability = effectiveCapabilityFromEndpoints(settings.model, [
       makeEndpoint({ provider_name: 'Nebius', supported_parameters: ['provider', 'max_tokens'] }),
     ])
+    const profile = makeProfile('openrouter')
     render(
-      <ApiModeSection chat={chat} capability={capability} profile={makeProfile('openrouter')} />,
+      <ApiModeSection
+        chat={chat}
+        capability={capability}
+        profile={profile}
+        routing={routeFor(chat, capability, profile)}
+      />,
     )
     fireEvent.click(screen.getByRole('button', { name: 'Text completions' }))
     await waitFor(async () => {
@@ -122,7 +164,15 @@ describe('ApiModeSection — two-button toggle', () => {
     const capability = effectiveCapabilityFromEndpoints(settings.model, [
       makeEndpoint({ supported_parameters: ['reasoning'] }),
     ])
-    render(<ApiModeSection chat={chat} capability={capability} profile={makeProfile('google')} />)
+    const profile = makeProfile('google')
+    render(
+      <ApiModeSection
+        chat={chat}
+        capability={capability}
+        profile={profile}
+        routing={routeFor(chat, capability, profile)}
+      />,
+    )
     expect(screen.getByRole('button', { name: 'Native' }).getAttribute('aria-pressed')).toBe('true')
     fireEvent.click(screen.getByRole('button', { name: 'OpenAI-compat' }))
     await waitFor(async () => {
@@ -139,8 +189,14 @@ describe('ApiModeSection — two-button toggle', () => {
     const capability = effectiveCapabilityFromEndpoints(settings.model, [
       makeEndpoint({ supported_parameters: ['tools'] }),
     ])
+    const profile = makeProfile('anthropic')
     render(
-      <ApiModeSection chat={chat} capability={capability} profile={makeProfile('anthropic')} />,
+      <ApiModeSection
+        chat={chat}
+        capability={capability}
+        profile={profile}
+        routing={routeFor(chat, capability, profile)}
+      />,
     )
     expect(screen.getByRole('button', { name: 'Messages' }).getAttribute('aria-pressed')).toBe(
       'true',
@@ -160,8 +216,14 @@ describe('ApiModeSection — two-button toggle', () => {
     settings.model = 'openai/gpt-5.3'
     const chat = await createChat({ settings })
     const capability = effectiveCapabilityFromEndpoints(settings.model, [makeEndpoint()])
+    const profile = makeProfile('openrouter')
     render(
-      <ApiModeSection chat={chat} capability={capability} profile={makeProfile('openrouter')} />,
+      <ApiModeSection
+        chat={chat}
+        capability={capability}
+        profile={profile}
+        routing={routeFor(chat, capability, profile)}
+      />,
     )
     fireEvent.click(screen.getByRole('button', { name: 'Chat completions' }))
     await waitFor(async () => {
@@ -178,6 +240,7 @@ describe('ApiModeSection — two-button toggle', () => {
     settings.model = 'openai/gpt-5.4-nano'
     const chat = await createChat({ settings })
     const capability = effectiveCapabilityFromEndpoints(settings.model, [makeEndpoint()])
+    const profile = makeProfile('openrouter')
     const originalConfirm = window.confirm
     let prompted = false
     window.confirm = () => {
@@ -186,7 +249,12 @@ describe('ApiModeSection — two-button toggle', () => {
     }
     try {
       render(
-        <ApiModeSection chat={chat} capability={capability} profile={makeProfile('openrouter')} />,
+        <ApiModeSection
+          chat={chat}
+          capability={capability}
+          profile={profile}
+          routing={routeFor(chat, capability, profile)}
+        />,
       )
       fireEvent.click(screen.getByRole('button', { name: 'Chat completions' }))
       await waitFor(async () => {
@@ -218,21 +286,25 @@ describe('ApiModeSection — two-button toggle', () => {
         content: [{ type: 'output_text', text: 'hi' }],
         nodeVersion: 0,
         deleted: false,
-        reasoningDetails: [
-          {
-            type: 'reasoning.encrypted',
-            data: 'opaque',
-            format: 'openai-responses-v1',
-          },
-        ],
+        reasoningEnvelope: reasoningEnvelopeFromDetailsForTest(
+          [
+            {
+              type: 'reasoning.encrypted',
+              data: 'opaque',
+              format: 'openai-responses-v1',
+            },
+          ],
+          'openai-responses',
+        ),
       },
     ]
+    const profile = makeProfile('openrouter')
     render(
       <ApiModeSection
         chat={chat}
         capability={capability}
-        profile={makeProfile('openrouter')}
-        activePathMessages={path}
+        profile={profile}
+        routing={routeFor(chat, capability, profile, path)}
       />,
     )
     const chatBtn = screen.getByRole('button', { name: 'Chat completions' })

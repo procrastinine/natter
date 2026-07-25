@@ -28,6 +28,8 @@ interface ChatCompletionDeltaWire {
   reasoning?: string | null
   reasoning_details?: unknown[]
   tool_calls?: unknown[]
+  annotations?: unknown[]
+  citations?: unknown[]
   [extra: string]: unknown
 }
 
@@ -40,6 +42,8 @@ interface ChatCompletionMessageWire {
   reasoning?: string | null
   reasoning_details?: unknown[]
   tool_calls?: unknown[]
+  annotations?: unknown[]
+  citations?: unknown[]
   [extra: string]: unknown
 }
 
@@ -72,6 +76,7 @@ export interface ChatCompletionChunkWire {
   choices?: ChatCompletionChoiceWire[]
   usage?: ChatCompletionUsageWire
   error?: ChatCompletionErrorWire
+  citations?: unknown[]
   [extra: string]: unknown
 }
 
@@ -82,6 +87,7 @@ export interface ChatCompletionResultWire {
   choices?: ChatCompletionChoiceWire[]
   usage?: ChatCompletionUsageWire
   error?: ChatCompletionErrorWire
+  citations?: unknown[]
   [extra: string]: unknown
 }
 

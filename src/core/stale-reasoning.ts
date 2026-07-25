@@ -5,9 +5,9 @@
 // a "retry without preserved reasoning" recovery flow.
 //
 // Patterns come from live probes against OpenAI and Gemini direct, plus the
-// generic "upstream 400 while reasoning_details were being sent" fallback.
+// generic "upstream 400 while preserved reasoning was sent" fallback.
 
-import type { ApiError } from '../api/errors'
+import type { PersistedReasoningCarryForward } from './types'
 
 type StaleReasoningProvider = 'openai' | 'gemini' | 'generic'
 
@@ -24,7 +24,7 @@ const GEMINI_PATTERNS = [
 
 export function detectStaleReasoning(
   error: { message?: string; statusCode?: number } | null | undefined,
-  opts: { hadReasoningDetails?: boolean } = {},
+  reasoningCarryForward: PersistedReasoningCarryForward = 'unknown',
 ): StaleReasoningProvider | null {
   if (!error) return null
   const msg = error.message ?? ''
@@ -34,29 +34,13 @@ export function detectStaleReasoning(
   for (const re of GEMINI_PATTERNS) {
     if (re.test(msg)) return 'gemini'
   }
-  // Generic 400 while reasoning_details were being sent. Only classify
-  // this way when the caller signals reasoning was in flight; otherwise
-  // every unrelated bad-request would trip the banner.
-  if (error.statusCode === 400 && opts.hadReasoningDetails === true) {
+  if (
+    error.statusCode === 400 &&
+    (reasoningCarryForward === 'visible-only' || reasoningCarryForward === 'carrier')
+  ) {
     return 'generic'
   }
   return null
-}
-
-// Version that takes an ApiError directly. Thin convenience wrapper so call
-// sites don't have to destructure the httpStatus themselves.
-export function detectStaleReasoningFromApiError(
-  error: ApiError | undefined,
-  opts: { hadReasoningDetails?: boolean } = {},
-): StaleReasoningProvider | null {
-  if (!error) return null
-  return detectStaleReasoning(
-    {
-      message: error.message,
-      ...(error.httpStatus !== undefined ? { statusCode: error.httpStatus } : {}),
-    },
-    opts,
-  )
 }
 
 export function staleReasoningBannerText(provider: StaleReasoningProvider): string {

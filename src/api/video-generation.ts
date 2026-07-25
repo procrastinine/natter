@@ -1,10 +1,17 @@
+import { generatedVideoJobSnapshot } from '../core/generated-output-localization'
 import type { ConnectionProfile } from '../core/types'
+import {
+  logStreamDebug,
+  logStreamDebugError,
+  logStreamDebugRequestAttempt,
+  type StreamDebugTrace,
+} from '../lib/debug-streams'
 import {
   type ApiKeyDispatchContext,
   buildHeaders,
-  fetchWithApiKeyFallback,
+  dispatchProviderJsonRequest,
   fetchWithTimeout,
-  hasExplicitAuthHeaderOverride,
+  type ProviderDispatchResult,
   readErrorResponseJson,
 } from './client'
 import { deferAdapterRequest } from './deferred-request'
@@ -43,18 +50,19 @@ interface VideoOutputMetadata {
 
 interface VideoPollContext {
   profile: ConnectionProfile
+  debugTrace: StreamDebugTrace | null
+  overrideHeaders?: Record<string, string>
   signal?: AbortSignal
   timeoutMs?: number
 }
 
-const POLL_INTERVAL_MS = 10_000
-const VIDEO_FAILURE_MESSAGES: Readonly<Record<string, string>> = {
-  failed: 'Video generation failed.',
-  cancelled: 'Video generation was cancelled.',
-  canceled: 'Video generation was canceled.',
-  expired: 'Video generation expired.',
+interface PostedVideoGeneration {
+  job: VideoGenerationJobWire
+  apiKey: string
+  debugTrace: StreamDebugTrace | null
 }
 
+const POLL_INTERVAL_MS = 10_000
 function videoGenerationUrl(profile: ConnectionProfile): string {
   const base = profile.baseUrl.replace(/\/+$/, '')
   return `${base}/videos`
@@ -68,68 +76,104 @@ function postVideoGeneration(
   ctx: VideoGenerationContext,
   req: VideoGenerationRequestWire,
   opts: CallOpts,
-): Promise<{ job: VideoGenerationJobWire; apiKey: string }> {
-  return postVideoGenerationSerialized(ctx, JSON.stringify(req), opts)
-}
-
-function postVideoGenerationSerialized(
-  ctx: VideoGenerationContext,
-  body: string,
-  opts: CallOpts,
-): Promise<{ job: VideoGenerationJobWire; apiKey: string }> {
-  const url = videoGenerationUrl(ctx.profile)
-  const authCtx = hasExplicitAuthHeaderOverride(ctx.profile, undefined, 'Authorization')
-    ? { apiKey: ctx.apiKey }
-    : ctx
-  const fetched = fetchWithApiKeyFallback(
-    authCtx,
-    (candidateApiKey) => {
-      const headers = buildHeaders(ctx.profile, candidateApiKey, { method: 'POST' })
-      return { url, init: { method: 'POST', headers, body } }
-    },
-    {
-      ...(opts.signal ? { signal: opts.signal } : {}),
-      ...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
-    },
+): Promise<PostedVideoGeneration> {
+  return finishVideoPost(
+    dispatchProviderJsonRequest({
+      adapter: 'video-generation',
+      context: ctx,
+      url: videoGenerationUrl(ctx.profile),
+      request: req,
+      opts,
+      authHeaderName: 'Authorization',
+    }),
   )
-  return finishVideoPost(fetched)
 }
 
 async function finishVideoPost(
-  fetched: ReturnType<typeof fetchWithApiKeyFallback>,
-): Promise<{ job: VideoGenerationJobWire; apiKey: string }> {
-  const { response, apiKey } = await fetched
-  if (!response.ok) {
-    throw normalizeError(await readJsonResponse(response), {
-      midStream: false,
-      httpStatus: response.status,
-    })
+  dispatched: Promise<ProviderDispatchResult>,
+): Promise<PostedVideoGeneration> {
+  const { response, selectedApiKey, debugTrace } = await dispatched
+  try {
+    const job = await decodeProviderJson<VideoGenerationJobWire>(response)
+    if (debugTrace) {
+      logStreamDebug(debugTrace, 'frame', () => ({
+        phase: 'dispatch',
+        status: generatedVideoJobSnapshot(job).status,
+      }))
+    }
+    return { job, apiKey: selectedApiKey, debugTrace }
+  } catch (error) {
+    if (debugTrace) logStreamDebugError(debugTrace, error, { phase: 'dispatch' })
+    throw error
   }
-  return { job: await decodeProviderJson<VideoGenerationJobWire>(response), apiKey }
 }
 
 async function getVideoGeneration(
   ctx: VideoPollContext,
   pollingUrl: string,
   apiKey: string,
-  opts: CallOpts,
+  attemptIndex: number,
 ): Promise<VideoGenerationJobWire> {
-  const headers = buildHeaders(ctx.profile, apiKey, { method: 'GET' })
-  const response = await fetchWithTimeout(
-    pollingUrl,
-    { method: 'GET', headers },
-    {
-      ...(opts.signal ? { signal: opts.signal } : {}),
-      ...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
-    },
-  )
-  if (!response.ok) {
-    throw normalizeError(await readJsonResponse(response), {
-      midStream: false,
-      httpStatus: response.status,
+  const headers = buildHeaders(ctx.profile, apiKey, {
+    method: 'GET',
+    ...(ctx.overrideHeaders ? { overrideHeaders: ctx.overrideHeaders } : {}),
+  })
+  if (ctx.debugTrace) {
+    logStreamDebugRequestAttempt(ctx.debugTrace, {
+      url: pollingUrl,
+      headers,
+      attemptIndex,
+      phase: 'poll',
     })
   }
-  return decodeProviderJson<VideoGenerationJobWire>(response)
+  let errorLogged = false
+  try {
+    const response = await fetchWithTimeout(
+      pollingUrl,
+      { method: 'GET', headers },
+      {
+        ...(ctx.signal ? { signal: ctx.signal } : {}),
+        ...(ctx.timeoutMs !== undefined ? { timeoutMs: ctx.timeoutMs } : {}),
+      },
+    )
+    if (ctx.debugTrace) {
+      logStreamDebug(ctx.debugTrace, 'response-head', {
+        phase: 'poll',
+        attemptIndex,
+        status: response.status,
+        contentType: response.headers.get('content-type'),
+      })
+    }
+    if (!response.ok) {
+      const errorBody = await readJsonResponse(response)
+      if (ctx.debugTrace) {
+        logStreamDebug(ctx.debugTrace, 'error', {
+          phase: 'poll',
+          attemptIndex,
+          status: response.status,
+          body: errorBody,
+        })
+        errorLogged = true
+      }
+      throw normalizeError(errorBody, {
+        midStream: false,
+        httpStatus: response.status,
+      })
+    }
+    const job = await decodeProviderJson<VideoGenerationJobWire>(response)
+    if (ctx.debugTrace) {
+      logStreamDebug(ctx.debugTrace, 'poll', () => ({
+        attemptIndex,
+        status: generatedVideoJobSnapshot(job).status,
+      }))
+    }
+    return job
+  } catch (error) {
+    if (ctx.debugTrace && !errorLogged) {
+      logStreamDebugError(ctx.debugTrace, error, { phase: 'poll', attemptIndex })
+    }
+    throw error
+  }
 }
 
 export function videoGeneration(
@@ -139,50 +183,60 @@ export function videoGeneration(
 ): AsyncGenerator<ChatStreamChunk, void, unknown> {
   return deferAdapterRequest(req, (request) => {
     const metadata: VideoOutputMetadata = { model: request.model, prompt: request.prompt }
-    const pollContext: VideoPollContext = {
+    return consumeVideoGeneration(postVideoGeneration(ctx, request, opts), metadata, {
       profile: ctx.profile,
+      debugTrace: null,
+      ...(opts.overrideHeaders ? { overrideHeaders: opts.overrideHeaders } : {}),
       ...(opts.signal ? { signal: opts.signal } : {}),
       ...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
-    }
-    return consumeVideoGeneration(postVideoGeneration(ctx, request, opts), metadata, pollContext)
+    })
   })
 }
 
 async function* consumeVideoGeneration(
-  postedRequest: Promise<{ job: VideoGenerationJobWire; apiKey: string }>,
+  postedRequest: Promise<PostedVideoGeneration>,
   metadata: VideoOutputMetadata,
   pollContext: VideoPollContext,
 ): AsyncGenerator<ChatStreamChunk, void, unknown> {
   const posted = await postedRequest
+  pollContext.debugTrace = posted.debugTrace
   let job = posted.job
   const pollingUrl = typeof job.polling_url === 'string' ? job.polling_url : undefined
   if (!pollingUrl) {
+    logVideoTerminal(posted.debugTrace, 'missing-poll-url')
     yield failedChunk(job, metadata.model, 'Video generation did not return a polling URL.')
     return
   }
 
+  let pollAttemptIndex = 0
   for (;;) {
-    const status = typeof job.status === 'string' ? job.status : 'pending'
-    yield { type: 'keepalive', comment: `video:${status}` }
-    if (status === 'completed') {
+    const snapshot = generatedVideoJobSnapshot(job)
+    yield { type: 'keepalive', comment: `video:${snapshot.status}` }
+    if (snapshot.status === 'completed') {
+      logVideoTerminal(posted.debugTrace, snapshot.urls.length > 0 ? 'completed' : 'missing-output')
       yield completedChunk(job, metadata)
       return
     }
-    const failureMessage = VIDEO_FAILURE_MESSAGES[status]
-    if (failureMessage) {
-      yield failedChunk(job, metadata.model, errorMessage(job.error) ?? failureMessage)
+    if (snapshot.failureMessage) {
+      logVideoTerminal(posted.debugTrace, 'provider-failure')
+      yield failedChunk(job, metadata.model, snapshot.failureMessage)
       return
     }
     await delay(POLL_INTERVAL_MS, pollContext.signal)
-    job = await getVideoGeneration(pollContext, pollingUrl, posted.apiKey, pollContext)
+    pollAttemptIndex += 1
+    job = await getVideoGeneration(pollContext, pollingUrl, posted.apiKey, pollAttemptIndex)
   }
+}
+
+function logVideoTerminal(trace: StreamDebugTrace | null, outcome: string): void {
+  if (trace) logStreamDebug(trace, 'terminal', { outcome })
 }
 
 function completedChunk(
   job: VideoGenerationJobWire,
   request: VideoOutputMetadata,
 ): ChatStreamChunk {
-  const urls = videoContentUrls(job)
+  const urls = generatedVideoJobSnapshot(job).urls
   if (urls.length === 0) {
     return failedChunk(job, request.model, 'Video generation completed without a content URL.')
   }
@@ -205,48 +259,6 @@ function completedChunk(
   }
 }
 
-function videoContentUrls(job: VideoGenerationJobWire): string[] {
-  const out = new Set<string>()
-  collectVideoUrls(out, job.unsigned_urls)
-  collectVideoUrls(out, job.urls)
-  collectVideoUrls(out, job.output)
-  collectVideoUrls(out, job.data)
-  return [...out].filter((url) => !isVideoPollingUrl(url))
-}
-
-function collectVideoUrls(out: Set<string>, value: unknown): void {
-  if (typeof value === 'string') {
-    if (value.length > 0) out.add(value)
-    return
-  }
-  if (Array.isArray(value)) {
-    for (const item of value) collectVideoUrls(out, item)
-    return
-  }
-  if (!value || typeof value !== 'object') return
-  const record = value as {
-    url?: unknown
-    content_url?: unknown
-    video_url?: unknown
-    unsigned_url?: unknown
-    unsigned_urls?: unknown
-  }
-  collectVideoUrls(out, record.url)
-  collectVideoUrls(out, record.content_url)
-  collectVideoUrls(out, record.video_url)
-  collectVideoUrls(out, record.unsigned_url)
-  collectVideoUrls(out, record.unsigned_urls)
-}
-
-function isVideoPollingUrl(value: string): boolean {
-  try {
-    const url = new URL(value)
-    return /\/videos\/[^/]+\/?$/u.test(url.pathname)
-  } catch {
-    return false
-  }
-}
-
 function failedChunk(job: VideoGenerationJobWire, model: string, message: string): ChatStreamChunk {
   const generationId = job.generation_id ?? job.id
   return {
@@ -264,15 +276,6 @@ function normalizeVideoUsage(usage: VideoGenerationJobWire['usage']): ChatComple
   const out: ChatCompletionUsageWire = {}
   if (typeof usage?.cost === 'number') out.cost = usage.cost
   return out
-}
-
-function errorMessage(error: unknown): string | undefined {
-  if (typeof error === 'string') return error
-  if (error && typeof error === 'object') {
-    const message = (error as { message?: unknown }).message
-    if (typeof message === 'string') return message
-  }
-  return undefined
 }
 
 function delay(ms: number, signal: AbortSignal | undefined): Promise<void> {

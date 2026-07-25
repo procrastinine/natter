@@ -1,10 +1,10 @@
-import { RenderingPreferencesProvider } from '../ui/settings/RenderingSettings'
+import { ConfigurationPreferencesProvider } from '../hooks/useConfigurationPreferences'
 import { Shell } from './Shell'
 
 export function App() {
   return (
-    <RenderingPreferencesProvider>
+    <ConfigurationPreferencesProvider>
       <Shell />
-    </RenderingPreferencesProvider>
+    </ConfigurationPreferencesProvider>
   )
 }

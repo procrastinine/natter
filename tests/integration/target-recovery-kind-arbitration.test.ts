@@ -1,22 +1,42 @@
 import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
-import type { ChatSettings, Message } from '../../src/core/types'
-import { recoverOrphans, recoverStreamOrphan } from '../../src/hooks/useChat'
-import { __resetBroadcastForTests, type BroadcastEvent, onEvent } from '../../src/store/broadcast'
+import type { ChatSettings, Message, MessageId } from '../../src/core/types'
 import {
   __resetBrowserRepositoryForTests,
   getBrowserRepository,
 } from '../../src/store/browser-repo'
-import { createChat } from '../../src/store/chats'
-import { recoverStaleContinuationAttempts } from '../../src/store/continuation-recovery'
-import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
-import type { StreamLeaseRow } from '../../src/store/repository'
-import { __resetStreamLeasesForTests } from '../../src/store/stream-leases'
-import { useChatStore } from '../../src/store/zustand/chatStore'
-import { useStreamStore } from '../../src/store/zustand/streamStore'
+import {
+  openBrowserWorkspace,
+  shutdownBrowserWorkspace,
+} from '../../src/store/browser-workspace-lifecycle'
+import { importMessagesOp } from '../../src/store/conversation-command-client'
+import { __resetDbForTests, getDb } from '../../src/store/db'
+import { persistStreamEventV2 } from '../../src/store/persisted-stream-event'
+import { type StreamLeaseRow, streamLeaseHasWriteFence } from '../../src/store/repository'
+import type { CanonicalStreamJournalFrameRow } from '../../src/store/stream-journal-codec'
+import { recoverStreamOrphan, streamRecoveryRuntimeSnapshot } from '../../src/store/stream-recovery'
+import type { WorkspaceRepository } from '../../src/store/workspace-protocol'
+import {
+  __resetWorkspaceRepositoryForTests,
+  __setWorkspaceRepositoryForTests,
+  getWorkspaceRepository,
+  readWorkspaceMeta,
+} from '../../src/store/workspace-repository'
+import { runWorkspaceAction, runWorkspaceRead } from '../../src/store/workspace-runtime'
+import { createChat } from '../helpers/chats'
+import { readTestMessageHeader } from '../helpers/message-storage'
+import { encodeTestStreamJournalEntries } from '../helpers/stream-journal'
+import {
+  type TestContinuationLeaseInput,
+  type TestGenerationLeaseInput,
+  testContinuationLease,
+  testGenerationLease,
+} from '../helpers/stream-leases'
 
 const DB_NAME = 'natter'
+const STARTED_AT = Date.now()
+const RECOVERY_AT = STARTED_AT + 60_000
 
 function settings(): ChatSettings {
   return {
@@ -27,601 +47,768 @@ function settings(): ChatSettings {
 }
 
 async function reset(): Promise<void> {
+  __resetWorkspaceRepositoryForTests()
   __resetBrowserRepositoryForTests()
   __resetDbForTests()
-  __resetBroadcastForTests()
-  __resetStreamLeasesForTests()
-  useChatStore.getState().reset()
-  useStreamStore.getState().reset()
   await Dexie.delete(DB_NAME)
 }
 
 beforeEach(async () => {
   await reset()
-  await openDb()
+  await openBrowserWorkspace()
 })
 
 afterEach(async () => {
   vi.restoreAllMocks()
+  __resetWorkspaceRepositoryForTests()
+  await shutdownBrowserWorkspace()
   await reset()
 })
 
 describe('target recovery kind arbitration', () => {
-  it('replays only the newest owning continuation after a finished generation', async () => {
-    const { chatId, target } = await seedAssistant('finished-target', true)
-    const repo = getBrowserRepository()
-    const baseline = required(await repo.getMessageHeader(target.id), 'target header')
-    const older = await repo.upsertStreamLease({
-      streamId: 'continuation-older',
+  it('recovers a committed continuation once and records its durable provenance', async () => {
+    const { chatId, target } = await seedAssistant('continuation')
+    const header = required(await messageHeader(target.id), 'target header')
+    const lease = await insertLease({
+      streamId: 'continuation-recovery',
       chatId,
       messageId: target.id,
-      ownerClientId: 'closed-continuation-older',
-      startedAt: 100,
-      heartbeatAt: 200,
       attemptKind: 'continuation',
+      targetCommittedAt: STARTED_AT + 1,
       continuationStrategy: 'prompt',
-      baseBodyVersion: baseline.bodyVersion,
+      baseNodeVersion: header.nodeVersion,
+      baseBodyVersion: header.bodyVersion,
+      requestedModel: settings().model,
+      apiUsed: 'chat',
     })
-    const durable = durableLeaseFields(older)
-    const newer: StreamLeaseRow = {
-      ...older,
-      streamId: 'continuation-newer',
-      ownerClientId: 'closed-continuation-newer',
-      fenceToken: 'continuation-newer-fence',
-      admissionSequence: durable.admissionSequence + 1,
-    }
-    const planning: StreamLeaseRow = {
-      streamId: 'continuation-planning',
-      chatId,
-      messageId: target.id,
-      ownerClientId: 'closed-continuation-planning',
-      fenceToken: 'continuation-planning-fence',
-      replacementEpoch: durable.replacementEpoch,
-      admissionSequence: durable.admissionSequence + 2,
-      startedAt: 100,
-      heartbeatAt: 200,
-      attemptKind: 'continuation',
-    }
-    const incompatibleGeneration: StreamLeaseRow = {
-      streamId: 'finished-target-generation',
-      chatId,
-      messageId: target.id,
-      ownerClientId: 'closed-finished-generation',
-      fenceToken: 'finished-target-generation-fence',
-      replacementEpoch: durable.replacementEpoch,
-      admissionSequence: durable.admissionSequence + 3,
-      startedAt: 100,
-      heartbeatAt: 200,
-      attemptKind: 'generation',
-    }
-    await getDb().streamLeases.bulkPut([newer, planning, incompatibleGeneration])
-    await repo.appendStreamChunks([
-      streamTextRow(older, target.id, '-older-should-not-apply'),
-      streamTextRow(newer, target.id, '-newer'),
-      streamTextRow(incompatibleGeneration, target.id, '-generation-should-not-apply'),
-    ])
-    const events: BroadcastEvent[] = []
-    const stop = onEvent((event) => events.push(event))
+    await appendStreamText(lease, ['-continued'])
 
-    await expect(
-      recoverStaleContinuationAttempts({
-        repo,
-        leases: [older, newer, planning, incompatibleGeneration],
-        now: 100_000,
-        isTargetActive: () => false,
-      }),
-    ).resolves.toBe(1)
-    stop()
-
-    const recovered = required(await repo.getMessage(target.id), 'recovered target')
-    expect(recovered.content).toEqual([{ type: 'output_text', text: 'original-newer' }])
-    expect(recovered.continuationAttempts).toHaveLength(1)
-    expect(recovered.continuationAttempts?.[0]).toMatchObject({
-      streamId: newer.streamId,
-      status: 'interrupted',
-      abortReason: 'tab-close',
-    })
-    expect(await repo.listStreamLeasesForMessage(target.id)).toEqual([])
-    expect(await repo.listStreamChunksForMessage(target.id)).toEqual([])
-    expect(endedStreamIds(events)).toEqual(
-      [older.streamId, newer.streamId, planning.streamId, incompatibleGeneration.streamId].sort(),
+    await expect(recoverStreamOrphan({ streamId: lease.streamId }, RECOVERY_AT)).resolves.toBe(
+      'recovered',
     )
+
+    const recovered = required(await message(target.id), 'recovered target')
+    expect(recovered.content).toEqual([{ type: 'output_text', text: 'original-continued' }])
+    expect(recovered.continuationAttempts).toEqual([
+      expect.objectContaining({
+        streamId: lease.streamId,
+        status: 'interrupted',
+        abortReason: 'tab-close',
+        requestedModel: settings().model,
+        apiUsed: 'chat',
+        startedAt: STARTED_AT,
+        finishedAt: RECOVERY_AT,
+      }),
+    ])
+    expect(await streamLease(lease.streamId)).toBeUndefined()
+    expect(await streamFrames(lease.streamId)).toEqual([])
+
+    await expect(recoverStreamOrphan({ streamId: lease.streamId }, RECOVERY_AT + 1)).resolves.toBe(
+      'resolved',
+    )
+    expect((await message(target.id))?.content).toEqual([
+      { type: 'output_text', text: 'original-continued' },
+    ])
+    expect((await message(target.id))?.continuationAttempts).toHaveLength(1)
   })
 
-  it('keeps an unfinished generation authoritative over a newer continuation journal', async () => {
-    const { chatId, target } = await seedAssistant('unfinished-target', false)
-    const repo = getBrowserRepository()
-    const generation = await repo.upsertStreamLease({
-      streamId: 'unfinished-generation',
+  it('recovers a committed generation according to its immutable lease kind', async () => {
+    const { chatId, target } = await seedAssistant('generation')
+    const lease = await insertLease({
+      streamId: 'generation-recovery',
       chatId,
       messageId: target.id,
-      ownerClientId: 'closed-generation',
-      startedAt: 100,
-      heartbeatAt: 200,
+      attemptKind: 'generation',
+      targetCommittedAt: STARTED_AT + 1,
+      requestedModel: settings().model,
+      apiUsed: 'chat',
     })
-    const durable = durableLeaseFields(generation)
-    const continuation: StreamLeaseRow = {
-      streamId: 'newer-incompatible-continuation',
-      chatId,
-      messageId: target.id,
-      ownerClientId: 'closed-continuation',
-      fenceToken: 'newer-incompatible-continuation-fence',
-      replacementEpoch: durable.replacementEpoch,
-      admissionSequence: durable.admissionSequence + 1,
-      startedAt: 100,
-      heartbeatAt: 200,
-      attemptKind: 'continuation',
-      continuationStrategy: 'prompt',
-      baseBodyVersion: required(await repo.getMessageHeader(target.id), 'target header')
-        .bodyVersion,
-    }
-    await getDb().streamLeases.put(continuation)
-    await repo.appendStreamChunks([
-      streamTextRow(generation, target.id, '-generation'),
-      streamTextRow(continuation, target.id, '-continuation-should-not-apply'),
-    ])
-    const events: BroadcastEvent[] = []
-    const stop = onEvent((event) => events.push(event))
+    await appendStreamText(lease, ['-generated'])
 
-    await expect(recoverOrphans(100_000, chatId)).resolves.toBe(1)
-    stop()
+    await expect(recoverStreamOrphan({ streamId: lease.streamId }, RECOVERY_AT)).resolves.toBe(
+      'recovered',
+    )
 
-    const recovered = required(await repo.getMessage(target.id), 'recovered target')
-    expect(recovered.content).toEqual([{ type: 'output_text', text: 'original-generation' }])
+    const recovered = required(await message(target.id), 'recovered target')
+    expect(recovered.content).toEqual([{ type: 'output_text', text: 'original-generated' }])
     expect(recovered.generation).toMatchObject({
+      model: settings().model,
+      requestedModel: settings().model,
+      apiUsed: 'chat',
       status: 'interrupted',
       abortReason: 'tab-close',
-      finishedAt: 100_000,
+      startedAt: STARTED_AT,
+      finishedAt: RECOVERY_AT,
     })
     expect(recovered.continuationAttempts).toBeUndefined()
-    expect(await repo.listStreamLeasesForMessage(target.id)).toEqual([])
-    expect(await repo.listStreamChunksForMessage(target.id)).toEqual([])
-    expect(endedStreamIds(events)).toEqual([generation.streamId, continuation.streamId].sort())
+    expect(await streamLease(lease.streamId)).toBeUndefined()
+    expect(await streamFrames(lease.streamId)).toEqual([])
   })
 
-  it('retains the generation anchor until every secondary journal survives cleanup', async () => {
-    const { chatId, target } = await seedAssistant('generation-cleanup-retry', false)
-    const repo = getBrowserRepository()
-    const older = await repo.upsertStreamLease({
-      streamId: 'generation-cleanup-secondary',
+  it('terminalizes a corrupt current journal once instead of leaving phantom stream ownership', async () => {
+    const { chatId, target } = await seedAssistant('corrupt-current-journal')
+    const lease = await insertLease({
+      streamId: 'corrupt-current-journal-recovery',
       chatId,
       messageId: target.id,
-      ownerClientId: 'closed-generation-secondary',
-      startedAt: 100,
-      heartbeatAt: 200,
       attemptKind: 'generation',
+      targetCommittedAt: STARTED_AT + 1,
+      requestedModel: settings().model,
+      apiUsed: 'chat',
     })
-    const durable = durableLeaseFields(older)
-    const primary: StreamLeaseRow = {
-      ...older,
-      streamId: 'generation-cleanup-anchor',
-      ownerClientId: 'closed-generation-anchor',
-      fenceToken: 'generation-cleanup-anchor-fence',
-      admissionSequence: durable.admissionSequence + 1,
-    }
-    const incompatible: StreamLeaseRow = {
-      streamId: 'generation-cleanup-continuation',
+    const frames = await encodeTestStreamJournalEntries({
+      streamId: lease.streamId,
+      chatId: lease.chatId,
+      messageId: lease.messageId,
+      fence: leaseFence(lease),
+      entries: [
+        {
+          createdAt: STARTED_AT + 2,
+          event: persistStreamEventV2({ lane: 'text', text: '-valid-prefix' }),
+        },
+        {
+          createdAt: STARTED_AT + 3,
+          event: { version: 1, event: { lane: 'text' } },
+        },
+      ],
+    })
+    await runWorkspaceAction('stream-recovery', (permit) =>
+      getWorkspaceRepository().execute(permit, {
+        kind: 'stream.append-journal-frames',
+        frames,
+      }),
+    )
+
+    await expect(recoverStreamOrphan({ streamId: lease.streamId }, RECOVERY_AT)).resolves.toBe(
+      'recovered',
+    )
+
+    expect(await message(target.id)).toMatchObject({
+      content: [{ type: 'output_text', text: 'original-valid-prefix' }],
+      generation: {
+        status: 'error',
+        error: {
+          category: 'integrity',
+          code: 'STREAM_JOURNAL_EVENT_INVALID',
+          retryable: false,
+        },
+      },
+    })
+    expect(await streamLease(lease.streamId)).toBeUndefined()
+    expect(await streamFrames(lease.streamId)).toEqual([])
+    expect(streamRecoveryRuntimeSnapshot().queuedCount).toBe(0)
+
+    const recovered = await message(target.id)
+    await expect(recoverStreamOrphan({ streamId: lease.streamId }, RECOVERY_AT + 1)).resolves.toBe(
+      'resolved',
+    )
+    expect(await message(target.id)).toEqual(recovered)
+  })
+
+  it('recovers a stopped generation as the durable user Stop after its owner disappears', async () => {
+    const { chatId, target } = await seedAssistant('stopped-generation')
+    const requestedAt = STARTED_AT + 10
+    const lease = await insertLease({
+      streamId: 'stopped-generation-recovery',
       chatId,
       messageId: target.id,
-      ownerClientId: 'closed-generation-cleanup-continuation',
-      fenceToken: 'generation-cleanup-continuation-fence',
-      replacementEpoch: durable.replacementEpoch,
-      admissionSequence: durable.admissionSequence + 2,
-      startedAt: 100,
-      heartbeatAt: 200,
-      attemptKind: 'continuation',
-      continuationStrategy: 'prompt',
-      baseBodyVersion: required(await repo.getMessageHeader(target.id), 'target header')
-        .bodyVersion,
+      attemptKind: 'generation',
+      targetCommittedAt: STARTED_AT + 1,
+      requestedModel: settings().model,
+      apiUsed: 'chat',
+      stopControl: {
+        requestId: 'stop:stopped-generation-recovery',
+        requestedBy: 'departed-tab',
+        requestedAt,
+        reason: 'user',
+      },
+    })
+    await appendStreamText(lease, ['-partial'])
+
+    await expect(recoverStreamOrphan({ streamId: lease.streamId }, RECOVERY_AT)).resolves.toBe(
+      'recovered',
+    )
+
+    const recovered = required(await message(target.id), 'recovered stopped target')
+    expect(recovered.content).toEqual([{ type: 'output_text', text: 'original-partial' }])
+    expect(recovered.generation).toMatchObject({
+      status: 'abort',
+      abortReason: 'user',
+      startedAt: STARTED_AT,
+      finishedAt: RECOVERY_AT,
+    })
+    expect(await streamLease(lease.streamId)).toBeUndefined()
+    expect(await streamFrames(lease.streamId)).toEqual([])
+  })
+
+  it.each([
+    'generation',
+    'continuation',
+  ] as const)('reuses a sealed %s decision and ignores journal rows beyond its receipt', async (attemptKind) => {
+    const { chatId, target } = await seedAssistant(`sealed-${attemptKind}`)
+    const header = required(await messageHeader(target.id), 'target header')
+    const finishedAt = STARTED_AT + 10
+    const terminal = {
+      version: 1 as const,
+      finishedAt,
+      journalMaxSeq: 0,
+      journalCompleteness: 'settled' as const,
+      decision: { outcome: 'done' as const, finishReason: 'stop' },
     }
-    await getDb().streamLeases.bulkPut([primary, incompatible])
-    await repo.appendStreamChunks([
-      streamTextRow(older, target.id, '-secondary-should-not-apply'),
-      streamTextRow(primary, target.id, '-primary'),
-      streamTextRow(incompatible, target.id, '-continuation-should-not-apply'),
-    ])
-    const originalDelete = repo.deleteStreamJournal.bind(repo)
-    let cleanupCalls = 0
-    let failed = false
-    vi.spyOn(repo, 'deleteStreamJournal').mockImplementation(async (...args) => {
-      cleanupCalls += 1
-      if (!failed && cleanupCalls === 2) {
-        failed = true
-        throw new Error('injected secondary cleanup failure')
-      }
-      return originalDelete(...args)
+    const lease = await insertLease(
+      attemptKind === 'generation'
+        ? {
+            streamId: 'sealed-generation-recovery',
+            chatId,
+            messageId: target.id,
+            attemptKind,
+            phase: 'terminal-decided',
+            journalMaxSeq: 0,
+            terminal,
+            stopControl: {
+              requestId: `stop-sealed-${attemptKind}`,
+              requestedBy: 'stranded-tab',
+              requestedAt: finishedAt + 1,
+              reason: 'user',
+            },
+            controlRevision: 1,
+            targetCommittedAt: STARTED_AT + 1,
+            requestedModel: settings().model,
+            apiUsed: 'chat',
+          }
+        : {
+            streamId: 'sealed-continuation-recovery',
+            chatId,
+            messageId: target.id,
+            attemptKind,
+            phase: 'terminal-decided',
+            journalMaxSeq: 0,
+            terminal,
+            stopControl: {
+              requestId: `stop-sealed-${attemptKind}`,
+              requestedBy: 'stranded-tab',
+              requestedAt: finishedAt + 1,
+              reason: 'user',
+            },
+            controlRevision: 1,
+            targetCommittedAt: STARTED_AT + 1,
+            continuationStrategy: 'prompt',
+            baseNodeVersion: header.nodeVersion,
+            baseBodyVersion: header.bodyVersion,
+            requestedModel: settings().model,
+            apiUsed: 'chat',
+          },
+    )
+    await putStreamTextFrames(lease, ['-sealed', '-must-not-replay'])
+
+    await expect(recoverStreamOrphan({ streamId: lease.streamId }, RECOVERY_AT)).resolves.toBe(
+      'recovered',
+    )
+
+    const recovered = required(await message(target.id), 'recovered target')
+    expect(recovered.content).toEqual([{ type: 'output_text', text: 'original-sealed' }])
+    if (attemptKind === 'generation') {
+      expect(recovered.generation).toMatchObject({ status: 'done', finishedAt })
+    } else {
+      expect(recovered.continuationAttempts).toEqual([
+        expect.objectContaining({ status: 'done', finishedAt }),
+      ])
+    }
+    expect(await streamLease(lease.streamId)).toBeUndefined()
+    expect(await streamFrames(lease.streamId)).toEqual([])
+  })
+
+  it('enforces one durable attempt per target before recovery has to arbitrate kinds', async () => {
+    const { chatId, target } = await seedAssistant('unique-target')
+    const first = leaseRow({
+      streamId: 'unique-generation',
+      chatId,
+      messageId: target.id,
+      attemptKind: 'generation',
+      targetCommittedAt: STARTED_AT + 1,
+      requestedModel: settings().model,
+      apiUsed: 'chat',
+    })
+    const second = leaseRow({
+      streamId: 'unique-continuation',
+      chatId,
+      messageId: target.id,
+      attemptKind: 'continuation',
+      targetCommittedAt: STARTED_AT + 2,
+      continuationStrategy: 'prompt',
+      baseNodeVersion: 0,
+      baseBodyVersion: 0,
+      requestedModel: settings().model,
+      apiUsed: 'chat',
+      admissionSequence: 2,
     })
 
-    await expect(recoverOrphans(100_000, chatId)).rejects.toThrow(
-      'injected secondary cleanup failure',
+    await getDb().streamLeases.put(first)
+    await expect(getDb().streamLeases.put(second)).rejects.toMatchObject({
+      name: 'ConstraintError',
+    })
+    expect(await streamLease(first.streamId)).toEqual(first)
+    expect(await streamLease(second.streamId)).toBeUndefined()
+  })
+
+  it('retains a canonical recovery until cleanup succeeds without applying it twice', async () => {
+    const { chatId, target } = await seedAssistant('cleanup-retry')
+    const header = required(await messageHeader(target.id), 'target header')
+    const lease = await insertLease({
+      streamId: 'continuation-cleanup-retry',
+      chatId,
+      messageId: target.id,
+      attemptKind: 'continuation',
+      targetCommittedAt: STARTED_AT + 1,
+      continuationStrategy: 'prompt',
+      baseNodeVersion: header.nodeVersion,
+      baseBodyVersion: header.bodyVersion,
+      requestedModel: settings().model,
+      apiUsed: 'chat',
+    })
+    await appendStreamText(lease, ['-once'])
+    const targetRepository = getBrowserRepository()
+    let failCleanup = true
+    const wrapped = repositoryProxy(targetRepository, async (permit, command) => {
+      if (command.kind === 'stream.finish-cleanup' && failCleanup) {
+        failCleanup = false
+        throw new Error('injected cleanup failure')
+      }
+      return targetRepository.execute(permit, command)
+    })
+    __setWorkspaceRepositoryForTests(wrapped)
+
+    await expect(recoverStreamOrphan({ streamId: lease.streamId }, RECOVERY_AT)).resolves.toBe(
+      'retry',
     )
-    expect((await repo.getMessage(target.id))?.content).toEqual([
-      { type: 'output_text', text: 'original-primary' },
+    expect((await message(target.id))?.content).toEqual([
+      { type: 'output_text', text: 'original-once' },
     ])
-    expect((await repo.getMessageHeader(target.id))?.generation?.finishedAt).toBe(100_000)
-    expect(
-      (await repo.listStreamLeasesForMessage(target.id)).map((lease) => lease.streamId),
-    ).toEqual([primary.streamId])
-    expect(
-      (await repo.listStreamChunksForMessage(target.id)).some(
-        (chunk) => chunk.streamId === primary.streamId,
+    expect((await message(target.id))?.continuationAttempts).toHaveLength(1)
+    expect(await streamLease(lease.streamId)).toMatchObject({ canonicalAt: RECOVERY_AT })
+
+    await expect(
+      recoverStreamOrphan({ streamId: lease.streamId }, RECOVERY_AT + 60_001),
+    ).resolves.toMatch(/^(?:recovered|resolved)$/u)
+    expect((await message(target.id))?.content).toEqual([
+      { type: 'output_text', text: 'original-once' },
+    ])
+    expect((await message(target.id))?.continuationAttempts).toHaveLength(1)
+    expect(await streamLease(lease.streamId)).toBeUndefined()
+    expect(await streamFrames(lease.streamId)).toEqual([])
+  })
+
+  it('single-flights simultaneous recovery callers through one durable claim', async () => {
+    const { chatId, target } = await seedAssistant('single-flight')
+    const header = required(await messageHeader(target.id), 'target header')
+    const lease = await insertLease({
+      streamId: 'continuation-single-flight',
+      chatId,
+      messageId: target.id,
+      attemptKind: 'continuation',
+      targetCommittedAt: STARTED_AT + 1,
+      continuationStrategy: 'prompt',
+      baseNodeVersion: header.nodeVersion,
+      baseBodyVersion: header.bodyVersion,
+      requestedModel: settings().model,
+      apiUsed: 'chat',
+    })
+    await appendStreamText(lease, ['-once'])
+    const targetRepository = getBrowserRepository()
+    let claimCount = 0
+    __setWorkspaceRepositoryForTests(
+      repositoryProxy(targetRepository, async (permit, command) => {
+        if (command.kind === 'stream.claim-recovery') claimCount += 1
+        return targetRepository.execute(permit, command)
+      }),
+    )
+
+    await expect(
+      Promise.all([
+        recoverStreamOrphan({ streamId: lease.streamId }, RECOVERY_AT),
+        recoverStreamOrphan({ streamId: lease.streamId }, RECOVERY_AT),
+      ]),
+    ).resolves.toEqual(['recovered', 'recovered'])
+    expect(claimCount).toBe(1)
+    expect((await message(target.id))?.content).toEqual([
+      { type: 'output_text', text: 'original-once' },
+    ])
+    expect((await message(target.id))?.continuationAttempts).toHaveLength(1)
+    expect(await streamLease(lease.streamId)).toBeUndefined()
+  })
+
+  it('leaves current coordinator evidence queued behind a stale fenced caller', async () => {
+    const { chatId, target } = await seedAssistant('stale-point-overlap')
+    const header = required(await messageHeader(target.id), 'target header')
+    const lease = await insertLease({
+      streamId: 'continuation-stale-point-overlap',
+      chatId,
+      messageId: target.id,
+      attemptKind: 'continuation',
+      targetCommittedAt: STARTED_AT + 1,
+      continuationStrategy: 'prompt',
+      baseNodeVersion: header.nodeVersion,
+      baseBodyVersion: header.bodyVersion,
+      requestedModel: settings().model,
+      apiUsed: 'chat',
+    })
+    await appendStreamText(lease, ['-once'])
+    const targetRepository = getBrowserRepository()
+    let failCleanup = true
+    __setWorkspaceRepositoryForTests(
+      repositoryProxy(targetRepository, async (permit, command) => {
+        if (command.kind === 'stream.finish-cleanup' && failCleanup) {
+          failCleanup = false
+          throw new Error('injected stale-overlap cleanup failure')
+        }
+        return targetRepository.execute(permit, command)
+      }),
+    )
+    await expect(recoverStreamOrphan({ streamId: lease.streamId }, RECOVERY_AT)).resolves.toBe(
+      'retry',
+    )
+    const canonical = required(await streamLease(lease.streamId), 'canonical lease')
+    const workspace = await readWorkspaceMeta()
+
+    let releaseWorkspaceRead = () => {}
+    const workspaceReadGate = new Promise<void>((resolve) => {
+      releaseWorkspaceRead = resolve
+    })
+    let enteredWorkspaceRead = () => {}
+    const workspaceReadEntered = new Promise<void>((resolve) => {
+      enteredWorkspaceRead = resolve
+    })
+    let blockFirstWorkspaceRead = true
+    __setWorkspaceRepositoryForTests(
+      repositoryProxy(
+        targetRepository,
+        targetRepository.execute.bind(targetRepository),
+        async (kind) => {
+          if (!blockFirstWorkspaceRead || kind !== 'workspace.meta') return
+          blockFirstWorkspaceRead = false
+          enteredWorkspaceRead()
+          await workspaceReadGate
+        },
       ),
-    ).toBe(true)
-
-    await expect(recoverOrphans(100_001, chatId)).resolves.toBe(1)
-    expect((await repo.getMessage(target.id))?.content).toEqual([
-      { type: 'output_text', text: 'original-primary' },
-    ])
-    expect(await repo.listStreamLeasesForMessage(target.id)).toEqual([])
-    expect(await repo.listStreamChunksForMessage(target.id)).toEqual([])
-  })
-
-  it('retains the continuation anchor and never appends twice after secondary cleanup fails', async () => {
-    const { chatId, target } = await seedAssistant('continuation-cleanup-retry', true)
-    const repo = getBrowserRepository()
-    const baseline = required(await repo.getMessageHeader(target.id), 'target header')
-    const older = await repo.upsertStreamLease({
-      streamId: 'continuation-cleanup-secondary',
-      chatId,
-      messageId: target.id,
-      ownerClientId: 'closed-continuation-secondary',
-      startedAt: 100,
-      heartbeatAt: 200,
-      attemptKind: 'continuation',
-      continuationStrategy: 'prompt',
-      baseBodyVersion: baseline.bodyVersion,
-    })
-    const durable = durableLeaseFields(older)
-    const primary: StreamLeaseRow = {
-      ...older,
-      streamId: 'continuation-cleanup-anchor',
-      ownerClientId: 'closed-continuation-anchor',
-      fenceToken: 'continuation-cleanup-anchor-fence',
-      admissionSequence: durable.admissionSequence + 1,
-    }
-    const incompatible: StreamLeaseRow = {
-      streamId: 'continuation-cleanup-generation',
-      chatId,
-      messageId: target.id,
-      ownerClientId: 'closed-continuation-cleanup-generation',
-      fenceToken: 'continuation-cleanup-generation-fence',
-      replacementEpoch: durable.replacementEpoch,
-      admissionSequence: durable.admissionSequence + 2,
-      startedAt: 100,
-      heartbeatAt: 200,
-      attemptKind: 'generation',
-    }
-    await getDb().streamLeases.bulkPut([primary, incompatible])
-    await repo.appendStreamChunks([
-      streamTextRow(older, target.id, '-secondary-should-not-apply'),
-      streamTextRow(primary, target.id, '-primary'),
-      streamTextRow(incompatible, target.id, '-generation-should-not-apply'),
-    ])
-    const originalDelete = repo.deleteStreamJournal.bind(repo)
-    let cleanupCalls = 0
-    let failed = false
-    vi.spyOn(repo, 'deleteStreamJournal').mockImplementation(async (...args) => {
-      cleanupCalls += 1
-      if (!failed && cleanupCalls === 2) {
-        failed = true
-        throw new Error('injected continuation secondary cleanup failure')
-      }
-      return originalDelete(...args)
-    })
-
-    await expect(recoverOrphans(100_000, chatId)).rejects.toThrow(
-      'injected continuation secondary cleanup failure',
     )
-    const firstRecovery = required(await repo.getMessage(target.id), 'first recovery target')
-    expect(firstRecovery.content).toEqual([{ type: 'output_text', text: 'original-primary' }])
-    expect(firstRecovery.continuationAttempts).toHaveLength(1)
-    expect(firstRecovery.continuationAttempts?.[0]?.streamId).toBe(primary.streamId)
-    expect(
-      (await repo.listStreamLeasesForMessage(target.id)).map((lease) => lease.streamId),
-    ).toEqual([primary.streamId])
-
-    await expect(recoverOrphans(100_001, chatId)).resolves.toBe(1)
-    const retried = required(await repo.getMessage(target.id), 'retried recovery target')
-    expect(retried.content).toEqual([{ type: 'output_text', text: 'original-primary' }])
-    expect(retried.continuationAttempts).toHaveLength(1)
-    expect(await repo.listStreamLeasesForMessage(target.id)).toEqual([])
-    expect(await repo.listStreamChunksForMessage(target.id)).toEqual([])
-  })
-
-  it('cleans incompatible journals before terminalizing a generation with no primary', async () => {
-    const { chatId, target } = await seedAssistant('generation-no-primary-retry', false)
-    const repo = getBrowserRepository()
-    const continuation = await repo.upsertStreamLease({
-      streamId: 'generation-no-primary-continuation',
-      chatId,
-      messageId: target.id,
-      ownerClientId: 'closed-no-primary-continuation',
-      startedAt: 100,
-      heartbeatAt: 200,
-      attemptKind: 'continuation',
-      continuationStrategy: 'prompt',
-      baseBodyVersion: required(await repo.getMessageHeader(target.id), 'target header')
-        .bodyVersion,
-    })
-    await repo.appendStreamChunks([
-      streamTextRow(continuation, target.id, '-continuation-should-not-apply'),
-    ])
-    const originalDelete = repo.deleteStreamJournal.bind(repo)
-    let failed = false
-    vi.spyOn(repo, 'deleteStreamJournal').mockImplementation(async (...args) => {
-      if (!failed) {
-        failed = true
-        throw new Error('injected pre-commit cleanup failure')
-      }
-      return originalDelete(...args)
-    })
-
-    await expect(recoverOrphans(100_000, chatId)).rejects.toThrow(
-      'injected pre-commit cleanup failure',
+    const stale = recoverStreamOrphan(
+      {
+        streamId: lease.streamId,
+        workspaceId: `${workspace.workspaceId}-stale`,
+        replacementEpoch: workspace.replacementEpoch,
+      },
+      RECOVERY_AT + 1,
     )
-    expect((await repo.getMessageHeader(target.id))?.generation?.finishedAt).toBeUndefined()
-    expect(await repo.listStreamLeasesForMessage(target.id)).toEqual([])
-    expect(await repo.listStreamChunksForMessage(target.id)).toHaveLength(1)
+    await workspaceReadEntered
+    await runWorkspaceAction('stream-recovery', (permit) =>
+      getWorkspaceRepository().execute(permit, {
+        kind: 'stream.claim-recovery',
+        expected: canonical,
+        now: RECOVERY_AT + 2,
+      }),
+    )
+    await Promise.resolve()
+    releaseWorkspaceRead()
 
-    await expect(recoverOrphans(100_001, chatId)).resolves.toBe(1)
-    expect((await repo.getMessage(target.id))?.content).toEqual(target.content)
-    expect((await repo.getMessageHeader(target.id))?.generation).toMatchObject({
-      finishedAt: 100_001,
-      status: 'interrupted',
-      abortReason: 'tab-close',
+    await expect(stale).resolves.toBe('resolved')
+    await vi.waitFor(async () => {
+      expect(await streamLease(lease.streamId)).toBeUndefined()
     })
-    expect(await repo.listStreamLeasesForMessage(target.id)).toEqual([])
-    expect(await repo.listStreamChunksForMessage(target.id)).toEqual([])
-  })
-
-  it('new target admission removes lease-less debris from a finalized recovery group', async () => {
-    const { chatId, target } = await seedAssistant('admission-cleans-target-debris', true)
-    const repo = getBrowserRepository()
-    const anchor = await repo.upsertStreamLease({
-      streamId: 'finalized-generation-anchor',
-      chatId,
-      messageId: target.id,
-      ownerClientId: 'closed-finalized-generation',
-      startedAt: 100,
-      heartbeatAt: 200,
-      attemptKind: 'generation',
-    })
-    const debris: StreamLeaseRow = {
-      ...anchor,
-      streamId: 'lease-less-secondary-debris',
-      ownerClientId: 'missing-secondary-owner',
-      fenceToken: 'lease-less-secondary-fence',
-    }
-    await repo.appendStreamChunks([streamTextRow(anchor, target.id, '-anchor')])
-    await getDb().streamChunks.put(streamTextRow(debris, target.id, '-debris'))
-
-    const incoming = await repo.upsertStreamLease({
-      streamId: 'incoming-continuation',
-      chatId,
-      messageId: target.id,
-      ownerClientId: 'incoming-owner',
-      startedAt: 300,
-      heartbeatAt: 300,
-      attemptKind: 'continuation',
-      continuationStrategy: 'prompt',
-      baseBodyVersion: required(await repo.getMessageHeader(target.id), 'target header')
-        .bodyVersion,
-    })
-
-    expect(
-      (await repo.listStreamLeasesForMessage(target.id)).map((lease) => lease.streamId),
-    ).toEqual([incoming.streamId])
-    expect(await repo.listStreamChunksForMessage(target.id)).toEqual([])
-  })
-
-  it('retries missing-target cleanup as one group without stranding lease-less sibling chunks', async () => {
-    const { chatId, target } = await seedAssistant('missing-target-cleanup-retry', false)
-    const repo = getBrowserRepository()
-    const anchor = await repo.upsertStreamLease({
-      streamId: 'missing-target-cleanup-anchor',
-      chatId,
-      messageId: target.id,
-      ownerClientId: 'closed-missing-target-owner',
-      startedAt: 100,
-      heartbeatAt: 200,
-      attemptKind: 'generation',
-    })
-    const debris: StreamLeaseRow = {
-      ...anchor,
-      streamId: 'missing-target-lease-less-debris',
-      ownerClientId: 'missing-target-debris-owner',
-      fenceToken: 'missing-target-debris-fence',
-    }
-    const durable = durableLeaseFields(anchor)
-    const newerSibling: StreamLeaseRow = {
-      ...anchor,
-      streamId: 'missing-target-newer-sibling',
-      ownerClientId: 'missing-target-newer-owner',
-      fenceToken: 'missing-target-newer-fence',
-      admissionSequence: durable.admissionSequence + 1,
-    }
-    await getDb().streamLeases.put(newerSibling)
-    await repo.appendStreamChunks([
-      streamTextRow(anchor, target.id, '-anchor'),
-      streamTextRow(newerSibling, target.id, '-newer'),
+    expect((await message(target.id))?.content).toEqual([
+      { type: 'output_text', text: 'original-once' },
     ])
-    await getDb().streamChunks.put(streamTextRow(debris, target.id, '-debris'))
+    expect((await message(target.id))?.continuationAttempts).toHaveLength(1)
+  })
+
+  it('does not let stale same-workspace freshness evidence absorb a current recovery', async () => {
+    const { chatId, target } = await seedAssistant('stale-freshness-overlap')
+    const header = required(await messageHeader(target.id), 'target header')
+    const lease = await insertLease({
+      streamId: 'continuation-stale-freshness-overlap',
+      chatId,
+      messageId: target.id,
+      attemptKind: 'continuation',
+      targetCommittedAt: STARTED_AT + 1,
+      continuationStrategy: 'prompt',
+      baseNodeVersion: header.nodeVersion,
+      baseBodyVersion: header.bodyVersion,
+      requestedModel: settings().model,
+      apiUsed: 'chat',
+    })
+    await appendStreamText(lease, ['-once'])
+    const current = required(await streamLease(lease.streamId), 'current recovery lease')
+    const targetRepository = getBrowserRepository()
+    const workspace = await readWorkspaceMeta()
+
+    let releaseWorkspaceRead = () => {}
+    const workspaceReadGate = new Promise<void>((resolve) => {
+      releaseWorkspaceRead = resolve
+    })
+    let enteredWorkspaceRead = () => {}
+    const workspaceReadEntered = new Promise<void>((resolve) => {
+      enteredWorkspaceRead = resolve
+    })
+    let blockFirstWorkspaceRead = true
+    __setWorkspaceRepositoryForTests(
+      repositoryProxy(
+        targetRepository,
+        targetRepository.execute.bind(targetRepository),
+        async (kind) => {
+          if (!blockFirstWorkspaceRead || kind !== 'workspace.meta') return
+          blockFirstWorkspaceRead = false
+          enteredWorkspaceRead()
+          await workspaceReadGate
+        },
+      ),
+    )
+    const controller = new AbortController()
+    const stale = recoverStreamOrphan(
+      {
+        streamId: lease.streamId,
+        workspaceId: workspace.workspaceId,
+        replacementEpoch: workspace.replacementEpoch,
+        freshnessEpoch: 'stale-freshness-evidence',
+        freshnessDeadline: 0,
+      },
+      RECOVERY_AT + 1,
+      controller.signal,
+    )
+    await workspaceReadEntered
+    await runWorkspaceAction('stream-recovery', (permit) =>
+      getWorkspaceRepository().execute(permit, {
+        kind: 'stream.claim-recovery',
+        expected: current,
+        now: STARTED_AT - 120_000,
+      }),
+    )
+    await vi.waitFor(() => {
+      expect(streamRecoveryRuntimeSnapshot().queuedCount).toBe(1)
+    })
+
+    controller.abort(new Error('stale freshness caller aborted'))
+    releaseWorkspaceRead()
+
+    await expect(stale).rejects.toThrow('stale freshness caller aborted')
+    await vi.waitFor(async () => {
+      expect(await streamLease(lease.streamId)).toBeUndefined()
+    })
+    expect(streamRecoveryRuntimeSnapshot().queuedCount).toBe(0)
+    expect((await message(target.id))?.content).toEqual([
+      { type: 'output_text', text: 'original-once' },
+    ])
+    expect((await message(target.id))?.continuationAttempts).toHaveLength(1)
+  })
+
+  it('cleans a missing target through the same canonical recovery protocol', async () => {
+    const { chatId, target } = await seedAssistant('missing-target')
+    const lease = await insertLease({
+      streamId: 'missing-target-recovery',
+      chatId,
+      messageId: target.id,
+      attemptKind: 'generation',
+      targetCommittedAt: STARTED_AT + 1,
+      requestedModel: settings().model,
+      apiUsed: 'chat',
+    })
+    await appendStreamText(lease, ['-orphan'])
     await getDb().transaction('rw', getDb().messages, getDb().messageBodies, async () => {
       await getDb().messages.delete(target.id)
       await getDb().messageBodies.delete(target.id)
     })
-    const originalDelete = repo.deleteStreamJournal.bind(repo)
-    let failed = false
-    vi.spyOn(repo, 'deleteStreamJournal').mockImplementation(async (...args) => {
-      if (!failed && args[0] === newerSibling.streamId) {
-        failed = true
-        throw new Error('injected missing-target group cleanup failure')
-      }
-      return originalDelete(...args)
-    })
-    const replacementEpoch = durableLeaseFields(anchor).replacementEpoch
-    const point = {
-      chatId,
-      streamId: anchor.streamId,
-      messageId: target.id,
-      attemptKind: 'generation' as const,
-      replacementEpoch,
-    }
 
-    await expect(recoverStreamOrphan(point, 100_000)).rejects.toThrow(
-      'injected missing-target group cleanup failure',
+    await expect(recoverStreamOrphan({ streamId: lease.streamId }, RECOVERY_AT)).resolves.toBe(
+      'recovered',
     )
-    expect(await repo.getStreamLease(anchor.streamId)).toBeDefined()
-    expect(await repo.listStreamChunksForMessage(target.id)).toHaveLength(2)
-
-    await expect(recoverStreamOrphan(point, 100_001)).resolves.toBe('recovered')
-    expect(await repo.listStreamLeasesForMessage(target.id)).toEqual([])
-    expect(await repo.listStreamChunksForMessage(target.id)).toEqual([])
+    expect(await message(target.id)).toBeUndefined()
+    expect(await streamLease(lease.streamId)).toBeUndefined()
+    expect(await streamFrames(lease.streamId)).toEqual([])
   })
 
-  it("never cleans another chat's target when a corrupt point reuses its message id", async () => {
-    const pointChat = await createChat({ settings: settings() })
-    const { chatId: ownerChatId, target } = await seedAssistant(
-      'cross-chat-missing-target-safety',
-      false,
-    )
-    const repo = getBrowserRepository()
-    const ownerLease = await repo.upsertStreamLease({
-      streamId: 'cross-chat-owner-stream',
-      chatId: ownerChatId,
+  it('fences recovery points from another workspace incarnation without touching the lease', async () => {
+    const { chatId, target } = await seedAssistant('workspace-fence')
+    const lease = await insertLease({
+      streamId: 'workspace-fenced-recovery',
+      chatId,
       messageId: target.id,
-      ownerClientId: 'cross-chat-owner',
-      startedAt: 100,
-      heartbeatAt: 200,
       attemptKind: 'generation',
+      targetCommittedAt: STARTED_AT + 1,
+      requestedModel: settings().model,
+      apiUsed: 'chat',
     })
-    await repo.appendStreamChunks([streamTextRow(ownerLease, target.id, '-owner-data')])
-    const replacementEpoch = durableLeaseFields(ownerLease).replacementEpoch
+    await appendStreamText(lease, ['-must-remain'])
+    const retained = required(await streamLease(lease.streamId), 'retained workspace-fenced lease')
+    const workspace = await readWorkspaceMeta()
 
     await expect(
       recoverStreamOrphan(
         {
-          chatId: pointChat.id,
-          streamId: 'cross-chat-corrupt-point',
-          messageId: target.id,
-          attemptKind: 'generation',
-          replacementEpoch,
+          streamId: lease.streamId,
+          workspaceId: `${workspace.workspaceId}-stale`,
+          replacementEpoch: workspace.replacementEpoch,
         },
-        100_000,
+        RECOVERY_AT,
       ),
-    ).resolves.toBe('recovered')
-
-    expect(await repo.getStreamLease(ownerLease.streamId)).toMatchObject({
-      streamId: ownerLease.streamId,
-      chatId: ownerChatId,
-      messageId: target.id,
-      ownerClientId: ownerLease.ownerClientId,
-      fenceToken: ownerLease.fenceToken,
-      replacementEpoch: ownerLease.replacementEpoch,
-    })
-    expect(await repo.listStreamChunks(ownerLease.streamId)).toHaveLength(1)
-    expect(await repo.getMessageHeader(target.id)).toMatchObject({ chatId: ownerChatId })
+    ).resolves.toBe('resolved')
+    expect(await streamLease(lease.streamId)).toEqual(retained)
+    expect(await streamFrames(lease.streamId)).toHaveLength(1)
   })
 })
 
-async function seedAssistant(
-  suffix: string,
-  finished: boolean,
-): Promise<{ chatId: string; target: Message }> {
+async function seedAssistant(suffix: string): Promise<{ chatId: string; target: Message }> {
   const chat = await createChat({ settings: settings() })
-  const repo = getBrowserRepository()
-  const user: Message = {
-    id: `user-${suffix}`,
+  const imported = await importMessagesOp({
     chatId: chat.id,
-    parentId: null,
-    siblingIndex: 0,
-    turnId: `user-turn-${suffix}`,
-    turnIndex: 0,
-    createdAt: 10,
-    role: 'user',
-    origin: 'user',
-    content: [{ type: 'text', text: 'question' }],
-    nodeVersion: 0,
-    deleted: false,
-  }
-  const target: Message = {
-    id: `assistant-${suffix}`,
-    chatId: chat.id,
-    parentId: user.id,
-    siblingIndex: 0,
-    turnId: `assistant-turn-${suffix}`,
-    turnIndex: 0,
-    createdAt: 20,
-    role: 'assistant',
-    origin: 'generated',
-    content: [{ type: 'output_text', text: 'original' }],
-    generation: {
-      id: `generation-${suffix}`,
-      model: 'test/recovery-model',
-      requestedModel: 'test/recovery-model',
-      apiUsed: 'chat',
-      delivery: 'streaming',
-      costSource: 'stream',
-      startedAt: 11,
-      ...(finished ? { finishedAt: 19, status: 'done' as const, integrity: 'clean' as const } : {}),
-    },
-    nodeVersion: 0,
-    deleted: false,
-  }
-  await repo.runMutation(
-    [
-      { kind: 'message', messageId: user.id },
-      { kind: 'message', messageId: target.id },
-      { kind: 'children', chatId: chat.id, parentId: null },
-      { kind: 'children', chatId: chat.id, parentId: user.id },
+    slot: { kind: 'at-end' },
+    activeLeafId: null,
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'question' }] },
+      { role: 'assistant', content: [{ type: 'output_text', text: 'original' }] },
     ],
-    async (ctx) => {
-      await ctx.putMessage(user)
-      await ctx.putMessage(target)
-    },
-  )
+    now: STARTED_AT - 100,
+  })
+  const target = required(imported.presentations[1]?.message, `assistant ${suffix}`)
   return { chatId: chat.id, target }
 }
 
-function streamTextRow(lease: StreamLeaseRow, messageId: string, text: string) {
-  const durable = durableLeaseFields(lease)
-  return {
-    id: `${lease.streamId}:0`,
-    streamId: lease.streamId,
-    chatId: lease.chatId,
-    messageId,
-    seq: 0,
-    createdAt: 300,
-    event: { lane: 'text' as const, text },
-    fenceToken: durable.fenceToken,
-    replacementEpoch: durable.replacementEpoch,
+type LeaseInput =
+  | (TestGenerationLeaseInput & { attemptKind: 'generation' })
+  | (TestContinuationLeaseInput & { attemptKind: 'continuation' })
+
+function leaseRow(input: LeaseInput): StreamLeaseRow {
+  const common = {
+    ...input,
+    ownerClientId: `owner:${input.streamId}`,
+    fenceToken: `fence:${input.streamId}`,
+    replacementEpoch: 0,
+    startedAt: STARTED_AT,
+    heartbeatAt: STARTED_AT,
+    admissionSequence: input.admissionSequence ?? 1,
+    revision: 0,
+    postCommit: input.postCommit ?? {
+      usedAt: STARTED_AT,
+      profileId: settings().profileId,
+    },
   }
+  return input.attemptKind === 'continuation'
+    ? testContinuationLease(common)
+    : testGenerationLease(common)
 }
 
-function durableLeaseFields(lease: StreamLeaseRow): {
-  fenceToken: string
-  replacementEpoch: number
-  admissionSequence: number
-} {
-  if (
-    !lease.fenceToken ||
-    lease.replacementEpoch === undefined ||
-    lease.admissionSequence === undefined
-  ) {
-    throw new Error(`expected durable lease fields for ${lease.streamId}`)
-  }
+async function insertLease(input: LeaseInput): Promise<StreamLeaseRow> {
+  const lease = leaseRow(input)
+  await getDb().streamLeases.put(lease)
+  return lease
+}
+
+function leaseFence(lease: StreamLeaseRow) {
+  if (!streamLeaseHasWriteFence(lease)) throw new Error('ExpectedFencedTestLease')
   return {
+    ownerClientId: lease.ownerClientId,
     fenceToken: lease.fenceToken,
     replacementEpoch: lease.replacementEpoch,
     admissionSequence: lease.admissionSequence,
   }
 }
 
-function endedStreamIds(events: readonly BroadcastEvent[]): string[] {
-  return events
-    .filter((event) => event.kind === 'stream-ended')
-    .map((event) => event.streamId)
-    .sort()
+async function streamTextFrames(
+  lease: StreamLeaseRow,
+  texts: readonly string[],
+): Promise<readonly CanonicalStreamJournalFrameRow[]> {
+  return encodeTestStreamJournalEntries({
+    streamId: lease.streamId,
+    chatId: lease.chatId,
+    messageId: lease.messageId,
+    fence: leaseFence(lease),
+    entries: texts.map((text, index) => ({
+      createdAt: STARTED_AT + 2 + index,
+      event: persistStreamEventV2({ lane: 'text', text }),
+    })),
+  })
+}
+
+async function appendStreamText(lease: StreamLeaseRow, texts: readonly string[]): Promise<void> {
+  const frames = await streamTextFrames(lease, texts)
+  await runWorkspaceAction('stream-recovery', (permit) =>
+    getWorkspaceRepository().execute(permit, {
+      kind: 'stream.append-journal-frames',
+      frames,
+    }),
+  )
+}
+
+async function putStreamTextFrames(lease: StreamLeaseRow, texts: readonly string[]): Promise<void> {
+  await getDb().streamChunks.bulkPut([...(await streamTextFrames(lease, texts))])
+}
+
+async function message(messageId: MessageId): Promise<Message | undefined> {
+  return runWorkspaceRead('repository-query', async (permit) => {
+    return (
+      await getWorkspaceRepository().query(
+        permit,
+        { kind: 'message.presentation', messageId },
+        { signal: permit.signal },
+      )
+    ).value?.message
+  })
+}
+
+async function messageHeader(messageId: MessageId) {
+  return readTestMessageHeader(messageId)
+}
+
+async function streamLease(streamId: string): Promise<StreamLeaseRow | undefined> {
+  return runWorkspaceRead('repository-query', async (permit) => {
+    return (
+      await getWorkspaceRepository().query(
+        permit,
+        { kind: 'stream.lease', streamId },
+        { signal: permit.signal },
+      )
+    ).value
+  })
+}
+
+async function streamFrames(streamId: string): Promise<readonly CanonicalStreamJournalFrameRow[]> {
+  return runWorkspaceRead('repository-query', async (permit) => {
+    const frames: CanonicalStreamJournalFrameRow[] = []
+    let afterSeq = -1
+    for (;;) {
+      const page = (
+        await getWorkspaceRepository().query(
+          permit,
+          {
+            kind: 'stream.journal-frame-page',
+            streamId,
+            afterSeq,
+            throughSeq: Number.MAX_SAFE_INTEGER,
+          },
+          { signal: permit.signal },
+        )
+      ).value
+      frames.push(...page.frames)
+      if (page.done) return frames
+      if (page.nextAfterSeq <= afterSeq) {
+        throw new Error(`StreamJournalPageMadeNoProgress:${streamId}`)
+      }
+      afterSeq = page.nextAfterSeq
+    }
+  })
+}
+
+function repositoryProxy(
+  target: WorkspaceRepository,
+  execute: WorkspaceRepository['execute'],
+  beforeQuery?: (kind: string) => Promise<void>,
+): WorkspaceRepository {
+  return {
+    async query(permit, query, options) {
+      await beforeQuery?.(query.kind)
+      return target.query(permit, query, options)
+    },
+    execute,
+    replace: target.replace.bind(target),
+    subscribeChanges: target.subscribeChanges.bind(target),
+  }
 }
 
 function required<T>(value: T | undefined, label: string): T {

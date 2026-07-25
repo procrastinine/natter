@@ -13,6 +13,43 @@
   color: var(--color-fg-primary);
 }
 
+[data-ui="workspace-bootstrap"][data-presentation="nonblocking"] {
+  position: fixed;
+  right: var(--space-4);
+  bottom: var(--space-4);
+  z-index: var(--z-toast, 100);
+  min-height: 0;
+  padding: 0;
+  pointer-events: none;
+  background: transparent;
+}
+
+[data-ui="workspace-bootstrap"][data-presentation="nonblocking"]
+  [data-ui="workspace-bootstrap-card"] {
+  width: auto;
+  max-width: min(420px, calc(100vw - 2 * var(--space-4)));
+  padding: var(--space-3) var(--space-4);
+  box-shadow: var(--shadow-sm);
+}
+
+[data-ui="workspace-bootstrap"][data-presentation="nonblocking"]
+  [data-ui="workspace-bootstrap-kicker"] {
+  margin-bottom: var(--space-1);
+}
+
+[data-ui="workspace-bootstrap"][data-presentation="nonblocking"]
+  [data-ui="workspace-bootstrap-card"]
+  h1 {
+  margin-bottom: var(--space-1);
+  font-size: var(--font-size-sm);
+}
+
+[data-ui="workspace-bootstrap"][data-presentation="nonblocking"]
+  [data-ui="workspace-bootstrap-card"]
+  p {
+  font-size: var(--font-size-xs);
+}
+
 [data-ui="workspace-bootstrap-card"] {
   width: min(600px, 100%);
   padding: var(--space-6);

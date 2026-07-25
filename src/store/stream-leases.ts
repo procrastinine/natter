@@ -1,169 +1,245 @@
-import { invalidatePostCommitTasks } from '../core/post-commit-task'
-import type { ChatId, MessageId } from '../core/types'
+import type { ChatId, KeyId, MessageId } from '../core/types'
 import { newId } from '../lib/ulid'
-import { type BroadcastEvent, isBroadcastChannelAvailable, onEvent, postEvent } from './broadcast'
+import type { AttemptOwnershipLockObservation, LocalAttemptAuthority } from './attempt-availability'
 import {
-  STREAM_LEASE_TTL_MS,
+  type FencedStreamLeaseRow,
+  type StreamLeaseAdmission,
+  type StreamLeaseHandoffReason,
   type StreamLeaseRow,
   type StreamWriteFence,
-  type WorkspaceRepository,
+  streamLeaseHasWriteFence,
+  type WorkspaceFence,
+  type WriterActiveStreamLeaseRow,
 } from './repository'
+import { STREAM_LEASE_HEARTBEAT_MS } from './stream-lease-policy'
+import { subscribeWorkspaceEffects, WORKSPACE_EFFECT_RECOVERY_OWNED } from './workspace-effect-hub'
+import type {
+  AttemptSealTerminalInput,
+  GenerationPostCommitMetadataResult,
+  StreamFinishCleanupResult,
+  WorkspaceDeltaFact,
+  WorkspaceLocalCommitApplication,
+  WorkspaceRepository,
+} from './workspace-protocol'
 import { getWorkspaceRepository } from './workspace-repository'
-import { clearLiveSnapshotIfPresent, useStreamStore } from './zustand/streamStore'
+import {
+  assertWorkspaceExecutionPermit,
+  releaseWorkspaceChild,
+  runWorkspacePhase,
+  type WorkspaceReservedPermit,
+  type WorkspaceWritePermit,
+} from './workspace-runtime'
 
-const STREAM_LEASE_HEARTBEAT_MS = 2_000
-const STREAM_LEASE_REFRESH_RETRY_MS = 2_000
-
-export { STREAM_LEASE_TTL_MS } from './repository'
-
-const ENDED_STREAM_TOMBSTONE_LIMIT = 4_096
-
-export type StreamEndedAnnouncement = Omit<
-  Extract<BroadcastEvent, { kind: 'stream-ended' }>,
-  'kind'
->
-
-export type RemoteStreamLeasesExpiredHandler = (leases: readonly StreamLeaseRow[]) => void
-
-export type RemoteStreamOwnershipReleasedHandler = (stream: {
-  chatId: ChatId
+interface LeaseWriterInput {
   streamId: string
-  messageId?: MessageId
-  attemptKind?: 'generation' | 'continuation'
-  replacementEpoch?: number
-}) => void
-
-interface RemoteStreamOwnershipReleaseSubscription {
-  chatId: ChatId | null
-  handler: RemoteStreamOwnershipReleasedHandler
-  stopped: boolean
-  watches: Map<string, AbortController>
+  chatId: ChatId
+  messageId: MessageId
+  startedAt: number
+  attemptKind: StreamLeaseRow['attemptKind']
+  workspaceId: string
+  replacementEpoch: number
 }
 
+type WriterStreamLeaseRow = Extract<FencedStreamLeaseRow, { custody: 'writer' }>
+
 interface ActiveLeaseWriter {
-  input: Parameters<typeof startStreamLease>[0]
+  input: LeaseWriterInput
   readonly repo: WorkspaceRepository
+  readonly applications: StreamLeaseLocalApplications
+  readonly runtimePermit: WorkspaceReservedPermit
+  readonly finishRuntime: () => void
   readonly fenceToken: string
+  readonly workspaceId: string
   readonly replacementEpoch: number
-  lease?: StreamLeaseRow
+  readonly abortTransport: () => void
+  lease: WriterStreamLeaseRow
+  deliveredControlRevision: number
+  transportInterrupted: boolean
   nextHeartbeatAt: number | null
   releaseOwnership: (() => void) | null
   ownershipSettled: Promise<void> | null
   closed: boolean
   writeScheduled: boolean
+  operationTail: Promise<void>
+  retirementPromise: Promise<StreamLeaseRetirementOutcome> | null
+}
+
+interface StreamOwnershipHold {
+  release: (() => void) | null
+  settled: Promise<void> | null
+}
+
+interface StreamOwnershipReservationState {
+  readonly admission: StreamLeaseAdmission
+  readonly runtimePermit: WorkspaceReservedPermit
+  readonly hold: StreamOwnershipHold
+  readonly abortTransport: () => void
+  stopEvidencePending: boolean
+  boundAdmissionSequence: number | null
+  pendingBoundControlRevision: number
+  transportInterrupted: boolean
+  status: 'reserved' | 'bound' | 'released'
+  releasePromise: Promise<void> | null
+}
+
+const STREAM_OWNERSHIP_RESERVATION = Symbol('stream-ownership-reservation')
+
+export interface StreamOwnershipReservation {
+  readonly streamId: string
+  readonly [STREAM_OWNERSHIP_RESERVATION]: StreamOwnershipReservationState
+}
+
+export type StreamLeaseRetirementOutcome =
+  | { readonly mode: 'cleanup'; readonly result: StreamFinishCleanupResult }
+  | { readonly mode: 'handoff'; readonly lease: StreamLeaseRow }
+
+export interface StreamLeaseLocalApplications {
+  readonly postCommitMetadata: WorkspaceLocalCommitApplication<GenerationPostCommitMetadataResult>
+  readonly cleanup: WorkspaceLocalCommitApplication<StreamFinishCleanupResult>
+  readonly handoff: WorkspaceLocalCommitApplication<StreamLeaseRow>
+}
+
+type StreamLeaseRetirementOptions =
+  | { readonly mode?: 'cleanup'; readonly handoffReason?: StreamLeaseHandoffReason }
+  | {
+      readonly mode: 'handoff'
+      readonly reason: StreamLeaseHandoffReason
+    }
+
+export interface StreamLeaseHandle {
+  readonly streamId: string
+  readonly fence: StreamWriteFence
+  readonly lease: FencedStreamLeaseRow
+  adoptTargetCommit(lease: WriterActiveStreamLeaseRow): Promise<StreamWriteFence>
+  noteSelectedKey(selectedKeyId: KeyId): Promise<void>
+  sealTerminal(
+    input: Omit<AttemptSealTerminalInput, 'streamId' | 'fence'>,
+  ): Promise<Extract<FencedStreamLeaseRow, { phase: 'terminal-decided' }>>
+  commitPostCommitMetadata(): Promise<GenerationPostCommitMetadataResult>
+  retire(options?: StreamLeaseRetirementOptions): Promise<StreamLeaseRetirementOutcome>
+}
+
+export interface ClaimedLocalAttemptStop {
+  readonly streamId: string
+  readonly chatId: ChatId
+  readonly messageId: MessageId
+  readonly kind: StreamLeaseRow['attemptKind']
+  readonly workspaceId: string
+  readonly replacementEpoch: number
+  readonly admissionSequence: number
+}
+
+export function interruptClaimedLocalAttemptTransport(target: ClaimedLocalAttemptStop): boolean {
+  const writer = leaseWriters.get(target.streamId)
+  if (
+    writer &&
+    !writer.closed &&
+    writer.input.chatId === target.chatId &&
+    writer.input.messageId === target.messageId &&
+    writer.input.attemptKind === target.kind &&
+    writer.workspaceId === target.workspaceId &&
+    writer.replacementEpoch === target.replacementEpoch &&
+    writer.lease.admissionSequence === target.admissionSequence
+  ) {
+    interruptWriterTransport(writer)
+    return true
+  }
+  const reservation = ownershipReservations.get(target.streamId)
+  if (
+    reservation?.status === 'reserved' &&
+    reservation.runtimePermit.workspaceId === target.workspaceId &&
+    reservation.admission.chatId === target.chatId &&
+    reservation.admission.messageId === target.messageId &&
+    reservation.admission.attemptKind === target.kind &&
+    reservation.admission.replacementEpoch === target.replacementEpoch &&
+    reservation.boundAdmissionSequence === target.admissionSequence
+  ) {
+    interruptReservationTransport(reservation)
+    return true
+  }
+  return false
 }
 
 type StreamLockManager = Pick<LockManager, 'request'>
 
 const clientId = newId()
-const activeLeaseWriters = new Map<string, ActiveLeaseWriter>()
-const streamOperationTails = new Map<string, Promise<void>>()
-const streamOwnershipTasks = new Set<Promise<void>>()
-const endedStreamIds = new Set<string>()
+const leaseWriters = new Map<string, ActiveLeaseWriter>()
+const ownershipReservations = new Map<string, StreamOwnershipReservationState>()
+let unsubscribeStopControl: (() => void) | null = null
 let lockManagerOverride: StreamLockManager | null | undefined
-let listenerInstalled = false
-let unsubscribe: (() => void) | null = null
+let streamLeaseRuntimeDisposed = true
+let streamRuntimeWork = 0
+let streamLeaseRuntimeIdle: Promise<void> = Promise.resolve()
+let resolveStreamLeaseRuntimeIdle: (() => void) | null = null
 let heartbeatTimer: ReturnType<typeof setTimeout> | null = null
 let heartbeatDeadline: number | null = null
-let heartbeatSchedulerWakeups = 0
-let fallbackRefreshTimer: ReturnType<typeof setInterval> | null = null
-let remoteExpiryTimer: ReturnType<typeof setTimeout> | null = null
-let remoteExpiryDeadline: number | null = null
-let refreshInFlight: { generation: number; promise: Promise<void> } | null = null
-let refreshGeneration = 0
-let currentReplacementEpoch: number | null = null
-let remoteObservationRevision = 0
-const remoteHeartbeatAtByStreamId = new Map<string, number>()
-const remoteExpiryHeap: Array<{ streamId: string; heartbeatAt: number }> = []
-const remoteObservationRevisionByStreamId = new Map<string, number>()
-const reportedExpiredStreamIds = new Set<string>()
-const remoteExpiryHandlers = new Set<RemoteStreamLeasesExpiredHandler>()
-const remoteOwnershipReleaseSubscriptions = new Set<RemoteStreamOwnershipReleaseSubscription>()
+let currentWorkspaceFence: WorkspaceFence | null = null
 
 export function getStreamClientId(): string {
   return clientId
 }
 
-export function isFreshStreamLease(lease: StreamLeaseRow, now = Date.now()): boolean {
-  return now - lease.heartbeatAt <= STREAM_LEASE_TTL_MS
+export function getLocalAttemptAuthority(streamId: string): LocalAttemptAuthority {
+  const writer = leaseWriters.get(streamId)
+  if (writer) {
+    return Object.freeze({
+      kind: 'writer',
+      workspaceId: writer.workspaceId,
+      lease: writer.lease,
+    })
+  }
+  const reservation = ownershipReservations.get(streamId)
+  if (reservation?.status === 'reserved') {
+    return Object.freeze({
+      kind: 'reservation',
+      workspaceId: reservation.runtimePermit.workspaceId,
+      admission: reservation.admission,
+    })
+  }
+  return Object.freeze({ kind: 'none' })
+}
+
+export async function observeStreamOwnershipLock(
+  streamId: string,
+): Promise<AttemptOwnershipLockObservation> {
+  if (streamLeaseRuntimeDisposed) return Object.freeze({ kind: 'unobserved' })
+  const manager = streamLockManager()
+  if (!manager) return Object.freeze({ kind: 'unsupported' })
+  return trackStreamRuntimePromise(observeStreamOwnershipLockWithManager(manager, streamId))
+}
+
+async function observeStreamOwnershipLockWithManager(
+  manager: StreamLockManager,
+  streamId: string,
+): Promise<AttemptOwnershipLockObservation> {
+  let observation: AttemptOwnershipLockObservation = Object.freeze({ kind: 'unobserved' })
+  try {
+    await manager.request(streamOwnershipLockName(streamId), { ifAvailable: true }, (lock) => {
+      observation = lock
+        ? Object.freeze({ kind: 'acquired-for-recovery', streamId })
+        : Object.freeze({ kind: 'held-by-other', streamId, observedAt: Date.now() })
+    })
+  } catch {
+    return Object.freeze({ kind: 'unobserved' })
+  }
+  return observation
 }
 
 export function isRecoveryClaimedStreamLease(lease: StreamLeaseRow): boolean {
-  return lease.ownerClientId.startsWith('recovery:')
-}
-
-export function streamLeaseRecoveryKind(
-  lease: Pick<
-    StreamLeaseRow,
-    'attemptKind' | 'continuationStrategy' | 'baseNodeVersion' | 'baseBodyVersion'
-  >,
-): 'generation' | 'continuation' {
-  if (lease.attemptKind) return lease.attemptKind
-  return lease.continuationStrategy !== undefined ||
-    lease.baseNodeVersion !== undefined ||
-    lease.baseBodyVersion !== undefined
-    ? 'continuation'
-    : 'generation'
-}
-
-export function compareStreamLeaseAdmissionOrder(
-  left: StreamLeaseRow,
-  right: StreamLeaseRow,
-): number {
-  if (left.admissionSequence !== undefined || right.admissionSequence !== undefined) {
-    if (left.admissionSequence === undefined) return -1
-    if (right.admissionSequence === undefined) return 1
-    if (left.admissionSequence !== right.admissionSequence) {
-      return left.admissionSequence - right.admissionSequence
-    }
-  }
-  const leftEpoch = left.replacementEpoch ?? -1
-  const rightEpoch = right.replacementEpoch ?? -1
-  if (leftEpoch !== rightEpoch) return leftEpoch - rightEpoch
-  if (left.startedAt !== right.startedAt) return left.startedAt - right.startedAt
-  if (left.heartbeatAt !== right.heartbeatAt) return left.heartbeatAt - right.heartbeatAt
-  return left.streamId.localeCompare(right.streamId)
-}
-
-export function newestStreamLeaseByAdmission(
-  leases: readonly StreamLeaseRow[],
-): StreamLeaseRow | undefined {
-  let newest: StreamLeaseRow | undefined
-  for (const lease of leases) {
-    if (!newest || compareStreamLeaseAdmissionOrder(lease, newest) > 0) newest = lease
-  }
-  return newest
-}
-
-export function indexStreamLeasesForRecovery(leases: readonly StreamLeaseRow[]): {
-  byMessageId: ReadonlyMap<MessageId, readonly StreamLeaseRow[]>
-  messageLessGenerationByChatId: ReadonlyMap<ChatId, readonly StreamLeaseRow[]>
-} {
-  const byMessageId = new Map<MessageId, StreamLeaseRow[]>()
-  const messageLessGenerationByChatId = new Map<ChatId, StreamLeaseRow[]>()
-  for (const lease of leases) {
-    const messageId = lease.messageId
-    if (messageId !== undefined) {
-      const indexed = byMessageId.get(messageId)
-      if (indexed) indexed.push(lease)
-      else byMessageId.set(messageId, [lease])
-      continue
-    }
-    if (streamLeaseRecoveryKind(lease) !== 'generation') continue
-    const indexed = messageLessGenerationByChatId.get(lease.chatId)
-    if (indexed) indexed.push(lease)
-    else messageLessGenerationByChatId.set(lease.chatId, [lease])
-  }
-  return { byMessageId, messageLessGenerationByChatId }
+  return lease.custody === 'recovery' || lease.custody === 'recovery-pending'
 }
 
 export type StreamRecoveryLockResult<T> = { acquired: false } | { acquired: true; value: T }
 
-export function streamOwnershipLocksSupported(): boolean {
-  return streamLockManager() !== null
+export async function withStreamRecoveryLocks<T>(
+  streamIds: readonly string[],
+  recover: (ownershipVerified: boolean) => Promise<T>,
+): Promise<StreamRecoveryLockResult<T>> {
+  if (streamLeaseRuntimeDisposed) throw new Error('StreamLeaseRuntimeDisposed')
+  return trackStreamRuntimePromise(withStreamRecoveryLocksInternal(streamIds, recover))
 }
 
-export async function withStreamRecoveryLocks<T>(
+async function withStreamRecoveryLocksInternal<T>(
   streamIds: readonly string[],
   recover: (ownershipVerified: boolean) => Promise<T>,
 ): Promise<StreamRecoveryLockResult<T>> {
@@ -193,721 +269,522 @@ export async function withStreamRecoveryLocks<T>(
   return result
 }
 
-export function installStreamLeaseListener(): void {
-  if (listenerInstalled) return
-  listenerInstalled = true
-  unsubscribe = onEvent((event) => {
-    if (event.kind === 'workspace-replaced') {
-      replaceStreamWorkspace(event.replacementEpoch)
-      ensureFallbackLeaseRefresh()
-      refreshRemoteStreamLeasesWithRetry()
-      return
-    }
-    if (event.kind === 'workspace-invalidated') {
-      refreshGeneration += 1
-      ensureFallbackLeaseRefresh()
-      refreshRemoteStreamLeasesWithRetry()
-      return
-    }
-    if (event.kind === 'stream-heartbeat') {
-      applyRemoteLease(event.lease, { recordObservation: true })
-      return
-    }
-    if (event.kind === 'stream-started') {
-      applyRemoteStreamStarted(event)
-      return
-    }
-    if (event.kind === 'stream-ended') {
-      applyStreamEnded(event)
-      return
-    }
-    if (
-      event.kind === 'stream-abort-requested' &&
-      event.ownerClientId === clientId &&
-      event.replacementEpoch === currentReplacementEpoch
-    ) {
-      useStreamStore.getState().abortStream(event.streamId, event.replacementEpoch)
-    }
-  })
-  ensureFallbackLeaseRefresh()
-  refreshRemoteStreamLeasesWithRetry()
-}
-
-export function announceStreamEnded(event: StreamEndedAnnouncement): void {
-  applyStreamEnded({ kind: 'stream-ended', ...event })
-  postEvent({ kind: 'stream-ended', ...event })
-}
-
-function replaceStreamWorkspace(replacementEpoch: number): boolean {
-  if (currentReplacementEpoch !== null && replacementEpoch <= currentReplacementEpoch) {
+export async function waitForStreamOwnershipRelease(
+  streamId: string,
+  signal: AbortSignal,
+): Promise<boolean> {
+  if (streamLeaseRuntimeDisposed || signal.aborted) return false
+  const manager = streamLockManager()
+  if (!manager) return false
+  try {
+    await manager.request(streamOwnershipLockName(streamId), { signal }, () => undefined)
+    return !signal.aborted
+  } catch {
     return false
   }
-  currentReplacementEpoch = replacementEpoch
-  invalidatePostCommitTasks()
-  refreshGeneration += 1
-  refreshInFlight = null
-  const writers = [...activeLeaseWriters.values()]
-  activeLeaseWriters.clear()
-  if (heartbeatTimer !== null) clearTimeout(heartbeatTimer)
-  heartbeatTimer = null
-  heartbeatDeadline = null
-  for (const writer of writers) {
-    writer.closed = true
-    writer.nextHeartbeatAt = null
-    writer.releaseOwnership?.()
-    writer.releaseOwnership = null
-  }
-  endedStreamIds.clear()
-  remoteObservationRevision = 0
-  remoteHeartbeatAtByStreamId.clear()
-  remoteExpiryHeap.length = 0
-  remoteObservationRevisionByStreamId.clear()
-  reportedExpiredStreamIds.clear()
-  for (const subscription of remoteOwnershipReleaseSubscriptions) {
-    for (const controller of subscription.watches.values()) controller.abort()
-    subscription.watches.clear()
-  }
-  if (remoteExpiryTimer !== null) clearTimeout(remoteExpiryTimer)
-  remoteExpiryTimer = null
-  remoteExpiryDeadline = null
-  useStreamStore.getState().replaceWorkspace(replacementEpoch)
-  return true
 }
 
-async function ensureCurrentReplacementEpoch(): Promise<number> {
-  if (currentReplacementEpoch !== null) {
-    if (useStreamStore.getState().replacementEpoch === null) {
-      useStreamStore.getState().replaceWorkspace(currentReplacementEpoch)
+export async function runWithStreamRecoveryCoordinatorLock(
+  workspaceId: string,
+  signal: AbortSignal,
+  coordinate: () => Promise<void>,
+): Promise<void> {
+  if (streamLeaseRuntimeDisposed || signal.aborted) return
+  const manager = streamLockManager()
+  if (!manager) {
+    await coordinate()
+    return
+  }
+  const state = { started: false }
+  try {
+    await manager.request(`stream-recovery-coordinator:${workspaceId}`, { signal }, async () => {
+      state.started = true
+      await coordinate()
+    })
+  } catch (error) {
+    if (state.started) throw error
+    if (signalIsActive(signal)) await coordinate()
+  }
+}
+
+function signalIsActive(signal: AbortSignal): boolean {
+  return !signal.aborted
+}
+
+export function reserveStreamOwnership(
+  runtimePermit: WorkspaceReservedPermit,
+  admission: StreamLeaseAdmission,
+  abortTransport: () => void,
+): Promise<StreamOwnershipReservation> {
+  if (streamLeaseRuntimeDisposed) {
+    releaseWorkspaceChild(runtimePermit)
+    return Promise.reject(new Error('StreamLeaseRuntimeDisposed'))
+  }
+  return trackStreamRuntimePromise(
+    reserveStreamOwnershipInternal(runtimePermit, admission, abortTransport),
+  )
+}
+
+async function reserveStreamOwnershipInternal(
+  runtimePermit: WorkspaceReservedPermit,
+  admission: StreamLeaseAdmission,
+  abortTransport: () => void,
+): Promise<StreamOwnershipReservation> {
+  let workspaceFence: WorkspaceFence
+  try {
+    workspaceFence = synchronizeWorkspaceFence(runtimePermit)
+  } catch (error) {
+    releaseWorkspaceChild(runtimePermit)
+    throw error
+  }
+  if (
+    admission.ownerClientId !== clientId ||
+    admission.replacementEpoch !== workspaceFence.replacementEpoch ||
+    admission.replacementEpoch !== runtimePermit.replacementEpoch
+  ) {
+    releaseWorkspaceChild(runtimePermit)
+    throw new Error(`StreamOwnershipReservationFenceMismatch:${admission.streamId}`)
+  }
+  let hold: StreamOwnershipHold
+  try {
+    hold = await acquireStreamOwnership(admission.streamId)
+  } catch (error) {
+    releaseWorkspaceChild(runtimePermit)
+    throw error
+  }
+  if (ownershipReservations.has(admission.streamId) || leaseWriters.has(admission.streamId)) {
+    await releaseStreamOwnershipHold(hold)
+    releaseWorkspaceChild(runtimePermit)
+    throw new Error(`StreamOwnershipReservationDuplicate:${admission.streamId}`)
+  }
+  const state: StreamOwnershipReservationState = {
+    admission: { ...admission },
+    runtimePermit,
+    hold,
+    abortTransport,
+    stopEvidencePending: false,
+    boundAdmissionSequence: null,
+    pendingBoundControlRevision: 0,
+    transportInterrupted: false,
+    status: 'reserved',
+    releasePromise: null,
+  }
+  ownershipReservations.set(admission.streamId, state)
+  return Object.freeze({
+    streamId: admission.streamId,
+    [STREAM_OWNERSHIP_RESERVATION]: state,
+  })
+}
+
+export function releaseStreamOwnershipReservation(
+  reservation: StreamOwnershipReservation,
+): Promise<void> {
+  return releaseStreamOwnershipReservationState(reservation[STREAM_OWNERSHIP_RESERVATION])
+}
+
+async function releaseStreamOwnershipReservationState(
+  state: StreamOwnershipReservationState,
+): Promise<void> {
+  if (state.releasePromise) return state.releasePromise
+  if (state.status !== 'reserved') return
+  state.status = 'released'
+  ownershipReservations.delete(state.admission.streamId)
+  state.releasePromise = (async () => {
+    try {
+      await releaseStreamOwnershipHold(state.hold)
+    } finally {
+      releaseWorkspaceChild(state.runtimePermit)
     }
-    return currentReplacementEpoch
+  })()
+  return state.releasePromise
+}
+
+export function adoptPreparedStreamLease(
+  reservation: StreamOwnershipReservation,
+  lease: StreamLeaseRow,
+  applications: StreamLeaseLocalApplications,
+): Promise<StreamLeaseHandle> {
+  const state = reservation[STREAM_OWNERSHIP_RESERVATION]
+  if (streamLeaseRuntimeDisposed) {
+    void releaseStreamOwnershipReservationState(state)
+    return Promise.reject(new Error('StreamLeaseRuntimeDisposed'))
   }
-  const replacementEpoch = (await getWorkspaceRepository().getWorkspaceMeta()).replacementEpoch
-  return synchronizeReplacementEpoch(replacementEpoch)
+  return trackStreamRuntimePromise(adoptPreparedStreamLeaseInternal(state, lease, applications))
 }
 
-function synchronizeReplacementEpoch(replacementEpoch: number): number {
-  if (currentReplacementEpoch === null) {
-    currentReplacementEpoch = replacementEpoch
-    useStreamStore.getState().replaceWorkspace(replacementEpoch)
-  } else if (replacementEpoch > currentReplacementEpoch) {
-    replaceStreamWorkspace(replacementEpoch)
+async function adoptPreparedStreamLeaseInternal(
+  reservation: StreamOwnershipReservationState,
+  lease: StreamLeaseRow,
+  applications: StreamLeaseLocalApplications,
+): Promise<StreamLeaseHandle> {
+  const runtimePermit = reservation.runtimePermit
+  let workspaceFence: WorkspaceFence
+  try {
+    workspaceFence = synchronizeWorkspaceFence(runtimePermit)
+  } catch (error) {
+    await releaseStreamOwnershipReservationState(reservation)
+    throw error
   }
-  return currentReplacementEpoch
-}
-
-export function onRemoteStreamLeasesExpired(handler: RemoteStreamLeasesExpiredHandler): () => void {
-  remoteExpiryHandlers.add(handler)
-  refreshRemoteStreamLeasesWithRetry()
-  return () => remoteExpiryHandlers.delete(handler)
-}
-
-export function onRemoteStreamOwnershipReleased(
-  chatId: ChatId,
-  handler: RemoteStreamOwnershipReleasedHandler,
-): () => void {
-  return subscribeRemoteStreamOwnershipReleased(chatId, handler)
-}
-
-export function onAnyRemoteStreamOwnershipReleased(
-  handler: RemoteStreamOwnershipReleasedHandler,
-): () => void {
-  return subscribeRemoteStreamOwnershipReleased(null, handler)
-}
-
-function subscribeRemoteStreamOwnershipReleased(
-  chatId: ChatId | null,
-  handler: RemoteStreamOwnershipReleasedHandler,
-): () => void {
-  const subscription: RemoteStreamOwnershipReleaseSubscription = {
-    chatId,
-    handler,
-    stopped: false,
-    watches: new Map(),
+  if (
+    reservation.status !== 'reserved' ||
+    lease.custody !== 'writer' ||
+    lease.ownerClientId !== clientId ||
+    lease.streamId !== reservation.admission.streamId ||
+    lease.chatId !== reservation.admission.chatId ||
+    lease.messageId !== reservation.admission.messageId ||
+    lease.attemptKind !== reservation.admission.attemptKind ||
+    lease.ownerClientId !== reservation.admission.ownerClientId ||
+    lease.fenceToken !== reservation.admission.fenceToken ||
+    lease.startedAt !== reservation.admission.startedAt ||
+    lease.replacementEpoch !== workspaceFence.replacementEpoch ||
+    lease.replacementEpoch !== reservation.admission.replacementEpoch ||
+    lease.replacementEpoch !== runtimePermit.replacementEpoch
+  ) {
+    await releaseStreamOwnershipReservationState(reservation)
+    throw new Error(`PreparedStreamLeaseFenceMismatch:${lease.streamId}`)
   }
-  remoteOwnershipReleaseSubscriptions.add(subscription)
-  const streams = chatId
-    ? useStreamStore.getState().listByChat(chatId)
-    : useStreamStore.getState().listActive()
-  for (const stream of streams) {
-    observeRemoteStreamOwnership(subscription, stream)
+  let repo: WorkspaceRepository
+  try {
+    repo = getWorkspaceRepository()
+  } catch (error) {
+    await releaseStreamOwnershipReservationState(reservation)
+    throw error
   }
-  void getWorkspaceRepository()
-    .listStreamLeases(chatId ?? undefined)
-    .then(
-      (leases) => {
-        if (subscription.stopped) return
-        for (const lease of leases) observeRemoteStreamOwnership(subscription, lease)
-      },
-      () => {},
+  reservation.boundAdmissionSequence = lease.admissionSequence
+  let adoptedLease = lease
+  if (reservation.stopEvidencePending) {
+    let observed: StreamLeaseRow | undefined
+    try {
+      observed = (
+        await repo.query(runtimePermit, { kind: 'stream.lease', streamId: lease.streamId })
+      ).value
+    } catch (error) {
+      await releaseStreamOwnershipReservationState(reservation)
+      throw error
+    }
+    if (
+      !observed ||
+      observed.custody !== 'writer' ||
+      observed.streamId !== lease.streamId ||
+      observed.chatId !== lease.chatId ||
+      observed.messageId !== lease.messageId ||
+      observed.attemptKind !== lease.attemptKind ||
+      observed.ownerClientId !== lease.ownerClientId ||
+      observed.fenceToken !== lease.fenceToken ||
+      observed.replacementEpoch !== lease.replacementEpoch ||
+      observed.startedAt !== lease.startedAt ||
+      observed.admissionSequence !== lease.admissionSequence ||
+      observed.phase !== lease.phase ||
+      observed.revision < lease.revision ||
+      observed.controlRevision < lease.controlRevision
+    ) {
+      await releaseStreamOwnershipReservationState(reservation)
+      throw new Error(`PreparedStreamLeaseStopEvidenceMismatch:${lease.streamId}`)
+    }
+    adoptedLease = observed
+  }
+  const writer = createLeaseWriter({
+    input: {
+      streamId: adoptedLease.streamId,
+      chatId: adoptedLease.chatId,
+      messageId: adoptedLease.messageId,
+      startedAt: adoptedLease.startedAt,
+      attemptKind: adoptedLease.attemptKind,
+      workspaceId: runtimePermit.workspaceId,
+      replacementEpoch: adoptedLease.replacementEpoch,
+    },
+    runtimePermit,
+    repo,
+    applications,
+    fenceToken: adoptedLease.fenceToken,
+    workspaceId: runtimePermit.workspaceId,
+    replacementEpoch: adoptedLease.replacementEpoch,
+    abortTransport: reservation.abortTransport,
+    deliveredControlRevision: 0,
+    transportInterrupted: reservation.transportInterrupted,
+    lease: { ...adoptedLease },
+  })
+  writer.releaseOwnership = reservation.hold.release
+  writer.ownershipSettled = reservation.hold.settled
+  reservation.status = 'bound'
+  ownershipReservations.delete(reservation.admission.streamId)
+  if (leaseWriters.has(writer.input.streamId)) {
+    throw new Error(`StreamLeaseWriterDuplicate:${writer.input.streamId}`)
+  }
+  leaseWriters.set(writer.input.streamId, writer)
+  applyDurableStopControl(writer, adoptedLease)
+  if (reservation.pendingBoundControlRevision > writer.deliveredControlRevision) {
+    writer.deliveredControlRevision = reservation.pendingBoundControlRevision
+    interruptWriterTransport(writer)
+  }
+  try {
+    assertWriterEpochCurrent(writer)
+  } catch (error) {
+    closeLeaseWriter(writer)
+    await handoffOwnedLease(writer, 'adoption-failed').catch(() => undefined)
+    await releaseOwnershipAfter(
+      writer,
+      pendingStreamOperations(writer).catch(() => {}),
     )
-  return () => stopRemoteOwnershipReleaseSubscription(subscription)
+    throw error
+  }
+  writer.nextHeartbeatAt = heartbeatSchedulerNow() + STREAM_LEASE_HEARTBEAT_MS
+  scheduleHeartbeatTimer()
+  return leaseHandle(writer)
 }
 
-export async function startStreamLease(input: {
-  streamId: string
-  chatId: ChatId
-  messageId?: MessageId
-  startedAt: number
-  attemptKind?: StreamLeaseRow['attemptKind']
-  continuationStrategy?: StreamLeaseRow['continuationStrategy']
-  baseBodyVersion?: number
-  baseNodeVersion?: number
-  requestedModel?: string
-  apiUsed?: StreamLeaseRow['apiUsed']
-  replacementEpoch?: number
-}): Promise<StreamWriteFence> {
-  const replacementEpoch = currentReplacementEpoch ?? (await ensureCurrentReplacementEpoch())
-  if (input.replacementEpoch !== undefined && input.replacementEpoch !== replacementEpoch) {
-    throw new Error(`StreamWorkspaceReplaced:${input.streamId}`)
-  }
-  const expectedReplacementEpoch = input.replacementEpoch ?? replacementEpoch
-  const existing = activeLeaseWriters.get(input.streamId)
-  if (existing) {
-    if (existing.input.chatId !== input.chatId) throw new Error('StreamLeaseChatMismatch')
-    if (existing.replacementEpoch !== expectedReplacementEpoch) {
-      throw new Error(`StreamWorkspaceReplaced:${input.streamId}`)
-    }
-    existing.input = { ...existing.input, ...input, startedAt: existing.input.startedAt }
-    await enqueueLeaseWrite(existing)
-    assertWriterEpochCurrent(existing)
-    return writerFence(existing)
-  }
-  const writer: ActiveLeaseWriter = {
-    input,
-    repo: getWorkspaceRepository(),
-    fenceToken: newId(),
-    replacementEpoch: expectedReplacementEpoch,
+function createLeaseWriter(input: {
+  input: LeaseWriterInput
+  runtimePermit: WorkspaceReservedPermit
+  repo: WorkspaceRepository
+  applications: StreamLeaseLocalApplications
+  fenceToken: string
+  workspaceId: string
+  replacementEpoch: number
+  abortTransport: () => void
+  deliveredControlRevision: number
+  transportInterrupted: boolean
+  lease: WriterStreamLeaseRow
+}): ActiveLeaseWriter {
+  let runtimeFinished = false
+  let resolveRuntime!: () => void
+  const runtimeLifetime = new Promise<void>((resolve) => {
+    resolveRuntime = resolve
+  })
+  const runtimePhase = runWorkspacePhase(input.runtimePermit, () => runtimeLifetime)
+  void runtimePhase.catch(() => {})
+  return {
+    input: input.input,
+    repo: input.repo,
+    applications: input.applications,
+    runtimePermit: input.runtimePermit,
+    finishRuntime: () => {
+      if (runtimeFinished) return
+      runtimeFinished = true
+      resolveRuntime()
+    },
+    fenceToken: input.fenceToken,
+    workspaceId: input.workspaceId,
+    replacementEpoch: input.replacementEpoch,
+    abortTransport: input.abortTransport,
+    lease: input.lease,
+    deliveredControlRevision: input.deliveredControlRevision,
+    transportInterrupted: input.transportInterrupted,
     nextHeartbeatAt: null,
     releaseOwnership: null,
     ownershipSettled: null,
     closed: false,
     writeScheduled: false,
+    operationTail: Promise.resolve(),
+    retirementPromise: null,
   }
-  activeLeaseWriters.set(input.streamId, writer)
-  try {
-    await holdStreamOwnership(writer)
-    await scheduleHeartbeat(writer)
-    assertWriterEpochCurrent(writer)
-  } catch (error) {
-    const closed = closeLeaseWriter(input.streamId)
-    if (closed) void releaseOwnershipAfter(closed, pendingStreamOperations(input.streamId))
-    await deleteCrossEpochAdmission(writer)
-    throw error
+}
+
+export function streamWriteFenceForLease(lease: FencedStreamLeaseRow): StreamWriteFence {
+  return {
+    ownerClientId: lease.ownerClientId,
+    fenceToken: lease.fenceToken,
+    replacementEpoch: lease.replacementEpoch,
+    admissionSequence: lease.admissionSequence,
   }
-  if (!writer.closed && activeLeaseWriters.get(input.streamId) === writer) {
-    writer.nextHeartbeatAt =
-      heartbeatTimer !== null && heartbeatDeadline !== null
-        ? heartbeatDeadline
-        : heartbeatSchedulerNow() + STREAM_LEASE_HEARTBEAT_MS
-    scheduleHeartbeatTimer()
+}
+
+export async function finishStreamCleanup(input: {
+  readonly repository: WorkspaceRepository
+  readonly permit: WorkspaceWritePermit
+  readonly chatId: ChatId
+  readonly streamId: string
+  readonly fence: StreamWriteFence
+  readonly application: WorkspaceLocalCommitApplication<StreamFinishCleanupResult>
+}): Promise<StreamFinishCleanupResult> {
+  let deletedLease = false
+  let deletedFrames = 0
+  for (;;) {
+    const committed = await input.repository.execute(
+      input.permit,
+      {
+        kind: 'stream.finish-cleanup',
+        chatId: input.chatId,
+        streamId: input.streamId,
+        fence: input.fence,
+      },
+      { localApplications: { conversation: input.application } },
+    )
+    deletedLease ||= committed.value.deletedLease
+    deletedFrames += committed.value.deletedFrames
+    if (committed.value.done) return { deletedLease, deletedFrames, done: true }
+    if (committed.value.deletedFrames === 0) {
+      throw new Error(`StreamCleanupMadeNoProgress:${input.streamId}`)
+    }
   }
-  return writerFence(writer)
+}
+
+function leaseHandle(writer: ActiveLeaseWriter): StreamLeaseHandle {
+  return Object.freeze({
+    streamId: writer.input.streamId,
+    get fence() {
+      return writerFence(writer)
+    },
+    get lease() {
+      return writer.lease
+    },
+    adoptTargetCommit: (lease: WriterActiveStreamLeaseRow) =>
+      enqueueWriterOperation(writer, () => {
+        assertWriterEpochCurrent(writer)
+        assertSameOwnedLease(writer, lease)
+        writer.lease = { ...lease }
+        return writerFence(writer)
+      }),
+    noteSelectedKey: (selectedKeyId: KeyId) =>
+      enqueueWriterOperation(writer, async () => {
+        assertWriterEpochCurrent(writer)
+        const noted = await writer.repo.execute(writer.runtimePermit, {
+          kind: 'stream.note-selected-key',
+          input: {
+            streamId: writer.input.streamId,
+            fence: writerFence(writer),
+            selectedKeyId,
+          },
+        })
+        assertSameOwnedLease(writer, noted.value)
+        writer.lease = { ...noted.value }
+      }),
+    sealTerminal: (input: Omit<AttemptSealTerminalInput, 'streamId' | 'fence'>) =>
+      enqueueWriterOperation(writer, async () => {
+        assertWriterEpochCurrent(writer)
+        const sealed = await writer.repo.execute(writer.runtimePermit, {
+          kind: 'attempt.seal-terminal',
+          input: {
+            ...input,
+            streamId: writer.input.streamId,
+            fence: writerFence(writer),
+          },
+        })
+        assertSameOwnedLease(writer, sealed.value)
+        writer.lease = { ...sealed.value }
+        return sealed.value
+      }),
+    commitPostCommitMetadata: () =>
+      enqueueWriterOperation(writer, async () => {
+        assertWriterEpochCurrent(writer)
+        const committed = await writer.repo.execute(
+          writer.runtimePermit,
+          {
+            kind: 'generation.post-commit-metadata',
+            input: {
+              streamId: writer.input.streamId,
+              fence: writerFence(writer),
+            },
+          },
+          {
+            localApplications: {
+              conversation: writer.applications.postCommitMetadata,
+            },
+          },
+        )
+        if (committed.value.outcome !== 'stale') {
+          assertSameOwnedLease(writer, committed.value.lease)
+          writer.lease = { ...committed.value.lease }
+        }
+        return committed.value
+      }),
+    retire: (options?: Parameters<StreamLeaseHandle['retire']>[0]) =>
+      retireLeaseWriter(writer, options),
+  })
+}
+
+function assertSameOwnedLease(
+  writer: ActiveLeaseWriter,
+  lease: StreamLeaseRow,
+): asserts lease is WriterStreamLeaseRow {
+  if (
+    !streamLeaseHasWriteFence(lease) ||
+    lease.custody !== 'writer' ||
+    lease.streamId !== writer.input.streamId ||
+    lease.chatId !== writer.input.chatId ||
+    lease.messageId !== writer.input.messageId ||
+    lease.ownerClientId !== clientId ||
+    lease.fenceToken !== writer.fenceToken ||
+    lease.replacementEpoch !== writer.replacementEpoch ||
+    lease.admissionSequence !== writer.lease.admissionSequence
+  ) {
+    throw new Error(`StreamLeaseTargetCommitMismatch:${writer.input.streamId}`)
+  }
+}
+
+function synchronizeWorkspaceFence(fence: WorkspaceFence): WorkspaceFence {
+  if (currentWorkspaceFence === null) {
+    currentWorkspaceFence = {
+      workspaceId: fence.workspaceId,
+      replacementEpoch: fence.replacementEpoch,
+    }
+  } else if (
+    currentWorkspaceFence.workspaceId === fence.workspaceId &&
+    currentWorkspaceFence.replacementEpoch > fence.replacementEpoch
+  ) {
+    return currentWorkspaceFence
+  } else if (!sameWorkspaceFence(currentWorkspaceFence, fence)) {
+    replaceStreamWorkspace(fence)
+  }
+  return currentWorkspaceFence
+}
+
+function replaceStreamWorkspace(fence: WorkspaceFence): void {
+  if (currentWorkspaceFence && sameWorkspaceFence(currentWorkspaceFence, fence)) return
+  assertNoOpenLeaseWriters('workspace-replacement')
+  currentWorkspaceFence = {
+    workspaceId: fence.workspaceId,
+    replacementEpoch: fence.replacementEpoch,
+  }
+  if (heartbeatTimer !== null) clearTimeout(heartbeatTimer)
+  heartbeatTimer = null
+  heartbeatDeadline = null
 }
 
 function assertWriterEpochCurrent(writer: ActiveLeaseWriter): void {
   if (
-    currentReplacementEpoch !== writer.replacementEpoch ||
-    writer.lease?.replacementEpoch !== writer.replacementEpoch
+    !currentWorkspaceFence ||
+    currentWorkspaceFence.workspaceId !== writer.workspaceId ||
+    currentWorkspaceFence.replacementEpoch !== writer.replacementEpoch ||
+    writer.lease.replacementEpoch !== writer.replacementEpoch
   ) {
     throw new Error(`StreamWorkspaceReplaced:${writer.input.streamId}`)
   }
 }
 
-async function deleteCrossEpochAdmission(writer: ActiveLeaseWriter): Promise<void> {
-  const lease = writer.lease
-  if (!lease || lease.replacementEpoch === writer.replacementEpoch) return
-  try {
-    await writer.repo.deleteOwnedStreamLease(lease.streamId, streamWriteFenceForLease(lease))
-  } catch {
-    // The unique owner fence makes a failed stale-admission cleanup safe to abandon.
-  }
-}
-
-export function stopStreamLease(
-  streamId: string,
-  options: { deleteRow?: boolean } = {},
-): Promise<void> {
-  const writer = activeLeaseWriters.get(streamId)
-  closeLeaseWriter(streamId)
-  if (options.deleteRow === false) {
-    const settled = pendingStreamOperations(streamId).catch(() => {})
-    return writer ? releaseOwnershipAfter(writer, settled) : settled
-  }
-  const repo = writer?.repo ?? getWorkspaceRepository()
-  const deleted = enqueueStreamOperation(streamId, async () => {
-    if (!writer?.lease) return
-    const fence = streamWriteFenceForLease(writer.lease)
-    try {
-      await repo.deleteOwnedStreamLease(streamId, fence)
-    } catch {
-      await repo.deleteOwnedStreamLease(streamId, fence)
-    }
-  })
-  return writer ? releaseOwnershipAfter(writer, deleted) : deleted
-}
-
-export function requestAbortForChat(chatId: ChatId): number {
-  let count = 0
-  const streamIds = useStreamStore
-    .getState()
-    .listByChat(chatId)
-    .map((stream) => stream.streamId)
-  for (const streamId of streamIds) {
-    if (requestAbortForStream(streamId)) count += 1
-  }
-  return count
-}
-
-export function requestAbortForStream(streamId: string): boolean {
-  const state = useStreamStore.getState()
-  const stream = state.getActive(streamId)
-  if (!stream) return false
-  if (stream.ownerClientId === clientId) {
-    return state.abortStream(streamId, stream.replacementEpoch)
-  }
-  postEvent({
-    kind: 'stream-abort-requested',
-    chatId: stream.chatId,
-    streamId: stream.streamId,
-    ownerClientId: stream.ownerClientId,
-    replacementEpoch: stream.replacementEpoch,
-  })
-  return true
-}
-
-function applyRemoteLease(
-  lease: StreamLeaseRow,
-  options: {
-    recordObservation?: boolean
-    refreshStartedAtRevision?: number
-  } = {},
-): void {
-  if (lease.replacementEpoch === undefined || lease.replacementEpoch !== currentReplacementEpoch) {
-    return
-  }
-  if (endedStreamIds.has(lease.streamId)) return
-  if (lease.ownerClientId === clientId) return
-  observeRemoteStreamOwnershipForSubscribers(lease)
-  if (!isFreshStreamLease(lease)) return
-  const observedRevision = remoteObservationRevisionByStreamId.get(lease.streamId) ?? 0
-  if (
-    options.refreshStartedAtRevision !== undefined &&
-    observedRevision > options.refreshStartedAtRevision
-  ) {
-    return
-  }
-  if (options.recordObservation) recordRemoteObservation(lease.streamId)
-  const state = useStreamStore.getState()
-  const current = state.getActive(lease.streamId)
-  const attemptKind = lease.attemptKind ?? current?.attemptKind
-  const knownHeartbeatAt = remoteHeartbeatAtByStreamId.get(lease.streamId)
-  const targetImproves = current?.messageId === undefined && lease.messageId !== undefined
-  const targetRegresses = current?.messageId !== undefined && lease.messageId === undefined
-  if (knownHeartbeatAt !== undefined && lease.heartbeatAt < knownHeartbeatAt && !targetImproves) {
-    return
-  }
-  recordRemoteHeartbeat(
-    lease.streamId,
-    Math.max(knownHeartbeatAt ?? lease.heartbeatAt, lease.heartbeatAt),
-  )
-  reportedExpiredStreamIds.delete(lease.streamId)
-  if (targetRegresses) {
-    scheduleRemoteExpiryRefresh()
-    return
-  }
-  setRemoteActiveIfChanged({
-    streamId: lease.streamId,
-    chatId: lease.chatId,
-    ...(lease.messageId ? { messageId: lease.messageId } : {}),
-    ...(attemptKind ? { attemptKind } : {}),
-    replacementEpoch: lease.replacementEpoch,
-    ...(lease.admissionSequence !== undefined
-      ? { admissionSequence: lease.admissionSequence }
-      : {}),
-    startedAt: lease.startedAt,
-    ownerClientId: lease.ownerClientId,
-  })
-  scheduleRemoteExpiryRefresh()
-}
-
-function applyRemoteStreamStarted(
-  event: Extract<BroadcastEvent, { kind: 'stream-started' }>,
-): void {
-  if (event.replacementEpoch !== currentReplacementEpoch) return
-  if (endedStreamIds.has(event.streamId)) return
-  if (event.ownerClientId === clientId) return
-  observeRemoteStreamOwnershipForSubscribers(event)
-  recordRemoteObservation(event.streamId)
-  const state = useStreamStore.getState()
-  const current = state.getActive(event.streamId)
-  const heartbeatAt = Math.max(
-    remoteHeartbeatAtByStreamId.get(event.streamId) ?? Number.NEGATIVE_INFINITY,
-    Date.now(),
-  )
-  recordRemoteHeartbeat(event.streamId, heartbeatAt)
-  reportedExpiredStreamIds.delete(event.streamId)
-  const attemptKind = event.attemptKind ?? current?.attemptKind
-  setRemoteActiveIfChanged({
-    streamId: event.streamId,
-    chatId: event.chatId,
-    ...((event.messageId ?? current?.messageId)
-      ? { messageId: (event.messageId ?? current?.messageId) as MessageId }
-      : {}),
-    ...(attemptKind ? { attemptKind } : {}),
-    replacementEpoch: event.replacementEpoch,
-    ...((event.admissionSequence ?? current?.admissionSequence) !== undefined
-      ? { admissionSequence: (event.admissionSequence ?? current?.admissionSequence) as number }
-      : {}),
-    startedAt: current?.startedAt ?? heartbeatAt,
-    ownerClientId: event.ownerClientId,
-  })
-  scheduleRemoteExpiryRefresh()
-}
-
-function applyStreamEnded(event: Extract<BroadcastEvent, { kind: 'stream-ended' }>): void {
-  if (event.replacementEpoch !== currentReplacementEpoch) return
-  markStreamEnded(event.streamId)
-  cancelRemoteOwnershipReleaseWatches(event.streamId)
-  remoteHeartbeatAtByStreamId.delete(event.streamId)
-  remoteObservationRevisionByStreamId.delete(event.streamId)
-  reportedExpiredStreamIds.delete(event.streamId)
-  useStreamStore.getState().clearActive(event.streamId, event.replacementEpoch)
-  if (event.messageId) {
-    clearLiveSnapshotIfPresent(event.messageId, event.streamId, event.replacementEpoch)
-  }
-  scheduleRemoteExpiryRefresh()
-}
-
-function observeRemoteStreamOwnershipForSubscribers(stream: {
-  chatId: ChatId
-  streamId: string
-  ownerClientId: string
-  messageId?: MessageId
-  attemptKind?: 'generation' | 'continuation'
-  replacementEpoch?: number
-}): void {
-  for (const subscription of remoteOwnershipReleaseSubscriptions) {
-    observeRemoteStreamOwnership(subscription, stream)
-  }
-}
-
-function observeRemoteStreamOwnership(
-  subscription: RemoteStreamOwnershipReleaseSubscription,
-  stream: {
-    chatId: ChatId
-    streamId: string
-    ownerClientId: string
-    messageId?: MessageId
-    attemptKind?: 'generation' | 'continuation'
-    replacementEpoch?: number
-  },
-): void {
-  if (
-    subscription.stopped ||
-    stream.replacementEpoch !== currentReplacementEpoch ||
-    (subscription.chatId !== null && subscription.chatId !== stream.chatId) ||
-    stream.ownerClientId === clientId ||
-    endedStreamIds.has(stream.streamId) ||
-    subscription.watches.has(stream.streamId)
-  ) {
-    return
-  }
-  const manager = streamLockManager()
-  if (!manager) return
-  const controller = new AbortController()
-  subscription.watches.set(stream.streamId, controller)
-  let ownershipReleased = false
-  let request: Promise<unknown>
-  try {
-    request = manager.request(
-      streamOwnershipLockName(stream.streamId),
-      { mode: 'shared', signal: controller.signal },
-      (lock) => {
-        ownershipReleased = lock !== null
+async function handoffOwnedLease(
+  writer: ActiveLeaseWriter,
+  reason: StreamLeaseHandoffReason,
+): Promise<StreamLeaseRow> {
+  const committed = await writer.repo.execute(
+    writer.runtimePermit,
+    {
+      kind: 'stream.handoff-recovery',
+      input: {
+        streamId: writer.input.streamId,
+        fence: writerFence(writer),
+        handedOffAt: Date.now(),
+        reason,
       },
-    )
-  } catch {
-    subscription.watches.delete(stream.streamId)
-    return
-  }
-  void request.then(
-    () => {
-      if (subscription.watches.get(stream.streamId) !== controller) return
-      subscription.watches.delete(stream.streamId)
-      if (
-        subscription.stopped ||
-        controller.signal.aborted ||
-        !ownershipReleased ||
-        endedStreamIds.has(stream.streamId)
-      ) {
-        return
-      }
-      try {
-        subscription.handler({
-          chatId: stream.chatId,
-          streamId: stream.streamId,
-          ...(stream.messageId ? { messageId: stream.messageId } : {}),
-          ...(stream.attemptKind ? { attemptKind: stream.attemptKind } : {}),
-          ...(stream.replacementEpoch !== undefined
-            ? { replacementEpoch: stream.replacementEpoch }
-            : {}),
-        })
-      } catch {
-        // A release observer only schedules recovery; another observer must still be notified.
-      }
     },
-    () => {
-      if (subscription.watches.get(stream.streamId) === controller) {
-        subscription.watches.delete(stream.streamId)
-      }
-    },
+    { localApplications: { conversation: writer.applications.handoff } },
   )
-}
-
-function cancelRemoteOwnershipReleaseWatches(streamId: string): void {
-  for (const subscription of remoteOwnershipReleaseSubscriptions) {
-    const controller = subscription.watches.get(streamId)
-    if (!controller) continue
-    subscription.watches.delete(streamId)
-    controller.abort()
-  }
-}
-
-function stopRemoteOwnershipReleaseSubscription(
-  subscription: RemoteStreamOwnershipReleaseSubscription,
-): void {
-  if (subscription.stopped) return
-  subscription.stopped = true
-  remoteOwnershipReleaseSubscriptions.delete(subscription)
-  for (const controller of subscription.watches.values()) controller.abort()
-  subscription.watches.clear()
-}
-
-function recordRemoteObservation(streamId: string): void {
-  remoteObservationRevision += 1
-  remoteObservationRevisionByStreamId.set(streamId, remoteObservationRevision)
-}
-
-function markStreamEnded(streamId: string): void {
-  endedStreamIds.delete(streamId)
-  endedStreamIds.add(streamId)
-  if (endedStreamIds.size <= ENDED_STREAM_TOMBSTONE_LIMIT) return
-  const oldest = endedStreamIds.values().next().value
-  if (oldest !== undefined) endedStreamIds.delete(oldest)
-}
-
-function requestRemoteStreamLeaseRefresh(): Promise<void> {
-  const generation = refreshGeneration
-  if (refreshInFlight?.generation === generation) return refreshInFlight.promise
-  const promise = refreshRemoteStreamLeases(generation).finally(() => {
-    if (refreshInFlight?.promise === promise) refreshInFlight = null
-  })
-  refreshInFlight = { generation, promise }
-  return promise
-}
-
-async function refreshRemoteStreamLeases(generation: number): Promise<void> {
-  const replacementEpoch = await ensureCurrentReplacementEpoch()
-  if (generation !== refreshGeneration) return
-  const refreshStartedAtRevision = remoteObservationRevision
-  const snapshot = await getWorkspaceRepository().listStreamLeases()
-  if (generation !== refreshGeneration || replacementEpoch !== currentReplacementEpoch) {
-    return
-  }
-  const leases = snapshot.filter((lease) => lease.replacementEpoch === replacementEpoch)
-  const now = Date.now()
-  const freshLeases = leases.filter((lease) => isFreshStreamLease(lease, now))
-  const snapshotIds = new Set(leases.map((lease) => lease.streamId))
-  const freshIds = new Set<string>()
-  for (const lease of freshLeases) {
-    freshIds.add(lease.streamId)
-    reportedExpiredStreamIds.delete(lease.streamId)
-    applyRemoteLease(lease, { refreshStartedAtRevision })
-  }
-  const state = useStreamStore.getState()
-  for (const stream of state.listActive()) {
-    if (stream.ownerClientId === clientId) continue
-    if (freshIds.has(stream.streamId)) continue
-    if (isFreshRemoteObservation(stream.streamId, now)) continue
-    if (
-      (remoteObservationRevisionByStreamId.get(stream.streamId) ?? 0) > refreshStartedAtRevision
-    ) {
-      continue
-    }
-    remoteHeartbeatAtByStreamId.delete(stream.streamId)
-    remoteObservationRevisionByStreamId.delete(stream.streamId)
-    state.clearActive(stream.streamId, replacementEpoch)
-  }
-  const newlyExpired: StreamLeaseRow[] = []
-  for (const lease of leases) {
-    if (isFreshStreamLease(lease, now)) continue
-    if (lease.ownerClientId === clientId || endedStreamIds.has(lease.streamId)) continue
-    if (isFreshRemoteObservation(lease.streamId, now)) continue
-    if (remoteExpiryHandlers.size === 0) continue
-    if ((remoteObservationRevisionByStreamId.get(lease.streamId) ?? 0) > refreshStartedAtRevision) {
-      continue
-    }
-    if (reportedExpiredStreamIds.has(lease.streamId)) continue
-    reportedExpiredStreamIds.add(lease.streamId)
-    newlyExpired.push({ ...lease })
-  }
-  for (const streamId of [...reportedExpiredStreamIds]) {
-    if (!snapshotIds.has(streamId)) reportedExpiredStreamIds.delete(streamId)
-  }
-  scheduleRemoteExpiryRefresh()
-  notifyRemoteStreamLeasesExpired(newlyExpired)
-}
-
-function isFreshRemoteObservation(streamId: string, now: number): boolean {
-  const heartbeatAt = remoteHeartbeatAtByStreamId.get(streamId)
-  return heartbeatAt !== undefined && now - heartbeatAt <= STREAM_LEASE_TTL_MS
-}
-
-function refreshRemoteStreamLeasesWithRetry(): void {
-  const generation = refreshGeneration
-  void requestRemoteStreamLeaseRefresh().then(
-    () => {
-      if (generation === refreshGeneration) scheduleRemoteExpiryRefresh()
-    },
-    () => {
-      if (generation === refreshGeneration) {
-        scheduleRemoteExpiryRefresh(Date.now() + STREAM_LEASE_REFRESH_RETRY_MS)
-      }
-    },
-  )
-}
-
-function notifyRemoteStreamLeasesExpired(leases: readonly StreamLeaseRow[]): void {
-  if (leases.length === 0) return
-  for (const handler of [...remoteExpiryHandlers]) {
-    try {
-      handler(leases)
-    } catch {
-      // One recovery subscriber must not prevent the others from observing expiry.
-    }
-  }
-}
-
-function setRemoteActiveIfChanged(stream: {
-  streamId: string
-  chatId: ChatId
-  messageId?: MessageId
-  attemptKind?: 'generation' | 'continuation'
-  replacementEpoch: number
-  admissionSequence?: number
-  startedAt: number
-  ownerClientId: string
-}): void {
-  const state = useStreamStore.getState()
-  const current = state.getActive(stream.streamId)
-  if (
-    current?.chatId === stream.chatId &&
-    current.messageId === stream.messageId &&
-    current.attemptKind === stream.attemptKind &&
-    current.replacementEpoch === stream.replacementEpoch &&
-    current.admissionSequence === stream.admissionSequence &&
-    current.startedAt === stream.startedAt &&
-    current.ownerClientId === stream.ownerClientId
-  ) {
-    return
-  }
-  state.setActive(stream)
-}
-
-function recordRemoteHeartbeat(streamId: string, heartbeatAt: number): void {
-  if (remoteHeartbeatAtByStreamId.get(streamId) === heartbeatAt) return
-  remoteHeartbeatAtByStreamId.set(streamId, heartbeatAt)
-  const entry = { streamId, heartbeatAt }
-  remoteExpiryHeap.push(entry)
-  let index = remoteExpiryHeap.length - 1
-  while (index > 0) {
-    const parent = Math.floor((index - 1) / 2)
-    const parentEntry = remoteExpiryHeap[parent]
-    if (!parentEntry || parentEntry.heartbeatAt <= heartbeatAt) break
-    remoteExpiryHeap[index] = parentEntry
-    index = parent
-  }
-  remoteExpiryHeap[index] = entry
-}
-
-function popRemoteExpiryHeap(): void {
-  const tail = remoteExpiryHeap.pop()
-  if (!tail || remoteExpiryHeap.length === 0) return
-  let index = 0
-  while (true) {
-    const left = index * 2 + 1
-    if (left >= remoteExpiryHeap.length) break
-    const right = left + 1
-    const leftEntry = remoteExpiryHeap[left] as { streamId: string; heartbeatAt: number }
-    const rightEntry = remoteExpiryHeap[right]
-    const child = rightEntry && rightEntry.heartbeatAt < leftEntry.heartbeatAt ? right : left
-    const childEntry = remoteExpiryHeap[child] as { streamId: string; heartbeatAt: number }
-    if (childEntry.heartbeatAt >= tail.heartbeatAt) break
-    remoteExpiryHeap[index] = childEntry
-    index = child
-  }
-  remoteExpiryHeap[index] = tail
-}
-
-function earliestRemoteExpiry(): number {
-  for (;;) {
-    const entry = remoteExpiryHeap[0]
-    if (!entry) return Number.POSITIVE_INFINITY
-    if (remoteHeartbeatAtByStreamId.get(entry.streamId) === entry.heartbeatAt) {
-      return entry.heartbeatAt + STREAM_LEASE_TTL_MS + 1
-    }
-    popRemoteExpiryHeap()
-  }
-}
-
-function scheduleRemoteExpiryRefresh(notBefore?: number): void {
-  const earliestExpiry = earliestRemoteExpiry()
-  const deadline = Number.isFinite(earliestExpiry)
-    ? Math.max(earliestExpiry, notBefore ?? Number.NEGATIVE_INFINITY)
-    : notBefore
-  if (deadline === undefined || !Number.isFinite(deadline)) {
-    if (remoteExpiryTimer !== null) clearTimeout(remoteExpiryTimer)
-    remoteExpiryTimer = null
-    remoteExpiryDeadline = null
-    return
-  }
-  if (
-    remoteExpiryTimer !== null &&
-    remoteExpiryDeadline !== null &&
-    remoteExpiryDeadline <= deadline
-  ) {
-    return
-  }
-  if (remoteExpiryTimer !== null) clearTimeout(remoteExpiryTimer)
-  remoteExpiryDeadline = deadline
-  remoteExpiryTimer = setTimeout(
-    () => {
-      remoteExpiryTimer = null
-      remoteExpiryDeadline = null
-      refreshRemoteStreamLeasesWithRetry()
-    },
-    Math.max(1, deadline - Date.now()),
-  )
-}
-
-function ensureFallbackLeaseRefresh(): void {
-  if (isBroadcastChannelAvailable()) {
-    if (fallbackRefreshTimer !== null) clearInterval(fallbackRefreshTimer)
-    fallbackRefreshTimer = null
-    return
-  }
-  if (fallbackRefreshTimer !== null) return
-  fallbackRefreshTimer = setInterval(() => {
-    refreshRemoteStreamLeasesWithRetry()
-  }, STREAM_LEASE_TTL_MS)
+  return committed.value
 }
 
 function heartbeatSchedulerNow(): number {
-  return Date.now()
+  return globalThis.performance.now()
 }
 
 function scheduleHeartbeatTimer(now = heartbeatSchedulerNow()): void {
-  if (activeLeaseWriters.size === 0) {
+  if (streamLeaseRuntimeDisposed) return
+  let hasActiveWriter = false
+  for (const writer of leaseWriters.values()) {
+    if (writer.closed) continue
+    hasActiveWriter = true
+    break
+  }
+  if (!hasActiveWriter) {
     if (heartbeatTimer !== null) clearTimeout(heartbeatTimer)
     heartbeatTimer = null
     heartbeatDeadline = null
@@ -923,8 +800,8 @@ function scheduleHeartbeatTimer(now = heartbeatSchedulerNow()): void {
 }
 
 function runDueHeartbeats(now: number): void {
-  heartbeatSchedulerWakeups += 1
-  for (const writer of activeLeaseWriters.values()) {
+  if (streamLeaseRuntimeDisposed) return
+  for (const writer of leaseWriters.values()) {
     if (writer.closed || writer.nextHeartbeatAt === null || writer.nextHeartbeatAt > now) continue
     writer.nextHeartbeatAt = now + STREAM_LEASE_HEARTBEAT_MS
     void scheduleHeartbeat(writer).catch(() => {})
@@ -933,7 +810,7 @@ function runDueHeartbeats(now: number): void {
 }
 
 function scheduleHeartbeat(writer: ActiveLeaseWriter): Promise<void> {
-  if (writer.closed || writer.writeScheduled) return pendingStreamOperations(writer.input.streamId)
+  if (writer.closed || writer.writeScheduled) return pendingStreamOperations(writer)
   writer.writeScheduled = true
   const write = enqueueLeaseWrite(writer)
   void write.then(
@@ -948,53 +825,100 @@ function scheduleHeartbeat(writer: ActiveLeaseWriter): Promise<void> {
 }
 
 function enqueueLeaseWrite(writer: ActiveLeaseWriter): Promise<void> {
-  return enqueueStreamOperation(writer.input.streamId, async () => {
-    const input = writer.input
-    const lease: StreamLeaseRow = {
-      streamId: input.streamId,
-      chatId: input.chatId,
-      ...(input.messageId ? { messageId: input.messageId } : {}),
-      ownerClientId: clientId,
-      fenceToken: writer.fenceToken,
-      startedAt: input.startedAt,
-      heartbeatAt: Date.now(),
-      ...(input.attemptKind ? { attemptKind: input.attemptKind } : {}),
-      ...(input.continuationStrategy ? { continuationStrategy: input.continuationStrategy } : {}),
-      ...(input.baseBodyVersion !== undefined ? { baseBodyVersion: input.baseBodyVersion } : {}),
-      ...(input.baseNodeVersion !== undefined ? { baseNodeVersion: input.baseNodeVersion } : {}),
-      ...(input.requestedModel ? { requestedModel: input.requestedModel } : {}),
-      ...(input.apiUsed ? { apiUsed: input.apiUsed } : {}),
+  return enqueueWriterOperation(writer, async () => {
+    assertWorkspaceExecutionPermit(writer.runtimePermit)
+    const renewed = await writer.repo.execute(writer.runtimePermit, {
+      kind: 'stream.renew',
+      heartbeat: {
+        streamId: writer.lease.streamId,
+        fence: streamWriteFenceForLease(writer.lease),
+        heartbeatAt: Date.now(),
+      },
+    })
+    if (!streamLeaseHasWriteFence(renewed.value) || renewed.value.custody !== 'writer') {
+      throw new Error(`StreamLeaseCustodyLost:${writer.input.streamId}`)
     }
-    const currentFence = writer.lease ? streamWriteFenceForLease(writer.lease) : undefined
-    const targetChanged = writer.lease?.messageId !== lease.messageId
-    writer.lease = currentFence
-      ? await writer.repo.renewStreamLease(
-          {
-            ...lease,
-            replacementEpoch: currentFence.replacementEpoch,
-          },
-          { targetChanged },
-        )
-      : await writer.repo.upsertStreamLease(lease)
+    writer.lease = renewed.value
+    applyDurableStopControl(writer, renewed.value)
   })
 }
 
-export function streamWriteFenceForLease(lease: StreamLeaseRow): StreamWriteFence {
-  if (typeof lease.fenceToken !== 'string' || lease.replacementEpoch === undefined) {
-    throw new Error(`StreamFenceMissing:${lease.streamId}`)
+type AttemptStopRequestedFact = Extract<WorkspaceDeltaFact, { kind: 'attempt-stop-requested' }>
+
+function receiveDurableStopFact(
+  fact: AttemptStopRequestedFact,
+  workspaceId: string,
+  replacementEpoch: number,
+): void {
+  if (
+    currentWorkspaceFence?.workspaceId !== workspaceId ||
+    currentWorkspaceFence.replacementEpoch !== replacementEpoch ||
+    fact.controlRevision < 1
+  ) {
+    return
   }
-  return {
-    ownerClientId: lease.ownerClientId,
-    fenceToken: lease.fenceToken,
-    replacementEpoch: lease.replacementEpoch,
-    ...(lease.admissionSequence !== undefined
-      ? { admissionSequence: lease.admissionSequence }
-      : {}),
+  const writer = leaseWriters.get(fact.streamId)
+  if (writer) {
+    if (
+      writer.input.chatId !== fact.chatId ||
+      writer.input.messageId !== fact.messageId ||
+      writer.input.attemptKind !== fact.attemptKind ||
+      writer.replacementEpoch !== replacementEpoch ||
+      writer.lease.admissionSequence !== fact.admissionSequence ||
+      writer.deliveredControlRevision >= fact.controlRevision
+    ) {
+      return
+    }
+    writer.deliveredControlRevision = fact.controlRevision
+    interruptWriterTransport(writer)
+    return
+  }
+  const reservation = ownershipReservations.get(fact.streamId)
+  if (
+    !reservation ||
+    reservation.admission.chatId !== fact.chatId ||
+    reservation.admission.messageId !== fact.messageId ||
+    reservation.admission.attemptKind !== fact.attemptKind ||
+    reservation.admission.replacementEpoch !== replacementEpoch
+  ) {
+    return
+  }
+  reservation.stopEvidencePending = true
+  if (
+    reservation.boundAdmissionSequence === fact.admissionSequence &&
+    fact.controlRevision > reservation.pendingBoundControlRevision
+  ) {
+    reservation.pendingBoundControlRevision = fact.controlRevision
+  }
+}
+
+function applyDurableStopControl(writer: ActiveLeaseWriter, lease: StreamLeaseRow): void {
+  if (!lease.stopControl || writer.deliveredControlRevision >= lease.controlRevision) return
+  writer.deliveredControlRevision = lease.controlRevision
+  interruptWriterTransport(writer)
+}
+
+function interruptWriterTransport(writer: ActiveLeaseWriter): void {
+  if (writer.transportInterrupted) return
+  writer.transportInterrupted = true
+  abortTransport(writer.abortTransport)
+}
+
+function interruptReservationTransport(reservation: StreamOwnershipReservationState): void {
+  if (reservation.transportInterrupted) return
+  reservation.transportInterrupted = true
+  abortTransport(reservation.abortTransport)
+}
+
+function abortTransport(abort: () => void): void {
+  try {
+    abort()
+  } catch {
+    // A transport abort callback cannot roll back the durable Stop request.
   }
 }
 
 function writerFence(writer: ActiveLeaseWriter): StreamWriteFence {
-  if (!writer.lease) throw new Error(`StreamLeaseAdmissionMissing:${writer.input.streamId}`)
   return streamWriteFenceForLease(writer.lease)
 }
 
@@ -1009,81 +933,150 @@ function streamLockManager(): StreamLockManager | null {
   return locks && typeof locks.request === 'function' ? locks : null
 }
 
-async function holdStreamOwnership(writer: ActiveLeaseWriter): Promise<void> {
+async function acquireStreamOwnership(streamId: string): Promise<StreamOwnershipHold> {
   const manager = streamLockManager()
-  if (!manager) return
+  if (!manager) return { release: null, settled: null }
   let release!: () => void
   const released = new Promise<void>((resolve) => {
     release = resolve
   })
-  writer.releaseOwnership = release
   let resolveReady!: () => void
   let rejectReady!: (error: unknown) => void
   const ready = new Promise<void>((resolve, reject) => {
     resolveReady = resolve
     rejectReady = reject
   })
-  let ownership: Promise<unknown>
-  try {
-    ownership = manager.request(
-      streamOwnershipLockName(writer.input.streamId),
-      { ifAvailable: true },
-      async (lock) => {
-        if (!lock) {
-          rejectReady(new Error(`StreamLeaseAlreadyOwned:${writer.input.streamId}`))
-          return
-        }
-        resolveReady()
-        if (writer.closed) return
-        await released
-      },
-    )
-  } catch (error) {
-    writer.releaseOwnership = null
-    throw error
-  }
+  const ownership = manager.request(
+    streamOwnershipLockName(streamId),
+    { ifAvailable: true },
+    async (lock) => {
+      if (!lock) {
+        rejectReady(new Error(`StreamLeaseAlreadyOwned:${streamId}`))
+        return
+      }
+      resolveReady()
+      await released
+    },
+  )
   const task = ownership.then(
     () => {},
     () => {},
   )
-  writer.ownershipSettled = task
   void ownership.catch((error) => rejectReady(error))
-  streamOwnershipTasks.add(task)
-  void task.finally(() => streamOwnershipTasks.delete(task))
-  try {
-    await ready
-  } catch (error) {
-    writer.releaseOwnership = null
-    throw error
-  }
+  beginStreamRuntimeWork()
+  void task.finally(endStreamRuntimeWork)
+  await ready
+  return { release, settled: task }
 }
 
-function enqueueStreamOperation(
-  streamId: string,
-  operation: () => Promise<unknown>,
-): Promise<void> {
-  const prior = streamOperationTails.get(streamId) ?? Promise.resolve()
-  const result = prior.then(operation, operation).then(() => {})
-  const tail = result.catch(() => {})
-  streamOperationTails.set(streamId, tail)
-  void tail.then(() => {
-    if (streamOperationTails.get(streamId) === tail) streamOperationTails.delete(streamId)
-  })
+async function releaseStreamOwnershipHold(hold: StreamOwnershipHold): Promise<void> {
+  hold.release?.()
+  hold.release = null
+  await hold.settled
+  hold.settled = null
+}
+
+function enqueueWriterOperation<T>(
+  writer: ActiveLeaseWriter,
+  operation: () => T | Promise<T>,
+): Promise<T> {
+  beginStreamRuntimeWork()
+  const prior = writer.operationTail
+  const result = prior.then(operation, operation).finally(endStreamRuntimeWork)
+  writer.operationTail = result.then(
+    () => {},
+    () => {},
+  )
   return result
 }
 
-function closeLeaseWriter(streamId: string): ActiveLeaseWriter | undefined {
-  const writer = activeLeaseWriters.get(streamId)
-  if (!writer) return undefined
+function closeLeaseWriter(writer: ActiveLeaseWriter): void {
+  if (writer.closed) return
   writer.closed = true
   writer.nextHeartbeatAt = null
-  activeLeaseWriters.delete(streamId)
   scheduleHeartbeatTimer()
-  return writer
 }
 
-function pendingStreamOperations(streamId: string): Promise<void> {
-  return streamOperationTails.get(streamId) ?? Promise.resolve()
+function pendingStreamOperations(writer: ActiveLeaseWriter): Promise<void> {
+  return writer.operationTail
+}
+
+function retireLeaseWriter(
+  writer: ActiveLeaseWriter,
+  options: StreamLeaseRetirementOptions = {},
+): Promise<StreamLeaseRetirementOutcome> {
+  if (writer.retirementPromise) return writer.retirementPromise
+  closeLeaseWriter(writer)
+
+  if (options.mode === 'handoff') {
+    const terminalOperation = enqueueWriterOperation<StreamLeaseRetirementOutcome>(
+      writer,
+      async () =>
+        ({
+          mode: 'handoff',
+          lease: await handoffOwnedLease(writer, options.reason),
+        }) as const,
+    )
+    writer.retirementPromise = releaseAfterTerminalOutcome(writer, terminalOperation)
+    return writer.retirementPromise
+  }
+
+  {
+    const terminalOperation = enqueueWriterOperation<StreamLeaseRetirementOutcome>(
+      writer,
+      async () => {
+        assertWriterEpochCurrent(writer)
+        try {
+          const result = await finishStreamCleanup({
+            repository: writer.repo,
+            permit: writer.runtimePermit,
+            chatId: writer.input.chatId,
+            streamId: writer.input.streamId,
+            fence: writerFence(writer),
+            application: writer.applications.cleanup,
+          })
+          return { mode: 'cleanup', result }
+        } catch (cleanupError) {
+          if (!options.handoffReason) throw cleanupError
+          try {
+            const lease = await handoffOwnedLease(writer, options.handoffReason)
+            return { mode: 'handoff', lease }
+          } catch (handoffError) {
+            throw new AggregateError(
+              [cleanupError, handoffError],
+              `StreamCleanupAndHandoffFailed:${writer.input.streamId}`,
+              { cause: handoffError },
+            )
+          }
+        }
+      },
+    )
+    writer.retirementPromise = releaseAfterTerminalOutcome(writer, terminalOperation)
+    return writer.retirementPromise
+  }
+}
+
+function releaseAfterTerminalOutcome(
+  writer: ActiveLeaseWriter,
+  operation: Promise<StreamLeaseRetirementOutcome>,
+): Promise<StreamLeaseRetirementOutcome> {
+  const release = releaseOwnershipAfter(
+    writer,
+    operation.then(
+      () => undefined,
+      () => undefined,
+    ),
+  )
+  return operation.then(
+    async (outcome) => {
+      await release
+      return outcome
+    },
+    async (error) => {
+      await release
+      throw error
+    },
+  )
 }
 
 function releaseOwnershipAfter(
@@ -1091,47 +1084,87 @@ function releaseOwnershipAfter(
   operations: Promise<void>,
 ): Promise<void> {
   return operations.finally(async () => {
-    writer.releaseOwnership?.()
-    writer.releaseOwnership = null
-    await writer.ownershipSettled
-    writer.ownershipSettled = null
+    try {
+      writer.releaseOwnership?.()
+      writer.releaseOwnership = null
+      await writer.ownershipSettled
+      writer.ownershipSettled = null
+    } finally {
+      leaseWriters.delete(writer.input.streamId)
+      writer.finishRuntime()
+    }
   })
 }
 
-export async function __flushStreamLeaseWritesForTests(): Promise<void> {
-  for (;;) {
-    const pending = [...streamOperationTails.values()]
-    if (pending.length === 0) return
-    await Promise.all(pending)
+export function disposeStreamLeaseRuntime(): void {
+  if (streamLeaseRuntimeDisposed) return
+  assertNoOpenLeaseWriters('runtime-disposal')
+  streamLeaseRuntimeDisposed = true
+  unsubscribeStopControl?.()
+  unsubscribeStopControl = null
+  if (heartbeatTimer !== null) clearTimeout(heartbeatTimer)
+  heartbeatTimer = null
+  heartbeatDeadline = null
+}
+
+export function awaitStreamLeaseRuntimeIdle(): Promise<void> {
+  return streamLeaseRuntimeIdle
+}
+
+export function resumeStreamLeaseRuntime(): void {
+  if (streamRuntimeWork !== 0) throw new Error('StreamLeaseRuntimeBusy')
+  streamLeaseRuntimeDisposed = false
+  unsubscribeStopControl ??= subscribeWorkspaceEffects({
+    owner: 'stream-lease-stop-control',
+    factKinds: ['attempt-stop-requested'],
+    replacements: false,
+    apply: (effect) => {
+      if (effect.kind !== 'changed') return
+      for (const fact of effect.factsByKind['attempt-stop-requested'] ?? []) {
+        receiveDurableStopFact(fact, effect.workspaceId, effect.replacementEpoch)
+      }
+    },
+    recover: () => WORKSPACE_EFFECT_RECOVERY_OWNED,
+  })
+}
+
+export function assertStreamLeaseRuntimeClosed(): void {
+  if (
+    !streamLeaseRuntimeDisposed ||
+    streamRuntimeWork !== 0 ||
+    leaseWriters.size > 0 ||
+    unsubscribeStopControl !== null
+  ) {
+    throw new Error('StreamLeaseRuntimeNotClosed')
   }
 }
 
-export async function __flushStreamOwnershipForTests(): Promise<void> {
-  for (;;) {
-    const pending = [...streamOwnershipTasks]
-    if (pending.length === 0) return
-    await Promise.all(pending)
+function trackStreamRuntimePromise<T>(promise: Promise<T>): Promise<T> {
+  beginStreamRuntimeWork()
+  return promise.finally(endStreamRuntimeWork)
+}
+
+function beginStreamRuntimeWork(): void {
+  if (streamRuntimeWork === 0) {
+    streamLeaseRuntimeIdle = new Promise<void>((resolve) => {
+      resolveStreamLeaseRuntimeIdle = resolve
+    })
   }
+  streamRuntimeWork += 1
+}
+
+function endStreamRuntimeWork(): void {
+  streamRuntimeWork -= 1
+  if (streamRuntimeWork !== 0) return
+  const resolve = resolveStreamLeaseRuntimeIdle
+  resolveStreamLeaseRuntimeIdle = null
+  resolve?.()
 }
 
 export function __setStreamLockManagerForTests(
   manager: StreamLockManager | null | undefined,
 ): void {
   lockManagerOverride = manager
-}
-
-export function __streamLeaseHeartbeatSchedulerStateForTests(): {
-  activeWriters: number
-  timerScheduled: boolean
-  deadline: number | null
-  wakeups: number
-} {
-  return {
-    activeWriters: activeLeaseWriters.size,
-    timerScheduled: heartbeatTimer !== null,
-    deadline: heartbeatDeadline,
-    wakeups: heartbeatSchedulerWakeups,
-  }
 }
 
 export function __runStreamLeaseHeartbeatSchedulerForTests(now: number): void {
@@ -1141,35 +1174,39 @@ export function __runStreamLeaseHeartbeatSchedulerForTests(now: number): void {
   runDueHeartbeats(now)
 }
 
-export function __resetStreamLeasesForTests(): void {
-  unsubscribe?.()
-  unsubscribe = null
-  listenerInstalled = false
+export function __resetStreamLeasesForTests(options: { admissionsOpen?: boolean } = {}): void {
   if (heartbeatTimer !== null) clearTimeout(heartbeatTimer)
   heartbeatTimer = null
   heartbeatDeadline = null
-  heartbeatSchedulerWakeups = 0
-  if (fallbackRefreshTimer !== null) clearInterval(fallbackRefreshTimer)
-  fallbackRefreshTimer = null
-  if (remoteExpiryTimer !== null) clearTimeout(remoteExpiryTimer)
-  remoteExpiryTimer = null
-  remoteExpiryDeadline = null
-  refreshGeneration += 1
-  refreshInFlight = null
-  currentReplacementEpoch = 0
-  remoteObservationRevision = 0
-  remoteHeartbeatAtByStreamId.clear()
-  remoteExpiryHeap.length = 0
-  remoteObservationRevisionByStreamId.clear()
-  reportedExpiredStreamIds.clear()
-  remoteExpiryHandlers.clear()
-  for (const subscription of [...remoteOwnershipReleaseSubscriptions]) {
-    stopRemoteOwnershipReleaseSubscription(subscription)
+  currentWorkspaceFence = null
+  unsubscribeStopControl?.()
+  unsubscribeStopControl = null
+  for (const writer of [...leaseWriters.values()]) {
+    forceReleaseLeaseWriterForTests(writer)
   }
-  for (const streamId of activeLeaseWriters.keys()) {
-    const writer = closeLeaseWriter(streamId)
-    if (writer) void releaseOwnershipAfter(writer, pendingStreamOperations(streamId))
+  for (const reservation of [...ownershipReservations.values()]) {
+    void releaseStreamOwnershipReservationState(reservation)
   }
-  endedStreamIds.clear()
   lockManagerOverride = undefined
+  streamLeaseRuntimeDisposed = !(options.admissionsOpen ?? false)
+}
+
+function sameWorkspaceFence(left: WorkspaceFence, right: WorkspaceFence): boolean {
+  return left.workspaceId === right.workspaceId && left.replacementEpoch === right.replacementEpoch
+}
+
+function assertNoOpenLeaseWriters(operation: string): void {
+  if (leaseWriters.size !== 0 || ownershipReservations.size !== 0) {
+    throw new Error(
+      `StreamLeaseWriterLifetimeViolation:${operation}:${leaseWriters.size}:${ownershipReservations.size}`,
+    )
+  }
+}
+
+function forceReleaseLeaseWriterForTests(writer: ActiveLeaseWriter): void {
+  closeLeaseWriter(writer)
+  void releaseOwnershipAfter(
+    writer,
+    pendingStreamOperations(writer).catch(() => {}),
+  )
 }

@@ -1,66 +1,914 @@
 import Dexie from 'dexie'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import {
-  attachmentContextIds,
-  attachmentContextPolicyForSettings,
-} from '../../src/core/attachments/context'
-import { buildBranchCacheRow } from '../../src/core/branch-flatten'
-import { applyContextCutoff } from '../../src/core/context-cutoff'
+import { ownBrowserWorkspaceSuite } from '../helpers/browser-workspace-suite'
+import { createChat } from '../helpers/chats'
+import 'fake-indexeddb/auto'
+import { IDBFactory } from 'fake-indexeddb'
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
+import type { AssistantPlanningResources } from '../../src/core/assistant-planning-resources'
+import { createBranchPath } from '../../src/core/branch-session'
+import { buildChildSlotProjection } from '../../src/core/child-list-state'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
-import {
-  deleteSingleMessage,
-  deleteTurn,
-  insertSibling,
-  regenerateAssistant,
-  sendUserMessage,
-} from '../../src/core/messages'
-import { applyOutboundContextRewrites } from '../../src/core/prompt-context'
-import { tokenizerFromSettings } from '../../src/core/prompt-size'
+import { resolveEffectiveEndpointRouting } from '../../src/core/effective-endpoint-routing'
+import { fixedConversationSelectionTarget } from '../../src/core/messages'
+import { EMPTY_MESSAGE_CONTEXT_ROUTE_FACTS } from '../../src/core/reasoning'
+import { EMPTY_TEXT_TEMPLATE, type SavedTextTemplate } from '../../src/core/text-templates'
+import { GLOBAL_TOKEN_CALIBRATION_KEY } from '../../src/core/token-calibration'
 import type {
   Attachment,
+  AttachmentArtifact,
+  AttachmentBlob,
   AttachmentId,
+  Chat,
+  ChatId,
   ChatSettings,
-  MediaContextStrategy,
+  ConnectionProfile,
   Message,
-  MessageAttachmentRef,
+  MessageId,
 } from '../../src/core/types'
-import { editInPlace } from '../../src/hooks/useMessageOps'
+import {
+  type AttachmentHeaderRow,
+  splitAttachmentForStorage,
+} from '../../src/store/attachment-storage'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
-import { getBrowserRepository } from '../../src/store/browser-repo'
-import { searchChats } from '../../src/store/chat-search'
+import { __resetBrowserRepositoryForTests } from '../../src/store/browser-repo'
+import { applyChatRowWriteTransitions } from '../../src/store/chat-row-transition'
+import { readCurrentChatRowsForTransaction } from '../../src/store/chat-storage-codec'
+
+import { __resetDbForTests, getDb } from '../../src/store/db'
+import type { SettingsRow } from '../../src/store/db-rows'
+import { createGenerationPromptMaterialLease } from '../../src/store/generation-prompt-material'
 import {
-  createChat,
-  listChatSidebarRows,
-  loadActiveBranchSnapshot,
-  loadKnownBranchPageSnapshot,
-} from '../../src/store/chats'
-import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
-import { hydrateMessages, splitMessageForStorage } from '../../src/store/message-storage'
+  type MessageBodyRow,
+  type MessageHeaderRow,
+  splitMessageForStorage,
+} from '../../src/store/message-storage'
+import { joinKnownBranchPageMaterial } from '../../src/store/repository'
+import { loadGenerationContextForBranch } from '../../src/store/send-context'
+import type { WorkspaceQuery, WorkspaceQueryResult } from '../../src/store/workspace-protocol'
 import {
-  loadActiveBranchHeaderSnapshot,
-  loadSendContextForBranch,
-} from '../../src/store/send-context'
-import { useChatStore } from '../../src/store/zustand/chatStore'
+  __resetWorkspaceRepositoryForTests,
+  getWorkspaceRepository,
+} from '../../src/store/workspace-repository'
+import { runWorkspaceRead } from '../../src/store/workspace-runtime'
+import { executeMessageCommand } from '../helpers/message-commands'
 
 const DB_NAME = 'natter'
+const workspaceSuite = ownBrowserWorkspaceSuite()
+let fixtureSequence = 0
 
-async function resetAll(): Promise<void> {
+beforeAll(async () => {
+  ;(globalThis as unknown as { indexedDB: IDBFactory }).indexedDB = new IDBFactory()
+  __resetWorkspaceRepositoryForTests()
+  __resetBrowserRepositoryForTests()
   __resetBroadcastForTests()
   __resetDbForTests()
-  vi.restoreAllMocks()
   await Dexie.delete(DB_NAME)
+  await workspaceSuite.open()
+})
+
+afterEach(() => {
+  vi.restoreAllMocks()
+})
+
+describe('cold message-body repository boundary', () => {
+  it('reads generation attachment token evidence without hydrating artifacts or blobs', async () => {
+    const attachmentId = nextId('attachment')
+    const artifact: AttachmentArtifact = {
+      kind: 'text',
+      artifactId: nextId('artifact'),
+      attachmentId,
+      processorId: 'test',
+      text: 'cold'.repeat(250_000),
+      charCount: 1_000_000,
+      createdAt: 1,
+    }
+    const attachment: Attachment = {
+      id: attachmentId,
+      kind: 'pdf',
+      mime: 'application/pdf',
+      filename: 'large.pdf',
+      origin: 'system-fixture',
+      createdAt: 1,
+      updatedAt: 1,
+      storage: { kind: 'remote-url', url: 'https://example.test/large.pdf' },
+      pageCount: 200,
+      artifacts: [artifact],
+      processing: [],
+      refCount: 1,
+    }
+    await getDb().transaction('rw', getDb().attachments, getDb().attachmentArtifacts, async () => {
+      await getDb().attachments.put(splitAttachmentForStorage(attachment, 7))
+      await getDb().attachmentArtifacts.put(artifact)
+    })
+    let artifactReads = 0
+    let blobReads = 0
+    const readArtifact = (row: AttachmentArtifact | undefined) => {
+      if (row) artifactReads += 1
+      return row
+    }
+    const readBlob = <T>(row: T | undefined): T | undefined => {
+      if (row) blobReads += 1
+      return row
+    }
+    getDb().attachmentArtifacts.hook('reading', readArtifact)
+    getDb().attachmentBlobs.hook('reading', readBlob)
+
+    const evidence = await query({
+      kind: 'attachment.generation-token-evidence',
+      attachmentId,
+    })
+
+    getDb().attachmentArtifacts.hook('reading').unsubscribe(readArtifact)
+    getDb().attachmentBlobs.hook('reading').unsubscribe(readBlob)
+    expect(evidence).toMatchObject({
+      wireVersion: 7,
+      attachment: { id: attachmentId, pageCount: 200, artifacts: [] },
+    })
+    expect(artifactReads).toBe(0)
+    expect(blobReads).toBe(0)
+  })
+
+  it('keeps organized sidebar reads on projected chat metadata', async () => {
+    const seeded = await seedLinearChat({ count: 12, bodyLength: 20_000 })
+    const headers = captureReads<MessageHeaderRow>('messages')
+    const bodies = captureReads<MessageBodyRow>('messageBodies')
+
+    const rows = (
+      await query({
+        kind: 'sidebar.presentation-page',
+        request: {
+          mode: 'expanded',
+          sort: 'updatedAt-desc',
+          collapsedFolderIds: [],
+          createdAtGroupBoundaries: [100, 90, 40, -190],
+          limit: 100,
+          countMode: 'exact',
+        },
+      })
+    ).rows.flatMap((row) => (row.kind === 'chat' ? [row.chat] : []))
+
+    expect(rows.some((row) => row.id === seeded.chat.id)).toBe(true)
+    expect(headers.ids).toEqual([])
+    expect(bodies.ids).toEqual([])
+    headers.stop()
+    bodies.stop()
+  })
+
+  it('keeps eager and selected configuration independent of cold chat, calibration, and template bodies', async () => {
+    const templateId = nextId('cold-template')
+    const previousCalibration = await getDb().settings.get(GLOBAL_TOKEN_CALIBRATION_KEY)
+    await getDb().transaction('rw', getDb().settings, getDb().textTemplates, async () => {
+      await getDb().settings.put({
+        key: GLOBAL_TOKEN_CALIBRATION_KEY,
+        value: {
+          version: 1,
+          byKey: Object.fromEntries(
+            Array.from({ length: 1_000 }, (_, index) => [
+              `model-${index}`,
+              { prompt: [], completion: [] },
+            ]),
+          ),
+          clearGeneration: 0,
+        },
+      })
+      await getDb().textTemplates.put({
+        id: templateId,
+        name: 'Cold template',
+        config: { ...EMPTY_TEXT_TEMPLATE, template: 'x'.repeat(2_000_000) },
+        createdAt: 1,
+        updatedAt: 1,
+      })
+    })
+    const chats = captureReads<Chat>('chats')
+    const headers = captureReads<MessageHeaderRow>('messages')
+    const bodies = captureReads<MessageBodyRow>('messageBodies')
+    const templates = captureReads<SavedTextTemplate>('textTemplates')
+    const settings = captureSettingReads()
+
+    await Promise.all([
+      query({
+        kind: 'configuration.active-selection',
+        target: {
+          kind: 'chat',
+          profileId: null,
+          presetId: null,
+          promptPresets: [],
+          textTemplateId: null,
+        },
+      }),
+      query({ kind: 'configuration.shell' }),
+    ])
+
+    expect(chats.ids).toEqual([])
+    expect(headers.ids).toEqual([])
+    expect(bodies.ids).toEqual([])
+    expect(templates.ids).toEqual([])
+    expect(templates.textCharacters()).toBe(0)
+    expect(settings.keys).not.toContain(GLOBAL_TOKEN_CALIBRATION_KEY)
+    chats.stop()
+    headers.stop()
+    bodies.stop()
+    templates.stop()
+    settings.stop()
+    await getDb().transaction('rw', getDb().settings, getDb().textTemplates, async () => {
+      if (previousCalibration) await getDb().settings.put(previousCalibration)
+      else await getDb().settings.delete(GLOBAL_TOKEN_CALIBRATION_KEY)
+      await getDb().textTemplates.delete(templateId)
+    })
+  })
+
+  it('opens a branch longer than 128 rows while hydrating only its destination row', async () => {
+    const seeded = await seedLinearChat({ count: 257, bodyLength: 128 })
+    const bodies = captureReads<MessageBodyRow>('messageBodies')
+
+    const opened = await query({
+      kind: 'branch.open',
+      chatId: seeded.chat.id,
+      target: fixedConversationSelectionTarget(
+        { kind: 'tip', messageId: seeded.leafId },
+        seeded.leafId,
+      ),
+      bodyDemand: 'none',
+    })
+    const destination = await query({
+      kind: 'message.presentation',
+      messageId: seeded.leafId,
+    })
+
+    expect(opened.kind).toBe('ready')
+    if (opened.kind !== 'ready') throw new Error('ExpectedReadySelection')
+    expect(opened.proof.pathHeaders).toHaveLength(257)
+    expect(destination?.message.id).toBe(seeded.leafId)
+    expect(bodies.ids).toEqual([seeded.leafId])
+    bodies.stop()
+  })
+
+  it('does not hydrate a huge sibling when opening another tab-local tip', async () => {
+    const prefix = linearMessages(nextId('branch-chat'), 20, 64)
+    const branchRoot = prefix[0]
+    const branchTail = prefix.at(-1)
+    if (!branchRoot || !branchTail) throw new Error('ExpectedBranchPrefix')
+    const branchParent = prefix[9] as Message
+    const selectedSuffix = linearMessages(branchRoot.chatId, 8, 64, {
+      startIndex: 20,
+      parentId: branchTail.id,
+      idPrefix: 'selected',
+    })
+    const hugeSibling = message(branchRoot.chatId, nextId('huge-sibling'), {
+      parentId: branchParent.id,
+      siblingIndex: 1,
+      turnIndex: 99,
+      createdAt: 99,
+      content: [{ type: 'output_text', text: 'x'.repeat(2_000_000) }],
+    })
+    const rows = [...prefix, ...selectedSuffix, hugeSibling]
+    const seeded = await seedChat(rows, selectedSuffix.at(-1)?.id ?? branchTail.id)
+    const bodies = captureReads<MessageBodyRow>('messageBodies')
+
+    const opened = await query({
+      kind: 'branch.open',
+      chatId: seeded.chat.id,
+      target: fixedConversationSelectionTarget(
+        { kind: 'tip', messageId: seeded.leafId },
+        seeded.leafId,
+      ),
+      bodyDemand: 'none',
+    })
+    const destination = await query({
+      kind: 'message.presentation',
+      messageId: seeded.leafId,
+    })
+
+    expect(opened.kind).toBe('ready')
+    expect(destination?.message.id).toBe(seeded.leafId)
+    expect(bodies.ids).toEqual([seeded.leafId])
+    expect(bodies.textCharacters()).toBe(64)
+    expect(bodies.ids).not.toContain(hugeSibling.id)
+    bodies.stop()
+  })
+
+  it('reports a missing destination body without blanking the exact header spine', async () => {
+    const seeded = await seedLinearChat({ count: 40, bodyLength: 80 })
+    await getDb().messageBodies.delete(seeded.leafId)
+
+    const opened = await query({
+      kind: 'branch.open',
+      chatId: seeded.chat.id,
+      target: fixedConversationSelectionTarget(
+        { kind: 'tip', messageId: seeded.leafId },
+        seeded.leafId,
+      ),
+      bodyDemand: 'none',
+    })
+    const destination = await query({
+      kind: 'message.presentation',
+      messageId: seeded.leafId,
+    })
+
+    expect(opened.kind).toBe('ready')
+    if (opened.kind !== 'ready') throw new Error('ExpectedReadySelection')
+    expect(opened.proof.pathHeaders).toHaveLength(40)
+    expect(destination).toBeUndefined()
+  })
+
+  it('reads only branch-page structure before joining exactly the requested material', async () => {
+    const seeded = await seedLinearChat({ count: 80, bodyLength: 256 })
+    const headers = await branchHeaders(seeded.chat.id, seeded.leafId)
+    const path = createBranchPath(headers)
+    const window = path.window({ offset: 31, limit: 17 })
+    const bodies = captureReads<MessageBodyRow>('messageBodies')
+
+    const structural = await query({
+      kind: 'branch.page-structure',
+      chatId: seeded.chat.id,
+      resolvedTipId: seeded.leafId,
+      structuralVersion: seeded.chat.structuralVersion,
+      window,
+    })
+
+    expect(structural.kind).toBe('ready')
+    if (structural.kind !== 'ready') throw new Error('ExpectedReadyPageStructure')
+    expect(structural.snapshot.pageHeaders.map((row) => row.id)).toEqual(
+      seeded.rows.slice(31, 48).map((row) => row.id),
+    )
+    expect(structural.snapshot.pageHeaders.every((row) => !('content' in row))).toBe(true)
+    expect(bodies.ids).toEqual([])
+
+    const material = await query({
+      kind: 'message.presentations',
+      messageIds: structural.snapshot.pageHeaders.map((row) => row.id),
+    })
+    const page = joinKnownBranchPageMaterial(structural, material)
+
+    expect(page.kind).toBe('ready')
+    if (page.kind !== 'ready') throw new Error('ExpectedReadyPage')
+    expect(page.snapshot.pageMessages.map((row) => row.id)).toEqual(
+      seeded.rows.slice(31, 48).map((row) => row.id),
+    )
+    expect(bodies.ids).toEqual(seeded.rows.slice(31, 48).map((row) => row.id))
+    bodies.stop()
+  })
+
+  it('keeps semantic transcript pages bounded at 24 and cumulative material reads linear', async () => {
+    const seeded = await seedLinearChat({ count: 96, bodyLength: 32 })
+    const path = createBranchPath(await branchHeaders(seeded.chat.id, seeded.leafId))
+    const bodies = captureReads<MessageBodyRow>('messageBodies')
+
+    await expect(
+      query({
+        kind: 'branch.page-structure',
+        chatId: seeded.chat.id,
+        resolvedTipId: seeded.leafId,
+        structuralVersion: seeded.chat.structuralVersion,
+        window: path.window({ offset: 0, limit: 25 }),
+      }),
+    ).rejects.toThrow('BranchPageBatchTooLarge')
+    expect(bodies.ids).toEqual([])
+
+    for (const page of [
+      { offset: 88, limit: 8 },
+      { offset: 72, limit: 16 },
+      { offset: 48, limit: 24 },
+      { offset: 24, limit: 24 },
+      { offset: 0, limit: 24 },
+    ]) {
+      const window = path.window(page)
+      const structural = await query({
+        kind: 'branch.page-structure',
+        chatId: seeded.chat.id,
+        resolvedTipId: seeded.leafId,
+        structuralVersion: seeded.chat.structuralVersion,
+        window,
+      })
+      expect(structural.kind).toBe('ready')
+      if (structural.kind !== 'ready') throw new Error('ExpectedReadyPageStructure')
+      expect(structural.snapshot.pageHeaders.length).toBeLessThanOrEqual(24)
+      const material = await query({
+        kind: 'message.presentations',
+        messageIds: structural.snapshot.pageHeaders.map((row) => row.id),
+      })
+      expect(joinKnownBranchPageMaterial(structural, material).kind).toBe('ready')
+    }
+
+    expect(bodies.ids).toHaveLength(96)
+    expect(new Set(bodies.ids).size).toBe(96)
+    expect(bodies.textCharacters()).toBe(96 * 32)
+    bodies.stop()
+  })
+
+  it('starts no body read for a pre-aborted page request', async () => {
+    const seeded = await seedLinearChat({ count: 30, bodyLength: 100 })
+    const path = createBranchPath(await branchHeaders(seeded.chat.id, seeded.leafId))
+    const bodies = captureReads<MessageBodyRow>('messageBodies')
+    const controller = new AbortController()
+    controller.abort()
+
+    await expect(
+      query(
+        {
+          kind: 'branch.page-structure',
+          chatId: seeded.chat.id,
+          resolvedTipId: seeded.leafId,
+          structuralVersion: seeded.chat.structuralVersion,
+          window: path.window({ offset: 10, limit: 10 }),
+        },
+        controller.signal,
+      ),
+    ).rejects.toMatchObject({ name: 'AbortError' })
+    expect(bodies.ids).toEqual([])
+    bodies.stop()
+  })
+
+  it('classifies missing requested material without changing the structural page', async () => {
+    const seeded = await seedLinearChat({ count: 12, bodyLength: 64 })
+    const path = createBranchPath(await branchHeaders(seeded.chat.id, seeded.leafId))
+    const structural = await query({
+      kind: 'branch.page-structure',
+      chatId: seeded.chat.id,
+      resolvedTipId: seeded.leafId,
+      structuralVersion: seeded.chat.structuralVersion,
+      window: path.window({ offset: 5, limit: 1 }),
+    })
+    expect(structural.kind).toBe('ready')
+    if (structural.kind !== 'ready') throw new Error('ExpectedReadyPageStructure')
+    const targetId = structural.snapshot.pageHeaders[0]?.id
+    if (!targetId) throw new Error('ExpectedPageTarget')
+    await getDb().messageBodies.delete(targetId)
+
+    const material = await query({ kind: 'message.presentations', messageIds: [targetId] })
+
+    expect(joinKnownBranchPageMaterial(structural, material)).toMatchObject({
+      kind: 'stale-path',
+      reason: 'missing-body',
+      messageId: targetId,
+    })
+    expect(structural.snapshot.pageHeaders.map((row) => row.id)).toEqual([targetId])
+  })
+
+  it('classifies full-header and body-version material drift as body-version mismatch', async () => {
+    const seeded = await seedLinearChat({ count: 12, bodyLength: 64 })
+    const path = createBranchPath(await branchHeaders(seeded.chat.id, seeded.leafId))
+    const structural = await query({
+      kind: 'branch.page-structure',
+      chatId: seeded.chat.id,
+      resolvedTipId: seeded.leafId,
+      structuralVersion: seeded.chat.structuralVersion,
+      window: path.window({ offset: 5, limit: 1 }),
+    })
+    expect(structural.kind).toBe('ready')
+    if (structural.kind !== 'ready') throw new Error('ExpectedReadyPageStructure')
+    const targetId = structural.snapshot.pageHeaders[0]?.id
+    if (!targetId) throw new Error('ExpectedPageTarget')
+    const presentation = (await query({ kind: 'message.presentations', messageIds: [targetId] }))[0]
+    if (!presentation) throw new Error('ExpectedMessagePresentation')
+
+    const changedHeader = {
+      ...presentation,
+      header: { ...presentation.header, nodeVersion: presentation.header.nodeVersion + 1 },
+    }
+    const changedBodyVersion = {
+      ...presentation,
+      bodyVersion: presentation.bodyVersion + 1,
+    }
+
+    for (const material of [[changedHeader], [changedBodyVersion]]) {
+      expect(joinKnownBranchPageMaterial(structural, material)).toMatchObject({
+        kind: 'stale-path',
+        reason: 'body-version-mismatch',
+        messageId: targetId,
+      })
+    }
+  })
+
+  it('serves tree previews from the preview projection even when bodies are cold', async () => {
+    const seeded = await seedLinearChat({ count: 8, bodyLength: 2_000 })
+    const target = seeded.stored[3] as StoredMessage
+    await getDb().messageBodies.delete(target.header.id)
+    const bodies = captureReads<MessageBodyRow>('messageBodies')
+
+    const previews = await query({
+      kind: 'message.preview-window',
+      targets: [{ messageId: target.header.id, bodyVersion: target.header.bodyVersion }],
+      maxChars: 80,
+    })
+
+    expect(previews[0]?.messageId).toBe(target.header.id)
+    expect(previews[0]?.text.length).toBeLessThanOrEqual(80)
+    expect(bodies.ids).toEqual([])
+    bodies.stop()
+  })
+
+  it('hydrates only the requested message presentation', async () => {
+    const seeded = await seedLinearChat({ count: 25, bodyLength: 50_000 })
+    const target = seeded.rows[12] as Message
+    const bodies = captureReads<MessageBodyRow>('messageBodies')
+
+    const presentation = await query({ kind: 'message.presentation', messageId: target.id })
+
+    expect(presentation?.message.id).toBe(target.id)
+    expect(bodies.ids).toEqual([target.id])
+    expect(bodies.textCharacters()).toBe(50_000)
+    bodies.stop()
+  })
+
+  it('enumerates topology without hydrating any message body', async () => {
+    const seeded = await seedLinearChat({ count: 180, bodyLength: 10_000 })
+    const bodies = captureReads<MessageBodyRow>('messageBodies')
+
+    const topology = await query({ kind: 'message.headers-by-chat', chatId: seeded.chat.id })
+
+    expect(topology.kind).toBe('ready')
+    if (topology.kind !== 'ready') throw new Error('ExpectedReadyTopology')
+    expect(topology.headers).toHaveLength(180)
+    expect(bodies.ids).toEqual([])
+    bodies.stop()
+  })
+
+  it('edits one row without hydrating its branch or huge sibling', async () => {
+    const seeded = await seedLinearChat({ count: 22, bodyLength: 300_000 })
+    const target = seeded.rows[8] as Message
+    const bodies = captureReads<MessageBodyRow>('messageBodies')
+
+    const result = await executeMessageCommand({
+      kind: 'message.edit-content',
+      input: {
+        chatId: seeded.chat.id,
+        messageId: target.id,
+        content: [{ type: 'text', text: 'edited target' }],
+        now: 10_000,
+      },
+    })
+
+    expect(result.message.content).toEqual([{ type: 'text', text: 'edited target' }])
+    expect(bodies.ids).toEqual([target.id])
+    expect(bodies.ids).not.toContain(seeded.leafId)
+    bodies.stop()
+  })
+
+  it('inserts a sibling from topology without reading existing payloads', async () => {
+    const seeded = await seedLinearChat({ count: 18, bodyLength: 400_000 })
+    const target = seeded.rows[7] as Message
+    const bodies = captureReads<MessageBodyRow>('messageBodies')
+
+    const inserted = await executeMessageCommand({
+      kind: 'message.insert-sibling',
+      input: {
+        chatId: seeded.chat.id,
+        targetId: target.id,
+        content: [{ type: 'output_text', text: 'new sibling' }],
+        role: target.role,
+        origin: 'imported',
+        now: 20_000,
+      },
+    })
+
+    expect(inserted.message.parentId).toBe(target.parentId)
+    expect(bodies.ids).toEqual([])
+    bodies.stop()
+  })
+
+  it('cascades structural deletion without hydrating or mutating payloads', async () => {
+    const seeded = await seedLinearChat({ count: 30, bodyLength: 250_000 })
+    const target = seeded.rows[10] as Message
+    const bodies = captureReads<MessageBodyRow>('messageBodies')
+    const before = await getDb().messageBodies.bulkGet(seeded.rows.map((row) => row.id))
+    bodies.ids.length = 0
+
+    const deleted = await executeMessageCommand({
+      kind: 'message.delete',
+      mode: 'single',
+      input: {
+        chatId: seeded.chat.id,
+        messageId: target.id,
+        activeLeafId: seeded.leafId,
+        cascade: true,
+        now: 30_000,
+      },
+    })
+
+    expect(deleted.effects.tombstoned).toContain(target.id)
+    expect(deleted.destination.proof.tipId).not.toBeNull()
+    expect(deleted.destination.presentations).toEqual([])
+    expect(bodies.ids).toEqual([])
+    const after = await getDb().messageBodies.bulkGet(seeded.rows.map((row) => row.id))
+    expect(after).toEqual(before)
+    bodies.stop()
+  })
+
+  it('plans bounded send context from the tail without hydrating the cold prefix', async () => {
+    const settings = cloneDefaultChatSettings()
+    settings.model = 'openai/gpt-4o'
+    settings.customMaxContext = 1
+    settings.maxCompletionTokens = 0
+    settings.contextStrategy = { ...settings.contextStrategy, keepFirstPairs: 0 }
+    const seeded = await seedLinearChat({ count: 24, bodyLength: 180, settings })
+    const snapshot = await query({
+      kind: 'branch.open',
+      chatId: seeded.chat.id,
+      target: fixedConversationSelectionTarget(
+        { kind: 'tip', messageId: seeded.leafId },
+        seeded.leafId,
+      ),
+      bodyDemand: 'none',
+    })
+    if (snapshot.kind !== 'ready') throw new Error('ExpectedReadySelection')
+    const pending = message(seeded.chat.id, nextId('pending'), {
+      parentId: seeded.leafId,
+      createdAt: 100_000,
+      role: 'user',
+      origin: 'user',
+      content: [{ type: 'text', text: 'mandatory '.repeat(200) }],
+    })
+    const bodies = captureReads<MessageBodyRow>('messageBodies')
+
+    const context = await runWorkspaceRead('repository-query', (authority) => {
+      const promptMaterial = createGenerationPromptMaterialLease(
+        authority,
+        snapshot.chat.id,
+        snapshot.proof.pathHeaders,
+      )
+      return loadGenerationContextForBranch({
+        chat: snapshot.chat,
+        branchHeaders: snapshot.proof.pathHeaders,
+        settings: snapshot.chat.settings,
+        pendingMessages: [pending],
+        routing: loadingPoisonRoute(snapshot.chat.settings),
+        promptMaterial,
+        authority,
+        signal: authority.signal,
+      }).finally(() => promptMaterial.release())
+    })
+
+    expect(context.usedFullBranch).toBe(false)
+    expect(context.pathMessages.at(-1)?.id).toBe(pending.id)
+    expect(context.loadedBodyIds.length).toBeLessThanOrEqual(16)
+    expect(bodies.ids).not.toContain(seeded.rows[0]?.id)
+    expect(bodies.ids).not.toContain(seeded.rows[1]?.id)
+    bodies.stop()
+  })
+
+  it('reads attachment evidence only for evaluated tail buckets and keeps artifact bodies cold', async () => {
+    const settings = cloneDefaultChatSettings()
+    settings.model = 'openai/gpt-4o'
+    settings.customMaxContext = 500
+    settings.maxCompletionTokens = 0
+    settings.contextStrategy = { ...settings.contextStrategy, keepFirstPairs: 0 }
+    const chatId = nextId('chat')
+    const rows = linearMessages(chatId, 24, 180)
+    const cold = largeImageAttachment(nextId('cold-attachment'))
+    const tail = largeImageAttachment(nextId('tail-attachment'))
+    rows[0] = withAttachment(rows[0] as Message, cold.attachment.id)
+    rows[22] = withAttachment(rows[22] as Message, tail.attachment.id)
+    const seeded = await seedChat(rows, undefined, settings)
+    const headers = await branchHeaders(seeded.chat.id, seeded.leafId)
+    const db = getDb()
+    await db.transaction(
+      'rw',
+      db.attachments,
+      db.attachmentArtifacts,
+      db.attachmentBlobs,
+      async () => {
+        await db.attachments.bulkPut([
+          splitAttachmentForStorage(cold.attachment, 7),
+          splitAttachmentForStorage(tail.attachment, 8),
+        ])
+        await db.attachmentArtifacts.bulkPut([cold.artifact, tail.artifact])
+        await db.attachmentBlobs.bulkPut([cold.blob, tail.blob])
+      },
+    )
+
+    const attachmentReads: AttachmentId[] = []
+    let artifactReads = 0
+    let blobReads = 0
+    const readAttachment = (row: AttachmentHeaderRow | undefined) => {
+      if (row) attachmentReads.push(row.id)
+      return row
+    }
+    const readArtifact = (row: AttachmentArtifact | undefined) => {
+      if (row) artifactReads += 1
+      return row
+    }
+    const readBlob = (row: AttachmentBlob | undefined) => {
+      if (row) blobReads += 1
+      return row
+    }
+    db.attachments.hook('reading', readAttachment)
+    db.attachmentArtifacts.hook('reading', readArtifact)
+    db.attachmentBlobs.hook('reading', readBlob)
+    const bodies = captureReads<MessageBodyRow>('messageBodies')
+    const evidenceReads: AttachmentId[] = []
+    const bundleReads: AttachmentId[] = []
+    let context: Awaited<ReturnType<typeof loadGenerationContextForBranch>>
+    try {
+      context = await runWorkspaceRead('repository-query', (authority) => {
+        const promptMaterial = createGenerationPromptMaterialLease(
+          authority,
+          seeded.chat.id,
+          headers,
+        )
+        const resources: AssistantPlanningResources = {
+          globalCalibration: () => ({ version: 1, updatedAt: 0, byModel: {} }),
+          calibrationMode: () => 'adaptive',
+          proxy: () => ({ url: '', secret: '' }),
+          readModels: async () => undefined,
+          resolveEndpoints: async () => null,
+          resolvePrivacy: async () => ({ policies: {}, offlineFallback: false }),
+          getAttachment: async (attachmentId) => {
+            evidenceReads.push(attachmentId)
+            return getWorkspaceRepository()
+              .query(
+                authority,
+                { kind: 'attachment.generation-token-evidence', attachmentId },
+                { signal: authority.signal },
+              )
+              .then((envelope) => envelope.value?.attachment)
+          },
+          getAttachmentBundle: async (attachmentId) => {
+            bundleReads.push(attachmentId)
+            throw new Error(`UnexpectedAttachmentBundleRead:${attachmentId}`)
+          },
+          resolveTextTemplate: async () => null,
+        }
+        return loadGenerationContextForBranch({
+          chat: seeded.chat,
+          branchHeaders: headers,
+          settings,
+          pendingMessages: [],
+          routing: loadingPoisonRoute(settings),
+          knownMessages: [rows[22] as Message, rows[23] as Message],
+          promptMaterial,
+          authority,
+          signal: authority.signal,
+          planningResources: resources,
+        }).finally(() => promptMaterial.release())
+      })
+    } finally {
+      db.attachments.hook('reading').unsubscribe(readAttachment)
+      db.attachmentArtifacts.hook('reading').unsubscribe(readArtifact)
+      db.attachmentBlobs.hook('reading').unsubscribe(readBlob)
+      bodies.stop()
+    }
+
+    expect(context.usedFullBranch).toBe(false)
+    expect(context.pathMessages.map((message) => message.id)).toContain(rows[22].id)
+    expect(context.pathMessages.map((message) => message.id)).not.toContain(rows[0].id)
+    expect(context.preCutAttachmentIds).toEqual([tail.attachment.id])
+    expect(context.attachmentTokenEvidence.map((attachment) => attachment.id)).toEqual([
+      tail.attachment.id,
+    ])
+    expect(evidenceReads).toEqual([tail.attachment.id])
+    expect(bundleReads).toEqual([])
+    expect(attachmentReads).toEqual([tail.attachment.id])
+    expect(artifactReads).toBe(0)
+    expect(blobReads).toBe(0)
+    const penultimate = rows.at(22)
+    const final = rows.at(23)
+    if (!penultimate || !final) throw new Error('Expected terminal loading-poison rows')
+    expect(bodies.ids).not.toContain(penultimate.id)
+    expect(bodies.ids).not.toContain(final.id)
+    expect(context.loadedBodyIds).not.toContain(penultimate.id)
+    expect(context.loadedBodyIds).not.toContain(final.id)
+  })
+})
+
+interface StoredMessage {
+  readonly header: MessageHeaderRow
+  readonly body: MessageBodyRow
+  readonly preview: ReturnType<typeof splitMessageForStorage>['preview']
 }
 
-beforeEach(async () => {
-  await resetAll()
-  await openDb()
-})
+const LOADING_POISON_PROFILE: ConnectionProfile = {
+  id: 'loading-poison-profile',
+  name: 'Loading poison fixture',
+  kind: 'custom',
+  baseUrl: 'https://example.test/v1',
+  defaultHeaders: {},
+  appTitle: '',
+  appUrl: '',
+  supportsEndpointsApi: false,
+  supportsGenerationApi: false,
+  supportsPrivacyScrape: false,
+  createdAt: 0,
+  updatedAt: 0,
+}
 
-afterEach(async () => {
-  await resetAll()
-})
+function loadingPoisonRoute(settings: ChatSettings) {
+  return resolveEffectiveEndpointRouting({
+    profile: LOADING_POISON_PROFILE,
+    settings,
+    contextFacts: EMPTY_MESSAGE_CONTEXT_ROUTE_FACTS,
+  }).route
+}
 
-function message(chatId: string, id: string, overrides: Partial<Message> = {}): Message {
+interface SeededChat {
+  readonly chat: Chat
+  readonly rows: readonly Message[]
+  readonly stored: readonly StoredMessage[]
+  readonly leafId: MessageId
+}
+
+async function seedLinearChat(input: {
+  readonly count: number
+  readonly bodyLength: number
+  readonly settings?: Chat['settings']
+}): Promise<SeededChat> {
+  const chatId = nextId('chat')
+  return seedChat(linearMessages(chatId, input.count, input.bodyLength), undefined, input.settings)
+}
+
+async function seedChat(
+  rows: readonly Message[],
+  leafId = rows.at(-1)?.id,
+  settings?: Chat['settings'],
+): Promise<SeededChat> {
+  const chatId = rows[0]?.chatId ?? nextId('empty-chat')
+  if (!leafId) throw new Error('SeedLeafMissing')
+  const chat = await createChat({
+    id: chatId,
+    title: chatId,
+    now: fixtureSequence + 1,
+    ...(settings === undefined ? {} : { settings }),
+  })
+  const stored = rows.map((row) => splitMessageForStorage(row, { bodyVersion: 1 }))
+  const childProjection = buildChildSlotProjection(
+    chatId,
+    stored.map((row) => row.header),
+    { updatedAt: fixtureSequence + 1 },
+  )
+  const firstUser = rows.find((row) => row.role === 'user' && !row.deleted)
+  const nextChat: Chat = {
+    ...chat,
+    lastUpdatedLeafId: leafId,
+    lastBranchUpdatedAt: fixtureSequence + 1,
+    previewText: firstUser ? textOf(firstUser).slice(0, 240) : '',
+  }
+  const db = getDb()
+  await db.transaction(
+    'rw',
+    [
+      db.chats,
+      db.chatSidebarRows,
+      db.chatSidebarAggregates,
+      db.settings,
+      db.messages,
+      db.messageBodies,
+      db.messagePreviews,
+      db.childLists,
+      db.childSlotMembers,
+    ],
+    async (tx) => {
+      const [currentChat] = await readCurrentChatRowsForTransaction(tx, [chat.id])
+      await applyChatRowWriteTransitions(tx, [
+        { kind: 'replace-preserving-links', previous: currentChat as Chat, next: nextChat },
+      ])
+      await db.messages.bulkPut(stored.map((row) => row.header))
+      await db.messageBodies.bulkPut(stored.map((row) => row.body))
+      await db.messagePreviews.bulkPut(stored.map((row) => row.preview))
+      await db.childLists.bulkPut(childProjection.states)
+      await db.childSlotMembers.bulkPut(childProjection.members)
+    },
+  )
+  return { chat: nextChat, rows, stored, leafId }
+}
+
+function linearMessages(
+  chatId: ChatId,
+  count: number,
+  bodyLength: number,
+  options: {
+    readonly startIndex?: number
+    readonly parentId?: MessageId | null
+    readonly idPrefix?: string
+  } = {},
+): Message[] {
+  const rows: Message[] = []
+  let parentId = options.parentId ?? null
+  const startIndex = options.startIndex ?? 0
+  for (let offset = 0; offset < count; offset += 1) {
+    const index = startIndex + offset
+    const role = index % 2 === 0 ? 'user' : 'assistant'
+    const id = nextId(options.idPrefix ?? 'message')
+    const row = message(chatId, id, {
+      parentId,
+      turnId: `turn-${chatId}-${Math.floor(index / 2)}`,
+      turnIndex: index % 2,
+      createdAt: index + 1,
+      role,
+      origin: role === 'assistant' ? 'generated' : 'user',
+      content: [
+        {
+          type: role === 'assistant' ? 'output_text' : 'text',
+          text: (role === 'assistant' ? 'a' : 'u').repeat(bodyLength),
+        },
+      ],
+    })
+    rows.push(row)
+    parentId = row.id
+  }
+  return rows
+}
+
+function message(chatId: ChatId, id: MessageId, overrides: Partial<Message> = {}): Message {
   return {
     id,
     chatId,
@@ -78,1567 +926,165 @@ function message(chatId: string, id: string, overrides: Partial<Message> = {}): 
   }
 }
 
-async function putFullMessages(rows: readonly Message[]): Promise<void> {
-  const split = rows.map((row) => splitMessageForStorage(row))
-  const db = getDb()
-  await db.messages.bulkPut(split.map((row) => row.header))
-  await db.messageBodies.bulkPut(split.map((row) => row.body))
-}
-
-async function putHeaderOnly(row: Message): Promise<void> {
-  await getDb().messages.put(splitMessageForStorage(row).header)
-}
-
-function attachmentRef(attachmentId: AttachmentId, createdAt = 1): MessageAttachmentRef {
+function withAttachment(row: Message, attachmentId: AttachmentId): Message {
   return {
-    refId: `ref-${attachmentId}-${createdAt}`,
+    ...row,
+    attachmentRefs: [
+      {
+        refId: nextId('attachment-ref'),
+        attachmentId,
+        includeInContext: true,
+        presentation: {},
+        createdAt: 1,
+        updatedAt: 1,
+      },
+    ],
+  }
+}
+
+function largeImageAttachment(attachmentId: AttachmentId): {
+  attachment: Attachment
+  artifact: AttachmentArtifact
+  blob: AttachmentBlob
+} {
+  const blobId = nextId('attachment-blob')
+  const artifact: AttachmentArtifact = {
+    kind: 'text',
+    artifactId: nextId('attachment-artifact'),
     attachmentId,
-    includeInContext: true,
-    presentation: {},
-    createdAt,
-    updatedAt: createdAt,
-  }
-}
-
-function storedAttachment(
-  partial: Partial<Attachment> & Pick<Attachment, 'id' | 'kind' | 'mime' | 'filename'>,
-): Attachment {
-  return {
-    origin: 'system-fixture',
+    processorId: 'poison-test',
+    text: 'artifact'.repeat(125_000),
+    charCount: 1_000_000,
     createdAt: 1,
-    updatedAt: 1,
-    storage: { kind: 'local-blob', blobId: `${partial.id}:blob` },
-    artifacts: [],
-    processing: [],
-    refCount: 1,
-    ...partial,
+  }
+  return {
+    attachment: {
+      id: attachmentId,
+      contentHash: `hash:${attachmentId}`,
+      kind: 'image',
+      mime: 'image/png',
+      filename: `${attachmentId}.png`,
+      sizeBytes: 1_000_000,
+      origin: 'system-fixture',
+      createdAt: 1,
+      updatedAt: 1,
+      storage: { kind: 'local-blob', blobId },
+      dimensions: { width: 64, height: 64 },
+      artifacts: [artifact],
+      processing: [],
+      refCount: 1,
+    },
+    artifact,
+    blob: {
+      id: blobId,
+      attachmentId,
+      role: 'original',
+      mime: 'image/png',
+      contentHash: `hash:${attachmentId}`,
+      sizeBytes: 1_000_000,
+      blob: new Blob(['x'.repeat(1_000_000)], { type: 'image/png' }),
+      createdAt: 1,
+    },
   }
 }
 
-async function hydrateBranchMessages(
-  branchHeaders: readonly ReturnType<typeof splitMessageForStorage>['header'][],
-): Promise<Message[]> {
-  const ids = branchHeaders.map((header) => header.id)
-  const db = getDb()
-  const [headers, bodies] = await Promise.all([
-    db.messages.bulkGet(ids),
-    db.messageBodies.bulkGet(ids),
-  ])
-  return hydrateMessages(
-    headers.map((header, index) => {
-      if (!header) throw new Error(`MessageHeaderMissing:${ids[index]}`)
-      return header
-    }),
-    bodies.map((body, index) => {
-      if (!body) throw new Error(`MessageBodyMissing:${ids[index]}`)
-      return body
-    }),
+async function branchHeaders(chatId: ChatId, leafId: MessageId): Promise<MessageHeaderRow[]> {
+  const topology = await query({ kind: 'message.headers-by-chat', chatId })
+  if (topology.kind !== 'ready') throw new Error('ExpectedReadyTopology')
+  const path = createBranchPath(topology.headers)
+  if (path.leaf?.id !== leafId) throw new Error('ExpectedTopologyTip')
+  return [...topology.headers]
+}
+
+async function query<Q extends WorkspaceQuery>(
+  request: Q,
+  signal?: AbortSignal,
+): Promise<WorkspaceQueryResult<Q>> {
+  return runWorkspaceRead(
+    'repository-query',
+    (permit) =>
+      getWorkspaceRepository()
+        .query(permit, request, { signal: signal ?? permit.signal })
+        .then((envelope) => envelope.value),
+    signal ? { signal } : {},
   )
 }
 
-async function seedChatProjection(
-  chatId: string,
-  messages: readonly Message[],
-  branchLeafId: string,
-  generatedAt = 10,
-): Promise<void> {
-  const cache = buildBranchCacheRow({ chatId, branchLeafId, messages, generatedAt })
-  await getDb().chats.update(chatId, {
-    lastUpdatedLeafId: branchLeafId,
-    lastBranchUpdatedAt: generatedAt,
-    wordCount: cache.wordCount,
-    totalCostUsd: messages.reduce(
-      (total, row) => total + (row.deleted ? 0 : (row.generation?.cost ?? 0)),
-      0,
-    ),
-    previewText: cache.previewText,
-  })
-  await getDb().chatBranchCache.put(cache)
-}
-
-function captureMessageBodyReads(): {
-  ids: string[]
-  textCharacters: () => number
-  stop: () => void
+function captureReads<Row extends { id: string }>(
+  table: 'chats' | 'messages' | 'messageBodies' | 'textTemplates',
+): {
+  readonly ids: string[]
+  readonly textCharacters: () => number
+  readonly stop: () => void
 } {
   const ids: string[] = []
   let textCharacters = 0
-  const reading = (body: ReturnType<typeof splitMessageForStorage>['body'] | undefined) => {
-    if (!body) return body
-    ids.push(body.id)
-    for (const item of body.content) {
-      if (item.type === 'text' || item.type === 'output_text') textCharacters += item.text.length
+  const reading = (row: Row | undefined): Row | undefined => {
+    if (!row) return row
+    ids.push(row.id)
+    if ('content' in row && Array.isArray(row.content)) {
+      for (const item of row.content as unknown[]) {
+        if (
+          item &&
+          typeof item === 'object' &&
+          'type' in item &&
+          (item.type === 'text' || item.type === 'output_text') &&
+          'text' in item &&
+          typeof item.text === 'string'
+        ) {
+          textCharacters += item.text.length
+        }
+      }
     }
-    return body
+    if (
+      'config' in row &&
+      row.config &&
+      typeof row.config === 'object' &&
+      'template' in row.config &&
+      typeof row.config.template === 'string'
+    ) {
+      textCharacters += row.config.template.length
+    }
+    return row
   }
-  getDb().messageBodies.hook('reading', reading)
+  const db = getDb()
+  const selected =
+    table === 'chats'
+      ? db.chats
+      : table === 'messages'
+        ? db.messages
+        : table === 'messageBodies'
+          ? db.messageBodies
+          : db.textTemplates
+  selected.hook('reading', reading as never)
   return {
     ids,
     textCharacters: () => textCharacters,
-    stop: () => getDb().messageBodies.hook('reading').unsubscribe(reading),
+    stop: () => selected.hook('reading').unsubscribe(reading as never),
   }
 }
 
-function captureMessageHeaderReads(): { ids: string[]; stop: () => void } {
-  const ids: string[] = []
-  const reading = (header: ReturnType<typeof splitMessageForStorage>['header'] | undefined) => {
-    if (header) ids.push(header.id)
-    return header
+function captureSettingReads(): { readonly keys: string[]; readonly stop: () => void } {
+  const keys: string[] = []
+  const reading = (row: SettingsRow | undefined): SettingsRow | undefined => {
+    if (row) keys.push(row.key)
+    return row
   }
-  getDb().messages.hook('reading', reading)
+  const table = getDb().settings
+  table.hook('reading', reading)
   return {
-    ids,
-    stop: () => getDb().messages.hook('reading').unsubscribe(reading),
+    keys,
+    stop: () => table.hook('reading').unsubscribe(reading),
   }
 }
 
-async function cutoffIdsAfterPlanning(input: {
-  messages: readonly Message[]
-  settings: ChatSettings
-  providerCap?: number | null
-  preCutAttachmentIds?: readonly AttachmentId[]
-}): Promise<Message['id'][]> {
-  const rewritten = applyOutboundContextRewrites(input.messages, input.settings)
-  const attachmentIds = new Set<AttachmentId>(
-    attachmentContextIds({
-      messages: rewritten,
-      policy: attachmentContextPolicyForSettings(input.settings),
-    }),
-  )
-  for (const id of input.preCutAttachmentIds ?? []) attachmentIds.add(id)
-  const rows = await getDb().attachments.bulkGet([...attachmentIds])
-  const byId = new Map<AttachmentId, Attachment>()
-  for (const row of rows) {
-    if (row) byId.set(row.id, row)
-  }
-  return applyContextCutoff({
-    messages: rewritten,
-    settings: input.settings,
-    tokenizer: tokenizerFromSettings(input.settings, null),
-    providerCap: input.providerCap ?? null,
-    currentModelId: input.settings.model,
-    attachmentResolver: (id) => byId.get(id),
-    ...(attachmentIds.size > 0 ? { disableTextCalibration: true } : {}),
-  }).map((row) => row.id)
+function textOf(row: Message): string {
+  return row.content
+    .flatMap((item) => (item.type === 'text' || item.type === 'output_text' ? [item.text] : []))
+    .join(' ')
 }
 
-describe('loading poison boundaries', () => {
-  it('keeps sidebar reads on chat metadata without touching messages or body rows', async () => {
-    const chat = await createChat({
-      id: 'sidebar-safe',
-      title: 'Sidebar safe',
-      settings: cloneDefaultChatSettings(),
-      now: 10,
-    })
-    await getBrowserRepository().runMutation(
-      [{ kind: 'chat-meta', chatId: chat.id }],
-      async (ctx) => {
-        ctx.patchChatMeta(chat.id, {
-          titleStatus: 'manual',
-          previewText: 'short preview',
-          folderId: 'folder-1',
-          tags: ['tag-a'],
-          settings: { ...chat.settings, systemPrompt: 'large-setting-blob'.repeat(10_000) },
-          tokenCalibration: {
-            poison: {
-              totalTextChars: 1,
-              totalTextTokens: 1,
-              sampleCount: 1,
-              updatedAt: 1,
-            },
-          },
-          favoriteModels: ['favorite-poison/'.repeat(5_000)],
-          recentModels: ['recent-poison/'.repeat(5_000)],
-        })
-      },
-    )
-    await putHeaderOnly(message(chat.id, 'sidebar-message-poison'))
-
-    const db = getDb()
-    const chatsGet = vi.spyOn(db.chats, 'get')
-    const chatsWhere = vi.spyOn(db.chats, 'where')
-    const chatsOrderBy = vi.spyOn(db.chats, 'orderBy')
-    const chatsToArray = vi.spyOn(db.chats, 'toArray')
-    const chatsBulkGet = vi.spyOn(db.chats, 'bulkGet')
-    const messagesWhere = vi.spyOn(db.messages, 'where')
-    const messagesToArray = vi.spyOn(db.messages, 'toArray')
-    const bodiesGet = vi.spyOn(db.messageBodies, 'get')
-    const bodiesBulkGet = vi.spyOn(db.messageBodies, 'bulkGet')
-    const bodiesToArray = vi.spyOn(db.messageBodies, 'toArray')
-
-    const rows = await listChatSidebarRows({ limit: 10 })
-
-    expect(rows).toHaveLength(1)
-    expect(rows[0]).toEqual(
-      expect.objectContaining({
-        id: chat.id,
-        title: 'Sidebar safe',
-        previewText: 'short preview',
-        folderId: 'folder-1',
-        tags: ['tag-a'],
-      }),
-    )
-    expect('settings' in (rows[0] as Record<string, unknown>)).toBe(false)
-    expect('tokenCalibration' in (rows[0] as Record<string, unknown>)).toBe(false)
-    expect('favoriteModels' in (rows[0] as Record<string, unknown>)).toBe(false)
-    expect('recentModels' in (rows[0] as Record<string, unknown>)).toBe(false)
-    expect(chatsGet).not.toHaveBeenCalled()
-    expect(chatsWhere).not.toHaveBeenCalled()
-    expect(chatsOrderBy).not.toHaveBeenCalled()
-    expect(chatsToArray).not.toHaveBeenCalled()
-    expect(chatsBulkGet).not.toHaveBeenCalled()
-    expect(messagesWhere).not.toHaveBeenCalled()
-    expect(messagesToArray).not.toHaveBeenCalled()
-    expect(bodiesGet).not.toHaveBeenCalled()
-    expect(bodiesBulkGet).not.toHaveBeenCalled()
-    expect(bodiesToArray).not.toHaveBeenCalled()
-  })
-
-  it('hydrates only active-branch bodies, not off-branch or other-chat poison rows', async () => {
-    const active = await createChat({
-      id: 'active-chat',
-      title: 'Active',
-      settings: cloneDefaultChatSettings(),
-    })
-    const other = await createChat({
-      id: 'other-chat',
-      title: 'Other',
-      settings: cloneDefaultChatSettings(),
-    })
-    const root = message(active.id, 'branch-root', { createdAt: 1 })
-    const activeLeaf = message(active.id, 'branch-active', {
-      parentId: root.id,
-      createdAt: 3,
-    })
-    const offBranch = message(active.id, 'off-branch-poison', {
-      parentId: root.id,
-      siblingIndex: 1,
-      createdAt: 2,
-      content: [{ type: 'text', text: 'OFF_BRANCH_BODY_MUST_NOT_LOAD' }],
-    })
-    const otherMessage = message(other.id, 'other-chat-poison', {
-      content: [{ type: 'text', text: 'OTHER_CHAT_BODY_MUST_NOT_LOAD' }],
-    })
-    await putFullMessages([root, activeLeaf])
-    await putHeaderOnly(offBranch)
-    await putHeaderOnly(otherMessage)
-
-    const bulkGet = vi.spyOn(getDb().messageBodies, 'bulkGet')
-
-    const snapshot = await loadActiveBranchSnapshot(active.id, {})
-
-    expect(snapshot.branch.map((row) => row.id)).toEqual(['branch-root', 'branch-active'])
-    expect(bulkGet).toHaveBeenCalledTimes(1)
-    expect(bulkGet.mock.calls[0]?.[0]).toEqual(['branch-root', 'branch-active'])
-  })
-
-  it('rebuilds a stale search cache from only the last-updated branch bodies', async () => {
-    const chat = await createChat({
-      id: 'search-cache-body-safe',
-      title: 'Search body safe',
-      settings: cloneDefaultChatSettings(),
-      now: 1,
-    })
-    const root = message(chat.id, 'search-root', { createdAt: 1 })
-    const selectedLeaf = message(chat.id, 'search-selected', {
-      parentId: root.id,
-      createdAt: 3,
-      role: 'assistant',
-      origin: 'generated',
-      content: [{ type: 'output_text', text: 'selected branch needle' }],
-    })
-    const poison = message(chat.id, 'search-off-branch-poison', {
-      parentId: root.id,
-      siblingIndex: 1,
-      createdAt: 2,
-      role: 'assistant',
-      origin: 'generated',
-      content: [{ type: 'output_text', text: 'OFF_BRANCH_SEARCH_BODY_MUST_NOT_LOAD' }],
-    })
-    await putFullMessages([root, selectedLeaf])
-    await putHeaderOnly(poison)
-    await getDb().chats.update(chat.id, {
-      lastUpdatedLeafId: selectedLeaf.id,
-      lastBranchUpdatedAt: 10,
-    })
-
-    const bodyReads = captureMessageBodyReads()
-    const output = await searchChats({
-      queryId: 'search-cache-poison',
-      query: 'needle',
-      repo: getBrowserRepository(),
-      concurrency: 1,
-    })
-    bodyReads.stop()
-
-    expect(output.results).toMatchObject([
-      {
-        chatId: chat.id,
-        source: 'branch-cache',
-        branchLeafId: selectedLeaf.id,
-      },
-    ])
-    expect(bodyReads.ids).toEqual([root.id, selectedLeaf.id])
-    expect(bodyReads.ids).not.toContain(poison.id)
-    expect(
-      (await getDb().chatBranchCache.get(chat.id))?.messageTimestamps.map(({ id }) => id),
-    ).toEqual([root.id, selectedLeaf.id])
-  })
-
-  it('persists a normal user-plus-assistant append without reading existing branch bodies', async () => {
-    const chat = await createChat({
-      id: 'append-body-safe',
-      title: 'Append body safe',
-      settings: cloneDefaultChatSettings(),
-      now: 1,
-    })
-    const root = message(chat.id, 'append-root', { createdAt: 1 })
-    const current = message(chat.id, 'append-current', {
-      parentId: root.id,
-      createdAt: 3,
-      role: 'assistant',
-      origin: 'generated',
-      content: [{ type: 'output_text', text: 'current answer' }],
-    })
-    const poison = message(chat.id, 'append-off-branch-poison', {
-      parentId: root.id,
-      siblingIndex: 1,
-      createdAt: 2,
-      role: 'assistant',
-      origin: 'generated',
-      content: [{ type: 'output_text', text: 'THIS BODY MUST NOT BE READ' }],
-    })
-    await putFullMessages([root, current])
-    await putHeaderOnly(poison)
-    await seedChatProjection(chat.id, [root, current, poison], current.id)
-
-    const bodyReads = captureMessageBodyReads()
-    const sent = await sendUserMessage({
-      chatId: chat.id,
-      expectedLeafId: current.id,
-      content: [{ type: 'text', text: 'next question' }],
-      now: 100,
-      messageId: 'append-user',
-      turnId: 'append-turn',
-      skipCalibration: true,
-    })
-    const headerReads = captureMessageHeaderReads()
-    const planned = await getBrowserRepository().getBranchHeaderSnapshotByLeaf(
-      chat.id,
-      sent.messageId,
-    )
-    headerReads.stop()
-    expect(planned.branchHeaders.map((header) => header.id)).toEqual([
-      root.id,
-      current.id,
-      sent.messageId,
-    ])
-    expect(headerReads.ids).toEqual([sent.messageId, current.id, root.id])
-    expect(headerReads.ids).not.toContain(poison.id)
-    const assistant: Message = message(chat.id, 'append-assistant', {
-      parentId: sent.messageId,
-      createdAt: 101,
-      role: 'assistant',
-      origin: 'generated',
-      content: [],
-    })
-    await getBrowserRepository().runMutation(
-      [
-        { kind: 'message', messageId: assistant.id },
-        { kind: 'children', chatId: chat.id, parentId: sent.messageId },
-      ],
-      async (ctx) => ctx.putMessage(assistant),
-    )
-    bodyReads.stop()
-
-    expect(bodyReads.ids).toEqual([])
-    expect(bodyReads.textCharacters()).toBe(0)
-    expect(await getDb().chatBranchCache.get(chat.id)).toBeUndefined()
-    const sentMessage = message(chat.id, sent.messageId, {
-      parentId: current.id,
-      createdAt: 100,
-      content: [{ type: 'text', text: 'next question' }],
-    })
-    expect((await getDb().chats.get(chat.id))?.wordCount).toBe(
-      buildBranchCacheRow({
-        chatId: chat.id,
-        branchLeafId: assistant.id,
-        messages: [root, current, sentMessage, assistant],
-      }).wordCount,
-    )
-  })
-
-  it('replaces a final placeholder while reading only that target body', async () => {
-    const chat = await createChat({
-      id: 'placeholder-body-safe',
-      title: 'Placeholder body safe',
-      settings: cloneDefaultChatSettings(),
-      now: 1,
-    })
-    const shared = message(chat.id, 'placeholder-shared-poison', {
-      createdAt: 1,
-      content: [{ type: 'text', text: 'shared prefix '.repeat(10_000) }],
-    })
-    const target = message(chat.id, 'placeholder-target', {
-      parentId: shared.id,
-      createdAt: 2,
-      role: 'assistant',
-      origin: 'generated',
-      content: [{ type: 'output_text', text: 'streaming placeholder' }],
-    })
-    await putHeaderOnly(shared)
-    await putFullMessages([target])
-    await seedChatProjection(chat.id, [shared, target], target.id)
-
-    const bodyReads = captureMessageBodyReads()
-    await getBrowserRepository().runMutation(
-      [{ kind: 'message', messageId: target.id }],
-      async (ctx) => {
-        await ctx.patchMessageBody(
-          target.id,
-          { content: [{ type: 'output_text', text: 'final replacement body' }] },
-          { replaceBody: true },
-        )
-      },
-    )
-    bodyReads.stop()
-
-    expect(bodyReads.ids).toEqual([target.id])
-    expect(bodyReads.ids).not.toContain(shared.id)
-    expect(await getDb().chatBranchCache.get(chat.id)).toBeUndefined()
-    const finalTarget = {
-      ...target,
-      content: [{ type: 'output_text' as const, text: 'final replacement body' }],
-    }
-    expect((await getDb().chats.get(chat.id))?.wordCount).toBe(
-      buildBranchCacheRow({
-        chatId: chat.id,
-        branchLeafId: target.id,
-        messages: [shared, finalTarget],
-      }).wordCount,
-    )
-  })
-
-  it('continues the latest assistant while reading only that target body', async () => {
-    const chat = await createChat({
-      id: 'continue-body-safe',
-      title: 'Continue body safe',
-      settings: cloneDefaultChatSettings(),
-      now: 1,
-    })
-    const shared = message(chat.id, 'continue-shared-poison', {
-      createdAt: 1,
-      content: [{ type: 'text', text: 'shared prefix '.repeat(10_000) }],
-    })
-    const target = message(chat.id, 'continue-target', {
-      parentId: shared.id,
-      createdAt: 2,
-      role: 'assistant',
-      origin: 'generated',
-      content: [{ type: 'output_text', text: 'existing '.repeat(10_000) }],
-    })
-    await putHeaderOnly(shared)
-    await putFullMessages([target])
-    await seedChatProjection(chat.id, [shared, target], target.id)
-
-    const bodyReads = captureMessageBodyReads()
-    await getBrowserRepository().runMutation(
-      [{ kind: 'message', messageId: target.id }],
-      async (ctx) => {
-        const current = await ctx.getMessage(target.id)
-        if (!current) throw new Error('missing continuation target')
-        await ctx.putMessage({
-          ...current,
-          content: [{ type: 'output_text', text: `${'existing '.repeat(10_000)}continued` }],
-        })
-      },
-    )
-    bodyReads.stop()
-
-    expect(bodyReads.ids.length).toBeGreaterThan(0)
-    expect(new Set(bodyReads.ids)).toEqual(new Set([target.id]))
-    expect(await getDb().chatBranchCache.get(chat.id)).toBeUndefined()
-  })
-
-  it('regenerates without reading the divergent old leaf or shared prefix', async () => {
-    const chat = await createChat({
-      id: 'regenerate-body-safe',
-      title: 'Regenerate body safe',
-      settings: cloneDefaultChatSettings(),
-      now: 1,
-    })
-    const root = message(chat.id, 'regenerate-root', { createdAt: 1 })
-    const target = message(chat.id, 'regenerate-target', {
-      parentId: root.id,
-      createdAt: 3,
-      role: 'assistant',
-      origin: 'generated',
-      content: [{ type: 'output_text', text: 'large old answer'.repeat(10_000) }],
-    })
-    const poison = message(chat.id, 'regenerate-off-branch-poison', {
-      parentId: root.id,
-      siblingIndex: 1,
-      createdAt: 2,
-      role: 'assistant',
-      origin: 'generated',
-      content: [{ type: 'output_text', text: 'THIS BODY MUST NOT BE READ' }],
-    })
-    await putHeaderOnly(root)
-    await putFullMessages([target])
-    await putHeaderOnly(poison)
-    await seedChatProjection(chat.id, [root, target, poison], target.id)
-
-    const bodyReads = captureMessageBodyReads()
-    const regenerated = await regenerateAssistant({
-      chatId: chat.id,
-      messageId: target.id,
-      now: 100,
-    })
-    bodyReads.stop()
-
-    expect(bodyReads.ids).toEqual([])
-    expect(bodyReads.ids).not.toContain(root.id)
-    expect(bodyReads.ids).not.toContain(poison.id)
-    expect((await getDb().chats.get(chat.id))?.lastUpdatedLeafId).toBe(regenerated.messageId)
-    expect((await getDb().chats.get(chat.id))?.wordCount).toBe(
-      buildBranchCacheRow({
-        chatId: chat.id,
-        branchLeafId: root.id,
-        messages: [root],
-      }).wordCount,
-    )
-    expect(await getDb().chatBranchCache.get(chat.id)).toBeUndefined()
-  })
-
-  it('creates an explicit sibling without reading the divergent old leaf', async () => {
-    const chat = await createChat({
-      id: 'sibling-body-safe',
-      title: 'Sibling body safe',
-      settings: cloneDefaultChatSettings(),
-      now: 1,
-    })
-    const root = message(chat.id, 'sibling-root', { createdAt: 1 })
-    const target = message(chat.id, 'sibling-target', {
-      parentId: root.id,
-      createdAt: 3,
-      role: 'assistant',
-      origin: 'generated',
-      content: [{ type: 'output_text', text: 'large old sibling'.repeat(10_000) }],
-    })
-    const poison = message(chat.id, 'sibling-off-branch-poison', {
-      parentId: root.id,
-      siblingIndex: 1,
-      createdAt: 2,
-      role: 'assistant',
-      origin: 'generated',
-    })
-    await putHeaderOnly(root)
-    await putFullMessages([target])
-    await putHeaderOnly(poison)
-    await seedChatProjection(chat.id, [root, target, poison], target.id)
-
-    const bodyReads = captureMessageBodyReads()
-    const sibling = await insertSibling({
-      chatId: chat.id,
-      targetId: target.id,
-      role: 'assistant',
-      origin: 'generated',
-      content: [{ type: 'output_text', text: 'replacement sibling' }],
-      now: 100,
-    })
-    bodyReads.stop()
-
-    expect(bodyReads.ids).toEqual([])
-    expect(bodyReads.ids).not.toContain(root.id)
-    expect(bodyReads.ids).not.toContain(poison.id)
-    expect((await getDb().chats.get(chat.id))?.lastUpdatedLeafId).toBe(sibling.messageId)
-    const inserted = message(chat.id, sibling.messageId, {
-      parentId: root.id,
-      createdAt: 100,
-      role: 'assistant',
-      origin: 'generated',
-      content: [{ type: 'output_text', text: 'replacement sibling' }],
-    })
-    expect((await getDb().chats.get(chat.id))?.wordCount).toBe(
-      buildBranchCacheRow({
-        chatId: chat.id,
-        branchLeafId: inserted.id,
-        messages: [root, inserted],
-      }).wordCount,
-    )
-    expect(await getDb().chatBranchCache.get(chat.id)).toBeUndefined()
-  })
-
-  it('uses header word projections when an old divergent body is missing', async () => {
-    const chat = await createChat({
-      id: 'missing-old-body-fallback',
-      title: 'Missing old body fallback',
-      settings: cloneDefaultChatSettings(),
-      now: 1,
-    })
-    const root = message(chat.id, 'fallback-root', {
-      createdAt: 1,
-      content: [{ type: 'text', text: 'shared root words' }],
-    })
-    const target = message(chat.id, 'fallback-missing-target', {
-      parentId: root.id,
-      createdAt: 2,
-      role: 'assistant',
-      origin: 'generated',
-      content: [{ type: 'output_text', text: 'missing old body words' }],
-    })
-    await putFullMessages([root])
-    await putHeaderOnly(target)
-    await seedChatProjection(chat.id, [root, target], target.id)
-
-    const bodyReads = captureMessageBodyReads()
-    await insertSibling({
-      chatId: chat.id,
-      targetId: target.id,
-      role: 'assistant',
-      origin: 'generated',
-      content: [{ type: 'output_text', text: 'new fallback answer' }],
-      now: 100,
-    })
-    bodyReads.stop()
-
-    expect(bodyReads.ids).toEqual([])
-    expect((await getDb().chats.get(chat.id))?.wordCount).toBe(6)
-    expect(await getDb().chatBranchCache.get(chat.id)).toBeUndefined()
-  })
-
-  it('appends over a multi-megabyte off-branch body corpus while reading zero existing body characters', async () => {
-    const chat = await createChat({
-      id: 'large-append-body-safe',
-      title: 'Large append body safe',
-      settings: cloneDefaultChatSettings(),
-      now: 1,
-    })
-    const root = message(chat.id, 'large-append-root', { createdAt: 1, role: 'system' })
-    const winner = message(chat.id, 'large-append-winner', {
-      parentId: root.id,
-      createdAt: 1_000,
-      role: 'assistant',
-      origin: 'generated',
-      content: [{ type: 'output_text', text: 'winner' }],
-    })
-    const bodyCharsPerBranch = 64 * 1_024
-    const offBranches = Array.from({ length: 64 }, (_, index) =>
-      message(chat.id, `large-off-${String(index).padStart(2, '0')}`, {
-        parentId: root.id,
-        siblingIndex: index + 1,
-        createdAt: index + 2,
-        role: 'assistant',
-        origin: 'generated',
-        content: [{ type: 'output_text', text: 'x'.repeat(bodyCharsPerBranch) }],
-      }),
-    )
-    await putFullMessages([root, winner, ...offBranches])
-    await seedChatProjection(chat.id, [root, winner, ...offBranches], winner.id)
-    const beforeWordCount = (await getDb().chats.get(chat.id))?.wordCount
-
-    const bodyReads = captureMessageBodyReads()
-    const appended = message(chat.id, 'large-append-new', {
-      parentId: winner.id,
-      createdAt: 2_000,
-      role: 'assistant',
-      origin: 'generated',
-      content: [],
-    })
-    await getBrowserRepository().runMutation(
-      [
-        { kind: 'message', messageId: appended.id },
-        { kind: 'children', chatId: chat.id, parentId: winner.id },
-      ],
-      async (ctx) => ctx.putMessage(appended),
-    )
-    bodyReads.stop()
-
-    expect(offBranches.length * bodyCharsPerBranch).toBe(4_194_304)
-    expect(bodyReads.ids).toEqual([])
-    expect(bodyReads.textCharacters()).toBe(0)
-    expect((await getDb().chats.get(chat.id))?.wordCount).toBe(beforeWordCount)
-    expect(await getDb().chatBranchCache.get(chat.id)).toBeUndefined()
-  })
-
-  it('cascades tombstones through missing and huge bodies without reading or writing payload rows', async () => {
-    const chat = await createChat({
-      id: 'header-only-cascade',
-      title: 'Header only cascade',
-      settings: cloneDefaultChatSettings(),
-      now: 1,
-    })
-    const rows = Array.from({ length: 64 }, (_, index) =>
-      message(chat.id, `cascade-${index}`, {
-        parentId: index === 0 ? null : `cascade-${index - 1}`,
-        createdAt: index,
-        role: 'assistant',
-        origin: 'generated',
-        content: [
-          {
-            type: 'output_text',
-            text: index === 0 ? 'x'.repeat(1024 * 1024) : `missing body ${index}`,
-          },
-        ],
-      }),
-    )
-    await putFullMessages([rows[0] as Message])
-    for (const row of rows.slice(1)) await putHeaderOnly(row)
-    await seedChatProjection(chat.id, rows, (rows.at(-1) as Message).id)
-
-    const db = getDb()
-    const bodyGet = vi.spyOn(db.messageBodies, 'get')
-    const bodyBulkGet = vi.spyOn(db.messageBodies, 'bulkGet')
-    const bodyPut = vi.spyOn(db.messageBodies, 'put')
-    const bodyBulkPut = vi.spyOn(db.messageBodies, 'bulkPut')
-    const bodyDelete = vi.spyOn(db.messageBodies, 'delete')
-    await deleteSingleMessage({
-      chatId: chat.id,
-      messageId: (rows[0] as Message).id,
-      cursor: {},
-      cascade: true,
-    })
-
-    expect(
-      (await db.messages.toArray())
-        .filter((row) => row.chatId === chat.id)
-        .every((header) => header.deleted),
-    ).toBe(true)
-    expect(bodyGet).not.toHaveBeenCalled()
-    expect(bodyBulkGet).not.toHaveBeenCalled()
-    expect(bodyPut).not.toHaveBeenCalled()
-    expect(bodyBulkPut).not.toHaveBeenCalled()
-    expect(bodyDelete).not.toHaveBeenCalled()
-  })
-
-  it('splices and renumbers a deep turn with linear header work and zero body I/O', async () => {
-    const chat = await createChat({
-      id: 'header-only-deep-splice',
-      title: 'Header only deep splice',
-      settings: cloneDefaultChatSettings(),
-      now: 1,
-    })
-    const depth = 128
-    const turnId = 'deep-turn'
-    const deletedRows = Array.from({ length: depth }, (_, index) =>
-      message(chat.id, `deep-${index}`, {
-        parentId: index === 0 ? null : `deep-${index - 1}`,
-        siblingIndex: 7,
-        turnId,
-        turnIndex: index,
-        createdAt: index,
-        role: 'assistant',
-        origin: 'generated',
-        content: [{ type: 'output_text', text: `missing ${index}` }],
-      }),
-    )
-    const survivor = message(chat.id, 'deep-survivor', {
-      parentId: `deep-${depth - 1}`,
-      siblingIndex: 11,
-      turnId: 'survivor-turn',
-      createdAt: depth,
-      role: 'user',
-      content: [{ type: 'text', text: 'y'.repeat(1024 * 1024) }],
-    })
-    for (const row of [...deletedRows, survivor]) await putHeaderOnly(row)
-    await seedChatProjection(chat.id, [...deletedRows, survivor], survivor.id)
-
-    const db = getDb()
-    let headerRowsRead = 0
-    const countHeader = (
-      header: ReturnType<typeof splitMessageForStorage>['header'] | undefined,
-    ) => {
-      if (header) headerRowsRead += 1
-      return header
-    }
-    db.messages.hook('reading', countHeader)
-    const bodyGet = vi.spyOn(db.messageBodies, 'get')
-    const bodyBulkGet = vi.spyOn(db.messageBodies, 'bulkGet')
-    const bodyPut = vi.spyOn(db.messageBodies, 'put')
-    const bodyBulkPut = vi.spyOn(db.messageBodies, 'bulkPut')
-    const bodyDelete = vi.spyOn(db.messageBodies, 'delete')
-    await deleteTurn({
-      chatId: chat.id,
-      messageId: `deep-${depth - 1}`,
-      cursor: {},
-    })
-    db.messages.hook('reading').unsubscribe(countHeader)
-
-    const rootHeaders = (await db.messages.where('chatId').equals(chat.id).toArray())
-      .filter((header) => header.parentId === null)
-      .sort((left, right) => left.siblingIndex - right.siblingIndex)
-    expect(rootHeaders.map((header) => header.id)).toEqual(['deep-0', survivor.id])
-    expect(rootHeaders.map((header) => header.siblingIndex)).toEqual([0, 1])
-    expect(rootHeaders[0]?.deleted).toBe(true)
-    expect(rootHeaders[1]?.deleted).toBe(false)
-    expect(headerRowsRead).toBeLessThanOrEqual((depth + 1) * 10)
-    expect(bodyGet).not.toHaveBeenCalled()
-    expect(bodyBulkGet).not.toHaveBeenCalled()
-    expect(bodyPut).not.toHaveBeenCalled()
-    expect(bodyBulkPut).not.toHaveBeenCalled()
-    expect(bodyDelete).not.toHaveBeenCalled()
-  })
-
-  it('hydrates only the requested active-branch body window', async () => {
-    const chat = await createChat({
-      id: 'window-chat',
-      title: 'Window',
-      settings: cloneDefaultChatSettings(),
-    })
-    const w0 = message(chat.id, 'W0', { createdAt: 0 })
-    const w1 = message(chat.id, 'W1', { parentId: 'W0', createdAt: 1 })
-    const w2 = message(chat.id, 'W2', { parentId: 'W1', createdAt: 2 })
-    const w3 = message(chat.id, 'W3', {
-      parentId: 'W2',
-      createdAt: 3,
-      content: [{ type: 'text', text: 'WINDOW_POISON_BODY_MUST_NOT_LOAD' }],
-    })
-    await putHeaderOnly(w0)
-    await putFullMessages([w1, w2])
-    await putHeaderOnly(w3)
-
-    const headerBulkGet = vi.spyOn(getDb().messages, 'bulkGet')
-    const headerWhere = vi.spyOn(getDb().messages, 'where')
-    const bulkGet = vi.spyOn(getDb().messageBodies, 'bulkGet')
-    const measurements: Array<{ pageHeaderRowsRead: number; bodyRowsRead: number }> = []
-
-    const result = await loadKnownBranchPageSnapshot(chat.id, ['W0', 'W1', 'W2', 'W3'], {
-      offset: 1,
-      limit: 2,
-      onMeasure: (measurement) => measurements.push(measurement),
-    })
-    expect(result.kind).toBe('ready')
-    if (result.kind !== 'ready') throw new Error('expected ready branch page')
-    const snapshot = result.snapshot
-
-    expect(snapshot.pageHeaders.map((row) => row.id)).toEqual(['W1', 'W2'])
-    expect(snapshot.pageMessages.map((row) => row.id)).toEqual(['W1', 'W2'])
-    expect(snapshot.branchLength).toBe(4)
-    expect(headerBulkGet).toHaveBeenCalledOnce()
-    expect(headerBulkGet).toHaveBeenCalledWith(['W1', 'W2'])
-    expect(headerWhere).not.toHaveBeenCalled()
-    expect(bulkGet).toHaveBeenCalledTimes(1)
-    expect(bulkGet.mock.calls[0]?.[0]).toEqual(['W1', 'W2'])
-    expect(measurements).toEqual([{ pageHeaderRowsRead: 2, bodyRowsRead: 2 }])
-  })
-
-  it('keeps cumulative header and body reads linear across geometrically growing pages', async () => {
-    const chat = await createChat({
-      id: 'linear-page-chat',
-      title: 'Linear pages',
-      settings: cloneDefaultChatSettings(),
-    })
-    const branchLength = 128
-    const rows = Array.from({ length: branchLength }, (_, index) =>
-      message(chat.id, `P${index}`, {
-        parentId: index === 0 ? null : `P${index - 1}`,
-        createdAt: index,
-      }),
-    )
-    const path = rows.map((row) => row.id)
-    await putFullMessages(rows)
-
-    const headerBulkGet = vi.spyOn(getDb().messages, 'bulkGet')
-    const bodyBulkGet = vi.spyOn(getDb().messageBodies, 'bulkGet')
-    const measurements: Array<{ pageHeaderRowsRead: number; bodyRowsRead: number }> = []
-    const limits = [8, 16, 32, 64, 128]
-
-    for (const limit of limits) {
-      const result = await loadKnownBranchPageSnapshot(chat.id, path, {
-        offset: -1,
-        limit,
-        onMeasure: (measurement) => measurements.push(measurement),
-      })
-      expect(result.kind).toBe('ready')
-      if (result.kind !== 'ready') throw new Error('expected ready branch page')
-      expect(result.snapshot.pageHeaders).toHaveLength(limit)
-      expect(result.snapshot.pageMessages).toHaveLength(limit)
-      expect(result.snapshot.pageOffset).toBe(branchLength - limit)
-      expect(result.snapshot.branchLength).toBe(branchLength)
-    }
-
-    expect(headerBulkGet.mock.calls.map(([ids]) => ids.length)).toEqual(limits)
-    expect(bodyBulkGet.mock.calls.map(([ids]) => ids.length)).toEqual(limits)
-    const totalHeaderRows = measurements.reduce(
-      (total, measurement) => total + measurement.pageHeaderRowsRead,
-      0,
-    )
-    const totalBodyRows = measurements.reduce(
-      (total, measurement) => total + measurement.bodyRowsRead,
-      0,
-    )
-    expect(totalHeaderRows).toBe(248)
-    expect(totalBodyRows).toBe(248)
-    expect(totalHeaderRows).toBeLessThan(2 * branchLength)
-    expect(totalBodyRows).toBeLessThan(2 * branchLength)
-  })
-
-  it('does not start a superseded branch page read', async () => {
-    const chat = await createChat({
-      id: 'aborted-page-chat',
-      title: 'Aborted page',
-      settings: cloneDefaultChatSettings(),
-    })
-    const root = message(chat.id, 'aborted-page-root', { createdAt: 0 })
-    await putFullMessages([root])
-    const headerBulkGet = vi.spyOn(getDb().messages, 'bulkGet')
-    const bodyBulkGet = vi.spyOn(getDb().messageBodies, 'bulkGet')
-    const controller = new AbortController()
-    controller.abort()
-
-    await expect(
-      loadKnownBranchPageSnapshot(chat.id, [root.id], {
-        offset: -1,
-        limit: 1,
-        signal: controller.signal,
-      }),
-    ).rejects.toMatchObject({ name: 'AbortError' })
-    expect(headerBulkGet).not.toHaveBeenCalled()
-    expect(bodyBulkGet).not.toHaveBeenCalled()
-  })
-
-  it('aborts an in-flight branch page transaction before body hydration continues', async () => {
-    const chat = await createChat({
-      id: 'in-flight-aborted-page-chat',
-      title: 'In-flight aborted page',
-      settings: cloneDefaultChatSettings(),
-    })
-    const rows = [
-      message(chat.id, 'abort-0', { createdAt: 0 }),
-      message(chat.id, 'abort-1', { parentId: 'abort-0', createdAt: 1 }),
-    ]
-    await putFullMessages(rows)
-    const controller = new AbortController()
-    let transactionAbortCalls: unknown[][] | undefined
-    const abortDuringHeaderRead = (
-      header: ReturnType<typeof splitMessageForStorage>['header'] | undefined,
-    ) => {
-      if (header && !controller.signal.aborted) {
-        const transaction = Dexie.currentTransaction
-        const abortSpy = vi.spyOn(transaction, 'abort')
-        transactionAbortCalls = abortSpy.mock.calls
-        controller.abort()
-      }
-      return header
-    }
-    getDb().messages.hook('reading', abortDuringHeaderRead)
-    const bodyBulkGet = vi.spyOn(getDb().messageBodies, 'bulkGet')
-    const measured = vi.fn()
-
-    await expect(
-      loadKnownBranchPageSnapshot(
-        chat.id,
-        rows.map((row) => row.id),
-        { offset: 0, limit: 2, signal: controller.signal, onMeasure: measured },
-      ),
-    ).rejects.toMatchObject({ name: 'AbortError' })
-    getDb().messages.hook('reading').unsubscribe(abortDuringHeaderRead)
-
-    expect(transactionAbortCalls).toHaveLength(1)
-    expect(bodyBulkGet).not.toHaveBeenCalled()
-    expect(measured).not.toHaveBeenCalled()
-  })
-
-  it('rejects a known page when a structural mutation breaks its boundary parent', async () => {
-    const chat = await createChat({
-      id: 'stale-page-structure-chat',
-      title: 'Stale page structure',
-      settings: cloneDefaultChatSettings(),
-    })
-    const root = message(chat.id, 'page-root', { createdAt: 0 })
-    const first = message(chat.id, 'page-first', { parentId: root.id, createdAt: 1 })
-    const second = message(chat.id, 'page-second', { parentId: first.id, createdAt: 2 })
-    const leaf = message(chat.id, 'page-leaf', { parentId: second.id, createdAt: 3 })
-    await putFullMessages([root, first, second, leaf])
-    const path = [root.id, first.id, second.id, leaf.id]
-
-    await getBrowserRepository().runMutation(
-      [
-        { kind: 'message', messageId: second.id },
-        { kind: 'children', chatId: chat.id, parentId: first.id },
-        { kind: 'children', chatId: chat.id, parentId: root.id },
-      ],
-      async (context) => {
-        await context.putMessage({ ...second, parentId: root.id, siblingIndex: 1 })
-      },
-    )
-
-    const headerBulkGet = vi.spyOn(getDb().messages, 'bulkGet')
-    const bodyBulkGet = vi.spyOn(getDb().messageBodies, 'bulkGet')
-    await expect(
-      loadKnownBranchPageSnapshot(chat.id, path, { offset: 2, limit: 2 }),
-    ).resolves.toMatchObject({
-      kind: 'stale-path',
-      reason: 'non-contiguous',
-      messageId: second.id,
-    })
-    expect(headerBulkGet).toHaveBeenCalledOnce()
-    expect(headerBulkGet).toHaveBeenCalledWith([second.id, leaf.id])
-    expect(bodyBulkGet).not.toHaveBeenCalled()
-  })
-
-  it('returns an explicit stale path for a missing or mismatched selected body', async () => {
-    const chat = await createChat({
-      id: 'stale-window-body-chat',
-      title: 'Stale body window',
-      settings: cloneDefaultChatSettings(),
-    })
-    const root = message(chat.id, 'stale-body-root', { createdAt: 0 })
-    await putHeaderOnly(root)
-
-    await expect(
-      loadKnownBranchPageSnapshot(chat.id, [root.id], { offset: -1, limit: 1 }),
-    ).resolves.toMatchObject({
-      kind: 'stale-path',
-      reason: 'missing-body',
-      messageId: root.id,
-    })
-
-    const { body } = splitMessageForStorage(root)
-    await getDb().messageBodies.put({ ...body, bodyVersion: body.bodyVersion + 1 })
-
-    await expect(
-      loadKnownBranchPageSnapshot(chat.id, [root.id], { offset: -1, limit: 1 }),
-    ).resolves.toMatchObject({
-      kind: 'stale-path',
-      reason: 'body-version-mismatch',
-      messageId: root.id,
-    })
-  })
-
-  it('anchors negative active-branch body pages to the newest messages', async () => {
-    const chat = await createChat({
-      id: 'tail-window-chat',
-      title: 'Tail window',
-      settings: cloneDefaultChatSettings(),
-    })
-    const w0 = message(chat.id, 'T0', { createdAt: 0 })
-    const w1 = message(chat.id, 'T1', { parentId: 'T0', createdAt: 1 })
-    const w2 = message(chat.id, 'T2', { parentId: 'T1', createdAt: 2 })
-    const w3 = message(chat.id, 'T3', { parentId: 'T2', createdAt: 3 })
-    const w4 = message(chat.id, 'T4', { parentId: 'T3', createdAt: 4 })
-    await putHeaderOnly(w0)
-    await putHeaderOnly(w1)
-    await putHeaderOnly(w2)
-    await putFullMessages([w3, w4])
-
-    const bulkGet = vi.spyOn(getDb().messageBodies, 'bulkGet')
-
-    const result = await loadKnownBranchPageSnapshot(chat.id, ['T0', 'T1', 'T2', 'T3', 'T4'], {
-      offset: -1,
-      limit: 2,
-    })
-    expect(result.kind).toBe('ready')
-    if (result.kind !== 'ready') throw new Error('expected ready branch page')
-    const snapshot = result.snapshot
-
-    expect(snapshot.pageHeaders.map((row) => row.id)).toEqual(['T3', 'T4'])
-    expect(snapshot.pageMessages.map((row) => row.id)).toEqual(['T3', 'T4'])
-    expect(snapshot.pageOffset).toBe(3)
-    expect(snapshot.branchLength).toBe(5)
-    expect(bulkGet).toHaveBeenCalledTimes(1)
-    expect(bulkGet.mock.calls[0]?.[0]).toEqual(['T3', 'T4'])
-  })
-
-  it('switching branches hydrates only the selected window, not stale sibling bodies', async () => {
-    const chat = await createChat({
-      id: 'branch-switch-window-chat',
-      title: 'Branch switch window',
-      settings: cloneDefaultChatSettings(),
-    })
-    const root = message(chat.id, 'root', { createdAt: 0 })
-    const branchA1 = message(chat.id, 'A1', {
-      parentId: root.id,
-      siblingIndex: 0,
-      createdAt: 1,
-      content: [{ type: 'text', text: 'A_BRANCH_BODY_MUST_NOT_LOAD' }],
-    })
-    const branchA2 = message(chat.id, 'A2', {
-      parentId: branchA1.id,
-      siblingIndex: 0,
-      createdAt: 2,
-      content: [{ type: 'text', text: 'A_BRANCH_TAIL_MUST_NOT_LOAD' }],
-    })
-    const branchB1 = message(chat.id, 'B1', {
-      parentId: root.id,
-      siblingIndex: 1,
-      createdAt: 3,
-    })
-    const branchB2 = message(chat.id, 'B2', {
-      parentId: branchB1.id,
-      siblingIndex: 0,
-      createdAt: 4,
-    })
-    await putHeaderOnly(root)
-    await putHeaderOnly(branchA1)
-    await putHeaderOnly(branchA2)
-    await putFullMessages([branchB1, branchB2])
-
-    const bulkGet = vi.spyOn(getDb().messageBodies, 'bulkGet')
-
-    const result = await loadKnownBranchPageSnapshot(chat.id, [root.id, branchB1.id, branchB2.id], {
-      offset: -1,
-      limit: 2,
-    })
-    expect(result.kind).toBe('ready')
-    if (result.kind !== 'ready') throw new Error('expected ready branch page')
-    const snapshot = result.snapshot
-
-    expect(snapshot.pageHeaders.map((row) => row.id)).toEqual(['B1', 'B2'])
-    expect(snapshot.pageMessages.map((row) => row.id)).toEqual(['B1', 'B2'])
-    expect(bulkGet).toHaveBeenCalledTimes(1)
-    expect(bulkGet.mock.calls[0]?.[0]).toEqual(['B1', 'B2'])
-  })
-
-  it('edits one message in place without branch-wide body hydration', async () => {
-    const chat = await createChat({
-      id: 'edit-efficient-chat',
-      title: 'Edit efficient',
-      settings: cloneDefaultChatSettings(),
-    })
-    const root = message(chat.id, 'edit-root', { createdAt: 0 })
-    const target = message(chat.id, 'edit-target', {
-      parentId: root.id,
-      createdAt: 1,
-      content: [
-        { type: 'text', text: 'before ' },
-        { type: 'output_text', text: 'edit' },
-      ],
-      reasoningDetails: [{ type: 'reasoning.summary', summary: 'preserved reasoning' }],
-      providerOutputItems: [
-        {
-          dialect: 'openai-responses',
-          type: 'reasoning',
-          item: { type: 'reasoning', id: 'reasoning-1', encrypted_content: 'sealed' },
-        },
-      ],
-    })
-    const later = message(chat.id, 'edit-later', {
-      parentId: target.id,
-      createdAt: 2,
-      content: [{ type: 'text', text: 'LATER_BODY_MUST_NOT_LOAD_FOR_EDIT' }],
-    })
-    await putHeaderOnly(root)
-    await putFullMessages([target])
-    await putHeaderOnly(later)
-
-    const bodiesBulkGet = vi.spyOn(getDb().messageBodies, 'bulkGet')
-    const messagesWhere = vi.spyOn(getDb().messages, 'where')
-
-    await editInPlace(chat.id, target, '  after edit  ')
-
-    const body = await getDb().messageBodies.get(target.id)
-    expect(body?.content).toEqual([{ type: 'text', text: '  after edit  ' }])
-    expect(body?.reasoningDetails).toEqual(target.reasoningDetails)
-    expect(body?.providerOutputItems).toEqual(target.providerOutputItems)
-    expect(bodiesBulkGet).not.toHaveBeenCalled()
-    expect(messagesWhere).not.toHaveBeenCalled()
-  })
-
-  it('keeps an open generation receipt owned while publishing an earlier-row edit', async () => {
-    const chat = await createChat({
-      id: 'edit-during-generation-chat',
-      title: 'Edit during generation',
-      settings: cloneDefaultChatSettings(),
-    })
-    const root = message(chat.id, 'edit-during-generation-root', { createdAt: 0 })
-    const placeholder = message(chat.id, 'edit-during-generation-placeholder', {
-      parentId: root.id,
-      createdAt: 1,
-      role: 'assistant',
-      origin: 'generated',
-      content: [{ type: 'output_text', text: '' }],
-    })
-    await putFullMessages([root, placeholder])
-    const [rootHeader, placeholderHeader] = await getDb().messages.bulkGet([
-      root.id,
-      placeholder.id,
-    ])
-    if (!rootHeader || !placeholderHeader) throw new Error('fixture headers missing')
-
-    const store = useChatStore.getState()
-    const producerIntent = store.beginNavigationIntent(chat.id)
-    const producer = store.registerCommittedPathProducer(chat.id, producerIntent)
-    if (!producer) throw new Error('committed path producer registration failed')
-    store.selectCommittedPathForProducer(
-      chat.id,
-      producer,
-      { __root__: root.id, [root.id]: placeholder.id },
-      {
-        phase: 'open',
-        pathHeaders: [rootHeader, placeholderHeader],
-        presentations: [
-          { header: rootHeader, message: root, bodyVersion: rootHeader.bodyVersion },
-          {
-            header: placeholderHeader,
-            message: placeholder,
-            bodyVersion: placeholderHeader.bodyVersion,
-          },
-        ],
-      },
-    )
-    const cursor = store.getCursor(chat.id)
-    const revision = store.getNavigationRevision(chat.id)
-    store.beginNavigationIntent('different-chat')
-
-    await editInPlace(chat.id, root, 'edited while the assistant waits', {
-      pathHeaders: [rootHeader, placeholderHeader],
-    })
-
-    expect(store.getCursor(chat.id)).toBe(cursor)
-    expect(store.getNavigationRevision(chat.id)).toBe(revision)
-    expect(store.getCommittedPathPresentation(chat.id)?.phase).toBe('open')
-    expect(store.getCommittedPathPresentation(chat.id)?.pathHeaders.at(-1)?.id).toBe(placeholder.id)
-    expect(
-      store
-        .getCommittedPathPresentation(chat.id)
-        ?.presentations.find((presentation) => presentation.message.id === root.id)?.message
-        .content,
-    ).toEqual([{ type: 'text', text: 'edited while the assistant waits' }])
-
-    const finalPlaceholder = {
-      ...placeholder,
-      nodeVersion: placeholderHeader.nodeVersion + 1,
-      content: [{ type: 'output_text' as const, text: 'late answer' }],
-    }
-    const finalSplit = splitMessageForStorage(finalPlaceholder, {
-      bodyVersion: placeholderHeader.bodyVersion + 1,
-    })
-    expect(
-      store.updateCommittedMessageForProducer(
-        chat.id,
-        producer,
-        {
-          header: finalSplit.header,
-          message: finalPlaceholder,
-          bodyVersion: finalSplit.header.bodyVersion,
-        },
-        'terminal',
-      ),
-    ).toBe(true)
-    const finalReceipt = store.getCommittedPathPresentation(chat.id)
-    expect(finalReceipt?.phase).toBe('terminal')
-    expect(finalReceipt?.pathHeaders.at(-1)?.id).toBe(placeholder.id)
-    expect(
-      finalReceipt?.presentations.find((presentation) => presentation.message.id === root.id)
-        ?.message.content,
-    ).toEqual([{ type: 'text', text: 'edited while the assistant waits' }])
-    expect(
-      finalReceipt?.presentations.find((presentation) => presentation.message.id === placeholder.id)
-        ?.message.content,
-    ).toEqual([{ type: 'output_text', text: 'late answer' }])
-  })
-
-  it('loads send context from the tail without hydrating cold branch bodies', async () => {
-    const settings = cloneDefaultChatSettings()
-    settings.model = 'openai/gpt-4o'
-    settings.customMaxContext = 80
-    settings.maxCompletionTokens = 0
-    settings.mediaContextStrategy = 'echo-all'
-    settings.contextStrategy = { ...settings.contextStrategy, keepFirstPairs: 0 }
-    const chat = await createChat({
-      id: 'send-tail-chat',
-      title: 'Send tail',
-      settings,
-    })
-    await getDb().attachments.put(
-      storedAttachment({
-        id: 'att-cold',
-        kind: 'image',
-        mime: 'image/png',
-        filename: 'cold.png',
-        dimensions: { width: 32, height: 32 },
-      }),
-    )
-
-    const rows: Message[] = []
-    let parentId: string | null = null
-    for (let i = 0; i < 6; i += 1) {
-      const user = message(chat.id, `u${i}`, {
-        parentId,
-        turnId: `turn-${i}`,
-        turnIndex: 0,
-        createdAt: i * 2,
-        role: 'user',
-        origin: 'user',
-        content: [{ type: 'text', text: `user ${i} ${'x'.repeat(80)}` }],
-        ...(i === 0 ? { attachmentRefs: [attachmentRef('att-cold')] } : {}),
-      })
-      const assistant = message(chat.id, `a${i}`, {
-        parentId: user.id,
-        turnId: `turn-${i}`,
-        turnIndex: 1,
-        createdAt: i * 2 + 1,
-        role: 'assistant',
-        origin: 'generated',
-        content: [{ type: 'text', text: `assistant ${i} ${'y'.repeat(80)}` }],
-      })
-      rows.push(user, assistant)
-      parentId = assistant.id
-    }
-    for (const row of rows.slice(0, 8)) await putHeaderOnly(row)
-    await putFullMessages(rows.slice(8))
-
-    const bulkGet = vi.spyOn(getDb().messageBodies, 'bulkGet')
-    const branch = await loadActiveBranchHeaderSnapshot(chat.id, {})
-    const messageTable = getDb().messages
-    const readHeaders = messageTable.bulkGet.bind(messageTable)
-    let calibrationCommits = 0
-    vi.spyOn(messageTable, 'bulkGet').mockImplementation((async (ids) => {
-      const headers = await readHeaders(ids)
-      if (ids.length === branch.branchHeaders.length && calibrationCommits < 2) {
-        const target = headers.at(-1)
-        if (!target) throw new Error('calibration target missing')
-        calibrationCommits += 1
-        await getDb().messages.put({
-          ...target,
-          nodeVersion: target.nodeVersion + 1,
-          cachedTokenEstimate: calibrationCommits,
-        })
-      }
-      return headers
-    }) as typeof messageTable.bulkGet)
-    const pending = message(chat.id, 'pending-user', {
-      parentId,
-      createdAt: 20,
-      content: [{ type: 'text', text: 'go' }],
-    })
-
-    const snapshot = await loadSendContextForBranch({
-      chat,
-      branchHeaders: branch.branchHeaders,
-      pendingMessages: [pending],
-    })
-
-    const requestedBodyIds = bulkGet.mock.calls.flatMap((call) => call[0])
-    expect(snapshot.usedFullBranch).toBe(false)
-    expect(calibrationCommits).toBe(2)
-    expect(snapshot.pathMessages.at(-1)?.id).toBe('pending-user')
-    expect(requestedBodyIds).not.toContain('u0')
-    expect(requestedBodyIds).not.toContain('a0')
-    expect(requestedBodyIds).not.toContain('u1')
-    expect(requestedBodyIds).not.toContain('a1')
-    expect(snapshot.preCutAttachmentIds).toContain('att-cold')
-  })
-
-  it.each<MediaContextStrategy>([
-    'echo-all',
-    'echo-last-N',
-    'echo-user-only',
-    'drop-all',
-  ])('matches previous full-hydration cutoff with %s attachment policy', async (mediaContextStrategy) => {
-    const settings = cloneDefaultChatSettings()
-    settings.model = 'openai/gpt-4o'
-    settings.customMaxContext = 260
-    settings.maxCompletionTokens = 0
-    settings.mediaContextStrategy = mediaContextStrategy
-    settings.mediaEchoN = 1
-    settings.contextStrategy = { ...settings.contextStrategy, keepFirstPairs: 1 }
-    const chat = await createChat({
-      id: `send-media-${mediaContextStrategy}`,
-      title: `Send media ${mediaContextStrategy}`,
-      settings,
-    })
-    await getDb().attachments.bulkPut([
-      storedAttachment({
-        id: 'att-head',
-        kind: 'image',
-        mime: 'image/png',
-        filename: 'head.png',
-        dimensions: { width: 32, height: 32 },
-      }),
-      storedAttachment({
-        id: 'att-assistant',
-        kind: 'image',
-        mime: 'image/png',
-        filename: 'assistant.png',
-        dimensions: { width: 32, height: 32 },
-      }),
-      storedAttachment({
-        id: 'att-pending',
-        kind: 'image',
-        mime: 'image/png',
-        filename: 'pending.png',
-        dimensions: { width: 32, height: 32 },
-      }),
-    ])
-
-    const rows: Message[] = []
-    let parentId: string | null = null
-    for (let i = 0; i < 4; i += 1) {
-      const user = message(chat.id, `mu${i}`, {
-        parentId,
-        turnId: `media-turn-${i}`,
-        turnIndex: 0,
-        createdAt: i * 2,
-        role: 'user',
-        origin: 'user',
-        content: [{ type: 'text', text: `user ${i} ${'u'.repeat(20)}` }],
-        ...(i === 0 ? { attachmentRefs: [attachmentRef('att-head', i)] } : {}),
-      })
-      const assistant = message(chat.id, `ma${i}`, {
-        parentId: user.id,
-        turnId: `media-turn-${i}`,
-        turnIndex: 1,
-        createdAt: i * 2 + 1,
-        role: 'assistant',
-        origin: 'generated',
-        content: [{ type: 'output_text', text: `assistant ${i} ${'a'.repeat(20)}` }],
-        ...(i === 2 ? { attachmentRefs: [attachmentRef('att-assistant', i)] } : {}),
-      })
-      rows.push(user, assistant)
-      parentId = assistant.id
-    }
-    await putFullMessages(rows)
-
-    const branch = await loadActiveBranchHeaderSnapshot(chat.id, {})
-    const fullPath = await hydrateBranchMessages(branch.branchHeaders)
-    const pending = message(chat.id, 'pending-media-user', {
-      parentId,
-      createdAt: 99,
-      role: 'user',
-      origin: 'user',
-      content: [{ type: 'text', text: 'final prompt' }],
-      attachmentRefs: [attachmentRef('att-pending', 99)],
-    })
-
-    const snapshot = await loadSendContextForBranch({
-      chat,
-      branchHeaders: branch.branchHeaders,
-      pendingMessages: [pending],
-    })
-    const expected = await cutoffIdsAfterPlanning({
-      messages: [...fullPath, pending],
-      settings,
-    })
-    const actual = await cutoffIdsAfterPlanning({
-      messages: snapshot.pathMessages,
-      settings,
-      preCutAttachmentIds: snapshot.preCutAttachmentIds,
-    })
-
-    expect(snapshot.usedFullBranch).toBe(false)
-    expect(actual).toEqual(expected)
-    expect([...snapshot.preCutAttachmentIds].sort()).toEqual(
-      attachmentContextIds({
-        messages: applyOutboundContextRewrites([...fullPath, pending], settings),
-        policy: attachmentContextPolicyForSettings(settings),
-      }),
-    )
-  })
-
-  it('matches previous full-hydration cutoff for inline media body items', async () => {
-    const settings = cloneDefaultChatSettings()
-    settings.model = 'openai/gpt-4o'
-    settings.customMaxContext = 180
-    settings.maxCompletionTokens = 0
-    settings.contextStrategy = { ...settings.contextStrategy, keepFirstPairs: 0 }
-    const chat = await createChat({
-      id: 'send-inline-media',
-      title: 'Send inline media',
-      settings,
-    })
-    const rows: Message[] = []
-    let parentId: string | null = null
-    for (let i = 0; i < 4; i += 1) {
-      const user = message(chat.id, `iu${i}`, {
-        parentId,
-        turnId: `inline-turn-${i}`,
-        turnIndex: 0,
-        createdAt: i * 2,
-        role: 'user',
-        origin: 'user',
-        content:
-          i === 3
-            ? ([
-                { type: 'image_url' },
-                { type: 'text', text: 'latest image' },
-              ] as Message['content'])
-            : [{ type: 'text', text: `older ${i} ${'x'.repeat(30)}` }],
-      })
-      const assistant = message(chat.id, `ia${i}`, {
-        parentId: user.id,
-        turnId: `inline-turn-${i}`,
-        turnIndex: 1,
-        createdAt: i * 2 + 1,
-        role: 'assistant',
-        origin: 'generated',
-        content: [{ type: 'output_text', text: `reply ${i}` }],
-      })
-      rows.push(user, assistant)
-      parentId = assistant.id
-    }
-    await putFullMessages(rows)
-
-    const branch = await loadActiveBranchHeaderSnapshot(chat.id, {})
-    const fullPath = await hydrateBranchMessages(branch.branchHeaders)
-    const snapshot = await loadSendContextForBranch({
-      chat,
-      branchHeaders: branch.branchHeaders,
-    })
-
-    expect(snapshot.usedFullBranch).toBe(false)
-    await expect(
-      cutoffIdsAfterPlanning({ messages: snapshot.pathMessages, settings }),
-    ).resolves.toEqual(await cutoffIdsAfterPlanning({ messages: fullPath, settings }))
-  })
-
-  it.each([
-    'off',
-    'middle_out_plugin',
-  ] as const)('falls back to the full branch for non-sliding context mode %s', async (kind) => {
-    const settings = cloneDefaultChatSettings()
-    settings.model = 'openai/gpt-4o'
-    settings.customMaxContext = 10
-    settings.maxCompletionTokens = 0
-    settings.contextStrategy = { ...settings.contextStrategy, kind, keepFirstPairs: 1 }
-    const chat = await createChat({
-      id: `send-non-sliding-${kind}`,
-      title: `Send non sliding ${kind}`,
-      settings,
-    })
-    const rows = [
-      message(chat.id, 'n0', { createdAt: 0 }),
-      message(chat.id, 'n1', { parentId: 'n0', createdAt: 1 }),
-      message(chat.id, 'n2', { parentId: 'n1', createdAt: 2 }),
-    ]
-    await putFullMessages(rows)
-    const bulkGet = vi.spyOn(getDb().messageBodies, 'bulkGet')
-    const branch = await loadActiveBranchHeaderSnapshot(chat.id, {})
-
-    const snapshot = await loadSendContextForBranch({
-      chat,
-      branchHeaders: branch.branchHeaders,
-    })
-
-    expect(snapshot.usedFullBranch).toBe(true)
-    expect(snapshot.pathMessages.map((row) => row.id)).toEqual(['n0', 'n1', 'n2'])
-    expect(bulkGet.mock.calls.some((call) => call[0].length === 3)).toBe(true)
-  })
-
-  it('counts append prompts before send-context cutoff', async () => {
-    const settings = cloneDefaultChatSettings()
-    settings.model = 'openai/gpt-4o'
-    settings.customMaxContext = 12
-    settings.maxCompletionTokens = 0
-    settings.contextStrategy = { ...settings.contextStrategy, keepFirstPairs: 0 }
-    settings.appendPrompt = `\n\n${'x'.repeat(200)}`
-    const chat = await createChat({
-      id: 'send-append-cutoff-chat',
-      title: 'Send append cutoff',
-      settings,
-    })
-    const pending = message(chat.id, 'pending-user', {
-      content: [{ type: 'text', text: 'short' }],
-    })
-
-    const snapshot = await loadSendContextForBranch({
-      chat,
-      branchHeaders: [],
-      pendingMessages: [pending],
-    })
-
-    expect(snapshot.usedFullBranch).toBe(false)
-    expect(snapshot.pathMessages).toEqual([])
-  })
-})
+function nextId(prefix: string): string {
+  fixtureSequence += 1
+  return `${prefix}-${fixtureSequence}`
+}

@@ -1,33 +1,49 @@
 import Dexie from 'dexie'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { cloneDefaultChatSettings, cloneDefaultPrivacyPrefs } from '../../src/core/defaults'
-import {
-  prepareAssistantRequestPlan,
-  resolveRequestPrivacyPlan,
-} from '../../src/core/send-planning'
+import { ownBrowserWorkspaceSuite } from '../helpers/browser-workspace-suite'
+import { createChat } from '../helpers/chats'
+import { putCachedEndpoints, putCachedPrivacyPolicy } from '../helpers/discovery-cache'
+import { putTestMessages } from '../helpers/message-storage'
+import 'fake-indexeddb/auto'
+import { IDBFactory } from 'fake-indexeddb'
+import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
+import { readCachedPrivacyPayload } from '../../src/api/privacy-scrape'
+import { normalizeEndpointsResponse } from '../../src/api/providers'
+import type { AssistantPlanningResources } from '../../src/core/assistant-planning-resources'
+import { cloneDefaultChatSettings } from '../../src/core/defaults'
+import { contextRouteFactsFromMessages } from '../../src/core/reasoning'
+import { isStaticTextTemplateId, resolveStaticTextTemplate } from '../../src/core/text-templates'
 import type { Chat, ConnectionProfile, Message, MessageAttachmentRef } from '../../src/core/types'
-import { deleteReferencedAttachmentBytes, ingestAttachmentBytes } from '../../src/store/attachments'
+import {
+  deleteReferencedAttachmentBytes,
+  getAttachment,
+  getAttachmentBundle,
+  ingestAttachmentBytes,
+} from '../../src/store/attachments'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
+import { __resetBrowserRepositoryForTests } from '../../src/store/browser-repo'
+
+import { __resetDbForTests, getDb } from '../../src/store/db'
+import { exportWorkspaceBackup, restoreWorkspaceBackup } from '../../src/store/import-export'
+import { getCachedEndpoints } from '../../src/store/models-cache'
+import { getCachedPrivacyPolicy } from '../../src/store/privacy-cache'
 import {
-  __resetBrowserRepositoryForTests,
-  getBrowserRepository,
-} from '../../src/store/browser-repo'
-import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
-import { putCachedEndpoints } from '../../src/store/models-cache'
+  prepareAssistantRequestPlan as prepareAssistantRequestPlanWithResources,
+  resolveAssistantRequestFacts,
+  resolveRequestPrivacyPlan as resolveRequestPrivacyPlanWithResources,
+} from '../../src/store/request-planning'
 import {
-  __resetPrivacyInFlightForTests,
-  putCachedPrivacyPolicy,
-} from '../../src/store/privacy-cache'
+  __resetWorkspaceRepositoryForTests,
+  getWorkspaceRepository,
+} from '../../src/store/workspace-repository'
+import { runWorkspaceRead } from '../../src/store/workspace-runtime'
+import { reasoningEnvelopeFromDetailsForTest } from '../helpers/reasoning-events'
 
 const DB_NAME = 'natter'
+const workspaceSuite = ownBrowserWorkspaceSuite()
 
-async function resetAll() {
-  __resetBrowserRepositoryForTests()
-  __resetDbForTests()
-  __resetBroadcastForTests()
-  __resetPrivacyInFlightForTests()
-  await Dexie.delete(DB_NAME)
-}
+const cloneDefaultPrivacyPrefs = () => cloneDefaultChatSettings().privacy
+
+let emptyWorkspaceBackup: Awaited<ReturnType<typeof exportWorkspaceBackup>>
 
 function makeProfile(): ConnectionProfile {
   return {
@@ -86,6 +102,19 @@ function makeAnthropicProfile(): ConnectionProfile {
   }
 }
 
+function makeLlamaServerProfile(): ConnectionProfile {
+  return {
+    ...makeProfile(),
+    id: 'prof-llama',
+    name: 'llama-server',
+    kind: 'llama-server',
+    baseUrl: 'http://llama.test/v1',
+    supportsEndpointsApi: false,
+    supportsGenerationApi: false,
+    supportsPrivacyScrape: false,
+  }
+}
+
 function makeChat(overrides: Partial<Chat['settings']> = {}): Chat {
   const settings = cloneDefaultChatSettings()
   settings.profileId = 'prof-1'
@@ -103,6 +132,7 @@ function makeChat(overrides: Partial<Chat['settings']> = {}): Chat {
     totalCostUsd: 0,
     metaVersion: 0,
     summaryVersion: 0,
+    structuralVersion: 0,
     settings,
     lastUpdatedLeafId: null,
     lastBranchUpdatedAt: 0,
@@ -169,16 +199,259 @@ function attachmentRef(attachmentId: string): MessageAttachmentRef {
   }
 }
 
-beforeEach(async () => {
-  await resetAll()
-  await openDb()
+beforeAll(async () => {
+  ;(globalThis as unknown as { indexedDB: IDBFactory }).indexedDB = new IDBFactory()
+  __resetWorkspaceRepositoryForTests()
+  __resetBrowserRepositoryForTests()
+  __resetBroadcastForTests()
+  __resetDbForTests()
+  await Dexie.delete(DB_NAME)
+  await workspaceSuite.open()
+  emptyWorkspaceBackup = await exportWorkspaceBackup()
 })
 
-afterEach(async () => {
-  await resetAll()
+beforeEach(async () => {
+  __resetWorkspaceRepositoryForTests()
+  __resetBrowserRepositoryForTests()
+  await restoreWorkspaceBackup(emptyWorkspaceBackup, { now: 1 })
+  await getDb().profiles.bulkPut([
+    makeProfile(),
+    makeOpenAiProfile(),
+    makeGoogleProfile(),
+    makeAnthropicProfile(),
+  ])
 })
+
+type PrepareInput = Omit<
+  Parameters<typeof prepareAssistantRequestPlanWithResources>[0],
+  'resources'
+>
+type PrivacyInput = Omit<
+  Parameters<typeof resolveRequestPrivacyPlanWithResources>[0],
+  'resources' | 'routing' | 'facts'
+>
+
+function prepareAssistantRequestPlan(input: PrepareInput) {
+  return prepareAssistantRequestPlanWithResources({
+    ...input,
+    resources: planningResources(input.connection),
+  })
+}
+
+async function resolveRequestPrivacyPlan(input: PrivacyInput) {
+  const resources = planningResources(input.profile)
+  const settings = input.settings ?? input.chat.settings
+  const facts = await resolveAssistantRequestFacts({
+    chat: input.chat,
+    connection: input.profile,
+    settings,
+    contextFacts: contextRouteFactsFromMessages(input.activePathMessages),
+    resources,
+  })
+  return resolveRequestPrivacyPlanWithResources({
+    ...input,
+    settings,
+    facts,
+    routing: facts.preflightRouting.route,
+    resources,
+  })
+}
+
+function planningResources(profile: ConnectionProfile): AssistantPlanningResources {
+  return {
+    globalCalibration: () => ({ version: 1, updatedAt: 0, byModel: {} }),
+    calibrationMode: () => 'adaptive',
+    proxy: () => ({ url: '', secret: '' }),
+    readModels: async () => undefined,
+    resolveEndpoints: async (modelId) => {
+      const row = await getCachedEndpoints(profile.id, modelId)
+      return row ? normalizeEndpointsResponse(row.payload) : null
+    },
+    resolvePrivacy: async (modelId) => {
+      const row = await getCachedPrivacyPolicy(profile.id, modelId)
+      return {
+        policies: row ? (readCachedPrivacyPayload(row.payload)?.policies ?? {}) : {},
+        offlineFallback: false,
+      }
+    },
+    getAttachment,
+    getAttachmentBundle,
+    resolveTextTemplate: async (id, customFallback) => {
+      if (!isStaticTextTemplateId(id)) return null
+      return resolveStaticTextTemplate(id, customFallback)
+    },
+  }
+}
 
 describe('resolveRequestPrivacyPlan', () => {
+  it('resolves endpoint context capability for free OpenRouter models without privacy routing', async () => {
+    const profile = makeProfile()
+    const chat = makeChat({ model: 'openai/free-test:free' })
+    await putCachedEndpoints(profile.id, chat.settings.model, {
+      id: chat.settings.model,
+      endpoints: [
+        {
+          provider_name: 'Free Host',
+          provider_slug: 'free-host',
+          supported_parameters: ['temperature'],
+          context_length: 8192,
+          max_prompt_tokens: 7168,
+          pricing: {},
+        },
+      ],
+    })
+
+    const facts = await resolveAssistantRequestFacts({
+      chat,
+      connection: profile,
+      resources: planningResources(profile),
+    })
+
+    expect(facts.preflightPrivacy.applicable).toBe(false)
+    expect(facts.capability).toMatchObject({ contextLength: 8192, maxPromptTokens: 7168 })
+
+    const { requestPlan, privacyPlan } = await prepareAssistantRequestPlan({
+      chat,
+      connection: profile,
+      pathMessages: [makeMessage('hello')],
+      facts,
+    })
+    expect(privacyPlan.privacy.applicable).toBe(false)
+    expect(requestPlan.effectiveRouting.selectedEndpoints).toHaveLength(1)
+    expect(requestPlan.effectiveRouting.endpointAvailability).toBe('available')
+    expect(requestPlan.wire.provider).toBeUndefined()
+  })
+
+  it('rejects an empty endpoint catalog without classifying it as provider filtering', async () => {
+    const profile = makeProfile()
+    const chat = makeChat({ model: 'openai/catalog-empty:free' })
+    await putCachedEndpoints(profile.id, chat.settings.model, {
+      id: chat.settings.model,
+      endpoints: [],
+    })
+
+    await expect(
+      resolveAssistantRequestFacts({
+        chat,
+        connection: profile,
+        resources: planningResources(profile),
+      }),
+    ).rejects.toThrow('No provider endpoints are currently available for this model.')
+  })
+
+  it('reuses one attempt-scoped discovery result across context facts and wire planning', async () => {
+    const profile = makeProfile()
+    const chat = makeChat()
+    await putCachedEndpoints(profile.id, chat.settings.model, {
+      id: chat.settings.model,
+      endpoints: [
+        {
+          provider_name: 'Clean Host',
+          provider_slug: 'clean-host',
+          supported_parameters: ['temperature'],
+          context_length: 8192,
+          pricing: {},
+        },
+      ],
+    })
+    await putCachedPrivacyPolicy(profile.id, chat.settings.model, {
+      policies: {
+        'Clean Host': {
+          training: false,
+          trainingOpenRouter: false,
+          retainsPrompts: false,
+          canPublish: false,
+          termsOfServiceURL: '',
+          privacyPolicyURL: '',
+        },
+      },
+      fetchedAt: Date.now(),
+    })
+    const base = planningResources(profile)
+    let endpointReads = 0
+    let privacyReads = 0
+    const resources: AssistantPlanningResources = {
+      ...base,
+      resolveEndpoints: async (...args) => {
+        endpointReads += 1
+        return base.resolveEndpoints(...args)
+      },
+      resolvePrivacy: async (...args) => {
+        privacyReads += 1
+        return base.resolvePrivacy(...args)
+      },
+    }
+    const facts = await resolveAssistantRequestFacts({
+      chat,
+      connection: profile,
+      resources,
+    })
+
+    await prepareAssistantRequestPlanWithResources({
+      chat,
+      connection: profile,
+      pathMessages: [makeMessage('submitted exactly once')],
+      facts,
+      resources,
+    })
+
+    expect(endpointReads).toBe(1)
+    expect(privacyReads).toBe(1)
+  })
+
+  it('derives the context cutoff from the providers the picker actually permits', async () => {
+    const profile = makeProfile()
+    const chat = makeChat({
+      providerPrefs: {
+        sort: 'price',
+        only: ['small-host'],
+      },
+    })
+    await putCachedEndpoints(profile.id, chat.settings.model, {
+      id: chat.settings.model,
+      endpoints: [
+        {
+          provider_name: 'Small Host',
+          provider_slug: 'small-host',
+          supported_parameters: ['temperature'],
+          context_length: 4096,
+          pricing: {},
+        },
+        {
+          provider_name: 'Large Host',
+          provider_slug: 'large-host',
+          supported_parameters: ['temperature'],
+          context_length: 200000,
+          pricing: {},
+        },
+      ],
+    })
+    await putCachedPrivacyPolicy(profile.id, chat.settings.model, {
+      policies: Object.fromEntries(
+        ['Small Host', 'Large Host'].map((name) => [
+          name,
+          {
+            training: false,
+            trainingOpenRouter: false,
+            retainsPrompts: false,
+            canPublish: false,
+            termsOfServiceURL: '',
+            privacyPolicyURL: '',
+          },
+        ]),
+      ),
+      fetchedAt: Date.now(),
+    })
+
+    const facts = await resolveAssistantRequestFacts({
+      chat,
+      connection: profile,
+      resources: planningResources(profile),
+    })
+
+    expect(facts.capability?.contextLength).toBe(4096)
+  })
+
   it('counts the submitted draft text for a normal send', async () => {
     const chat = makeChat()
     const profile = makeProfile()
@@ -384,7 +657,129 @@ describe('resolveRequestPrivacyPlan', () => {
     expect(privacyPlan.privacy.applicable).toBe(false)
     expect(requestPlan.wire.provider).toBeUndefined()
     expect(requestPlan.wire.tools).toBeUndefined()
-    expect(requestPlan.route?.kind).toBe('chat-completions')
+    expect(requestPlan.kind).toBe('chat-completions')
+  })
+
+  it('seals GPT summary visibility from the effective OpenRouter or direct Chat route', async () => {
+    const baseReasoning = {
+      ...cloneDefaultChatSettings().reasoning,
+      mode: 'default' as const,
+      summary: 'auto' as const,
+    }
+    const openRouter = makeProfile()
+    const openRouterChat = makeChat({
+      model: 'openai/gpt-5.4',
+      api: 'chat',
+      reasoning: baseReasoning,
+    })
+    const direct = makeOpenAiProfile()
+    const directChat = makeChat({
+      profileId: direct.id,
+      model: 'gpt-5.4',
+      api: 'chat',
+      reasoning: baseReasoning,
+    })
+    await putCachedEndpoints(openRouter.id, openRouterChat.settings.model, {
+      id: openRouterChat.settings.model,
+      endpoints: [
+        {
+          provider_name: 'OpenAI',
+          provider_slug: 'openai',
+          supported_parameters: ['reasoning'],
+          context_length: 200_000,
+          pricing: {},
+        },
+      ],
+    })
+    await putCachedPrivacyPolicy(openRouter.id, openRouterChat.settings.model, {
+      policies: {
+        OpenAI: {
+          training: false,
+          trainingOpenRouter: false,
+          retainsPrompts: false,
+          canPublish: false,
+          termsOfServiceURL: '',
+          privacyPolicyURL: '',
+        },
+      },
+      fetchedAt: 0,
+    })
+
+    const [openRouterPlan, directPlan] = await Promise.all([
+      prepareAssistantRequestPlan({
+        chat: openRouterChat,
+        connection: openRouter,
+        pathMessages: [makeMessage('hello')],
+        draftText: '',
+        capabilities: {
+          supportedParameters: ['reasoning'],
+          streaming: 'supported',
+        },
+      }),
+      prepareAssistantRequestPlan({
+        chat: directChat,
+        connection: direct,
+        pathMessages: [makeMessage('hello')],
+        draftText: '',
+        capabilities: {
+          supportedParameters: ['reasoning'],
+          streaming: 'supported',
+        },
+      }),
+    ])
+
+    expect(openRouterPlan.requestPlan.wire.reasoning).toEqual({ summary: 'auto' })
+    expect(openRouterPlan.requestPlan.reasoning.inboundVisibility).toEqual({
+      disclosure: 'visible',
+      visibleKind: 'summary',
+    })
+    expect(directPlan.requestPlan.wire.reasoning).toBeUndefined()
+    expect(directPlan.requestPlan.reasoning.inboundVisibility).toEqual({
+      disclosure: 'absent',
+      unexpectedVisibleKind: 'summary',
+      reason: 'api-mode',
+    })
+  })
+
+  it('seals direct Responses summary visibility from emitted or capability-gated wire', async () => {
+    const profile = makeOpenAiProfile()
+    const chat = makeChat({
+      profileId: profile.id,
+      model: 'gpt-5.4',
+      api: 'responses',
+      reasoning: {
+        ...cloneDefaultChatSettings().reasoning,
+        mode: 'default',
+        summary: 'auto',
+      },
+    })
+
+    const emitted = await prepareAssistantRequestPlan({
+      chat,
+      connection: profile,
+      pathMessages: [makeMessage('hello')],
+      draftText: '',
+      capabilities: { supportedParameters: ['reasoning'], streaming: 'supported' },
+    })
+    expect(emitted.requestPlan.wire.reasoning).toEqual({ summary: 'auto' })
+    expect(emitted.requestPlan.reasoning.inboundVisibility).toEqual({
+      disclosure: 'visible',
+      visibleKind: 'summary',
+    })
+
+    const gated = await prepareAssistantRequestPlan({
+      chat,
+      connection: profile,
+      pathMessages: [makeMessage('hello')],
+      draftText: '',
+      capabilities: { supportedParameters: [], streaming: 'supported' },
+    })
+    expect(gated.requestPlan.wire.reasoning).toBeUndefined()
+    expect(gated.requestPlan.reasoning.inboundVisibility).toEqual({
+      disclosure: 'absent',
+      unexpectedVisibleKind: 'summary',
+      reason: 'provider-default',
+    })
   })
 
   it('does not carry OpenRouter hosted tools onto direct OpenAI Responses requests', async () => {
@@ -423,7 +818,7 @@ describe('resolveRequestPrivacyPlan', () => {
     })
 
     expect(privacyPlan.privacy.applicable).toBe(false)
-    expect(requestPlan.route?.kind).toBe('responses')
+    expect(requestPlan.kind).toBe('responses')
     expect(requestPlan.wire.input).toBeDefined()
     expect(requestPlan.wire.provider).toBeUndefined()
     expect(requestPlan.wire.tools).toBeUndefined()
@@ -445,7 +840,7 @@ describe('resolveRequestPrivacyPlan', () => {
       draftText: '',
     })
 
-    expect(requestPlan.route?.kind).toBe('responses')
+    expect(requestPlan.kind).toBe('responses')
     expect(requestPlan.wire.stream).toBeUndefined()
   })
 
@@ -491,8 +886,8 @@ describe('resolveRequestPrivacyPlan', () => {
     })
 
     expect(privacyPlan.privacy.applicable).toBe(false)
-    expect(requestPlan.route?.kind).toBe('responses')
-    expect(requestPlan.route?.reason).toBe('OpenAI hosted tools require Responses API')
+    expect(requestPlan.kind).toBe('responses')
+    expect(requestPlan.reason).toBe('OpenAI hosted tools require Responses API')
     expect(requestPlan.wire.provider).toBeUndefined()
     expect(requestPlan.wire.tools).toEqual([
       { type: 'web_search', search_context_size: 'medium' },
@@ -539,8 +934,8 @@ describe('resolveRequestPrivacyPlan', () => {
     })
 
     expect(privacyPlan.privacy.applicable).toBe(false)
-    expect(requestPlan.route?.kind).toBe('gemini-generate')
-    expect(requestPlan.route?.reason).toBe('Gemini native required for Google hosted tools')
+    expect(requestPlan.kind).toBe('gemini-generate')
+    expect(requestPlan.reason).toBe('Gemini native required for Google hosted tools')
     expect(requestPlan.wire.provider).toBeUndefined()
     expect(requestPlan.wire.tools).toEqual([{ googleSearch: {} }, { urlContext: {} }])
   })
@@ -570,7 +965,7 @@ describe('resolveRequestPrivacyPlan', () => {
     })
 
     expect(privacyPlan.privacy.applicable).toBe(false)
-    expect(requestPlan.route?.kind).toBe('anthropic-messages')
+    expect(requestPlan.kind).toBe('anthropic-messages')
     expect(requestPlan.anthropicModelId).toBe('claude-haiku-4-5')
     expect(requestPlan.wire.model).toBe('claude-haiku-4-5')
     expect(requestPlan.wire.tools).toEqual([
@@ -797,7 +1192,7 @@ describe('resolveRequestPrivacyPlan', () => {
       draftText: '',
     })
 
-    expect(requestPlan.route?.kind).toBe('chat-completions')
+    expect(requestPlan.kind).toBe('chat-completions')
     expect(requestPlan.wire.max_tokens).toBe(32)
     expect(requestPlan.wire.max_completion_tokens).toBeUndefined()
   })
@@ -843,8 +1238,8 @@ describe('resolveRequestPrivacyPlan', () => {
       draftText: '',
     })
 
-    expect(requestPlan.route?.transport).toBe('openrouter-video')
-    expect(requestPlan.route?.kind).toBe('video-generation')
+    expect(requestPlan.transport).toBe('openrouter-video')
+    expect(requestPlan.kind).toBe('video-generation')
     expect(requestPlan.wire.model).toBe(model)
     expect(requestPlan.wire.prompt).toBe('make a five second clip of a lighthouse')
     expect(requestPlan.wire.messages).toBeUndefined()
@@ -900,8 +1295,8 @@ describe('resolveRequestPrivacyPlan', () => {
       draftText: '',
     })
 
-    expect(requestPlan.useTextProtocol).toBe(true)
-    expect(requestPlan.route?.kind).toBe('text-completions')
+    expect(requestPlan.transport).toBe('openai-text')
+    expect(requestPlan.kind).toBe('text-completions')
     expect(requestPlan.wire.prompt).toContain('<|im_start|>user\nhello<|im_end|>')
     expect(requestPlan.wire.max_tokens).toBe(32)
     expect(requestPlan.wire.reasoning).toEqual({ enabled: false })
@@ -910,6 +1305,72 @@ describe('resolveRequestPrivacyPlan', () => {
       allow_fallbacks: false,
     })
     expect(requestPlan.wire.tools).toBeUndefined()
+  })
+
+  it('keeps llama-server default-template reasoning evidence opaque through planning', async () => {
+    const profile = makeLlamaServerProfile()
+    const chat = makeChat({
+      profileId: profile.id,
+      model: 'local-model',
+      api: 'text',
+      protocol: 'text',
+      textTemplate: 'default',
+      reasoning: {
+        ...cloneDefaultChatSettings().reasoning,
+        include: { encrypted: false, summary: false, text: true },
+      },
+    })
+    const assistant: Message = {
+      ...makeMessage('answer'),
+      id: 'a1',
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_text', text: 'answer' }],
+      reasoningEnvelope: reasoningEnvelopeFromDetailsForTest(
+        [{ type: 'reasoning.text', format: 'unknown', text: 'thought' }],
+        'inline',
+      ),
+    }
+    let appliedMessages: unknown
+    const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      if (typeof init?.body !== 'string') throw new Error('Expected string template body')
+      const parsed: unknown = JSON.parse(init.body)
+      if (!parsed || typeof parsed !== 'object' || !('messages' in parsed)) {
+        throw new Error('Expected template messages')
+      }
+      appliedMessages = parsed.messages
+      return new Response(JSON.stringify({ prompt: 'opaque server prompt' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const { requestPlan } = await prepareAssistantRequestPlan({
+        chat,
+        connection: profile,
+        pathMessages: [assistant],
+        draftText: '',
+      })
+
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+      const request = fetchMock.mock.calls[0]?.[0]
+      const requestUrl = request instanceof Request ? request.url : request?.toString()
+      expect(requestUrl).toBe('http://llama.test/apply-template')
+      expect(appliedMessages).toEqual([
+        {
+          role: 'assistant',
+          content: '<think>\nthought\n</think>\n\nanswer',
+        },
+      ])
+      expect(requestPlan.wire.prompt).toBe('opaque server prompt')
+      expect(requestPlan.reasoningCarryForwardEvidence).toEqual({
+        certainty: 'opaque',
+        possible: 'visible-only',
+      })
+    } finally {
+      vi.unstubAllGlobals()
+    }
   })
 
   it('drops attachment context for text-completions plans', async () => {
@@ -967,7 +1428,7 @@ describe('resolveRequestPrivacyPlan', () => {
       draftText: '',
     })
 
-    expect(requestPlan.useTextProtocol).toBe(true)
+    expect(requestPlan.transport).toBe('openai-text')
     expect(requestPlan.hasAttachmentContext).toBe(false)
     expect(String(requestPlan.wire.prompt)).not.toContain('cat.png')
   })
@@ -975,6 +1436,18 @@ describe('resolveRequestPrivacyPlan', () => {
   it('skips a referenced attachment whose bytes were explicitly deleted', async () => {
     const profile = makeProfile()
     const chat = makeChat({ model: 'openai/gpt-4o:free' })
+    await putCachedEndpoints(profile.id, chat.settings.model, {
+      id: chat.settings.model,
+      endpoints: [
+        {
+          provider_name: 'OpenAI',
+          provider_slug: 'openai',
+          supported_parameters: ['temperature'],
+          context_length: 200_000,
+          pricing: {},
+        },
+      ],
+    })
     await ingestAttachmentBytes({
       blob: new Blob([new Uint8Array([1, 2, 3])], { type: 'image/png' }),
       filename: 'deleted-cat.png',
@@ -985,20 +1458,17 @@ describe('resolveRequestPrivacyPlan', () => {
       ...makeMessage('look'),
       attachmentRefs: [attachmentRef('att-deleted-cat')],
     }
-    await getDb().chats.put(chat)
-    await getBrowserRepository().runMutation(
-      [
-        { kind: 'message', messageId: message.id },
-        { kind: 'children', chatId: chat.id, parentId: null },
-        { kind: 'attachment', attachmentId: 'att-deleted-cat' },
-      ],
-      async (ctx) => {
-        await ctx.putMessage(message)
-      },
-    )
+    await createChat({ id: chat.id, title: chat.title, settings: chat.settings, now: 1 })
+    await putTestMessages([message])
     await deleteReferencedAttachmentBytes('att-deleted-cat', 'deleted', 10)
-    const loaded = await getBrowserRepository().getMessage(message.id)
+    const loaded = await runWorkspaceRead('repository-query', (permit) =>
+      getWorkspaceRepository()
+        .query(permit, { kind: 'message.presentation', messageId: message.id })
+        .then((envelope) => envelope.value?.message),
+    )
     if (!loaded) throw new Error('expected referenced message to remain loadable')
+    const cachedEndpoints = await getCachedEndpoints(profile.id, chat.settings.model)
+    expect(normalizeEndpointsResponse(cachedEndpoints?.payload)?.endpoints).toHaveLength(1)
 
     const { requestPlan } = await prepareAssistantRequestPlan({
       chat,
@@ -1047,7 +1517,7 @@ describe('resolveRequestPrivacyPlan', () => {
     expect(outboundLastUser).not.toBe(stored)
   })
 
-  it('applies appendPrompt before context cutoff instead of after it', async () => {
+  it('applies appendPrompt before cutoff while retaining the mandatory terminal user', async () => {
     const profile = makeOpenAiProfile()
     const chat = makeChat({
       profileId: profile.id,
@@ -1070,8 +1540,9 @@ describe('resolveRequestPrivacyPlan', () => {
     })
 
     const wireMessages = requestPlan.wire.messages as Array<{ role: string; content: unknown }>
-    expect(requestPlan.outboundPath).toHaveLength(0)
-    expect(wireMessages.some((m) => m.role === 'user')).toBe(false)
+    expect(requestPlan.outboundPath).toHaveLength(1)
+    expect(JSON.stringify(wireMessages)).toContain('short')
+    expect(JSON.stringify(wireMessages)).toContain('x'.repeat(200))
   })
 
   it('non-prefill continue rides appendPrompt on the previous user turn, not the synthetic continueUser wrapper', async () => {
@@ -1116,10 +1587,10 @@ describe('resolveRequestPrivacyPlan', () => {
   })
 
   it('continue-prefill injects visible plaintext reasoning as think context even when reasoning echo is off', async () => {
-    const profile = makeOpenAiProfile()
+    const profile = makeAnthropicProfile()
     const chat = makeChat({
       profileId: profile.id,
-      model: 'gpt-4o',
+      model: 'claude-haiku-4.5',
       api: 'chat',
       reasoning: {
         ...cloneDefaultChatSettings().reasoning,
@@ -1129,6 +1600,14 @@ describe('resolveRequestPrivacyPlan', () => {
       },
     })
     const user = makeMessage('Explain the proof.')
+    const reasoningEnvelope = reasoningEnvelopeFromDetailsForTest(
+      [
+        { type: 'reasoning.encrypted', data: 'opaque' },
+        { type: 'reasoning.text', text: 'visible chain' },
+        { type: 'reasoning.summary', summary: 'visible summary' },
+      ],
+      'inline',
+    )
     const prefillAssistant: Message = {
       ...makeMessage('Partial answer'),
       id: 'a1',
@@ -1136,11 +1615,7 @@ describe('resolveRequestPrivacyPlan', () => {
       role: 'assistant',
       origin: 'prefill',
       content: [{ type: 'output_text', text: 'Partial answer' }],
-      reasoningDetails: [
-        { type: 'reasoning.encrypted', data: 'opaque' },
-        { type: 'reasoning.text', text: 'visible chain' },
-        { type: 'reasoning.summary', summary: 'visible summary' },
-      ],
+      reasoningEnvelope,
     }
 
     const { requestPlan } = await prepareAssistantRequestPlan({
@@ -1160,14 +1635,16 @@ describe('resolveRequestPrivacyPlan', () => {
       '<think>\nvisible chain\n\nSummary: visible summary\n</think>\n\nPartial answer',
     )
     expect(assistantWire).not.toHaveProperty('reasoning_details')
-    expect(prefillAssistant.reasoningDetails).toHaveLength(3)
+    expect(prefillAssistant.reasoningEnvelope).toBe(reasoningEnvelope)
+    expect(reasoningEnvelope.visible).toHaveLength(2)
+    expect(reasoningEnvelope.carriers).toHaveLength(1)
   })
 
   it('continue-prefill honors hidden reasoning and leaves an open think block when only reasoning exists', async () => {
-    const profile = makeOpenAiProfile()
+    const profile = makeAnthropicProfile()
     const chat = makeChat({
       profileId: profile.id,
-      model: 'gpt-4o',
+      model: 'claude-haiku-4.5',
       api: 'chat',
       reasoning: {
         ...cloneDefaultChatSettings().reasoning,
@@ -1184,10 +1661,13 @@ describe('resolveRequestPrivacyPlan', () => {
       role: 'assistant',
       origin: 'prefill',
       content: [],
-      reasoningDetails: [
-        { type: 'reasoning.text', text: 'do not send me', hidden: true },
-        { type: 'reasoning.text', text: 'still thinking' },
-      ],
+      reasoningEnvelope: reasoningEnvelopeFromDetailsForTest(
+        [
+          { type: 'reasoning.text', text: 'do not send me', hidden: true },
+          { type: 'reasoning.text', text: 'still thinking' },
+        ],
+        'inline',
+      ),
     }
 
     const { requestPlan } = await prepareAssistantRequestPlan({
@@ -1205,14 +1685,15 @@ describe('resolveRequestPrivacyPlan', () => {
   })
 
   it('continue-prefill preserves overlap-looking rows and excludes tool signatures', async () => {
-    const profile = makeOpenAiProfile()
-    const chat = makeChat({ profileId: profile.id, model: 'gpt-4o', api: 'chat' })
+    const profile = makeAnthropicProfile()
+    const chat = makeChat({ profileId: profile.id, model: 'claude-haiku-4.5', api: 'chat' })
     const user = makeMessage('Continue the partial answer.')
-    const reasoningDetails: NonNullable<Message['reasoningDetails']> = [
+    const reasoningDetails = [
       { type: 'reasoning.text', id: 'block-a', index: 0, text: 'ends A' },
       { type: 'reasoning.text', id: 'tool_call-1', index: 0, text: 'tool carrier' },
       { type: 'reasoning.text', id: 'block-b', index: 0, text: 'A starts' },
-    ]
+    ] as const
+    const reasoningEnvelope = reasoningEnvelopeFromDetailsForTest(reasoningDetails, 'inline')
     const prefillAssistant: Message = {
       ...makeMessage('Partial answer'),
       id: 'a1',
@@ -1220,7 +1701,7 @@ describe('resolveRequestPrivacyPlan', () => {
       role: 'assistant',
       origin: 'prefill',
       content: [{ type: 'output_text', text: 'Partial answer' }],
-      reasoningDetails,
+      reasoningEnvelope,
     }
 
     const { requestPlan } = await prepareAssistantRequestPlan({
@@ -1233,7 +1714,7 @@ describe('resolveRequestPrivacyPlan', () => {
     const wireMessages = requestPlan.wire.messages as Array<{ role: string; content: unknown }>
     const assistantWire = wireMessages.find((message) => message.role === 'assistant')
     expect(assistantWire?.content).toBe('<think>\nends A\n\nA starts\n</think>\n\nPartial answer')
-    expect(prefillAssistant.reasoningDetails).toEqual(reasoningDetails)
+    expect(prefillAssistant.reasoningEnvelope).toBe(reasoningEnvelope)
   })
 
   it('omits appendPrompt entirely when the slot is blank', async () => {

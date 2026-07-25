@@ -62,26 +62,127 @@ export function providerRefCandidates(endpoint: ModelEndpoint): string[] {
   ])
 }
 
+export class ProviderEndpointIndex {
+  readonly endpoints: readonly ModelEndpoint[]
+  private readonly exactSlug = new Map<string, ModelEndpoint[]>()
+  private readonly normalizedCandidate = new Map<string, ModelEndpoint[]>()
+  private readonly displayCounts = new Map<string, number>()
+
+  constructor(endpoints: readonly ModelEndpoint[], visit?: (endpoint: ModelEndpoint) => void) {
+    this.endpoints = endpoints
+    for (const endpoint of endpoints) {
+      visit?.(endpoint)
+      const slug = cleanRef(endpoint.provider_slug)
+      if (slug) appendEndpoint(this.exactSlug, slug, endpoint)
+      for (const candidate of providerRefCandidates(endpoint)) {
+        appendEndpoint(this.normalizedCandidate, normalizeRef(candidate), endpoint)
+      }
+      const display = providerDisplayName(endpoint)
+      this.displayCounts.set(display, (this.displayCounts.get(display) ?? 0) + 1)
+    }
+  }
+
+  matches(endpoint: ModelEndpoint, ref: string): boolean {
+    const cleaned = cleanRef(ref)
+    if (!cleaned) return false
+    if (this.exactSlug.has(cleaned)) return endpoint.provider_slug === cleaned
+    const target = normalizeRef(cleaned)
+    return providerRefCandidates(endpoint).some((candidate) => normalizeRef(candidate) === target)
+  }
+
+  endpointsForRefs(refs: readonly string[] | undefined): ReadonlySet<ModelEndpoint> {
+    const matched = new Set<ModelEndpoint>()
+    for (const ref of refs ?? []) {
+      for (const endpoint of this.endpointsForRef(ref)) matched.add(endpoint)
+    }
+    return matched
+  }
+
+  resolveRoutingRefs(
+    refs: readonly string[] | undefined,
+    opts: { preserveUnknown?: boolean } = {},
+  ): string[] {
+    if (!refs || refs.length === 0) return []
+    const out: string[] = []
+    const seen = new Set<string>()
+    for (const ref of refs) {
+      const hits = this.endpointsForRef(ref)
+      if (hits.length === 0) {
+        const cleaned = cleanRef(ref)
+        if (opts.preserveUnknown && cleaned) pushUnique(out, seen, cleaned)
+        continue
+      }
+      for (const endpoint of hits) pushUnique(out, seen, providerRoutingRef(endpoint))
+    }
+    return out
+  }
+
+  displayLabel(endpoint: ModelEndpoint): string {
+    const display = providerDisplayName(endpoint)
+    const key = providerEndpointKey(endpoint)
+    return (this.displayCounts.get(display) ?? 0) > 1 && key !== display
+      ? `${display} (${key})`
+      : display
+  }
+
+  orderByRefs(refs: readonly string[] | undefined): ModelEndpoint[] {
+    const out: ModelEndpoint[] = []
+    const seen = new Set<string>()
+    for (const ref of refs ?? []) {
+      for (const endpoint of this.endpointsForRef(ref)) {
+        const key = providerEndpointKey(endpoint)
+        if (seen.has(key)) continue
+        seen.add(key)
+        out.push(endpoint)
+      }
+    }
+    for (const endpoint of this.endpoints) {
+      if (!seen.has(providerEndpointKey(endpoint))) out.push(endpoint)
+    }
+    return out
+  }
+
+  private endpointsForRef(ref: string): readonly ModelEndpoint[] {
+    const cleaned = cleanRef(ref)
+    if (!cleaned) return []
+    return this.exactSlug.get(cleaned) ?? this.normalizedCandidate.get(normalizeRef(cleaned)) ?? []
+  }
+}
+
+function appendEndpoint(
+  index: Map<string, ModelEndpoint[]>,
+  key: string,
+  endpoint: ModelEndpoint,
+): void {
+  const rows = index.get(key)
+  if (rows) rows.push(endpoint)
+  else index.set(key, [endpoint])
+}
+
+function endpointIndex(
+  endpoints: readonly ModelEndpoint[] | ProviderEndpointIndex,
+): ProviderEndpointIndex {
+  return endpoints instanceof ProviderEndpointIndex
+    ? endpoints
+    : new ProviderEndpointIndex(endpoints)
+}
+
 export function endpointMatchesAnyProviderRef(
   endpoint: ModelEndpoint,
   refs: readonly string[] | undefined,
-  allEndpoints: readonly ModelEndpoint[] = [],
+  allEndpoints: readonly ModelEndpoint[] | ProviderEndpointIndex = [],
 ): boolean {
   if (!refs || refs.length === 0) return false
-  return refs.some((ref) => endpointMatchesProviderRef(endpoint, ref, allEndpoints))
+  const index = endpointIndex(allEndpoints)
+  return refs.some((ref) => index.matches(endpoint, ref))
 }
 
 export function endpointMatchesProviderRef(
   endpoint: ModelEndpoint,
   ref: string,
-  allEndpoints: readonly ModelEndpoint[] = [],
+  allEndpoints: readonly ModelEndpoint[] | ProviderEndpointIndex = [],
 ): boolean {
-  const cleaned = cleanRef(ref)
-  if (!cleaned) return false
-  const exactSlugExists = allEndpoints.some((candidate) => candidate.provider_slug === cleaned)
-  if (exactSlugExists) return endpoint.provider_slug === cleaned
-  const target = normalizeRef(cleaned)
-  return providerRefCandidates(endpoint).some((candidate) => normalizeRef(candidate) === target)
+  return endpointIndex(allEndpoints).matches(endpoint, ref)
 }
 
 export function providerPolicyLookupKeys(endpoint: ModelEndpoint): string[] {
@@ -100,41 +201,18 @@ export function providerPolicyLookupKeys(endpoint: ModelEndpoint): string[] {
 }
 
 export function resolveProviderRefsToRoutingRefs(
-  endpoints: readonly ModelEndpoint[],
+  endpoints: readonly ModelEndpoint[] | ProviderEndpointIndex,
   refs: readonly string[] | undefined,
   opts: { preserveUnknown?: boolean } = {},
 ): string[] {
-  if (!refs || refs.length === 0) return []
-  const out: string[] = []
-  const seen = new Set<string>()
-  for (const ref of refs) {
-    const cleaned = cleanRef(ref)
-    const exactSlugHits = cleaned
-      ? endpoints.filter((endpoint) => endpoint.provider_slug === cleaned)
-      : []
-    const hits =
-      exactSlugHits.length > 0
-        ? exactSlugHits
-        : endpoints.filter((endpoint) => endpointMatchesProviderRef(endpoint, ref, endpoints))
-    if (hits.length === 0) {
-      const cleaned = cleanRef(ref)
-      if (opts.preserveUnknown && cleaned) pushUnique(out, seen, cleaned)
-      continue
-    }
-    for (const endpoint of hits) pushUnique(out, seen, providerRoutingRef(endpoint))
-  }
-  return out
+  return endpointIndex(endpoints).resolveRoutingRefs(refs, opts)
 }
 
 export function providerDisplayLabel(
   endpoint: ModelEndpoint,
-  allEndpoints: readonly ModelEndpoint[] = [],
+  allEndpoints: readonly ModelEndpoint[] | ProviderEndpointIndex = [],
 ): string {
-  const display = providerDisplayName(endpoint)
-  const key = providerEndpointKey(endpoint)
-  const duplicateDisplay =
-    allEndpoints.filter((other) => providerDisplayName(other) === display).length > 1
-  return duplicateDisplay && key !== display ? `${display} (${key})` : display
+  return endpointIndex(allEndpoints).displayLabel(endpoint)
 }
 
 function pushUnique(out: string[], seen: Set<string>, value: string): void {

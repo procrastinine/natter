@@ -1,19 +1,6 @@
-import {
-  chatMatchesBranchCacheWriteGuard,
-  readChatBranchCacheSource,
-  type WorkspaceRepository,
-} from '../store/repository'
 import { indexById } from './active-path'
-import type {
-  Chat,
-  ChatBranchCache,
-  ChatId,
-  ContentItem,
-  CursorMap,
-  Message,
-  MessageId,
-} from './types'
-import { countMessagesWords } from './word-count'
+import { type AppliedMessageView, createAppliedMessageView } from './continuation-content'
+import type { Chat, ContentItem, Message, MessageId } from './types'
 
 const ROLE_LABEL: Record<Message['role'], string> = {
   user: 'USER',
@@ -28,7 +15,7 @@ const PHASE_LABEL: Record<NonNullable<Message['phase']>, string> = {
   final_answer: 'final',
 }
 
-interface ChatTextExport {
+export interface ChatTextExport {
   filename: string
   content: string
 }
@@ -56,18 +43,39 @@ export function buildBranchMessages(
 }
 
 export function messageRenderableText(message: Message): string {
-  const parts: string[] = []
+  return [...messageRenderableTextSegments(message)].join('\n')
+}
+
+export function* messageRenderableTextSegments(
+  message: Pick<Message, 'content' | 'attachmentRefs' | 'toolCalls' | 'continuationAttempts'>,
+  view: AppliedMessageView = createAppliedMessageView(message),
+): Generator<string> {
   for (const item of message.content) {
     const rendered = renderContentItem(item)
-    if (rendered.length > 0) parts.push(rendered)
+    if (rendered.length > 0) yield rendered
   }
   for (const ref of message.attachmentRefs ?? []) {
-    if (ref.attachmentId) parts.push(`[attachment: ${ref.presentation.label ?? ref.attachmentId}]`)
+    if (ref.attachmentId) yield `[attachment: ${ref.presentation.label ?? ref.attachmentId}]`
   }
-  for (const call of message.toolCalls ?? []) {
-    parts.push(`[tool call: ${call.function.name}]`)
+  for (const call of view.toolCalls) {
+    yield `[tool call: ${call.function.name}]`
   }
-  return parts.join('\n')
+}
+
+export function messageRenderableTextSemanticsEqual(
+  left: Pick<Message, 'content' | 'attachmentRefs' | 'toolCalls' | 'continuationAttempts'>,
+  right: Pick<Message, 'content' | 'attachmentRefs' | 'toolCalls' | 'continuationAttempts'>,
+  leftView: AppliedMessageView = createAppliedMessageView(left),
+  rightView: AppliedMessageView = createAppliedMessageView(right),
+): boolean {
+  const leftSegments = messageRenderableTextSegments(left, leftView)
+  const rightSegments = messageRenderableTextSegments(right, rightView)
+  for (;;) {
+    const leftSegment = leftSegments.next()
+    const rightSegment = rightSegments.next()
+    if (leftSegment.done || rightSegment.done) return leftSegment.done === rightSegment.done
+    if (leftSegment.value !== rightSegment.value) return false
+  }
 }
 
 export function flattenBranchMessages(
@@ -75,104 +83,51 @@ export function flattenBranchMessages(
   chat?: Pick<Chat, 'title'>,
   options: FlattenBranchOptions = {},
 ): string {
-  const blocks: string[] = []
+  return [...branchTextSegments(messages, chat, options)].join('')
+}
+
+function* branchTextSegments(
+  messages: Iterable<Message>,
+  chat?: Pick<Chat, 'title'>,
+  options: FlattenBranchOptions = {},
+): Generator<string> {
+  let hasBlock = false
   if (options.includeTitle !== false) {
-    blocks.push(`# ${displayTitle(chat)}`)
+    yield `# ${displayTitle(chat)}`
+    hasBlock = true
   }
   for (const message of messages) {
-    const phase = message.phase ? ` (${PHASE_LABEL[message.phase]})` : ''
-    blocks.push(`${ROLE_LABEL[message.role]}${phase}:\n${messageRenderableText(message)}`)
+    if (hasBlock) yield '\n\n'
+    yield* branchMessageTextSegments(message)
+    hasBlock = true
   }
-  return `${blocks.join('\n\n')}\n`
+  yield '\n'
 }
 
-export function buildBranchCacheRow(input: {
-  chatId: ChatId
-  branchLeafId: MessageId | null
-  messages: readonly Message[]
-  generatedAt?: number
-}): ChatBranchCache {
-  const branch = buildBranchMessages(input.messages, input.branchLeafId)
-  return {
-    chatId: input.chatId,
-    branchLeafId: input.branchLeafId,
-    generatedAt: input.generatedAt ?? Date.now(),
-    textContent: flattenBranchMessages(branch, undefined, { includeTitle: false }),
-    previewText: newestPreviewText(branch),
-    messageCount: branch.length,
-    wordCount: countMessagesWords(branch),
-    messageTimestamps: branch.map((message) => ({
-      id: message.id,
-      createdAt: message.createdAt,
-      editedAt: message.editedAt ?? message.createdAt,
-    })),
+export function* branchMessageTextSegments(message: Message): Generator<string> {
+  const view = createAppliedMessageView(message)
+  const phase = view.phase ? ` (${PHASE_LABEL[view.phase]})` : ''
+  yield `${ROLE_LABEL[message.role]}${phase}:\n`
+  let hasRenderableText = false
+  for (const segment of messageRenderableTextSegments(message, view)) {
+    if (hasRenderableText) yield '\n'
+    yield segment
+    hasRenderableText = true
   }
 }
 
-export async function exportActiveBranchAsTxt(
-  repo: WorkspaceRepository,
-  chatId: ChatId,
-  cursorSnapshot: CursorMap = {},
-): Promise<ChatTextExport> {
-  const [chat, snapshot] = await Promise.all([
-    repo.getChat(chatId),
-    repo.getActiveBranchSnapshot(chatId, cursorSnapshot),
-  ])
-  if (!chat) throw new Error(`ChatMissing:${chatId}`)
-  return {
-    filename: exportFilename(chat),
-    content: flattenBranchMessages(snapshot.branch, chat),
-  }
+export function branchTextExport(
+  chat: Pick<Chat, 'id' | 'title' | 'titleStatus'>,
+  messages: readonly Message[],
+): ChatTextExport {
+  return { filename: exportFilename(chat), content: flattenBranchMessages(messages, chat) }
 }
 
-export async function exportLastUpdatedBranchAsTxt(
-  repo: WorkspaceRepository,
-  chatId: ChatId,
-): Promise<ChatTextExport> {
-  for (;;) {
-    const { chat, expected } = await readChatBranchCacheSource(repo, chatId)
-    if (!chat) throw new Error(`ChatMissing:${chatId}`)
-    const cached = await repo.getChatBranchCache(chatId)
-    if ((await repo.getWorkspaceMeta()).replacementEpoch !== expected.replacementEpoch) continue
-    if (
-      cached &&
-      cached.branchLeafId === chat.lastUpdatedLeafId &&
-      cached.generatedAt >= chat.lastBranchUpdatedAt
-    ) {
-      return {
-        filename: exportFilename(chat),
-        content: textBodyWithTitle(chat, cached.textContent),
-      }
-    }
-
-    const branch = await repo.getBranchByLeaf(chatId, chat.lastUpdatedLeafId)
-    if (chat.lastUpdatedLeafId === null) {
-      if (cached) await repo.deleteChatBranchCache(chatId, expected)
-      const current = await readChatBranchCacheSource(repo, chatId)
-      if (!current.chat) throw new Error(`ChatMissing:${chatId}`)
-      if (
-        current.expected.replacementEpoch !== expected.replacementEpoch ||
-        !chatMatchesBranchCacheWriteGuard(current.chat, expected)
-      ) {
-        continue
-      }
-    } else {
-      const written = await repo.putChatBranchCache(
-        buildBranchCacheRow({
-          chatId,
-          branchLeafId: chat.lastUpdatedLeafId,
-          messages: branch,
-          generatedAt: Math.max(Date.now(), chat.lastBranchUpdatedAt),
-        }),
-        expected,
-      )
-      if (!written) continue
-    }
-    return {
-      filename: exportFilename(chat),
-      content: flattenBranchMessages(branch, chat),
-    }
-  }
+export function branchTextBodyExport(
+  chat: Pick<Chat, 'id' | 'title' | 'titleStatus'>,
+  body: string,
+): ChatTextExport {
+  return { filename: exportFilename(chat), content: textBodyWithTitle(chat, body) }
 }
 
 function renderContentItem(item: ContentItem): string {
@@ -189,24 +144,14 @@ function renderContentItem(item: ContentItem): string {
     case 'video_url':
       return `[video: ${item.attachmentId ?? item.url ?? 'inline'}]`
     case 'output_image':
-      return `[image: ${item.attachmentId ?? item.url ?? item.prompt ?? 'generated'}]`
+      return `[image: ${item.attachmentId ?? item.url}]`
     case 'audio_output':
       return (
         item.transcript ?? `[audio: ${item.attachmentId ?? item.url ?? item.format ?? 'generated'}]`
       )
     case 'output_video':
-      return `[video: ${item.attachmentId ?? item.url ?? item.prompt ?? 'generated'}]`
+      return `[video: ${item.attachmentId ?? item.url}]`
   }
-}
-
-function newestPreviewText(messages: readonly Message[]): string {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const text = messageRenderableText(messages[i] as Message)
-      .replace(/\s+/g, ' ')
-      .trim()
-    if (text.length > 0) return text.length > 500 ? text.slice(0, 500) : text
-  }
-  return ''
 }
 
 function displayTitle(chat?: Pick<Chat, 'title'>): string {

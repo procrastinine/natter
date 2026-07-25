@@ -1,3 +1,5 @@
+import { createChat } from '../helpers/chats'
+import { putCachedEndpoints } from '../helpers/discovery-cache'
 // The contract is that a mid-stream switch is a `chat-meta:{chatId}`
 // mutation — independent of the stream's `message:` scope — so the in-flight
 // stream continues to completion using the PRE-SWITCH settings snapshot.
@@ -12,20 +14,28 @@
 
 import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { AssistantStreamChunk } from '../../src/api/assistant-stream'
 import type { ChatStreamChunk } from '../../src/api/types'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import type { ChatSettings, ConnectionProfile, Message } from '../../src/core/types'
-import { sendText } from '../../src/hooks/useChat'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
+import { __resetBrowserRepositoryForTests } from '../../src/store/browser-repo'
 import {
-  __resetBrowserRepositoryForTests,
-  getBrowserRepository,
-} from '../../src/store/browser-repo'
-import { createChat } from '../../src/store/chats'
-import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
-import { putCachedEndpoints } from '../../src/store/models-cache'
-import { useChatStore } from '../../src/store/zustand/chatStore'
-import { useStreamStore } from '../../src/store/zustand/streamStore'
+  openBrowserWorkspace,
+  shutdownBrowserWorkspace,
+} from '../../src/store/browser-workspace-lifecycle'
+import { getChat } from '../../src/store/chats'
+import { configurationApplication } from '../../src/store/configuration-application'
+import { __resetDbForTests } from '../../src/store/db'
+import type { GenerationTransportInput } from '../../src/store/generation-engine'
+
+import { getWorkspaceRepository } from '../../src/store/workspace-repository'
+import { runWorkspaceRead } from '../../src/store/workspace-runtime'
+import {
+  createConfigurationChatPreset,
+  updateConfigurationChatPreset,
+} from '../helpers/configuration'
+import { installGenerationProfile, runControlledGeneration } from '../helpers/generation-engine'
 
 const DB_NAME = 'natter'
 
@@ -71,14 +81,16 @@ async function reset() {
   __resetBrowserRepositoryForTests()
   __resetDbForTests()
   __resetBroadcastForTests()
-  useChatStore.getState().reset()
-  useStreamStore.getState().reset()
   await Dexie.delete(DB_NAME)
 }
 
 beforeEach(async () => {
   await reset()
-  await openDb()
+  await openBrowserWorkspace()
+  await installGenerationProfile(profile(), { 'key-s1': 'sk-s1' })
+  await installGenerationProfile(profile({ id: 'prof-s2', apiKeyRef: 'key-s2' }), {
+    'key-s2': 'sk-s2',
+  })
   await seedOpenRouterDiscovery('prof-s1', [
     'model-s1',
     'model-s2',
@@ -90,6 +102,7 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
+  await shutdownBrowserWorkspace()
   await reset()
   vi.restoreAllMocks()
 })
@@ -114,9 +127,33 @@ function twoChunkStream(options: {
 }
 
 async function getMessage(id: string): Promise<Message> {
-  const row = await getBrowserRepository().getMessage(id)
+  const row = await runWorkspaceRead('repository-query', (permit) =>
+    getWorkspaceRepository()
+      .query(permit, { kind: 'message.presentation', messageId: id })
+      .then((envelope) => envelope.value?.message),
+  )
   if (!row) throw new Error(`message ${id} missing`)
   return row
+}
+
+async function send(
+  chatId: string,
+  connection: ConnectionProfile,
+  keyMaterial: Readonly<Record<string, string>>,
+  content: string,
+  openStream: (input: GenerationTransportInput) => AsyncIterable<AssistantStreamChunk>,
+) {
+  const chat = await getChat(chatId)
+  if (!chat) throw new Error(`chat ${chatId} missing`)
+  return runControlledGeneration(
+    {
+      kind: 'send',
+      chatId,
+      expectedLeafId: chat.lastUpdatedLeafId,
+      content: [{ type: 'text', text: content }],
+    },
+    { profile: connection, keyMaterial, openStream },
+  )
 }
 
 async function seedOpenRouterDiscovery(
@@ -181,13 +218,11 @@ describe('mid-stream preset/connection/model switch', () => {
       beforeFirst: () => undefined,
       beforeSecondChunk: async () => {
         // Tab B mutates chat.settings + presetId between chunks.
-        await getDb()
-          .chats.where('id')
-          .equals(chat.id)
-          .modify((row) => {
-            row.settings = settings('model-s2', { profileId: 'prof-s2' })
-            row.presetId = 'preset-s2'
-          })
+        await configurationApplication.replaceChatSettings(
+          chat.id,
+          settings('model-s2', { profileId: 'prof-s2' }),
+          { presetId: 'preset-s2' },
+        )
         sawSwitch = true
       },
       first: {
@@ -204,15 +239,9 @@ describe('mid-stream preset/connection/model switch', () => {
       },
     })
 
-    const first = await sendText({
-      chatId: chat.id,
-      connection: profile(),
-      apiKey: 'sk-s1',
-      content: [{ type: 'text', text: 'hello' }],
-      openStream: (open) => {
-        capturedWire = open.wireBody
-        return stream()
-      },
+    const first = await send(chat.id, profile(), { 'key-s1': 'sk-s1' }, 'hello', (open) => {
+      capturedWire = open.requestPlan.wire
+      return stream()
     })
     expect(sawSwitch).toBe(true)
     expect(first.outcome).toBe('done')
@@ -234,13 +263,13 @@ describe('mid-stream preset/connection/model switch', () => {
 
     // Next send composes from S2.
     let secondWire: Record<string, unknown> | undefined
-    const second = await sendText({
-      chatId: chat.id,
-      connection: profile({ id: 'prof-s2' }),
-      apiKey: 'sk-s2',
-      content: [{ type: 'text', text: 'again' }],
-      openStream: (open) => {
-        secondWire = open.wireBody
+    const second = await send(
+      chat.id,
+      profile({ id: 'prof-s2', apiKeyRef: 'key-s2' }),
+      { 'key-s2': 'sk-s2' },
+      'again',
+      (open) => {
+        secondWire = open.requestPlan.wire
         return (async function* () {
           yield {
             type: 'delta',
@@ -248,7 +277,7 @@ describe('mid-stream preset/connection/model switch', () => {
           }
         })()
       },
-    })
+    )
     expect(second.outcome).toBe('done')
     expect(secondWire?.model).toBe('model-s2')
   })
@@ -259,12 +288,7 @@ describe('mid-stream preset/connection/model switch', () => {
 
     const stream = twoChunkStream({
       beforeSecondChunk: async () => {
-        await getDb()
-          .chats.where('id')
-          .equals(chat.id)
-          .modify((row) => {
-            row.settings = { ...row.settings, profileId: 'prof-s2' }
-          })
+        await configurationApplication.patchChatSettings(chat.id, { profileId: 'prof-s2' })
       },
       first: { type: 'delta', chunk: { id: 'conn', choices: [{ delta: { content: 'A' } }] } },
       second: { type: 'delta', chunk: { choices: [{ delta: { content: 'B' } }] } },
@@ -277,15 +301,9 @@ describe('mid-stream preset/connection/model switch', () => {
       },
     })
 
-    const first = await sendText({
-      chatId: chat.id,
-      connection: profile(),
-      apiKey: 'sk-s1',
-      content: [{ type: 'text', text: 'hi' }],
-      openStream: (open) => {
-        capturedWire = open.wireBody
-        return stream()
-      },
+    const first = await send(chat.id, profile(), { 'key-s1': 'sk-s1' }, 'hi', (open) => {
+      capturedWire = open.requestPlan.wire
+      return stream()
     })
     expect(first.outcome).toBe('done')
     const assistant = await getMessage(first.assistantMessageId)
@@ -294,7 +312,7 @@ describe('mid-stream preset/connection/model switch', () => {
     expect(capturedWire?.model).toBe('model-shared')
 
     // chat.settings.profileId reflects S2 for the next send.
-    const chatNow = await getDb().chats.get(chat.id)
+    const chatNow = await getChat(chat.id)
     expect(chatNow?.settings.profileId).toBe('prof-s2')
   })
 
@@ -305,27 +323,16 @@ describe('mid-stream preset/connection/model switch', () => {
 
     const stream = twoChunkStream({
       beforeSecondChunk: async () => {
-        await getDb()
-          .chats.where('id')
-          .equals(chat.id)
-          .modify((row) => {
-            row.settings = { ...row.settings, model: 'new-model' }
-          })
+        await configurationApplication.patchChatSettings(chat.id, { model: 'new-model' })
       },
       first: { type: 'delta', chunk: { id: 'mo', choices: [{ delta: { content: 'first ' } }] } },
       second: { type: 'delta', chunk: { choices: [{ delta: { content: 'half' } }] } },
       usage: { type: 'delta', chunk: { choices: [{ delta: {}, finish_reason: 'stop' }] } },
     })
 
-    const first = await sendText({
-      chatId: chat.id,
-      connection: profile(),
-      apiKey: 'sk-s1',
-      content: [{ type: 'text', text: 'go' }],
-      openStream: (open) => {
-        firstWire = open.wireBody
-        return stream()
-      },
+    const first = await send(chat.id, profile(), { 'key-s1': 'sk-s1' }, 'go', (open) => {
+      firstWire = open.requestPlan.wire
+      return stream()
     })
     expect(first.outcome).toBe('done')
     expect(firstWire?.model).toBe('orig-model')
@@ -334,20 +341,14 @@ describe('mid-stream preset/connection/model switch', () => {
     expect(assistant.generation?.requestedModel).toBe('orig-model')
 
     // Next send — composed from new settings.
-    const second = await sendText({
-      chatId: chat.id,
-      connection: profile(),
-      apiKey: 'sk-s1',
-      content: [{ type: 'text', text: 'again' }],
-      openStream: (open) => {
-        secondWire = open.wireBody
-        return (async function* () {
-          yield {
-            type: 'delta',
-            chunk: { id: 'mo-2', choices: [{ delta: { content: 'ok' }, finish_reason: 'stop' }] },
-          }
-        })()
-      },
+    const second = await send(chat.id, profile(), { 'key-s1': 'sk-s1' }, 'again', (open) => {
+      secondWire = open.requestPlan.wire
+      return (async function* () {
+        yield {
+          type: 'delta',
+          chunk: { id: 'mo-2', choices: [{ delta: { content: 'ok' }, finish_reason: 'stop' }] },
+        }
+      })()
     })
     expect(second.outcome).toBe('done')
     expect(secondWire?.model).toBe('new-model')
@@ -360,15 +361,13 @@ describe('preset-edit mid-stream', () => {
   // continues with its captured S1, and the next send STILL composes from
   // chat.settings (which is S1 until the user explicitly reapplies).
   it('writing to presets table leaves chat.settings + the stream untouched', async () => {
-    const db = await openDb()
-    await db.presets.put({
+    await createConfigurationChatPreset({
       id: 'preset-1',
       name: 'P1',
       connectionProfileId: 'prof-s1',
       settings: settings('model-s1'),
       sortIndex: 0,
-      createdAt: 1,
-      updatedAt: 1,
+      now: 1,
     })
     const chat = await createChat({
       settings: settings('model-s1'),
@@ -379,27 +378,16 @@ describe('preset-edit mid-stream', () => {
     const stream = twoChunkStream({
       beforeSecondChunk: async () => {
         // Tab B edits the preset but DOES NOT touch chat.settings.
-        await getDb()
-          .presets.where('id')
-          .equals('preset-1')
-          .modify((row) => {
-            row.settings = settings('edited-model')
-          })
+        await updateConfigurationChatPreset('preset-1', { settings: settings('edited-model') })
       },
       first: { type: 'delta', chunk: { id: 'ed', choices: [{ delta: { content: 'pre-' } }] } },
       second: { type: 'delta', chunk: { choices: [{ delta: { content: 'edit' } }] } },
       usage: { type: 'delta', chunk: { choices: [{ delta: {}, finish_reason: 'stop' }] } },
     })
 
-    const first = await sendText({
-      chatId: chat.id,
-      connection: profile(),
-      apiKey: 'sk-s1',
-      content: [{ type: 'text', text: 'send' }],
-      openStream: (open) => {
-        captured = open.wireBody
-        return stream()
-      },
+    const first = await send(chat.id, profile(), { 'key-s1': 'sk-s1' }, 'send', (open) => {
+      captured = open.requestPlan.wire
+      return stream()
     })
     expect(first.outcome).toBe('done')
     expect(captured?.model).toBe('model-s1')
@@ -407,25 +395,19 @@ describe('preset-edit mid-stream', () => {
     expect(assistant.content).toEqual([{ type: 'output_text', text: 'pre-edit' }])
 
     // chat.settings still points at model-s1 — preset edits don't propagate.
-    const chatNow = await getDb().chats.get(chat.id)
+    const chatNow = await getChat(chat.id)
     expect(chatNow?.settings.model).toBe('model-s1')
 
     // Next send ALSO uses chat.settings (model-s1), not the edited preset.
     let nextCaptured: Record<string, unknown> | undefined
-    await sendText({
-      chatId: chat.id,
-      connection: profile(),
-      apiKey: 'sk-s1',
-      content: [{ type: 'text', text: 'again' }],
-      openStream: (open) => {
-        nextCaptured = open.wireBody
-        return (async function* () {
-          yield {
-            type: 'delta',
-            chunk: { id: 'ed-2', choices: [{ delta: { content: 'ok' }, finish_reason: 'stop' }] },
-          }
-        })()
-      },
+    await send(chat.id, profile(), { 'key-s1': 'sk-s1' }, 'again', (open) => {
+      nextCaptured = open.requestPlan.wire
+      return (async function* () {
+        yield {
+          type: 'delta',
+          chunk: { id: 'ed-2', choices: [{ delta: { content: 'ok' }, finish_reason: 'stop' }] },
+        }
+      })()
     })
     expect(nextCaptured?.model).toBe('model-s1')
   })

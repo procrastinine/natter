@@ -1,29 +1,75 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { createChat } from '../helpers/chats'
 import 'fake-indexeddb/auto'
 import Dexie from 'dexie'
 import { IDBFactory } from 'fake-indexeddb'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
-import { newId } from '../../src/lib/ulid'
+import { DEFAULT_GLOBAL_PREFERENCES } from '../../src/core/global-settings'
+import { DEFAULT_RENDERING_PREFS } from '../../src/core/rendering-preferences'
+import type { Chat, ConnectionProfile } from '../../src/core/types'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
-import { __resetDbForTests, openDb } from '../../src/store/db'
-import { __resetKeyCacheForTests, createKey, getKey } from '../../src/store/keys'
-import { createPreset, listPresets } from '../../src/store/presets'
-import * as profileStore from '../../src/store/profiles'
-import { createProfile, getProfile, listProfiles } from '../../src/store/profiles'
-import { __setRepositoryMutationSubscriberForTests } from '../../src/store/reactive-query'
 import {
-  ConnectionHeader,
-  readActiveProfileId,
-  writeActiveProfileId,
-} from '../../src/ui/header/ConnectionHeader'
+  openBrowserWorkspace,
+  shutdownBrowserWorkspace,
+} from '../../src/store/browser-workspace-lifecycle'
+
+import { configurationApplication } from '../../src/store/configuration-application'
+import {
+  type ConfigurationProjectionSource,
+  configurationController,
+} from '../../src/store/configuration-controller'
+import type { ConversationSnapshot } from '../../src/store/conversation-controller'
+import { __resetDbForTests } from '../../src/store/db'
+import { __resetKeyCacheForTests, createKey } from '../../src/store/keys'
+import type {
+  ConfigurationActiveSelectionProjection,
+  ConfigurationShellProjection,
+} from '../../src/store/workspace-protocol'
+import { ConnectionHeader } from '../../src/ui/header/ConnectionHeader'
+import {
+  createConfigurationChatPreset,
+  createConfigurationProfile,
+  getConfigurationProfile,
+  listConfigurationChatPresets,
+  listConfigurationProfiles,
+} from '../helpers/configuration'
 
 const DB_NAME = 'natter'
+
+const writeActiveProfileId = (profileId: string | null) =>
+  configurationController.rememberProfile(profileId)
+const readActiveProfileId = () => {
+  const seed = configurationController.getSnapshot().seed
+  return seed.settings?.profileId || seed.profileId
+}
 
 function jsonResponse(body: unknown): Response {
   return new Response(JSON.stringify(body), {
     status: 200,
     headers: { 'content-type': 'application/json' },
+  })
+}
+
+function mockOnboardingModels(...modelIds: string[]): void {
+  vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+    jsonResponse({ data: modelIds.map((id) => ({ id, supported_parameters: ['tools'] })) }),
+  )
+}
+
+function openRouterProbeEndpoints(modelId: string): Response {
+  return jsonResponse({
+    data: {
+      id: modelId,
+      endpoints: [
+        {
+          provider_name: 'OpenAI',
+          supported_parameters: ['tools'],
+          context_length: 128_000,
+          pricing: {},
+        },
+      ],
+    },
   })
 }
 
@@ -36,19 +82,21 @@ async function resetAll() {
 }
 
 async function seedProfile(
-  overrides: Partial<Parameters<typeof createProfile>[0]> & { key?: string | null } = {},
+  overrides: Partial<Parameters<typeof createConfigurationProfile>[0]> & {
+    key?: string | null
+  } = {},
 ) {
   const name = overrides.name ?? 'OpenRouter'
   const key =
     overrides.key === undefined
       ? 'sk-or-v1-test-0000000000000000000000000000000000000000'
       : overrides.key
-  const apiKeyRef = key === null ? newId() : (await createKey({ name, plaintextKey: key })).id
-  return createProfile({
+  const apiKeyRef = key === null ? undefined : (await createKey({ name, plaintextKey: key })).id
+  return createConfigurationProfile({
     name,
     kind: overrides.kind ?? 'openrouter',
     baseUrl: overrides.baseUrl ?? 'https://openrouter.ai/api/v1',
-    apiKeyRef,
+    ...(apiKeyRef ? { apiKeyRef } : {}),
   })
 }
 
@@ -58,14 +106,28 @@ function connectionButtonMatcher(name: string): RegExp {
 
 async function openConnectionPopover(name: string) {
   const button = await screen.findByRole('button', { name: connectionButtonMatcher(name) })
+  await waitFor(() => expect(button).not.toBeDisabled())
   fireEvent.click(button)
   await screen.findByRole('region', { name: `Connection: ${name}` })
+}
+
+function observeActiveChat(chat: Chat | null): void {
+  const fence = configurationController.getSnapshot().workspaceFence
+  if (!fence) throw new Error('ConfigurationWorkspaceNotReconciled')
+  configurationController.observeConversation({
+    workspaceId: fence.workspaceId,
+    workspaceEpoch: fence.replacementEpoch,
+    activeChatId: chat?.id ?? null,
+    active: chat
+      ? ({ chatId: chat.id, chat } as NonNullable<ConversationSnapshot['active']>)
+      : null,
+  })
 }
 
 beforeEach(async () => {
   ;(globalThis as unknown as { indexedDB: IDBFactory }).indexedDB = new IDBFactory()
   await resetAll()
-  await openDb()
+  await openBrowserWorkspace()
 })
 
 afterEach(async () => {
@@ -74,9 +136,9 @@ afterEach(async () => {
   // those are still resolving makes vitest flag a `DatabaseClosedError`
   // unhandled rejection. Cleanup first cancels the subscriptions.
   cleanup()
-  __setRepositoryMutationSubscriberForTests(undefined)
   vi.restoreAllMocks()
   await new Promise((resolve) => setTimeout(resolve, 10))
+  await shutdownBrowserWorkspace()
   await resetAll()
 })
 
@@ -97,8 +159,9 @@ describe('ConnectionHeader', () => {
   })
 
   it('creates a first connection from the full setup dialog with any provider + name', async () => {
+    mockOnboardingModels('local/default-model')
     render(<ConnectionHeader />)
-    fireEvent.click(screen.getByText('Add connection'))
+    fireEvent.click(await screen.findByText('Add connection'))
     await waitFor(() => {
       expect(screen.getByLabelText('Add connection')).toBeTruthy()
     })
@@ -106,22 +169,24 @@ describe('ConnectionHeader', () => {
     fireEvent.change(screen.getByLabelText('Provider'), { target: { value: 'llama-server' } })
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
     await waitFor(async () => {
-      expect(await listProfiles()).toHaveLength(1)
-      expect(await listPresets()).toHaveLength(1)
+      expect(await listConfigurationProfiles()).toHaveLength(1)
+      expect(await listConfigurationChatPresets()).toHaveLength(1)
     })
     await waitFor(() => {
       expect(screen.queryByRole('dialog', { name: 'Add connection' })).not.toBeInTheDocument()
     })
     expect(screen.queryByRole('button', { name: 'Add connection' })).toBeNull()
-    const profiles = await listProfiles()
-    const presets = await listPresets()
+    const profiles = await listConfigurationProfiles()
+    const presets = await listConfigurationChatPresets()
     expect(profiles).toHaveLength(1)
     expect(profiles[0]?.kind).toBe('llama-server')
     expect(profiles[0]?.name).toBe('Local llama')
     expect(presets).toHaveLength(1)
+    expect(presets[0]?.settings.model).toBe('local/default-model')
   })
 
   it('keeps the connection popover open while its portalled setup dialog is used', async () => {
+    mockOnboardingModels('models/gemini-3.5-flash')
     const profile = await seedProfile()
     writeActiveProfileId(profile.id)
     render(<ConnectionHeader variant="title-icon" />)
@@ -146,6 +211,9 @@ describe('ConnectionHeader', () => {
       const url = input instanceof Request ? input.url : String(input)
       if (url.endsWith('/models')) {
         return Promise.resolve(jsonResponse({ data: [{ id: 'openai/gpt-4o-mini' }] }))
+      }
+      if (url.endsWith('/endpoints')) {
+        return Promise.resolve(openRouterProbeEndpoints('openai/gpt-4o-mini'))
       }
       return Promise.resolve(
         jsonResponse({
@@ -218,6 +286,9 @@ describe('ConnectionHeader', () => {
       if (url.endsWith('/models')) {
         return Promise.resolve(jsonResponse({ data: [{ id: 'openai/gpt-4o-mini' }] }))
       }
+      if (url.endsWith('/endpoints')) {
+        return Promise.resolve(openRouterProbeEndpoints('openai/gpt-4o-mini'))
+      }
       return Promise.resolve(
         jsonResponse({
           id: 'gen-test',
@@ -235,9 +306,7 @@ describe('ConnectionHeader', () => {
 
     fireEvent.change(screen.getByLabelText('Profile'), { target: { value: b.id } })
 
-    await waitFor(() => {
-      expect(screen.getByText('OpenRouter B')).toBeTruthy()
-    })
+    await screen.findByRole('button', { name: connectionButtonMatcher('OpenRouter B') })
     expect(screen.queryByText(/Completed test chat/i)).toBeNull()
   })
 
@@ -252,13 +321,13 @@ describe('ConnectionHeader', () => {
     await waitFor(() => expect(confirm).toBeEnabled())
     fireEvent.click(confirm)
     await waitFor(async () => {
-      expect(await listProfiles()).toHaveLength(0)
+      expect(await listConfigurationProfiles()).toHaveLength(0)
     })
   })
 
   it('blocks deletion while a non-archived preset still uses the connection', async () => {
     const profile = await seedProfile()
-    await createPreset({
+    await createConfigurationChatPreset({
       name: 'Private reasoning',
       connectionProfileId: profile.id,
       settings: cloneDefaultChatSettings(),
@@ -268,9 +337,9 @@ describe('ConnectionHeader', () => {
     await openConnectionPopover('OpenRouter')
     fireEvent.click(await screen.findByRole('button', { name: 'Delete connection' }))
 
-    expect(await screen.findByText(/1 non-archived preset and 0 non-archived chats/u)).toBeVisible()
+    expect(await screen.findByText(/1 preset and 0 chats/u)).toBeVisible()
     expect(screen.getByRole('button', { name: 'Delete' })).toBeDisabled()
-    expect(await getProfile(profile.id)).toBeDefined()
+    expect(await getConfigurationProfile(profile.id)).toBeDefined()
   })
 
   it('saves in place when the name stays the same and keeps the original key when left blank', async () => {
@@ -286,12 +355,13 @@ describe('ConnectionHeader', () => {
     await waitFor(() => {
       expect(screen.getByRole('button', { name: 'Edit' })).toBeTruthy()
     })
-    const updated = await getProfile(profile.id)
+    const updated = await getConfigurationProfile(profile.id)
     expect(updated?.kind).toBe('openai-compatible')
     expect(updated?.apiKeyRef).toBe(profile.apiKeyRef)
   })
 
   it('saves as new automatically when the name changes and blank key means no key', async () => {
+    mockOnboardingModels('anthropic/claude-opus-4.8')
     const profile = await seedProfile()
     writeActiveProfileId(profile.id)
     render(<ConnectionHeader variant="title-icon" />)
@@ -300,27 +370,36 @@ describe('ConnectionHeader', () => {
     fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'OpenRouter copy' } })
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
     await screen.findByRole('button', { name: connectionButtonMatcher('OpenRouter copy') })
-    const profiles = await listProfiles()
+    const profiles = await listConfigurationProfiles()
     const copy = profiles.find((row) => row.name === 'OpenRouter copy')
     expect(profiles).toHaveLength(2)
     expect(copy).toBeTruthy()
     if (!copy) {
       throw new Error('expected copied profile to exist')
     }
-    expect(await getKey(copy.apiKeyRef)).toBeUndefined()
+    expect(copy.apiKeyRef).toBeUndefined()
+    const copyPreset = (await listConfigurationChatPresets()).find(
+      (preset) => preset.connectionProfileId === copy.id,
+    )
+    expect(copyPreset?.settings.model).toBe('anthropic/claude-opus-4.8')
   })
 
-  it('shows the active chat profile while viewed, then falls back to the remembered tab default', async () => {
+  it('shows the active chat profile and remembers it as this tab new-chat seed', async () => {
     const a = await seedProfile({ name: 'OpenRouter A' })
     const b = await seedProfile({ name: 'OpenRouter B' })
     writeActiveProfileId(b.id)
+    const settings = cloneDefaultChatSettings()
+    settings.profileId = a.id
+    const chat = await createChat({ settings })
+    observeActiveChat(chat)
     const { rerender } = render(
-      <ConnectionHeader variant="title-icon" activeChatProfileId={a.id} />,
+      <ConnectionHeader variant="title-icon" activeChatId={chat.id} activeChatProfileId={a.id} />,
     )
     await screen.findByRole('button', { name: connectionButtonMatcher('OpenRouter A') })
-    expect(readActiveProfileId()).toBe(b.id)
+    expect(readActiveProfileId()).toBe(a.id)
+    observeActiveChat(null)
     rerender(<ConnectionHeader variant="title-icon" activeChatProfileId={null} />)
-    await screen.findByRole('button', { name: connectionButtonMatcher('OpenRouter B') })
+    await screen.findByRole('button', { name: connectionButtonMatcher('OpenRouter A') })
   })
 
   it('does not keep a cached profile visible after a later live deletion', async () => {
@@ -329,7 +408,12 @@ describe('ConnectionHeader', () => {
     render(<ConnectionHeader variant="title-icon" />)
     await screen.findByRole('button', { name: connectionButtonMatcher('OpenRouter') })
 
-    await profileStore.deleteProfile(profile.id, { force: true })
+    await configurationApplication.execute({
+      kind: 'connection.delete',
+      profileId: profile.id,
+      force: true,
+      now: Date.now(),
+    })
 
     await waitFor(() => {
       expect(
@@ -338,18 +422,22 @@ describe('ConnectionHeader', () => {
     })
   })
 
-  it('keeps a saved profile through rerenders until its live query catches up', async () => {
-    const pendingPublications: Array<() => void> = []
-    __setRepositoryMutationSubscriberForTests(undefined, 'natter', undefined, (task) =>
-      pendingPublications.push(task),
-    )
+  it('moves an archived active connection to the remaining available connection', async () => {
+    const source = await seedProfile({ name: 'Source' })
+    const replacement = await seedProfile({ name: 'Replacement' })
+    writeActiveProfileId(source.id)
+    render(<ConnectionHeader variant="title-icon" />)
+    await screen.findByRole('button', { name: connectionButtonMatcher('Source') })
+
+    await configurationApplication.archiveConnection(source.id)
+
+    await screen.findByRole('button', { name: connectionButtonMatcher('Replacement') })
+    expect(readActiveProfileId()).toBe(replacement.id)
+  })
+
+  it('keeps a locally committed saved profile through rerenders', async () => {
+    mockOnboardingModels('local/default-model')
     const view = render(<ConnectionHeader />)
-    await waitFor(() => {
-      expect(pendingPublications.length).toBeGreaterThan(0)
-    })
-    act(() => {
-      for (const publish of pendingPublications.splice(0)) publish()
-    })
     fireEvent.click(await screen.findByText('Add connection'))
     fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Local llama' } })
     fireEvent.change(screen.getByLabelText('Provider'), { target: { value: 'llama-server' } })
@@ -376,39 +464,89 @@ describe('ConnectionHeader', () => {
       baseUrl: 'http://127.0.0.1:8081/v1',
       key: null,
     })
-    writeActiveProfileId(b.id)
-    const listProfilesActual = profileStore.listProfiles
-    let resolveBlockedRows!: (value: Awaited<ReturnType<typeof listProfilesActual>>) => void
-    const blockedRows = new Promise<Awaited<ReturnType<typeof listProfilesActual>>>((resolve) => {
-      resolveBlockedRows = resolve
+    writeActiveProfileId(a.id)
+    let releaseB!: () => void
+    const bGate = new Promise<void>((resolve) => {
+      releaseB = resolve
     })
-    const spy = vi.spyOn(profileStore, 'listProfiles')
-    let blockNextLoad = false
-    spy.mockImplementation(() => {
-      if (blockNextLoad) {
-        blockNextLoad = false
-        return blockedRows
-      }
-      return listProfilesActual()
-    })
+    let blockB = false
+    const source: ConfigurationProjectionSource = {
+      async loadShell() {
+        return configurationShell(2)
+      },
+      async loadGlobalTokenCalibration() {
+        return { version: 1, updatedAt: 0, byModel: {}, clearGeneration: 0 }
+      },
+      async loadTextTemplateCatalog() {
+        return []
+      },
+      async loadActiveSelection(target) {
+        if (blockB && target.profileId === b.id) await bGate
+        return configurationSelection(target.profileId === b.id ? b : a)
+      },
+      async loadActiveModel(target) {
+        return {
+          kind: 'ready',
+          projection: {
+            revision: target.requestRevision,
+            modelId: target.modelId,
+            models: { kind: 'not-requested' },
+            endpoints: { kind: 'not-requested' },
+            privacy: { kind: 'not-requested' },
+          },
+        }
+      },
+    }
+    await configurationController.setProjectionSource(source)
 
-    const { rerender } = render(
-      <ConnectionHeader variant="title-icon" activeChatProfileId={a.id} />,
-    )
+    render(<ConnectionHeader variant="title-icon" />)
     await screen.findByRole('button', { name: connectionButtonMatcher('llama A') })
 
-    blockNextLoad = true
-    rerender(<ConnectionHeader variant="title-icon" activeChatProfileId={null} />)
+    blockB = true
+    act(() => writeActiveProfileId(b.id))
     expect(screen.queryByText('No connection configured')).toBeNull()
-    expect(screen.getByRole('button', { name: connectionButtonMatcher('llama A') })).toBeTruthy()
+    const retained = screen.getByRole('button', { name: connectionButtonMatcher('llama A') })
+    await waitFor(() => expect(retained).toBeDisabled())
+    expect(retained.closest('[data-ui="connection-title-entry"]')).toHaveAttribute(
+      'data-presentation',
+      'retained',
+    )
 
-    await waitFor(() => {
-      expect(spy).toHaveBeenCalledTimes(2)
-    })
-    resolveBlockedRows(await listProfilesActual())
+    releaseB()
 
     await waitFor(() => {
       expect(screen.getByRole('button', { name: connectionButtonMatcher('llama B') })).toBeTruthy()
     })
   })
 })
+
+function configurationShell(totalProfileCount: number): ConfigurationShellProjection {
+  return {
+    preferences: {
+      global: structuredClone(DEFAULT_GLOBAL_PREFERENCES),
+      rendering: structuredClone(DEFAULT_RENDERING_PREFS),
+      sidebarSortMode: 'updatedAt-desc',
+      collapsedFolderIds: [],
+      imageAllowlist: [],
+      samplePromptsDismissed: false,
+    },
+    totalProfileCount,
+  }
+}
+
+function configurationSelection(
+  profile: ConnectionProfile,
+): ConfigurationActiveSelectionProjection {
+  return {
+    profile,
+    preset: null,
+    requestRevision: {
+      profileId: profile.id,
+      requestRevision: profile.requestRevision ?? 0,
+      key: { kind: 'missing' },
+    },
+    dispatchKeyRevisions: [],
+    promptPresets: [],
+    textTemplate: null,
+  }
+}

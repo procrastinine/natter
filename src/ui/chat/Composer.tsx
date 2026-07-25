@@ -6,11 +6,24 @@ import {
   useLayoutEffect,
   useRef,
   useState,
+  useSyncExternalStore,
 } from 'react'
 import type { SendShortcut } from '../../core/global-settings'
+import {
+  AVAILABLE_GENERATION_CAPABILITY,
+  type GenerationCapability,
+  generationUnavailableReason,
+  type NonReadyGenerationCapability,
+} from '../../core/interaction-capability'
 import { estimateTokens } from '../../core/tokens'
 import type { MessageAttachmentRef } from '../../core/types'
 import { isPageHidingAbortError } from '../../lib/page-lifecycle'
+import { configurationController } from '../../store/configuration-controller'
+import { writeComposerHeight, writeComposerManualHeight } from '../../store/preferences-application'
+import type {
+  AttemptStopCapability,
+  RequestableAttemptStopCapability,
+} from '../../store/presentation-contracts'
 import { AttachmentDraftTray } from '../attachments/AttachmentDraftTray'
 import { AttachmentPicker } from '../attachments/AttachmentPicker'
 import { useAttachmentDrafts } from '../attachments/useAttachmentDrafts'
@@ -24,16 +37,15 @@ import {
 
 export { moveComposerDraft } from './composer-draft-state'
 
-interface ComposerProps {
+export interface ComposerProps {
   // Disables the textarea entirely.
   disabled?: boolean
-  // The textarea remains editable but Send is locked. Reason is rendered
-  // beneath the composer and used as the Send-button tooltip.
-  sendBlockedReason?: string
+  generationCapability?: GenerationCapability
+  replyGenerationCapability?: GenerationCapability
   onSubmit: (
     text: string,
     opts?: { prefillText?: string; attachmentRefs?: MessageAttachmentRef[] },
-  ) => void | Promise<void>
+  ) => ComposerSubmission
   draftKey?: string | null
   seed?: string | null
   onSeedConsumed?: () => void
@@ -42,13 +54,8 @@ interface ComposerProps {
   // context (e.g. the "Jump to latest" pill). Floats above the body
   // regardless of how tall the composer is dragged.
   floatingAccessory?: ReactNode
-  // Streaming state + abort handler. When `streaming` is true, the Send
-  // button slot is replaced with a Stop button (square glyph) that calls
-  // `onAbort`. The user asked for Stop to occupy the Send slot — moving
-  // it here (from the chat title bar) makes the affordance reachable
-  // alongside where the user's hand is anyway.
-  streaming?: boolean
-  onAbort?: () => void
+  stopCapability?: AttemptStopCapability
+  onRequestStop?: (capability: RequestableAttemptStopCapability) => void
   // "Import at end" button handler (§10.7). Opens the import modal
   // pre-scoped to "end of active path." Rendered only when provided.
   onImportAtEnd?: () => void
@@ -57,7 +64,7 @@ interface ComposerProps {
   // user message and the composer text is empty, pressing Send triggers
   // this instead of creating a new user message — it just fires an
   // assistant completion under the existing trailing user.
-  onReplyToTrailingUser?: () => void | Promise<void>
+  onReplyToTrailingUser?: () => ComposerSubmission
   // Whether the active path currently ends with a user message. When
   // true and the composer text is empty, the Send button switches to
   // "Reply" and calls `onReplyToTrailingUser` on click.
@@ -89,11 +96,23 @@ interface ComposerProps {
   //     focus mode the composer IS the bottom of the reading lane
   //     (scrolls with content, no sticky footer), so a bigger default
   //     and a bigger ceiling are useful for drafting.
-  // Each variant has its own localStorage key for the height so user
-  // drags in one mode don't leak into the other.
+  // Each variant has its own durable future default so user drags in one
+  // mode don't leak into the other; the mounted tab keeps its live value.
   autoSizeVariant?: AutoSizeVariant
   autoSizeMeasurementKey?: string
+  presentationOnly?: boolean
 }
+
+export type ComposerSubmissionOutcome =
+  | { readonly kind: 'prepared' }
+  | {
+      readonly kind: 'not-prepared'
+      readonly reason: 'cancelled' | 'failed' | 'rejected-pending' | 'superseded'
+    }
+
+export type ComposerSubmission =
+  | { readonly kind: 'started'; readonly completion: Promise<ComposerSubmissionOutcome> }
+  | { readonly kind: 'not-started'; readonly capability: NonReadyGenerationCapability }
 
 type AutoSizeVariant = 'normal' | 'focus'
 
@@ -105,50 +124,23 @@ export interface ComposerDroppedFiles {
 interface AutoSizeProfile {
   autoMinHeight: number
   autoGrowMax: number
-  storageKey: string
 }
 
 const AUTO_SIZE_PROFILES: Record<AutoSizeVariant, AutoSizeProfile> = {
   normal: {
     autoMinHeight: 0,
     autoGrowMax: 240,
-    storageKey: 'natter:composer-floor',
   },
   focus: {
     autoMinHeight: 200,
     autoGrowMax: 480,
-    storageKey: 'natter:composer-height-focus',
   },
 }
 
-const COMPOSER_HEIGHT_STORAGE_KEY = 'natter:composer-height'
 const COMPOSER_MIN_HEIGHT = 80
 const COMPOSER_MAX_HEIGHT = 600
 const COMPOSER_DEFAULT_HEIGHT = 120
 const EMPTY_ATTACHMENT_REFS: readonly MessageAttachmentRef[] = Object.freeze([])
-
-function readSavedHeight(): number {
-  if (typeof window === 'undefined') return COMPOSER_DEFAULT_HEIGHT
-  const raw = window.localStorage.getItem(COMPOSER_HEIGHT_STORAGE_KEY)
-  if (!raw) return COMPOSER_DEFAULT_HEIGHT
-  const parsed = Number.parseInt(raw, 10)
-  if (!Number.isFinite(parsed)) return COMPOSER_DEFAULT_HEIGHT
-  return clampFixedHeight(parsed)
-}
-
-function readSavedManualHeight(variant: AutoSizeVariant): number | null {
-  const profile = AUTO_SIZE_PROFILES[variant]
-  if (typeof window === 'undefined') return null
-  const raw = window.localStorage.getItem(profile.storageKey)
-  if (!raw) return null
-  const parsed = Number.parseInt(raw, 10)
-  if (!Number.isFinite(parsed) || parsed <= 0) return null
-  return Math.min(COMPOSER_MAX_HEIGHT, parsed)
-}
-
-function clampFixedHeight(value: number): number {
-  return Math.min(COMPOSER_MAX_HEIGHT, Math.max(COMPOSER_MIN_HEIGHT, value))
-}
 
 function clampComposerHeight(value: number, minHeight: number): number {
   return Math.min(COMPOSER_MAX_HEIGHT, Math.max(minHeight, value))
@@ -196,15 +188,16 @@ function setComposerTextareaHeight(
 
 export function Composer({
   disabled,
-  sendBlockedReason,
+  generationCapability = AVAILABLE_GENERATION_CAPABILITY,
+  replyGenerationCapability = generationCapability,
   onSubmit,
   draftKey = null,
   seed,
   onSeedConsumed,
   sendShortcut = 'enter',
   floatingAccessory,
-  streaming = false,
-  onAbort,
+  stopCapability,
+  onRequestStop,
   onImportAtEnd,
   onImportAtEndIntent,
   onReplyToTrailingUser,
@@ -212,6 +205,7 @@ export function Composer({
   autoSize = false,
   autoSizeVariant = 'normal',
   autoSizeMeasurementKey,
+  presentationOnly = false,
   showPrefillButton,
   defaultPrefill,
   prefillScopeKey,
@@ -251,10 +245,36 @@ export function Composer({
   const prefillTextareaRef = useRef<HTMLTextAreaElement | null>(null)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const profile = AUTO_SIZE_PROFILES[autoSizeVariant]
+  const configurationSession = useSyncExternalStore(
+    configurationController.subscribe,
+    configurationController.getSnapshot,
+    configurationController.getSnapshot,
+  )
+  const savedHeight = autoSize
+    ? autoSizeVariant === 'normal'
+      ? configurationSession.ui.composerNormalManualHeight
+      : configurationSession.ui.composerFocusManualHeight
+    : configurationSession.ui.composerHeight
   // A null auto-size height means content-driven sizing. The first manual
   // resize stores an exact viewport height; fixed mode always has a value.
-  const [height, setHeight] = useState<number | null>(() =>
-    autoSize ? readSavedManualHeight(autoSizeVariant) : readSavedHeight(),
+  const [height, setHeight] = useState<number | null>(() => savedHeight)
+  const heightRef = useRef(height)
+  const updateHeight = useCallback((next: number | null) => {
+    heightRef.current = next
+    setHeight(next)
+  }, [])
+  const commitHeight = useCallback(
+    (next: number | null = heightRef.current) => {
+      const variant = autoSize ? autoSizeVariant : 'fixed'
+      configurationController.setComposerHeight(variant, next)
+      const write = autoSize
+        ? writeComposerManualHeight(autoSizeVariant, next)
+        : writeComposerHeight(next ?? COMPOSER_DEFAULT_HEIGHT)
+      void write.catch((error: unknown) => {
+        console.error('Failed to save composer height preference', error)
+      })
+    },
+    [autoSize, autoSizeVariant],
   )
   const [renderedHeight, setRenderedHeight] = useState(() =>
     autoSize ? profile.autoMinHeight : (height ?? COMPOSER_DEFAULT_HEIGHT),
@@ -335,15 +355,6 @@ export function Composer({
       setPrefillOpen(false)
     }
   }, [prefillOpen, defaultPrefill])
-  useEffect(() => {
-    if (typeof window === 'undefined') return
-    const key = autoSize ? profile.storageKey : COMPOSER_HEIGHT_STORAGE_KEY
-    if (autoSize && height === null) {
-      window.localStorage.removeItem(key)
-      return
-    }
-    window.localStorage.setItem(key, String(Math.round(height ?? COMPOSER_DEFAULT_HEIGHT)))
-  }, [autoSize, profile.storageKey, height])
   // Drive the textarea height imperatively (via the DOM ref). The visual
   // size is dynamic — either drag-updated+persisted or content-driven —
   // so it can't live in a stylesheet, and the project's style-discipline
@@ -370,9 +381,9 @@ export function Composer({
         setComposerTextareaHeight(el, manualHeight)
         setRenderedHeight((current) => (current === manualHeight ? current : manualHeight))
         if (manualHeight === oneLineHeight && el.scrollHeight <= manualHeight + 1) {
-          setHeight(null)
+          updateHeight(null)
         } else if (manualHeight !== height) {
-          setHeight(manualHeight)
+          updateHeight(manualHeight)
         }
         return
       }
@@ -400,7 +411,15 @@ export function Composer({
     const fixedHeight = height ?? COMPOSER_DEFAULT_HEIGHT
     setComposerTextareaHeight(el, fixedHeight)
     setRenderedHeight((current) => (current === fixedHeight ? current : Math.ceil(fixedHeight)))
-  }, [autoSize, autoSizeMeasurementKey, profile.autoGrowMax, profile.autoMinHeight, height, text])
+  }, [
+    autoSize,
+    autoSizeMeasurementKey,
+    profile.autoGrowMax,
+    profile.autoMinHeight,
+    height,
+    text,
+    updateHeight,
+  ])
   const trimmed = text.trim()
   const attachments = useAttachmentDrafts()
   const {
@@ -414,7 +433,7 @@ export function Composer({
     ingestFiles,
     dismissUpload,
     clear: clearAttachments,
-    restore: restoreAttachments,
+    consume: consumeAttachments,
   } = attachments
   useEffect(() => {
     if (!droppedFiles) return
@@ -440,8 +459,7 @@ export function Composer({
   useEffect(() => {
     if (!draftScopeStable) return
     publishComposerContextDraft(draftKey, {
-      text: deferredText.trim(),
-      prefillText: prefillScopeStable ? deferredPrefillText : '',
+      prefillText: prefillScopeStable && prefillOpen ? prefillText.trim() : '',
       attachmentRefs:
         attachmentScopeStable && !attachmentsDisabled ? attachmentRefs : EMPTY_ATTACHMENT_REFS,
     })
@@ -449,33 +467,50 @@ export function Composer({
     attachmentRefs,
     attachmentScopeStable,
     attachmentsDisabled,
-    deferredPrefillText,
-    deferredText,
     draftKey,
     draftScopeStable,
+    prefillOpen,
+    prefillText,
     prefillScopeStable,
   ])
   const uploadingAttachments = uploads.some((upload) => upload.state === 'uploading')
-  const sendBlocked =
-    Boolean(sendBlockedReason) ||
-    Boolean(disabled) ||
-    streaming ||
-    submitting ||
-    uploadingAttachments
-  const attachmentControlsDisabled = Boolean(disabled) || attachmentsDisabled
   const hasAttachments = !attachmentsDisabled && attachmentRefs.length > 0
   const emptyWithTrailingUser =
     trimmed.length === 0 &&
     !hasAttachments &&
     Boolean(trailingUserMessage) &&
     Boolean(onReplyToTrailingUser)
+  const activeGenerationCapability = emptyWithTrailingUser
+    ? replyGenerationCapability
+    : generationCapability
+  const sendBlockedReason = generationUnavailableReason(
+    activeGenerationCapability,
+    emptyWithTrailingUser ? 'reply' : 'send',
+  )
+  const sendBlocked =
+    Boolean(sendBlockedReason) ||
+    activeGenerationCapability.state === 'failed' ||
+    Boolean(disabled) ||
+    presentationOnly ||
+    stopCapability !== undefined ||
+    submitting ||
+    uploadingAttachments
+  const attachmentControlsDisabled = Boolean(disabled) || attachmentsDisabled
   const send = useCallback(async () => {
     if (sendBlocked) return
     if (text.trim().length === 0 && !hasAttachments) {
       if (emptyWithTrailingUser && onReplyToTrailingUser) {
+        let submission: ComposerSubmission
+        try {
+          submission = onReplyToTrailingUser()
+        } catch (err) {
+          if (!isPageHidingAbortError(err)) console.error('composer reply admission failed', err)
+          return
+        }
+        if (submission.kind === 'not-started') return
         setSubmitting(true)
         try {
-          await onReplyToTrailingUser()
+          await submission.completion
         } catch (err) {
           if (isPageHidingAbortError(err)) return
           console.error('composer reply failed', err)
@@ -485,31 +520,35 @@ export function Composer({
       }
       return
     }
-    const out = text.trim()
+    const submittedDraft = text
+    const out = submittedDraft.trim()
     const refsOut = attachmentsDisabled ? [] : attachmentRefs
-    const rowsOut = new Map(attachmentRows)
-    // Capture and clear the prefill text in the same render so a fast
-    // double-tap doesn't send the same prefill twice. Empty / whitespace-
-    // only prefill is treated as no prefill (the wire transform would trim
-    // trailing whitespace anyway, so an empty prefill turn would be a
-    // no-op-then-confuse-the-model).
+    // Empty / whitespace-only prefill is treated as no prefill (the wire
+    // transform would trim trailing whitespace anyway, so an empty prefill
+    // turn would be a no-op-then-confuse-the-model).
     const prefillOut = prefillOpen && prefillText.trim().length > 0 ? prefillText : ''
-    setComposerText('')
-    if (!attachmentsDisabled) clearAttachments()
-    if (prefillOut.length > 0) {
-      setPrefillText(defaultPrefill ?? '')
-    }
-    setSubmitting(true)
+    let submission: ComposerSubmission
     try {
-      await onSubmit(out, {
+      submission = onSubmit(out, {
         ...(prefillOut.length > 0 ? { prefillText: prefillOut } : {}),
         ...(refsOut.length > 0 ? { attachmentRefs: refsOut } : {}),
       })
     } catch (err) {
+      if (!isPageHidingAbortError(err)) console.error('composer admission failed', err)
+      return
+    }
+    if (submission.kind === 'not-started') return
+    setSubmitting(true)
+    try {
+      const outcome = await submission.completion
+      if (outcome.kind !== 'prepared') return
+      setComposerText((current) => (current === submittedDraft ? '' : current))
+      if (!attachmentsDisabled && refsOut.length > 0) consumeAttachments(refsOut)
+      if (prefillOut.length > 0) {
+        setPrefillText((current) => (current === prefillOut ? (defaultPrefill ?? '') : current))
+      }
+    } catch (err) {
       if (isPageHidingAbortError(err)) return
-      setComposerText((current) => (current.length === 0 ? out : current))
-      if (refsOut.length > 0) restoreAttachments(refsOut, rowsOut)
-      if (prefillOut.length > 0) setPrefillText(prefillOut)
       console.error('composer submit failed', err)
     } finally {
       setSubmitting(false)
@@ -524,11 +563,9 @@ export function Composer({
     prefillText,
     defaultPrefill,
     attachmentRefs,
-    attachmentRows,
     hasAttachments,
     attachmentsDisabled,
-    clearAttachments,
-    restoreAttachments,
+    consumeAttachments,
     setComposerText,
   ])
   const sendButtonLabel = emptyWithTrailingUser
@@ -553,23 +590,31 @@ export function Composer({
     },
     [autoSize, renderedHeight],
   )
-  const handlePointerMove = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
-    const drag = dragStateRef.current
-    if (!drag) return
-    const delta = drag.startY - e.clientY
-    const next = drag.startHeight + delta
-    setHeight(clampComposerHeight(next, drag.minHeight))
-  }, [])
-  const handlePointerUp = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
-    if (!dragStateRef.current) return
-    e.currentTarget.releasePointerCapture(e.pointerId)
-    dragStateRef.current = null
-  }, [])
+  const handlePointerMove = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      const drag = dragStateRef.current
+      if (!drag) return
+      const delta = drag.startY - e.clientY
+      const next = drag.startHeight + delta
+      updateHeight(clampComposerHeight(next, drag.minHeight))
+    },
+    [updateHeight],
+  )
+  const handlePointerUp = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      if (!dragStateRef.current) return
+      e.currentTarget.releasePointerCapture(e.pointerId)
+      dragStateRef.current = null
+      commitHeight()
+    },
+    [commitHeight],
+  )
   const handleResizeKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLHRElement>) => {
       if (autoSize && e.key === 'Enter') {
         e.preventDefault()
-        setHeight(null)
+        updateHeight(null)
+        commitHeight(null)
         return
       }
       if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return
@@ -579,15 +624,19 @@ export function Composer({
       const textarea = textareaRef.current
       const minHeight = autoSize && textarea ? oneLineTextareaHeight(textarea) : COMPOSER_MIN_HEIGHT
       const start = textarea?.getBoundingClientRect().height ?? renderedHeight
-      setHeight(clampComposerHeight(start + delta, minHeight))
+      const next = clampComposerHeight(start + delta, minHeight)
+      updateHeight(next)
+      commitHeight(next)
     },
-    [autoSize, renderedHeight],
+    [autoSize, commitHeight, renderedHeight, updateHeight],
   )
 
   return (
     <form
       data-ui="composer"
       data-autosize={autoSize ? 'true' : 'false'}
+      data-presentation-only={presentationOnly || undefined}
+      inert={presentationOnly || undefined}
       onSubmit={(e) => {
         e.preventDefault()
         void send()
@@ -612,7 +661,9 @@ export function Composer({
         onPointerUp={handlePointerUp}
         onPointerCancel={handlePointerUp}
         onDoubleClick={() => {
-          if (autoSize) setHeight(null)
+          if (!autoSize) return
+          updateHeight(null)
+          commitHeight(null)
         }}
         onKeyDown={handleResizeKeyDown}
       />
@@ -758,18 +809,31 @@ export function Composer({
               <span>Import</span>
             </Button>
           ) : null}
-          {streaming && onAbort ? (
+          {stopCapability ? (
             <Button
               data-ui="abort"
               tone="danger"
               appearance="solid"
               geometry="flush"
-              onClick={onAbort}
-              title="Stop generating (⌘.)"
-              aria-label="Stop generating"
+              onClick={() => {
+                if (stopCapability.kind === 'requestable') onRequestStop?.(stopCapability)
+              }}
+              title={
+                stopCapability.kind === 'requestable' ? 'Stop generating (⌘.)' : 'Stop requested'
+              }
+              aria-label={
+                stopCapability.kind === 'requestable' ? 'Stop generating' : 'Stop requested'
+              }
+              disabled={stopCapability.kind !== 'requestable' || !onRequestStop}
             >
               <StopIcon size={14} />
-              <span>Stop</span>
+              <span>
+                {stopCapability.kind === 'requestable'
+                  ? 'Stop'
+                  : stopCapability.kind === 'requesting'
+                    ? 'Stop requested…'
+                    : 'Stopping…'}
+              </span>
             </Button>
           ) : (
             <Button
@@ -802,11 +866,11 @@ export function Composer({
       ) : null}
       {pickerOpen ? (
         <AttachmentPicker
+          sessionSurface="picker-composer"
           title="Use stored attachment"
           onClose={() => setPickerOpen(false)}
           onPick={(attachment) => {
             addAttachment(attachment)
-            setPickerOpen(false)
           }}
         />
       ) : null}

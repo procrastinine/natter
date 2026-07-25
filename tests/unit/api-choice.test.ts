@@ -1,12 +1,14 @@
 import { describe, expect, it } from 'vitest'
 import {
-  chooseApi,
+  chooseApi as chooseApiFromFacts,
   isGeminiNative,
   isResponsesCapable,
   type RouterCapabilities,
   responsesExplanationFor,
+  responsesReasoningContractFor,
 } from '../../src/core/api-choice'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
+import { contextRouteFactsFromMessages, reasoningPolicyForSettings } from '../../src/core/reasoning'
 import type {
   ApiVariant,
   ConnectionKind,
@@ -14,7 +16,9 @@ import type {
   Message,
   ReasoningDetail,
   ReasoningFormat,
+  ReasoningOriginDialect,
 } from '../../src/core/types'
+import { reasoningEnvelopeFromDetailsForTest } from '../helpers/reasoning-events'
 
 function makeProfile(overrides: Partial<ConnectionProfile> = {}): ConnectionProfile {
   return {
@@ -55,11 +59,37 @@ function makeCapsWithOutput(outputModalities: readonly string[]): RouterCapabili
   return { quirks: {}, outputModalities: new Set(outputModalities) }
 }
 
-function assistantWithEncrypted(id: string, format: ReasoningFormat | undefined): Message {
+function chooseApi(
+  profile: Parameters<typeof chooseApiFromFacts>[0],
+  settings: Parameters<typeof chooseApiFromFacts>[1],
+  messages: readonly Message[],
+  caps: Parameters<typeof chooseApiFromFacts>[3],
+) {
+  const policy = reasoningPolicyForSettings(settings, {
+    ...(caps.quirks.acceptsAnthropicRedactedThinking !== undefined
+      ? {
+          acceptsAnthropicRedactedThinking: caps.quirks.acceptsAnthropicRedactedThinking,
+        }
+      : {}),
+  })
+  return chooseApiFromFacts(
+    profile,
+    settings,
+    contextRouteFactsFromMessages(messages),
+    caps,
+    policy,
+    responsesReasoningContractFor(profile, caps, policy),
+  )
+}
+
+function assistantWithEncrypted(
+  id: string,
+  format: ReasoningFormat,
+  detailId = 'r_e',
+  dialect: ReasoningOriginDialect = 'openrouter-responses',
+): Message {
   const details: ReasoningDetail[] = [
-    format === undefined
-      ? { type: 'reasoning.encrypted', id: 'r_e', data: 'blob' }
-      : { type: 'reasoning.encrypted', id: 'r_e', data: 'blob', format },
+    { type: 'reasoning.encrypted', id: detailId, data: 'blob', format },
   ]
   return {
     id,
@@ -72,7 +102,7 @@ function assistantWithEncrypted(id: string, format: ReasoningFormat | undefined)
     role: 'assistant',
     origin: 'generated',
     content: [{ type: 'text', text: '' }],
-    reasoningDetails: details,
+    reasoningEnvelope: reasoningEnvelopeFromDetailsForTest(details, dialect),
     nodeVersion: 0,
     deleted: false,
   }
@@ -90,7 +120,17 @@ function assistantWithResponsesItem(itemType: string): Message {
     role: 'assistant',
     origin: 'generated',
     content: [{ type: 'text', text: '' }],
-    responsesEchoItem: { type: itemType },
+    ...(itemType === 'message' || itemType === 'reasoning'
+      ? {}
+      : {
+          providerOutputItems: [
+            {
+              dialect: 'openai-responses' as const,
+              type: itemType,
+              item: { type: itemType },
+            },
+          ],
+        }),
     nodeVersion: 0,
     deleted: false,
   }
@@ -199,8 +239,7 @@ describe('chooseApi matrix', () => {
     })
 
     it('ordinary message / reasoning items do NOT trigger the upgrade', () => {
-      // Non-OpenAI model to isolate step 5 from step 10 (OR default-to-Responses
-      // for OpenAI-family models).
+      // Non-OpenAI model keeps this case isolated from model route requirements.
       const r = chooseApi(
         makeProfile(),
         makeSettings('auto', true, 'anthropic/claude-haiku-4.5'),
@@ -271,9 +310,7 @@ describe('chooseApi matrix', () => {
     })
 
     it('does not upgrade from a tool-prefixed encrypted row', () => {
-      const assistant = assistantWithEncrypted('a1', 'openai-responses-v1')
-      const detail = assistant.reasoningDetails?.[0]
-      if (detail) detail.id = 'tool_call-1'
+      const assistant = assistantWithEncrypted('a1', 'openai-responses-v1', 'tool_call-1')
       const r = chooseApi(
         makeProfile(),
         makeSettings('auto', true, 'anthropic/claude-haiku-4.5'),
@@ -284,8 +321,6 @@ describe('chooseApi matrix', () => {
     })
 
     it('does NOT upgrade when include.encrypted is false (non-OpenAI model to isolate step 6)', () => {
-      // On OpenAI models, step 10 (OR → Responses for OpenAI family) would
-      // upgrade regardless; use anthropic to isolate step 6 behavior.
       const r = chooseApi(
         makeProfile(),
         makeSettings('auto', false, 'anthropic/claude-haiku-4.5'),
@@ -299,7 +334,7 @@ describe('chooseApi matrix', () => {
       const r = chooseApi(
         makeProfile(),
         makeSettings('auto', true, 'anthropic/claude-haiku-4.5'),
-        [assistantWithEncrypted('a1', 'anthropic-claude-v1')],
+        [assistantWithEncrypted('a1', 'anthropic-claude-v1', 'r_e', 'openrouter-chat')],
         makeCaps({ reasoningPreservationFormat: 'anthropic-claude-v1' }),
       )
       expect(r.kind).toBe('chat-completions')
@@ -375,12 +410,16 @@ describe('chooseApi matrix', () => {
     })
   })
 
-  describe('step 10 — OR default-to-Responses for OpenAI-family', () => {
-    it('OpenRouter + OpenAI-family model with no other hints → responses', () => {
-      // gpt-5.4-nano on OR hits step 10 (responsesSupport==='both' AND OR).
-      const r = chooseApi(makeProfile({ kind: 'openrouter' }), makeSettings('auto'), [], makeCaps())
-      expect(r.kind).toBe('responses')
-      expect(r.reason).toMatch(/OpenRouter/i)
+  describe('step 10 — OpenRouter connection default', () => {
+    it('OpenRouter + Responses-capable model with no route requirement → chat-completions', () => {
+      const r = chooseApi(
+        makeProfile({ kind: 'openrouter' }),
+        makeSettings('auto', true, 'openai/gpt-4o'),
+        [],
+        makeCaps(),
+      )
+      expect(r.kind).toBe('chat-completions')
+      expect(r.reason).toMatch(/default/i)
     })
 
     it('OpenRouter + non-OpenAI-family model → chat-completions', () => {

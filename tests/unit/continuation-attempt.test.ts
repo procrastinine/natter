@@ -3,13 +3,15 @@ import { ApiError } from '../../src/api/errors'
 import { buildContinuationAttempt } from '../../src/core/continuation-attempt'
 import {
   appendContinuationText,
-  hasAppliedSuccessfulContinuation,
+  createAppliedMessageView,
 } from '../../src/core/continuation-content'
 import {
   applyStreamAccumulatorEvent,
   createStreamAccumulator,
+  projectStreamAccumulatorFinal,
 } from '../../src/core/stream-accumulator'
 import type { ContentItem, ContinuationAttempt } from '../../src/core/types'
+import { reasoningEnvelopeFromDetailsForTest } from '../helpers/reasoning-events'
 
 describe('appendContinuationText', () => {
   it('extends only a final unannotated output block without mutating the source', () => {
@@ -22,6 +24,39 @@ describe('appendContinuationText', () => {
     expect(appended[0]).not.toBe(original[0])
   })
 
+  it('rebases continuation annotations onto a merged final output block', () => {
+    const original: ContentItem[] = [{ type: 'output_text', text: 'partial' }]
+    const annotations = [
+      {
+        type: 'url_citation' as const,
+        url: 'https://example.invalid/source',
+        startIndex: 1,
+        endIndex: 5,
+        source: 'openai-chat' as const,
+        providerPayload: {
+          type: 'url_citation',
+          url: 'https://example.invalid/source',
+          start_index: 1,
+          end_index: 5,
+        },
+      },
+    ]
+
+    const appended = appendContinuationText(original, ' tail', annotations)
+
+    expect(appended).toEqual([
+      {
+        type: 'output_text',
+        text: 'partial tail',
+        annotations: [{ ...annotations[0], startIndex: 8, endIndex: 12 }],
+      },
+    ])
+    const output = appended[0]
+    if (output?.type !== 'output_text') throw new Error('expected output text fixture')
+    expect(output.annotations).not.toBe(annotations)
+    expect(output.annotations?.[0]).not.toBe(annotations[0])
+  })
+
   it('preserves annotated and interleaved items in order and deep-clones them', () => {
     const original: ContentItem[] = [
       {
@@ -31,7 +66,15 @@ describe('appendContinuationText', () => {
           {
             type: 'url_citation',
             url: 'https://example.invalid/source',
-            range: { start: 0, end: 5 },
+            startIndex: 0,
+            endIndex: 5,
+            source: 'imported',
+            providerPayload: {
+              type: 'url_citation',
+              url: 'https://example.invalid/source',
+              start_index: 0,
+              end_index: 5,
+            },
           },
         ],
       },
@@ -41,7 +84,17 @@ describe('appendContinuationText', () => {
       {
         type: 'output_text',
         text: 'final citation',
-        annotations: [{ type: 'file_citation', filename: 'evidence.txt' }],
+        annotations: [
+          {
+            type: 'file_citation',
+            filename: 'evidence.txt',
+            file: { kind: 'unresolved', provider: 'imported' },
+            startIndex: 14,
+            endIndex: 14,
+            source: 'imported',
+            providerPayload: { type: 'file_citation', filename: 'evidence.txt' },
+          },
+        ],
       },
     ]
 
@@ -60,30 +113,72 @@ describe('appendContinuationText', () => {
     expect(first.annotations).not.toBe(originalFirst.annotations)
     expect(first.annotations?.[0]).not.toBe(originalFirst.annotations?.[0])
   })
+
+  it('keeps continuation annotations relative to a new exact output block', () => {
+    const original: ContentItem[] = [
+      {
+        type: 'output_text',
+        text: 'cited',
+        annotations: [
+          {
+            type: 'url_citation',
+            url: 'https://example.invalid/original',
+            startIndex: 0,
+            endIndex: 5,
+            source: 'openai-chat',
+            providerPayload: { type: 'url_citation', url: 'https://example.invalid/original' },
+          },
+        ],
+      },
+    ]
+    const continuationAnnotation = {
+      type: 'url_citation' as const,
+      url: 'https://example.invalid/continued',
+      startIndex: 1,
+      endIndex: 10,
+      source: 'openai-chat' as const,
+      providerPayload: { type: 'url_citation', url: 'https://example.invalid/continued' },
+    }
+
+    expect(appendContinuationText(original, ' continued', [continuationAnnotation])).toEqual([
+      ...original,
+      {
+        type: 'output_text',
+        text: ' continued',
+        annotations: [continuationAnnotation],
+      },
+    ])
+  })
 })
 
-describe('hasAppliedSuccessfulContinuation', () => {
-  const attempt = (overrides: Partial<ContinuationAttempt> = {}): ContinuationAttempt => ({
-    streamId: 'stream',
-    strategy: 'prompt' as const,
-    status: 'done' as const,
-    startedAt: 1,
-    finishedAt: 2,
-    ...overrides,
-  })
+describe('applied continuation selection', () => {
+  const attempt = (applied: boolean): ContinuationAttempt => {
+    const draft = {
+      streamId: 'stream',
+      strategy: 'prompt' as const,
+      status: 'done' as const,
+      startedAt: 1,
+      finishedAt: 2,
+      reasoningCarryForward: 'unknown' as const,
+      reasoningVisibility: { disclosure: 'unknown' as const },
+    }
+    return applied
+      ? { ...draft, application: { kind: 'applied' } }
+      : {
+          ...draft,
+          application: { kind: 'unapplied', reason: 'base-version-changed' },
+        }
+  }
 
-  it('suppresses an original failure only after an applied successful continuation', () => {
-    expect(hasAppliedSuccessfulContinuation({ continuationAttempts: [attempt()] })).toBe(true)
+  it('advances the applied view only for an explicitly applied attempt', () => {
+    const applied = attempt(true)
+    const unapplied = attempt(false)
     expect(
-      hasAppliedSuccessfulContinuation({
-        continuationAttempts: [attempt({ unappliedText: 'unapplied' })],
-      }),
-    ).toBe(false)
+      createAppliedMessageView({ content: [], continuationAttempts: [applied] }).latestAttempt,
+    ).toMatchObject({ kind: 'continuation', metadata: applied })
     expect(
-      hasAppliedSuccessfulContinuation({
-        continuationAttempts: [attempt({ status: 'interrupted' })],
-      }),
-    ).toBe(false)
+      createAppliedMessageView({ content: [], continuationAttempts: [unapplied] }).latestAttempt,
+    ).toMatchObject({ kind: 'generation' })
   })
 })
 
@@ -103,11 +198,22 @@ describe('buildContinuationAttempt', () => {
       cost: 0.003,
     }
     accumulator.finishReason = 'stop'
-    accumulator.reasoningList.push({
-      type: 'reasoning.summary',
-      id: 'reasoning-1',
-      summary: 'continued reasoning',
-    })
+    const reasoningEnvelope = reasoningEnvelopeFromDetailsForTest(
+      [
+        {
+          type: 'reasoning.summary',
+          format: 'openai-responses-v1',
+          id: 'reasoning-1',
+          summary: 'continued reasoning',
+        },
+      ],
+      'openai-responses',
+    )
+    applyStreamAccumulatorEvent(
+      accumulator,
+      { lane: 'reasoning', mutations: [{ kind: 'replace', envelope: reasoningEnvelope }] },
+      13,
+    )
     accumulator.phase = 'final_answer'
     accumulator.providerOutputItems.push({
       dialect: 'openai-responses',
@@ -144,10 +250,11 @@ describe('buildContinuationAttempt', () => {
       apiUsed: 'responses',
       startedAt: 10,
       finishedAt: 14,
+      reasoningCarryForward: 'carrier',
+      reasoningVisibility: { disclosure: 'visible', visibleKind: 'summary' },
       accumulator,
       abortReason: 'network',
       error,
-      unappliedText: 'recovered tail',
     })
 
     expect(attempt).toEqual({
@@ -183,14 +290,9 @@ describe('buildContinuationAttempt', () => {
         midStream: true,
       },
       abortReason: 'network',
-      unappliedText: 'recovered tail',
-      reasoningDetails: [
-        {
-          type: 'reasoning.summary',
-          id: 'reasoning-1',
-          summary: 'continued reasoning',
-        },
-      ],
+      reasoningCarryForward: 'carrier',
+      reasoningVisibility: { disclosure: 'visible', visibleKind: 'summary' },
+      reasoningEnvelope,
       toolCalls: [
         {
           id: 'continuation-call',
@@ -209,7 +311,9 @@ describe('buildContinuationAttempt', () => {
       ],
     })
     expect(attempt.usage).not.toBe(accumulator.usage)
-    expect(attempt.reasoningDetails).not.toBe(accumulator.reasoningList)
+    expect(attempt.reasoningEnvelope).not.toBe(reasoningEnvelope)
+    const attemptVisible = attempt.reasoningEnvelope?.visible[0] as { text: string } | undefined
+    if (attemptVisible) attemptVisible.text = 'changed after projection'
     expect(attempt.providerOutputItems).not.toBe(accumulator.providerOutputItems)
     expect(accumulator).toMatchObject({
       generationId: 'generation-1',
@@ -218,7 +322,7 @@ describe('buildContinuationAttempt', () => {
       finishReason: 'stop',
       phase: 'final_answer',
     })
-    expect(accumulator.reasoningList).toHaveLength(1)
+    expect(projectStreamAccumulatorFinal(accumulator).reasoningEnvelope).toEqual(reasoningEnvelope)
     expect(accumulator.providerOutputItems).toHaveLength(1)
   })
 
@@ -234,6 +338,12 @@ describe('buildContinuationAttempt', () => {
         apiUsed: 'chat',
         startedAt: 1,
         finishedAt: 2,
+        reasoningCarryForward: 'none',
+        reasoningVisibility: {
+          disclosure: 'absent',
+          unexpectedVisibleKind: 'text',
+          reason: 'disabled',
+        },
         accumulator,
       }),
     ).toMatchObject({
@@ -261,6 +371,8 @@ describe('buildContinuationAttempt', () => {
       status: 'error',
       startedAt: 1,
       finishedAt: 3,
+      reasoningCarryForward: 'unknown',
+      reasoningVisibility: { disclosure: 'unknown' },
       accumulator,
     })
 

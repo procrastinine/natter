@@ -17,18 +17,21 @@
 // clears provider order/ignore overrides while restoring the default Price sort.
 
 import { useCallback, useMemo, useState } from 'react'
+import {
+  configurationWriteInteraction,
+  configurationWriteTarget,
+} from '../../app/presentation-interactions'
 import { DEFAULT_OPENROUTER_PROVIDER_SORT } from '../../core/provider-defaults'
 import {
-  endpointMatchesProviderRef,
-  providerDisplayLabel,
+  ProviderEndpointIndex,
   providerDisplayName,
   providerEndpointKey,
   providerRoutingRef,
-  resolveProviderRefsToRoutingRefs,
 } from '../../core/provider-identity'
 import type { Chat, ModelEndpoint, ProviderPreferences, SortBy } from '../../core/types'
-import type { UsePrivacyRoutingResult } from '../../hooks/usePrivacyRouting'
-import { updateChatSettings } from '../../store/chats'
+import type { UsePrivacyRoutingResult } from '../../hooks/useModelCatalog'
+import { usePresentationInteraction } from '../../hooks/usePresentationInteraction'
+import { configurationApplication } from '../../store/configuration-application'
 import { LockIcon } from '../icons/Icon'
 import { Button, IconButton } from '../primitives/Button'
 import { InfoDisclosure } from './InfoDisclosure'
@@ -39,6 +42,7 @@ import {
   isLowQuantization,
   isUnknownQuantization,
   type PickerRow,
+  pickerRowIsHardDenied,
   reasonsToTooltip,
   tierToLockLabel,
 } from './provider-picker-rows'
@@ -70,9 +74,15 @@ export function ProviderPicker({
   routing,
   neededTokens: neededTokensRaw,
 }: ProviderPickerProps) {
-  const { endpoints, filter, loading, isFreeModel, scrapeApplicable, liveScrapeEnabled, refresh } =
-    routing
-  const prefs = chat.settings.providerPrefs ?? {}
+  const { run: runConfigurationWrite } = usePresentationInteraction(configurationWriteInteraction, {
+    observePending: false,
+  })
+  const providerRoutingTarget = configurationWriteTarget(chat.id, 'provider-routing')
+  const { loading, liveScrapeEnabled, privacyPresentation, refresh } = routing
+  const { endpoints, filter, isFreeModel, scrapeApplicable, retained, settings } =
+    privacyPresentation
+  const presentationSettings = settings ?? chat.settings
+  const prefs = presentationSettings.providerPrefs ?? {}
   const storedSort = persistedProviderSort(prefs.sort)
   const currentSort: SortBy =
     typeof storedSort === 'string'
@@ -80,20 +90,32 @@ export function ProviderPicker({
       : typeof storedSort === 'object' && storedSort !== null
         ? storedSort.by
         : DEFAULT_OPENROUTER_PROVIDER_SORT
-  const manualOrdered = useMemo(() => orderEndpoints(endpoints, prefs), [endpoints, prefs])
+  const endpointIndex = useMemo(() => new ProviderEndpointIndex(endpoints), [endpoints])
+  const manualOrdered = useMemo(
+    () => endpointIndex.orderByRefs(prefs.order),
+    [endpointIndex, prefs.order],
+  )
   const displayOrdered = useMemo(
     () => sortEndpointsByMetric(manualOrdered, currentSort),
     [manualOrdered, currentSort],
   )
   const rows = useMemo(
     () =>
-      loading && scrapeApplicable && !filter
+      loading && !retained && scrapeApplicable && !filter
         ? []
         : buildPickerRows(displayOrdered, filter, {
             providerPrefs: prefs,
-            privacy: chat.settings.privacy,
+            privacy: presentationSettings.privacy,
           }),
-    [displayOrdered, filter, prefs, chat.settings.privacy, loading, scrapeApplicable],
+    [
+      displayOrdered,
+      filter,
+      prefs,
+      presentationSettings.privacy,
+      loading,
+      retained,
+      scrapeApplicable,
+    ],
   )
   // Provider filtering ignores unsent draft text; the live composer only
   // tracks characters, while the full token estimate is recomputed on send.
@@ -101,18 +123,29 @@ export function ProviderPicker({
 
   const updatePrefs = useCallback(
     (patch: Partial<ProviderPreferences>) => {
-      const next: ProviderPreferences = { ...(chat.settings.providerPrefs ?? {}), ...patch }
-      if (patch.ignore !== undefined) delete next.only
-      void updateChatSettings(chat.id, { providerPrefs: next })
+      runConfigurationWrite({
+        target: providerRoutingTarget,
+        action: () =>
+          configurationApplication.patchChatSettingsFields(chat.id, [
+            ...Object.entries(patch).map(([key, value]) => ({
+              path: ['providerPrefs', key] as const,
+              value,
+            })),
+            ...(patch.ignore === undefined
+              ? []
+              : [{ path: ['providerPrefs', 'only'] as const, value: undefined }]),
+          ]),
+      })
     },
-    [chat.id, chat.settings.providerPrefs],
+    [chat.id, providerRoutingTarget, runConfigurationWrite],
   )
 
   const toggleProvider = useCallback(
     (providerRef: string, enabled: boolean) => {
       // Unified allowed/disallowed model:
       //   - `prefs.ignoreOverridesFilter=true` means "user touched the
-      //     picker; trust their `ignore` list verbatim."
+      //     picker; trust their `ignore` list for reversible exclusions."
+      //   - Training denial remains visible and cannot be toggled.
       //   - When false/undefined, the wire falls back to the filter's
       //     auto-exclusion.
       // On first click `ignore` is seeded from the filter's current
@@ -121,27 +154,35 @@ export function ProviderPicker({
       // still pins the chat into user-authoritative mode.
       const alreadyTouched = prefs.ignoreOverridesFilter === true
       const base = alreadyTouched
-        ? new Set(
-            resolveProviderRefsToRoutingRefs(endpoints, prefs.ignore, { preserveUnknown: true }),
-          )
+        ? new Set(endpointIndex.resolveRoutingRefs(prefs.ignore, { preserveUnknown: true }))
         : new Set((filter?.excluded ?? []).map((e) => providerRoutingRef(e.endpoint)))
       if (enabled) base.delete(providerRef)
       else base.add(providerRef)
-      const nextPrefs: ProviderPreferences = {
-        ...(chat.settings.providerPrefs ?? {}),
-        ignore: [...base],
-        ignoreOverridesFilter: true,
-      }
-      delete nextPrefs.only
-      void updateChatSettings(chat.id, { providerPrefs: nextPrefs })
+      runConfigurationWrite({
+        target: providerRoutingTarget,
+        action: () =>
+          configurationApplication.patchChatSettingsFields(chat.id, [
+            ...(alreadyTouched
+              ? [
+                  {
+                    path: ['providerPrefs', 'ignore'] as const,
+                    membership: { member: providerRef, present: !enabled },
+                  },
+                ]
+              : [{ path: ['providerPrefs', 'ignore'] as const, value: [...base] }]),
+            { path: ['providerPrefs', 'ignoreOverridesFilter'], value: true },
+            { path: ['providerPrefs', 'only'], value: undefined },
+          ]),
+      })
     },
     [
       chat.id,
-      chat.settings.providerPrefs,
-      endpoints,
+      endpointIndex,
       prefs.ignore,
       prefs.ignoreOverridesFilter,
       filter,
+      providerRoutingTarget,
+      runConfigurationWrite,
     ],
   )
 
@@ -149,7 +190,7 @@ export function ProviderPicker({
     (providerRef: string, delta: 1 | -1) => {
       const current =
         prefs.order && prefs.order.length > 0
-          ? resolveProviderRefsToRoutingRefs(endpoints, prefs.order, { preserveUnknown: true })
+          ? endpointIndex.resolveRoutingRefs(prefs.order, { preserveUnknown: true })
           : manualOrdered.map((e) => providerRoutingRef(e))
       const idx = current.indexOf(providerRef)
       if (idx < 0) current.push(providerRef)
@@ -160,16 +201,20 @@ export function ProviderPicker({
       current.splice(to, 0, providerRef)
       updatePrefs({ order: current })
     },
-    [endpoints, manualOrdered, prefs.order, updatePrefs],
+    [endpointIndex, manualOrdered, prefs.order, updatePrefs],
   )
 
   const setSort = useCallback(
     (sort: SortBy) => {
-      const next: ProviderPreferences = { ...(chat.settings.providerPrefs ?? {}) }
-      next.sort = sort
-      void updateChatSettings(chat.id, { providerPrefs: next })
+      runConfigurationWrite({
+        target: providerRoutingTarget,
+        action: () =>
+          configurationApplication.patchChatSettingsFields(chat.id, [
+            { path: ['providerPrefs', 'sort'], value: sort },
+          ]),
+      })
     },
-    [chat.id, chat.settings.providerPrefs],
+    [chat.id, providerRoutingTarget, runConfigurationWrite],
   )
 
   const resetPrefs = useCallback(() => {
@@ -178,23 +223,43 @@ export function ProviderPicker({
     // strict mode, and non-default sort.
     // After reset the picker falls back to Price + the filter's default — kept providers checked,
     // auto-excluded providers unchecked.
-    void updateChatSettings(chat.id, {
-      strictProviderRouting: undefined,
-      providerPrefs: { sort: DEFAULT_OPENROUTER_PROVIDER_SORT },
+    runConfigurationWrite({
+      target: providerRoutingTarget,
+      action: () =>
+        configurationApplication.patchChatSettingsFields(chat.id, [
+          { path: ['strictProviderRouting'], value: undefined },
+          { path: ['providerPrefs', 'order'], value: undefined },
+          { path: ['providerPrefs', 'ignore'], value: undefined },
+          { path: ['providerPrefs', 'only'], value: undefined },
+          { path: ['providerPrefs', 'quantizations'], value: undefined },
+          { path: ['providerPrefs', 'ignoreOverridesFilter'], value: undefined },
+          { path: ['providerPrefs', 'requireParameters'], value: undefined },
+          { path: ['providerPrefs', 'sort'], value: DEFAULT_OPENROUTER_PROVIDER_SORT },
+        ]),
     })
-  }, [chat.id])
+  }, [chat.id, providerRoutingTarget, runConfigurationWrite])
 
   const setAllProviders = useCallback(
     (enabled: boolean) => {
-      const nextPrefs: ProviderPreferences = {
-        ...(chat.settings.providerPrefs ?? {}),
-        ignore: enabled ? [] : displayOrdered.map((endpoint) => providerRoutingRef(endpoint)),
-        ignoreOverridesFilter: true,
-      }
-      delete nextPrefs.only
-      void updateChatSettings(chat.id, { providerPrefs: nextPrefs })
+      const mandatoryIgnore = rows
+        .filter(pickerRowIsHardDenied)
+        .map((row) => providerRoutingRef(row.endpoint))
+      runConfigurationWrite({
+        target: providerRoutingTarget,
+        action: () =>
+          configurationApplication.patchChatSettingsFields(chat.id, [
+            {
+              path: ['providerPrefs', 'ignore'],
+              value: enabled
+                ? mandatoryIgnore
+                : displayOrdered.map((endpoint) => providerRoutingRef(endpoint)),
+            },
+            { path: ['providerPrefs', 'ignoreOverridesFilter'], value: true },
+            { path: ['providerPrefs', 'only'], value: undefined },
+          ]),
+      })
     },
-    [chat.id, chat.settings.providerPrefs, displayOrdered],
+    [chat.id, displayOrdered, providerRoutingTarget, rows, runConfigurationWrite],
   )
   const selectedLowQuantizationCount = useMemo(
     () =>
@@ -210,29 +275,41 @@ export function ProviderPicker({
   )
   const deselectProvidersWhere = useCallback(
     (shouldDeselect: (endpoint: ModelEndpoint) => boolean) => {
-      const nextPrefs: ProviderPreferences = {
-        ...(chat.settings.providerPrefs ?? {}),
-        ignore: ignoredProviderRefsAfterBulkDeselect(
-          rows,
-          endpoints,
-          chat.settings.providerPrefs,
-          shouldDeselect,
-        ),
-        ignoreOverridesFilter: true,
-      }
-      delete nextPrefs.only
-      void updateChatSettings(chat.id, { providerPrefs: nextPrefs })
+      runConfigurationWrite({
+        target: providerRoutingTarget,
+        action: () =>
+          configurationApplication.patchChatSettingsFields(chat.id, [
+            {
+              path: ['providerPrefs', 'ignore'],
+              value: ignoredProviderRefsAfterBulkDeselect(
+                rows,
+                endpoints,
+                chat.settings.providerPrefs,
+                shouldDeselect,
+              ),
+            },
+            { path: ['providerPrefs', 'ignoreOverridesFilter'], value: true },
+            { path: ['providerPrefs', 'only'], value: undefined },
+          ]),
+      })
     },
-    [chat.id, chat.settings.providerPrefs, endpoints, rows],
+    [
+      chat.id,
+      chat.settings.providerPrefs,
+      endpoints,
+      providerRoutingTarget,
+      rows,
+      runConfigurationWrite,
+    ],
   )
 
-  if (!chat.settings.model) return null
+  if (!presentationSettings.model) return null
 
   const sortOverridden =
     prefs.sort !== undefined &&
     JSON.stringify(prefs.sort) !== JSON.stringify(DEFAULT_OPENROUTER_PROVIDER_SORT)
   const hasOverrides =
-    chat.settings.strictProviderRouting !== undefined ||
+    presentationSettings.strictProviderRouting !== undefined ||
     prefs.ignoreOverridesFilter === true ||
     (prefs.ignore?.length ?? 0) > 0 ||
     (prefs.only?.length ?? 0) > 0 ||
@@ -242,7 +319,13 @@ export function ProviderPicker({
     sortOverridden
 
   return (
-    <div data-ui="settings-section" data-ui-section="provider-picker">
+    <div
+      data-ui="settings-section"
+      data-ui-section="provider-picker"
+      data-routing-presentation={retained ? 'retained' : 'current'}
+      aria-busy={loading}
+      inert={retained ? true : undefined}
+    >
       <header data-ui="provider-picker-header">
         <h3>Providers</h3>
         <IconButton
@@ -260,15 +343,16 @@ export function ProviderPicker({
         <label data-ui="provider-picker-strict">
           <input
             type="checkbox"
-            checked={chat.settings.strictProviderRouting === true}
+            checked={presentationSettings.strictProviderRouting === true}
             onChange={(e) => {
               const checked = e.target.checked
-              void updateChatSettings(chat.id, {
-                strictProviderRouting: checked,
-                providerPrefs: {
-                  ...(chat.settings.providerPrefs ?? {}),
-                  requireParameters: checked,
-                },
+              runConfigurationWrite({
+                target: providerRoutingTarget,
+                action: () =>
+                  configurationApplication.patchChatSettingsFields(chat.id, [
+                    { path: ['strictProviderRouting'], value: checked },
+                    { path: ['providerPrefs', 'requireParameters'], value: checked },
+                  ]),
               })
             }}
           />
@@ -312,7 +396,7 @@ export function ProviderPicker({
               neededTokens !== undefined && epCap !== undefined && epCap > 0 && neededTokens > epCap
             const ref = providerRoutingRef(row.endpoint)
             const key = providerEndpointKey(row.endpoint)
-            const label = providerDisplayLabel(row.endpoint, endpoints)
+            const label = endpointIndex.displayLabel(row.endpoint)
             const allowed = row.state === 'kept'
             return (
               <ProviderRow
@@ -427,28 +511,6 @@ export function ProviderPicker({
   )
 }
 
-function orderEndpoints(
-  endpoints: readonly ModelEndpoint[],
-  prefs: ProviderPreferences,
-): ModelEndpoint[] {
-  const order = prefs.order ?? []
-  const out: ModelEndpoint[] = []
-  const seen = new Set<string>()
-  for (const ref of order) {
-    for (const ep of endpoints) {
-      const key = providerEndpointKey(ep)
-      if (seen.has(key)) continue
-      if (!endpointMatchesProviderRef(ep, ref, endpoints)) continue
-      out.push(ep)
-      seen.add(key)
-    }
-  }
-  for (const ep of endpoints) {
-    if (!seen.has(providerEndpointKey(ep))) out.push(ep)
-  }
-  return out
-}
-
 function sortEndpointsByMetric(endpoints: readonly ModelEndpoint[], sort: SortBy): ModelEndpoint[] {
   return endpoints
     .map((endpoint, index) => ({ endpoint, index, value: endpointSortValue(endpoint, sort) }))
@@ -513,6 +575,7 @@ function ProviderRow({
 }) {
   const [expanded, setExpanded] = useState(false)
   const { endpoint } = row
+  const hardDenied = pickerRowIsHardDenied(row)
   const pricingLabel = useMemo(() => {
     const prompt = Number(endpoint.pricing.prompt)
     const completion = Number(endpoint.pricing.completion)
@@ -571,14 +634,17 @@ function ProviderRow({
           <input
             type="checkbox"
             checked={allowed}
+            disabled={hardDenied}
             onChange={(e) => onToggle(e.target.checked)}
             aria-label={`Use ${label}`}
-            {...(insufficientContext
-              ? {
-                  title:
-                    "Checked but greyed out — this provider can't fit the current prompt. Send will skip it until the chat shrinks.",
-                }
-              : {})}
+            {...(hardDenied
+              ? { title: reasonsToTooltip(row.reasons, row.policy) }
+              : insufficientContext
+                ? {
+                    title:
+                      "Checked but greyed out — this provider can't fit the current prompt. Send will skip it until the chat shrinks.",
+                  }
+                : {})}
           />
           {row.state !== 'no-filter' ? <PrivacyLock tier={row.tier} title={lockTitle} /> : null}
           <span data-ui="provider-picker-name" title={label}>

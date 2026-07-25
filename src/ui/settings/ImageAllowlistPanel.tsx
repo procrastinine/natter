@@ -1,22 +1,10 @@
 import { useCallback, useState } from 'react'
 import { DEFAULT_IMAGE_ORIGINS } from '../../core/image-allowlist'
-import { primaryKeys } from '../../store/reactive-dependencies'
-import { useRepositoryQuery } from '../../store/reactive-query'
-import { getSetting, setSetting } from '../../store/settings'
+import { useConfigurationPreferences } from '../../hooks/useConfigurationPreferences'
+import { configurationApplication } from '../../store/configuration-application'
 import { TrashIcon } from '../icons/Icon'
 import { Button, IconButton } from '../primitives/Button'
 import { InfoDisclosure } from './InfoDisclosure'
-
-const STORAGE_KEY = 'image-allowlist'
-
-async function readImageAllowlist(): Promise<string[]> {
-  const stored = await getSetting<string[]>(STORAGE_KEY)
-  return stored ?? []
-}
-
-async function writeImageAllowlist(next: string[]): Promise<void> {
-  await setSetting(STORAGE_KEY, next)
-}
 
 export function normalizeOrigin(input: string): string | null {
   const trimmed = input.trim()
@@ -40,12 +28,7 @@ export function normalizeOrigin(input: string): string | null {
 }
 
 export function ImageAllowlistPanel() {
-  const allowlist = useRepositoryQuery(
-    'image-allowlist',
-    readImageAllowlist,
-    [],
-    primaryKeys('settings', STORAGE_KEY),
-  )
+  const allowlist = useConfigurationPreferences()?.imageAllowlist ?? []
   const [draft, setDraft] = useState('')
   const [error, setError] = useState<string | null>(null)
 
@@ -55,19 +38,17 @@ export function ImageAllowlistPanel() {
       setError('Enter an origin like https://example.com or https://*.example.com.')
       return
     }
-    const current = await readImageAllowlist()
-    if (current.includes(normalized) || DEFAULT_IMAGE_ORIGINS.includes(normalized)) {
+    if (allowlist.includes(normalized) || DEFAULT_IMAGE_ORIGINS.includes(normalized)) {
       setError('Origin already allowed.')
       return
     }
     setError(null)
     setDraft('')
-    await writeImageAllowlist([...current, normalized])
-  }, [draft])
+    await configurationApplication.addImageOrigin(normalized)
+  }, [allowlist, draft])
 
   const onRemove = useCallback(async (origin: string) => {
-    const current = await readImageAllowlist()
-    await writeImageAllowlist(current.filter((v) => v !== origin))
+    await configurationApplication.removeImageOrigin(origin)
   }, [])
 
   return (

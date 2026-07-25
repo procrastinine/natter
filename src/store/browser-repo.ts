@@ -1,290 +1,627 @@
-import Dexie, { type Collection, type Table, type Transaction } from 'dexie'
-import { activePath, compareLiveLeafRecency, findLastUpdatedLeafId } from '../core/active-path'
-import { buildBranchCacheRow } from '../core/branch-flatten'
+import Dexie, { type IndexableTypePart, type Table, type Transaction } from 'dexie'
+import type { ActiveBranchForkTarget } from '../core/active-branch-spine'
+import { compareLiveLeafRecency, findLastUpdatedLeafId } from '../core/active-path'
+import { messageRenderableTextSemanticsEqual } from '../core/branch-flatten'
+import { type BranchPathWindow, readLiveBranchPath } from '../core/branch-session'
+import { modelCatalogQueryForConnectionKind, modelsCacheKey } from '../core/cache-keys'
+import { computeBranchTitle } from '../core/chat-fork'
+import {
+  chatSettingsPromptPresetReferences,
+  normalizeChatSettings,
+  sameOrderedIds,
+} from '../core/chat-metadata'
+import { connectionDispatchKeyRefs, connectionHttpProfile } from '../core/connection-dispatch-proof'
+import {
+  type AppliedMessageSemanticEffect,
+  appliedMessageRequestSemanticsEqual,
+  createAppliedMessageView,
+} from '../core/continuation-content'
+import {
+  GENERATED_OUTPUT_LOCALIZATION_PROCESSOR_ID,
+  isGeneratedOutputLocalizationJob,
+  isGeneratedVideoPollingUrl,
+  profileAuthorizesGeneratedVideoUrl,
+  withGeneratedOutputLocalizationState,
+} from '../core/generated-output-localization'
+import {
+  GLOBAL_PREFERENCE_KEYS,
+  globalPreferencesFromStored,
+  SAMPLE_PROMPTS_DISMISSED_KEY,
+} from '../core/global-settings'
+import { customImageOriginsFromStored, IMAGE_ALLOWLIST_KEY } from '../core/image-allowlist'
+import { keyDispatchProof, keyDispatchRevisions } from '../core/key-dispatch-proof'
+import { treeParentKey } from '../core/message-tree-index'
+import {
+  type ConversationDestinationPoint,
+  type ConversationSelectionProofTarget,
+  fixedConversationSelectionTarget,
+  type MessageMutationRepository,
+} from '../core/messages'
+import { forceEquivalentModelIdForConnection } from '../core/model-selection'
+import {
+  normalizeRenderingPreferences,
+  RENDERING_PREFERENCES_KEY,
+} from '../core/rendering-preferences'
+import {
+  normalizeCollapsedSidebarFolderIds,
+  parseSidebarSortMode,
+  SIDEBAR_COLLAPSED_FOLDERS_SETTING_KEY,
+  SIDEBAR_SORT_SETTING_KEY,
+  sortChatFolders,
+} from '../core/sidebar-sort'
+import {
+  isStaticTextTemplateId,
+  normalizeTextTemplateConfig,
+  type SavedTextTemplate,
+  type SavedTextTemplateCatalogRow,
+} from '../core/text-templates'
+import {
+  GLOBAL_TOKEN_CALIBRATION_KEY,
+  normalizeGlobalTokenCalibration,
+} from '../core/token-calibration'
+import { TRANSCRIPT_BODY_READ_BATCH_ROWS } from '../core/transcript-work-budget'
 import type {
   Attachment,
   AttachmentArtifact,
-  AttachmentBlob,
   AttachmentId,
   AttachmentJob,
+  AttachmentMissingReason,
   AttachmentReferenceEdge,
   Chat,
-  ChatBranchCache,
   ChatFolder,
   ChatId,
+  ChatPreset,
   ChatTag,
-  ChatVersions,
+  ChatUsage,
   ChildListState,
+  ConnectionProfile,
+  DispatchedGenerationMeta,
   DraftRow,
   FolderId,
+  GenerationMeta,
+  GlobalTokenCalibration,
+  KeyId,
+  KeyRecord,
   Message,
   MessageAttachmentRef,
   MessageId,
   MutationScope,
   PresetId,
-  TagId,
+  ProfileId,
+  PromptPresetId,
+  PromptPresetKind,
+  TextTemplateId,
 } from '../core/types'
 import { countMessagesWords } from '../core/word-count'
+import { assertNever } from '../lib/assert'
+import { sameOrderedValues, sameValue, stableStringify } from '../lib/same-value'
 import { newId } from '../lib/ulid'
+import { ATTACHMENT_CATALOG_MUTATION_TRANSACTION_CAPABILITY } from './attachment-catalog-projection'
 import {
-  attachmentReferenceCounts,
-  edgesForOwner,
-  replaceAttachmentReferenceOwner,
-  replaceAttachmentReferenceOwners,
-  requireNoAttachmentReferences,
-} from './attachment-reference-edges'
+  ATTACHMENT_INTEGRITY_TRANSACTION_CAPABILITY,
+  reconcileAttachmentIntegrityPage,
+} from './attachment-integrity-maintenance'
 import { liveAttachmentRefs, normalizeAttachmentRefs } from './attachment-refs'
+import { type AttachmentHeaderRow, hydrateAttachment } from './attachment-storage'
+import { subscribeWorkspaceChanges } from './broadcast'
 import {
-  type AttachmentHeaderRow,
-  attachmentHeaderFromStoredRow,
-  hydrateAttachment,
-  splitAttachmentForStorage,
-} from './attachment-storage'
-import { postEvent } from './broadcast'
+  type ConversationOpenFrameStore,
+  readActiveBranchChildAtPositionInTransaction,
+  readActiveBranchForksInTransaction,
+  readConversationOpenInitialReceiptInTransaction,
+  resolveConversationOpenReceipt,
+} from './browser-active-branch-spine'
 import {
-  createChatInBrowser,
-  deletePresetAndClearBreadcrumbsInBrowser,
-  deleteProfileAndReassignInBrowser,
-  deletePromptPresetAndClearPinsInBrowser,
-  discardEmptyDraftChatsInBrowser,
-  updateProfileAndInvalidateCachesInBrowser,
-  updatePromptPresetAndPropagateInBrowser,
+  evaluateAttachmentCatalogRows,
+  readAttachmentCatalogAggregate,
+  readAttachmentCatalogPage,
+  readAttachmentCatalogRows,
+  readAttachmentManagerCore,
+  readSidebarAggregate,
+  readSidebarCatalogPage,
+  readSidebarCreatedAtGroupCount,
+  readSidebarPresentationPage,
+  readSidebarRowsById,
+} from './browser-catalog-queries'
+import {
+  type AttachmentReferenceStateFact,
+  type BrowserCommandMessageRevisionFact,
+  type BrowserCommandMutationFacts,
+  type BrowserCommandPhysicalMutation,
+  type BrowserCommandPhysicalOwnerScope,
+  INTERNAL_ATTACHMENT_INTEGRITY_MAINTENANCE,
+  INTERNAL_DISCOVERY_CACHE_MAINTENANCE,
+  recordBrowserCommandInvalidation,
+  recordBrowserCommandStorageRetentionMutation,
+  runBrowserCommandTransaction,
+} from './browser-command-mutation-journal'
+import {
+  type BrowserCommandSessionPort,
+  type BrowserGenerationCommandSupport,
+  type BrowserLockedCommandPort,
+  type BrowserMutationCommandPort,
+  type BrowserMutationOperations,
+  type BrowserMutationSharedInternals,
+  type BrowserMutationTransactionExtension,
+  type ChatMutationState,
+  type ResolvedGenerationPromptPath,
+  VALIDATED_GENERATION_PROMPT_PATH_HEADERS,
+  type ValidatedGenerationPromptPath,
+  type ValidatedGenerationPromptPathHeaders,
 } from './browser-domain-mutations'
-import { deleteChatSidebarProjections, putChatSidebarProjection } from './chat-sidebar-projection'
-import { childListKey, type NatterDb, openDb } from './db'
-import { withMutationLocks, withNamedLock, withNamedLocks } from './locks'
+import type { BrowserImportExportRead } from './browser-import-export'
 import {
-  contentIncludesCaseInsensitiveText,
+  type BrowserMutationTableName,
+  GenerationPlanningSeedChangedError,
+} from './browser-mutation-plan'
+import {
+  BODY_READ_PAGE_SIZE,
+  HEADER_READ_PAGE_SIZE,
+  readBulkGetPages,
+  readChatMessageHeaderPages,
+  readChildHeaderPages,
+  readExactMessageRowsByIdPages,
+  readStreamJournalFramePage,
+  readStreamLeasePages,
+  readStringPrimaryKeyPages,
+} from './browser-query-pages'
+import {
+  boundedMaintenanceLimit,
+  MAX_STORAGE_MAINTENANCE_BATCH,
+} from './browser-workspace-maintenance-contract'
+import {
+  addPhysicalStorageRow,
+  addPhysicalStorageRows,
+  insertMessageBody,
+  putPhysicalStorageRow,
+} from './byte-owner-mutation'
+import {
+  applyChatRowWriteTransitions,
+  CHAT_ROW_LINKED_TRANSACTION_CAPABILITY,
+  CHAT_ROW_PRESERVING_LINKS_TRANSACTION_CAPABILITY,
+} from './chat-row-transition'
+import { readTemporaryChatIdPage } from './chat-storage-codec'
+import {
+  CHAT_CLOSURE_BATCH_LIMIT,
+  CHAT_CLOSURE_TRANSACTION_CAPABILITY,
+  ChatClosurePlanChangedError,
+  deletePlannedEmptyDraftChats,
+  emptyDraftChatClosureLockNames,
+  planEmptyDraftChatClosure,
+} from './chat-storage-ownership'
+import {
+  CONFIGURATION_PRESET_RECENCY_TRANSACTION_CAPABILITY,
+  CONFIGURATION_PROFILE_CATALOG_STATE_ID,
+  CONFIGURATION_PROFILE_CATALOG_TRANSACTION_CAPABILITY,
+  type ConfigurationCatalogStateRow,
+  type ConfigurationPresetCatalogProjectionRow,
+  type ConfigurationProfileCatalogProjectionRow,
+  type ConfigurationPromptPresetCatalogProjectionRow,
+  configurationPromptPresetCatalogStateId,
+  readDefaultConfigurationProfileId,
+} from './configuration-catalog-projection'
+import {
+  type ConfigurationLink,
+  chatConfigurationTargetResourceNames,
+  configurationRequestRevisionFor,
+  configurationRequestRevisionKey,
+  configurationTargetKey,
+} from './configuration-domain-contract'
+import {
+  CONFIGURATION_PROFILE_MANAGER_STATE_ID,
+  type ConfigurationProfileUsageProjectionRow,
+  emptyConfigurationProfileUsageProjectionRow,
+} from './configuration-profile-usage-projection'
+import {
+  type BrowserWorkspaceSession,
+  childListKey,
+  getBrowserWorkspaceSession,
+  type NatterDb,
+  runBrowserWorkspaceRepositoryOperation,
+} from './db'
+import type {
+  CachedEndpointsRow,
+  CachedEndpointsStorageRow,
+  CachedModelsRow,
+  CachedModelsStorageRow,
+  CachedPrivacyPolicyRow,
+  CachedPrivacyPolicyStorageRow,
+  SettingsRow,
+} from './db-rows'
+import {
+  DISCOVERY_CACHE_MUTATION_TRANSACTION_CAPABILITY,
+  type DiscoveryCacheStorageTable,
+  deleteDiscoveryCacheRow,
+  maintainDiscoveryCache,
+  prepareDiscoveryPayload,
+  putDiscoveryCacheRow,
+  readDiscoveryCacheRow,
+  type DiscoveryCacheEviction as StorageDiscoveryCacheEviction,
+  type DiscoveryCachePutResult as StorageDiscoveryCachePutResult,
+} from './discovery-cache-storage'
+import { exactCompoundPrefixBetween, scalarCompoundIndexBetween } from './indexeddb-key-ranges'
+import {
+  type AuthoritativeCommandLockSession,
+  type LockGrant,
+  normalizeNamedLocks,
+  scopeResourceName,
+  withSharedAuthoritativeCommandSession,
+} from './locks'
+import {
+  deletePairInRepository,
+  deleteSingleMessageInRepository,
+  deleteTurnInRepository,
+  deleteVariantInRepository,
+  editMessageContentInRepository,
+  mutateMessageBodyInRepository,
+  pasteImportInRepository,
+} from './message-command-repository'
+import { searchMessageCorpusInBrowser } from './message-corpus-search'
+import {
+  canonicalMessageHeaderRow,
   hydrateMessage,
   hydrateMessages,
+  hydrateMessageWithOwnedBody,
+  MESSAGE_TEXT_PREVIEW_MAX_CHARS,
   type MessageBodyRow,
   type MessageHeaderRow,
-  messageHeaderTreeKey,
+  type MessageTextPreviewRow,
   previewTextFromMessages,
   previewTextFromStoredProjection,
+  rebaseHydratedMessageHeader,
+  sameMessageHeaderStructure,
+  sameMessageHeaderValue,
   splitMessageForStorage,
-  syncMessageHeaderProjections,
 } from './message-storage'
+import {
+  assertPhysicalTransactionTablesDeclared,
+  bindFencedTransaction,
+  type FencedTransaction,
+  PHYSICAL_STORAGE_POLICY,
+  type PhysicalStorageTableName,
+  type PhysicalTransactionPlan,
+  physicalStorageTables,
+  physicalTransactionPlan,
+} from './physical-storage-tables'
+import {
+  PRESET_ORDER_STATE_ID,
+  type PresetOrderBlockRow,
+  type PresetOrderMembershipRow,
+  type PresetOrderStateRow,
+} from './preset-order'
 import type {
-  ActiveBranchBodyPage,
-  ActiveBranchSnapshot,
-  AppendMessageToExpectedLeafInput,
-  AppendMessageToExpectedLeafResult,
   AttachmentBundle,
-  AttachmentSearchMeasurement,
-  AttachmentSearchPage,
-  AttachmentSearchQuery,
-  BranchHeaderSnapshot,
-  ChatBranchCacheWriteGuard,
-  ChatMutationSummary,
+  AttachmentDispatchBundle,
+  ChatMetadataPatch,
   CreateFolderInput,
-  CreateTagInput,
-  DeleteArchivedChatsResult,
   DeleteFolderResult,
-  DeletePresetCascadeResult,
-  DeleteProfileAtomicInput,
-  DeleteProfileAtomicResult,
-  DeletePromptPresetAtomicInput,
-  DeletePromptPresetAtomicResult,
-  DeleteTagResult,
+  EnsureFolderAndMoveChatsInput,
+  EnsureFolderAndMoveChatsResult,
+  FencedStreamLeaseRow,
   ForkChatFromMessageInput,
   ForkChatFromMessageResult,
-  KnownBranchPageResult,
+  GenerationAttachmentTokenEvidence,
+  GenerationMessageReadProof,
+  KnownBranchPageStructuralResult,
   MessageBodyPatch,
   MessageCalibrationPatch,
   MessageHeaderPatch,
-  MessagePresentationSnapshot,
-  MessageStructurePatch,
+  MessageTextPreviewSnapshot,
+  MessageTextPreviewTarget,
   MutationContext,
-  PatchMessageBodyOptions,
-  PutMessageOptions,
-  SendContextRevisionSnapshot,
-  StreamChunkRow,
+  MutationFinalizationContext,
+  StreamJournalFrameRow,
+  StreamLeaseAdmission,
+  StreamLeaseHeartbeat,
   StreamLeaseRow,
+  StreamPostCommitEvidence,
+  StreamPostCommitUsageEvidence,
   StreamWriteFence,
+  TerminalDecidedStreamLeaseRow,
   UpdateFolderInput,
-  UpdateProfileAtomicInput,
-  UpdateProfileAtomicResult,
-  UpdatePromptPresetAtomicInput,
-  UpdatePromptPresetAtomicResult,
-  UpdateTagInput,
+  WorkspaceFence,
   WorkspaceMeta,
   WorkspaceMutationOptions,
   WorkspaceMutationResult,
-  WorkspaceRepository,
 } from './repository'
 import {
+  BranchTargetUnavailableError,
   ChatMissingError,
-  ChatStreamBusyError,
-  chatMatchesBranchCacheWriteGuard,
   ExpectedLeafChangedError,
+  generationMessageReadProofFromHeader,
+  isStreamLeaseRow,
+  requireStreamLeaseRow,
   StreamTargetBusyError,
-  streamLeaseOwnsTargetWrites,
+  streamLeaseHasCommittedTarget,
+  streamLeaseHasWriteFence,
+  streamLeaseMatchesWriteFence,
   WorkspaceReplacementFenceError,
 } from './repository'
 import {
-  bumpBrowserWorkspaceMeta,
-  readBrowserWorkspaceMeta,
-  readBrowserWorkspaceMetaFromTransaction,
-} from './workspace-meta'
+  awaitStorageCompactionWriteAdmission,
+  registerPhysicalMutationTransaction,
+} from './storage-compaction-state'
+import {
+  type AttachmentReapCursor,
+  advanceStorageRetentionState,
+  assertStorageRetentionCycleCurrent,
+  readStorageRetentionState,
+  type StorageRetentionCursor,
+  type StorageRetentionCycle,
+  type StorageRetentionStateRowFor,
+  type StorageRetentionTask,
+  storageRetentionCycle,
+} from './storage-retention-state'
+import { canonicalStreamJournalFrameBatch } from './stream-journal-codec'
+import {
+  readStreamJournalIntegrityPlan,
+  reconcileStreamJournalIntegrityPage,
+  STREAM_JOURNAL_INTEGRITY_TRANSACTION_CAPABILITY,
+  StreamJournalIntegrityPlanChangedError,
+} from './stream-journal-integrity'
+import {
+  appendStreamJournalFrames as persistStreamJournalFrames,
+  putStreamLeaseByteOwner,
+  retireStreamJournalOwnershipPage,
+  STREAM_JOURNAL_MUTATION_TRANSACTION_CAPABILITY,
+  STREAM_LEASE_MUTATION_TRANSACTION_CAPABILITY,
+} from './stream-journal-storage'
+import { STREAM_LEASE_HEARTBEAT_COALESCE_MS } from './stream-lease-policy'
+import { applyStructuralSnapshotInRepository } from './structural-undo-repository'
+import { readTextTemplateCatalog } from './text-template-storage'
+import { nextChatUpdatedAtInTransaction, TransactionChatUpdateClock } from './transaction-order'
+import { WorkspaceLocalChildSlotAccumulator } from './workspace-local-evidence'
+import { readBrowserWorkspaceMeta, readBrowserWorkspaceMetaFromTransaction } from './workspace-meta'
+import type {
+  AttachmentBundleWriteInput,
+  AttachmentBundleWriteResult,
+  AttachmentDeleteBytesInput,
+  AttachmentDeleteIfUnreferencedResult,
+  AttachmentDeleteManyInput,
+  AttachmentDeleteManyResult,
+  AttachmentIntegrityMaintenanceResult,
+  AttachmentMediaProjection,
+  AttachmentReapResult,
+  AttachmentRefAddInput,
+  AttachmentRefDetachInput,
+  AttachmentReferenceRow,
+  AttachmentRefOwner,
+  AttachmentRefRelinkInput,
+  AttachmentRefRelinkResult,
+  AttachmentRefVisibilityInput,
+  AttachmentRefWriteResult,
+  AttemptDispatchInput,
+  AttemptDispatchResult,
+  AttemptFinalizeResult,
+  AttemptPrepareResult,
+  AttemptRequestStopInput,
+  AttemptRequestStopResult,
+  AttemptSealTerminalInput,
+  AttemptTerminalProjection,
+  ChatCalibrationEverywhereResult,
+  ChatMetadataWriteResult,
+  ChatTagAssignmentResult,
+  CommitEnvelope,
+  ConfigurationActiveModelKnownPayloads,
+  ConfigurationActiveModelProjection,
+  ConfigurationActiveModelRead,
+  ConfigurationActiveSelectionProjection,
+  ConfigurationCatalogAddress,
+  ConfigurationCatalogPage,
+  ConfigurationCatalogPageRequest,
+  ConfigurationConnectionManagerPage,
+  ConfigurationConnectionManagerRow,
+  ConfigurationDiscoveryPayloadProjection,
+  ConfigurationDiscoveryPayloadToken,
+  ConfigurationPreferencesProjection,
+  ConfigurationPresetCatalogPage,
+  ConfigurationPresetCatalogRow,
+  ConfigurationProfileCatalogPage,
+  ConfigurationProfileCatalogRow,
+  ConfigurationPromptPresetCatalogPage,
+  ConfigurationPromptPresetCatalogRow,
+  ConfigurationSelectionQueryTarget,
+  ConfigurationShellProjection,
+  ConversationForksResult,
+  ConversationTopologyResult,
+  DeleteArchivedChatMetadataResult,
+  DiscoveryCacheCommand,
+  DiscoveryCacheEviction,
+  DiscoveryCacheMaintenanceResult,
+  DiscoveryCachePutResult,
+  DiscoveryCacheWriteGuard,
+  DiscoveryModelsPutResult,
+  GeneratedOutputLocalizationClaim,
+  GeneratedOutputLocalizationClaimInput,
+  GeneratedOutputLocalizationCompleteInput,
+  GeneratedOutputLocalizationFailInput,
+  GeneratedOutputLocalizationJobResult,
+  GeneratedOutputLocalizationQueueSnapshot,
+  GeneratedOutputLocalizationRetryInput,
+  GeneratedOutputVideoExpandInput,
+  GeneratedOutputVideoExpandResult,
+  GenerationPostCommitMetadataInput,
+  GenerationPostCommitMetadataResult,
+  GenerationPromptPathClaim,
+  GenerationPromptPathProof,
+  MessagePresentation,
+  PrepareAttemptInput,
+  PreparedAttachmentBundle,
+  PreparedGenerationPrompt,
+  ReadEnvelope,
+  StorageMaintenanceRequestTaskKind,
+  StreamHandoffRecoveryInput,
+  StreamNoteSelectedKeyInput,
+  WorkspaceChange,
+  WorkspaceCommand,
+  WorkspaceCommandResult,
+  WorkspaceDelta,
+  WorkspaceDeltaFact,
+  WorkspaceDependency,
+  WorkspaceLocalChildSlotEvidence,
+  WorkspaceLocalMessageRevision,
+  WorkspaceLocalReceipt,
+  WorkspaceQuery,
+  WorkspaceQueryOptions,
+  WorkspaceQueryResult,
+  WorkspaceReadAuthority,
+  WorkspaceReplacement,
+  WorkspaceReplacementEnvelope,
+  WorkspaceReplacementResult,
+  WorkspaceRepository,
+  WorkspaceWriteAuthority,
+} from './workspace-protocol'
+import {
+  CONFIGURATION_CATALOG_MAX_ADDRESSED_ROWS,
+  CONFIGURATION_CATALOG_MAX_PAGE_SIZE,
+  CONFIGURATION_CATALOG_MAX_REFRESH_ANCHORS,
+  connectionDiscoveryRevisionKey,
+  normalizeWorkspaceDependencies,
+  workspaceDependenciesForDeltaFact,
+} from './workspace-protocol'
+import { assertWorkspaceExecutionPermit, assertWorkspaceReadPermit } from './workspace-runtime'
 
-export { ChatMissingError, ChatStreamBusyError } from './repository'
+const STREAM_LEASE_TRANSACTION = physicalTransactionPlan(
+  STREAM_LEASE_MUTATION_TRANSACTION_CAPABILITY,
+)
+const STREAM_JOURNAL_TRANSACTION = physicalTransactionPlan(
+  STREAM_JOURNAL_MUTATION_TRANSACTION_CAPABILITY,
+)
+const STREAM_JOURNAL_INTEGRITY_TRANSACTION = physicalTransactionPlan(
+  STREAM_JOURNAL_INTEGRITY_TRANSACTION_CAPABILITY,
+)
+const DISCOVERY_CACHE_TRANSACTION = physicalTransactionPlan(
+  DISCOVERY_CACHE_MUTATION_TRANSACTION_CAPABILITY,
+)
+const DISCOVERY_CACHE_ROW_WRITE_TRANSACTION = physicalTransactionPlan(
+  DISCOVERY_CACHE_MUTATION_TRANSACTION_CAPABILITY,
+  physicalStorageTables('keys', 'profiles'),
+)
+const DISCOVERY_MODELS_WRITE_TRANSACTION = physicalTransactionPlan(
+  DISCOVERY_CACHE_MUTATION_TRANSACTION_CAPABILITY,
+  CHAT_ROW_LINKED_TRANSACTION_CAPABILITY,
+  physicalStorageTables('keys', 'profiles'),
+)
+const ATTACHMENT_INTEGRITY_TRANSACTION = physicalTransactionPlan(
+  ATTACHMENT_INTEGRITY_TRANSACTION_CAPABILITY,
+)
+const STORAGE_RETENTION_STATE_TRANSACTION_CAPABILITY =
+  physicalStorageTables('storageRetentionState')
+const TERMINAL_STREAM_RETENTION_TRANSACTION = physicalTransactionPlan(
+  STREAM_JOURNAL_MUTATION_TRANSACTION_CAPABILITY,
+  STORAGE_RETENTION_STATE_TRANSACTION_CAPABILITY,
+)
+const GENERATION_METADATA_TRANSACTION = physicalTransactionPlan(
+  CONFIGURATION_PROFILE_CATALOG_TRANSACTION_CAPABILITY,
+  CONFIGURATION_PRESET_RECENCY_TRANSACTION_CAPABILITY,
+  STREAM_LEASE_MUTATION_TRANSACTION_CAPABILITY,
+  CHAT_ROW_PRESERVING_LINKS_TRANSACTION_CAPABILITY,
+  physicalStorageTables('keys', 'messages', 'presets', 'profiles', 'settings'),
+)
+const FORK_CHAT_TRANSACTION = physicalTransactionPlan(
+  ATTACHMENT_CATALOG_MUTATION_TRANSACTION_CAPABILITY,
+  CHAT_ROW_LINKED_TRANSACTION_CAPABILITY,
+  physicalStorageTables(
+    'childLists',
+    'childSlotMembers',
+    'messages',
+    'messageBodies',
+    'messagePreviews',
+  ),
+)
+type BrowserInterchangeQuery = Extract<WorkspaceQuery, { kind: `interchange.${string}` }>
+type BrowserConversationEnvelopeQuery = Extract<
+  WorkspaceQuery,
+  {
+    kind: 'message.headers-by-chat' | 'branch.open' | 'branch.forks' | 'branch.page-structure'
+  }
+>
+type BrowserInlineQuery = Exclude<
+  WorkspaceQuery,
+  BrowserInterchangeQuery | BrowserConversationEnvelopeQuery | { kind: 'workspace.meta' }
+>
 
-interface ChatMutationState {
-  beforeChat: Chat
-  beforeHeaders?: MessageHeaderRow[]
-  afterHeadersById?: Map<MessageId, MessageHeaderRow>
-  headersBeforeWrites: Map<MessageId, MessageHeaderRow | undefined>
-  incrementalAppends: Message[]
-  wordCountDeltas: Map<MessageId, number>
-  totalCostDelta: number
-  visibleMetaPatch: Partial<Chat>
-  hiddenMetaPatch: Partial<Chat>
-  summaryPatch: Partial<Chat>
-  visibleMetaDirty: boolean
-  summaryVersionDirty: boolean
-  messageSummaryDirty: boolean
-  branchCorpusDirtyMessageIds: Set<MessageId>
-  previewDirty: boolean
-  broadcast: boolean
-  changedMessageIds: Set<MessageId>
-  affected: Map<string, ChatMutationSummary>
+interface BrowserWorkspaceReadFrame {
+  readonly db: NatterDb
+  readonly permit: WorkspaceReadAuthority
+  readonly signal: AbortSignal
+  readonly workspace: WorkspaceMeta
 }
 
-type BrowserMutationTableName =
-  | 'attachmentArtifacts'
-  | 'attachmentBlobs'
-  | 'attachmentJobs'
-  | 'attachmentRefEdges'
-  | 'attachments'
-  | 'chatBranchCache'
-  | 'chatSidebarRows'
-  | 'chats'
-  | 'childLists'
-  | 'drafts'
-  | 'messages'
-  | 'messageBodies'
-  | 'settings'
-  | 'streamLeases'
-
-const MUTATION_TABLE_ORDER: readonly BrowserMutationTableName[] = [
-  'attachmentArtifacts',
-  'attachmentBlobs',
-  'attachmentJobs',
-  'attachmentRefEdges',
-  'attachments',
-  'chatBranchCache',
-  'chatSidebarRows',
-  'chats',
-  'childLists',
-  'drafts',
-  'messages',
-  'messageBodies',
-  'settings',
-  'streamLeases',
-]
-
-function stableStringify(value: unknown): string {
-  return JSON.stringify(value)
+function isBrowserInterchangeQuery(query: WorkspaceQuery): query is BrowserInterchangeQuery {
+  return query.kind.startsWith('interchange.')
 }
 
-function streamOwnedMessageFieldsChanged(
-  existingHeader: MessageHeaderRow,
-  existingBody: MessageBodyRow,
-  nextHeader: MessageHeaderRow,
-  nextBody: MessageBodyRow,
-): boolean {
-  const comparableHeader = (header: MessageHeaderRow) => {
-    const {
-      nodeVersion,
-      requestContextVersion,
-      bodyVersion,
-      bodyWordCount,
-      hiddenFromContext,
-      attachmentRefs,
-      cachedMediaTokens,
-      ...value
-    } = header
-    void nodeVersion
-    void requestContextVersion
-    void bodyVersion
-    void bodyWordCount
-    void hiddenFromContext
-    void attachmentRefs
-    void cachedMediaTokens
-    return value
+function requiredUnreferencedAt(attachment: AttachmentHeaderRow): number {
+  if (typeof attachment.unreferencedAt !== 'number') {
+    throw new Error(`AttachmentReapEligibilityMissing:${attachment.id}`)
   }
-  const comparableBody = (body: MessageBodyRow) => {
-    const { bodyVersion, updatedAt, ...value } = body
-    void bodyVersion
-    void updatedAt
-    return value
+  return attachment.unreferencedAt
+}
+
+function protocolDiscoveryCacheEvictions(
+  evictions: readonly StorageDiscoveryCacheEviction[],
+): DiscoveryCacheEviction[] {
+  return evictions.map((eviction) => ({
+    cacheKind: eviction.tableName === 'privacyPolicies' ? 'privacy' : eviction.tableName,
+    profileId: eviction.profileId,
+    discriminator: eviction.discriminator,
+  }))
+}
+
+function protocolDiscoveryCachePutResult(
+  result: StorageDiscoveryCachePutResult,
+): DiscoveryCachePutResult {
+  return {
+    accepted: result.accepted,
+    cacheChanged: result.cacheChanged,
+    cached: result.cached,
+    repairRequired: result.repairRequired,
+    evictions: protocolDiscoveryCacheEvictions(result.evictions),
   }
-  return (
-    stableStringify(comparableHeader(existingHeader)) !==
-      stableStringify(comparableHeader(nextHeader)) ||
-    stableStringify(comparableBody(existingBody)) !== stableStringify(comparableBody(nextBody))
+}
+
+function emptyDiscoveryCachePutResult(): DiscoveryCachePutResult {
+  return {
+    accepted: false,
+    cacheChanged: false,
+    cached: false,
+    repairRequired: false,
+    evictions: [],
+  }
+}
+
+class ModelResolutionPublicationPlanChangedError extends Error {}
+
+async function pendingModelResolutionChatIds(
+  table: Table<ConfigurationLink, string>,
+  targetKey: string,
+): Promise<ChatId[]> {
+  const links = await table.where('targetKey').equals(targetKey).toArray()
+  return [
+    ...new Set(links.flatMap((link) => (link.ownerKind === 'chat' ? [link.ownerId] : []))),
+  ].sort()
+}
+
+class TerminalStreamRetentionPlanChangedError extends Error {}
+
+async function commitStorageRetentionPage<Task extends StorageRetentionTask>(
+  tx: Transaction,
+  cycle: StorageRetentionCycle<Task>,
+  outcome:
+    | { readonly done: false; readonly cursor?: StorageRetentionCursor<Task> }
+    | { readonly done: true; readonly earliestDeferredAt?: number },
+): Promise<void> {
+  const previous = await readStorageRetentionState(tx, cycle.task)
+  assertStorageRetentionCycleCurrent(previous, cycle)
+  const next = advanceStorageRetentionState(cycle, outcome)
+  await putPhysicalStorageRow<StorageRetentionStateRowFor<Task>, StorageRetentionTask>(
+    tx,
+    'storageRetentionState',
+    next,
+    previous,
   )
-}
-
-type RequestContextFieldClass = 'semantic' | 'advisory'
-
-const MESSAGE_HEADER_REQUEST_CONTEXT_FIELDS = {
-  id: 'semantic',
-  chatId: 'semantic',
-  parentId: 'semantic',
-  siblingIndex: 'advisory',
-  turnId: 'advisory',
-  turnIndex: 'advisory',
-  createdAt: 'advisory',
-  editedAt: 'advisory',
-  role: 'semantic',
-  origin: 'semantic',
-  generation: 'advisory',
-  attachmentRefs: 'semantic',
-  approval: 'semantic',
-  nodeVersion: 'advisory',
-  pinCache: 'semantic',
-  hiddenFromContext: 'semantic',
-  deleted: 'semantic',
-  originalCharCount: 'advisory',
-  originalTokenEstimate: 'advisory',
-  originalModelId: 'advisory',
-  originalCalibrationKey: 'advisory',
-  charCountDelta: 'advisory',
-  cachedTokenEstimate: 'advisory',
-  cachedMediaTokens: 'advisory',
-  requestContextVersion: 'advisory',
-  bodyVersion: 'advisory',
-  bodyWordCount: 'advisory',
-  textPreview: 'advisory',
-} as const satisfies Record<keyof MessageHeaderRow, RequestContextFieldClass>
-
-const MESSAGE_BODY_REQUEST_CONTEXT_FIELDS = {
-  id: 'semantic',
-  chatId: 'semantic',
-  bodyVersion: 'advisory',
-  updatedAt: 'advisory',
-  content: 'semantic',
-  reasoningDetails: 'semantic',
-  toolCalls: 'semantic',
-  refusal: 'semantic',
-  phase: 'semantic',
-  responsesEchoItem: 'semantic',
-  providerOutputItems: 'semantic',
-  continuationAttempts: 'advisory',
-  generationServerToolOutputs: 'advisory',
-} as const satisfies Record<keyof MessageBodyRow, RequestContextFieldClass>
-
-function requestContextProjection<Row extends object>(
-  row: Row,
-  fields: Record<keyof Row, RequestContextFieldClass>,
-): Partial<Row> {
-  const projected: Partial<Row> = {}
-  for (const key of Object.keys(fields) as Array<keyof Row>) {
-    if (fields[key] === 'semantic') projected[key] = row[key]
-  }
-  return projected
+  recordBrowserCommandStorageRetentionMutation(tx, cycle.task)
 }
 
 export function __messageRequestContextChangedForTests(
@@ -293,177 +630,70 @@ export function __messageRequestContextChangedForTests(
   nextHeader: MessageHeaderRow,
   nextBody: MessageBodyRow,
 ): boolean {
-  return (
-    stableStringify(
-      requestContextProjection(existingHeader, MESSAGE_HEADER_REQUEST_CONTEXT_FIELDS),
-    ) !==
-      stableStringify(
-        requestContextProjection(nextHeader, MESSAGE_HEADER_REQUEST_CONTEXT_FIELDS),
-      ) ||
-    stableStringify(requestContextProjection(existingBody, MESSAGE_BODY_REQUEST_CONTEXT_FIELDS)) !==
-      stableStringify(requestContextProjection(nextBody, MESSAGE_BODY_REQUEST_CONTEXT_FIELDS))
-  )
+  return messageSemanticEffect(existingHeader, existingBody, nextHeader, nextBody)
+    .requestContextChanged
 }
 
-const messageRequestContextChanged = __messageRequestContextChangedForTests
-
-function messageBranchCorpusChanged(
+function messageSemanticEffect(
   existingHeader: MessageHeaderRow,
-  existingBody: MessageBodyRow,
+  existingBody: MessageBodyRow | undefined,
   nextHeader: MessageHeaderRow,
   nextBody: MessageBodyRow,
-): boolean {
-  return (
+  appliedBodyEffect?: AppliedMessageSemanticEffect,
+): AppliedMessageSemanticEffect {
+  const requestHeaderChanged =
+    existingHeader.id !== nextHeader.id ||
+    existingHeader.chatId !== nextHeader.chatId ||
+    existingHeader.parentId !== nextHeader.parentId ||
     existingHeader.role !== nextHeader.role ||
-    existingHeader.editedAt !== nextHeader.editedAt ||
-    stableStringify(existingHeader.attachmentRefs ?? []) !==
-      stableStringify(nextHeader.attachmentRefs ?? []) ||
-    stableStringify(existingBody.content) !== stableStringify(nextBody.content) ||
-    stableStringify(existingBody.toolCalls ?? []) !== stableStringify(nextBody.toolCalls ?? []) ||
-    existingBody.phase !== nextBody.phase
-  )
-}
-
-function nextBranchUpdatedAt(current: number, now: number): number {
-  return Math.max(now, current + 1)
-}
-
-async function assertStreamLeaseTargetAvailable(
-  tx: Transaction,
-  incoming: StreamLeaseRow,
-): Promise<number> {
-  const settings = tx.table<{ key: string; value: unknown }, string>('settings')
-  const sequenceRow = await settings.get('stream-admission-sequence')
-  const currentSequence =
-    typeof sequenceRow?.value === 'number' &&
-    Number.isSafeInteger(sequenceRow.value) &&
-    sequenceRow.value >= 0
-      ? sequenceRow.value
-      : 0
-  if (currentSequence >= Number.MAX_SAFE_INTEGER)
-    throw new Error('StreamAdmissionSequenceExhausted')
-  const admissionSequence = currentSequence + 1
-  await settings.put({ key: 'stream-admission-sequence', value: admissionSequence })
-  if (!incoming.messageId) return admissionSequence
-  const leaseTable = tx.table<StreamLeaseRow, string>('streamLeases')
-  const chunkTable = tx.table<StreamChunkRow, [string, number]>('streamChunks')
-  const competing = await leaseTable.where('messageId').equals(incoming.messageId).toArray()
-  const finalizedStreamIds: string[] = []
-  for (const previous of competing) {
-    if (previous.streamId === incoming.streamId) continue
-    if (!(await streamLeaseTargetFinalized(tx, previous))) {
-      throw new StreamTargetBusyError(incoming.messageId)
+    existingHeader.origin !== nextHeader.origin ||
+    !sameValue(existingHeader.attachmentRefs, nextHeader.attachmentRefs) ||
+    !sameValue(existingHeader.approval, nextHeader.approval) ||
+    existingHeader.pinCache !== nextHeader.pinCache ||
+    existingHeader.hiddenFromContext !== nextHeader.hiddenFromContext ||
+    existingHeader.deleted !== nextHeader.deleted
+  const corpusHeaderChanged =
+    existingHeader.role !== nextHeader.role ||
+    !sameValue(existingHeader.attachmentRefs, nextHeader.attachmentRefs)
+  if (appliedBodyEffect) {
+    return {
+      requestContextChanged: requestHeaderChanged || appliedBodyEffect.requestContextChanged,
+      branchCorpusChanged: corpusHeaderChanged || appliedBodyEffect.branchCorpusChanged,
     }
-    finalizedStreamIds.push(previous.streamId)
   }
-  await leaseTable.bulkDelete(finalizedStreamIds)
-  await chunkTable
-    .where('messageId')
-    .equals(incoming.messageId)
-    .filter((chunk) => chunk.streamId !== incoming.streamId)
-    .delete()
-  return admissionSequence
-}
-
-async function assertStreamLeaseWorkspaceTarget(
-  tx: Transaction,
-  lease: StreamLeaseRow,
-): Promise<void> {
-  const chat = await tx.table<Chat, ChatId>('chats').get(lease.chatId)
-  if (!chat) throw new ChatMissingError(lease.chatId)
-  if (!lease.messageId) return
-  const target = await tx.table<MessageHeaderRow, MessageId>('messages').get(lease.messageId)
-  if (target && target.chatId !== lease.chatId) {
-    throw new Error(
-      `StreamLeaseTargetChatMismatch:${lease.streamId}:${lease.messageId}:${lease.chatId}:${target.chatId}`,
-    )
+  if (!existingBody) {
+    return { requestContextChanged: true, branchCorpusChanged: true }
   }
-}
-
-async function streamLeaseTargetFinalized(
-  tx: Transaction,
-  lease: StreamLeaseRow,
-  options: { readContinuationBody?: boolean } = {},
-): Promise<boolean> {
-  if (!lease.messageId) return false
-  const header = await tx.table<MessageHeaderRow, MessageId>('messages').get(lease.messageId)
-  if (lease.attemptKind === 'generation') return header?.generation?.finishedAt !== undefined
-  if (lease.attemptKind !== 'continuation') return false
-  if (options.readContinuationBody === false) return false
-  const body = await tx.table<MessageBodyRow, MessageId>('messageBodies').get(lease.messageId)
-  return body?.continuationAttempts?.some((attempt) => attempt.streamId === lease.streamId) === true
-}
-
-function isStreamLeaseRow(value: unknown): value is StreamLeaseRow {
-  if (!value || typeof value !== 'object') return false
-  const row = value as Partial<Record<keyof StreamLeaseRow, unknown>>
-  return (
-    typeof row.streamId === 'string' &&
-    typeof row.chatId === 'string' &&
-    (row.messageId === undefined || typeof row.messageId === 'string') &&
-    typeof row.ownerClientId === 'string' &&
-    typeof row.startedAt === 'number' &&
-    Number.isFinite(row.startedAt) &&
-    typeof row.heartbeatAt === 'number' &&
-    Number.isFinite(row.heartbeatAt) &&
-    (row.admissionSequence === undefined ||
-      (typeof row.admissionSequence === 'number' &&
-        Number.isSafeInteger(row.admissionSequence) &&
-        row.admissionSequence >= 0)) &&
-    (row.attemptKind === undefined ||
-      row.attemptKind === 'generation' ||
-      row.attemptKind === 'continuation') &&
-    (row.continuationStrategy === undefined ||
-      row.continuationStrategy === 'prompt' ||
-      row.continuationStrategy === 'prefill') &&
-    (row.baseNodeVersion === undefined ||
-      (typeof row.baseNodeVersion === 'number' &&
-        Number.isSafeInteger(row.baseNodeVersion) &&
-        row.baseNodeVersion >= 0)) &&
-    (row.baseBodyVersion === undefined ||
-      (typeof row.baseBodyVersion === 'number' &&
-        Number.isSafeInteger(row.baseBodyVersion) &&
-        row.baseBodyVersion >= 0)) &&
-    (row.requestedModel === undefined || typeof row.requestedModel === 'string') &&
-    (row.apiUsed === undefined ||
-      row.apiUsed === 'chat' ||
-      row.apiUsed === 'responses' ||
-      row.apiUsed === 'gemini-native' ||
-      row.apiUsed === 'anthropic-messages' ||
-      row.apiUsed === 'completion' ||
-      row.apiUsed === 'video-generation')
-  )
-}
-
-function requiredStreamFence(lease: StreamLeaseRow): StreamWriteFence {
-  if (
-    typeof lease.fenceToken !== 'string' ||
-    !Number.isSafeInteger(lease.replacementEpoch) ||
-    (lease.replacementEpoch ?? -1) < 0
-  ) {
-    throw new Error(`StreamFenceMissing:${lease.streamId}`)
-  }
+  const existingView = createAppliedMessageView(existingBody)
+  const nextView = createAppliedMessageView(nextBody)
   return {
-    ownerClientId: lease.ownerClientId,
-    fenceToken: lease.fenceToken,
-    replacementEpoch: lease.replacementEpoch as number,
+    requestContextChanged:
+      requestHeaderChanged || !appliedMessageRequestSemanticsEqual(existingView, nextView),
+    branchCorpusChanged:
+      corpusHeaderChanged ||
+      existingView.phase !== nextView.phase ||
+      !messageRenderableTextSemanticsEqual(
+        {
+          ...existingBody,
+          ...(existingHeader.attachmentRefs
+            ? { attachmentRefs: existingHeader.attachmentRefs }
+            : {}),
+        },
+        {
+          ...nextBody,
+          ...(nextHeader.attachmentRefs ? { attachmentRefs: nextHeader.attachmentRefs } : {}),
+        },
+        existingView,
+        nextView,
+      ),
   }
 }
 
-function requiredChunkFence(
-  chunk: StreamChunkRow,
-): Pick<StreamWriteFence, 'fenceToken' | 'replacementEpoch'> {
-  if (
-    typeof chunk.fenceToken !== 'string' ||
-    !Number.isSafeInteger(chunk.replacementEpoch) ||
-    (chunk.replacementEpoch ?? -1) < 0
-  ) {
-    throw new Error(`StreamFenceMissing:${chunk.streamId}`)
+function nextStreamLeaseRevision(lease: Pick<StreamLeaseRow, 'revision'>): number {
+  if (lease.revision >= Number.MAX_SAFE_INTEGER) {
+    throw new Error('StreamLeaseRevisionExhausted')
   }
-  return {
-    fenceToken: chunk.fenceToken,
-    replacementEpoch: chunk.replacementEpoch as number,
-  }
+  return lease.revision + 1
 }
 
 function assertOwnedStreamFence(
@@ -471,79 +701,18 @@ function assertOwnedStreamFence(
   fence: StreamWriteFence,
   replacementEpoch: number,
   streamId: string,
-): asserts lease is StreamLeaseRow {
-  if (
-    !lease ||
-    lease.ownerClientId !== fence.ownerClientId ||
-    lease.fenceToken !== fence.fenceToken ||
-    lease.replacementEpoch !== fence.replacementEpoch ||
-    replacementEpoch !== fence.replacementEpoch
-  ) {
+): asserts lease is FencedStreamLeaseRow {
+  if (!streamLeaseMatchesWriteFence(lease, fence) || replacementEpoch !== fence.replacementEpoch) {
     throw new Error(`StreamFenceLost:${streamId}`)
   }
 }
 
-function isStreamChunkRow(value: unknown): value is StreamChunkRow {
-  if (!value || typeof value !== 'object') return false
-  const row = value as Partial<StreamChunkRow>
-  return (
-    typeof row.id === 'string' &&
-    typeof row.streamId === 'string' &&
-    typeof row.chatId === 'string' &&
-    typeof row.messageId === 'string' &&
-    typeof row.seq === 'number' &&
-    Number.isFinite(row.seq) &&
-    typeof row.createdAt === 'number' &&
-    Number.isFinite(row.createdAt) &&
-    'event' in row
-  )
-}
-
-function valuesEqual(left: unknown, right: unknown): boolean {
-  return stableStringify(left) === stableStringify(right)
-}
-
-function changedPatch<Row extends object>(
-  current: Partial<Row>,
-  patch: Partial<Row>,
-): Partial<Row> | null {
-  const next: Partial<Row> = {}
-  let changed = false
-  for (const key of Object.keys(patch) as Array<keyof Row>) {
-    const value = patch[key]
-    if (valuesEqual(current[key], value)) continue
-    next[key] = value
-    changed = true
-  }
-  return changed ? next : null
-}
-
-function cloneMessage(message: Message): Message {
-  const cloned = structuredClone(message)
-  cloned.attachmentRefs = normalizeAttachmentRefs(cloned.attachmentRefs, {
-    messageId: cloned.id,
-    createdAt: cloned.createdAt,
-  })
-  return cloned
-}
-
 function cloneMessageHeader(message: MessageHeaderRow): MessageHeaderRow {
-  const cloned = structuredClone(message)
-  cloned.attachmentRefs = normalizeAttachmentRefs(cloned.attachmentRefs, {
-    messageId: cloned.id,
-    createdAt: cloned.createdAt,
-  })
-  return cloned
+  return canonicalMessageHeaderRow(message)
 }
 
-function branchWindowRange(
-  total: number,
-  window: Pick<ActiveBranchBodyPage, 'offset' | 'limit'>,
-): { start: number; end: number; limit: number } {
-  const limit = Math.max(0, Math.floor(window.limit))
-  const offset = Math.floor(window.offset)
-  const start = offset < 0 ? Math.max(0, total - limit) : Math.max(0, Math.min(total, offset))
-  return { start, end: Math.min(total, start + limit), limit }
+type MutableMessageHeaderRow = {
+  -readonly [K in keyof MessageHeaderRow]: MessageHeaderRow[K]
 }
 
 function throwIfReadonlyAborted(signal: AbortSignal | undefined, message: string): void {
@@ -565,123 +734,11 @@ function bindReadonlyTransactionAbort(
   return () => signal.removeEventListener('abort', abort)
 }
 
-async function listChildHeaderRows(
-  table: Table<MessageHeaderRow, MessageId>,
-  chatId: ChatId,
-  parentId: MessageId | null,
-): Promise<MessageHeaderRow[]> {
-  if (parentId === null) {
-    return table
-      .where('chatId')
-      .equals(chatId)
-      .filter((row) => row.parentId === null)
-      .toArray()
-  }
-  return table
-    .where('[chatId+parentId]')
-    .equals([chatId, parentId] as never)
-    .toArray()
-}
-
-function nextSiblingIndex(headers: readonly Pick<MessageHeaderRow, 'siblingIndex'>[]): number {
-  let highest = -1
-  for (const header of headers) highest = Math.max(highest, header.siblingIndex)
-  return highest + 1
-}
-
-function applyMessageBodyPatch(body: MessageBodyRow, patch: MessageBodyPatch): MessageBodyRow {
-  const next = structuredClone(body)
-  if ('content' in patch) {
-    if (patch.content === undefined) throw new Error(`MessageBodyPatchMissingContent:${body.id}`)
-    next.content = structuredClone(patch.content)
-  }
-  if ('reasoningDetails' in patch) {
-    if (patch.reasoningDetails === undefined) delete next.reasoningDetails
-    else next.reasoningDetails = structuredClone(patch.reasoningDetails)
-  }
-  if ('toolCalls' in patch) {
-    if (patch.toolCalls === undefined) delete next.toolCalls
-    else next.toolCalls = structuredClone(patch.toolCalls)
-  }
-  if ('refusal' in patch) {
-    if (patch.refusal === undefined) delete next.refusal
-    else next.refusal = patch.refusal
-  }
-  if ('phase' in patch) {
-    if (patch.phase === undefined) delete next.phase
-    else next.phase = patch.phase
-  }
-  if ('responsesEchoItem' in patch) {
-    if (patch.responsesEchoItem === undefined) delete next.responsesEchoItem
-    else next.responsesEchoItem = structuredClone(patch.responsesEchoItem)
-  }
-  if ('providerOutputItems' in patch) {
-    if (patch.providerOutputItems === undefined) delete next.providerOutputItems
-    else next.providerOutputItems = structuredClone(patch.providerOutputItems)
-  }
-  if ('continuationAttempts' in patch) {
-    if (patch.continuationAttempts === undefined) delete next.continuationAttempts
-    else next.continuationAttempts = structuredClone(patch.continuationAttempts)
-  }
-  return next
-}
-
-function replacementMessageBody(
-  header: MessageHeaderRow,
-  patch: MessageBodyPatch,
-  options: { bodyVersion: number; updatedAt: number },
-): MessageBodyRow {
-  if (!('content' in patch) || patch.content === undefined) {
-    throw new Error(`MessageBodyPatchMissingContent:${header.id}`)
-  }
-  const body: MessageBodyRow = {
-    id: header.id,
-    chatId: header.chatId,
-    bodyVersion: options.bodyVersion,
-    updatedAt: options.updatedAt,
-    content: structuredClone(patch.content),
-  }
-  if (patch.reasoningDetails !== undefined) {
-    body.reasoningDetails = structuredClone(patch.reasoningDetails)
-  }
-  if (patch.toolCalls !== undefined) body.toolCalls = structuredClone(patch.toolCalls)
-  if (patch.refusal !== undefined) body.refusal = patch.refusal
-  if (patch.phase !== undefined) body.phase = patch.phase
-  if (patch.responsesEchoItem !== undefined) {
-    body.responsesEchoItem = structuredClone(patch.responsesEchoItem)
-  }
-  if (patch.providerOutputItems !== undefined) {
-    body.providerOutputItems = structuredClone(patch.providerOutputItems)
-  }
-  if (patch.continuationAttempts !== undefined) {
-    body.continuationAttempts = structuredClone(patch.continuationAttempts)
-  }
-  return body
-}
-
-const FORBIDDEN_MESSAGE_HEADER_PATCH_KEYS = new Set<keyof MessageHeaderRow>([
-  'id',
-  'chatId',
-  'parentId',
-  'siblingIndex',
-  'turnId',
-  'turnIndex',
-  'createdAt',
-  'role',
-  'origin',
-  'nodeVersion',
-  'requestContextVersion',
-  'bodyVersion',
-  'bodyWordCount',
-  'deleted',
-  'textPreview',
-])
-
 function applyMessageHeaderPatch(
   header: MessageHeaderRow,
   patch: MessageHeaderPatch | undefined,
 ): MessageHeaderRow {
-  const next = cloneMessageHeader(header)
+  const next: MutableMessageHeaderRow = cloneMessageHeader(header)
   if (!patch) return next
   for (const key of Object.keys(patch) as Array<keyof MessageHeaderRow>) {
     if (FORBIDDEN_MESSAGE_HEADER_PATCH_KEYS.has(key)) {
@@ -728,20 +785,13 @@ function hydrateStoredMessage(header: MessageHeaderRow, body: MessageBodyRow): M
   return hydrateMessage(cloneMessageHeader(header), body)
 }
 
-function hydrateStoredMessagePresentationSnapshot(
-  header: MessageHeaderRow,
-  body: MessageBodyRow,
-): MessagePresentationSnapshot {
-  return { message: hydrateStoredMessage(header, body), bodyVersion: body.bodyVersion }
-}
-
 async function readStoredMessage<T>(
+  db: NatterDb,
   messageId: MessageId,
   signal: AbortSignal | undefined,
   project: (header: MessageHeaderRow, body: MessageBodyRow) => T,
 ): Promise<T | undefined> {
   throwIfReadonlyAborted(signal, 'Message read aborted')
-  const db = await openDb()
   return db.transaction('r', db.messages, db.messageBodies, async (tx: Transaction) => {
     const unbind = bindReadonlyTransactionAbort(tx, signal, 'Message read aborted')
     try {
@@ -757,6 +807,64 @@ async function readStoredMessage<T>(
   })
 }
 
+async function readMessageTextPreviewWindow(
+  db: NatterDb,
+  targets: readonly (MessageTextPreviewTarget | { messageId: MessageId })[],
+  options: { maxChars?: number; signal?: AbortSignal },
+): Promise<Array<MessageTextPreviewSnapshot | undefined>> {
+  throwIfReadonlyAborted(options.signal, 'Message preview read aborted')
+  if (targets.length === 0) return []
+  const maxChars = Math.min(
+    MESSAGE_TEXT_PREVIEW_MAX_CHARS,
+    Math.max(1, Math.floor(options.maxChars ?? 240)),
+  )
+  const rows: Array<MessageTextPreviewSnapshot | undefined> = []
+  for (let offset = 0; offset < targets.length; offset += BODY_READ_PAGE_SIZE) {
+    throwIfReadonlyAborted(options.signal, 'Message preview read aborted')
+    const pageTargets = targets.slice(offset, offset + BODY_READ_PAGE_SIZE)
+    const messageIds = pageTargets.map((target) => target.messageId)
+    const page = await db.transaction(
+      'r',
+      db.messages,
+      db.messagePreviews,
+      async (tx: Transaction) => {
+        const unbind = bindReadonlyTransactionAbort(
+          tx,
+          options.signal,
+          'Message preview read aborted',
+        )
+        try {
+          const [headers, previews] = await Promise.all([
+            tx.table<MessageHeaderRow, MessageId>('messages').bulkGet(messageIds),
+            tx.table<MessageTextPreviewRow, MessageId>('messagePreviews').bulkGet(messageIds),
+          ])
+          return pageTargets.map((target, index) => {
+            const header = headers[index]
+            if (!header) return undefined
+            if ('bodyVersion' in target && header.bodyVersion !== target.bodyVersion) {
+              return undefined
+            }
+            const preview = previews[index]
+            if (!preview) throw new Error(`MessagePreviewMissing:${target.messageId}`)
+            if (preview.bodyVersion !== header.bodyVersion) {
+              throw new Error(`MessagePreviewVersionMismatch:${target.messageId}`)
+            }
+            return {
+              messageId: target.messageId,
+              bodyVersion: header.bodyVersion,
+              text: previewTextFromStoredProjection(preview.text, maxChars),
+            }
+          })
+        } finally {
+          unbind()
+        }
+      },
+    )
+    rows.push(...page)
+  }
+  return rows
+}
+
 async function hydrateStoredMessages(
   headers: readonly MessageHeaderRow[],
   bodyTable: Table<MessageBodyRow, MessageId>,
@@ -765,66 +873,6 @@ async function hydrateStoredMessages(
     (row): row is MessageBodyRow => row !== undefined,
   )
   return hydrateMessages(headers.map(cloneMessageHeader), bodies)
-}
-
-async function listMessagesInTransaction(tx: Transaction, chatId: ChatId): Promise<Message[]> {
-  const headers = await tx
-    .table<MessageHeaderRow, MessageId>('messages')
-    .where('chatId')
-    .equals(chatId)
-    .toArray()
-  return hydrateStoredMessages(headers, tx.table<MessageBodyRow, MessageId>('messageBodies'))
-}
-
-async function chatPreviewInTransaction(tx: Transaction, chatId: ChatId): Promise<string> {
-  const header = await tx
-    .table<MessageHeaderRow, MessageId>('messages')
-    .where('[chatId+createdAt]')
-    .between([chatId, Dexie.minKey], [chatId, Dexie.maxKey])
-    .filter((row) => !row.deleted && row.role === 'user')
-    .first()
-  if (!header) return ''
-  return previewTextFromStoredProjection(header.textPreview)
-}
-
-function branchHeadersByLeaf(
-  headers: readonly MessageHeaderRow[],
-  leafId: MessageId | null,
-): MessageHeaderRow[] {
-  if (leafId === null) return []
-  const byId = new Map(headers.map((header) => [header.id, header]))
-  const branch: MessageHeaderRow[] = []
-  let cursor: MessageId | null = leafId
-  while (cursor !== null) {
-    const header = byId.get(cursor)
-    if (!header || header.deleted) break
-    branch.push(header)
-    cursor = header.parentId
-  }
-  branch.reverse()
-  return branch
-}
-
-function siblingGroupsForBranch(
-  headers: readonly MessageHeaderRow[],
-  branchHeaders: readonly MessageHeaderRow[],
-): ActiveBranchSnapshot['siblingGroups'] {
-  const parentIds = new Set<MessageId | null>([null])
-  for (const header of branchHeaders) parentIds.add(header.parentId)
-  const byParent = new Map<MessageId | null, MessageHeaderRow[]>()
-  for (const header of headers) {
-    if (!parentIds.has(header.parentId)) continue
-    const bucket = byParent.get(header.parentId)
-    if (bucket) bucket.push(header)
-    else byParent.set(header.parentId, [header])
-  }
-  for (const bucket of byParent.values()) {
-    bucket.sort((left, right) => left.siblingIndex - right.siblingIndex)
-  }
-  return [...parentIds].map((parentId) => ({
-    parentId,
-    siblings: (byParent.get(parentId) ?? []).map(cloneMessageHeader),
-  }))
 }
 
 function cloneDraft(draft: DraftRow): DraftRow {
@@ -843,34 +891,6 @@ async function hydrateStoredAttachment(
   return hydrateAttachment(header, await artifacts.bulkGet(header.artifactIds))
 }
 
-function setMessageHeader(
-  messagesById: Map<MessageId, MessageHeaderRow>,
-  nextMessage: MessageHeaderRow,
-): void {
-  messagesById.set(nextMessage.id, cloneMessageHeader(nextMessage))
-}
-
-function messageCost(message: Message): number {
-  return message.deleted ? 0 : (message.generation?.cost ?? 0)
-}
-
-function recordMessageSummaryDeltas(
-  state: ChatMutationState | undefined,
-  messageId: MessageId,
-  before: Message,
-  after: Message,
-): void {
-  if (!state) return
-  const delta = countMessagesWords([after]) - countMessagesWords([before])
-  state.wordCountDeltas.set(messageId, (state.wordCountDeltas.get(messageId) ?? 0) + delta)
-  state.totalCostDelta += messageCost(after) - messageCost(before)
-}
-
-function recordNewMessageSummary(state: ChatMutationState, message: Message): void {
-  state.wordCountDeltas.set(message.id, countMessagesWords([message]))
-  state.totalCostDelta += messageCost(message)
-}
-
 function computeTotalCostUsd(messages: readonly Pick<Message, 'deleted' | 'generation'>[]): number {
   let total = 0
   for (const message of messages) {
@@ -880,580 +900,447 @@ function computeTotalCostUsd(messages: readonly Pick<Message, 'deleted' | 'gener
   return total
 }
 
-function stripMetaPatch(patch: Partial<Chat>): Partial<Chat> {
-  const next = { ...patch }
-  delete next.updatedAt
-  delete next.wordCount
-  delete next.totalCostUsd
-  delete next.lastUpdatedLeafId
-  delete next.lastBranchUpdatedAt
-  delete next.summaryVersion
-  delete next.metaVersion
-  return next
+function sealValidatedGenerationPromptPathHeaders(
+  headers: MessageHeaderRow[],
+): ValidatedGenerationPromptPathHeaders {
+  Object.defineProperty(headers, VALIDATED_GENERATION_PROMPT_PATH_HEADERS, { value: true })
+  return Object.freeze(headers) as ValidatedGenerationPromptPathHeaders
 }
 
-function stripSummaryPatch(patch: Partial<Chat>): Partial<Chat> {
-  const next = { ...patch }
-  delete next.updatedAt
-  delete next.metaVersion
-  delete next.summaryVersion
-  delete next.settings
-  delete next.title
-  delete next.titleStatus
-  delete next.archived
-  delete next.pinned
-  delete next.folderId
-  delete next.tags
-  delete next.presetId
-  return next
-}
-
-function attachmentSearchText(
-  attachment: AttachmentHeaderRow,
-  artifacts: readonly AttachmentArtifact[],
-): string {
-  return [
-    attachment.id,
-    attachment.contentHash,
-    attachment.kind,
-    attachment.mime,
-    attachment.filename,
-    attachment.extension,
-    attachment.origin,
-    attachment.sourceUrl,
-    attachment.storage.kind,
-    ...attachment.processing.map((state) => state.processorId),
-    ...artifacts.flatMap((artifact) => [
-      artifact.artifactId,
-      artifact.kind,
-      artifact.processorId,
-      artifact.kind === 'text' ? artifact.text : undefined,
-      artifact.kind === 'json' ? JSON.stringify(artifact.value) : undefined,
+function appendValidatedGenerationPromptPath(
+  path: ValidatedGenerationPromptPath,
+  header: MessageHeaderRow,
+): ValidatedGenerationPromptPath {
+  return Object.freeze({
+    headers: sealValidatedGenerationPromptPathHeaders([
+      ...path.headers,
+      cloneMessageHeader(header),
     ]),
-  ]
-    .filter((value): value is string => typeof value === 'string' && value.length > 0)
-    .join('\n')
-    .toLowerCase()
+    messageProofs: Object.freeze([
+      ...path.messageProofs,
+      generationMessageReadProofFromHeader(header),
+    ]),
+  })
 }
 
-function attachmentSorter(
-  sort: AttachmentSearchQuery['sort'],
-): (left: AttachmentHeaderRow, right: AttachmentHeaderRow) => number {
-  const resolvedSort = sort ?? 'created-desc'
-  return (left, right) =>
-    compareAttachmentSortTuples(
-      attachmentSortValue(left, resolvedSort),
-      left.id,
-      attachmentSortValue(right, resolvedSort),
-      right.id,
-      resolvedSort,
-    )
-}
-
-type AttachmentSearchSort = NonNullable<AttachmentSearchQuery['sort']>
-type AttachmentSearchIndex = AttachmentSearchMeasurement['selectedIndex']
-
-const ATTACHMENT_SEARCH_CURSOR_PREFIX = 'natter-attachment-search:v1:'
-const ATTACHMENT_SEARCH_CURSOR_FAMILY = 'natter-attachment-search:'
-const ATTACHMENT_ARTIFACT_ID_BATCH = 500
-const ATTACHMENT_SEARCH_ABORT_CHECK_INTERVAL = 256
-
-interface AttachmentCursorTuple {
-  sort: AttachmentSearchSort
-  value: number
-  id: AttachmentId
-}
-
-interface AttachmentIndexCandidate {
-  index: Exclude<AttachmentSearchIndex, 'createdAt' | 'updatedAt' | 'primary'>
-  collection: Collection<Attachment, AttachmentId>
-  count: number
-}
-
-async function loadAttachmentSearchMetadata(
-  table: Table<Attachment, AttachmentId>,
-  query: AttachmentSearchQuery,
-  sort: AttachmentSearchSort,
-  measurement: AttachmentSearchMeasurement,
-): Promise<AttachmentHeaderRow[]> {
-  const filters = query.filters
+async function resolveGenerationPromptPathProof(
+  ctx: MutationContext,
+  chatId: ChatId,
+  proof: GenerationPromptPathProof,
+  path: ValidatedGenerationPromptPath,
+): Promise<ResolvedGenerationPromptPath> {
+  const { headers } = path
+  const requirement = proof.requirement
+  if (requirement.surface === 'chat' && requirement.chatId !== chatId) {
+    throw new GenerationPlanningSeedChangedError(chatId)
+  }
+  let targetHeader: MessageHeaderRow | undefined
+  let leafId: MessageId | null = null
+  if (requirement.target.kind !== 'root') {
+    targetHeader = await ctx.getMessageHeader(requirement.target.messageId)
+    if (
+      !targetHeader ||
+      targetHeader.chatId !== chatId ||
+      targetHeader.deleted ||
+      (requirement.target.role !== 'any' && targetHeader.role !== requirement.target.role)
+    ) {
+      throw new GenerationPlanningSeedChangedError(chatId)
+    }
+    leafId = requirement.target.kind === 'exclude' ? targetHeader.parentId : targetHeader.id
+  }
   if (
-    filters?.minRefCount !== undefined &&
-    filters.maxRefCount !== undefined &&
-    filters.minRefCount > filters.maxRefCount
+    proof.claim.chatId !== chatId ||
+    proof.claim.leafId !== leafId ||
+    (leafId === null ? headers.length !== 0 : headers.at(-1)?.id !== leafId)
   ) {
-    measurement.selectedIndex = 'refCount'
-    measurement.indexCounts.refCount = 0
-    return []
+    throw new GenerationPlanningSeedChangedError(chatId)
   }
-  const candidates: Array<{
-    index: AttachmentIndexCandidate['index']
-    collection: Collection<Attachment, AttachmentId>
-  }> = []
-  if (filters?.kind) {
-    candidates.push({ index: 'kind', collection: table.where('kind').equals(filters.kind) })
+  let slot: ChildListState | undefined
+  if (requirement.childSlot !== 'none') {
+    slot = await ctx.getChildList(chatId, leafId)
+    if (requirement.childSlot === 'empty' && slot.liveCount > 0) {
+      throw new ExpectedLeafChangedError(
+        chatId,
+        leafId,
+        leafId === null ? 'root-not-empty' : 'has-live-child',
+        slot.firstLiveChildId ?? undefined,
+      )
+    }
   }
-  if (filters?.mime) {
-    candidates.push({ index: 'mime', collection: table.where('mime').equals(filters.mime) })
+  return {
+    ...path,
+    leafId,
+    ...(targetHeader ? { targetHeader } : {}),
+    ...(slot ? { slot } : {}),
   }
-  if (filters?.origin) {
-    candidates.push({ index: 'origin', collection: table.where('origin').equals(filters.origin) })
+}
+
+function requiredPromptPathTarget(
+  path: ResolvedGenerationPromptPath,
+  chatId: ChatId,
+): MessageHeaderRow {
+  if (!path.targetHeader) throw new GenerationPlanningSeedChangedError(chatId)
+  return path.targetHeader
+}
+
+function requiredPromptPathSlot(
+  path: ResolvedGenerationPromptPath,
+  chatId: ChatId,
+): ChildListState {
+  if (!path.slot) throw new GenerationPlanningSeedChangedError(chatId)
+  return path.slot
+}
+
+class BrowserCommandCommit implements BrowserCommandSessionPort {
+  private readonly committedMutationTables = new Set<string>()
+  private readonly physicalMutationsByAddress = new Map<string, BrowserCommandPhysicalMutation>()
+  private readonly physicalOwnerScopesById = new Map<string, BrowserCommandPhysicalOwnerScope>()
+  private readonly internalMutationEvidence = new Set<string>()
+  private readonly messageRevisionsById = new Map<
+    MessageId,
+    {
+      readonly before?: MessageHeaderRow
+      readonly header: MessageHeaderRow
+      readonly structuralVersion: number
+      readonly presentation?: MessagePresentation
+    }
+  >()
+  private readonly childSlotsById = new Map<string, WorkspaceLocalChildSlotAccumulator>()
+  private readonly chatsById = new Map<ChatId, Chat | null>()
+  private readonly initialChatExistsById = new Map<ChatId, boolean>()
+  private readonly attachmentReferenceStates = new Map<AttachmentId, AttachmentReferenceStateFact>()
+  private readonly attachmentRowsById = new Map<AttachmentId, boolean>()
+  private readonly inexactAttachmentReferenceIds = new Set<AttachmentId>()
+  private readonly attachmentReapRequestIds = new Set<AttachmentId>()
+  private readonly extraInvalidations: WorkspaceDependency[] = []
+  private readonly db: Dexie
+  private readonly lockSession: AuthoritativeCommandLockSession
+  private readonly workspaceId: string
+  private readonly replacementEpoch: number
+  readonly commitId: string
+
+  constructor(
+    db: Dexie,
+    lockSession: AuthoritativeCommandLockSession,
+    workspaceId: string,
+    replacementEpoch: number,
+    commitId: string,
+  ) {
+    this.db = db
+    this.lockSession = lockSession
+    this.workspaceId = workspaceId
+    this.replacementEpoch = replacementEpoch
+    this.commitId = commitId
   }
-  if (filters?.minRefCount !== undefined || filters?.maxRefCount !== undefined) {
-    candidates.push({
-      index: 'refCount',
-      collection: table
-        .where('refCount')
-        .between(
-          filters.minRefCount ?? Dexie.minKey,
-          filters.maxRefCount ?? Dexie.maxKey,
-          true,
-          true,
-        ),
+
+  withLocks<T>(
+    resourceNames: readonly string[],
+    operation: (locked: BrowserLockedCommandPort) => Promise<T> | T,
+  ): Promise<T> {
+    return this.lockSession.withResourceLocks(resourceNames, async (grant) => {
+      let active = true
+      const locked: BrowserLockedCommandPort = Object.freeze({
+        runTransaction: <Tables extends PhysicalStorageTableName, Result>(
+          plan: PhysicalTransactionPlan<Tables>,
+          transactionOperation: (tx: FencedTransaction<Tables>) => Promise<Result> | Result,
+        ) => {
+          if (!active) return Promise.reject(new Error('BrowserLockedCommandPortExpired'))
+          return this.runTransaction(grant, plan, transactionOperation)
+        },
+      })
+      try {
+        return await operation(locked)
+      } finally {
+        active = false
+      }
     })
   }
 
-  let selected: AttachmentIndexCandidate | undefined
-  if (candidates.length === 1) {
-    const candidate = candidates[0]
-    if (candidate) selected = { ...candidate, count: 0 }
-  } else {
-    for (const candidate of candidates) {
-      throwIfAttachmentSearchAborted(query.signal)
-      const count = await candidate.collection.count()
-      throwIfAttachmentSearchAborted(query.signal)
-      measurement.indexCounts[candidate.index] = count
-      if (!selected || count < selected.count) selected = { ...candidate, count }
+  private async runTransaction<Tables extends PhysicalStorageTableName, T>(
+    grant: LockGrant,
+    plan: PhysicalTransactionPlan<Tables>,
+    operation: (tx: FencedTransaction<Tables>) => Promise<T> | T,
+  ): Promise<T> {
+    const committed = await grant.runTransaction(this.db, plan.tableNames, async (tx) => {
+      registerPhysicalMutationTransaction(tx)
+      const result = await runBrowserCommandTransaction(tx, (transaction) =>
+        operation(bindFencedTransaction(transaction, plan)),
+      )
+      assertPhysicalTransactionTablesDeclared(plan, result.facts.tableNames)
+      return result
+    })
+    this.recordCommittedMutationFacts(committed.facts)
+    return committed.value
+  }
+
+  private recordCommittedMutationFacts(facts: BrowserCommandMutationFacts): void {
+    for (const tableName of facts.tableNames) this.committedMutationTables.add(tableName)
+    for (const scope of facts.physicalOwnerScopes) {
+      const previous = this.physicalOwnerScopesById.get(scope.id)
+      if (previous && !sameValue(previous, scope)) {
+        throw new Error(`BrowserCommandPhysicalOwnerScopeConflict:${scope.id}`)
+      }
+      this.physicalOwnerScopesById.set(scope.id, structuredClone(scope))
+    }
+    for (const mutation of facts.physicalMutations) {
+      this.physicalMutationsByAddress.set(mutation.address, structuredClone(mutation))
+    }
+    for (const address of facts.internalMutationEvidence) {
+      this.internalMutationEvidence.add(address)
+    }
+    for (const invalidation of facts.invalidations) this.extraInvalidations.push(invalidation)
+    for (const fact of facts.chatStates) {
+      if (!this.initialChatExistsById.has(fact.chatId)) {
+        this.initialChatExistsById.set(fact.chatId, fact.initialExists)
+      }
+      this.chatsById.set(fact.chatId, fact.chat ? structuredClone(fact.chat) : null)
+    }
+    for (const fact of facts.attachmentRows) {
+      this.attachmentRowsById.set(fact.attachmentId, fact.exists)
+    }
+    this.accumulateMessageRevisions(facts.messageRevisions)
+    this.accumulateChildSlots(facts.childSlots)
+    for (const fact of facts.attachmentReferenceStates) {
+      if (
+        fact.final.exists &&
+        fact.final.refCount === 0 &&
+        (!fact.initial.exists || fact.initial.refCount > 0)
+      ) {
+        this.attachmentReapRequestIds.add(fact.attachmentId)
+      }
+      const current = this.attachmentReferenceStates.get(fact.attachmentId)
+      if (!current) {
+        this.attachmentReferenceStates.set(fact.attachmentId, fact)
+        continue
+      }
+      if (this.inexactAttachmentReferenceIds.has(fact.attachmentId)) {
+        this.attachmentReferenceStates.set(fact.attachmentId, {
+          attachmentId: fact.attachmentId,
+          initial: current.initial,
+          final: fact.final,
+          projectionChanged: current.projectionChanged || fact.projectionChanged,
+        })
+        continue
+      }
+      if (
+        current.final.exists !== fact.initial.exists ||
+        current.final.refCount !== fact.initial.refCount
+      ) {
+        this.attachmentReferenceStates.set(fact.attachmentId, {
+          attachmentId: fact.attachmentId,
+          initial: current.initial,
+          final: fact.final,
+          projectionChanged: current.projectionChanged || fact.projectionChanged,
+        })
+        this.inexactAttachmentReferenceIds.add(fact.attachmentId)
+        continue
+      }
+      this.attachmentReferenceStates.set(fact.attachmentId, {
+        attachmentId: fact.attachmentId,
+        initial: current.initial,
+        final: fact.final,
+        projectionChanged: current.projectionChanged || fact.projectionChanged,
+      })
     }
   }
 
-  let collection: Collection<Attachment, AttachmentId>
-  if (selected) {
-    measurement.selectedIndex = selected.index
-    collection = selected.collection
-  } else if (sort === 'created-asc' || sort === 'created-desc') {
-    measurement.selectedIndex = 'createdAt'
-    const ordered = table.orderBy('createdAt')
-    collection = sort === 'created-desc' ? ordered.reverse() : ordered
-  } else if (sort === 'updated-desc') {
-    measurement.selectedIndex = 'updatedAt'
-    collection = table.orderBy('updatedAt').reverse()
-  } else {
-    measurement.selectedIndex = 'primary'
-    collection = table.toCollection()
-  }
-
-  const rows = await collection.toArray()
-  throwIfAttachmentSearchAborted(query.signal)
-  measurement.metadataRowsRead = rows.length
-  return rows.map(attachmentHeaderFromStoredRow)
-}
-
-function attachmentMatchesFilters(
-  attachment: AttachmentHeaderRow,
-  query: AttachmentSearchQuery,
-): boolean {
-  const filters = query.filters
-  if (filters?.kind && attachment.kind !== filters.kind) return false
-  if (filters?.mime && attachment.mime !== filters.mime) return false
-  if (filters?.origin && attachment.origin !== filters.origin) return false
-  if (filters?.storageKind && attachment.storage.kind !== filters.storageKind) return false
-  if (filters?.minSizeBytes !== undefined && (attachment.sizeBytes ?? 0) < filters.minSizeBytes) {
-    return false
-  }
-  if (filters?.maxSizeBytes !== undefined && (attachment.sizeBytes ?? 0) > filters.maxSizeBytes) {
-    return false
-  }
-  if (filters?.minRefCount !== undefined && attachment.refCount < filters.minRefCount) return false
-  if (filters?.maxRefCount !== undefined && attachment.refCount > filters.maxRefCount) return false
-  return true
-}
-
-async function loadCandidateAttachmentArtifacts(
-  table: Table<AttachmentArtifact, string>,
-  attachmentIds: readonly AttachmentId[],
-  signal: AbortSignal | undefined,
-): Promise<AttachmentArtifact[]> {
-  const rows: AttachmentArtifact[] = []
-  for (let offset = 0; offset < attachmentIds.length; offset += ATTACHMENT_ARTIFACT_ID_BATCH) {
-    throwIfAttachmentSearchAborted(signal)
-    const batch = attachmentIds.slice(offset, offset + ATTACHMENT_ARTIFACT_ID_BATCH)
-    rows.push(...(await table.where('attachmentId').anyOf(batch).toArray()))
-    throwIfAttachmentSearchAborted(signal)
-  }
-  return rows
-}
-
-function encodeAttachmentCursor(
-  attachment: AttachmentHeaderRow,
-  sort: AttachmentSearchSort,
-): string {
-  const tuple: [AttachmentSearchSort, number, AttachmentId] = [
-    sort,
-    attachmentSortValue(attachment, sort),
-    attachment.id,
-  ]
-  return `${ATTACHMENT_SEARCH_CURSOR_PREFIX}${encodeURIComponent(JSON.stringify(tuple))}`
-}
-
-function decodeAttachmentCursor(cursor: string): AttachmentCursorTuple | { legacyId: string } {
-  if (!cursor.startsWith(ATTACHMENT_SEARCH_CURSOR_FAMILY)) return { legacyId: cursor }
-  if (!cursor.startsWith(ATTACHMENT_SEARCH_CURSOR_PREFIX)) {
-    throw new Error('AttachmentSearchCursorVersionUnsupported')
-  }
-  try {
-    const parsed = JSON.parse(
-      decodeURIComponent(cursor.slice(ATTACHMENT_SEARCH_CURSOR_PREFIX.length)),
-    ) as unknown
-    if (!Array.isArray(parsed) || parsed.length !== 3) throw new Error('shape')
-    const sort: unknown = parsed[0]
-    const value: unknown = parsed[1]
-    const id: unknown = parsed[2]
-    if (!isAttachmentSearchSort(sort) || typeof value !== 'number' || typeof id !== 'string') {
-      throw new Error('value')
-    }
-    return { sort, value, id }
-  } catch {
-    throw new Error('AttachmentSearchCursorInvalid')
-  }
-}
-
-function attachmentPageStart(
-  rows: readonly AttachmentHeaderRow[],
-  cursor: string | undefined,
-  sort: AttachmentSearchSort,
-): number {
-  if (cursor === undefined) return 0
-  const decoded = decodeAttachmentCursor(cursor)
-  if ('legacyId' in decoded || decoded.sort !== sort) {
-    const legacyId = 'legacyId' in decoded ? decoded.legacyId : decoded.id
-    return Math.max(0, rows.findIndex((row) => row.id === legacyId) + 1)
-  }
-  let low = 0
-  let high = rows.length
-  while (low < high) {
-    const middle = low + Math.floor((high - low) / 2)
-    const row = rows[middle]
-    if (
-      row &&
-      compareAttachmentSortTuples(
-        attachmentSortValue(row, sort),
-        row.id,
-        decoded.value,
-        decoded.id,
-        sort,
-      ) <= 0
-    ) {
-      low = middle + 1
-    } else {
-      high = middle
+  private accumulateMessageRevisions(
+    revisions: readonly BrowserCommandMessageRevisionFact[],
+  ): void {
+    for (const revision of revisions) {
+      const { header } = revision
+      const current = this.messageRevisionsById.get(header.id)
+      if (
+        current &&
+        (!revision.before || !sameMessageHeaderValue(current.header, revision.before))
+      ) {
+        throw new Error(`BrowserCommandMessageRevisionTransitionBroken:${header.id}`)
+      }
+      const retainedPresentation =
+        revision.presentation ??
+        (current?.presentation?.bodyVersion === header.bodyVersion
+          ? current.presentation
+          : undefined)
+      this.messageRevisionsById.set(header.id, {
+        ...(current
+          ? current.before
+            ? { before: cloneMessageHeader(current.before) }
+            : {}
+          : revision.before
+            ? { before: cloneMessageHeader(revision.before) }
+            : {}),
+        header: cloneMessageHeader(header),
+        structuralVersion: revision.structuralVersion,
+        ...(retainedPresentation ? { presentation: structuredClone(retainedPresentation) } : {}),
+      })
     }
   }
-  return low
-}
 
-function attachmentSortValue(attachment: AttachmentHeaderRow, sort: AttachmentSearchSort): number {
-  if (sort === 'updated-desc') return attachment.updatedAt
-  if (sort === 'size-desc' || sort === 'size-asc') return attachment.sizeBytes ?? 0
-  return attachment.createdAt
-}
-
-function compareAttachmentSortTuples(
-  leftValue: number,
-  leftId: AttachmentId,
-  rightValue: number,
-  rightId: AttachmentId,
-  sort: AttachmentSearchSort,
-): number {
-  if (leftValue !== rightValue) {
-    const ascending = sort === 'created-asc' || sort === 'size-asc'
-    return (leftValue < rightValue ? -1 : 1) * (ascending ? 1 : -1)
-  }
-  return leftId < rightId ? -1 : leftId > rightId ? 1 : 0
-}
-
-function isAttachmentSearchSort(value: unknown): value is AttachmentSearchSort {
-  return (
-    value === 'created-desc' ||
-    value === 'created-asc' ||
-    value === 'updated-desc' ||
-    value === 'size-desc' ||
-    value === 'size-asc'
-  )
-}
-
-function throwIfAttachmentSearchAborted(signal: AbortSignal | undefined): void {
-  if (signal?.aborted) throw new DOMException('Attachment search aborted', 'AbortError')
-}
-
-export function resolveMutationTableNames(
-  scopes: readonly MutationScope[],
-  options?: WorkspaceMutationOptions,
-): BrowserMutationTableName[] {
-  const names = new Set<BrowserMutationTableName>(['settings'])
-  if (options?.streamFence) names.add('streamLeases')
-  for (const scope of scopes) {
-    switch (scope.kind) {
-      case 'attachment':
-        names.add('attachmentArtifacts')
-        names.add('attachmentBlobs')
-        names.add('attachmentJobs')
-        names.add('attachmentRefEdges')
-        names.add('attachments')
-        break
-      case 'chat-meta':
-        names.add('chatSidebarRows')
-        names.add('chats')
-        break
-      case 'children':
-        names.add('chatBranchCache')
-        names.add('chatSidebarRows')
-        names.add('chats')
-        names.add('childLists')
-        names.add('messages')
-        names.add('messageBodies')
-        break
-      case 'draft':
-        names.add('chatSidebarRows')
-        names.add('chats')
-        names.add('drafts')
-        break
-      case 'message':
-        names.add('chatBranchCache')
-        names.add('chatSidebarRows')
-        names.add('chats')
-        names.add('messages')
-        names.add('messageBodies')
-        names.add('streamLeases')
-        break
+  private accumulateChildSlots(evidenceRows: readonly WorkspaceLocalChildSlotEvidence[]): void {
+    for (const evidence of evidenceRows) {
+      let accumulator = this.childSlotsById.get(evidence.state.id)
+      if (!accumulator) {
+        accumulator = new WorkspaceLocalChildSlotAccumulator()
+        this.childSlotsById.set(evidence.state.id, accumulator)
+      }
+      accumulator.add(evidence)
     }
   }
-  return MUTATION_TABLE_ORDER.filter((name) => names.has(name))
-}
 
-function resolveMutationTables(
-  db: NatterDb,
-  scopes: readonly MutationScope[],
-  options?: WorkspaceMutationOptions,
-): Table<unknown, unknown>[] {
-  return resolveMutationTableNames(scopes, options).map((name) => {
-    switch (name) {
-      case 'attachments':
-        return db.attachments as Table<unknown, unknown>
-      case 'attachmentArtifacts':
-        return db.attachmentArtifacts as Table<unknown, unknown>
-      case 'attachmentBlobs':
-        return db.attachmentBlobs as Table<unknown, unknown>
-      case 'attachmentJobs':
-        return db.attachmentJobs as Table<unknown, unknown>
-      case 'attachmentRefEdges':
-        return db.attachmentRefEdges as Table<unknown, unknown>
-      case 'chats':
-        return db.chats as Table<unknown, unknown>
-      case 'chatBranchCache':
-        return db.chatBranchCache as Table<unknown, unknown>
-      case 'chatSidebarRows':
-        return db.chatSidebarRows as Table<unknown, unknown>
-      case 'childLists':
-        return db.childLists as Table<unknown, unknown>
-      case 'drafts':
-        return db.drafts as Table<unknown, unknown>
-      case 'messages':
-        return db.messages as Table<unknown, unknown>
-      case 'messageBodies':
-        return db.messageBodies as Table<unknown, unknown>
-      case 'settings':
-        return db.settings as Table<unknown, unknown>
-      case 'streamLeases':
-        return db.streamLeases as Table<unknown, unknown>
+  childSlots(excludedChatIds: ReadonlySet<ChatId>): WorkspaceLocalChildSlotEvidence[] {
+    return [...this.childSlotsById.values()].flatMap((accumulator) => {
+      const evidence = accumulator.materialize()
+      return evidence && !excludedChatIds.has(evidence.state.chatId) ? [evidence] : []
+    })
+  }
+
+  messageRevisions(excludedChatIds: ReadonlySet<ChatId>): WorkspaceLocalMessageRevision[] {
+    return [...this.messageRevisionsById.values()].flatMap((revision) => {
+      if (excludedChatIds.has(revision.header.chatId)) return []
+      const presentation =
+        revision.presentation?.bodyVersion === revision.header.bodyVersion
+          ? {
+              ...structuredClone(revision.presentation),
+              header: cloneMessageHeader(revision.header),
+              message: rebaseHydratedMessageHeader(revision.presentation.message, revision.header),
+            }
+          : undefined
+      return [
+        {
+          ...(revision.before ? { before: cloneMessageHeader(revision.before) } : {}),
+          header: cloneMessageHeader(revision.header),
+          structuralVersion: revision.structuralVersion,
+          changed: {
+            structure:
+              !revision.before || !sameMessageHeaderStructure(revision.before, revision.header),
+            body: !revision.before || revision.before.bodyVersion !== revision.header.bodyVersion,
+          },
+          ...(presentation ? { presentation } : {}),
+        },
+      ]
+    })
+  }
+
+  messageDelta(revisions: readonly CommittedMessageRevision[]): WorkspaceDelta {
+    return workspaceDeltaForMessageRevisions(revisions)
+  }
+
+  materializeChatEvidence(): {
+    readonly facts: readonly WorkspaceDeltaFact[]
+    readonly invalidations: readonly WorkspaceDependency[]
+    readonly receiptChats: readonly Chat[]
+    readonly constructions: readonly Chat[]
+    readonly constructedChatIds: ReadonlySet<ChatId>
+    readonly deletedChatIds: ReadonlySet<ChatId>
+  } {
+    const facts: WorkspaceDeltaFact[] = []
+    const ordinaryChatIds: ChatId[] = []
+    const receiptChats: Chat[] = []
+    const constructions: Chat[] = []
+    const constructedChatIds = new Set<ChatId>()
+    const deletedChatIds = new Set<ChatId>()
+    const entries = [...this.chatsById.entries()].sort(([left], [right]) =>
+      left.localeCompare(right),
+    )
+    for (const [chatId, finalChat] of entries) {
+      const initialExists = this.initialChatExistsById.get(chatId)
+      if (initialExists === undefined) {
+        throw new Error(`BrowserCommandChatInitialStateMissing:${chatId}`)
+      }
+      if (!finalChat) {
+        if (!initialExists) continue
+        facts.push({ kind: 'chat-deleted', chatId }, { kind: 'sidebar-row-deleted', chatId })
+        deletedChatIds.add(chatId)
+        ordinaryChatIds.push(chatId)
+        continue
+      }
+      if (!initialExists) {
+        facts.push({ kind: 'conversation-created', chatId })
+        constructions.push(structuredClone(finalChat))
+        constructedChatIds.add(chatId)
+        continue
+      }
+      facts.push({ kind: 'sidebar-row-changed', chatId })
+      ordinaryChatIds.push(chatId)
+      receiptChats.push(structuredClone(finalChat))
     }
-    const exhaustive: never = name
-    void exhaustive
-    throw new Error('UnknownMutationTable')
-  })
-}
-
-function affectedKey(summary: ChatMutationSummary): string {
-  switch (summary.kind) {
-    case 'chat-meta':
-      return `chat-meta:${summary.chatId ?? ''}`
-    case 'message':
-      return `message:${summary.chatId ?? ''}:${summary.messageId ?? ''}`
-    case 'children':
-      return `children:${summary.chatId ?? ''}:${summary.parentId ?? '__root__'}`
-    case 'draft':
-      return `draft:${summary.chatId ?? ''}`
-    case 'attachment':
-      return `attachment:${summary.attachmentId ?? ''}`
+    return Object.freeze({
+      facts: Object.freeze(facts),
+      invalidations: Object.freeze(
+        ordinaryChatIds.length === 0
+          ? []
+          : [
+              Object.freeze({ kind: 'chat' as const, chatIds: ordinaryChatIds }),
+              Object.freeze({ kind: 'sidebar' as const, chatIds: ordinaryChatIds }),
+            ],
+      ),
+      receiptChats: Object.freeze(receiptChats),
+      constructions: Object.freeze(constructions),
+      constructedChatIds,
+      deletedChatIds,
+    })
   }
-}
 
-function scopeResourceName(scope: MutationScope): string {
-  switch (scope.kind) {
-    case 'chat-meta':
-      return `chat-meta:${scope.chatId}`
-    case 'message':
-      return `message:${scope.messageId}`
-    case 'children':
-      return `children:${scope.chatId}:${scope.parentId ?? '__root__'}`
-    case 'draft':
-      return `draft:${scope.chatId}`
-    case 'attachment':
-      return `attachment:${scope.attachmentId}`
+  attachmentFacts(): WorkspaceDeltaFact[] {
+    return [...this.attachmentRowsById]
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([attachmentId, exists]) => ({
+        kind: exists ? ('attachment-row-changed' as const) : ('attachment-row-deleted' as const),
+        attachmentId,
+      }))
   }
-}
 
-function createScopeChecker(scopes: readonly MutationScope[]) {
-  const allowed = new Set(scopes.map(scopeResourceName))
-  const assertScope = (scope: MutationScope): void => {
-    const key = scopeResourceName(scope)
-    if (!allowed.has(key)) {
-      throw new Error(`UndeclaredScope:${key}`)
-    }
+  assertPhysicalEvidenceCoverage(
+    delta: WorkspaceDelta,
+    receipt: WorkspaceLocalReceipt,
+    terminalChatIds: ReadonlySet<ChatId>,
+  ): void {
+    assertPhysicalMutationEvidenceCoverage(
+      [...this.physicalMutationsByAddress.values()],
+      delta,
+      receipt,
+      terminalChatIds,
+      this.physicalOwnerScopesById,
+      this.internalMutationEvidence,
+    )
   }
-  return { assertScope }
-}
 
-function upsertAffected(state: ChatMutationState, summary: ChatMutationSummary): void {
-  state.affected.set(affectedKey(summary), summary)
-}
-
-async function loadChatOrThrow(table: Table<Chat, string>, chatId: ChatId): Promise<Chat> {
-  const chat = await table.get(chatId)
-  if (!chat) throw new ChatMissingError(chatId)
-  return structuredClone(chat)
-}
-
-function findLastUpdatedLeafIdFromHeaders(headers: readonly MessageHeaderRow[]): MessageId | null {
-  const parentsWithLiveChildren = new Set<MessageId>()
-  for (const header of headers) {
-    if (!header.deleted && header.parentId !== null) parentsWithLiveChildren.add(header.parentId)
-  }
-  let best: MessageHeaderRow | undefined
-  for (const header of headers) {
-    if (header.deleted || parentsWithLiveChildren.has(header.id)) continue
-    if (!best || compareLiveLeafRecency(header, best) > 0) {
-      best = header
-    }
-  }
-  return best?.id ?? null
-}
-
-function headerPathIdsToLeaf(
-  leafId: MessageId,
-  byId: ReadonlyMap<MessageId, MessageHeaderRow>,
-): Set<MessageId> {
-  const path = new Set<MessageId>()
-  let currentId: MessageId | null = leafId
-  while (currentId !== null) {
-    path.add(currentId)
-    currentId = byId.get(currentId)?.parentId ?? null
-  }
-  return path
-}
-
-function shouldBumpLastBranchUpdatedAt(
-  beforeChat: Chat,
-  beforeHeaders: readonly MessageHeaderRow[],
-  afterHeaders: readonly MessageHeaderRow[],
-  changedMessageIds: ReadonlySet<MessageId>,
-): boolean {
-  const nextLeafId = findLastUpdatedLeafIdFromHeaders(afterHeaders)
-  if (nextLeafId !== beforeChat.lastUpdatedLeafId) return true
-  if (nextLeafId === null) return false
-  if (changedMessageIds.size === 0) return false
-  const beforeById = new Map(beforeHeaders.map((header) => [header.id, header]))
-  const afterById = new Map(afterHeaders.map((header) => [header.id, header]))
-  const beforePathIds = headerPathIdsToLeaf(nextLeafId, beforeById)
-  const afterPathIds = headerPathIdsToLeaf(nextLeafId, afterById)
-  for (const messageId of changedMessageIds) {
-    if (beforePathIds.has(messageId) || afterPathIds.has(messageId)) {
-      return true
+  assertReplacementEpoch(expectedReplacementEpoch: number): void {
+    if (expectedReplacementEpoch !== this.replacementEpoch) {
+      throw new WorkspaceReplacementFenceError()
     }
   }
-  return false
-}
 
-function shouldBumpLastBranchUpdatedAtFromHeaders(
-  beforeChat: Chat,
-  nextLeafId: MessageId | null,
-  branchHeaders: readonly MessageHeaderRow[],
-  changedMessageIds: ReadonlySet<MessageId>,
-): boolean {
-  if (nextLeafId !== beforeChat.lastUpdatedLeafId) return true
-  if (nextLeafId === null || changedMessageIds.size === 0) return false
-  const branchIds = new Set(branchHeaders.map((header) => header.id))
-  for (const messageId of changedMessageIds) {
-    if (branchIds.has(messageId)) return true
+  finish(): {
+    fence: WorkspaceFence
+    didMutateStorage: boolean
+    extraInvalidations: readonly WorkspaceDependency[]
+  } {
+    const attachmentRefreshIds = new Set<AttachmentId>(this.inexactAttachmentReferenceIds)
+    for (const fact of this.attachmentReferenceStates.values()) {
+      if (fact.projectionChanged) attachmentRefreshIds.add(fact.attachmentId)
+    }
+    const attachmentInvalidations: WorkspaceDependency[] =
+      attachmentRefreshIds.size === 0
+        ? []
+        : [
+            {
+              kind: 'attachment',
+              attachmentIds: [...attachmentRefreshIds],
+            },
+          ]
+    if (this.attachmentReapRequestIds.size > 0) {
+      attachmentInvalidations.push({ kind: 'storage-maintenance', tasks: ['reap-attachments'] })
+    }
+    return {
+      fence: {
+        workspaceId: this.workspaceId,
+        replacementEpoch: this.replacementEpoch,
+      },
+      didMutateStorage: this.committedMutationTables.size > 0,
+      extraInvalidations: [...this.extraInvalidations, ...attachmentInvalidations],
+    }
   }
-  return false
-}
-
-async function invalidateBranchCacheForSummary(tx: Transaction, chatId: ChatId): Promise<void> {
-  await tx.table<ChatBranchCache, ChatId>('chatBranchCache').delete(chatId)
-}
-
-function structuralBranchWordCount(input: {
-  afterHeaders: readonly MessageHeaderRow[]
-  nextLeafId: MessageId | null
-}): number {
-  const newBranch = branchHeadersByLeaf(input.afterHeaders, input.nextLeafId)
-  let wordCount = 0
-  for (const header of newBranch) wordCount += header.bodyWordCount
-  return wordCount
-}
-
-function messageOutranksLeaf(
-  message: Pick<Message, 'createdAt' | 'id'>,
-  leaf: Pick<MessageHeaderRow, 'createdAt' | 'id'>,
-): boolean {
-  return compareLiveLeafRecency(message, leaf) > 0
-}
-
-async function branchHeadersByLeafInTransaction(
-  tx: Transaction,
-  chatId: ChatId,
-  leafId: MessageId | null,
-): Promise<MessageHeaderRow[]> {
-  if (leafId === null) return []
-  const table = tx.table<MessageHeaderRow, MessageId>('messages')
-  const branch: MessageHeaderRow[] = []
-  let currentId: MessageId | null = leafId
-  while (currentId !== null) {
-    const header: MessageHeaderRow | undefined = await table.get(currentId)
-    if (!header || header.chatId !== chatId || header.deleted) break
-    branch.push(cloneMessageHeader(header))
-    currentId = header.parentId
-  }
-  branch.reverse()
-  return branch
-}
-
-async function getWorkspaceMetaRow(): Promise<WorkspaceMeta> {
-  const db = await openDb()
-  return readBrowserWorkspaceMeta(db)
-}
-
-async function bumpWorkspaceMeta(tx: Transaction, now: number): Promise<void> {
-  await bumpBrowserWorkspaceMeta(tx, now)
-}
-
-function normalizeName(value: string, kind: 'Folder' | 'Tag'): string {
-  const name = value.trim()
-  if (name.length === 0) throw new Error(`${kind}NameRequired`)
-  return name
-}
-
-function tagNameLower(name: string): string {
-  return name.toLocaleLowerCase()
-}
-
-function sortFolders(rows: ChatFolder[]): ChatFolder[] {
-  return rows.sort((left, right) => {
-    if (left.sortIndex !== right.sortIndex) return left.sortIndex - right.sortIndex
-    const byName = left.name.localeCompare(right.name)
-    return byName !== 0 ? byName : left.id.localeCompare(right.id)
-  })
 }
 
 function sortTags(rows: ChatTag[]): ChatTag[] {
@@ -1463,88 +1350,577 @@ function sortTags(rows: ChatTag[]): ChatTag[] {
   })
 }
 
-function patchOptionalString<T extends object>(
-  row: T,
-  key: keyof T,
-  value: string | null | undefined,
-): void {
-  if (value === null || value === undefined || value.trim().length === 0) {
-    delete row[key]
-    return
+function configurationPreferencesFromValues(
+  values: ReadonlyMap<string, unknown>,
+): ConfigurationPreferencesProjection {
+  return {
+    global: globalPreferencesFromStored(values),
+    rendering: normalizeRenderingPreferences(values.get(RENDERING_PREFERENCES_KEY)),
+    sidebarSortMode: parseSidebarSortMode(values.get(SIDEBAR_SORT_SETTING_KEY)),
+    collapsedFolderIds: normalizeCollapsedSidebarFolderIds(
+      values.get(SIDEBAR_COLLAPSED_FOLDERS_SETTING_KEY),
+    ),
+    imageAllowlist: customImageOriginsFromStored(values.get(IMAGE_ALLOWLIST_KEY)),
+    samplePromptsDismissed: values.get(SAMPLE_PROMPTS_DISMISSED_KEY) === true,
   }
-  row[key] = value as T[keyof T]
 }
 
-function patchOptionalNumber<T extends object>(
-  row: T,
-  key: keyof T,
-  value: number | null | undefined,
-): void {
-  if (value === null || value === undefined) {
-    delete row[key]
-    return
+async function readDefaultConfigurationPresetId(
+  tx: Transaction,
+  profileId: ProfileId | null,
+): Promise<PresetId | null> {
+  const table = tx.table<ConfigurationPresetCatalogProjectionRow, PresetId>(
+    'configurationPresetCatalogRows',
+  )
+  const scoped = profileId
+    ? await table
+        .where('[connectionProfileId+activeKey+defaultTier+defaultTime+id]')
+        .between(...scalarCompoundIndexBetween([profileId, 1], [profileId, 1], 5))
+        .first()
+    : undefined
+  if (scoped) return scoped.id
+  const global = await table
+    .where('[activeKey+defaultTier+defaultTime+id]')
+    .between(...scalarCompoundIndexBetween([1], [1], 4))
+    .first()
+  return global?.id ?? null
+}
+
+type ConfigurationCatalogIndexKey = Array<IndexableTypePart>
+type ConfigurationCatalogCursorKey = Array<string | number>
+
+interface ConfigurationCatalogIndexCursor {
+  readonly revision: number
+  readonly key: ConfigurationCatalogCursorKey
+}
+
+function configurationCatalogAddressIds(
+  request: ConfigurationCatalogPageRequest,
+): readonly string[] {
+  const rawIds = request.addressedIds ?? []
+  if (rawIds.length > CONFIGURATION_CATALOG_MAX_ADDRESSED_ROWS) {
+    throw new Error('ConfigurationCatalogAddressLimitExceeded')
   }
-  row[key] = value as T[keyof T]
+  return [...new Set(rawIds)]
 }
 
-interface ArchivedChatDeleteSnapshot {
-  chatId: ChatId
-  messageIds: MessageId[]
-  attachmentIds: AttachmentId[]
+function configurationCatalogPageLimit(request: ConfigurationCatalogPageRequest): number {
+  if (!Number.isSafeInteger(request.limit) || request.limit < 1) {
+    throw new Error('ConfigurationCatalogPageLimitInvalid')
+  }
+  return Math.min(CONFIGURATION_CATALOG_MAX_PAGE_SIZE, request.limit)
 }
 
-class ArchivedChatDeletePlanChangedError extends Error {}
+function projectConfigurationProfileCatalogRow(
+  stored: ConfigurationProfileCatalogProjectionRow | undefined,
+): ConfigurationProfileCatalogRow | null {
+  if (stored?.activeKey !== 1) return null
+  return projectAddressedConfigurationProfileCatalogRow(stored)
+}
 
-async function archivedDeleteSnapshots(
-  db: NatterDb,
-  chatIds: readonly ChatId[],
-): Promise<ArchivedChatDeleteSnapshot[]> {
-  const snapshots: ArchivedChatDeleteSnapshot[] = []
-  await db.transaction('r', [db.chats, db.messages, db.drafts], async (tx: Transaction) => {
-    const chats = tx.table<Chat, ChatId>('chats')
-    const messages = tx.table<MessageHeaderRow, MessageId>('messages')
-    const drafts = tx.table<DraftRow, ChatId>('drafts')
-    for (const chatId of chatIds) {
-      const chat = await chats.get(chatId)
-      if (!chat?.archived) continue
-      const rows = await messages.where('chatId').equals(chatId).toArray()
-      const draft = await drafts.get(chatId)
-      snapshots.push({
-        chatId,
-        messageIds: rows.map((message) => message.id),
-        attachmentIds: attachmentIdsFromDeletedChat(rows, draft),
+function projectAddressedConfigurationProfileCatalogRow(
+  stored: ConfigurationProfileCatalogProjectionRow | undefined,
+): ConfigurationProfileCatalogRow | null {
+  if (!stored) return null
+  const {
+    activeKey: _activeKey,
+    managerTier: _managerTier,
+    mruSortKey: _mruSortKey,
+    nameSortKey: _nameSortKey,
+    ...row
+  } = stored
+  return row
+}
+
+function projectConfigurationConnectionManagerProfileRow(
+  stored: ConfigurationProfileCatalogProjectionRow | undefined,
+): ConfigurationConnectionManagerRow | null {
+  if (!stored) return null
+  return {
+    id: stored.id,
+    name: stored.name,
+    kind: stored.kind,
+    archived: stored.archived === true,
+    presetCount: 0,
+    activePresetCount: 0,
+    chatCount: 0,
+    activeChatCount: 0,
+  }
+}
+
+function projectConfigurationPromptPresetCatalogRow(
+  stored: ConfigurationPromptPresetCatalogProjectionRow | undefined,
+  kind: PromptPresetKind,
+): ConfigurationPromptPresetCatalogRow | null {
+  if (stored?.kind !== kind) return null
+  const { nameSortKey: _nameSortKey, lastUsedAt: _lastUsedAt, ...row } = stored
+  return row
+}
+
+function projectConfigurationPresetCatalogRow(
+  stored: ConfigurationPresetCatalogProjectionRow | undefined,
+): ConfigurationPresetCatalogRow | null {
+  if (stored?.activeKey !== 1) return null
+  const {
+    activeKey: _activeKey,
+    defaultTier: _defaultTier,
+    defaultTime: _defaultTime,
+    archived: _archived,
+    lastUsedAt: _lastUsedAt,
+    ...row
+  } = stored
+  return row
+}
+
+function encodeConfigurationCatalogCursor(
+  catalog: string,
+  revision: number,
+  key: readonly (string | number)[],
+): string {
+  return `configuration-catalog-v3:${catalog}:${encodeURIComponent(
+    JSON.stringify({ revision, key }),
+  )}`
+}
+
+function decodeConfigurationCatalogCursor(
+  cursor: string | undefined,
+  catalog: string,
+  keyLength: number,
+): ConfigurationCatalogIndexCursor | undefined {
+  if (!cursor) return undefined
+  const prefix = `configuration-catalog-v3:${catalog}:`
+  if (!cursor.startsWith(prefix)) throw new Error('ConfigurationCatalogCursorInvalid')
+  try {
+    const parsed: unknown = JSON.parse(decodeURIComponent(cursor.slice(prefix.length)))
+    if (
+      !parsed ||
+      typeof parsed !== 'object' ||
+      !Number.isSafeInteger((parsed as { revision?: unknown }).revision) ||
+      (parsed as { revision: number }).revision < 0 ||
+      !Array.isArray((parsed as { key?: unknown }).key) ||
+      (parsed as { key: unknown[] }).key.length !== keyLength ||
+      (parsed as { key: unknown[] }).key.some(
+        (value) => typeof value !== 'string' && typeof value !== 'number',
+      )
+    ) {
+      throw new Error('ConfigurationCatalogCursorInvalid')
+    }
+    return parsed as ConfigurationCatalogIndexCursor
+  } catch (error) {
+    if (error instanceof Error && error.message === 'ConfigurationCatalogCursorInvalid') throw error
+    throw new Error('ConfigurationCatalogCursorInvalid', { cause: error })
+  }
+}
+
+async function readConfigurationCatalogIndexPage<Stored, Row>(input: {
+  readonly table: Table<Stored, string>
+  readonly index: string
+  readonly catalog: string
+  readonly lower: ConfigurationCatalogIndexKey
+  readonly upper: ConfigurationCatalogIndexKey
+  readonly request: ConfigurationCatalogPageRequest
+  readonly state: ConfigurationCatalogStateRow
+  readonly addressedRows: readonly ConfigurationCatalogAddress<Row>[]
+  readonly keyFor: (row: Stored) => ConfigurationCatalogCursorKey
+  readonly project: (row: Stored) => Row | null
+  readonly signal: AbortSignal | undefined
+}): Promise<ConfigurationCatalogPage<Row>> {
+  input.signal?.throwIfAborted()
+  const rawAnchorIds = input.request.anchorIds ?? []
+  if (rawAnchorIds.length > CONFIGURATION_CATALOG_MAX_REFRESH_ANCHORS) {
+    throw new Error('ConfigurationCatalogAnchorLimitExceeded')
+  }
+  const anchorIds = [...new Set(rawAnchorIds)]
+  if (input.request.cursor && anchorIds.length > 0) {
+    throw new Error('ConfigurationCatalogBoundaryAmbiguous')
+  }
+  if (anchorIds.length > 0 && input.request.direction !== 'forward') {
+    throw new Error('ConfigurationCatalogAnchorDirectionInvalid')
+  }
+  const cursor = decodeConfigurationCatalogCursor(
+    input.request.cursor,
+    input.catalog,
+    input.lower.length,
+  )
+  if (cursor && cursor.revision !== input.state.revision) {
+    return Object.freeze({
+      kind: 'stale-cursor',
+      catalogRevision: input.state.revision,
+      exactCount: input.state.exactCount,
+      addressedRows: input.addressedRows,
+    })
+  }
+  let anchorKey: ConfigurationCatalogCursorKey | undefined
+  let anchorHasPrevious = false
+  if (anchorIds.length > 0) {
+    const anchors = await input.table.bulkGet(anchorIds)
+    const anchor = anchors.find(
+      (row): row is Stored => row !== undefined && input.project(row) !== null,
+    )
+    if (!anchor) {
+      return Object.freeze({
+        kind: 'anchor-missing',
+        catalogRevision: input.state.revision,
+        exactCount: input.state.exactCount,
+        addressedRows: input.addressedRows,
       })
     }
-  })
-  return snapshots
-}
-
-function attachmentIdsFromDeletedChat(
-  messages: readonly Pick<Message, 'attachmentRefs'>[],
-  draft: DraftRow | undefined,
-): AttachmentId[] {
-  const ids: AttachmentId[] = []
-  for (const message of messages) {
-    for (const ref of liveAttachmentRefs(message.attachmentRefs)) ids.push(ref.attachmentId)
+    anchorKey = input.keyFor(anchor)
+    anchorHasPrevious =
+      (await input.table
+        .where(input.index)
+        .between(input.lower, anchorKey, true, false)
+        .limit(1)
+        .count()) > 0
   }
-  for (const ref of liveAttachmentRefs(draft?.attachmentRefs)) ids.push(ref.attachmentId)
-  return ids
+  const limit = configurationCatalogPageLimit(input.request)
+  const backward = input.request.direction === 'backward'
+  const lower = backward ? input.lower : (anchorKey ?? cursor?.key ?? input.lower)
+  const upper = backward ? (cursor?.key ?? input.upper) : input.upper
+  const includeLower = backward || cursor === undefined
+  const includeUpper = !backward || cursor === undefined
+  let collection = input.table.where(input.index).between(lower, upper, includeLower, includeUpper)
+  if (backward) collection = collection.reverse()
+  const fetched = await collection.limit(limit + 1).toArray()
+  input.signal?.throwIfAborted()
+  const hasMore = fetched.length > limit
+  const selected = fetched.slice(0, limit)
+  if (backward) selected.reverse()
+  const first = selected[0]
+  const last = selected[selected.length - 1]
+  return Object.freeze({
+    kind: 'page',
+    catalogRevision: input.state.revision,
+    exactCount: input.state.exactCount,
+    rows: Object.freeze(
+      selected.map((stored) => {
+        const row = input.project(stored)
+        if (!row) throw new Error('ConfigurationCatalogProjectionInvalid')
+        return row
+      }),
+    ),
+    addressedRows: input.addressedRows,
+    ...(first && (backward ? hasMore : cursor !== undefined || anchorHasPrevious)
+      ? {
+          previousCursor: encodeConfigurationCatalogCursor(
+            input.catalog,
+            input.state.revision,
+            input.keyFor(first),
+          ),
+        }
+      : {}),
+    ...(last && (backward ? cursor !== undefined : hasMore)
+      ? {
+          nextCursor: encodeConfigurationCatalogCursor(
+            input.catalog,
+            input.state.revision,
+            input.keyFor(last),
+          ),
+        }
+      : {}),
+  })
 }
 
-function sameArchivedDeleteSnapshot(
-  snapshot: ArchivedChatDeleteSnapshot,
-  messages: readonly MessageHeaderRow[],
-  draft: DraftRow | undefined,
+interface ConfigurationPresetOrderEntry {
+  readonly presetId: PresetId
+  readonly blockId: string
+  readonly offset: number
+}
+
+async function readConfigurationPresetOrderPage(
+  tx: Transaction,
+  request: ConfigurationCatalogPageRequest,
+  signal?: AbortSignal,
+): Promise<ConfigurationPresetCatalogPage> {
+  signal?.throwIfAborted()
+  const state = await tx
+    .table<PresetOrderStateRow, typeof PRESET_ORDER_STATE_ID>('presetOrderState')
+    .get(PRESET_ORDER_STATE_ID)
+  if (!state) throw new Error('PresetOrderStateMissing')
+  const projections = tx.table<ConfigurationPresetCatalogProjectionRow, PresetId>(
+    'configurationPresetCatalogRows',
+  )
+  const addressedIds = configurationCatalogAddressIds(request) as PresetId[]
+  const addressed = await projections.bulkGet(addressedIds)
+  const addressedRows = Object.freeze(
+    addressedIds.map((id, index) => ({
+      id,
+      row: projectConfigurationPresetCatalogRow(addressed[index]),
+    })),
+  )
+  const rawAnchorIds = request.anchorIds ?? []
+  if (rawAnchorIds.length > CONFIGURATION_CATALOG_MAX_REFRESH_ANCHORS) {
+    throw new Error('ConfigurationCatalogAnchorLimitExceeded')
+  }
+  const anchorIds = [...new Set(rawAnchorIds)] as PresetId[]
+  if (request.cursor && anchorIds.length > 0) {
+    throw new Error('ConfigurationCatalogBoundaryAmbiguous')
+  }
+  if (anchorIds.length > 0 && request.direction !== 'forward') {
+    throw new Error('ConfigurationCatalogAnchorDirectionInvalid')
+  }
+  const cursor = decodeConfigurationCatalogCursor(request.cursor, 'presets', 3)
+  if (cursor && cursor.revision !== state.revision) {
+    return Object.freeze({
+      kind: 'stale-cursor',
+      catalogRevision: state.revision,
+      exactCount: state.exactCount,
+      addressedRows,
+    })
+  }
+  const limit = configurationCatalogPageLimit(request)
+  const backward = request.direction === 'backward'
+  const blocks = tx.table<PresetOrderBlockRow, string>('presetOrderBlocks')
+  const loaded = new Map<string, PresetOrderBlockRow>()
+  const loadBlock = async (blockId: string): Promise<PresetOrderBlockRow> => {
+    const cached = loaded.get(blockId)
+    if (cached) return cached
+    const block = await blocks.get(blockId)
+    if (!block) throw new Error(`PresetOrderBlockMissing:${blockId}`)
+    if (block.presetIds.length === 0) throw new Error(`PresetOrderBlockEmpty:${blockId}`)
+    loaded.set(blockId, block)
+    return block
+  }
+
+  let blockId: string | null
+  let offset: number
+  let anchorHasPrevious = false
+  if (cursor) {
+    const [rawBlockId, rawOffset, rawPresetId] = cursor.key
+    if (
+      typeof rawBlockId !== 'string' ||
+      typeof rawOffset !== 'number' ||
+      !Number.isSafeInteger(rawOffset) ||
+      typeof rawPresetId !== 'string'
+    ) {
+      throw new Error('ConfigurationCatalogCursorInvalid')
+    }
+    const boundary = await loadBlock(rawBlockId)
+    if (rawOffset < 0 || boundary.presetIds[rawOffset] !== rawPresetId) {
+      throw new Error('ConfigurationCatalogCursorInvalid')
+    }
+    if (backward) {
+      if (rawOffset > 0) {
+        blockId = rawBlockId
+        offset = rawOffset - 1
+      } else {
+        blockId = boundary.previousBlockId
+        if (blockId) {
+          const previous = await loadBlock(blockId)
+          if (previous.nextBlockId !== boundary.id) throw new Error('PresetOrderLinkInvalid')
+          offset = previous.presetIds.length - 1
+        } else {
+          offset = -1
+        }
+      }
+    } else if (rawOffset + 1 < boundary.presetIds.length) {
+      blockId = rawBlockId
+      offset = rawOffset + 1
+    } else {
+      blockId = boundary.nextBlockId
+      if (blockId) {
+        const next = await loadBlock(blockId)
+        if (next.previousBlockId !== boundary.id) throw new Error('PresetOrderLinkInvalid')
+      }
+      offset = 0
+    }
+  } else if (anchorIds.length > 0) {
+    const [memberships, projectionsByAnchor] = await Promise.all([
+      tx.table<PresetOrderMembershipRow, PresetId>('presetOrderMembership').bulkGet(anchorIds),
+      projections.bulkGet(anchorIds),
+    ])
+    const anchorIndex = anchorIds.findIndex(
+      (_, index) =>
+        memberships[index] !== undefined &&
+        projectConfigurationPresetCatalogRow(projectionsByAnchor[index]) !== null,
+    )
+    if (anchorIndex < 0) {
+      return Object.freeze({
+        kind: 'anchor-missing',
+        catalogRevision: state.revision,
+        exactCount: state.exactCount,
+        addressedRows,
+      })
+    }
+    const anchorId = anchorIds[anchorIndex] as PresetId
+    const membership = memberships[anchorIndex]
+    if (!membership) throw new Error(`PresetOrderMembershipMissing:${anchorId}`)
+    const block = await loadBlock(membership.blockId)
+    const anchorOffset = block.presetIds.indexOf(anchorId)
+    if (anchorOffset < 0) throw new Error(`PresetOrderMembershipMismatch:${anchorId}`)
+    blockId = block.id
+    offset = anchorOffset
+    anchorHasPrevious = anchorOffset > 0 || block.previousBlockId !== null
+  } else {
+    blockId = backward ? state.tailBlockId : state.headBlockId
+    if (blockId && backward) offset = (await loadBlock(blockId)).presetIds.length - 1
+    else offset = 0
+  }
+
+  const entries: ConfigurationPresetOrderEntry[] = []
+  const visitedBlocks = new Set<string>()
+  while (blockId && entries.length <= limit) {
+    signal?.throwIfAborted()
+    if (visitedBlocks.has(blockId)) throw new Error(`PresetOrderBlockCycle:${blockId}`)
+    visitedBlocks.add(blockId)
+    const block = await loadBlock(blockId)
+    if (backward) {
+      for (let index = offset; index >= 0 && entries.length <= limit; index -= 1) {
+        const presetId = block.presetIds[index]
+        if (!presetId) throw new Error(`PresetOrderBlockEntryMissing:${block.id}:${index}`)
+        entries.push({ presetId, blockId: block.id, offset: index })
+      }
+      const previousBlockId = block.previousBlockId
+      if (previousBlockId && entries.length <= limit) {
+        const previous = await loadBlock(previousBlockId)
+        if (previous.nextBlockId !== block.id) throw new Error('PresetOrderLinkInvalid')
+        offset = previous.presetIds.length - 1
+      }
+      blockId = previousBlockId
+    } else {
+      for (
+        let index = offset;
+        index < block.presetIds.length && entries.length <= limit;
+        index += 1
+      ) {
+        const presetId = block.presetIds[index]
+        if (!presetId) throw new Error(`PresetOrderBlockEntryMissing:${block.id}:${index}`)
+        entries.push({ presetId, blockId: block.id, offset: index })
+      }
+      const nextBlockId = block.nextBlockId
+      if (nextBlockId && entries.length <= limit) {
+        const next = await loadBlock(nextBlockId)
+        if (next.previousBlockId !== block.id) throw new Error('PresetOrderLinkInvalid')
+      }
+      blockId = nextBlockId
+      offset = 0
+    }
+  }
+  const hasMore = entries.length > limit
+  let selected = entries.slice(0, limit)
+  if (backward) selected = selected.reverse()
+  const storedRows = await projections.bulkGet(selected.map((entry) => entry.presetId))
+  const rows = Object.freeze(
+    storedRows.map((stored, index) => {
+      const row = projectConfigurationPresetCatalogRow(stored)
+      if (!row || row.id !== selected[index]?.presetId) {
+        throw new Error(`PresetOrderProjectionMissing:${selected[index]?.presetId ?? 'unknown'}`)
+      }
+      return row
+    }),
+  )
+  const first = selected[0]
+  const last = selected.at(-1)
+  return Object.freeze({
+    kind: 'page',
+    catalogRevision: state.revision,
+    exactCount: state.exactCount,
+    rows,
+    addressedRows,
+    ...(first && (backward ? hasMore : cursor !== undefined || anchorHasPrevious)
+      ? {
+          previousCursor: encodeConfigurationCatalogCursor('presets', state.revision, [
+            first.blockId,
+            first.offset,
+            first.presetId,
+          ]),
+        }
+      : {}),
+    ...(last && (backward ? cursor !== undefined : hasMore)
+      ? {
+          nextCursor: encodeConfigurationCatalogCursor('presets', state.revision, [
+            last.blockId,
+            last.offset,
+            last.presetId,
+          ]),
+        }
+      : {}),
+  })
+}
+
+interface ConfigurationDiscoveryStorageHeader {
+  readonly profileRevision: string
+  readonly payloadId: string
+  readonly payloadByteLength: number
+  readonly fetchedAt: number
+}
+
+function configurationDiscoveryPayloadToken(
+  row: ConfigurationDiscoveryStorageHeader,
+): ConfigurationDiscoveryPayloadToken {
+  return {
+    profileRevision: row.profileRevision,
+    payloadId: row.payloadId,
+    payloadByteLength: row.payloadByteLength,
+    fetchedAt: row.fetchedAt,
+  }
+}
+
+function configurationDiscoveryPayloadUnchanged(
+  known: ConfigurationDiscoveryPayloadToken | undefined,
+  current: ConfigurationDiscoveryPayloadToken,
 ): boolean {
   return (
-    sameOrderedValues(
-      [...snapshot.messageIds].sort(),
-      messages.map((message) => message.id).sort(),
-    ) &&
-    sameOrderedValues(
-      [...snapshot.attachmentIds].sort(),
-      attachmentIdsFromDeletedChat(messages, draft).sort(),
-    )
+    known?.profileRevision === current.profileRevision &&
+    known.payloadId === current.payloadId &&
+    known.payloadByteLength === current.payloadByteLength
+  )
+}
+
+async function readConfigurationModelsPayload(
+  tx: Transaction,
+  key: [string, string],
+  revisionKey: string,
+  known: ConfigurationDiscoveryPayloadToken | undefined,
+): Promise<ConfigurationDiscoveryPayloadProjection<CachedModelsRow>> {
+  const stored = await tx.table<CachedModelsStorageRow, [string, string]>('models').get(key)
+  if (!stored || stored.profileRevision !== revisionKey) return { kind: 'missing' }
+  const token = configurationDiscoveryPayloadToken(stored)
+  if (configurationDiscoveryPayloadUnchanged(known, token)) return { kind: 'unchanged', token }
+  const row = await readDiscoveryCacheRow(tx, 'models', key)
+  return row ? { kind: 'loaded', token, row } : { kind: 'missing' }
+}
+
+async function readConfigurationEndpointsPayload(
+  tx: Transaction,
+  key: [string, string],
+  revisionKey: string,
+  known: ConfigurationDiscoveryPayloadToken | undefined,
+): Promise<ConfigurationDiscoveryPayloadProjection<CachedEndpointsRow>> {
+  const stored = await tx.table<CachedEndpointsStorageRow, [string, string]>('endpoints').get(key)
+  if (!stored || stored.profileRevision !== revisionKey) return { kind: 'missing' }
+  const token = configurationDiscoveryPayloadToken(stored)
+  if (configurationDiscoveryPayloadUnchanged(known, token)) return { kind: 'unchanged', token }
+  const row = await readDiscoveryCacheRow(tx, 'endpoints', key)
+  return row ? { kind: 'loaded', token, row } : { kind: 'missing' }
+}
+
+async function readConfigurationPrivacyPayload(
+  tx: Transaction,
+  key: [string, string],
+  revisionKey: string,
+  known: ConfigurationDiscoveryPayloadToken | undefined,
+): Promise<ConfigurationDiscoveryPayloadProjection<CachedPrivacyPolicyRow>> {
+  const stored = await tx
+    .table<CachedPrivacyPolicyStorageRow, [string, string]>('privacyPolicies')
+    .get(key)
+  if (!stored || stored.profileRevision !== revisionKey) return { kind: 'missing' }
+  const token = configurationDiscoveryPayloadToken(stored)
+  if (configurationDiscoveryPayloadUnchanged(known, token)) return { kind: 'unchanged', token }
+  const row = await readDiscoveryCacheRow(tx, 'privacyPolicies', key)
+  return row ? { kind: 'loaded', token, row } : { kind: 'missing' }
+}
+
+function sameTemporaryChatPage(
+  left: Awaited<ReturnType<typeof readTemporaryChatIdPage>>,
+  right: Awaited<ReturnType<typeof readTemporaryChatIdPage>>,
+): boolean {
+  return (
+    sameOrderedValues(left.chatIds, right.chatIds) &&
+    left.done === right.done &&
+    left.earliestDeferredAt === right.earliestDeferredAt &&
+    left.nextCursor?.chatId === right.nextCursor?.chatId &&
+    left.nextCursor?.retentionAt === right.nextCursor?.retentionAt
   )
 }
 
@@ -1555,35 +1931,26 @@ interface ForkWritePlan {
   destinationChatId: ChatId
   destinationMessageIds: MessageId[]
   destinationParentIds: Array<MessageId | null>
+  sourceLinkResourceNames: string[]
   scopes: MutationScope[]
 }
 
 class ForkWritePlanChangedError extends Error {}
 
-async function forkAncestorHeaders(
+async function readForkLivePathHeaders(
   table: Table<MessageHeaderRow, MessageId>,
   chatId: ChatId,
   targetId: MessageId,
 ): Promise<MessageHeaderRow[]> {
-  const ancestors: MessageHeaderRow[] = []
-  const visited = new Set<MessageId>()
-  let currentId: MessageId | null = targetId
-  while (currentId !== null) {
-    if (visited.has(currentId)) throw new Error(`fork: cycle at message ${currentId}`)
-    visited.add(currentId)
-    const row: MessageHeaderRow | undefined = await table.get(currentId)
-    if (!row) {
-      if (currentId === targetId) throw new Error(`fork: message ${targetId} not found`)
-      break
-    }
-    if (row.chatId !== chatId) {
-      throw new Error(`fork: message ${row.id} does not belong to chat ${chatId}`)
-    }
-    ancestors.push(cloneMessageHeader(row))
-    currentId = row.parentId
+  const result = await readLiveBranchPath({
+    chatId,
+    leafId: targetId,
+    getHeader: (messageId) => table.get(messageId),
+  })
+  if (result.kind === 'unavailable') {
+    throw new Error(`fork: ${result.reason} at message ${result.messageId}`)
   }
-  ancestors.reverse()
-  return ancestors
+  return result.rows.map(cloneMessageHeader)
 }
 
 function forkLiveAttachmentIds(rows: readonly Pick<Message, 'attachmentRefs'>[]): AttachmentId[] {
@@ -1592,8 +1959,386 @@ function forkLiveAttachmentIds(rows: readonly Pick<Message, 'attachmentRefs'>[])
   )
 }
 
-function sameOrderedValues<T>(left: readonly T[], right: readonly T[]): boolean {
-  return left.length === right.length && left.every((value, index) => value === right[index])
+function mutationScopeKey(scope: MutationScope): string {
+  switch (scope.kind) {
+    case 'message':
+      return `message:${scope.messageId}`
+    case 'chat-topology':
+      return `message-topology:${scope.chatId}`
+    case 'children':
+      return `children:${scope.chatId}:${scope.parentId ?? '__root__'}`
+    case 'attachment':
+      return `attachment:${scope.attachmentId}`
+    case 'draft':
+      return `draft:${scope.chatId}`
+    case 'chat-meta':
+      return `chat-meta:${scope.chatId}`
+  }
+}
+
+function dedupeMutationScopes(scopes: readonly MutationScope[]): MutationScope[] {
+  const seen = new Set<string>()
+  return scopes.filter((scope) => {
+    const key = mutationScopeKey(scope)
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+}
+
+function attachmentOwnerScopes(
+  owner: AttachmentRefOwner,
+  attachmentIds: readonly AttachmentId[] = [],
+): MutationScope[] {
+  return dedupeMutationScopes([
+    owner.kind === 'message'
+      ? { kind: 'message', messageId: owner.messageId }
+      : { kind: 'draft', chatId: owner.chatId },
+    ...attachmentIds.map((attachmentId) => ({
+      kind: 'attachment' as const,
+      attachmentId,
+    })),
+  ])
+}
+
+async function attachmentOwnerMessage(
+  ctx: MutationContext,
+  owner: Extract<AttachmentRefOwner, { kind: 'message' }>,
+): Promise<Message> {
+  const message = await ctx.getMessage(owner.messageId)
+  if (!message || message.chatId !== owner.chatId || message.deleted) {
+    throw new Error(`MessageMissing:${owner.messageId}`)
+  }
+  return message
+}
+
+function insertAttachmentRef(
+  refs: readonly MessageAttachmentRef[],
+  ref: MessageAttachmentRef,
+  afterRefId?: string,
+): MessageAttachmentRef[] {
+  if (!afterRefId) return [...refs, ref]
+  const index = refs.findIndex((candidate) => candidate.refId === afterRefId)
+  return index < 0 ? [...refs, ref] : [...refs.slice(0, index + 1), ref, ...refs.slice(index + 1)]
+}
+
+function messageWithWorkspaceAttachmentRefs(
+  message: Message,
+  attachmentRefs: readonly MessageAttachmentRef[],
+): Message {
+  const next = { ...message, attachmentRefs: [...attachmentRefs] }
+  delete next.cachedMediaTokens
+  return next
+}
+
+async function attachmentMessageRefResult(
+  ctx: MutationContext,
+  message: Message,
+  ref?: MessageAttachmentRef,
+): Promise<AttachmentRefWriteResult> {
+  const header = await ctx.getMessageHeader(message.id)
+  if (!header) throw new Error(`MessageMissing:${message.id}`)
+  return {
+    ...(ref ? { ref } : {}),
+    presentation: { header, message, bodyVersion: header.bodyVersion },
+  }
+}
+
+function assertExpectedAttachmentReference(
+  ref: MessageAttachmentRef,
+  expectedAttachmentId: AttachmentId,
+): void {
+  if (ref.deletedAt !== undefined) throw new Error(`AttachmentRefNotLive:${ref.refId}`)
+  if (ref.attachmentId !== expectedAttachmentId) {
+    throw new Error(`AttachmentRefChanged:${ref.refId}:${expectedAttachmentId}:${ref.attachmentId}`)
+  }
+}
+
+function groupAttachmentRelinkSpecs(specs: AttachmentRefRelinkInput['refs']): Map<
+  string,
+  {
+    owner: AttachmentRefOwner
+    specs: Array<AttachmentRefRelinkInput['refs'][number] & { inputIndex: number }>
+  }
+> {
+  const groups = new Map<
+    string,
+    {
+      owner: AttachmentRefOwner
+      specs: Array<AttachmentRefRelinkInput['refs'][number] & { inputIndex: number }>
+    }
+  >()
+  specs.forEach((spec, inputIndex) => {
+    const key =
+      spec.owner.kind === 'message'
+        ? `message:${spec.owner.messageId}`
+        : `draft:${spec.owner.chatId}`
+    const group = groups.get(key) ?? { owner: spec.owner, specs: [] }
+    if (group.specs.some((candidate) => candidate.refId === spec.refId)) {
+      throw new Error(`DuplicateAttachmentRelinkSpec:${key}:${spec.refId}`)
+    }
+    group.specs.push({ ...spec, inputIndex })
+    groups.set(key, group)
+  })
+  return groups
+}
+
+function applyAttachmentRelinks(
+  refs: readonly MessageAttachmentRef[],
+  specs: readonly (AttachmentRefRelinkInput['refs'][number] & { inputIndex: number })[],
+  newAttachmentId: AttachmentId,
+  now: number,
+  updatedByInput: Map<number, MessageAttachmentRef>,
+): MessageAttachmentRef[] {
+  const specsByRefId = new Map(specs.map((spec) => [spec.refId, spec]))
+  const matched = new Set<string>()
+  const next = refs.map((ref) => {
+    const spec = specsByRefId.get(ref.refId)
+    if (!spec) return ref
+    assertExpectedAttachmentReference(ref, spec.expectedAttachmentId)
+    matched.add(ref.refId)
+    const updated = { ...ref, attachmentId: newAttachmentId, updatedAt: now }
+    updatedByInput.set(spec.inputIndex, updated)
+    return updated
+  })
+  for (const spec of specs) {
+    if (!matched.has(spec.refId)) throw new Error(`AttachmentRefMissing:${spec.refId}`)
+  }
+  return next
+}
+
+async function persistPreparedAttachmentBundleInMutation(
+  ctx: MutationContext,
+  bundle: PreparedAttachmentBundle,
+  current?: Attachment,
+): Promise<void> {
+  await ctx.putAttachment({
+    ...bundle.attachment,
+    ...(current ? { createdAt: current.createdAt, refCount: current.refCount } : {}),
+  })
+  for (const blob of bundle.blobs) await ctx.putAttachmentBlob(blob)
+  for (const artifact of bundle.artifacts) await ctx.putAttachmentArtifact(artifact)
+  for (const job of bundle.jobs) await ctx.putAttachmentJob(job)
+}
+
+function generatedOutputLocalizationAttachmentProjection(
+  attachment: Attachment,
+): GeneratedOutputLocalizationClaim['attachment'] {
+  return {
+    id: attachment.id,
+    kind: attachment.kind,
+    mime: attachment.mime,
+    filename: attachment.filename,
+    storage: structuredClone(attachment.storage),
+    ...(attachment.sourceUrl ? { sourceUrl: attachment.sourceUrl } : {}),
+  }
+}
+
+function generatedOutputLocalizationSourceMatches(
+  attachment: Attachment,
+  job: AttachmentJob,
+): boolean {
+  return (
+    isGeneratedOutputLocalizationJob(job) &&
+    attachment.origin === 'generated-output' &&
+    attachment.storage.kind === 'remote-url' &&
+    attachment.storage.url === job.task.expectedSourceUrl
+  )
+}
+
+function generatedOutputLocalizationLeaseMatches(
+  attachment: Attachment,
+  job: AttachmentJob,
+  leaseId: string,
+): boolean {
+  return (
+    generatedOutputLocalizationSourceMatches(attachment, job) &&
+    job.status === 'running' &&
+    job.leaseId === leaseId
+  )
+}
+
+function runningGeneratedOutputLocalizationJob(
+  job: GeneratedOutputLocalizationClaim['job'],
+  input: GeneratedOutputLocalizationClaimInput,
+): GeneratedOutputLocalizationClaim['job'] {
+  const next: GeneratedOutputLocalizationClaim['job'] = {
+    ...job,
+    status: 'running',
+    attemptCount: job.attemptCount + 1,
+    startedAt: input.now,
+    leaseId: input.leaseId,
+    leaseExpiresAt: input.leaseExpiresAt,
+    updatedAt: input.now,
+  }
+  delete next.finishedAt
+  delete next.error
+  delete next.nextAttemptAt
+  return next
+}
+
+function retriedGeneratedOutputLocalizationJob(
+  job: AttachmentJob,
+  input: GeneratedOutputLocalizationRetryInput,
+): AttachmentJob {
+  const next: AttachmentJob = {
+    ...job,
+    status: 'pending',
+    error: { ...input.error },
+    nextAttemptAt: input.nextAttemptAt,
+    updatedAt: input.now,
+  }
+  delete next.finishedAt
+  delete next.leaseId
+  delete next.leaseExpiresAt
+  return next
+}
+
+function failedGeneratedOutputLocalizationJob(
+  job: AttachmentJob,
+  input: GeneratedOutputLocalizationFailInput,
+): AttachmentJob {
+  const next: AttachmentJob = {
+    ...job,
+    status: 'failed',
+    error: { ...input.error },
+    finishedAt: input.now,
+    updatedAt: input.now,
+  }
+  delete next.nextAttemptAt
+  delete next.leaseId
+  delete next.leaseExpiresAt
+  return next
+}
+
+function succeededGeneratedOutputLocalizationJob(job: AttachmentJob, now: number): AttachmentJob {
+  const next: AttachmentJob = {
+    ...job,
+    status: 'succeeded',
+    finishedAt: now,
+    updatedAt: now,
+  }
+  delete next.error
+  delete next.nextAttemptAt
+  delete next.leaseId
+  delete next.leaseExpiresAt
+  return next
+}
+
+class GeneratedOutputLocalizationPlanChangedError extends Error {}
+
+function preparedAttachmentIdentityMatches(current: Attachment, prepared: Attachment): boolean {
+  if (
+    current.id !== prepared.id ||
+    current.origin !== 'generated-output' ||
+    prepared.origin !== 'generated-output'
+  ) {
+    return false
+  }
+  if (current.storage.kind === 'remote-url' && prepared.storage.kind === 'remote-url') {
+    return current.storage.url === prepared.storage.url
+  }
+  return (
+    current.storage.kind === 'local-blob' &&
+    prepared.storage.kind === 'local-blob' &&
+    current.contentHash !== undefined &&
+    current.contentHash === prepared.contentHash
+  )
+}
+
+function replaceGeneratedPollingVideoContent(
+  content: readonly Message['content'][number][],
+  attachmentId: AttachmentId,
+  replacementIds: readonly AttachmentId[],
+): { content: Message['content']; changed: boolean } {
+  const next: Message['content'] = []
+  let changed = false
+  for (const item of content) {
+    if (item.type !== 'output_video' || item.attachmentId !== attachmentId) {
+      next.push(structuredClone(item))
+      continue
+    }
+    changed = true
+    for (const replacementId of replacementIds) {
+      next.push({
+        type: 'output_video',
+        attachmentId: replacementId,
+        ...(item.prompt ? { prompt: item.prompt } : {}),
+      })
+    }
+  }
+  return { content: next, changed }
+}
+
+function replaceGeneratedPollingVideoRefs(
+  input: readonly MessageAttachmentRef[] | undefined,
+  attachmentId: AttachmentId,
+  replacementIds: readonly AttachmentId[],
+  owner: AttachmentRefOwner,
+  now: number,
+): { refs: MessageAttachmentRef[]; changed: boolean } {
+  const refs = normalizeAttachmentRefs(
+    input,
+    owner.kind === 'message'
+      ? { messageId: owner.messageId, createdAt: now }
+      : { draftChatId: owner.chatId, createdAt: now },
+  )
+  const target = refs.find(
+    (ref) => ref.deletedAt === undefined && ref.attachmentId === attachmentId,
+  )
+  const kept = refs.filter(
+    (ref) => ref.deletedAt !== undefined || ref.attachmentId !== attachmentId,
+  )
+  const replacements = replacementIds.map((replacementId, index) => ({
+    ...(target
+      ? {
+          ...target,
+          refId: index === 0 ? target.refId : newId(),
+          attachmentId: replacementId,
+          updatedAt: now,
+        }
+      : {
+          refId: newId(),
+          attachmentId: replacementId,
+          includeInContext: true,
+          presentation: {},
+          createdAt: now,
+          updatedAt: now,
+        }),
+  }))
+  return {
+    refs: [...kept, ...replacements],
+    changed: target !== undefined || replacements.length > 0,
+  }
+}
+
+function missingAttachmentAfterByteDeletion(
+  attachment: Attachment,
+  reason: AttachmentMissingReason,
+  now: number,
+  artifacts: AttachmentArtifact[],
+  processing: Attachment['processing'],
+): Attachment {
+  const lastKnownBlobId =
+    attachment.storage.kind === 'local-blob'
+      ? attachment.storage.blobId
+      : attachment.storage.kind === 'missing'
+        ? attachment.storage.lastKnownBlobId
+        : undefined
+  const next: Attachment = {
+    ...attachment,
+    updatedAt: now,
+    storage: {
+      kind: 'missing',
+      reason,
+      missingSince: now,
+      ...(lastKnownBlobId ? { lastKnownBlobId } : {}),
+    },
+    artifacts,
+    processing,
+  }
+  delete next.thumbnailBlobId
+  return next
 }
 
 function sameForkPlanSource(plan: ForkWritePlan, rows: readonly Message[]): boolean {
@@ -1615,16 +2360,21 @@ async function planForkWrite(
   input: ForkChatFromMessageInput,
   destinationChatId: ChatId,
 ): Promise<ForkWritePlan> {
-  const headers = await db.transaction('r', [db.chats, db.messages], async (tx: Transaction) => {
-    if (!(await tx.table<Chat, ChatId>('chats').get(input.chatId))) {
+  const sourcePlan = await db.transaction('r', [db.chats, db.messages], async (tx: Transaction) => {
+    const source = await tx.table<Chat, ChatId>('chats').get(input.chatId)
+    if (!source) {
       throw new Error(`fork: source chat ${input.chatId} not found`)
     }
-    return forkAncestorHeaders(
-      tx.table<MessageHeaderRow, MessageId>('messages'),
-      input.chatId,
-      input.messageId,
-    )
+    return {
+      headers: await readForkLivePathHeaders(
+        tx.table<MessageHeaderRow, MessageId>('messages'),
+        input.chatId,
+        input.messageId,
+      ),
+      sourceLinkResourceNames: normalizeNamedLocks(chatConfigurationTargetResourceNames(source)),
+    }
   })
+  const { headers } = sourcePlan
   if (headers.length === 0) throw new Error('fork: no ancestors to copy')
 
   const destinationMessageIds = headers.map(() => newId())
@@ -1655,6 +2405,7 @@ async function planForkWrite(
     destinationChatId,
     destinationMessageIds,
     destinationParentIds,
+    sourceLinkResourceNames: sourcePlan.sourceLinkResourceNames,
     scopes,
   }
 }
@@ -1667,14 +2418,19 @@ function cloneForkMessages(
   const destinationIdBySourceId = new Map(
     ancestors.map((row, index) => [row.id, plan.destinationMessageIds[index] as MessageId]),
   )
+  const destinationTurnIdBySourceTurnId = new Map<string, string>()
   return ancestors.map((source, index) => {
     const clone = structuredClone(source)
     clone.id = plan.destinationMessageIds[index] as MessageId
     clone.chatId = plan.destinationChatId
     clone.parentId = source.parentId ? (destinationIdBySourceId.get(source.parentId) ?? null) : null
     clone.siblingIndex = 0
-    clone.turnId = newId()
-    clone.turnIndex = 0
+    let destinationTurnId = destinationTurnIdBySourceTurnId.get(source.turnId)
+    if (!destinationTurnId) {
+      destinationTurnId = newId()
+      destinationTurnIdBySourceTurnId.set(source.turnId, destinationTurnId)
+    }
+    clone.turnId = destinationTurnId
     clone.createdAt = now - (ancestors.length - index)
     if (clone.editedAt !== undefined) clone.editedAt = now
     clone.nodeVersion = 0
@@ -1682,117 +2438,1963 @@ function cloneForkMessages(
   })
 }
 
-class BrowserWorkspaceRepository implements WorkspaceRepository {
-  async getWorkspaceMeta(): Promise<WorkspaceMeta> {
-    return getWorkspaceMetaRow()
-  }
+const FORBIDDEN_MESSAGE_HEADER_PATCH_KEYS = new Set<keyof MessageHeaderRow>([
+  'id',
+  'chatId',
+  'parentId',
+  'siblingIndex',
+  'turnId',
+  'turnIndex',
+  'createdAt',
+  'role',
+  'origin',
+  'nodeVersion',
+  'requestContextVersion',
+  'bodyVersion',
+  'bodyWordCount',
+  'bodyTextCharCount',
+  'bodyMediaCount',
+  'bodyRenderCost',
+  'contextRouteFacts',
+  'treeParentKey',
+  'treeLive',
+  'deleted',
+])
 
-  async appendMessageToExpectedLeaf(
-    input: AppendMessageToExpectedLeafInput,
-  ): Promise<AppendMessageToExpectedLeafResult> {
-    const { expectedLeafId, message } = input
-    const attachmentIds = [
-      ...new Set((message.attachmentRefs ?? []).map((ref) => ref.attachmentId)),
-    ]
-    const result = await this.runMutation(
-      [
-        { kind: 'message', messageId: message.id },
-        ...(expectedLeafId ? [{ kind: 'message' as const, messageId: expectedLeafId }] : []),
-        { kind: 'children', chatId: message.chatId, parentId: expectedLeafId },
-        ...attachmentIds.map((attachmentId) => ({
-          kind: 'attachment' as const,
-          attachmentId,
-        })),
-      ],
-      async (ctx) => {
-        if (await ctx.getMessageHeader(message.id)) {
-          throw new Error(`AppendMessageIdAlreadyExists:${message.id}`)
+const CHAT_METADATA_PATCH_KEYS = new Set<keyof Chat>([
+  'title',
+  'titleStatus',
+  'lastViewedAt',
+  'configurationVersion',
+  'settings',
+  'presetId',
+  'modelResolution',
+  'archived',
+  'pinned',
+  'color',
+  'tags',
+  'favoriteModels',
+  'recentModels',
+  'temporary',
+])
+
+const DISCOVERY_CACHE_INTERNAL_MAINTENANCE_TABLES = new Set<PhysicalStorageTableName>([
+  'discoveryCacheState',
+  'discoveryPayloadMetadata',
+  'discoveryPayloads',
+])
+
+function streamOwnedMessageFieldsChanged(
+  existingHeader: MessageHeaderRow,
+  existingBody: MessageBodyRow,
+  nextHeader: MessageHeaderRow,
+  nextBody: MessageBodyRow,
+): boolean {
+  const comparableHeader = (header: MessageHeaderRow) => {
+    const {
+      nodeVersion,
+      requestContextVersion,
+      bodyVersion,
+      bodyWordCount,
+      bodyTextCharCount,
+      bodyMediaCount,
+      bodyRenderCost,
+      contextRouteFacts,
+      treeParentKey: _treeParentKey,
+      treeLive,
+      hiddenFromContext,
+      attachmentRefs,
+      cachedMediaTokens,
+      ...value
+    } = header
+    void nodeVersion
+    void requestContextVersion
+    void bodyVersion
+    void bodyWordCount
+    void bodyTextCharCount
+    void bodyMediaCount
+    void bodyRenderCost
+    void contextRouteFacts
+    void _treeParentKey
+    void treeLive
+    void hiddenFromContext
+    void attachmentRefs
+    void cachedMediaTokens
+    return value
+  }
+  const comparableBody = (body: MessageBodyRow) => {
+    const { bodyVersion, updatedAt, ...value } = body
+    void bodyVersion
+    void updatedAt
+    return value
+  }
+  return (
+    stableStringify(comparableHeader(existingHeader)) !==
+      stableStringify(comparableHeader(nextHeader)) ||
+    stableStringify(comparableBody(existingBody)) !== stableStringify(comparableBody(nextBody))
+  )
+}
+
+function nextBranchUpdatedAt(current: number, now: number): number {
+  return Math.max(now, current + 1)
+}
+
+async function reserveStreamLeaseTarget(
+  tx: FencedTransaction<'settings' | 'streamLeases'>,
+  incoming: StreamLeaseAdmission,
+): Promise<number> {
+  const settings = tx.table<{ key: string; value: unknown }, string>('settings')
+  const sequenceRow = await settings.get('stream-admission-sequence')
+  const currentSequence =
+    typeof sequenceRow?.value === 'number' &&
+    Number.isSafeInteger(sequenceRow.value) &&
+    sequenceRow.value >= 0
+      ? sequenceRow.value
+      : 0
+  if (currentSequence >= Number.MAX_SAFE_INTEGER)
+    throw new Error('StreamAdmissionSequenceExhausted')
+  const admissionSequence = currentSequence + 1
+  const leaseTable = tx.table<StreamLeaseRow, string>('streamLeases')
+  const competing = await leaseTable.where('targetOwnerKey').equals(incoming.messageId).first()
+  if (competing) throw new StreamTargetBusyError(incoming.messageId)
+  await settings.put({ key: 'stream-admission-sequence', value: admissionSequence })
+  recordBrowserCommandInvalidation(tx, {
+    kind: 'setting',
+    keys: ['stream-admission-sequence'],
+  })
+  return admissionSequence
+}
+
+async function assertStreamLeaseWorkspaceTarget(
+  tx: Transaction,
+  lease: Pick<StreamLeaseRow, 'streamId' | 'chatId' | 'messageId' | 'attemptKind'>,
+): Promise<void> {
+  const chat = await tx.table<Chat, ChatId>('chats').get(lease.chatId)
+  if (!chat) throw new ChatMissingError(lease.chatId)
+  const target = await tx.table<MessageHeaderRow, MessageId>('messages').get(lease.messageId)
+  if (lease.attemptKind === 'generation' && target) {
+    throw new StreamTargetBusyError(lease.messageId)
+  }
+  if (
+    lease.attemptKind === 'continuation' &&
+    (!target || target.deleted || target.chatId !== lease.chatId || target.role !== 'assistant')
+  ) {
+    throw new Error(`ContinuationStreamTargetInvalid:${lease.streamId}:${lease.messageId}`)
+  }
+}
+
+function valuesEqual(left: unknown, right: unknown): boolean {
+  return stableStringify(left) === stableStringify(right)
+}
+
+function changedPatch<Row extends object>(
+  current: Partial<Row>,
+  patch: Partial<Row>,
+): Partial<Row> | null {
+  const next: Partial<Row> = {}
+  let changed = false
+  for (const key of Object.keys(patch) as Array<keyof Row>) {
+    const value = patch[key]
+    if (valuesEqual(current[key], value)) continue
+    next[key] = value
+    changed = true
+  }
+  return changed ? next : null
+}
+
+function cloneMessage(message: Message): Message {
+  const cloned = structuredClone(message)
+  cloned.attachmentRefs = normalizeAttachmentRefs(cloned.attachmentRefs, {
+    messageId: cloned.id,
+    createdAt: cloned.createdAt,
+  })
+  return cloned
+}
+
+function assertExistingMessageIdentity(existing: MessageHeaderRow, candidate: Message): void {
+  if (
+    existing.id !== candidate.id ||
+    existing.chatId !== candidate.chatId ||
+    existing.turnId !== candidate.turnId ||
+    existing.turnIndex !== candidate.turnIndex ||
+    existing.createdAt !== candidate.createdAt ||
+    existing.role !== candidate.role ||
+    existing.origin !== candidate.origin
+  ) {
+    throw new Error(`ImmutableMessageFieldChanged:${existing.id}`)
+  }
+  if (
+    existing.parentId !== candidate.parentId ||
+    existing.siblingIndex !== candidate.siblingIndex ||
+    existing.deleted !== candidate.deleted
+  ) {
+    throw new Error(`MessageStructurePatchRequired:${existing.id}`)
+  }
+}
+
+async function listChildHeaderRows(
+  table: Table<MessageHeaderRow, MessageId>,
+  chatId: ChatId,
+  parentId: MessageId | null,
+): Promise<MessageHeaderRow[]> {
+  return table
+    .where('[chatId+treeParentKey+siblingIndex+id]')
+    .between(...exactCompoundPrefixBetween([chatId, treeParentKey(parentId)]))
+    .toArray()
+}
+
+function applyMessageBodyPatch(body: MessageBodyRow, patch: MessageBodyPatch): MessageBodyRow {
+  const next = structuredClone(body)
+  if ('content' in patch) {
+    if (patch.content === undefined) throw new Error(`MessageBodyPatchMissingContent:${body.id}`)
+    next.content = structuredClone(patch.content)
+  }
+  if ('reasoningEnvelope' in patch) {
+    if (patch.reasoningEnvelope === undefined) delete next.reasoningEnvelope
+    else next.reasoningEnvelope = structuredClone(patch.reasoningEnvelope)
+  }
+  if ('toolCalls' in patch) {
+    if (patch.toolCalls === undefined) delete next.toolCalls
+    else next.toolCalls = structuredClone(patch.toolCalls)
+  }
+  if ('refusal' in patch) {
+    if (patch.refusal === undefined) delete next.refusal
+    else next.refusal = patch.refusal
+  }
+  if ('phase' in patch) {
+    if (patch.phase === undefined) delete next.phase
+    else next.phase = patch.phase
+  }
+  if ('providerOutputItems' in patch) {
+    if (patch.providerOutputItems === undefined) delete next.providerOutputItems
+    else next.providerOutputItems = structuredClone(patch.providerOutputItems)
+  }
+  if ('continuationAttempts' in patch) {
+    if (patch.continuationAttempts === undefined) delete next.continuationAttempts
+    else next.continuationAttempts = structuredClone(patch.continuationAttempts)
+  }
+  return next
+}
+
+function replacementMessageBody(
+  header: MessageHeaderRow,
+  patch: MessageBodyPatch,
+  options: { bodyVersion: number; updatedAt: number },
+): MessageBodyRow {
+  if (!('content' in patch) || patch.content === undefined) {
+    throw new Error(`MessageBodyPatchMissingContent:${header.id}`)
+  }
+  const body: MessageBodyRow = {
+    id: header.id,
+    chatId: header.chatId,
+    bodyVersion: options.bodyVersion,
+    updatedAt: options.updatedAt,
+    content: structuredClone(patch.content),
+  }
+  if (patch.reasoningEnvelope !== undefined) {
+    body.reasoningEnvelope = structuredClone(patch.reasoningEnvelope)
+  }
+  if (patch.toolCalls !== undefined) body.toolCalls = structuredClone(patch.toolCalls)
+  if (patch.refusal !== undefined) body.refusal = patch.refusal
+  if (patch.phase !== undefined) body.phase = patch.phase
+  if (patch.providerOutputItems !== undefined) {
+    body.providerOutputItems = structuredClone(patch.providerOutputItems)
+  }
+  if (patch.continuationAttempts !== undefined) {
+    body.continuationAttempts = structuredClone(patch.continuationAttempts)
+  }
+  return body
+}
+
+function transitionMessageGenerationForDispatch(
+  header: MessageHeaderRow,
+  generation: DispatchedGenerationMeta,
+): MessageHeaderRow {
+  if (stableStringify(header.generation) === stableStringify(generation)) {
+    return cloneMessageHeader(header)
+  }
+  const current = header.generation
+  if (
+    header.role !== 'assistant' ||
+    header.origin !== 'generated' ||
+    header.deleted ||
+    !current ||
+    current.status !== 'preparing'
+  ) {
+    throw new Error(`MessageGenerationDispatchSourceInvalid:${header.id}`)
+  }
+  if (generation.model !== current.model || generation.startedAt !== current.startedAt) {
+    throw new Error(`MessageGenerationDispatchTargetInvalid:${header.id}`)
+  }
+  return {
+    ...cloneMessageHeader(header),
+    generation: structuredClone(generation),
+    nodeVersion: header.nodeVersion + 1,
+    requestContextVersion: header.requestContextVersion,
+    bodyVersion: header.bodyVersion,
+  }
+}
+
+async function chatPreviewInTransaction(tx: Transaction, chatId: ChatId): Promise<string> {
+  const header = await tx
+    .table<MessageHeaderRow, MessageId>('messages')
+    .where('[chatId+createdAt+id]')
+    .between(...exactCompoundPrefixBetween([chatId]))
+    .filter((row) => !row.deleted && row.role === 'user')
+    .first()
+  if (!header) return ''
+  const preview = await tx.table<MessageTextPreviewRow, MessageId>('messagePreviews').get(header.id)
+  if (!preview) throw new Error(`MessagePreviewMissing:${header.id}`)
+  if (preview.bodyVersion !== header.bodyVersion) {
+    throw new Error(`MessagePreviewVersionMismatch:${header.id}`)
+  }
+  return previewTextFromStoredProjection(preview.text)
+}
+
+function messageCost(message: Pick<Message, 'deleted' | 'generation'>): number {
+  return message.deleted ? 0 : (message.generation?.cost ?? 0)
+}
+
+function recordMessageSummaryDeltas(
+  state: ChatMutationState | undefined,
+  messageId: MessageId,
+  before: Message,
+  after: Message,
+): boolean {
+  if (!state) return false
+  const wordCountDelta = countMessagesWords([after]) - countMessagesWords([before])
+  const costDelta = messageCost(after) - messageCost(before)
+  if (wordCountDelta !== 0) {
+    state.wordCountDeltas.set(
+      messageId,
+      (state.wordCountDeltas.get(messageId) ?? 0) + wordCountDelta,
+    )
+  }
+  state.totalCostDelta += costDelta
+  return wordCountDelta !== 0 || costDelta !== 0
+}
+
+function recordMessageHeaderSummaryDeltas(
+  state: ChatMutationState | undefined,
+  messageId: MessageId,
+  before: MessageHeaderRow,
+  after: MessageHeaderRow,
+): boolean {
+  if (!state) return false
+  const beforeWords = before.deleted ? 0 : before.bodyWordCount
+  const afterWords = after.deleted ? 0 : after.bodyWordCount
+  const wordCountDelta = afterWords - beforeWords
+  const costDelta = messageCost(after) - messageCost(before)
+  if (wordCountDelta !== 0) {
+    state.wordCountDeltas.set(
+      messageId,
+      (state.wordCountDeltas.get(messageId) ?? 0) + wordCountDelta,
+    )
+  }
+  state.totalCostDelta += costDelta
+  return wordCountDelta !== 0 || costDelta !== 0
+}
+
+function recordNewMessageSummary(state: ChatMutationState, message: Message): void {
+  state.wordCountDeltas.set(message.id, countMessagesWords([message]))
+  state.totalCostDelta += messageCost(message)
+}
+
+function requireChatMetadataPatch(patch: ChatMetadataPatch): ChatMetadataPatch {
+  for (const key of Object.keys(patch) as Array<keyof Chat>) {
+    if (!CHAT_METADATA_PATCH_KEYS.has(key)) throw new Error(`ChatMetadataPatchForbidden:${key}`)
+  }
+  return patch
+}
+
+async function loadChatOrThrow(table: Table<Chat, string>, chatId: ChatId): Promise<Chat> {
+  const chat = await table.get(chatId)
+  if (!chat) throw new ChatMissingError(chatId)
+  return structuredClone(chat)
+}
+
+function shouldBumpStructuralLastBranchUpdatedAt(
+  beforeChat: Chat,
+  previousBranchIds: ReadonlySet<MessageId>,
+  nextLeafId: MessageId | null,
+  nextBranchHeaders: readonly MessageHeaderRow[],
+  changedMessageIds: ReadonlySet<MessageId>,
+): boolean {
+  if (nextLeafId !== beforeChat.lastUpdatedLeafId) return true
+  if (nextLeafId === null) return false
+  if (changedMessageIds.size === 0) return false
+  const nextBranchIds = new Set(nextBranchHeaders.map((header) => header.id))
+  for (const messageId of changedMessageIds) {
+    if (previousBranchIds.has(messageId) || nextBranchIds.has(messageId)) return true
+  }
+  return false
+}
+
+function shouldBumpLastBranchUpdatedAtFromHeaders(
+  beforeChat: Chat,
+  nextLeafId: MessageId | null,
+  branchHeaders: readonly MessageHeaderRow[],
+  changedMessageIds: ReadonlySet<MessageId>,
+): boolean {
+  if (nextLeafId !== beforeChat.lastUpdatedLeafId) return true
+  if (nextLeafId === null || changedMessageIds.size === 0) return false
+  const branchIds = new Set(branchHeaders.map((header) => header.id))
+  for (const messageId of changedMessageIds) {
+    if (branchIds.has(messageId)) return true
+  }
+  return false
+}
+
+function branchHeaderWordCount(headers: readonly MessageHeaderRow[]): number {
+  let wordCount = 0
+  for (const header of headers) wordCount += header.bodyWordCount
+  return wordCount
+}
+
+function canApplyIncrementalBranchAppend(state: ChatMutationState): boolean {
+  if (state.incrementalAppends.length === 0) return false
+  const appendedIds = new Set(state.incrementalAppends.map((message) => message.id))
+  if ([...state.changedMessageIds].some((messageId) => !appendedIds.has(messageId))) return false
+  if ([...state.wordCountDeltas.keys()].some((messageId) => !appendedIds.has(messageId))) {
+    return false
+  }
+  let parentId = state.beforeChat.lastUpdatedLeafId
+  for (const message of state.incrementalAppends) {
+    if (message.deleted || message.parentId !== parentId) return false
+    parentId = message.id
+  }
+  return true
+}
+
+async function newestLiveLeafIdInTransaction(
+  tx: Transaction,
+  chatId: ChatId,
+): Promise<MessageId | null> {
+  const messages = tx.table<MessageHeaderRow, MessageId>('messages')
+  const childLists = tx.table<ChildListState, string>('childLists')
+  const prefixRange = exactCompoundPrefixBetween([chatId])
+  let before: readonly [number, MessageId] | undefined
+  for (;;) {
+    const page = await messages
+      .where('[chatId+createdAt+id]')
+      .between(
+        prefixRange[0],
+        before ? [chatId, before[0], before[1]] : prefixRange[1],
+        true,
+        false,
+      )
+      .reverse()
+      .limit(HEADER_READ_PAGE_SIZE)
+      .toArray()
+    if (page.length === 0) return null
+    const live = page.filter((header) => !header.deleted)
+    const childStates = await childLists.bulkGet(
+      live.map((header) => childListKey(chatId, header.id)),
+    )
+    for (let index = 0; index < live.length; index += 1) {
+      if ((childStates[index]?.liveCount ?? 0) === 0) return live[index]?.id ?? null
+    }
+    const last = page.at(-1) as MessageHeaderRow
+    before = [last.createdAt, last.id]
+    if (page.length < HEADER_READ_PAGE_SIZE) return null
+  }
+}
+
+function messageOutranksLeaf(
+  message: Pick<Message, 'createdAt' | 'id'>,
+  leaf: Pick<MessageHeaderRow, 'createdAt' | 'id'>,
+): boolean {
+  return compareLiveLeafRecency(message, leaf) > 0
+}
+
+async function readBranchPathInTransaction(
+  tx: Transaction,
+  chatId: ChatId,
+  leafId: MessageId | null,
+  signal?: AbortSignal,
+): Promise<MessageHeaderRow[]> {
+  if (leafId === null) return []
+  const table = tx.table<MessageHeaderRow, MessageId>('messages')
+  const result = await readLiveBranchPath({
+    chatId,
+    leafId,
+    getHeader: async (messageId) => {
+      const header = await table.get(messageId)
+      throwIfReadonlyAborted(signal, 'Branch target read aborted')
+      return header
+    },
+    ...(signal ? { signal } : {}),
+  })
+  if (result.kind === 'unavailable') {
+    const reason =
+      result.reason === 'cycle'
+        ? 'ancestry-cycle'
+        : result.messageId !== leafId
+          ? 'invalid-ancestry'
+          : result.reason === 'missing'
+            ? 'message-missing'
+            : result.reason === 'wrong-chat'
+              ? 'message-chat-mismatch'
+              : 'message-deleted'
+    throw new BranchTargetUnavailableError(chatId, leafId, reason)
+  }
+  return result.rows.map(cloneMessageHeader)
+}
+
+function assertGenerationPromptPathClaimStructure(
+  chatId: ChatId,
+  claim: GenerationPromptPathClaim,
+): void {
+  let parentId: MessageId | null = null
+  for (const header of claim.headers) {
+    if (header.parentId !== parentId) {
+      throw new GenerationPlanningSeedChangedError(chatId)
+    }
+    parentId = header.messageId
+  }
+}
+
+async function validateGenerationPromptPathClaim(
+  tx: Transaction,
+  chatId: ChatId,
+  claim: GenerationPromptPathClaim,
+): Promise<ValidatedGenerationPromptPath> {
+  if (claim.chatId !== chatId) throw new GenerationPlanningSeedChangedError(chatId)
+  if (claim.leafId === null) {
+    if (claim.headers.length !== 0) throw new GenerationPlanningSeedChangedError(chatId)
+    return Object.freeze({
+      headers: sealValidatedGenerationPromptPathHeaders([]),
+      messageProofs: claim.headers,
+    })
+  }
+  if (claim.headers.at(-1)?.messageId !== claim.leafId) {
+    throw new GenerationPlanningSeedChangedError(chatId)
+  }
+  assertGenerationPromptPathClaimStructure(chatId, claim)
+  const table = tx.table<MessageHeaderRow, MessageId>('messages')
+  const validated: MessageHeaderRow[] = []
+  for (let offset = 0; offset < claim.headers.length; offset += HEADER_READ_PAGE_SIZE) {
+    const pageLength = Math.min(HEADER_READ_PAGE_SIZE, claim.headers.length - offset)
+    const ids = new Array<MessageId>(pageLength)
+    for (let index = 0; index < pageLength; index += 1) {
+      const expected = claim.headers[offset + index]
+      if (!expected) throw new GenerationPlanningSeedChangedError(chatId)
+      ids[index] = expected.messageId
+    }
+    const rows = await table.bulkGet(ids)
+    for (let index = 0; index < pageLength; index += 1) {
+      const expected = claim.headers[offset + index]
+      const row = rows[index]
+      if (
+        !row ||
+        !expected ||
+        row.id !== expected.messageId ||
+        row.chatId !== chatId ||
+        row.deleted ||
+        row.parentId !== expected.parentId ||
+        row.requestContextVersion !== expected.requestContextVersion
+      ) {
+        throw new GenerationPlanningSeedChangedError(chatId)
+      }
+      validated.push(row)
+    }
+  }
+  return Object.freeze({
+    headers: sealValidatedGenerationPromptPathHeaders(validated),
+    messageProofs: claim.headers,
+  })
+}
+
+function assertPhysicalMutationEvidenceCoverage(
+  mutations: readonly BrowserCommandPhysicalMutation[],
+  delta: WorkspaceDelta,
+  receipt: WorkspaceLocalReceipt,
+  terminalChatIds: ReadonlySet<ChatId>,
+  physicalOwnerScopes: ReadonlyMap<string, BrowserCommandPhysicalOwnerScope>,
+  internalMutationEvidence: ReadonlySet<string>,
+): void {
+  const chatIds = new Set<ChatId>()
+  for (const chat of [...receipt.chats, ...receipt.constructions]) chatIds.add(chat.id)
+  for (const fact of delta.facts) {
+    if (
+      fact.kind === 'chat-deleted' ||
+      fact.kind === 'conversation-created' ||
+      fact.kind === 'sidebar-row-changed'
+    ) {
+      chatIds.add(fact.chatId)
+    }
+  }
+  const revisions = new Map(
+    receipt.messageRevisions.map((revision) => [revision.header.id, revision]),
+  )
+  const previewIds = new Set<MessageId>()
+  const settingKeys = new Set<string>()
+  const attachmentIds = new Set<AttachmentId>()
+  for (const dependency of delta.invalidations) {
+    if (dependency.kind === 'message-preview' && dependency.messageIds) {
+      for (const messageId of dependency.messageIds) previewIds.add(messageId)
+    } else if (dependency.kind === 'setting' && dependency.keys) {
+      for (const key of dependency.keys) settingKeys.add(key)
+    } else if (dependency.kind === 'attachment' && dependency.attachmentIds) {
+      for (const attachmentId of dependency.attachmentIds) attachmentIds.add(attachmentId)
+    }
+  }
+  for (const fact of delta.facts) {
+    if (fact.kind === 'attachment-row-changed' || fact.kind === 'attachment-row-deleted') {
+      attachmentIds.add(fact.attachmentId)
+    }
+  }
+  const childSlotIds = new Set<string>()
+  const childMemberIds = new Set<MessageId>()
+  for (const evidence of receipt.childSlots) {
+    childSlotIds.add(evidence.state.id)
+    for (const member of evidence.upserts) childMemberIds.add(member.id)
+    for (const messageId of evidence.removedMessageIds) childMemberIds.add(messageId)
+  }
+  const evidenceDependencies = [
+    ...delta.invalidations,
+    ...delta.facts.flatMap(workspaceDependenciesForDeltaFact),
+  ]
+  const terminalChatOwnerScopeIds = new Set(
+    [...physicalOwnerScopes.values()].flatMap((scope) =>
+      scope.ownerIds.length > 0 && scope.ownerIds.every((chatId) => terminalChatIds.has(chatId))
+        ? [scope.id]
+        : [],
+    ),
+  )
+
+  for (const mutation of mutations) {
+    if (
+      internalMutationEvidence.has(mutation.address) ||
+      internalMutationGroupCovers(mutation, internalMutationEvidence)
+    ) {
+      continue
+    }
+    switch (mutation.tableName) {
+      case 'chats': {
+        if (!mutation.rowId || !chatIds.has(mutation.rowId)) {
+          throw new Error(`BrowserCommandPhysicalChatEvidenceMissing:${mutation.rowId ?? '?'}`)
         }
-        if (expectedLeafId !== null) {
-          const expected = await ctx.getMessageHeader(expectedLeafId)
-          if (!expected) {
-            throw new ExpectedLeafChangedError(message.chatId, expectedLeafId, 'missing')
-          }
-          if (expected.chatId !== message.chatId) {
-            throw new ExpectedLeafChangedError(message.chatId, expectedLeafId, 'wrong-chat')
-          }
-          if (expected.deleted) {
-            throw new ExpectedLeafChangedError(message.chatId, expectedLeafId, 'deleted')
-          }
-        }
-        const siblings = await ctx.listChildHeaders(message.chatId, expectedLeafId)
-        const blockingChild = siblings.find((header) => !header.deleted)
-        if (blockingChild) {
-          throw new ExpectedLeafChangedError(
-            message.chatId,
-            expectedLeafId,
-            expectedLeafId === null ? 'root-not-empty' : 'has-live-child',
-            blockingChild.id,
+        break
+      }
+      case 'messages': {
+        if (
+          physicalMutationCoveredByTerminalChat(
+            mutation,
+            terminalChatIds,
+            terminalChatOwnerScopeIds,
+          )
+        )
+          break
+        if (!mutation.messageId || !revisions.has(mutation.messageId)) {
+          throw new Error(
+            `BrowserCommandPhysicalMessageEvidenceMissing:${mutation.messageId ?? '?'}`,
           )
         }
-        const appended: Message = {
-          ...structuredClone(message),
-          parentId: expectedLeafId,
-          siblingIndex: nextSiblingIndex(siblings),
-          nodeVersion: 0,
-          deleted: false,
+        break
+      }
+      case 'messageBodies': {
+        if (
+          physicalMutationCoveredByTerminalChat(
+            mutation,
+            terminalChatIds,
+            terminalChatOwnerScopeIds,
+          )
+        )
+          break
+        const revision = mutation.messageId ? revisions.get(mutation.messageId) : undefined
+        if (
+          !revision?.changed.body ||
+          !revision.presentation ||
+          revision.presentation.bodyVersion !== revision.header.bodyVersion
+        ) {
+          throw new Error(
+            `BrowserCommandPhysicalMessageBodyEvidenceMissing:${mutation.messageId ?? '?'}`,
+          )
         }
-        await ctx.putMessage(appended)
-        const branchHeaders: MessageHeaderRow[] = []
-        let current = await ctx.getMessageHeader(appended.id)
-        while (current) {
-          branchHeaders.push(current)
-          current = current.parentId ? await ctx.getMessageHeader(current.parentId) : undefined
+        break
+      }
+      case 'messagePreviews': {
+        if (
+          physicalMutationCoveredByTerminalChat(
+            mutation,
+            terminalChatIds,
+            terminalChatOwnerScopeIds,
+          )
+        )
+          break
+        const revision = mutation.messageId ? revisions.get(mutation.messageId) : undefined
+        if (
+          !mutation.messageId ||
+          !revision?.changed.body ||
+          !revision.presentation ||
+          revision.presentation.bodyVersion !== revision.header.bodyVersion ||
+          !previewIds.has(mutation.messageId)
+        ) {
+          throw new Error(
+            `BrowserCommandPhysicalMessagePreviewEvidenceMissing:${mutation.messageId ?? '?'}`,
+          )
         }
-        branchHeaders.reverse()
-        const header = branchHeaders.at(-1)
-        if (!header || header.id !== appended.id) {
-          throw new Error(`AppendMessageHeaderMissing:${appended.id}`)
+        break
+      }
+      case 'childLists':
+        if (
+          !physicalMutationCoveredByTerminalChat(
+            mutation,
+            terminalChatIds,
+            terminalChatOwnerScopeIds,
+          ) &&
+          (!mutation.rowId || !childSlotIds.has(mutation.rowId))
+        ) {
+          throw new Error(`BrowserCommandPhysicalChildSlotEvidenceMissing:${mutation.rowId ?? '?'}`)
         }
-        return {
-          message: appended,
-          header,
-          branchHeaders,
-          hadExistingSiblings: siblings.length > 0,
+        break
+      case 'childSlotMembers':
+        if (
+          !physicalMutationCoveredByTerminalChat(
+            mutation,
+            terminalChatIds,
+            terminalChatOwnerScopeIds,
+          ) &&
+          (!mutation.messageId || !childMemberIds.has(mutation.messageId))
+        ) {
+          throw new Error(
+            `BrowserCommandPhysicalChildMemberEvidenceMissing:${mutation.messageId ?? '?'}`,
+          )
         }
-      },
-    )
-    const versions = result.chatVersions[message.chatId]
-    if (!versions) throw new Error(`AppendMessageVersionsMissing:${message.chatId}`)
-    return { ...result.value, versions }
+        break
+      case 'settings': {
+        const key = typeof mutation.key === 'string' ? mutation.key : null
+        if (!key || !settingKeys.has(key)) {
+          throw new Error(`BrowserCommandPhysicalSettingEvidenceMissing:${key ?? '?'}`)
+        }
+        break
+      }
+      case 'attachments':
+        if (!mutation.attachmentId || !attachmentIds.has(mutation.attachmentId)) {
+          throw new Error(
+            `BrowserCommandPhysicalAttachmentEvidenceMissing:${mutation.attachmentId ?? '?'}`,
+          )
+        }
+        break
+      default: {
+        const allowedKinds =
+          PHYSICAL_STORAGE_POLICY[mutation.tableName as PhysicalStorageTableName].effectKinds
+        if (
+          !evidenceDependencies.some(
+            (dependency) =>
+              allowedKinds.includes(dependency.kind) &&
+              workspaceDependencyCoversPhysicalMutation(dependency, mutation, physicalOwnerScopes),
+          )
+        ) {
+          throw new Error(
+            `BrowserCommandPhysicalEffectEvidenceMissing:${mutation.tableName}:${mutation.rowId ?? '?'}`,
+          )
+        }
+      }
+    }
+  }
+}
+
+function internalMutationGroupCovers(
+  mutation: BrowserCommandPhysicalMutation,
+  evidence: ReadonlySet<string>,
+): boolean {
+  if (
+    evidence.has(INTERNAL_DISCOVERY_CACHE_MAINTENANCE) &&
+    DISCOVERY_CACHE_INTERNAL_MAINTENANCE_TABLES.has(mutation.tableName as PhysicalStorageTableName)
+  ) {
+    return true
+  }
+  return (
+    evidence.has(INTERNAL_ATTACHMENT_INTEGRITY_MAINTENANCE) &&
+    mutation.tableName === 'attachmentIntegrityState'
+  )
+}
+
+function physicalMutationCoveredByTerminalChat(
+  mutation: BrowserCommandPhysicalMutation,
+  terminalChatIds: ReadonlySet<ChatId>,
+  terminalChatOwnerScopeIds: ReadonlySet<string>,
+): boolean {
+  return (
+    (mutation.chatId !== undefined && terminalChatIds.has(mutation.chatId)) ||
+    (mutation.ownerScopeId !== undefined && terminalChatOwnerScopeIds.has(mutation.ownerScopeId))
+  )
+}
+
+function workspaceDependencyCoversPhysicalMutation(
+  dependency: WorkspaceDependency,
+  mutation: BrowserCommandPhysicalMutation,
+  physicalOwnerScopes: ReadonlyMap<string, BrowserCommandPhysicalOwnerScope>,
+): boolean {
+  switch (dependency.kind) {
+    case 'workspace':
+      return true
+    case 'chat':
+    case 'sidebar':
+    case 'draft': {
+      if (physicalEffectGroupCovers(dependency.kind, mutation.tableName)) return true
+      const chatId =
+        mutation.chatId ?? (mutation.tableName === 'drafts' ? mutation.rowId : undefined)
+      const chatIds = physicalMutationChatIds(mutation, physicalOwnerScopes, chatId)
+      return (
+        !dependency.chatIds ||
+        (chatIds.length > 0 && chatIds.every((id) => dependency.chatIds?.includes(id)))
+      )
+    }
+    case 'message-header':
+    case 'message-body':
+    case 'message-preview':
+      return (
+        (!dependency.chatId ||
+          physicalMutationChatsMatch(
+            mutation,
+            physicalOwnerScopes,
+            (chatId) => chatId === dependency.chatId,
+          )) &&
+        (!dependency.messageIds ||
+          (mutation.messageId !== undefined && dependency.messageIds.includes(mutation.messageId)))
+      )
+    case 'child-slot':
+      return physicalMutationChatsMatch(
+        mutation,
+        physicalOwnerScopes,
+        (chatId) => chatId === dependency.chatId,
+      )
+    case 'attachment':
+      if (physicalEffectGroupCovers(dependency.kind, mutation.tableName)) return true
+      return (
+        !dependency.attachmentIds ||
+        (mutation.attachmentId !== undefined &&
+          dependency.attachmentIds.includes(mutation.attachmentId))
+      )
+    case 'attachment-job':
+      return (
+        (!dependency.attachmentIds ||
+          (mutation.attachmentId !== undefined &&
+            dependency.attachmentIds.includes(mutation.attachmentId))) &&
+        (!dependency.jobIds ||
+          (mutation.rowId !== undefined && dependency.jobIds.includes(mutation.rowId)))
+      )
+    case 'profile': {
+      if (physicalEffectGroupCovers(dependency.kind, mutation.tableName)) return true
+      const profileIds = mutation.profileIds ?? (mutation.profileId ? [mutation.profileId] : [])
+      return !dependency.profileIds || dependency.profileIds.some((id) => profileIds.includes(id))
+    }
+    case 'preset': {
+      if (physicalEffectGroupCovers(dependency.kind, mutation.tableName)) return true
+      return (
+        !dependency.presetIds ||
+        dependency.presetIds.some((id) => mutation.presetIds?.includes(id) === true)
+      )
+    }
+    case 'prompt-preset': {
+      if (physicalEffectGroupCovers(dependency.kind, mutation.tableName)) return true
+      return (
+        !dependency.presetIds ||
+        dependency.presetIds.some((id) => mutation.promptPresetIds?.includes(id) === true)
+      )
+    }
+    case 'text-template':
+      return (
+        !dependency.templateIds ||
+        dependency.templateIds.some((id) => mutation.templateIds?.includes(id) === true)
+      )
+    case 'folder':
+      return (
+        !dependency.folderIds ||
+        (mutation.rowId !== undefined && dependency.folderIds.includes(mutation.rowId))
+      )
+    case 'tag':
+      return (
+        !dependency.tagIds ||
+        (mutation.rowId !== undefined && dependency.tagIds.includes(mutation.rowId))
+      )
+    case 'key':
+      return (
+        !dependency.keyIds || dependency.keyIds.some((id) => mutation.keyIds?.includes(id) === true)
+      )
+    case 'setting':
+      return (
+        !dependency.keys ||
+        (typeof mutation.key === 'string' && dependency.keys.includes(mutation.key))
+      )
+    case 'stream-lease':
+    case 'stream-chunks':
+      return (
+        (!dependency.chatId ||
+          physicalMutationChatsMatch(
+            mutation,
+            physicalOwnerScopes,
+            (chatId) => chatId === dependency.chatId,
+          )) &&
+        (!dependency.streamIds ||
+          (mutation.streamId !== undefined && dependency.streamIds.includes(mutation.streamId)))
+      )
+    case 'discovery-cache':
+      if (physicalEffectGroupCovers(dependency.kind, mutation.tableName)) return true
+      return (
+        !dependency.profileIds ||
+        dependency.profileIds.some(
+          (id) => mutation.profileIds?.includes(id) === true || mutation.profileId === id,
+        )
+      )
+    case 'storage-maintenance':
+      return (
+        mutation.rowId !== undefined &&
+        dependency.tasks.includes(mutation.rowId as StorageMaintenanceRequestTaskKind)
+      )
+  }
+}
+
+function physicalMutationChatIds(
+  mutation: BrowserCommandPhysicalMutation,
+  physicalOwnerScopes: ReadonlyMap<string, BrowserCommandPhysicalOwnerScope>,
+  fallbackChatId = mutation.chatId,
+): readonly ChatId[] {
+  if (fallbackChatId) return [fallbackChatId]
+  if (!mutation.ownerScopeId) return []
+  const scope = physicalOwnerScopes.get(mutation.ownerScopeId)
+  return scope?.kind === 'chat' ? scope.ownerIds : []
+}
+
+function physicalMutationChatsMatch(
+  mutation: BrowserCommandPhysicalMutation,
+  physicalOwnerScopes: ReadonlyMap<string, BrowserCommandPhysicalOwnerScope>,
+  predicate: (chatId: ChatId) => boolean,
+): boolean {
+  const chatIds = physicalMutationChatIds(mutation, physicalOwnerScopes)
+  return chatIds.length > 0 && chatIds.every(predicate)
+}
+
+function physicalEffectGroupCovers(kind: WorkspaceDependency['kind'], tableName: string): boolean {
+  return PHYSICAL_STORAGE_POLICY[tableName as PhysicalStorageTableName].groupEffectKinds.includes(
+    kind,
+  )
+}
+
+function materializeChatMutationState(state: ChatMutationState): Chat {
+  const chat = {
+    ...state.beforeChat,
+    ...state.hiddenMetaPatch,
+    ...state.visibleMetaPatch,
+  }
+  if (state.clearModelResolution) delete chat.modelResolution
+  return chat
+}
+
+function workspaceDeltaForMessageRevisions(
+  authoritativeRevisions: readonly CommittedMessageRevision[],
+): WorkspaceDelta {
+  if (authoritativeRevisions.length === 0) return { facts: [], invalidations: [] }
+  const childSlots = new Map<string, { chatId: ChatId; parentId: MessageId | null }>()
+  const previewIdsByChat = new Map<ChatId, MessageId[]>()
+  for (const revision of authoritativeRevisions) {
+    if (revision.changed.structure) {
+      const addSlot = (parentId: MessageId | null) => {
+        childSlots.set(`${revision.header.chatId}:${parentId ?? '__root__'}`, {
+          chatId: revision.header.chatId,
+          parentId,
+        })
+      }
+      if (revision.before) addSlot(revision.before.parentId)
+      addSlot(revision.header.parentId)
+    }
+    if (revision.changed.body) {
+      const ids = previewIdsByChat.get(revision.header.chatId) ?? []
+      ids.push(revision.header.id)
+      previewIdsByChat.set(revision.header.chatId, ids)
+    }
+  }
+  const parentIdsByChat = new Map<ChatId, Array<MessageId | null>>()
+  for (const { chatId, parentId } of childSlots.values()) {
+    const parentIds = parentIdsByChat.get(chatId) ?? []
+    parentIds.push(parentId)
+    parentIdsByChat.set(chatId, parentIds)
+  }
+  return {
+    facts: authoritativeRevisions.map(
+      (revision): WorkspaceDeltaFact => ({
+        kind: 'message-revision',
+        chatId: revision.header.chatId,
+        structuralVersion: revision.structuralVersion,
+        header: revision.header,
+        changed: revision.changed,
+      }),
+    ),
+    invalidations: normalizeWorkspaceDependencies([
+      ...[...parentIdsByChat].map(
+        ([chatId, parentIds]): WorkspaceDependency => ({
+          kind: 'child-slot',
+          chatId,
+          parentIds,
+        }),
+      ),
+      ...[...previewIdsByChat].map(
+        ([chatId, messageIds]): WorkspaceDependency => ({
+          kind: 'message-preview',
+          chatId,
+          messageIds,
+        }),
+      ),
+    ]),
+  }
+}
+
+const browserMutationSharedInternals: BrowserMutationSharedInternals = Object.freeze({
+  applyMessageBodyPatch,
+  applyMessageHeaderPatch,
+  assertExistingMessageIdentity,
+  assertOwnedStreamFence,
+  assertStreamLeaseWorkspaceTarget,
+  branchHeaderWordCount,
+  calibrationUsageFromPostCommit,
+  canApplyIncrementalBranchAppend,
+  changedPatch,
+  chatConfigurationTargetResourceNames,
+  chatPreviewInTransaction,
+  cloneDraft,
+  cloneMessage,
+  cloneMessageHeader,
+  hydrateStoredAttachment,
+  hydrateStoredMessage,
+  listChildHeaderRows,
+  loadChatOrThrow,
+  materializeChatMutationState,
+  messageCost,
+  messageOutranksLeaf,
+  messageSemanticEffect,
+  newestLiveLeafIdInTransaction,
+  nextBranchUpdatedAt,
+  nextStreamLeaseRevision,
+  readBranchPathInTransaction,
+  recordMessageHeaderSummaryDeltas,
+  recordMessageSummaryDeltas,
+  recordNewMessageSummary,
+  replacementMessageBody,
+  requireChatMetadataPatch,
+  requiredStreamPostCommitEvidence,
+  reserveStreamLeaseTarget,
+  shouldBumpLastBranchUpdatedAtFromHeaders,
+  shouldBumpStructuralLastBranchUpdatedAt,
+  stableStringify,
+  streamOwnedMessageFieldsChanged,
+  transitionMessageGenerationForDispatch,
+  validateGenerationPromptPathClaim,
+})
+
+class BrowserWorkspaceRepository implements WorkspaceRepository {
+  private readonly session: BrowserWorkspaceSession
+  private databasePromise: Promise<NatterDb> | null = null
+
+  constructor(session: BrowserWorkspaceSession) {
+    this.session = session
   }
 
-  async forkChatFromMessage(input: ForkChatFromMessageInput): Promise<ForkChatFromMessageResult> {
-    const db = await openDb()
-    const destinationChatId = newId()
+  private openDb(): Promise<NatterDb> {
+    const current = this.databasePromise
+    if (current) return current
+    const opening = this.session.open()
+    this.databasePromise = opening
+    void opening.catch(() => {
+      if (this.databasePromise === opening) this.databasePromise = null
+    })
+    return opening
+  }
+
+  private async openReadFrame(
+    permit: WorkspaceReadAuthority,
+    signal: AbortSignal,
+  ): Promise<BrowserWorkspaceReadFrame> {
+    const db = await this.openDb()
+    const sessionWorkspace = this.session.getWorkspaceFence()
+    assertPermitFence(permit, sessionWorkspace)
+    const frame: BrowserWorkspaceReadFrame = Object.freeze({
+      db,
+      permit,
+      signal,
+      workspace: Object.freeze({
+        workspaceId: sessionWorkspace.workspaceId,
+        replacementEpoch: sessionWorkspace.replacementEpoch,
+        backendKind: 'browser-idb' as const,
+      }),
+    })
+    this.assertReadFrameCurrent(frame)
+    return frame
+  }
+
+  private finishReadFrame<T>(frame: BrowserWorkspaceReadFrame, value: T): ReadEnvelope<T> {
+    this.assertReadFrameCurrent(frame)
+    return {
+      workspaceId: frame.workspace.workspaceId,
+      replacementEpoch: frame.workspace.replacementEpoch,
+      value,
+    }
+  }
+
+  private assertReadFrameCurrent(frame: BrowserWorkspaceReadFrame): void {
+    this.session.assertCurrent()
+    assertWorkspaceReadPermit(frame.permit)
+    throwIfWorkspaceQueryAborted(frame.signal)
+  }
+
+  async query<Q extends WorkspaceQuery>(
+    permit: WorkspaceReadAuthority,
+    query: Q,
+    options: WorkspaceQueryOptions<Q> = {},
+  ): Promise<ReadEnvelope<WorkspaceQueryResult<Q>>> {
+    const linkedSignal = linkWorkspaceQuerySignals(permit.signal, options.signal)
+    try {
+      assertWorkspaceReadPermit(permit)
+      throwIfWorkspaceQueryAborted(linkedSignal.signal)
+      if (isBrowserInterchangeQuery(query)) {
+        const { BrowserImportExportHandler } = await import('./browser-import-export')
+        const handler = new BrowserImportExportHandler(await this.openDb())
+        const read =
+          query.kind === 'interchange.export-chat'
+            ? await handler.exportChat(query.chatId)
+            : query.kind === 'interchange.export-chat-preset'
+              ? await handler.exportChatPreset(query.presetId)
+              : query.kind === 'interchange.export-connection-profile'
+                ? await handler.exportConnectionProfile(query.profileId)
+                : await handler.exportWorkspaceBackup()
+        assertWorkspaceReadPermit(permit)
+        throwIfWorkspaceQueryAborted(linkedSignal.signal)
+        return this.interchangeReadEnvelope(
+          permit,
+          read as BrowserImportExportRead<WorkspaceQueryResult<Q>>,
+        )
+      }
+
+      if (query.kind === 'branch.open') {
+        return (await this.readConversationOpenEnvelope(
+          permit,
+          query.chatId,
+          query.target,
+          query.bodyDemand,
+          options.onStage as
+            | ((stage: ReadEnvelope<ConversationDestinationPoint>) => void)
+            | undefined,
+          linkedSignal.signal,
+        )) as ReadEnvelope<WorkspaceQueryResult<Q>>
+      }
+
+      if (query.kind === 'branch.page-structure') {
+        return (await this.readConversationPageStructureEnvelope(
+          permit,
+          query.chatId,
+          query.resolvedTipId,
+          query.structuralVersion,
+          query.window,
+          linkedSignal.signal,
+        )) as ReadEnvelope<WorkspaceQueryResult<Q>>
+      }
+
+      if (query.kind === 'message.headers-by-chat') {
+        return (await this.readConversationTopologyEnvelope(
+          permit,
+          query.chatId,
+          linkedSignal.signal,
+        )) as ReadEnvelope<WorkspaceQueryResult<Q>>
+      }
+
+      if (query.kind === 'branch.forks') {
+        return (await this.readConversationForksEnvelope(
+          permit,
+          query.chatId,
+          query.structuralVersion,
+          query.targets,
+          linkedSignal.signal,
+        )) as ReadEnvelope<WorkspaceQueryResult<Q>>
+      }
+
+      const frame = await this.openReadFrame(permit, linkedSignal.signal)
+      const value = (
+        query.kind === 'workspace.meta' ? frame.workspace : await this.dispatchQuery(query, frame)
+      ) as WorkspaceQueryResult<Q>
+      return this.finishReadFrame(frame, value)
+    } finally {
+      linkedSignal.dispose()
+    }
+  }
+
+  private interchangeReadEnvelope<T>(
+    permit: WorkspaceReadAuthority,
+    read: BrowserImportExportRead<T>,
+  ): ReadEnvelope<T> {
+    assertPermitFence(permit, read.workspace)
+    return {
+      workspaceId: read.workspace.workspaceId,
+      replacementEpoch: read.workspace.replacementEpoch,
+      value: read.value,
+    }
+  }
+
+  async execute<C extends WorkspaceCommand>(
+    permit: WorkspaceWriteAuthority,
+    command: C,
+  ): Promise<CommitEnvelope<WorkspaceCommandResult<C>>> {
+    assertWorkspaceExecutionPermit(permit)
+    const db = await this.openDb()
+    await awaitStorageCompactionWriteAdmission(db)
+    return withSharedAuthoritativeCommandSession(db, async (lockSession) => {
+      const durable = await readBrowserWorkspaceMeta(db)
+      assertPermitFence(permit, durable)
+      const commit = new BrowserCommandCommit(
+        db,
+        lockSession,
+        permit.workspaceId,
+        permit.replacementEpoch,
+        newId(),
+      )
+      const value = (await this.dispatchCommand(
+        command,
+        permit.replacementEpoch,
+        commit,
+      )) as WorkspaceCommandResult<C>
+      const chatEvidence = commit.materializeChatEvidence()
+      const messageRevisions = commit
+        .messageRevisions(chatEvidence.constructedChatIds)
+        .filter(
+          (revision) =>
+            !revision.before || !sameMessageHeaderValue(revision.before, revision.header),
+        )
+      const messageDelta = commit.messageDelta(messageRevisions)
+      const attemptTargetFacts = attemptTargetCommittedFacts(command, value)
+      const attemptStopFacts = attemptStopRequestedFacts(command, value)
+      const outcome = commit.finish()
+      const rawDelta: WorkspaceDelta = outcome.didMutateStorage
+        ? {
+            facts: [
+              ...chatEvidence.facts,
+              ...commit.attachmentFacts(),
+              ...messageDelta.facts,
+              ...attemptTargetFacts,
+              ...attemptStopFacts,
+            ],
+            invalidations: normalizeWorkspaceDependencies([
+              ...outcome.extraInvalidations,
+              ...chatEvidence.invalidations,
+              ...messageDelta.invalidations,
+            ]),
+          }
+        : { facts: [], invalidations: [] }
+      const receipt: WorkspaceLocalReceipt = {
+        chats: outcome.didMutateStorage ? chatEvidence.receiptChats : [],
+        constructions: outcome.didMutateStorage ? chatEvidence.constructions : [],
+        messageRevisions,
+        childSlots: outcome.didMutateStorage
+          ? commit.childSlots(chatEvidence.constructedChatIds)
+          : [],
+      }
+      const terminalChatIds = new Set([
+        ...chatEvidence.constructedChatIds,
+        ...chatEvidence.deletedChatIds,
+      ])
+      if (outcome.didMutateStorage) {
+        commit.assertPhysicalEvidenceCoverage(rawDelta, receipt, terminalChatIds)
+      }
+      const delta = outcome.didMutateStorage
+        ? collapseConversationConstructionPublication(rawDelta)
+        : rawDelta
+      const effectScope =
+        rawDelta.facts.length > 0 || rawDelta.invalidations.length > 0
+          ? ('workspace' as const)
+          : ('none' as const)
+      const stamp = {
+        workspaceId: outcome.fence.workspaceId,
+        replacementEpoch: outcome.fence.replacementEpoch,
+        commitId: commit.commitId,
+      }
+      return {
+        ...stamp,
+        effectScope,
+        value,
+        receipt,
+        delta,
+      }
+    })
+  }
+
+  async replace<R extends WorkspaceReplacement>(
+    replacement: R,
+  ): Promise<WorkspaceReplacementEnvelope<WorkspaceReplacementResult<R>>> {
+    return replaceBrowserRepository(replacement)
+  }
+
+  subscribeChanges(
+    listener: (change: WorkspaceChange) => void,
+    options?: { readonly delivery?: 'all' | 'remote' },
+  ): () => void {
+    return subscribeWorkspaceChanges(listener, options)
+  }
+
+  private async dispatchQuery(
+    query: BrowserInlineQuery,
+    frame: BrowserWorkspaceReadFrame,
+  ): Promise<unknown> {
+    const signalOptions = { signal: frame.signal }
+    switch (query.kind) {
+      case 'chat.get':
+        return this.getChat(query.chatId)
+      case 'chat.token-calibrations': {
+        const db = frame.db
+        const chats = await db.chats.bulkGet([...query.chatIds])
+        return chats.map((chat) => {
+          if (!chat) return undefined
+          const tokenCalibration = chat.tokenCalibration
+          return {
+            chatId: chat.id,
+            ...(tokenCalibration
+              ? {
+                  tokenCalibration: Object.fromEntries(
+                    Object.entries(tokenCalibration).map(([key, sample]) => [key, { ...sample }]),
+                  ),
+                }
+              : {}),
+          }
+        })
+      }
+      case 'sidebar.rows-by-id': {
+        return readSidebarRowsById(frame.db, query.chatIds, frame.signal)
+      }
+      case 'sidebar.catalog-page': {
+        return readSidebarCatalogPage(frame.db, query.request, frame.signal)
+      }
+      case 'sidebar.presentation-page': {
+        return readSidebarPresentationPage(frame.db, query.request, frame.signal)
+      }
+      case 'sidebar.aggregate': {
+        return readSidebarAggregate(frame.db)
+      }
+      case 'sidebar.created-at-group-count': {
+        return readSidebarCreatedAtGroupCount(frame.db, query.request, frame.signal)
+      }
+      case 'chat.next-fork-title':
+        return this.nextForkTitle(query.baseTitle)
+      case 'configuration.discovery-snapshot':
+        return this.getConnectionDiscoverySnapshot(query.profileId)
+      case 'configuration.shell':
+        return this.getConfigurationShell(frame.signal)
+      case 'configuration.global-token-calibration':
+        return this.getConfigurationGlobalTokenCalibration(frame.signal)
+      case 'configuration.text-template-catalog':
+        return this.getConfigurationTextTemplateCatalog(frame.signal)
+      case 'configuration.active-selection':
+        return this.getConfigurationActiveSelection(query.target, frame.signal)
+      case 'configuration.active-model':
+        return this.getConfigurationActiveModel(
+          query.profileId,
+          query.modelId,
+          query.revision,
+          query.includeModels,
+          query.knownPayloads,
+          frame.signal,
+        )
+      case 'configuration.profile-switch-plan':
+        return this.getConfigurationProfileSwitchPlan(query.chatId, query.profileId)
+      case 'configuration.profile-catalog-page':
+        return this.getConfigurationProfileCatalogPage(query.request, frame.signal)
+      case 'configuration.preset-catalog-page':
+        return this.getConfigurationPresetCatalogPage(query.request, frame.signal)
+      case 'configuration.prompt-preset-catalog-page':
+        return this.getConfigurationPromptPresetCatalogPage(
+          query.promptKind,
+          query.request,
+          frame.signal,
+        )
+      case 'configuration.connection-manager-page':
+        return this.getConfigurationConnectionManagerPage(query.request, frame.signal)
+      case 'configuration.generated-output-network-access':
+        return this.getGeneratedOutputNetworkAccess(
+          query.profileIds,
+          query.url,
+          query.requestCredential,
+        )
+      case 'key.get':
+        return this.getKey(query.keyId)
+      case 'setting.get':
+        return this.getSetting(query.key)
+      case 'setting.get-many':
+        return Object.fromEntries(await this.getSettings(query.keys, signalOptions))
+      case 'folder.list':
+        return this.listFolders()
+      case 'tag.list':
+        return this.listTags()
+      case 'message.presentation':
+        return (await this.getExactMessagePresentations([query.messageId], frame.signal))[0]
+      case 'message.presentations':
+        return this.getExactMessagePresentations(query.messageIds, frame.signal)
+      case 'message.preview-window':
+        return this.getMessageTextPreviewWindow(query.targets, {
+          ...(query.maxChars === undefined ? {} : { maxChars: query.maxChars }),
+          ...signalOptions,
+        })
+      case 'message.search-corpus':
+        return searchMessageCorpusInBrowser(frame.db, query.request, frame.signal)
+      case 'branch.child-at-position':
+        return this.getActiveBranchChildAtPosition(
+          query.chatId,
+          query.parentId,
+          query.position,
+          frame.signal,
+        )
+      case 'stream.lease':
+        return this.getStreamLease(query.streamId)
+      case 'stream.lease-head':
+        return this.getStreamLeaseHead()
+      case 'stream.leases-by-id':
+        return this.getStreamLeases(query.streamIds, signalOptions)
+      case 'stream.leases':
+        return this.listStreamLeases(query.chatId, signalOptions)
+      case 'stream.journal-frame-page':
+        return readStreamJournalFramePage(frame.db, query, signalOptions)
+      case 'attachment.get':
+        return this.getAttachment(query.attachmentId)
+      case 'attachment.generation-token-evidence':
+        return this.getAttachmentGenerationTokenEvidence(query.attachmentId)
+      case 'attachment.get-many':
+        return this.getAttachments(query.attachmentIds, signalOptions)
+      case 'attachment.media':
+        return this.getAttachmentMedia(query.attachmentId, query.purpose, frame.signal)
+      case 'attachment.media-many':
+        return this.getAttachmentMediaMany(query.attachmentIds, query.purpose, frame.signal)
+      case 'attachment.bundle':
+        return this.getAttachmentBundle(query.attachmentId)
+      case 'attachment.dispatch-bundle':
+        return this.getAttachmentDispatchBundle(query.attachmentId)
+      case 'attachment.find-hash':
+        return this.findAttachmentIdByContentHash(
+          query.filename,
+          query.contentHash,
+          query.excludeId,
+        )
+      case 'attachment.references':
+        return this.listAttachmentReferenceEdges(query.attachmentId)
+      case 'attachment.reference-rows':
+        return this.listAttachmentReferenceRows(query.attachmentId)
+      case 'attachment.catalog-rows':
+        return readAttachmentCatalogRows(frame.db, query.attachmentIds, frame.signal)
+      case 'attachment.catalog-page':
+        return readAttachmentCatalogPage(frame.db, query.search, frame.signal)
+      case 'attachment.catalog-evaluate':
+        return evaluateAttachmentCatalogRows(
+          frame.db,
+          query.search,
+          query.attachmentIds,
+          frame.signal,
+        )
+      case 'attachment.catalog-aggregate':
+        return readAttachmentCatalogAggregate(frame.db)
+      case 'attachment.manager-detail': {
+        const db = frame.db
+        return db.transaction(
+          'r',
+          [
+            db.attachmentCatalogRows,
+            db.attachmentArtifacts,
+            db.attachmentJobs,
+            db.attachmentRefEdges,
+            db.messages,
+            db.drafts,
+            db.chats,
+          ],
+          async () => {
+            const core = await readAttachmentManagerCore(db, query.attachmentId)
+            if (!core) return undefined
+            return {
+              ...core,
+              references: await this.listAttachmentReferenceRows(query.attachmentId),
+            }
+          },
+        )
+      }
+      case 'generated-output.localization-queue':
+        return this.getGeneratedOutputLocalizationQueue(query.now, query.limit)
+      case 'draft.get':
+        return this.getDraft(query.chatId)
+      case 'discovery.models':
+        return this.readDiscoveryCacheRow('models', [query.profileId, query.queryKey])
+      case 'discovery.endpoints':
+        return this.readDiscoveryCacheRow('endpoints', [query.profileId, query.modelId])
+      case 'discovery.privacy':
+        return this.readDiscoveryCacheRow('privacyPolicies', [query.profileId, query.modelId])
+      default:
+        return assertNever(query)
+    }
+  }
+
+  private messageMutationRepository(commit: BrowserCommandCommit): MessageMutationRepository {
+    return {
+      getChat: (chatId) => this.getChat(chatId),
+      getMessage: (messageId) => this.getMessage(messageId),
+      getMessageHeader: (messageId) => this.getMessageHeader(messageId),
+      getMessageHeaders: (messageIds) => this.getMessageHeaders(messageIds),
+      listChildHeaders: (chatId, parentId) => this.listChildHeaders(chatId, parentId),
+      runMutation: (scopes, fn, finalize) =>
+        this.runMutation(scopes, fn, undefined, commit, finalize),
+    }
+  }
+
+  private async dispatchCommand(
+    command: WorkspaceCommand,
+    replacementEpoch: number,
+    commit: BrowserCommandCommit,
+  ): Promise<unknown> {
+    switch (command.kind) {
+      case 'interchange.import-chat': {
+        const { BrowserImportExportHandler } = await import('./browser-import-export')
+        return new BrowserImportExportHandler(await this.openDb(), commit).importChat(
+          command.envelope,
+          command.options,
+        )
+      }
+      case 'interchange.import-chat-preset': {
+        const { BrowserImportExportHandler } = await import('./browser-import-export')
+        return new BrowserImportExportHandler(await this.openDb(), commit).importChatPreset(
+          command.envelope,
+          command.options,
+        )
+      }
+      case 'interchange.import-connection-profile': {
+        const { BrowserImportExportHandler } = await import('./browser-import-export')
+        return new BrowserImportExportHandler(await this.openDb(), commit).importConnectionProfile(
+          command.envelope,
+          command.options,
+        )
+      }
+      case 'chat.discard-empty-drafts':
+        return this.discardEmptyDraftChats(command, commit)
+      case 'chat.materialize-temporary':
+        return this.materializeTemporaryChat(command.input, replacementEpoch, commit)
+      case 'chat.set-archived':
+        return this.setChatsArchived(command.chatIds, command.archived, command.now, commit)
+      case 'chat.delete-archived':
+        return this.deleteArchivedChatRows(command.chatIds, command.now, commit)
+      case 'chat.empty-archive':
+        return this.emptyArchivedChatRows(command, commit)
+      case 'chat.move-to-folder':
+        return this.moveChatRowsToFolder(command.chatIds, command.folderId, command.now, commit)
+      case 'chat.set-tags-from-names':
+        return this.setChatRowsTagsFromNames(command.chatIds, command.names, command.now, commit)
+      case 'chat.touch-viewed':
+        return this.touchChatViewed(command.chatId, command.now, commit)
+      case 'chat.set-manual-title':
+        return this.setChatManualTitle(command.chatId, command.title, command.now, commit)
+      case 'chat.calibration.clear':
+        return this.clearChatCalibration(command, commit)
+      case 'chat.calibration.clear-family':
+        return this.clearCalibrationEverywhere(command, commit)
+      case 'chat.calibration.clear-all':
+        return this.clearCalibrationEverywhere(command, commit)
+      case 'chat.fork':
+        return this.forkChatFromMessage(command.input, commit)
+      case 'message.edit-content':
+        return editMessageContentInRepository(
+          this.messageMutationRepository(commit),
+          command.input,
+          this,
+        )
+      case 'message.toggle-reasoning-detail':
+      case 'message.toggle-provider-output-item':
+      case 'message.toggle-context':
+      case 'message.dismiss-generation-notice':
+        return mutateMessageBodyInRepository(this.messageMutationRepository(commit), command)
+      case 'message.import':
+        return pasteImportInRepository(this.messageMutationRepository(commit), command.input)
+      case 'message.delete': {
+        const mode = command.mode
+        switch (mode) {
+          case 'pair':
+            return deletePairInRepository(this.messageMutationRepository(commit), command.input)
+          case 'single':
+            return deleteSingleMessageInRepository(
+              this.messageMutationRepository(commit),
+              command.input,
+            )
+          case 'turn':
+            return deleteTurnInRepository(this.messageMutationRepository(commit), command.input)
+          case 'variant':
+            return deleteVariantInRepository(this.messageMutationRepository(commit), command.input)
+        }
+        return assertNever(mode)
+      }
+      case 'message.restore-structure': {
+        return applyStructuralSnapshotInRepository(
+          this.messageMutationRepository(commit),
+          command.input,
+        )
+      }
+      case 'attempt.prepare':
+        return this.prepareAttempt(command.input, replacementEpoch, commit)
+      case 'attempt.dispatch':
+        return this.dispatchAttempt(command.input, replacementEpoch, commit)
+      case 'attempt.request-stop':
+        return this.requestAttemptStop(command.input, replacementEpoch, commit)
+      case 'attempt.seal-terminal':
+        return this.sealAttemptTerminal(command.input, replacementEpoch, commit)
+      case 'attempt.finalize':
+        return this.finalizeAttempt(command.input, replacementEpoch, commit)
+      case 'generation.post-commit-metadata':
+        return this.commitGenerationMetadata(command.input, replacementEpoch, commit)
+      case 'stream.note-selected-key':
+        return this.noteStreamSelectedKey(command.input, replacementEpoch, commit)
+      case 'stream.renew':
+        return this.renewStreamLease(command.heartbeat, commit)
+      case 'stream.handoff-recovery':
+        return this.handoffStreamLeaseForRecovery(command.input, replacementEpoch, commit)
+      case 'stream.claim-recovery':
+        return this.claimStreamLeaseForRecovery(command.expected, command.now, commit)
+      case 'stream.append-journal-frames':
+        return this.appendStreamJournalFrames(command.frames, commit)
+      case 'stream.finish-cleanup':
+        return this.deleteStreamJournal(
+          command.streamId,
+          {
+            replacementEpoch,
+            streamFence: command.fence,
+          },
+          commit,
+        )
+      case 'maintenance.reconcile-stream-journal-integrity':
+        return this.reconcileStreamJournalIntegrity(command.limit, commit)
+      case 'maintenance.prune-terminal-stream-journals':
+        return this.pruneTerminalStreamJournals(
+          command.now,
+          command.maxAgeMs,
+          command.limit,
+          commit,
+        )
+      case 'maintenance.prune-empty-draft-chats':
+        return this.pruneEmptyDraftChats(command, commit)
+      case 'maintenance.prune-discovery-cache':
+        return this.pruneDiscoveryCache(command.limit, commit)
+      case 'maintenance.reconcile-attachment-integrity':
+        return this.reconcileAttachmentIntegrity(command.limit, commit)
+      case 'attachment.bundle.write':
+        return this.writeAttachmentBundle(command.input, commit)
+      case 'attachment.ref.add':
+        return this.addAttachmentReference(command.input, commit)
+      case 'attachment.ref.set-visibility':
+        return this.setAttachmentReferenceVisibility(command.input, commit)
+      case 'attachment.ref.detach':
+        return this.detachAttachmentReference(command.input, commit)
+      case 'attachment.ref.relink':
+        return this.relinkAttachmentReferences(command.input, commit)
+      case 'attachment.bytes.delete':
+        return this.deleteAttachmentBytes(command.input, commit)
+      case 'attachment.delete-if-unreferenced':
+        return this.deleteAttachmentIfUnreferenced(command.attachmentId, commit)
+      case 'attachment.delete-many':
+        return this.deleteManyAttachments(command.input, commit)
+      case 'attachment.reap':
+        return this.reapAttachments(command.now, command.maxAgeMs, command.limit, commit)
+      case 'draft.put':
+        return this.putDraftRow(command.input, commit)
+      case 'generated-output.localization-claim':
+        return this.claimGeneratedOutputLocalization(command.input, commit)
+      case 'generated-output.localization-retry':
+        return this.retryGeneratedOutputLocalization(command.input, commit)
+      case 'generated-output.localization-fail':
+        return this.failGeneratedOutputLocalization(command.input, commit)
+      case 'generated-output.localization-complete':
+        return this.completeGeneratedOutputLocalization(command.input, commit)
+      case 'generated-output.video-expand':
+        return this.expandGeneratedOutputVideo(command.input, commit)
+      case 'discovery.models.put':
+      case 'discovery.endpoints.put':
+      case 'discovery.privacy.put':
+      case 'discovery.models.delete':
+        return this.mutateDiscoveryCache(command, replacementEpoch, commit)
+      case 'configuration.execute': {
+        const { executeConfigurationCommandInBrowser } = await import(
+          './browser-configuration-domain'
+        )
+        return executeConfigurationCommandInBrowser(await this.openDb(), command.input, commit)
+      }
+      case 'folder.create':
+        return this.createFolder(command.input, commit)
+      case 'folder.update':
+        return this.updateFolder(command.folderId, command.patch, commit)
+      case 'folder.delete':
+        return this.deleteFolder(
+          command.folderId,
+          command.chatDisposition ?? 'move-top-level',
+          command.now ?? Date.now(),
+          commit,
+        )
+      case 'folder.ensure-and-move-chats':
+        return this.ensureFolderAndMoveChats(command.input, commit)
+      default:
+        return assertNever(command)
+    }
+  }
+
+  private async getExactMessagePresentations(
+    messageIds: readonly MessageId[],
+    signal?: AbortSignal,
+  ): Promise<Array<MessagePresentation | undefined>> {
+    if (signal?.aborted) throw signal.reason
+    const db = await this.openDb()
+    const rows = await readExactMessageRowsByIdPages(db, messageIds, signal ? { signal } : {})
+    return rows.map((row) => {
+      if (!row) return undefined
+      const clonedHeader = cloneMessageHeader(row.header)
+      return {
+        header: clonedHeader,
+        message: hydrateMessageWithOwnedBody(clonedHeader, row.body),
+        bodyVersion: clonedHeader.bodyVersion,
+      }
+    })
+  }
+
+  private async prepareAttempt(
+    input: PrepareAttemptInput,
+    replacementEpoch: number,
+    commit: BrowserCommandCommit,
+  ): Promise<AttemptPrepareResult> {
+    const { prepareBrowserAttempt } = await import('./browser-generation-command-runtime')
+    return prepareBrowserAttempt(
+      this,
+      browserGenerationCommandSupport,
+      input,
+      replacementEpoch,
+      commit,
+    )
+  }
+
+  private async dispatchAttempt(
+    input: AttemptDispatchInput,
+    replacementEpoch: number,
+    commit: BrowserCommandCommit,
+  ): Promise<AttemptDispatchResult> {
+    const { dispatchBrowserAttempt } = await import('./browser-generation-command-runtime')
+    return dispatchBrowserAttempt(this, input, replacementEpoch, commit)
+  }
+
+  private async sealAttemptTerminal(
+    input: AttemptSealTerminalInput,
+    replacementEpoch: number,
+    commit: BrowserCommandCommit,
+  ): Promise<TerminalDecidedStreamLeaseRow> {
+    if (!Number.isSafeInteger(input.finishedAt) || input.finishedAt < 0) {
+      throw new Error(`AttemptTerminalTimestampInvalid:${input.streamId}`)
+    }
+    return commit.withLocks([`stream-journal:${input.streamId}`], (locked) =>
+      locked.runTransaction(STREAM_LEASE_TRANSACTION, async (tx) => {
+        const leases = tx.table<StreamLeaseRow, string>('streamLeases')
+        const lease = await leases.get(input.streamId)
+        assertOwnedStreamFence(lease, input.fence, replacementEpoch, input.streamId)
+        const terminal = {
+          version: 1 as const,
+          finishedAt: Math.max(input.finishedAt, lease.stopControl?.requestedAt ?? 0),
+          journalMaxSeq: lease.journalMaxSeq ?? -1,
+          journalCompleteness: input.journalCompleteness,
+          decision: structuredClone(
+            lease.stopControl
+              ? { outcome: 'abort' as const, abortReason: lease.stopControl.reason }
+              : input.decision,
+          ),
+        }
+        if (lease.phase === 'terminal-decided') {
+          if (stableStringify(lease.terminal) !== stableStringify(terminal)) {
+            throw new Error(`AttemptTerminalDecisionConflict:${input.streamId}`)
+          }
+          return structuredClone(lease)
+        }
+        if (lease.phase !== 'reserved' && lease.phase !== 'active') {
+          throw new Error(`AttemptTerminalSealPhaseInvalid:${input.streamId}:${lease.phase}`)
+        }
+        const decided = requireStreamLeaseRow({
+          ...lease,
+          phase: 'terminal-decided',
+          dispatch: lease.phase === 'active' ? lease.dispatch : null,
+          terminal,
+          revision: nextStreamLeaseRevision(lease),
+        })
+        if (decided.phase !== 'terminal-decided' || !streamLeaseHasWriteFence(decided)) {
+          throw new Error(`AttemptTerminalSealInvalid:${input.streamId}`)
+        }
+        await putStreamLeaseByteOwner(tx, decided, lease)
+        return structuredClone(decided)
+      }),
+    )
+  }
+
+  private async requestAttemptStop(
+    input: AttemptRequestStopInput,
+    replacementEpoch: number,
+    commit: BrowserCommandCommit,
+  ): Promise<AttemptRequestStopResult> {
+    if (!Number.isSafeInteger(input.requestedAt) || input.requestedAt < 0) {
+      throw new Error(`AttemptStopRequestInvalid:${input.streamId}`)
+    }
+    if (input.replacementEpoch !== replacementEpoch) return { outcome: 'stale' }
+    return commit.withLocks([`stream-journal:${input.streamId}`], (locked) =>
+      locked.runTransaction(STREAM_LEASE_TRANSACTION, async (tx) => {
+        const leases = tx.table<StreamLeaseRow, string>('streamLeases')
+        const lease = await leases.get(input.streamId)
+        if (!lease) return { outcome: 'missing' } as const
+        if (
+          lease.chatId !== input.chatId ||
+          lease.messageId !== input.messageId ||
+          lease.attemptKind !== input.attemptKind ||
+          lease.replacementEpoch !== input.replacementEpoch ||
+          lease.admissionSequence !== input.admissionSequence
+        ) {
+          return { outcome: 'stale', lease: structuredClone(lease) } as const
+        }
+        if (lease.phase === 'canonical' || lease.phase === 'metadata-committed') {
+          return { outcome: 'terminal', lease: structuredClone(lease) } as const
+        }
+        if (lease.stopControl) {
+          return { outcome: 'already-requested', lease: structuredClone(lease) } as const
+        }
+        if (lease.controlRevision >= Number.MAX_SAFE_INTEGER) {
+          throw new Error(`StreamLeaseControlRevisionExhausted:${input.streamId}`)
+        }
+        const stopped = requireStreamLeaseRow({
+          ...lease,
+          revision: nextStreamLeaseRevision(lease),
+          controlRevision: lease.controlRevision + 1,
+          stopControl: {
+            requestId: input.requestId,
+            requestedBy: input.requestedBy,
+            requestedAt: input.requestedAt,
+            reason: input.reason,
+          },
+        })
+        await putStreamLeaseByteOwner(tx, stopped, lease)
+        return { outcome: 'accepted', lease: structuredClone(stopped) } as const
+      }),
+    )
+  }
+
+  private async finalizeAttempt(
+    input: AttemptTerminalProjection,
+    replacementEpoch: number,
+    commit: BrowserCommandCommit,
+  ): Promise<AttemptFinalizeResult> {
+    const { finalizeBrowserAttempt } = await import('./browser-generation-command-runtime')
+    return finalizeBrowserAttempt(
+      this,
+      browserGenerationCommandSupport,
+      input,
+      replacementEpoch,
+      commit,
+    )
+  }
+
+  private async commitGenerationMetadata(
+    input: GenerationPostCommitMetadataInput,
+    replacementEpoch: number,
+    commit: BrowserCommandCommit,
+  ): Promise<GenerationPostCommitMetadataResult> {
+    const { commitBrowserGenerationMetadata } = await import('./browser-generation-command-runtime')
+    return commitBrowserGenerationMetadata(
+      this,
+      browserGenerationCommandSupport,
+      input,
+      replacementEpoch,
+      commit,
+    )
+  }
+
+  private async noteStreamSelectedKey(
+    input: StreamNoteSelectedKeyInput,
+    replacementEpoch: number,
+    commit: BrowserCommandCommit,
+  ): Promise<StreamLeaseRow> {
+    return commit.withLocks([`stream-journal:${input.streamId}`], (locked) =>
+      locked.runTransaction(STREAM_LEASE_TRANSACTION, async (tx) => {
+        const leases = tx.table<StreamLeaseRow, string>('streamLeases')
+        const lease = await leases.get(input.streamId)
+        assertOwnedStreamFence(lease, input.fence, replacementEpoch, input.streamId)
+        if (!streamLeaseHasCommittedTarget(lease)) {
+          throw new Error(`StreamSelectedKeyBeforeDispatch:${input.streamId}`)
+        }
+        const evidence = requiredStreamPostCommitEvidence(lease)
+        const recordedKeyId = evidence.selectedKeyId ?? evidence.final?.selectedKeyId
+        if (recordedKeyId !== undefined && recordedKeyId !== input.selectedKeyId) {
+          throw new Error(`StreamSelectedKeyMismatch:${input.streamId}`)
+        }
+        if (
+          lease.phase === 'terminal-decided' ||
+          lease.phase === 'canonical' ||
+          lease.phase === 'metadata-committed'
+        ) {
+          if (recordedKeyId === input.selectedKeyId) return structuredClone(lease)
+          throw new Error(`StreamSelectedKeyAfterTerminalDecision:${input.streamId}`)
+        }
+        if (
+          evidence.selectedKeyId === input.selectedKeyId &&
+          (evidence.final === undefined || evidence.final.selectedKeyId === input.selectedKeyId)
+        ) {
+          return structuredClone(lease)
+        }
+        const noted = requireStreamLeaseRow({
+          ...lease,
+          revision: nextStreamLeaseRevision(lease),
+          postCommit: {
+            ...evidence,
+            selectedKeyId: input.selectedKeyId,
+            ...(evidence.final
+              ? {
+                  final: {
+                    ...evidence.final,
+                    selectedKeyId: input.selectedKeyId,
+                  },
+                }
+              : {}),
+          },
+        })
+        await putStreamLeaseByteOwner(tx, noted, lease)
+        return structuredClone(noted)
+      }),
+    )
+  }
+
+  async forkChatFromMessage(
+    input: ForkChatFromMessageInput,
+    commit: BrowserCommandCommit,
+  ): Promise<ForkChatFromMessageResult> {
+    const db = await this.openDb()
+    const [
+      { buildChildSlotProjection },
+      { applyAttachmentReferenceOwnerTransitions },
+      { proveConversationSelectionInTransaction },
+    ] = await Promise.all([
+      import('../core/child-list-state'),
+      import('./attachment-reference-edges'),
+      import('./conversation-destination-seal'),
+    ])
+    const destinationChatId = input.destinationChatId ?? newId()
     const now = input.now ?? Date.now()
 
     for (;;) {
       const plan = await planForkWrite(db, input, destinationChatId)
       try {
-        const result = await withMutationLocks(plan.scopes, async (grant) =>
-          grant.runTransaction(
-            db,
-            [
-              db.attachments,
-              db.attachmentRefEdges,
-              db.chatBranchCache,
-              db.chatSidebarRows,
-              db.chats,
-              db.childLists,
-              db.messages,
-              db.messageBodies,
-              db.settings,
-            ],
-            async (tx: Transaction) => {
+        const result = await commit.withLocks(
+          ['chat-catalog', ...plan.sourceLinkResourceNames, ...plan.scopes.map(scopeResourceName)],
+          async (locked) =>
+            locked.runTransaction(FORK_CHAT_TRANSACTION, async (tx) => {
               const chatTable = tx.table<Chat, ChatId>('chats')
               const source = await chatTable.get(input.chatId)
               if (!source) throw new Error(`fork: source chat ${input.chatId} not found`)
+              if (
+                !sameOrderedValues(
+                  plan.sourceLinkResourceNames,
+                  normalizeNamedLocks(chatConfigurationTargetResourceNames(source)),
+                )
+              ) {
+                throw new ForkWritePlanChangedError()
+              }
               if (await chatTable.get(destinationChatId)) {
                 throw new Error(`fork: destination chat ${destinationChatId} already exists`)
               }
 
-              const headers = await forkAncestorHeaders(
+              const headers = await readForkLivePathHeaders(
                 tx.table<MessageHeaderRow, MessageId>('messages'),
                 input.chatId,
                 input.messageId,
@@ -1805,29 +4407,23 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
 
               const messages = cloneForkMessages(ancestors, plan, now)
               const lastUpdatedLeafId = findLastUpdatedLeafId(messages)
-              const branchCache =
-                lastUpdatedLeafId === null
-                  ? undefined
-                  : buildBranchCacheRow({
-                      chatId: destinationChatId,
-                      branchLeafId: lastUpdatedLeafId,
-                      messages,
-                      generatedAt: now,
-                    })
+              const selectedTipId = messages.at(-1)?.id ?? null
+              const updatedAt = await nextChatUpdatedAtInTransaction(tx, now)
               const chat: Chat = {
                 id: destinationChatId,
                 title: input.title,
                 titleStatus: 'manual',
                 createdAt: now,
-                updatedAt: now,
+                updatedAt,
                 lastViewedAt: now,
-                wordCount: branchCache?.wordCount ?? 0,
+                wordCount: countMessagesWords(messages),
                 totalCostUsd: computeTotalCostUsd(messages),
                 metaVersion: 0,
                 summaryVersion: 1,
+                structuralVersion: messages.length === 0 ? 0 : 1,
                 settings: structuredClone(source.settings),
                 lastUpdatedLeafId,
-                lastBranchUpdatedAt: now,
+                lastBranchUpdatedAt: updatedAt,
                 archived: false,
                 pinned: false,
                 folderId: null,
@@ -1836,60 +4432,60 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
                 ...(source.presetId ? { presetId: source.presetId } : {}),
               }
 
-              await chatTable.put(chat)
-              await putChatSidebarProjection(tx, chat, true)
-              const headerTable = tx.table<MessageHeaderRow, MessageId>('messages')
-              const bodyTable = tx.table<MessageBodyRow, MessageId>('messageBodies')
-              const childListTable = tx.table<ChildListState, string>('childLists')
+              await applyChatRowWriteTransitions(tx, [{ kind: 'add-linked', next: chat }])
+              let selectedTipPresentation: MessagePresentation | undefined
               for (const message of messages) {
-                const { header, body } = splitMessageForStorage(message, { updatedAt: now })
-                await headerTable.put(header)
-                await bodyTable.put(body)
-                await childListTable.put({
-                  id: childListKey(destinationChatId, message.parentId),
-                  chatId: destinationChatId,
-                  parentId: message.parentId,
-                  version: 1,
+                const storage = splitMessageForStorage(message, {
                   updatedAt: now,
                 })
+                const header = storage.header
+                const { body, preview } = storage
+                await addPhysicalStorageRow(tx, 'messages', header)
+                await insertMessageBody(tx, body)
+                await addPhysicalStorageRow(tx, 'messagePreviews', preview)
+                if (message.id === selectedTipId) {
+                  selectedTipPresentation = {
+                    header,
+                    message,
+                    bodyVersion: header.bodyVersion,
+                  }
+                }
               }
-              if (branchCache) {
-                await tx.table<ChatBranchCache, ChatId>('chatBranchCache').put(branchCache)
-              }
-              await replaceAttachmentReferenceOwners(
+              const childProjection = buildChildSlotProjection(destinationChatId, messages, {
+                updatedAt: now,
+                defaultVersion: 1,
+              })
+              await addPhysicalStorageRows(tx, 'childLists', childProjection.states)
+              await addPhysicalStorageRows(tx, 'childSlotMembers', childProjection.members)
+              const destination = await proveConversationSelectionInTransaction(tx, {
+                chat,
+                target: fixedConversationSelectionTarget(
+                  selectedTipId === null
+                    ? { kind: 'default' }
+                    : { kind: 'tip', messageId: selectedTipId },
+                  selectedTipId,
+                ),
+                tipId: selectedTipId,
+                presentations: selectedTipPresentation ? [selectedTipPresentation] : [],
+              })
+              await applyAttachmentReferenceOwnerTransitions(
                 tx,
                 messages.map((message) => ({
                   ownerKind: 'message' as const,
                   ownerId: message.id,
                   chatId: message.chatId,
-                  refs: message.attachmentRefs,
+                  previousRefs: undefined,
+                  nextRefs: message.attachmentRefs,
                 })),
+                now,
               )
-              await bumpWorkspaceMeta(tx, now)
-              return { chatId: destinationChatId, messageCount: messages.length }
-            },
-          ),
+              return {
+                chatId: destinationChatId,
+                messageCount: messages.length,
+                destination,
+              }
+            }),
         )
-
-        postEvent({
-          kind: 'chat-mutated',
-          chatId: destinationChatId,
-          metaVersion: 0,
-          summaryVersion: 1,
-          affected: [
-            { kind: 'chat-meta', chatId: destinationChatId },
-            ...plan.destinationMessageIds.map((messageId) => ({
-              kind: 'message' as const,
-              chatId: destinationChatId,
-              messageId,
-            })),
-            ...plan.destinationParentIds.map((parentId) => ({
-              kind: 'children' as const,
-              chatId: destinationChatId,
-              parentId,
-            })),
-          ],
-        })
         return result
       } catch (error) {
         if (error instanceof ForkWritePlanChangedError) continue
@@ -1898,1038 +4494,1446 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     }
   }
 
-  async createChat(chat: Chat): Promise<Chat> {
-    const result = await withMutationLocks(
-      [{ kind: 'chat-meta', chatId: chat.id }],
-      async (grant) => createChatInBrowser(await openDb(), grant, chat, bumpWorkspaceMeta),
+  private async nextForkTitle(baseTitle: string): Promise<string> {
+    const base = baseTitle.trim() || 'Untitled chat'
+    const rows = await (await this.openDb()).chatSidebarRows
+      .where('title')
+      .startsWith(`${base} Branch `)
+      .toArray()
+    return computeBranchTitle(
+      base,
+      rows.map((row) => row.title),
     )
-    postEvent({
-      kind: 'chat-mutated',
-      chatId: result.id,
-      metaVersion: result.metaVersion,
-      summaryVersion: result.summaryVersion,
-      affected: [{ kind: 'chat-meta', chatId: result.id }],
+  }
+
+  private async materializeTemporaryChat(
+    input: Extract<WorkspaceCommand, { kind: 'chat.materialize-temporary' }>['input'],
+    replacementEpoch: number,
+    commit: BrowserCommandCommit,
+  ) {
+    const runtime = await import('./browser-catalog-command-runtime')
+    return runtime.materializeTemporaryChat(this, input, replacementEpoch, commit)
+  }
+
+  async discardEmptyDraftChats(
+    input: {
+      chatIds: readonly ChatId[]
+      exceptChatId?: ChatId | null
+      now?: number
+      staleBefore?: number
+    },
+    commit: BrowserCommandCommit,
+  ): Promise<DeleteArchivedChatMetadataResult> {
+    const runtime = await import('./browser-catalog-command-runtime')
+    return runtime.discardEmptyDraftChats(await this.openDb(), input, commit)
+  }
+
+  private async pruneEmptyDraftChats(
+    input: {
+      maxAgeMs: number
+      limit: number
+      now: number
+    },
+    commit: BrowserCommandCommit,
+  ) {
+    const limit = Math.min(boundedMaintenanceLimit(input.limit), CHAT_CLOSURE_BATCH_LIMIT)
+    const db = await this.openDb()
+    for (;;) {
+      const state = await readStorageRetentionState(db, 'empty-draft-prune')
+      const cycle = storageRetentionCycle(state, input.now, input.maxAgeMs)
+      const page = await readTemporaryChatIdPage(db, {
+        ...(cycle.cursor === undefined ? {} : { after: cycle.cursor }),
+        cutoff: cycle.cutoff,
+        limit,
+      })
+      const plan = await planEmptyDraftChatClosure(db, page.chatIds, cycle.cutoff)
+      try {
+        return await commit.withLocks(
+          emptyDraftChatClosureLockNames(plan, ['storage-retention:empty-draft-prune']),
+          (locked) =>
+            locked.runTransaction(
+              physicalTransactionPlan(
+                CHAT_CLOSURE_TRANSACTION_CAPABILITY,
+                physicalStorageTables('storageRetentionState'),
+              ),
+              async (tx) => {
+                const currentState = await readStorageRetentionState(tx, 'empty-draft-prune')
+                assertStorageRetentionCycleCurrent(currentState, cycle)
+                const currentPage = await readTemporaryChatIdPage(tx, {
+                  ...(cycle.cursor === undefined ? {} : { after: cycle.cursor }),
+                  cutoff: cycle.cutoff,
+                  limit,
+                })
+                if (!sameTemporaryChatPage(page, currentPage)) {
+                  throw new ChatClosurePlanChangedError()
+                }
+                const closure = await deletePlannedEmptyDraftChats(
+                  tx,
+                  plan,
+                  cycle.cutoff,
+                  cycle.cycleNow,
+                )
+                const next = advanceStorageRetentionState(
+                  cycle,
+                  page.done
+                    ? {
+                        done: true,
+                        ...(page.earliestDeferredAt === undefined
+                          ? {}
+                          : { earliestDeferredAt: page.earliestDeferredAt }),
+                      }
+                    : {
+                        done: false,
+                        ...(page.nextCursor === undefined ? {} : { cursor: page.nextCursor }),
+                      },
+                )
+                await putPhysicalStorageRow<
+                  StorageRetentionStateRowFor<'empty-draft-prune'>,
+                  StorageRetentionTask
+                >(tx, 'storageRetentionState', next, currentState)
+                recordBrowserCommandStorageRetentionMutation(tx, 'empty-draft-prune')
+                return {
+                  deletedChatIds: closure.deletedChatIds,
+                  affectedAttachmentIds: closure.affectedAttachmentIds,
+                  scannedChatIds: page.chatIds.length,
+                  ...(page.earliestDeferredAt === undefined
+                    ? {}
+                    : { earliestDeferredAt: page.earliestDeferredAt }),
+                  done: page.done,
+                }
+              },
+            ),
+        )
+      } catch (error) {
+        if (error instanceof ChatClosurePlanChangedError) continue
+        throw error
+      }
+    }
+  }
+
+  private async getConnectionDiscoverySnapshot(profileId: ProfileId) {
+    const db = await this.openDb()
+    return db.transaction('r', [db.profiles, db.keys], async (tx: Transaction) => {
+      const profile = await tx.table<ConnectionProfile, ProfileId>('profiles').get(profileId)
+      if (!profile) return undefined
+      const key = profile.apiKeyRef
+        ? await tx.table<KeyRecord, KeyId>('keys').get(profile.apiKeyRef)
+        : undefined
+      return {
+        profile: Object.freeze({ id: profile.id, ...connectionHttpProfile(profile) }),
+        revision: configurationRequestRevisionFor(profile, key),
+        ...(key ? { primaryKey: keyDispatchProof(key) } : {}),
+      }
     })
-    return result
   }
 
-  async discardEmptyDraftChats(input: {
-    chatIds?: readonly ChatId[]
-    exceptChatId?: ChatId | null
-    now?: number
-  }): Promise<ChatId[]> {
-    const deleted = await withNamedLock('db:global', async (grant) =>
-      discardEmptyDraftChatsInBrowser(
-        await openDb(),
-        grant,
-        input,
-        input.now ?? Date.now(),
-        bumpWorkspaceMeta,
-      ),
+  private async getConfigurationShell(signal?: AbortSignal): Promise<ConfigurationShellProjection> {
+    signal?.throwIfAborted()
+    const db = await this.openDb()
+    return db.transaction(
+      'r',
+      [db.configurationCatalogAggregates, db.settings],
+      async (tx: Transaction) => {
+        const keys = [
+          ...GLOBAL_PREFERENCE_KEYS,
+          IMAGE_ALLOWLIST_KEY,
+          RENDERING_PREFERENCES_KEY,
+          SAMPLE_PROMPTS_DISMISSED_KEY,
+          SIDEBAR_SORT_SETTING_KEY,
+          SIDEBAR_COLLAPSED_FOLDERS_SETTING_KEY,
+        ]
+        const [rows, aggregate] = await Promise.all([
+          tx.table<SettingsRow, string>('settings').bulkGet(keys),
+          tx
+            .table<{ id: string; totalProfileCount: number }, string>(
+              'configurationCatalogAggregates',
+            )
+            .get('global'),
+        ])
+        signal?.throwIfAborted()
+        if (!aggregate) throw new Error('ConfigurationCatalogAggregateMissing')
+        return {
+          preferences: configurationPreferencesFromValues(
+            new Map(keys.map((key, index) => [key, rows[index]?.value] as const)),
+          ),
+          totalProfileCount: aggregate.totalProfileCount,
+        }
+      },
     )
-    for (const chatId of deleted) postEvent({ kind: 'chat-deleted', chatId })
-    return deleted
   }
 
-  async deletePresetAndClearBreadcrumbs(
-    presetId: PresetId,
-    now: number,
-  ): Promise<DeletePresetCascadeResult> {
-    const result = await withNamedLock(`preset:${presetId}`, async (grant) =>
-      deletePresetAndClearBreadcrumbsInBrowser(
-        await openDb(),
-        grant,
-        presetId,
-        now,
-        bumpWorkspaceMeta,
-      ),
+  private async getConfigurationGlobalTokenCalibration(
+    signal?: AbortSignal,
+  ): Promise<GlobalTokenCalibration> {
+    signal?.throwIfAborted()
+    const row = await (await this.openDb()).settings.get(GLOBAL_TOKEN_CALIBRATION_KEY)
+    signal?.throwIfAborted()
+    return normalizeGlobalTokenCalibration(row?.value)
+  }
+
+  private async getConfigurationTextTemplateCatalog(
+    signal?: AbortSignal,
+  ): Promise<readonly SavedTextTemplateCatalogRow[]> {
+    signal?.throwIfAborted()
+    return readTextTemplateCatalog((await this.openDb()).textTemplates, signal)
+  }
+
+  private async getConfigurationActiveSelection(
+    target: ConfigurationSelectionQueryTarget,
+    signal?: AbortSignal,
+  ): Promise<ConfigurationActiveSelectionProjection> {
+    signal?.throwIfAborted()
+    const db = await this.openDb()
+    return db.transaction(
+      'r',
+      [
+        db.configurationPresetCatalogRows,
+        db.configurationProfileCatalogRows,
+        db.configurationPromptPresetCatalogRows,
+        db.keys,
+        db.presets,
+        db.profiles,
+        db.textTemplates,
+      ],
+      async (tx: Transaction) => {
+        const profiles = tx.table<ConnectionProfile, ProfileId>('profiles')
+        const presets = tx.table<ChatPreset, PresetId>('presets')
+        let profile = target.profileId ? ((await profiles.get(target.profileId)) ?? null) : null
+        let preset = target.presetId ? ((await presets.get(target.presetId)) ?? null) : null
+
+        if (target.kind === 'chat') {
+          if (preset && profile && preset.connectionProfileId !== profile.id) preset = null
+        } else {
+          if (profile?.archived) profile = null
+          if (preset?.archived) preset = null
+          if (target.fallback === 'none') {
+            if (preset && (!profile || preset.connectionProfileId !== profile.id)) preset = null
+          } else if (target.fallback === 'missing-profile') {
+            if (profile) {
+              if (preset && preset.connectionProfileId !== profile.id) preset = null
+            } else {
+              preset = null
+              const profileId = await readDefaultConfigurationProfileId(tx)
+              profile = profileId ? ((await profiles.get(profileId)) ?? null) : null
+            }
+          } else {
+            if (preset && profile && preset.connectionProfileId !== profile.id) preset = null
+            let selectedPresetId = preset?.id ?? null
+            if (!selectedPresetId) {
+              selectedPresetId = await readDefaultConfigurationPresetId(tx, profile?.id ?? null)
+            }
+            preset = selectedPresetId ? ((await presets.get(selectedPresetId)) ?? null) : null
+            if (preset) {
+              profile = (await profiles.get(preset.connectionProfileId)) ?? null
+            } else if (!profile) {
+              const profileId = await readDefaultConfigurationProfileId(tx)
+              profile = profileId ? ((await profiles.get(profileId)) ?? null) : null
+            }
+          }
+        }
+
+        const dispatchKeyIds = profile ? connectionDispatchKeyRefs(profile) : []
+        const dispatchKeyRows =
+          dispatchKeyIds.length > 0
+            ? await tx.table<KeyRecord, KeyId>('keys').bulkGet(dispatchKeyIds)
+            : []
+        const key = profile?.apiKeyRef
+          ? dispatchKeyRows[dispatchKeyIds.indexOf(profile.apiKeyRef)]
+          : undefined
+        const promptPresetReferences =
+          target.promptPresets.length > 0
+            ? target.promptPresets
+            : target.kind === 'new-chat' && target.fallback === 'full' && preset
+              ? chatSettingsPromptPresetReferences(preset.settings)
+              : []
+        const promptPresetRows =
+          promptPresetReferences.length === 0
+            ? []
+            : await tx
+                .table<ConfigurationPromptPresetCatalogProjectionRow, PromptPresetId>(
+                  'configurationPromptPresetCatalogRows',
+                )
+                .bulkGet(promptPresetReferences.map((reference) => reference.id))
+        const promptPresets = promptPresetRows.flatMap((row, index) => {
+          const reference = promptPresetReferences[index]
+          return row && reference && row.kind === reference.kind ? [row] : []
+        })
+        const textTemplateId =
+          target.textTemplateId ??
+          (target.kind === 'new-chat' && target.fallback === 'full'
+            ? (preset?.settings.textTemplate ?? null)
+            : null)
+        const textTemplateRow =
+          textTemplateId && !isStaticTextTemplateId(textTemplateId)
+            ? await tx.table<SavedTextTemplate, TextTemplateId>('textTemplates').get(textTemplateId)
+            : undefined
+        signal?.throwIfAborted()
+        const selectedProfile = profile ? structuredClone(profile) : null
+        const selectedPreset = preset ? structuredClone(preset) : null
+        if (selectedProfile) {
+          delete selectedProfile.lastUsedAt
+          delete selectedProfile.requestRevision
+        }
+        if (selectedPreset) {
+          delete selectedPreset.lastUsedAt
+          delete selectedPreset.archived
+        }
+        return {
+          profile: selectedProfile,
+          preset: selectedPreset,
+          requestRevision: profile ? configurationRequestRevisionFor(profile, key) : null,
+          dispatchKeyRevisions: keyDispatchRevisions(dispatchKeyIds, dispatchKeyRows),
+          promptPresets: promptPresets.map(({ lastUsedAt: _lastUsedAt, ...row }) => row),
+          textTemplate:
+            textTemplateId && !isStaticTextTemplateId(textTemplateId)
+              ? {
+                  templateId: textTemplateId,
+                  config: textTemplateRow
+                    ? normalizeTextTemplateConfig(textTemplateRow.config)
+                    : null,
+                }
+              : null,
+        }
+      },
     )
-    if (result.kind === 'missing') return result
-    for (const chat of result.chats) {
-      postEvent({
-        kind: 'chat-mutated',
-        chatId: chat.chatId,
-        metaVersion: chat.metaVersion,
-        summaryVersion: chat.summaryVersion,
-        affected: [{ kind: 'chat-meta', chatId: chat.chatId }],
-      })
-    }
-    postEvent({ kind: 'preset-deleted', presetId })
-    return result
   }
 
-  async updateProfileAndInvalidateCaches(
-    input: UpdateProfileAtomicInput,
-  ): Promise<UpdateProfileAtomicResult> {
-    const result = await withNamedLock(`profile:${input.profileId}`, async (grant) =>
-      updateProfileAndInvalidateCachesInBrowser(await openDb(), grant, input, bumpWorkspaceMeta),
+  private async getConfigurationActiveModel(
+    profileId: ProfileId,
+    modelId: string | null,
+    requestedRevision: ConfigurationActiveModelProjection['revision'],
+    includeModels: boolean,
+    knownPayloads: ConfigurationActiveModelKnownPayloads | undefined,
+    signal?: AbortSignal,
+  ): Promise<ConfigurationActiveModelRead> {
+    signal?.throwIfAborted()
+    const db = await this.openDb()
+    return db.transaction(
+      'r',
+      [
+        db.discoveryPayloadMetadata,
+        db.discoveryPayloads,
+        db.endpoints,
+        db.keys,
+        db.models,
+        db.privacyPolicies,
+        db.profiles,
+      ],
+      async (tx: Transaction) => {
+        const profile = await tx.table<ConnectionProfile, ProfileId>('profiles').get(profileId)
+        if (!profile) return { kind: 'missing-profile' }
+        const key = profile.apiKeyRef
+          ? await tx.table<KeyRecord, KeyId>('keys').get(profile.apiKeyRef)
+          : undefined
+        const revision = configurationRequestRevisionFor(profile, key)
+        if (
+          configurationRequestRevisionKey(revision) !==
+          configurationRequestRevisionKey(requestedRevision)
+        ) {
+          return { kind: 'stale-selection' }
+        }
+        const revisionKey = connectionDiscoveryRevisionKey(revision)
+        const modelsQueryKey = modelsCacheKey(modelCatalogQueryForConnectionKind(profile.kind))
+        const [models, endpoints, privacy] = await Promise.all([
+          includeModels
+            ? readConfigurationModelsPayload(
+                tx,
+                [profileId, modelsQueryKey],
+                revisionKey,
+                knownPayloads?.models,
+              )
+            : Promise.resolve({ kind: 'not-requested' } as const),
+          modelId
+            ? readConfigurationEndpointsPayload(
+                tx,
+                [profileId, modelId],
+                revisionKey,
+                knownPayloads?.endpoints,
+              )
+            : Promise.resolve({ kind: 'not-requested' } as const),
+          modelId
+            ? readConfigurationPrivacyPayload(
+                tx,
+                [profileId, modelId],
+                revisionKey,
+                knownPayloads?.privacy,
+              )
+            : Promise.resolve({ kind: 'not-requested' } as const),
+        ])
+        signal?.throwIfAborted()
+        return {
+          kind: 'ready',
+          projection: {
+            revision,
+            modelId,
+            models,
+            endpoints,
+            privacy,
+          },
+        }
+      },
     )
-    if (result.kind === 'missing') return result
-    if (result.cachesInvalidated) {
-      postEvent({ kind: 'models-refreshed', profileId: input.profileId })
-    }
-    postEvent({ kind: 'profile-mutated', profileId: input.profileId })
-    return result
   }
 
-  async deleteProfileAndReassign(
-    input: DeleteProfileAtomicInput,
-  ): Promise<DeleteProfileAtomicResult> {
-    const lockIds = [
-      ...new Set(
-        [input.profileId, input.reassignTo].filter((id): id is string => id !== undefined),
-      ),
-    ].sort()
-    const result = await withNamedLocks(
-      lockIds.map((profileId) => `profile:${profileId}`),
-      async (grant) =>
-        deleteProfileAndReassignInBrowser(await openDb(), grant, input, bumpWorkspaceMeta),
+  private async readDiscoveryCacheRow<T extends DiscoveryCacheStorageTable>(
+    tableName: T,
+    key: [string, string],
+  ) {
+    const db = await this.openDb()
+    return db.transaction(
+      'r',
+      [db.table(tableName), db.discoveryPayloadMetadata, db.discoveryPayloads],
+      (tx) => readDiscoveryCacheRow(tx, tableName, key),
     )
-    if (result.kind !== 'deleted') return result
-    for (const presetId of result.presetIds) {
-      postEvent({ kind: 'preset-mutated', presetId })
-    }
-    for (const chat of result.chats) {
-      postEvent({
-        kind: 'chat-mutated',
-        chatId: chat.chatId,
-        metaVersion: chat.metaVersion,
-        summaryVersion: chat.summaryVersion,
-        affected: [{ kind: 'chat-meta', chatId: chat.chatId }],
-      })
-    }
-    for (const keyId of result.deletedKeyIds) {
-      postEvent({ kind: 'key-rotated', keyId })
-    }
-    postEvent({ kind: 'profile-deleted', profileId: input.profileId })
-    return result
   }
 
-  async updatePromptPresetAndPropagate(
-    input: UpdatePromptPresetAtomicInput,
-  ): Promise<UpdatePromptPresetAtomicResult> {
-    const result = await withNamedLock(`prompt-preset:${input.presetId}`, async (grant) =>
-      updatePromptPresetAndPropagateInBrowser(await openDb(), grant, input, bumpWorkspaceMeta),
+  private async getConfigurationProfileSwitchPlan(chatId: ChatId, profileId: ProfileId) {
+    const db = await this.openDb()
+    return db.transaction(
+      'r',
+      [
+        db.chats,
+        db.discoveryPayloadMetadata,
+        db.discoveryPayloads,
+        db.profiles,
+        db.keys,
+        db.models,
+      ],
+      async (tx: Transaction) => {
+        const [chat, profile] = await Promise.all([
+          tx.table<Chat, ChatId>('chats').get(chatId),
+          tx.table<ConnectionProfile, ProfileId>('profiles').get(profileId),
+        ])
+        if (!chat || !profile) return undefined
+        const key = profile.apiKeyRef
+          ? await tx.table<KeyRecord, KeyId>('keys').get(profile.apiKeyRef)
+          : undefined
+        const target = configurationRequestRevisionFor(profile, key)
+        const queryKey = modelsCacheKey(modelCatalogQueryForConnectionKind(profile.kind))
+        const cachedModels = await readDiscoveryCacheRow(tx, 'models', [profile.id, queryKey])
+        return {
+          chat: {
+            settings: structuredClone(chat.settings),
+            ...(chat.configurationVersion === undefined
+              ? {}
+              : { configurationVersion: chat.configurationVersion }),
+          },
+          profile: { kind: profile.kind, baseUrl: profile.baseUrl },
+          target,
+          ...(cachedModels?.profileRevision === connectionDiscoveryRevisionKey(target)
+            ? { cachedModels: structuredClone(cachedModels) }
+            : {}),
+        }
+      },
     )
-    if (result.kind === 'missing') return result
-    postEvent({ kind: 'prompt-preset-mutated', promptPresetId: input.presetId })
-    for (const chat of result.chats) {
-      postEvent({
-        kind: 'chat-mutated',
-        chatId: chat.chatId,
-        metaVersion: chat.metaVersion,
-        summaryVersion: chat.summaryVersion,
-        affected: [{ kind: 'chat-meta', chatId: chat.chatId }],
-      })
-    }
-    for (const presetId of result.presetIds) {
-      postEvent({ kind: 'preset-mutated', presetId })
-    }
-    return result
   }
 
-  async deletePromptPresetAndClearPins(
-    input: DeletePromptPresetAtomicInput,
-  ): Promise<DeletePromptPresetAtomicResult> {
-    const result = await withNamedLock(`prompt-preset:${input.presetId}`, async (grant) =>
-      deletePromptPresetAndClearPinsInBrowser(await openDb(), grant, input, bumpWorkspaceMeta),
+  private async getConfigurationProfileCatalogPage(
+    request: ConfigurationCatalogPageRequest,
+    signal?: AbortSignal,
+  ): Promise<ConfigurationProfileCatalogPage> {
+    const db = await this.openDb()
+    return db.transaction(
+      'r',
+      [db.configurationCatalogAggregates, db.configurationProfileCatalogRows],
+      async (tx) => {
+        const table = tx.table<ConfigurationProfileCatalogProjectionRow, ProfileId>(
+          'configurationProfileCatalogRows',
+        )
+        const state = await tx
+          .table<ConfigurationCatalogStateRow, string>('configurationCatalogAggregates')
+          .get(CONFIGURATION_PROFILE_CATALOG_STATE_ID)
+        if (!state) throw new Error('ConfigurationProfileCatalogStateMissing')
+        const addressedIds = configurationCatalogAddressIds(request) as ProfileId[]
+        const addressed = await table.bulkGet(addressedIds)
+        const addressedRows = Object.freeze(
+          addressedIds.map((id, index) => ({
+            id,
+            row: projectAddressedConfigurationProfileCatalogRow(addressed[index]),
+          })),
+        )
+        const [lower, upper] = scalarCompoundIndexBetween([1], [1], 4)
+        return readConfigurationCatalogIndexPage({
+          table,
+          state,
+          addressedRows,
+          index: '[activeKey+mruSortKey+nameSortKey+id]',
+          catalog: 'profiles',
+          lower,
+          upper,
+          request,
+          keyFor: (row) => [row.activeKey, row.mruSortKey, row.nameSortKey, row.id],
+          project: projectConfigurationProfileCatalogRow,
+          signal,
+        })
+      },
     )
-    if (result.kind === 'missing') return result
-    postEvent({ kind: 'prompt-preset-deleted', promptPresetId: input.presetId })
-    for (const chat of result.chats) {
-      postEvent({
-        kind: 'chat-mutated',
-        chatId: chat.chatId,
-        metaVersion: chat.metaVersion,
-        summaryVersion: chat.summaryVersion,
-        affected: [{ kind: 'chat-meta', chatId: chat.chatId }],
-      })
-    }
-    for (const presetId of result.presetIds) {
-      postEvent({ kind: 'preset-mutated', presetId })
-    }
-    return result
   }
 
-  async upsertStreamLease(lease: StreamLeaseRow): Promise<StreamLeaseRow> {
-    const db = await openDb()
-    const row = await withNamedLocks(
-      [`chat-meta:${lease.chatId}`, `stream-journal:${lease.streamId}`],
-      (grant) =>
-        grant.runTransaction(
-          db,
-          lease.messageId
-            ? [
-                db.chats,
-                db.streamLeases,
-                db.streamChunks,
-                db.settings,
-                db.messages,
-                db.messageBodies,
-              ]
-            : [db.chats, db.streamLeases, db.settings],
-          async (tx) => {
-            const table = tx.table<StreamLeaseRow, string>('streamLeases')
-            const existing = await table.get(lease.streamId)
-            const meta = await readBrowserWorkspaceMetaFromTransaction(tx)
-            await assertStreamLeaseWorkspaceTarget(tx, lease)
-            const fenceToken = lease.fenceToken ?? newId()
-            if (existing && existing.chatId !== lease.chatId) {
-              throw new Error(`StreamLeaseChatMismatch:${lease.streamId}`)
+  private async getConfigurationPresetCatalogPage(
+    request: ConfigurationCatalogPageRequest,
+    signal?: AbortSignal,
+  ): Promise<ConfigurationPresetCatalogPage> {
+    const db = await this.openDb()
+    return db.transaction(
+      'r',
+      [
+        db.configurationPresetCatalogRows,
+        db.presetOrderBlocks,
+        db.presetOrderMembership,
+        db.presetOrderState,
+      ],
+      (tx) => readConfigurationPresetOrderPage(tx, request, signal),
+    )
+  }
+
+  private async getConfigurationPromptPresetCatalogPage(
+    promptKind: PromptPresetKind,
+    request: ConfigurationCatalogPageRequest,
+    signal?: AbortSignal,
+  ): Promise<ConfigurationPromptPresetCatalogPage> {
+    const db = await this.openDb()
+    return db.transaction(
+      'r',
+      [db.configurationCatalogAggregates, db.configurationPromptPresetCatalogRows],
+      async (tx) => {
+        const table = tx.table<ConfigurationPromptPresetCatalogProjectionRow, PromptPresetId>(
+          'configurationPromptPresetCatalogRows',
+        )
+        const state = await tx
+          .table<ConfigurationCatalogStateRow, string>('configurationCatalogAggregates')
+          .get(configurationPromptPresetCatalogStateId(promptKind))
+        if (!state) throw new Error(`ConfigurationPromptPresetCatalogStateMissing:${promptKind}`)
+        const addressedIds = configurationCatalogAddressIds(request) as PromptPresetId[]
+        const addressed = await table.bulkGet(addressedIds)
+        const addressedRows = Object.freeze(
+          addressedIds.map((id, index) => ({
+            id,
+            row: projectConfigurationPromptPresetCatalogRow(addressed[index], promptKind),
+          })),
+        )
+        const [lower, upper] = scalarCompoundIndexBetween([promptKind], [promptKind], 3)
+        return readConfigurationCatalogIndexPage({
+          table,
+          state,
+          addressedRows,
+          index: '[kind+nameSortKey+id]',
+          catalog: `prompt-presets:${promptKind}`,
+          lower,
+          upper,
+          request,
+          keyFor: (row) => [row.kind, row.nameSortKey, row.id],
+          project: (row) => projectConfigurationPromptPresetCatalogRow(row, promptKind),
+          signal,
+        })
+      },
+    )
+  }
+
+  private async getConfigurationConnectionManagerPage(
+    request: ConfigurationCatalogPageRequest,
+    signal?: AbortSignal,
+  ): Promise<ConfigurationConnectionManagerPage> {
+    signal?.throwIfAborted()
+    const db = await this.openDb()
+    return db.transaction(
+      'r',
+      [
+        db.configurationCatalogAggregates,
+        db.configurationProfileCatalogRows,
+        db.configurationProfileUsageRows,
+      ],
+      async (tx: Transaction) => {
+        const profiles = tx.table<ConfigurationProfileCatalogProjectionRow, ProfileId>(
+          'configurationProfileCatalogRows',
+        )
+        const state = await tx
+          .table<ConfigurationCatalogStateRow, string>('configurationCatalogAggregates')
+          .get(CONFIGURATION_PROFILE_MANAGER_STATE_ID)
+        if (!state) throw new Error('ConfigurationProfileManagerStateMissing')
+        const addressedIds = configurationCatalogAddressIds(request) as ProfileId[]
+        const addressed = await profiles.bulkGet(addressedIds)
+        const [lower, upper] = scalarCompoundIndexBetween([0], [1], 3)
+        const page = await readConfigurationCatalogIndexPage({
+          table: profiles,
+          state,
+          addressedRows: Object.freeze(
+            addressedIds.map((id, index) => ({
+              id,
+              row: projectConfigurationConnectionManagerProfileRow(addressed[index]),
+            })),
+          ),
+          index: '[managerTier+nameSortKey+id]',
+          catalog: 'connection-manager',
+          lower,
+          upper,
+          request,
+          keyFor: (row) => [row.managerTier, row.nameSortKey, row.id],
+          project: projectConfigurationConnectionManagerProfileRow,
+          signal,
+        })
+        const profileRows = [
+          ...new Map(
+            [
+              ...(page.kind === 'page' ? page.rows : []),
+              ...page.addressedRows.flatMap((address) => (address.row ? [address.row] : [])),
+            ].map((profile) => [profile.id, profile]),
+          ).values(),
+        ]
+        const usages = await tx
+          .table<ConfigurationProfileUsageProjectionRow, ProfileId>('configurationProfileUsageRows')
+          .bulkGet(profileRows.map((profile) => profile.id))
+        const usageById = new Map(
+          profileRows.map((profile, index) => [
+            profile.id,
+            usages[index] ?? emptyConfigurationProfileUsageProjectionRow(profile.id),
+          ]),
+        )
+        const decorate = (profile: ConfigurationConnectionManagerRow) => ({
+          ...profile,
+          ...(usageById.get(profile.id) ?? emptyConfigurationProfileUsageProjectionRow(profile.id)),
+        })
+        return Object.freeze({
+          ...page,
+          ...(page.kind === 'page' ? { rows: Object.freeze(page.rows.map(decorate)) } : {}),
+          addressedRows: Object.freeze(
+            page.addressedRows.map((address) => ({
+              id: address.id,
+              row: address.row ? decorate(address.row) : null,
+            })),
+          ),
+        })
+      },
+    )
+  }
+
+  private async getGeneratedOutputNetworkAccess(
+    profileIds: readonly ProfileId[],
+    url: string,
+    requestCredential?: { profileId: ProfileId; selectedKeyId: KeyId },
+  ) {
+    const db = await this.openDb()
+    const uniqueProfileIds = requestCredential
+      ? [requestCredential.profileId]
+      : [...new Set(profileIds)]
+    return db.transaction('r', [db.profiles, db.keys], async (tx: Transaction) => {
+      const profiles = await tx
+        .table<ConnectionProfile, ProfileId>('profiles')
+        .bulkGet(uniqueProfileIds)
+      const profile = profiles.find(
+        (candidate): candidate is ConnectionProfile =>
+          candidate !== undefined && profileAuthorizesGeneratedVideoUrl(url, candidate.baseUrl),
+      )
+      if (!profile) return { profileKind: null, polling: false }
+      const selectedKeyId = requestCredential?.selectedKeyId ?? profile.apiKeyRef
+      const selectedKeyBelongsToProfile =
+        selectedKeyId !== undefined &&
+        (profile.apiKeyRef === selectedKeyId ||
+          profile.apiKeyFallbackRefs?.includes(selectedKeyId) === true)
+      const key = selectedKeyBelongsToProfile
+        ? await tx.table<KeyRecord, KeyId>('keys').get(selectedKeyId)
+        : undefined
+      return {
+        profileKind: profile.kind,
+        ...(key ? { credentialKey: keyDispatchProof(key) } : {}),
+        polling: profile.kind === 'openrouter' && isGeneratedVideoPollingUrl(url),
+      }
+    })
+  }
+
+  async getKey(keyId: KeyId): Promise<KeyRecord | undefined> {
+    return (await this.openDb()).keys.get(keyId)
+  }
+
+  private async mutateDiscoveryCache(
+    command: DiscoveryCacheCommand,
+    replacementEpoch: number,
+    commit: BrowserCommandCommit,
+  ): Promise<boolean | number | DiscoveryCachePutResult | DiscoveryModelsPutResult> {
+    switch (command.kind) {
+      case 'discovery.models.put':
+        return this.putModelsDiscoveryCacheRow(
+          command.row,
+          command.modelIds,
+          command.guard,
+          replacementEpoch,
+          commit,
+        )
+      case 'discovery.endpoints.put':
+        return this.putDiscoveryCacheRow(
+          'endpoints',
+          command.row,
+          [command.row.profileId, command.row.modelId],
+          command.guard,
+          replacementEpoch,
+          commit,
+        )
+      case 'discovery.privacy.put':
+        return this.putDiscoveryCacheRow(
+          'privacyPolicies',
+          command.row,
+          [command.row.profileId, command.row.modelId],
+          command.guard,
+          replacementEpoch,
+          commit,
+        )
+      case 'discovery.models.delete':
+        return this.deleteDiscoveryCacheRow(
+          'models',
+          command.profileId,
+          [command.profileId, command.queryKey],
+          replacementEpoch,
+          commit,
+        )
+    }
+  }
+
+  private async putModelsDiscoveryCacheRow(
+    row: CachedModelsRow,
+    modelIds: readonly string[],
+    guard: DiscoveryCacheWriteGuard<CachedModelsRow> | undefined,
+    replacementEpoch: number,
+    commit: BrowserCommandCommit,
+  ): Promise<DiscoveryModelsPutResult> {
+    commit.assertReplacementEpoch(replacementEpoch)
+    const db = await this.openDb()
+    const preparedPayload = await prepareDiscoveryPayload('models', row.payload)
+    const targetKey = configurationTargetKey('model-resolution', row.profileRevision)
+    for (;;) {
+      const plannedChatIds = await pendingModelResolutionChatIds(db.configurationLinks, targetKey)
+      try {
+        return await commit.withLocks(
+          [
+            'discovery-cache:retention',
+            `discovery-cache:models:${row.profileId}`,
+            `configuration-target:${targetKey}`,
+            ...plannedChatIds.map((chatId) => `chat-meta:${chatId}`),
+          ],
+          (locked) =>
+            locked.runTransaction(DISCOVERY_MODELS_WRITE_TRANSACTION, async (tx) => {
+              const currentProfile =
+                (await tx.table<ConnectionProfile, ProfileId>('profiles').get(row.profileId)) ??
+                null
+              const currentKey = currentProfile?.apiKeyRef
+                ? await tx.table<KeyRecord, KeyId>('keys').get(currentProfile.apiKeyRef)
+                : undefined
+              const currentRevision = currentProfile
+                ? configurationRequestRevisionFor(currentProfile, currentKey)
+                : null
+              if (
+                guard?.expectedProfileRevision !== undefined &&
+                stableStringify(currentRevision) !==
+                  stableStringify(guard.expectedProfileRevision ?? null)
+              ) {
+                return {
+                  accepted: false,
+                  cacheChanged: false,
+                  cached: false,
+                  repairRequired: false,
+                  evictions: [],
+                  resolvedChatIds: [],
+                }
+              }
+              if (
+                currentProfile &&
+                currentRevision &&
+                row.profileRevision !== connectionDiscoveryRevisionKey(currentRevision)
+              ) {
+                throw new Error(`DiscoveryCacheRowRevisionMismatch:${row.profileId}`)
+              }
+
+              const primaryKey: [ProfileId, string] = [row.profileId, row.queryKey]
+              if (guard?.expectedCurrent !== undefined) {
+                const current = await readDiscoveryCacheRow(tx, 'models', primaryKey)
+                if (
+                  stableStringify(current ?? null) !==
+                  stableStringify(guard.expectedCurrent ?? null)
+                ) {
+                  return {
+                    accepted: false,
+                    cacheChanged: false,
+                    cached: false,
+                    repairRequired: false,
+                    evictions: [],
+                    resolvedChatIds: [],
+                  }
+                }
+              }
+              const storageResult = await putDiscoveryCacheRow(tx, 'models', row, preparedPayload)
+
+              const currentChatIds = await pendingModelResolutionChatIds(
+                tx.table<ConfigurationLink, string>('configurationLinks'),
+                targetKey,
+              )
+              if (!sameOrderedIds(plannedChatIds, currentChatIds)) {
+                throw new ModelResolutionPublicationPlanChangedError()
+              }
+              const resolvedChatIds: ChatId[] = []
+              if (
+                currentProfile &&
+                row.queryKey ===
+                  modelsCacheKey(modelCatalogQueryForConnectionKind(currentProfile.kind))
+              ) {
+                const candidates = [...new Set(modelIds)].map((id) => ({ id }))
+                const chats = tx.table<Chat, ChatId>('chats')
+                const currentChats = await chats.bulkGet(currentChatIds)
+                const updatedAtClock = new TransactionChatUpdateClock()
+                const writes: Array<{ previous: Chat; next: Chat }> = []
+                for (const chat of currentChats) {
+                  const pending = chat?.modelResolution
+                  if (
+                    !chat ||
+                    !pending ||
+                    pending.target.profileId !== currentProfile.id ||
+                    configurationRequestRevisionKey(pending.target) !== row.profileRevision ||
+                    (chat.configurationVersion ?? 0) !== pending.expectedConfigurationVersion
+                  ) {
+                    continue
+                  }
+                  const resolvedModel =
+                    forceEquivalentModelIdForConnection(
+                      pending.sourceModelId,
+                      currentProfile.kind,
+                      candidates,
+                    ) ?? (candidates.length === 1 ? candidates[0]?.id : '')
+                  const written: Chat = {
+                    ...chat,
+                    settings: normalizeChatSettings({
+                      ...chat.settings,
+                      model: resolvedModel ?? '',
+                    }),
+                    configurationVersion: (chat.configurationVersion ?? 0) + 1,
+                    metaVersion: chat.metaVersion + 1,
+                    summaryVersion: chat.summaryVersion + 1,
+                    updatedAt: await updatedAtClock.next(tx, row.fetchedAt),
+                  }
+                  delete written.modelResolution
+                  writes.push({ previous: chat, next: written })
+                  resolvedChatIds.push(chat.id)
+                }
+                await applyChatRowWriteTransitions(
+                  tx,
+                  writes.map(({ previous, next }) => ({
+                    kind: 'replace-linked',
+                    previous,
+                    next,
+                  })),
+                )
+              }
+              return {
+                accepted: true,
+                cacheChanged: storageResult.cacheChanged,
+                cached: storageResult.cached,
+                repairRequired: storageResult.repairRequired,
+                evictions: protocolDiscoveryCacheEvictions(storageResult.evictions),
+                resolvedChatIds,
+              }
+            }),
+        )
+      } catch (error) {
+        if (error instanceof ModelResolutionPublicationPlanChangedError) continue
+        throw error
+      }
+    }
+  }
+
+  private async putDiscoveryCacheRow<Row extends CachedEndpointsRow | CachedPrivacyPolicyRow>(
+    tableName: 'endpoints' | 'privacyPolicies',
+    row: Row,
+    primaryKey: string | [string, string],
+    guard: DiscoveryCacheWriteGuard<Row> | undefined,
+    replacementEpoch: number,
+    commit: BrowserCommandCommit,
+  ): Promise<DiscoveryCachePutResult> {
+    commit.assertReplacementEpoch(replacementEpoch)
+    const preparedPayload = await prepareDiscoveryPayload(tableName, row.payload)
+    return commit.withLocks(
+      ['discovery-cache:retention', `discovery-cache:${tableName}:${row.profileId}`],
+      (locked) =>
+        locked.runTransaction(DISCOVERY_CACHE_ROW_WRITE_TRANSACTION, async (tx) => {
+          if (guard && 'expectedProfileRevision' in guard) {
+            const currentProfile =
+              (await tx.table<ConnectionProfile, ProfileId>('profiles').get(row.profileId)) ?? null
+            const currentKey = currentProfile?.apiKeyRef
+              ? await tx.table<KeyRecord, KeyId>('keys').get(currentProfile.apiKeyRef)
+              : undefined
+            const currentRevision = currentProfile
+              ? configurationRequestRevisionFor(currentProfile, currentKey)
+              : null
+            if (
+              stableStringify(currentRevision) !==
+              stableStringify(guard.expectedProfileRevision ?? null)
+            ) {
+              return emptyDiscoveryCachePutResult()
             }
             if (
-              existing &&
-              (existing.ownerClientId !== lease.ownerClientId || existing.fenceToken !== fenceToken)
+              currentProfile &&
+              'profileRevision' in row &&
+              currentRevision &&
+              row.profileRevision !== connectionDiscoveryRevisionKey(currentRevision)
             ) {
-              throw new Error(`StreamLeaseAlreadyOwned:${lease.streamId}`)
+              throw new Error(`DiscoveryCacheRowRevisionMismatch:${row.profileId}`)
             }
-            const targetChanged = existing?.messageId !== lease.messageId
-            const admissionSequence =
-              !existing || targetChanged || existing.admissionSequence === undefined
-                ? await assertStreamLeaseTargetAvailable(tx, lease)
-                : existing.admissionSequence
-            const admitted: StreamLeaseRow = {
-              ...lease,
-              fenceToken,
-              replacementEpoch: meta.replacementEpoch,
-              admissionSequence,
+          }
+          if (guard && 'expectedCurrent' in guard) {
+            const current = (await readDiscoveryCacheRow(tx, tableName, primaryKey)) as
+              | Row
+              | undefined
+            if (
+              stableStringify(current ?? null) !== stableStringify(guard.expectedCurrent ?? null)
+            ) {
+              return emptyDiscoveryCachePutResult()
             }
-            await table.put(admitted)
-            return admitted
-          },
-        ),
+          }
+          const result = await putDiscoveryCacheRow(tx, tableName, row, preparedPayload)
+          return protocolDiscoveryCachePutResult(result)
+        }),
     )
-    postEvent({ kind: 'stream-heartbeat', lease: row })
-    return row
+  }
+
+  private async deleteDiscoveryCacheRow(
+    tableName: 'models',
+    profileId: ProfileId,
+    primaryKey: [string, string],
+    replacementEpoch: number,
+    commit: BrowserCommandCommit,
+  ): Promise<boolean> {
+    commit.assertReplacementEpoch(replacementEpoch)
+    return commit.withLocks(
+      ['discovery-cache:retention', `discovery-cache:${tableName}:${profileId}`],
+      (locked) =>
+        locked.runTransaction(DISCOVERY_CACHE_TRANSACTION, async (tx) => {
+          const result = await deleteDiscoveryCacheRow(tx, tableName, primaryKey)
+          return result.deleted
+        }),
+    )
+  }
+
+  async getSetting<T>(key: string): Promise<T | undefined> {
+    const row = await (await this.openDb()).settings.get(key)
+    return row?.value as T | undefined
+  }
+
+  async getSettings(
+    keys: readonly string[],
+    options: { signal?: AbortSignal } = {},
+  ): Promise<ReadonlyMap<string, unknown>> {
+    const db = await this.openDb()
+    const rows = await readBulkGetPages(db.settings, keys, options)
+    return new Map(
+      rows.flatMap((row) => (row === undefined ? [] : [[row.key, row.value] as const])),
+    )
   }
 
   async renewStreamLease(
-    lease: StreamLeaseRow,
-    options: { targetChanged?: boolean } = {},
+    heartbeat: StreamLeaseHeartbeat,
+    commit: BrowserCommandCommit,
   ): Promise<StreamLeaseRow> {
-    const fence = requiredStreamFence(lease)
-    const db = await openDb()
-    const checkTarget = options.targetChanged !== false
-    const row = await withNamedLocks(
-      [...(checkTarget ? [`chat-meta:${lease.chatId}`] : []), `stream-journal:${lease.streamId}`],
-      (grant) =>
-        grant.runTransaction(
-          db,
-          checkTarget
-            ? [
-                db.chats,
-                db.streamLeases,
-                db.streamChunks,
-                db.settings,
-                db.messages,
-                db.messageBodies,
-              ]
-            : [db.streamLeases, db.settings],
-          async (tx) => {
-            const meta = await readBrowserWorkspaceMetaFromTransaction(tx)
-            const table = tx.table<StreamLeaseRow, string>('streamLeases')
-            const existing = await table.get(lease.streamId)
-            assertOwnedStreamFence(existing, fence, meta.replacementEpoch, lease.streamId)
-            if (existing.chatId !== lease.chatId) {
-              throw new Error(`StreamLeaseChatMismatch:${lease.streamId}`)
-            }
-            const renewed: StreamLeaseRow = {
-              ...lease,
-              startedAt: existing.startedAt,
-              fenceToken: fence.fenceToken,
-              replacementEpoch: fence.replacementEpoch,
-              ...(existing.admissionSequence !== undefined
-                ? { admissionSequence: existing.admissionSequence }
-                : {}),
-            }
-            if (renewed.messageId !== existing.messageId) {
-              if (!checkTarget) throw new Error(`StreamLeaseTargetChanged:${lease.streamId}`)
-              await assertStreamLeaseWorkspaceTarget(tx, renewed)
-              renewed.admissionSequence = await assertStreamLeaseTargetAvailable(tx, renewed)
-            }
-            await table.put(renewed)
-            return renewed
-          },
-        ),
+    const { fence } = heartbeat
+    commit.assertReplacementEpoch(fence.replacementEpoch)
+    const row = await commit.withLocks([`stream-journal:${heartbeat.streamId}`], (locked) =>
+      locked.runTransaction(STREAM_LEASE_TRANSACTION, async (tx) => {
+        const table = tx.table<StreamLeaseRow, string>('streamLeases')
+        const existing = await table.get(heartbeat.streamId)
+        assertOwnedStreamFence(existing, fence, fence.replacementEpoch, heartbeat.streamId)
+        const elapsed = heartbeat.heartbeatAt - existing.heartbeatAt
+        if (elapsed >= 0 && elapsed <= STREAM_LEASE_HEARTBEAT_COALESCE_MS) {
+          return structuredClone(existing)
+        }
+        const renewed = requireStreamLeaseRow({
+          ...existing,
+          heartbeatAt: heartbeat.heartbeatAt,
+          revision: nextStreamLeaseRevision(existing),
+        })
+        await putStreamLeaseByteOwner(tx, renewed, existing)
+        return renewed
+      }),
     )
-    postEvent({ kind: 'stream-heartbeat', lease: row })
     return row
   }
 
   async claimStreamLeaseForRecovery(
     expected: StreamLeaseRow,
     now: number,
+    commit: BrowserCommandCommit,
   ): Promise<StreamLeaseRow | undefined> {
-    const expectedFence = requiredStreamFence(expected)
-    const db = await openDb()
-    return withNamedLock(`stream-journal:${expected.streamId}`, (grant) =>
-      grant.runTransaction(db, [db.streamLeases, db.settings], async (tx) => {
-        const meta = await readBrowserWorkspaceMetaFromTransaction(tx)
+    commit.assertReplacementEpoch(expected.replacementEpoch)
+    return commit.withLocks([`stream-journal:${expected.streamId}`], (locked) =>
+      locked.runTransaction(STREAM_LEASE_TRANSACTION, async (tx) => {
         const table = tx.table<StreamLeaseRow, string>('streamLeases')
         const existing = await table.get(expected.streamId)
         if (
           !existing ||
-          existing.ownerClientId !== expectedFence.ownerClientId ||
-          existing.fenceToken !== expectedFence.fenceToken ||
-          existing.replacementEpoch !== expectedFence.replacementEpoch ||
-          existing.heartbeatAt !== expected.heartbeatAt ||
-          meta.replacementEpoch !== expectedFence.replacementEpoch
+          existing.replacementEpoch !== expected.replacementEpoch ||
+          existing.admissionSequence !== expected.admissionSequence ||
+          existing.revision !== expected.revision ||
+          existing.custody !== expected.custody ||
+          (streamLeaseHasWriteFence(existing) &&
+            streamLeaseHasWriteFence(expected) &&
+            (existing.ownerClientId !== expected.ownerClientId ||
+              existing.fenceToken !== expected.fenceToken ||
+              existing.heartbeatAt !== expected.heartbeatAt)) ||
+          (existing.custody === 'recovery-pending' &&
+            expected.custody === 'recovery-pending' &&
+            existing.handoffId !== expected.handoffId)
         ) {
           return undefined
         }
-        const claimed: StreamLeaseRow = {
-          ...existing,
+        const {
+          custody: _custody,
+          ownerClientId: _ownerClientId,
+          fenceToken: _fenceToken,
+          heartbeatAt: _heartbeatAt,
+          handoffId: _handoffId,
+          handedOffAt: _handedOffAt,
+          handoffReason: _handoffReason,
+          ...leaseState
+        } = existing
+        const claimed = requireStreamLeaseRow({
+          ...leaseState,
+          custody: 'recovery',
           ownerClientId: `recovery:${newId()}`,
           fenceToken: newId(),
           heartbeatAt: now,
-        }
-        await table.put(claimed)
+          revision: nextStreamLeaseRevision(existing),
+        })
+        await putStreamLeaseByteOwner(tx, claimed, existing)
         return claimed
       }),
     )
   }
 
-  async deleteStreamLease(streamId: string): Promise<boolean> {
-    const db = await openDb()
-    return withNamedLock(`stream-journal:${streamId}`, (grant) =>
-      grant.runTransaction(db, [db.streamLeases], async (tx) => {
+  async handoffStreamLeaseForRecovery(
+    input: StreamHandoffRecoveryInput,
+    replacementEpoch: number,
+    commit: BrowserCommandCommit,
+  ): Promise<StreamLeaseRow> {
+    commit.assertReplacementEpoch(replacementEpoch)
+    return commit.withLocks([`stream-journal:${input.streamId}`], (locked) =>
+      locked.runTransaction(STREAM_LEASE_TRANSACTION, async (tx) => {
         const table = tx.table<StreamLeaseRow, string>('streamLeases')
-        const existing = await table.get(streamId)
-        if (!existing) return false
-        await table.delete(streamId)
-        return true
+        const existing = await table.get(input.streamId)
+        assertOwnedStreamFence(existing, input.fence, replacementEpoch, input.streamId)
+        if (existing.custody !== 'writer') {
+          throw new Error(`StreamHandoffCustodyInvalid:${input.streamId}`)
+        }
+        const {
+          custody: _custody,
+          ownerClientId: _ownerClientId,
+          fenceToken: _fenceToken,
+          heartbeatAt: _heartbeatAt,
+          ...leaseState
+        } = existing
+        const handedOff = requireStreamLeaseRow({
+          ...leaseState,
+          custody: 'recovery-pending',
+          handoffId: newId(),
+          handedOffAt: input.handedOffAt,
+          handoffReason: input.reason,
+          revision: nextStreamLeaseRevision(existing),
+        })
+        await putStreamLeaseByteOwner(tx, handedOff, existing)
+        return handedOff
       }),
     )
   }
 
-  async deleteOwnedStreamLease(streamId: string, fence: StreamWriteFence): Promise<boolean> {
-    const db = await openDb()
-    return withNamedLock(`stream-journal:${streamId}`, (grant) =>
-      grant.runTransaction(db, [db.streamLeases, db.settings], async (tx) => {
-        const meta = await readBrowserWorkspaceMetaFromTransaction(tx)
-        const table = tx.table<StreamLeaseRow, string>('streamLeases')
-        const existing = await table.get(streamId)
-        if (!existing) return false
-        assertOwnedStreamFence(existing, fence, meta.replacementEpoch, streamId)
-        await table.delete(streamId)
-        return true
-      }),
-    )
-  }
-
-  async listStreamLeases(chatId?: ChatId): Promise<StreamLeaseRow[]> {
-    const db = await openDb()
-    const rows =
-      chatId === undefined
-        ? await db.streamLeases.toArray()
-        : await db.streamLeases.where('chatId').equals(chatId).toArray()
-    return rows.filter(isStreamLeaseRow).map((lease) => ({ ...lease }))
+  async listStreamLeases(
+    chatId?: ChatId,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<StreamLeaseRow[]> {
+    return readStreamLeasePages(await this.openDb(), chatId, options)
   }
 
   async getStreamLease(streamId: string): Promise<StreamLeaseRow | undefined> {
-    const db = await openDb()
+    const db = await this.openDb()
     const lease = await db.streamLeases.get(streamId)
     return isStreamLeaseRow(lease) ? { ...lease } : undefined
   }
 
-  async listStreamLeasesForMessage(messageId: MessageId): Promise<StreamLeaseRow[]> {
-    const db = await openDb()
-    const rows = await db.streamLeases.where('messageId').equals(messageId).toArray()
-    return rows.filter(isStreamLeaseRow).map((lease) => ({ ...lease }))
+  async getStreamLeaseHead(): Promise<StreamLeaseRow | undefined> {
+    const db = await this.openDb()
+    const lease = await db.streamLeases.limit(1).first()
+    return isStreamLeaseRow(lease) ? { ...lease } : undefined
   }
 
-  async listMessageLessGenerationStreamLeases(chatId: ChatId): Promise<StreamLeaseRow[]> {
-    const db = await openDb()
-    const rows = await db.streamLeases.where('chatId').equals(chatId).toArray()
-    return rows
-      .filter(
-        (lease) =>
-          isStreamLeaseRow(lease) &&
-          lease.messageId === undefined &&
-          lease.attemptKind === 'generation',
-      )
-      .map((lease) => ({ ...lease }))
+  async getStreamLeases(
+    streamIds: readonly string[],
+    options: { signal?: AbortSignal } = {},
+  ): Promise<Array<StreamLeaseRow | undefined>> {
+    const rows = await readBulkGetPages((await this.openDb()).streamLeases, streamIds, options)
+    return rows.map((row) => (isStreamLeaseRow(row) ? { ...row } : undefined))
   }
 
-  async appendStreamChunks(chunks: readonly StreamChunkRow[]): Promise<void> {
-    if (chunks.length === 0) return
-    const db = await openDb()
-    const streamIds = [...new Set(chunks.map((chunk) => chunk.streamId))]
-    await withNamedLocks(
-      streamIds.map((streamId) => `stream-journal:${streamId}`),
-      (grant) =>
-        grant.runTransaction(db, [db.streamChunks, db.streamLeases, db.settings], async (tx) => {
-          const meta = await readBrowserWorkspaceMetaFromTransaction(tx)
-          const leases = tx.table<StreamLeaseRow, string>('streamLeases')
-          const leaseRows = await leases.bulkGet(streamIds)
-          const byStreamId = new Map(
-            leaseRows.flatMap((lease) => (lease ? [[lease.streamId, lease] as const] : [])),
-          )
-          const latestCreatedAtByStreamId = new Map<string, number>()
-          for (const chunk of chunks) {
-            const fence = requiredChunkFence(chunk)
-            const lease = byStreamId.get(chunk.streamId)
-            if (
-              !lease ||
-              lease.fenceToken !== fence.fenceToken ||
-              lease.replacementEpoch !== fence.replacementEpoch ||
-              meta.replacementEpoch !== fence.replacementEpoch
-            ) {
-              throw new Error(`StreamFenceLost:${chunk.streamId}`)
-            }
-            latestCreatedAtByStreamId.set(
-              chunk.streamId,
-              Math.max(
-                latestCreatedAtByStreamId.get(chunk.streamId) ?? chunk.createdAt,
-                chunk.createdAt,
-              ),
-            )
-          }
-          const advancedLeases: StreamLeaseRow[] = []
-          for (const [streamId, latestCreatedAt] of latestCreatedAtByStreamId) {
-            const lease = byStreamId.get(streamId) as StreamLeaseRow
-            if (latestCreatedAt <= lease.heartbeatAt) continue
-            advancedLeases.push({ ...lease, heartbeatAt: latestCreatedAt })
-          }
-          if (advancedLeases.length > 0) await leases.bulkPut(advancedLeases)
-          await tx
-            .table<StreamChunkRow, string>('streamChunks')
-            .bulkPut(chunks.map((chunk) => structuredClone(chunk)))
-        }),
-    )
-  }
-
-  async listStreamChunks(streamId: string): Promise<StreamChunkRow[]> {
-    const db = await openDb()
-    const rows = await db.streamChunks
-      .where('[streamId+seq]')
-      .between([streamId, Dexie.minKey], [streamId, Dexie.maxKey])
-      .toArray()
-    return rows.filter(isStreamChunkRow).map((chunk) => structuredClone(chunk))
-  }
-
-  async listStreamChunksForMessage(messageId: MessageId): Promise<StreamChunkRow[]> {
-    const db = await openDb()
-    const rows = await db.streamChunks.where('messageId').equals(messageId).toArray()
-    return rows
-      .filter(isStreamChunkRow)
-      .sort((a, b) => a.seq - b.seq)
-      .map((chunk) => structuredClone(chunk))
-  }
-
-  async listStreamChunksForChat(chatId: ChatId): Promise<StreamChunkRow[]> {
-    const db = await openDb()
-    const rows = await db.streamChunks.where('chatId').equals(chatId).toArray()
-    return rows
-      .filter(isStreamChunkRow)
-      .sort((a, b) =>
-        a.streamId === b.streamId ? a.seq - b.seq : a.streamId.localeCompare(b.streamId),
-      )
-      .map((chunk) => structuredClone(chunk))
-  }
-
-  async deleteStreamChunks(streamId: string, fence?: StreamWriteFence): Promise<number> {
-    const db = await openDb()
-    return withNamedLock(`stream-journal:${streamId}`, (grant) =>
-      grant.runTransaction(
-        db,
-        fence ? [db.streamChunks, db.streamLeases, db.settings] : [db.streamChunks],
-        async (tx) => {
-          if (fence) {
-            const meta = await readBrowserWorkspaceMetaFromTransaction(tx)
-            const lease = await tx.table<StreamLeaseRow, string>('streamLeases').get(streamId)
-            assertOwnedStreamFence(lease, fence, meta.replacementEpoch, streamId)
-          }
-          return tx
-            .table<StreamChunkRow, string>('streamChunks')
-            .where('streamId')
-            .equals(streamId)
-            .delete()
-        },
+  async appendStreamJournalFrames(
+    frames: readonly StreamJournalFrameRow[],
+    commit: BrowserCommandCommit,
+  ): Promise<void> {
+    if (frames.length === 0) return
+    const batch = canonicalStreamJournalFrameBatch(frames)
+    const streamId = batch[0]?.streamId
+    if (!streamId) throw new Error('StreamJournalAppendBatchEmpty')
+    await commit.withLocks([`stream-journal:${streamId}`], (locked) =>
+      locked.runTransaction(STREAM_JOURNAL_TRANSACTION, (tx) =>
+        persistStreamJournalFrames(tx, batch, Date.now()),
       ),
     )
   }
 
   async deleteStreamJournal(
     streamId: string,
-    options:
-      | {
-          replacementEpoch: number
-          streamFence: StreamWriteFence
-          expectedLeaseMissing?: never
-        }
-      | {
-          replacementEpoch: number
-          expectedLeaseMissing: true
-          streamFence?: never
-        },
-  ): Promise<{ deletedLease: boolean; deletedChunks: number }> {
-    const db = await openDb()
-    return withNamedLock(`stream-journal:${streamId}`, (grant) =>
-      grant.runTransaction(db, [db.streamChunks, db.streamLeases, db.settings], async (tx) => {
-        const meta = await readBrowserWorkspaceMetaFromTransaction(tx)
-        if (meta.replacementEpoch !== options.replacementEpoch) {
-          throw new WorkspaceReplacementFenceError()
-        }
-        const leases = tx.table<StreamLeaseRow, string>('streamLeases')
-        const existing = await leases.get(streamId)
-        if (options.streamFence) {
-          assertOwnedStreamFence(existing, options.streamFence, meta.replacementEpoch, streamId)
-        } else if (options.expectedLeaseMissing && existing) {
+    options: {
+      replacementEpoch: number
+      streamFence: StreamWriteFence
+    },
+    commit: BrowserCommandCommit,
+  ): Promise<{ deletedLease: boolean; deletedFrames: number; done: boolean }> {
+    commit.assertReplacementEpoch(options.replacementEpoch)
+    return commit.withLocks([`stream-journal:${streamId}`], (locked) =>
+      locked.runTransaction(STREAM_JOURNAL_TRANSACTION, async (tx) => {
+        const page = await retireStreamJournalOwnershipPage(tx, {
+          kind: 'owned-metadata-committed',
+          streamId,
+          fence: options.streamFence,
+        })
+        if (page.outcome === 'ineligible') {
+          if (page.reason === 'not-metadata-committed') {
+            throw new Error(`StreamCleanupBeforeMetadata:${streamId}`)
+          }
           throw new Error(`StreamFenceLost:${streamId}`)
         }
-        const deletedChunks = await tx
-          .table<StreamChunkRow, string>('streamChunks')
-          .where('streamId')
-          .equals(streamId)
-          .delete()
-        if (existing) await leases.delete(streamId)
-        return { deletedLease: existing !== undefined, deletedChunks }
+        return {
+          deletedLease: page.deletedLeases > 0,
+          deletedFrames: page.deletedFrames,
+          done: page.done,
+        }
       }),
     )
   }
 
-  async listChats(): Promise<Chat[]> {
-    return openDb().then((db) => db.chats.toArray())
+  private async reconcileStreamJournalIntegrity(
+    requestedLimit: number,
+    commit: BrowserCommandCommit,
+  ): Promise<{
+    scannedStreamIds: number
+    deletedStreamIds: string[]
+    deletedFrames: number
+    done: boolean
+  }> {
+    const limit = boundedMaintenanceLimit(requestedLimit)
+    const db = await this.openDb()
+    for (;;) {
+      const plan = await readStreamJournalIntegrityPlan(db)
+      if (plan.kind === 'complete') {
+        return {
+          scannedStreamIds: 0,
+          deletedStreamIds: [],
+          deletedFrames: 0,
+          done: true,
+        }
+      }
+      try {
+        return await commit.withLocks(
+          [
+            'stream-journal-integrity:maintenance',
+            ...(plan.kind === 'retire' ? [`stream-journal:${plan.streamId}`] : []),
+          ],
+          (locked) =>
+            locked.runTransaction(STREAM_JOURNAL_INTEGRITY_TRANSACTION, async (tx) => {
+              const result = await reconcileStreamJournalIntegrityPage(tx, limit, plan)
+              return {
+                ...result,
+                deletedStreamIds: [...result.deletedStreamIds],
+              }
+            }),
+        )
+      } catch (error) {
+        if (error instanceof StreamJournalIntegrityPlanChangedError) continue
+        throw error
+      }
+    }
+  }
+
+  private async pruneTerminalStreamJournals(
+    now: number,
+    maxAgeMs: number,
+    requestedLimit: number,
+    commit: BrowserCommandCommit,
+  ): Promise<{
+    scanned: number
+    deletedStreamIds: string[]
+    deletedFrames: number
+    earliestDeferredAt?: number
+    done: boolean
+  }> {
+    boundedMaintenanceLimit(requestedLimit)
+    const db = await this.openDb()
+    for (;;) {
+      const state = await readStorageRetentionState(db, 'terminal-stream-prune')
+      const cycle = storageRetentionCycle(state, now, maxAgeMs)
+      const lower = cycle.cursor ? [cycle.cursor.terminalRetentionAt, cycle.cursor.streamId] : []
+      const candidate = await db.streamLeases
+        .where('[terminalRetentionAt+streamId]')
+        .between(lower, [cycle.cutoff], false, false)
+        .first()
+      try {
+        return await commit.withLocks(
+          [
+            'storage-retention:terminal-stream-prune',
+            ...(candidate ? [`stream-journal:${candidate.streamId}`] : []),
+          ],
+          (locked) =>
+            locked.runTransaction(TERMINAL_STREAM_RETENTION_TRANSACTION, async (tx) => {
+              const currentState = await readStorageRetentionState(tx, 'terminal-stream-prune')
+              if (currentState.revision !== cycle.expectedRevision) {
+                throw new TerminalStreamRetentionPlanChangedError()
+              }
+              const leases = tx.table<StreamLeaseRow, string>('streamLeases')
+              const current = await leases
+                .where('[terminalRetentionAt+streamId]')
+                .between(lower, [cycle.cutoff], false, false)
+                .first()
+              if (
+                current?.streamId !== candidate?.streamId ||
+                current?.revision !== candidate?.revision ||
+                current?.terminalRetentionAt !== candidate?.terminalRetentionAt
+              ) {
+                throw new TerminalStreamRetentionPlanChangedError()
+              }
+              if (!current) {
+                const deferred = await leases
+                  .where('[terminalRetentionAt+streamId]')
+                  .aboveOrEqual([cycle.cutoff])
+                  .first()
+                const earliestDeferredAt = deferred?.terminalRetentionAt
+                await commitStorageRetentionPage(tx, cycle, {
+                  done: true,
+                  ...(earliestDeferredAt === undefined ? {} : { earliestDeferredAt }),
+                })
+                return {
+                  scanned: 0,
+                  deletedStreamIds: [],
+                  deletedFrames: 0,
+                  ...(earliestDeferredAt === undefined ? {} : { earliestDeferredAt }),
+                  done: true,
+                }
+              }
+              if (current.terminalRetentionAt === undefined) {
+                throw new TerminalStreamRetentionPlanChangedError()
+              }
+              const page = await retireStreamJournalOwnershipPage(tx, {
+                kind: 'retention-candidate',
+                streamId: current.streamId,
+                expectedRevision: current.revision,
+                expectedTerminalRetentionAt: current.terminalRetentionAt,
+                cutoff: cycle.cutoff,
+              })
+              if (page.outcome === 'ineligible') {
+                throw new TerminalStreamRetentionPlanChangedError()
+              }
+              if (page.outcome === 'complete') {
+                await commitStorageRetentionPage(tx, cycle, {
+                  done: false,
+                  cursor: {
+                    terminalRetentionAt: current.terminalRetentionAt,
+                    streamId: current.streamId,
+                  },
+                })
+              }
+              return {
+                scanned: 1,
+                deletedStreamIds: page.deletedLeases > 0 ? [current.streamId] : [],
+                deletedFrames: page.deletedFrames,
+                done: false,
+              }
+            }),
+        )
+      } catch (error) {
+        if (error instanceof TerminalStreamRetentionPlanChangedError) continue
+        throw error
+      }
+    }
+  }
+
+  private async pruneDiscoveryCache(
+    requestedLimit: number,
+    commit: BrowserCommandCommit,
+  ): Promise<DiscoveryCacheMaintenanceResult> {
+    return commit.withLocks(['discovery-cache:retention'], (locked) =>
+      locked.runTransaction(DISCOVERY_CACHE_TRANSACTION, async (tx) => {
+        const result = await maintainDiscoveryCache(tx, requestedLimit)
+        return {
+          scanned: result.scanned,
+          deletedPayloads: result.deletedPayloads,
+          evictions: protocolDiscoveryCacheEvictions(result.evictions),
+          done: result.done,
+        }
+      }),
+    )
+  }
+
+  private async reconcileAttachmentIntegrity(
+    requestedLimit: number,
+    commit: BrowserCommandCommit,
+  ): Promise<AttachmentIntegrityMaintenanceResult> {
+    const limit = boundedMaintenanceLimit(requestedLimit)
+    return commit.withLocks(['attachment-integrity:maintenance'], (locked) =>
+      locked.runTransaction(ATTACHMENT_INTEGRITY_TRANSACTION, async (tx) => {
+        const result = await reconcileAttachmentIntegrityPage(tx, limit)
+        return result
+      }),
+    )
   }
 
   async getChat(chatId: ChatId): Promise<Chat | undefined> {
-    return openDb().then((db) => db.chats.get(chatId))
+    return this.openDb().then((db) => db.chats.get(chatId))
   }
 
-  async deleteArchivedChat(chatId: ChatId): Promise<boolean> {
-    const result = await this.deleteArchivedChats([chatId])
-    return result.deletedChatIds.includes(chatId)
-  }
-
-  async deleteArchivedChatReturningRow(chatId: ChatId): Promise<Chat | undefined> {
-    const result = await this.deleteArchivedChats([chatId])
-    return result.deletedChats.find((chat) => chat.id === chatId)
-  }
-
-  async emptyArchivedChats(): Promise<DeleteArchivedChatsResult> {
-    const db = await openDb()
-    const archivedIds = (await db.chats.filter((chat) => chat.archived).toArray()).map(
-      (chat) => chat.id,
-    )
-    return this.deleteArchivedChats(archivedIds)
-  }
-
-  private async deleteArchivedChats(
+  private async setChatsArchived(
     chatIds: readonly ChatId[],
-  ): Promise<DeleteArchivedChatsResult> {
-    if (chatIds.length === 0) return { deletedChatIds: [], deletedChats: [] }
-    const db = await openDb()
-    for (;;) {
-      const snapshots = await archivedDeleteSnapshots(db, chatIds)
-      if (snapshots.length === 0) return { deletedChatIds: [], deletedChats: [] }
-      const scopes: MutationScope[] = []
-      const attachmentScopeIds = new Set<AttachmentId>()
-      for (const snapshot of snapshots) {
-        scopes.push({ kind: 'chat-meta', chatId: snapshot.chatId })
-        scopes.push({ kind: 'draft', chatId: snapshot.chatId })
-        for (const messageId of snapshot.messageIds) {
-          scopes.push({ kind: 'message', messageId })
-        }
-        for (const attachmentId of snapshot.attachmentIds) {
-          if (attachmentScopeIds.has(attachmentId)) continue
-          attachmentScopeIds.add(attachmentId)
-          scopes.push({ kind: 'attachment', attachmentId })
-        }
-      }
+    archived: boolean,
+    now: number,
+    commit: BrowserCommandCommit,
+  ): Promise<ChatMetadataWriteResult<readonly ChatId[]>> {
+    const runtime = await import('./browser-catalog-command-runtime')
+    return runtime.setChatsArchived(await this.openDb(), chatIds, archived, now, commit)
+  }
 
-      const deletedChatIds: ChatId[] = []
-      const deletedChats: Chat[] = []
-      const now = Date.now()
-      try {
-        await withMutationLocks(scopes, async (grant) =>
-          grant.runTransaction(
-            db,
-            [
-              db.attachmentArtifacts,
-              db.attachmentBlobs,
-              db.attachmentJobs,
-              db.attachmentRefEdges,
-              db.attachments,
-              db.chatBranchCache,
-              db.chatSidebarRows,
-              db.chats,
-              db.childLists,
-              db.drafts,
-              db.messages,
-              db.messageBodies,
-              db.streamLeases,
-              db.streamChunks,
-              db.settings,
-            ],
-            async (tx: Transaction) => {
-              const chats = tx.table<Chat, ChatId>('chats')
-              const messages = tx.table<MessageHeaderRow, MessageId>('messages')
-              const drafts = tx.table<DraftRow, ChatId>('drafts')
-              for (const snapshot of snapshots) {
-                const chat = await chats.get(snapshot.chatId)
-                if (!chat?.archived) continue
-                const activeLease = await tx
-                  .table<StreamLeaseRow, string>('streamLeases')
-                  .where('chatId')
-                  .equals(snapshot.chatId)
-                  .first()
-                if (activeLease) {
-                  throw new ChatStreamBusyError(snapshot.chatId, activeLease.streamId)
-                }
-                const messageRows = await messages.where('chatId').equals(snapshot.chatId).toArray()
-                const draft = await drafts.get(snapshot.chatId)
-                if (!sameArchivedDeleteSnapshot(snapshot, messageRows, draft)) {
-                  throw new ArchivedChatDeletePlanChangedError()
-                }
-                await replaceAttachmentReferenceOwners(tx, [
-                  ...messageRows.map((message) => ({
-                    ownerKind: 'message' as const,
-                    ownerId: message.id,
-                    chatId: message.chatId,
-                    refs: [],
-                  })),
-                  ...(draft
-                    ? [
-                        {
-                          ownerKind: 'draft' as const,
-                          ownerId: draft.chatId,
-                          chatId: draft.chatId,
-                          refs: [],
-                        },
-                      ]
-                    : []),
-                ])
-                await messages.where('chatId').equals(snapshot.chatId).delete()
-                await tx
-                  .table<MessageBodyRow, MessageId>('messageBodies')
-                  .where('chatId')
-                  .equals(snapshot.chatId)
-                  .delete()
-                await drafts.delete(snapshot.chatId)
-                await tx.table<ChatBranchCache, ChatId>('chatBranchCache').delete(snapshot.chatId)
-                await tx
-                  .table<ChildListState, string>('childLists')
-                  .filter((row) => row.chatId === snapshot.chatId)
-                  .delete()
-                await tx
-                  .table<StreamLeaseRow, string>('streamLeases')
-                  .where('chatId')
-                  .equals(snapshot.chatId)
-                  .delete()
-                await tx
-                  .table<StreamChunkRow, string>('streamChunks')
-                  .where('chatId')
-                  .equals(snapshot.chatId)
-                  .delete()
-                await chats.delete(snapshot.chatId)
-                deletedChatIds.push(snapshot.chatId)
-                deletedChats.push(structuredClone(chat))
-              }
-              if (deletedChatIds.length > 0) {
-                await deleteChatSidebarProjections(tx, deletedChatIds)
-                await bumpWorkspaceMeta(tx, now)
-              }
-            },
-          ),
-        )
-      } catch (error) {
-        if (error instanceof ArchivedChatDeletePlanChangedError) continue
-        throw error
-      }
+  private async touchChatViewed(
+    chatId: ChatId,
+    now: number,
+    commit: BrowserCommandCommit,
+  ): Promise<ChatMetadataWriteResult<boolean>> {
+    const runtime = await import('./browser-catalog-command-runtime')
+    return runtime.touchChatViewed(await this.openDb(), chatId, now, commit)
+  }
 
-      for (const chatId of deletedChatIds) {
-        postEvent({ kind: 'chat-deleted', chatId })
-        postEvent({ kind: 'branch-cache-refreshed', chatId })
-      }
-      return { deletedChatIds, deletedChats }
-    }
+  private async setChatManualTitle(
+    chatId: ChatId,
+    title: string,
+    now: number,
+    commit: BrowserCommandCommit,
+  ): Promise<ChatMetadataWriteResult<boolean>> {
+    const runtime = await import('./browser-catalog-command-runtime')
+    return runtime.setChatManualTitle(await this.openDb(), chatId, title, now, commit)
+  }
+
+  private async moveChatRowsToFolder(
+    chatIds: readonly ChatId[],
+    folderId: FolderId | null,
+    now: number,
+    commit: BrowserCommandCommit,
+  ): Promise<ChatMetadataWriteResult<boolean>> {
+    const runtime = await import('./browser-catalog-command-runtime')
+    return runtime.moveChatRowsToFolder(await this.openDb(), chatIds, folderId, now, commit)
+  }
+
+  private async setChatRowsTagsFromNames(
+    chatIds: readonly ChatId[],
+    names: readonly string[],
+    now: number,
+    commit: BrowserCommandCommit,
+  ): Promise<ChatTagAssignmentResult> {
+    const runtime = await import('./browser-catalog-command-runtime')
+    return runtime.setChatRowsTagsFromNames(chatIds, names, now, commit)
+  }
+
+  private async clearChatCalibration(
+    command: Extract<WorkspaceCommand, { kind: 'chat.calibration.clear' }>,
+    commit: BrowserCommandCommit,
+  ): Promise<ChatMetadataWriteResult<boolean>> {
+    const runtime = await import('./browser-catalog-command-runtime')
+    return runtime.clearChatCalibration(command, commit)
+  }
+
+  private async clearCalibrationEverywhere(
+    command: Extract<
+      WorkspaceCommand,
+      { kind: 'chat.calibration.clear-family' | 'chat.calibration.clear-all' }
+    >,
+    commit: BrowserCommandCommit,
+  ): Promise<ChatCalibrationEverywhereResult> {
+    const runtime = await import('./browser-catalog-command-runtime')
+    return runtime.clearCalibrationEverywhere(await this.openDb(), command, commit)
+  }
+
+  private async deleteArchivedChatRows(
+    chatIds: readonly ChatId[],
+    now: number,
+    commit: BrowserCommandCommit,
+  ): Promise<DeleteArchivedChatMetadataResult> {
+    const runtime = await import('./browser-catalog-command-runtime')
+    return runtime.deleteArchivedChatRows(await this.openDb(), chatIds, now, commit)
+  }
+
+  private async emptyArchivedChatRows(
+    input: { afterChatId?: ChatId; limit: number; now: number },
+    commit: BrowserCommandCommit,
+  ) {
+    const runtime = await import('./browser-catalog-command-runtime')
+    return runtime.emptyArchivedChatRows(await this.openDb(), input, commit)
   }
 
   async listFolders(): Promise<ChatFolder[]> {
-    const db = await openDb()
-    return sortFolders(await db.folders.toArray())
+    const db = await this.openDb()
+    return sortChatFolders(await readStringPrimaryKeyPages(db.folders, (folder) => folder.id))
   }
 
-  async getFolder(folderId: FolderId): Promise<ChatFolder | undefined> {
-    const db = await openDb()
-    return db.folders.get(folderId)
-  }
-
-  async createFolder(input: CreateFolderInput): Promise<ChatFolder> {
-    const db = await openDb()
-    const now = input.now ?? Date.now()
-    const folder: ChatFolder = {
-      id: input.id ?? newId(),
-      name: normalizeName(input.name, 'Folder'),
-      sortIndex: input.sortIndex ?? now,
-      createdAt: now,
-      updatedAt: now,
-    }
-    if (input.color) folder.color = input.color
-
-    await withNamedLock(`folder:${folder.id}`, (grant) =>
-      grant.runTransaction(db, [db.folders, db.settings], async (tx: Transaction) => {
-        await tx.table<ChatFolder, FolderId>('folders').put(folder)
-        await bumpWorkspaceMeta(tx, now)
-      }),
-    )
-    postEvent({ kind: 'folder-mutated', folderId: folder.id })
-    return folder
+  async createFolder(input: CreateFolderInput, commit: BrowserCommandCommit): Promise<ChatFolder> {
+    const runtime = await import('./browser-catalog-command-runtime')
+    return runtime.createFolder(input, commit)
   }
 
   async updateFolder(
     folderId: FolderId,
     patch: UpdateFolderInput,
+    commit: BrowserCommandCommit,
   ): Promise<ChatFolder | undefined> {
-    const db = await openDb()
-    const now = patch.now ?? Date.now()
-    let next: ChatFolder | undefined
-    const result = { changed: false }
-    await withNamedLock(`folder:${folderId}`, (grant) =>
-      grant.runTransaction(db, [db.folders, db.settings], async (tx: Transaction) => {
-        const table = tx.table<ChatFolder, FolderId>('folders')
-        const current = await table.get(folderId)
-        if (!current) return
-        next = { ...current }
-        if (patch.name !== undefined) next.name = normalizeName(patch.name, 'Folder')
-        if (patch.color !== undefined) patchOptionalString(next, 'color', patch.color)
-        if (patch.sortIndex !== undefined) next.sortIndex = patch.sortIndex
-        if (patch.lastUsedAt !== undefined) {
-          patchOptionalNumber(next, 'lastUsedAt', patch.lastUsedAt)
-        }
-        if (stableStringify(current) === stableStringify(next)) return
-        next.updatedAt = now
-        result.changed = true
-        await table.put(next)
-        await bumpWorkspaceMeta(tx, now)
-      }),
-    )
-    if (result.changed) postEvent({ kind: 'folder-mutated', folderId })
-    return next
+    const runtime = await import('./browser-catalog-command-runtime')
+    return runtime.updateFolder(folderId, patch, commit)
   }
 
-  async deleteFolder(folderId: FolderId): Promise<DeleteFolderResult> {
-    const db = await openDb()
-    const now = Date.now()
-    const changedChats: Chat[] = []
-    const result = { deleted: false }
-    await withNamedLock(`folder:${folderId}`, (grant) =>
-      grant.runTransaction(
-        db,
-        [db.folders, db.chatSidebarRows, db.chats, db.settings],
-        async (tx: Transaction) => {
-          const folders = tx.table<ChatFolder, FolderId>('folders')
-          if (!(await folders.get(folderId))) return
-          await folders.delete(folderId)
-          result.deleted = true
+  private async ensureFolderAndMoveChats(
+    input: EnsureFolderAndMoveChatsInput,
+    commit: BrowserCommandCommit,
+  ): Promise<EnsureFolderAndMoveChatsResult> {
+    const runtime = await import('./browser-catalog-command-runtime')
+    return runtime.ensureFolderAndMoveChats(await this.openDb(), input, commit)
+  }
 
-          const chats = tx.table<Chat, ChatId>('chats')
-          const rows = await chats.where('folderId').equals(folderId).toArray()
-          for (const row of rows) {
-            const next: Chat = {
-              ...row,
-              folderId: null,
-              updatedAt: now,
-              metaVersion: row.metaVersion + 1,
-              summaryVersion: row.summaryVersion + 1,
-            }
-            await chats.put(next)
-            await putChatSidebarProjection(tx, next)
-            changedChats.push(next)
-          }
-          await bumpWorkspaceMeta(tx, now)
-        },
-      ),
-    )
-    if (result.deleted) {
-      postEvent({ kind: 'folder-deleted', folderId })
-      for (const chat of changedChats) {
-        postEvent({
-          kind: 'chat-mutated',
-          chatId: chat.id,
-          metaVersion: chat.metaVersion,
-          summaryVersion: chat.summaryVersion,
-          affected: [{ kind: 'chat-meta', chatId: chat.id }],
-        })
-      }
-    }
-    return { deleted: result.deleted, affectedChatIds: changedChats.map((chat) => chat.id) }
+  async deleteFolder(
+    folderId: FolderId,
+    chatDisposition: 'move-top-level' | 'archive',
+    now: number,
+    commit: BrowserCommandCommit,
+  ): Promise<DeleteFolderResult> {
+    const runtime = await import('./browser-catalog-command-runtime')
+    return runtime.deleteFolder(await this.openDb(), folderId, chatDisposition, now, commit)
   }
 
   async listTags(): Promise<ChatTag[]> {
-    const db = await openDb()
-    return sortTags(await db.tags.toArray())
-  }
-
-  async getTag(tagId: TagId): Promise<ChatTag | undefined> {
-    const db = await openDb()
-    return db.tags.get(tagId)
-  }
-
-  async createTag(input: CreateTagInput): Promise<ChatTag> {
-    const db = await openDb()
-    const now = input.now ?? Date.now()
-    const name = normalizeName(input.name, 'Tag')
-    const tag: ChatTag = {
-      id: input.id ?? newId(),
-      name,
-      nameLower: tagNameLower(name),
-      createdAt: now,
-      updatedAt: now,
-    }
-    if (input.color) tag.color = input.color
-
-    await withNamedLock(`tag:${tag.id}`, (grant) =>
-      grant.runTransaction(db, [db.tags, db.settings], async (tx: Transaction) => {
-        await tx.table<ChatTag, TagId>('tags').put(tag)
-        await bumpWorkspaceMeta(tx, now)
-      }),
-    )
-    postEvent({ kind: 'tag-mutated', tagId: tag.id })
-    return tag
-  }
-
-  async updateTag(tagId: TagId, patch: UpdateTagInput): Promise<ChatTag | undefined> {
-    const db = await openDb()
-    const now = patch.now ?? Date.now()
-    let next: ChatTag | undefined
-    const result = { changed: false }
-    await withNamedLock(`tag:${tagId}`, (grant) =>
-      grant.runTransaction(db, [db.tags, db.settings], async (tx: Transaction) => {
-        const table = tx.table<ChatTag, TagId>('tags')
-        const current = await table.get(tagId)
-        if (!current) return
-        next = { ...current }
-        if (patch.name !== undefined) {
-          next.name = normalizeName(patch.name, 'Tag')
-          next.nameLower = tagNameLower(next.name)
-        }
-        if (patch.color !== undefined) patchOptionalString(next, 'color', patch.color)
-        if (patch.lastUsedAt !== undefined) {
-          patchOptionalNumber(next, 'lastUsedAt', patch.lastUsedAt)
-        }
-        if (stableStringify(current) === stableStringify(next)) return
-        next.updatedAt = now
-        result.changed = true
-        await table.put(next)
-        await bumpWorkspaceMeta(tx, now)
-      }),
-    )
-    if (result.changed) postEvent({ kind: 'tag-mutated', tagId })
-    return next
-  }
-
-  async deleteTag(tagId: TagId): Promise<DeleteTagResult> {
-    const db = await openDb()
-    const now = Date.now()
-    const changedChats: Chat[] = []
-    const result = { deleted: false }
-    await withNamedLock(`tag:${tagId}`, (grant) =>
-      grant.runTransaction(
-        db,
-        [db.tags, db.chatSidebarRows, db.chats, db.settings],
-        async (tx: Transaction) => {
-          const tags = tx.table<ChatTag, TagId>('tags')
-          if (!(await tags.get(tagId))) return
-          await tags.delete(tagId)
-          result.deleted = true
-
-          const chats = tx.table<Chat, ChatId>('chats')
-          const rows = await chats.where('tags').equals(tagId).toArray()
-          for (const row of rows) {
-            const nextTags = row.tags.filter((id) => id !== tagId)
-            if (nextTags.length === row.tags.length) continue
-            const next: Chat = {
-              ...row,
-              tags: nextTags,
-              metaVersion: row.metaVersion + 1,
-            }
-            await chats.put(next)
-            await putChatSidebarProjection(tx, next)
-            changedChats.push(next)
-          }
-          await bumpWorkspaceMeta(tx, now)
-        },
-      ),
-    )
-    if (result.deleted) {
-      postEvent({ kind: 'tag-deleted', tagId })
-      for (const chat of changedChats) {
-        postEvent({
-          kind: 'chat-mutated',
-          chatId: chat.id,
-          metaVersion: chat.metaVersion,
-          summaryVersion: chat.summaryVersion,
-          affected: [{ kind: 'chat-meta', chatId: chat.id }],
-        })
-      }
-    }
-    return { deleted: result.deleted, affectedChatIds: changedChats.map((chat) => chat.id) }
-  }
-
-  async getChatBranchCache(chatId: ChatId): Promise<ChatBranchCache | undefined> {
-    const db = await openDb()
-    return db.chatBranchCache.get(chatId)
-  }
-
-  async putChatBranchCache(
-    cache: ChatBranchCache,
-    expected: ChatBranchCacheWriteGuard,
-  ): Promise<ChatBranchCache | undefined> {
-    if (expected.missingChat) throw new Error(`BranchCacheGuardMissingChat:${cache.chatId}`)
-    if (cache.branchLeafId !== expected.branchLeafId) {
-      throw new Error(`BranchCacheGuardLeafMismatch:${cache.chatId}`)
-    }
-    const db = await openDb()
-    const now = Date.now()
-    const guardedCache =
-      cache.generatedAt < expected.lastBranchUpdatedAt
-        ? { ...cache, generatedAt: expected.lastBranchUpdatedAt }
-        : cache
-    let written: ChatBranchCache | undefined
-    await withNamedLock(`branch-cache:${cache.chatId}`, (grant) =>
-      grant.runTransaction(
-        db,
-        [db.chatBranchCache, db.chats, db.settings],
-        async (tx: Transaction) => {
-          const [chat, meta] = await Promise.all([
-            tx.table<Chat, ChatId>('chats').get(cache.chatId),
-            readBrowserWorkspaceMetaFromTransaction(tx),
-          ])
-          if (
-            meta.replacementEpoch !== expected.replacementEpoch ||
-            !chat ||
-            !chatMatchesBranchCacheWriteGuard(chat, expected)
-          ) {
-            return
-          }
-          await tx.table<ChatBranchCache, ChatId>('chatBranchCache').put(guardedCache)
-          written = guardedCache
-          await bumpWorkspaceMeta(tx, now)
-        },
-      ),
-    )
-    if (written) postEvent({ kind: 'branch-cache-refreshed', chatId: cache.chatId })
-    return written
-  }
-
-  async deleteChatBranchCache(
-    chatId: ChatId,
-    expected?: ChatBranchCacheWriteGuard,
-  ): Promise<boolean> {
-    const db = await openDb()
-    const now = Date.now()
-    const result = { deleted: false }
-    await withNamedLock(`branch-cache:${chatId}`, (grant) =>
-      grant.runTransaction(
-        db,
-        expected ? [db.chatBranchCache, db.chats, db.settings] : [db.chatBranchCache, db.settings],
-        async (tx: Transaction) => {
-          if (expected) {
-            const [chat, meta] = await Promise.all([
-              tx.table<Chat, ChatId>('chats').get(chatId),
-              readBrowserWorkspaceMetaFromTransaction(tx),
-            ])
-            if (meta.replacementEpoch !== expected.replacementEpoch) return
-            if (
-              expected.missingChat
-                ? chat !== undefined
-                : !chat || !chatMatchesBranchCacheWriteGuard(chat, expected)
-            )
-              return
-          }
-          const table = tx.table<ChatBranchCache, ChatId>('chatBranchCache')
-          result.deleted = (await table.where(':id').equals(chatId).delete()) > 0
-          if (result.deleted) await bumpWorkspaceMeta(tx, now)
-        },
-      ),
-    )
-    if (result.deleted) postEvent({ kind: 'branch-cache-refreshed', chatId })
-    return result.deleted
+    const db = await this.openDb()
+    return sortTags(await readStringPrimaryKeyPages(db.tags, (tag) => tag.id))
   }
 
   async getMessage(
     messageId: MessageId,
     options: { signal?: AbortSignal } = {},
   ): Promise<Message | undefined> {
-    return readStoredMessage(messageId, options.signal, hydrateStoredMessage)
+    return readStoredMessage(await this.openDb(), messageId, options.signal, hydrateStoredMessage)
   }
 
-  async getMessagePresentationSnapshot(
-    messageId: MessageId,
-    options: { signal?: AbortSignal } = {},
-  ): Promise<MessagePresentationSnapshot | undefined> {
-    return readStoredMessage(messageId, options.signal, hydrateStoredMessagePresentationSnapshot)
-  }
-
-  async getMessageTextPreview(
-    messageId: MessageId,
+  async getMessageTextPreviewWindow(
+    targets: readonly MessageTextPreviewTarget[],
     options: { maxChars?: number; signal?: AbortSignal } = {},
-  ): Promise<string | undefined> {
+  ): Promise<Array<MessageTextPreviewSnapshot | undefined>> {
     throwIfReadonlyAborted(options.signal, 'Message preview read aborted')
-    const db = await openDb()
-    const maxChars = Math.min(4_096, Math.max(1, Math.floor(options.maxChars ?? 240)))
-    return db.transaction('r', db.messages, db.messageBodies, async (tx: Transaction) => {
-      const unbind = bindReadonlyTransactionAbort(
-        tx,
-        options.signal,
-        'Message preview read aborted',
-      )
-      try {
-        const [header, bodyKey] = await Promise.all([
-          db.messages.get(messageId),
-          db.messageBodies.where(':id').equals(messageId).firstKey(),
-        ])
-        throwIfReadonlyAborted(options.signal, 'Message preview read aborted')
-        if (!header || bodyKey === undefined) return undefined
-        return previewTextFromStoredProjection(header.textPreview, maxChars)
-      } finally {
-        unbind()
-      }
-    })
-  }
-
-  async searchChatMessageText(
-    chatId: ChatId,
-    query: string,
-    options: { signal?: AbortSignal } = {},
-  ): Promise<MessageId[]> {
-    if (query.length === 0) return []
-    if (options.signal?.aborted) throw new DOMException('Search aborted', 'AbortError')
-    const db = await openDb()
-    return db.transaction('r', db.messages, db.messageBodies, async () => {
-      const liveIds = new Set(
-        (await db.messages.where('chatId').equals(chatId).toArray())
-          .filter((header) => !header.deleted)
-          .map((header) => header.id),
-      )
-      const matches: MessageId[] = []
-      await db.messageBodies
-        .where('chatId')
-        .equals(chatId)
-        .each((body) => {
-          if (options.signal?.aborted) throw new DOMException('Search aborted', 'AbortError')
-          if (!liveIds.has(body.id)) return
-          if (contentIncludesCaseInsensitiveText(body.content, query, options.signal)) {
-            matches.push(body.id)
-          }
-        })
-      return matches
-    })
-  }
-
-  async listMessages(chatId: ChatId): Promise<Message[]> {
-    return openDb().then(async (db) => {
-      return db.transaction('r', db.messages, db.messageBodies, async () => {
-        const headers = await db.messages.where('chatId').equals(chatId).toArray()
-        return hydrateStoredMessages(headers, db.messageBodies)
-      })
-    })
+    if (targets.length === 0) return []
+    return readMessageTextPreviewWindow(await this.openDb(), targets, options)
   }
 
   async getMessageHeader(messageId: MessageId): Promise<MessageHeaderRow | undefined> {
-    const db = await openDb()
+    const db = await this.openDb()
     const header = await db.messages.get(messageId)
     return header ? cloneMessageHeader(header) : undefined
   }
@@ -2939,34 +5943,9 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     options: { signal?: AbortSignal } = {},
   ): Promise<Array<MessageHeaderRow | undefined>> {
     throwIfReadonlyAborted(options.signal, 'Header read aborted')
-    const db = await openDb()
-    return db.transaction('r', db.messages, async (tx: Transaction) => {
-      const unbind = bindReadonlyTransactionAbort(tx, options.signal, 'Header read aborted')
-      try {
-        const headers = await db.messages.bulkGet([...messageIds])
-        throwIfReadonlyAborted(options.signal, 'Header read aborted')
-        return headers.map((header) => (header ? cloneMessageHeader(header) : undefined))
-      } finally {
-        unbind()
-      }
-    })
-  }
-
-  async getSendContextRevisionSnapshot(
-    chatId: ChatId,
-    messageIds: readonly MessageId[],
-  ): Promise<SendContextRevisionSnapshot> {
-    const db = await openDb()
-    return db.transaction('r', db.chats, db.messages, async () => {
-      const [chat, headers] = await Promise.all([
-        db.chats.get(chatId),
-        db.messages.bulkGet([...messageIds]),
-      ])
-      return {
-        chat,
-        headers: headers.map((header) => (header ? cloneMessageHeader(header) : undefined)),
-      }
-    })
+    const db = await this.openDb()
+    const headers = await readBulkGetPages(db.messages, messageIds, options)
+    return headers.map((header) => (header ? cloneMessageHeader(header) : undefined))
   }
 
   async listMessageHeaders(
@@ -2974,1463 +5953,2165 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     options: { signal?: AbortSignal } = {},
   ): Promise<MessageHeaderRow[]> {
     throwIfReadonlyAborted(options.signal, 'Header read aborted')
-    const db = await openDb()
-    return db.transaction('r', db.messages, async (tx: Transaction) => {
-      const unbind = bindReadonlyTransactionAbort(tx, options.signal, 'Header read aborted')
-      try {
-        const headers = await db.messages.where('chatId').equals(chatId).toArray()
-        throwIfReadonlyAborted(options.signal, 'Header read aborted')
-        return headers.map(cloneMessageHeader)
-      } finally {
-        unbind()
-      }
-    })
+    const db = await this.openDb()
+    const headers = await readChatMessageHeaderPages(db, chatId, options)
+    throwIfReadonlyAborted(options.signal, 'Header read aborted')
+    return headers.map(cloneMessageHeader)
   }
 
-  async listChildHeaders(chatId: ChatId, parentId: MessageId | null): Promise<MessageHeaderRow[]> {
-    const db = await openDb()
-    return (await listChildHeaderRows(db.messages, chatId, parentId)).map(cloneMessageHeader)
-  }
-
-  async getActiveBranchSnapshot(
+  async listChildHeaders(
     chatId: ChatId,
-    cursor: Record<string, MessageId>,
-  ): Promise<ActiveBranchSnapshot> {
-    const db = await openDb()
-    return db.transaction('r', db.messages, db.messageBodies, async () => {
-      const headers = await db.messages.where('chatId').equals(chatId).toArray()
-      const branchHeaders = activePath(headers as unknown as Message[], cursor).map(
-        (message) => message as unknown as MessageHeaderRow,
-      )
-      const bodies = (
-        await db.messageBodies.bulkGet(branchHeaders.map((header) => header.id))
-      ).filter((row): row is MessageBodyRow => row !== undefined)
-      return {
-        chatId,
-        allHeaders: headers.map(cloneMessageHeader),
-        branchHeaders: branchHeaders.map(cloneMessageHeader),
-        branch: hydrateMessages(branchHeaders.map(cloneMessageHeader), bodies),
-        siblingGroups: siblingGroupsForBranch(headers, branchHeaders),
-        treeKey: messageHeaderTreeKey(headers),
-      }
-    })
+    parentId: MessageId | null,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<MessageHeaderRow[]> {
+    const rows = await readChildHeaderPages(await this.openDb(), chatId, parentId, options)
+    return rows.map(cloneMessageHeader)
   }
 
-  async getKnownBranchPageSnapshot(
+  private async readConversationStructuralFrame(
+    db: NatterDb,
+    permit: WorkspaceReadAuthority,
     chatId: ChatId,
-    pathMessageIds: readonly MessageId[],
-    page: ActiveBranchBodyPage,
-  ): Promise<KnownBranchPageResult> {
-    const branchLength = pathMessageIds.length
-    const range = branchWindowRange(branchLength, page)
-    const pageMessageIds = pathMessageIds.slice(range.start, range.end)
-    const boundaryParentId = range.start === 0 ? null : pathMessageIds[range.start - 1]
-    throwIfReadonlyAborted(page.signal, 'Branch page read aborted')
-    const db = await openDb()
-    return db.transaction('r', db.messages, db.messageBodies, async (tx: Transaction) => {
-      const unbind = bindReadonlyTransactionAbort(tx, page.signal, 'Branch page read aborted')
+    signal?: AbortSignal,
+  ) {
+    return db.transaction('r', [db.workspaceFence, db.chats], async (tx: Transaction) => {
+      const unbind = bindReadonlyTransactionAbort(tx, signal, 'Conversation frame read aborted')
       try {
-        if (branchLength === 0) {
-          return { kind: 'stale-path', chatId, reason: 'empty-path' }
-        }
-
-        const seen = new Set<MessageId>()
-        for (const messageId of pageMessageIds) {
-          if (seen.has(messageId)) {
-            return { kind: 'stale-path', chatId, reason: 'duplicate-id', messageId }
-          }
-          seen.add(messageId)
-        }
-
-        const storedHeaders = await db.messages.bulkGet(pageMessageIds)
-        throwIfReadonlyAborted(page.signal, 'Branch page read aborted')
-        const pageHeaders: MessageHeaderRow[] = []
-        for (let index = 0; index < pageMessageIds.length; index += 1) {
-          const messageId = pageMessageIds[index] as MessageId
-          const header = storedHeaders[index]
-          if (!header || header.id !== messageId) {
-            return { kind: 'stale-path', chatId, reason: 'missing-header', messageId }
-          }
-          if (header.chatId !== chatId) {
-            return { kind: 'stale-path', chatId, reason: 'wrong-chat', messageId }
-          }
-          if (header.deleted) {
-            return { kind: 'stale-path', chatId, reason: 'deleted-header', messageId }
-          }
-          const expectedParentId = index === 0 ? boundaryParentId : pageMessageIds[index - 1]
-          if (header.parentId !== expectedParentId) {
-            return {
-              kind: 'stale-path',
-              chatId,
-              reason: range.start === 0 && index === 0 ? 'non-root' : 'non-contiguous',
-              messageId,
-            }
-          }
-          pageHeaders.push(cloneMessageHeader(header))
-        }
-
-        const bodies = await db.messageBodies.bulkGet(pageMessageIds)
-        throwIfReadonlyAborted(page.signal, 'Branch page read aborted')
-        const pageMessages: Message[] = []
-        for (let index = 0; index < pageHeaders.length; index += 1) {
-          const header = pageHeaders[index] as MessageHeaderRow
-          const body = bodies[index]
-          if (!body) {
-            return { kind: 'stale-path', chatId, reason: 'missing-body', messageId: header.id }
-          }
-          if (
-            body.id !== header.id ||
-            body.chatId !== chatId ||
-            body.bodyVersion !== header.bodyVersion
-          ) {
-            return {
-              kind: 'stale-path',
-              chatId,
-              reason: 'body-version-mismatch',
-              messageId: header.id,
-            }
-          }
-          pageMessages.push(hydrateMessage(header, body))
-        }
-
-        page.onMeasure?.({
-          pageHeaderRowsRead: storedHeaders.length,
-          bodyRowsRead: bodies.length,
+        const [workspace, chat] = await Promise.all([
+          readBrowserWorkspaceMetaFromTransaction(tx),
+          tx.table<Chat, ChatId>('chats').get(chatId),
+        ])
+        assertPermitFence(permit, workspace)
+        throwIfReadonlyAborted(signal, 'Conversation frame read aborted')
+        return Object.freeze({
+          workspace,
+          chat: chat ? Object.freeze(structuredClone(chat)) : undefined,
         })
-        return {
-          kind: 'ready',
-          snapshot: {
-            chatId,
-            pageHeaders,
-            pageMessages,
-            pageOffset: range.start,
-            pageLimit: range.limit,
-            branchLength,
-          },
-        }
       } finally {
         unbind()
       }
     })
   }
 
-  async getBranchHeaderSnapshotByLeaf(
+  private async readConversationOpenFrame<T>(
+    db: NatterDb,
+    permit: WorkspaceReadAuthority,
     chatId: ChatId,
-    leafId: MessageId | null,
-  ): Promise<BranchHeaderSnapshot> {
-    const db = await openDb()
-    return db.transaction('r', db.chats, db.messages, async (tx: Transaction) => {
-      const [chat, branchHeaders] = await Promise.all([
-        db.chats.get(chatId),
-        branchHeadersByLeafInTransaction(tx, chatId, leafId),
-      ])
-      if (!chat) throw new ChatMissingError(chatId)
-      return {
-        chat,
-        chatId,
-        branchHeaders,
+    expectedStructuralVersion: number,
+    stores: readonly ConversationOpenFrameStore[],
+    signal: AbortSignal | undefined,
+    read: (tx: Transaction) => Promise<T>,
+  ) {
+    const payloadTables: Table[] = stores.map((store) => {
+      switch (store) {
+        case 'messages':
+          return db.messages
+        case 'messageBodies':
+          return db.messageBodies
+        case 'childLists':
+          return db.childLists
+        case 'childSlotMembers':
+          return db.childSlotMembers
+        default:
+          return assertNever(store)
       }
     })
+    return db.transaction(
+      'r',
+      [db.workspaceFence, db.chats, ...new Set(payloadTables)],
+      async (tx: Transaction) => {
+        const unbind = bindReadonlyTransactionAbort(tx, signal, 'Conversation frame read aborted')
+        try {
+          const workspace = await readBrowserWorkspaceMetaFromTransaction(tx)
+          const chat = await tx.table<Chat, ChatId>('chats').get(chatId)
+          assertPermitFence(permit, workspace)
+          throwIfReadonlyAborted(signal, 'Conversation frame read aborted')
+          if (!chat || chat.structuralVersion !== expectedStructuralVersion) {
+            return Object.freeze({ kind: 'stale' as const })
+          }
+          const value = await read(tx)
+          throwIfReadonlyAborted(signal, 'Conversation frame read aborted')
+          return Object.freeze({ kind: 'ready' as const, value })
+        } finally {
+          unbind()
+        }
+      },
+    )
   }
 
-  async getBranchByLeaf(chatId: ChatId, leafId: MessageId | null): Promise<Message[]> {
-    const db = await openDb()
-    return db.transaction('r', db.messages, db.messageBodies, async () => {
-      const headers = await db.messages.where('chatId').equals(chatId).toArray()
-      const branchHeaders = branchHeadersByLeaf(headers, leafId)
-      return hydrateStoredMessages(branchHeaders, db.messageBodies)
+  private async readConversationTopologyEnvelope(
+    permit: WorkspaceReadAuthority,
+    chatId: ChatId,
+    signal?: AbortSignal,
+  ): Promise<ReadEnvelope<ConversationTopologyResult>> {
+    throwIfReadonlyAborted(signal, 'Conversation topology read aborted')
+    const db = await this.openDb()
+    const initial = await this.readConversationStructuralFrame(db, permit, chatId, signal)
+    const headers = initial.chat
+      ? await readChatMessageHeaderPages(db, chatId, signal ? { signal } : {})
+      : []
+    const final = await this.readConversationStructuralFrame(db, permit, chatId, signal)
+    const value: ConversationTopologyResult =
+      initial.chat === undefined
+        ? final.chat === undefined
+          ? Object.freeze({ kind: 'missing', chatId })
+          : Object.freeze({ kind: 'stale' })
+        : final.chat === undefined ||
+            initial.chat.structuralVersion !== final.chat.structuralVersion
+          ? Object.freeze({ kind: 'stale' })
+          : Object.freeze({
+              kind: 'ready',
+              chat: structuredClone(final.chat),
+              structuralVersion: final.chat.structuralVersion,
+              headers: Object.freeze(headers.map(cloneMessageHeader)),
+            })
+    return {
+      workspaceId: final.workspace.workspaceId,
+      replacementEpoch: final.workspace.replacementEpoch,
+      value,
+    }
+  }
+
+  private async readConversationPageStructureEnvelope(
+    permit: WorkspaceReadAuthority,
+    chatId: ChatId,
+    resolvedTipId: MessageId,
+    structuralVersion: number,
+    pathWindow: BranchPathWindow<MessageHeaderRow>,
+    signal?: AbortSignal,
+  ) {
+    if (pathWindow.nodes.length > TRANSCRIPT_BODY_READ_BATCH_ROWS) {
+      throw new Error('BranchPageBatchTooLarge')
+    }
+    const branchLength = pathWindow.branchLength
+    const pageMessageIds = pathWindow.nodes.map((header) => header.id)
+    const boundaryParentId = pathWindow.boundaryParentId
+    throwIfReadonlyAborted(signal, 'Branch page structure read aborted')
+    const db = await this.openDb()
+    return db.transaction(
+      'r',
+      [db.workspaceFence, db.chats, db.messages],
+      async (tx: Transaction) => {
+        const unbind = bindReadonlyTransactionAbort(
+          tx,
+          signal,
+          'Branch page structure read aborted',
+        )
+        try {
+          const [workspace, chat, storedHeaders] = await Promise.all([
+            readBrowserWorkspaceMetaFromTransaction(tx),
+            tx.table<Chat, ChatId>('chats').get(chatId),
+            tx.table<MessageHeaderRow, MessageId>('messages').bulkGet(pageMessageIds),
+          ])
+          assertPermitFence(permit, workspace)
+          throwIfReadonlyAborted(signal, 'Branch page structure read aborted')
+          const structuralValue: KnownBranchPageStructuralResult = (() => {
+            if (branchLength === 0) {
+              return { kind: 'stale-path', chatId, reason: 'empty-path' }
+            }
+            if (
+              pathWindow.offset + pathWindow.nodes.length === branchLength &&
+              pathWindow.nodes.at(-1)?.id !== resolvedTipId
+            ) {
+              return { kind: 'stale-path', chatId, reason: 'non-contiguous' }
+            }
+
+            const seen = new Set<MessageId>()
+            const pageHeaders: MessageHeaderRow[] = []
+            if (!chat) return { kind: 'stale-path', chatId, reason: 'chat-missing' }
+            if (chat.structuralVersion !== structuralVersion) {
+              return { kind: 'stale-path', chatId, reason: 'structural-version-mismatch' }
+            }
+            for (let index = 0; index < pathWindow.nodes.length; index += 1) {
+              const expectedHeader = pathWindow.nodes[index] as MessageHeaderRow
+              const header = storedHeaders[index]
+              if (!header) {
+                return {
+                  kind: 'stale-path',
+                  chatId,
+                  reason: 'missing-header',
+                  messageId: expectedHeader.id,
+                }
+              }
+              if (seen.has(header.id)) {
+                return {
+                  kind: 'stale-path',
+                  chatId,
+                  reason: 'duplicate-id',
+                  messageId: header.id,
+                }
+              }
+              seen.add(header.id)
+              if (header.chatId !== chatId) {
+                return {
+                  kind: 'stale-path',
+                  chatId,
+                  reason: 'wrong-chat',
+                  messageId: header.id,
+                }
+              }
+              if (header.deleted) {
+                return {
+                  kind: 'stale-path',
+                  chatId,
+                  reason: 'deleted-header',
+                  messageId: header.id,
+                }
+              }
+              const expectedParentId =
+                index === 0 ? boundaryParentId : (pathWindow.nodes[index - 1]?.id ?? null)
+              if (
+                !sameMessageHeaderStructure(header, expectedHeader) ||
+                header.parentId !== expectedParentId
+              ) {
+                return {
+                  kind: 'stale-path',
+                  chatId,
+                  reason:
+                    header.parentId !== expectedParentId && pathWindow.offset === 0 && index === 0
+                      ? 'non-root'
+                      : 'non-contiguous',
+                  messageId: header.id,
+                }
+              }
+              pageHeaders.push(cloneMessageHeader(header))
+            }
+
+            return {
+              kind: 'ready',
+              snapshot: {
+                chatId,
+                pageHeaders,
+                pageOffset: pathWindow.offset,
+                pageLimit: pathWindow.limit,
+                branchLength,
+              },
+            }
+          })()
+          assertWorkspaceReadPermit(permit)
+          throwIfReadonlyAborted(signal, 'Branch page structure read aborted')
+          return {
+            workspaceId: workspace.workspaceId,
+            replacementEpoch: workspace.replacementEpoch,
+            value: Object.freeze(structuralValue),
+          }
+        } finally {
+          unbind()
+        }
+      },
+    )
+  }
+
+  private async readConversationOpenEnvelope(
+    permit: WorkspaceReadAuthority,
+    chatId: ChatId,
+    target: ConversationSelectionProofTarget,
+    bodyDemand: 'terminal' | 'none',
+    onStage?: (stage: ReadEnvelope<ConversationDestinationPoint>) => void,
+    signal?: AbortSignal,
+  ) {
+    throwIfReadonlyAborted(signal, 'Conversation open read aborted')
+    const db = await this.openDb()
+    let stageDelivered = false
+    const initial = await db.transaction(
+      'r',
+      [db.workspaceFence, db.chats, db.messages, db.childLists, db.childSlotMembers],
+      async (tx: Transaction) => {
+        const unbind = bindReadonlyTransactionAbort(tx, signal, 'Conversation open read aborted')
+        try {
+          const workspace = await readBrowserWorkspaceMetaFromTransaction(tx)
+          const chat = await tx.table<Chat, ChatId>('chats').get(chatId)
+          assertPermitFence(permit, workspace)
+          const receipt = await readConversationOpenInitialReceiptInTransaction(
+            tx,
+            chatId,
+            chat ? Object.freeze(structuredClone(chat)) : undefined,
+            target,
+            signal,
+          )
+          throwIfReadonlyAborted(signal, 'Conversation open read aborted')
+          return Object.freeze({ workspace, receipt })
+        } finally {
+          unbind()
+        }
+      },
+    )
+    const expectedStructuralVersion =
+      initial.receipt.kind === 'missing' ? -1 : initial.receipt.chat.structuralVersion
+    const result = await resolveConversationOpenReceipt(
+      {
+        runFrame: (stores, read) =>
+          this.readConversationOpenFrame(
+            db,
+            permit,
+            chatId,
+            expectedStructuralVersion,
+            stores,
+            signal,
+            read,
+          ),
+        readTerminalPresentation: (messageId, bodySignal) =>
+          this.readConversationOpenFrame(
+            db,
+            permit,
+            chatId,
+            expectedStructuralVersion,
+            ['messages', 'messageBodies'],
+            bodySignal,
+            async (tx) => {
+              const [header, body] = await Promise.all([
+                tx.table<MessageHeaderRow, MessageId>('messages').get(messageId),
+                tx.table<MessageBodyRow, MessageId>('messageBodies').get(messageId),
+              ])
+              if (!header || !body) return undefined
+              const clonedHeader = cloneMessageHeader(header)
+              return Object.freeze({
+                header: clonedHeader,
+                message: hydrateMessageWithOwnedBody(clonedHeader, body),
+                bodyVersion: clonedHeader.bodyVersion,
+              })
+            },
+          ),
+      },
+      initial.receipt,
+      bodyDemand,
+      onStage
+        ? (point) => {
+            if (stageDelivered) return
+            assertWorkspaceReadPermit(permit)
+            throwIfReadonlyAborted(signal, 'Conversation open read aborted')
+            const currentTransaction = (
+              Dexie as unknown as { readonly currentTransaction?: Transaction }
+            ).currentTransaction
+            if (currentTransaction) {
+              throw new Error('ConversationOpenStageTransactionLeak')
+            }
+            stageDelivered = true
+            const stage = Object.freeze({
+              workspaceId: initial.workspace.workspaceId,
+              replacementEpoch: initial.workspace.replacementEpoch,
+              value: point,
+            })
+            try {
+              onStage(stage)
+            } catch {
+              // The terminal point is an optional latency stage; the sealed final result
+              // remains authoritative if its consumer has already moved on.
+            }
+          }
+        : undefined,
+      signal,
+    )
+    assertWorkspaceReadPermit(permit)
+    throwIfReadonlyAborted(signal, 'Conversation open read aborted')
+    return {
+      workspaceId: initial.workspace.workspaceId,
+      replacementEpoch: initial.workspace.replacementEpoch,
+      value: result,
+    }
+  }
+
+  private async readConversationForksEnvelope(
+    permit: WorkspaceReadAuthority,
+    chatId: ChatId,
+    structuralVersion: number,
+    targets: readonly ActiveBranchForkTarget[],
+    signal?: AbortSignal,
+  ): Promise<ReadEnvelope<ConversationForksResult>> {
+    throwIfReadonlyAborted(signal, 'Active branch fork read aborted')
+    const db = await this.openDb()
+    return db.transaction(
+      'r',
+      [db.workspaceFence, db.chats, db.messages, db.childLists, db.childSlotMembers],
+      async (tx: Transaction) => {
+        const unbind = bindReadonlyTransactionAbort(tx, signal, 'Active branch fork read aborted')
+        try {
+          const [workspace, chat] = await Promise.all([
+            readBrowserWorkspaceMetaFromTransaction(tx),
+            tx.table<Chat, ChatId>('chats').get(chatId),
+          ])
+          assertPermitFence(permit, workspace)
+          const value: ConversationForksResult =
+            !chat || chat.structuralVersion !== structuralVersion
+              ? Object.freeze({ kind: 'stale-selection' })
+              : Object.freeze({
+                  kind: 'ready',
+                  structuralVersion,
+                  forks: await readActiveBranchForksInTransaction(tx, chatId, targets, signal),
+                })
+          assertWorkspaceReadPermit(permit)
+          throwIfReadonlyAborted(signal, 'Active branch fork read aborted')
+          return {
+            workspaceId: workspace.workspaceId,
+            replacementEpoch: workspace.replacementEpoch,
+            value,
+          }
+        } finally {
+          unbind()
+        }
+      },
+    )
+  }
+
+  async getActiveBranchChildAtPosition(
+    chatId: ChatId,
+    parentId: MessageId | null,
+    position: number,
+    signal?: AbortSignal,
+  ): Promise<MessageId | null> {
+    throwIfReadonlyAborted(signal, 'Active branch child position read aborted')
+    const db = await this.openDb()
+    return db.transaction(
+      'r',
+      [db.messages, db.childLists, db.childSlotMembers],
+      async (tx: Transaction) => {
+        const unbind = bindReadonlyTransactionAbort(
+          tx,
+          signal,
+          'Active branch child position read aborted',
+        )
+        try {
+          return await readActiveBranchChildAtPositionInTransaction(
+            tx,
+            chatId,
+            parentId,
+            position,
+            signal,
+          )
+        } finally {
+          unbind()
+        }
+      },
+    )
+  }
+
+  private async writeAttachmentBundle(
+    input: AttachmentBundleWriteInput,
+    commit: BrowserCommandCommit,
+  ): Promise<AttachmentBundleWriteResult> {
+    const { bundle, mode } = input
+    const contentLock = bundle.attachment.contentHash
+      ? `attachment-content:${bundle.attachment.contentHash}:${bundle.attachment.filename}`
+      : `attachment-id:${bundle.attachment.id}`
+    const mutation = await this.runMutation(
+      [{ kind: 'attachment', attachmentId: bundle.attachment.id }],
+      async (ctx) => {
+        if ((mode === 'dedupe' || mode === 'dedupe-or-replace') && bundle.attachment.contentHash) {
+          const duplicateId = await ctx.findAttachmentIdByContentHash(
+            bundle.attachment.filename,
+            bundle.attachment.contentHash,
+          )
+          if (duplicateId) {
+            return { attachmentId: duplicateId, outcome: 'existing' as const }
+          }
+        }
+        const current = await ctx.getAttachment(bundle.attachment.id)
+        if (current && (mode === 'put-if-absent' || mode === 'dedupe')) {
+          return { attachmentId: current.id, outcome: 'existing' as const }
+        }
+        if ((mode === 'replace' || mode === 'dedupe-or-replace') && !current) {
+          throw new Error(`AttachmentMissing:${bundle.attachment.id}`)
+        }
+        if (current && (mode === 'replace' || mode === 'dedupe-or-replace' || mode === 'put')) {
+          await ctx.deleteAttachmentBlobs(current.id)
+          await ctx.deleteAttachmentArtifacts(current.id)
+          await ctx.deleteAttachmentJobs(current.id)
+        }
+        await persistPreparedAttachmentBundleInMutation(ctx, bundle, current)
+        return { attachmentId: bundle.attachment.id, outcome: 'written' as const }
+      },
+      { additionalLockNames: [contentLock] },
+      commit,
+    )
+    return mutation.value
+  }
+
+  private async addAttachmentReference(
+    input: AttachmentRefAddInput,
+    commit: BrowserCommandCommit,
+  ): Promise<AttachmentRefWriteResult> {
+    const scopes = attachmentOwnerScopes(input.owner, [input.ref.attachmentId])
+    const mutation = await this.runMutation(
+      scopes,
+      async (ctx) => {
+        if (!(await ctx.getAttachment(input.ref.attachmentId))) {
+          throw new Error(`AttachmentMissing:${input.ref.attachmentId}`)
+        }
+        if (input.owner.kind === 'message') {
+          const message = await attachmentOwnerMessage(ctx, input.owner)
+          const refs = normalizeAttachmentRefs(message.attachmentRefs, {
+            messageId: message.id,
+            createdAt: message.createdAt,
+          })
+          if (refs.some((ref) => ref.refId === input.ref.refId)) {
+            throw new Error(`AttachmentRefAlreadyExists:${input.ref.refId}`)
+          }
+          const nextRefs = insertAttachmentRef(refs, input.ref, input.afterRefId)
+          const written = await ctx.putMessage(
+            messageWithWorkspaceAttachmentRefs(message, nextRefs),
+            {
+              touchChatSummary: false,
+            },
+          )
+          return attachmentMessageRefResult(ctx, written, input.ref)
+        }
+        const current =
+          (await ctx.getDraft(input.owner.chatId)) ??
+          ({
+            chatId: input.owner.chatId,
+            text: '',
+            attachmentRefs: [],
+            updatedAt: 0,
+          } satisfies DraftRow)
+        const refs = normalizeAttachmentRefs(current.attachmentRefs, {
+          draftChatId: current.chatId,
+          createdAt: current.updatedAt,
+        })
+        if (refs.some((ref) => ref.refId === input.ref.refId)) {
+          throw new Error(`AttachmentRefAlreadyExists:${input.ref.refId}`)
+        }
+        const draft = {
+          ...current,
+          attachmentRefs: insertAttachmentRef(refs, input.ref, input.afterRefId),
+          updatedAt: strictlyMonotonicTimestamp(current.updatedAt, input.now),
+        }
+        await ctx.putDraft(draft)
+        return { ref: input.ref, draft }
+      },
+      undefined,
+      commit,
+    )
+    return mutation.value
+  }
+
+  private async setAttachmentReferenceVisibility(
+    input: AttachmentRefVisibilityInput,
+    commit: BrowserCommandCommit,
+  ): Promise<AttachmentRefWriteResult> {
+    return this.mutateSingleAttachmentReference(
+      input.owner,
+      input.expectedAttachmentId,
+      commit,
+      (ref) => ({ ...ref, includeInContext: input.includeInContext, updatedAt: input.now }),
+      input.refId,
+    )
+  }
+
+  private async detachAttachmentReference(
+    input: AttachmentRefDetachInput,
+    commit: BrowserCommandCommit,
+  ): Promise<AttachmentRefWriteResult> {
+    return this.mutateSingleAttachmentReference(
+      input.owner,
+      input.expectedAttachmentId,
+      commit,
+      () => undefined,
+      input.refId,
+      input.now,
+    )
+  }
+
+  private async mutateSingleAttachmentReference(
+    owner: AttachmentRefOwner,
+    expectedAttachmentId: AttachmentId,
+    commit: BrowserCommandCommit,
+    mutate: (ref: MessageAttachmentRef) => MessageAttachmentRef | undefined,
+    refId: string,
+    now = Date.now(),
+  ): Promise<AttachmentRefWriteResult> {
+    const mutation = await this.runMutation(
+      attachmentOwnerScopes(owner, [expectedAttachmentId]),
+      async (ctx) => {
+        if (owner.kind === 'message') {
+          const message = await attachmentOwnerMessage(ctx, owner)
+          const refs = normalizeAttachmentRefs(message.attachmentRefs, {
+            messageId: message.id,
+            createdAt: message.createdAt,
+          })
+          const index = refs.findIndex((ref) => ref.refId === refId)
+          if (index < 0) return {}
+          const existing = refs[index] as MessageAttachmentRef
+          assertExpectedAttachmentReference(existing, expectedAttachmentId)
+          const updated = mutate(existing)
+          const nextRefs = [...refs]
+          if (updated) nextRefs[index] = updated
+          else nextRefs.splice(index, 1)
+          const written = await ctx.putMessage(
+            messageWithWorkspaceAttachmentRefs(message, nextRefs),
+            {
+              touchChatSummary: false,
+            },
+          )
+          return attachmentMessageRefResult(ctx, written, updated)
+        }
+        const draft = await ctx.getDraft(owner.chatId)
+        if (!draft) return {}
+        const refs = normalizeAttachmentRefs(draft.attachmentRefs, {
+          draftChatId: draft.chatId,
+          createdAt: draft.updatedAt,
+        })
+        const index = refs.findIndex((ref) => ref.refId === refId)
+        if (index < 0) return {}
+        const existing = refs[index] as MessageAttachmentRef
+        assertExpectedAttachmentReference(existing, expectedAttachmentId)
+        const updated = mutate(existing)
+        const nextRefs = [...refs]
+        if (updated) nextRefs[index] = updated
+        else nextRefs.splice(index, 1)
+        const next = {
+          ...draft,
+          attachmentRefs: nextRefs,
+          updatedAt: strictlyMonotonicTimestamp(draft.updatedAt, now),
+        }
+        await ctx.putDraft(next)
+        return { ...(updated ? { ref: updated } : {}), draft: next }
+      },
+      undefined,
+      commit,
+    )
+    return mutation.value
+  }
+
+  private async relinkAttachmentReferences(
+    input: AttachmentRefRelinkInput,
+    commit: BrowserCommandCommit,
+  ): Promise<AttachmentRefRelinkResult> {
+    const attachmentIds = [
+      input.newAttachmentId,
+      ...input.refs.map((ref) => ref.expectedAttachmentId),
+      ...(input.supersedeAttachmentId ? [input.supersedeAttachmentId] : []),
+    ]
+    const scopes = dedupeMutationScopes([
+      ...input.refs.flatMap((ref) => attachmentOwnerScopes(ref.owner)),
+      ...attachmentIds.map((attachmentId) => ({
+        kind: 'attachment' as const,
+        attachmentId,
+      })),
+    ])
+    const mutation = await this.runMutation(
+      scopes,
+      async (ctx) => {
+        if (!(await ctx.getAttachment(input.newAttachmentId))) {
+          throw new Error(`AttachmentMissing:${input.newAttachmentId}`)
+        }
+        const grouped = groupAttachmentRelinkSpecs(input.refs)
+        const updatedByInput = new Map<number, MessageAttachmentRef>()
+        const presentations: MessagePresentation[] = []
+        const drafts: DraftRow[] = []
+        for (const group of grouped.values()) {
+          if (group.owner.kind === 'message') {
+            const message = await attachmentOwnerMessage(ctx, group.owner)
+            const refs = normalizeAttachmentRefs(message.attachmentRefs, {
+              messageId: message.id,
+              createdAt: message.createdAt,
+            })
+            const nextRefs = applyAttachmentRelinks(
+              refs,
+              group.specs,
+              input.newAttachmentId,
+              input.now,
+              updatedByInput,
+            )
+            const written = await ctx.putMessage(
+              messageWithWorkspaceAttachmentRefs(message, nextRefs),
+              {
+                touchChatSummary: false,
+              },
+            )
+            const result = await attachmentMessageRefResult(ctx, written)
+            if (result.presentation) presentations.push(result.presentation)
+          } else {
+            const draft = await ctx.getDraft(group.owner.chatId)
+            if (!draft) throw new Error(`DraftMissing:${group.owner.chatId}`)
+            const refs = normalizeAttachmentRefs(draft.attachmentRefs, {
+              draftChatId: draft.chatId,
+              createdAt: draft.updatedAt,
+            })
+            const next = {
+              ...draft,
+              attachmentRefs: applyAttachmentRelinks(
+                refs,
+                group.specs,
+                input.newAttachmentId,
+                input.now,
+                updatedByInput,
+              ),
+              updatedAt: strictlyMonotonicTimestamp(draft.updatedAt, input.now),
+            }
+            await ctx.putDraft(next)
+            drafts.push(next)
+          }
+        }
+        if (input.supersedeAttachmentId) {
+          const superseded = await ctx.getAttachment(input.supersedeAttachmentId)
+          if (!superseded) {
+            throw new Error(`AttachmentMissing:${input.supersedeAttachmentId}`)
+          }
+          await ctx.putAttachment({
+            ...superseded,
+            supersededByAttachmentId: input.newAttachmentId,
+            updatedAt: input.now,
+          })
+        }
+        return {
+          refs: input.refs.map((_, index) => {
+            const ref = updatedByInput.get(index)
+            if (!ref) throw new Error(`AttachmentRelinkResultMissing:${index}`)
+            return ref
+          }),
+          presentations,
+          drafts,
+        }
+      },
+      undefined,
+      commit,
+    )
+    return mutation.value
+  }
+
+  private async deleteAttachmentBytes(
+    input: AttachmentDeleteBytesInput,
+    commit: BrowserCommandCommit,
+  ): Promise<Attachment | undefined> {
+    const mutation = await this.runMutation(
+      [{ kind: 'attachment', attachmentId: input.attachmentId }],
+      async (ctx) => {
+        const current = await ctx.getAttachment(input.attachmentId)
+        if (!current) return undefined
+        return this.deleteAttachmentBytesInMutation(ctx, current, input.reason, input.now)
+      },
+      undefined,
+      commit,
+    )
+    return mutation.value
+  }
+
+  private async deleteAttachmentBytesInMutation(
+    ctx: MutationContext,
+    current: Attachment,
+    reason: AttachmentDeleteBytesInput['reason'],
+    now: number,
+  ): Promise<Attachment> {
+    const [artifacts, jobs] = await Promise.all([
+      ctx.getAttachmentArtifacts(current.id),
+      ctx.getAttachmentJobs(current.id),
+    ])
+    const retainedArtifacts = artifacts.filter((artifact) => artifact.kind !== 'blob')
+    const retainedArtifactIds = new Set(retainedArtifacts.map((artifact) => artifact.artifactId))
+    await ctx.deleteAttachmentBlobs(current.id)
+    for (const artifact of artifacts) {
+      if (artifact.kind === 'blob') await ctx.deleteAttachmentArtifact(artifact.artifactId)
+    }
+    for (const job of jobs) {
+      const outputArtifactIds = job.outputArtifactIds.filter((id) => retainedArtifactIds.has(id))
+      if (job.outputArtifactIds.length > 0 && outputArtifactIds.length === 0) {
+        await ctx.deleteAttachmentJob(job.id)
+      } else if (!sameOrderedValues(outputArtifactIds, job.outputArtifactIds)) {
+        await ctx.putAttachmentJob({ ...job, outputArtifactIds, updatedAt: now })
+      }
+    }
+    const processing = current.processing.flatMap((state) => {
+      const outputArtifactIds = state.outputArtifactIds.filter((id) => retainedArtifactIds.has(id))
+      return state.outputArtifactIds.length > 0 && outputArtifactIds.length === 0
+        ? []
+        : [{ ...state, outputArtifactIds }]
     })
+    const next = missingAttachmentAfterByteDeletion(
+      current,
+      reason,
+      now,
+      retainedArtifacts,
+      processing,
+    )
+    await ctx.putAttachment(next)
+    return next
+  }
+
+  private async deleteAttachmentIfUnreferenced(
+    attachmentId: AttachmentId,
+    commit: BrowserCommandCommit,
+  ): Promise<AttachmentDeleteIfUnreferencedResult> {
+    const mutation = await this.runMutation(
+      [{ kind: 'attachment', attachmentId }],
+      async (ctx) => {
+        const counts = await ctx.countAttachmentReferences(attachmentId)
+        const refs = { messages: counts.messages, drafts: counts.drafts }
+        if (counts.occurrences > 0 || !(await ctx.getAttachment(attachmentId))) {
+          return { deleted: false, refs }
+        }
+        await ctx.deleteAttachment(attachmentId)
+        return { deleted: true, refs }
+      },
+      undefined,
+      commit,
+    )
+    return mutation.value
+  }
+
+  private async deleteManyAttachments(
+    input: AttachmentDeleteManyInput,
+    commit: BrowserCommandCommit,
+  ): Promise<AttachmentDeleteManyResult> {
+    const attachmentIds = [...new Set(input.attachmentIds)]
+    if (attachmentIds.length === 0 || attachmentIds.length > MAX_STORAGE_MAINTENANCE_BATCH) {
+      throw new Error('AttachmentDeleteManyBatchInvalid')
+    }
+    const mutation = await this.runMutation(
+      attachmentIds.map((attachmentId) => ({ kind: 'attachment', attachmentId })),
+      async (ctx) => {
+        const deletedAttachmentIds: AttachmentId[] = []
+        const stubbedAttachmentIds: AttachmentId[] = []
+        const absentAttachmentIds: AttachmentId[] = []
+        for (const attachmentId of attachmentIds) {
+          const current = await ctx.getAttachment(attachmentId)
+          if (!current) {
+            absentAttachmentIds.push(attachmentId)
+            continue
+          }
+          const counts = await ctx.countAttachmentReferences(attachmentId)
+          if (counts.occurrences === 0) {
+            await ctx.deleteAttachment(attachmentId)
+            deletedAttachmentIds.push(attachmentId)
+            continue
+          }
+          await this.deleteAttachmentBytesInMutation(ctx, current, input.reason, input.now)
+          stubbedAttachmentIds.push(attachmentId)
+        }
+        return { deletedAttachmentIds, stubbedAttachmentIds, absentAttachmentIds }
+      },
+      { expectedAttachmentCatalogRevision: input.expectedCatalogRevision },
+      commit,
+      async (ctx, result) => ({
+        ...result,
+        catalogRevision: await ctx.getAttachmentCatalogRevision(),
+      }),
+    )
+    return mutation.value
+  }
+
+  private async reapAttachments(
+    now: number,
+    maxAgeMs: number,
+    requestedLimit: number | undefined,
+    commit: BrowserCommandCommit,
+  ): Promise<AttachmentReapResult> {
+    const limit = boundedMaintenanceLimit(requestedLimit ?? MAX_STORAGE_MAINTENANCE_BATCH)
+    const db = await this.openDb()
+    const state = await readStorageRetentionState(db, 'attachment-reap')
+    const cycle = storageRetentionCycle(state, now, maxAgeMs)
+    const candidates = await this.listAttachmentReapCandidates(cycle.cutoff, cycle.cursor, limit)
+    const candidateIds = candidates.map((candidate) => candidate.id)
+    type AttachmentReapPageOutcome =
+      | { readonly done: false; readonly cursor?: AttachmentReapCursor }
+      | { readonly done: true; readonly earliestDeferredAt?: number }
+    const mutation = await this.runMutation(
+      candidateIds.map((attachmentId) => ({ kind: 'attachment', attachmentId })),
+      async (ctx) => {
+        const deleted: AttachmentId[] = []
+        for (const attachmentId of candidateIds) {
+          const counts = await ctx.countAttachmentReferences(attachmentId)
+          const current = await ctx.getAttachmentReclamationState(attachmentId)
+          if (
+            !current.exists ||
+            current.unreferencedAt === null ||
+            current.unreferencedAt >= cycle.cutoff ||
+            counts.occurrences > 0
+          ) {
+            continue
+          }
+          await ctx.deleteAttachment(attachmentId)
+          deleted.push(attachmentId)
+        }
+        return deleted
+      },
+      undefined,
+      commit,
+      undefined,
+      {
+        tableNames: ['attachments', 'storageRetentionState'],
+        async commit(tx) {
+          const last = candidates.at(-1)
+          const cursor = last
+            ? {
+                unreferencedAt: requiredUnreferencedAt(last),
+                attachmentId: last.id,
+              }
+            : cycle.cursor
+          const lower = cursor ? [0, cursor.unreferencedAt, cursor.attachmentId] : [0]
+          const attachmentTable = tx.table<AttachmentHeaderRow, AttachmentId>('attachments')
+          const nextDue = await attachmentTable
+            .where('[refCount+unreferencedAt+id]')
+            .between(lower, [0, cycle.cutoff], false, false)
+            .first()
+          let outcome: AttachmentReapPageOutcome
+          if (nextDue) {
+            outcome = { done: false, ...(cursor ? { cursor } : {}) }
+          } else {
+            const deferred = await attachmentTable
+              .where('[refCount+unreferencedAt+id]')
+              .between([0, cycle.cutoff], [0, []], true, false)
+              .first()
+            outcome = {
+              done: true,
+              ...(typeof deferred?.unreferencedAt === 'number'
+                ? { earliestDeferredAt: deferred.unreferencedAt }
+                : {}),
+            }
+          }
+          await commitStorageRetentionPage(tx, cycle, outcome)
+          return outcome
+        },
+      },
+    )
+    const committedOutcome = mutation.transactionExtensionResult
+    return {
+      scanned: candidates.length,
+      deletedAttachmentIds: mutation.value,
+      ...(committedOutcome.done && committedOutcome.earliestDeferredAt !== undefined
+        ? { earliestDeferredAt: committedOutcome.earliestDeferredAt }
+        : {}),
+      done: committedOutcome.done,
+    }
+  }
+
+  private async putDraftRow(
+    input: { draft: DraftRow; expectedUpdatedAt: number | null },
+    commit: BrowserCommandCommit,
+  ): Promise<DraftRow> {
+    const observed = await this.getDraft(input.draft.chatId)
+    const attachmentIds = new Set([
+      ...liveAttachmentRefs(observed?.attachmentRefs).map((ref) => ref.attachmentId),
+      ...liveAttachmentRefs(input.draft.attachmentRefs).map((ref) => ref.attachmentId),
+    ])
+    const mutation = await this.runMutation(
+      attachmentOwnerScopes({ kind: 'draft', chatId: input.draft.chatId }, [...attachmentIds]),
+      async (ctx, mutation) => {
+        const current = await ctx.getDraft(input.draft.chatId)
+        if ((current?.updatedAt ?? null) !== input.expectedUpdatedAt) {
+          throw new Error(`DraftChanged:${input.draft.chatId}`)
+        }
+        for (const attachmentId of liveAttachmentRefs(input.draft.attachmentRefs).map(
+          (ref) => ref.attachmentId,
+        )) {
+          if (!(await ctx.getAttachment(attachmentId))) {
+            throw new Error(`AttachmentMissing:${attachmentId}`)
+          }
+        }
+        const draft = {
+          ...input.draft,
+          updatedAt: current
+            ? strictlyMonotonicTimestamp(current.updatedAt, input.draft.updatedAt)
+            : input.draft.updatedAt,
+        }
+        const becameEmpty =
+          current !== undefined &&
+          (current.text.trim().length > 0 || current.attachmentRefs.length > 0) &&
+          draft.text.trim().length === 0 &&
+          draft.attachmentRefs.length === 0
+        await ctx.putDraft(draft)
+        if (becameEmpty) mutation.requestStorageMaintenance('prune-empty-drafts')
+        return { draft, becameEmpty }
+      },
+      undefined,
+      commit,
+    )
+    return mutation.value.draft
+  }
+
+  private async claimGeneratedOutputLocalization(
+    input: GeneratedOutputLocalizationClaimInput,
+    commit: BrowserCommandCommit,
+  ): Promise<GeneratedOutputLocalizationClaim | undefined> {
+    const attachmentId = await this.generatedOutputLocalizationAttachmentId(input.jobId, commit)
+    if (!attachmentId) return undefined
+    const mutation = await this.runMutation(
+      [{ kind: 'attachment', attachmentId }],
+      async (ctx) => {
+        const attachment = await ctx.getAttachment(attachmentId)
+        const job = (await ctx.getAttachmentJobs(attachmentId)).find(
+          (candidate) => candidate.id === input.jobId,
+        )
+        if (!attachment || !isGeneratedOutputLocalizationJob(job)) return undefined
+        if (!generatedOutputLocalizationSourceMatches(attachment, job)) return undefined
+        const claimable =
+          (job.status === 'pending' &&
+            job.nextAttemptAt !== undefined &&
+            job.nextAttemptAt <= input.now) ||
+          (job.status === 'running' && (job.leaseExpiresAt ?? 0) <= input.now)
+        if (!claimable) return undefined
+        const claimed = runningGeneratedOutputLocalizationJob(job, input)
+        await ctx.putAttachmentJob(claimed, { affectsWire: false })
+        return {
+          job: claimed,
+          attachment: generatedOutputLocalizationAttachmentProjection(attachment),
+        }
+      },
+      undefined,
+      commit,
+      undefined,
+      {
+        tableNames: ['attachmentRefEdges', 'chats'],
+        commit: (tx, value) =>
+          value
+            ? this.generatedOutputLocalizationProfileIds(tx, attachmentId)
+            : Promise.resolve([]),
+      },
+    )
+    if (!mutation.value) return undefined
+    return {
+      ...mutation.value,
+      profileIds: mutation.transactionExtensionResult,
+    }
+  }
+
+  private async retryGeneratedOutputLocalization(
+    input: GeneratedOutputLocalizationRetryInput,
+    commit: BrowserCommandCommit,
+  ): Promise<GeneratedOutputLocalizationJobResult> {
+    const attachmentId = await this.generatedOutputLocalizationAttachmentId(input.jobId, commit)
+    if (!attachmentId) return { outcome: 'missing' }
+    const mutation = await this.runMutation(
+      [{ kind: 'attachment', attachmentId }],
+      async (ctx) => {
+        const attachment = await ctx.getAttachment(attachmentId)
+        const job = (await ctx.getAttachmentJobs(attachmentId)).find(
+          (candidate) => candidate.id === input.jobId,
+        )
+        if (!attachment || !job) return { outcome: 'missing' as const }
+        if (!generatedOutputLocalizationLeaseMatches(attachment, job, input.leaseId)) {
+          return { outcome: 'stale' as const, attachmentId }
+        }
+        await ctx.putAttachmentJob(retriedGeneratedOutputLocalizationJob(job, input), {
+          affectsWire: false,
+        })
+        return { outcome: 'committed' as const, attachmentId }
+      },
+      undefined,
+      commit,
+    )
+    return mutation.value
+  }
+
+  private async failGeneratedOutputLocalization(
+    input: GeneratedOutputLocalizationFailInput,
+    commit: BrowserCommandCommit,
+  ): Promise<GeneratedOutputLocalizationJobResult> {
+    const attachmentId = await this.generatedOutputLocalizationAttachmentId(input.jobId, commit)
+    if (!attachmentId) return { outcome: 'missing' }
+    const mutation = await this.runMutation(
+      [{ kind: 'attachment', attachmentId }],
+      async (ctx) => {
+        const attachment = await ctx.getAttachment(attachmentId)
+        const job = (await ctx.getAttachmentJobs(attachmentId)).find(
+          (candidate) => candidate.id === input.jobId,
+        )
+        if (!attachment || !job) return { outcome: 'missing' as const }
+        if (!generatedOutputLocalizationLeaseMatches(attachment, job, input.leaseId)) {
+          return { outcome: 'stale' as const, attachmentId }
+        }
+        const failed = failedGeneratedOutputLocalizationJob(job, input)
+        await ctx.putAttachmentJob(failed, { affectsWire: false })
+        await ctx.putAttachment({
+          ...attachment,
+          processing: withGeneratedOutputLocalizationState(attachment.processing, failed),
+        })
+        return { outcome: 'committed' as const, attachmentId }
+      },
+      undefined,
+      commit,
+    )
+    return mutation.value
+  }
+
+  private async completeGeneratedOutputLocalization(
+    input: GeneratedOutputLocalizationCompleteInput,
+    commit: BrowserCommandCommit,
+  ): Promise<GeneratedOutputLocalizationJobResult> {
+    const attachmentId = await this.generatedOutputLocalizationAttachmentId(input.jobId, commit)
+    if (!attachmentId) return { outcome: 'missing' }
+    const mutation = await this.runMutation(
+      [{ kind: 'attachment', attachmentId }],
+      async (ctx) => {
+        const attachment = await ctx.getAttachment(attachmentId)
+        const job = (await ctx.getAttachmentJobs(attachmentId)).find(
+          (candidate) => candidate.id === input.jobId,
+        )
+        if (!attachment || !job) return { outcome: 'missing' as const }
+        if (!generatedOutputLocalizationLeaseMatches(attachment, job, input.leaseId)) {
+          return { outcome: 'stale' as const, attachmentId }
+        }
+        if (
+          input.bundle.attachment.id !== attachmentId ||
+          input.bundle.attachment.storage.kind !== 'local-blob'
+        ) {
+          throw new Error(`GeneratedOutputLocalizationBundleInvalid:${attachmentId}`)
+        }
+        const succeeded = succeededGeneratedOutputLocalizationJob(job, input.now)
+        const bundle: PreparedAttachmentBundle = {
+          ...input.bundle,
+          attachment: {
+            ...input.bundle.attachment,
+            ...(job.task?.expectedSourceUrl ? { sourceUrl: job.task.expectedSourceUrl } : {}),
+            processing: withGeneratedOutputLocalizationState(
+              input.bundle.attachment.processing,
+              succeeded,
+            ),
+          },
+          jobs: [
+            ...input.bundle.jobs.filter(
+              (candidate) => candidate.processorId !== GENERATED_OUTPUT_LOCALIZATION_PROCESSOR_ID,
+            ),
+            succeeded,
+          ],
+        }
+        await ctx.deleteAttachmentBlobs(attachmentId)
+        await ctx.deleteAttachmentArtifacts(attachmentId)
+        await ctx.deleteAttachmentJobs(attachmentId)
+        await persistPreparedAttachmentBundleInMutation(ctx, bundle, attachment)
+        return { outcome: 'committed' as const, attachmentId }
+      },
+      undefined,
+      commit,
+    )
+    return mutation.value
+  }
+
+  private async expandGeneratedOutputVideo(
+    input: GeneratedOutputVideoExpandInput,
+    commit: BrowserCommandCommit,
+  ): Promise<GeneratedOutputVideoExpandResult> {
+    const attachmentId = await this.generatedOutputLocalizationAttachmentId(input.jobId, commit)
+    if (!attachmentId) {
+      return { outcome: 'missing', presentations: [], drafts: [], changedAttachmentIds: [] }
+    }
+    if (input.attachmentBundles.length === 0) {
+      throw new Error(`GeneratedOutputVideoExpansionEmpty:${attachmentId}`)
+    }
+    for (;;) {
+      const plannedEdges = await this.listAttachmentReferenceEdges(attachmentId)
+      const messageIds = [
+        ...new Set(
+          plannedEdges.flatMap((edge) => (edge.ownerKind === 'message' ? [edge.ownerId] : [])),
+        ),
+      ]
+      const draftChatIds = [
+        ...new Set(
+          plannedEdges.flatMap((edge) => (edge.ownerKind === 'draft' ? [edge.chatId] : [])),
+        ),
+      ]
+      try {
+        const mutation = await this.runMutation(
+          dedupeMutationScopes([
+            { kind: 'attachment', attachmentId },
+            ...input.attachmentBundles.map((bundle) => ({
+              kind: 'attachment' as const,
+              attachmentId: bundle.attachment.id,
+            })),
+            ...messageIds.map((messageId) => ({ kind: 'message' as const, messageId })),
+            ...draftChatIds.map((chatId) => ({ kind: 'draft' as const, chatId })),
+          ]),
+          async (ctx) => {
+            const attachment = await ctx.getAttachment(attachmentId)
+            const job = (await ctx.getAttachmentJobs(attachmentId)).find(
+              (candidate) => candidate.id === input.jobId,
+            )
+            if (!attachment || !job) {
+              return {
+                outcome: 'missing' as const,
+                presentations: [],
+                drafts: [],
+                changedAttachmentIds: [],
+              }
+            }
+            if (!generatedOutputLocalizationLeaseMatches(attachment, job, input.leaseId)) {
+              return {
+                outcome: 'stale' as const,
+                attachmentId,
+                presentations: [],
+                drafts: [],
+                changedAttachmentIds: [],
+              }
+            }
+            const currentEdges = await ctx.getAttachmentReferenceEdges(attachmentId)
+            const currentMessageIds = [
+              ...new Set(
+                currentEdges.flatMap((edge) =>
+                  edge.ownerKind === 'message' ? [edge.ownerId] : [],
+                ),
+              ),
+            ]
+            const currentDraftChatIds = [
+              ...new Set(
+                currentEdges.flatMap((edge) => (edge.ownerKind === 'draft' ? [edge.chatId] : [])),
+              ),
+            ]
+            if (
+              currentMessageIds.some((messageId) => !messageIds.includes(messageId)) ||
+              currentDraftChatIds.some((chatId) => !draftChatIds.includes(chatId))
+            ) {
+              throw new GeneratedOutputLocalizationPlanChangedError()
+            }
+            const replacementIds = input.attachmentBundles.map((bundle) => bundle.attachment.id)
+            for (const bundle of input.attachmentBundles) {
+              if (bundle.attachment.origin !== 'generated-output') {
+                throw new Error(`GeneratedOutputVideoExpansionOrigin:${bundle.attachment.id}`)
+              }
+              const existing = await ctx.getAttachment(bundle.attachment.id)
+              if (existing) {
+                if (!preparedAttachmentIdentityMatches(existing, bundle.attachment)) {
+                  throw new Error(`GeneratedOutputVideoExpansionCollision:${bundle.attachment.id}`)
+                }
+              } else {
+                await persistPreparedAttachmentBundleInMutation(ctx, bundle)
+              }
+            }
+            const presentations: MessagePresentation[] = []
+            for (const messageId of currentMessageIds) {
+              const message = await ctx.getMessage(messageId)
+              if (!message || message.deleted) continue
+              const content = replaceGeneratedPollingVideoContent(
+                message.content,
+                attachmentId,
+                replacementIds,
+              )
+              const refs = replaceGeneratedPollingVideoRefs(
+                message.attachmentRefs,
+                attachmentId,
+                replacementIds,
+                { kind: 'message', chatId: message.chatId, messageId: message.id },
+                input.now,
+              )
+              if (!content.changed && !refs.changed) continue
+              const presentation = await ctx.patchMessageBody(
+                message.id,
+                { content: content.content },
+                { headerPatch: { attachmentRefs: refs.refs }, touchChatSummary: false },
+              )
+              if (presentation) presentations.push(presentation)
+            }
+            const drafts: DraftRow[] = []
+            for (const chatId of currentDraftChatIds) {
+              const draft = await ctx.getDraft(chatId)
+              if (!draft) continue
+              const refs = replaceGeneratedPollingVideoRefs(
+                draft.attachmentRefs,
+                attachmentId,
+                replacementIds,
+                { kind: 'draft', chatId },
+                input.now,
+              )
+              if (!refs.changed) continue
+              const next = {
+                ...draft,
+                attachmentRefs: refs.refs,
+                updatedAt: strictlyMonotonicTimestamp(draft.updatedAt, input.now),
+              }
+              await ctx.putDraft(next)
+              drafts.push(next)
+            }
+            const counts = await ctx.countAttachmentReferences(attachmentId)
+            if (counts.occurrences === 0) {
+              await ctx.deleteAttachment(attachmentId)
+            } else {
+              await ctx.putAttachmentJob(succeededGeneratedOutputLocalizationJob(job, input.now), {
+                affectsWire: false,
+              })
+            }
+            return {
+              outcome: 'committed' as const,
+              attachmentId,
+              presentations,
+              drafts,
+              changedAttachmentIds: [attachmentId, ...replacementIds],
+            }
+          },
+          undefined,
+          commit,
+        )
+        return mutation.value
+      } catch (error) {
+        if (error instanceof GeneratedOutputLocalizationPlanChangedError) continue
+        throw error
+      }
+    }
+  }
+
+  private async generatedOutputLocalizationAttachmentId(
+    jobId: string,
+    _commit: BrowserCommandCommit,
+  ): Promise<AttachmentId | undefined> {
+    const db = await this.openDb()
+    const row = await db.transaction('r', db.attachmentJobs, async (tx) => {
+      return tx.table<AttachmentJob, string>('attachmentJobs').get(jobId)
+    })
+    return row?.attachmentId
+  }
+
+  private async generatedOutputLocalizationProfileIds(
+    tx: FencedTransaction<BrowserMutationTableName>,
+    attachmentId: AttachmentId,
+  ): Promise<ProfileId[]> {
+    const attachmentChatKeys = await tx
+      .table<AttachmentReferenceEdge, string>('attachmentRefEdges')
+      .where('[attachmentId+chatId]')
+      .between(...exactCompoundPrefixBetween([attachmentId]))
+      .uniqueKeys()
+    const chatIds = attachmentChatKeys.map((key) => {
+      if (!Array.isArray(key) || typeof key[1] !== 'string') {
+        throw new Error('AttachmentReferenceCompoundKeyInvalid')
+      }
+      return key[1]
+    })
+    const chats = await tx.table<Chat, ChatId>('chats').bulkGet(chatIds)
+    return [
+      ...new Set(
+        chats.flatMap((chat) => (chat?.settings.profileId ? [chat.settings.profileId] : [])),
+      ),
+    ]
   }
 
   async getAttachment(attachmentId: AttachmentId): Promise<Attachment | undefined> {
-    return openDb().then(async (db) => {
+    const db = await this.openDb()
+    return db.transaction('r', db.attachments, db.attachmentArtifacts, async () => {
       const header = await db.attachments.get(attachmentId)
-      return header
-        ? hydrateStoredAttachment(attachmentHeaderFromStoredRow(header), db.attachmentArtifacts)
-        : undefined
+      return header ? hydrateStoredAttachment(header, db.attachmentArtifacts) : undefined
+    })
+  }
+
+  async getAttachmentGenerationTokenEvidence(
+    attachmentId: AttachmentId,
+  ): Promise<GenerationAttachmentTokenEvidence | undefined> {
+    const header = await (await this.openDb()).attachments.get(attachmentId)
+    if (!header) return undefined
+    return {
+      attachment: hydrateAttachment(header, []),
+      wireVersion: header.wireVersion,
+    }
+  }
+
+  async getAttachments(
+    attachmentIds: readonly AttachmentId[],
+    options: { signal?: AbortSignal } = {},
+  ): Promise<Array<Attachment | undefined>> {
+    if (attachmentIds.length === 0) return []
+    throwIfReadonlyAborted(options.signal, 'Attachment context read aborted')
+    const uniqueIds = [...new Set(attachmentIds)]
+    const db = await this.openDb()
+    return db.transaction('r', db.attachments, db.attachmentArtifacts, async () => {
+      const [headers, artifacts] = await Promise.all([
+        db.attachments.bulkGet(uniqueIds),
+        db.attachmentArtifacts.where('attachmentId').anyOf(uniqueIds).toArray(),
+      ])
+      throwIfReadonlyAborted(options.signal, 'Attachment context read aborted')
+      const artifactsByAttachmentId = new Map<AttachmentId, AttachmentArtifact[]>()
+      for (const artifact of artifacts) {
+        const rows = artifactsByAttachmentId.get(artifact.attachmentId) ?? []
+        rows.push(artifact)
+        artifactsByAttachmentId.set(artifact.attachmentId, rows)
+      }
+      const attachmentById = new Map<AttachmentId, Attachment | undefined>()
+      for (let index = 0; index < uniqueIds.length; index += 1) {
+        if (index % 128 === 0) {
+          throwIfReadonlyAborted(options.signal, 'Attachment context read aborted')
+        }
+        const attachmentId = uniqueIds[index] as AttachmentId
+        const header = headers[index]
+        attachmentById.set(
+          attachmentId,
+          header
+            ? hydrateAttachment(header, artifactsByAttachmentId.get(attachmentId) ?? [])
+            : undefined,
+        )
+      }
+      throwIfReadonlyAborted(options.signal, 'Attachment context read aborted')
+      return attachmentIds.map((attachmentId) => attachmentById.get(attachmentId))
+    })
+  }
+
+  async getAttachmentMedia(
+    attachmentId: AttachmentId,
+    purpose: 'message-output' | 'preview',
+    signal?: AbortSignal,
+  ): Promise<AttachmentMediaProjection | undefined> {
+    return (await this.getAttachmentMediaMany([attachmentId], purpose, signal))[0]
+  }
+
+  async getAttachmentMediaMany(
+    attachmentIds: readonly AttachmentId[],
+    purpose: 'message-output' | 'preview',
+    signal?: AbortSignal,
+  ): Promise<readonly (AttachmentMediaProjection | undefined)[]> {
+    const db = await this.openDb()
+    return db.transaction('r', db.attachments, db.attachmentBlobs, async () => {
+      throwIfReadonlyAborted(signal, 'Attachment media read aborted')
+      const attachments = await db.attachments.bulkGet([...attachmentIds])
+      const blobIds = attachments.flatMap((attachment) => {
+        if (attachment?.storage.kind !== 'local-blob') return []
+        return [
+          purpose === 'preview' && attachment.thumbnailBlobId
+            ? attachment.thumbnailBlobId
+            : attachment.storage.blobId,
+        ]
+      })
+      const uniqueBlobIds = [...new Set(blobIds)]
+      const blobs = await db.attachmentBlobs.bulkGet(uniqueBlobIds)
+      const blobsById = new Map(
+        uniqueBlobIds.flatMap((blobId, index) => {
+          const blob = blobs[index]
+          return blob ? [[blobId, blob] as const] : []
+        }),
+      )
+      throwIfReadonlyAborted(signal, 'Attachment media read aborted')
+      return attachments.map((attachment): AttachmentMediaProjection | undefined => {
+        if (!attachment) return undefined
+        const projection: AttachmentMediaProjection = {
+          id: attachment.id,
+          attachment: {
+            id: attachment.id,
+            kind: attachment.kind,
+            mime: attachment.mime,
+            filename: attachment.filename,
+            storage: structuredClone(attachment.storage),
+          },
+        }
+        if (attachment.storage.kind !== 'local-blob') return projection
+        const blobId =
+          purpose === 'preview' && attachment.thumbnailBlobId
+            ? attachment.thumbnailBlobId
+            : attachment.storage.blobId
+        const blob = blobsById.get(blobId)
+        return blob ? { ...projection, blob } : projection
+      })
+    })
+  }
+
+  async getGeneratedOutputLocalizationQueue(
+    now: number,
+    requestedLimit: number,
+  ): Promise<GeneratedOutputLocalizationQueueSnapshot> {
+    const limit = Math.max(1, Math.min(32, Math.floor(requestedLimit)))
+    const db = await this.openDb()
+    return db.transaction('r', db.attachmentJobs, async () => {
+      const pendingIndex = '[processorId+status+nextAttemptAt]'
+      const leaseIndex = '[processorId+status+leaseExpiresAt]'
+      const pendingRange = exactCompoundPrefixBetween([
+        GENERATED_OUTPUT_LOCALIZATION_PROCESSOR_ID,
+        'pending',
+      ])
+      const runningRange = exactCompoundPrefixBetween([
+        GENERATED_OUTPUT_LOCALIZATION_PROCESSOR_ID,
+        'running',
+      ])
+      const pending = await db.attachmentJobs
+        .where(pendingIndex)
+        .between(
+          pendingRange[0],
+          [GENERATED_OUTPUT_LOCALIZATION_PROCESSOR_ID, 'pending', now],
+          true,
+          true,
+        )
+        .limit(limit)
+        .primaryKeys()
+      const remaining = limit - pending.length
+      const expired =
+        remaining > 0
+          ? await db.attachmentJobs
+              .where(leaseIndex)
+              .between(
+                runningRange[0],
+                [GENERATED_OUTPUT_LOCALIZATION_PROCESSOR_ID, 'running', now],
+                true,
+                true,
+              )
+              .limit(remaining)
+              .primaryKeys()
+          : []
+      const [nextPending, nextLease] = await Promise.all([
+        db.attachmentJobs
+          .where(pendingIndex)
+          .between(
+            [GENERATED_OUTPUT_LOCALIZATION_PROCESSOR_ID, 'pending', now],
+            pendingRange[1],
+            false,
+            false,
+          )
+          .first(),
+        db.attachmentJobs
+          .where(leaseIndex)
+          .between(
+            [GENERATED_OUTPUT_LOCALIZATION_PROCESSOR_ID, 'running', now],
+            runningRange[1],
+            false,
+            false,
+          )
+          .first(),
+      ])
+      const nextWakeAt = Math.min(
+        nextPending?.nextAttemptAt ?? Number.POSITIVE_INFINITY,
+        nextLease?.leaseExpiresAt ?? Number.POSITIVE_INFINITY,
+      )
+      return {
+        readyJobIds: [...pending, ...expired].map(String),
+        ...(Number.isFinite(nextWakeAt) ? { nextWakeAt } : {}),
+      }
     })
   }
 
   async getAttachmentBundle(attachmentId: AttachmentId): Promise<AttachmentBundle | undefined> {
-    return openDb().then(async (db) => {
-      const header = await db.attachments.get(attachmentId)
-      if (!header) return undefined
-      const [blobs, artifacts, jobs] = await Promise.all([
-        db.attachmentBlobs.where('attachmentId').equals(attachmentId).toArray(),
-        db.attachmentArtifacts.where('attachmentId').equals(attachmentId).toArray(),
-        db.attachmentJobs.where('attachmentId').equals(attachmentId).toArray(),
-      ])
-      const attachment = hydrateAttachment(attachmentHeaderFromStoredRow(header), artifacts)
-      return { attachment, blobs, artifacts, jobs }
-    })
-  }
-
-  async getAttachmentBlob(blobId: string): Promise<AttachmentBlob | undefined> {
-    return openDb().then((db) => db.attachmentBlobs.get(blobId))
-  }
-
-  async searchAttachments(query: AttachmentSearchQuery = {}): Promise<AttachmentSearchPage> {
-    const db = await openDb()
-    throwIfAttachmentSearchAborted(query.signal)
-    const limit = query.limit ?? 100
-    const sort = query.sort ?? 'created-desc'
-    const measurement: AttachmentSearchMeasurement = {
-      selectedIndex: 'primary',
-      indexCounts: {},
-      metadataRowsRead: 0,
-      metadataCandidates: 0,
-      embeddedArtifactRowsRead: 0,
-      artifactCandidateAttachments: 0,
-      artifactRowsRead: 0,
-      attachmentBlobRowsRead: 0,
-      matchedRows: 0,
-      returnedRows: 0,
-    }
-    const rows = await loadAttachmentSearchMetadata(db.attachments, query, sort, measurement)
-    throwIfAttachmentSearchAborted(query.signal)
-    const terms = query.query?.trim().toLowerCase().split(/\s+/).filter(Boolean) ?? []
-    const metadataCandidates: AttachmentHeaderRow[] = []
-    for (const [index, attachment] of rows.entries()) {
-      if (index % ATTACHMENT_SEARCH_ABORT_CHECK_INTERVAL === 0) {
-        throwIfAttachmentSearchAborted(query.signal)
-      }
-      if (attachmentMatchesFilters(attachment, query)) metadataCandidates.push(attachment)
-    }
-    measurement.metadataCandidates = metadataCandidates.length
-    const metadataTextByAttachment = new Map<AttachmentId, string>()
-    const artifactCandidateIds: AttachmentId[] = []
-    if (terms.length > 0) {
-      for (const [index, attachment] of metadataCandidates.entries()) {
-        if (index % ATTACHMENT_SEARCH_ABORT_CHECK_INTERVAL === 0) {
-          throwIfAttachmentSearchAborted(query.signal)
-        }
-        const metadataText = attachmentSearchText(attachment, [])
-        metadataTextByAttachment.set(attachment.id, metadataText)
-        if (!terms.every((term) => metadataText.includes(term))) {
-          artifactCandidateIds.push(attachment.id)
-        }
-      }
-    }
-    measurement.artifactCandidateAttachments = artifactCandidateIds.length
-    const artifacts =
-      terms.length === 0
-        ? []
-        : await loadCandidateAttachmentArtifacts(
-            db.attachmentArtifacts,
-            artifactCandidateIds,
-            query.signal,
-          )
-    measurement.artifactRowsRead = artifacts.length
-    const artifactsByAttachment = new Map<AttachmentId, AttachmentArtifact[]>()
-    for (const [index, artifact] of artifacts.entries()) {
-      if (index % ATTACHMENT_SEARCH_ABORT_CHECK_INTERVAL === 0) {
-        throwIfAttachmentSearchAborted(query.signal)
-      }
-      const list = artifactsByAttachment.get(artifact.attachmentId) ?? []
-      list.push(artifact)
-      artifactsByAttachment.set(artifact.attachmentId, list)
-    }
-    const filtered: AttachmentHeaderRow[] = []
-    for (const [index, attachment] of metadataCandidates.entries()) {
-      if (index % ATTACHMENT_SEARCH_ABORT_CHECK_INTERVAL === 0) {
-        throwIfAttachmentSearchAborted(query.signal)
-      }
-      if (terms.length === 0) {
-        filtered.push(attachment)
-        continue
-      }
-      const metadataText = metadataTextByAttachment.get(attachment.id) ?? ''
-      if (terms.every((term) => metadataText.includes(term))) {
-        filtered.push(attachment)
-        continue
-      }
-      const haystack = attachmentSearchText(
-        attachment,
-        artifactsByAttachment.get(attachment.id) ?? [],
-      )
-      if (terms.every((term) => haystack.includes(term))) filtered.push(attachment)
-    }
-    filtered.sort(attachmentSorter(sort))
-    throwIfAttachmentSearchAborted(query.signal)
-    measurement.matchedRows = filtered.length
-    const start = attachmentPageStart(filtered, query.cursor, sort)
-    const pageHeaders = filtered.slice(start, start + limit)
-    const last = pageHeaders.at(-1)
-    const nextCursor =
-      last && filtered.length > start + limit ? encodeAttachmentCursor(last, sort) : undefined
-    const artifactsById = new Map(artifacts.map((artifact) => [artifact.artifactId, artifact]))
-    const missingArtifactIds = pageHeaders
-      .flatMap((header) => header.artifactIds)
-      .filter((artifactId) => !artifactsById.has(artifactId))
-    if (missingArtifactIds.length > 0) {
-      const pageArtifacts = await db.attachmentArtifacts.bulkGet(missingArtifactIds)
-      for (const artifact of pageArtifacts) {
-        if (artifact) artifactsById.set(artifact.artifactId, artifact)
-      }
-      measurement.artifactRowsRead += pageArtifacts.filter(
-        (artifact): artifact is AttachmentArtifact => artifact !== undefined,
-      ).length
-    }
-    const page = pageHeaders.map((header) =>
-      hydrateAttachment(
-        header,
-        header.artifactIds.map((artifactId) => artifactsById.get(artifactId)),
-      ),
+    const db = await this.openDb()
+    return db.transaction(
+      'r',
+      db.attachments,
+      db.attachmentBlobs,
+      db.attachmentArtifacts,
+      db.attachmentJobs,
+      async () => {
+        const header = await db.attachments.get(attachmentId)
+        if (!header) return undefined
+        const [blobs, artifacts, jobs] = await Promise.all([
+          db.attachmentBlobs.where('attachmentId').equals(attachmentId).toArray(),
+          db.attachmentArtifacts.where('attachmentId').equals(attachmentId).toArray(),
+          db.attachmentJobs.where('attachmentId').equals(attachmentId).toArray(),
+        ])
+        const attachment = hydrateAttachment(header, artifacts)
+        return { attachment, blobs, artifacts, jobs }
+      },
     )
-    measurement.returnedRows = page.length
-    query.onMeasure?.({ ...measurement, indexCounts: { ...measurement.indexCounts } })
-    return nextCursor ? { rows: page, nextCursor } : { rows: page }
+  }
+
+  async getAttachmentDispatchBundle(
+    attachmentId: AttachmentId,
+  ): Promise<AttachmentDispatchBundle | undefined> {
+    const db = await this.openDb()
+    return db.transaction(
+      'r',
+      db.attachments,
+      db.attachmentBlobs,
+      db.attachmentArtifacts,
+      db.attachmentJobs,
+      async () => {
+        const header = await db.attachments.get(attachmentId)
+        if (!header) return undefined
+        const [blobs, artifacts, jobs] = await Promise.all([
+          db.attachmentBlobs.where('attachmentId').equals(attachmentId).toArray(),
+          db.attachmentArtifacts.where('attachmentId').equals(attachmentId).toArray(),
+          db.attachmentJobs.where('attachmentId').equals(attachmentId).toArray(),
+        ])
+        return {
+          bundle: {
+            attachment: hydrateAttachment(header, artifacts),
+            blobs,
+            artifacts,
+            jobs,
+          },
+          wireVersion: header.wireVersion,
+        }
+      },
+    )
+  }
+
+  async findAttachmentIdByContentHash(
+    filename: string,
+    contentHash: string,
+    excludeId?: AttachmentId,
+  ): Promise<AttachmentId | undefined> {
+    const db = await this.openDb()
+    const row = await db.attachments
+      .where('contentHash')
+      .equals(contentHash)
+      .filter(
+        (attachment) =>
+          attachment.id !== excludeId &&
+          attachment.filename === filename &&
+          attachment.deletedAt === undefined &&
+          attachment.storage.kind !== 'missing',
+      )
+      .first()
+    return row?.id
+  }
+
+  private async listAttachmentReapCandidates(
+    cutoff: number,
+    after: AttachmentReapCursor | undefined,
+    limit: number,
+  ): Promise<AttachmentHeaderRow[]> {
+    const db = await this.openDb()
+    const lower = after ? [0, after.unreferencedAt, after.attachmentId] : [0]
+    return db.attachments
+      .where('[refCount+unreferencedAt+id]')
+      .between(lower, [0, cutoff], false, false)
+      .limit(limit)
+      .toArray()
+  }
+
+  async listAttachmentReferenceEdges(
+    attachmentId: AttachmentId,
+  ): Promise<AttachmentReferenceEdge[]> {
+    return (await this.openDb()).attachmentRefEdges
+      .where('attachmentId')
+      .equals(attachmentId)
+      .toArray()
+  }
+
+  async listAttachmentReferenceRows(attachmentId: AttachmentId): Promise<AttachmentReferenceRow[]> {
+    const db = await this.openDb()
+    return db.transaction(
+      'r',
+      db.attachmentRefEdges,
+      db.messages,
+      db.drafts,
+      db.chats,
+      async () => {
+        const edges = await db.attachmentRefEdges
+          .where('attachmentId')
+          .equals(attachmentId)
+          .toArray()
+        if (edges.length === 0) return []
+        const messageIds = [
+          ...new Set(
+            edges.filter((edge) => edge.ownerKind === 'message').map((edge) => edge.ownerId),
+          ),
+        ]
+        const draftChatIds = [
+          ...new Set(
+            edges.filter((edge) => edge.ownerKind === 'draft').map((edge) => edge.ownerId),
+          ),
+        ]
+        const chatIds = [...new Set(edges.map((edge) => edge.chatId))]
+        const [messages, drafts, chats] = await Promise.all([
+          db.messages.bulkGet(messageIds),
+          db.drafts.bulkGet(draftChatIds),
+          db.chats.bulkGet(chatIds),
+        ])
+        const messageById = new Map(
+          messages.flatMap((message) => (message ? [[message.id, message] as const] : [])),
+        )
+        const draftByChatId = new Map(
+          drafts.flatMap((draft) => (draft ? [[draft.chatId, draft] as const] : [])),
+        )
+        const chatById = new Map(chats.flatMap((chat) => (chat ? [[chat.id, chat] as const] : [])))
+        const rows: AttachmentReferenceRow[] = []
+        for (const edge of edges) {
+          if (edge.ownerKind === 'message') {
+            const message = messageById.get(edge.ownerId)
+            if (!message) {
+              throw new Error(`AttachmentReferenceOwnerMissing:message:${edge.ownerId}`)
+            }
+            const ref = normalizeAttachmentRefs(message.attachmentRefs, {
+              messageId: message.id,
+              createdAt: message.createdAt,
+            }).find(
+              (candidate) =>
+                candidate.refId === edge.refId &&
+                candidate.attachmentId === edge.attachmentId &&
+                candidate.deletedAt === undefined,
+            )
+            if (!ref) {
+              throw new Error(
+                `AttachmentReferenceProjectionMismatch:message:${edge.ownerId}:${edge.refId}`,
+              )
+            }
+            const chat = chatById.get(message.chatId)
+            rows.push({
+              ownerKind: 'message',
+              chatId: message.chatId,
+              chatTitle: workspaceAttachmentChatTitle(chat),
+              chatTitleStatus: chat?.titleStatus ?? 'untitled',
+              messageId: message.id,
+              role: message.role,
+              messageCreatedAt: message.createdAt,
+              ref,
+            })
+            continue
+          }
+          const draft = draftByChatId.get(edge.ownerId)
+          if (!draft) throw new Error(`AttachmentReferenceOwnerMissing:draft:${edge.ownerId}`)
+          const ref = normalizeAttachmentRefs(draft.attachmentRefs, {
+            draftChatId: draft.chatId,
+            createdAt: draft.updatedAt,
+          }).find(
+            (candidate) =>
+              candidate.refId === edge.refId &&
+              candidate.attachmentId === edge.attachmentId &&
+              candidate.deletedAt === undefined,
+          )
+          if (!ref) {
+            throw new Error(
+              `AttachmentReferenceProjectionMismatch:draft:${edge.ownerId}:${edge.refId}`,
+            )
+          }
+          const chat = chatById.get(draft.chatId)
+          rows.push({
+            ownerKind: 'draft',
+            chatId: draft.chatId,
+            chatTitle: workspaceAttachmentChatTitle(chat),
+            chatTitleStatus: chat?.titleStatus ?? 'untitled',
+            draftChatId: draft.chatId,
+            ref,
+          })
+        }
+        rows.sort(
+          (left, right) =>
+            (right.messageCreatedAt ?? right.ref.createdAt) -
+            (left.messageCreatedAt ?? left.ref.createdAt),
+        )
+        return rows
+      },
+    )
   }
 
   async getDraft(chatId: ChatId): Promise<DraftRow | undefined> {
-    return openDb().then(async (db) => {
+    return this.openDb().then(async (db) => {
       const row = await db.drafts.get(chatId)
       return row ? cloneDraft(row) : undefined
     })
   }
 
-  async runMutation<T>(
+  async runMutation<T, U = T, ExtensionResult = undefined>(
     scopes: MutationScope[],
-    fn: (ctx: MutationContext) => Promise<T> | T,
-    options?: WorkspaceMutationOptions,
-  ): Promise<WorkspaceMutationResult<T>> {
-    const db = await openDb()
-    const now = Date.now()
-    const pendingEvents: Array<{
-      chatId: ChatId
-      versions: ChatVersions
-      affected: ChatMutationSummary[]
-    }> = []
-    const pendingBranchCacheEvents = new Set<ChatId>()
-    const mutationTables = resolveMutationTables(db, scopes, options)
-
-    const result: WorkspaceMutationResult<T> = await withMutationLocks(scopes, async (grant) =>
-      grant.runTransaction<WorkspaceMutationResult<T>>(
-        db,
-        mutationTables,
-        async (tx: Transaction) => {
-          if (options?.workspaceFence) {
-            const meta = await readBrowserWorkspaceMetaFromTransaction(tx)
-            if (meta.replacementEpoch !== options.workspaceFence.replacementEpoch) {
-              throw new WorkspaceReplacementFenceError()
-            }
-          }
-          let ownedStreamLease: StreamLeaseRow | undefined
-          if (options?.streamFence) {
-            const { streamId, fence } = options.streamFence
-            const [meta, lease] = await Promise.all([
-              readBrowserWorkspaceMetaFromTransaction(tx),
-              tx.table<StreamLeaseRow, string>('streamLeases').get(streamId),
-            ])
-            assertOwnedStreamFence(lease, fence, meta.replacementEpoch, streamId)
-            ownedStreamLease = lease
-          }
-          const { assertScope } = createScopeChecker(scopes)
-          const chatStates = new Map<ChatId, ChatMutationState>()
-          const affectedMessageIds = new Set<MessageId>()
-          let wroteWorkspaceState = false
-          const targetLeasesByMessage = new Map<MessageId, StreamLeaseRow[]>()
-
-          const assertStreamTargetWriteAllowed = async (
-            messageId: MessageId,
-            options: { readContinuationBody?: boolean } = {},
-          ): Promise<void> => {
-            let targetLeases = targetLeasesByMessage.get(messageId)
-            if (!targetLeases) {
-              const candidates = await tx
-                .table<StreamLeaseRow, string>('streamLeases')
-                .where('messageId')
-                .equals(messageId)
-                .toArray()
-              targetLeases = []
-              for (const lease of candidates) {
-                if (!streamLeaseOwnsTargetWrites(lease)) continue
-                if (!(await streamLeaseTargetFinalized(tx, lease, options))) {
-                  targetLeases.push(lease)
-                }
-              }
-              targetLeasesByMessage.set(messageId, targetLeases)
-            }
-            if (targetLeases.length === 0) return
-            if (
-              ownedStreamLease?.messageId === messageId &&
-              targetLeases.every((lease) => lease.streamId === ownedStreamLease.streamId)
-            ) {
-              return
-            }
-            throw new StreamTargetBusyError(messageId)
-          }
-
-          const syncAttachmentReferenceOwner = async (input: {
-            ownerKind: AttachmentReferenceEdge['ownerKind']
-            ownerId: string
-            chatId: ChatId
-            previousRefs: readonly MessageAttachmentRef[] | undefined
-            nextRefs: readonly MessageAttachmentRef[] | undefined
-          }): Promise<void> => {
-            const previousEdges = edgesForOwner({
-              ownerKind: input.ownerKind,
-              ownerId: input.ownerId,
-              chatId: input.chatId,
-              refs: input.previousRefs,
-            })
-            const nextOwner = {
-              ownerKind: input.ownerKind,
-              ownerId: input.ownerId,
-              chatId: input.chatId,
-              refs: input.nextRefs,
-            }
-            const nextEdges = edgesForOwner(nextOwner)
-            if (stableStringify(previousEdges) === stableStringify(nextEdges)) return
-            if (!scopes.some((scope) => scope.kind === 'attachment')) {
-              throw new Error(
-                `UndeclaredAttachmentReferenceScope:${input.ownerKind}:${input.ownerId}`,
-              )
-            }
-            await replaceAttachmentReferenceOwner(tx, nextOwner, (attachmentId) =>
-              assertScope({ kind: 'attachment', attachmentId }),
-            )
-          }
-
-          const ensureChatState = async (chatId: ChatId): Promise<ChatMutationState> => {
-            const existing = chatStates.get(chatId)
-            if (existing) return existing
-            const beforeChat = await loadChatOrThrow(tx.table<Chat, ChatId>('chats'), chatId)
-            const state: ChatMutationState = {
-              beforeChat,
-              headersBeforeWrites: new Map<MessageId, MessageHeaderRow | undefined>(),
-              incrementalAppends: [],
-              wordCountDeltas: new Map<MessageId, number>(),
-              totalCostDelta: 0,
-              visibleMetaPatch: {},
-              hiddenMetaPatch: {},
-              summaryPatch: {},
-              visibleMetaDirty: false,
-              summaryVersionDirty: false,
-              messageSummaryDirty: false,
-              branchCorpusDirtyMessageIds: new Set<MessageId>(),
-              previewDirty: false,
-              broadcast: false,
-              changedMessageIds: new Set<MessageId>(),
-              affected: new Map<string, ChatMutationSummary>(),
-            }
-            chatStates.set(chatId, state)
-            return state
-          }
-
-          const ensureMessageHeaderSnapshots = async (state: ChatMutationState): Promise<void> => {
-            if (state.beforeHeaders && state.afterHeadersById) return
-            const currentHeaders = (
-              await tx
-                .table<MessageHeaderRow, MessageId>('messages')
-                .where('chatId')
-                .equals(state.beforeChat.id)
-                .toArray()
-            ).map(cloneMessageHeader)
-            const beforeHeadersById = new Map(
-              currentHeaders.map((header) => [header.id, cloneMessageHeader(header)]),
-            )
-            for (const [messageId, before] of state.headersBeforeWrites) {
-              if (before) beforeHeadersById.set(messageId, cloneMessageHeader(before))
-              else beforeHeadersById.delete(messageId)
-            }
-            state.beforeHeaders = [...beforeHeadersById.values()]
-            state.afterHeadersById = new Map(currentHeaders.map((header) => [header.id, header]))
-          }
-
-          const recordHeaderBeforeWrite = (
-            state: ChatMutationState | undefined,
-            messageId: MessageId,
-            header: MessageHeaderRow | undefined,
-          ): void => {
-            if (!state || state.headersBeforeWrites.has(messageId)) return
-            state.headersBeforeWrites.set(
-              messageId,
-              header ? cloneMessageHeader(header) : undefined,
-            )
-          }
-
-          for (const scope of scopes) {
-            if (scope.kind === 'chat-meta' || scope.kind === 'children' || scope.kind === 'draft') {
-              await ensureChatState(scope.chatId)
-            }
-          }
-
-          const requireChatState = (chatId: ChatId): ChatMutationState => {
-            const state = chatStates.get(chatId)
-            if (!state) {
-              throw new Error(`ChatStateUnavailable:${chatId}`)
-            }
-            return state
-          }
-
-          const bumpChildList = async (
-            chatId: ChatId,
-            parentId: MessageId | null,
-            bumpNow = now,
-          ): Promise<ChildListState> => {
-            assertScope({ kind: 'children', chatId, parentId })
-            const table = tx.table<ChildListState, string>('childLists')
-            const id = childListKey(chatId, parentId)
-            const existing = await table.get(id)
-            const next: ChildListState = existing
-              ? { ...existing, version: existing.version + 1, updatedAt: bumpNow }
-              : { id, chatId, parentId, version: 1, updatedAt: bumpNow }
-            await table.put(next)
-            wroteWorkspaceState = true
-            const state = await ensureChatState(chatId)
-            state.broadcast = true
-            upsertAffected(state, { kind: 'children', chatId, parentId })
-            return next
-          }
-
-          const ctx: MutationContext = {
-            getChat: async (chatId) => {
-              const state = chatStates.get(chatId)
-              if (!state) return tx.table<Chat, ChatId>('chats').get(chatId)
-              return {
-                ...state.beforeChat,
-                ...state.hiddenMetaPatch,
-                ...state.visibleMetaPatch,
-                ...state.summaryPatch,
-              }
-            },
-
-            patchChatMeta: (chatId, patch, options = {}) => {
-              const {
-                touchVisibleState = true,
-                touchSummary = touchVisibleState,
-                broadcast = touchVisibleState || touchSummary,
-              } = options
-              assertScope({ kind: 'chat-meta', chatId })
-              const state = requireChatState(chatId)
-              const current = {
-                ...state.beforeChat,
-                ...state.hiddenMetaPatch,
-                ...state.visibleMetaPatch,
-                ...state.summaryPatch,
-              }
-              if (touchVisibleState) {
-                const applied = changedPatch(current, stripMetaPatch(patch))
-                if (!applied) return
-                state.visibleMetaPatch = {
-                  ...state.visibleMetaPatch,
-                  ...applied,
-                }
-                state.visibleMetaDirty = true
-                state.summaryVersionDirty ||= touchSummary
-              } else {
-                const applied = changedPatch(current, stripMetaPatch(patch))
-                if (!applied) return
-                state.hiddenMetaPatch = {
-                  ...state.hiddenMetaPatch,
-                  ...applied,
-                }
-              }
-              state.broadcast ||= broadcast
-              upsertAffected(state, { kind: 'chat-meta', chatId })
-            },
-
-            patchChatSummary: (chatId, patch) => {
-              const state = requireChatState(chatId)
-              const current = {
-                ...state.beforeChat,
-                ...state.hiddenMetaPatch,
-                ...state.visibleMetaPatch,
-                ...state.summaryPatch,
-              }
-              const applied = changedPatch(current, stripSummaryPatch(patch))
-              if (!applied) return
-              state.summaryPatch = {
-                ...state.summaryPatch,
-                ...applied,
-              }
-              state.summaryVersionDirty = true
-              state.broadcast = true
-              upsertAffected(state, { kind: 'chat-meta', chatId })
-            },
-
-            getMessage: async (messageId) => {
-              const [header, body] = await Promise.all([
-                tx.table<MessageHeaderRow, MessageId>('messages').get(messageId),
-                tx.table<MessageBodyRow, MessageId>('messageBodies').get(messageId),
-              ])
-              return header && body ? hydrateStoredMessage(header, body) : undefined
-            },
-
-            getMessageHeader: async (messageId) => {
-              const header = await tx.table<MessageHeaderRow, MessageId>('messages').get(messageId)
-              return header ? cloneMessageHeader(header) : undefined
-            },
-
-            getMessageHeaders: async (messageIds) => {
-              const headers = await tx
-                .table<MessageHeaderRow, MessageId>('messages')
-                .bulkGet([...messageIds])
-              return headers.map((header) => (header ? cloneMessageHeader(header) : undefined))
-            },
-
-            listMessages: async (chatId) => listMessagesInTransaction(tx, chatId),
-
-            listMessageHeaders: async (chatId) =>
-              (
-                await tx
-                  .table<MessageHeaderRow, MessageId>('messages')
-                  .where('chatId')
-                  .equals(chatId)
-                  .toArray()
-              ).map(cloneMessageHeader),
-
-            listChildHeaders: async (chatId, parentId) => {
-              return (
-                await listChildHeaderRows(
-                  tx.table<MessageHeaderRow, MessageId>('messages'),
-                  chatId,
-                  parentId,
-                )
-              ).map(cloneMessageHeader)
-            },
-
-            putMessage: async (message, options: PutMessageOptions = {}) => {
-              const { touchChatSummary = true, broadcast = touchChatSummary } = options
-              const headerTable = tx.table<MessageHeaderRow, MessageId>('messages')
-              const bodyTable = tx.table<MessageBodyRow, MessageId>('messageBodies')
-              const existing = await headerTable.get(message.id)
-              const existingBody = existing ? await bodyTable.get(message.id) : undefined
-              const chatId = existing?.chatId ?? message.chatId
-              const needsChatState = touchChatSummary || broadcast
-              let state = needsChatState ? await ensureChatState(chatId) : undefined
-              const clone = cloneMessage(message)
-
-              assertScope({ kind: 'message', messageId: clone.id })
-              if (existing) {
-                if (existing.chatId !== clone.chatId) {
-                  throw new Error(`CrossChatMessageMove:${clone.id}`)
-                }
-                const moved =
-                  existing.parentId !== clone.parentId ||
-                  existing.siblingIndex !== clone.siblingIndex
-                const deletionChanged = existing.deleted !== clone.deleted
-                const leafOrderingChanged = existing.createdAt !== clone.createdAt
-                if (!touchChatSummary && (moved || deletionChanged || leafOrderingChanged)) {
-                  throw new Error(`DeferredMessageWriteRequiresStableTree:${clone.id}`)
-                }
-                if (moved || deletionChanged) {
-                  assertScope({ kind: 'children', chatId, parentId: existing.parentId })
-                  assertScope({ kind: 'children', chatId, parentId: clone.parentId })
-                }
-                if (!existingBody) throw new Error(`MessageBodyMissing:${clone.id}`)
-                const comparable = { ...clone, nodeVersion: existing.nodeVersion }
-                const comparableSplit = splitMessageForStorage(comparable, {
-                  bodyVersion: existing.bodyVersion,
-                  requestContextVersion: existing.requestContextVersion,
-                  updatedAt: existingBody.updatedAt,
-                })
-                const headerChanged =
-                  stableStringify(existing) !== stableStringify(comparableSplit.header)
-                const bodyChanged =
-                  stableStringify(existingBody) !== stableStringify(comparableSplit.body)
-                if (!headerChanged && !bodyChanged) return
-                if (
-                  !touchChatSummary &&
-                  messageBranchCorpusChanged(
-                    existing,
-                    existingBody,
-                    comparableSplit.header,
-                    comparableSplit.body,
-                  )
-                ) {
-                  state ??= await ensureChatState(chatId)
-                  state.branchCorpusDirtyMessageIds.add(clone.id)
-                }
-                if (
-                  streamOwnedMessageFieldsChanged(
-                    existing,
-                    existingBody,
-                    comparableSplit.header,
-                    comparableSplit.body,
-                  )
-                ) {
-                  await assertStreamTargetWriteAllowed(clone.id)
-                }
-                if (
-                  (existing.role === 'user' || clone.role === 'user') &&
-                  (existing.role !== clone.role ||
-                    deletionChanged ||
-                    existing.createdAt !== clone.createdAt ||
-                    stableStringify(existingBody.content) !== stableStringify(clone.content))
-                ) {
-                  const previewState = state ?? (await ensureChatState(chatId))
-                  previewState.previewDirty = true
-                }
-                if (touchChatSummary && (moved || deletionChanged || leafOrderingChanged)) {
-                  await ensureMessageHeaderSnapshots(state as ChatMutationState)
-                }
-                if (touchChatSummary) {
-                  recordMessageSummaryDeltas(
-                    state,
-                    clone.id,
-                    hydrateStoredMessage(existing, existingBody),
-                    clone,
-                  )
-                }
-                recordHeaderBeforeWrite(state, clone.id, existing)
-                const requestContextChanged = messageRequestContextChanged(
-                  existing,
-                  existingBody,
-                  comparableSplit.header,
-                  comparableSplit.body,
-                )
-                clone.nodeVersion = existing.nodeVersion + 1
-                const requestContextVersion =
-                  existing.requestContextVersion + (requestContextChanged ? 1 : 0)
-                let header: MessageHeaderRow
-                let body: MessageBodyRow | undefined
-                if (bodyChanged) {
-                  const split = splitMessageForStorage(clone, {
-                    bodyVersion: existing.bodyVersion + 1,
-                    requestContextVersion,
-                    updatedAt: now,
-                  })
-                  header = split.header
-                  body = split.body
-                } else {
-                  header = {
-                    ...comparableSplit.header,
-                    nodeVersion: clone.nodeVersion,
-                    requestContextVersion,
-                    bodyVersion: existing.bodyVersion,
-                  }
-                }
-                await syncAttachmentReferenceOwner({
-                  ownerKind: 'message',
-                  ownerId: clone.id,
-                  chatId: clone.chatId,
-                  previousRefs: existing.attachmentRefs,
-                  nextRefs: clone.attachmentRefs,
-                })
-                await headerTable.put(header)
-                if (body) await bodyTable.put(body)
-                wroteWorkspaceState = true
-                if (state?.afterHeadersById) {
-                  setMessageHeader(state.afterHeadersById, header)
-                }
-                if (moved || deletionChanged) {
-                  await bumpChildList(chatId, existing.parentId)
-                  if (existing.parentId !== clone.parentId) {
-                    await bumpChildList(chatId, clone.parentId)
-                  }
-                }
-              } else {
-                if (!touchChatSummary) {
-                  throw new Error(`DeferredMessageWriteRequiresExistingRow:${clone.id}`)
-                }
-                const summaryState = state as ChatMutationState
-                const expectedLeafId =
-                  summaryState.incrementalAppends.at(-1)?.id ??
-                  summaryState.beforeChat.lastUpdatedLeafId
-                let incrementalAppend =
-                  !summaryState.afterHeadersById &&
-                  !clone.deleted &&
-                  clone.parentId === expectedLeafId
-                if (incrementalAppend && expectedLeafId !== null) {
-                  const expectedLeaf = await headerTable.get(expectedLeafId)
-                  incrementalAppend =
-                    expectedLeaf !== undefined &&
-                    !expectedLeaf.deleted &&
-                    messageOutranksLeaf(clone, expectedLeaf)
-                }
-                if (!incrementalAppend) {
-                  await ensureMessageHeaderSnapshots(summaryState)
-                }
-                assertScope({ kind: 'children', chatId, parentId: clone.parentId })
-                const { header, body } = splitMessageForStorage(clone, { updatedAt: now })
-                recordHeaderBeforeWrite(summaryState, clone.id, undefined)
-                await syncAttachmentReferenceOwner({
-                  ownerKind: 'message',
-                  ownerId: clone.id,
-                  chatId: clone.chatId,
-                  previousRefs: undefined,
-                  nextRefs: clone.attachmentRefs,
-                })
-                await headerTable.put(header)
-                await bodyTable.put(body)
-                wroteWorkspaceState = true
-                if (clone.role === 'user') summaryState.previewDirty = true
-                recordNewMessageSummary(summaryState, clone)
-                if (summaryState.afterHeadersById) {
-                  setMessageHeader(summaryState.afterHeadersById, header)
-                } else if (incrementalAppend) {
-                  summaryState.incrementalAppends.push(clone)
-                }
-                await bumpChildList(chatId, clone.parentId)
-              }
-
-              if (touchChatSummary && state) {
-                state.summaryVersionDirty = true
-                state.messageSummaryDirty = true
-                state.changedMessageIds.add(clone.id)
-              }
-              if (broadcast && state) {
-                state.broadcast = true
-                upsertAffected(state, { kind: 'message', chatId, messageId: clone.id })
-              }
-              affectedMessageIds.add(clone.id)
-            },
-
-            patchMessageStructure: async (
-              messageId,
-              patch: MessageStructurePatch,
-            ): Promise<void> => {
-              assertScope({ kind: 'message', messageId })
-              const keys = Object.keys(patch)
-              if (
-                keys.some(
-                  (key) => key !== 'deleted' && key !== 'parentId' && key !== 'siblingIndex',
-                )
-              ) {
-                throw new Error(`MessageStructurePatchForbidden:${messageId}`)
-              }
-              const headerTable = tx.table<MessageHeaderRow, MessageId>('messages')
-              const existing = await headerTable.get(messageId)
-              if (!existing) return
-              const next = cloneMessageHeader(existing)
-              if (patch.parentId !== undefined) next.parentId = patch.parentId
-              if (patch.siblingIndex !== undefined) next.siblingIndex = patch.siblingIndex
-              if (patch.deleted !== undefined) next.deleted = patch.deleted
-              const changed =
-                next.parentId !== existing.parentId ||
-                next.siblingIndex !== existing.siblingIndex ||
-                next.deleted !== existing.deleted
-              if (!changed) return
-
-              const state = await ensureChatState(existing.chatId)
-              await ensureMessageHeaderSnapshots(state)
-              assertScope({
-                kind: 'children',
-                chatId: existing.chatId,
-                parentId: existing.parentId,
-              })
-              if (next.parentId !== existing.parentId) {
-                assertScope({
-                  kind: 'children',
-                  chatId: existing.chatId,
-                  parentId: next.parentId,
-                })
-              }
-              await assertStreamTargetWriteAllowed(messageId, { readContinuationBody: false })
-              recordHeaderBeforeWrite(state, messageId, existing)
-              next.nodeVersion = existing.nodeVersion + 1
-              next.requestContextVersion =
-                existing.requestContextVersion +
-                (next.parentId !== existing.parentId || next.deleted !== existing.deleted ? 1 : 0)
-              await headerTable.put(next)
-              wroteWorkspaceState = true
-              setMessageHeader(state.afterHeadersById as Map<MessageId, MessageHeaderRow>, next)
-              await bumpChildList(existing.chatId, existing.parentId)
-              if (next.parentId !== existing.parentId) {
-                await bumpChildList(existing.chatId, next.parentId)
-              }
-              if (existing.role === 'user' && next.deleted !== existing.deleted) {
-                state.previewDirty = true
-              }
-              state.summaryVersionDirty = true
-              state.messageSummaryDirty = true
-              state.broadcast = true
-              state.changedMessageIds.add(messageId)
-              affectedMessageIds.add(messageId)
-              upsertAffected(state, {
-                kind: 'message',
-                chatId: existing.chatId,
-                messageId,
-              })
-            },
-
-            patchMessageBody: async (messageId, patch, options: PatchMessageBodyOptions = {}) => {
-              const {
-                touchChatSummary = true,
-                broadcast = touchChatSummary,
-                headerPatch,
-                replaceBody = false,
-              } = options
-              assertScope({ kind: 'message', messageId })
-              const headerTable = tx.table<MessageHeaderRow, MessageId>('messages')
-              const bodyTable = tx.table<MessageBodyRow, MessageId>('messageBodies')
-              const existing = await headerTable.get(messageId)
-              if (!existing) return
-              let state =
-                touchChatSummary || broadcast ? await ensureChatState(existing.chatId) : undefined
-              const nextHeader = applyMessageHeaderPatch(existing, headerPatch)
-              const generationReplaced =
-                headerPatch !== undefined && Object.hasOwn(headerPatch, 'generation')
-              const preserveColdServerToolOutputs =
-                replaceBody &&
-                !generationReplaced &&
-                (existing.generation?.serverTools?.length ?? 0) > 0
-              const existingBody =
-                replaceBody && !touchChatSummary && !preserveColdServerToolOutputs
-                  ? undefined
-                  : await bodyTable.get(messageId)
-              if (!replaceBody && !existingBody) throw new Error(`MessageBodyMissing:${messageId}`)
-              if (replaceBody && touchChatSummary && !existingBody) {
-                throw new Error(`MessageBodyMissing:${messageId}`)
-              }
-              let nextBody: MessageBodyRow
-              let bodyChanged = true
-              if (!replaceBody) {
-                const patchedBody = applyMessageBodyPatch(existingBody as MessageBodyRow, patch)
-                nextHeader.nodeVersion = existing.nodeVersion
-                nextHeader.bodyVersion = existing.bodyVersion
-                patchedBody.bodyVersion = (existingBody as MessageBodyRow).bodyVersion
-                patchedBody.updatedAt = (existingBody as MessageBodyRow).updatedAt
-                syncMessageHeaderProjections(nextHeader, patchedBody, {
-                  replaceGenerationServerToolOutputs: generationReplaced,
-                })
-                const headerChanged = stableStringify(existing) !== stableStringify(nextHeader)
-                bodyChanged = stableStringify(existingBody) !== stableStringify(patchedBody)
-                if (!headerChanged && !bodyChanged) return
-                const requestContextChanged = messageRequestContextChanged(
-                  existing,
-                  existingBody as MessageBodyRow,
-                  nextHeader,
-                  patchedBody,
-                )
-                nextHeader.nodeVersion = existing.nodeVersion + 1
-                nextHeader.requestContextVersion =
-                  existing.requestContextVersion + (requestContextChanged ? 1 : 0)
-                nextHeader.bodyVersion = existing.bodyVersion + (bodyChanged ? 1 : 0)
-                nextBody = bodyChanged
-                  ? {
-                      ...patchedBody,
-                      bodyVersion: nextHeader.bodyVersion,
-                      updatedAt: now,
-                    }
-                  : (existingBody as MessageBodyRow)
-                if (touchChatSummary) {
-                  recordMessageSummaryDeltas(
-                    state,
-                    messageId,
-                    hydrateStoredMessage(existing, existingBody as MessageBodyRow),
-                    hydrateStoredMessage(nextHeader, nextBody),
-                  )
-                }
-              } else {
-                await assertStreamTargetWriteAllowed(messageId)
-                nextHeader.nodeVersion = existing.nodeVersion + 1
-                nextHeader.bodyVersion = existing.bodyVersion + 1
-                nextBody = replacementMessageBody(nextHeader, patch, {
-                  bodyVersion: nextHeader.bodyVersion,
-                  updatedAt: now,
-                })
-                if (preserveColdServerToolOutputs && existingBody?.generationServerToolOutputs) {
-                  nextBody.generationServerToolOutputs = structuredClone(
-                    existingBody.generationServerToolOutputs,
-                  )
-                }
-                syncMessageHeaderProjections(nextHeader, nextBody, {
-                  replaceGenerationServerToolOutputs: generationReplaced,
-                })
-                nextHeader.requestContextVersion =
-                  existing.requestContextVersion +
-                  (existingBody &&
-                  !messageRequestContextChanged(existing, existingBody, nextHeader, nextBody)
-                    ? 0
-                    : 1)
-                if (touchChatSummary) {
-                  recordMessageSummaryDeltas(
-                    state,
-                    messageId,
-                    hydrateStoredMessage(existing, existingBody as MessageBodyRow),
-                    hydrateStoredMessage(nextHeader, nextBody),
-                  )
-                }
-              }
-              if (
-                !touchChatSummary &&
-                (!existingBody ||
-                  messageBranchCorpusChanged(existing, existingBody, nextHeader, nextBody))
-              ) {
-                state ??= await ensureChatState(existing.chatId)
-                state.branchCorpusDirtyMessageIds.add(messageId)
-              }
-              if (
-                !replaceBody &&
-                streamOwnedMessageFieldsChanged(
-                  existing,
-                  existingBody as MessageBodyRow,
-                  nextHeader,
-                  nextBody,
-                )
-              ) {
-                await assertStreamTargetWriteAllowed(messageId)
-              }
-              if (
-                headerPatch !== undefined &&
-                Object.hasOwn(headerPatch, 'attachmentRefs') &&
-                stableStringify(existing.attachmentRefs ?? []) !==
-                  stableStringify(nextHeader.attachmentRefs ?? [])
-              ) {
-                await syncAttachmentReferenceOwner({
-                  ownerKind: 'message',
-                  ownerId: nextHeader.id,
-                  chatId: nextHeader.chatId,
-                  previousRefs: existing.attachmentRefs,
-                  nextRefs: nextHeader.attachmentRefs,
-                })
-              }
-              recordHeaderBeforeWrite(state, messageId, existing)
-              await headerTable.put(nextHeader)
-              if (bodyChanged) await bodyTable.put(nextBody)
-              wroteWorkspaceState = true
-              if (existing.role === 'user' && Object.hasOwn(patch, 'content')) {
-                const previewState = state ?? (await ensureChatState(existing.chatId))
-                previewState.previewDirty = true
-              }
-              if (state?.afterHeadersById) {
-                setMessageHeader(state.afterHeadersById, nextHeader)
-              }
-              if (touchChatSummary && state) {
-                state.summaryVersionDirty = true
-                state.messageSummaryDirty = true
-                state.changedMessageIds.add(messageId)
-              }
-              if (broadcast && state) {
-                state.broadcast = true
-                upsertAffected(state, {
-                  kind: 'message',
-                  chatId: existing.chatId,
-                  messageId,
-                })
-              }
-              affectedMessageIds.add(messageId)
-            },
-
-            patchMessageCalibration: async (messageId, patch) => {
-              assertScope({ kind: 'message', messageId })
-              const headerTable = tx.table<MessageHeaderRow, MessageId>('messages')
-              const existing = await headerTable.get(messageId)
-              if (!existing) return undefined
-              const next = applyMessageCalibrationPatch(existing, patch)
-              if (stableStringify(existing) === stableStringify(next)) {
-                return cloneMessageHeader(existing)
-              }
-              next.nodeVersion = existing.nodeVersion + 1
-              next.requestContextVersion = existing.requestContextVersion
-              next.bodyVersion = existing.bodyVersion
-              await headerTable.put(next)
-              wroteWorkspaceState = true
-              affectedMessageIds.add(messageId)
-              return cloneMessageHeader(next)
-            },
-
-            deleteMessage: async (messageId) => {
-              assertScope({ kind: 'message', messageId })
-              const table = tx.table<MessageHeaderRow, MessageId>('messages')
-              const existing = await table.get(messageId)
-              if (!existing) return
-              await assertStreamTargetWriteAllowed(messageId)
-              const state = await ensureChatState(existing.chatId)
-              await ensureMessageHeaderSnapshots(state)
-              assertScope({
-                kind: 'children',
-                chatId: existing.chatId,
-                parentId: existing.parentId,
-              })
-              await syncAttachmentReferenceOwner({
-                ownerKind: 'message',
-                ownerId: existing.id,
-                chatId: existing.chatId,
-                previousRefs: existing.attachmentRefs,
-                nextRefs: [],
-              })
-              recordHeaderBeforeWrite(state, messageId, existing)
-              await table.delete(messageId)
-              await tx.table<MessageBodyRow, MessageId>('messageBodies').delete(messageId)
-              wroteWorkspaceState = true
-              if (existing.role === 'user') state.previewDirty = true
-              state.afterHeadersById?.delete(messageId)
-              await bumpChildList(existing.chatId, existing.parentId)
-              state.summaryVersionDirty = true
-              state.messageSummaryDirty = true
-              state.broadcast = true
-              state.changedMessageIds.add(messageId)
-              affectedMessageIds.add(messageId)
-              upsertAffected(state, {
-                kind: 'message',
-                chatId: existing.chatId,
-                messageId,
-              })
-            },
-
-            getChildList: async (chatId, parentId) => {
-              const row = await tx
-                .table<ChildListState, string>('childLists')
-                .get(childListKey(chatId, parentId))
-              return (
-                row ?? {
-                  id: childListKey(chatId, parentId),
-                  chatId,
-                  parentId,
-                  version: 0,
-                  updatedAt: 0,
-                }
-              )
-            },
-
-            bumpChildList,
-
-            getAttachment: async (attachmentId) => {
-              const header = await tx
-                .table<AttachmentHeaderRow, AttachmentId>('attachments')
-                .get(attachmentId)
-              return header
-                ? hydrateStoredAttachment(
-                    header,
-                    tx.table<AttachmentArtifact, string>('attachmentArtifacts'),
-                  )
-                : undefined
-            },
-
-            putAttachment: async (attachment) => {
-              assertScope({ kind: 'attachment', attachmentId: attachment.id })
-              const refCount = await tx
-                .table<AttachmentReferenceEdge>('attachmentRefEdges')
-                .where('attachmentId')
-                .equals(attachment.id)
-                .count()
-              await tx
-                .table<AttachmentHeaderRow, AttachmentId>('attachments')
-                .put(splitAttachmentForStorage({ ...attachment, refCount }))
-              wroteWorkspaceState = true
-            },
-
-            deleteAttachment: async (attachmentId) => {
-              assertScope({ kind: 'attachment', attachmentId })
-              const table = tx.table<AttachmentHeaderRow, AttachmentId>('attachments')
-              const existing = await table.get(attachmentId)
-              if (!existing) return
-              if (!(await requireNoAttachmentReferences(tx, attachmentId))) {
-                throw new Error(`AttachmentStillReferenced:${attachmentId}`)
-              }
-              await tx
-                .table<AttachmentBlob, string>('attachmentBlobs')
-                .where('attachmentId')
-                .equals(attachmentId)
-                .delete()
-              await tx
-                .table<AttachmentArtifact, string>('attachmentArtifacts')
-                .where('attachmentId')
-                .equals(attachmentId)
-                .delete()
-              await tx
-                .table<AttachmentJob, string>('attachmentJobs')
-                .where('attachmentId')
-                .equals(attachmentId)
-                .delete()
-              await table.delete(attachmentId)
-              wroteWorkspaceState = true
-            },
-
-            countAttachmentReferences: async (attachmentId) =>
-              attachmentReferenceCounts(tx, attachmentId),
-
-            deleteAttachmentBlobs: async (attachmentId) => {
-              assertScope({ kind: 'attachment', attachmentId })
-              await tx
-                .table<AttachmentBlob, string>('attachmentBlobs')
-                .where('attachmentId')
-                .equals(attachmentId)
-                .delete()
-              wroteWorkspaceState = true
-            },
-
-            deleteAttachmentArtifacts: async (attachmentId) => {
-              assertScope({ kind: 'attachment', attachmentId })
-              await tx
-                .table<AttachmentArtifact, string>('attachmentArtifacts')
-                .where('attachmentId')
-                .equals(attachmentId)
-                .delete()
-              wroteWorkspaceState = true
-            },
-
-            deleteAttachmentJobs: async (attachmentId) => {
-              assertScope({ kind: 'attachment', attachmentId })
-              await tx
-                .table<AttachmentJob, string>('attachmentJobs')
-                .where('attachmentId')
-                .equals(attachmentId)
-                .delete()
-              wroteWorkspaceState = true
-            },
-
-            getAttachmentBlob: async (blobId) =>
-              tx.table<AttachmentBlob, string>('attachmentBlobs').get(blobId),
-
-            putAttachmentBlob: async (blob) => {
-              assertScope({ kind: 'attachment', attachmentId: blob.attachmentId })
-              await tx.table<AttachmentBlob, string>('attachmentBlobs').put(blob)
-              wroteWorkspaceState = true
-            },
-
-            deleteAttachmentBlob: async (blobId) => {
-              const table = tx.table<AttachmentBlob, string>('attachmentBlobs')
-              const existing = await table.get(blobId)
-              if (!existing) return
-              assertScope({ kind: 'attachment', attachmentId: existing.attachmentId })
-              await table.delete(blobId)
-              wroteWorkspaceState = true
-            },
-
-            putAttachmentArtifact: async (artifact) => {
-              assertScope({ kind: 'attachment', attachmentId: artifact.attachmentId })
-              await tx.table<AttachmentArtifact, string>('attachmentArtifacts').put(artifact)
-              wroteWorkspaceState = true
-            },
-
-            deleteAttachmentArtifact: async (artifactId) => {
-              const table = tx.table<AttachmentArtifact, string>('attachmentArtifacts')
-              const existing = await table.get(artifactId)
-              if (!existing) return
-              assertScope({ kind: 'attachment', attachmentId: existing.attachmentId })
-              await table.delete(artifactId)
-              wroteWorkspaceState = true
-            },
-
-            putAttachmentJob: async (job) => {
-              assertScope({ kind: 'attachment', attachmentId: job.attachmentId })
-              await tx.table<AttachmentJob, string>('attachmentJobs').put(job)
-              wroteWorkspaceState = true
-            },
-
-            deleteAttachmentJob: async (jobId) => {
-              const table = tx.table<AttachmentJob, string>('attachmentJobs')
-              const existing = await table.get(jobId)
-              if (!existing) return
-              assertScope({ kind: 'attachment', attachmentId: existing.attachmentId })
-              await table.delete(jobId)
-              wroteWorkspaceState = true
-            },
-
-            getDraft: async (chatId) => {
-              const row = await tx.table<DraftRow, ChatId>('drafts').get(chatId)
-              return row ? cloneDraft(row) : undefined
-            },
-
-            putDraft: async (draft) => {
-              assertScope({ kind: 'draft', chatId: draft.chatId })
-              const state = await ensureChatState(draft.chatId)
-              const table = tx.table<DraftRow, ChatId>('drafts')
-              const existing = await table.get(draft.chatId)
-              const normalized = cloneDraft(draft)
-              if (existing && stableStringify(cloneDraft(existing)) === stableStringify(normalized))
-                return
-              if (
-                stableStringify(existing?.attachmentRefs ?? []) !==
-                stableStringify(normalized.attachmentRefs)
-              ) {
-                await syncAttachmentReferenceOwner({
-                  ownerKind: 'draft',
-                  ownerId: normalized.chatId,
-                  chatId: normalized.chatId,
-                  previousRefs: existing?.attachmentRefs,
-                  nextRefs: normalized.attachmentRefs,
-                })
-              }
-              await table.put(normalized)
-              wroteWorkspaceState = true
-              state.broadcast = true
-              upsertAffected(state, { kind: 'draft', chatId: draft.chatId })
-            },
-
-            deleteDraft: async (chatId) => {
-              assertScope({ kind: 'draft', chatId })
-              const state = await ensureChatState(chatId)
-              const table = tx.table<DraftRow, ChatId>('drafts')
-              const existing = await table.get(chatId)
-              if (!existing) return
-              await syncAttachmentReferenceOwner({
-                ownerKind: 'draft',
-                ownerId: chatId,
-                chatId,
-                previousRefs: existing.attachmentRefs,
-                nextRefs: [],
-              })
-              await table.delete(chatId)
-              wroteWorkspaceState = true
-              state.broadcast = true
-              upsertAffected(state, { kind: 'draft', chatId })
-            },
-          }
-
-          const value = await fn(ctx)
-
-          const chatVersions: Record<ChatId, ChatVersions> = {}
-          const affectedChatIds: ChatId[] = []
-          const chatTable = tx.table<Chat, ChatId>('chats')
-
-          for (const [chatId, state] of chatStates) {
-            const current = await chatTable.get(chatId)
-            if (!current) throw new ChatMissingError(chatId)
-            const next: Chat = {
-              ...current,
-              ...state.hiddenMetaPatch,
-              ...state.visibleMetaPatch,
-            }
-
-            if (state.visibleMetaDirty) {
-              next.metaVersion = current.metaVersion + 1
-            }
-
-            if (state.summaryVersionDirty) {
-              next.updatedAt = now
-              next.summaryVersion = current.summaryVersion + 1
-            }
-
-            if (state.messageSummaryDirty) {
-              if (state.afterHeadersById) {
-                const afterHeaders = [...state.afterHeadersById.values()]
-                const nextLeafId = findLastUpdatedLeafIdFromHeaders(afterHeaders)
-                next.lastUpdatedLeafId = nextLeafId
-                next.wordCount = structuralBranchWordCount({
-                  afterHeaders,
-                  nextLeafId,
-                })
-                next.totalCostUsd = computeTotalCostUsd(afterHeaders)
-                const lastBranchUpdatedAtChanged = shouldBumpLastBranchUpdatedAt(
-                  state.beforeChat,
-                  state.beforeHeaders ?? [],
-                  afterHeaders,
-                  state.changedMessageIds,
-                )
-                if (lastBranchUpdatedAtChanged) {
-                  next.lastBranchUpdatedAt = nextBranchUpdatedAt(current.lastBranchUpdatedAt, now)
-                }
-                if (
-                  nextLeafId !== state.beforeChat.lastUpdatedLeafId ||
-                  lastBranchUpdatedAtChanged
-                ) {
-                  await invalidateBranchCacheForSummary(tx, chatId)
-                  wroteWorkspaceState = true
-                  pendingBranchCacheEvents.add(chatId)
-                }
-              } else {
-                const nextLeafId =
-                  state.incrementalAppends.at(-1)?.id ?? state.beforeChat.lastUpdatedLeafId
-                const branchHeaders = await branchHeadersByLeafInTransaction(tx, chatId, nextLeafId)
-                next.lastUpdatedLeafId = nextLeafId
-                let wordCountDelta = 0
-                const branchIds = new Set(branchHeaders.map((header) => header.id))
-                for (const [messageId, delta] of state.wordCountDeltas) {
-                  if (branchIds.has(messageId)) wordCountDelta += delta
-                }
-                next.wordCount = Math.max(0, current.wordCount + wordCountDelta)
-                next.totalCostUsd = Math.max(0, current.totalCostUsd + state.totalCostDelta)
-                const lastBranchUpdatedAtChanged = shouldBumpLastBranchUpdatedAtFromHeaders(
-                  state.beforeChat,
-                  nextLeafId,
-                  branchHeaders,
-                  state.changedMessageIds,
-                )
-                if (lastBranchUpdatedAtChanged) {
-                  next.lastBranchUpdatedAt = nextBranchUpdatedAt(current.lastBranchUpdatedAt, now)
-                }
-                if (
-                  nextLeafId !== state.beforeChat.lastUpdatedLeafId ||
-                  lastBranchUpdatedAtChanged
-                ) {
-                  await invalidateBranchCacheForSummary(tx, chatId)
-                  wroteWorkspaceState = true
-                  pendingBranchCacheEvents.add(chatId)
-                }
-              }
-            }
-
-            if (state.branchCorpusDirtyMessageIds.size > 0 && next.lastUpdatedLeafId !== null) {
-              const branchHeaders = await branchHeadersByLeafInTransaction(
-                tx,
-                chatId,
-                next.lastUpdatedLeafId,
-              )
-              if (
-                branchHeaders.some((header) => state.branchCorpusDirtyMessageIds.has(header.id))
-              ) {
-                next.lastBranchUpdatedAt = nextBranchUpdatedAt(current.lastBranchUpdatedAt, now)
-                await invalidateBranchCacheForSummary(tx, chatId)
-                wroteWorkspaceState = true
-                pendingBranchCacheEvents.add(chatId)
-              }
-            }
-
-            if (state.previewDirty) {
-              next.previewText = await chatPreviewInTransaction(tx, chatId)
-            }
-
-            const summaryPatch = stripSummaryPatch(state.summaryPatch)
-            const patched: Chat = { ...next, ...summaryPatch }
-
-            const changed = stableStringify(current) !== stableStringify(patched)
-            if (changed) {
-              await chatTable.put(patched)
-              await putChatSidebarProjection(tx, patched)
-              wroteWorkspaceState = true
-              affectedChatIds.push(chatId)
-            }
-            chatVersions[chatId] = {
-              metaVersion: patched.metaVersion,
-              summaryVersion: patched.summaryVersion,
-            }
-          }
-
-          if (wroteWorkspaceState) {
-            await bumpWorkspaceMeta(tx, now)
-          }
-
-          for (const [chatId, state] of chatStates) {
-            if (!state.broadcast) continue
-            const versions = chatVersions[chatId]
-            if (!versions) continue
-            pendingEvents.push({
-              chatId,
-              versions,
-              affected: [...state.affected.values()],
-            })
-          }
-
-          return {
-            value,
-            affectedChatIds,
-            affectedMessageIds: [...affectedMessageIds],
-            chatVersions,
-          }
-        },
-      ),
+    fn: (ctx: MutationContext, operations: BrowserMutationOperations) => Promise<T> | T,
+    options: WorkspaceMutationOptions | undefined,
+    commandCommit: BrowserMutationCommandPort,
+    finalize?: (ctx: MutationFinalizationContext, value: T) => Promise<U> | U,
+    transactionExtension?: BrowserMutationTransactionExtension<T, ExtensionResult>,
+  ): Promise<
+    WorkspaceMutationResult<U> & { readonly transactionExtensionResult: ExtensionResult }
+  > {
+    const { runBrowserMutation } = await import('./browser-mutation-runtime')
+    return runBrowserMutation(
+      scopes,
+      fn,
+      options,
+      commandCommit,
+      browserMutationSharedInternals,
+      finalize,
+      transactionExtension,
     )
-
-    for (const event of pendingEvents) {
-      postEvent({
-        kind: 'chat-mutated',
-        chatId: event.chatId,
-        metaVersion: event.versions.metaVersion,
-        summaryVersion: event.versions.summaryVersion,
-        affected: event.affected,
-      })
-    }
-    for (const chatId of pendingBranchCacheEvents) {
-      postEvent({ kind: 'branch-cache-refreshed', chatId })
-    }
-
-    return result
   }
 }
 
-let singleton: WorkspaceRepository | null = null
+function assertPermitFence(
+  permit: { workspaceId: string; replacementEpoch: number },
+  durable: { workspaceId: string; replacementEpoch: number },
+): void {
+  if (
+    permit.workspaceId !== durable.workspaceId ||
+    permit.replacementEpoch !== durable.replacementEpoch
+  ) {
+    throw new WorkspaceReplacementFenceError()
+  }
+}
+
+function linkWorkspaceQuerySignals(
+  permitSignal: AbortSignal,
+  requestedSignal: AbortSignal | undefined,
+): { signal: AbortSignal; dispose: () => void } {
+  if (!requestedSignal || requestedSignal === permitSignal) {
+    return { signal: permitSignal, dispose: () => undefined }
+  }
+  const controller = new AbortController()
+  const sources = [permitSignal, requestedSignal]
+  const disposers: Array<() => void> = []
+  for (const source of sources) {
+    if (source.aborted) {
+      controller.abort(source.reason)
+      break
+    }
+    const abort = () => controller.abort(source.reason)
+    source.addEventListener('abort', abort, { once: true })
+    disposers.push(() => source.removeEventListener('abort', abort))
+  }
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      for (const dispose of disposers) dispose()
+    },
+  }
+}
+
+function throwIfWorkspaceQueryAborted(signal: AbortSignal): void {
+  if (!signal.aborted) return
+  throw signal.reason ?? new DOMException('Workspace query aborted', 'AbortError')
+}
+
+function chatTokenCalibrationGeneration(chat: Pick<Chat, 'tokenCalibrationGeneration'>): number {
+  const generation = chat.tokenCalibrationGeneration
+  return typeof generation === 'number' && Number.isSafeInteger(generation) && generation >= 0
+    ? generation
+    : 0
+}
+
+function streamFenceMatches(
+  lease: StreamLeaseRow | undefined,
+  fence: StreamWriteFence,
+  replacementEpoch: number,
+): lease is FencedStreamLeaseRow {
+  return Boolean(
+    streamLeaseMatchesWriteFence(lease, fence) && replacementEpoch === fence.replacementEpoch,
+  )
+}
+
+function requiredStreamPostCommitEvidence(lease: StreamLeaseRow): StreamPostCommitEvidence {
+  return lease.postCommit
+}
+
+function calibrationUsageFromPostCommit(usage: StreamPostCommitUsageEvidence): ChatUsage {
+  return {
+    prompt_tokens: usage.promptTokens,
+    completion_tokens: usage.completionTokens,
+    total_tokens: Math.min(Number.MAX_SAFE_INTEGER, usage.promptTokens + usage.completionTokens),
+    ...(usage.reasoningTokens === undefined
+      ? {}
+      : { completion_tokens_details: { reasoning_tokens: usage.reasoningTokens } }),
+  }
+}
+
+function monotonicTimestamp(current: number | undefined, next: number): number {
+  return Math.max(current ?? 0, next)
+}
+
+function strictlyMonotonicTimestamp(current: number, next: number): number {
+  return Math.max(current + 1, next)
+}
+
+function continuationGlobalCalibration(value: unknown): GlobalTokenCalibration | undefined {
+  if (!value || typeof value !== 'object') return undefined
+  const calibration = value as Partial<GlobalTokenCalibration>
+  if (calibration.version !== 1 || !calibration.byModel) return undefined
+  return structuredClone(calibration as GlobalTokenCalibration)
+}
+
+function preparedMessage(
+  message: Message,
+  parentId: MessageId | null,
+  siblingIndex: number,
+): Message {
+  return {
+    ...structuredClone(message),
+    parentId,
+    siblingIndex,
+    nodeVersion: 0,
+    deleted: false,
+  }
+}
+
+function preparedGenerationPrompt(
+  leafId: MessageId | null,
+  canonicalHeaders: ValidatedGenerationPromptPathHeaders,
+  messageProofs: readonly GenerationMessageReadProof[],
+  knownPresentations: readonly [] | readonly [MessagePresentation],
+): PreparedGenerationPrompt {
+  if ((canonicalHeaders.at(-1)?.id ?? null) !== leafId) {
+    throw new Error(`PreparedGenerationPromptLeafMismatch:${leafId ?? 'root'}`)
+  }
+  if (messageProofs.length !== canonicalHeaders.length) {
+    throw new Error(`PreparedGenerationPromptProofCountMismatch:${leafId ?? 'root'}`)
+  }
+  const canonicalPresentations = Object.freeze(
+    knownPresentations.flatMap((presentation) => {
+      const header = canonicalHeaders.find((candidate) => candidate.id === presentation.header.id)
+      if (
+        !header ||
+        presentation.message.id !== header.id ||
+        presentation.message.chatId !== header.chatId ||
+        presentation.bodyVersion !== header.bodyVersion
+      ) {
+        return []
+      }
+      return [
+        Object.freeze({
+          header,
+          message: rebaseHydratedMessageHeader(structuredClone(presentation.message), header),
+          bodyVersion: header.bodyVersion,
+        }),
+      ]
+    }),
+  )
+  return Object.freeze({
+    leafId,
+    headers: canonicalHeaders,
+    messageProofs,
+    knownPresentations: canonicalPresentations,
+  })
+}
+
+type PreparedAttemptAssistantMessage = Message & {
+  generation: GenerationMeta
+}
+
+function assertPreparedAttemptMessage(
+  message: Message,
+  lease: StreamLeaseAdmission,
+  role: 'assistant',
+  origin: 'generated',
+): asserts message is PreparedAttemptAssistantMessage
+function assertPreparedAttemptMessage(
+  message: Message,
+  lease: StreamLeaseAdmission,
+  role: 'user',
+  origin: 'user',
+): void
+function assertPreparedAttemptMessage(
+  message: Message,
+  lease: StreamLeaseAdmission,
+  role: 'user' | 'assistant',
+  origin: 'user' | 'generated',
+): void {
+  if (
+    message.chatId !== lease.chatId ||
+    message.role !== role ||
+    message.origin !== origin ||
+    message.deleted
+  ) {
+    throw new Error(`AttemptPreparedMessageInvalid:${message.id}`)
+  }
+  if (role === 'assistant') {
+    const generation = message.generation
+    if (
+      message.id !== lease.messageId ||
+      !generation ||
+      generation.id !== undefined ||
+      generation.status !== 'preparing' ||
+      generation.startedAt !== lease.startedAt ||
+      generation.finishedAt !== undefined ||
+      !generation.model ||
+      !generation.requestedModel
+    ) {
+      throw new Error(`AttemptPreparedGenerationInvalid:${message.id}`)
+    }
+  }
+}
+
+function assertNewChatAttemptRow(chat: Chat, chatId: ChatId): void {
+  if (
+    chat.id !== chatId ||
+    chat.lastUpdatedLeafId !== null ||
+    chat.wordCount !== 0 ||
+    chat.totalCostUsd !== 0 ||
+    chat.metaVersion !== 0 ||
+    chat.summaryVersion !== 0 ||
+    chat.structuralVersion !== 0 ||
+    chat.archived ||
+    chat.temporary === true ||
+    !chat.settings.profileId ||
+    !chat.settings.model
+  ) {
+    throw new Error(`AttemptInitialChatInvalid:${chatId}`)
+  }
+}
+
+const browserGenerationCommandSupport: BrowserGenerationCommandSupport = Object.freeze({
+  GENERATION_METADATA_TRANSACTION,
+  appendValidatedGenerationPromptPath,
+  applyMessageCalibrationPatch,
+  assertNewChatAttemptRow,
+  assertPreparedAttemptMessage,
+  calibrationUsageFromPostCommit,
+  chatConfigurationTargetResourceNames,
+  chatTokenCalibrationGeneration,
+  cloneMessageHeader,
+  continuationGlobalCalibration,
+  dedupeMutationScopes,
+  monotonicTimestamp,
+  persistPreparedAttachmentBundleInMutation,
+  preparedAttachmentIdentityMatches,
+  preparedGenerationPrompt,
+  preparedMessage,
+  requiredPromptPathSlot,
+  requiredPromptPathTarget,
+  resolveGenerationPromptPathProof,
+  stableStringify,
+  streamFenceMatches,
+})
+
+function workspaceAttachmentChatTitle(chat: Pick<Chat, 'title'> | undefined): string {
+  const title = chat ? chat.title.trim() : ''
+  return title && title.length > 0 ? title : 'Untitled chat'
+}
+
+type CommittedMessageRevision = WorkspaceLocalMessageRevision
+
+function attemptTargetCommittedFacts(
+  command: WorkspaceCommand,
+  value: unknown,
+): readonly WorkspaceDeltaFact[] {
+  if (command.kind !== 'attempt.finalize') return Object.freeze([])
+  const result = value as AttemptFinalizeResult
+  const presentation = result.presentation
+  if (!presentation || result.outcome === 'target-missing') return Object.freeze([])
+  const lease = result.lease
+  if (lease.phase !== 'canonical' && lease.phase !== 'metadata-committed') {
+    throw new Error(`AttemptTargetCommitLeaseInvalid:${command.input.streamId}`)
+  }
+  const expectedBodyVersion = lease.postCommit.final.expectedBodyVersion
+  if (expectedBodyVersion !== presentation.bodyVersion) {
+    throw new Error(`AttemptTargetCommitBodyVersionMismatch:${command.input.streamId}`)
+  }
+  return Object.freeze([
+    Object.freeze({
+      kind: 'attempt-target-committed' as const,
+      streamId: lease.streamId,
+      chatId: lease.chatId,
+      messageId: lease.messageId,
+      attemptKind: lease.attemptKind,
+      admissionSequence: lease.admissionSequence,
+      leaseRevision: lease.revision,
+      bodyVersion: expectedBodyVersion,
+    }),
+  ])
+}
+
+function attemptStopRequestedFacts(
+  command: WorkspaceCommand,
+  value: unknown,
+): readonly WorkspaceDeltaFact[] {
+  if (command.kind !== 'attempt.request-stop') return Object.freeze([])
+  const result = value as AttemptRequestStopResult
+  if (result.outcome !== 'accepted') return Object.freeze([])
+  const lease = result.lease
+  const control = lease.stopControl
+  if (!control || lease.controlRevision < 1) {
+    throw new Error(`AttemptStopCommitEvidenceMissing:${command.input.streamId}`)
+  }
+  return Object.freeze([
+    Object.freeze({
+      kind: 'attempt-stop-requested' as const,
+      streamId: lease.streamId,
+      chatId: lease.chatId,
+      messageId: lease.messageId,
+      attemptKind: lease.attemptKind,
+      admissionSequence: lease.admissionSequence,
+      controlRevision: lease.controlRevision,
+      requestId: control.requestId,
+      requestedBy: control.requestedBy,
+      requestedAt: control.requestedAt,
+      reason: control.reason,
+    }),
+  ])
+}
+
+function collapseConversationConstructionPublication(delta: WorkspaceDelta): WorkspaceDelta {
+  const constructedChatIds = new Set(
+    delta.facts.flatMap((fact) => (fact.kind === 'conversation-created' ? [fact.chatId] : [])),
+  )
+  if (constructedChatIds.size === 0) return delta
+  const attachmentChanged =
+    delta.facts.some((fact) => fact.kind === 'attachment-row-changed') ||
+    delta.invalidations.some((invalidation) => invalidation.kind === 'attachment')
+  const attachmentJobsChanged = delta.invalidations.some(
+    (invalidation) => invalidation.kind === 'attachment-job',
+  )
+  const conversationInvalidations = delta.invalidations.flatMap(
+    (invalidation): WorkspaceDependency[] => {
+      if (invalidation.kind === 'chat' || invalidation.kind === 'sidebar') {
+        if (!invalidation.chatIds) return [invalidation]
+        const chatIds = invalidation.chatIds.filter((chatId) => !constructedChatIds.has(chatId))
+        return chatIds.length > 0 ? [{ ...invalidation, chatIds }] : []
+      }
+      if (
+        invalidation.kind === 'message-header' ||
+        invalidation.kind === 'message-body' ||
+        invalidation.kind === 'message-preview' ||
+        invalidation.kind === 'child-slot'
+      ) {
+        return invalidation.chatId && constructedChatIds.has(invalidation.chatId)
+          ? []
+          : [invalidation]
+      }
+      return [invalidation]
+    },
+  )
+  return {
+    facts: delta.facts.filter((fact) => {
+      if (fact.kind === 'attachment-row-changed') return false
+      if (fact.kind === 'message-revision') return !constructedChatIds.has(fact.chatId)
+      if (fact.kind === 'sidebar-row-changed' || fact.kind === 'sidebar-row-deleted') {
+        return !constructedChatIds.has(fact.chatId)
+      }
+      return true
+    }),
+    invalidations: normalizeWorkspaceDependencies([
+      ...conversationInvalidations.filter(
+        (invalidation) =>
+          invalidation.kind !== 'attachment' && invalidation.kind !== 'attachment-job',
+      ),
+      ...(attachmentChanged ? [{ kind: 'attachment' as const }] : []),
+      ...(attachmentJobsChanged ? [{ kind: 'attachment-job' as const }] : []),
+    ]),
+  }
+}
+
+let singleton: { repository: WorkspaceRepository; session: BrowserWorkspaceSession } | null = null
+
+async function replaceBrowserRepository<R extends WorkspaceReplacement>(
+  replacement: R,
+): Promise<WorkspaceReplacementEnvelope<WorkspaceReplacementResult<R>>> {
+  const { replaceBrowserWorkspace } = await import('./browser-workspace-replacement')
+  return replaceBrowserWorkspace(replacement)
+}
+
+function bindRepositoryToSession(
+  target: BrowserWorkspaceRepository,
+  session: BrowserWorkspaceSession,
+): WorkspaceRepository {
+  const run = <T>(operation: () => Promise<T>): Promise<T> => {
+    try {
+      return runBrowserWorkspaceRepositoryOperation(() => session.runOperation(operation))
+    } catch (error) {
+      return Promise.reject(
+        error instanceof Error
+          ? error
+          : new Error('BrowserWorkspaceRepositoryOperationFailed', { cause: error }),
+      )
+    }
+  }
+  return Object.freeze({
+    query: <Q extends WorkspaceQuery>(
+      permit: WorkspaceReadAuthority,
+      query: Q,
+      options?: WorkspaceQueryOptions<Q>,
+    ) => run(() => target.query(permit, query, options)),
+    execute: <C extends WorkspaceCommand>(permit: WorkspaceWriteAuthority, command: C) =>
+      run(() => target.execute(permit, command)),
+    replace: <R extends WorkspaceReplacement>(replacement: R) => target.replace(replacement),
+    subscribeChanges: (
+      listener: (change: WorkspaceChange) => void,
+      options?: { readonly delivery?: 'all' | 'remote' },
+    ) => target.subscribeChanges(listener, options),
+  })
+}
+
+function currentBrowserWorkspaceSessionRepository(): WorkspaceRepository {
+  const session = getBrowserWorkspaceSession()
+  if (singleton?.session !== session) {
+    const target = new BrowserWorkspaceRepository(session)
+    singleton = { repository: bindRepositoryToSession(target, session), session }
+  }
+  return singleton.repository
+}
+
+const stableBrowserRepository: WorkspaceRepository = Object.freeze({
+  query: <Q extends WorkspaceQuery>(
+    permit: WorkspaceReadAuthority,
+    query: Q,
+    options?: WorkspaceQueryOptions<Q>,
+  ) => currentBrowserWorkspaceSessionRepository().query(permit, query, options),
+  execute: <C extends WorkspaceCommand>(permit: WorkspaceWriteAuthority, command: C) =>
+    currentBrowserWorkspaceSessionRepository().execute(permit, command),
+  replace: replaceBrowserRepository,
+  subscribeChanges: subscribeWorkspaceChanges,
+})
 
 export function getBrowserRepository(): WorkspaceRepository {
-  singleton ??= new BrowserWorkspaceRepository()
-  return singleton
+  return stableBrowserRepository
 }
 
-export function __resetBrowserRepositoryForTests(): void {
+export function __getBrowserWorkspaceSessionRepositoryForTests(): WorkspaceRepository {
+  return currentBrowserWorkspaceSessionRepository()
+}
+
+function resetBrowserRepository(): void {
   singleton = null
 }
+
+export const __resetBrowserRepositoryForTests = resetBrowserRepository

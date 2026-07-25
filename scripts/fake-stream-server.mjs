@@ -113,7 +113,7 @@ async function handleRequest(request, response) {
 
   const control = parseControlRoute(url.pathname)
   if (control) {
-    await handleControlRequest(request, response, control.scenarioId)
+    await handleControlRequest(request, response, control.scenarioId, control.action)
     return
   }
 
@@ -161,6 +161,44 @@ async function handleRequest(request, response) {
     )
     return
   }
+  if (provider.relativePath === `/models/${MODEL_ID}/endpoints`) {
+    if (method !== 'GET') throw new HttpError(405, 'Method not allowed')
+    sendJson(
+      response,
+      200,
+      {
+        data: {
+          id: MODEL_ID,
+          name: 'Natter Fake Stream',
+          context_length: 1_000_000,
+          architecture: {
+            tokenizer: 'Other',
+            input_modalities: ['text'],
+            output_modalities: ['text'],
+          },
+          endpoints: [
+            {
+              provider_name: 'Natter Fake Provider',
+              context_length: 1_000_000,
+              supported_parameters: ['max_tokens', 'reasoning'],
+              pricing: {},
+              data_policy: {
+                training: false,
+                training_openrouter: false,
+                retains_prompts: false,
+                can_publish: false,
+                requires_user_ids: false,
+                terms_of_service_url: '',
+                privacy_policy_url: '',
+              },
+            },
+          ],
+        },
+      },
+      providerCorsHeaders(request),
+    )
+    return
+  }
   if (provider.relativePath !== '/chat/completions') {
     throw new HttpError(409, `No scripted response remains for ${method} ${provider.relativePath}`)
   }
@@ -174,8 +212,27 @@ async function handleRequest(request, response) {
   await sendStreamingCompletion(request, response, requestId, body, config, selected)
 }
 
-async function handleControlRequest(request, response, scenarioId) {
+async function handleControlRequest(request, response, scenarioId, action) {
   pruneScenarios()
+  if (action === 'hold') {
+    if (request.method !== 'POST') throw new HttpError(405, 'Method not allowed')
+    const entry = scenarios.get(scenarioId)
+    if (!entry) throw new HttpError(404, `Unknown scenario: ${scenarioId}`)
+    if (entry.activeStreams !== 0) throw new HttpError(409, 'Scenario stream is active')
+    entry.releaseOpen = false
+    entry.lastTouchedAt = Date.now()
+    sendJson(response, 200, controlSnapshot(entry))
+    return
+  }
+  if (action === 'release') {
+    if (request.method !== 'POST') throw new HttpError(405, 'Method not allowed')
+    const entry = scenarios.get(scenarioId)
+    if (!entry) throw new HttpError(404, `Unknown scenario: ${scenarioId}`)
+    openScenarioRelease(entry)
+    entry.lastTouchedAt = Date.now()
+    sendJson(response, 200, controlSnapshot(entry))
+    return
+  }
   if (request.method === 'PUT') {
     const body = await readJsonBody(request)
     const definition = parseScenarioDefinition(body)
@@ -189,6 +246,7 @@ async function handleControlRequest(request, response, scenarioId) {
     if (nextStoredScenarioBytes > LIMITS.scenarioBytes) {
       throw new HttpError(429, `Stored scenario data exceeds ${LIMITS.scenarioBytes} bytes`)
     }
+    if (existing) openScenarioRelease(existing)
     const entry = existing ?? {
       scenarioId,
       config: definition.config,
@@ -200,6 +258,8 @@ async function handleControlRequest(request, response, scenarioId) {
       activeStreams: 0,
       requestCount: 0,
       requests: [],
+      releaseOpen: !definition.config.holdUntilReleased,
+      releaseWaiters: new Set(),
     }
     entry.config = definition.config
     entry.scriptedResponses = definition.scriptedResponses
@@ -208,6 +268,7 @@ async function handleControlRequest(request, response, scenarioId) {
     entry.lastTouchedAt = now
     entry.requestCount = 0
     entry.requests = []
+    entry.releaseOpen = !definition.config.holdUntilReleased
     storedScenarioBytes = nextStoredScenarioBytes
     scenarios.set(scenarioId, entry)
     sendJson(response, existing ? 200 : 201, controlSnapshot(entry))
@@ -222,6 +283,7 @@ async function handleControlRequest(request, response, scenarioId) {
   }
   if (request.method === 'DELETE') {
     const entry = scenarios.get(scenarioId)
+    if (entry) openScenarioRelease(entry)
     const deleted = scenarios.delete(scenarioId)
     if (deleted && entry) storedScenarioBytes -= entry.storedBytes
     sendJson(response, deleted ? 200 : 404, { deleted, scenarioId })
@@ -231,9 +293,9 @@ async function handleControlRequest(request, response, scenarioId) {
 }
 
 function parseControlRoute(pathname) {
-  const match = /^\/__control\/scenarios\/([^/]+)$/u.exec(pathname)
+  const match = /^\/__control\/scenarios\/([^/]+)(?:\/(hold|release))?$/u.exec(pathname)
   if (!match) return null
-  return { scenarioId: parseScenarioId(match[1]) }
+  return { scenarioId: parseScenarioId(match[1]), action: match[2] ?? null }
 }
 
 function parseProviderRoute(pathname) {
@@ -296,10 +358,15 @@ function parseScenarioDefinition(value) {
     'reasoningChunkChars',
     'initialDelayMs',
     'delayMs',
+    'holdUntilReleased',
+    'usage',
     'responses',
   ])
   for (const key of Object.keys(value)) {
     if (!allowed.has(key)) throw new HttpError(400, `Unknown scenario option: ${key}`)
+  }
+  if (value.holdUntilReleased !== undefined && typeof value.holdUntilReleased !== 'boolean') {
+    throw new HttpError(400, 'holdUntilReleased must be a boolean')
   }
   const chunkChars = boundedInteger(
     value.chunkChars ?? options.defaults.chunkChars,
@@ -309,19 +376,21 @@ function parseScenarioDefinition(value) {
   )
   const defaultReasoningChunkChars =
     value.chunkChars === undefined ? options.defaults.reasoningChunkChars : chunkChars
+  const targetChars = boundedInteger(
+    value.targetChars ?? options.defaults.targetChars,
+    'targetChars',
+    0,
+    LIMITS.targetChars,
+  )
+  const reasoningChars = boundedInteger(
+    value.reasoningChars ?? options.defaults.reasoningChars,
+    'reasoningChars',
+    0,
+    LIMITS.reasoningChars,
+  )
   const config = {
-    targetChars: boundedInteger(
-      value.targetChars ?? options.defaults.targetChars,
-      'targetChars',
-      0,
-      LIMITS.targetChars,
-    ),
-    reasoningChars: boundedInteger(
-      value.reasoningChars ?? options.defaults.reasoningChars,
-      'reasoningChars',
-      0,
-      LIMITS.reasoningChars,
-    ),
+    targetChars,
+    reasoningChars,
     chunkChars,
     reasoningChunkChars: boundedInteger(
       value.reasoningChunkChars ?? defaultReasoningChunkChars,
@@ -341,6 +410,8 @@ function parseScenarioDefinition(value) {
       0,
       LIMITS.delayMs,
     ),
+    holdUntilReleased: value.holdUntilReleased === true,
+    usage: parseUsageDefinition(value.usage, targetChars, reasoningChars),
   }
   const rawResponses = value.responses ?? []
   if (!Array.isArray(rawResponses)) throw new HttpError(400, 'responses must be an array')
@@ -349,6 +420,97 @@ function parseScenarioDefinition(value) {
     config,
     scriptedResponses,
     storedBytes: scriptedResponses.reduce((sum, scripted) => sum + scripted.storedBytes, 0),
+  }
+}
+
+function parseUsageDefinition(value, targetChars, reasoningChars) {
+  if (value !== undefined && !isRecord(value)) {
+    throw new HttpError(400, 'usage must be a JSON object')
+  }
+  const usage = value ?? {}
+  const allowed = new Set([
+    'promptTokens',
+    'completionTokens',
+    'reasoningTokens',
+    'cachedTokens',
+    'cacheCreationInputTokens',
+    'cost',
+    'costDetails',
+  ])
+  for (const key of Object.keys(usage)) {
+    if (!allowed.has(key)) throw new HttpError(400, `Unknown usage option: ${key}`)
+  }
+
+  const reasoningTokens = boundedInteger(
+    usage.reasoningTokens ?? Math.ceil(reasoningChars / 4),
+    'usage.reasoningTokens',
+    0,
+    Number.MAX_SAFE_INTEGER,
+  )
+  const promptTokens = boundedInteger(
+    usage.promptTokens ?? 17,
+    'usage.promptTokens',
+    0,
+    Number.MAX_SAFE_INTEGER,
+  )
+  const completionTokens = boundedInteger(
+    usage.completionTokens ?? Math.ceil(targetChars / 4) + reasoningTokens,
+    'usage.completionTokens',
+    reasoningTokens,
+    Number.MAX_SAFE_INTEGER,
+  )
+  const cachedTokens = boundedInteger(
+    usage.cachedTokens ?? Math.min(3, promptTokens),
+    'usage.cachedTokens',
+    0,
+    promptTokens,
+  )
+  const cacheCreationInputTokens = boundedInteger(
+    usage.cacheCreationInputTokens ?? Math.min(2, promptTokens),
+    'usage.cacheCreationInputTokens',
+    0,
+    Number.MAX_SAFE_INTEGER,
+  )
+  const cost = boundedFiniteNumber(usage.cost ?? 0.000123, 'usage.cost', 0)
+  const costDetails = parseUsageCostDetails(usage.costDetails, cost)
+  return {
+    promptTokens,
+    completionTokens,
+    reasoningTokens,
+    cachedTokens,
+    cacheCreationInputTokens,
+    cost,
+    costDetails,
+  }
+}
+
+function parseUsageCostDetails(value, cost) {
+  if (value !== undefined && !isRecord(value)) {
+    throw new HttpError(400, 'usage.costDetails must be a JSON object')
+  }
+  const details = value ?? {}
+  const allowed = new Set(['upstreamInferenceCost', 'promptCost', 'completionCost'])
+  for (const key of Object.keys(details)) {
+    if (!allowed.has(key)) throw new HttpError(400, `Unknown usage.costDetails option: ${key}`)
+  }
+  const promptCost = boundedFiniteNumber(
+    details.promptCost ?? cost / 3,
+    'usage.costDetails.promptCost',
+    0,
+  )
+  const completionCost = boundedFiniteNumber(
+    details.completionCost ?? cost - promptCost,
+    'usage.costDetails.completionCost',
+    0,
+  )
+  return {
+    upstreamInferenceCost: boundedFiniteNumber(
+      details.upstreamInferenceCost ?? cost,
+      'usage.costDetails.upstreamInferenceCost',
+      0,
+    ),
+    promptCost,
+    completionCost,
   }
 }
 
@@ -639,6 +801,10 @@ async function sendStreamingCompletion(request, response, requestId, body, confi
   try {
     await abortableDelay(config.initialDelayMs, abortController.signal)
     if (abortController.signal.aborted) return
+    if (config.holdUntilReleased && selected.entry) {
+      await waitForScenarioRelease(selected.entry, abortController.signal)
+    }
+    if (abortController.signal.aborted) return
     let chunkIndex = 0
     chunkIndex = await streamLane({
       response,
@@ -751,14 +917,28 @@ function sendBufferedCompletion(request, response, requestId, body, config, scen
 }
 
 function completionUsage(config) {
-  const promptTokens = 8
-  const completionTokens = Math.ceil(config.targetChars / 4)
-  const reasoningTokens = Math.ceil(config.reasoningChars / 4)
+  const {
+    promptTokens,
+    completionTokens,
+    reasoningTokens,
+    cachedTokens,
+    cacheCreationInputTokens,
+    cost,
+    costDetails,
+  } = config.usage
   return {
     prompt_tokens: promptTokens,
     completion_tokens: completionTokens,
+    prompt_tokens_details: { cached_tokens: cachedTokens },
     completion_tokens_details: { reasoning_tokens: reasoningTokens },
-    total_tokens: promptTokens + completionTokens + reasoningTokens,
+    total_tokens: promptTokens + completionTokens,
+    cache_creation_input_tokens: cacheCreationInputTokens,
+    cost,
+    cost_details: {
+      upstream_inference_cost: costDetails.upstreamInferenceCost,
+      upstream_inference_prompt_cost: costDetails.promptCost,
+      upstream_inference_completions_cost: costDetails.completionCost,
+    },
   }
 }
 
@@ -801,6 +981,25 @@ function recordScenarioRequest(entry, requestRecord) {
   entry.lastTouchedAt = Date.now()
 }
 
+function waitForScenarioRelease(entry, signal) {
+  if (entry.releaseOpen || signal.aborted) return Promise.resolve()
+  return new Promise((resolve) => {
+    const finish = () => {
+      signal.removeEventListener('abort', finish)
+      entry.releaseWaiters.delete(finish)
+      resolve()
+    }
+    entry.releaseWaiters.add(finish)
+    signal.addEventListener('abort', finish, { once: true })
+    if (entry.releaseOpen) finish()
+  })
+}
+
+function openScenarioRelease(entry) {
+  entry.releaseOpen = true
+  for (const release of [...entry.releaseWaiters]) release()
+}
+
 function controlSnapshot(entry) {
   return {
     scenarioId: entry.scenarioId,
@@ -808,6 +1007,7 @@ function controlSnapshot(entry) {
     createdAt: entry.createdAt,
     updatedAt: entry.updatedAt,
     activeStreams: entry.activeStreams,
+    releaseOpen: entry.releaseOpen,
     requestCount: entry.requestCount,
     requests: entry.requests,
     storedBytes: entry.storedBytes,
@@ -1024,6 +1224,14 @@ function boundedInteger(value, name, minimum, maximum) {
   const parsed = typeof value === 'number' ? value : Number(value)
   if (!Number.isSafeInteger(parsed) || parsed < minimum || parsed > maximum) {
     throw new HttpError(400, `${name} must be an integer between ${minimum} and ${maximum}`)
+  }
+  return parsed
+}
+
+function boundedFiniteNumber(value, name, minimum) {
+  const parsed = typeof value === 'number' ? value : Number(value)
+  if (!Number.isFinite(parsed) || parsed < minimum) {
+    throw new HttpError(400, `${name} must be a finite number greater than or equal to ${minimum}`)
   }
   return parsed
 }

@@ -1,3 +1,5 @@
+import { findLiteralSearchRanges } from '../../core/search-query'
+
 const MATCH_HIGHLIGHT = 'branch-tree-inspector-search-match'
 const CURRENT_HIGHLIGHT = 'branch-tree-inspector-search-current'
 const STYLE_ID = 'branch-tree-inspector-search-highlights'
@@ -53,20 +55,13 @@ export function renderedSearchRanges(root: Element, query: string): RenderedSear
   if (visibleChars === 0) return { ranges: [], totalCount: 0 }
   const visibleText = textParts.join('')
 
+  const literalMatches = findLiteralSearchRanges(visibleText, query, MAX_RENDERED_RANGES)
   const ranges: Range[] = []
-  let totalCount = 0
-  const matcher = new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi')
-  let match = matcher.exec(visibleText)
   let startNodeIndex = 0
   let endNodeIndex = 0
-  while (match) {
-    totalCount += 1
-    if (ranges.length >= MAX_RENDERED_RANGES) {
-      match = matcher.exec(visibleText)
-      continue
-    }
-    const start = match.index
-    const end = start + match[0].length
+  for (const match of literalMatches.ranges) {
+    const start = match.start
+    const end = match.end
     while (
       startNodeIndex < textNodes.length - 1 &&
       (starts[startNodeIndex] ?? 0) + (textNodes[startNodeIndex]?.data.length ?? 0) <= start
@@ -88,9 +83,8 @@ export function renderedSearchRanges(root: Element, query: string): RenderedSear
       range.setEnd(endNode, end - (starts[endNodeIndex] ?? 0))
       ranges.push(range)
     }
-    match = matcher.exec(visibleText)
   }
-  return { ranges, totalCount }
+  return { ranges, totalCount: literalMatches.totalCount }
 }
 
 export function clearSearchHighlights(): void {

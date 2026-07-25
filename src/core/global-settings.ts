@@ -2,17 +2,13 @@
 // on `Chat.settings` / `ChatPreset.settings`) and from connection-profile
 // settings (credentials and endpoint, on `ConnectionProfile`).
 //
-// Everything here is keyed under the `settings` IDB table via the existing
-// `getSetting/setSetting` helpers. Typed read/write wrappers are exposed so
-// call sites don't have to remember the key names.
+// This module owns only the schema, defaults, normalization and document
+// projection. Persisted reads/writes live behind the workspace store boundary.
 
-import { getSettings, setSetting } from '../store/settings'
 import { type CorsProxyConfig, DEFAULT_CORS_PROXY_URL, DEV_CORS_PROXY_URL } from './cors-proxy'
+import { LATEST_OPENROUTER_MODEL_IDS } from './latest-models'
+import { DEFAULT_TRANSCRIPT_INITIAL_ROW_COUNT } from './transcript-work-budget'
 
-export {
-  CONTINUE_SYSTEM_PROMPT_PLACEHOLDER,
-  resolveContinueSystemPromptTemplate,
-} from './continue-prompts'
 export { DEV_CORS_PROXY_URL }
 
 export type ThemePreference = 'system' | 'light' | 'dark' | 'high-contrast'
@@ -61,7 +57,7 @@ export type LongMessageDisplayMode = 'full' | 'compact'
 
 export type RenderWindowLoadMode = 'auto' | 'manual'
 
-// Continue prompts injected by Continue-in-place (see `src/hooks/useContinue.ts`).
+// Continue prompts injected by the unified generation engine.
 // The actual prompts live on `chat.settings.continueSystemPrompt` /
 // `continueUserPrompt` (per-chat, preset-pinnable). These constants remain
 // the seed defaults for new chats and the reset-to-default target.
@@ -71,7 +67,7 @@ export type RenderWindowLoadMode = 'auto' | 'manual'
 // original system prompt is not appended automatically.
 // `continueUserPrompt` is appended as a synthetic trailing user turn when
 // non-empty; blank falls back to the legacy double-assistant shape.
-interface GlobalPreferences {
+export interface GlobalPreferences {
   theme: ThemePreference
   sendShortcut: SendShortcut
   userProfilePicture: ProfilePictureRef
@@ -97,10 +93,10 @@ interface GlobalPreferences {
   // Default rendering mode for long/oversized messages when a row mounts
   // or reloads. Manual avatar clicks stay session-local.
   longMessageDisplayMode: LongMessageDisplayMode
-  // Render-window sizes bound expensive DOM work for long transcripts and
-  // large sidebars. The full active branch/sidebar model can still exist in
-  // memory, but React only mounts this many rows before incremental expansion.
-  messageRenderWindowSize: number
+  // Relative initial transcript work target. Durable body-cost projections
+  // and viewport overscan decide the actual row suffix; this value never caps
+  // branch length or reachability.
+  messageInitialRenderWork: number
   sidebarRenderWindowSize: number
   messageRenderWindowLoadMode: RenderWindowLoadMode
   sidebarRenderWindowLoadMode: RenderWindowLoadMode
@@ -111,15 +107,13 @@ interface GlobalPreferences {
   // Optional secret echoed as `X-Proxy-Secret` so a hosted bouncer can
   // gatekeep its open relay. Empty string = header omitted.
   corsProxySecret: string
+  // Durable defaults for a newly mounted tab. The live sidebar/composer
+  // presentation remains tab-local after these values seed it.
+  sidebarCollapsed: boolean
+  composerHeight: number
+  composerNormalManualHeight: number | null
+  composerFocusManualHeight: number | null
 }
-
-export const DEFAULT_PINNED_MODELS: readonly string[] = Object.freeze([
-  'openai/gpt-5.4',
-  'anthropic/claude-opus-4.7',
-  'deepseek/deepseek-v4-pro',
-  'google/gemini-3.1-pro-preview',
-  'google/gemini-3.1-flash-lite-preview',
-])
 
 export function defaultCorsProxyUrlForRuntime(isDev = import.meta.env.DEV): string {
   return isDev ? DEV_CORS_PROXY_URL : DEFAULT_CORS_PROXY_URL
@@ -134,41 +128,225 @@ export const DEFAULT_GLOBAL_PREFERENCES: Readonly<GlobalPreferences> = Object.fr
   fontFamily: 'system',
   baseFontSize: 15,
   autoScrollOnStream: true,
-  pinnedModels: [...DEFAULT_PINNED_MODELS],
+  pinnedModels: [...LATEST_OPENROUTER_MODEL_IDS],
   recentModels: [],
   tokenCalibrationMode: 'adaptive',
   longMessageDisplayMode: 'full',
-  messageRenderWindowSize: 10,
+  messageInitialRenderWork: DEFAULT_TRANSCRIPT_INITIAL_ROW_COUNT,
   sidebarRenderWindowSize: 50,
   messageRenderWindowLoadMode: 'auto',
   sidebarRenderWindowLoadMode: 'auto',
   corsProxyUrl: defaultCorsProxyUrlForRuntime(),
   corsProxySecret: '',
+  sidebarCollapsed: false,
+  composerHeight: 120,
+  composerNormalManualHeight: null,
+  composerFocusManualHeight: null,
 })
 
-export const MESSAGE_RENDER_WINDOW_SIZE_MIN = 1
-export const MESSAGE_RENDER_WINDOW_SIZE_MAX = 500
+export const MESSAGE_INITIAL_RENDER_WORK_MIN = 1
+export const MESSAGE_INITIAL_RENDER_WORK_MAX = 500
 export const SIDEBAR_RENDER_WINDOW_SIZE_MIN = 1
 export const SIDEBAR_RENDER_WINDOW_SIZE_MAX = 1000
 
-const THEME_KEY = 'global:theme'
-const SEND_SHORTCUT_KEY = 'global:send-shortcut'
+export const THEME_KEY = 'global:theme'
+export const SEND_SHORTCUT_KEY = 'global:send-shortcut'
 const USER_PIC_KEY = 'global:user-profile-picture'
 const ASSISTANT_PIC_KEY = 'global:assistant-profile-picture'
-const CHAT_MAX_WIDTH_KEY = 'global:chat-max-width'
-const FONT_FAMILY_KEY = 'global:font-family'
-const BASE_FONT_SIZE_KEY = 'global:base-font-size'
-const AUTO_SCROLL_STREAM_KEY = 'global:auto-scroll-stream'
-const PINNED_MODELS_KEY = 'global:pinned-models'
-const RECENT_MODELS_KEY = 'global:recent-models'
-const TOKEN_CALIBRATION_MODE_KEY = 'global:token-calibration-mode'
-const LONG_MESSAGE_DISPLAY_MODE_KEY = 'global:long-message-display-mode'
-const MESSAGE_RENDER_WINDOW_SIZE_KEY = 'global:message-render-window-size'
-const SIDEBAR_RENDER_WINDOW_SIZE_KEY = 'global:sidebar-render-window-size'
-const MESSAGE_RENDER_WINDOW_LOAD_MODE_KEY = 'global:message-render-window-load-mode'
-const SIDEBAR_RENDER_WINDOW_LOAD_MODE_KEY = 'global:sidebar-render-window-load-mode'
-const CORS_PROXY_URL_KEY = 'global:cors-proxy-url'
-const CORS_PROXY_SECRET_KEY = 'global:cors-proxy-secret'
+export const CHAT_MAX_WIDTH_KEY = 'global:chat-max-width'
+export const FONT_FAMILY_KEY = 'global:font-family'
+export const BASE_FONT_SIZE_KEY = 'global:base-font-size'
+export const AUTO_SCROLL_STREAM_KEY = 'global:auto-scroll-stream'
+export const PINNED_MODELS_KEY = 'global:pinned-models'
+export const RECENT_MODELS_KEY = 'global:recent-models'
+export const RECENT_MODEL_RECENCY_KEY = 'global:recent-model-recency-v1'
+export const RECENT_MODEL_LIMIT = 20
+
+export interface RecentModelRecencyEntry {
+  modelId: string
+  usedAt: number
+  streamId: string
+}
+
+export interface RecentModelRecencyRecord {
+  version: 1
+  entries: RecentModelRecencyEntry[]
+}
+
+export interface RecentModelState {
+  changed: boolean
+  models: string[]
+  recency: RecentModelRecencyRecord
+}
+
+export function emptyRecentModelRecency(): RecentModelRecencyRecord {
+  return { version: 1, entries: [] }
+}
+
+export function normalizeRecentModels(value: unknown, limit = RECENT_MODEL_LIMIT): string[] {
+  if (!Array.isArray(value)) return []
+  const boundedLimit = boundedRecentModelLimit(limit)
+  if (boundedLimit === 0) return []
+  const seen = new Set<string>()
+  const models: string[] = []
+  for (const item of value) {
+    if (typeof item !== 'string' || item.length === 0 || seen.has(item)) continue
+    seen.add(item)
+    models.push(item)
+    if (models.length === boundedLimit) break
+  }
+  return models
+}
+
+export function normalizeRecentModelRecency(value: unknown): RecentModelRecencyRecord | undefined {
+  if (!value || typeof value !== 'object') return undefined
+  const record = value as Partial<RecentModelRecencyRecord>
+  if (record.version !== 1 || !Array.isArray(record.entries)) return undefined
+  const byModel = new Map<string, RecentModelRecencyEntry>()
+  for (const candidate of record.entries) {
+    if (
+      typeof candidate.modelId !== 'string' ||
+      candidate.modelId.length === 0 ||
+      typeof candidate.streamId !== 'string' ||
+      candidate.streamId.length === 0 ||
+      !Number.isSafeInteger(candidate.usedAt) ||
+      candidate.usedAt < 0
+    ) {
+      return undefined
+    }
+    const entry: RecentModelRecencyEntry = {
+      modelId: candidate.modelId,
+      usedAt: candidate.usedAt,
+      streamId: candidate.streamId,
+    }
+    const existing = byModel.get(entry.modelId)
+    if (!existing || compareRecentModelRecency(entry, existing) > 0) {
+      byModel.set(entry.modelId, entry)
+    }
+  }
+  return {
+    version: 1,
+    entries: [...byModel.values()]
+      .sort((left, right) => compareRecentModelRecency(right, left))
+      .slice(0, RECENT_MODEL_LIMIT),
+  }
+}
+
+export function isCanonicalRecentModelState(publicValue: unknown, recencyValue: unknown): boolean {
+  const models = normalizeRecentModels(publicValue)
+  if (!sameStringArray(publicValue, models)) return false
+  const recency = normalizeRecentModelRecency(recencyValue)
+  return (
+    recency !== undefined &&
+    sameRecentModelRecency(recencyValue, recency) &&
+    sameStringArray(
+      models,
+      recency.entries.map((entry) => entry.modelId),
+    )
+  )
+}
+
+export function advanceRecentModelState(
+  publicValue: unknown,
+  recencyValue: unknown,
+  candidate: RecentModelRecencyEntry,
+  limit = RECENT_MODEL_LIMIT,
+): RecentModelState {
+  if (!isCanonicalRecentModelState(publicValue, recencyValue)) {
+    throw new Error('RecentModelStateInvariant')
+  }
+  if (
+    typeof candidate.modelId !== 'string' ||
+    candidate.modelId.length === 0 ||
+    typeof candidate.streamId !== 'string' ||
+    candidate.streamId.length === 0 ||
+    !Number.isSafeInteger(candidate.usedAt) ||
+    candidate.usedAt < 0
+  ) {
+    throw new Error('RecentModelRecencyCandidateInvalid')
+  }
+  const currentModels = publicValue as string[]
+  const currentRecency = recencyValue as RecentModelRecencyRecord
+  const byModel = new Map(
+    currentRecency.entries.map((entry) => [entry.modelId, { ...entry }] as const),
+  )
+  const existing = byModel.get(candidate.modelId)
+  if (!existing || compareRecentModelRecency(candidate, existing) > 0) {
+    byModel.set(candidate.modelId, { ...candidate })
+  }
+  const entries = [...byModel.values()]
+    .sort((left, right) => compareRecentModelRecency(right, left))
+    .slice(0, boundedRecentModelLimit(limit))
+  const recency: RecentModelRecencyRecord = { version: 1, entries }
+  const models = entries.map((entry) => entry.modelId)
+  return {
+    changed:
+      !sameStringArray(currentModels, models) || !sameRecentModelRecency(currentRecency, recency),
+    models,
+    recency,
+  }
+}
+
+function boundedRecentModelLimit(value: number): number {
+  if (!Number.isFinite(value)) return RECENT_MODEL_LIMIT
+  return Math.min(RECENT_MODEL_LIMIT, Math.max(0, Math.trunc(value)))
+}
+
+function compareRecentModelRecency(
+  left: Pick<RecentModelRecencyEntry, 'usedAt' | 'streamId'>,
+  right: Pick<RecentModelRecencyEntry, 'usedAt' | 'streamId'>,
+): number {
+  if (left.usedAt !== right.usedAt) return left.usedAt - right.usedAt
+  if (left.streamId === right.streamId) return 0
+  return left.streamId < right.streamId ? -1 : 1
+}
+
+function sameStringArray(value: unknown, expected: readonly string[]): boolean {
+  return (
+    Array.isArray(value) &&
+    value.length === expected.length &&
+    value.every((entry, index) => entry === expected[index])
+  )
+}
+
+function sameRecentModelRecency(value: unknown, expected: RecentModelRecencyRecord): boolean {
+  if (!value || typeof value !== 'object') return false
+  const record = value as Partial<RecentModelRecencyRecord>
+  return (
+    record.version === expected.version &&
+    Array.isArray(record.entries) &&
+    record.entries.length === expected.entries.length &&
+    record.entries.every((entry, index) => {
+      const expectedEntry = expected.entries.at(index)
+      if (!expectedEntry) return false
+      return (
+        entry.modelId === expectedEntry.modelId &&
+        entry.usedAt === expectedEntry.usedAt &&
+        entry.streamId === expectedEntry.streamId
+      )
+    })
+  )
+}
+export const TOKEN_CALIBRATION_MODE_KEY = 'global:token-calibration-mode'
+export const LONG_MESSAGE_DISPLAY_MODE_KEY = 'global:long-message-display-mode'
+export const MESSAGE_INITIAL_RENDER_WORK_KEY = 'global:message-initial-render-work'
+const LEGACY_MESSAGE_RENDER_WINDOW_SIZE_KEY = 'global:message-render-window-size'
+export const SIDEBAR_RENDER_WINDOW_SIZE_KEY = 'global:sidebar-render-window-size'
+export const MESSAGE_RENDER_WINDOW_LOAD_MODE_KEY = 'global:message-render-window-load-mode'
+export const SIDEBAR_RENDER_WINDOW_LOAD_MODE_KEY = 'global:sidebar-render-window-load-mode'
+export const CORS_PROXY_URL_KEY = 'global:cors-proxy-url'
+export const CORS_PROXY_SECRET_KEY = 'global:cors-proxy-secret'
+export const SAMPLE_PROMPTS_DISMISSED_KEY = 'sample-prompts:dismissed'
+export const SIDEBAR_COLLAPSED_KEY = 'global:sidebar-collapsed'
+export const COMPOSER_HEIGHT_KEY = 'global:composer-height'
+export const COMPOSER_NORMAL_MANUAL_HEIGHT_KEY = 'global:composer-normal-manual-height'
+export const COMPOSER_FOCUS_MANUAL_HEIGHT_KEY = 'global:composer-focus-manual-height'
+
+export const GENERATION_GLOBAL_PREFERENCE_KEYS = [
+  TOKEN_CALIBRATION_MODE_KEY,
+  CORS_PROXY_URL_KEY,
+  CORS_PROXY_SECRET_KEY,
+] as const
 
 export const GLOBAL_PREFERENCE_KEYS = [
   THEME_KEY,
@@ -183,12 +361,17 @@ export const GLOBAL_PREFERENCE_KEYS = [
   RECENT_MODELS_KEY,
   TOKEN_CALIBRATION_MODE_KEY,
   LONG_MESSAGE_DISPLAY_MODE_KEY,
-  MESSAGE_RENDER_WINDOW_SIZE_KEY,
+  MESSAGE_INITIAL_RENDER_WORK_KEY,
+  LEGACY_MESSAGE_RENDER_WINDOW_SIZE_KEY,
   SIDEBAR_RENDER_WINDOW_SIZE_KEY,
   MESSAGE_RENDER_WINDOW_LOAD_MODE_KEY,
   SIDEBAR_RENDER_WINDOW_LOAD_MODE_KEY,
   CORS_PROXY_URL_KEY,
   CORS_PROXY_SECRET_KEY,
+  SIDEBAR_COLLAPSED_KEY,
+  COMPOSER_HEIGHT_KEY,
+  COMPOSER_NORMAL_MANUAL_HEIGHT_KEY,
+  COMPOSER_FOCUS_MANUAL_HEIGHT_KEY,
 ] as const
 
 export const FONT_FAMILY_OPTIONS: ReadonlyArray<{
@@ -287,7 +470,7 @@ const ALLOWED_CALIBRATION_MODES: readonly TokenCalibrationMode[] = [
   'family-defaults-only',
 ]
 
-function calibrationModeOrDefault(value: unknown): TokenCalibrationMode {
+export function tokenCalibrationModeFromStored(value: unknown): TokenCalibrationMode {
   return ALLOWED_CALIBRATION_MODES.includes(value as TokenCalibrationMode)
     ? (value as TokenCalibrationMode)
     : DEFAULT_GLOBAL_PREFERENCES.tokenCalibrationMode
@@ -318,13 +501,14 @@ function intInRangeOrDefault(value: unknown, fallback: number, min: number, max:
     : fallback
 }
 
-function clampInt(value: number, min: number, max: number): number {
+export function clampGlobalPreferenceInt(value: number, min: number, max: number): number {
   if (!Number.isFinite(value)) return min
   return Math.min(max, Math.max(min, Math.round(value)))
 }
 
-export async function readGlobalPreferences(): Promise<GlobalPreferences> {
-  const stored = await getSettings(GLOBAL_PREFERENCE_KEYS)
+export function globalPreferencesFromStored(
+  stored: ReadonlyMap<string, unknown>,
+): GlobalPreferences {
   const theme = stored.get(THEME_KEY)
   const sendShortcut = stored.get(SEND_SHORTCUT_KEY)
   const userPic = stored.get(USER_PIC_KEY)
@@ -337,12 +521,17 @@ export async function readGlobalPreferences(): Promise<GlobalPreferences> {
   const recent = stored.get(RECENT_MODELS_KEY)
   const tokenCalibrationMode = stored.get(TOKEN_CALIBRATION_MODE_KEY)
   const longMessageDisplayMode = stored.get(LONG_MESSAGE_DISPLAY_MODE_KEY)
-  const messageRenderWindowSize = stored.get(MESSAGE_RENDER_WINDOW_SIZE_KEY)
+  const messageInitialRenderWork =
+    stored.get(MESSAGE_INITIAL_RENDER_WORK_KEY) ?? stored.get(LEGACY_MESSAGE_RENDER_WINDOW_SIZE_KEY)
   const sidebarRenderWindowSize = stored.get(SIDEBAR_RENDER_WINDOW_SIZE_KEY)
   const messageRenderWindowLoadMode = stored.get(MESSAGE_RENDER_WINDOW_LOAD_MODE_KEY)
   const sidebarRenderWindowLoadMode = stored.get(SIDEBAR_RENDER_WINDOW_LOAD_MODE_KEY)
   const corsProxyUrl = stored.get(CORS_PROXY_URL_KEY)
   const corsProxySecret = stored.get(CORS_PROXY_SECRET_KEY)
+  const sidebarCollapsed = stored.get(SIDEBAR_COLLAPSED_KEY)
+  const composerHeight = stored.get(COMPOSER_HEIGHT_KEY)
+  const composerNormalManualHeight = stored.get(COMPOSER_NORMAL_MANUAL_HEIGHT_KEY)
+  const composerFocusManualHeight = stored.get(COMPOSER_FOCUS_MANUAL_HEIGHT_KEY)
   return {
     theme: ALLOWED_THEMES.includes(theme as ThemePreference)
       ? (theme as ThemePreference)
@@ -364,15 +553,15 @@ export async function readGlobalPreferences(): Promise<GlobalPreferences> {
         : DEFAULT_GLOBAL_PREFERENCES.autoScrollOnStream,
     pinnedModels: Array.isArray(pinned)
       ? pinned.filter((x) => typeof x === 'string')
-      : [...DEFAULT_PINNED_MODELS],
+      : [...LATEST_OPENROUTER_MODEL_IDS],
     recentModels: Array.isArray(recent) ? recent.filter((x) => typeof x === 'string') : [],
-    tokenCalibrationMode: calibrationModeOrDefault(tokenCalibrationMode),
+    tokenCalibrationMode: tokenCalibrationModeFromStored(tokenCalibrationMode),
     longMessageDisplayMode: longMessageDisplayModeOrDefault(longMessageDisplayMode),
-    messageRenderWindowSize: intInRangeOrDefault(
-      messageRenderWindowSize,
-      DEFAULT_GLOBAL_PREFERENCES.messageRenderWindowSize,
-      MESSAGE_RENDER_WINDOW_SIZE_MIN,
-      MESSAGE_RENDER_WINDOW_SIZE_MAX,
+    messageInitialRenderWork: intInRangeOrDefault(
+      messageInitialRenderWork,
+      DEFAULT_GLOBAL_PREFERENCES.messageInitialRenderWork,
+      MESSAGE_INITIAL_RENDER_WORK_MIN,
+      MESSAGE_INITIAL_RENDER_WORK_MAX,
     ),
     sidebarRenderWindowSize: intInRangeOrDefault(
       sidebarRenderWindowSize,
@@ -390,7 +579,41 @@ export async function readGlobalPreferences(): Promise<GlobalPreferences> {
     ),
     corsProxyUrl: typeof corsProxyUrl === 'string' ? corsProxyUrl : defaultCorsProxyUrlForRuntime(),
     corsProxySecret: typeof corsProxySecret === 'string' ? corsProxySecret : '',
+    sidebarCollapsed:
+      typeof sidebarCollapsed === 'boolean'
+        ? sidebarCollapsed
+        : DEFAULT_GLOBAL_PREFERENCES.sidebarCollapsed,
+    composerHeight: intInRangeOrDefault(
+      composerHeight,
+      DEFAULT_GLOBAL_PREFERENCES.composerHeight,
+      80,
+      600,
+    ),
+    composerNormalManualHeight: nullableIntInRangeOrDefault(
+      composerNormalManualHeight,
+      DEFAULT_GLOBAL_PREFERENCES.composerNormalManualHeight,
+      1,
+      600,
+    ),
+    composerFocusManualHeight: nullableIntInRangeOrDefault(
+      composerFocusManualHeight,
+      DEFAULT_GLOBAL_PREFERENCES.composerFocusManualHeight,
+      1,
+      600,
+    ),
   }
+}
+
+function nullableIntInRangeOrDefault(
+  value: unknown,
+  fallback: number | null,
+  min: number,
+  max: number,
+): number | null {
+  if (value === null) return null
+  return typeof value === 'number' && Number.isInteger(value) && value >= min && value <= max
+    ? value
+    : fallback
 }
 
 export function corsProxyConfigFromPrefs(prefs: GlobalPreferences): CorsProxyConfig {
@@ -401,85 +624,16 @@ export function corsProxyConfigFromPrefs(prefs: GlobalPreferences): CorsProxyCon
   }
 }
 
-export async function writeCorsProxyUrl(value: string): Promise<void> {
-  await setSetting(CORS_PROXY_URL_KEY, value)
-}
-
-export async function writeCorsProxySecret(value: string): Promise<void> {
-  await setSetting(CORS_PROXY_SECRET_KEY, value)
-}
-
-export async function writeLongMessageDisplayMode(value: LongMessageDisplayMode): Promise<void> {
-  await setSetting(LONG_MESSAGE_DISPLAY_MODE_KEY, value)
-}
-
-export async function writeMessageRenderWindowSize(value: number): Promise<void> {
-  await setSetting(
-    MESSAGE_RENDER_WINDOW_SIZE_KEY,
-    clampInt(value, MESSAGE_RENDER_WINDOW_SIZE_MIN, MESSAGE_RENDER_WINDOW_SIZE_MAX),
-  )
-}
-
-export async function writeSidebarRenderWindowSize(value: number): Promise<void> {
-  await setSetting(
-    SIDEBAR_RENDER_WINDOW_SIZE_KEY,
-    clampInt(value, SIDEBAR_RENDER_WINDOW_SIZE_MIN, SIDEBAR_RENDER_WINDOW_SIZE_MAX),
-  )
-}
-
-export async function writeMessageRenderWindowLoadMode(value: RenderWindowLoadMode): Promise<void> {
-  await setSetting(MESSAGE_RENDER_WINDOW_LOAD_MODE_KEY, value)
-}
-
-export async function writeSidebarRenderWindowLoadMode(value: RenderWindowLoadMode): Promise<void> {
-  await setSetting(SIDEBAR_RENDER_WINDOW_LOAD_MODE_KEY, value)
-}
-
-export async function writeTokenCalibrationMode(value: TokenCalibrationMode): Promise<void> {
-  await setSetting(TOKEN_CALIBRATION_MODE_KEY, value)
-}
-
-export async function writePinnedModels(value: readonly string[]): Promise<void> {
-  await setSetting(PINNED_MODELS_KEY, [...value])
-}
-
-export async function writeRecentModels(value: readonly string[]): Promise<void> {
-  await setSetting(RECENT_MODELS_KEY, [...value])
-}
-
-// Move `modelId` to the head of the recent-models list, deduped, capped at
-// 20 entries. Used by the send pipeline to keep the picker's Recent tab
-// ordered by actual usage.
-export async function bumpRecentModel(modelId: string): Promise<void> {
-  if (!modelId) return
-  const current = (await readGlobalPreferences()).recentModels
-  const deduped = current.filter((id) => id !== modelId)
-  deduped.unshift(modelId)
-  await writeRecentModels(deduped.slice(0, 20))
-}
-
-export async function writeTheme(theme: ThemePreference): Promise<void> {
-  await setSetting(THEME_KEY, theme)
-}
-
-export async function writeSendShortcut(value: SendShortcut): Promise<void> {
-  await setSetting(SEND_SHORTCUT_KEY, value)
-}
-
-export async function writeChatMaxWidth(value: ChatMaxWidth): Promise<void> {
-  await setSetting(CHAT_MAX_WIDTH_KEY, value)
-}
-
-export async function writeFontFamily(value: FontFamilyChoice): Promise<void> {
-  await setSetting(FONT_FAMILY_KEY, value)
-}
-
-export async function writeBaseFontSize(value: BaseFontSize): Promise<void> {
-  await setSetting(BASE_FONT_SIZE_KEY, value)
-}
-
-export async function writeAutoScrollOnStream(value: boolean): Promise<void> {
-  await setSetting(AUTO_SCROLL_STREAM_KEY, value)
+export function generationCorsProxyConfigFromStored(
+  values: ReadonlyMap<string, unknown>,
+): CorsProxyConfig {
+  const url = values.get(CORS_PROXY_URL_KEY)
+  const secret = values.get(CORS_PROXY_SECRET_KEY)
+  return corsProxyConfigFromPrefs({
+    ...DEFAULT_GLOBAL_PREFERENCES,
+    corsProxyUrl: typeof url === 'string' ? url : defaultCorsProxyUrlForRuntime(),
+    corsProxySecret: typeof secret === 'string' ? secret : '',
+  })
 }
 
 // Apply the font-family preference by swapping the `--font-sans` CSS

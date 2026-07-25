@@ -1,18 +1,20 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { anthropicOnce } from '../../src/api/anthropic-messages'
-import { openAssistantRequestStream } from '../../src/api/assistant-stream'
+import {
+  createAssistantDispatchPlan,
+  openAssistantRequestStream,
+} from '../../src/api/assistant-stream'
 import { chatCompletions } from '../../src/api/chat-completions'
 import type { ApiKeyCandidate } from '../../src/api/client'
 import { geminiOnce } from '../../src/api/gemini-native'
 import { responsesOnce } from '../../src/api/responses'
 import { textCompletionsOnce } from '../../src/api/text-completions'
 import { videoGeneration } from '../../src/api/video-generation'
-import type { AssistantRequestPlan } from '../../src/core/send-planning'
 import type { ConnectionProfile } from '../../src/core/types'
+import { responsesRouteContract } from '../helpers/reasoning-contracts'
 
 interface TestCandidate extends ApiKeyCandidate {
   resolve: ReturnType<typeof vi.fn<() => Promise<string>>>
-  markUsed: ReturnType<typeof vi.fn<() => Promise<void>>>
 }
 
 interface SeenRequest {
@@ -56,7 +58,6 @@ function profile(
 function candidate(apiKey: string): TestCandidate {
   return {
     resolve: vi.fn(async () => apiKey),
-    markUsed: vi.fn(async () => {}),
   }
 }
 
@@ -141,8 +142,6 @@ describe('provider adapter key fallback', () => {
     expect(requestBody(seen[0] as SeenRequest)).toBe(requestBody(seen[1] as SeenRequest))
     expect(requestHeaders(seen[0] as SeenRequest).Authorization).toBe('Bearer key-one')
     expect(requestHeaders(seen[1] as SeenRequest).Authorization).toBe('Bearer key-two')
-    expect(first.markUsed).not.toHaveBeenCalled()
-    expect(second.markUsed).toHaveBeenCalledOnce()
     expect(selected).toHaveBeenCalledWith(second, 1, 'key-two')
   })
 
@@ -270,12 +269,24 @@ describe('provider adapter key fallback', () => {
     expect(requestHeaders(seen[1] as SeenRequest).Authorization).toBe('Bearer key-two')
   })
 
-  it('does not discard an accepted response when best-effort key-use metadata fails', async () => {
+  it('rejects before consuming an accepted body when selected-key durability fails', async () => {
     const accepted = candidate('accepted-key')
-    accepted.markUsed.mockRejectedValueOnce(new Error('metadata unavailable'))
+    const failure = new Error('selected-key durability unavailable')
+    const selected = vi.fn(async () => {
+      throw failure
+    })
+    let canceled = false
+    const response = new Response(
+      new ReadableStream<Uint8Array>({
+        cancel() {
+          canceled = true
+        },
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    )
     vi.stubGlobal(
       'fetch',
-      vi.fn(async () => jsonResponse({ id: 'resp_1', status: 'completed', output: [] })),
+      vi.fn(async () => response),
     )
 
     await expect(
@@ -284,32 +295,82 @@ describe('provider adapter key fallback', () => {
           profile: profile('openai-compatible', 'https://api.openai.com/v1'),
           apiKey: 'legacy-unused',
           apiKeyCandidates: [accepted],
+          onKeyCandidateSelected: selected,
         },
         { model: 'm', input: 'hi' },
       ),
-    ).resolves.toMatchObject({ id: 'resp_1', status: 'completed' })
-    expect(accepted.markUsed).toHaveBeenCalledOnce()
+    ).rejects.toBe(failure)
+    expect(selected).toHaveBeenCalledOnce()
+    await vi.waitFor(() => expect(canceled).toBe(true))
   })
 
-  it('does not delay an accepted response behind key-use metadata storage', async () => {
+  it('holds an accepted body unread until selected-key durability settles', async () => {
     const accepted = candidate('accepted-key')
-    accepted.markUsed.mockImplementationOnce(() => new Promise<void>(() => {}))
+    let releaseDurability: (() => void) | undefined
+    const durability = new Promise<void>((resolve) => {
+      releaseDurability = resolve
+    })
+    const selected = vi.fn(() => durability)
+    const response = jsonResponse({ id: 'resp_1', status: 'completed', output: [] })
     vi.stubGlobal(
       'fetch',
-      vi.fn(async () => jsonResponse({ id: 'resp_1', status: 'completed', output: [] })),
+      vi.fn(async () => response),
     )
 
-    await expect(
-      responsesOnce(
-        {
-          profile: profile('openai-compatible', 'https://api.openai.com/v1'),
-          apiKey: 'legacy-unused',
-          apiKeyCandidates: [accepted],
+    let settled = false
+    const result = responsesOnce(
+      {
+        profile: profile('openai-compatible', 'https://api.openai.com/v1'),
+        apiKey: 'legacy-unused',
+        apiKeyCandidates: [accepted],
+        onKeyCandidateSelected: selected,
+      },
+      { model: 'm', input: 'hi' },
+    ).finally(() => {
+      settled = true
+    })
+    await vi.waitFor(() => expect(selected).toHaveBeenCalledOnce())
+    expect(response.bodyUsed).toBe(false)
+    expect(settled).toBe(false)
+
+    releaseDurability?.()
+    await expect(result).resolves.toMatchObject({ id: 'resp_1', status: 'completed' })
+  })
+
+  it('aborts a pending selected-key handoff and cancels the accepted body', async () => {
+    const accepted = candidate('accepted-key')
+    const controller = new AbortController()
+    const selected = vi.fn(() => new Promise<void>(() => {}))
+    let canceled = false
+    const response = new Response(
+      new ReadableStream<Uint8Array>({
+        cancel() {
+          canceled = true
         },
-        { model: 'm', input: 'hi' },
-      ),
-    ).resolves.toMatchObject({ id: 'resp_1', status: 'completed' })
-    expect(accepted.markUsed).toHaveBeenCalledOnce()
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    )
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => response),
+    )
+
+    const result = responsesOnce(
+      {
+        profile: profile('openai-compatible', 'https://api.openai.com/v1'),
+        apiKey: 'legacy-unused',
+        apiKeyCandidates: [accepted],
+        onKeyCandidateSelected: selected,
+      },
+      { model: 'm', input: 'hi' },
+      { signal: controller.signal },
+    )
+    await vi.waitFor(() => expect(selected).toHaveBeenCalledOnce())
+    expect(response.bodyUsed).toBe(false)
+
+    controller.abort(new DOMException('stopped', 'AbortError'))
+    await expect(result).rejects.toMatchObject({ kind: 'abort', code: 'ABORTED' })
+    await vi.waitFor(() => expect(canceled).toBe(true))
   })
 
   it('rotates text completions only for an account-exhaustion 429', async () => {
@@ -512,12 +573,11 @@ describe('provider adapter key fallback', () => {
           : jsonResponse({ id: 'resp_1', status: 'completed', output: [] })
       }),
     )
-    const requestPlan = {
-      useTextProtocol: false,
-      route: { transport: 'openai-responses' },
+    const requestPlan = createAssistantDispatchPlan({
+      ...responsesRouteContract(),
       requestedModel: 'm',
       wire: { model: 'm', input: 'hi', stream: false },
-    } as unknown as AssistantRequestPlan
+    })
 
     const chunks = []
     const stream = openAssistantRequestStream({

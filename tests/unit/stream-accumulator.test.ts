@@ -1,9 +1,14 @@
 import { describe, expect, it } from 'vitest'
 import { ApiError } from '../../src/api/errors'
-import type { StreamLaneEvent } from '../../src/api/stream-transforms'
+import type { StreamLaneEvent } from '../../src/core/generation-stream-live-events'
+import { inspectReasoningEnvelopeState } from '../../src/core/reasoning-envelope'
 import {
-  applyStreamAccumulatorEvent,
+  type ReasoningObservation,
+  reasoningObservationsFromDetails,
+} from '../../src/core/reasoning-observation'
+import {
   createStreamAccumulator,
+  foldStreamAccumulatorEvent,
   markStreamAccumulatorPublished,
   projectStreamAccumulatorFinal,
   projectStreamAccumulatorLive,
@@ -15,14 +20,119 @@ import {
   streamAccumulatorReasoningLength,
   streamAccumulatorText,
 } from '../../src/core/stream-accumulator'
-import type { ChatUsage, ContentItem } from '../../src/core/types'
+import type { ChatUsage, ContentItem, ReasoningDetail, ReasoningFormat } from '../../src/core/types'
+
+const applyStreamAccumulatorEvent = foldStreamAccumulatorEvent
+
+function reasoningEvent(
+  observations: readonly ReasoningObservation[],
+): Extract<StreamLaneEvent, { lane: 'reasoning-observation' }> {
+  return {
+    lane: 'reasoning-observation',
+    batch: { observations },
+  }
+}
+
+function detailReasoningEvent(
+  details: readonly ReasoningDetail[],
+  mode: 'delta' | 'snapshot' | 'cumulative' = 'delta',
+  source: Readonly<{ outputIndex?: number; itemId?: string }> = {},
+): Extract<StreamLaneEvent, { lane: 'reasoning-observation' }> {
+  return reasoningEvent(
+    reasoningObservationsFromDetails({
+      details,
+      mode,
+      dialect: 'openrouter-chat',
+      bridge: 'openrouter',
+      untypedVisibleKind: 'text',
+      source,
+    }),
+  )
+}
+
+function responsesVisibleObservation(input: {
+  value: string
+  visibleKind: 'text' | 'summary'
+  update?: 'append' | 'append-overlap' | 'append-section' | 'set' | 'cumulative'
+  outputIndex?: number
+  itemId?: string
+  memberIndex?: number
+  format?: ReasoningFormat
+}): Extract<ReasoningObservation, { kind: 'visible' }> {
+  const outputIndex = input.outputIndex ?? 0
+  const member =
+    input.visibleKind === 'summary'
+      ? (`summary:${input.memberIndex ?? 0}` as const)
+      : (`content:${input.memberIndex ?? 0}` as const)
+  return {
+    kind: 'visible',
+    visibleKind: input.visibleKind,
+    update: input.update ?? 'append',
+    value: input.value,
+    format: input.format ?? 'unknown',
+    source: {
+      dialect: 'openrouter-responses',
+      bridge: 'openrouter',
+      outputIndex,
+      ...(input.itemId ? { itemId: input.itemId } : {}),
+      ...(input.visibleKind === 'summary' ? { summaryIndex: input.memberIndex ?? 0 } : {}),
+      ...(input.visibleKind === 'text' ? { contentIndex: input.memberIndex ?? 0 } : {}),
+    },
+    groupAliases: [
+      ...(input.itemId ? [{ kind: 'responses-item' as const, itemId: input.itemId }] : []),
+      { kind: 'responses-output', outputIndex },
+    ],
+    memberAliases: [
+      {
+        kind: 'responses-member',
+        outputIndex,
+        ...(input.itemId ? { itemId: input.itemId } : {}),
+        member,
+      },
+    ],
+  }
+}
+
+function responsesCarrierObservation(input: {
+  value: string
+  update: 'append' | 'set' | 'cumulative'
+  outputIndex?: number
+  itemId?: string
+}): Extract<ReasoningObservation, { kind: 'carrier' }> {
+  const outputIndex = input.outputIndex ?? 0
+  return {
+    kind: 'carrier',
+    carrierKind: 'responses-encrypted',
+    update: input.update,
+    value: input.value,
+    format: 'openai-responses-v1',
+    source: {
+      dialect: 'openrouter-responses',
+      bridge: 'openrouter',
+      outputIndex,
+      ...(input.itemId ? { itemId: input.itemId } : {}),
+    },
+    groupAliases: [
+      ...(input.itemId ? [{ kind: 'responses-item' as const, itemId: input.itemId }] : []),
+      { kind: 'responses-output', outputIndex },
+    ],
+    memberAliases: [
+      {
+        kind: 'responses-member',
+        outputIndex,
+        ...(input.itemId ? { itemId: input.itemId } : {}),
+        member: 'encrypted',
+      },
+    ],
+  }
+}
 
 function applyTrace(
   accumulator: ReturnType<typeof createStreamAccumulator>,
   trace: ReadonlyArray<{ event: StreamLaneEvent; at: number }>,
 ): void {
   for (const entry of trace) {
-    applyStreamAccumulatorEvent(accumulator, entry.event, entry.at)
+    foldStreamAccumulatorEvent(accumulator, entry.event, entry.at)
   }
 }
 
@@ -47,37 +157,39 @@ describe('stream accumulator', () => {
     for (const textDelta of [repeated, repeated, ...overlapping]) {
       applyStreamAccumulatorEvent(
         accumulator,
-        { lane: 'reasoning', textDelta, outputIndex: 0, itemId: 'reasoning-repeat' },
+        reasoningEvent([
+          responsesVisibleObservation({
+            value: textDelta,
+            visibleKind: 'text',
+            outputIndex: 0,
+            itemId: 'reasoning-repeat',
+          }),
+        ]),
         1,
       )
     }
     for (const summaryDelta of ['sum', 'mary', 'mary']) {
       applyStreamAccumulatorEvent(
         accumulator,
-        {
-          lane: 'reasoning',
-          summaryDelta,
-          outputIndex: 0,
-          itemId: 'reasoning-repeat',
-          summaryIndex: 0,
-        },
+        reasoningEvent([
+          responsesVisibleObservation({
+            value: summaryDelta,
+            visibleKind: 'summary',
+            outputIndex: 0,
+            itemId: 'reasoning-repeat',
+            memberIndex: 0,
+          }),
+        ]),
         1,
       )
     }
 
-    expect(projectStreamAccumulatorFinal(accumulator).reasoningDetails).toEqual([
-      {
-        type: 'reasoning.text',
-        id: 'text#reasoning-repeat',
-        index: 0,
+    expect(projectStreamAccumulatorFinal(accumulator).reasoningEnvelope?.visible).toEqual([
+      expect.objectContaining({
+        kind: 'text',
         text: `${repeated}${repeated}${overlapping.join('')}`,
-      },
-      {
-        type: 'reasoning.summary',
-        id: 'summary#reasoning-repeat#0',
-        index: 0,
-        summary: 'summarymary',
-      },
+      }),
+      expect.objectContaining({ kind: 'summary', text: 'summarymary' }),
     ])
   })
 
@@ -86,22 +198,20 @@ describe('stream accumulator', () => {
     for (const text of ['ha', 'ha', 'prefix-tail', 'tail-next']) {
       applyStreamAccumulatorEvent(
         accumulator,
-        {
-          lane: 'reasoning',
-          detailsMode: 'delta',
-          details: [{ type: 'reasoning.text', index: 0, format: 'unknown', text }],
-        },
+        detailReasoningEvent(
+          [{ type: 'reasoning.text', index: 0, format: 'unknown', text }],
+          'delta',
+        ),
         1,
       )
     }
 
-    expect(projectStreamAccumulatorFinal(accumulator).reasoningDetails).toEqual([
-      {
-        type: 'reasoning.text',
-        index: 0,
+    expect(projectStreamAccumulatorFinal(accumulator).reasoningEnvelope?.visible).toEqual([
+      expect.objectContaining({
+        kind: 'text',
         format: 'unknown',
         text: 'hahaprefix-tailtail-next',
-      },
+      }),
     ])
   })
 
@@ -113,41 +223,32 @@ describe('stream accumulator', () => {
     for (let index = 0; index < chunkCount; index += 1) {
       applyStreamAccumulatorEvent(
         accumulator,
-        { lane: 'reasoning', textDelta: chunk, outputIndex: 0 },
+        reasoningEvent([
+          responsesVisibleObservation({ value: chunk, visibleKind: 'text', outputIndex: 0 }),
+        ]),
         index + 1,
       )
     }
 
-    expect(accumulator.reasoningList).toEqual([
-      { type: 'reasoning.text', id: 'text#0', index: 0, text: '' },
-    ])
-    expect(accumulator.reasoningSegmentsByRow.get(0)?.sections.length).toBe(1)
+    const inspected = inspectReasoningEnvelopeState(accumulator.reasoning.envelope)
+    expect(inspected.visibleParts).toBe(1)
+    expect(inspected.retainedTextSegments).toBeLessThanOrEqual(Math.ceil(Math.log2(chunkCount)) + 1)
     expect(streamAccumulatorReasoningLength(accumulator)).toBe(chunk.length * chunkCount)
     const liveReasoningRows = projectStreamAccumulatorLive(accumulator, {
       requestedModel: 'requested/model',
       apiUsed: 'chat',
       now: chunkCount,
-    }).reasoningRows
+    }).reasoning?.visible
     expect(liveReasoningRows).toHaveLength(1)
-    const liveReasoningRow = liveReasoningRows?.[0]
+    if (!liveReasoningRows) throw new Error('expected live reasoning rows')
+    const liveReasoningRow = liveReasoningRows[0]
     if (!liveReasoningRow) throw new Error('expected live reasoning row')
-    expect(liveReasoningRow.detail).toEqual({
-      type: 'reasoning.text',
-      id: 'text#0',
-      index: 0,
-      text: '',
-    })
+    expect(liveReasoningRow.part).toMatchObject({ kind: 'text', format: 'unknown' })
     const valueSections = liveReasoningRow.valueSections
-    if (!valueSections) throw new Error('expected live reasoning sections')
     expect(valueSections.length).toBeGreaterThan(0)
     expect(valueSections.every((section) => typeof section === 'string')).toBe(true)
-    expect(projectStreamAccumulatorFinal(accumulator).reasoningDetails).toEqual([
-      {
-        type: 'reasoning.text',
-        id: 'text#0',
-        index: 0,
-        text: chunk.repeat(chunkCount),
-      },
+    expect(projectStreamAccumulatorFinal(accumulator).reasoningEnvelope?.visible).toEqual([
+      expect.objectContaining({ kind: 'text', text: chunk.repeat(chunkCount) }),
     ])
   })
 
@@ -159,9 +260,8 @@ describe('stream accumulator', () => {
       cumulative += String(index % 10)
       applyStreamAccumulatorEvent(
         accumulator,
-        {
-          lane: 'reasoning',
-          details: [
+        detailReasoningEvent(
+          [
             {
               type: 'reasoning.text',
               index: 0,
@@ -169,15 +269,15 @@ describe('stream accumulator', () => {
               text: cumulative,
             },
           ],
-        },
+          'snapshot',
+        ),
         index + 1,
       )
     }
     applyStreamAccumulatorEvent(
       accumulator,
-      {
-        lane: 'reasoning',
-        details: [
+      detailReasoningEvent(
+        [
           {
             type: 'reasoning.text',
             index: 0,
@@ -185,21 +285,31 @@ describe('stream accumulator', () => {
             signature: 'final-signature',
           },
         ],
-      },
+        'snapshot',
+      ),
       100_001,
     )
 
-    expect(accumulator.reasoningList).toHaveLength(1)
-    expect(accumulator.reasoningSegmentsByRow.size).toBe(0)
-    expect(streamAccumulatorReasoningLength(accumulator)).toBe(100_000)
-    expect(projectStreamAccumulatorFinal(accumulator).reasoningDetails).toEqual([
-      {
-        type: 'reasoning.text',
-        index: 0,
+    const inspected = inspectReasoningEnvelopeState(accumulator.reasoning.envelope)
+    expect(inspected.visibleParts).toBe(1)
+    expect(inspected.carriers).toBe(1)
+    expect(inspected.retainedTextSegments).toBe(1)
+    expect(streamAccumulatorReasoningLength(accumulator)).toBe(100_000 + 'final-signature'.length)
+    const envelope = projectStreamAccumulatorFinal(accumulator).reasoningEnvelope
+    expect(envelope?.visible).toEqual([
+      expect.objectContaining({
+        kind: 'text',
         format: 'anthropic-claude-v1',
         text: cumulative,
+      }),
+    ])
+    expect(envelope?.carriers).toEqual([
+      expect.objectContaining({
+        kind: 'anthropic-signature',
+        format: 'anthropic-claude-v1',
         signature: 'final-signature',
-      },
+        bindsVisiblePartId: envelope?.visible[0]?.id,
+      }),
     ])
   })
 
@@ -207,46 +317,73 @@ describe('stream accumulator', () => {
     const accumulator = createStreamAccumulator({ initialContent: [], now: 0 })
     applyStreamAccumulatorEvent(
       accumulator,
-      { lane: 'reasoning', textDelta: '1 ', outputIndex: 0 },
+      reasoningEvent([
+        {
+          kind: 'visible',
+          visibleKind: 'text',
+          update: 'append',
+          value: '1 ',
+          format: 'unknown',
+          source: { dialect: 'openrouter-chat', bridge: 'openrouter', choiceIndex: 0 },
+          groupAliases: [{ kind: 'chat-choice', choiceIndex: 0, memberKind: 'text' }],
+          memberAliases: [{ kind: 'chat-scalar', choiceIndex: 0, visibleKind: 'text' }],
+        },
+      ]),
       1,
     )
+    const [structured] = reasoningObservationsFromDetails({
+      details: [
+        {
+          type: 'reasoning.text',
+          index: 0,
+          format: 'anthropic-claude-v1',
+          text: '1 2 ',
+        },
+      ],
+      mode: 'cumulative',
+      dialect: 'openrouter-chat',
+      bridge: 'openrouter',
+      untypedVisibleKind: 'text',
+      source: { choiceIndex: 0 },
+    })
+    if (!structured || structured.kind !== 'visible') {
+      throw new Error('expected structured visible reasoning observation')
+    }
     applyStreamAccumulatorEvent(
       accumulator,
-      {
-        lane: 'reasoning',
-        detailsMode: 'cumulative',
-        details: [
-          {
-            type: 'reasoning.text',
-            index: 0,
-            format: 'anthropic-claude-v1',
-            text: '1 2 ',
-          },
-        ],
-      },
+      reasoningEvent([
+        {
+          ...structured,
+          update: 'append-overlap',
+          groupAliases: [
+            { kind: 'chat-choice', choiceIndex: 0, memberKind: 'text' },
+            ...structured.groupAliases,
+          ],
+          memberAliases: [
+            { kind: 'chat-scalar', choiceIndex: 0, visibleKind: 'text' },
+            ...structured.memberAliases,
+          ],
+        },
+      ]),
       2,
     )
 
-    expect(projectStreamAccumulatorFinal(accumulator).reasoningDetails).toEqual([
-      {
-        type: 'reasoning.text',
-        id: 'text#0',
-        index: 0,
+    expect(projectStreamAccumulatorFinal(accumulator).reasoningEnvelope?.visible).toEqual([
+      expect.objectContaining({
+        kind: 'text',
         format: 'anthropic-claude-v1',
         text: '1 2 ',
-      },
+      }),
     ])
   })
 
-  it('preserves non-prefix cumulative details instead of guessing from text overlap', () => {
+  it('replaces non-prefix cumulative details instead of treating snapshots as deltas', () => {
     const accumulator = createStreamAccumulator({ initialContent: [], now: 0 })
     for (const [index, text] of ['base', 'tail', 'tailX'].entries()) {
       applyStreamAccumulatorEvent(
         accumulator,
-        {
-          lane: 'reasoning',
-          detailsMode: 'cumulative',
-          details: [
+        detailReasoningEvent(
+          [
             {
               type: 'reasoning.text',
               id: 'reasoning-0',
@@ -255,24 +392,23 @@ describe('stream accumulator', () => {
               text,
             },
           ],
-        },
+          'cumulative',
+        ),
         index + 1,
       )
     }
 
-    expect(projectStreamAccumulatorFinal(accumulator).reasoningDetails?.[0]).toMatchObject({
-      text: 'basetailtailX',
+    expect(projectStreamAccumulatorFinal(accumulator).reasoningEnvelope?.visible[0]).toMatchObject({
+      text: 'tailX',
     })
   })
 
-  it('preserves an existing Claude prefix when a cumulative candidate is not authoritative', () => {
+  it('replaces an existing Claude prefix when a cumulative candidate is authoritative', () => {
     const accumulator = createStreamAccumulator({ initialContent: [], now: 0 })
     applyStreamAccumulatorEvent(
       accumulator,
-      {
-        lane: 'reasoning',
-        detailsMode: 'delta',
-        details: [
+      detailReasoningEvent(
+        [
           {
             type: 'reasoning.text',
             index: 0,
@@ -280,15 +416,14 @@ describe('stream accumulator', () => {
             text: 'EARLY ',
           },
         ],
-      },
+        'delta',
+      ),
       1,
     )
     applyStreamAccumulatorEvent(
       accumulator,
-      {
-        lane: 'reasoning',
-        detailsMode: 'cumulative',
-        details: [
+      detailReasoningEvent(
+        [
           {
             type: 'reasoning.text',
             index: 0,
@@ -296,12 +431,13 @@ describe('stream accumulator', () => {
             text: 'LATER tail',
           },
         ],
-      },
+        'cumulative',
+      ),
       2,
     )
 
-    expect(projectStreamAccumulatorFinal(accumulator).reasoningDetails?.[0]).toMatchObject({
-      text: 'EARLY LATER tail',
+    expect(projectStreamAccumulatorFinal(accumulator).reasoningEnvelope?.visible[0]).toMatchObject({
+      text: 'LATER tail',
     })
   })
 
@@ -349,6 +485,8 @@ describe('stream accumulator', () => {
         integrity: 'clean',
         costSource: 'stream',
         startedAt: 90,
+        reasoningCarryForward: 'none',
+        reasoningVisibility: { disclosure: 'unknown' },
         firstTextAt: 101,
       },
       textLength: 20_001,
@@ -382,7 +520,9 @@ describe('stream accumulator', () => {
       applyStreamAccumulatorEvent(accumulator, { lane: 'text', text: section }, index + 1)
       applyStreamAccumulatorEvent(
         accumulator,
-        { lane: 'reasoning', textDelta: section, outputIndex: 0 },
+        reasoningEvent([
+          responsesVisibleObservation({ value: section, visibleKind: 'text', outputIndex: 0 }),
+        ]),
         index + 1,
       )
       const live = projectStreamAccumulatorLive(accumulator, {
@@ -393,7 +533,7 @@ describe('stream accumulator', () => {
       const textItems = live.content.filter(
         (item) => item.type === 'text' || item.type === 'output_text',
       )
-      const reasoningSections = live.reasoningRows?.[0]?.valueSections ?? []
+      const reasoningSections = live.reasoning?.visible[0]?.valueSections ?? []
       expect(textItems.length).toBeLessThanOrEqual(perProjectionBudget)
       expect(reasoningSections.length).toBeLessThanOrEqual(perProjectionBudget)
       textSectionVisits += textItems.length
@@ -404,7 +544,7 @@ describe('stream accumulator', () => {
     expect(textSectionVisits).toBeLessThanOrEqual(cumulativeVisitBudget)
     expect(reasoningSectionVisits).toBeLessThanOrEqual(cumulativeVisitBudget)
     expect(streamAccumulatorText(accumulator)).toBe(section.repeat(sectionCount))
-    expect(projectStreamAccumulatorFinal(accumulator).reasoningDetails?.[0]).toMatchObject({
+    expect(projectStreamAccumulatorFinal(accumulator).reasoningEnvelope?.visible[0]).toMatchObject({
       text: section.repeat(sectionCount),
     })
   })
@@ -472,81 +612,101 @@ describe('stream accumulator', () => {
       },
       { event: { lane: 'text', text: 'answer' }, at: 1_002 },
       {
-        event: {
-          lane: 'reasoning',
-          details: [
-            {
-              type: 'reasoning.text',
-              id: 'legacy-reasoning',
-              index: 0,
-              format: 'openai-responses-v1',
-              text: 'Legacy ',
-            },
-            { type: 'reasoning.text', id: 'tool_signature', text: 'ignored' },
-          ],
-        },
+        event: detailReasoningEvent([
+          {
+            type: 'reasoning.text',
+            id: 'legacy-reasoning',
+            index: 0,
+            format: 'openai-responses-v1',
+            text: 'Legacy ',
+          },
+          {
+            type: 'reasoning.text',
+            id: 'tool_signature',
+            format: 'openai-responses-v1',
+            text: 'ignored',
+          },
+        ]),
         at: 1_003,
       },
       {
-        event: {
-          lane: 'reasoning',
-          details: [
-            {
-              type: 'reasoning.text',
-              id: 'legacy-reasoning',
-              index: 0,
-              format: 'openai-responses-v1',
-              text: 'detail',
-            },
-          ],
-        },
+        event: detailReasoningEvent([
+          {
+            type: 'reasoning.text',
+            id: 'legacy-reasoning',
+            index: 0,
+            format: 'openai-responses-v1',
+            text: 'detail',
+          },
+        ]),
         at: 1_004,
       },
       {
-        event: { lane: 'reasoning', textDelta: 'think', outputIndex: 2, itemId: 'reasoning-2' },
+        event: reasoningEvent([
+          responsesVisibleObservation({
+            value: 'think',
+            visibleKind: 'text',
+            outputIndex: 2,
+            itemId: 'reasoning-2',
+          }),
+        ]),
         at: 1_005,
       },
       {
-        event: { lane: 'reasoning', textDelta: 'ing', outputIndex: 2, itemId: 'reasoning-2' },
+        event: reasoningEvent([
+          responsesVisibleObservation({
+            value: 'ing',
+            visibleKind: 'text',
+            outputIndex: 2,
+            itemId: 'reasoning-2',
+          }),
+        ]),
         at: 1_006,
       },
       {
-        event: {
-          lane: 'reasoning',
-          summaryDelta: 'sum',
-          outputIndex: 2,
-          itemId: 'reasoning-2',
-          summaryIndex: 1,
-        },
+        event: reasoningEvent([
+          responsesVisibleObservation({
+            value: 'sum',
+            visibleKind: 'summary',
+            outputIndex: 2,
+            itemId: 'reasoning-2',
+            memberIndex: 1,
+          }),
+        ]),
         at: 1_007,
       },
       {
-        event: {
-          lane: 'reasoning',
-          summaryDelta: 'mary',
-          outputIndex: 2,
-          itemId: 'reasoning-2',
-          summaryIndex: 1,
-        },
+        event: reasoningEvent([
+          responsesVisibleObservation({
+            value: 'mary',
+            visibleKind: 'summary',
+            outputIndex: 2,
+            itemId: 'reasoning-2',
+            memberIndex: 1,
+          }),
+        ]),
         at: 1_008,
       },
       {
-        event: {
-          lane: 'reasoning',
-          encryptedDelta: 'provisional',
-          outputIndex: 2,
-          itemId: 'reasoning-2',
-        },
+        event: reasoningEvent([
+          responsesCarrierObservation({
+            value: 'provisional',
+            update: 'append',
+            outputIndex: 2,
+            itemId: 'reasoning-2',
+          }),
+        ]),
         at: 1_009,
       },
       {
-        event: {
-          lane: 'reasoning',
-          encryptedDelta: 'authoritative',
-          replaceEncrypted: true,
-          outputIndex: 2,
-          itemId: 'reasoning-2',
-        },
+        event: reasoningEvent([
+          responsesCarrierObservation({
+            value: 'authoritative',
+            update: 'set',
+            outputIndex: 2,
+            itemId: 'reasoning-2',
+          }),
+        ]),
         at: 1_010,
       },
       {
@@ -579,6 +739,7 @@ describe('stream accumulator', () => {
       {
         event: {
           lane: 'output-item-done',
+          dialect: 'openai-responses',
           outputIndex: 0,
           item: { type: 'web_search_call', id: 'search-1', status: 'completed', query: 'cats' },
         },
@@ -587,6 +748,7 @@ describe('stream accumulator', () => {
       {
         event: {
           lane: 'server-tool-output',
+          dialect: 'google-gemini',
           itemType: 'google:code_execution',
           itemId: 'code-tool',
           outputIndex: 1,
@@ -600,28 +762,6 @@ describe('stream accumulator', () => {
       { event: { lane: 'finish', finishReason: 'stop' }, at: 1_020 },
     ])
 
-    const reasoningDetails = [
-      {
-        type: 'reasoning.text',
-        id: 'legacy-reasoning',
-        index: 0,
-        format: 'openai-responses-v1',
-        text: 'Legacy detail',
-      },
-      { type: 'reasoning.text', id: 'text#reasoning-2', index: 2, text: 'thinking' },
-      {
-        type: 'reasoning.summary',
-        id: 'summary#reasoning-2#1',
-        index: 2,
-        summary: 'summary',
-      },
-      {
-        type: 'reasoning.encrypted',
-        id: 'encrypted#reasoning-2',
-        index: 2,
-        data: 'authoritative',
-      },
-    ]
     const providerOutputItems = [
       {
         dialect: 'openai-responses',
@@ -637,33 +777,17 @@ describe('stream accumulator', () => {
       },
     ]
 
-    expect(
-      projectStreamAccumulatorLive(accumulator, {
-        requestedModel: 'requested/model',
-        apiUsed: 'responses',
-        now: 1_020,
-        generationStartedAt: 999,
-      }),
-    ).toEqual({
+    const live = projectStreamAccumulatorLive(accumulator, {
+      requestedModel: 'requested/model',
+      apiUsed: 'responses',
+      now: 1_020,
+      generationStartedAt: 999,
+    })
+    expect(live).toMatchObject({
       content: [
         { type: 'output_text', text: 'seed:' },
         { type: 'output_text', text: 'answer' },
         { type: 'output_image', url: 'image://one' },
-      ],
-      reasoningRows: [
-        { detail: reasoningDetails[0] },
-        {
-          detail: { ...reasoningDetails[1], text: '' },
-          valueSections: ['thinking'],
-        },
-        {
-          detail: { ...reasoningDetails[2], summary: '' },
-          valueSections: ['summary'],
-        },
-        {
-          detail: { ...reasoningDetails[3], data: '' },
-          valueSections: ['authoritative'],
-        },
       ],
       generation: {
         id: 'generation-1',
@@ -678,6 +802,7 @@ describe('stream accumulator', () => {
         cost: 0.004,
         costSource: 'stream',
         startedAt: 999,
+        reasoningCarryForward: 'none',
         firstTextAt: 1_002,
         reasoningStartedAt: 1_003,
         reasoningFinishedAt: 1_010,
@@ -689,12 +814,6 @@ describe('stream accumulator', () => {
             id: 'search-1',
             status: 'completed',
             outputIndex: 0,
-            output: {
-              type: 'web_search_call',
-              id: 'search-1',
-              status: 'completed',
-              query: 'cats',
-            },
           },
           {
             type: 'google:code_execution',
@@ -702,7 +821,6 @@ describe('stream accumulator', () => {
             id: 'code-tool',
             status: 'completed',
             outputIndex: 1,
-            output: { executableCode: { id: 'code-1', language: 'PYTHON', code: '1 + 1' } },
           },
         ],
       },
@@ -710,8 +828,22 @@ describe('stream accumulator', () => {
       reasoningLength: 41,
       updatedAt: 1_020,
     })
+    expect(
+      live.reasoning?.visible.map((row) => ({
+        kind: row.part.kind,
+        value: [...row.valueSections, row.pendingValue ?? ''].join(''),
+      })),
+    ).toEqual([
+      { kind: 'text', value: 'Legacy detail' },
+      { kind: 'text', value: 'thinking' },
+      { kind: 'summary', value: 'summary' },
+    ])
+    expect(live.reasoning?.carriers).toEqual([
+      expect.objectContaining({ valueLength: 'authoritative'.length }),
+    ])
 
-    expect(projectStreamAccumulatorFinal(accumulator)).toEqual({
+    const final = projectStreamAccumulatorFinal(accumulator)
+    expect(final).toMatchObject({
       content: [
         { type: 'output_text', text: 'seed:answer' },
         { type: 'output_image', url: 'image://one' },
@@ -723,10 +855,17 @@ describe('stream accumulator', () => {
           url: 'data:audio/mp3;base64,QUJD',
         },
       ],
-      reasoningDetails,
       phase: 'final_answer',
       providerOutputItems,
     })
+    expect(final.reasoningEnvelope?.visible).toEqual([
+      expect.objectContaining({ kind: 'text', text: 'Legacy detail' }),
+      expect.objectContaining({ kind: 'text', text: 'thinking' }),
+      expect.objectContaining({ kind: 'summary', text: 'summary' }),
+    ])
+    expect(final.reasoningEnvelope?.carriers).toEqual([
+      expect.objectContaining({ kind: 'responses-encrypted', data: 'authoritative' }),
+    ])
     expect(streamAccumulatorReasoningLength(accumulator)).toBe(41)
     expect(streamAccumulatorHasCompletionCalibrationBlockers(accumulator)).toBe(true)
 
@@ -745,11 +884,13 @@ describe('stream accumulator', () => {
     const validTrace = [
       { event: { lane: 'text', text: 'answer' } satisfies StreamLaneEvent, at: 1 },
       {
-        event: {
-          lane: 'reasoning',
-          summaryDelta: 'summary',
-          summaryIndex: 0,
-        } satisfies StreamLaneEvent,
+        event: reasoningEvent([
+          responsesVisibleObservation({
+            value: 'summary',
+            visibleKind: 'summary',
+            memberIndex: 0,
+          }),
+        ]),
         at: 2,
       },
       { event: { lane: 'finish', finishReason: 'stop' } satisfies StreamLaneEvent, at: 3 },
@@ -826,15 +967,18 @@ describe('stream accumulator', () => {
         custom_requests: 1,
       },
     } satisfies ChatUsage
+    const canonicalReasoning = foldStreamAccumulatorEvent(
+      createStreamAccumulator({ initialContent: [], now: 13 }),
+      reasoningEvent([responsesVisibleObservation({ value: 'thought', visibleKind: 'text' })]),
+      13,
+    )
     const replayed = replayStreamAccumulator({
       initialContent: [{ type: 'text', text: 'before-' }],
       now: 10,
       entries: [
-        { event: null, createdAt: 10 },
-        { event: { lane: 'unknown' }, createdAt: 10 },
         { event: { lane: 'meta', generationId: 'generation-replayed' }, createdAt: 11 },
         { event: { lane: 'text', text: 'after' }, createdAt: 12 },
-        { event: { lane: 'reasoning', textDelta: 'thought' }, createdAt: 13 },
+        { event: canonicalReasoning, createdAt: 13 },
         { event: { lane: 'phase', phase: 'commentary', outputIndex: 0 }, createdAt: 14 },
         { event: { lane: 'phase', phase: null, outputIndex: 0 }, createdAt: 15 },
         { event: { lane: 'keepalive', comment: 'ping' }, createdAt: 16 },
@@ -846,9 +990,8 @@ describe('stream accumulator', () => {
     })
 
     expect(replayed.finishedCleanly).toBe(true)
-    expect(replayed.final).toEqual({
+    expect(replayed.final).toMatchObject({
       content: [{ type: 'output_text', text: 'before-after' }],
-      reasoningDetails: [{ type: 'reasoning.text', id: 'text#default', index: 0, text: 'thought' }],
       providerOutputItems: [
         {
           dialect: 'unknown',
@@ -863,6 +1006,9 @@ describe('stream accumulator', () => {
         },
       ],
     })
+    expect(replayed.final.reasoningEnvelope?.visible).toEqual([
+      expect.objectContaining({ kind: 'text', text: 'thought' }),
+    ])
     expect(replayed.accumulator.midStreamError).toBe(error)
     expect(
       projectStreamGeneration(undefined, replayed.accumulator, 'requested/model', {
@@ -879,6 +1025,8 @@ describe('stream accumulator', () => {
       usage,
       costSource: 'stream',
       startedAt: 9,
+      reasoningCarryForward: 'none',
+      reasoningVisibility: { disclosure: 'unknown' },
       firstTextAt: 12,
       reasoningStartedAt: 13,
       reasoningFinishedAt: 13,
@@ -889,14 +1037,12 @@ describe('stream accumulator', () => {
           source: 'usage',
           status: 'completed',
           requestCount: 2,
-          output: { web_search_requests: 2 },
         },
         {
           type: 'custom_requests',
           source: 'usage',
           status: 'completed',
           requestCount: 1,
-          output: { custom_requests: 1 },
         },
       ],
     })
@@ -906,7 +1052,6 @@ describe('stream accumulator', () => {
       initialContent: [],
       textSections: [],
       textLength: 0,
-      reasoningList: [],
       toolCallRows: [],
       toolCallArgumentsLength: 0,
       generatedContent: [],
@@ -921,7 +1066,14 @@ describe('stream accumulator', () => {
       reasoningFinishedAt: 13,
       midStreamError: error,
     })
-    expect(replayed.accumulator.reasoningRowById.size).toBe(0)
+    expect(inspectReasoningEnvelopeState(replayed.accumulator.reasoning.envelope)).toEqual({
+      visibleParts: 0,
+      carriers: 0,
+      visibleTextLength: 0,
+      carrierByteLength: 0,
+      retainedTextSegments: 0,
+      retainedCarrierSegments: 0,
+    })
     expect(replayed.accumulator.audioOutput).toBeUndefined()
   })
 

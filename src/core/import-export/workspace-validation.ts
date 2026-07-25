@@ -12,8 +12,10 @@ import type {
 import type {
   PortableAttachmentBundle,
   PortableChatPayload,
+  WorkspaceBackupManifest,
   WorkspaceBackupPayload,
 } from './schema'
+import { WORKSPACE_BACKUP_TABLE_KEYS } from './schema'
 
 export interface WorkspaceValidationResult {
   readonly attachmentRefCounts: ReadonlyMap<AttachmentId, number>
@@ -22,6 +24,7 @@ export interface WorkspaceValidationResult {
 export function validateWorkspaceBackupGraph(
   payload: WorkspaceBackupPayload,
 ): WorkspaceValidationResult {
+  validateWorkspaceBackupManifest(payload)
   const chats = uniqueMap(payload.chats, (row) => row.id, 'Chat')
   const messages = uniqueMap(payload.messages, (row) => row.id, 'Message')
   const attachments = uniqueMap(payload.attachments, (row) => row.attachment.id, 'Attachment')
@@ -54,6 +57,49 @@ export function validateWorkspaceBackupGraph(
     }
   }
   return { attachmentRefCounts }
+}
+
+export function validateWorkspaceBackupManifest(
+  payload: WorkspaceBackupPayload,
+  options: { readonly required?: boolean } = {},
+): WorkspaceBackupManifest | undefined {
+  const manifest = payload.manifest
+  if (!manifest) {
+    if (options.required) throw new Error('ImportWorkspaceManifestMissing')
+    return undefined
+  }
+  for (const key of WORKSPACE_BACKUP_TABLE_KEYS) {
+    const actual = payload[key].length
+    const expected = manifest.counts[key]
+    if (actual !== expected) {
+      throw new Error(`ImportWorkspaceManifestCountMismatch:${key}:${expected}:${actual}`)
+    }
+  }
+  let attachmentBlobCount = 0
+  let attachmentBlobBytes = 0
+  for (const bundle of payload.attachments) {
+    attachmentBlobCount += bundle.blobs.length
+    for (const blob of bundle.blobs) {
+      if (!Number.isSafeInteger(blob.sizeBytes) || blob.sizeBytes < 0) {
+        throw new Error(`ImportWorkspaceManifestBlobSizeInvalid:${blob.id}`)
+      }
+      attachmentBlobBytes += blob.sizeBytes
+      if (!Number.isSafeInteger(attachmentBlobBytes)) {
+        throw new Error('ImportWorkspaceManifestBlobBytesOverflow')
+      }
+    }
+  }
+  if (attachmentBlobCount !== manifest.attachmentBlobCount) {
+    throw new Error(
+      `ImportWorkspaceManifestBlobCountMismatch:${manifest.attachmentBlobCount}:${attachmentBlobCount}`,
+    )
+  }
+  if (attachmentBlobBytes !== manifest.attachmentBlobBytes) {
+    throw new Error(
+      `ImportWorkspaceManifestBlobBytesMismatch:${manifest.attachmentBlobBytes}:${attachmentBlobBytes}`,
+    )
+  }
+  return manifest
 }
 
 export function validatePortableChatGraph(payload: PortableChatPayload): void {
@@ -181,7 +227,9 @@ function validateProfiles(
   keys: ReadonlyMap<KeyId, { id: KeyId }>,
 ): void {
   for (const profile of profiles) {
-    validateProfileKeyRef(profile, 'primary', profile.apiKeyRef, keys)
+    if (profile.apiKeyRef !== undefined) {
+      validateProfileKeyRef(profile, 'primary', profile.apiKeyRef, keys)
+    }
     for (const keyId of profile.apiKeyFallbackRefs ?? []) {
       validateProfileKeyRef(profile, 'fallback', keyId, keys)
     }

@@ -3,14 +3,16 @@ import { CloseIcon } from '../icons/Icon'
 import { Button, IconButton } from '../primitives/Button'
 import { Dialog } from '../primitives/Dialog'
 import { AppearanceSettings } from './AppearanceSettings'
+import { ConnectionsSettings } from './ConnectionsSettings'
 import { GeneralSettings } from './GeneralSettings'
 import { ImageAllowlistPanel } from './ImageAllowlistPanel'
 import { PerformanceSettings } from './PerformanceSettings'
 
-type GlobalSettingsTab = 'general' | 'appearance' | 'performance' | 'images'
+type GlobalSettingsTab = 'general' | 'connections' | 'appearance' | 'performance' | 'images'
 
 const TAB_LABELS: Record<GlobalSettingsTab, string> = {
   general: 'General',
+  connections: 'Connections',
   appearance: 'Appearance',
   performance: 'Performance',
   images: 'Images',
@@ -18,6 +20,7 @@ const TAB_LABELS: Record<GlobalSettingsTab, string> = {
 
 const GLOBAL_SETTINGS_TABS: readonly GlobalSettingsTab[] = [
   'general',
+  'connections',
   'appearance',
   'performance',
   'images',
@@ -72,6 +75,7 @@ export function GlobalSettingsModal({ open, onClose }: GlobalSettingsModalProps)
       </div>
       <div role="tabpanel" data-ui="settings-panel" data-active-tab={tab}>
         {tab === 'general' ? <GeneralSettings /> : null}
+        {tab === 'connections' ? <ConnectionsSettings /> : null}
         {tab === 'appearance' ? <AppearanceSettings /> : null}
         {tab === 'performance' ? <PerformanceSettings /> : null}
         {tab === 'images' ? <ImageAllowlistPanel /> : null}

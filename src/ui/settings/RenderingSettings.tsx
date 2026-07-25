@@ -1,90 +1,45 @@
-import { createContext, type ReactNode, useCallback, useEffect, useState } from 'react'
+import { createContext } from 'react'
+import { definePresentationInteraction } from '../../app/presentation-interactions'
 import {
   DEFAULT_RENDERING_PREFS,
-  normalizeRenderingPreferences,
-  RENDERING_PREFERENCES_KEY,
   type RenderingPreferences,
   SHIKI_THEME_CHOICES,
   type ShikiThemeChoice,
 } from '../../core/rendering-preferences'
-import { primaryKeys } from '../../store/reactive-dependencies'
-import { useRepositoryQuery } from '../../store/reactive-query'
-import { getSetting, setSetting } from '../../store/settings'
+import { useConfigurationPreferences } from '../../hooks/useConfigurationPreferences'
+import { usePresentationInteraction } from '../../hooks/usePresentationInteraction'
+import { configurationApplication } from '../../store/configuration-application'
 import { InfoDisclosure } from './InfoDisclosure'
 
-export type { RenderingPreferences, ShikiThemeChoice }
-export { DEFAULT_RENDERING_PREFS }
+export const RenderingPreferencesContext = createContext<RenderingPreferences | null>(null)
 
-export const RenderingPreferencesContext =
-  createContext<RenderingPreferences>(DEFAULT_RENDERING_PREFS)
-
-type RenderingPreferencesListener = (prefs: RenderingPreferences) => void
-const renderingPreferencesListeners = new Set<RenderingPreferencesListener>()
-let latestRenderingPreferences = DEFAULT_RENDERING_PREFS
-
-function publishRenderingPreferences(prefs: RenderingPreferences): void {
-  latestRenderingPreferences = prefs
-  for (const listener of renderingPreferencesListeners) listener(prefs)
-}
-
-function subscribeRenderingPreferences(listener: RenderingPreferencesListener): () => void {
-  renderingPreferencesListeners.add(listener)
-  return () => renderingPreferencesListeners.delete(listener)
-}
-
-async function readRenderingPreferences(): Promise<RenderingPreferences> {
-  const stored = await getSetting<unknown>(RENDERING_PREFERENCES_KEY)
-  return normalizeRenderingPreferences(stored)
-}
+const renderingPreferenceInteraction = definePresentationInteraction<keyof RenderingPreferences>({
+  id: 'rendering-preference.patch',
+  label: 'Rendering preference update',
+  concurrency: 'reject',
+  lifetime: 'workspace-tab',
+})
 
 async function writeRenderingPreferences(next: Partial<RenderingPreferences>): Promise<void> {
-  publishRenderingPreferences({ ...latestRenderingPreferences, ...next })
-  const current = await readRenderingPreferences()
-  const updated = { ...current, ...next }
-  await setSetting(RENDERING_PREFERENCES_KEY, updated)
-  publishRenderingPreferences(updated)
+  await configurationApplication.patchRenderingPreferences(next)
 }
 
 function useRenderingPreferences(): RenderingPreferences {
-  const storedPrefs = useRepositoryQuery(
-    'rendering-preferences',
-    readRenderingPreferences,
-    DEFAULT_RENDERING_PREFS,
-    primaryKeys('settings', RENDERING_PREFERENCES_KEY),
-  )
-  const [prefs, setPrefs] = useState<RenderingPreferences>(storedPrefs)
-  useEffect(() => {
-    const next = storedPrefs
-    latestRenderingPreferences = next
-    setPrefs(next)
-  }, [storedPrefs])
-  useEffect(() => subscribeRenderingPreferences(setPrefs), [])
-  return prefs
-}
-
-export function RenderingPreferencesProvider({ children }: { children: ReactNode }) {
-  const prefs = useRenderingPreferences()
-  return (
-    <RenderingPreferencesContext.Provider value={prefs}>
-      {children}
-    </RenderingPreferencesContext.Provider>
-  )
+  return useConfigurationPreferences()?.rendering ?? DEFAULT_RENDERING_PREFS
 }
 
 export function RenderingSettings() {
   const prefs = useRenderingPreferences()
-  const onLight = useCallback((value: ShikiThemeChoice) => {
-    void writeRenderingPreferences({ shikiLight: value })
-  }, [])
-  const onDark = useCallback((value: ShikiThemeChoice) => {
-    void writeRenderingPreferences({ shikiDark: value })
-  }, [])
-  const onSingleDollarTextMath = useCallback((value: boolean) => {
-    void writeRenderingPreferences({ singleDollarTextMath: value })
-  }, [])
-  const onSingleNewlineHardBreaks = useCallback((value: boolean) => {
-    void writeRenderingPreferences({ singleNewlineHardBreaks: value })
-  }, [])
+  const renderingInteraction = usePresentationInteraction(renderingPreferenceInteraction)
+  const writePreference = <Key extends keyof RenderingPreferences>(
+    key: Key,
+    value: RenderingPreferences[Key],
+  ) => {
+    renderingInteraction.run({
+      target: key,
+      action: () => writeRenderingPreferences({ [key]: value }),
+    })
+  }
   return (
     <div data-ui="settings-section" data-ui-section="rendering-settings">
       <h3>Rendering</h3>
@@ -96,7 +51,8 @@ export function RenderingSettings() {
               data-ui="single-newline-hard-breaks"
               type="checkbox"
               checked={prefs.singleNewlineHardBreaks}
-              onChange={(e) => onSingleNewlineHardBreaks(e.target.checked)}
+              disabled={renderingInteraction.isPending('singleNewlineHardBreaks')}
+              onChange={(e) => writePreference('singleNewlineHardBreaks', e.target.checked)}
             />
             <span>Single newline as line break</span>
             <InfoDisclosure title="Single newline as line break">
@@ -112,7 +68,8 @@ export function RenderingSettings() {
               data-ui="single-dollar-text-math"
               type="checkbox"
               checked={prefs.singleDollarTextMath}
-              onChange={(e) => onSingleDollarTextMath(e.target.checked)}
+              disabled={renderingInteraction.isPending('singleDollarTextMath')}
+              onChange={(e) => writePreference('singleDollarTextMath', e.target.checked)}
             />
             <span>Single-dollar LaTeX markdown</span>
             <InfoDisclosure title="Single-dollar LaTeX markdown">
@@ -127,7 +84,8 @@ export function RenderingSettings() {
             id="shiki-light"
             data-ui="shiki-theme-light"
             value={prefs.shikiLight}
-            onChange={(e) => onLight(e.target.value as ShikiThemeChoice)}
+            disabled={renderingInteraction.isPending('shikiLight')}
+            onChange={(e) => writePreference('shikiLight', e.target.value as ShikiThemeChoice)}
           >
             {SHIKI_THEME_CHOICES.map((v) => (
               <option key={v} value={v}>
@@ -142,7 +100,8 @@ export function RenderingSettings() {
             id="shiki-dark"
             data-ui="shiki-theme-dark"
             value={prefs.shikiDark}
-            onChange={(e) => onDark(e.target.value as ShikiThemeChoice)}
+            disabled={renderingInteraction.isPending('shikiDark')}
+            onChange={(e) => writePreference('shikiDark', e.target.value as ShikiThemeChoice)}
           >
             {SHIKI_THEME_CHOICES.map((v) => (
               <option key={v} value={v}>

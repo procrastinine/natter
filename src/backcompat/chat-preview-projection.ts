@@ -1,7 +1,10 @@
 import type Dexie from 'dexie'
 import type { Table, Transaction } from 'dexie'
 import type { Chat, ChatId } from '../core/types'
-import { putChatSidebarProjection } from '../store/chat-sidebar-projection'
+import {
+  type ChatSidebarProjectionRow,
+  chatSidebarProjectionRow,
+} from '../store/chat-sidebar-projection'
 import type { SettingsRow } from '../store/db-rows'
 import {
   type MessageBodyRow,
@@ -9,6 +12,7 @@ import {
   previewTextFromContent,
 } from '../store/message-storage'
 import { forEachTableBatch } from './batched-table'
+import { runOnceBackfill, runOnceBackfillInTransaction } from './run-once'
 
 const CHAT_PREVIEW_PROJECTION_BACKFILL_KEY = 'backfill:chat-preview-projection-v1'
 
@@ -17,9 +21,13 @@ export function chatPreviewProjectionBackfillMarker(): SettingsRow {
 }
 
 export async function migrateChatPreviewProjection(tx: Transaction): Promise<void> {
-  const settings = tx.table<SettingsRow, string>('settings')
-  if ((await settings.get(CHAT_PREVIEW_PROJECTION_BACKFILL_KEY))?.value === 1) return
+  await runOnceBackfillInTransaction(tx, {
+    marker: chatPreviewProjectionBackfillMarker(),
+    run: migrateChatPreviewProjectionRows,
+  })
+}
 
+async function migrateChatPreviewProjectionRows(tx: Transaction): Promise<void> {
   const chats = tx.table<Chat, ChatId>('chats')
   const earliestByChat = await earliestLiveUserHeaders(
     tx.table<MessageHeaderRow, string>('messages'),
@@ -32,22 +40,19 @@ export async function migrateChatPreviewProjection(tx: Transaction): Promise<voi
       const body = header ? await bodies.get(header.id) : undefined
       const next = { ...chat, previewText: previewTextFromContent(body?.content ?? []) }
       await chats.put(next)
-      await putChatSidebarProjection(tx, next)
+      await tx
+        .table<ChatSidebarProjectionRow, ChatId>('chatSidebarRows')
+        .put(chatSidebarProjectionRow(next))
     }
   })
-  await settings.put(chatPreviewProjectionBackfillMarker())
 }
 
 export async function backfillChatPreviewProjection(db: Dexie): Promise<void> {
-  const chats = db.table<Chat, ChatId>('chats')
-  const messages = db.table<MessageHeaderRow, string>('messages')
-  const bodies = db.table<MessageBodyRow, string>('messageBodies')
-  const sidebarRows = db.table('chatSidebarRows')
-  const settings = db.table<SettingsRow, string>('settings')
-  if ((await settings.get(CHAT_PREVIEW_PROJECTION_BACKFILL_KEY))?.value === 1) return
-  await db.transaction('rw', chats, sidebarRows, messages, bodies, settings, (tx) =>
-    migrateChatPreviewProjection(tx),
-  )
+  await runOnceBackfill(db, {
+    marker: chatPreviewProjectionBackfillMarker(),
+    tables: ['chats', 'messages', 'messageBodies', 'chatSidebarRows'],
+    run: migrateChatPreviewProjectionRows,
+  })
 }
 
 async function earliestLiveUserHeaders(

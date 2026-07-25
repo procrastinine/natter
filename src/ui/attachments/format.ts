@@ -1,4 +1,7 @@
 import type { Attachment, AttachmentKind } from '../../core/types'
+import type { AttachmentCatalogRow } from '../../store/presentation-contracts'
+
+export type AttachmentDisplayRow = Attachment | AttachmentCatalogRow
 
 export function formatBytes(bytes: number | undefined): string {
   if (bytes === undefined || !Number.isFinite(bytes) || bytes < 0) return 'unknown'
@@ -23,7 +26,7 @@ export function formatDate(ms: number | undefined): string {
   }).format(new Date(ms))
 }
 
-export function storageLabel(attachment: Attachment): string {
+export function storageLabel(attachment: Pick<Attachment, 'storage'>): string {
   if (attachment.storage.kind === 'local-blob') return 'local'
   if (attachment.storage.kind === 'remote-url') return 'remote'
   return 'missing'

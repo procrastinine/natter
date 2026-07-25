@@ -4,20 +4,27 @@
 // "verbosity" segmented control with xhigh as the ceiling, and adaptive-
 // only models hide the effort segmented control entirely.
 //
-// On mount the stored settings are validated against the live caps; any
-// dropped params or clamped enums are surfaced via a small issues banner
-// and a toast. This way moving from a low-cap model to a high-cap one
-// doesn't leave dangling knobs that will 400 on send.
+// Stored settings remain a preference reservoir across model changes. The
+// request planner derives the capability-valid request snapshot, so merely
+// mounting this panel never mutates durable chat state.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { LlamaServerProps } from '../../api/probe'
-import { chooseApi, isResponsesCapable, isTextCompletionsCapable } from '../../core/api-choice'
+import {
+  configurationWriteInteraction,
+  configurationWriteTarget,
+} from '../../app/presentation-interactions'
+import {
+  type AssistantRouteContract,
+  isResponsesCapable,
+  isTextCompletionsCapable,
+} from '../../core/api-choice'
 import type { EffectiveCapability } from '../../core/capabilities'
-import { validateChatSettings } from '../../core/capabilities'
+import type { ChatSettingsFieldPatch } from '../../core/chat-metadata'
+import type { PrefillPlan } from '../../core/effective-endpoint-routing'
 import { type HostedToolProvider, isOpenAiDirectProfile } from '../../core/provider-hosted-tools'
 import {
   emitsEncryptedReasoningFor,
-  prefillClassFor,
   reasoningToggleableFor,
   responsesSupportFor,
 } from '../../core/quirks'
@@ -27,15 +34,15 @@ import type {
   ConnectionKind,
   ConnectionProfile,
   GoogleServerToolId,
-  Message,
-  ModelEndpoint,
   OpenAiServerToolId,
+  OpenRouterServerToolId,
   ReasoningInclude,
   SamplingKey,
-  ServerToolId,
   VerbosityLevel,
 } from '../../core/types'
-import { updateChatSettings } from '../../store/chats'
+import { usePresentationInteraction } from '../../hooks/usePresentationInteraction'
+import { useSettledChatSettingsEdit } from '../../hooks/useSettledConfigurationEdit'
+import { configurationApplication } from '../../store/configuration-application'
 import { PrefillSettingsPrompt } from '../chat/PrefillSettingsPrompt'
 import { Button } from '../primitives/Button'
 import { InfoDisclosure } from './InfoDisclosure'
@@ -45,9 +52,6 @@ import { TextTemplateSection } from './TextTemplateSection'
 interface ParamFormProps {
   chat: Chat
   capability: EffectiveCapability | null
-  // Preserved for forward-compat — future sampling fields (seed variance,
-  // deterministic tokenizer-aware ops) may want it. Unused today.
-  endpointTokenizer?: string | null | undefined
   textTemplateMode?: 'openrouter' | 'llama-server' | null | undefined
   llamaProps?: LlamaServerProps | null | undefined
   connectionKind?: ConnectionKind | undefined
@@ -275,10 +279,8 @@ const SAMPLING_FIELDS: SamplingSpec[] = [
   },
 ]
 
-const SETTINGS_SLIDER_COMMIT_DEBOUNCE_MS = 200
-
 const OPENROUTER_HOSTED_TOOL_OPTIONS: ReadonlyArray<{
-  id: ServerToolId
+  id: OpenRouterServerToolId
   label: string
   help: string
 }> = [
@@ -328,32 +330,6 @@ export function ParamForm({
   connectionProfile = null,
   textCompletionsActive = false,
 }: ParamFormProps) {
-  const prefillSupportedForModel = chat.settings.model
-    ? prefillClassFor(chat.settings.model) !== 'unsupported'
-    : false
-  const continuePrefillStored = chat.settings.continuePrefill === true
-
-  // Validate stored settings once the live cap lands. Re-run whenever the
-  // cap identity changes, e.g. model swap. Silent: values are simply
-  // fixed, no user-visible banner (the UI re-renders with the clamped values).
-  const lastValidatedCapRef = useRef<EffectiveCapability | null>(null)
-  useEffect(() => {
-    if (!capability) return
-    if (lastValidatedCapRef.current === capability) return
-    lastValidatedCapRef.current = capability
-    const result = validateChatSettings(chat.settings, capability)
-    if (result.changed) {
-      void updateChatSettings(chat.id, result.settings)
-    }
-  }, [capability, chat.id, chat.settings])
-
-  useEffect(() => {
-    if (!chat.settings.model) return
-    if (prefillSupportedForModel) return
-    if (!continuePrefillStored) return
-    void updateChatSettings(chat.id, { continuePrefill: false })
-  }, [chat.id, chat.settings.model, continuePrefillStored, prefillSupportedForModel])
-
   if (!chat.settings.model) {
     return (
       <div data-ui="param-form">
@@ -413,14 +389,23 @@ export function ParamForm({
 
 export function PrefillSettingsSection({
   chat,
-  endpoints,
+  prefillPlan,
 }: {
   chat: Chat
-  endpoints: readonly ModelEndpoint[]
+  prefillPlan: PrefillPlan
 }) {
+  const { run: runConfigurationWrite } = usePresentationInteraction(configurationWriteInteraction, {
+    observePending: false,
+  })
   const continuePrefill = chat.settings.continuePrefill === true
   const toggleContinuePrefill = () =>
-    void updateChatSettings(chat.id, { continuePrefill: !continuePrefill })
+    runConfigurationWrite({
+      target: configurationWriteTarget(chat.id, 'continuePrefill'),
+      action: () =>
+        configurationApplication.patchChatSettings(chat.id, {
+          continuePrefill: !continuePrefill,
+        }),
+    })
   return (
     <PrefillPromptEditor chat={chat}>
       <div data-ui="field-group" data-ui-field>
@@ -434,9 +419,7 @@ export function PrefillSettingsSection({
           <span>Continue prefill</span>
         </label>
       </div>
-      {continuePrefill ? (
-        <PrefillSettingsPrompt chatId={chat.id} settings={chat.settings} endpoints={endpoints} />
-      ) : null}
+      {continuePrefill ? <PrefillSettingsPrompt chatId={chat.id} plan={prefillPlan} /> : null}
     </PrefillPromptEditor>
   )
 }
@@ -454,6 +437,9 @@ function HostedToolsSection({
   connectionProfile?: ConnectionProfile | null | undefined
   textCompletionsActive: boolean
 }) {
+  const { run: runConfigurationWrite } = usePresentationInteraction(configurationWriteInteraction, {
+    observePending: false,
+  })
   const config = hostedToolUiConfig({ connectionKind, connectionProfile, chat, capability })
   if (!config || textCompletionsActive) {
     return null
@@ -470,19 +456,18 @@ function HostedToolsSection({
   const enabledCount = options.filter((option) => selected.includes(option.id)).length
 
   const toggle = (id: string, checked: boolean) => {
-    const next = checked
-      ? selected.includes(id)
-        ? selected
-        : [...selected, id]
-      : selected.filter((candidate) => candidate !== id)
-    void updateChatSettings(chat.id, {
-      tools: {
-        ...chat.settings.tools,
-        [config.provider]: {
-          ...bucket,
-          enabledServerToolIds: next,
-        },
-      },
+    runConfigurationWrite({
+      target: configurationWriteTarget(
+        chat.id,
+        `tools.${config.provider}.enabledServerToolIds:${id}`,
+      ),
+      action: () =>
+        configurationApplication.patchChatSettingsFields(chat.id, [
+          {
+            path: ['tools', config.provider, 'enabledServerToolIds'],
+            membership: { member: id, present: checked },
+          },
+        ]),
     })
   }
 
@@ -592,20 +577,28 @@ function HostedToolConfigControls({
 }
 
 function OpenAiHostedToolConfig({ chat, toolId }: { chat: Chat; toolId: OpenAiServerToolId }) {
-  const bucket = chat.settings.tools.openai
-  const config = bucket.config ?? {}
-  const updateConfig = (patch: NonNullable<typeof bucket.config>) => {
-    void updateChatSettings(chat.id, {
-      tools: {
-        ...chat.settings.tools,
-        openai: {
-          ...bucket,
-          config: {
-            ...config,
-            ...patch,
-          },
-        },
-      },
+  const { run: runConfigurationWrite } = usePresentationInteraction(configurationWriteInteraction, {
+    observePending: false,
+  })
+  const config = chat.settings.tools.openai.config ?? {}
+  const updateConfig = (tool: string, patch: Record<string, unknown>) => {
+    const fields = Object.entries(patch)
+    runConfigurationWrite({
+      target: configurationWriteTarget(
+        chat.id,
+        fields
+          .map(([field]) => `tools.openai.config.${tool}.${field}`)
+          .sort()
+          .join('+'),
+      ),
+      action: () =>
+        configurationApplication.patchChatSettingsFields(
+          chat.id,
+          fields.map(([field, value]) => ({
+            path: ['tools', 'openai', 'config', tool, field],
+            value,
+          })),
+        ),
     })
   }
   if (toolId === 'web-search') {
@@ -621,7 +614,7 @@ function OpenAiHostedToolConfig({ chat, toolId }: { chat: Chat; toolId: OpenAiSe
                 type="button"
                 data-ui="segmented-option"
                 aria-pressed={(web.searchContextSize ?? 'medium') === value}
-                onClick={() => updateConfig({ 'web-search': { ...web, searchContextSize: value } })}
+                onClick={() => updateConfig('web-search', { searchContextSize: value })}
               >
                 {value}
               </Button>
@@ -632,9 +625,7 @@ function OpenAiHostedToolConfig({ chat, toolId }: { chat: Chat; toolId: OpenAiSe
           <input
             type="checkbox"
             checked={web.includeSources === true}
-            onChange={(e) =>
-              updateConfig({ 'web-search': { ...web, includeSources: e.target.checked } })
-            }
+            onChange={(e) => updateConfig('web-search', { includeSources: e.target.checked })}
           />
           <span>Include sources</span>
         </label>
@@ -651,11 +642,8 @@ function OpenAiHostedToolConfig({ chat, toolId }: { chat: Chat; toolId: OpenAiSe
             aria-label="Image format"
             value={image.format ?? 'png'}
             onChange={(e) =>
-              updateConfig({
-                'image-generation': {
-                  ...image,
-                  format: e.target.value as NonNullable<typeof image.format>,
-                },
+              updateConfig('image-generation', {
+                format: e.target.value,
               })
             }
           >
@@ -667,11 +655,8 @@ function OpenAiHostedToolConfig({ chat, toolId }: { chat: Chat; toolId: OpenAiSe
             aria-label="Image size"
             value={image.size ?? 'auto'}
             onChange={(e) =>
-              updateConfig({
-                'image-generation': {
-                  ...image,
-                  size: e.target.value as NonNullable<typeof image.size>,
-                },
+              updateConfig('image-generation', {
+                size: e.target.value,
               })
             }
           >
@@ -691,9 +676,11 @@ function OpenAiHostedToolConfig({ chat, toolId }: { chat: Chat; toolId: OpenAiSe
 }
 
 function GoogleHostedToolConfig({ chat, toolId }: { chat: Chat; toolId: GoogleServerToolId }) {
+  const { run: runConfigurationWrite } = usePresentationInteraction(configurationWriteInteraction, {
+    observePending: false,
+  })
   if (toolId !== 'google-search') return null
-  const bucket = chat.settings.tools.google
-  const config = bucket.config ?? {}
+  const config = chat.settings.tools.google.config ?? {}
   const search = config['google-search'] ?? {}
   return (
     <label data-ui="checkbox-row">
@@ -701,20 +688,18 @@ function GoogleHostedToolConfig({ chat, toolId }: { chat: Chat; toolId: GoogleSe
         type="checkbox"
         checked={search.renderSearchEntryPoint === true}
         onChange={(e) =>
-          void updateChatSettings(chat.id, {
-            tools: {
-              ...chat.settings.tools,
-              google: {
-                ...bucket,
-                config: {
-                  ...config,
-                  'google-search': {
-                    ...search,
-                    renderSearchEntryPoint: e.target.checked,
-                  },
+          runConfigurationWrite({
+            target: configurationWriteTarget(
+              chat.id,
+              'tools.google.config.google-search.renderSearchEntryPoint',
+            ),
+            action: () =>
+              configurationApplication.patchChatSettingsFields(chat.id, [
+                {
+                  path: ['tools', 'google', 'config', 'google-search', 'renderSearchEntryPoint'],
+                  value: e.target.checked,
                 },
-              },
-            },
+              ]),
           })
         }
       />
@@ -730,20 +715,28 @@ function AnthropicHostedToolConfig({
   chat: Chat
   toolId: AnthropicServerToolId
 }) {
-  const bucket = chat.settings.tools.anthropic
-  const config = bucket.config ?? {}
-  const updateConfig = (patch: NonNullable<typeof bucket.config>) => {
-    void updateChatSettings(chat.id, {
-      tools: {
-        ...chat.settings.tools,
-        anthropic: {
-          ...bucket,
-          config: {
-            ...config,
-            ...patch,
-          },
-        },
-      },
+  const { run: runConfigurationWrite } = usePresentationInteraction(configurationWriteInteraction, {
+    observePending: false,
+  })
+  const config = chat.settings.tools.anthropic.config ?? {}
+  const updateConfig = (tool: string, patch: Record<string, unknown>) => {
+    const fields = Object.entries(patch)
+    runConfigurationWrite({
+      target: configurationWriteTarget(
+        chat.id,
+        fields
+          .map(([field]) => `tools.anthropic.config.${tool}.${field}`)
+          .sort()
+          .join('+'),
+      ),
+      action: () =>
+        configurationApplication.patchChatSettingsFields(
+          chat.id,
+          fields.map(([field, value]) => ({
+            path: ['tools', 'anthropic', 'config', tool, field],
+            value,
+          })),
+        ),
     })
   }
 
@@ -757,11 +750,8 @@ function AnthropicHostedToolConfig({
             aria-label="Anthropic web search version"
             value={web.version ?? 'web_search_20250305'}
             onChange={(e) =>
-              updateConfig({
-                'web-search': {
-                  ...web,
-                  version: e.target.value as NonNullable<typeof web.version>,
-                },
+              updateConfig('web-search', {
+                version: e.target.value,
               })
             }
           >
@@ -769,16 +759,18 @@ function AnthropicHostedToolConfig({
             <option value="web_search_20260209">Dynamic filtering</option>
           </select>
           <NumberField
+            chatId={chat.id}
+            fieldKey="tools.anthropic.config.web-search.maxUses"
             label="Max uses"
             value={web.maxUses}
             min={1}
             max={100}
-            onCommit={(value) => {
-              const next = { ...web }
-              if (value === undefined) delete next.maxUses
-              else next.maxUses = value
-              updateConfig({ 'web-search': next })
-            }}
+            patches={(value) => [
+              {
+                path: ['tools', 'anthropic', 'config', 'web-search', 'maxUses'],
+                value,
+              },
+            ]}
           />
         </div>
       </div>
@@ -795,11 +787,8 @@ function AnthropicHostedToolConfig({
             aria-label="Anthropic web fetch version"
             value={fetch.version ?? 'web_fetch_20250910'}
             onChange={(e) =>
-              updateConfig({
-                'web-fetch': {
-                  ...fetch,
-                  version: e.target.value as NonNullable<typeof fetch.version>,
-                },
+              updateConfig('web-fetch', {
+                version: e.target.value,
               })
             }
           >
@@ -807,37 +796,39 @@ function AnthropicHostedToolConfig({
             <option value="web_fetch_20260209">Dynamic filtering</option>
           </select>
           <NumberField
+            chatId={chat.id}
+            fieldKey="tools.anthropic.config.web-fetch.maxUses"
             label="Max uses"
             value={fetch.maxUses}
             min={1}
             max={100}
-            onCommit={(value) => {
-              const next = { ...fetch }
-              if (value === undefined) delete next.maxUses
-              else next.maxUses = value
-              updateConfig({ 'web-fetch': next })
-            }}
+            patches={(value) => [
+              {
+                path: ['tools', 'anthropic', 'config', 'web-fetch', 'maxUses'],
+                value,
+              },
+            ]}
           />
           <NumberField
+            chatId={chat.id}
+            fieldKey="tools.anthropic.config.web-fetch.maxContentTokens"
             label="Max content tokens"
             value={fetch.maxContentTokens}
             min={1}
             max={200000}
-            onCommit={(value) => {
-              const next = { ...fetch }
-              if (value === undefined) delete next.maxContentTokens
-              else next.maxContentTokens = value
-              updateConfig({ 'web-fetch': next })
-            }}
+            patches={(value) => [
+              {
+                path: ['tools', 'anthropic', 'config', 'web-fetch', 'maxContentTokens'],
+                value,
+              },
+            ]}
           />
         </div>
         <label data-ui="checkbox-row">
           <input
             type="checkbox"
             checked={fetch.citationsEnabled === true}
-            onChange={(e) =>
-              updateConfig({ 'web-fetch': { ...fetch, citationsEnabled: e.target.checked } })
-            }
+            onChange={(e) => updateConfig('web-fetch', { citationsEnabled: e.target.checked })}
           />
           <span>Include citations</span>
         </label>
@@ -855,11 +846,8 @@ function AnthropicHostedToolConfig({
             aria-label="Anthropic code execution version"
             value={code.version ?? 'code_execution_20250825'}
             onChange={(e) =>
-              updateConfig({
-                'code-execution': {
-                  ...code,
-                  version: e.target.value as NonNullable<typeof code.version>,
-                },
+              updateConfig('code-execution', {
+                version: e.target.value,
               })
             }
           >
@@ -880,7 +868,7 @@ function AnthropicHostedToolConfig({
         <select
           aria-label="Anthropic advisor model"
           value={advisor.advisorModel}
-          onChange={() => updateConfig({ advisor: { advisorModel: 'claude-opus-4-7' } })}
+          onChange={() => updateConfig('advisor', { advisorModel: 'claude-opus-4-7' })}
         >
           <option value="claude-opus-4-7">Claude Opus 4.7</option>
         </select>
@@ -903,22 +891,44 @@ function anthropicAdvisorAvailable(modelId: string): boolean {
 }
 
 function NumberField({
+  chatId,
+  fieldKey,
   label,
   value,
   min,
   max,
-  onCommit,
+  patches,
 }: {
+  chatId: Chat['id']
+  fieldKey: string
   label: string
   value: number | undefined
   min: number
   max: number
-  onCommit: (value: number | undefined) => void
+  patches: (value: number | undefined) => readonly ChatSettingsFieldPatch[]
 }) {
+  const edit = useSettledChatSettingsEdit({
+    chatId,
+    fieldKey,
+    storedValue: value,
+    patches,
+  })
   const [draft, setDraft] = useState(value === undefined ? '' : String(value))
   useEffect(() => {
     setDraft(value === undefined ? '' : String(value))
   }, [value])
+  const commit = () => {
+    const trimmed = draft.trim()
+    if (trimmed.length === 0) {
+      edit.setValue(undefined)
+      edit.onBlur()
+      return
+    }
+    const parsed = Number(trimmed)
+    if (!Number.isFinite(parsed)) return
+    edit.setValue(Math.min(max, Math.max(min, Math.trunc(parsed))))
+    edit.onBlur()
+  }
   return (
     <label data-ui="inline-control-row">
       <span>{label}</span>
@@ -927,17 +937,18 @@ function NumberField({
         min={min}
         max={max}
         value={draft}
-        onChange={(e) => setDraft(e.target.value)}
-        onBlur={() => {
-          const trimmed = draft.trim()
-          if (trimmed.length === 0) {
-            onCommit(undefined)
-            return
+        onChange={(e) => {
+          const next = e.target.value
+          setDraft(next)
+          if (next.trim().length === 0) edit.setValue(undefined)
+          else {
+            const parsed = Number(next)
+            if (Number.isFinite(parsed)) {
+              edit.setValue(Math.min(max, Math.max(min, Math.trunc(parsed))))
+            }
           }
-          const parsed = Number(trimmed)
-          if (!Number.isFinite(parsed)) return
-          onCommit(Math.min(max, Math.max(min, Math.trunc(parsed))))
         }}
+        onBlur={commit}
       />
     </label>
   )
@@ -967,14 +978,9 @@ function SamplingSection({
           {visible.map((s) => (
             <SamplingInput
               key={s.key}
+              chatId={chat.id}
               spec={s}
               value={chat.settings.sampling[s.key]}
-              onCommit={(v) => {
-                const next = { ...chat.settings.sampling }
-                if (v === undefined) delete next[s.key]
-                else next[s.key] = v
-                void updateChatSettings(chat.id, { sampling: next })
-              }}
             />
           ))}
         </div>
@@ -986,6 +992,9 @@ function SamplingSection({
 }
 
 function ReasoningSection({ chat, capability }: { chat: Chat; capability: EffectiveCapability }) {
+  const { run: runConfigurationWrite } = usePresentationInteraction(configurationWriteInteraction, {
+    observePending: false,
+  })
   const hasReasoning =
     capability.supportedParameters.has('reasoning') ||
     capability.supportedParameters.has('thinking') ||
@@ -993,11 +1002,6 @@ function ReasoningSection({ chat, capability }: { chat: Chat; capability: Effect
   if (!hasReasoning) return null
   const adaptiveOnly = capability.quirks.adaptiveReasoningOnly === true
   const effortChoices = adaptiveOnly ? [] : capability.allowedEffort
-  // OpenAI o-series returns reasoning opaquely — control rendering stays
-  // the same, but the user won't see tokens in the response. Hide the
-  // whole section for hidden-reasoning models to avoid implying the
-  // knobs do something visible.
-  if (capability.quirks.reasoningHidden === true) return null
   const supportsReasoning =
     capability.supportedParameters.has('reasoning') ||
     capability.supportedParameters.has('thinking')
@@ -1022,7 +1026,21 @@ function ReasoningSection({ chat, capability }: { chat: Chat; capability: Effect
       : null
   const r = chat.settings.reasoning
   const updateReasoning = (patch: Partial<typeof r>) => {
-    void updateChatSettings(chat.id, { reasoning: { ...r, ...patch } })
+    const fields = Object.entries(patch)
+    runConfigurationWrite({
+      target: configurationWriteTarget(
+        chat.id,
+        fields
+          .map(([key]) => `reasoning.${key}`)
+          .sort()
+          .join('+'),
+      ),
+      action: () =>
+        configurationApplication.patchChatSettingsFields(
+          chat.id,
+          fields.map(([key, value]) => ({ path: ['reasoning', key], value })),
+        ),
+    })
   }
   return (
     <section data-ui="settings-section" data-ui-section="reasoning">
@@ -1063,9 +1081,9 @@ function ReasoningSection({ chat, capability }: { chat: Chat; capability: Effect
       ) : null}
       {r.mode === 'budget' && supportsBudget ? (
         <ReasoningBudgetControl
+          chatId={chat.id}
           max={capability.maxCompletionTokens ?? 32000}
           value={r.maxTokens}
-          onCommit={(next) => updateReasoning({ maxTokens: next })}
         />
       ) : null}
       <ReasoningSummaryControl chat={chat} capability={capability} />
@@ -1074,60 +1092,37 @@ function ReasoningSection({ chat, capability }: { chat: Chat; capability: Effect
 }
 
 function ReasoningBudgetControl({
+  chatId,
   max,
   value,
-  onCommit,
 }: {
+  chatId: Chat['id']
   max: number
   value: number | undefined
-  onCommit: (next: number) => void
 }) {
-  const committedSliderValue = Math.min(max, Math.max(0, value ?? 0))
+  const edit = useSettledChatSettingsEdit({
+    chatId,
+    fieldKey: 'reasoning.maxTokens',
+    storedValue: value ?? 0,
+    patches: (next) => [{ path: ['reasoning', 'maxTokens'], value: next }],
+  })
+  const committedSliderValue = Math.min(max, Math.max(0, edit.value))
   const [draft, setDraft] = useState(value === undefined ? '' : String(value))
-  const [sliderValue, setSliderValue] = useState(committedSliderValue)
-  const lastRequestedSliderValueRef = useRef(committedSliderValue)
 
   useEffect(() => {
     setDraft(value === undefined ? '' : String(value))
-    setSliderValue(committedSliderValue)
-    lastRequestedSliderValueRef.current = committedSliderValue
-  }, [value, committedSliderValue])
-
-  const commitSliderDraft = useCallback(() => {
-    const clamped = Math.min(max, Math.max(0, sliderValue))
-    if (clamped === lastRequestedSliderValueRef.current) return
-    lastRequestedSliderValueRef.current = clamped
-    onCommit(clamped)
-  }, [max, sliderValue, onCommit])
-  const unmountCommitRef = useRef(commitSliderDraft)
-  unmountCommitRef.current = commitSliderDraft
-
-  useEffect(() => {
-    return () => unmountCommitRef.current()
-  }, [])
-
-  useEffect(() => {
-    if (sliderValue === committedSliderValue) return
-    const id = window.setTimeout(() => {
-      commitSliderDraft()
-    }, SETTINGS_SLIDER_COMMIT_DEBOUNCE_MS)
-    return () => window.clearTimeout(id)
-  }, [sliderValue, committedSliderValue, commitSliderDraft])
+  }, [value])
 
   const commitNumberDraft = () => {
     const n = Number(draft)
     if (!Number.isFinite(n) || n < 0) {
       setDraft(value === undefined ? '' : String(value))
-      setSliderValue(committedSliderValue)
       return
     }
     const clamped = Math.min(max, Math.floor(n))
-    if (clamped !== lastRequestedSliderValueRef.current) {
-      lastRequestedSliderValueRef.current = clamped
-      onCommit(clamped)
-    }
+    edit.setValue(clamped)
     setDraft(String(clamped))
-    setSliderValue(clamped)
+    edit.onBlur()
   }
 
   return (
@@ -1139,14 +1134,14 @@ function ReasoningBudgetControl({
         min={0}
         max={max}
         step={1}
-        value={sliderValue}
+        value={committedSliderValue}
         onChange={(e) => {
           const next = Number(e.target.value)
-          setSliderValue(next)
+          edit.setValue(next)
           setDraft(String(next))
         }}
-        onPointerUp={commitSliderDraft}
-        onBlur={commitSliderDraft}
+        onPointerUp={edit.onPointerUp}
+        onBlur={edit.onBlur}
       />
       <input
         data-ui="slider-number"
@@ -1161,7 +1156,7 @@ function ReasoningBudgetControl({
           if (raw === '') return
           const n = Number(raw)
           if (Number.isFinite(n) && n >= 0) {
-            setSliderValue(Math.min(max, Math.floor(n)))
+            edit.setValue(Math.min(max, Math.floor(n)))
           }
         }}
         onBlur={commitNumberDraft}
@@ -1169,7 +1164,6 @@ function ReasoningBudgetControl({
           if (e.key === 'Enter') (e.target as HTMLInputElement).blur()
           if (e.key === 'Escape') {
             setDraft(value === undefined ? '' : String(value))
-            setSliderValue(committedSliderValue)
             ;(e.target as HTMLInputElement).blur()
           }
         }}
@@ -1192,6 +1186,9 @@ function ReasoningSummaryControl({
   chat: Chat
   capability: EffectiveCapability
 }) {
+  const { run: runConfigurationWrite } = usePresentationInteraction(configurationWriteInteraction, {
+    observePending: false,
+  })
   // Summary-output is a request flag asking the provider to surface the
   // visible reasoning summary. The provider decides whether to honor it;
   // on chat-completions against most models it's ignored, on OpenAI
@@ -1214,8 +1211,12 @@ function ReasoningSummaryControl({
             data-ui="segmented-option"
             aria-pressed={selected === v}
             onClick={() =>
-              void updateChatSettings(chat.id, {
-                reasoning: { ...r, summary: v },
+              runConfigurationWrite({
+                target: configurationWriteTarget(chat.id, 'reasoning.summary'),
+                action: () =>
+                  configurationApplication.patchChatSettingsFields(chat.id, [
+                    { path: ['reasoning', 'summary'], value: v },
+                  ]),
               })
             }
           >
@@ -1237,8 +1238,8 @@ function ReasoningSummaryControl({
 // hidden entirely when the model doesn't emit encrypted reasoning (unknown
 // format, Gemini 2.5, etc.), no disabled-with-tooltip.
 //
-// Filter-side safety: `filterReasoningForInclude` silent-drops incompatible
-// formats before sending, with a console.warn. The UI just lets users pick.
+// The selected route's reasoning projector drops incompatible carriers before
+// serialization. The UI only owns the user's include preference.
 //
 // Lives on the Context tab (see `ChatModelPanel` — tabs 2026-04).
 export function ReasoningIncludeControls({
@@ -1247,6 +1248,9 @@ export function ReasoningIncludeControls({
   chat: Chat
   capability: EffectiveCapability | null
 }) {
+  const { run: runConfigurationWrite } = usePresentationInteraction(configurationWriteInteraction, {
+    observePending: false,
+  })
   if (!chat.settings.model) return null
 
   // Plaintext reasoning is portable: it can stay in a native plaintext
@@ -1256,10 +1260,26 @@ export function ReasoningIncludeControls({
   const include = r.include
   const includeToolCalls = chat.settings.toolCallContext.include
   const emitsEncrypted = emitsEncryptedReasoningFor(chat.settings.model) === 'always'
-  const updateInclude = (patch: Partial<ReasoningInclude>) =>
-    void updateChatSettings(chat.id, {
-      reasoning: { ...r, include: { ...include, ...patch } },
+  const updateInclude = (patch: Partial<ReasoningInclude>) => {
+    const fields = Object.entries(patch)
+    runConfigurationWrite({
+      target: configurationWriteTarget(
+        chat.id,
+        fields
+          .map(([key]) => `reasoning.include.${key}`)
+          .sort()
+          .join('+'),
+      ),
+      action: () =>
+        configurationApplication.patchChatSettingsFields(
+          chat.id,
+          fields.map(([key, value]) => ({
+            path: ['reasoning', 'include', key],
+            value,
+          })),
+        ),
     })
+  }
   const echoAsThink = r.echoAsThinkTags === true
   const textCompletionsActive = chat.settings.api === 'text' || chat.settings.protocol === 'text'
   // Text completions has no structured reasoning echo channel; carried
@@ -1313,8 +1333,12 @@ export function ReasoningIncludeControls({
               disabled={sendAsThinkDisabled}
               onChange={(e) => {
                 if (textCompletionsActive) return
-                void updateChatSettings(chat.id, {
-                  reasoning: { ...r, echoAsThinkTags: e.target.checked },
+                runConfigurationWrite({
+                  target: configurationWriteTarget(chat.id, 'reasoning.echoAsThinkTags'),
+                  action: () =>
+                    configurationApplication.patchChatSettingsFields(chat.id, [
+                      { path: ['reasoning', 'echoAsThinkTags'], value: e.target.checked },
+                    ]),
                 })
               }}
             />
@@ -1325,8 +1349,12 @@ export function ReasoningIncludeControls({
               type="checkbox"
               checked={includeToolCalls}
               onChange={(e) =>
-                void updateChatSettings(chat.id, {
-                  toolCallContext: { include: e.target.checked },
+                runConfigurationWrite({
+                  target: configurationWriteTarget(chat.id, 'toolCallContext.include'),
+                  action: () =>
+                    configurationApplication.patchChatSettingsFields(chat.id, [
+                      { path: ['toolCallContext', 'include'], value: e.target.checked },
+                    ]),
                 })
               }
             />
@@ -1348,13 +1376,16 @@ export function ApiModeSection({
   chat,
   capability,
   profile,
-  activePathMessages = [],
+  routing,
 }: {
   chat: Chat
   capability: EffectiveCapability
   profile: ConnectionProfile | null
-  activePathMessages?: readonly Message[]
+  routing: AssistantRouteContract | null
 }) {
+  const { run: runConfigurationWrite } = usePresentationInteraction(configurationWriteInteraction, {
+    observePending: false,
+  })
   if (!profile) return null
   if (profile.kind === 'google') {
     const resolvedKind = chat.settings.api === 'chat' ? 'chat' : 'gemini-native'
@@ -1370,7 +1401,15 @@ export function ApiModeSection({
               type="button"
               data-ui="segmented-option"
               aria-pressed={resolvedKind === 'gemini-native'}
-              onClick={() => void updateChatSettings(chat.id, { api: 'gemini-native' })}
+              onClick={() =>
+                runConfigurationWrite({
+                  target: configurationWriteTarget(chat.id, 'api'),
+                  action: () =>
+                    configurationApplication.patchChatSettings(chat.id, {
+                      api: 'gemini-native',
+                    }),
+                })
+              }
             >
               Native
             </Button>
@@ -1378,7 +1417,13 @@ export function ApiModeSection({
               type="button"
               data-ui="segmented-option"
               aria-pressed={resolvedKind === 'chat'}
-              onClick={() => void updateChatSettings(chat.id, { api: 'chat' })}
+              onClick={() =>
+                runConfigurationWrite({
+                  target: configurationWriteTarget(chat.id, 'api'),
+                  action: () =>
+                    configurationApplication.patchChatSettings(chat.id, { api: 'chat' }),
+                })
+              }
             >
               OpenAI-compat
             </Button>
@@ -1401,7 +1446,15 @@ export function ApiModeSection({
               type="button"
               data-ui="segmented-option"
               aria-pressed={resolvedKind === 'anthropic-messages'}
-              onClick={() => void updateChatSettings(chat.id, { api: 'anthropic-messages' })}
+              onClick={() =>
+                runConfigurationWrite({
+                  target: configurationWriteTarget(chat.id, 'api'),
+                  action: () =>
+                    configurationApplication.patchChatSettings(chat.id, {
+                      api: 'anthropic-messages',
+                    }),
+                })
+              }
             >
               Messages
             </Button>
@@ -1409,7 +1462,13 @@ export function ApiModeSection({
               type="button"
               data-ui="segmented-option"
               aria-pressed={resolvedKind === 'chat'}
-              onClick={() => void updateChatSettings(chat.id, { api: 'chat' })}
+              onClick={() =>
+                runConfigurationWrite({
+                  target: configurationWriteTarget(chat.id, 'api'),
+                  action: () =>
+                    configurationApplication.patchChatSettings(chat.id, { api: 'chat' }),
+                })
+              }
             >
               OpenAI-compat
             </Button>
@@ -1427,9 +1486,10 @@ export function ApiModeSection({
   // Hide the whole section unless the current model exposes a genuine
   // per-chat API choice beyond the default chat-completions route.
   if (!canResponses && !canText) return null
-  const route = chooseApi(profile, chat.settings, activePathMessages, capability)
+  if (!routing) return null
+  const route = routing
   const resolvedKind: 'chat' | 'responses' | 'text' =
-    route.kind === 'responses' ? 'responses' : route.kind === 'text-completions' ? 'text' : 'chat'
+    route.kind === 'text-completions' ? 'text' : route.kind === 'responses' ? 'responses' : 'chat'
   const requiresPhaseEcho = capability.quirks.requiresPhaseEcho === true
   const pinTo = (target: 'chat' | 'responses' | 'text') => {
     if (target === 'chat' && requiresPhaseEcho) {
@@ -1442,7 +1502,10 @@ export function ApiModeSection({
         return
       }
     }
-    void updateChatSettings(chat.id, { api: target })
+    runConfigurationWrite({
+      target: configurationWriteTarget(chat.id, 'api'),
+      action: () => configurationApplication.patchChatSettings(chat.id, { api: target }),
+    })
   }
   return (
     <section data-ui="settings-section" data-ui-section="api-mode">
@@ -1487,6 +1550,9 @@ export function ApiModeSection({
 }
 
 function VerbositySection({ chat, capability }: { chat: Chat; capability: EffectiveCapability }) {
+  const { run: runConfigurationWrite } = usePresentationInteraction(configurationWriteInteraction, {
+    observePending: false,
+  })
   if (!capability.supportedParameters.has('verbosity')) return null
   const choices = capability.allowedVerbosity
   if (choices.length === 0) return null
@@ -1503,10 +1569,14 @@ function VerbositySection({ chat, capability }: { chat: Chat; capability: Effect
             data-ui="segmented-option"
             aria-pressed={selected === v}
             onClick={() =>
-              void updateChatSettings(
-                chat.id,
-                v === 'default' ? { verbosity: undefined } : { verbosity: v },
-              )
+              runConfigurationWrite({
+                target: configurationWriteTarget(chat.id, 'verbosity'),
+                action: () =>
+                  configurationApplication.patchChatSettings(
+                    chat.id,
+                    v === 'default' ? { verbosity: undefined } : { verbosity: v },
+                  ),
+              })
             }
           >
             {v}
@@ -1518,6 +1588,9 @@ function VerbositySection({ chat, capability }: { chat: Chat; capability: Effect
 }
 
 function StopInlineRow({ chat, capability }: { chat: Chat; capability: EffectiveCapability }) {
+  const { run: runConfigurationWrite } = usePresentationInteraction(configurationWriteInteraction, {
+    observePending: false,
+  })
   const hasStop =
     capability.supportedParameters.has('stop') ||
     capability.supportedParameters.has('stop_sequences')
@@ -1525,7 +1598,14 @@ function StopInlineRow({ chat, capability }: { chat: Chat; capability: Effective
   const values = chat.settings.stop ?? []
   const setValues = (next: string[]) => {
     const clean = sanitizeStopValues(next)
-    void updateChatSettings(chat.id, clean.length === 0 ? { stop: [] } : { stop: clean })
+    runConfigurationWrite({
+      target: configurationWriteTarget(chat.id, 'stop'),
+      action: () =>
+        configurationApplication.patchChatSettings(
+          chat.id,
+          clean.length === 0 ? { stop: [] } : { stop: clean },
+        ),
+    })
   }
   const entries = values.map((value, index) => ({
     value,
@@ -1583,15 +1663,13 @@ function StopTextAreaControl({
     capability.supportedParameters.has('stop_sequences')
   const values = chat.settings.stop ?? []
   const text = values.join('\n')
-  const [draft, setDraft] = useState(text)
-  useEffect(() => {
-    setDraft(text)
-  }, [text])
+  const edit = useSettledChatSettingsEdit({
+    chatId: chat.id,
+    fieldKey: 'stop',
+    storedValue: text,
+    patches: (next) => [{ path: ['stop'], value: sanitizeStopValues(next.split('\n')) }],
+  })
   if (!hasStop) return null
-  const setValues = (next: string[]) => {
-    const clean = sanitizeStopValues(next)
-    void updateChatSettings(chat.id, clean.length === 0 ? { stop: [] } : { stop: clean })
-  }
   const id = 'request-stop-sequences'
   return (
     <div data-ui="field-group">
@@ -1599,12 +1677,9 @@ function StopTextAreaControl({
       <textarea
         id={id}
         rows={4}
-        value={draft}
-        onChange={(e) => setDraft(e.target.value)}
-        onBlur={() => {
-          if (draft === text) return
-          setValues(draft.split('\n'))
-        }}
+        value={edit.value}
+        onChange={(e) => edit.setValue(e.target.value)}
+        onBlur={edit.onBlur}
       />
       <span data-ui="helper">{helper}</span>
     </div>
@@ -1622,6 +1697,14 @@ function LogitBiasSection({ chat, capability }: { chat: Chat; capability: Effect
   const [open, setOpen] = useState(false)
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
   const fileRef = useRef<HTMLInputElement | null>(null)
+  const storedBias = chat.settings.logitBias ?? EMPTY_LOGIT_BIAS
+  const edit = useSettledChatSettingsEdit({
+    chatId: chat.id,
+    fieldKey: 'logitBias',
+    storedValue: storedBias,
+    equal: sameLogitBias,
+    patches: (next) => [{ path: ['logitBias'], value: next }],
+  })
   const raw = useMemo(
     () => (chat.settings.logitBias ? JSON.stringify(chat.settings.logitBias, null, 2) : ''),
     [chat.settings.logitBias],
@@ -1633,51 +1716,28 @@ function LogitBiasSection({ chat, capability }: { chat: Chat; capability: Effect
   }, [raw])
   if (!capability.supportedParameters.has('logit_bias')) return null
   const commit = () => {
-    if (draft.trim() === '') {
-      void updateChatSettings(chat.id, { logitBias: {} })
-      setErrorMsg(null)
+    const parsed = parseLogitBiasDraft(draft)
+    if ('error' in parsed) {
+      setErrorMsg(parsed.error)
       return
     }
-    try {
-      const parsed: unknown = JSON.parse(draft)
-      if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-        setErrorMsg('Must be an object of token → bias pairs')
-        return
-      }
-      for (const v of Object.values(parsed)) {
-        if (typeof v !== 'number') {
-          setErrorMsg('Bias values must be numbers')
-          return
-        }
-      }
-      void updateChatSettings(chat.id, { logitBias: parsed as Record<string, number> })
-      setErrorMsg(null)
-    } catch (err) {
-      setErrorMsg(err instanceof Error ? err.message : 'invalid JSON')
-    }
+    edit.setValue(parsed.value)
+    edit.onBlur()
+    setErrorMsg(null)
   }
   const handleUpload = (file: File) => {
     const reader = new FileReader()
     reader.onload = () => {
       const text = typeof reader.result === 'string' ? reader.result : ''
       setDraft(text)
-      try {
-        const parsed: unknown = JSON.parse(text)
-        if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-          setErrorMsg('Must be an object of token → bias pairs')
-          return
-        }
-        for (const v of Object.values(parsed)) {
-          if (typeof v !== 'number') {
-            setErrorMsg('Bias values must be numbers')
-            return
-          }
-        }
-        void updateChatSettings(chat.id, { logitBias: parsed as Record<string, number> })
-        setErrorMsg(null)
-      } catch (err) {
-        setErrorMsg(err instanceof Error ? err.message : 'invalid JSON')
+      const parsed = parseLogitBiasDraft(text)
+      if ('error' in parsed) {
+        setErrorMsg(parsed.error)
+        return
       }
+      edit.setValue(parsed.value)
+      edit.onBlur()
+      setErrorMsg(null)
     }
     reader.readAsText(file)
   }
@@ -1714,7 +1774,8 @@ function LogitBiasSection({ chat, capability }: { chat: Chat; capability: Effect
                 data-ui="logit-bias-btn"
                 onClick={() => {
                   setDraft('')
-                  void updateChatSettings(chat.id, { logitBias: {} })
+                  edit.setValue({})
+                  edit.onBlur()
                   setErrorMsg(null)
                 }}
               >
@@ -1725,7 +1786,12 @@ function LogitBiasSection({ chat, capability }: { chat: Chat; capability: Effect
           <textarea
             data-ui="logit-bias-editor"
             value={draft}
-            onChange={(e) => setDraft(e.target.value)}
+            onChange={(e) => {
+              const next = e.target.value
+              setDraft(next)
+              const parsed = parseLogitBiasDraft(next)
+              if (!('error' in parsed)) edit.setValue(parsed.value)
+            }}
             placeholder='{ "50256": -100 }'
             rows={6}
             onBlur={commit}
@@ -1743,6 +1809,34 @@ function LogitBiasSection({ chat, capability }: { chat: Chat; capability: Effect
   )
 }
 
+const EMPTY_LOGIT_BIAS: Readonly<Record<string, number>> = Object.freeze({})
+
+function parseLogitBiasDraft(text: string): { value: Record<string, number> } | { error: string } {
+  if (text.trim() === '') return { value: {} }
+  try {
+    const parsed: unknown = JSON.parse(text)
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      return { error: 'Must be an object of token → bias pairs' }
+    }
+    for (const value of Object.values(parsed)) {
+      if (typeof value !== 'number') return { error: 'Bias values must be numbers' }
+    }
+    return { value: parsed as Record<string, number> }
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : 'invalid JSON' }
+  }
+}
+
+function sameLogitBias(
+  left: Readonly<Record<string, number>>,
+  right: Readonly<Record<string, number>>,
+): boolean {
+  const leftKeys = Object.keys(left)
+  const rightKeys = Object.keys(right)
+  if (leftKeys.length !== rightKeys.length) return false
+  return leftKeys.every((key) => Object.hasOwn(right, key) && left[key] === right[key])
+}
+
 function placeholderForSpec(spec: SamplingSpec): string {
   // Seed hasn't got a meaningful "allowed range" — any int. Show the
   // hint placeholder instead.
@@ -1756,14 +1850,20 @@ function placeholderForSpec(spec: SamplingSpec): string {
 }
 
 function SamplingInput({
+  chatId,
   spec,
   value,
-  onCommit,
 }: {
+  chatId: Chat['id']
   spec: SamplingSpec
   value: number | undefined
-  onCommit: (v: number | undefined) => void
 }) {
+  const edit = useSettledChatSettingsEdit({
+    chatId,
+    fieldKey: `sampling.${spec.key}`,
+    storedValue: value,
+    patches: (next) => [{ path: ['sampling', spec.key], value: next }],
+  })
   const [draft, setDraft] = useState<string>(value === undefined ? '' : String(value))
   const [invalid, setInvalid] = useState<string | null>(null)
   useEffect(() => {
@@ -1774,7 +1874,8 @@ function SamplingInput({
     const raw = draft.trim()
     if (raw === '') {
       setInvalid(null)
-      if (value !== undefined) onCommit(undefined)
+      edit.setValue(undefined)
+      edit.onBlur()
       return
     }
     const n = Number(raw)
@@ -1791,7 +1892,8 @@ function SamplingInput({
       return
     }
     setInvalid(null)
-    if (n !== value) onCommit(n)
+    edit.setValue(n)
+    edit.onBlur()
   }
   return (
     <div data-ui="sampling-field" data-invalid={invalid ? 'true' : undefined}>
@@ -1805,12 +1907,29 @@ function SamplingInput({
         inputMode={spec.integer ? 'numeric' : 'decimal'}
         value={draft}
         placeholder={placeholderForSpec(spec)}
-        onChange={(e) => setDraft(e.target.value)}
+        onChange={(e) => {
+          const next = e.target.value
+          setDraft(next)
+          const raw = next.trim()
+          if (raw === '') {
+            edit.setValue(undefined)
+            return
+          }
+          const parsed = Number(raw)
+          if (
+            Number.isFinite(parsed) &&
+            (!spec.integer || Number.isInteger(parsed)) &&
+            parsed >= spec.min &&
+            parsed <= spec.max
+          ) {
+            edit.setValue(parsed)
+          }
+        }}
         onBlur={commit}
         onKeyDown={(e) => {
           if (e.key === 'Enter') (e.target as HTMLInputElement).blur()
           if (e.key === 'Escape') {
-            setDraft(value === undefined ? '' : String(value))
+            setDraft(edit.value === undefined ? '' : String(edit.value))
             setInvalid(null)
             ;(e.target as HTMLInputElement).blur()
           }

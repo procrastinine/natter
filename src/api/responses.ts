@@ -17,26 +17,18 @@
 //     `buffered` lane event, same as chat.
 //
 import type { ConnectionProfile } from '../core/types'
-import {
-  logStreamDebug,
-  type StreamDebugTrace,
-  snapshotStreamDebugRequest,
-  startStreamDebug,
-} from '../lib/debug-streams'
 import { errorFromUnknown } from '../lib/error'
 import {
   type ApiKeyDispatchContext,
-  buildHeaders,
-  fetchWithApiKeyFallback,
-  hasExplicitAuthHeaderOverride,
-  readErrorResponseJson,
+  dispatchProviderJsonRequest,
+  type ProviderDispatchResult,
 } from './client'
 import { deferAdapterRequest } from './deferred-request'
-import { normalizeError } from './errors'
 import { validateResponsesEvent, validateResponsesResult } from './provider-json-boundary'
-import { decodeProviderStreamFrame, decodeValidatedProviderJson, parseSSE } from './sse'
+import { consumeProviderOnce, consumeProviderStream } from './provider-stream-runtime'
 import type {
   CallOpts,
+  ResponsesEventWire,
   ResponsesRequestWire,
   ResponsesResultWire,
   ResponsesStreamChunk,
@@ -51,87 +43,19 @@ function responsesUrl(profile: ConnectionProfile): string {
   return `${base}/responses`
 }
 
-interface DispatchResult {
-  response: Response
-  debugTrace: StreamDebugTrace | null
-}
-
 function dispatch(
   ctx: ResponsesContext,
   req: ResponsesRequestWire,
   opts: CallOpts,
-): Promise<DispatchResult> {
-  return dispatchSerialized(
-    ctx,
-    JSON.stringify(req),
-    snapshotStreamDebugRequest(ctx.profile, req),
+): Promise<ProviderDispatchResult> {
+  return dispatchProviderJsonRequest({
+    adapter: 'responses',
+    context: ctx,
+    url: responsesUrl(ctx.profile),
+    request: req,
     opts,
-  )
-}
-
-function dispatchSerialized(
-  ctx: ResponsesContext,
-  body: string,
-  debugRequest: unknown,
-  opts: CallOpts,
-): Promise<DispatchResult> {
-  const url = responsesUrl(ctx.profile)
-  let debugTrace: StreamDebugTrace | null = null
-  const fetchOpts: { signal?: AbortSignal; timeoutMs?: number } = {}
-  if (opts.signal) fetchOpts.signal = opts.signal
-  if (opts.timeoutMs !== undefined) fetchOpts.timeoutMs = opts.timeoutMs
-  const authCtx = hasExplicitAuthHeaderOverride(ctx.profile, opts.overrideHeaders, 'Authorization')
-    ? { apiKey: ctx.apiKey }
-    : ctx
-  const fetched = fetchWithApiKeyFallback(
-    authCtx,
-    (apiKey) => {
-      const headers = buildHeaders(ctx.profile, apiKey, {
-        method: 'POST',
-        ...(opts.overrideHeaders ? { overrideHeaders: opts.overrideHeaders } : {}),
-      })
-      if (debugRequest !== null) {
-        debugTrace ??= startStreamDebug({
-          adapter: 'responses',
-          profile: ctx.profile,
-          url,
-          request: debugRequest,
-          headers,
-        })
-      }
-      return { url, init: { method: 'POST', headers, body } }
-    },
-    fetchOpts,
-  )
-  return finishDispatch(fetched, () => debugTrace)
-}
-
-async function finishDispatch(
-  fetched: ReturnType<typeof fetchWithApiKeyFallback>,
-  getDebugTrace: () => StreamDebugTrace | null,
-): Promise<DispatchResult> {
-  const { response } = await fetched
-  return { response, debugTrace: getDebugTrace() }
-}
-
-async function requireSuccessfulDispatch(
-  dispatched: Promise<DispatchResult>,
-): Promise<DispatchResult> {
-  const result = await dispatched
-  const { response, debugTrace } = result
-  if (!response.ok) {
-    const errorBody = await readErrorResponseJson(response)
-    throw normalizeError(errorBody, {
-      midStream: false,
-      httpStatus: response.status,
-    })
-  }
-  logStreamDebug(debugTrace, 'response.head', {
-    status: response.status,
-    contentType: response.headers.get('content-type'),
-    generationId: response.headers.get('x-generation-id') ?? undefined,
+    authHeaderName: 'Authorization',
   })
-  return result
 }
 
 export function responses(
@@ -149,46 +73,26 @@ export function responses(
   })
 }
 
-async function* consumeResponses(
-  dispatched: Promise<DispatchResult>,
+function consumeResponses(
+  dispatched: Promise<ProviderDispatchResult>,
   signal: AbortSignal | undefined,
 ): AsyncGenerator<ResponsesStreamChunk, void, unknown> {
-  const { response, debugTrace } = await requireSuccessfulDispatch(dispatched)
-  const generationId = response.headers.get('x-generation-id') ?? undefined
-  const contentType = response.headers.get('content-type') ?? ''
-
-  if (!/text\/event-stream/i.test(contentType)) {
-    const result = await decodeValidatedProviderJson(response, validateResponsesResult)
-    logStreamDebug(debugTrace, 'buffered_result', result)
-    yield generationId
-      ? { type: 'buffered_result', result, generationId }
-      : { type: 'buffered_result', result }
-    return
-  }
-
-  for await (const ev of parseSSE(response, signal ? { signal } : {})) {
-    if (ev.kind === 'done') continue
-    if (ev.kind === 'keepalive') {
-      yield { type: 'keepalive', comment: ev.comment }
-      continue
-    }
-    logStreamDebug(debugTrace, 'sse.raw', { event: ev.event, data: ev.data })
-    const decoded = decodeProviderStreamFrame({
-      adapter: 'responses',
-      eventType: ev.event,
-      data: ev.data,
-      validate: validateResponsesEvent,
-    })
-    if (!decoded.ok) {
-      console.warn('responses: invalid SSE frame skipped', decoded.diagnostic)
-      yield { type: 'integrity', integrity: decoded.integrity }
-      continue
-    }
-    logStreamDebug(debugTrace, 'sse.parsed', decoded.value)
-    yield generationId
-      ? { type: 'event', event: decoded.value, generationId }
-      : { type: 'event', event: decoded.value }
-  }
+  return consumeProviderStream<ResponsesEventWire, ResponsesResultWire, ResponsesStreamChunk>({
+    adapter: 'responses',
+    dispatched,
+    ...(signal ? { signal } : {}),
+    generationId: (response) => response.headers.get('x-generation-id') ?? undefined,
+    validateBuffered: validateResponsesResult,
+    validateFrame: validateResponsesEvent,
+    bufferedChunk: (result, generationId) =>
+      generationId
+        ? { type: 'buffered_result', result, generationId }
+        : { type: 'buffered_result', result },
+    frameChunk: (event, generationId) =>
+      generationId ? { type: 'event', event, generationId } : { type: 'event', event },
+    integrityChunk: (integrity) => ({ type: 'integrity', integrity }),
+    keepaliveChunk: (comment) => ({ type: 'keepalive', comment }),
+  })
 }
 
 export function responsesOnce(
@@ -205,10 +109,7 @@ export function responsesOnce(
 }
 
 async function consumeResponsesOnce(
-  dispatched: Promise<DispatchResult>,
+  dispatched: Promise<ProviderDispatchResult>,
 ): Promise<ResponsesResultWire> {
-  const { response, debugTrace } = await requireSuccessfulDispatch(dispatched)
-  const result = await decodeValidatedProviderJson(response, validateResponsesResult)
-  logStreamDebug(debugTrace, 'once.result', result)
-  return result
+  return consumeProviderOnce(dispatched, validateResponsesResult)
 }

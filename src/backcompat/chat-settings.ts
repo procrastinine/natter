@@ -1,6 +1,7 @@
 import { cloneDefaultChatSettings } from '../core/defaults'
 import { defaultReasoningInclude, normalizeReasoningSettings } from '../core/reasoning'
 import type { ChatSettings, ReasoningFormat, ReasoningInclude } from '../core/types'
+import { sameValue } from '../lib/same-value'
 import { migrateProviderToolSettings } from './provider-tools'
 
 const LEGACY_PRIVACY_KEYS = ['usePreferredOrdering'] as const
@@ -116,10 +117,7 @@ export function migrateCurrentChatSettingsSnapshot(
     delete next.gemini
   }
 
-  const changed =
-    toolResult.changed ||
-    legacyResult.changed ||
-    JSON.stringify(sortObjectKeys(rawSettings)) !== JSON.stringify(sortObjectKeys(next))
+  const changed = toolResult.changed || legacyResult.changed || !sameValue(rawSettings, next)
   return changed ? { settings: next, changed: true } : { settings: rawSettings, changed: false }
 }
 
@@ -241,15 +239,4 @@ function mergeObject<T extends object>(defaults: T, raw: unknown): T {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value)
-}
-
-function sortObjectKeys(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(sortObjectKeys)
-  if (!isRecord(value)) return value
-  const out: Record<string, unknown> = {}
-  for (const key of Object.keys(value).sort()) {
-    const child = value[key]
-    if (child !== undefined) out[key] = sortObjectKeys(child)
-  }
-  return out
 }

@@ -25,6 +25,20 @@ afterEach(() => {
 })
 
 describe('notice actions', () => {
+  it('bounds visual notice retention during producer bursts', () => {
+    const toastIds = Array.from({ length: 40 }, (_, index) =>
+      useToastStore.getState().push({ level: 'info', text: `Toast ${index}` }),
+    )
+    const bannerIds = Array.from({ length: 40 }, (_, index) =>
+      useToastStore.getState().pushBanner({ kind: 'mutation-conflict', text: `Banner ${index}` }),
+    )
+
+    expect(useToastStore.getState().toasts.map((toast) => toast.id)).toEqual(toastIds.slice(-24))
+    expect(useToastStore.getState().banners.map((banner) => banner.id)).toEqual(
+      bannerIds.slice(-24),
+    )
+  })
+
   it('keeps a toast pending until undo succeeds and then dismisses it', async () => {
     const result = deferred()
     const undo = vi.fn(() => result.promise)

@@ -3,8 +3,12 @@ import 'fake-indexeddb/auto'
 import Dexie from 'dexie'
 import { IDBFactory } from 'fake-indexeddb'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { readGlobalPreferences } from '../../src/core/global-settings'
-import { __resetDbForTests, openDb } from '../../src/store/db'
+import {
+  openBrowserWorkspace,
+  shutdownBrowserWorkspace,
+} from '../../src/store/browser-workspace-lifecycle'
+import { __resetDbForTests } from '../../src/store/db'
+import { readGlobalPreferences } from '../../src/store/global-settings'
 import { GeneralSettings } from '../../src/ui/settings/GeneralSettings'
 
 const DB_NAME = 'natter'
@@ -14,11 +18,12 @@ describe('GeneralSettings', () => {
     ;(globalThis as unknown as { indexedDB: IDBFactory }).indexedDB = new IDBFactory()
     __resetDbForTests()
     await Dexie.delete(DB_NAME)
-    await openDb()
+    await openBrowserWorkspace()
   })
 
   afterEach(async () => {
     cleanup()
+    await shutdownBrowserWorkspace()
     __resetDbForTests()
     await Dexie.delete(DB_NAME)
   })

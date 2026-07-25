@@ -12,24 +12,15 @@
 // reducers can keep their one shape.
 
 import type { ConnectionProfile } from '../core/types'
-import {
-  logStreamDebug,
-  type StreamDebugTrace,
-  snapshotStreamDebugRequest,
-  startStreamDebug,
-} from '../lib/debug-streams'
 import { errorFromUnknown } from '../lib/error'
 import {
   type ApiKeyDispatchContext,
-  buildHeaders,
-  fetchWithApiKeyFallback,
-  hasExplicitAuthHeaderOverride,
-  readErrorResponseJson,
+  dispatchProviderJsonRequest,
+  type ProviderDispatchResult,
 } from './client'
 import { deferAdapterRequest } from './deferred-request'
-import { normalizeError } from './errors'
 import { validateTextCompletionPayload } from './provider-json-boundary'
-import { decodeProviderStreamFrame, decodeValidatedProviderJson, parseSSE } from './sse'
+import { consumeProviderOnce, consumeProviderStream } from './provider-stream-runtime'
 import type {
   CallOpts,
   ChatCompletionChunkWire,
@@ -54,84 +45,19 @@ function textCompletionsUrl(profile: ConnectionProfile): string {
   return `${base}/completions`
 }
 
-interface DispatchResult {
-  response: Response
-  debugTrace: StreamDebugTrace | null
-}
-
 function dispatch(
   ctx: TextCompletionsContext,
   req: TextCompletionRequestWire,
   opts: CallOpts,
-): Promise<DispatchResult> {
-  return dispatchSerialized(
-    ctx,
-    JSON.stringify(req),
-    snapshotStreamDebugRequest(ctx.profile, req),
+): Promise<ProviderDispatchResult> {
+  return dispatchProviderJsonRequest({
+    adapter: 'text-completions',
+    context: ctx,
+    url: textCompletionsUrl(ctx.profile),
+    request: req,
     opts,
-  )
-}
-
-function dispatchSerialized(
-  ctx: TextCompletionsContext,
-  body: string,
-  debugRequest: unknown,
-  opts: CallOpts,
-): Promise<DispatchResult> {
-  const url = textCompletionsUrl(ctx.profile)
-  let debugTrace: StreamDebugTrace | null = null
-  const fetchOpts: { signal?: AbortSignal; timeoutMs?: number } = {}
-  if (opts.signal) fetchOpts.signal = opts.signal
-  if (opts.timeoutMs !== undefined) fetchOpts.timeoutMs = opts.timeoutMs
-  const authCtx = hasExplicitAuthHeaderOverride(ctx.profile, opts.overrideHeaders, 'Authorization')
-    ? { apiKey: ctx.apiKey }
-    : ctx
-  const fetched = fetchWithApiKeyFallback(
-    authCtx,
-    (apiKey) => {
-      const headers = buildHeaders(ctx.profile, apiKey, {
-        method: 'POST',
-        ...(opts.overrideHeaders ? { overrideHeaders: opts.overrideHeaders } : {}),
-      })
-      if (debugRequest !== null) {
-        debugTrace ??= startStreamDebug({
-          adapter: 'text-completions',
-          profile: ctx.profile,
-          url,
-          request: debugRequest,
-          headers,
-        })
-      }
-      return { url, init: { method: 'POST', headers, body } }
-    },
-    fetchOpts,
-  )
-  return finishDispatch(fetched, () => debugTrace)
-}
-
-async function finishDispatch(
-  fetched: ReturnType<typeof fetchWithApiKeyFallback>,
-  getDebugTrace: () => StreamDebugTrace | null,
-): Promise<DispatchResult> {
-  const { response } = await fetched
-  return { response, debugTrace: getDebugTrace() }
-}
-
-async function requireSuccessfulDispatch(
-  dispatched: Promise<DispatchResult>,
-): Promise<DispatchResult> {
-  const result = await dispatched
-  const { response, debugTrace } = result
-  if (!response.ok) {
-    const errorBody = await readErrorResponseJson(response)
-    throw normalizeError(errorBody, { midStream: false, httpStatus: response.status })
-  }
-  logStreamDebug(debugTrace, 'response.head', {
-    status: response.status,
-    contentType: response.headers.get('content-type'),
-    generationId: response.headers.get('x-generation-id') ?? undefined,
+    authHeaderName: 'Authorization',
   })
-  return result
 }
 
 interface TextCompletionChoiceWire {
@@ -189,55 +115,34 @@ export function textCompletions(
   })
 }
 
-async function* consumeTextCompletions(
-  dispatched: Promise<DispatchResult>,
+function consumeTextCompletions(
+  dispatched: Promise<ProviderDispatchResult>,
   signal: AbortSignal | undefined,
 ): AsyncGenerator<ChatStreamChunk, void, unknown> {
-  const { response, debugTrace } = await requireSuccessfulDispatch(dispatched)
-  const generationId = response.headers.get('x-generation-id') ?? undefined
-  const contentType = response.headers.get('content-type') ?? ''
-
-  if (!/text\/event-stream/i.test(contentType)) {
-    const body = await decodeValidatedProviderJson(response, validateTextCompletionPayload)
-    logStreamDebug(debugTrace, 'buffered_result', body)
-    const lifted = liftBufferedToChat(body)
-    const chunk: ChatStreamChunk = generationId
-      ? { type: 'buffered_result', result: lifted, generationId }
-      : { type: 'buffered_result', result: lifted }
-    yield chunk
-    return
-  }
-
-  for await (const ev of parseSSE(response, signal ? { signal } : {})) {
-    if (ev.kind === 'done') {
-      yield { type: 'transport_terminal', evidence: 'done-sentinel' }
-      continue
-    }
-    if (ev.kind === 'keepalive') {
-      yield { type: 'keepalive', comment: ev.comment }
-      continue
-    }
-    logStreamDebug(debugTrace, 'sse.raw', { event: ev.event, data: ev.data })
-    const decoded = decodeProviderStreamFrame({
-      adapter: 'text-completions',
-      eventType: ev.event,
-      data: ev.data,
-      validate: validateTextCompletionPayload,
-    })
-    if (!decoded.ok) {
-      console.warn('textCompletions: invalid SSE frame skipped', decoded.diagnostic)
-      yield { type: 'integrity', integrity: decoded.integrity }
-      continue
-    }
-    const parsed = decoded.value
-    if (generationId && parsed.id === undefined) parsed.id = generationId
-    logStreamDebug(debugTrace, 'sse.parsed', parsed)
-    const lifted = liftTextToDelta(parsed)
-    const chunk: ChatStreamChunk = generationId
-      ? { type: 'delta', chunk: lifted, generationId }
-      : { type: 'delta', chunk: lifted }
-    yield chunk
-  }
+  return consumeProviderStream<TextCompletionChunkWire, TextCompletionChunkWire, ChatStreamChunk>({
+    adapter: 'text-completions',
+    dispatched,
+    ...(signal ? { signal } : {}),
+    generationId: (response) => response.headers.get('x-generation-id') ?? undefined,
+    validateBuffered: validateTextCompletionPayload,
+    validateFrame: validateTextCompletionPayload,
+    bufferedChunk: (result, generationId) => {
+      const lifted = liftBufferedToChat(result)
+      return generationId
+        ? { type: 'buffered_result', result: lifted, generationId }
+        : { type: 'buffered_result', result: lifted }
+    },
+    frameChunk: (parsed, generationId) => {
+      if (generationId && parsed.id === undefined) parsed.id = generationId
+      const lifted = liftTextToDelta(parsed)
+      return generationId
+        ? { type: 'delta', chunk: lifted, generationId }
+        : { type: 'delta', chunk: lifted }
+    },
+    integrityChunk: (integrity) => ({ type: 'integrity', integrity }),
+    keepaliveChunk: (comment) => ({ type: 'keepalive', comment }),
+    doneChunk: () => ({ type: 'transport_terminal', evidence: 'done-sentinel' }),
+  })
 }
 
 export function textCompletionsOnce(
@@ -254,10 +159,7 @@ export function textCompletionsOnce(
 }
 
 async function consumeTextCompletionsOnce(
-  dispatched: Promise<DispatchResult>,
+  dispatched: Promise<ProviderDispatchResult>,
 ): Promise<ChatCompletionResultWire> {
-  const { response, debugTrace } = await requireSuccessfulDispatch(dispatched)
-  const result = await decodeValidatedProviderJson(response, validateTextCompletionPayload)
-  logStreamDebug(debugTrace, 'once.result', result)
-  return liftBufferedToChat(result)
+  return consumeProviderOnce(dispatched, validateTextCompletionPayload).then(liftBufferedToChat)
 }

@@ -1,5 +1,7 @@
 import Dexie from 'dexie'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import 'fake-indexeddb/auto'
+import { IDBFactory } from 'fake-indexeddb'
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import type {
   AttachmentArtifact,
@@ -10,6 +12,11 @@ import type {
   MessageAttachmentRef,
 } from '../../src/core/types'
 import { newId } from '../../src/lib/ulid'
+import {
+  executeAttachmentBulkDelete,
+  planAttachmentBulkDelete,
+} from '../../src/store/attachment-bulk-delete'
+import { refreshAttachmentCatalogProjectionsForRepair } from '../../src/store/attachment-catalog-projection'
 import {
   addExistingAttachmentRef,
   batchRelinkAttachmentRefs,
@@ -22,38 +29,50 @@ import {
   listAttachmentReferences,
   mutateMessageAttachmentRef,
   putAttachment,
-  reapOrphanedAttachments,
+  putWorkspaceDraft,
   relinkAttachmentRef,
   replaceAttachmentBytes,
   setAttachmentRefVisibility,
   sha256Hex,
 } from '../../src/store/attachments'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
+import { __resetBrowserRepositoryForTests } from '../../src/store/browser-repo'
 import {
-  __resetBrowserRepositoryForTests,
-  getBrowserRepository,
-} from '../../src/store/browser-repo'
-import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
+  openBrowserWorkspace,
+  shutdownBrowserWorkspace,
+} from '../../src/store/browser-workspace-lifecycle'
+import { __resetDbForTests, getDb } from '../../src/store/db'
+import { exportWorkspaceBackup, restoreWorkspaceBackup } from '../../src/store/import-export'
 import {
-  __resetLockTrackerForTests,
   __setLockBackendForTests,
+  type AuthoritativeCommandLockSession,
   type LockBackend,
 } from '../../src/store/locks'
 import type {
+  AttachmentCatalogSearchRequest,
   AttachmentSearchFilters,
   AttachmentSearchMeasurement,
 } from '../../src/store/repository'
+import type {
+  CommitEnvelope,
+  ReadEnvelope,
+  WorkspaceCommand,
+  WorkspaceCommandResult,
+  WorkspaceQuery,
+  WorkspaceQueryResult,
+} from '../../src/store/workspace-protocol'
+import {
+  __resetWorkspaceRepositoryForTests,
+  getWorkspaceRepository,
+} from '../../src/store/workspace-repository'
+import { runWorkspaceAction, runWorkspaceRead } from '../../src/store/workspace-runtime'
 import { expectAttachmentReferenceInvariants } from '../helpers/attachment-reference-invariants'
+import { putTestChat } from '../helpers/chats'
+import { putTestMessages } from '../helpers/message-storage'
 
 const DB_NAME = 'natter'
 
-async function resetAll() {
-  __resetBrowserRepositoryForTests()
-  __resetDbForTests()
-  __resetBroadcastForTests()
-  __resetLockTrackerForTests()
-  await Dexie.delete(DB_NAME)
-}
+let emptyWorkspaceBackup: Awaited<ReturnType<typeof exportWorkspaceBackup>>
 
 class PausableFirstLockBackend implements LockBackend {
   readonly kind = 'web-locks' as const
@@ -112,18 +131,42 @@ class PausableFirstLockBackend implements LockBackend {
       })
       .finally(() => releaseQueue?.())
   }
+
+  async runAuthoritativeCommandSession<T>(
+    _database: Dexie,
+    operation: (session: AuthoritativeCommandLockSession) => Promise<T> | T,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<T> {
+    if (options.signal?.aborted) throw options.signal.reason
+    return operation({
+      kind: this.kind,
+      withResourceLocks: (resourceNames, child) => this.run(resourceNames, child),
+    })
+  }
 }
 
-beforeEach(async () => {
-  await resetAll()
+beforeAll(async () => {
+  ;(globalThis as unknown as { indexedDB: IDBFactory }).indexedDB = new IDBFactory()
+  __resetWorkspaceRepositoryForTests()
+  __resetBrowserRepositoryForTests()
+  __resetBroadcastForTests()
+  __resetDbForTests()
+  await Dexie.delete(DB_NAME)
+  await openBrowserWorkspace()
+  emptyWorkspaceBackup = await exportWorkspaceBackup()
 })
 
-afterEach(async () => {
-  await resetAll()
+beforeEach(async () => {
+  __setLockBackendForTests(null)
+  await restoreWorkspaceBackup(emptyWorkspaceBackup, { now: 1 })
+})
+
+afterAll(async () => {
+  __setLockBackendForTests(null)
+  await shutdownBrowserWorkspace()
 })
 
 async function seedChat(id = newId()): Promise<Chat> {
-  const db = await openDb()
   const chat: Chat = {
     id,
     title: 'T',
@@ -135,6 +178,7 @@ async function seedChat(id = newId()): Promise<Chat> {
     totalCostUsd: 0,
     metaVersion: 0,
     summaryVersion: 0,
+    structuralVersion: 0,
     settings: cloneDefaultChatSettings(),
     lastUpdatedLeafId: null,
     lastBranchUpdatedAt: 1,
@@ -143,8 +187,7 @@ async function seedChat(id = newId()): Promise<Chat> {
     folderId: null,
     tags: [],
   }
-  await db.chats.put(chat)
-  return chat
+  return putTestChat(chat)
 }
 
 function bytes(content: string): Blob {
@@ -182,18 +225,59 @@ function makeMessage(chatId: string, attachmentRefs?: MessageAttachmentRef[]): M
 }
 
 async function putMessage(message: Message): Promise<void> {
-  await getBrowserRepository().runMutation(
-    [
-      { kind: 'message', messageId: message.id },
-      { kind: 'children', chatId: message.chatId, parentId: message.parentId },
-      ...[...new Set((message.attachmentRefs ?? []).map((ref) => ref.attachmentId))].map(
-        (attachmentId) => ({ kind: 'attachment' as const, attachmentId }),
-      ),
-    ],
-    async (ctx) => {
-      await ctx.putMessage(message)
+  if (await getMessage(message.id)) return
+  const chat = (await query({ kind: 'chat.get', chatId: message.chatId })).value
+  if (!chat) throw new Error(`ChatMissing:${message.chatId}`)
+  await putTestMessages([
+    {
+      ...message,
+      parentId: message.parentId ?? chat.lastUpdatedLeafId,
     },
+  ])
+}
+
+function query<Q extends WorkspaceQuery>(
+  request: Q,
+  signal?: AbortSignal,
+): Promise<ReadEnvelope<WorkspaceQueryResult<Q>>> {
+  return runWorkspaceRead(
+    'repository-query',
+    (permit) => getWorkspaceRepository().query(permit, request, { signal: permit.signal }),
+    signal ? { signal } : {},
   )
+}
+
+function execute<C extends WorkspaceCommand>(
+  command: C,
+): Promise<CommitEnvelope<WorkspaceCommandResult<C>>> {
+  return runWorkspaceAction('maintenance', (permit) =>
+    getWorkspaceRepository().execute(permit, command),
+  )
+}
+
+async function getMessage(messageId: string): Promise<Message | undefined> {
+  return (await query({ kind: 'message.presentation', messageId })).value?.message
+}
+
+async function getDraft(chatId: string) {
+  return (await query({ kind: 'draft.get', chatId })).value
+}
+
+type TestAttachmentSearchRequest = AttachmentCatalogSearchRequest & {
+  signal?: AbortSignal
+  onMeasure?: (measurement: AttachmentSearchMeasurement) => void
+}
+
+async function searchAttachments(request: TestAttachmentSearchRequest = {}) {
+  const { signal, onMeasure, ...search } = request
+  const page = (
+    await query(
+      { kind: 'attachment.catalog-page', search: { ...search, direction: 'forward' } },
+      signal,
+    )
+  ).value
+  onMeasure?.(page.measurement)
+  return page
 }
 
 async function expectAttachmentBundleInvariants(attachmentId: string): Promise<void> {
@@ -250,6 +334,93 @@ describe('buildAttachment', () => {
 })
 
 describe('attachment backend storage', () => {
+  it('bulk deletes one revision-fenced snapshot with bounded progress and reference-safe stubs', async () => {
+    const chat = await seedChat()
+    const message = makeMessage(chat.id)
+    await putMessage(message)
+    const first = await ingestAttachmentBytes({
+      blob: bytes('first'),
+      filename: 'bulk-first.txt',
+      now: 10,
+    })
+    const referenced = await ingestAttachmentBytes({
+      blob: bytes('referenced'),
+      filename: 'bulk-referenced.txt',
+      now: 11,
+    })
+    await addExistingAttachmentRef({
+      messageId: message.id,
+      attachmentId: referenced.attachment.id,
+      now: 12,
+    })
+    const ignored = await ingestAttachmentBytes({
+      blob: bytes('ignored'),
+      filename: 'ignored.png',
+      declaredMime: 'image/png',
+      now: 13,
+    })
+    const plan = await planAttachmentBulkDelete({ filters: { kind: 'plaintext' } })
+    const afterPlan = await ingestAttachmentBytes({
+      blob: bytes('after plan'),
+      filename: 'after-plan.txt',
+      now: 14,
+    })
+    await expect(executeAttachmentBulkDelete(plan)).rejects.toThrow('AttachmentBulkDeletePlanStale')
+    expect(await getAttachmentBundle(first.attachment.id)).toBeDefined()
+    expect(await getAttachmentBundle(referenced.attachment.id)).toBeDefined()
+
+    const currentPlan = await planAttachmentBulkDelete({
+      query: 'bulk-',
+      filters: { kind: 'plaintext' },
+    })
+    const progress: Array<{ processed: number; done: boolean }> = []
+
+    const result = await executeAttachmentBulkDelete(currentPlan, {
+      selectedAttachmentId: first.attachment.id,
+      onProgress: (snapshot) =>
+        progress.push({ processed: snapshot.processed, done: snapshot.done }),
+    })
+
+    expect(plan.matchedCount).toBe(2)
+    expect(currentPlan.matchedCount).toBe(2)
+    expect(result).toMatchObject({
+      planned: 2,
+      processed: 2,
+      deleted: 1,
+      stubbed: 1,
+      absent: 0,
+      done: true,
+      selectedDisposition: 'deleted',
+    })
+    expect(progress.at(-1)).toEqual({ processed: 2, done: true })
+    expect(await getAttachmentBundle(first.attachment.id)).toBeUndefined()
+    expect((await getAttachmentBundle(referenced.attachment.id))?.attachment.storage.kind).toBe(
+      'missing',
+    )
+    expect(await getAttachmentBundle(afterPlan.attachment.id)).toBeDefined()
+    expect(await getAttachmentBundle(ignored.attachment.id)).toBeDefined()
+  })
+
+  it('aborts a bulk delete before its first atomic batch without changing membership', async () => {
+    const attachment = await ingestAttachmentBytes({
+      blob: bytes('cancelled'),
+      filename: 'cancelled.txt',
+      now: 20,
+    })
+    const plan = await planAttachmentBulkDelete({ query: 'cancelled.txt' })
+    const controller = new AbortController()
+
+    await expect(
+      executeAttachmentBulkDelete(plan, {
+        signal: controller.signal,
+        onProgress: (progress) => {
+          if (progress.processed === 0 && !progress.done) controller.abort()
+        },
+      }),
+    ).rejects.toThrow()
+    expect(await getAttachmentBundle(attachment.attachment.id)).toBeDefined()
+  })
+
   it('ingests local bytes into metadata, blob, artifact, and job rows', async () => {
     const bundle = await ingestAttachmentBytes({
       blob: bytes('# Attachment backend\n\nSearchable markdown body.'),
@@ -294,7 +465,7 @@ describe('attachment backend storage', () => {
     const artifactTableScan = vi.spyOn(getDb().attachmentArtifacts, 'toArray')
     const blobTableScan = vi.spyOn(getDb().attachmentBlobs, 'toArray')
     const measurements: AttachmentSearchMeasurement[] = []
-    const hits = await getBrowserRepository().searchAttachments({
+    const hits = await searchAttachments({
       query: 'notes markdown searchable',
       filters: { kind: 'plaintext' },
       onMeasure: (value) => {
@@ -304,8 +475,8 @@ describe('attachment backend storage', () => {
     const measurement = measurements[0]
     expect(hits.rows.map((row) => row.id)).toEqual([bundle.attachment.id])
     expect(measurement).toMatchObject({
-      selectedIndex: 'kind',
-      metadataRowsRead: 1,
+      selectedIndex: 'createdAt',
+      metadataRowsRead: 9,
       metadataCandidates: 1,
       embeddedArtifactRowsRead: 0,
       artifactCandidateAttachments: 1,
@@ -322,15 +493,15 @@ describe('attachment backend storage', () => {
       filename: 'other.txt',
       now: 11,
     })
-    const pageOne = await getBrowserRepository().searchAttachments({
+    const pageOne = await searchAttachments({
       query: '  \n\t ',
       filters: { kind: 'plaintext' },
       sort: 'created-asc',
       limit: 1,
     })
-    expect(pageOne.nextCursor).toMatch(/^natter-attachment-search:v1:/)
+    expect(pageOne.nextCursor).toMatch(/^natter-attachment-catalog:v1:/)
     if (!pageOne.nextCursor) throw new Error('expected cursor')
-    const pageTwo = await getBrowserRepository().searchAttachments({
+    const pageTwo = await searchAttachments({
       query: '  \n\t ',
       filters: { kind: 'plaintext' },
       sort: 'created-asc',
@@ -339,14 +510,15 @@ describe('attachment backend storage', () => {
     })
     expect(pageTwo.rows).toHaveLength(1)
     expect(pageTwo.rows[0]?.id).not.toBe(bundle.attachment.id)
-    const legacyPage = await getBrowserRepository().searchAttachments({
-      query: '  \n\t ',
-      filters: { kind: 'plaintext' },
-      sort: 'created-asc',
-      limit: 1,
-      cursor: bundle.attachment.id,
-    })
-    expect(legacyPage.rows.map((row) => row.id)).toEqual(pageTwo.rows.map((row) => row.id))
+    await expect(
+      searchAttachments({
+        query: '  \n\t ',
+        filters: { kind: 'plaintext' },
+        sort: 'created-asc',
+        limit: 1,
+        cursor: bundle.attachment.id,
+      }),
+    ).rejects.toThrow('CatalogCursorVersionUnsupported')
     expect(artifactTableScan).not.toHaveBeenCalled()
   })
 
@@ -370,7 +542,7 @@ describe('attachment backend storage', () => {
     const seen: string[] = []
     let cursor: string | undefined
     do {
-      const page = await getBrowserRepository().searchAttachments({
+      const page = await searchAttachments({
         filters: { kind: 'plaintext' },
         sort: 'created-asc',
         limit: 1,
@@ -386,7 +558,7 @@ describe('attachment backend storage', () => {
     controller.abort()
     const metadataScan = vi.spyOn(getDb().attachments, 'toArray')
     await expect(
-      getBrowserRepository().searchAttachments({ query: 'anything', signal: controller.signal }),
+      searchAttachments({ query: 'anything', signal: controller.signal }),
     ).rejects.toMatchObject({ name: 'AbortError' })
     expect(metadataScan).not.toHaveBeenCalled()
   })
@@ -417,50 +589,73 @@ describe('attachment backend storage', () => {
       createdAt: 30,
     })
     await Promise.all([putAttachment(markdown), putAttachment(plain), putAttachment(image)])
-    await getDb().attachments.update(markdown.id, { refCount: 3 })
+    await getDb().transaction(
+      'rw',
+      getDb().attachments,
+      getDb().attachmentRefEdges,
+      getDb().attachmentCatalogRows,
+      getDb().attachmentCatalogAggregate,
+      async (tx) => {
+        await getDb().attachments.update(markdown.id, { refCount: 3 })
+        await getDb().attachmentRefEdges.bulkPut(
+          Array.from({ length: 3 }, (_, index) => ({
+            ownerKind: 'message' as const,
+            ownerId: `search-owner-${index}`,
+            chatId: 'search-chat',
+            refId: `search-ref-${index}`,
+            attachmentId: markdown.id,
+            ordinal: 0,
+            includeInContext: true,
+            refUpdatedAt: 1,
+          })),
+        )
+        await refreshAttachmentCatalogProjectionsForRepair(tx, [markdown.id])
+      },
+    )
 
     const cases: Array<{
       filters: AttachmentSearchFilters
-      selectedIndex: AttachmentSearchMeasurement['selectedIndex']
       ids: string[]
     }> = [
-      { filters: { kind: 'image' }, selectedIndex: 'kind', ids: [image.id] },
-      { filters: { mime: 'text/markdown' }, selectedIndex: 'mime', ids: [markdown.id] },
-      { filters: { origin: 'import' }, selectedIndex: 'origin', ids: [markdown.id] },
+      { filters: { kind: 'image' }, ids: [image.id] },
+      { filters: { mime: 'text/markdown' }, ids: [markdown.id] },
+      { filters: { origin: 'import' }, ids: [markdown.id] },
       {
         filters: { minRefCount: 2, maxRefCount: 4 },
-        selectedIndex: 'refCount',
         ids: [markdown.id],
       },
     ]
     for (const testCase of cases) {
       const measurements: AttachmentSearchMeasurement[] = []
-      const result = await getBrowserRepository().searchAttachments({
+      const result = await searchAttachments({
         filters: testCase.filters,
         sort: 'created-asc',
         onMeasure: (value) => measurements.push(value),
       })
-      expect(result.rows.map((row) => row.id)).toEqual(testCase.ids)
+      expect(
+        result.rows.map((row) => row.id),
+        JSON.stringify(testCase.filters),
+      ).toEqual(testCase.ids)
       expect(measurements[0]).toMatchObject({
-        selectedIndex: testCase.selectedIndex,
+        selectedIndex: 'createdAt',
         metadataCandidates: testCase.ids.length,
       })
     }
 
     const narrowedMeasurements: AttachmentSearchMeasurement[] = []
-    const narrowed = await getBrowserRepository().searchAttachments({
+    const narrowed = await searchAttachments({
       filters: { kind: 'plaintext', mime: 'text/markdown', origin: 'import' },
       onMeasure: (value) => narrowedMeasurements.push(value),
     })
     expect(narrowed.rows.map((row) => row.id)).toEqual([markdown.id])
     expect(narrowedMeasurements[0]).toMatchObject({
-      selectedIndex: 'mime',
-      indexCounts: { kind: 2, mime: 1, origin: 1 },
-      metadataRowsRead: 1,
+      selectedIndex: 'createdAt',
+      indexCounts: {},
+      metadataRowsRead: 3,
     })
 
     if (plain.sizeBytes === undefined) throw new Error('expected stored attachment size')
-    const exactSizeAndStorage = await getBrowserRepository().searchAttachments({
+    const exactSizeAndStorage = await searchAttachments({
       filters: {
         kind: 'plaintext',
         storageKind: 'local-blob',
@@ -471,7 +666,7 @@ describe('attachment backend storage', () => {
     expect(exactSizeAndStorage.rows.map((row) => row.id)).toEqual([plain.id])
 
     const sortMeasurements: AttachmentSearchMeasurement[] = []
-    await getBrowserRepository().searchAttachments({
+    await searchAttachments({
       sort: 'updated-desc',
       onMeasure: (value) => sortMeasurements.push(value),
     })
@@ -556,7 +751,7 @@ describe('attachment backend storage', () => {
       now: 20,
     })
     expect((await getDb().attachments.get(first.attachment.id))?.refCount).toBe(1)
-    const withRef = await getBrowserRepository().getMessage(message.id)
+    const withRef = await getMessage(message.id)
     expect(typeof withRef?.attachmentRefs?.[0]).toBe('object')
     expect(withRef?.attachmentRefs?.[0]).toMatchObject({
       refId: ref.refId,
@@ -588,14 +783,10 @@ describe('attachment backend storage', () => {
     })
     expect(await getDb().attachments.get(first.attachment.id)).toBeUndefined()
 
-    await expect(
-      getBrowserRepository().runMutation(
-        [{ kind: 'attachment', attachmentId: second.attachment.id }],
-        async (ctx) => {
-          await ctx.deleteAttachment(second.attachment.id)
-        },
-      ),
-    ).rejects.toThrow(`AttachmentStillReferenced:${second.attachment.id}`)
+    await expect(deleteUnreferencedAttachment(second.attachment.id)).resolves.toEqual({
+      deleted: false,
+      refs: { messages: 1, drafts: 0 },
+    })
     const missing = await deleteReferencedAttachmentBytes(second.attachment.id, 'deleted', 23)
     expect(missing?.storage).toMatchObject({ kind: 'missing', reason: 'deleted' })
     const missingBundle = await getAttachmentBundle(second.attachment.id)
@@ -607,7 +798,7 @@ describe('attachment backend storage', () => {
     expect(
       await getDb().attachmentRefEdges.where('attachmentId').equals(second.attachment.id).count(),
     ).toBe(1)
-    expect(await getBrowserRepository().getMessage(message.id)).toMatchObject({ id: message.id })
+    expect(await getMessage(message.id)).toMatchObject({ id: message.id })
     await expectAttachmentReferenceInvariants(getDb())
   })
 
@@ -751,16 +942,18 @@ describe('attachment backend storage', () => {
         },
       ],
     }
-    await getBrowserRepository().runMutation(
-      [{ kind: 'attachment', attachmentId: bundle.attachment.id }],
-      async (ctx) => {
-        await ctx.putAttachmentBlob(derivedBlob)
-        await ctx.putAttachmentArtifact(derivedArtifact)
-        await ctx.putAttachmentJob(mixedJob)
-        await ctx.putAttachmentJob(blobOnlyJob)
-        await ctx.putAttachment(enriched)
+    await execute({
+      kind: 'attachment.bundle.write',
+      input: {
+        mode: 'replace',
+        bundle: {
+          attachment: enriched,
+          blobs: [...bundle.blobs, derivedBlob],
+          artifacts: [...bundle.artifacts, derivedArtifact],
+          jobs: [...bundle.jobs, mixedJob, blobOnlyJob],
+        },
       },
-    )
+    })
 
     const deleted = await deleteReferencedAttachmentBytes(bundle.attachment.id, 'deleted', 20)
     expect(deleted?.storage).toEqual({
@@ -791,8 +984,8 @@ describe('attachment backend storage', () => {
     })
     expect(await countLiveRefs(bundle.attachment.id)).toEqual({ messages: 1, drafts: 1 })
     expect(stored?.attachment.refCount).toBe(2)
-    expect((await getBrowserRepository().getMessage(message.id))?.attachmentRefs).toHaveLength(1)
-    expect((await getBrowserRepository().getDraft(chat.id))?.attachmentRefs).toHaveLength(1)
+    expect((await getMessage(message.id))?.attachmentRefs).toHaveLength(1)
+    expect((await getDraft(chat.id))?.attachmentRefs).toHaveLength(1)
     await expectAttachmentBundleInvariants(bundle.attachment.id)
     await expectAttachmentReferenceInvariants(getDb())
   })
@@ -881,8 +1074,7 @@ describe('attachment backend storage', () => {
 })
 
 describe('attachment refcounts under repository mutations', () => {
-  it('tracks refcount across message write, edit, and hard delete', async () => {
-    const repo = getBrowserRepository()
+  it('tracks refcount across message write, body edit, and explicit ref detach', async () => {
     const chat = await seedChat()
     const attachment = await buildAttachment({
       blob: bytes('x'),
@@ -893,91 +1085,34 @@ describe('attachment refcounts under repository mutations', () => {
     await putAttachment(attachment)
     const message = makeMessage(chat.id, [attachmentRef(attachment.id)])
 
-    await repo.runMutation(
-      [
-        { kind: 'message', messageId: message.id },
-        { kind: 'children', chatId: chat.id, parentId: null },
-        { kind: 'attachment', attachmentId: attachment.id },
-      ],
-      async (ctx) => {
-        await ctx.putMessage(message)
-      },
-    )
+    await putMessage(message)
     expect((await getDb().attachments.get(attachment.id))?.refCount).toBe(1)
 
-    await repo.runMutation(
-      [
-        { kind: 'message', messageId: message.id },
-        { kind: 'attachment', attachmentId: attachment.id },
-      ],
-      async (ctx) => {
-        const current = (await ctx.getMessage(message.id)) as Message
-        await ctx.putMessage({
-          ...current,
-          content: [{ type: 'text', text: 'updated' }],
-        })
+    await execute({
+      kind: 'message.edit-content',
+      input: {
+        chatId: chat.id,
+        messageId: message.id,
+        content: [{ type: 'text', text: 'updated' }],
+        now: 2,
       },
-    )
+    })
     expect((await getDb().attachments.get(attachment.id))?.refCount).toBe(1)
 
-    await repo.runMutation(
-      [
-        { kind: 'message', messageId: message.id },
-        { kind: 'children', chatId: chat.id, parentId: null },
-        { kind: 'attachment', attachmentId: attachment.id },
-      ],
-      async (ctx) => {
-        await ctx.deleteMessage(message.id)
-      },
-    )
+    const ref = (await getMessage(message.id))?.attachmentRefs?.[0]
+    if (!ref) throw new Error('ExpectedAttachmentRef')
+    await mutateMessageAttachmentRef({
+      chatId: chat.id,
+      messageId: message.id,
+      mutation: { kind: 'detach', refId: ref.refId },
+      now: 3,
+    })
     expect((await getDb().attachments.get(attachment.id))?.refCount).toBe(0)
     await expectAttachmentReferenceInvariants(getDb())
   })
 })
 
-describe('reapOrphanedAttachments', () => {
-  it('reaps only older refCount-zero attachments', async () => {
-    const db = await openDb()
-    const old = await buildAttachment({
-      blob: bytes('old'),
-      filename: 'o',
-      mime: 'application/octet-stream',
-      kind: 'file',
-      createdAt: 1000,
-    })
-    const recent = await buildAttachment({
-      blob: bytes('new'),
-      filename: 'n',
-      mime: 'application/octet-stream',
-      kind: 'file',
-      createdAt: 9000,
-    })
-    await putAttachment(old)
-    await putAttachment(recent)
-
-    const reaped = await reapOrphanedAttachments({ now: 10_000, olderThanMs: 5000 })
-    expect(reaped).toEqual([old.id])
-    expect(await db.attachments.get(old.id)).toBeUndefined()
-    expect(await db.attachments.get(recent.id)).toBeDefined()
-  })
-
-  it('keeps attachments still referenced by live messages', async () => {
-    const chat = await seedChat()
-    const attachment = await buildAttachment({
-      blob: bytes('used'),
-      filename: 'used.bin',
-      mime: 'application/octet-stream',
-      kind: 'file',
-      createdAt: 1000,
-    })
-    await putAttachment(attachment)
-    await putMessage(makeMessage(chat.id, [attachmentRef(attachment.id)]))
-
-    const reaped = await reapOrphanedAttachments({ now: 10_000, olderThanMs: 5000 })
-    expect(reaped).toEqual([])
-    expect(await getDb().attachments.get(attachment.id)).toBeDefined()
-  })
-
+describe('attachment deletion concurrency', () => {
   it('serializes attach and GC correctly in both commit orders', async () => {
     const chat = await seedChat()
     const firstMessage = makeMessage(chat.id)
@@ -1032,7 +1167,7 @@ describe('reapOrphanedAttachments', () => {
     gcFirstBackend.releaseFirst()
     expect(await gc).toEqual({ deleted: true, refs: { messages: 0, drafts: 0 } })
     await expect(losingAttach).rejects.toThrow(`AttachmentMissing:${gcWins.id}`)
-    expect((await getBrowserRepository().getMessage(secondMessage.id))?.attachmentRefs).toEqual([])
+    expect((await getMessage(secondMessage.id))?.attachmentRefs).toEqual([])
     await expectAttachmentReferenceInvariants(getDb())
     __setLockBackendForTests(null)
   })
@@ -1052,16 +1187,15 @@ describe('attachment edge projection invariants', () => {
     await putMessage(message)
     const edgeReads = vi.spyOn(getDb().attachmentRefEdges, 'where')
 
-    await getBrowserRepository().runMutation(
-      [{ kind: 'message', messageId: message.id }],
-      async (ctx) => {
-        await ctx.patchMessageBody(
-          message.id,
-          { content: [{ type: 'text', text: 'stream finalization' }] },
-          { touchChatSummary: false, broadcast: false },
-        )
+    await execute({
+      kind: 'message.edit-content',
+      input: {
+        chatId: chat.id,
+        messageId: message.id,
+        content: [{ type: 'text', text: 'stream finalization' }],
+        now: 2,
       },
-    )
+    })
 
     expect(edgeReads).not.toHaveBeenCalled()
     expect((await getDb().attachments.get(attachment.id))?.refCount).toBe(1)
@@ -1082,7 +1216,7 @@ describe('attachment edge projection invariants', () => {
       attachmentRef(attachment.id, 2),
       { ...attachmentRef(attachment.id, 3), deletedAt: 0 },
     ]
-    const message = { ...makeMessage(chat.id, refs), deleted: true }
+    const message = makeMessage(chat.id, refs)
     await putMessage(message)
 
     expect((await getDb().attachments.get(attachment.id))?.refCount).toBe(2)
@@ -1091,21 +1225,37 @@ describe('attachment edge projection invariants', () => {
       await getDb().attachmentRefEdges.where('attachmentId').equals(attachment.id).count(),
     ).toBe(2)
 
-    const current = await getBrowserRepository().getMessage(message.id)
+    const current = await getMessage(message.id)
     if (!current?.attachmentRefs) throw new Error('expected refs')
     const tombstoned = current.attachmentRefs.map((ref) =>
       ref.refId === refs[1]?.refId ? { ...ref, deletedAt: 0 } : ref,
     )
-    await getBrowserRepository().runMutation(
-      [
-        { kind: 'message', messageId: message.id },
-        { kind: 'attachment', attachmentId: attachment.id },
-      ],
-      async (ctx) => {
-        await ctx.putMessage({ ...current, attachmentRefs: tombstoned })
+    await execute({
+      kind: 'message.edit-content',
+      input: {
+        chatId: chat.id,
+        messageId: message.id,
+        content: current.content,
+        attachmentRefs: tombstoned,
+        now: 2,
       },
-    )
+    })
     expect((await getDb().attachments.get(attachment.id))?.refCount).toBe(1)
+    await execute({
+      kind: 'message.delete',
+      mode: 'single',
+      input: {
+        chatId: chat.id,
+        messageId: message.id,
+        activeLeafId: message.id,
+        now: 3,
+      },
+    })
+    expect((await getDb().attachments.get(attachment.id))?.refCount).toBe(1)
+    expect(await countLiveRefs(attachment.id)).toEqual({ messages: 1, drafts: 0 })
+    expect(
+      await getDb().attachmentRefEdges.where('attachmentId').equals(attachment.id).count(),
+    ).toBe(1)
     await expectAttachmentReferenceInvariants(getDb())
   })
 
@@ -1124,35 +1274,24 @@ describe('attachment edge projection invariants', () => {
     if (!duplicate) throw new Error('expected ref')
 
     await expect(
-      getBrowserRepository().runMutation(
-        [
-          { kind: 'message', messageId: original.id },
-          { kind: 'attachment', attachmentId: attachment.id },
-        ],
-        async (ctx) => {
-          await ctx.putMessage({
-            ...original,
-            attachmentRefs: [duplicate, { ...duplicate, updatedAt: duplicate.updatedAt + 1 }],
-          })
+      execute({
+        kind: 'message.edit-content',
+        input: {
+          chatId: chat.id,
+          messageId: original.id,
+          content: original.content,
+          attachmentRefs: [duplicate, { ...duplicate, updatedAt: duplicate.updatedAt + 1 }],
+          now: 2,
         },
-      ),
+      }),
     ).rejects.toThrow(`DuplicateAttachmentRefId:message:${original.id}:${duplicate.refId}`)
 
     const missing = makeMessage(chat.id, [attachmentRef('missing-target')])
-    await expect(
-      getBrowserRepository().runMutation(
-        [
-          { kind: 'message', messageId: missing.id },
-          { kind: 'children', chatId: chat.id, parentId: null },
-          { kind: 'attachment', attachmentId: 'missing-target' },
-        ],
-        async (ctx) => {
-          await ctx.putMessage(missing)
-        },
-      ),
-    ).rejects.toThrow('AttachmentMissing:missing-target')
-    expect(await getBrowserRepository().getMessage(missing.id)).toBeUndefined()
-    expect(await getBrowserRepository().getMessage(original.id)).toEqual(original)
+    await expect(putTestMessages([{ ...missing, parentId: original.id }])).rejects.toThrow(
+      'AttachmentMissing:missing-target',
+    )
+    expect(await getMessage(missing.id)).toBeUndefined()
+    expect(await getMessage(original.id)).toEqual(original)
     await expectAttachmentReferenceInvariants(getDb())
   })
 
@@ -1197,8 +1336,8 @@ describe('attachment edge projection invariants', () => {
         refs: [{ messageId: first.id, refId: firstRef.refId }],
         now: 11,
       }),
-    ).rejects.toThrow(`AttachmentRelinkStale:${firstRef.refId}`)
-    expect((await getBrowserRepository().getMessage(first.id))?.attachmentRefs?.[0]).toMatchObject({
+    ).rejects.toThrow(`AttachmentRefChanged:${firstRef.refId}`)
+    expect((await getMessage(first.id))?.attachmentRefs?.[0]).toMatchObject({
       attachmentId: oldAttachment.id,
     })
     expect((await getDb().attachments.get(oldAttachment.id))?.refCount).toBe(2)
@@ -1218,19 +1357,14 @@ describe('misc attachment helpers', () => {
     })
     await putAttachment(attachment)
     await putMessage(makeMessage(chat.id, [attachmentRef(attachment.id)]))
-    await getBrowserRepository().runMutation(
-      [
-        { kind: 'draft', chatId: chat.id },
-        { kind: 'attachment', attachmentId: attachment.id },
-      ],
-      async (ctx) => {
-        await ctx.putDraft({
-          chatId: chat.id,
-          text: '',
-          attachmentRefs: [attachmentRef(attachment.id)],
-          updatedAt: 1,
-        })
+    await putWorkspaceDraft(
+      {
+        chatId: chat.id,
+        text: '',
+        attachmentRefs: [attachmentRef(attachment.id)],
+        updatedAt: 1,
       },
+      null,
     )
 
     const messageScan = vi.spyOn(getDb().messages, 'toArray')

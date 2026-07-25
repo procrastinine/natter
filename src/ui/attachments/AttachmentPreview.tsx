@@ -1,60 +1,49 @@
-import { useEffect, useMemo, useState } from 'react'
-import type { Attachment, AttachmentBlob } from '../../core/types'
-import { attachmentBundleDependencies } from '../../store/reactive-dependencies'
-import { useRepositoryQuery } from '../../store/reactive-query'
-import type { AttachmentBundle } from '../../store/repository'
-import { getWorkspaceRepository } from '../../store/workspace-repository'
+import { useMemo } from 'react'
+import type { AttachmentBlob } from '../../core/types'
+import type { AttachmentBundle, WorkspaceFence } from '../../store/presentation-contracts'
 import { FileIcon } from '../icons/Icon'
+import type { AttachmentDisplayRow } from './format'
+import { useAttachmentMedia } from './useAttachmentMedia'
+import { useAttachmentObjectUrl } from './useAttachmentObjectUrl'
 
 type AttachmentPreviewVariant = 'chip' | 'card' | 'panel'
 
 export function AttachmentPreview({
   attachment,
   bundle,
+  bundleWorkspaceFence,
+  textPreview,
   variant = 'chip',
 }: {
-  attachment: Attachment | undefined
+  attachment: AttachmentDisplayRow | undefined
   bundle?: AttachmentBundle | undefined
+  bundleWorkspaceFence?: WorkspaceFence | null | undefined
+  textPreview?: string | undefined
   variant?: AttachmentPreviewVariant
 }) {
-  const needsBundle = Boolean(attachment && !bundle && canPreviewFromBundle(attachment))
-  const liveBundle = useRepositoryQuery(
-    JSON.stringify(['attachment-bundle', needsBundle ? attachment?.id : null]),
-    async () => {
-      if (!attachment || !needsBundle) return undefined
-      return getWorkspaceRepository().getAttachmentBundle(attachment.id)
-    },
-    undefined,
-    attachmentBundleDependencies(needsBundle ? attachment?.id : null),
-  )
-  const resolvedBundle = bundle ?? liveBundle
+  const needsMedia = Boolean(attachment && !bundle && canPreviewFromMedia(attachment))
+  const liveMedia = useAttachmentMedia(needsMedia ? attachment?.id : undefined, 'preview')
   const blob = useMemo(
-    () => (attachment ? selectPreviewBlob(attachment, resolvedBundle, variant) : undefined),
-    [attachment, resolvedBundle, variant],
+    () =>
+      attachment
+        ? bundle
+          ? selectPreviewBlob(attachment, bundle, variant)
+          : liveMedia.media?.blob
+        : undefined,
+    [attachment, bundle, liveMedia.media, variant],
   )
-  const [objectUrl, setObjectUrl] = useState<string | undefined>(undefined)
-
-  useEffect(() => {
-    if (!blob) {
-      setObjectUrl(undefined)
-      return
-    }
-    const objectUrlApi: Partial<Pick<typeof URL, 'createObjectURL' | 'revokeObjectURL'>> = URL
-    if (!(blob.blob instanceof Blob) || typeof objectUrlApi.createObjectURL !== 'function') {
-      setObjectUrl(undefined)
-      return
-    }
-    const url = objectUrlApi.createObjectURL(blob.blob)
-    setObjectUrl(url)
-    return () => objectUrlApi.revokeObjectURL?.(url)
-  }, [blob])
+  const objectUrl = useAttachmentObjectUrl(
+    blob,
+    bundle ? bundleWorkspaceFence : liveMedia.workspaceFence,
+  )
 
   const src = objectUrl ?? remotePreviewUrl(attachment)
   const mime = blob?.mime ?? attachment?.mime ?? ''
   const textArtifact = useMemo(
-    () => resolvedBundle?.artifacts.find((artifact) => artifact.kind === 'text'),
-    [resolvedBundle],
+    () => bundle?.artifacts.find((artifact) => artifact.kind === 'text'),
+    [bundle],
   )
+  const previewText = textPreview ?? textArtifact?.text
 
   if (attachment && src && isImageAttachment(attachment, mime)) {
     return (
@@ -94,8 +83,8 @@ export function AttachmentPreview({
     )
   }
 
-  if (variant === 'panel' && attachment && textArtifact) {
-    const text = textArtifact.text.trim()
+  if (variant === 'panel' && attachment && previewText) {
+    const text = previewText.trim()
     return (
       <span data-ui="attachment-preview" data-variant="panel" data-media="text">
         <pre>{text.length > 6000 ? `${text.slice(0, 6000)}\n...` : text}</pre>
@@ -103,7 +92,7 @@ export function AttachmentPreview({
     )
   }
 
-  if (variant !== 'panel' && textArtifact && attachment && isTextAttachment(attachment, mime)) {
+  if (variant !== 'panel' && attachment && isTextAttachment(attachment, mime)) {
     return (
       <span data-ui="attachment-preview" data-variant={variant} data-media="text-mini">
         <span>{attachment.kind === 'code' ? '{}' : 'TXT'}</span>
@@ -118,20 +107,18 @@ export function AttachmentPreview({
   )
 }
 
-function canPreviewFromBundle(attachment: Attachment): boolean {
+function canPreviewFromMedia(attachment: AttachmentDisplayRow): boolean {
   if (attachment.storage.kind === 'missing') return false
   return (
     attachment.kind === 'image' ||
     attachment.kind === 'audio' ||
     attachment.kind === 'video' ||
-    attachment.kind === 'pdf' ||
-    attachment.kind === 'plaintext' ||
-    attachment.kind === 'code'
+    attachment.kind === 'pdf'
   )
 }
 
 function selectPreviewBlob(
-  attachment: Attachment,
+  attachment: AttachmentDisplayRow,
   bundle: AttachmentBundle | undefined,
   variant: AttachmentPreviewVariant,
 ): AttachmentBlob | undefined {
@@ -158,28 +145,28 @@ function selectPreviewBlob(
   )
 }
 
-function remotePreviewUrl(attachment: Attachment | undefined): string | undefined {
+function remotePreviewUrl(attachment: AttachmentDisplayRow | undefined): string | undefined {
   if (!attachment) return undefined
   if (attachment.storage.kind === 'remote-url') return attachment.storage.url
-  return attachment.sourceUrl
+  return undefined
 }
 
-function isImageAttachment(attachment: Attachment, mime: string): boolean {
+function isImageAttachment(attachment: AttachmentDisplayRow, mime: string): boolean {
   return attachment.kind === 'image' || mime.startsWith('image/')
 }
 
-function isAudioAttachment(attachment: Attachment, mime: string): boolean {
+function isAudioAttachment(attachment: AttachmentDisplayRow, mime: string): boolean {
   return attachment.kind === 'audio' || mime.startsWith('audio/')
 }
 
-function isVideoAttachment(attachment: Attachment, mime: string): boolean {
+function isVideoAttachment(attachment: AttachmentDisplayRow, mime: string): boolean {
   return attachment.kind === 'video' || mime.startsWith('video/')
 }
 
-function isPdfAttachment(attachment: Attachment, mime: string): boolean {
+function isPdfAttachment(attachment: AttachmentDisplayRow, mime: string): boolean {
   return attachment.kind === 'pdf' || mime === 'application/pdf'
 }
 
-function isTextAttachment(attachment: Attachment, mime: string): boolean {
+function isTextAttachment(attachment: AttachmentDisplayRow, mime: string): boolean {
   return attachment.kind === 'plaintext' || attachment.kind === 'code' || mime.startsWith('text/')
 }

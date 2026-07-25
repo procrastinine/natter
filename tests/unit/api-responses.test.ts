@@ -1,16 +1,19 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { openAssistantRequestStream } from '../../src/api/assistant-stream'
+import {
+  createAssistantDispatchPlan,
+  openAssistantRequestStream,
+} from '../../src/api/assistant-stream'
 import { type ResponsesContext, responses, responsesOnce } from '../../src/api/responses'
 import type {
   ResponsesEventWire,
   ResponsesResultWire,
   ResponsesStreamChunk,
 } from '../../src/api/types'
-import type { AssistantRequestPlan } from '../../src/core/send-planning'
 import type { ConnectionProfile } from '../../src/core/types'
 import { responsesBufferedResult, responsesStreamSse } from '../helpers/protocol-fixtures'
+import { responsesRouteContract } from '../helpers/reasoning-contracts'
 
 const PROBE5_PATH = resolve(
   __dirname,
@@ -254,11 +257,11 @@ describe('responsesOnce', () => {
         return jsonResponse(buffered)
       }),
     )
-    const requestPlan = {
-      useTextProtocol: false,
-      route: { kind: 'responses', transport: 'openai-responses', reason: 'buffered-only model' },
+    const requestPlan = createAssistantDispatchPlan({
+      ...responsesRouteContract(),
+      requestedModel: 'gpt-5.5-pro',
       wire: { model: 'gpt-5.5-pro', input: 'x' },
-    } as unknown as AssistantRequestPlan
+    })
     const chunks = []
     for await (const chunk of openAssistantRequestStream({
       connection: makeProfile(),

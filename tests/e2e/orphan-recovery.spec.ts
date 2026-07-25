@@ -1,5 +1,5 @@
 import { expect, test } from './fixtures'
-import { clearIndexedDb, seedFirstRun } from './helpers'
+import { activeWorkspaceDatabaseName, clearIndexedDb, seedFirstRun } from './helpers'
 
 // The orphan sweep (Shell.tsx → recoverOrphans on mount) rescues any message
 // whose `generation.startedAt` is set without `finishedAt` by marking it
@@ -18,65 +18,69 @@ test('orphan in-flight message is marked tab-close on next mount', async ({ page
 
   // Inject an orphan assistant message directly into the messages store.
   const orphanId = 'orphan-01HYZ9V4T9EXAMPLE0000000'
-  await page.evaluate(async (id) => {
-    const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const req = indexedDB.open('natter')
-      req.onsuccess = () => resolve(req.result)
-      req.onerror = () => reject(req.error)
-    })
-    try {
-      const chatId = await new Promise<string>((resolve, reject) => {
-        const tx = db.transaction('chats', 'readonly')
-        const req = tx.objectStore('chats').getAll()
-        req.onsuccess = () => resolve((req.result as Array<{ id: string }>)[0]?.id ?? '')
+  const databaseName = await activeWorkspaceDatabaseName(page)
+  await page.evaluate(
+    async ({ databaseName, id }) => {
+      const db = await new Promise<IDBDatabase>((resolve, reject) => {
+        const req = indexedDB.open(databaseName)
+        req.onsuccess = () => resolve(req.result)
         req.onerror = () => reject(req.error)
       })
-      await new Promise<void>((resolve, reject) => {
-        const tx = db.transaction(['messages', 'messageBodies'], 'readwrite')
-        tx.objectStore('messages').put({
-          id,
-          chatId,
-          parentId: null,
-          siblingIndex: 0,
-          turnId: `${id}-turn`,
-          turnIndex: 0,
-          createdAt: 1,
-          role: 'assistant',
-          origin: 'generated',
-          nodeVersion: 0,
-          deleted: false,
-          generation: {
-            id: '',
-            model: 'google/gemini-3.1-flash-lite-preview',
-            requestedModel: 'google/gemini-3.1-flash-lite-preview',
-            apiUsed: 'chat',
-            delivery: 'streaming',
-            costSource: 'stream',
-            startedAt: 100,
-          },
+      try {
+        const chatId = await new Promise<string>((resolve, reject) => {
+          const tx = db.transaction('chats', 'readonly')
+          const req = tx.objectStore('chats').getAll()
+          req.onsuccess = () => resolve((req.result as Array<{ id: string }>)[0]?.id ?? '')
+          req.onerror = () => reject(req.error)
         })
-        tx.objectStore('messageBodies').put({
-          id,
-          chatId,
-          nodeVersion: 0,
-          updatedAt: 100,
-          content: [{ type: 'output_text', text: 'partial' }],
+        await new Promise<void>((resolve, reject) => {
+          const tx = db.transaction(['messages', 'messageBodies'], 'readwrite')
+          tx.objectStore('messages').put({
+            id,
+            chatId,
+            parentId: null,
+            siblingIndex: 0,
+            turnId: `${id}-turn`,
+            turnIndex: 0,
+            createdAt: 1,
+            role: 'assistant',
+            origin: 'generated',
+            nodeVersion: 0,
+            deleted: false,
+            generation: {
+              id: '',
+              model: 'google/gemini-3.1-flash-lite-preview',
+              requestedModel: 'google/gemini-3.1-flash-lite-preview',
+              apiUsed: 'chat',
+              delivery: 'streaming',
+              costSource: 'stream',
+              startedAt: 100,
+            },
+          })
+          tx.objectStore('messageBodies').put({
+            id,
+            chatId,
+            nodeVersion: 0,
+            updatedAt: 100,
+            content: [{ type: 'output_text', text: 'partial' }],
+          })
+          tx.oncomplete = () => resolve()
+          tx.onerror = () => reject(tx.error)
         })
-        tx.oncomplete = () => resolve()
-        tx.onerror = () => reject(tx.error)
-      })
-    } finally {
-      db.close()
-    }
-  }, orphanId)
+      } finally {
+        db.close()
+      }
+    },
+    { databaseName, id: orphanId },
+  )
 
   // Reload so Shell.tsx's useEffect fires recoverOrphans.
   await page.reload()
   // Wait until recoverOrphans commits.
   await page.waitForFunction(
-    async (id) => {
+    async ({ databaseName, id }) => {
       const db = await new Promise<IDBDatabase>((resolve, reject) => {
-        const req = indexedDB.open('natter')
+        const req = indexedDB.open(databaseName)
         req.onsuccess = () => resolve(req.result)
         req.onerror = () => reject(req.error)
       })
@@ -94,7 +98,7 @@ test('orphan in-flight message is marked tab-close on next mount', async ({ page
         db.close()
       }
     },
-    orphanId,
+    { databaseName, id: orphanId },
     { timeout: 5000 },
   )
 })

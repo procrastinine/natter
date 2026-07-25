@@ -118,6 +118,6 @@ async function startChat(page: Page): Promise<void> {
     title: 'Mobile shell layout check',
   })
   await page.setViewportSize({ width: 390, height: 740 })
-  await page.goto(`/#/chat/${chatId}/message/msg-001`)
+  await page.goto(`/#/chat/${chatId}`)
   await expect(page.locator('[data-ui="message"][data-role="assistant"]')).toBeVisible()
 }

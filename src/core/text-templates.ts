@@ -4,13 +4,26 @@
 // or any client-rendered template here. OpenRouter has no embedded template
 // surface, so it always uses a client-rendered built-in or saved user template.
 
-import { newId } from '../lib/ulid'
-import { getSetting, updateSetting } from '../store/settings'
-import { filterReasoningForInclude } from './reasoning'
+import { createAppliedMessageView } from './continuation-content'
+import {
+  type OutboundReasoningResolver,
+  resolveOutboundReasoningResolver,
+} from './outbound-reasoning'
+import {
+  type AttemptProviderOutputContract,
+  projectProviderOutputForContext,
+  renderProviderOutputContextFallback,
+} from './provider-tool-context'
+import {
+  mergeSealedReasoningCarryForward,
+  sealedReasoningCarryForwardEvidence,
+  type TextReasoningContract,
+} from './reasoning'
 import type {
   ChatSettings,
   Message,
-  ReasoningDetail,
+  ReasoningCarryForwardEvidence,
+  SealedReasoningCarryForward,
   TextTemplateConfig,
   TextTemplateId,
 } from './types'
@@ -29,7 +42,9 @@ export interface SavedTextTemplate {
   updatedAt: number
 }
 
-export const SAVED_TEXT_TEMPLATES_KEY = 'global:text-templates:v1'
+export type SavedTextTemplateCatalogRow = Omit<SavedTextTemplate, 'config'>
+
+export const LEGACY_SAVED_TEXT_TEMPLATES_KEY = 'global:text-templates:v1'
 
 const EMPTY_LEGACY_TEXT_TEMPLATE: TextTemplateConfig = {
   userPrefix: '',
@@ -306,7 +321,7 @@ export const BUILTIN_TEXT_TEMPLATE_ORDER: readonly TextTemplateId[] = [
   'raw',
 ]
 
-function resolveTextTemplate(
+export function resolveStaticTextTemplate(
   id: TextTemplateId,
   customFallback?: TextTemplateConfig,
 ): TextTemplateConfig | null {
@@ -315,74 +330,48 @@ function resolveTextTemplate(
   return TEXT_TEMPLATES[id] ?? null
 }
 
-export async function resolveTextTemplateFromLibrary(
-  id: TextTemplateId,
-  customFallback?: TextTemplateConfig,
-): Promise<TextTemplateConfig | null> {
-  const builtIn = resolveTextTemplate(id, customFallback)
-  if (builtIn || id === 'default' || id === 'custom') return builtIn
-  const saved = await readSavedTextTemplates()
-  return saved.find((row) => row.id === id)?.config ?? null
+export function isStaticTextTemplateId(id: TextTemplateId): boolean {
+  return id === 'default' || id === 'custom' || Object.hasOwn(TEXT_TEMPLATES, id)
 }
 
-export async function readSavedTextTemplates(): Promise<SavedTextTemplate[]> {
-  const raw = await getSetting<unknown>(SAVED_TEXT_TEMPLATES_KEY)
-  if (!Array.isArray(raw)) return []
-  return raw.map(normalizeSavedTemplate).filter((row): row is SavedTextTemplate => row !== null)
-}
-
-export async function createSavedTextTemplate(input: {
-  name: string
-  config?: TextTemplateConfig
-  now?: number
-}): Promise<SavedTextTemplate> {
-  const now = input.now ?? Date.now()
-  const row: SavedTextTemplate = {
-    id: `user:${newId()}`,
-    name: input.name.trim() || 'Untitled template',
-    config: normalizeTextTemplateConfig(input.config ?? EMPTY_TEXT_TEMPLATE),
-    createdAt: now,
-    updatedAt: now,
+export function savedTextTemplatesFromStoredValue(value: unknown): SavedTextTemplate[] {
+  if (!Array.isArray(value)) return []
+  const byId = new Map<TextTemplateId, SavedTextTemplate>()
+  for (const raw of value) {
+    const row = normalizeSavedTextTemplate(raw)
+    if (!row) continue
+    const current = byId.get(row.id)
+    if (
+      !current ||
+      row.updatedAt > current.updatedAt ||
+      (row.updatedAt === current.updatedAt && row.createdAt > current.createdAt)
+    ) {
+      byId.set(row.id, row)
+    }
   }
-  await updateSetting<SavedTextTemplate[]>(SAVED_TEXT_TEMPLATES_KEY, (current) => [
-    ...sanitizeSavedTemplates(current),
-    row,
-  ])
-  return row
+  return [...byId.values()].sort(compareSavedTextTemplates)
 }
 
-export async function updateSavedTextTemplate(
-  id: TextTemplateId,
-  patch: Partial<Omit<SavedTextTemplate, 'id' | 'createdAt'>>,
-  now = Date.now(),
-): Promise<void> {
-  await updateSetting<SavedTextTemplate[]>(SAVED_TEXT_TEMPLATES_KEY, (current) =>
-    sanitizeSavedTemplates(current).map((row) => {
-      if (row.id !== id) return row
-      return {
-        ...row,
-        ...(patch.name !== undefined ? { name: patch.name.trim() || row.name } : {}),
-        ...(patch.config !== undefined
-          ? { config: normalizeTextTemplateConfig(patch.config) }
-          : {}),
-        updatedAt: now,
-      }
-    }),
-  )
+export function savedTextTemplatesStoredValueIsCanonical(
+  value: unknown,
+  normalized: readonly SavedTextTemplate[],
+): boolean {
+  if (!Array.isArray(value) || value.length !== normalized.length) return false
+  return value.every((raw, index) => {
+    const expected = normalized[index]
+    if (!expected || !raw || typeof raw !== 'object') return false
+    const current = raw as Partial<SavedTextTemplate>
+    return (
+      current.id === expected.id &&
+      current.name === expected.name &&
+      current.createdAt === expected.createdAt &&
+      current.updatedAt === expected.updatedAt &&
+      sameTextTemplateConfig(current.config, expected.config)
+    )
+  })
 }
 
-export async function deleteSavedTextTemplate(id: TextTemplateId): Promise<void> {
-  await updateSetting<SavedTextTemplate[]>(SAVED_TEXT_TEMPLATES_KEY, (current) =>
-    sanitizeSavedTemplates(current).filter((row) => row.id !== id),
-  )
-}
-
-function sanitizeSavedTemplates(current: SavedTextTemplate[] | undefined): SavedTextTemplate[] {
-  if (!Array.isArray(current)) return []
-  return current.map(normalizeSavedTemplate).filter((row): row is SavedTextTemplate => row !== null)
-}
-
-function normalizeSavedTemplate(raw: unknown): SavedTextTemplate | null {
+export function normalizeSavedTextTemplate(raw: unknown): SavedTextTemplate | null {
   if (!raw || typeof raw !== 'object') return null
   const value = raw as Partial<SavedTextTemplate>
   if (typeof value.id !== 'string' || !value.id.startsWith('user:')) return null
@@ -392,12 +381,49 @@ function normalizeSavedTemplate(raw: unknown): SavedTextTemplate | null {
     id: value.id,
     name,
     config: normalizeTextTemplateConfig(value.config),
-    createdAt: typeof value.createdAt === 'number' ? value.createdAt : 0,
-    updatedAt: typeof value.updatedAt === 'number' ? value.updatedAt : 0,
+    createdAt:
+      typeof value.createdAt === 'number' && Number.isFinite(value.createdAt) ? value.createdAt : 0,
+    updatedAt:
+      typeof value.updatedAt === 'number' && Number.isFinite(value.updatedAt) ? value.updatedAt : 0,
   }
 }
 
-function normalizeTextTemplateConfig(raw: unknown): TextTemplateConfig {
+export function savedTextTemplateCatalogRow(
+  template: SavedTextTemplate,
+): SavedTextTemplateCatalogRow {
+  return {
+    id: template.id,
+    name: template.name,
+    createdAt: template.createdAt,
+    updatedAt: template.updatedAt,
+  }
+}
+
+function compareSavedTextTemplates(left: SavedTextTemplate, right: SavedTextTemplate): number {
+  if (left.createdAt !== right.createdAt) return left.createdAt - right.createdAt
+  return left.id.localeCompare(right.id)
+}
+
+function sameTextTemplateConfig(left: unknown, right: TextTemplateConfig): boolean {
+  if (!left || typeof left !== 'object') return false
+  const value = left as Partial<TextTemplateConfig>
+  return (
+    value.template === right.template &&
+    value.includeSystemPrompt === right.includeSystemPrompt &&
+    value.userPrefix === right.userPrefix &&
+    value.userSuffix === right.userSuffix &&
+    value.assistantPrefix === right.assistantPrefix &&
+    value.assistantSuffix === right.assistantSuffix &&
+    value.systemPrefix === right.systemPrefix &&
+    value.systemSuffix === right.systemSuffix &&
+    value.bos === right.bos &&
+    Array.isArray(value.stop) &&
+    value.stop.length === right.stop.length &&
+    value.stop.every((stop, index) => stop === right.stop[index])
+  )
+}
+
+export function normalizeTextTemplateConfig(raw: unknown): TextTemplateConfig {
   if (!raw || typeof raw !== 'object') return { ...EMPTY_TEXT_TEMPLATE, stop: [] }
   const value = raw as Partial<TextTemplateConfig>
   const next: TextTemplateConfig = {
@@ -468,53 +494,173 @@ function pushRoleTemplate(
   parts.push(`{% ${branch} message.role == "${role}" %}`, prefix, '{{ message.content }}', suffix)
 }
 
-export function renderTextPrompt(
-  template: TextTemplateConfig,
-  settingsOrSystemPrompt: ChatSettings | string,
-  branch: readonly Message[],
-): string {
-  if (template.template !== undefined) {
-    return renderTemplatePrompt(template, settingsOrSystemPrompt, branch)
-  }
-  const settings = typeof settingsOrSystemPrompt === 'string' ? null : settingsOrSystemPrompt
-  const implicitSystemPrompt =
-    typeof settingsOrSystemPrompt === 'string'
-      ? settingsOrSystemPrompt
-      : settingsOrSystemPrompt.systemPrompt
-  const systemPrompt = isPlainContinuationTemplate(template) ? '' : implicitSystemPrompt
-  const visible = branch.filter((m) => m.hiddenFromContext !== true && !m.deleted)
-  const parts: string[] = []
-  if (template.bos) parts.push(template.bos)
-  const hasImportedSystem = visible.some((m) => m.role === 'system' || m.role === 'developer')
-  if (!hasImportedSystem && systemPrompt.length > 0) {
-    parts.push(template.systemPrefix, systemPrompt, template.systemSuffix)
-  }
-  const tail = visible.at(-1)
-  const tailIsOpenAssistant = tail?.role === 'assistant' && tail.origin === 'prefill'
-
-  for (let index = 0; index < visible.length; index += 1) {
-    const msg = visible[index]
-    if (!msg) continue
-    const text = extractMessageText(msg)
-    if (msg.role === 'user') {
-      parts.push(template.userPrefix, text, template.userSuffix)
-    } else if (msg.role === 'assistant') {
-      const renderedText = settings ? assistantTextForPrompt(msg, text, settings) : text
-      const open = tailIsOpenAssistant && index === visible.length - 1
-      parts.push(template.assistantPrefix, renderedText)
-      if (!open) parts.push(template.assistantSuffix)
-    } else if (msg.role === 'system' || msg.role === 'developer') {
-      parts.push(template.systemPrefix, text, template.systemSuffix)
-    }
-  }
-  if (!tailIsOpenAssistant) parts.push(template.assistantPrefix)
-  return parts.join('')
+export interface RenderedTextPrompt {
+  readonly prompt: string
+  readonly reasoning: ReasoningCarryForwardEvidence
 }
 
-interface TemplateMessage {
-  role: Message['role']
-  content: string
-  is_open: boolean
+export interface OpaqueServerRenderedPrompt {
+  readonly kind: 'opaque-server-rendered-prompt'
+  readonly prompt: string
+}
+
+export function renderedTextPromptFromOpaqueServer(
+  rendered: OpaqueServerRenderedPrompt,
+  candidateReasoningCarryForward: SealedReasoningCarryForward,
+): RenderedTextPrompt {
+  return candidateReasoningCarryForward === 'none'
+    ? renderedTextPromptFromClient(rendered.prompt, 'none')
+    : {
+        prompt: rendered.prompt,
+        reasoning: { certainty: 'opaque', possible: candidateReasoningCarryForward },
+      }
+}
+
+function renderedTextPromptFromClient(
+  prompt: string,
+  reasoningCarryForward: SealedReasoningCarryForward,
+): RenderedTextPrompt {
+  return {
+    prompt,
+    reasoning: sealedReasoningCarryForwardEvidence(reasoningCarryForward),
+  }
+}
+
+export function renderTextPromptProjection(
+  template: TextTemplateConfig,
+  settings: ChatSettings,
+  branch: readonly Message[],
+  reasoning: TextReasoningContract,
+  providerOutput: AttemptProviderOutputContract,
+  options: {
+    reasoningCarryForwardByMessageId?: ReadonlyMap<Message['id'], SealedReasoningCarryForward>
+    reasoningResolver?: OutboundReasoningResolver
+  } = {},
+): RenderedTextPrompt {
+  const projected = projectTextPromptMessagesProjection(
+    settings,
+    branch,
+    reasoning,
+    providerOutput,
+    {
+      includeSystemPrompt: !isPlainContinuationTemplate(template),
+      ...(options.reasoningCarryForwardByMessageId
+        ? { reasoningCarryForwardByMessageId: options.reasoningCarryForwardByMessageId }
+        : {}),
+      ...(options.reasoningResolver ? { reasoningResolver: options.reasoningResolver } : {}),
+    },
+  )
+  const rendered =
+    template.template !== undefined
+      ? renderProjectedTemplatePrompt(template, projected.messages)
+      : renderDelimitedTextPromptMessages(template, projected.messages)
+  return renderedTextPromptFromClient(rendered.text, rendered.reasoningCarryForward)
+}
+
+function renderDelimitedTextPromptMessages(
+  template: TextTemplateConfig,
+  messages: readonly TextPromptMessage[],
+): RenderedTemplateString {
+  const parts: string[] = []
+  let reasoningCarryForward: SealedReasoningCarryForward = 'none'
+  if (template.bos) parts.push(template.bos)
+  for (const message of messages) {
+    if (message.role === 'user') {
+      parts.push(template.userPrefix, message.content, template.userSuffix)
+    } else if (message.role === 'assistant') {
+      parts.push(template.assistantPrefix, message.content)
+      if (!message.is_open) parts.push(template.assistantSuffix)
+    } else if (message.role === 'system' || message.role === 'developer') {
+      parts.push(template.systemPrefix, message.content, template.systemSuffix)
+    }
+    reasoningCarryForward = mergeSealedReasoningCarryForward(
+      reasoningCarryForward,
+      message.reasoningCarryForward,
+    )
+  }
+  if (!messages.at(-1)?.is_open) parts.push(template.assistantPrefix)
+  return { text: parts.join(''), reasoningCarryForward }
+}
+
+export interface TextPromptProjection {
+  readonly messages: readonly TextPromptMessage[]
+  readonly reasoningCarryForward: SealedReasoningCarryForward
+}
+
+export function projectTextPromptMessagesProjection(
+  settings: ChatSettings,
+  branch: readonly Message[],
+  reasoning: TextReasoningContract,
+  providerOutput: AttemptProviderOutputContract,
+  options: {
+    includeSystemPrompt?: boolean
+    reasoningCarryForwardByMessageId?: ReadonlyMap<Message['id'], SealedReasoningCarryForward>
+    reasoningResolver?: OutboundReasoningResolver
+  } = {},
+): TextPromptProjection {
+  const reasoningResolver = resolveOutboundReasoningResolver(
+    { kind: 'text', contract: reasoning },
+    options.reasoningResolver,
+  )
+  let tailIndex = -1
+  let hasImportedSystem = false
+  for (let index = branch.length - 1; index >= 0; index -= 1) {
+    const message = branch[index]
+    if (!message || message.hiddenFromContext === true || message.deleted) continue
+    if (tailIndex < 0) tailIndex = index
+    if (message.role === 'system' || message.role === 'developer') hasImportedSystem = true
+  }
+  const tail = tailIndex >= 0 ? branch[tailIndex] : undefined
+  const tailIsOpenAssistant = tail?.role === 'assistant' && tail.origin === 'prefill'
+  const messages: TextPromptMessage[] = []
+  let reasoningCarryForward: SealedReasoningCarryForward = 'none'
+  if (
+    options.includeSystemPrompt !== false &&
+    !hasImportedSystem &&
+    settings.systemPrompt.length > 0
+  ) {
+    messages.push({
+      role: 'system',
+      content: settings.systemPrompt,
+      is_open: false,
+      reasoningCarryForward: 'none',
+    })
+  }
+  for (const [index, message] of branch.entries()) {
+    if (message.hiddenFromContext === true || message.deleted) continue
+    const text = extractMessageText(message)
+    const assistantProjection =
+      message.role === 'assistant'
+        ? assistantTextForPrompt(
+            message,
+            text,
+            providerOutput,
+            settings.toolCallContext.include,
+            options.reasoningCarryForwardByMessageId?.get(message.id) ?? 'none',
+            reasoningResolver,
+          )
+        : null
+    if (assistantProjection) {
+      reasoningCarryForward = mergeSealedReasoningCarryForward(
+        reasoningCarryForward,
+        assistantProjection.reasoningCarryForward,
+      )
+    }
+    messages.push({
+      role: message.role,
+      content: assistantProjection?.text ?? text,
+      is_open: tailIsOpenAssistant && index === tailIndex,
+      reasoningCarryForward: assistantProjection?.reasoningCarryForward ?? 'none',
+    })
+  }
+  return { messages, reasoningCarryForward }
+}
+
+export interface TextPromptMessage {
+  readonly role: Message['role']
+  readonly content: string
+  readonly is_open: boolean
+  readonly reasoningCarryForward: SealedReasoningCarryForward
 }
 
 interface TemplateLoopState {
@@ -526,12 +672,28 @@ interface TemplateLoopState {
 }
 
 interface TemplateContext {
-  messages: readonly TemplateMessage[]
-  add_generation_prompt: boolean
-  bos_token: string
-  eos_token: string
-  vars: Record<string, unknown>
-  loop?: TemplateLoopState
+  readonly messages: readonly TextPromptMessage[]
+  readonly add_generation_prompt: boolean
+  readonly bos_token: string
+  readonly eos_token: string
+  readonly variables: unknown[]
+  readonly loops: TemplateLoopState[]
+}
+
+interface TemplateStringValue {
+  readonly kind: 'template-string'
+  readonly text: string
+  readonly reasoningCarryForward: SealedReasoningCarryForward
+}
+
+interface RenderedTemplateString {
+  text: string
+  reasoningCarryForward: SealedReasoningCarryForward
+}
+
+interface TemplateOutputWriter {
+  readonly parts: string[]
+  reasoningCarryForward: SealedReasoningCarryForward
 }
 
 interface TemplateToken {
@@ -541,59 +703,121 @@ interface TemplateToken {
   trimRight: boolean
 }
 
-function renderTemplatePrompt(
+type TemplateNode =
+  | { readonly kind: 'text'; readonly value: string }
+  | { readonly kind: 'expr'; readonly expression: TemplateExpression }
+  | {
+      readonly kind: 'for'
+      readonly variableSlot: number
+      readonly expression: TemplateExpression
+      readonly body: readonly TemplateNode[]
+    }
+  | {
+      readonly kind: 'if'
+      readonly branches: readonly {
+        readonly condition: TemplateExpression | null
+        readonly body: readonly TemplateNode[]
+      }[]
+    }
+
+type TemplateExpression =
+  | { readonly kind: 'literal'; readonly value: unknown }
+  | {
+      readonly kind: 'path'
+      readonly root:
+        | 'messages'
+        | 'add-generation-prompt'
+        | 'bos-token'
+        | 'eos-token'
+        | 'loop'
+        | 'variable'
+        | 'unknown'
+      readonly variableSlot?: number
+      readonly parts: readonly string[]
+    }
+  | { readonly kind: 'concat'; readonly values: readonly TemplateExpression[] }
+  | { readonly kind: 'not'; readonly value: TemplateExpression }
+  | {
+      readonly kind: 'boolean'
+      readonly operator: 'and' | 'or'
+      readonly left: TemplateExpression
+      readonly right: TemplateExpression
+    }
+  | {
+      readonly kind: 'compare'
+      readonly operator: '==' | '!='
+      readonly left: TemplateExpression
+      readonly right: TemplateExpression
+    }
+
+type TemplateExpressionToken =
+  | { readonly kind: 'string'; readonly value: string }
+  | { readonly kind: 'number'; readonly value: number }
+  | { readonly kind: 'atom'; readonly value: string }
+  | {
+      readonly kind: 'operator'
+      readonly value: '+' | '==' | '!=' | '(' | ')' | 'and' | 'or' | 'not'
+    }
+
+interface TemplateExpressionParser {
+  readonly tokens: readonly TemplateExpressionToken[]
+  readonly scope: TemplateCompilerScope
+  index: number
+}
+
+interface TemplateCompilerScope {
+  readonly variableSlots: Map<string, number[]>
+  depth: number
+}
+
+type TemplateBlockStop = 'endfor' | 'elif' | 'else' | 'endif'
+
+interface ParsedTemplateBlock {
+  readonly nodes: readonly TemplateNode[]
+  readonly next: number
+  readonly stop?: TemplateBlockStop
+  readonly stopValue?: string
+}
+
+function renderProjectedTemplatePrompt(
   template: TextTemplateConfig,
-  settingsOrSystemPrompt: ChatSettings | string,
-  branch: readonly Message[],
-): string {
-  const settings = typeof settingsOrSystemPrompt === 'string' ? null : settingsOrSystemPrompt
-  const systemPrompt =
-    typeof settingsOrSystemPrompt === 'string'
-      ? settingsOrSystemPrompt
-      : settingsOrSystemPrompt.systemPrompt
-  const messages = buildTemplateMessages(template, settings, systemPrompt, branch)
+  messages: readonly TextPromptMessage[],
+): RenderedTemplateString {
   const tail = messages.at(-1)
   return renderTemplateString(template.template ?? '', {
     messages,
     add_generation_prompt: !(tail?.role === 'assistant' && tail.is_open),
     bos_token: template.bos,
     eos_token: template.stop[0] ?? '',
-    vars: {},
+    variables: [],
+    loops: [],
   })
 }
 
-function buildTemplateMessages(
-  template: TextTemplateConfig,
-  settings: ChatSettings | null,
-  systemPrompt: string,
-  branch: readonly Message[],
-): TemplateMessage[] {
-  const visible = branch.filter((m) => m.hiddenFromContext !== true && !m.deleted)
-  const tail = visible.at(-1)
-  const tailIsOpenAssistant = tail?.role === 'assistant' && tail.origin === 'prefill'
-  const messages: TemplateMessage[] = []
-  const hasImportedSystem = visible.some((m) => m.role === 'system' || m.role === 'developer')
-  if (template.includeSystemPrompt !== false && !hasImportedSystem && systemPrompt.length > 0) {
-    messages.push({ role: 'system', content: systemPrompt, is_open: false })
-  }
-  for (let index = 0; index < visible.length; index += 1) {
-    const msg = visible[index]
-    if (!msg) continue
-    const text = extractMessageText(msg)
-    const content =
-      msg.role === 'assistant' && settings ? assistantTextForPrompt(msg, text, settings) : text
-    messages.push({
-      role: msg.role,
-      content,
-      is_open: tailIsOpenAssistant && index === visible.length - 1,
-    })
-  }
-  return messages
+function renderTemplateString(source: string, context: TemplateContext): RenderedTemplateString {
+  const tokens = tokenizeTemplate(source)
+  const writer: TemplateOutputWriter = { parts: [], reasoningCarryForward: 'none' }
+  renderTemplateNodes(
+    compileTemplate(tokens, { variableSlots: new Map(), depth: 0 }),
+    context,
+    writer,
+  )
+  return { text: writer.parts.join(''), reasoningCarryForward: writer.reasoningCarryForward }
 }
 
-function renderTemplateString(source: string, context: TemplateContext): string {
-  const tokens = tokenizeTemplate(source)
-  return renderTokenRange(tokens, 0, tokens.length, context)
+function templateStringValue(
+  text: string,
+  reasoningCarryForward: SealedReasoningCarryForward,
+): TemplateStringValue {
+  return { kind: 'template-string', text, reasoningCarryForward }
+}
+
+function isTemplateStringValue(value: unknown): value is TemplateStringValue {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    (value as { kind?: unknown }).kind === 'template-string'
+  )
 }
 
 function tokenizeTemplate(source: string): TemplateToken[] {
@@ -601,9 +825,7 @@ function tokenizeTemplate(source: string): TemplateToken[] {
   let index = 0
   let stripNextText = false
   while (index < source.length) {
-    const exprIndex = source.indexOf('{{', index)
-    const stmtIndex = source.indexOf('{%', index)
-    const nextIndex = nextTemplateIndex(exprIndex, stmtIndex)
+    const nextIndex = findNextTemplateMarker(source, index)
     if (nextIndex < 0) {
       pushTextToken(tokens, source.slice(index), stripNextText)
       break
@@ -614,7 +836,7 @@ function tokenizeTemplate(source: string): TemplateToken[] {
     let bodyStart = nextIndex + 2
     const trimLeft = source[bodyStart] === '-'
     if (trimLeft) bodyStart += 1
-    const closeIndex = source.indexOf(close, bodyStart)
+    const closeIndex = findTemplateClose(source, close, bodyStart)
     if (closeIndex < 0) {
       pushTextToken(tokens, source.slice(nextIndex), false)
       break
@@ -633,10 +855,20 @@ function tokenizeTemplate(source: string): TemplateToken[] {
   return tokens
 }
 
-function nextTemplateIndex(exprIndex: number, stmtIndex: number): number {
-  if (exprIndex < 0) return stmtIndex
-  if (stmtIndex < 0) return exprIndex
-  return Math.min(exprIndex, stmtIndex)
+function findNextTemplateMarker(source: string, start: number): number {
+  for (let index = start; index < source.length - 1; index += 1) {
+    if (source[index] === '{' && (source[index + 1] === '{' || source[index + 1] === '%')) {
+      return index
+    }
+  }
+  return -1
+}
+
+function findTemplateClose(source: string, close: '}}' | '%}', start: number): number {
+  for (let index = start; index < source.length - 1; index += 1) {
+    if (source[index] === close[0] && source[index + 1] === close[1]) return index
+  }
+  return -1
 }
 
 function pushTextToken(tokens: TemplateToken[], value: string, stripLeadingWhitespace: boolean) {
@@ -649,357 +881,491 @@ function pushTextToken(tokens: TemplateToken[], value: string, stripLeadingWhite
   })
 }
 
-function renderTokenRange(
+function compileTemplate(
+  tokens: readonly TemplateToken[],
+  scope: TemplateCompilerScope,
+): readonly TemplateNode[] {
+  return parseTemplateBlock(tokens, 0, new Set(), scope).nodes
+}
+
+function parseTemplateBlock(
   tokens: readonly TemplateToken[],
   start: number,
-  end: number,
-  context: TemplateContext,
-): string {
-  const out: string[] = []
+  stops: ReadonlySet<TemplateBlockStop>,
+  scope: TemplateCompilerScope,
+): ParsedTemplateBlock {
+  const nodes: TemplateNode[] = []
   let index = start
-  while (index < end) {
+  while (index < tokens.length) {
     const token = tokens[index]
     if (!token) break
     if (token.kind === 'text') {
-      out.push(token.value)
+      nodes.push({ kind: 'text', value: token.value })
       index += 1
       continue
     }
     if (token.kind === 'expr') {
-      out.push(stringifyTemplateValue(evaluateTemplateValue(token.value, context)))
+      nodes.push({ kind: 'expr', expression: compileTemplateExpression(token.value, scope) })
       index += 1
       continue
     }
-    if (token.value.startsWith('for ')) {
-      const close = findMatchingStatement(tokens, index, 'for ', 'endfor')
-      if (close < 0) {
+    const stop = templateBlockStop(token.value)
+    if (stop && stops.has(stop)) {
+      return { nodes, next: index + 1, stop, stopValue: token.value }
+    }
+    const forMatch = /^for\s+([A-Za-z_]\w*)\s+in\s+(.+)$/u.exec(token.value)
+    if (forMatch) {
+      const variable = forMatch[1]
+      const expression = forMatch[2]
+      if (!variable || !expression) {
         index += 1
         continue
       }
-      out.push(renderForStatement(token.value, tokens, index + 1, close, context))
-      index = close + 1
+      const variableSlot = enterTemplateVariable(scope, variable)
+      const body = parseTemplateBlock(tokens, index + 1, new Set(['endfor']), scope)
+      leaveTemplateVariable(scope, variable)
+      nodes.push({
+        kind: 'for',
+        variableSlot,
+        expression: compileTemplateExpression(expression, scope),
+        body: body.nodes,
+      })
+      index = body.next
       continue
     }
     if (token.value.startsWith('if ')) {
-      const resolved = renderIfStatement(tokens, index, context)
-      out.push(resolved.output)
-      index = resolved.next
+      const parsed = parseTemplateIf(tokens, index + 1, token.value.slice(3).trim(), scope)
+      nodes.push(parsed.node)
+      index = parsed.next
       continue
     }
     index += 1
   }
-  return out.join('')
+  return { nodes, next: index }
 }
 
-function renderForStatement(
-  statement: string,
+function parseTemplateIf(
   tokens: readonly TemplateToken[],
   start: number,
-  end: number,
+  firstCondition: string,
+  scope: TemplateCompilerScope,
+): { readonly node: Extract<TemplateNode, { kind: 'if' }>; readonly next: number } {
+  const branches: Array<{
+    condition: TemplateExpression | null
+    body: readonly TemplateNode[]
+  }> = []
+  let condition: TemplateExpression | null = compileTemplateExpression(firstCondition, scope)
+  let index = start
+  while (index <= tokens.length) {
+    const branch = parseTemplateBlock(tokens, index, new Set(['elif', 'else', 'endif']), scope)
+    branches.push({ condition, body: branch.nodes })
+    index = branch.next
+    if (branch.stop === 'elif') {
+      condition = compileTemplateExpression(branch.stopValue?.slice(5).trim() ?? '', scope)
+      continue
+    }
+    if (branch.stop === 'else') {
+      const fallback = parseTemplateBlock(tokens, index, new Set(['endif']), scope)
+      branches.push({ condition: null, body: fallback.nodes })
+      index = fallback.next
+    }
+    break
+  }
+  return { node: { kind: 'if', branches }, next: index }
+}
+
+function enterTemplateVariable(scope: TemplateCompilerScope, variable: string): number {
+  const slot = scope.depth
+  scope.depth += 1
+  const slots = scope.variableSlots.get(variable)
+  if (slots) slots.push(slot)
+  else scope.variableSlots.set(variable, [slot])
+  return slot
+}
+
+function leaveTemplateVariable(scope: TemplateCompilerScope, variable: string): void {
+  scope.depth -= 1
+  const slots = scope.variableSlots.get(variable)
+  slots?.pop()
+  if (slots?.length === 0) scope.variableSlots.delete(variable)
+}
+
+function templateBlockStop(value: string): TemplateBlockStop | undefined {
+  if (value === 'endfor' || value === 'else' || value === 'endif') return value
+  if (value.startsWith('elif ')) return 'elif'
+  return undefined
+}
+
+function renderTemplateNodes(
+  nodes: readonly TemplateNode[],
   context: TemplateContext,
-): string {
-  const match = /^for\s+([A-Za-z_]\w*)\s+in\s+(.+)$/u.exec(statement)
-  if (!match) return ''
-  const variable = match[1]
-  const expression = match[2]
-  if (!variable || !expression) return ''
-  const iterable = evaluateTemplateValue(expression, context)
-  if (!Array.isArray(iterable)) return ''
-  const values = iterable as unknown[]
-  return values
-    .map((item, index) =>
-      renderTokenRange(tokens, start, end, {
-        ...context,
-        vars: { ...context.vars, [variable]: item },
-        loop: {
-          index0: index,
-          index: index + 1,
-          first: index === 0,
-          last: index === values.length - 1,
-          length: values.length,
-        },
-      }),
-    )
-    .join('')
+  writer: TemplateOutputWriter,
+): void {
+  for (const node of nodes) {
+    if (node.kind === 'text') {
+      writer.parts.push(node.value)
+      continue
+    }
+    if (node.kind === 'expr') {
+      appendTemplateExpression(node.expression, context, writer)
+      continue
+    }
+    if (node.kind === 'for') {
+      renderForNode(node, context, writer)
+      continue
+    }
+    renderIfNode(node, context, writer)
+  }
 }
 
-function renderIfStatement(
-  tokens: readonly TemplateToken[],
-  start: number,
+function renderForNode(
+  node: Extract<TemplateNode, { kind: 'for' }>,
   context: TemplateContext,
-): { output: string; next: number } {
-  const branches = collectIfBranches(tokens, start)
-  if (!branches) return { output: '', next: start + 1 }
-  for (const branch of branches.branches) {
-    if (branch.condition === null || evaluateTemplateBoolean(branch.condition, context)) {
-      return {
-        output: renderTokenRange(tokens, branch.start, branch.end, context),
-        next: branches.end + 1,
-      }
-    }
+  writer: TemplateOutputWriter,
+): void {
+  const iterable = evaluateTemplateExpression(node.expression, context)
+  if (!Array.isArray(iterable)) return
+  const loop: TemplateLoopState = {
+    index0: 0,
+    index: 1,
+    first: true,
+    last: iterable.length === 1,
+    length: iterable.length,
   }
-  return { output: '', next: branches.end + 1 }
+  context.variables.push(undefined)
+  context.loops.push(loop)
+  for (let index = 0; index < iterable.length; index += 1) {
+    context.variables[node.variableSlot] = iterable[index]
+    loop.index0 = index
+    loop.index = index + 1
+    loop.first = index === 0
+    loop.last = index === iterable.length - 1
+    renderTemplateNodes(node.body, context, writer)
+  }
+  context.loops.pop()
+  context.variables.pop()
 }
 
-function collectIfBranches(
-  tokens: readonly TemplateToken[],
+function renderIfNode(
+  node: Extract<TemplateNode, { kind: 'if' }>,
+  context: TemplateContext,
+  writer: TemplateOutputWriter,
+): void {
+  for (const branch of node.branches) {
+    if (
+      branch.condition === null ||
+      comparableTemplateValue(evaluateTemplateExpression(branch.condition, context))
+    ) {
+      renderTemplateNodes(branch.body, context, writer)
+      return
+    }
+  }
+}
+
+function compileTemplateExpression(
+  source: string,
+  scope: TemplateCompilerScope,
+): TemplateExpression {
+  const parser: TemplateExpressionParser = {
+    tokens: tokenizeTemplateExpression(source),
+    scope,
+    index: 0,
+  }
+  return parseTemplateOrExpression(parser)
+}
+
+function tokenizeTemplateExpression(source: string): TemplateExpressionToken[] {
+  const tokens: TemplateExpressionToken[] = []
+  let index = 0
+  while (index < source.length) {
+    const char = source[index]
+    if (!char) break
+    if (/\s/u.test(char)) {
+      index += 1
+      continue
+    }
+    if (char === '|') break
+    if (char === '"' || char === "'") {
+      const quoted = readTemplateQuotedString(source, index, char)
+      tokens.push({ kind: 'string', value: quoted.value })
+      index = quoted.next
+      continue
+    }
+    const pair = source.slice(index, index + 2)
+    if (pair === '==' || pair === '!=') {
+      tokens.push({ kind: 'operator', value: pair })
+      index += 2
+      continue
+    }
+    if (char === '+' || char === '(' || char === ')') {
+      tokens.push({ kind: 'operator', value: char })
+      index += 1
+      continue
+    }
+    const atom = readTemplateExpressionAtom(source, index)
+    if (atom.next === index) {
+      index += 1
+      continue
+    }
+    if (atom.value === 'and' || atom.value === 'or' || atom.value === 'not') {
+      tokens.push({ kind: 'operator', value: atom.value })
+    } else if (/^-?\d+(?:\.\d+)?$/u.test(atom.value)) {
+      tokens.push({ kind: 'number', value: Number(atom.value) })
+    } else {
+      tokens.push({ kind: 'atom', value: atom.value })
+    }
+    index = atom.next
+  }
+  return tokens
+}
+
+function readTemplateQuotedString(
+  source: string,
   start: number,
-): {
-  branches: Array<{ condition: string | null; start: number; end: number }>
-  end: number
-} | null {
-  const first = tokens[start]
-  if (first?.kind !== 'stmt' || !first.value.startsWith('if ')) return null
-  const branches: Array<{ condition: string | null; start: number; end: number }> = []
-  let condition: string | null = first.value.slice(3).trim()
-  let branchStart = start + 1
-  let depth = 0
-  for (let index = start + 1; index < tokens.length; index += 1) {
-    const token = tokens[index]
-    if (token?.kind !== 'stmt') continue
-    if (token.value.startsWith('if ')) {
-      depth += 1
-    } else if (token.value === 'endif') {
-      if (depth === 0) {
-        branches.push({ condition, start: branchStart, end: index })
-        return { branches, end: index }
-      }
-      depth -= 1
-    } else if (depth === 0 && token.value.startsWith('elif ')) {
-      branches.push({ condition, start: branchStart, end: index })
-      condition = token.value.slice(5).trim()
-      branchStart = index + 1
-    } else if (depth === 0 && token.value === 'else') {
-      branches.push({ condition, start: branchStart, end: index })
-      condition = null
-      branchStart = index + 1
+  quote: '"' | "'",
+): { readonly value: string; readonly next: number } {
+  const parts: string[] = []
+  let index = start + 1
+  while (index < source.length) {
+    const char = source[index]
+    if (!char) break
+    if (char === quote) return { value: parts.join(''), next: index + 1 }
+    if (char !== '\\') {
+      parts.push(char)
+      index += 1
+      continue
     }
+    const escaped = source[index + 1]
+    if (escaped === undefined) {
+      parts.push('\\')
+      return { value: parts.join(''), next: source.length }
+    }
+    parts.push(escaped === 'n' ? '\n' : escaped === 'r' ? '\r' : escaped === 't' ? '\t' : escaped)
+    index += 2
   }
-  return null
+  return { value: parts.join(''), next: source.length }
 }
 
-function findMatchingStatement(
-  tokens: readonly TemplateToken[],
+function readTemplateExpressionAtom(
+  source: string,
   start: number,
-  opener: string,
-  closer: string,
-): number {
-  let depth = 0
-  for (let index = start + 1; index < tokens.length; index += 1) {
-    const token = tokens[index]
-    if (token?.kind !== 'stmt') continue
-    if (token.value.startsWith(opener)) {
-      depth += 1
-    } else if (token.value === closer) {
-      if (depth === 0) return index
-      depth -= 1
-    }
-  }
-  return -1
-}
-
-function evaluateTemplateBoolean(expression: string, context: TemplateContext): boolean {
-  const trimmed = stripOuterParens(expression.trim())
-  const orParts = splitByBooleanOperator(trimmed, 'or')
-  if (orParts.length > 1) return orParts.some((part) => evaluateTemplateBoolean(part, context))
-  const andParts = splitByBooleanOperator(trimmed, 'and')
-  if (andParts.length > 1) return andParts.every((part) => evaluateTemplateBoolean(part, context))
-  if (trimmed.startsWith('not ')) return !evaluateTemplateBoolean(trimmed.slice(4), context)
-  const comparison = splitComparison(trimmed)
-  if (comparison) {
-    const left = evaluateTemplateValue(comparison.left, context)
-    const right = evaluateTemplateValue(comparison.right, context)
-    return comparison.operator === '==' ? left === right : left !== right
-  }
-  return Boolean(evaluateTemplateValue(trimmed, context))
-}
-
-function evaluateTemplateValue(expression: string, context: TemplateContext): unknown {
-  const trimmed = stripOuterParens(expression.trim())
-  const plusParts = splitOutsideQuotes(trimmed, '+')
-  if (plusParts.length > 1) {
-    return plusParts
-      .map((part) => stringifyTemplateValue(evaluateTemplateValue(part, context)))
-      .join('')
-  }
-  const filtered = splitOutsideQuotes(trimmed, '|')[0]?.trim() ?? ''
-  if (isQuotedString(filtered)) return parseTemplateString(filtered)
-  if (filtered === 'true' || filtered === 'True') return true
-  if (filtered === 'false' || filtered === 'False') return false
-  if (filtered === 'none' || filtered === 'None' || filtered === 'null') return null
-  if (/^-?\d+(\.\d+)?$/u.test(filtered)) return Number(filtered)
-  return resolveTemplatePath(filtered, context)
-}
-
-function splitByBooleanOperator(expression: string, operator: 'and' | 'or'): string[] {
-  const parts: string[] = []
-  let quote: string | null = null
-  let depth = 0
-  let start = 0
-  for (let index = 0; index < expression.length; index += 1) {
-    const char = expression[index]
-    if (!char) continue
+): { readonly value: string; readonly next: number } {
+  let index = start
+  let bracketDepth = 0
+  let quote: '"' | "'" | null = null
+  while (index < source.length) {
+    const char = source[index]
+    if (!char) break
     if (quote) {
-      if (char === '\\') index += 1
-      else if (char === quote) quote = null
+      if (char === '\\') index += 2
+      else {
+        if (char === quote) quote = null
+        index += 1
+      }
       continue
     }
-    if (char === '"' || char === "'") {
+    if (bracketDepth > 0 && (char === '"' || char === "'")) {
       quote = char
+      index += 1
       continue
     }
-    if (char === '(') depth += 1
-    else if (char === ')') depth -= 1
-    if (depth !== 0) continue
-    if (matchesWordAt(expression, operator, index)) {
-      parts.push(expression.slice(start, index).trim())
-      start = index + operator.length
-      index = start - 1
-    }
-  }
-  if (parts.length === 0) return [expression]
-  parts.push(expression.slice(start).trim())
-  return parts
-}
-
-function matchesWordAt(source: string, word: string, index: number): boolean {
-  if (source.slice(index, index + word.length) !== word) return false
-  const before = source[index - 1]
-  const after = source[index + word.length]
-  return !isWordChar(before) && !isWordChar(after)
-}
-
-function isWordChar(value: string | undefined): boolean {
-  return value !== undefined && /[A-Za-z0-9_]/u.test(value)
-}
-
-function splitComparison(
-  expression: string,
-): { left: string; operator: '==' | '!='; right: string } | null {
-  const neq = findOperatorOutsideQuotes(expression, '!=')
-  if (neq >= 0) {
-    return {
-      left: expression.slice(0, neq).trim(),
-      operator: '!=',
-      right: expression.slice(neq + 2).trim(),
-    }
-  }
-  const eq = findOperatorOutsideQuotes(expression, '==')
-  if (eq >= 0) {
-    return {
-      left: expression.slice(0, eq).trim(),
-      operator: '==',
-      right: expression.slice(eq + 2).trim(),
-    }
-  }
-  return null
-}
-
-function findOperatorOutsideQuotes(expression: string, operator: string): number {
-  let quote: string | null = null
-  for (let index = 0; index <= expression.length - operator.length; index += 1) {
-    const char = expression[index]
-    if (!char) continue
-    if (quote) {
-      if (char === '\\') index += 1
-      else if (char === quote) quote = null
+    if (char === '[') {
+      bracketDepth += 1
+      index += 1
       continue
     }
-    if (char === '"' || char === "'") {
-      quote = char
+    if (char === ']') {
+      bracketDepth = Math.max(0, bracketDepth - 1)
+      index += 1
       continue
     }
-    if (expression.slice(index, index + operator.length) === operator) return index
+    if (
+      bracketDepth === 0 &&
+      (/\s/u.test(char) ||
+        char === '+' ||
+        char === '(' ||
+        char === ')' ||
+        char === '|' ||
+        source.startsWith('==', index) ||
+        source.startsWith('!=', index))
+    ) {
+      break
+    }
+    index += 1
   }
-  return -1
+  return { value: source.slice(start, index), next: index }
 }
 
-function splitOutsideQuotes(expression: string, separator: string): string[] {
-  const parts: string[] = []
-  let quote: string | null = null
-  let start = 0
-  for (let index = 0; index < expression.length; index += 1) {
-    const char = expression[index]
-    if (!char) continue
-    if (quote) {
-      if (char === '\\') index += 1
-      else if (char === quote) quote = null
-      continue
-    }
-    if (char === '"' || char === "'") {
-      quote = char
-      continue
-    }
-    if (char === separator) {
-      parts.push(expression.slice(start, index).trim())
-      start = index + 1
-    }
-  }
-  if (parts.length === 0) return [expression]
-  parts.push(expression.slice(start).trim())
-  return parts
-}
-
-function stripOuterParens(expression: string): string {
-  if (!expression.startsWith('(') || !expression.endsWith(')')) return expression
-  let depth = 0
-  let quote: string | null = null
-  for (let index = 0; index < expression.length; index += 1) {
-    const char = expression[index]
-    if (!char) continue
-    if (quote) {
-      if (char === '\\') index += 1
-      else if (char === quote) quote = null
-      continue
-    }
-    if (char === '"' || char === "'") {
-      quote = char
-    } else if (char === '(') {
-      depth += 1
-    } else if (char === ')') {
-      depth -= 1
-      if (depth === 0 && index < expression.length - 1) return expression
+function parseTemplateOrExpression(parser: TemplateExpressionParser): TemplateExpression {
+  let expression = parseTemplateAndExpression(parser)
+  while (consumeTemplateOperator(parser, 'or')) {
+    expression = {
+      kind: 'boolean',
+      operator: 'or',
+      left: expression,
+      right: parseTemplateAndExpression(parser),
     }
   }
-  return depth === 0 ? expression.slice(1, -1).trim() : expression
-}
-
-function isQuotedString(expression: string): boolean {
-  if (expression.length < 2) return false
-  const first = expression[0]
-  return (first === '"' || first === "'") && expression.at(-1) === first
-}
-
-function parseTemplateString(expression: string): string {
   return expression
-    .slice(1, -1)
-    .replace(/\\n/gu, '\n')
-    .replace(/\\r/gu, '\r')
-    .replace(/\\t/gu, '\t')
-    .replace(/\\"/gu, '"')
-    .replace(/\\'/gu, "'")
-    .replace(/\\\\/gu, '\\')
 }
 
-function resolveTemplatePath(path: string, context: TemplateContext): unknown {
+function parseTemplateAndExpression(parser: TemplateExpressionParser): TemplateExpression {
+  let expression = parseTemplateNotExpression(parser)
+  while (consumeTemplateOperator(parser, 'and')) {
+    expression = {
+      kind: 'boolean',
+      operator: 'and',
+      left: expression,
+      right: parseTemplateNotExpression(parser),
+    }
+  }
+  return expression
+}
+
+function parseTemplateNotExpression(parser: TemplateExpressionParser): TemplateExpression {
+  if (consumeTemplateOperator(parser, 'not')) {
+    return { kind: 'not', value: parseTemplateNotExpression(parser) }
+  }
+  return parseTemplateComparisonExpression(parser)
+}
+
+function parseTemplateComparisonExpression(parser: TemplateExpressionParser): TemplateExpression {
+  const left = parseTemplateConcatExpression(parser)
+  const operator = peekTemplateOperator(parser)
+  if (operator !== '==' && operator !== '!=') return left
+  parser.index += 1
+  return {
+    kind: 'compare',
+    operator,
+    left,
+    right: parseTemplateConcatExpression(parser),
+  }
+}
+
+function parseTemplateConcatExpression(parser: TemplateExpressionParser): TemplateExpression {
+  const values = [parseTemplatePrimaryExpression(parser)]
+  while (consumeTemplateOperator(parser, '+')) {
+    values.push(parseTemplatePrimaryExpression(parser))
+  }
+  return values.length === 1 ? (values[0] as TemplateExpression) : { kind: 'concat', values }
+}
+
+function parseTemplatePrimaryExpression(parser: TemplateExpressionParser): TemplateExpression {
+  if (consumeTemplateOperator(parser, '(')) {
+    const expression = parseTemplateOrExpression(parser)
+    consumeTemplateOperator(parser, ')')
+    return expression
+  }
+  const token = parser.tokens[parser.index]
+  if (!token) return { kind: 'literal', value: '' }
+  parser.index += 1
+  if (token.kind === 'string' || token.kind === 'number') {
+    return { kind: 'literal', value: token.value }
+  }
+  if (token.kind === 'atom') {
+    if (token.value === 'true' || token.value === 'True') return { kind: 'literal', value: true }
+    if (token.value === 'false' || token.value === 'False') return { kind: 'literal', value: false }
+    if (token.value === 'none' || token.value === 'None' || token.value === 'null') {
+      return { kind: 'literal', value: null }
+    }
+    return compileTemplatePath(token.value, parser.scope)
+  }
+  return { kind: 'literal', value: '' }
+}
+
+function consumeTemplateOperator(
+  parser: TemplateExpressionParser,
+  operator: Extract<TemplateExpressionToken, { kind: 'operator' }>['value'],
+): boolean {
+  if (peekTemplateOperator(parser) !== operator) return false
+  parser.index += 1
+  return true
+}
+
+function peekTemplateOperator(
+  parser: TemplateExpressionParser,
+): Extract<TemplateExpressionToken, { kind: 'operator' }>['value'] | undefined {
+  const token = parser.tokens[parser.index]
+  return token?.kind === 'operator' ? token.value : undefined
+}
+
+function evaluateTemplateExpression(
+  expression: TemplateExpression,
+  context: TemplateContext,
+): unknown {
+  if (expression.kind === 'literal') return expression.value
+  if (expression.kind === 'path') return resolveTemplatePath(expression, context)
+  if (expression.kind === 'not') {
+    return !comparableTemplateValue(evaluateTemplateExpression(expression.value, context))
+  }
+  if (expression.kind === 'boolean') {
+    const left = Boolean(
+      comparableTemplateValue(evaluateTemplateExpression(expression.left, context)),
+    )
+    if (expression.operator === 'and') {
+      return (
+        left &&
+        Boolean(comparableTemplateValue(evaluateTemplateExpression(expression.right, context)))
+      )
+    }
+    return (
+      left ||
+      Boolean(comparableTemplateValue(evaluateTemplateExpression(expression.right, context)))
+    )
+  }
+  if (expression.kind === 'compare') {
+    const left = comparableTemplateValue(evaluateTemplateExpression(expression.left, context))
+    const right = comparableTemplateValue(evaluateTemplateExpression(expression.right, context))
+    return expression.operator === '==' ? left === right : left !== right
+  }
+  const writer: TemplateOutputWriter = { parts: [], reasoningCarryForward: 'none' }
+  appendTemplateExpression(expression, context, writer)
+  return templateStringValue(writer.parts.join(''), writer.reasoningCarryForward)
+}
+
+function compileTemplatePath(
+  path: string,
+  scope: TemplateCompilerScope,
+): Extract<TemplateExpression, { kind: 'path' }> {
   const normalized = path.replace(/\[['"]([^'"]+)['"]\]/gu, '.$1').replace(/\[(\d+)\]/gu, '.$1')
-  const parts = normalized.split('.').filter((part) => part.length > 0)
-  if (parts.length === 0) return ''
-  const root = parts[0]
-  if (!root) return ''
+  const [root = '', ...parts] = normalized.split('.').filter((part) => part.length > 0)
+  if (root === 'messages') return { kind: 'path', root: 'messages', parts }
+  if (root === 'add_generation_prompt') {
+    return { kind: 'path', root: 'add-generation-prompt', parts }
+  }
+  if (root === 'bos_token') return { kind: 'path', root: 'bos-token', parts }
+  if (root === 'eos_token') return { kind: 'path', root: 'eos-token', parts }
+  if (root === 'loop') return { kind: 'path', root: 'loop', parts }
+  const slots = scope.variableSlots.get(root)
+  const variableSlot = slots?.at(-1)
+  return variableSlot === undefined
+    ? { kind: 'path', root: 'unknown', parts }
+    : { kind: 'path', root: 'variable', variableSlot, parts }
+}
+
+function resolveTemplatePath(
+  expression: Extract<TemplateExpression, { kind: 'path' }>,
+  context: TemplateContext,
+): unknown {
   let current: unknown
-  if (root === 'messages') current = context.messages
-  else if (root === 'add_generation_prompt') current = context.add_generation_prompt
-  else if (root === 'bos_token') current = context.bos_token
-  else if (root === 'eos_token') current = context.eos_token
-  else if (root === 'loop') current = context.loop
-  else current = context.vars[root]
-  for (const part of parts.slice(1)) {
+  if (expression.root === 'messages') current = context.messages
+  else if (expression.root === 'add-generation-prompt') current = context.add_generation_prompt
+  else if (expression.root === 'bos-token') current = context.bos_token
+  else if (expression.root === 'eos-token') current = context.eos_token
+  else if (expression.root === 'loop') current = context.loops.at(-1)
+  else if (expression.root === 'variable')
+    current = context.variables[expression.variableSlot ?? -1]
+  else return ''
+  for (const part of expression.parts) {
     if (current === null || current === undefined) return ''
     if (Array.isArray(current) && /^\d+$/u.test(part)) {
       current = current[Number(part)]
     } else if (typeof current === 'object') {
-      current = (current as Record<string, unknown>)[part]
+      const record = current as Record<string, unknown>
+      current =
+        part === 'content' && isProjectedTemplateMessage(record)
+          ? templateStringValue(record.content, record.reasoningCarryForward)
+          : record[part]
     } else {
       return ''
     }
@@ -1007,11 +1373,51 @@ function resolveTemplatePath(path: string, context: TemplateContext): unknown {
   return current
 }
 
+function appendTemplateExpression(
+  expression: TemplateExpression,
+  context: TemplateContext,
+  writer: TemplateOutputWriter,
+): void {
+  if (expression.kind === 'concat') {
+    for (const value of expression.values) appendTemplateExpression(value, context, writer)
+    return
+  }
+  appendTemplateValue(evaluateTemplateExpression(expression, context), writer)
+}
+
+function appendTemplateValue(value: unknown, writer: TemplateOutputWriter): void {
+  writer.parts.push(stringifyTemplateValue(value))
+  writer.reasoningCarryForward = mergeSealedReasoningCarryForward(
+    writer.reasoningCarryForward,
+    reasoningCarryForwardForTemplateValue(value),
+  )
+}
+
+function isProjectedTemplateMessage(
+  value: Record<string, unknown>,
+): value is Record<string, unknown> & Pick<TextPromptMessage, 'content' | 'reasoningCarryForward'> {
+  return (
+    typeof value.content === 'string' &&
+    (value.reasoningCarryForward === 'none' ||
+      value.reasoningCarryForward === 'visible-only' ||
+      value.reasoningCarryForward === 'carrier')
+  )
+}
+
 function stringifyTemplateValue(value: unknown): string {
+  if (isTemplateStringValue(value)) return value.text
   if (value === null || value === undefined || value === false) return ''
   if (typeof value === 'string') return value
   if (typeof value === 'number' || typeof value === 'boolean') return String(value)
   return ''
+}
+
+function reasoningCarryForwardForTemplateValue(value: unknown): SealedReasoningCarryForward {
+  return isTemplateStringValue(value) ? value.reasoningCarryForward : 'none'
+}
+
+function comparableTemplateValue(value: unknown): unknown {
+  return isTemplateStringValue(value) ? value.text : value
 }
 
 function isPlainContinuationTemplate(template: TextTemplateConfig): boolean {
@@ -1027,61 +1433,42 @@ function isPlainContinuationTemplate(template: TextTemplateConfig): boolean {
   )
 }
 
-function assistantTextForPrompt(msg: Message, visibleText: string, settings: ChatSettings): string {
-  const think = reasoningThinkBlockForMessage(msg, settings)
-  if (!think) return visibleText
-  return visibleText.length > 0 ? `${think}\n\n${visibleText}` : think
-}
-
-function reasoningThinkBlockForMessage(msg: Message, settings: ChatSettings): string | null {
-  if (!msg.reasoningDetails || msg.reasoningDetails.length === 0) return null
-  const kept = filterReasoningForInclude(
-    msg.reasoningDetails,
-    settings.reasoning.include,
-    undefined,
+function assistantTextForPrompt(
+  msg: Message,
+  visibleText: string,
+  providerOutput: AttemptProviderOutputContract,
+  includeToolCalls: boolean,
+  rewrittenReasoningCarryForward: SealedReasoningCarryForward,
+  reasoningResolver: OutboundReasoningResolver,
+): { text: string; reasoningCarryForward: SealedReasoningCarryForward } {
+  const appliedView = createAppliedMessageView(msg)
+  const reasoningProjection = reasoningThinkBlockForMessage(msg, reasoningResolver)
+  const toolContext = renderProviderOutputContextFallback(
+    projectProviderOutputForContext(appliedView, providerOutput, {
+      includeToolCalls,
+    }),
   )
-  const ordered = kept
-    .map((detail, position) => ({ detail, position }))
-    .sort((left, right) => {
-      const li = left.detail.index ?? left.position
-      const ri = right.detail.index ?? right.position
-      return li - ri || left.position - right.position
-    })
-    .map((row) => row.detail)
-  const parts: string[] = []
-  for (const detail of ordered) {
-    const text = reasoningDetailPlainText(detail)
-    if (text.length > 0) parts.push(text)
+  return {
+    text: [reasoningProjection.text, visibleText, toolContext]
+      .filter((part): part is string => Boolean(part))
+      .join('\n\n'),
+    reasoningCarryForward: mergeSealedReasoningCarryForward(
+      reasoningProjection.reasoningCarryForward,
+      visibleText.length > 0 ? rewrittenReasoningCarryForward : 'none',
+    ),
   }
-  if (parts.length === 0) return null
-  return `<think>\n${parts.join('\n\n')}\n</think>`
 }
 
-function reasoningDetailPlainText(detail: ReasoningDetail): string {
-  if (detail.type === 'reasoning.summary') return normalizeThinkPayload(detail.summary)
-  if (detail.type === 'reasoning.text') return normalizeThinkPayload(detail.text ?? '')
-  return ''
-}
-
-function normalizeThinkPayload(value: string): string {
-  let text = value.trim()
-  let changed = true
-  while (changed) {
-    const before = text
-    text = text
-      .replace(/^<think>\s*/iu, '')
-      .replace(/\s*<\/think>$/iu, '')
-      .replace(/^<thought>\s*/iu, '')
-      .replace(/\s*<\/thought>$/iu, '')
-      .trim()
-    changed = text !== before
+function reasoningThinkBlockForMessage(
+  message: Message,
+  reasoningResolver: OutboundReasoningResolver,
+): { text: string | null; reasoningCarryForward: SealedReasoningCarryForward } {
+  const compiled = reasoningResolver.compilationFor(message)
+  if (compiled.kind !== 'text') throw new Error(`ReasoningRouteMismatch:text:${message.id}`)
+  return {
+    text: compiled.inline,
+    reasoningCarryForward: compiled.reasoningCarryForward,
   }
-  return text
-    .replace(/<think>/giu, '<think >')
-    .replace(/<\/think>/giu, '</think >')
-    .replace(/<thought>/giu, '<thought >')
-    .replace(/<\/thought>/giu, '</thought >')
-    .trim()
 }
 
 function extractMessageText(msg: Message): string {

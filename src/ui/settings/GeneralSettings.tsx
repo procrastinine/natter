@@ -4,21 +4,30 @@
 // refactor — they're no longer workspace-global.
 
 import { useCallback } from 'react'
+import { workspaceConfigurationWriteInteraction } from '../../app/presentation-interactions'
 import {
+  AUTO_SCROLL_STREAM_KEY,
+  CORS_PROXY_SECRET_KEY,
+  CORS_PROXY_URL_KEY,
   DEFAULT_GLOBAL_PREFERENCES,
   DEV_CORS_PROXY_URL,
   defaultCorsProxyUrlForRuntime,
-  readGlobalPreferences,
+  SEND_SHORTCUT_KEY,
   type SendShortcut,
+  TOKEN_CALIBRATION_MODE_KEY,
   type TokenCalibrationMode,
+} from '../../core/global-settings'
+import { useConfigurationPreferences } from '../../hooks/useConfigurationPreferences'
+import { usePresentationInteraction } from '../../hooks/usePresentationInteraction'
+import { useSettledConfigurationEdit } from '../../hooks/useSettledConfigurationEdit'
+import { configurationController } from '../../store/configuration-controller'
+import {
   writeAutoScrollOnStream,
   writeCorsProxySecret,
   writeCorsProxyUrl,
   writeSendShortcut,
   writeTokenCalibrationMode,
-} from '../../core/global-settings'
-import { GLOBAL_PREFERENCES_DEPENDENCIES } from '../../store/reactive-dependencies'
-import { useRepositoryQuery } from '../../store/reactive-query'
+} from '../../store/preferences-application'
 import { InfoDisclosure } from './InfoDisclosure'
 
 const SHORTCUT_OPTIONS: ReadonlyArray<{ value: SendShortcut; label: string }> = [
@@ -49,32 +58,52 @@ const CALIBRATION_MODE_OPTIONS: ReadonlyArray<{
 ]
 
 export function GeneralSettings() {
-  const prefs = useRepositoryQuery(
-    'global-preferences',
-    readGlobalPreferences,
-    DEFAULT_GLOBAL_PREFERENCES,
-    GLOBAL_PREFERENCES_DEPENDENCIES,
+  const { run: runWorkspaceConfigurationWrite } = usePresentationInteraction(
+    workspaceConfigurationWriteInteraction,
+    { observePending: false },
   )
-  const onShortcut = useCallback(async (value: SendShortcut) => {
-    await writeSendShortcut(value)
-  }, [])
-  const onAutoScrollOnStream = useCallback(async (value: boolean) => {
-    await writeAutoScrollOnStream(value)
-  }, [])
-  const onTokenCalibrationMode = useCallback(async (value: TokenCalibrationMode) => {
-    await writeTokenCalibrationMode(value)
-  }, [])
-  const onCorsProxyUrl = useCallback(async (value: string) => {
-    await writeCorsProxyUrl(value)
-  }, [])
-  const onCorsProxySecret = useCallback(async (value: string) => {
-    await writeCorsProxySecret(value)
-  }, [])
+  const prefs = useConfigurationPreferences()?.global ?? DEFAULT_GLOBAL_PREFERENCES
+  const onShortcut = useCallback(
+    (value: SendShortcut) =>
+      runWorkspaceConfigurationWrite({
+        target: SEND_SHORTCUT_KEY,
+        action: () => writeSendShortcut(value),
+      }),
+    [runWorkspaceConfigurationWrite],
+  )
+  const onAutoScrollOnStream = useCallback(
+    (value: boolean) =>
+      runWorkspaceConfigurationWrite({
+        target: AUTO_SCROLL_STREAM_KEY,
+        action: () => writeAutoScrollOnStream(value),
+      }),
+    [runWorkspaceConfigurationWrite],
+  )
+  const onTokenCalibrationMode = useCallback(
+    (value: TokenCalibrationMode) =>
+      runWorkspaceConfigurationWrite({
+        target: TOKEN_CALIBRATION_MODE_KEY,
+        action: () => writeTokenCalibrationMode(value),
+      }),
+    [runWorkspaceConfigurationWrite],
+  )
+  const corsProxyUrl = useSettledConfigurationEdit({
+    fieldKey: CORS_PROXY_URL_KEY,
+    storedValue: prefs.corsProxyUrl,
+    stage: (value) => configurationController.stageWorkspaceSetting(CORS_PROXY_URL_KEY, value),
+    commit: writeCorsProxyUrl,
+  })
+  const corsProxySecret = useSettledConfigurationEdit({
+    fieldKey: CORS_PROXY_SECRET_KEY,
+    storedValue: prefs.corsProxySecret,
+    stage: (value) => configurationController.stageWorkspaceSetting(CORS_PROXY_SECRET_KEY, value),
+    commit: writeCorsProxySecret,
+  })
 
   // `/_or_scrape` is a Vite dev-server rewrite — the compiled bundle
   // has no route for it, so it is only the default in `pnpm dev`.
   const isDev = import.meta.env.DEV
-  const trimmedProxyUrl = prefs.corsProxyUrl.trim()
+  const trimmedProxyUrl = corsProxyUrl.value.trim()
   const proxyDisabled = trimmedProxyUrl.length === 0 && !isDev
   const proxyIsRelative = trimmedProxyUrl.length > 0 && trimmedProxyUrl.startsWith('/')
   const showDevDefaultWarning = proxyIsRelative && !isDev
@@ -191,8 +220,9 @@ export function GeneralSettings() {
             inputMode="url"
             spellCheck={false}
             placeholder={proxyPlaceholder}
-            value={prefs.corsProxyUrl}
-            onChange={(e) => void onCorsProxyUrl(e.target.value)}
+            value={corsProxyUrl.value}
+            onChange={(e) => corsProxyUrl.setValue(e.target.value)}
+            onBlur={corsProxyUrl.onBlur}
             aria-invalid={showDevDefaultWarning}
           />
           {showDevDefaultWarning ? (
@@ -223,8 +253,9 @@ export function GeneralSettings() {
             autoComplete="off"
             spellCheck={false}
             placeholder="X-Proxy-Secret value"
-            value={prefs.corsProxySecret}
-            onChange={(e) => void onCorsProxySecret(e.target.value)}
+            value={corsProxySecret.value}
+            onChange={(e) => corsProxySecret.setValue(e.target.value)}
+            onBlur={corsProxySecret.onBlur}
           />
         </div>
       </div>

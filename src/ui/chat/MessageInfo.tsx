@@ -1,19 +1,20 @@
-import { useState } from 'react'
-import { normalizeReasoningDetails } from '../../core/reasoning'
+import {
+  type AppliedMessageView,
+  createAppliedMessageView,
+  projectAppliedMessageReasoningPresentation,
+} from '../../core/continuation-content'
+import type { ReasoningPresentation } from '../../core/reasoning-envelope'
 import {
   messageTextCharCount,
   RATIO_BOUNDS,
   tokenizerFamilyForModel,
 } from '../../core/token-calibration'
-import type {
-  GenerationMeta,
-  GenerationServerToolCall,
-  Message as MessageRow,
-  ReasoningDetail,
-} from '../../core/types'
+import type { GenerationServerToolCall, Message as MessageRow } from '../../core/types'
 
 interface MessageInfoProps {
   message: MessageRow
+  appliedView?: AppliedMessageView
+  reasoningPresentation?: ReasoningPresentation
   // Set to true when the previous message on the active path was a user
   // message that got edited after this assistant was generated — the
   // factual-record (tokens, cost, text) is still the original but the
@@ -26,12 +27,19 @@ interface MessageInfoProps {
 // Detail panel revealed via the ⓘ button on each message. Contains the
 // metadata previously dumped as always-visible chips (model, timestamps,
 // token breakdown, cost). Quiet two-column layout, no badges.
-export function MessageInfo({ message, staleReplyHint }: MessageInfoProps) {
-  const gen = message.generation
+export function MessageInfo({
+  message,
+  appliedView,
+  reasoningPresentation,
+  staleReplyHint,
+}: MessageInfoProps) {
+  const view = appliedView ?? createAppliedMessageView(message)
+  const gen = view.latestAttempt.metadata
+  const rootGeneration =
+    view.latestAttempt.kind === 'generation' ? view.latestAttempt.metadata : undefined
   const usage = gen?.usage
-  const normalizedReasoning = normalizeReasoningDetails(message.reasoningDetails ?? []).filter(
-    (detail) => !detail.id?.startsWith('tool_'),
-  )
+  const presentedReasoning =
+    reasoningPresentation ?? projectAppliedMessageReasoningPresentation(view)
   const start = gen?.startedAt
   const end = gen?.finishedAt
   const elapsedSec =
@@ -43,6 +51,7 @@ export function MessageInfo({ message, staleReplyHint }: MessageInfoProps) {
     elapsedSec && elapsedSec > 0 && completionTokens ? completionTokens / elapsedSec : undefined
   const rows: Array<[string, React.ReactNode]> = []
   rows.push(['Created', new Date(message.createdAt).toLocaleString()])
+  if (view.latestAttempt.kind === 'continuation') rows.push(['Attempt', 'Continued response'])
   if (message.editedAt) {
     rows.push([
       'Edited',
@@ -70,10 +79,10 @@ export function MessageInfo({ message, staleReplyHint }: MessageInfoProps) {
   if (gen?.provider) {
     rows.push(['Provider', gen.provider])
   }
-  if (gen?.requestedModels && gen.requestedModels.length > 1) {
+  if (rootGeneration?.requestedModels && rootGeneration.requestedModels.length > 1) {
     // Fallback chain was consulted — e.g. requested [gpt-5.4, gpt-5.4-mini].
     // Show the full chain so the user can see where the cascade landed.
-    rows.push(['Fallback chain', gen.requestedModels.join(' → ')])
+    rows.push(['Fallback chain', rootGeneration.requestedModels.join(' → ')])
   }
   if (usage?.prompt_tokens !== undefined) {
     rows.push(['Prompt tokens', usage.prompt_tokens.toLocaleString()])
@@ -83,7 +92,7 @@ export function MessageInfo({ message, staleReplyHint }: MessageInfoProps) {
   }
   const reasoningTok = usage?.completion_tokens_details?.reasoning_tokens
   const hasReasoningBreakout =
-    (typeof reasoningTok === 'number' && reasoningTok > 0) || normalizedReasoning.length > 0
+    (typeof reasoningTok === 'number' && reasoningTok > 0) || presentedReasoning.hasReasoning
   const answerTokens =
     hasReasoningBreakout && usage?.completion_tokens !== undefined && reasoningTok !== undefined
       ? Math.max(0, usage.completion_tokens - reasoningTok)
@@ -94,9 +103,10 @@ export function MessageInfo({ message, staleReplyHint }: MessageInfoProps) {
   if (reasoningTok) {
     rows.push(['Reasoning tokens', reasoningTok.toLocaleString()])
   } else {
-    const reasoningChars = summarizeReasoningChars(normalizedReasoning)
-    if (reasoningChars.total > 0) {
-      rows.push(['Reasoning chars', formatReasoningChars(reasoningChars)])
+    const reasoningChars =
+      presentedReasoning.visibleCharCount + presentedReasoning.preservedCarrierBytes
+    if (reasoningChars > 0) {
+      rows.push(['Reasoning chars', formatReasoningChars(presentedReasoning)])
     }
   }
   const cachedTok = usage?.prompt_tokens_details?.cached_tokens
@@ -162,11 +172,14 @@ export function MessageInfo({ message, staleReplyHint }: MessageInfoProps) {
   if (gen?.apiUsed) {
     rows.push(['API', gen.apiUsed])
   }
-  if (gen?.delivery) {
-    rows.push(['Delivery', gen.delivery])
+  if (rootGeneration?.delivery) {
+    rows.push(['Delivery', rootGeneration.delivery])
   }
-  if (gen?.serverTools && gen.serverTools.length > 0) {
-    rows.push(['Tool calls', <ServerToolCalls key="tool-calls" tools={gen.serverTools} />])
+  if (rootGeneration?.serverTools && rootGeneration.serverTools.length > 0) {
+    rows.push([
+      'Tool calls',
+      <ServerToolCalls key="tool-calls" tools={rootGeneration.serverTools} />,
+    ])
   }
   if (staleReplyHint) {
     rows.push(['Note', 'Previous user message was edited after this reply — text may be stale.'])
@@ -194,18 +207,7 @@ function ServerToolCalls({ tools }: { tools: readonly GenerationServerToolCall[]
 }
 
 function ServerToolCall({ tool }: { tool: GenerationServerToolCall }) {
-  const [open, setOpen] = useState(false)
-  return (
-    <details
-      data-ui="tool-call"
-      onToggle={(event) => {
-        setOpen(event.currentTarget.open)
-      }}
-    >
-      <summary>{serverToolSummary(tool)}</summary>
-      {open ? <pre>{formatServerToolOutput(tool)}</pre> : null}
-    </details>
-  )
+  return <div data-ui="tool-call">{serverToolSummary(tool)}</div>
 }
 
 function serverToolSummary(tool: GenerationServerToolCall): string {
@@ -243,44 +245,23 @@ function serverToolLabel(type: string): string {
   return type
 }
 
-function formatServerToolOutput(tool: GenerationServerToolCall): string {
-  const payload = tool.output ?? tool
-  try {
-    return JSON.stringify(payload, null, 2)
-  } catch {
-    return '[unserializable server tool output]'
-  }
-}
-
-function summarizeReasoningChars(details: ReasoningDetail[]): {
-  text: number
-  summary: number
-  encrypted: number
-  total: number
-} {
-  let text = 0
-  let summary = 0
-  let encrypted = 0
-  for (const detail of normalizeReasoningDetails(details)) {
-    if (detail.type === 'reasoning.text') text += detail.text?.length ?? 0
-    else if (detail.type === 'reasoning.summary') summary += detail.summary.length
-    else encrypted += detail.data.length
-  }
-  return { text, summary, encrypted, total: text + summary + encrypted }
-}
-
-function formatReasoningChars(counts: {
-  text: number
-  summary: number
-  encrypted: number
-  total: number
-}): string {
+function formatReasoningChars(presentation: ReasoningPresentation): string {
+  const total = presentation.visibleCharCount + presentation.preservedCarrierBytes
   const parts: string[] = []
-  if (counts.text > 0) parts.push(`text ${counts.text.toLocaleString()}`)
-  if (counts.summary > 0) parts.push(`summary ${counts.summary.toLocaleString()}`)
-  if (counts.encrypted > 0) parts.push(`encrypted ${counts.encrypted.toLocaleString()}`)
-  if (parts.length === 0) return counts.total.toLocaleString()
-  return `${counts.total.toLocaleString()} total (${parts.join(', ')})`
+  if (presentation.textCharCount > 0) {
+    parts.push(`text ${presentation.textCharCount.toLocaleString()}`)
+  }
+  if (presentation.summaryCharCount > 0) {
+    parts.push(`summary ${presentation.summaryCharCount.toLocaleString()}`)
+  }
+  if (presentation.opaqueCarrierBytes > 0) {
+    parts.push(`encrypted ${presentation.opaqueCarrierBytes.toLocaleString()}`)
+  }
+  if (presentation.authenticationCarrierBytes > 0) {
+    parts.push(`signature ${presentation.authenticationCarrierBytes.toLocaleString()}`)
+  }
+  if (parts.length === 0) return total.toLocaleString()
+  return `${total.toLocaleString()} total (${parts.join(', ')})`
 }
 
 // Compute the text-token count to display in MessageInfo. Prefers the
@@ -303,7 +284,16 @@ function computeDisplayTextTokens(message: MessageRow, displayChars: number): nu
   return Math.ceil(displayChars / ratio)
 }
 
-function reasoningTimingRow(gen: GenerationMeta | undefined): [string, string] | null {
+function reasoningTimingRow(
+  gen:
+    | Readonly<{
+        reasoningStartedAt?: number
+        firstTextAt?: number
+        reasoningFinishedAt?: number
+        finishedAt?: number
+      }>
+    | undefined,
+): [string, string] | null {
   if (!gen || gen.reasoningStartedAt === undefined) return null
   const end =
     gen.firstTextAt !== undefined && gen.firstTextAt >= gen.reasoningStartedAt

@@ -1,4 +1,4 @@
-import { expect, test } from './fixtures'
+import { createChatUiJourneyProfile, expect, test } from './fixtures'
 import {
   buildSseBody,
   clearIndexedDb,
@@ -15,7 +15,7 @@ test.beforeEach(async ({ page }) => {
   await seedFirstRun(page)
 })
 
-test('happy path: streamed SSE renders and persists the final row', async ({ page }) => {
+test('happy path: streamed SSE renders and persists the final row', async ({ page, uiJourney }) => {
   await mockChatCompletions(page, {
     body: buildSseBody([
       { id: 'gen-1', model: 'google/gemini-3.1-flash-lite-preview', content: 'Hello' },
@@ -33,9 +33,20 @@ test('happy path: streamed SSE renders and persists the final row', async ({ pag
     headers: { 'x-generation-id': 'gen-1' },
   })
   await createChatAndOpen(page)
-  await sendMessage(page, 'say hi')
+  await uiJourney.start(page, createChatUiJourneyProfile({ chatHeader: false }), 'send-flow')
+  await page.locator('[data-ui="composer-input"]').fill('say hi')
+  await expect(page.locator('[data-ui="send"]')).toBeEnabled()
+  await uiJourney.intent(page, {
+    kind: 'gesture',
+    id: 'send-message',
+    targetSelector: '[data-ui="send"]',
+    expectedRoute: { kind: 'includes', value: '/message/' },
+    outcome: { selector: '[data-ui="message"][data-role="assistant"]' },
+  })
+  await page.locator('[data-ui="send"]').click()
   const assistant = page.locator('[data-ui="message"][data-role="assistant"]').first()
   await expect(assistant.locator('[data-ui="message-body"]')).toHaveText('Hello world')
+  await uiJourney.checkpoint(page, 'assistant-finished')
 
   const chatId = await firstChatId(page)
   const rows = await readMessages(page, chatId)
@@ -48,6 +59,35 @@ test('happy path: streamed SSE renders and persists the final row', async ({ pag
   expect(assistantRow.generation.finishReason).toBe('stop')
   expect(assistantRow.generation.usage.total_tokens).toBe(5)
   expect(assistantRow.generation.cost).toBeCloseTo(0.00001)
+})
+
+test('a second send from a non-root leaf persists through Chromium compound-index ranges', async ({
+  page,
+}) => {
+  let turn = 0
+  await page.route('**/api/v1/chat/completions', async (route) => {
+    turn += 1
+    await route.fulfill({
+      contentType: 'text/event-stream',
+      body: buildSseBody([
+        { id: `compound-range-${turn}`, content: `reply ${turn}`, finish: 'stop' },
+      ]),
+    })
+  })
+  await createChatAndOpen(page)
+  await sendMessage(page, 'first turn')
+  await expect(
+    page.locator('[data-ui="message"][data-role="assistant"] [data-ui="message-body"]').first(),
+  ).toHaveText('reply 1')
+
+  await sendMessage(page, 'second turn')
+  await expect(
+    page.locator('[data-ui="message"][data-role="assistant"] [data-ui="message-body"]').nth(1),
+  ).toHaveText('reply 2')
+
+  const chatId = await firstChatId(page)
+  const rows = await readMessages(page, chatId)
+  expect(rows.map((row) => row.role)).toEqual(['user', 'assistant', 'user', 'assistant'])
 })
 
 test('delayed stream start keeps the sent turn visible before first bytes arrive', async ({
@@ -206,19 +246,9 @@ test('network drop mid-stream persists partial text + abortReason=network + Cont
   expect(typeof assistantRow.generation.finishedAt).toBe('number')
 })
 
-test('malformed SSE JSON warns once while valid output completes cleanly', async ({
+test('malformed SSE JSON records degraded integrity while valid output completes', async ({
   page,
-  expectRuntimeDiagnostic,
 }) => {
-  expectRuntimeDiagnostic({
-    category: 'console-other',
-    source: 'console',
-    level: 'warning',
-    message:
-      '^chatCompletions: invalid SSE frame skipped \\{eventType: message, characterCount: 10, fingerprint: fnv1a32:d7b44597, error: Object\\}$',
-    count: 1,
-  })
-
   const body = [
     'data: {"id":"g1","choices":[{"delta":{"content":"A"}}]}',
     '',

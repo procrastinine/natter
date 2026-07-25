@@ -1,19 +1,24 @@
+import { useVirtualizer } from '@tanstack/react-virtual'
 import {
   type ChangeEvent,
-  Fragment,
-  type MouseEvent,
+  lazy,
   type ReactNode,
+  Suspense,
   useCallback,
+  useDeferredValue,
   useEffect,
   useMemo,
   useRef,
   useState,
 } from 'react'
+import {
+  attachmentMutationTarget,
+  definePresentationInteraction,
+} from '../../app/presentation-interactions'
 import type { StorageRoute } from '../../app/router'
 import {
   attachmentHref,
   beginRouteIntent,
-  beginWorkspaceReplacementRouteIntent,
   cancelRouteIntent,
   chatHref,
   isRouteIntentCurrent,
@@ -22,152 +27,112 @@ import {
   navigateForIntent,
   storageHref,
 } from '../../app/router'
-import {
-  exportLastUpdatedChatAsTxt,
-  exportLastUpdatedChatsAsZip,
-  triggerBrowserBlobDownload,
-  triggerBrowserDownload,
-} from '../../core/chat-export'
-import {
-  DEFAULT_SIDEBAR_SORT_MODE,
-  SIDEBAR_SORT_OPTIONS,
-  type SidebarSortMode,
-  sidebarSortDirection,
-  sidebarSortField,
-  sidebarSortOption,
-} from '../../core/sidebar-sort'
-import {
-  aggregateCalibrationSamples,
-  readTokenCalibrationGlobal,
-} from '../../core/token-calibration'
+import { isWorkspaceReplacementRecoveryRequiredError } from '../../core/import-export/errors'
 import type {
-  Attachment,
   AttachmentBlob,
   AttachmentKind,
-  Chat,
-  ChatFolder,
   ChatId,
   ChatSidebarRow,
-  ChatTag,
-  FolderId,
   MessageId,
-  TagId,
-  TokenCalibrationSample,
 } from '../../core/types'
-import { wipeSiteStorage } from '../../lib/storage-wipe'
+import { usePresentationInteraction } from '../../hooks/usePresentationInteraction'
 import {
-  type AttachmentReferenceRow,
-  batchRelinkAttachmentRefs,
-  deleteReferencedAttachmentBytes,
-  deleteUnreferencedAttachment,
-  detachAttachmentRef,
-  ingestAttachmentBytes,
-  listAttachmentReferenceEdges,
-  listAttachmentReferences,
-  relinkAttachmentRef,
-  replaceAttachmentBytes,
-  restoreMissingAttachment,
-  setAttachmentRefVisibility,
-} from '../../store/attachments'
+  useArchiveCatalogApplication,
+  useAttachmentManagerCatalogApplication,
+  useStorageOverviewCatalogApplication,
+} from '../../hooks/useStorageCatalogApplication'
+import type {
+  AttachmentCatalogRow,
+  AttachmentManagerDetail,
+  AttachmentReferenceRow,
+  PreparedAttachmentBundle,
+  QuotaSnapshot,
+  StorageGlobalCalibrationModel,
+  StorageProbeState,
+  StorageProbeStatus,
+} from '../../store/presentation-contracts'
 import {
-  DEFAULT_SEARCH_FILTERS,
-  hasActiveSearchFilters,
-  type SearchFilters,
-  type SearchResult,
-} from '../../store/chat-search'
-import {
-  archiveChat,
-  clearAllTokenCalibrationEverywhere,
-  clearChatTokenCalibration,
-  clearTokenCalibrationFamilyEverywhere,
-  deleteArchivedChatPermanently,
-  emptyArchivedChats,
-  listChatSidebarRows,
-  listChats,
-  moveChatsToFolder,
-  projectChatSidebarRow,
-  setChatsTagsFromNames,
-  unarchiveChat,
-} from '../../store/chats'
-import { createFolder, listFolders } from '../../store/folders'
-import {
-  exportChat,
-  exportWorkspaceBackup,
-  importChat,
-  restoreWorkspaceBackup,
-} from '../../store/import-export'
-import {
-  estimateQuota,
-  isPersisted,
-  type QuotaSnapshot,
+  probePersisted,
+  probePersistRequest,
+  probeQuota,
   requestNotificationPermissionForStoragePersistence,
-  requestPersist,
   storagePersistenceAvailable,
   storagePersistenceNotificationMayHelp,
 } from '../../store/quota'
-import {
-  allTable,
-  attachmentBundleDependencies,
-  GLOBAL_TOKEN_CALIBRATION_DEPENDENCIES,
-  indexKeys,
-  primaryKeys,
-  SIDEBAR_MODEL_DEPENDENCIES,
-  WORKSPACE_META_DEPENDENCIES,
-} from '../../store/reactive-dependencies'
-import { useRepositoryQuery } from '../../store/reactive-query'
-import { type AttachmentBundle, ChatStreamBusyError } from '../../store/repository'
-import { abortSearchSession, requestSearchSession } from '../../store/search-session'
-import {
-  readSidebarSortMode,
-  SIDEBAR_SORT_SETTING_KEY,
-  writeSidebarSortMode,
-} from '../../store/sidebar-preferences'
-import { listTags } from '../../store/tags'
-import { getWorkspaceRepository } from '../../store/workspace-repository'
-import {
-  orderedSearchResults,
-  startSearchStoreBroadcastListener,
-  useSearchStore,
-} from '../../store/zustand/searchStore'
+import { storageApplication } from '../../store/storage-application'
 import { useToastStore } from '../../store/zustand/toastStore'
 import { AttachmentPicker } from '../attachments/AttachmentPicker'
 import { AttachmentPreview } from '../attachments/AttachmentPreview'
-import { formatBytes, formatDate, kindLabel, shortId, storageLabel } from '../attachments/format'
+import {
+  type AttachmentDisplayRow,
+  formatBytes,
+  formatDate,
+  kindLabel,
+  shortId,
+  storageLabel,
+} from '../attachments/format'
 import {
   ArchiveIcon,
-  ChevronIcon,
   CloseIcon,
   DatabaseIcon,
   DownloadIcon,
   EyeIcon,
   EyeOffIcon,
   FileIcon,
-  FolderIcon,
   MessageSquareIcon,
   SearchIcon,
   SidebarIcon,
-  SortIcon,
-  TagIcon,
   TrashIcon,
   UnarchiveIcon,
   UploadIcon,
 } from '../icons/Icon'
+import { triggerBrowserBlobDownload } from '../import-export/chat-download'
 import {
-  forEachJsonOrZipFile,
   importExportErrorMessage,
+  jsonDocumentBlob,
   natterJsonFilename,
-  natterZipFilename,
   readJsonFile,
-  triggerJsonDownload,
-  triggerJsonZipDownload,
 } from '../import-export/json-file'
 import { Button, IconButton } from '../primitives/Button'
 import { ConfirmDialog } from '../primitives/ConfirmDialog'
-import { isEmptySidebarDraft, sortChats } from '../sidebar/chat-organization'
+import { useVirtualSpacerHeight } from '../primitives/virtual-spacer'
+
+import {
+  displayChatTitle,
+  formatCalibrationRatio,
+  formatInteger,
+  permanentDeleteBlockedMessage,
+  pluralize,
+} from './storage-surface-shared'
+
+const loadStorageChatsSurface = () => import('./StorageChatsSurface')
+const ChatsStorageSurface = lazy(loadStorageChatsSurface)
+
+const storageCalibrationInteraction = definePresentationInteraction<'workspace'>({
+  id: 'storage-calibration.clear',
+  label: 'Clear token calibration',
+  concurrency: 'reject',
+  lifetime: 'workspace-tab',
+  pendingMessage: 'Another calibration update is already in progress.',
+})
+
+const storageArchiveInteraction = definePresentationInteraction<'archive'>({
+  id: 'storage-archive.mutate',
+  label: 'Archive update',
+  concurrency: 'reject',
+  lifetime: 'workspace-tab',
+  pendingMessage: 'Another archive update is already in progress.',
+  describeFailure: (error) => {
+    const blocked = permanentDeleteBlockedMessage(error)
+    if (blocked) return { message: blocked, tone: 'warning' }
+    const message = error instanceof Error ? error.message : 'Unknown error'
+    return { message: `Archive update failed: ${message}`, tone: 'danger' }
+  },
+})
 
 interface StorageViewProps {
   route: StorageRoute
-  onOpenSidebar?: () => void
+  onOpenSidebar: () => void
 }
 
 type ManagerFilter =
@@ -195,65 +160,17 @@ const FILTERS: ManagerFilter[] = [
   'generated',
 ]
 
-interface StorageChatModel {
-  chats: ChatSidebarRow[]
-  folders: ChatFolder[]
-  tags: ChatTag[]
-  calibrations: Map<ChatId, Record<string, TokenCalibrationSample> | undefined>
-}
-
-interface StorageGlobalCalibrationModel {
-  rows: Array<[string, TokenCalibrationSample]>
-}
-
-const EMPTY_STORAGE_CHAT_MODEL: StorageChatModel = {
-  chats: [],
-  folders: [],
-  tags: [],
-  calibrations: new Map(),
-}
-const EMPTY_GLOBAL_CALIBRATION_MODEL: StorageGlobalCalibrationModel = {
-  rows: [],
-}
 const STORAGE_USAGE_DETAIL_LABELS: Record<string, string> = {
   caches: 'Cache API',
+  fileSystem: 'Origin file system',
   indexedDB: 'IndexedDB',
   serviceWorkerRegistrations: 'Service workers',
 }
 
-async function loadStorageChatModel(): Promise<StorageChatModel> {
-  try {
-    const [rows, chats, folders, tags] = await Promise.all([
-      listChatSidebarRows(),
-      listChats(),
-      listFolders(),
-      listTags(),
-    ])
-    return {
-      chats: rows,
-      folders,
-      tags,
-      calibrations: new Map(chats.map((chat) => [chat.id, chat.tokenCalibration])),
-    }
-  } catch (error) {
-    if (error instanceof Error && error.name === 'DatabaseClosedError') {
-      return EMPTY_STORAGE_CHAT_MODEL
-    }
-    throw error
-  }
-}
-
-async function loadStorageGlobalCalibrationModel(): Promise<StorageGlobalCalibrationModel> {
-  const global = await readTokenCalibrationGlobal()
-  return {
-    rows: Object.entries(aggregateCalibrationSamples(global.byModel)).sort(([left], [right]) =>
-      left.localeCompare(right),
-    ),
-  }
-}
-
 export function StorageView({ route, onOpenSidebar }: StorageViewProps) {
   const section = route.section === 'backups' ? 'overview' : route.section
+  const renderedRoute = useDeferredValue(route)
+  const renderedSection = renderedRoute.section === 'backups' ? 'overview' : renderedRoute.section
   return (
     <main data-ui="storage-view">
       <header data-ui="storage-header">
@@ -283,6 +200,9 @@ export function StorageView({ route, onOpenSidebar }: StorageViewProps) {
           <a
             href={storageHref({ section: 'chats' })}
             onClick={makeAnchorClickHandler(storageHref({ section: 'chats' }))}
+            onPointerEnter={() => void loadStorageChatsSurface()}
+            onPointerDown={() => void loadStorageChatsSurface()}
+            onFocus={() => void loadStorageChatsSurface()}
             aria-current={section === 'chats' ? 'page' : undefined}
             aria-label="Chats"
             title="Chats"
@@ -309,35 +229,32 @@ export function StorageView({ route, onOpenSidebar }: StorageViewProps) {
           </a>
         </nav>
       </header>
-      {section === 'overview' ? <StorageOverview /> : null}
-      {section === 'chats' ? <ChatsStorageSurface /> : null}
-      {section === 'attachments' && route.section === 'attachments' ? (
-        <AttachmentManager route={route} />
-      ) : null}
-      {section === 'archive' ? <ArchiveManager /> : null}
+      <Suspense fallback={<section data-ui="storage-surface-loading" aria-busy="true" />}>
+        {renderedSection === 'overview' ? <StorageOverview /> : null}
+        {renderedSection === 'chats' ? <ChatsStorageSurface /> : null}
+        {renderedSection === 'attachments' && renderedRoute.section === 'attachments' ? (
+          <AttachmentManager route={renderedRoute} />
+        ) : null}
+        {renderedSection === 'archive' ? <ArchiveManager /> : null}
+      </Suspense>
     </main>
   )
 }
 
 function StorageOverview() {
   const pushToast = useToastStore((s) => s.push)
-  const chats = useRepositoryQuery('chats:all', () => listChats(), [], allTable('chats'))
-  const attachments = useRepositoryQuery(
-    'manager-attachments:overview',
-    () => listManagerAttachments({ query: '', filter: 'all' }),
-    [],
-    allTable('attachments', 'attachmentArtifacts'),
-  )
-  const workspaceMeta = useRepositoryQuery(
-    'workspace-meta',
-    () => getWorkspaceRepository().getWorkspaceMeta(),
-    null,
-    WORKSPACE_META_DEPENDENCIES,
-  )
-  const [quota, setQuota] = useState<QuotaSnapshot | null>(null)
-  const [persistence, setPersistence] = useState<
-    'checking' | 'unsupported' | 'persistent' | 'best-effort'
-  >(storagePersistenceAvailable() ? 'checking' : 'unsupported')
+  const {
+    chats: chatAggregate,
+    attachments: attachmentAggregate,
+    calibration,
+    workspace: workspaceMeta,
+  } = useStorageOverviewCatalogApplication()
+  const [quotaProbe, setQuotaProbe] = useState<StorageProbeState<QuotaSnapshot>>({
+    status: 'checking',
+  })
+  const [persistenceProbe, setPersistenceProbe] = useState<StorageProbeState<boolean>>({
+    status: 'checking',
+  })
   const [persistenceRequestResult, setPersistenceRequestResult] = useState<
     'granted' | 'denied' | null
   >(null)
@@ -345,62 +262,83 @@ function StorageOverview() {
   const [workspaceTransferBusy, setWorkspaceTransferBusy] = useState<
     'export' | 'import' | 'clear' | null
   >(null)
+  const [workspaceRecoveryRequired, setWorkspaceRecoveryRequired] = useState(false)
   const [workspaceExportConfirmOpen, setWorkspaceExportConfirmOpen] = useState(false)
   const workspaceImportInputRef = useRef<HTMLInputElement | null>(null)
-  const isIndexedDbMode = workspaceMeta?.backendKind === 'browser-idb'
-  const localBytes = attachments.reduce((sum, row) => sum + (row.sizeBytes ?? 0), 0)
+  const workspaceBackendKind = workspaceMeta?.backendKind
+  const isIndexedDbMode = workspaceBackendKind === 'browser-idb'
   useEffect(() => {
-    if (!workspaceMeta) return
+    if (!workspaceBackendKind) {
+      setQuotaProbe({ status: 'checking' })
+      setPersistenceProbe({ status: 'checking' })
+      return
+    }
     if (!isIndexedDbMode) {
-      setQuota(null)
-      setPersistence('unsupported')
+      setQuotaProbe({ status: 'unavailable' })
+      setPersistenceProbe({ status: 'unavailable' })
       setPersistenceRequestResult(null)
       return
     }
     let active = true
-    void Promise.all([
-      estimateQuota(),
-      storagePersistenceAvailable() ? isPersisted() : Promise.resolve(false),
-    ]).then(([quotaSnapshot, persisted]) => {
-      if (!active) return
-      setQuota(quotaSnapshot)
-      setPersistence(
-        storagePersistenceAvailable() ? (persisted ? 'persistent' : 'best-effort') : 'unsupported',
-      )
+    setQuotaProbe({ status: 'checking' })
+    setPersistenceProbe({ status: 'checking' })
+    void probeQuota().then((result) => {
+      if (active) setQuotaProbe(result)
+    })
+    void probePersisted().then((result) => {
+      if (active) setPersistenceProbe(result)
     })
     return () => {
       active = false
     }
-  }, [isIndexedDbMode, workspaceMeta])
+  }, [isIndexedDbMode, workspaceBackendKind])
   const handleRequestPersistence = async () => {
     if (!isIndexedDbMode) {
-      setPersistence('unsupported')
+      setPersistenceProbe({ status: 'unavailable' })
       setPersistenceRequestResult(null)
       return
     }
     if (!storagePersistenceAvailable()) {
-      setPersistence('unsupported')
+      setPersistenceProbe({ status: 'unavailable' })
       setPersistenceRequestResult(null)
       return
     }
     setPersistenceBusy(true)
+    setPersistenceProbe({ status: 'checking' })
+    setPersistenceRequestResult(null)
     try {
       await requestNotificationPermissionForStoragePersistence()
-      const granted = await requestPersist()
-      const persisted = granted || (await isPersisted())
-      setPersistence(persisted ? 'persistent' : 'best-effort')
-      setPersistenceRequestResult(persisted ? 'granted' : 'denied')
-      if (persisted) {
+      const requestResult = await probePersistRequest()
+      const persistedResult =
+        requestResult.status === 'ready' && requestResult.value
+          ? requestResult
+          : await probePersisted()
+      const finalResult =
+        requestResult.status === 'ready' && requestResult.value
+          ? requestResult
+          : persistedResult.status === 'ready' && persistedResult.value
+            ? persistedResult
+            : requestResult.status === 'ready' && persistedResult.status === 'ready'
+              ? requestResult
+              : requestResult.status !== 'ready'
+                ? requestResult
+                : persistedResult
+      setPersistenceProbe(finalResult)
+      if (finalResult.status === 'ready' && finalResult.value) {
+        setPersistenceRequestResult('granted')
         console.info('Natter storage persistence granted for this origin.')
         pushToast({ level: 'success', text: 'Storage persistence granted.' })
-      } else {
+      } else if (finalResult.status === 'ready') {
+        setPersistenceRequestResult('denied')
         console.warn(
           'Natter storage persistence denied by the browser. Chromium grants this only for origins it considers important, such as installed, bookmarked, notification-permitted, or high-engagement sites.',
         )
         pushToast({ level: 'warning', text: 'Browser denied storage persistence.' })
+      } else {
+        pushToast({ level: 'warning', text: 'Storage persistence status unavailable.' })
       }
-      const quotaSnapshot = await estimateQuota()
-      setQuota(quotaSnapshot)
+      setQuotaProbe({ status: 'checking' })
+      void probeQuota().then(setQuotaProbe)
     } finally {
       setPersistenceBusy(false)
     }
@@ -408,8 +346,8 @@ function StorageOverview() {
   const handleExportWorkspace = async () => {
     setWorkspaceTransferBusy('export')
     try {
-      const backup = await exportWorkspaceBackup()
-      triggerJsonDownload(natterJsonFilename('workspace-backup'), backup)
+      const blob = await storageApplication.transfer.exportWorkspaceDocument(jsonDocumentBlob)
+      triggerBrowserBlobDownload(natterJsonFilename('workspace-backup'), blob)
       setWorkspaceExportConfirmOpen(false)
       pushToast({ level: 'success', text: 'Exported workspace backup.', durationMs: 2500 })
     } catch (error) {
@@ -434,11 +372,11 @@ function StorageOverview() {
     ) {
       return
     }
-    const routeIntent = beginWorkspaceReplacementRouteIntent()
+    const routeIntent = beginRouteIntent()
     setWorkspaceTransferBusy('import')
     try {
       const value = await readJsonFile(file)
-      const result = await restoreWorkspaceBackup(value)
+      const result = await storageApplication.transfer.restoreWorkspace(value)
       pushToast({
         level: 'success',
         text: `Imported workspace backup (${result.chatCount} chats).`,
@@ -447,6 +385,9 @@ function StorageOverview() {
       navigateForIntent(routeIntent, storageHref())
     } catch (error) {
       console.error('Failed to import workspace backup', error)
+      if (isWorkspaceReplacementRecoveryRequiredError(error)) {
+        setWorkspaceRecoveryRequired(true)
+      }
       pushToast({
         level: 'danger',
         text: importExportErrorMessage(error),
@@ -459,39 +400,63 @@ function StorageOverview() {
   const handleClearWorkspace = async () => {
     if (
       !window.confirm(
-        'Clear all local Natter data for this browser origin? This removes chats, presets, connections, keys, attachments, local storage, caches, cookies, and service workers, then reloads.',
+        'Clear all local Natter data for this browser origin? This removes chats, presets, connections, keys, attachments, databases, storage buckets, origin-private files, local storage, caches, cookies, and service workers, then reloads.',
       )
     ) {
       return
     }
     setWorkspaceTransferBusy('clear')
     try {
-      await wipeSiteStorage()
+      await storageApplication.storage.clearAll()
     } catch (error) {
       console.error('Failed to clear local workspace data', error)
       pushToast({ level: 'danger', text: importExportErrorMessage(error) })
       setWorkspaceTransferBusy(null)
     }
   }
-  const spaceValue = quota ? `${formatBytes(quota.usage)} / ${formatBytes(quota.quota)}` : 'Unknown'
+  const quota = quotaProbe.status === 'ready' ? quotaProbe.value : null
+  const spaceValue =
+    quotaProbe.status === 'ready'
+      ? `${formatBytes(quotaProbe.value.usage)} / ${formatBytes(quotaProbe.value.quota)}`
+      : quotaProbe.status === 'checking'
+        ? 'Checking'
+        : 'Unavailable'
+  const spaceDetail =
+    quotaProbe.status === 'error'
+      ? quotaProbe.reason === 'timeout'
+        ? 'Browser probe timed out'
+        : 'Browser probe failed'
+      : quotaProbe.status === 'unavailable'
+        ? 'Storage estimate API unavailable'
+        : 'Browser-reported usage / quota'
   const persistenceValue =
     persistenceRequestResult === 'denied'
       ? 'Denied'
-      : persistence === 'persistent'
-        ? 'Persistent'
-        : persistence === 'best-effort'
-          ? 'Best effort'
-          : persistence === 'unsupported'
-            ? 'Unsupported'
+      : persistenceProbe.status === 'ready'
+        ? persistenceProbe.value
+          ? 'Persistent'
+          : 'Best effort'
+        : persistenceProbe.status === 'unavailable'
+          ? 'Unsupported'
+          : persistenceProbe.status === 'error'
+            ? 'Unavailable'
             : 'Checking'
   let persistenceDetail: string | undefined
   if (persistenceRequestResult === 'granted') persistenceDetail = 'Granted by browser'
   else if (persistenceRequestResult === 'denied') persistenceDetail = 'Denied by browser'
-  else if (persistence === 'persistent') persistenceDetail = 'Eviction protected'
-  else if (persistence === 'best-effort') persistenceDetail = 'Browser may evict under pressure'
-  else if (persistence === 'unsupported') persistenceDetail = 'API unavailable'
+  else if (persistenceProbe.status === 'ready' && persistenceProbe.value)
+    persistenceDetail = 'Eviction protected'
+  else if (persistenceProbe.status === 'ready')
+    persistenceDetail = 'Browser may evict under pressure'
+  else if (persistenceProbe.status === 'unavailable') persistenceDetail = 'API unavailable'
+  else if (persistenceProbe.status === 'error')
+    persistenceDetail =
+      persistenceProbe.reason === 'timeout' ? 'Browser probe timed out' : 'Browser probe failed'
   const showPersistenceHelp =
-    isIndexedDbMode && persistence !== 'persistent' && storagePersistenceNotificationMayHelp()
+    isIndexedDbMode &&
+    persistenceProbe.status === 'ready' &&
+    !persistenceProbe.value &&
+    storagePersistenceNotificationMayHelp()
   const modeValue =
     workspaceMeta?.backendKind === 'browser-idb'
       ? 'IndexedDB'
@@ -510,13 +475,17 @@ function StorageOverview() {
                 label="Persistence"
                 value={persistenceValue}
                 detail={persistenceDetail}
+                state={persistenceProbe.status}
               />
-              {persistence !== 'unsupported' ? (
+              {storagePersistenceAvailable() ? (
                 <Button
                   type="button"
                   data-ui="storage-action"
                   onClick={() => void handleRequestPersistence()}
-                  disabled={persistenceBusy || persistence === 'persistent'}
+                  disabled={
+                    persistenceBusy ||
+                    (persistenceProbe.status === 'ready' && persistenceProbe.value)
+                  }
                   title="Request persistent browser storage"
                 >
                   <DatabaseIcon size={14} />
@@ -539,7 +508,7 @@ function StorageOverview() {
                   type="button"
                   data-ui="storage-action"
                   onClick={() => setWorkspaceExportConfirmOpen(true)}
-                  disabled={workspaceTransferBusy !== null}
+                  disabled={workspaceTransferBusy !== null || workspaceRecoveryRequired}
                   title="Export the full IndexedDB workspace"
                 >
                   <DownloadIcon size={14} />
@@ -549,8 +518,12 @@ function StorageOverview() {
                   type="button"
                   data-ui="storage-action"
                   onClick={() => workspaceImportInputRef.current?.click()}
-                  disabled={workspaceTransferBusy !== null}
-                  title="Import a full workspace backup"
+                  disabled={workspaceTransferBusy !== null || workspaceRecoveryRequired}
+                  title={
+                    workspaceRecoveryRequired
+                      ? 'Reload before another workspace transfer'
+                      : 'Import a full workspace backup'
+                  }
                 >
                   <UploadIcon size={14} />
                   {workspaceTransferBusy === 'import' ? 'Importing' : 'Import all'}
@@ -560,7 +533,7 @@ function StorageOverview() {
                   data-ui="storage-action"
                   tone="danger"
                   onClick={() => void handleClearWorkspace()}
-                  disabled={workspaceTransferBusy !== null}
+                  disabled={workspaceTransferBusy !== null || workspaceRecoveryRequired}
                   title="Clear all local Natter data and reload"
                 >
                   <TrashIcon size={14} />
@@ -581,23 +554,24 @@ function StorageOverview() {
         <StoragePanel
           title="Origin space"
           value={spaceValue}
-          detail="Browser-reported usage / quota"
+          detail={spaceDetail}
+          state={quotaProbe.status}
         >
           <StorageUsageDetails quota={quota} />
         </StoragePanel>
         <StoragePanel
           title="Chats"
-          value={String(chats.length)}
+          value={String(chatAggregate.totalCount)}
           href={storageHref({ section: 'chats' })}
         />
         <StoragePanel
           title="Attachments"
-          value={`${attachments.length} (${formatBytes(localBytes)})`}
+          value={`${attachmentAggregate.totalCount} (${formatBytes(attachmentAggregate.totalSizeBytes)})`}
           href={storageHref({ section: 'attachments' })}
         />
       </div>
       <div data-ui="storage-panel-row" data-role="calibration">
-        <StorageGlobalCalibrationPanel />
+        <StorageGlobalCalibrationPanel model={calibration} />
       </div>
       {workspaceExportConfirmOpen ? (
         <ConfirmDialog
@@ -655,30 +629,20 @@ function StorageUsageDetails({ quota }: { quota: QuotaSnapshot | null }) {
   )
 }
 
-function StorageGlobalCalibrationPanel() {
-  const model = useRepositoryQuery(
-    'storage-global-calibration-model',
-    loadStorageGlobalCalibrationModel,
-    EMPTY_GLOBAL_CALIBRATION_MODEL,
-    GLOBAL_TOKEN_CALIBRATION_DEPENDENCIES,
-  )
-  const [busy, setBusy] = useState<string | null>(null)
+function StorageGlobalCalibrationPanel({ model }: { model: StorageGlobalCalibrationModel }) {
   const rows = model.rows
-  const handleClearFamily = async (calibrationKey: string) => {
-    setBusy(calibrationKey)
-    try {
-      await clearTokenCalibrationFamilyEverywhere(calibrationKey)
-    } finally {
-      setBusy(null)
-    }
+  const calibrationInteraction = usePresentationInteraction(storageCalibrationInteraction)
+  const handleClearFamily = (calibrationKey: string) => {
+    calibrationInteraction.run({
+      target: 'workspace',
+      action: () => storageApplication.calibration.clearFamilyEverywhere(calibrationKey),
+    })
   }
-  const handleClearAll = async () => {
-    setBusy('*')
-    try {
-      await clearAllTokenCalibrationEverywhere()
-    } finally {
-      setBusy(null)
-    }
+  const handleClearAll = () => {
+    calibrationInteraction.run({
+      target: 'workspace',
+      action: () => storageApplication.calibration.clearAllEverywhere(),
+    })
   }
   return (
     <StoragePanel
@@ -703,8 +667,8 @@ function StorageGlobalCalibrationPanel() {
                 type="button"
                 data-ui="storage-action"
                 aria-label={`Clear calibration for ${key}`}
-                disabled={busy !== null}
-                onClick={() => void handleClearFamily(key)}
+                disabled={calibrationInteraction.isPending('workspace')}
+                onClick={() => handleClearFamily(key)}
               >
                 Clear
               </Button>
@@ -715,8 +679,8 @@ function StorageGlobalCalibrationPanel() {
       <Button
         type="button"
         data-ui="storage-action"
-        disabled={busy !== null || rows.length === 0}
-        onClick={() => void handleClearAll()}
+        disabled={calibrationInteraction.isPending('workspace') || rows.length === 0}
+        onClick={handleClearAll}
       >
         Clear all calibration globally
       </Button>
@@ -729,12 +693,14 @@ function StoragePanel({
   value,
   detail,
   href,
+  state,
   children,
 }: {
   title: string
   value: string
   detail?: string | undefined
   href?: string | undefined
+  state?: StorageProbeStatus | undefined
   children?: ReactNode
 }) {
   const content = (
@@ -747,25 +713,36 @@ function StoragePanel({
   )
   if (href) {
     return (
-      <a data-ui="storage-panel" href={href} onClick={makeAnchorClickHandler(href)}>
+      <a
+        data-ui="storage-panel"
+        data-state={state}
+        href={href}
+        onClick={makeAnchorClickHandler(href)}
+      >
         {content}
       </a>
     )
   }
-  return <section data-ui="storage-panel">{content}</section>
+  return (
+    <section data-ui="storage-panel" data-state={state}>
+      {content}
+    </section>
+  )
 }
 
 function StoragePanelMetric({
   label,
   value,
   detail,
+  state,
 }: {
   label: string
   value: string
   detail?: string | undefined
+  state?: StorageProbeStatus | undefined
 }) {
   return (
-    <span data-ui="storage-panel-metric">
+    <span data-ui="storage-panel-metric" data-state={state}>
       <span>{label}</span>
       <strong>{value}</strong>
       {detail ? <small>{detail}</small> : null}
@@ -773,1131 +750,190 @@ function StoragePanelMetric({
   )
 }
 
-function ChatsStorageSurface() {
-  const pushToast = useToastStore((s) => s.push)
-  const model = useRepositoryQuery(
-    'storage-chat-model',
-    loadStorageChatModel,
-    EMPTY_STORAGE_CHAT_MODEL,
-    [...SIDEBAR_MODEL_DEPENDENCIES, ...allTable('chats')],
-  )
-  const persistedSortMode = useRepositoryQuery(
-    'sidebar-sort-mode',
-    readSidebarSortMode,
-    DEFAULT_SIDEBAR_SORT_MODE,
-    primaryKeys('settings', SIDEBAR_SORT_SETTING_KEY),
-  )
-  const [sortMode, setSortMode] = useState<SidebarSortMode>(DEFAULT_SIDEBAR_SORT_MODE)
-  const [searchQuery, setSearchQuery] = useState('')
-  const [searchTitleOnly, setSearchTitleOnly] = useState(false)
-  const [searchAllBranches, setSearchAllBranches] = useState(false)
-  const [searchIncludeArchived, setSearchIncludeArchived] = useState(false)
-  const [includeFolderIds, setIncludeFolderIds] = useState<FolderId[]>([])
-  const [excludeFolderIds, setExcludeFolderIds] = useState<FolderId[]>([])
-  const [includeTagIds, setIncludeTagIds] = useState<TagId[]>([])
-  const [excludeTagIds, setExcludeTagIds] = useState<TagId[]>([])
-  const [openCalibrationChatId, setOpenCalibrationChatId] = useState<ChatId | null>(null)
-  const [selectedChatIds, setSelectedChatIds] = useState<Set<ChatId>>(() => new Set())
-  const [selectionAnchorId, setSelectionAnchorId] = useState<ChatId | null>(null)
-  const [busyChatAction, setBusyChatAction] = useState<string | null>(null)
-  const [busyCalibration, setBusyCalibration] = useState<string | null>(null)
-  const selectAllRef = useRef<HTMLInputElement | null>(null)
-  const chatImportInputRef = useRef<HTMLInputElement | null>(null)
-  const searchSession = useSearchStore((state) => state.session)
-  const sortLocale = useMemo(
-    () => (typeof navigator === 'undefined' ? 'en-US' : navigator.language),
-    [],
-  )
-  const sortOptions = useMemo(() => ({ locale: sortLocale }), [sortLocale])
-  const activeSortOption = sidebarSortOption(sortMode)
-  const folderById = useMemo(
-    () => new Map(model.folders.map((folder) => [folder.id, folder])),
-    [model.folders],
-  )
-  const tagById = useMemo(() => new Map(model.tags.map((tag) => [tag.id, tag])), [model.tags])
-  const searchFilters = useMemo<SearchFilters>(
-    () => ({
-      includeFolderIds,
-      excludeFolderIds,
-      includeTagIds,
-      excludeTagIds,
-      archived: searchIncludeArchived ? 'include' : DEFAULT_SEARCH_FILTERS.archived,
-      titleOnly: searchTitleOnly,
-    }),
-    [
-      excludeFolderIds,
-      excludeTagIds,
-      includeFolderIds,
-      includeTagIds,
-      searchIncludeArchived,
-      searchTitleOnly,
-    ],
-  )
-  const searchTextActive = searchQuery.trim().length > 0
-  const searchHasFilters = hasActiveSearchFilters(searchFilters) || searchAllBranches
-  const sortedSearchResults = useMemo(() => {
-    const results = orderedSearchResults(searchSession?.results)
-    const byChatId = new Map(results.map((result) => [result.chatId, result]))
-    return sortChats(
-      results.map((result) => projectChatSidebarRow(result.chat)),
-      sortMode,
-      sortOptions,
-    )
-      .map((chat) => byChatId.get(chat.id))
-      .filter((result): result is SearchResult => Boolean(result))
-  }, [searchSession?.results, sortMode, sortOptions])
-  const searchResultByChatId = useMemo(
-    () => new Map(sortedSearchResults.map((result) => [result.chatId, result])),
-    [sortedSearchResults],
-  )
-  const filteredLocalRows = useMemo(
-    () =>
-      model.chats.filter(
-        (chat) => !isEmptySidebarDraft(chat) && chatPassesStorageFilters(chat, searchFilters),
-      ),
-    [model.chats, searchFilters],
-  )
-  const tableRows = useMemo(() => {
-    if (searchTextActive) {
-      return sortedSearchResults
-        .map((result) => projectChatSidebarRow(result.chat))
-        .filter((chat) => !isEmptySidebarDraft(chat))
-    }
-    return sortChats(filteredLocalRows, sortMode, sortOptions)
-  }, [filteredLocalRows, searchTextActive, sortMode, sortOptions, sortedSearchResults])
-  const tableRowIds = useMemo(() => tableRows.map((chat) => chat.id), [tableRows])
-  const tableRowIndexById = useMemo(
-    () => new Map(tableRows.map((chat, index) => [chat.id, index])),
-    [tableRows],
-  )
-  const selectedChats = useMemo(
-    () => tableRows.filter((chat) => selectedChatIds.has(chat.id)),
-    [selectedChatIds, tableRows],
-  )
-  const live = model.chats.filter((chat) => !chat.archived && !isEmptySidebarDraft(chat)).length
-  const archived = model.chats.filter((chat) => chat.archived && !isEmptySidebarDraft(chat)).length
-  const status = searchSession?.status ?? 'idle'
-  const completed = searchSession?.completedCount ?? 0
-  const total = searchSession?.candidateCount ?? 0
-  const selectedArchivedCount = selectedChats.filter((chat) => chat.archived).length
-  const selectedLiveCount = selectedChats.length - selectedArchivedCount
+function ArchiveManager() {
+  const { session: catalogSession, loadMore } = useArchiveCatalogApplication()
+  const archiveInteraction = usePresentationInteraction(storageArchiveInteraction)
+  const archiveBusy = archiveInteraction.isPending('archive')
+  const archived = catalogSession?.page.rows ?? []
+  const archivedCount = catalogSession?.page.exactCount ?? 0
+  const archiveListRef = useRef<HTMLUListElement | null>(null)
+  const archiveLoadRef = useRef<HTMLLIElement | null>(null)
+  const archiveVirtualizer = useVirtualizer<HTMLUListElement, HTMLLIElement>({
+    count: archived.length,
+    getScrollElement: () => archiveListRef.current,
+    estimateSize: () => 58,
+    getItemKey: (index) => archived[index]?.id ?? index,
+    overscan: 8,
+    initialRect: { width: 800, height: 720 },
+    enabled: archived.length > 100,
+  })
+  const measuredArchiveItems = archiveVirtualizer.getVirtualItems()
+  const archiveItems =
+    archived.length <= 100 || measuredArchiveItems.length > 0
+      ? measuredArchiveItems
+      : Array.from({ length: Math.min(30, archived.length) }, (_, index) => ({
+          index,
+          start: index * 58,
+          end: (index + 1) * 58,
+        }))
+  const archiveTopSpacer = archiveItems[0]?.start ?? 0
+  const archiveTotalSize =
+    measuredArchiveItems.length > 0 ? archiveVirtualizer.getTotalSize() : archived.length * 58
+  const archiveBottomSpacer =
+    archiveItems.length === 0 ? 0 : Math.max(0, archiveTotalSize - (archiveItems.at(-1)?.end ?? 0))
+  const archiveTopSpacerRef = useVirtualSpacerHeight<HTMLLIElement>(archiveTopSpacer)
+  const archiveBottomSpacerRef = useVirtualSpacerHeight<HTMLLIElement>(archiveBottomSpacer)
 
   useEffect(() => {
-    startSearchStoreBroadcastListener()
-  }, [])
-  useEffect(() => setSortMode(persistedSortMode), [persistedSortMode])
-  useEffect(() => {
-    if (!searchTextActive) {
-      abortSearchSession()
+    if (
+      !catalogSession?.interactive ||
+      catalogSession.status === 'refreshing' ||
+      !catalogSession.page.nextCursor ||
+      typeof IntersectionObserver === 'undefined'
+    ) {
       return
     }
-    requestSearchSession({
-      query: searchQuery,
-      scope: searchAllBranches ? 'all-branches' : 'last-updated-branch',
-      filters: searchFilters,
-    })
-  }, [searchAllBranches, searchFilters, searchQuery, searchTextActive])
-  useEffect(() => () => abortSearchSession(), [])
-  useEffect(() => {
-    const visible = new Set(tableRowIds)
-    setSelectedChatIds((current) => {
-      let changed = false
-      const next = new Set<ChatId>()
-      for (const chatId of current) {
-        if (visible.has(chatId)) next.add(chatId)
-        else changed = true
-      }
-      return changed ? next : current
-    })
-    setSelectionAnchorId((current) => (current && visible.has(current) ? current : null))
-  }, [tableRowIds])
-  useEffect(() => {
-    if (!selectAllRef.current) return
-    selectAllRef.current.indeterminate =
-      selectedChats.length > 0 && selectedChats.length < tableRows.length
-  }, [selectedChats.length, tableRows.length])
-
-  const handleSelectSortMode = useCallback((mode: SidebarSortMode) => {
-    setSortMode(mode)
-    void writeSidebarSortMode(mode).catch((error: unknown) => {
-      console.error('Failed to persist sidebar sort mode', error)
-    })
-  }, [])
-  const handleColumnSort = useCallback(
-    (field: ReturnType<typeof sidebarSortField>) => {
-      const currentField = sidebarSortField(sortMode)
-      const currentDirection = sidebarSortDirection(sortMode)
-      const direction =
-        currentField === field
-          ? currentDirection === 'asc'
-            ? 'desc'
-            : 'asc'
-          : field === 'title'
-            ? 'asc'
-            : 'desc'
-      handleSelectSortMode(`${field}-${direction}`)
-    },
-    [handleSelectSortMode, sortMode],
-  )
-  const handleClearSearch = useCallback(() => {
-    setSearchQuery('')
-    setSearchTitleOnly(false)
-    setSearchAllBranches(false)
-    setSearchIncludeArchived(false)
-    setIncludeFolderIds([])
-    setExcludeFolderIds([])
-    setIncludeTagIds([])
-    setExcludeTagIds([])
-  }, [])
-  const toggleFolderFilter = useCallback(
-    (folderId: FolderId) => {
-      const state = filterState(folderId, includeFolderIds, excludeFolderIds)
-      if (state === 'none') {
-        setIncludeFolderIds([...includeFolderIds, folderId])
-        setExcludeFolderIds(excludeFolderIds.filter((id) => id !== folderId))
-      } else if (state === 'include') {
-        setIncludeFolderIds(includeFolderIds.filter((id) => id !== folderId))
-        setExcludeFolderIds([...excludeFolderIds, folderId])
-      } else {
-        setExcludeFolderIds(excludeFolderIds.filter((id) => id !== folderId))
-      }
-    },
-    [excludeFolderIds, includeFolderIds],
-  )
-  const toggleTagFilter = useCallback(
-    (tagId: TagId) => {
-      const state = filterState(tagId, includeTagIds, excludeTagIds)
-      if (state === 'none') {
-        setIncludeTagIds([...includeTagIds, tagId])
-        setExcludeTagIds(excludeTagIds.filter((id) => id !== tagId))
-      } else if (state === 'include') {
-        setIncludeTagIds(includeTagIds.filter((id) => id !== tagId))
-        setExcludeTagIds([...excludeTagIds, tagId])
-      } else {
-        setExcludeTagIds(excludeTagIds.filter((id) => id !== tagId))
-      }
-    },
-    [excludeTagIds, includeTagIds],
-  )
-  const withBusyChatAction = useCallback(
-    async (key: string, action: () => Promise<void>) => {
-      setBusyChatAction(key)
-      try {
-        await action()
-      } catch (error) {
-        const message = permanentDeleteBlockedMessage(error)
-        if (!message) throw error
-        pushToast({ level: 'warning', text: message })
-      } finally {
-        setBusyChatAction(null)
-      }
-    },
-    [pushToast],
-  )
-  const handleSelectAllVisible = useCallback(
-    (checked: boolean) => {
-      setSelectedChatIds(checked ? new Set(tableRowIds) : new Set())
-      setSelectionAnchorId(checked ? (tableRowIds.at(-1) ?? null) : null)
-    },
-    [tableRowIds],
-  )
-  const handleSelectChat = useCallback(
-    (chatId: ChatId, event: Pick<MouseEvent<HTMLElement>, 'shiftKey' | 'metaKey' | 'ctrlKey'>) => {
-      if (event.shiftKey && selectionAnchorId && tableRowIndexById.has(selectionAnchorId)) {
-        const anchorIndex = tableRowIndexById.get(selectionAnchorId) as number
-        const targetIndex = tableRowIndexById.get(chatId)
-        if (targetIndex !== undefined) {
-          const start = Math.min(anchorIndex, targetIndex)
-          const end = Math.max(anchorIndex, targetIndex)
-          setSelectedChatIds((current) => {
-            const next = new Set(current)
-            for (const row of tableRows.slice(start, end + 1)) next.add(row.id)
-            return next
-          })
-          return
-        }
-      }
-      setSelectedChatIds((current) => {
-        const next = new Set(current)
-        if (next.has(chatId)) next.delete(chatId)
-        else next.add(chatId)
-        return next
-      })
-      setSelectionAnchorId(chatId)
-    },
-    [selectionAnchorId, tableRowIndexById, tableRows],
-  )
-  const clearSelection = useCallback(() => {
-    setSelectedChatIds(new Set())
-    setSelectionAnchorId(null)
-  }, [])
-  const handleDownloadSelection = useCallback(async () => {
-    if (selectedChats.length === 0) return
-    const chatIds = selectedChats.map((chat) => chat.id)
-    await withBusyChatAction('bulk:download', async () => {
-      if (chatIds.length === 1) {
-        const { filename, content } = await exportLastUpdatedChatAsTxt(chatIds[0] as ChatId)
-        triggerBrowserDownload(filename, content)
-        return
-      }
-      const { filename, blob } = await exportLastUpdatedChatsAsZip(chatIds)
-      triggerBrowserBlobDownload(filename, blob)
-    })
-  }, [selectedChats, withBusyChatAction])
-  const handleExportSelection = useCallback(async () => {
-    const chats = selectedChats
-    if (chats.length === 0) return
-    const actionId = chats.length === 1 ? `export:${chats[0]?.id}` : 'bulk:export-json'
-    await withBusyChatAction(actionId, async () => {
-      try {
-        if (chats.length === 1) {
-          const chat = chats[0]
-          if (!chat) return
-          const envelope = await exportChat(chat.id)
-          triggerJsonDownload(natterJsonFilename('chat', displayChatTitle(chat), chat.id), envelope)
-          pushToast({ level: 'success', text: 'Exported chat JSON.', durationMs: 2500 })
-          return
-        }
-        const pendingEntries = chats.map((chat) => ({
-          chat,
-          filename: natterJsonFilename('chat', displayChatTitle(chat), chat.id),
-        }))
-        const entries = pendingEntries.map(({ chat, filename }) => ({
-          filename,
-          loadValue: () => exportChat(chat.id),
-        }))
-        await triggerJsonZipDownload(natterZipFilename('chats'), entries)
-        pushToast({
-          level: 'success',
-          text: `Exported ${chats.length} chat JSON files.`,
-          durationMs: 2500,
-        })
-      } catch (error) {
-        console.error('Failed to export chat JSON', error)
-        pushToast({ level: 'danger', text: importExportErrorMessage(error) })
-      }
-    })
-  }, [pushToast, selectedChats, withBusyChatAction])
-  const handleImportChatFile = useCallback(
-    async (event: ChangeEvent<HTMLInputElement>) => {
-      const input = event.currentTarget
-      const file = input.files?.[0] ?? null
-      input.value = ''
-      if (!file) return
-      setBusyChatAction('import')
-      try {
-        let importedCount = 0
-        let lastChatId = ''
-        await forEachJsonOrZipFile(file, async (value) => {
-          const result = await importChat(value)
-          importedCount += 1
-          lastChatId = result.chatId
-        })
-        pushToast({
-          level: 'success',
-          text:
-            importedCount === 1
-              ? `Imported chat ${shortId(lastChatId)}.`
-              : `Imported ${importedCount} chats.`,
-          durationMs: 3000,
-        })
-      } catch (error) {
-        console.error('Failed to import chat JSON/ZIP', error)
-        pushToast({ level: 'danger', text: importExportErrorMessage(error) })
-      } finally {
-        setBusyChatAction(null)
-      }
-    },
-    [pushToast],
-  )
-  const handleMoveSelection = useCallback(async () => {
-    if (selectedChats.length === 0) return
-    const defaultName = sharedFolderName(selectedChats, folderById)
-    const name = window.prompt(
-      `Move ${selectedChats.length} ${pluralize('chat', selectedChats.length)} to folder (blank removes folder)`,
-      defaultName,
+    const root = archiveListRef.current
+    const target = archiveLoadRef.current
+    if (!root || !target) return
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) loadMore()
+      },
+      { root, rootMargin: '0px 0px 240px 0px', threshold: 0 },
     )
-    if (name === null) return
-    await withBusyChatAction('bulk:move', async () => {
-      const trimmed = name.trim()
-      if (trimmed.length === 0) {
-        await moveChatsToFolder(
-          selectedChats.map((chat) => chat.id),
-          null,
-        )
-        return
-      }
-      const existing = model.folders.find(
-        (folder) => folder.name.toLocaleLowerCase() === trimmed.toLocaleLowerCase(),
-      )
-      const folder = existing ?? (await createFolder({ name: trimmed }))
-      await moveChatsToFolder(
-        selectedChats.map((chat) => chat.id),
-        folder.id,
-      )
+    observer.observe(target)
+    return () => observer.disconnect()
+  }, [
+    catalogSession?.interactive,
+    catalogSession?.page.nextCursor,
+    catalogSession?.status,
+    loadMore,
+  ])
+
+  if (catalogSession?.status === 'error' && archived.length === 0) throw catalogSession.error
+
+  const handleRestore = (chat: ChatSidebarRow) => {
+    archiveInteraction.run({
+      target: 'archive',
+      action: () => storageApplication.chat.unarchive(chat.id),
     })
-  }, [folderById, model.folders, selectedChats, withBusyChatAction])
-  const handleSetSelectedTags = useCallback(async () => {
-    if (selectedChats.length === 0) return
-    const defaultNames = sharedTagNames(selectedChats, tagById)
-    const value = window.prompt(
-      `Tags for ${selectedChats.length} ${pluralize('chat', selectedChats.length)}, comma-separated`,
-      defaultNames,
-    )
-    if (value === null) return
-    await withBusyChatAction('bulk:tags', async () => {
-      await setChatsTagsFromNames(
-        selectedChats.map((chat) => chat.id),
-        tagNamesFromPrompt(value),
-      )
-    })
-  }, [selectedChats, tagById, withBusyChatAction])
-  const handleDeleteSelection = useCallback(async () => {
-    if (selectedChats.length === 0) return
-    const archivedCount = selectedChats.filter((chat) => chat.archived).length
-    const liveCount = selectedChats.length - archivedCount
-    const message =
-      archivedCount > 0 && liveCount > 0
-        ? `Archive ${liveCount} live ${pluralize('chat', liveCount)} and permanently delete ${archivedCount} archived ${pluralize('chat', archivedCount)}?`
-        : archivedCount > 0
-          ? `Permanently delete ${archivedCount} archived ${pluralize('chat', archivedCount)}? This cannot be undone.`
-          : `Delete ${liveCount} ${pluralize('chat', liveCount)}? They will move to the archive.`
-    if (!window.confirm(message)) return
-    await withBusyChatAction('bulk:delete', async () => {
-      await Promise.all(
-        selectedChats.map((chat) =>
-          chat.archived ? deleteArchivedChatPermanently(chat.id) : archiveChat(chat.id),
-        ),
-      )
-      clearSelection()
-    })
-  }, [clearSelection, selectedChats, withBusyChatAction])
-  const handleUnarchiveSelection = useCallback(async () => {
-    const archivedChats = selectedChats.filter((chat) => chat.archived)
-    if (archivedChats.length === 0) return
-    await withBusyChatAction('bulk:unarchive', async () => {
-      await Promise.all(archivedChats.map((chat) => unarchiveChat(chat.id)))
-    })
-  }, [selectedChats, withBusyChatAction])
-  const handleClearCalibration = useCallback(async (chatId: ChatId, calibrationKey?: string) => {
-    const busyKey = `${chatId}:${calibrationKey ?? '*'}`
-    setBusyCalibration(busyKey)
-    try {
-      await clearChatTokenCalibration(chatId, calibrationKey)
-    } finally {
-      setBusyCalibration(null)
-    }
-  }, [])
-  return (
-    <section data-ui="storage-chats">
-      <div data-ui="storage-chat-toolbar">
-        <label data-ui="storage-chat-search">
-          <SearchIcon size={14} />
-          <input
-            data-ui="storage-chat-search-input"
-            type="search"
-            value={searchQuery}
-            placeholder="Search chats"
-            aria-label="Search chats"
-            onChange={(event) => setSearchQuery(event.currentTarget.value)}
-            onKeyDown={(event) => {
-              if (event.key === 'Escape') handleClearSearch()
-            }}
-          />
-          {searchTextActive ? (
-            <span data-ui="storage-chat-search-progress">
-              {status === 'scanning' || status === 'debouncing'
-                ? `${completed}/${total}`
-                : `${sortedSearchResults.length}`}
-            </span>
-          ) : null}
-          {searchTextActive || searchHasFilters ? (
-            <IconButton
-              type="button"
-              data-ui="storage-chat-search-clear"
-              aria-label="Clear search"
-              title="Clear search"
-              onClick={handleClearSearch}
-            >
-              <CloseIcon size={13} />
-            </IconButton>
-          ) : null}
-        </label>
-        <label data-ui="storage-chat-sort">
-          <SortIcon size={14} />
-          <select
-            value={sortMode}
-            aria-label={`Sort: ${activeSortOption.label}`}
-            onChange={(event) => handleSelectSortMode(event.currentTarget.value as SidebarSortMode)}
-          >
-            {SIDEBAR_SORT_OPTIONS.map((option) => (
-              <option key={option.mode} value={option.mode}>
-                {option.label}
-              </option>
-            ))}
-          </select>
-        </label>
-        <IconButton
-          type="button"
-          data-ui="icon-button"
-          data-size="lg"
-          size="lg"
-          data-role="chat-import"
-          disabled={Boolean(busyChatAction)}
-          onClick={() => chatImportInputRef.current?.click()}
-          aria-label="Import chat JSON or ZIP"
-          title="Import chat JSON or ZIP"
-        >
-          <UploadIcon size={16} />
-        </IconButton>
-        <input
-          ref={chatImportInputRef}
-          data-ui="storage-chat-import-input"
-          type="file"
-          accept="application/json,application/zip,.json,.zip"
-          hidden
-          onChange={(event) => void handleImportChatFile(event)}
-        />
-        <span data-ui="storage-chat-count">
-          {searchTextActive || searchHasFilters ? tableRows.length : live} live / {archived}{' '}
-          archived
-        </span>
-      </div>
-      <div data-ui="storage-chat-filters">
-        <label>
-          <input
-            type="checkbox"
-            checked={searchTitleOnly}
-            onChange={(event) => setSearchTitleOnly(event.currentTarget.checked)}
-          />
-          <span>Title</span>
-        </label>
-        <label>
-          <input
-            type="checkbox"
-            checked={searchAllBranches}
-            onChange={(event) => setSearchAllBranches(event.currentTarget.checked)}
-          />
-          <span>Branches</span>
-        </label>
-        <label>
-          <input
-            type="checkbox"
-            checked={searchIncludeArchived}
-            onChange={(event) => setSearchIncludeArchived(event.currentTarget.checked)}
-          />
-          <span>Archive</span>
-        </label>
-      </div>
-      {model.folders.length > 0 ? (
-        <section data-ui="storage-chat-filter-group">
-          <span>
-            <FolderIcon size={12} />
-            Folders
-          </span>
-          <div data-ui="storage-chat-chip-row">
-            {model.folders.map((folder) => (
-              <Button
-                key={folder.id}
-                type="button"
-                data-filter-state={filterState(folder.id, includeFolderIds, excludeFolderIds)}
-                title={filterTitle(folder.name, includeFolderIds, excludeFolderIds, folder.id)}
-                onClick={() => toggleFolderFilter(folder.id)}
-              >
-                {folder.name}
-              </Button>
-            ))}
-          </div>
-        </section>
-      ) : null}
-      {model.tags.length > 0 ? (
-        <section data-ui="storage-chat-filter-group">
-          <span>
-            <TagIcon size={12} />
-            Tags
-          </span>
-          <div data-ui="storage-chat-chip-row">
-            {model.tags.map((tag) => (
-              <Button
-                key={tag.id}
-                type="button"
-                data-filter-state={filterState(tag.id, includeTagIds, excludeTagIds)}
-                title={filterTitle(tag.name, includeTagIds, excludeTagIds, tag.id)}
-                onClick={() => toggleTagFilter(tag.id)}
-              >
-                {tag.name}
-              </Button>
-            ))}
-          </div>
-        </section>
-      ) : null}
-      {searchSession?.status === 'error' && searchSession.error ? (
-        <div data-ui="storage-chat-search-error">{searchSession.error}</div>
-      ) : null}
-      {selectedChats.length > 0 ? (
-        <div data-ui="storage-chat-selection-toolbar">
-          <span data-ui="storage-chat-selection-count">
-            {selectedChats.length} selected
-            {selectedArchivedCount > 0 ? ` (${selectedArchivedCount} archived)` : ''}
-          </span>
-          <span data-ui="storage-chat-selection-actions">
-            <Button
-              type="button"
-              data-ui="storage-chat-bulk-download"
-              disabled={Boolean(busyChatAction)}
-              onClick={() => void handleDownloadSelection()}
-            >
-              <DownloadIcon size={14} />
-              Download
-            </Button>
-            <Button
-              type="button"
-              data-ui="storage-chat-bulk-export"
-              disabled={Boolean(busyChatAction)}
-              onClick={() => void handleExportSelection()}
-              title={
-                selectedChats.length === 1
-                  ? 'Export selected chat JSON'
-                  : 'Export selected chats as a JSON ZIP'
-              }
-            >
-              <FileIcon size={14} />
-              Export
-            </Button>
-            <Button
-              type="button"
-              data-ui="storage-chat-bulk-move"
-              disabled={Boolean(busyChatAction)}
-              onClick={() => void handleMoveSelection()}
-            >
-              <FolderIcon size={14} />
-              Move
-            </Button>
-            <Button
-              type="button"
-              data-ui="storage-chat-bulk-tags"
-              disabled={Boolean(busyChatAction)}
-              onClick={() => void handleSetSelectedTags()}
-            >
-              <TagIcon size={14} />
-              Tags
-            </Button>
-            {selectedArchivedCount > 0 ? (
-              <Button
-                type="button"
-                data-ui="storage-chat-bulk-unarchive"
-                disabled={Boolean(busyChatAction)}
-                onClick={() => void handleUnarchiveSelection()}
-              >
-                <UnarchiveIcon size={14} />
-                Unarchive
-              </Button>
-            ) : null}
-            {selectedLiveCount > 0 ? (
-              <Button
-                type="button"
-                data-ui="storage-chat-bulk-archive"
-                disabled={Boolean(busyChatAction)}
-                onClick={() =>
-                  void withBusyChatAction('bulk:archive', async () => {
-                    await Promise.all(
-                      selectedChats
-                        .filter((chat) => !chat.archived)
-                        .map((chat) => archiveChat(chat.id)),
-                    )
-                  })
-                }
-              >
-                <ArchiveIcon size={14} />
-                Archive
-              </Button>
-            ) : null}
-            <Button
-              type="button"
-              data-ui="storage-chat-bulk-delete"
-              tone="danger"
-              disabled={Boolean(busyChatAction)}
-              onClick={() => void handleDeleteSelection()}
-            >
-              <TrashIcon size={14} />
-              Delete
-            </Button>
-            <Button type="button" disabled={Boolean(busyChatAction)} onClick={clearSelection}>
-              Clear
-            </Button>
-          </span>
-        </div>
-      ) : null}
-      <div data-ui="storage-chat-table-wrap">
-        <table data-ui="storage-chat-table" data-sort-key={sortMode}>
-          <thead>
-            <tr>
-              <th scope="col" data-ui="storage-chat-select-header">
-                <input
-                  ref={selectAllRef}
-                  type="checkbox"
-                  aria-label="Select all visible chats"
-                  checked={tableRows.length > 0 && selectedChats.length === tableRows.length}
-                  disabled={tableRows.length === 0}
-                  onChange={(event) => handleSelectAllVisible(event.currentTarget.checked)}
-                />
-              </th>
-              <StorageSortableHeader
-                label="Title"
-                field="title"
-                sortMode={sortMode}
-                onSort={handleColumnSort}
-              />
-              <th scope="col">Preview</th>
-              <StorageSortableHeader
-                label="Updated"
-                field="updatedAt"
-                sortMode={sortMode}
-                onSort={handleColumnSort}
-              />
-              <StorageSortableHeader
-                label="Created"
-                field="createdAt"
-                sortMode={sortMode}
-                onSort={handleColumnSort}
-              />
-              <StorageSortableHeader
-                label="Viewed"
-                field="lastViewedAt"
-                sortMode={sortMode}
-                onSort={handleColumnSort}
-              />
-              <StorageSortableHeader
-                label="Cost"
-                field="totalCostUsd"
-                sortMode={sortMode}
-                onSort={handleColumnSort}
-              />
-              <StorageSortableHeader
-                label="Words"
-                field="wordCount"
-                sortMode={sortMode}
-                onSort={handleColumnSort}
-              />
-              <th scope="col">Folder</th>
-              <th scope="col">Tags</th>
-              <th scope="col">Calibration</th>
-            </tr>
-          </thead>
-          <tbody>
-            {tableRows.length === 0 ? (
-              <tr>
-                <td colSpan={11} data-ui="storage-chat-empty">
-                  {searchTextActive || searchHasFilters ? 'No matches' : 'No chats'}
-                </td>
-              </tr>
-            ) : (
-              tableRows.map((chat) => {
-                const title = displayChatTitle(chat)
-                const href = chatHref(chat.id)
-                const searchResult = searchResultByChatId.get(chat.id)
-                const preview = searchResult?.snippet || chat.previewText || shortId(chat.id)
-                const calibrationRows = calibrationEntries(model.calibrations.get(chat.id))
-                const calibrationOpen = openCalibrationChatId === chat.id
-                const selected = selectedChatIds.has(chat.id)
-                return (
-                  <Fragment key={chat.id}>
-                    <tr
-                      data-ui="storage-chat-row"
-                      data-archived={chat.archived ? 'true' : undefined}
-                      data-selected={selected ? 'true' : undefined}
-                      onClick={(event) => {
-                        if (!event.shiftKey && !event.metaKey && !event.ctrlKey) return
-                        const target = event.target
-                        if (
-                          target instanceof Element &&
-                          target.closest('a, button, input, select, textarea')
-                        ) {
-                          return
-                        }
-                        handleSelectChat(chat.id, event)
-                      }}
-                    >
-                      <td data-ui="storage-chat-select-cell">
-                        <input
-                          data-ui="storage-chat-select"
-                          type="checkbox"
-                          aria-label={`Select ${title}`}
-                          checked={selected}
-                          onClick={(event) => handleSelectChat(chat.id, event)}
-                          readOnly
-                        />
-                      </td>
-                      <td data-ui="storage-chat-title-cell">
-                        <a href={href} onClick={makeAnchorClickHandler(href)}>
-                          {title}
-                        </a>
-                        {chat.archived ? <span data-ui="storage-chat-state">Archived</span> : null}
-                      </td>
-                      <td data-ui="storage-chat-preview-cell">
-                        <a href={href} onClick={makeAnchorClickHandler(href)}>
-                          {preview}
-                        </a>
-                      </td>
-                      <td>{formatDate(chat.updatedAt)}</td>
-                      <td>{formatDate(chat.createdAt)}</td>
-                      <td>{formatDate(chat.lastViewedAt)}</td>
-                      <td>{formatCost(chat.totalCostUsd)}</td>
-                      <td>{formatInteger(chat.wordCount)}</td>
-                      <td>{folderLabel(chat.folderId, folderById)}</td>
-                      <td data-ui="storage-chat-tags-cell">{tagLabels(chat.tags, tagById)}</td>
-                      <td>
-                        <Button
-                          type="button"
-                          data-ui="storage-chat-calibration-button"
-                          aria-expanded={calibrationOpen}
-                          onClick={() =>
-                            setOpenCalibrationChatId((current) =>
-                              current === chat.id ? null : chat.id,
-                            )
-                          }
-                        >
-                          {calibrationLabel(calibrationRows)}
-                          <ChevronIcon size={12} rotate={calibrationOpen ? 90 : 0} />
-                        </Button>
-                      </td>
-                    </tr>
-                    {calibrationOpen ? (
-                      <tr data-ui="storage-chat-calibration-row">
-                        <td colSpan={11}>
-                          <div data-ui="storage-chat-calibration-detail">
-                            <div data-ui="storage-chat-calibration-detail-header">
-                              <strong>{title}</strong>
-                              <Button
-                                type="button"
-                                data-ui="storage-action"
-                                disabled={
-                                  calibrationRows.length === 0 || busyCalibration === `${chat.id}:*`
-                                }
-                                onClick={() => void handleClearCalibration(chat.id)}
-                              >
-                                <TrashIcon size={13} />
-                                Clear all calibration
-                              </Button>
-                            </div>
-                            {calibrationRows.length === 0 ? (
-                              <span data-ui="helper">No chat calibration.</span>
-                            ) : (
-                              <div data-ui="storage-chat-calibration-list">
-                                {calibrationRows.map(([key, sample]) => (
-                                  <div key={key} data-ui="storage-chat-calibration-item">
-                                    <span data-ui="storage-chat-calibration-key">{key}</span>
-                                    <span>{formatCalibrationRatio(sample)}</span>
-                                    <span>{formatInteger(sample.sampleCount)} samples</span>
-                                    <span>{formatDate(sample.updatedAt)}</span>
-                                    <Button
-                                      type="button"
-                                      data-ui="storage-action"
-                                      disabled={busyCalibration === `${chat.id}:${key}`}
-                                      onClick={() => void handleClearCalibration(chat.id, key)}
-                                    >
-                                      Clear
-                                    </Button>
-                                  </div>
-                                ))}
-                              </div>
-                            )}
-                          </div>
-                        </td>
-                      </tr>
-                    ) : null}
-                  </Fragment>
-                )
-              })
-            )}
-          </tbody>
-        </table>
-      </div>
-    </section>
-  )
-}
-
-function StorageSortableHeader({
-  label,
-  field,
-  sortMode,
-  onSort,
-}: {
-  label: string
-  field: ReturnType<typeof sidebarSortField>
-  sortMode: SidebarSortMode
-  onSort: (field: ReturnType<typeof sidebarSortField>) => void
-}) {
-  const active = sidebarSortField(sortMode) === field
-  const direction = sidebarSortDirection(sortMode)
-  return (
-    <th
-      scope="col"
-      aria-sort={active ? (direction === 'asc' ? 'ascending' : 'descending') : 'none'}
-    >
-      <Button
-        type="button"
-        data-ui="storage-chat-sort-header"
-        data-active={active ? 'true' : undefined}
-        onClick={() => onSort(field)}
-      >
-        <span>{label}</span>
-        <ChevronIcon size={12} rotate={active && direction === 'asc' ? 270 : 90} />
-      </Button>
-    </th>
-  )
-}
-
-function calibrationEntries(
-  samples: Record<string, TokenCalibrationSample> | undefined,
-): Array<[string, TokenCalibrationSample]> {
-  return Object.entries(aggregateCalibrationSamples(samples)).sort(([left], [right]) =>
-    left.localeCompare(right),
-  )
-}
-
-function calibrationLabel(entries: readonly [string, TokenCalibrationSample][]): string {
-  if (entries.length === 0) return 'None'
-  if (entries.length === 1) return '1 family'
-  return `${entries.length} families`
-}
-
-function formatCalibrationRatio(sample: TokenCalibrationSample): string {
-  if (sample.totalTextTokens <= 0) return 'Unknown ratio'
-  const ratio = sample.totalTextChars / sample.totalTextTokens
-  if (!Number.isFinite(ratio) || ratio <= 0) return 'Unknown ratio'
-  return `${ratio.toFixed(2)} chars/token`
-}
-
-function formatCost(value: number): string {
-  if (!Number.isFinite(value) || value <= 0) return '$0.00'
-  if (value < 0.01) return '<$0.01'
-  return `$${value.toLocaleString(undefined, {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  })}`
-}
-
-function formatInteger(value: number): string {
-  if (!Number.isFinite(value)) return '0'
-  return Math.max(0, Math.round(value)).toLocaleString()
-}
-
-function folderLabel(
-  folderId: FolderId | null,
-  folderById: ReadonlyMap<FolderId, ChatFolder>,
-): string {
-  if (!folderId) return 'Top-level'
-  return folderById.get(folderId)?.name ?? 'Missing folder'
-}
-
-function sharedFolderName(
-  chats: readonly ChatSidebarRow[],
-  folderById: ReadonlyMap<FolderId, ChatFolder>,
-): string {
-  if (chats.length === 0) return ''
-  const folderId = chats[0]?.folderId ?? null
-  if (chats.some((chat) => (chat.folderId ?? null) !== folderId)) return ''
-  return folderId ? (folderById.get(folderId)?.name ?? '') : ''
-}
-
-function tagLabels(tagIds: readonly TagId[], tagById: ReadonlyMap<TagId, ChatTag>): ReactNode {
-  const names = tagIds
-    .map((tagId) => tagById.get(tagId)?.name)
-    .filter((name): name is string => Boolean(name))
-  if (names.length === 0) return 'None'
-  return (
-    <span data-ui="storage-chat-tag-list">
-      {names.map((name) => (
-        <span key={name} data-ui="storage-chat-tag">
-          {name}
-        </span>
-      ))}
-    </span>
-  )
-}
-
-function sharedTagNames(
-  chats: readonly ChatSidebarRow[],
-  tagById: ReadonlyMap<TagId, ChatTag>,
-): string {
-  if (chats.length === 0) return ''
-  const firstKey = normalizedTagSetKey(chats[0]?.tags ?? [])
-  if (chats.some((chat) => normalizedTagSetKey(chat.tags) !== firstKey)) return ''
-  return (chats[0]?.tags ?? [])
-    .map((tagId) => tagById.get(tagId)?.name)
-    .filter((name): name is string => Boolean(name))
-    .join(', ')
-}
-
-function normalizedTagSetKey(tagIds: readonly TagId[]): string {
-  return [...tagIds].sort().join('\u0000')
-}
-
-function tagNamesFromPrompt(value: string): string[] {
-  return value
-    .split(',')
-    .map((item) => item.trim())
-    .filter(Boolean)
-}
-
-function pluralize(word: string, count: number): string {
-  if (count === 1) return word
-  return word.endsWith('y') ? `${word.slice(0, -1)}ies` : `${word}s`
-}
-
-function filterState(id: string, includeIds: readonly string[], excludeIds: readonly string[]) {
-  if (includeIds.includes(id)) return 'include'
-  if (excludeIds.includes(id)) return 'exclude'
-  return 'none'
-}
-
-function filterTitle(
-  name: string,
-  includeIds: readonly string[],
-  excludeIds: readonly string[],
-  id: string,
-): string {
-  const state = filterState(id, includeIds, excludeIds)
-  if (state === 'include') return `Including ${name}; click to exclude`
-  if (state === 'exclude') return `Excluding ${name}; click to clear`
-  return `Click to include ${name}`
-}
-
-function chatPassesStorageFilters(chat: ChatSidebarRow, filters: SearchFilters): boolean {
-  if (filters.archived === 'exclude' && chat.archived) return false
-  if (filters.archived === 'only' && !chat.archived) return false
-  if (
-    filters.includeFolderIds.length > 0 &&
-    (!chat.folderId || !filters.includeFolderIds.includes(chat.folderId))
-  ) {
-    return false
   }
-  if (chat.folderId && filters.excludeFolderIds.includes(chat.folderId)) return false
-  if (
-    filters.includeTagIds.length > 0 &&
-    !chat.tags.some((tagId) => filters.includeTagIds.includes(tagId))
-  ) {
-    return false
-  }
-  if (chat.tags.some((tagId) => filters.excludeTagIds.includes(tagId))) return false
-  return true
-}
-
-function ArchiveManager() {
-  const pushToast = useToastStore((s) => s.push)
-  const chats = useRepositoryQuery('chats:all', () => listChats(), [], allTable('chats'))
-  const [busy, setBusy] = useState<string | null>(null)
-  const archived = chats
-    .filter((chat) => chat.archived)
-    .sort((left, right) => right.updatedAt - left.updatedAt || right.id.localeCompare(left.id))
-  const handleRestore = async (chat: Chat) => {
-    setBusy(chat.id)
-    try {
-      await unarchiveChat(chat.id)
-    } finally {
-      setBusy(null)
-    }
-  }
-  const handleDelete = async (chat: Chat) => {
+  const handleDelete = (chat: ChatSidebarRow) => {
     const title = displayChatTitle(chat)
     if (!window.confirm(`Permanently delete "${title}"? This cannot be undone.`)) return
-    setBusy(chat.id)
-    try {
-      await deleteArchivedChatPermanently(chat.id)
-    } catch (error) {
-      const message = permanentDeleteBlockedMessage(error)
-      if (!message) throw error
-      pushToast({ level: 'warning', text: message })
-    } finally {
-      setBusy(null)
-    }
+    archiveInteraction.run({
+      target: 'archive',
+      action: () => storageApplication.chat.deleteArchived(chat.id),
+    })
   }
-  const handleEmpty = async () => {
-    if (archived.length === 0) return
-    if (!window.confirm(`Permanently delete ${archived.length} archived chats?`)) return
-    setBusy('__all__')
-    try {
-      await emptyArchivedChats()
-    } catch (error) {
-      const message = permanentDeleteBlockedMessage(error)
-      if (!message) throw error
-      pushToast({ level: 'warning', text: message })
-    } finally {
-      setBusy(null)
-    }
+  const handleEmpty = () => {
+    if (archivedCount === 0) return
+    if (!window.confirm(`Permanently delete ${archivedCount} archived chats?`)) return
+    archiveInteraction.run({
+      target: 'archive',
+      action: () => storageApplication.chat.emptyArchive(),
+    })
   }
 
   return (
     <section data-ui="archive-manager">
       <div data-ui="archive-toolbar">
-        <span data-ui="archive-count">{archived.length}</span>
+        <span data-ui="archive-count">{archivedCount}</span>
         <IconButton
           type="button"
           data-ui="storage-action"
           tone="danger"
           aria-label="Empty trash"
           title="Empty trash"
-          disabled={archived.length === 0 || busy !== null}
-          onClick={() => void handleEmpty()}
+          disabled={archivedCount === 0 || archiveBusy || !catalogSession?.interactive}
+          onClick={handleEmpty}
         >
           <TrashIcon size={14} />
         </IconButton>
       </div>
       {archived.length === 0 ? (
-        <p data-ui="helper">No archived chats.</p>
+        <p data-ui="helper">
+          {catalogSession?.status === 'ready' ? 'No archived chats.' : 'Loading archived chats…'}
+        </p>
       ) : (
-        <ul data-ui="archive-list">
-          {archived.map((chat) => {
-            const title = displayChatTitle(chat)
-            const href = chatHref(chat.id)
-            return (
-              <li key={chat.id} data-ui="archive-row">
-                <a data-ui="archive-row-link" href={href} onClick={makeAnchorClickHandler(href)}>
-                  <span data-ui="archive-row-main">
-                    <strong>{title}</strong>
-                    <span>{chat.previewText || shortId(chat.id)}</span>
+        <ul ref={archiveListRef} data-ui="archive-list">
+          {archiveTopSpacer > 0 ? (
+            <li ref={archiveTopSpacerRef} aria-hidden="true" data-ui="archive-virtual-spacer" />
+          ) : null}
+          {(archived.length <= 100 ? archived.map((_, index) => ({ index })) : archiveItems).map(
+            (virtual) => {
+              const chat = archived[virtual.index]
+              if (!chat) return null
+              const title = displayChatTitle(chat)
+              const href = chatHref(chat.id)
+              return (
+                <li
+                  key={chat.id}
+                  data-index={virtual.index}
+                  data-ui="archive-row"
+                  ref={archived.length > 100 ? archiveVirtualizer.measureElement : undefined}
+                >
+                  <a
+                    data-ui="archive-row-link"
+                    href={catalogSession?.interactive ? href : undefined}
+                    aria-disabled={!catalogSession?.interactive || undefined}
+                    tabIndex={catalogSession?.interactive ? undefined : -1}
+                    onClick={
+                      catalogSession?.interactive
+                        ? makeAnchorClickHandler(href)
+                        : (event) => event.preventDefault()
+                    }
+                  >
+                    <span data-ui="archive-row-main">
+                      <strong>{title}</strong>
+                      <span>{chat.previewText || shortId(chat.id)}</span>
+                    </span>
+                    <span data-ui="archive-row-meta">{formatDate(chat.updatedAt)}</span>
+                  </a>
+                  <span data-ui="archive-row-actions">
+                    <IconButton
+                      type="button"
+                      data-ui="archive-restore-button"
+                      aria-label={`Restore ${title}`}
+                      title="Restore to sidebar"
+                      disabled={archiveBusy || !catalogSession?.interactive}
+                      onClick={() => handleRestore(chat)}
+                    >
+                      <UnarchiveIcon size={14} />
+                    </IconButton>
+                    <Button
+                      type="button"
+                      aria-label={`Permanently delete ${title}`}
+                      title="Delete permanently"
+                      disabled={archiveBusy || !catalogSession?.interactive}
+                      onClick={() => handleDelete(chat)}
+                    >
+                      <TrashIcon size={14} />
+                    </Button>
                   </span>
-                  <span data-ui="archive-row-meta">{formatDate(chat.updatedAt)}</span>
-                </a>
-                <span data-ui="archive-row-actions">
-                  <IconButton
-                    type="button"
-                    data-ui="archive-restore-button"
-                    aria-label={`Restore ${title}`}
-                    title="Restore to sidebar"
-                    disabled={busy !== null}
-                    onClick={() => void handleRestore(chat)}
-                  >
-                    <UnarchiveIcon size={14} />
-                  </IconButton>
-                  <Button
-                    type="button"
-                    aria-label={`Permanently delete ${title}`}
-                    title="Delete permanently"
-                    disabled={busy !== null}
-                    onClick={() => void handleDelete(chat)}
-                  >
-                    <TrashIcon size={14} />
-                  </Button>
-                </span>
-              </li>
-            )
-          })}
+                </li>
+              )
+            },
+          )}
+          {archiveBottomSpacer > 0 ? (
+            <li ref={archiveBottomSpacerRef} aria-hidden="true" data-ui="archive-virtual-spacer" />
+          ) : null}
+          {catalogSession?.page.nextCursor ? (
+            <li ref={archiveLoadRef} data-ui="archive-window-load">
+              <Button
+                type="button"
+                disabled={!catalogSession.interactive || catalogSession.status === 'refreshing'}
+                onClick={loadMore}
+              >
+                {catalogSession.status === 'refreshing' ? 'Loading…' : 'Load more'}
+              </Button>
+            </li>
+          ) : null}
         </ul>
       )}
     </section>
   )
-}
-
-function displayChatTitle(chat: { title: string }): string {
-  const trimmed = chat.title.trim()
-  return trimmed.length > 0 ? trimmed : 'Untitled chat'
-}
-
-function permanentDeleteBlockedMessage(error: unknown): string | undefined {
-  if (!(error instanceof ChatStreamBusyError)) return undefined
-  return 'Wait for the active response to finish before permanently deleting this chat.'
 }
 
 function AttachmentManager({
@@ -1905,67 +941,63 @@ function AttachmentManager({
 }: {
   route: Extract<StorageRoute, { section: 'attachments' }>
 }) {
+  const pushToast = useToastStore((state) => state.push)
   const routeFilter = route.filter ?? 'all'
   const [query, setQuery] = useState('')
   const [filter, setFilter] = useState<ManagerFilter>(routeFilter)
   const [replaceTarget, setReplaceTarget] = useState<AttachmentReferenceRow | null>(null)
-  const [bulkDeleting, setBulkDeleting] = useState(false)
+  const [bulkDeleteProgress, setBulkDeleteProgress] = useState<{
+    readonly phase: 'planning' | 'deleting'
+    readonly processed: number
+    readonly planned: number
+  } | null>(null)
+  const bulkDeleteControllerRef = useRef<AbortController | null>(null)
   const uploadRef = useRef<HTMLInputElement | null>(null)
   const replaceUploadRef = useRef<HTMLInputElement | null>(null)
   const selectedId = route.attachmentId
-  const rows = useRepositoryQuery(
-    JSON.stringify(['manager-attachments', query, filter]),
-    async () => listManagerAttachments({ query, filter, limit: 5000 }),
-    [],
-    allTable('attachments', 'attachmentArtifacts'),
+  const searchFilters = useMemo(() => filterToSearch(filter), [filter])
+  const searchRequest = useMemo(
+    () => ({
+      ...(query.trim() ? { query: query.trim() } : {}),
+      ...(searchFilters ? { filters: searchFilters } : {}),
+      sort: 'size-desc' as const,
+    }),
+    [query, searchFilters],
   )
-  const selected = useRepositoryQuery(
-    JSON.stringify(['attachment-bundle', selectedId ?? null]),
-    async () =>
-      selectedId ? await getWorkspaceRepository().getAttachmentBundle(selectedId) : undefined,
-    undefined,
-    attachmentBundleDependencies(selectedId),
-  )
-  const referenceEdges = useRepositoryQuery(
-    JSON.stringify(['attachment-reference-edges', selectedId ?? null]),
-    async () => (selectedId ? await listAttachmentReferenceEdges(selectedId) : []),
-    [],
-    [
-      ...primaryKeys('attachments', selectedId),
-      ...indexKeys('attachmentRefEdges', 'attachmentId', selectedId),
-    ],
-  )
-  const referenceOwnerKey = JSON.stringify(
-    referenceEdges.map((edge) => [
-      edge.ownerKind,
-      edge.ownerId,
-      edge.chatId,
-      edge.refId,
-      edge.ordinal,
-    ]),
-  )
-  const references = useRepositoryQuery(
-    JSON.stringify(['attachment-references', selectedId ?? null, referenceOwnerKey]),
-    async () => (selectedId ? await listAttachmentReferences(selectedId) : []),
-    [],
-    [
-      ...primaryKeys(
-        'messages',
-        ...referenceEdges
-          .filter((edge) => edge.ownerKind === 'message')
-          .map((edge) => edge.ownerId),
-      ),
-      ...primaryKeys(
-        'drafts',
-        ...referenceEdges.filter((edge) => edge.ownerKind === 'draft').map((edge) => edge.ownerId),
-      ),
-      ...primaryKeys('chats', ...referenceEdges.map((edge) => edge.chatId)),
-    ],
-  )
-  const unknownSelected = Boolean(selectedId && selected === undefined)
+  const {
+    search: searchSession,
+    detail: detailSession,
+    detailId,
+    loadMore: loadMoreAttachments,
+  } = useAttachmentManagerCatalogApplication(searchRequest, selectedId)
+  const rows = searchSession?.rows ?? []
+  const exactDetail = detailSession?.detail?.row.id === detailId ? detailSession.detail : undefined
   const displaySelected =
-    selected?.attachment ?? (selectedId ? rows.find((row) => row.id === selectedId) : rows[0])
-  const handleDeleteAttachment = async (attachment: Attachment) => {
+    exactDetail?.row ??
+    (detailId ? rows.find((row) => row.id === detailId) : undefined) ??
+    detailSession?.detail?.row
+  const references = exactDetail?.references ?? []
+  const exactMatchCount =
+    searchSession?.matchedCount ?? (searchSession?.complete ? rows.length : undefined)
+  const unknownSelected = Boolean(
+    selectedId &&
+      detailSession?.attachmentId === selectedId &&
+      detailSession.status === 'ready' &&
+      !exactDetail,
+  )
+
+  useEffect(
+    () => () => {
+      bulkDeleteControllerRef.current?.abort()
+      bulkDeleteControllerRef.current = null
+    },
+    [],
+  )
+
+  if (searchSession?.status === 'error' && rows.length === 0) throw searchSession.error
+  if (detailSession?.status === 'error' && !displaySelected) throw detailSession.error
+
+  const handleDeleteAttachment = async (attachment: AttachmentDisplayRow) => {
     if (!confirmDeleteAttachment(attachment)) return
     const routeIntent = selectedId === attachment.id ? beginRouteIntent() : null
     try {
@@ -1977,7 +1009,6 @@ function AttachmentManager({
       if (routeIntent) cancelRouteIntent(routeIntent)
     }
   }
-
   return (
     <section data-ui="attachment-manager">
       <div data-ui="attachment-manager-toolbar">
@@ -2007,29 +1038,70 @@ function AttachmentManager({
             type="button"
             data-ui="storage-action"
             tone="danger"
-            disabled={bulkDeleting || rows.length === 0}
+            disabled={
+              bulkDeleteProgress === null && (rows.length === 0 || !searchSession?.interactive)
+            }
             onClick={() => {
+              if (bulkDeleteControllerRef.current) {
+                bulkDeleteControllerRef.current.abort()
+                return
+              }
               void (async () => {
                 const routeIntent = beginRouteIntent()
-                setBulkDeleting(true)
+                const controller = new AbortController()
+                bulkDeleteControllerRef.current = controller
+                setBulkDeleteProgress({ phase: 'planning', processed: 0, planned: 0 })
                 try {
-                  const candidates = await listManagerAttachments({ query, filter })
-                  if (candidates.length === 0) return
+                  const plan = await storageApplication.attachment.planBulkDelete(
+                    searchRequest,
+                    controller.signal,
+                  )
+                  if (plan.matchedCount === 0) return
                   if (!isRouteIntentCurrent(routeIntent)) return
-                  if (!confirmDeleteAll(filter, query, candidates.length)) return
-                  const removedIds = await deleteAttachmentsForStorage(candidates)
-                  if (selectedId && removedIds.has(selectedId)) {
+                  if (!confirmDeleteAll(filter, query, plan.matchedCount)) return
+                  setBulkDeleteProgress({
+                    phase: 'deleting',
+                    processed: 0,
+                    planned: plan.matchedCount,
+                  })
+                  const result = await storageApplication.attachment.executeBulkDelete(plan, {
+                    signal: controller.signal,
+                    ...(selectedId ? { selectedAttachmentId: selectedId } : {}),
+                    onProgress: (progress) =>
+                      setBulkDeleteProgress({
+                        phase: 'deleting',
+                        processed: progress.processed,
+                        planned: progress.planned,
+                      }),
+                  })
+                  if (
+                    selectedId &&
+                    (result.selectedDisposition === 'deleted' ||
+                      result.selectedDisposition === 'absent')
+                  ) {
                     navigateForIntent(routeIntent, attachmentListHrefForFilter(filter))
+                  }
+                } catch (error) {
+                  if (!controller.signal.aborted) {
+                    console.error('Failed to bulk delete attachments', error)
+                    pushToast({ level: 'danger', text: 'Attachment deletion failed.' })
                   }
                 } finally {
                   cancelRouteIntent(routeIntent)
-                  setBulkDeleting(false)
+                  if (bulkDeleteControllerRef.current === controller) {
+                    bulkDeleteControllerRef.current = null
+                    setBulkDeleteProgress(null)
+                  }
                 }
               })()
             }}
           >
             <TrashIcon size={14} />
-            {bulkDeleting ? 'Deleting…' : `Delete all${rows.length > 0 ? ` (${rows.length})` : ''}`}
+            {bulkDeleteProgress
+              ? bulkDeleteProgress.phase === 'planning'
+                ? 'Cancel check'
+                : `Cancel delete (${bulkDeleteProgress.processed}/${bulkDeleteProgress.planned})`
+              : `Delete all${exactMatchCount === undefined ? '' : ` (${exactMatchCount})`}`}
           </Button>
         </div>
       </div>
@@ -2042,12 +1114,17 @@ function AttachmentManager({
         <AttachmentTable
           rows={rows}
           selectedId={displaySelected?.id}
+          interactive={Boolean(searchSession?.interactive)}
+          hasMore={Boolean(searchSession?.nextCursor)}
+          loadingMore={searchSession?.status === 'refreshing'}
+          onLoadMore={loadMoreAttachments}
           onDelete={handleDeleteAttachment}
         />
         <AttachmentDetails
           attachment={displaySelected}
-          bundle={displaySelected?.id === selectedId ? selected : undefined}
-          references={displaySelected?.id === selectedId || !selectedId ? references : []}
+          detail={exactDetail}
+          interactive={Boolean(exactDetail && detailSession?.interactive)}
+          references={references}
           onReplaceRef={setReplaceTarget}
           onRestoreUpload={() => uploadRef.current?.click()}
           onReplaceUpload={() => replaceUploadRef.current?.click()}
@@ -2063,13 +1140,13 @@ function AttachmentManager({
           event.currentTarget.value = ''
           if (!file || !displaySelected) return
           void (async () => {
-            const replacement = await ingestAttachmentBytes({
+            const replacement = await storageApplication.attachment.ingestBytes({
               blob: file,
               filename: file.name,
               origin: 'user-upload',
               ...(file.type ? { declaredMime: file.type } : {}),
             })
-            await restoreMissingAttachment({
+            await storageApplication.attachment.restoreMissing({
               missingAttachmentId: displaySelected.id,
               replacementAttachmentId: replacement.attachment.id,
               refs: references.map(referenceTarget),
@@ -2088,7 +1165,7 @@ function AttachmentManager({
           const routeIntent = beginRouteIntent()
           void (async () => {
             try {
-              const result = await replaceAttachmentBytes({
+              const result = await storageApplication.attachment.replaceBytes({
                 attachmentId: displaySelected.id,
                 blob: file,
                 filename: file.name,
@@ -2097,13 +1174,13 @@ function AttachmentManager({
               })
               if (result.reusedExisting && result.bundle.attachment.id !== displaySelected.id) {
                 if (references.length > 0) {
-                  await batchRelinkAttachmentRefs({
+                  await storageApplication.attachment.batchRelinkRefs({
                     oldAttachmentId: displaySelected.id,
                     newAttachmentId: result.bundle.attachment.id,
                     refs: references.map(referenceTarget),
                   })
                 }
-                await deleteUnreferencedAttachment(displaySelected.id)
+                await storageApplication.attachment.deleteUnreferenced(displaySelected.id)
                 navigateForIntent(routeIntent, attachmentHref(result.bundle.attachment.id))
               }
             } finally {
@@ -2114,15 +1191,16 @@ function AttachmentManager({
       />
       {replaceTarget ? (
         <AttachmentPicker
+          sessionSurface="picker-storage-reference"
           title="Relink reference"
           excludeAttachmentId={replaceTarget.ref.attachmentId}
+          interactionTarget={attachmentMutationTarget(referenceTarget(replaceTarget))}
           onClose={() => setReplaceTarget(null)}
           onPick={async (attachment) => {
-            await relinkAttachmentRef({
+            await storageApplication.attachment.relinkRef({
               ...referenceTarget(replaceTarget),
               newAttachmentId: attachment.id,
             })
-            setReplaceTarget(null)
           }}
         />
       ) : null}
@@ -2133,14 +1211,66 @@ function AttachmentManager({
 function AttachmentTable({
   rows,
   selectedId,
+  interactive,
+  hasMore,
+  loadingMore,
+  onLoadMore,
   onDelete,
 }: {
-  rows: Attachment[]
+  rows: readonly AttachmentCatalogRow[]
   selectedId: string | undefined
-  onDelete: (attachment: Attachment) => void | Promise<void>
+  interactive: boolean
+  hasMore: boolean
+  loadingMore: boolean
+  onLoadMore: () => void
+  onDelete: (attachment: AttachmentCatalogRow) => void | Promise<void>
 }) {
+  const scrollRef = useRef<HTMLDivElement | null>(null)
+  const loadRef = useRef<HTMLSpanElement | null>(null)
+  const virtualizer = useVirtualizer<HTMLDivElement, HTMLTableRowElement>({
+    count: rows.length,
+    getScrollElement: () => scrollRef.current,
+    estimateSize: () => 45,
+    getItemKey: (index) => rows[index]?.id ?? index,
+    overscan: 10,
+    initialRect: { width: 720, height: 720 },
+    enabled: rows.length > 100,
+  })
+  const measuredItems = virtualizer.getVirtualItems()
+  const virtualItems =
+    rows.length <= 100 || measuredItems.length > 0
+      ? measuredItems
+      : Array.from({ length: Math.min(40, rows.length) }, (_, index) => ({
+          index,
+          start: index * 45,
+          end: (index + 1) * 45,
+        }))
+  const topSpacer = virtualItems[0]?.start ?? 0
+  const totalSize = measuredItems.length > 0 ? virtualizer.getTotalSize() : rows.length * 45
+  const bottomSpacer =
+    virtualItems.length === 0 ? 0 : Math.max(0, totalSize - (virtualItems.at(-1)?.end ?? 0))
+  const topSpacerRef = useVirtualSpacerHeight<HTMLTableCellElement>(topSpacer)
+  const bottomSpacerRef = useVirtualSpacerHeight<HTMLTableCellElement>(bottomSpacer)
+
+  useEffect(() => {
+    if (!interactive || !hasMore || loadingMore || typeof IntersectionObserver === 'undefined') {
+      return
+    }
+    const root = scrollRef.current
+    const target = loadRef.current
+    if (!root || !target) return
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) onLoadMore()
+      },
+      { root, rootMargin: '0px 0px 240px 0px', threshold: 0 },
+    )
+    observer.observe(target)
+    return () => observer.disconnect()
+  }, [hasMore, interactive, loadingMore, onLoadMore])
+
   return (
-    <div data-ui="attachment-table-wrap">
+    <div ref={scrollRef} data-ui="attachment-table-wrap">
       <table data-ui="attachment-table">
         <thead>
           <tr>
@@ -2152,57 +1282,103 @@ function AttachmentTable({
           </tr>
         </thead>
         <tbody>
-          {rows.map((attachment) => {
-            const href = attachmentHref(attachment.id)
-            return (
-              <tr
-                key={attachment.id}
-                data-selected={selectedId === attachment.id ? 'true' : undefined}
-                tabIndex={0}
-                onClick={(event) => {
-                  if ((event.target as HTMLElement).closest('a, button, input, select, textarea')) {
-                    return
-                  }
-                  navigate(href)
-                }}
-                onKeyDown={(event) => {
-                  if ((event.target as HTMLElement).closest('a, button, input, select, textarea')) {
-                    return
-                  }
-                  if (event.key !== 'Enter' && event.key !== ' ') return
-                  event.preventDefault()
-                  navigate(href)
-                }}
-              >
-                <td>
-                  <a href={href} onClick={makeAnchorClickHandler(href)}>
-                    <FileIcon size={14} />
-                    <span>{attachment.filename}</span>
-                    <small>{shortId(attachment.id)}</small>
-                  </a>
-                </td>
-                <td>
-                  {formatBytes(attachment.sizeBytes)} · {storageLabel(attachment)}
-                </td>
-                <td>{attachment.refCount}</td>
-                <td>{formatDate(attachment.createdAt)}</td>
-                <td data-ui="attachment-table-actions">
-                  <IconButton
-                    type="button"
-                    data-ui="icon-button"
-                    data-size="xs"
-                    size="xs"
-                    aria-label={`Delete ${attachment.filename}`}
-                    title="Delete"
-                    onClick={() => void onDelete(attachment)}
-                  >
-                    <TrashIcon size={13} />
-                  </IconButton>
-                </td>
-              </tr>
-            )
-          })}
+          {topSpacer > 0 ? (
+            <tr data-ui="attachment-virtual-spacer">
+              <td ref={topSpacerRef} colSpan={5} />
+            </tr>
+          ) : null}
+          {(rows.length <= 100 ? rows.map((_, index) => ({ index })) : virtualItems).map(
+            (virtual) => {
+              const attachment = rows[virtual.index]
+              if (!attachment) return null
+              const href = attachmentHref(attachment.id)
+              return (
+                <tr
+                  key={attachment.id}
+                  data-index={virtual.index}
+                  data-selected={selectedId === attachment.id ? 'true' : undefined}
+                  data-inert={!interactive || undefined}
+                  ref={rows.length > 100 ? virtualizer.measureElement : undefined}
+                  tabIndex={interactive ? 0 : -1}
+                  onClick={(event) => {
+                    if (!interactive) return
+                    if (
+                      (event.target as HTMLElement).closest('a, button, input, select, textarea')
+                    ) {
+                      return
+                    }
+                    navigate(href)
+                  }}
+                  onKeyDown={(event) => {
+                    if (!interactive) return
+                    if (
+                      (event.target as HTMLElement).closest('a, button, input, select, textarea')
+                    ) {
+                      return
+                    }
+                    if (event.key !== 'Enter' && event.key !== ' ') return
+                    event.preventDefault()
+                    navigate(href)
+                  }}
+                >
+                  <td>
+                    <a
+                      href={interactive ? href : undefined}
+                      aria-disabled={!interactive || undefined}
+                      tabIndex={interactive ? undefined : -1}
+                      onClick={
+                        interactive
+                          ? makeAnchorClickHandler(href)
+                          : (event) => event.preventDefault()
+                      }
+                    >
+                      <FileIcon size={14} />
+                      <span>{attachment.filename}</span>
+                      <small>{shortId(attachment.id)}</small>
+                    </a>
+                  </td>
+                  <td>
+                    {formatBytes(attachment.sizeBytes)} · {storageLabel(attachment)}
+                  </td>
+                  <td>{attachment.refCount}</td>
+                  <td>{formatDate(attachment.createdAt)}</td>
+                  <td data-ui="attachment-table-actions">
+                    <IconButton
+                      type="button"
+                      data-ui="icon-button"
+                      data-size="xs"
+                      size="xs"
+                      aria-label={`Delete ${attachment.filename}`}
+                      title="Delete"
+                      disabled={!interactive}
+                      onClick={() => void onDelete(attachment)}
+                    >
+                      <TrashIcon size={13} />
+                    </IconButton>
+                  </td>
+                </tr>
+              )
+            },
+          )}
+          {bottomSpacer > 0 ? (
+            <tr data-ui="attachment-virtual-spacer">
+              <td ref={bottomSpacerRef} colSpan={5} />
+            </tr>
+          ) : null}
         </tbody>
+        {hasMore ? (
+          <tfoot>
+            <tr data-ui="attachment-window-load">
+              <td colSpan={5}>
+                <span ref={loadRef}>
+                  <Button type="button" disabled={!interactive || loadingMore} onClick={onLoadMore}>
+                    {loadingMore ? 'Loading…' : 'Load more'}
+                  </Button>
+                </span>
+              </td>
+            </tr>
+          </tfoot>
+        ) : null}
       </table>
     </div>
   )
@@ -2210,24 +1386,27 @@ function AttachmentTable({
 
 function AttachmentDetails({
   attachment,
-  bundle,
+  detail,
+  interactive,
   references,
   onReplaceRef,
   onRestoreUpload,
   onReplaceUpload,
   onDelete,
 }: {
-  attachment: Attachment | undefined
-  bundle: AttachmentBundle | undefined
-  references: AttachmentReferenceRow[]
+  attachment: AttachmentCatalogRow | undefined
+  detail: AttachmentManagerDetail | undefined
+  interactive: boolean
+  references: readonly AttachmentReferenceRow[]
   onReplaceRef: (reference: AttachmentReferenceRow) => void
   onRestoreUpload: () => void
   onReplaceUpload: () => void
-  onDelete: (attachment: Attachment) => void | Promise<void>
+  onDelete: (attachment: AttachmentCatalogRow) => void | Promise<void>
 }) {
   const pushToast = useToastStore((s) => s.push)
   const [downloadBusy, setDownloadBusy] = useState(false)
   const canDownload = Boolean(attachment && attachment.storage.kind !== 'missing')
+  const textPreview = detail?.artifacts.find((artifact) => artifact.kind === 'text')?.textPreview
   const handleDownload = useCallback(async () => {
     if (!attachment || !canDownload) return
     setDownloadBusy(true)
@@ -2256,7 +1435,7 @@ function AttachmentDetails({
           {attachment.filename}
         </span>
       </header>
-      <AttachmentPreview attachment={attachment} bundle={bundle} variant="panel" />
+      <AttachmentPreview attachment={attachment} textPreview={textPreview} variant="panel" />
       <dl data-ui="attachment-metadata">
         <Meta label="id" value={attachment.id} />
         <Meta label="kind" value={kindLabel(attachment.kind)} />
@@ -2266,6 +1445,11 @@ function AttachmentDetails({
         <Meta label="hash" value={attachment.contentHash ?? 'none'} />
         <Meta label="origin" value={attachment.origin} />
         <Meta label="created" value={formatDate(attachment.createdAt)} />
+        <Meta label="updated" value={formatDate(attachment.updatedAt)} />
+        <Meta
+          label="references"
+          value={`${attachment.messageRefCount} message · ${attachment.draftRefCount} draft · ${attachment.visibleRefCount} in context`}
+        />
         {attachment.sourceUrl ? <Meta label="URL" value={attachment.sourceUrl} /> : null}
         {attachment.pageCount !== undefined ? (
           <Meta label="pages" value={String(attachment.pageCount)} />
@@ -2276,13 +1460,30 @@ function AttachmentDetails({
             value={`${attachment.dimensions.width}×${attachment.dimensions.height}`}
           />
         ) : null}
+        {attachment.durationMs !== undefined ? (
+          <Meta label="duration" value={`${Math.round(attachment.durationMs / 1000)}s`} />
+        ) : null}
+        {attachment.processing.map((state) => (
+          <Meta
+            key={state.processorId}
+            label={`processor · ${state.processorId}`}
+            value={state.errorCode ? `${state.status} · ${state.errorCode}` : state.status}
+          />
+        ))}
+        {detail?.jobs.map((job) => (
+          <Meta
+            key={job.id}
+            label={`job · ${job.processorId}`}
+            value={job.error ? `${job.status} · ${job.error.code}` : job.status}
+          />
+        ))}
       </dl>
       <div data-ui="attachment-lifecycle-actions">
         {canDownload ? (
           <Button
             type="button"
             data-ui="storage-action"
-            disabled={downloadBusy}
+            disabled={downloadBusy || !interactive}
             aria-label={`Download ${attachment.filename}`}
             onClick={() => void handleDownload()}
           >
@@ -2290,12 +1491,22 @@ function AttachmentDetails({
             {downloadBusy ? 'Downloading...' : 'Download'}
           </Button>
         ) : null}
-        <Button type="button" data-ui="storage-action" onClick={onReplaceUpload}>
+        <Button
+          type="button"
+          data-ui="storage-action"
+          disabled={!interactive}
+          onClick={onReplaceUpload}
+        >
           <UploadIcon size={14} />
           Replace
         </Button>
         {attachment.storage.kind === 'missing' ? (
-          <Button type="button" data-ui="storage-action" onClick={onRestoreUpload}>
+          <Button
+            type="button"
+            data-ui="storage-action"
+            disabled={!interactive}
+            onClick={onRestoreUpload}
+          >
             <UploadIcon size={14} />
             Restore
           </Button>
@@ -2304,6 +1515,7 @@ function AttachmentDetails({
           type="button"
           data-ui="storage-action"
           tone="danger"
+          disabled={!interactive}
           onClick={() => void onDelete(attachment)}
         >
           <TrashIcon size={14} />
@@ -2341,8 +1553,9 @@ function AttachmentDetails({
                         ? 'Hide this exact reference from future context'
                         : 'Include this exact reference in future context'
                     }
+                    disabled={!interactive}
                     onClick={() =>
-                      void setAttachmentRefVisibility({
+                      void storageApplication.attachment.setRefVisibility({
                         ...referenceTarget(row),
                         includeInContext: !row.ref.includeInContext,
                       })
@@ -2357,6 +1570,7 @@ function AttachmentDetails({
                     size="xs"
                     aria-label="Relink reference"
                     title="Relink this exact reference to another stored attachment"
+                    disabled={!interactive}
                     onClick={() => onReplaceRef(row)}
                   >
                     <DatabaseIcon size={13} />
@@ -2368,7 +1582,10 @@ function AttachmentDetails({
                     size="xs"
                     aria-label="Detach reference"
                     title="Detach this exact reference"
-                    onClick={() => void detachAttachmentRef(referenceTarget(row))}
+                    disabled={!interactive}
+                    onClick={() =>
+                      void storageApplication.attachment.detachRef(referenceTarget(row))
+                    }
                   >
                     <CloseIcon size={13} />
                   </IconButton>
@@ -2391,14 +1608,14 @@ function Meta({ label, value }: { label: string; value: string }) {
   )
 }
 
-async function downloadAttachment(attachment: Attachment): Promise<void> {
+async function downloadAttachment(attachment: AttachmentDisplayRow): Promise<void> {
   if (attachment.storage.kind === 'missing') throw new Error(`AttachmentMissing:${attachment.id}`)
   if (attachment.storage.kind === 'remote-url') {
     triggerRemoteAttachmentDownload(attachment.filename, attachment.storage.url)
     return
   }
 
-  const bundle = await getWorkspaceRepository().getAttachmentBundle(attachment.id)
+  const bundle = await storageApplication.attachment.getBundle(attachment.id)
   const blobRow = selectAttachmentDownloadBlob(attachment, bundle)
   if (!blobRow) throw new Error(`AttachmentBlobMissing:${attachment.id}`)
   const blob = await attachmentDownloadBlob(blobRow)
@@ -2434,8 +1651,8 @@ async function attachmentDownloadBlob(blobRow: AttachmentBlob): Promise<Blob> {
 }
 
 function selectAttachmentDownloadBlob(
-  attachment: Attachment,
-  bundle: AttachmentBundle | undefined,
+  attachment: AttachmentDisplayRow,
+  bundle: PreparedAttachmentBundle | undefined,
 ) {
   if (!bundle || attachment.storage.kind !== 'local-blob') return undefined
   const blobId = attachment.storage.blobId
@@ -2466,61 +1683,22 @@ function filterToSearch(filter: ManagerFilter) {
     return { kind: filter as AttachmentKind }
   }
   if (filter === 'document') return { kind: 'document' as AttachmentKind }
+  if (filter === 'generated') return { origin: 'generated-output' as const }
   return undefined
 }
 
-async function listManagerAttachments({
-  query,
-  filter,
-  limit,
-}: {
-  query: string
-  filter: ManagerFilter
-  limit?: number
-}): Promise<Attachment[]> {
-  const filters = filterToSearch(filter)
-  const rows: Attachment[] = []
-  let cursor: string | undefined
-  do {
-    const page = await getWorkspaceRepository().searchAttachments({
-      query,
-      ...(filters ? { filters } : {}),
-      sort: 'size-desc',
-      limit: 500,
-      ...(cursor ? { cursor } : {}),
-    })
-    const pageRows =
-      filter === 'generated'
-        ? page.rows.filter((row) => row.origin === 'generated-output')
-        : page.rows
-    rows.push(...pageRows)
-    cursor = page.nextCursor
-  } while (cursor && (limit === undefined || rows.length < limit))
-  return limit === undefined ? rows : rows.slice(0, limit)
-}
-
-export async function deleteAttachmentForStorage(attachment: Attachment): Promise<boolean> {
+export async function deleteAttachmentForStorage(
+  attachment: AttachmentDisplayRow,
+): Promise<boolean> {
   if (attachment.refCount === 0) {
-    const result = await deleteUnreferencedAttachment(attachment.id)
+    const result = await storageApplication.attachment.deleteUnreferenced(attachment.id)
     return result.deleted
   }
-  await deleteReferencedAttachmentBytes(attachment.id, 'deleted')
+  await storageApplication.attachment.deleteReferencedBytes(attachment.id, 'deleted')
   return false
 }
 
-async function deleteAttachmentsForStorage(
-  attachments: readonly Attachment[],
-): Promise<Set<string>> {
-  const removed = new Set<string>()
-  for (const attachment of attachments) {
-    if (await deleteAttachmentForStorage(attachment)) {
-      removed.add(attachment.id)
-    }
-  }
-  return removed
-}
-
-function confirmDeleteAttachment(attachment: Attachment): boolean {
+function confirmDeleteAttachment(attachment: AttachmentDisplayRow): boolean {
   if (attachment.refCount === 0) {
     return window.confirm(`Delete "${attachment.filename}"?`)
   }

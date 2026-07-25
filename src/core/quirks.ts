@@ -18,9 +18,10 @@
 // OpenRouter aliases and direct-provider ids do not drift apart.
 
 import { canonicalCompatModelId, canonicalModelSlug } from './model-ids'
+import type { ReasoningVisibilityPolicy } from './reasoning'
 import type { EffortLevel, ReasoningFormat, VerbosityLevel } from './types'
 
-// `native`  — prefill works transparently (Claude < 4.6, Gemini).
+// `native`  — prefill works transparently for the selected model/route.
 // `unsupported` — provider or model rejects prefill (Claude ≥ 4.6,
 //                 openai/gpt-oss-*, OpenAI GPT family).
 // `oss-toggleable` — default for hybrid thinking-capable OSS models;
@@ -67,7 +68,7 @@ interface QuirksEntry {
   // works (e.g. GPT-5 / o-series).
   preferApi?: 'chat' | 'responses'
   // Which `ReasoningFormat` the model's encrypted carrier uses. Drives the
-  // carry-forward matrix in `core/transforms.ts`:
+  // carry-forward matrix in `api/request-transforms.ts`:
   //  - `openai-responses-v1` / `azure-openai-responses-v1` — OpenAI direct
   //    or via OpenRouter (proxied; format flips to `azure-openai-responses-v1`
   //    per live probe 6).
@@ -81,6 +82,10 @@ interface QuirksEntry {
   // Claude 4.7+ uses adaptive-only reasoning: `reasoning` is in
   // supported_parameters but `effort` and `max_tokens` are ignored or rejected.
   adaptiveReasoningOnly?: boolean
+  // The model accepts these legacy sampling fields but ignores them. Remove
+  // their controls from the effective capability instead of trusting stale
+  // provider metadata that may still advertise them.
+  dropsSamplingParams?: boolean
   // Anthropic does not honor cache_control below this per-model token floor.
   cacheMinTokens?: number
   // `phase` field must be persisted verbatim across Responses-API turns
@@ -98,14 +103,7 @@ interface QuirksEntry {
   // Thinking, GLM-4.x thinking, etc.) by scanning the first chunk for a
   // leading `<think>` / `<thought>` tag.
   reasoningInlineTags?: readonly string[]
-  // Reasoning happens but isn't returned (OpenAI o-series on chat-
-  // completions; some preview Gemini). The UI hides the reasoning panel
-  // on these.
-  reasoningHidden?: boolean
-  // Phase 11 preferred spelling — scoped to the chat-completions API so
-  // the UI can keep rendering the reasoning panel on `responses` (where
-  // the same model DOES return reasoning).
-  hiddenReasoningOnChatApi?: boolean
+  reasoningVisibility?: ReasoningVisibilityPolicy
   // GPT-5.3-codex / GPT-5.4+ family:
   // `temperature`, `top_p`, `logprobs`, `top_k` are ONLY accepted when
   // `reasoning.effort === 'none'`. With any other effort the API rejects
@@ -139,7 +137,8 @@ interface QuirksEntry {
   // Assistant-prefill classification. Unset defaults to `oss-toggleable`
   // (the permissive case for any model not explicitly listed). The three
   // buckets that DO need an entry: `unsupported` for Claude ≥ 4.6 / gpt-oss /
-  // plain OpenAI GPT; `native` for Claude < 4.6 / Gemini; and
+  // plain OpenAI GPT / explicit Gemini exceptions; `native` for Claude < 4.6 /
+  // supported Gemini models; and
   // `oss-reasoning-required` for the P.7 list (models whose reasoning can't
   // be toggled off).
   prefillClass?: PrefillClass
@@ -172,6 +171,10 @@ const CLAUDE_ADAPTIVE_ONLY_QUIRKS: QuirksEntry = {
   allowedEffort: [],
   allowedVerbosity: ['low', 'medium', 'high', 'xhigh', 'max'],
   reasoningPreservationFormat: 'anthropic-claude-v1',
+  reasoningVisibility: {
+    kind: 'anthropic-summary',
+    directDefault: 'omitted',
+  },
 }
 
 const CLAUDE_OPUS_47_PLUS_QUIRKS: QuirksEntry = {
@@ -183,6 +186,11 @@ const CLAUDE_SONNET_5_PLUS_QUIRKS: QuirksEntry = {
   ...CLAUDE_ADAPTIVE_ONLY_QUIRKS,
   cacheMinTokens: 1024,
 }
+
+const SUMMARY_ONLY_REASONING: ReasoningVisibilityPolicy = Object.freeze({
+  kind: 'uniform',
+  visibleKind: 'summary',
+})
 
 const REGISTRY: Record<string, QuirksEntry> = {
   // Anthropic Opus 4.7+ — no temperature/top_p/top_k (already filtered by the
@@ -327,16 +335,14 @@ const REGISTRY: Record<string, QuirksEntry> = {
   },
   'o1-pro': {
     requiresResponsesApi: true,
-    hiddenReasoningOnChatApi: true,
-    reasoningHidden: true,
+    reasoningVisibility: { kind: 'hidden-on-chat', otherwise: 'summary' },
     allowedVerbosity: [],
     reasoningPreservationFormat: 'openai-responses-v1',
     responsesSupport: 'responses-only',
   },
   'o3-pro': {
     requiresResponsesApi: true,
-    hiddenReasoningOnChatApi: true,
-    reasoningHidden: true,
+    reasoningVisibility: { kind: 'hidden-on-chat', otherwise: 'summary' },
     allowedVerbosity: [],
     reasoningPreservationFormat: 'openai-responses-v1',
     responsesSupport: 'responses-only',
@@ -344,37 +350,32 @@ const REGISTRY: Record<string, QuirksEntry> = {
 
   // OpenAI o-series: reasoning runs but is NOT returned over chat-
   // completions (Responses API is needed to see it). `preferApi: 'responses'`
-  // + `hiddenReasoningOnChatApi: true` means the UI hides the panel on chat
+  // + `reasoningVisibility: hidden-on-chat` means the UI hides the panel on chat
   // but shows it when the route is upgraded.
   o1: {
-    hiddenReasoningOnChatApi: true,
-    reasoningHidden: true,
+    reasoningVisibility: { kind: 'hidden-on-chat', otherwise: 'summary' },
     preferApi: 'responses',
     allowedVerbosity: [],
     reasoningPreservationFormat: 'openai-responses-v1',
   },
   'o1-mini': {
-    reasoningHidden: true,
-    hiddenReasoningOnChatApi: true,
+    reasoningVisibility: { kind: 'hidden-on-chat', otherwise: 'summary' },
     allowedVerbosity: [],
   },
   'o3-mini': {
-    hiddenReasoningOnChatApi: true,
-    reasoningHidden: true,
+    reasoningVisibility: { kind: 'hidden-on-chat', otherwise: 'summary' },
     preferApi: 'responses',
     allowedVerbosity: [],
     reasoningPreservationFormat: 'openai-responses-v1',
   },
   o3: {
-    hiddenReasoningOnChatApi: true,
-    reasoningHidden: true,
+    reasoningVisibility: { kind: 'hidden-on-chat', otherwise: 'summary' },
     preferApi: 'responses',
     allowedVerbosity: [],
     reasoningPreservationFormat: 'openai-responses-v1',
   },
   'o4-mini': {
-    hiddenReasoningOnChatApi: true,
-    reasoningHidden: true,
+    reasoningVisibility: { kind: 'hidden-on-chat', otherwise: 'summary' },
     preferApi: 'responses',
     allowedVerbosity: [],
     reasoningPreservationFormat: 'openai-responses-v1',
@@ -532,6 +533,10 @@ function openAiGpt54PlusFamilyQuirks(normalized: string): QuirksEntry | null {
 const GEMINI_3_PRO_PATTERN = /^gemini-3(?::\d+)?-pro(?:$|-)/
 const GEMINI_3_FLASH_PATTERN = /^gemini-3(?::\d+)?-flash(?:$|-)/
 const GEMINI_3_ANY_PATTERN = /^gemini-3(?::\d+)?(?:$|-)/
+const GEMINI_DROPS_SAMPLING_PARAMS: ReadonlySet<string> = new Set([
+  'gemini-3:5-flash-lite',
+  'gemini-3:6-flash',
+])
 
 function gemini3FamilyQuirks(normalized: string): QuirksEntry | null {
   if (GEMINI_3_PRO_PATTERN.test(normalized)) {
@@ -544,6 +549,7 @@ function gemini3FamilyQuirks(normalized: string): QuirksEntry | null {
     return {
       allowedEffort: ['minimal', 'low', 'medium', 'high'],
       reasoningPreservationFormat: 'google-gemini-v1',
+      ...(GEMINI_DROPS_SAMPLING_PARAMS.has(normalized) ? { dropsSamplingParams: true } : {}),
     }
   }
   return null
@@ -579,6 +585,9 @@ function claudeVersionAtLeast(version: ClaudeVersion, major: number, minor: numb
 function claudeFamilyQuirks(normalized: string): QuirksEntry | null {
   const version = claudeVersionFor(normalized)
   if (!version) return null
+  if (version.family === 'opus' && claudeVersionAtLeast(version, 4, 8)) {
+    return CLAUDE_OPUS_47_PLUS_QUIRKS
+  }
   if (version.family === 'opus' && claudeVersionAtLeast(version, 4, 7)) {
     return CLAUDE_OPUS_47_PLUS_QUIRKS
   }
@@ -614,6 +623,22 @@ export function quirksFor(modelId: string): QuirksEntry {
   return {}
 }
 
+export function reasoningVisibilityPolicyFor(modelId: string): ReasoningVisibilityPolicy {
+  return reasoningVisibilityPolicyFromQuirks(quirksFor(modelId))
+}
+
+export function reasoningVisibilityPolicyFromQuirks(
+  quirks: Pick<QuirksEntry, 'reasoningVisibility' | 'reasoningPreservationFormat'>,
+): ReasoningVisibilityPolicy {
+  if (quirks.reasoningVisibility) return quirks.reasoningVisibility
+  return quirks.reasoningPreservationFormat === 'google-gemini-v1' ||
+    quirks.reasoningPreservationFormat === 'openai-responses-v1' ||
+    quirks.reasoningPreservationFormat === 'azure-openai-responses-v1' ||
+    quirks.reasoningPreservationFormat === 'xai-responses-v1'
+    ? SUMMARY_ONLY_REASONING
+    : { kind: 'uniform', visibleKind: 'text' }
+}
+
 export function allowedEffortFor(modelId: string): readonly EffortLevel[] {
   const q = quirksFor(modelId)
   return q.allowedEffort ?? FULL_EFFORT
@@ -634,8 +659,8 @@ export function reasoningPreservationFormatFor(modelId: string): ReasoningFormat
 
 // True for OpenAI-family slugs that support the Responses API (gpt-*, o1/o3/o4
 // series minus chat-latest aliases and gpt-3.5-turbo-instruct). Used as a
-// fallback when the model isn't in the registry so OpenAI models on
-// OpenRouter still route to Responses by default.
+// fallback when the model isn't in the registry. Route selection still honors
+// connection defaults and uses this only for Responses capability/requirements.
 function slugIsOpenAiResponsesFamily(stripped: string): boolean {
   if (!stripped) return false
   if (stripped.endsWith('-chat-latest')) return false
@@ -686,6 +711,11 @@ export function emitsEncryptedReasoningFor(modelId: string): 'always' | 'tools-o
 // prefill, add a registry entry for that slug with `prefillClass: 'native'`.
 const OPENAI_PREFILL_UNSUPPORTED_PATTERN = /^(?:gpt-|chatgpt-|o\d|gpt-oss)/
 
+const PREFILL_UNSUPPORTED_GEMINI_MODELS: ReadonlySet<string> = new Set([
+  'gemini-3:5-flash-lite',
+  'gemini-3:6-flash',
+])
+
 // Models that reject `reasoning.enabled: false` outright OR accept it
 // silently while still emitting reasoning tokens (per the r12/r13 probe
 // sweep). Generic default is "toggleable"; only these are reasoning-locked.
@@ -720,6 +750,7 @@ export function prefillClassFor(modelId: string): PrefillClass {
   const q = quirksFor(modelId)
   if (q.prefillClass) return q.prefillClass
   const slug = canonicalCompatModelId(modelId)
+  if (PREFILL_UNSUPPORTED_GEMINI_MODELS.has(slug)) return 'unsupported'
   const claude = claudeVersionFor(slug)
   if (claude && claudeVersionAtLeast(claude, 4, 6)) return 'unsupported'
   if (OPENAI_PREFILL_UNSUPPORTED_PATTERN.test(slug)) return 'unsupported'

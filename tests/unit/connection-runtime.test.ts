@@ -1,15 +1,21 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ConnectionProfile, KeyId } from '../../src/core/types'
-import { postEvent } from '../../src/store/broadcast'
 import {
   __resetConnectionRuntimeForTests,
+  CONNECTION_RUNTIME_KEY_PREFERENCE_LIMIT,
+  ConnectionRuntimeKeyPreferenceSession,
   ConnectionRuntimeKeysUnavailableError,
   connectionKeyRefs,
   connectionRequiresKey,
   primeConnectionRuntimeKeyCandidates,
+  recordAcceptedConnectionRuntimeKeyPreference,
   resolveConnectionRuntimeKeys,
 } from '../../src/store/connection-runtime'
 import { PassphraseRequiredError, WrongPassphraseError } from '../../src/store/keys'
+import {
+  deleteChatFromWorkspaceTabSession,
+  reconcileWorkspaceTabSessionStorage,
+} from '../../src/store/workspace-tab-session'
 
 function profile(
   apiKeyRef: KeyId,
@@ -41,7 +47,6 @@ function keyAccess(
   return {
     exists: vi.fn(async (ref: KeyId) => existing.includes(ref)),
     resolve: vi.fn(resolve),
-    markUsed: vi.fn(async (_ref: KeyId) => {}),
   }
 }
 
@@ -72,7 +77,6 @@ describe('connection runtime keys', () => {
     await expect(candidates[1]?.resolve()).resolves.toBe('secret-for-fallback-a')
     expect(access.resolve).toHaveBeenCalledOnce()
     expect(access.resolve).toHaveBeenCalledWith('fallback-a')
-    expect(access.markUsed).not.toHaveBeenCalled()
   })
 
   it('skips missing records while preserving configured chain indices', async () => {
@@ -157,8 +161,6 @@ describe('connection runtime keys', () => {
     expect(JSON.stringify(primed)).not.toContain(secret)
     await expect(primed?.[0]?.resolve()).resolves.toBe(secret)
     expect(access.resolve).toHaveBeenCalledOnce()
-    await expect(primed?.[0]?.markUsed()).resolves.toBeUndefined()
-    expect(access.markUsed).toHaveBeenCalledWith('primary')
     await expect(primed?.[1]?.resolve()).resolves.toBe('fallback-secret')
     expect(access.resolve.mock.calls.map(([ref]) => ref)).toEqual(['primary', 'fallback'])
   })
@@ -176,48 +178,175 @@ describe('connection runtime keys', () => {
     expect(candidate?.ref).toBeNull()
     expect(candidate?.index).toBe(0)
     await expect(candidate?.resolve()).resolves.toBe('')
-    await expect(candidate?.markUsed()).resolves.toBeUndefined()
-    expect(access.markUsed).not.toHaveBeenCalled()
   })
 
-  it('marks only the successful candidate used and prefers it for that chat session', async () => {
+  it('prefers an explicitly accepted key for only that chat and profile', async () => {
     const access = keyAccess(['primary', 'fallback'])
     const connection = profile('primary', ['fallback'])
-    const first = await resolveConnectionRuntimeKeys(connection, { chatId: 'chat-a', access })
+    await resolveConnectionRuntimeKeys(connection, { chatId: 'chat-a', access })
+    recordAcceptedConnectionRuntimeKeyPreference({
+      chatId: 'chat-a',
+      profileId: connection.id,
+      ref: 'fallback',
+      index: 1,
+    })
 
-    await first[1]?.markUsed()
-
-    expect(access.markUsed).toHaveBeenCalledOnce()
-    expect(access.markUsed).toHaveBeenCalledWith('fallback')
     const next = await resolveConnectionRuntimeKeys(connection, { chatId: 'chat-a', access })
     expect(next.map(({ ref, index }) => ({ ref, index }))).toEqual([
       { ref: 'fallback', index: 1 },
       { ref: 'primary', index: 0 },
     ])
-
-    postEvent({ kind: 'workspace-replaced', replacementEpoch: 1 })
-    const afterReplacement = await resolveConnectionRuntimeKeys(connection, {
-      chatId: 'chat-a',
-      access,
-    })
-    expect(afterReplacement.map(({ ref }) => ref)).toEqual(['primary', 'fallback'])
+    expect(
+      (await resolveConnectionRuntimeKeys(connection, { chatId: 'chat-b', access })).map(
+        ({ ref }) => ref,
+      ),
+    ).toEqual(['primary', 'fallback'])
+    expect(
+      (
+        await resolveConnectionRuntimeKeys(
+          { ...connection, id: 'profile-b' },
+          { chatId: 'chat-a', access },
+        )
+      ).map(({ ref }) => ref),
+    ).toEqual(['primary', 'fallback'])
   })
 
-  it('updates the session preference before best-effort key metadata finishes', async () => {
-    let releaseMetadata: (() => void) | undefined
-    const metadataBlocked = new Promise<void>((resolve) => {
-      releaseMetadata = resolve
+  it('clears accepted-key preference with its chat and workspace tab session', async () => {
+    const access = keyAccess(['primary', 'fallback'])
+    const connection = profile('primary', ['fallback'])
+    recordAcceptedConnectionRuntimeKeyPreference({
+      chatId: 'chat-a',
+      profileId: connection.id,
+      ref: 'fallback',
+      index: 1,
+    })
+
+    deleteChatFromWorkspaceTabSession('chat-a')
+    expect(
+      (await resolveConnectionRuntimeKeys(connection, { chatId: 'chat-a', access })).map(
+        ({ ref }) => ref,
+      ),
+    ).toEqual(['primary', 'fallback'])
+
+    recordAcceptedConnectionRuntimeKeyPreference({
+      chatId: 'chat-a',
+      profileId: connection.id,
+      ref: 'fallback',
+      index: 1,
+    })
+    reconcileWorkspaceTabSessionStorage({
+      workspaceId: `connection-runtime-${crypto.randomUUID()}`,
+      replacementEpoch: 1,
+    })
+    expect(
+      (await resolveConnectionRuntimeKeys(connection, { chatId: 'chat-a', access })).map(
+        ({ ref }) => ref,
+      ),
+    ).toEqual(['primary', 'fallback'])
+  })
+
+  it('does not publish the tab preference before durable selected-key work settles', async () => {
+    let releaseDurableNote: (() => void) | undefined
+    const durableNote = new Promise<void>((resolve) => {
+      releaseDurableNote = resolve
     })
     const access = keyAccess(['primary', 'fallback'])
-    access.markUsed.mockImplementationOnce(() => metadataBlocked)
     const connection = profile('primary', ['fallback'])
-    const first = await resolveConnectionRuntimeKeys(connection, { chatId: 'chat-a', access })
 
-    const marking = first[1]?.markUsed()
-    const next = await resolveConnectionRuntimeKeys(connection, { chatId: 'chat-a', access })
-    expect(next.map(({ ref }) => ref)).toEqual(['fallback', 'primary'])
+    const accepting = (async () => {
+      await durableNote
+      recordAcceptedConnectionRuntimeKeyPreference({
+        chatId: 'chat-a',
+        profileId: connection.id,
+        ref: 'fallback',
+        index: 1,
+      })
+    })()
+    expect(
+      (await resolveConnectionRuntimeKeys(connection, { chatId: 'chat-a', access })).map(
+        ({ ref }) => ref,
+      ),
+    ).toEqual(['primary', 'fallback'])
 
-    releaseMetadata?.()
-    await marking
+    releaseDurableNote?.()
+    await accepting
+    expect(
+      (await resolveConnectionRuntimeKeys(connection, { chatId: 'chat-a', access })).map(
+        ({ ref }) => ref,
+      ),
+    ).toEqual(['fallback', 'primary'])
+  })
+
+  it('keeps preferences isolated between tab-session owners', async () => {
+    const access = keyAccess(['primary', 'fallback'])
+    const candidates = await resolveConnectionRuntimeKeys(profile('primary', ['fallback']), {
+      access,
+    })
+    const tabA = new ConnectionRuntimeKeyPreferenceSession(2)
+    const tabB = new ConnectionRuntimeKeyPreferenceSession(2)
+    tabA.accept('chat-a', 'profile-a', 'fallback')
+
+    expect(tabA.order('profile-a', 'chat-a', candidates).map(({ ref }) => ref)).toEqual([
+      'fallback',
+      'primary',
+    ])
+    expect(tabB.order('profile-a', 'chat-a', candidates).map(({ ref }) => ref)).toEqual([
+      'primary',
+      'fallback',
+    ])
+  })
+
+  it('retains only a bounded least-recently-used set with constant-time chat eviction', async () => {
+    const session = new ConnectionRuntimeKeyPreferenceSession()
+    for (let index = 0; index < CONNECTION_RUNTIME_KEY_PREFERENCE_LIMIT + 32; index += 1) {
+      session.accept(`chat-${index}`, 'profile-a', 'fallback')
+    }
+    expect(session.retainedChatCount).toBe(CONNECTION_RUNTIME_KEY_PREFERENCE_LIMIT)
+
+    const access = keyAccess(['primary', 'fallback'])
+    const candidates = await resolveConnectionRuntimeKeys(profile('primary', ['fallback']), {
+      access,
+    })
+    expect(session.order('profile-a', 'chat-0', candidates).map(({ ref }) => ref)).toEqual([
+      'primary',
+      'fallback',
+    ])
+    expect(
+      session
+        .order('profile-a', `chat-${CONNECTION_RUNTIME_KEY_PREFERENCE_LIMIT + 31}`, candidates)
+        .map(({ ref }) => ref),
+    ).toEqual(['fallback', 'primary'])
+  })
+
+  it('drops a preference whose key no longer belongs to the captured candidate chain', async () => {
+    const session = new ConnectionRuntimeKeyPreferenceSession(2)
+    const access = keyAccess(['primary'])
+    const candidates = await resolveConnectionRuntimeKeys(profile('primary'), { access })
+    session.accept('chat-a', 'profile-a', 'removed-fallback')
+
+    expect(session.order('profile-a', 'chat-a', candidates)).toEqual(candidates)
+    expect(session.retainedChatCount).toBe(0)
+  })
+
+  it('retains a configured fallback preference while an earlier key is temporarily unavailable', async () => {
+    const session = new ConnectionRuntimeKeyPreferenceSession(2)
+    session.accept('chat-a', 'profile-a', 'fallback')
+    const missingPrimary = await resolveConnectionRuntimeKeys(
+      profile('missing-primary', ['fallback']),
+      { access: keyAccess(['fallback']) },
+    )
+
+    expect(session.order('profile-a', 'chat-a', missingPrimary).map(({ ref }) => ref)).toEqual([
+      'fallback',
+    ])
+    expect(session.retainedChatCount).toBe(1)
+
+    const restoredPrimary = await resolveConnectionRuntimeKeys(profile('primary', ['fallback']), {
+      access: keyAccess(['primary', 'fallback']),
+    })
+    expect(session.order('profile-a', 'chat-a', restoredPrimary).map(({ ref }) => ref)).toEqual([
+      'fallback',
+      'primary',
+    ])
   })
 })

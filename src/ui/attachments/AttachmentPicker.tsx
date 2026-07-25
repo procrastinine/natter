@@ -1,14 +1,28 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useState, useSyncExternalStore } from 'react'
+import {
+  attachmentMutationInteraction,
+  definePresentationInteraction,
+} from '../../app/presentation-interactions'
 import type { Attachment, AttachmentKind } from '../../core/types'
-import { getWorkspaceRepository } from '../../store/workspace-repository'
+import { useAttachmentSearchSession } from '../../hooks/useAttachmentSearchSession'
+import { usePresentationInteraction } from '../../hooks/usePresentationInteraction'
+import { getAttachment } from '../../store/attachment-application'
+import { catalogSessionWorkspace } from '../../store/catalog-session-workspace'
+import type { AttachmentSearchSurface } from '../../store/presentation-contracts'
+import {
+  getWorkspaceTabSessionSnapshot,
+  subscribeWorkspaceTabSession,
+} from '../../store/workspace-tab-session'
 import { CloseIcon, DatabaseIcon, SearchIcon } from '../icons/Icon'
 import { Button, IconButton } from '../primitives/Button'
 import { Dialog } from '../primitives/Dialog'
 import { formatBytes, kindLabel, shortId, storageLabel } from './format'
 
 interface AttachmentPickerProps {
+  sessionSurface: Exclude<AttachmentSearchSurface, 'storage-manager'>
   title?: string
   excludeAttachmentId?: string
+  interactionTarget?: string
   onPick: (attachment: Attachment) => void | Promise<void>
   onClose: () => void
 }
@@ -26,60 +40,60 @@ const KIND_FILTERS: Array<AttachmentKind | 'all'> = [
   'plaintext',
   'other',
 ]
-const ATTACHMENT_SEARCH_DEBOUNCE_MS = 150
+
+const attachmentPickerInteraction = definePresentationInteraction<string>({
+  id: 'attachment-picker.pick',
+  label: 'Select attachment',
+  concurrency: 'reject',
+  lifetime: 'presenter',
+})
 
 export function AttachmentPicker({
+  sessionSurface,
   title = 'Stored attachments',
   excludeAttachmentId,
+  interactionTarget,
   onPick,
   onClose,
 }: AttachmentPickerProps) {
   const [query, setQuery] = useState('')
   const [kind, setKind] = useState<AttachmentKind | 'all'>('all')
-  const [rows, setRows] = useState<Attachment[]>([])
-  const [busyId, setBusyId] = useState<string | null>(null)
-  const lastStartedTextQueryRef = useRef<string | null>(null)
+  const pickInteraction = usePresentationInteraction(
+    interactionTarget ? attachmentMutationInteraction : attachmentPickerInteraction,
+  )
+  const pickTarget = interactionTarget ?? 'picker'
+  const searchController = catalogSessionWorkspace.attachmentSearchFor(sessionSurface)
+  const searchSession = useAttachmentSearchSession(searchController)
+  const workspaceSession = useSyncExternalStore(
+    subscribeWorkspaceTabSession,
+    getWorkspaceTabSessionSnapshot,
+    getWorkspaceTabSessionSnapshot,
+  )
 
   const filters = useMemo(() => (kind === 'all' ? undefined : { kind }), [kind])
+  const rows = useMemo(
+    () =>
+      excludeAttachmentId
+        ? (searchSession?.rows ?? []).filter((row) => row.id !== excludeAttachmentId)
+        : (searchSession?.rows ?? []),
+    [excludeAttachmentId, searchSession?.rows],
+  )
 
   useEffect(() => {
-    const controller = new AbortController()
+    const fence = workspaceSession.fence
+    if (!fence) return
     const normalizedQuery = query.trim()
-    const delay =
-      normalizedQuery.length > 0 &&
-      lastStartedTextQueryRef.current !== null &&
-      lastStartedTextQueryRef.current !== normalizedQuery
-        ? ATTACHMENT_SEARCH_DEBOUNCE_MS
-        : 0
-    const timer = window.setTimeout(() => {
-      lastStartedTextQueryRef.current = normalizedQuery.length > 0 ? normalizedQuery : null
-      void getWorkspaceRepository()
-        .searchAttachments({
-          query,
-          ...(filters ? { filters } : {}),
-          sort: 'created-desc',
-          limit: 80,
-          signal: controller.signal,
-        })
-        .then((page) => {
-          if (controller.signal.aborted) return
-          setRows(
-            excludeAttachmentId
-              ? page.rows.filter((row) => row.id !== excludeAttachmentId)
-              : page.rows,
-          )
-        })
-        .catch((error: unknown) => {
-          if (!controller.signal.aborted && (error as { name?: string }).name !== 'AbortError') {
-            throw error
-          }
-        })
-    }, delay)
-    return () => {
-      window.clearTimeout(timer)
-      controller.abort()
-    }
-  }, [query, filters, excludeAttachmentId])
+    return searchController.request({
+      ...fence,
+      search: {
+        ...(normalizedQuery ? { query: normalizedQuery } : {}),
+        ...(filters ? { filters } : {}),
+        sort: 'created-desc',
+      },
+      pageSize: 80,
+    })
+  }, [filters, query, searchController, workspaceSession.fence])
+  if (searchSession?.status === 'error' && rows.length === 0) throw searchSession.error
 
   return (
     <Dialog
@@ -142,10 +156,22 @@ export function AttachmentPicker({
               type="button"
               data-ui="attachment-picker-row"
               onClick={() => {
-                setBusyId(attachment.id)
-                void Promise.resolve(onPick(attachment)).finally(() => setBusyId(null))
+                if (!searchSession?.interactive) return
+                pickInteraction.run({
+                  target: pickTarget,
+                  action: async ({ signal }) => {
+                    const current = await getAttachment(attachment.id)
+                    if (signal.aborted) return
+                    if (!current) throw new Error(`AttachmentMissing:${attachment.id}`)
+                    await onPick(current)
+                  },
+                  commit: () => {
+                    onClose()
+                    return undefined
+                  },
+                })
               }}
-              disabled={busyId !== null}
+              disabled={pickInteraction.isPending(pickTarget) || !searchSession?.interactive}
               title={`${attachment.id}\n${attachment.mime}`}
             >
               <span data-ui="attachment-row-main">

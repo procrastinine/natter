@@ -1,11 +1,22 @@
 import { describe, expect, it } from 'vitest'
-import { type StreamLaneEvent, splitChatStream } from '../../src/api/stream-transforms'
+import { splitChatStream as splitChatStreamWithContract } from '../../src/api/stream-transforms'
 import type { ChatStreamChunk } from '../../src/api/types'
-import {
-  applyStreamAccumulatorEvent,
-  createStreamAccumulator,
-  projectStreamAccumulatorFinal,
-} from '../../src/core/stream-accumulator'
+import type { StreamLaneEvent } from '../../src/core/generation-stream-live-events'
+import type { ReasoningObservation } from '../../src/core/reasoning-observation'
+import { chatReasoningContract } from '../helpers/reasoning-contracts'
+import { collectReasoningObservations, foldStreamLaneEvents } from '../helpers/reasoning-events'
+
+type ChatSplitOptions = Omit<Parameters<typeof splitChatStreamWithContract>[1], 'reasoning'>
+
+function splitChatStream(
+  source: Parameters<typeof splitChatStreamWithContract>[0],
+  options: ChatSplitOptions = {},
+) {
+  return splitChatStreamWithContract(source, {
+    ...options,
+    reasoning: chatReasoningContract({ carrier: 'openrouter-reasoning-details' }),
+  })
+}
 
 async function* fromChunks(chunks: ChatStreamChunk[]): AsyncGenerator<ChatStreamChunk> {
   for (const c of chunks) yield c
@@ -15,6 +26,25 @@ async function collect(iter: AsyncIterable<StreamLaneEvent>): Promise<StreamLane
   const out: StreamLaneEvent[] = []
   for await (const e of iter) out.push(e)
   return out
+}
+
+function visibleReasoning(events: readonly StreamLaneEvent[]) {
+  return collectReasoningObservations(events).filter(
+    (operation): operation is Extract<ReasoningObservation, { kind: 'visible' }> =>
+      operation.kind === 'visible',
+  )
+}
+
+function visibleReasoningIngress(events: readonly StreamLaneEvent[]) {
+  return visibleReasoning(events)
+}
+
+function projectedReasoningText(events: readonly StreamLaneEvent[]): string {
+  return (
+    foldStreamLaneEvents(events)
+      .final.reasoningEnvelope?.visible.map((part) => part.text)
+      .join('') ?? ''
+  )
 }
 
 describe('splitChatStream', () => {
@@ -239,10 +269,18 @@ describe('splitChatStream', () => {
       },
     ])
     const events = await collect(splitChatStream(source))
-    expect(events.find((e) => e.lane === 'reasoning')).toEqual({
-      lane: 'reasoning',
-      detailsMode: 'delta',
-      details: [{ type: 'reasoning.text', index: 0, text: 'thinking…' }],
+    const ingress = visibleReasoningIngress(events)
+    expect(ingress).toHaveLength(1)
+    expect(ingress[0]).toMatchObject({
+      kind: 'visible',
+      update: 'append',
+      value: 'thinking…',
+      visibleKind: 'text',
+    })
+    expect(ingress[0]?.source).toMatchObject({
+      dialect: 'openrouter-chat',
+      choiceIndex: 0,
+      detailIndex: 0,
     })
   })
 
@@ -268,19 +306,15 @@ describe('splitChatStream', () => {
       ),
     )
 
-    expect(events.find((event) => event.lane === 'reasoning')).toEqual({
-      lane: 'reasoning',
-      textDelta: 'thinking…',
-      detailsMode: 'delta',
-      details,
+    const visible = visibleReasoning(events)
+    expect(visible).toHaveLength(1)
+    expect(visible[0]).toMatchObject({
+      update: 'append',
+      value: 'thinking…',
+      visibleKind: 'text',
     })
-    const accumulator = createStreamAccumulator({ initialContent: [], now: 0 })
-    for (const [index, event] of events.entries()) {
-      applyStreamAccumulatorEvent(accumulator, event, index + 1)
-    }
-    expect(projectStreamAccumulatorFinal(accumulator).reasoningDetails).toEqual([
-      expect.objectContaining({ type: 'reasoning.text', text: 'thinking…' }),
-    ])
+    expect(visible[0]?.source).toMatchObject({ dialect: 'openrouter-chat', choiceIndex: 0 })
+    expect(projectedReasoningText(events)).toBe('thinking…')
   })
 
   it('drops a legacy Claude reasoning delta covered by a cumulative structured snapshot', async () => {
@@ -309,19 +343,24 @@ describe('splitChatStream', () => {
     ])
 
     const events = await collect(splitChatStream(source))
-    expect(events.find((event) => event.lane === 'reasoning')).toEqual({
-      lane: 'reasoning',
-      detailsMode: 'cumulative',
-      details: [
-        {
-          type: 'reasoning.text',
-          index: 0,
-          format: 'anthropic-claude-v1',
-          text: '1 2 ',
-          signature: 'sig',
-        },
-      ],
-    })
+    expect(visibleReasoningIngress(events)).toEqual([
+      expect.objectContaining({
+        kind: 'visible',
+        update: 'append-overlap',
+        value: '1 2 ',
+        visibleKind: 'text',
+        format: 'anthropic-claude-v1',
+      }),
+    ])
+    expect(
+      collectReasoningObservations(events).filter((operation) => operation.kind === 'carrier'),
+    ).toEqual([
+      expect.objectContaining({
+        update: 'set',
+        value: 'sig',
+        carrierKind: 'anthropic-signature',
+      }),
+    ])
   })
 
   it('stores mixed Claude delta and cumulative reasoning paths exactly once across chunks', async () => {
@@ -350,19 +389,14 @@ describe('splitChatStream', () => {
         },
       }
     })
-    const accumulator = createStreamAccumulator({ initialContent: [], now: 0 })
-    for (const [index, event] of (await collect(splitChatStream(fromChunks(chunks)))).entries()) {
-      applyStreamAccumulatorEvent(accumulator, event, index + 1)
-    }
-
-    expect(projectStreamAccumulatorFinal(accumulator).reasoningDetails).toEqual([
-      {
-        type: 'reasoning.text',
-        index: 0,
-        format: 'anthropic-claude-v1',
-        text: '1 2 3 4 ',
-      },
+    const events = await collect(splitChatStream(fromChunks(chunks)))
+    expect(visibleReasoningIngress(events).map((operation) => operation.update)).toEqual([
+      'append',
+      'append-overlap',
+      'append-overlap',
+      'append-overlap',
     ])
+    expect(projectedReasoningText(events)).toBe('1 2 3 4 ')
   })
 
   it('concatenates details-only Claude reasoning deltas instead of replacing them', async () => {
@@ -381,27 +415,104 @@ describe('splitChatStream', () => {
       },
     }))
     const events = await collect(splitChatStream(fromChunks(chunks)))
-    expect(events.filter((event) => event.lane === 'reasoning')).toEqual(
-      chunks.map((_, index) => ({
-        lane: 'reasoning',
-        detailsMode: 'delta',
-        details: [
+    expect(visibleReasoningIngress(events).map((operation) => operation.update)).toEqual([
+      'append',
+      'append',
+      'append',
+      'append',
+    ])
+    expect(visibleReasoning(events).map((operation) => operation.value)).toEqual([
+      '1 ',
+      '2 ',
+      '3 ',
+      '4 ',
+    ])
+    expect(projectedReasoningText(events)).toBe('1 2 3 4 ')
+  })
+
+  it('keeps distinct same-kind detail members separate across detail-only chunks', async () => {
+    const chunks: ChatStreamChunk[] = [
+      {
+        type: 'delta',
+        chunk: {
+          choices: [
+            {
+              delta: {
+                reasoning_details: [
+                  {
+                    type: 'reasoning.text',
+                    id: 'detail-a',
+                    index: 0,
+                    format: 'anthropic-claude-v1',
+                    text: 'A',
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      },
+      {
+        type: 'delta',
+        chunk: {
+          choices: [
+            {
+              delta: {
+                reasoning_details: [
+                  {
+                    type: 'reasoning.text',
+                    id: 'detail-b',
+                    index: 0,
+                    format: 'anthropic-claude-v1',
+                    text: 'B',
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      },
+    ]
+    const events = await collect(splitChatStream(fromChunks(chunks)))
+
+    expect(visibleReasoning(events)).toHaveLength(2)
+    expect(projectedReasoningText(events)).toBe('AB')
+  })
+
+  it('keeps a non-mirroring scalar and structured member as distinct observations', async () => {
+    const events = await collect(
+      splitChatStream(
+        fromChunks([
           {
-            type: 'reasoning.text',
-            index: 0,
-            format: 'anthropic-claude-v1',
-            text: `${index + 1} `,
+            type: 'delta',
+            chunk: {
+              choices: [
+                {
+                  delta: {
+                    reasoning: 'scalar',
+                    reasoning_details: [
+                      {
+                        type: 'reasoning.text',
+                        id: 'structured-detail',
+                        index: 0,
+                        format: 'anthropic-claude-v1',
+                        text: 'detail',
+                      },
+                    ],
+                  },
+                },
+              ],
+            },
           },
-        ],
-      })),
+        ]),
+      ),
     )
-    const accumulator = createStreamAccumulator({ initialContent: [], now: 0 })
-    for (const [index, event] of events.entries()) {
-      applyStreamAccumulatorEvent(accumulator, event, index + 1)
-    }
-    expect(projectStreamAccumulatorFinal(accumulator).reasoningDetails?.[0]).toMatchObject({
-      text: '1 2 3 4 ',
-    })
+
+    expect(visibleReasoning(events).map((operation) => operation.value)).toEqual([
+      'scalar',
+      'detail',
+    ])
+    expect(projectedReasoningText(events)).toBe('scalardetail')
   })
 
   it('appends an unmatched scalar delta exactly after structured reasoning', async () => {
@@ -434,29 +545,8 @@ describe('splitChatStream', () => {
         ]),
       ),
     )
-    expect(events.filter((event) => event.lane === 'reasoning')).toEqual([
-      {
-        lane: 'reasoning',
-        detailsMode: 'delta',
-        details: [
-          {
-            type: 'reasoning.text',
-            index: 0,
-            format: 'anthropic-claude-v1',
-            text: 'hel',
-          },
-        ],
-      },
-      { lane: 'reasoning', textDelta: 'lo' },
-    ])
-
-    const accumulator = createStreamAccumulator({ initialContent: [], now: 0 })
-    for (const [index, event] of events.entries()) {
-      applyStreamAccumulatorEvent(accumulator, event, index + 1)
-    }
-    expect(projectStreamAccumulatorFinal(accumulator).reasoningDetails?.[0]).toMatchObject({
-      text: 'hello',
-    })
+    expect(visibleReasoning(events).map((operation) => operation.value)).toEqual(['hel', 'lo'])
+    expect(projectedReasoningText(events)).toBe('hello')
   })
 
   it('does not trim a valid scalar continuation after an earlier exact mirror', async () => {
@@ -490,14 +580,7 @@ describe('splitChatStream', () => {
         ]),
       ),
     )
-    const accumulator = createStreamAccumulator({ initialContent: [], now: 0 })
-    for (const [index, event] of events.entries()) {
-      applyStreamAccumulatorEvent(accumulator, event, index + 1)
-    }
-
-    expect(projectStreamAccumulatorFinal(accumulator).reasoningDetails?.[0]).toMatchObject({
-      text: 'hello',
-    })
+    expect(projectedReasoningText(events)).toBe('hello')
   })
 
   it('preserves a long overlap-looking scalar delta after an exact mirror', async () => {
@@ -524,14 +607,7 @@ describe('splitChatStream', () => {
         ]),
       ),
     )
-    const accumulator = createStreamAccumulator({ initialContent: [], now: 0 })
-    for (const [index, event] of events.entries()) {
-      applyStreamAccumulatorEvent(accumulator, event, index + 1)
-    }
-
-    expect(projectStreamAccumulatorFinal(accumulator).reasoningDetails?.[0]).toMatchObject({
-      text: 'abcdabcdX',
-    })
+    expect(projectedReasoningText(events)).toBe('abcdabcdX')
   })
 
   it('keeps prefix-growing details-only Claude chunks as deltas', async () => {
@@ -551,17 +627,12 @@ describe('splitChatStream', () => {
       },
     }))
     const events = await collect(splitChatStream(fromChunks(chunks)))
-    expect(
-      events.filter((event) => event.lane === 'reasoning').map((event) => event.detailsMode),
-    ).toEqual(['delta', 'delta', 'delta'])
-
-    const accumulator = createStreamAccumulator({ initialContent: [], now: 0 })
-    for (const [index, event] of events.entries()) {
-      applyStreamAccumulatorEvent(accumulator, event, index + 1)
-    }
-    expect(projectStreamAccumulatorFinal(accumulator).reasoningDetails?.[0]).toMatchObject({
-      text: pieces.join(''),
-    })
+    expect(visibleReasoningIngress(events).map((operation) => operation.update)).toEqual([
+      'append',
+      'append',
+      'append',
+    ])
+    expect(projectedReasoningText(events)).toBe(pieces.join(''))
   })
 
   it('preserves prefix-growing scalar and structured mirrors as exact deltas', async () => {
@@ -580,17 +651,12 @@ describe('splitChatStream', () => {
       },
     }))
     const events = await collect(splitChatStream(fromChunks(chunks)))
-    expect(
-      events.filter((event) => event.lane === 'reasoning').map((event) => event.detailsMode),
-    ).toEqual(['delta', 'delta', 'delta'])
-
-    const accumulator = createStreamAccumulator({ initialContent: [], now: 0 })
-    for (const [index, event] of events.entries()) {
-      applyStreamAccumulatorEvent(accumulator, event, index + 1)
-    }
-    expect(projectStreamAccumulatorFinal(accumulator).reasoningDetails?.[0]).toMatchObject({
-      text: pieces.join(''),
-    })
+    expect(visibleReasoningIngress(events).map((operation) => operation.update)).toEqual([
+      'append',
+      'append',
+      'append',
+    ])
+    expect(projectedReasoningText(events)).toBe(pieces.join(''))
   })
 
   it('does not discard earlier Claude reasoning for a suffix-mirrored structured delta', async () => {
@@ -656,14 +722,8 @@ describe('splitChatStream', () => {
         },
       },
     ]
-    const accumulator = createStreamAccumulator({ initialContent: [], now: 0 })
-    for (const [index, event] of (await collect(splitChatStream(fromChunks(chunks)))).entries()) {
-      applyStreamAccumulatorEvent(accumulator, event, index + 1)
-    }
-
-    expect(projectStreamAccumulatorFinal(accumulator).reasoningDetails?.[0]).toMatchObject({
-      text: 'EARLY LATER tail END',
-    })
+    const events = await collect(splitChatStream(fromChunks(chunks)))
+    expect(projectedReasoningText(events)).toBe('EARLY LATER tail END')
   })
 
   it('does not duplicate an equal cumulative mirror after a scalar-only delta', async () => {
@@ -703,14 +763,8 @@ describe('splitChatStream', () => {
         },
       },
     ]
-    const accumulator = createStreamAccumulator({ initialContent: [], now: 0 })
-    for (const [index, event] of (await collect(splitChatStream(fromChunks(chunks)))).entries()) {
-      applyStreamAccumulatorEvent(accumulator, event, index + 1)
-    }
-
-    expect(projectStreamAccumulatorFinal(accumulator).reasoningDetails?.[0]).toMatchObject({
-      text: 'ab',
-    })
+    const events = await collect(splitChatStream(fromChunks(chunks)))
+    expect(projectedReasoningText(events)).toBe('ab')
   })
 
   it('deduplicates equal scalar and structured Claude deltas while keeping repeated chunks', async () => {
@@ -730,16 +784,12 @@ describe('splitChatStream', () => {
       },
     }))
     const events = await collect(splitChatStream(fromChunks(chunks)))
-    expect(
-      events.filter((event) => event.lane === 'reasoning').map((event) => event.detailsMode),
-    ).toEqual(['delta', 'delta', 'delta'])
-    const accumulator = createStreamAccumulator({ initialContent: [], now: 0 })
-    for (const [index, event] of events.entries()) {
-      applyStreamAccumulatorEvent(accumulator, event, index + 1)
-    }
-    expect(projectStreamAccumulatorFinal(accumulator).reasoningDetails?.[0]).toMatchObject({
-      text: 'haha ho',
-    })
+    expect(visibleReasoningIngress(events).map((operation) => operation.update)).toEqual([
+      'append',
+      'append',
+      'append',
+    ])
+    expect(projectedReasoningText(events)).toBe('haha ho')
   })
 
   it('preserves a repeated scalar reasoning delta after structured reasoning', async () => {
@@ -768,20 +818,8 @@ describe('splitChatStream', () => {
         chunk: { choices: [{ delta: { reasoning: 'ha' } }] },
       },
     ]
-    const accumulator = createStreamAccumulator({ initialContent: [], now: 0 })
-    for (const [index, event] of (await collect(splitChatStream(fromChunks(chunks)))).entries()) {
-      applyStreamAccumulatorEvent(accumulator, event, index + 1)
-    }
-
-    expect(projectStreamAccumulatorFinal(accumulator).reasoningDetails).toEqual([
-      {
-        type: 'reasoning.text',
-        index: 0,
-        format: 'anthropic-claude-v1',
-        text: 'haha',
-        id: 'text#default',
-      },
-    ])
+    const events = await collect(splitChatStream(fromChunks(chunks)))
+    expect(projectedReasoningText(events)).toBe('haha')
   })
 
   it('appends repeated and overlap-looking structured reasoning deltas exactly', async () => {
@@ -798,19 +836,8 @@ describe('splitChatStream', () => {
         ],
       },
     }))
-    const accumulator = createStreamAccumulator({ initialContent: [], now: 0 })
-    for (const [index, event] of (await collect(splitChatStream(fromChunks(chunks)))).entries()) {
-      applyStreamAccumulatorEvent(accumulator, event, index + 1)
-    }
-
-    expect(projectStreamAccumulatorFinal(accumulator).reasoningDetails).toEqual([
-      {
-        type: 'reasoning.text',
-        index: 0,
-        format: 'unknown',
-        text: pieces.join(''),
-      },
-    ])
+    const events = await collect(splitChatStream(fromChunks(chunks)))
+    expect(projectedReasoningText(events)).toBe(pieces.join(''))
   })
 
   it('does not discard generic prefix or suffix matches as mirrors', async () => {
@@ -832,13 +859,12 @@ describe('splitChatStream', () => {
       },
     ])
 
-    expect(
-      (await collect(splitChatStream(source))).find((event) => event.lane === 'reasoning'),
-    ).toMatchObject({
-      lane: 'reasoning',
-      textDelta: 'prefix-suffix',
-      details: [{ type: 'reasoning.text', text: 'prefix' }],
-    })
+    const events = await collect(splitChatStream(source))
+    expect(visibleReasoning(events).map((operation) => operation.value)).toEqual([
+      'prefix-suffix',
+      'prefix',
+    ])
+    expect(projectedReasoningText(events)).toBe('prefix-suffixprefix')
   })
 
   it('drops mirrored reasoning text when OpenAI-family reasoning.summary already carries the same delta', async () => {
@@ -865,18 +891,15 @@ describe('splitChatStream', () => {
       },
     ])
     const events = await collect(splitChatStream(source))
-    expect(events.find((e) => e.lane === 'reasoning')).toEqual({
-      lane: 'reasoning',
-      detailsMode: 'delta',
-      details: [
-        {
-          type: 'reasoning.summary',
-          index: 0,
-          format: 'azure-openai-responses-v1',
-          summary: 'thinking…',
-        },
-      ],
-    })
+    expect(visibleReasoningIngress(events)).toEqual([
+      expect.objectContaining({
+        kind: 'visible',
+        update: 'append',
+        value: 'thinking…',
+        visibleKind: 'summary',
+        format: 'azure-openai-responses-v1',
+      }),
+    ])
   })
 
   it('preserves distinct reasoning text when details do not mirror it', async () => {
@@ -896,12 +919,15 @@ describe('splitChatStream', () => {
       },
     ])
     const events = await collect(splitChatStream(source))
-    expect(events.find((e) => e.lane === 'reasoning')).toEqual({
-      lane: 'reasoning',
-      textDelta: 'thinking…',
-      detailsMode: 'delta',
-      details: [{ type: 'reasoning.summary', summary: 'brief' }],
-    })
+    expect(
+      visibleReasoning(events).map((operation) => ({
+        kind: operation.visibleKind,
+        value: operation.value,
+      })),
+    ).toEqual([
+      { kind: 'text', value: 'thinking…' },
+      { kind: 'summary', value: 'brief' },
+    ])
   })
 
   it('normalizes a synthetic buffered_result into meta + text + finish + usage lanes', async () => {
@@ -926,14 +952,72 @@ describe('splitChatStream', () => {
       },
     ])
     const events = await collect(splitChatStream(source))
-    expect(events).toMatchObject([
-      { lane: 'meta', generationId: 'g1', model: 'm' },
-      { lane: 'buffered' },
-      { lane: 'reasoning', details: [{ type: 'reasoning.text', text: 'thinking', index: 0 }] },
-      { lane: 'text', text: 'hello' },
-      { lane: 'finish', finishReason: 'stop' },
-      { lane: 'usage', usage: { prompt_tokens: 1, completion_tokens: 1 } },
+    expect(events.map((event) => event.lane)).toEqual([
+      'meta',
+      'reasoning-observation',
+      'text',
+      'finish',
+      'usage',
     ])
+    expect(events[0]).toMatchObject({ lane: 'meta', generationId: 'g1', model: 'm' })
+    expect(visibleReasoning(events)).toEqual([
+      expect.objectContaining({ update: 'set', value: 'thinking' }),
+    ])
+    expect(events[2]).toMatchObject({ lane: 'text', text: 'hello' })
+    expect(events[3]).toMatchObject({ lane: 'finish', finishReason: 'stop' })
+    expect(events[4]).toMatchObject({
+      lane: 'usage',
+      usage: { prompt_tokens: 1, completion_tokens: 1 },
+    })
+  })
+
+  it('retains streamed Claude text when the terminal message carries only its signature', async () => {
+    const events = await collect(
+      splitChatStream(
+        fromChunks([
+          {
+            type: 'delta',
+            chunk: {
+              choices: [{ index: 0, delta: { reasoning: 'visible thought' } }],
+            },
+          },
+          {
+            type: 'buffered_result',
+            result: {
+              id: 'claude-terminal-signature',
+              choices: [
+                {
+                  index: 0,
+                  finish_reason: 'stop',
+                  message: {
+                    content: 'answer',
+                    reasoning_details: [
+                      {
+                        type: 'reasoning.text',
+                        index: 0,
+                        format: 'anthropic-claude-v1',
+                        signature: 'terminal-signature',
+                      },
+                    ],
+                  },
+                },
+              ],
+            },
+          },
+        ]),
+      ),
+    )
+
+    const envelope = foldStreamLaneEvents(events).final.reasoningEnvelope
+    expect(envelope?.visible).toHaveLength(1)
+    expect(envelope?.visible[0]).toMatchObject({ kind: 'text', text: 'visible thought' })
+    expect(envelope?.carriers).toHaveLength(1)
+    if (!envelope) throw new Error('BufferedReasoningEnvelopeMissing')
+    expect(envelope.carriers[0]).toMatchObject({
+      kind: 'anthropic-signature',
+      signature: 'terminal-signature',
+      bindsVisiblePartId: envelope.visible[0]?.id,
+    })
   })
 
   it('normalizes buffered chat tool calls into authoritative tool-call lanes', async () => {

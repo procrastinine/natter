@@ -1,156 +1,199 @@
-import Dexie from 'dexie'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
-  __buildBroadDexieObservabilitySetForTests,
   __resetBroadcastForTests,
   __setBroadcastFallbackReaderForTests,
-  type BroadcastEvent,
-  onEvent,
-  postEvent,
+  broadcastWorkspaceRuntimeResources,
+  postWorkspaceChange,
+  seedBroadcastWorkspaceSnapshot,
+  subscribeWorkspaceChanges,
 } from '../../src/store/broadcast'
+import type { WorkspaceChange } from '../../src/store/workspace-protocol'
+
+beforeEach(() => {
+  __resetBroadcastForTests({ admissionsOpen: true })
+})
 
 afterEach(() => {
-  __resetBroadcastForTests()
+  __resetBroadcastForTests({ admissionsOpen: true })
   vi.useRealTimers()
   vi.unstubAllGlobals()
   vi.restoreAllMocks()
 })
 
-// Wait for BroadcastChannel's microtask fan-out to complete. Vitest + jsdom
-// queue deliveries on the task queue, so `setTimeout(_, 0)` drains them.
-const tick = (ms = 25): Promise<void> => new Promise((r) => setTimeout(r, ms))
+describe('workspace change transport', () => {
+  it('fans a local commit out to every subscriber exactly once', () => {
+    const channel = installBroadcastChannel()
+    const first: WorkspaceChange[] = []
+    const second: WorkspaceChange[] = []
+    const stopFirst = subscribeWorkspaceChanges((change) => first.push(change))
+    const stopSecond = subscribeWorkspaceChanges((change) => second.push(change))
+    const change = commit('local-1')
 
-function observabilityDb(): Dexie {
-  const db = new Dexie(`broadcast-observability-${Math.random().toString(36).slice(2)}`)
-  db.version(1).stores({
-    things: '&id, value, *tags',
-    settings: '&key',
-  })
-  return db
-}
+    postWorkspaceChange(change)
 
-describe('broadcast', () => {
-  it('fans out a posted event to local subscribers exactly once', () => {
-    const received: BroadcastEvent[] = []
-    const deliveries: string[] = []
-    const unsub = onEvent((ev, delivery) => {
-      received.push(ev)
-      deliveries.push(delivery)
-    })
-    postEvent({
-      kind: 'chat-mutated',
-      chatId: 'C1',
-      metaVersion: 1,
-      summaryVersion: 2,
-      affected: [{ kind: 'message', chatId: 'C1', messageId: 'M1' }],
-    })
-    expect(received).toEqual([
-      {
-        kind: 'chat-mutated',
-        chatId: 'C1',
-        metaVersion: 1,
-        summaryVersion: 2,
-        affected: [{ kind: 'message', chatId: 'C1', messageId: 'M1' }],
-      },
-    ])
-    expect(deliveries).toEqual(['local'])
-    unsub()
+    expect(first).toEqual([change])
+    expect(second).toEqual([change])
+    expect(channel.posted).toEqual([change])
+    stopFirst()
+    stopSecond()
   })
 
-  it('labels events arriving from another tab as remote', async () => {
-    const marker = `remote-delivery-${Math.random().toString(36).slice(2)}`
-    const otherTab = new BroadcastChannel('llm-api-frontend')
-    const deliveries: string[] = []
-    const unsubscribe = onEvent((event, delivery) => {
-      if (event.kind === 'preset-mutated' && event.presetId === marker) {
-        deliveries.push(delivery)
-      }
-    })
-
-    otherTab.postMessage({ kind: 'preset-mutated', presetId: marker } satisfies BroadcastEvent)
-    await tick()
-
-    expect(deliveries).toEqual(['remote'])
-    unsubscribe()
-    otherTab.close()
-  })
-
-  it('drops unstamped workspace-scoped events from remote tabs', async () => {
-    const otherTab = new BroadcastChannel('llm-api-frontend')
-    const received: BroadcastEvent[] = []
-    const unsubscribe = onEvent((event, delivery) => {
-      if (delivery === 'remote' && event.kind === 'workspace-replaced') received.push(event)
-    })
-
-    otherTab.postMessage({ kind: 'workspace-replaced' })
-    otherTab.postMessage({ kind: 'workspace-replaced', replacementEpoch: 7 })
-    await tick()
-
-    expect(received).toEqual([{ kind: 'workspace-replaced', replacementEpoch: 7 }])
-    unsubscribe()
-    otherTab.close()
-  })
-
-  it('delivers to every local subscriber, each exactly once', () => {
-    let count1 = 0
-    let count2 = 0
-    const u1 = onEvent(() => {
-      count1 += 1
-    })
-    const u2 = onEvent(() => {
-      count2 += 1
-    })
-    postEvent({ kind: 'profile-mutated', profileId: 'P1' })
-    postEvent({ kind: 'profile-mutated', profileId: 'P2' })
-    expect(count1).toBe(2)
-    expect(count2).toBe(2)
-    u1()
-    u2()
-  })
-
-  it('isolates subscriber failures from later handlers and callers', () => {
-    const received: BroadcastEvent[] = []
-    const bad = onEvent(() => {
+  it('isolates subscriber failures and stops delivery after unsubscribe', () => {
+    installBroadcastChannel()
+    const received: WorkspaceChange[] = []
+    const stopBad = subscribeWorkspaceChanges(() => {
       throw new Error('listener failed')
     })
-    const good = onEvent((event) => received.push(event))
+    const stopGood = subscribeWorkspaceChanges((change) => received.push(change))
 
-    expect(() => postEvent({ kind: 'settings-mutated', key: 'safe' })).not.toThrow()
-    expect(received).toEqual([{ kind: 'settings-mutated', key: 'safe' }])
+    expect(() => postWorkspaceChange(commit('safe-1'))).not.toThrow()
+    stopGood()
+    postWorkspaceChange(commit('safe-2'))
 
-    bad()
-    good()
+    expect(received).toEqual([commit('safe-1')])
+    stopBad()
   })
 
-  it('recreates the channel and retries one failed post without duplicating local delivery', () => {
+  it('delivers a same-workspace remote commit without echoing it back', async () => {
+    const channel = installBroadcastChannel({ fanOut: true })
+    seedBroadcastWorkspaceSnapshot(WORKSPACE)
+    const received: WorkspaceChange[] = []
+    const stop = subscribeWorkspaceChanges((change) => received.push(change))
+    const otherTab = new BroadcastChannel('llm-api-frontend')
+    const change = commit('remote-1')
+
+    otherTab.postMessage(change)
+    await tick()
+
+    expect(received).toEqual([change])
+    expect(channel.posted).toEqual([change])
+    stop()
+    otherTab.close()
+  })
+
+  it('drops malformed and unstamped remote payloads', async () => {
+    installBroadcastChannel({ fanOut: true })
+    seedBroadcastWorkspaceSnapshot(WORKSPACE)
+    const received: WorkspaceChange[] = []
+    const stop = subscribeWorkspaceChanges((change) => received.push(change))
+    const otherTab = new BroadcastChannel('llm-api-frontend')
+
+    otherTab.postMessage({ kind: 'commit', stamp: { workspaceId: 'workspace' } })
+    otherTab.postMessage({ kind: 'invalidate', workspaceId: '', replacementEpoch: 1 })
+    otherTab.postMessage({ kind: 'replace', workspaceId: 'workspace', replacementEpoch: -1 })
+    otherTab.postMessage({
+      ...attemptTargetCommit('malformed-attempt'),
+      delta: {
+        facts: [
+          ...attemptTargetCommit('malformed-attempt').delta.facts,
+          ...attemptTargetCommit('malformed-attempt').delta.facts,
+        ],
+        invalidations: [],
+      },
+    })
+    await tick()
+
+    expect(received).toEqual([])
+    stop()
+    otherTab.close()
+  })
+
+  it('preserves a typed terminal target fact across the tab transport', async () => {
+    const channel = installBroadcastChannel({ fanOut: true })
+    seedBroadcastWorkspaceSnapshot(WORKSPACE)
+    const received: WorkspaceChange[] = []
+    const stop = subscribeWorkspaceChanges((change) => received.push(change))
+    const otherTab = new BroadcastChannel('llm-api-frontend')
+    const change = attemptTargetCommit('remote-terminal-target')
+
+    otherTab.postMessage(change)
+    await tick()
+
+    expect(received).toEqual([change])
+    expect(channel.posted).toEqual([change])
+    stop()
+    otherTab.close()
+  })
+
+  it('verifies a foreign-fence remote change and never delivers the stale payload', async () => {
+    installBroadcastChannel({ fanOut: true })
+    seedBroadcastWorkspaceSnapshot(WORKSPACE)
+    const read = vi.fn(async () => WORKSPACE)
+    __setBroadcastFallbackReaderForTests(read)
+    const received: WorkspaceChange[] = []
+    const stop = subscribeWorkspaceChanges((change) => received.push(change))
+    const otherTab = new BroadcastChannel('llm-api-frontend')
+
+    otherTab.postMessage(
+      commit('foreign', { workspaceId: 'deleted-workspace', replacementEpoch: 9 }),
+    )
+    await tick()
+
+    expect(read).toHaveBeenCalledTimes(1)
+    expect(received).toEqual([invalidate(WORKSPACE)])
+    stop()
+    otherTab.close()
+  })
+
+  it('turns a durably confirmed foreign fence into one replacement', async () => {
+    installBroadcastChannel({ fanOut: true })
+    seedBroadcastWorkspaceSnapshot(WORKSPACE)
+    const replacement = { workspaceId: 'replacement', replacementEpoch: 2 }
+    __setBroadcastFallbackReaderForTests(async () => replacement)
+    const received: WorkspaceChange[] = []
+    const stop = subscribeWorkspaceChanges((change) => received.push(change))
+    const otherTab = new BroadcastChannel('llm-api-frontend')
+
+    otherTab.postMessage(commit('replacement-commit', replacement))
+    await tick()
+
+    expect(received).toEqual([replace(replacement)])
+    stop()
+    otherTab.close()
+  })
+
+  it('emits replacement before a local change from a new workspace fence', () => {
+    installBroadcastChannel()
+    seedBroadcastWorkspaceSnapshot(WORKSPACE)
+    const received: WorkspaceChange[] = []
+    const stop = subscribeWorkspaceChanges((change) => received.push(change))
+    const replacement = { workspaceId: 'replacement', replacementEpoch: 3 }
+    const change = commit('local-replacement', replacement)
+
+    postWorkspaceChange(change)
+
+    expect(received).toEqual([replace(replacement), change])
+    stop()
+  })
+
+  it('recreates the channel and retries one failed post without duplicate local delivery', () => {
     let constructions = 0
-    const posted: BroadcastEvent[] = []
+    const posted: WorkspaceChange[] = []
     vi.stubGlobal(
       'BroadcastChannel',
       class {
         private readonly fail = constructions++ === 0
-
         addEventListener() {}
         close() {}
-        postMessage(event: BroadcastEvent) {
-          if (this.fail) throw new Error('channel became unusable')
-          posted.push(event)
+        postMessage(change: WorkspaceChange) {
+          if (this.fail) throw new Error('channel failed')
+          posted.push(change)
         }
       },
     )
-    const received: BroadcastEvent[] = []
-    const unsubscribe = onEvent((event) => received.push(event))
-    const event = { kind: 'settings-mutated' as const, key: 'retry-safe' }
+    const received: WorkspaceChange[] = []
+    const stop = subscribeWorkspaceChanges((change) => received.push(change))
+    const change = commit('retry')
 
-    expect(() => postEvent(event)).not.toThrow()
+    postWorkspaceChange(change)
+
     expect(constructions).toBe(2)
-    expect(posted).toEqual([event])
-    expect(received).toEqual([event])
-
-    unsubscribe()
+    expect(posted).toEqual([change])
+    expect(received).toEqual([change])
+    stop()
   })
 
-  it('falls back to polling after a repeated post failure and still fans out locally', async () => {
+  it('contains repeated post failure, delivers locally, and enters durable fallback', async () => {
     vi.useFakeTimers()
     let constructions = 0
     vi.stubGlobal(
@@ -166,25 +209,23 @@ describe('broadcast', () => {
         }
       },
     )
-    const db = observabilityDb()
-    const read = vi.fn(async () => ({ db, mutationCounter: 3 }))
+    const read = vi.fn(async () => WORKSPACE)
     __setBroadcastFallbackReaderForTests(read)
-    const received: BroadcastEvent[] = []
-    const unsubscribe = onEvent((event) => received.push(event))
-    const event = { kind: 'settings-mutated' as const, key: 'committed' }
+    const received: WorkspaceChange[] = []
+    const stop = subscribeWorkspaceChanges((change) => received.push(change))
+    const change = commit('fallback-post')
 
-    expect(() => postEvent(event)).not.toThrow()
-    expect(constructions).toBe(2)
-    expect(received).toContainEqual(event)
+    expect(() => postWorkspaceChange(change)).not.toThrow()
     await vi.advanceTimersByTimeAsync(0)
-    expect(read).toHaveBeenCalledTimes(1)
-    expect(received).toContainEqual({ kind: 'workspace-invalidated', mutationCounter: 3 })
 
-    unsubscribe()
-    db.close()
+    expect(constructions).toBe(2)
+    expect(read).toHaveBeenCalledTimes(1)
+    expect(received).toContainEqual(change)
+    expect(received).toContainEqual(invalidate(WORKSPACE))
+    stop()
   })
 
-  it('switches to polling when the channel reports a messageerror', async () => {
+  it('switches to durable fallback after a channel message error', async () => {
     vi.useFakeTimers()
     let reportMessageError: (() => void) | undefined
     vi.stubGlobal(
@@ -197,354 +238,298 @@ describe('broadcast', () => {
         postMessage() {}
       },
     )
-    const db = observabilityDb()
-    const read = vi.fn(async () => ({ db, mutationCounter: 5 }))
+    const read = vi.fn(async () => WORKSPACE)
     __setBroadcastFallbackReaderForTests(read)
-    const received: BroadcastEvent[] = []
-    const unsubscribe = onEvent((event) => received.push(event))
+    const received: WorkspaceChange[] = []
+    const stop = subscribeWorkspaceChanges((change) => received.push(change))
 
     reportMessageError?.()
     await vi.advanceTimersByTimeAsync(0)
 
     expect(read).toHaveBeenCalledTimes(1)
-    expect(received).toEqual([{ kind: 'workspace-invalidated', mutationCounter: 5 }])
-
-    unsubscribe()
-    db.close()
+    expect(received).toEqual([invalidate(WORKSPACE)])
+    stop()
   })
 
-  it('stops delivering after unsubscribe', () => {
-    const received: BroadcastEvent[] = []
-    const unsub = onEvent((ev) => received.push(ev))
-    postEvent({
-      kind: 'chat-mutated',
-      chatId: 'C1',
-      metaVersion: 1,
-      summaryVersion: 1,
-      affected: [{ kind: 'chat-meta', chatId: 'C1' }],
-    })
-    unsub()
-    postEvent({
-      kind: 'chat-mutated',
-      chatId: 'C1',
-      metaVersion: 2,
-      summaryVersion: 2,
-      affected: [{ kind: 'chat-meta', chatId: 'C1' }],
-    })
-    expect(received).toHaveLength(1)
-    expect(received[0]).toEqual({
-      kind: 'chat-mutated',
-      chatId: 'C1',
-      metaVersion: 1,
-      summaryVersion: 1,
-      affected: [{ kind: 'chat-meta', chatId: 'C1' }],
-    })
-  })
-
-  it('crosses a BroadcastChannel to other tabs exactly once and does not echo to the sender', async () => {
-    // Tag the event with a unique marker because Node's BroadcastChannel is
-    // process-global — under vitest's default threads pool, other test files
-    // running in the same process post events on this channel too.
-    const marker = `broadcast-test-${Math.random().toString(36).slice(2)}`
-    const otherTab = new BroadcastChannel('llm-api-frontend')
-    const receivedByOther: BroadcastEvent[] = []
-    const receivedByLocal: BroadcastEvent[] = []
-    otherTab.addEventListener('message', (ev) => {
-      const event = ev.data as BroadcastEvent
-      if (event.kind === 'preset-mutated' && event.presetId === marker) {
-        receivedByOther.push(event)
-      }
-    })
-    const unsubLocal = onEvent((ev) => {
-      if (ev.kind === 'preset-mutated' && ev.presetId === marker) {
-        receivedByLocal.push(ev)
-      }
-    })
-    postEvent({ kind: 'preset-mutated', presetId: marker })
-    await tick()
-    expect(receivedByOther).toEqual([{ kind: 'preset-mutated', presetId: marker }])
-    // Local subscriber saw it from the direct dispatch path.
-    expect(receivedByLocal).toEqual([{ kind: 'preset-mutated', presetId: marker }])
-    // The posting tab's own BroadcastChannel does NOT echo — confirmed because
-    // the local count is 1 (direct dispatch), not 2 (dispatch + BC echo).
-    unsubLocal()
-    otherTab.close()
-  })
-
-  it('does not echo-loop when a subscriber posts a different event', () => {
-    const seen: BroadcastEvent[] = []
-    const unsub = onEvent((ev) => {
-      seen.push(ev)
-      if (ev.kind === 'chat-mutated' && seen.length === 1) {
-        postEvent({ kind: 'settings-mutated', key: 'derived' })
-      }
-    })
-    postEvent({
-      kind: 'chat-mutated',
-      chatId: 'C1',
-      metaVersion: 1,
-      summaryVersion: 1,
-      affected: [{ kind: 'children', chatId: 'C1', parentId: null }],
-    })
-    // Exactly two events: the original plus the downstream one. No repeat.
-    expect(seen).toEqual([
-      {
-        kind: 'chat-mutated',
-        chatId: 'C1',
-        metaVersion: 1,
-        summaryVersion: 1,
-        affected: [{ kind: 'children', chatId: 'C1', parentId: null }],
-      },
-      { kind: 'settings-mutated', key: 'derived' },
-    ])
-    unsub()
-  })
-
-  it('builds broad Dexie invalidation ranges from every actual table and index', () => {
-    const db = observabilityDb()
-    const parts = __buildBroadDexieObservabilitySetForTests(db)
-    const prefix = `idb://${db.name}`
-
-    expect(Object.keys(parts)).toEqual(
-      expect.arrayContaining([
-        `${prefix}/things/`,
-        `${prefix}/things/:dels`,
-        `${prefix}/things/value`,
-        `${prefix}/things/tags`,
-        `${prefix}/settings/`,
-        `${prefix}/settings/:dels`,
-      ]),
-    )
-    expect(Object.keys(parts)).toHaveLength(6)
-    db.close()
-  })
-
-  it('polls mutationCounter without BroadcastChannel and coalesces missed increments', async () => {
-    vi.useFakeTimers()
-    vi.stubGlobal('BroadcastChannel', undefined)
-    const db = observabilityDb()
-    let mutationCounter = 1
-    const read = vi.fn(async () => ({ db, mutationCounter }))
-    const storageMutated = vi.spyOn(Dexie.on.storagemutated, 'fire')
-    __setBroadcastFallbackReaderForTests(read)
-    const received: BroadcastEvent[] = []
-    const unsubscribe = onEvent((event) => received.push(event))
-
-    await vi.advanceTimersByTimeAsync(0)
-    expect(read).toHaveBeenCalledTimes(1)
-
-    mutationCounter = 4
-    await vi.advanceTimersByTimeAsync(1_000)
-    mutationCounter = 8
-    await vi.advanceTimersByTimeAsync(1_000)
-    mutationCounter = 1
-    await vi.advanceTimersByTimeAsync(1_000)
-
-    expect(received).toEqual([
-      { kind: 'workspace-invalidated', mutationCounter: 1 },
-      { kind: 'workspace-invalidated', mutationCounter: 4 },
-      { kind: 'workspace-invalidated', mutationCounter: 8 },
-      { kind: 'workspace-invalidated', mutationCounter: 1 },
-    ])
-    expect(storageMutated).toHaveBeenCalledTimes(4)
-
-    unsubscribe()
-    await vi.advanceTimersByTimeAsync(5_000)
-    expect(read).toHaveBeenCalledTimes(4)
-    db.close()
-  })
-
-  it('preserves workspace replacement semantics through fallback polling', async () => {
-    vi.useFakeTimers()
-    vi.stubGlobal('BroadcastChannel', undefined)
-    const db = observabilityDb()
-    let mutationCounter = 1
-    let replacementEpoch = 0
-    __setBroadcastFallbackReaderForTests(async () => ({
-      db,
-      mutationCounter,
-      replacementEpoch,
-    }))
-    const received: Array<{ event: BroadcastEvent; delivery: string }> = []
-    const unsubscribe = onEvent((event, delivery) => received.push({ event, delivery }))
-
-    await vi.advanceTimersByTimeAsync(0)
-    mutationCounter = 2
-    replacementEpoch = 1
-    await vi.advanceTimersByTimeAsync(1_000)
-    mutationCounter = 3
-    await vi.advanceTimersByTimeAsync(1_000)
-
-    expect(received).toEqual([
-      {
-        event: { kind: 'workspace-invalidated', mutationCounter: 1 },
-        delivery: 'remote',
-      },
-      {
-        event: { kind: 'workspace-replaced', replacementEpoch: 1 },
-        delivery: 'remote',
-      },
-      {
-        event: { kind: 'workspace-invalidated', mutationCounter: 3 },
-        delivery: 'remote',
-      },
-    ])
-
-    unsubscribe()
-    db.close()
-  })
-
-  it('establishes a historical replacement epoch as the fallback baseline', async () => {
-    vi.useFakeTimers()
-    vi.stubGlobal('BroadcastChannel', undefined)
-    const db = observabilityDb()
-    let mutationCounter = 7
-    let replacementEpoch = 4
-    __setBroadcastFallbackReaderForTests(async () => ({
-      db,
-      mutationCounter,
-      replacementEpoch,
-    }))
-    const received: BroadcastEvent[] = []
-    const unsubscribe = onEvent((event) => received.push(event))
-
-    await vi.advanceTimersByTimeAsync(0)
-    mutationCounter = 8
-    await vi.advanceTimersByTimeAsync(1_000)
-    mutationCounter = 9
-    replacementEpoch = 5
-    await vi.advanceTimersByTimeAsync(1_000)
-
-    expect(received).toEqual([
-      { kind: 'workspace-invalidated', mutationCounter: 7 },
-      { kind: 'workspace-invalidated', mutationCounter: 8 },
-      { kind: 'workspace-replaced', replacementEpoch: 5 },
-    ])
-
-    unsubscribe()
-    db.close()
-  })
-
-  it('allows only one fallback read in flight', async () => {
-    vi.useFakeTimers()
-    vi.stubGlobal('BroadcastChannel', undefined)
-    const db = observabilityDb()
-    let resolveFirst!: (snapshot: { db: Dexie; mutationCounter: number }) => void
-    const first = new Promise<{ db: Dexie; mutationCounter: number }>((resolve) => {
-      resolveFirst = resolve
-    })
-    const read = vi
-      .fn<() => Promise<{ db: Dexie; mutationCounter: number }>>()
-      .mockReturnValueOnce(first)
-      .mockResolvedValue({ db, mutationCounter: 1 })
-    __setBroadcastFallbackReaderForTests(read)
-    const unsubscribe = onEvent(() => {})
-
-    await vi.advanceTimersByTimeAsync(5_000)
-    expect(read).toHaveBeenCalledTimes(1)
-
-    resolveFirst({ db, mutationCounter: 1 })
-    await vi.advanceTimersByTimeAsync(0)
-    await vi.advanceTimersByTimeAsync(999)
-    expect(read).toHaveBeenCalledTimes(1)
-    await vi.advanceTimersByTimeAsync(1)
-    expect(read).toHaveBeenCalledTimes(2)
-
-    unsubscribe()
-    db.close()
-  })
-
-  it('invalidates when the first fallback read resolves after a concurrent commit', async () => {
-    vi.useFakeTimers()
-    vi.stubGlobal('BroadcastChannel', undefined)
-    const db = observabilityDb()
-    let resolveFirst!: (snapshot: { db: Dexie; mutationCounter: number }) => void
-    const first = new Promise<{ db: Dexie; mutationCounter: number }>((resolve) => {
-      resolveFirst = resolve
-    })
-    const read = vi.fn(() => first)
-    const storageMutated = vi.spyOn(Dexie.on.storagemutated, 'fire')
-    __setBroadcastFallbackReaderForTests(read)
-    const received: BroadcastEvent[] = []
-    const unsubscribe = onEvent((event) => received.push(event))
-
-    await vi.advanceTimersByTimeAsync(0)
-    resolveFirst({ db, mutationCounter: 9 })
-    await vi.advanceTimersByTimeAsync(0)
-
-    expect(received).toEqual([{ kind: 'workspace-invalidated', mutationCounter: 9 }])
-    expect(storageMutated).toHaveBeenCalledTimes(1)
-
-    unsubscribe()
-    db.close()
-  })
-
-  it('contains fallback read failures and retries on the next interval', async () => {
-    vi.useFakeTimers()
-    vi.stubGlobal('BroadcastChannel', undefined)
-    const db = observabilityDb()
-    const read = vi
-      .fn<() => Promise<{ db: Dexie; mutationCounter: number }>>()
-      .mockRejectedValueOnce(new Error('temporary read failure'))
-      .mockResolvedValueOnce({ db, mutationCounter: 2 })
-      .mockResolvedValueOnce({ db, mutationCounter: 3 })
-    __setBroadcastFallbackReaderForTests(read)
-    const received: BroadcastEvent[] = []
-    const unsubscribe = onEvent((event) => received.push(event))
-
-    await vi.advanceTimersByTimeAsync(0)
-    await vi.advanceTimersByTimeAsync(1_000)
-    await vi.advanceTimersByTimeAsync(1_000)
-
-    expect(read).toHaveBeenCalledTimes(3)
-    expect(received).toEqual([
-      { kind: 'workspace-invalidated', mutationCounter: 2 },
-      { kind: 'workspace-invalidated', mutationCounter: 3 },
-    ])
-
-    unsubscribe()
-    db.close()
-  })
-
-  it('falls back when BroadcastChannel construction throws', async () => {
+  it('falls back when channel construction throws', async () => {
     vi.useFakeTimers()
     vi.stubGlobal(
       'BroadcastChannel',
       class {
         constructor() {
-          throw new Error('BroadcastChannel denied')
+          throw new Error('blocked')
         }
       },
     )
-    const db = observabilityDb()
-    const read = vi.fn(async () => ({ db, mutationCounter: 1 }))
+    const read = vi.fn(async () => WORKSPACE)
     __setBroadcastFallbackReaderForTests(read)
+    const received: WorkspaceChange[] = []
+    const stop = subscribeWorkspaceChanges((change) => received.push(change))
 
-    const unsubscribe = onEvent(() => {})
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(read).toHaveBeenCalledTimes(1)
+    expect(received).toEqual([invalidate(WORKSPACE)])
+    stop()
+  })
+
+  it('does no fallback reads while BroadcastChannel remains available', async () => {
+    vi.useFakeTimers()
+    installBroadcastChannel()
+    const read = vi.fn(async () => WORKSPACE)
+    __setBroadcastFallbackReaderForTests(read)
+    const stop = subscribeWorkspaceChanges(() => {})
+
+    await vi.advanceTimersByTimeAsync(30_000)
+
+    expect(read).not.toHaveBeenCalled()
+    stop()
+  })
+
+  it('allows only one fallback read in flight', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('BroadcastChannel', undefined)
+    const pending = deferred<typeof WORKSPACE>()
+    const read = vi.fn(() => pending.promise)
+    __setBroadcastFallbackReaderForTests(read)
+    const stop = subscribeWorkspaceChanges(() => {})
+
+    await vi.advanceTimersByTimeAsync(20_000)
+    expect(read).toHaveBeenCalledTimes(1)
+
+    pending.resolve(WORKSPACE)
+    await vi.advanceTimersByTimeAsync(0)
+    stop()
+  })
+
+  it('contains a fallback read failure and retries on lifecycle catch-up', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('BroadcastChannel', undefined)
+    const read = vi
+      .fn<() => Promise<typeof WORKSPACE>>()
+      .mockRejectedValueOnce(new Error('temporary failure'))
+      .mockResolvedValue(WORKSPACE)
+    __setBroadcastFallbackReaderForTests(read)
+    const received: WorkspaceChange[] = []
+    const stop = subscribeWorkspaceChanges((change) => received.push(change))
+
+    await vi.advanceTimersByTimeAsync(0)
+    expect(received).toEqual([])
+    window.dispatchEvent(new Event('focus'))
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(read).toHaveBeenCalledTimes(2)
+    expect(received).toEqual([invalidate(WORKSPACE)])
+    stop()
+  })
+
+  it('does no idle reads when the storage signal is readable and catches up on focus', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('BroadcastChannel', undefined)
+    const read = vi.fn(async () => WORKSPACE)
+    __setBroadcastFallbackReaderForTests(read)
+    const stop = subscribeWorkspaceChanges(() => {})
+
     await vi.advanceTimersByTimeAsync(0)
     expect(read).toHaveBeenCalledTimes(1)
 
-    unsubscribe()
-    db.close()
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(read).toHaveBeenCalledTimes(1)
+
+    window.dispatchEvent(new Event('focus'))
+    await vi.advanceTimersByTimeAsync(0)
+    expect(read).toHaveBeenCalledTimes(2)
+    stop()
   })
 
-  it('suppresses fallback polling when BroadcastChannel is available', async () => {
+  it('turns a fallback storage notification into one durable verification', async () => {
     vi.useFakeTimers()
-    vi.stubGlobal(
-      'BroadcastChannel',
-      class {
-        addEventListener() {}
-        postMessage() {}
-        close() {}
-      },
-    )
-    const read = vi.fn(async () => ({ db: observabilityDb(), mutationCounter: 1 }))
+    vi.stubGlobal('BroadcastChannel', undefined)
+    const read = vi.fn(async () => WORKSPACE)
     __setBroadcastFallbackReaderForTests(read)
+    const stop = subscribeWorkspaceChanges(() => {})
 
-    const unsubscribe = onEvent(() => {})
-    await vi.advanceTimersByTimeAsync(10_000)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(read).toHaveBeenCalledTimes(1)
+
+    const event = new Event('storage')
+    Object.defineProperty(event, 'key', { value: 'natter:workspace-change' })
+    window.dispatchEvent(event)
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(read).toHaveBeenCalledTimes(2)
+    stop()
+  })
+
+  it('preserves replacement semantics through fallback reconciliation', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('BroadcastChannel', undefined)
+    seedBroadcastWorkspaceSnapshot(WORKSPACE)
+    const replacement = { workspaceId: 'replacement', replacementEpoch: 4 }
+    __setBroadcastFallbackReaderForTests(async () => replacement)
+    const received: WorkspaceChange[] = []
+    const stop = subscribeWorkspaceChanges((change) => received.push(change))
+
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(received).toEqual([replace(replacement)])
+    stop()
+  })
+
+  it('uses an already-seeded historical fence as the fallback baseline', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('BroadcastChannel', undefined)
+    const historical = { workspaceId: 'workspace', replacementEpoch: 17 }
+    seedBroadcastWorkspaceSnapshot(historical)
+    __setBroadcastFallbackReaderForTests(async () => historical)
+    const received: WorkspaceChange[] = []
+    const stop = subscribeWorkspaceChanges((change) => received.push(change))
+
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(received).toEqual([invalidate(historical)])
+    stop()
+  })
+
+  it('coalesces inbound work while quiesced and reconciles once on resume', async () => {
+    const channel = installBroadcastChannel({ fanOut: true })
+    seedBroadcastWorkspaceSnapshot(WORKSPACE)
+    const read = vi.fn(async () => WORKSPACE)
+    __setBroadcastFallbackReaderForTests(read)
+    const received: WorkspaceChange[] = []
+    const stop = subscribeWorkspaceChanges((change) => received.push(change))
+    const inbound = broadcastWorkspaceRuntimeResources['broadcast-remote-inbound']
+
+    inbound.closeAdmissions()
+    channel.emit(commit('missed-1'))
+    channel.emit(commit('missed-2'))
+    expect(received).toEqual([])
+
+    inbound.attach(WORKSPACE)
+
     expect(read).not.toHaveBeenCalled()
+    expect(received).toEqual([invalidate(WORKSPACE)])
+    stop()
+  })
 
-    unsubscribe()
+  it('keeps durable verification closed during startup and catches up once after resume', async () => {
+    __resetBroadcastForTests({ admissionsOpen: false })
+    const channel = installBroadcastChannel()
+    const read = vi.fn(async () => WORKSPACE)
+    __setBroadcastFallbackReaderForTests(read)
+    const received: WorkspaceChange[] = []
+    const stop = subscribeWorkspaceChanges((change) => received.push(change))
+
+    broadcastWorkspaceRuntimeResources.broadcast.attach()
+    channel.emit(commit('arrived-during-startup'))
+    await tick()
+
+    expect(read).not.toHaveBeenCalled()
+    expect(received).toEqual([])
+
+    broadcastWorkspaceRuntimeResources['broadcast-remote-inbound'].attach(WORKSPACE)
+
+    expect(read).not.toHaveBeenCalled()
+    expect(received).toEqual([invalidate(WORKSPACE)])
+    stop()
   })
 })
+
+const WORKSPACE = { workspaceId: 'workspace', replacementEpoch: 1 } as const
+
+function commit(
+  commitId: string,
+  workspace: { workspaceId: string; replacementEpoch: number } = WORKSPACE,
+): WorkspaceChange {
+  return {
+    kind: 'commit',
+    stamp: { ...workspace, commitId },
+    delta: { facts: [], invalidations: [{ kind: 'workspace' }] },
+  }
+}
+
+function attemptTargetCommit(commitId: string): Extract<WorkspaceChange, { kind: 'commit' }> {
+  return {
+    kind: 'commit',
+    stamp: { ...WORKSPACE, commitId },
+    delta: {
+      facts: [
+        {
+          kind: 'attempt-target-committed',
+          streamId: 'stream-a',
+          chatId: 'chat-a',
+          messageId: 'message-a',
+          attemptKind: 'generation',
+          admissionSequence: 4,
+          leaseRevision: 7,
+          bodyVersion: 3,
+        },
+      ],
+      invalidations: [],
+    },
+  }
+}
+
+function invalidate(workspace: { workspaceId: string; replacementEpoch: number }): WorkspaceChange {
+  return { kind: 'invalidate', ...workspace, dependencies: 'all' }
+}
+
+function replace(workspace: { workspaceId: string; replacementEpoch: number }): WorkspaceChange {
+  return { kind: 'replace', ...workspace }
+}
+
+function installBroadcastChannel(options: { fanOut?: boolean } = {}): {
+  posted: WorkspaceChange[]
+  emit(change: WorkspaceChange): void
+} {
+  const instances: StubBroadcastChannel[] = []
+  const posted: WorkspaceChange[] = []
+  class StubBroadcastChannel {
+    private readonly messageHandlers = new Set<(event: MessageEvent) => void>()
+    private readonly messageErrorHandlers = new Set<() => void>()
+
+    constructor(_name: string) {
+      instances.push(this)
+    }
+
+    addEventListener(kind: string, handler: EventListener): void {
+      if (kind === 'message') {
+        this.messageHandlers.add(handler as (event: MessageEvent) => void)
+      } else if (kind === 'messageerror') {
+        this.messageErrorHandlers.add(handler as () => void)
+      }
+    }
+
+    close(): void {
+      const index = instances.indexOf(this)
+      if (index >= 0) instances.splice(index, 1)
+    }
+
+    postMessage(value: unknown): void {
+      posted.push(value as WorkspaceChange)
+      if (!options.fanOut) return
+      for (const instance of [...instances]) {
+        if (instance !== this) instance.emit(value)
+      }
+    }
+
+    emit(value: unknown): void {
+      for (const handler of [...this.messageHandlers]) handler({ data: value } as MessageEvent)
+    }
+  }
+  vi.stubGlobal('BroadcastChannel', StubBroadcastChannel)
+  return {
+    posted,
+    emit: (change) => instances[0]?.emit(change),
+  }
+}
+
+function deferred<T>(): { promise: Promise<T>; resolve(value: T): void } {
+  let resolvePromise!: (value: T) => void
+  const promise = new Promise<T>((resolve) => {
+    resolvePromise = resolve
+  })
+  return { promise, resolve: resolvePromise }
+}
+
+const tick = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0))

@@ -1,361 +1,389 @@
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
-import { join, relative, sep } from 'node:path'
+import { extname, join, relative, sep } from 'node:path'
 import ts from 'typescript'
 import { describe, expect, it } from 'vitest'
 
 const SRC_ROOT = join(process.cwd(), 'src')
 const SOURCE_EXTENSIONS = new Set(['.ts', '.tsx'])
+const SOURCE_RECORDS = sourceFiles(SRC_ROOT).map((file) => ({
+  rel: relative(SRC_ROOT, file).split(sep).join('/'),
+  source: readFileSync(file, 'utf8'),
+}))
 
-const PATCH_NAVIGATION_WRITERS = new Set([
-  'app/Shell.tsx',
-  'ui/chat/BranchControls.tsx',
-  'ui/chat/MessageList.tsx',
-])
+const ROUTER = 'app/router.ts'
+const CONTROLLER = 'store/conversation-controller.ts'
+const CURSOR = 'hooks/useConversationCursor.ts'
+const ACTIONS = 'app/conversation-actions.ts'
+const COMMAND_CLIENT = 'store/conversation-command-client.ts'
+const ADMISSION_CONTROLLER = 'store/generation-admission-controller.ts'
+const GENERATION_ENGINE = 'store/generation-engine.ts'
+const REPOSITORY_ADAPTER = 'store/conversation-repository-adapter.ts'
+const SHELL = 'app/Shell.tsx'
 
-const RECONCILIATION_WRITERS = new Set(['hooks/useBranchUrlSync.ts'])
-const GUARDED_PATCH_WRITERS = new Set(['app/Shell.tsx', 'hooks/useBranchUrlSync.ts'])
-const GUARDED_STRUCTURAL_WRITERS = new Set<string>()
-const PATH_SELECTION_WRITERS = new Set<string>()
-const COMMITTED_PATH_PRODUCER_REGISTRARS = new Set([
-  'app/Shell.tsx',
-  'hooks/useChat.ts',
-  'hooks/useContinue.ts',
-  'hooks/useMessageOps.ts',
-  'ui/chat/ImportModal.tsx',
-  'ui/chat/MessageActions.tsx',
-])
-const COMMITTED_PATH_SELECTION_WRITERS = new Set([
-  'app/Shell.tsx',
-  'hooks/useChat.ts',
-  'hooks/useContinue.ts',
-  'hooks/useMessageOps.ts',
-  'ui/chat/ImportModal.tsx',
-  'ui/chat/MessageActions.tsx',
-])
-const COMMITTED_PRESENTATION_UPDATE_WRITERS = new Set(['hooks/useChat.ts', 'hooks/useContinue.ts'])
-const COMMITTED_MESSAGE_MUTATION_WRITERS = new Set([
-  'hooks/useChat.ts',
-  'hooks/useContinue.ts',
-  'hooks/useMessageOps.ts',
-])
-const COMMITTED_MESSAGE_BATCH_WRITERS = new Set(['hooks/useChat.ts'])
-const COMMITTED_PRESENTATION_SEAL_WRITERS = new Set([
-  'app/Shell.tsx',
-  'hooks/useChat.ts',
-  'hooks/useContinue.ts',
-  'hooks/useMessageOps.ts',
-  'ui/chat/ImportModal.tsx',
-  'ui/chat/MessageActions.tsx',
-])
-const COMMITTED_PRESENTATION_ACK_WRITERS = new Set(['app/Shell.tsx'])
-const CHAT_STORE_MODULE = 'store/zustand/chatStore.ts'
-const ROUTE_INTENT_USERS = new Set([
-  'app/Shell.tsx',
-  'app/router.ts',
-  'ui/chat/MessageList.tsx',
-  'ui/sidebar/ChatList.tsx',
-  'ui/storage/StorageView.tsx',
-])
-
-describe('tab branch navigation boundary', () => {
-  it('keeps hot cursor writers on bounded patch APIs', () => {
-    expect(filesCalling(/\bnavigateWithCursorPatch\s*\(/)).toEqual(
-      [...PATCH_NAVIGATION_WRITERS].sort(),
-    )
-    expect(filesCalling(/\bpatchCursorForIntent\s*\(/)).toEqual([...GUARDED_PATCH_WRITERS].sort())
-    expect(filesCalling(/\bselectPathForIntent\s*\(/)).toEqual([...PATH_SELECTION_WRITERS].sort())
-    expect(filesCalling(/\bregisterCommittedPathProducer\s*\(/)).toEqual(
-      [...COMMITTED_PATH_PRODUCER_REGISTRARS].sort(),
-    )
-    expect(filesCalling(/\bselectCommittedPathForProducer\s*\(/)).toEqual(
-      [...COMMITTED_PATH_SELECTION_WRITERS].sort(),
-    )
-    expect(filesCalling(/\bupdateCommittedMessageForProducer\s*\(/)).toEqual(
-      [...COMMITTED_PRESENTATION_UPDATE_WRITERS].sort(),
-    )
-    expect(filesCalling(/\bpublishCommittedMessageMutation\s*\(/)).toEqual(
-      [...COMMITTED_MESSAGE_MUTATION_WRITERS].sort(),
-    )
-    expect(filesCalling(/\bpublishCommittedMessageBatch\s*\(/)).toEqual(
-      [...COMMITTED_MESSAGE_BATCH_WRITERS].sort(),
-    )
-    expect(filesCalling(/\bsealCommittedPathProducer\s*\(/)).toEqual(
-      [...COMMITTED_PRESENTATION_SEAL_WRITERS].sort(),
-    )
-    expect(filesCalling(/\backnowledgeCommittedPathPresentation\s*\(/)).toEqual(
-      [...COMMITTED_PRESENTATION_ACK_WRITERS].sort(),
-    )
-    expect(filesCalling(/\bsetCursorForIntent\s*\(/)).toEqual(
-      [...GUARDED_STRUCTURAL_WRITERS].sort(),
-    )
-    expect(chatStoreConsumerFilesCalling(/\.navigateToCursor\s*\(/)).toEqual([])
-    expect(chatStoreConsumerFilesCalling(/\.reconcileCursor\s*\(/)).toEqual([])
-  })
-
-  it('keeps repository reconciliation separate from user navigation intents', () => {
-    expect(filesCalling(/\breconcileCursorPatch\s*\(/)).toEqual([...RECONCILIATION_WRITERS].sort())
-  })
-
-  it('keeps the per-chat branch registry private', () => {
-    expect(chatStoreConsumerFilesCalling(/\.branches\b/)).toEqual([])
-    expect(sourceRecord(CHAT_STORE_MODULE).source).not.toMatch(/^\s*branches\s*:/mu)
-  })
-
-  it('does not use numeric navigation revisions as async authority', () => {
-    expect(filesCalling(/\bnavigationRevision\??\s*:\s*number\b/)).toEqual([])
-  })
-
-  it('centralizes tab-local stream-origin matching with owner identity', () => {
-    expect(filesCalling(/\boriginNavigationRevision\s*(?:===|!==)/)).toEqual([
-      'store/zustand/streamStore.ts',
-    ])
-  })
-
-  it('keeps delayed whole-route navigation behind the opaque tab intent boundary', () => {
-    expect(filesCalling(/\bbeginRouteIntent\s*\(/)).toEqual([...ROUTE_INTENT_USERS].sort())
-    expect(filesCalling(/\bcancelRouteIntent\s*\(/)).toEqual([...ROUTE_INTENT_USERS].sort())
-    expect(routeIntentsWithoutFinallyCleanup()).toEqual([])
-    expect(filesCalling(/\b(?:navigateForIntent|navigateToChatForIntent)\s*\(/)).toEqual(
-      [...ROUTE_INTENT_USERS].sort(),
-    )
-    expect(filesCalling(/\bnavigateToChatForIntent\s*\(/)).toEqual([
-      'app/Shell.tsx',
-      'app/router.ts',
-    ])
-    expect(filesCalling(/\bnavigateToChat\s*\(/)).toEqual([])
-    expect(asyncUnguardedRouteCalls()).toEqual([])
-  })
-
-  it('centralizes browser history writes and silent branch URL projections', () => {
-    expect(filesCalling(/window\.location\.hash\s*=(?!=)/)).toEqual([])
-    expect(filesCalling(/history\.pushState\s*\(/)).toEqual(['app/router.ts'])
-    expect(filesCalling(/history\.replaceState\s*\(/)).toEqual([
-      'app/router.ts',
+describe('unified tab conversation ownership boundary', () => {
+  it('makes the router the sole hash/history writer and route-arrival publisher', () => {
+    expect(filesContaining(/window\.location\.hash\s*=(?!=)/)).toEqual([])
+    expect(filesContaining(/history\.pushState\s*\(/)).toEqual([ROUTER])
+    expect(filesContaining(/history\.replaceState\s*\(/)).toEqual([
+      ROUTER,
       'lib/preload-recovery.ts',
     ])
-    expect(filesCalling(/addEventListener\s*\(\s*['"]hashchange['"]/)).toEqual(['app/router.ts'])
-    expect(filesCalling(/\breplaceRoute\s*\(/)).toEqual([
-      'app/router.ts',
-      'hooks/useBranchUrlSync.ts',
-      'hooks/useChat.ts',
+    expect(filesContaining(/addEventListener\s*\(\s*['"]hashchange['"]/)).toEqual([ROUTER])
+    expect(filesContaining(/\bpublishRouteChange\s*\(/)).toEqual([ROUTER])
+    expect(filesContaining(/conversationController\.setNavigationPort\s*\(/)).toEqual(['main.tsx'])
+    expect(filesContaining(/\breplaceConversationUrl\s*\(/)).toEqual([CONTROLLER])
+  })
+
+  it('keeps per-tab branch selection and presentation sessions inside ConversationController', () => {
+    expect(filesContaining(/private readonly sessions\s*=\s*new Map<ChatId, ChatSession>/)).toEqual(
+      [CONTROLLER],
+    )
+    expect(filesContaining(/\bpresentationRequest\b/)).toEqual([CONTROLLER])
+    expect(filesContaining(/readonly visibleReady:/)).toEqual([CONTROLLER])
+    expect(filesContaining(/\bpresentationResidents\b/)).toEqual([CONTROLLER])
+    expect(filesContaining(/\bpendingRevealTargetId\b/)).toEqual([CONTROLLER])
+    expect(filesContaining(/\bwritePersistedSession\s*\(/)).toEqual([CONTROLLER])
+    expect(filesContaining(/\bCONVERSATION_SESSION_PREFIX\b/)).toEqual([
+      CONTROLLER,
+      'store/workspace-tab-session.ts',
     ])
+    expect(sourceRecordsImportingLegacyRuntime()).toEqual([])
+    for (const rel of LEGACY_RUNTIME_MODULES) {
+      expect(existsSync(join(SRC_ROOT, rel))).toBe(false)
+    }
+
+    expect(reactPresentationStateDeclarations(SHELL)).toEqual([])
+    expect(sourceRecord(SHELL)).not.toMatch(
+      /\b(?:pendingTreeOpen|pendingTreeExitChatId|retainedAlternateViewsChatId)\b/,
+    )
   })
 
-  it('restricts non-blocking repository reads to active branch presentation observers', () => {
-    expect(filesCalling(/\buseRepositoryPresentationQuery\s*\(/)).toEqual(['app/Shell.tsx'])
-    expect(filesCalling(/\buseRepositoryKeyedPresentationQuery\s*\(/)).toEqual([
-      'hooks/useBranchUrlSync.ts',
+  it('routes UI selection through useConversationCursor and UI mutations through conversationActions', () => {
+    expect(filesContaining(/conversationController\.navigate\s*\(/)).toEqual([CURSOR])
+    expect(filesContaining(/conversationController\.resolveSiblingPosition\s*\(/)).toEqual([CURSOR])
+
+    const cursorConsumers = filesContaining(
+      /\bnavigateConversation(?:Message|SiblingPosition)\s*\(/,
+    ).filter((rel) => rel !== CURSOR)
+    for (const rel of cursorConsumers) {
+      const source = sourceRecord(rel)
+      expect(
+        source.includes("from '../../hooks/useConversationCursor'") ||
+          source.includes("from '../hooks/useConversationCursor'"),
+      ).toBe(true)
+    }
+
+    expect(filesContaining(/\bconversationActions\.\w+\s*\(/)).toEqual([
+      'app/Shell.tsx',
+      'ui/chat/ImportModal.tsx',
+      'ui/chat/MessageList.tsx',
+      'ui/sidebar/ChatList.tsx',
     ])
-    expect(
-      sourceRecords()
-        .filter(
-          ({ rel, source }) =>
-            rel !== 'store/reactive-query.ts' && source.includes('useRepositoryPresentationQuery'),
-        )
-        .map(({ rel }) => rel)
-        .sort(),
-    ).toEqual(['app/Shell.tsx', 'ui/chat/BranchTreeView.tsx'])
-    expect(sourceRecord('app/Shell.tsx').source).not.toMatch(
-      /activeBranchHandoff|activeBranchSnapshotOverride|refreshTranscriptForTreeHandoff|flushSync/,
+    expect(uiFilesImportingLowerMutationCapabilities()).toEqual([])
+  })
+
+  it('makes GenerationEngine the sole generation starter and admission the sole generation selection owner', () => {
+    expect(filesContaining(/generationEngine\.start\s*\(/)).toEqual([COMMAND_CLIENT])
+    expect(sourceRecord(COMMAND_CLIENT)).not.toContain("from './conversation-controller'")
+    expect(sourceRecord(COMMAND_CLIENT)).not.toMatch(/conversationController\./)
+
+    const generationKinds = [
+      'new-chat-send',
+      'send',
+      'reply',
+      'regenerate',
+      'edit-resend',
+      'continue',
+    ] as const
+    for (const kind of generationKinds) {
+      expect(sourceRecord(COMMAND_CLIENT)).toContain(`kind: '${kind}'`)
+    }
+
+    const acceptPrepared = classMethodSource(ADMISSION_CONTROLLER, 'acceptPrepared')
+    expect(acceptPrepared).toContain("claim.strategy === 'continue'")
+    expect(acceptPrepared).toContain("kind: 'preserve'")
+    expect(acceptPrepared).toContain("kind: 'select-transition'")
+    expect(acceptPrepared).toContain('receipt: input.selection')
+    expect(acceptPrepared).toContain('revealTargetMessageId: claim.assistantMessageId')
+    expect(acceptPrepared).not.toContain('transitionPresentations')
+    expect(acceptPrepared).not.toContain('transitionPathHeaders')
+    expect(filesContaining(/generationAdmissionController\.acceptPrepared\s*\(/)).toEqual([
+      GENERATION_ENGINE,
+    ])
+    expect(sourceRecord(GENERATION_ENGINE)).not.toMatch(
+      /conversationController\.(?:acceptLocalResult|claimOperation)\s*\(/,
     )
   })
 
-  it('keeps structural projection ownership above transcript and tree consumers', () => {
-    expect(sourceRecord('ui/chat/MessageList.tsx').source).not.toMatch(
-      /\bcreateMessageTreeProjection\s*\(/,
+  it('treats remote deltas as observations that preserve the resolved tab leaf', () => {
+    const receiveEffect = classMethodSource(REPOSITORY_ADAPTER, 'receiveEffect')
+    expect(receiveEffect).toContain('this.controller.applyCommittedEffects(')
+    expect(receiveEffect).toContain('conversationCommittedEffectsForDelta(')
+    expect(receiveEffect).not.toMatch(
+      /(?:navigate|requestPresentation|claimOperation|acceptLocalResult|lastUpdatedLeafId)/,
     )
-    expect(sourceRecord('ui/chat/BranchTreeView.tsx').source).not.toMatch(
-      /\bcreateMessageTreeProjection\s*\(/,
+
+    const applyCommittedEffects = classMethodSource(CONTROLLER, 'applyCommittedEffects')
+    expect(applyCommittedEffects).not.toMatch(
+      /(?:navigate|requestPresentation|installReveal|claimOperation|acceptLocalResult)/,
     )
-    expect(
-      sourceRecord('hooks/useBranchUrlSync.ts').source.match(/\bcreateMessageTreeProjection\s*\(/g),
-    ).toHaveLength(2)
-    expect(
-      sourceRecord('app/Shell.tsx').source.match(/\bcreateMessageTreeProjection\s*\(/g),
-    ).toHaveLength(1)
   })
 
-  it('invalidates body hydration from body rows rather than structural headers', () => {
-    const shell = sourceRecord('app/Shell.tsx').source
-    const tree = sourceRecord('ui/chat/BranchTreeView.tsx').source
-    expect(shell).toContain("primaryKeys('messageBodies', ...activeBodyWindowIntentIds)")
-    expect(shell).not.toContain("primaryKeys('messages', ...activeBodyWindowIntentIds)")
-    expect(tree).toContain("primaryKeys('messageBodies', inspectedMessageId)")
-    expect(tree).not.toContain("primaryKeys('messages', inspectedMessageId)")
+  it('keeps numeric freshness counters internal and removes legacy navigation authority', () => {
+    expect(filesContaining(/\bnavigationRevision\b/)).toEqual([])
+    expect(filesContaining(/\boriginNavigationRevision\b/)).toEqual([])
+    expect(filesContaining(/\bselectionRevision\b/)).toEqual([
+      'hooks/useActiveBranchFrame.ts',
+      'hooks/useConversationFrame.ts',
+      CONTROLLER,
+    ])
+    expect(sourceRecord(CURSOR)).not.toContain('selectionRevision')
+    expect(sourceRecord(ACTIONS)).not.toContain('selectionRevision')
+  })
+
+  it('feeds each paint surface one sealed controller binding without rebuilding readiness or state', () => {
+    const transcript = sourceRecord('ui/chat/MessageList.tsx')
+    const tree = sourceRecord('ui/chat/BranchTreeView.tsx')
+    const shell = sourceRecord('app/Shell.tsx')
+    const paintConsumers = [
+      'ui/chat/MessageList.tsx',
+      'ui/chat/Message.tsx',
+      'ui/chat/BranchTreeView.tsx',
+      'ui/chat/BranchTreeInspector.tsx',
+    ] as const
+
+    for (const source of [transcript, tree]) {
+      expect(source).not.toMatch(/\bgetWorkspaceRepository\s*\(/)
+      expect(source).not.toMatch(/\bload(?:Spine|Topology|TranscriptPage|DestinationTail)\s*\(/)
+      expect(source).not.toMatch(/\bcreateMessageTreeProjection\s*\(/)
+      expect(source).not.toMatch(/\bcreateMessageTopologyIndex\s*\(/)
+    }
+    const transcriptProps = interfacePropertyNames('ui/chat/MessageList.tsx', 'MessageListProps')
+    expect(transcriptProps.filter((property) => property === 'binding')).toHaveLength(1)
+    expect(transcript).toContain('binding: ConversationTranscriptSurface')
+    expect(transcriptProps).not.toEqual(
+      expect.arrayContaining(['branchSnapshot', 'branchSpine', 'activePath']),
+    )
+    const treeProps = interfacePropertyNames('ui/chat/BranchTreeView.tsx', 'BranchTreeViewProps')
+    expect(treeProps.filter((property) => property === 'binding')).toHaveLength(1)
+    expect(tree).toContain('binding: ConversationTreeSurface')
+    expect(treeProps).not.toEqual(
+      expect.arrayContaining(['projection', 'acceptedPath', 'headerById', 'changedHeaderKeys']),
+    )
+    expect(shell).toContain('binding={transcriptBinding}')
+    expect(shell).toContain('binding={treeBinding}')
+    expect(shell).not.toContain('presentationBindingReady')
+    expect(shell).not.toMatch(/activePresentation\?\.visible\s*===\s*activeSurfaceTarget\.binding/)
+    expect(shell).not.toMatch(/activeSurfaceTarget\.binding\.(?:currency|reveal)/)
+
+    for (const rel of paintConsumers) {
+      const source = sourceRecord(rel)
+      expect(source).not.toMatch(
+        /\b(?:useConversationSnapshot|useConversationFrame|useAttemptExecutionsForChat|useAttemptTargetSnapshot)\s*\(/,
+      )
+    }
+    expect(sourceRecord('hooks/useActiveBranchFrame.ts')).toContain(
+      'const activeStreams = useAttemptExecutionsForChat(activeChatId)',
+    )
+    expect(shell).toContain('frame: activeConversation')
+  })
+
+  it('inventories every navigation, presentation, committed-selection, and count capability', () => {
+    expect(
+      filesContaining(/\bnavigateConversationMessage\s*\(/).filter((rel) => rel !== CURSOR),
+    ).toEqual(['app/Shell.tsx', 'ui/chat/BranchControls.tsx', 'ui/chat/MessageList.tsx'])
+    expect(
+      filesContaining(/\bnavigateConversationSiblingPosition\s*\(/).filter((rel) => rel !== CURSOR),
+    ).toEqual(['ui/chat/BranchControls.tsx'])
+    expect(filesContaining(/conversationController\.requestPresentation\s*\(/)).toEqual([SHELL])
+    expect(filesContaining(/conversationController\.setPresentation\s*\(/)).toEqual([])
+    expect(filesContaining(/conversationController\.installPresentationResourcePort\s*\(/)).toEqual(
+      [SHELL],
+    )
+    expect(filesContaining(/\binstallCommittedSelection\s*\(/)).toEqual([CONTROLLER])
+    expect(filesContaining(/\brequestForkUpdates\s*\(/)).toEqual([CONTROLLER])
+    expect(filesContaining(/\bcommittedConversationTransition\s*\(/)).toEqual([
+      GENERATION_ENGINE,
+      'store/repository.ts',
+    ])
+    expect(filesContaining(/\bsealConversationSelection\s*\(/)).toEqual([
+      'core/messages.ts',
+      CONTROLLER,
+      REPOSITORY_ADAPTER,
+    ])
+    expect(filesContaining(/\bmaterializeCommittedBranchSelection\s*\(/)).toEqual([])
+    expect(filesContaining(/\.forkFor\s*\(/)).toEqual([CONTROLLER, 'ui/chat/MessageList.tsx'])
+    expect(sourceRecord('core/active-branch-spine.ts')).toMatch(/\bforkFor\(messageId:/)
+    expect(sourceRecord('ui/chat/BranchControls.tsx')).not.toMatch(
+      /\b(?:liveByParent|childLists|childSlotMembers|getWorkspaceRepository)\b/,
+    )
   })
 })
 
-function filesCalling(pattern: RegExp): string[] {
-  return sourceRecords()
-    .filter(({ source }) => pattern.test(source))
+const LEGACY_RUNTIME_MODULES = [
+  'hooks/useBranchUrlSync.ts',
+  'hooks/useChat.ts',
+  'hooks/useContinue.ts',
+  'hooks/useMessageOps.ts',
+  'store/zustand/chatStore.ts',
+  'store/zustand/searchStore.ts',
+  'store/zustand/streamStore.ts',
+] as const
+
+function sourceRecord(rel: string): string {
+  const record = SOURCE_RECORDS.find((candidate) => candidate.rel === rel)
+  if (!record) throw new Error(`MissingSourceRecord:${rel}`)
+  return record.source
+}
+
+function filesContaining(pattern: RegExp): string[] {
+  return SOURCE_RECORDS.filter(({ source }) => pattern.test(source))
     .map(({ rel }) => rel)
     .sort()
 }
 
-function chatStoreConsumerFilesCalling(pattern: RegExp): string[] {
-  return sourceRecords()
-    .filter(
-      ({ rel, source }) => rel !== CHAT_STORE_MODULE && source.includes('store/zustand/chatStore'),
-    )
-    .filter(({ source }) => pattern.test(source))
-    .map(({ rel }) => rel)
-    .sort()
-}
-
-function sourceRecord(rel: string): { rel: string; source: string } {
-  return {
-    rel,
-    source: readFileSync(join(SRC_ROOT, rel), 'utf8'),
-  }
-}
-
-function sourceRecords(): Array<{ rel: string; source: string }> {
-  return sourceFiles(SRC_ROOT).map((file) =>
-    sourceRecord(relative(SRC_ROOT, file).split(sep).join('/')),
+function sourceRecordsImportingLegacyRuntime(): string[] {
+  return SOURCE_RECORDS.filter(({ source }) =>
+    LEGACY_RUNTIME_MODULES.some((rel) => source.includes(rel.replace(/\.ts$/, ''))),
   )
+    .map(({ rel }) => rel)
+    .sort()
+}
+
+function uiFilesImportingLowerMutationCapabilities(): string[] {
+  const lowerMutationModules = new Set([
+    '../store/conversation-command-client',
+    '../store/generation-engine',
+    '../store/conversation-workspace',
+    '../../store/conversation-command-client',
+    '../../store/generation-engine',
+    '../../store/conversation-workspace',
+  ])
+  const readOnlyRuntimeExports = new Set([
+    'getWorkspaceRuntimeState',
+    'subscribeWorkspaceRuntimeState',
+  ])
+  return SOURCE_RECORDS.filter(({ rel }) => rel.startsWith('ui/') || rel === 'app/Shell.tsx')
+    .filter(({ rel }) => {
+      const file = parsedSource(rel)
+      return file.statements.some((statement) => {
+        if (!ts.isImportDeclaration(statement) || !ts.isStringLiteral(statement.moduleSpecifier)) {
+          return false
+        }
+        const module = statement.moduleSpecifier.text
+        const clause = statement.importClause
+        if (clause?.isTypeOnly) return false
+        if (lowerMutationModules.has(module)) {
+          const bindings = clause?.namedBindings
+          if (!bindings || !ts.isNamedImports(bindings)) return true
+          return bindings.elements.some((element) => !element.isTypeOnly)
+        }
+        if (module !== '../store/workspace-runtime' && module !== '../../store/workspace-runtime') {
+          return false
+        }
+        const bindings = clause?.namedBindings
+        return (
+          !bindings ||
+          !ts.isNamedImports(bindings) ||
+          bindings.elements.some((element) => !readOnlyRuntimeExports.has(element.name.text))
+        )
+      })
+    })
+    .map(({ rel }) => rel)
+    .sort()
+}
+
+function classMethodSource(rel: string, name: string): string {
+  const file = parsedSource(rel)
+  let match: ts.MethodDeclaration | undefined
+  visit(file, (node) => {
+    if (
+      ts.isMethodDeclaration(node) &&
+      node.body &&
+      ((ts.isIdentifier(node.name) && node.name.text === name) ||
+        (ts.isStringLiteral(node.name) && node.name.text === name))
+    ) {
+      match = node
+    }
+  })
+  if (!match) throw new Error(`MissingClassMethod:${rel}:${name}`)
+  return match.getText(file)
+}
+
+function interfacePropertyNames(rel: string, name: string): string[] {
+  const file = parsedSource(rel)
+  const declaration = file.statements.find(
+    (statement): statement is ts.InterfaceDeclaration =>
+      ts.isInterfaceDeclaration(statement) && statement.name.text === name,
+  )
+  if (!declaration) throw new Error(`MissingInterface:${rel}:${name}`)
+  return declaration.members
+    .map((member) => member.name)
+    .filter((property): property is ts.PropertyName => property !== undefined)
+    .map((property) => property.getText(file))
+    .sort()
+}
+
+function reactPresentationStateDeclarations(rel: string): string[] {
+  const file = parsedSource(rel)
+  const matches = new Set<string>()
+  visit(file, (node) => {
+    if (
+      !ts.isVariableDeclaration(node) ||
+      !ts.isArrayBindingPattern(node.name) ||
+      !node.initializer ||
+      !ts.isCallExpression(node.initializer) ||
+      !ts.isIdentifier(node.initializer.expression) ||
+      node.initializer.expression.text !== 'useState'
+    ) {
+      return
+    }
+    const stateBinding = node.name.elements[0]
+    if (
+      !stateBinding ||
+      ts.isOmittedExpression(stateBinding) ||
+      !ts.isIdentifier(stateBinding.name)
+    ) {
+      return
+    }
+    const stateName = stateBinding.name.text
+    const typeText =
+      node.initializer.typeArguments?.map((type) => type.getText(file)).join(' ') ?? ''
+    const initialText = node.initializer.arguments[0]?.getText(file) ?? ''
+    if (
+      /(?:presentation|surface|treeView|pendingTree|retainedAlternate)/iu.test(stateName) ||
+      /\bConversationSurface\b/u.test(typeText) ||
+      /^['"](?:transcript|tree)['"]$/u.test(initialText)
+    ) {
+      matches.add(stateName)
+    }
+  })
+  return [...matches].sort()
+}
+
+function parsedSource(rel: string): ts.SourceFile {
+  return ts.createSourceFile(
+    rel,
+    sourceRecord(rel),
+    ts.ScriptTarget.Latest,
+    true,
+    rel.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS,
+  )
+}
+
+function visit(node: ts.Node, visitor: (node: ts.Node) => void): void {
+  visitor(node)
+  ts.forEachChild(node, (child) => visit(child, visitor))
 }
 
 function sourceFiles(dir: string): string[] {
   if (!existsSync(dir)) return []
-  const out: string[] = []
+  const files: string[] = []
   for (const entry of readdirSync(dir)) {
     const path = join(dir, entry)
     const stat = statSync(path)
-    if (stat.isDirectory()) out.push(...sourceFiles(path))
-    else if (SOURCE_EXTENSIONS.has(path.slice(path.lastIndexOf('.')))) out.push(path)
+    if (stat.isDirectory()) files.push(...sourceFiles(path))
+    else if (SOURCE_EXTENSIONS.has(extname(path))) files.push(path)
   }
-  return out
-}
-
-function asyncUnguardedRouteCalls(): string[] {
-  const unguarded = new Set(['navigate', 'navigateHome', 'navigateNew', 'navigateToChat'])
-  const calls: string[] = []
-  for (const { rel, source } of sourceRecords()) {
-    const file = ts.createSourceFile(
-      rel,
-      source,
-      ts.ScriptTarget.Latest,
-      true,
-      rel.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS,
-    )
-    const visit = (node: ts.Node, afterAwaitBoundary: boolean) => {
-      const isFunction =
-        ts.isFunctionDeclaration(node) ||
-        ts.isFunctionExpression(node) ||
-        ts.isArrowFunction(node) ||
-        ts.isMethodDeclaration(node) ||
-        ts.isGetAccessorDeclaration(node) ||
-        ts.isSetAccessorDeclaration(node)
-      const isAsync = Boolean(
-        isFunction &&
-          ts.getModifiers(node)?.some((modifier) => modifier.kind === ts.SyntaxKind.AsyncKeyword),
-      )
-      const delayed = afterAwaitBoundary || isAsync
-      if (
-        delayed &&
-        ts.isCallExpression(node) &&
-        ts.isIdentifier(node.expression) &&
-        unguarded.has(node.expression.text)
-      ) {
-        const line = file.getLineAndCharacterOfPosition(node.getStart(file)).line + 1
-        calls.push(`${rel}:${line}:${node.expression.text}`)
-      }
-      node.forEachChild((child) => visit(child, delayed))
-    }
-    visit(file, false)
-  }
-  return calls.sort()
-}
-
-function routeIntentsWithoutFinallyCleanup(): string[] {
-  const failures: string[] = []
-  for (const { rel, source } of sourceRecords()) {
-    if (rel === 'app/router.ts') continue
-    const file = ts.createSourceFile(
-      rel,
-      source,
-      ts.ScriptTarget.Latest,
-      true,
-      rel.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS,
-    )
-    const visit = (node: ts.Node) => {
-      if (
-        ts.isCallExpression(node) &&
-        ts.isIdentifier(node.expression) &&
-        (node.expression.text === 'beginRouteIntent' ||
-          node.expression.text === 'beginWorkspaceReplacementRouteIntent')
-      ) {
-        const declaration = ancestor(node, ts.isVariableDeclaration)
-        const owner = ancestor(node, isFunctionNode)
-        const name =
-          declaration && ts.isIdentifier(declaration.name) ? declaration.name.text : undefined
-        const cleaned = Boolean(owner && name && hasFinallyRouteIntentCleanup(owner, name))
-        if (!cleaned) {
-          const line = file.getLineAndCharacterOfPosition(node.getStart(file)).line + 1
-          failures.push(`${rel}:${line}:${name ?? '<unbound>'}`)
-        }
-      }
-      node.forEachChild(visit)
-    }
-    visit(file)
-  }
-  return failures.sort()
-}
-
-function ancestor<T extends ts.Node>(
-  node: ts.Node,
-  predicate: (candidate: ts.Node) => candidate is T,
-): T | undefined {
-  let current = node.parent
-  for (;;) {
-    if (predicate(current)) return current
-    if (ts.isSourceFile(current)) return undefined
-    current = current.parent
-  }
-}
-
-function isFunctionNode(node: ts.Node): node is ts.FunctionLikeDeclaration {
-  return (
-    ts.isFunctionDeclaration(node) ||
-    ts.isFunctionExpression(node) ||
-    ts.isArrowFunction(node) ||
-    ts.isMethodDeclaration(node) ||
-    ts.isGetAccessorDeclaration(node) ||
-    ts.isSetAccessorDeclaration(node)
-  )
-}
-
-function insideFinally(node: ts.Node, owner: ts.Node): boolean {
-  let current = node.parent
-  while (current !== owner) {
-    if (
-      ts.isBlock(current) &&
-      ts.isTryStatement(current.parent) &&
-      current.parent.finallyBlock === current
-    ) {
-      return true
-    }
-    if (ts.isSourceFile(current)) return false
-    current = current.parent
-  }
-  return false
-}
-
-function hasFinallyRouteIntentCleanup(owner: ts.Node, name: string): boolean {
-  let found = false
-  const inspect = (candidate: ts.Node) => {
-    if (
-      ts.isCallExpression(candidate) &&
-      ts.isIdentifier(candidate.expression) &&
-      candidate.expression.text === 'cancelRouteIntent' &&
-      candidate.arguments.some((argument) => ts.isIdentifier(argument) && argument.text === name) &&
-      insideFinally(candidate, owner)
-    ) {
-      found = true
-      return
-    }
-    candidate.forEachChild(inspect)
-  }
-  owner.forEachChild(inspect)
-  return found
+  return files
 }

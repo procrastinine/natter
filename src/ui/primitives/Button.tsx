@@ -1,16 +1,9 @@
 import { type ButtonHTMLAttributes, forwardRef, type ReactNode } from 'react'
 
 export type ButtonTone = 'neutral' | 'accent' | 'success' | 'warning' | 'danger'
-export type ButtonAppearance =
-  | 'surface'
-  | 'solid'
-  | 'soft'
-  | 'outline'
-  | 'ghost'
-  | 'plain'
-  | 'strip'
-export type ButtonSize = 'xs' | 'sm' | 'md' | 'lg' | 'icon-xs' | 'icon-sm' | 'icon-md' | 'icon-lg'
-export type ButtonGeometry = 'default' | 'flush' | 'joined-start' | 'joined-center' | 'joined-end'
+type ButtonAppearance = 'surface' | 'solid' | 'soft' | 'outline' | 'ghost' | 'plain' | 'strip'
+type ButtonSize = 'xs' | 'sm' | 'md' | 'lg' | 'icon-xs' | 'icon-sm' | 'icon-md' | 'icon-lg'
+type ButtonGeometry = 'default' | 'flush' | 'joined-start' | 'joined-center' | 'joined-end'
 
 export interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
   tone?: ButtonTone | undefined

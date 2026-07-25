@@ -7,8 +7,13 @@
 // Hidden entirely on non-OpenRouter connections because none apply there.
 
 import { useCallback } from 'react'
+import {
+  configurationWriteInteraction,
+  configurationWriteTarget,
+} from '../../app/presentation-interactions'
 import type { Chat } from '../../core/types'
-import { updateChatSettings } from '../../store/chats'
+import { usePresentationInteraction } from '../../hooks/usePresentationInteraction'
+import { configurationApplication } from '../../store/configuration-application'
 import { InfoDisclosure } from './InfoDisclosure'
 
 interface PrivacySectionProps {
@@ -16,41 +21,58 @@ interface PrivacySectionProps {
 }
 
 export function PrivacySection({ chat }: PrivacySectionProps) {
-  const prefs = chat.settings.providerPrefs ?? {}
+  const { run: runConfigurationWrite } = usePresentationInteraction(configurationWriteInteraction, {
+    observePending: false,
+  })
   const privacy = chat.settings.privacy
 
   const setPareto = useCallback(
     (on: boolean) => {
-      void updateChatSettings(chat.id, {
-        privacy: { ...privacy, paretoFilter: on },
+      runConfigurationWrite({
+        target: configurationWriteTarget(chat.id, 'privacy.paretoFilter'),
+        action: () =>
+          configurationApplication.patchChatSettingsFields(chat.id, [
+            { path: ['privacy', 'paretoFilter'], value: on },
+          ]),
       })
     },
-    [chat.id, privacy],
+    [chat.id, runConfigurationWrite],
   )
   const setZdr = useCallback(
     (on: boolean) => {
-      void updateChatSettings(chat.id, {
-        privacy: { ...privacy, zdrOnly: on },
+      runConfigurationWrite({
+        target: configurationWriteTarget(chat.id, 'privacy.zdrOnly'),
+        action: () =>
+          configurationApplication.patchChatSettingsFields(chat.id, [
+            { path: ['privacy', 'zdrOnly'], value: on },
+          ]),
       })
     },
-    [chat.id, privacy],
+    [chat.id, runConfigurationWrite],
   )
   const setDenyCollection = useCallback(
     (on: boolean) => {
-      void updateChatSettings(chat.id, {
-        privacy: { ...privacy, denyDataCollection: on },
+      runConfigurationWrite({
+        target: configurationWriteTarget(chat.id, 'privacy.denyDataCollection'),
+        action: () =>
+          configurationApplication.patchChatSettingsFields(chat.id, [
+            { path: ['privacy', 'denyDataCollection'], value: on },
+          ]),
       })
     },
-    [chat.id, privacy],
+    [chat.id, runConfigurationWrite],
   )
   const setAllowFallbacks = useCallback(
     (on: boolean) => {
-      void updateChatSettings(chat.id, {
-        allowFallbacks: on,
-        providerPrefs: prefs,
+      runConfigurationWrite({
+        target: configurationWriteTarget(chat.id, 'allowFallbacks'),
+        action: () =>
+          configurationApplication.patchChatSettings(chat.id, {
+            allowFallbacks: on,
+          }),
       })
     },
-    [chat.id, prefs],
+    [chat.id, runConfigurationWrite],
   )
 
   return (

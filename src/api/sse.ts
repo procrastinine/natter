@@ -24,6 +24,11 @@ const DEFAULT_STREAM_FIRST_BYTE_TIMEOUT_MS = 300_000
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 120_000
 const DEFAULT_MAX_PENDING_EVENT_CHARS = 32 * 1024 * 1024
 
+function monotonicNow(): number {
+  const performance = (globalThis as { performance?: Performance }).performance
+  return performance?.now() ?? Date.now()
+}
+
 export interface SSEWatchdogOptions {
   firstByteTimeoutMs?: number
   idleTimeoutMs?: number
@@ -85,7 +90,7 @@ export function decodeProviderStreamFrame<T>(input: {
   }
 }
 
-export function malformedJsonFrameReport(input: {
+function malformedJsonFrameReport(input: {
   adapter: StreamAdapter
   eventType: string | undefined
   data: string
@@ -306,13 +311,13 @@ export async function* parseSSE(
         watchdogTimer = undefined
         watchdogTimerDeadline = undefined
         if (!readPending || interruptedBy !== undefined || readDeadline === null) return
-        if (Date.now() < readDeadline) {
+        if (monotonicNow() < readDeadline) {
           armWatchdog(readDeadline)
           return
         }
         interrupt(signal?.aborted ? 'abort' : 'timeout')
       },
-      Math.max(0, deadline - Date.now()),
+      Math.max(0, deadline - monotonicNow()),
     )
   }
 
@@ -320,13 +325,13 @@ export async function* parseSSE(
     timeoutMs: number | null,
   ): Promise<{ result: ReadableStreamReadResult<Uint8Array>; elapsedMs: number }> => {
     throwIfAborted()
-    const startedAt = Date.now()
+    const startedAt = monotonicNow()
     readPending = true
     readDeadline = timeoutMs === null ? null : startedAt + timeoutMs
     armWatchdog(readDeadline)
     try {
       const result = await Promise.race([reader.read(), interruption])
-      return { result, elapsedMs: Math.max(0, Date.now() - startedAt) }
+      return { result, elapsedMs: Math.max(0, monotonicNow() - startedAt) }
     } finally {
       readPending = false
       readDeadline = null

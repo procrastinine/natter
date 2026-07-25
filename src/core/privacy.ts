@@ -20,13 +20,13 @@ export function synthesizeDataPolicy(raw: DataPolicy | null | undefined): DataPo
 // orange drops out when Google AI Studio yellow is present).
 export function dominates(a: DataPolicy | undefined, b: DataPolicy | undefined): boolean {
   if (!a || !b) return false
-  return tierRank(a) < tierRank(b)
+  return privacyPolicyTierRank(a) < privacyPolicyTierRank(b)
 }
 
 // Mirrors `privacyTierForPolicy` in `privacy-filter.ts`. Lower rank =
 // more private; `dominates` returns true when the caller has a lower
 // rank than the comparison target.
-function tierRank(p: DataPolicy): number {
+export function privacyPolicyTierRank(p: DataPolicy): number {
   if (p.training || p.trainingOpenRouter) return 3
   const userIds = p.requiresUserIDs === true
   const retainsUnknownPeriod = p.retainsPrompts && p.retentionDays === undefined

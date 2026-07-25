@@ -10,30 +10,16 @@ import {
 } from '../backcompat/attachment-reference-edges'
 import {
   attachmentRefsBackfillMarker,
-  migrateAttachmentRefRows,
   migrateLegacyAttachmentStorage,
   normalizeAttachmentRefOwners,
 } from '../backcompat/attachment-refs'
-import { BACKCOMPAT_BATCH_SIZE, forEachTableBatch } from '../backcompat/batched-table'
 import { migrateBrowserWriterLock } from '../backcompat/browser-writer-lock'
-import {
-  backfillChatPreviewProjection,
-  chatPreviewProjectionBackfillMarker,
-  migrateChatPreviewProjection,
-} from '../backcompat/chat-preview-projection'
+import { migrateChatPreviewProjection } from '../backcompat/chat-preview-projection'
 import { migrateCurrentChatSettingsSnapshot } from '../backcompat/chat-settings'
 import { migrateChatSidebarProjection } from '../backcompat/chat-sidebar-projection'
 import { migrateLegacyChildLists } from '../backcompat/child-lists'
 import { migrateGenerationAttemptOutcomes } from '../backcompat/generation-attempt-outcomes'
-import {
-  globalSettingsBackfillMarker,
-  migrateGlobalSettingsRows,
-} from '../backcompat/global-settings'
-import {
-  backfillMissingMessageBodies,
-  messageBodySplitBackfillMarker,
-  migrateInlineMessageBodies,
-} from '../backcompat/message-body-split'
+import { migrateInlineMessageBodies } from '../backcompat/message-body-split'
 import { migrateMessageBodyVersions } from '../backcompat/message-body-version'
 import { migrateMessageHeaderProjections } from '../backcompat/message-header-projections'
 import { migrateMessageRequestContextVersions } from '../backcompat/message-request-context-version'
@@ -42,106 +28,154 @@ import {
   PRESET_SORT_MIGRATION_INDEX,
 } from '../backcompat/preset-sort-order'
 import { migrateProviderApiModeTables } from '../backcompat/provider-api-modes'
-import {
-  migrateProviderOutputItemRows,
-  migrateProviderOutputItemRowsInTables,
-  providerOutputItemsBackfillMarker,
-} from '../backcompat/provider-output-items'
 import { migrateProviderSettingsTables } from '../backcompat/provider-settings-migration'
-import {
-  migrateProviderToolSettings,
-  migrateProviderToolSettingsRows,
-  providerToolSettingsBackfillMarker,
-} from '../backcompat/provider-tools'
+import { migrateProviderToolSettings } from '../backcompat/provider-tools'
+import { runOnceBackfillInTransaction } from '../backcompat/run-once'
 import { migrateStreamLeaseAttempts } from '../backcompat/stream-lease-attempts'
-import {
-  canonicalizeTokenCalibrationRows,
-  rebuildTokenCalibrationGlobalRows,
-  tokenCalibrationCanonicalizeBackfillMarker,
-  tokenCalibrationGlobalBackfillMarker,
-} from '../backcompat/token-calibration-global'
 import { migrateWorkspaceReplacementEpoch } from '../backcompat/workspace-meta'
-import { findLastUpdatedLeafId } from '../core/active-path'
-import { buildBranchMessages } from '../core/branch-flatten'
 import {
   DEFAULT_CONTINUE_SYSTEM_PROMPT,
   DEFAULT_CONTINUE_USER_PROMPT,
 } from '../core/continue-prompts'
 import {
+  emptyRecentModelRecency,
+  RECENT_MODEL_RECENCY_KEY,
+  RECENT_MODELS_KEY,
+} from '../core/global-settings'
+import {
   normalizeRenderingPreferences,
   RENDERING_PREFERENCES_KEY,
 } from '../core/rendering-preferences'
+import type { SavedTextTemplate } from '../core/text-templates'
 import type {
-  Attachment,
   AttachmentArtifact,
   AttachmentBlob,
   AttachmentJob,
   AttachmentReferenceEdge,
   Chat,
-  ChatBranchCache,
   ChatFolder,
   ChatPreset,
   ChatTag,
   ChildListState,
+  ChildSlotMember,
   ConnectionProfile,
   DraftRow,
   KeyRecord,
   Message,
-  PresetResolution,
+  PresetId,
   PromptPreset,
 } from '../core/types'
-import { countMessagesWords } from '../core/word-count'
-import { configureBroadcastFallbackReader } from './broadcast'
+import type { BrowserWorkspaceDatabaseName } from '../lib/origin-storage-names'
+import {
+  ATTACHMENT_CATALOG_AGGREGATE_ID,
+  type AttachmentCatalogAggregateRow,
+  type AttachmentCatalogProjectionRow,
+  emptyAttachmentCatalogAggregateRow,
+} from './attachment-catalog-projection'
+import {
+  type AttachmentIntegrityStateRow,
+  completedAttachmentIntegrityState,
+} from './attachment-integrity-maintenance'
+import type { AttachmentHeaderRow } from './attachment-storage'
+import { configureBroadcastFallbackReader, seedBroadcastWorkspaceSnapshot } from './broadcast'
+import { installBrowserCommandMutationJournal } from './browser-command-mutation-journal'
 import { type BrowserLockRow, emptyBrowserWriterLockRow } from './browser-lock-record'
 import {
-  CHAT_SIDEBAR_PROJECTION_BACKFILL_KEY,
-  CHAT_SIDEBAR_PROJECTION_MANIFEST_KEY,
-  type ChatSidebarProjectionRow,
-  chatSidebarProjectionSettings,
-  isValidChatSidebarProjectionManifest,
-  putChatSidebarProjection,
-  rebuildChatSidebarProjection,
-} from './chat-sidebar-projection'
+  assertBrowserWorkspaceBootstrapAuthority,
+  assertBrowserWorkspaceBootstrapAuthorityOwned,
+  type BrowserWorkspaceBootstrapAuthority,
+} from './browser-workspace-bootstrap-authority'
+import { readExistingIndexedDb } from './browser-workspace-database-control'
+import { rebuildCurrentBrowserWorkspaceDerivedStateInTransaction } from './browser-workspace-derived-repair'
 import type {
-  CachedEndpointsRow,
-  CachedModelsRow,
-  CachedPrivacyPolicyRow,
-  CachedProvidersRow,
+  BrowserWorkspaceMigrationProgress,
+  BrowserWorkspaceOpenOptions,
+  BrowserWorkspaceOpenProgress,
+} from './browser-workspace-open-contract'
+import {
+  WAVE_A_STORAGE_VERSION,
+  WAVE_A_V94_STORES,
+  waveACompletionSettingsV94,
+} from './browser-workspace-schema-v94'
+import {
+  CHAT_SIDEBAR_AGGREGATE_ID,
+  type ChatSidebarAggregateProjectionRow,
+  type ChatSidebarProjectionRow,
+  emptyChatSidebarAggregateRow,
+} from './chat-sidebar-projection'
+import { installChatStorageCodec } from './chat-storage-codec'
+import {
+  CONFIGURATION_CATALOG_AGGREGATE_ID,
+  type ConfigurationCatalogMetadataRow,
+  type ConfigurationPresetCatalogProjectionRow,
+  type ConfigurationProfileCatalogProjectionRow,
+  type ConfigurationPromptPresetCatalogProjectionRow,
+  emptyConfigurationCatalogMetadataRows,
+} from './configuration-catalog-projection'
+import type { ConfigurationLink } from './configuration-domain-contract'
+import type { ConfigurationProfileUsageProjectionRow } from './configuration-profile-usage-projection'
+import type {
+  CachedEndpointsStorageRow,
+  CachedModelsStorageRow,
+  CachedPrivacyPolicyStorageRow,
+  DiscoveryCacheStateStorageRow,
+  DiscoveryPayloadMetadataStorageRow,
+  DiscoveryPayloadStorageRow,
   SettingsRow,
 } from './db-rows'
-import { configureLockDatabaseOpener } from './locks'
+import { seedEmptyDiscoveryCacheState } from './discovery-cache-storage'
+import { configureLockDatabaseRunner } from './locks'
 import {
-  hydrateMessages,
+  installMessageStorageCodec,
   type MessageBodyRow,
   type MessageHeaderRow,
-  previewTextFromContent,
+  type MessageTextPreviewRow,
 } from './message-storage'
-import type { StreamChunkRow, StreamLeaseRow } from './repository'
-import { readBrowserWorkspaceMeta } from './workspace-meta'
+import {
+  CANONICAL_PHYSICAL_STORAGE_TABLE_NAMES,
+  REPAIRABLE_PHYSICAL_STORAGE_TABLE_NAMES,
+} from './physical-storage-tables'
+import {
+  emptyPresetOrderState,
+  PRESET_ORDER_STATE_ID,
+  type PresetOrderBlockRow,
+  type PresetOrderMembershipRow,
+  type PresetOrderStateRow,
+} from './preset-order'
+import {
+  type StreamJournalFrameRow,
+  type StreamLeaseRow,
+  type WorkspaceFence,
+  WorkspaceSessionClosedError,
+} from './repository'
+import { accumulateStorageCompactionDebt } from './storage-compaction-state'
+import {
+  freshStorageRetentionStateRows,
+  type StorageRetentionStateRow,
+  type StorageRetentionTask,
+} from './storage-retention-state'
+import {
+  type BrowserWorkspaceFenceRow,
+  browserWorkspaceFenceRow,
+  readBrowserWorkspaceMeta,
+} from './workspace-meta'
 
-export type {
-  CachedEndpointsRow,
-  CachedModelsRow,
-  CachedPrivacyPolicyRow,
-  CachedProvidersRow,
-  SettingsRow,
-} from './db-rows'
+export type { SettingsRow } from './db-rows'
 
-interface CachedGenerationRow {
-  id: string
-  chatId: string
-  gen_id: string
-  fetchedAt: number
-  payload: unknown
-}
+export const CURRENT_DB_VERSION = WAVE_A_STORAGE_VERSION
 
 export class NatterDb extends Dexie {
   chats!: Table<Chat, string>
   chatSidebarRows!: Table<ChatSidebarProjectionRow, string>
+  chatSidebarAggregates!: Table<ChatSidebarAggregateProjectionRow, string>
   messages!: Table<MessageHeaderRow, string>
   messageBodies!: Table<MessageBodyRow, string>
+  messagePreviews!: Table<MessageTextPreviewRow, string>
   childLists!: Table<ChildListState, string>
-  attachments!: Table<Attachment, string>
+  childSlotMembers!: Table<ChildSlotMember, string>
+  attachments!: Table<AttachmentHeaderRow, string>
+  attachmentCatalogRows!: Table<AttachmentCatalogProjectionRow, string>
+  attachmentCatalogAggregate!: Table<AttachmentCatalogAggregateRow, string>
   attachmentBlobs!: Table<AttachmentBlob, string>
   attachmentArtifacts!: Table<AttachmentArtifact, string>
   attachmentJobs!: Table<AttachmentJob, string>
@@ -149,50 +183,418 @@ export class NatterDb extends Dexie {
     AttachmentReferenceEdge,
     [AttachmentReferenceEdge['ownerKind'], string, string]
   >
+  attachmentIntegrityState!: Table<AttachmentIntegrityStateRow, string>
   profiles!: Table<ConnectionProfile, string>
+  configurationProfileCatalogRows!: Table<ConfigurationProfileCatalogProjectionRow, string>
+  configurationProfileUsageRows!: Table<ConfigurationProfileUsageProjectionRow, string>
+  configurationCatalogAggregates!: Table<ConfigurationCatalogMetadataRow, string>
   presets!: Table<ChatPreset, string>
+  configurationPresetCatalogRows!: Table<ConfigurationPresetCatalogProjectionRow, string>
+  presetOrderState!: Table<PresetOrderStateRow, typeof PRESET_ORDER_STATE_ID>
+  presetOrderBlocks!: Table<PresetOrderBlockRow, string>
+  presetOrderMembership!: Table<PresetOrderMembershipRow, PresetId>
   promptPresets!: Table<PromptPreset, string>
+  configurationPromptPresetCatalogRows!: Table<
+    ConfigurationPromptPresetCatalogProjectionRow,
+    string
+  >
   folders!: Table<ChatFolder, string>
   tags!: Table<ChatTag, string>
-  chatBranchCache!: Table<ChatBranchCache, string>
   keys!: Table<KeyRecord, string>
   settings!: Table<SettingsRow, string>
+  storageRetentionState!: Table<StorageRetentionStateRow, StorageRetentionTask>
+  workspaceFence!: Table<BrowserWorkspaceFenceRow, string>
   browserLocks!: Table<BrowserLockRow, string>
   streamLeases!: Table<StreamLeaseRow, string>
-  streamChunks!: Table<StreamChunkRow, string>
-  models!: Table<CachedModelsRow, [string, string]>
-  endpoints!: Table<CachedEndpointsRow, [string, string]>
-  privacyPolicies!: Table<CachedPrivacyPolicyRow, [string, string]>
-  providers!: Table<CachedProvidersRow, string>
-  generations!: Table<CachedGenerationRow, string>
-  presetResolutions!: Table<PresetResolution, [string, string]>
+  streamChunks!: Table<StreamJournalFrameRow, string>
+  models!: Table<CachedModelsStorageRow, [string, string]>
+  endpoints!: Table<CachedEndpointsStorageRow, [string, string]>
+  privacyPolicies!: Table<CachedPrivacyPolicyStorageRow, [string, string]>
+  discoveryPayloads!: Table<DiscoveryPayloadStorageRow, string>
+  discoveryPayloadMetadata!: Table<DiscoveryPayloadMetadataStorageRow, string>
+  discoveryCacheState!: Table<DiscoveryCacheStateStorageRow, string>
   drafts!: Table<DraftRow, string>
+  configurationLinks!: Table<ConfigurationLink, string>
+  textTemplates!: Table<SavedTextTemplate, string>
 
   constructor(name = 'natter') {
     super(name)
+    installBrowserCommandMutationJournal(this)
     registerSchema(this)
+    installChatStorageCodec(this)
+    installMessageStorageCodec(this)
   }
+}
+
+interface BrowserWorkspaceIndexManifest {
+  readonly keyPath: string
+  readonly unique: boolean
+  readonly multiEntry: boolean
+}
+
+interface BrowserWorkspaceStoreManifest {
+  readonly name: string
+  readonly keyPath: string
+  readonly autoIncrement: boolean
+  readonly indexes: readonly BrowserWorkspaceIndexManifest[]
+}
+
+type BrowserWorkspaceSchemaManifest = readonly BrowserWorkspaceStoreManifest[]
+type BrowserWorkspaceStoreSpec = Readonly<Record<string, string | null>>
+
+const CANONICAL_BROWSER_WORKSPACE_STORES = new Set<string>(CANONICAL_PHYSICAL_STORAGE_TABLE_NAMES)
+const DERIVED_BROWSER_WORKSPACE_STORES = new Set<string>(REPAIRABLE_PHYSICAL_STORAGE_TABLE_NAMES)
+const RETIRED_BROWSER_WORKSPACE_STORES = new Set([
+  'chatBranchCache',
+  'generations',
+  'presetResolutions',
+  'providers',
+  'storageMaintenanceState',
+])
+const CURRENT_BROWSER_WORKSPACE_NATIVE_VERSION = CURRENT_DB_VERSION * 10
+
+interface BrowserWorkspaceSchemaPreflight {
+  readonly physicalVersion?: number
+  readonly repairVersion?: number
+  readonly repairStores: readonly string[]
+  readonly compactionControlTransferPrepared: boolean
+}
+
+interface WaveAUpgradePreflight {
+  readonly compactionControlTransferPrepared: boolean
+  readonly observedAt: number
+  readonly physicalVersion?: number
+}
+
+const waveAUpgradePreflights = new WeakMap<Dexie, WaveAUpgradePreflight>()
+const waveAUpgradeProgressPorts = new WeakMap<
+  Dexie,
+  (progress: BrowserWorkspaceOpenProgress) => void
+>()
+
+class BrowserWorkspaceSchemaIntegrityError extends Error {
+  readonly detail: string
+
+  constructor(detail: string) {
+    super(`BrowserWorkspaceSchemaIntegrity:${detail}`)
+    this.name = 'BrowserWorkspaceSchemaIntegrityError'
+    this.detail = detail
+  }
+}
+
+function registeredBrowserWorkspaceSchema(db: NatterDb): BrowserWorkspaceSchemaManifest {
+  return Object.freeze(
+    db.tables
+      .map((table) =>
+        Object.freeze({
+          name: table.name,
+          keyPath: schemaKeyPath(table.schema.primKey.keyPath),
+          autoIncrement: table.schema.primKey.auto === true,
+          indexes: Object.freeze(
+            table.schema.indexes
+              .map((index) =>
+                Object.freeze({
+                  keyPath: schemaKeyPath(index.keyPath),
+                  unique: index.unique === true,
+                  multiEntry: index.multi === true,
+                }),
+              )
+              .sort(compareIndexManifest),
+          ),
+        }),
+      )
+      .sort((left, right) => left.name.localeCompare(right.name)),
+  )
+}
+
+function registeredBrowserWorkspaceStoreSpec(db: NatterDb): BrowserWorkspaceStoreSpec {
+  return Object.freeze(
+    Object.fromEntries(
+      db.tables.map((table) => [
+        table.name,
+        [table.schema.primKey.src, ...table.schema.indexes.map((index) => index.src)].join(', '),
+      ]),
+    ),
+  )
+}
+
+function verifyBrowserWorkspaceSchema(
+  db: NatterDb,
+  expected: BrowserWorkspaceSchemaManifest,
+): void {
+  const backend = db.backendDB()
+  const actualStoreNames = [...backend.objectStoreNames].sort((left, right) =>
+    left.localeCompare(right),
+  )
+  const expectedStoreNames = expected.map((store) => store.name)
+  if (!sameStringArray(actualStoreNames, expectedStoreNames)) {
+    const actual = new Set(actualStoreNames)
+    const registered = new Set(expectedStoreNames)
+    const missing = expectedStoreNames.filter((name) => !actual.has(name))
+    const unexpected = actualStoreNames.filter((name) => !registered.has(name))
+    throw new BrowserWorkspaceSchemaIntegrityError(
+      `stores:missing=${missing.join(',')}:unexpected=${unexpected.join(',')}`,
+    )
+  }
+  let transaction: IDBTransaction
+  try {
+    transaction = backend.transaction(actualStoreNames, 'readonly')
+  } catch {
+    throw new BrowserWorkspaceSchemaIntegrityError('transaction')
+  }
+  for (const expectedStore of expected) {
+    let actualStore: IDBObjectStore
+    try {
+      actualStore = transaction.objectStore(expectedStore.name)
+    } catch {
+      throw new BrowserWorkspaceSchemaIntegrityError(`store:${expectedStore.name}`)
+    }
+    if (
+      schemaKeyPath(actualStore.keyPath) !== expectedStore.keyPath ||
+      actualStore.autoIncrement !== expectedStore.autoIncrement
+    ) {
+      throw new BrowserWorkspaceSchemaIntegrityError(`primary:${expectedStore.name}`)
+    }
+    const actualIndexes = [...actualStore.indexNames]
+      .map((name) => {
+        const index = actualStore.index(name)
+        return {
+          keyPath: schemaKeyPath(index.keyPath),
+          unique: index.unique,
+          multiEntry: index.multiEntry,
+        }
+      })
+      .sort(compareIndexManifest)
+    if (
+      actualIndexes.length !== expectedStore.indexes.length ||
+      actualIndexes.some((index, position) => {
+        const expectedIndex = expectedStore.indexes[position]
+        return (
+          !expectedIndex ||
+          index.keyPath !== expectedIndex.keyPath ||
+          index.unique !== expectedIndex.unique ||
+          index.multiEntry !== expectedIndex.multiEntry
+        )
+      })
+    ) {
+      throw new BrowserWorkspaceSchemaIntegrityError(`indexes:${expectedStore.name}`)
+    }
+  }
+}
+
+async function preflightBrowserWorkspaceSchema(
+  db: NatterDb,
+  expected: BrowserWorkspaceSchemaManifest,
+): Promise<BrowserWorkspaceSchemaPreflight> {
+  const physical = await readPhysicalBrowserWorkspaceSchema(db.name)
+  if (!physical) {
+    return {
+      repairStores: Object.freeze([]),
+      compactionControlTransferPrepared: false,
+    }
+  }
+  const compactionControlTransferPrepared =
+    physical.version >= 250 && physical.version < WAVE_A_STORAGE_VERSION * 10
+      ? await prepareWaveACompactionControlTransfer(db.name)
+      : false
+  // Older authored versions may legitimately predate a canonical store; only
+  // the registered version-gated upgrade is allowed to create and migrate it.
+  const expectedNames = new Set(expected.map((store) => store.name))
+  const missing = [...expectedNames].filter((name) => !physical.storeNames.has(name)).sort()
+  const missingCanonical =
+    physical.version < CURRENT_BROWSER_WORKSPACE_NATIVE_VERSION
+      ? []
+      : missing.filter((name) => CANONICAL_BROWSER_WORKSPACE_STORES.has(name))
+  if (missingCanonical.length > 0) {
+    throw new BrowserWorkspaceSchemaIntegrityError(
+      `canonical-stores-missing:${missingCanonical.join(',')}`,
+    )
+  }
+  const unclassifiedExpected = [...expectedNames].filter(
+    (name) =>
+      !CANONICAL_BROWSER_WORKSPACE_STORES.has(name) && !DERIVED_BROWSER_WORKSPACE_STORES.has(name),
+  )
+  if (unclassifiedExpected.length > 0) {
+    throw new BrowserWorkspaceSchemaIntegrityError(
+      `store-classification-missing:${unclassifiedExpected.sort().join(',')}`,
+    )
+  }
+  const derivedRepairStores = new Set(
+    missing.filter((name) => DERIVED_BROWSER_WORKSPACE_STORES.has(name)),
+  )
+  const unknownUnexpected: string[] = []
+  for (const name of physical.storeNames) {
+    if (expectedNames.has(name)) continue
+    if (RETIRED_BROWSER_WORKSPACE_STORES.has(name)) derivedRepairStores.add(name)
+    else unknownUnexpected.push(name)
+  }
+  if (unknownUnexpected.length > 0) {
+    throw new BrowserWorkspaceSchemaIntegrityError(
+      `unexpected-stores:${unknownUnexpected.sort().join(',')}`,
+    )
+  }
+  for (const store of expected) {
+    const actualPrimary = physical.primaryKeys.get(store.name)
+    if (!actualPrimary) continue
+    const primaryMatches =
+      actualPrimary.keyPath === store.keyPath && actualPrimary.autoIncrement === store.autoIncrement
+    if (primaryMatches) continue
+    if (
+      CANONICAL_BROWSER_WORKSPACE_STORES.has(store.name) &&
+      physical.version >= CURRENT_BROWSER_WORKSPACE_NATIVE_VERSION
+    ) {
+      throw new BrowserWorkspaceSchemaIntegrityError(`canonical-primary:${store.name}`)
+    }
+    derivedRepairStores.add(store.name)
+  }
+  for (const store of expected) {
+    const actualIndexes = physical.indexes.get(store.name)
+    if (actualIndexes && !sameIndexManifests(actualIndexes, store.indexes)) {
+      derivedRepairStores.add(store.name)
+    }
+  }
+  const repairable = Object.freeze([...derivedRepairStores].sort())
+  return {
+    physicalVersion: physical.version,
+    ...(physical.version >= CURRENT_BROWSER_WORKSPACE_NATIVE_VERSION && repairable.length > 0
+      ? { repairVersion: physical.version + 1 }
+      : {}),
+    repairStores: repairable,
+    compactionControlTransferPrepared,
+  }
+}
+
+async function prepareWaveACompactionControlTransfer(databaseName: string): Promise<boolean> {
+  const migration = await import('../backcompat/storage-compaction-control')
+  return migration.prepareStorageCompactionStateControlTransfer(databaseName)
+}
+
+function readPhysicalBrowserWorkspaceSchema(name: string): Promise<{
+  readonly version: number
+  readonly storeNames: ReadonlySet<string>
+  readonly primaryKeys: ReadonlyMap<
+    string,
+    { readonly keyPath: string; readonly autoIncrement: boolean }
+  >
+  readonly indexes: ReadonlyMap<string, readonly BrowserWorkspaceIndexManifest[]>
+} | null> {
+  return readExistingIndexedDb(name, (database) => {
+    const storeNames = [...database.objectStoreNames]
+    const primaryKeys = new Map<
+      string,
+      { readonly keyPath: string; readonly autoIncrement: boolean }
+    >()
+    const indexes = new Map<string, readonly BrowserWorkspaceIndexManifest[]>()
+    if (storeNames.length === 0) {
+      return {
+        kind: 'value',
+        value: {
+          version: database.version,
+          storeNames: new Set(),
+          primaryKeys,
+          indexes,
+        },
+      } as const
+    }
+    return {
+      kind: 'transaction',
+      storeNames,
+      read: (transaction) => {
+        for (const storeName of storeNames) {
+          const store = transaction.objectStore(storeName)
+          primaryKeys.set(storeName, {
+            keyPath: schemaKeyPath(store.keyPath),
+            autoIncrement: store.autoIncrement,
+          })
+          indexes.set(
+            storeName,
+            [...store.indexNames]
+              .map((indexName) => {
+                const index = store.index(indexName)
+                return {
+                  keyPath: schemaKeyPath(index.keyPath),
+                  unique: index.unique,
+                  multiEntry: index.multiEntry,
+                }
+              })
+              .sort(compareIndexManifest),
+          )
+        }
+        return {
+          version: database.version,
+          storeNames: new Set(storeNames),
+          primaryKeys,
+          indexes,
+        }
+      },
+    } as const
+  })
+}
+
+function schemaKeyPath(value: string | string[] | null | undefined): string {
+  if (Array.isArray(value)) return JSON.stringify(value)
+  return value ?? ''
+}
+
+function compareIndexManifest(
+  left: BrowserWorkspaceIndexManifest,
+  right: BrowserWorkspaceIndexManifest,
+): number {
+  return (
+    left.keyPath.localeCompare(right.keyPath) ||
+    Number(left.unique) - Number(right.unique) ||
+    Number(left.multiEntry) - Number(right.multiEntry)
+  )
+}
+
+function sameIndexManifests(
+  left: readonly BrowserWorkspaceIndexManifest[],
+  right: readonly BrowserWorkspaceIndexManifest[],
+): boolean {
+  return (
+    left.length === right.length &&
+    left.every((index, position) => {
+      const expected = right[position]
+      return (
+        expected !== undefined &&
+        index.keyPath === expected.keyPath &&
+        index.unique === expected.unique &&
+        index.multiEntry === expected.multiEntry
+      )
+    })
+  )
+}
+
+function sameStringArray(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index])
 }
 
 // Schema registration is pulled out so test-only subclasses can replay v1 and
 // then tack on synthetic v2/v3 upgrades.
 export function registerSchema(db: Dexie): void {
-  db.on('populate', (tx) => {
-    void tx
-      .table<SettingsRow>('settings')
-      .bulkPut([
-        attachmentRefsBackfillMarker(),
-        messageBodySplitBackfillMarker(),
-        organizationFieldsBackfillMarker(),
-        chatPreviewProjectionBackfillMarker(),
-        globalSettingsBackfillMarker(),
-        providerOutputItemsBackfillMarker(),
-        providerToolSettingsBackfillMarker(),
-        tokenCalibrationGlobalBackfillMarker(),
-        tokenCalibrationCanonicalizeBackfillMarker(),
-        ...chatSidebarProjectionSettings(0),
-      ])
-    void tx.table<BrowserLockRow>('browserLocks').put(emptyBrowserWriterLockRow())
+  db.on('populate', async (tx) => {
+    await Promise.all([
+      tx.table<SettingsRow>('settings').bulkPut(freshWorkspaceSettingsRows()),
+      tx.table<BrowserWorkspaceFenceRow>('workspaceFence').put(browserWorkspaceFenceRow()),
+      tx.table<BrowserLockRow>('browserLocks').put(emptyBrowserWriterLockRow()),
+      tx
+        .table<AttachmentCatalogAggregateRow>('attachmentCatalogAggregate')
+        .put(emptyAttachmentCatalogAggregateRow()),
+      tx
+        .table<AttachmentIntegrityStateRow>('attachmentIntegrityState')
+        .put(completedAttachmentIntegrityState()),
+      tx
+        .table<ChatSidebarAggregateProjectionRow>('chatSidebarAggregates')
+        .put(emptyChatSidebarAggregateRow()),
+      tx
+        .table<ConfigurationCatalogMetadataRow>('configurationCatalogAggregates')
+        .bulkPut(emptyConfigurationCatalogMetadataRows()),
+      tx.table<PresetOrderStateRow>('presetOrderState').put(emptyPresetOrderState()),
+      tx
+        .table<StorageRetentionStateRow>('storageRetentionState')
+        .bulkPut([...freshStorageRetentionStateRows()]),
+      seedEmptyDiscoveryCacheState(tx),
+    ])
   })
 
   db.version(1).stores({
@@ -749,11 +1151,6 @@ export function registerSchema(db: Dexie): void {
           const result = migrateProviderToolSettings(preset.settings)
           if (result.changed) preset.settings = result.settings
         })
-
-      await migrateProviderOutputItemRowsInTables(
-        tx.table<MessageHeaderRow, string>('messages'),
-        tx.table<MessageBodyRow, string>('messageBodies'),
-      )
     })
 
   // v15: ChatPreset.settings is the single full ChatSettings snapshot. Backfill
@@ -887,7 +1284,7 @@ export function registerSchema(db: Dexie): void {
     .upgrade(async (tx) => {
       const settings = tx.table<SettingsRow>('settings')
       const defaults: SettingsRow[] = [
-        { key: 'global:message-render-window-size', value: 10 },
+        { key: 'global:message-initial-render-work', value: 10 },
         { key: 'global:sidebar-render-window-size', value: 50 },
         { key: 'global:message-render-window-load-mode', value: 'auto' },
         { key: 'global:sidebar-render-window-load-mode', value: 'auto' },
@@ -1061,10 +1458,14 @@ export function registerSchema(db: Dexie): void {
       await migrateStreamLeaseAttempts(tx)
       await migrateGenerationAttemptOutcomes(tx)
       await migrateBrowserWriterLock(tx)
-      await normalizeAttachmentRefOwners(tx)
-      await scrubMissingAttachmentByteReferences(tx)
-      await rebuildAttachmentReferenceEdges(tx)
-      await tx.table<SettingsRow>('settings').put(attachmentRefsBackfillMarker())
+      await runOnceBackfillInTransaction(tx, {
+        marker: attachmentRefsBackfillMarker(),
+        run: async (transaction) => {
+          await normalizeAttachmentRefOwners(transaction)
+          await scrubMissingAttachmentByteReferences(transaction)
+          await rebuildAttachmentReferenceEdges(transaction)
+        },
+      })
       await migrateChatPreviewProjection(tx)
       await migrateChatSidebarProjection(tx)
     })
@@ -1121,227 +1522,787 @@ export function registerSchema(db: Dexie): void {
   // metadata, sibling renumbering, and derived calibration no longer
   // impersonate a changed outbound prompt.
   db.version(25).upgrade(migrateMessageRequestContextVersions)
+
+  db.version(WAVE_A_STORAGE_VERSION)
+    .stores(WAVE_A_V94_STORES)
+    .upgrade(async (tx) => {
+      const migration = await Dexie.waitFor(import('../backcompat/wave-a-storage-epoch-v94'))
+      const preflight = waveAUpgradePreflights.get(db)
+      const report = waveAUpgradeProgressPorts.get(db)
+      const reportProgress = report
+        ? (progress: BrowserWorkspaceMigrationProgress) =>
+            report({
+              kind: 'database-upgrade',
+              databaseName: db.name as BrowserWorkspaceDatabaseName,
+              ...(preflight?.physicalVersion === undefined
+                ? {}
+                : { fromVersion: preflight.physicalVersion / 10 }),
+              targetVersion: WAVE_A_STORAGE_VERSION,
+              ...progress,
+            })
+        : undefined
+      const result = await migration.migrateWaveAStorageEpochRowsV94(tx, {
+        observedAt: preflight?.observedAt ?? Date.now(),
+        recordObsoleteBytes: (byteLength) => accumulateStorageCompactionDebt(tx, byteLength),
+        compactionControlTransferPrepared: preflight?.compactionControlTransferPrepared === true,
+        ...(reportProgress ? { reportProgress } : {}),
+      })
+      await migration.finalizeWaveAStorageEpochRowsV94(tx, result, reportProgress)
+    })
 }
 
-function organizationDefaultsPatch(
-  chat: Partial<Chat> & Record<string, unknown>,
-  messageHeaders: readonly Pick<Message, 'origin'>[],
-  computed: {
-    lastUpdatedLeafId: string | null
-    previewText: string
-    wordCount: number
-    totalCostUsd: number
-  },
-): Partial<Chat> | null {
-  const patch: Partial<Chat> = {}
-  if (
-    chat.folderId === undefined ||
-    (chat.folderId !== null && typeof chat.folderId !== 'string')
-  ) {
-    patch.folderId = null
-  }
-  if (!Array.isArray(chat.tags) || !chat.tags.every((tag) => typeof tag === 'string')) {
-    patch.tags = []
-  }
-  if (!isTitleStatus(chat.titleStatus)) {
-    patch.titleStatus = inferLegacyTitleStatus(chat.title, messageHeaders)
-  }
-  if (!isFiniteNumber(chat.lastViewedAt)) {
-    patch.lastViewedAt = isFiniteNumber(chat.updatedAt) ? chat.updatedAt : 0
-  }
-  if (chat.lastUpdatedLeafId !== computed.lastUpdatedLeafId) {
-    patch.lastUpdatedLeafId = computed.lastUpdatedLeafId
-  }
-  if (chat.previewText === undefined) {
-    patch.previewText = computed.previewText
-  }
-  if (!isFiniteNumber(chat.lastBranchUpdatedAt)) {
-    patch.lastBranchUpdatedAt = 0
-  }
-  if (!isFiniteNumber(chat.wordCount) || chat.wordCount !== computed.wordCount) {
-    patch.wordCount = computed.wordCount
-  }
-  if (!isFiniteNumber(chat.totalCostUsd) || chat.totalCostUsd !== computed.totalCostUsd) {
-    patch.totalCostUsd = computed.totalCostUsd
-  }
-  return Object.keys(patch).length > 0 ? patch : null
-}
-
-function isTitleStatus(value: unknown): value is Chat['titleStatus'] {
-  return (
-    value === 'untitled' ||
-    value === 'pending' ||
-    value === 'auto' ||
-    value === 'manual' ||
-    value === 'auto-failed'
-  )
-}
-
-function inferLegacyTitleStatus(
-  value: unknown,
-  messageHeaders: readonly Pick<Message, 'origin'>[],
-): Chat['titleStatus'] {
-  const title = typeof value === 'string' ? value.trim() : ''
-  const imported = messageHeaders.some((message) => message.origin === 'imported')
-  if (imported || title.length === 0 || title === 'Untitled chat') return 'untitled'
-  return 'auto'
-}
-
-function isFiniteNumber(value: unknown): value is number {
-  return typeof value === 'number' && Number.isFinite(value)
+function freshWorkspaceSettingsRows(): SettingsRow[] {
+  return [
+    ...waveACompletionSettingsV94(),
+    { key: RECENT_MODELS_KEY, value: [] },
+    { key: RECENT_MODEL_RECENCY_KEY, value: emptyRecentModelRecency() },
+  ]
 }
 
 function jsonValuesEqual(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right)
 }
 
-async function computePreviewText(
-  bodies: Table<MessageBodyRow, string>,
-  rows: readonly MessageHeaderRow[],
-): Promise<string> {
-  let earliestHeader: MessageHeaderRow | undefined
-  for (const header of rows) {
-    if (header.deleted || header.role !== 'user') continue
-    if (
-      !earliestHeader ||
-      header.createdAt < earliestHeader.createdAt ||
-      (header.createdAt === earliestHeader.createdAt && header.id < earliestHeader.id)
-    ) {
-      earliestHeader = header
-    }
-  }
-  if (!earliestHeader) return ''
-  const body = await bodies.get(earliestHeader.id)
-  return previewTextFromContent(body?.content ?? [])
-}
-
-export function childListKey(chatId: string, parentId: string | null): string {
-  return `${chatId}:${parentId ?? '__root__'}`
-}
+export { childListKey } from '../core/child-list-state'
 
 let singleton: NatterDb | null = null
-let organizationFieldsBackfillPromise: Promise<void> | null = null
-let chatPreviewProjectionBackfillPromise: Promise<void> | null = null
-let chatSidebarProjectionBackfillPromise: Promise<void> | null = null
-let messageBodySplitBackfillPromise: Promise<void> | null = null
-let globalSettingsBackfillPromise: Promise<void> | null = null
-let attachmentRefsBackfillPromise: Promise<void> | null = null
-let providerOutputItemsBackfillPromise: Promise<void> | null = null
-let providerToolSettingsBackfillPromise: Promise<void> | null = null
-let tokenCalibrationGlobalBackfillPromise: Promise<void> | null = null
-let tokenCalibrationCanonicalizeBackfillPromise: Promise<void> | null = null
-const ORGANIZATION_FIELDS_BACKFILL_KEY = 'backfill:organization-fields-v1'
+let configuredBrowserWorkspaceDatabaseName: BrowserWorkspaceDatabaseName | null = null
+let currentSession: BrowserWorkspaceSessionImpl | null = null
+let invalidatedSession: BrowserWorkspaceSessionImpl | null = null
+let browserWorkspaceAdmissionsOpen = false
+let browserWorkspaceRepositoryAdmissionsOpen = false
+let activeBrowserWorkspaceRepositoryOperations = 0
+let browserWorkspaceRepositoryIdlePromise: Promise<void> = Promise.resolve()
+let resolveBrowserWorkspaceRepositoryIdle: (() => void) | null = null
+let nextSessionGeneration = 0
+declare const browserWorkspaceFatalInvalidationOwnerBrand: unique symbol
 
-function organizationFieldsBackfillMarker(): SettingsRow {
-  return { key: ORGANIZATION_FIELDS_BACKFILL_KEY, value: 1 }
+export interface BrowserWorkspaceFatalInvalidationOwner {
+  readonly [browserWorkspaceFatalInvalidationOwnerBrand]: true
+}
+
+interface BrowserWorkspaceFatalInvalidationOwnerRecord {
+  readonly handler: (event: BrowserWorkspaceFatalInvalidation) => void
+  active: boolean
+}
+
+let browserWorkspaceFatalInvalidationOwner: BrowserWorkspaceFatalInvalidationOwnerRecord | null =
+  null
+
+export interface BrowserWorkspaceFatalInvalidation {
+  readonly databaseName: string
+  readonly sessionGeneration: number
+  readonly kind: 'unexpected-close' | 'unexpected-versionchange'
+  readonly oldVersion?: number
+  readonly newVersion?: number | null
+}
+
+export function claimBrowserWorkspaceFatalInvalidationOwner(
+  handler: (event: BrowserWorkspaceFatalInvalidation) => void,
+): BrowserWorkspaceFatalInvalidationOwner {
+  if (browserWorkspaceFatalInvalidationOwner) {
+    throw new Error('BrowserWorkspaceFatalInvalidationOwnerAlreadyInstalled')
+  }
+  const owner: BrowserWorkspaceFatalInvalidationOwnerRecord = { handler, active: true }
+  browserWorkspaceFatalInvalidationOwner = owner
+  return owner as unknown as BrowserWorkspaceFatalInvalidationOwner
+}
+
+export function releaseBrowserWorkspaceFatalInvalidationOwner(
+  handle: BrowserWorkspaceFatalInvalidationOwner,
+): void {
+  const owner = handle as unknown as BrowserWorkspaceFatalInvalidationOwnerRecord
+  if (!owner.active) return
+  if (browserWorkspaceFatalInvalidationOwner !== owner) {
+    throw new Error('BrowserWorkspaceFatalInvalidationOwnerMismatch')
+  }
+  owner.active = false
+  browserWorkspaceFatalInvalidationOwner = null
+}
+
+export async function recreateAndVerifyBrowserWorkspaceDatabase(name = 'natter'): Promise<void> {
+  const db = new NatterDb(name)
+  const schema = registeredBrowserWorkspaceSchema(db)
+  try {
+    await db.open()
+    verifyBrowserWorkspaceSchema(db, schema)
+    await verifyFreshBrowserWorkspace(db)
+  } finally {
+    db.close()
+  }
+}
+
+async function verifyFreshBrowserWorkspace(db: NatterDb): Promise<void> {
+  await readBrowserWorkspaceMeta(db)
+  const expectedSettings = freshWorkspaceSettingsRows()
+  const settings = await db.settings.bulkGet(expectedSettings.map((row) => row.key))
+  if (settings.some((row) => row === undefined)) {
+    throw new BrowserWorkspaceSchemaIntegrityError('populate:settings')
+  }
+  const writerLock = emptyBrowserWriterLockRow()
+  const [
+    storedWriterLock,
+    attachmentAggregate,
+    sidebarAggregate,
+    configurationAggregate,
+    activePresetOrder,
+  ] = await Promise.all([
+    db.browserLocks.get(writerLock.name),
+    db.attachmentCatalogAggregate.get(ATTACHMENT_CATALOG_AGGREGATE_ID),
+    db.chatSidebarAggregates.get(CHAT_SIDEBAR_AGGREGATE_ID),
+    db.configurationCatalogAggregates.get(CONFIGURATION_CATALOG_AGGREGATE_ID),
+    db.presetOrderState.get(PRESET_ORDER_STATE_ID),
+  ])
+  if (!storedWriterLock) throw new BrowserWorkspaceSchemaIntegrityError('populate:writer-lock')
+  if (!attachmentAggregate) {
+    throw new BrowserWorkspaceSchemaIntegrityError('populate:attachment-aggregate')
+  }
+  if (!sidebarAggregate) {
+    throw new BrowserWorkspaceSchemaIntegrityError('populate:sidebar-aggregate')
+  }
+  if (!configurationAggregate) {
+    throw new BrowserWorkspaceSchemaIntegrityError('populate:configuration-aggregate')
+  }
+  if (!activePresetOrder) {
+    throw new BrowserWorkspaceSchemaIntegrityError('populate:preset-order')
+  }
+  const unexpectedDomainRows = await Promise.all([
+    db.chats.count(),
+    db.messages.count(),
+    db.attachments.count(),
+    db.profiles.count(),
+    db.presets.count(),
+    db.keys.count(),
+  ])
+  if (unexpectedDomainRows.some((count) => count !== 0)) {
+    throw new BrowserWorkspaceSchemaIntegrityError('populate:domain-rows')
+  }
 }
 
 export function getDb(): NatterDb {
-  if (!singleton) singleton = new NatterDb()
+  assertBrowserWorkspaceAdmissionsOpen()
+  if (!configuredBrowserWorkspaceDatabaseName) {
+    throw new Error('BrowserWorkspaceDatabaseSelectionRequired')
+  }
+  if (!singleton) singleton = new NatterDb(configuredBrowserWorkspaceDatabaseName)
   return singleton
 }
 
-function resetBackfillState(): void {
-  organizationFieldsBackfillPromise = null
-  chatPreviewProjectionBackfillPromise = null
-  chatSidebarProjectionBackfillPromise = null
-  messageBodySplitBackfillPromise = null
-  globalSettingsBackfillPromise = null
-  attachmentRefsBackfillPromise = null
-  providerOutputItemsBackfillPromise = null
-  providerToolSettingsBackfillPromise = null
-  tokenCalibrationGlobalBackfillPromise = null
-  tokenCalibrationCanonicalizeBackfillPromise = null
+export function configureBrowserWorkspaceDatabaseName(
+  databaseName: BrowserWorkspaceDatabaseName,
+): void {
+  if (singleton && singleton.name !== databaseName) {
+    throw new Error(
+      `BrowserWorkspaceDatabaseSelectionAlreadyOpen:${singleton.name}:${databaseName}`,
+    )
+  }
+  configuredBrowserWorkspaceDatabaseName = databaseName
+}
+
+export function getConfiguredBrowserWorkspaceDatabaseName(): BrowserWorkspaceDatabaseName {
+  if (!configuredBrowserWorkspaceDatabaseName) {
+    throw new Error('BrowserWorkspaceDatabaseSelectionRequired')
+  }
+  return configuredBrowserWorkspaceDatabaseName
+}
+
+export class BrowserWorkspaceSessionClosedError extends WorkspaceSessionClosedError {
+  constructor(cause?: unknown) {
+    super('BrowserWorkspaceSessionClosed', cause)
+    this.name = 'BrowserWorkspaceSessionClosedError'
+  }
+}
+
+export interface BrowserWorkspaceSession {
+  readonly generation: number
+  readonly databaseName: string
+  isCurrent(): boolean
+  isOpen(): boolean
+  assertCurrent(): void
+  bindWorkspaceFence(authority: BrowserWorkspaceBootstrapAuthority, fence: WorkspaceFence): void
+  getWorkspaceFence(): WorkspaceFence
+  open(options?: OpenDbOptions): Promise<NatterDb>
+  runOperation<T>(operation: (db: NatterDb) => T): T
+}
+
+export interface InvalidatedBrowserWorkspaceSession {
+  readonly generation: number
+  readonly databaseName: string
+  waitForIdle(): Promise<void>
+}
+
+type BrowserWorkspaceSessionState = 'current' | 'invalidated' | 'closed'
+
+class BrowserWorkspaceSessionImpl implements BrowserWorkspaceSession {
+  readonly generation: number
+  readonly databaseName: string
+  readonly database: NatterDb
+  readonly registeredSchema: BrowserWorkspaceSchemaManifest
+  readonly registeredStoreSpec: BrowserWorkspaceStoreSpec
+  schemaPreflight: Promise<BrowserWorkspaceSchemaPreflight> | null = null
+  schemaRegistrationConfigured = false
+  private state: BrowserWorkspaceSessionState = 'current'
+  private activeOperations = 0
+  private idlePromise = Promise.resolve()
+  private resolveIdle: (() => void) | null = null
+  private databaseOpenInFlight = 0
+  private fatalInvalidationReported = false
+  private schemaVerified = false
+  private workspaceFence: WorkspaceFence | null = null
+  private readonly fatalInvalidationOwner: BrowserWorkspaceFatalInvalidationOwnerRecord | null
+
+  constructor(database: NatterDb) {
+    this.generation = ++nextSessionGeneration
+    this.databaseName = database.name
+    this.database = database
+    this.fatalInvalidationOwner = browserWorkspaceFatalInvalidationOwner
+    this.registeredSchema = registeredBrowserWorkspaceSchema(database)
+    this.registeredStoreSpec = registeredBrowserWorkspaceStoreSpec(database)
+    database.on.close.subscribe(this.receiveDatabaseClose)
+    database.on.versionchange.subscribe(this.receiveDatabaseVersionChange)
+  }
+
+  isCurrent(): boolean {
+    return (
+      this.state === 'current' &&
+      browserWorkspaceAdmissionsOpen &&
+      currentSession === this &&
+      singleton === this.database
+    )
+  }
+
+  isOpen(): boolean {
+    return this.database.isOpen()
+  }
+
+  open(options: OpenDbOptions = {}): Promise<NatterDb> {
+    return this.runOperation(() => openSessionDatabase(this, options, () => this.assertCurrent()))
+  }
+
+  openForBootstrap(
+    authority: BrowserWorkspaceBootstrapAuthority,
+    options: OpenDbOptions = {},
+  ): Promise<NatterDb> {
+    return this.runBootstrapOperation(authority, () =>
+      openSessionDatabase(this, options, () => this.assertBootstrapCurrent(authority)),
+    )
+  }
+
+  runOperation<T>(operation: (db: NatterDb) => T): T {
+    if (!this.isCurrent()) throw new BrowserWorkspaceSessionClosedError()
+    this.beginOperation()
+    try {
+      const result = operation(this.database)
+      if (isPromiseLike(result)) {
+        return Promise.resolve(result)
+          .catch((error: unknown) => {
+            throw this.normalizeOperationError(error)
+          })
+          .finally(() => this.endOperation()) as T
+      }
+      this.endOperation()
+      return result
+    } catch (error) {
+      this.endOperation()
+      throw this.normalizeOperationError(error)
+    }
+  }
+
+  invalidate(): void {
+    if (this.state !== 'current') return
+    this.state = 'invalidated'
+    if (this.databaseOpenInFlight > 0 && !this.database.isOpen()) this.database.close()
+  }
+
+  assertCurrent(): void {
+    if (!this.isCurrent()) throw new BrowserWorkspaceSessionClosedError()
+  }
+
+  bindWorkspaceFence(authority: BrowserWorkspaceBootstrapAuthority, fence: WorkspaceFence): void {
+    this.assertBootstrapCurrent(authority)
+    const current = this.workspaceFence
+    if (
+      current &&
+      (current.workspaceId !== fence.workspaceId ||
+        current.replacementEpoch !== fence.replacementEpoch)
+    ) {
+      throw new Error('BrowserWorkspaceSessionFenceAlreadyBound')
+    }
+    this.workspaceFence ??= Object.freeze({
+      workspaceId: fence.workspaceId,
+      replacementEpoch: fence.replacementEpoch,
+    })
+  }
+
+  getWorkspaceFence(): WorkspaceFence {
+    this.assertCurrent()
+    if (!this.workspaceFence) throw new Error('BrowserWorkspaceSessionFenceUnbound')
+    return this.workspaceFence
+  }
+
+  assertBootstrapCurrent(authority: BrowserWorkspaceBootstrapAuthority): void {
+    assertBrowserWorkspaceBootstrapAuthority(authority)
+    if (this.state !== 'current' || currentSession !== this || singleton !== this.database) {
+      throw new BrowserWorkspaceSessionClosedError()
+    }
+  }
+
+  assertBootstrapOwned(authority: BrowserWorkspaceBootstrapAuthority): void {
+    assertBrowserWorkspaceBootstrapAuthorityOwned(authority)
+    if (this.state !== 'current' || currentSession !== this || singleton !== this.database) {
+      throw new BrowserWorkspaceSessionClosedError()
+    }
+  }
+
+  beginDatabaseOpen(): void {
+    this.databaseOpenInFlight += 1
+  }
+
+  endDatabaseOpen(): void {
+    this.databaseOpenInFlight -= 1
+  }
+
+  verifySchema(): void {
+    if (this.schemaVerified) return
+    verifyBrowserWorkspaceSchema(this.database, this.registeredSchema)
+    this.schemaVerified = true
+  }
+
+  waitForIdle(): Promise<void> {
+    return this.idlePromise
+  }
+
+  closeAfterIdle(): void {
+    if (this.activeOperations !== 0) {
+      throw new Error('BrowserWorkspaceSessionStillActive')
+    }
+    this.state = 'closed'
+    this.database.close()
+  }
+
+  forceClose(): void {
+    this.state = 'closed'
+    this.database.close()
+  }
+
+  private beginOperation(): void {
+    if (this.activeOperations === 0) {
+      this.idlePromise = new Promise<void>((resolve) => {
+        this.resolveIdle = resolve
+      })
+    }
+    this.activeOperations += 1
+  }
+
+  private runBootstrapOperation<T>(
+    authority: BrowserWorkspaceBootstrapAuthority,
+    operation: (db: NatterDb) => T,
+  ): T {
+    this.assertBootstrapCurrent(authority)
+    this.beginOperation()
+    try {
+      const result = operation(this.database)
+      if (isPromiseLike(result)) {
+        return Promise.resolve(result)
+          .catch((error: unknown) => {
+            throw this.normalizeOperationError(error)
+          })
+          .finally(() => this.endOperation()) as T
+      }
+      this.endOperation()
+      return result
+    } catch (error) {
+      this.endOperation()
+      throw this.normalizeOperationError(error)
+    }
+  }
+
+  private endOperation(): void {
+    this.activeOperations -= 1
+    if (this.activeOperations !== 0) return
+    const resolve = this.resolveIdle
+    this.resolveIdle = null
+    resolve?.()
+  }
+
+  private normalizeOperationError(error: unknown): unknown {
+    if (error instanceof BrowserWorkspaceSessionClosedError) return error
+    if (!isDatabaseClosedError(error)) return error
+    if (this.isCurrent() && this.database.isOpen()) return error
+    return new BrowserWorkspaceSessionClosedError(error)
+  }
+
+  private readonly receiveDatabaseClose = (): void => {
+    if (this.databaseOpenInFlight > 0) return
+    this.reportFatalInvalidation({ kind: 'unexpected-close' })
+  }
+
+  private readonly receiveDatabaseVersionChange = (event: IDBVersionChangeEvent): void => {
+    this.reportFatalInvalidation({
+      kind: 'unexpected-versionchange',
+      oldVersion: event.oldVersion,
+      newVersion: event.newVersion,
+    })
+  }
+
+  private reportFatalInvalidation(
+    detail: Pick<BrowserWorkspaceFatalInvalidation, 'kind' | 'oldVersion' | 'newVersion'>,
+  ): void {
+    if (
+      this.fatalInvalidationReported ||
+      this.state !== 'current' ||
+      currentSession !== this ||
+      singleton !== this.database
+    ) {
+      return
+    }
+    this.fatalInvalidationReported = true
+    this.state = 'invalidated'
+    browserWorkspaceAdmissionsOpen = false
+    browserWorkspaceRepositoryAdmissionsOpen = false
+    invalidatedSession ??= currentSession
+    currentSession = null
+    const event: BrowserWorkspaceFatalInvalidation = {
+      databaseName: this.databaseName,
+      sessionGeneration: this.generation,
+      kind: detail.kind,
+      ...(detail.oldVersion === undefined ? {} : { oldVersion: detail.oldVersion }),
+      ...(detail.newVersion === undefined ? {} : { newVersion: detail.newVersion }),
+    }
+    const owner = this.fatalInvalidationOwner
+    queueMicrotask(() => {
+      if (owner?.active && browserWorkspaceFatalInvalidationOwner === owner) owner.handler(event)
+    })
+  }
+}
+
+export function getBrowserWorkspaceSession(): BrowserWorkspaceSession {
+  assertBrowserWorkspaceAdmissionsOpen()
+  currentSession ??= new BrowserWorkspaceSessionImpl(getDb())
+  return currentSession
+}
+
+function getBrowserWorkspaceSessionForBootstrap(
+  authority: BrowserWorkspaceBootstrapAuthority,
+): BrowserWorkspaceSessionImpl {
+  assertBrowserWorkspaceBootstrapAuthority(authority)
+  if (!configuredBrowserWorkspaceDatabaseName) {
+    throw new Error('BrowserWorkspaceDatabaseSelectionRequired')
+  }
+  if (!singleton) singleton = new NatterDb(configuredBrowserWorkspaceDatabaseName)
+  currentSession ??= new BrowserWorkspaceSessionImpl(singleton)
+  currentSession.assertBootstrapCurrent(authority)
+  return currentSession
+}
+
+export function runBrowserWorkspaceRepositoryOperation<T>(operation: () => T): T {
+  return runBrowserWorkspaceLifecycleOperation(operation)
+}
+
+function runBrowserWorkspaceLifecycleOperation<T>(operation: () => T): T {
+  if (!browserWorkspaceRepositoryAdmissionsOpen) {
+    throw new BrowserWorkspaceSessionClosedError()
+  }
+  if (activeBrowserWorkspaceRepositoryOperations === 0) {
+    browserWorkspaceRepositoryIdlePromise = new Promise<void>((resolve) => {
+      resolveBrowserWorkspaceRepositoryIdle = resolve
+    })
+  }
+  activeBrowserWorkspaceRepositoryOperations += 1
+  try {
+    const result = operation()
+    if (isPromiseLike(result)) {
+      return Promise.resolve(result).finally(finishBrowserWorkspaceRepositoryOperation) as T
+    }
+    finishBrowserWorkspaceRepositoryOperation()
+    return result
+  } catch (error) {
+    finishBrowserWorkspaceRepositoryOperation()
+    throw error
+  }
+}
+
+export function stopBrowserWorkspaceRepositoryAdmissions(): void {
+  browserWorkspaceRepositoryAdmissionsOpen = false
+}
+
+export function awaitBrowserWorkspaceRepositoryIdle(): Promise<void> {
+  return browserWorkspaceRepositoryIdlePromise
+}
+
+export function resumeBrowserWorkspaceRepositoryAdmissions(): void {
+  if (activeBrowserWorkspaceRepositoryOperations !== 0) {
+    throw new Error('BrowserWorkspaceRepositoryStillActive')
+  }
+  browserWorkspaceRepositoryAdmissionsOpen = true
+}
+
+export function assertBrowserWorkspaceRepositoryAdmissionsClosed(): void {
+  if (
+    browserWorkspaceRepositoryAdmissionsOpen ||
+    activeBrowserWorkspaceRepositoryOperations !== 0
+  ) {
+    throw new Error('BrowserWorkspaceRepositoryAdmissionsNotClosed')
+  }
+}
+
+export function assertBrowserWorkspaceSessionAdmissionsClosed(): void {
+  if (browserWorkspaceAdmissionsOpen || invalidatedSession) {
+    throw new Error('BrowserWorkspaceSessionAdmissionsNotClosed')
+  }
+}
+
+function finishBrowserWorkspaceRepositoryOperation(): void {
+  activeBrowserWorkspaceRepositoryOperations -= 1
+  if (activeBrowserWorkspaceRepositoryOperations !== 0) return
+  const resolve = resolveBrowserWorkspaceRepositoryIdle
+  resolveBrowserWorkspaceRepositoryIdle = null
+  resolve?.()
+}
+
+function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
+  return (
+    (typeof value === 'object' && value !== null && 'then' in value) ||
+    (typeof value === 'function' && 'then' in value)
+  )
+}
+
+function isDatabaseClosedError(error: unknown): boolean {
+  const pending = [error]
+  const seen = new Set<object>()
+  for (let index = 0; index < pending.length && index < 16; index += 1) {
+    const candidate = pending[index]
+    if (
+      typeof candidate === 'object' &&
+      candidate !== null &&
+      'name' in candidate &&
+      candidate.name === Dexie.errnames.DatabaseClosed
+    ) {
+      return true
+    }
+    if (!candidate || typeof candidate !== 'object' || seen.has(candidate)) continue
+    seen.add(candidate)
+    const wrapped = candidate as { cause?: unknown; inner?: unknown }
+    if (wrapped.cause !== undefined) pending.push(wrapped.cause)
+    if (wrapped.inner !== undefined) pending.push(wrapped.inner)
+  }
+  return false
+}
+
+function assertBrowserWorkspaceAdmissionsOpen(): void {
+  if (!browserWorkspaceAdmissionsOpen) throw new BrowserWorkspaceSessionClosedError()
+}
+
+export function invalidateBrowserWorkspaceSession(): InvalidatedBrowserWorkspaceSession | null {
+  browserWorkspaceAdmissionsOpen = false
+  if (invalidatedSession) return invalidatedSession
+
+  const session = currentSession ?? (singleton ? new BrowserWorkspaceSessionImpl(singleton) : null)
+  currentSession = null
+  if (!session) return null
+  session.invalidate()
+  invalidatedSession = session
+  return session
+}
+
+export async function closeInvalidatedBrowserWorkspaceSession(
+  handle: InvalidatedBrowserWorkspaceSession,
+): Promise<void> {
+  if (!(handle instanceof BrowserWorkspaceSessionImpl) || invalidatedSession !== handle) {
+    throw new Error('InvalidBrowserWorkspaceSessionHandle')
+  }
+  await handle.waitForIdle()
+  handle.closeAfterIdle()
+  if (singleton === handle.database) singleton = null
+  invalidatedSession = null
+}
+
+export function resumeBrowserWorkspaceSessionAdmissions(): void {
+  if (invalidatedSession) throw new Error('BrowserWorkspaceSessionShutdownIncomplete')
+  browserWorkspaceAdmissionsOpen = true
 }
 
 // Explicit open — resolves when the underlying IDBDatabase is ready and the
 // schema has settled. Safe to call repeatedly; Dexie caches the open call.
-export interface OpenDbOptions {
-  onBlocked?: (event: IDBVersionChangeEvent) => void
-}
+export type OpenDbOptions = BrowserWorkspaceOpenOptions
 
 export async function openDb(options: OpenDbOptions = {}): Promise<NatterDb> {
-  const db = getDb()
+  return runBrowserWorkspaceRepositoryOperation(() => getBrowserWorkspaceSession().open(options))
+}
+
+export async function bootstrapBrowserWorkspace(
+  authority: BrowserWorkspaceBootstrapAuthority,
+  options: OpenDbOptions = {},
+): Promise<{ workspaceId: string; replacementEpoch: number }> {
+  const session = getBrowserWorkspaceSessionForBootstrap(authority)
+  const db = await session.openForBootstrap(authority, options)
+  session.assertBootstrapCurrent(authority)
+  options.onProgress?.({
+    kind: 'workspace-metadata',
+    databaseName: session.databaseName as BrowserWorkspaceDatabaseName,
+  })
+  const workspace = await readBrowserWorkspaceMeta(db)
+  session.assertBootstrapCurrent(authority)
+  session.bindWorkspaceFence(authority, workspace)
+  seedBroadcastWorkspaceSnapshot(workspace)
+  return {
+    workspaceId: workspace.workspaceId,
+    replacementEpoch: workspace.replacementEpoch,
+  }
+}
+
+export async function discardBrowserWorkspaceBootstrapSession(
+  authority: BrowserWorkspaceBootstrapAuthority,
+): Promise<void> {
+  assertBrowserWorkspaceBootstrapAuthorityOwned(authority)
+  const session = currentSession
+  if (!session) return
+  session.assertBootstrapOwned(authority)
+  await session.waitForIdle()
+  session.forceClose()
+  currentSession = null
+  if (singleton === session.database) singleton = null
+}
+
+function configurePreflightBrowserWorkspaceSchema(
+  session: BrowserWorkspaceSessionImpl,
+  preflight: BrowserWorkspaceSchemaPreflight,
+): void {
+  if (session.schemaRegistrationConfigured) return
+  session.schemaRegistrationConfigured = true
+  registerPreflightBrowserWorkspaceSchema(session.database, session.registeredStoreSpec, preflight)
+}
+
+function registerPreflightBrowserWorkspaceSchema(
+  database: NatterDb,
+  registeredStoreSpec: BrowserWorkspaceStoreSpec,
+  preflight: BrowserWorkspaceSchemaPreflight,
+): void {
+  waveAUpgradePreflights.set(database, {
+    compactionControlTransferPrepared: preflight.compactionControlTransferPrepared,
+    observedAt: Date.now(),
+    ...(preflight.physicalVersion === undefined
+      ? {}
+      : { physicalVersion: preflight.physicalVersion }),
+  })
+  const physicalVersion = preflight.physicalVersion
+  if (physicalVersion === undefined || physicalVersion < CURRENT_BROWSER_WORKSPACE_NATIVE_VERSION) {
+    return
+  }
+  if (preflight.repairVersion !== undefined) {
+    const repairSpec: Record<string, string | null> = { ...registeredStoreSpec }
+    for (const retired of RETIRED_BROWSER_WORKSPACE_STORES) repairSpec[retired] = null
+    database
+      .version(preflight.repairVersion / 10)
+      .stores(repairSpec)
+      .upgrade(rebuildCurrentBrowserWorkspaceDerivedStateInTransaction)
+    return
+  }
+  if (physicalVersion > CURRENT_BROWSER_WORKSPACE_NATIVE_VERSION) {
+    database.version(physicalVersion / 10).stores(registeredStoreSpec)
+  }
+}
+
+export async function prepareBrowserWorkspaceSchema(db: NatterDb): Promise<void> {
+  const registeredSchema = registeredBrowserWorkspaceSchema(db)
+  const preflight = await preflightBrowserWorkspaceSchema(db, registeredSchema)
+  registerPreflightBrowserWorkspaceSchema(db, registeredBrowserWorkspaceStoreSpec(db), preflight)
+}
+
+async function openSessionDatabase(
+  session: BrowserWorkspaceSessionImpl,
+  options: OpenDbOptions,
+  assertCurrent: () => void,
+): Promise<NatterDb> {
+  assertCurrent()
+  const db = session.database
   const blocked = options.onBlocked
   if (blocked) db.on.blocked.subscribe(blocked)
   try {
-    if (!db.isOpen()) await db.open()
+    options.onProgress?.({
+      kind: 'schema-preflight',
+      databaseName: session.databaseName as BrowserWorkspaceDatabaseName,
+    })
+    session.schemaPreflight ??= preflightBrowserWorkspaceSchema(db, session.registeredSchema)
+    const preflight = await session.schemaPreflight
+    assertCurrent()
+    configurePreflightBrowserWorkspaceSchema(session, preflight)
+    options.onProgress?.({
+      kind: 'database-open',
+      databaseName: session.databaseName as BrowserWorkspaceDatabaseName,
+      ...(preflight.physicalVersion === undefined
+        ? {}
+        : { fromVersion: preflight.physicalVersion / 10 }),
+      targetVersion: CURRENT_DB_VERSION,
+    })
+    if (!db.isOpen()) {
+      session.beginDatabaseOpen()
+      if (options.onProgress) waveAUpgradeProgressPorts.set(db, options.onProgress)
+      try {
+        await db.open()
+      } finally {
+        waveAUpgradeProgressPorts.delete(db)
+        session.endDatabaseOpen()
+      }
+    }
   } finally {
     if (blocked) db.on.blocked.unsubscribe(blocked)
   }
-  attachmentRefsBackfillPromise ??= migrateAttachmentRefRows(db).catch((err) => {
-    attachmentRefsBackfillPromise = null
-    throw err
-  })
-  await attachmentRefsBackfillPromise
-  messageBodySplitBackfillPromise ??= backfillMissingMessageBodies(db).catch((err) => {
-    messageBodySplitBackfillPromise = null
-    throw err
-  })
-  await messageBodySplitBackfillPromise
-  chatPreviewProjectionBackfillPromise ??= backfillChatPreviewProjection(db).catch((err) => {
-    chatPreviewProjectionBackfillPromise = null
-    throw err
-  })
-  await chatPreviewProjectionBackfillPromise
-  organizationFieldsBackfillPromise ??= backfillOrganizationFields(db).catch((err) => {
-    organizationFieldsBackfillPromise = null
-    throw err
-  })
-  await organizationFieldsBackfillPromise
-  chatSidebarProjectionBackfillPromise ??= ensureChatSidebarProjection(db).catch((err) => {
-    chatSidebarProjectionBackfillPromise = null
-    throw err
-  })
-  await chatSidebarProjectionBackfillPromise
-  globalSettingsBackfillPromise ??= migrateGlobalSettingsRows(db).catch((err) => {
-    globalSettingsBackfillPromise = null
-    throw err
-  })
-  await globalSettingsBackfillPromise
-  providerOutputItemsBackfillPromise ??= migrateProviderOutputItemRows(db).catch((err) => {
-    providerOutputItemsBackfillPromise = null
-    throw err
-  })
-  await providerOutputItemsBackfillPromise
-  providerToolSettingsBackfillPromise ??= migrateProviderToolSettingsRows(db).catch((err) => {
-    providerToolSettingsBackfillPromise = null
-    throw err
-  })
-  await providerToolSettingsBackfillPromise
-  tokenCalibrationGlobalBackfillPromise ??= rebuildTokenCalibrationGlobalRows(db).catch((err) => {
-    tokenCalibrationGlobalBackfillPromise = null
-    throw err
-  })
-  await tokenCalibrationGlobalBackfillPromise
-  tokenCalibrationCanonicalizeBackfillPromise ??= canonicalizeTokenCalibrationRows(db).catch(
-    (err) => {
-      tokenCalibrationCanonicalizeBackfillPromise = null
-      throw err
-    },
-  )
-  await tokenCalibrationCanonicalizeBackfillPromise
+  assertCurrent()
+  session.verifySchema()
   return db
 }
 
-configureLockDatabaseOpener(openDb)
-configureBroadcastFallbackReader(async () => {
-  const db = await openDb()
-  const { mutationCounter, replacementEpoch } = await readBrowserWorkspaceMeta(db)
-  return { db, mutationCounter, replacementEpoch }
-})
-
-export function closeDb(): void {
-  if (singleton) {
-    singleton.close()
-    singleton = null
+configureLockDatabaseRunner((operation) => {
+  const session = getBrowserWorkspaceSession()
+  if (!session.isOpen()) {
+    return session.runOperation(async (db) => {
+      await session.open()
+      return operation(db)
+    })
   }
-  resetBackfillState()
+  return session.runOperation((db) => operation(db))
+})
+configureBroadcastFallbackReader(() =>
+  runBrowserWorkspaceLifecycleOperation(async () => {
+    const session = getBrowserWorkspaceSession()
+    const db = await session.open()
+    const { workspaceId, replacementEpoch } = await readBrowserWorkspaceMeta(db)
+    return { workspaceId, replacementEpoch }
+  }),
+)
+
+function __forceCloseDbForTests(
+  databaseName: BrowserWorkspaceDatabaseName | null,
+  admissionsOpen: boolean,
+): void {
+  browserWorkspaceAdmissionsOpen = false
+  browserWorkspaceRepositoryAdmissionsOpen = false
+  const session = invalidatedSession ?? currentSession
+  currentSession = null
+  invalidatedSession = null
+  if (session) session.forceClose()
+  else singleton?.close()
+  singleton = null
+  configuredBrowserWorkspaceDatabaseName = databaseName
+  browserWorkspaceAdmissionsOpen = admissionsOpen
+  browserWorkspaceRepositoryAdmissionsOpen = admissionsOpen
 }
 
 // Test-only reset so unit tests can swap in their own jsdom-backed IDB.
-export function __resetDbForTests(): void {
-  closeDb()
+export function __resetDbForTests(
+  options: { databaseName?: BrowserWorkspaceDatabaseName | null; admissionsOpen?: boolean } = {},
+): void {
+  __forceCloseDbForTests(
+    options.databaseName === undefined ? 'natter' : options.databaseName,
+    options.admissionsOpen ?? false,
+  )
+}
+
+export function __resetBrowserWorkspaceFatalInvalidationOwnerForTests(): void {
+  if (!browserWorkspaceFatalInvalidationOwner) return
+  browserWorkspaceFatalInvalidationOwner.active = false
+  browserWorkspaceFatalInvalidationOwner = null
 }
 
 // Mint a uniquely-named Dexie instance for integration tests that want to
@@ -1349,83 +2310,4 @@ export function __resetDbForTests(): void {
 // Caller is responsible for `await db.delete()` on teardown.
 export function createDbForTests(name: string): NatterDb {
   return new NatterDb(name)
-}
-
-export async function backfillOrganizationFields(db: NatterDb): Promise<void> {
-  const marker = await db.settings.get(ORGANIZATION_FIELDS_BACKFILL_KEY)
-  if (marker?.value === 1) return
-
-  await db.transaction(
-    'rw',
-    db.chats,
-    db.chatSidebarRows,
-    db.messages,
-    db.messageBodies,
-    db.settings,
-    async (tx) => {
-      await forEachTableBatch(db.chats, async (chats) => {
-        const patchedChats: Chat[] = []
-        for (const chat of chats) {
-          const rows = await db.messages.where('chatId').equals(chat.id).toArray()
-          const nextLeafId = findLastUpdatedLeafId(rows as unknown as Message[])
-          const branchHeaders =
-            nextLeafId !== null
-              ? (buildBranchMessages(
-                  rows as unknown as Message[],
-                  nextLeafId,
-                ) as unknown as MessageHeaderRow[])
-              : []
-          let wordCount = 0
-          for (let start = 0; start < branchHeaders.length; start += BACKCOMPAT_BATCH_SIZE) {
-            const headers = branchHeaders.slice(start, start + BACKCOMPAT_BATCH_SIZE)
-            const bodies = (
-              await db.messageBodies.bulkGet(headers.map((message) => message.id))
-            ).filter((row): row is MessageBodyRow => row !== undefined)
-            wordCount += countMessagesWords(hydrateMessages(headers, bodies))
-          }
-          const totalCostUsd = rows.reduce(
-            (total, message) => total + (message.deleted ? 0 : (message.generation?.cost ?? 0)),
-            0,
-          )
-          const patch = organizationDefaultsPatch(
-            chat as Partial<Chat> & Record<string, unknown>,
-            rows,
-            {
-              lastUpdatedLeafId: nextLeafId,
-              previewText:
-                chat.previewText === undefined
-                  ? await computePreviewText(db.messageBodies, rows)
-                  : chat.previewText,
-              wordCount,
-              totalCostUsd,
-            },
-          )
-          if (patch) patchedChats.push({ ...chat, ...patch })
-        }
-        if (patchedChats.length > 0) {
-          await db.chats.bulkPut(patchedChats)
-          for (const chat of patchedChats) await putChatSidebarProjection(tx, chat)
-        }
-      })
-      await db.settings.put(organizationFieldsBackfillMarker())
-    },
-  )
-}
-
-async function ensureChatSidebarProjection(db: NatterDb): Promise<void> {
-  const [marker, manifest, actualCount] = await db.transaction(
-    'r',
-    db.chatSidebarRows,
-    db.settings,
-    async () =>
-      Promise.all([
-        db.settings.get(CHAT_SIDEBAR_PROJECTION_BACKFILL_KEY),
-        db.settings.get(CHAT_SIDEBAR_PROJECTION_MANIFEST_KEY),
-        db.chatSidebarRows.count(),
-      ]),
-  )
-  if (marker?.value === 1 && isValidChatSidebarProjectionManifest(manifest?.value, actualCount)) {
-    return
-  }
-  await rebuildChatSidebarProjection(db)
 }

@@ -1,7 +1,6 @@
 import {
   Activity,
   lazy,
-  type MouseEvent,
   type ReactNode,
   Suspense,
   useCallback,
@@ -11,138 +10,98 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
 } from 'react'
-import { activePathProjected, createMessageTreeProjection, cursorKeyOf } from '../core/active-path'
 import { attachmentsDisabledByTextProtocol } from '../core/attachments/context'
-import { seedCursorAtMessageProjected } from '../core/branch-resolve'
-import { cloneDefaultChatSettings } from '../core/defaults'
+import {
+  PREFILL_UNAVAILABLE_PLAN,
+  rebaseEffectiveEndpointRouting,
+} from '../core/effective-endpoint-routing'
 import {
   applyBaseFontSizeToDocument,
   applyChatMaxWidthToDocument,
   applyFontFamilyToDocument,
   applyThemeToDocument,
-  bumpRecentModel,
   DEFAULT_GLOBAL_PREFERENCES,
   fontFamilyStack,
-  readGlobalPreferences,
 } from '../core/global-settings'
 import {
-  deleteSingleMessage,
-  type PasteImportSlot,
-  structuralEffectsCursorPatch,
-  structuralEffectsUndoCursorPatch,
-} from '../core/messages'
-import {
-  forceEquivalentModelIdForConnection,
-  modelLooksForeignForProfile,
-  pickEquivalentModelId,
-} from '../core/model-selection'
-import { withProfileApiDefaults } from '../core/provider-defaults'
-import { prefillClassFor } from '../core/quirks'
+  connectionAvailabilityFromProfileCount,
+  generationNotStarted,
+  pendingGenerationCapability,
+} from '../core/interaction-capability'
+import type { PasteImportSlot } from '../core/messages'
+import { EMPTY_MESSAGE_CONTEXT_ROUTE_FACTS, mergeMessageContextRouteFacts } from '../core/reasoning'
 import { DEFAULT_SIDEBAR_SORT_MODE } from '../core/sidebar-sort'
 import type {
   Chat,
   ChatId,
-  ConnectionProfile,
-  CursorMap,
   Message,
   MessageAttachmentRef,
   MessageId,
   MessageRole,
+  ProviderOutputMemberRef,
+  ReasoningMemberRef,
 } from '../core/types'
-import { useBranchUrlSync, useStableStructuralHeaders } from '../hooks/useBranchUrlSync'
-import {
-  nextOrphanRecoveryAt,
-  type OrphanRecoveryPoint,
-  recoverOrphans,
-  recoverStreamOrphan,
-  useChat,
-} from '../hooks/useChat'
-import { useEndpoints } from '../hooks/useEndpoints'
-import { useModels } from '../hooks/useModels'
-import { LruMap } from '../lib/lru-map'
+import { useActiveBranchFrame } from '../hooks/useActiveBranchFrame'
+import { catalogChatPresentation, useCatalogTab } from '../hooks/useCatalogApplication'
+import { useConfigurationPreferences } from '../hooks/useConfigurationPreferences'
+import { navigateConversationMessage } from '../hooks/useConversationCursor'
+import { useConversationSnapshot } from '../hooks/useConversationFrame'
+import { useModelCatalog } from '../hooks/useModelCatalog'
+import { usePresentationInteraction } from '../hooks/usePresentationInteraction'
 import { isPageHidingAbortError } from '../lib/page-lifecycle'
 import { newId } from '../lib/ulid'
-import type { MessageAttachmentRefMutation } from '../store/attachments'
-import { onEvent } from '../store/broadcast'
+import { requestAttemptStop } from '../store/attempt-control-application'
+import { attemptStopCapability, useAttemptTargetAdmissionFrame } from '../store/attempt-controller'
+import { catalogApplication } from '../store/catalog-application'
+import { discardEmptyDraftChat, touchLastViewed } from '../store/chat-metadata-application'
 import {
-  createChat,
-  discardEmptyDraftChat,
-  discardEmptyDraftChats,
-  getChat,
-  listChatSidebarRows,
-  loadKnownBranchPageSnapshot,
-  markChatPermanent,
-  touchLastViewed,
-  updateChatSettings,
-} from '../store/chats'
-import { resolveConnectionRuntimeKeys } from '../store/connection-runtime'
-import { type MessageHeaderRow, rebaseHydratedMessageHeader } from '../store/message-storage'
-import { bumpPresetLastUsedAt, getPreset, pickPreferredPreset } from '../store/presets'
-import { bumpProfileLastUsedAt, countProfiles, getProfile } from '../store/profiles'
+  configurationController,
+  currentActiveConfigurationSelection,
+  readyActiveConfigurationSelection,
+} from '../store/configuration-controller'
+import { conversationController } from '../store/conversation-controller'
+import { generationCapabilityController } from '../store/generation-capability-controller'
+import { materializeTemporaryNewChat } from '../store/new-chat-seed'
+import { writeSidebarCollapsed } from '../store/preferences-application'
+import type {
+  ConfigurationProjectionLoadStates,
+  ConversationPresentationResourcePort,
+  ConversationPresentationResourceState,
+  ConversationSurface,
+  MessageAttachmentRefMutation,
+  RequestableAttemptStopCapability,
+} from '../store/presentation-contracts'
 import { installPersistenceRequestOnFirstInteraction } from '../store/quota'
 import {
-  allTable,
-  chatRowDependencies,
-  GLOBAL_PREFERENCES_DEPENDENCIES,
-  primaryKeys,
-} from '../store/reactive-dependencies'
-import {
-  invalidateRepositoryQueriesForWorkspaceReplacement,
-  useRepositoryPresentationQuery,
-  useRepositoryQuery,
-  useRepositoryQueryState,
-} from '../store/reactive-query'
-import type {
-  ActiveBranchPageSnapshot,
-  ActiveBranchWindowSnapshot,
-  KnownBranchPageResult,
-  MessagePresentationSnapshot,
-} from '../store/repository'
-import { readSidebarSortMode, SIDEBAR_SORT_SETTING_KEY } from '../store/sidebar-preferences'
-import {
-  getStreamClientId,
-  installStreamLeaseListener,
-  onAnyRemoteStreamOwnershipReleased,
-  onRemoteStreamLeasesExpired,
-  requestAbortForStream,
-} from '../store/stream-leases'
-import { getWorkspaceRepository } from '../store/workspace-repository'
+  getWorkspaceRuntimeState,
+  subscribeWorkspaceRuntimeState,
+} from '../store/workspace-runtime'
+import { readWorkspaceMeta } from '../store/workspace-shell-application'
 import { announceEditTreeMode, announceTreeBranchOpened } from '../store/zustand/announcementStore'
-import type {
-  CommittedMessagePresentation,
-  CommittedMessagePresentationReceipt,
-  CommittedPathPresentationReceipt,
-  CommittedPresentationFocus,
-} from '../store/zustand/chatStore'
-import { useChatStore } from '../store/zustand/chatStore'
-import {
-  isRecoveryPendingStream,
-  isStreamRelevantToSelectedPath,
-  mostRecentlyAdmittedStream,
-  recoveryPendingStreams,
-  streamOriginatesFromTabNavigation,
-  subscribeRecoveryPendingStreams,
-  useActiveStreamsForChat,
-  useStreamStore,
-} from '../store/zustand/streamStore'
 import { useToastStore } from '../store/zustand/toastStore'
 import { useUiStore } from '../store/zustand/uiStore'
 import { BannerTray } from '../ui/chat/BannerTray'
+import type { BranchTreeView as BranchTreeViewComponent } from '../ui/chat/BranchTreeView'
 import { ChatHeader } from '../ui/chat/ChatHeader'
-import { Composer, type ComposerDroppedFiles, moveComposerDraft } from '../ui/chat/Composer'
+import {
+  Composer,
+  type ComposerDroppedFiles,
+  type ComposerProps,
+  type ComposerSubmission,
+  type ComposerSubmissionOutcome,
+  moveComposerDraft,
+} from '../ui/chat/Composer'
 import { EditTreeToolbar } from '../ui/chat/EditTreeToolbar'
 import { EmptyState } from '../ui/chat/EmptyState'
 import { FocusModeToggle } from '../ui/chat/FocusModeToggle'
+import type { MessageList as MessageListComponent } from '../ui/chat/MessageList'
 import { PrefillSettingsPrompt } from '../ui/chat/PrefillSettingsPrompt'
 import { ScrollRegion, type ScrollRegionHandle, type ScrollState } from '../ui/chat/ScrollRegion'
 import { ToastTray } from '../ui/chat/ToastTray'
 import { ZeroEligibleModal } from '../ui/chat/ZeroEligibleModal'
-import {
-  ConnectionHeader,
-  readActiveSeedState,
-  writeActiveSeedState,
-} from '../ui/header/ConnectionHeader'
+import { ConnectionHeader } from '../ui/header/ConnectionHeader'
 import {
   ChevronIcon,
   CogIcon,
@@ -154,43 +113,128 @@ import {
 import { Button, IconButton } from '../ui/primitives/Button'
 import { LiveRegions } from '../ui/primitives/LiveRegions'
 import { ChatModelPanel } from '../ui/settings/ChatModelPanel'
+import { GlobalSettingsModal } from '../ui/settings/GlobalSettingsModal'
 import { ChatList } from '../ui/sidebar/ChatList'
+import {
+  loadConversationActions,
+  requireConversationActions,
+} from './conversation-actions-capability'
+import {
+  type ConversationMutationIntent,
+  type ConversationMutationSettlement,
+  conversationMutationInteraction,
+  conversationMutationTarget,
+  generationSubmitInteraction,
+} from './presentation-interactions'
 import {
   beginRouteIntent,
   cancelRouteIntent,
-  chatHref,
   homeHref,
   isRouteIntentCurrent,
   makeAnchorClickHandler,
-  navigateForIntent,
   navigateHome,
   navigateNew,
   navigateToChatForIntent,
   newChatHref,
-  type RouteIntent,
-  refreshRouteForWorkspaceReplacement,
+  routeIntentOwner,
   storageHref,
   useRoute,
 } from './router'
 
-const loadMessageList = () =>
-  import('../ui/chat/MessageList').then((module) => ({ default: module.MessageList }))
-const loadBranchTreeView = () =>
-  import('../ui/chat/BranchTreeView').then((module) => ({ default: module.BranchTreeView }))
+type MessageListModule = { default: typeof MessageListComponent }
+type BranchTreeViewModule = { default: typeof BranchTreeViewComponent }
+
+function createSurfaceModuleResource<Module>(loader: () => Promise<Module>) {
+  let loaded: Module | null = null
+  let pending: Promise<Module> | null = null
+  let state: ConversationPresentationResourceState = Object.freeze({ kind: 'idle' })
+  const listeners = new Set<() => void>()
+  const publish = () => {
+    for (const listener of [...listeners]) listener()
+  }
+  return Object.freeze({
+    getSnapshot: () => loaded,
+    getState: () => state,
+    subscribe: (listener: () => void) => {
+      listeners.add(listener)
+      return () => listeners.delete(listener)
+    },
+    load: () => {
+      if (loaded) return Promise.resolve(loaded)
+      if (pending) return pending
+      state = Object.freeze({ kind: 'loading' })
+      pending = loader().then(
+        (module) => {
+          loaded = module
+          state = Object.freeze({ kind: 'ready' })
+          publish()
+          return module
+        },
+        (error: unknown) => {
+          pending = null
+          state = Object.freeze({
+            kind: 'failed',
+            message: error instanceof Error ? error.message : 'Conversation surface failed to load',
+          })
+          publish()
+          throw error
+        },
+      )
+      return pending
+    },
+  })
+}
+
+const messageListModuleResource = createSurfaceModuleResource<MessageListModule>(() =>
+  Promise.all([import('../ui/chat/MessageList'), loadConversationActions()]).then(([module]) => ({
+    default: module.MessageList,
+  })),
+)
+const branchTreeViewModuleResource = createSurfaceModuleResource<BranchTreeViewModule>(() =>
+  Promise.all([import('../ui/chat/BranchTreeView'), loadConversationActions()]).then(
+    ([module]) => ({
+      default: module.BranchTreeView,
+    }),
+  ),
+)
+const loadMessageList = messageListModuleResource.load
+const loadBranchTreeView = branchTreeViewModuleResource.load
+const presentationResources: Readonly<
+  Record<
+    ConversationSurface,
+    typeof messageListModuleResource | typeof branchTreeViewModuleResource
+  >
+> = Object.freeze({
+  transcript: messageListModuleResource,
+  tree: branchTreeViewModuleResource,
+})
+const conversationPresentationResourcePort: ConversationPresentationResourcePort = Object.freeze({
+  get: (surface: ConversationSurface) => presentationResources[surface].getState(),
+  request: (surface: ConversationSurface) => {
+    void presentationResources[surface].load().catch(() => undefined)
+  },
+  subscribe: (listener: () => void) => {
+    const unsubscribeTranscript = messageListModuleResource.subscribe(listener)
+    const unsubscribeTree = branchTreeViewModuleResource.subscribe(listener)
+    return () => {
+      unsubscribeTranscript()
+      unsubscribeTree()
+    }
+  },
+})
+conversationController.installPresentationResourcePort(conversationPresentationResourcePort)
 const loadImportModal = () =>
-  import('../ui/chat/ImportModal').then((module) => ({ default: module.ImportModal }))
-const loadGlobalSettingsModal = () =>
-  import('../ui/settings/GlobalSettingsModal').then((module) => ({
-    default: module.GlobalSettingsModal,
+  Promise.all([import('../ui/chat/ImportModal'), loadConversationActions()]).then(([module]) => ({
+    default: module.ImportModal,
   }))
 const loadStorageView = () =>
   import('../ui/storage/StorageView').then((module) => ({ default: module.StorageView }))
 
-const MessageList = lazy(loadMessageList)
-const BranchTreeView = lazy(loadBranchTreeView)
 const ImportModal = lazy(loadImportModal)
-const GlobalSettingsModal = lazy(loadGlobalSettingsModal)
 const StorageView = lazy(loadStorageView)
+const PENDING_TREE_GENERATION_START = generationNotStarted(
+  pendingGenerationCapability('prompt-path'),
+)
 
 function preload(loader: () => Promise<unknown>): void {
   void loader().catch(() => undefined)
@@ -199,7 +243,6 @@ function preload(loader: () => Promise<unknown>): void {
 const preloadMessageList = () => preload(loadMessageList)
 const preloadBranchTreeView = () => preload(loadBranchTreeView)
 const preloadImportModal = () => preload(loadImportModal)
-const preloadGlobalSettingsModal = () => preload(loadGlobalSettingsModal)
 const preloadStorageView = () => preload(loadStorageView)
 
 function SurfaceLoading({ label, overlay = false }: { label: string; overlay?: boolean }) {
@@ -215,40 +258,41 @@ function SurfaceLoading({ label, overlay = false }: { label: string; overlay?: b
   )
 }
 
-const SIDEBAR_COLLAPSED_STORAGE_KEY = 'natter:sidebar-collapsed'
+function TranscriptLoadFailure({ onRetry }: { onRetry: () => void }) {
+  return (
+    <div data-ui="surface-loading" data-placement="inline" role="alert">
+      <span>Conversation could not be loaded.</span>
+      <Button type="button" onClick={onRetry}>
+        Retry
+      </Button>
+    </div>
+  )
+}
+
+function ConfigurationLoadFailure({ loads }: { loads: ConfigurationProjectionLoadStates }) {
+  const failed = (['shell', 'globalTokenCalibration', 'textTemplates'] as const).filter(
+    (kind) => loads[kind].status === 'error',
+  )
+  if (failed.length === 0) return null
+  const retry = () => {
+    for (const kind of failed) configurationController.retryProjection(kind)
+  }
+  return (
+    <div data-ui="banner-tray">
+      <div data-ui="banner" data-kind="configuration-load" data-tone="warning" role="alert">
+        <span data-ui="banner-text">
+          Workspace configuration could not be loaded. Defaults are being used where possible.
+        </span>
+        <span data-ui="banner-spacer" />
+        <Button type="button" data-ui="banner-primary" onClick={retry}>
+          Retry
+        </Button>
+      </div>
+    </div>
+  )
+}
+
 const MOBILE_SHELL_QUERY = '(max-width: 700px)'
-// Stable empty reference so useSyncExternalStore selectors don't allocate a
-// fresh `{}` each render (React 19 flags that as infinite re-render).
-const EMPTY_CURSOR: CursorMap = Object.freeze({})
-const EMPTY_COMMITTED_MESSAGE_RECEIPTS = Object.freeze(
-  [],
-) as readonly CommittedMessagePresentationReceipt[]
-// Matches ModelPicker's MODELS_QUERY — the cache row is keyed on the query
-// signature, so reusing the same one here means the picker and the
-// auto-selector share a single /models fetch instead of triggering two.
-const MODEL_AUTOSELECT_QUERY = {
-  outputModalities: ['text', 'image', 'audio', 'file', 'video'],
-} as const
-const DIRECT_MODEL_AUTOSELECT_QUERY = {} as const
-const ORPHAN_RECOVERY_FAILURE_RETRY_MS = 2_000
-const CHAT_SNAPSHOT_CACHE_MAX_ENTRIES = 16
-
-interface ActiveBranchPageSnapshotResult {
-  key: string
-  intentKey: string
-  readEpoch: number
-  result: KnownBranchPageResult
-}
-
-interface LastBranchSnapshot {
-  intentKey: string
-  snapshot: ActiveBranchWindowSnapshot
-}
-
-interface ActiveProfileState {
-  chatId: ChatId
-  profileId: string
-}
 
 interface TreeInsertTarget {
   chatId: ChatId
@@ -256,566 +300,11 @@ interface TreeInsertTarget {
   defaultRole: MessageRole
 }
 
-interface MessageHeaderLookup {
-  get(messageId: MessageId): MessageHeaderRow | undefined
-}
-
 function oppositeRole(role: MessageRole): MessageRole {
   if (role === 'user') return 'assistant'
   if (role === 'assistant') return 'user'
   return role
 }
-
-let activeBranchWindowReadEpoch = 0
-
-function invalidateActiveBranchWindowReads(): void {
-  activeBranchWindowReadEpoch += 1
-}
-
-function overlayKnownPathHeaders(
-  headers: readonly MessageHeaderRow[],
-  pathHeaders: readonly MessageHeaderRow[],
-): readonly MessageHeaderRow[] {
-  const indexById = new Map(headers.map((header, index) => [header.id, index]))
-  const next = [...headers]
-  for (const header of pathHeaders) {
-    const index = indexById.get(header.id)
-    if (index === undefined) {
-      indexById.set(header.id, next.length)
-      next.push(header)
-    } else {
-      next[index] = header
-    }
-  }
-  return next
-}
-
-function sameHeaderStructure(left: MessageHeaderRow, right: MessageHeaderRow): boolean {
-  return (
-    left.id === right.id &&
-    left.chatId === right.chatId &&
-    left.parentId === right.parentId &&
-    left.siblingIndex === right.siblingIndex &&
-    left.deleted === right.deleted
-  )
-}
-
-function headerStrictlyDominates(candidate: MessageHeaderRow, current: MessageHeaderRow): boolean {
-  return (
-    (candidate.nodeVersion > current.nodeVersion && candidate.bodyVersion >= current.bodyVersion) ||
-    (candidate.bodyVersion > current.bodyVersion && candidate.nodeVersion >= current.nodeVersion)
-  )
-}
-
-function preferStrictlyNewerHeader(
-  current: MessageHeaderRow | undefined,
-  candidate: MessageHeaderRow | undefined,
-): MessageHeaderRow | undefined {
-  if (!candidate) return current
-  if (!current || headerStrictlyDominates(candidate, current)) return candidate
-  return current
-}
-
-function addExactMessagePresentationSnapshot(
-  snapshots: Map<MessageId, MessagePresentationSnapshot>,
-  receipt: CommittedMessagePresentationReceipt | undefined,
-  authoritativeHeaderById: MessageHeaderLookup,
-): void {
-  if (!receipt) return
-  const { presentation } = receipt
-  const authoritativeHeader = authoritativeHeaderById.get(presentation.message.id)
-  if (
-    !authoritativeHeader ||
-    authoritativeHeader.bodyVersion !== presentation.bodyVersion ||
-    authoritativeHeader.chatId !== presentation.header.chatId
-  ) {
-    return
-  }
-  snapshots.set(presentation.message.id, {
-    message: overlayCanonicalMessageHeader(presentation.message, authoritativeHeader),
-    bodyVersion: presentation.bodyVersion,
-  })
-}
-
-export const __addExactMessagePresentationSnapshotForTests = addExactMessagePresentationSnapshot
-
-function overlayCommittedPathHeaders(
-  headers: readonly MessageHeaderRow[],
-  receipt: CommittedPathPresentationReceipt | undefined,
-): readonly MessageHeaderRow[] {
-  if (!receipt) return headers
-  const indexById = new Map(headers.map((header, index) => [header.id, index]))
-  const next = [...headers]
-  for (const committed of receipt.structuralHeaders) {
-    const index = indexById.get(committed.id)
-    if (index === undefined) {
-      indexById.set(committed.id, next.length)
-      next.push(committed)
-      continue
-    }
-    const observed = next[index] as MessageHeaderRow
-    const structuralContradiction =
-      !sameHeaderStructure(observed, committed) && observed.nodeVersion >= committed.nodeVersion
-    if (structuralContradiction) continue
-    if (
-      committed.nodeVersion >= observed.nodeVersion &&
-      committed.bodyVersion >= observed.bodyVersion
-    ) {
-      next[index] = committed
-    }
-  }
-  return next
-}
-
-export const __overlayCommittedPathHeadersForTests = overlayCommittedPathHeaders
-
-function overlayCanonicalMessageHeader(message: Message, header: MessageHeaderRow): Message {
-  return rebaseHydratedMessageHeader(message, header)
-}
-
-interface VisibleHeaderOverlayState {
-  source: ActiveBranchWindowSnapshot | null
-  value: ActiveBranchWindowSnapshot | null
-  windowIndexById: ReadonlyMap<MessageId, number>
-  appliedHeaderById: ReadonlyMap<MessageId, MessageHeaderRow>
-  latestHeaderSource: MessageHeaderLookup | null
-  committedReceipts: readonly CommittedMessagePresentationReceipt[]
-}
-
-function repositorySnapshotObservesCommittedMessage(
-  snapshot: ActiveBranchWindowSnapshot | null,
-  receipt: CommittedMessagePresentationReceipt | undefined,
-  pathIndexById?: ReadonlyMap<MessageId, number>,
-): boolean {
-  if (!snapshot || !receipt || snapshot.chatId !== receipt.chatId) return false
-  const pathIndex =
-    pathIndexById?.get(receipt.presentation.message.id) ??
-    snapshot.branchHeaders.findIndex((header) => header.id === receipt.presentation.message.id)
-  const windowIndex = pathIndex - snapshot.windowOffset
-  if (pathIndex < 0 || windowIndex < 0 || windowIndex >= snapshot.branchWindow.length) return false
-  const header = snapshot.branchHeaders[pathIndex]
-  const message = snapshot.branchWindow[windowIndex]
-  const headerObserved =
-    header !== undefined &&
-    header.nodeVersion >= receipt.presentation.header.nodeVersion &&
-    header.bodyVersion >= receipt.presentation.bodyVersion &&
-    (sameHeaderStructure(header, receipt.presentation.header) ||
-      header.nodeVersion > receipt.presentation.header.nodeVersion)
-  return (
-    header?.id === receipt.presentation.message.id &&
-    message?.id === receipt.presentation.message.id &&
-    headerObserved
-  )
-}
-
-export const __repositorySnapshotObservesCommittedMessageForTests =
-  repositorySnapshotObservesCommittedMessage
-
-function useVisibleMessageHeaderOverlay(
-  snapshot: ActiveBranchWindowSnapshot | null,
-  latestHeaderById: MessageHeaderLookup,
-  changedHeaderKeys: readonly string[] | null,
-  changedHeaders: readonly (MessageHeaderRow | undefined)[] | null,
-  committedReceipts: readonly CommittedMessagePresentationReceipt[],
-): ActiveBranchWindowSnapshot | null {
-  const stateRef = useRef<VisibleHeaderOverlayState>({
-    source: null,
-    value: null,
-    windowIndexById: new Map(),
-    appliedHeaderById: new Map(),
-    latestHeaderSource: null,
-    committedReceipts: [],
-  })
-
-  return useMemo(() => {
-    const previous = stateRef.current
-    if (!snapshot) {
-      if (previous.source === null && previous.value === null) return null
-      stateRef.current = {
-        source: null,
-        value: null,
-        windowIndexById: new Map(),
-        appliedHeaderById: new Map(),
-        latestHeaderSource: latestHeaderById,
-        committedReceipts: [],
-      }
-      return null
-    }
-
-    const sourceChanged = previous.source !== snapshot
-    const windowIndexById = sourceChanged
-      ? new Map(snapshot.branchWindow.map((message, index) => [message.id, index]))
-      : previous.windowIndexById
-    const appliedHeaderById = sourceChanged
-      ? new Map<MessageId, MessageHeaderRow>()
-      : new Map(previous.appliedHeaderById)
-    let value = sourceChanged ? snapshot : (previous.value ?? snapshot)
-    const pendingUpdate: { headers: MessageHeaderRow[] | null; window: Message[] | null } = {
-      headers: null,
-      window: null,
-    }
-
-    const applyHeader = (header: MessageHeaderRow | undefined): void => {
-      if (!header || header.chatId !== snapshot.chatId) return
-      const windowIndex = windowIndexById.get(header.id)
-      if (windowIndex === undefined || appliedHeaderById.get(header.id) === header) return
-      const branchHeader = snapshot.branchHeaders[snapshot.windowOffset + windowIndex]
-      const currentMessage = (pendingUpdate.window ?? value.branchWindow)[windowIndex]
-      if (
-        !branchHeader ||
-        !currentMessage ||
-        branchHeader.id !== header.id ||
-        header.bodyVersion !== branchHeader.bodyVersion ||
-        header.nodeVersion < currentMessage.nodeVersion
-      ) {
-        return
-      }
-      pendingUpdate.window ??= [...value.branchWindow]
-      pendingUpdate.window[windowIndex] = overlayCanonicalMessageHeader(currentMessage, header)
-      appliedHeaderById.set(header.id, header)
-    }
-
-    if (
-      sourceChanged ||
-      (changedHeaderKeys === null && previous.latestHeaderSource !== latestHeaderById)
-    ) {
-      for (const message of snapshot.branchWindow) applyHeader(latestHeaderById.get(message.id))
-    } else if (
-      changedHeaders &&
-      changedHeaderKeys &&
-      changedHeaders.length === changedHeaderKeys.length
-    ) {
-      for (const header of changedHeaders) applyHeader(header)
-    }
-
-    for (const { presentation: committedPresentation } of committedReceipts) {
-      const windowIndex = windowIndexById.get(committedPresentation.message.id)
-      const pathIndex = windowIndex === undefined ? -1 : snapshot.windowOffset + windowIndex
-      const currentHeader =
-        pathIndex < 0 ? undefined : (pendingUpdate.headers ?? value.branchHeaders)[pathIndex]
-      const currentMessage =
-        windowIndex === undefined
-          ? undefined
-          : (pendingUpdate.window ?? value.branchWindow)[windowIndex]
-      const observedHeader = latestHeaderById.get(committedPresentation.message.id)
-      const exactBodyHeader =
-        observedHeader &&
-        observedHeader.bodyVersion === committedPresentation.bodyVersion &&
-        observedHeader.nodeVersion >= committedPresentation.header.nodeVersion &&
-        sameHeaderStructure(observedHeader, committedPresentation.header)
-          ? observedHeader
-          : currentHeader &&
-              currentHeader.bodyVersion === committedPresentation.bodyVersion &&
-              currentHeader.nodeVersion >= committedPresentation.header.nodeVersion &&
-              sameHeaderStructure(currentHeader, committedPresentation.header)
-            ? currentHeader
-            : committedPresentation.header
-      if (
-        windowIndex !== undefined &&
-        currentHeader &&
-        currentMessage?.id === committedPresentation.message.id &&
-        sameHeaderStructure(currentHeader, committedPresentation.header) &&
-        committedPresentation.bodyVersion >= currentHeader.bodyVersion &&
-        (committedPresentation.bodyVersion === currentHeader.bodyVersion ||
-          committedPresentation.header.nodeVersion >= currentHeader.nodeVersion)
-      ) {
-        pendingUpdate.headers ??= [...value.branchHeaders]
-        pendingUpdate.window ??= [...value.branchWindow]
-        pendingUpdate.headers[pathIndex] = exactBodyHeader
-        pendingUpdate.window[windowIndex] = overlayCanonicalMessageHeader(
-          committedPresentation.message,
-          exactBodyHeader,
-        )
-        appliedHeaderById.set(exactBodyHeader.id, exactBodyHeader)
-      }
-    }
-
-    if (pendingUpdate.headers || pendingUpdate.window) {
-      value = {
-        ...value,
-        ...(pendingUpdate.headers ? { branchHeaders: pendingUpdate.headers } : {}),
-        ...(pendingUpdate.window ? { branchWindow: pendingUpdate.window } : {}),
-      }
-    }
-    stateRef.current = {
-      source: snapshot,
-      value,
-      windowIndexById,
-      appliedHeaderById,
-      latestHeaderSource: latestHeaderById,
-      committedReceipts,
-    }
-    return value
-  }, [changedHeaderKeys, changedHeaders, committedReceipts, latestHeaderById, snapshot])
-}
-
-function composeKnownBranchPage(
-  chatId: ChatId,
-  pathMessageIds: readonly MessageId[],
-  knownPathHeaders: readonly MessageHeaderRow[] | null,
-  knownHeaderById: MessageHeaderLookup,
-  page: ActiveBranchPageSnapshot,
-): ActiveBranchWindowSnapshot | null {
-  if (page.chatId !== chatId || page.branchLength !== pathMessageIds.length) return null
-  if (
-    page.pageOffset < 0 ||
-    page.pageOffset + page.pageHeaders.length > pathMessageIds.length ||
-    page.pageHeaders.length !== page.pageMessages.length
-  ) {
-    return null
-  }
-  let branchHeaders: readonly MessageHeaderRow[] | null = null
-  if (knownPathHeaders?.length === pathMessageIds.length) {
-    let pageMatchesKnownPath = true
-    for (let index = 0; index < page.pageHeaders.length; index += 1) {
-      const header = page.pageHeaders[index]
-      const known = knownPathHeaders[page.pageOffset + index]
-      if (!header || !known || header.id !== known.id || header.bodyVersion !== known.bodyVersion) {
-        pageMatchesKnownPath = false
-        break
-      }
-    }
-    if (pageMatchesKnownPath) branchHeaders = knownPathHeaders
-  }
-  const pageHeaderById = new Map(page.pageHeaders.map((header) => [header.id, header]))
-  const reconstructedHeaders: MessageHeaderRow[] = []
-  if (!branchHeaders) {
-    const seen = new Set<MessageId>()
-    for (let index = 0; index < pathMessageIds.length; index += 1) {
-      const messageId = pathMessageIds[index] as MessageId
-      if (seen.has(messageId)) return null
-      seen.add(messageId)
-      const header = pageHeaderById.get(messageId) ?? knownHeaderById.get(messageId)
-      const expectedParentId = index === 0 ? null : pathMessageIds[index - 1]
-      if (
-        !header ||
-        header.chatId !== chatId ||
-        header.deleted ||
-        header.parentId !== expectedParentId
-      ) {
-        return null
-      }
-      reconstructedHeaders.push(header)
-    }
-    branchHeaders = reconstructedHeaders
-  }
-  const branchMessages: Message[] = []
-  for (let index = 0; index < page.pageHeaders.length; index += 1) {
-    const header = page.pageHeaders[index]
-    const message = page.pageMessages[index]
-    const known = header ? knownHeaderById.get(header.id) : undefined
-    const authoritative = branchHeaders[page.pageOffset + index]
-    if (
-      !header ||
-      !message ||
-      !authoritative ||
-      pathMessageIds[page.pageOffset + index] !== header.id ||
-      message.id !== header.id ||
-      authoritative.id !== header.id ||
-      authoritative.bodyVersion !== header.bodyVersion ||
-      (known !== undefined &&
-        known.bodyVersion !== header.bodyVersion &&
-        known.nodeVersion >= header.nodeVersion)
-    ) {
-      return null
-    }
-    const exactHeader =
-      known?.bodyVersion === header.bodyVersion && known.nodeVersion >= header.nodeVersion
-        ? known
-        : authoritative.nodeVersion > header.nodeVersion
-          ? authoritative
-          : header
-    branchMessages.push(overlayCanonicalMessageHeader(message, exactHeader))
-  }
-  return {
-    chatId,
-    branchHeaders: branchHeaders as MessageHeaderRow[],
-    branchWindow: branchMessages,
-    windowOffset: page.pageOffset,
-    windowLimit: page.pageLimit,
-    branchLength: page.branchLength,
-  }
-}
-
-function rebaseBranchSnapshot(
-  snapshot: ActiveBranchWindowSnapshot,
-  path: readonly MessageHeaderRow[],
-): ActiveBranchWindowSnapshot | null {
-  if (snapshot.branchHeaders.length !== path.length) return null
-  for (let index = 0; index < path.length; index += 1) {
-    const retained = snapshot.branchHeaders[index]
-    const authoritative = path[index]
-    if (
-      !retained ||
-      !authoritative ||
-      retained.id !== authoritative.id ||
-      retained.bodyVersion !== authoritative.bodyVersion
-    ) {
-      return null
-    }
-  }
-  if (snapshot.branchHeaders === path) return snapshot
-  const branchWindow = snapshot.branchWindow.map((message, index) => {
-    const authoritative = path[snapshot.windowOffset + index]
-    return authoritative ? overlayCanonicalMessageHeader(message, authoritative) : message
-  })
-  return { ...snapshot, branchHeaders: path as MessageHeaderRow[], branchWindow }
-}
-
-function composeCommittedPathWindow(
-  receipt: CommittedPathPresentationReceipt,
-  exactMessagePresentations: readonly CommittedMessagePresentation[],
-  structuralPath: readonly MessageHeaderRow[],
-  authoritativeHeaderById: MessageHeaderLookup,
-  base: ActiveBranchWindowSnapshot | null,
-  limit: number,
-): ActiveBranchWindowSnapshot | null {
-  const path = structuralPath.map((header) => authoritativeHeaderById.get(header.id) ?? header)
-  if (path.length === 0) return null
-  const pathById = new Map(path.map((header) => [header.id, header]))
-  const committedById = new Map(
-    receipt.presentations.map((presentation) => [presentation.message.id, presentation]),
-  )
-  for (const exactMessagePresentation of exactMessagePresentations) {
-    if (exactMessagePresentation.message.chatId !== receipt.chatId) continue
-    const pathPresentation = committedById.get(exactMessagePresentation.message.id)
-    if (
-      !pathPresentation ||
-      (exactMessagePresentation.header.nodeVersion >= pathPresentation.header.nodeVersion &&
-        exactMessagePresentation.bodyVersion >= pathPresentation.bodyVersion &&
-        (exactMessagePresentation.header.nodeVersion > pathPresentation.header.nodeVersion ||
-          exactMessagePresentation.bodyVersion > pathPresentation.bodyVersion))
-    ) {
-      committedById.set(exactMessagePresentation.message.id, exactMessagePresentation)
-    }
-  }
-  const available = new Map<MessageId, CommittedMessagePresentation>()
-  if (base?.chatId === receipt.chatId) {
-    for (let index = 0; index < base.branchWindow.length; index += 1) {
-      const message = base.branchWindow[index]
-      const header = base.branchHeaders[base.windowOffset + index]
-      const committedHeader = message ? pathById.get(message.id) : undefined
-      if (
-        message &&
-        header &&
-        committedHeader &&
-        header.id === message.id &&
-        header.bodyVersion === committedHeader.bodyVersion
-      ) {
-        available.set(message.id, {
-          header: committedHeader,
-          message,
-          bodyVersion: committedHeader.bodyVersion,
-        })
-      }
-    }
-  }
-  for (const presentation of committedById.values()) {
-    const header = pathById.get(presentation.message.id)
-    if (!header || header.bodyVersion !== presentation.bodyVersion) continue
-    available.set(presentation.message.id, presentation)
-  }
-  const windowLimit = Math.max(1, limit)
-  let windowOffset = Math.max(0, path.length - windowLimit)
-  for (let index = windowOffset; index < path.length; index += 1) {
-    const header = path[index] as MessageHeaderRow
-    const presentation = available.get(header.id)
-    if (!presentation || presentation.bodyVersion !== header.bodyVersion) windowOffset = index + 1
-  }
-  if (windowOffset >= path.length) return null
-  const branchWindow = path.slice(windowOffset).map((header) => {
-    const presentation = available.get(header.id) as CommittedMessagePresentation
-    return overlayCanonicalMessageHeader(presentation.message, header)
-  })
-  return {
-    chatId: receipt.chatId,
-    branchHeaders: [...path],
-    branchWindow,
-    windowOffset,
-    windowLimit,
-    branchLength: path.length,
-  }
-}
-
-function repositorySnapshotDominatesReceipt(
-  snapshot: ActiveBranchWindowSnapshot | null,
-  receipt: CommittedPathPresentationReceipt,
-  visibleWindowLimit: number,
-): boolean {
-  if (receipt.pathHeaders.length === 0) return receipt.presentations.length === 0
-  if (!snapshot || snapshot.chatId !== receipt.chatId) return false
-  if (snapshot.branchHeaders.length < receipt.pathHeaders.length) return false
-  const windowMessageIds = new Set(snapshot.branchWindow.map((message) => message.id))
-  const pathIndexById = new Map(receipt.pathHeaders.map((header, index) => [header.id, index]))
-  const visibleMessageIds = new Set(
-    snapshot.branchHeaders.slice(-Math.max(1, visibleWindowLimit)).map((header) => header.id),
-  )
-  for (let index = 0; index < receipt.pathHeaders.length; index += 1) {
-    const committed = receipt.pathHeaders[index]
-    const observed = snapshot.branchHeaders[index]
-    if (!committed || !observed || committed.id !== observed.id) return false
-  }
-  return receipt.presentations.every((presentation) => {
-    if (!visibleMessageIds.has(presentation.message.id)) return true
-    const index = pathIndexById.get(presentation.message.id)
-    const observed = index === undefined ? undefined : snapshot.branchHeaders[index]
-    return (
-      observed !== undefined &&
-      observed.bodyVersion >= presentation.bodyVersion &&
-      windowMessageIds.has(presentation.message.id)
-    )
-  })
-}
-
-function repositoryHeadersResolveReceipt(
-  headerById: MessageHeaderLookup,
-  receipt: CommittedPathPresentationReceipt,
-): boolean {
-  return receipt.structuralHeaders.every((committed) => {
-    const observed = headerById.get(committed.id)
-    return (
-      observed !== undefined &&
-      observed.nodeVersion >= committed.nodeVersion &&
-      observed.bodyVersion >= committed.bodyVersion
-    )
-  })
-}
-
-function repositoryPathContradictsReceipt(
-  headerById: MessageHeaderLookup,
-  receipt: CommittedPathPresentationReceipt,
-): boolean {
-  return receipt.pathHeaders.some((committed) => {
-    const observed = headerById.get(committed.id)
-    return (
-      observed !== undefined &&
-      observed.nodeVersion >= committed.nodeVersion &&
-      !sameHeaderStructure(observed, committed)
-    )
-  })
-}
-
-export const __repositoryHeadersResolveReceiptForTests = repositoryHeadersResolveReceipt
-
-function branchSnapshotMatchesStructure(
-  snapshot: ActiveBranchWindowSnapshot,
-  path: readonly Pick<Message, 'id' | 'parentId' | 'siblingIndex' | 'deleted'>[],
-): boolean {
-  if (snapshot.branchHeaders.length !== path.length) return false
-  return snapshot.branchHeaders.every((header, index) => {
-    const authoritative = path[index]
-    return (
-      authoritative !== undefined &&
-      header.id === authoritative.id &&
-      header.parentId === authoritative.parentId &&
-      header.siblingIndex === authoritative.siblingIndex &&
-      header.deleted === authoritative.deleted
-    )
-  })
-}
-
-export const __composeKnownBranchPageForTests = composeKnownBranchPage
-export const __rebaseBranchSnapshotForTests = rebaseBranchSnapshot
 
 function hasFileTransfer(dataTransfer: DataTransfer): boolean {
   return Array.from(dataTransfer.types).includes('Files')
@@ -843,49 +332,31 @@ function useMediaQuery(query: string): boolean {
   return matches
 }
 
-function useStableMessageIdPath(path: readonly MessageId[]): readonly MessageId[] {
-  const stableRef = useRef<readonly MessageId[]>(path)
-  const stable = stableRef.current
-  if (
-    stable !== path &&
-    (stable.length !== path.length || stable.some((messageId, index) => messageId !== path[index]))
-  ) {
-    stableRef.current = path
-  }
-  return stableRef.current
-}
-
-// Seed settings for a new chat from this tab's remembered default first,
-// then fall back to the workspace-global MRU preset. The remembered seed
-// tracks the most recently viewed chat in this tab (including preset-backed
-// chats with no local edits), plus explicit new-chat/profile-switch actions.
-// `profileId` is still overridden with the preferred profile so an explicit
-// connection choice can win even when a different preset had to be used
-// for the rest of the seed settings.
-// If the chosen profileId differs from the preset's, clear the model —
-// the preset's model is almost certainly not served on the new connection,
-// and the Shell-level auto-selector will fill it in if the new connection
-// has exactly one model.
-function seedSettingsForNewChat(
-  presetSettings: Chat['settings'] | undefined,
-  preferredProfile: ConnectionProfile | null,
-): Chat['settings'] {
-  const base = presetSettings ? { ...presetSettings } : cloneDefaultChatSettings()
-  const targetId = preferredProfile?.id ?? base.profileId
-  let next = base
-  if (targetId && targetId !== base.profileId) {
-    next = { ...base, profileId: targetId, model: '' }
-  }
-  return preferredProfile ? withProfileApiDefaults(next, preferredProfile) : next
-}
-
 export function Shell() {
+  const workspaceRuntimeState = useSyncExternalStore(
+    subscribeWorkspaceRuntimeState,
+    getWorkspaceRuntimeState,
+    getWorkspaceRuntimeState,
+  )
   const route = useRoute()
+  const messageListModule = useSyncExternalStore(
+    messageListModuleResource.subscribe,
+    messageListModuleResource.getSnapshot,
+    messageListModuleResource.getSnapshot,
+  )
+  const branchTreeViewModule = useSyncExternalStore(
+    branchTreeViewModuleResource.subscribe,
+    branchTreeViewModuleResource.getSnapshot,
+    branchTreeViewModuleResource.getSnapshot,
+  )
+  const MessageList = messageListModule?.default
+  const BranchTreeView = branchTreeViewModule?.default
   const activeChatId = route.kind === 'chat' ? route.chatId : null
+  const onNewChatSurface = route.kind === 'new'
+  if (activeChatId || onNewChatSurface) preloadMessageList()
   const activeStorageRoute = route.kind === 'storage' ? route.storage : null
   const activeStorageRouteKey = activeStorageRoute ? storageHref(activeStorageRoute) : null
   const focusModeAvailable = !activeStorageRoute
-  const onNewChatSurface = route.kind === 'new'
   const activeSurfaceKey = activeChatId
     ? `chat:${activeChatId}`
     : activeStorageRouteKey
@@ -894,24 +365,14 @@ export function Shell() {
         ? 'new'
         : 'empty'
   const isNarrowScreen = useMediaQuery(MOBILE_SHELL_QUERY)
-  const {
-    headerById: latestTreeHeaderById,
-    changedHeaderKeys: activeChangedHeaderKeys,
-    changedHeaders: activeChangedHeaders,
-    navigationHeaders: activeTreeHeaders,
-    structuralHeaders: structuralTreeHeaders,
-    projection: structuralTreeProjection,
-  } = useBranchUrlSync(activeChatId)
-  const { send, sendFrom } = useChat()
-  const activeChatStreams = useActiveStreamsForChat(activeChatId)
-  const profileCount = useRepositoryQuery(
-    'profile-count:include-archived',
-    () => countProfiles({ includeArchived: true }),
-    undefined,
-    allTable('profiles'),
+  const configurationSession = useSyncExternalStore(
+    configurationController.subscribe,
+    configurationController.getSnapshot,
+    configurationController.getSnapshot,
   )
-  const connectionKnown = profileCount !== undefined
-  const hasConnection = connectionKnown && profileCount > 0
+  const profileCount = configurationSession.frame.shell?.totalProfileCount
+  const connectionAvailability = connectionAvailabilityFromProfileCount(profileCount)
+  const connectionKnown = connectionAvailability !== 'unknown'
   const [chatModelOpen, setChatModelOpen] = useState(false)
   const [globalSettingsOpen, setGlobalSettingsOpen] = useState(false)
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false)
@@ -922,638 +383,129 @@ export function Shell() {
   const [scrollState, setScrollState] = useState<ScrollState>('follow')
   const [importAtEndOpen, setImportAtEndOpen] = useState(false)
   const [treeInsertTarget, setTreeInsertTarget] = useState<TreeInsertTarget | null>(null)
-  const [retainedAlternateViewsChatId, setRetainedAlternateViewsChatId] = useState<ChatId | null>(
-    null,
+  const { run: runGenerationSubmit } = usePresentationInteraction(generationSubmitInteraction)
+  const { run: runConversationMutationInteraction } = usePresentationInteraction(
+    conversationMutationInteraction,
+    { observePending: false },
   )
-  const [pendingTreeExitChatId, setPendingTreeExitChatId] = useState<ChatId | null>(null)
-  const committedPresentationFocusRef = useRef<CommittedPresentationFocus | null>(null)
+  const runConversationMutation = useCallback(
+    (
+      intent: ConversationMutationIntent,
+      action: () => Promise<void>,
+    ): ConversationMutationSettlement =>
+      runConversationMutationInteraction({
+        target: conversationMutationTarget(intent),
+        action,
+      }).settled,
+    [runConversationMutationInteraction],
+  )
   const editTreeMode = useUiStore((s) => s.editTreeMode)
   const setEditTreeMode = useUiStore((s) => s.setEditTreeMode)
-  const treeViewChatId = useUiStore((s) => s.treeViewChatId)
-  const setTreeViewChatId = useUiStore((s) => s.setTreeViewChatId)
   const treeExpanded = useUiStore((s) => s.treeExpanded)
-  const treeViewActive = activeChatId !== null && treeViewChatId === activeChatId
-  const setEphemeralActiveChatId = useUiStore((s) => s.setActiveChatId)
-  const focusMode = useUiStore((s) => s.focusMode)
-  const transcriptFocusMode = !isNarrowScreen && focusMode && focusModeAvailable
-  const effectiveFocusMode = !treeViewActive && transcriptFocusMode
+  const conversationSnapshot = useConversationSnapshot()
   const pushBanner = useToastStore((s) => s.pushBanner)
   const pushToast = useToastStore((s) => s.push)
   const clearBannersByKind = useToastStore((s) => s.clearBannersByKind)
-  const activeCursor = useChatStore((s) =>
-    activeChatId ? (s.getCursor(activeChatId) ?? EMPTY_CURSOR) : EMPTY_CURSOR,
-  )
-  const activeNavigationRevision = useChatStore((s) =>
-    activeChatId ? s.getNavigationRevision(activeChatId) : '0',
-  )
-  const activePendingBranchNavigation = useChatStore((s) =>
-    activeChatId ? s.getPendingBranchNavigation(activeChatId) : undefined,
-  )
-  const activeCommittedPathPresentation = useChatStore((s) =>
-    activeChatId ? s.getCommittedPathPresentation(activeChatId) : undefined,
-  )
-  const activeCommittedMessagePresentations = useChatStore((s) =>
-    activeChatId
-      ? s.getCommittedMessagePresentations(activeChatId)
-      : EMPTY_COMMITTED_MESSAGE_RECEIPTS,
-  )
-  const activeCommittedMessagePresentationValues = useMemo(
-    () => activeCommittedMessagePresentations.map(({ presentation }) => presentation),
-    [activeCommittedMessagePresentations],
-  )
-  const committedMessageReceiptIds = useMemo(
-    () =>
-      new Set(
-        activeCommittedMessagePresentations.map(({ presentation }) => presentation.message.id),
-      ),
-    [activeCommittedMessagePresentations],
-  )
-  const committedMessageHeaderById = useMemo(
-    () =>
-      new Map(
-        activeCommittedMessagePresentations.map(({ presentation }) => [
-          presentation.message.id,
-          presentation.header,
-        ]),
-      ),
-    [activeCommittedMessagePresentations],
-  )
-  const committedPathHeaderById = useMemo(
-    () =>
-      new Map(
-        activeCommittedPathPresentation?.structuralHeaders.map((header) => [header.id, header]) ??
-          [],
-      ),
-    [activeCommittedPathPresentation],
-  )
-  const authoritativeHeaderById = useMemo<MessageHeaderLookup>(
-    () => ({
-      get(messageId) {
-        let header = latestTreeHeaderById.get(messageId)
-        header = preferStrictlyNewerHeader(header, committedPathHeaderById.get(messageId))
-        header = preferStrictlyNewerHeader(header, committedMessageHeaderById.get(messageId))
-        return header
-      },
-    }),
-    [committedMessageHeaderById, committedPathHeaderById, latestTreeHeaderById],
-  )
-  const structuralPathHeaders = useMemo(
-    () => activePathProjected(structuralTreeProjection, activeCursor),
-    [activeCursor, structuralTreeProjection],
-  )
-  const navigationHeaderById = useMemo(
-    () => new Map(activeTreeHeaders.map((header) => [header.id, header])),
-    [activeTreeHeaders],
-  )
-  const livePathHeaders = useMemo(
-    () =>
-      structuralPathHeaders.map(
-        (header) => navigationHeaderById.get(header.id) as MessageHeaderRow,
-      ),
-    [navigationHeaderById, structuralPathHeaders],
-  )
-  const pendingLeafIntent =
-    activePendingBranchNavigation?.revision === activeNavigationRevision &&
-    Object.entries(activePendingBranchNavigation.selections).every(
-      ([key, value]) => activeCursor[key] === value,
-    )
-      ? (activePendingBranchNavigation.pathMessageIds.at(-1) ?? null)
+  const activeConversation =
+    activeChatId !== null && conversationSnapshot.active?.chatId === activeChatId
+      ? conversationSnapshot.active
       : null
-  const computedActivePathIntentIds = useMemo(
-    () =>
-      pendingLeafIntent
-        ? (activePendingBranchNavigation?.pathMessageIds ?? [])
-        : livePathHeaders.map((header) => header.id),
-    [activePendingBranchNavigation?.pathMessageIds, livePathHeaders, pendingLeafIntent],
+  const conversationWorkspaceFence = useMemo(
+    () => ({
+      workspaceId: conversationSnapshot.workspaceId ?? '',
+      replacementEpoch: conversationSnapshot.workspaceEpoch,
+    }),
+    [conversationSnapshot.workspaceEpoch, conversationSnapshot.workspaceId],
   )
-  const activePathIntentIds = useStableMessageIdPath(computedActivePathIntentIds)
-  const activePathIntentIdSet = useMemo(() => new Set(activePathIntentIds), [activePathIntentIds])
-  const knownHeaderMessageIds = useMemo(() => {
-    const ids = new Set(structuralTreeHeaders.map((header) => header.id))
-    for (const header of activeCommittedPathPresentation?.structuralHeaders ?? []) {
-      ids.add(header.id)
-    }
-    return ids
-  }, [activeCommittedPathPresentation, structuralTreeHeaders])
-  const selectedPathStreams = useMemo(
-    () =>
-      activeChatStreams.filter((stream) =>
-        isStreamRelevantToSelectedPath(
-          stream,
-          activePathIntentIdSet,
-          knownHeaderMessageIds,
-          activeNavigationRevision,
-          getStreamClientId(),
-        ),
-      ),
-    [activeChatStreams, activeNavigationRevision, activePathIntentIdSet, knownHeaderMessageIds],
-  )
-  const selectedPathStreamActive = selectedPathStreams.length > 0
-  const newestSelectedPathStream = useMemo(
-    () => mostRecentlyAdmittedStream(selectedPathStreams),
-    [selectedPathStreams],
-  )
-  const pendingLocalGenerationStream = useMemo(
-    () =>
-      mostRecentlyAdmittedStream(
-        activeChatStreams.filter(
-          (stream) =>
-            stream.attemptKind === 'generation' &&
-            streamOriginatesFromTabNavigation(
-              stream,
-              activeNavigationRevision,
-              getStreamClientId(),
-            ) &&
-            (stream.messageId === undefined || !knownHeaderMessageIds.has(stream.messageId)),
-        ),
-      ),
-    [activeChatStreams, activeNavigationRevision, knownHeaderMessageIds],
-  )
-  const branchIntentIdentityRef = useRef<{
-    chatId: ChatId | null
-    pathMessageIds: readonly MessageId[]
-    serial: number
-    key: string | null
-  }>({ chatId: null, pathMessageIds: [], serial: 0, key: null })
-  if (
-    branchIntentIdentityRef.current.chatId !== activeChatId ||
-    branchIntentIdentityRef.current.pathMessageIds !== activePathIntentIds
-  ) {
-    const serial = branchIntentIdentityRef.current.serial + 1
-    branchIntentIdentityRef.current = {
-      chatId: activeChatId,
-      pathMessageIds: activePathIntentIds,
-      serial,
-      key:
-        activeChatId && activePathIntentIds.length > 0
-          ? `${activeChatId}:branch-intent:${serial}`
-          : null,
-    }
-  }
-  const activeBranchIntentKey = branchIntentIdentityRef.current.key
-  useLayoutEffect(() => {
-    const pending = activePendingBranchNavigation
-    if (!activeChatId || !pending) return
-    if (pending.revision !== activeNavigationRevision) return
-    const pendingLeaf = pending.pathMessageIds.at(-1)
-    if (!pendingLeaf || !latestTreeHeaderById.has(pendingLeaf)) return
-    useChatStore.getState().acknowledgePendingBranchNavigation(activeChatId, pending)
-  }, [activeChatId, activeNavigationRevision, activePendingBranchNavigation, latestTreeHeaderById])
+  const activePresentation = activeConversation?.presentation ?? null
+  const visibleConversationSurface = activePresentation?.painted?.binding.surface ?? null
+  const displayedConversationSurface =
+    visibleConversationSurface ?? activePresentation?.request.surface ?? 'transcript'
+  const treeViewActive = displayedConversationSurface === 'tree'
+  const treeViewRequested = activePresentation?.request.surface === 'tree'
+  if (treeViewRequested) preloadBranchTreeView()
+  const focusMode = useUiStore((s) => s.focusMode)
+  const transcriptFocusMode = !isNarrowScreen && focusMode && focusModeAvailable
+  const effectiveFocusMode = !treeViewActive && transcriptFocusMode
   useEffect(() => {
     if (treeViewActive && editTreeMode) setEditTreeMode(false)
   }, [editTreeMode, setEditTreeMode, treeViewActive])
-  useLayoutEffect(() => {
-    const receiptFocus = activeChatId
-      ? useChatStore.getState().beginCommittedPresentationFocus(activeChatId)
-      : null
-    committedPresentationFocusRef.current = receiptFocus
-    setEphemeralActiveChatId(activeChatId)
-    return () => {
-      if (receiptFocus) {
-        if (committedPresentationFocusRef.current === receiptFocus) {
-          committedPresentationFocusRef.current = null
-        }
-        useChatStore.getState().endCommittedPresentationFocus(receiptFocus)
-      }
-      if (useUiStore.getState().activeChatId === activeChatId) {
-        setEphemeralActiveChatId(null)
-      }
-    }
-  }, [activeChatId, setEphemeralActiveChatId])
-  // Keep a single active chat-row subscription. Expensive body loading is
-  // handled by the message-window query below, not by draft/token observers.
-  const activeChatRow = useRepositoryQuery(
-    JSON.stringify(['chat', activeChatId]),
-    async () => (activeChatId ? await getChat(activeChatId) : undefined),
-    undefined,
-    chatRowDependencies(activeChatId),
-  )
-  const chatSnapshotCacheRef = useRef(new LruMap<ChatId, Chat>(CHAT_SNAPSHOT_CACHE_MAX_ENTRIES))
+  const lastProjectionFailureRef = useRef<string | null>(null)
   useEffect(() => {
-    if (!activeChatRow) return
-    chatSnapshotCacheRef.current.set(activeChatRow.id, activeChatRow)
-  }, [activeChatRow])
-  useEffect(
-    () =>
-      onEvent((event) => {
-        if (event.kind === 'chat-deleted') {
-          chatSnapshotCacheRef.current.delete(event.chatId)
-          useChatStore.getState().clearCursor(event.chatId)
-        } else if (event.kind === 'workspace-replaced') {
-          chatSnapshotCacheRef.current.clear()
-          useChatStore.getState().resetForWorkspaceReplacement()
-        }
-      }),
-    [],
-  )
-  const resolvedActiveChatRow =
-    activeChatRow ?? (activeChatId ? chatSnapshotCacheRef.current.get(activeChatId) : undefined)
-  const globalPreferencesQuery = useRepositoryQueryState(
-    'global-preferences',
-    readGlobalPreferences,
-    DEFAULT_GLOBAL_PREFERENCES,
-    GLOBAL_PREFERENCES_DEPENDENCIES,
-  )
-  if (globalPreferencesQuery.status === 'error') throw globalPreferencesQuery.error
-  const loadedPrefs =
-    globalPreferencesQuery.status === 'ready' ? globalPreferencesQuery.value : undefined
-  const prefs = globalPreferencesQuery.value
-  const [messageBodyWindow, setMessageBodyWindow] = useState({
-    intentKey: '__none__',
-    baseSize: DEFAULT_GLOBAL_PREFERENCES.messageRenderWindowSize,
-    limit: DEFAULT_GLOBAL_PREFERENCES.messageRenderWindowSize,
+    const failure = activeConversation?.failure
+    if (!failure) return
+    const failureKey = `${activeConversation.chatId}:${failure.kind}:${failure.code}:${failure.key}:${failure.observationRevision}`
+    if (lastProjectionFailureRef.current === failureKey) return
+    lastProjectionFailureRef.current = failureKey
+    pushToast({ level: 'danger', text: `Chat view failed to refresh: ${failure.message}` })
+  }, [activeConversation, pushToast])
+  const lastPresentationFailureRef = useRef<string | null>(null)
+  useEffect(() => {
+    const target = activePresentation?.target
+    if (!activePresentation || target?.kind !== 'failed') return
+    const key = `${activeConversation?.chatId ?? ''}:${activePresentation.request.revision}:${target.surface}:${target.blocker}:${target.message}`
+    if (lastPresentationFailureRef.current === key) return
+    lastPresentationFailureRef.current = key
+    pushToast({
+      level: 'danger',
+      text: `Conversation ${target.surface} failed to load: ${target.message}`,
+    })
+  }, [activeConversation?.chatId, activePresentation, pushToast])
+  const resolvedActiveChatRow = activeConversation?.chat
+    ? configurationController.projectChatConfiguration(activeConversation.chat)
+    : undefined
+  const configurationPreferences = useConfigurationPreferences()
+  const loadedPrefs = configurationPreferences?.global
+  const prefs = loadedPrefs ?? DEFAULT_GLOBAL_PREFERENCES
+  const transcriptMounted = activePresentation?.mounted.transcript ?? !treeViewActive
+  const treeMounted = activePresentation?.mounted.tree ?? treeViewRequested
+  const {
+    visibleBinding,
+    paintedChat,
+    transcriptBinding,
+    treeBinding,
+    activePath,
+    activeBranchTailId,
+    treeStreams,
+    selectedPathStreamActive,
+    newestTranscriptStream,
+    newestSelectedPathStream,
+    composerStream,
+    keyboardStopAttempt,
+    transcriptPresentationOnly,
+    activeTranscriptExists,
+    activeRevealRequest,
+    acknowledgeActiveRevealRequest,
+    urlPinnedTargetPending,
+    transcriptLoadFailed,
+    loadOlderMessageWindow,
+  } = useActiveBranchFrame({
+    activeChatId,
+    frame: activeConversation,
+    workspaceFence: conversationWorkspaceFence,
+    ...(route.kind === 'chat' && route.pinnedMessageId !== undefined
+      ? { pinnedMessageId: route.pinnedMessageId }
+      : {}),
+    initialTranscriptWorkScale: prefs.messageInitialRenderWork,
   })
-  const activeChatHasTranscript = resolvedActiveChatRow?.lastUpdatedLeafId != null
-  const messageBodyWindowKey = activeBranchIntentKey ?? '__none__'
-  const defaultMessageBodyWindowLimit = Math.max(1, prefs.messageRenderWindowSize)
-  const effectiveMessageBodyWindowLimit =
-    messageBodyWindow.intentKey === messageBodyWindowKey &&
-    messageBodyWindow.baseSize === defaultMessageBodyWindowLimit
-      ? messageBodyWindow.limit
-      : defaultMessageBodyWindowLimit
-  useLayoutEffect(() => {
-    if (!activeChatId) return
-    const store = useChatStore.getState()
-    store.setCommittedPresentationWindowLimit(activeChatId, effectiveMessageBodyWindowLimit)
-    return () => {
-      store.clearCommittedPresentationWindowLimit(activeChatId, effectiveMessageBodyWindowLimit)
-    }
-  }, [activeChatId, effectiveMessageBodyWindowLimit])
-  const alternateViewsRetained = retainedAlternateViewsChatId === activeChatId
-  const activeBranchWindowQueryKey =
-    activeBranchIntentKey && (!treeViewActive || selectedPathStreamActive || alternateViewsRetained)
-      ? JSON.stringify([activeBranchIntentKey, effectiveMessageBodyWindowLimit])
-      : null
-  const activeBodyWindowIntentIds = activePathIntentIds.slice(-effectiveMessageBodyWindowLimit)
-  const activeBranchWindowResult = useRepositoryPresentationQuery(
-    JSON.stringify(['active-branch-window', activeChatId, activeBranchWindowQueryKey]),
-    async (signal): Promise<ActiveBranchPageSnapshotResult | null> => {
-      const intentKey = activeBranchIntentKey
-      if (!activeChatId || !activeBranchWindowQueryKey || !intentKey) return null
-      const readEpoch = activeBranchWindowReadEpoch
-      const result = await loadKnownBranchPageSnapshot(activeChatId, activePathIntentIds, {
-        offset: -1,
-        limit: effectiveMessageBodyWindowLimit,
-        signal,
-      })
-      return { key: activeBranchWindowQueryKey, intentKey, readEpoch, result }
-    },
-    null as ActiveBranchPageSnapshotResult | null,
-    activeBranchWindowQueryKey
-      ? [...primaryKeys('messageBodies', ...activeBodyWindowIntentIds)]
-      : [],
-  )
-  const readyActiveBranchPage =
-    activeBranchWindowResult?.key === activeBranchWindowQueryKey &&
-    activeBranchWindowResult.intentKey === activeBranchIntentKey &&
-    activeBranchWindowResult.readEpoch === activeBranchWindowReadEpoch &&
-    activeBranchWindowResult.result.kind === 'ready'
-      ? activeBranchWindowResult.result.snapshot
-      : null
-  const readyActiveBranchSnapshot = useMemo(
-    () =>
-      activeChatId && readyActiveBranchPage
-        ? composeKnownBranchPage(
-            activeChatId,
-            activePathIntentIds,
-            pendingLeafIntent ? null : livePathHeaders,
-            authoritativeHeaderById,
-            readyActiveBranchPage,
-          )
-        : null,
-    [
-      activeChatId,
-      activePathIntentIds,
-      authoritativeHeaderById,
-      livePathHeaders,
-      pendingLeafIntent,
-      readyActiveBranchPage,
-    ],
-  )
-  const branchSnapshotCacheRef = useRef(new Map<string, ActiveBranchWindowSnapshot>())
-  const lastBranchSnapshotByChatRef = useRef(new Map<ChatId, LastBranchSnapshot>())
-  useEffect(
-    () =>
-      onEvent((event, delivery) => {
-        if (event.kind !== 'workspace-replaced') return
-        invalidateActiveBranchWindowReads()
-        branchSnapshotCacheRef.current.clear()
-        lastBranchSnapshotByChatRef.current.clear()
-        invalidateRepositoryQueriesForWorkspaceReplacement()
-        refreshRouteForWorkspaceReplacement(delivery)
-      }),
-    [],
-  )
+  const catalogTab = useCatalogTab()
+  const resolvedPaintedChatRow = paintedChat
+    ? catalogChatPresentation(
+        catalogTab,
+        configurationController.projectChatConfiguration(paintedChat),
+      )
+    : undefined
   useEffect(() => {
-    if (!activeChatId) {
-      branchSnapshotCacheRef.current.clear()
-      lastBranchSnapshotByChatRef.current.clear()
-      return
-    }
-    branchSnapshotCacheRef.current.clear()
-    lastBranchSnapshotByChatRef.current.clear()
-    setPendingTreeExitChatId(null)
-  }, [activeChatId])
+    if (paintedChat) catalogApplication.tab.observeChatRows([paintedChat])
+  }, [paintedChat])
+  const visiblePresentationOnly =
+    visibleBinding === null ||
+    visibleBinding.currency !== 'current' ||
+    visibleBinding.seal.chatId !== activeChatId
   useEffect(() => {
     if (!treeViewActive) return
     setTreeInsertTarget(null)
   }, [treeViewActive])
-  useEffect(() => {
-    if (!activeBranchWindowResult || !readyActiveBranchSnapshot) return
-    branchSnapshotCacheRef.current.clear()
-    branchSnapshotCacheRef.current.set(activeBranchWindowResult.key, readyActiveBranchSnapshot)
-    lastBranchSnapshotByChatRef.current.clear()
-    lastBranchSnapshotByChatRef.current.set(readyActiveBranchSnapshot.chatId, {
-      intentKey: activeBranchWindowResult.intentKey,
-      snapshot: readyActiveBranchSnapshot,
-    })
-  }, [activeBranchWindowResult, readyActiveBranchSnapshot])
-  const activePathIntentTailId = activePathIntentIds.at(-1) ?? null
-  const knownActivePathSnapshot = readyActiveBranchSnapshot
-  const authoritativeTreeHeaders = useMemo(() => {
-    let headers = activeTreeHeaders
-    if (
-      knownActivePathSnapshot &&
-      activePathIntentTailId &&
-      !headers.some((header) => header.id === activePathIntentTailId)
-    ) {
-      headers = overlayKnownPathHeaders(headers, knownActivePathSnapshot.branchHeaders)
-    }
-    return overlayCommittedPathHeaders(headers, activeCommittedPathPresentation)
-  }, [
-    activeCommittedPathPresentation,
-    activePathIntentTailId,
-    activeTreeHeaders,
-    knownActivePathSnapshot,
-  ])
-  const authoritativeStructuralTreeHeaders = useStableStructuralHeaders(
-    authoritativeTreeHeaders,
-    activeTreeHeaders,
-    structuralTreeHeaders,
-  )
-  const topologyHeaderById = useMemo(
-    () =>
-      authoritativeTreeHeaders === activeTreeHeaders
-        ? navigationHeaderById
-        : new Map(authoritativeTreeHeaders.map((header) => [header.id, header])),
-    [activeTreeHeaders, authoritativeTreeHeaders, navigationHeaderById],
-  )
-  const authoritativeStructuralTreeProjection = useMemo(
-    () =>
-      authoritativeStructuralTreeHeaders === structuralTreeHeaders
-        ? structuralTreeProjection
-        : createMessageTreeProjection(authoritativeStructuralTreeHeaders),
-    [authoritativeStructuralTreeHeaders, structuralTreeHeaders, structuralTreeProjection],
-  )
-  const authoritativeStructuralPathHeaders = useMemo(
-    () =>
-      authoritativeStructuralTreeProjection === structuralTreeProjection
-        ? structuralPathHeaders
-        : activePathProjected(authoritativeStructuralTreeProjection, activeCursor),
-    [
-      activeCursor,
-      authoritativeStructuralTreeProjection,
-      structuralPathHeaders,
-      structuralTreeProjection,
-    ],
-  )
-  const authoritativePathHeaders = useMemo(
-    () =>
-      authoritativeStructuralPathHeaders.map(
-        (header) => topologyHeaderById.get(header.id) as MessageHeaderRow,
-      ),
-    [authoritativeStructuralPathHeaders, topologyHeaderById],
-  )
-  const urlPinnedTargetPending =
-    route.kind === 'chat' &&
-    route.pinnedMessageId !== undefined &&
-    !authoritativePathHeaders.some((header) => header.id === route.pinnedMessageId)
-  const queryBranchSnapshot = readyActiveBranchSnapshot
-  const cachedBranchSnapshot = activeBranchWindowQueryKey
-    ? (branchSnapshotCacheRef.current.get(activeBranchWindowQueryKey) ?? null)
-    : null
-  const matchingCachedSnapshot = useMemo(
-    () =>
-      !queryBranchSnapshot && cachedBranchSnapshot
-        ? rebaseBranchSnapshot(cachedBranchSnapshot, authoritativePathHeaders)
-        : null,
-    [authoritativePathHeaders, cachedBranchSnapshot, queryBranchSnapshot],
-  )
-  const reactiveBranchSnapshot = queryBranchSnapshot ?? matchingCachedSnapshot
-  const lastActiveBranchSnapshot = activeChatId
-    ? lastBranchSnapshotByChatRef.current.get(activeChatId)
-    : undefined
-  const matchingLoadedWindowSnapshot = useMemo(
-    () =>
-      !reactiveBranchSnapshot && lastActiveBranchSnapshot?.intentKey === activeBranchIntentKey
-        ? rebaseBranchSnapshot(lastActiveBranchSnapshot.snapshot, authoritativePathHeaders)
-        : null,
-    [
-      activeBranchIntentKey,
-      authoritativePathHeaders,
-      lastActiveBranchSnapshot,
-      reactiveBranchSnapshot,
-    ],
-  )
-  const repositoryBranchSnapshot = reactiveBranchSnapshot ?? matchingLoadedWindowSnapshot
-  const committedReceiptMatchesActivePath =
-    activeCommittedPathPresentation !== undefined &&
-    activeCommittedPathPresentation.chatId === activeChatId &&
-    activeCommittedPathPresentation.pathHeaders.length === authoritativePathHeaders.length &&
-    activeCommittedPathPresentation.pathHeaders.every(
-      (header, index) =>
-        header.id === authoritativePathHeaders[index]?.id &&
-        sameHeaderStructure(header, authoritativePathHeaders[index]),
-    )
-  const committedEmptyPath =
-    committedReceiptMatchesActivePath && activeCommittedPathPresentation.pathHeaders.length === 0
-  const committedPathWindow = useMemo(
-    () =>
-      activeCommittedPathPresentation && committedReceiptMatchesActivePath
-        ? composeCommittedPathWindow(
-            activeCommittedPathPresentation,
-            activeCommittedMessagePresentationValues,
-            authoritativePathHeaders,
-            authoritativeHeaderById,
-            reactiveBranchSnapshot ?? lastActiveBranchSnapshot?.snapshot ?? null,
-            effectiveMessageBodyWindowLimit,
-          )
-        : null,
-    [
-      activeCommittedPathPresentation,
-      activeCommittedMessagePresentationValues,
-      authoritativeHeaderById,
-      authoritativePathHeaders,
-      committedReceiptMatchesActivePath,
-      effectiveMessageBodyWindowLimit,
-      lastActiveBranchSnapshot,
-      reactiveBranchSnapshot,
-    ],
-  )
-  const repositoryCaughtCommittedReceipt =
-    activeCommittedPathPresentation !== undefined &&
-    repositorySnapshotDominatesReceipt(
-      repositoryBranchSnapshot,
-      activeCommittedPathPresentation,
-      effectiveMessageBodyWindowLimit,
-    )
-  const exactActiveBranchSnapshot =
-    activeCommittedPathPresentation &&
-    committedReceiptMatchesActivePath &&
-    !repositoryCaughtCommittedReceipt
-      ? (committedPathWindow ?? repositoryBranchSnapshot)
-      : (repositoryBranchSnapshot ?? committedPathWindow)
-  const committedReceiptPathContradicted =
-    activeCommittedPathPresentation !== undefined &&
-    repositoryPathContradictsReceipt(latestTreeHeaderById, activeCommittedPathPresentation)
-  const committedReceiptObserved =
-    activeCommittedPathPresentation?.phase === 'terminal' &&
-    repositoryHeadersResolveReceipt(latestTreeHeaderById, activeCommittedPathPresentation) &&
-    (repositoryCaughtCommittedReceipt || committedReceiptPathContradicted)
-  useLayoutEffect(() => {
-    const receipt = activeCommittedPathPresentation
-    if (!activeChatId || !receipt || !committedReceiptObserved) return
-    useChatStore.getState().acknowledgeCommittedPathPresentation(activeChatId, receipt)
-  }, [activeChatId, activeCommittedPathPresentation, committedReceiptObserved])
-  const observedCommittedMessageReceipts = useMemo(() => {
-    const pathIndexById = new Map<MessageId, number>()
-    repositoryBranchSnapshot?.branchHeaders.forEach((header, index) => {
-      pathIndexById.set(header.id, index)
-    })
-    return activeCommittedMessagePresentations.filter((receipt) =>
-      repositorySnapshotObservesCommittedMessage(repositoryBranchSnapshot, receipt, pathIndexById),
-    )
-  }, [activeCommittedMessagePresentations, repositoryBranchSnapshot])
-  useEffect(() => {
-    if (!activeChatId || observedCommittedMessageReceipts.length === 0) return
-    useChatStore
-      .getState()
-      .acknowledgeCommittedMessagePresentations(activeChatId, observedCommittedMessageReceipts)
-  }, [activeChatId, observedCommittedMessageReceipts])
-  const retainedActiveBranchSnapshot =
-    !committedEmptyPath &&
-    (!treeViewActive || lastActiveBranchSnapshot?.intentKey === activeBranchIntentKey)
-      ? (lastActiveBranchSnapshot?.snapshot ?? null)
-      : null
-  const resolvedBaseBranchSnapshot = exactActiveBranchSnapshot ?? retainedActiveBranchSnapshot
-  const resolvedActiveBranchSnapshot = useVisibleMessageHeaderOverlay(
-    resolvedBaseBranchSnapshot,
-    latestTreeHeaderById,
-    activeChangedHeaderKeys,
-    activeChangedHeaders,
-    activeCommittedMessagePresentations,
-  )
-  const workspaceRepository = getWorkspaceRepository()
-  const treePresentationSnapshots = useMemo<
-    ReadonlyMap<MessageId, MessagePresentationSnapshot> | undefined
-  >(() => {
-    const snapshots = new Map<MessageId, MessagePresentationSnapshot>()
-    if (resolvedActiveBranchSnapshot) {
-      for (let index = 0; index < resolvedActiveBranchSnapshot.branchWindow.length; index += 1) {
-        const message = resolvedActiveBranchSnapshot.branchWindow[index]
-        const header =
-          resolvedActiveBranchSnapshot.branchHeaders[
-            resolvedActiveBranchSnapshot.windowOffset + index
-          ]
-        if (message && header?.id === message.id) {
-          snapshots.set(message.id, { message, bodyVersion: header.bodyVersion })
-        }
-      }
-    }
-    for (const presentation of activeCommittedPathPresentation?.presentations ?? []) {
-      const authoritativeHeader = authoritativeHeaderById.get(presentation.message.id)
-      if (
-        !authoritativeHeader ||
-        authoritativeHeader.bodyVersion !== presentation.bodyVersion ||
-        authoritativeHeader.chatId !== presentation.header.chatId
-      ) {
-        continue
-      }
-      snapshots.set(presentation.message.id, {
-        message: overlayCanonicalMessageHeader(presentation.message, authoritativeHeader),
-        bodyVersion: presentation.bodyVersion,
-      })
-    }
-    for (const receipt of activeCommittedMessagePresentations) {
-      addExactMessagePresentationSnapshot(snapshots, receipt, authoritativeHeaderById)
-    }
-    return snapshots.size > 0 ? snapshots : undefined
-  }, [
-    activeCommittedMessagePresentations,
-    activeCommittedPathPresentation,
-    authoritativeHeaderById,
-    resolvedActiveBranchSnapshot,
-  ])
-  const acknowledgeVerifiedTreePresentation = useCallback(
-    (messageId: MessageId, snapshot: MessagePresentationSnapshot) => {
-      if (!activeChatId || snapshot.message.id !== messageId) return
-      const store = useChatStore.getState()
-      const receipt = store.getCommittedMessagePresentation(activeChatId, messageId)
-      if (!receipt) return
-      const { message } = snapshot
-      const expected = receipt.presentation.header
-      const sameStructure =
-        message.chatId === expected.chatId &&
-        message.parentId === expected.parentId &&
-        message.siblingIndex === expected.siblingIndex &&
-        message.deleted === expected.deleted
-      if (
-        message.chatId === activeChatId &&
-        message.nodeVersion >= expected.nodeVersion &&
-        snapshot.bodyVersion >= receipt.presentation.bodyVersion &&
-        (sameStructure || message.nodeVersion > expected.nodeVersion)
-      ) {
-        store.acknowledgeCommittedMessagePresentation(activeChatId, receipt)
-      }
-    },
-    [activeChatId],
-  )
-  const focusTreePresentationReceipt = useCallback((messageId: MessageId | null) => {
-    const focus = committedPresentationFocusRef.current
-    if (!focus) return
-    useChatStore.getState().setCommittedPresentationFocusMessage(focus, messageId)
-  }, [])
-  const retainedPresentationMatchesActiveStructure =
-    exactActiveBranchSnapshot === null &&
-    resolvedActiveBranchSnapshot !== null &&
-    branchSnapshotMatchesStructure(resolvedActiveBranchSnapshot, authoritativePathHeaders)
-  const activeBranchTailId = pendingLeafIntent ?? authoritativePathHeaders.at(-1)?.id ?? null
-  const activeBranchTailStream = useMemo(
-    () => activeChatStreams.find((stream) => stream.messageId === activeBranchTailId),
-    [activeBranchTailId, activeChatStreams],
-  )
-  const composerStream = activeBranchTailStream ?? pendingLocalGenerationStream
-  const composerStreaming = composerStream !== undefined
-  const keyboardAbortStream = composerStream ?? newestSelectedPathStream
-  const retainedPresentationIsExactStreamingPath =
-    !urlPinnedTargetPending &&
-    retainedPresentationMatchesActiveStructure &&
-    selectedPathStreamActive
-  const transcriptPresentationOnly =
-    urlPinnedTargetPending ||
-    (exactActiveBranchSnapshot === null &&
-      retainedActiveBranchSnapshot !== null &&
-      !retainedPresentationIsExactStreamingPath)
-  const transcriptReadyForTreeExit =
-    exactActiveBranchSnapshot !== null || retainedPresentationIsExactStreamingPath
-  useEffect(() => {
-    if (
-      !activeChatId ||
-      pendingTreeExitChatId !== activeChatId ||
-      !treeViewActive ||
-      !transcriptReadyForTreeExit
-    ) {
-      return
-    }
-    setPendingTreeExitChatId(null)
-    setTreeViewChatId(null)
-  }, [
-    activeChatId,
-    pendingTreeExitChatId,
-    setTreeViewChatId,
-    transcriptReadyForTreeExit,
-    treeViewActive,
-  ])
   useEffect(() => {
     if (urlPinnedTargetPending) {
       setImportAtEndOpen(false)
@@ -1562,174 +514,121 @@ export function Shell() {
     }
     if (!treeViewActive && transcriptPresentationOnly) setImportAtEndOpen(false)
   }, [transcriptPresentationOnly, treeViewActive, urlPinnedTargetPending])
-  const activeBranchLength = authoritativePathHeaders.length
-  const activeTranscriptExists =
-    !committedEmptyPath &&
-    (activeBranchTailId !== null ||
-      activeChatHasTranscript ||
-      (resolvedActiveBranchSnapshot?.branchLength ?? 0) > 0)
-  const loadOlderMessageWindow = useCallback(() => {
-    const nextLimit = Math.max(defaultMessageBodyWindowLimit, effectiveMessageBodyWindowLimit * 2)
-    setMessageBodyWindow({
-      intentKey: messageBodyWindowKey,
-      baseSize: defaultMessageBodyWindowLimit,
-      limit: activeBranchLength > 0 ? Math.min(activeBranchLength, nextLimit) : nextLimit,
-    })
+  // One catalog projection supplies the same live-plus-bundled rows to every
+  // model, capability and privacy consumer on this surface.
+  const configurationTarget =
+    configurationSession.frame.target.kind === 'new-chat' ||
+    configurationSession.frame.target.kind === 'chat'
+      ? configurationSession.frame.target
+      : null
+  const attemptTargetAdmission = useAttemptTargetAdmissionFrame(activeChatId)
+  const generationCapabilityFrame =
+    generationCapabilityController.captureFrame(attemptTargetAdmission)
+  const connectionGenerationCapability = generationCapabilityFrame.capability(
+    configurationTarget?.kind === 'new-chat' ? { kind: 'new-chat-send' } : null,
+  )
+  const activeSendCapability = generationCapabilityFrame.capability(
+    activeChatId
+      ? { kind: 'send', chatId: activeChatId, expectedLeafId: activeBranchTailId }
+      : null,
+  )
+  const targetProfileId = configurationTarget?.profileId ?? null
+  const selectedCatalogProfile =
+    currentActiveConfigurationSelection(configurationSession.frame)?.value.profile ?? null
+  const activeProfileForModelList =
+    selectedCatalogProfile?.id === targetProfileId ? selectedCatalogProfile : undefined
+  const activeModelCatalog = useModelCatalog(configurationTarget, activeProfileForModelList, {
+    modelsDemanded: chatModelOpen,
+  })
+  const activeEndpoints = activeModelCatalog.routing
+  const activeCapabilityPresentation = activeEndpoints.capabilityPresentation
+  const activeCapability = activeCapabilityPresentation.capability
+  const activePrefillPlan = useMemo(() => {
+    if (activeCapabilityPresentation.retained) {
+      return activeCapabilityPresentation.effectiveRouting?.prefillPlan ?? PREFILL_UNAVAILABLE_PLAN
+    }
+    const profile = activeProfileForModelList
+    const settings = resolvedActiveChatRow?.settings
+    if (!profile || !settings) return PREFILL_UNAVAILABLE_PLAN
+    const contextFacts = activePath
+      ? mergeMessageContextRouteFacts(
+          activePath
+            .materializeNodes()
+            .filter((header) => !header.deleted && header.hiddenFromContext !== true)
+            .map((header) => header.contextRouteFacts),
+        )
+      : EMPTY_MESSAGE_CONTEXT_ROUTE_FACTS
+    const routing = activeEndpoints.effectiveRouting
+    if (!routing) return PREFILL_UNAVAILABLE_PLAN
+    return rebaseEffectiveEndpointRouting(routing, contextFacts).prefillPlan
   }, [
-    activeBranchLength,
-    defaultMessageBodyWindowLimit,
-    effectiveMessageBodyWindowLimit,
-    messageBodyWindowKey,
+    activeEndpoints.effectiveRouting,
+    activePath,
+    activeCapabilityPresentation.effectiveRouting,
+    activeCapabilityPresentation.retained,
+    activeProfileForModelList,
+    resolvedActiveChatRow?.settings,
   ])
-  const activeEndpoints = useEndpoints(
-    resolvedActiveChatRow?.settings.profileId ?? null,
-    resolvedActiveChatRow?.settings.model || null,
-    { strict: resolvedActiveChatRow?.settings.strictProviderRouting === true },
-  )
-  const activeCapability = activeEndpoints.capability
-  // Keep the chat's model coherent with its connection. If a profile switch
-  // cleared a model, first try to select the equivalent model from the new
-  // connection's /models list. Fresh no-model chats still get the old
-  // single-model convenience fallback.
-  //
-  // `useModels` powers both the fetch and read halves so this code sees the
-  // same merged direct-provider list as ModelPicker. That matters for direct
-  // Anthropic/Google, whose live /models rows can be sparse or unavailable
-  // while bundled capability rows are still valid picker choices.
-  const activeProfileId = resolvedActiveChatRow?.settings.profileId ?? null
-  const activeProfileForModelList = useRepositoryQuery(
-    JSON.stringify(['profile', activeProfileId]),
-    () => (activeProfileId ? getProfile(activeProfileId) : Promise.resolve(undefined)),
-    undefined,
-    primaryKeys('profiles', activeProfileId),
-  )
-  const autoSelectModelsQuery =
-    activeProfileForModelList?.kind === 'openrouter'
-      ? MODEL_AUTOSELECT_QUERY
-      : DIRECT_MODEL_AUTOSELECT_QUERY
-  const autoSelectModels = useModels(activeProfileId, {
-    query: autoSelectModelsQuery,
-    enabled: !!resolvedActiveChatRow && !!activeProfileForModelList,
-  })
-  const previousActiveProfileStateRef = useRef<ActiveProfileState | null>(null)
-  const pendingProfileSwitchRef = useRef<ActiveProfileState | null>(null)
-  useEffect(() => {
-    if (!resolvedActiveChatRow) return
-    const activeProfileState: ActiveProfileState = {
-      chatId: resolvedActiveChatRow.id,
-      profileId: resolvedActiveChatRow.settings.profileId,
-    }
-    const previousProfileState = previousActiveProfileStateRef.current
-    if (
-      previousProfileState &&
-      previousProfileState.chatId === activeProfileState.chatId &&
-      previousProfileState.profileId !== activeProfileState.profileId
-    ) {
-      pendingProfileSwitchRef.current = activeProfileState
-    }
-    previousActiveProfileStateRef.current = activeProfileState
-    if (!activeProfileForModelList) return
-    if (activeProfileId !== resolvedActiveChatRow.settings.profileId) return
-    if (activeProfileForModelList.id !== activeProfileId) return
-    const pendingProfileSwitch = pendingProfileSwitchRef.current
-    const shouldReconcileExistingModel =
-      pendingProfileSwitch?.chatId === activeProfileState.chatId &&
-      pendingProfileSwitch.profileId === activeProfileState.profileId
-    const rows = autoSelectModels.models
-    if (resolvedActiveChatRow.settings.model) {
-      if (!shouldReconcileExistingModel) return
-      if (rows.length === 0) return
-      const equivalentModelId = pickEquivalentModelId(resolvedActiveChatRow.settings.model, rows)
-      const normalizedEquivalentModelId = equivalentModelId
-        ? (forceEquivalentModelIdForConnection(equivalentModelId, activeProfileForModelList.kind) ??
-          equivalentModelId)
-        : null
-      const nextModel = normalizedEquivalentModelId
-        ? normalizedEquivalentModelId === resolvedActiveChatRow.settings.model
-          ? null
-          : normalizedEquivalentModelId
-        : modelLooksForeignForProfile(
-              activeProfileForModelList.kind,
-              resolvedActiveChatRow.settings.model,
-            )
-          ? ''
-          : null
-      if (nextModel === null) {
-        pendingProfileSwitchRef.current = null
-        return
-      }
-      pendingProfileSwitchRef.current = null
-      void (async () => {
-        const latest = await getChat(resolvedActiveChatRow.id)
-        if (!latest) return
-        if (latest.settings.profileId !== resolvedActiveChatRow.settings.profileId) return
-        if (latest.settings.model !== resolvedActiveChatRow.settings.model) return
-        await updateChatSettings(resolvedActiveChatRow.id, { model: nextModel })
-      })()
-      return
-    }
-    pendingProfileSwitchRef.current = null
-    if (resolvedActiveChatRow.presetId) return
-    if (rows.length !== 1) return
-    const only = rows[0]
-    if (!only) return
-    void (async () => {
-      // Re-read through the store layer (not getDb directly) so this lookup
-      // migrates cleanly to the daemon WorkspaceRepository — whichever backend
-      // is wired up, getChat() returns the same Chat shape.
-      const latest = await getChat(resolvedActiveChatRow.id)
-      if (!latest || latest.settings.model) return
-      if (latest.settings.profileId !== resolvedActiveChatRow.settings.profileId) return
-      await updateChatSettings(resolvedActiveChatRow.id, { model: only.id })
-    })()
-  }, [resolvedActiveChatRow, activeProfileId, activeProfileForModelList, autoSelectModels.models])
-  const activePathHeaders = authoritativePathHeaders
-  const sidebarSortMode = useRepositoryQuery(
-    'sidebar-sort-mode',
-    readSidebarSortMode,
-    DEFAULT_SIDEBAR_SORT_MODE,
-    primaryKeys('settings', SIDEBAR_SORT_SETTING_KEY),
-  )
-  const trailingLeaf = useMemo(() => activePathHeaders.at(-1) ?? null, [activePathHeaders])
+  const sidebarSortMode = configurationPreferences?.sidebarSortMode ?? DEFAULT_SIDEBAR_SORT_MODE
+  const trailingLeaf = activePath?.leaf ?? null
   const trailingUserMessage = trailingLeaf?.role === 'user' ? trailingLeaf : null
-  const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() => {
-    if (typeof window === 'undefined') return false
-    return window.localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY) === '1'
-  })
+  const trailingReplyCapability = generationCapabilityFrame.capability(
+    activeChatId && trailingUserMessage
+      ? { kind: 'reply', chatId: activeChatId, parentUserId: trailingUserMessage.id }
+      : null,
+  )
+  const sidebarCollapsed = configurationSession.ui.sidebarCollapsed
+  const updateSidebarCollapsed = useCallback((collapsed: boolean) => {
+    configurationController.setSidebarCollapsed(collapsed)
+    void writeSidebarCollapsed(collapsed).catch((error: unknown) => {
+      console.error('Failed to save sidebar preference', error)
+    })
+  }, [])
   const scrollRef = useRef<ScrollRegionHandle>(null)
+  useLayoutEffect(() => {
+    void treeViewActive
+    if (!activeChatId) return
+    return conversationController.installViewportPort({
+      chatId: activeChatId,
+      prepare: (transition) =>
+        scrollRef.current?.prepareLayoutChange(transition) ?? { kind: 'unavailable' },
+    })
+  }, [activeChatId, treeViewActive])
   const activeComposerDraftKey = activeChatId
     ? `chat:${activeChatId}`
     : onNewChatSurface
       ? 'new'
       : null
-  const abortStream = useCallback(
-    (streamId: string) => {
-      if (!requestAbortForStream(streamId)) {
-        pushToast({ level: 'warning', text: 'That stream is no longer active.' })
-      }
+  const requestStop = useCallback(
+    (capability: RequestableAttemptStopCapability) => {
+      const request = requestAttemptStop(capability)
+      void request.completed.catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : 'Unknown error'
+        pushToast({ level: 'danger', text: `Stop failed: ${message}` })
+      })
     },
     [pushToast],
   )
-  const composerStreamId = composerStream?.streamId
-  const abortComposerStream = useCallback(() => {
-    if (composerStreamId) abortStream(composerStreamId)
-  }, [abortStream, composerStreamId])
-  const keyboardAbortStreamId = keyboardAbortStream?.streamId
-  const abortKeyboardStream = useCallback(() => {
-    if (keyboardAbortStreamId) abortStream(keyboardAbortStreamId)
-  }, [abortStream, keyboardAbortStreamId])
-  const selectedPathFollowKey = newestSelectedPathStream
-    ? `${newestSelectedPathStream.streamId}:${newestSelectedPathStream.messageId ?? ''}`
-    : activeBranchTailId
-  const selectedPathFollowClaimKey =
-    newestSelectedPathStream &&
-    streamOriginatesFromTabNavigation(
-      newestSelectedPathStream,
-      activeNavigationRevision,
-      getStreamClientId(),
-    )
-      ? newestSelectedPathStream.streamId
-      : null
+  const composerStopCapability = useMemo(
+    () => attemptStopCapability(composerStream),
+    [composerStream],
+  )
+  const keyboardStopCapability = useMemo(
+    () => attemptStopCapability(keyboardStopAttempt),
+    [keyboardStopAttempt],
+  )
+  const requestKeyboardStop = useCallback(() => {
+    if (keyboardStopCapability?.kind === 'requestable') requestStop(keyboardStopCapability)
+  }, [keyboardStopCapability, requestStop])
+  const selectedPathFollowKey = newestTranscriptStream
+    ? `${newestTranscriptStream.streamId}:${newestTranscriptStream.messageId}`
+    : null
+  const selectedPathFollowTargetMessageId =
+    newestTranscriptStream?.messageId ?? transcriptBinding?.seal.leafId ?? null
+  const selectedPathRevealClaimKey = activeRevealRequest?.revision ?? null
+  const acknowledgeSelectedPathRevealClaim = useCallback(() => {
+    if (activeRevealRequest) acknowledgeActiveRevealRequest(activeRevealRequest)
+  }, [acknowledgeActiveRevealRequest, activeRevealRequest])
 
   useEffect(() => {
     if (activeStorageRoute && chatModelOpen) setChatModelOpen(false)
@@ -1746,312 +645,69 @@ export function Shell() {
     setMobileSidebarOpen(false)
   }, [activeSurfaceKey])
 
-  useEffect(() => {
-    installStreamLeaseListener()
-  }, [])
-
-  useEffect(() => {
-    let stopped = false
-    let timer: number | null = null
-    let running: Promise<void> | null = null
-    let scheduled = false
-    type QueueEntry = { point: OrphanRecoveryPoint; remoteEvidence: boolean }
-    const pointForStream = (stream: ReturnType<typeof recoveryPendingStreams>[number]) => ({
-      chatId: stream.chatId,
-      streamId: stream.streamId,
-      ...(stream.messageId ? { messageId: stream.messageId } : {}),
-      ...(stream.attemptKind ? { attemptKind: stream.attemptKind } : {}),
-      replacementEpoch: stream.replacementEpoch,
-      ...(stream.recoveryOutcome ? { outcome: stream.recoveryOutcome } : {}),
-    })
-    const queued = new Map<string, QueueEntry>()
-    const retries = new Map<string, QueueEntry>()
-    const enqueue = (entry: QueueEntry) => {
-      queued.set(entry.point.streamId, entry)
-      retries.delete(entry.point.streamId)
-      scheduleRun()
-    }
-    for (const stream of recoveryPendingStreams()) {
-      queued.set(stream.streamId, { point: pointForStream(stream), remoteEvidence: false })
-    }
-
-    const scheduleRetry = () => {
-      if (stopped || timer !== null || retries.size === 0) return
-      timer = window.setTimeout(() => {
-        timer = null
-        for (const [streamId, entry] of retries) {
-          if (entry.remoteEvidence || isRecoveryPendingStream(streamId)) {
-            queued.set(streamId, entry)
-          }
-        }
-        retries.clear()
-        scheduleRun()
-      }, ORPHAN_RECOVERY_FAILURE_RETRY_MS)
-    }
-    const perform = async () => {
-      const entries = [...queued.values()]
-      queued.clear()
-      if (entries.length === 0) return
-      const now = Date.now()
-      await Promise.all(
-        entries.map(async (entry) => {
-          try {
-            const result = await recoverStreamOrphan(entry.point, now)
-            if (result === 'retry') {
-              retries.set(entry.point.streamId, entry)
-            }
-          } catch {
-            retries.set(entry.point.streamId, entry)
-          }
-        }),
-      )
-      scheduleRetry()
-    }
-    const run = () => {
-      scheduled = false
-      if (stopped || running || queued.size === 0) return
-      running = perform().finally(() => {
-        running = null
-        if (queued.size > 0) scheduleRun()
-      })
-    }
-    const scheduleRun = () => {
-      if (stopped || scheduled || running || queued.size === 0) return
-      scheduled = true
-      queueMicrotask(run)
-    }
-    const stopPending = subscribeRecoveryPendingStreams((stream) => {
-      enqueue({ point: pointForStream(stream), remoteEvidence: false })
-    })
-    const stopExpiry = onRemoteStreamLeasesExpired((leases) => {
-      for (const lease of leases) {
-        enqueue({
-          point: {
-            chatId: lease.chatId,
-            streamId: lease.streamId,
-            ...(lease.messageId ? { messageId: lease.messageId } : {}),
-            ...(lease.attemptKind ? { attemptKind: lease.attemptKind } : {}),
-            ...(lease.replacementEpoch !== undefined
-              ? { replacementEpoch: lease.replacementEpoch }
-              : {}),
-            outcome: 'abort',
-          },
-          remoteEvidence: true,
-        })
-      }
-    })
-    const stopOwnershipRelease = onAnyRemoteStreamOwnershipReleased((released) => {
-      const active = useStreamStore.getState().getActive(released.streamId)
-      const messageId = released.messageId ?? active?.messageId
-      const attemptKind = released.attemptKind ?? active?.attemptKind
-      const replacementEpoch = released.replacementEpoch ?? active?.replacementEpoch
-      enqueue({
-        point: {
-          chatId: released.chatId,
-          streamId: released.streamId,
-          ...(messageId ? { messageId } : {}),
-          ...(attemptKind ? { attemptKind } : {}),
-          ...(replacementEpoch !== undefined ? { replacementEpoch } : {}),
-          outcome: 'abort',
-        },
-        remoteEvidence: true,
-      })
-    })
-    scheduleRun()
-    return () => {
-      stopped = true
-      stopPending()
-      stopExpiry()
-      stopOwnershipRelease()
-      if (timer !== null) window.clearTimeout(timer)
-    }
-  }, [])
-
   const previousActiveChatIdRef = useRef<ChatId | null>(activeChatId)
   useEffect(() => {
     const previous = previousActiveChatIdRef.current
     previousActiveChatIdRef.current = activeChatId
     if (!previous || previous === activeChatId) return
-    void discardEmptyDraftChat(previous).catch((error: unknown) => {
-      if (isPageHidingAbortError(error)) return
+    const controller = new AbortController()
+    void discardEmptyDraftChat(previous, { signal: controller.signal }).catch((error: unknown) => {
+      if (controller.signal.aborted || isPageHidingAbortError(error)) return
       console.error('Failed to discard empty draft chat', error)
     })
-  }, [activeChatId])
-
-  useEffect(() => {
-    if (onNewChatSurface) return
-    void discardEmptyDraftChats({ exceptChatId: activeChatId }).catch((error: unknown) => {
-      if (isPageHidingAbortError(error)) return
-      console.error('Failed to discard stale empty draft chats', error)
-    })
-  }, [activeChatId, onNewChatSurface])
-
-  useEffect(() => {
-    if (!activeChatId) return
-    let stopped = false
-    let timer: number | null = null
-    let running: Promise<void> | null = null
-    let rerun = false
-
-    const schedule = (deadline: number) => {
-      if (stopped) return
-      if (timer !== null) window.clearTimeout(timer)
-      timer = window.setTimeout(run, Math.max(1, deadline - Date.now()))
-    }
-    const perform = async () => {
-      try {
-        await recoverOrphans(Date.now(), activeChatId)
-        const next = await nextOrphanRecoveryAt(activeChatId)
-        if (next !== null) schedule(next)
-      } catch {
-        schedule(Date.now() + ORPHAN_RECOVERY_FAILURE_RETRY_MS)
-      }
-    }
-    const run = () => {
-      if (stopped) return
-      if (running) {
-        rerun = true
-        return
-      }
-      if (timer !== null) window.clearTimeout(timer)
-      timer = null
-      running = perform().finally(() => {
-        running = null
-        if (!rerun) return
-        rerun = false
-        run()
-      })
-    }
-    run()
-    return () => {
-      stopped = true
-      if (timer !== null) window.clearTimeout(timer)
-    }
+    return () => controller.abort()
   }, [activeChatId])
 
   useEffect(() => {
     if (!activeChatId) return
-    void touchLastViewed(activeChatId).catch((error: unknown) => {
-      if (isPageHidingAbortError(error)) return
-      console.error('Failed to update chat viewed timestamp', error)
-    })
+    const controller = new AbortController()
+    void touchLastViewed(activeChatId, Date.now(), { signal: controller.signal }).catch(
+      (error: unknown) => {
+        if (controller.signal.aborted || isPageHidingAbortError(error)) return
+        console.error('Failed to update chat viewed timestamp', error)
+      },
+    )
+    return () => controller.abort()
   }, [activeChatId])
 
-  const lastSeedSignatureRef = useRef<string>('')
-
-  useEffect(() => {
-    if (!resolvedActiveChatRow) return
-    const nextSeed = {
-      profileId: resolvedActiveChatRow.settings.profileId || null,
-      presetId: resolvedActiveChatRow.presetId ?? null,
-      settings: resolvedActiveChatRow.settings,
-    }
-    const signature = JSON.stringify({
-      presetId: nextSeed.presetId,
-      settings: nextSeed.settings,
-    })
-    if (signature === lastSeedSignatureRef.current) return
-    lastSeedSignatureRef.current = signature
-    writeActiveSeedState(nextSeed)
-  }, [resolvedActiveChatRow])
-
-  const resolveNewChatSeed = useCallback(async () => {
-    const remembered = readActiveSeedState()
-    const rememberedProfileId = remembered.settings?.profileId || remembered.profileId
-    const rememberedProfile = rememberedProfileId
-      ? await getProfile(rememberedProfileId)
-      : undefined
-    if (remembered.settings && rememberedProfile) {
-      const preset = remembered.presetId ? await getPreset(remembered.presetId) : undefined
-      return {
-        preset,
-        settings: withProfileApiDefaults(structuredClone(remembered.settings), rememberedProfile),
-      }
-    }
-    const preset = await pickPreferredPreset({
-      presetId: remembered.presetId,
-      profileId: rememberedProfile ? rememberedProfile.id : null,
-    })
-    const settings = seedSettingsForNewChat(preset?.settings, rememberedProfile ?? null)
-    return {
-      preset,
-      settings,
-    }
-  }, [])
-
-  const openingNewChatSettingsRef = useRef<Promise<void> | null>(null)
-  const openingNewChatSettingsRouteIntentRef = useRef<RouteIntent | null>(null)
-  const openSettingsForNewChat = useCallback(async () => {
+  const openingNewChatSettingsRef = useRef<{
+    readonly intent: ReturnType<typeof beginRouteIntent>
+    readonly task: Promise<void>
+  } | null>(null)
+  const openSettingsForNewChat = useCallback((): Promise<void> => {
+    const pending = openingNewChatSettingsRef.current
+    if (pending && isRouteIntentCurrent(pending.intent)) return pending.task
     const routeIntent = beginRouteIntent()
-    openingNewChatSettingsRouteIntentRef.current = routeIntent
-    if (openingNewChatSettingsRef.current) {
+    const task = (async () => {
       try {
-        await openingNewChatSettingsRef.current
+        const materialized = await materializeTemporaryNewChat(routeIntentOwner(routeIntent))
+        if (!materialized) return
+        if (navigateToChatForIntent(routeIntent, materialized.chatId, materialized.routeHandoff)) {
+          moveComposerDraft('new', `chat:${materialized.chatId}`)
+          setChatModelOpen(true)
+        }
       } finally {
         cancelRouteIntent(routeIntent)
-        if (openingNewChatSettingsRouteIntentRef.current === routeIntent) {
-          openingNewChatSettingsRouteIntentRef.current = null
+        if (openingNewChatSettingsRef.current?.intent === routeIntent) {
+          openingNewChatSettingsRef.current = null
         }
       }
-      return
-    }
-    const task = (async () => {
-      const { preset, settings } = await resolveNewChatSeed()
-      const routeIntent = openingNewChatSettingsRouteIntentRef.current
-      if (!routeIntent || !isRouteIntentCurrent(routeIntent)) return
-      writeActiveSeedState({
-        profileId: settings.profileId || null,
-        presetId: preset?.id ?? null,
-        settings,
-      })
-      const chat = await createChat({
-        settings,
-        temporary: true,
-        ...(preset ? { presetId: preset.id } : {}),
-      })
-      const latestRouteIntent = openingNewChatSettingsRouteIntentRef.current
-      if (latestRouteIntent && navigateForIntent(latestRouteIntent, chatHref(chat.id))) {
-        moveComposerDraft('new', `chat:${chat.id}`)
-        setChatModelOpen(true)
-      }
     })()
-    openingNewChatSettingsRef.current = task
-    try {
-      await task
-    } finally {
-      cancelRouteIntent(routeIntent)
-      if (openingNewChatSettingsRef.current === task) {
-        openingNewChatSettingsRef.current = null
-      }
-      if (openingNewChatSettingsRouteIntentRef.current === routeIntent) {
-        openingNewChatSettingsRouteIntentRef.current = null
-      }
-    }
-  }, [resolveNewChatSeed])
+    openingNewChatSettingsRef.current = Object.freeze({ intent: routeIntent, task })
+    return task
+  }, [])
 
   const openNewChat = useCallback(() => {
+    if (route.kind !== 'new') navigateNew()
     if (chatModelOpen) {
       void openSettingsForNewChat()
       return
     }
-    navigateNew()
-  }, [chatModelOpen, openSettingsForNewChat])
+    if (route.kind === 'new') navigateNew()
+  }, [chatModelOpen, openSettingsForNewChat, route.kind])
 
-  const handleNewChatClick = useCallback(
-    (event: MouseEvent<HTMLAnchorElement>) => {
-      if (
-        event.defaultPrevented ||
-        event.button !== 0 ||
-        event.metaKey ||
-        event.ctrlKey ||
-        event.shiftKey ||
-        event.altKey
-      ) {
-        return
-      }
-      event.preventDefault()
-      openNewChat()
-    },
+  const handleNewChatClick = useMemo(
+    () => makeAnchorClickHandler(newChatHref(), () => openNewChat()),
     [openNewChat],
   )
 
@@ -2074,18 +730,19 @@ export function Shell() {
   useEffect(() => {
     let active = true
     let cleanup = () => {}
-    void getWorkspaceRepository()
-      .getWorkspaceMeta()
+    const controller = new AbortController()
+    void readWorkspaceMeta({ signal: controller.signal })
       .then((meta) => {
         if (!active || meta.backendKind !== 'browser-idb') return
         cleanup = installPersistenceRequestOnFirstInteraction()
       })
       .catch((error: unknown) => {
-        if (isPageHidingAbortError(error)) return
+        if (controller.signal.aborted || isPageHidingAbortError(error)) return
         console.error('Failed to inspect workspace backend for persistence request', error)
       })
     return () => {
       active = false
+      controller.abort()
       cleanup()
     }
   }, [])
@@ -2094,21 +751,12 @@ export function Shell() {
   // in particular, navigating to /new or between chats shouldn't auto-
   // collapse the settings pane the user explicitly opened.
 
-  useEffect(() => {
-    if (typeof window === 'undefined') return
-    window.localStorage.setItem(SIDEBAR_COLLAPSED_STORAGE_KEY, sidebarCollapsed ? '1' : '0')
-  }, [sidebarCollapsed])
-
   // Chat-not-found banner: if the route refers to a chat id that doesn't
   // resolve (deleted, never existed, or pasted from another workspace),
   // surface the banner per §10.13.1 Route table. Reactive storage invalidation guarantees
   // re-evaluation when the chats table changes.
-  const routedChatExists = useRepositoryQuery(
-    JSON.stringify(['chat-exists', activeChatId]),
-    () => (activeChatId ? getChat(activeChatId).then((c) => !!c) : Promise.resolve(true)),
-    true,
-    chatRowDependencies(activeChatId),
-  )
+  const routedChatExists =
+    !activeChatId || !activeConversation || activeConversation.destination.kind !== 'missing'
   useEffect(() => {
     clearBannersByKind('chat-not-found')
     if (!activeChatId) return
@@ -2124,19 +772,7 @@ export function Shell() {
     })
   }, [activeChatId, routedChatExists, pushBanner, clearBannersByKind])
 
-  const failSend = useCallback(
-    (message: string, err?: unknown): never => {
-      console.error(message, err)
-      pushToast({ level: 'danger', text: message.replace(/^send: /, 'Send failed: ') })
-      throw err instanceof Error ? err : new Error(message)
-    },
-    [pushToast],
-  )
-
-  const activePrefillClass = resolvedActiveChatRow?.settings.model
-    ? prefillClassFor(resolvedActiveChatRow.settings.model)
-    : null
-  const showPrefillButton = activePrefillClass !== null && activePrefillClass !== 'unsupported'
+  const showPrefillButton = activePrefillPlan.availability !== 'unsupported'
   const activeDefaultPrefill = resolvedActiveChatRow?.settings.defaultPrefill ?? ''
   const attachmentsDisabledForActiveChat = resolvedActiveChatRow
     ? attachmentsDisabledByTextProtocol(resolvedActiveChatRow.settings)
@@ -2145,185 +781,117 @@ export function Shell() {
     setComposerDroppedFiles((current) => (current?.id === id ? null : current))
   }, [])
 
+  const ownGenerationSubmission = useCallback(
+    (action: (signal: AbortSignal) => Promise<void>): ComposerSubmission => {
+      const claim = runGenerationSubmit({
+        target: 'composer',
+        action: ({ signal }) => action(signal),
+      })
+      const completion = (async (): Promise<ComposerSubmissionOutcome> => {
+        const outcome = await claim.settled
+        switch (outcome.kind) {
+          case 'succeeded':
+            return Object.freeze({ kind: 'prepared' })
+          case 'failed':
+          case 'superseded':
+          case 'rejected-pending':
+          case 'cancelled':
+            return Object.freeze({ kind: 'not-prepared', reason: outcome.kind })
+        }
+      })()
+      return Object.freeze({ kind: 'started', completion })
+    },
+    [runGenerationSubmit],
+  )
+
   const handleSubmit = useCallback(
-    async (
+    (
       text: string,
       opts?: { prefillText?: string; attachmentRefs?: MessageAttachmentRef[] },
-    ) => {
-      preloadMessageList()
-      if (!activeChatId) return failSend('send: no active chat')
-      const chatStore = useChatStore.getState()
-      const navigationIntent = chatStore.beginNavigationIntent(activeChatId)
-      const committedPathProducer = chatStore.registerCommittedPathProducer(
-        activeChatId,
-        navigationIntent,
-      )
-      if (!committedPathProducer) return failSend('send: navigation was superseded')
-      try {
-        const chat = await getChat(activeChatId)
-        if (!chat) return failSend('send: chat row missing', { chatId: activeChatId })
-        if (!chat.settings.profileId) {
-          return failSend(
-            'send: chat.settings.profileId is empty — create the chat from a seeded preset',
+    ): ComposerSubmission => {
+      if (!activeChatId) throw new Error('SendActiveChatMissing')
+      const prefillText = opts?.prefillText ?? ''
+      return ownGenerationSubmission(async (signal) => {
+        const admission = generationCapabilityController.claimSelectedSend(activeChatId)
+        let admissionTransferred = false
+        try {
+          const conversationActions = await loadConversationActions()
+          const handlePromise = conversationActions.sendSelectedMessageWhenCapabilitySettles(
+            activeChatId,
+            [{ type: 'text', text }],
+            signal,
+            {
+              admission,
+              ...(opts?.attachmentRefs ? { attachmentRefs: opts.attachmentRefs } : {}),
+              ...(prefillText.length > 0
+                ? { prefillContent: [{ type: 'text', text: prefillText }] }
+                : {}),
+            },
           )
-        }
-        if (!chat.settings.model) {
-          return failSend('send: chat.settings.model is empty — no model selected')
-        }
-        const profile = await getProfile(chat.settings.profileId)
-        if (!profile) {
-          return failSend('send: connection profile missing', {
-            profileId: chat.settings.profileId,
-          })
-        }
-        let apiKeyCandidates: Awaited<ReturnType<typeof resolveConnectionRuntimeKeys>>
-        try {
-          apiKeyCandidates = await resolveConnectionRuntimeKeys(profile, { chatId: activeChatId })
-        } catch (err) {
-          return failSend('send: resolveKey failed', err)
-        }
-        try {
-          const prefillText = opts?.prefillText ?? ''
-          const result = await send({
-            chatId: activeChatId,
-            navigationIntent,
-            committedPathProducer,
-            expectedLeafId: activeBranchTailId,
-            connection: profile,
-            apiKey: '',
-            apiKeyCandidates,
-            content: [{ type: 'text', text }],
-            ...(opts?.attachmentRefs ? { attachmentRefs: opts.attachmentRefs } : {}),
-            ...(prefillText.length > 0
-              ? { prefillContent: [{ type: 'text', text: prefillText }] }
-              : {}),
-          })
-          if (result.outcome !== 'done') {
-            console.info('send: stream ended with outcome', result.outcome, result.error?.kind)
+          admissionTransferred = true
+          const handle = await handlePromise
+          preloadMessageList()
+          await handle.prepared
+        } finally {
+          if (!admissionTransferred) {
+            generationCapabilityController.cancelSelectedSend(admission)
           }
-          if (chat.temporary) await markChatPermanent(activeChatId)
-        } catch (err) {
-          if (isPageHidingAbortError(err)) return
-          return failSend('send: pipeline threw', err)
         }
-        await bumpProfileLastUsedAt(profile.id)
-        if (chat.presetId) await bumpPresetLastUsedAt(chat.presetId)
-        await bumpRecentModel(chat.settings.model)
-      } finally {
-        chatStore.sealCommittedPathProducer(activeChatId, committedPathProducer)
-      }
+      })
     },
-    [activeBranchTailId, activeChatId, failSend, send],
+    [activeChatId, ownGenerationSubmission],
   )
 
   const handleNewChatSubmit = useCallback(
-    async (
+    (
       text: string,
       opts?: { prefillText?: string; attachmentRefs?: MessageAttachmentRef[] },
-    ) => {
-      const routeIntent = beginRouteIntent()
-      try {
-        preloadMessageList()
-        const { preset, settings } = await resolveNewChatSeed()
-        if (!settings.profileId) {
-          return failSend('send: chat.settings.profileId is empty — no profile selected')
-        }
-        if (!settings.model) {
-          return failSend('send: chat.settings.model is empty — no model selected')
-        }
-        const profile = await getProfile(settings.profileId)
-        if (!profile) {
-          return failSend('send: connection profile missing', { profileId: settings.profileId })
-        }
-        let apiKeyCandidates: Awaited<ReturnType<typeof resolveConnectionRuntimeKeys>>
+    ): ComposerSubmission => {
+      const prefillText = opts?.prefillText ?? ''
+      return ownGenerationSubmission(async (signal) => {
+        const routeIntent = beginRouteIntent()
         try {
-          apiKeyCandidates = await resolveConnectionRuntimeKeys(profile)
-        } catch (err) {
-          return failSend('send: resolveKey failed', err)
-        }
-        writeActiveSeedState({
-          profileId: settings.profileId || null,
-          presetId: preset?.id ?? null,
-          settings,
-        })
-        const chat = await createChat({
-          settings,
-          temporary: true,
-          ...(preset ? { presetId: preset.id } : {}),
-        })
-        const navigationIntent = navigateToChatForIntent(routeIntent, chat.id)
-        const committedPathProducer = navigationIntent
-          ? useChatStore.getState().registerCommittedPathProducer(chat.id, navigationIntent)
-          : null
-        try {
-          const prefillText = opts?.prefillText ?? ''
-          const result = await send({
-            chatId: chat.id,
-            navigationIntent,
-            committedPathProducer,
-            expectedLeafId: null,
-            connection: profile,
-            apiKey: '',
-            apiKeyCandidates,
-            content: [{ type: 'text', text }],
-            ...(opts?.attachmentRefs ? { attachmentRefs: opts.attachmentRefs } : {}),
-            ...(prefillText.length > 0
-              ? { prefillContent: [{ type: 'text', text: prefillText }] }
-              : {}),
-          })
-          if (result.outcome !== 'done') {
-            console.info('send: stream ended with outcome', result.outcome, result.error?.kind)
+          const conversationActions = await loadConversationActions()
+          const handle = await conversationActions.sendNewChatWhenCapabilitySettles(
+            [{ type: 'text', text }],
+            routeIntentOwner(routeIntent),
+            signal,
+            {
+              ...(opts?.attachmentRefs ? { attachmentRefs: opts.attachmentRefs } : {}),
+              ...(prefillText.length > 0
+                ? { prefillContent: [{ type: 'text', text: prefillText }] }
+                : {}),
+            },
+          )
+          const prepared = await handle.prepared
+          if (prepared.kind === 'handoff') {
+            navigateToChatForIntent(routeIntent, prepared.chatId, prepared.handoff)
           }
-          await markChatPermanent(chat.id)
-        } catch (err) {
-          if (isPageHidingAbortError(err)) return
-          return failSend('send: pipeline threw', err)
+        } finally {
+          cancelRouteIntent(routeIntent)
         }
-        await bumpProfileLastUsedAt(profile.id)
-        if (chat.presetId) await bumpPresetLastUsedAt(chat.presetId)
-        await bumpRecentModel(chat.settings.model)
-      } finally {
-        cancelRouteIntent(routeIntent)
-      }
+      })
     },
-    [failSend, resolveNewChatSeed, send],
+    [ownGenerationSubmission],
   )
 
-  const handleReplyToTrailingUser = useCallback(async () => {
-    if (!activeChatId || !trailingUserMessage) return
-    const chatStore = useChatStore.getState()
-    const navigationIntent = chatStore.beginNavigationIntent(activeChatId)
-    const committedPathProducer = chatStore.registerCommittedPathProducer(
-      activeChatId,
-      navigationIntent,
-    )
-    if (!committedPathProducer) return
-    try {
-      const chat = await getChat(activeChatId)
-      if (!chat) return
-      const profile = await getProfile(chat.settings.profileId)
-      if (!profile) return
-      const apiKeyCandidates = await resolveConnectionRuntimeKeys(profile, {
-        chatId: activeChatId,
+  const handleReplyToTrailingUser = useCallback((): ComposerSubmission => {
+    if (!activeChatId || !trailingUserMessage) {
+      return Object.freeze({
+        kind: 'not-started',
+        capability: pendingGenerationCapability('prompt-path'),
       })
-      await sendFrom({
-        chatId: activeChatId,
-        navigationIntent,
-        committedPathProducer,
-        connection: profile,
-        apiKey: '',
-        apiKeyCandidates,
-        parentMessageId: trailingUserMessage.id,
-      })
-      await bumpProfileLastUsedAt(profile.id)
-      if (chat.presetId) await bumpPresetLastUsedAt(chat.presetId)
-    } catch (err) {
-      if (isPageHidingAbortError(err)) return
-      console.error('reply-to-trailing failed', err)
-    } finally {
-      chatStore.sealCommittedPathProducer(activeChatId, committedPathProducer)
     }
-  }, [activeChatId, sendFrom, trailingUserMessage])
+    return ownGenerationSubmission(async (signal) => {
+      const conversationActions = await loadConversationActions()
+      const handle = await conversationActions.replyToMessageWhenCapabilitySettles(
+        activeChatId,
+        trailingUserMessage.id,
+        signal,
+      )
+      await handle.prepared
+    })
+  }, [activeChatId, ownGenerationSubmission, trailingUserMessage])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -2338,9 +906,13 @@ export function Shell() {
         e.preventDefault()
         setGlobalSettingsOpen((v) => !v)
       }
-      if (e.key === '.' && (e.metaKey || e.ctrlKey) && keyboardAbortStreamId) {
+      if (
+        e.key === '.' &&
+        (e.metaKey || e.ctrlKey) &&
+        keyboardStopCapability?.kind === 'requestable'
+      ) {
         e.preventDefault()
-        abortKeyboardStream()
+        requestKeyboardStop()
       }
       // Edit-tree mode toggle (§10.14). Works globally; scoped by chat only
       // because the mode visually affects rows — the store field itself is
@@ -2376,8 +948,8 @@ export function Shell() {
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [
-    abortKeyboardStream,
-    keyboardAbortStreamId,
+    requestKeyboardStop,
+    keyboardStopCapability,
     activeChatId,
     setEditTreeMode,
     openNewChat,
@@ -2396,33 +968,31 @@ export function Shell() {
     setMobileSidebarOpen(false)
     setChatModelOpen(false)
   }, [])
-  const treeHeaderById = authoritativeHeaderById
+  const treeHeaderById = treeBinding?.headers ?? null
+  const treeProjection = treeBinding?.topology ?? null
+  const treeStreamTargetIds = useMemo(() => {
+    const ids = new Set<MessageId>()
+    for (const attempt of treeStreams) {
+      if (attempt.messageId) ids.add(attempt.messageId)
+    }
+    return ids
+  }, [treeStreams])
   const activateTreeNode = useCallback(
-    (messageId: MessageId) => {
-      if (!activeChatId) return
+    (messageId: MessageId, observedTipId?: MessageId) => {
+      if (!activeChatId || !treeHeaderById) return
       const header = treeHeaderById.get(messageId)
       if (!header || header.deleted) return
-      const current = useChatStore.getState().getCursor(activeChatId) ?? {}
-      const patch = seedCursorAtMessageProjected(
-        authoritativeStructuralTreeProjection,
-        messageId,
-        current,
-        { preserveDescendantPins: false },
-      )
-      useChatStore.getState().navigateWithCursorPatch(activeChatId, patch)
+      navigateConversationMessage(activeChatId, messageId, observedTipId)
       announceTreeBranchOpened(header.role)
     },
-    [activeChatId, authoritativeStructuralTreeProjection, treeHeaderById],
+    [activeChatId, treeHeaderById],
   )
   const insertAtSharedTreeTrunk = useCallback(
     (parentId: MessageId | null) => {
-      if (!activeChatId) return
-      const childStreaming = authoritativeTreeHeaders.some(
-        (header) =>
-          !header.deleted &&
-          header.parentId === parentId &&
-          useStreamStore.getState().isTargetActive(activeChatId, header.id),
-      )
+      if (!activeChatId || !treeHeaderById || !treeProjection) return
+      const childStreaming = (treeProjection.liveByParent.get(parentId) ?? []).some((header) => {
+        return treeStreamTargetIds.has(header.id)
+      })
       if (childStreaming) {
         pushToast({ level: 'info', text: 'Wait for the connected generation to finish.' })
         return
@@ -2434,14 +1004,14 @@ export function Shell() {
         defaultRole: parent ? oppositeRole(parent.role) : 'user',
       })
     },
-    [activeChatId, authoritativeTreeHeaders, pushToast, treeHeaderById],
+    [activeChatId, pushToast, treeHeaderById, treeProjection, treeStreamTargetIds],
   )
   const insertAtTreeChildLeg = useCallback(
     (childId: MessageId) => {
-      if (!activeChatId) return
+      if (!activeChatId || !treeHeaderById) return
       const child = treeHeaderById.get(childId)
       if (!child || child.deleted) return
-      if (useStreamStore.getState().isTargetActive(activeChatId, childId)) {
+      if (treeStreamTargetIds.has(childId)) {
         pushToast({ level: 'info', text: 'Wait for this generation to finish.' })
         return
       }
@@ -2451,18 +1021,16 @@ export function Shell() {
         defaultRole: oppositeRole(child.role),
       })
     },
-    [activeChatId, pushToast, treeHeaderById],
+    [activeChatId, pushToast, treeHeaderById, treeStreamTargetIds],
   )
   const insertAfterTreeLeaf = useCallback(
     (messageId: MessageId) => {
-      if (!activeChatId) return
+      if (!activeChatId || !treeHeaderById || !treeProjection) return
       const leaf = treeHeaderById.get(messageId)
       if (!leaf || leaf.deleted) return
-      const hasLiveChild = authoritativeTreeHeaders.some(
-        (header) => !header.deleted && header.parentId === messageId,
-      )
+      const hasLiveChild = (treeProjection.liveByParent.get(messageId)?.length ?? 0) > 0
       if (hasLiveChild) return
-      if (useStreamStore.getState().isTargetActive(activeChatId, messageId)) {
+      if (treeStreamTargetIds.has(messageId)) {
         pushToast({ level: 'info', text: 'Wait for this generation to finish.' })
         return
       }
@@ -2472,331 +1040,99 @@ export function Shell() {
         defaultRole: oppositeRole(leaf.role),
       })
     },
-    [activeChatId, authoritativeTreeHeaders, pushToast, treeHeaderById],
+    [activeChatId, pushToast, treeHeaderById, treeProjection, treeStreamTargetIds],
   )
   const editTreeMessage = useCallback(
-    async (message: Message, text: string) => {
-      if (!activeChatId || message.chatId !== activeChatId) return
-      if (useStreamStore.getState().isTargetActive(activeChatId, message.id)) {
-        throw new Error('Wait for this generation to finish before editing it.')
-      }
-      const { editInPlace } = await import('../hooks/useMessageOps')
-      await editInPlace(activeChatId, message, text, {
-        pathHeaders: authoritativePathHeaders,
-      })
-    },
-    [activeChatId, authoritativePathHeaders],
-  )
-  const beginTreeActionNavigation = useCallback(
-    (messageId: MessageId) => {
-      if (!activeChatId || !authoritativeStructuralTreeProjection.byId.has(messageId)) return null
-      const state = useChatStore.getState()
-      const intent = state.beginNavigationIntent(activeChatId)
-      const committedPathProducer = state.registerCommittedPathProducer(activeChatId, intent)
-      if (!committedPathProducer) return null
-      state.patchCursorForIntent(
-        activeChatId,
-        intent,
-        seedCursorAtMessageProjected(
-          authoritativeStructuralTreeProjection,
-          messageId,
-          state.getCursor(activeChatId) ?? EMPTY_CURSOR,
-          { preserveDescendantPins: false },
-        ),
-      )
-      return { navigationIntent: intent, committedPathProducer }
-    },
-    [activeChatId, authoritativeStructuralTreeProjection],
+    (message: Message, text: string) =>
+      runConversationMutation({ kind: 'edit', chatId: message.chatId, messageId: message.id }, () =>
+        requireConversationActions().editMessage(message.chatId, message, text),
+      ),
+    [runConversationMutation],
   )
   const editAndSendTreeMessage = useCallback(
     (message: Message, text: string) => {
-      if (!activeChatId || message.chatId !== activeChatId || message.role !== 'user') return
-      const navigation = beginTreeActionNavigation(message.id)
-      if (!navigation) return
-      return {
-        navigationRevision: navigation.navigationIntent.revision,
-        completion: (async () => {
-          try {
-            const { editAndResend } = await import('../hooks/useMessageOps')
-            const result = await editAndResend(
-              { chatId: activeChatId, ...navigation, sendFrom },
-              message,
-              text,
-              message.attachmentRefs ? { attachmentRefs: message.attachmentRefs } : {},
-            )
-            return result.assistantMessageId
-          } catch (error) {
-            pushToast({
-              level: 'danger',
-              text: `Send failed: ${error instanceof Error ? error.message : 'unknown error'}`,
-            })
-            throw error
-          } finally {
-            useChatStore
-              .getState()
-              .sealCommittedPathProducer(activeChatId, navigation.committedPathProducer)
-          }
-        })(),
+      if (!activeChatId || message.chatId !== activeChatId || message.role !== 'user') {
+        return PENDING_TREE_GENERATION_START
       }
+      return requireConversationActions().editAndResend(
+        activeChatId,
+        message,
+        text,
+        message.attachmentRefs ? { attachmentRefs: message.attachmentRefs } : {},
+      )
     },
-    [activeChatId, beginTreeActionNavigation, pushToast, sendFrom],
+    [activeChatId],
   )
   const deleteTreeNode = useCallback(
-    async (messageId: MessageId) => {
-      if (!activeChatId) return
-      if (useStreamStore.getState().isTargetActive(activeChatId, messageId)) {
-        pushToast({ level: 'info', text: 'Wait for this generation to finish before deleting it.' })
-        return
-      }
-      const chatStore = useChatStore.getState()
-      const navigationIntent = chatStore.beginNavigationIntent(activeChatId)
-      const committedPathProducer = chatStore.registerCommittedPathProducer(
-        activeChatId,
-        navigationIntent,
-      )
-      if (!committedPathProducer) return
-      const priorCursor = chatStore.getCursor(activeChatId) ?? EMPTY_CURSOR
-      try {
-        const result = await deleteSingleMessage({
-          chatId: activeChatId,
-          messageId,
-          cursor: priorCursor,
-          ...(useUiStore.getState().cascadeDelete ? { cascade: true } : {}),
-        })
-        chatStore.selectCommittedPathForProducer(
-          activeChatId,
-          committedPathProducer,
-          Object.fromEntries(
-            result.selectedPathHeaders.map((header) => [cursorKeyOf(header.parentId), header.id]),
-          ),
-          {
-            phase: 'terminal',
-            pathHeaders: result.selectedPathHeaders,
-            structuralHeaders: result.structuralHeaders,
-            presentations: result.presentations,
-          },
-          structuralEffectsCursorPatch(result.effects),
-        )
-        pushToast({
-          level: 'info',
-          text: 'Deleted message.',
-          undo: async () => {
-            const undoStore = useChatStore.getState()
-            const undoIntent = undoStore.beginNavigationIntent(activeChatId)
-            const undoProducer = undoStore.registerCommittedPathProducer(activeChatId, undoIntent)
-            if (!undoProducer) return
-            const { applyStructuralSnapshot } = await import('../core/undo')
-            try {
-              const restored = await applyStructuralSnapshot(result.preImage, {
-                cursor: priorCursor,
-                presentationWindowLimit: effectiveMessageBodyWindowLimit,
-              })
-              if (!restored) return
-              const state = useChatStore.getState()
-              const selections: Record<string, string> = {}
-              for (const header of restored.selectedPathHeaders) {
-                selections[cursorKeyOf(header.parentId)] = header.id
-              }
-              state.selectCommittedPathForProducer(
-                activeChatId,
-                undoProducer,
-                selections,
-                {
-                  phase: 'terminal',
-                  pathHeaders: restored.selectedPathHeaders,
-                  structuralHeaders: restored.structuralHeaders,
-                  presentations: restored.presentations,
-                },
-                structuralEffectsUndoCursorPatch(priorCursor, result.effects),
-              )
-            } finally {
-              useChatStore.getState().sealCommittedPathProducer(activeChatId, undoProducer)
-            }
-          },
-        })
-      } catch (error) {
-        pushToast({
-          level: 'danger',
-          text: `Delete failed: ${error instanceof Error ? error.message : 'unknown error'}`,
-        })
-      } finally {
-        chatStore.sealCommittedPathProducer(activeChatId, committedPathProducer)
-      }
-    },
-    [activeChatId, effectiveMessageBodyWindowLimit, pushToast],
+    (message: Message) =>
+      runConversationMutation({ kind: 'delete', chatId: message.chatId }, () =>
+        requireConversationActions().deleteMessage(message.chatId, message.id, 'single'),
+      ),
+    [runConversationMutation],
   )
   const regenerateTreeMessage = useCallback(
     (message: Message) => {
-      if (!activeChatId || message.chatId !== activeChatId || message.role !== 'assistant') return
-      const navigation = beginTreeActionNavigation(message.id)
-      if (!navigation) return
-      return {
-        navigationRevision: navigation.navigationIntent.revision,
-        completion: (async () => {
-          try {
-            const { regenerateFromMessage } = await import('../hooks/useMessageOps')
-            const result = await regenerateFromMessage(
-              { chatId: activeChatId, ...navigation, sendFrom },
-              message,
-            )
-            return result.assistantMessageId
-          } catch (error) {
-            pushToast({
-              level: 'danger',
-              text: `Regenerate failed: ${error instanceof Error ? error.message : 'unknown error'}`,
-            })
-            return undefined
-          } finally {
-            useChatStore
-              .getState()
-              .sealCommittedPathProducer(activeChatId, navigation.committedPathProducer)
-          }
-        })(),
+      if (!activeChatId || message.chatId !== activeChatId || message.role !== 'assistant') {
+        return PENDING_TREE_GENERATION_START
       }
+      return requireConversationActions().regenerate(activeChatId, message)
     },
-    [activeChatId, beginTreeActionNavigation, pushToast, sendFrom],
+    [activeChatId],
   )
   const continueTreeMessage = useCallback(
     (message: Message) => {
-      if (!activeChatId || message.chatId !== activeChatId || message.role !== 'assistant') return
-      if (useStreamStore.getState().isTargetActive(activeChatId, message.id)) {
-        pushToast({
-          level: 'info',
-          text: 'Wait for this generation to finish before continuing it.',
-        })
-        return
+      if (!activeChatId || message.chatId !== activeChatId || message.role !== 'assistant') {
+        return PENDING_TREE_GENERATION_START
       }
-      const navigation = beginTreeActionNavigation(message.id)
-      if (!navigation) return
-      return {
-        navigationRevision: navigation.navigationIntent.revision,
-        completion: (async () => {
-          try {
-            const { continueFromMessage } = await import('../hooks/useMessageOps')
-            await continueFromMessage({ chatId: activeChatId, ...navigation, sendFrom }, message)
-            return message.id
-          } catch (error) {
-            pushToast({
-              level: 'danger',
-              text: `Continue failed: ${error instanceof Error ? error.message : 'unknown error'}`,
-            })
-            return undefined
-          } finally {
-            useChatStore
-              .getState()
-              .sealCommittedPathProducer(activeChatId, navigation.committedPathProducer)
-          }
-        })(),
-      }
+      return requireConversationActions().continueMessage(activeChatId, message)
     },
-    [activeChatId, beginTreeActionNavigation, pushToast, sendFrom],
+    [activeChatId],
   )
   const forkTreeMessage = useCallback(
-    async (message: Message) => {
-      if (!activeChatId || message.chatId !== activeChatId) return
-      const routeIntent = beginRouteIntent()
-      try {
-        const { computeBranchTitle, forkChatFromMessage } = await import('../core/chat-fork')
-        const sourceChat = await getChat(activeChatId)
-        if (!sourceChat) throw new Error('Chat not found.')
-        const existing = await listChatSidebarRows()
-        const defaultTitle = computeBranchTitle(
-          sourceChat.title,
-          existing.map((chat) => chat.title),
-        )
-        if (!isRouteIntentCurrent(routeIntent)) return
-        const chosen = window.prompt('Name the new chat:', defaultTitle)
-        if (chosen === null) return
-        const title = chosen.trim() || defaultTitle
-        const result = await forkChatFromMessage({
-          chatId: activeChatId,
-          messageId: message.id,
-          title,
-          cursor: activeCursor,
-        })
-        pushToast({
-          level: 'success',
-          text: `Forked to "${title}" (${result.messageCount} messages).`,
-        })
-        navigateForIntent(routeIntent, chatHref(result.chatId))
-      } catch (error) {
-        pushToast({
-          level: 'danger',
-          text: `Fork failed: ${error instanceof Error ? error.message : 'unknown error'}`,
-        })
-      } finally {
-        cancelRouteIntent(routeIntent)
-      }
-    },
-    [activeChatId, activeCursor, pushToast],
+    (message: Message) =>
+      runConversationMutation({ kind: 'fork', chatId: message.chatId, messageId: message.id }, () =>
+        requireConversationActions().forkMessage(message.chatId, message),
+      ),
+    [runConversationMutation],
   )
   const toggleTreeMessageContextVisibility = useCallback(
-    async (message: Message) => {
-      if (!activeChatId || message.chatId !== activeChatId) return
-      try {
-        const { toggleMessageContextHidden } = await import('../hooks/useMessageOps')
-        await toggleMessageContextHidden(activeChatId, message.id, {
-          pathHeaders: authoritativePathHeaders,
-        })
-      } catch (error) {
-        pushToast({
-          level: 'danger',
-          text: `Context visibility update failed: ${error instanceof Error ? error.message : 'unknown error'}`,
-        })
-      }
-    },
-    [activeChatId, authoritativePathHeaders, pushToast],
+    (message: Message) =>
+      runConversationMutation(
+        { kind: 'context', chatId: message.chatId, messageId: message.id },
+        () => requireConversationActions().toggleContext(message.chatId, message),
+      ),
+    [runConversationMutation],
   )
   const mutateTreeMessageAttachmentRef = useCallback(
-    async (message: Message, mutation: MessageAttachmentRefMutation) => {
-      if (!activeChatId || message.chatId !== activeChatId) return
-      try {
-        const { mutateMessageAttachmentReference } = await import('../hooks/useMessageOps')
-        await mutateMessageAttachmentReference(activeChatId, message.id, mutation, {
-          pathHeaders: authoritativePathHeaders,
-        })
-      } catch (error) {
-        pushToast({
-          level: 'danger',
-          text: `Attachment update failed: ${error instanceof Error ? error.message : 'unknown error'}`,
-        })
-      }
-    },
-    [activeChatId, authoritativePathHeaders, pushToast],
+    (message: Message, mutation: MessageAttachmentRefMutation) =>
+      requireConversationActions().mutateAttachment(message, mutation),
+    [],
   )
   const toggleTreeReasoningDetailHidden = useCallback(
-    async (message: Message, detailIndex: number) => {
-      if (!activeChatId || message.chatId !== activeChatId) return
-      try {
-        const { toggleReasoningDetailHidden } = await import('../hooks/useMessageOps')
-        await toggleReasoningDetailHidden(activeChatId, message.id, detailIndex, {
-          pathHeaders: authoritativePathHeaders,
-        })
-      } catch (error) {
-        pushToast({
-          level: 'danger',
-          text: `Reasoning visibility update failed: ${error instanceof Error ? error.message : 'unknown error'}`,
-        })
-      }
-    },
-    [activeChatId, authoritativePathHeaders, pushToast],
+    (message: Message, member: ReasoningMemberRef) =>
+      runConversationMutation(
+        {
+          kind: 'reasoning',
+          chatId: message.chatId,
+          messageId: message.id,
+          member,
+        },
+        () => requireConversationActions().toggleReasoning(message.chatId, message, member),
+      ),
+    [runConversationMutation],
   )
   const toggleTreeProviderOutputItemHidden = useCallback(
-    async (message: Message, itemIndex: number) => {
-      if (!activeChatId || message.chatId !== activeChatId) return
-      try {
-        const { toggleProviderOutputItemHidden } = await import('../hooks/useMessageOps')
-        await toggleProviderOutputItemHidden(activeChatId, message.id, itemIndex, {
-          pathHeaders: authoritativePathHeaders,
-        })
-      } catch (error) {
-        pushToast({
-          level: 'danger',
-          text: `Tool visibility update failed: ${error instanceof Error ? error.message : 'unknown error'}`,
-        })
-      }
-    },
-    [activeChatId, authoritativePathHeaders, pushToast],
+    (message: Message, member: ProviderOutputMemberRef) =>
+      runConversationMutation(
+        {
+          kind: 'provider-output',
+          chatId: message.chatId,
+          messageId: message.id,
+          member,
+        },
+        () => requireConversationActions().toggleProviderOutput(message.chatId, message, member),
+      ),
+    [runConversationMutation],
   )
   const activeMobileConnectionControl =
     connectionKnown && activeChatId ? (
@@ -2809,10 +1145,113 @@ export function Shell() {
   const newChatMobileConnectionControl = connectionKnown ? (
     <ConnectionHeader variant="mobile-menu" />
   ) : null
+  const unmaterializedChatTitleBar = activeChatId ? null : (
+    <div data-ui="chat-title-bar" {...(onNewChatSurface ? {} : { 'data-mobile-home': true })}>
+      <IconButton
+        type="button"
+        data-ui="icon-button"
+        data-role="mobile-sidebar-toggle"
+        aria-label="Open chats sidebar"
+        aria-expanded={mobileSidebarOpen}
+        title="Chats"
+        onClick={() => setMobileSidebarOpen(true)}
+      >
+        <SidebarIcon size={20} />
+      </IconButton>
+      {onNewChatSurface ? <ConnectionHeader variant="title-icon" /> : null}
+      <span data-ui="chat-title" data-title-status={onNewChatSurface ? 'untitled' : 'manual'}>
+        <span data-ui="chat-title-label">{onNewChatSurface ? 'New chat' : 'natter'}</span>
+      </span>
+      <span data-ui="header-spacer" />
+      <IconButton
+        type="button"
+        data-ui="icon-button"
+        data-role="settings-cog"
+        aria-label="Open chat settings"
+        title="Chat settings"
+        onClick={() => void openSettingsForNewChat()}
+      >
+        <CogIcon size={20} />
+      </IconButton>
+      <MobileNewChatControls connectionControl={newChatMobileConnectionControl} />
+    </div>
+  )
+  const activeComposerProps:
+    | (ComposerProps & {
+        generationCapability: NonNullable<ComposerProps['generationCapability']>
+      })
+    | null = activeChatId
+    ? {
+        onSubmit: handleSubmit,
+        ...(composerStopCapability ? { stopCapability: composerStopCapability } : {}),
+        onRequestStop: requestStop,
+        autoSize: true,
+        ...(transcriptFocusMode ? { autoSizeVariant: 'focus' as const } : {}),
+        autoSizeMeasurementKey: `${prefs.fontFamily}:${prefs.baseFontSize}`,
+        generationCapability: activeSendCapability,
+        replyGenerationCapability: trailingReplyCapability,
+        seed: composerSeed,
+        onSeedConsumed: () => setComposerSeed(null),
+        draftKey: activeComposerDraftKey,
+        attachmentScopeKey: activeChatId,
+        attachmentsDisabled: attachmentsDisabledForActiveChat,
+        attachmentsDisabledReason: 'Attachments are unavailable with Text completions.',
+        droppedFiles: composerDroppedFiles,
+        onDroppedFilesConsumed: handleDroppedFilesConsumed,
+        sendShortcut: prefs.sendShortcut,
+        onImportAtEndIntent: preloadImportModal,
+        onImportAtEnd: () => setImportAtEndOpen(true),
+        ...(showPrefillButton
+          ? {
+              showPrefillButton: true,
+              defaultPrefill: activeDefaultPrefill,
+              prefillScopeKey: activeChatId,
+              prefillSettingsPrompt: resolvedActiveChatRow ? (
+                <PrefillSettingsPrompt chatId={resolvedActiveChatRow.id} plan={activePrefillPlan} />
+              ) : null,
+            }
+          : {}),
+        trailingUserMessage: Boolean(trailingUserMessage),
+        ...(trailingUserMessage ? { onReplyToTrailingUser: handleReplyToTrailingUser } : {}),
+        ...(!transcriptFocusMode && scrollState === 'pinned'
+          ? {
+              floatingAccessory: (
+                <Button
+                  type="button"
+                  data-ui="jump-to-latest"
+                  onClick={() => scrollRef.current?.scrollToBottom({ smooth: true })}
+                >
+                  ↓ Jump to latest
+                </Button>
+              ),
+            }
+          : {}),
+      }
+    : null
+  const readyConfigurationSelection = readyActiveConfigurationSelection(configurationSession.frame)
+  const activeComposerPresentationReady =
+    activeChatId !== null &&
+    activePresentation?.visibleReady === true &&
+    readyConfigurationSelection?.target.kind === 'chat' &&
+    readyConfigurationSelection.target.chatId === activeChatId
+  const composerPresentation = useSampleAndHoldPresentation(
+    activeComposerProps,
+    activeComposerPresentationReady,
+  )
+  const displayedTranscriptComposer = composerPresentation.value ? (
+    <Composer
+      key={composerPresentation.value.draftKey}
+      {...composerPresentation.value}
+      generationCapability={composerPresentation.value.generationCapability}
+      presentationOnly={composerPresentation.retained}
+    />
+  ) : null
+  const activeSurfaceReady = activeChatId ? activePresentation?.visibleReady === true : true
 
   return (
     <div
       data-ui="app-shell"
+      data-workspace-runtime-state={workspaceRuntimeState}
       data-chat-model-panel={showChatModelPanel ? 'open' : 'closed'}
       data-sidebar={effectiveSidebarCollapsed ? 'collapsed' : 'expanded'}
       data-mobile-sidebar={mobileSidebarOpen ? 'open' : 'closed'}
@@ -2853,7 +1292,7 @@ export function Shell() {
                 setMobileSidebarOpen(false)
                 return
               }
-              setSidebarCollapsed((v) => !v)
+              updateSidebarCollapsed(!sidebarCollapsed)
             }}
           >
             <ChevronIcon size={16} rotate={effectiveSidebarCollapsed ? 0 : 180} />
@@ -2882,9 +1321,6 @@ export function Shell() {
             data-ui="open-global-settings"
             aria-label="Open settings"
             title="Settings (⌘,)"
-            onPointerEnter={preloadGlobalSettingsModal}
-            onPointerDown={preloadGlobalSettingsModal}
-            onFocus={preloadGlobalSettingsModal}
             onClick={() => setGlobalSettingsOpen(true)}
           >
             <CogIcon size={18} />
@@ -2906,6 +1342,7 @@ export function Shell() {
       </aside>
       <main
         data-ui="main-pane"
+        data-active-surface-ready={activeSurfaceReady}
         onDragOver={(event) => {
           if (treeViewActive || activeStorageRoute || (!activeChatId && !onNewChatSurface)) return
           if (!hasFileTransfer(event.dataTransfer)) return
@@ -2921,6 +1358,7 @@ export function Shell() {
           setComposerDroppedFiles({ id: newId(), files })
         }}
       >
+        <ConfigurationLoadFailure loads={configurationSession.loads} />
         {activeStorageRoute ? (
           <Suspense fallback={<SurfaceLoading label="Loading storage…" />}>
             <StorageView
@@ -2930,7 +1368,7 @@ export function Shell() {
           </Suspense>
         ) : (
           <>
-            {connectionKnown && !hasConnection && !isNarrowScreen ? (
+            {connectionAvailability === 'missing' && !isNarrowScreen ? (
               <ConnectionHeader
                 activeChatId={activeChatId}
                 activeChatProfileId={resolvedActiveChatRow?.settings.profileId ?? null}
@@ -2938,7 +1376,11 @@ export function Shell() {
             ) : null}
             {activeChatId ? (
               <>
-                <div data-ui="chat-title-bar">
+                <div
+                  data-ui="chat-title-bar"
+                  data-chat-id={resolvedPaintedChatRow?.id}
+                  data-presentation-only={transcriptPresentationOnly || undefined}
+                >
                   <IconButton
                     type="button"
                     data-ui="icon-button"
@@ -2952,11 +1394,14 @@ export function Shell() {
                   </IconButton>
                   <ConnectionHeader
                     variant="title-icon"
-                    activeChatId={activeChatId}
-                    activeChatProfileId={resolvedActiveChatRow?.settings.profileId ?? null}
+                    activeChatId={paintedChat?.id ?? activeChatId}
+                    activeChatProfileId={resolvedPaintedChatRow?.settings.profileId ?? null}
                   />
                   <ChatHeader
-                    chatId={activeChatId}
+                    chat={resolvedPaintedChatRow}
+                    paintedBranchLeafId={visibleBinding?.seal.leafId ?? undefined}
+                    presentationOnly={visiblePresentationOnly}
+                    privacyRouting={activeModelCatalog.routing}
                     settingsOpen={chatModelOpen}
                     onToggleSettings={() => setChatModelOpen((v) => !v)}
                     editTreeActive={editTreeMode}
@@ -2968,60 +1413,39 @@ export function Shell() {
                     treeViewActive={treeViewActive}
                     onTreeViewIntent={preloadBranchTreeView}
                     onToggleTreeView={() => {
-                      setRetainedAlternateViewsChatId(activeChatId)
-                      if (!treeViewActive) {
-                        setPendingTreeExitChatId(null)
-                        setEditTreeMode(false)
-                        setTreeViewChatId(activeChatId)
-                        return
-                      }
-                      if (
-                        resolvedActiveChatRow?.lastUpdatedLeafId === null &&
-                        activePathIntentIds.length === 0
-                      ) {
-                        setPendingTreeExitChatId(null)
-                        setTreeViewChatId(null)
-                        return
-                      }
-                      if (transcriptReadyForTreeExit) {
-                        setPendingTreeExitChatId(null)
-                        setTreeViewChatId(null)
-                        return
-                      }
-                      setPendingTreeExitChatId((pending) =>
-                        pending === activeChatId ? null : activeChatId,
-                      )
+                      const retryingFailedTree =
+                        treeViewRequested && activePresentation.target.kind === 'failed'
+                      const surface =
+                        treeViewActive || (treeViewRequested && !retryingFailedTree)
+                          ? 'transcript'
+                          : 'tree'
+                      if (surface === 'tree') setEditTreeMode(false)
+                      conversationController.requestPresentation({
+                        chatId: activeChatId,
+                        surface,
+                        ...(surface === 'tree' && newestSelectedPathStream?.messageId
+                          ? { revealTargetMessageId: newestSelectedPathStream.messageId }
+                          : {}),
+                      })
                     }}
                     mobileConnectionControl={activeMobileConnectionControl}
                   />
                 </div>
                 {!treeViewActive ? <EditTreeToolbar /> : null}
                 <BannerTray />
-                {treeViewActive || alternateViewsRetained ? (
+                {treeMounted ? (
                   <Activity
                     name={`conversation-tree:${activeChatId}`}
                     mode={treeViewActive ? 'visible' : 'hidden'}
                   >
-                    <Suspense fallback={<SurfaceLoading label="Loading conversation tree…" />}>
+                    {BranchTreeView && treeBinding ? (
                       <BranchTreeView
-                        chatId={activeChatId}
-                        headers={authoritativeTreeHeaders}
-                        latestHeaderById={latestTreeHeaderById}
-                        presentationHeaderById={authoritativeHeaderById}
-                        changedHeaderKeys={activeChangedHeaderKeys}
-                        changedHeaders={activeChangedHeaders}
-                        projection={authoritativeStructuralTreeProjection}
-                        cursor={activeCursor}
+                        binding={treeBinding}
+                        attempts={treeStreams}
+                        viewportActive={treeViewActive}
                         expanded={treeExpanded}
-                        repository={workspaceRepository}
-                        {...(treePresentationSnapshots
-                          ? { presentationSnapshots: treePresentationSnapshots }
-                          : {})}
-                        verifyPresentationSnapshotIds={committedMessageReceiptIds}
-                        onPresentationSnapshotVerified={acknowledgeVerifiedTreePresentation}
                         previewFontFamily={fontFamilyStack(prefs.fontFamily)}
                         onActivateNode={activateTreeNode}
-                        onSelectNode={focusTreePresentationReceipt}
                         onInsertAtSharedTrunk={insertAtSharedTreeTrunk}
                         onInsertAtChildLeg={insertAtTreeChildLeg}
                         onInsertAfterLeaf={insertAfterTreeLeaf}
@@ -3035,160 +1459,70 @@ export function Shell() {
                         onMutateMessageAttachmentRef={mutateTreeMessageAttachmentRef}
                         onToggleReasoningDetailHidden={toggleTreeReasoningDetailHidden}
                         onToggleProviderOutputItemHidden={toggleTreeProviderOutputItemHidden}
-                        onAbort={abortStream}
-                        followActiveStreamOnMount={selectedPathStreamActive}
-                        navigationRevision={activeNavigationRevision}
-                        hasConnection={hasConnection}
+                        onRequestStop={requestStop}
+                        generationCapabilityFrame={generationCapabilityFrame}
                       />
-                    </Suspense>
+                    ) : (
+                      <SurfaceLoading label="Loading conversation tree…" />
+                    )}
                   </Activity>
                 ) : null}
-                {!treeViewActive || alternateViewsRetained ? (
+                {transcriptMounted ? (
                   <Activity
                     name={`conversation-transcript:${activeChatId}`}
                     mode={treeViewActive ? 'hidden' : 'visible'}
                   >
                     <ScrollRegion
-                      key={activeChatId}
+                      key={transcriptBinding?.seal.chatId ?? activeChatId}
                       ref={scrollRef}
+                      viewportActive={!treeViewActive}
                       autoScrollOnStream={prefs.autoScrollOnStream}
                       streamActive={selectedPathStreamActive}
-                      resetKey={activeChatId}
+                      workspaceEpoch={
+                        transcriptBinding?.seal.replacementEpoch ??
+                        conversationSnapshot.workspaceEpoch
+                      }
+                      resetKey={transcriptBinding?.seal.chatId ?? activeChatId}
+                      selectionKey={transcriptBinding?.seal.leafId ?? null}
+                      viewportRevision={transcriptBinding?.viewportRevision ?? 0}
                       streamFollowKey={selectedPathFollowKey}
-                      streamFollowClaimKey={selectedPathFollowClaimKey}
+                      streamFollowTargetMessageId={selectedPathFollowTargetMessageId}
+                      revealClaimKey={selectedPathRevealClaimKey}
+                      revealClaimTargetMessageId={activeRevealRequest?.targetMessageId ?? null}
+                      onRevealClaimConsumed={acknowledgeSelectedPathRevealClaim}
                       onStateChange={setScrollState}
                     >
                       {activeTranscriptExists ? (
-                        resolvedActiveBranchSnapshot && resolvedActiveChatRow ? (
-                          <Suspense fallback={<SurfaceLoading label="Loading conversation…" />}>
+                        transcriptBinding && resolvedPaintedChatRow ? (
+                          MessageList ? (
                             <MessageList
-                              key={activeChatId}
-                              chatId={activeChatId}
-                              chatSettings={resolvedActiveChatRow.settings}
-                              hasConnection={hasConnection}
-                              branchSnapshot={resolvedActiveBranchSnapshot}
-                              treeProjection={authoritativeStructuralTreeProjection}
-                              authoritativePathHeaders={authoritativePathHeaders}
-                              presentationOnly={transcriptPresentationOnly}
-                              allowPresentationStreamProjection={
-                                !urlPinnedTargetPending &&
-                                retainedPresentationMatchesActiveStructure
-                              }
+                              key={transcriptBinding.seal.chatId}
+                              binding={transcriptBinding}
+                              chatSettings={resolvedPaintedChatRow.settings}
+                              generationCapabilityFrame={generationCapabilityFrame}
+                              contextPreviewFrozen={selectedPathStreamActive}
                               {...(activeCapability ? { capability: activeCapability } : {})}
-                              prefillRecommendationEndpoints={activeEndpoints.endpoints}
+                              prefillPlan={activePrefillPlan}
                               longMessageDisplayMode={prefs.longMessageDisplayMode}
-                              messageRenderWindowSize={prefs.messageRenderWindowSize}
+                              messageInitialRenderWork={prefs.messageInitialRenderWork}
                               messageRenderWindowLoadMode={
                                 loadedPrefs ? prefs.messageRenderWindowLoadMode : 'manual'
                               }
+                              transcriptLoadFailed={transcriptLoadFailed}
                               onLoadOlderMessages={loadOlderMessageWindow}
                             />
-                          </Suspense>
+                          ) : (
+                            <SurfaceLoading label="Loading conversation…" />
+                          )
+                        ) : transcriptLoadFailed ? (
+                          <TranscriptLoadFailure onRetry={loadOlderMessageWindow} />
                         ) : (
                           <SurfaceLoading label="Loading conversation…" />
                         )
                       ) : null}
-                      {transcriptFocusMode ? (
-                        <Composer
-                          onSubmit={handleSubmit}
-                          disabled={transcriptPresentationOnly}
-                          streaming={composerStreaming}
-                          onAbort={abortComposerStream}
-                          autoSize
-                          autoSizeVariant="focus"
-                          autoSizeMeasurementKey={`${prefs.fontFamily}:${prefs.baseFontSize}`}
-                          {...(hasConnection
-                            ? {}
-                            : { sendBlockedReason: 'Add a connection to send messages.' })}
-                          seed={composerSeed}
-                          onSeedConsumed={() => setComposerSeed(null)}
-                          draftKey={activeComposerDraftKey}
-                          attachmentScopeKey={activeChatId}
-                          attachmentsDisabled={attachmentsDisabledForActiveChat}
-                          attachmentsDisabledReason="Attachments are unavailable with Text completions."
-                          droppedFiles={composerDroppedFiles}
-                          onDroppedFilesConsumed={handleDroppedFilesConsumed}
-                          sendShortcut={prefs.sendShortcut}
-                          onImportAtEndIntent={preloadImportModal}
-                          onImportAtEnd={() => setImportAtEndOpen(true)}
-                          {...(showPrefillButton
-                            ? {
-                                showPrefillButton: true,
-                                defaultPrefill: activeDefaultPrefill,
-                                prefillScopeKey: activeChatId,
-                                prefillSettingsPrompt: resolvedActiveChatRow ? (
-                                  <PrefillSettingsPrompt
-                                    chatId={resolvedActiveChatRow.id}
-                                    settings={resolvedActiveChatRow.settings}
-                                    endpoints={activeEndpoints.endpoints}
-                                  />
-                                ) : null,
-                              }
-                            : {})}
-                          trailingUserMessage={Boolean(trailingUserMessage)}
-                          {...(trailingUserMessage && hasConnection
-                            ? {
-                                onReplyToTrailingUser: handleReplyToTrailingUser,
-                              }
-                            : {})}
-                        />
-                      ) : null}
+                      {transcriptFocusMode ? displayedTranscriptComposer : null}
                     </ScrollRegion>
-                    {transcriptFocusMode ? null : (
-                      <Composer
-                        onSubmit={handleSubmit}
-                        disabled={transcriptPresentationOnly}
-                        streaming={composerStreaming}
-                        onAbort={abortComposerStream}
-                        autoSize
-                        autoSizeMeasurementKey={`${prefs.fontFamily}:${prefs.baseFontSize}`}
-                        {...(hasConnection
-                          ? {}
-                          : { sendBlockedReason: 'Add a connection to send messages.' })}
-                        seed={composerSeed}
-                        onSeedConsumed={() => setComposerSeed(null)}
-                        draftKey={activeComposerDraftKey}
-                        attachmentScopeKey={activeChatId}
-                        attachmentsDisabled={attachmentsDisabledForActiveChat}
-                        attachmentsDisabledReason="Attachments are unavailable with Text completions."
-                        droppedFiles={composerDroppedFiles}
-                        onDroppedFilesConsumed={handleDroppedFilesConsumed}
-                        sendShortcut={prefs.sendShortcut}
-                        onImportAtEndIntent={preloadImportModal}
-                        onImportAtEnd={() => setImportAtEndOpen(true)}
-                        {...(showPrefillButton
-                          ? {
-                              showPrefillButton: true,
-                              defaultPrefill: activeDefaultPrefill,
-                              prefillScopeKey: activeChatId,
-                              prefillSettingsPrompt: resolvedActiveChatRow ? (
-                                <PrefillSettingsPrompt
-                                  chatId={resolvedActiveChatRow.id}
-                                  settings={resolvedActiveChatRow.settings}
-                                  endpoints={activeEndpoints.endpoints}
-                                />
-                              ) : null,
-                            }
-                          : {})}
-                        trailingUserMessage={Boolean(trailingUserMessage)}
-                        {...(trailingUserMessage && hasConnection
-                          ? {
-                              onReplyToTrailingUser: handleReplyToTrailingUser,
-                            }
-                          : {})}
-                        floatingAccessory={
-                          scrollState === 'pinned' ? (
-                            <Button
-                              type="button"
-                              data-ui="jump-to-latest"
-                              onClick={() => scrollRef.current?.scrollToBottom({ smooth: true })}
-                            >
-                              ↓ Jump to latest
-                            </Button>
-                          ) : null
-                        }
-                      />
-                    )}
+                    {transcriptFocusMode ? null : displayedTranscriptComposer}
                   </Activity>
                 ) : null}
               </>
@@ -3196,43 +1530,13 @@ export function Shell() {
               <>
                 {/* The new-chat surface stays IDB-cold until send/import/settings
                  * needs a row. */}
-                <div data-ui="chat-title-bar">
-                  <IconButton
-                    type="button"
-                    data-ui="icon-button"
-                    data-role="mobile-sidebar-toggle"
-                    aria-label="Open chats sidebar"
-                    aria-expanded={mobileSidebarOpen}
-                    title="Chats"
-                    onClick={() => setMobileSidebarOpen(true)}
-                  >
-                    <SidebarIcon size={20} />
-                  </IconButton>
-                  <ConnectionHeader variant="title-icon" />
-                  <span data-ui="chat-title" data-title-status="untitled">
-                    <span data-ui="chat-title-label">New chat</span>
-                  </span>
-                  <span data-ui="header-spacer" />
-                  <IconButton
-                    type="button"
-                    data-ui="icon-button"
-                    data-role="settings-cog"
-                    aria-label="Open chat settings"
-                    title="Chat settings"
-                    onClick={() => void openSettingsForNewChat()}
-                  >
-                    <CogIcon size={20} />
-                  </IconButton>
-                  <MobileNewChatControls connectionControl={newChatMobileConnectionControl} />
-                </div>
+                {unmaterializedChatTitleBar}
                 <EmptyState onPick={(text) => setComposerSeed(text)} />
                 <Composer
                   onSubmit={handleNewChatSubmit}
                   autoSize
                   autoSizeMeasurementKey={`${prefs.fontFamily}:${prefs.baseFontSize}`}
-                  {...(hasConnection
-                    ? {}
-                    : { sendBlockedReason: 'Add a connection to send messages.' })}
+                  generationCapability={connectionGenerationCapability}
                   seed={composerSeed}
                   onSeedConsumed={() => setComposerSeed(null)}
                   draftKey={activeComposerDraftKey}
@@ -3246,34 +1550,7 @@ export function Shell() {
               </>
             ) : (
               <>
-                <div data-ui="chat-title-bar" data-mobile-home="true">
-                  <IconButton
-                    type="button"
-                    data-ui="icon-button"
-                    data-role="mobile-sidebar-toggle"
-                    aria-label="Open chats sidebar"
-                    aria-expanded={mobileSidebarOpen}
-                    title="Chats"
-                    onClick={() => setMobileSidebarOpen(true)}
-                  >
-                    <SidebarIcon size={20} />
-                  </IconButton>
-                  <span data-ui="chat-title" data-title-status="manual">
-                    <span data-ui="chat-title-label">natter</span>
-                  </span>
-                  <span data-ui="header-spacer" />
-                  <IconButton
-                    type="button"
-                    data-ui="icon-button"
-                    data-role="settings-cog"
-                    aria-label="Open chat settings"
-                    title="Chat settings"
-                    onClick={() => void openSettingsForNewChat()}
-                  >
-                    <CogIcon size={20} />
-                  </IconButton>
-                  <MobileNewChatControls connectionControl={newChatMobileConnectionControl} />
-                </div>
+                {unmaterializedChatTitleBar}
                 <EmptyState onPick={(text) => setComposerSeed(text)} />
               </>
             )}
@@ -3292,23 +1569,19 @@ export function Shell() {
         <ChatModelPanel
           chatSnapshot={resolvedActiveChatRow}
           profileSnapshot={activeProfileForModelList ?? null}
-          draftKey={activeComposerDraftKey}
+          modelCatalog={activeModelCatalog}
           onClose={() => setChatModelOpen(false)}
         />
       ) : null}
       {globalSettingsOpen ? (
-        <Suspense fallback={<SurfaceLoading label="Loading settings…" overlay />}>
-          <GlobalSettingsModal open onClose={() => setGlobalSettingsOpen(false)} />
-        </Suspense>
+        <GlobalSettingsModal open onClose={() => setGlobalSettingsOpen(false)} />
       ) : null}
-      <ZeroEligibleModalHost />
+      <ZeroEligibleModalHost activeChat={resolvedActiveChatRow} />
       {importAtEndOpen && activeChatId ? (
         <Suspense fallback={<SurfaceLoading label="Loading import…" overlay />}>
           <ImportModal
             chatId={activeChatId}
             slot={{ kind: 'at-end' }}
-            cursor={activeCursor}
-            presentationWindowLimit={effectiveMessageBodyWindowLimit}
             onClose={() => setImportAtEndOpen(false)}
             onDone={() => setImportAtEndOpen(false)}
           />
@@ -3319,28 +1592,17 @@ export function Shell() {
           <ImportModal
             chatId={null}
             slot={{ kind: 'at-end' }}
-            cursor={EMPTY_CURSOR}
-            presentationWindowLimit={effectiveMessageBodyWindowLimit}
             materializeChat={async () => {
               const routeIntent = beginRouteIntent()
               try {
                 // Fire only when the user clicks Import; if import never writes
                 // messages, the temporary row is discarded on navigation.
-                const { preset, settings } = await resolveNewChatSeed()
-                writeActiveSeedState({
-                  profileId: settings.profileId || null,
-                  presetId: preset?.id ?? null,
-                  settings,
-                })
-                const chat = await createChat({
-                  settings,
-                  temporary: true,
-                  ...(preset ? { presetId: preset.id } : {}),
-                })
-                return {
-                  chatId: chat.id,
-                  navigationIntent: navigateToChatForIntent(routeIntent, chat.id),
-                }
+                const materialized = await materializeTemporaryNewChat(
+                  routeIntentOwner(routeIntent),
+                )
+                if (!materialized) return null
+                navigateToChatForIntent(routeIntent, materialized.chatId, materialized.routeHandoff)
+                return { chatId: materialized.chatId }
               } finally {
                 cancelRouteIntent(routeIntent)
               }
@@ -3355,8 +1617,6 @@ export function Shell() {
           <ImportModal
             chatId={activeChatId}
             slot={treeInsertTarget.slot}
-            cursor={activeCursor}
-            presentationWindowLimit={effectiveMessageBodyWindowLimit}
             defaultRole={treeInsertTarget.defaultRole}
             onClose={() => setTreeInsertTarget(null)}
             onDone={() => {
@@ -3425,8 +1685,30 @@ function MobileNewChatControls({ connectionControl }: { connectionControl: React
 // Tiny wrapper that only renders the modal when `zeroEligibleChatId` is
 // set. Having this as its own component lets Shell subscribe via
 // Zustand without forcing the modal to mount all the time.
-function ZeroEligibleModalHost() {
+function ZeroEligibleModalHost({ activeChat }: { activeChat: Chat | undefined }) {
   const chatId = useUiStore((s) => s.zeroEligibleChatId)
   if (!chatId) return null
-  return <ZeroEligibleModal chatId={chatId} />
+  return (
+    <ZeroEligibleModal
+      chatId={chatId}
+      {...(activeChat?.id === chatId && activeChat.settings.model
+        ? { modelLabel: activeChat.settings.model }
+        : {})}
+    />
+  )
+}
+
+function useSampleAndHoldPresentation<T>(
+  value: T | null,
+  ready: boolean,
+): { readonly value: T | null; readonly retained: boolean } {
+  const lastCommittedValue = useRef(value)
+  useLayoutEffect(() => {
+    if (ready && value !== null) lastCommittedValue.current = value
+  }, [ready, value])
+  const presented = ready ? value : lastCommittedValue.current
+  return {
+    value: presented,
+    retained: !ready && presented !== null,
+  }
 }

@@ -1,50 +1,45 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { DEFAULT_GLOBAL_PREFERENCES } from '../../src/core/global-settings'
+import { DEFAULT_RENDERING_PREFS } from '../../src/core/rendering-preferences'
 import { AppearanceSettings } from '../../src/ui/settings/AppearanceSettings'
+import { installPresentationWorkspaceFence } from '../helpers/presentation-interactions'
 
-const liveQueryState = vi.hoisted<{ value: unknown }>(() => ({
-  value: undefined,
-}))
+const preferenceState = vi.hoisted<{
+  value: unknown
+  writes: Map<string, unknown>
+}>(() => ({ value: null, writes: new Map() }))
 
-vi.mock('../../src/store/settings', () => {
-  const state = new Map<string, unknown>()
+vi.mock('../../src/hooks/useConfigurationPreferences', () => {
+  return { useConfigurationPreferences: () => preferenceState.value }
+})
+
+vi.mock('../../src/store/preferences-application', () => {
+  const write = (key: string) => async (value: unknown) => {
+    preferenceState.writes.set(key, value)
+  }
   return {
-    async getSetting<T>(key: string): Promise<T | undefined> {
-      return state.get(key) as T | undefined
-    },
-    async setSetting<T>(key: string, value: T): Promise<void> {
-      state.set(key, value)
-    },
-    __get(key: string): unknown {
-      return state.get(key)
-    },
-    __reset(): void {
-      state.clear()
-    },
+    writeTheme: write('global:theme'),
+    writeChatMaxWidth: write('global:chat-max-width'),
+    writeFontFamily: write('global:font-family'),
+    writeBaseFontSize: write('global:base-font-size'),
+    writeLongMessageDisplayMode: write('global:long-message-display-mode'),
   }
 })
 
-vi.mock('../../src/store/reactive-query', () => {
-  return {
-    useRepositoryQuery: <T,>(_key: string, _query: () => Promise<T>, initial: T): T => initial,
-    useRepositoryQueryState: <T,>(_key: string, _query: () => Promise<T>, initial: T) =>
-      liveQueryState.value === undefined
-        ? { status: 'loading', value: initial, error: null }
-        : { status: 'ready', value: liveQueryState.value as T, error: null },
+beforeEach(() => {
+  installPresentationWorkspaceFence('appearance-settings')
+  preferenceState.writes.clear()
+  preferenceState.value = {
+    global: DEFAULT_GLOBAL_PREFERENCES,
+    rendering: DEFAULT_RENDERING_PREFS,
   }
-})
-
-beforeEach(async () => {
-  const mod = (await import('../../src/store/settings')) as unknown as { __reset(): void }
-  mod.__reset()
-  liveQueryState.value = DEFAULT_GLOBAL_PREFERENCES
   document.documentElement.style.removeProperty('--message-max-width')
 })
 
 describe('AppearanceSettings', () => {
   it('does not apply fallback layout preferences while storage is still loading', () => {
-    liveQueryState.value = undefined
+    preferenceState.value = null
 
     render(<AppearanceSettings />)
 
@@ -58,11 +53,8 @@ describe('AppearanceSettings', () => {
 
     fireEvent.change(slider, { target: { value: '960' } })
 
-    const mod = (await import('../../src/store/settings')) as unknown as {
-      __get(key: string): unknown
-    }
     await waitFor(() => {
-      expect(mod.__get('global:chat-max-width')).toBe(960)
+      expect(preferenceState.writes.get('global:chat-max-width')).toBe(960)
     })
     expect(document.documentElement.style.getPropertyValue('--message-max-width')).toBe('960px')
   })
@@ -73,11 +65,8 @@ describe('AppearanceSettings', () => {
       target: { value: 'compact' },
     })
 
-    const mod = (await import('../../src/store/settings')) as unknown as {
-      __get(key: string): unknown
-    }
     await waitFor(() => {
-      expect(mod.__get('global:long-message-display-mode')).toBe('compact')
+      expect(preferenceState.writes.get('global:long-message-display-mode')).toBe('compact')
     })
   })
 })

@@ -5,9 +5,11 @@ import {
 } from './fake-stream-provider'
 import { type CDPSession, expect, type Page, test } from './fixtures'
 import {
+  activeWorkspaceDatabaseName,
   clearIndexedDb,
   createChatAndOpen,
   firstChatId,
+  interactiveComposer,
   seedFirstRun,
   sendMessage,
   waitForAssistantGenerationFinished,
@@ -18,6 +20,9 @@ interface RetentionStorageState {
   latestAssistantId: string | null
   latestContentChars: number
   latestReasoningChars: number
+  latestReasoningCarrierCount: number
+  latestReasoningSchemaVersion: number | null
+  legacyReasoningDetailsPresent: boolean
   latestUserAssistantChildren: number
   latestUserId: string | null
   streamChunkCount: number
@@ -96,91 +101,109 @@ async function readRetentionStorageState(
   page: Page,
   chatId: string,
 ): Promise<RetentionStorageState> {
-  return page.evaluate(async (id) => {
-    const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const request = indexedDB.open('natter')
-      request.onsuccess = () => resolve(request.result)
-      request.onerror = () => reject(request.error)
-    })
-    const read = <T>(request: IDBRequest<T>) =>
-      new Promise<T>((resolve, reject) => {
+  const databaseName = await activeWorkspaceDatabaseName(page)
+  return page.evaluate(
+    async ({ databaseName, id }) => {
+      const db = await new Promise<IDBDatabase>((resolve, reject) => {
+        const request = indexedDB.open(databaseName)
         request.onsuccess = () => resolve(request.result)
         request.onerror = () => reject(request.error)
       })
-    try {
-      const transaction = db.transaction(
-        ['messages', 'messageBodies', 'streamLeases', 'streamChunks'],
-        'readonly',
-      )
-      const [headers, bodies, leases, chunks] = await Promise.all([
-        read(transaction.objectStore('messages').index('chatId').getAll(id)),
-        read(transaction.objectStore('messageBodies').getAll()),
-        read(transaction.objectStore('streamLeases').getAll()),
-        read(transaction.objectStore('streamChunks').getAll()),
-      ])
-      const messageHeaders = (headers as Array<Record<string, unknown>>).sort(
-        (left, right) =>
-          Number(left.createdAt ?? 0) - Number(right.createdAt ?? 0) ||
-          String(left.id).localeCompare(String(right.id)),
-      )
-      const users = messageHeaders.filter((row) => row.role === 'user')
-      const assistants = messageHeaders.filter((row) => row.role === 'assistant')
-      const latestUser = users.at(-1)
-      const latestAssistant = assistants.at(-1)
-      const body = (bodies as Array<Record<string, unknown>>).find(
-        (row) => row.id === latestAssistant?.id,
-      )
-      const content: unknown[] = Array.isArray(body?.content) ? body.content : []
-      const reasoning: unknown[] = Array.isArray(body?.reasoningDetails)
-        ? body.reasoningDetails
-        : []
-      const generationFinished = (row: Record<string, unknown>) => {
-        const generation = row.generation
-        return (
-          typeof generation === 'object' &&
-          generation !== null &&
-          typeof (generation as { finishedAt?: unknown }).finishedAt === 'number'
+      const read = <T>(request: IDBRequest<T>) =>
+        new Promise<T>((resolve, reject) => {
+          request.onsuccess = () => resolve(request.result)
+          request.onerror = () => reject(request.error)
+        })
+      try {
+        const transaction = db.transaction(
+          ['messages', 'messageBodies', 'streamLeases', 'streamChunks'],
+          'readonly',
         )
-      }
-      return {
-        assistantCount: assistants.length,
-        latestAssistantId: typeof latestAssistant?.id === 'string' ? latestAssistant.id : null,
-        latestContentChars: content.reduce<number>(
-          (total, item) =>
-            total +
-            (typeof item === 'object' &&
-            item !== null &&
-            typeof (item as { text?: unknown }).text === 'string'
-              ? (item as { text: string }).text.length
-              : 0),
-          0,
-        ),
-        latestReasoningChars: reasoning.reduce<number>(
-          (total, item) =>
-            total +
-            (typeof item === 'object' &&
-            item !== null &&
-            typeof (item as { text?: unknown }).text === 'string'
-              ? (item as { text: string }).text.length
-              : 0),
-          0,
-        ),
-        latestUserAssistantChildren:
-          typeof latestUser?.id === 'string'
-            ? assistants.filter((row) => row.parentId === latestUser.id).length
+        const [headers, bodies, leases, chunks] = await Promise.all([
+          read(transaction.objectStore('messages').index('chatId').getAll(id)),
+          read(transaction.objectStore('messageBodies').getAll()),
+          read(transaction.objectStore('streamLeases').getAll()),
+          read(transaction.objectStore('streamChunks').getAll()),
+        ])
+        const messageHeaders = (headers as Array<Record<string, unknown>>).sort(
+          (left, right) =>
+            Number(left.createdAt ?? 0) - Number(right.createdAt ?? 0) ||
+            String(left.id).localeCompare(String(right.id)),
+        )
+        const users = messageHeaders.filter((row) => row.role === 'user')
+        const assistants = messageHeaders.filter((row) => row.role === 'assistant')
+        const latestUser = users.at(-1)
+        const latestAssistant = assistants.at(-1)
+        const body = (bodies as Array<Record<string, unknown>>).find(
+          (row) => row.id === latestAssistant?.id,
+        )
+        const content: unknown[] = Array.isArray(body?.content) ? body.content : []
+        const reasoningEnvelope =
+          typeof body?.reasoningEnvelope === 'object' && body.reasoningEnvelope !== null
+            ? (body.reasoningEnvelope as Record<string, unknown>)
+            : null
+        const reasoning: unknown[] = Array.isArray(reasoningEnvelope?.visible)
+          ? reasoningEnvelope.visible
+          : []
+        const generationFinished = (row: Record<string, unknown>) => {
+          const generation = row.generation
+          return (
+            typeof generation === 'object' &&
+            generation !== null &&
+            typeof (generation as { finishedAt?: unknown }).finishedAt === 'number'
+          )
+        }
+        return {
+          assistantCount: assistants.length,
+          latestAssistantId: typeof latestAssistant?.id === 'string' ? latestAssistant.id : null,
+          latestContentChars: content.reduce<number>(
+            (total, item) =>
+              total +
+              (typeof item === 'object' &&
+              item !== null &&
+              typeof (item as { text?: unknown }).text === 'string'
+                ? (item as { text: string }).text.length
+                : 0),
+            0,
+          ),
+          latestReasoningChars: reasoning.reduce<number>(
+            (total, item) =>
+              total +
+              (typeof item === 'object' &&
+              item !== null &&
+              typeof (item as { text?: unknown }).text === 'string'
+                ? (item as { text: string }).text.length
+                : 0),
+            0,
+          ),
+          latestReasoningCarrierCount: Array.isArray(reasoningEnvelope?.carriers)
+            ? reasoningEnvelope.carriers.length
             : 0,
-        latestUserId: typeof latestUser?.id === 'string' ? latestUser.id : null,
-        streamChunkCount: (chunks as Array<{ chatId?: unknown }>).filter((row) => row.chatId === id)
-          .length,
-        streamLeaseCount: (leases as Array<{ chatId?: unknown }>).filter((row) => row.chatId === id)
-          .length,
-        unfinishedAssistantCount: assistants.filter((row) => !generationFinished(row)).length,
-        userCount: users.length,
+          latestReasoningSchemaVersion:
+            typeof reasoningEnvelope?.schemaVersion === 'number'
+              ? reasoningEnvelope.schemaVersion
+              : null,
+          legacyReasoningDetailsPresent: Object.hasOwn(body ?? {}, 'reasoningDetails'),
+          latestUserAssistantChildren:
+            typeof latestUser?.id === 'string'
+              ? assistants.filter((row) => row.parentId === latestUser.id).length
+              : 0,
+          latestUserId: typeof latestUser?.id === 'string' ? latestUser.id : null,
+          streamChunkCount: (chunks as Array<{ chatId?: unknown }>).filter(
+            (row) => row.chatId === id,
+          ).length,
+          streamLeaseCount: (leases as Array<{ chatId?: unknown }>).filter(
+            (row) => row.chatId === id,
+          ).length,
+          unfinishedAssistantCount: assistants.filter((row) => !generationFinished(row)).length,
+          userCount: users.length,
+        }
+      } finally {
+        db.close()
       }
-    } finally {
-      db.close()
-    }
-  }, chatId)
+    },
+    { databaseName, id: chatId },
+  )
 }
 
 async function waitForDurableBatch(
@@ -213,13 +236,16 @@ async function waitForDurableBatch(
   const state = await readRetentionStorageState(page, chatId)
   expect(state.latestContentChars).toBe(100_000)
   expect(state.latestReasoningChars).toBe(100_000)
+  expect(state.latestReasoningSchemaVersion).toBe(2)
+  expect(state.latestReasoningCarrierCount).toBe(0)
+  expect(state.legacyReasoningDetailsPresent).toBe(false)
   return state
 }
 
 async function openStoredChat(page: Page, chatId: string): Promise<void> {
   await page.locator(`[data-ui="chat-row-link"][href="#/chat/${chatId}"]`).click()
   await expect.poll(() => page.evaluate(() => window.location.hash)).toContain(`#/chat/${chatId}`)
-  await expect(page.locator('[data-ui="composer"]')).toBeVisible()
+  await expect(interactiveComposer(page)).toBeVisible()
 }
 
 async function leaveForBlankChat(page: Page): Promise<void> {
@@ -253,29 +279,33 @@ function generationRequestCount(
 }
 
 async function streamChunkCountForChat(page: Page, chatId: string): Promise<number> {
-  return page.evaluate(async (id) => {
-    const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const request = indexedDB.open('natter')
-      request.onsuccess = () => resolve(request.result)
-      request.onerror = () => reject(request.error)
-    })
-    try {
-      return await new Promise<number>((resolve, reject) => {
-        const request = db
-          .transaction('streamChunks', 'readonly')
-          .objectStore('streamChunks')
-          .getAll()
-        request.onsuccess = () =>
-          resolve(
-            (request.result as Array<{ chatId?: unknown }>).filter((row) => row.chatId === id)
-              .length,
-          )
+  const databaseName = await activeWorkspaceDatabaseName(page)
+  return page.evaluate(
+    async ({ databaseName, id }) => {
+      const db = await new Promise<IDBDatabase>((resolve, reject) => {
+        const request = indexedDB.open(databaseName)
+        request.onsuccess = () => resolve(request.result)
         request.onerror = () => reject(request.error)
       })
-    } finally {
-      db.close()
-    }
-  }, chatId)
+      try {
+        return await new Promise<number>((resolve, reject) => {
+          const request = db
+            .transaction('streamChunks', 'readonly')
+            .objectStore('streamChunks')
+            .getAll()
+          request.onsuccess = () =>
+            resolve(
+              (request.result as Array<{ chatId?: unknown }>).filter((row) => row.chatId === id)
+                .length,
+            )
+          request.onerror = () => reject(request.error)
+        })
+      } finally {
+        db.close()
+      }
+    },
+    { databaseName, id: chatId },
+  )
 }
 
 async function activeRouteChatId(page: Page): Promise<string> {
@@ -290,7 +320,7 @@ test('returning to an offscreen paused stream projects its current durable prefi
   const scenario = await createFakeStreamScenario({ targetChars: 8, chunkChars: 8 })
   scenarios.add(scenario)
   await clearIndexedDb(page)
-  await seedFirstRun(page, { model: 'natter/fake-stream' })
+  await seedFirstRun(page)
   await retargetOnlyProfileToFakeProvider(page, scenario.providerBaseUrl)
 
   await createChatAndOpen(page)
@@ -362,6 +392,7 @@ async function sendDetachedTurn(
     userCount: number
   },
 ): Promise<{ chatId: string; state: RetentionStorageState }> {
+  await scenario.hold()
   if (input.chatId) await openStoredChat(page, input.chatId)
   else await createChatAndOpen(page)
   await sendMessage(page, input.prompt)
@@ -370,6 +401,7 @@ async function sendDetachedTurn(
   expect(chatId).not.toBe('')
   await waitForProviderStream(scenario, input.generationCount)
   await leaveForBlankChat(page)
+  await scenario.release()
   return {
     chatId,
     state: await waitForDurableBatch(page, scenario, chatId, input),
@@ -386,12 +418,14 @@ async function regenerateDetached(
     userCount: number
   },
 ): Promise<RetentionStorageState> {
+  await scenario.hold()
   await openStoredChat(page, input.chatId)
   const assistant = page.locator('[data-ui="message"][data-role="assistant"]').last()
   await expect(assistant).toBeVisible()
   await assistant.locator('[data-action="regenerate"]').click()
   await waitForProviderStream(scenario, input.generationCount)
   await leaveForBlankChat(page)
+  await scenario.release()
   return waitForDurableBatch(page, scenario, input.chatId, input)
 }
 
@@ -407,9 +441,10 @@ test('settled detached streams release wrappers without retaining tab branch sta
     reasoningChars: 100_000,
     chunkChars: 128,
     initialDelayMs: 250,
+    holdUntilReleased: true,
   })
   scenarios.add(scenario)
-  await seedFirstRun(page, { model: 'natter/fake-stream' })
+  await seedFirstRun(page)
   await retargetOnlyProfileToFakeProvider(page, scenario.providerBaseUrl)
   const client = await page.context().newCDPSession(page)
 

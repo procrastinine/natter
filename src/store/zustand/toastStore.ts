@@ -30,15 +30,16 @@ interface Toast {
 }
 
 type BannerKind = 'chat-not-found' | 'mutation-conflict' | 'stale-edit' | 'stale-reasoning'
+type BannerAction = () => void | boolean | Promise<void> | Promise<boolean>
 
 interface Banner {
   id: string
   kind: BannerKind
   text: string
   // Optional primary action (e.g. "Return to home", "Retry").
-  primary?: { label: string; action: () => void | Promise<void> }
+  primary?: { label: string; action: BannerAction }
   // Optional secondary action (e.g. "Dismiss", "Cancel").
-  secondary?: { label: string; action: () => void | Promise<void> }
+  secondary?: { label: string; action: BannerAction }
   actionState?: NoticeActionState<'primary' | 'secondary'>
 }
 
@@ -72,6 +73,8 @@ function nextId(prefix: string): string {
 }
 
 const ACTION_FAILED_MESSAGE = 'Action failed. Try again.'
+const MAX_VISUAL_TOASTS = 24
+const MAX_VISUAL_BANNERS = 24
 
 export const useToastStore = create<ToastStoreState>((set, get) => ({
   toasts: [],
@@ -86,7 +89,9 @@ export const useToastStore = create<ToastStoreState>((set, get) => ({
       durationMs: t.durationMs ?? 5000,
       createdAt: Date.now(),
     }
-    set((state) => ({ toasts: [...state.toasts, toast] }))
+    set((state) => ({
+      toasts: [...state.toasts, toast].slice(-MAX_VISUAL_TOASTS),
+    }))
     useAnnouncementStore.getState().announce({
       text: toast.text,
       priority: toast.level === 'danger' ? 'assertive' : 'polite',
@@ -130,7 +135,9 @@ export const useToastStore = create<ToastStoreState>((set, get) => ({
   },
   pushBanner: (b) => {
     const id = nextId('banner')
-    set((state) => ({ banners: [...state.banners, { ...b, id }] }))
+    set((state) => ({
+      banners: [...state.banners, { ...b, id }].slice(-MAX_VISUAL_BANNERS),
+    }))
     useAnnouncementStore.getState().announce({ text: b.text, eventKey: id })
     return id
   },
@@ -145,7 +152,17 @@ export const useToastStore = create<ToastStoreState>((set, get) => ({
       ),
     }))
     try {
-      await action()
+      const consumed = await action()
+      if (consumed === false) {
+        set((state) => ({
+          banners: state.banners.map((candidate) =>
+            candidate.id === id
+              ? { ...candidate, actionState: { key, pending: false } }
+              : candidate,
+          ),
+        }))
+        return false
+      }
     } catch {
       set((state) => ({
         banners: state.banners.map((candidate) =>

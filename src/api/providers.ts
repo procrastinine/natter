@@ -9,31 +9,13 @@
 // `{ data: [{ id, object, created, owned_by }, ...] }`. No capability data;
 // the hooks layer merges with bundled capability tables.
 
-import type { ModelEndpoint, PercentileBucket } from '../core/types'
+import type {
+  EndpointsDescriptor,
+  ModelEndpoint,
+  ModelListEntry,
+  PercentileBucket,
+} from '../core/types'
 import { normalizeDataPolicy } from './privacy-scrape'
-
-export interface ModelListEntry {
-  id: string
-  canonicalSlug?: string
-  name?: string
-  description?: string
-  created?: number
-  contextLength?: number
-  architecture?: {
-    inputModalities?: string[]
-    outputModalities?: string[]
-    tokenizer?: string
-  }
-  pricing?: Record<string, string | undefined>
-  topProvider?: Record<string, unknown>
-  perRequestLimits?: Record<string, unknown>
-  supportedParameters?: string[]
-  defaultParameters?: Record<string, number>
-  expirationDate?: string
-  knowledgeCutoff?: string
-  huggingFaceId?: string
-  links?: { details?: string }
-}
 
 function asStringArray(v: unknown): string[] | undefined {
   if (!Array.isArray(v)) return undefined
@@ -158,15 +140,6 @@ export function normalizeEndpoint(raw: unknown): ModelEndpoint | null {
   const arch = normalizeArchitecture(obj.architecture)
   if (arch) endpoint.architecture = arch
   return endpoint
-}
-
-export interface EndpointsDescriptor {
-  modelId: string
-  name?: string
-  description?: string
-  contextLength?: number
-  architecture?: ModelEndpoint['architecture']
-  endpoints: ModelEndpoint[]
 }
 
 // Normalize an /endpoints response. OpenRouter wraps the payload in `data`;

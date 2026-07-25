@@ -1,8 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   classifyQuota,
-  estimateQuota,
   isPersisted,
+  probePersisted,
+  probePersistRequest,
+  probeQuota,
   QUOTA_HARD_WARN_RATIO,
   QUOTA_WARN_RATIO,
   requestNotificationPermissionForStoragePersistence,
@@ -87,12 +89,6 @@ describe('classifyQuota', () => {
 })
 
 describe('storage probes (fallback when navigator.storage is unavailable)', () => {
-  it('estimateQuota resolves to null when the API is missing', async () => {
-    // jsdom 29 does not implement navigator.storage.estimate; the probe must
-    // report "unknown" rather than throw.
-    expect(await estimateQuota()).toBeNull()
-  })
-
   it('requestPersist resolves to false when the API is missing', async () => {
     expect(await requestPersist()).toBe(false)
   })
@@ -119,6 +115,28 @@ describe('storage probes (fallback when navigator.storage is unavailable)', () =
     expect(await isPersisted()).toBe(true)
     expect(persist).toHaveBeenCalledTimes(1)
     expect(persisted).toHaveBeenCalledTimes(1)
+  })
+
+  it('settles missing, rejected, and hung browser probes independently', async () => {
+    setNavigatorStorage(undefined)
+    await expect(probeQuota()).resolves.toEqual({ status: 'unavailable' })
+
+    setNavigatorStorage({
+      estimate: vi.fn<StorageManager['estimate']>().mockImplementation(() => new Promise(() => {})),
+      persist: vi.fn<StorageManager['persist']>().mockRejectedValue(new Error('blocked')),
+      persisted: vi.fn<StorageManager['persisted']>().mockResolvedValue(false),
+    })
+
+    const quota = probeQuota({ timeoutMs: 1 })
+    await expect(probePersisted({ timeoutMs: 50 })).resolves.toEqual({
+      status: 'ready',
+      value: false,
+    })
+    await expect(probePersistRequest({ timeoutMs: 50 })).resolves.toEqual({
+      status: 'error',
+      reason: 'failed',
+    })
+    await expect(quota).resolves.toEqual({ status: 'error', reason: 'timeout' })
   })
 
   it('requests notification permission for Chromium and Safari persistence requests only', async () => {

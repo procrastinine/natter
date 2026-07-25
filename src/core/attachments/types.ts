@@ -28,7 +28,7 @@ type AttachmentArtifactKind =
   | 'metadata'
   | 'archive-inventory'
 
-export interface AttachmentRecord {
+interface AttachmentRecord {
   id: string
   contentHash?: string
   kind: AttachmentKind
@@ -98,38 +98,4 @@ export interface ProcessAttachmentResult {
     requiredProcessors: string[]
     pdfEngine?: 'native' | 'cloudflare-ai' | 'mistral-ocr'
   }
-}
-
-interface AttachmentSearchFilters {
-  kind?: AttachmentKind
-  mime?: string
-  origin?: AttachmentOrigin
-  storageState?: AttachmentStorageState
-  minSizeBytes?: number
-  maxSizeBytes?: number
-  minRefCount?: number
-  maxRefCount?: number
-}
-
-type AttachmentSearchSort = 'created-desc' | 'created-asc' | 'size-desc' | 'size-asc'
-
-export interface AttachmentSearchQuery {
-  query?: string
-  filters?: AttachmentSearchFilters
-  sort?: AttachmentSearchSort
-  limit?: number
-}
-
-export interface MessageAttachmentRef {
-  refId: string
-  messageId?: string
-  draftChatId?: string
-  attachmentId: string
-  includeInContext: boolean
-  tokenEstimate: number
-  filenameSnapshot: string
-  kindSnapshot: AttachmentKind
-  storageStateSnapshot: AttachmentStorageState
-  createdAt: number
-  updatedAt: number
 }

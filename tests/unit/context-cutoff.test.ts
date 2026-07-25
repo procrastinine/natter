@@ -46,7 +46,7 @@ function makeMessage(role: MessageRole, text: string, partial: Partial<Message> 
       ? { hiddenFromContext: partial.hiddenFromContext }
       : {}),
     ...(partial.generation ? { generation: partial.generation } : {}),
-    ...(partial.reasoningDetails ? { reasoningDetails: partial.reasoningDetails } : {}),
+    ...(partial.reasoningEnvelope ? { reasoningEnvelope: partial.reasoningEnvelope } : {}),
   }
 }
 
@@ -218,6 +218,22 @@ describe('computeCutoffPlan — head + greedy tail', () => {
     expect(plan.kept.length).toBe(10)
   })
 
+  it('keeps the terminal pair when mandatory input alone exceeds the budget', () => {
+    const first = [makeMessage('user', 'first'), makeMessage('assistant', 'answer')]
+    const terminal = [makeMessage('user', 'u'.repeat(400)), makeMessage('assistant', 'prefill')]
+    const plan = computeCutoffPlan({
+      messages: [...first, ...terminal],
+      settings: settings({ keepFirstPairs: 0, customMaxContext: 1 }),
+      tokenizer: TOKENIZER,
+      providerCap: null,
+    })
+
+    expect(plan.kept).toEqual(terminal)
+    expect(plan.headPairCount).toBe(0)
+    expect(plan.tailPairCount).toBe(1)
+    expect(plan.available).toBe(1)
+  })
+
   it('anchors keepFirstPairs at the top and fills the tail with what is left', () => {
     const plan = computeCutoffPlan({
       messages: tenEqualPairs(),
@@ -381,8 +397,9 @@ describe('computeCutoffPlan — preamble stays fixed', () => {
       providerCap: null,
     })
     // Preamble takes ~20 tokens; available after preamble = 5.
-    // Neither pair fits, so head=0, tail=0 — but preamble survives.
+    // Optional history is removed, but the terminal pair remains mandatory.
     expect(plan.kept.some((m) => m.role === 'system')).toBe(true)
+    expect(plan.kept.slice(-2)).toEqual(path.slice(-2))
     expect(plan.preambleTokens).toBeGreaterThan(15)
   })
 })

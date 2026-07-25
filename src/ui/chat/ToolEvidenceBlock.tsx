@@ -1,25 +1,59 @@
-import { toolEvidenceSectionsForMessage } from '../../core/provider-tool-context'
-import type { Message } from '../../core/types'
+import { useMemo, useState } from 'react'
+import type { ConversationMutationSettlement } from '../../app/presentation-interactions'
+import { type AppliedMessageView, createAppliedMessageView } from '../../core/continuation-content'
+import {
+  formatProviderOutputValuePreview,
+  toolEvidenceSectionsForMessage,
+} from '../../core/provider-tool-context'
+import type { Message, ProviderOutputMemberRef } from '../../core/types'
 import { Button } from '../primitives/Button'
 
 interface ToolEvidenceBlockProps {
   message: Message
-  onToggleHidden?: (itemIndex: number) => void
+  appliedView?: AppliedMessageView
+  onToggleHidden?: (member: ProviderOutputMemberRef) => ConversationMutationSettlement
   toggleHiddenDisabled?: boolean
 }
 
+const TOOL_EVIDENCE_PAGE_SIZE = 20
+const TOOL_EVIDENCE_RAW_PREVIEW_CHARS = 64 * 1024
+
 export function ToolEvidenceBlock({
   message,
+  appliedView,
   onToggleHidden,
   toggleHiddenDisabled = false,
 }: ToolEvidenceBlockProps) {
-  const sections = toolEvidenceSectionsForMessage(message)
-  if (sections.length === 0) return null
+  const view = useMemo(
+    () => appliedView ?? createAppliedMessageView(message),
+    [appliedView, message],
+  )
+  const [open, setOpen] = useState(false)
+  const [window, setWindow] = useState(() => ({
+    messageId: message.id,
+    limit: TOOL_EVIDENCE_PAGE_SIZE,
+  }))
+  const count = view.providerOutputCount
+  const visibleLimit = window.messageId === message.id ? window.limit : TOOL_EVIDENCE_PAGE_SIZE
+  const sections = useMemo(
+    () =>
+      open
+        ? toolEvidenceSectionsForMessage(view, {
+            limit: visibleLimit,
+          })
+        : [],
+    [open, view, visibleLimit],
+  )
+  if (count === 0) return null
   return (
-    <details data-ui="tool-evidence">
+    <details
+      data-ui="tool-evidence"
+      open={open}
+      onToggle={(event) => setOpen(event.currentTarget.open)}
+    >
       <summary data-ui="tool-evidence-summary">
         <span data-ui="tool-evidence-title">Tool results</span>
-        <span data-ui="tool-evidence-badge">{sections.length}</span>
+        <span data-ui="tool-evidence-badge">{count}</span>
       </summary>
       <div data-ui="tool-evidence-details">
         {sections.map((section) => (
@@ -44,7 +78,7 @@ export function ToolEvidenceBlock({
                   onClick={(event) => {
                     event.preventDefault()
                     event.stopPropagation()
-                    onToggleHidden(section.itemIndex)
+                    void onToggleHidden(section.member)
                   }}
                   aria-label={section.hidden ? 'Unhide tool call' : 'Hide tool call'}
                   title={
@@ -80,14 +114,43 @@ export function ToolEvidenceBlock({
                   </ul>
                 </div>
               ) : null}
-              <details data-ui="tool-evidence-raw">
-                <summary>Raw</summary>
-                <pre>{formatRaw(section.raw)}</pre>
-              </details>
+              <RawEvidenceDisclosure value={section.raw} />
             </div>
           </details>
         ))}
+        {visibleLimit < count ? (
+          <Button
+            type="button"
+            data-ui="tool-evidence-more"
+            onClick={() =>
+              setWindow({
+                messageId: message.id,
+                limit: Math.min(count, visibleLimit + TOOL_EVIDENCE_PAGE_SIZE),
+              })
+            }
+          >
+            Show more
+          </Button>
+        ) : null}
       </div>
+    </details>
+  )
+}
+
+function RawEvidenceDisclosure({ value }: { value: unknown }) {
+  const [open, setOpen] = useState(false)
+  const formatted = useMemo(
+    () => (open ? formatProviderOutputValuePreview(value, TOOL_EVIDENCE_RAW_PREVIEW_CHARS) : ''),
+    [open, value],
+  )
+  return (
+    <details
+      data-ui="tool-evidence-raw"
+      open={open}
+      onToggle={(event) => setOpen(event.currentTarget.open)}
+    >
+      <summary>Raw</summary>
+      {open ? <pre>{formatted}</pre> : null}
     </details>
   )
 }
@@ -123,22 +186,4 @@ function EyeOffIcon() {
       <path d="M2 2l12 12" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
     </svg>
   )
-}
-
-function formatRaw(value: unknown): string {
-  try {
-    return JSON.stringify(redactNoisyFields(value), null, 2)
-  } catch {
-    return String(value)
-  }
-}
-
-function redactNoisyFields(value: unknown): unknown {
-  if (!value || typeof value !== 'object') return value
-  if (Array.isArray(value)) return value.map(redactNoisyFields)
-  const out: Record<string, unknown> = {}
-  for (const [key, child] of Object.entries(value)) {
-    out[key] = key === 'encrypted_content' ? '[encrypted]' : redactNoisyFields(child)
-  }
-  return out
 }

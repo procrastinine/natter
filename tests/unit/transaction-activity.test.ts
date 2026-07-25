@@ -1,8 +1,21 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import {
+  localTransactionActivityStats,
+  resumeLocalTransactionAdmissions,
   runWithLocalReadActivity,
   runWithLocalWriteActivity,
+  stopLocalTransactionAdmissions,
+  waitForLocalTransactionIdle,
 } from '../../src/store/transaction-activity'
+
+beforeEach(() => {
+  resumeLocalTransactionAdmissions()
+})
+
+afterEach(async () => {
+  await waitForLocalTransactionIdle()
+  stopLocalTransactionAdmissions()
+})
 
 describe('local transaction activity', () => {
   it('runs same-mode work concurrently and alternates queued mode phases in FIFO order', async () => {
@@ -112,6 +125,36 @@ describe('local transaction activity', () => {
     await expect(syncFailure).rejects.toThrow('sync failure')
     await expect(asyncFailure).rejects.toThrow('async failure')
     await expect(finalRead).resolves.toBe('unblocked')
+  })
+
+  it('rejects queued and new admissions while physical work drains', async () => {
+    const activeRelease = deferred<void>()
+    const activeStarted = deferred<void>()
+    const active = runWithLocalReadActivity(async () => {
+      activeStarted.resolve()
+      await activeRelease.promise
+    })
+    await activeStarted.promise
+    const queued = runWithLocalWriteActivity(() => undefined)
+
+    stopLocalTransactionAdmissions()
+
+    await expect(queued).rejects.toThrow('LocalTransactionActivityClosed')
+    await expect(runWithLocalReadActivity(() => undefined)).rejects.toThrow(
+      'LocalTransactionActivityClosed',
+    )
+    expect(localTransactionActivityStats()).toEqual({ accepting: false, active: 1, queued: 0 })
+
+    let drained = false
+    const drain = waitForLocalTransactionIdle().then(() => {
+      drained = true
+    })
+    await Promise.resolve()
+    expect(drained).toBe(false)
+
+    activeRelease.resolve()
+    await Promise.all([active, drain])
+    expect(localTransactionActivityStats()).toEqual({ accepting: false, active: 0, queued: 0 })
   })
 })
 

@@ -10,14 +10,11 @@
 // dimensions / page-count / bytes aware estimates; without it the estimator
 // falls back to conservative family-specific constants.
 //
-// Reasoning echo: when an assistant message carries `reasoningDetails[]`,
-// the next turn echoes the subset allowed by the chat's `ReasoningInclude`
-// flags (`encrypted` / `summary` / `text`) back in the wire. That costs
-// prompt tokens. `filterReasoningForInclude` + `estimateReasoningEchoTokens`
-// live in `core/tokens.ts` and `core/reasoning.ts` respectively. Per-block
-// `hidden: true` is honored inside the filter, so toggling the eye on a
-// reasoning row drops its contribution from the gauge.
+// Reasoning echo projects each assistant envelope through the selected route's
+// replay contract. The estimator consumes that same projection, including its
+// visibility and compatibility decisions, so the gauge and final wire agree.
 
+import type { AssistantRouteContract } from './api-choice'
 import {
   attachmentContextHasRefs,
   attachmentContextPolicyForSettings,
@@ -33,8 +30,26 @@ import {
   mediaTokensForMessage,
   mediaTokensForRefs,
 } from './media-context-tokens'
+import {
+  assertOutboundReasoningResolverRoute,
+  createOutboundReasoningCompiler,
+  type OutboundReasoningResolver,
+  type OutboundReasoningRoute,
+  outboundReasoningRouteForAssistantRoute,
+  outboundReasoningRouteForReplayContract,
+  resolveOutboundReasoningResolver,
+} from './outbound-reasoning'
 import { applyOutboundContextRewrites } from './prompt-context'
+import {
+  type AttemptProviderOutputContract,
+  TEXT_PROVIDER_OUTPUT_CONTRACT,
+} from './provider-tool-context'
 import { quirksFor } from './quirks'
+import {
+  type ReasoningReplayContract,
+  reasoningPolicyForSettings,
+  sealReasoningReplayContract,
+} from './reasoning'
 import { type CalibrationMode, charsPerToken, readPathTextTokenEstimate } from './token-calibration'
 import { clampTokens, safeContent, safeServerTokens } from './token-guards'
 import {
@@ -52,8 +67,6 @@ import type {
   GlobalTokenCalibration,
   MediaContextStrategy,
   Message,
-  ReasoningFormat,
-  ReasoningInclude,
   TokenCalibrationSample,
 } from './types'
 
@@ -64,13 +77,13 @@ export interface PromptSizeEstimateInput {
   activePathMessages: Message[]
   draftText: string
   tokenizer: TokenizerFamily
-  // Caller opts in by passing these; when omitted, reasoning contributes
-  // zero to the total (backcompat with pre-Phase-11 callers). The Context
-  // panel and composer gauge always pass them so toggling the three
-  // Include checkboxes updates the number live.
-  reasoningInclude?: ReasoningInclude
-  reasoningPreservationFormat?: ReasoningFormat
-  reasoningExcluded?: boolean
+  // The generation path passes its sealed route contract. UI-only estimates
+  // use the same shape, projected from settings before a request exists.
+  // When omitted, reasoning contributes zero.
+  reasoning?: ReasoningReplayContract
+  reasoningRoute?: OutboundReasoningRoute
+  reasoningResolver?: OutboundReasoningResolver
+  providerOutput?: AttemptProviderOutputContract
   includeToolCalls?: boolean
   // Optional — unlocks attachment-aware image / PDF heuristics. Callers
   // without the attachment table fall through to the fallback values.
@@ -98,6 +111,11 @@ interface TokenEstimateCalibrationContext {
   chatTokenCalibration?: Record<string, TokenCalibrationSample> | undefined
   globalCalibration?: GlobalTokenCalibration | null | undefined
   mode?: CalibrationMode | undefined
+}
+
+export interface PromptSizeContextReuse {
+  readonly contextAlreadySelected?: boolean
+  readonly reasoningResolver?: OutboundReasoningResolver
 }
 
 export interface PromptSizeEstimate {
@@ -196,6 +214,12 @@ function pathHasVisibilityExclusions(messages: readonly Message[]): boolean {
 
 export function estimatePromptSize(input: PromptSizeEstimateInput): PromptSizeEstimate {
   const family = input.tokenizer
+  const reasoningResolver = input.reasoning
+    ? resolveOutboundReasoningResolver(
+        input.reasoningRoute ?? outboundReasoningRouteForReplayContract(input.reasoning),
+        input.reasoningResolver,
+      )
+    : undefined
   const systemTokens = estimateTokens(input.systemPrompt, family)
   const attachmentRefsByOwner = resolveAttachmentContextRefs({
     messages: input.activePathMessages,
@@ -284,15 +308,12 @@ export function estimatePromptSize(input: PromptSizeEstimateInput): PromptSizeEs
     }
     let preBaselineReasoning = 0
     let preBaselineToolCalls = 0
-    if (input.reasoningInclude) {
+    if (reasoningResolver && input.providerOutput) {
       const opts: PromptEstimateOptions = {
         family,
-        reasoningInclude: input.reasoningInclude,
-        reasoningExcluded: input.reasoningExcluded ?? false,
+        reasoningResolver,
+        providerOutput: input.providerOutput,
         includeToolCalls: input.includeToolCalls === true,
-      }
-      if (input.reasoningPreservationFormat !== undefined) {
-        opts.reasoningPreservationFormat = input.reasoningPreservationFormat
       }
       preBaselineReasoning = estimateReasoningEchoTokens(preBaselineVisible, opts)
       preBaselineToolCalls = estimateToolCallContextTokens(preBaselineVisible, opts)
@@ -357,15 +378,12 @@ export function estimatePromptSize(input: PromptSizeEstimateInput): PromptSizeEs
   // preservation-format match for encrypted carriers.
   let reasoningTokens = 0
   let toolCallTokens = 0
-  if (input.reasoningInclude) {
+  if (reasoningResolver && input.providerOutput) {
     const opts: PromptEstimateOptions = {
       family,
-      reasoningInclude: input.reasoningInclude,
-      reasoningExcluded: input.reasoningExcluded ?? false,
+      reasoningResolver,
+      providerOutput: input.providerOutput,
       includeToolCalls: input.includeToolCalls === true,
-    }
-    if (input.reasoningPreservationFormat !== undefined) {
-      opts.reasoningPreservationFormat = input.reasoningPreservationFormat
     }
     reasoningTokens = estimateReasoningEchoTokens(visiblePath, opts)
     toolCallTokens = estimateToolCallContextTokens(visiblePath, opts)
@@ -392,8 +410,60 @@ function attachmentRefSignature(refs: readonly AttachmentRef[] | undefined): unk
     refId: ref.refId,
     attachmentId: ref.attachmentId,
     includeInContext: ref.includeInContext !== false,
+    pdfTier: ref.presentation.pdfTier ?? null,
     deletedAt: ref.deletedAt ?? null,
   }))
+}
+
+function attachmentEvidenceSignature(
+  input: PromptSizeEstimateInput,
+  frozenMessageIds: ReadonlySet<string>,
+): unknown[] {
+  if (!input.attachmentResolver) return []
+  const refsByOwner = resolveAttachmentContextRefs({
+    messages: input.activePathMessages,
+    policy: {
+      mediaContextStrategy: input.mediaContextStrategy ?? 'echo-all',
+      ...(input.mediaEchoN !== undefined ? { mediaEchoN: input.mediaEchoN } : {}),
+    },
+    ...(input.draftAttachmentRefs
+      ? { draft: { refs: input.draftAttachmentRefs, role: 'user' as const } }
+      : {}),
+  })
+  const ids = new Set<AttachmentId>()
+  for (const message of input.activePathMessages) {
+    if (message.deleted || message.hiddenFromContext) continue
+    if (frozenMessageIds.has(message.id)) continue
+    const refs = contextRefsForMessage(refsByOwner, message.id)
+    const visibleIds =
+      message.attachmentRefs === undefined ? null : new Set(refs.map((ref) => ref.attachmentId))
+    for (const item of safeContent(message.content)) {
+      const id = 'attachmentId' in item ? item.attachmentId : undefined
+      if (id && (visibleIds === null || visibleIds.has(id))) ids.add(id)
+    }
+    for (const ref of refs) ids.add(ref.attachmentId)
+  }
+  for (const ref of refsByOwner.get(DRAFT_ATTACHMENT_CONTEXT_ID) ?? []) {
+    ids.add(ref.attachmentId)
+  }
+  return [...ids].sort().map((id) => [id, attachmentTokenEvidence(input.attachmentResolver?.(id))])
+}
+
+function attachmentTokenEvidence(attachment: ReturnType<AttachmentResolver>): unknown {
+  if (!attachment) return null
+  if (attachment.storage.kind === 'missing') return ['missing']
+  if (attachment.kind === 'image') {
+    return [
+      'image',
+      attachment.dimensions?.width ?? null,
+      attachment.dimensions?.height ?? null,
+      attachment.sizeBytes ?? null,
+    ]
+  }
+  if (attachment.kind === 'pdf') {
+    return ['pdf', attachment.pageCount ?? null, attachment.sizeBytes ?? null]
+  }
+  return ['available', attachment.kind]
 }
 
 export function promptEstimateInputSignature(
@@ -409,11 +479,12 @@ export function promptEstimateInputSignature(
     mediaContextStrategy: input.mediaContextStrategy ?? 'echo-all',
     mediaEchoN: input.mediaEchoN ?? null,
     disablePromptUsageBaseline: input.disablePromptUsageBaseline === true,
+    disableTextCalibration: input.disableTextCalibration === true,
     currentModelId: input.currentModelId ?? null,
     currentTextCharsPerToken: input.currentTextCharsPerToken ?? null,
-    reasoningInclude: input.reasoningInclude ?? null,
-    reasoningPreservationFormat: input.reasoningPreservationFormat ?? null,
-    reasoningExcluded: input.reasoningExcluded ?? false,
+    reasoning: input.reasoning ?? null,
+    reasoningRouteKind: input.reasoningRoute?.kind ?? null,
+    providerOutput: input.providerOutput ?? null,
     includeToolCalls: input.includeToolCalls === true,
     activePathMessages: input.activePathMessages.map((message) =>
       frozenMessageIds.has(message.id)
@@ -427,12 +498,13 @@ export function promptEstimateInputSignature(
           }
         : { id: message.id, nodeVersion: message.nodeVersion },
     ),
+    attachmentEvidence: attachmentEvidenceSignature(input, frozenMessageIds),
   })
 }
 
 export function buildSettingsPromptSizeEstimateInput(
   settings: ChatSettings,
-  activePathMessages: Message[],
+  activePathMessages: readonly Message[],
   draftText: string,
   endpointTokenizer: string | null | undefined,
   // Provider/model cap. When provided AND the user hasn't set an explicit
@@ -444,10 +516,15 @@ export function buildSettingsPromptSizeEstimateInput(
   calibration?: TokenEstimateCalibrationContext,
   draftAttachmentRefs?: readonly AttachmentRef[],
   preCutAttachmentIds?: readonly AttachmentId[],
+  routing?: AssistantRouteContract,
+  contextReuse?: PromptSizeContextReuse,
 ): PromptSizeEstimateInput {
-  const quirks = quirksFor(settings.model)
+  const reasoning = routing?.reasoning ?? estimateReasoningContractForSettings(settings)
+  const providerOutput = routing?.providerOutput ?? TEXT_PROVIDER_OUTPUT_CONTRACT
   const tokenizer = tokenizerFromSettings(settings, endpointTokenizer ?? null)
-  const contextPathMessages = applyOutboundContextRewrites(activePathMessages, settings)
+  const contextPathMessages = contextReuse?.contextAlreadySelected
+    ? [...activePathMessages]
+    : applyOutboundContextRewrites(activePathMessages, settings)
   const attachmentPolicy = attachmentContextPolicyForSettings(settings)
   const preCutHasAttachments = (preCutAttachmentIds?.length ?? 0) > 0
   const contextHasAttachments =
@@ -467,29 +544,38 @@ export function buildSettingsPromptSizeEstimateInput(
         )
       : undefined
 
+  const reasoningRoute = routing
+    ? outboundReasoningRouteForAssistantRoute(routing)
+    : outboundReasoningRouteForReplayContract(reasoning)
+  const reasoningCompiler = contextReuse?.reasoningResolver
+    ? null
+    : createOutboundReasoningCompiler(reasoningRoute)
+  let reasoningResolver = contextReuse?.reasoningResolver ?? reasoningCompiler
+  if (!reasoningResolver) throw new Error('PromptSizeReasoningResolverMissing')
+  assertOutboundReasoningResolverRoute(reasoningResolver, reasoningRoute)
   const reasoningOpts: PromptEstimateOptions = {
     family: tokenizer,
-    reasoningInclude: settings.reasoning.include,
-    reasoningExcluded: settings.reasoning.exclude === true,
+    reasoningResolver,
+    providerOutput,
     includeToolCalls: settings.toolCallContext.include,
   }
-  if (quirks.reasoningPreservationFormat !== undefined) {
-    reasoningOpts.reasoningPreservationFormat = quirks.reasoningPreservationFormat
-  }
 
-  const plan = computeCutoffPlan({
-    messages: contextPathMessages,
-    settings,
-    tokenizer,
-    providerCap,
-    draftText,
-    ...(draftAttachmentRefs ? { draftAttachmentRefs } : {}),
-    reasoningOpts,
-    ...(attachmentResolver !== undefined ? { attachmentResolver } : {}),
-    currentModelId: settings.model,
-    ...(contextHasAttachments ? { disableTextCalibration: true } : {}),
-    ...(currentTextCharsPerToken !== undefined ? { currentTextCharsPerToken } : {}),
-  })
+  const plan = contextReuse?.contextAlreadySelected
+    ? { kept: contextPathMessages, applied: false }
+    : computeCutoffPlan({
+        messages: contextPathMessages,
+        settings,
+        tokenizer,
+        providerCap,
+        draftText,
+        ...(draftAttachmentRefs ? { draftAttachmentRefs } : {}),
+        reasoningOpts,
+        ...(attachmentResolver !== undefined ? { attachmentResolver } : {}),
+        currentModelId: settings.model,
+        ...(contextHasAttachments ? { disableTextCalibration: true } : {}),
+        ...(currentTextCharsPerToken !== undefined ? { currentTextCharsPerToken } : {}),
+      })
+  if (reasoningCompiler) reasoningResolver = reasoningCompiler.retain(plan.kept)
   const baselineInvalidated =
     plan.applied || contextHasAttachments || pathHasVisibilityExclusions(contextPathMessages)
 
@@ -506,8 +592,10 @@ export function buildSettingsPromptSizeEstimateInput(
       ? { mediaEchoN: attachmentPolicy.mediaEchoN }
       : {}),
     ...(baselineInvalidated ? { disablePromptUsageBaseline: true } : {}),
-    reasoningInclude: settings.reasoning.include,
-    reasoningExcluded: settings.reasoning.exclude === true,
+    reasoning,
+    reasoningRoute,
+    reasoningResolver,
+    providerOutput,
     includeToolCalls: settings.toolCallContext.include,
     ...(attachmentResolver !== undefined ? { attachmentResolver } : {}),
     currentModelId: settings.model,
@@ -515,15 +603,28 @@ export function buildSettingsPromptSizeEstimateInput(
     ...(contextHasAttachments ? { disableTextCalibration: true } : {}),
     ...(currentTextCharsPerToken !== undefined ? { currentTextCharsPerToken } : {}),
   }
-  if (quirks.reasoningPreservationFormat !== undefined) {
-    input.reasoningPreservationFormat = quirks.reasoningPreservationFormat
-  }
   return input
+}
+
+export function estimateReasoningContractForSettings(
+  settings: ChatSettings,
+): ReasoningReplayContract {
+  const quirks = quirksFor(settings.model)
+  return sealReasoningReplayContract(
+    reasoningPolicyForSettings(settings, {
+      ...(quirks.acceptsAnthropicRedactedThinking !== undefined
+        ? { acceptsAnthropicRedactedThinking: quirks.acceptsAnthropicRedactedThinking }
+        : {}),
+    }),
+    quirks.reasoningPreservationFormat,
+    'plaintext-only',
+    'unknown',
+  )
 }
 
 export function estimateSettingsPromptSize(
   settings: ChatSettings,
-  activePathMessages: Message[],
+  activePathMessages: readonly Message[],
   draftText: string,
   endpointTokenizer: string | null | undefined,
   // Provider/model cap. When provided AND the user hasn't set an explicit
@@ -535,6 +636,8 @@ export function estimateSettingsPromptSize(
   calibration?: TokenEstimateCalibrationContext,
   draftAttachmentRefs?: readonly AttachmentRef[],
   preCutAttachmentIds?: readonly AttachmentId[],
+  routing?: AssistantRouteContract,
+  contextReuse?: PromptSizeContextReuse,
 ): PromptSizeEstimate {
   return estimatePromptSize(
     buildSettingsPromptSizeEstimateInput(
@@ -547,6 +650,8 @@ export function estimateSettingsPromptSize(
       calibration,
       draftAttachmentRefs,
       preCutAttachmentIds,
+      routing,
+      contextReuse,
     ),
   )
 }

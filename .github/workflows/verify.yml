@@ -19,6 +19,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
 
       - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6
 
@@ -29,49 +31,24 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
 
-      - name: Check peer dependencies (advisory)
-        id: peer_dependencies
-        continue-on-error: true
-        run: pnpm deps:peers
-
-      - name: Check formatting and lint (advisory)
-        id: biome
-        continue-on-error: true
-        run: pnpm check:ci
-
-      - name: Check semantic lint (advisory)
-        id: semantic_lint
-        continue-on-error: true
-        run: pnpm lint:semantic
-
-      - name: Check dead code (advisory)
-        id: dead_code
-        continue-on-error: true
-        run: pnpm deadcode
-
-      - run: pnpm test:run
-        env:
-          NODE_OPTIONS: --localstorage-file=/tmp/natter-vitest-${{ github.run_id }}-${{ github.run_attempt }}.json
-
       - run: pnpm exec playwright install --with-deps chromium
 
-      - name: Test the built app against the loopback fake provider
-        run: pnpm e2e
-        env:
-          E2E_FAKE_PROVIDER_PORT: 4174
+      - run: sudo apt-get install --yes openbox x11-utils
 
-      - name: Check performance budgets (advisory)
-        id: performance
-        continue-on-error: true
-        run: pnpm perf:report
+      - name: Run seam-aware verification
+        run: pnpm verify:ci
 
-      - name: Report advisory findings
-        if: >-
-          always() && (
-            steps.peer_dependencies.outcome == 'failure' ||
-            steps.biome.outcome == 'failure' ||
-            steps.semantic_lint.outcome == 'failure' ||
-            steps.dead_code.outcome == 'failure' ||
-            steps.performance.outcome == 'failure'
-          )
-        run: echo "::warning title=Advisory verification findings::One or more non-blocking checks reported findings; see the advisory step logs."
+      - name: Upload verification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verification-evidence-${{ github.run_attempt }}
+          path: |
+            test-results/verification-summary.json
+            test-results/verification-checkpoint/
+            test-results/verification-stages/
+            test-results/playwright-results/
+            test-results/migration-cut/
+            test-results/verification-slice/
+          if-no-files-found: error
+          retention-days: 7

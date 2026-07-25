@@ -14,20 +14,17 @@ import type { ConnectionProfile } from '../core/types'
 import { errorFromUnknown } from '../lib/error'
 import {
   type ApiKeyDispatchContext,
-  buildHeaders,
-  fetchWithApiKeyFallback,
-  hasExplicitAuthHeaderOverride,
-  readErrorResponseJson,
+  dispatchProviderJsonRequest,
+  type ProviderDispatchResult,
 } from './client'
 import { deferAdapterRequest } from './deferred-request'
-import { normalizeError } from './errors'
 import type {
   GeminiStreamChunk,
   GenerateContentRequestWire,
   GenerateContentResponseWire,
 } from './gemini-types'
 import { validateGeminiResponse } from './provider-json-boundary'
-import { decodeProviderStreamFrame, decodeValidatedProviderJson, parseSSE } from './sse'
+import { consumeProviderOnce, consumeProviderStream } from './provider-stream-runtime'
 import type { CallOpts } from './types'
 
 export interface GeminiContext extends ApiKeyDispatchContext {
@@ -35,7 +32,7 @@ export interface GeminiContext extends ApiKeyDispatchContext {
 }
 
 // "models/{model}" is the Gemini URL pattern. Model ids sometimes arrive
-// with a slug prefix ("google/gemini-3.1-flash-lite-preview") from
+// with a provider slug prefix (for example, "google/gemini-3.5-flash") from
 // OpenRouter-shaped settings; the prefix is stripped.
 function normalizeModelId(raw: string): string {
   const slash = raw.indexOf('/')
@@ -55,48 +52,16 @@ function dispatch(
   modelId: string,
   stream: boolean,
   opts: CallOpts,
-): Promise<Response> {
-  return dispatchSerialized(ctx, JSON.stringify(req), modelId, stream, opts)
-}
-
-function dispatchSerialized(
-  ctx: GeminiContext,
-  body: string,
-  modelId: string,
-  stream: boolean,
-  opts: CallOpts,
-): Promise<Response> {
-  const url = geminiUrl(ctx.profile, modelId, stream)
-  const fetchOpts: { signal?: AbortSignal; timeoutMs?: number } = {}
-  if (opts.signal) fetchOpts.signal = opts.signal
-  if (opts.timeoutMs !== undefined) fetchOpts.timeoutMs = opts.timeoutMs
-  const authCtx = hasExplicitAuthHeaderOverride(ctx.profile, opts.overrideHeaders, 'x-goog-api-key')
-    ? { apiKey: ctx.apiKey }
-    : ctx
-  const fetched = fetchWithApiKeyFallback(
-    authCtx,
-    (apiKey) => {
-      const headers = buildHeaders(ctx.profile, apiKey, {
-        method: 'POST',
-        authScheme: 'gemini-native',
-        ...(opts.overrideHeaders ? { overrideHeaders: opts.overrideHeaders } : {}),
-      })
-      return { url, init: { method: 'POST', headers, body } }
-    },
-    fetchOpts,
-  )
-  return requireSuccessfulResponse(fetched)
-}
-
-async function requireSuccessfulResponse(
-  fetched: ReturnType<typeof fetchWithApiKeyFallback>,
-): Promise<Response> {
-  const { response } = await fetched
-  if (!response.ok) {
-    const errorBody = await readErrorResponseJson(response)
-    throw normalizeError(errorBody, { midStream: false, httpStatus: response.status })
-  }
-  return response
+): Promise<ProviderDispatchResult> {
+  return dispatchProviderJsonRequest({
+    adapter: 'gemini-native',
+    context: ctx,
+    url: geminiUrl(ctx.profile, modelId, stream),
+    request: req,
+    opts,
+    authHeaderName: 'x-goog-api-key',
+    authScheme: 'gemini-native',
+  })
 }
 
 export function geminiStream(
@@ -110,46 +75,30 @@ export function geminiStream(
   )
 }
 
-async function* consumeGeminiStream(
-  dispatched: Promise<Response>,
+function consumeGeminiStream(
+  dispatched: Promise<ProviderDispatchResult>,
   signal: AbortSignal | undefined,
 ): AsyncGenerator<GeminiStreamChunk, void, unknown> {
-  const response = await dispatched
-  const generationId = response.headers.get('x-request-id') ?? undefined
-  const contentType = response.headers.get('content-type') ?? ''
-
-  // Buffered fallback — if the server answers with a single JSON object
-  // despite `?alt=sse`, yield a buffered_result chunk so downstream code
-  // can unify the consumer path.
-  if (!/text\/event-stream/i.test(contentType)) {
-    const result = await decodeValidatedProviderJson(response, validateGeminiResponse)
-    yield generationId
-      ? { type: 'buffered_result', result, generationId }
-      : { type: 'buffered_result', result }
-    return
-  }
-
-  for await (const ev of parseSSE(response, signal ? { signal } : {})) {
-    if (ev.kind === 'done') continue
-    if (ev.kind === 'keepalive') {
-      yield { type: 'keepalive', comment: ev.comment }
-      continue
-    }
-    const decoded = decodeProviderStreamFrame({
-      adapter: 'gemini-native',
-      eventType: ev.event,
-      data: ev.data,
-      validate: validateGeminiResponse,
-    })
-    if (!decoded.ok) {
-      console.warn('geminiStream: invalid SSE frame skipped', decoded.diagnostic)
-      yield { type: 'integrity', integrity: decoded.integrity }
-      continue
-    }
-    yield generationId
-      ? { type: 'chunk', chunk: decoded.value, generationId }
-      : { type: 'chunk', chunk: decoded.value }
-  }
+  return consumeProviderStream<
+    GenerateContentResponseWire,
+    GenerateContentResponseWire,
+    GeminiStreamChunk
+  >({
+    adapter: 'gemini-native',
+    dispatched,
+    ...(signal ? { signal } : {}),
+    generationId: (response) => response.headers.get('x-request-id') ?? undefined,
+    validateBuffered: validateGeminiResponse,
+    validateFrame: validateGeminiResponse,
+    bufferedChunk: (result, generationId) =>
+      generationId
+        ? { type: 'buffered_result', result, generationId }
+        : { type: 'buffered_result', result },
+    frameChunk: (chunk, generationId) =>
+      generationId ? { type: 'chunk', chunk, generationId } : { type: 'chunk', chunk },
+    integrityChunk: (integrity) => ({ type: 'integrity', integrity }),
+    keepaliveChunk: (comment) => ({ type: 'keepalive', comment }),
+  })
 }
 
 export function geminiOnce(
@@ -166,8 +115,7 @@ export function geminiOnce(
 }
 
 async function consumeGeminiOnce(
-  dispatched: Promise<Response>,
+  dispatched: Promise<ProviderDispatchResult>,
 ): Promise<GenerateContentResponseWire> {
-  const response = await dispatched
-  return decodeValidatedProviderJson(response, validateGeminiResponse)
+  return consumeProviderOnce(dispatched, validateGeminiResponse)
 }

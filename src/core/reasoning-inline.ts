@@ -53,6 +53,27 @@ export interface InlineReasoningLifter {
   finish(): InlineReasoningEvent[]
 }
 
+export function normalizeInlineReasoningPayload(value: string): string {
+  let text = value.trim()
+  let changed = true
+  while (changed) {
+    const before = text
+    text = text
+      .replace(/^<think>\s*/iu, '')
+      .replace(/\s*<\/think>$/iu, '')
+      .replace(/^<thought>\s*/iu, '')
+      .replace(/\s*<\/thought>$/iu, '')
+      .trim()
+    changed = text !== before
+  }
+  return text
+    .replace(/<think>/giu, '<think >')
+    .replace(/<\/think>/giu, '</think >')
+    .replace(/<thought>/giu, '<thought >')
+    .replace(/<\/thought>/giu, '</thought >')
+    .trim()
+}
+
 export function createInlineReasoningLifter(
   opts: InlineReasoningLifterOptions = {},
 ): InlineReasoningLifter {

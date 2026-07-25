@@ -2,7 +2,6 @@ import { memo, useMemo } from 'react'
 import type { MessageRole } from '../../core/types'
 import { PersonIcon, RobotIcon } from '../icons/Icon'
 
-const WRAP_CACHE_LIMIT = 512
 const POPOVER_MAX_WIDTH = 420
 const POPOVER_MIN_WIDTH = 80
 const POPOVER_MAX_HEIGHT = 252
@@ -12,18 +11,12 @@ interface WrappedLine {
   text: string
 }
 
-interface WrappedLinesCacheEntry {
-  sourceText: string
-  lines: WrappedLine[]
-}
-
 interface ExpandedPreviewProps {
   kind: 'expanded'
   role: MessageRole
   text: string
   width: number
   fontFamily: string
-  cacheKey?: string | undefined
 }
 
 interface HoverPreviewProps {
@@ -37,8 +30,6 @@ interface HoverPreviewProps {
   fontFamily: string
 }
 
-const wrapCache = new Map<string, WrappedLinesCacheEntry>()
-
 export const BranchTreePreview = memo(function BranchTreePreview(
   props: ExpandedPreviewProps | HoverPreviewProps,
 ) {
@@ -46,10 +37,10 @@ export const BranchTreePreview = memo(function BranchTreePreview(
   return <HoverPreview {...props} />
 })
 
-function ExpandedPreview({ role, text, width, fontFamily, cacheKey }: ExpandedPreviewProps) {
+function ExpandedPreview({ role, text, width, fontFamily }: ExpandedPreviewProps) {
   const lines = useMemo(
-    () => wrappedLines(text, width - 32, 4, fontFamily, cacheKey),
-    [cacheKey, fontFamily, text, width],
+    () => wrapPreviewLines(text, width - 32, 4, fontFamily),
+    [fontFamily, text, width],
   )
   return (
     <g data-ui="branch-tree-node-card-content">
@@ -86,7 +77,7 @@ function HoverPreview({
         : 'No text content'
   const width = Math.min(POPOVER_MAX_WIDTH, Math.max(POPOVER_MIN_WIDTH, viewport.width - 16))
   const lines = useMemo(
-    () => wrappedLines(previewText, width - 32, 10, fontFamily),
+    () => wrapPreviewLines(previewText, width - 32, 10, fontFamily),
     [fontFamily, previewText, width],
   )
   const height = Math.min(POPOVER_MAX_HEIGHT, 54 + Math.max(1, lines.length) * 19)
@@ -114,32 +105,6 @@ function HoverPreview({
       </text>
     </g>
   )
-}
-
-function wrappedLines(
-  text: string,
-  maxWidth: number,
-  maxLines: number,
-  fontFamily: string,
-  sourceKey?: string,
-): WrappedLine[] {
-  const key = sourceKey ? `${sourceKey}\u0000${fontFamily}\u0000${maxWidth}\u0000${maxLines}` : null
-  const cached = key ? wrapCache.get(key) : undefined
-  if (key && cached?.sourceText === text) {
-    wrapCache.delete(key)
-    wrapCache.set(key, cached)
-    return cached.lines
-  }
-  const lines = wrapPreviewLines(text, maxWidth, maxLines, fontFamily)
-  if (key) {
-    wrapCache.set(key, { sourceText: text, lines })
-    while (wrapCache.size > WRAP_CACHE_LIMIT) {
-      const oldest = wrapCache.keys().next().value
-      if (oldest === undefined) break
-      wrapCache.delete(oldest)
-    }
-  }
-  return lines
 }
 
 function wrapPreviewLines(

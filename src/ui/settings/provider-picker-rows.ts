@@ -9,15 +9,15 @@
 
 import {
   type ExclusionReason,
+  hasHardPrivacyExclusion,
   type PrivacyFilterResult,
   type PrivacyTier,
   privacyTierForPolicy,
 } from '../../core/privacy-filter'
 import {
-  endpointMatchesAnyProviderRef,
+  ProviderEndpointIndex,
   providerEndpointKey,
   providerRoutingRef,
-  resolveProviderRefsToRoutingRefs,
 } from '../../core/provider-identity'
 import type { DataPolicy, ModelEndpoint, PrivacyPrefs, ProviderPreferences } from '../../core/types'
 
@@ -30,6 +30,10 @@ export interface PickerRow {
   tier: PrivacyTier
   reasons: readonly ExclusionReason[]
   policySynthesized: boolean
+}
+
+export function pickerRowIsHardDenied(row: PickerRow): boolean {
+  return hasHardPrivacyExclusion(row.reasons)
 }
 
 interface BuildPickerRowsOptions {
@@ -61,6 +65,9 @@ export function buildPickerRows(
   for (const k of filter.kept) kept.set(providerEndpointKey(k.endpoint), k)
   const excluded = new Map<string, (typeof filter.excluded)[number]>()
   for (const e of filter.excluded) excluded.set(providerEndpointKey(e.endpoint), e)
+  const endpointIndex = new ProviderEndpointIndex(endpoints)
+  const ignoredEndpoints = endpointIndex.endpointsForRefs(opts.providerPrefs?.ignore)
+  const onlyEndpoints = endpointIndex.endpointsForRefs(opts.providerPrefs?.only)
 
   return endpoints.map((ep) => {
     const key = providerEndpointKey(ep)
@@ -74,7 +81,7 @@ export function buildPickerRows(
         reasons: ex.reasons,
         policySynthesized: ex.policySynthesized,
       }
-      return applyManualPickerState(row, opts, endpoints)
+      return applyManualPickerState(row, opts, ignoredEndpoints, onlyEndpoints)
     }
     const k = kept.get(key)
     if (k) {
@@ -86,7 +93,7 @@ export function buildPickerRows(
         reasons: [],
         policySynthesized: k.policySynthesized,
       }
-      return applyManualPickerState(row, opts, endpoints)
+      return applyManualPickerState(row, opts, ignoredEndpoints, onlyEndpoints)
     }
     // An endpoint that made it into `endpoints` but not into `kept` or
     // `excluded` means the filter skipped it — shouldn't happen, but
@@ -99,27 +106,27 @@ export function buildPickerRows(
       reasons: ['unknown-policy'],
       policySynthesized: false,
     }
-    return applyManualPickerState(row, opts, endpoints)
+    return applyManualPickerState(row, opts, ignoredEndpoints, onlyEndpoints)
   })
 }
 
 function applyManualPickerState(
   row: PickerRow,
   opts: BuildPickerRowsOptions,
-  endpoints: readonly ModelEndpoint[],
+  ignoredEndpoints: ReadonlySet<ModelEndpoint>,
+  onlyEndpoints: ReadonlySet<ModelEndpoint>,
 ): PickerRow {
   const providerPrefs = opts.providerPrefs
   const userTouchedPicker = providerPrefs?.ignoreOverridesFilter === true
   const hasOnly = (providerPrefs?.only?.length ?? 0) > 0
+  if (pickerRowIsHardDenied(row)) return row
   if (!userTouchedPicker && !hasOnly) return row
 
-  const ignoredByPicker =
-    userTouchedPicker &&
-    endpointMatchesAnyProviderRef(row.endpoint, providerPrefs.ignore, endpoints)
+  const ignoredByPicker = userTouchedPicker && ignoredEndpoints.has(row.endpoint)
   if (ignoredByPicker) {
     return { ...row, state: 'auto-excluded', reasons: ['user-ignored'] }
   }
-  if (hasOnly && !endpointMatchesAnyProviderRef(row.endpoint, providerPrefs?.only, endpoints)) {
+  if (hasOnly && !onlyEndpoints.has(row.endpoint)) {
     return { ...row, state: 'auto-excluded', reasons: ['not-in-only-list'] }
   }
 
@@ -208,11 +215,12 @@ export function ignoredProviderRefsAfterBulkDeselect(
   providerPrefs: ProviderPreferences | undefined,
   shouldDeselect: (endpoint: ModelEndpoint) => boolean,
 ): string[] {
+  const endpointIndex = new ProviderEndpointIndex(endpoints)
   const ignored = new Set<string>()
   for (const row of rows) {
     if (row.state !== 'kept') ignored.add(providerRoutingRef(row.endpoint))
   }
-  for (const ref of resolveProviderRefsToRoutingRefs(endpoints, providerPrefs?.ignore, {
+  for (const ref of endpointIndex.resolveRoutingRefs(providerPrefs?.ignore, {
     preserveUnknown: true,
   })) {
     ignored.add(ref)

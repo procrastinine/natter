@@ -1,122 +1,149 @@
-// BroadcastChannel delivers messages to OTHER tabs only — the sender never
-// receives its own `postMessage`. For same-tab-within-a-module fan-out
-// UI listeners need to fire on local writes too, so `postEvent` dispatches
-// locally and also crosses the channel. The two paths never double-fire because
-// remote tabs only see the BroadcastChannel path and local tabs only see the
-// direct dispatch (their own BC instance ignores their own posts).
+import { browserLocalStorage } from '../lib/browser-storage'
+import type { WorkspaceFence } from './repository'
+import {
+  canonicalizeWorkspaceChange,
+  workspaceFenceFromUnknownChange,
+} from './workspace-change-boundary'
+import type { WorkspaceChange } from './workspace-protocol'
+import type { WorkspaceRuntimeResourceSubset } from './workspace-runtime-control'
 
-import Dexie, { type ObservabilitySet, RangeSet } from 'dexie'
-import type {
-  ChatId,
-  FolderId,
-  KeyId,
-  PresetId,
-  ProfileId,
-  PromptPresetId,
-  TagId,
-} from '../core/types'
-import type { ChatMutationSummary, StreamLeaseRow } from './repository'
-
-type EngineKind = 'daemon' | 'in-tab'
-type AutoTitleStatus = 'auto' | 'auto-failed' | 'manual'
-type StreamOutcome = 'done' | 'error' | 'abort'
-type EngineDetachReason = 'daemon-offline' | 'tab-close' | 'shutdown'
-
-export type BroadcastEvent =
-  | {
-      kind: 'chat-mutated'
-      chatId: ChatId
-      metaVersion: number
-      summaryVersion: number
-      affected: ChatMutationSummary[]
-    }
-  | { kind: 'chat-deleted'; chatId: ChatId }
-  | { kind: 'branch-cache-refreshed'; chatId: ChatId }
-  | { kind: 'profile-mutated'; profileId: ProfileId }
-  | { kind: 'profile-deleted'; profileId: ProfileId }
-  | { kind: 'preset-mutated'; presetId: PresetId }
-  | { kind: 'preset-deleted'; presetId: PresetId }
-  | { kind: 'prompt-preset-mutated'; promptPresetId: PromptPresetId }
-  | { kind: 'prompt-preset-deleted'; promptPresetId: PromptPresetId }
-  | { kind: 'folder-mutated'; folderId: FolderId }
-  | { kind: 'folder-deleted'; folderId: FolderId }
-  | { kind: 'tag-mutated'; tagId: TagId }
-  | { kind: 'tag-deleted'; tagId: TagId }
-  | { kind: 'autotitle-completed'; chatId: ChatId; status: AutoTitleStatus }
-  | { kind: 'key-rotated'; keyId: KeyId }
-  | { kind: 'settings-mutated'; key: string }
-  | { kind: 'workspace-replaced'; replacementEpoch: number }
-  | { kind: 'workspace-invalidated'; mutationCounter: number }
-  | { kind: 'privacy-refreshed'; profileId: ProfileId; modelId: string }
-  | { kind: 'models-refreshed'; profileId: ProfileId }
-  | {
-      kind: 'stream-started'
-      chatId: ChatId
-      streamId: string
-      messageId?: string
-      attemptKind?: 'generation' | 'continuation'
-      ownerClientId: string
-      replacementEpoch: number
-      admissionSequence?: number
-    }
-  | { kind: 'stream-heartbeat'; lease: StreamLeaseRow }
-  | {
-      kind: 'stream-abort-requested'
-      chatId: ChatId
-      streamId: string
-      ownerClientId: string
-      replacementEpoch: number
-    }
-  | {
-      kind: 'stream-ended'
-      chatId: ChatId
-      streamId: string
-      messageId?: string
-      outcome: StreamOutcome
-      replacementEpoch: number
-    }
-  | { kind: 'engine-attached'; engineKind: EngineKind; version: string }
-  | { kind: 'engine-detached'; reason: EngineDetachReason }
-
-export type BroadcastDelivery = 'local' | 'remote'
-type BroadcastHandler = (event: BroadcastEvent, delivery: BroadcastDelivery) => void
-type FallbackSnapshotReader = () => Promise<{
-  db: Dexie
-  mutationCounter: number
-  replacementEpoch?: number
+type FallbackSnapshotReader = (signal?: AbortSignal) => Promise<{
+  workspaceId: string
+  replacementEpoch: number
 }>
 
 const CHANNEL_NAME = 'llm-api-frontend'
-const FALLBACK_POLL_INTERVAL_MS = 1_000
+const FALLBACK_SIGNAL_KEY = 'natter:workspace-change'
 
 let channel: BroadcastChannel | null = null
 let channelUnavailable = false
-const localSubs = new Set<BroadcastHandler>()
-let fallbackPollTimer: ReturnType<typeof setTimeout> | null = null
-let fallbackPollActive = false
-let fallbackPollInFlight = false
-let fallbackPollGeneration = 0
-let lastMutationCounter: number | null = null
-let lastReplacementEpoch: number | null = null
+const workspaceChangeSubs = new Set<(change: WorkspaceChange) => void>()
+const remoteWorkspaceChangeSubs = new Set<(change: WorkspaceChange) => void>()
+const workspaceApplicationChangeSubs = new Set<(change: WorkspaceChange) => void>()
+let fallbackVerificationActive = false
+let deliveredWorkspaceFence: WorkspaceFence | null = null
 let productionFallbackSnapshotReader: FallbackSnapshotReader | null = null
 let fallbackSnapshotReader: FallbackSnapshotReader = readFallbackSnapshot
+let broadcastAdmissionsOpen = false
+let fallbackVerificationAdmissionsOpen = false
+let remoteInboundAdmissionsOpen = false
+let remoteWorkspaceChangeMissed = false
+let durableVerificationRequested = false
+let durableVerificationInFlight = false
+let durableVerificationPromise: Promise<void> = Promise.resolve()
+let durableVerificationGeneration = 0
+let storageListenerInstalled = false
+let lifecycleListenersInstalled = false
+
+export const broadcastWorkspaceRuntimeResources = {
+  'broadcast-remote-inbound': {
+    id: 'broadcast-remote-inbound',
+    phase: 'inbound',
+    closeAdmissions: () => {
+      remoteInboundAdmissionsOpen = false
+      stopFallbackVerification()
+    },
+    abort: () => {},
+    awaitIdle: () => Promise.resolve(),
+    assertClosed: () => {
+      if (remoteInboundAdmissionsOpen) throw new Error('BroadcastRemoteInboundNotClosed')
+    },
+    attach: (snapshot) => {
+      const previousFence = deliveredWorkspaceFence
+      setDeliveredWorkspaceFence(snapshot)
+      if (previousFence !== null) {
+        fanOutWorkspaceChange(
+          !sameWorkspaceFence(previousFence, snapshot)
+            ? replacementChange(snapshot)
+            : invalidationChange(snapshot),
+        )
+      } else if (remoteWorkspaceChangeMissed) {
+        fanOutWorkspaceChange(invalidationChange(snapshot))
+      }
+      remoteWorkspaceChangeMissed = false
+      remoteInboundAdmissionsOpen = true
+      if (hasWorkspaceChangeSubscribers() && channel === null) startFallbackVerification()
+    },
+  },
+  'broadcast-fallback-verification': {
+    id: 'broadcast-fallback-verification',
+    phase: 'query',
+    closeAdmissions: () => {
+      fallbackVerificationAdmissionsOpen = false
+    },
+    abort: stopFallbackVerification,
+    awaitIdle: () => durableVerificationPromise,
+    assertClosed: () => {
+      if (
+        fallbackVerificationAdmissionsOpen ||
+        fallbackVerificationActive ||
+        durableVerificationInFlight ||
+        storageListenerInstalled ||
+        lifecycleListenersInstalled
+      ) {
+        throw new Error('BroadcastFallbackVerificationNotClosed')
+      }
+    },
+    attach: () => {
+      fallbackVerificationAdmissionsOpen = true
+      if (hasWorkspaceChangeSubscribers() && channel === null) startFallbackVerification()
+    },
+  },
+  broadcast: {
+    id: 'broadcast',
+    phase: 'transport',
+    closeAdmissions: () => {
+      broadcastAdmissionsOpen = false
+    },
+    abort: () => {},
+    awaitIdle: () => Promise.resolve(),
+    assertClosed: () => {
+      if (broadcastAdmissionsOpen || channel !== null) {
+        throw new Error('BroadcastTransportNotClosed')
+      }
+    },
+    finishDispose: () => {
+      closeChannel(channel)
+      channel = null
+      stopFallbackVerification()
+    },
+    attach: () => {
+      broadcastAdmissionsOpen = true
+      if (!hasWorkspaceChangeSubscribers()) return
+      if (!ensureChannel()) startFallbackVerification()
+    },
+  },
+} satisfies WorkspaceRuntimeResourceSubset<
+  'broadcast-remote-inbound' | 'broadcast-fallback-verification' | 'broadcast'
+>
 
 function ensureChannel(): BroadcastChannel | null {
   if (channel !== null) return channel
+  if (!broadcastAdmissionsOpen) return null
   if (channelUnavailable || typeof BroadcastChannel === 'undefined') {
     channelUnavailable = true
-    startFallbackPolling()
+    startFallbackVerification()
     return null
   }
   let next: BroadcastChannel | null = null
   try {
     next = new BroadcastChannel(CHANNEL_NAME)
-    next.addEventListener('message', (msg: MessageEvent) => {
-      if (isEpochFencedBroadcastEvent(msg.data)) fanOutLocal(msg.data, 'remote')
+    next.addEventListener('message', (message: MessageEvent) => {
+      let change: WorkspaceChange
+      try {
+        change = canonicalizeWorkspaceChange(message.data)
+      } catch {
+        remoteWorkspaceChangeMissed = true
+        requestDurableWorkspaceVerification()
+        return
+      }
+      if (!remoteInboundAdmissionsOpen) {
+        remoteWorkspaceChangeMissed = true
+        return
+      }
+      receiveRemoteWorkspaceChange(change)
     })
-    next.addEventListener('messageerror', () => {
-      makeChannelUnavailable(next)
-    })
+    next.addEventListener('messageerror', () => makeChannelUnavailable(next))
     channel = next
     return channel
   } catch {
@@ -126,47 +153,11 @@ function ensureChannel(): BroadcastChannel | null {
   }
 }
 
-function isEpochFencedBroadcastEvent(value: unknown): value is BroadcastEvent {
-  if (
-    !value ||
-    typeof value !== 'object' ||
-    typeof (value as { kind?: unknown }).kind !== 'string'
-  ) {
-    return false
-  }
-  const event = value as { kind: string; replacementEpoch?: unknown; lease?: unknown }
-  if (event.kind === 'stream-heartbeat') {
-    const lease = event.lease
-    return (
-      !!lease &&
-      typeof lease === 'object' &&
-      isReplacementEpoch((lease as { replacementEpoch?: unknown }).replacementEpoch)
-    )
-  }
-  if (
-    event.kind === 'workspace-replaced' ||
-    event.kind === 'stream-started' ||
-    event.kind === 'stream-abort-requested' ||
-    event.kind === 'stream-ended'
-  ) {
-    return isReplacementEpoch(event.replacementEpoch)
-  }
-  return true
-}
-
-function isReplacementEpoch(value: unknown): value is number {
-  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
-}
-
-export function isBroadcastChannelAvailable(): boolean {
-  return ensureChannel() !== null
-}
-
 function closeChannel(target: BroadcastChannel | null): void {
   try {
     target?.close()
   } catch {
-    // A broken transport must not escape notification cleanup.
+    // Transport cleanup cannot affect workspace state.
   }
 }
 
@@ -175,61 +166,221 @@ function makeChannelUnavailable(target: BroadcastChannel | null): void {
   closeChannel(channel)
   channel = null
   channelUnavailable = true
-  startFallbackPolling()
+  startFallbackVerification()
 }
 
-function retryChannelPost(event: BroadcastEvent, failedChannel: BroadcastChannel): void {
-  if (channel !== failedChannel) return
+function retryChannelPost(change: WorkspaceChange, failedChannel: BroadcastChannel): boolean {
+  if (channel !== failedChannel) return false
   closeChannel(failedChannel)
   channel = null
   const retry = ensureChannel()
-  if (!retry) return
+  if (!retry) return false
   try {
-    retry.postMessage(event)
+    retry.postMessage(change)
+    return true
   } catch {
     makeChannelUnavailable(retry)
+    return false
   }
 }
 
-function fanOutLocal(event: BroadcastEvent, delivery: BroadcastDelivery): void {
-  for (const handler of [...localSubs]) {
+function fanOutWorkspaceChange(
+  change: WorkspaceChange,
+  delivery: 'local' | 'shared' = 'shared',
+): void {
+  const canonical = canonicalizeWorkspaceChange(change)
+  const subscribers =
+    delivery === 'local'
+      ? [...workspaceApplicationChangeSubs, ...workspaceChangeSubs]
+      : [...workspaceApplicationChangeSubs, ...workspaceChangeSubs, ...remoteWorkspaceChangeSubs]
+  for (const handler of subscribers) {
     try {
-      handler(event, delivery)
+      handler(canonical)
     } catch {
-      // Broadcast delivery is post-commit notification; subscriber failures are isolated.
+      // A projection subscriber cannot affect transport delivery.
     }
   }
 }
 
-export function postEvent(event: BroadcastEvent): void {
-  const bc = ensureChannel()
-  if (bc) {
-    try {
-      bc.postMessage(event)
-    } catch {
-      retryChannelPost(event, bc)
+function receiveLocalWorkspaceChange(change: WorkspaceChange): void {
+  const stamp = workspaceStamp(change)
+  const prior = deliveredWorkspaceFence
+  if (prior && !sameWorkspaceFence(prior, stamp)) {
+    setDeliveredWorkspaceFence(stamp)
+    if (change.kind === 'replace') fanOutWorkspaceChange(change, 'local')
+    else {
+      fanOutWorkspaceChange(replacementChange(stamp), 'local')
+      fanOutWorkspaceChange(change, 'local')
     }
+    return
   }
-  fanOutLocal(event, 'local')
+  setDeliveredWorkspaceFence(stamp)
+  fanOutWorkspaceChange(change, 'local')
 }
 
-export function onEvent(handler: BroadcastHandler): () => void {
+function receiveRemoteWorkspaceChange(change: WorkspaceChange): void {
+  const stamp = workspaceStamp(change)
+  const current = deliveredWorkspaceFence
+  if (!current || !sameWorkspaceFence(current, stamp)) {
+    remoteWorkspaceChangeMissed = true
+    requestDurableWorkspaceVerification()
+    return
+  }
+  fanOutWorkspaceChange(change)
+}
+
+function requestDurableWorkspaceVerification(): void {
+  durableVerificationRequested = true
+  if (durableVerificationInFlight) return
+  durableVerificationInFlight = true
+  const generation = durableVerificationGeneration
+  durableVerificationPromise = (async () => {
+    while (
+      generation === durableVerificationGeneration &&
+      durableVerificationRequested &&
+      remoteInboundAdmissionsOpen
+    ) {
+      durableVerificationRequested = false
+      try {
+        const snapshot = await fallbackSnapshotReader()
+        if (generation !== durableVerificationGeneration) return
+        if (remoteInboundAdmissionsClosed()) {
+          remoteWorkspaceChangeMissed = true
+          return
+        }
+        const prior = deliveredWorkspaceFence
+        setDeliveredWorkspaceFence(snapshot)
+        fanOutWorkspaceChange(
+          prior && !sameWorkspaceFence(prior, snapshot)
+            ? replacementChange(snapshot)
+            : invalidationChange(snapshot),
+        )
+        remoteWorkspaceChangeMissed = false
+      } catch {
+        remoteWorkspaceChangeMissed = true
+      }
+    }
+  })().finally(() => {
+    if (generation !== durableVerificationGeneration) return
+    durableVerificationInFlight = false
+    if (durableVerificationRequested && remoteInboundAdmissionsOpen) {
+      requestDurableWorkspaceVerification()
+    }
+  })
+}
+
+function remoteInboundAdmissionsClosed(): boolean {
+  return !remoteInboundAdmissionsOpen
+}
+
+function workspaceStamp(change: WorkspaceChange): WorkspaceFence {
+  return change.kind === 'commit' ? change.stamp : change
+}
+
+function sameWorkspaceFence(left: WorkspaceFence, right: WorkspaceFence): boolean {
+  return left.workspaceId === right.workspaceId && left.replacementEpoch === right.replacementEpoch
+}
+
+function setDeliveredWorkspaceFence(snapshot: WorkspaceFence): void {
+  deliveredWorkspaceFence = {
+    workspaceId: snapshot.workspaceId,
+    replacementEpoch: snapshot.replacementEpoch,
+  }
+}
+
+function replacementChange(snapshot: WorkspaceFence): WorkspaceChange {
+  return {
+    kind: 'replace',
+    workspaceId: snapshot.workspaceId,
+    replacementEpoch: snapshot.replacementEpoch,
+  }
+}
+
+function invalidationChange(snapshot: WorkspaceFence): WorkspaceChange {
+  return {
+    kind: 'invalidate',
+    workspaceId: snapshot.workspaceId,
+    replacementEpoch: snapshot.replacementEpoch,
+    dependencies: 'all',
+  }
+}
+
+export function postWorkspaceChange(change: WorkspaceChange): void {
+  let canonical: WorkspaceChange
+  try {
+    canonical = canonicalizeWorkspaceChange(change)
+  } catch {
+    const fence = workspaceFenceFromUnknownChange(change)
+    if (!fence) return
+    canonical = canonicalizeWorkspaceChange(invalidationChange(fence))
+  }
+  try {
+    receiveLocalWorkspaceChange(canonical)
+  } catch {
+    // Local projection delivery cannot alter an authoritative commit.
+  }
+  try {
+    const bc = ensureChannel()
+    let posted = false
+    if (bc) {
+      try {
+        bc.postMessage(canonical)
+        posted = true
+      } catch {
+        posted = retryChannelPost(canonical, bc)
+      }
+    }
+    if (!posted) postFallbackSignal(canonical)
+  } catch {
+    postFallbackSignal(canonical)
+  }
+}
+
+export function subscribeWorkspaceChanges(
+  handler: (change: WorkspaceChange) => void,
+  options: { readonly delivery?: 'all' | 'remote' } = {},
+): () => void {
   const bc = ensureChannel()
-  localSubs.add(handler)
-  if (!bc) startFallbackPolling()
+  const subscribers =
+    options.delivery === 'remote' ? remoteWorkspaceChangeSubs : workspaceChangeSubs
+  subscribers.add(handler)
+  if (!bc) startFallbackVerification()
   return () => {
-    localSubs.delete(handler)
-    if (localSubs.size === 0) stopFallbackPolling()
+    subscribers.delete(handler)
+    if (!hasWorkspaceChangeSubscribers()) stopFallbackVerification()
   }
 }
 
-export function __resetBroadcastForTests(): void {
-  stopFallbackPolling()
+export function subscribeWorkspaceApplicationChanges(
+  handler: (change: WorkspaceChange) => void,
+): () => void {
+  const bc = ensureChannel()
+  workspaceApplicationChangeSubs.add(handler)
+  if (!bc) startFallbackVerification()
+  return () => {
+    workspaceApplicationChangeSubs.delete(handler)
+    if (!hasWorkspaceChangeSubscribers()) stopFallbackVerification()
+  }
+}
+
+export function __resetBroadcastForTests(options: { admissionsOpen?: boolean } = {}): void {
+  stopFallbackVerification()
   closeChannel(channel)
   channel = null
   channelUnavailable = false
-  localSubs.clear()
+  workspaceChangeSubs.clear()
+  remoteWorkspaceChangeSubs.clear()
   fallbackSnapshotReader = readFallbackSnapshot
+  const admissionsOpen = options.admissionsOpen ?? false
+  broadcastAdmissionsOpen = admissionsOpen
+  fallbackVerificationAdmissionsOpen = admissionsOpen
+  remoteInboundAdmissionsOpen = admissionsOpen
+  deliveredWorkspaceFence = null
+  remoteWorkspaceChangeMissed = false
+  durableVerificationGeneration += 1
+  durableVerificationRequested = false
+  durableVerificationInFlight = false
+  durableVerificationPromise = Promise.resolve()
 }
 
 export function __setBroadcastFallbackReaderForTests(reader: FallbackSnapshotReader | null): void {
@@ -240,99 +391,133 @@ export function configureBroadcastFallbackReader(reader: FallbackSnapshotReader)
   productionFallbackSnapshotReader = reader
 }
 
-function startFallbackPolling(): void {
-  if (fallbackPollActive || channel !== null || localSubs.size === 0) return
-  fallbackPollActive = true
-  const generation = ++fallbackPollGeneration
-  void pollWorkspaceMeta(generation)
+export function seedBroadcastWorkspaceSnapshot(snapshot: WorkspaceFence): void {
+  if (deliveredWorkspaceFence !== null) return
+  setDeliveredWorkspaceFence(snapshot)
 }
 
-function stopFallbackPolling(): void {
-  fallbackPollActive = false
-  fallbackPollGeneration += 1
-  lastMutationCounter = null
-  lastReplacementEpoch = null
-  if (fallbackPollTimer !== null) clearTimeout(fallbackPollTimer)
-  fallbackPollTimer = null
-}
-
-async function pollWorkspaceMeta(generation: number): Promise<void> {
-  if (!fallbackPollShouldRun(generation)) return
-  if (fallbackPollInFlight) {
-    scheduleFallbackPoll(generation)
+function startFallbackVerification(): void {
+  if (
+    !broadcastAdmissionsOpen ||
+    !fallbackVerificationAdmissionsOpen ||
+    !remoteInboundAdmissionsOpen ||
+    fallbackVerificationActive ||
+    channel !== null ||
+    !hasWorkspaceChangeSubscribers()
+  ) {
     return
   }
-
-  fallbackPollInFlight = true
-  try {
-    const { db, mutationCounter, replacementEpoch } = await fallbackSnapshotReader()
-    if (!fallbackPollShouldRun(generation)) return
-    if (mutationCounter === lastMutationCounter) return
-    const replacementChanged =
-      replacementEpoch !== undefined &&
-      lastReplacementEpoch !== null &&
-      replacementEpoch !== lastReplacementEpoch
-    lastMutationCounter = mutationCounter
-    if (replacementEpoch !== undefined) lastReplacementEpoch = replacementEpoch
-    fireBroadDexieInvalidation(db)
-    const event: BroadcastEvent = replacementChanged
-      ? { kind: 'workspace-replaced', replacementEpoch }
-      : { kind: 'workspace-invalidated', mutationCounter }
-    fanOutLocal(event, 'remote')
-  } catch {
-    // A transient open/read failure must not stop later cross-tab checks.
-  } finally {
-    fallbackPollInFlight = false
-    if (fallbackPollShouldRun(generation)) scheduleFallbackPoll(generation)
-  }
+  fallbackVerificationActive = true
+  installStorageListener()
+  installLifecycleListeners()
+  requestDurableWorkspaceVerification()
 }
 
-function fallbackPollShouldRun(generation: number): boolean {
+function hasWorkspaceChangeSubscribers(): boolean {
   return (
-    fallbackPollActive &&
-    fallbackPollGeneration === generation &&
-    channel === null &&
-    localSubs.size > 0
+    workspaceApplicationChangeSubs.size > 0 ||
+    workspaceChangeSubs.size > 0 ||
+    remoteWorkspaceChangeSubs.size > 0
   )
 }
 
-function scheduleFallbackPoll(generation: number): void {
-  if (!fallbackPollShouldRun(generation) || fallbackPollTimer !== null) return
-  fallbackPollTimer = setTimeout(() => {
-    fallbackPollTimer = null
-    void pollWorkspaceMeta(generation)
-  }, FALLBACK_POLL_INTERVAL_MS)
+function stopFallbackVerification(): void {
+  fallbackVerificationActive = false
+  removeStorageListener()
+  removeLifecycleListeners()
 }
 
-function fireBroadDexieInvalidation(db: Dexie): void {
-  Dexie.on.storagemutated.fire(buildBroadDexieObservabilitySet(db))
-}
-
-export function __buildBroadDexieObservabilitySetForTests(db: Dexie): ObservabilitySet {
-  return buildBroadDexieObservabilitySet(db)
-}
-
-function buildBroadDexieObservabilitySet(db: Dexie): ObservabilitySet {
-  const parts: ObservabilitySet = {}
-  for (const table of db.tables) {
-    const tablePart = `idb://${db.name}/${table.name}/`
-    parts[tablePart] = fullKeyRange()
-    parts[`${tablePart}:dels`] = fullKeyRange()
-    for (const index of table.schema.indexes) {
-      if (index.name) parts[`${tablePart}${index.name}`] = fullKeyRange()
-    }
+function postFallbackSignal(change: WorkspaceChange): void {
+  try {
+    const storage = browserLocalStorage()
+    if (!storage) return
+    const stamp = workspaceStamp(change)
+    const value = JSON.stringify({
+      workspaceId: stamp.workspaceId,
+      replacementEpoch: stamp.replacementEpoch,
+      commitId: change.kind === 'commit' ? change.stamp.commitId : null,
+      nonce: `${Date.now()}:${Math.random()}`,
+    })
+    storage.setItem(FALLBACK_SIGNAL_KEY, value)
+  } catch {
+    return
   }
-  return parts
 }
 
-function fullKeyRange(): RangeSet {
-  return new RangeSet(Dexie.minKey, Dexie.maxKey)
+function installStorageListener(): void {
+  if (storageListenerInstalled || typeof window === 'undefined') return
+  window.addEventListener('storage', handleStorageSignal)
+  storageListenerInstalled = true
+}
+
+function removeStorageListener(): void {
+  if (!storageListenerInstalled || typeof window === 'undefined') return
+  window.removeEventListener('storage', handleStorageSignal)
+  storageListenerInstalled = false
+}
+
+function handleStorageSignal(event: StorageEvent): void {
+  if (event.key !== FALLBACK_SIGNAL_KEY) return
+  if (!remoteInboundAdmissionsOpen) {
+    remoteWorkspaceChangeMissed = true
+    return
+  }
+  const fence = fallbackSignalFence(event.newValue)
+  if (fence && deliveredWorkspaceFence && sameWorkspaceFence(deliveredWorkspaceFence, fence)) {
+    fanOutWorkspaceChange(invalidationChange(fence))
+    remoteWorkspaceChangeMissed = false
+    return
+  }
+  remoteWorkspaceChangeMissed = true
+  requestDurableWorkspaceVerification()
+}
+
+function installLifecycleListeners(): void {
+  if (lifecycleListenersInstalled || typeof window === 'undefined') return
+  window.addEventListener('focus', handleFallbackLifecycleCatchUp)
+  window.addEventListener('pageshow', handleFallbackLifecycleCatchUp)
+  document.addEventListener('visibilitychange', handleFallbackVisibilityChange)
+  lifecycleListenersInstalled = true
+}
+
+function removeLifecycleListeners(): void {
+  if (!lifecycleListenersInstalled || typeof window === 'undefined') return
+  window.removeEventListener('focus', handleFallbackLifecycleCatchUp)
+  window.removeEventListener('pageshow', handleFallbackLifecycleCatchUp)
+  document.removeEventListener('visibilitychange', handleFallbackVisibilityChange)
+  lifecycleListenersInstalled = false
+}
+
+function handleFallbackVisibilityChange(): void {
+  if (document.visibilityState === 'visible') handleFallbackLifecycleCatchUp()
+}
+
+function handleFallbackLifecycleCatchUp(): void {
+  if (!fallbackVerificationActive || channel !== null) return
+  requestDurableWorkspaceVerification()
+}
+
+function fallbackSignalFence(value: string | null): WorkspaceFence | null {
+  if (!value) return null
+  try {
+    const parsed = JSON.parse(value) as Record<string, unknown>
+    return typeof parsed.workspaceId === 'string' &&
+      parsed.workspaceId.length > 0 &&
+      Number.isSafeInteger(parsed.replacementEpoch) &&
+      (parsed.replacementEpoch as number) >= 0
+      ? {
+          workspaceId: parsed.workspaceId,
+          replacementEpoch: parsed.replacementEpoch as number,
+        }
+      : null
+  } catch {
+    return null
+  }
 }
 
 async function readFallbackSnapshot(): Promise<{
-  db: Dexie
-  mutationCounter: number
-  replacementEpoch?: number
+  workspaceId: string
+  replacementEpoch: number
 }> {
   if (!productionFallbackSnapshotReader) throw new Error('BroadcastFallbackReaderUnavailable')
   return productionFallbackSnapshotReader()

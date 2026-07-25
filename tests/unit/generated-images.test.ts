@@ -1,491 +1,255 @@
-import Dexie from 'dexie'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { cloneDefaultChatSettings } from '../../src/core/defaults'
-import type { Chat, Message } from '../../src/core/types'
-import { newId } from '../../src/lib/ulid'
+import { describe, expect, it, vi } from 'vitest'
+import { GENERATED_OUTPUT_LOCALIZATION_PROCESSOR_ID } from '../../src/core/generated-output-localization'
+import type { AttachmentRef, ContentItem } from '../../src/core/types'
 import {
-  attachmentScopes,
-  deleteReferencedAttachmentBytes,
-  ingestAttachmentBytes,
-} from '../../src/store/attachments'
-import { __resetBroadcastForTests } from '../../src/store/broadcast'
-import {
-  __resetBrowserRepositoryForTests,
-  getBrowserRepository,
-} from '../../src/store/browser-repo'
-import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
-import {
-  commitPreparedGeneratedOutputAttachments,
-  materializeGeneratedOutputAttachments,
-  migrateGeneratedImageOutputAttachments,
-  normalizeGeneratedImageOutputAttachmentRefs,
-  persistPreparedGeneratedOutputAttachments,
+  contentNeedsGeneratedOutputMaterialization,
+  generatedOutputAttachmentId,
+  generatedOutputAttachmentIds,
+  localizedGeneratedOutputFilename,
+  mergeGeneratedImageAttachmentRefs,
   prepareGeneratedOutputAttachments,
+  prepareGeneratedOutputTerminalWrite,
 } from '../../src/store/generated-images'
-import { WorkspaceReplacementFenceError } from '../../src/store/repository'
-import {
-  markBrowserWorkspaceReplaced,
-  readBrowserWorkspaceMeta,
-} from '../../src/store/workspace-meta'
-import { expectAttachmentReferenceInvariants } from '../helpers/attachment-reference-invariants'
 
-const DB_NAME = 'natter'
 const ONE_PIXEL_PNG =
   'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII='
 
-async function resetAll() {
-  __resetDbForTests()
-  __resetBrowserRepositoryForTests()
-  __resetBroadcastForTests()
-  await Dexie.delete(DB_NAME)
-}
-
-beforeEach(async () => {
-  await resetAll()
-  await openDb()
-})
-
-afterEach(async () => {
-  await resetAll()
-})
-
-async function seedChat(): Promise<Chat> {
-  const chat: Chat = {
-    id: newId(),
-    title: 'Test',
-    titleStatus: 'untitled',
-    createdAt: 1,
-    updatedAt: 1,
-    lastViewedAt: 1,
-    wordCount: 0,
-    totalCostUsd: 0,
-    metaVersion: 0,
-    summaryVersion: 0,
-    settings: cloneDefaultChatSettings(),
-    lastUpdatedLeafId: null,
-    lastBranchUpdatedAt: 1,
-    archived: false,
-    pinned: false,
-    folderId: null,
-    tags: [],
-  }
-  await getDb().chats.put(chat)
-  return chat
-}
-
-async function putMessage(message: Message): Promise<void> {
-  await getBrowserRepository().runMutation(
-    [
-      { kind: 'message', messageId: message.id },
-      { kind: 'children', chatId: message.chatId, parentId: message.parentId },
-      ...[...new Set((message.attachmentRefs ?? []).map((ref) => ref.attachmentId))].map(
-        (attachmentId) => ({ kind: 'attachment' as const, attachmentId }),
-      ),
-    ],
-    async (ctx) => {
-      await ctx.putMessage(message)
-    },
-  )
-}
-
-describe('generated image output storage migration', () => {
-  it('keeps raw remote output URLs when background download fails', async () => {
-    const content = [{ type: 'output_image' as const, url: 'https://cdn.example/output.png' }]
+describe('canonical generated-output preparation', () => {
+  it('turns a remote image into a durable reference and deferred localization job without fetching', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch')
+    const source = 'https://cdn.example/output.png'
     const prepared = await prepareGeneratedOutputAttachments({
-      messageId: 'm-download-failed',
-      content,
-      downloader: async () => {
-        throw new Error('offline')
-      },
-      preserveRemoteUrlOnDownloadFailure: true,
+      messageId: 'remote-image',
+      content: [{ type: 'output_image', url: source, prompt: 'red square' }],
+      now: 10,
     })
 
-    expect(prepared.changed).toBe(false)
-    expect(prepared.content).toEqual(content)
-    expect(prepared.newRefs).toHaveLength(0)
-    expect(prepared.attachmentBundles).toHaveLength(0)
-  })
-
-  it('prepares a local attachment when the background remote download succeeds', async () => {
-    const prepared = await prepareGeneratedOutputAttachments({
-      messageId: 'm-download-succeeded',
-      content: [{ type: 'output_image', url: 'https://cdn.example/output.png' }],
-      downloader: async () => new Blob(['png'], { type: 'image/png' }),
-      preserveRemoteUrlOnDownloadFailure: true,
-    })
-
+    expect(fetchSpy).not.toHaveBeenCalled()
     expect(prepared.changed).toBe(true)
     expect(prepared.content).toEqual([
-      { type: 'output_image', attachmentId: 'generated:m-download-succeeded:1' },
+      {
+        type: 'output_image',
+        attachmentId: 'generated:remote-image:1',
+        prompt: 'red square',
+      },
     ])
-    expect(prepared.attachmentBundles[0]?.attachment.storage.kind).toBe('local-blob')
-  })
-
-  it('rejects delayed localization from an older workspace epoch', async () => {
-    const chat = await seedChat()
-    const message: Message = {
-      id: 'm-replaced-workspace',
-      chatId: chat.id,
-      parentId: null,
-      siblingIndex: 0,
-      turnId: newId(),
-      turnIndex: 0,
-      createdAt: 2,
-      role: 'assistant',
-      origin: 'generated',
-      content: [{ type: 'output_image', url: ONE_PIXEL_PNG }],
-      nodeVersion: 0,
-      deleted: false,
-    }
-    await putMessage(message)
-    const repo = getBrowserRepository()
-    const [header, persistedMessage, workspace] = await Promise.all([
-      repo.getMessageHeader(message.id),
-      repo.getMessage(message.id),
-      readBrowserWorkspaceMeta(getDb()),
-    ])
-    if (!header || !persistedMessage) throw new Error('MessagePresentationMissing')
-    const prepared = await prepareGeneratedOutputAttachments({
-      messageId: message.id,
-      content: message.content,
-      now: 10,
-      preserveRemoteUrlOnDownloadFailure: true,
+    expect(prepared.newRefs).toHaveLength(1)
+    expect(prepared.newRefs[0]).toMatchObject({
+      attachmentId: 'generated:remote-image:1',
+      includeInContext: true,
     })
-    const db = getDb()
-    await db.transaction('rw', db.settings, async (tx) => {
-      await markBrowserWorkspaceReplaced(tx, 20, workspace)
-    })
-
-    await expect(
-      commitPreparedGeneratedOutputAttachments({
-        repo,
-        presentation: { header, message: persistedMessage, bodyVersion: header.bodyVersion },
-        prepared,
-        expectedReplacementEpoch: workspace.replacementEpoch,
-        isCurrent: () => true,
-      }),
-    ).rejects.toBeInstanceOf(WorkspaceReplacementFenceError)
-    expect((await repo.getMessage(message.id))?.content).toEqual(message.content)
-    expect(await db.attachments.count()).toBe(0)
-  })
-
-  it('prepares generated output without writes and commits its attachment with the message', async () => {
-    const chat = await seedChat()
-    const message: Message = {
-      id: 'm-prepared',
-      chatId: chat.id,
-      parentId: null,
-      siblingIndex: 0,
-      turnId: newId(),
-      turnIndex: 0,
-      createdAt: 2,
-      role: 'assistant',
-      origin: 'generated',
-      content: [{ type: 'output_text', text: '' }],
-      nodeVersion: 0,
-      deleted: false,
-    }
-    await putMessage(message)
-    const prepared = await prepareGeneratedOutputAttachments({
-      messageId: message.id,
-      content: [{ type: 'output_image', url: ONE_PIXEL_PNG }],
-      now: 10,
-    })
-
     expect(prepared.attachmentBundles).toHaveLength(1)
-    expect(await getDb().attachments.count()).toBe(0)
-
-    const scopes = [
-      { kind: 'message' as const, messageId: message.id },
-      ...attachmentScopes(prepared.newRefs),
-    ]
-    await expect(
-      getBrowserRepository().runMutation(scopes, async (ctx) => {
-        await persistPreparedGeneratedOutputAttachments(ctx, prepared)
-        const current = await ctx.getMessage(message.id)
-        if (!current) throw new Error('MessageMissing')
-        await ctx.putMessage({
-          ...current,
-          content: prepared.content,
-          attachmentRefs: prepared.newRefs,
-        })
-        throw new Error('reject-canonical-finalize')
+    expect(prepared.attachmentBundles[0]?.attachment).toMatchObject({
+      id: 'generated:remote-image:1',
+      kind: 'image',
+      origin: 'generated-output',
+      sourceUrl: source,
+      storage: { kind: 'remote-url', url: source },
+    })
+    expect(prepared.attachmentBundles[0]?.jobs).toEqual([
+      expect.objectContaining({
+        processorId: GENERATED_OUTPUT_LOCALIZATION_PROCESSOR_ID,
+        status: 'pending',
+        nextAttemptAt: 10,
+        task: {
+          kind: GENERATED_OUTPUT_LOCALIZATION_PROCESSOR_ID,
+          expectedSourceUrl: source,
+        },
       }),
-    ).rejects.toThrow('reject-canonical-finalize')
-    expect(await getDb().attachments.count()).toBe(0)
-    expect((await getBrowserRepository().getMessage(message.id))?.attachmentRefs).toHaveLength(0)
-
-    await getBrowserRepository().runMutation(scopes, async (ctx) => {
-      await persistPreparedGeneratedOutputAttachments(ctx, prepared)
-      const current = await ctx.getMessage(message.id)
-      if (!current) throw new Error('MessageMissing')
-      await ctx.putMessage({
-        ...current,
-        content: prepared.content,
-        attachmentRefs: prepared.newRefs,
-      })
-    })
-
-    const attachmentId = prepared.newRefs[0]?.attachmentId
-    expect(attachmentId).toBe('generated:m-prepared:1')
-    expect((await getBrowserRepository().getAttachment(attachmentId ?? ''))?.refCount).toBe(1)
-    await expectAttachmentReferenceInvariants(getDb())
+    ])
   })
 
-  it('preserves a referenced generated attachment whose bytes were manually deleted', async () => {
-    const chat = await seedChat()
-    const message: Message = {
-      id: 'm-manual-delete',
-      chatId: chat.id,
-      parentId: null,
-      siblingIndex: 0,
-      turnId: newId(),
-      turnIndex: 0,
-      createdAt: 2,
-      role: 'assistant',
-      origin: 'generated',
-      content: [{ type: 'output_text', text: '' }],
-      nodeVersion: 0,
-      deleted: false,
-    }
-    await putMessage(message)
+  it('materializes inline image bytes immediately and schedules no localization job', async () => {
     const prepared = await prepareGeneratedOutputAttachments({
-      messageId: message.id,
+      messageId: 'inline-image',
       content: [{ type: 'output_image', url: ONE_PIXEL_PNG }],
-      now: 10,
-    })
-    const scopes = [
-      { kind: 'message' as const, messageId: message.id },
-      ...attachmentScopes(prepared.newRefs),
-    ]
-    await getBrowserRepository().runMutation(scopes, async (ctx) => {
-      await persistPreparedGeneratedOutputAttachments(ctx, prepared)
-      const current = await ctx.getMessage(message.id)
-      if (!current) throw new Error('MessageMissing')
-      await ctx.putMessage({
-        ...current,
-        content: prepared.content,
-        attachmentRefs: prepared.newRefs,
-      })
-    })
-    const attachmentId = prepared.newRefs[0]?.attachmentId
-    if (!attachmentId) throw new Error('AttachmentMissing')
-    await deleteReferencedAttachmentBytes(attachmentId, 'deleted', 20)
-
-    const retry = await prepareGeneratedOutputAttachments({
-      messageId: message.id,
-      content: [{ type: 'output_image', url: ONE_PIXEL_PNG }],
-      now: 30,
-    })
-    await getBrowserRepository().runMutation(scopes, async (ctx) => {
-      await persistPreparedGeneratedOutputAttachments(ctx, retry)
-    })
-
-    const bundle = await getBrowserRepository().getAttachmentBundle(attachmentId)
-    expect(bundle?.attachment.storage).toMatchObject({ kind: 'missing', reason: 'deleted' })
-    expect(bundle?.blobs).toHaveLength(0)
-    expect(bundle?.attachment.refCount).toBe(1)
-    await expectAttachmentReferenceInvariants(getDb())
-  })
-
-  it('replaces a conflicting unreferenced legacy generated-output row at commit', async () => {
-    const eager = await materializeGeneratedOutputAttachments({
-      messageId: 'm-orphan',
-      content: [{ type: 'output_image', url: 'https://old.example/generated.png' }],
-      now: 10,
-    })
-    const attachmentId = eager.newRefs[0]?.attachmentId
-    expect(attachmentId).toBe('generated:m-orphan:1')
-    expect((await getBrowserRepository().getAttachment(attachmentId ?? ''))?.refCount).toBe(0)
-
-    const prepared = await prepareGeneratedOutputAttachments({
-      messageId: 'm-orphan',
-      content: [{ type: 'output_image', url: 'https://new.example/generated.png' }],
       now: 20,
     })
-    await getBrowserRepository().runMutation(attachmentScopes(prepared.newRefs), async (ctx) => {
-      await persistPreparedGeneratedOutputAttachments(ctx, prepared)
-    })
 
-    expect(await getBrowserRepository().getAttachment(attachmentId ?? '')).toMatchObject({
-      sourceUrl: 'https://new.example/generated.png',
-      storage: { kind: 'remote-url', url: 'https://new.example/generated.png' },
-      refCount: 0,
+    expect(prepared.content).toEqual([
+      { type: 'output_image', attachmentId: 'generated:inline-image:1' },
+    ])
+    expect(prepared.attachmentBundles[0]?.attachment).toMatchObject({
+      id: 'generated:inline-image:1',
+      kind: 'image',
+      mime: 'image/png',
+      origin: 'generated-output',
+      storage: { kind: 'local-blob' },
     })
+    expect(
+      prepared.attachmentBundles[0]?.jobs.some(
+        (job) => job.processorId === GENERATED_OUTPUT_LOCALIZATION_PROCESSOR_ID,
+      ),
+    ).toBe(false)
+    expect(prepared.attachmentBundles[0]?.blobs.some((blob) => blob.role === 'original')).toBe(true)
   })
 
-  it('materializes raw generated audio data URLs into attachments', async () => {
-    const materialized = await materializeGeneratedOutputAttachments({
-      messageId: 'm-audio',
+  it('canonicalizes inline audio while preserving transcript and format metadata', async () => {
+    const prepared = await prepareGeneratedOutputAttachments({
+      messageId: 'inline-audio',
       content: [
         {
           type: 'audio_output',
           url: 'data:audio/wav;base64,UklGRg==',
           transcript: 'Hi',
           format: 'wav',
+          durationMs: 12,
         },
       ],
-      now: 10,
+      now: 30,
     })
-    const output = materialized.content[0]
-    expect(output).toMatchObject({ type: 'audio_output', transcript: 'Hi', format: 'wav' })
-    expect(output?.type === 'audio_output' ? output.url : undefined).toBeUndefined()
-    const attachmentId = output?.type === 'audio_output' ? output.attachmentId : undefined
-    expect(attachmentId).toBeTruthy()
-    expect(materialized.newRefs).toHaveLength(1)
-    const bundle = attachmentId
-      ? await getBrowserRepository().getAttachmentBundle(attachmentId)
-      : undefined
-    expect(bundle?.attachment).toMatchObject({
+
+    expect(prepared.content).toEqual([
+      {
+        type: 'audio_output',
+        attachmentId: 'generated:inline-audio:audio:1',
+        transcript: 'Hi',
+        format: 'wav',
+        durationMs: 12,
+      },
+    ])
+    expect(prepared.attachmentBundles[0]?.attachment).toMatchObject({
       kind: 'audio',
       mime: 'audio/wav',
       origin: 'generated-output',
+      storage: { kind: 'local-blob' },
     })
   })
 
-  it('moves legacy raw output_image data URLs into stored generated attachments', async () => {
-    const chat = await seedChat()
-    const message: Message = {
-      id: newId(),
-      chatId: chat.id,
-      parentId: null,
-      siblingIndex: 0,
-      turnId: newId(),
-      turnIndex: 0,
-      createdAt: 2,
-      role: 'assistant',
-      origin: 'generated',
-      content: [{ type: 'output_image', url: ONE_PIXEL_PNG, prompt: 'red square' }],
-      nodeVersion: 0,
-      deleted: false,
-    }
-    await putMessage(message)
-
-    await migrateGeneratedImageOutputAttachments(message.id)
-
-    const stored = await getBrowserRepository().getMessage(message.id)
-    const output = stored?.content.find((item) => item.type === 'output_image')
-    expect(output).toMatchObject({ type: 'output_image', prompt: 'red square' })
-    expect(output && 'url' in output ? output.url : undefined).toBeUndefined()
-    const attachmentId = output?.type === 'output_image' ? output.attachmentId : undefined
-    expect(attachmentId).toBeTruthy()
-    expect(stored?.attachmentRefs).toHaveLength(1)
-    expect(stored?.attachmentRefs?.[0]).toMatchObject({
-      attachmentId,
-      includeInContext: true,
+  it('prepares every remote media kind as a bounded durable job set', async () => {
+    const content: ContentItem[] = [
+      { type: 'output_image', url: 'https://cdn.example/a.webp' },
+      { type: 'audio_output', url: 'https://cdn.example/a.mp3' },
+      { type: 'output_video', url: 'https://cdn.example/a.mp4', prompt: 'motion' },
+      {
+        type: 'file',
+        url: 'https://cdn.example/report.pdf',
+        filename: 'report.pdf',
+        mime: 'application/pdf',
+      },
+    ]
+    const prepared = await prepareGeneratedOutputAttachments({
+      messageId: 'remote-media',
+      content,
+      now: 40,
     })
 
-    const bundle = attachmentId
-      ? await getBrowserRepository().getAttachmentBundle(attachmentId)
-      : undefined
-    expect(bundle?.attachment).toMatchObject({
-      kind: 'image',
-      mime: 'image/png',
-      origin: 'generated-output',
-      refCount: 1,
-    })
-    expect(bundle?.blobs.some((blob) => blob.role === 'original')).toBe(true)
-    await expectAttachmentReferenceInvariants(getDb())
-  })
-
-  it('is idempotent when a legacy row is migrated twice at the same time', async () => {
-    const chat = await seedChat()
-    const message: Message = {
-      id: newId(),
-      chatId: chat.id,
-      parentId: null,
-      siblingIndex: 0,
-      turnId: newId(),
-      turnIndex: 0,
-      createdAt: 2,
-      role: 'assistant',
-      origin: 'generated',
-      content: [{ type: 'output_image', url: ONE_PIXEL_PNG }],
-      nodeVersion: 0,
-      deleted: false,
-    }
-    await putMessage(message)
-
-    await Promise.all([
-      migrateGeneratedImageOutputAttachments(message.id),
-      migrateGeneratedImageOutputAttachments(message.id),
+    expect(prepared.changed).toBe(true)
+    expect(prepared.content.every((item) => !('url' in item))).toBe(true)
+    expect(prepared.newRefs).toHaveLength(4)
+    expect(prepared.attachmentBundles).toHaveLength(4)
+    expect(prepared.attachmentBundles.map((bundle) => bundle.jobs.length)).toEqual([1, 1, 1, 1])
+    expect(prepared.attachmentBundles.map((bundle) => bundle.attachment.storage.kind)).toEqual([
+      'remote-url',
+      'remote-url',
+      'remote-url',
+      'remote-url',
     ])
-
-    const stored = await getBrowserRepository().getMessage(message.id)
-    expect(stored?.attachmentRefs).toHaveLength(1)
-    const output = stored?.content.find((item) => item.type === 'output_image')
-    const attachmentId = output?.type === 'output_image' ? output.attachmentId : undefined
-    expect(stored?.attachmentRefs?.[0]).toMatchObject({ attachmentId })
-    const generated = await getDb()
-      .attachments.filter((attachment) => attachment.origin === 'generated-output')
-      .toArray()
-    expect(generated).toHaveLength(1)
-    expect(generated[0]?.id).toBe(attachmentId)
-    expect(generated[0]?.refCount).toBe(1)
-    expect(
-      await getDb()
-        .browserLocks.filter((row) => row.name.startsWith('natter:coordination:'))
-        .count(),
-    ).toBe(0)
-    await expectAttachmentReferenceInvariants(getDb())
   })
 
-  it('removes stale generated-output refs that are not the inline output image', async () => {
-    const chat = await seedChat()
-    const kept = await ingestAttachmentBytes({
-      id: 'att-kept',
-      blob: new Blob([new Uint8Array([0x89, 0x50, 0x4e, 0x47])], { type: 'image/png' }),
-      filename: 'kept.png',
-      declaredMime: 'image/png',
-      origin: 'generated-output',
-    })
-    const stale = await ingestAttachmentBytes({
-      id: 'att-stale',
-      blob: new Blob([new Uint8Array([0x89, 0x50, 0x4e, 0x48])], { type: 'image/png' }),
-      filename: 'stale.png',
-      declaredMime: 'image/png',
-      origin: 'generated-output',
-    })
-    const message: Message = {
-      id: newId(),
-      chatId: chat.id,
-      parentId: null,
-      siblingIndex: 0,
-      turnId: newId(),
-      turnIndex: 0,
-      createdAt: 2,
-      role: 'assistant',
-      origin: 'generated',
-      content: [{ type: 'output_image', attachmentId: kept.attachment.id }],
-      attachmentRefs: [
-        {
-          refId: 'ref-kept',
-          attachmentId: kept.attachment.id,
-          includeInContext: true,
-          presentation: {},
-          createdAt: 2,
-          updatedAt: 2,
-        },
-        {
-          refId: 'ref-stale',
-          attachmentId: stale.attachment.id,
-          includeInContext: true,
-          presentation: {},
-          createdAt: 2,
-          updatedAt: 2,
-        },
-      ],
-      nodeVersion: 0,
-      deleted: false,
+  it('builds one canonical terminal write and preserves unrelated attachment refs', async () => {
+    const existing: AttachmentRef = {
+      refId: 'existing-ref',
+      attachmentId: 'existing-attachment',
+      includeInContext: false,
+      presentation: {},
+      createdAt: 1,
+      updatedAt: 1,
     }
-    await putMessage(message)
+    const prepared = await prepareGeneratedOutputTerminalWrite({
+      messageId: 'terminal-output',
+      content: [{ type: 'output_image', url: 'https://cdn.example/final.png' }],
+      attachmentRefs: [existing],
+      now: 50,
+      requestCredential: {
+        profileId: 'profile-at-dispatch',
+        selectedKeyId: 'accepted-fallback-key',
+      },
+    })
 
-    await normalizeGeneratedImageOutputAttachmentRefs(message.id)
+    expect(prepared).toBeDefined()
+    expect(contentNeedsGeneratedOutputMaterialization(prepared?.content ?? [])).toBe(false)
+    expect(prepared?.attachmentRefs).toHaveLength(2)
+    expect(prepared?.attachmentRefs[0]).toMatchObject(existing)
+    expect(prepared?.attachmentRefs[1]).toMatchObject({
+      attachmentId: 'generated:terminal-output:1',
+    })
+    expect(prepared?.attachmentBundles[0]?.jobs[0]?.task).toMatchObject({
+      expectedSourceUrl: 'https://cdn.example/final.png',
+      requestCredential: {
+        profileId: 'profile-at-dispatch',
+        selectedKeyId: 'accepted-fallback-key',
+      },
+    })
+  })
 
-    const stored = await getBrowserRepository().getMessage(message.id)
-    expect(stored?.attachmentRefs).toHaveLength(1)
-    expect(stored?.attachmentRefs?.[0]).toMatchObject({ attachmentId: kept.attachment.id })
-    expect(await getBrowserRepository().getAttachment(stale.attachment.id)).toBeUndefined()
-    await expectAttachmentReferenceInvariants(getDb())
+  it('deduplicates new live refs without reviving or discarding existing ref history', async () => {
+    const prepared = await prepareGeneratedOutputAttachments({
+      messageId: 'merge-output',
+      content: [{ type: 'output_image', url: ONE_PIXEL_PNG }],
+      now: 60,
+    })
+    const first = mergeGeneratedImageAttachmentRefs([], prepared.newRefs, 'merge-output', 60)
+    const second = mergeGeneratedImageAttachmentRefs(
+      first.refs,
+      prepared.newRefs,
+      'merge-output',
+      61,
+    )
+
+    expect(first.addedRefs).toHaveLength(1)
+    expect(second.addedRefs).toHaveLength(0)
+    expect(second.refs).toEqual(first.refs)
+    expect(generatedOutputAttachmentIds(prepared.content)).toEqual(
+      new Set(['generated:merge-output:1']),
+    )
+  })
+
+  it('leaves unsupported URLs untouched and rejects them at the canonical terminal boundary', async () => {
+    const content: ContentItem[] = [{ type: 'output_image', url: 'ftp://example.invalid/a.png' }]
+    const prepared = await prepareGeneratedOutputAttachments({
+      messageId: 'unsupported-output',
+      content,
+      now: 70,
+    })
+
+    expect(prepared).toMatchObject({
+      changed: false,
+      content,
+      newRefs: [],
+      attachmentBundles: [],
+    })
+    await expect(
+      prepareGeneratedOutputTerminalWrite({
+        messageId: 'unsupported-output',
+        content,
+        attachmentRefs: [],
+        now: 70,
+      }),
+    ).rejects.toThrow('GeneratedOutputMaterializationFailed:unsupported-output')
+  })
+
+  it('keeps deterministic ids and localized filenames independent of persistence', () => {
+    expect(
+      generatedOutputAttachmentId(
+        'message',
+        { type: 'output_image', url: 'https://cdn.example/a.png' },
+        2,
+      ),
+    ).toBe('generated:message:3')
+    expect(
+      generatedOutputAttachmentId(
+        'message',
+        { type: 'output_video', url: 'https://cdn.example/a.mp4' },
+        2,
+      ),
+    ).toBe('generated:message:video:3')
+    expect(localizedGeneratedOutputFilename('generated.bin', 'image/webp', 'image')).toBe(
+      'generated.webp',
+    )
+    expect(localizedGeneratedOutputFilename('clip.bin', 'video/mp4', 'video')).toBe('clip.mp4')
+    expect(localizedGeneratedOutputFilename('report.pdf', 'application/pdf', 'file')).toBe(
+      'report.pdf',
+    )
   })
 })

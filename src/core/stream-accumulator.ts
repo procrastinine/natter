@@ -1,25 +1,44 @@
-import type { ApiError } from '../api/errors'
-import type { StreamIntegrityEvent } from '../api/sse'
-import type { StreamLaneEvent } from '../api/stream-transforms'
+import { sameValue } from '../lib/same-value'
+import { createAppliedMessageView } from './continuation-content'
+import type {
+  CanonicalStreamEventV2,
+  GenerationStreamFailureV2,
+  GenerationStreamIntegrityV2,
+  ResultSnapshotReplacementV2,
+} from './generation-stream-events'
+import type { StreamLaneEvent } from './generation-stream-live-events'
 import {
+  isKnownProviderToolOutputType,
   providerOutputItemFromGeminiPart,
   providerOutputItemFromResponsesItem,
+  providerOutputItemIdentity,
 } from './provider-tool-context'
 import {
-  findMergeTargetIndex,
-  mergeReasoningDetail,
-  normalizeIncomingReasoningDetail,
-} from './reasoning'
+  inspectReasoningEnvelopeState,
+  projectReasoningEnvelope,
+  projectReasoningEnvelopeLive,
+  type ReasoningEnvelopeLiveProjection,
+  reasoningEnvelopeIsEmpty,
+} from './reasoning-envelope'
+import {
+  applyCanonicalReasoningMutation,
+  applyReasoningObservationBatch,
+  createReasoningObservationCodecState,
+  type ReasoningObservationCodecState,
+  releaseReasoningObservationCodecState,
+} from './reasoning-observation'
 import type {
   AttemptIntegritySummary,
   ChatUsage,
+  ContentAnnotation,
   ContentItem,
   FinishReason,
   GenerationMeta,
   GenerationServerToolCall,
+  Message,
   MessagePhase,
   ProviderOutputItem,
-  ReasoningDetail,
+  ReasoningEnvelopeV2,
   ToolCall,
 } from './types'
 
@@ -28,45 +47,19 @@ export const STREAM_DURABLE_BATCH_TEXT_CHARS = 128 * 1024
 const STREAM_LIVE_TEXT_SECTION_CHARS = 20_000
 const STREAM_INTEGRITY_ENTRY_LIMIT = 16
 
-const HOSTED_SERVER_TOOL_ITEM_TYPES = new Set<string>([
-  'web_search_call',
-  'file_search_call',
-  'image_generation_call',
-  'code_interpreter_call',
-  'shell_call',
-  'shell_call_output',
-  'computer_call',
-  'mcp_tool_call',
-  'mcp_call',
-  'google:google_search',
-  'google:url_context',
-  'google:code_execution',
-  'google:google_maps',
-  'openrouter:datetime',
-  'openrouter:web_fetch',
-  'openrouter:web_search',
-  'server_tool_use',
-  'web_search_tool_result',
-  'web_fetch_tool_result',
-  'code_execution_tool_result',
-  'bash_code_execution_tool_result',
-  'text_editor_code_execution_tool_result',
-  'advisor_tool_result',
-])
-
 export interface StreamAccumulator {
   initialContent: ContentItem[]
   initialTextPrefix: string
   initialNonTextContent: ContentItem[]
+  initialAnnotations: ContentAnnotation[]
   textSections: string[]
   textPendingParts: string[]
   textPendingLength: number
   textLength: number
-  reasoningList: ReasoningDetail[]
-  reasoningRowById: Map<string, number>
-  reasoningSegmentsByRow: Map<number, ReasoningSegmentBuffer>
-  reasoningCumulativeValueByRow: Map<number, string>
-  reasoningLength: number
+  textSpansByWirePart: Map<string, { start: number; length: number }>
+  annotations: ContentAnnotation[]
+  annotationIdentities: Set<string>
+  reasoning: ReasoningObservationCodecState
   toolCallRows: ToolCallAccumulatorRow[]
   toolCallRowByIndex: Map<number, number>
   toolCallRowById: Map<string, number>
@@ -88,7 +81,12 @@ export interface StreamAccumulator {
     format: 'wav' | 'mp3' | 'flac' | 'ogg' | 'm4a' | 'pcm16'
   }
   serverTools: GenerationServerToolCall[]
+  serverToolRowByKey: Map<string, number>
+  serverToolsRevision: number
+  serverToolsProjectionRevision: number
+  serverToolsProjection: GenerationServerToolCall[]
   providerOutputItems: ProviderOutputItem[]
+  providerOutputRowByKey: Map<string, number>
   firstTextAt?: number
   reasoningStartedAt?: number
   reasoningFinishedAt?: number
@@ -98,13 +96,13 @@ export interface StreamAccumulator {
   lastLivePublishedTextLen: number
   lastLivePublishedReasoningLen: number
   lastLivePublishedToolCallArgumentsLen: number
-  midStreamError?: ApiError
+  midStreamError?: GenerationStreamFailureV2
   integritySummary: AttemptIntegritySummary
 }
 
 export interface StreamAccumulatorLiveProjection {
   content: ContentItem[]
-  reasoningRows?: StreamAccumulatorLiveReasoningRow[]
+  reasoning?: ReasoningEnvelopeLiveProjection
   toolCallRows?: StreamAccumulatorLiveToolCallRow[]
   generation: GenerationMeta
   textLength: number
@@ -112,9 +110,10 @@ export interface StreamAccumulatorLiveProjection {
   updatedAt: number
 }
 
-export interface StreamAccumulatorLiveReasoningRow {
-  detail: ReasoningDetail
-  valueSections?: string[]
+export interface StreamAccumulatorLiveAttemptArtifacts {
+  reasoning?: ReasoningEnvelopeLiveProjection
+  toolCallRows?: StreamAccumulatorLiveToolCallRow[]
+  reasoningLength: number
 }
 
 export interface StreamAccumulatorLiveToolCallRow {
@@ -129,7 +128,7 @@ export interface StreamAccumulatorLiveToolCallRow {
 
 export interface StreamAccumulatorFinalProjection {
   content: ContentItem[]
-  reasoningDetails?: ReasoningDetail[]
+  reasoningEnvelope?: ReasoningEnvelopeV2
   toolCalls?: ToolCall[]
   phase?: MessagePhase
   providerOutputItems?: ProviderOutputItem[]
@@ -141,7 +140,7 @@ export type StreamAccumulatorFinalMetadataProjection = Omit<
 >
 
 export interface StreamAccumulatorReplayEntry {
-  event: unknown
+  event: CanonicalStreamEventV2
   createdAt: number
 }
 
@@ -149,16 +148,6 @@ export interface StreamAccumulatorReplayResult {
   accumulator: StreamAccumulator
   final: StreamAccumulatorFinalProjection
   finishedCleanly: boolean
-}
-
-type ReasoningSegmentField = 'text' | 'summary' | 'data'
-
-interface ReasoningSegmentBuffer {
-  field: ReasoningSegmentField
-  sections: string[]
-  pendingParts: string[]
-  pendingLength: number
-  length: number
 }
 
 interface ToolCallAccumulatorRow {
@@ -189,19 +178,20 @@ export function createStreamAccumulator(input: {
   const initialNonTextContent = input.initialContent.filter(
     (item) => item.type !== 'text' && item.type !== 'output_text',
   )
+  const initialAnnotations = collectInitialContentAnnotations(input.initialContent)
   return {
     initialContent: input.initialContent,
     initialTextPrefix,
     initialNonTextContent,
+    initialAnnotations,
     textSections: [],
     textPendingParts: [],
     textPendingLength: 0,
     textLength: 0,
-    reasoningList: [],
-    reasoningRowById: new Map(),
-    reasoningSegmentsByRow: new Map(),
-    reasoningCumulativeValueByRow: new Map(),
-    reasoningLength: 0,
+    textSpansByWirePart: new Map(),
+    annotations: initialAnnotations,
+    annotationIdentities: new Set(initialAnnotations.map(streamAnnotationIdentity)),
+    reasoning: createReasoningObservationCodecState(),
     toolCallRows: [],
     toolCallRowByIndex: new Map(),
     toolCallRowById: new Map(),
@@ -209,7 +199,12 @@ export function createStreamAccumulator(input: {
     toolCallArgumentsLength: 0,
     generatedContent: [],
     serverTools: [],
+    serverToolRowByKey: new Map(),
+    serverToolsRevision: 0,
+    serverToolsProjectionRevision: -1,
+    serverToolsProjection: [],
     providerOutputItems: [],
+    providerOutputRowByKey: new Map(),
     integritySummary: { count: 0, characterCount: 0, entries: [] },
     dirtySinceLastLivePublish: false,
     liveMutationRevision: 0,
@@ -220,74 +215,62 @@ export function createStreamAccumulator(input: {
   }
 }
 
-export function applyStreamAccumulatorEvent(
+export function foldStreamAccumulatorEvent(
   acc: StreamAccumulator,
   event: StreamLaneEvent,
+  nowMs: number,
+): CanonicalStreamEventV2 {
+  if (event.lane === 'reasoning-observation') {
+    const mutations = applyReasoningObservationBatch(acc.reasoning, event.batch)
+    if (mutations.length > 0) noteReasoningMutation(acc, nowMs)
+    return { lane: 'reasoning', mutations, observed: { firstAt: nowMs, lastAt: nowMs } }
+  }
+  if (event.lane === 'result-snapshot' && event.payload.kind === 'replace') {
+    const mutations = applyReasoningObservationBatch(acc.reasoning, event.payload.reasoning)
+    if (mutations.length > 0) noteReasoningMutation(acc, nowMs)
+    const { reasoning: _reasoning, ...payload } = event.payload
+    const canonical: CanonicalStreamEventV2 = {
+      ...event,
+      payload: {
+        ...payload,
+        reasoningEnvelope: projectReasoningEnvelope(acc.reasoning.envelope),
+      },
+    }
+    applyStreamAccumulatorEvent(acc, canonical, nowMs)
+    return canonical
+  }
+  if (event.lane === 'result-snapshot') {
+    const canonical: CanonicalStreamEventV2 = {
+      ...event,
+      payload: { kind: 'retain' },
+    }
+    applyStreamAccumulatorEvent(acc, canonical, nowMs)
+    return canonical
+  }
+  applyStreamAccumulatorEvent(acc, event, nowMs)
+  return event
+}
+
+export function applyStreamAccumulatorEvent(
+  acc: StreamAccumulator,
+  event: CanonicalStreamEventV2,
   nowMs: number,
 ): void {
   switch (event.lane) {
     case 'text':
       if (acc.firstTextAt === undefined) acc.firstTextAt = nowMs
+      recordTextSpan(acc, event)
       appendStreamText(acc, event.text)
       markLiveProjectionDirty(acc)
       return
+    case 'text-annotations':
+      if (putTextAnnotations(acc, event)) markLiveProjectionDirty(acc)
+      return
     case 'reasoning': {
-      if (acc.reasoningStartedAt === undefined) acc.reasoningStartedAt = nowMs
-      acc.reasoningFinishedAt = nowMs
-      const outputIndex = event.outputIndex ?? 0
-      if (Array.isArray(event.details)) {
-        for (const raw of event.details) {
-          if (!raw || typeof raw !== 'object') continue
-          const detail = normalizeIncomingReasoningDetail(
-            raw as ReasoningDetail & { index?: number },
-          )
-          if (detail.id?.startsWith('tool_')) continue
-          putReasoningDetail(acc, detail, event.detailsMode ?? 'snapshot')
-          markLiveProjectionDirty(acc)
-        }
+      for (const mutation of event.mutations) {
+        applyCanonicalReasoningMutation(acc.reasoning, mutation)
       }
-      if (event.textDelta !== undefined) {
-        const id = syntheticReasoningDetailId('reasoning.text', event)
-        const detail: ReasoningDetail = {
-          type: 'reasoning.text',
-          ...(id ? { id } : {}),
-          index: outputIndex,
-          ...(event.format ? { format: event.format } : {}),
-          text: event.textDelta,
-        }
-        putReasoningDelta(acc, detail, false)
-        markLiveProjectionDirty(acc)
-      }
-      if (event.summaryDelta !== undefined) {
-        const id = syntheticReasoningDetailId('reasoning.summary', event)
-        putReasoningDelta(
-          acc,
-          {
-            type: 'reasoning.summary',
-            ...(id ? { id } : {}),
-            index: outputIndex,
-            ...(event.format ? { format: event.format } : {}),
-            summary: event.summaryDelta,
-          },
-          false,
-        )
-        markLiveProjectionDirty(acc)
-      }
-      if (event.encryptedDelta !== undefined) {
-        const id = syntheticReasoningDetailId('reasoning.encrypted', event)
-        putReasoningDelta(
-          acc,
-          {
-            type: 'reasoning.encrypted',
-            ...(id ? { id } : {}),
-            index: outputIndex,
-            ...(event.format ? { format: event.format } : {}),
-            data: event.encryptedDelta,
-          },
-          event.replaceEncrypted === true,
-        )
-        markLiveProjectionDirty(acc)
-      }
+      noteReasoningMutation(acc, event.observed?.firstAt ?? nowMs, event.observed?.lastAt ?? nowMs)
       return
     }
     case 'tool-call':
@@ -296,6 +279,7 @@ export function applyStreamAccumulatorEvent(
       return
     case 'usage':
       acc.usage = event.usage as ChatUsage
+      acc.serverToolsRevision += 1
       return
     case 'finish':
       acc.finishReason = event.finishReason
@@ -337,26 +321,35 @@ export function applyStreamAccumulatorEvent(
       recordServerToolStatus(acc, event)
       return
     case 'server-tool-output':
-      upsertServerTool(acc.serverTools, {
+      putServerTool(acc, {
         type: event.itemType,
         source: 'provider-output',
         id: event.itemId,
         ...(event.status ? { status: event.status } : {}),
         outputIndex: event.outputIndex,
-        output: structuredClone(event.output),
       })
-      recordProviderOutputItem(acc, event.itemType, event.output, event.outputIndex)
+      recordProviderOutputItem(
+        acc,
+        event.dialect,
+        event.itemType,
+        event.itemId,
+        event.output,
+        event.outputIndex,
+      )
       return
     case 'output-item-added':
       recordServerToolOutputItem(acc, event.item, event.outputIndex, 'stream-status')
       return
     case 'output-item-done':
       recordServerToolOutputItem(acc, event.item, event.outputIndex, 'responses-output')
-      recordResponsesOutputItem(acc, event.item, event.outputIndex)
+      recordResponsesOutputItem(acc, event.dialect, event.item, event.outputIndex)
       return
     case 'phase':
       if (event.phase === null) delete acc.phase
       else acc.phase = event.phase
+      return
+    case 'result-snapshot':
+      applyResultSnapshot(acc, event, nowMs)
       return
     case 'integrity':
       recordStreamIntegrity(acc.integritySummary, event.integrity)
@@ -364,11 +357,16 @@ export function applyStreamAccumulatorEvent(
     case 'error':
       acc.midStreamError = event.error
       return
-    case 'buffered':
     case 'keepalive':
     case 'terminal':
       return
   }
+}
+
+function noteReasoningMutation(acc: StreamAccumulator, firstAt: number, lastAt = firstAt): void {
+  if (acc.reasoningStartedAt === undefined) acc.reasoningStartedAt = firstAt
+  acc.reasoningFinishedAt = lastAt
+  markLiveProjectionDirty(acc)
 }
 
 export function shouldPublishStreamAccumulatorLive(acc: StreamAccumulator, nowMs: number): boolean {
@@ -403,21 +401,38 @@ export function projectStreamAccumulatorLive(
     apiUsed: GenerationMeta['apiUsed']
     now: number
     generationStartedAt?: number
+    reasoningCarryForward?: GenerationMeta['reasoningCarryForward']
+    reasoningVisibility?: GenerationMeta['reasoningVisibility']
   },
 ): StreamAccumulatorLiveProjection {
-  const reasoningRows = collectLiveReasoningRows(acc)
-  const toolCallRows = collectLiveToolCallRows(acc)
+  const artifacts = projectStreamAccumulatorLiveAttemptArtifacts(acc)
   return {
     content: projectStreamAccumulatorLiveContent(acc),
-    ...(reasoningRows.length > 0 ? { reasoningRows } : {}),
-    ...(toolCallRows.length > 0 ? { toolCallRows } : {}),
+    ...artifacts,
     generation: projectStreamGeneration(undefined, acc, input.requestedModel, {
       apiUsed: input.apiUsed,
       ...(input.generationStartedAt !== undefined ? { startedAt: input.generationStartedAt } : {}),
+      ...(input.reasoningCarryForward !== undefined
+        ? { reasoningCarryForward: input.reasoningCarryForward }
+        : {}),
+      ...(input.reasoningVisibility !== undefined
+        ? { reasoningVisibility: input.reasoningVisibility }
+        : {}),
     }),
     textLength: acc.textLength,
-    reasoningLength: acc.reasoningLength,
     updatedAt: input.now,
+  }
+}
+
+export function projectStreamAccumulatorLiveAttemptArtifacts(
+  acc: StreamAccumulator,
+): StreamAccumulatorLiveAttemptArtifacts {
+  const reasoning = projectReasoningEnvelopeLive(acc.reasoning.envelope)
+  const toolCallRows = collectLiveToolCallRows(acc)
+  return {
+    ...(reasoning.visible.length > 0 || reasoning.carriers.length > 0 ? { reasoning } : {}),
+    ...(toolCallRows.length > 0 ? { toolCallRows } : {}),
+    reasoningLength: streamAccumulatorReasoningLength(acc),
   }
 }
 
@@ -449,6 +464,7 @@ export function projectStreamAccumulatorFinal(
       acc.initialNonTextContent,
       streamAccumulatorText(acc),
       [...acc.generatedContent, ...audioOutputContent(acc)],
+      acc.annotations,
     ),
     ...metadata,
   }
@@ -457,15 +473,15 @@ export function projectStreamAccumulatorFinal(
 export function projectStreamAccumulatorFinalMetadata(
   acc: StreamAccumulator,
 ): StreamAccumulatorFinalMetadataProjection {
-  const reasoning = collectReasoning(acc)
+  const reasoningEnvelope = projectReasoningEnvelope(acc.reasoning.envelope)
   const toolCalls = collectToolCalls(acc)
   const providerOutputItems = [
     ...acc.providerOutputItems,
     ...collectIncompleteToolCallOutputItems(acc),
   ]
   return {
-    ...(reasoning.length > 0 ? { reasoningDetails: reasoning } : {}),
-    ...(toolCalls.length > 0 ? { toolCalls } : {}),
+    ...(!reasoningEnvelopeIsEmpty(reasoningEnvelope) ? { reasoningEnvelope } : {}),
+    ...(toolCalls.length > 0 ? { toolCalls: structuredClone(toolCalls) } : {}),
     ...(acc.phase !== undefined ? { phase: acc.phase } : {}),
     ...(providerOutputItems.length > 0
       ? { providerOutputItems: structuredClone(providerOutputItems) }
@@ -481,6 +497,8 @@ export function projectStreamGeneration(
     apiUsed?: GenerationMeta['apiUsed']
     finishedAt?: number
     startedAt?: number
+    reasoningCarryForward?: GenerationMeta['reasoningCarryForward']
+    reasoningVisibility?: GenerationMeta['reasoningVisibility']
   } = {},
 ): GenerationMeta {
   const base: GenerationMeta = existing
@@ -493,17 +511,22 @@ export function projectStreamGeneration(
         delivery: 'streaming',
         costSource: 'stream',
         startedAt: opts.startedAt ?? Date.now(),
+        reasoningCarryForward: opts.reasoningCarryForward ?? 'none',
+        reasoningVisibility: opts.reasoningVisibility ?? { disclosure: 'unknown' },
       }
   if (opts.apiUsed !== undefined) base.apiUsed = opts.apiUsed
+  if (opts.reasoningCarryForward !== undefined) {
+    base.reasoningCarryForward = opts.reasoningCarryForward
+  }
+  if (opts.reasoningVisibility !== undefined) {
+    base.reasoningVisibility = opts.reasoningVisibility
+  }
   if (acc.generationId) base.id = acc.generationId
   if (acc.model) base.model = acc.model
   if (acc.provider) base.provider = acc.provider
   if (acc.usage) base.usage = acc.usage
   if (acc.usage?.cost !== undefined) base.cost = acc.usage.cost
-  const serverTools = mergeServerToolRecords([
-    ...acc.serverTools,
-    ...(acc.serverTools.length === 0 ? serverToolRecordsFromUsage(acc.usage) : []),
-  ])
+  const serverTools = projectServerTools(acc)
   if (serverTools.length > 0) base.serverTools = serverTools
   else delete base.serverTools
   if (acc.firstTextAt !== undefined) base.firstTextAt = acc.firstTextAt
@@ -529,37 +552,58 @@ export function replayStreamAccumulator(input: {
   now: number
   entries: readonly StreamAccumulatorReplayEntry[]
 }): StreamAccumulatorReplayResult {
+  const replayed = replayStreamAccumulatorState(input)
+  return {
+    ...replayed,
+    final: projectStreamAccumulatorFinal(replayed.accumulator),
+  }
+}
+
+export function replayStreamAccumulatorState(input: {
+  initialContent: readonly ContentItem[]
+  now: number
+  entries: readonly StreamAccumulatorReplayEntry[]
+}): Pick<StreamAccumulatorReplayResult, 'accumulator' | 'finishedCleanly'> {
   const accumulator = createStreamAccumulator({
     initialContent: structuredClone([...input.initialContent]),
     now: input.now,
   })
   let finishedCleanly = false
   for (const entry of input.entries) {
-    const event = replayableStreamEvent(entry.event)
-    if (!event) continue
-    applyStreamAccumulatorEvent(accumulator, event, entry.createdAt)
-    if (event.lane === 'finish' || event.lane === 'terminal') finishedCleanly = true
+    if (applyStreamAccumulatorReplayEntry(accumulator, entry)) finishedCleanly = true
   }
   return {
     accumulator,
-    final: projectStreamAccumulatorFinal(accumulator),
     finishedCleanly,
   }
+}
+
+export function applyStreamAccumulatorReplayEntry(
+  accumulator: StreamAccumulator,
+  entry: StreamAccumulatorReplayEntry,
+): boolean {
+  const event = entry.event
+  applyStreamAccumulatorEvent(accumulator, event, entry.createdAt)
+  return (
+    event.lane === 'finish' ||
+    event.lane === 'terminal' ||
+    (event.lane === 'result-snapshot' && event.outcome.kind === 'finish')
+  )
 }
 
 export function releaseStreamAccumulatorBuffers(acc: StreamAccumulator): void {
   acc.initialContent = []
   acc.initialTextPrefix = ''
   acc.initialNonTextContent = []
+  acc.initialAnnotations = []
   acc.textSections = []
   acc.textPendingParts = []
   acc.textPendingLength = 0
   acc.textLength = 0
-  acc.reasoningList = []
-  acc.reasoningRowById.clear()
-  acc.reasoningSegmentsByRow.clear()
-  acc.reasoningCumulativeValueByRow.clear()
-  acc.reasoningLength = 0
+  acc.textSpansByWirePart.clear()
+  acc.annotations = []
+  acc.annotationIdentities.clear()
+  releaseReasoningObservationCodecState(acc.reasoning)
   acc.toolCallRows = []
   acc.toolCallRowByIndex.clear()
   acc.toolCallRowById.clear()
@@ -567,13 +611,165 @@ export function releaseStreamAccumulatorBuffers(acc: StreamAccumulator): void {
   acc.toolCallArgumentsLength = 0
   acc.generatedContent = []
   acc.serverTools = []
+  acc.serverToolRowByKey.clear()
+  acc.serverToolsRevision += 1
+  acc.serverToolsProjectionRevision = -1
+  acc.serverToolsProjection = []
   acc.providerOutputItems = []
+  acc.providerOutputRowByKey.clear()
   acc.integritySummary = { count: 0, characterCount: 0, entries: [] }
   delete acc.audioOutput
 }
 
+function applyResultSnapshot(
+  acc: StreamAccumulator,
+  event: Extract<CanonicalStreamEventV2, { lane: 'result-snapshot' }>,
+  nowMs: number,
+): void {
+  if (event.generationId !== undefined) acc.generationId = event.generationId
+  if (event.model !== undefined) acc.model = event.model
+  if (event.usage !== undefined) acc.usage = event.usage as ChatUsage
+  for (const integrity of event.integrity ?? []) {
+    recordStreamIntegrity(acc.integritySummary, integrity)
+  }
+  if (event.payload.kind === 'replace') {
+    const changed = resultSnapshotChangesAccumulator(acc, event.payload)
+    replaceAccumulatorPayload(acc, event.payload, nowMs)
+    if (changed) markLiveProjectionDirty(acc)
+  }
+  if (event.outcome.kind === 'finish') {
+    acc.finishReason = event.outcome.finishReason
+    delete acc.midStreamError
+  } else {
+    delete acc.finishReason
+    acc.midStreamError = event.outcome.error
+  }
+}
+
+function resultSnapshotChangesAccumulator(
+  acc: StreamAccumulator,
+  snapshot: ResultSnapshotReplacementV2,
+): boolean {
+  const snapshotText = snapshot.textParts.map((part) => part.text).join('')
+  const snapshotAnnotations = resultSnapshotAnnotations(
+    acc.initialAnnotations,
+    acc.initialTextPrefix.length,
+    snapshot.textParts,
+  )
+  return (
+    streamAccumulatorText(acc) !== snapshotText ||
+    !sameValue(acc.annotations, snapshotAnnotations) ||
+    !sameValue(projectReasoningEnvelope(acc.reasoning.envelope), snapshot.reasoningEnvelope) ||
+    !sameValue(collectSnapshotToolCalls(acc), snapshot.toolCalls) ||
+    !sameValue(acc.generatedContent, snapshot.generatedContent) ||
+    !sameValue(acc.serverTools, snapshot.serverTools) ||
+    !sameValue(acc.providerOutputItems, snapshot.providerOutputItems) ||
+    acc.audioOutput !== undefined ||
+    (acc.phase ?? null) !== snapshot.phase
+  )
+}
+
+function replaceAccumulatorPayload(
+  acc: StreamAccumulator,
+  snapshot: ResultSnapshotReplacementV2,
+  nowMs: number,
+): void {
+  acc.textSections = []
+  acc.textPendingParts = []
+  acc.textPendingLength = 0
+  acc.textLength = 0
+  acc.textSpansByWirePart.clear()
+  for (const part of snapshot.textParts) {
+    const key = streamTextPartKey(part)
+    const existing = acc.textSpansByWirePart.get(key)
+    if (existing) existing.length += part.text.length
+    else acc.textSpansByWirePart.set(key, { start: acc.textLength, length: part.text.length })
+    appendStreamText(acc, part.text)
+  }
+  if (acc.textLength > 0 && acc.firstTextAt === undefined) acc.firstTextAt = nowMs
+  acc.annotations = resultSnapshotAnnotations(
+    acc.initialAnnotations,
+    acc.initialTextPrefix.length,
+    snapshot.textParts,
+  )
+  acc.annotationIdentities = new Set(acc.annotations.map(streamAnnotationIdentity))
+
+  const reasoningChanged = applyCanonicalReasoningMutation(acc.reasoning, {
+    kind: 'replace',
+    envelope: snapshot.reasoningEnvelope,
+  })
+  if (reasoningChanged && !reasoningEnvelopeIsEmpty(snapshot.reasoningEnvelope)) {
+    if (acc.reasoningStartedAt === undefined) acc.reasoningStartedAt = nowMs
+    acc.reasoningFinishedAt = nowMs
+  }
+
+  acc.toolCallRows = []
+  acc.toolCallRowByIndex.clear()
+  acc.toolCallRowById.clear()
+  acc.toolCallArgumentsByRow.clear()
+  acc.toolCallArgumentsLength = 0
+  for (const call of snapshot.toolCalls) {
+    putToolCallEvent(acc, {
+      lane: 'tool-call',
+      index: call.index,
+      ...(call.id !== undefined ? { id: call.id } : {}),
+      ...(call.type !== undefined ? { type: call.type } : {}),
+      ...(call.name !== undefined ? { name: call.name } : {}),
+      argumentsSnapshot: call.arguments,
+      outputIndex: call.index,
+    })
+  }
+
+  acc.generatedContent = structuredClone([...snapshot.generatedContent])
+  delete acc.audioOutput
+  acc.serverTools = structuredClone([...snapshot.serverTools])
+  rebuildServerToolIndex(acc)
+  acc.serverToolsRevision += 1
+  acc.providerOutputItems = structuredClone([...snapshot.providerOutputItems])
+  rebuildProviderOutputIndex(acc)
+  if (snapshot.phase === null) delete acc.phase
+  else acc.phase = snapshot.phase
+}
+
+function collectSnapshotToolCalls(acc: StreamAccumulator): Array<{
+  index: number
+  id?: string
+  type?: 'function'
+  name?: string
+  arguments: string
+}> {
+  return acc.toolCallRows.map((row, index) => ({
+    ...row,
+    arguments: toolCallArgumentsAt(acc, index),
+  }))
+}
+
+function resultSnapshotAnnotations(
+  initial: readonly ContentAnnotation[],
+  initialTextLength: number,
+  parts: ResultSnapshotReplacementV2['textParts'],
+): ContentAnnotation[] {
+  const annotations = structuredClone([...initial])
+  let textOffset = initialTextLength
+  for (const part of parts) {
+    for (const annotation of part.annotations) {
+      annotations.push({
+        ...structuredClone(annotation),
+        startIndex: textOffset + Math.max(0, Math.min(part.text.length, annotation.startIndex)),
+        endIndex: textOffset + Math.max(0, Math.min(part.text.length, annotation.endIndex)),
+      })
+    }
+    textOffset += part.text.length
+  }
+  return annotations
+}
+
 export function streamAccumulatorText(acc: StreamAccumulator): string {
   return joinTextSections(acc.textSections, acc.textPendingParts)
+}
+
+export function streamAccumulatorAnnotations(acc: StreamAccumulator): ContentAnnotation[] {
+  return structuredClone(acc.annotations)
 }
 
 export function projectStreamAccumulatorLiveContent(acc: StreamAccumulator): ContentItem[] {
@@ -582,11 +778,13 @@ export function projectStreamAccumulatorLiveContent(acc: StreamAccumulator): Con
     acc.initialNonTextContent,
     materializedTextSections(acc.textSections, acc.textPendingParts, acc.textPendingLength),
     streamPreviewGeneratedContent(acc.generatedContent),
+    acc.annotations,
   )
 }
 
 export function streamAccumulatorReasoningLength(acc: StreamAccumulator): number {
-  return acc.reasoningLength
+  const inspected = inspectReasoningEnvelopeState(acc.reasoning.envelope)
+  return inspected.visibleTextLength + inspected.carrierByteLength
 }
 
 export function streamAccumulatorHasCompletionCalibrationBlockers(acc: StreamAccumulator): boolean {
@@ -601,6 +799,15 @@ export function streamAccumulatorHasCompletionCalibrationBlockers(acc: StreamAcc
   )
 }
 
+export function messageHasToolArtifacts(message: Message): boolean {
+  if (message.role === 'tool' || (message.generation?.serverTools?.length ?? 0) > 0) return true
+  for (const attempt of createAppliedMessageView(message).attempts) {
+    if ((attempt.toolCalls?.length ?? 0) > 0) return true
+    if (attempt.providerOutputItems?.some(providerOutputItemHasToolArtifact) === true) return true
+  }
+  return false
+}
+
 function appendStreamText(acc: StreamAccumulator, text: string): void {
   if (text.length === 0) return
   acc.textPendingLength = appendTextToSections(
@@ -612,9 +819,82 @@ function appendStreamText(acc: StreamAccumulator, text: string): void {
   acc.textLength += text.length
 }
 
+function recordTextSpan(
+  acc: StreamAccumulator,
+  event: Extract<StreamLaneEvent, { lane: 'text' }>,
+): void {
+  const key = streamTextPartKey(event)
+  const current = acc.textSpansByWirePart.get(key)
+  if (current) {
+    current.length += event.text.length
+    return
+  }
+  acc.textSpansByWirePart.set(key, { start: acc.textLength, length: event.text.length })
+}
+
+function putTextAnnotations(
+  acc: StreamAccumulator,
+  event: Extract<StreamLaneEvent, { lane: 'text-annotations' }>,
+): boolean {
+  const span = acc.textSpansByWirePart.get(streamTextPartKey(event))
+  const fallbackStart = Math.max(0, acc.textLength - event.ownerTextLength)
+  const base = acc.initialTextPrefix.length + (span?.start ?? fallbackStart)
+  const ownerLength = span?.length ?? event.ownerTextLength
+  let changed = false
+  for (const annotation of event.annotations) {
+    const shifted = structuredClone(annotation)
+    shifted.startIndex = base + Math.max(0, Math.min(ownerLength, annotation.startIndex))
+    shifted.endIndex = base + Math.max(0, Math.min(ownerLength, annotation.endIndex))
+    const identity = streamAnnotationIdentity(shifted)
+    if (acc.annotationIdentities.has(identity)) continue
+    acc.annotationIdentities.add(identity)
+    acc.annotations.push(shifted)
+    changed = true
+  }
+  return changed
+}
+
+function streamTextPartKey(
+  event: Pick<
+    Extract<StreamLaneEvent, { lane: 'text' | 'text-annotations' }>,
+    'outputIndex' | 'contentIndex'
+  >,
+): string {
+  return `${event.outputIndex ?? 'default'}:${event.contentIndex ?? 'all'}`
+}
+
+function collectInitialContentAnnotations(content: readonly ContentItem[]): ContentAnnotation[] {
+  const annotations: ContentAnnotation[] = []
+  let textOffset = 0
+  for (const item of content) {
+    if (item.type !== 'text' && item.type !== 'output_text') continue
+    if (item.type === 'output_text') {
+      for (const annotation of item.annotations ?? []) {
+        annotations.push({
+          ...structuredClone(annotation),
+          startIndex: textOffset + annotation.startIndex,
+          endIndex: textOffset + annotation.endIndex,
+        })
+      }
+    }
+    textOffset += item.text.length
+  }
+  return annotations
+}
+
+function streamAnnotationIdentity(annotation: ContentAnnotation): string {
+  const target =
+    annotation.type === 'url_citation'
+      ? annotation.url
+      : annotation.type === 'file_citation'
+        ? JSON.stringify(annotation.file)
+        : `${annotation.annotationType}:${JSON.stringify(annotation.providerPayload)}`
+  return `${annotation.source}:${annotation.type}:${annotation.startIndex}:${annotation.endIndex}:${target}`
+}
+
 function recordStreamIntegrity(
   summary: AttemptIntegritySummary,
-  event: StreamIntegrityEvent,
+  event: GenerationStreamIntegrityV2,
 ): void {
   summary.count += event.count
   summary.characterCount += event.characterCount
@@ -684,25 +964,6 @@ function materializedTextSections(
 function joinTextSections(sections: readonly string[], pendingParts: readonly string[]): string {
   if (pendingParts.length === 0) return sections.join('')
   return [...sections, ...pendingParts].join('')
-}
-
-function collectReasoning(acc: StreamAccumulator): ReasoningDetail[] {
-  return acc.reasoningList.map((detail, index) => materializedReasoningDetail(acc, index, detail))
-}
-
-function collectLiveReasoningRows(acc: StreamAccumulator): StreamAccumulatorLiveReasoningRow[] {
-  return acc.reasoningList.map((detail, index) => {
-    const buffer = acc.reasoningSegmentsByRow.get(index)
-    if (!buffer) return { detail }
-    return {
-      detail,
-      valueSections: materializedTextSections(
-        buffer.sections,
-        buffer.pendingParts,
-        buffer.pendingLength,
-      ),
-    }
-  })
 }
 
 function putToolCallEvent(
@@ -844,451 +1105,20 @@ function toolCallArgumentsAt(acc: StreamAccumulator, rowIndex: number): string {
   return buffer ? joinTextSections(buffer.sections, buffer.pendingParts) : ''
 }
 
-function putReasoningDetail(
-  acc: StreamAccumulator,
-  incoming: ReasoningDetail,
-  mode: 'delta' | 'snapshot' | 'cumulative' = 'snapshot',
-): void {
-  if (mode === 'snapshot' && isAnthropicReasoningSnapshot(incoming)) {
-    const target = findAnthropicReasoningSnapshotTarget(acc, incoming)
-    if (target !== undefined) {
-      replaceAnthropicReasoningSnapshot(acc, target, incoming)
-      return
-    }
-    pushReasoningRow(acc, incoming)
-    return
-  }
-  if (mode === 'delta') {
-    putStructuredReasoningDetailDelta(acc, incoming)
-    return
-  }
-  if (mode === 'cumulative') {
-    putCumulativeReasoningDetail(acc, incoming)
-    return
-  }
-  if (incoming.id) {
-    const existing = acc.reasoningRowById.get(incoming.id)
-    if (existing !== undefined) {
-      mergeReasoningRow(acc, existing, incoming)
-      return
-    }
-  }
-  let target = findMergeTargetIndex(acc.reasoningList, incoming)
-  if (target < 0 && acc.reasoningSegmentsByRow.size > 0) {
-    target = findMergeTargetIndex(collectReasoning(acc), incoming)
-  }
-  if (target >= 0) {
-    mergeReasoningRow(acc, target, incoming)
-    if (incoming.id) acc.reasoningRowById.set(incoming.id, target)
-    return
-  }
-  pushReasoningRow(acc, incoming)
-}
-
-function putStructuredReasoningDetailDelta(
-  acc: StreamAccumulator,
-  incoming: ReasoningDetail,
-): void {
-  const target = findStructuredReasoningDetailTarget(acc, incoming)
-  if (target === undefined) {
-    pushReasoningDeltaRow(acc, incoming)
-    return
-  }
-  if (incoming.id) acc.reasoningRowById.set(incoming.id, target)
-  const existing = acc.reasoningList[target]
-  if (existing?.type === incoming.type) {
-    acc.reasoningCumulativeValueByRow.delete(target)
-    appendReasoningDelta(acc, target, geminiSummarySectionDelta(acc, target, incoming), false)
-    return
-  }
-  replaceReasoningRow(acc, target, incoming)
-}
-
-function putCumulativeReasoningDetail(acc: StreamAccumulator, incoming: ReasoningDetail): void {
-  const target = findStructuredReasoningDetailTarget(acc, incoming)
-  if (target === undefined) {
-    pushReasoningDeltaRow(acc, incoming)
-    return
-  }
-  if (incoming.id) acc.reasoningRowById.set(incoming.id, target)
-  if (acc.reasoningList[target]?.type !== incoming.type) {
-    replaceReasoningRow(acc, target, incoming)
-    acc.reasoningCumulativeValueByRow.set(target, reasoningDetailValue(incoming))
-    return
-  }
-  const incomingValue = reasoningDetailValue(incoming)
-  const previousCumulativeValue = acc.reasoningCumulativeValueByRow.get(target)
-  if (
-    incomingValue.length === reasoningRowLength(acc, target) &&
-    reasoningRowMatchesPrefixOf(acc, target, incomingValue)
-  ) {
-    const existing = acc.reasoningList[target]
-    acc.reasoningList[target] = acc.reasoningSegmentsByRow.has(target)
-      ? withReasoningDetailValue({ ...existing, ...incoming }, '')
-      : { ...existing, ...incoming }
-    acc.reasoningCumulativeValueByRow.set(target, incomingValue)
-    return
-  }
-  if (
-    previousCumulativeValue !== undefined &&
-    incomingValue.length > previousCumulativeValue.length &&
-    incomingValue.startsWith(previousCumulativeValue)
-  ) {
-    const existing = acc.reasoningList[target]
-    replaceReasoningRow(acc, target, { ...existing, ...incoming })
-    acc.reasoningCumulativeValueByRow.set(target, incomingValue)
-    return
-  }
-  if (
-    incomingValue.length > reasoningRowLength(acc, target) &&
-    reasoningRowMatchesPrefixOf(acc, target, incomingValue)
-  ) {
-    appendReasoningDelta(acc, target, incoming, true)
-    acc.reasoningCumulativeValueByRow.set(target, incomingValue)
-    return
-  }
-  appendReasoningDelta(acc, target, incoming, false)
-  acc.reasoningCumulativeValueByRow.delete(target)
-}
-
-function reasoningRowMatchesPrefixOf(
-  acc: StreamAccumulator,
-  index: number,
-  incomingValue: string,
-): boolean {
-  const buffer = acc.reasoningSegmentsByRow.get(index)
-  if (!buffer) {
-    const detail = acc.reasoningList[index]
-    return detail ? incomingValue.startsWith(reasoningDetailValue(detail)) : true
-  }
-  let offset = 0
-  for (const fragment of buffer.sections) {
-    if (!incomingValue.startsWith(fragment, offset)) return false
-    offset += fragment.length
-  }
-  for (const fragment of buffer.pendingParts) {
-    if (!incomingValue.startsWith(fragment, offset)) return false
-    offset += fragment.length
-  }
-  return true
-}
-
-function findStructuredReasoningDetailTarget(
-  acc: StreamAccumulator,
-  incoming: ReasoningDetail,
-): number | undefined {
-  const byId = incoming.id ? acc.reasoningRowById.get(incoming.id) : undefined
-  if (byId !== undefined) return byId
-  for (let index = acc.reasoningList.length - 1; index >= 0; index -= 1) {
-    const existing = acc.reasoningList[index]
-    if (!existing || existing.type !== incoming.type) continue
-    if (existing.id && incoming.id && existing.id !== incoming.id) continue
-    if (existing.index === incoming.index) return index
-  }
-  return undefined
-}
-
-function geminiSummarySectionDelta(
-  acc: StreamAccumulator,
-  index: number,
-  incoming: ReasoningDetail,
-): ReasoningDetail {
-  if (
-    incoming.type !== 'reasoning.summary' ||
-    incoming.format !== 'google-gemini-v1' ||
-    incoming.summary.length === 0 ||
-    reasoningRowLength(acc, index) === 0 ||
-    reasoningRowEndsWithBlankLine(acc, index) ||
-    /^\s*\n/u.test(incoming.summary)
-  ) {
-    return incoming
-  }
-  return { ...incoming, summary: `\n\n${incoming.summary}` }
-}
-
-function reasoningRowEndsWithBlankLine(acc: StreamAccumulator, index: number): boolean {
-  const buffer = acc.reasoningSegmentsByRow.get(index)
-  const fragments = buffer
-    ? [...buffer.sections, ...buffer.pendingParts]
-    : [reasoningDetailValue(acc.reasoningList[index] as ReasoningDetail)]
-  for (let fragmentIndex = fragments.length - 1; fragmentIndex >= 0; fragmentIndex -= 1) {
-    const fragment = fragments[fragmentIndex] as string
-    for (let charIndex = fragment.length - 1; charIndex >= 0; charIndex -= 1) {
-      const char = fragment[charIndex]
-      if (char === '\n') return true
-      if (char !== ' ' && char !== '\t' && char !== '\r') return false
-    }
-  }
-  return false
-}
-
-function isAnthropicReasoningSnapshot(
-  detail: ReasoningDetail,
-): detail is Extract<ReasoningDetail, { type: 'reasoning.text' }> {
-  return detail.type === 'reasoning.text' && detail.format === 'anthropic-claude-v1'
-}
-
-function findAnthropicReasoningSnapshotTarget(
-  acc: StreamAccumulator,
-  incoming: Extract<ReasoningDetail, { type: 'reasoning.text' }>,
-): number | undefined {
-  if (incoming.id) {
-    const byId = acc.reasoningRowById.get(incoming.id)
-    if (byId !== undefined) return byId
-  }
-  if (incoming.index === undefined) return undefined
-  for (let index = acc.reasoningList.length - 1; index >= 0; index -= 1) {
-    const existing = acc.reasoningList[index]
-    if (
-      existing?.type === 'reasoning.text' &&
-      existing.index === incoming.index &&
-      (existing.format === undefined || existing.format === 'anthropic-claude-v1') &&
-      (!existing.id || !incoming.id || existing.id === incoming.id)
-    ) {
-      return index
-    }
-  }
-  return undefined
-}
-
-function replaceAnthropicReasoningSnapshot(
-  acc: StreamAccumulator,
-  index: number,
-  incoming: Extract<ReasoningDetail, { type: 'reasoning.text' }>,
-): void {
-  const existing = acc.reasoningList[index]
-  if (existing?.type !== 'reasoning.text') {
-    replaceReasoningRow(acc, index, incoming)
-    return
-  }
-  const next = {
-    ...existing,
-    ...incoming,
-    ...(incoming.text === undefined
-      ? { text: reasoningDetailValueAt(acc, index) }
-      : { text: incoming.text }),
-  } satisfies ReasoningDetail
-  replaceReasoningRow(acc, index, next)
-}
-
-function putReasoningDelta(
-  acc: StreamAccumulator,
-  incoming: ReasoningDetail,
-  replace: boolean,
-): void {
-  if (!incoming.id) {
-    putReasoningDetail(acc, incoming)
-    return
-  }
-  const existingIndex =
-    acc.reasoningRowById.get(incoming.id) ?? findUnidentifiedReasoningDeltaTarget(acc, incoming)
-  if (existingIndex === undefined) {
-    pushReasoningDeltaRow(acc, incoming)
-    return
-  }
-  acc.reasoningRowById.set(incoming.id, existingIndex)
-  const existing = acc.reasoningList[existingIndex]
-  if (existing?.type === incoming.type) {
-    acc.reasoningCumulativeValueByRow.delete(existingIndex)
-    appendReasoningDelta(acc, existingIndex, incoming, replace)
-    return
-  }
-  replaceReasoningRow(acc, existingIndex, incoming)
-}
-
-function pushReasoningRow(acc: StreamAccumulator, incoming: ReasoningDetail): void {
-  const index = acc.reasoningList.length
-  acc.reasoningList.push(incoming)
-  acc.reasoningLength += reasoningDetailLength(incoming)
-  if (incoming.id) acc.reasoningRowById.set(incoming.id, index)
-}
-
-function pushReasoningDeltaRow(acc: StreamAccumulator, incoming: ReasoningDetail): void {
-  const index = acc.reasoningList.length
-  const field = reasoningSegmentField(incoming)
-  const value = reasoningDetailValue(incoming)
-  const sections: string[] = []
-  const pendingParts: string[] = []
-  const pendingLength = appendTextToSections(sections, pendingParts, 0, value)
-  acc.reasoningList.push(withReasoningDetailValue(incoming, ''))
-  acc.reasoningSegmentsByRow.set(index, {
-    field,
-    sections,
-    pendingParts,
-    pendingLength,
-    length: value.length,
-  })
-  acc.reasoningLength += value.length
-  if (incoming.id) acc.reasoningRowById.set(incoming.id, index)
-}
-
-function appendReasoningDelta(
-  acc: StreamAccumulator,
-  index: number,
-  incoming: ReasoningDetail,
-  replace: boolean,
-): void {
-  const field = reasoningSegmentField(incoming)
-  const incomingValue = reasoningDetailValue(incoming)
-  let buffer = acc.reasoningSegmentsByRow.get(index)
-  const existing = acc.reasoningList[index]
-  if (!existing || existing.type !== incoming.type || (buffer && buffer.field !== field)) {
-    replaceReasoningRow(acc, index, incoming)
-    return
-  }
-  if (!buffer) {
-    const existingValue = reasoningDetailValue(existing)
-    const sections: string[] = []
-    const pendingParts: string[] = []
-    const pendingLength = appendTextToSections(sections, pendingParts, 0, existingValue)
-    buffer = { field, sections, pendingParts, pendingLength, length: existingValue.length }
-    acc.reasoningSegmentsByRow.set(index, buffer)
-  }
-  acc.reasoningList[index] = withReasoningDetailValue({ ...existing, ...incoming }, '')
-  if (replace) {
-    acc.reasoningLength -= buffer.length
-    buffer.sections = []
-    buffer.pendingParts = []
-    buffer.pendingLength = 0
-    buffer.length = 0
-  }
-  buffer.pendingLength = appendTextToSections(
-    buffer.sections,
-    buffer.pendingParts,
-    buffer.pendingLength,
-    incomingValue,
-  )
-  buffer.length += incomingValue.length
-  acc.reasoningLength += incomingValue.length
-}
-
-function mergeReasoningRow(acc: StreamAccumulator, index: number, incoming: ReasoningDetail): void {
-  const existing = materializeReasoningRow(acc, index)
-  replaceReasoningRow(acc, index, mergeReasoningDetail(existing, incoming))
-}
-
-function replaceReasoningRow(
-  acc: StreamAccumulator,
-  index: number,
-  incoming: ReasoningDetail,
-): void {
-  const existingLength = reasoningRowLength(acc, index)
-  acc.reasoningSegmentsByRow.delete(index)
-  acc.reasoningCumulativeValueByRow.delete(index)
-  acc.reasoningList[index] = incoming
-  acc.reasoningLength += reasoningDetailLength(incoming) - existingLength
-  if (incoming.id) acc.reasoningRowById.set(incoming.id, index)
-}
-
-function materializeReasoningRow(
-  acc: StreamAccumulator,
-  index: number,
-): ReasoningDetail | undefined {
-  const detail = acc.reasoningList[index]
-  if (!detail) return undefined
-  const buffer = acc.reasoningSegmentsByRow.get(index)
-  if (!buffer) return detail
-  const materialized = withReasoningDetailValue(
-    detail,
-    joinTextSections(buffer.sections, buffer.pendingParts),
-  )
-  acc.reasoningList[index] = materialized
-  acc.reasoningSegmentsByRow.delete(index)
-  return materialized
-}
-
-function materializedReasoningDetail(
-  acc: StreamAccumulator,
-  index: number,
-  detail: ReasoningDetail,
-): ReasoningDetail {
-  const buffer = acc.reasoningSegmentsByRow.get(index)
-  return buffer
-    ? withReasoningDetailValue(detail, joinTextSections(buffer.sections, buffer.pendingParts))
-    : detail
-}
-
-function reasoningRowLength(acc: StreamAccumulator, index: number): number {
-  return (
-    acc.reasoningSegmentsByRow.get(index)?.length ?? reasoningDetailLength(acc.reasoningList[index])
-  )
-}
-
-function reasoningDetailValueAt(acc: StreamAccumulator, index: number): string {
-  const buffer = acc.reasoningSegmentsByRow.get(index)
-  if (buffer) return joinTextSections(buffer.sections, buffer.pendingParts)
-  const detail = acc.reasoningList[index]
-  return detail ? reasoningDetailValue(detail) : ''
-}
-
-function reasoningDetailLength(detail: ReasoningDetail | undefined): number {
-  return detail ? reasoningDetailValue(detail).length : 0
-}
-
-function reasoningSegmentField(detail: ReasoningDetail): ReasoningSegmentField {
-  if (detail.type === 'reasoning.text') return 'text'
-  if (detail.type === 'reasoning.summary') return 'summary'
-  return 'data'
-}
-
-function reasoningDetailValue(detail: ReasoningDetail): string {
-  if (detail.type === 'reasoning.text') return detail.text ?? ''
-  if (detail.type === 'reasoning.summary') return detail.summary
-  return detail.data
-}
-
-function withReasoningDetailValue(detail: ReasoningDetail, value: string): ReasoningDetail {
-  if (detail.type === 'reasoning.text') return { ...detail, text: value }
-  if (detail.type === 'reasoning.summary') return { ...detail, summary: value }
-  return { ...detail, data: value }
-}
-
-function findUnidentifiedReasoningDeltaTarget(
-  acc: StreamAccumulator,
-  incoming: ReasoningDetail,
-): number | undefined {
-  for (let index = acc.reasoningList.length - 1; index >= 0; index -= 1) {
-    const existing = acc.reasoningList[index]
-    if (!existing || existing.id !== undefined || existing.type !== incoming.type) continue
-    if (existing.index === incoming.index) return index
-  }
-  return undefined
-}
-
-function syntheticReasoningDetailId(
-  type: ReasoningDetail['type'],
-  event: Extract<StreamLaneEvent, { lane: 'reasoning' }>,
-): string | undefined {
-  if (type === 'reasoning.summary') {
-    if (event.itemId) return `summary#${event.itemId}#${event.summaryIndex ?? 0}`
-    if (event.summaryIndex !== undefined) {
-      return event.outputIndex !== undefined
-        ? `summary#${event.outputIndex}#${event.summaryIndex}`
-        : `summary#${event.summaryIndex}`
-    }
-    return event.outputIndex !== undefined ? `summary#${event.outputIndex}` : 'summary#default'
-  }
-  if (event.itemId) {
-    return type === 'reasoning.text' ? `text#${event.itemId}` : `encrypted#${event.itemId}`
-  }
-  if (event.outputIndex !== undefined) {
-    return type === 'reasoning.text'
-      ? `text#${event.outputIndex}`
-      : `encrypted#${event.outputIndex}`
-  }
-  if (type === 'reasoning.text') return 'text#default'
-  return 'encrypted#default'
-}
-
 function assistantContentWithStreamPrefix(
   initialTextPrefix: string,
   initialNonTextContent: readonly ContentItem[],
   streamedText: string,
   generatedContent: readonly ContentItem[] = [],
+  annotations: readonly ContentAnnotation[] = [],
 ): ContentItem[] {
   const text = initialTextPrefix.length > 0 ? `${initialTextPrefix}${streamedText}` : streamedText
   return [
-    { type: 'output_text', text },
+    {
+      type: 'output_text',
+      text,
+      ...(annotations.length > 0 ? { annotations: structuredClone([...annotations]) } : {}),
+    },
     ...structuredClone(initialNonTextContent),
     ...structuredClone(generatedContent),
   ]
@@ -1299,6 +1129,7 @@ function assistantContentWithStreamSections(
   initialNonTextContent: readonly ContentItem[],
   streamedSections: readonly string[],
   generatedContent: readonly ContentItem[] = [],
+  annotations: readonly ContentAnnotation[] = [],
 ): ContentItem[] {
   const textItems: ContentItem[] = []
   if (initialTextPrefix.length > 0) {
@@ -1308,7 +1139,71 @@ function assistantContentWithStreamSections(
     if (section.length > 0) textItems.push({ type: 'output_text', text: section })
   }
   if (textItems.length === 0) textItems.push({ type: 'output_text', text: '' })
-  return [...textItems, ...initialNonTextContent, ...generatedContent]
+  return [
+    ...attachAnnotationsToTextItems(textItems, annotations),
+    ...initialNonTextContent,
+    ...generatedContent,
+  ]
+}
+
+function attachAnnotationsToTextItems(
+  textItems: readonly ContentItem[],
+  annotations: readonly ContentAnnotation[],
+): ContentItem[] {
+  if (annotations.length === 0) return [...textItems]
+  const result = structuredClone([...textItems])
+  const textRows = result
+    .map((item, index) => ({ item, index }))
+    .filter(
+      (
+        row,
+      ): row is {
+        item: Extract<ContentItem, { type: 'text' | 'output_text' }>
+        index: number
+      } => row.item.type === 'text' || row.item.type === 'output_text',
+    )
+  const boundaries: number[] = []
+  let totalTextLength = 0
+  for (const row of textRows) {
+    totalTextLength += row.item.text.length
+    boundaries.push(totalTextLength)
+  }
+  const ownedByRow = textRows.map(() => [] as ContentAnnotation[])
+  for (const annotation of annotations) {
+    const rowIndex = lowerBound(boundaries, annotation.endIndex)
+    if (rowIndex >= textRows.length) continue
+    const textOffset = rowIndex === 0 ? 0 : (boundaries[rowIndex - 1] ?? 0)
+    if (annotation.endIndex <= textOffset && !(textOffset === 0 && annotation.endIndex === 0)) {
+      continue
+    }
+    ownedByRow[rowIndex]?.push({
+      ...structuredClone(annotation),
+      startIndex: Math.max(0, annotation.startIndex - textOffset),
+      endIndex: Math.max(0, annotation.endIndex - textOffset),
+    })
+  }
+  for (const [rowIndex, row] of textRows.entries()) {
+    const owned = ownedByRow[rowIndex] ?? []
+    if (owned.length > 0) {
+      result[row.index] = {
+        type: 'output_text',
+        text: row.item.text,
+        annotations: owned,
+      }
+    }
+  }
+  return result
+}
+
+function lowerBound(values: readonly number[], target: number): number {
+  let low = 0
+  let high = values.length
+  while (low < high) {
+    const middle = low + Math.floor((high - low) / 2)
+    if ((values[middle] ?? Number.POSITIVE_INFINITY) < target) low = middle + 1
+    else high = middle
+  }
+  return low
 }
 
 function streamPreviewGeneratedContent(generatedContent: readonly ContentItem[]): ContentItem[] {
@@ -1335,18 +1230,17 @@ function audioOutputContent(acc: StreamAccumulator): ContentItem[] {
     acc.audioOutput.transcriptSections,
     acc.audioOutput.transcriptPendingParts,
   )
-  const item: ContentItem = {
+  const base = {
     type: 'audio_output',
     format,
     ...(transcript.length > 0 ? { transcript } : {}),
-  }
-  if (joined.length > 0) {
-    item.url =
-      format === 'pcm16'
-        ? pcm16DataUrlToWav(joined, { sampleRate: 24_000, channels: 1 })
-        : `data:audio/${format};base64,${joined}`
-  }
-  return [item]
+  } as const
+  if (joined.length === 0) return [base]
+  const url =
+    format === 'pcm16'
+      ? pcm16DataUrlToWav(joined, { sampleRate: 24_000, channels: 1 })
+      : `data:audio/${format};base64,${joined}`
+  return [{ ...base, url }]
 }
 
 function pcm16DataUrlToWav(
@@ -1406,7 +1300,7 @@ function writeAscii(view: DataView, offset: number, value: string): void {
 }
 
 function providerOutputItemHasToolArtifact(item: ProviderOutputItem): boolean {
-  return HOSTED_SERVER_TOOL_ITEM_TYPES.has(item.type) || item.type.endsWith('_tool_result')
+  return isKnownProviderToolOutputType(item.type) || item.type.endsWith('_tool_result')
 }
 
 function hasServerToolUsage(usage: ChatUsage | undefined): boolean {
@@ -1420,13 +1314,12 @@ function recordServerToolStatus(
   acc: StreamAccumulator,
   event: Extract<StreamLaneEvent, { lane: 'server-tool' }>,
 ): void {
-  upsertServerTool(acc.serverTools, {
+  putServerTool(acc, {
     type: event.itemType,
     source: 'stream-status',
     id: event.itemId,
     status: event.status,
     outputIndex: event.outputIndex,
-    ...(event.partialImageB64 ? { output: { partialImageB64: event.partialImageB64 } } : {}),
   })
 }
 
@@ -1438,40 +1331,48 @@ function recordServerToolOutputItem(
 ): void {
   if (!item || typeof item !== 'object') return
   const record = item as { type?: unknown; id?: unknown; status?: unknown }
-  if (typeof record.type !== 'string' || !HOSTED_SERVER_TOOL_ITEM_TYPES.has(record.type)) return
-  upsertServerTool(acc.serverTools, {
+  if (typeof record.type !== 'string' || !isKnownProviderToolOutputType(record.type)) return
+  putServerTool(acc, {
     type: record.type,
     source: fallbackSource,
     ...(typeof record.id === 'string' ? { id: record.id } : {}),
     ...(typeof record.status === 'string' ? { status: record.status } : {}),
     outputIndex,
-    output: structuredClone(item),
   })
 }
 
 function recordResponsesOutputItem(
   acc: StreamAccumulator,
+  dialect: 'openai-responses' | 'openrouter-responses',
   item: unknown,
   outputIndex: number,
 ): void {
-  const providerItem = providerOutputItemFromResponsesItem(item, outputIndex)
+  const providerItem = providerOutputItemFromResponsesItem(item, dialect, outputIndex)
   if (!providerItem) return
-  upsertProviderOutputItem(acc.providerOutputItems, providerItem)
+  putProviderOutputItem(acc, providerItem)
 }
 
 function recordProviderOutputItem(
   acc: StreamAccumulator,
+  dialect: 'google-gemini' | 'anthropic-claude',
   type: string,
+  captureId: string,
   output: unknown,
   outputIndex: number,
 ): void {
-  const providerItem = type.startsWith('google:')
-    ? providerOutputItemFromGeminiPart(type, output, outputIndex)
-    : type === 'server_tool_use' || type.endsWith('_tool_result')
-      ? providerOutputItemFromResponsesItem(output, outputIndex)
-      : null
+  const providerItem =
+    dialect === 'google-gemini'
+      ? providerOutputItemFromGeminiPart(type, output, outputIndex)
+      : {
+          dialect,
+          type,
+          captureId,
+          outputIndex,
+          item: structuredClone(output),
+        }
   if (!providerItem) return
-  upsertProviderOutputItem(acc.providerOutputItems, providerItem)
+  providerItem.captureId = captureId
+  putProviderOutputItem(acc, providerItem)
 }
 
 function serverToolRecordsFromUsage(usage: ChatUsage | undefined): GenerationServerToolCall[] {
@@ -1485,7 +1386,6 @@ function serverToolRecordsFromUsage(usage: ChatUsage | undefined): GenerationSer
       source: 'usage',
       status: 'completed',
       requestCount: value,
-      output: { [key]: value },
     })
   }
   return records
@@ -1502,23 +1402,34 @@ function mergeServerToolRecords(
   records: readonly GenerationServerToolCall[],
 ): GenerationServerToolCall[] {
   const merged: GenerationServerToolCall[] = []
-  for (const record of records) upsertServerTool(merged, record)
+  const rowByKey = new Map<string, number>()
+  for (const record of records) putServerToolRecord(merged, rowByKey, record)
   return merged
 }
 
-function upsertServerTool(
+function putServerTool(acc: StreamAccumulator, incoming: GenerationServerToolCall): void {
+  if (putServerToolRecord(acc.serverTools, acc.serverToolRowByKey, incoming)) {
+    acc.serverToolsRevision += 1
+  }
+}
+
+function putServerToolRecord(
   records: GenerationServerToolCall[],
+  rowByKey: Map<string, number>,
   incoming: GenerationServerToolCall,
-): void {
-  const key = serverToolRecordKey(incoming)
-  const index = records.findIndex((record) => serverToolRecordKey(record) === key)
-  if (index < 0) {
+): boolean {
+  const incomingAliases = serverToolRecordAliases(incoming)
+  const index = incomingAliases
+    .map((alias) => rowByKey.get(alias))
+    .find((candidate): candidate is number => candidate !== undefined)
+  if (index === undefined) {
+    for (const alias of incomingAliases) rowByKey.set(alias, records.length)
     records.push(structuredClone(incoming))
-    return
+    return true
   }
   const existing = records[index]
-  if (!existing) return
-  records[index] = {
+  if (!existing) return false
+  const next = {
     ...existing,
     ...structuredClone(incoming),
     source:
@@ -1526,77 +1437,63 @@ function upsertServerTool(
         ? incoming.source
         : existing.source,
   }
+  if (sameValue(existing, next)) return false
+  records[index] = next
+  for (const alias of serverToolRecordAliases(next)) rowByKey.set(alias, index)
+  return true
 }
 
-function upsertProviderOutputItem(
-  records: ProviderOutputItem[],
-  incoming: ProviderOutputItem,
-): void {
-  const key = providerOutputItemKey(incoming)
-  const index = records.findIndex((record) => providerOutputItemKey(record) === key)
-  if (index < 0) {
-    records.push(structuredClone(incoming))
+function projectServerTools(acc: StreamAccumulator): GenerationServerToolCall[] {
+  if (acc.serverToolsProjectionRevision === acc.serverToolsRevision) {
+    return acc.serverToolsProjection
+  }
+  acc.serverToolsProjection = mergeServerToolRecords([
+    ...acc.serverTools,
+    ...(acc.serverTools.length === 0 ? serverToolRecordsFromUsage(acc.usage) : []),
+  ])
+  acc.serverToolsProjectionRevision = acc.serverToolsRevision
+  return acc.serverToolsProjection
+}
+
+function putProviderOutputItem(acc: StreamAccumulator, incoming: ProviderOutputItem): void {
+  const key = providerOutputItemIdentity(incoming, acc.providerOutputItems.length)
+  const index = acc.providerOutputRowByKey.get(key)
+  if (index === undefined) {
+    acc.providerOutputRowByKey.set(key, acc.providerOutputItems.length)
+    acc.providerOutputItems.push(structuredClone(incoming))
     return
   }
-  records[index] = structuredClone(incoming)
+  acc.providerOutputItems[index] = structuredClone(incoming)
 }
 
-function providerOutputItemKey(record: ProviderOutputItem): string {
-  const rawItem = record.item
-  const item =
-    rawItem !== null && typeof rawItem === 'object'
-      ? (rawItem as {
-          id?: unknown
-          call_id?: unknown
-          executableCode?: { id?: unknown }
-          codeExecutionResult?: { id?: unknown }
-        })
-      : undefined
-  if (typeof item?.id === 'string') return `id:${item.id}`
-  if (typeof item?.call_id === 'string') return `call:${record.type}:${item.call_id}`
-  if (typeof item?.executableCode?.id === 'string') {
-    return `gemini-code:${item.executableCode.id}:exec`
+function rebuildServerToolIndex(acc: StreamAccumulator): void {
+  acc.serverToolRowByKey.clear()
+  for (let index = 0; index < acc.serverTools.length; index += 1) {
+    const record = acc.serverTools[index]
+    if (record) {
+      for (const alias of serverToolRecordAliases(record)) {
+        acc.serverToolRowByKey.set(alias, index)
+      }
+    }
   }
-  if (typeof item?.codeExecutionResult?.id === 'string') {
-    return `gemini-code:${item.codeExecutionResult.id}:result`
+}
+
+function rebuildProviderOutputIndex(acc: StreamAccumulator): void {
+  acc.providerOutputRowByKey.clear()
+  for (let index = 0; index < acc.providerOutputItems.length; index += 1) {
+    const record = acc.providerOutputItems[index]
+    if (record) {
+      acc.providerOutputRowByKey.set(providerOutputItemIdentity(record, index), index)
+    }
   }
+}
+
+function serverToolRecordAliases(record: GenerationServerToolCall): string[] {
+  const aliases: string[] = []
+  if (record.id) aliases.push(`id:${record.id}:${record.type}`)
   if (record.outputIndex !== undefined) {
-    return `idx:${record.outputIndex}:${record.type}:${Object.keys(item ?? {}).join(',')}`
+    aliases.push(`idx:${record.outputIndex}:${record.type}`)
   }
-  return `${record.dialect}:${record.type}:${JSON.stringify(record.item).slice(0, 128)}`
-}
-
-function serverToolRecordKey(record: GenerationServerToolCall): string {
-  if (record.id) return `id:${record.id}:${record.type}`
-  if (record.outputIndex !== undefined) return `idx:${record.outputIndex}:${record.type}`
-  return `usage:${record.type}`
-}
-
-function replayableStreamEvent(event: unknown): StreamLaneEvent | null {
-  if (!event || typeof event !== 'object') return null
-  const lane = (event as { lane?: unknown }).lane
-  if (typeof lane !== 'string') return null
-  switch (lane) {
-    case 'text':
-    case 'reasoning':
-    case 'usage':
-    case 'finish':
-    case 'terminal':
-    case 'meta':
-    case 'content-item':
-    case 'audio-output':
-    case 'server-tool':
-    case 'server-tool-output':
-    case 'output-item-added':
-    case 'output-item-done':
-    case 'phase':
-    case 'integrity':
-    case 'error':
-    case 'buffered':
-    case 'keepalive':
-    case 'tool-call':
-      return event as StreamLaneEvent
-    default:
-      return null
-  }
+  if (aliases.length === 0) aliases.push(`usage:${record.type}`)
+  return aliases
 }

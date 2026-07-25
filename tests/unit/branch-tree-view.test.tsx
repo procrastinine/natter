@@ -1,31 +1,782 @@
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { StrictMode, useMemo } from 'react'
-import { afterEach, describe, expect, it, vi } from 'vitest'
-import { createMessageTreeProjection } from '../../src/core/active-path'
-import type { Message, MessageId, MessageRole } from '../../src/core/types'
-import { useStableStructuralHeaders } from '../../src/hooks/useBranchUrlSync'
-import { postEvent } from '../../src/store/broadcast'
-import type { MessageHeaderRow } from '../../src/store/message-storage'
-import { getStreamClientId } from '../../src/store/stream-leases'
-import { useStreamStore } from '../../src/store/zustand/streamStore'
-import { BranchTreeInspector } from '../../src/ui/chat/BranchTreeInspector'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { StrictMode, useLayoutEffect, useMemo, useRef, useSyncExternalStore } from 'react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import {
+  type ActiveBranchForkSlot,
+  createActiveBranchSpineFromPath,
+} from '../../src/core/active-branch-spine'
+import type { MessageTreeProjection } from '../../src/core/active-path'
+import { createBranchPath } from '../../src/core/branch-session'
+import { cloneDefaultChatSettings } from '../../src/core/defaults'
+import { AVAILABLE_GENERATION_CAPABILITY } from '../../src/core/interaction-capability'
+import { createMessageTopologyIndex } from '../../src/core/message-topology'
+import { messageTreeIndexFields } from '../../src/core/message-tree-index'
+import {
+  type ConversationSelectionProofTarget,
+  sealConversationSelection,
+} from '../../src/core/messages'
+import { EMPTY_MESSAGE_CONTEXT_ROUTE_FACTS } from '../../src/core/reasoning'
+import type { Chat, Message, MessageId, MessageRole } from '../../src/core/types'
+import { useAttemptExecutionsForChat } from '../../src/store/attempt-controller'
+import { postWorkspaceChange, subscribeWorkspaceChanges } from '../../src/store/broadcast'
+import {
+  type ConversationCommittedEffect,
+  type ConversationController,
+  type ConversationMessagePresentation,
+  type ConversationNavigationPort,
+  type ConversationPresentationResourcePort,
+  type ConversationProjectionSource,
+  type ConversationRouteArrival,
+  type ConversationTreeSurface,
+  createConversationController,
+  TREE_PREVIEW_MAX_CHARS,
+} from '../../src/store/conversation-controller'
+import type { GenerationCapabilityFrame } from '../../src/store/generation-admission-controller'
+import type { GenerationStartResult } from '../../src/store/generation-engine'
+import { type MessageHeaderRow, sameMessageHeaderValue } from '../../src/store/message-storage'
+import {
+  attachMountedRepositoryProjections,
+  resetMountedRepositoryProjectionsForTests,
+} from '../../src/store/mounted-projection-lifecycle'
+import type { AttachmentCatalogRow } from '../../src/store/presentation-contracts'
+import type { WorkspaceFence } from '../../src/store/repository'
+import { reconcileWorkspaceTabSessionStorage } from '../../src/store/workspace-tab-session'
+import { useToastStore } from '../../src/store/zustand/toastStore'
+import { observeBranchTreeInspectorComputations } from '../../src/ui/chat/BranchTreeInspector'
 import {
   type BranchTreeRepository,
   BranchTreeView as BranchTreeViewComponent,
   type BranchTreeViewProps,
+  observeBranchTreeComputations,
 } from '../../src/ui/chat/BranchTreeView'
+import {
+  observeTestAttempt,
+  publishTestLiveProjection,
+  removeTestAttempt,
+  resetAttemptControllerForTests,
+} from '../helpers/attempt-controller'
+import {
+  createInteractionSettlementHarness,
+  succeededInteractionSettlement,
+} from '../helpers/presentation-interactions'
+import { reasoningEnvelopeFromDetailsForTest } from '../helpers/reasoning-events'
+
+const attachmentCatalogState = vi.hoisted(() => ({
+  rowsById: new Map<string, AttachmentCatalogRow>(),
+  workspaceFence: { workspaceId: 'tree-test-workspace', replacementEpoch: 0 },
+}))
+
+vi.mock('../../src/ui/attachments/useAttachmentCatalogRows', () => ({
+  useAttachmentCatalogRows: () => ({
+    revision: 1,
+    status: 'ready',
+    interactive: true,
+    attachmentIds: [...attachmentCatalogState.rowsById.keys()],
+    rowsById: attachmentCatalogState.rowsById,
+    errorsById: new Map(),
+    workspaceFence: attachmentCatalogState.workspaceFence,
+  }),
+}))
+
+vi.mock('../../src/ui/attachments/useAttachmentMedia', () => ({
+  useAttachmentMedia: () => ({ status: 'idle', media: null, workspaceFence: null }),
+}))
+
+vi.mock('../../src/ui/attachments/useAttachmentObjectUrl', () => ({
+  useAttachmentObjectUrl: () => undefined,
+}))
+
+type CursorMap = Readonly<Record<string, MessageId>>
+
+const READY_GENERATION_CAPABILITY_FRAME: GenerationCapabilityFrame = Object.freeze({
+  capability: () => AVAILABLE_GENERATION_CAPABILITY,
+})
+
+const TEST_STRUCTURAL_VERSION = 1
+const EMPTY_TREE_PREVIEWS: ConversationTreeSurface['previews'] = new Map()
+let testWorkspaceFence: WorkspaceFence = {
+  workspaceId: 'tree-test-workspace',
+  replacementEpoch: 0,
+}
+
+function sameTreeStructure(left: MessageHeaderRow, right: MessageHeaderRow): boolean {
+  return (
+    left.id === right.id &&
+    left.parentId === right.parentId &&
+    left.siblingIndex === right.siblingIndex &&
+    left.deleted === right.deleted
+  )
+}
+
+interface LiveLeafScore {
+  readonly createdAt: number
+  readonly id: MessageId
+}
+
+function compareLeafScore(left: LiveLeafScore, right: LiveLeafScore): number {
+  return left.createdAt - right.createdAt || (left.id < right.id ? -1 : left.id > right.id ? 1 : 0)
+}
+
+function activePathForCursor<T extends MessageHeaderRow>(
+  projection: MessageTreeProjection<T>,
+  cursor: CursorMap,
+): T[] {
+  const scores = new Map<MessageId, LiveLeafScore>()
+  const remainingChildren = new Map<MessageId, number>()
+  const ready: T[] = []
+  for (const message of projection.byId.values()) {
+    if (message.deleted) continue
+    const childCount = projection.liveByParent.get(message.id)?.length ?? 0
+    remainingChildren.set(message.id, childCount)
+    if (childCount === 0) {
+      scores.set(message.id, { createdAt: message.createdAt, id: message.id })
+      ready.push(message)
+    }
+  }
+  for (let index = 0; index < ready.length; index += 1) {
+    const message = ready[index] as T
+    if (message.parentId === null) continue
+    const parent = projection.byId.get(message.parentId)
+    if (!parent || parent.deleted) continue
+    const childScore = scores.get(message.id)
+    const parentScore = scores.get(parent.id)
+    if (childScore && (!parentScore || compareLeafScore(childScore, parentScore) > 0)) {
+      scores.set(parent.id, childScore)
+    }
+    const remaining = (remainingChildren.get(parent.id) ?? 1) - 1
+    remainingChildren.set(parent.id, remaining)
+    if (remaining === 0) ready.push(parent)
+  }
+
+  const path: T[] = []
+  let parentId: MessageId | null = null
+  for (;;) {
+    const children = projection.liveByParent.get(parentId) ?? []
+    if (children.length === 0) return path
+    const pinnedId: MessageId | undefined = cursor[parentId ?? '__root__']
+    const pinned: T | undefined = pinnedId
+      ? children.find((candidate) => candidate.id === pinnedId)
+      : undefined
+    let chosen: T = pinned ?? (children[0] as T)
+    if (!pinned) {
+      for (let index = 1; index < children.length; index += 1) {
+        const candidate = children[index] as T
+        const candidateScore = scores.get(candidate.id)
+        const chosenScore = scores.get(chosen.id)
+        const scoreOrder = candidateScore
+          ? chosenScore
+            ? compareLeafScore(candidateScore, chosenScore)
+            : 1
+          : chosenScore
+            ? -1
+            : 0
+        if (
+          scoreOrder > 0 ||
+          (scoreOrder === 0 &&
+            (candidate.siblingIndex > chosen.siblingIndex ||
+              (candidate.siblingIndex === chosen.siblingIndex && candidate.id > chosen.id)))
+        ) {
+          chosen = candidate
+        }
+      }
+    }
+    path.push(chosen)
+    parentId = chosen.id
+  }
+}
+
+function newestDescendantId(
+  projection: MessageTreeProjection<MessageHeaderRow>,
+  messageId: MessageId,
+): MessageId | null {
+  const root = projection.byId.get(messageId)
+  if (!root || root.deleted) return null
+  const stack = [root]
+  let newest: MessageHeaderRow | null = null
+  while (stack.length > 0) {
+    const current = stack.pop() as MessageHeaderRow
+    const children = projection.liveByParent.get(current.id) ?? []
+    if (children.length > 0) {
+      for (const child of children) stack.push(child)
+      continue
+    }
+    if (
+      !newest ||
+      compareLeafScore(
+        { createdAt: current.createdAt, id: current.id },
+        { createdAt: newest.createdAt, id: newest.id },
+      ) > 0
+    ) {
+      newest = current
+    }
+  }
+  return newest?.id ?? root.id
+}
+
+function pathToMessage(
+  projection: MessageTreeProjection<MessageHeaderRow>,
+  messageId: MessageId | null,
+): MessageHeaderRow[] {
+  if (messageId === null) return []
+  const reversePath: MessageHeaderRow[] = []
+  const seen = new Set<MessageId>()
+  let current = projection.byId.get(messageId)
+  while (current && !current.deleted && !seen.has(current.id)) {
+    seen.add(current.id)
+    reversePath.push(current)
+    current = current.parentId ? projection.byId.get(current.parentId) : undefined
+  }
+  return reversePath.reverse()
+}
+
+function resolveSelectionPath(
+  headers: readonly MessageHeaderRow[],
+  target: ConversationSelectionProofTarget,
+): MessageHeaderRow[] {
+  const projection = createMessageTopologyIndex(headers, {
+    sameStructure: sameTreeStructure,
+  })
+  let tipId: MessageId | null
+  if (target.kind === 'fixed-empty') {
+    tipId = null
+  } else if (target.kind === 'fixed-tip') {
+    tipId = target.messageId
+  } else if (target.selection.kind === 'default') {
+    tipId = activePathForCursor(projection, {}).at(-1)?.id ?? null
+  } else if (target.selection.kind === 'tip') {
+    tipId = target.selection.messageId
+  } else if (target.selection.kind === 'message') {
+    tipId =
+      target.selection.observedTipId ?? newestDescendantId(projection, target.selection.messageId)
+  } else {
+    const selected = (projection.liveByParent.get(target.selection.parentId) ?? [])[
+      target.selection.position
+    ]
+    tipId =
+      target.selection.observedTipId ??
+      (selected ? newestDescendantId(projection, selected.id) : null)
+  }
+  return pathToMessage(projection, tipId)
+}
+
+function newestLeafId(headers: readonly MessageHeaderRow[]): MessageId | null {
+  const projection = createMessageTopologyIndex(headers, {
+    sameStructure: sameTreeStructure,
+  })
+  return activePathForCursor(projection, {}).at(-1)?.id ?? null
+}
+
+function testChat(chatId: string, structuralVersion: number, leafId: MessageId | null): Chat {
+  return {
+    id: chatId,
+    title: 'Tree test',
+    titleStatus: 'untitled',
+    createdAt: 1,
+    updatedAt: 1,
+    lastViewedAt: 1,
+    wordCount: 0,
+    totalCostUsd: 0,
+    metaVersion: 1,
+    summaryVersion: 1,
+    structuralVersion,
+    settings: cloneDefaultChatSettings(),
+    lastUpdatedLeafId: leafId,
+    lastBranchUpdatedAt: 1,
+    archived: false,
+    pinned: false,
+    folderId: null,
+    tags: [],
+  }
+}
+
+function startedGenerationResult(messageId = 'generated'): GenerationStartResult {
+  const prepared = Object.freeze({
+    streamId: `stream-${messageId}`,
+    chatId: 'chat-1',
+    assistantMessageId: messageId,
+  })
+  return Object.freeze({
+    kind: 'started' as const,
+    handle: Object.freeze({
+      streamId: prepared.streamId,
+      chatId: prepared.chatId,
+      prepared: Promise.resolve(prepared),
+      completed: Promise.resolve({ ...prepared, outcome: 'done' as const }),
+      abort: () => undefined,
+    }),
+  })
+}
 
 const BranchTreeView = Object.assign(
-  function TestBranchTreeView(props: Omit<BranchTreeViewProps, 'projection'>) {
-    const structuralHeaders = useStableStructuralHeaders(props.headers)
-    const projection = useMemo(
-      () => createMessageTreeProjection(structuralHeaders),
-      [structuralHeaders],
+  function TestBranchTreeView(
+    props: Omit<
+      BranchTreeViewProps,
+      | 'attempts'
+      | 'binding'
+      | 'conversationController'
+      | 'generationCapabilityFrame'
+      | 'viewportActive'
+    > & {
+      chatId: string
+      cursor: CursorMap
+      generationCapabilityFrame?: GenerationCapabilityFrame
+      headers: readonly MessageHeaderRow[]
+      latestHeaders?: readonly MessageHeaderRow[]
+      localPresentations?: ReadonlyMap<
+        MessageId,
+        { readonly message: Message; readonly bodyVersion: number }
+      >
+      testController?: ConversationController
+      viewportActive?: boolean
+      bindingCurrency?: ConversationTreeSurface['currency']
+    },
+  ) {
+    const {
+      cursor,
+      headers,
+      latestHeaders,
+      localPresentations,
+      testController,
+      viewportActive = true,
+      bindingCurrency = 'current',
+      generationCapabilityFrame = READY_GENERATION_CAPABILITY_FRAME,
+      ...viewProps
+    } = props
+    const structuralHeaders = headers
+    const exactHeaders = latestHeaders ?? structuralHeaders
+    const structuralSignature = structuralHeaders
+      .map((row) => `${row.id}:${row.parentId ?? ''}:${row.siblingIndex}:${Number(row.deleted)}`)
+      .join('|')
+    const projectionCache = useRef<
+      | {
+          signature: string
+          projection: MessageTreeProjection<MessageHeaderRow>
+        }
+      | undefined
+    >(undefined)
+    if (!projectionCache.current || projectionCache.current.signature !== structuralSignature) {
+      projectionCache.current = {
+        signature: structuralSignature,
+        projection: createMessageTopologyIndex(structuralHeaders, {
+          sameStructure: sameTreeStructure,
+        }),
+      }
+    }
+    const projection = projectionCache.current.projection
+    const selectedHeaders = activePathForCursor(projection, cursor)
+    const selectedPathSignature = selectedHeaders
+      .map((row) => `${row.id}:${row.nodeVersion}:${row.parentId ?? ''}:${row.siblingIndex}`)
+      .join('|')
+    const acceptedPathCache = useRef<{
+      signature: string
+      path: ReturnType<typeof createBranchPath<MessageHeaderRow>>
+      revision: number
+    } | null>(null)
+    if (
+      !acceptedPathCache.current ||
+      acceptedPathCache.current.signature !== selectedPathSignature
+    ) {
+      acceptedPathCache.current = {
+        signature: selectedPathSignature,
+        path: createBranchPath(selectedHeaders),
+        revision: (acceptedPathCache.current?.revision ?? 0) + 1,
+      }
+    }
+    const acceptedPath = acceptedPathCache.current.path
+    const selectionRevision = acceptedPathCache.current.revision
+    const requestedHeaderById = useMemo(
+      () => new Map(exactHeaders.map((header) => [header.id, header] as const)),
+      [exactHeaders],
     )
-    return <BranchTreeViewComponent {...props} projection={projection} />
+    const ownedController = useMemo(() => createConversationController(), [])
+    const controller = testController ?? ownedController
+    const controllerSnapshot = useSyncExternalStore(
+      controller.subscribe,
+      controller.getSnapshot,
+      controller.getSnapshot,
+    )
+    const currentRef = useRef({
+      headers: exactHeaders,
+      acceptedPath,
+      repository: props.repository as TestBranchTreeRepository | undefined,
+      structuralVersion: TEST_STRUCTURAL_VERSION,
+    })
+    const topologyVersionRef = useRef({
+      signature: structuralSignature,
+      version: TEST_STRUCTURAL_VERSION,
+    })
+    if (topologyVersionRef.current.signature !== structuralSignature) {
+      topologyVersionRef.current = {
+        signature: structuralSignature,
+        version: topologyVersionRef.current.version + 1,
+      }
+    }
+    currentRef.current = {
+      headers: exactHeaders,
+      acceptedPath,
+      repository: props.repository as TestBranchTreeRepository | undefined,
+      structuralVersion: topologyVersionRef.current.version,
+    }
+    const fenceRef = useRef<WorkspaceFence>(testWorkspaceFence)
+    const projectionReadCountsRef = useRef(new Map<string, number>())
+    const deliveredWorkspaceRef = useRef('')
+    const deliveredPresentationsRef = useRef(
+      new Map<MessageId, { readonly bodyVersion: number; readonly message: Message }>(),
+    )
+    const navigation = useMemo(() => new TestNavigationPort(), [])
+    const presentationResources = useMemo<ConversationPresentationResourcePort>(
+      () => ({
+        get: () => Object.freeze({ kind: 'ready' as const }),
+        request: () => undefined,
+        subscribe: () => () => undefined,
+      }),
+      [],
+    )
+    const source = useMemo<ConversationProjectionSource>(() => {
+      const countProjectionRead = (kind: string) => {
+        const count = (projectionReadCountsRef.current.get(kind) ?? 0) + 1
+        projectionReadCountsRef.current.set(kind, count)
+        if (count > 100) throw new Error(`TreeTestProjectionReadLoop:${kind}`)
+      }
+      return {
+        openSelection: async (chatId, target) => {
+          countProjectionRead('selection')
+          const path = createBranchPath(resolveSelectionPath(currentRef.current.headers, target))
+          const structuralVersion = currentRef.current.structuralVersion
+          const chat = testChat(chatId, structuralVersion, newestLeafId(currentRef.current.headers))
+          return envelope(
+            fenceRef.current,
+            sealConversationSelection(
+              {
+                kind: 'ready',
+                chat,
+                target,
+                proof: {
+                  chatId,
+                  structuralVersion,
+                  tipId: path.leaf?.id ?? null,
+                },
+                presentations: [],
+              },
+              path,
+            ),
+          )
+        },
+        loadChat: async (chatId) => {
+          countProjectionRead('chat')
+          return envelope(
+            fenceRef.current,
+            testChat(
+              chatId,
+              currentRef.current.structuralVersion,
+              newestLeafId(currentRef.current.headers),
+            ),
+          )
+        },
+        loadForks: async (_chatId, structuralVersion, targets) => {
+          countProjectionRead('forks')
+          return envelope(fenceRef.current, {
+            kind: 'ready' as const,
+            structuralVersion,
+            forks: targets.flatMap((target) => {
+              const selected = currentRef.current.headers.find(
+                (header) => header.id === target.selectedMessageId,
+              )
+              return selected ? [forkForHeader(selected, currentRef.current.headers)] : []
+            }),
+          })
+        },
+        loadChildAtPosition: async (_chatId, parentId, position) =>
+          envelope(
+            fenceRef.current,
+            liveChildren(currentRef.current.headers, parentId)[position]?.id ?? null,
+          ),
+        loadTopology: async (chatId) => {
+          countProjectionRead('topology')
+          const headers = currentRef.current.headers.filter((header) => header.chatId === chatId)
+          const structuralVersion = currentRef.current.structuralVersion
+          return envelope(fenceRef.current, {
+            kind: 'ready' as const,
+            chat: testChat(chatId, structuralVersion, newestLeafId(currentRef.current.headers)),
+            structuralVersion,
+            headers,
+          })
+        },
+        loadTranscriptPage: async () =>
+          envelope(fenceRef.current, {
+            kind: 'stale-selection' as const,
+            material: Object.freeze([]),
+          }),
+        loadInspector: async (chatId, messageId, signal) => {
+          countProjectionRead('inspector')
+          const testRepository = currentRef.current.repository
+          const snapshot = testRepository
+            ? await testRepository.getMessagePresentationSnapshot(messageId, { signal })
+            : undefined
+          const header = currentRef.current.headers.find(
+            (candidate) => candidate.id === messageId && candidate.chatId === chatId,
+          )
+          const presentation: ConversationMessagePresentation | null =
+            snapshot && header
+              ? {
+                  header,
+                  message: snapshot.message,
+                  bodyVersion: snapshot.bodyVersion,
+                }
+              : null
+          return envelope(fenceRef.current, presentation)
+        },
+        loadPreviews: async (_chatId, targets, signal) => {
+          countProjectionRead('previews')
+          const testRepository = currentRef.current.repository
+          const previews = testRepository
+            ? await testRepository.getMessageTextPreviewWindow(targets, {
+                maxChars: TREE_PREVIEW_MAX_CHARS,
+                signal,
+              })
+            : []
+          return envelope(
+            fenceRef.current,
+            previews.filter((preview) => preview !== undefined),
+          )
+        },
+      }
+    }, [])
+    useLayoutEffect(() => {
+      controller.reconcileWorkspace(fenceRef.current)
+      controller.setProjectionSource(source)
+      const uninstallPresentationResources =
+        controller.installPresentationResourcePort(presentationResources)
+      controller.setNavigationPort(navigation)
+      controller.requestPresentation({ chatId: props.chatId, surface: 'tree' })
+      const acceptedLeaf = currentRef.current.acceptedPath.leaf
+      navigation.arrive(props.chatId, acceptedLeaf === null ? undefined : acceptedLeaf.id)
+      return () => {
+        controller.setNavigationPort(null)
+        uninstallPresentationResources()
+        controller.setProjectionSource(null)
+      }
+    }, [controller, navigation, presentationResources, props.chatId, source])
+    useLayoutEffect(() => {
+      const workspaceKey = `${controllerSnapshot.workspaceId ?? ''}:${controllerSnapshot.workspaceEpoch}`
+      if (deliveredWorkspaceRef.current !== workspaceKey) {
+        deliveredWorkspaceRef.current = workspaceKey
+        deliveredPresentationsRef.current.clear()
+      }
+      const active = controllerSnapshot.active
+      if (
+        active?.chatId !== props.chatId ||
+        active.destination.kind !== 'ready' ||
+        !active.topologyLoaded
+      ) {
+        return
+      }
+
+      const effects: ConversationCommittedEffect[] = []
+      const structuralTransition =
+        active.chat?.structuralVersion === currentRef.current.structuralVersion
+          ? ({ kind: 'none' } as const)
+          : ({
+              kind: 'incomplete',
+              toVersion: currentRef.current.structuralVersion,
+              scope: true,
+            } as const)
+      const localIds = new Set(localPresentations?.keys() ?? [])
+      if (localPresentations && localPresentations.size > 0) {
+        const revisions = []
+        for (const [messageId, snapshot] of localPresentations) {
+          const nextHeader = requestedHeaderById.get(messageId)
+          if (!nextHeader) continue
+          const priorHeader = active.headerFacts.get(messageId)
+          const priorPresentation = deliveredPresentationsRef.current.get(messageId)
+          const headerChanged = !priorHeader || !sameMessageHeaderValue(nextHeader, priorHeader)
+          const presentationChanged =
+            !priorPresentation ||
+            priorPresentation.bodyVersion !== snapshot.bodyVersion ||
+            priorPresentation.message !== snapshot.message
+          if (!headerChanged && !presentationChanged) continue
+          deliveredPresentationsRef.current.set(messageId, snapshot)
+          revisions.push({
+            header: nextHeader,
+            structuralVersion: currentRef.current.structuralVersion,
+            presentation: { header: nextHeader, ...snapshot },
+          })
+        }
+        if (revisions.length > 0) {
+          effects.push({
+            ...fenceRef.current,
+            chatId: props.chatId,
+            source: 'local',
+            kind: 'changed',
+            structural: structuralTransition,
+            revisions,
+          })
+        }
+      }
+      const remoteRevisions = exactHeaders.flatMap((nextHeader) => {
+        if (localIds.has(nextHeader.id)) return []
+        const priorHeader = active.headerFacts.get(nextHeader.id)
+        if (priorHeader && sameMessageHeaderValue(nextHeader, priorHeader)) return []
+        return [
+          {
+            header: nextHeader,
+            structuralVersion: currentRef.current.structuralVersion,
+          },
+        ]
+      })
+      if (remoteRevisions.length > 0) {
+        effects.push({
+          ...fenceRef.current,
+          chatId: props.chatId,
+          source: 'remote',
+          kind: 'changed',
+          structural: structuralTransition,
+          revisions: remoteRevisions,
+        })
+      }
+      if (effects.length > 0) controller.applyCommittedEffects(effects)
+    }, [
+      controller,
+      controllerSnapshot,
+      exactHeaders,
+      localPresentations,
+      props.chatId,
+      requestedHeaderById,
+    ])
+    useLayoutEffect(
+      () =>
+        subscribeWorkspaceChanges((event) => {
+          if (event.kind !== 'replace') return
+          fenceRef.current = {
+            workspaceId: event.workspaceId,
+            replacementEpoch: event.replacementEpoch,
+          }
+          controller.reconcileWorkspace(fenceRef.current)
+          controller.requestPresentation({ chatId: props.chatId, surface: 'tree' })
+          const acceptedLeaf = currentRef.current.acceptedPath.leaf
+          navigation.arrive(props.chatId, acceptedLeaf === null ? undefined : acceptedLeaf.id)
+        }),
+      [controller, navigation, props.chatId],
+    )
+    const requestedHeaderLookup = useMemo(
+      () => new Map(exactHeaders.map((requested) => [requested.id, requested] as const)),
+      [exactHeaders],
+    )
+    const headerDeliveryRef = useRef<{
+      headers: ReadonlyMap<MessageId, MessageHeaderRow>
+      revision: number
+      changedKeys: readonly MessageId[]
+    }>({
+      headers: requestedHeaderLookup,
+      revision: 1,
+      changedKeys: exactHeaders.map((header) => header.id),
+    })
+    const priorHeaderDelivery = headerDeliveryRef.current
+    const changedHeaderKeys = exactHeaders
+      .filter((header) => {
+        const prior = priorHeaderDelivery.headers.get(header.id)
+        return !prior || !sameMessageHeaderValue(prior, header)
+      })
+      .map((header) => header.id)
+    for (const priorId of priorHeaderDelivery.headers.keys()) {
+      if (!requestedHeaderLookup.has(priorId)) changedHeaderKeys.push(priorId)
+    }
+    if (changedHeaderKeys.length > 0) {
+      headerDeliveryRef.current = {
+        headers: requestedHeaderLookup,
+        revision: priorHeaderDelivery.revision + 1,
+        changedKeys: changedHeaderKeys,
+      }
+    }
+    const headerDelivery = headerDeliveryRef.current
+    const fallbackSpine = useMemo(
+      () =>
+        createActiveBranchSpineFromPath({
+          chatId: props.chatId,
+          structuralVersion: topologyVersionRef.current.version,
+          resolvedLeafId: acceptedPath.leaf?.id ?? null,
+          path: acceptedPath,
+        }),
+      [acceptedPath, props.chatId],
+    )
+    const controllerInspector = controllerSnapshot.active?.inspector
+    const locallyPresentedInspector = (() => {
+      const inspectedId =
+        controllerInspector?.exact?.message.id ?? controllerInspector?.retained?.message.id
+      const local = inspectedId ? localPresentations?.get(inspectedId) : undefined
+      const header = inspectedId ? headerDelivery.headers.get(inspectedId) : undefined
+      return local && header ? { header, ...local } : null
+    })()
+    const inspectorRef = useRef<ConversationTreeSurface['inspector'] | null>(null)
+    const nextInspector = {
+      exact: locallyPresentedInspector ?? controllerInspector?.exact ?? null,
+      retained: locallyPresentedInspector === null ? (controllerInspector?.retained ?? null) : null,
+      resolving: controllerInspector?.resolving ?? false,
+    }
+    const priorInspector = inspectorRef.current
+    const inspector =
+      priorInspector &&
+      priorInspector.exact === nextInspector.exact &&
+      priorInspector.retained === nextInspector.retained &&
+      priorInspector.resolving === nextInspector.resolving
+        ? priorInspector
+        : Object.freeze(nextInspector)
+    inspectorRef.current = inspector
+    const previews = controllerSnapshot.active?.previews ?? EMPTY_TREE_PREVIEWS
+    const workspaceId = fenceRef.current.workspaceId
+    const replacementEpoch = fenceRef.current.replacementEpoch
+    const seal = useMemo<ConversationTreeSurface['seal']>(
+      () =>
+        Object.freeze({
+          workspaceId,
+          replacementEpoch,
+          chatId: props.chatId,
+          selectionRevision,
+          structuralVersion: topologyVersionRef.current.version,
+          leafId: acceptedPath.leaf?.id ?? null,
+        }),
+      [acceptedPath, props.chatId, replacementEpoch, selectionRevision, workspaceId],
+    )
+    const binding = useMemo<ConversationTreeSurface>(() => {
+      const payload = Object.freeze({
+        surface: 'tree',
+        seal,
+        spine: fallbackSpine,
+        headers: headerDelivery.headers,
+        topology: projection,
+        headerChangeRevision: headerDelivery.revision,
+        changedHeaderKeys: headerDelivery.changedKeys,
+        inspector,
+        previews,
+      } as const)
+      return bindingCurrency === 'current'
+        ? Object.freeze({ ...payload, currency: 'current' as const, reveal: null })
+        : Object.freeze({ ...payload, currency: 'retained' as const, reveal: null })
+    }, [fallbackSpine, headerDelivery, inspector, previews, projection, seal, bindingCurrency])
+    const observedAttempts = useAttemptExecutionsForChat(props.chatId)
+    const attempts = useMemo(
+      () =>
+        observedAttempts.filter(
+          (attempt) =>
+            attempt.workspaceId === binding.seal.workspaceId &&
+            attempt.replacementEpoch === binding.seal.replacementEpoch &&
+            binding.topology.byId.has(attempt.messageId),
+        ),
+      [binding, observedAttempts],
+    )
+    return (
+      <BranchTreeViewComponent
+        {...viewProps}
+        binding={binding}
+        attempts={attempts}
+        viewportActive={viewportActive}
+        conversationController={controller}
+        generationCapabilityFrame={generationCapabilityFrame}
+      />
+    )
   },
   {
-    __setComputationProbeForTests: BranchTreeViewComponent.__setComputationProbeForTests,
+    __setComputationProbeForTests: observeBranchTreeComputations,
   },
 )
 
@@ -49,9 +800,13 @@ function header(
     requestContextVersion: 1,
     bodyVersion: 1,
     bodyWordCount: 2,
-    textPreview: `Preview ${id}`,
+    bodyTextCharCount: 8,
+    bodyMediaCount: 0,
+    bodyRenderCost: 1,
+    contextRouteFacts: EMPTY_MESSAGE_CONTEXT_ROUTE_FACTS,
     nodeVersion: 1,
     deleted: false,
+    ...messageTreeIndexFields({ parentId, deleted: false }),
   }
 }
 
@@ -62,25 +817,146 @@ type TestMessageReader = (
 
 type TestRepositoryOverrides = Partial<BranchTreeRepository> & {
   getMessage?: TestMessageReader
+  getMessagePresentationSnapshot?: TestBranchTreeRepository['getMessagePresentationSnapshot']
+  getMessageTextPreview?: TestBranchTreeRepository['getMessageTextPreview']
+  getMessageTextPreviewWindow?: TestBranchTreeRepository['getMessageTextPreviewWindow']
 }
 
-function repository(overrides: TestRepositoryOverrides = {}): BranchTreeRepository {
-  const { getMessage, ...repositoryOverrides } = overrides
-  return {
-    getMessagePresentationSnapshot: vi.fn(
-      async (messageId: MessageId, options?: { signal?: AbortSignal }) => {
+interface TestBranchTreeRepository extends BranchTreeRepository {
+  getMessagePresentationSnapshot(
+    messageId: MessageId,
+    options?: { signal?: AbortSignal },
+  ): Promise<{ message: Message; bodyVersion: number } | undefined>
+  getMessageTextPreview(
+    messageId: MessageId,
+    options?: { maxChars?: number; signal?: AbortSignal },
+  ): Promise<string | undefined>
+  getMessageTextPreviewWindow(
+    targets: readonly { messageId: MessageId; bodyVersion: number }[],
+    options?: { maxChars?: number; signal?: AbortSignal },
+  ): Promise<Array<{ messageId: MessageId; bodyVersion: number; text: string } | undefined>>
+  searchChatMessageText(
+    chatId: string,
+    query: string,
+    options?: { signal?: AbortSignal },
+  ): Promise<readonly MessageId[]>
+}
+
+class TestNavigationPort implements ConversationNavigationPort {
+  private arrival: ConversationRouteArrival = Object.freeze({ id: 'arrival-0', route: null })
+  private readonly listeners = new Set<() => void>()
+  private serial = 0
+
+  getArrival = () => this.arrival
+
+  subscribeArrival = (listener: () => void) => {
+    this.listeners.add(listener)
+    return () => this.listeners.delete(listener)
+  }
+
+  replaceConversationUrl = () => undefined
+
+  arrive(chatId: string, targetMessageId?: MessageId) {
+    this.arrival = Object.freeze({
+      id: `arrival-${++this.serial}`,
+      route: { chatId, ...(targetMessageId ? { targetMessageId } : {}) },
+    })
+    for (const listener of this.listeners) listener()
+  }
+}
+
+function repository(overrides: TestRepositoryOverrides = {}): TestBranchTreeRepository {
+  const {
+    getMessage,
+    getMessagePresentationSnapshot: presentationOverride,
+    getMessageTextPreview: previewOverride,
+    getMessageTextPreviewWindow: previewWindowOverride,
+    searchChatMessageText: searchOverride,
+    evaluateMessageTexts: evaluateOverride,
+  } = overrides
+  const getMessageTextPreview =
+    previewOverride ?? vi.fn(async (messageId: string) => `Preview ${messageId}`)
+  const getMessageTextPreviewWindow =
+    previewWindowOverride ??
+    vi.fn(
+      async (
+        targets: readonly { messageId: MessageId; bodyVersion: number }[],
+        options?: { maxChars?: number; signal?: AbortSignal },
+      ) =>
+        Promise.all(
+          targets.map(async (target) => {
+            const text = await getMessageTextPreview(target.messageId, options)
+            return text === undefined
+              ? undefined
+              : {
+                  messageId: target.messageId,
+                  bodyVersion: target.bodyVersion,
+                  text: text.slice(0, options?.maxChars ?? TREE_PREVIEW_MAX_CHARS),
+                }
+          }),
+        ),
+    )
+  const result: TestBranchTreeRepository = {
+    getMessagePresentationSnapshot:
+      presentationOverride ??
+      vi.fn(async (messageId: MessageId, options?: { signal?: AbortSignal }) => {
         const message = getMessage
           ? await getMessage(messageId, options)
           : fullMessageFor(messageId)
         const bodyVersion = (message as (Message & { bodyVersion?: number }) | undefined)
           ?.bodyVersion
         return message ? { message, bodyVersion: bodyVersion ?? 1 } : undefined
-      },
-    ),
-    getMessageTextPreview: vi.fn(async (messageId: string) => `Preview ${messageId}`),
-    searchChatMessageText: vi.fn(async () => []),
-    ...repositoryOverrides,
+      }),
+    getMessageTextPreview,
+    getMessageTextPreviewWindow,
+    searchChatMessageText: searchOverride ?? vi.fn(async () => []),
+    evaluateMessageTexts:
+      evaluateOverride ??
+      vi.fn(async (_chatId: string, messageIds: readonly MessageId[]) =>
+        messageIds.map((messageId) => ({
+          messageId,
+          nodeVersion: 1,
+          bodyVersion: 1,
+          present: true,
+          pending: false,
+          matches: false,
+        })),
+      ),
   }
+  return result
+}
+
+function envelope<T>(fence: WorkspaceFence, value: T) {
+  return { ...fence, value }
+}
+
+function liveChildren(
+  headers: readonly MessageHeaderRow[],
+  parentId: MessageId | null,
+): MessageHeaderRow[] {
+  return headers
+    .filter((header) => !header.deleted && header.parentId === parentId)
+    .sort((left, right) => left.siblingIndex - right.siblingIndex)
+}
+
+function forkForHeader(
+  header: MessageHeaderRow,
+  headers: readonly MessageHeaderRow[],
+): ActiveBranchForkSlot {
+  const siblings = liveChildren(headers, header.parentId)
+  const position = siblings.findIndex((candidate) => candidate.id === header.id)
+  if (position < 0) throw new Error(`MissingSelectedSibling:${header.id}`)
+  return Object.freeze({
+    parentId: header.parentId,
+    selectedMessageId: header.id,
+    slotVersion: siblings.reduce((sum, sibling) => sum + sibling.nodeVersion + 1, 0),
+    position,
+    liveCount: siblings.length,
+    previousMessageId: siblings[position - 1]?.id ?? null,
+    nextMessageId: siblings[position + 1]?.id ?? null,
+    firstMessageId: siblings[0]?.id as MessageId,
+    lastMessageId: siblings.at(-1)?.id as MessageId,
+  })
 }
 
 const smallTree = [
@@ -89,15 +965,61 @@ const smallTree = [
   header('right', 'root', 1, 'assistant', 3),
 ]
 
+beforeEach(() => {
+  window.sessionStorage.clear()
+  useToastStore.getState().reset()
+  testWorkspaceFence = resetAttemptControllerForTests()
+  reconcileWorkspaceTabSessionStorage(testWorkspaceFence)
+  resetMountedRepositoryProjectionsForTests()
+  attachMountedRepositoryProjections(testWorkspaceFence)
+  attachmentCatalogState.workspaceFence = testWorkspaceFence
+  attachmentCatalogState.rowsById = new Map([
+    [
+      'attachment-action',
+      {
+        id: 'attachment-action',
+        kind: 'plaintext',
+        mime: 'text/plain',
+        filename: 'action.txt',
+        sizeBytes: 7,
+        origin: 'user-upload',
+        createdAt: 1,
+        updatedAt: 1,
+        storage: { kind: 'remote-url', url: 'https://example.test/action.txt' },
+        refCount: 1,
+        messageRefCount: 1,
+        draftRefCount: 0,
+        visibleRefCount: 1,
+        hiddenRefCount: 0,
+        missingVisibleRefCount: 0,
+        lastUsedAt: 1,
+        processing: [],
+      },
+    ],
+  ])
+})
+
 afterEach(() => {
-  useStreamStore.getState().reset()
+  cleanup()
+  useToastStore.getState().reset()
+  resetAttemptControllerForTests()
+  resetMountedRepositoryProjectionsForTests()
   BranchTreeView.__setComputationProbeForTests(undefined)
-  BranchTreeInspector.__setComputationProbeForTests(undefined)
+  observeBranchTreeInspectorComputations(undefined)
 })
 
 function fullMessageFor(messageId: string): Message | undefined {
   const row = smallTree.find((header) => header.id === messageId)
   return row ? { ...row, content: [{ type: 'text', text: `Full ${messageId}` }] } : undefined
+}
+
+async function waitForActiveTree(): Promise<void> {
+  await waitFor(() =>
+    expect(screen.getByRole('region', { name: 'Chat tree' })).not.toHaveAttribute(
+      'aria-busy',
+      'true',
+    ),
+  )
 }
 
 function streamingGeneration(): NonNullable<Message['generation']> {
@@ -110,8 +1032,60 @@ function streamingGeneration(): NonNullable<Message['generation']> {
     status: 'streaming',
     costSource: 'stream',
     startedAt: 4,
+    reasoningCarryForward: 'none',
+    reasoningVisibility: { disclosure: 'unknown' },
   }
 }
+
+function actionMessage(): Message {
+  return {
+    ...(fullMessageFor('right') as Message),
+    attachmentRefs: [
+      {
+        refId: 'attachment-ref-action',
+        attachmentId: 'attachment-action',
+        includeInContext: true,
+        presentation: { label: 'action.txt' },
+        createdAt: 1,
+        updatedAt: 1,
+      },
+    ],
+    reasoningEnvelope: reasoningEnvelopeFromDetailsForTest(
+      [
+        {
+          type: 'reasoning.text',
+          text: 'Action settlement reasoning.',
+          format: 'anthropic-claude-v1',
+        },
+      ],
+      'anthropic-messages',
+    ),
+    providerOutputItems: [
+      {
+        dialect: 'openai-responses',
+        type: 'web_search_call',
+        outputIndex: 0,
+        item: {
+          type: 'web_search_call',
+          id: 'action-search',
+          status: 'completed',
+          action: { type: 'search', query: 'owner settlement' },
+        },
+      },
+    ],
+  }
+}
+
+const rejectedTreeActionCases = [
+  { kind: 'activate', label: 'Open branch' },
+  { kind: 'delete', label: 'Delete message' },
+  { kind: 'fork', label: 'Fork chat' },
+  { kind: 'toggle', label: 'Context visibility update' },
+  { kind: 'attachment', label: 'Attachment update' },
+  { kind: 'reasoning-visibility', label: 'Reasoning visibility update' },
+  { kind: 'tool-visibility', label: 'Tool visibility update' },
+  { kind: 'insert', label: 'Insert message' },
+] as const
 
 describe('BranchTreeView', () => {
   it('keeps bodies cold in compact mode and uses one shared hover preview', async () => {
@@ -128,6 +1102,7 @@ describe('BranchTreeView', () => {
     )
 
     expect(getMessageTextPreview).not.toHaveBeenCalled()
+    await waitForActiveTree()
     fireEvent.pointerEnter(screen.getByRole('link', { name: 'User message' }))
     await waitFor(() =>
       expect(document.querySelector('[data-ui="branch-tree-preview"]')).toHaveTextContent(
@@ -148,26 +1123,19 @@ describe('BranchTreeView', () => {
     expect(document.querySelectorAll('[data-ui="branch-tree-preview"]')).toHaveLength(1)
   })
 
-  it('serializes compact hover reads and rejects superseded or version-stale results', async () => {
+  it('cancels superseded compact preview batches and rejects version-stale results', async () => {
     const reads: Array<{
       messageId: string
       resolve: (text: string) => void
       signal: AbortSignal | undefined
     }> = []
-    let inFlight = 0
-    let maxInFlight = 0
     const getMessageTextPreview = vi.fn(
       (messageId: string, options?: { maxChars?: number; signal?: AbortSignal }) =>
         new Promise<string>((resolve) => {
-          inFlight += 1
-          maxInFlight = Math.max(maxInFlight, inFlight)
           reads.push({
             messageId,
             signal: options?.signal,
-            resolve: (text) => {
-              inFlight -= 1
-              resolve(text)
-            },
+            resolve,
           })
         }),
     )
@@ -183,28 +1151,28 @@ describe('BranchTreeView', () => {
       />,
     )
 
+    await waitForActiveTree()
     fireEvent.pointerEnter(screen.getByRole('link', { name: 'User message' }))
     fireEvent.pointerEnter(screen.getByRole('link', { name: 'Assistant message' }))
     fireEvent.pointerEnter(screen.getByRole('link', { name: 'User message' }))
 
-    expect(getMessageTextPreview).toHaveBeenCalledTimes(1)
-    expect(reads[0]?.messageId).toBe('root')
-    expect(reads[0]?.signal?.aborted).toBe(true)
-    expect(maxInFlight).toBe(1)
+    await waitFor(() => expect(getMessageTextPreview.mock.calls.length).toBeGreaterThanOrEqual(3))
+    const currentRead = reads.at(-1)
+    expect(currentRead?.messageId).toBe('root')
+    for (const read of reads.slice(0, -1)) expect(read.signal?.aborted).toBe(true)
 
     await act(async () => {
-      reads[0]?.resolve('Superseded root preview')
+      for (const read of reads.slice(0, -1)) read.resolve('Superseded preview')
       await Promise.resolve()
     })
-    await waitFor(() => expect(getMessageTextPreview).toHaveBeenCalledTimes(2))
-    expect(reads[1]?.messageId).toBe('root')
     expect(document.querySelector('[data-ui="branch-tree-preview"]')).not.toHaveTextContent(
-      'Superseded root preview',
+      'Superseded preview',
     )
 
     const updatedHeaders = smallTree.map((row) =>
       row.id === 'root' ? { ...row, bodyVersion: row.bodyVersion + 1 } : row,
     )
+    const staleReadCount = reads.length
     view.rerender(
       <BranchTreeView
         chatId="chat-1"
@@ -215,19 +1183,20 @@ describe('BranchTreeView', () => {
         onActivateNode={() => undefined}
       />,
     )
-    await waitFor(() => expect(reads[1]?.signal?.aborted).toBe(true))
+    await waitFor(() => expect(currentRead?.signal?.aborted).toBe(true))
+    await waitFor(() => expect(reads.length).toBeGreaterThan(staleReadCount))
+    const freshRead = reads.at(-1)
+    expect(freshRead?.messageId).toBe('root')
     await act(async () => {
-      reads[1]?.resolve('Stale root preview')
+      currentRead?.resolve('Stale root preview')
       await Promise.resolve()
     })
-    await waitFor(() => expect(getMessageTextPreview).toHaveBeenCalledTimes(3))
-    expect(reads[2]?.messageId).toBe('root')
     expect(document.querySelector('[data-ui="branch-tree-preview"]')).not.toHaveTextContent(
       'Stale root preview',
     )
 
     await act(async () => {
-      reads[2]?.resolve('Current root preview')
+      freshRead?.resolve('Current root preview')
       await Promise.resolve()
     })
     await waitFor(() =>
@@ -235,14 +1204,11 @@ describe('BranchTreeView', () => {
         'Current root preview',
       ),
     )
-    expect(maxInFlight).toBe(1)
   })
 
   it('publishes completed expanded previews back into visible cards', async () => {
     let renderCount = 0
-    const operations: string[] = []
     BranchTreeView.__setComputationProbeForTests((operation) => {
-      operations.push(operation)
       if (operation === 'render') renderCount += 1
     })
     const getMessageTextPreview = vi.fn(async (messageId: string) => `Loaded ${messageId}`)
@@ -258,16 +1224,6 @@ describe('BranchTreeView', () => {
     )
 
     await waitFor(() => expect(getMessageTextPreview).toHaveBeenCalledTimes(3))
-    await waitFor(() =>
-      expect(operations.filter((entry) => entry === 'preview-complete')).toHaveLength(3),
-    )
-    await waitFor(() =>
-      expect(operations.filter((entry) => entry === 'preview-publish')).toHaveLength(1),
-    )
-    await waitFor(() => {
-      const publishIndex = operations.lastIndexOf('preview-publish')
-      expect(operations.slice(publishIndex + 1)).toContain('render')
-    })
     expect(renderCount).toBeGreaterThan(1)
     await waitFor(() =>
       expect(
@@ -308,7 +1264,7 @@ describe('BranchTreeView', () => {
         cursor={{ root: 'left' }}
         expanded
         repository={treeRepository}
-        presentationSnapshots={
+        localPresentations={
           new Map([
             [
               'left',
@@ -337,24 +1293,29 @@ describe('BranchTreeView', () => {
     expect(
       document.querySelector('[data-message-id="right"] [data-ui="branch-tree-node-preview"]'),
     ).toHaveTextContent('Loaded right')
-    expect(getMessageTextPreview).toHaveBeenCalledTimes(3)
+    expect(getMessageTextPreview.mock.calls.filter(([id]) => id === 'root')).toHaveLength(1)
+    expect(getMessageTextPreview.mock.calls.filter(([id]) => id === 'right')).toHaveLength(1)
   })
 
   it('keeps an inspected off-path disclosure mounted across an exact body-version update', async () => {
     const initialRight = {
       ...(fullMessageFor('right') as Message),
-      reasoningDetails: [
-        {
-          type: 'reasoning.text' as const,
-          text: 'Off-path reasoning.',
-          format: 'anthropic-claude-v1' as const,
-        },
-      ],
-    }
+      reasoningEnvelope: reasoningEnvelopeFromDetailsForTest(
+        [
+          {
+            type: 'reasoning.text',
+            text: 'Off-path reasoning.',
+            format: 'anthropic-claude-v1',
+          },
+        ],
+        'anthropic-messages',
+      ),
+    } satisfies Message
     const getMessage = vi.fn(async (messageId: MessageId) =>
       messageId === 'right' ? initialRight : fullMessageFor(messageId),
     )
     const treeRepository = repository({ getMessage })
+    const testController = createConversationController()
     const view = render(
       <BranchTreeView
         chatId="chat-1"
@@ -362,6 +1323,7 @@ describe('BranchTreeView', () => {
         cursor={{ root: 'left' }}
         expanded={false}
         repository={treeRepository}
+        testController={testController}
         onActivateNode={() => undefined}
       />,
     )
@@ -373,43 +1335,45 @@ describe('BranchTreeView', () => {
     const inspector = document.querySelector('[data-ui="branch-tree-inspector"]')
     const reasoning = document.querySelector<HTMLDetailsElement>('[data-ui="reasoning"]')
     if (!reasoning) throw new Error('Reasoning disclosure missing')
-    reasoning.open = true
-    fireEvent(reasoning, new Event('toggle'))
+    fireEvent.click(reasoning.querySelector('summary') as HTMLElement)
     await waitFor(() => expect(reasoning).toHaveAttribute('data-pinned', 'true'))
 
     const updatedHeaders = smallTree.map((row) =>
       row.id === 'right' ? { ...row, nodeVersion: 2, bodyVersion: 2 } : row,
     )
     const updatedHeader = updatedHeaders.find((row) => row.id === 'right') as MessageHeaderRow
+    const reasoningEnvelope = initialRight.reasoningEnvelope
     const updatedMessage: Message = {
       ...initialRight,
       nodeVersion: 2,
-      reasoningDetails: initialRight.reasoningDetails.map((detail) => ({
-        ...detail,
-        hidden: true,
-      })),
+      reasoningEnvelope: {
+        ...reasoningEnvelope,
+        visible: reasoningEnvelope.visible.map((part) => ({ ...part, hidden: true })),
+      },
     }
-    view.rerender(
-      <BranchTreeView
-        chatId="chat-1"
-        headers={updatedHeaders}
-        cursor={{ root: 'left' }}
-        expanded={false}
-        repository={treeRepository}
-        presentationSnapshots={
-          new Map([
-            [
-              'right',
-              {
-                bodyVersion: 2,
-                message: updatedMessage,
-              },
-            ],
-          ])
-        }
-        onActivateNode={() => undefined}
-      />,
-    )
+    const localPresentations = new Map([
+      [
+        'right',
+        {
+          bodyVersion: 2,
+          message: updatedMessage,
+        },
+      ],
+    ])
+    act(() => {
+      view.rerender(
+        <BranchTreeView
+          chatId="chat-1"
+          headers={updatedHeaders}
+          cursor={{ root: 'left' }}
+          expanded={false}
+          repository={treeRepository}
+          testController={testController}
+          localPresentations={localPresentations}
+          onActivateNode={() => undefined}
+        />,
+      )
+    })
 
     expect(document.querySelector('[data-ui="branch-tree-inspector"]')).toBe(inspector)
     const updatedReasoning = document.querySelector<HTMLDetailsElement>('[data-ui="reasoning"]')
@@ -475,7 +1439,7 @@ describe('BranchTreeView', () => {
     if (!canvas) throw new Error('Missing tree canvas')
     canvas.scrollLeft = 137
     canvas.scrollTop = 91
-    expect(root).toHaveAttribute('href', '#/chat/chat-1/message/root')
+    expect(root).toHaveAttribute('href', '#/chat/chat-1/message/right')
     expect(fireEvent.click(root, { metaKey: true })).toBe(true)
     expect(
       fireEvent(root, new MouseEvent('auxclick', { bubbles: true, cancelable: true, button: 1 })),
@@ -497,7 +1461,7 @@ describe('BranchTreeView', () => {
       { timeout: 5_000 },
     )
     fireEvent.doubleClick(root)
-    expect(activate).toHaveBeenCalledWith('root')
+    expect(activate).toHaveBeenCalledWith('root', 'right')
 
     fireEvent.click(document.querySelector('[data-ui="branch-tree-scroll"]') as HTMLElement)
     await waitFor(() =>
@@ -505,8 +1469,9 @@ describe('BranchTreeView', () => {
     )
   })
 
-  it('marks context-hidden nodes without hydrating their bodies', () => {
+  it('marks context-hidden nodes without hydrating their bodies', async () => {
     const getMessage = vi.fn(async (messageId: string) => fullMessageFor(messageId))
+    const treeRepository = repository({ getMessage })
     const hiddenHeaders = smallTree.map((row) =>
       row.id === 'root' ? { ...row, hiddenFromContext: true, nodeVersion: 2 } : row,
     )
@@ -516,11 +1481,12 @@ describe('BranchTreeView', () => {
         headers={hiddenHeaders}
         cursor={{ root: 'left' }}
         expanded={false}
-        repository={repository({ getMessage })}
+        repository={treeRepository}
         onActivateNode={() => undefined}
       />,
     )
 
+    await waitForActiveTree()
     const hiddenNode = screen.getByRole('link', {
       name: 'User message, hidden from context',
     })
@@ -528,18 +1494,23 @@ describe('BranchTreeView', () => {
     expect(hiddenNode.querySelector('[data-ui="branch-tree-node-visibility"]')).toBeInTheDocument()
     expect(getMessage).not.toHaveBeenCalled()
 
+    const visibleHeaders = hiddenHeaders.map((row) =>
+      row.id === 'root' ? { ...row, hiddenFromContext: false, nodeVersion: 3 } : row,
+    )
     view.rerender(
       <BranchTreeView
         chatId="chat-1"
-        headers={smallTree}
+        headers={visibleHeaders}
         cursor={{ root: 'left' }}
         expanded
-        repository={repository({ getMessage })}
+        repository={treeRepository}
         onActivateNode={() => undefined}
       />,
     )
 
-    const visibleNode = screen.getByRole('link', { name: 'User message' })
+    await waitForActiveTree()
+    const visibleNode = document.querySelector('[data-message-id="root"]') as Element
+    expect(visibleNode).toBeInTheDocument()
     expect(visibleNode).not.toHaveAttribute('data-hidden-from-context')
     expect(
       visibleNode.querySelector('[data-ui="branch-tree-node-visibility"]'),
@@ -548,15 +1519,8 @@ describe('BranchTreeView', () => {
   })
 
   it('follows a request-created active leaf into the inspector', async () => {
-    let resolveRequest: ((messageId: MessageId) => void) | undefined
-    const navigationRevision = 'local-tree-request-revision'
     const onSelectNode = vi.fn()
-    const regenerate = vi.fn(() => ({
-      navigationRevision,
-      completion: new Promise<MessageId>((resolve) => {
-        resolveRequest = resolve
-      }),
-    }))
+    const regenerate = vi.fn(() => startedGenerationResult('regenerated'))
     let headers = smallTree
     const getMessage = vi.fn(async (messageId: string): Promise<Message | undefined> => {
       const row = headers.find((header) => header.id === messageId)
@@ -575,7 +1539,6 @@ describe('BranchTreeView', () => {
         onActivateNode={() => undefined}
         onSelectNode={onSelectNode}
         onRegenerateMessage={regenerate}
-        hasConnection
       />,
     )
 
@@ -585,14 +1548,11 @@ describe('BranchTreeView', () => {
     onSelectNode.mockClear()
 
     act(() => {
-      useStreamStore.getState().setActive({
+      observeTestAttempt({
         streamId: 'remote-tree-request',
-        replacementEpoch: 0,
         chatId: 'chat-1',
         messageId: 'left',
-        startedAt: 3,
-        ownerClientId: 'remote-client',
-        originNavigationRevision: navigationRevision,
+        local: false,
       })
     })
     await act(async () => Promise.resolve())
@@ -604,14 +1564,10 @@ describe('BranchTreeView', () => {
 
     headers = [...smallTree, header('regenerated', 'root', 2, 'assistant', 4)]
     act(() => {
-      useStreamStore.getState().setActive({
+      observeTestAttempt({
         streamId: 'new-tree-request',
-        replacementEpoch: 0,
         chatId: 'chat-1',
         messageId: 'regenerated',
-        startedAt: 4,
-        ownerClientId: getStreamClientId(),
-        originNavigationRevision: navigationRevision,
       })
     })
     view.rerender(
@@ -619,12 +1575,12 @@ describe('BranchTreeView', () => {
         chatId="chat-1"
         headers={headers}
         cursor={{ root: 'regenerated' }}
+        selectedNodeId="regenerated"
         expanded={false}
         repository={treeRepository}
         onActivateNode={() => undefined}
         onSelectNode={onSelectNode}
         onRegenerateMessage={regenerate}
-        hasConnection
       />,
     )
 
@@ -640,29 +1596,18 @@ describe('BranchTreeView', () => {
         'regenerated',
       ),
     )
-
-    act(() => resolveRequest?.('regenerated'))
   })
 
   it('opens the current streaming leaf when tree view mounts mid-response', async () => {
+    const getMessage = vi.fn(async (messageId: MessageId) => {
+      const message = fullMessageFor(messageId)
+      return messageId === 'left' && message ? { ...message, content: [] } : message
+    })
     act(() => {
-      useStreamStore.getState().setActive({
+      observeTestAttempt({
         streamId: 'already-streaming',
-        replacementEpoch: 0,
         chatId: 'chat-1',
         messageId: 'left',
-        startedAt: 4,
-        ownerClientId: getStreamClientId(),
-      })
-      useStreamStore.getState().setLiveSnapshot({
-        streamId: 'already-streaming',
-        replacementEpoch: 0,
-        chatId: 'chat-1',
-        messageId: 'left',
-        content: [{ type: 'output_text', text: 'Already streaming in transcript mode.' }],
-        textLength: 37,
-        reasoningLength: 0,
-        updatedAt: 5,
       })
     })
 
@@ -672,8 +1617,9 @@ describe('BranchTreeView', () => {
           chatId="chat-1"
           headers={smallTree}
           cursor={{ root: 'left' }}
+          selectedNodeId="left"
           expanded={false}
-          repository={repository()}
+          repository={repository({ getMessage })}
           onActivateNode={() => undefined}
         />
       </StrictMode>,
@@ -691,12 +1637,25 @@ describe('BranchTreeView', () => {
         'left',
       ),
     )
+    act(() => {
+      expect(
+        publishTestLiveProjection({
+          streamId: 'already-streaming',
+          chatId: 'chat-1',
+          messageId: 'left',
+          content: [{ type: 'output_text', text: 'Already streaming in transcript mode.' }],
+          textLength: 37,
+          reasoningLength: 0,
+          updatedAt: 5,
+        }),
+      ).toBe(true)
+    })
     expect(document.querySelector('[data-ui="branch-tree-inspector"]')).toHaveTextContent(
       'Already streaming in transcript mode.',
     )
   })
 
-  it('follows an initially untargeted stream once its target header becomes available', async () => {
+  it('follows a selected stream once its target header becomes available', async () => {
     let headers = smallTree
     const getMessage = vi.fn(async (messageId: string): Promise<Message | undefined> => {
       const row = headers.find((candidate) => candidate.id === messageId)
@@ -706,12 +1665,10 @@ describe('BranchTreeView', () => {
     })
     const treeRepository = repository({ getMessage })
     act(() => {
-      useStreamStore.getState().setActive({
+      observeTestAttempt({
         streamId: 'waiting-for-target',
-        replacementEpoch: 0,
         chatId: 'chat-1',
-        startedAt: 4,
-        ownerClientId: getStreamClientId(),
+        messageId: 'stream-leaf',
       })
     })
     const view = render(
@@ -719,6 +1676,7 @@ describe('BranchTreeView', () => {
         chatId="chat-1"
         headers={headers}
         cursor={{ root: 'left' }}
+        selectedNodeId="stream-leaf"
         expanded={false}
         repository={treeRepository}
         onActivateNode={() => undefined}
@@ -726,17 +1684,6 @@ describe('BranchTreeView', () => {
     )
     expect(document.querySelector('[data-selected="true"]')).not.toBeInTheDocument()
 
-    act(() => {
-      useStreamStore.getState().setActive({
-        streamId: 'waiting-for-target',
-        replacementEpoch: 0,
-        chatId: 'chat-1',
-        messageId: 'stream-leaf',
-        startedAt: 4,
-        ownerClientId: getStreamClientId(),
-      })
-    })
-    await act(async () => Promise.resolve())
     expect(document.querySelector('[data-selected="true"]')).not.toBeInTheDocument()
 
     headers = [...smallTree, header('stream-leaf', 'root', 2, 'assistant', 5)]
@@ -745,6 +1692,7 @@ describe('BranchTreeView', () => {
         chatId="chat-1"
         headers={headers}
         cursor={{ root: 'stream-leaf' }}
+        selectedNodeId="stream-leaf"
         expanded={false}
         repository={treeRepository}
         onActivateNode={() => undefined}
@@ -763,6 +1711,9 @@ describe('BranchTreeView', () => {
         'stream-leaf',
       ),
     )
+    act(() => {
+      expect(removeTestAttempt('waiting-for-target')).toBe(true)
+    })
   })
 
   it('follows an existing stream that hydrates after the initial empty render', async () => {
@@ -789,13 +1740,11 @@ describe('BranchTreeView', () => {
     expect(document.querySelector('[data-selected="true"]')).not.toBeInTheDocument()
 
     act(() => {
-      useStreamStore.getState().setActive({
+      observeTestAttempt({
         streamId: 'late-hydrated-stream',
-        replacementEpoch: 0,
         chatId: 'chat-1',
         messageId: 'hydrated-leaf',
-        startedAt: 4,
-        ownerClientId: 'remote-client',
+        local: false,
       })
     })
     headers = [
@@ -811,6 +1760,7 @@ describe('BranchTreeView', () => {
           chatId="chat-1"
           headers={headers}
           cursor={{ 'hydrated-root': 'hydrated-leaf' }}
+          selectedNodeId="hydrated-leaf"
           expanded={false}
           repository={treeRepository}
           onActivateNode={() => undefined}
@@ -824,9 +1774,12 @@ describe('BranchTreeView', () => {
         'true',
       ),
     )
-    expect(document.querySelector('[data-ui="branch-tree-inspector"]')).toHaveAttribute(
-      'data-message-id',
-      'hydrated-leaf',
+    await waitFor(() => expect(getMessage).toHaveBeenCalledWith('hydrated-leaf', expect.anything()))
+    await waitFor(() =>
+      expect(document.querySelector('[data-ui="branch-tree-inspector"]')).toHaveAttribute(
+        'data-message-id',
+        'hydrated-leaf',
+      ),
     )
   })
 
@@ -862,13 +1815,12 @@ describe('BranchTreeView', () => {
 
     const startedAfterTreeOpened = Date.now() + 60_000
     act(() => {
-      useStreamStore.getState().setActive({
+      observeTestAttempt({
         streamId: 'future-stream',
-        replacementEpoch: 0,
         chatId: 'chat-1',
         messageId: 'left',
-        startedAt: startedAfterTreeOpened,
-        ownerClientId: 'remote-client',
+        local: false,
+        admissionSequence: startedAfterTreeOpened,
       })
     })
     headers = headers.map((row) =>
@@ -903,23 +1855,18 @@ describe('BranchTreeView', () => {
   })
 
   it('ignores off-path and other-chat streams when choosing an initial inspector target', async () => {
-    const abort = vi.fn()
+    const requestStop = vi.fn()
     act(() => {
-      useStreamStore.getState().setActive({
+      observeTestAttempt({
         streamId: 'off-path',
-        replacementEpoch: 0,
         chatId: 'chat-1',
         messageId: 'right',
-        startedAt: 4,
-        ownerClientId: getStreamClientId(),
       })
-      useStreamStore.getState().setActive({
+      observeTestAttempt({
         streamId: 'other-chat',
-        replacementEpoch: 0,
         chatId: 'chat-elsewhere',
         messageId: 'left',
-        startedAt: 5,
-        ownerClientId: 'client-2',
+        local: false,
       })
     })
 
@@ -931,7 +1878,7 @@ describe('BranchTreeView', () => {
         expanded={false}
         repository={repository()}
         onActivateNode={() => undefined}
-        onAbort={abort}
+        onRequestStop={requestStop}
       />,
     )
     await act(async () => Promise.resolve())
@@ -939,19 +1886,16 @@ describe('BranchTreeView', () => {
     expect(document.querySelector('[data-selected="true"]')).not.toBeInTheDocument()
     expect(document.querySelector('[data-ui="branch-tree-inspector"]')).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Stop generating' })).not.toBeInTheDocument()
-    expect(abort).not.toHaveBeenCalled()
+    expect(requestStop).not.toHaveBeenCalled()
   })
 
   it('shows Stop after switching onto a streaming branch and aborts only that stream', async () => {
-    const abort = vi.fn()
+    const requestStop = vi.fn()
     act(() => {
-      useStreamStore.getState().setActive({
+      observeTestAttempt({
         streamId: 'right-stream',
-        replacementEpoch: 0,
         chatId: 'chat-1',
         messageId: 'right',
-        startedAt: 4,
-        ownerClientId: getStreamClientId(),
       })
     })
     const view = render(
@@ -962,7 +1906,7 @@ describe('BranchTreeView', () => {
         expanded={false}
         repository={repository()}
         onActivateNode={() => undefined}
-        onAbort={abort}
+        onRequestStop={requestStop}
       />,
     )
 
@@ -975,33 +1919,30 @@ describe('BranchTreeView', () => {
         expanded={false}
         repository={repository()}
         onActivateNode={() => undefined}
-        onAbort={abort}
+        onRequestStop={requestStop}
       />,
     )
 
     fireEvent.click(await screen.findByRole('button', { name: 'Stop generating' }))
-    expect(abort).toHaveBeenCalledOnce()
-    expect(abort).toHaveBeenCalledWith('right-stream')
+    expect(requestStop).toHaveBeenCalledOnce()
+    expect(requestStop.mock.calls[0]?.[0]).toMatchObject({
+      kind: 'requestable',
+      attempt: { streamId: 'right-stream' },
+    })
   })
 
   it('chooses the inspected stream before the active-leaf stream', async () => {
-    const abort = vi.fn()
+    const requestStop = vi.fn()
     act(() => {
-      useStreamStore.getState().setActive({
+      observeTestAttempt({
         streamId: 'left-stream',
-        replacementEpoch: 0,
         chatId: 'chat-1',
         messageId: 'left',
-        startedAt: 4,
-        ownerClientId: getStreamClientId(),
       })
-      useStreamStore.getState().setActive({
+      observeTestAttempt({
         streamId: 'right-stream',
-        replacementEpoch: 0,
         chatId: 'chat-1',
         messageId: 'right',
-        startedAt: 5,
-        ownerClientId: getStreamClientId(),
       })
     })
     render(
@@ -1012,12 +1953,15 @@ describe('BranchTreeView', () => {
         expanded={false}
         repository={repository()}
         onActivateNode={() => undefined}
-        onAbort={abort}
+        onRequestStop={requestStop}
       />,
     )
 
     fireEvent.click(screen.getByRole('button', { name: 'Stop generating' }))
-    expect(abort).toHaveBeenLastCalledWith('left-stream')
+    expect(requestStop.mock.calls.at(-1)?.[0]).toMatchObject({
+      kind: 'requestable',
+      attempt: { streamId: 'left-stream' },
+    })
 
     fireEvent.click(document.querySelector('[data-message-id="right"]') as Element)
     await waitFor(() =>
@@ -1027,18 +1971,18 @@ describe('BranchTreeView', () => {
       ),
     )
     fireEvent.click(screen.getByRole('button', { name: 'Stop generating' }))
-    expect(abort).toHaveBeenLastCalledWith('right-stream')
+    expect(requestStop.mock.calls.at(-1)?.[0]).toMatchObject({
+      kind: 'requestable',
+      attempt: { streamId: 'right-stream' },
+    })
   })
 
   it('does not block inspector requests for an uninspected off-path stream', async () => {
     act(() => {
-      useStreamStore.getState().setActive({
+      observeTestAttempt({
         streamId: 'off-path-request',
-        replacementEpoch: 0,
         chatId: 'chat-1',
         messageId: 'right',
-        startedAt: 4,
-        ownerClientId: getStreamClientId(),
       })
     })
     render(
@@ -1049,9 +1993,8 @@ describe('BranchTreeView', () => {
         expanded={false}
         repository={repository()}
         onActivateNode={() => undefined}
-        onRegenerateMessage={() => undefined}
-        onContinueMessage={() => undefined}
-        hasConnection
+        onRegenerateMessage={() => startedGenerationResult()}
+        onContinueMessage={() => startedGenerationResult()}
       />,
     )
 
@@ -1064,13 +2007,10 @@ describe('BranchTreeView', () => {
   it('inspects an off-path stream without activating its branch', async () => {
     const activate = vi.fn()
     act(() => {
-      useStreamStore.getState().setActive({
+      observeTestAttempt({
         streamId: 'inspect-off-path',
-        replacementEpoch: 0,
         chatId: 'chat-1',
         messageId: 'right',
-        startedAt: 4,
-        ownerClientId: getStreamClientId(),
       })
     })
 
@@ -1107,19 +2047,10 @@ describe('BranchTreeView', () => {
     ).toHaveTextContent('Streaming on another branch. Open this branch to follow live output.')
     fireEvent.click(screen.getByRole('button', { name: 'Open this branch' }))
     expect(activate).toHaveBeenCalledOnce()
-    expect(activate).toHaveBeenCalledWith('right')
+    expect(activate).toHaveBeenCalledWith('right', 'right')
   })
 
   it('does not let a late stream target replace an explicit manual selection', async () => {
-    act(() => {
-      useStreamStore.getState().setActive({
-        streamId: 'late-manual-target',
-        replacementEpoch: 0,
-        chatId: 'chat-1',
-        startedAt: 4,
-        ownerClientId: getStreamClientId(),
-      })
-    })
     render(
       <BranchTreeView
         chatId="chat-1"
@@ -1139,13 +2070,10 @@ describe('BranchTreeView', () => {
     )
 
     act(() => {
-      useStreamStore.getState().setActive({
+      observeTestAttempt({
         streamId: 'late-manual-target',
-        replacementEpoch: 0,
         chatId: 'chat-1',
         messageId: 'left',
-        startedAt: 4,
-        ownerClientId: getStreamClientId(),
       })
     })
     await act(async () => Promise.resolve())
@@ -1162,13 +2090,10 @@ describe('BranchTreeView', () => {
 
   it('keeps an explicitly closed streaming inspector closed', async () => {
     act(() => {
-      useStreamStore.getState().setActive({
+      observeTestAttempt({
         streamId: 'closed-stream',
-        replacementEpoch: 0,
         chatId: 'chat-1',
         messageId: 'left',
-        startedAt: 4,
-        ownerClientId: getStreamClientId(),
       })
     })
     render(
@@ -1181,20 +2106,18 @@ describe('BranchTreeView', () => {
         onActivateNode={() => undefined}
       />,
     )
+    fireEvent.click(document.querySelector('[data-message-id="left"]') as Element)
     fireEvent.click(await screen.findByRole('button', { name: 'Close message inspector' }))
     await waitFor(() =>
       expect(document.querySelector('[data-ui="branch-tree-inspector"]')).not.toBeInTheDocument(),
     )
 
     act(() => {
-      useStreamStore.getState().setActive({
+      observeTestAttempt({
         streamId: 'closed-stream',
-        replacementEpoch: 0,
         chatId: 'chat-1',
         messageId: 'left',
-        startedAt: 4,
-        heartbeatAt: 6,
-        ownerClientId: getStreamClientId(),
+        revision: 2,
       })
     })
     await act(async () => Promise.resolve())
@@ -1210,13 +2133,10 @@ describe('BranchTreeView', () => {
       return `Preview ${messageId}`
     })
     act(() => {
-      useStreamStore.getState().setActive({
+      observeTestAttempt({
         streamId: 'empty-preview-stream',
-        replacementEpoch: 0,
         chatId: 'chat-1',
         messageId: 'left',
-        startedAt: 4,
-        ownerClientId: getStreamClientId(),
       })
     })
     render(
@@ -1239,7 +2159,7 @@ describe('BranchTreeView', () => {
     ).length
 
     committed = true
-    act(() => useStreamStore.getState().clearActive('empty-preview-stream', 0))
+    await act(() => removeTestAttempt('empty-preview-stream'))
 
     await waitFor(() =>
       expect(
@@ -1261,6 +2181,7 @@ describe('BranchTreeView', () => {
       />,
     )
 
+    await waitForActiveTree()
     fireEvent.pointerEnter(screen.getByRole('link', { name: 'User message' }))
     await waitFor(() =>
       expect(document.querySelector('[data-ui="branch-tree-preview"]')).toHaveTextContent(/…$/),
@@ -1290,6 +2211,7 @@ describe('BranchTreeView', () => {
 
     const input = screen.getByRole('searchbox', { name: 'Search messages in this chat' })
     fireEvent.change(input, { target: { value: '  preview  ' } })
+    expect(screen.getByText('Searching…')).toBeInTheDocument()
     await waitFor(() => expect(screen.getByText('1 / 3')).toBeInTheDocument())
     const searchCall = searchChatMessageText.mock.calls.at(0)
     expect(searchCall?.[0]).toBe('chat-1')
@@ -1325,7 +2247,9 @@ describe('BranchTreeView', () => {
       <BranchTreeView
         chatId="chat-1"
         headers={smallTree.map((row) =>
-          row.id === 'root' ? { ...row, bodyVersion: row.bodyVersion + 1 } : row,
+          row.id === 'root'
+            ? { ...row, bodyVersion: row.bodyVersion + 1, nodeVersion: row.nodeVersion + 1 }
+            : row,
         )}
         cursor={{ root: 'left' }}
         expanded={false}
@@ -1333,7 +2257,8 @@ describe('BranchTreeView', () => {
         onActivateNode={() => undefined}
       />,
     )
-    await waitFor(() => expect(searchChatMessageText).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(treeRepository.evaluateMessageTexts).toHaveBeenCalledTimes(1))
+    expect(searchChatMessageText).toHaveBeenCalledTimes(1)
     expect(document.querySelector('[data-current-match="true"]')).toHaveAttribute(
       'data-message-id',
       'left',
@@ -1348,7 +2273,7 @@ describe('BranchTreeView', () => {
 
     fireEvent.change(input, { target: { value: '   ' } })
     await waitFor(() => expect(screen.getByText('0 / 0')).toBeInTheDocument())
-    expect(searchChatMessageText).toHaveBeenCalledTimes(2)
+    expect(searchChatMessageText).toHaveBeenCalledTimes(1)
   })
 
   it('invalidates search from exact body deltas only after the stream is terminal', async () => {
@@ -1358,33 +2283,38 @@ describe('BranchTreeView', () => {
       generation: streamingGeneration(),
     }
     const retainedHeaders = [retainedRoot, streamingLeaf]
-    let searchCallCount = 0
-    const searchChatMessageText = vi.fn<BranchTreeRepository['searchChatMessageText']>(async () => {
-      searchCallCount += 1
-      return searchCallCount >= 2 ? ['left'] : []
-    })
+    const searchChatMessageText = vi.fn<BranchTreeRepository['searchChatMessageText']>(
+      async () => [],
+    )
+    const evaluateMessageTexts = vi.fn<BranchTreeRepository['evaluateMessageTexts']>(
+      async (_chatId, messageIds) =>
+        messageIds.map((messageId) => ({
+          messageId,
+          nodeVersion: 3,
+          bodyVersion: 3,
+          present: true,
+          pending: false,
+          matches: messageId === 'left',
+        })),
+    )
     let layoutBuilds = 0
     BranchTreeView.__setComputationProbeForTests((operation) => {
       if (operation === 'layout') layoutBuilds += 1
     })
     act(() => {
-      useStreamStore.getState().setActive({
+      observeTestAttempt({
         streamId: 'search-finalization-stream',
-        replacementEpoch: 0,
         chatId: 'chat-1',
         messageId: 'left',
-        startedAt: 4,
-        ownerClientId: 'remote-client',
+        local: false,
       })
     })
-    const treeRepository = repository({ searchChatMessageText })
+    const treeRepository = repository({ searchChatMessageText, evaluateMessageTexts })
     const view = render(
       <BranchTreeView
         chatId="chat-1"
         headers={retainedHeaders}
-        latestHeaderById={new Map(retainedHeaders.map((row) => [row.id, row]))}
-        changedHeaderKeys={null}
-        changedHeaders={null}
+        latestHeaders={retainedHeaders}
         cursor={{ root: 'left' }}
         expanded={false}
         repository={treeRepository}
@@ -1402,14 +2332,7 @@ describe('BranchTreeView', () => {
       <BranchTreeView
         chatId="chat-1"
         headers={retainedHeaders}
-        latestHeaderById={
-          new Map([
-            [retainedRoot.id, retainedRoot],
-            [streamedHeader.id, streamedHeader],
-          ])
-        }
-        changedHeaderKeys={[streamedHeader.id]}
-        changedHeaders={[streamedHeader]}
+        latestHeaders={[retainedRoot, streamedHeader]}
         cursor={{ root: 'left' }}
         expanded={false}
         repository={treeRepository}
@@ -1419,9 +2342,7 @@ describe('BranchTreeView', () => {
     await act(async () => Promise.resolve())
     expect(searchChatMessageText).toHaveBeenCalledTimes(1)
 
-    act(() => {
-      useStreamStore.getState().clearActive('search-finalization-stream', 0)
-    })
+    await act(() => removeTestAttempt('search-finalization-stream'))
     await act(async () => Promise.resolve())
     expect(searchChatMessageText).toHaveBeenCalledTimes(1)
 
@@ -1435,14 +2356,7 @@ describe('BranchTreeView', () => {
       <BranchTreeView
         chatId="chat-1"
         headers={retainedHeaders}
-        latestHeaderById={
-          new Map([
-            [retainedRoot.id, retainedRoot],
-            [finalHeader.id, finalHeader],
-          ])
-        }
-        changedHeaderKeys={[finalHeader.id]}
-        changedHeaders={[finalHeader]}
+        latestHeaders={[retainedRoot, finalHeader]}
         cursor={{ root: 'left' }}
         expanded={false}
         repository={treeRepository}
@@ -1450,7 +2364,8 @@ describe('BranchTreeView', () => {
       />,
     )
 
-    await waitFor(() => expect(searchChatMessageText).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(evaluateMessageTexts).toHaveBeenCalledTimes(1))
+    expect(searchChatMessageText).toHaveBeenCalledTimes(1)
     expect(screen.getByText('1 / 1')).toBeInTheDocument()
     expect(layoutBuilds).toBe(baselineLayoutBuilds)
   })
@@ -1535,7 +2450,7 @@ describe('BranchTreeView', () => {
       ),
     )
     expect(signals.get('left')?.aborted).toBe(true)
-    expect(signals.get('right')?.aborted).toBe(false)
+    expect(signals.has('right')).toBe(true)
     expect(getMessage).toHaveBeenCalledTimes(3)
   })
 
@@ -1574,9 +2489,14 @@ describe('BranchTreeView', () => {
     await waitFor(() => expect(getMessage).toHaveBeenCalledTimes(1))
 
     workspace = 'new'
-    act(() => postEvent({ kind: 'workspace-replaced', replacementEpoch: 1 }))
+    act(() =>
+      postWorkspaceChange({
+        kind: 'replace',
+        workspaceId: 'tree-test-workspace-replaced-1',
+        replacementEpoch: 1,
+      }),
+    )
 
-    await waitFor(() => expect(getMessageTextPreview).toHaveBeenCalledTimes(6))
     await waitFor(() =>
       expect(
         document.querySelector('[data-message-id="left"] [data-ui="branch-tree-node-preview"]'),
@@ -1609,7 +2529,7 @@ describe('BranchTreeView', () => {
     let workspace: 'old' | 'new' = 'old'
     let resolveNewBody:
       | ((
-          snapshot: Awaited<ReturnType<BranchTreeRepository['getMessagePresentationSnapshot']>>,
+          snapshot: Awaited<ReturnType<TestBranchTreeRepository['getMessagePresentationSnapshot']>>,
         ) => void)
       | undefined
     const getMessagePresentationSnapshot = vi.fn(async (messageId: MessageId) => {
@@ -1621,7 +2541,7 @@ describe('BranchTreeView', () => {
         }
       }
       return new Promise<
-        Awaited<ReturnType<BranchTreeRepository['getMessagePresentationSnapshot']>>
+        Awaited<ReturnType<TestBranchTreeRepository['getMessagePresentationSnapshot']>>
       >((resolve) => {
         resolveNewBody = resolve
       })
@@ -1643,10 +2563,35 @@ describe('BranchTreeView', () => {
         'Old workspace body',
       ),
     )
+    act(() => {
+      observeTestAttempt({
+        streamId: 'old-workspace-stream',
+        chatId: 'chat-1',
+        messageId: 'left',
+        local: false,
+      })
+    })
+    await waitFor(() =>
+      expect(document.querySelector('[data-message-id="left"]')).toHaveAttribute(
+        'data-streaming',
+        'true',
+      ),
+    )
 
     workspace = 'new'
-    act(() => postEvent({ kind: 'workspace-replaced', replacementEpoch: 2 }))
+    act(() =>
+      postWorkspaceChange({
+        kind: 'replace',
+        workspaceId: 'tree-test-workspace-replaced-2',
+        replacementEpoch: 2,
+      }),
+    )
     await waitFor(() => expect(getMessagePresentationSnapshot).toHaveBeenCalledTimes(2))
+    await waitFor(() =>
+      expect(document.querySelector('[data-message-id="left"]')).not.toHaveAttribute(
+        'data-streaming',
+      ),
+    )
     await waitFor(() =>
       expect(document.querySelector('[data-ui="branch-tree-inspector"]')).not.toBeInTheDocument(),
     )
@@ -1762,7 +2707,9 @@ describe('BranchTreeView', () => {
       <BranchTreeView
         chatId="chat-1"
         headers={smallTree.map((row) =>
-          row.id === 'root' ? { ...row, bodyVersion: row.bodyVersion + 1 } : row,
+          row.id === 'root'
+            ? { ...row, bodyVersion: row.bodyVersion + 1, nodeVersion: row.nodeVersion + 2 }
+            : row,
         )}
         cursor={{ root: 'left' }}
         expanded={false}
@@ -1914,13 +2861,11 @@ describe('BranchTreeView', () => {
 
   it('treats deleted-only children as leaves and disables append while that leaf streams', () => {
     const insertAfterLeaf = vi.fn()
-    useStreamStore.getState().setActive({
+    observeTestAttempt({
       streamId: 'root-stream',
-      replacementEpoch: 0,
       chatId: 'chat-1',
       messageId: 'root',
-      startedAt: 1,
-      ownerClientId: 'client-1',
+      local: false,
     })
     render(
       <BranchTreeView
@@ -1945,7 +2890,7 @@ describe('BranchTreeView', () => {
     expect(insertAfterLeaf).not.toHaveBeenCalled()
   })
 
-  it('treats an uncommitted persisted streaming generation as busy without an active lease', async () => {
+  it('never treats a historical streaming header as live without an execution lease', async () => {
     const streamingLeaf = {
       ...header('left', 'root', 0, 'assistant', 2),
       generation: streamingGeneration(),
@@ -1966,26 +2911,22 @@ describe('BranchTreeView', () => {
         repository={repository({ getMessage })}
         onActivateNode={() => undefined}
         onInsertAfterLeaf={() => undefined}
-        onEditMessage={() => undefined}
-        onDeleteNode={() => undefined}
-        onContinueMessage={() => undefined}
-        hasConnection
+        onEditMessage={succeededInteractionSettlement}
+        onDeleteNode={succeededInteractionSettlement}
+        onContinueMessage={() => startedGenerationResult('left')}
       />,
     )
 
     const append = screen.getByRole('button', { name: 'Add message after this leaf' })
     expect(append).toHaveAttribute('data-parent-id', 'left')
-    expect(append).toHaveAttribute('aria-disabled', 'true')
+    expect(append).not.toHaveAttribute('aria-disabled')
 
     fireEvent.click(document.querySelector('[data-message-id="left"]') as Element)
-    await waitFor(() =>
-      expect(
-        document.querySelector('[data-ui="branch-tree-inspector-stream-status"]'),
-      ).toHaveTextContent('Finishing response…'),
-    )
-    expect(screen.getByRole('button', { name: 'Edit message' })).toBeDisabled()
-    expect(screen.getByRole('button', { name: 'Delete message' })).toBeDisabled()
-    expect(screen.getByRole('button', { name: 'Continue from here' })).toBeDisabled()
+    await screen.findByRole('button', { name: 'Edit message' })
+    expect(document.querySelector('[data-ui="branch-tree-inspector-stream-status"]')).toBeNull()
+    expect(screen.getByRole('button', { name: 'Edit message' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Delete message' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Continue from here' })).toBeEnabled()
   })
 
   it('uses one centered insertion target for a parent with only one child', () => {
@@ -2051,7 +2992,7 @@ describe('BranchTreeView', () => {
   })
 
   it('exposes selected-node deletion in the inspector separately from connector insertion', async () => {
-    const deleteNode = vi.fn()
+    const deleteNode = vi.fn(() => succeededInteractionSettlement())
     render(
       <BranchTreeView
         chatId="chat-1"
@@ -2074,7 +3015,140 @@ describe('BranchTreeView', () => {
     ).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('link', { name: 'User message' }))
     fireEvent.click(await screen.findByRole('button', { name: 'Delete message' }))
-    expect(deleteNode).toHaveBeenCalledWith('root')
+    expect(deleteNode).toHaveBeenCalledWith(expect.objectContaining({ id: 'root' }))
+  })
+
+  it.each(
+    rejectedTreeActionCases,
+  )('owns and surfaces rejected $kind actions without closing or applying them', async ({
+    kind,
+    label,
+  }) => {
+    const rejected = vi.fn(async () => {
+      throw new Error(`${kind} rejected`)
+    })
+    const settlements = createInteractionSettlementHarness()
+    const rejectedMutation = vi.fn(() => settlements.fail(new Error(`${kind} rejected`)))
+    const treeRepository = repository({
+      getMessage: async (messageId) =>
+        messageId === 'right' ? actionMessage() : fullMessageFor(messageId),
+    })
+    render(
+      <BranchTreeView
+        chatId="chat-1"
+        headers={smallTree}
+        cursor={{ root: 'left' }}
+        expanded={false}
+        repository={treeRepository}
+        onActivateNode={kind === 'activate' ? rejected : () => undefined}
+        {...(kind === 'delete' ? { onDeleteNode: rejectedMutation } : {})}
+        {...(kind === 'fork' ? { onForkMessage: rejectedMutation } : {})}
+        {...(kind === 'toggle' ? { onToggleMessageContextVisibility: rejectedMutation } : {})}
+        {...(kind === 'attachment' ? { onMutateMessageAttachmentRef: rejected } : {})}
+        {...(kind === 'reasoning-visibility'
+          ? { onToggleReasoningDetailHidden: rejectedMutation }
+          : {})}
+        {...(kind === 'tool-visibility'
+          ? { onToggleProviderOutputItemHidden: rejectedMutation }
+          : {})}
+        {...(kind === 'insert' ? { onInsertAfterLeaf: rejected } : {})}
+      />,
+    )
+
+    fireEvent.click(document.querySelector('[data-message-id="right"]') as Element)
+    const inspector = await waitFor(() => {
+      const current = document.querySelector('[data-ui="branch-tree-inspector"]')
+      expect(current).toHaveAttribute('data-message-id', 'right')
+      return current as HTMLElement
+    })
+
+    if (kind === 'activate') {
+      fireEvent.click(screen.getByRole('button', { name: 'Open this branch' }))
+    } else if (kind === 'delete') {
+      fireEvent.click(screen.getByRole('button', { name: 'Delete message' }))
+    } else if (kind === 'fork') {
+      fireEvent.click(screen.getByRole('button', { name: 'Branch this chat from here' }))
+    } else if (kind === 'toggle') {
+      fireEvent.click(
+        screen.getByRole('button', { name: 'Hide from context (never send to model)' }),
+      )
+    } else if (kind === 'attachment') {
+      fireEvent.click(screen.getByRole('button', { name: 'Hide attachment from context' }))
+    } else if (kind === 'reasoning-visibility') {
+      const reasoning = document.querySelector<HTMLDetailsElement>('[data-ui="reasoning"]')
+      if (!reasoning) throw new Error('Reasoning disclosure missing')
+      reasoning.open = true
+      fireEvent(reasoning, new Event('toggle'))
+      fireEvent.click(screen.getByRole('button', { name: 'Hide this reasoning block' }))
+    } else if (kind === 'tool-visibility') {
+      const toolEvidence = document.querySelector<HTMLDetailsElement>('[data-ui="tool-evidence"]')
+      if (!toolEvidence) throw new Error('Tool evidence disclosure missing')
+      toolEvidence.open = true
+      fireEvent(toolEvidence, new Event('toggle'))
+      fireEvent.click(screen.getByRole('button', { name: 'Hide tool call' }))
+    } else {
+      const append = document.querySelector<HTMLElement>(
+        '[data-connector-hit="leaf-append"][data-parent-id="right"]',
+      )
+      if (!append) throw new Error('Leaf insertion target missing')
+      fireEvent.click(append)
+    }
+
+    const mutationOwned = [
+      'delete',
+      'fork',
+      'toggle',
+      'reasoning-visibility',
+      'tool-visibility',
+    ].includes(kind)
+    if (mutationOwned) {
+      await waitFor(() => expect(settlements.presented).toHaveLength(1))
+      expect(settlements.presented[0]?.message).toContain(`${kind} rejected`)
+    } else if (kind === 'attachment') {
+      const expectedToast = {
+        level: 'danger',
+        text: `${label} failed: ${kind} rejected`,
+      }
+      await waitFor(() =>
+        expect(
+          useToastStore
+            .getState()
+            .toasts.filter(
+              (toast) => toast.level === expectedToast.level && toast.text === expectedToast.text,
+            ),
+        ).toHaveLength(1),
+      )
+    } else {
+      expect(await screen.findByRole('alert')).toHaveTextContent(
+        `${label} failed: ${kind} rejected`,
+      )
+    }
+    if (mutationOwned) expect(rejectedMutation).toHaveBeenCalledOnce()
+    else expect(rejected).toHaveBeenCalledOnce()
+    expect(document.querySelector('[data-ui="branch-tree-inspector"]')).toBe(inspector)
+    expect(document.querySelector('[data-message-id="right"]')).toHaveAttribute(
+      'data-selected',
+      'true',
+    )
+    if (kind === 'activate') {
+      expect(document.querySelector('[data-message-id="left"]')).toHaveAttribute(
+        'data-current-leaf',
+        'true',
+      )
+    } else if (kind === 'toggle') {
+      expect(
+        screen.getByRole('button', { name: 'Hide from context (never send to model)' }),
+      ).toHaveAttribute('aria-pressed', 'false')
+    } else if (kind === 'attachment') {
+      expect(document.querySelector('[data-ui="attachment-chip"]')).toHaveAttribute(
+        'data-context',
+        'included',
+      )
+    } else if (kind === 'reasoning-visibility') {
+      expect(screen.getByRole('button', { name: 'Hide this reasoning block' })).toBeInTheDocument()
+    } else if (kind === 'tool-visibility') {
+      expect(screen.getByRole('button', { name: 'Hide tool call' })).toBeInTheDocument()
+    }
   })
 
   it('renders viewport-sized DOM for a very wide tree and only previews visible expanded cards', async () => {
@@ -2114,7 +3188,7 @@ describe('BranchTreeView', () => {
     )
   })
 
-  it('keeps deep-tree nodes, connectors, and leaf controls bounded to the viewport', () => {
+  it('keeps deep-tree nodes, connectors, and leaf controls bounded to the viewport', async () => {
     const headers: MessageHeaderRow[] = []
     for (let index = 0; index < 2_000; index += 1) {
       headers.push(
@@ -2142,13 +3216,14 @@ describe('BranchTreeView', () => {
       />,
     )
 
+    await waitForActiveTree()
     expect(document.querySelectorAll('[data-ui="branch-tree-node"]').length).toBeLessThan(30)
     expect(document.querySelectorAll('[data-ui="branch-tree-connector"]').length).toBeLessThan(60)
     expect(document.querySelectorAll('[data-connector-hit]').length).toBeLessThan(30)
     expect(document.querySelectorAll('[data-ui="branch-tree-leaf-add"]')).toHaveLength(1)
   })
 
-  it('globally caps expanded preview reads while rapid panning replaces queued windows', async () => {
+  it('batches each visible preview window and aborts superseded panning reads', async () => {
     const headers: MessageHeaderRow[] = [header('root', null, 0, 'user', 1)]
     for (let index = 0; index < 600; index += 1) {
       headers.push(header(`child-${index}`, 'root', index, 'assistant', index + 2))
@@ -2156,16 +3231,41 @@ describe('BranchTreeView', () => {
     let inFlight = 0
     let maxInFlight = 0
     const pending: Array<() => void> = []
-    const getMessageTextPreview = vi.fn(
-      async (messageId: string) =>
-        new Promise<string>((resolve) => {
-          inFlight += 1
-          maxInFlight = Math.max(maxInFlight, inFlight)
-          pending.push(() => {
-            inFlight -= 1
-            resolve(`Preview ${messageId}`)
-          })
-        }),
+    const signals: AbortSignal[] = []
+    const getMessageTextPreviewWindow = vi.fn(
+      async (
+        targets: readonly { messageId: MessageId; bodyVersion: number }[],
+        options?: { signal?: AbortSignal },
+      ) =>
+        new Promise<Array<{ messageId: MessageId; bodyVersion: number; text: string }>>(
+          (resolve, reject) => {
+            let settled = false
+            inFlight += 1
+            maxInFlight = Math.max(maxInFlight, inFlight)
+            if (options?.signal) signals.push(options.signal)
+            options?.signal?.addEventListener(
+              'abort',
+              () => {
+                if (settled) return
+                settled = true
+                inFlight -= 1
+                reject(new DOMException('Aborted', 'AbortError'))
+              },
+              { once: true },
+            )
+            pending.push(() => {
+              if (settled) return
+              settled = true
+              inFlight -= 1
+              resolve(
+                targets.map((target) => ({
+                  ...target,
+                  text: `Preview ${target.messageId}`,
+                })),
+              )
+            })
+          },
+        ),
     )
     render(
       <BranchTreeView
@@ -2173,11 +3273,11 @@ describe('BranchTreeView', () => {
         headers={headers}
         cursor={{ root: 'child-0' }}
         expanded
-        repository={repository({ getMessageTextPreview })}
+        repository={repository({ getMessageTextPreviewWindow })}
         onActivateNode={() => undefined}
       />,
     )
-    await waitFor(() => expect(getMessageTextPreview).toHaveBeenCalled())
+    await waitFor(() => expect(getMessageTextPreviewWindow).toHaveBeenCalled())
     const canvas = document.querySelector<HTMLElement>('[data-ui="branch-tree-scroll"]')
     if (!canvas) throw new Error('Missing tree canvas')
 
@@ -2187,26 +3287,26 @@ describe('BranchTreeView', () => {
       await new Promise((resolve) => requestAnimationFrame(() => resolve(undefined)))
     }
 
-    expect(getMessageTextPreview.mock.calls.length).toBeLessThanOrEqual(6)
-    expect(maxInFlight).toBeLessThanOrEqual(6)
-    const firstWaveCount = getMessageTextPreview.mock.calls.length
-    await act(async () => {
-      for (const resolve of pending.splice(0)) resolve()
-    })
-    await waitFor(() =>
-      expect(getMessageTextPreview.mock.calls.length).toBeGreaterThan(firstWaveCount),
-    )
-    expect(getMessageTextPreview.mock.calls.length).toBeLessThanOrEqual(firstWaveCount + 6)
-    expect(maxInFlight).toBeLessThanOrEqual(6)
+    expect(getMessageTextPreviewWindow.mock.calls.length).toBeLessThanOrEqual(6)
+    for (const [targets] of getMessageTextPreviewWindow.mock.calls) {
+      expect(targets.length).toBeLessThan(50)
+    }
+    for (const signal of signals.slice(0, -1)) expect(signal.aborted).toBe(true)
+    expect(maxInFlight).toBe(1)
+    for (let pass = 0; pass < 3 && inFlight > 0; pass += 1) {
+      await act(async () => {
+        for (const resolve of pending.splice(0)) resolve()
+        await Promise.resolve()
+      })
+    }
+    await waitFor(() => expect(inFlight).toBe(0))
   })
 
   it('keeps topology work and the inspector isolated from non-structural activity', async () => {
     const treeComputations: string[] = []
     const inspectorComputations: string[] = []
     BranchTreeView.__setComputationProbeForTests((operation) => treeComputations.push(operation))
-    BranchTreeInspector.__setComputationProbeForTests((operation) =>
-      inspectorComputations.push(operation),
-    )
+    observeBranchTreeInspectorComputations((operation) => inspectorComputations.push(operation))
     const treeRepository = repository()
     const activate = vi.fn()
     const view = render(
@@ -2248,17 +3348,14 @@ describe('BranchTreeView', () => {
       (entry) => entry === 'render',
     ).length
     act(() => {
-      useStreamStore.getState().setActive({
+      observeTestAttempt({
         streamId: 'unrelated',
-        replacementEpoch: 0,
         chatId: 'chat-elsewhere',
         messageId: 'other-message',
-        startedAt: 1,
-        ownerClientId: 'client-1',
+        local: false,
       })
-      useStreamStore.getState().setLiveSnapshot({
+      publishTestLiveProjection({
         streamId: 'unrelated',
-        replacementEpoch: 0,
         chatId: 'chat-elsewhere',
         messageId: 'other-message',
         content: [{ type: 'output_text', text: 'Elsewhere' }],
@@ -2285,6 +3382,81 @@ describe('BranchTreeView', () => {
     )
     expect(treeComputations.filter((entry) => entry === 'render').length).toBeGreaterThan(
       initialTreeRenders,
+    )
+  })
+
+  it('retains the tree workspace while releasing hidden viewport geometry', async () => {
+    const computations: string[] = []
+    BranchTreeView.__setComputationProbeForTests((operation) => computations.push(operation))
+    const treeRepository = repository()
+    const view = render(
+      <BranchTreeView
+        chatId="chat-1"
+        headers={smallTree}
+        cursor={{ root: 'left' }}
+        expanded={false}
+        repository={treeRepository}
+        onActivateNode={() => undefined}
+      />,
+    )
+    const workspace = document.querySelector<HTMLElement>('[data-ui="branch-tree-view"]')
+    if (!workspace) throw new Error('Missing tree workspace')
+    workspace.dataset.retainedIdentity = 'true'
+    const activeLayouts = computations.filter((entry) => entry === 'layout').length
+    const activeIndexes = computations.filter((entry) => entry === 'connector-index').length
+    expect(document.querySelectorAll('[data-ui="branch-tree-node"]')).toHaveLength(3)
+
+    const changedTree = [...smallTree, header('right-child', 'right', 0, 'assistant', 4)]
+    view.rerender(
+      <BranchTreeView
+        chatId="chat-1"
+        headers={changedTree}
+        cursor={{ root: 'left' }}
+        expanded={false}
+        viewportActive={false}
+        repository={treeRepository}
+        onActivateNode={() => undefined}
+      />,
+    )
+
+    expect(document.querySelector('[data-ui="branch-tree-view"]')).toBe(workspace)
+    expect(workspace.dataset.retainedIdentity).toBe('true')
+    expect(document.querySelectorAll('[data-ui="branch-tree-node"]')).toHaveLength(0)
+    expect(computations.filter((entry) => entry === 'layout')).toHaveLength(activeLayouts)
+    expect(computations.filter((entry) => entry === 'connector-index')).toHaveLength(activeIndexes)
+
+    view.rerender(
+      <BranchTreeView
+        chatId="chat-1"
+        headers={changedTree}
+        cursor={{ root: 'left' }}
+        expanded={false}
+        bindingCurrency="retained"
+        repository={treeRepository}
+        onActivateNode={() => undefined}
+      />,
+    )
+    expect(document.querySelector('[data-ui="branch-tree-view"]')).toBe(workspace)
+    expect(workspace).toHaveAttribute('inert')
+    expect(document.querySelectorAll('[data-ui="branch-tree-node"]')).toHaveLength(0)
+    expect(computations.filter((entry) => entry === 'layout')).toHaveLength(activeLayouts)
+    expect(computations.filter((entry) => entry === 'connector-index')).toHaveLength(activeIndexes)
+
+    view.rerender(
+      <BranchTreeView
+        chatId="chat-1"
+        headers={changedTree}
+        cursor={{ root: 'left' }}
+        expanded={false}
+        repository={treeRepository}
+        onActivateNode={() => undefined}
+      />,
+    )
+    expect(document.querySelector('[data-ui="branch-tree-view"]')).toBe(workspace)
+    expect(document.querySelectorAll('[data-ui="branch-tree-node"]')).toHaveLength(4)
+    expect(computations.filter((entry) => entry === 'layout')).toHaveLength(activeLayouts + 1)
+    expect(computations.filter((entry) => entry === 'connector-index')).toHaveLength(
+      activeIndexes + 1,
     )
   })
 

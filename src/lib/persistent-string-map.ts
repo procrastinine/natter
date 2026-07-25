@@ -13,6 +13,15 @@ interface BranchNode<Value> {
 
 type TreeNode<Value> = LeafNode<Value> | BranchNode<Value>
 
+interface SearchStep<Value> {
+  readonly branch: BranchNode<Value>
+  readonly direction: 0 | 1
+}
+
+export interface PersistentStringMapMeasurement {
+  nodeVisits: number
+}
+
 export class PersistentStringMap<Value> {
   private readonly root: TreeNode<Value> | null
   readonly size: number
@@ -21,10 +30,25 @@ export class PersistentStringMap<Value> {
     return new PersistentStringMap<Value>(null, 0)
   }
 
+  static singleton<Value>(key: string, value: Value): PersistentStringMap<Value> {
+    return new PersistentStringMap<Value>({ kind: 'leaf', key, value }, 1)
+  }
+
   static from<Value>(entries: Iterable<readonly [string, Value]>): PersistentStringMap<Value> {
-    let result = PersistentStringMap.empty<Value>()
-    for (const [key, value] of entries) result = result.set(key, value)
-    return result
+    const valuesByKey = new Map<string, Value>()
+    for (const [key, value] of entries) valuesByKey.set(key, value)
+    if (valuesByKey.size === 0) return PersistentStringMap.empty<Value>()
+    if (valuesByKey.size === 1) {
+      const [key, value] = valuesByKey.entries().next().value as [string, Value]
+      return PersistentStringMap.singleton(key, value)
+    }
+    const sorted = [...valuesByKey].sort(([left], [right]) =>
+      left < right ? -1 : left > right ? 1 : 0,
+    )
+    return new PersistentStringMap(
+      buildTreeFromSortedEntries(sorted, 0, sorted.length),
+      sorted.length,
+    )
   }
 
   private constructor(root: TreeNode<Value> | null, size: number) {
@@ -32,8 +56,8 @@ export class PersistentStringMap<Value> {
     this.size = size
   }
 
-  get(key: string): Value | undefined {
-    const leaf = findLeaf(this.root, key)
+  get(key: string, measurement?: PersistentStringMapMeasurement): Value | undefined {
+    const leaf = findLeaf(this.root, key, measurement)
     return leaf?.key === key ? leaf.value : undefined
   }
 
@@ -41,21 +65,50 @@ export class PersistentStringMap<Value> {
     return findLeaf(this.root, key)?.key === key
   }
 
-  set(key: string, value: Value): PersistentStringMap<Value> {
+  set(
+    key: string,
+    value: Value,
+    measurement?: PersistentStringMapMeasurement,
+  ): PersistentStringMap<Value> {
     if (!this.root) return new PersistentStringMap({ kind: 'leaf', key, value }, 1)
-    const leaf = findLeaf(this.root, key) as LeafNode<Value>
+    const { leaf, path } = traceLeaf(this.root, key, measurement)
     if (leaf.key === key) {
       if (Object.is(leaf.value, value)) return this
-      return new PersistentStringMap(replaceLeaf(this.root, key, value), this.size)
+      return new PersistentStringMap(
+        rebuildPath(path, path.length, { kind: 'leaf', key, value }),
+        this.size,
+      )
     }
     const bit = firstDifferingBit(key, leaf.key)
-    const inserted = insertAtBit(this.root, bit, key, value)
-    return new PersistentStringMap(inserted, this.size + 1)
+    let insertionDepth = 0
+    while (
+      insertionDepth < path.length &&
+      (path[insertionDepth] as SearchStep<Value>).branch.bit < bit
+    ) {
+      insertionDepth += 1
+    }
+    const existing: TreeNode<Value> =
+      insertionDepth === path.length ? leaf : (path[insertionDepth] as SearchStep<Value>).branch
+    const insertedLeaf: LeafNode<Value> = { kind: 'leaf', key, value }
+    const inserted: BranchNode<Value> =
+      bitAt(key, bit) === 0
+        ? { kind: 'branch', bit, zero: insertedLeaf, one: existing }
+        : { kind: 'branch', bit, zero: existing, one: insertedLeaf }
+    return new PersistentStringMap(rebuildPath(path, insertionDepth, inserted), this.size + 1)
   }
 
-  delete(key: string): PersistentStringMap<Value> {
-    if (!this.root || findLeaf(this.root, key)?.key !== key) return this
-    return new PersistentStringMap(deleteLeaf(this.root, key), this.size - 1)
+  delete(key: string, measurement?: PersistentStringMapMeasurement): PersistentStringMap<Value> {
+    if (!this.root) return this
+    const { leaf, path } = traceLeaf(this.root, key, measurement)
+    if (leaf.key !== key) return this
+    if (path.length === 0) return PersistentStringMap.empty<Value>()
+    const parent = path[path.length - 1] as SearchStep<Value>
+    const sibling = parent.direction === 0 ? parent.branch.one : parent.branch.zero
+    return new PersistentStringMap(rebuildPath(path, path.length - 1, sibling), this.size - 1)
+  }
+
+  maxDepth(): number {
+    return treeDepth(this.root)
   }
 
   *entries(): IterableIterator<[string, Value]> {
@@ -83,48 +136,83 @@ export class PersistentStringMap<Value> {
   }
 }
 
-function findLeaf<Value>(node: TreeNode<Value> | null, key: string): LeafNode<Value> | null {
+function findLeaf<Value>(
+  node: TreeNode<Value> | null,
+  key: string,
+  measurement?: PersistentStringMapMeasurement,
+): LeafNode<Value> | null {
   let current = node
   while (current?.kind === 'branch') {
+    if (measurement) measurement.nodeVisits += 1
     current = bitAt(key, current.bit) === 0 ? current.zero : current.one
+  }
+  if (current && measurement) measurement.nodeVisits += 1
+  return current
+}
+
+function traceLeaf<Value>(
+  root: TreeNode<Value>,
+  key: string,
+  measurement?: PersistentStringMapMeasurement,
+): { leaf: LeafNode<Value>; path: SearchStep<Value>[] } {
+  const path: SearchStep<Value>[] = []
+  let current = root
+  while (current.kind === 'branch') {
+    if (measurement) measurement.nodeVisits += 1
+    const direction = bitAt(key, current.bit)
+    path.push({ branch: current, direction })
+    current = direction === 0 ? current.zero : current.one
+  }
+  if (measurement) measurement.nodeVisits += 1
+  return { leaf: current, path }
+}
+
+function rebuildPath<Value>(
+  path: readonly SearchStep<Value>[],
+  ancestorCount: number,
+  replacement: TreeNode<Value>,
+): TreeNode<Value> {
+  let current = replacement
+  for (let index = ancestorCount - 1; index >= 0; index -= 1) {
+    const step = path[index] as SearchStep<Value>
+    current =
+      step.direction === 0 ? { ...step.branch, zero: current } : { ...step.branch, one: current }
   }
   return current
 }
 
-function replaceLeaf<Value>(node: TreeNode<Value>, key: string, value: Value): TreeNode<Value> {
-  if (node.kind === 'leaf') return { kind: 'leaf', key, value }
-  if (bitAt(key, node.bit) === 0) {
-    return { ...node, zero: replaceLeaf(node.zero, key, value) }
-  }
-  return { ...node, one: replaceLeaf(node.one, key, value) }
+function treeDepth<Value>(node: TreeNode<Value> | null): number {
+  if (!node) return 0
+  if (node.kind === 'leaf') return 1
+  return Math.max(treeDepth(node.zero), treeDepth(node.one)) + 1
 }
 
-function insertAtBit<Value>(
-  node: TreeNode<Value>,
-  bit: number,
-  key: string,
-  value: Value,
+function buildTreeFromSortedEntries<Value>(
+  entries: readonly (readonly [string, Value])[],
+  start: number,
+  end: number,
 ): TreeNode<Value> {
-  if (node.kind === 'branch' && node.bit < bit) {
-    if (bitAt(key, node.bit) === 0) {
-      return { ...node, zero: insertAtBit(node.zero, bit, key, value) }
-    }
-    return { ...node, one: insertAtBit(node.one, bit, key, value) }
+  if (end - start === 1) {
+    const [key, value] = entries[start] as readonly [string, Value]
+    return { kind: 'leaf', key, value }
   }
-  const leaf: LeafNode<Value> = { kind: 'leaf', key, value }
-  return bitAt(key, bit) === 0
-    ? { kind: 'branch', bit, zero: leaf, one: node }
-    : { kind: 'branch', bit, zero: node, one: leaf }
-}
-
-function deleteLeaf<Value>(node: TreeNode<Value>, key: string): TreeNode<Value> | null {
-  if (node.kind === 'leaf') return null
-  if (bitAt(key, node.bit) === 0) {
-    const zero = deleteLeaf(node.zero, key)
-    return zero ? { ...node, zero } : node.one
+  const first = entries[start] as readonly [string, Value]
+  const last = entries[end - 1] as readonly [string, Value]
+  const bit = firstDifferingBit(first[0], last[0])
+  let low = start + 1
+  let high = end
+  while (low < high) {
+    const middle = low + Math.floor((high - low) / 2)
+    const entry = entries[middle] as readonly [string, Value]
+    if (bitAt(entry[0], bit) === 0) low = middle + 1
+    else high = middle
   }
-  const one = deleteLeaf(node.one, key)
-  return one ? { ...node, one } : node.zero
+  return {
+    kind: 'branch',
+    bit,
+    zero: buildTreeFromSortedEntries(entries, start, low),
+    one: buildTreeFromSortedEntries(entries, low, end),
+  }
 }
 
 function* entriesFrom<Value>(node: TreeNode<Value>): IterableIterator<[string, Value]> {

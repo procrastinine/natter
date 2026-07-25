@@ -1,8 +1,28 @@
-import { memo, useCallback, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import type { Message, MessageRole } from '../../core/types'
+import { memo, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import {
+  type ConversationMutationSettlement,
+  definePresentationInteraction,
+} from '../../app/presentation-interactions'
+import {
+  createAppliedMessageView,
+  projectAppliedMessageReasoningPresentation,
+} from '../../core/continuation-content'
+import {
+  type GenerationCapability,
+  generationCapabilityAvailable,
+  generationCapabilityBlockedReason,
+  pendingGenerationCapability,
+} from '../../core/interaction-capability'
+import { plaintextOf } from '../../core/message-content'
+import { literalSearchHasMatchEndingAfter } from '../../core/search-query'
+import type { Message, ProviderOutputMemberRef, ReasoningMemberRef } from '../../core/types'
 import { useMessageStreamProjection } from '../../hooks/useMessageStreamProjection'
-import type { MessageAttachmentRefMutation } from '../../store/attachments'
-import { getStreamClientId } from '../../store/stream-leases'
+import { usePresentationInteraction } from '../../hooks/usePresentationInteraction'
+import type {
+  GenerationStartResult,
+  MessageAttachmentRefMutation,
+  WorkspaceFence,
+} from '../../store/presentation-contracts'
 import { AttachmentRefChips } from '../attachments/AttachmentRefChips'
 import {
   BranchIcon,
@@ -19,32 +39,43 @@ import {
 } from '../icons/Icon'
 import { Button } from '../primitives/Button'
 import type { BranchTreeInspectorSearchTools as InspectorSearchTools } from './BranchTreeInspectorSearch'
-import { InlineEditor, plaintextOf } from './InlineEditor'
+import { InlineEditor } from './InlineEditor'
 import { MessageContent, messageTextSegmentsFromContent } from './MessageContent'
 import { MessageInfo } from './MessageInfo'
 import { ReasoningBlock } from './ReasoningBlock'
 import { ToolEvidenceBlock } from './ToolEvidenceBlock'
 
 const DEFAULT_MARKDOWN_CHAR_LIMIT = 100_000
-const SEARCH_SCAN_CHUNK_CHARS = 64 * 1024
+
+const branchInspectorSearchInteraction = definePresentationInteraction<string>({
+  id: 'branch-inspector.search-tools',
+  label: 'Message search',
+  concurrency: 'replace',
+  lifetime: 'presenter',
+})
 
 export interface BranchTreeInspectorProps {
   message: Message
+  presentationFence: WorkspaceFence
   bodyVersion: number
   bodyReady?: boolean
   onClose: () => void
   onActivate?: () => void
-  onEdit?: (message: Message, text: string) => void | Promise<void>
-  onEditAndSend?: (message: Message, text: string) => void | Promise<void>
-  onDelete?: () => void | Promise<void>
-  onRegenerate?: () => void | Promise<void>
-  onContinue?: () => void | Promise<void>
-  onForkChat?: () => void | Promise<void>
-  onToggleContextVisibility?: () => void | Promise<void>
+  onEdit?: (message: Message, text: string) => ConversationMutationSettlement
+  onEditAndSend?: (message: Message, text: string) => GenerationStartResult
+  onDelete?: () => ConversationMutationSettlement
+  onRegenerate?: () => GenerationStartResult
+  onContinue?: () => GenerationStartResult
+  onForkChat?: () => ConversationMutationSettlement
+  onToggleContextVisibility?: () => ConversationMutationSettlement
   onMutateAttachmentRef?: (mutation: MessageAttachmentRefMutation) => void | Promise<void>
-  onToggleReasoningDetailHidden?: (detailIndex: number) => void | Promise<void>
-  onToggleProviderOutputItemHidden?: (itemIndex: number) => void | Promise<void>
-  hasConnection?: boolean
+  onToggleReasoningDetailHidden?: (member: ReasoningMemberRef) => ConversationMutationSettlement
+  onToggleProviderOutputItemHidden?: (
+    member: ProviderOutputMemberRef,
+  ) => ConversationMutationSettlement
+  editResendCapability?: GenerationCapability
+  regenerateCapability?: GenerationCapability
+  continueCapability?: GenerationCapability
   streamOnActivePath?: boolean
   searchQuery?: string
   searchMatched?: boolean
@@ -55,27 +86,21 @@ interface TextProjection {
   totalChars: number
 }
 
-function roleLabel(role: MessageRole): string {
-  return role.charAt(0).toLocaleUpperCase() + role.slice(1)
-}
-
 type BranchTreeInspectorComputation = 'render' | 'bounded-projection' | 'search-scan'
 type BranchTreeInspectorComputationProbe = (operation: BranchTreeInspectorComputation) => void
 let branchTreeInspectorComputationProbe: BranchTreeInspectorComputationProbe | undefined
 
-function setBranchTreeInspectorComputationProbeForTests(
-  probe: BranchTreeInspectorComputationProbe | undefined,
+export function observeBranchTreeInspectorComputations(
+  observer: BranchTreeInspectorComputationProbe | undefined,
 ): void {
-  if (import.meta.env.MODE === 'test') branchTreeInspectorComputationProbe = probe
+  branchTreeInspectorComputationProbe = observer
 }
 
 const StaticToolEvidenceBlock = memo(ToolEvidenceBlock)
 const StaticAttachmentRefChips = memo(AttachmentRefChips)
 
 function projectText(segments: readonly string[]): TextProjection {
-  if (import.meta.env.MODE === 'test') {
-    branchTreeInspectorComputationProbe?.('bounded-projection')
-  }
+  branchTreeInspectorComputationProbe?.('bounded-projection')
   const prefixParts: string[] = []
   let prefixChars = 0
   let totalChars = 0
@@ -95,38 +120,9 @@ function textLengthOf(segments: readonly string[]): number {
   return length
 }
 
-function hasMatchBeyondPrefix(
-  segments: readonly string[],
-  query: string,
-  prefixChars: number,
-): boolean {
-  const needle = query.toLocaleLowerCase()
-  if (needle.length === 0) return false
-  const retainedLength = needle.length - 1
-  let trailing = ''
-  let processedChars = 0
-
-  for (const segment of segments) {
-    for (let offset = 0; offset < segment.length; offset += SEARCH_SCAN_CHUNK_CHARS) {
-      const lowered = segment.slice(offset, offset + SEARCH_SCAN_CHUNK_CHARS).toLocaleLowerCase()
-      const searchable = `${trailing}${lowered}`
-      const searchableStart = processedChars - trailing.length
-      let matchIndex = searchable.indexOf(needle)
-      while (matchIndex >= 0) {
-        if (searchableStart + matchIndex + needle.length > prefixChars) return true
-        matchIndex = searchable.indexOf(needle, matchIndex + Math.max(1, needle.length))
-      }
-      processedChars += lowered.length
-      if (retainedLength > 0) {
-        trailing = searchable.slice(-retainedLength)
-      }
-    }
-  }
-  return false
-}
-
 const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
   message,
+  presentationFence,
   bodyVersion,
   bodyReady = true,
   onClose,
@@ -141,61 +137,83 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
   onMutateAttachmentRef,
   onToggleReasoningDetailHidden,
   onToggleProviderOutputItemHidden,
-  hasConnection = false,
+  editResendCapability = pendingGenerationCapability('prompt-path'),
+  regenerateCapability = pendingGenerationCapability('prompt-path'),
+  continueCapability = pendingGenerationCapability('prompt-path'),
   streamOnActivePath = true,
   searchQuery,
   searchMatched = false,
 }: BranchTreeInspectorProps) {
-  if (import.meta.env.MODE === 'test') branchTreeInspectorComputationProbe?.('render')
+  branchTreeInspectorComputationProbe?.('render')
+  const editResendAvailable = generationCapabilityAvailable(editResendCapability)
+  const regenerateAvailable = generationCapabilityAvailable(regenerateCapability)
+  const continueAvailable = generationCapabilityAvailable(continueCapability)
+  const editResendBlockedReason = generationCapabilityBlockedReason(
+    editResendCapability,
+    'edit-resend',
+  )
+  const regenerateBlockedReason = generationCapabilityBlockedReason(
+    regenerateCapability,
+    'regenerate',
+  )
+  const continueBlockedReason = generationCapabilityBlockedReason(continueCapability, 'continue')
   const [fullMessageId, setFullMessageId] = useState<string | null>(null)
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null)
-  const [editError, setEditError] = useState<{ messageId: string; text: string } | null>(null)
   const [showInfo, setShowInfo] = useState(false)
   const [occurrenceCount, setOccurrenceCount] = useState(0)
   const [totalOccurrenceCount, setTotalOccurrenceCount] = useState(0)
   const [currentOccurrence, setCurrentOccurrence] = useState(-1)
-  const [activeStream, liveSnapshot] = useMessageStreamProjection(
+  const appliedView = useMemo(() => createAppliedMessageView(message), [message])
+  const searchToolsInteraction = usePresentationInteraction(branchInspectorSearchInteraction)
+  const runSearchToolsInteraction = searchToolsInteraction.run
+  const streamProjection = useMessageStreamProjection(
     message,
+    presentationFence,
     message.role === 'assistant',
   )
-  const persistedStreamBusy =
-    message.generation?.status === 'streaming' && message.generation.finishedAt === undefined
-  const streamTargetBusy =
-    activeStream !== undefined || persistedStreamBusy || liveSnapshot !== undefined
+  const activeAttempt = streamProjection.execution
+  const availability = activeAttempt?.availability
+  const liveSnapshot = streamProjection.liveProjection
+  const presentationPending =
+    streamProjection.presentation !== undefined ||
+    (activeAttempt === undefined && liveSnapshot !== undefined)
+  const streamTargetBusy = availability?.blocksReplacement === true
+  const activeStreamingPresentation =
+    availability !== undefined && availability.presentation !== 'none'
+  const liveRendering =
+    activeStreamingPresentation || liveSnapshot !== undefined || presentationPending
   const requestBusy = !bodyReady || streamTargetBusy
-  const remoteStreaming =
-    activeStream !== undefined && activeStream.ownerClientId !== getStreamClientId()
-  const liveReasoningRows = liveSnapshot?.reasoningRows
-  const showOriginalFailure = !message.continuationAttempts?.some(
-    (attempt) => attempt.status === 'done' && attempt.unappliedText === undefined,
-  )
-  const finalError = showOriginalFailure ? message.generation?.error : undefined
-  const finalAbort = showOriginalFailure ? message.generation?.abortReason : undefined
-  const streamStatus: { text: string; tone?: 'warning' | 'error' } | null = remoteStreaming
-    ? { text: 'This response is currently streaming in another tab.' }
-    : activeStream && !streamOnActivePath
-      ? { text: 'Streaming on another branch. Open this branch to follow live output.' }
-      : activeStream
-        ? liveSnapshot
-          ? { text: 'Streaming response…' }
-          : { text: 'Waiting for response…' }
-        : persistedStreamBusy
-          ? { text: 'Finishing response…' }
-          : liveSnapshot
-            ? { text: 'Finishing response…' }
-            : finalError
-              ? {
-                  text: `Error${finalError.statusCode ? ` ${finalError.statusCode}` : ''}: ${finalError.message}`,
-                  tone: 'error',
-                }
-              : finalAbort === 'user'
-                ? {
-                    text: 'Cancelled — partial response kept above. Continue to resume.',
-                    tone: 'warning',
-                  }
-                : finalAbort
-                  ? { text: `Stream interrupted (${finalAbort}).`, tone: 'warning' }
-                  : null
+  const liveReasoning = liveSnapshot?.reasoning
+  const finalError = appliedView.latestAttempt.metadata?.error
+  const finalAbort = appliedView.latestAttempt.metadata?.abortReason
+  const streamStatus: { text: string; tone?: 'warning' | 'error' } | null =
+    availability?.presentation === 'remote-streaming'
+      ? { text: 'This response is currently streaming in another tab.' }
+      : activeStreamingPresentation && !streamOnActivePath
+        ? { text: 'Streaming on another branch. Open this branch to follow live output.' }
+        : activeStreamingPresentation
+          ? liveSnapshot
+            ? { text: 'Streaming response…' }
+            : { text: 'Waiting for response…' }
+          : availability?.state === 'provisional' || availability?.state === 'reconciling'
+            ? { text: 'Checking response state…' }
+            : streamTargetBusy
+              ? { text: 'Waiting for response…' }
+              : presentationPending
+                ? { text: 'Finishing response…' }
+                : finalError
+                  ? {
+                      text: `Error${finalError.statusCode ? ` ${finalError.statusCode}` : ''}: ${finalError.message}`,
+                      tone: 'error',
+                    }
+                  : finalAbort === 'user'
+                    ? {
+                        text: 'Cancelled — partial response kept above. Continue to resume.',
+                        tone: 'warning',
+                      }
+                    : finalAbort
+                      ? { text: `Stream interrupted (${finalAbort}).`, tone: 'warning' }
+                      : null
   const contentRef = useRef<HTMLElement | null>(null)
   const searchRangesRef = useRef<Range[]>([])
   const searchToolsRef = useRef<InspectorSearchTools | null>(null)
@@ -207,44 +225,49 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
     [renderedContent],
   )
   const boundedProjection = useMemo(
-    () => (streamTargetBusy ? undefined : projectText(textSegments)),
-    [streamTargetBusy, textSegments],
+    () => (liveRendering ? undefined : projectText(textSegments)),
+    [liveRendering, textSegments],
   )
-  const totalChars = streamTargetBusy
+  const totalChars = liveRendering
     ? (liveSnapshot?.textLength ?? textLengthOf(textSegments))
     : (boundedProjection?.totalChars ?? 0)
-  const truncated = !streamTargetBusy && totalChars > DEFAULT_MARKDOWN_CHAR_LIMIT
+  const truncated = !liveRendering && totalChars > DEFAULT_MARKDOWN_CHAR_LIMIT
   const showingFull = truncated && fullMessageId === message.id
   const normalizedSearchQuery = searchQuery?.trim() ?? ''
   const editing = editingMessageId === message.id
   const renderedText = useMemo(
     () =>
-      streamTargetBusy
-        ? ''
-        : showingFull
-          ? textSegments.join('')
-          : (boundedProjection?.prefix ?? ''),
-    [boundedProjection?.prefix, showingFull, streamTargetBusy, textSegments],
+      liveRendering ? '' : showingFull ? textSegments.join('') : (boundedProjection?.prefix ?? ''),
+    [boundedProjection?.prefix, liveRendering, showingFull, textSegments],
   )
   const matchBeyondPrefix = useMemo(
     () =>
       truncated &&
       !showingFull &&
       normalizedSearchQuery.length > 0 &&
-      hasMatchBeyondPrefix(textSegments, normalizedSearchQuery, DEFAULT_MARKDOWN_CHAR_LIMIT),
+      literalSearchHasMatchEndingAfter(
+        textSegments,
+        normalizedSearchQuery,
+        DEFAULT_MARKDOWN_CHAR_LIMIT,
+      ),
     [normalizedSearchQuery, showingFull, textSegments, truncated],
   )
-  const liveReasoningDetails = useMemo(
-    () => liveReasoningRows?.map((row) => row.detail),
-    [liveReasoningRows],
+  const reasoningPresentation = useMemo(
+    () =>
+      liveReasoning
+        ? projectAppliedMessageReasoningPresentation(appliedView, {
+            attemptKind: liveSnapshot.attemptKind,
+            streamId: liveSnapshot.streamId,
+            projection: liveReasoning,
+          })
+        : projectAppliedMessageReasoningPresentation(appliedView),
+    [appliedView, liveReasoning, liveSnapshot?.attemptKind, liveSnapshot?.streamId],
   )
-  const renderedReasoningDetails = liveReasoningDetails ?? message.reasoningDetails
   const infoMessage = useMemo<Message>(() => {
     if (!showInfo || !liveSnapshot) return message
     return {
       ...message,
-      content: renderedContent,
-      ...(liveReasoningDetails ? { reasoningDetails: liveReasoningDetails } : {}),
+      content: [...renderedContent],
       ...(liveSnapshot.generation
         ? {
             generation: message.generation
@@ -253,19 +276,7 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
           }
         : {}),
     }
-  }, [liveReasoningDetails, liveSnapshot, message, renderedContent, showInfo])
-  const toggleReasoningDetailHidden = useCallback(
-    (detailIndex: number) => {
-      void onToggleReasoningDetailHidden?.(detailIndex)
-    },
-    [onToggleReasoningDetailHidden],
-  )
-  const toggleProviderOutputItemHidden = useCallback(
-    (itemIndex: number) => {
-      void onToggleProviderOutputItemHidden?.(itemIndex)
-    },
-    [onToggleProviderOutputItemHidden],
-  )
+  }, [liveSnapshot, message, renderedContent, showInfo])
   const titleId = `${idPrefix}-title`
   const contentId = `${idPrefix}-content-title`
   const detailsId = `${idPrefix}-details-title`
@@ -276,7 +287,7 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
     searchRangesRef.current = []
     if (
       editing ||
-      streamTargetBusy ||
+      liveRendering ||
       normalizedSearchQuery.length === 0 ||
       renderedText.length === 0 ||
       !contentRef.current ||
@@ -298,7 +309,7 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
     const refreshRanges = (resetCurrent: boolean) => {
       const tools = searchToolsRef.current
       if (disposed || !contentRef.current || !tools) return
-      if (import.meta.env.MODE === 'test') branchTreeInspectorComputationProbe?.('search-scan')
+      branchTreeInspectorComputationProbe?.('search-scan')
       const { ranges, totalCount } = tools.renderedSearchRanges(
         contentRef.current,
         normalizedSearchQuery,
@@ -332,21 +343,26 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
         refreshRanges(false)
       })
     }
-    void import('./BranchTreeInspectorSearch').then((tools) => {
-      if (disposed || !contentRef.current) return
-      searchToolsRef.current = tools
-      tools.installSearchHighlightStyles()
-      refreshRanges(true)
-      const markdown = contentRef.current.querySelector('[data-ui="markdown"]')
-      observer = markdown ? new MutationObserver(scheduleRangeRefresh) : null
-      observer?.observe(markdown as Node, {
-        childList: true,
-        characterData: true,
-        subtree: true,
-      })
+    const claim = runSearchToolsInteraction({
+      target: message.id,
+      action: () => import('./BranchTreeInspectorSearch'),
+      commit: (tools) => {
+        if (disposed || !contentRef.current) return
+        searchToolsRef.current = tools
+        tools.installSearchHighlightStyles()
+        refreshRanges(true)
+        const markdown = contentRef.current.querySelector('[data-ui="markdown"]')
+        observer = markdown ? new MutationObserver(scheduleRangeRefresh) : null
+        observer?.observe(markdown as Node, {
+          childList: true,
+          characterData: true,
+          subtree: true,
+        })
+      },
     })
     return () => {
       disposed = true
+      claim.releasePresenter()
       observer?.disconnect()
       if (scheduledFrame !== null && typeof cancelAnimationFrame === 'function') {
         cancelAnimationFrame(scheduledFrame)
@@ -354,7 +370,14 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
       searchRangesRef.current = []
       searchToolsRef.current?.clearSearchHighlights()
     }
-  }, [editing, message.id, normalizedSearchQuery, renderedText, streamTargetBusy])
+  }, [
+    editing,
+    message.id,
+    normalizedSearchQuery,
+    renderedText,
+    runSearchToolsInteraction,
+    liveRendering,
+  ])
 
   const goToOccurrence = (direction: -1 | 1) => {
     if (occurrenceCount === 0) return
@@ -367,65 +390,17 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
 
   const searchHighlightLimited = totalOccurrenceCount > occurrenceCount
 
-  const copyMessage = async () => {
-    try {
-      await navigator.clipboard.writeText(plaintextOf(renderedContent))
-    } catch {
-      return
-    }
-  }
+  const copyMessage = () =>
+    navigator.clipboard.writeText(plaintextOf(renderedContent)).catch(() => undefined)
 
-  const submitEdit = async (
-    text: string,
-    action: ((message: Message, text: string) => void | Promise<void>) | undefined,
-    busyMessage: string,
-    fallbackMessage: string,
-  ) => {
-    if (!action) return
-    if (!bodyReady) {
-      setEditError({ messageId: message.id, text: 'Wait for the latest message body to load.' })
-      return
-    }
-    if (streamTargetBusy) {
-      setEditError({ messageId: message.id, text: busyMessage })
-      return
-    }
-    try {
-      await action(message, text)
-      setEditingMessageId((current) => (current === message.id ? null : current))
-      setEditError(null)
-    } catch (error) {
-      setEditError({
-        messageId: message.id,
-        text: error instanceof Error ? error.message : fallbackMessage,
-      })
-    }
-  }
-
-  const saveEdit = (text: string) =>
-    submitEdit(
-      text,
-      onEdit,
-      'Wait for this generation to finish before editing it.',
-      'Unable to save this edit.',
-    )
-  const saveEditAndSend = (text: string) =>
-    requestBusy
-      ? setEditError({
-          messageId: message.id,
-          text: 'Wait for the current generation to finish before sending again.',
-        })
-      : submitEdit(
-          text,
-          onEditAndSend,
-          'Wait for the current generation to finish before sending again.',
-          'Unable to send this edit.',
-        )
+  const saveEditAndSend = onEditAndSend
+    ? (text: string): GenerationStartResult => onEditAndSend(message, text)
+    : undefined
 
   return (
     <aside
       data-ui="branch-tree-inspector"
-      data-body-ready={bodyReady ? 'true' : 'false'}
+      data-body-ready={bodyReady}
       data-body-version={bodyVersion}
       data-role={message.role}
       data-message-id={message.id}
@@ -434,7 +409,9 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
     >
       <header data-ui="branch-tree-inspector-header">
         <div data-ui="branch-tree-inspector-heading">
-          <h2 id={titleId}>{roleLabel(message.role)} message</h2>
+          <h2 id={titleId}>
+            {message.role.charAt(0).toUpperCase() + message.role.slice(1)} message
+          </h2>
           <code data-ui="branch-tree-inspector-message-id">{message.id}</code>
           <span data-ui="branch-tree-inspector-char-count">
             {totalChars.toLocaleString()} text characters
@@ -481,7 +458,6 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
               aria-pressed={editing}
               disabled={!bodyReady || editing || streamTargetBusy}
               onClick={() => {
-                setEditError(null)
                 setEditingMessageId(message.id)
               }}
             >
@@ -497,14 +473,18 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
               title={
                 !bodyReady
                   ? 'Refreshing message details…'
-                  : !hasConnection
-                    ? 'Add a connection to regenerate.'
+                  : regenerateBlockedReason
+                    ? regenerateBlockedReason
                     : streamTargetBusy
                       ? "Can't regenerate while this message is streaming."
-                      : 'Regenerate response'
+                      : regenerateCapability.state === 'pending'
+                        ? undefined
+                        : 'Regenerate response'
               }
-              disabled={!hasConnection || requestBusy}
-              onClick={() => void onRegenerate()}
+              disabled={!regenerateAvailable || requestBusy}
+              onClick={() => {
+                onRegenerate()
+              }}
             >
               <ReloadIcon size={15} />
             </Button>
@@ -520,12 +500,15 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
                   ? 'Refreshing message details…'
                   : streamTargetBusy
                     ? "Can't continue while streaming."
-                    : hasConnection
-                      ? 'Continue this assistant message'
-                      : 'Add a connection to continue.'
+                    : (continueBlockedReason ??
+                      (continueCapability.state === 'pending'
+                        ? undefined
+                        : 'Continue this assistant message'))
               }
-              disabled={!hasConnection || requestBusy}
-              onClick={() => void onContinue()}
+              disabled={!continueAvailable || requestBusy}
+              onClick={() => {
+                onContinue()
+              }}
             >
               <SendIcon size={15} />
             </Button>
@@ -638,7 +621,7 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
                   <ChevronIcon size={14} />
                 </Button>
               </div>
-              {streamTargetBusy ? (
+              {liveRendering ? (
                 <span data-ui="branch-tree-inspector-search-overflow">
                   Search highlighting resumes when this response finishes streaming.
                 </span>
@@ -650,7 +633,7 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
                   to navigate the rest.
                 </span>
               ) : null}
-              {searchMatched && !streamTargetBusy && occurrenceCount === 0 && !matchBeyondPrefix ? (
+              {searchMatched && !liveRendering && occurrenceCount === 0 && !matchBeyondPrefix ? (
                 <span data-ui="branch-tree-inspector-search-overflow">
                   This match is in Markdown source or other non-rendered text, so there is no
                   visible occurrence to highlight.
@@ -683,76 +666,64 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
               </Button>
             </div>
           ) : null}
-          {editing ? (
-            <>
-              <InlineEditor
-                key={message.id}
-                initial={plaintextOf(message.content)}
-                onSave={saveEdit}
-                onCancel={() => {
-                  setEditingMessageId(null)
-                  setEditError(null)
-                }}
-                attachmentsEnabled={false}
-                saveContentOnly
-                {...(message.role === 'user' && onEditAndSend
-                  ? {
-                      onSaveAndSend: (text: string) => saveEditAndSend(text),
-                      saveAndSendDisabled: !hasConnection || requestBusy,
-                      ...(!hasConnection
-                        ? { saveAndSendDisabledReason: 'Add a connection to send messages.' }
-                        : requestBusy
-                          ? {
-                              saveAndSendDisabledReason:
-                                'Wait for this generation to finish before sending again.',
-                            }
-                          : {}),
-                    }
-                  : {})}
-                ariaLabel={`Edit ${message.role} message`}
-              />
-              {editError?.messageId === message.id ? (
-                <div data-ui="branch-tree-inspector-edit-error" role="alert">
-                  Edit failed: {editError.text}
-                </div>
-              ) : null}
-            </>
+          {editing && onEdit ? (
+            <InlineEditor
+              key={message.id}
+              initial={plaintextOf(message.content)}
+              onSave={(text) => onEdit(message, text)}
+              onCancel={() => setEditingMessageId(null)}
+              saveDisabled={!bodyReady || streamTargetBusy}
+              attachmentsEnabled={false}
+              {...(message.role === 'user' && saveEditAndSend
+                ? {
+                    onSaveAndSend: saveEditAndSend,
+                    saveAndSendDisabled: !editResendAvailable || requestBusy,
+                    ...(editResendBlockedReason
+                      ? {
+                          saveAndSendDisabledReason: editResendBlockedReason,
+                        }
+                      : requestBusy
+                        ? {
+                            saveAndSendDisabledReason:
+                              'Wait for this generation to finish before sending again.',
+                          }
+                        : {}),
+                  }
+                : {})}
+              ariaLabel={`Edit ${message.role} message`}
+            />
           ) : (
             <>
-              {renderedReasoningDetails && renderedReasoningDetails.length > 0 ? (
+              {reasoningPresentation.hasReasoning ? (
                 <ReasoningBlock
-                  details={renderedReasoningDetails}
-                  {...(liveReasoningRows
-                    ? { detailsNormalized: true, liveRows: liveReasoningRows }
-                    : {})}
-                  streaming={streamTargetBusy}
+                  presentation={reasoningPresentation}
+                  streaming={liveRendering}
                   hasContent={totalChars > 0}
                   deferContentUntilOpen
-                  toggleHiddenDisabled={
-                    !bodyReady || streamTargetBusy || Boolean(liveReasoningRows)
-                  }
+                  toggleHiddenDisabled={!bodyReady || streamTargetBusy || Boolean(liveReasoning)}
                   {...(onToggleReasoningDetailHidden
                     ? {
-                        onToggleHidden: toggleReasoningDetailHidden,
+                        onToggleHidden: onToggleReasoningDetailHidden,
                       }
                     : {})}
                 />
               ) : null}
               <StaticToolEvidenceBlock
                 message={message}
+                appliedView={appliedView}
                 toggleHiddenDisabled={!bodyReady || streamTargetBusy}
                 {...(onToggleProviderOutputItemHidden
                   ? {
-                      onToggleHidden: toggleProviderOutputItemHidden,
+                      onToggleHidden: onToggleProviderOutputItemHidden,
                     }
                   : {})}
               />
               <MessageContent
-                key={`${message.id}:${bodyVersion}`}
                 content={renderedContent}
-                text={streamTargetBusy ? '' : renderedText}
-                textSegments={streamTargetBusy ? textSegments : undefined}
-                streaming={streamTargetBusy}
+                text={liveRendering ? '' : renderedText}
+                textSegments={liveRendering ? textSegments : undefined}
+                streaming={liveRendering}
+                renderRevision={bodyVersion}
                 messageId={message.id}
                 attachmentRefs={message.attachmentRefs}
                 {...(onMutateAttachmentRef ? { onMutateAttachmentRef } : {})}
@@ -769,7 +740,11 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
         {showInfo ? (
           <section data-ui="branch-tree-inspector-details" aria-labelledby={detailsId}>
             <h3 id={detailsId}>Message details</h3>
-            <MessageInfo message={infoMessage} />
+            <MessageInfo
+              message={infoMessage}
+              appliedView={appliedView}
+              reasoningPresentation={reasoningPresentation}
+            />
           </section>
         ) : null}
       </div>
@@ -777,10 +752,4 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
   )
 })
 
-export const BranchTreeInspector =
-  BranchTreeInspectorComponent as typeof BranchTreeInspectorComponent & {
-    __setComputationProbeForTests: (probe: BranchTreeInspectorComputationProbe | undefined) => void
-  }
-if (import.meta.env.MODE === 'test') {
-  BranchTreeInspector.__setComputationProbeForTests = setBranchTreeInspectorComputationProbeForTests
-}
+export const BranchTreeInspector = BranchTreeInspectorComponent

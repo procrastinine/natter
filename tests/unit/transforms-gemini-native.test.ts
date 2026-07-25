@@ -3,9 +3,43 @@
 // coexist in the same response).
 
 import { describe, expect, it } from 'vitest'
+import { toGeminiNative as toGeminiNativeWithContract } from '../../src/api/request-transforms'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
-import { toGeminiNative } from '../../src/core/transforms'
-import type { ChatSettings, Message, ReasoningDetail, ToolCall } from '../../src/core/types'
+import { GOOGLE_PROVIDER_OUTPUT_CONTRACT } from '../../src/core/provider-tool-context'
+import type {
+  ChatSettings,
+  Message,
+  ReasoningDetail,
+  ReasoningOriginDialect,
+  ToolCall,
+} from '../../src/core/types'
+import {
+  geminiReasoningContractForSettings,
+  TEST_NATIVE_MODEL_TAIL_PREFILL_PLAN,
+} from '../helpers/reasoning-contracts'
+import { reasoningEnvelopeFromDetailsForTest } from '../helpers/reasoning-events'
+
+type GeminiOptions = Omit<
+  Parameters<typeof toGeminiNativeWithContract>[2],
+  'reasoning' | 'providerOutput' | 'prefillPlan'
+> & {
+  reasoning?: Parameters<typeof toGeminiNativeWithContract>[2]['reasoning']
+  providerOutput?: Parameters<typeof toGeminiNativeWithContract>[2]['providerOutput']
+  prefillPlan?: Parameters<typeof toGeminiNativeWithContract>[2]['prefillPlan']
+}
+
+function toGeminiNative(
+  settings: Parameters<typeof toGeminiNativeWithContract>[0],
+  path: Parameters<typeof toGeminiNativeWithContract>[1],
+  options: GeminiOptions = {},
+) {
+  return toGeminiNativeWithContract(settings, path, {
+    ...options,
+    reasoning: options.reasoning ?? geminiReasoningContractForSettings(settings),
+    providerOutput: options.providerOutput ?? GOOGLE_PROVIDER_OUTPUT_CONTRACT,
+    prefillPlan: options.prefillPlan ?? TEST_NATIVE_MODEL_TAIL_PREFILL_PLAN,
+  })
+}
 
 function settings(overrides: Partial<ChatSettings> = {}): ChatSettings {
   const s = cloneDefaultChatSettings()
@@ -44,7 +78,13 @@ function user(id: string, text: string): Message {
   }
 }
 
-function assistant(id: string, text: string, opts: Partial<Message> = {}): Message {
+type AssistantOptions = Partial<Message> & {
+  reasoningDetails?: readonly ReasoningDetail[]
+  reasoningDialect?: ReasoningOriginDialect
+}
+
+function assistant(id: string, text: string, opts: AssistantOptions = {}): Message {
+  const { reasoningDetails, reasoningDialect = 'gemini-native', ...messageOptions } = opts
   return {
     id,
     chatId: 'c',
@@ -58,7 +98,15 @@ function assistant(id: string, text: string, opts: Partial<Message> = {}): Messa
     content: [{ type: 'text', text }],
     nodeVersion: 0,
     deleted: false,
-    ...opts,
+    ...messageOptions,
+    ...(reasoningDetails
+      ? {
+          reasoningEnvelope: reasoningEnvelopeFromDetailsForTest(
+            reasoningDetails,
+            reasoningDialect,
+          ),
+        }
+      : {}),
   }
 }
 
@@ -251,12 +299,57 @@ describe('toGeminiNative — thinkingConfig (Gemini 3)', () => {
     )
     expect(wire.generationConfig?.thinkingConfig?.includeThoughts).toBeUndefined()
   })
+
+  it('suppresses includeThoughts when output is excluded and reports the request choice', () => {
+    const result = toGeminiNative(
+      settings({
+        reasoning: {
+          mode: 'enabled',
+          effort: 'medium',
+          exclude: true,
+          summary: 'detailed',
+          include: { encrypted: true, summary: false, text: false },
+        },
+      }),
+      [user('u1', 'hi')],
+    )
+    expect(result.wire.generationConfig?.thinkingConfig?.includeThoughts).toBeUndefined()
+    expect(result.reasoningVisibilityEvidence).toEqual({
+      kind: 'gemini',
+      thoughts: 'omitted',
+      omittedReason: 'request-display',
+    })
+  })
 })
 
 describe('toGeminiNative — thinkingConfig (Gemini 2.5)', () => {
   function g25(): ChatSettings {
     return { ...settings(), model: 'google/gemini-2.5-flash' }
   }
+
+  it('lets an emitted zero budget override includeThoughts in visibility evidence', () => {
+    const s = g25()
+    const result = toGeminiNative(
+      {
+        ...s,
+        reasoning: {
+          ...s.reasoning,
+          mode: 'off',
+          summary: 'detailed',
+        },
+      },
+      [user('u1', 'hi')],
+    )
+    expect(result.wire.generationConfig?.thinkingConfig).toMatchObject({
+      thinkingBudget: 0,
+      includeThoughts: true,
+    })
+    expect(result.reasoningVisibilityEvidence).toEqual({
+      kind: 'gemini',
+      thoughts: 'omitted',
+      omittedReason: 'disabled',
+    })
+  })
 
   it('maps effort → thinkingBudget (integer)', () => {
     // Per Google's Vertex thinking docs: gemini-2.5-flash supports budgets
@@ -342,6 +435,30 @@ describe('toGeminiNative — reasoning echo (thoughtSignature on LAST part)', ()
     expect(lastPart.text).toBe('The answer is 42.')
   })
 
+  it('preserves a signature-only assistant turn with an empty provider anchor', () => {
+    const details: ReasoningDetail[] = [
+      {
+        type: 'reasoning.encrypted',
+        id: 'r_e',
+        data: 'SIGNATURE_WITHOUT_VISIBLE_OUTPUT',
+        format: 'google-gemini-v1',
+      },
+    ]
+    const path: Message[] = [
+      user('u1', 'q'),
+      assistant('a1', '', { reasoningDetails: details }),
+      user('u2', 'follow'),
+    ]
+
+    const { wire } = toGeminiNative(settings(), path)
+
+    expect(wire.contents).toHaveLength(3)
+    expect(wire.contents[1]).toEqual({
+      role: 'model',
+      parts: [{ text: '', thoughtSignature: 'SIGNATURE_WITHOUT_VISIBLE_OUTPUT' }],
+    })
+  })
+
   it('ignores tool-prefixed encrypted rows when selecting thoughtSignature', () => {
     const details: ReasoningDetail[] = [
       {
@@ -370,7 +487,9 @@ describe('toGeminiNative — reasoning echo (thoughtSignature on LAST part)', ()
       thoughtSignature?: string
     }
     expect(lastPart.thoughtSignature).toBe('GEMINI_SIGNATURE')
-    expect(path[1]?.reasoningDetails).toEqual(details)
+    expect(path[1]?.reasoningEnvelope).toEqual(
+      reasoningEnvelopeFromDetailsForTest(details, 'gemini-native'),
+    )
   })
 
   it('drops signature when include.encrypted is false', () => {
@@ -429,11 +548,19 @@ describe('toGeminiNative — reasoning echo (thoughtSignature on LAST part)', ()
 
   it('emits thought:true summary parts when include.summary is on', () => {
     const details: ReasoningDetail[] = [
-      { type: 'reasoning.summary', id: 'r_s', summary: 'I was thinking about X.' },
+      {
+        type: 'reasoning.summary',
+        id: 'r_s',
+        format: 'google-gemini-v1',
+        summary: 'I was thinking about X.',
+      },
     ]
     const path: Message[] = [
       user('u1', 'q'),
-      assistant('a1', 'answer', { reasoningDetails: details }),
+      assistant('a1', 'answer', {
+        reasoningDetails: details,
+        reasoningDialect: 'openrouter-chat',
+      }),
     ]
     const { wire } = toGeminiNative(
       settings({
@@ -465,7 +592,10 @@ describe('toGeminiNative — reasoning echo (thoughtSignature on LAST part)', ()
     ]
     const path: Message[] = [
       user('u1', 'q'),
-      assistant('a1', 'answer', { reasoningDetails: details }),
+      assistant('a1', 'answer', {
+        reasoningDetails: details,
+        reasoningDialect: 'openrouter-chat',
+      }),
     ]
     const { wire } = toGeminiNative(
       settings({
@@ -488,9 +618,27 @@ describe('toGeminiNative — reasoning echo (thoughtSignature on LAST part)', ()
     // noisy multi-block echo on the next turn. Single-part is the expected
     // shape — matches Gemini's own typical "one thought, then answer".
     const details: ReasoningDetail[] = [
-      { type: 'reasoning.summary', id: 'r_s_0', summary: 'Step one.', index: 0 },
-      { type: 'reasoning.summary', id: 'r_s_1', summary: 'Step two.', index: 1 },
-      { type: 'reasoning.summary', id: 'r_s_2', summary: 'Step three.', index: 2 },
+      {
+        type: 'reasoning.summary',
+        id: 'r_s_0',
+        format: 'google-gemini-v1',
+        summary: 'Step one.',
+        index: 0,
+      },
+      {
+        type: 'reasoning.summary',
+        id: 'r_s_1',
+        format: 'google-gemini-v1',
+        summary: 'Step two.',
+        index: 1,
+      },
+      {
+        type: 'reasoning.summary',
+        id: 'r_s_2',
+        format: 'google-gemini-v1',
+        summary: 'Step three.',
+        index: 2,
+      },
     ]
     const path: Message[] = [
       user('u1', 'q'),
@@ -523,8 +671,18 @@ describe('toGeminiNative — reasoning echo (thoughtSignature on LAST part)', ()
 
   it('coalesces summary + plaintext text into ONE thought part when both include flags on', () => {
     const details: ReasoningDetail[] = [
-      { type: 'reasoning.summary', id: 'r_s', summary: 'Brief summary.' },
-      { type: 'reasoning.text', id: 'r_t', text: 'Full chain of thought.' },
+      {
+        type: 'reasoning.summary',
+        id: 'r_s',
+        format: 'google-gemini-v1',
+        summary: 'Brief summary.',
+      },
+      {
+        type: 'reasoning.text',
+        id: 'r_t',
+        format: 'google-gemini-v1',
+        text: 'Full chain of thought.',
+      },
     ]
     const path: Message[] = [
       user('u1', 'q'),

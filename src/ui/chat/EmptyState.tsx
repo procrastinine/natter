@@ -1,10 +1,7 @@
 import { useCallback } from 'react'
-import { primaryKeys } from '../../store/reactive-dependencies'
-import { useRepositoryQuery } from '../../store/reactive-query'
-import { getSetting, setSetting } from '../../store/settings'
+import { useConfigurationPreferences } from '../../hooks/useConfigurationPreferences'
+import { configurationApplication } from '../../store/configuration-application'
 import { Button } from '../primitives/Button'
-
-const DISMISS_KEY = 'sample-prompts:dismissed'
 
 interface Prompt {
   title: string
@@ -40,17 +37,12 @@ interface EmptyStateProps {
 }
 
 export function EmptyState({ onPick }: EmptyStateProps) {
-  const dismissed = useRepositoryQuery(
-    `setting:${DISMISS_KEY}`,
-    () => getSetting<boolean>(DISMISS_KEY).then((v) => v === true),
-    false,
-    primaryKeys('settings', DISMISS_KEY),
-  )
+  const dismissed = useConfigurationPreferences()?.samplePromptsDismissed ?? false
   const onDismiss = useCallback(async () => {
-    await setSetting(DISMISS_KEY, true)
+    await configurationApplication.setSamplePromptsDismissed(true)
   }, [])
   const onRestore = useCallback(async () => {
-    await setSetting(DISMISS_KEY, false)
+    await configurationApplication.setSamplePromptsDismissed(false)
   }, [])
   return (
     <div data-ui="empty-state">

@@ -1,19 +1,24 @@
 import { useCallback } from 'react'
+import { workspaceConfigurationWriteInteraction } from '../../app/presentation-interactions'
 import {
   DEFAULT_GLOBAL_PREFERENCES,
-  MESSAGE_RENDER_WINDOW_SIZE_MAX,
-  MESSAGE_RENDER_WINDOW_SIZE_MIN,
+  MESSAGE_INITIAL_RENDER_WORK_MAX,
+  MESSAGE_INITIAL_RENDER_WORK_MIN,
+  MESSAGE_RENDER_WINDOW_LOAD_MODE_KEY,
   type RenderWindowLoadMode,
-  readGlobalPreferences,
+  SIDEBAR_RENDER_WINDOW_LOAD_MODE_KEY,
   SIDEBAR_RENDER_WINDOW_SIZE_MAX,
   SIDEBAR_RENDER_WINDOW_SIZE_MIN,
+} from '../../core/global-settings'
+import { useConfigurationPreferences } from '../../hooks/useConfigurationPreferences'
+import { usePresentationInteraction } from '../../hooks/usePresentationInteraction'
+import { useSettledConfigurationEdit } from '../../hooks/useSettledConfigurationEdit'
+import {
+  writeMessageInitialRenderWork,
   writeMessageRenderWindowLoadMode,
-  writeMessageRenderWindowSize,
   writeSidebarRenderWindowLoadMode,
   writeSidebarRenderWindowSize,
-} from '../../core/global-settings'
-import { GLOBAL_PREFERENCES_DEPENDENCIES } from '../../store/reactive-dependencies'
-import { useRepositoryQuery } from '../../store/reactive-query'
+} from '../../store/preferences-application'
 import { InfoDisclosure } from './InfoDisclosure'
 
 const LOAD_MODE_OPTIONS: ReadonlyArray<{ value: RenderWindowLoadMode; label: string }> = [
@@ -22,25 +27,37 @@ const LOAD_MODE_OPTIONS: ReadonlyArray<{ value: RenderWindowLoadMode; label: str
 ]
 
 export function PerformanceSettings() {
-  const prefs = useRepositoryQuery(
-    'global-preferences',
-    readGlobalPreferences,
-    DEFAULT_GLOBAL_PREFERENCES,
-    GLOBAL_PREFERENCES_DEPENDENCIES,
+  const { run: runWorkspaceConfigurationWrite } = usePresentationInteraction(
+    workspaceConfigurationWriteInteraction,
+    { observePending: false },
   )
-
-  const onMessageRenderWindowSize = useCallback(async (value: number) => {
-    await writeMessageRenderWindowSize(value)
-  }, [])
-  const onSidebarRenderWindowSize = useCallback(async (value: number) => {
-    await writeSidebarRenderWindowSize(value)
-  }, [])
-  const onMessageRenderWindowLoadMode = useCallback(async (value: RenderWindowLoadMode) => {
-    await writeMessageRenderWindowLoadMode(value)
-  }, [])
-  const onSidebarRenderWindowLoadMode = useCallback(async (value: RenderWindowLoadMode) => {
-    await writeSidebarRenderWindowLoadMode(value)
-  }, [])
+  const prefs = useConfigurationPreferences()?.global ?? DEFAULT_GLOBAL_PREFERENCES
+  const messageInitialRenderWork = useSettledConfigurationEdit({
+    fieldKey: 'global.messageInitialRenderWork',
+    storedValue: prefs.messageInitialRenderWork,
+    commit: writeMessageInitialRenderWork,
+  })
+  const sidebarRenderWindowSize = useSettledConfigurationEdit({
+    fieldKey: 'global.sidebarRenderWindowSize',
+    storedValue: prefs.sidebarRenderWindowSize,
+    commit: writeSidebarRenderWindowSize,
+  })
+  const onMessageRenderWindowLoadMode = useCallback(
+    (value: RenderWindowLoadMode) =>
+      runWorkspaceConfigurationWrite({
+        target: MESSAGE_RENDER_WINDOW_LOAD_MODE_KEY,
+        action: () => writeMessageRenderWindowLoadMode(value),
+      }),
+    [runWorkspaceConfigurationWrite],
+  )
+  const onSidebarRenderWindowLoadMode = useCallback(
+    (value: RenderWindowLoadMode) =>
+      runWorkspaceConfigurationWrite({
+        target: SIDEBAR_RENDER_WINDOW_LOAD_MODE_KEY,
+        action: () => writeSidebarRenderWindowLoadMode(value),
+      }),
+    [runWorkspaceConfigurationWrite],
+  )
 
   return (
     <>
@@ -48,20 +65,26 @@ export function PerformanceSettings() {
         <h3>Chat Rendering</h3>
         <div data-ui="field-group" data-ui-inline-number-row="">
           <span>
-            Newest messages
-            <InfoDisclosure title="Newest messages">
-              The active chat mounts only the newest messages initially. Older messages are added in
-              batches when you scroll to the top or press Load more.
+            Initial render work
+            <InfoDisclosure title="Initial render work">
+              After the newest reply paints, fills at least this many messages in the background.
+              Text, media, and viewport work may include more. It never limits chat length; older
+              messages remain reachable through automatic scrolling or Load more.
             </InfoDisclosure>
           </span>
           <input
             type="number"
-            aria-label="Newest messages"
-            min={MESSAGE_RENDER_WINDOW_SIZE_MIN}
-            max={MESSAGE_RENDER_WINDOW_SIZE_MAX}
+            aria-label="Initial render work"
+            min={MESSAGE_INITIAL_RENDER_WORK_MIN}
+            max={MESSAGE_INITIAL_RENDER_WORK_MAX}
             step={1}
-            value={prefs.messageRenderWindowSize}
-            onChange={(e) => void onMessageRenderWindowSize(e.currentTarget.valueAsNumber)}
+            value={messageInitialRenderWork.value}
+            onChange={(e) => {
+              if (Number.isFinite(e.currentTarget.valueAsNumber)) {
+                messageInitialRenderWork.setValue(e.currentTarget.valueAsNumber)
+              }
+            }}
+            onBlur={messageInitialRenderWork.onBlur}
           />
         </div>
         <div data-ui="field-group">
@@ -98,8 +121,13 @@ export function PerformanceSettings() {
             min={SIDEBAR_RENDER_WINDOW_SIZE_MIN}
             max={SIDEBAR_RENDER_WINDOW_SIZE_MAX}
             step={1}
-            value={prefs.sidebarRenderWindowSize}
-            onChange={(e) => void onSidebarRenderWindowSize(e.currentTarget.valueAsNumber)}
+            value={sidebarRenderWindowSize.value}
+            onChange={(e) => {
+              if (Number.isFinite(e.currentTarget.valueAsNumber)) {
+                sidebarRenderWindowSize.setValue(e.currentTarget.valueAsNumber)
+              }
+            }}
+            onBlur={sidebarRenderWindowSize.onBlur}
           />
         </div>
         <div data-ui="field-group">

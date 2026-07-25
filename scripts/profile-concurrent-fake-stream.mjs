@@ -1,10 +1,12 @@
 import { createHash } from 'node:crypto'
 import { chromium } from '@playwright/test'
 import {
+  activeWorkspaceDatabaseName,
   assertLoopbackUrl,
   createProviderScenario,
   FAKE_REASONING_SEED,
   FAKE_TEXT_SEED,
+  installProfileDurableReasoningObserver,
   monitorScenario,
   navigateToChat,
   openNewChat,
@@ -13,23 +15,26 @@ import {
   seedAndRetargetWorkspace,
   startComposerSend,
   startFakeProvider,
+  startPreviewServer,
   startRegenerate,
   waitForProviderIdle,
   waitForWorkspaceStreamQuiescence,
 } from './profile-stream-harness.mjs'
+import { evaluateConcurrentStreamProfile } from './stream-profile-evaluator.mjs'
 
 const DEFAULTS = Object.freeze({
-  url: 'http://127.0.0.1:5173/',
+  url: `http://127.0.0.1:${process.env.E2E_PORT ?? '5173'}/`,
   pageCount: 10,
   streamsPerPage: 10,
   contextChars: 100_000,
   targetChars: 100_000,
   reasoningChars: 100_000,
   chunkChars: 128,
-  initialDelayMs: 5_000,
+  initialDelayMs: 0,
   regenerationCount: 100,
   timeoutMs: 180_000,
   providerUrl: null,
+  servePreview: false,
 })
 const options = parseArgs(process.argv.slice(2))
 if (options.help) {
@@ -55,7 +60,8 @@ if (regenerationCount > totalStreams) {
   throw new Error('regenerationCount cannot exceed totalStreams')
 }
 
-const provider = await startFakeProvider({ providerUrl, timeoutMs })
+const preview = options.servePreview ? await startPreviewServer({ appUrl: url, timeoutMs }) : null
+let provider
 let scenario
 let browser
 let context
@@ -64,6 +70,7 @@ const cdpSessions = []
 const consoleProblems = []
 
 try {
+  provider = await startFakeProvider({ providerUrl, timeoutMs })
   scenario = await createProviderScenario(provider.origin, generatedConfig(1, 0, 0))
   browser = await chromium.launch({
     headless: true,
@@ -254,16 +261,12 @@ try {
     ['current-turn', currentPhase],
     ['regeneration', regenerationPhase],
   ]) {
-    if (phase.provider.maxActiveStreams !== phase.expectedConcurrent) {
-      failures.push(
-        `${label}: provider high-water ${phase.provider.maxActiveStreams}/${phase.expectedConcurrent}`,
-      )
-    }
+    failures.push(...phase.applicationAdmission.failures.map((failure) => `${label}: ${failure}`))
   }
   if (consoleProblems.length > 0) failures.push(`${consoleProblems.length} console problems`)
 
   const report = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     measurementModel: 'external-http-ui-v1',
     scenario: {
       pageCount,
@@ -292,6 +295,11 @@ try {
       currentTurn: currentPhase.provider,
       regeneration: regenerationPhase.provider,
     },
+    applicationAdmissionPhases: {
+      previousTurn: previousPhase.applicationAdmission,
+      currentTurn: currentPhase.applicationAdmission,
+      regeneration: regenerationPhase.applicationAdmission,
+    },
     seed: {
       chatId: seed.chatId,
       assistantMessageId: seed.assistantMessageId,
@@ -312,16 +320,19 @@ try {
     consoleProblems,
     failures,
   }
-  console.log(JSON.stringify(report, null, 2))
-  if (failures.length > 0) process.exitCode = 1
+  const evaluation = evaluateConcurrentStreamProfile(report)
+  console.log(JSON.stringify({ ...report, evaluation }, null, 2))
+  if (evaluation.status !== 'pass') process.exitCode = 1
 } finally {
   await browser?.close()
   await scenario?.dispose().catch(() => undefined)
-  await provider.stop()
+  await provider?.stop()
+  await preview?.stop()
 }
 
 async function createMeasuredPage(index) {
   const page = await context.newPage()
+  await page.addInitScript(installProfileDurableReasoningObserver)
   page.setDefaultTimeout(timeoutMs)
   page.setDefaultNavigationTimeout(timeoutMs)
   page.on('console', (message) => {
@@ -355,18 +366,35 @@ async function runPhase({ label, expectedConcurrent, config, start }) {
       batches: pages.map(() => []),
       elapsedMs: 0,
       expectedConcurrent,
+      applicationAdmission: {
+        expected: 0,
+        observed: 0,
+        statuses: {},
+        failures: [],
+      },
       provider: { maxActiveStreams: 0, samples: 0, final },
     }
   }
-  await scenario.update(config)
+  await scenario.update({ ...config, holdUntilReleased: true })
   const monitor = monitorScenario(scenario, 5)
   const startedAt = performance.now()
-  const batches = await withinTimeout(
-    Promise.all(pages.map((page, pageIndex) => start(page, pageIndex))),
-    `${label} admission`,
-    timeoutMs,
-  )
-  const admissions = batches.flat()
+  let batches
+  let admissions
+  let applicationAdmission
+  try {
+    batches = await withinTimeout(
+      Promise.all(pages.map((page, pageIndex) => start(page, pageIndex))),
+      `${label} admission`,
+      timeoutMs,
+    )
+    admissions = batches.flat()
+    applicationAdmission = await readApplicationAdmission(
+      pages[0],
+      admissions.map((entry) => entry.assistantMessageId),
+    )
+  } finally {
+    await scenario.release().catch(() => undefined)
+  }
   await waitForProviderIdle(scenario, timeoutMs)
   const states = await waitForWorkspaceStreamQuiescence(
     pages[0],
@@ -388,14 +416,72 @@ async function runPhase({ label, expectedConcurrent, config, start }) {
     batches: settledBatches,
     elapsedMs: performance.now() - startedAt,
     expectedConcurrent,
+    applicationAdmission,
     provider: providerEvidence,
   }
 }
 
+async function readApplicationAdmission(page, assistantIds) {
+  const databaseName = await activeWorkspaceDatabaseName(page)
+  return page.evaluate(
+    async ({ databaseName, expectedIds }) => {
+      const db = await new Promise((resolve, reject) => {
+        const request = indexedDB.open(databaseName)
+        request.onsuccess = () => resolve(request.result)
+        request.onerror = () => reject(request.error)
+      })
+      try {
+        const transaction = db.transaction('streamLeases', 'readonly')
+        const leases = await new Promise((resolve, reject) => {
+          const request = transaction.objectStore('streamLeases').getAll()
+          request.onsuccess = () => resolve(request.result)
+          request.onerror = () => reject(request.error)
+        })
+        await new Promise((resolve, reject) => {
+          transaction.oncomplete = () => resolve()
+          transaction.onerror = () => reject(transaction.error)
+          transaction.onabort = () => reject(transaction.error)
+        })
+        const expected = new Set(expectedIds)
+        const owned = leases.filter((lease) => expected.has(lease.targetOwnerKey))
+        const statuses = {}
+        const observed = new Set()
+        const failures = []
+        for (const lease of owned) {
+          statuses[lease.phase] = (statuses[lease.phase] ?? 0) + 1
+          if (lease.targetOwnerKey !== lease.messageId) {
+            failures.push(`${lease.messageId}: target owner mismatch`)
+          }
+          if (lease.phase !== 'reserved' && lease.phase !== 'active') {
+            failures.push(`${lease.messageId}: admission phase ${lease.phase}`)
+          }
+          if (observed.has(lease.messageId)) {
+            failures.push(`${lease.messageId}: duplicate admission lease`)
+          }
+          observed.add(lease.messageId)
+        }
+        for (const id of expected) {
+          if (!observed.has(id)) failures.push(`${id}: missing admission lease`)
+        }
+        return {
+          expected: expected.size,
+          observed: observed.size,
+          statuses,
+          failures,
+        }
+      } finally {
+        db.close()
+      }
+    },
+    { databaseName, expectedIds: assistantIds },
+  )
+}
+
 async function collectPageState(page) {
-  return page.evaluate(async () => {
+  const databaseName = await activeWorkspaceDatabaseName(page)
+  return page.evaluate(async (databaseName) => {
     const db = await new Promise((resolve, reject) => {
-      const request = indexedDB.open('natter')
+      const request = indexedDB.open(databaseName)
       request.onsuccess = () => resolve(request.result)
       request.onerror = () => reject(request.error)
     })
@@ -430,7 +516,7 @@ async function collectPageState(page) {
     } finally {
       db.close()
     }
-  })
+  }, databaseName)
 }
 
 function parseArgs(args) {
@@ -440,6 +526,10 @@ function parseArgs(args) {
     if (argument === '--') continue
     if (argument === '--help' || argument === '-h') {
       parsed.help = true
+      continue
+    }
+    if (argument === '--serve-preview') {
+      parsed.servePreview = true
       continue
     }
     if (!argument.startsWith('--')) {
@@ -507,6 +597,7 @@ heap use, and post-reload data. The default scenario persists 30M characters bef
 Options:
   --url <url>                 Loopback app URL (default: ${DEFAULTS.url})
   --provider-url <url>        Reuse an explicit loopback fake-provider origin
+  --serve-preview             Start and stop the already-built Vite preview
   --pages <count>             Browser pages (default: ${DEFAULTS.pageCount})
   --streams-per-page <count>  Streams on each page (default: ${DEFAULTS.streamsPerPage})
   --context-chars <count>     Prior assistant text per stream (default: ${DEFAULTS.contextChars})
@@ -582,236 +673,242 @@ async function measureHeap(_pages, sessions) {
 }
 
 async function verifyStored(page, expected) {
-  return page.evaluate(async (input) => {
-    const db = await new Promise((resolve, reject) => {
-      const request = indexedDB.open('natter')
-      request.onsuccess = () => resolve(request.result)
-      request.onerror = () => reject(request.error)
-    })
-    const transaction = db.transaction(
-      ['chats', 'messages', 'messageBodies', 'streamLeases', 'streamChunks'],
-      'readonly',
-    )
-    const get = (store, key) =>
-      new Promise((resolve, reject) => {
-        const request = transaction.objectStore(store).get(key)
+  const databaseName = await activeWorkspaceDatabaseName(page)
+  return page.evaluate(
+    async ({ databaseName, input }) => {
+      const db = await new Promise((resolve, reject) => {
+        const request = indexedDB.open(databaseName)
         request.onsuccess = () => resolve(request.result)
         request.onerror = () => reject(request.error)
       })
-    const count = (store) =>
-      new Promise((resolve, reject) => {
-        const request = transaction.objectStore(store).count()
-        request.onsuccess = () => resolve(request.result)
-        request.onerror = () => reject(request.error)
+      const transaction = db.transaction(
+        ['chats', 'messages', 'messageBodies', 'streamLeases', 'streamChunks'],
+        'readonly',
+      )
+      const get = (store, key) =>
+        new Promise((resolve, reject) => {
+          const request = transaction.objectStore(store).get(key)
+          request.onsuccess = () => resolve(request.result)
+          request.onerror = () => reject(request.error)
+        })
+      const count = (store) =>
+        new Promise((resolve, reject) => {
+          const request = transaction.objectStore(store).count()
+          request.onsuccess = () => resolve(request.result)
+          request.onerror = () => reject(request.error)
+        })
+      const countIndex = (store, index, key) =>
+        new Promise((resolve, reject) => {
+          const request = transaction.objectStore(store).index(index).count(key)
+          request.onsuccess = () => resolve(request.result)
+          request.onerror = () => reject(request.error)
+        })
+      const sha256 = async (text) => {
+        const bytes = new TextEncoder().encode(text)
+        const digest = await crypto.subtle.digest('SHA-256', bytes)
+        return [...new Uint8Array(digest)]
+          .map((byte) => byte.toString(16).padStart(2, '0'))
+          .join('')
+      }
+      const durableReasoningText = globalThis.__natterProfileDurableReasoningText
+      if (typeof durableReasoningText !== 'function') {
+        throw new Error('profile durable reasoning observer is unavailable')
+      }
+      const rowsPromise = Promise.all(
+        input.assistantIds.map(async (assistantId, index) => {
+          const previousAssistantId = input.previousAssistantIds[index]
+          const userId = input.userIds[index]
+          const [header, body, userHeader, previousHeader, previousBody, chat] = await Promise.all([
+            get('messages', assistantId),
+            get('messageBodies', assistantId),
+            get('messages', userId),
+            get('messages', previousAssistantId),
+            get('messageBodies', previousAssistantId),
+            get('chats', input.chatIds[index]),
+          ])
+          const context =
+            previousBody?.content
+              ?.filter((item) => item?.type === 'text' || item?.type === 'output_text')
+              .map((item) => item.text ?? '')
+              .join('') ?? ''
+          const text =
+            body?.content
+              ?.filter((item) => item?.type === 'text' || item?.type === 'output_text')
+              .map((item) => item.text ?? '')
+              .join('') ?? ''
+          const reasoning = durableReasoningText(body)
+          return {
+            assistantId,
+            previousHeaderExists: Boolean(previousHeader),
+            previousBodyExists: Boolean(previousBody),
+            userHeaderExists: Boolean(userHeader),
+            headerExists: Boolean(header),
+            bodyExists: Boolean(body),
+            chatExists: Boolean(chat),
+            bodyVersionsMatch: header?.bodyVersion === body?.bodyVersion,
+            previousBodyVersionsMatch: previousHeader?.bodyVersion === previousBody?.bodyVersion,
+            multiTurnParentsMatch:
+              userHeader?.parentId === previousAssistantId && header?.parentId === userId,
+            previousStatus: previousHeader?.generation?.status,
+            previousIntegrity: previousHeader?.generation?.integrity,
+            status: header?.generation?.status,
+            integrity: header?.generation?.integrity,
+            contextLength: context.length,
+            textLength: text.length,
+            reasoningLength: reasoning.length,
+            contextHash: await sha256(context),
+            textHash: await sha256(text),
+            reasoningHash: await sha256(reasoning),
+          }
+        }),
+      )
+      const regenerationRowsPromise = Promise.all(
+        input.regenerations.map(async (regeneration) => {
+          const [header, body, sourceHeader, parentHeader, messageCount] = await Promise.all([
+            get('messages', regeneration.assistantMessageId),
+            get('messageBodies', regeneration.assistantMessageId),
+            get('messages', regeneration.sourceAssistantId),
+            get('messages', regeneration.parentUserId),
+            countIndex('messages', 'chatId', regeneration.chatId),
+          ])
+          const text =
+            body?.content
+              ?.filter((item) => item?.type === 'text' || item?.type === 'output_text')
+              .map((item) => item.text ?? '')
+              .join('') ?? ''
+          const reasoning = durableReasoningText(body)
+          return {
+            assistantId: regeneration.assistantMessageId,
+            headerExists: Boolean(header),
+            bodyExists: Boolean(body),
+            sourceHeaderExists: Boolean(sourceHeader),
+            parentHeaderExists: Boolean(parentHeader),
+            bodyVersionsMatch: header?.bodyVersion === body?.bodyVersion,
+            branchShapeMatches:
+              header?.parentId === regeneration.parentUserId &&
+              sourceHeader?.parentId === regeneration.parentUserId &&
+              header?.id !== sourceHeader?.id &&
+              header?.siblingIndex !== sourceHeader?.siblingIndex,
+            parentRole: parentHeader?.role,
+            status: header?.generation?.status,
+            integrity: header?.generation?.integrity,
+            messageCount,
+            textLength: text.length,
+            reasoningLength: reasoning.length,
+            textHash: await sha256(text),
+            reasoningHash: await sha256(reasoning),
+          }
+        }),
+      )
+      const [rows, regenerationRows] = await Promise.all([rowsPromise, regenerationRowsPromise])
+      const [leaseCount, chunkCount] = await Promise.all([
+        count('streamLeases'),
+        count('streamChunks'),
+      ])
+      await new Promise((resolve, reject) => {
+        transaction.oncomplete = () => resolve()
+        transaction.onerror = () => reject(transaction.error)
+        transaction.onabort = () => reject(transaction.error)
       })
-    const countIndex = (store, index, key) =>
-      new Promise((resolve, reject) => {
-        const request = transaction.objectStore(store).index(index).count(key)
-        request.onsuccess = () => resolve(request.result)
-        request.onerror = () => reject(request.error)
-      })
-    const sha256 = async (text) => {
-      const bytes = new TextEncoder().encode(text)
-      const digest = await crypto.subtle.digest('SHA-256', bytes)
-      return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('')
-    }
-    const rowsPromise = Promise.all(
-      input.assistantIds.map(async (assistantId, index) => {
-        const previousAssistantId = input.previousAssistantIds[index]
-        const userId = input.userIds[index]
-        const [header, body, userHeader, previousHeader, previousBody, chat] = await Promise.all([
-          get('messages', assistantId),
-          get('messageBodies', assistantId),
-          get('messages', userId),
-          get('messages', previousAssistantId),
-          get('messageBodies', previousAssistantId),
-          get('chats', input.chatIds[index]),
-        ])
-        const context =
-          previousBody?.content
-            ?.filter((item) => item?.type === 'text' || item?.type === 'output_text')
-            .map((item) => item.text ?? '')
-            .join('') ?? ''
-        const text =
-          body?.content
-            ?.filter((item) => item?.type === 'text' || item?.type === 'output_text')
-            .map((item) => item.text ?? '')
-            .join('') ?? ''
-        const reasoning =
-          body?.reasoningDetails
-            ?.filter((item) => item?.type === 'reasoning.text')
-            .sort((left, right) => (left.index ?? 0) - (right.index ?? 0))
-            .map((item) => item.text ?? '')
-            .join('') ?? ''
-        return {
-          assistantId,
-          previousHeaderExists: Boolean(previousHeader),
-          previousBodyExists: Boolean(previousBody),
-          userHeaderExists: Boolean(userHeader),
-          headerExists: Boolean(header),
-          bodyExists: Boolean(body),
-          chatExists: Boolean(chat),
-          bodyVersionsMatch: header?.bodyVersion === body?.bodyVersion,
-          previousBodyVersionsMatch: previousHeader?.bodyVersion === previousBody?.bodyVersion,
-          multiTurnParentsMatch:
-            userHeader?.parentId === previousAssistantId && header?.parentId === userId,
-          previousStatus: previousHeader?.generation?.status,
-          previousIntegrity: previousHeader?.generation?.integrity,
-          status: header?.generation?.status,
-          integrity: header?.generation?.integrity,
-          contextLength: context.length,
-          textLength: text.length,
-          reasoningLength: reasoning.length,
-          contextHash: await sha256(context),
-          textHash: await sha256(text),
-          reasoningHash: await sha256(reasoning),
-        }
-      }),
-    )
-    const regenerationRowsPromise = Promise.all(
-      input.regenerations.map(async (regeneration) => {
-        const [header, body, sourceHeader, parentHeader, messageCount] = await Promise.all([
-          get('messages', regeneration.assistantMessageId),
-          get('messageBodies', regeneration.assistantMessageId),
-          get('messages', regeneration.sourceAssistantId),
-          get('messages', regeneration.parentUserId),
-          countIndex('messages', 'chatId', regeneration.chatId),
-        ])
-        const text =
-          body?.content
-            ?.filter((item) => item?.type === 'text' || item?.type === 'output_text')
-            .map((item) => item.text ?? '')
-            .join('') ?? ''
-        const reasoning =
-          body?.reasoningDetails
-            ?.filter((item) => item?.type === 'reasoning.text')
-            .sort((left, right) => (left.index ?? 0) - (right.index ?? 0))
-            .map((item) => item.text ?? '')
-            .join('') ?? ''
-        return {
-          assistantId: regeneration.assistantMessageId,
-          headerExists: Boolean(header),
-          bodyExists: Boolean(body),
-          sourceHeaderExists: Boolean(sourceHeader),
-          parentHeaderExists: Boolean(parentHeader),
-          bodyVersionsMatch: header?.bodyVersion === body?.bodyVersion,
-          branchShapeMatches:
-            header?.parentId === regeneration.parentUserId &&
-            sourceHeader?.parentId === regeneration.parentUserId &&
-            header?.id !== sourceHeader?.id &&
-            header?.siblingIndex !== sourceHeader?.siblingIndex,
-          parentRole: parentHeader?.role,
-          status: header?.generation?.status,
-          integrity: header?.generation?.integrity,
-          messageCount,
-          textLength: text.length,
-          reasoningLength: reasoning.length,
-          textHash: await sha256(text),
-          reasoningHash: await sha256(reasoning),
-        }
-      }),
-    )
-    const [rows, regenerationRows] = await Promise.all([rowsPromise, regenerationRowsPromise])
-    const [leaseCount, chunkCount] = await Promise.all([
-      count('streamLeases'),
-      count('streamChunks'),
-    ])
-    await new Promise((resolve, reject) => {
-      transaction.oncomplete = () => resolve()
-      transaction.onerror = () => reject(transaction.error)
-      transaction.onabort = () => reject(transaction.error)
-    })
-    db.close()
+      db.close()
 
-    const failures = []
-    for (const row of rows) {
-      if (!row.headerExists) failures.push(`${row.assistantId}: missing header`)
-      if (!row.bodyExists) failures.push(`${row.assistantId}: missing body`)
-      if (!row.previousHeaderExists) failures.push(`${row.assistantId}: missing previous header`)
-      if (!row.previousBodyExists)
-        failures.push(`${row.assistantId}: missing previous context body`)
-      if (!row.userHeaderExists) failures.push(`${row.assistantId}: missing current user header`)
-      if (!row.chatExists) failures.push(`${row.assistantId}: missing chat`)
-      if (!row.bodyVersionsMatch) failures.push(`${row.assistantId}: header/body version mismatch`)
-      if (!row.previousBodyVersionsMatch) {
-        failures.push(`${row.assistantId}: previous header/body version mismatch`)
+      const failures = []
+      for (const row of rows) {
+        if (!row.headerExists) failures.push(`${row.assistantId}: missing header`)
+        if (!row.bodyExists) failures.push(`${row.assistantId}: missing body`)
+        if (!row.previousHeaderExists) failures.push(`${row.assistantId}: missing previous header`)
+        if (!row.previousBodyExists)
+          failures.push(`${row.assistantId}: missing previous context body`)
+        if (!row.userHeaderExists) failures.push(`${row.assistantId}: missing current user header`)
+        if (!row.chatExists) failures.push(`${row.assistantId}: missing chat`)
+        if (!row.bodyVersionsMatch)
+          failures.push(`${row.assistantId}: header/body version mismatch`)
+        if (!row.previousBodyVersionsMatch) {
+          failures.push(`${row.assistantId}: previous header/body version mismatch`)
+        }
+        if (!row.multiTurnParentsMatch)
+          failures.push(`${row.assistantId}: broken multi-turn parent chain`)
+        if (row.previousStatus !== 'done') {
+          failures.push(`${row.assistantId}: previous status ${row.previousStatus}`)
+        }
+        if (row.previousIntegrity !== 'clean') {
+          failures.push(`${row.assistantId}: previous integrity ${row.previousIntegrity}`)
+        }
+        if (row.status !== 'done') failures.push(`${row.assistantId}: status ${row.status}`)
+        if (row.integrity !== 'clean')
+          failures.push(`${row.assistantId}: integrity ${row.integrity}`)
+        if (row.contextLength !== input.contextChars) {
+          failures.push(
+            `${row.assistantId}: context length ${row.contextLength}/${input.contextChars}`,
+          )
+        }
+        if (row.textLength !== input.targetChars) {
+          failures.push(`${row.assistantId}: text length ${row.textLength}/${input.targetChars}`)
+        }
+        if (row.reasoningLength !== input.reasoningChars) {
+          failures.push(
+            `${row.assistantId}: reasoning length ${row.reasoningLength}/${input.reasoningChars}`,
+          )
+        }
+        if (row.textHash !== input.expectedTextHash) failures.push(`${row.assistantId}: text hash`)
+        if (row.contextHash !== input.expectedContextHash) {
+          failures.push(`${row.assistantId}: context hash`)
+        }
+        if (row.reasoningHash !== input.expectedReasoningHash) {
+          failures.push(`${row.assistantId}: reasoning hash`)
+        }
       }
-      if (!row.multiTurnParentsMatch)
-        failures.push(`${row.assistantId}: broken multi-turn parent chain`)
-      if (row.previousStatus !== 'done') {
-        failures.push(`${row.assistantId}: previous status ${row.previousStatus}`)
+      for (const row of regenerationRows) {
+        if (!row.headerExists) failures.push(`${row.assistantId}: missing regeneration header`)
+        if (!row.bodyExists) failures.push(`${row.assistantId}: missing regeneration body`)
+        if (!row.sourceHeaderExists) failures.push(`${row.assistantId}: missing source sibling`)
+        if (!row.parentHeaderExists) failures.push(`${row.assistantId}: missing shared parent`)
+        if (!row.bodyVersionsMatch) {
+          failures.push(`${row.assistantId}: regeneration header/body version mismatch`)
+        }
+        if (!row.branchShapeMatches) failures.push(`${row.assistantId}: copied or malformed branch`)
+        if (row.parentRole !== 'user')
+          failures.push(`${row.assistantId}: parent role ${row.parentRole}`)
+        if (row.status !== 'done') failures.push(`${row.assistantId}: status ${row.status}`)
+        if (row.integrity !== 'clean')
+          failures.push(`${row.assistantId}: integrity ${row.integrity}`)
+        if (row.messageCount !== 5) {
+          failures.push(`${row.assistantId}: chat message count ${row.messageCount}/5`)
+        }
+        if (row.textLength !== input.targetChars) {
+          failures.push(`${row.assistantId}: text length ${row.textLength}/${input.targetChars}`)
+        }
+        if (row.reasoningLength !== input.reasoningChars) {
+          failures.push(
+            `${row.assistantId}: reasoning length ${row.reasoningLength}/${input.reasoningChars}`,
+          )
+        }
+        if (row.textHash !== input.expectedTextHash) failures.push(`${row.assistantId}: text hash`)
+        if (row.reasoningHash !== input.expectedReasoningHash) {
+          failures.push(`${row.assistantId}: reasoning hash`)
+        }
       }
-      if (row.previousIntegrity !== 'clean') {
-        failures.push(`${row.assistantId}: previous integrity ${row.previousIntegrity}`)
+      if (leaseCount !== 0) failures.push(`${leaseCount} stream leases remain`)
+      if (chunkCount !== 0) failures.push(`${chunkCount} stream chunks remain`)
+      return {
+        checkedRows: rows.length,
+        leaseCount,
+        chunkCount,
+        contextBytesChecked: rows.reduce((sum, row) => sum + row.contextLength, 0),
+        textBytesChecked: rows.reduce((sum, row) => sum + row.textLength, 0),
+        reasoningBytesChecked: rows.reduce((sum, row) => sum + row.reasoningLength, 0),
+        regenerationRowsChecked: regenerationRows.length,
+        regenerationTextBytesChecked: regenerationRows.reduce(
+          (sum, row) => sum + row.textLength,
+          0,
+        ),
+        regenerationReasoningBytesChecked: regenerationRows.reduce(
+          (sum, row) => sum + row.reasoningLength,
+          0,
+        ),
+        failures,
       }
-      if (row.status !== 'done') failures.push(`${row.assistantId}: status ${row.status}`)
-      if (row.integrity !== 'clean') failures.push(`${row.assistantId}: integrity ${row.integrity}`)
-      if (row.contextLength !== input.contextChars) {
-        failures.push(
-          `${row.assistantId}: context length ${row.contextLength}/${input.contextChars}`,
-        )
-      }
-      if (row.textLength !== input.targetChars) {
-        failures.push(`${row.assistantId}: text length ${row.textLength}/${input.targetChars}`)
-      }
-      if (row.reasoningLength !== input.reasoningChars) {
-        failures.push(
-          `${row.assistantId}: reasoning length ${row.reasoningLength}/${input.reasoningChars}`,
-        )
-      }
-      if (row.textHash !== input.expectedTextHash) failures.push(`${row.assistantId}: text hash`)
-      if (row.contextHash !== input.expectedContextHash) {
-        failures.push(`${row.assistantId}: context hash`)
-      }
-      if (row.reasoningHash !== input.expectedReasoningHash) {
-        failures.push(`${row.assistantId}: reasoning hash`)
-      }
-    }
-    for (const row of regenerationRows) {
-      if (!row.headerExists) failures.push(`${row.assistantId}: missing regeneration header`)
-      if (!row.bodyExists) failures.push(`${row.assistantId}: missing regeneration body`)
-      if (!row.sourceHeaderExists) failures.push(`${row.assistantId}: missing source sibling`)
-      if (!row.parentHeaderExists) failures.push(`${row.assistantId}: missing shared parent`)
-      if (!row.bodyVersionsMatch) {
-        failures.push(`${row.assistantId}: regeneration header/body version mismatch`)
-      }
-      if (!row.branchShapeMatches) failures.push(`${row.assistantId}: copied or malformed branch`)
-      if (row.parentRole !== 'user')
-        failures.push(`${row.assistantId}: parent role ${row.parentRole}`)
-      if (row.status !== 'done') failures.push(`${row.assistantId}: status ${row.status}`)
-      if (row.integrity !== 'clean') failures.push(`${row.assistantId}: integrity ${row.integrity}`)
-      if (row.messageCount !== 5) {
-        failures.push(`${row.assistantId}: chat message count ${row.messageCount}/5`)
-      }
-      if (row.textLength !== input.targetChars) {
-        failures.push(`${row.assistantId}: text length ${row.textLength}/${input.targetChars}`)
-      }
-      if (row.reasoningLength !== input.reasoningChars) {
-        failures.push(
-          `${row.assistantId}: reasoning length ${row.reasoningLength}/${input.reasoningChars}`,
-        )
-      }
-      if (row.textHash !== input.expectedTextHash) failures.push(`${row.assistantId}: text hash`)
-      if (row.reasoningHash !== input.expectedReasoningHash) {
-        failures.push(`${row.assistantId}: reasoning hash`)
-      }
-    }
-    if (leaseCount !== 0) failures.push(`${leaseCount} stream leases remain`)
-    if (chunkCount !== 0) failures.push(`${chunkCount} stream chunks remain`)
-    return {
-      checkedRows: rows.length,
-      leaseCount,
-      chunkCount,
-      contextBytesChecked: rows.reduce((sum, row) => sum + row.contextLength, 0),
-      textBytesChecked: rows.reduce((sum, row) => sum + row.textLength, 0),
-      reasoningBytesChecked: rows.reduce((sum, row) => sum + row.reasoningLength, 0),
-      regenerationRowsChecked: regenerationRows.length,
-      regenerationTextBytesChecked: regenerationRows.reduce((sum, row) => sum + row.textLength, 0),
-      regenerationReasoningBytesChecked: regenerationRows.reduce(
-        (sum, row) => sum + row.reasoningLength,
-        0,
-      ),
-      failures,
-    }
-  }, expected)
+    },
+    { databaseName, input: expected },
+  )
 }

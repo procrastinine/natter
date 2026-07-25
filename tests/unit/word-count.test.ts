@@ -1,5 +1,24 @@
 import { describe, expect, it } from 'vitest'
-import { countWords } from '../../src/core/word-count'
+import type { Message } from '../../src/core/types'
+import { countMessagesWords } from '../../src/core/word-count'
+
+function countWords(text: string): number {
+  const message: Message = {
+    id: 'message',
+    chatId: 'chat',
+    parentId: null,
+    siblingIndex: 0,
+    turnId: 'turn',
+    turnIndex: 0,
+    createdAt: 0,
+    role: 'user',
+    origin: 'user',
+    content: [{ type: 'text', text }],
+    nodeVersion: 0,
+    deleted: false,
+  }
+  return countMessagesWords([message])
+}
 
 describe('word-count', () => {
   it('counts ASCII text', () => {

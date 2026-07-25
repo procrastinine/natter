@@ -1,0 +1,1184 @@
+{
+  "schemaVersion": 2,
+  "allowances": [
+    {
+      "purpose": "read-only-assertion",
+      "mutationScope": {
+        "kind": "none",
+        "targets": []
+      },
+      "cleanupRestoreObligation": "Close the exact raw database handle after the bounded schema read and leave all durable rows and schema unchanged.",
+      "publicUiCannotExpress": "The upgrade proof requires exact physical object-store and index names that the public UI deliberately does not expose.",
+      "siteIds": [
+        "tests/e2e/startup-recovery.spec.ts::owner=function%3AreadDatabaseSchema::operation=indexeddb.database.close::mode=-::store=-::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=function%3AreadDatabaseSchema::operation=indexeddb.database.enumerate-stores::mode=-::store=%3Cdatabase%3E::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=function%3AreadDatabaseSchema::operation=indexeddb.database.transaction::mode=readonly::store=%3Cdynamic%3E::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=function%3AreadDatabaseSchema::operation=indexeddb.factory.open::mode=-::store=-::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=function%3AreadDatabaseSchema::operation=indexeddb.object-store.index::mode=readonly::store=%3Cdynamic%3E%40index%3A%3Cdynamic%3E::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=function%3AreadDatabaseSchema::operation=indexeddb.transaction.object-store::mode=readonly::store=%3Cdynamic%3E::occurrence=1"
+      ],
+      "cleanupEvidence": {
+        "siteIds": [
+          "tests/e2e/startup-recovery.spec.ts::owner=function%3AreadDatabaseSchema::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+        ],
+        "fixtureOwners": [],
+        "processOwned": false
+      }
+    },
+    {
+      "purpose": "fault-injection",
+      "mutationScope": {
+        "kind": "origin-storage",
+        "targets": ["workspace control manifest pending journal", "one inactive workspace slot"]
+      },
+      "cleanupRestoreObligation": "Release the held selection gate, close every raw database handle, close the auxiliary page, and let afterEach clear the isolated browser context.",
+      "publicUiCannotExpress": "Proving startup remains usable while a live replacement owns selection requires installing an exact pending control journal and holding the real Web Lock.",
+      "siteIds": [
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Astartup%20opens%20the%20committed%20source%20while%20a%20live%20replacement%20owns%20selection%3Ecallback%3Aonerror::operation=indexeddb.database.close::mode=-::store=-::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Astartup%20opens%20the%20committed%20source%20while%20a%20live%20replacement%20owns%20selection%3Ecallback%3Aonsuccess::operation=indexeddb.database.close::mode=-::store=-::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Astartup%20opens%20the%20committed%20source%20while%20a%20live%20replacement%20owns%20selection%3Ecallback%3Aonsuccess::operation=indexeddb.database.transaction::mode=readonly::store=manifests::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Astartup%20opens%20the%20committed%20source%20while%20a%20live%20replacement%20owns%20selection%3Ecallback%3Aonsuccess::operation=indexeddb.get::mode=readonly::store=manifests::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Astartup%20opens%20the%20committed%20source%20while%20a%20live%20replacement%20owns%20selection%3Ecallback%3Aonsuccess::operation=indexeddb.transaction.object-store::mode=readonly::store=manifests::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Astartup%20opens%20the%20committed%20source%20while%20a%20live%20replacement%20owns%20selection::operation=indexeddb.database.close::mode=-::store=-::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Astartup%20opens%20the%20committed%20source%20while%20a%20live%20replacement%20owns%20selection::operation=indexeddb.database.close::mode=-::store=-::occurrence=2",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Astartup%20opens%20the%20committed%20source%20while%20a%20live%20replacement%20owns%20selection::operation=indexeddb.database.transaction::mode=readonly::store=manifests::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Astartup%20opens%20the%20committed%20source%20while%20a%20live%20replacement%20owns%20selection::operation=indexeddb.database.transaction::mode=readwrite::store=manifests::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Astartup%20opens%20the%20committed%20source%20while%20a%20live%20replacement%20owns%20selection::operation=indexeddb.factory.enumerate-databases::mode=-::store=-::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Astartup%20opens%20the%20committed%20source%20while%20a%20live%20replacement%20owns%20selection::operation=indexeddb.factory.open::mode=-::store=-::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Astartup%20opens%20the%20committed%20source%20while%20a%20live%20replacement%20owns%20selection::operation=indexeddb.factory.open::mode=-::store=-::occurrence=2",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Astartup%20opens%20the%20committed%20source%20while%20a%20live%20replacement%20owns%20selection::operation=indexeddb.factory.open::mode=-::store=-::occurrence=3",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Astartup%20opens%20the%20committed%20source%20while%20a%20live%20replacement%20owns%20selection::operation=indexeddb.get::mode=readonly::store=manifests::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Astartup%20opens%20the%20committed%20source%20while%20a%20live%20replacement%20owns%20selection::operation=indexeddb.put::mode=readwrite::store=manifests::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Astartup%20opens%20the%20committed%20source%20while%20a%20live%20replacement%20owns%20selection::operation=indexeddb.transaction.object-store::mode=readonly::store=manifests::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Astartup%20opens%20the%20committed%20source%20while%20a%20live%20replacement%20owns%20selection::operation=indexeddb.transaction.object-store::mode=readwrite::store=manifests::occurrence=1"
+      ],
+      "cleanupEvidence": {
+        "siteIds": [
+          "tests/e2e/startup-recovery.spec.ts::owner=hook%3AafterEach::operation=fixture.clear-indexeddb::mode=-::store=-::occurrence=1",
+          "tests/e2e/startup-recovery.spec.ts::owner=test%3Astartup%20opens%20the%20committed%20source%20while%20a%20live%20replacement%20owns%20selection::operation=fixture.playwright-context-teardown::mode=-::store=-::occurrence=1",
+          "tests/e2e/startup-recovery.spec.ts::owner=test%3Astartup%20opens%20the%20committed%20source%20while%20a%20live%20replacement%20owns%20selection::operation=indexeddb.database.close::mode=-::store=-::occurrence=1",
+          "tests/e2e/startup-recovery.spec.ts::owner=test%3Astartup%20opens%20the%20committed%20source%20while%20a%20live%20replacement%20owns%20selection::operation=indexeddb.database.close::mode=-::store=-::occurrence=2"
+        ],
+        "fixtureOwners": [],
+        "processOwned": false
+      }
+    },
+    {
+      "purpose": "legacy-fixture",
+      "mutationScope": {
+        "kind": "database-schema",
+        "targets": [
+          "one isolated active workspace database at the observed v94 schema",
+          "one settings sentinel row"
+        ]
+      },
+      "cleanupRestoreObligation": "Close both raw database handles and let afterEach delete the isolated physical workspace after the upgrade assertions.",
+      "publicUiCannotExpress": "The browser journey must construct an exact observed intermediate physical schema and sentinel row before current code opens and upgrades it.",
+      "siteIds": [
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20upgrades%20once%20and%20opens%20in%20Chromium%3Ecallback%3Aonupgradeneeded::operation=indexeddb.createIndex::mode=versionchange::store=%3Cdynamic%3E%40index%3A%3Cdynamic%3E::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20upgrades%20once%20and%20opens%20in%20Chromium%3Ecallback%3Aonupgradeneeded::operation=indexeddb.database.create-object-store::mode=versionchange::store=%3Cdynamic%3E::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20upgrades%20once%20and%20opens%20in%20Chromium::operation=indexeddb.database.close::mode=-::store=-::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20upgrades%20once%20and%20opens%20in%20Chromium::operation=indexeddb.database.close::mode=-::store=-::occurrence=2",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20upgrades%20once%20and%20opens%20in%20Chromium::operation=indexeddb.database.transaction::mode=readonly::store=settings::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20upgrades%20once%20and%20opens%20in%20Chromium::operation=indexeddb.database.transaction::mode=readwrite::store=settings::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20upgrades%20once%20and%20opens%20in%20Chromium::operation=indexeddb.factory.delete-database::mode=-::store=-::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20upgrades%20once%20and%20opens%20in%20Chromium::operation=indexeddb.factory.open::mode=-::store=-::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20upgrades%20once%20and%20opens%20in%20Chromium::operation=indexeddb.factory.open::mode=-::store=-::occurrence=2",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20upgrades%20once%20and%20opens%20in%20Chromium::operation=indexeddb.get::mode=readonly::store=settings::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20upgrades%20once%20and%20opens%20in%20Chromium::operation=indexeddb.put::mode=readwrite::store=settings::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20upgrades%20once%20and%20opens%20in%20Chromium::operation=indexeddb.transaction.object-store::mode=readonly::store=settings::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20upgrades%20once%20and%20opens%20in%20Chromium::operation=indexeddb.transaction.object-store::mode=readwrite::store=settings::occurrence=1"
+      ],
+      "cleanupEvidence": {
+        "siteIds": [
+          "tests/e2e/startup-recovery.spec.ts::owner=hook%3AafterEach::operation=fixture.clear-indexeddb::mode=-::store=-::occurrence=1",
+          "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20upgrades%20once%20and%20opens%20in%20Chromium::operation=fixture.playwright-context-teardown::mode=-::store=-::occurrence=1",
+          "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20upgrades%20once%20and%20opens%20in%20Chromium::operation=indexeddb.database.close::mode=-::store=-::occurrence=1",
+          "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20upgrades%20once%20and%20opens%20in%20Chromium::operation=indexeddb.database.close::mode=-::store=-::occurrence=2"
+        ],
+        "fixtureOwners": [],
+        "processOwned": false
+      }
+    },
+    {
+      "purpose": "fault-injection",
+      "mutationScope": {
+        "kind": "none",
+        "targets": []
+      },
+      "cleanupRestoreObligation": "Restore every instrumented IndexedDB prototype by destroying the isolated Playwright browser context after the destination budget journey.",
+      "publicUiCannotExpress": "Exact transaction and request counts require browser-prototype observation; the recorder delegates to every native operation and does not mutate durable storage.",
+      "siteIds": [
+        "tests/e2e/destination-frame-budget-recorder.ts::owner=function%3AinstallDestinationFrameBudgetRecorder::operation=indexeddb.transaction.addEventListener::mode=<dynamic>::store=%3Ctransaction-scope%3E::occurrence=1",
+        "tests/e2e/destination-frame-budget-recorder.ts::owner=function%3AinstallDestinationFrameBudgetRecorder::operation=indexeddb.transaction.addEventListener::mode=<dynamic>::store=%3Ctransaction-scope%3E::occurrence=2",
+        "tests/e2e/destination-frame-budget-recorder.ts::owner=function%3AinstallDestinationFrameBudgetRecorder::operation=indexeddb.transaction.addEventListener::mode=<dynamic>::store=%3Ctransaction-scope%3E::occurrence=3"
+      ]
+    },
+    {
+      "purpose": "fault-injection",
+      "mutationScope": {
+        "kind": "none",
+        "targets": []
+      },
+      "cleanupRestoreObligation": "Release the keep-alive read, await transaction completion, and close the exact workspace database handle on both success and failure paths.",
+      "publicUiCannotExpress": "Deterministically preempting a physical copy at one object store requires holding a readwrite IndexedDB transaction open without changing any durable row.",
+      "siteIds": [
+        "tests/e2e/helpers.ts::owner=function%3AholdIndexedDbStoreGate%3Ecallback%3Aoncomplete::operation=indexeddb.database.close::mode=-::store=-::occurrence=1",
+        "tests/e2e/helpers.ts::owner=function%3AholdIndexedDbStoreGate%3Efunction%3Afail::operation=indexeddb.database.close::mode=-::store=-::occurrence=1",
+        "tests/e2e/helpers.ts::owner=function%3AholdIndexedDbStoreGate%3Efunction%3AkeepAlive::operation=indexeddb.get::mode=readwrite::store=%3Cdynamic%3E::occurrence=1",
+        "tests/e2e/helpers.ts::owner=function%3AholdIndexedDbStoreGate::operation=indexeddb.database.transaction::mode=readwrite::store=%3Cdynamic%3E::occurrence=1",
+        "tests/e2e/helpers.ts::owner=function%3AholdIndexedDbStoreGate::operation=indexeddb.factory.open::mode=-::store=-::occurrence=1",
+        "tests/e2e/helpers.ts::owner=function%3AholdIndexedDbStoreGate::operation=indexeddb.transaction.object-store::mode=readwrite::store=%3Cdynamic%3E::occurrence=1"
+      ],
+      "cleanupEvidence": {
+        "siteIds": [
+          "tests/e2e/helpers.ts::owner=function%3AholdIndexedDbStoreGate%3Ecallback%3Aoncomplete::operation=indexeddb.database.close::mode=-::store=-::occurrence=1",
+          "tests/e2e/helpers.ts::owner=function%3AholdIndexedDbStoreGate%3Efunction%3Afail::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+        ],
+        "fixtureOwners": [],
+        "processOwned": false
+      }
+    },
+    {
+      "purpose": "read-only-assertion",
+      "mutationScope": {
+        "kind": "none",
+        "targets": []
+      },
+      "cleanupRestoreObligation": "Use one readonly control-database transaction, close its handle, and leave workspace manifests, compaction state, and physical databases unchanged.",
+      "publicUiCannotExpress": "The compaction claim revisions, physical source database identity, and pending slot-switch journal are intentionally absent from the public UI.",
+      "siteIds": [
+        "tests/e2e/storage-reclamation.spec.ts::owner=function%3AreadWorkspaceControlSnapshot::operation=indexeddb.database.close::mode=-::store=-::occurrence=1",
+        "tests/e2e/storage-reclamation.spec.ts::owner=function%3AreadWorkspaceControlSnapshot::operation=indexeddb.database.transaction::mode=readonly::store=manifests%2BcompactionStates::occurrence=1",
+        "tests/e2e/storage-reclamation.spec.ts::owner=function%3AreadWorkspaceControlSnapshot::operation=indexeddb.factory.enumerate-databases::mode=-::store=-::occurrence=1",
+        "tests/e2e/storage-reclamation.spec.ts::owner=function%3AreadWorkspaceControlSnapshot::operation=indexeddb.factory.open::mode=-::store=-::occurrence=1",
+        "tests/e2e/storage-reclamation.spec.ts::owner=function%3AreadWorkspaceControlSnapshot::operation=indexeddb.get::mode=readonly::store=compactionStates::occurrence=1",
+        "tests/e2e/storage-reclamation.spec.ts::owner=function%3AreadWorkspaceControlSnapshot::operation=indexeddb.get::mode=readonly::store=compactionStates::occurrence=2",
+        "tests/e2e/storage-reclamation.spec.ts::owner=function%3AreadWorkspaceControlSnapshot::operation=indexeddb.get::mode=readonly::store=manifests::occurrence=1",
+        "tests/e2e/storage-reclamation.spec.ts::owner=function%3AreadWorkspaceControlSnapshot::operation=indexeddb.transaction.object-store::mode=readonly::store=compactionStates::occurrence=1",
+        "tests/e2e/storage-reclamation.spec.ts::owner=function%3AreadWorkspaceControlSnapshot::operation=indexeddb.transaction.object-store::mode=readonly::store=manifests::occurrence=1"
+      ],
+      "cleanupEvidence": {
+        "siteIds": [
+          "tests/e2e/storage-reclamation.spec.ts::owner=function%3AreadWorkspaceControlSnapshot::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+        ],
+        "fixtureOwners": [],
+        "processOwned": false
+      }
+    },
+    {
+      "purpose": "read-only-assertion",
+      "mutationScope": {
+        "kind": "none",
+        "targets": []
+      },
+      "cleanupRestoreObligation": "Use a readonly streamLeases transaction, close the opened IndexedDB handle, and leave all durable browser state unchanged.",
+      "publicUiCannotExpress": "The ownership proof requires the exact persisted lease phase and owner identity, which the public UI deliberately summarizes.",
+      "siteIds": [
+        "tests/e2e/stream-ownership-admission.spec.ts::owner=function%3AreadLeaseState::operation=indexeddb.factory.open::mode=-::store=-::occurrence=1",
+        "tests/e2e/stream-ownership-admission.spec.ts::owner=function%3AreadLeaseState::operation=indexeddb.database.transaction::mode=readonly::store=streamLeases::occurrence=1",
+        "tests/e2e/stream-ownership-admission.spec.ts::owner=function%3AreadLeaseState::operation=indexeddb.transaction.object-store::mode=readonly::store=streamLeases::occurrence=1",
+        "tests/e2e/stream-ownership-admission.spec.ts::owner=function%3AreadLeaseState::operation=indexeddb.getAll::mode=readonly::store=streamLeases::occurrence=1",
+        "tests/e2e/stream-ownership-admission.spec.ts::owner=function%3AreadLeaseState::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+      ],
+      "cleanupEvidence": {
+        "siteIds": [
+          "tests/e2e/stream-ownership-admission.spec.ts::owner=function%3AreadLeaseState::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+        ],
+        "fixtureOwners": [],
+        "processOwned": false
+      }
+    },
+    {
+      "purpose": "read-only-assertion",
+      "mutationScope": {
+        "kind": "none",
+        "targets": []
+      },
+      "cleanupRestoreObligation": "Read browser quota estimates as attached telemetry only and leave every origin storage namespace unchanged.",
+      "publicUiCannotExpress": "The public storage UI projects logical live and reclaimable bytes, while origin-wide browser quota estimates are nondeterministic diagnostic telemetry.",
+      "siteIds": [
+        "tests/e2e/storage-reclamation.spec.ts::owner=test%3Anormal%20use%20retries%20real%20compaction%20debt%20and%20preserves%20two-tab%20work%20across%20the%20slot%20switch::operation=storage-manager.estimate::mode=-::store=%3Corigin%3E::occurrence=1",
+        "tests/e2e/storage-reclamation.spec.ts::owner=test%3Anormal%20use%20retries%20real%20compaction%20debt%20and%20preserves%20two-tab%20work%20across%20the%20slot%20switch::operation=storage-manager.estimate::mode=-::store=%3Corigin%3E::occurrence=2",
+        "tests/e2e/storage-reclamation.spec.ts::owner=test%3Anormal%20use%20retries%20real%20compaction%20debt%20and%20preserves%20two-tab%20work%20across%20the%20slot%20switch::operation=storage-manager.estimate::mode=-::store=%3Corigin%3E::occurrence=3"
+      ]
+    },
+    {
+      "purpose": "read-only-assertion",
+      "mutationScope": {
+        "kind": "none",
+        "targets": []
+      },
+      "cleanupRestoreObligation": "Use readonly transactions, close every opened IndexedDB handle, and leave all durable browser state unchanged.",
+      "publicUiCannotExpress": "The assertion requires exact persisted rows, physical workspace identity, or transaction state that the public UI deliberately projects, virtualizes, or omits.",
+      "siteIds": [
+        "tests/e2e/advanced-generation-routing.spec.ts::owner=function%3AwaitForProviderOrder::operation=indexeddb.factory.open::mode=-::store=-::occurrence=1",
+        "tests/e2e/advanced-generation-routing.spec.ts::owner=function%3AwaitForProviderOrder::operation=indexeddb.database.transaction::mode=readonly::store=chats::occurrence=1",
+        "tests/e2e/advanced-generation-routing.spec.ts::owner=function%3AwaitForProviderOrder::operation=indexeddb.get::mode=readonly::store=chats::occurrence=1",
+        "tests/e2e/advanced-generation-routing.spec.ts::owner=function%3AwaitForProviderOrder::operation=indexeddb.transaction.object-store::mode=readonly::store=chats::occurrence=1",
+        "tests/e2e/advanced-generation-routing.spec.ts::owner=function%3AwaitForProviderOrder::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+      ],
+      "cleanupEvidence": {
+        "siteIds": [
+          "tests/e2e/advanced-generation-routing.spec.ts::owner=function%3AwaitForProviderOrder::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+        ],
+        "fixtureOwners": [],
+        "processOwned": false
+      }
+    },
+    {
+      "purpose": "read-only-assertion",
+      "mutationScope": {
+        "kind": "none",
+        "targets": []
+      },
+      "cleanupRestoreObligation": "Use readonly transactions, close every opened IndexedDB handle, and leave all durable browser state unchanged.",
+      "publicUiCannotExpress": "The assertion requires exact persisted rows, physical workspace identity, or transaction state that the public UI deliberately projects, virtualizes, or omits.",
+      "siteIds": [
+        "tests/e2e/branch-tree.spec.ts::owner=function%3AreadStoredMessage::operation=indexeddb.factory.open::mode=-::store=-::occurrence=1",
+        "tests/e2e/branch-tree.spec.ts::owner=function%3AreadStoredMessage::operation=indexeddb.database.transaction::mode=readonly::store=messages%2BmessageBodies::occurrence=1",
+        "tests/e2e/branch-tree.spec.ts::owner=function%3AreadStoredMessage::operation=indexeddb.get::mode=readonly::store=messages::occurrence=1",
+        "tests/e2e/branch-tree.spec.ts::owner=function%3AreadStoredMessage::operation=indexeddb.transaction.object-store::mode=readonly::store=messages::occurrence=1",
+        "tests/e2e/branch-tree.spec.ts::owner=function%3AreadStoredMessage::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+      ],
+      "cleanupEvidence": {
+        "siteIds": [
+          "tests/e2e/branch-tree.spec.ts::owner=function%3AreadStoredMessage::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+        ],
+        "fixtureOwners": [],
+        "processOwned": false
+      }
+    },
+    {
+      "purpose": "read-only-assertion",
+      "mutationScope": {
+        "kind": "none",
+        "targets": []
+      },
+      "cleanupRestoreObligation": "Use readonly transactions, close every opened IndexedDB handle, and leave all durable browser state unchanged.",
+      "publicUiCannotExpress": "The assertion requires exact persisted rows, physical workspace identity, or transaction state that the public UI deliberately projects, virtualizes, or omits.",
+      "siteIds": [
+        "tests/e2e/branch-tree.spec.ts::owner=function%3AreadStoredMessage%3Ecallback%3Aonsuccess::operation=indexeddb.get::mode=readonly::store=messageBodies::occurrence=1",
+        "tests/e2e/branch-tree.spec.ts::owner=function%3AreadStoredMessage%3Ecallback%3Aonsuccess::operation=indexeddb.transaction.object-store::mode=readonly::store=messageBodies::occurrence=1"
+      ]
+    },
+    {
+      "purpose": "read-only-assertion",
+      "mutationScope": {
+        "kind": "none",
+        "targets": []
+      },
+      "cleanupRestoreObligation": "Use readonly transactions, close every opened IndexedDB handle, and leave all durable browser state unchanged.",
+      "publicUiCannotExpress": "The assertion requires exact persisted rows, physical workspace identity, or transaction state that the public UI deliberately projects, virtualizes, or omits.",
+      "siteIds": [
+        "tests/e2e/branch-tree.spec.ts::owner=test%3Aevery%20leaf%20exposes%20an%20append%20target%20that%20inserts%20a%20child%20after%20it::operation=indexeddb.factory.open::mode=-::store=-::occurrence=1",
+        "tests/e2e/branch-tree.spec.ts::owner=test%3Aevery%20leaf%20exposes%20an%20append%20target%20that%20inserts%20a%20child%20after%20it::operation=indexeddb.database.transaction::mode=readonly::store=messages::occurrence=1",
+        "tests/e2e/branch-tree.spec.ts::owner=test%3Aevery%20leaf%20exposes%20an%20append%20target%20that%20inserts%20a%20child%20after%20it::operation=indexeddb.getAll::mode=readonly::store=messages::occurrence=1",
+        "tests/e2e/branch-tree.spec.ts::owner=test%3Aevery%20leaf%20exposes%20an%20append%20target%20that%20inserts%20a%20child%20after%20it::operation=indexeddb.transaction.object-store::mode=readonly::store=messages::occurrence=1",
+        "tests/e2e/branch-tree.spec.ts::owner=test%3Aevery%20leaf%20exposes%20an%20append%20target%20that%20inserts%20a%20child%20after%20it::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+      ],
+      "cleanupEvidence": {
+        "siteIds": [
+          "tests/e2e/branch-tree.spec.ts::owner=test%3Aevery%20leaf%20exposes%20an%20append%20target%20that%20inserts%20a%20child%20after%20it::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+        ],
+        "fixtureOwners": [],
+        "processOwned": false
+      }
+    },
+    {
+      "purpose": "read-only-assertion",
+      "mutationScope": {
+        "kind": "none",
+        "targets": []
+      },
+      "cleanupRestoreObligation": "Use readonly transactions, close every opened IndexedDB handle, and leave all durable browser state unchanged.",
+      "publicUiCannotExpress": "The assertion requires exact persisted rows, physical workspace identity, or transaction state that the public UI deliberately projects, virtualizes, or omits.",
+      "siteIds": [
+        "tests/e2e/branch-tree.spec.ts::owner=test%3Ashared%20and%20child%20connector%20targets%20remain%20distinct%20and%20shared%20insertion%20moves%20all%20children::operation=indexeddb.factory.open::mode=-::store=-::occurrence=1",
+        "tests/e2e/branch-tree.spec.ts::owner=test%3Ashared%20and%20child%20connector%20targets%20remain%20distinct%20and%20shared%20insertion%20moves%20all%20children::operation=indexeddb.database.transaction::mode=readonly::store=messages::occurrence=1",
+        "tests/e2e/branch-tree.spec.ts::owner=test%3Ashared%20and%20child%20connector%20targets%20remain%20distinct%20and%20shared%20insertion%20moves%20all%20children::operation=indexeddb.getAll::mode=readonly::store=messages::occurrence=1",
+        "tests/e2e/branch-tree.spec.ts::owner=test%3Ashared%20and%20child%20connector%20targets%20remain%20distinct%20and%20shared%20insertion%20moves%20all%20children::operation=indexeddb.transaction.object-store::mode=readonly::store=messages::occurrence=1",
+        "tests/e2e/branch-tree.spec.ts::owner=test%3Ashared%20and%20child%20connector%20targets%20remain%20distinct%20and%20shared%20insertion%20moves%20all%20children::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+      ],
+      "cleanupEvidence": {
+        "siteIds": [
+          "tests/e2e/branch-tree.spec.ts::owner=test%3Ashared%20and%20child%20connector%20targets%20remain%20distinct%20and%20shared%20insertion%20moves%20all%20children::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+        ],
+        "fixtureOwners": [],
+        "processOwned": false
+      }
+    },
+    {
+      "purpose": "read-only-assertion",
+      "mutationScope": {
+        "kind": "none",
+        "targets": []
+      },
+      "cleanupRestoreObligation": "Use readonly transactions, close every opened IndexedDB handle, and leave all durable browser state unchanged.",
+      "publicUiCannotExpress": "The assertion requires exact persisted rows, physical workspace identity, or transaction state that the public UI deliberately projects, virtualizes, or omits.",
+      "siteIds": [
+        "tests/e2e/composer.spec.ts::owner=test%3Aa%20successful%20send%20stays%20cleared%20after%20leaving%20and%20returning%20to%20the%20chat::operation=web-storage.getItem::mode=-::store=sessionStorage::occurrence=1",
+        "tests/e2e/composer.spec.ts::owner=test%3Aa%20successful%20send%20stays%20cleared%20after%20leaving%20and%20returning%20to%20the%20chat::operation=web-storage.getItem::mode=-::store=sessionStorage::occurrence=2"
+      ]
+    },
+    {
+      "purpose": "read-only-assertion",
+      "mutationScope": {
+        "kind": "none",
+        "targets": []
+      },
+      "cleanupRestoreObligation": "Use readonly transactions, close every opened IndexedDB handle, and leave all durable browser state unchanged.",
+      "publicUiCannotExpress": "The assertion requires exact persisted rows, physical workspace identity, or transaction state that the public UI deliberately projects, virtualizes, or omits.",
+      "siteIds": [
+        "tests/e2e/concurrent-ops.spec.ts::owner=test%3Atwo%20tabs%20streaming%20different%20chats%20run%20in%20parallel%20without%20aborting%20each%20other::operation=indexeddb.factory.open::mode=-::store=-::occurrence=1",
+        "tests/e2e/concurrent-ops.spec.ts::owner=test%3Atwo%20tabs%20streaming%20different%20chats%20run%20in%20parallel%20without%20aborting%20each%20other::operation=indexeddb.database.transaction::mode=readonly::store=chats::occurrence=1",
+        "tests/e2e/concurrent-ops.spec.ts::owner=test%3Atwo%20tabs%20streaming%20different%20chats%20run%20in%20parallel%20without%20aborting%20each%20other::operation=indexeddb.count::mode=readonly::store=chats::occurrence=1",
+        "tests/e2e/concurrent-ops.spec.ts::owner=test%3Atwo%20tabs%20streaming%20different%20chats%20run%20in%20parallel%20without%20aborting%20each%20other::operation=indexeddb.transaction.object-store::mode=readonly::store=chats::occurrence=1",
+        "tests/e2e/concurrent-ops.spec.ts::owner=test%3Atwo%20tabs%20streaming%20different%20chats%20run%20in%20parallel%20without%20aborting%20each%20other::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+      ],
+      "cleanupEvidence": {
+        "siteIds": [
+          "tests/e2e/concurrent-ops.spec.ts::owner=test%3Atwo%20tabs%20streaming%20different%20chats%20run%20in%20parallel%20without%20aborting%20each%20other::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+        ],
+        "fixtureOwners": [],
+        "processOwned": false
+      }
+    },
+    {
+      "purpose": "fault-injection",
+      "mutationScope": {
+        "kind": "stores",
+        "targets": ["generation metadata on one assistant messages row"]
+      },
+      "cleanupRestoreObligation": "Complete the fenced write, close the database, reload to observe the corruption, and let Playwright test-context teardown discard the corrupted workspace after the assertions.",
+      "publicUiCannotExpress": "The public UI validates generation metadata, so only an out-of-band physical write can exercise the row-level render error boundary.",
+      "siteIds": [
+        "tests/e2e/error-boundary.spec.ts::owner=test%3Aa%20single%20crashed%20Message%20renders%20a%20replacement%3B%20peers%20remain%20interactive::operation=indexeddb.factory.open::mode=-::store=-::occurrence=1",
+        "tests/e2e/error-boundary.spec.ts::owner=test%3Aa%20single%20crashed%20Message%20renders%20a%20replacement%3B%20peers%20remain%20interactive::operation=indexeddb.database.transaction::mode=readwrite::store=messages::occurrence=1",
+        "tests/e2e/error-boundary.spec.ts::owner=test%3Aa%20single%20crashed%20Message%20renders%20a%20replacement%3B%20peers%20remain%20interactive::operation=indexeddb.object-store.index::mode=readwrite::store=messages%40index%3AchatId::occurrence=1",
+        "tests/e2e/error-boundary.spec.ts::owner=test%3Aa%20single%20crashed%20Message%20renders%20a%20replacement%3B%20peers%20remain%20interactive::operation=indexeddb.transaction.object-store::mode=readwrite::store=messages::occurrence=1",
+        "tests/e2e/error-boundary.spec.ts::owner=test%3Aa%20single%20crashed%20Message%20renders%20a%20replacement%3B%20peers%20remain%20interactive::operation=indexeddb.openCursor::mode=readwrite::store=messages%40index%3AchatId::occurrence=1",
+        "tests/e2e/error-boundary.spec.ts::owner=test%3Aa%20single%20crashed%20Message%20renders%20a%20replacement%3B%20peers%20remain%20interactive%3Ecallback%3Aonsuccess::operation=indexeddb.cursor.update::mode=-::store=%3Ccursor-source%3E::occurrence=1",
+        "tests/e2e/error-boundary.spec.ts::owner=test%3Aa%20single%20crashed%20Message%20renders%20a%20replacement%3B%20peers%20remain%20interactive%3Ecallback%3Aonsuccess::operation=indexeddb.cursor.continue::mode=-::store=%3Ccursor-source%3E::occurrence=1",
+        "tests/e2e/error-boundary.spec.ts::owner=test%3Aa%20single%20crashed%20Message%20renders%20a%20replacement%3B%20peers%20remain%20interactive::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+      ],
+      "cleanupEvidence": {
+        "siteIds": [
+          "tests/e2e/error-boundary.spec.ts::owner=test%3Aa%20single%20crashed%20Message%20renders%20a%20replacement%3B%20peers%20remain%20interactive::operation=fixture.page.reload::mode=-::store=-::occurrence=1",
+          "tests/e2e/error-boundary.spec.ts::owner=test%3Aa%20single%20crashed%20Message%20renders%20a%20replacement%3B%20peers%20remain%20interactive::operation=fixture.playwright-context-teardown::mode=-::store=-::occurrence=1",
+          "tests/e2e/error-boundary.spec.ts::owner=test%3Aa%20single%20crashed%20Message%20renders%20a%20replacement%3B%20peers%20remain%20interactive::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+        ],
+        "fixtureOwners": [],
+        "processOwned": false
+      }
+    },
+    {
+      "purpose": "read-only-assertion",
+      "mutationScope": {
+        "kind": "none",
+        "targets": []
+      },
+      "cleanupRestoreObligation": "Use readonly transactions, close every opened IndexedDB handle, and leave all durable browser state unchanged.",
+      "publicUiCannotExpress": "The assertion requires exact persisted rows, physical workspace identity, or transaction state that the public UI deliberately projects, virtualizes, or omits.",
+      "siteIds": [
+        "tests/e2e/first-run-seed.spec.ts::owner=test%3Asubmitting%20the%20connection-setup%20modal%20seeds%20a%20profile%20%2B%20preset%20and%20moves%20editing%20to%20the%20title%20icon::operation=indexeddb.factory.open::mode=-::store=-::occurrence=1",
+        "tests/e2e/first-run-seed.spec.ts::owner=test%3Asubmitting%20the%20connection-setup%20modal%20seeds%20a%20profile%20%2B%20preset%20and%20moves%20editing%20to%20the%20title%20icon::operation=indexeddb.database.transaction::mode=readonly::store=%3Cdynamic%3E::occurrence=1",
+        "tests/e2e/first-run-seed.spec.ts::owner=test%3Asubmitting%20the%20connection-setup%20modal%20seeds%20a%20profile%20%2B%20preset%20and%20moves%20editing%20to%20the%20title%20icon::operation=indexeddb.count::mode=readonly::store=%3Cdynamic%3E::occurrence=1",
+        "tests/e2e/first-run-seed.spec.ts::owner=test%3Asubmitting%20the%20connection-setup%20modal%20seeds%20a%20profile%20%2B%20preset%20and%20moves%20editing%20to%20the%20title%20icon::operation=indexeddb.transaction.object-store::mode=readonly::store=%3Cdynamic%3E::occurrence=1",
+        "tests/e2e/first-run-seed.spec.ts::owner=test%3Asubmitting%20the%20connection-setup%20modal%20seeds%20a%20profile%20%2B%20preset%20and%20moves%20editing%20to%20the%20title%20icon::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+      ],
+      "cleanupEvidence": {
+        "siteIds": [
+          "tests/e2e/first-run-seed.spec.ts::owner=test%3Asubmitting%20the%20connection-setup%20modal%20seeds%20a%20profile%20%2B%20preset%20and%20moves%20editing%20to%20the%20title%20icon::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+        ],
+        "fixtureOwners": [],
+        "processOwned": false
+      }
+    },
+    {
+      "purpose": "read-only-assertion",
+      "mutationScope": {
+        "kind": "none",
+        "targets": []
+      },
+      "cleanupRestoreObligation": "Use readonly transactions, close every opened IndexedDB handle, and leave all durable browser state unchanged.",
+      "publicUiCannotExpress": "The assertion requires exact persisted rows, physical workspace identity, or transaction state that the public UI deliberately projects, virtualizes, or omits.",
+      "siteIds": [
+        "tests/e2e/first-run-seed.spec.ts::owner=test%3Awhitespace-only%20key%20keeps%20submit%20disabled%3B%20trim%20happens%20on%20save::operation=indexeddb.factory.open::mode=-::store=-::occurrence=1",
+        "tests/e2e/first-run-seed.spec.ts::owner=test%3Awhitespace-only%20key%20keeps%20submit%20disabled%3B%20trim%20happens%20on%20save::operation=indexeddb.database.transaction::mode=readonly::store=keys::occurrence=1",
+        "tests/e2e/first-run-seed.spec.ts::owner=test%3Awhitespace-only%20key%20keeps%20submit%20disabled%3B%20trim%20happens%20on%20save::operation=indexeddb.getAll::mode=readonly::store=keys::occurrence=1",
+        "tests/e2e/first-run-seed.spec.ts::owner=test%3Awhitespace-only%20key%20keeps%20submit%20disabled%3B%20trim%20happens%20on%20save::operation=indexeddb.transaction.object-store::mode=readonly::store=keys::occurrence=1",
+        "tests/e2e/first-run-seed.spec.ts::owner=test%3Awhitespace-only%20key%20keeps%20submit%20disabled%3B%20trim%20happens%20on%20save::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+      ],
+      "cleanupEvidence": {
+        "siteIds": [
+          "tests/e2e/first-run-seed.spec.ts::owner=test%3Awhitespace-only%20key%20keeps%20submit%20disabled%3B%20trim%20happens%20on%20save::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+        ],
+        "fixtureOwners": [],
+        "processOwned": false
+      }
+    },
+    {
+      "purpose": "reset",
+      "mutationScope": {
+        "kind": "web-storage",
+        "targets": ["localStorage (all keys)", "sessionStorage (all keys)"]
+      },
+      "cleanupRestoreObligation": "These calls are the pre-test cleanup itself; the application recreates only state explicitly seeded by the test.",
+      "publicUiCannotExpress": "Isolation must clear per-tab and origin Web Storage before the application mounts, when no public UI is available.",
+      "siteIds": [
+        "tests/e2e/focus-mode-layout.spec.ts::owner=hook%3AbeforeEach::operation=web-storage.clear::mode=-::store=sessionStorage::occurrence=1",
+        "tests/e2e/focus-mode-layout.spec.ts::owner=hook%3AbeforeEach::operation=web-storage.clear::mode=-::store=localStorage::occurrence=1"
+      ],
+      "cleanupEvidence": {
+        "siteIds": [
+          "tests/e2e/focus-mode-layout.spec.ts::owner=hook%3AbeforeEach::operation=fixture.clear-indexeddb::mode=-::store=-::occurrence=1",
+          "tests/e2e/focus-mode-layout.spec.ts::owner=hook%3AbeforeEach::operation=web-storage.clear::mode=-::store=localStorage::occurrence=1",
+          "tests/e2e/focus-mode-layout.spec.ts::owner=hook%3AbeforeEach::operation=web-storage.clear::mode=-::store=sessionStorage::occurrence=1"
+        ],
+        "fixtureOwners": [],
+        "processOwned": false
+      }
+    },
+    {
+      "purpose": "read-only-assertion",
+      "mutationScope": {
+        "kind": "none",
+        "targets": []
+      },
+      "cleanupRestoreObligation": "Use readonly transactions, close every opened IndexedDB handle, and leave all durable browser state unchanged.",
+      "publicUiCannotExpress": "The assertion requires exact persisted rows, physical workspace identity, or transaction state that the public UI deliberately projects, virtualizes, or omits.",
+      "siteIds": [
+        "tests/e2e/helpers.ts::owner=function%3AactiveWorkspaceDatabaseName::operation=indexeddb.factory.enumerate-databases::mode=-::store=-::occurrence=1",
+        "tests/e2e/helpers.ts::owner=function%3AactiveWorkspaceDatabaseName::operation=indexeddb.factory.open::mode=-::store=-::occurrence=1",
+        "tests/e2e/helpers.ts::owner=function%3AactiveWorkspaceDatabaseName::operation=indexeddb.get::mode=readonly::store=manifests::occurrence=1",
+        "tests/e2e/helpers.ts::owner=function%3AactiveWorkspaceDatabaseName::operation=indexeddb.transaction.object-store::mode=readonly::store=manifests::occurrence=1",
+        "tests/e2e/helpers.ts::owner=function%3AactiveWorkspaceDatabaseName::operation=indexeddb.database.transaction::mode=readonly::store=manifests::occurrence=1",
+        "tests/e2e/helpers.ts::owner=function%3AactiveWorkspaceDatabaseName::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+      ],
+      "cleanupEvidence": {
+        "siteIds": [
+          "tests/e2e/helpers.ts::owner=function%3AactiveWorkspaceDatabaseName::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+        ],
+        "fixtureOwners": [],
+        "processOwned": false
+      }
+    },
+    {
+      "purpose": "reset",
+      "mutationScope": {
+        "kind": "origin-storage",
+        "targets": [
+          "localStorage (all keys)",
+          "sessionStorage (all keys)",
+          "IndexedDB:natter-control",
+          "IndexedDB:known and enumerated workspace databases"
+        ]
+      },
+      "cleanupRestoreObligation": "This helper is the reset boundary; it must wait for every database deletion and then navigate to a newly booted application root.",
+      "publicUiCannotExpress": "E2E setup must remove every physical workspace slot even when the application cannot boot far enough to expose Clear all.",
+      "siteIds": [
+        "tests/e2e/helpers.ts::owner=function%3AclearIndexedDb::operation=web-storage.clear::mode=-::store=localStorage::occurrence=1",
+        "tests/e2e/helpers.ts::owner=function%3AclearIndexedDb::operation=web-storage.clear::mode=-::store=sessionStorage::occurrence=1",
+        "tests/e2e/helpers.ts::owner=function%3AclearIndexedDb::operation=indexeddb.factory.enumerate-databases::mode=-::store=-::occurrence=1",
+        "tests/e2e/helpers.ts::owner=function%3AclearIndexedDb::operation=indexeddb.factory.delete-database::mode=-::store=-::occurrence=1"
+      ],
+      "cleanupEvidence": {
+        "siteIds": [
+          "tests/e2e/helpers.ts::owner=function%3AclearIndexedDb::operation=web-storage.clear::mode=-::store=localStorage::occurrence=1",
+          "tests/e2e/helpers.ts::owner=function%3AclearIndexedDb::operation=web-storage.clear::mode=-::store=sessionStorage::occurrence=1",
+          "tests/e2e/helpers.ts::owner=function%3AclearIndexedDb::operation=indexeddb.factory.delete-database::mode=-::store=-::occurrence=1"
+        ],
+        "fixtureOwners": [],
+        "processOwned": false
+      }
+    },
+    {
+      "purpose": "read-only-assertion",
+      "mutationScope": {
+        "kind": "none",
+        "targets": []
+      },
+      "cleanupRestoreObligation": "Use readonly transactions, close every opened IndexedDB handle, and leave all durable browser state unchanged.",
+      "publicUiCannotExpress": "The assertion requires exact persisted rows, physical workspace identity, or transaction state that the public UI deliberately projects, virtualizes, or omits.",
+      "siteIds": [
+        "tests/e2e/helpers.ts::owner=function%3AfirstChatId::operation=indexeddb.factory.open::mode=-::store=-::occurrence=1",
+        "tests/e2e/helpers.ts::owner=function%3AfirstChatId::operation=indexeddb.database.transaction::mode=readonly::store=chats::occurrence=1",
+        "tests/e2e/helpers.ts::owner=function%3AfirstChatId::operation=indexeddb.transaction.object-store::mode=readonly::store=chats::occurrence=1",
+        "tests/e2e/helpers.ts::owner=function%3AfirstChatId::operation=indexeddb.getAll::mode=readonly::store=chats::occurrence=1",
+        "tests/e2e/helpers.ts::owner=function%3AfirstChatId::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+      ],
+      "cleanupEvidence": {
+        "siteIds": [
+          "tests/e2e/helpers.ts::owner=function%3AfirstChatId::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+        ],
+        "fixtureOwners": [],
+        "processOwned": false
+      }
+    },
+    {
+      "purpose": "legacy-fixture",
+      "mutationScope": {
+        "kind": "stores",
+        "targets": ["all stores present in the supplied legacy IndexedDB dump"]
+      },
+      "cleanupRestoreObligation": "The transaction must clear and repopulate atomically, close the handle, reload after import, and let Playwright test-context teardown discard the imported workspace.",
+      "publicUiCannotExpress": "A physical historical IndexedDB dump is below the portable public import format and must reproduce exact legacy rows for recovery coverage.",
+      "siteIds": [
+        "tests/e2e/helpers.ts::owner=function%3AimportIndexedDbDump::operation=indexeddb.factory.open::mode=-::store=-::occurrence=1",
+        "tests/e2e/helpers.ts::owner=function%3AimportIndexedDbDump::operation=indexeddb.database.enumerate-stores::mode=-::store=%3Cdatabase%3E::occurrence=1",
+        "tests/e2e/helpers.ts::owner=function%3AimportIndexedDbDump::operation=indexeddb.database.transaction::mode=readwrite::store=%3Cdynamic%3E::occurrence=1",
+        "tests/e2e/helpers.ts::owner=function%3AimportIndexedDbDump::operation=indexeddb.transaction.object-store::mode=readwrite::store=%3Cdynamic%3E::occurrence=1",
+        "tests/e2e/helpers.ts::owner=function%3AimportIndexedDbDump::operation=indexeddb.clear::mode=readwrite::store=%3Cdynamic%3E::occurrence=1",
+        "tests/e2e/helpers.ts::owner=function%3AimportIndexedDbDump::operation=indexeddb.put::mode=readwrite::store=%3Cdynamic%3E::occurrence=1",
+        "tests/e2e/helpers.ts::owner=function%3AimportIndexedDbDump::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+      ],
+      "cleanupEvidence": {
+        "siteIds": [
+          "tests/e2e/helpers.ts::owner=function%3AimportIndexedDbDump::operation=fixture.page.reload::mode=-::store=-::occurrence=1",
+          "tests/e2e/helpers.ts::owner=function%3AimportIndexedDbDump::operation=indexeddb.clear::mode=readwrite::store=%3Cdynamic%3E::occurrence=1",
+          "tests/e2e/helpers.ts::owner=function%3AimportIndexedDbDump::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+        ],
+        "fixtureOwners": [
+          "tests/e2e/indexeddb-dump-provider-picker.spec.ts::owner=test%3Arestored%20IndexedDB%20dump%20can%20check%20the%20exact%20Anthropic%20provider%20row"
+        ],
+        "processOwned": false
+      }
+    },
+    {
+      "purpose": "read-only-assertion",
+      "mutationScope": {
+        "kind": "none",
+        "targets": []
+      },
+      "cleanupRestoreObligation": "Use readonly transactions, close every opened IndexedDB handle, and leave all durable browser state unchanged.",
+      "publicUiCannotExpress": "The assertion requires exact persisted rows, physical workspace identity, or transaction state that the public UI deliberately projects, virtualizes, or omits.",
+      "siteIds": [
+        "tests/e2e/helpers.ts::owner=function%3AreadChatRow::operation=indexeddb.factory.open::mode=-::store=-::occurrence=1",
+        "tests/e2e/helpers.ts::owner=function%3AreadChatRow::operation=indexeddb.get::mode=readonly::store=chats::occurrence=1",
+        "tests/e2e/helpers.ts::owner=function%3AreadChatRow::operation=indexeddb.transaction.object-store::mode=readonly::store=chats::occurrence=1",
+        "tests/e2e/helpers.ts::owner=function%3AreadChatRow::operation=indexeddb.database.transaction::mode=readonly::store=chats::occurrence=1",
+        "tests/e2e/helpers.ts::owner=function%3AreadChatRow::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+      ],
+      "cleanupEvidence": {
+        "siteIds": [
+          "tests/e2e/helpers.ts::owner=function%3AreadChatRow::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+        ],
+        "fixtureOwners": [],
+        "processOwned": false
+      }
+    },
+    {
+      "purpose": "read-only-assertion",
+      "mutationScope": {
+        "kind": "none",
+        "targets": []
+      },
+      "cleanupRestoreObligation": "Use readonly transactions, close every opened IndexedDB handle, and leave all durable browser state unchanged.",
+      "publicUiCannotExpress": "The assertion requires exact persisted rows, physical workspace identity, or transaction state that the public UI deliberately projects, virtualizes, or omits.",
+      "siteIds": [
+        "tests/e2e/helpers.ts::owner=function%3AreadMessages::operation=indexeddb.factory.open::mode=-::store=-::occurrence=1",
+        "tests/e2e/helpers.ts::owner=function%3AreadMessages::operation=indexeddb.database.transaction::mode=readonly::store=messages%2BmessageBodies::occurrence=1",
+        "tests/e2e/helpers.ts::owner=function%3AreadMessages::operation=indexeddb.transaction.object-store::mode=readonly::store=messages::occurrence=1",
+        "tests/e2e/helpers.ts::owner=function%3AreadMessages::operation=indexeddb.transaction.object-store::mode=readonly::store=messageBodies::occurrence=1",
+        "tests/e2e/helpers.ts::owner=function%3AreadMessages::operation=indexeddb.object-store.index::mode=readonly::store=messages%40index%3AchatId::occurrence=1",
+        "tests/e2e/helpers.ts::owner=function%3AreadMessages::operation=indexeddb.getAll::mode=readonly::store=messages%40index%3AchatId::occurrence=1",
+        "tests/e2e/helpers.ts::owner=function%3AreadMessages::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+      ],
+      "cleanupEvidence": {
+        "siteIds": [
+          "tests/e2e/helpers.ts::owner=function%3AreadMessages::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+        ],
+        "fixtureOwners": [],
+        "processOwned": false
+      }
+    },
+    {
+      "purpose": "read-only-assertion",
+      "mutationScope": {
+        "kind": "none",
+        "targets": []
+      },
+      "cleanupRestoreObligation": "Use readonly transactions, close every opened IndexedDB handle, and leave all durable browser state unchanged.",
+      "publicUiCannotExpress": "The assertion requires exact persisted rows, physical workspace identity, or transaction state that the public UI deliberately projects, virtualizes, or omits.",
+      "siteIds": [
+        "tests/e2e/helpers.ts::owner=function%3AreadMessages%3Ecallback%3Aonsuccess::operation=indexeddb.getAll::mode=readonly::store=messageBodies::occurrence=1"
+      ]
+    },
+    {
+      "purpose": "legacy-fixture",
+      "mutationScope": {
+        "kind": "none",
+        "targets": []
+      },
+      "cleanupRestoreObligation": "Close the read-only database handle; the surrounding legacy-import fixture owns reset and restoration.",
+      "publicUiCannotExpress": "The assertion must inspect exact legacy chat and preset rows after import, while the public UI intentionally exposes only normalized projections.",
+      "siteIds": [
+        "tests/e2e/indexeddb-dump-provider-picker.spec.ts::owner=function%3AlegacyProviderSettingsSummary::operation=indexeddb.factory.open::mode=-::store=-::occurrence=1",
+        "tests/e2e/indexeddb-dump-provider-picker.spec.ts::owner=function%3AlegacyProviderSettingsSummary::operation=indexeddb.database.transaction::mode=readonly::store=chats%2Bpresets::occurrence=1",
+        "tests/e2e/indexeddb-dump-provider-picker.spec.ts::owner=function%3AlegacyProviderSettingsSummary::operation=indexeddb.getAll::mode=readonly::store=chats::occurrence=1",
+        "tests/e2e/indexeddb-dump-provider-picker.spec.ts::owner=function%3AlegacyProviderSettingsSummary::operation=indexeddb.transaction.object-store::mode=readonly::store=chats::occurrence=1",
+        "tests/e2e/indexeddb-dump-provider-picker.spec.ts::owner=function%3AlegacyProviderSettingsSummary::operation=indexeddb.getAll::mode=readonly::store=presets::occurrence=1",
+        "tests/e2e/indexeddb-dump-provider-picker.spec.ts::owner=function%3AlegacyProviderSettingsSummary::operation=indexeddb.transaction.object-store::mode=readonly::store=presets::occurrence=1",
+        "tests/e2e/indexeddb-dump-provider-picker.spec.ts::owner=function%3AlegacyProviderSettingsSummary::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+      ],
+      "cleanupEvidence": {
+        "siteIds": [
+          "tests/e2e/indexeddb-dump-provider-picker.spec.ts::owner=function%3AlegacyProviderSettingsSummary::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+        ],
+        "fixtureOwners": [],
+        "processOwned": false
+      }
+    },
+    {
+      "purpose": "legacy-fixture",
+      "mutationScope": {
+        "kind": "none",
+        "targets": []
+      },
+      "cleanupRestoreObligation": "Close the control-database handle; the public import flow and standard E2E reset own all durable cleanup.",
+      "publicUiCannotExpress": "The test must identify the active physical workspace chosen after importing a historical backup; that slot mapping is intentionally not public UI.",
+      "siteIds": [
+        "tests/e2e/legacy-import-recovery.spec.ts::owner=function%3AreadWorkspaceSlotState::operation=indexeddb.factory.enumerate-databases::mode=-::store=-::occurrence=1",
+        "tests/e2e/legacy-import-recovery.spec.ts::owner=function%3AreadWorkspaceSlotState::operation=indexeddb.factory.open::mode=-::store=-::occurrence=1",
+        "tests/e2e/legacy-import-recovery.spec.ts::owner=function%3AreadWorkspaceSlotState::operation=indexeddb.get::mode=readonly::store=manifests::occurrence=1",
+        "tests/e2e/legacy-import-recovery.spec.ts::owner=function%3AreadWorkspaceSlotState::operation=indexeddb.transaction.object-store::mode=readonly::store=manifests::occurrence=1",
+        "tests/e2e/legacy-import-recovery.spec.ts::owner=function%3AreadWorkspaceSlotState::operation=indexeddb.database.transaction::mode=readonly::store=manifests::occurrence=1",
+        "tests/e2e/legacy-import-recovery.spec.ts::owner=function%3AreadWorkspaceSlotState::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+      ],
+      "cleanupEvidence": {
+        "siteIds": [
+          "tests/e2e/legacy-import-recovery.spec.ts::owner=function%3AreadWorkspaceSlotState::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+        ],
+        "fixtureOwners": [],
+        "processOwned": false
+      }
+    },
+    {
+      "purpose": "read-only-assertion",
+      "mutationScope": {
+        "kind": "none",
+        "targets": []
+      },
+      "cleanupRestoreObligation": "Observe one transaction-completion event without mutating browser storage.",
+      "publicUiCannotExpress": "Exact startup transaction-completion timing is browser instrumentation and is not a public UI surface.",
+      "siteIds": [
+        "tests/e2e/large-workspace-startup.spec.ts::owner=function%3AinstallStartupProbe::operation=indexeddb.transaction.addEventListener::mode=<dynamic>::store=%3Ctransaction-scope%3E::occurrence=1"
+      ]
+    },
+    {
+      "purpose": "legacy-fixture",
+      "mutationScope": {
+        "kind": "none",
+        "targets": []
+      },
+      "cleanupRestoreObligation": "The exact release helper closes the deliberately retained obsolete database handle before the test continues.",
+      "publicUiCannotExpress": "A historical database handle must remain open across one public import to prove blocked-version recovery behavior.",
+      "siteIds": [
+        "tests/e2e/legacy-import-recovery.spec.ts::owner=function%3AretainObsoleteWorkspaceDatabase::operation=indexeddb.factory.open::mode=-::store=-::occurrence=1",
+        "tests/e2e/legacy-import-recovery.spec.ts::owner=function%3AreleaseObsoleteWorkspaceDatabase::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+      ],
+      "cleanupEvidence": {
+        "siteIds": [
+          "tests/e2e/legacy-import-recovery.spec.ts::owner=function%3AreleaseObsoleteWorkspaceDatabase::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+        ],
+        "fixtureOwners": [
+          "tests/e2e/legacy-import-recovery.spec.ts::owner=function%3AreleaseObsoleteWorkspaceDatabase"
+        ],
+        "processOwned": true,
+        "processOwnerReason": "The test page deliberately retains this handle across import and the exact release helper closes and deletes it before the test continues."
+      }
+    },
+    {
+      "purpose": "reset",
+      "mutationScope": {
+        "kind": "web-storage",
+        "targets": ["localStorage (all keys)", "sessionStorage (all keys)"]
+      },
+      "cleanupRestoreObligation": "These calls are the pre-test cleanup itself; the application recreates only state explicitly seeded by the test.",
+      "publicUiCannotExpress": "Isolation must clear per-tab and origin Web Storage before the application mounts, when no public UI is available.",
+      "siteIds": [
+        "tests/e2e/mobile-shell.spec.ts::owner=hook%3AbeforeEach::operation=web-storage.clear::mode=-::store=sessionStorage::occurrence=1",
+        "tests/e2e/mobile-shell.spec.ts::owner=hook%3AbeforeEach::operation=web-storage.clear::mode=-::store=localStorage::occurrence=1"
+      ],
+      "cleanupEvidence": {
+        "siteIds": [
+          "tests/e2e/mobile-shell.spec.ts::owner=hook%3AbeforeEach::operation=fixture.clear-indexeddb::mode=-::store=-::occurrence=1",
+          "tests/e2e/mobile-shell.spec.ts::owner=hook%3AbeforeEach::operation=web-storage.clear::mode=-::store=localStorage::occurrence=1",
+          "tests/e2e/mobile-shell.spec.ts::owner=hook%3AbeforeEach::operation=web-storage.clear::mode=-::store=sessionStorage::occurrence=1"
+        ],
+        "fixtureOwners": [],
+        "processOwned": false
+      }
+    },
+    {
+      "purpose": "fault-injection",
+      "mutationScope": {
+        "kind": "stores",
+        "targets": ["messages orphan generation row", "messageBodies orphan placeholder row"]
+      },
+      "cleanupRestoreObligation": "Close both database handles and let Playwright test-context teardown discard the injected orphan after the recovery assertions.",
+      "publicUiCannotExpress": "The UI cannot manufacture a crash-era in-flight assistant row without a live owner; exact orphan recovery requires durable fault injection.",
+      "siteIds": [
+        "tests/e2e/orphan-recovery.spec.ts::owner=test%3Aorphan%20in-flight%20message%20is%20marked%20tab-close%20on%20next%20mount::operation=indexeddb.factory.open::mode=-::store=-::occurrence=1",
+        "tests/e2e/orphan-recovery.spec.ts::owner=test%3Aorphan%20in-flight%20message%20is%20marked%20tab-close%20on%20next%20mount::operation=indexeddb.database.transaction::mode=readonly::store=chats::occurrence=1",
+        "tests/e2e/orphan-recovery.spec.ts::owner=test%3Aorphan%20in-flight%20message%20is%20marked%20tab-close%20on%20next%20mount::operation=indexeddb.getAll::mode=readonly::store=chats::occurrence=1",
+        "tests/e2e/orphan-recovery.spec.ts::owner=test%3Aorphan%20in-flight%20message%20is%20marked%20tab-close%20on%20next%20mount::operation=indexeddb.transaction.object-store::mode=readonly::store=chats::occurrence=1",
+        "tests/e2e/orphan-recovery.spec.ts::owner=test%3Aorphan%20in-flight%20message%20is%20marked%20tab-close%20on%20next%20mount::operation=indexeddb.database.transaction::mode=readwrite::store=messages%2BmessageBodies::occurrence=1",
+        "tests/e2e/orphan-recovery.spec.ts::owner=test%3Aorphan%20in-flight%20message%20is%20marked%20tab-close%20on%20next%20mount::operation=indexeddb.put::mode=readwrite::store=messages::occurrence=1",
+        "tests/e2e/orphan-recovery.spec.ts::owner=test%3Aorphan%20in-flight%20message%20is%20marked%20tab-close%20on%20next%20mount::operation=indexeddb.transaction.object-store::mode=readwrite::store=messages::occurrence=1",
+        "tests/e2e/orphan-recovery.spec.ts::owner=test%3Aorphan%20in-flight%20message%20is%20marked%20tab-close%20on%20next%20mount::operation=indexeddb.put::mode=readwrite::store=messageBodies::occurrence=1",
+        "tests/e2e/orphan-recovery.spec.ts::owner=test%3Aorphan%20in-flight%20message%20is%20marked%20tab-close%20on%20next%20mount::operation=indexeddb.transaction.object-store::mode=readwrite::store=messageBodies::occurrence=1",
+        "tests/e2e/orphan-recovery.spec.ts::owner=test%3Aorphan%20in-flight%20message%20is%20marked%20tab-close%20on%20next%20mount::operation=indexeddb.database.close::mode=-::store=-::occurrence=1",
+        "tests/e2e/orphan-recovery.spec.ts::owner=test%3Aorphan%20in-flight%20message%20is%20marked%20tab-close%20on%20next%20mount::operation=indexeddb.factory.open::mode=-::store=-::occurrence=2",
+        "tests/e2e/orphan-recovery.spec.ts::owner=test%3Aorphan%20in-flight%20message%20is%20marked%20tab-close%20on%20next%20mount::operation=indexeddb.database.transaction::mode=readonly::store=messages::occurrence=1",
+        "tests/e2e/orphan-recovery.spec.ts::owner=test%3Aorphan%20in-flight%20message%20is%20marked%20tab-close%20on%20next%20mount::operation=indexeddb.get::mode=readonly::store=messages::occurrence=1",
+        "tests/e2e/orphan-recovery.spec.ts::owner=test%3Aorphan%20in-flight%20message%20is%20marked%20tab-close%20on%20next%20mount::operation=indexeddb.transaction.object-store::mode=readonly::store=messages::occurrence=1",
+        "tests/e2e/orphan-recovery.spec.ts::owner=test%3Aorphan%20in-flight%20message%20is%20marked%20tab-close%20on%20next%20mount::operation=indexeddb.database.close::mode=-::store=-::occurrence=2"
+      ],
+      "cleanupEvidence": {
+        "siteIds": [
+          "tests/e2e/orphan-recovery.spec.ts::owner=test%3Aorphan%20in-flight%20message%20is%20marked%20tab-close%20on%20next%20mount::operation=fixture.playwright-context-teardown::mode=-::store=-::occurrence=1",
+          "tests/e2e/orphan-recovery.spec.ts::owner=test%3Aorphan%20in-flight%20message%20is%20marked%20tab-close%20on%20next%20mount::operation=indexeddb.database.close::mode=-::store=-::occurrence=1",
+          "tests/e2e/orphan-recovery.spec.ts::owner=test%3Aorphan%20in-flight%20message%20is%20marked%20tab-close%20on%20next%20mount::operation=indexeddb.database.close::mode=-::store=-::occurrence=2"
+        ],
+        "fixtureOwners": [],
+        "processOwned": false
+      }
+    },
+    {
+      "purpose": "reset",
+      "mutationScope": {
+        "kind": "web-storage",
+        "targets": ["localStorage (all keys)", "sessionStorage (all keys)"]
+      },
+      "cleanupRestoreObligation": "These calls are the pre-test cleanup itself; the application recreates only state explicitly seeded by the test.",
+      "publicUiCannotExpress": "Isolation must clear per-tab and origin Web Storage before the application mounts, when no public UI is available.",
+      "siteIds": [
+        "tests/e2e/provider-tool-fixture-replay.spec.ts::owner=hook%3AbeforeEach::operation=web-storage.clear::mode=-::store=sessionStorage::occurrence=1",
+        "tests/e2e/provider-tool-fixture-replay.spec.ts::owner=hook%3AbeforeEach::operation=web-storage.clear::mode=-::store=localStorage::occurrence=1"
+      ],
+      "cleanupEvidence": {
+        "siteIds": [
+          "tests/e2e/provider-tool-fixture-replay.spec.ts::owner=hook%3AbeforeEach::operation=fixture.clear-indexeddb::mode=-::store=-::occurrence=1",
+          "tests/e2e/provider-tool-fixture-replay.spec.ts::owner=hook%3AbeforeEach::operation=web-storage.clear::mode=-::store=localStorage::occurrence=1",
+          "tests/e2e/provider-tool-fixture-replay.spec.ts::owner=hook%3AbeforeEach::operation=web-storage.clear::mode=-::store=sessionStorage::occurrence=1"
+        ],
+        "fixtureOwners": [],
+        "processOwned": false
+      }
+    },
+    {
+      "purpose": "read-only-assertion",
+      "mutationScope": {
+        "kind": "none",
+        "targets": []
+      },
+      "cleanupRestoreObligation": "Use readonly transactions, close every opened IndexedDB handle, and leave all durable browser state unchanged.",
+      "publicUiCannotExpress": "The assertion requires exact persisted rows, physical workspace identity, or transaction state that the public UI deliberately projects, virtualizes, or omits.",
+      "siteIds": [
+        "tests/e2e/reactive-storage-stress.spec.ts::owner=function%3AreadReactiveState::operation=indexeddb.factory.open::mode=-::store=-::occurrence=1",
+        "tests/e2e/reactive-storage-stress.spec.ts::owner=function%3AreadReactiveState::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+      ],
+      "cleanupEvidence": {
+        "siteIds": [
+          "tests/e2e/reactive-storage-stress.spec.ts::owner=function%3AreadReactiveState::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+        ],
+        "fixtureOwners": [],
+        "processOwned": false
+      }
+    },
+    {
+      "purpose": "read-only-assertion",
+      "mutationScope": {
+        "kind": "none",
+        "targets": []
+      },
+      "cleanupRestoreObligation": "Use readonly transactions, close every opened IndexedDB handle, and leave all durable browser state unchanged.",
+      "publicUiCannotExpress": "The assertion requires exact persisted rows, physical workspace identity, or transaction state that the public UI deliberately projects, virtualizes, or omits.",
+      "siteIds": [
+        "tests/e2e/reactive-storage-stress.spec.ts::owner=function%3AreadReactiveState%3Efunction%3AreadRow::operation=indexeddb.database.transaction::mode=readonly::store=%3Cdynamic%3E::occurrence=1",
+        "tests/e2e/reactive-storage-stress.spec.ts::owner=function%3AreadReactiveState%3Efunction%3AreadRow::operation=indexeddb.get::mode=readonly::store=%3Cdynamic%3E::occurrence=1",
+        "tests/e2e/reactive-storage-stress.spec.ts::owner=function%3AreadReactiveState%3Efunction%3AreadRow::operation=indexeddb.transaction.object-store::mode=readonly::store=%3Cdynamic%3E::occurrence=1"
+      ]
+    },
+    {
+      "purpose": "read-only-assertion",
+      "mutationScope": {
+        "kind": "none",
+        "targets": []
+      },
+      "cleanupRestoreObligation": "Use readonly transactions, close every opened IndexedDB handle, and leave all durable browser state unchanged.",
+      "publicUiCannotExpress": "The assertion requires exact persisted rows, physical workspace identity, or transaction state that the public UI deliberately projects, virtualizes, or omits.",
+      "siteIds": [
+        "tests/e2e/reactive-storage-stress.spec.ts::owner=function%3AreadReactiveState%3Efunction%3AreadRows::operation=indexeddb.database.transaction::mode=readonly::store=%3Cdynamic%3E::occurrence=1",
+        "tests/e2e/reactive-storage-stress.spec.ts::owner=function%3AreadReactiveState%3Efunction%3AreadRows::operation=indexeddb.getAll::mode=readonly::store=%3Cdynamic%3E%40index%3A%3Cdynamic%3E::occurrence=1",
+        "tests/e2e/reactive-storage-stress.spec.ts::owner=function%3AreadReactiveState%3Efunction%3AreadRows::operation=indexeddb.object-store.index::mode=readonly::store=%3Cdynamic%3E%40index%3A%3Cdynamic%3E::occurrence=1",
+        "tests/e2e/reactive-storage-stress.spec.ts::owner=function%3AreadReactiveState%3Efunction%3AreadRows::operation=indexeddb.transaction.object-store::mode=readonly::store=%3Cdynamic%3E::occurrence=1"
+      ]
+    },
+    {
+      "purpose": "fault-injection",
+      "mutationScope": {
+        "kind": "origin-storage",
+        "targets": [
+          "active workspace database recreated at the legacy v25 native version",
+          "messages header row with no required body row"
+        ]
+      },
+      "cleanupRestoreObligation": "Close both database handles before application boot; afterEach clearIndexedDb must remove the irreparable legacy workspace after recovery assertions.",
+      "publicUiCannotExpress": "Current commands always create a message header and body atomically, so the real v25-to-v94 irreparable migration boundary requires a legacy physical database with a missing body.",
+      "siteIds": [
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aa%20poisoned%20local%20database%20shows%20recovery%20instead%20of%20a%20blank%20root::operation=indexeddb.factory.open::mode=-::store=-::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aa%20poisoned%20local%20database%20shows%20recovery%20instead%20of%20a%20blank%20root::operation=indexeddb.database.enumerate-stores::mode=-::store=%3Cdatabase%3E::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aa%20poisoned%20local%20database%20shows%20recovery%20instead%20of%20a%20blank%20root::operation=indexeddb.database.transaction::mode=readonly::store=%3Cdynamic%3E::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aa%20poisoned%20local%20database%20shows%20recovery%20instead%20of%20a%20blank%20root::operation=indexeddb.transaction.object-store::mode=readonly::store=%3Cdynamic%3E::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aa%20poisoned%20local%20database%20shows%20recovery%20instead%20of%20a%20blank%20root::operation=indexeddb.object-store.index::mode=readonly::store=%3Cdynamic%3E%40index%3A%3Cdynamic%3E::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aa%20poisoned%20local%20database%20shows%20recovery%20instead%20of%20a%20blank%20root::operation=indexeddb.database.close::mode=-::store=-::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aa%20poisoned%20local%20database%20shows%20recovery%20instead%20of%20a%20blank%20root::operation=indexeddb.factory.delete-database::mode=-::store=-::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aa%20poisoned%20local%20database%20shows%20recovery%20instead%20of%20a%20blank%20root::operation=indexeddb.factory.open::mode=-::store=-::occurrence=2",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aa%20poisoned%20local%20database%20shows%20recovery%20instead%20of%20a%20blank%20root%3Ecallback%3Aonupgradeneeded::operation=indexeddb.database.create-object-store::mode=versionchange::store=%3Cdynamic%3E::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aa%20poisoned%20local%20database%20shows%20recovery%20instead%20of%20a%20blank%20root%3Ecallback%3Aonupgradeneeded::operation=indexeddb.createIndex::mode=versionchange::store=%3Cdynamic%3E%40index%3A%3Cdynamic%3E::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aa%20poisoned%20local%20database%20shows%20recovery%20instead%20of%20a%20blank%20root::operation=indexeddb.database.transaction::mode=readwrite::store=messages::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aa%20poisoned%20local%20database%20shows%20recovery%20instead%20of%20a%20blank%20root::operation=indexeddb.put::mode=readwrite::store=messages::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aa%20poisoned%20local%20database%20shows%20recovery%20instead%20of%20a%20blank%20root::operation=indexeddb.transaction.object-store::mode=readwrite::store=messages::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aa%20poisoned%20local%20database%20shows%20recovery%20instead%20of%20a%20blank%20root::operation=indexeddb.database.close::mode=-::store=-::occurrence=2"
+      ],
+      "cleanupEvidence": {
+        "siteIds": [
+          "tests/e2e/startup-recovery.spec.ts::owner=hook%3AafterEach::operation=fixture.clear-indexeddb::mode=-::store=-::occurrence=1",
+          "tests/e2e/startup-recovery.spec.ts::owner=test%3Aa%20poisoned%20local%20database%20shows%20recovery%20instead%20of%20a%20blank%20root::operation=fixture.playwright-context-teardown::mode=-::store=-::occurrence=1",
+          "tests/e2e/startup-recovery.spec.ts::owner=test%3Aa%20poisoned%20local%20database%20shows%20recovery%20instead%20of%20a%20blank%20root::operation=indexeddb.database.close::mode=-::store=-::occurrence=1",
+          "tests/e2e/startup-recovery.spec.ts::owner=test%3Aa%20poisoned%20local%20database%20shows%20recovery%20instead%20of%20a%20blank%20root::operation=indexeddb.database.close::mode=-::store=-::occurrence=2"
+        ],
+        "fixtureOwners": [],
+        "processOwned": false
+      }
+    },
+    {
+      "purpose": "physical-reclamation",
+      "mutationScope": {
+        "kind": "origin-storage",
+        "targets": [
+          "auxiliary natter-clear-all IndexedDB database",
+          "Cache Storage probe",
+          "localStorage and sessionStorage probe keys",
+          "OPFS probe file",
+          "Storage Bucket probe"
+        ]
+      },
+      "cleanupRestoreObligation": "The public Clear all action must remove every seeded origin resource; the test then verifies absence from both tabs before creating fresh application state.",
+      "publicUiCannotExpress": "The test must seed and enumerate browser storage namespaces the application does not otherwise use so Clear all proves physical origin-wide reclamation.",
+      "siteIds": [
+        "tests/e2e/storage-reclamation.spec.ts::owner=test%3Aclear%20all%20reloads%20into%20a%20fresh%20workspace%20that%20can%20fetch%20and%20select%20models%20again::operation=indexeddb.factory.open::mode=-::store=-::occurrence=1",
+        "tests/e2e/storage-reclamation.spec.ts::owner=test%3Aclear%20all%20reloads%20into%20a%20fresh%20workspace%20that%20can%20fetch%20and%20select%20models%20again::operation=indexeddb.database.transaction::mode=readwrite::store=rows::occurrence=1",
+        "tests/e2e/storage-reclamation.spec.ts::owner=test%3Aclear%20all%20reloads%20into%20a%20fresh%20workspace%20that%20can%20fetch%20and%20select%20models%20again::operation=indexeddb.put::mode=readwrite::store=rows::occurrence=1",
+        "tests/e2e/storage-reclamation.spec.ts::owner=test%3Aclear%20all%20reloads%20into%20a%20fresh%20workspace%20that%20can%20fetch%20and%20select%20models%20again::operation=indexeddb.transaction.object-store::mode=readwrite::store=rows::occurrence=1",
+        "tests/e2e/storage-reclamation.spec.ts::owner=test%3Aclear%20all%20reloads%20into%20a%20fresh%20workspace%20that%20can%20fetch%20and%20select%20models%20again::operation=indexeddb.database.close::mode=-::store=-::occurrence=1",
+        "tests/e2e/storage-reclamation.spec.ts::owner=test%3Aclear%20all%20reloads%20into%20a%20fresh%20workspace%20that%20can%20fetch%20and%20select%20models%20again::operation=cache-storage.open::mode=-::store=%3Corigin%3E::occurrence=1",
+        "tests/e2e/storage-reclamation.spec.ts::owner=test%3Aclear%20all%20reloads%20into%20a%20fresh%20workspace%20that%20can%20fetch%20and%20select%20models%20again::operation=cache.put::mode=-::store=%3Ccache%3E::occurrence=1",
+        "tests/e2e/storage-reclamation.spec.ts::owner=test%3Aclear%20all%20reloads%20into%20a%20fresh%20workspace%20that%20can%20fetch%20and%20select%20models%20again::operation=web-storage.setItem::mode=-::store=localStorage::occurrence=1",
+        "tests/e2e/storage-reclamation.spec.ts::owner=test%3Aclear%20all%20reloads%20into%20a%20fresh%20workspace%20that%20can%20fetch%20and%20select%20models%20again::operation=web-storage.setItem::mode=-::store=sessionStorage::occurrence=1",
+        "tests/e2e/storage-reclamation.spec.ts::owner=test%3Aclear%20all%20reloads%20into%20a%20fresh%20workspace%20that%20can%20fetch%20and%20select%20models%20again::operation=storage-manager.getDirectory::mode=-::store=%3Corigin%3E::occurrence=1",
+        "tests/e2e/storage-reclamation.spec.ts::owner=test%3Aclear%20all%20reloads%20into%20a%20fresh%20workspace%20that%20can%20fetch%20and%20select%20models%20again::operation=opfs.getFileHandle::mode=-::store=%3Corigin-root%3E::occurrence=1",
+        "tests/e2e/storage-reclamation.spec.ts::owner=test%3Aclear%20all%20reloads%20into%20a%20fresh%20workspace%20that%20can%20fetch%20and%20select%20models%20again::operation=opfs.createWritable::mode=-::store=%3Cfile%3E::occurrence=1",
+        "tests/e2e/storage-reclamation.spec.ts::owner=test%3Aclear%20all%20reloads%20into%20a%20fresh%20workspace%20that%20can%20fetch%20and%20select%20models%20again::operation=opfs.write::mode=-::store=%3Cfile%3E::occurrence=1",
+        "tests/e2e/storage-reclamation.spec.ts::owner=test%3Aclear%20all%20reloads%20into%20a%20fresh%20workspace%20that%20can%20fetch%20and%20select%20models%20again::operation=opfs.close::mode=-::store=%3Cfile%3E::occurrence=1",
+        "tests/e2e/storage-reclamation.spec.ts::owner=test%3Aclear%20all%20reloads%20into%20a%20fresh%20workspace%20that%20can%20fetch%20and%20select%20models%20again::operation=storage-buckets.open::mode=-::store=%3Corigin%3E::occurrence=1",
+        "tests/e2e/storage-reclamation.spec.ts::owner=test%3Aclear%20all%20reloads%20into%20a%20fresh%20workspace%20that%20can%20fetch%20and%20select%20models%20again::operation=storage-buckets.keys::mode=-::store=%3Corigin%3E::occurrence=1",
+        "tests/e2e/storage-reclamation.spec.ts::owner=test%3Aclear%20all%20reloads%20into%20a%20fresh%20workspace%20that%20can%20fetch%20and%20select%20models%20again::operation=indexeddb.factory.enumerate-databases::mode=-::store=-::occurrence=1",
+        "tests/e2e/storage-reclamation.spec.ts::owner=test%3Aclear%20all%20reloads%20into%20a%20fresh%20workspace%20that%20can%20fetch%20and%20select%20models%20again::operation=web-storage.setItem::mode=-::store=sessionStorage::occurrence=2",
+        "tests/e2e/storage-reclamation.spec.ts::owner=test%3Aclear%20all%20reloads%20into%20a%20fresh%20workspace%20that%20can%20fetch%20and%20select%20models%20again::operation=indexeddb.factory.enumerate-databases::mode=-::store=-::occurrence=2",
+        "tests/e2e/storage-reclamation.spec.ts::owner=test%3Aclear%20all%20reloads%20into%20a%20fresh%20workspace%20that%20can%20fetch%20and%20select%20models%20again::operation=cache-storage.keys::mode=-::store=%3Corigin%3E::occurrence=1",
+        "tests/e2e/storage-reclamation.spec.ts::owner=test%3Aclear%20all%20reloads%20into%20a%20fresh%20workspace%20that%20can%20fetch%20and%20select%20models%20again::operation=storage-manager.getDirectory::mode=-::store=%3Corigin%3E::occurrence=2",
+        "tests/e2e/storage-reclamation.spec.ts::owner=test%3Aclear%20all%20reloads%20into%20a%20fresh%20workspace%20that%20can%20fetch%20and%20select%20models%20again::operation=opfs.entries::mode=-::store=%3Corigin-root%3E::occurrence=1",
+        "tests/e2e/storage-reclamation.spec.ts::owner=test%3Aclear%20all%20reloads%20into%20a%20fresh%20workspace%20that%20can%20fetch%20and%20select%20models%20again::operation=storage-buckets.keys::mode=-::store=%3Corigin%3E::occurrence=2",
+        "tests/e2e/storage-reclamation.spec.ts::owner=test%3Aclear%20all%20reloads%20into%20a%20fresh%20workspace%20that%20can%20fetch%20and%20select%20models%20again::operation=web-storage.getItem::mode=-::store=localStorage::occurrence=1",
+        "tests/e2e/storage-reclamation.spec.ts::owner=test%3Aclear%20all%20reloads%20into%20a%20fresh%20workspace%20that%20can%20fetch%20and%20select%20models%20again::operation=web-storage.getItem::mode=-::store=sessionStorage::occurrence=1",
+        "tests/e2e/storage-reclamation.spec.ts::owner=test%3Aclear%20all%20reloads%20into%20a%20fresh%20workspace%20that%20can%20fetch%20and%20select%20models%20again::operation=web-storage.getItem::mode=-::store=sessionStorage::occurrence=2"
+      ],
+      "cleanupEvidence": {
+        "siteIds": [
+          "tests/e2e/storage-reclamation.spec.ts::owner=test%3Aclear%20all%20reloads%20into%20a%20fresh%20workspace%20that%20can%20fetch%20and%20select%20models%20again::operation=fixture.playwright-context-teardown::mode=-::store=-::occurrence=1",
+          "tests/e2e/storage-reclamation.spec.ts::owner=test%3Aclear%20all%20reloads%20into%20a%20fresh%20workspace%20that%20can%20fetch%20and%20select%20models%20again::operation=fixture.public-clear-all::mode=-::store=-::occurrence=1",
+          "tests/e2e/storage-reclamation.spec.ts::owner=test%3Aclear%20all%20reloads%20into%20a%20fresh%20workspace%20that%20can%20fetch%20and%20select%20models%20again::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+        ],
+        "fixtureOwners": [],
+        "processOwned": false
+      }
+    },
+    {
+      "purpose": "physical-reclamation",
+      "mutationScope": {
+        "kind": "origin-storage",
+        "targets": [
+          "auxiliary natter-clear-all IndexedDB database",
+          "Cache Storage probe",
+          "localStorage and sessionStorage probe keys",
+          "OPFS probe file",
+          "Storage Bucket probe"
+        ]
+      },
+      "cleanupRestoreObligation": "The public Clear all action must remove every seeded origin resource; the test then verifies absence from both tabs before creating fresh application state.",
+      "publicUiCannotExpress": "The test must seed and enumerate browser storage namespaces the application does not otherwise use so Clear all proves physical origin-wide reclamation.",
+      "siteIds": [
+        "tests/e2e/storage-reclamation.spec.ts::owner=test%3Aclear%20all%20reloads%20into%20a%20fresh%20workspace%20that%20can%20fetch%20and%20select%20models%20again%3Ecallback%3Aonupgradeneeded::operation=indexeddb.database.create-object-store::mode=versionchange::store=rows::occurrence=1"
+      ],
+      "cleanupEvidence": {
+        "siteIds": [
+          "tests/e2e/storage-reclamation.spec.ts::owner=test%3Aclear%20all%20reloads%20into%20a%20fresh%20workspace%20that%20can%20fetch%20and%20select%20models%20again::operation=fixture.playwright-context-teardown::mode=-::store=-::occurrence=1",
+          "tests/e2e/storage-reclamation.spec.ts::owner=test%3Aclear%20all%20reloads%20into%20a%20fresh%20workspace%20that%20can%20fetch%20and%20select%20models%20again::operation=fixture.public-clear-all::mode=-::store=-::occurrence=1"
+        ],
+        "fixtureOwners": [],
+        "processOwned": false
+      }
+    },
+    {
+      "purpose": "physical-reclamation",
+      "mutationScope": {
+        "kind": "database-schema",
+        "targets": [
+          "unique natter-storage-reclaim-probe-* database",
+          "obsolete probe store and rows",
+          "replacement current store"
+        ]
+      },
+      "cleanupRestoreObligation": "Close every opened version, delete the unique probe database before returning, and retain only attached numeric measurements.",
+      "publicUiCannotExpress": "Measuring browser quota behavior across an IndexedDB versionchange and store deletion requires a disposable physical database outside the application schema.",
+      "siteIds": [
+        "tests/e2e/storage-reclamation.spec.ts::owner=test%3Arecords%20schema%20cleanup%20without%20assuming%20immediate%20Chromium%20quota%20reclamation::operation=indexeddb.database.create-object-store::mode=versionchange::store=obsolete::occurrence=1",
+        "tests/e2e/storage-reclamation.spec.ts::owner=test%3Arecords%20schema%20cleanup%20without%20assuming%20immediate%20Chromium%20quota%20reclamation::operation=indexeddb.database.transaction::mode=readwrite::store=obsolete::occurrence=1",
+        "tests/e2e/storage-reclamation.spec.ts::owner=test%3Arecords%20schema%20cleanup%20without%20assuming%20immediate%20Chromium%20quota%20reclamation::operation=indexeddb.transaction.object-store::mode=readwrite::store=obsolete::occurrence=1",
+        "tests/e2e/storage-reclamation.spec.ts::owner=test%3Arecords%20schema%20cleanup%20without%20assuming%20immediate%20Chromium%20quota%20reclamation::operation=indexeddb.put::mode=readwrite::store=obsolete::occurrence=1",
+        "tests/e2e/storage-reclamation.spec.ts::owner=test%3Arecords%20schema%20cleanup%20without%20assuming%20immediate%20Chromium%20quota%20reclamation::operation=indexeddb.database.close::mode=-::store=-::occurrence=1",
+        "tests/e2e/storage-reclamation.spec.ts::owner=test%3Arecords%20schema%20cleanup%20without%20assuming%20immediate%20Chromium%20quota%20reclamation::operation=indexeddb.database.delete-object-store::mode=versionchange::store=obsolete::occurrence=1",
+        "tests/e2e/storage-reclamation.spec.ts::owner=test%3Arecords%20schema%20cleanup%20without%20assuming%20immediate%20Chromium%20quota%20reclamation::operation=indexeddb.database.create-object-store::mode=versionchange::store=current::occurrence=1",
+        "tests/e2e/storage-reclamation.spec.ts::owner=test%3Arecords%20schema%20cleanup%20without%20assuming%20immediate%20Chromium%20quota%20reclamation::operation=indexeddb.database.enumerate-stores::mode=-::store=%3Cdatabase%3E::occurrence=1",
+        "tests/e2e/storage-reclamation.spec.ts::owner=test%3Arecords%20schema%20cleanup%20without%20assuming%20immediate%20Chromium%20quota%20reclamation::operation=indexeddb.database.close::mode=-::store=-::occurrence=2"
+      ],
+      "cleanupEvidence": {
+        "siteIds": [
+          "tests/e2e/storage-reclamation.spec.ts::owner=test%3Arecords%20schema%20cleanup%20without%20assuming%20immediate%20Chromium%20quota%20reclamation%3Efunction%3Aremove::operation=indexeddb.factory.delete-database::mode=-::store=-::occurrence=1",
+          "tests/e2e/storage-reclamation.spec.ts::owner=test%3Arecords%20schema%20cleanup%20without%20assuming%20immediate%20Chromium%20quota%20reclamation::operation=fixture.playwright-context-teardown::mode=-::store=-::occurrence=1",
+          "tests/e2e/storage-reclamation.spec.ts::owner=test%3Arecords%20schema%20cleanup%20without%20assuming%20immediate%20Chromium%20quota%20reclamation::operation=indexeddb.database.close::mode=-::store=-::occurrence=1",
+          "tests/e2e/storage-reclamation.spec.ts::owner=test%3Arecords%20schema%20cleanup%20without%20assuming%20immediate%20Chromium%20quota%20reclamation::operation=indexeddb.database.close::mode=-::store=-::occurrence=2",
+          "tests/e2e/storage-reclamation.spec.ts::owner=test%3Arecords%20schema%20cleanup%20without%20assuming%20immediate%20Chromium%20quota%20reclamation::operation=indexeddb.database.delete-object-store::mode=versionchange::store=obsolete::occurrence=1"
+        ],
+        "fixtureOwners": [],
+        "processOwned": false
+      }
+    },
+    {
+      "purpose": "physical-reclamation",
+      "mutationScope": {
+        "kind": "database-schema",
+        "targets": [
+          "unique natter-storage-reclaim-probe-* database",
+          "obsolete probe store and rows",
+          "replacement current store"
+        ]
+      },
+      "cleanupRestoreObligation": "Close every opened version, delete the unique probe database before returning, and retain only attached numeric measurements.",
+      "publicUiCannotExpress": "Measuring browser quota behavior across an IndexedDB versionchange and store deletion requires a disposable physical database outside the application schema.",
+      "siteIds": [
+        "tests/e2e/storage-reclamation.spec.ts::owner=test%3Arecords%20schema%20cleanup%20without%20assuming%20immediate%20Chromium%20quota%20reclamation%3Efunction%3Aopen::operation=indexeddb.factory.open::mode=-::store=-::occurrence=1"
+      ],
+      "cleanupEvidence": {
+        "siteIds": [
+          "tests/e2e/storage-reclamation.spec.ts::owner=test%3Arecords%20schema%20cleanup%20without%20assuming%20immediate%20Chromium%20quota%20reclamation%3Efunction%3Aremove::operation=indexeddb.factory.delete-database::mode=-::store=-::occurrence=1",
+          "tests/e2e/storage-reclamation.spec.ts::owner=test%3Arecords%20schema%20cleanup%20without%20assuming%20immediate%20Chromium%20quota%20reclamation::operation=fixture.playwright-context-teardown::mode=-::store=-::occurrence=1",
+          "tests/e2e/storage-reclamation.spec.ts::owner=test%3Arecords%20schema%20cleanup%20without%20assuming%20immediate%20Chromium%20quota%20reclamation::operation=indexeddb.database.close::mode=-::store=-::occurrence=1",
+          "tests/e2e/storage-reclamation.spec.ts::owner=test%3Arecords%20schema%20cleanup%20without%20assuming%20immediate%20Chromium%20quota%20reclamation::operation=indexeddb.database.close::mode=-::store=-::occurrence=2",
+          "tests/e2e/storage-reclamation.spec.ts::owner=test%3Arecords%20schema%20cleanup%20without%20assuming%20immediate%20Chromium%20quota%20reclamation::operation=indexeddb.database.delete-object-store::mode=versionchange::store=obsolete::occurrence=1"
+        ],
+        "fixtureOwners": [],
+        "processOwned": false
+      }
+    },
+    {
+      "purpose": "physical-reclamation",
+      "mutationScope": {
+        "kind": "database-schema",
+        "targets": [
+          "unique natter-storage-reclaim-probe-* database",
+          "obsolete probe store and rows",
+          "replacement current store"
+        ]
+      },
+      "cleanupRestoreObligation": "Close every opened version, delete the unique probe database before returning, and retain only attached numeric measurements.",
+      "publicUiCannotExpress": "Measuring browser quota behavior across an IndexedDB versionchange and store deletion requires a disposable physical database outside the application schema.",
+      "siteIds": [
+        "tests/e2e/storage-reclamation.spec.ts::owner=test%3Arecords%20schema%20cleanup%20without%20assuming%20immediate%20Chromium%20quota%20reclamation%3Efunction%3Aremove::operation=indexeddb.factory.delete-database::mode=-::store=-::occurrence=1"
+      ],
+      "cleanupEvidence": {
+        "siteIds": [
+          "tests/e2e/storage-reclamation.spec.ts::owner=test%3Arecords%20schema%20cleanup%20without%20assuming%20immediate%20Chromium%20quota%20reclamation%3Efunction%3Aremove::operation=indexeddb.factory.delete-database::mode=-::store=-::occurrence=1",
+          "tests/e2e/storage-reclamation.spec.ts::owner=test%3Arecords%20schema%20cleanup%20without%20assuming%20immediate%20Chromium%20quota%20reclamation::operation=fixture.playwright-context-teardown::mode=-::store=-::occurrence=1",
+          "tests/e2e/storage-reclamation.spec.ts::owner=test%3Arecords%20schema%20cleanup%20without%20assuming%20immediate%20Chromium%20quota%20reclamation::operation=indexeddb.database.close::mode=-::store=-::occurrence=1",
+          "tests/e2e/storage-reclamation.spec.ts::owner=test%3Arecords%20schema%20cleanup%20without%20assuming%20immediate%20Chromium%20quota%20reclamation::operation=indexeddb.database.close::mode=-::store=-::occurrence=2",
+          "tests/e2e/storage-reclamation.spec.ts::owner=test%3Arecords%20schema%20cleanup%20without%20assuming%20immediate%20Chromium%20quota%20reclamation::operation=indexeddb.database.delete-object-store::mode=versionchange::store=obsolete::occurrence=1"
+        ],
+        "fixtureOwners": [],
+        "processOwned": false
+      }
+    },
+    {
+      "purpose": "physical-reclamation",
+      "mutationScope": {
+        "kind": "database-schema",
+        "targets": [
+          "unique natter-storage-reclaim-probe-* database",
+          "obsolete probe store and rows",
+          "replacement current store"
+        ]
+      },
+      "cleanupRestoreObligation": "Close every opened version, delete the unique probe database before returning, and retain only attached numeric measurements.",
+      "publicUiCannotExpress": "Measuring browser quota behavior across an IndexedDB versionchange and store deletion requires a disposable physical database outside the application schema.",
+      "siteIds": [
+        "tests/e2e/storage-reclamation.spec.ts::owner=test%3Arecords%20schema%20cleanup%20without%20assuming%20immediate%20Chromium%20quota%20reclamation%3Efunction%3Ausage::operation=storage-manager.estimate::mode=-::store=%3Corigin%3E::occurrence=1"
+      ]
+    },
+    {
+      "purpose": "read-only-assertion",
+      "mutationScope": {
+        "kind": "none",
+        "targets": []
+      },
+      "cleanupRestoreObligation": "Use readonly transactions, close every opened IndexedDB handle, and leave all durable browser state unchanged.",
+      "publicUiCannotExpress": "The assertion requires exact persisted rows, physical workspace identity, or transaction state that the public UI deliberately projects, virtualizes, or omits.",
+      "siteIds": [
+        "tests/e2e/stream-ownership-admission.spec.ts::owner=function%3AreadActiveRouteMessage::operation=indexeddb.get::mode=readonly::store=messages::occurrence=1",
+        "tests/e2e/stream-ownership-admission.spec.ts::owner=function%3AreadActiveRouteMessage::operation=indexeddb.transaction.object-store::mode=readonly::store=messages::occurrence=1",
+        "tests/e2e/stream-ownership-admission.spec.ts::owner=function%3AreadActiveRouteMessage::operation=indexeddb.database.transaction::mode=readonly::store=messages::occurrence=1",
+        "tests/e2e/stream-ownership-admission.spec.ts::owner=function%3AreadActiveRouteMessage::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+      ]
+    },
+    {
+      "purpose": "read-only-assertion",
+      "mutationScope": {
+        "kind": "none",
+        "targets": []
+      },
+      "cleanupRestoreObligation": "Use readonly transactions, close every opened IndexedDB handle, and leave all durable browser state unchanged.",
+      "publicUiCannotExpress": "The assertion requires exact persisted rows, physical workspace identity, or transaction state that the public UI deliberately projects, virtualizes, or omits.",
+      "siteIds": [
+        "tests/e2e/stream-ownership-admission.spec.ts::owner=function%3AreadActiveRouteMessage%3Efunction%3AopenNatterDatabase::operation=indexeddb.factory.open::mode=-::store=-::occurrence=1"
+      ],
+      "cleanupEvidence": {
+        "siteIds": [
+          "tests/e2e/stream-ownership-admission.spec.ts::owner=function%3AreadActiveRouteMessage::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+        ],
+        "fixtureOwners": [],
+        "processOwned": false
+      }
+    },
+    {
+      "purpose": "read-only-assertion",
+      "mutationScope": {
+        "kind": "none",
+        "targets": []
+      },
+      "cleanupRestoreObligation": "Use readonly transactions, close every opened IndexedDB handle, and leave all durable browser state unchanged.",
+      "publicUiCannotExpress": "The assertion requires exact persisted rows, physical workspace identity, or transaction state that the public UI deliberately projects, virtualizes, or omits.",
+      "siteIds": [
+        "tests/e2e/stream-ownership-admission.spec.ts::owner=function%3AreadDurableOwnershipState::operation=indexeddb.factory.open::mode=-::store=-::occurrence=1",
+        "tests/e2e/stream-ownership-admission.spec.ts::owner=function%3AreadDurableOwnershipState::operation=indexeddb.database.transaction::mode=readonly::store=chats%2Bmessages%2BstreamLeases%2BstreamChunks::occurrence=1",
+        "tests/e2e/stream-ownership-admission.spec.ts::owner=function%3AreadDurableOwnershipState::operation=indexeddb.get::mode=readonly::store=chats::occurrence=1",
+        "tests/e2e/stream-ownership-admission.spec.ts::owner=function%3AreadDurableOwnershipState::operation=indexeddb.transaction.object-store::mode=readonly::store=chats::occurrence=1",
+        "tests/e2e/stream-ownership-admission.spec.ts::owner=function%3AreadDurableOwnershipState::operation=indexeddb.getAll::mode=readonly::store=messages%40index%3AchatId::occurrence=1",
+        "tests/e2e/stream-ownership-admission.spec.ts::owner=function%3AreadDurableOwnershipState::operation=indexeddb.object-store.index::mode=readonly::store=messages%40index%3AchatId::occurrence=1",
+        "tests/e2e/stream-ownership-admission.spec.ts::owner=function%3AreadDurableOwnershipState::operation=indexeddb.transaction.object-store::mode=readonly::store=messages::occurrence=1",
+        "tests/e2e/stream-ownership-admission.spec.ts::owner=function%3AreadDurableOwnershipState::operation=indexeddb.getAll::mode=readonly::store=streamLeases::occurrence=1",
+        "tests/e2e/stream-ownership-admission.spec.ts::owner=function%3AreadDurableOwnershipState::operation=indexeddb.transaction.object-store::mode=readonly::store=streamLeases::occurrence=1",
+        "tests/e2e/stream-ownership-admission.spec.ts::owner=function%3AreadDurableOwnershipState::operation=indexeddb.getAll::mode=readonly::store=streamChunks::occurrence=1",
+        "tests/e2e/stream-ownership-admission.spec.ts::owner=function%3AreadDurableOwnershipState::operation=indexeddb.transaction.object-store::mode=readonly::store=streamChunks::occurrence=1",
+        "tests/e2e/stream-ownership-admission.spec.ts::owner=function%3AreadDurableOwnershipState::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+      ],
+      "cleanupEvidence": {
+        "siteIds": [
+          "tests/e2e/stream-ownership-admission.spec.ts::owner=function%3AreadDurableOwnershipState::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+        ],
+        "fixtureOwners": [],
+        "processOwned": false
+      }
+    },
+    {
+      "purpose": "read-only-assertion",
+      "mutationScope": {
+        "kind": "none",
+        "targets": []
+      },
+      "cleanupRestoreObligation": "Use readonly transactions, close every opened IndexedDB handle, and leave all durable browser state unchanged.",
+      "publicUiCannotExpress": "The assertion requires exact persisted rows, physical workspace identity, or transaction state that the public UI deliberately projects, virtualizes, or omits.",
+      "siteIds": [
+        "tests/e2e/stream-retention.spec.ts::owner=function%3AreadRetentionStorageState::operation=indexeddb.factory.open::mode=-::store=-::occurrence=1",
+        "tests/e2e/stream-retention.spec.ts::owner=function%3AreadRetentionStorageState::operation=indexeddb.database.transaction::mode=readonly::store=messages%2BmessageBodies%2BstreamLeases%2BstreamChunks::occurrence=1",
+        "tests/e2e/stream-retention.spec.ts::owner=function%3AreadRetentionStorageState::operation=indexeddb.getAll::mode=readonly::store=messages%40index%3AchatId::occurrence=1",
+        "tests/e2e/stream-retention.spec.ts::owner=function%3AreadRetentionStorageState::operation=indexeddb.object-store.index::mode=readonly::store=messages%40index%3AchatId::occurrence=1",
+        "tests/e2e/stream-retention.spec.ts::owner=function%3AreadRetentionStorageState::operation=indexeddb.transaction.object-store::mode=readonly::store=messages::occurrence=1",
+        "tests/e2e/stream-retention.spec.ts::owner=function%3AreadRetentionStorageState::operation=indexeddb.getAll::mode=readonly::store=messageBodies::occurrence=1",
+        "tests/e2e/stream-retention.spec.ts::owner=function%3AreadRetentionStorageState::operation=indexeddb.transaction.object-store::mode=readonly::store=messageBodies::occurrence=1",
+        "tests/e2e/stream-retention.spec.ts::owner=function%3AreadRetentionStorageState::operation=indexeddb.getAll::mode=readonly::store=streamLeases::occurrence=1",
+        "tests/e2e/stream-retention.spec.ts::owner=function%3AreadRetentionStorageState::operation=indexeddb.transaction.object-store::mode=readonly::store=streamLeases::occurrence=1",
+        "tests/e2e/stream-retention.spec.ts::owner=function%3AreadRetentionStorageState::operation=indexeddb.getAll::mode=readonly::store=streamChunks::occurrence=1",
+        "tests/e2e/stream-retention.spec.ts::owner=function%3AreadRetentionStorageState::operation=indexeddb.transaction.object-store::mode=readonly::store=streamChunks::occurrence=1",
+        "tests/e2e/stream-retention.spec.ts::owner=function%3AreadRetentionStorageState::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+      ],
+      "cleanupEvidence": {
+        "siteIds": [
+          "tests/e2e/stream-retention.spec.ts::owner=function%3AreadRetentionStorageState::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+        ],
+        "fixtureOwners": [],
+        "processOwned": false
+      }
+    },
+    {
+      "purpose": "read-only-assertion",
+      "mutationScope": {
+        "kind": "none",
+        "targets": []
+      },
+      "cleanupRestoreObligation": "Use readonly transactions, close every opened IndexedDB handle, and leave all durable browser state unchanged.",
+      "publicUiCannotExpress": "The assertion requires exact persisted rows, physical workspace identity, or transaction state that the public UI deliberately projects, virtualizes, or omits.",
+      "siteIds": [
+        "tests/e2e/stream-retention.spec.ts::owner=function%3AstreamChunkCountForChat::operation=indexeddb.factory.open::mode=-::store=-::occurrence=1",
+        "tests/e2e/stream-retention.spec.ts::owner=function%3AstreamChunkCountForChat::operation=indexeddb.getAll::mode=readonly::store=streamChunks::occurrence=1",
+        "tests/e2e/stream-retention.spec.ts::owner=function%3AstreamChunkCountForChat::operation=indexeddb.transaction.object-store::mode=readonly::store=streamChunks::occurrence=1",
+        "tests/e2e/stream-retention.spec.ts::owner=function%3AstreamChunkCountForChat::operation=indexeddb.database.transaction::mode=readonly::store=streamChunks::occurrence=1",
+        "tests/e2e/stream-retention.spec.ts::owner=function%3AstreamChunkCountForChat::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+      ],
+      "cleanupEvidence": {
+        "siteIds": [
+          "tests/e2e/stream-retention.spec.ts::owner=function%3AstreamChunkCountForChat::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+        ],
+        "fixtureOwners": [],
+        "processOwned": false
+      }
+    },
+    {
+      "purpose": "fault-injection",
+      "mutationScope": {
+        "kind": "none",
+        "targets": []
+      },
+      "cleanupRestoreObligation": "The probe must delegate to both native methods, release every opened handle normally, and rely on isolated Playwright context teardown to restore the instrumented prototypes.",
+      "publicUiCannotExpress": "The public UI cannot observe every physical IndexedDB open and close call needed to prove hidden-tab handle quiescence without instrumenting browser prototypes.",
+      "siteIds": [
+        "tests/e2e/reactive-storage-stress.spec.ts::owner=function%3AinstallIdleHandleProbe::operation=indexeddb.factory.prototype-open-read::mode=-::store=-::occurrence=1",
+        "tests/e2e/reactive-storage-stress.spec.ts::owner=function%3AinstallIdleHandleProbe::operation=indexeddb.factory.prototype-open-override::mode=-::store=-::occurrence=1",
+        "tests/e2e/reactive-storage-stress.spec.ts::owner=function%3AinstallIdleHandleProbe%3Ecallback%3Aopen::operation=indexeddb.factory.open-via-alias::mode=-::store=-::occurrence=1",
+        "tests/e2e/reactive-storage-stress.spec.ts::owner=function%3AinstallIdleHandleProbe%3Ecallback%3Aopen::operation=indexeddb.factory.open-via-alias::mode=-::store=-::occurrence=2",
+        "tests/e2e/reactive-storage-stress.spec.ts::owner=function%3AinstallIdleHandleProbe::operation=indexeddb.database.prototype-close-read::mode=-::store=-::occurrence=1",
+        "tests/e2e/reactive-storage-stress.spec.ts::owner=function%3AinstallIdleHandleProbe::operation=indexeddb.database.prototype-close-override::mode=-::store=-::occurrence=1",
+        "tests/e2e/reactive-storage-stress.spec.ts::owner=function%3AinstallIdleHandleProbe%3Ecallback%3Aclose::operation=indexeddb.database.close-via-alias::mode=-::store=-::occurrence=1"
+      ],
+      "cleanupEvidence": {
+        "siteIds": [
+          "tests/e2e/reactive-storage-stress.spec.ts::owner=function%3AinstallIdleHandleProbe%3Ecallback%3Aclose::operation=indexeddb.database.close-via-alias::mode=-::store=-::occurrence=1"
+        ],
+        "fixtureOwners": [],
+        "processOwned": false
+      }
+    }
+  ]
+}

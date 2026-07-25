@@ -1,15 +1,21 @@
-import type { Collection, Table } from 'dexie'
+import type { Collection, Table, Transaction } from 'dexie'
 import { findLastUpdatedLeafId } from '../core/active-path'
 import { sha256Hex as sha256BytesHex } from '../core/attachments/process'
-import { buildBranchCacheRow } from '../core/branch-flatten'
+import { buildBranchMessages } from '../core/branch-flatten'
+import { chatTagNameLower } from '../core/chat-metadata'
+import { buildChildSlotProjection, type ChildSlotProjection } from '../core/child-list-state'
+import {
+  assertCanonicalGeneratedOutputMessage,
+  isGeneratedOutputLocalizationJob,
+  withGeneratedOutputLocalizationState,
+} from '../core/generated-output-localization'
 import { WorkspaceReplacementInProgressError } from '../core/import-export/errors'
+import { flattenChatSettingsForPortableExport } from '../core/import-export/flatten'
 import {
-  flattenChatSettingsForPortableExport,
-  stripPromptPresetPins,
-} from '../core/import-export/flatten'
-import {
+  assertEnvelopeKind,
   type ChatExportEnvelope,
   type ChatPresetExportEnvelope,
+  type ConnectionProfileExportEnvelope,
   type ConnectionSketch,
   NATTER_EXPORT_SCHEMA_VERSION,
   type NatterExportEnvelope,
@@ -18,16 +24,24 @@ import {
   type PortableAttachmentBundle,
   type PortableChatPayload,
   type PortableChatPresetPayload,
+  type PortableConnectionProfilePayload,
   type PortableFolderSketch,
   type PortableTagSketch,
   type WorkspaceBackupEnvelope,
   type WorkspaceBackupPayload,
+  workspaceBackupManifest,
 } from '../core/import-export/schema'
+import { normalizeWorkspaceCredentialReferences } from '../core/import-export/workspace-credentials'
 import {
   validatePortableChatGraph,
   validateWorkspaceBackupGraph,
 } from '../core/import-export/workspace-validation'
-import { readSavedTextTemplates } from '../core/text-templates'
+import { fixedConversationSelectionTarget } from '../core/messages'
+import {
+  LEGACY_SAVED_TEXT_TEMPLATES_KEY,
+  type SavedTextTemplate,
+  savedTextTemplatesFromStoredValue,
+} from '../core/text-templates'
 import type {
   Attachment,
   AttachmentArtifact,
@@ -40,6 +54,7 @@ import type {
   ChatSettings,
   ChatTag,
   ChildListState,
+  ChildSlotMember,
   ConnectionProfile,
   ContentItem,
   FolderId,
@@ -48,34 +63,85 @@ import type {
   MessageId,
   PresetId,
   ProfileId,
+  PromptPresetKind,
   TagId,
 } from '../core/types'
+import { countMessagesWords } from '../core/word-count'
 import { newId } from '../lib/ulid'
-import { replaceAttachmentReferenceOwners } from './attachment-reference-edges'
+import {
+  ATTACHMENT_CATALOG_MUTATION_TRANSACTION_CAPABILITY,
+  emptyAttachmentCatalogAggregateRow,
+  putAttachmentCatalogProjectionFromHeader,
+} from './attachment-catalog-projection'
+import { markAttachmentIntegrityRepairComplete } from './attachment-integrity-maintenance'
+import { applyAttachmentReferenceOwnerTransitions } from './attachment-reference-edges'
 import {
   type AttachmentHeaderRow,
-  attachmentHeaderFromStoredRow,
   hydrateAttachment,
   splitAttachmentForStorage,
 } from './attachment-storage'
-import { postEvent } from './broadcast'
+import { reduceAttemptAvailability } from './attempt-availability'
+import { recordBrowserCommandAttachmentReferenceState } from './browser-command-mutation-journal'
+import type { BrowserCommandSessionPort } from './browser-domain-mutations'
+import type { BrowserWorkspaceReplacementMutationGrant } from './browser-workspace-contract'
+import { rebuildChildSlotDerivedState } from './browser-workspace-derived-repair'
 import {
+  addAttachmentArtifactByteOwners,
+  addAttachmentBlobByteOwners,
+  addAttachmentJobByteOwners,
+  addLinkedSemanticByteOwner,
+  putAttachmentHeaderByteOwner,
+  putChatFolderByteOwner,
+  putChatTagByteOwners,
+} from './byte-owner-mutation'
+import {
+  applyChatRowWriteTransitions,
+  CHAT_ROW_LINKED_TRANSACTION_CAPABILITY,
+} from './chat-row-transition'
+import {
+  accumulateChatSidebarAggregateRows,
   chatSidebarProjectionRow,
   chatSidebarProjectionSettings,
+  createChatSidebarAggregateAccumulator,
   isChatSidebarProjectionSettingKey,
-  putChatSidebarProjection,
+  materializeChatSidebarAggregateRows,
 } from './chat-sidebar-projection'
-import { childListKey, type NatterDb, openDb } from './db'
+import {
+  CONFIGURATION_PRESET_CATALOG_TRANSACTION_CAPABILITY,
+  CONFIGURATION_PROFILE_CATALOG_TRANSACTION_CAPABILITY,
+  type ConfigurationProfileCatalogProjectionRow,
+  configurationCatalogMetadataRowsFromCounts,
+  configurationPresetCatalogProjectionRow,
+  configurationProfileCatalogProjectionRow,
+  configurationPromptPresetCatalogProjectionRow,
+  putConfigurationPresetCatalogProjection,
+  putConfigurationProfileCatalogProjection,
+} from './configuration-catalog-projection'
+import {
+  buildConnectionProfile,
+  configurationLinksForChat,
+  configurationLinksForPreset,
+  configurationLinksForProfile,
+} from './configuration-domain-contract'
+import { PresetMissingError } from './configuration-errors'
+import {
+  CONFIGURATION_LINK_MUTATION_TRANSACTION_CAPABILITY,
+  configurationProfileUsageProjectionRows,
+} from './configuration-profile-usage-projection'
+import { proveConversationSelectionInTransaction } from './conversation-destination-seal'
+import type { NatterDb } from './db'
+import { seedEmptyDiscoveryCacheState } from './discovery-cache-storage'
 import type {
   ImportChatOptions,
   ImportChatPresetOptions,
   ImportChatPresetResult,
   ImportChatResult,
+  ImportConnectionProfileOptions,
+  ImportConnectionProfileResult,
   RestoreWorkspaceBackupOptions,
   RestoreWorkspaceBackupResult,
-  WorkspaceImportExportBackend,
 } from './import-export-contract'
-import { withNamedLock } from './locks'
+import { scopeResourceName } from './locks'
 import {
   hydrateMessages,
   type MessageBodyRow,
@@ -84,22 +150,66 @@ import {
   previewTextsByChat,
   splitMessageForStorage,
 } from './message-storage'
-import { PresetMissingError } from './presets'
-import type { StreamLeaseRow } from './repository'
-import { isFreshStreamLease, STREAM_LEASE_TTL_MS } from './stream-leases'
+import { physicalStorageTables, physicalTransactionPlan } from './physical-storage-tables'
 import {
-  bumpBrowserWorkspaceMeta,
+  appendPresetOrderEntry,
+  buildPresetOrderOnEmptyTables,
+  PRESET_ORDER_MUTATION_TRANSACTION_CAPABILITY,
+  readPresetOrderIds,
+} from './preset-order'
+import type { StreamLeaseRow, WorkspaceMeta } from './repository'
+import { discardStorageCompactionDebt } from './storage-compaction-state'
+import { freshStorageRetentionStateRows } from './storage-retention-state'
+import { estimateStoredValueBytes } from './storage-size-estimate'
+import { completedStreamJournalIntegritySetting } from './stream-journal-integrity'
+import {
   markBrowserWorkspaceReplaced,
   readBrowserWorkspaceMetaFromTransaction,
 } from './workspace-meta'
-import { useStreamStore } from './zustand/streamStore'
 
 function isInternalStreamAdmissionSettingKey(key: string): boolean {
   return key === 'stream-admission-sequence'
 }
 
-const WORKSPACE_ID = 'browser-idb:natter'
+function isPortableWorkspaceSettingKey(key: string): boolean {
+  return (
+    !isChatSidebarProjectionSettingKey(key) &&
+    !isInternalStreamAdmissionSettingKey(key) &&
+    key !== 'workspace-meta' &&
+    key !== LEGACY_SAVED_TEXT_TEMPLATES_KEY
+  )
+}
+
 const IMPORT_EXPORT_PAGE_SIZE = 128
+
+const IMPORT_CHAT_TRANSACTION = physicalTransactionPlan(
+  ATTACHMENT_CATALOG_MUTATION_TRANSACTION_CAPABILITY,
+  CHAT_ROW_LINKED_TRANSACTION_CAPABILITY,
+  physicalStorageTables(
+    'attachmentArtifacts',
+    'attachmentBlobs',
+    'attachmentJobs',
+    'childLists',
+    'childSlotMembers',
+    'folders',
+    'messageBodies',
+    'messagePreviews',
+    'messages',
+    'profiles',
+    'tags',
+  ),
+)
+const IMPORT_CONNECTION_PROFILE_TRANSACTION = physicalTransactionPlan(
+  CONFIGURATION_PROFILE_CATALOG_TRANSACTION_CAPABILITY,
+  CONFIGURATION_LINK_MUTATION_TRANSACTION_CAPABILITY,
+  physicalStorageTables('profiles'),
+)
+const IMPORT_CHAT_PRESET_TRANSACTION = physicalTransactionPlan(
+  CONFIGURATION_PRESET_CATALOG_TRANSACTION_CAPABILITY,
+  CONFIGURATION_LINK_MUTATION_TRANSACTION_CAPABILITY,
+  PRESET_ORDER_MUTATION_TRANSACTION_CAPABILITY,
+  physicalStorageTables('presets', 'profiles'),
+)
 
 interface ImportExportMaterializationMetrics {
   tableReadBatches: number
@@ -149,17 +259,46 @@ interface ResolvedProfile {
   matched: boolean
 }
 
-interface ImportedAttachmentBundle {
-  sourceAttachmentId: AttachmentId
-  targetAttachmentId: AttachmentId
-  reused: boolean
-  bundle?: ValidatedAttachmentBundle
+async function selectedSavedTextTemplate(
+  db: NatterDb,
+  settings: ChatSettings,
+): Promise<SavedTextTemplate | undefined> {
+  const templateId = settings.textTemplate
+  if (!templateId?.startsWith('user:')) return undefined
+  const template = await db.textTemplates.get(templateId)
+  return template ? structuredClone(template) : undefined
 }
 
-class BrowserImportExportBackend implements WorkspaceImportExportBackend {
-  async exportChat(chatId: string): Promise<ChatExportEnvelope> {
-    const db = await openDb()
-    const savedTextTemplates = await readSavedTextTemplates()
+interface PreparedImportedAttachmentBundle {
+  sourceAttachmentId: AttachmentId
+  bundle: ValidatedAttachmentBundle
+}
+
+interface ImportChatLinkPlan {
+  readonly profile: ResolvedProfile
+  readonly attachmentIdBySourceId: ReadonlyMap<AttachmentId, AttachmentId>
+}
+
+class ImportChatLinkPlanChangedError extends Error {}
+
+export type BrowserImportExportCommit = BrowserCommandSessionPort
+
+export interface BrowserImportExportRead<T> {
+  readonly workspace: WorkspaceMeta
+  readonly value: T
+}
+
+export class BrowserImportExportHandler {
+  private readonly db: NatterDb
+  private readonly commit: BrowserImportExportCommit | undefined
+
+  constructor(db: NatterDb, commit?: BrowserImportExportCommit) {
+    this.db = db
+    this.commit = commit
+  }
+
+  async exportChat(chatId: string): Promise<BrowserImportExportRead<ChatExportEnvelope>> {
+    const db = this.db
     const snapshot = await db.transaction(
       'r',
       [
@@ -167,15 +306,17 @@ class BrowserImportExportBackend implements WorkspaceImportExportBackend {
         db.attachmentBlobs,
         db.attachmentJobs,
         db.attachments,
-        db.chatBranchCache,
         db.chats,
         db.folders,
         db.messageBodies,
         db.messages,
         db.profiles,
+        db.settings,
+        db.textTemplates,
         db.tags,
+        db.workspaceFence,
       ],
-      async () => {
+      async (tx) => {
         const chat = await db.chats.get(chatId)
         if (!chat) throw new Error(`ChatMissing:${chatId}`)
         const messages = sortMessages(
@@ -188,7 +329,18 @@ class BrowserImportExportBackend implements WorkspaceImportExportBackend {
         const tags = chat.tags.length > 0 ? await db.tags.bulkGet(chat.tags) : []
         const profile = await db.profiles.get(chat.settings.profileId)
         const bundles = await storedAttachmentBundles(db, collectAttachmentIds(messages))
-        return { chat, messages, folder, tags: tags.filter(isDefined), profile, bundles }
+        const savedTextTemplate = await selectedSavedTextTemplate(db, chat.settings)
+        const workspace = await readBrowserWorkspaceMetaFromTransaction(tx)
+        return {
+          chat,
+          messages,
+          folder,
+          tags: tags.filter(isDefined),
+          profile,
+          bundles,
+          savedTextTemplate,
+          workspace,
+        }
       },
     )
 
@@ -199,7 +351,7 @@ class BrowserImportExportBackend implements WorkspaceImportExportBackend {
         createdAt: snapshot.chat.createdAt,
         updatedAt: snapshot.chat.updatedAt,
         settings: flattenChatSettingsForPortableExport(snapshot.chat.settings, {
-          savedTextTemplates,
+          ...(snapshot.savedTextTemplate ? { savedTextTemplate: snapshot.savedTextTemplate } : {}),
         }),
         ...(snapshot.chat.color ? { color: snapshot.chat.color } : {}),
         ...(snapshot.chat.favoriteModels
@@ -214,261 +366,420 @@ class BrowserImportExportBackend implements WorkspaceImportExportBackend {
       ...(snapshot.profile ? { connectionSketch: connectionSketch(snapshot.profile) } : {}),
     }
 
-    return envelope(db, 'chat', payload)
+    return {
+      workspace: snapshot.workspace,
+      value: envelope(db, snapshot.workspace.workspaceId, 'chat', payload),
+    }
   }
 
   async importChat(
     envelope: ChatExportEnvelope,
     options: ImportChatOptions = {},
   ): Promise<ImportChatResult> {
-    const db = await openDb()
+    const db = this.db
+    const commit = this.requireCommit()
     const now = options.now ?? Date.now()
     const payload = envelope.payload
     validatePortableChatGraph(payload)
-    const resolvedProfile = await resolveProfileId(
-      db,
-      payload.chat.settings,
-      payload.connectionSketch,
-      {
-        targetProfileId: options.targetProfileId,
-      },
-    )
-
-    const attachmentRows = await prepareImportedAttachments(db, payload.attachments)
-    const attachmentIdMap = Object.fromEntries(
-      attachmentRows.map((row) => [row.sourceAttachmentId, row.targetAttachmentId]),
-    )
-    const chatId = newId()
+    const attachmentCandidates = await prepareImportedAttachments(payload.attachments)
+    const chatId = options.destinationChatId ?? newId()
     const messageIdMap = Object.fromEntries(
       payload.messages.map((message) => [message.id, newId()]),
     )
-    const turnIdMap = new Map<string, string>()
-    const messages = payload.messages.map((message) =>
-      remapImportedMessage(message, {
-        chatId,
-        messageIdMap,
-        turnIdMap,
-        attachmentIdMap,
-      }),
-    )
-    const liveRefCounts = countLiveAttachmentRefs(messages)
-    const branchLeafId = findLastUpdatedLeafId(messages)
-    const branchCache = buildBranchCacheRow({
-      chatId,
-      branchLeafId,
-      messages,
-      generatedAt: now,
-    })
-    const totalCostUsd = messages.reduce(
-      (total, message) => total + (message.deleted ? 0 : (message.generation?.cost ?? 0)),
-      0,
-    )
-    const settings = normalizedImportedSettings(payload.chat.settings, resolvedProfile.profileId)
+    const importedFolderId = portableFolderCandidateId(payload.folder)
+    const missingProfileId = `missing:${newId()}`
+    let result: ImportChatResult | undefined
 
-    let folderId: FolderId | undefined
-    let tagIds: TagId[] = []
-    const createdFolderIds: FolderId[] = []
-    const createdTagIds: TagId[] = []
-    const childLists = childListsForMessages(chatId, messages, now)
-    const createdAttachmentIds: AttachmentId[] = []
-    const reusedAttachmentIds: AttachmentId[] = []
-
-    await withNamedLock(`workspace:import-chat:${chatId}`, (grant) =>
-      grant.runTransaction(
+    for (;;) {
+      const plan = await planImportChatLinks(
         db,
-        [
-          db.attachmentArtifacts,
-          db.attachmentBlobs,
-          db.attachmentJobs,
-          db.attachmentRefEdges,
-          db.attachments,
-          db.chatBranchCache,
-          db.chatSidebarRows,
-          db.chats,
-          db.childLists,
-          db.folders,
-          db.messageBodies,
-          db.messages,
-          db.settings,
-          db.tags,
-        ],
-        async (tx) => {
-          const folderResult = await ensurePortableFolder(db, payload.folder, now)
-          folderId = folderResult.folderId
-          if (folderResult.created && folderResult.folderId) {
-            createdFolderIds.push(folderResult.folderId)
-          }
+        payload.chat.settings,
+        payload.connectionSketch,
+        options.targetProfileId,
+        missingProfileId,
+        attachmentCandidates,
+      )
+      try {
+        await commit.withLocks(
+          [
+            'interchange:import-chat',
+            'chat-catalog',
+            'folder-catalog',
+            'profile-catalog',
+            'tag-catalog',
+            scopeResourceName({ kind: 'chat-meta', chatId }),
+            `profile:${plan.profile.profileId}`,
+            `configuration-target:profile:${plan.profile.profileId}`,
+            ...(importedFolderId ? [`folder:${importedFolderId}`] : []),
+            ...[...plan.attachmentIdBySourceId.values()].map((attachmentId) =>
+              scopeResourceName({ kind: 'attachment', attachmentId }),
+            ),
+          ],
+          (locked) =>
+            locked.runTransaction(IMPORT_CHAT_TRANSACTION, async (tx) => {
+              const profiles = tx.table<ConnectionProfile, ProfileId>('profiles')
+              const attachments = tx.table<AttachmentHeaderRow, AttachmentId>('attachments')
+              const resolvedProfile = await resolveProfileId(
+                profiles,
+                payload.chat.settings,
+                payload.connectionSketch,
+                {
+                  targetProfileId: options.targetProfileId,
+                  missingProfileId,
+                },
+              )
+              if (!sameResolvedProfile(plan.profile, resolvedProfile)) {
+                throw new ImportChatLinkPlanChangedError()
+              }
+              const attachmentIdMap: Record<string, string> = {}
+              for (const candidate of attachmentCandidates) {
+                const duplicate = await findExistingAttachment(
+                  attachments,
+                  candidate.bundle.attachment,
+                )
+                const plannedAttachmentId = plan.attachmentIdBySourceId.get(
+                  candidate.sourceAttachmentId,
+                )
+                const currentAttachmentId = duplicate?.id ?? candidate.bundle.attachment.id
+                if (plannedAttachmentId !== currentAttachmentId) {
+                  throw new ImportChatLinkPlanChangedError()
+                }
+                attachmentIdMap[candidate.sourceAttachmentId] = currentAttachmentId
+                if (duplicate) continue
+                await storeValidatedAttachmentBundle(tx, candidate.bundle)
+              }
 
-          const tagResult = await ensurePortableTags(db, payload.tags, now)
-          tagIds = tagResult.tagIds
-          createdTagIds.push(...tagResult.createdTagIds)
+              const turnIdMap = new Map<string, string>()
+              const messages = payload.messages.map((message) =>
+                remapImportedMessage(message, {
+                  chatId,
+                  messageIdMap,
+                  turnIdMap,
+                  attachmentIdMap,
+                }),
+              )
+              const branchLeafId = findLastUpdatedLeafId(messages)
+              const branchMessages = buildBranchMessages(messages, branchLeafId)
+              const totalCostUsd = messages.reduce(
+                (total, message) => total + (message.deleted ? 0 : (message.generation?.cost ?? 0)),
+                0,
+              )
+              const settings = normalizedImportedSettings(
+                payload.chat.settings,
+                resolvedProfile.profileId,
+              )
+              const folderResult = await ensurePortableFolder(
+                tx,
+                payload.folder,
+                now,
+                importedFolderId,
+              )
+              const folderId = folderResult.folderId
+              const tagResult = await ensurePortableTags(tx, payload.tags, now)
+              const tagIds = tagResult.tagIds
+              const childSlots = childSlotsForMessages(chatId, messages, now)
 
-          for (const imported of attachmentRows) {
-            if (imported.reused) {
-              reusedAttachmentIds.push(imported.targetAttachmentId)
-              continue
-            }
-            if (!imported.bundle) continue
-            await storeValidatedAttachmentBundle(db, imported.bundle)
-            createdAttachmentIds.push(imported.targetAttachmentId)
-          }
+              const chat: Chat = {
+                id: chatId,
+                title: payload.chat.title,
+                titleStatus: 'untitled',
+                createdAt: now,
+                updatedAt: now,
+                lastViewedAt: now,
+                wordCount: countMessagesWords(branchMessages),
+                totalCostUsd,
+                metaVersion: 0,
+                summaryVersion: 0,
+                structuralVersion: messages.length === 0 ? 0 : 1,
+                configurationVersion: 0,
+                settings,
+                lastUpdatedLeafId: branchLeafId,
+                lastBranchUpdatedAt: now,
+                archived: false,
+                pinned: false,
+                folderId: folderId ?? null,
+                tags: tagIds,
+                ...(payload.chat.color ? { color: payload.chat.color } : {}),
+                ...(payload.chat.favoriteModels
+                  ? { favoriteModels: [...payload.chat.favoriteModels] }
+                  : {}),
+                ...(payload.chat.recentModels
+                  ? { recentModels: [...payload.chat.recentModels] }
+                  : {}),
+                previewText: previewTextFromMessages(messages),
+              }
+              await applyChatRowWriteTransitions(tx, [{ kind: 'add-linked', next: chat }])
+              await storeNewMessagesInPages(tx, messages)
+              await replaceMessageAttachmentReferenceOwnersInPages(tx, messages)
+              await bulkAddInPages(
+                tx.table<ChildListState, string>('childLists'),
+                childSlots.states,
+              )
+              await bulkAddInPages(
+                tx.table<ChildSlotMember, MessageId>('childSlotMembers'),
+                childSlots.members,
+              )
+              const branchTip = branchMessages.at(-1)
+              const branchTipStorage = branchTip ? splitMessageForStorage(branchTip) : undefined
+              const destination = await proveConversationSelectionInTransaction(tx, {
+                chat,
+                target: fixedConversationSelectionTarget(
+                  branchLeafId === null
+                    ? { kind: 'default' }
+                    : { kind: 'tip', messageId: branchLeafId },
+                  branchLeafId,
+                ),
+                tipId: branchLeafId,
+                presentations:
+                  branchTip && branchTipStorage
+                    ? [
+                        {
+                          header: branchTipStorage.header,
+                          message: branchTip,
+                          bodyVersion: branchTipStorage.header.bodyVersion,
+                        },
+                      ]
+                    : [],
+              })
+              result = {
+                chatId,
+                destination,
+              }
+            }),
+        )
+        break
+      } catch (error) {
+        if (error instanceof ImportChatLinkPlanChangedError) continue
+        throw error
+      }
+    }
+    if (!result) throw new Error('ImportChatCommitMissing')
+    return result
+  }
 
-          const chat: Chat = {
-            id: chatId,
-            title: payload.chat.title,
-            titleStatus: 'untitled',
-            createdAt: now,
-            updatedAt: now,
-            lastViewedAt: now,
-            wordCount: branchCache.wordCount,
-            totalCostUsd,
-            metaVersion: 0,
-            summaryVersion: 0,
-            settings,
-            lastUpdatedLeafId: branchLeafId,
-            lastBranchUpdatedAt: now,
-            archived: false,
-            pinned: false,
-            folderId: folderId ?? null,
-            tags: tagIds,
-            ...(payload.chat.color ? { color: payload.chat.color } : {}),
-            ...(payload.chat.favoriteModels
-              ? { favoriteModels: [...payload.chat.favoriteModels] }
-              : {}),
-            ...(payload.chat.recentModels ? { recentModels: [...payload.chat.recentModels] } : {}),
-            previewText: previewTextFromMessages(messages),
-          }
-          await db.chats.put(chat)
-          await putChatSidebarProjection(tx, chat, true)
-          await storeMessagesInPages(db, messages)
-          await replaceMessageAttachmentReferenceOwnersInPages(tx, messages)
-          if (childLists.length > 0) await db.childLists.bulkPut(childLists)
-          await db.chatBranchCache.put(branchCache)
-          await bumpBrowserWorkspaceMeta(tx, now)
-        },
-      ),
+  async exportChatPreset(
+    presetId: PresetId,
+  ): Promise<BrowserImportExportRead<ChatPresetExportEnvelope>> {
+    const db = this.db
+    const snapshot = await db.transaction(
+      'r',
+      [db.presets, db.profiles, db.settings, db.textTemplates, db.workspaceFence],
+      async (tx) => {
+        const preset = await db.presets.get(presetId)
+        if (!preset) throw new PresetMissingError(presetId)
+        const profile = await db.profiles.get(preset.connectionProfileId)
+        const savedTextTemplate = await selectedSavedTextTemplate(db, preset.settings)
+        const workspace = await readBrowserWorkspaceMetaFromTransaction(tx)
+        return { preset, profile, savedTextTemplate, workspace }
+      },
     )
-
-    for (const id of createdFolderIds) postEvent({ kind: 'folder-mutated', folderId: id })
-    for (const id of createdTagIds) postEvent({ kind: 'tag-mutated', tagId: id })
-    postEvent({
-      kind: 'chat-mutated',
-      chatId,
-      metaVersion: 0,
-      summaryVersion: 0,
-      affected: [
-        { kind: 'chat-meta', chatId },
-        { kind: 'children', chatId, parentId: null },
-        ...messages.map((message) => ({ kind: 'message' as const, chatId, messageId: message.id })),
-        ...[...liveRefCounts.keys()].map((attachmentId) => ({
-          kind: 'attachment' as const,
-          attachmentId,
-        })),
-      ],
-    })
-    postEvent({ kind: 'branch-cache-refreshed', chatId })
 
     return {
-      chatId,
-      messageIdMap,
-      attachmentIdMap,
-      createdAttachmentIds,
-      reusedAttachmentIds,
-      ...(folderId ? { folderId } : {}),
-      tagIds,
-      profileId: resolvedProfile.profileId,
-      profileMatched: resolvedProfile.matched,
+      workspace: snapshot.workspace,
+      value: envelope(db, snapshot.workspace.workspaceId, 'chat-preset', {
+        sourcePresetId: snapshot.preset.id,
+        name: snapshot.preset.name,
+        settings: flattenChatSettingsForPortableExport(snapshot.preset.settings, {
+          ...(snapshot.savedTextTemplate ? { savedTextTemplate: snapshot.savedTextTemplate } : {}),
+        }),
+        createdAt: snapshot.preset.createdAt,
+        updatedAt: snapshot.preset.updatedAt,
+        ...(snapshot.profile ? { connectionSketch: connectionSketch(snapshot.profile) } : {}),
+      }),
     }
   }
 
-  async exportChatPreset(presetId: PresetId): Promise<ChatPresetExportEnvelope> {
-    const db = await openDb()
-    const savedTextTemplates = await readSavedTextTemplates()
-    const snapshot = await db.transaction('r', [db.presets, db.profiles], async () => {
-      const preset = await db.presets.get(presetId)
-      if (!preset) throw new PresetMissingError(presetId)
-      const profile = await db.profiles.get(preset.connectionProfileId)
-      return { preset, profile }
+  async exportConnectionProfile(
+    profileId: ProfileId,
+  ): Promise<BrowserImportExportRead<ConnectionProfileExportEnvelope>> {
+    const db = this.db
+    const snapshot = await db.transaction('r', [db.profiles, db.workspaceFence], async (tx) => {
+      const profile = await db.profiles.get(profileId)
+      if (!profile) throw new Error(`ProfileMissing:${profileId}`)
+      const workspace = await readBrowserWorkspaceMetaFromTransaction(tx)
+      return { profile, workspace }
     })
-
-    return envelope(db, 'chat-preset', {
-      sourcePresetId: snapshot.preset.id,
-      name: snapshot.preset.name,
-      settings: flattenChatSettingsForPortableExport(snapshot.preset.settings, {
-        savedTextTemplates,
+    const profile = snapshot.profile
+    return {
+      workspace: snapshot.workspace,
+      value: envelope(db, snapshot.workspace.workspaceId, 'connection-profile', {
+        sourceProfileId: profile.id,
+        name: profile.name,
+        kind: profile.kind,
+        baseUrl: profile.baseUrl,
+        defaultHeaders: portableConnectionHeaders(profile.defaultHeaders),
+        appTitle: profile.appTitle,
+        appUrl: profile.appUrl,
+        ...(profile.appCategories === undefined
+          ? {}
+          : { appCategories: [...profile.appCategories] }),
+        supportsEndpointsApi: profile.supportsEndpointsApi,
+        supportsGenerationApi: profile.supportsGenerationApi,
+        supportsPrivacyScrape: profile.supportsPrivacyScrape,
+        ...(profile.capabilityOverrides === undefined
+          ? {}
+          : { capabilityOverrides: structuredClone(profile.capabilityOverrides) }),
+        ...(profile.debugRequests === undefined ? {} : { debugRequests: profile.debugRequests }),
       }),
-      createdAt: snapshot.preset.createdAt,
-      updatedAt: snapshot.preset.updatedAt,
-      ...(snapshot.profile ? { connectionSketch: connectionSketch(snapshot.profile) } : {}),
-    })
+    }
+  }
+
+  async importConnectionProfile(
+    envelope: ConnectionProfileExportEnvelope,
+    options: ImportConnectionProfileOptions = {},
+  ): Promise<ImportConnectionProfileResult> {
+    const commit = this.requireCommit()
+    const now = options.now ?? Date.now()
+    const profileId = newId()
+    return commit.withLocks(
+      ['interchange:import-connection-profile', 'profile-catalog', `profile:${profileId}`],
+      (locked) =>
+        locked.runTransaction(IMPORT_CONNECTION_PROFILE_TRANSACTION, async (tx) => {
+          const payload = envelope.payload
+          const profile = buildConnectionProfile({
+            ...structuredClone(payload),
+            id: profileId,
+            name: await uniqueConnectionName(tx, payload.name),
+            defaultHeaders: portableConnectionHeaders(payload.defaultHeaders),
+            now,
+          })
+          await addLinkedSemanticByteOwner(tx, 'profiles', profile)
+          await putConfigurationProfileCatalogProjection(tx, profile)
+
+          return { profileId }
+        }),
+    )
   }
 
   async importChatPreset(
     envelope: ChatPresetExportEnvelope,
     options: ImportChatPresetOptions = {},
   ): Promise<ImportChatPresetResult> {
-    const db = await openDb()
+    const db = this.db
+    const commit = this.requireCommit()
     const now = options.now ?? Date.now()
     const payload = envelope.payload
-    const resolvedProfile = await resolveProfileId(db, payload.settings, payload.connectionSketch, {
-      targetProfileId: options.targetProfileId,
-    })
     const presetId = newId()
-    const preset: ChatPreset = {
-      id: presetId,
-      name: await uniquePresetName(db, payload.name),
-      connectionProfileId: resolvedProfile.profileId,
-      settings: normalizedImportedSettings(payload.settings, resolvedProfile.profileId),
-      sortIndex: await nextPresetSortIndex(db),
-      createdAt: now,
-      updatedAt: now,
-      archived: false,
+    const missingProfileId = `missing:${newId()}`
+    let result: ImportChatPresetResult | undefined
+    for (;;) {
+      const plannedProfile = await db.transaction('r', db.profiles, (tx) =>
+        resolveProfileId(
+          tx.table<ConnectionProfile, ProfileId>('profiles'),
+          payload.settings,
+          payload.connectionSketch,
+          {
+            targetProfileId: options.targetProfileId,
+            missingProfileId,
+          },
+        ),
+      )
+      try {
+        await commit.withLocks(
+          [
+            'interchange:import-chat-preset',
+            'preset-catalog',
+            'profile-catalog',
+            `preset:${presetId}`,
+            `profile:${plannedProfile.profileId}`,
+            `configuration-target:profile:${plannedProfile.profileId}`,
+          ],
+          (locked) =>
+            locked.runTransaction(IMPORT_CHAT_PRESET_TRANSACTION, async (tx) => {
+              const resolvedProfile = await resolveProfileId(
+                tx.table<ConnectionProfile, ProfileId>('profiles'),
+                payload.settings,
+                payload.connectionSketch,
+                {
+                  targetProfileId: options.targetProfileId,
+                  missingProfileId,
+                },
+              )
+              if (!sameResolvedProfile(plannedProfile, resolvedProfile)) {
+                throw new ImportChatLinkPlanChangedError()
+              }
+              const importedName = await uniquePresetName(
+                tx.table<ChatPreset, PresetId>('presets'),
+                payload.name,
+              )
+              const preset: ChatPreset = {
+                id: presetId,
+                name: importedName,
+                connectionProfileId: resolvedProfile.profileId,
+                settings: normalizedImportedSettings(payload.settings, resolvedProfile.profileId),
+                createdAt: now,
+                updatedAt: now,
+                archived: false,
+              }
+              await addLinkedSemanticByteOwner(tx, 'presets', preset)
+              await appendPresetOrderEntry(tx, preset.id)
+              await putConfigurationPresetCatalogProjection(tx, preset)
+
+              result = {
+                presetId,
+                profileId: resolvedProfile.profileId,
+                profileMatched: resolvedProfile.matched,
+              }
+            }),
+        )
+        break
+      } catch (error) {
+        if (error instanceof ImportChatLinkPlanChangedError) continue
+        throw error
+      }
     }
-    await withNamedLock(`preset:${presetId}`, (grant) =>
-      grant.runTransaction(db, [db.presets, db.settings], async (tx) => {
-        await tx.table('presets').put(preset)
-        await bumpBrowserWorkspaceMeta(tx, now)
-      }),
-    )
-    postEvent({ kind: 'preset-mutated', presetId })
-    return {
-      presetId,
-      profileId: resolvedProfile.profileId,
-      profileMatched: resolvedProfile.matched,
-    }
+    if (!result) throw new Error('ImportChatPresetCommitMissing')
+    return result
   }
 
-  async exportWorkspaceBackup(): Promise<WorkspaceBackupEnvelope> {
-    const db = await openDb()
-    const snapshot = await db.transaction('r', db.tables, async () => {
+  async exportWorkspaceBackup(): Promise<BrowserImportExportRead<WorkspaceBackupEnvelope>> {
+    const db = this.db
+    const snapshot = await db.transaction('r', db.tables, async (tx) => {
+      const workspace = await readBrowserWorkspaceMetaFromTransaction(tx)
+      const messages = sortMessages(await hydrateAllStoredMessagesInPages(db))
+      const drafts = await readTableInPages(db.drafts)
+      const attachmentIds = collectWorkspaceAttachmentIds(messages, drafts)
+      const allPresets = await readTableInPages(db.presets)
+      const presetById = new Map(allPresets.map((preset) => [preset.id, preset]))
+      const activePresetIds = await readPresetOrderIds(tx)
+      const activePresets = activePresetIds.map((presetId) => {
+        const preset = presetById.get(presetId)
+        if (!preset) throw new Error(`PresetOrderPresetMissing:${presetId}`)
+        if (preset.archived === true) throw new Error(`PresetOrderPresetArchived:${presetId}`)
+        presetById.delete(presetId)
+        return preset
+      })
+      const archivedPresets = [...presetById.values()]
+        .filter((preset) => preset.archived === true)
+        .sort((left, right) => left.id.localeCompare(right.id))
+      if (presetById.size !== archivedPresets.length)
+        throw new Error('PresetOrderActivePresetMissing')
       return {
+        workspace,
         chats: await readTableInPages(db.chats),
-        messages: sortMessages(await hydrateAllStoredMessagesInPages(db)),
-        childLists: await readTableInPages(db.childLists),
-        chatBranchCache: await readTableInPages(db.chatBranchCache),
-        attachmentBundles: await storedAllAttachmentBundlesInPages(db),
+        messages,
+        attachmentBundles: await storedAttachmentBundles(db, attachmentIds),
         profiles: await readTableInPages(db.profiles),
-        presets: await readTableInPages(db.presets),
+        presets: [...activePresets, ...archivedPresets],
         promptPresets: await readTableInPages(db.promptPresets),
         folders: await readTableInPages(db.folders),
         tags: await readTableInPages(db.tags),
-        drafts: await readTableInPages(db.drafts),
+        drafts,
         keys: await readTableInPages(db.keys),
-        settings: (await readTableInPages(db.settings)).filter(
-          (row) =>
-            !isChatSidebarProjectionSettingKey(row.key) &&
-            !isInternalStreamAdmissionSettingKey(row.key),
+        textTemplates: await readTableInPages(db.textTemplates),
+        settings: (await readTableInPages(db.settings)).filter((row) =>
+          isPortableWorkspaceSettingKey(row.key),
         ),
       }
     })
 
     const attachments = await consumePortableAttachmentBundles(snapshot.attachmentBundles)
 
-    return envelope(db, 'workspace-backup', {
+    const sourcePayload: WorkspaceBackupPayload = {
       chats: snapshot.chats,
       messages: snapshot.messages,
-      childLists: snapshot.childLists,
-      chatBranchCache: snapshot.chatBranchCache,
+      childLists: [],
+      chatBranchCache: [],
       attachments,
       profiles: snapshot.profiles,
       presets: snapshot.presets,
@@ -477,177 +788,414 @@ class BrowserImportExportBackend implements WorkspaceImportExportBackend {
       tags: snapshot.tags,
       drafts: snapshot.drafts,
       keys: snapshot.keys,
-      settings: snapshot.settings,
-    })
-  }
+      settings: [
+        ...snapshot.settings,
+        ...(snapshot.textTemplates.length > 0
+          ? [
+              {
+                key: LEGACY_SAVED_TEXT_TEMPLATES_KEY,
+                value: snapshot.textTemplates,
+              },
+            ]
+          : []),
+      ],
+    }
+    const normalizedPayload = normalizeWorkspaceCredentialReferences(sourcePayload)
+    const payload: WorkspaceBackupPayload = {
+      ...normalizedPayload,
+      manifest: workspaceBackupManifest(normalizedPayload),
+    }
+    const value = envelope(db, snapshot.workspace.workspaceId, 'workspace-backup', payload)
+    assertEnvelopeKind(value, 'workspace-backup')
+    validateWorkspaceBackupGraph(value.payload)
 
-  async restoreWorkspaceBackup(
-    envelope: WorkspaceBackupEnvelope,
-    options: RestoreWorkspaceBackupOptions = {},
-  ): Promise<RestoreWorkspaceBackupResult> {
-    const db = await openDb()
-    const now = options.now ?? Date.now()
-    validateWorkspaceBackupGraph(envelope.payload)
-    const validatedBlobTypes = await validatePortableAttachmentBundles(envelope.payload.attachments)
-    const previewTextByChatId = previewTextsByChat(envelope.payload.messages)
-    const workspaceTables = db.tables.filter((table) => table.name !== 'browserLocks')
-    let replacementEpoch: number | undefined
-    await withNamedLock('db:global', async (grant) => {
-      const runtimeStreamIds = await replacementRuntimeStreamIds()
-      if (runtimeStreamIds.length > 0) {
-        throw new WorkspaceReplacementInProgressError(runtimeStreamIds)
-      }
-      await grant.runTransaction(db, workspaceTables, async (tx) => {
-        const beforeRestoreMeta = await readBrowserWorkspaceMetaFromTransaction(tx)
-        const activeStreamIds = new Set<string>()
-        const leases = await tx.table<StreamLeaseRow, string>('streamLeases').toArray()
-        for (const lease of leases) {
-          if (isFreshStreamLease(lease)) activeStreamIds.add(lease.streamId)
-        }
-        await tx.table<MessageHeaderRow, string>('messages').each((message) => {
-          if (
-            message.generation?.status === 'streaming' &&
-            Date.now() - message.generation.startedAt <= STREAM_LEASE_TTL_MS
-          ) {
-            activeStreamIds.add(`streaming-message:${message.id}`)
-          }
-        })
-        for (const streamId of useStreamStore.getState().listStreamIds()) {
-          activeStreamIds.add(streamId)
-        }
-        if (activeStreamIds.size > 0) {
-          throw new WorkspaceReplacementInProgressError(activeStreamIds)
-        }
-        for (const table of workspaceTables) await tx.table(table.name).clear()
-        await bulkPutInPages(db.folders, envelope.payload.folders)
-        await bulkPutInPages(db.tags, envelope.payload.tags)
-        await bulkPutInPages(db.profiles, envelope.payload.profiles)
-        await bulkPutInPages(db.presets, envelope.payload.presets)
-        await bulkPutInPages(db.promptPresets, envelope.payload.promptPresets)
-        await bulkPutInPages(db.keys, envelope.payload.keys)
-        for (const page of pages(envelope.payload.settings)) {
-          const authoritative = page.filter(
-            (row) =>
-              !isChatSidebarProjectionSettingKey(row.key) &&
-              !isInternalStreamAdmissionSettingKey(row.key),
-          )
-          if (authoritative.length > 0) {
-            await db.settings.bulkPut(authoritative)
-            recordTableWrite(authoritative.length)
-          }
-        }
-        for (const page of pages(envelope.payload.chats)) {
-          const restored = page.map((chat) => ({
-            ...chat,
-            previewText: previewTextByChatId.get(chat.id) ?? '',
-          }))
-          await db.chats.bulkPut(restored)
-          await db.chatSidebarRows.bulkPut(restored.map(chatSidebarProjectionRow))
-          recordTableWrite(restored.length)
-          recordTableWrite(restored.length)
-        }
-        await db.settings.bulkPut(chatSidebarProjectionSettings(envelope.payload.chats.length))
-        recordTableWrite(2)
-        for (const bundle of envelope.payload.attachments) {
-          await storePortableAttachmentBundle(db, bundle, validatedBlobTypes)
-        }
-        await storeMessagesInPages(db, envelope.payload.messages)
-        await bulkPutInPages(db.drafts, envelope.payload.drafts)
-        await replaceMessageAttachmentReferenceOwnersInPages(tx, envelope.payload.messages)
-        for (const page of pages(envelope.payload.drafts)) {
-          await replaceAttachmentReferenceOwners(
-            tx,
-            page.map((draft) => ({
-              ownerKind: 'draft' as const,
-              ownerId: draft.chatId,
-              chatId: draft.chatId,
-              refs: draft.attachmentRefs,
-            })),
-          )
-        }
-        await bulkPutInPages(db.childLists, envelope.payload.childLists)
-        await bulkPutInPages(db.chatBranchCache, envelope.payload.chatBranchCache)
-        replacementEpoch = await markBrowserWorkspaceReplaced(tx, now, beforeRestoreMeta)
-      })
-      postEvent({ kind: 'workspace-replaced', replacementEpoch: replacementEpoch as number })
-    })
     return {
-      chatCount: envelope.payload.chats.length,
-      messageCount: envelope.payload.messages.length,
-      attachmentCount: envelope.payload.attachments.length,
-      profileCount: envelope.payload.profiles.length,
-      presetCount: envelope.payload.presets.length,
-      promptPresetCount: envelope.payload.promptPresets.length,
-      keyCount: envelope.payload.keys.length,
+      workspace: snapshot.workspace,
+      value,
     }
+  }
+
+  private requireCommit(): BrowserImportExportCommit {
+    if (!this.commit) throw new Error('BrowserImportExportCommitRequired')
+    return this.commit
   }
 }
 
-async function replacementRuntimeStreamIds(): Promise<string[]> {
-  const ids = new Set<string>()
-  addRuntimeStreamIds(ids)
-  const manager = lockQueryManager()
-  if (!manager) return [...ids]
-  try {
-    const snapshot = await manager.query()
-    for (const lock of [...(snapshot.held ?? []), ...(snapshot.pending ?? [])]) {
-      if (lock.name?.startsWith('stream-owner:')) ids.add(lock.name.slice('stream-owner:'.length))
-    }
-  } catch {
-    ids.add('stream-owner-state-unknown')
+export interface PreparedBrowserWorkspaceBackup {
+  readonly envelope: WorkspaceBackupEnvelope
+  readonly validatedBlobTypes: ReadonlyMap<PortableAttachmentBlob, string>
+  readonly previewTextByChatId: ReadonlyMap<string, string>
+}
+
+export async function prepareBrowserWorkspaceBackup(
+  envelope: WorkspaceBackupEnvelope,
+): Promise<PreparedBrowserWorkspaceBackup> {
+  validateWorkspaceBackupGraph(envelope.payload)
+  const validatedBlobTypes = await validatePortableAttachmentBundles(envelope.payload.attachments)
+  return {
+    envelope,
+    validatedBlobTypes,
+    previewTextByChatId: previewTextsByChat(envelope.payload.messages),
   }
-  addRuntimeStreamIds(ids)
-  return [...ids]
 }
 
-function addRuntimeStreamIds(ids: Set<string>): void {
-  for (const streamId of useStreamStore.getState().listStreamIds()) ids.add(streamId)
+export async function commitPreparedBrowserWorkspaceBackup(
+  db: NatterDb,
+  grant: BrowserWorkspaceReplacementMutationGrant,
+  prepared: PreparedBrowserWorkspaceBackup,
+  options: RestoreWorkspaceBackupOptions = {},
+  preactivationCheckpoint: () => void = () => undefined,
+): Promise<{
+  result: RestoreWorkspaceBackupResult
+  workspace: WorkspaceMeta
+  estimatedLiveBytes: number
+}> {
+  preactivationCheckpoint()
+  const payload = prepared.envelope.payload
+  const workspaceTables = db.tables.filter(
+    (table) => table.name !== 'browserLocks' && table.name !== 'workspaceFence',
+  )
+  const transactionTables = [db.workspaceFence, ...workspaceTables]
+  const workspace =
+    grant.atomicity === 'slotted-staging'
+      ? await restorePreparedBrowserWorkspaceRows(
+          db,
+          prepared,
+          options.now ?? Date.now(),
+          preactivationCheckpoint,
+          (tables, operation) =>
+            grant.runTransaction(db, tables, async (tx) => {
+              const result = await operation(tx)
+              discardStorageCompactionDebt(tx)
+              return result
+            }),
+          workspaceTables,
+        )
+      : await grant.runTransaction(db, transactionTables, (tx) =>
+          restorePreparedBrowserWorkspaceRows(
+            db,
+            prepared,
+            options.now ?? Date.now(),
+            preactivationCheckpoint,
+            (_tables, operation) => operation(tx),
+            workspaceTables,
+          ),
+        )
+  const estimatedLiveBytes = await estimateBrowserWorkspaceLiveBytes(db, preactivationCheckpoint)
+  return {
+    workspace,
+    estimatedLiveBytes,
+    result: {
+      chatCount: payload.chats.length,
+      messageCount: payload.messages.length,
+      attachmentCount: payload.attachments.length,
+      profileCount: payload.profiles.length,
+      presetCount: payload.presets.length,
+      promptPresetCount: payload.promptPresets.length,
+      keyCount: payload.keys.length,
+    },
+  }
 }
 
-function lockQueryManager():
-  | {
-      query: () => Promise<{ held?: Array<{ name?: string }>; pending?: Array<{ name?: string }> }>
-    }
-  | undefined {
-  if (typeof navigator === 'undefined') return undefined
-  const locks = (navigator as unknown as { locks?: LockManager }).locks as
-    | (LockManager & {
-        query?: () => Promise<{
-          held?: Array<{ name?: string }>
-          pending?: Array<{ name?: string }>
-        }>
+async function restorePreparedBrowserWorkspaceRows(
+  db: NatterDb,
+  prepared: PreparedBrowserWorkspaceBackup,
+  now: number,
+  preactivationCheckpoint: () => void,
+  runTransaction: <T>(
+    tables: readonly Table[],
+    operation: (tx: Transaction) => Promise<T>,
+  ) => Promise<T>,
+  workspaceTables: readonly Table[],
+): Promise<WorkspaceMeta> {
+  const payload = prepared.envelope.payload
+  const textTemplates = savedTextTemplatesFromStoredValue(
+    payload.settings.find((row) => row.key === LEGACY_SAVED_TEXT_TEMPLATES_KEY)?.value,
+  )
+  const recordRestoredValues = (_values: readonly unknown[]) => undefined
+  const restoreBulkPut = async <T>(table: Table<T, string>, rows: readonly T[]) => {
+    for (const page of pages(rows)) {
+      preactivationCheckpoint()
+      await runTransaction([table], async (tx) => {
+        await tx.table<T, string>(table.name).bulkPut(page)
+        recordRestoredValues(page)
+        recordTableWrite(page.length)
       })
-    | undefined
-  const query = locks?.query
-  return typeof query === 'function' ? { query: () => query.call(locks) } : undefined
+    }
+  }
+  const beforeRestoreMeta = await runTransaction(
+    [db.workspaceFence, db.streamLeases],
+    async (tx) => {
+      const workspace = await readBrowserWorkspaceMetaFromTransaction(tx)
+      const activeStreamIds = await workspaceReplacementBlockersInTransaction(tx, now)
+      if (activeStreamIds.length > 0) {
+        throw new WorkspaceReplacementInProgressError(activeStreamIds)
+      }
+      return workspace
+    },
+  )
+  preactivationCheckpoint()
+  await runTransaction(workspaceTables, async (tx) => {
+    for (const table of workspaceTables) {
+      await tx.table(table.name).clear()
+    }
+  })
+  await runTransaction([db.storageRetentionState, db.discoveryCacheState], async (tx) => {
+    const retentionRows = [...freshStorageRetentionStateRows()]
+    await tx
+      .table<(typeof retentionRows)[number], string>('storageRetentionState')
+      .bulkPut(retentionRows)
+    recordRestoredValues(retentionRows)
+    await seedEmptyDiscoveryCacheState(tx)
+  })
+  await restoreBulkPut(db.folders, payload.folders)
+  await restoreBulkPut(db.tags, payload.tags)
+  const profiles = payload.profiles.map((profile) => ({
+    ...profile,
+    requestRevision: profile.requestRevision ?? 0,
+  }))
+  const presets = payload.presets.map((preset) => ({
+    ...preset,
+    settings: structuredClone(preset.settings),
+  }))
+  const keys = payload.keys.map((key) => ({
+    ...key,
+    materialRevision: key.materialRevision ?? 0,
+  }))
+  await restoreBulkPut(db.profiles, profiles)
+  await restoreBulkPut(
+    db.configurationProfileCatalogRows,
+    profiles.map(configurationProfileCatalogProjectionRow),
+  )
+  const promptPresetCounts: Record<PromptPresetKind, number> = {
+    system: 0,
+    append: 0,
+    'continue-system': 0,
+    'continue-user': 0,
+    prefill: 0,
+  }
+  for (const promptPreset of payload.promptPresets) {
+    promptPresetCounts[promptPreset.kind] += 1
+  }
+  const configurationAggregates = configurationCatalogMetadataRowsFromCounts({
+    totalProfileCount: profiles.length,
+    activeProfileCount: profiles.filter((profile) => profile.archived !== true).length,
+    promptPresetCounts,
+  })
+  await restoreBulkPut(db.configurationCatalogAggregates, configurationAggregates)
+  await restoreBulkPut(db.presets, presets)
+  await buildPresetOrderOnEmptyTables(
+    {
+      states: db.presetOrderState,
+      blocks: db.presetOrderBlocks,
+      memberships: db.presetOrderMembership,
+    },
+    activePresetIdsInOrder(presets),
+    runTransaction,
+    preactivationCheckpoint,
+  )
+  await restoreBulkPut(
+    db.configurationPresetCatalogRows,
+    presets.map(configurationPresetCatalogProjectionRow),
+  )
+  await restoreBulkPut(db.promptPresets, payload.promptPresets)
+  await restoreBulkPut(
+    db.configurationPromptPresetCatalogRows,
+    payload.promptPresets.map(configurationPromptPresetCatalogProjectionRow),
+  )
+  await restoreBulkPut(db.keys, keys)
+  await restoreBulkPut(db.textTemplates, textTemplates)
+  for (const page of pages(profiles)) {
+    await restoreBulkPut(db.configurationLinks, page.flatMap(configurationLinksForProfile))
+  }
+  for (const page of pages(presets)) {
+    await restoreBulkPut(db.configurationLinks, page.flatMap(configurationLinksForPreset))
+  }
+  for (const page of pages(payload.settings)) {
+    const authoritative = page.filter((row) => isPortableWorkspaceSettingKey(row.key))
+    await restoreBulkPut(db.settings, authoritative)
+  }
+  await restoreBulkPut(db.settings, [completedStreamJournalIntegritySetting()])
+  const sidebarAggregates = createChatSidebarAggregateAccumulator()
+  for (const page of pages(payload.chats)) {
+    preactivationCheckpoint()
+    const restored = page.map((chat) => ({
+      ...chat,
+      structuralVersion: chat.structuralVersion,
+      configurationVersion: chat.configurationVersion ?? 0,
+      previewText: prepared.previewTextByChatId.get(chat.id) ?? '',
+    }))
+    const projected = restored.map(chatSidebarProjectionRow)
+    await runTransaction([db.chats, db.chatSidebarRows, db.configurationLinks], async (tx) => {
+      await tx.table('chats').bulkPut(restored)
+      await tx.table('chatSidebarRows').bulkPut(projected)
+      await tx.table('configurationLinks').bulkPut(restored.flatMap(configurationLinksForChat))
+      recordRestoredValues(restored)
+      recordRestoredValues(projected)
+      recordTableWrite(restored.length)
+      recordTableWrite(restored.length)
+    })
+    accumulateChatSidebarAggregateRows(sidebarAggregates, projected)
+  }
+  await restoreBulkPut(
+    db.configurationProfileUsageRows,
+    configurationProfileUsageProjectionRows(presets, payload.chats),
+  )
+  await restoreBulkPut(
+    db.chatSidebarAggregates,
+    materializeChatSidebarAggregateRows(sidebarAggregates),
+  )
+  await restoreBulkPut(db.settings, chatSidebarProjectionSettings())
+  await restoreBulkPut(db.attachmentCatalogAggregate, [emptyAttachmentCatalogAggregateRow()])
+  for (const bundle of payload.attachments) {
+    await storePortableAttachmentBundle(
+      db,
+      bundle,
+      prepared.validatedBlobTypes,
+      runTransaction,
+      preactivationCheckpoint,
+      recordRestoredValues,
+    )
+  }
+  await storeMessagesInPages(
+    db,
+    payload.messages,
+    preactivationCheckpoint,
+    recordRestoredValues,
+    runTransaction,
+  )
+  await restoreBulkPut(db.drafts, payload.drafts)
+  await replaceMessageAttachmentReferenceOwnersInRestoreTransactions(
+    db,
+    payload.messages,
+    now,
+    preactivationCheckpoint,
+    runTransaction,
+  )
+  for (const page of pages(payload.drafts)) {
+    preactivationCheckpoint()
+    await runTransaction(
+      [
+        db.attachmentRefEdges,
+        db.attachments,
+        db.attachmentCatalogRows,
+        db.attachmentCatalogAggregate,
+      ],
+      (tx) =>
+        applyAttachmentReferenceOwnerTransitions(
+          tx,
+          page.map((draft) => ({
+            ownerKind: 'draft' as const,
+            ownerId: draft.chatId,
+            chatId: draft.chatId,
+            previousRefs: undefined,
+            nextRefs: draft.attachmentRefs,
+          })),
+          now,
+        ).then(() => undefined),
+    )
+  }
+  await runTransaction([db.chats, db.messages, db.childLists, db.childSlotMembers], (tx) =>
+    rebuildChildSlotDerivedState(tx, {
+      rebuiltAt: now,
+      checkpoint: preactivationCheckpoint,
+    }),
+  )
+  return runTransaction(
+    [db.attachmentCatalogAggregate, db.attachmentIntegrityState, db.workspaceFence],
+    async (tx) => {
+      await markAttachmentIntegrityRepairComplete(tx)
+      await markBrowserWorkspaceReplaced(tx, beforeRestoreMeta)
+      preactivationCheckpoint()
+      discardStorageCompactionDebt(tx)
+      return readBrowserWorkspaceMetaFromTransaction(tx)
+    },
+  )
 }
 
-let singleton: WorkspaceImportExportBackend | null = null
-
-export function getBrowserImportExportBackend(): WorkspaceImportExportBackend {
-  singleton ??= new BrowserImportExportBackend()
-  return singleton
+async function estimateBrowserWorkspaceLiveBytes(
+  db: NatterDb,
+  preactivationCheckpoint: () => void,
+): Promise<number> {
+  let total = 0
+  for (const table of db.tables) {
+    if (table.name === 'browserLocks') continue
+    let batchRows = 0
+    await table.each((row) => {
+      if (batchRows === 0) preactivationCheckpoint()
+      total = Math.min(Number.MAX_SAFE_INTEGER, total + estimateStoredValueBytes(row))
+      batchRows += 1
+      if (batchRows !== IMPORT_EXPORT_PAGE_SIZE) return
+      recordTableRead(batchRows)
+      batchRows = 0
+    })
+    if (batchRows > 0) recordTableRead(batchRows)
+  }
+  return total
 }
 
-export function __resetBrowserImportExportBackendForTests(): void {
-  singleton = null
+export async function browserWorkspaceReplacementBlockers(
+  db: NatterDb,
+  now = Date.now(),
+): Promise<string[]> {
+  return db.transaction('r', [db.streamLeases, db.workspaceFence], (tx) =>
+    workspaceReplacementBlockersInTransaction(tx, now),
+  )
 }
 
-function envelope(db: NatterDb, kind: 'chat', payload: PortableChatPayload): ChatExportEnvelope
+async function workspaceReplacementBlockersInTransaction(
+  tx: Transaction,
+  now: number,
+): Promise<string[]> {
+  const blockers = new Set<string>()
+  const workspace = await readBrowserWorkspaceMetaFromTransaction(tx)
+  await tx.table<StreamLeaseRow, string>('streamLeases').each((lease) => {
+    const availability = reduceAttemptAvailability(undefined, {
+      workspace,
+      lease: { kind: 'present', lease },
+      localAuthority: { kind: 'none' },
+      ownershipLock: { kind: 'unsupported' },
+      wallNow: now,
+      schedulerNow: now,
+    })
+    if (availability.blocksReplacement) blockers.add(lease.streamId)
+  })
+  return [...blockers].sort()
+}
+
 function envelope(
   db: NatterDb,
+  workspaceId: string,
+  kind: 'chat',
+  payload: PortableChatPayload,
+): ChatExportEnvelope
+function envelope(
+  db: NatterDb,
+  workspaceId: string,
   kind: 'chat-preset',
   payload: PortableChatPresetPayload,
 ): ChatPresetExportEnvelope
 function envelope(
   db: NatterDb,
+  workspaceId: string,
+  kind: 'connection-profile',
+  payload: PortableConnectionProfilePayload,
+): ConnectionProfileExportEnvelope
+function envelope(
+  db: NatterDb,
+  workspaceId: string,
   kind: 'workspace-backup',
   payload: WorkspaceBackupPayload,
 ): WorkspaceBackupEnvelope
 function envelope(
   db: NatterDb,
+  workspaceId: string,
   kind: NatterExportObjectKind,
-  payload: PortableChatPayload | PortableChatPresetPayload | WorkspaceBackupPayload,
+  payload:
+    | PortableChatPayload
+    | PortableChatPresetPayload
+    | PortableConnectionProfilePayload
+    | WorkspaceBackupPayload,
 ): NatterExportEnvelope {
   return {
     objectKind: kind,
@@ -657,10 +1205,21 @@ function envelope(
     source: {
       app: 'natter',
       backendKind: 'browser-idb',
-      workspaceId: WORKSPACE_ID,
+      workspaceId,
     },
     payload,
   } as NatterExportEnvelope
+}
+
+function portableConnectionHeaders(
+  headers: Readonly<Record<string, string>>,
+): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(headers).filter(([name]) => {
+      const normalized = name.toLowerCase().replace(/[^a-z0-9]/g, '')
+      return !/(authorization|apikey|token|secret|password|credential|cookie)/.test(normalized)
+    }),
+  )
 }
 
 function connectionSketch(profile: ConnectionProfile): ConnectionSketch {
@@ -687,28 +1246,34 @@ function tagSketch(tag: ChatTag): PortableTagSketch {
 }
 
 async function resolveProfileId(
-  db: NatterDb,
+  profiles: Table<ConnectionProfile, ProfileId>,
   settings: ChatSettings,
   sketch: ConnectionSketch | undefined,
-  options: { targetProfileId?: ProfileId | null | undefined },
+  options: {
+    targetProfileId?: ProfileId | null | undefined
+    missingProfileId?: ProfileId
+  },
 ): Promise<ResolvedProfile> {
   if (typeof options.targetProfileId === 'string') {
     return {
       profileId: options.targetProfileId,
-      matched: Boolean(await db.profiles.get(options.targetProfileId)),
+      matched: Boolean(await profiles.get(options.targetProfileId)),
     }
   }
 
   const sourceId = sketch?.sourceProfileId ?? settings.profileId
   if (options.targetProfileId === null) {
-    return { profileId: sourceId || `missing:${newId()}`, matched: false }
+    return {
+      profileId: sourceId || options.missingProfileId || `missing:${newId()}`,
+      matched: false,
+    }
   }
 
-  if (sourceId && (await db.profiles.get(sourceId))) return { profileId: sourceId, matched: true }
+  if (sourceId && (await profiles.get(sourceId))) return { profileId: sourceId, matched: true }
 
   if (sketch) {
-    const profiles = await db.profiles.toArray()
-    const match = profiles.find(
+    const rows = await profiles.toArray()
+    const match = rows.find(
       (profile) =>
         profile.archived !== true &&
         profile.kind === sketch.kind &&
@@ -717,7 +1282,51 @@ async function resolveProfileId(
     if (match) return { profileId: match.id, matched: true }
   }
 
-  return { profileId: sourceId || `missing:${newId()}`, matched: false }
+  return {
+    profileId: sourceId || options.missingProfileId || `missing:${newId()}`,
+    matched: false,
+  }
+}
+
+async function planImportChatLinks(
+  db: NatterDb,
+  settings: ChatSettings,
+  sketch: ConnectionSketch | undefined,
+  targetProfileId: ProfileId | null | undefined,
+  missingProfileId: ProfileId,
+  attachments: readonly PreparedImportedAttachmentBundle[],
+): Promise<ImportChatLinkPlan> {
+  return db.transaction('r', [db.attachments, db.profiles], async (tx) => {
+    const profile = await resolveProfileId(
+      tx.table<ConnectionProfile, ProfileId>('profiles'),
+      settings,
+      sketch,
+      {
+        targetProfileId,
+        missingProfileId,
+      },
+    )
+    const attachmentsTable = tx.table<AttachmentHeaderRow, AttachmentId>('attachments')
+    const attachmentIdBySourceId = new Map<AttachmentId, AttachmentId>()
+    for (const candidate of attachments) {
+      const duplicate = await findExistingAttachment(attachmentsTable, candidate.bundle.attachment)
+      attachmentIdBySourceId.set(
+        candidate.sourceAttachmentId,
+        duplicate?.id ?? candidate.bundle.attachment.id,
+      )
+    }
+    return { profile, attachmentIdBySourceId }
+  })
+}
+
+function sameResolvedProfile(left: ResolvedProfile, right: ResolvedProfile): boolean {
+  return left.profileId === right.profileId && left.matched === right.matched
+}
+
+function* activePresetIdsInOrder(presets: readonly ChatPreset[]): Iterable<PresetId> {
+  for (const preset of presets) {
+    if (preset.archived !== true) yield preset.id
+  }
 }
 
 function normalizeBaseUrl(value: string): string {
@@ -725,29 +1334,29 @@ function normalizeBaseUrl(value: string): string {
 }
 
 function normalizedImportedSettings(settings: ChatSettings, profileId: ProfileId): ChatSettings {
-  const next = stripPromptPresetPins(structuredClone(settings))
+  const next = flattenChatSettingsForPortableExport(settings)
   next.profileId = profileId
-  next.enabledToolIds = []
-  next.trustedToolIds = []
   return next
 }
 
 async function ensurePortableFolder(
-  db: NatterDb,
+  tx: Transaction,
   sketch: PortableFolderSketch | undefined,
   now: number,
+  createdFolderId: FolderId | undefined,
 ): Promise<{ folderId: FolderId | undefined; created: boolean }> {
   if (!sketch) return { folderId: undefined, created: false }
   const name = sketch.name.trim()
   if (!name) return { folderId: undefined, created: false }
-  const existing = (await db.folders.toArray()).find(
+  const folders = tx.table<ChatFolder, FolderId>('folders')
+  const rows = await folders.toArray()
+  const existing = rows.find(
     (folder) => folder.name.toLocaleLowerCase() === name.toLocaleLowerCase(),
   )
   if (existing) return { folderId: existing.id, created: false }
-  const rows = await db.folders.toArray()
   const sortIndex = rows.reduce((max, row) => Math.max(max, row.sortIndex), 0) + 1
   const folder: ChatFolder = {
-    id: newId(),
+    id: createdFolderId ?? newId(),
     name,
     ...(sketch.color ? { color: sketch.color } : {}),
     sortIndex,
@@ -755,23 +1364,27 @@ async function ensurePortableFolder(
     updatedAt: now,
     lastUsedAt: now,
   }
-  await db.folders.put(folder)
+  await putChatFolderByteOwner(tx, folder, undefined)
   return { folderId: folder.id, created: true }
 }
 
+function portableFolderCandidateId(sketch: PortableFolderSketch | undefined): FolderId | undefined {
+  return sketch?.name.trim() ? newId() : undefined
+}
+
 async function ensurePortableTags(
-  db: NatterDb,
+  tx: Transaction,
   sketches: readonly PortableTagSketch[],
   now: number,
 ): Promise<{ tagIds: TagId[]; createdTagIds: TagId[] }> {
-  const existing = await db.tags.toArray()
+  const existing = await tx.table<ChatTag, TagId>('tags').toArray()
   const byLower = new Map(existing.map((tag) => [tag.nameLower, tag]))
   const tagIds: TagId[] = []
-  const createdTagIds: TagId[] = []
+  const createdTags: ChatTag[] = []
   for (const sketch of sketches) {
     const name = sketch.name.trim()
     if (!name) continue
-    const nameLower = name.toLocaleLowerCase()
+    const nameLower = chatTagNameLower(name)
     const current = byLower.get(nameLower)
     if (current) {
       tagIds.push(current.id)
@@ -786,17 +1399,20 @@ async function ensurePortableTags(
       updatedAt: now,
       lastUsedAt: now,
     }
-    await db.tags.put(tag)
     byLower.set(nameLower, tag)
     tagIds.push(tag.id)
-    createdTagIds.push(tag.id)
+    createdTags.push(tag)
   }
-  return { tagIds: [...new Set(tagIds)], createdTagIds }
+  await putChatTagByteOwners(tx, createdTags, [])
+  return { tagIds: [...new Set(tagIds)], createdTagIds: createdTags.map((tag) => tag.id) }
 }
 
-async function uniquePresetName(db: NatterDb, name: string): Promise<string> {
+async function uniquePresetName(
+  presets: Table<ChatPreset, PresetId>,
+  name: string,
+): Promise<string> {
   const base = name.trim() || 'Imported preset'
-  const existing = new Set((await db.presets.toArray()).map((preset) => preset.name))
+  const existing = new Set((await presets.toArray()).map((preset) => preset.name))
   if (!existing.has(base)) return base
   for (let i = 2; ; i += 1) {
     const candidate = `${base} (${i})`
@@ -804,9 +1420,22 @@ async function uniquePresetName(db: NatterDb, name: string): Promise<string> {
   }
 }
 
-async function nextPresetSortIndex(db: NatterDb): Promise<number> {
-  const rows = await db.presets.toArray()
-  return rows.length === 0 ? 0 : Math.max(...rows.map((row) => row.sortIndex)) + 1
+async function uniqueConnectionName(tx: Transaction, name: string): Promise<string> {
+  const base = name.trim() || 'Imported connection'
+  const existing = new Set(
+    (
+      await tx
+        .table<ConfigurationProfileCatalogProjectionRow, ProfileId>(
+          'configurationProfileCatalogRows',
+        )
+        .toArray()
+    ).map((profile) => profile.name),
+  )
+  if (!existing.has(base)) return base
+  for (let index = 2; ; index += 1) {
+    const candidate = `${base} (${index})`
+    if (!existing.has(candidate)) return candidate
+  }
 }
 
 async function storedAttachmentBundles(
@@ -821,33 +1450,11 @@ async function storedAttachmentBundles(
       db.attachmentArtifacts.where('attachmentId').equals(id),
     )
     bundles.push({
-      attachment: hydrateAttachment(attachmentHeaderFromStoredRow(header), artifacts),
+      attachment: hydrateAttachment(header, artifacts),
       blobs: await readCollectionInPages(db.attachmentBlobs.where('attachmentId').equals(id)),
       artifacts,
       jobs: await readCollectionInPages(db.attachmentJobs.where('attachmentId').equals(id)),
     })
-  }
-  return bundles
-}
-
-async function storedAllAttachmentBundlesInPages(db: NatterDb): Promise<StoredAttachmentBundle[]> {
-  const bundles: StoredAttachmentBundle[] = []
-  for await (const attachments of tablePages(db.attachments)) {
-    for (const header of attachments) {
-      const artifacts = await readCollectionInPages(
-        db.attachmentArtifacts.where('attachmentId').equals(header.id),
-      )
-      bundles.push({
-        attachment: hydrateAttachment(attachmentHeaderFromStoredRow(header), artifacts),
-        blobs: await readCollectionInPages(
-          db.attachmentBlobs.where('attachmentId').equals(header.id),
-        ),
-        artifacts,
-        jobs: await readCollectionInPages(
-          db.attachmentJobs.where('attachmentId').equals(header.id),
-        ),
-      })
-    }
   }
   return bundles
 }
@@ -920,29 +1527,115 @@ async function hydrateAllStoredMessagesInPages(db: NatterDb): Promise<Message[]>
   return messages
 }
 
-async function storeMessagesInPages(db: NatterDb, messages: readonly Message[]): Promise<void> {
+async function storeMessagesInPages(
+  db: NatterDb,
+  messages: readonly Message[],
+  preactivationCheckpoint: () => void = () => undefined,
+  recordStoredValues: (values: readonly unknown[]) => void = () => undefined,
+  runTransaction?: <T>(
+    tables: readonly Table[],
+    operation: (tx: Transaction) => Promise<T>,
+  ) => Promise<T>,
+): Promise<void> {
   for (const page of pages(messages)) {
+    preactivationCheckpoint()
+    for (const message of page) {
+      assertCanonicalGeneratedOutputMessage(message.content, message.attachmentRefs, message.id)
+    }
     const split = page.map((message) => splitMessageForStorage(message))
-    await db.messages.bulkPut(split.map((row) => row.header))
-    await db.messageBodies.bulkPut(split.map((row) => row.body))
+    const headers = split.map((row) => row.header)
+    const bodies = split.map((row) => row.body)
+    const previews = split.map((row) => row.preview)
+    const write = async (tx?: Transaction) => {
+      await (tx?.table('messages') ?? db.messages).bulkPut(headers)
+      await (tx?.table('messageBodies') ?? db.messageBodies).bulkPut(bodies)
+      await (tx?.table('messagePreviews') ?? db.messagePreviews).bulkPut(previews)
+    }
+    if (runTransaction) {
+      await runTransaction([db.messages, db.messageBodies, db.messagePreviews], (tx) => write(tx))
+    } else await write()
+    recordStoredValues(headers)
+    recordStoredValues(bodies)
+    recordStoredValues(previews)
+    recordTableWrite(split.length)
+    recordTableWrite(split.length)
+    recordTableWrite(split.length)
+  }
+}
+
+async function storeNewMessagesInPages(
+  tx: Transaction,
+  messages: readonly Message[],
+): Promise<void> {
+  const headers = tx.table<MessageHeaderRow, MessageId>('messages')
+  const bodies = tx.table<MessageBodyRow, MessageId>('messageBodies')
+  const previews = tx.table('messagePreviews')
+  for (const page of pages(messages)) {
+    for (const message of page) {
+      assertCanonicalGeneratedOutputMessage(message.content, message.attachmentRefs, message.id)
+    }
+    const split = page.map((message) => splitMessageForStorage(message))
+    await headers.bulkAdd(split.map((row) => row.header))
+    await bodies.bulkAdd(split.map((row) => row.body))
+    await previews.bulkAdd(split.map((row) => row.preview))
+    recordTableWrite(split.length)
     recordTableWrite(split.length)
     recordTableWrite(split.length)
   }
 }
 
 async function replaceMessageAttachmentReferenceOwnersInPages(
-  tx: Parameters<typeof replaceAttachmentReferenceOwners>[0],
+  tx: Parameters<typeof applyAttachmentReferenceOwnerTransitions>[0],
   messages: readonly Message[],
+  preactivationCheckpoint: () => void = () => undefined,
 ): Promise<void> {
   for (const page of pages(messages)) {
-    await replaceAttachmentReferenceOwners(
+    preactivationCheckpoint()
+    await applyAttachmentReferenceOwnerTransitions(
       tx,
       page.map((message) => ({
         ownerKind: 'message' as const,
         ownerId: message.id,
         chatId: message.chatId,
-        refs: message.attachmentRefs,
+        previousRefs: undefined,
+        nextRefs: message.attachmentRefs,
       })),
+      Date.now(),
+    )
+  }
+}
+
+async function replaceMessageAttachmentReferenceOwnersInRestoreTransactions(
+  db: NatterDb,
+  messages: readonly Message[],
+  now: number,
+  preactivationCheckpoint: () => void,
+  runTransaction: <T>(
+    tables: readonly Table[],
+    operation: (tx: Transaction) => Promise<T>,
+  ) => Promise<T>,
+): Promise<void> {
+  for (const page of pages(messages)) {
+    preactivationCheckpoint()
+    await runTransaction(
+      [
+        db.attachmentRefEdges,
+        db.attachments,
+        db.attachmentCatalogRows,
+        db.attachmentCatalogAggregate,
+      ],
+      (tx) =>
+        applyAttachmentReferenceOwnerTransitions(
+          tx,
+          page.map((message) => ({
+            ownerKind: 'message' as const,
+            ownerId: message.id,
+            chatId: message.chatId,
+            previousRefs: undefined,
+            nextRefs: message.attachmentRefs,
+          })),
+          now,
+        ).then(() => undefined),
     )
   }
 }
@@ -995,9 +1688,9 @@ async function readCollectionInPages<T>(collection: Collection<T, string>): Prom
   return rows
 }
 
-async function bulkPutInPages<T>(table: Table<T, string>, rows: readonly T[]): Promise<void> {
+async function bulkAddInPages<T>(table: Table<T, string>, rows: readonly T[]): Promise<void> {
   for (const page of pages(rows)) {
-    await table.bulkPut(page)
+    await table.bulkAdd(page)
     recordTableWrite(page.length)
   }
 }
@@ -1052,38 +1745,33 @@ async function portableBlob(blob: AttachmentBlob): Promise<PortableAttachmentBlo
     materializationMetrics.maxAttachmentBlobReadBytes,
     bytes.byteLength,
   )
+  if (bytes.byteLength !== blob.sizeBytes) {
+    throw new Error(`ExportAttachmentBlobSizeMismatch:${blob.id}`)
+  }
+  const contentHash = await sha256BytesHex(bytes)
+  if (contentHash !== blob.contentHash) {
+    throw new Error(`ExportAttachmentBlobHashMismatch:${blob.id}`)
+  }
   return {
     id: blob.id,
     attachmentId: blob.attachmentId,
     role: blob.role,
     mime: blob.mime,
-    contentHash: blob.contentHash,
-    sizeBytes: blob.sizeBytes,
+    contentHash,
+    sizeBytes: bytes.byteLength,
     dataBase64: bytesToBase64(bytes),
     createdAt: blob.createdAt,
   }
 }
 
 async function prepareImportedAttachments(
-  db: NatterDb,
   bundles: readonly PortableAttachmentBundle[],
-): Promise<ImportedAttachmentBundle[]> {
-  const prepared: ImportedAttachmentBundle[] = []
+): Promise<PreparedImportedAttachmentBundle[]> {
+  const prepared: PreparedImportedAttachmentBundle[] = []
   for (const bundle of bundles) {
-    const duplicate = await findExistingAttachment(db, bundle.attachment)
-    if (duplicate) {
-      prepared.push({
-        sourceAttachmentId: bundle.attachment.id,
-        targetAttachmentId: duplicate.id,
-        reused: true,
-      })
-      continue
-    }
     const stored = await validatedAttachmentBundleFromPortableWithNewIds(bundle)
     prepared.push({
       sourceAttachmentId: bundle.attachment.id,
-      targetAttachmentId: stored.attachment.id,
-      reused: false,
       bundle: stored,
     })
   }
@@ -1091,11 +1779,11 @@ async function prepareImportedAttachments(
 }
 
 async function findExistingAttachment(
-  db: NatterDb,
+  attachments: Table<AttachmentHeaderRow, AttachmentId>,
   source: Attachment,
-): Promise<Attachment | undefined> {
+): Promise<AttachmentHeaderRow | undefined> {
   if (!source.contentHash) return undefined
-  return db.attachments
+  return attachments
     .where('contentHash')
     .equals(source.contentHash)
     .filter(
@@ -1141,7 +1829,7 @@ async function validatedAttachmentBundleFromPortableWithNewIds(
   )
   for (const artifact of source.artifacts) artifactIdMap.set(artifact.artifactId, newId())
 
-  const attachment: Attachment = rewriteAttachmentForImport(
+  let attachment: Attachment = rewriteAttachmentForImport(
     source.attachment,
     targetAttachmentId,
     blobIdMap,
@@ -1150,7 +1838,21 @@ async function validatedAttachmentBundleFromPortableWithNewIds(
   const artifacts = source.artifacts.map((artifact) =>
     rewriteArtifactForImport(artifact, targetAttachmentId, blobIdMap, artifactIdMap),
   )
-  const jobs = source.jobs.map((job) => rewriteJobForImport(job, targetAttachmentId, artifactIdMap))
+  const jobs = source.jobs.map((job) =>
+    rewriteJobForImport(
+      job,
+      targetAttachmentId,
+      artifactIdMap,
+      source.attachment.storage.kind === 'remote-url',
+    ),
+  )
+  const localizationJob = jobs.find(isGeneratedOutputLocalizationJob)
+  if (localizationJob) {
+    attachment = {
+      ...attachment,
+      processing: withGeneratedOutputLocalizationState(attachment.processing, localizationJob),
+    }
+  }
   verifyPortableBundleIntegrity(attachment, blobs)
   return { attachment, blobs, artifacts, jobs }
 }
@@ -1196,38 +1898,90 @@ function materializePortableBlob(blob: PortableAttachmentBlob, blobType: string)
 }
 
 async function storeValidatedAttachmentBundle(
-  db: NatterDb,
+  tx: Transaction,
   bundle: ValidatedAttachmentBundle,
 ): Promise<void> {
-  await db
-    .table<AttachmentHeaderRow, string>('attachments')
-    .put(splitAttachmentForStorage({ ...bundle.attachment, refCount: 0 }))
+  const header = splitAttachmentForStorage({ ...bundle.attachment, refCount: 0 })
+  await putAttachmentHeaderByteOwner(tx, header, undefined)
+  await putAttachmentCatalogProjectionFromHeader(tx, header, undefined)
+  recordBrowserCommandAttachmentReferenceState(tx, {
+    attachmentId: header.id,
+    initial: { exists: false, refCount: 0 },
+    final: { exists: true, refCount: 0 },
+    projectionChanged: true,
+  })
   recordTableWrite(1)
-  for (const blob of bundle.blobs) {
-    await db.attachmentBlobs.put(materializeValidatedBlob(blob))
-    recordTableWrite(1)
-  }
-  await bulkPutInPages(db.attachmentArtifacts, bundle.artifacts)
-  await bulkPutInPages(db.attachmentJobs, bundle.jobs)
+  recordTableWrite(1)
+  recordTableWrite(1)
+  const blobs = bundle.blobs.map(materializeValidatedBlob)
+  await addAttachmentBlobByteOwners(tx, blobs)
+  await addAttachmentArtifactByteOwners(tx, bundle.artifacts)
+  await addAttachmentJobByteOwners(tx, bundle.jobs)
+  if (blobs.length > 0) recordTableWrite(blobs.length)
+  if (bundle.artifacts.length > 0) recordTableWrite(bundle.artifacts.length)
+  if (bundle.jobs.length > 0) recordTableWrite(bundle.jobs.length)
 }
 
 async function storePortableAttachmentBundle(
   db: NatterDb,
   bundle: PortableAttachmentBundle,
   blobTypes: ReadonlyMap<PortableAttachmentBlob, string>,
+  runTransaction: <T>(
+    tables: readonly Table[],
+    operation: (tx: Transaction) => Promise<T>,
+  ) => Promise<T>,
+  preactivationCheckpoint: () => void = () => undefined,
+  recordStoredValues: (values: readonly unknown[]) => void = () => undefined,
 ): Promise<void> {
-  await db
-    .table<AttachmentHeaderRow, string>('attachments')
-    .put(splitAttachmentForStorage({ ...bundle.attachment, refCount: 0 }))
-  recordTableWrite(1)
-  for (const blob of bundle.blobs) {
-    const blobType = blobTypes.get(blob)
-    if (blobType === undefined) throw new Error(`ImportAttachmentBlobValidationMissing:${blob.id}`)
-    await db.attachmentBlobs.put(materializePortableBlob(blob, blobType))
-    recordTableWrite(1)
+  const header = splitAttachmentForStorage({ ...bundle.attachment, refCount: 0 })
+  preactivationCheckpoint()
+  await runTransaction(
+    [db.attachments, db.attachmentCatalogRows, db.attachmentCatalogAggregate],
+    async (tx) => {
+      await tx.table<AttachmentHeaderRow, string>('attachments').put(header)
+      recordStoredValues([header])
+      await putAttachmentCatalogProjectionFromHeader(tx, header, undefined)
+      recordBrowserCommandAttachmentReferenceState(tx, {
+        attachmentId: header.id,
+        initial: { exists: false, refCount: 0 },
+        final: { exists: true, refCount: 0 },
+        projectionChanged: true,
+      })
+      recordTableWrite(1)
+      recordTableWrite(1)
+      recordTableWrite(1)
+    },
+  )
+  for (const page of pages(bundle.blobs)) {
+    preactivationCheckpoint()
+    const stored = page.map((blob) => {
+      const blobType = blobTypes.get(blob)
+      if (blobType === undefined)
+        throw new Error(`ImportAttachmentBlobValidationMissing:${blob.id}`)
+      return materializePortableBlob(blob, blobType)
+    })
+    await runTransaction([db.attachmentBlobs], async (tx) => {
+      await tx.table('attachmentBlobs').bulkPut(stored)
+      recordStoredValues(stored)
+      recordTableWrite(stored.length)
+    })
   }
-  await bulkPutInPages(db.attachmentArtifacts, bundle.artifacts)
-  await bulkPutInPages(db.attachmentJobs, bundle.jobs)
+  for (const page of pages(bundle.artifacts)) {
+    preactivationCheckpoint()
+    await runTransaction([db.attachmentArtifacts], async (tx) => {
+      await tx.table('attachmentArtifacts').bulkPut(page)
+      recordStoredValues(page)
+      recordTableWrite(page.length)
+    })
+  }
+  for (const page of pages(bundle.jobs)) {
+    preactivationCheckpoint()
+    await runTransaction([db.attachmentJobs], async (tx) => {
+      await tx.table('attachmentJobs').bulkPut(page)
+      recordStoredValues(page)
+      recordTableWrite(page.length)
+    })
+  }
 }
 
 function verifyPortableBundleIntegrity(
@@ -1253,7 +2007,7 @@ function rewriteAttachmentForImport(
 ): Attachment {
   const attachment = structuredClone(source)
   attachment.id = targetAttachmentId
-  attachment.origin = 'import'
+  attachment.origin = source.origin === 'generated-output' ? 'generated-output' : 'import'
   attachment.refCount = 0
   attachment.artifacts = source.artifacts.map((artifact) =>
     rewriteArtifactForImport(artifact, targetAttachmentId, blobIdMap, artifactIdMap),
@@ -1300,13 +2054,28 @@ function rewriteJobForImport(
   job: AttachmentJob,
   attachmentId: AttachmentId,
   artifactIdMap: ReadonlyMap<string, string>,
+  remoteGeneratedOutputLocalization: boolean,
 ): AttachmentJob {
-  return {
+  const rewritten: AttachmentJob = {
     ...structuredClone(job),
     id: newId(),
     attachmentId,
     outputArtifactIds: job.outputArtifactIds.map((id) => artifactIdMap.get(id) ?? id),
   }
+  if (!isGeneratedOutputLocalizationJob(job)) return rewritten
+  const now = Date.now()
+  rewritten.status = remoteGeneratedOutputLocalization ? 'pending' : 'succeeded'
+  if (remoteGeneratedOutputLocalization) rewritten.attemptCount = 0
+  rewritten.updatedAt = now
+  if (remoteGeneratedOutputLocalization) rewritten.nextAttemptAt = now
+  else delete rewritten.nextAttemptAt
+  delete rewritten.startedAt
+  if (remoteGeneratedOutputLocalization) delete rewritten.finishedAt
+  else rewritten.finishedAt = now
+  delete rewritten.error
+  delete rewritten.leaseId
+  delete rewritten.leaseExpiresAt
+  return rewritten
 }
 
 function collectAttachmentIds(messages: readonly Message[]): AttachmentId[] {
@@ -1319,6 +2088,17 @@ function collectAttachmentIds(messages: readonly Message[]): AttachmentId[] {
     }
   }
   return ids
+}
+
+function collectWorkspaceAttachmentIds(
+  messages: readonly Message[],
+  drafts: readonly { readonly attachmentRefs: readonly MessageAttachmentRef[] }[],
+): AttachmentId[] {
+  const ids = new Set(collectAttachmentIds(messages))
+  for (const draft of drafts) {
+    for (const ref of draft.attachmentRefs) ids.add(ref.attachmentId)
+  }
+  return [...ids]
 }
 
 function contentAttachmentId(item: ContentItem): AttachmentId | undefined {
@@ -1413,31 +2193,12 @@ function remapAttachmentRef(
   }
 }
 
-function countLiveAttachmentRefs(messages: readonly Message[]): Map<AttachmentId, number> {
-  const counts = new Map<AttachmentId, number>()
-  for (const message of messages) {
-    for (const ref of message.attachmentRefs ?? []) {
-      if (ref.deletedAt !== undefined) continue
-      counts.set(ref.attachmentId, (counts.get(ref.attachmentId) ?? 0) + 1)
-    }
-  }
-  return counts
-}
-
-function childListsForMessages(
+function childSlotsForMessages(
   chatId: string,
   messages: readonly Message[],
   updatedAt: number,
-): ChildListState[] {
-  const parentIds = new Set<MessageId | null>([null])
-  for (const message of messages) parentIds.add(message.parentId)
-  return [...parentIds].map((parentId) => ({
-    id: childListKey(chatId, parentId),
-    chatId,
-    parentId,
-    version: 0,
-    updatedAt,
-  }))
+): ChildSlotProjection {
+  return buildChildSlotProjection(chatId, messages, { updatedAt })
 }
 
 function sortMessages(messages: Message[]): Message[] {

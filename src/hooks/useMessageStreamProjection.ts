@@ -1,37 +1,68 @@
 import { useEffect } from 'react'
 import type { Message } from '../core/types'
-import {
-  type ActiveStream,
-  type LiveStreamSnapshot,
-  useStreamTarget,
-} from '../store/zustand/streamStore'
+import { useAttemptTargetSnapshot } from '../store/attempt-controller'
+import type {
+  AttemptExecutionRecord,
+  AttemptPresentationRecord,
+  WorkspaceFence,
+} from '../store/presentation-contracts'
 
-function streamAttemptCommitted(message: Message, stream: ActiveStream): boolean {
-  if (stream.attemptKind === 'continuation') {
-    return (
-      message.continuationAttempts?.some((attempt) => attempt.streamId === stream.streamId) === true
-    )
-  }
-  return message.generation?.status !== 'streaming' && message.generation?.finishedAt !== undefined
-}
-
-export function useMessageStreamProjection(message: Message, enabled = true) {
-  const { activeStream, liveSnapshot } = useStreamTarget(message.chatId, message.id, enabled)
-  const committed = activeStream ? streamAttemptCommitted(message, activeStream) : false
+export function useMessageStreamProjection(
+  message: Message,
+  fence: WorkspaceFence,
+  enabled = true,
+) {
+  const target = useAttemptTargetSnapshot(message.chatId, message.id, enabled)
+  const execution = attemptMatchesFence(target.execution, fence) ? target.execution : undefined
+  const presentation = attemptMatchesFence(target.presentation, fence)
+    ? target.presentation
+    : undefined
+  const liveProjection = liveProjectionMatchesFence(target.liveProjection, fence)
+    ? target.liveProjection
+    : undefined
   useEffect(() => {
-    if (!enabled || !activeStream || committed || !activeStream.requestLiveSnapshot) return
+    if (!enabled || !execution || !execution.requestLiveProjection) {
+      return
+    }
     const requestIfVisible = () => {
       if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return
-      void activeStream.requestLiveSnapshot?.().catch(() => {})
+      void execution.requestLiveProjection?.().catch(() => {})
     }
-    requestIfVisible()
     if (typeof document === 'undefined') return
     document.addEventListener('visibilitychange', requestIfVisible)
     return () => document.removeEventListener('visibilitychange', requestIfVisible)
-  }, [activeStream, committed, enabled])
-  const currentLiveSnapshot: LiveStreamSnapshot | undefined =
-    activeStream && liveSnapshot?.streamId === activeStream.streamId && !committed
-      ? liveSnapshot
+  }, [enabled, execution])
+  const currentLiveSnapshot =
+    liveProjection &&
+    (liveProjection.streamId === execution?.streamId ||
+      liveProjection.streamId === presentation?.streamId)
+      ? liveProjection
       : undefined
-  return [activeStream, currentLiveSnapshot] as const
+  return {
+    execution,
+    presentation,
+    liveProjection: currentLiveSnapshot,
+  } as const
+}
+
+function attemptMatchesFence(
+  attempt: AttemptExecutionRecord | AttemptPresentationRecord | undefined,
+  fence: WorkspaceFence,
+): boolean {
+  return Boolean(
+    attempt &&
+      attempt.workspaceId === fence.workspaceId &&
+      attempt.replacementEpoch === fence.replacementEpoch,
+  )
+}
+
+function liveProjectionMatchesFence(
+  projection: ReturnType<typeof useAttemptTargetSnapshot>['liveProjection'],
+  fence: WorkspaceFence,
+): boolean {
+  return Boolean(
+    projection &&
+      projection.workspaceId === fence.workspaceId &&
+      projection.replacementEpoch === fence.replacementEpoch,
+  )
 }

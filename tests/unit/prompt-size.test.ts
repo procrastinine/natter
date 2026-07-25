@@ -10,11 +10,17 @@ import { describe, expect, it } from 'vitest'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import { tokenCalibrationKey } from '../../src/core/model-ids'
 import {
+  createOutboundReasoningCompiler,
+  outboundReasoningRouteForReplayContract,
+} from '../../src/core/outbound-reasoning'
+import {
   buildSettingsPromptSizeEstimateInput,
   estimatePromptSize,
   estimateSettingsPromptSize,
+  promptEstimateInputSignature,
   tokenizerFromSettings,
 } from '../../src/core/prompt-size'
+import { OPENAI_RESPONSES_PROVIDER_OUTPUT_CONTRACT } from '../../src/core/provider-tool-context'
 import type {
   Attachment,
   ChatUsage,
@@ -22,7 +28,11 @@ import type {
   Message,
   MessageAttachmentRef,
   MessageRole,
+  ReasoningDetail,
+  ReasoningInclude,
 } from '../../src/core/types'
+import { chatRouteContract, responsesReasoningContract } from '../helpers/reasoning-contracts'
+import { reasoningEnvelopeFromDetailsForTest } from '../helpers/reasoning-events'
 
 const DEFAULT_TOKENIZER = 'gpt' as const
 
@@ -54,10 +64,26 @@ function makeMessage(partial: Partial<Message> & { role: MessageRole; text?: str
       ? { hiddenFromContext: partial.hiddenFromContext }
       : {}),
     ...(partial.generation ? { generation: partial.generation } : {}),
-    ...(partial.reasoningDetails ? { reasoningDetails: partial.reasoningDetails } : {}),
+    ...(partial.reasoningEnvelope ? { reasoningEnvelope: partial.reasoningEnvelope } : {}),
     ...(partial.providerOutputItems ? { providerOutputItems: partial.providerOutputItems } : {}),
     ...(partial.attachmentRefs ? { attachmentRefs: partial.attachmentRefs } : {}),
   }
+}
+
+function responsesReasoningEstimate(path: readonly Message[], include: ReasoningInclude) {
+  const reasoning = responsesReasoningContract({ include })
+  const compiler = createOutboundReasoningCompiler(
+    outboundReasoningRouteForReplayContract(reasoning),
+  )
+  return {
+    reasoning,
+    reasoningResolver: compiler.retain(path),
+    providerOutput: OPENAI_RESPONSES_PROVIDER_OUTPUT_CONTRACT,
+  }
+}
+
+function responsesEnvelope(details: readonly ReasoningDetail[]) {
+  return reasoningEnvelopeFromDetailsForTest(details, 'openai-responses')
 }
 
 function storedAttachment(
@@ -100,6 +126,8 @@ function withUsage(promptTokens: number): GenerationMeta {
     delivery: 'streaming',
     usage,
     costSource: 'stream',
+    reasoningCarryForward: 'none',
+    reasoningVisibility: { disclosure: 'unknown' },
     startedAt: 1,
   }
 }
@@ -168,19 +196,48 @@ describe('estimatePromptSize — fallback branch', () => {
   })
 
   it('applies appendPrompt before cutoff so appended tokens can evict an overflowing pair', () => {
-    const settings = cloneDefaultChatSettings()
-    settings.model = 'openai/gpt-4o'
-    settings.customMaxContext = 12
-    settings.maxCompletionTokens = 0
-    settings.contextStrategy = { ...settings.contextStrategy, keepFirstPairs: 0 }
+    const path = [
+      makeMessage({ role: 'user', text: 'earlier prompt' }),
+      makeMessage({ role: 'assistant', text: 'earlier answer' }),
+      makeMessage({ role: 'user', text: 'terminal prompt' }),
+    ]
+    const baselineSettings = cloneDefaultChatSettings()
+    baselineSettings.model = 'openai/gpt-4o'
+    baselineSettings.customMaxContext = -1
+    baselineSettings.maxCompletionTokens = 0
+    baselineSettings.contextStrategy = {
+      ...baselineSettings.contextStrategy,
+      keepFirstPairs: 0,
+    }
+    const baseline = buildSettingsPromptSizeEstimateInput(
+      baselineSettings,
+      path,
+      '',
+      tokenizerFromSettings(baselineSettings, null),
+    )
+    const exactHistoryBudget = estimatePromptSize(baseline).historyTokens
+    baselineSettings.customMaxContext = exactHistoryBudget
+    expect(
+      buildSettingsPromptSizeEstimateInput(
+        baselineSettings,
+        path,
+        '',
+        tokenizerFromSettings(baselineSettings, null),
+      ).activePathMessages,
+    ).toHaveLength(3)
+
+    const settings = structuredClone(baselineSettings)
     settings.appendPrompt = `\n\n${'x'.repeat(200)}`
     const input = buildSettingsPromptSizeEstimateInput(
       settings,
-      [makeMessage({ role: 'user', text: 'short' })],
+      path,
       '',
       tokenizerFromSettings(settings, null),
     )
-    expect(input.activePathMessages).toHaveLength(0)
+    expect(input.activePathMessages).toHaveLength(1)
+    expect(input.activePathMessages[0]?.content).toEqual([
+      { type: 'text', text: `terminal prompt\n\n${'x'.repeat(200)}` },
+    ])
   })
 
   it('skips hiddenFromContext messages in both branches', () => {
@@ -870,26 +927,38 @@ describe('estimatePromptSize — reasoning echo accounting', () => {
       makeMessage({
         role: 'assistant',
         text: 'reply',
-        reasoningDetails: [
-          { type: 'reasoning.encrypted', data: 'A'.repeat(300), format: 'openai-responses-v1' },
-        ],
-      } as never),
+        reasoningEnvelope: responsesEnvelope([
+          {
+            type: 'reasoning.encrypted',
+            data: 'A'.repeat(300),
+            format: 'openai-responses-v1',
+          },
+        ]),
+      }),
     ]
+    const includedReasoning = responsesReasoningEstimate(path, {
+      encrypted: true,
+      summary: false,
+      text: false,
+    })
+    const excludedReasoning = responsesReasoningEstimate(path, {
+      encrypted: false,
+      summary: false,
+      text: false,
+    })
     const withInclude = estimatePromptSize({
       systemPrompt: '',
       activePathMessages: path,
       draftText: '',
       tokenizer: DEFAULT_TOKENIZER,
-      reasoningInclude: { encrypted: true, summary: false, text: false },
-      reasoningPreservationFormat: 'openai-responses-v1',
+      ...includedReasoning,
     })
     const withoutInclude = estimatePromptSize({
       systemPrompt: '',
       activePathMessages: path,
       draftText: '',
       tokenizer: DEFAULT_TOKENIZER,
-      reasoningInclude: { encrypted: false, summary: false, text: false },
-      reasoningPreservationFormat: 'openai-responses-v1',
+      ...excludedReasoning,
     })
     expect(withInclude.reasoningTokens).toBe(100) // 300 bytes / 3
     expect(withoutInclude.reasoningTokens).toBe(0)
@@ -901,26 +970,32 @@ describe('estimatePromptSize — reasoning echo accounting', () => {
       makeMessage({
         role: 'assistant',
         text: 'reply',
-        reasoningDetails: [
+        reasoningEnvelope: responsesEnvelope([
           {
             type: 'reasoning.summary',
+            format: 'openai-responses-v1',
             summary: 'A'.repeat(70),
             hidden: true,
           },
           {
             type: 'reasoning.summary',
+            format: 'openai-responses-v1',
             summary: 'B'.repeat(70),
           },
-        ],
-      } as never),
+        ]),
+      }),
     ]
+    const reasoning = responsesReasoningEstimate(path, {
+      encrypted: false,
+      summary: true,
+      text: false,
+    })
     const est = estimatePromptSize({
       systemPrompt: '',
       activePathMessages: path,
       draftText: '',
       tokenizer: DEFAULT_TOKENIZER,
-      reasoningInclude: { encrypted: false, summary: true, text: false },
-      reasoningPreservationFormat: 'openai-responses-v1',
+      ...reasoning,
     })
     // Only the non-hidden summary counts (70 / 3.5 = 20).
     expect(est.reasoningTokens).toBe(20)
@@ -931,8 +1006,14 @@ describe('estimatePromptSize — reasoning echo accounting', () => {
       makeMessage({
         role: 'assistant',
         text: 'reply',
-        reasoningDetails: [{ type: 'reasoning.summary', summary: 'A'.repeat(70) }],
-      } as never),
+        reasoningEnvelope: responsesEnvelope([
+          {
+            type: 'reasoning.summary',
+            format: 'openai-responses-v1',
+            summary: 'A'.repeat(70),
+          },
+        ]),
+      }),
     ]
     const est = estimatePromptSize({
       systemPrompt: '',
@@ -1285,6 +1366,81 @@ describe('estimatePromptSize — send-from-intermediate', () => {
       tokenizer: DEFAULT_TOKENIZER,
     })
     expect(est.historyTokens).toBeGreaterThan(0)
+  })
+})
+
+describe('promptEstimateInputSignature', () => {
+  it('ignores resolver identity churn but tracks token-relevant attachment evidence', () => {
+    const message = makeMessage({
+      id: 'streaming-message',
+      role: 'user',
+      content: [{ type: 'image_url', attachmentId: 'att-1' }],
+    })
+    const input = (width: number) => ({
+      systemPrompt: '',
+      activePathMessages: [message],
+      draftText: '',
+      tokenizer: DEFAULT_TOKENIZER,
+      attachmentResolver: (id: string) =>
+        id === 'att-1'
+          ? storedAttachment({
+              id,
+              kind: 'image',
+              mime: 'image/png',
+              filename: 'image.png',
+              sizeBytes: 10_000,
+              dimensions: { width, height: 512 },
+            })
+          : undefined,
+    })
+
+    expect(promptEstimateInputSignature(input(512))).toBe(promptEstimateInputSignature(input(512)))
+    expect(promptEstimateInputSignature(input(512))).not.toBe(
+      promptEstimateInputSignature(input(1_024)),
+    )
+    const frozen = new Set(['streaming-message'])
+    expect(promptEstimateInputSignature(input(512), frozen)).toBe(
+      promptEstimateInputSignature(input(1_024), frozen),
+    )
+  })
+
+  it('tracks the calibration gate that changes text-token estimation', () => {
+    const base = {
+      systemPrompt: '',
+      activePathMessages: [makeMessage({ role: 'user', text: 'calibrated text' })],
+      draftText: '',
+      tokenizer: DEFAULT_TOKENIZER,
+      currentTextCharsPerToken: 9,
+    }
+
+    expect(promptEstimateInputSignature(base)).not.toBe(
+      promptEstimateInputSignature({ ...base, disableTextCalibration: true }),
+    )
+  })
+
+  it('preserves the selected transport route for plaintext chat reasoning', () => {
+    const settings = cloneDefaultChatSettings()
+    const input = buildSettingsPromptSizeEstimateInput(
+      settings,
+      [],
+      '',
+      null,
+      null,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      chatRouteContract(),
+    )
+
+    expect(input.reasoningRoute?.kind).toBe('chat')
+    expect(() => estimatePromptSize(input)).not.toThrow()
+    expect(promptEstimateInputSignature(input)).not.toBe(
+      promptEstimateInputSignature({
+        ...input,
+        reasoningRoute: outboundReasoningRouteForReplayContract(input.reasoning!),
+      }),
+    )
   })
 })
 

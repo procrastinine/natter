@@ -13,12 +13,19 @@ import {
   validateTextCompletionPayload,
 } from '../../src/api/provider-json-boundary'
 import { responses, responsesOnce } from '../../src/api/responses'
-import type { StreamLaneEvent } from '../../src/api/stream-transforms'
 import { textCompletions, textCompletionsOnce } from '../../src/api/text-completions'
 import { videoGeneration } from '../../src/api/video-generation'
-import type { ApiRoute } from '../../src/core/api-choice'
+import type { AssistantAttemptContract } from '../../src/core/api-choice'
+import type { StreamLaneEvent } from '../../src/core/generation-stream-live-events'
 import type { ConnectionProfile } from '../../src/core/types'
 import { redactDiagnosticValue } from '../../src/lib/diagnostic-redaction'
+import {
+  anthropicRouteContract,
+  chatRouteContract,
+  geminiRouteContract,
+  responsesRouteContract,
+  textRouteContract,
+} from '../helpers/reasoning-contracts'
 
 function profile(kind: ConnectionProfile['kind'], baseUrl: string): ConnectionProfile {
   return {
@@ -127,7 +134,7 @@ describe('malformed stream-frame diagnostics', () => {
       | 'text-completions'
     malformedEventType: string
     expectedEventType: string
-    transportHint: ApiRoute['transport']
+    routeContract: AssistantAttemptContract
     validFrames: ReadonlyArray<{ eventType?: string; data: string }>
     validLanes: StreamLaneEvent[]
     run: () => AsyncIterable<AssistantStreamChunk>
@@ -137,7 +144,7 @@ describe('malformed stream-frame diagnostics', () => {
       adapter: 'chat-completions',
       malformedEventType: 'private-full-private-prompt',
       expectedEventType: 'unknown',
-      transportHint: 'openai-chat',
+      routeContract: chatRouteContract(),
       validFrames: [{ data: '{"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}' }],
       validLanes: [
         { lane: 'text', text: 'ok' },
@@ -157,7 +164,7 @@ describe('malformed stream-frame diagnostics', () => {
       adapter: 'responses',
       malformedEventType: 'response.output_text.delta',
       expectedEventType: 'response.output_text.delta',
-      transportHint: 'openai-responses',
+      routeContract: responsesRouteContract(),
       validFrames: [
         {
           eventType: 'response.output_text.delta',
@@ -170,7 +177,11 @@ describe('malformed stream-frame diagnostics', () => {
       ],
       validLanes: [
         { lane: 'text', text: 'ok', outputIndex: 0, contentIndex: 0 },
-        { lane: 'finish', finishReason: 'stop' },
+        {
+          lane: 'result-snapshot',
+          payload: { kind: 'retain' },
+          outcome: { kind: 'finish', finishReason: 'stop' },
+        },
       ],
       run: () =>
         responses(
@@ -186,7 +197,7 @@ describe('malformed stream-frame diagnostics', () => {
       adapter: 'anthropic-messages',
       malformedEventType: 'content_block_delta',
       expectedEventType: 'content_block_delta',
-      transportHint: 'anthropic',
+      routeContract: anthropicRouteContract(),
       validFrames: [
         {
           eventType: 'content_block_start',
@@ -212,14 +223,14 @@ describe('malformed stream-frame diagnostics', () => {
       adapter: 'gemini-native',
       malformedEventType: 'message',
       expectedEventType: 'message',
-      transportHint: 'gemini-native',
+      routeContract: geminiRouteContract(),
       validFrames: [
         {
           data: '{"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]},"finishReason":"STOP"}]}',
         },
       ],
       validLanes: [
-        { lane: 'text', text: 'ok' },
+        { lane: 'text', text: 'ok', outputIndex: 0, contentIndex: 0 },
         { lane: 'finish', finishReason: 'stop' },
       ],
       run: () =>
@@ -237,7 +248,7 @@ describe('malformed stream-frame diagnostics', () => {
       adapter: 'text-completions',
       malformedEventType: 'private-full-private-prompt',
       expectedEventType: 'unknown',
-      transportHint: 'openai-text',
+      routeContract: textRouteContract(),
       validFrames: [{ data: '{"choices":[{"text":"ok","finish_reason":"stop"}]}' }],
       validLanes: [
         { lane: 'text', text: 'ok' },
@@ -264,7 +275,7 @@ describe('malformed stream-frame diagnostics', () => {
       )
       const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
 
-      const lanes = await collectLanes(splitAssistantStream(adapter.run(), adapter.transportHint))
+      const lanes = await collectLanes(splitAssistantStream(adapter.run(), adapter.routeContract))
 
       const integrityLane = lanes[0]
       expect(integrityLane).toMatchObject({
@@ -280,14 +291,7 @@ describe('malformed stream-frame diagnostics', () => {
       if (integrityLane?.lane !== 'integrity') throw new Error('expected stream integrity lane')
       expect(integrityLane.integrity.fingerprint).toMatch(/^fnv1a32:[0-9a-f]{8}$/u)
       expect(lanes.slice(1)).toEqual(adapter.validLanes)
-      expect(warn).toHaveBeenCalledTimes(1)
-      const warning = warn.mock.calls[0]?.[1] as Record<string, unknown>
-      expect(warning).toMatchObject({
-        eventType: adapter.expectedEventType,
-        characterCount: malformedData.length,
-        error: { name: 'SyntaxError' },
-      })
-      expect(warning.fingerprint).toMatch(/^fnv1a32:[0-9a-f]{8}$/u)
+      expect(warn).not.toHaveBeenCalled()
       const serialized = JSON.stringify({ warnings: warn.mock.calls, lanes })
       expect(serialized).not.toContain(malformedData)
       expect(serialized).not.toContain('private-full-private-prompt')
@@ -375,7 +379,7 @@ describe('malformed stream-frame diagnostics', () => {
       )
       const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
 
-      const lanes = await collectLanes(splitAssistantStream(adapter.run(), adapter.transportHint))
+      const lanes = await collectLanes(splitAssistantStream(adapter.run(), adapter.routeContract))
 
       const expectedEventType =
         'eventType' in malformed ? malformed.eventType : adapter.expectedEventType
@@ -390,12 +394,7 @@ describe('malformed stream-frame diagnostics', () => {
         },
       })
       expect(lanes.slice(1)).toEqual(adapter.validLanes)
-      expect(warn).toHaveBeenCalledTimes(1)
-      expect(warn.mock.calls[0]?.[1]).toMatchObject({
-        eventType: expectedEventType,
-        characterCount: malformed.data.length,
-        error: { name: 'ProviderFrameShapeError', code: malformed.issue },
-      })
+      expect(warn).not.toHaveBeenCalled()
       expect(JSON.stringify({ warnings: warn.mock.calls, lanes })).not.toContain('shape-secret')
     })
   }
@@ -418,7 +417,7 @@ describe('malformed stream-frame diagnostics', () => {
           },
           { model: 'model', input: 'input', stream: true },
         ),
-        'openai-responses',
+        responsesRouteContract(),
       ),
     )
 
@@ -437,8 +436,12 @@ describe('malformed stream-frame diagnostics', () => {
     const integrityLane = lanes[1]
     if (integrityLane?.lane !== 'integrity') throw new Error('expected stream integrity lane')
     expect(integrityLane.integrity.fingerprint).toMatch(/^fnv1a32:[0-9a-f]{8}$/u)
-    expect(lanes[2]).toEqual({ lane: 'finish', finishReason: 'stop' })
-    expect(warn).toHaveBeenCalledTimes(1)
+    expect(lanes[2]).toEqual({
+      lane: 'result-snapshot',
+      payload: { kind: 'retain' },
+      outcome: { kind: 'finish', finishReason: 'stop' },
+    })
+    expect(warn).not.toHaveBeenCalled()
   })
 
   it('preserves terminal text-completion usage on the streaming path', async () => {
@@ -462,7 +465,7 @@ describe('malformed stream-frame diagnostics', () => {
           },
           { model: 'model', prompt: 'input', stream: true },
         ),
-        'openai-text',
+        textRouteContract(),
       ),
     )
 

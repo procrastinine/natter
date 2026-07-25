@@ -30,7 +30,7 @@ test('connection deletion is blocked while its seeded preset remains active', as
 
   const dialog = page.getByRole('dialog', { name: 'Delete connection?' })
   await expect(dialog).toBeVisible()
-  await expect(dialog).toContainText('1 non-archived preset and 0 non-archived chats')
+  await expect(dialog).toContainText('1 preset and 0 chats still use this connection')
   await expect(dialog.getByRole('button', { name: 'Delete', exact: true })).toBeDisabled()
 })
 

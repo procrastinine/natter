@@ -1,5 +1,5 @@
 import { expect, test } from './fixtures'
-import { clearIndexedDb } from './helpers'
+import { activeWorkspaceDatabaseName, clearIndexedDb } from './helpers'
 
 test.beforeEach(async ({ page }) => {
   await clearIndexedDb(page)
@@ -48,9 +48,10 @@ test('submitting the connection-setup modal seeds a profile + preset and moves e
   await expect(
     page.locator('[data-ui="connection-header"][data-state="configured"][data-variant="popover"]'),
   ).toBeVisible()
-  const counts = await page.evaluate(async () => {
+  const databaseName = await activeWorkspaceDatabaseName(page)
+  const counts = await page.evaluate(async (databaseName) => {
     const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const req = indexedDB.open('natter')
+      const req = indexedDB.open(databaseName)
       req.onsuccess = () => resolve(req.result)
       req.onerror = () => reject(req.error)
     })
@@ -68,7 +69,7 @@ test('submitting the connection-setup modal seeds a profile + preset and moves e
     } finally {
       db.close()
     }
-  })
+  }, databaseName)
   expect(counts).toEqual({ keys: 1, profiles: 1, presets: 1 })
 })
 
@@ -100,9 +101,10 @@ test('whitespace-only key keeps submit disabled; trim happens on save', async ({
   await page.locator('[data-ui="connection-setup-modal"]').waitFor({ state: 'detached' })
   await expect(page.locator('[data-ui="connection-empty-action"]')).toHaveCount(0)
   await expect(page.locator('[data-ui="connection-header"]')).toHaveCount(0)
-  const previews = await page.evaluate(async () => {
+  const databaseName = await activeWorkspaceDatabaseName(page)
+  const previews = await page.evaluate(async (databaseName) => {
     const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const req = indexedDB.open('natter')
+      const req = indexedDB.open(databaseName)
       req.onsuccess = () => resolve(req.result)
       req.onerror = () => reject(req.error)
     })
@@ -119,7 +121,7 @@ test('whitespace-only key keeps submit disabled; trim happens on save', async ({
     } finally {
       db.close()
     }
-  })
+  }, databaseName)
   expect(previews).toHaveLength(1)
   // obscurePreview keeps 10-char prefix + 4-char suffix. Trimmed prefix is
   // "sk-or-v1-t"; untrimmed would be "  sk-or-v1".

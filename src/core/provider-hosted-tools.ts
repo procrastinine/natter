@@ -5,7 +5,7 @@ import type {
   ConnectionProfile,
   GoogleServerToolId,
   OpenAiServerToolId,
-  ServerToolId,
+  OpenRouterServerToolId,
 } from './types'
 
 export type HostedToolProvider = 'openrouter' | 'openai' | 'anthropic' | 'google'
@@ -29,17 +29,16 @@ export function hasEnabledHostedTools(
   return enabledHostedToolIds(settings, provider).length > 0
 }
 
-const OPENROUTER_SERVER_TOOL_TYPES: Readonly<Partial<Record<ServerToolId, string>>> = Object.freeze(
-  {
+const OPENROUTER_SERVER_TOOL_TYPES: Readonly<Partial<Record<OpenRouterServerToolId, string>>> =
+  Object.freeze({
     'web-search': 'openrouter:web_search',
     datetime: 'openrouter:datetime',
     'web-fetch': 'openrouter:web_fetch',
-  },
-)
+  })
 
 export function buildOpenRouterServerTools(settings: ChatSettings): Array<{ type: string }> {
   const tools: Array<{ type: string }> = []
-  const seen = new Set<ServerToolId>()
+  const seen = new Set<OpenRouterServerToolId>()
   for (const id of settings.tools.openrouter.enabledServerToolIds) {
     if (seen.has(id)) continue
     seen.add(id)

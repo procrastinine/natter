@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest'
+import { toResponses as toResponsesWithContract } from '../../src/api/request-transforms'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
-import { toResponses } from '../../src/core/transforms'
+import {
+  OPENAI_RESPONSES_PROVIDER_OUTPUT_CONTRACT,
+  OPENROUTER_RESPONSES_PROVIDER_OUTPUT_CONTRACT,
+} from '../../src/core/provider-tool-context'
 import type {
   ChatSettings,
   Message,
@@ -8,6 +12,33 @@ import type {
   ResponsesOutputItem,
   ToolCall,
 } from '../../src/core/types'
+import {
+  responsesReasoningContractForSettings,
+  TEST_UNSUPPORTED_PREFILL_PLAN,
+} from '../helpers/reasoning-contracts'
+import { reasoningEnvelopeFromDetailsForTest } from '../helpers/reasoning-events'
+
+type ResponsesOptions = Omit<
+  Parameters<typeof toResponsesWithContract>[2],
+  'reasoning' | 'providerOutput' | 'prefillPlan'
+> & {
+  reasoning?: Parameters<typeof toResponsesWithContract>[2]['reasoning']
+  providerOutput?: Parameters<typeof toResponsesWithContract>[2]['providerOutput']
+  prefillPlan?: Parameters<typeof toResponsesWithContract>[2]['prefillPlan']
+}
+
+function toResponses(
+  settings: Parameters<typeof toResponsesWithContract>[0],
+  path: Parameters<typeof toResponsesWithContract>[1],
+  options: ResponsesOptions = {},
+) {
+  return toResponsesWithContract(settings, path, {
+    ...options,
+    reasoning: options.reasoning ?? responsesReasoningContractForSettings(settings),
+    providerOutput: options.providerOutput ?? OPENAI_RESPONSES_PROVIDER_OUTPUT_CONTRACT,
+    prefillPlan: options.prefillPlan ?? TEST_UNSUPPORTED_PREFILL_PLAN,
+  })
+}
 
 function settings(overrides: Partial<ChatSettings> = {}): ChatSettings {
   const s = cloneDefaultChatSettings()
@@ -54,7 +85,12 @@ function user(id: string, text: string): Message {
   }
 }
 
-function assistant(id: string, text: string, opts: Partial<Message> = {}): Message {
+type AssistantOptions = Partial<Message> & {
+  reasoningDetails?: readonly ReasoningDetail[]
+}
+
+function assistant(id: string, text: string, opts: AssistantOptions = {}): Message {
+  const { reasoningDetails, ...messageOptions } = opts
   return {
     id,
     chatId: 'c',
@@ -68,7 +104,15 @@ function assistant(id: string, text: string, opts: Partial<Message> = {}): Messa
     content: [{ type: 'text', text }],
     nodeVersion: 0,
     deleted: false,
-    ...opts,
+    ...messageOptions,
+    ...(reasoningDetails
+      ? {
+          reasoningEnvelope: reasoningEnvelopeFromDetailsForTest(
+            reasoningDetails,
+            'openai-responses',
+          ),
+        }
+      : {}),
   }
 }
 
@@ -213,17 +257,94 @@ describe('toResponses — envelope', () => {
   })
 })
 
+describe('toResponses — citation echo', () => {
+  it('keeps Responses annotations on their exact output text part and does not cross-echo other dialects', () => {
+    const prior = assistant('a1', '', {
+      content: [
+        {
+          type: 'output_text',
+          text: 'OpenAI source',
+          annotations: [
+            {
+              type: 'url_citation',
+              url: 'https://openai.example/source',
+              startIndex: 7,
+              endIndex: 13,
+              source: 'openai-responses',
+              providerPayload: {
+                type: 'url_citation',
+                start_index: 7,
+                end_index: 13,
+                url: 'https://openai.example/source',
+              },
+            },
+          ],
+        },
+        {
+          type: 'output_text',
+          text: 'Anthropic source',
+          annotations: [
+            {
+              type: 'url_citation',
+              url: 'https://anthropic.example/source',
+              startIndex: 10,
+              endIndex: 16,
+              source: 'anthropic-messages',
+              providerPayload: {
+                type: 'web_search_result_location',
+                cited_text: 'source',
+                url: 'https://anthropic.example/source',
+              },
+            },
+          ],
+        },
+      ],
+    })
+    const { wire } = toResponses(settings(), [prior])
+    const item = (wire.input as ResponsesOutputItem[]).find(
+      (candidate) => candidate.type === 'message',
+    )
+    expect(item?.content).toEqual([
+      {
+        type: 'output_text',
+        text: 'OpenAI source',
+        annotations: [
+          {
+            type: 'url_citation',
+            start_index: 7,
+            end_index: 13,
+            url: 'https://openai.example/source',
+          },
+        ],
+      },
+      { type: 'output_text', text: 'Anthropic source' },
+    ])
+  })
+})
+
 describe('toResponses — reasoning echo', () => {
-  it('emits responsesEchoItem verbatim when include flags allow (encrypted + summary)', () => {
-    const echo: ResponsesOutputItem = {
-      type: 'reasoning',
-      id: 'rs_1',
-      encrypted_content: 'gAAA...blob',
-      summary: [{ type: 'summary_text', text: 'I thought about X' }],
-    }
+  it('rebuilds the provider reasoning item from canonical grouped carrier rows', () => {
     const path: Message[] = [
       user('u1', 'q'),
-      assistant('a1', 'answer', { responsesEchoItem: echo }),
+      assistant('a1', 'answer', {
+        reasoningDetails: [
+          {
+            type: 'reasoning.encrypted',
+            format: 'openai-responses-v1',
+            data: 'gAAA...blob',
+            providerItemId: 'rs_1',
+            providerOutputIndex: 0,
+          },
+          {
+            type: 'reasoning.summary',
+            format: 'openai-responses-v1',
+            summary: 'I thought about X',
+            providerItemId: 'rs_1',
+            providerOutputIndex: 0,
+            providerSummaryIndex: 0,
+          },
+        ],
+      }),
       user('u2', 'follow'),
     ]
     // Enable BOTH summary + encrypted so the echo rides through unchanged.
@@ -240,21 +361,34 @@ describe('toResponses — reasoning echo', () => {
     )
     const items = wire.input as Array<{ type: string; [k: string]: unknown }>
     const reasoningItem = items.find((i) => i.type === 'reasoning')
-    expect(reasoningItem).toEqual(echo)
-  })
-
-  it('strips output-only status from echoed reasoning items', () => {
-    const echo: ResponsesOutputItem = {
+    expect(reasoningItem).toEqual({
       type: 'reasoning',
-      id: 'rs_tmp_proxy',
-      status: 'completed',
-      format: 'openai-responses-v1',
+      id: 'rs_1',
       encrypted_content: 'gAAA...blob',
       summary: [{ type: 'summary_text', text: 'I thought about X' }],
-    }
+    })
+  })
+
+  it('emits only canonical input fields from persisted reasoning rows', () => {
     const path: Message[] = [
       user('u1', 'q'),
-      assistant('a1', 'answer', { responsesEchoItem: echo }),
+      assistant('a1', 'answer', {
+        reasoningDetails: [
+          {
+            type: 'reasoning.encrypted',
+            format: 'openai-responses-v1',
+            data: 'gAAA...blob',
+            providerOutputIndex: 0,
+          },
+          {
+            type: 'reasoning.summary',
+            format: 'openai-responses-v1',
+            summary: 'I thought about X',
+            providerOutputIndex: 0,
+            providerSummaryIndex: 0,
+          },
+        ],
+      }),
       user('u2', 'follow'),
     ]
     const { wire } = toResponses(
@@ -276,18 +410,22 @@ describe('toResponses — reasoning echo', () => {
     })
   })
 
-  it('drops naked reasoning item when stripping leaves no carrier fields', () => {
+  it('does not create a naked reasoning item when no carrier row survives policy', () => {
     // With include.encrypted=false and no `summary` on the echo item,
     // stripping leaves `{type:'reasoning', id}` — an empty envelope the
     // next turn cannot use. The transform drops it instead of sending it.
-    const echo: ResponsesOutputItem = {
-      type: 'reasoning',
-      id: 'rs_1',
-      encrypted_content: 'gAAA...blob',
-    }
     const path: Message[] = [
       user('u1', 'q'),
-      assistant('a1', 'answer', { responsesEchoItem: echo }),
+      assistant('a1', 'answer', {
+        reasoningDetails: [
+          {
+            type: 'reasoning.encrypted',
+            format: 'openai-responses-v1',
+            data: 'gAAA...blob',
+            providerItemId: 'rs_1',
+          },
+        ],
+      }),
     ]
     const { wire } = toResponses(
       settings({
@@ -305,16 +443,26 @@ describe('toResponses — reasoning echo', () => {
     expect(reasoningItem).toBeUndefined()
   })
 
-  it('keeps echo item when summary survives stripping (include.summary = true)', () => {
-    const echo: ResponsesOutputItem = {
-      type: 'reasoning',
-      id: 'rs_1',
-      encrypted_content: 'gAAA...blob',
-      summary: [{ type: 'summary_text', text: 'visible reasoning' }],
-    }
+  it('keeps a grouped item when its summary row survives policy', () => {
     const path: Message[] = [
       user('u1', 'q'),
-      assistant('a1', 'answer', { responsesEchoItem: echo }),
+      assistant('a1', 'answer', {
+        reasoningDetails: [
+          {
+            type: 'reasoning.encrypted',
+            format: 'openai-responses-v1',
+            data: 'gAAA...blob',
+            providerItemId: 'rs_1',
+          },
+          {
+            type: 'reasoning.summary',
+            format: 'openai-responses-v1',
+            summary: 'visible reasoning',
+            providerItemId: 'rs_1',
+            providerSummaryIndex: 0,
+          },
+        ],
+      }),
     ]
     const { wire } = toResponses(
       settings({
@@ -341,10 +489,22 @@ describe('toResponses — reasoning echo', () => {
     expect(reasoningItem?.summary).toHaveLength(1)
   })
 
-  it('synthesizes reasoning item from reasoningDetails when responsesEchoItem is absent', () => {
+  it('synthesizes a reasoning item from canonical reasoning details', () => {
     const details: ReasoningDetail[] = [
-      { type: 'reasoning.encrypted', id: 'r_e', data: 'blob', format: 'openai-responses-v1' },
-      { type: 'reasoning.summary', id: 'r_s', summary: 'quick summary' },
+      {
+        type: 'reasoning.encrypted',
+        id: 'r_e',
+        data: 'blob',
+        format: 'openai-responses-v1',
+        providerOutputIndex: 0,
+      },
+      {
+        type: 'reasoning.summary',
+        id: 'r_s',
+        format: 'openai-responses-v1',
+        summary: 'quick summary',
+        providerOutputIndex: 0,
+      },
     ]
     const path: Message[] = [
       user('u1', 'q'),
@@ -361,7 +521,6 @@ describe('toResponses — reasoning echo', () => {
         },
       }),
       path,
-      { reasoningPreservationFormat: 'openai-responses-v1' },
     )
     const items = wire.input as Array<{ type: string; [k: string]: unknown }>
     const reasoning = items.find((i) => i.type === 'reasoning') as
@@ -389,7 +548,6 @@ describe('toResponses — reasoning echo', () => {
         },
       }),
       path,
-      { reasoningPreservationFormat: 'openai-responses-v1' },
     )
     const items = wire.input as Array<{ type: string }>
     expect(items.find((i) => i.type === 'reasoning')).toBeUndefined()
@@ -420,21 +578,67 @@ describe('toResponses — reasoning dialect', () => {
         include: { encrypted: true, summary: false, text: false },
       },
     })
-    expect(toResponses(s, [user('u1', 'hi')]).wire.reasoning).toEqual({
+    const direct = toResponses(s, [user('u1', 'hi')])
+    expect(direct.wire.reasoning).toEqual({
       effort: 'high',
       summary: 'auto',
     })
-    expect(
-      toResponses(s, [user('u1', 'hi')], { allowOpenRouterExtensions: true }).wire.reasoning,
-    ).toEqual({ enabled: true, effort: 'high', exclude: true, summary: 'auto' })
+    expect(direct.reasoningVisibilityEvidence).toMatchObject({ activation: 'active' })
+    const openRouter = toResponses(s, [user('u1', 'hi')], {
+      allowOpenRouterExtensions: true,
+    })
+    expect(openRouter.wire.reasoning).toEqual({
+      enabled: true,
+      effort: 'high',
+      exclude: true,
+    })
+    expect(openRouter.reasoningVisibilityEvidence).toMatchObject({ activation: 'excluded' })
+  })
+
+  it('emits an independently requested summary on direct and OpenRouter Responses', () => {
+    const s = settings({
+      reasoning: {
+        ...settings().reasoning,
+        mode: 'default',
+        summary: 'auto',
+      },
+    })
+    const direct = toResponses(s, [user('u1', 'hi')])
+    const openRouter = toResponses(s, [user('u1', 'hi')], {
+      allowOpenRouterExtensions: true,
+    })
+    expect(direct.wire.reasoning).toEqual({ summary: 'auto' })
+    expect(direct.reasoningVisibilityEvidence).toMatchObject({
+      dialect: 'openai-responses',
+      display: 'available',
+    })
+    expect(openRouter.wire.reasoning).toEqual({ summary: 'auto' })
+    expect(openRouter.reasoningVisibilityEvidence).toMatchObject({
+      dialect: 'openrouter-responses',
+      display: 'available',
+    })
+
+    const explicitlyOmitted = toResponses(
+      {
+        ...s,
+        reasoning: { ...s.reasoning, mode: 'effort', effort: 'low', summary: 'off' },
+      },
+      [user('u1', 'hi')],
+    )
+    expect(explicitlyOmitted.reasoningVisibilityEvidence).toMatchObject({
+      display: 'request-omitted',
+    })
   })
 
   it('uses each provider dialect to turn reasoning off', () => {
-    expect(toResponses(settings(), [user('u1', 'hi')]).wire.reasoning).toEqual({ effort: 'none' })
-    expect(
-      toResponses(settings(), [user('u1', 'hi')], { allowOpenRouterExtensions: true }).wire
-        .reasoning,
-    ).toEqual({ enabled: false })
+    const direct = toResponses(settings(), [user('u1', 'hi')])
+    expect(direct.wire.reasoning).toEqual({ effort: 'none' })
+    expect(direct.reasoningVisibilityEvidence).toMatchObject({ activation: 'disabled' })
+    const openRouter = toResponses(settings(), [user('u1', 'hi')], {
+      allowOpenRouterExtensions: true,
+    })
+    expect(openRouter.wire.reasoning).toEqual({ enabled: false })
+    expect(openRouter.reasoningVisibilityEvidence).toMatchObject({ activation: 'disabled' })
   })
 })
 
@@ -504,7 +708,6 @@ describe('toResponses — include header', () => {
         },
       }),
       [user('u1', 'hi')],
-      { reasoningPreservationFormat: 'openai-responses-v1' },
     )
     expect(wire.include).toEqual(['reasoning.encrypted_content'])
   })
@@ -521,7 +724,6 @@ describe('toResponses — include header', () => {
         },
       }),
       [user('u1', 'hi')],
-      { reasoningPreservationFormat: 'openai-responses-v1' },
     )
     expect(wire.include).toBeUndefined()
   })
@@ -539,7 +741,6 @@ describe('toResponses — include header', () => {
         },
       }),
       [user('u1', 'hi')],
-      { reasoningPreservationFormat: 'openai-responses-v1' },
     )
     expect(wire.include).toEqual(['reasoning.encrypted_content'])
     expect(wire.store).toBe(true)
@@ -595,7 +796,10 @@ describe('toResponses — tool calls + tool outputs', () => {
         ],
       }),
     ]
-    const { wire } = toResponses(settings(), path, { hostedToolsProvider: 'openrouter' })
+    const { wire } = toResponses(settings(), path, {
+      hostedToolsProvider: 'openrouter',
+      providerOutput: OPENROUTER_RESPONSES_PROVIDER_OUTPUT_CONTRACT,
+    })
     const items = wire.input as Array<Record<string, unknown>>
     expect(items.some((item) => item.type === 'shell_call_output')).toBe(false)
     const assistantMessage = items.find(

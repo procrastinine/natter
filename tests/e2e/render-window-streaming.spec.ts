@@ -1,11 +1,12 @@
 import { createFakeStreamScenario, retargetOnlyProfileToFakeProvider } from './fake-stream-provider'
-import { expect, test } from './fixtures'
+import { expect, type Locator, test } from './fixtures'
 import {
   clearIndexedDb,
   createChatAndOpen,
   firstChatId,
   readMessages,
   seedFirstRun,
+  seedLinearChat,
   sendMessage,
   startMessageCountRecorder,
   stopMessageCountRecorder,
@@ -63,8 +64,173 @@ test('large streamed turns do not recycle the transcript after completion', asyn
       listRemoved: false,
       listReplaced: false,
       loadingSeen: false,
+      messageCountDecreased: false,
+      messageCountsIncludeZero: false,
+      minimumMessageCount: expect.any(Number),
+    })
+  } finally {
+    await scenario.dispose()
+  }
+})
+
+test('ordinary composer send appends user and streaming assistant without replacing the mounted prefix', async ({
+  page,
+}, testInfo) => {
+  const scenario = await createFakeStreamScenario({
+    targetChars: 160_000,
+    reasoningChars: 0,
+    chunkChars: 10_000,
+    initialDelayMs: 100,
+    delayMs: 80,
+    holdUntilReleased: true,
+  })
+  try {
+    await retargetOnlyProfileToFakeProvider(page, scenario.providerBaseUrl)
+    const chatId = await seedLinearChat(page, {
+      messageCount: 8,
+      chatId: 'ordinary-send-continuity-chat',
+      title: 'Ordinary send continuity chat',
+      textPrefix: 'ordinary send history',
+      assistantContentType: 'output_text',
+      settings: {
+        'global:message-initial-render-work': 8,
+        'global:message-render-window-load-mode': 'manual',
+      },
+    })
+    await page.goto(`/#/chat/${chatId}`)
+    await page.reload()
+
+    const messages = page.locator('[data-ui="message"][data-message-id]')
+    await expect(messages).toHaveCount(8)
+    const commonPrefixMessageIds = await messages.evaluateAll((nodes) =>
+      nodes
+        .map((node) => node.getAttribute('data-message-id'))
+        .filter((id): id is string => id !== null),
+    )
+    const region = page.locator('[data-ui="scroll-region"]')
+    await expect.poll(() => scrollDistanceFromBottom(region)).toBeLessThanOrEqual(4)
+
+    await startMessageCountRecorder(page, { commonPrefixMessageIds })
+    await sendMessage(page, 'ordinary composer continuity prompt')
+    await expect(messages).toHaveCount(10)
+    await expect(messages.nth(8)).toHaveAttribute('data-role', 'user')
+    await expect(messages.nth(8).locator('[data-ui="message-body"]')).toHaveText(
+      'ordinary composer continuity prompt',
+    )
+    const streamedAssistant = messages.nth(9)
+    await expect(streamedAssistant).toHaveAttribute('data-role', 'assistant')
+    await expect.poll(() => scenario.snapshot().then((state) => state.activeStreams)).toBe(1)
+    await scenario.release()
+    await expect
+      .poll(() =>
+        streamedAssistant
+          .locator('[data-ui="message-body"]')
+          .evaluate((node) => node.textContent.length),
+      )
+      .toBeGreaterThan(80_000)
+    await expect
+      .poll(() => region.evaluate((node) => node.scrollHeight > node.clientHeight + 100))
+      .toBe(true)
+    await expect(region).toHaveAttribute('data-scroll-state', 'follow')
+    await expect.poll(() => scrollDistanceFromBottom(region)).toBeLessThanOrEqual(4)
+    const retainedStreamingPrefix = streamedAssistant
+      .locator('[data-ui="markdown-segment"][data-mode="static"]')
+      .first()
+    await expect(retainedStreamingPrefix).toHaveCount(1)
+    const streamingMarkdownRoot = streamedAssistant.locator('[data-ui="markdown"]')
+    const transitionMetrics = await region.evaluate((node) => ({
+      distanceFromBottom: node.scrollHeight - node.scrollTop - node.clientHeight,
+      scrollTop: node.scrollTop,
+    }))
+    await streamedAssistant.evaluate((node) => {
+      ;(node as HTMLElement & { retainedAcrossFinalization?: true }).retainedAcrossFinalization =
+        true
+    })
+    await streamedAssistant.locator('[data-ui="message-body"]').evaluate((node) => {
+      ;(node as HTMLElement & { retainedAcrossFinalization?: true }).retainedAcrossFinalization =
+        true
+    })
+    await streamingMarkdownRoot.evaluate((node) => {
+      ;(node as HTMLElement & { retainedAcrossFinalization?: true }).retainedAcrossFinalization =
+        true
+    })
+    await retainedStreamingPrefix.evaluate((node) => {
+      ;(node as HTMLElement & { retainedAcrossFinalization?: true }).retainedAcrossFinalization =
+        true
+    })
+
+    await waitForAssistantGenerationFinished(page, chatId, 4)
+    await expect.poll(() => scenario.snapshot().then((state) => state.activeStreams)).toBe(0)
+    const assistants = (await readMessages(page, chatId)).filter(
+      (row) => row.role === 'assistant' && row.deleted === false,
+    )
+    expect(assistants).toHaveLength(5)
+    expect(messageTextLength(assistants.at(-1))).toBe(160_000)
+    await expect(messages).toHaveCount(10)
+    await expect(region).toHaveAttribute('data-scroll-state', 'follow')
+    await expect.poll(() => scrollDistanceFromBottom(region)).toBeLessThanOrEqual(4)
+    expect(
+      await streamedAssistant.evaluate((node) => {
+        const retained = (element: Element | null) =>
+          element !== null &&
+          'retainedAcrossFinalization' in element &&
+          element.retainedAcrossFinalization === true
+        return {
+          message: retained(node),
+          body: retained(node.querySelector('[data-ui="message-body"]')),
+          markdown: retained(node.querySelector('[data-ui="markdown"]')),
+          frozenPrefix: retained(
+            node.querySelector('[data-ui="markdown-segment"][data-mode="static"]'),
+          ),
+        }
+      }),
+    ).toEqual({ message: true, body: true, markdown: true, frozenPrefix: true })
+    await expect(streamingMarkdownRoot).toHaveAttribute('data-overflow', 'streaming-segmented')
+    expect(
+      await streamingMarkdownRoot
+        .locator('[data-ui="markdown-segment"]')
+        .evaluateAll((segments) =>
+          segments.every((segment) => segment.getAttribute('data-mode') === 'static'),
+        ),
+    ).toBe(true)
+    const finalizedMetrics = await region.evaluate((node) => ({
+      distanceFromBottom: node.scrollHeight - node.scrollTop - node.clientHeight,
+      scrollTop: node.scrollTop,
+    }))
+    expect(
+      Math.abs(finalizedMetrics.distanceFromBottom - transitionMetrics.distanceFromBottom),
+    ).toBeLessThanOrEqual(4)
+    await testInfo.attach('finalization-geometry.json', {
+      body: JSON.stringify(
+        {
+          transitionMetrics,
+          finalizedMetrics,
+          bottomDistanceDelta: Math.abs(
+            finalizedMetrics.distanceFromBottom - transitionMetrics.distanceFromBottom,
+          ),
+        },
+        null,
+        2,
+      ),
+      contentType: 'application/json',
+    })
+    await testInfo.attach('finalized-transcript.png', {
+      body: await page.screenshot(),
+      contentType: 'image/png',
+    })
+
+    const continuity = await stopMessageCountRecorder(page)
+    expect(continuity).toMatchObject({
+      commonPrefixDisconnectedIds: [],
+      commonPrefixReplacedIds: [],
+      listRemoved: false,
+      listReplaced: false,
+      loadingSeen: false,
+      messageCountBelowExpectedCommonPrefix: false,
+      messageCountDecreased: false,
       messageCountsIncludeZero: false,
     })
+    expect(continuity.minimumMessageCount).toBeGreaterThanOrEqual(commonPrefixMessageIds.length)
   } finally {
     await scenario.dispose()
   }
@@ -77,4 +243,8 @@ function messageTextLength(row: Record<string, unknown> | undefined): number {
     (sum, item) => sum + (typeof item.text === 'string' ? item.text.length : 0),
     0,
   )
+}
+
+async function scrollDistanceFromBottom(region: Locator): Promise<number> {
+  return region.evaluate((node) => node.scrollHeight - node.scrollTop - node.clientHeight)
 }

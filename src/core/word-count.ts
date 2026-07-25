@@ -21,7 +21,7 @@ function getSegmenter(): InstanceType<SegmenterCtor> | null {
   return segmenter
 }
 
-export function countWords(text: string): number {
+function countWords(text: string): number {
   const trimmed = text.trim()
   if (trimmed.length === 0) return 0
 

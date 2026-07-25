@@ -2,7 +2,7 @@
 //   - `reasoningPreservationFormat` per model family
 //   - `preferApi` / `requiresResponsesApi` / `requiresPhaseEcho`
 //   - `gpt54SamplingGate` + `adjustGpt54SamplingGate`
-//   - `hiddenReasoningOnChatApi` (renamed-scoped spelling of `reasoningHidden`)
+//   - public reasoning visibility policy for chat and Responses transports
 //   - GPT-5.4 family effort enum excludes `minimal` (verified by live probe 4)
 
 import { describe, expect, it } from 'vitest'
@@ -14,6 +14,7 @@ import {
   quirksFor,
   reasoningPreservationFormatFor,
   reasoningToggleableFor,
+  reasoningVisibilityPolicyFor,
   responsesSupportFor,
 } from '../../src/core/quirks'
 
@@ -174,8 +175,14 @@ describe('API routing hints', () => {
   })
 
   it('Gemini 3.x Flash releases inherit encrypted reasoning without a registry row', () => {
-    expect(reasoningPreservationFormatFor('google/gemini-3.5-flash')).toBe('google-gemini-v1')
-    expect(emitsEncryptedReasoningFor('google/gemini-3.5-flash')).toBe('always')
+    for (const model of [
+      'google/gemini-3.5-flash',
+      'google/gemini-3.5-flash-lite',
+      'google/gemini-3.6-flash',
+    ]) {
+      expect(reasoningPreservationFormatFor(model)).toBe('google-gemini-v1')
+      expect(emitsEncryptedReasoningFor(model)).toBe('always')
+    }
     expect(emitsEncryptedReasoningFor('google/gemini-2.5-flash')).toBe('never')
   })
 
@@ -185,7 +192,10 @@ describe('API routing hints', () => {
     for (const m of ['openai/o1', 'openai/o3', 'openai/o3-mini', 'openai/o4-mini']) {
       const q = quirksFor(m)
       expect(q.preferApi).toBe('responses')
-      expect(q.hiddenReasoningOnChatApi).toBe(true)
+      expect(reasoningVisibilityPolicyFor(m)).toEqual({
+        kind: 'hidden-on-chat',
+        otherwise: 'summary',
+      })
     }
     expect(quirksFor('openai/o1-pro').requiresResponsesApi).toBe(true)
   })

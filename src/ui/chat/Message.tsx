@@ -8,35 +8,44 @@ import {
   useRef,
   useState,
 } from 'react'
-import type { EffectiveCapability } from '../../core/capabilities'
-import { hasAppliedSuccessfulContinuation } from '../../core/continuation-content'
+import type { ConversationDeleteMode } from '../../app/conversation-actions'
+import type { ConversationMutationSettlement } from '../../app/presentation-interactions'
+import type { ChatSettingsPatch } from '../../core/chat-metadata'
+import {
+  createAppliedMessageView,
+  projectAppliedMessageReasoningPresentation,
+} from '../../core/continuation-content'
 import type { LongMessageDisplayMode } from '../../core/global-settings'
-import { quirksFor } from '../../core/quirks'
-import { normalizeReasoningDetails } from '../../core/reasoning'
+import {
+  type GenerationCapability,
+  generationCapabilityAvailable,
+  generationCapabilityBlockedReason,
+  generationNotStarted,
+  pendingGenerationCapability,
+} from '../../core/interaction-capability'
+import { plaintextOf } from '../../core/message-content'
+import { messageReasoningVisibility } from '../../core/reasoning'
 import { detectStaleReasoning, staleReasoningBannerText } from '../../core/stale-reasoning'
-import type { StreamAccumulatorLiveReasoningRow } from '../../core/stream-accumulator'
 import type {
   ChatId,
   MessageAttachmentRef,
   Message as MessageRow,
-  ReasoningDetail,
+  ProviderOutputMemberRef,
+  ReasoningMemberRef,
 } from '../../core/types'
 import { useMessageStreamProjection } from '../../hooks/useMessageStreamProjection'
-import type { MessageAttachmentRefMutation } from '../../store/attachments'
-import { updateChatSettings } from '../../store/chats'
-import {
-  contentNeedsGeneratedOutputMaterialization,
-  generatedOutputAttachmentIds,
-  normalizeGeneratedImageOutputAttachmentRefs,
-  scheduleGeneratedOutputMigration,
-} from '../../store/generated-images'
-import { getStreamClientId } from '../../store/stream-leases'
+import type {
+  GenerationStartResult,
+  MessageAttachmentRefMutation,
+  WorkspaceFence,
+} from '../../store/presentation-contracts'
 import { useToastStore } from '../../store/zustand/toastStore'
 import { useUiStore } from '../../store/zustand/uiStore'
 import { AttachmentRefChips } from '../attachments/AttachmentRefChips'
 import { Button } from '../primitives/Button'
 import { BranchControls, type BranchNavigationContext } from './BranchControls'
-import { InlineEditor, plaintextOf } from './InlineEditor'
+import { InlineEditor } from './InlineEditor'
+import { PROGRESSIVE_STATIC_MARKDOWN_CHARS } from './MarkdownView'
 import { type InsertSlot, MessageActions, MessageEditTreeActions } from './MessageActions'
 import { MessageContent, messageTextSegmentsFromContent } from './MessageContent'
 import { MessageHeader } from './MessageHeader'
@@ -54,16 +63,13 @@ interface MessageProps {
   chatId: ChatId
   message: MessageRow
   bodyVersion: number
+  bodyExact?: boolean
   branchContext?: BranchNavigationContext
-  hasAnyReasoningDetails: boolean
-  streaming?: boolean
-  hasConnection: boolean
-  generationBusy?: boolean
+  editResendCapability: GenerationCapability
+  regenerateCapability: GenerationCapability
+  continueCapability: GenerationCapability
   presentationOnly?: boolean
-  allowPresentationStreamProjection?: boolean
-  // Effective capability for the chat's current model. Message-level quirks
-  // should still prefer the stored message generation model when available.
-  capability?: EffectiveCapability
+  presentationFence: WorkspaceFence
   // Whether this message sits immediately before a message of the same role
   // on the active path — surfaces the adjacency-warning badge (§10.6).
   roleMismatch?: boolean
@@ -77,23 +83,44 @@ interface MessageProps {
   excludedFromContext?: boolean
   // Structural op handlers. Threaded from the list so `<Message>` can stay
   // presentational except for its own edit-swap state.
-  onEditInPlace: (message: MessageRow, text: string) => Promise<void>
-  onToggleContextVisibility?: (message: MessageRow) => Promise<void>
-  onDismissGenerationNotice?: (message: MessageRow) => Promise<void>
+  onBeginEdit: (
+    presentationFence: WorkspaceFence,
+    message: MessageRow,
+  ) => {
+    readonly admitted: Promise<void>
+    release(): void
+  }
+  onEditInPlace: (message: MessageRow, text: string) => ConversationMutationSettlement
+  onToggleContextVisibility?: (message: MessageRow) => ConversationMutationSettlement
+  onDismissGenerationNotice?: (message: MessageRow) => ConversationMutationSettlement
   onMutateAttachmentRef?: (
     message: MessageRow,
     mutation: MessageAttachmentRefMutation,
   ) => Promise<void>
-  onToggleReasoningDetailHidden?: (message: MessageRow, detailIndex: number) => Promise<void>
-  onToggleProviderOutputItemHidden?: (message: MessageRow, itemIndex: number) => Promise<void>
+  onToggleReasoningDetailHidden?: (
+    message: MessageRow,
+    member: ReasoningMemberRef,
+  ) => ConversationMutationSettlement
+  onToggleProviderOutputItemHidden?: (
+    message: MessageRow,
+    member: ProviderOutputMemberRef,
+  ) => ConversationMutationSettlement
   onEditAndSend?: (
     message: MessageRow,
     text: string,
     opts?: { prefillText?: string; attachmentRefs?: MessageAttachmentRef[] },
-  ) => Promise<void>
-  onRegenerate?: (message: MessageRow) => Promise<void>
-  onContinue?: (message: MessageRow) => Promise<void>
-  onForkChat?: (message: MessageRow) => Promise<void>
+  ) => GenerationStartResult
+  onRegenerate?: (
+    message: MessageRow,
+    options?: { settingsPatch?: ChatSettingsPatch },
+  ) => GenerationStartResult
+  onContinue?: (message: MessageRow) => GenerationStartResult
+  onForkChat?: (message: MessageRow) => ConversationMutationSettlement
+  onDeleteMessage: (
+    message: MessageRow,
+    mode: ConversationDeleteMode,
+    roleMismatch?: boolean,
+  ) => ConversationMutationSettlement
   onInsert?: (message: MessageRow, slot: InsertSlot) => void
   // Prefill UI plumbing — passes through to InlineEditor's Save & Send.
   // `showPrefillButton` is true only when the chat's model class is not
@@ -105,6 +132,10 @@ interface MessageProps {
 }
 
 let messageRenderProbe: ((messageId: string) => void) | undefined
+
+const PENDING_PRESENTATION_GENERATION_START = generationNotStarted(
+  pendingGenerationCapability('prompt-path'),
+)
 
 export function __setMessageRenderProbeForTests(
   probe: ((messageId: string) => void) | undefined,
@@ -128,17 +159,17 @@ export const Message = memo(
   (prev, next) =>
     prev.message === next.message &&
     prev.bodyVersion === next.bodyVersion &&
+    prev.bodyExact === next.bodyExact &&
     prev.branchContext === next.branchContext &&
-    prev.hasAnyReasoningDetails === next.hasAnyReasoningDetails &&
-    prev.streaming === next.streaming &&
-    prev.hasConnection === next.hasConnection &&
-    prev.generationBusy === next.generationBusy &&
+    prev.editResendCapability === next.editResendCapability &&
+    prev.regenerateCapability === next.regenerateCapability &&
+    prev.continueCapability === next.continueCapability &&
     prev.presentationOnly === next.presentationOnly &&
-    prev.allowPresentationStreamProjection === next.allowPresentationStreamProjection &&
-    prev.capability === next.capability &&
+    prev.presentationFence === next.presentationFence &&
     prev.roleMismatch === next.roleMismatch &&
     prev.staleReplyHint === next.staleReplyHint &&
     prev.excludedFromContext === next.excludedFromContext &&
+    prev.onBeginEdit === next.onBeginEdit &&
     prev.onEditInPlace === next.onEditInPlace &&
     prev.onToggleContextVisibility === next.onToggleContextVisibility &&
     prev.onDismissGenerationNotice === next.onDismissGenerationNotice &&
@@ -149,6 +180,7 @@ export const Message = memo(
     prev.onRegenerate === next.onRegenerate &&
     prev.onContinue === next.onContinue &&
     prev.onForkChat === next.onForkChat &&
+    prev.onDeleteMessage === next.onDeleteMessage &&
     prev.onInsert === next.onInsert &&
     prev.showPrefillButton === next.showPrefillButton &&
     prev.defaultPrefill === next.defaultPrefill &&
@@ -160,17 +192,17 @@ function MessageInner({
   chatId,
   message,
   bodyVersion,
+  bodyExact = true,
   branchContext,
-  hasAnyReasoningDetails,
-  streaming,
-  hasConnection,
-  generationBusy = false,
+  editResendCapability,
+  regenerateCapability,
+  continueCapability,
   presentationOnly = false,
-  allowPresentationStreamProjection = false,
-  capability,
+  presentationFence,
   roleMismatch,
   staleReplyHint,
   excludedFromContext,
+  onBeginEdit,
   onEditInPlace,
   onToggleContextVisibility,
   onDismissGenerationNotice,
@@ -181,6 +213,7 @@ function MessageInner({
   onRegenerate,
   onContinue,
   onForkChat,
+  onDeleteMessage,
   onInsert,
   showPrefillButton,
   defaultPrefill,
@@ -188,52 +221,103 @@ function MessageInner({
   longMessageDisplayMode = 'full',
 }: MessageProps) {
   messageRenderProbe?.(message.id)
-  const debug = (message as unknown as { debugCrash?: boolean }).debugCrash
-  if (debug) {
-    throw new Error('Message debug crash')
-  }
+  const editResendAvailable = generationCapabilityAvailable(editResendCapability)
+  const regenerateAvailable = generationCapabilityAvailable(regenerateCapability)
+  const continueAvailable = generationCapabilityAvailable(continueCapability)
+  const bodyMutationUnavailable = presentationOnly || !bodyExact
+  const editResendBlockedReason = generationCapabilityBlockedReason(
+    editResendCapability,
+    'edit-resend',
+  )
   const [showInfo, setShowInfo] = useState(false)
   const [editing, setEditing] = useState(false)
-  // Streaming state is tracked per-message (messageId) in the ephemeral
-  // stream store. Prop `streaming` is the authoritative fallback when a
-  // caller passes it in; otherwise the store is checked. Either way, the
-  // resolved value drives streaming render mode plus reasoning/collapse
-  // affordances.
-  const [activeStream, liveSnapshot] = useMessageStreamProjection(
-    message,
-    message.role === 'assistant' && (!presentationOnly || allowPresentationStreamProjection),
-  )
-  const storeStreaming = activeStream !== undefined
-  const isStreaming = !presentationOnly && (streaming === true || storeStreaming)
-  const remoteStreaming =
-    activeStream !== undefined && activeStream.ownerClientId !== getStreamClientId()
-  const renderedContent = liveSnapshot?.content ?? message.content
-  const liveReasoningRows = liveSnapshot?.reasoningRows
-  const renderedGeneration = mergeLiveGeneration(message.generation, liveSnapshot?.generation)
-  const infoReasoningDetails = useMemo(
+  const [editSessionReady, setEditSessionReady] = useState(false)
+  const editSessionRef = useRef<{
+    readonly identity: string
+    readonly admitted: Promise<void>
+    release(): void
+  } | null>(null)
+  const editIdentity = `${presentationFence.workspaceId}:${presentationFence.replacementEpoch}:${chatId}:${message.id}`
+  const appliedView = useMemo(() => createAppliedMessageView(message), [message])
+  const projectionEnabled = message.role === 'assistant'
+  const streamProjection = useMessageStreamProjection(message, presentationFence, projectionEnabled)
+  const activeAttempt = streamProjection.execution
+  const availability = activeAttempt?.availability
+  const liveSnapshot = streamProjection.liveProjection
+  const streamTargetBusy = availability?.blocksReplacement === true
+  const activeStreamingPresentation =
+    availability !== undefined && availability.presentation !== 'none'
+  const liveRendering =
+    activeStreamingPresentation ||
+    liveSnapshot !== undefined ||
+    streamProjection.presentation !== undefined
+
+  const endEditing = useCallback(() => {
+    editSessionRef.current?.release()
+    editSessionRef.current = null
+    setEditSessionReady(false)
+    setEditing(false)
+  }, [])
+  const beginEditing = useCallback(() => {
+    editSessionRef.current?.release()
+    const session = onBeginEdit(presentationFence, message)
+    const owned = { ...session, identity: editIdentity }
+    editSessionRef.current = owned
+    setEditSessionReady(false)
+    setEditing(false)
+    void session.admitted.then(
+      () => {
+        if (editSessionRef.current === owned) {
+          setEditing(true)
+          setEditSessionReady(true)
+        }
+      },
+      () => {
+        if (editSessionRef.current === owned) endEditing()
+      },
+    )
+  }, [editIdentity, endEditing, message, onBeginEdit, presentationFence])
+  useEffect(() => {
+    const session = editSessionRef.current
+    if (session && session.identity !== editIdentity) endEditing()
+  }, [editIdentity, endEditing])
+  useEffect(() => endEditing, [endEditing])
+  const editMutationUnavailable =
+    !editSessionReady || editSessionRef.current?.identity !== editIdentity
+  const remoteStreaming = availability?.presentation === 'remote-streaming'
+  const renderedContent = useMemo(
     () =>
-      showInfo && liveReasoningRows
-        ? materializeLiveReasoningRows(liveReasoningRows)
-        : message.reasoningDetails,
-    [liveReasoningRows, message.reasoningDetails, showInfo],
+      liveSnapshot?.baseContent
+        ? [...liveSnapshot.baseContent, ...liveSnapshot.content]
+        : (liveSnapshot?.content ?? message.content),
+    [liveSnapshot, message.content],
   )
+  const liveReasoning = liveSnapshot?.reasoning
+  const renderedGeneration = mergeLiveGeneration(message.generation, liveSnapshot?.generation)
   const infoMessage = useMemo(() => {
     if (!showInfo || !liveSnapshot) return message
     return {
       ...message,
-      content: renderedContent,
-      ...(infoReasoningDetails ? { reasoningDetails: infoReasoningDetails } : {}),
+      content: [...renderedContent],
       ...(renderedGeneration ? { generation: renderedGeneration } : {}),
     }
-  }, [showInfo, liveSnapshot, message, renderedContent, infoReasoningDetails, renderedGeneration])
-  const reasoning = useMemo(
-    () =>
-      liveReasoningRows
-        ? liveReasoningRows.map((row) => row.detail)
-        : normalizeReasoningDetails(message.reasoningDetails ?? []),
-    [liveReasoningRows, message.reasoningDetails],
+  }, [showInfo, liveSnapshot, message, renderedContent, renderedGeneration])
+  const infoAppliedView = useMemo(
+    () => (infoMessage === message ? appliedView : createAppliedMessageView(infoMessage)),
+    [appliedView, infoMessage, message],
   )
-  const hasDisplayReasoning = reasoning.some((detail) => !detail.id?.startsWith('tool_'))
+  const reasoningPresentation = useMemo(
+    () =>
+      liveReasoning
+        ? projectAppliedMessageReasoningPresentation(appliedView, {
+            attemptKind: liveSnapshot.attemptKind,
+            streamId: liveSnapshot.streamId,
+            projection: liveReasoning,
+          })
+        : projectAppliedMessageReasoningPresentation(appliedView),
+    [appliedView, liveReasoning, liveSnapshot?.attemptKind, liveSnapshot?.streamId],
+  )
+  const hasDisplayReasoning = reasoningPresentation.hasReasoning
   const textSegments = useMemo(
     () => messageTextSegmentsFromContent(renderedContent),
     [renderedContent],
@@ -243,8 +327,9 @@ function MessageInner({
     [textSegments],
   )
   const text = useMemo(
-    () => (isStreaming ? '' : textSegments.join('')),
-    [isStreaming, textSegments],
+    () =>
+      liveRendering || textLength > PROGRESSIVE_STATIC_MARKDOWN_CHARS ? '' : textSegments.join(''),
+    [liveRendering, textLength, textSegments],
   )
   const hasContent =
     textLength > 0 ||
@@ -252,46 +337,32 @@ function MessageInner({
       (item) =>
         item.type === 'output_image' ||
         item.type === 'audio_output' ||
-        item.type === 'output_video',
+        item.type === 'output_video' ||
+        item.type === 'file',
     )
-  useEffect(() => {
-    if (presentationOnly) return
-    if (isStreaming) return
-    if (contentNeedsGeneratedOutputMaterialization(renderedContent)) {
-      scheduleGeneratedOutputMigration(message.id)
-      return
-    }
-    if (generatedOutputAttachmentIds(renderedContent).size > 0) {
-      void normalizeGeneratedImageOutputAttachmentRefs(message.id).catch(() => {})
-    }
-  }, [isStreaming, presentationOnly, renderedContent, message.id])
-  const gen = renderedGeneration
-  const suppressOriginalFailure = hasAppliedSuccessfulContinuation(message)
-  const error = suppressOriginalFailure ? undefined : gen?.error
-  const abortReason = suppressOriginalFailure ? undefined : gen?.abortReason
-  const messageModelQuirks = useMemo(
-    () => quirksFor(gen?.model ?? gen?.requestedModel ?? ''),
-    [gen?.model, gen?.requestedModel],
-  )
-  // Hidden-reasoning footer: only applies to assistant turns on a route that
-  // hides reasoning. `apiUsed === 'responses'` means reasoning IS returned
-  // (or could be, via summary+encrypted). The footer is explicitly for chat-
-  // completions where the model reasons silently.
-  const apiUsed = gen?.apiUsed
+  const latestAttempt = appliedView.latestAttempt
+  const terminalAttempt =
+    latestAttempt.kind === 'generation' ? renderedGeneration : latestAttempt.metadata
+  const gen = terminalAttempt
+  const error = gen?.error
+  const abortReason = gen?.abortReason
+  const reasoningVisibility = messageReasoningVisibility(appliedView)
   const showHiddenReasoningFooter =
     message.role === 'assistant' &&
     !editing &&
     !hasDisplayReasoning &&
-    (messageModelQuirks.hiddenReasoningOnChatApi === true ||
-      capability?.quirks.hiddenReasoningOnChatApi === true) &&
-    apiUsed === 'chat'
+    !streamTargetBusy &&
+    reasoningVisibility.disclosure === 'absent' &&
+    reasoningVisibility.reason === 'api-mode'
   const canSwitchToResponses = Boolean(
-    !presentationOnly && onRegenerate && hasConnection && !generationBusy,
+    !bodyMutationUnavailable && onRegenerate && regenerateAvailable && !streamTargetBusy,
   )
-  const handleSwitchToResponses = useCallback(async () => {
-    await updateChatSettings(chatId, { api: 'responses' })
-    if (onRegenerate) await onRegenerate(message)
-  }, [chatId, message, onRegenerate])
+  const handleSwitchToResponses = useCallback((): GenerationStartResult => {
+    if (bodyMutationUnavailable || !onRegenerate) {
+      return PENDING_PRESENTATION_GENERATION_START
+    }
+    return onRegenerate(message, { settingsPatch: { api: 'responses' } })
+  }, [bodyMutationUnavailable, message, onRegenerate])
 
   // Stale-reasoning detection. When a fresh assistant error matches the
   // "preserved reasoning got rejected" pattern, push a banner with actions
@@ -307,20 +378,24 @@ function MessageInner({
         message: error.message,
         ...(error.statusCode !== undefined ? { statusCode: error.statusCode } : {}),
       },
-      { hadReasoningDetails: hasAnyReasoningDetails },
+      gen.reasoningCarryForward,
     )
-  }, [error, hasAnyReasoningDetails])
-  const handleRetryWithoutReasoning = useCallback(async () => {
-    await updateChatSettings(chatId, {
-      reasoning: {
-        mode: 'default',
-        exclude: false,
-        summary: 'auto',
-        include: { encrypted: false, summary: false, text: false },
+  }, [error, gen])
+  const handleRetryWithoutReasoning = useCallback((): GenerationStartResult => {
+    if (bodyMutationUnavailable || !onRegenerate) {
+      return PENDING_PRESENTATION_GENERATION_START
+    }
+    return onRegenerate(message, {
+      settingsPatch: {
+        reasoning: {
+          mode: 'default',
+          exclude: false,
+          summary: 'auto',
+          include: { encrypted: false, summary: false, text: false },
+        },
       },
     })
-    if (onRegenerate) await onRegenerate(message)
-  }, [chatId, message, onRegenerate])
+  }, [bodyMutationUnavailable, message, onRegenerate])
   const handleCopyError = useCallback(() => {
     if (!error) return
     const payload = JSON.stringify(
@@ -340,7 +415,7 @@ function MessageInner({
     }
   }, [error, message.id])
   useEffect(() => {
-    if (presentationOnly) return
+    if (bodyMutationUnavailable) return
     if (!staleProvider) return
     // One banner per error id. The key is the message id so subsequent
     // swipes back to the same failed leaf don't stack a second banner.
@@ -350,7 +425,12 @@ function MessageInner({
       text: staleReasoningBannerText(staleProvider),
       primary: {
         label: 'Retry without preserved reasoning',
-        action: handleRetryWithoutReasoning,
+        action: async () => {
+          const start = handleRetryWithoutReasoning()
+          if (start.kind === 'not-started') return false
+          await start.handle.prepared
+          return true
+        },
       },
       secondary: {
         label: 'Copy error',
@@ -369,63 +449,50 @@ function MessageInner({
     dismissBanner,
     handleRetryWithoutReasoning,
     handleCopyError,
-    presentationOnly,
+    bodyMutationUnavailable,
   ])
   const collapseProfile = useMemo(
-    () => collapseProfileFor(textLength, { streaming: isStreaming, longMessageDisplayMode }),
-    [isStreaming, longMessageDisplayMode, textLength],
+    () => collapseProfileFor(textLength, { streaming: liveRendering, longMessageDisplayMode }),
+    [liveRendering, longMessageDisplayMode, textLength],
   )
   const manualCollapseRef = useRef(false)
+  const previousStreamingRef = useRef(liveRendering)
   const [collapseMode, setCollapseMode] = useState<MessageCollapseMode>(collapseProfile.defaultMode)
 
   useEffect(() => {
-    if (!presentationOnly) return
-    setEditing(false)
-    setShowInfo(false)
-  }, [presentationOnly])
-
-  useEffect(() => {
+    const justFinalized = previousStreamingRef.current && !liveRendering
+    previousStreamingRef.current = liveRendering
     setCollapseMode((prev) => {
       if (manualCollapseRef.current) {
         return collapseProfile.modes.includes(prev) ? prev : collapseProfile.defaultMode
       }
+      if (justFinalized && collapseProfile.modes.includes(prev)) return prev
       return collapseProfile.defaultMode
     })
-  }, [collapseProfile.defaultMode, collapseProfile.modes])
+  }, [collapseProfile.defaultMode, collapseProfile.modes, liveRendering])
 
   const handleSave = useCallback(
-    async (text: string) => {
-      await onEditInPlace(message, text)
-      setEditing(false)
-    },
+    (text: string) => onEditInPlace(message, text),
     [message, onEditInPlace],
   )
   // The display normalizer is deliberately one-row-in/one-row-out. Apply the
   // eye toggle to that same raw row and leave every other carrier untouched.
   const handleToggleReasoningHidden = useCallback(
-    (detailIndex: number) => {
-      if (liveReasoningRows || !onToggleReasoningDetailHidden) return
-      void onToggleReasoningDetailHidden(message, detailIndex)
-    },
-    [liveReasoningRows, message, onToggleReasoningDetailHidden],
+    (member: ReasoningMemberRef) => onToggleReasoningDetailHidden!(message, member),
+    [message, onToggleReasoningDetailHidden],
   )
   const handleToggleToolHidden = useCallback(
-    (itemIndex: number) => {
-      if (!onToggleProviderOutputItemHidden) return
-      void onToggleProviderOutputItemHidden(message, itemIndex)
-    },
+    (member: ProviderOutputMemberRef) => onToggleProviderOutputItemHidden!(message, member),
     [message, onToggleProviderOutputItemHidden],
   )
   const handleSaveAndSend = useCallback(
-    async (
-      text: string,
-      opts?: { prefillText?: string; attachmentRefs?: MessageAttachmentRef[] },
-    ) => {
-      if (!onEditAndSend) return
-      await onEditAndSend(message, text, opts)
-      setEditing(false)
+    (text: string, opts?: { prefillText?: string; attachmentRefs?: MessageAttachmentRef[] }) => {
+      if (editMutationUnavailable || !onEditAndSend) {
+        return PENDING_PRESENTATION_GENERATION_START
+      }
+      return onEditAndSend(message, text, opts)
     },
-    [message, onEditAndSend],
+    [editMutationUnavailable, message, onEditAndSend],
   )
   const editTreeMode = useUiStore((s) => s.editTreeMode)
   const collapseEnabled = !editing && collapseProfile.modes.length > 1
@@ -435,23 +502,30 @@ function MessageInner({
     setCollapseMode((prev) => nextCollapseMode(prev, collapseProfile.modes))
   }, [collapseEnabled, collapseProfile.modes])
   const handleRegenerate = useCallback(() => {
-    if (!onRegenerate) return
-    void onRegenerate(message)
-  }, [message, onRegenerate])
+    if (bodyMutationUnavailable || !onRegenerate) {
+      return PENDING_PRESENTATION_GENERATION_START
+    }
+    return onRegenerate(message)
+  }, [bodyMutationUnavailable, message, onRegenerate])
   const handleContinue = useCallback(() => {
-    if (!onContinue) return
-    void onContinue(message)
-  }, [message, onContinue])
+    if (bodyMutationUnavailable || !onContinue) {
+      return PENDING_PRESENTATION_GENERATION_START
+    }
+    return onContinue(message)
+  }, [bodyMutationUnavailable, message, onContinue])
   const handleForkChat = useCallback(() => {
-    if (!onForkChat) return
-    void onForkChat(message)
+    return onForkChat!(message)
   }, [message, onForkChat])
+  const handleDeleteMessage = useCallback(
+    (mode: ConversationDeleteMode) => onDeleteMessage(message, mode, roleMismatch),
+    [message, onDeleteMessage, roleMismatch],
+  )
   const handleInsert = useCallback(
     (slot: InsertSlot) => {
-      if (!onInsert) return
+      if (presentationOnly || !onInsert) return
       onInsert(message, slot)
     },
-    [message, onInsert],
+    [message, onInsert, presentationOnly],
   )
 
   return (
@@ -464,7 +538,8 @@ function MessageInner({
       data-has-error={error ? 'true' : 'false'}
       data-has-reasoning={hasDisplayReasoning ? 'true' : 'false'}
       data-collapse-mode={collapseMode}
-      aria-busy={isStreaming || undefined}
+      data-body-exact={bodyExact ? 'true' : 'false'}
+      aria-busy={streamTargetBusy || undefined}
     >
       <Button
         type="button"
@@ -473,7 +548,7 @@ function MessageInner({
         data-collapse-enabled={collapseEnabled ? 'true' : 'false'}
         data-collapse-oversized={collapseProfile.oversized ? 'true' : undefined}
         onClick={cycleCollapse}
-        disabled={presentationOnly || !collapseEnabled}
+        disabled={!collapseEnabled}
         aria-label={collapseButtonLabel(message.role, collapseMode, collapseProfile.modes.length)}
         title={collapseButtonTitle(
           collapseMode,
@@ -488,15 +563,14 @@ function MessageInner({
         />
       </Button>
       <div data-ui="message-body-column">
-        <MessageHeader message={message} />
+        <MessageHeader message={message} appliedView={appliedView} />
         {collapseMode === 'full' && hasDisplayReasoning && !editing ? (
           <ReasoningBlock
-            details={reasoning}
-            detailsNormalized
-            {...(liveReasoningRows ? { liveRows: liveReasoningRows } : {})}
-            streaming={isStreaming}
+            presentation={reasoningPresentation}
+            streaming={liveRendering}
             hasContent={hasContent}
-            toggleHiddenDisabled={isStreaming}
+            deferContentUntilOpen={!liveRendering}
+            toggleHiddenDisabled={bodyMutationUnavailable}
             {...(message.role === 'assistant' && onToggleReasoningDetailHidden
               ? { onToggleHidden: handleToggleReasoningHidden }
               : {})}
@@ -505,7 +579,8 @@ function MessageInner({
         {collapseMode === 'full' && !editing ? (
           <ToolEvidenceBlock
             message={infoMessage}
-            toggleHiddenDisabled={isStreaming}
+            appliedView={appliedView}
+            toggleHiddenDisabled={bodyMutationUnavailable}
             {...(onToggleProviderOutputItemHidden
               ? { onToggleHidden: handleToggleToolHidden }
               : {})}
@@ -521,7 +596,9 @@ function MessageInner({
               <Button
                 type="button"
                 data-ui="message-hidden-reasoning-action"
-                onClick={() => void handleSwitchToResponses()}
+                onClick={() => {
+                  handleSwitchToResponses()
+                }}
                 title="Switch this chat to the Responses API and regenerate"
               >
                 Switch to Responses API
@@ -533,14 +610,15 @@ function MessageInner({
           <InlineEditor
             initial={plaintextOf(message.content)}
             onSave={handleSave}
-            onCancel={() => setEditing(false)}
-            saveContentOnly
+            onCancel={endEditing}
+            saveDisabled={editMutationUnavailable}
             attachmentsEnabled={message.role === 'user' && onEditAndSend !== undefined}
             {...(message.role === 'user' && onEditAndSend
               ? {
                   initialAttachmentRefs: message.attachmentRefs,
                   onSaveAndSend: handleSaveAndSend,
-                  saveAndSendDisabled: !hasConnection || generationBusy,
+                  saveAndSendDisabled:
+                    editMutationUnavailable || !editResendAvailable || streamTargetBusy,
                   ...(showPrefillButton
                     ? {
                         showPrefillButton: true,
@@ -548,9 +626,11 @@ function MessageInner({
                         prefillSettingsPrompt,
                       }
                     : {}),
-                  ...(!hasConnection
-                    ? { saveAndSendDisabledReason: 'Add a connection to send messages.' }
-                    : generationBusy
+                  ...(editResendBlockedReason
+                    ? {
+                        saveAndSendDisabledReason: editResendBlockedReason,
+                      }
+                    : streamTargetBusy
                       ? { saveAndSendDisabledReason: 'A request is already running for this chat.' }
                       : {}),
                 }
@@ -559,15 +639,15 @@ function MessageInner({
           />
         ) : (
           <MessageContent
-            key={`${message.id}:${bodyVersion}`}
             content={renderedContent}
             text={text}
-            textSegments={isStreaming ? textSegments : undefined}
-            streaming={isStreaming}
+            textSegments={textSegments}
+            streaming={liveRendering}
+            renderRevision={bodyVersion}
             collapseMode={collapseMode}
             messageId={message.id}
             attachmentRefs={message.attachmentRefs}
-            {...(onMutateAttachmentRef
+            {...(!bodyMutationUnavailable && onMutateAttachmentRef
               ? {
                   onMutateAttachmentRef: (mutation: MessageAttachmentRefMutation) =>
                     onMutateAttachmentRef(message, mutation),
@@ -579,7 +659,7 @@ function MessageInner({
           <AttachmentRefChips
             refs={message.attachmentRefs}
             messageId={message.id}
-            {...(onMutateAttachmentRef
+            {...(!bodyMutationUnavailable && onMutateAttachmentRef
               ? {
                   onMutateMessageRef: (mutation: MessageAttachmentRefMutation) =>
                     onMutateAttachmentRef(message, mutation),
@@ -594,8 +674,11 @@ function MessageInner({
               type="button"
               data-ui="message-error-dismiss"
               onClick={() => void onDismissGenerationNotice?.(message)}
+              disabled={bodyMutationUnavailable || onDismissGenerationNotice === undefined}
               aria-label="Dismiss error"
-              title="Dismiss"
+              title={
+                bodyMutationUnavailable ? 'Refreshing this message before dismissal.' : 'Dismiss'
+              }
             >
               ×
             </Button>
@@ -613,8 +696,11 @@ function MessageInner({
                 type="button"
                 data-ui="message-continue"
                 onClick={handleContinue}
-                disabled={!hasConnection}
-                title={!hasConnection ? 'Add a connection to continue.' : 'Continue this response'}
+                disabled={bodyMutationUnavailable || !continueAvailable || streamTargetBusy}
+                title={
+                  generationCapabilityBlockedReason(continueCapability, 'continue') ??
+                  'Continue this response'
+                }
               >
                 Continue
               </Button>
@@ -623,8 +709,11 @@ function MessageInner({
               type="button"
               data-ui="message-error-dismiss"
               onClick={() => void onDismissGenerationNotice?.(message)}
+              disabled={bodyMutationUnavailable || onDismissGenerationNotice === undefined}
               aria-label="Dismiss banner"
-              title="Dismiss"
+              title={
+                bodyMutationUnavailable ? 'Refreshing this message before dismissal.' : 'Dismiss'
+              }
             >
               ×
             </Button>
@@ -637,27 +726,24 @@ function MessageInner({
         ) : null}
         {null}
         <div data-ui="message-action-row">
-          {branchContext ? (
-            <BranchControls
-              key={presentationOnly ? 'branch-presentation' : 'branch-interactive'}
-              chatId={chatId}
-              message={message}
-              context={branchContext}
-            />
+          {branchContext && !presentationOnly ? (
+            <BranchControls chatId={chatId} message={message} context={branchContext} />
           ) : (
             <span data-ui="message-action-row-spacer" />
           )}
           <MessageActions
-            key={presentationOnly ? 'actions-presentation' : 'actions-interactive'}
-            chatId={chatId}
             message={message}
+            appliedView={appliedView}
             showInfo={showInfo}
             onToggleInfo={() => setShowInfo((v) => !v)}
             isEditing={editing}
-            onBeginEdit={() => setEditing(true)}
-            hasConnection={hasConnection}
-            generationBusy={generationBusy}
-            streamTargetBusy={isStreaming}
+            onBeginEdit={beginEditing}
+            regenerateCapability={regenerateCapability}
+            continueCapability={continueCapability}
+            generationBusy={streamTargetBusy}
+            streamTargetBusy={streamTargetBusy || presentationOnly}
+            mutationDisabled={bodyMutationUnavailable}
+            structuralDisabled={presentationOnly}
             {...(onToggleContextVisibility
               ? { onToggleContextVisibility: () => onToggleContextVisibility(message) }
               : {})}
@@ -665,38 +751,27 @@ function MessageInner({
             {...(onRegenerate ? { onRegenerate: handleRegenerate } : {})}
             {...(onContinue ? { onContinue: handleContinue } : {})}
             {...(onForkChat ? { onForkChat: handleForkChat } : {})}
+            onDelete={handleDeleteMessage}
           />
         </div>
         {editTreeMode ? (
           <MessageEditTreeActions
-            chatId={chatId}
-            message={message}
-            streamTargetBusy={isStreaming}
+            streamTargetBusy={streamTargetBusy || presentationOnly}
+            onDelete={handleDeleteMessage}
             {...(onInsert ? { onInsert: handleInsert } : {})}
-            {...(roleMismatch ? { roleMismatch: true } : {})}
           />
         ) : null}
         {showInfo ? (
           <MessageInfo
             message={infoMessage}
+            appliedView={infoAppliedView}
+            reasoningPresentation={reasoningPresentation}
             {...(staleReplyHint ? { staleReplyHint: true } : {})}
           />
         ) : null}
       </div>
     </article>
   )
-}
-
-function materializeLiveReasoningRows(
-  rows: readonly StreamAccumulatorLiveReasoningRow[],
-): ReasoningDetail[] {
-  return rows.map(({ detail, valueSections }) => {
-    if (!valueSections) return detail
-    const value = valueSections.join('')
-    if (detail.type === 'reasoning.text') return { ...detail, text: value }
-    if (detail.type === 'reasoning.summary') return { ...detail, summary: value }
-    return { ...detail, data: value }
-  })
 }
 
 function mergeLiveGeneration(

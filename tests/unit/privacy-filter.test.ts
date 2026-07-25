@@ -8,13 +8,15 @@
 //   - Explicit offline fallback → synthesized worst-case, flagged `unknown-policy`
 
 import { describe, expect, it } from 'vitest'
-import { cloneDefaultPrivacyPrefs } from '../../src/core/defaults'
+import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import {
   buildWireProviderPrivacy,
   filterEndpointsByPrivacy,
   privacyTierForPolicy,
 } from '../../src/core/privacy-filter'
 import type { DataPolicy, ModelEndpoint } from '../../src/core/types'
+
+const cloneDefaultPrivacyPrefs = () => cloneDefaultChatSettings().privacy
 
 function ep(provider_name: string, overrides: Partial<ModelEndpoint> = {}): ModelEndpoint {
   return {
@@ -368,7 +370,7 @@ describe('buildWireProviderPrivacy', () => {
     expect(wire.zeroEligible).toBe(false)
   })
 
-  it('lets manual provider prefs re-allow hard-denied providers when userTouchedPicker=true', () => {
+  it('keeps hard-denied providers ignored when the picker owns reversible exclusions', () => {
     const result = filterEndpointsByPrivacy({
       model: 'openai/gpt-5.4',
       endpoints: [ep('Azure'), ep('Training Host')],
@@ -379,8 +381,23 @@ describe('buildWireProviderPrivacy', () => {
       existingIgnore: [],
       userTouchedPicker: true,
     })
-    expect(wire.ignore).toBeUndefined()
+    expect(wire.ignore).toEqual(['Training Host'])
     expect(wire.zeroEligible).toBe(false)
+  })
+
+  it('reports zero eligible when manual selection excludes every provider', () => {
+    const result = filterEndpointsByPrivacy({
+      model: 'openai/gpt-5.4',
+      endpoints: [ep('Azure'), ep('OpenAI')],
+      policies: { Azure: POLICY_CLEAN, OpenAI: POLICY_UNKNOWN_RETENTION },
+      privacy: cloneDefaultPrivacyPrefs(),
+    })
+    const wire = buildWireProviderPrivacy(result, cloneDefaultPrivacyPrefs(), {
+      existingIgnore: ['Azure', 'OpenAI'],
+      userTouchedPicker: true,
+    })
+    expect(wire.ignore).toEqual(['Azure', 'OpenAI'])
+    expect(wire.zeroEligible).toBe(true)
   })
 
   it('does not synthesize provider order when multiple providers survive', () => {

@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest'
-import { DEFAULT_IMAGE_ORIGINS, isImageOriginAllowed } from '../../src/core/image-allowlist'
+import {
+  customImageOriginsFromStored,
+  DEFAULT_IMAGE_ORIGINS,
+  isImageOriginAllowed,
+} from '../../src/core/image-allowlist'
 import { normalizeOrigin } from '../../src/ui/settings/ImageAllowlistPanel'
 
 describe('image-allowlist defaults', () => {
@@ -61,5 +65,19 @@ describe('normalizeOrigin', () => {
   it('returns null for empty input', () => {
     expect(normalizeOrigin('')).toBe(null)
     expect(normalizeOrigin('   ')).toBe(null)
+  })
+})
+
+describe('customImageOriginsFromStored', () => {
+  it('normalizes an untrusted setting to unique string origins', () => {
+    expect(
+      customImageOriginsFromStored([
+        'https://one.example',
+        null,
+        'https://one.example',
+        'https://two.example',
+      ]),
+    ).toEqual(['https://one.example', 'https://two.example'])
+    expect(customImageOriginsFromStored({ origin: 'https://one.example' })).toEqual([])
   })
 })

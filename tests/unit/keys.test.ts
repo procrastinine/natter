@@ -1,12 +1,15 @@
 import Dexie from 'dexie'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import 'fake-indexeddb/auto'
+import { IDBFactory } from 'fake-indexeddb'
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
+import { __resetBroadcastForTests, subscribeWorkspaceChanges } from '../../src/store/broadcast'
+import { __resetBrowserRepositoryForTests } from '../../src/store/browser-repo'
 import {
-  __resetBroadcastForTests,
-  type BroadcastEvent,
-  onEvent,
-  postEvent,
-} from '../../src/store/broadcast'
-import { __resetDbForTests, openDb } from '../../src/store/db'
+  openBrowserWorkspace,
+  shutdownBrowserWorkspace,
+} from '../../src/store/browser-workspace-lifecycle'
+import { __resetDbForTests } from '../../src/store/db'
+import { exportWorkspaceBackup, restoreWorkspaceBackup } from '../../src/store/import-export'
 import {
   __resetKeyCacheForTests,
   changePassphrase,
@@ -15,8 +18,8 @@ import {
   getKey,
   getOrCreateInstallSecret,
   KeyMissingError,
-  markKeyUsed,
   obscurePreview,
+  observeKeyMaterialWorkspaceEffect,
   PassphraseRequiredError,
   resolveKey,
   resolveKeyForDispatch,
@@ -24,23 +27,35 @@ import {
 } from '../../src/store/keys'
 import { withNamedLock } from '../../src/store/locks'
 import { getSetting } from '../../src/store/settings'
+import { reduceWorkspaceChange } from '../../src/store/workspace-effect-hub'
+import type { WorkspaceChange, WorkspaceDependency } from '../../src/store/workspace-protocol'
+import { __resetWorkspaceRepositoryForTests } from '../../src/store/workspace-repository'
+import { createConfigurationProfile } from '../helpers/configuration'
 
 const DB_NAME = 'natter'
 
-async function resetAll() {
+let emptyWorkspaceBackup: Awaited<ReturnType<typeof exportWorkspaceBackup>>
+
+beforeAll(async () => {
+  ;(globalThis as unknown as { indexedDB: IDBFactory }).indexedDB = new IDBFactory()
+  __resetWorkspaceRepositoryForTests()
+  __resetBrowserRepositoryForTests()
   __resetBroadcastForTests()
   __resetKeyCacheForTests()
   __resetDbForTests()
   await Dexie.delete(DB_NAME)
-}
-
-beforeEach(async () => {
-  await resetAll()
-  await openDb()
+  await openBrowserWorkspace()
+  emptyWorkspaceBackup = await exportWorkspaceBackup()
 })
 
-afterEach(async () => {
-  await resetAll()
+beforeEach(async () => {
+  vi.restoreAllMocks()
+  await restoreWorkspaceBackup(emptyWorkspaceBackup, { now: 1 })
+})
+
+afterAll(async () => {
+  await shutdownBrowserWorkspace()
+  __resetKeyCacheForTests()
 })
 
 describe('obscurePreview', () => {
@@ -54,15 +69,20 @@ describe('obscurePreview', () => {
 })
 
 describe('install-secret', () => {
-  it('creates and persists an install secret on first access; reuses it thereafter', async () => {
+  it('creates one persisted secret through the configuration command and reuses it', async () => {
+    const changes: WorkspaceChange[] = []
+    const unsubscribe = subscribeWorkspaceChanges((change) => changes.push(change))
+
     const first = await getOrCreateInstallSecret()
     const second = await getOrCreateInstallSecret()
-    expect(first).toBe(second)
-    const stored = await getSetting<string>('install-secret')
-    expect(stored).toBe(first)
+    unsubscribe()
+
+    expect(second).toBe(first)
+    expect(await getSetting<string>('install-secret')).toBe(first)
+    expect(changedDependencies(changes)).toEqual([{ kind: 'setting', keys: ['install-secret'] }])
   })
 
-  it('atomically initializes concurrent encryptors and decrypts both after a reload', async () => {
+  it('atomically initializes concurrent encryptors and decrypts both after a tab restart', async () => {
     let announceLockHeld: (() => void) | undefined
     const lockHeld = new Promise<void>((resolve) => {
       announceLockHeld = resolve
@@ -110,12 +130,10 @@ describe('install-secret', () => {
       await lockTask
       const [firstRecord, secondRecord] = await Promise.all([firstKey, secondKey])
       expect(candidateCount).toBe(2)
-      const persistedSecret = await getSetting<string>('install-secret')
-      expect(persistedSecret).toBe(await getOrCreateInstallSecret())
+      expect(await getSetting<string>('install-secret')).toBe(await getOrCreateInstallSecret())
 
-      __resetKeyCacheForTests()
-      __resetDbForTests()
-      await openDb()
+      await shutdownBrowserWorkspace()
+      await openBrowserWorkspace()
       await expect(resolveKeyForDispatch(firstRecord.id)).resolves.toBe('sk-or-v1-concurrent-one')
       await expect(resolveKeyForDispatch(secondRecord.id)).resolves.toBe('sk-or-v1-concurrent-two')
     } finally {
@@ -126,36 +144,43 @@ describe('install-secret', () => {
   })
 })
 
-describe('createKey + resolveKey (passphrase mode)', () => {
-  it('round-trips plaintext through encrypt + decrypt', async () => {
+describe('passphrase encryption and tab-local wrapper cache', () => {
+  it('round-trips plaintext and publishes recency without publishing key material', async () => {
     const record = await createKey({
       name: 'OpenRouter',
       plaintextKey: 'sk-or-v1-1234567890abcdefghijxyz',
       passphrase: 'correct horse battery staple',
       passphraseHint: 'the xkcd one',
     })
-    expect(record.passphraseHint).toBe('the xkcd one')
-    expect(record.obscuredPreview).toBe('sk-or-v1-1…jxyz')
+    const changes: WorkspaceChange[] = []
+    const unsubscribe = subscribeWorkspaceChanges((change) => changes.push(change))
+
     const plaintext = await resolveKey(record.id, {
       passphrase: 'correct horse battery staple',
     })
+    unsubscribe()
+
+    expect(record.passphraseHint).toBe('the xkcd one')
+    expect(record.obscuredPreview).toBe('sk-or-v1-1…jxyz')
     expect(plaintext).toBe('sk-or-v1-1234567890abcdefghijxyz')
+    expect(changedDependencies(changes)).toEqual([
+      { kind: 'key', keyIds: [record.id], facets: ['usage'] },
+    ])
+    expect(JSON.stringify(changes)).not.toContain(plaintext)
+    await expect(resolveKeyForDispatch(record.id)).resolves.toBe(plaintext)
   })
 
-  it('throws WrongPassphraseError on a bad passphrase without falling through', async () => {
+  it('throws WrongPassphraseError on a bad passphrase without returning plaintext', async () => {
     const record = await createKey({
       name: 'OpenRouter',
       plaintextKey: 'sk-or-v1-secret',
       passphrase: 'correct',
     })
-    // Clear the derived-key cache so the wrong passphrase actually attempts the
-    // expensive PBKDF2 + AES-GCM decrypt — otherwise the cached wrapper from
-    // createKey would satisfy the resolveKey call without a derivation round.
     __resetKeyCacheForTests()
+
     await expect(resolveKey(record.id, { passphrase: 'wrong' })).rejects.toBeInstanceOf(
       WrongPassphraseError,
     )
-    // Ensure no plaintext leaked through the return channel.
     await expect(
       resolveKey(record.id, { passphrase: 'wrong' }).catch(() => 'error-caught'),
     ).resolves.toBe('error-caught')
@@ -168,48 +193,101 @@ describe('createKey + resolveKey (passphrase mode)', () => {
       passphrase: 'pp',
     })
     __resetKeyCacheForTests()
-    await expect(resolveKey(record.id)).rejects.toBeInstanceOf(PassphraseRequiredError)
+
+    await expect(resolveKeyForDispatch(record.id)).rejects.toBeInstanceOf(PassphraseRequiredError)
   })
 
-  it.each([
-    { kind: 'workspace-replaced' as const, replacementEpoch: 1 },
-    { kind: 'workspace-invalidated' as const, mutationCounter: 7 },
-  ])('drops derived wrapper keys on $kind', async (event) => {
+  it('uses exact compact key deltas to preserve unrelated wrappers and drop changed material', async () => {
+    const first = await createKey({
+      name: 'First',
+      plaintextKey: 'sk-or-v1-first',
+      passphrase: 'first-passphrase',
+    })
+    const second = await createKey({
+      name: 'Second',
+      plaintextKey: 'sk-or-v1-second',
+      passphrase: 'second-passphrase',
+    })
+
+    observeRemoteKeyMaterialChange(
+      compactCommit([{ kind: 'key', keyIds: [first.id], facets: ['usage'] }]),
+    )
+    observeRemoteKeyMaterialChange(
+      compactCommit([{ kind: 'key', keyIds: [second.id], facets: ['request-material'] }]),
+    )
+    await expect(resolveKeyForDispatch(first.id)).resolves.toBe('sk-or-v1-first')
+
+    observeRemoteKeyMaterialChange(
+      compactCommit([{ kind: 'key', keyIds: [first.id], facets: ['request-material'] }]),
+    )
+    await expect(resolveKeyForDispatch(first.id)).rejects.toBeInstanceOf(PassphraseRequiredError)
+  })
+
+  it('drops every wrapper on workspace replacement and on a broad remote invalidation', async () => {
     const record = await createKey({
       name: 'OpenRouter',
       plaintextKey: 'sk-or-v1-secret',
       passphrase: 'correct',
     })
-    await expect(resolveKey(record.id, { passphrase: 'correct' })).resolves.toBe('sk-or-v1-secret')
 
-    postEvent(event)
+    observeRemoteKeyMaterialChange({
+      kind: 'invalidate',
+      workspaceId: 'workspace-a',
+      replacementEpoch: 1,
+      dependencies: 'all',
+    })
+    await expect(resolveKeyForDispatch(record.id)).rejects.toBeInstanceOf(PassphraseRequiredError)
 
-    await expect(resolveKey(record.id)).rejects.toBeInstanceOf(PassphraseRequiredError)
+    await expect(resolveKeyForDispatch(record.id, { passphrase: 'correct' })).resolves.toBe(
+      'sk-or-v1-secret',
+    )
+    observeRemoteKeyMaterialChange({
+      kind: 'replace',
+      workspaceId: 'workspace-b',
+      replacementEpoch: 2,
+    })
+    await expect(resolveKeyForDispatch(record.id)).rejects.toBeInstanceOf(PassphraseRequiredError)
+  })
+
+  it('drops passphrase wrappers when the tab workspace runtime restarts', async () => {
+    const record = await createKey({
+      name: 'OpenRouter',
+      plaintextKey: 'sk-or-v1-tab-cache',
+      passphrase: 'tab-passphrase',
+    })
+    await expect(resolveKeyForDispatch(record.id)).resolves.toBe('sk-or-v1-tab-cache')
+
+    await shutdownBrowserWorkspace()
+    await openBrowserWorkspace()
+
+    await expect(resolveKeyForDispatch(record.id)).rejects.toBeInstanceOf(PassphraseRequiredError)
   })
 })
 
-describe('createKey + resolveKey (install-secret mode)', () => {
+describe('install-secret encryption and dispatch recency', () => {
   it('round-trips plaintext without any passphrase prompt', async () => {
     const record = await createKey({
       name: 'OpenRouter',
       plaintextKey: 'sk-or-v1-installsecretonly',
     })
+
     expect(record.passphraseHint).toBeUndefined()
-    const plaintext = await resolveKey(record.id)
-    expect(plaintext).toBe('sk-or-v1-installsecretonly')
+    await expect(resolveKey(record.id)).resolves.toBe('sk-or-v1-installsecretonly')
   })
 
-  it('survives a fresh tab (in-memory derived cache cleared) because the install secret is persisted', async () => {
+  it('survives a fresh tab because only the install secret is persisted', async () => {
     const record = await createKey({
       name: 'OpenRouter',
       plaintextKey: 'sk-or-v1-persist',
     })
-    __resetKeyCacheForTests()
-    const plaintext = await resolveKey(record.id)
-    expect(plaintext).toBe('sk-or-v1-persist')
+
+    await shutdownBrowserWorkspace()
+    await openBrowserWorkspace()
+
+    await expect(resolveKeyForDispatch(record.id)).resolves.toBe('sk-or-v1-persist')
   })
 
-  it('can decrypt for dispatch without marking an unselected fallback used', async () => {
+  it('keeps dispatch decryption recency-free because accepted fallback order is tab-session-owned', async () => {
     const record = await createKey({
       name: 'Fallback',
       plaintextKey: 'sk-or-v1-lazy-fallback',
@@ -218,20 +296,20 @@ describe('createKey + resolveKey (install-secret mode)', () => {
     await expect(resolveKeyForDispatch(record.id)).resolves.toBe('sk-or-v1-lazy-fallback')
     expect((await getKey(record.id))?.lastUsedAt).toBeUndefined()
 
-    await markKeyUsed(record.id, 123)
-    expect((await getKey(record.id))?.lastUsedAt).toBe(123)
+    await expect(resolveKey(record.id)).resolves.toBe('sk-or-v1-lazy-fallback')
+    expect((await getKey(record.id))?.lastUsedAt).toEqual(expect.any(Number))
   })
 })
 
 describe('changePassphrase', () => {
-  it('re-encrypts with a fresh salt + iv and broadcasts key-rotated', async () => {
+  it('re-encrypts with fresh material and publishes one compact material invalidation', async () => {
     const record = await createKey({
       name: 'OpenRouter',
       plaintextKey: 'sk-or-v1-rotated',
       passphrase: 'old-one',
     })
-    const seen: BroadcastEvent[] = []
-    const unsub = onEvent((ev) => seen.push(ev))
+    const changes: WorkspaceChange[] = []
+    const unsubscribe = subscribeWorkspaceChanges((change) => changes.push(change))
 
     const next = await changePassphrase({
       keyId: record.id,
@@ -239,20 +317,30 @@ describe('changePassphrase', () => {
       newPassphrase: 'new-one',
       newPassphraseHint: 'fresh',
     })
-    unsub()
+    unsubscribe()
 
     expect(next.passphraseHint).toBe('fresh')
+    expect(next.materialRevision).toBe((record.materialRevision ?? 0) + 1)
     expect(next.salt).not.toBe(record.salt)
     expect(next.iv).not.toBe(record.iv)
     expect(next.ciphertext).not.toBe(record.ciphertext)
-    expect(seen.some((ev) => ev.kind === 'key-rotated' && ev.keyId === record.id)).toBe(true)
+    expect(changedDependencies(changes)).toEqual([
+      {
+        kind: 'key',
+        keyIds: [record.id],
+        facets: ['request-material', 'selected-detail', 'usage'],
+      },
+    ])
+    expect(JSON.stringify(changes)).not.toContain(record.ciphertext)
+    expect(JSON.stringify(changes)).not.toContain(next.ciphertext)
 
     __resetKeyCacheForTests()
-    await expect(resolveKey(record.id, { passphrase: 'old-one' })).rejects.toBeInstanceOf(
-      WrongPassphraseError,
+    await expect(
+      resolveKeyForDispatch(record.id, { passphrase: 'old-one' }),
+    ).rejects.toBeInstanceOf(WrongPassphraseError)
+    await expect(resolveKeyForDispatch(record.id, { passphrase: 'new-one' })).resolves.toBe(
+      'sk-or-v1-rotated',
     )
-    const plaintext = await resolveKey(record.id, { passphrase: 'new-one' })
-    expect(plaintext).toBe('sk-or-v1-rotated')
   })
 
   it('drops from passphrase mode to install-secret mode', async () => {
@@ -261,42 +349,104 @@ describe('changePassphrase', () => {
       plaintextKey: 'sk-or-v1-switch',
       passphrase: 'starting',
     })
+
     await changePassphrase({ keyId: record.id, oldPassphrase: 'starting' })
     __resetKeyCacheForTests()
-    const plaintext = await resolveKey(record.id)
-    expect(plaintext).toBe('sk-or-v1-switch')
-    const stored = await getKey(record.id)
-    expect(stored?.passphraseHint).toBeUndefined()
+
+    await expect(resolveKeyForDispatch(record.id)).resolves.toBe('sk-or-v1-switch')
+    expect((await getKey(record.id))?.passphraseHint).toBeUndefined()
   })
 })
 
 describe('deleteKey', () => {
-  it('removes the row and broadcasts key-rotated; subsequent resolves throw KeyMissingError', async () => {
+  it('removes the row, publishes exact compact invalidations, and makes every resolve fail', async () => {
     const record = await createKey({
       name: 'OpenRouter',
       plaintextKey: 'sk-or-v1-goner',
     })
-    const seen: BroadcastEvent[] = []
-    const unsub = onEvent((ev) => seen.push(ev))
+    const firstProfile = await createConfigurationProfile({
+      id: 'profile-a',
+      name: 'Profile A',
+      kind: 'openrouter',
+      baseUrl: 'https://openrouter.ai/api/v1',
+      apiKeyRef: record.id,
+      now: 1,
+    })
+    const secondProfile = await createConfigurationProfile({
+      id: 'profile-b',
+      name: 'Profile B',
+      kind: 'openrouter',
+      baseUrl: 'https://openrouter.ai/api/v1',
+      apiKeyRef: record.id,
+      now: 2,
+    })
+    const changes: WorkspaceChange[] = []
+    const unsubscribe = subscribeWorkspaceChanges((change) => changes.push(change))
+
     await deleteKey(record.id)
-    unsub()
-    expect(seen.some((ev) => ev.kind === 'key-rotated' && ev.keyId === record.id)).toBe(true)
-    await expect(resolveKey(record.id)).rejects.toBeInstanceOf(KeyMissingError)
-    const row = await getKey(record.id)
-    expect(row).toBeUndefined()
+    unsubscribe()
+
+    expect(changedDependencies(changes)).toEqual([
+      {
+        kind: 'key',
+        keyIds: [record.id],
+        facets: ['membership', 'request-material', 'selected-detail', 'usage'],
+      },
+      {
+        kind: 'profile',
+        profileIds: [firstProfile.id, secondProfile.id],
+        facets: ['request-material'],
+      },
+      {
+        kind: 'discovery-cache',
+        profileIds: [firstProfile.id, secondProfile.id],
+      },
+    ])
+    await expect(resolveKeyForDispatch(record.id)).rejects.toBeInstanceOf(KeyMissingError)
+    expect(await getKey(record.id)).toBeUndefined()
   })
 
-  it('invalidates dependent connections — resolveKey against the shared keyId fails for every profile that referenced it', async () => {
+  it('is idempotent and does not publish a second commit for an already-missing key', async () => {
     const record = await createKey({
       name: 'OpenRouter',
       plaintextKey: 'sk-or-v1-shared',
     })
-    // Two profiles sharing the same key (the common "prod vs dev" pattern).
-    // Deleting the key must break BOTH; neither profile can silently proceed
-    // to unauthenticated sends.
-    await expect(resolveKey(record.id)).resolves.toBe('sk-or-v1-shared')
     await deleteKey(record.id)
-    __resetKeyCacheForTests()
-    await expect(resolveKey(record.id)).rejects.toBeInstanceOf(KeyMissingError)
+    const changes: WorkspaceChange[] = []
+    const unsubscribe = subscribeWorkspaceChanges((change) => changes.push(change))
+
+    await deleteKey(record.id)
+    unsubscribe()
+
+    expect(changes).toEqual([])
+    await expect(resolveKeyForDispatch(record.id)).rejects.toBeInstanceOf(KeyMissingError)
   })
 })
+
+function compactCommit(invalidations: readonly WorkspaceDependency[]): WorkspaceChange {
+  return {
+    kind: 'commit',
+    stamp: {
+      workspaceId: 'remote-workspace',
+      replacementEpoch: 1,
+      commitId: 'remote-commit',
+    },
+    delta: { facts: [], invalidations },
+  }
+}
+
+function observeRemoteKeyMaterialChange(change: WorkspaceChange): void {
+  observeKeyMaterialWorkspaceEffect(reduceWorkspaceChange(change, 'remote'))
+}
+
+function changedDependencies(changes: readonly WorkspaceChange[]): WorkspaceDependency[] {
+  return changes.flatMap((change) => {
+    if (change.kind === 'replace') return [{ kind: 'workspace' } satisfies WorkspaceDependency]
+    if (change.kind === 'invalidate') {
+      return change.dependencies === 'all'
+        ? [{ kind: 'workspace' } satisfies WorkspaceDependency]
+        : [...change.dependencies]
+    }
+    return [...change.delta.invalidations]
+  })
+}

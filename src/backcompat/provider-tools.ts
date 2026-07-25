@@ -1,6 +1,7 @@
 import type Dexie from 'dexie'
 import type { Chat, ChatPreset, ChatProviderToolSettings, ChatSettings } from '../core/types'
 import type { SettingsRow } from '../store/db-rows'
+import { runOnceBackfill } from './run-once'
 
 const PROVIDER_TOOL_SETTINGS_BACKFILL_KEY = 'backfill:provider-tool-settings-v2'
 
@@ -9,22 +10,21 @@ export function providerToolSettingsBackfillMarker(): SettingsRow {
 }
 
 export async function migrateProviderToolSettingsRows(db: Dexie): Promise<void> {
-  const chats = db.table<Chat, string>('chats')
-  const presets = db.table<ChatPreset, string>('presets')
-  const settings = db.table<SettingsRow, string>('settings')
-  const marker = await settings.get(PROVIDER_TOOL_SETTINGS_BACKFILL_KEY)
-  if (marker?.value === 1) return
-
-  await db.transaction('rw', chats, presets, settings, async () => {
-    await chats.toCollection().modify((chat) => {
-      const result = migrateProviderToolSettings(chat.settings)
-      if (result.changed) chat.settings = result.settings
-    })
-    await presets.toCollection().modify((preset) => {
-      const result = migrateProviderToolSettings(preset.settings)
-      if (result.changed) preset.settings = result.settings
-    })
-    await settings.put(providerToolSettingsBackfillMarker())
+  await runOnceBackfill(db, {
+    marker: providerToolSettingsBackfillMarker(),
+    tables: ['chats', 'presets'],
+    run: async (tx) => {
+      const chats = tx.table<Chat, string>('chats')
+      const presets = tx.table<ChatPreset, string>('presets')
+      await chats.toCollection().modify((chat) => {
+        const result = migrateProviderToolSettings(chat.settings)
+        if (result.changed) chat.settings = result.settings
+      })
+      await presets.toCollection().modify((preset) => {
+        const result = migrateProviderToolSettings(preset.settings)
+        if (result.changed) preset.settings = result.settings
+      })
+    },
   })
 }
 

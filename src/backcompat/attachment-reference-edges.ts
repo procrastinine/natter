@@ -180,6 +180,8 @@ function collectOwnerEdges(
       refId: ref.refId,
       attachmentId: ref.attachmentId,
       ordinal,
+      includeInContext: ref.includeInContext !== false,
+      refUpdatedAt: ref.updatedAt,
     })
     refCounts.set(ref.attachmentId, (refCounts.get(ref.attachmentId) ?? 0) + 1)
   }

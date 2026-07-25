@@ -4,9 +4,15 @@ import { countMessagesWords } from '../core/word-count'
 import type { MessageBodyRow, MessageHeaderRow } from '../store/message-storage'
 import { forEachTableBatch } from './batched-table'
 
-type LegacyMessageHeaderRow = Omit<MessageHeaderRow, 'bodyVersion' | 'bodyWordCount'> & {
+type LegacyMessageHeaderRow = Omit<
+  MessageHeaderRow,
+  'bodyVersion' | 'bodyWordCount' | 'bodyTextCharCount' | 'bodyMediaCount' | 'bodyRenderCost'
+> & {
   bodyVersion?: number
   bodyWordCount?: number
+  bodyTextCharCount?: number
+  bodyMediaCount?: number
+  bodyRenderCost?: number
 }
 
 type LegacyMessageBodyRow = Omit<MessageBodyRow, 'bodyVersion'> & {

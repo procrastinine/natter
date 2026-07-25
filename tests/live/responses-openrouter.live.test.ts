@@ -10,9 +10,20 @@ import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { beforeAll, describe, expect, it } from 'vitest'
 import { type ResponsesContext, responses, responsesOnce } from '../../src/api/responses'
-import { type StreamLaneEvent, splitResponsesStream } from '../../src/api/stream-transforms'
+import { splitResponsesStream as splitResponsesStreamWithContract } from '../../src/api/stream-transforms'
 import type { ResponsesEventWire, ResponsesInputItem } from '../../src/api/types'
+import type { StreamLaneEvent } from '../../src/core/generation-stream-live-events'
+import { OPENROUTER_RESPONSES_PROVIDER_OUTPUT_CONTRACT } from '../../src/core/provider-tool-context'
 import type { ConnectionProfile } from '../../src/core/types'
+import { responsesReasoningContract } from '../helpers/reasoning-contracts'
+
+function splitResponsesStream(source: Parameters<typeof splitResponsesStreamWithContract>[0]) {
+  return splitResponsesStreamWithContract(
+    source,
+    responsesReasoningContract(),
+    OPENROUTER_RESPONSES_PROVIDER_OUTPUT_CONTRACT,
+  )
+}
 
 const LIVE = process.env.LIVE === '1'
 

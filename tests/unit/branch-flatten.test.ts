@@ -1,22 +1,32 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
-  buildBranchCacheRow,
   buildBranchMessages,
-  exportActiveBranchAsTxt,
-  exportLastUpdatedBranchAsTxt,
   flattenBranchMessages,
   messageRenderableText,
 } from '../../src/core/branch-flatten'
-import type { Chat, ChatBranchCache, Message } from '../../src/core/types'
-import type { ChatBranchCacheWriteGuard, WorkspaceRepository } from '../../src/store/repository'
+import { cloneDefaultChatSettings } from '../../src/core/defaults'
+import type { Chat, Message } from '../../src/core/types'
+import {
+  exportActiveBranchAsTxt,
+  exportLastUpdatedBranchAsTxt,
+} from '../../src/store/branch-flatten'
+import { splitMessageForStorage } from '../../src/store/message-storage'
+import type {
+  WorkspaceQuery,
+  WorkspaceReadAuthority,
+  WorkspaceRepository,
+} from '../../src/store/workspace-protocol'
+
+const authority = { signal: new AbortController().signal } as WorkspaceReadAuthority
+const CHAT_ID = '01ABCDEFGHJKMNPQRSTVWXYZ'
 
 function message(overrides: Partial<Message>): Message {
   return {
     id: 'm',
-    chatId: 'c',
+    chatId: CHAT_ID,
     parentId: null,
     siblingIndex: 0,
-    turnId: 't',
+    turnId: 'turn',
     turnIndex: 0,
     createdAt: 1,
     role: 'user',
@@ -28,11 +38,11 @@ function message(overrides: Partial<Message>): Message {
   }
 }
 
-const chat = { title: '' } as Pick<Chat, 'title'>
-
-function fullChat(overrides: Partial<Chat> = {}): Chat {
+function chat(
+  overrides: Partial<Pick<Chat, 'lastUpdatedLeafId' | 'title' | 'titleStatus'>> = {},
+): Chat {
   return {
-    id: '01ABCDEFGHJKMNPQRSTVWXYZ',
+    id: CHAT_ID,
     title: 'Export chat',
     titleStatus: 'manual',
     createdAt: 1,
@@ -41,8 +51,9 @@ function fullChat(overrides: Partial<Chat> = {}): Chat {
     wordCount: 0,
     totalCostUsd: 0,
     metaVersion: 0,
-    summaryVersion: 0,
-    settings: {} as Chat['settings'],
+    summaryVersion: 1,
+    structuralVersion: 1,
+    settings: cloneDefaultChatSettings(),
     lastUpdatedLeafId: null,
     lastBranchUpdatedAt: 1,
     archived: false,
@@ -53,14 +64,74 @@ function fullChat(overrides: Partial<Chat> = {}): Chat {
   }
 }
 
-function getWorkspaceMeta() {
-  return Promise.resolve({
-    workspaceId: 'test-workspace',
-    backendKind: 'browser-idb' as const,
-    lastMutationAt: 0,
-    mutationCounter: 0,
-    replacementEpoch: 0,
+function repository(currentChat: Chat, messages: readonly Message[]): WorkspaceRepository {
+  const presentations = messages.map((row) => {
+    const { header } = splitMessageForStorage(row)
+    return { header, message: row, bodyVersion: header.bodyVersion }
   })
+  const headers = presentations.map((row) => row.header)
+  const presentationsById = new Map(presentations.map((row) => [row.message.id, row] as const))
+  return {
+    query: vi.fn(async (_authority: unknown, request: WorkspaceQuery) => {
+      if (
+        request.kind !== 'chat.get' &&
+        request.kind !== 'branch.open' &&
+        request.kind !== 'branch.page-structure' &&
+        request.kind !== 'message.presentations'
+      ) {
+        throw new Error(`UnexpectedQuery:${request.kind}`)
+      }
+      let value: unknown
+      switch (request.kind) {
+        case 'chat.get':
+          value = currentChat
+          break
+        case 'branch.open': {
+          const branchLeafId =
+            request.target.kind === 'fixed-empty'
+              ? null
+              : request.target.kind === 'fixed-tip'
+                ? request.target.messageId
+                : currentChat.lastUpdatedLeafId
+          value = {
+            kind: 'ready',
+            chat: currentChat,
+            target: request.target,
+            proof: {
+              chatId: currentChat.id,
+              structuralVersion: currentChat.structuralVersion,
+              tipId: branchLeafId,
+              pathHeaders: branchLeafId === null ? [] : headers,
+            },
+            presentations: [],
+          }
+          break
+        }
+        case 'branch.page-structure':
+          value = {
+            kind: 'ready',
+            snapshot: {
+              chatId: currentChat.id,
+              pageHeaders: headers.slice(
+                request.window.offset,
+                request.window.offset + request.window.nodes.length,
+              ),
+              pageOffset: request.window.offset,
+              pageLimit: request.window.limit,
+              branchLength: headers.length,
+            },
+          }
+          break
+        case 'message.presentations':
+          value = request.messageIds.map((messageId) => presentationsById.get(messageId))
+          break
+      }
+      return { workspaceId: 'workspace', replacementEpoch: 0, value }
+    }),
+    execute: vi.fn(),
+    replace: vi.fn(),
+    subscribeChanges: vi.fn(() => () => undefined),
+  } as unknown as WorkspaceRepository
 }
 
 afterEach(() => {
@@ -69,7 +140,7 @@ afterEach(() => {
 
 describe('branch-flatten', () => {
   it('walks a root-to-leaf branch', () => {
-    const root = message({ id: 'root', createdAt: 1, content: [{ type: 'text', text: 'root' }] })
+    const root = message({ id: 'root', content: [{ type: 'text', text: 'root' }] })
     const older = message({
       id: 'older',
       parentId: root.id,
@@ -84,362 +155,94 @@ describe('branch-flatten', () => {
       createdAt: 3,
       content: [{ type: 'text', text: 'leaf' }],
     })
-    expect(buildBranchMessages([leaf, older, root], leaf.id).map((m) => m.id)).toEqual([
+
+    expect(buildBranchMessages([leaf, older, root], leaf.id).map((row) => row.id)).toEqual([
       'root',
       'leaf',
     ])
   })
 
-  it('flattens a simple user plus assistant branch', () => {
-    const user = message({ id: 'u', role: 'user', content: [{ type: 'text', text: 'Hi' }] })
+  it('flattens phases, tools, and attachments without branch metadata', () => {
+    const user = message({ id: 'user', content: [{ type: 'text', text: 'Hi' }] })
     const assistant = message({
-      id: 'a',
-      role: 'assistant',
+      id: 'assistant',
       parentId: user.id,
       createdAt: 2,
-      content: [{ type: 'output_text', text: 'Hello' }],
-    })
-    expect(flattenBranchMessages([user, assistant], chat)).toBe(
-      '# Untitled chat\n\nUSER:\nHi\n\nASSISTANT:\nHello\n',
-    )
-  })
-
-  it('renders tools and attachments as placeholders', () => {
-    const row = message({
-      id: 'tool',
       role: 'assistant',
+      origin: 'generated',
+      phase: 'final_answer',
       attachmentRefs: [
         {
-          refId: 'ref-1',
-          attachmentId: 'att-1',
+          refId: 'ref',
+          attachmentId: 'attachment',
           includeInContext: true,
           presentation: { label: 'brief.pdf' },
           createdAt: 1,
           updatedAt: 1,
         },
       ],
-      toolCalls: [
-        { id: 'call-1', type: 'function', function: { name: 'search', arguments: '{}' } },
-      ],
-      content: [{ type: 'output_image', attachmentId: 'img-1' }],
+      toolCalls: [{ id: 'call', type: 'function', function: { name: 'search', arguments: '{}' } }],
+      content: [{ type: 'output_image', attachmentId: 'image' }],
     })
-    expect(messageRenderableText(row)).toBe(
-      '[image: img-1]\n[attachment: brief.pdf]\n[tool call: search]',
+
+    expect(messageRenderableText(assistant)).toBe(
+      '[image: image]\n[attachment: brief.pdf]\n[tool call: search]',
+    )
+    expect(flattenBranchMessages([user, assistant], { title: '' })).toBe(
+      '# Untitled chat\n\nUSER:\nHi\n\nASSISTANT (final):\n[image: image]\n[attachment: brief.pdf]\n[tool call: search]\n',
     )
   })
 
-  it('labels multi-item Responses phases', () => {
-    const row = message({
-      id: 'phase',
-      role: 'assistant',
-      phase: 'final_answer',
-      content: [{ type: 'output_text', text: 'final' }],
-    })
-    expect(flattenBranchMessages([row], chat)).toBe(
-      '# Untitled chat\n\nASSISTANT (final):\nfinal\n',
-    )
-  })
-
-  it('builds branch-cache rows from the same renderable text', () => {
-    const user = message({ id: 'u', role: 'user', content: [{ type: 'text', text: 'Hi there' }] })
+  it('exports last-updated text through the canonical segmented reader', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-04-26T12:00:00.000Z'))
+    const user = message({ id: 'user', content: [{ type: 'text', text: 'hello' }] })
     const assistant = message({
-      id: 'a',
-      role: 'assistant',
+      id: 'assistant',
       parentId: user.id,
       createdAt: 2,
-      editedAt: 5,
-      content: [{ type: 'output_text', text: 'Hello back' }],
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_text', text: 'world' }],
     })
-    const row = buildBranchCacheRow({
-      chatId: 'c',
-      branchLeafId: assistant.id,
-      messages: [user, assistant],
-      generatedAt: 10,
+    const currentChat = chat({
+      title: 'Branching deep dive',
+      lastUpdatedLeafId: assistant.id,
     })
-    expect(row).toMatchObject({
-      chatId: 'c',
-      branchLeafId: 'a',
-      generatedAt: 10,
-      previewText: 'Hello back',
-      messageCount: 2,
-      wordCount: 4,
-      messageTimestamps: [
-        { id: 'u', createdAt: 1, editedAt: 1 },
-        { id: 'a', createdAt: 2, editedAt: 5 },
-      ],
+
+    const result = await exportLastUpdatedBranchAsTxt(
+      repository(currentChat, [user, assistant]),
+      currentChat.id,
+      authority,
+    )
+
+    expect(result).toEqual({
+      filename: 'branching-deep-dive-2026-04-26.txt',
+      content: '# Branching deep dive\n\nUSER:\nhello\n\nASSISTANT:\nworld\n',
     })
-    expect(row.textContent).toBe('USER:\nHi there\n\nASSISTANT:\nHello back\n')
   })
 
-  it('exports the active cursor branch with dated slug filenames', async () => {
+  it('uses the same reader for an explicit per-tab leaf and empty chats', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-04-26T12:00:00.000Z'))
-    const user = message({
-      id: 'u',
-      role: 'user',
-      content: [{ type: 'text', text: 'active user' }],
-    })
-    const stale = message({
-      id: 'old',
-      parentId: user.id,
-      siblingIndex: 0,
-      createdAt: 2,
-      content: [{ type: 'text', text: 'old branch' }],
-    })
-    const active = message({
-      id: 'active',
-      parentId: user.id,
-      siblingIndex: 1,
-      createdAt: 3,
-      content: [{ type: 'text', text: 'current branch' }],
-    })
-    const repo = {
-      getChat: vi.fn(async () => fullChat({ title: 'Branching Deep Dive' })),
-      getActiveBranchSnapshot: vi.fn(async () => ({
-        chatId: 'c',
-        branch: [user, active],
-        allHeaders: [user, stale, active],
-        branchHeaders: [user, active],
-        siblingGroups: [],
-        treeKey: 'tree',
-      })),
-    } as unknown as WorkspaceRepository
+    const leaf = message({ id: 'leaf', content: [{ type: 'text', text: 'selected branch' }] })
+    const currentChat = chat({ titleStatus: 'untitled', title: '', lastUpdatedLeafId: leaf.id })
 
-    const out = await exportActiveBranchAsTxt(repo, 'c', { u: 'active' })
-
-    expect(out.filename).toBe('branching-deep-dive-2026-04-26.txt')
-    expect(out.content).toBe(
-      '# Branching Deep Dive\n\nUSER:\nactive user\n\nUSER:\ncurrent branch\n',
+    const active = await exportActiveBranchAsTxt(
+      repository(currentChat, [leaf]),
+      currentChat.id,
+      leaf.id,
+      authority,
     )
-  })
-
-  it('uses a chat-id fallback filename for untitled exports', async () => {
-    vi.useFakeTimers()
-    vi.setSystemTime(new Date('2026-04-26T12:00:00.000Z'))
-    const repo = {
-      getWorkspaceMeta,
-      getChat: vi.fn(async () =>
-        fullChat({
-          id: '01UNTITLEDXYZ',
-          title: 'Untitled chat',
-          titleStatus: 'untitled',
-        }),
-      ),
-      getActiveBranchSnapshot: vi.fn(async () => ({
-        chatId: 'c',
-        branch: [],
-        allHeaders: [],
-        branchHeaders: [],
-        siblingGroups: [],
-        treeKey: '',
-      })),
-    } as unknown as WorkspaceRepository
-
-    const out = await exportActiveBranchAsTxt(repo, 'c', {})
-
-    expect(out.filename).toBe('chat-01UNTITL-2026-04-26.txt')
-    expect(out.content).toBe('# Untitled chat\n')
-  })
-
-  it('exports last-updated text from a fresh cache without loading messages', async () => {
-    vi.useFakeTimers()
-    vi.setSystemTime(new Date('2026-04-26T12:00:00.000Z'))
-    const listMessages = vi.fn(async () => {
-      throw new Error('should not load messages')
-    })
-    const repo = {
-      getWorkspaceMeta,
-      getChat: vi.fn(async () =>
-        fullChat({
-          title: 'Cached branch',
-          lastUpdatedLeafId: 'a',
-          lastBranchUpdatedAt: 5,
-        }),
-      ),
-      getChatBranchCache: vi.fn(async () => ({
-        chatId: 'c',
-        branchLeafId: 'a',
-        generatedAt: 10,
-        textContent: 'USER:\nfrom cache\n',
-        previewText: 'from cache',
-        messageCount: 1,
-        wordCount: 2,
-        messageTimestamps: [],
-      })),
-      listMessages,
-    } as unknown as WorkspaceRepository
-
-    const out = await exportLastUpdatedBranchAsTxt(repo, 'c')
-
-    expect(out.content).toBe('# Cached branch\n\nUSER:\nfrom cache\n')
-    expect(listMessages).not.toHaveBeenCalled()
-  })
-
-  it('retries a fresh-cache read when workspace replacement changes the epoch', async () => {
-    const oldChat = fullChat({
-      title: 'Old workspace',
-      lastUpdatedLeafId: 'a',
-      lastBranchUpdatedAt: 5,
-    })
-    const restoredChat = { ...oldChat, title: 'Restored workspace' }
-    const oldCache: ChatBranchCache = {
-      chatId: 'c',
-      branchLeafId: 'a',
-      generatedAt: 10,
-      textContent: 'old body',
-      previewText: 'old body',
-      messageCount: 1,
-      wordCount: 2,
-      messageTimestamps: [],
-    }
-    const restoredCache = { ...oldCache, textContent: 'restored body' }
-    let epoch = 0
-    let currentChat = oldChat
-    let cacheReads = 0
-    const repo = {
-      getWorkspaceMeta: vi.fn(async () => ({
-        workspaceId: 'test-workspace',
-        backendKind: 'browser-idb' as const,
-        lastMutationAt: 0,
-        mutationCounter: 0,
-        replacementEpoch: epoch,
-      })),
-      getChat: vi.fn(async () => currentChat),
-      getChatBranchCache: vi.fn(async () => {
-        cacheReads += 1
-        if (cacheReads === 1) {
-          epoch = 1
-          currentChat = restoredChat
-          return oldCache
-        }
-        return restoredCache
-      }),
-    } as unknown as WorkspaceRepository
-
-    const out = await exportLastUpdatedBranchAsTxt(repo, 'c')
-
-    expect(out.content).toBe('# Restored workspace\n\nrestored body\n')
-    expect(cacheReads).toBe(2)
-  })
-
-  it('refreshes stale last-updated cache through the repository', async () => {
-    const user = message({ id: 'u', content: [{ type: 'text', text: 'fresh user' }] })
-    const assistant = message({
-      id: 'a',
-      role: 'assistant',
-      parentId: user.id,
-      createdAt: 2,
-      content: [{ type: 'output_text', text: 'fresh assistant' }],
-    })
-    const putChatBranchCache = vi.fn(async (row: ChatBranchCache) => row)
-    const repo = {
-      getWorkspaceMeta,
-      getChat: vi.fn(async () =>
-        fullChat({
-          title: 'Freshened branch',
-          lastUpdatedLeafId: 'a',
-          lastBranchUpdatedAt: 20,
-        }),
-      ),
-      getChatBranchCache: vi.fn(async () => ({
-        chatId: 'c',
-        branchLeafId: 'a',
-        generatedAt: 10,
-        textContent: 'stale',
-        previewText: 'stale',
-        messageCount: 1,
-        wordCount: 1,
-        messageTimestamps: [],
-      })),
-      getBranchByLeaf: vi.fn(async () => [user, assistant]),
-      putChatBranchCache,
-    } as unknown as WorkspaceRepository
-
-    const out = await exportLastUpdatedBranchAsTxt(repo, 'c')
-
-    expect(out.content).toBe(
-      '# Freshened branch\n\nUSER:\nfresh user\n\nASSISTANT:\nfresh assistant\n',
+    const empty = await exportActiveBranchAsTxt(
+      repository(currentChat, []),
+      currentChat.id,
+      null,
+      authority,
     )
-    expect(putChatBranchCache).toHaveBeenCalledWith(
-      expect.objectContaining({
-        chatId: 'c',
-        branchLeafId: 'a',
-        previewText: 'fresh assistant',
-      }),
-      {
-        branchLeafId: 'a',
-        lastBranchUpdatedAt: 20,
-        summaryVersion: 0,
-        replacementEpoch: 0,
-      },
-    )
-  })
 
-  it('retries export when the last-updated leaf changes before the guarded cache write', async () => {
-    const root = message({ id: 'race-root', content: [{ type: 'text', text: 'root' }] })
-    const oldLeaf = message({
-      id: 'race-old',
-      role: 'assistant',
-      parentId: root.id,
-      createdAt: 2,
-      content: [{ type: 'output_text', text: 'stale branch text' }],
-    })
-    const newLeaf = message({
-      id: 'race-new',
-      role: 'assistant',
-      parentId: root.id,
-      siblingIndex: 1,
-      createdAt: 3,
-      content: [{ type: 'output_text', text: 'current branch text' }],
-    })
-    const oldChat = fullChat({
-      title: 'Racing export',
-      lastUpdatedLeafId: oldLeaf.id,
-      lastBranchUpdatedAt: 10,
-      summaryVersion: 1,
-    })
-    const newChat = {
-      ...oldChat,
-      lastUpdatedLeafId: newLeaf.id,
-      lastBranchUpdatedAt: 20,
-      summaryVersion: 2,
-    }
-    let current = oldChat
-    const putChatBranchCache = vi.fn(
-      async (row: ChatBranchCache, _expected: ChatBranchCacheWriteGuard) => {
-        if (putChatBranchCache.mock.calls.length === 1) {
-          current = newChat
-          return undefined
-        }
-        return row
-      },
-    )
-    const repo = {
-      getWorkspaceMeta,
-      getChat: vi.fn(async () => current),
-      getChatBranchCache: vi.fn(async () => undefined),
-      getBranchByLeaf: vi.fn(async (_chatId: string, leafId: string | null) =>
-        leafId === oldLeaf.id ? [root, oldLeaf] : [root, newLeaf],
-      ),
-      putChatBranchCache,
-    } as unknown as WorkspaceRepository
-
-    const out = await exportLastUpdatedBranchAsTxt(repo, 'c')
-
-    expect(putChatBranchCache).toHaveBeenCalledTimes(2)
-    expect(putChatBranchCache.mock.calls[0]?.[1]).toEqual({
-      branchLeafId: oldLeaf.id,
-      lastBranchUpdatedAt: 10,
-      summaryVersion: 1,
-      replacementEpoch: 0,
-    })
-    expect(putChatBranchCache.mock.calls[1]?.[1]).toEqual({
-      branchLeafId: newLeaf.id,
-      lastBranchUpdatedAt: 20,
-      summaryVersion: 2,
-      replacementEpoch: 0,
-    })
-    expect(out.content).toContain('current branch text')
-    expect(out.content).not.toContain('stale branch text')
+    expect(active.filename).toBe('chat-01ABCDEF-2026-04-26.txt')
+    expect(active.content).toBe('# Untitled chat\n\nUSER:\nselected branch\n')
+    expect(empty.content).toBe('# Untitled chat\n')
   })
 })

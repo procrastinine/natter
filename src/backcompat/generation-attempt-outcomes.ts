@@ -12,10 +12,10 @@ import type {
   PersistedAttemptFailure,
 } from '../core/types'
 import type { MessageBodyRow, MessageHeaderRow } from '../store/message-storage'
-import type { StreamChunkRow } from '../store/repository'
 import { forEachTableBatch } from './batched-table'
 
 const GENERATION_STATUSES = new Set<NonNullable<GenerationMeta['status']>>([
+  'preparing',
   'streaming',
   'done',
   'error',
@@ -104,11 +104,15 @@ export async function migrateGenerationAttemptOutcomes(tx: Transaction): Promise
   })
 
   await tx
-    .table<StreamChunkRow, string>('streamChunks')
+    .table<LegacyStreamChunkEventRow, string>('streamChunks')
     .toCollection()
     .modify((row) => {
       row.event = normalizeStreamChunkEvent(row.event)
     })
+}
+
+interface LegacyStreamChunkEventRow {
+  event: unknown
 }
 
 type LegacyContinuationHeaderRow = MessageHeaderRow & {

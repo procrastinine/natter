@@ -35,6 +35,16 @@ describe('CodeBlock', () => {
     expect(body?.textContent).toContain('line 10000')
   })
 
+  it('bounds a single enormous line by characters before explicit highlighting', () => {
+    const tail = 'must-not-render-eagerly'
+    const code = `${'x'.repeat(500_001)}${tail}`
+    const { container } = render(<CodeBlock code={code} language="txt" />)
+    const body = container.querySelector('[data-ui="code-block-body"]')
+
+    expect(body?.textContent).not.toContain(tail)
+    expect(body?.textContent.length).toBeLessThanOrEqual(20_002)
+  })
+
   it('offers line-numbers=on when content is longer than 5 lines', () => {
     const manyLines = Array.from({ length: 30 }, (_, i) => `line ${i}`).join('\n')
     render(<CodeBlock code={manyLines} language="txt" />)

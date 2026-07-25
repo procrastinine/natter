@@ -137,7 +137,7 @@ describe('chatCompletions', () => {
     if (chunks[0]?.type === 'delta') {
       expect(chunks[0].chunk.choices?.[0]?.delta?.content).toBe('A')
     }
-    expect(warnSpy).toHaveBeenCalledTimes(1)
+    expect(warnSpy).not.toHaveBeenCalled()
   })
 
   it('forwards keepalive comments so callers can drive hang detection', async () => {

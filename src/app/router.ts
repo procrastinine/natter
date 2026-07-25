@@ -23,70 +23,69 @@
 
 import { type MouseEvent, useSyncExternalStore } from 'react'
 import type { AttachmentId, ChatId, MessageId } from '../core/types'
-import type { BroadcastDelivery } from '../store/broadcast'
-import { type NavigationIntent, useChatStore } from '../store/zustand/chatStore'
-import {
-  claimTabNavigation,
-  consumeTabNavigation,
-  invalidateTabNavigation,
-  isTabNavigationCurrent,
-  type TabNavigationAuthority,
-} from '../store/zustand/tabNavigation'
+import { newId } from '../lib/ulid'
+import { createConversationRouteOwnerController } from '../store/conversation-route-owner'
+import type {
+  ConversationNavigationPort,
+  ConversationRouteArrival,
+  ConversationRouteHandoff,
+  ConversationRouteOwner,
+  ConversationRouteOwnerController,
+} from '../store/presentation-contracts'
 
 const routeIntentBrand: unique symbol = Symbol('RouteIntent')
-const routeAuthority: unique symbol = Symbol('RouteAuthority')
+const routeIntentState: unique symbol = Symbol('RouteIntentState')
 
 export interface RouteIntent {
-  readonly revision: string
   readonly startedAtHash: string
   readonly [routeIntentBrand]: true
-  readonly [routeAuthority]: TabNavigationAuthority
+  readonly [routeIntentState]: {
+    expectedHash: string
+    readonly controller: AbortController
+    readonly routeOwnerController: ConversationRouteOwnerController
+  }
 }
 
 let currentRouteIntent: RouteIntent | null = null
-let localWorkspaceReplacementRouteIntent: RouteIntent | null = null
-let currentRouteExpectedHash = ''
-let workspaceRouteReplayPending = false
 
-function clearRouteIntent(): void {
+function invalidateRouteIntent(): void {
+  currentRouteIntent?.[routeIntentState].controller.abort()
+  currentRouteIntent?.[routeIntentState].routeOwnerController.cancel()
   currentRouteIntent = null
-  localWorkspaceReplacementRouteIntent = null
-  currentRouteExpectedHash = ''
-}
-
-function invalidateAllTabNavigation(): void {
-  clearRouteIntent()
-  invalidateTabNavigation()
 }
 
 export function beginRouteIntent(): RouteIntent {
-  ensureHashListener()
-  const authority = claimTabNavigation()
-  const startedAtHash = typeof window === 'undefined' ? '' : window.location.hash
-  const intent = Object.freeze({
-    revision: authority.revision,
-    startedAtHash,
-    [routeIntentBrand]: true as const,
-    [routeAuthority]: authority,
-  })
-  currentRouteIntent = intent
-  localWorkspaceReplacementRouteIntent = null
-  currentRouteExpectedHash = startedAtHash
-  return intent
+  return claimRouteIntent()
 }
 
-export function beginWorkspaceReplacementRouteIntent(): RouteIntent {
-  const intent = beginRouteIntent()
-  localWorkspaceReplacementRouteIntent = intent
+function claimRouteIntent(): RouteIntent {
+  ensureHashListener()
+  invalidateRouteIntent()
+  const startedAtHash = typeof window === 'undefined' ? '' : window.location.hash
+  const intent = Object.freeze({
+    startedAtHash,
+    [routeIntentBrand]: true as const,
+    [routeIntentState]: {
+      expectedHash: startedAtHash,
+      controller: new AbortController(),
+      routeOwnerController: createConversationRouteOwnerController(),
+    },
+  })
+  currentRouteIntent = intent
   return intent
 }
 
 export function isRouteIntentCurrent(intent: RouteIntent): boolean {
   return (
     currentRouteIntent === intent &&
-    isTabNavigationCurrent(intent[routeAuthority]) &&
-    (typeof window === 'undefined' || window.location.hash === currentRouteExpectedHash)
+    !intent[routeIntentState].controller.signal.aborted &&
+    intent[routeIntentState].expectedHash ===
+      (typeof window === 'undefined' ? intent.startedAtHash : window.location.hash)
   )
+}
+
+export function routeIntentOwner(intent: RouteIntent): ConversationRouteOwner {
+  return intent[routeIntentState].routeOwnerController.owner
 }
 
 export function navigateForIntent(intent: RouteIntent, href: string): boolean {
@@ -99,23 +98,19 @@ export function navigateForIntent(intent: RouteIntent, href: string): boolean {
 // Cleanup belongs in every async owner's finally block; successful navigation
 // consumes the same object first, making that cleanup a harmless no-op.
 export function cancelRouteIntent(intent: RouteIntent): boolean {
-  if (currentRouteIntent !== intent) return false
-  const stillOwnsNavigation = isTabNavigationCurrent(intent[routeAuthority])
-  if (stillOwnsNavigation) {
-    consumeTabNavigation(intent[routeAuthority])
-  }
-  clearRouteIntent()
-  if (workspaceRouteReplayPending) {
-    workspaceRouteReplayPending = false
-    if (stillOwnsNavigation) publishRouteChange()
-  }
+  const stillOwnsNavigation = currentRouteIntent === intent
+  if (!stillOwnsNavigation) return false
+  currentRouteIntent = null
+  intent[routeIntentState].controller.abort()
+  intent[routeIntentState].routeOwnerController.cancel()
   return true
 }
 
 function consumeRouteIntent(intent: RouteIntent): boolean {
   if (!isRouteIntentCurrent(intent)) return false
-  if (!consumeTabNavigation(intent[routeAuthority])) return false
-  clearRouteIntent()
+  currentRouteIntent = null
+  intent[routeIntentState].controller.abort()
+  intent[routeIntentState].routeOwnerController.cancel()
   return true
 }
 
@@ -126,12 +121,28 @@ function consumeRouteIntent(intent: RouteIntent): boolean {
 export function navigateToChatForIntent(
   intent: RouteIntent,
   chatId: ChatId,
-): NavigationIntent | null {
-  if (!consumeRouteIntent(intent)) return null
-  const routeChanged = commitHashNavigation(chatHref(chatId), false)
-  const navigationIntent = useChatStore.getState().beginNavigationIntent(chatId)
-  if (routeChanged) publishRouteChange()
-  return navigationIntent
+  handoff?: ConversationRouteHandoff,
+): boolean {
+  if (!isRouteIntentCurrent(intent)) {
+    handoff?.cancel()
+    return false
+  }
+  const routeOwner = intent[routeIntentState].routeOwnerController.owner
+  if (handoff && (handoff.chatId !== chatId || handoff.id !== routeOwner.id)) {
+    handoff.cancel()
+    throw new Error('ConversationRouteHandoffChatMismatch')
+  }
+  currentRouteIntent = null
+  intent[routeIntentState].controller.abort()
+  try {
+    commitHashNavigation(chatHref(chatId), false)
+    publishRouteChange(handoff)
+    return true
+  } catch (error) {
+    intent[routeIntentState].routeOwnerController.cancel(error)
+    handoff?.cancel()
+    throw error
+  }
 }
 
 export type StorageRoute =
@@ -141,7 +152,7 @@ export type StorageRoute =
   | { section: 'archive' }
   | { section: 'backups' }
 
-type Route =
+export type Route =
   | { kind: 'home' }
   | { kind: 'new' }
   | { kind: 'chat'; chatId: ChatId; pinnedMessageId?: MessageId }
@@ -190,6 +201,15 @@ export function parseRoute(hash: string): Route {
     if (parts.length === 2) return { kind: 'chat', chatId }
   }
   return { kind: 'unknown', raw: stripped }
+}
+
+export function activeRouteChatId(): ChatId | null {
+  const route = committedRouteSnapshot
+  return route.kind === 'chat' ? route.chatId : null
+}
+
+export function isChatRouteActive(chatId: ChatId): boolean {
+  return activeRouteChatId() === chatId
 }
 
 export function routeToHref(route: Route): string {
@@ -246,7 +266,7 @@ function storageRouteToHref(route: StorageRoute): string {
 
 export function navigate(href: string): void {
   if (typeof window === 'undefined') return
-  invalidateAllTabNavigation()
+  invalidateRouteIntent()
   commitHashNavigation(href)
 }
 
@@ -276,17 +296,25 @@ function commitHashNavigation(href: string, publish = true): boolean {
 // back button that undoes the auto-redirect.
 export function replaceRoute(href: string): void {
   if (typeof window === 'undefined') return
-  // A completed cursor → URL projection proves this tab has reconciled the
-  // current workspace, even if the projected href is already in the bar.
-  workspaceRouteReplayPending = false
-  if (window.location.hash === href) return
-  const routeIntent = currentRouteIntent
-  if (routeIntent && isTabNavigationCurrent(routeIntent[routeAuthority])) {
-    currentRouteExpectedHash = href
+  const before = window.location.hash
+  if (currentRouteIntent && currentRouteIntent[routeIntentState].expectedHash === before) {
+    currentRouteIntent[routeIntentState].expectedHash = href
+  }
+  if (window.location.hash === href) {
+    const candidate = currentAddressRoute()
+    updateRouteArrivalSnapshot(false, candidate)
+    if (routeToHref(committedRouteSnapshot) !== routeToHref(candidate)) {
+      committedRouteSnapshot = candidate
+      publishRouteSnapshotChange()
+    }
+    return
   }
   const url = new URL(window.location.href)
   url.hash = href
   window.history.replaceState(window.history.state, '', url.toString())
+  const candidate = currentAddressRoute()
+  updateRouteArrivalSnapshot(false, candidate)
+  committedRouteSnapshot = candidate
   publishRouteSnapshotChange()
 }
 
@@ -300,21 +328,61 @@ export function navigateNew(): void {
 
 const routeSnapshotSubscribers = new Set<() => void>()
 const routeArrivalSubscribers = new Set<() => void>()
+const routeArrivalPrefix = newId()
+let routeArrivalRevision = 0n
+const HOME_ROUTE = Object.freeze({ kind: 'home' as const })
+let committedRouteSnapshot = currentAddressRoute()
+let routeArrivalSnapshot = conversationRouteArrival(committedRouteSnapshot)
 let hashListenerInstalled = false
 
 function ensureHashListener(): void {
   if (typeof window === 'undefined' || hashListenerInstalled) return
   hashListenerInstalled = true
   window.addEventListener('hashchange', () => {
-    invalidateAllTabNavigation()
+    invalidateRouteIntent()
     publishRouteChange()
   })
 }
 
-function publishRouteChange(): void {
-  workspaceRouteReplayPending = false
-  publishRouteSnapshotChange()
+function publishRouteChange(handoff?: ConversationRouteHandoff): void {
+  const candidate = currentAddressRoute()
+  updateRouteArrivalSnapshot(true, candidate, handoff)
   for (const fn of [...routeArrivalSubscribers]) fn()
+  committedRouteSnapshot = candidate
+  publishRouteSnapshotChange()
+}
+
+function currentAddressRoute(): Route {
+  return typeof window === 'undefined' ? HOME_ROUTE : parseRoute(window.location.hash)
+}
+
+function conversationRouteArrival(
+  route: Route,
+  handoff?: ConversationRouteHandoff,
+): ConversationRouteArrival {
+  return Object.freeze({
+    id: `${routeArrivalPrefix}:${routeArrivalRevision.toString()}`,
+    route:
+      route.kind === 'chat'
+        ? Object.freeze({
+            chatId: route.chatId,
+            ...(route.pinnedMessageId ? { targetMessageId: route.pinnedMessageId } : {}),
+            ...(handoff?.chatId === route.chatId ? { handoff } : {}),
+          })
+        : null,
+  })
+}
+
+function updateRouteArrivalSnapshot(
+  increment: boolean,
+  route: Route,
+  handoff?: ConversationRouteHandoff,
+): void {
+  if (increment) routeArrivalRevision += 1n
+  const next = conversationRouteArrival(route, handoff)
+  const previousHandoff = routeArrivalSnapshot.route?.handoff
+  if (previousHandoff && previousHandoff !== next.route?.handoff) previousHandoff.cancel()
+  routeArrivalSnapshot = next
 }
 
 function publishRouteSnapshotChange(): void {
@@ -337,35 +405,41 @@ export function subscribeRouteArrival(fn: () => void): () => void {
   return () => routeArrivalSubscribers.delete(fn)
 }
 
-export function refreshRouteForWorkspaceReplacement(delivery: BroadcastDelivery): void {
-  ensureHashListener()
-  if (
-    delivery === 'local' &&
-    currentRouteIntent === localWorkspaceReplacementRouteIntent &&
-    currentRouteIntent &&
-    isRouteIntentCurrent(currentRouteIntent)
-  ) {
-    workspaceRouteReplayPending = true
-    return
-  }
-  invalidateAllTabNavigation()
-  publishRouteChange()
+export const browserConversationNavigationPort: ConversationNavigationPort = Object.freeze({
+  getArrival: () => routeArrivalSnapshot,
+  subscribeArrival: subscribeRouteArrival,
+  replaceConversationUrl: (chatId: ChatId, targetMessageId?: MessageId) => {
+    if (typeof window === 'undefined') return
+    const route = parseRoute(window.location.hash)
+    if (route.kind !== 'chat' || route.chatId !== chatId) return
+    const publishedRoute = routeArrivalSnapshot.route
+    if (
+      !publishedRoute ||
+      publishedRoute.chatId !== route.chatId ||
+      publishedRoute.targetMessageId !== route.pinnedMessageId
+    ) {
+      return
+    }
+    replaceRoute(chatHref(chatId, targetMessageId))
+  },
+})
+
+function getCommittedRouteSnapshot(): Route {
+  return committedRouteSnapshot
 }
 
-function getHashSnapshot(): string {
-  if (typeof window === 'undefined') return ''
-  return window.location.hash
-}
-
-function getServerSnapshot(): string {
-  return ''
+function getServerRouteSnapshot(): Route {
+  return HOME_ROUTE
 }
 
 // React hook surface. Rerenders the consumer whenever the hash changes —
 // any number of components can call this; one window listener feeds them all.
 export function useRoute(): Route {
-  const hash = useSyncExternalStore(subscribeRouteChange, getHashSnapshot, getServerSnapshot)
-  return parseRoute(hash)
+  return useSyncExternalStore(
+    subscribeRouteChange,
+    getCommittedRouteSnapshot,
+    getServerRouteSnapshot,
+  )
 }
 
 // Intercept-on-left-click handler factory. Plain left-click → in-app SPA nav;
@@ -373,6 +447,7 @@ export function useRoute(): Route {
 // fall through to the browser so the affordance opens in a new tab/window.
 export function makeAnchorClickHandler(
   href: string,
+  onPrimaryNavigate: (href: string) => void = navigate,
 ): (event: MouseEvent<HTMLAnchorElement>) => void {
   return (event) => {
     if (
@@ -386,6 +461,6 @@ export function makeAnchorClickHandler(
       return
     }
     event.preventDefault()
-    navigate(href)
+    onPrimaryNavigate(href)
   }
 }

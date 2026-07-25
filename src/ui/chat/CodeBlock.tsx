@@ -5,19 +5,30 @@ interface CodeBlockProps {
   code: string
   language?: string
   fileName?: string
+  onHighlightAnyway?: () => void
+  highlightAnywayDisabled?: boolean
 }
 
 const MAX_LINES_WITHOUT_TOOLBAR = 5
-const HARD_SIZE_CAP_LINES = 10_000
+export const CODE_HIGHLIGHT_LIMITS = Object.freeze({
+  lines: 10_000,
+  sourceChars: 500_000,
+  previewLines: 20,
+  previewChars: 20_000,
+})
 
-// Minimal standalone code-block component for content that doesn't come
-// through the Streamdown pipeline (e.g. programmatic content lanes or
-// stream-overflow disclosures). Streamdown-rendered code fences get their
-// chrome from Streamdown — this module is intentionally independent so it
-// can be rendered without any streaming context.
-export function CodeBlock({ code, language, fileName }: CodeBlockProps) {
-  const lineCount = useMemo(() => code.split('\n').length, [code])
-  const overLimit = lineCount > HARD_SIZE_CAP_LINES
+// This renderer stays independent of Streamdown context so oversized fences
+// can remain bounded before either Streamdown or Shiki sees their full body.
+export function CodeBlock({
+  code,
+  language,
+  fileName,
+  onHighlightAnyway,
+  highlightAnywayDisabled = false,
+}: CodeBlockProps) {
+  const lineCount = useMemo(() => countLinesUpTo(code, CODE_HIGHLIGHT_LIMITS.lines + 1), [code])
+  const overLimit =
+    code.length > CODE_HIGHLIGHT_LIMITS.sourceChars || lineCount > CODE_HIGHLIGHT_LIMITS.lines
   const [showLarge, setShowLarge] = useState(false)
 
   const onCopy = useCallback(async () => {
@@ -50,7 +61,11 @@ export function CodeBlock({ code, language, fileName }: CodeBlockProps) {
             <Button
               type="button"
               data-ui="code-toolbar-highlight-anyway"
-              onClick={() => setShowLarge(true)}
+              disabled={highlightAnywayDisabled}
+              onClick={() => {
+                if (onHighlightAnyway) onHighlightAnyway()
+                else setShowLarge(true)
+              }}
             >
               Highlight anyway
             </Button>
@@ -63,7 +78,7 @@ export function CodeBlock({ code, language, fileName }: CodeBlockProps) {
           </div>
         </div>
         <pre data-ui="code-block-body">
-          {code.split('\n').slice(0, 20).join('\n')}
+          {boundedPreview(code)}
           {'\n…'}
         </pre>
       </div>
@@ -89,6 +104,25 @@ export function CodeBlock({ code, language, fileName }: CodeBlockProps) {
       </pre>
     </div>
   )
+}
+
+function countLinesUpTo(code: string, limit: number): number {
+  let lines = 1
+  for (let index = 0; index < code.length && lines < limit; index += 1) {
+    if (code.charCodeAt(index) === 10) lines += 1
+  }
+  return lines
+}
+
+function boundedPreview(code: string): string {
+  const characterLimit = Math.min(code.length, CODE_HIGHLIGHT_LIMITS.previewChars)
+  let lines = 1
+  for (let index = 0; index < characterLimit; index += 1) {
+    if (code.charCodeAt(index) !== 10) continue
+    lines += 1
+    if (lines > CODE_HIGHLIGHT_LIMITS.previewLines) return code.slice(0, index)
+  }
+  return code.slice(0, characterLimit)
 }
 
 function extensionFor(language: string | undefined): string {

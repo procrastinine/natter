@@ -4,9 +4,36 @@
 //   - Pre-computed privacy wire fragments merge into the provider block
 
 import { describe, expect, it } from 'vitest'
+import { toChatCompletions as toChatCompletionsWithContract } from '../../src/api/request-transforms'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
-import { toChatCompletions } from '../../src/core/transforms'
+import { TEXT_PROVIDER_OUTPUT_CONTRACT } from '../../src/core/provider-tool-context'
 import type { ChatSettings } from '../../src/core/types'
+import {
+  chatReasoningContractForSettings,
+  TEST_ASSISTANT_TAIL_PREFILL_PLAN,
+} from '../helpers/reasoning-contracts'
+
+type ChatOptions = Omit<
+  Parameters<typeof toChatCompletionsWithContract>[2],
+  'reasoning' | 'providerOutput' | 'prefillPlan'
+> & {
+  reasoning?: Parameters<typeof toChatCompletionsWithContract>[2]['reasoning']
+  providerOutput?: Parameters<typeof toChatCompletionsWithContract>[2]['providerOutput']
+  prefillPlan?: Parameters<typeof toChatCompletionsWithContract>[2]['prefillPlan']
+}
+
+function toChatCompletions(
+  settings: Parameters<typeof toChatCompletionsWithContract>[0],
+  path: Parameters<typeof toChatCompletionsWithContract>[1],
+  options: ChatOptions = {},
+) {
+  return toChatCompletionsWithContract(settings, path, {
+    ...options,
+    reasoning: options.reasoning ?? chatReasoningContractForSettings(settings),
+    providerOutput: options.providerOutput ?? TEXT_PROVIDER_OUTPUT_CONTRACT,
+    prefillPlan: options.prefillPlan ?? TEST_ASSISTANT_TAIL_PREFILL_PLAN,
+  })
+}
 
 function makeSettings(overrides: Partial<ChatSettings> = {}): ChatSettings {
   return { ...cloneDefaultChatSettings(), ...overrides }

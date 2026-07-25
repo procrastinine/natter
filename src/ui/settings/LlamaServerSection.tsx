@@ -6,8 +6,13 @@
 //   and /v1/completions at dispatch time.
 // Text-template editing lives on the Generation tab next to Stop sequences.
 
-import type { Chat, ChatSettings, ConnectionProfile } from '../../core/types'
-import { updateChatSettings } from '../../store/chats'
+import {
+  configurationWriteInteraction,
+  configurationWriteTarget,
+} from '../../app/presentation-interactions'
+import type { Chat, ConnectionProfile } from '../../core/types'
+import { usePresentationInteraction } from '../../hooks/usePresentationInteraction'
+import { configurationApplication } from '../../store/configuration-application'
 import { Button } from '../primitives/Button'
 
 interface LlamaServerSectionProps {
@@ -16,29 +21,29 @@ interface LlamaServerSectionProps {
 }
 
 export function LlamaServerSection({ chat }: LlamaServerSectionProps) {
+  const { run: runConfigurationWrite } = usePresentationInteraction(configurationWriteInteraction, {
+    observePending: false,
+  })
   const protocol = chat.settings.protocol ?? 'chat'
   // Wire default is true. An explicit `false` is only persisted when the
   // user opts out; persisting true would be noise.
   const reuseCache = chat.settings.cachePrompt !== false
 
   const setProtocol = (next: 'chat' | 'text') => {
-    void updateChatSettings(chat.id, { protocol: next })
+    runConfigurationWrite({
+      target: configurationWriteTarget(chat.id, 'protocol'),
+      action: () => configurationApplication.patchChatSettings(chat.id, { protocol: next }),
+    })
   }
 
   const setReuseCache = (next: boolean) => {
-    // Write undefined when matching the server default to keep payloads
-    // clean (and to avoid the preset drift that would otherwise flag
-    // the chat as diverged from a preset that doesn't carry the field).
-    const patch: Partial<ChatSettings> = next ? {} : { cachePrompt: false }
-    if (next && chat.settings.cachePrompt !== undefined) {
-      // Unset an explicit `false` by rewriting the sub-object without it.
-      // updateChatSettings merges top-level, so deleting a key via patch
-      // isn't supported; shallow-clone and omit instead.
-      const { cachePrompt: _drop, ...rest } = chat.settings
-      void updateChatSettings(chat.id, rest)
-      return
-    }
-    void updateChatSettings(chat.id, patch)
+    runConfigurationWrite({
+      target: configurationWriteTarget(chat.id, 'cachePrompt'),
+      action: () =>
+        configurationApplication.patchChatSettings(chat.id, {
+          cachePrompt: next ? undefined : false,
+        }),
+    })
   }
 
   return (

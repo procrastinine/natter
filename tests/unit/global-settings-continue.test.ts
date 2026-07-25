@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   CONTINUE_SYSTEM_PROMPT_PLACEHOLDER,
   resolveContinueSystemPromptTemplate,
-} from '../../src/core/global-settings'
+} from '../../src/core/continue-prompts'
 
 // Continue prompts now live on `chat.settings.continueSystemPrompt` /
 // `continueUserPrompt` rather than on GlobalPreferences. The legacy global

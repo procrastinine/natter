@@ -1,22 +1,34 @@
 import Dexie from 'dexie'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import type { MutationScope } from '../../src/core/types'
-import { BROWSER_WRITER_LOCK_NAME } from '../../src/store/browser-lock-record'
+import { BROWSER_WRITER_LOCK_NAME, type BrowserLockRow } from '../../src/store/browser-lock-record'
 import { createDbForTests } from '../../src/store/db'
 import {
   __resetLockTrackerForTests,
+  __setLockBackendForTests,
   assertAcquireOrder,
+  awaitLockRuntimeIdle,
   createIndexedDbLockBackend,
+  disposeLockRuntime,
+  type LockBackend,
   LockFenceLostError,
   normalizeMutationScopes,
+  resumeLockRuntime,
   ScopeOrderError,
   scopeResourceName,
+  withMutationLocks,
   withNamedLock,
+  withQuiescedWorkspaceReplacementLock,
   withTrackedScopes,
 } from '../../src/store/locks'
+import { resumeLocalTransactionAdmissions } from '../../src/store/transaction-activity'
+
+beforeAll(() => {
+  resumeLocalTransactionAdmissions()
+})
 
 afterEach(() => {
-  __resetLockTrackerForTests()
+  __resetLockTrackerForTests({ admissionsOpen: true })
 })
 
 describe('scopeResourceName', () => {
@@ -99,6 +111,60 @@ describe('tracked acquisition order', () => {
   })
 })
 
+describe('lock runtime disposal', () => {
+  it('gates and drains the primary mutation-lock path', async () => {
+    const entered = deferred()
+    const release = deferred()
+    let disposed = false
+    const backend: LockBackend = {
+      kind: 'web-locks',
+      run: async (logicalNames, fn) => {
+        if (disposed) throw new Error('backend disposed')
+        expect(logicalNames).toEqual(['message:M1'])
+        return fn({
+          kind: 'web-locks',
+          logicalNames,
+          runTransaction: async (_db, _tables, transactionFn) => transactionFn({} as never),
+        })
+      },
+      runAuthoritativeCommandSession: async (_database, operation, options = {}) => {
+        if (options.signal?.aborted) throw options.signal.reason
+        return operation({
+          kind: 'web-locks',
+          withResourceLocks: (resourceNames, child) => backend.run(resourceNames, child, options),
+        })
+      },
+      dispose: () => {
+        disposed = true
+      },
+    }
+    __setLockBackendForTests(backend)
+    const operation = withMutationLocks([{ kind: 'message', messageId: 'M1' }], async () => {
+      entered.resolve()
+      await release.promise
+    })
+    await entered.promise
+
+    disposeLockRuntime()
+    await expect(
+      withMutationLocks([{ kind: 'message', messageId: 'M2' }], async () => {}),
+    ).rejects.toThrow('LockRuntimeDisposed')
+    let drained = false
+    const drain = awaitLockRuntimeIdle().then(() => {
+      drained = true
+    })
+    await Promise.resolve()
+    expect(drained).toBe(false)
+
+    release.resolve()
+    await operation
+    await drain
+    expect(drained).toBe(true)
+    __setLockBackendForTests(null)
+    resumeLockRuntime()
+  })
+})
+
 function deferred<T = void>() {
   let resolve!: (value: T | PromiseLike<T>) => void
   let reject!: (reason?: unknown) => void
@@ -166,6 +232,136 @@ describe('IndexedDB fallback fencing', () => {
     await databases.close()
   })
 
+  it('wakes a fallback follower on release without polling the lock row', async () => {
+    const databases = await lockDatabases()
+    const releaseLeft = deferred()
+    const leftEntered = deferred()
+    const rightEntered = deferred()
+    const left = createIndexedDbLockBackend({
+      openDatabase: async () => databases.left,
+      clientId: 'left-page',
+      leaseMs: 10_000,
+      renewMs: 1_000,
+      retryMs: 5,
+    })
+    const right = createIndexedDbLockBackend({
+      openDatabase: async () => databases.right,
+      clientId: 'right-page',
+      leaseMs: 10_000,
+      renewMs: 1_000,
+      retryMs: 5,
+    })
+    const rightTransactions = vi.spyOn(databases.right, 'transaction')
+
+    const first = left.run(['maintenance'], async () => {
+      leftEntered.resolve()
+      await releaseLeft.promise
+    })
+    await leftEntered.promise
+    const second = right.run(['maintenance'], async () => {
+      rightEntered.resolve()
+    })
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    expect(rightTransactions).toHaveBeenCalledTimes(1)
+
+    releaseLeft.resolve()
+    await rightEntered.promise
+    await Promise.all([first, second])
+    expect(rightTransactions).toHaveBeenCalledTimes(3)
+
+    left.dispose?.()
+    right.dispose?.()
+    await databases.close()
+  })
+
+  it('does not wake a fallback waiter from a release in another database', async () => {
+    const waitingDatabases = await lockDatabases()
+    const unrelatedDatabases = await lockDatabases()
+    const now = Date.now()
+    await waitingDatabases.left.browserLocks.put({
+      name: BROWSER_WRITER_LOCK_NAME,
+      ownerClientId: 'waiting-owner',
+      leaseId: 'waiting-lease',
+      fencingToken: 1,
+      acquiredAt: now,
+      heartbeatAt: now,
+      expiresAt: now + 60_000,
+    })
+    const controller = new AbortController()
+    const waitingBackend = createIndexedDbLockBackend({
+      openDatabase: async () => waitingDatabases.right,
+      clientId: 'waiting-page',
+      leaseMs: 1_000,
+      renewMs: 100,
+      retryMs: 5,
+    })
+    const firstAttempt = deferred()
+    const observeFirstRead = (row: BrowserLockRow | undefined): BrowserLockRow | undefined => {
+      firstAttempt.resolve()
+      return row
+    }
+    waitingDatabases.right.browserLocks.hook('reading', observeFirstRead)
+    const transactions = vi.spyOn(waitingDatabases.right, 'transaction')
+    const waiting = waitingBackend.run(['maintenance'], async () => {}, {
+      signal: controller.signal,
+    })
+    await firstAttempt.promise
+    waitingDatabases.right.browserLocks.hook('reading').unsubscribe(observeFirstRead)
+    expect(transactions).toHaveBeenCalledTimes(1)
+
+    const unrelatedBackend = createIndexedDbLockBackend({
+      openDatabase: async () => unrelatedDatabases.left,
+      clientId: 'unrelated-page',
+      leaseMs: 1_000,
+      renewMs: 100,
+      retryMs: 5,
+    })
+    await unrelatedBackend.run(['maintenance'], async () => {})
+    await unrelatedBackend.awaitIdle?.()
+    await Promise.resolve()
+    expect(transactions).toHaveBeenCalledTimes(1)
+
+    const reason = new Error('waiting-cancelled')
+    controller.abort(reason)
+    await expect(waiting).rejects.toBe(reason)
+    waitingBackend.dispose?.()
+    unrelatedBackend.dispose?.()
+    await waitingDatabases.close()
+    await unrelatedDatabases.close()
+  })
+
+  it('takes over an abandoned fallback lease at its persisted expiry without release events', async () => {
+    const databases = await lockDatabases()
+    const now = Date.now()
+    await databases.left.browserLocks.put({
+      name: BROWSER_WRITER_LOCK_NAME,
+      ownerClientId: 'crashed-page',
+      leaseId: 'crashed-lease',
+      fencingToken: 7,
+      acquiredAt: now,
+      heartbeatAt: now,
+      expiresAt: now + 80,
+    })
+    const backend = createIndexedDbLockBackend({
+      openDatabase: async () => databases.right,
+      clientId: 'successor-page',
+      leaseMs: 1_000,
+      renewMs: 100,
+      retryMs: 5,
+    })
+    const transactions = vi.spyOn(databases.right, 'transaction')
+
+    await backend.run(['maintenance'], async () => {})
+
+    expect(transactions).toHaveBeenCalledTimes(3)
+    expect(await databases.left.browserLocks.get(BROWSER_WRITER_LOCK_NAME)).toMatchObject({
+      ownerClientId: null,
+      fencingToken: 8,
+    })
+    backend.dispose?.()
+    await databases.close()
+  })
+
   it('rejects a stale owner inside the same transaction before domain writes', async () => {
     const databases = await lockDatabases()
     let now = 0
@@ -213,6 +409,63 @@ describe('IndexedDB fallback fencing', () => {
     expect((await databases.left.settings.get('right-write'))?.value).toBe(true)
     releaseRight.resolve()
     await rightWrite
+
+    left.dispose?.()
+    right.dispose?.()
+    await databases.close()
+  })
+
+  it('notifies a long-lived coordination callback when its fallback lease is lost', async () => {
+    const databases = await lockDatabases()
+    let now = 0
+    const leftEntered = deferred()
+    const rightEntered = deferred()
+    const releaseRight = deferred()
+    const left = createIndexedDbLockBackend({
+      openDatabase: async () => databases.left,
+      clientId: 'left-page',
+      now: () => now,
+      leaseMs: 100,
+      renewMs: 20,
+      retryMs: 5,
+    })
+    const right = createIndexedDbLockBackend({
+      openDatabase: async () => databases.right,
+      clientId: 'right-page',
+      now: () => now,
+      leaseMs: 100,
+      renewMs: 20,
+      retryMs: 5,
+    })
+
+    let lossReason: unknown
+    const first = left.run(['maintenance'], async (grant) => {
+      const ownershipLost = grant.ownershipLost
+      if (!ownershipLost) throw new Error('FallbackOwnershipSignalMissing')
+      leftEntered.resolve()
+      await new Promise<void>((resolve) => {
+        ownershipLost.addEventListener(
+          'abort',
+          () => {
+            lossReason = ownershipLost.reason
+            resolve()
+          },
+          { once: true },
+        )
+      })
+    })
+    await leftEntered.promise
+    now = 101
+    const second = right.run(['maintenance'], async () => {
+      rightEntered.resolve()
+      await releaseRight.promise
+    })
+
+    await rightEntered.promise
+    await first
+    expect(lossReason).toBeInstanceOf(LockFenceLostError)
+    releaseRight.resolve()
+    await second
 
     left.dispose?.()
     right.dispose?.()
@@ -306,6 +559,41 @@ describe('IndexedDB fallback fencing', () => {
     await expect(waiting).rejects.toThrow('LockBackendDisposed')
     releaseOwner.resolve()
     await owner
+    await databases.close()
+  })
+
+  it('drains accepted fallback work through its physical callback finally', async () => {
+    const databases = await lockDatabases()
+    const entered = deferred()
+    const release = deferred()
+    const backend = createIndexedDbLockBackend({
+      openDatabase: async () => databases.left,
+      clientId: 'draining-page',
+      leaseMs: 10_000,
+      renewMs: 1_000,
+      retryMs: 5,
+    })
+    const operation = backend.run(['message:M1'], async () => {
+      entered.resolve()
+      await release.promise
+    })
+    await entered.promise
+    backend.dispose?.()
+    let drained = false
+    const drain = backend.awaitIdle?.().then(() => {
+      drained = true
+    })
+
+    await Promise.resolve()
+    expect(drained).toBe(false)
+    await expect(backend.run(['message:M2'], async () => {})).rejects.toThrow('LockBackendDisposed')
+    release.resolve()
+    await operation
+    await drain
+    expect(drained).toBe(true)
+    expect(
+      (await databases.left.browserLocks.get(BROWSER_WRITER_LOCK_NAME))?.ownerClientId,
+    ).toBeNull()
     await databases.close()
   })
 
@@ -421,6 +709,73 @@ describe('IndexedDB fallback fencing', () => {
     left.dispose?.()
     await databases.close()
   })
+
+  it('cancels only a pending fallback replacement lock acquisition', async () => {
+    const originalLocks = Object.getOwnPropertyDescriptor(navigator, 'locks')
+    Reflect.deleteProperty(navigator, 'locks')
+    const databases = await lockDatabases()
+    const releaseOwner = deferred()
+    const ownerEntered = deferred()
+    const owner = createIndexedDbLockBackend({
+      openDatabase: async () => databases.left,
+      clientId: 'replacement-blocker',
+      leaseMs: 10_000,
+      renewMs: 1_000,
+      retryMs: 5,
+    })
+    const owned = owner.run(['db:global'], async () => {
+      ownerEntered.resolve()
+      await releaseOwner.promise
+    })
+    await ownerEntered.promise
+    const controller = new AbortController()
+    const reason = new Error('replacement-cancelled-while-pending')
+    let called = false
+    const waiting = withQuiescedWorkspaceReplacementLock(
+      databases.right,
+      async () => {
+        called = true
+      },
+      { signal: controller.signal },
+    )
+
+    controller.abort(reason)
+    await expect(waiting).rejects.toBe(reason)
+    expect(called).toBe(false)
+
+    releaseOwner.resolve()
+    await owned
+    owner.dispose?.()
+    await databases.close()
+    if (originalLocks) Object.defineProperty(navigator, 'locks', originalLocks)
+  })
+
+  it('does not interrupt a fallback replacement callback after lock entry', async () => {
+    const originalLocks = Object.getOwnPropertyDescriptor(navigator, 'locks')
+    Reflect.deleteProperty(navigator, 'locks')
+    const databases = await lockDatabases()
+    const entered = deferred()
+    const release = deferred()
+    const controller = new AbortController()
+    const reason = new Error('replacement-cancelled-after-entry')
+    const operation = withQuiescedWorkspaceReplacementLock(
+      databases.left,
+      async () => {
+        entered.resolve()
+        await release.promise
+        return 'committed'
+      },
+      { signal: controller.signal },
+    )
+
+    await entered.promise
+    controller.abort(reason)
+    release.resolve()
+    await expect(operation).resolves.toBe('committed')
+
+    await databases.close()
+    if (originalLocks) Object.defineProperty(navigator, 'locks', originalLocks)
+  })
 })
 
 class WorkspaceGateLockManager {
@@ -480,7 +835,7 @@ describe('Web Locks workspace gate', () => {
     const original = Object.getOwnPropertyDescriptor(navigator, 'locks')
     const manager = new WorkspaceGateLockManager()
     Object.defineProperty(navigator, 'locks', { configurable: true, value: manager })
-    __resetLockTrackerForTests()
+    __resetLockTrackerForTests({ admissionsOpen: true })
     const releaseOrdinary = deferred()
     const ordinaryEntered = deferred()
     const secondOrdinaryEntered = deferred()
@@ -505,6 +860,6 @@ describe('Web Locks workspace gate', () => {
     expect(replacementEntered).toBe(true)
     if (original) Object.defineProperty(navigator, 'locks', original)
     else Reflect.deleteProperty(navigator, 'locks')
-    __resetLockTrackerForTests()
+    __resetLockTrackerForTests({ admissionsOpen: true })
   })
 })

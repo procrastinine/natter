@@ -1,5 +1,7 @@
+import { transformWorkspaceThroughUi } from '../../scripts/workspace-provider-fixture.mjs'
 import { expect, type Page, test } from './fixtures'
 import {
+  activeWorkspaceDatabaseName,
   buildSseBody,
   clearIndexedDb,
   createChatAndOpen,
@@ -84,13 +86,17 @@ test('GUI OpenRouter Responses GPT-5.4 xhigh reasoning and Continue stay on the 
   const chatId = await firstChatId(page)
   const rows = await readMessages(page, chatId)
   const storedAssistant = rows.find((row) => row.role === 'assistant') as
-    | { reasoningDetails?: Array<Record<string, unknown>> }
+    | {
+        reasoningEnvelope?: {
+          visible?: Array<{ kind?: unknown; text?: unknown }>
+        }
+      }
     | undefined
   const summaries =
-    storedAssistant?.reasoningDetails?.filter((detail) => detail.type === 'reasoning.summary') ?? []
+    storedAssistant?.reasoningEnvelope?.visible?.filter((detail) => detail.kind === 'summary') ?? []
   expect(summaries).toHaveLength(1)
-  expect(summaries[0]?.summary).toContain('fragment-000 fragment-001 fragment-002')
-  expect(summaries[0]?.summary).toContain('fragment-119')
+  expect(summaries[0]?.text).toContain('fragment-000 fragment-001 fragment-002')
+  expect(summaries[0]?.text).toContain('fragment-119')
 
   expectNoConsoleProblems(consoleLines)
 })
@@ -116,9 +122,9 @@ test('GUI OpenRouter Text completions posts /completions with a selected templat
   await textMode.click()
   await expect(textMode).toHaveAttribute('aria-pressed', 'true')
   await page.getByRole('tab', { name: 'Generation' }).click()
-  await page.locator('[data-ui="text-template-picker"]').selectOption('raw')
   const composer = page.locator('[data-ui="composer-input"]')
   await composer.fill('OpenRouter text route check')
+  await page.locator('[data-ui="text-template-picker"]').selectOption('raw')
   await composer.press('Enter')
   await expect(page.locator('[data-ui="message"][data-role="assistant"]').first()).toContainText(
     'openrouter text ok',
@@ -313,7 +319,7 @@ test('GUI edit Save & Send reuses provider planning for the edited branch', asyn
   expect(JSON.stringify(second?.messages)).not.toContain('original user prompt')
   expect(second?.provider).toMatchObject({ data_collection: 'deny' })
   const secondProvider = second?.provider as { order?: string[]; ignore?: string[] } | undefined
-  expect(secondProvider?.order?.slice(0, 3)).toEqual(['Budget Clean', 'Alpha ZDR', 'Tiny Context'])
+  expect(secondProvider?.order).toEqual(['Budget Clean', 'Alpha ZDR'])
   expect(secondProvider?.ignore).toEqual(
     expect.arrayContaining(['Fast Retain', 'Training Host', 'Tiny Context', 'UserID Host']),
   )
@@ -376,9 +382,8 @@ test('GUI manual provider allow updates privacy badge and overrides red tiers', 
     .locator('[data-ui="provider-picker-row"]')
     .filter({ hasText: 'Training Host' })
   await expect(trainingRow).toHaveAttribute('data-allowed', 'false')
-  await page.getByLabel('Use Training Host').click()
-  await expect(trainingRow).toHaveAttribute('data-allowed', 'true')
-  await expect(headerLock).toHaveAttribute('data-privacy-tier', 'red')
+  await expect(page.getByLabel('Use Training Host')).toBeDisabled()
+  await expect(headerLock).toHaveAttribute('data-privacy-tier', 'orange')
 
   const composer = page.locator('[data-ui="composer-input"]')
   await composer.fill('manual provider override route check')
@@ -392,7 +397,7 @@ test('GUI manual provider allow updates privacy badge and overrides red tiers', 
   expect(provider.data_collection).toBe('deny')
   expect(provider.ignore).not.toContain('Fast Retain')
   expect(provider.ignore).not.toContain('UserID Host')
-  expect(provider.ignore).not.toContain('Training Host')
+  expect(provider.ignore).toContain('Training Host')
 
   expectNoConsoleProblems(consoleLines)
 })
@@ -405,7 +410,7 @@ test('GUI duplicate provider display names stay independently selectable by slug
   await mockOpenRouterDiscovery(page, 'anthropic/claude-opus-4.7', {
     endpointsPayload: duplicateAnthropicEndpointsPayload('anthropic/claude-opus-4.7'),
   })
-  await mockChatCompletionsCapture(page, requests, ['duplicate provider ok'])
+  await mockChatCompletionsCapture(page, requests, ['legacy fixture seed', 'duplicate provider ok'])
 
   await seedFirstRun(page, {
     model: 'anthropic/claude-opus-4.7',
@@ -413,6 +418,7 @@ test('GUI duplicate provider display names stay independently selectable by slug
     corsProxyUrl: '/_or_scrape',
   })
   await createChatAndOpen(page)
+  await sendAndExpectAssistant(page, 'materialize legacy fixture chat', 'legacy fixture seed')
   await openSettingsPanel(page)
   await seedLegacyProviderPrivacy(page, ['Anthropic'])
   await page.reload()
@@ -446,12 +452,15 @@ test('GUI duplicate provider display names stay independently selectable by slug
   const composer = page.locator('[data-ui="composer-input"]')
   await composer.fill('duplicate provider route check')
   await composer.press('Enter')
-  await expect(page.locator('[data-ui="message"][data-role="assistant"]').first()).toContainText(
-    'duplicate provider ok',
-  )
+  await expect(
+    page
+      .locator('[data-ui="message"][data-role="assistant"]')
+      .filter({ hasText: 'duplicate provider ok' }),
+  ).toBeVisible()
   await waitForAssistantGenerationFinished(page, await firstChatId(page))
 
-  const provider = requests[0]?.body.provider as { ignore?: string[]; order?: string[] }
+  expect(requests).toHaveLength(2)
+  const provider = requests[1]?.body.provider as { ignore?: string[]; order?: string[] }
   expect(provider.ignore).toEqual(['anthropic/2'])
   expect(provider.order).toBeUndefined()
   expectNoConsoleProblems(consoleLines)
@@ -797,8 +806,35 @@ async function addConnectionThroughGui(
 
 async function switchConnectionThroughGui(page: Page, profileName: string): Promise<void> {
   await openConnectionDetail(page)
-  await page.locator('[data-ui="connection-profile-select"]').selectOption({ label: profileName })
-  await expect(page.locator('[data-ui="connection-name"]')).toContainText(profileName)
+  const select = page.locator('[data-ui="connection-profile-select"]')
+  const optionLabels = async () => select.locator('option').allTextContents()
+  const choosePageControl = async (label: string): Promise<void> => {
+    const before = JSON.stringify(await optionLabels())
+    await select.selectOption({ label })
+    await expect.poll(async () => JSON.stringify(await optionLabels())).not.toBe(before)
+  }
+
+  for (let pageIndex = 0; pageIndex < 50; pageIndex += 1) {
+    const labels = await optionLabels()
+    if (labels.includes(profileName)) {
+      await select.selectOption({ label: profileName })
+      await expect(page.locator('[data-ui="connection-name"]')).toContainText(profileName)
+      return
+    }
+    if (!labels.includes('Earlier connections…')) break
+    await choosePageControl('Earlier connections…')
+  }
+  for (let pageIndex = 0; pageIndex < 50; pageIndex += 1) {
+    const labels = await optionLabels()
+    if (labels.includes(profileName)) {
+      await select.selectOption({ label: profileName })
+      await expect(page.locator('[data-ui="connection-name"]')).toContainText(profileName)
+      return
+    }
+    if (!labels.includes('Load more connections…')) break
+    await choosePageControl('Load more connections…')
+  }
+  throw new Error(`connection profile not found through paginated selector: ${profileName}`)
 }
 
 async function openConnectionDetail(page: Page): Promise<void> {
@@ -852,32 +888,36 @@ async function expectNoHorizontalOverflow(page: Page): Promise<void> {
 }
 
 async function waitForProviderOrder(page: Page, expected: string[]): Promise<void> {
-  await page.waitForFunction(async (order) => {
-    const chatId = window.location.hash.match(/^#\/chat\/([^/?#]+)/)?.[1]
-    if (!chatId) return false
-    const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const req = indexedDB.open('natter')
-      req.onsuccess = () => resolve(req.result)
-      req.onerror = () => reject(req.error)
-    })
-    try {
-      return await new Promise<boolean>((resolve, reject) => {
-        const tx = db.transaction('chats', 'readonly')
-        const req = tx.objectStore('chats').get(chatId)
-        req.onsuccess = () => {
-          const row = req.result as
-            | { settings?: { providerPrefs?: { order?: string[] } } }
-            | undefined
-          resolve(
-            JSON.stringify(row?.settings?.providerPrefs?.order ?? []) === JSON.stringify(order),
-          )
-        }
+  const databaseName = await activeWorkspaceDatabaseName(page)
+  await page.waitForFunction(
+    async ({ databaseName, order }) => {
+      const chatId = window.location.hash.match(/^#\/chat\/([^/?#]+)/)?.[1]
+      if (!chatId) return false
+      const db = await new Promise<IDBDatabase>((resolve, reject) => {
+        const req = indexedDB.open(databaseName)
+        req.onsuccess = () => resolve(req.result)
         req.onerror = () => reject(req.error)
       })
-    } finally {
-      db.close()
-    }
-  }, expected)
+      try {
+        return await new Promise<boolean>((resolve, reject) => {
+          const tx = db.transaction('chats', 'readonly')
+          const req = tx.objectStore('chats').get(chatId)
+          req.onsuccess = () => {
+            const row = req.result as
+              | { settings?: { providerPrefs?: { order?: string[] } } }
+              | undefined
+            resolve(
+              JSON.stringify(row?.settings?.providerPrefs?.order ?? []) === JSON.stringify(order),
+            )
+          }
+          req.onerror = () => reject(req.error)
+        })
+      } finally {
+        db.close()
+      }
+    },
+    { databaseName, order: expected },
+  )
 }
 
 async function seedLegacyProviderPrivacy(
@@ -885,47 +925,23 @@ async function seedLegacyProviderPrivacy(
   ignoreProviders: string[],
   onlyProviders: string[] = [],
 ): Promise<void> {
-  await page.evaluate(
-    async ({ ignoreProviders, onlyProviders }) => {
-      const chatId = window.location.hash.match(/^#\/chat\/([^/?#]+)/)?.[1]
-      if (!chatId) throw new Error('missing active chat id')
-      const db = await new Promise<IDBDatabase>((resolve, reject) => {
-        const req = indexedDB.open('natter')
-        req.onsuccess = () => resolve(req.result)
-        req.onerror = () => reject(req.error)
-      })
-      try {
-        await new Promise<void>((resolve, reject) => {
-          const tx = db.transaction('chats', 'readwrite')
-          const store = tx.objectStore('chats')
-          const req = store.get(chatId)
-          req.onsuccess = () => {
-            const chat = req.result as
-              | { settings?: { privacy?: Record<string, unknown>; providerPrefs?: unknown } }
-              | undefined
-            if (!chat?.settings?.privacy) {
-              reject(new Error('missing chat settings'))
-              return
-            }
-            chat.settings.privacy = {
-              ...chat.settings.privacy,
-              ignoreProviders,
-              onlyProviders,
-            }
-            delete chat.settings.providerPrefs
-            store.put(chat)
-          }
-          req.onerror = () => reject(req.error)
-          tx.oncomplete = () => resolve()
-          tx.onerror = () => reject(tx.error)
-          tx.onabort = () => reject(tx.error)
-        })
-      } finally {
-        db.close()
-      }
-    },
-    { ignoreProviders, onlyProviders },
-  )
+  const chatId = new URL(page.url()).hash.match(/^#\/chat\/([^/?#]+)/)?.[1]
+  if (!chatId) throw new Error('missing active chat id')
+  await transformWorkspaceThroughUi(page, (backup) => {
+    const payload = backup.payload as { chats?: Array<Record<string, unknown>> } | undefined
+    const chat = payload?.chats?.find((row) => row.id === chatId)
+    if (!chat) throw new Error('active chat missing from workspace backup')
+    const settings = chat.settings as
+      | { privacy?: Record<string, unknown>; providerPrefs?: unknown }
+      | undefined
+    if (!settings?.privacy) throw new Error('missing chat settings')
+    settings.privacy = {
+      ...settings.privacy,
+      ignoreProviders,
+      onlyProviders,
+    }
+    delete settings.providerPrefs
+  })
 }
 
 async function mockOpenRouterDiscovery(

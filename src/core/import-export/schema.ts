@@ -3,7 +3,6 @@ import type {
   AttachmentArtifact,
   AttachmentJob,
   Chat,
-  ChatBranchCache,
   ChatFolder,
   ChatPreset,
   ChatSettings,
@@ -20,12 +19,17 @@ import type {
 import {
   assertPortableChatPresetRows,
   assertPortableChatRows,
+  assertPortableConnectionProfileRows,
   assertWorkspaceBackupRows,
 } from './row-validation'
 
-export const NATTER_EXPORT_SCHEMA_VERSION = 1
+export const NATTER_EXPORT_SCHEMA_VERSION = 2
 
-export type NatterExportObjectKind = 'workspace-backup' | 'chat' | 'chat-preset'
+export type NatterExportObjectKind =
+  | 'workspace-backup'
+  | 'chat'
+  | 'chat-preset'
+  | 'connection-profile'
 
 interface ExportSourceMeta {
   app: 'natter'
@@ -106,16 +110,51 @@ export interface PortableChatPresetPayload {
   connectionSketch?: ConnectionSketch
 }
 
+export interface PortableConnectionProfilePayload
+  extends Pick<
+    ConnectionProfile,
+    | 'name'
+    | 'kind'
+    | 'baseUrl'
+    | 'defaultHeaders'
+    | 'appTitle'
+    | 'appUrl'
+    | 'appCategories'
+    | 'supportsEndpointsApi'
+    | 'supportsGenerationApi'
+    | 'supportsPrivacyScrape'
+    | 'capabilityOverrides'
+    | 'debugRequests'
+  > {
+  sourceProfileId: ProfileId
+}
+
 interface WorkspaceSettingsRow {
   key: string
   value: unknown
 }
 
+interface LegacyChatBranchCache {
+  chatId: string
+  branchLeafId: string | null
+  generatedAt: number
+  textContent: string
+  previewText: string
+  messageCount: number
+  wordCount: number
+  messageTimestamps: Array<{
+    id: string
+    createdAt: number
+    editedAt: number
+  }>
+}
+
 export interface WorkspaceBackupPayload {
+  manifest?: WorkspaceBackupManifest
   chats: Chat[]
   messages: Message[]
   childLists: ChildListState[]
-  chatBranchCache: ChatBranchCache[]
+  chatBranchCache: LegacyChatBranchCache[]
   attachments: PortableAttachmentBundle[]
   profiles: ConnectionProfile[]
   presets: ChatPreset[]
@@ -127,10 +166,69 @@ export interface WorkspaceBackupPayload {
   settings: WorkspaceSettingsRow[]
 }
 
+export const WORKSPACE_BACKUP_TABLE_KEYS = [
+  'chats',
+  'messages',
+  'childLists',
+  'chatBranchCache',
+  'attachments',
+  'profiles',
+  'presets',
+  'promptPresets',
+  'folders',
+  'tags',
+  'drafts',
+  'keys',
+  'settings',
+] as const
+
+type WorkspaceBackupTableKey = (typeof WORKSPACE_BACKUP_TABLE_KEYS)[number]
+
+export interface WorkspaceBackupManifest {
+  version: 1
+  counts: Record<WorkspaceBackupTableKey, number>
+  attachmentBlobCount: number
+  attachmentBlobBytes: number
+}
+
+export function workspaceBackupManifest(
+  payload: Omit<WorkspaceBackupPayload, 'manifest'>,
+): WorkspaceBackupManifest {
+  let attachmentBlobCount = 0
+  let attachmentBlobBytes = 0
+  for (const bundle of payload.attachments) {
+    attachmentBlobCount += bundle.blobs.length
+    if (!Number.isSafeInteger(attachmentBlobCount)) {
+      throw new Error('ExportWorkspaceManifestBlobCountOverflow')
+    }
+    for (const blob of bundle.blobs) {
+      if (!Number.isSafeInteger(blob.sizeBytes) || blob.sizeBytes < 0) {
+        throw new Error(`ExportWorkspaceManifestBlobSizeInvalid:${blob.id}`)
+      }
+      attachmentBlobBytes += blob.sizeBytes
+      if (!Number.isSafeInteger(attachmentBlobBytes)) {
+        throw new Error('ExportWorkspaceManifestBlobBytesOverflow')
+      }
+    }
+  }
+  return {
+    version: 1,
+    counts: Object.fromEntries(
+      WORKSPACE_BACKUP_TABLE_KEYS.map((key) => [key, payload[key].length]),
+    ) as Record<WorkspaceBackupTableKey, number>,
+    attachmentBlobCount,
+    attachmentBlobBytes,
+  }
+}
+
 export type ChatExportEnvelope = NatterExportEnvelopeBase<'chat', PortableChatPayload>
 export type ChatPresetExportEnvelope = NatterExportEnvelopeBase<
   'chat-preset',
   PortableChatPresetPayload
+>
+export type ConnectionProfileExportEnvelope = NatterExportEnvelopeBase<
+  'connection-profile',
+  PortableConnectionProfilePayload
 >
 export type WorkspaceBackupEnvelope = NatterExportEnvelopeBase<
   'workspace-backup',
@@ -140,6 +238,7 @@ export type WorkspaceBackupEnvelope = NatterExportEnvelopeBase<
 export type NatterExportEnvelope =
   | ChatExportEnvelope
   | ChatPresetExportEnvelope
+  | ConnectionProfileExportEnvelope
   | WorkspaceBackupEnvelope
 
 export function assertNatterExportEnvelope(value: unknown): asserts value is NatterExportEnvelope {
@@ -150,6 +249,7 @@ export function assertNatterExportEnvelope(value: unknown): asserts value is Nat
   if (
     value.objectKind !== 'chat' &&
     value.objectKind !== 'chat-preset' &&
+    value.objectKind !== 'connection-profile' &&
     value.objectKind !== 'workspace-backup'
   ) {
     throw new Error(`ImportObjectKindUnsupported:${String(value.objectKind)}`)
@@ -166,6 +266,9 @@ export function assertNatterExportEnvelope(value: unknown): asserts value is Nat
   if (!isRecord(value.payload)) throw new Error('ImportEnvelopePayloadInvalid')
   if (value.objectKind === 'chat') assertChatPayload(value.payload)
   if (value.objectKind === 'chat-preset') assertChatPresetPayload(value.payload)
+  if (value.objectKind === 'connection-profile') {
+    assertPortableConnectionProfileRows(value.payload)
+  }
   if (value.objectKind === 'workspace-backup') assertWorkspaceBackupPayload(value.payload)
 }
 
@@ -216,7 +319,36 @@ function assertWorkspaceBackupPayload(value: unknown): asserts value is Workspac
   ] as const) {
     if (!Array.isArray(value[key])) throw new Error(`ImportWorkspaceMissingTable:${key}`)
   }
+  if (value.manifest !== undefined) assertWorkspaceBackupManifest(value.manifest)
   assertWorkspaceBackupRows(value)
+}
+
+function assertWorkspaceBackupManifest(value: unknown): asserts value is WorkspaceBackupManifest {
+  if (!isRecord(value) || value.version !== 1 || !isRecord(value.counts)) {
+    throw new Error('ImportWorkspaceManifestInvalid')
+  }
+  const countKeys = Object.keys(value.counts)
+  if (
+    countKeys.length !== WORKSPACE_BACKUP_TABLE_KEYS.length ||
+    countKeys.some((key) => !WORKSPACE_BACKUP_TABLE_KEYS.includes(key as WorkspaceBackupTableKey))
+  ) {
+    throw new Error('ImportWorkspaceManifestCountsInvalid')
+  }
+  for (const key of WORKSPACE_BACKUP_TABLE_KEYS) {
+    if (!isNonnegativeSafeInteger(value.counts[key])) {
+      throw new Error(`ImportWorkspaceManifestCountInvalid:${key}`)
+    }
+  }
+  if (!isNonnegativeSafeInteger(value.attachmentBlobCount)) {
+    throw new Error('ImportWorkspaceManifestBlobCountInvalid')
+  }
+  if (!isNonnegativeSafeInteger(value.attachmentBlobBytes)) {
+    throw new Error('ImportWorkspaceManifestBlobBytesInvalid')
+  }
+}
+
+function isNonnegativeSafeInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) >= 0
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

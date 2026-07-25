@@ -18,7 +18,8 @@ test('focus mode keeps an open chat settings panel visible', async ({ page }) =>
   await expect(shell).toHaveAttribute('data-chat-model-panel', 'open')
   await expect(page.locator('[data-ui="chat-model-panel"]')).toBeVisible()
 
-  await page.getByRole('button', { name: 'Enter reading mode' }).click()
+  const focusModeToggle = page.locator('[data-ui="focus-mode-toggle"]')
+  await focusModeToggle.click()
 
   await expect(shell).toHaveAttribute('data-focus-mode', 'on')
   await expect(shell).toHaveAttribute('data-chat-model-panel', 'open')
@@ -26,7 +27,7 @@ test('focus mode keeps an open chat settings panel visible', async ({ page }) =>
   await expect(page.locator('[data-ui="sidebar"]')).toBeHidden()
   await expect(page.getByRole('button', { name: 'Exit reading mode' })).toBeVisible()
 
-  await page.getByRole('button', { name: 'Exit reading mode' }).click()
+  await focusModeToggle.click()
 
   await expect(shell).toHaveAttribute('data-focus-mode', 'off')
   await expect(shell).toHaveAttribute('data-chat-model-panel', 'open')
@@ -35,7 +36,7 @@ test('focus mode keeps an open chat settings panel visible', async ({ page }) =>
 
 test('focus composer keeps auto-growing until the user resizes it', async ({ page }) => {
   await startChat(page)
-  await page.getByRole('button', { name: 'Enter reading mode' }).click()
+  await page.locator('[data-ui="focus-mode-toggle"]').click()
 
   const input = page.locator('[data-ui="composer-input"]')
   await expect(input).toHaveCSS('height', '200px')
@@ -59,6 +60,6 @@ async function startChat(page: Page): Promise<void> {
     textPrefix: 'focus layout message',
     title: 'Focus mode layout check',
   })
-  await page.goto(`/#/chat/${chatId}/message/msg-001`)
+  await page.goto(`/#/chat/${chatId}`)
   await expect(page.locator('[data-ui="message"][data-role="assistant"]')).toBeVisible()
 }

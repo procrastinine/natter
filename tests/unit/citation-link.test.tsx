@@ -1,14 +1,37 @@
 import { fireEvent, render, screen } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
+import type { ContentAnnotation } from '../../src/core/types'
 import { CitationLink } from '../../src/ui/chat/CitationLink'
+
+function urlCitation(): Extract<ContentAnnotation, { type: 'url_citation' }> {
+  return {
+    type: 'url_citation',
+    url: 'https://arxiv.org/abs/1234',
+    title: 'Paper',
+    startIndex: 0,
+    endIndex: 5,
+    source: 'openai-responses',
+    providerPayload: { type: 'url_citation', url: 'https://arxiv.org/abs/1234' },
+  }
+}
+
+function fileCitation(
+  file: Extract<ContentAnnotation, { type: 'file_citation' }>['file'],
+): Extract<ContentAnnotation, { type: 'file_citation' }> {
+  return {
+    type: 'file_citation',
+    file,
+    filename: 'evidence.txt',
+    startIndex: 0,
+    endIndex: 5,
+    source: 'openai-responses',
+    providerPayload: { type: 'file_citation' },
+  }
+}
 
 describe('CitationLink', () => {
   it('renders URL citations as external links with noopener', () => {
-    render(
-      <CitationLink kind="url" href="https://arxiv.org/abs/1234">
-        ref
-      </CitationLink>,
-    )
+    render(<CitationLink annotation={urlCitation()}>ref</CitationLink>)
     const anchor = screen.getByText('ref')
     expect(anchor.getAttribute('href')).toBe('https://arxiv.org/abs/1234')
     expect(anchor.getAttribute('target')).toBe('_blank')
@@ -16,22 +39,38 @@ describe('CitationLink', () => {
     expect(anchor.getAttribute('data-citation-kind')).toBe('url')
   })
 
-  it('renders file citations with a scroll-to-chunk handler', () => {
-    const onScrollToFile = vi.fn()
+  it('point-reads a local attachment only after click', () => {
+    const onOpenAttachment = vi.fn()
     render(
-      <CitationLink kind="file" fileRef="doc-123" chunkId="para-42" onScrollToFile={onScrollToFile}>
+      <CitationLink
+        annotation={fileCitation({ kind: 'attachment', attachmentId: 'attachment-123' })}
+        onOpenAttachment={onOpenAttachment}
+      >
         see source
       </CitationLink>,
     )
+    expect(onOpenAttachment).not.toHaveBeenCalled()
     fireEvent.click(screen.getByText('see source'))
-    expect(onScrollToFile).toHaveBeenCalledWith('doc-123', 'para-42')
-    const anchor = screen.getByText('see source')
-    expect(anchor.getAttribute('data-citation-kind')).toBe('file')
-    expect(anchor.getAttribute('href')).toBe('#file:doc-123@para-42')
+    expect(onOpenAttachment).toHaveBeenCalledWith('attachment-123')
+    expect(screen.getByText('see source').getAttribute('data-file-identity')).toBe('attachment')
   })
 
-  it('falls back to the fileRef label when no children are provided', () => {
-    render(<CitationLink kind="file" fileRef="doc-9" />)
-    expect(screen.getByText('doc-9')).toBeTruthy()
+  it('does not issue a bogus local lookup for a provider file id', () => {
+    const onOpenAttachment = vi.fn()
+    render(
+      <CitationLink
+        annotation={fileCitation({
+          kind: 'provider-file',
+          provider: 'openai-responses',
+          fileId: 'file-provider-only',
+        })}
+        onOpenAttachment={onOpenAttachment}
+      />,
+    )
+    const anchor = screen.getByText('evidence.txt')
+    fireEvent.click(anchor)
+    expect(onOpenAttachment).not.toHaveBeenCalled()
+    expect(anchor.getAttribute('aria-disabled')).toBe('true')
+    expect(anchor.getAttribute('data-file-identity')).toBe('provider-file')
   })
 })

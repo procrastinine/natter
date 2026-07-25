@@ -6,13 +6,23 @@
 // - `undefined` = "not in the domain"; `null` = "explicitly unset on the wire"
 // - Append-only for ids/turn metadata; content and a few mutable fields use LWW inside the chat lock
 
+import type {
+  OpaqueReasoningCarrierV2 as FrozenOpaqueReasoningCarrierV2,
+  OpaqueReasoningCarrierDescriptorV2 as FrozenOpaqueReasoningCarrierV2Descriptor,
+  ReasoningEnvelopeMutationV2 as FrozenReasoningEnvelopeMutationV2,
+  ReasoningEnvelopeV2Schema as FrozenReasoningEnvelopeV2,
+  ReasoningProducerBridgeV2 as FrozenReasoningProducerBridge,
+  ReasoningSourceRefV2 as FrozenReasoningSourceRefV2,
+  ReasoningVisiblePartV2 as FrozenReasoningVisiblePartV2,
+} from './generation-stream-events'
+
 // ---------------------------------------------------------------------------
 // Primitive IDs & enum-shaped literal unions
 // ---------------------------------------------------------------------------
 
 export type ChatId = string
 export type MessageId = string
-export type TurnId = string
+type TurnId = string
 export type AttachmentId = string
 type ToolDefinitionId = string
 export type KeyId = string
@@ -153,32 +163,168 @@ export type ReasoningFormat =
   | 'anthropic-claude-v1'
   | 'google-gemini-v1'
 
-export type ReasoningDetail =
+export type KnownReasoningFormat = Exclude<ReasoningFormat, 'unknown'>
+
+export type SealedReasoningCarryForward = 'none' | 'visible-only' | 'carrier'
+
+export type PersistedReasoningCarryForward = SealedReasoningCarryForward | 'unknown'
+
+export type ReasoningVisibleKind = 'text' | 'summary'
+
+export type InboundReasoningVisibility =
+  | Readonly<{
+      disclosure: 'visible'
+      visibleKind: ReasoningVisibleKind
+    }>
+  | Readonly<{
+      disclosure: 'absent'
+      unexpectedVisibleKind: ReasoningVisibleKind
+      reason: 'api-mode' | 'request-display' | 'provider-default' | 'disabled'
+    }>
+
+export type PersistedInboundReasoningVisibility =
+  | InboundReasoningVisibility
+  | Readonly<{ disclosure: 'unknown' }>
+
+export type ReasoningCarryForwardEvidence =
+  | {
+      readonly certainty: 'sealed'
+      readonly value: SealedReasoningCarryForward
+    }
+  | {
+      readonly certainty: 'opaque'
+      readonly possible: Exclude<SealedReasoningCarryForward, 'none'>
+    }
+
+type ReasoningDetailMetadata = {
+  id?: string
+  index?: number
+  hidden?: boolean
+  providerItemId?: string
+  providerOutputIndex?: number
+  providerSummaryIndex?: number
+}
+
+export type ReasoningDetail = (
   | {
       type: 'reasoning.text'
-      id?: string
-      index?: number
-      format?: ReasoningFormat
+      format: ReasoningFormat
       text?: string
-      signature?: string
-      hidden?: boolean
+      signature?: never
+    }
+  | {
+      type: 'reasoning.text'
+      format: ReasoningFormat
+      text?: string
+      signature: string
     }
   | {
       type: 'reasoning.summary'
-      id?: string
-      index?: number
-      format?: ReasoningFormat
+      format: ReasoningFormat
       summary: string
-      hidden?: boolean
     }
   | {
       type: 'reasoning.encrypted'
-      id?: string
-      index?: number
-      format?: ReasoningFormat
+      format: ReasoningFormat
       data: string
-      hidden?: boolean
     }
+) &
+  ReasoningDetailMetadata
+
+export type ReasoningOriginDialect =
+  | 'inline'
+  | 'openai-chat'
+  | 'openrouter-chat'
+  | 'openai-responses'
+  | 'openrouter-responses'
+  | 'anthropic-messages'
+  | 'gemini-native'
+  | 'unknown'
+
+export interface ReasoningSourceRef {
+  dialect: ReasoningOriginDialect
+  itemId?: string
+  detailId?: string
+  choiceIndex?: number
+  outputIndex?: number
+  contentIndex?: number
+  summaryIndex?: number
+  detailIndex?: number
+  detailOrdinal?: number
+  candidateIndex?: number
+  frameIndex?: number
+  partIndex?: number
+  blockIndex?: number
+}
+
+export interface ReasoningVisiblePart {
+  id: string
+  groupId: string
+  kind: 'text' | 'summary'
+  text: string
+  format: ReasoningFormat
+  source: ReasoningSourceRef
+  hidden?: boolean
+}
+
+interface OpaqueReasoningCarrierBase {
+  id: string
+  groupId: string
+  format: ReasoningFormat
+  source: ReasoningSourceRef
+  hidden?: boolean
+}
+
+export type OpaqueReasoningCarrier =
+  | (OpaqueReasoningCarrierBase & {
+      kind: 'responses-encrypted'
+      data: string
+    })
+  | (OpaqueReasoningCarrierBase & {
+      kind: 'anthropic-signature'
+      signature: string
+      bindsVisiblePartId: string
+    })
+  | (OpaqueReasoningCarrierBase & {
+      kind: 'anthropic-redacted'
+      data: string
+    })
+  | (OpaqueReasoningCarrierBase & {
+      kind: 'gemini-thought-signature'
+      data: string
+      bindsVisiblePartId?: string
+    })
+  | (OpaqueReasoningCarrierBase & {
+      kind: 'unknown'
+      data: string
+    })
+
+export type OpaqueReasoningCarrierDescriptor = OpaqueReasoningCarrier extends infer Carrier
+  ? Carrier extends OpaqueReasoningCarrier
+    ? Omit<Carrier, 'data' | 'signature'>
+    : never
+  : never
+
+export type ReasoningProducerBridge = FrozenReasoningProducerBridge
+export type ReasoningSourceRefV2 = FrozenReasoningSourceRefV2
+export type ReasoningVisiblePartV2 = FrozenReasoningVisiblePartV2
+export type OpaqueReasoningCarrierV2 = FrozenOpaqueReasoningCarrierV2
+export type OpaqueReasoningCarrierV2Descriptor = FrozenOpaqueReasoningCarrierV2Descriptor
+export type ReasoningEnvelopeV2 = FrozenReasoningEnvelopeV2
+export type ReasoningEnvelopeMutationV2 = FrozenReasoningEnvelopeMutationV2
+
+export type MessageAttemptOwner =
+  | Readonly<{ kind: 'generation' }>
+  | Readonly<{ kind: 'continuation'; streamId: string }>
+
+export type ReasoningMemberRef =
+  | { readonly owner: MessageAttemptOwner; readonly kind: 'visible'; readonly id: string }
+  | { readonly owner: MessageAttemptOwner; readonly kind: 'carrier'; readonly id: string }
+
+export interface ProviderOutputMemberRef {
+  readonly owner: MessageAttemptOwner
+  readonly itemIndex: number
+}
 
 // ---------------------------------------------------------------------------
 // Tools
@@ -221,13 +367,10 @@ export interface ToolDefinition {
   updatedAt: number
 }
 
-type OpenRouterServerToolId = 'web-search' | 'datetime' | 'web-fetch' | 'image-generation'
+export type OpenRouterServerToolId = 'web-search' | 'datetime' | 'web-fetch' | 'image-generation'
 export type OpenAiServerToolId = 'web-search' | 'image-generation' | 'code-interpreter' | 'shell'
 export type AnthropicServerToolId = 'web-search' | 'web-fetch' | 'code-execution' | 'advisor'
 export type GoogleServerToolId = 'google-search' | 'url-context' | 'code-execution' | 'google-maps'
-// Legacy alias for older call sites and persisted rows. New provider-specific
-// code should use the provider bucket's id type instead.
-export type ServerToolId = OpenRouterServerToolId
 
 interface ApproximateLocation {
   country?: string
@@ -450,8 +593,8 @@ export interface ChatSettings {
   fallbackModels?: string[]
   systemPrompt: string
   // Optional pin back to a PromptPreset (`kind: 'system'`). When set AND the
-  // preset still exists, the preset is the canonical source — edits to the
-  // preset propagate to `systemPrompt` via `prompt-presets.ts`. Editing the
+  // preset still exists, the preset is the canonical source — configuration
+  // commands propagate preset edits to `systemPrompt`. Editing the
   // text locally clears the pin; deleting the preset clears the pin but
   // preserves the last propagated text.
   systemPromptPresetId?: PromptPresetId
@@ -625,6 +768,25 @@ export interface DraftRow extends ChatDraft {
 
 export type ChatTitleStatus = 'untitled' | 'pending' | 'auto' | 'manual' | 'auto-failed'
 
+export interface ConfigurationRequestRevision {
+  profileId: ProfileId
+  requestRevision: number
+  key:
+    | { kind: 'missing' }
+    | {
+        kind: 'material'
+        keyId: KeyId
+        materialRevision: number
+      }
+}
+
+export interface PendingModelResolution {
+  intentId: string
+  target: ConfigurationRequestRevision
+  sourceModelId: string
+  expectedConfigurationVersion: number
+}
+
 export interface Chat {
   id: ChatId
   title: string
@@ -636,8 +798,11 @@ export interface Chat {
   totalCostUsd: number
   metaVersion: number
   summaryVersion: number
+  structuralVersion: number
+  configurationVersion?: number
   settings: ChatSettings
   presetId?: PresetId
+  modelResolution?: PendingModelResolution
   lastUpdatedLeafId: MessageId | null
   lastBranchUpdatedAt: number
   archived: boolean
@@ -739,32 +904,37 @@ export interface ChatTag {
   lastUsedAt?: number
 }
 
-export interface ChatBranchCache {
-  chatId: ChatId
-  branchLeafId: MessageId | null
-  generatedAt: number
-  textContent: string
-  previewText: string
-  messageCount: number
-  wordCount: number
-  messageTimestamps: Array<{
-    id: MessageId
-    createdAt: number
-    editedAt: number
-  }>
-}
-
 export interface ChildListState {
   id: string
   chatId: ChatId
   parentId: MessageId | null
   version: number
   updatedAt: number
+  liveCount: number
+  firstLiveChildId: MessageId | null
+  lastLiveChildId: MessageId | null
+  nextSiblingIndex: number
+}
+
+export interface ChildSlotMember {
+  id: MessageId
+  chatId: ChatId
+  parentId: MessageId | null
+  parentKey: string
+  position: number
+  previousMessageId: MessageId | null
+  nextMessageId: MessageId | null
 }
 
 // ---------------------------------------------------------------------------
 // Messages
 // ---------------------------------------------------------------------------
+
+type GeneratedOutputLocator =
+  | { attachmentId: AttachmentId; url?: never }
+  | { attachmentId?: never; url: string }
+
+type OptionalContentLocator = GeneratedOutputLocator | { attachmentId?: never; url?: never }
 
 export type ContentItem =
   | { type: 'text'; text: string; cacheControl?: CacheControl }
@@ -779,40 +949,71 @@ export type ContentItem =
       attachmentId?: AttachmentId
       format: 'wav' | 'mp3' | 'flac' | 'ogg' | 'm4a'
     }
-  | {
+  | ({
       type: 'file'
-      attachmentId?: AttachmentId
       filename: string
       mime: string
-      url?: string
-    }
+    } & OptionalContentLocator)
   | { type: 'video_url'; attachmentId?: AttachmentId; url?: string }
-  | { type: 'output_text'; text: string; annotations?: Annotation[] }
-  | {
+  | { type: 'output_text'; text: string; annotations?: ContentAnnotation[] }
+  | ({
       type: 'output_image'
-      attachmentId?: AttachmentId
-      url?: string
       prompt?: string
-    }
-  | {
+    } & GeneratedOutputLocator)
+  | ({
       type: 'audio_output'
-      attachmentId?: AttachmentId
-      url?: string
       transcript?: string
       durationMs?: number
       format?: 'wav' | 'mp3' | 'flac' | 'ogg' | 'm4a' | 'pcm16'
-    }
-  | {
+    } & OptionalContentLocator)
+  | ({
       type: 'output_video'
-      attachmentId?: AttachmentId
-      url?: string
       prompt?: string
-    }
+    } & GeneratedOutputLocator)
 
-interface Annotation {
-  type: 'url_citation' | 'file_citation'
-  [key: string]: unknown
+export type ContentAnnotationSource =
+  | 'openai-responses'
+  | 'openai-chat'
+  | 'anthropic-messages'
+  | 'gemini-native'
+  | 'imported'
+  | 'unknown'
+
+export type CitationFileIdentity =
+  | { kind: 'attachment'; attachmentId: AttachmentId }
+  | {
+      kind: 'provider-file'
+      provider: ContentAnnotationSource
+      fileId: string
+      containerId?: string
+    }
+  | { kind: 'document'; provider: ContentAnnotationSource; documentIndex: number }
+  | { kind: 'unresolved'; provider: ContentAnnotationSource }
+
+interface ContentAnnotationBase {
+  startIndex: number
+  endIndex: number
+  source: ContentAnnotationSource
+  providerPayload: Record<string, unknown>
 }
+
+export type ContentAnnotation =
+  | (ContentAnnotationBase & {
+      type: 'url_citation'
+      url: string
+      title?: string
+    })
+  | (ContentAnnotationBase & {
+      type: 'file_citation'
+      file: CitationFileIdentity
+      filename?: string
+      title?: string
+      citedText?: string
+    })
+  | (ContentAnnotationBase & {
+      type: 'unknown'
+      annotationType: string
+    })
 
 export interface MessageApproval {
   state: 'pending' | 'approved' | 'denied'
@@ -894,7 +1095,6 @@ export interface GenerationServerToolCall {
   status?: string
   outputIndex?: number
   requestCount?: number
-  output?: unknown
 }
 
 interface GenerationTokenCalibration {
@@ -917,6 +1117,7 @@ export type ProviderOutputDialect =
 export interface ProviderOutputItem {
   dialect: ProviderOutputDialect
   type: string
+  captureId?: string
   outputIndex?: number
   hidden?: boolean
   edited?: boolean
@@ -924,25 +1125,25 @@ export interface ProviderOutputItem {
 }
 
 export interface GenerationMeta {
-  id: string
-  model: string
-  requestedModel: string
+  id?: string
+  model?: string
+  requestedModel?: string
   requestedModels?: string[]
   provider?: string
-  apiUsed:
+  apiUsed?:
     | 'chat'
     | 'responses'
     | 'gemini-native'
     | 'anthropic-messages'
     | 'completion'
     | 'video-generation'
-  delivery: DeliveryMethod
-  status?: 'streaming' | 'done' | 'error' | 'abort' | 'interrupted'
+  delivery?: DeliveryMethod
+  status?: 'preparing' | 'streaming' | 'done' | 'error' | 'abort' | 'interrupted'
   integrity?: AttemptIntegrityState
   integritySummary?: AttemptIntegritySummary
   usage?: ChatUsage
   cost?: number
-  costSource: 'stream' | 'generation-endpoint' | 'estimated'
+  costSource?: 'stream' | 'generation-endpoint' | 'estimated'
   startedAt: number
   firstTextAt?: number
   reasoningStartedAt?: number
@@ -954,6 +1155,21 @@ export interface GenerationMeta {
   abortReason?: AbortReason
   serverTools?: GenerationServerToolCall[]
   tokenCalibration?: GenerationTokenCalibration
+  reasoningCarryForward: PersistedReasoningCarryForward
+  reasoningVisibility: PersistedInboundReasoningVisibility
+}
+
+export interface DispatchedGenerationMeta {
+  model: string
+  requestedModel: string
+  apiUsed: NonNullable<GenerationMeta['apiUsed']>
+  delivery: DeliveryMethod
+  status: 'streaming'
+  integrity: 'clean'
+  costSource: 'stream'
+  startedAt: number
+  reasoningCarryForward: PersistedReasoningCarryForward
+  reasoningVisibility: InboundReasoningVisibility
 }
 
 export type ContinuationStrategy = 'prompt' | 'prefill'
@@ -962,7 +1178,11 @@ export type ContinuationAttemptStrategy = ContinuationStrategy | 'unknown'
 
 export type ContinuationAttemptStatus = 'done' | 'error' | 'abort' | 'interrupted'
 
-export interface ContinuationAttempt {
+export type ContinuationAttemptApplication =
+  | Readonly<{ kind: 'applied' }>
+  | Readonly<{ kind: 'unapplied'; reason: 'base-version-changed' }>
+
+export interface ContinuationAttemptDraft {
   streamId: string
   strategy: ContinuationAttemptStrategy
   status: ContinuationAttemptStatus
@@ -985,12 +1205,23 @@ export interface ContinuationAttempt {
   nativeFinishReason?: string
   error?: PersistedAttemptFailure
   abortReason?: AbortReason
-  unappliedText?: string
-  reasoningDetails?: ReasoningDetail[]
+  reasoningEnvelope?: ReasoningEnvelopeV2
   toolCalls?: ToolCall[]
   phase?: MessagePhase
   providerOutputItems?: ProviderOutputItem[]
+  reasoningCarryForward: PersistedReasoningCarryForward
+  reasoningVisibility: PersistedInboundReasoningVisibility
 }
+
+export type ContinuationAttempt = ContinuationAttemptDraft &
+  (
+    | Readonly<{ application: Readonly<{ kind: 'applied' }> }>
+    | Readonly<{
+        application: Readonly<{ kind: 'unapplied'; reason: 'base-version-changed' }>
+        unappliedText?: string
+        unappliedAnnotations?: ContentAnnotation[]
+      }>
+  )
 
 // Minimal echo envelope for a Responses API output item. The full variant list
 // lives in transforms; this shape stays open so callers can round-trip unknown
@@ -1014,11 +1245,10 @@ export interface Message {
   origin: MessageOrigin
   generation?: GenerationMeta
   content: ContentItem[]
-  reasoningDetails?: ReasoningDetail[]
+  reasoningEnvelope?: ReasoningEnvelopeV2
   toolCalls?: ToolCall[]
   refusal?: string
   phase?: MessagePhase
-  responsesEchoItem?: ResponsesOutputItem
   providerOutputItems?: ProviderOutputItem[]
   continuationAttempts?: ContinuationAttempt[]
   attachmentRefs?: MessageAttachmentRef[]
@@ -1165,9 +1395,23 @@ interface AttachmentProcessingState {
   outputArtifactIds: string[]
 }
 
+export interface GeneratedOutputLocalizationTask {
+  kind: 'generated-output-localization-v1'
+  expectedSourceUrl: string
+  requestCredential?: {
+    profileId: ProfileId
+    selectedKeyId: KeyId
+  }
+}
+
 export interface AttachmentJob extends AttachmentProcessingState {
   id: string
   attachmentId: AttachmentId
+  task?: GeneratedOutputLocalizationTask
+  attemptCount?: number
+  nextAttemptAt?: number
+  leaseId?: string
+  leaseExpiresAt?: number
   updatedAt: number
 }
 
@@ -1211,6 +1455,8 @@ export interface AttachmentReferenceEdge {
   refId: string
   attachmentId: AttachmentId
   ordinal: number
+  includeInContext: boolean
+  refUpdatedAt: number
 }
 
 export interface Attachment {
@@ -1245,6 +1491,12 @@ export interface Attachment {
 // Connections, presets, keys
 // ---------------------------------------------------------------------------
 
+export type EndpointPrefillCapability =
+  | { kind: 'unsupported' }
+  | { kind: 'assistant-tail'; marker: 'none' | 'partial' | 'prefix' }
+  | { kind: 'native-model-tail' }
+  | { kind: 'text-prefix' }
+
 export interface CapabilityDescriptor {
   supportedParameters: string[]
   streaming: 'supported' | 'buffered-only' | 'unsupported'
@@ -1262,6 +1514,7 @@ export interface CapabilityDescriptor {
     inputModalities?: Array<'text' | 'image' | 'audio' | 'video' | 'file'>
     outputModalities?: Array<'text' | 'image' | 'audio' | 'video'>
   }
+  prefill?: EndpointPrefillCapability
 }
 
 type CapabilityOverride = Partial<CapabilityDescriptor>
@@ -1271,7 +1524,7 @@ export interface ConnectionProfile {
   name: string
   kind: ConnectionKind
   baseUrl: string
-  apiKeyRef: KeyId
+  apiKeyRef?: KeyId
   apiKeyFallbackRefs?: KeyId[]
   managementApiKeyRef?: KeyId
   defaultHeaders: Record<string, string>
@@ -1283,18 +1536,23 @@ export interface ConnectionProfile {
   supportsPrivacyScrape: boolean
   capabilityOverrides?: Record<string, CapabilityOverride>
   debugRequests?: boolean
+  requestRevision?: number
   createdAt: number
   updatedAt: number
   lastUsedAt?: number
   archived?: boolean
 }
 
+export type ConnectionHttpProfile = Pick<
+  ConnectionProfile,
+  'kind' | 'baseUrl' | 'defaultHeaders' | 'appTitle' | 'appUrl' | 'appCategories'
+>
+
 export interface ChatPreset {
   id: PresetId
   name: string
   connectionProfileId: ProfileId
   settings: ChatSettings
-  sortIndex: number
   createdAt: number
   updatedAt: number
   lastUsedAt?: number
@@ -1318,14 +1576,6 @@ export interface PromptPreset {
   lastUsedAt?: number
 }
 
-export interface PresetResolution {
-  profileId: ProfileId
-  presetSlug: string
-  resolvedModel: string
-  fetchedAt: number
-  sourceGenerationId?: string
-}
-
 export interface KeyRecord {
   id: KeyId
   name: string
@@ -1336,21 +1586,14 @@ export interface KeyRecord {
   kdf: { name: 'PBKDF2'; iterations: 200000; hash: 'SHA-256' }
   passphraseHint?: string
   obscuredPreview: string
+  materialRevision?: number
   createdAt: number
   lastUsedAt?: number
 }
 
-// ---------------------------------------------------------------------------
-// Branching / cursor
-// ---------------------------------------------------------------------------
-
-// Root key is `'__root__'` so `Record` lookup can represent "which child of the
-// virtual root is the active top-level message."
-export type CursorMap = Record<string, MessageId>
-export type CursorPatch = Record<string, MessageId | undefined>
-
 export type MutationScope =
   | { kind: 'chat-meta'; chatId: ChatId }
+  | { kind: 'chat-topology'; chatId: ChatId }
   | { kind: 'message'; messageId: MessageId }
   | { kind: 'children'; chatId: ChatId; parentId: MessageId | null }
   | { kind: 'draft'; chatId: ChatId }
@@ -1359,6 +1602,7 @@ export type MutationScope =
 export interface ChatVersions {
   metaVersion: number
   summaryVersion: number
+  structuralVersion: number
 }
 
 // ---------------------------------------------------------------------------
@@ -1394,6 +1638,38 @@ export interface ModelEndpoint {
     output_modalities?: string[]
     tokenizer?: string
   }
+}
+
+export interface ModelListEntry {
+  id: string
+  canonicalSlug?: string
+  name?: string
+  description?: string
+  created?: number
+  contextLength?: number
+  architecture?: {
+    inputModalities?: string[]
+    outputModalities?: string[]
+    tokenizer?: string
+  }
+  pricing?: Record<string, string | undefined>
+  topProvider?: Record<string, unknown>
+  perRequestLimits?: Record<string, unknown>
+  supportedParameters?: string[]
+  defaultParameters?: Record<string, number>
+  expirationDate?: string
+  knowledgeCutoff?: string
+  huggingFaceId?: string
+  links?: { details?: string }
+}
+
+export interface EndpointsDescriptor {
+  modelId: string
+  name?: string
+  description?: string
+  contextLength?: number
+  architecture?: ModelEndpoint['architecture']
+  endpoints: ModelEndpoint[]
 }
 
 export interface ModelsQuery {

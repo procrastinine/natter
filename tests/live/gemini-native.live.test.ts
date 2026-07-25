@@ -7,8 +7,19 @@ import { resolve } from 'node:path'
 import { beforeAll, describe, expect, it } from 'vitest'
 import { type GeminiContext, geminiOnce, geminiStream } from '../../src/api/gemini-native'
 import type { GeminiContent, GeminiPart } from '../../src/api/gemini-types'
-import { type StreamLaneEvent, splitGeminiStream } from '../../src/api/stream-transforms'
+import { splitGeminiStream as splitGeminiStreamWithContract } from '../../src/api/stream-transforms'
+import type { StreamLaneEvent } from '../../src/core/generation-stream-live-events'
+import { GOOGLE_PROVIDER_OUTPUT_CONTRACT } from '../../src/core/provider-tool-context'
 import type { ConnectionProfile } from '../../src/core/types'
+import { geminiReasoningContract } from '../helpers/reasoning-contracts'
+
+function splitGeminiStream(source: Parameters<typeof splitGeminiStreamWithContract>[0]) {
+  return splitGeminiStreamWithContract(
+    source,
+    geminiReasoningContract(),
+    GOOGLE_PROVIDER_OUTPUT_CONTRACT,
+  )
+}
 
 const LIVE = process.env.LIVE === '1'
 
@@ -117,12 +128,15 @@ describe.skipIf(!LIVE)('live — Gemini native generateContent', () => {
     // `stop` or `length` — either way, one encrypted lane event should fire.
     expect(['stop', 'length']).toContain(finishLane?.finishReason)
 
-    const encryptedLanes = lanes.filter(
-      (l): l is Extract<StreamLaneEvent, { lane: 'reasoning' }> =>
-        l.lane === 'reasoning' && l.encryptedDelta !== undefined,
-    )
-    expect(encryptedLanes.length).toBeGreaterThanOrEqual(1)
-    expect(encryptedLanes[encryptedLanes.length - 1]?.replaceEncrypted).toBe(true)
+    const carrierObservations = lanes
+      .filter((lane) => lane.lane === 'reasoning-observation')
+      .flatMap((lane) => lane.batch.observations)
+      .filter(
+        (observation) =>
+          observation.kind === 'carrier' && observation.carrierKind === 'gemini-thought-signature',
+      )
+    expect(carrierObservations.length).toBeGreaterThanOrEqual(1)
+    expect(carrierObservations.at(-1)).toMatchObject({ update: 'set' })
   }, 90_000)
 
   it('multi-turn: echoed thoughtSignature is accepted on next call', async () => {

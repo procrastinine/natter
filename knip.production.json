@@ -1,0 +1,5 @@
+{
+  "$schema": "./node_modules/knip/schema.json",
+  "entry": ["src/main.tsx"],
+  "ignoreFiles": ["scripts/**", "tests/**", "tools/**"]
+}

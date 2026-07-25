@@ -3,9 +3,20 @@
 // so the UI context gauge is safer to under-fill. `usage.*_tokens` in the response
 // is authoritative and always wins during reconciliation.
 
+import { createAppliedMessageView } from './continuation-content'
+import type {
+  AnthropicReasoningCompilation,
+  ChatReasoningCompilation,
+  GeminiReasoningCompilation,
+  OutboundReasoningCompilation,
+  OutboundReasoningResolver,
+  ResponsesReasoningCompilation,
+} from './outbound-reasoning'
 import {
-  providerOutputItemsIncludedInContext,
-  renderProviderOutputItemsAsText,
+  type AttemptProviderOutputContract,
+  estimateNativeProviderOutputCharacters,
+  projectProviderOutputForContext,
+  renderProviderOutputContextFallback,
 } from './provider-tool-context'
 import { clampTokens, safeContent, safeLen, safeServerTokens } from './token-guards'
 
@@ -76,17 +87,12 @@ export function estimateTokensByTokenizer(
 // Phase 11: reasoning-echo token accounting.
 // ---------------------------------------------------------------------------
 
-import { filterReasoningForInclude, normalizeReasoningDetails } from './reasoning'
-import type { Message, ReasoningFormat, ReasoningInclude } from './types'
+import type { Message } from './types'
 
 export interface PromptEstimateOptions {
   family: TokenizerFamily
-  reasoningInclude: ReasoningInclude
-  reasoningPreservationFormat?: ReasoningFormat
-  // When `true`, the server won't return reasoning on the *current* turn
-  // (so there's nothing to echo on the *next* one). Forces visible-summary
-  // / visible-text echo cost to 0 regardless of include flags.
-  reasoningExcluded: boolean
+  reasoningResolver: OutboundReasoningResolver
+  providerOutput: AttemptProviderOutputContract
   includeToolCalls?: boolean
 }
 
@@ -103,8 +109,6 @@ export interface PromptEstimateOptions {
 // The estimate NEVER double-counts: only `reasoningDetails[]` is iterated
 // (storage never carries the scalar `reasoning` field; it was suppressed
 // by the splitter's de-dup fix in commit 1390685).
-// `normalizeReasoningDetails` applies per-row provider relabeling without
-// guessing that overlap-looking persisted rows are duplicates.
 const SIGNATURE_TOKEN_GUARD = 16
 
 export function estimateReasoningEchoTokensForMessage(
@@ -112,68 +116,131 @@ export function estimateReasoningEchoTokensForMessage(
   opts: PromptEstimateOptions,
 ): number {
   if (message.role !== 'assistant') return 0
-  if (!message.reasoningDetails || message.reasoningDetails.length === 0) return 0
+  return estimateCompiledReasoningTokens(
+    opts.reasoningResolver.compilationFor(message),
+    opts.family,
+  )
+}
 
-  // Whole body wrapped: a corrupt rehydrated row with `reasoningDetails`
-  // items of unexpected shape would otherwise crash the gauge. A
-  // conservative 0 estimate is preferred over a UI-wide break.
-  try {
-    const normalized = normalizeReasoningDetails(message.reasoningDetails)
+export function estimateCompiledReasoningTokens(
+  compiled: OutboundReasoningCompilation,
+  family: TokenizerFamily,
+): number {
+  let total = compiled.inline ? estimateTokens(compiled.inline, family) : 0
+  switch (compiled.kind) {
+    case 'text':
+      return clampTokens(total)
+    case 'chat':
+      total += estimateCompiledChatAttempts(compiled, family)
+      break
+    case 'responses':
+      total += estimateCompiledResponsesAttempts(compiled, family)
+      break
+    case 'anthropic':
+      total += estimateCompiledAnthropicAttempts(compiled, family)
+      break
+    case 'gemini':
+      total += estimateCompiledGeminiAttempts(compiled, family)
+      break
+  }
+  return clampTokens(total)
+}
 
-    // Apply the include matrix: if the user excluded reasoning entirely on
-    // THIS turn, visible summary/text don't count (nothing was returned).
-    const includeForEcho: ReasoningInclude = opts.reasoningExcluded
-      ? { encrypted: opts.reasoningInclude.encrypted, summary: false, text: false }
-      : opts.reasoningInclude
-    const kept = filterReasoningForInclude(
-      normalized,
-      includeForEcho,
-      opts.reasoningPreservationFormat,
-    )
+function cappedAttemptCost(
+  opaque: number,
+  visible: number,
+  reportedReasoningTokens: number | undefined,
+): number {
+  const reported = safeServerTokens(reportedReasoningTokens)
+  return clampTokens(
+    (opaque > 0 && reported !== undefined ? Math.min(opaque, reported) : opaque) + visible,
+  )
+}
 
-    // When the assistant message has `reasoning_tokens` from the provider,
-    // that number is the authoritative upper bound for the round-trip cost
-    // of echoing the ENCRYPTED blob (OpenAI's encrypted_content, xAI's
-    // encrypted reasoning, Anthropic's signed text; all tokenize back at
-    // roughly the same count as they were emitted). Without it the
-    // estimator falls back to the conservative `data.length / 3` byte-cap
-    // estimate, which over-reports by ~1.8x for base64-ish blobs.
-    const providerReasoningTokens = safeServerTokens(
-      message.generation?.usage?.completion_tokens_details?.reasoning_tokens,
-    )
-
-    let encryptedCharCost = 0
-    let visibleCost = 0
-    for (const d of kept) {
-      if (d.type === 'reasoning.text') {
-        if (typeof d.text === 'string') {
-          if (typeof d.signature === 'string' && d.signature.length > 0) {
-            // Anthropic signed text is the encrypted carrier; count it as
-            // encrypted-like so the `reasoning_tokens` clamp applies.
-            encryptedCharCost += estimateTokens(d.text, opts.family) + SIGNATURE_TOKEN_GUARD
-          } else {
-            visibleCost += estimateTokens(d.text, opts.family)
-          }
+function estimateCompiledChatAttempts(
+  compiled: ChatReasoningCompilation,
+  family: TokenizerFamily,
+): number {
+  let total = 0
+  for (const attempt of compiled.attempts) {
+    let opaque = 0
+    let visible = 0
+    for (const detail of attempt.units) {
+      if (detail.type === 'reasoning.encrypted') {
+        opaque += clampTokens(Math.ceil(safeLen(detail.data) / 3))
+      } else if (detail.type === 'reasoning.summary') {
+        visible += estimateTokens(detail.summary, family)
+      } else if (typeof detail.text === 'string') {
+        if (typeof detail.signature === 'string' && detail.signature.length > 0) {
+          opaque += estimateTokens(detail.text, family) + SIGNATURE_TOKEN_GUARD
+        } else {
+          visible += estimateTokens(detail.text, family)
         }
-      } else if (d.type === 'reasoning.summary') {
-        visibleCost += estimateTokens(d.summary, opts.family)
-      } else {
-        // Cap raw byte-length contribution; a 10MB blob would otherwise
-        // balloon to ~3.3M tokens and poison both the gauge and budget math.
-        encryptedCharCost += clampTokens(Math.ceil(safeLen(d.data) / 3))
       }
     }
-
-    if (encryptedCharCost > 0 && providerReasoningTokens !== undefined) {
-      // Authoritative clamp: echoing encrypted reasoning costs AT MOST
-      // what the provider charged as reasoning_tokens on the original
-      // turn. Usually lands within a few percent of the true echo cost.
-      return clampTokens(Math.min(encryptedCharCost, providerReasoningTokens) + visibleCost)
-    }
-    return clampTokens(encryptedCharCost + visibleCost)
-  } catch {
-    return 0
+    total += cappedAttemptCost(opaque, visible, attempt.reportedReasoningTokens)
   }
+  return total
+}
+
+function estimateCompiledResponsesAttempts(
+  compiled: ResponsesReasoningCompilation,
+  family: TokenizerFamily,
+): number {
+  let total = 0
+  for (const attempt of compiled.attempts) {
+    let opaque = 0
+    let visible = 0
+    for (const unit of attempt.units) {
+      if (unit.encryptedContent) {
+        opaque += clampTokens(Math.ceil(safeLen(unit.encryptedContent) / 3))
+      }
+      for (const summary of unit.summaries) visible += estimateTokens(summary.text, family)
+    }
+    total += cappedAttemptCost(opaque, visible, attempt.reportedReasoningTokens)
+  }
+  return total
+}
+
+function estimateCompiledAnthropicAttempts(
+  compiled: AnthropicReasoningCompilation,
+  family: TokenizerFamily,
+): number {
+  let total = 0
+  for (const attempt of compiled.attempts) {
+    let opaque = 0
+    for (const unit of attempt.units) {
+      opaque +=
+        unit.kind === 'thinking-authenticated'
+          ? estimateTokens(unit.text, family) + SIGNATURE_TOKEN_GUARD
+          : clampTokens(Math.ceil(safeLen(unit.data) / 3))
+    }
+    total += cappedAttemptCost(opaque, 0, attempt.reportedReasoningTokens)
+  }
+  return total
+}
+
+function estimateCompiledGeminiAttempts(
+  compiled: GeminiReasoningCompilation,
+  family: TokenizerFamily,
+): number {
+  let total = 0
+  for (const attempt of compiled.attempts) {
+    let opaque = 0
+    let visible = 0
+    for (const unit of attempt.units) {
+      if (unit.kind === 'bound-thought') {
+        opaque += clampTokens(Math.ceil(safeLen(unit.signature) / 3))
+        visible += estimateTokens(unit.text, family)
+      } else if (unit.kind === 'unbound-signature') {
+        opaque += clampTokens(Math.ceil(safeLen(unit.signature) / 3))
+      } else {
+        visible += estimateTokens(unit.text, family)
+      }
+    }
+    total += cappedAttemptCost(opaque, visible, attempt.reportedReasoningTokens)
+  }
+  return total
 }
 
 export function estimateReasoningEchoTokens(
@@ -189,20 +256,34 @@ export function estimateReasoningEchoTokens(
 
 export function estimateToolCallContextTokensForMessage(
   message: Message,
-  opts: Pick<PromptEstimateOptions, 'family' | 'includeToolCalls'>,
+  opts: Pick<PromptEstimateOptions, 'family' | 'providerOutput' | 'includeToolCalls'>,
 ): number {
   if (message.role !== 'assistant') return 0
   if (opts.includeToolCalls !== true) return 0
-  const items = providerOutputItemsIncludedInContext(message, {
-    includeToolCalls: opts.includeToolCalls,
-  })
-  if (items.length === 0) return 0
-  return estimateTokens(renderProviderOutputItemsAsText(items), opts.family)
+  const projection = projectProviderOutputForContext(
+    createAppliedMessageView(message),
+    opts.providerOutput,
+    {
+      includeToolCalls: opts.includeToolCalls,
+    },
+  )
+  const fallback = renderProviderOutputContextFallback(projection)
+  const fallbackTokens = fallback ? estimateTokens(fallback, opts.family) : 0
+  const nativeCharacters = estimateNativeProviderOutputCharacters(projection)
+  const nativeTokens =
+    nativeCharacters > 0
+      ? clampTokens(
+          Math.ceil(
+            (nativeCharacters + projection.native.length * 8) / CHAR_PER_TOKEN[opts.family],
+          ),
+        )
+      : 0
+  return clampTokens(fallbackTokens + nativeTokens)
 }
 
 export function estimateToolCallContextTokens(
   messages: readonly Message[],
-  opts: Pick<PromptEstimateOptions, 'family' | 'includeToolCalls'>,
+  opts: Pick<PromptEstimateOptions, 'family' | 'providerOutput' | 'includeToolCalls'>,
 ): number {
   let total = 0
   for (const message of messages) total += estimateToolCallContextTokensForMessage(message, opts)

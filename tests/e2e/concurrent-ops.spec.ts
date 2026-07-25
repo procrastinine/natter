@@ -1,11 +1,14 @@
 import type { Route } from '@playwright/test'
-import { expect, type Page, test } from './fixtures'
+import { createChatUiJourneyProfile, expect, type Page, test } from './fixtures'
 import {
+  activeWorkspaceDatabaseName,
   buildSseBody,
   clearIndexedDb,
   createChatAndOpen,
   firstChatId,
+  holdIndexedDbStoreGate,
   mockChatCompletions,
+  readChatRow,
   readMessages,
   seedFirstRun,
   sendMessage,
@@ -25,6 +28,7 @@ test.beforeEach(async ({ page }) => {
 
 test('two tabs streaming different chats run in parallel without aborting each other', async ({
   page,
+  uiJourney,
 }) => {
   // Tab A: create chat #1, open a slow stream.
   await mockChatCompletions(page, {
@@ -33,6 +37,9 @@ test('two tabs streaming different chats run in parallel without aborting each o
   })
   await createChatAndOpen(page)
   await sendMessage(page, 'hello-A')
+  await expect(page).toHaveURL(/#\/chat\/[^/]+\/message\//u)
+  await uiJourney.start(page, createChatUiJourneyProfile(), 'parallel-tab-primary')
+  await uiJourney.intent(page, { kind: 'follow-bottom', id: 'parallel-tab-follow' })
 
   // Tab B — second page in the SAME browser context so IndexedDB is shared
   // (same-origin multi-tab behavior).
@@ -62,9 +69,10 @@ test('two tabs streaming different chats run in parallel without aborting each o
   ).toHaveText('tab-a-reply', { timeout: 5000 })
 
   // The shared IndexedDB contains at least two distinct chats.
-  const chatCount = await page.evaluate(async () => {
+  const databaseName = await activeWorkspaceDatabaseName(page)
+  const chatCount = await page.evaluate(async (databaseName) => {
     const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const req = indexedDB.open('natter')
+      const req = indexedDB.open(databaseName)
       req.onsuccess = () => resolve(req.result)
       req.onerror = () => reject(req.error)
     })
@@ -78,8 +86,9 @@ test('two tabs streaming different chats run in parallel without aborting each o
     } finally {
       db.close()
     }
-  })
+  }, databaseName)
   expect(chatCount).toBeGreaterThanOrEqual(2)
+  await uiJourney.checkpoint(page, 'parallel-streams-finished')
   await second.close()
 })
 
@@ -188,7 +197,7 @@ test('a send that leaves before its first receipt finishes exactly when returnin
       .toEqual({
         rowCount: 4,
         assistantId: expect.any(String),
-        assistantContent: [{ type: 'output_text', text: '' }],
+        assistantContent: [],
         generationStatus: 'streaming',
       })
     expect(backgroundAssistantId).not.toBe('')
@@ -328,16 +337,6 @@ test('a send that leaves before its first receipt finishes exactly when returnin
 })
 
 test.describe('same-leaf composer admission', () => {
-  test.use({
-    runtimeDiagnosticAllowances: [
-      {
-        category: 'console-other',
-        message: '^(?:send: pipeline threw|composer submit failed)',
-        detail: '\\bExpectedLeafChangedError: ExpectedLeafChanged:',
-      },
-    ],
-  })
-
   test('two tabs cannot turn simultaneous composer sends into an implicit branch', async ({
     page,
   }) => {
@@ -384,7 +383,7 @@ test.describe('same-leaf composer admission', () => {
       await second.route(completionRoute, routeCompletion)
       await page.locator('[data-ui="composer-input"]').fill('same-chat A')
       await second.locator('[data-ui="composer-input"]').fill('same-chat B')
-      const admissionLockName = `message:${baselineId}`
+      const admissionLockName = `chat-meta:${chatId}`
       await page.evaluate(
         (lockName) =>
           new Promise<void>((ready) => {
@@ -427,23 +426,32 @@ test.describe('same-leaf composer admission', () => {
       })
       await expect.poll(() => requestCount).toBe(1)
       await expect
-        .poll(async () => {
-          const values = [
-            await page.locator('[data-ui="composer-input"]').inputValue(),
-            await second.locator('[data-ui="composer-input"]').inputValue(),
-          ]
-          return values.filter((value) => value === 'same-chat A' || value === 'same-chat B').length
-        })
+        .poll(async () =>
+          Promise.all([
+            page.locator('[data-ui="composer-input"]').inputValue(),
+            second.locator('[data-ui="composer-input"]').inputValue(),
+          ]).then((values) => values.filter((value) => value === '').length),
+        )
         .toBe(1)
+      const composerValues = await Promise.all([
+        page.locator('[data-ui="composer-input"]').inputValue(),
+        second.locator('[data-ui="composer-input"]').inputValue(),
+      ])
+      expect(composerValues.filter((value) => value === '')).toHaveLength(1)
+      expect(
+        composerValues.filter((value) => value === 'same-chat A' || value === 'same-chat B'),
+      ).toHaveLength(1)
 
       releaseResponse()
-      const winningPage =
-        (await page.locator('[data-ui="composer-input"]').inputValue()) === '' ? page : second
+      const winningPage = composerValues[0] === '' ? page : second
+      const losingPage = composerValues[0] === '' ? second : page
+      const losingDraft = composerValues[0] === '' ? 'same-chat B' : 'same-chat A'
       await expect(
         winningPage
           .locator('[data-ui="message"][data-role="assistant"] [data-ui="message-body"]')
           .last(),
       ).toContainText('accepted answer')
+      await expect(losingPage.locator('[data-ui="composer-input"]')).toHaveValue(losingDraft)
 
       await expect
         .poll(async () => (await readMessages(page, chatId)).filter((row) => row.deleted !== true))
@@ -481,8 +489,145 @@ test.describe('same-leaf composer admission', () => {
   })
 })
 
+test('one Enter keeps its claimed branch while destination and a remote publication settle', async ({
+  page,
+  uiJourney,
+}) => {
+  const completionRoute = '**/api/v1/chat/completions'
+  await mockChatCompletions(page, {
+    body: buildSseBody([
+      { id: 'claimed-destination-baseline', content: 'first variant answer' },
+      { finish: 'stop' },
+    ]),
+  })
+  await createChatAndOpen(page)
+  await sendMessage(page, 'establish claimed destination')
+  const firstVariant = page.locator('[data-ui="message"][data-role="assistant"]').last()
+  await expect(firstVariant.locator('[data-ui="message-body"]')).toHaveText('first variant answer')
+  const chatId = await firstChatId(page)
+  const firstAssistantId = await firstVariant.getAttribute('data-message-id')
+  if (!firstAssistantId) throw new Error('first variant assistant has no id')
+
+  await page.unroute(completionRoute)
+  await mockChatCompletions(page, {
+    body: buildSseBody([
+      { id: 'claimed-destination-regenerate', content: 'second variant answer' },
+      { finish: 'stop' },
+    ]),
+  })
+  await firstVariant.locator('[data-action="regenerate"]').click()
+  const secondVariant = page
+    .locator('[data-ui="message"][data-role="assistant"]')
+    .filter({ hasText: 'second variant answer' })
+  await expect(secondVariant.locator('[data-ui="message-body"]')).toHaveText(
+    'second variant answer',
+  )
+  const secondAssistantId = await secondVariant.getAttribute('data-message-id')
+  if (!secondAssistantId) throw new Error('second variant assistant has no id')
+  await expect(secondVariant.locator('[data-ui="branch-count"]')).toHaveText('2 / 2')
+
+  const peer = await page.context().newPage()
+  let releaseMessages: () => Promise<void> = async () => undefined
+  try {
+    await peer.goto(`/#/chat/${chatId}/message/${secondAssistantId}`)
+    await expect(
+      peer.locator(`[data-ui="message"][data-message-id="${secondAssistantId}"]`),
+    ).toBeVisible()
+
+    await page.unroute(completionRoute)
+    let requestCount = 0
+    await page.route(completionRoute, async (route) => {
+      requestCount += 1
+      await route.fulfill({
+        status: 200,
+        contentType: 'text/event-stream',
+        body: buildSseBody([
+          { id: 'claimed-destination-send', content: 'claimed destination answer' },
+          { finish: 'stop' },
+        ]),
+      })
+    })
+    await uiJourney.start(
+      page,
+      createChatUiJourneyProfile({ activeSurfaceReady: false }),
+      'claimed-send-destination',
+    )
+    releaseMessages = await holdIndexedDbStoreGate(page, ['messages'])
+    const draft = 'send exactly once to the claimed branch'
+    const input = page.locator('[data-ui="composer-input"]')
+    await input.fill(draft)
+    await uiJourney.intent(page, {
+      kind: 'gesture',
+      id: 'claimed-destination-enter',
+      targetSelector: '[data-ui="composer-input"]',
+      eventType: 'keydown',
+      expectedDeliveries: 1,
+      expectedRoute: { kind: 'prefix', value: `/#/chat/${chatId}/message/` },
+    })
+    await page.evaluate((secondAssistantId) => {
+      const first = document.querySelector<HTMLAnchorElement>(
+        `[data-ui="message"][data-message-id="${secondAssistantId}"] [data-ui="branch-arrow"][data-role="first"]`,
+      )
+      const composer = document.querySelector<HTMLTextAreaElement>('[data-ui="composer-input"]')
+      if (!first || !composer) throw new Error('branch control or composer missing')
+      first.click()
+      composer.dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }),
+      )
+    }, secondAssistantId)
+
+    expect(requestCount).toBe(0)
+    await expect(input).toHaveValue(draft)
+    peer.once('dialog', (dialog) => dialog.accept('Remote during destination settle'))
+    await peer.getByLabel('New folder').click()
+    await expect(
+      page.locator('[data-ui="folder-section"]').filter({
+        hasText: 'Remote during destination settle',
+      }),
+    ).toBeVisible()
+    await expect(input).toHaveValue(draft)
+
+    await uiJourney.intent(page, {
+      kind: 'route',
+      id: 'claimed-destination-send-result',
+      expected: { kind: 'prefix', value: `/#/chat/${chatId}/message/` },
+    })
+    await releaseMessages()
+    await expect.poll(() => requestCount).toBe(1)
+    await expect(input).toHaveValue('')
+    await expect(
+      page
+        .locator('[data-ui="message"][data-role="assistant"]')
+        .filter({ hasText: 'claimed destination answer' }),
+    ).toBeVisible()
+
+    const rows = (await readMessages(page, chatId)).filter((row) => row.deleted !== true)
+    const submittedUsers = rows.filter(
+      (row) =>
+        row.role === 'user' &&
+        Array.isArray(row.content) &&
+        row.content.some(
+          (item) =>
+            typeof item === 'object' &&
+            item !== null &&
+            (item as { text?: unknown }).text === draft,
+        ),
+    )
+    expect(submittedUsers).toHaveLength(1)
+    expect(submittedUsers[0]?.parentId).toBe(firstAssistantId)
+    expect(
+      rows.filter((row) => row.role === 'assistant' && row.parentId === submittedUsers[0]?.id),
+    ).toHaveLength(1)
+    await uiJourney.checkpoint(page, 'claimed-send-destination-finished')
+  } finally {
+    await releaseMessages()
+    await peer.close()
+  }
+})
+
 test('a remote extension then newer sibling keeps each tab on its own branch without flashing', async ({
   page,
+  uiJourney,
 }) => {
   const completionRoute = '**/api/v1/chat/completions'
   await mockChatCompletions(page, {
@@ -499,6 +644,33 @@ test('a remote extension then newer sibling keeps each tab on its own branch wit
   const baselineId = await baseline.getAttribute('data-message-id')
   if (!baselineId) throw new Error('baseline assistant has no id')
   await page.unroute(completionRoute)
+  const composer = page.locator('[data-ui="composer-input"]')
+  await composer.fill('tab-local draft remains selected')
+  await composer.focus()
+  const journeyProfile = createChatUiJourneyProfile()
+  await uiJourney.start(
+    page,
+    {
+      ...journeyProfile,
+      semanticNodes: [
+        ...(journeyProfile.semanticNodes ?? []),
+        {
+          id: 'composer-draft',
+          selector: '[data-ui="composer-input"]',
+          properties: { value: { kind: 'stable' } },
+          resetOnRouteChange: false,
+        },
+      ],
+    },
+    'remote-conversation-locality',
+  )
+  await uiJourney.intent(page, {
+    kind: 'focus-continuity',
+    id: 'remote-conversation-focus',
+    selector: '[data-ui="composer-input"]',
+    preserveSelection: true,
+  })
+  await uiJourney.intent(page, { kind: 'follow-bottom', id: 'remote-conversation-scroll' })
 
   const first = page
   const second = await page.context().newPage()
@@ -526,11 +698,16 @@ test('a remote extension then newer sibling keeps each tab on its own branch wit
     if (!extensionId) throw new Error('extension assistant has no id')
     await expect(
       first.locator(`[data-ui="message"][data-message-id="${extensionId}"]`),
-    ).toBeVisible()
+    ).toHaveCount(0)
     await expect
       .poll(() => first.evaluate(() => window.location.hash))
-      .toBe(`#/chat/${chatId}/message/${extensionId}`)
-    await startMessageCountRecorder(first)
+      .toBe(`#/chat/${chatId}/message/${baselineId}`)
+    await expect(
+      first.locator(
+        `[data-ui="message"][data-message-id="${baselineId}"] [data-ui="branch-count"]`,
+      ),
+    ).toHaveCount(0)
+    await startMessageCountRecorder(first, { commonPrefixMessageIds: [baselineId] })
     await first.evaluate(() => {
       const win = window as typeof window & {
         __remoteTailSamples?: string[]
@@ -566,17 +743,36 @@ test('a remote extension then newer sibling keeps each tab on its own branch wit
     await expect(newerSibling.locator('[data-ui="message-body"]')).toHaveText(
       'newer sibling answer',
     )
+    await expect(
+      first.locator(
+        `[data-ui="chat-row-link"][href="#/chat/${chatId}"] [data-ui="chat-row-preview"]`,
+      ),
+    ).toContainText('tab-local baseline')
+    await expect
+      .poll(() => readChatRow(first, chatId))
+      .toMatchObject({
+        lastUpdatedLeafId: newerSiblingId,
+      })
 
-    const firstAccepted = first.locator(`[data-ui="message"][data-message-id="${extensionId}"]`)
     const secondAccepted = newerSibling
-    await expect(firstAccepted.locator('[data-ui="branch-count"]')).toHaveText('1 / 2')
     await expect(secondAccepted.locator('[data-ui="branch-count"]')).toHaveText('2 / 2')
+    await expect(
+      first.locator(`[data-ui="message"][data-message-id="${baselineId}"]`),
+    ).toBeVisible()
+    await expect(
+      first.locator(`[data-ui="message"][data-message-id="${extensionId}"]`),
+    ).toHaveCount(0)
     await expect(
       first.locator(`[data-ui="message"][data-message-id="${newerSiblingId}"]`),
     ).toHaveCount(0)
     await expect
       .poll(() => first.evaluate(() => window.location.hash))
-      .toBe(`#/chat/${chatId}/message/${extensionId}`)
+      .toBe(`#/chat/${chatId}/message/${baselineId}`)
+    await expect(
+      first.locator(
+        `[data-ui="message"][data-message-id="${baselineId}"] [data-ui="branch-count"]`,
+      ),
+    ).toHaveCount(0)
     await expect
       .poll(() => second.evaluate(() => window.location.hash))
       .toBe(`#/chat/${chatId}/message/${newerSiblingId}`)
@@ -588,15 +784,23 @@ test('a remote extension then newer sibling keeps each tab on its own branch wit
       win.__remoteTailObserver?.disconnect()
       return win.__remoteTailSamples ?? []
     })
-    expect(remoteTailSamples).toContain(extensionId)
+    expect(remoteTailSamples).toContain(baselineId)
+    expect(remoteTailSamples).not.toContain(extensionId)
     expect(remoteTailSamples).not.toContain(newerSiblingId)
     expect(await stopMessageCountRecorder(first)).toEqual({
       anchorRemoved: false,
       listRemoved: false,
       listReplaced: false,
       loadingSeen: false,
+      messageCountDecreased: false,
       messageCountsIncludeZero: false,
+      minimumMessageCount: expect.any(Number),
+      commonPrefixDisconnectedIds: [],
+      commonPrefixReplacedIds: [],
+      messageCountBelowExpectedCommonPrefix: false,
     })
+    await expect(composer).toHaveValue('tab-local draft remains selected')
+    await uiJourney.finish(page, 'remote-conversation-published')
   } finally {
     await second.close()
   }
@@ -726,35 +930,16 @@ test('bumping lastViewedAt on the active chat from tab B leaves the stream intac
   await createChatAndOpen(page)
   await sendMessage(page, 'view me')
   await expect(page.locator('[data-ui="abort"]')).toBeVisible()
-  // Chat row materializes on first send, so the lookup happens *after* sending.
   const chatId = await firstChatId(page)
 
-  // Simulate a peer tab bumping lastViewedAt via IDB while the stream is live.
-  await page.evaluate(async (id) => {
-    const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const req = indexedDB.open('natter')
-      req.onsuccess = () => resolve(req.result)
-      req.onerror = () => reject(req.error)
-    })
-    try {
-      await new Promise<void>((resolve, reject) => {
-        const tx = db.transaction('chats', 'readwrite')
-        const store = tx.objectStore('chats')
-        const getReq = store.get(id)
-        getReq.onsuccess = () => {
-          const row = getReq.result as Record<string, unknown>
-          row.lastViewedAt = Date.now()
-          store.put(row)
-        }
-        tx.oncomplete = () => resolve()
-        tx.onerror = () => reject(tx.error)
-      })
-    } finally {
-      db.close()
-    }
-  }, chatId)
+  const peer = await page.context().newPage()
+  try {
+    await peer.goto(`/#/chat/${chatId}`)
+    await expect(peer.locator('[data-ui="chat-title"]')).toBeVisible()
+  } finally {
+    await peer.close()
+  }
 
-  // Stream still completes and the assistant row finalises.
   await expect(
     page
       .locator('[data-ui="message"][data-role="assistant"]')
@@ -771,36 +956,19 @@ test('renaming the chat while streaming does not abort the stream', async ({ pag
   await createChatAndOpen(page)
   await sendMessage(page, 'keep streaming')
   await expect(page.locator('[data-ui="abort"]')).toBeVisible()
-  // Chat row materializes on first send, so the lookup happens *after* sending.
   const chatId = await firstChatId(page)
 
-  // Direct IDB title rename, emulating a peer-tab rename that lands before
-  // the stream finishes. (The full inline-title editor arrives in Phase 8.)
-  await page.evaluate(async (id) => {
-    const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const req = indexedDB.open('natter')
-      req.onsuccess = () => resolve(req.result)
-      req.onerror = () => reject(req.error)
-    })
-    try {
-      await new Promise<void>((resolve, reject) => {
-        const tx = db.transaction('chats', 'readwrite')
-        const store = tx.objectStore('chats')
-        const getReq = store.get(id)
-        getReq.onsuccess = () => {
-          const row = getReq.result as Record<string, unknown>
-          row.title = 'Renamed Mid-Stream'
-          store.put(row)
-        }
-        tx.oncomplete = () => resolve()
-        tx.onerror = () => reject(tx.error)
-      })
-    } finally {
-      db.close()
-    }
-  }, chatId)
+  const peer = await page.context().newPage()
+  try {
+    await peer.goto(`/#/chat/${chatId}`)
+    await peer.locator('[data-role="chat-title-edit"]').click()
+    await peer.locator('[data-ui="chat-title-editor"]').fill('Renamed Mid-Stream')
+    await peer.locator('[data-ui="chat-title-editor"]').press('Enter')
+    await expect(peer.locator('[data-ui="chat-title-label"]')).toHaveText('Renamed Mid-Stream')
+  } finally {
+    await peer.close()
+  }
 
-  // Assertion: the assistant row still completes with the streamed reply.
   await expect(
     page
       .locator('[data-ui="message"][data-role="assistant"]')

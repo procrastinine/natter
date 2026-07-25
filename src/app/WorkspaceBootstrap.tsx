@@ -8,28 +8,31 @@ import {
   useState,
 } from 'react'
 import { redactDiagnosticValue } from '../lib/diagnostic-redaction'
+import type {
+  BrowserWorkspaceOpenOptions,
+  BrowserWorkspaceOpenProgress,
+} from '../store/presentation-contracts'
+import { registerWorkspacePresentationRoot } from '../store/workspace-presentation-lifecycle'
 import { Button } from '../ui/primitives/Button'
 import { ConfirmDialog } from '../ui/primitives/ConfirmDialog'
 
-export interface WorkspaceOpenOptions {
-  onBlocked?: (event: IDBVersionChangeEvent) => void
-}
+export type WorkspaceOpenOptions = BrowserWorkspaceOpenOptions
 
 interface WorkspaceBootstrapProps {
   children: ReactNode
   openWorkspace: (options: WorkspaceOpenOptions) => Promise<unknown>
-  beforeRetry?: () => void
-  resetWorkspace?: () => Promise<void>
+  onReady?: () => void
+  resetWorkspace?: () => Promise<unknown>
   reload?: () => void
 }
 
 type OpenPhase =
-  | { kind: 'opening'; attempt: number }
+  | { kind: 'opening'; attempt: number; progress: BrowserWorkspaceOpenProgress }
   | { kind: 'blocked'; oldVersion: number; newVersion: number | null; occurredAt: string }
   | { kind: 'failed'; error: unknown; occurredAt: string }
   | { kind: 'ready' }
 
-type RecoveryCategory = 'quota' | 'version' | 'migration' | 'render' | 'general'
+type RecoveryCategory = 'quota' | 'version' | 'migration' | 'integrity' | 'render' | 'general'
 
 interface RecoveryViewProps {
   stage: 'database-open' | 'render'
@@ -38,18 +41,22 @@ interface RecoveryViewProps {
   occurredAt: string
   onRetry: () => void
   onReload: () => void
-  onReset?: () => Promise<void>
+  onReset?: () => Promise<unknown>
 }
 
 interface RootBoundaryProps {
   children: ReactNode
   reload: () => void
-  resetWorkspace?: () => Promise<void>
+  resetWorkspace?: () => Promise<unknown>
 }
 
 interface RootBoundaryState {
   error: unknown
   occurredAt: string | null
+}
+
+const INITIAL_OPEN_PROGRESS: BrowserWorkspaceOpenProgress = {
+  kind: 'storage-administration',
 }
 
 function nowIso(): string {
@@ -80,6 +87,7 @@ function recoveryCategory(stage: RecoveryViewProps['stage'], error: unknown): Re
   const names = errorNameChain(error)
   if (names.some((name) => name.includes('QuotaExceeded'))) return 'quota'
   if (names.some((name) => name.includes('VersionError'))) return 'version'
+  if (names.some((name) => name.includes('SchemaIntegrity'))) return 'integrity'
   if (names.some((name) => /Migration|Upgrade/u.test(name))) return 'migration'
   return 'general'
 }
@@ -104,6 +112,12 @@ function recoveryCopy(category: RecoveryCategory): { title: string; detail: stri
         detail:
           'The upgrade was rolled back without replacing the previous database. Retry, or export a backup from any tab that can still open it.',
       }
+    case 'integrity':
+      return {
+        title: 'The local workspace is incomplete',
+        detail:
+          'A required canonical database store is missing or has an incompatible primary key. Import a workspace backup if one is available, or reset local data to start a verified empty workspace.',
+      }
     case 'render':
       return {
         title: 'Natter could not render the workspace',
@@ -117,6 +131,59 @@ function recoveryCopy(category: RecoveryCategory): { title: string; detail: stri
           'Close other Natter tabs, check available browser storage, and try again. Reloading does not erase local data.',
       }
   }
+}
+
+function openingCopy(progress: BrowserWorkspaceOpenProgress): string {
+  switch (progress.kind) {
+    case 'storage-administration':
+      return 'Coordinating access to local browser storage.'
+    case 'database-selection':
+      return databaseSelectionOpeningCopy(progress)
+    case 'schema-preflight':
+      return `Inspecting the physical schema for ${progress.databaseName}.`
+    case 'database-open':
+      return `Opening ${progress.databaseName} at storage version ${progress.targetVersion}.`
+    case 'database-upgrade': {
+      const count =
+        progress.processedRows > 0
+          ? ` Processed ${progress.processedRows.toLocaleString()} rows (${progress.processedBytes.toLocaleString()} estimated bytes).`
+          : ''
+      return `Upgrading ${progress.databaseName}: ${progress.operation}.${count}`
+    }
+    case 'workspace-metadata':
+      return `Reading the workspace identity from ${progress.databaseName}.`
+    case 'runtime-resources':
+      return `Starting workspace capabilities: ${progress.operation}.`
+  }
+}
+
+function databaseSelectionOpeningCopy(
+  progress: Extract<BrowserWorkspaceOpenProgress, { kind: 'database-selection' }>,
+): string {
+  const databaseName = progress.databaseName ? ` (${progress.databaseName})` : ''
+  switch (progress.operation) {
+    case 'read-active-slot':
+      return 'Reading the active workspace database slot.'
+    case 'acquire-active-slot':
+      return `Opening the active workspace slot${databaseName}.`
+    case 'confirm-active-slot':
+      return `Confirming the active workspace slot${databaseName}.`
+    case 'retry-changed-slot':
+      return 'The active workspace changed during opening; following the committed slot.'
+  }
+}
+
+function openingDiagnosticsText(attempt: number, progress: BrowserWorkspaceOpenProgress): string {
+  return JSON.stringify(
+    redactDiagnosticValue({
+      stage: 'database-open',
+      attempt,
+      progress,
+      observedAt: nowIso(),
+    }),
+    null,
+    2,
+  )
 }
 
 function diagnosticsText({
@@ -301,96 +368,190 @@ class RootErrorBoundary extends Component<RootBoundaryProps, RootBoundaryState> 
 export function WorkspaceBootstrap({
   children,
   openWorkspace,
-  beforeRetry,
+  onReady,
   resetWorkspace,
   reload = () => window.location.reload(),
 }: WorkspaceBootstrapProps) {
   const [attempt, setAttempt] = useState(0)
-  const [phase, setPhase] = useState<OpenPhase>({ kind: 'opening', attempt: 0 })
-  const blockedHandlerRef = useRef<(event: IDBVersionChangeEvent) => void>(() => {})
+  const [phase, setPhase] = useState<OpenPhase>({
+    kind: 'opening',
+    attempt: 0,
+    progress: INITIAL_OPEN_PROGRESS,
+  })
+  const [presentationSuspensionGeneration, setPresentationSuspensionGeneration] = useState<
+    number | null
+  >(null)
+  const presentationSuspensionAckRef = useRef<{
+    readonly generation: number
+    readonly resolve: () => void
+  } | null>(null)
+  const currentAttemptRef = useRef(0)
+  const readyNotifiedAttemptRef = useRef<number | null>(null)
   const openAttemptRef = useRef<{
     attempt: number
     opener: WorkspaceBootstrapProps['openWorkspace']
     promise: Promise<unknown>
+    blocked: { oldVersion: number; newVersion: number | null } | null
+    progress: BrowserWorkspaceOpenProgress
+    blockedListeners: Set<(blocked: { oldVersion: number; newVersion: number | null }) => void>
+    progressListeners: Set<(progress: BrowserWorkspaceOpenProgress) => void>
   } | null>(null)
 
+  useEffect(
+    () =>
+      registerWorkspacePresentationRoot(
+        ({ generation }) =>
+          new Promise<void>((resolve) => {
+            presentationSuspensionAckRef.current = { generation, resolve }
+            setPresentationSuspensionGeneration(generation)
+          }),
+      ),
+    [],
+  )
+
   useEffect(() => {
+    if (presentationSuspensionGeneration === null) return
+    const pendingAck = presentationSuspensionAckRef.current
+    if (!pendingAck || pendingAck.generation !== presentationSuspensionGeneration) return
+    presentationSuspensionAckRef.current = null
+    pendingAck.resolve()
+  }, [presentationSuspensionGeneration])
+
+  useEffect(() => {
+    if (phase.kind !== 'ready' || readyNotifiedAttemptRef.current === attempt) return
+    readyNotifiedAttemptRef.current = attempt
+    onReady?.()
+  }, [attempt, onReady, phase.kind])
+
+  useEffect(() => {
+    if (attempt !== currentAttemptRef.current) return
     let active = true
-    setPhase({ kind: 'opening', attempt })
-    const handleBlocked = (event: IDBVersionChangeEvent) => {
+    const handleBlocked = (blocked: { oldVersion: number; newVersion: number | null }) => {
       if (!active) return
       setPhase({
         kind: 'blocked',
-        oldVersion: event.oldVersion,
-        newVersion: event.newVersion,
+        oldVersion: blocked.oldVersion,
+        newVersion: blocked.newVersion,
         occurredAt: nowIso(),
       })
     }
-    blockedHandlerRef.current = handleBlocked
+    const handleProgress = (progress: BrowserWorkspaceOpenProgress) => {
+      if (!active) return
+      setPhase({ kind: 'opening', attempt, progress })
+    }
     let openAttempt = openAttemptRef.current
     if (!openAttempt || openAttempt.attempt !== attempt || openAttempt.opener !== openWorkspace) {
+      const blockedListeners = new Set<
+        (blocked: { oldVersion: number; newVersion: number | null }) => void
+      >()
+      const progressListeners = new Set<(progress: BrowserWorkspaceOpenProgress) => void>()
       openAttempt = {
         attempt,
         opener: openWorkspace,
+        blocked: null,
+        progress: INITIAL_OPEN_PROGRESS,
+        blockedListeners,
+        progressListeners,
         promise: Promise.resolve().then(() =>
           openWorkspace({
-            onBlocked: (event) => blockedHandlerRef.current(event),
+            onBlocked: (event) => {
+              if (currentAttemptRef.current !== attempt) return
+              const current = openAttemptRef.current
+              if (!current || current.attempt !== attempt || current.opener !== openWorkspace)
+                return
+              current.blocked = { oldVersion: event.oldVersion, newVersion: event.newVersion }
+              for (const listener of [...current.blockedListeners]) listener(current.blocked)
+            },
+            onProgress: (progress) => {
+              if (currentAttemptRef.current !== attempt) return
+              const current = openAttemptRef.current
+              if (!current || current.attempt !== attempt || current.opener !== openWorkspace)
+                return
+              current.progress = progress
+              for (const listener of [...current.progressListeners]) listener(progress)
+            },
           }),
         ),
       }
       openAttemptRef.current = openAttempt
     }
+    openAttempt.blockedListeners.add(handleBlocked)
+    openAttempt.progressListeners.add(handleProgress)
+    handleProgress(openAttempt.progress)
+    if (openAttempt.blocked) handleBlocked(openAttempt.blocked)
     void openAttempt.promise.then(
       () => {
-        if (active) setPhase({ kind: 'ready' })
+        if (active && currentAttemptRef.current === attempt) setPhase({ kind: 'ready' })
       },
       (error: unknown) => {
-        if (active) setPhase({ kind: 'failed', error, occurredAt: nowIso() })
+        if (active && currentAttemptRef.current === attempt) {
+          setPhase({ kind: 'failed', error, occurredAt: nowIso() })
+        }
       },
     )
     return () => {
       active = false
-      if (blockedHandlerRef.current === handleBlocked) blockedHandlerRef.current = () => {}
+      openAttempt.blockedListeners.delete(handleBlocked)
+      openAttempt.progressListeners.delete(handleProgress)
     }
   }, [attempt, openWorkspace])
 
   const retryOpen = () => {
-    beforeRetry?.()
-    setAttempt((current) => current + 1)
+    const nextAttempt = currentAttemptRef.current + 1
+    currentAttemptRef.current = nextAttempt
+    setPhase({ kind: 'opening', attempt: nextAttempt, progress: INITIAL_OPEN_PROGRESS })
+    setAttempt(nextAttempt)
   }
 
-  if (phase.kind === 'ready') {
+  if (presentationSuspensionGeneration !== null) {
     return (
-      <RootErrorBoundary reload={reload} {...(resetWorkspace ? { resetWorkspace } : {})}>
-        {children}
-      </RootErrorBoundary>
-    )
-  }
-
-  if (phase.kind === 'opening') {
-    return (
-      <main data-ui="workspace-bootstrap" data-state="opening">
+      <main data-ui="workspace-bootstrap" data-state="suspending">
         <section data-ui="workspace-bootstrap-card" role="status" aria-live="polite">
-          <span data-ui="workspace-bootstrap-kicker">Natter</span>
-          <h1>Opening local workspace…</h1>
-          <p>Applying any required database upgrades before loading chats.</p>
+          <span data-ui="workspace-bootstrap-kicker">Local workspace</span>
+          <h1>Closing local workspace…</h1>
+          <p>Finishing active views before local storage is replaced.</p>
         </section>
       </main>
     )
   }
 
   return (
-    <RecoveryView
-      stage="database-open"
-      {...(phase.kind === 'blocked'
-        ? {
-            blocked: { oldVersion: phase.oldVersion, newVersion: phase.newVersion },
-            occurredAt: phase.occurredAt,
-          }
-        : { error: phase.error, occurredAt: phase.occurredAt })}
-      onRetry={retryOpen}
-      onReload={reload}
-      {...(resetWorkspace ? { onReset: resetWorkspace } : {})}
-    />
+    <RootErrorBoundary reload={reload} {...(resetWorkspace ? { resetWorkspace } : {})}>
+      {children}
+      {phase.kind === 'opening' ? (
+        <main
+          data-ui="workspace-bootstrap"
+          data-state="opening"
+          data-presentation="nonblocking"
+          data-open-stage={phase.progress.kind}
+          data-open-operation={'operation' in phase.progress ? phase.progress.operation : undefined}
+        >
+          <section data-ui="workspace-bootstrap-card" role="status" aria-live="polite">
+            <span data-ui="workspace-bootstrap-kicker">Natter</span>
+            <h1>Opening local workspace…</h1>
+            <p>{openingCopy(phase.progress)}</p>
+            <details data-ui="workspace-bootstrap-opening-diagnostics">
+              <summary>Opening diagnostics</summary>
+              <section aria-label="Opening diagnostics">
+                <pre>{openingDiagnosticsText(phase.attempt, phase.progress)}</pre>
+              </section>
+            </details>
+          </section>
+        </main>
+      ) : phase.kind === 'ready' ? null : (
+        <RecoveryView
+          stage="database-open"
+          {...(phase.kind === 'blocked'
+            ? {
+                blocked: { oldVersion: phase.oldVersion, newVersion: phase.newVersion },
+                occurredAt: phase.occurredAt,
+              }
+            : { error: phase.error, occurredAt: phase.occurredAt })}
+          onRetry={retryOpen}
+          onReload={reload}
+          {...(resetWorkspace ? { onReset: resetWorkspace } : {})}
+        />
+      )}
+    </RootErrorBoundary>
   )
 }

@@ -1,3 +1,5 @@
+import { isReasoningFormat } from '../core/reasoning'
+import type { ReasoningDetail, ReasoningFormat } from '../core/types'
 import type { AnthropicEventWire, AnthropicMessagesResultWire } from './anthropic-types'
 import type { GeminiPart, GenerateContentResponseWire } from './gemini-types'
 import type {
@@ -12,6 +14,29 @@ import type {
 export type ProviderJsonValidation<T> = { ok: true; value: T } | { ok: false; issue: string }
 
 type JsonRecord = Record<string, unknown>
+
+function normalizeEventType(
+  value: JsonRecord,
+  sseEventType?: string,
+): ProviderJsonValidation<string> {
+  const inlineType = value.type
+  if (inlineType !== undefined && typeof inlineType !== 'string') {
+    return invalid('event-type-not-string')
+  }
+  const type = typeof inlineType === 'string' ? inlineType : sseEventType
+  if (typeof type !== 'string' || type.length === 0 || type === 'message') {
+    return invalid('event-type-missing')
+  }
+  if (
+    typeof inlineType === 'string' &&
+    isSpecificSseEventType(sseEventType) &&
+    inlineType !== sseEventType
+  ) {
+    return invalid('event-type-mismatch')
+  }
+  value.type = type
+  return valid(type)
+}
 
 export function validateChatCompletionChunk(
   value: unknown,
@@ -60,22 +85,9 @@ export function validateResponsesEvent(
   sseEventType?: string,
 ): ProviderJsonValidation<ResponsesEventWire> {
   if (!isRecord(value)) return invalid('frame-not-object')
-  const inlineType = value.type
-  if (inlineType !== undefined && typeof inlineType !== 'string') {
-    return invalid('event-type-not-string')
-  }
-  const type = typeof inlineType === 'string' ? inlineType : sseEventType
-  if (typeof type !== 'string' || type.length === 0 || type === 'message') {
-    return invalid('event-type-missing')
-  }
-  if (
-    typeof inlineType === 'string' &&
-    isSpecificSseEventType(sseEventType) &&
-    inlineType !== sseEventType
-  ) {
-    return invalid('event-type-mismatch')
-  }
-  value.type = type
+  const normalized = normalizeEventType(value, sseEventType)
+  if (!normalized.ok) return normalized
+  const type = normalized.value
 
   switch (type) {
     case 'response.created':
@@ -168,22 +180,9 @@ export function validateAnthropicEvent(
   sseEventType?: string,
 ): ProviderJsonValidation<AnthropicEventWire> {
   if (!isRecord(value)) return invalid('frame-not-object')
-  const inlineType = value.type
-  if (inlineType !== undefined && typeof inlineType !== 'string') {
-    return invalid('event-type-not-string')
-  }
-  const type = typeof inlineType === 'string' ? inlineType : sseEventType
-  if (typeof type !== 'string' || type.length === 0 || type === 'message') {
-    return invalid('event-type-missing')
-  }
-  if (
-    typeof inlineType === 'string' &&
-    isSpecificSseEventType(sseEventType) &&
-    inlineType !== sseEventType
-  ) {
-    return invalid('event-type-mismatch')
-  }
-  value.type = type
+  const normalized = normalizeEventType(value, sseEventType)
+  if (!normalized.ok) return normalized
+  const type = normalized.value
 
   switch (type) {
     case 'message_start':
@@ -330,6 +329,117 @@ function chatContentIssue(value: JsonRecord): string | null {
     return 'tool-call-invalid'
   }
   return null
+}
+
+export function decodeProviderReasoningDetails(
+  value: readonly unknown[],
+  targetFormat: Exclude<ReasoningFormat, 'unknown'> | null,
+): { readonly details: ReasoningDetail[]; readonly issues: readonly string[] } {
+  const details: ReasoningDetail[] = []
+  const issues: string[] = []
+  for (const [index, raw] of value.entries()) {
+    const issue = providerReasoningDetailIssue(raw)
+    if (issue) {
+      issues.push(`${index}:${issue}`)
+      continue
+    }
+    if (
+      typeof (raw as JsonRecord).format === 'string' &&
+      !isReasoningFormat((raw as JsonRecord).format)
+    ) {
+      issues.push(`${index}:reasoning-detail-format-unknown`)
+    }
+    details.push(
+      normalizeIncomingReasoningDetail(
+        canonicalProviderReasoningDetail(raw as JsonRecord, targetFormat),
+        targetFormat,
+      ),
+    )
+  }
+  return { details, issues }
+}
+
+function normalizeIncomingReasoningDetail(
+  detail: ReasoningDetail,
+  targetFormat: Exclude<ReasoningFormat, 'unknown'> | null,
+): ReasoningDetail {
+  const rawFormat = (detail as { format?: unknown }).format
+  const format = isReasoningFormat(rawFormat) ? rawFormat : (targetFormat ?? 'unknown')
+  const stamped = rawFormat === format ? detail : { ...detail, format }
+  if (
+    stamped.type === 'reasoning.text' &&
+    stamped.format === 'google-gemini-v1' &&
+    !stamped.signature
+  ) {
+    const { text, ...rest } = stamped
+    return { ...rest, type: 'reasoning.summary', summary: text ?? '' }
+  }
+  return stamped
+}
+
+function providerReasoningDetailIssue(raw: unknown): string | null {
+  if (!isRecord(raw)) return 'reasoning-detail-not-object'
+  if (!isOptionalString(raw.id)) return 'reasoning-detail-id-not-string'
+  if (!isOptionalNumber(raw.index)) return 'reasoning-detail-index-not-number'
+  if (!isOptionalString(raw.format)) return 'reasoning-detail-format-invalid'
+  if (raw.hidden !== undefined && typeof raw.hidden !== 'boolean') {
+    return 'reasoning-detail-hidden-not-boolean'
+  }
+  if (raw.type === 'reasoning.text') {
+    return !isOptionalString(raw.text) || !isOptionalString(raw.signature)
+      ? 'reasoning-text-invalid'
+      : null
+  }
+  if (raw.type === 'reasoning.summary') {
+    return typeof raw.summary !== 'string' ? 'reasoning-summary-invalid' : null
+  }
+  if (raw.type === 'reasoning.encrypted') {
+    return typeof raw.data !== 'string' ? 'reasoning-encrypted-invalid' : null
+  }
+  return 'reasoning-detail-type-invalid'
+}
+
+function canonicalProviderReasoningDetail(
+  raw: JsonRecord,
+  targetFormat: Exclude<ReasoningFormat, 'unknown'> | null,
+): ReasoningDetail {
+  const format = isReasoningFormat(raw.format)
+    ? raw.format
+    : raw.format === undefined
+      ? (targetFormat ?? 'unknown')
+      : 'unknown'
+  const responseItemId =
+    typeof raw.id === 'string' &&
+    (format === 'openai-responses-v1' ||
+      format === 'azure-openai-responses-v1' ||
+      format === 'xai-responses-v1')
+      ? raw.id
+      : undefined
+  const metadata = {
+    ...(typeof raw.id === 'string' ? { id: raw.id } : {}),
+    ...(responseItemId ? { providerItemId: responseItemId } : {}),
+    ...(typeof raw.index === 'number' ? { index: raw.index } : {}),
+    ...(typeof raw.hidden === 'boolean' ? { hidden: raw.hidden } : {}),
+  }
+  if (raw.type === 'reasoning.encrypted') {
+    return { ...metadata, type: raw.type, format, data: raw.data as string }
+  }
+  if (raw.type === 'reasoning.summary') {
+    return {
+      ...metadata,
+      type: raw.type,
+      format,
+      summary: raw.summary as string,
+    }
+  }
+  const signature = typeof raw.signature === 'string' ? raw.signature : undefined
+  return {
+    ...metadata,
+    type: 'reasoning.text',
+    format,
+    ...(signature ? { signature } : {}),
+    ...(typeof raw.text === 'string' ? { text: raw.text } : {}),
+  }
 }
 
 function isChatToolCall(value: unknown): boolean {

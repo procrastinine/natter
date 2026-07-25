@@ -1,19 +1,10 @@
 // Default values for the core domain. Frozen to guard against accidental mutation
 // via shared references, since every new chat / preset copies from these.
 import { DEFAULT_CONTINUE_SYSTEM_PROMPT, DEFAULT_CONTINUE_USER_PROMPT } from './continue-prompts'
+import { LATEST_OPENROUTER_MODEL_IDS } from './latest-models'
 import type { ChatSettings, DataPolicy, PrivacyPrefs } from './types'
 
-// First-run seed: ordered candidate model list consumed by `resolveDefaultModel`
-// when creating the seed ChatPreset for a new ConnectionProfile. This
-// pure-data default keeps the list out of fetch and resolution code.
-export const SEED_DEFAULT_MODEL_CANDIDATES: readonly string[] = Object.freeze([
-  'anthropic/claude-opus-4.7',
-  'openai/gpt-5.4',
-  'google/gemini-3.1-pro',
-  'z-ai/glm-5.1',
-])
-
-export const DEFAULT_PRIVACY_PREFS: Readonly<PrivacyPrefs> = Object.freeze({
+const DEFAULT_PRIVACY_PREFS: Readonly<PrivacyPrefs> = Object.freeze({
   denyDataCollection: true,
   zdrOnly: false,
   paretoFilter: true,
@@ -31,7 +22,7 @@ export const UNKNOWN_POLICY: Readonly<DataPolicy> = Object.freeze({
   privacyPolicyURL: '',
 })
 
-export const DEFAULT_CHAT_SETTINGS: Readonly<ChatSettings> = Object.freeze({
+const DEFAULT_CHAT_SETTINGS: Readonly<ChatSettings> = Object.freeze({
   profileId: '',
   model: '',
   systemPrompt: '',
@@ -104,16 +95,6 @@ export function cloneDefaultChatSettings(): ChatSettings {
   return structuredClone(DEFAULT_CHAT_SETTINGS)
 }
 
-export function cloneDefaultPrivacyPrefs(): PrivacyPrefs {
-  return structuredClone(DEFAULT_PRIVACY_PREFS)
-}
-
-// Pick a default model for a brand-new ConnectionProfile's seed preset.
-// §14.35.8: walk the candidate list in order, returning the first model
-// exposed by `/models` whose `expiration_date` (if any) is at least 60 days
-// out. If none match, fall back to the first tool-capable model; finally, the
-// first model the endpoint advertised at all. Phase 5 callers pass
-// `availableModels` from the live `/models` response; tests supply fixtures.
 interface ModelCandidate {
   id: string
   expirationDate?: string
@@ -128,19 +109,18 @@ export function resolveDefaultModel(
 ): string {
   const now = opts.now ?? Date.now()
   const byId = new Map<string, ModelCandidate>()
-  for (const m of availableModels) byId.set(m.id, m)
-  const freshEnough = (m: ModelCandidate): boolean => {
-    if (!m.expirationDate) return true
-    const parsed = Date.parse(m.expirationDate)
-    if (Number.isNaN(parsed)) return true
-    return parsed - now >= SIXTY_DAYS_MS
+  for (const model of availableModels) byId.set(model.id, model)
+  const freshEnough = (model: ModelCandidate): boolean => {
+    if (!model.expirationDate) return true
+    const expiration = Date.parse(model.expirationDate)
+    return Number.isNaN(expiration) || expiration - now >= SIXTY_DAYS_MS
   }
-  for (const candidate of SEED_DEFAULT_MODEL_CANDIDATES) {
-    const match = byId.get(candidate)
-    if (match && freshEnough(match)) return match.id
+  for (const candidate of LATEST_OPENROUTER_MODEL_IDS) {
+    const model = byId.get(candidate)
+    if (model && freshEnough(model)) return model.id
   }
-  for (const m of availableModels) {
-    if (m.supportedParameters?.includes('tools') && freshEnough(m)) return m.id
+  for (const model of availableModels) {
+    if (model.supportedParameters?.includes('tools') && freshEnough(model)) return model.id
   }
-  return availableModels[0]?.id ?? SEED_DEFAULT_MODEL_CANDIDATES[0] ?? ''
+  return availableModels[0]?.id ?? LATEST_OPENROUTER_MODEL_IDS[0] ?? ''
 }

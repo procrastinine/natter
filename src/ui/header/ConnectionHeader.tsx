@@ -1,150 +1,53 @@
-import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
-import { runAssistantRequestOnce } from '../../api/assistant-stream'
-import { fetchModels } from '../../api/models'
-import { probeLlamaServer } from '../../api/probe'
-import { normalizeModelsResponse } from '../../api/providers'
-import { listBundledEntries } from '../../capabilities'
-import { cloneDefaultChatSettings } from '../../core/defaults'
-import { forceEquivalentModelIdForConnection } from '../../core/model-selection'
-import { defaultApiForProfile, withProfileApiDefaults } from '../../core/provider-defaults'
-import { prepareAssistantRequestPlan } from '../../core/send-planning'
-import type {
-  Chat,
-  ChatId,
-  ChatSettings,
-  ConnectionKind,
-  ConnectionProfile,
-  Message,
-  PresetId,
-  ProfileId,
-} from '../../core/types'
-import { newId } from '../../lib/ulid'
-import { getChat, updateChatSettings } from '../../store/chats'
-import { createKey, getKey, resolveKey } from '../../store/keys'
-import { createPreset } from '../../store/presets'
 import {
-  bumpProfileLastUsedAt,
-  createProfile,
-  deleteProfile,
-  getProfile,
-  listProfiles,
-  ProfileInUseError,
-  profileDependents,
-  updateProfile,
-} from '../../store/profiles'
-import { allTable } from '../../store/reactive-dependencies'
-import { useRepositoryQuery } from '../../store/reactive-query'
+  useCallback,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from 'react'
+import type { ChatId, ConnectionKind, ConnectionProfile, ProfileId } from '../../core/types'
+import {
+  useConnectionManagerCatalog,
+  useConnectionProfileCatalog,
+} from '../../hooks/useConfigurationCatalog'
+import { configurationApplication } from '../../store/configuration-application'
+import {
+  configurationController,
+  currentActiveConfigurationSelection,
+  previousActiveConfigurationSelection,
+} from '../../store/configuration-controller'
+import { createConnectionWithSeedPreset } from '../../store/connection-onboarding'
+import {
+  isValidConnectionHttpUrl as isValidHttpUrl,
+  connectionKindRequiresKey as kindRequiresKey,
+  loadConnectionProbeApplication,
+} from '../../store/connection-probe-capability'
+import type {
+  ActiveConfigurationSeed,
+  ConfigurationConnectionProbeInput,
+  ConfigurationProfileCatalogRow,
+  ConnectionProbeState as ProbeState,
+} from '../../store/presentation-contracts'
 import { ChevronIcon, CloseIcon, TrashIcon } from '../icons/Icon'
 import { Button, IconButton } from '../primitives/Button'
-import { ConfirmDialog } from '../primitives/ConfirmDialog'
 import { Dialog } from '../primitives/Dialog'
+import { ConnectionDeleteDialog } from './ConnectionDeleteDialog'
 
-interface HeaderState {
-  profile: ConnectionProfile | null
-  profiles: ConnectionProfile[]
-  hasKey: boolean
+async function runConnectionTest(input: ConfigurationConnectionProbeInput): Promise<ProbeState> {
+  try {
+    const application = await loadConnectionProbeApplication()
+    return await application.runConfigurationConnectionProbe(input)
+  } catch (error) {
+    return { kind: 'fail', message: keyErrorMessage(error) }
+  }
 }
-
-type ProbeState =
-  | { kind: 'idle' }
-  | { kind: 'running' }
-  | { kind: 'ok'; message: string }
-  | { kind: 'fail'; message: string }
 
 interface ConnectionSaveResult {
   profileId: ProfileId
   activate: boolean
-  resetModel: boolean
-}
-
-const ACTIVE_SEED_KEY = 'natter:active-seed'
-
-interface ActiveSeedState {
-  profileId: ProfileId | null
-  presetId: PresetId | null
-  settings: ChatSettings | null
-}
-
-function normalizeActiveSeedState(value: unknown): ActiveSeedState | null {
-  if (!value || typeof value !== 'object') return null
-  const candidate = value as { profileId?: unknown; presetId?: unknown; settings?: unknown }
-  const profileId = typeof candidate.profileId === 'string' ? candidate.profileId : null
-  const presetId = typeof candidate.presetId === 'string' ? candidate.presetId : null
-  const rawSettings =
-    candidate.settings && typeof candidate.settings === 'object'
-      ? (candidate.settings as ChatSettings)
-      : null
-  const settings = rawSettings ? structuredClone(rawSettings) : null
-  if (!profileId && !presetId && !settings) return null
-  return { profileId, presetId, settings }
-}
-
-export function readActiveSeedState(): ActiveSeedState {
-  if (typeof window === 'undefined') return { profileId: null, presetId: null, settings: null }
-  const raw = window.sessionStorage.getItem(ACTIVE_SEED_KEY)
-  if (raw) {
-    try {
-      const parsed = normalizeActiveSeedState(JSON.parse(raw))
-      if (parsed) return parsed
-    } catch {
-      window.sessionStorage.removeItem(ACTIVE_SEED_KEY)
-    }
-  }
-  return { profileId: null, presetId: null, settings: null }
-}
-
-export function writeActiveSeedState(state: ActiveSeedState): void {
-  if (typeof window === 'undefined') return
-  if (state.profileId || state.presetId || state.settings) {
-    window.sessionStorage.setItem(
-      ACTIVE_SEED_KEY,
-      JSON.stringify({
-        profileId: state.profileId ?? null,
-        presetId: state.presetId ?? null,
-        settings: state.settings ?? null,
-      }),
-    )
-  } else {
-    window.sessionStorage.removeItem(ACTIVE_SEED_KEY)
-  }
-}
-
-export function readActiveProfileId(): ProfileId | null {
-  const state = readActiveSeedState()
-  return state.settings?.profileId || state.profileId
-}
-
-export function writeActiveProfileId(id: ProfileId | null): void {
-  if (!id) {
-    writeActiveSeedState({ profileId: null, presetId: null, settings: null })
-    return
-  }
-  const current = readActiveSeedState()
-  const nextSettings = current.settings
-    ? structuredClone(current.settings)
-    : cloneDefaultChatSettings()
-  const currentProfileId = current.settings?.profileId || current.profileId
-  nextSettings.profileId = id
-  if (currentProfileId && currentProfileId !== id) nextSettings.model = ''
-  writeActiveSeedState({ profileId: id, presetId: null, settings: nextSettings })
-}
-
-function chatIdFromHash(): ChatId | null {
-  if (typeof window === 'undefined') return null
-  const match = /^#\/chat\/([^/?#]+)/u.exec(window.location.hash)
-  return match?.[1] ?? null
-}
-
-async function loadHeaderState(
-  activeId: ProfileId | null,
-  chatProfileId: ProfileId | null,
-): Promise<HeaderState> {
-  const live = (await listProfiles()).sort((a, b) => (b.lastUsedAt ?? 0) - (a.lastUsedAt ?? 0))
-  const chatProfile = chatProfileId ? live.find((p) => p.id === chatProfileId) : undefined
-  const fallback = activeId ? live.find((p) => p.id === activeId) : undefined
-  const profile = chatProfile ?? fallback ?? live[0] ?? null
-  const hasKey = profile ? ((await getKey(profile.apiKeyRef)) ?? null) !== null : false
-  return { profile, profiles: live, hasKey }
+  seed?: ActiveConfigurationSeed
 }
 
 const KIND_LABEL: Record<ConnectionKind, string> = {
@@ -192,36 +95,14 @@ const KIND_DEFAULT_BASE_URL: Record<ConnectionKind, string> = {
   custom: '',
 }
 
-function kindRequiresKey(kind: ConnectionKind): boolean {
-  return kind !== 'custom' && kind !== 'llama-server'
-}
-
 const PLACEHOLDER_KEY = '••••••••••••••••'
-
-const PROBE_MODEL_CANDIDATES: Record<ConnectionKind, readonly string[]> = {
-  openrouter: ['anthropic/claude-haiku-4.5', 'openai/gpt-4o-mini'],
-  'openai-compatible': ['gpt-4o-mini', 'gpt-4.1-mini', 'gpt-4o'],
-  anthropic: ['claude-haiku-4-5', 'claude-sonnet-4-5', 'claude-opus-4-1-20250805'],
-  google: ['gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.5-pro'],
-  'llama-server': [],
-  custom: [],
-}
+const EMPTY_PROFILE_ADDRESS_IDS: readonly ProfileId[] = Object.freeze([])
 
 function hostFor(url: string): string {
   try {
     return new URL(url).host
   } catch {
     return url
-  }
-}
-
-function isValidHttpUrl(value: string): boolean {
-  if (!value) return false
-  try {
-    const parsed = new URL(value)
-    return parsed.protocol === 'http:' || parsed.protocol === 'https:'
-  } catch {
-    return false
   }
 }
 
@@ -237,174 +118,8 @@ function nextBaseUrlForKind(
     : currentBaseUrl
 }
 
-function buildProbeProfile(kind: ConnectionKind, name: string, baseUrl: string): ConnectionProfile {
-  const now = Date.now()
-  return {
-    id: `probe:${kind}:${name}`,
-    name,
-    kind,
-    baseUrl,
-    apiKeyRef: 'probe-key',
-    defaultHeaders: {},
-    appTitle: 'llm-api-frontend',
-    appUrl: '',
-    supportsEndpointsApi: false,
-    supportsGenerationApi: false,
-    supportsPrivacyScrape: kind === 'openrouter',
-    createdAt: now,
-    updatedAt: now,
-  }
-}
-
-function normalizeProbeModelId(kind: ConnectionKind, modelId: string): string {
-  if (kind === 'google' && modelId.startsWith('models/')) {
-    return modelId.slice('models/'.length)
-  }
-  if (kind === 'anthropic') {
-    return modelId.replace(/-\d{8}$/u, '').replace(/(\d)\.(\d)(?=-|$)/g, '$1-$2')
-  }
-  return modelId
-}
-
-function pickProbeModel(kind: ConnectionKind, modelIds: string[]): string {
-  const candidates = PROBE_MODEL_CANDIDATES[kind]
-  for (const candidate of candidates) {
-    const hit = modelIds.find((modelId) => normalizeProbeModelId(kind, modelId) === candidate)
-    if (hit) return hit
-  }
-  return modelIds[0] ?? candidates[0] ?? ''
-}
-
-function probeUserMessage(): Message {
-  return {
-    id: 'probe-user',
-    chatId: 'probe-chat',
-    parentId: null,
-    siblingIndex: 0,
-    turnId: 'probe-turn',
-    turnIndex: 0,
-    role: 'user',
-    origin: 'user',
-    content: [{ type: 'text', text: 'Reply with the single word ok.' }],
-    createdAt: 1,
-    nodeVersion: 0,
-    deleted: false,
-  }
-}
-
-function probeChat(settings: ChatSettings): Chat {
-  return {
-    id: 'probe-chat',
-    title: 'Connection probe',
-    titleStatus: 'manual',
-    createdAt: 1,
-    updatedAt: 1,
-    lastViewedAt: 1,
-    wordCount: 0,
-    totalCostUsd: 0,
-    metaVersion: 0,
-    summaryVersion: 0,
-    settings,
-    lastUpdatedLeafId: null,
-    lastBranchUpdatedAt: 1,
-    archived: false,
-    pinned: false,
-    folderId: null,
-    tags: [],
-  }
-}
-
 function keyErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
-}
-
-async function runConnectionTest(opts: {
-  kind: ConnectionKind
-  name: string
-  baseUrl: string
-  apiKey: string | null
-}): Promise<ProbeState> {
-  if (!isValidHttpUrl(opts.baseUrl)) {
-    return { kind: 'fail', message: 'Enter a full URL starting with http:// or https://.' }
-  }
-  if (opts.kind === 'llama-server') {
-    const result = await probeLlamaServer({ baseUrl: opts.baseUrl }, { timeoutMs: 3_000 })
-    if (result.kind === 'ok') {
-      const tpl = result.props.chatTemplate
-      const ctx = result.props.defaultContextLength
-      const model = result.props.modelPath
-      const bits = [
-        model ? model.split('/').pop() : null,
-        ctx ? `ctx ${ctx}` : null,
-        tpl ? 'template detected' : null,
-      ]
-      return {
-        kind: 'ok',
-        message: `Reached llama-server in ${result.elapsedMs}ms — ${bits.filter(Boolean).join(' · ') || 'OK'}`,
-      }
-    }
-    return {
-      kind: 'fail',
-      message: `${result.message} (${result.rootUrl}/props)`,
-    }
-  }
-  if (kindRequiresKey(opts.kind) && !opts.apiKey) {
-    return { kind: 'fail', message: 'Set an API key before testing this profile.' }
-  }
-  const started = performance.now()
-  try {
-    const probeProfile = buildProbeProfile(opts.kind, opts.name, opts.baseUrl)
-    let modelIds: string[] = []
-    try {
-      const payload = await fetchModels(
-        {
-          profile: probeProfile,
-          apiKey: opts.apiKey ?? '',
-        },
-        {},
-        { timeoutMs: 3_000 },
-      )
-      modelIds = normalizeModelsResponse(payload).map((row) =>
-        normalizeProbeModelId(opts.kind, row.id),
-      )
-    } catch {
-      // Some OpenAI-compatible layers (notably Anthropic) accept chat
-      // completions but do not provide a bearer-authenticated /models list.
-      // The actual test path is a tiny completion below, so model discovery
-      // failures are advisory rather than fatal here.
-    }
-    const model = pickProbeModel(opts.kind, modelIds)
-    if (!model) {
-      return {
-        kind: 'fail',
-        message: 'Could not choose a model to test.',
-      }
-    }
-    const settings = cloneDefaultChatSettings()
-    settings.profileId = probeProfile.id
-    settings.model = model
-    const probeSettings = withProfileApiDefaults(settings, probeProfile)
-    const { requestPlan } = await prepareAssistantRequestPlan({
-      chat: probeChat(probeSettings),
-      connection: probeProfile,
-      pathMessages: [probeUserMessage()],
-      settings: probeSettings,
-      stream: false,
-      debugSource: 'connection-probe',
-    })
-    await runAssistantRequestOnce({
-      connection: probeProfile,
-      apiKey: opts.apiKey ?? '',
-      requestPlan,
-    })
-    const elapsedMs = Math.round(performance.now() - started)
-    return {
-      kind: 'ok',
-      message: `Completed test chat in ${elapsedMs}ms — ${model}`,
-    }
-  } catch (error) {
-    return { kind: 'fail', message: keyErrorMessage(error) }
-  }
 }
 
 interface ConnectionHeaderProps {
@@ -415,67 +130,130 @@ interface ConnectionHeaderProps {
 
 export function ConnectionHeader({
   activeChatId = null,
-  activeChatProfileId = null,
+  activeChatProfileId,
   variant = 'empty-action',
 }: ConnectionHeaderProps = {}) {
-  const [activeId, setActiveId] = useState<ProfileId | null>(() => readActiveProfileId())
-  const [setupOpen, setSetupOpen] = useState(false)
-  const liveState = useRepositoryQuery(
-    JSON.stringify(['connection-header', activeId, activeChatProfileId]),
-    () => loadHeaderState(activeId, activeChatProfileId),
-    undefined,
-    allTable('profiles', 'keys'),
+  const activeSeed = useSyncExternalStore(
+    configurationController.subscribe,
+    configurationController.getSnapshot,
+    configurationController.getSnapshot,
   )
-  const stateCacheRef = useRef<HeaderState>({ profile: null, profiles: [], hasKey: false })
-  const pendingSaveProfileIdRef = useRef<ProfileId | null>(null)
-  useEffect(() => {
-    if (liveState === undefined) return
-    const pendingProfileId = pendingSaveProfileIdRef.current
-    if (
-      pendingProfileId !== null &&
-      activeId === pendingProfileId &&
-      stateCacheRef.current.profile?.id === pendingProfileId &&
-      liveState.profile?.id !== pendingProfileId
-    ) {
-      return
-    }
-    if (setupOpen && stateCacheRef.current.profile === null && liveState.profile !== null) return
-    stateCacheRef.current = liveState
-  }, [activeId, liveState, setupOpen])
-  useEffect(() => {
-    const pendingProfileId = pendingSaveProfileIdRef.current
-    if (
-      pendingProfileId !== null &&
-      (activeId !== pendingProfileId || liveState?.profile?.id === pendingProfileId)
-    ) {
-      pendingSaveProfileIdRef.current = null
-    }
-  }, [activeId, liveState])
-  const pendingSaveProfileId = pendingSaveProfileIdRef.current
-  const cachedStateTargetsPendingSave =
-    pendingSaveProfileId !== null &&
-    activeId === pendingSaveProfileId &&
-    stateCacheRef.current.profile?.id === pendingSaveProfileId &&
-    liveState?.profile?.id !== pendingSaveProfileId
-  const state =
-    cachedStateTargetsPendingSave || (setupOpen && stateCacheRef.current.profile === null)
-      ? stateCacheRef.current
-      : (liveState ?? stateCacheRef.current)
+  const [setupOpen, setSetupOpen] = useState(false)
   const [open, setOpen] = useState(false)
   const [editing, setEditing] = useState(false)
+  const currentSelection = currentActiveConfigurationSelection(activeSeed.frame)
+  const previousSelection = previousActiveConfigurationSelection(activeSeed.frame)
+  const selectionMatchesSurface = (selection: NonNullable<typeof currentSelection>): boolean =>
+    activeChatId
+      ? selection.target.kind === 'chat' &&
+        selection.target.chatId === activeChatId &&
+        selection.target.profileId === (activeChatProfileId ?? null)
+      : selection.target.kind === 'new-chat'
+  const currentSurfaceSelection =
+    currentSelection && selectionMatchesSurface(currentSelection) ? currentSelection : null
+  const previousSurfaceSelection = previousSelection
+  const presentedSelection = currentSurfaceSelection ?? previousSurfaceSelection
+  const selectionPresentationOnly = currentSurfaceSelection === null && presentedSelection !== null
+  const activeId =
+    currentSurfaceSelection?.target.profileId ??
+    activeSeed.seed.settings?.profileId ??
+    activeSeed.seed.profileId
+  const selectedProfile = presentedSelection?.value.profile ?? null
+  const addressedProfileId = selectedProfile?.id ?? activeId ?? null
+  const addressedProfileIds = useMemo(
+    (): readonly ProfileId[] =>
+      addressedProfileId ? [addressedProfileId] : EMPTY_PROFILE_ADDRESS_IDS,
+    [addressedProfileId],
+  )
+  const profileCatalogResult = useConnectionProfileCatalog(
+    variant === 'mobile-menu' || open,
+    addressedProfileIds,
+  )
+  const profileCatalog = profileCatalogResult.snapshot
+  const maskRemoteFirstProfile =
+    setupOpen &&
+    activeId === null &&
+    (activeChatProfileId === null || activeChatProfileId === undefined)
+  const profileRows = useMemo(() => {
+    const rows = profileCatalog?.page.rows ?? []
+    const addressed = profileCatalog?.page.addressedRows.find(
+      (candidate) => candidate.id === addressedProfileId,
+    )?.row
+    if (!addressed || rows.some((row) => row.id === addressed.id)) return rows
+    return [addressed, ...rows]
+  }, [addressedProfileId, profileCatalog?.page.addressedRows, profileCatalog?.page.rows])
+  const requestKey = presentedSelection?.value.requestRevision?.key ?? null
+  const state = maskRemoteFirstProfile
+    ? { profile: null, profiles: [], hasKey: false, keyMaterialRevision: null }
+    : {
+        profile: selectedProfile,
+        profiles: profileRows,
+        hasKey: requestKey?.kind === 'material',
+        keyMaterialRevision: requestKey?.kind === 'material' ? requestKey.materialRevision : null,
+      }
   const [probeState, setProbeState] = useState<ProbeState>({ kind: 'idle' })
   const [deleteBusy, setDeleteBusy] = useState(false)
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false)
-  const [deleteDependents, setDeleteDependents] = useState<{
-    presetIds: PresetId[]
-    chatIds: string[]
+  const [deleteCountOverride, setDeleteCountOverride] = useState<{
+    revision: number
+    presetCount: number
+    chatCount: number
   } | null>(null)
+  const [deleteReassignTo, setDeleteReassignTo] = useState<ProfileId | null>(null)
   const [deleteError, setDeleteError] = useState<string | null>(null)
   const detailId = `connection-title-detail-${useId().replace(/:/g, '')}`
   const titleEntryRef = useRef<HTMLDivElement | null>(null)
   const probeRunRef = useRef(0)
   const hasConnection = state.profile !== null
-  const selectedProfileId = state.profile?.id ?? null
+  const connectionsKnownMissing = activeSeed.frame.shell?.totalProfileCount === 0
+  const selectedProfileId = currentSurfaceSelection?.value.profile?.id ?? null
+  const deleteAddressedIds = useMemo(
+    () =>
+      deleteConfirmOpen
+        ? [
+            ...new Set(
+              [selectedProfileId, deleteReassignTo].filter((id): id is ProfileId => id !== null),
+            ),
+          ]
+        : EMPTY_PROFILE_ADDRESS_IDS,
+    [deleteConfirmOpen, deleteReassignTo, selectedProfileId],
+  )
+  const deleteManagerCatalog = useConnectionManagerCatalog(
+    deleteConfirmOpen && selectedProfileId !== null,
+    deleteAddressedIds,
+    1,
+  )
+  const deleteManagerSnapshot = deleteManagerCatalog.snapshot
+  const deleteManagerPage = deleteManagerSnapshot?.page
+  const deleteManagerRows = useMemo(
+    () => [
+      ...new Map(
+        [
+          ...(deleteManagerPage?.rows ?? []),
+          ...(deleteManagerPage?.addressedRows.flatMap((address) =>
+            address.row ? [address.row] : [],
+          ) ?? []),
+        ].map((row) => [row.id, row]),
+      ).values(),
+    ],
+    [deleteManagerPage?.addressedRows, deleteManagerPage?.rows],
+  )
+  const deleteManagerRow = selectedProfileId
+    ? (deleteManagerRows.find((row) => row.id === selectedProfileId) ?? null)
+    : null
+  const effectiveDeleteCountOverride =
+    deleteCountOverride?.revision === deleteManagerSnapshot?.revision ? deleteCountOverride : null
+  const deleteDependents = deleteManagerRow
+    ? effectiveDeleteCountOverride
+      ? {
+          presetCount: effectiveDeleteCountOverride.presetCount,
+          chatCount: effectiveDeleteCountOverride.chatCount,
+        }
+      : {
+          presetCount: deleteManagerRow.presetCount,
+          chatCount: deleteManagerRow.chatCount,
+        }
+    : null
 
   const resetProbeState = useCallback(() => {
     probeRunRef.current += 1
@@ -487,27 +265,22 @@ export function ConnectionHeader({
     setEditing(false)
     resetProbeState()
     setDeleteConfirmOpen(false)
-    setDeleteDependents(null)
+    setDeleteCountOverride(null)
+    setDeleteReassignTo(null)
     setDeleteError(null)
   }, [selectedProfileId, resetProbeState])
 
   useEffect(() => {
-    if (!deleteConfirmOpen || !selectedProfileId) return
-    let active = true
-    setDeleteDependents(null)
-    setDeleteError(null)
-    void profileDependents(selectedProfileId).then(
-      (dependents) => {
-        if (active) setDeleteDependents(dependents)
-      },
-      () => {
-        if (active) setDeleteError('Could not verify which presets and chats use this connection.')
-      },
-    )
-    return () => {
-      active = false
+    if (
+      deleteReassignTo !== null &&
+      deleteManagerSnapshot?.status === 'ready' &&
+      !deleteManagerRows.some(
+        (row) => row.id === deleteReassignTo && row.id !== selectedProfileId && !row.archived,
+      )
+    ) {
+      setDeleteReassignTo(null)
     }
-  }, [deleteConfirmOpen, selectedProfileId])
+  }, [deleteManagerRows, deleteManagerSnapshot?.status, deleteReassignTo, selectedProfileId])
 
   useEffect(() => {
     if (variant !== 'title-icon' || !open) return
@@ -527,32 +300,26 @@ export function ConnectionHeader({
   }, [variant, open])
 
   const activateProfile = useCallback(
-    async (id: ProfileId, opts: { resetModel?: boolean } = {}) => {
-      writeActiveProfileId(id)
-      setActiveId(id)
-      await bumpProfileLastUsedAt(id)
-      const targetChatId = activeChatId ?? chatIdFromHash()
-      if (!targetChatId) return
-      const profile =
-        state.profiles.find((candidate) => candidate.id === id) ?? (await getProfile(id))
-      const chat = await getChat(targetChatId)
-      const shouldResetModel = opts.resetModel || (!!chat && chat.settings.profileId !== id)
-      const patch: { profileId: ProfileId; model?: string; api?: ChatSettings['api'] } = {
+    async (id: ProfileId, seed?: ActiveConfigurationSeed) => {
+      const intent = configurationController.claimIntent()
+      if (activeChatId) {
+        await configurationApplication.switchChatProfile({
+          chatId: activeChatId,
+          profileId: id,
+          isCurrent: () => configurationController.intentIsCurrent(intent),
+        })
+        return
+      }
+      if (!configurationController.intentIsCurrent(intent)) return
+      if (seed) configurationController.rememberSeed(seed)
+      else configurationController.rememberProfile(id)
+      await configurationApplication.execute({
+        kind: 'connection.touch',
         profileId: id,
-      }
-      if (profile && shouldResetModel) {
-        const candidates = listBundledEntries(profile.kind).map((entry) => ({ id: entry.id }))
-        patch.model = chat?.settings.model
-          ? (forceEquivalentModelIdForConnection(chat.settings.model, profile.kind, candidates) ??
-            '')
-          : ''
-        patch.api = defaultApiForProfile(profile)
-      } else if (shouldResetModel) {
-        patch.model = ''
-      }
-      await updateChatSettings(targetChatId, patch)
+        now: Date.now(),
+      })
     },
-    [activeChatId, state.profiles],
+    [activeChatId],
   )
 
   const switchProfile = useCallback(
@@ -562,7 +329,7 @@ export function ConnectionHeader({
         resetProbeState()
         setDeleteConfirmOpen(false)
       }
-      await activateProfile(id, { resetModel: true })
+      await activateProfile(id)
     },
     [activateProfile, resetProbeState, selectedProfileId],
   )
@@ -570,64 +337,48 @@ export function ConnectionHeader({
   const applySaveResult = useCallback(
     async (result: ConnectionSaveResult) => {
       if (result.activate) {
-        await activateProfile(result.profileId, { resetModel: result.resetModel })
-        const targetChatId = activeChatId ?? chatIdFromHash()
-        if (targetChatId && result.resetModel) {
-          const [profile, chat] = await Promise.all([
-            getProfile(result.profileId),
-            getChat(targetChatId),
-          ])
-          if (profile && chat) {
-            const candidates = listBundledEntries(profile.kind).map((entry) => ({ id: entry.id }))
-            const model = chat.settings.model
-              ? (forceEquivalentModelIdForConnection(
-                  chat.settings.model,
-                  profile.kind,
-                  candidates,
-                ) ?? '')
-              : ''
-            await updateChatSettings(targetChatId, {
-              profileId: result.profileId,
-              model,
-              api: defaultApiForProfile(profile),
-            })
-          }
-        }
-      } else if (activeChatId && activeChatProfileId === result.profileId && result.resetModel) {
-        await updateChatSettings(activeChatId, { model: '' })
+        await activateProfile(result.profileId, result.seed)
       }
-      const savedState = await loadHeaderState(result.profileId, null)
-      pendingSaveProfileIdRef.current = result.profileId
-      stateCacheRef.current = savedState
       setEditing(false)
       setSetupOpen(false)
     },
-    [activateProfile, activeChatId, activeChatProfileId],
+    [activateProfile],
   )
 
   const deleteCurrentProfile = useCallback(async () => {
     const profile = state.profile
     if (!profile || !deleteDependents) return
-    if (deleteDependents.presetIds.length > 0 || deleteDependents.chatIds.length > 0) return
+    const hasDependents = deleteDependents.presetCount > 0 || deleteDependents.chatCount > 0
+    if (hasDependents && deleteReassignTo === null) return
     setDeleteBusy(true)
     setDeleteError(null)
     try {
-      await deleteProfile(profile.id)
-      setEditing(false)
-      setDeleteConfirmOpen(false)
-      const nextProfile = state.profiles.find((candidate) => candidate.id !== profile.id) ?? null
-      writeActiveProfileId(nextProfile?.id ?? null)
-      setActiveId(nextProfile?.id ?? null)
-    } catch (error) {
-      if (error instanceof ProfileInUseError) {
-        setDeleteDependents({ presetIds: error.presetIds, chatIds: error.chatIds })
+      const result = await configurationApplication.deleteConnection(
+        profile.id,
+        deleteReassignTo === null ? {} : { reassignTo: deleteReassignTo },
+      )
+      if (result.kind === 'connection-delete-blocked') {
+        setDeleteCountOverride({
+          revision: deleteManagerSnapshot?.revision ?? -1,
+          presetCount: result.presetCount,
+          chatCount: result.chatCount,
+        })
         return
       }
+      if (result.kind !== 'connection-deleted') {
+        setDeleteError('The connection could not be deleted. Nothing was changed.')
+        return
+      }
+      setEditing(false)
+      setDeleteConfirmOpen(false)
+      setDeleteReassignTo(null)
+      setDeleteCountOverride(null)
+    } catch {
       setDeleteError('The connection could not be deleted. Nothing was changed.')
     } finally {
       setDeleteBusy(false)
     }
-  }, [deleteDependents, state.profile, state.profiles])
+  }, [deleteDependents, deleteManagerSnapshot?.revision, deleteReassignTo, state.profile])
 
   const runSavedProfileTest = useCallback(async () => {
     const profile = state.profile
@@ -635,15 +386,11 @@ export function ConnectionHeader({
     const probeRun = ++probeRunRef.current
     setProbeState({ kind: 'running' })
     try {
-      let apiKey: string | null = null
-      if (kindRequiresKey(profile.kind)) {
-        apiKey = await resolveKey(profile.apiKeyRef)
-      }
       const nextState = await runConnectionTest({
         kind: profile.kind,
         name: profile.name,
         baseUrl: profile.baseUrl,
-        apiKey,
+        ...(profile.apiKeyRef ? { fallbackKeyId: profile.apiKeyRef } : {}),
       })
       if (probeRunRef.current === probeRun) setProbeState(nextState)
     } catch (error) {
@@ -653,7 +400,18 @@ export function ConnectionHeader({
     }
   }, [state.profile])
 
-  if (!hasConnection || !state.profile) {
+  if (!presentedSelection && !maskRemoteFirstProfile && !connectionsKnownMissing) {
+    return variant === 'title-icon' ? null : (
+      <div
+        data-ui="connection-empty-action"
+        data-variant={variant}
+        data-state="resolving"
+        aria-hidden="true"
+      />
+    )
+  }
+
+  if (connectionsKnownMissing || !hasConnection || !state.profile) {
     if (variant === 'title-icon') return null
     return (
       <div data-ui="connection-empty-action" data-variant={variant}>
@@ -720,6 +478,7 @@ export function ConnectionHeader({
         aria-expanded={open}
         aria-controls={detailId}
         onClick={() => setOpen((v) => !v)}
+        disabled={selectionPresentationOnly}
       >
         <span data-ui="connection-chevron" aria-hidden="true">
           <ChevronIcon size={14} rotate={open ? 90 : 0} />
@@ -732,13 +491,19 @@ export function ConnectionHeader({
       <ProfileSwitcher
         profiles={profiles}
         activeId={profile.id}
+        hasPrevious={Boolean(profileCatalog?.page.previousCursor)}
+        hasMore={Boolean(profileCatalog?.page.nextCursor)}
+        onLoadPrevious={profileCatalogResult.demandBefore}
+        onLoadMore={profileCatalogResult.demandAfter}
         onSwitch={switchProfile}
         onCreateNew={() => setSetupOpen(true)}
       />
       {editing ? (
         <ConnectionEditor
           profile={profile}
+          resetModelChatId={activeChatId}
           hasKey={hasKey}
+          keyMaterialRevision={state.keyMaterialRevision}
           deleteBusy={deleteBusy}
           onDone={applySaveResult}
           onCancel={() => setEditing(false)}
@@ -761,7 +526,7 @@ export function ConnectionHeader({
     <>
       {setupOpen ? (
         <ConnectionSetupModal
-          hasExistingConnections={profiles.length > 0}
+          hasExistingConnections={(activeSeed.frame.shell?.totalProfileCount ?? 0) > 0}
           onClose={() => setSetupOpen(false)}
           onSaved={applySaveResult}
         />
@@ -771,9 +536,22 @@ export function ConnectionHeader({
           profileName={profile.name}
           busy={deleteBusy}
           dependents={deleteDependents}
+          replacementProfiles={deleteManagerRows.filter(
+            (candidate) => candidate.id !== profile.id && !candidate.archived,
+          )}
+          hasPreviousReplacementProfiles={Boolean(deleteManagerPage?.previousCursor)}
+          hasMoreReplacementProfiles={Boolean(deleteManagerPage?.nextCursor)}
+          reassignTo={deleteReassignTo}
           error={deleteError}
-          onCancel={() => setDeleteConfirmOpen(false)}
+          onCancel={() => {
+            setDeleteConfirmOpen(false)
+            setDeleteReassignTo(null)
+            setDeleteCountOverride(null)
+          }}
           onConfirm={deleteCurrentProfile}
+          onLoadPreviousReplacementProfiles={deleteManagerCatalog.demandBefore}
+          onLoadMoreReplacementProfiles={deleteManagerCatalog.demandAfter}
+          onReassignTo={setDeleteReassignTo}
         />
       ) : null}
     </>
@@ -787,6 +565,8 @@ export function ConnectionHeader({
         data-open="true"
         data-variant="mobile-menu"
         aria-label={`Connection: ${profile.name}`}
+        data-presentation={selectionPresentationOnly ? 'retained' : 'current'}
+        inert={selectionPresentationOnly ? true : undefined}
       >
         {connectionRow}
         {connectionDetail}
@@ -797,7 +577,11 @@ export function ConnectionHeader({
 
   if (variant !== 'title-icon') return null
   return (
-    <div data-ui="connection-title-entry" ref={titleEntryRef}>
+    <div
+      data-ui="connection-title-entry"
+      data-presentation={selectionPresentationOnly ? 'retained' : 'current'}
+      ref={titleEntryRef}
+    >
       <Button
         type="button"
         data-ui="connection-provider-button"
@@ -807,6 +591,7 @@ export function ConnectionHeader({
         aria-controls={detailId}
         title={`${KIND_LABEL[profile.kind]} · ${profile.name}`}
         onClick={() => setOpen((v) => !v)}
+        disabled={selectionPresentationOnly}
       >
         <ConnectionKindIcon kind={profile.kind} size={18} />
       </Button>
@@ -817,6 +602,8 @@ export function ConnectionHeader({
           data-open="true"
           data-variant="popover"
           aria-label={`Connection: ${profile.name}`}
+          data-presentation={selectionPresentationOnly ? 'retained' : 'current'}
+          inert={selectionPresentationOnly ? true : undefined}
         >
           {connectionRow}
           {connectionDetail}
@@ -951,13 +738,29 @@ function ConnectionKindIcon({ kind, size }: { kind: ConnectionKind; size: number
 }
 
 interface ProfileSwitcherProps {
-  profiles: ConnectionProfile[]
+  profiles: readonly ConfigurationProfileCatalogRow[]
   activeId: ProfileId
+  hasPrevious: boolean
+  hasMore: boolean
+  onLoadPrevious: () => void
+  onLoadMore: () => void
   onSwitch: (id: ProfileId) => void | Promise<void>
   onCreateNew: () => void
 }
 
-function ProfileSwitcher({ profiles, activeId, onSwitch, onCreateNew }: ProfileSwitcherProps) {
+const LOAD_MORE_PROFILES_VALUE = '__natter_load_more_profiles__'
+const LOAD_PREVIOUS_PROFILES_VALUE = '__natter_load_previous_profiles__'
+
+function ProfileSwitcher({
+  profiles,
+  activeId,
+  hasPrevious,
+  hasMore,
+  onLoadPrevious,
+  onLoadMore,
+  onSwitch,
+  onCreateNew,
+}: ProfileSwitcherProps) {
   return (
     <div data-ui="connection-switcher">
       <label htmlFor="connection-profile-select">Profile</label>
@@ -965,13 +768,28 @@ function ProfileSwitcher({ profiles, activeId, onSwitch, onCreateNew }: ProfileS
         id="connection-profile-select"
         data-ui="connection-profile-select"
         value={activeId}
-        onChange={(e) => void onSwitch(e.target.value)}
+        onChange={(event) => {
+          if (event.target.value === LOAD_PREVIOUS_PROFILES_VALUE) {
+            onLoadPrevious()
+            return
+          }
+          if (event.target.value === LOAD_MORE_PROFILES_VALUE) {
+            onLoadMore()
+            return
+          }
+          void onSwitch(event.target.value)
+        }}
       >
+        {hasPrevious ? (
+          <option value={LOAD_PREVIOUS_PROFILES_VALUE}>Earlier connections…</option>
+        ) : null}
         {profiles.map((p) => (
-          <option key={p.id} value={p.id}>
+          <option key={p.id} value={p.id} disabled={p.archived === true}>
             {p.name}
+            {p.archived ? ' (archived)' : ''}
           </option>
         ))}
+        {hasMore ? <option value={LOAD_MORE_PROFILES_VALUE}>Load more connections…</option> : null}
       </select>
       <Button
         type="button"
@@ -983,60 +801,6 @@ function ProfileSwitcher({ profiles, activeId, onSwitch, onCreateNew }: ProfileS
         +
       </Button>
     </div>
-  )
-}
-
-function ConnectionDeleteDialog({
-  profileName,
-  busy,
-  dependents,
-  error,
-  onCancel,
-  onConfirm,
-}: {
-  profileName: string
-  busy: boolean
-  dependents: { presetIds: PresetId[]; chatIds: string[] } | null
-  error: string | null
-  onCancel: () => void
-  onConfirm: () => void | Promise<void>
-}) {
-  const presetCount = dependents?.presetIds.length ?? 0
-  const chatCount = dependents?.chatIds.length ?? 0
-  const blocked = presetCount > 0 || chatCount > 0
-  const dependencyLabel = `${presetCount} non-archived ${presetCount === 1 ? 'preset' : 'presets'} and ${chatCount} non-archived ${chatCount === 1 ? 'chat' : 'chats'}`
-  return (
-    <ConfirmDialog
-      title="Delete connection?"
-      confirmLabel="Delete"
-      busyLabel="Deleting…"
-      busy={busy}
-      confirmDisabled={dependents === null || blocked || error !== null}
-      initialFocus="cancel"
-      onCancel={onCancel}
-      onConfirm={onConfirm}
-      closeLabel="Cancel connection delete"
-    >
-      <div data-ui="confirm-dialog-copy">
-        <p>
-          Delete <strong>{profileName}</strong>? This cannot be undone.
-        </p>
-        <p data-role="status" data-state={error ? 'error' : blocked ? 'blocked' : 'ready'}>
-          {error ? (
-            <strong>{error}</strong>
-          ) : dependents === null ? (
-            'Checking dependent presets and chats…'
-          ) : blocked ? (
-            <>
-              <strong>Cannot delete:</strong> {dependencyLabel} still use this connection. Move or
-              archive them, then try again.
-            </>
-          ) : (
-            'No active presets or chats use this connection.'
-          )}
-        </p>
-      </div>
-    </ConfirmDialog>
   )
 }
 
@@ -1120,7 +884,9 @@ function ConnectionViewer({
 
 interface ConnectionEditorProps {
   profile: ConnectionProfile
+  resetModelChatId: ChatId | null
   hasKey: boolean
+  keyMaterialRevision: number | null
   deleteBusy: boolean
   onDone: (result: ConnectionSaveResult) => void | Promise<void>
   onCancel: () => void
@@ -1129,7 +895,9 @@ interface ConnectionEditorProps {
 
 function ConnectionEditor({
   profile,
+  resetModelChatId,
   hasKey,
+  keyMaterialRevision,
   deleteBusy,
   onDone,
   onCancel,
@@ -1167,18 +935,15 @@ function ConnectionEditor({
   const runProbe = useCallback(async () => {
     setProbeState({ kind: 'running' })
     try {
-      let apiKey: string | null = null
-      if (trimmedKey.length > 0) {
-        apiKey = trimmedKey
-      } else if (!saveAsNew && hasKey && kindRequiresKey(kind)) {
-        apiKey = await resolveKey(profile.apiKeyRef)
-      }
       setProbeState(
         await runConnectionTest({
           kind,
           name: trimmedName || profile.name,
           baseUrl: trimmedBaseUrl,
-          apiKey,
+          ...(trimmedKey.length > 0 ? { apiKey: trimmedKey } : {}),
+          ...(!saveAsNew && hasKey && profile.apiKeyRef
+            ? { fallbackKeyId: profile.apiKeyRef }
+            : {}),
         }),
       )
     } catch (probeError) {
@@ -1222,36 +987,43 @@ function ConnectionEditor({
     try {
       const resetModel = kind !== profile.kind || trimmedBaseUrl !== profile.baseUrl
       if (saveAsNew) {
-        const apiKeyRef =
-          trimmedKey.length > 0
-            ? (
-                await createKey({
-                  name: trimmedName,
-                  plaintextKey: trimmedKey,
-                })
-              ).id
-            : newId()
-        const created = await createProfile({
+        const result = await createConnectionWithSeedPreset({
           name: trimmedName,
           kind,
           baseUrl: trimmedBaseUrl,
-          apiKeyRef,
+          ...(trimmedKey.length > 0 ? { plaintextKey: trimmedKey } : {}),
+          initialPresetName: `${trimmedName} default`,
         })
-        await onDone({ profileId: created.id, activate: true, resetModel })
+        if (result.kind !== 'connection-saved') return
+        const created = result.profile
+        await onDone({
+          profileId: created.id,
+          activate: true,
+          ...(result.initialPreset
+            ? {
+                seed: {
+                  profileId: created.id,
+                  presetId: result.initialPreset.id,
+                  settings: result.initialPreset.settings,
+                },
+              }
+            : {}),
+        })
       } else {
-        await updateProfile(profile.id, {
-          name: trimmedName,
-          kind,
-          baseUrl: trimmedBaseUrl,
-        })
-        if (trimmedKey.length > 0) {
-          await createKey({
-            id: profile.apiKeyRef,
+        await configurationApplication.editConnection({
+          profile,
+          patch: {
             name: trimmedName,
-            plaintextKey: trimmedKey,
-          })
-        }
-        await onDone({ profileId: profile.id, activate: false, resetModel })
+            kind,
+            baseUrl: trimmedBaseUrl,
+          },
+          ...(trimmedKey.length > 0 ? { plaintextKey: trimmedKey } : {}),
+          ...(resetModel && resetModelChatId ? { resetModelChatId } : {}),
+          ...(keyMaterialRevision === null
+            ? {}
+            : { expectedKeyMaterialRevision: keyMaterialRevision }),
+        })
+        await onDone({ profileId: profile.id, activate: false })
       }
     } catch (submitError) {
       setError(keyErrorMessage(submitError))
@@ -1260,12 +1032,11 @@ function ConnectionEditor({
     }
   }, [
     canSave,
+    keyMaterialRevision,
     kind,
     onDone,
-    profile.apiKeyRef,
-    profile.baseUrl,
-    profile.id,
-    profile.kind,
+    profile,
+    resetModelChatId,
     saveAsNew,
     trimmedBaseUrl,
     trimmedKey,
@@ -1532,7 +1303,7 @@ function ConnectionSetupModal({
         kind,
         name: trimmedName || KIND_DEFAULT_NAME[kind],
         baseUrl: trimmedBaseUrl,
-        apiKey: trimmedKey.length > 0 ? trimmedKey : null,
+        ...(trimmedKey.length > 0 ? { apiKey: trimmedKey } : {}),
       }),
     )
   }, [kind, trimmedName, trimmedBaseUrl, trimmedKey])
@@ -1543,41 +1314,35 @@ function ConnectionSetupModal({
     setError(null)
     try {
       const now = Date.now()
-      const apiKeyRef =
-        trimmedKey.length > 0
-          ? (
-              await createKey({
-                name: trimmedName,
-                plaintextKey: trimmedKey,
-                now,
-              })
-            ).id
-          : newId()
-      const profile = await createProfile({
+      const result = await createConnectionWithSeedPreset({
         name: trimmedName,
         kind,
         baseUrl: trimmedBaseUrl,
-        apiKeyRef,
+        ...(trimmedKey.length > 0 ? { plaintextKey: trimmedKey } : {}),
+        initialPresetName: `${trimmedName} default`,
         now,
       })
-      if (!hasExistingConnections) {
-        const settings = cloneDefaultChatSettings()
-        settings.profileId = profile.id
-        await createPreset({
-          name: `${profile.name} default`,
-          connectionProfileId: profile.id,
-          settings: withProfileApiDefaults(settings, profile),
-          lastUsedAt: now,
-          now,
-        })
-      }
-      await onSaved({ profileId: profile.id, activate: true, resetModel: true })
+      if (result.kind !== 'connection-saved') return
+      const profile = result.profile
+      await onSaved({
+        profileId: profile.id,
+        activate: true,
+        ...(result.initialPreset
+          ? {
+              seed: {
+                profileId: profile.id,
+                presetId: result.initialPreset.id,
+                settings: result.initialPreset.settings,
+              },
+            }
+          : {}),
+      })
     } catch (submitError) {
       setError(keyErrorMessage(submitError))
     } finally {
       setBusy(false)
     }
-  }, [canSave, hasExistingConnections, kind, onSaved, trimmedBaseUrl, trimmedKey, trimmedName])
+  }, [canSave, kind, onSaved, trimmedBaseUrl, trimmedKey, trimmedName])
 
   return (
     <Dialog

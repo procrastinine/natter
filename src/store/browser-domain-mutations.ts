@@ -1,490 +1,374 @@
-import type Dexie from 'dexie'
-import type { Transaction } from 'dexie'
-import { connectionKindDefaults } from '../core/connection-defaults'
+import type { Table, Transaction } from 'dexie'
+import type { AppliedMessageSemanticEffect } from '../core/continuation-content'
 import type {
+  Attachment,
+  AttachmentArtifact,
   Chat,
   ChatId,
-  ChatPreset,
-  ChatSettings,
-  ConnectionProfile,
+  ChatUsage,
+  ChildListState,
+  DispatchedGenerationMeta,
   DraftRow,
-  KeyId,
-  PresetId,
-  ProfileId,
-  PromptPreset,
-  PromptPresetId,
+  GenerationMeta,
+  GlobalTokenCalibration,
+  Message,
+  MessageId,
+  MutationScope,
 } from '../core/types'
-import { deleteChatSidebarProjections, putChatSidebarProjection } from './chat-sidebar-projection'
-import type { LockGrant } from './locks'
+import type { AttachmentHeaderRow } from './attachment-storage'
+import type { BrowserMutationTableName } from './browser-mutation-plan'
+import type { MessageBodyRow, MessageHeaderRow } from './message-storage'
 import type {
-  ChatCascadeVersion,
-  DeletePresetCascadeResult,
-  DeleteProfileAtomicInput,
-  DeleteProfileAtomicResult,
-  DeletePromptPresetAtomicInput,
-  DeletePromptPresetAtomicResult,
-  PromptPresetSlot,
-  UpdateProfileAtomicInput,
-  UpdateProfileAtomicResult,
-  UpdatePromptPresetAtomicInput,
-  UpdatePromptPresetAtomicResult,
+  FencedTransaction,
+  PhysicalStorageTableName,
+  PhysicalTransactionPlan,
+} from './physical-storage-tables'
+import type {
+  ChatMetadataPatch,
+  FencedStreamLeaseRow,
+  GenerationMessageReadProof,
+  MessageBodyPatch,
+  MessageCalibrationPatch,
+  MessageHeaderPatch,
+  MutationContext,
+  MutationFinalizationContext,
+  StreamLeaseAdmission,
+  StreamLeaseRow,
+  StreamPostCommitEvidence,
+  StreamPostCommitUsageEvidence,
+  StreamWriteFence,
+  WorkspaceMutationOptions,
+  WorkspaceMutationResult,
 } from './repository'
+import type {
+  GenerationPlanningSnapshot,
+  GenerationPromptPathClaim,
+  GenerationPromptPathProof,
+  MessagePresentation,
+  PrepareAttemptConfigurationClaim,
+  PreparedAttachmentBundle,
+  PreparedGenerationPrompt,
+  StorageMaintenanceRequestTaskKind,
+} from './workspace-protocol'
 
-type BumpWorkspaceMeta = (tx: Transaction, now: number) => Promise<void>
+export const VALIDATED_GENERATION_PROMPT_PATH_HEADERS = Symbol(
+  'validated-generation-prompt-path-headers',
+)
 
-export async function deletePresetAndClearBreadcrumbsInBrowser(
-  db: Dexie,
-  grant: LockGrant,
-  presetId: PresetId,
-  now: number,
-  bumpWorkspaceMeta: BumpWorkspaceMeta,
-): Promise<DeletePresetCascadeResult> {
-  return grant.runTransaction(
-    db,
-    ['chatSidebarRows', 'chats', 'presets', 'settings'],
-    async (tx: Transaction) => {
-      const presetTable = tx.table<ChatPreset, PresetId>('presets')
-      if (!(await presetTable.get(presetId))) return { kind: 'missing' }
-
-      const chatTable = tx.table<Chat, ChatId>('chats')
-      const chats = await chatTable.where('presetId').equals(presetId).toArray()
-      const versions: ChatCascadeVersion[] = []
-      for (const chat of chats) {
-        const next = structuredClone(chat)
-        delete next.presetId
-        next.updatedAt = now
-        next.metaVersion = chat.metaVersion + 1
-        next.summaryVersion = chat.summaryVersion + 1
-        await chatTable.put(next)
-        await putChatSidebarProjection(tx, next)
-        versions.push({
-          chatId: chat.id,
-          metaVersion: next.metaVersion,
-          summaryVersion: next.summaryVersion,
-        })
-      }
-      await presetTable.delete(presetId)
-      await bumpWorkspaceMeta(tx, now)
-      return { kind: 'deleted', chats: versions }
-    },
-  )
+export type ValidatedGenerationPromptPathHeaders = readonly MessageHeaderRow[] & {
+  readonly [VALIDATED_GENERATION_PROMPT_PATH_HEADERS]: true
 }
 
-async function clearProfileCaches(tx: Transaction, profileId: ProfileId): Promise<void> {
-  await tx.table('models').where('profileId').equals(profileId).delete()
-  await tx.table('endpoints').where('profileId').equals(profileId).delete()
-  await tx.table('privacyPolicies').where('profileId').equals(profileId).delete()
-  await tx.table('providers').delete(profileId)
-  await tx.table('presetResolutions').where('profileId').equals(profileId).delete()
+export interface ValidatedGenerationPromptPath {
+  readonly headers: ValidatedGenerationPromptPathHeaders
+  readonly messageProofs: readonly GenerationMessageReadProof[]
 }
 
-export async function updateProfileAndInvalidateCachesInBrowser(
-  db: Dexie,
-  grant: LockGrant,
-  input: UpdateProfileAtomicInput,
-  bumpWorkspaceMeta: BumpWorkspaceMeta,
-): Promise<UpdateProfileAtomicResult> {
-  return grant.runTransaction(
-    db,
-    [
-      'endpoints',
-      'models',
-      'presetResolutions',
-      'privacyPolicies',
-      'profiles',
-      'providers',
-      'settings',
-    ],
-    async (tx: Transaction) => {
-      const table = tx.table<ConnectionProfile, ProfileId>('profiles')
-      const existing = await table.get(input.profileId)
-      if (!existing) return { kind: 'missing' }
-      const kindChanged = input.patch.kind !== undefined && input.patch.kind !== existing.kind
-      const kindOverrides: Partial<ConnectionProfile> = {}
-      if (kindChanged && input.patch.kind !== undefined) {
-        const defaults = connectionKindDefaults(
-          input.patch.kind,
-          input.patch.baseUrl ?? existing.baseUrl,
-        )
-        if (input.patch.supportsEndpointsApi === undefined) {
-          kindOverrides.supportsEndpointsApi = defaults.supportsEndpointsApi
-        }
-        if (input.patch.supportsGenerationApi === undefined) {
-          kindOverrides.supportsGenerationApi = defaults.supportsGenerationApi
-        }
-        if (input.patch.supportsPrivacyScrape === undefined) {
-          kindOverrides.supportsPrivacyScrape = defaults.supportsPrivacyScrape
-        }
-      }
-      const cachesInvalidated =
-        (input.patch.baseUrl !== undefined && input.patch.baseUrl !== existing.baseUrl) ||
-        kindChanged
-      const next: ConnectionProfile = {
-        ...existing,
-        ...input.patch,
-        ...kindOverrides,
-        id: existing.id,
-        createdAt: existing.createdAt,
-        updatedAt: input.now,
-      }
-      await table.put(next)
-      if (cachesInvalidated) await clearProfileCaches(tx, input.profileId)
-      await bumpWorkspaceMeta(tx, input.now)
-      return { kind: 'updated', profile: next, cachesInvalidated }
-    },
-  )
+export interface ResolvedGenerationPromptPath extends ValidatedGenerationPromptPath {
+  readonly leafId: MessageId | null
+  readonly targetHeader?: MessageHeaderRow
+  readonly slot?: ChildListState
 }
 
-export async function deleteProfileAndReassignInBrowser(
-  db: Dexie,
-  grant: LockGrant,
-  input: DeleteProfileAtomicInput,
-  bumpWorkspaceMeta: BumpWorkspaceMeta,
-): Promise<DeleteProfileAtomicResult> {
-  return grant.runTransaction(
-    db,
-    [
-      'chats',
-      'chatSidebarRows',
-      'endpoints',
-      'keys',
-      'models',
-      'presetResolutions',
-      'presets',
-      'privacyPolicies',
-      'profiles',
-      'providers',
-      'settings',
-    ],
-    async (tx: Transaction) => {
-      const profileTable = tx.table<ConnectionProfile, ProfileId>('profiles')
-      const existing = await profileTable.get(input.profileId)
-      if (!existing) return { kind: 'missing-profile', profileId: input.profileId }
-      if (input.reassignTo !== undefined && !(await profileTable.get(input.reassignTo))) {
-        return { kind: 'missing-target', profileId: input.reassignTo }
-      }
-
-      const presetTable = tx.table<ChatPreset, PresetId>('presets')
-      const presetRows = await presetTable
-        .where('connectionProfileId')
-        .equals(input.profileId)
-        .toArray()
-      const chatTable = tx.table<Chat, ChatId>('chats')
-      const chatRows = (await chatTable.toArray()).filter(
-        (chat) => chat.settings.profileId === input.profileId,
-      )
-      if (input.reassignTo === undefined && !input.force) {
-        const presetIds = presetRows
-          .filter((preset) => preset.archived !== true)
-          .map((preset) => preset.id)
-        const chatIds = chatRows.filter((chat) => chat.archived !== true).map((chat) => chat.id)
-        if (presetIds.length > 0 || chatIds.length > 0) {
-          return { kind: 'in-use', presetIds, chatIds }
-        }
-      }
-
-      const touchedPresetIds: PresetId[] = []
-      const chatVersions: ChatCascadeVersion[] = []
-      if (input.reassignTo !== undefined) {
-        for (const preset of presetRows) {
-          await presetTable.put({
-            ...preset,
-            connectionProfileId: input.reassignTo,
-            settings: { ...preset.settings, profileId: input.reassignTo },
-            updatedAt: input.now,
-          })
-          touchedPresetIds.push(preset.id)
-        }
-        for (const chat of chatRows) {
-          const next: Chat = {
-            ...chat,
-            settings: { ...chat.settings, profileId: input.reassignTo },
-            updatedAt: input.now,
-            metaVersion: chat.metaVersion + 1,
-            summaryVersion: chat.summaryVersion + 1,
-          }
-          await chatTable.put(next)
-          await putChatSidebarProjection(tx, next)
-          chatVersions.push({
-            chatId: chat.id,
-            metaVersion: next.metaVersion,
-            summaryVersion: next.summaryVersion,
-          })
-        }
-      }
-
-      await profileTable.delete(input.profileId)
-      await clearProfileCaches(tx, input.profileId)
-      const remainingKeyRefs = new Set((await profileTable.toArray()).flatMap(profileKeyRefs))
-      const deletedKeyIds: KeyId[] = []
-      for (const keyId of new Set(profileKeyRefs(existing))) {
-        if (remainingKeyRefs.has(keyId)) continue
-        await tx.table('keys').delete(keyId)
-        deletedKeyIds.push(keyId)
-      }
-      await bumpWorkspaceMeta(tx, input.now)
-      return {
-        kind: 'deleted',
-        chats: chatVersions,
-        presetIds: touchedPresetIds,
-        deletedKeyIds,
-      }
-    },
-  )
+export interface ChatMutationState {
+  beforeChat: Chat
+  structuralSummaryDirty: boolean
+  structuralVersionDirty: boolean
+  previousBranchIds?: ReadonlySet<MessageId>
+  headersBeforeWrites: Map<MessageId, MessageHeaderRow | undefined>
+  incrementalAppends: Message[]
+  wordCountDeltas: Map<MessageId, number>
+  totalCostDelta: number
+  visibleMetaPatch: Partial<Chat>
+  hiddenMetaPatch: Partial<Chat>
+  clearModelResolution: boolean
+  visibleMetaDirty: boolean
+  summaryVersionDirty: boolean
+  messageSummaryDirty: boolean
+  branchCorpusDirtyMessageIds: Set<MessageId>
+  previewDirty: boolean
+  changedMessageIds: Set<MessageId>
 }
 
-function profileKeyRefs(profile: ConnectionProfile): KeyId[] {
-  return [
-    profile.apiKeyRef,
-    ...(profile.apiKeyFallbackRefs ?? []),
-    ...(profile.managementApiKeyRef === undefined ? [] : [profile.managementApiKeyRef]),
-  ]
+export interface BrowserMutationOperations {
+  validateGenerationPromptPathClaim(
+    chatId: ChatId,
+    claim: GenerationPromptPathClaim,
+  ): Promise<ValidatedGenerationPromptPath>
+  captureGenerationPlanningSnapshot(
+    chatId: ChatId,
+    expected: PrepareAttemptConfigurationClaim,
+    planningChat: Chat,
+  ): Promise<GenerationPlanningSnapshot>
+  requestStorageMaintenance(task: StorageMaintenanceRequestTaskKind): void
 }
 
-function withPromptText(
-  settings: ChatSettings,
-  key: PromptPresetSlot['textKey'],
-  text: string,
-): ChatSettings {
-  const next = { ...settings }
-  ;(next as unknown as Record<string, unknown>)[key] = text
-  return next
+export interface BrowserMutationTransactionExtension<Value, Result> {
+  readonly tableNames: readonly BrowserMutationTableName[]
+  commit(tx: FencedTransaction<BrowserMutationTableName>, value: Value): Promise<Result> | Result
 }
 
-function withoutPromptPin(settings: ChatSettings, key: PromptPresetSlot['pinKey']): ChatSettings {
-  const next = { ...settings }
-  delete (next as Partial<ChatSettings>)[key]
-  return next
+export interface BrowserMutationSharedInternals {
+  applyMessageBodyPatch(this: void, body: MessageBodyRow, patch: MessageBodyPatch): MessageBodyRow
+  applyMessageHeaderPatch(
+    this: void,
+    header: MessageHeaderRow,
+    patch: MessageHeaderPatch | undefined,
+  ): MessageHeaderRow
+  assertExistingMessageIdentity(this: void, existing: MessageHeaderRow, candidate: Message): void
+  assertOwnedStreamFence(
+    this: void,
+    lease: StreamLeaseRow | undefined,
+    fence: StreamWriteFence,
+    replacementEpoch: number,
+    streamId: string,
+  ): asserts lease is FencedStreamLeaseRow
+  assertStreamLeaseWorkspaceTarget(
+    this: void,
+    tx: Transaction,
+    lease: Pick<StreamLeaseRow, 'streamId' | 'chatId' | 'messageId' | 'attemptKind'>,
+  ): Promise<void>
+  branchHeaderWordCount(this: void, headers: readonly MessageHeaderRow[]): number
+  calibrationUsageFromPostCommit(this: void, usage: StreamPostCommitUsageEvidence): ChatUsage
+  canApplyIncrementalBranchAppend(this: void, state: ChatMutationState): boolean
+  changedPatch<Row extends object>(
+    this: void,
+    current: Partial<Row>,
+    patch: Partial<Row>,
+  ): Partial<Row> | null
+  chatConfigurationTargetResourceNames(this: void, chat: Chat): string[]
+  chatPreviewInTransaction(this: void, tx: Transaction, chatId: ChatId): Promise<string>
+  cloneDraft(this: void, draft: DraftRow): DraftRow
+  cloneMessage(this: void, message: Message): Message
+  cloneMessageHeader(this: void, message: MessageHeaderRow): MessageHeaderRow
+  hydrateStoredAttachment(
+    this: void,
+    header: AttachmentHeaderRow,
+    artifacts: Table<AttachmentArtifact, string>,
+  ): Promise<Attachment>
+  hydrateStoredMessage(this: void, header: MessageHeaderRow, body: MessageBodyRow): Message
+  listChildHeaderRows(
+    this: void,
+    table: Table<MessageHeaderRow, MessageId>,
+    chatId: ChatId,
+    parentId: MessageId | null,
+  ): Promise<MessageHeaderRow[]>
+  loadChatOrThrow(this: void, table: Table<Chat, string>, chatId: ChatId): Promise<Chat>
+  materializeChatMutationState(this: void, state: ChatMutationState): Chat
+  messageCost(this: void, message: Pick<Message, 'deleted' | 'generation'>): number
+  messageOutranksLeaf(
+    this: void,
+    message: Pick<Message, 'createdAt' | 'id'>,
+    leaf: Pick<MessageHeaderRow, 'createdAt' | 'id'>,
+  ): boolean
+  messageSemanticEffect(
+    this: void,
+    existingHeader: MessageHeaderRow,
+    existingBody: MessageBodyRow | undefined,
+    nextHeader: MessageHeaderRow,
+    nextBody: MessageBodyRow,
+    appliedBodyEffect?: AppliedMessageSemanticEffect,
+  ): AppliedMessageSemanticEffect
+  newestLiveLeafIdInTransaction(
+    this: void,
+    tx: Transaction,
+    chatId: ChatId,
+  ): Promise<MessageId | null>
+  nextBranchUpdatedAt(this: void, current: number, now: number): number
+  nextStreamLeaseRevision(this: void, lease: Pick<StreamLeaseRow, 'revision'>): number
+  readBranchPathInTransaction(
+    this: void,
+    tx: Transaction,
+    chatId: ChatId,
+    leafId: MessageId | null,
+    signal?: AbortSignal,
+  ): Promise<MessageHeaderRow[]>
+  recordMessageHeaderSummaryDeltas(
+    this: void,
+    state: ChatMutationState | undefined,
+    messageId: MessageId,
+    before: MessageHeaderRow,
+    after: MessageHeaderRow,
+  ): boolean
+  recordMessageSummaryDeltas(
+    this: void,
+    state: ChatMutationState | undefined,
+    messageId: MessageId,
+    before: Message,
+    after: Message,
+  ): boolean
+  recordNewMessageSummary(this: void, state: ChatMutationState, message: Message): void
+  replacementMessageBody(
+    this: void,
+    header: MessageHeaderRow,
+    patch: MessageBodyPatch,
+    options: { bodyVersion: number; updatedAt: number },
+  ): MessageBodyRow
+  requireChatMetadataPatch(this: void, patch: ChatMetadataPatch): ChatMetadataPatch
+  requiredStreamPostCommitEvidence(this: void, lease: StreamLeaseRow): StreamPostCommitEvidence
+  reserveStreamLeaseTarget(
+    this: void,
+    tx: FencedTransaction<'settings' | 'streamLeases'>,
+    incoming: StreamLeaseAdmission,
+  ): Promise<number>
+  shouldBumpLastBranchUpdatedAtFromHeaders(
+    this: void,
+    beforeChat: Chat,
+    nextLeafId: MessageId | null,
+    branchHeaders: readonly MessageHeaderRow[],
+    changedMessageIds: ReadonlySet<MessageId>,
+  ): boolean
+  shouldBumpStructuralLastBranchUpdatedAt(
+    this: void,
+    beforeChat: Chat,
+    previousBranchIds: ReadonlySet<MessageId>,
+    nextLeafId: MessageId | null,
+    nextBranchHeaders: readonly MessageHeaderRow[],
+    changedMessageIds: ReadonlySet<MessageId>,
+  ): boolean
+  stableStringify(this: void, value: unknown): string
+  streamOwnedMessageFieldsChanged(
+    this: void,
+    existingHeader: MessageHeaderRow,
+    existingBody: MessageBodyRow,
+    nextHeader: MessageHeaderRow,
+    nextBody: MessageBodyRow,
+  ): boolean
+  transitionMessageGenerationForDispatch(
+    this: void,
+    header: MessageHeaderRow,
+    generation: DispatchedGenerationMeta,
+  ): MessageHeaderRow
+  validateGenerationPromptPathClaim(
+    this: void,
+    tx: Transaction,
+    chatId: ChatId,
+    claim: GenerationPromptPathClaim,
+  ): Promise<ValidatedGenerationPromptPath>
 }
 
-export async function updatePromptPresetAndPropagateInBrowser(
-  db: Dexie,
-  grant: LockGrant,
-  input: UpdatePromptPresetAtomicInput,
-  bumpWorkspaceMeta: BumpWorkspaceMeta,
-): Promise<UpdatePromptPresetAtomicResult> {
-  return grant.runTransaction(
-    db,
-    ['chatSidebarRows', 'chats', 'presets', 'promptPresets', 'settings'],
-    async (tx: Transaction) => {
-      const promptTable = tx.table<PromptPreset, PromptPresetId>('promptPresets')
-      const existing = await promptTable.get(input.presetId)
-      if (!existing) return { kind: 'missing' }
-      const next: PromptPreset = {
-        ...existing,
-        ...input.patch,
-        id: existing.id,
-        kind: existing.kind,
-        createdAt: existing.createdAt,
-        updatedAt: input.now,
-      }
-      await promptTable.put(next)
-
-      const chatVersions: ChatCascadeVersion[] = []
-      const touchedPresetIds: PresetId[] = []
-      if (input.patch.text !== undefined && input.patch.text !== existing.text) {
-        const chatTable = tx.table<Chat, ChatId>('chats')
-        const chats = (await chatTable.toArray()).filter(
-          (chat) => chat.settings[input.slot.pinKey] === input.presetId,
-        )
-        for (const chat of chats) {
-          const written: Chat = {
-            ...chat,
-            settings: withPromptText(chat.settings, input.slot.textKey, input.patch.text),
-            updatedAt: input.now,
-            metaVersion: chat.metaVersion + 1,
-            summaryVersion: chat.summaryVersion + 1,
-          }
-          await chatTable.put(written)
-          await putChatSidebarProjection(tx, written)
-          chatVersions.push({
-            chatId: chat.id,
-            metaVersion: written.metaVersion,
-            summaryVersion: written.summaryVersion,
-          })
-        }
-        const presetTable = tx.table<ChatPreset, PresetId>('presets')
-        const presets = (await presetTable.toArray()).filter(
-          (preset) => preset.settings[input.slot.pinKey] === input.presetId,
-        )
-        for (const preset of presets) {
-          await presetTable.put({
-            ...preset,
-            settings: withPromptText(preset.settings, input.slot.textKey, input.patch.text),
-            updatedAt: input.now,
-          })
-          touchedPresetIds.push(preset.id)
-        }
-      }
-      await bumpWorkspaceMeta(tx, input.now)
-      return {
-        kind: 'updated',
-        promptPreset: next,
-        chats: chatVersions,
-        presetIds: touchedPresetIds,
-      }
-    },
-  )
+export interface BrowserMutationRunnerPort {
+  runMutation<T, U = T, ExtensionResult = undefined>(
+    scopes: MutationScope[],
+    fn: (ctx: MutationContext, operations: BrowserMutationOperations) => Promise<T> | T,
+    options: WorkspaceMutationOptions | undefined,
+    commandCommit: BrowserMutationCommandPort,
+    finalize?: (ctx: MutationFinalizationContext, value: T) => Promise<U> | U,
+    transactionExtension?: BrowserMutationTransactionExtension<T, ExtensionResult>,
+  ): Promise<WorkspaceMutationResult<U> & { readonly transactionExtensionResult: ExtensionResult }>
 }
 
-export async function deletePromptPresetAndClearPinsInBrowser(
-  db: Dexie,
-  grant: LockGrant,
-  input: DeletePromptPresetAtomicInput,
-  bumpWorkspaceMeta: BumpWorkspaceMeta,
-): Promise<DeletePromptPresetAtomicResult> {
-  return grant.runTransaction(
-    db,
-    ['chatSidebarRows', 'chats', 'presets', 'promptPresets', 'settings'],
-    async (tx: Transaction) => {
-      const promptTable = tx.table<PromptPreset, PromptPresetId>('promptPresets')
-      if (!(await promptTable.get(input.presetId))) return { kind: 'missing' }
-
-      const chatTable = tx.table<Chat, ChatId>('chats')
-      const chats = (await chatTable.toArray()).filter(
-        (chat) => chat.settings[input.slot.pinKey] === input.presetId,
-      )
-      const chatVersions: ChatCascadeVersion[] = []
-      for (const chat of chats) {
-        const written: Chat = {
-          ...chat,
-          settings: withoutPromptPin(chat.settings, input.slot.pinKey),
-          updatedAt: input.now,
-          metaVersion: chat.metaVersion + 1,
-          summaryVersion: chat.summaryVersion + 1,
-        }
-        await chatTable.put(written)
-        await putChatSidebarProjection(tx, written)
-        chatVersions.push({
-          chatId: chat.id,
-          metaVersion: written.metaVersion,
-          summaryVersion: written.summaryVersion,
-        })
-      }
-      const presetTable = tx.table<ChatPreset, PresetId>('presets')
-      const presets = (await presetTable.toArray()).filter(
-        (preset) => preset.settings[input.slot.pinKey] === input.presetId,
-      )
-      const touchedPresetIds: PresetId[] = []
-      for (const preset of presets) {
-        await presetTable.put({
-          ...preset,
-          settings: withoutPromptPin(preset.settings, input.slot.pinKey),
-          updatedAt: input.now,
-        })
-        touchedPresetIds.push(preset.id)
-      }
-      await promptTable.delete(input.presetId)
-      await bumpWorkspaceMeta(tx, input.now)
-      return { kind: 'deleted', chats: chatVersions, presetIds: touchedPresetIds }
-    },
-  )
+export interface BrowserMutationCommandPort extends BrowserCommandSessionPort {
+  assertReplacementEpoch(expectedReplacementEpoch: number): void
 }
 
-export async function createChatInBrowser(
-  db: Dexie,
-  grant: LockGrant,
-  chat: Chat,
-  bumpWorkspaceMeta: BumpWorkspaceMeta,
-): Promise<Chat> {
-  await grant.runTransaction(
-    db,
-    ['chatSidebarRows', 'chats', 'settings'],
-    async (tx: Transaction) => {
-      await tx.table<Chat, ChatId>('chats').add(structuredClone(chat))
-      await putChatSidebarProjection(tx, chat, true)
-      await bumpWorkspaceMeta(tx, chat.updatedAt)
-    },
-  )
-  return structuredClone(chat)
+export interface BrowserGenerationCommandPort extends BrowserMutationRunnerPort {
+  getStreamLease(streamId: string): Promise<StreamLeaseRow | undefined>
 }
 
-function isEmptyDraftRow(draft: DraftRow | undefined): boolean {
-  return (
-    draft === undefined || (draft.text.trim().length === 0 && draft.attachmentRefs.length === 0)
-  )
+export interface BrowserGenerationCommandSupport {
+  readonly GENERATION_METADATA_TRANSACTION: PhysicalTransactionPlan<
+    | 'configurationProfileCatalogRows'
+    | 'chatSidebarAggregates'
+    | 'chatSidebarRows'
+    | 'chats'
+    | 'configurationCatalogAggregates'
+    | 'configurationPresetCatalogRows'
+    | 'keys'
+    | 'messages'
+    | 'presets'
+    | 'profiles'
+    | 'settings'
+    | 'streamLeases'
+  >
+  appendValidatedGenerationPromptPath(
+    this: void,
+    path: ValidatedGenerationPromptPath,
+    header: MessageHeaderRow,
+  ): ValidatedGenerationPromptPath
+  applyMessageCalibrationPatch(
+    this: void,
+    header: MessageHeaderRow,
+    patch: MessageCalibrationPatch,
+  ): MessageHeaderRow
+  assertNewChatAttemptRow(this: void, chat: Chat, chatId: ChatId): void
+  assertPreparedAttemptMessage(
+    this: void,
+    message: Message,
+    lease: StreamLeaseAdmission,
+    role: 'assistant',
+    origin: 'generated',
+  ): asserts message is Message & { generation: GenerationMeta }
+  assertPreparedAttemptMessage(
+    this: void,
+    message: Message,
+    lease: StreamLeaseAdmission,
+    role: 'user',
+    origin: 'user',
+  ): void
+  calibrationUsageFromPostCommit(this: void, usage: StreamPostCommitUsageEvidence): ChatUsage
+  chatConfigurationTargetResourceNames(this: void, chat: Chat): string[]
+  chatTokenCalibrationGeneration(this: void, chat: Pick<Chat, 'tokenCalibrationGeneration'>): number
+  cloneMessageHeader(this: void, message: MessageHeaderRow): MessageHeaderRow
+  continuationGlobalCalibration(this: void, value: unknown): GlobalTokenCalibration | undefined
+  dedupeMutationScopes(this: void, scopes: readonly MutationScope[]): MutationScope[]
+  monotonicTimestamp(this: void, current: number | undefined, next: number): number
+  persistPreparedAttachmentBundleInMutation(
+    this: void,
+    ctx: MutationContext,
+    bundle: PreparedAttachmentBundle,
+    current?: Attachment,
+  ): Promise<void>
+  preparedAttachmentIdentityMatches(this: void, current: Attachment, prepared: Attachment): boolean
+  preparedGenerationPrompt(
+    this: void,
+    leafId: MessageId | null,
+    canonicalHeaders: ValidatedGenerationPromptPathHeaders,
+    messageProofs: readonly GenerationMessageReadProof[],
+    knownPresentations: readonly [] | readonly [MessagePresentation],
+  ): PreparedGenerationPrompt
+  preparedMessage(
+    this: void,
+    message: Message,
+    parentId: MessageId | null,
+    siblingIndex: number,
+  ): Message
+  requiredPromptPathSlot(
+    this: void,
+    path: ResolvedGenerationPromptPath,
+    chatId: ChatId,
+  ): ChildListState
+  requiredPromptPathTarget(
+    this: void,
+    path: ResolvedGenerationPromptPath,
+    chatId: ChatId,
+  ): MessageHeaderRow
+  resolveGenerationPromptPathProof(
+    this: void,
+    ctx: MutationContext,
+    chatId: ChatId,
+    proof: GenerationPromptPathProof,
+    path: ValidatedGenerationPromptPath,
+  ): Promise<ResolvedGenerationPromptPath>
+  stableStringify(this: void, value: unknown): string
+  streamFenceMatches(
+    this: void,
+    lease: StreamLeaseRow | undefined,
+    fence: StreamWriteFence,
+    replacementEpoch: number,
+  ): lease is FencedStreamLeaseRow
 }
 
-function isEmptyMaterializedDraftChat(chat: Chat): boolean {
-  const hasCalibration = Object.keys(chat.tokenCalibration ?? {}).length > 0
-  const legacyHiddenDraft =
-    chat.temporary === undefined &&
-    chat.presetId === undefined &&
-    chat.title.trim().length === 0 &&
-    chat.titleStatus === 'untitled' &&
-    (chat.previewText === undefined || chat.previewText === '')
-  return (
-    (chat.temporary === true || legacyHiddenDraft) &&
-    chat.lastUpdatedLeafId === null &&
-    chat.wordCount === 0 &&
-    chat.totalCostUsd === 0 &&
-    !hasCalibration
-  )
+export interface BrowserLockedCommandPort {
+  runTransaction<Tables extends PhysicalStorageTableName, T>(
+    plan: PhysicalTransactionPlan<Tables>,
+    operation: (tx: FencedTransaction<Tables>) => Promise<T> | T,
+  ): Promise<T>
 }
 
-export async function discardEmptyDraftChatsInBrowser(
-  db: Dexie,
-  grant: LockGrant,
-  input: { chatIds?: readonly ChatId[]; exceptChatId?: ChatId | null },
-  now: number,
-  bumpWorkspaceMeta: BumpWorkspaceMeta,
-): Promise<ChatId[]> {
-  return grant.runTransaction(
-    db,
-    [
-      'chatBranchCache',
-      'chatSidebarRows',
-      'chats',
-      'childLists',
-      'drafts',
-      'messageBodies',
-      'messages',
-      'settings',
-      'streamChunks',
-      'streamLeases',
-    ],
-    async (tx: Transaction) => {
-      const chatTable = tx.table<Chat, ChatId>('chats')
-      const candidates =
-        input.chatIds === undefined
-          ? await chatTable.where('wordCount').equals(0).toArray()
-          : (await chatTable.bulkGet([...new Set(input.chatIds)])).filter(
-              (chat): chat is Chat => chat !== undefined,
-            )
-      const deleted: ChatId[] = []
-      for (const candidate of candidates) {
-        if (candidate.id === input.exceptChatId) continue
-        const chat = await chatTable.get(candidate.id)
-        if (!chat || !isEmptyMaterializedDraftChat(chat)) continue
-        const messageTable = tx.table<{ chatId: ChatId }, string>('messages')
-        const draftTable = tx.table<DraftRow, ChatId>('drafts')
-        const [message, draft, streamLease] = await Promise.all([
-          messageTable.where('chatId').equals(chat.id).first(),
-          draftTable.get(chat.id),
-          tx
-            .table<{ chatId: ChatId }, string>('streamLeases')
-            .where('chatId')
-            .equals(chat.id)
-            .first(),
-        ])
-        if (message || !isEmptyDraftRow(draft) || streamLease) continue
-        await messageTable.where('chatId').equals(chat.id).delete()
-        await tx.table('messageBodies').where('chatId').equals(chat.id).delete()
-        await draftTable.delete(chat.id)
-        await tx.table('chatBranchCache').delete(chat.id)
-        await tx
-          .table('childLists')
-          .filter((row: { chatId?: unknown }) => row.chatId === chat.id)
-          .delete()
-        await tx.table('streamChunks').where('chatId').equals(chat.id).delete()
-        await chatTable.delete(chat.id)
-        deleted.push(chat.id)
-      }
-      if (deleted.length > 0) {
-        await deleteChatSidebarProjections(tx, deleted)
-        await bumpWorkspaceMeta(tx, now)
-      }
-      return deleted
-    },
-  )
+export interface BrowserCommandSessionPort {
+  withLocks<T>(
+    resourceNames: readonly string[],
+    operation: (locked: BrowserLockedCommandPort) => Promise<T> | T,
+  ): Promise<T>
 }

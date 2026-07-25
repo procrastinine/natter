@@ -139,6 +139,7 @@ export function Dialog({
         aria-label={scrimLabel}
         tabIndex={-1}
         onClick={closeOnScrim ? onClose : undefined}
+        disabled={!closeOnScrim}
       />
       {createElement(
         surfaceAs,

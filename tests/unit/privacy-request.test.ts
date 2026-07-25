@@ -1,74 +1,242 @@
-// Request-time privacy resolution. Covers the cache-read path and the
-// guard rails for free-model + non-OpenRouter connections.
-//
-// The resolver is intentionally pure in the sense that it reads only from
-// the two Dexie cache rows (endpoints + privacy policies). It never
-// triggers a fetch — the hook layer keeps caches warm. See
-// `src/core/privacy-request.ts`.
-
-import Dexie from 'dexie'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type * as ModelsModule from '../../src/api/models'
-import { fetchEndpoints } from '../../src/api/models'
-import type * as PrivacyScrapeModule from '../../src/api/privacy-scrape'
-import { fetchPrivacyScrape } from '../../src/api/privacy-scrape'
-import { type CorsProxyConfig, DEV_CORS_PROXY_URL } from '../../src/core/cors-proxy'
-import { cloneDefaultChatSettings, cloneDefaultPrivacyPrefs } from '../../src/core/defaults'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import type { AssistantPlanningResources } from '../../src/core/assistant-planning-resources'
+import { DEV_CORS_PROXY_URL } from '../../src/core/cors-proxy'
+import { cloneDefaultChatSettings } from '../../src/core/defaults'
+import type { Chat, ConnectionProfile, DataPolicy, EndpointsDescriptor } from '../../src/core/types'
 import {
+  buildPrivacyForSendResult,
   PrivacyDiscoveryUnavailableError,
   resolvePrivacyForSend,
-} from '../../src/core/privacy-request'
-import type { Chat, ConnectionProfile } from '../../src/core/types'
-import { __resetBroadcastForTests } from '../../src/store/broadcast'
-import { __resetDbForTests, openDb } from '../../src/store/db'
-import {
-  __resetModelsInFlightForTests,
-  dedupedEndpointsFetch,
-  putCachedEndpoints,
-} from '../../src/store/models-cache'
-import {
-  __resetPrivacyInFlightForTests,
-  EMPTY_PRIVACY_POLICY_RETRY_MS,
-  putCachedPrivacyPolicy,
-} from '../../src/store/privacy-cache'
+} from '../../src/store/request-privacy-planning'
 
-vi.mock('../../src/api/models', async () => {
-  const actual = await vi.importActual<typeof ModelsModule>('../../src/api/models')
-  return { ...actual, fetchEndpoints: vi.fn() }
+const cloneDefaultPrivacyPrefs = () => cloneDefaultChatSettings().privacy
+
+afterEach(() => {
+  vi.useRealTimers()
 })
 
-vi.mock('../../src/api/privacy-scrape', async () => {
-  const actual = await vi.importActual<typeof PrivacyScrapeModule>('../../src/api/privacy-scrape')
-  return { ...actual, fetchPrivacyScrape: vi.fn() }
+describe('request privacy planning', () => {
+  it('skips discovery for non-OpenRouter connections', async () => {
+    const resources = planningResources(descriptor(), {})
+    const result = await resolvePrivacyForSend({
+      chat: chat(),
+      profile: profile('openai-compatible'),
+      resources,
+    })
+
+    expect(result.applicable).toBe(false)
+    expect(result.wire).toBeNull()
+    expect(resources.resolveEndpoints).not.toHaveBeenCalled()
+    expect(resources.resolvePrivacy).not.toHaveBeenCalled()
+  })
+
+  it('resolves endpoint capability but skips privacy discovery and provider routing for free models', async () => {
+    const resources = planningResources(descriptor(), {})
+    const result = await resolvePrivacyForSend({
+      chat: chat({ model: 'deepseek/deepseek-r1:free' }),
+      profile: profile(),
+      resources,
+    })
+
+    expect(result.applicable).toBe(false)
+    expect(resources.resolveEndpoints).toHaveBeenCalledOnce()
+    const endpointCall = vi.mocked(resources.resolveEndpoints).mock.calls[0]
+    expect(endpointCall?.[0]).toBe('deepseek/deepseek-r1:free')
+    expect(endpointCall?.[1]?.signal).toBeInstanceOf(AbortSignal)
+    expect(resources.resolvePrivacy).not.toHaveBeenCalled()
+  })
+
+  it('resolves endpoints and policies through the captured planning resources', async () => {
+    const resources = planningResources(descriptor(), {
+      azure: policy(),
+      openai: policy({ retainsPrompts: true, requiresUserIDs: true }),
+    })
+    const result = await resolvePrivacyForSend({ chat: chat(), profile: profile(), resources })
+
+    const endpointCall = vi.mocked(resources.resolveEndpoints).mock.calls[0]
+    expect(endpointCall?.[0]).toBe('openai/gpt-5.4')
+    expect(endpointCall?.[1]?.signal).toBeInstanceOf(AbortSignal)
+    const privacyCall = vi.mocked(resources.resolvePrivacy).mock.calls[0]
+    expect(privacyCall?.[0]).toBe('openai/gpt-5.4')
+    expect(privacyCall?.[1].refresh).toBe(true)
+    expect(privacyCall?.[1].signal).toBeInstanceOf(AbortSignal)
+    expect(result.filter?.kept.map((row) => row.endpoint.provider_name)).toEqual(['Azure'])
+    expect(result.wire?.ignore).toContain('openai')
+    expect(result.wire?.data_collection).toBe('deny')
+  })
+
+  it('does not request a live scrape when the captured proxy is disabled', async () => {
+    const resources = planningResources(descriptor(), {}, { proxyUrl: '' })
+
+    await resolvePrivacyForSend({ chat: chat(), profile: profile(), resources })
+
+    const privacyCall = vi.mocked(resources.resolvePrivacy).mock.calls[0]
+    expect(privacyCall?.[0]).toBe('openai/gpt-5.4')
+    expect(privacyCall?.[1].refresh).toBe(false)
+    expect(privacyCall?.[1].signal).toBeInstanceOf(AbortSignal)
+  })
+
+  it('does not request a scrape when every endpoint embeds a data policy', async () => {
+    const embedded = descriptor([
+      endpoint('Azure', 'azure', { data_policy: policy() }),
+      endpoint('OpenAI', 'openai', { data_policy: policy() }),
+    ])
+    const resources = planningResources(embedded, {})
+
+    await resolvePrivacyForSend({ chat: chat(), profile: profile(), resources })
+
+    const privacyCall = vi.mocked(resources.resolvePrivacy).mock.calls[0]
+    expect(privacyCall?.[0]).toBe('openai/gpt-5.4')
+    expect(privacyCall?.[1].refresh).toBe(false)
+    expect(privacyCall?.[1].signal).toBeInstanceOf(AbortSignal)
+  })
+
+  it('blocks the send when endpoint discovery fails', async () => {
+    const resources = planningResources(descriptor(), {})
+    vi.mocked(resources.resolveEndpoints).mockRejectedValueOnce(new Error('network down'))
+
+    await expect(
+      resolvePrivacyForSend({ chat: chat(), profile: profile(), resources }),
+    ).rejects.toBeInstanceOf(PrivacyDiscoveryUnavailableError)
+  })
+
+  it('applies the send deadline without mutating the shared resource promise', async () => {
+    vi.useFakeTimers()
+    const resources = planningResources(descriptor(), {})
+    const shared = new Promise<EndpointsDescriptor | null>(() => {})
+    vi.mocked(resources.resolveEndpoints).mockReturnValueOnce(shared)
+    const pending = resolvePrivacyForSend({ chat: chat(), profile: profile(), resources })
+    const rejection = expect(pending).rejects.toBeInstanceOf(PrivacyDiscoveryUnavailableError)
+
+    await vi.advanceTimersByTimeAsync(15_000)
+
+    await rejection
+    expect(resources.resolveEndpoints).toHaveBeenCalledOnce()
+  })
+
+  it('lets an aborted send stop waiting through the resource boundary', async () => {
+    const resources = planningResources(descriptor(), {})
+    vi.mocked(resources.resolveEndpoints).mockReturnValueOnce(
+      new Promise<EndpointsDescriptor | null>(() => {}),
+    )
+    const controller = new AbortController()
+    const pending = resolvePrivacyForSend({
+      chat: chat(),
+      profile: profile(),
+      resources,
+      signal: controller.signal,
+    })
+
+    controller.abort()
+
+    await expect(pending).rejects.toBeInstanceOf(PrivacyDiscoveryUnavailableError)
+    const operationSignal = vi.mocked(resources.resolveEndpoints).mock.calls[0]?.[1]?.signal
+    expect(operationSignal).not.toBe(controller.signal)
+    expect(operationSignal?.aborted).toBe(true)
+    expect(operationSignal?.reason).toBe(controller.signal.reason)
+  })
+
+  it('flags zero eligible when every endpoint trains on prompts', () => {
+    const policies = {
+      azure: policy({ training: true, retainsPrompts: true }),
+      openai: policy({ training: true, retainsPrompts: true }),
+    }
+
+    const result = buildPrivacyForSendResult({
+      chat: chat(),
+      profile: profile(),
+      facts: { descriptor: descriptor(), policies, offlineFallback: false },
+    })
+
+    expect(result.filter?.zeroEligible).toBe(true)
+    expect(result.wire?.zeroEligible).toBe(true)
+  })
+
+  it('uses an explicit provider ignore list verbatim after the user touches the picker', () => {
+    const selected = chat()
+    selected.settings.providerPrefs = {
+      ignore: ['openai'],
+      only: ['azure'],
+      order: ['azure'],
+      ignoreOverridesFilter: true,
+    }
+    const result = buildPrivacyForSendResult({
+      chat: selected,
+      profile: profile(),
+      facts: {
+        descriptor: descriptor(),
+        policies: { azure: policy(), openai: policy() },
+        offlineFallback: false,
+      },
+    })
+
+    expect(result.wire?.ignore).toEqual(['openai'])
+    expect(result.wire?.only).toEqual(['azure'])
+    expect(result.wire?.order).toEqual(['azure'])
+  })
+
+  it('keeps duplicate display names independently addressable by provider slug', () => {
+    const duplicateNames = descriptor([
+      endpoint('DeepInfra', 'deepinfra/fp8'),
+      endpoint('DeepInfra', 'deepinfra/fp4'),
+    ])
+    const result = buildPrivacyForSendResult({
+      chat: chat(),
+      profile: profile(),
+      facts: {
+        descriptor: duplicateNames,
+        policies: {
+          'deepinfra/fp8': policy({ training: true, retainsPrompts: true }),
+          'deepinfra/fp4': policy(),
+        },
+        offlineFallback: false,
+      },
+    })
+
+    expect(result.filter?.kept.map((row) => row.endpoint.provider_slug)).toEqual(['deepinfra/fp4'])
+    expect(result.wire?.ignore).toContain('deepinfra/fp8')
+    expect(result.wire?.ignore).not.toContain('deepinfra/fp4')
+  })
+
+  it('adds insufficient-context providers to this request without changing settings', () => {
+    const selected = chat()
+    const before = structuredClone(selected.settings.providerPrefs)
+    const result = buildPrivacyForSendResult({
+      chat: selected,
+      profile: profile(),
+      facts: {
+        descriptor: descriptor([
+          endpoint('Azure', 'azure', { context_length: 8_000 }),
+          endpoint('OpenAI', 'openai', { context_length: 200_000 }),
+        ]),
+        policies: { azure: policy(), openai: policy() },
+        offlineFallback: false,
+      },
+      neededTokens: 20_000,
+    })
+
+    expect(result.contextIgnoredProviders).toEqual(['azure'])
+    expect(result.wire?.ignore).toContain('azure')
+    expect(selected.settings.providerPrefs).toEqual(before)
+  })
 })
 
-const fetchEndpointsMock = vi.mocked(fetchEndpoints)
-const fetchPrivacyScrapeMock = vi.mocked(fetchPrivacyScrape)
-
-const DB_NAME = 'natter'
-
-async function resetAll() {
-  __resetDbForTests()
-  __resetBroadcastForTests()
-  __resetModelsInFlightForTests()
-  __resetPrivacyInFlightForTests()
-  await Dexie.delete(DB_NAME)
+function planningResources(
+  endpoints: EndpointsDescriptor,
+  policies: Readonly<Record<string, DataPolicy>>,
+  options: { proxyUrl?: string; offlineFallback?: boolean } = {},
+): AssistantPlanningResources {
+  return {
+    proxy: vi.fn(() => ({ url: options.proxyUrl ?? DEV_CORS_PROXY_URL, secret: '' })),
+    resolveEndpoints: vi.fn(async () => endpoints),
+    resolvePrivacy: vi.fn(async () => ({
+      policies,
+      offlineFallback: options.offlineFallback ?? false,
+    })),
+  } as unknown as AssistantPlanningResources
 }
 
-beforeEach(async () => {
-  vi.clearAllMocks()
-  await resetAll()
-  await openDb()
-})
-
-afterEach(async () => {
-  vi.useRealTimers()
-  await resetAll()
-})
-
-const TEST_PROXY: CorsProxyConfig = { url: DEV_CORS_PROXY_URL, secret: '' }
-
-function makeProfile(kind: ConnectionProfile['kind'] = 'openrouter'): ConnectionProfile {
+function profile(kind: ConnectionProfile['kind'] = 'openrouter'): ConnectionProfile {
   return {
     id: 'prof-1',
     name: 'OpenRouter',
@@ -86,7 +254,7 @@ function makeProfile(kind: ConnectionProfile['kind'] = 'openrouter'): Connection
   }
 }
 
-function makeChat(overrides: Partial<Chat['settings']> = {}): Chat {
+function chat(overrides: Partial<Chat['settings']> = {}): Chat {
   const settings = cloneDefaultChatSettings()
   settings.profileId = 'prof-1'
   settings.model = 'openai/gpt-5.4'
@@ -103,6 +271,8 @@ function makeChat(overrides: Partial<Chat['settings']> = {}): Chat {
     totalCostUsd: 0,
     metaVersion: 0,
     summaryVersion: 0,
+    structuralVersion: 0,
+    configurationVersion: 0,
     settings,
     lastUpdatedLeafId: null,
     lastBranchUpdatedAt: 0,
@@ -110,471 +280,42 @@ function makeChat(overrides: Partial<Chat['settings']> = {}): Chat {
     pinned: false,
     folderId: null,
     tags: [],
+    previewText: '',
   }
 }
 
-describe('resolvePrivacyForSend', () => {
-  it('returns { applicable: false } for non-OpenRouter profiles', async () => {
-    const chat = makeChat()
-    const profile = makeProfile('openai-compatible')
-    const r = await resolvePrivacyForSend({ chat, profile, proxy: TEST_PROXY })
-    expect(r.applicable).toBe(false)
-    expect(r.wire).toBeNull()
-    expect(r.filter).toBeNull()
-  })
+function descriptor(
+  endpoints: EndpointsDescriptor['endpoints'] = [
+    endpoint('Azure', 'azure'),
+    endpoint('OpenAI', 'openai'),
+  ],
+): EndpointsDescriptor {
+  return { modelId: 'openai/gpt-5.4', endpoints }
+}
 
-  it('returns { applicable: false } on a free model', async () => {
-    const chat = makeChat({ model: 'deepseek/deepseek-r1:free' })
-    const profile = makeProfile()
-    const r = await resolvePrivacyForSend({ chat, profile, proxy: TEST_PROXY })
-    expect(r.applicable).toBe(false)
-  })
+function endpoint(
+  providerName: string,
+  providerSlug: string,
+  overrides: Partial<EndpointsDescriptor['endpoints'][number]> = {},
+): EndpointsDescriptor['endpoints'][number] {
+  return {
+    provider_name: providerName,
+    provider_slug: providerSlug,
+    supported_parameters: ['temperature'],
+    context_length: 200_000,
+    pricing: { prompt: '0.0000025', completion: '0.00001' },
+    ...overrides,
+  }
+}
 
-  it('does not reuse the paid model privacy cache for a :free variant of the same base slug', async () => {
-    const profile = makeProfile()
-    await putCachedEndpoints('prof-1', 'google/gemma-3-12b-it', {
-      id: 'google/gemma-3-12b-it',
-      endpoints: [
-        {
-          provider_name: 'DeepInfra',
-          supported_parameters: ['temperature'],
-          context_length: 128000,
-          pricing: { prompt: '0.000001', completion: '0.000002' },
-        },
-      ],
-    })
-    await putCachedPrivacyPolicy('prof-1', 'google/gemma-3-12b-it', {
-      policies: {
-        DeepInfra: {
-          training: false,
-          trainingOpenRouter: false,
-          retainsPrompts: false,
-          canPublish: false,
-          termsOfServiceURL: '',
-          privacyPolicyURL: '',
-        },
-      },
-      fetchedAt: 0,
-    })
-    const chat = makeChat({ model: 'google/gemma-3-12b-it:free' })
-    const r = await resolvePrivacyForSend({ chat, profile, proxy: TEST_PROXY })
-    expect(r.applicable).toBe(false)
-    expect(r.wire).toBeNull()
-    expect(r.filter).toBeNull()
-  })
-
-  it('fetches endpoints and privacy before sending when caches are cold', async () => {
-    fetchEndpointsMock.mockResolvedValueOnce({
-      id: 'openai/gpt-5.4',
-      endpoints: [
-        {
-          provider_name: 'Azure',
-          supported_parameters: ['temperature'],
-          context_length: 200000,
-          pricing: { prompt: '0.0000025', completion: '0.00001' },
-        },
-        {
-          provider_name: 'OpenAI',
-          supported_parameters: ['temperature'],
-          context_length: 200000,
-          pricing: { prompt: '0.0000025', completion: '0.00001' },
-        },
-      ],
-    })
-    fetchPrivacyScrapeMock.mockResolvedValueOnce({
-      modelId: 'openai/gpt-5.4',
-      policies: {},
-      raw: {
-        policies: {
-          Azure: {
-            training: false,
-            trainingOpenRouter: false,
-            retainsPrompts: false,
-            canPublish: false,
-            termsOfServiceURL: '',
-            privacyPolicyURL: '',
-          },
-          OpenAI: {
-            training: false,
-            trainingOpenRouter: false,
-            retainsPrompts: true,
-            requiresUserIDs: true,
-            canPublish: false,
-            termsOfServiceURL: '',
-            privacyPolicyURL: '',
-          },
-        },
-        fetchedAt: Date.now(),
-      },
-      fetchedAt: Date.now(),
-    })
-    const chat = makeChat()
-    const profile = makeProfile()
-    const r = await resolvePrivacyForSend({ chat, profile, proxy: TEST_PROXY })
-    expect(r.applicable).toBe(true)
-    expect(fetchEndpointsMock).toHaveBeenCalledTimes(1)
-    expect(fetchPrivacyScrapeMock).toHaveBeenCalledTimes(1)
-    expect(r.filter?.kept.map((k) => k.endpoint.provider_name)).toEqual(['Azure'])
-    expect(r.wire?.ignore).toContain('OpenAI')
-    expect(r.wire?.data_collection).toBe('deny')
-  })
-
-  it('does not live-scrape when the privacy proxy is disabled', async () => {
-    await putCachedEndpoints('prof-1', 'openai/gpt-5.4', {
-      id: 'openai/gpt-5.4',
-      endpoints: [
-        {
-          provider_name: 'Azure',
-          supported_parameters: ['temperature'],
-          context_length: 200000,
-          pricing: { prompt: '0.0000025', completion: '0.00001' },
-        },
-      ],
-    })
-    const chat = makeChat()
-    const profile = makeProfile()
-    const r = await resolvePrivacyForSend({ chat, profile, proxy: { url: '', secret: '' } })
-
-    expect(fetchPrivacyScrapeMock).not.toHaveBeenCalled()
-    expect(r.applicable).toBe(true)
-    expect(r.filter?.zeroEligible).toBe(false)
-    expect(r.filter?.kept.map((row) => row.endpoint.provider_name)).toEqual(['Azure'])
-    expect(r.wire?.zeroEligible).toBe(false)
-  })
-
-  it('blocks instead of sending without privacy routing when cold endpoint discovery fails', async () => {
-    fetchEndpointsMock.mockRejectedValueOnce(new Error('network down'))
-    const chat = makeChat()
-    const profile = makeProfile()
-
-    await expect(
-      resolvePrivacyForSend({ chat, profile, proxy: TEST_PROXY }),
-    ).rejects.toBeInstanceOf(PrivacyDiscoveryUnavailableError)
-  })
-
-  it('applies the send deadline while a longer shared endpoint fetch remains in flight', async () => {
-    vi.useFakeTimers()
-    let resolveFetchStarted!: () => void
-    const fetchStarted = new Promise<void>((resolve) => {
-      resolveFetchStarted = resolve
-    })
-    void dedupedEndpointsFetch('prof-1', 'openai/gpt-5.4', () => {
-      resolveFetchStarted()
-      return new Promise<never>(() => {})
-    })
-    await fetchStarted
-    const pending = resolvePrivacyForSend({
-      chat: makeChat(),
-      profile: makeProfile(),
-      proxy: TEST_PROXY,
-    })
-    const rejected = expect(pending).rejects.toBeInstanceOf(PrivacyDiscoveryUnavailableError)
-    for (let index = 0; index < 10; index += 1) await Promise.resolve()
-
-    await vi.advanceTimersByTimeAsync(15_000)
-
-    await rejected
-  })
-
-  it('lets an aborted send stop waiting without cancelling shared endpoint discovery', async () => {
-    let resolveFetchStarted!: () => void
-    const fetchStarted = new Promise<void>((resolve) => {
-      resolveFetchStarted = resolve
-    })
-    void dedupedEndpointsFetch('prof-1', 'openai/gpt-5.4', () => {
-      resolveFetchStarted()
-      return new Promise<never>(() => {})
-    })
-    await fetchStarted
-    const controller = new AbortController()
-    const pending = resolvePrivacyForSend({
-      chat: makeChat(),
-      profile: makeProfile(),
-      proxy: TEST_PROXY,
-      signal: controller.signal,
-    })
-    const rejected = expect(pending).rejects.toBeInstanceOf(PrivacyDiscoveryUnavailableError)
-
-    controller.abort()
-
-    await rejected
-  })
-
-  it('runs the filter and builds a wire block when both caches are warm', async () => {
-    const chat = makeChat()
-    const profile = makeProfile()
-    await putCachedEndpoints('prof-1', 'openai/gpt-5.4', {
-      id: 'openai/gpt-5.4',
-      endpoints: [
-        {
-          provider_name: 'Azure',
-          supported_parameters: ['temperature'],
-          context_length: 200000,
-          pricing: { prompt: '0.0000025', completion: '0.00001' },
-        },
-        {
-          provider_name: 'OpenAI',
-          supported_parameters: ['temperature'],
-          context_length: 200000,
-          pricing: { prompt: '0.0000025', completion: '0.00001' },
-        },
-      ],
-    })
-    await putCachedPrivacyPolicy('prof-1', 'openai/gpt-5.4', {
-      policies: {
-        Azure: {
-          training: false,
-          trainingOpenRouter: false,
-          retainsPrompts: false,
-          canPublish: false,
-          termsOfServiceURL: '',
-          privacyPolicyURL: '',
-        },
-        OpenAI: {
-          training: false,
-          trainingOpenRouter: false,
-          retainsPrompts: true,
-          requiresUserIDs: true,
-          canPublish: false,
-          termsOfServiceURL: '',
-          privacyPolicyURL: '',
-        },
-      },
-      fetchedAt: 0,
-    })
-    const r = await resolvePrivacyForSend({ chat, profile, proxy: TEST_PROXY })
-    expect(r.applicable).toBe(true)
-    expect(r.filter?.kept.map((k) => k.endpoint.provider_name)).toEqual(['Azure'])
-    expect(r.wire?.ignore).toContain('OpenAI')
-    expect(r.wire?.data_collection).toBe('deny')
-    expect(r.wire?.zeroEligible).toBe(false)
-  })
-
-  it('reuses a recent empty privacy result and refetches it after the short retry TTL', async () => {
-    const chat = makeChat({ model: 'deepseek/deepseek-v4-flash' })
-    const profile = makeProfile()
-    await putCachedEndpoints('prof-1', 'deepseek/deepseek-v4-flash', {
-      id: 'deepseek/deepseek-v4-flash',
-      endpoints: [
-        {
-          provider_name: 'DeepSeek',
-          provider_slug: 'deepseek',
-          supported_parameters: ['temperature'],
-          context_length: 1048576,
-          pricing: {},
-        },
-        {
-          provider_name: 'DeepInfra',
-          provider_slug: 'deepinfra/fp4',
-          supported_parameters: ['temperature'],
-          context_length: 1048576,
-          pricing: {},
-        },
-      ],
-    })
-    const cachedAt = Date.now()
-    await putCachedPrivacyPolicy(
-      'prof-1',
-      'deepseek/deepseek-v4-flash',
-      { policies: {}, fetchedAt: cachedAt },
-      cachedAt,
-    )
-    fetchPrivacyScrapeMock.mockResolvedValueOnce({
-      modelId: 'deepseek/deepseek-v4-flash',
-      policies: {},
-      raw: {
-        policies: {
-          deepseek: {
-            training: true,
-            trainingOpenRouter: false,
-            retainsPrompts: true,
-            canPublish: false,
-            termsOfServiceURL: '',
-            privacyPolicyURL: '',
-          },
-          'deepinfra/fp4': {
-            training: false,
-            trainingOpenRouter: false,
-            retainsPrompts: false,
-            canPublish: false,
-            termsOfServiceURL: '',
-            privacyPolicyURL: '',
-          },
-        },
-        fetchedAt: Date.now(),
-      },
-      fetchedAt: Date.now(),
-    })
-
-    const cachedResult = await resolvePrivacyForSend({ chat, profile, proxy: TEST_PROXY })
-    expect(fetchPrivacyScrapeMock).not.toHaveBeenCalled()
-    expect(cachedResult.applicable).toBe(true)
-
-    await putCachedPrivacyPolicy(
-      'prof-1',
-      'deepseek/deepseek-v4-flash',
-      { policies: {}, fetchedAt: cachedAt - EMPTY_PRIVACY_POLICY_RETRY_MS - 1 },
-      cachedAt - EMPTY_PRIVACY_POLICY_RETRY_MS - 1,
-    )
-    const refreshedResult = await resolvePrivacyForSend({ chat, profile, proxy: TEST_PROXY })
-
-    expect(fetchPrivacyScrapeMock).toHaveBeenCalledTimes(1)
-    expect(refreshedResult.filter?.kept.map((k) => k.endpoint.provider_name)).toEqual(['DeepInfra'])
-    expect(refreshedResult.wire?.ignore).toContain('deepseek')
-    expect(refreshedResult.wire?.ignore).not.toContain('deepinfra/fp4')
-  })
-
-  it('flags zeroEligible when every endpoint is a trainer', async () => {
-    const chat = makeChat({ model: 'example/x' })
-    const profile = makeProfile()
-    await putCachedEndpoints('prof-1', 'example/x', {
-      id: 'example/x',
-      endpoints: [
-        {
-          provider_name: 'Trainer A',
-          supported_parameters: ['temperature'],
-          context_length: 200000,
-          pricing: {},
-        },
-        {
-          provider_name: 'Trainer B',
-          supported_parameters: ['temperature'],
-          context_length: 200000,
-          pricing: {},
-        },
-      ],
-    })
-    await putCachedPrivacyPolicy('prof-1', 'example/x', {
-      policies: {
-        'Trainer A': {
-          training: true,
-          trainingOpenRouter: false,
-          retainsPrompts: true,
-          canPublish: false,
-          termsOfServiceURL: '',
-          privacyPolicyURL: '',
-        },
-        'Trainer B': {
-          training: true,
-          trainingOpenRouter: false,
-          retainsPrompts: true,
-          canPublish: false,
-          termsOfServiceURL: '',
-          privacyPolicyURL: '',
-        },
-      },
-      fetchedAt: 0,
-    })
-    const r = await resolvePrivacyForSend({ chat, profile, proxy: TEST_PROXY })
-    expect(r.filter?.zeroEligible).toBe(true)
-    expect(r.wire?.zeroEligible).toBe(true)
-  })
-
-  it('uses providerPrefs.ignore verbatim when ignoreOverridesFilter is set', async () => {
-    // Unified allow/disallow: `ignoreOverridesFilter: true` signals the
-    // user has taken over — the wire uses `ignore` verbatim without
-    // re-layering autoIgnore. That lets them re-allow a filter-excluded
-    // row by simply leaving it out of `ignore` after touching the picker.
-    const chat = makeChat({
-      providerPrefs: { ignore: ['Legacy Host'], ignoreOverridesFilter: true },
-    })
-    const profile = makeProfile()
-    await putCachedEndpoints('prof-1', 'openai/gpt-5.4', {
-      id: 'openai/gpt-5.4',
-      endpoints: [
-        {
-          provider_name: 'Azure',
-          supported_parameters: ['temperature'],
-          context_length: 200000,
-          pricing: {},
-        },
-        {
-          provider_name: 'OpenAI',
-          supported_parameters: ['temperature'],
-          context_length: 200000,
-          pricing: {},
-        },
-      ],
-    })
-    await putCachedPrivacyPolicy('prof-1', 'openai/gpt-5.4', {
-      policies: {
-        Azure: {
-          training: false,
-          trainingOpenRouter: false,
-          retainsPrompts: false,
-          canPublish: false,
-          termsOfServiceURL: '',
-          privacyPolicyURL: '',
-        },
-        OpenAI: {
-          training: false,
-          trainingOpenRouter: false,
-          retainsPrompts: true,
-          requiresUserIDs: true,
-          canPublish: false,
-          termsOfServiceURL: '',
-          privacyPolicyURL: '',
-        },
-      },
-      fetchedAt: 0,
-    })
-    const r = await resolvePrivacyForSend({ chat, profile, proxy: TEST_PROXY })
-    expect(r.wire?.ignore).toEqual(['Legacy Host'])
-  })
-
-  it('resolves duplicate provider display names to exact provider slugs on the wire', async () => {
-    const chat = makeChat({
-      model: 'anthropic/claude-opus-4.7',
-      providerPrefs: {
-        ignore: ['anthropic/2'],
-        ignoreOverridesFilter: true,
-        order: ['Anthropic'],
-      },
-    })
-    const profile = makeProfile()
-    await putCachedEndpoints('prof-1', 'anthropic/claude-opus-4.7', {
-      id: 'anthropic/claude-opus-4.7',
-      endpoints: [
-        {
-          provider_name: 'Anthropic',
-          provider_slug: 'anthropic/2',
-          supported_parameters: ['temperature'],
-          context_length: 200000,
-          pricing: {},
-        },
-        {
-          provider_name: 'Anthropic',
-          provider_slug: 'anthropic',
-          supported_parameters: ['temperature'],
-          context_length: 200000,
-          pricing: {},
-        },
-      ],
-    })
-    await putCachedPrivacyPolicy('prof-1', 'anthropic/claude-opus-4.7', {
-      policies: {
-        'anthropic/2': {
-          training: false,
-          trainingOpenRouter: false,
-          retainsPrompts: false,
-          canPublish: false,
-          termsOfServiceURL: '',
-          privacyPolicyURL: '',
-        },
-        anthropic: {
-          training: false,
-          trainingOpenRouter: false,
-          retainsPrompts: false,
-          canPublish: false,
-          termsOfServiceURL: '',
-          privacyPolicyURL: '',
-        },
-      },
-      fetchedAt: 0,
-    })
-    const r = await resolvePrivacyForSend({ chat, profile, proxy: TEST_PROXY })
-    expect(r.wire?.ignore).toEqual(['anthropic/2'])
-    expect(r.wire?.ignore).not.toContain('Anthropic')
-    expect(r.wire?.order).toEqual(['anthropic/2', 'anthropic'])
-  })
-})
+function policy(overrides: Partial<DataPolicy> = {}): DataPolicy {
+  return {
+    training: false,
+    trainingOpenRouter: false,
+    retainsPrompts: false,
+    canPublish: false,
+    termsOfServiceURL: '',
+    privacyPolicyURL: '',
+    ...overrides,
+  }
+}

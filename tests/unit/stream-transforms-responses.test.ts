@@ -1,18 +1,25 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { type StreamLaneEvent, splitResponsesStream } from '../../src/api/stream-transforms'
+import { splitResponsesStream as splitResponsesStreamWithContract } from '../../src/api/stream-transforms'
 import type {
   ResponsesEventWire,
   ResponsesResultWire,
   ResponsesStreamChunk,
 } from '../../src/api/types'
-import {
-  applyStreamAccumulatorEvent,
-  createStreamAccumulator,
-  projectStreamAccumulatorFinal,
-} from '../../src/core/stream-accumulator'
+import type { StreamLaneEvent } from '../../src/core/generation-stream-live-events'
+import { OPENAI_RESPONSES_PROVIDER_OUTPUT_CONTRACT } from '../../src/core/provider-tool-context'
 import { responsesBufferedResult, responsesStreamSse } from '../helpers/protocol-fixtures'
+import { responsesReasoningContract } from '../helpers/reasoning-contracts'
+import { collectReasoningObservations, foldStreamLaneEvents } from '../helpers/reasoning-events'
+
+function splitResponsesStream(source: Parameters<typeof splitResponsesStreamWithContract>[0]) {
+  return splitResponsesStreamWithContract(
+    source,
+    responsesReasoningContract(),
+    OPENAI_RESPONSES_PROVIDER_OUTPUT_CONTRACT,
+  )
+}
 
 const PROBE5 = resolve(
   __dirname,
@@ -49,7 +56,7 @@ async function collect(source: AsyncIterable<StreamLaneEvent>): Promise<StreamLa
 }
 
 describe('splitResponsesStream — representative streaming fixture', () => {
-  it('emits reasoning (summaryDelta) + text deltas + phase + finish in order', async () => {
+  it('emits source-stable summary/carrier operations plus text, phase, and terminal state', async () => {
     const lanes = await collect(splitResponsesStream(asAsync(sseToChunks(responsesStreamSse))))
 
     // 1. First event should be meta with model + generationId.
@@ -63,16 +70,25 @@ describe('splitResponsesStream — representative streaming fixture', () => {
     )
     expect(reasoningItemAdded).toBeDefined()
 
-    // 3. At least one reasoning summary delta.
-    const summaryDeltas = lanes.filter(
-      (l): l is Extract<StreamLaneEvent, { lane: 'reasoning' }> =>
-        l.lane === 'reasoning' && l.summaryDelta !== undefined,
+    const operations = collectReasoningObservations(lanes)
+    const summaryDeltas = operations.filter(
+      (operation) => operation.kind === 'visible' && operation.visibleKind === 'summary',
     )
     expect(summaryDeltas.length).toBeGreaterThan(1)
-    expect(summaryDeltas.every((l) => typeof l.itemId === 'string')).toBe(true)
-    expect(summaryDeltas.every((l) => typeof l.summaryIndex === 'number')).toBe(true)
-    expect(new Set(summaryDeltas.map((l) => l.itemId)).size).toBe(1)
-    const joinedSummary = summaryDeltas.map((l) => l.summaryDelta ?? '').join('')
+    expect(
+      summaryDeltas.every((operation) => operation.source.dialect === 'openai-responses'),
+    ).toBe(true)
+    expect(summaryDeltas.every((operation) => typeof operation.source.itemId === 'string')).toBe(
+      true,
+    )
+    expect(
+      summaryDeltas.every((operation) => typeof operation.source.summaryIndex === 'number'),
+    ).toBe(true)
+    expect(new Set(summaryDeltas.map((operation) => operation.source.itemId)).size).toBe(1)
+    expect(
+      new Set(summaryDeltas.map((operation) => JSON.stringify(operation.memberAliases))).size,
+    ).toBe(1)
+    const joinedSummary = summaryDeltas.map((operation) => operation.value).join('')
     expect(joinedSummary).toMatch(/consecutive/i)
 
     // 4. At least one text delta for the assistant answer.
@@ -88,34 +104,38 @@ describe('splitResponsesStream — representative streaming fixture', () => {
     expect(phaseEvents.length).toBe(1)
     expect(phaseEvents[0]?.phase).toBe('final_answer')
 
-    // 6. Terminal finish event.
-    const finish = lanes.filter(
-      (l): l is Extract<StreamLaneEvent, { lane: 'finish' }> => l.lane === 'finish',
+    const terminal = lanes.filter(
+      (event): event is Extract<StreamLaneEvent, { lane: 'result-snapshot' }> =>
+        event.lane === 'result-snapshot',
     )
-    expect(finish).toHaveLength(1)
-    expect(finish[0]?.finishReason).toBe('stop')
+    expect(terminal).toHaveLength(1)
+    expect(terminal[0]?.outcome).toEqual({ kind: 'finish', finishReason: 'stop' })
 
-    // 7. Last-encrypted-wins: the two reasoning `replaceEncrypted` events are
-    //    the INITIAL value (from output_item.added) and the FINAL value
-    //    (from output_item.done). They should differ because encrypted_content
-    //    grows — see probe 5.
-    const encryptedReplaces = lanes.filter(
-      (l): l is Extract<StreamLaneEvent, { lane: 'reasoning' }> =>
-        l.lane === 'reasoning' && l.replaceEncrypted === true,
+    const encryptedSets = operations.filter(
+      (operation) =>
+        operation.kind === 'carrier' && operation.carrierKind === 'responses-encrypted',
     )
-    expect(encryptedReplaces.length).toBe(2)
-    const [initial, final] = encryptedReplaces
-    expect(initial?.encryptedDelta).toBeDefined()
-    expect(final?.encryptedDelta).toBeDefined()
-    expect(initial?.encryptedDelta).not.toBe(final?.encryptedDelta)
-    // Both blobs start with the OpenAI `gAAA` prefix.
-    expect(initial?.encryptedDelta).toMatch(/^gAAA/)
-    expect(final?.encryptedDelta).toMatch(/^gAAA/)
+    expect(encryptedSets).toHaveLength(2)
+    expect(encryptedSets.every((operation) => operation.update === 'set')).toBe(true)
+    expect(
+      new Set(encryptedSets.map((operation) => JSON.stringify(operation.memberAliases))).size,
+    ).toBe(1)
+    expect(encryptedSets[0]?.value).toMatch(/^gAAA/)
+    expect(encryptedSets[1]?.value).toMatch(/^gAAA/)
+    expect(encryptedSets[0]?.value).not.toBe(encryptedSets[1]?.value)
+
+    const finalEnvelope = foldStreamLaneEvents(lanes).final.reasoningEnvelope
+    expect(finalEnvelope?.visible.map((part) => part.text).join('')).toMatch(/consecutive/i)
+    expect(finalEnvelope?.carriers).toHaveLength(1)
+    expect(finalEnvelope?.carriers[0]).toMatchObject({
+      kind: 'responses-encrypted',
+      data: encryptedSets[1]?.value,
+    })
   })
 })
 
 describe('splitResponsesStream — representative buffered result', () => {
-  it('synthesizes output-item + reasoning + text + phase + usage + finish from buffered JSON', async () => {
+  it('synthesizes one authoritative envelope/text/tool/phase terminal snapshot', async () => {
     const buffered = responsesBufferedResult
     const chunks: ResponsesStreamChunk[] = [
       buffered.id
@@ -124,44 +144,169 @@ describe('splitResponsesStream — representative buffered result', () => {
     ]
     const lanes = await collect(splitResponsesStream(asAsync(chunks)))
 
-    const laneNames = lanes.map((l) => l.lane)
-    // Meta + buffered first.
-    expect(laneNames[0]).toBe('meta')
-    expect(laneNames[1]).toBe('buffered')
+    expect(lanes).toHaveLength(1)
+    const snapshot = lanes[0]
+    expect(snapshot?.lane).toBe('result-snapshot')
+    if (snapshot?.lane !== 'result-snapshot' || snapshot.payload.kind !== 'replace') {
+      throw new Error('ResponsesBufferedSnapshotMissing')
+    }
+    expect(snapshot.outcome).toEqual({ kind: 'finish', finishReason: 'stop' })
+    expect(snapshot.generationId).toBe(buffered.id)
+    expect(snapshot.usage).toBeDefined()
+    expect(snapshot.payload.textParts.map((part) => part.text).join('')).toMatch(/44 and 46/)
+    expect(snapshot.payload.phase).toBe('final_answer')
+    const envelope = foldStreamLaneEvents(lanes).final.reasoningEnvelope
+    expect(envelope?.visible[0]).toMatchObject({
+      kind: 'summary',
+      source: {
+        dialect: 'openai-responses',
+        itemId: buffered.output?.[0]?.id,
+        outputIndex: 0,
+        summaryIndex: 0,
+      },
+    })
+    expect(envelope?.carriers[0]).toMatchObject({
+      kind: 'responses-encrypted',
+      source: {
+        dialect: 'openai-responses',
+        itemId: buffered.output?.[0]?.id,
+        outputIndex: 0,
+      },
+    })
+    expect(envelope).toBeDefined()
+  })
 
-    // One output-item-added per item in result.output.
-    const adds = lanes.filter((l) => l.lane === 'output-item-added')
-    expect(adds).toHaveLength(2)
-    expect((adds[0] as Extract<StreamLaneEvent, { lane: 'output-item-added' }>).item.type).toBe(
-      'reasoning',
+  it('isolates equal member indices across multiple reasoning output items', async () => {
+    const result: ResponsesResultWire = {
+      id: 'resp_multi_reasoning',
+      status: 'completed',
+      output: [
+        {
+          id: 'rs_a',
+          type: 'reasoning',
+          encrypted_content: 'carrier-a',
+          summary: [{ type: 'summary_text', text: 'summary a' }],
+        },
+        {
+          id: 'rs_b',
+          type: 'reasoning',
+          encrypted_content: 'carrier-b',
+          summary: [{ type: 'summary_text', text: 'summary b' }],
+        },
+      ],
+    }
+    const lanes = await collect(
+      splitResponsesStream(asAsync([{ type: 'buffered_result', result }])),
     )
-    expect((adds[1] as Extract<StreamLaneEvent, { lane: 'output-item-added' }>).item.type).toBe(
-      'message',
+    const envelope = foldStreamLaneEvents(lanes).final.reasoningEnvelope
+    expect(envelope?.visible.map((part) => [part.source.itemId, part.text])).toEqual([
+      ['rs_a', 'summary a'],
+      ['rs_b', 'summary b'],
+    ])
+    expect(
+      envelope?.carriers.map((carrier) => [
+        carrier.source.itemId,
+        carrier.kind === 'anthropic-signature' ? carrier.signature : carrier.data,
+      ]),
+    ).toEqual([
+      ['rs_a', 'carrier-a'],
+      ['rs_b', 'carrier-b'],
+    ])
+    expect(new Set(envelope?.visible.map((part) => part.id)).size).toBe(2)
+    expect(new Set(envelope?.carriers.map((carrier) => carrier.id)).size).toBe(2)
+  })
+
+  it('reconciles incremental events and buffered transport to the same terminal envelope', async () => {
+    const item = {
+      id: 'rs_equivalent',
+      type: 'reasoning' as const,
+      encrypted_content: 'final-carrier',
+      summary: [{ type: 'summary_text', text: 'same summary' }],
+    }
+    const result: ResponsesResultWire = {
+      id: 'resp_equivalent',
+      status: 'completed',
+      output: [item],
+    }
+    const streamed = await collect(
+      splitResponsesStream(
+        asAsync([
+          {
+            type: 'event',
+            event: {
+              type: 'response.output_item.added',
+              output_index: 0,
+              item: { ...item, encrypted_content: 'partial-carrier', summary: [] },
+            },
+          },
+          {
+            type: 'event',
+            event: {
+              type: 'response.reasoning_summary_text.delta',
+              output_index: 0,
+              item_id: item.id,
+              summary_index: 0,
+              delta: 'same summary',
+            },
+          },
+          {
+            type: 'event',
+            event: { type: 'response.output_item.done', output_index: 0, item },
+          },
+          { type: 'event', event: { type: 'response.completed', response: result } },
+        ]),
+      ),
+    )
+    const buffered = await collect(
+      splitResponsesStream(asAsync([{ type: 'buffered_result', result }])),
+    )
+    expect(foldStreamLaneEvents(streamed).final.reasoningEnvelope).toEqual(
+      foldStreamLaneEvents(buffered).final.reasoningEnvelope,
+    )
+  })
+
+  it('retains a streamed summary when the terminal response contains only encrypted reasoning', async () => {
+    const lanes = await collect(
+      splitResponsesStream(
+        asAsync([
+          {
+            type: 'event',
+            event: {
+              type: 'response.reasoning_summary_text.delta',
+              output_index: 0,
+              item_id: 'reasoning-omission',
+              summary_index: 0,
+              delta: 'retained summary',
+            },
+          },
+          {
+            type: 'event',
+            event: {
+              type: 'response.completed',
+              response: {
+                id: 'response-omission',
+                status: 'completed',
+                output: [
+                  {
+                    id: 'reasoning-omission',
+                    type: 'reasoning',
+                    encrypted_content: 'terminal-carrier',
+                  },
+                ],
+              },
+            },
+          },
+        ]),
+      ),
     )
 
-    // Reasoning lane carries encrypted + summary.
-    const reasoning = lanes.filter(
-      (l): l is Extract<StreamLaneEvent, { lane: 'reasoning' }> => l.lane === 'reasoning',
-    )
-    expect(reasoning.some((r) => r.encryptedDelta?.startsWith('gAAA'))).toBe(true)
-    expect(reasoning.some((r) => typeof r.summaryDelta === 'string')).toBe(true)
-    const bufferedSummary = reasoning.find((r) => typeof r.summaryDelta === 'string')
-    expect(bufferedSummary?.itemId).toBe(buffered.output?.[0]?.id)
-    expect(bufferedSummary?.summaryIndex).toBe(0)
-
-    // Text lane emits the message content once.
-    const text = lanes.filter((l) => l.lane === 'text')
-    expect(text).toHaveLength(1)
-    expect((text[0] as Extract<StreamLaneEvent, { lane: 'text' }>).text).toMatch(/44 and 46/)
-
-    // Phase event for the message item.
-    const phases = lanes.filter((l) => l.lane === 'phase')
-    expect(phases).toHaveLength(1)
-    expect((phases[0] as Extract<StreamLaneEvent, { lane: 'phase' }>).phase).toBe('final_answer')
-
-    // Finish + usage.
-    expect(lanes.some((l) => l.lane === 'finish')).toBe(true)
-    expect(lanes.some((l) => l.lane === 'usage')).toBe(true)
+    const envelope = foldStreamLaneEvents(lanes).final.reasoningEnvelope
+    expect(envelope?.visible).toEqual([
+      expect.objectContaining({ kind: 'summary', text: 'retained summary' }),
+    ])
+    expect(envelope?.carriers).toEqual([
+      expect.objectContaining({ kind: 'responses-encrypted', data: 'terminal-carrier' }),
+    ])
   })
 })
 
@@ -171,9 +316,9 @@ if (existsSync(PROBE5)) {
       const lanes = await collect(
         splitResponsesStream(asAsync(sseToChunks(readFileSync(PROBE5, 'utf8')))),
       )
-      expect(lanes.some((lane) => lane.lane === 'reasoning')).toBe(true)
+      expect(collectReasoningObservations(lanes).length).toBeGreaterThan(0)
       expect(lanes.some((lane) => lane.lane === 'text')).toBe(true)
-      expect(lanes.at(-1)?.lane).toBe('finish')
+      expect(lanes.at(-1)?.lane).toBe('result-snapshot')
     })
   })
 }
@@ -186,16 +331,20 @@ if (existsSync(PROBE6)) {
         ? { type: 'buffered_result', result: buffered, generationId: buffered.id }
         : { type: 'buffered_result', result: buffered }
       const lanes = await collect(splitResponsesStream(asAsync([chunk])))
-      expect(lanes.filter((lane) => lane.lane === 'output-item-added')).toHaveLength(
-        buffered.output?.length ?? 0,
-      )
-      expect(lanes.some((lane) => lane.lane === 'finish')).toBe(true)
+      expect(lanes).toHaveLength(1)
+      const snapshot = lanes[0]
+      expect(snapshot?.lane).toBe('result-snapshot')
+      if (snapshot?.lane !== 'result-snapshot' || snapshot.payload.kind !== 'replace') {
+        throw new Error('ResponsesBufferedSnapshotMissing')
+      }
+      expect(snapshot.payload.providerOutputItems.length).toBeGreaterThanOrEqual(0)
+      expect(snapshot.outcome.kind).toBe('finish')
     })
   })
 }
 
 describe('splitResponsesStream — encrypted_content overwrite contract', () => {
-  it('emits replaceEncrypted:true on both output_item.added and output_item.done', async () => {
+  it('sets one stable carrier identity on add and authoritatively replaces it on done', async () => {
     // Synthetic minimal sequence: added → done (each with distinct encrypted_content).
     const events: ResponsesStreamChunk[] = [
       {
@@ -223,12 +372,19 @@ describe('splitResponsesStream — encrypted_content overwrite contract', () => 
       },
     ]
     const lanes = await collect(splitResponsesStream(asAsync(events)))
-    const reasoning = lanes.filter(
-      (l): l is Extract<StreamLaneEvent, { lane: 'reasoning' }> => l.lane === 'reasoning',
+    const reasoning = collectReasoningObservations(lanes).filter(
+      (operation) =>
+        operation.kind === 'carrier' && operation.carrierKind === 'responses-encrypted',
     )
     expect(reasoning).toHaveLength(2)
-    expect(reasoning[0]).toMatchObject({ encryptedDelta: 'partial', replaceEncrypted: true })
-    expect(reasoning[1]).toMatchObject({ encryptedDelta: 'FINAL', replaceEncrypted: true })
+    expect(reasoning.map((operation) => operation.update)).toEqual(['set', 'set'])
+    expect(reasoning.map((operation) => operation.value)).toEqual(['partial', 'FINAL'])
+    expect(
+      new Set(reasoning.map((operation) => JSON.stringify(operation.memberAliases))).size,
+    ).toBe(1)
+    expect(foldStreamLaneEvents(lanes).final.reasoningEnvelope?.carriers).toEqual([
+      expect.objectContaining({ kind: 'responses-encrypted', data: 'FINAL' }),
+    ])
   })
 })
 
@@ -295,10 +451,7 @@ describe('splitResponsesStream — function calls', () => {
     const toolCalls = lanes.filter(
       (lane): lane is Extract<StreamLaneEvent, { lane: 'tool-call' }> => lane.lane === 'tool-call',
     )
-    const accumulator = createStreamAccumulator({ initialContent: [], now: 0 })
-    for (const [index, lane] of toolCalls.entries()) {
-      applyStreamAccumulatorEvent(accumulator, lane, index + 1)
-    }
+    const final = foldStreamLaneEvents(toolCalls).final
 
     expect(toolCalls[0]).toMatchObject({
       index: 4,
@@ -308,7 +461,7 @@ describe('splitResponsesStream — function calls', () => {
     })
     expect(toolCalls.filter((lane) => lane.argumentsDelta !== undefined)).toHaveLength(2)
     expect(toolCalls.filter((lane) => lane.argumentsSnapshot !== undefined)).toHaveLength(2)
-    expect(projectStreamAccumulatorFinal(accumulator).toolCalls).toEqual([
+    expect(final.toolCalls).toEqual([
       {
         id: 'call_1',
         type: 'function',
@@ -336,12 +489,7 @@ describe('splitResponsesStream — function calls', () => {
         asAsync([{ type: 'buffered_result', result, generationId: 'resp_tools' }]),
       ),
     )
-    const accumulator = createStreamAccumulator({ initialContent: [], now: 0 })
-    for (const [index, lane] of lanes.entries()) {
-      applyStreamAccumulatorEvent(accumulator, lane, index + 1)
-    }
-
-    expect(projectStreamAccumulatorFinal(accumulator).toolCalls).toEqual([
+    expect(foldStreamLaneEvents(lanes).final.toolCalls).toEqual([
       {
         id: 'call_2',
         type: 'function',
@@ -454,11 +602,15 @@ describe('splitResponsesStream — server tools', () => {
         asAsync([{ type: 'buffered_result', result, generationId: 'resp_shell' }]),
       ),
     )
-    const done = lanes.filter(
-      (l): l is Extract<StreamLaneEvent, { lane: 'output-item-done' }> =>
-        l.lane === 'output-item-done',
-    )
-    expect(done.map((event) => event.item.type)).toEqual(['shell_call', 'shell_call_output'])
+    const snapshot = lanes[0]
+    expect(snapshot?.lane).toBe('result-snapshot')
+    if (snapshot?.lane !== 'result-snapshot' || snapshot.payload.kind !== 'replace') {
+      throw new Error('ResponsesBufferedSnapshotMissing')
+    }
+    expect(snapshot.payload.providerOutputItems.map((item) => item.type)).toEqual([
+      'shell_call',
+      'shell_call_output',
+    ])
   })
 
   it('emits generated image output as a persistable content item', async () => {
@@ -545,12 +697,14 @@ describe('splitResponsesStream — forward-compat', () => {
       },
     ]
     const lanes = await collect(splitResponsesStream(asAsync(events)))
-    expect(lanes.some((l) => l.lane === 'finish')).toBe(true)
+    expect(
+      lanes.some((event) => event.lane === 'result-snapshot' && event.outcome.kind === 'finish'),
+    ).toBe(true)
   })
 })
 
 describe('splitResponsesStream — error event', () => {
-  it('maps response.failed into an error lane event', async () => {
+  it('maps response.failed into an authoritative error outcome', async () => {
     const events: ResponsesStreamChunk[] = [
       {
         type: 'event',
@@ -564,6 +718,10 @@ describe('splitResponsesStream — error event', () => {
       },
     ]
     const lanes = await collect(splitResponsesStream(asAsync(events)))
-    expect(lanes.some((l) => l.lane === 'error')).toBe(true)
+    const snapshot = lanes.find(
+      (event): event is Extract<StreamLaneEvent, { lane: 'result-snapshot' }> =>
+        event.lane === 'result-snapshot',
+    )
+    expect(snapshot?.outcome.kind).toBe('error')
   })
 })

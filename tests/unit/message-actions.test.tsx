@@ -1,31 +1,20 @@
-import { act, fireEvent, render, screen } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { createAppliedMessageView } from '../../src/core/continuation-content'
+import {
+  AVAILABLE_GENERATION_CAPABILITY,
+  failedGenerationCapability,
+  type NonReadyGenerationCapability,
+  pendingGenerationCapability,
+  unavailableGenerationCapability,
+} from '../../src/core/interaction-capability'
 import type { Message } from '../../src/core/types'
-import { splitMessageForStorage } from '../../src/store/message-storage'
-import { useChatStore } from '../../src/store/zustand/chatStore'
-import { __setPersistentCursorEnumerationProbeForTests } from '../../src/store/zustand/persistentCursor'
-import { useToastStore } from '../../src/store/zustand/toastStore'
-import { MessageActions } from '../../src/ui/chat/MessageActions'
-
-const deleteMocks = vi.hoisted(() => ({
-  pair: vi.fn(),
-  single: vi.fn(),
-  turn: vi.fn(),
-  variant: vi.fn(),
-}))
-
-const undoMocks = vi.hoisted(() => ({ apply: vi.fn() }))
-
-vi.mock('../../src/hooks/useMessageOps', () => ({
-  deletePairOp: deleteMocks.pair,
-  deleteSingleOp: deleteMocks.single,
-  deleteTurnOp: deleteMocks.turn,
-  deleteVariantOp: deleteMocks.variant,
-}))
-
-vi.mock('../../src/core/undo', () => ({
-  applyStructuralSnapshot: undoMocks.apply,
-}))
+import type { GenerationStartResult } from '../../src/store/generation-engine'
+import { MessageActions, MessageEditTreeActions } from '../../src/ui/chat/MessageActions'
+import {
+  createInteractionSettlementHarness,
+  succeededInteractionSettlement,
+} from '../helpers/presentation-interactions'
 
 function assistantMessage(): Message {
   return {
@@ -44,44 +33,54 @@ function assistantMessage(): Message {
   }
 }
 
-function restoredDeletePresentation() {
-  const assistant = assistantMessage()
-  const root: Message = {
-    ...assistant,
-    id: 'user-1',
-    parentId: null,
-    role: 'user',
-    origin: 'user',
-    content: [{ type: 'text', text: 'prompt' }],
-  }
-  const child: Message = {
-    ...root,
-    id: 'child-1',
-    parentId: assistant.id,
-    content: [{ type: 'text', text: 'child' }],
-  }
-  const presentations = [root, assistant, child].map((message) => {
-    const { header } = splitMessageForStorage(message)
-    return { header, message, bodyVersion: header.bodyVersion }
+function startedGeneration(): GenerationStartResult {
+  const prepared = Object.freeze({
+    streamId: 'stream-1',
+    chatId: 'chat-1',
+    assistantMessageId: 'assistant-1',
   })
-  return {
-    selectedPathHeaders: presentations.map((presentation) => presentation.header),
-    structuralHeaders: presentations.map((presentation) => presentation.header),
-    presentations,
-  }
+  return Object.freeze({
+    kind: 'started',
+    handle: Object.freeze({
+      streamId: prepared.streamId,
+      chatId: prepared.chatId,
+      prepared: Promise.resolve(prepared),
+      completed: Promise.resolve(Object.freeze({ ...prepared, outcome: 'done' as const })),
+    }),
+  })
 }
 
+function generationAction() {
+  return vi.fn(() => startedGeneration())
+}
+
+const NON_READY_ACTION_CASES = [
+  ['pending', 'regenerate', pendingGenerationCapability('prompt-path')],
+  ['pending', 'continue', pendingGenerationCapability('prompt-path')],
+  ['unavailable', 'regenerate', unavailableGenerationCapability('target-unavailable')],
+  ['unavailable', 'continue', unavailableGenerationCapability('target-unavailable')],
+  ['failed', 'regenerate', failedGenerationCapability('configuration')],
+  ['failed', 'continue', failedGenerationCapability('configuration')],
+] as const satisfies readonly (readonly [
+  'pending' | 'unavailable' | 'failed',
+  'regenerate' | 'continue',
+  NonReadyGenerationCapability,
+])[]
+
 function renderActions(props: Partial<Parameters<typeof MessageActions>[0]> = {}) {
+  const message = props.message ?? assistantMessage()
   return render(
     <MessageActions
-      message={assistantMessage()}
-      showInfo={false}
-      onToggleInfo={() => {}}
-      isEditing={false}
-      onBeginEdit={() => {}}
-      hasConnection
-      chatId="chat-1"
       {...props}
+      message={message}
+      appliedView={props.appliedView ?? createAppliedMessageView(message)}
+      showInfo={props.showInfo ?? false}
+      onToggleInfo={props.onToggleInfo ?? (() => {})}
+      isEditing={props.isEditing ?? false}
+      onBeginEdit={props.onBeginEdit ?? (() => {})}
+      regenerateCapability={props.regenerateCapability ?? AVAILABLE_GENERATION_CAPABILITY}
+      continueCapability={props.continueCapability ?? AVAILABLE_GENERATION_CAPABILITY}
+      onDelete={props.onDelete ?? (() => succeededInteractionSettlement())}
     />,
   )
 }
@@ -90,34 +89,31 @@ afterEach(() => {
   vi.useRealTimers()
   vi.unstubAllGlobals()
   vi.resetAllMocks()
-  __setPersistentCursorEnumerationProbeForTests(undefined)
-  useChatStore.getState().reset()
-  useToastStore.getState().reset()
 })
 
 describe('MessageActions', () => {
   it('disables generation actions while another request is active for the chat', () => {
     renderActions({
       generationBusy: true,
-      onRegenerate: vi.fn(),
-      onContinue: vi.fn(),
+      onRegenerate: generationAction(),
+      onContinue: generationAction(),
     })
 
     expect(screen.getByRole('button', { name: 'Regenerate response' })).toBeDisabled()
     expect(screen.getByRole('button', { name: 'Continue from here' })).toBeDisabled()
   })
 
-  it('blocks edits, Continue, and deletion only on the active stream target', () => {
+  it('blocks every target-mutating action on the active stream target', () => {
     renderActions({
       streamTargetBusy: true,
-      onRegenerate: vi.fn(),
-      onContinue: vi.fn(),
+      onRegenerate: generationAction(),
+      onContinue: generationAction(),
     })
 
     expect(screen.getByRole('button', { name: 'Edit message' })).toBeDisabled()
     expect(screen.getByRole('button', { name: 'Continue from here' })).toBeDisabled()
     expect(screen.getByRole('button', { name: 'Delete message' })).toBeDisabled()
-    expect(screen.getByRole('button', { name: 'Regenerate response' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Regenerate response' })).toBeDisabled()
   })
 
   it('treats an applied successful continuation as resolving the original partial state', () => {
@@ -132,6 +128,8 @@ describe('MessageActions', () => {
       startedAt: 1,
       finishedAt: 2,
       abortReason: 'network',
+      reasoningCarryForward: 'none',
+      reasoningVisibility: { disclosure: 'unknown' },
     }
     message.continuationAttempts = [
       {
@@ -140,15 +138,49 @@ describe('MessageActions', () => {
         status: 'done',
         startedAt: 3,
         finishedAt: 4,
+        reasoningCarryForward: 'none',
+        reasoningVisibility: { disclosure: 'unknown' },
+        application: { kind: 'applied' },
       },
     ]
 
-    renderActions({ message, onContinue: vi.fn() })
+    renderActions({ message, onContinue: generationAction() })
 
     expect(screen.getByRole('button', { name: 'Continue from here' })).toHaveAttribute(
       'title',
       'Continue this assistant message',
     )
+  })
+
+  it.each(
+    NON_READY_ACTION_CASES,
+  )('keeps unrelated actions live when %s blocks only %s', (_state, blockedAction, capability) => {
+    const onRegenerate = generationAction()
+    const onContinue = generationAction()
+    renderActions({
+      regenerateCapability:
+        blockedAction === 'regenerate' ? capability : AVAILABLE_GENERATION_CAPABILITY,
+      continueCapability:
+        blockedAction === 'continue' ? capability : AVAILABLE_GENERATION_CAPABILITY,
+      onRegenerate,
+      onContinue,
+    })
+
+    const regenerate = screen.getByRole('button', { name: 'Regenerate response' })
+    const continuation = screen.getByRole('button', { name: 'Continue from here' })
+    const blocked = blockedAction === 'regenerate' ? regenerate : continuation
+    const independent = blockedAction === 'regenerate' ? continuation : regenerate
+
+    expect(blocked).toBeDisabled()
+    expect(independent).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Edit message' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'Delete message' })).toBeEnabled()
+
+    fireEvent.click(blocked)
+    fireEvent.click(independent)
+
+    expect(blockedAction === 'regenerate' ? onRegenerate : onContinue).not.toHaveBeenCalled()
+    expect(blockedAction === 'regenerate' ? onContinue : onRegenerate).toHaveBeenCalledOnce()
   })
 
   it('shows a temporary copied state after writing message text to the clipboard', async () => {
@@ -168,7 +200,6 @@ describe('MessageActions', () => {
     act(() => {
       vi.advanceTimersByTime(2500)
     })
-
     expect(screen.getByRole('button', { name: 'Copy message' })).toHaveAttribute('title', 'Copy')
   })
 
@@ -181,185 +212,13 @@ describe('MessageActions', () => {
       await Promise.resolve()
     })
 
-    expect(onCopy).toHaveBeenCalledTimes(1)
-    expect(screen.getByRole('button', { name: 'Copied' })).toBeTruthy()
+    expect(onCopy).toHaveBeenCalledOnce()
+    expect(screen.getByRole('button', { name: 'Copied' })).toBeVisible()
   })
 
-  it('applies delete cursor effects without letting undo overwrite later navigation', async () => {
-    const priorCursor = {
-      __root__: 'user-1',
-      'user-1': 'assistant-1',
-      'assistant-1': 'child-1',
-    }
-    useChatStore.getState().navigateToCursor('chat-1', priorCursor)
-    let resolveDelete: ((value: unknown) => void) | undefined
-    const pendingDelete = new Promise((resolve) => {
-      resolveDelete = resolve
-    })
-    deleteMocks.pair.mockReturnValue(pendingDelete)
-    undoMocks.apply.mockResolvedValue(undefined)
-    renderActions()
-
-    fireEvent.click(screen.getByRole('button', { name: 'Delete message' }))
-    fireEvent.click(screen.getByRole('button', { name: 'Delete' }))
-    expect(deleteMocks.pair).toHaveBeenCalledWith({
-      chatId: 'chat-1',
-      messageId: 'assistant-1',
-      cursor: priorCursor,
-    })
-    const cursorEnumeration = vi.fn()
-    __setPersistentCursorEnumerationProbeForTests(cursorEnumeration)
-
-    const preImage = {
-      chatId: 'chat-1',
-      previousRows: [assistantMessage()],
-      newMessageIds: [],
-      attachmentIds: [],
-    }
-    await act(async () => {
-      resolveDelete?.({
-        effects: {
-          cursorUpdates: { 'user-1': 'replacement' },
-          cursorRemoveKeys: ['assistant-1'],
-          newMessageIds: [],
-          tombstoned: ['assistant-1'],
-          reparented: [],
-        },
-        versions: { metaVersion: 1, summaryVersion: 1 },
-        preImage,
-        selectedPathHeaders: [],
-        structuralHeaders: [],
-        presentations: [],
-      })
-      await pendingDelete
-    })
-
-    expect(cursorEnumeration).not.toHaveBeenCalled()
-    __setPersistentCursorEnumerationProbeForTests(undefined)
-    expect(useChatStore.getState().getCursor('chat-1')).toEqual({
-      __root__: 'user-1',
-      'user-1': 'replacement',
-    })
-    const toast = useToastStore.getState().toasts.at(-1)
-    expect(toast?.text).toBe('Deleted pair.')
-    let resolveUndo: ((value: ReturnType<typeof restoredDeletePresentation>) => void) | undefined
-    const pendingUndo = new Promise<ReturnType<typeof restoredDeletePresentation>>((resolve) => {
-      resolveUndo = resolve
-    })
-    undoMocks.apply.mockReturnValueOnce(pendingUndo)
-    let undoPromise: Promise<void> | undefined
-    await act(async () => {
-      undoPromise = Promise.resolve(toast?.undo?.())
-      await Promise.resolve()
-    })
-    const laterCursor = { __root__: 'other-root', 'other-root': 'other-leaf' }
-    useChatStore.getState().navigateToCursor('chat-1', laterCursor)
-    resolveUndo?.(restoredDeletePresentation())
-    await act(async () => undoPromise)
-    expect(undoMocks.apply).toHaveBeenCalledWith(preImage, {
-      cursor: priorCursor,
-      presentationWindowLimit: 10,
-    })
-    expect(useChatStore.getState().getCursor('chat-1')).toEqual(laterCursor)
-  })
-
-  it('restores the pre-delete cursor when undo remains the latest local intent', async () => {
-    const priorCursor = {
-      __root__: 'user-1',
-      'user-1': 'assistant-1',
-      'assistant-1': 'child-1',
-    }
-    useChatStore.getState().navigateToCursor('chat-1', priorCursor)
-    undoMocks.apply.mockResolvedValue(restoredDeletePresentation())
-    deleteMocks.pair.mockResolvedValue({
-      effects: {
-        cursorUpdates: { 'user-1': 'child-1' },
-        cursorRemoveKeys: ['assistant-1'],
-        newMessageIds: [],
-        tombstoned: ['assistant-1'],
-        reparented: [],
-      },
-      versions: { metaVersion: 1, summaryVersion: 1 },
-      preImage: {
-        chatId: 'chat-1',
-        previousRows: [assistantMessage()],
-        newMessageIds: [],
-        attachmentIds: [],
-      },
-      selectedPathHeaders: [],
-      structuralHeaders: [],
-      presentations: [],
-    })
-    renderActions()
-
-    fireEvent.click(screen.getByRole('button', { name: 'Delete message' }))
-    await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: 'Delete' }))
-      await Promise.resolve()
-    })
-    const cursorEnumeration = vi.fn()
-    __setPersistentCursorEnumerationProbeForTests(cursorEnumeration)
-    await act(async () => {
-      await useToastStore.getState().toasts.at(-1)?.undo?.()
-    })
-
-    expect(cursorEnumeration).not.toHaveBeenCalled()
-    __setPersistentCursorEnumerationProbeForTests(undefined)
-    expect(useChatStore.getState().getCursor('chat-1')).toEqual(priorCursor)
-    expect(
-      useChatStore
-        .getState()
-        .getCommittedPathPresentation('chat-1')
-        ?.pathHeaders.map((header) => header.id),
-    ).toEqual(['user-1', 'assistant-1', 'child-1'])
-  })
-
-  it('does not let a delayed delete overwrite newer navigation', async () => {
-    const priorCursor = { __root__: 'root', root: 'assistant-1' }
-    useChatStore.getState().navigateToCursor('chat-1', priorCursor)
-    let resolveDelete: ((value: unknown) => void) | undefined
-    const pendingDelete = new Promise((resolve) => {
-      resolveDelete = resolve
-    })
-    deleteMocks.pair.mockReturnValue(pendingDelete)
-    renderActions()
-
-    fireEvent.click(screen.getByRole('button', { name: 'Delete message' }))
-    fireEvent.click(screen.getByRole('button', { name: 'Delete' }))
-    const laterCursor = { __root__: 'other-root', 'other-root': 'other-leaf' }
-    useChatStore.getState().navigateToCursor('chat-1', laterCursor)
-
-    await act(async () => {
-      resolveDelete?.({
-        effects: {
-          cursorUpdates: { root: 'replacement' },
-          cursorRemoveKeys: [],
-          newMessageIds: [],
-          tombstoned: ['assistant-1'],
-          reparented: [],
-        },
-        versions: { metaVersion: 1, summaryVersion: 1 },
-        preImage: {
-          chatId: 'chat-1',
-          previousRows: [assistantMessage()],
-          newMessageIds: [],
-          attachmentIds: [],
-        },
-        selectedPathHeaders: [],
-        structuralHeaders: [],
-        presentations: [],
-      })
-      await pendingDelete
-    })
-
-    expect(useChatStore.getState().getCursor('chat-1')).toEqual(laterCursor)
-  })
-
-  it('leaves the cursor unchanged when delete is rejected', async () => {
-    const priorCursor = { __root__: 'root', 'user-1': 'assistant-1' }
-    useChatStore.getState().navigateToCursor('chat-1', priorCursor)
-    deleteMocks.pair.mockRejectedValue(new Error('tree changed'))
-    renderActions()
+  it('delegates the confirmed default pair delete to its mutation owner', async () => {
+    const onDelete = vi.fn(() => succeededInteractionSettlement())
+    renderActions({ onDelete })
 
     fireEvent.click(screen.getByRole('button', { name: 'Delete message' }))
     await act(async () => {
@@ -367,11 +226,51 @@ describe('MessageActions', () => {
       await Promise.resolve()
     })
 
-    expect(useChatStore.getState().getCursor('chat-1')).toEqual(priorCursor)
-    expect(useToastStore.getState().toasts.at(-1)).toMatchObject({
-      level: 'danger',
-      text: 'Delete failed: tree changed',
+    expect(onDelete).toHaveBeenCalledWith('pair')
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  })
+
+  it('retains an actionable delete dialog when the mutation owner reports failure', async () => {
+    const settlements = createInteractionSettlementHarness()
+    const onDelete = vi.fn(() => settlements.fail(new Error('delete denied')))
+    renderActions({ onDelete })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Delete message' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Delete' }))
+
+    await waitFor(() => expect(settlements.presented).toHaveLength(1))
+    expect(settlements.presented).toEqual([
+      { message: 'Test interaction: delete denied', tone: 'danger' },
+    ])
+    expect(onDelete).toHaveBeenCalledWith('pair')
+    expect(screen.getByRole('dialog', { name: 'Delete message?' })).toBeVisible()
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Delete' })).toBeEnabled())
+  })
+
+  it('forces a role-mismatch confirmation to a single-message delete', async () => {
+    const onDelete = vi.fn(() => succeededInteractionSettlement())
+    renderActions({ roleMismatch: true, onDelete })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Delete message' }))
+    expect(screen.getByRole('checkbox')).toBeDisabled()
+    expect(screen.getByRole('checkbox')).not.toBeChecked()
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Delete' }))
+      await Promise.resolve()
     })
-    expect(undoMocks.apply).not.toHaveBeenCalled()
+
+    expect(onDelete).toHaveBeenCalledWith('single')
+  })
+})
+
+describe('MessageEditTreeActions', () => {
+  it('delegates explicit variant and turn deletion modes to its mutation owner', () => {
+    const onDelete = vi.fn(() => succeededInteractionSettlement())
+    render(<MessageEditTreeActions onDelete={onDelete} />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Delete variant' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Delete turn' }))
+
+    expect(onDelete.mock.calls).toEqual([['variant'], ['turn']])
   })
 })

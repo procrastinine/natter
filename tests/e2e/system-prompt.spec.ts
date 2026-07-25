@@ -5,6 +5,7 @@ import {
   createChatAndOpen,
   firstChatId,
   mockChatCompletions,
+  readChatRow,
   seedFirstRun,
   sendMessage,
   waitForAssistantGenerationFinished,
@@ -140,21 +141,5 @@ async function expectChatSetting(page: Page, chatId: string, key: string, value:
 }
 
 async function readChat(page: Page, chatId: string): Promise<Record<string, unknown>> {
-  return page.evaluate(async (id) => {
-    const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const req = indexedDB.open('natter')
-      req.onsuccess = () => resolve(req.result)
-      req.onerror = () => reject(req.error)
-    })
-    try {
-      return await new Promise<Record<string, unknown>>((resolve, reject) => {
-        const tx = db.transaction('chats', 'readonly')
-        const req = tx.objectStore('chats').get(id)
-        req.onsuccess = () => resolve(req.result as Record<string, unknown>)
-        req.onerror = () => reject(req.error)
-      })
-    } finally {
-      db.close()
-    }
-  }, chatId)
+  return readChatRow(page, chatId)
 }

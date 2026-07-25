@@ -1,0 +1,14 @@
+{
+  "threshold": 1,
+  "minLines": 12,
+  "minTokens": 80,
+  "path": ["src"],
+  "reporters": ["console"],
+  "ignore": [
+    "node_modules/**",
+    "dist/**",
+    "coverage/**",
+    "src/backcompat/**",
+    "src/capabilities/*.json"
+  ]
+}

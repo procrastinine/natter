@@ -1,15 +1,17 @@
-import { render } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
+import { DEFAULT_GLOBAL_PREFERENCES } from '../../src/core/global-settings'
+import { DEFAULT_RENDERING_PREFS } from '../../src/core/rendering-preferences'
+import { DEFAULT_SIDEBAR_SORT_MODE } from '../../src/core/sidebar-sort'
+import { ConfigurationPreferencesContext } from '../../src/hooks/useConfigurationPreferences'
 import {
   createStreamingMarkdownSegmentCache,
   MarkdownView,
+  PROGRESSIVE_STATIC_MARKDOWN_CHARS,
   STREAMING_MARKDOWN_SEGMENT_CHARS,
   segmentStreamingMarkdownForTests,
 } from '../../src/ui/chat/MarkdownView'
-import {
-  DEFAULT_RENDERING_PREFS,
-  RenderingPreferencesContext,
-} from '../../src/ui/settings/RenderingSettings'
+import { RenderingPreferencesContext } from '../../src/ui/settings/RenderingSettings'
 
 describe('MarkdownView', () => {
   it('renders an empty surface for empty content without throwing', () => {
@@ -87,31 +89,65 @@ describe('MarkdownView', () => {
     expect(segments[1]?.getAttribute('data-mode')).toBe('streaming')
   })
 
+  it('keeps an adversarial oversized fenced stream whole until its closing boundary', () => {
+    const cache = createStreamingMarkdownSegmentCache()
+    const openFence = `\`\`\`ts\n${'x\n'.repeat(10_001)}stream-tail`
+    const beforeClose = segmentStreamingMarkdownForTests(
+      [openFence.slice(0, 19_997), openFence.slice(19_997)],
+      cache,
+    )
+
+    expect(beforeClose).toEqual([{ content: openFence, streaming: true }])
+
+    const closed = `${openFence}\n\`\`\`\n\nafter`
+    const afterClose = segmentStreamingMarkdownForTests(
+      [openFence.slice(0, 19_997), openFence.slice(19_997), closed.slice(openFence.length)],
+      cache,
+    )
+    expect(afterClose[0]).toEqual({ content: `${openFence}\n\`\`\`\n`, streaming: false })
+    expect(afterClose[1]).toEqual({ content: '\nafter', streaming: true })
+  })
+
+  it('bounds an oversized fenced block while it is still streaming', () => {
+    const code = `\`\`\`ts\n${'x\n'.repeat(10_001)}still-streaming`
+    const { container } = render(
+      <MarkdownView
+        content=""
+        contentSegments={[code.slice(0, 19_997), code.slice(19_997)]}
+        streaming
+      />,
+    )
+
+    expect(
+      container.querySelector('[data-ui="code-block"][data-overflow="truncated"]'),
+    ).toBeTruthy()
+    expect(container.querySelector('[data-streamdown="code-block"]')).toBeNull()
+  })
+
   it('does not rescan an unchanged frozen prefix when the live tail advances', () => {
     const prefix = `${'a'.repeat(STREAMING_MARKDOWN_SEGMENT_CHARS - 100)}\n\n${'b'.repeat(98)}`
     const cache = createStreamingMarkdownSegmentCache()
-    const nativeLastIndexOf = String.prototype.lastIndexOf
-    let boundaryScans = 0
-    const lastIndexOf = vi.spyOn(String.prototype, 'lastIndexOf').mockImplementation(function (
+    const nativeIndexOf = String.prototype.indexOf
+    let scanPositions: number[] = []
+    const indexOf = vi.spyOn(String.prototype, 'indexOf').mockImplementation(function (
       this: string,
       searchString: string,
       position?: number,
     ) {
-      if (searchString === '\n\n' || searchString === '\n') {
-        boundaryScans += 1
-      }
-      return nativeLastIndexOf.call(this, searchString, position)
+      if (searchString === '\n') scanPositions.push(position ?? 0)
+      return nativeIndexOf.call(this, searchString, position)
     })
 
     try {
       segmentStreamingMarkdownForTests([prefix, 'tail'], cache)
-      expect(boundaryScans).toBeGreaterThan(0)
-      const scansAfterInitialRender = boundaryScans
+      expect(scanPositions.length).toBeGreaterThan(0)
+      const scannedThrough = cache.boundaryScanOffset
 
+      scanPositions = []
       segmentStreamingMarkdownForTests([prefix, 'tail', '-advanced'], cache)
-      expect(boundaryScans).toBe(scansAfterInitialRender)
+      expect(scanPositions.every((position) => position >= scannedThrough)).toBe(true)
     } finally {
-      lastIndexOf.mockRestore()
+      indexOf.mockRestore()
     }
   })
 
@@ -165,6 +201,46 @@ describe('MarkdownView', () => {
     expect(container.querySelector('h1')?.textContent).toContain('Heading')
   })
 
+  it('reserves the exact skipped-prefix geometry while a long static body completes', () => {
+    const content = `${'x'.repeat(PROGRESSIVE_STATIC_MARKDOWN_CHARS)}\n\ntail`
+    const { container } = render(<MarkdownView content={content} />)
+    const spacer = container.querySelector<HTMLElement>('[data-ui="markdown-progressive-prefix"]')
+    if (!spacer) throw new Error('progressive static prefix spacer missing')
+    const prefixLength = Number(spacer.dataset.length)
+    const expectedHeight = Math.min(2_000_000, Math.ceil(prefixLength / 84) * 22)
+
+    expect(prefixLength).toBeGreaterThan(0)
+    expect(spacer.style.getPropertyValue('--virtual-spacer-height')).toBe(`${expectedHeight}px`)
+  })
+
+  it('finalizes an unchanged long stream without replacing its frozen prefix', () => {
+    const content = `# Heading\n\n${'x'.repeat(160_000)}`
+    const { container, rerender } = render(
+      <MarkdownView content="" contentSegments={[content]} streaming renderRevision={1} />,
+    )
+    const frozenPrefix = container.querySelector<HTMLElement>(
+      '[data-ui="markdown-segment"][data-mode="static"]',
+    )
+    if (!frozenPrefix) throw new Error('streaming prefix did not freeze')
+    const streamingSegmentCount = container.querySelectorAll('[data-ui="markdown-segment"]').length
+    frozenPrefix.dataset.finalizationAnchor = 'retained'
+
+    rerender(
+      <MarkdownView content="" contentSegments={[content]} streaming={false} renderRevision={2} />,
+    )
+
+    expect(container.querySelector('[data-finalization-anchor="retained"]')).toBe(frozenPrefix)
+    expect(container.querySelector('[data-overflow="progressive-static"]')).toBeNull()
+    expect(container.querySelectorAll('[data-ui="markdown-segment"]')).toHaveLength(
+      streamingSegmentCount,
+    )
+    expect(
+      Array.from(container.querySelectorAll('[data-ui="markdown-segment"]')).every(
+        (segment) => segment.getAttribute('data-mode') === 'static',
+      ),
+    ).toBe(true)
+  })
+
   it('blocks images from unlisted origins with a visible fallback', () => {
     const { container } = render(
       <MarkdownView content="![alt text](https://tracker.example.com/pixel.gif)" />,
@@ -189,6 +265,24 @@ describe('MarkdownView', () => {
     expect(container.querySelector('img[src="https://cdn.mysite.example/a.png"]')).toBeTruthy()
   })
 
+  it('applies the resident custom origin policy without one prop per message', () => {
+    const { container } = render(
+      <ConfigurationPreferencesContext.Provider
+        value={{
+          global: DEFAULT_GLOBAL_PREFERENCES,
+          rendering: DEFAULT_RENDERING_PREFS,
+          sidebarSortMode: DEFAULT_SIDEBAR_SORT_MODE,
+          collapsedFolderIds: [],
+          imageAllowlist: ['https://cdn.workspace.example'],
+          samplePromptsDismissed: false,
+        }}
+      >
+        <MarkdownView content="![a](https://cdn.workspace.example/a.png)" />
+      </ConfigurationPreferencesContext.Provider>,
+    )
+    expect(container.querySelector('img[src="https://cdn.workspace.example/a.png"]')).toBeTruthy()
+  })
+
   it('renders lists, tables, and blockquotes from fixtures', () => {
     const md = `
 * item one
@@ -211,6 +305,25 @@ describe('MarkdownView', () => {
     expect(() => render(<MarkdownView content={md} streaming />)).not.toThrow()
   })
 
+  it('routes oversized fences through the bounded production renderer before Shiki', async () => {
+    const finalLine = 'must-stay-cold-until-explicit-highlight'
+    const code = `${'x\n'.repeat(10_001)}${finalLine}`
+    const { container } = render(<MarkdownView content={`\`\`\`ts\n${code}\n\`\`\``} />)
+
+    expect(
+      container.querySelector('[data-ui="code-block"][data-overflow="truncated"]'),
+    ).toBeTruthy()
+    expect(screen.getByRole('button', { name: /highlight anyway/i })).toBeEnabled()
+    expect(container.textContent).not.toContain(finalLine)
+    expect(container.querySelector('[data-streamdown="code-block"]')).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: /highlight anyway/i }))
+    await waitFor(() =>
+      expect(container.querySelector('[data-streamdown="code-block"]')).toBeTruthy(),
+    )
+    expect(container.textContent).toContain(finalLine)
+  })
+
   it('leaves currency ranges with single dollar signs as text', () => {
     const { container } = render(
       <MarkdownView content="The usual price recommendation is $10 to $12 per month." />,
@@ -222,7 +335,23 @@ describe('MarkdownView', () => {
   it('still renders double-dollar math', () => {
     const { container } = render(<MarkdownView content="Use $$E = mc^2$$ here." />)
     expect(container.querySelector('.katex')).toBeTruthy()
+    expect(container.querySelector('.katex-display')).toBeTruthy()
     expect(container.textContent).toContain('E=mc')
+  })
+
+  it('keeps malformed math inert and exposes the KaTeX parse explanation', () => {
+    const { container } = render(<MarkdownView content={'$$\\frac{1}{2$$'} />)
+    const error = container.querySelector('.katex-error')
+    expect(error?.getAttribute('title')).toMatch(/parse error/i)
+    expect(error?.textContent).toContain('\\frac{1}{2')
+  })
+
+  it('does not turn an untrusted KaTeX href into a link', () => {
+    const { container } = render(
+      <MarkdownView content={'$$\\href{https://evil.example}{click}$$'} />,
+    )
+    expect(container.querySelector('a[href*="evil.example"]')).toBeNull()
+    expect(container.querySelector('.katex')).toBeTruthy()
   })
 
   it('renders single-dollar math when the rendering preference is enabled', () => {

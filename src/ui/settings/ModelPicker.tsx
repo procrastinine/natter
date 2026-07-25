@@ -18,17 +18,15 @@
 
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
-import type { ModelListEntry } from '../../api/providers'
+import { DEFAULT_GLOBAL_PREFERENCES } from '../../core/global-settings'
+import type { Chat, ModelListEntry } from '../../core/types'
+import { useConfigurationPreferences } from '../../hooks/useConfigurationPreferences'
+import type { UseModelsResult } from '../../hooks/useModelCatalog'
 import {
-  DEFAULT_PINNED_MODELS,
-  readGlobalPreferences,
-  writePinnedModels,
-  writeRecentModels,
-} from '../../core/global-settings'
-import type { Chat, ConnectionKind } from '../../core/types'
-import { useModels } from '../../hooks/useModels'
-import { GLOBAL_PREFERENCES_DEPENDENCIES } from '../../store/reactive-dependencies'
-import { useRepositoryQuery } from '../../store/reactive-query'
+  clearRecentModels,
+  movePinnedModel,
+  setPinnedModel,
+} from '../../store/preferences-application'
 import { Button, IconButton } from '../primitives/Button'
 
 // Below this threshold, the picker collapses to a plain list. OpenRouter's ~350
@@ -36,22 +34,16 @@ import { Button, IconButton } from '../primitives/Button'
 // llama.cpp with one or two loaded models falls below.
 const COMPACT_MODEL_COUNT = 10
 
-const OPENROUTER_MODELS_QUERY = {
-  query: { outputModalities: ['text', 'image', 'audio', 'file', 'video'] },
-} as const
-
-const DIRECT_MODELS_QUERY = {} as const
-
 type PickerTab = 'recent' | 'all'
 
 interface ModelPickerProps {
   chat: Chat
-  profileKind: ConnectionKind
+  modelsResult: UseModelsResult
   onPick: (modelId: string) => void | Promise<void>
   onPickForPreset?: (modelId: string) => void | Promise<void>
 }
 
-export function ModelPicker({ chat, profileKind, onPick, onPickForPreset }: ModelPickerProps) {
+export function ModelPicker({ chat, modelsResult, onPick, onPickForPreset }: ModelPickerProps) {
   const [tab, setTab] = useState<PickerTab>('recent')
   const [searchRaw, setSearchRaw] = useState('')
   const search = useDeferredValue(searchRaw)
@@ -66,26 +58,17 @@ export function ModelPicker({ chat, profileKind, onPick, onPickForPreset }: Mode
     lastSearchRef.current = search
   }, [search])
 
-  const modelsQuery = profileKind === 'openrouter' ? OPENROUTER_MODELS_QUERY : DIRECT_MODELS_QUERY
-  const { models, loading, refresh } = useModels(chat.settings.profileId, modelsQuery)
+  const { models, loading, retained, error, refresh } = modelsResult
   const currentModel = chat.settings.model
   const compact = models.length > 0 && models.length <= COMPACT_MODEL_COUNT
 
   // Pinned + recent model ids come from global prefs (workspace-wide).
-  // Live queries poll prefs; `writePinnedModels` / `writeRecentModels`
-  // broadcast through IDB so other tabs see the update.
-  const prefs = useRepositoryQuery(
-    'global-model-preferences',
-    async () => {
-      const p = await readGlobalPreferences()
-      return { pinned: p.pinnedModels, recent: p.recentModels }
-    },
-    { pinned: [...DEFAULT_PINNED_MODELS], recent: [] as string[] },
-    GLOBAL_PREFERENCES_DEPENDENCIES,
-  )
-  const pinnedModels = prefs.pinned
+  // Exact preference deltas publish through the workspace repository so other
+  // tabs see them without this tab replacing a concurrently changed array.
+  const prefs = useConfigurationPreferences()?.global ?? DEFAULT_GLOBAL_PREFERENCES
+  const pinnedModels = prefs.pinnedModels
   const pinnedSet = useMemo(() => new Set(pinnedModels), [pinnedModels])
-  const recents = prefs.recent
+  const recents = prefs.recentModels
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase()
@@ -116,16 +99,6 @@ export function ModelPicker({ chat, profileKind, onPick, onPickForPreset }: Mode
     const byId = new Map(filtered.map((m) => [m.id, m]))
     const out: ModelListEntry[] = []
     const seen = new Set<string>()
-    // OpenRouter lists are large enough that hoisting the current model is
-    // useful. On smaller direct-provider lists it just scrambles the natural
-    // order and makes refreshes look unstable.
-    if (profileKind === 'openrouter' && currentModel) {
-      const m = byId.get(currentModel)
-      if (m) {
-        out.push(m)
-        seen.add(currentModel)
-      }
-    }
     // Compact mode is just the flat live list; no recents/pins sorting so
     // a local server showing "1 of 1 · ⇧-click pins on preset" stops
     // pretending it's OpenRouter with 350 models to navigate.
@@ -165,7 +138,7 @@ export function ModelPicker({ chat, profileKind, onPick, onPickForPreset }: Mode
       }
     }
     return out
-  }, [compact, filtered, pinnedModels, recents, tab, search, currentModel, profileKind])
+  }, [compact, filtered, pinnedModels, recents, tab, search])
 
   const listRef = useRef<HTMLDivElement | null>(null)
   const rowVirtualizer = useVirtualizer({
@@ -175,28 +148,19 @@ export function ModelPicker({ chat, profileKind, onPick, onPickForPreset }: Mode
     overscan: 8,
   })
 
-  const togglePin = useCallback(async (modelId: string) => {
-    const current = (await readGlobalPreferences()).pinnedModels
-    if (current.includes(modelId)) {
-      await writePinnedModels(current.filter((x) => x !== modelId))
-    } else {
-      await writePinnedModels([...current, modelId])
-    }
-  }, [])
+  const togglePin = useCallback(
+    async (modelId: string) => {
+      await setPinnedModel(modelId, !pinnedSet.has(modelId))
+    },
+    [pinnedSet],
+  )
 
   const movePin = useCallback(async (modelId: string, delta: 1 | -1) => {
-    const current = [...(await readGlobalPreferences()).pinnedModels]
-    const idx = current.indexOf(modelId)
-    if (idx < 0) return
-    const to = Math.max(0, Math.min(current.length - 1, idx + delta))
-    if (to === idx) return
-    current.splice(idx, 1)
-    current.splice(to, 0, modelId)
-    await writePinnedModels(current)
+    await movePinnedModel(modelId, delta)
   }, [])
 
   const clearRecentHistory = useCallback(async () => {
-    await writeRecentModels([])
+    await clearRecentModels()
   }, [])
 
   const handlePick = useCallback(
@@ -211,7 +175,13 @@ export function ModelPicker({ chat, profileKind, onPick, onPickForPreset }: Mode
   )
 
   return (
-    <div data-ui="model-picker" data-compact={compact ? 'true' : undefined}>
+    <div
+      data-ui="model-picker"
+      data-compact={compact ? 'true' : undefined}
+      data-presentation={retained ? 'retained' : 'current'}
+      inert={retained || undefined}
+      aria-busy={loading}
+    >
       <div data-ui="model-picker-search">
         <input
           data-ui="model-picker-search-input"
@@ -261,7 +231,9 @@ export function ModelPicker({ chat, profileKind, onPick, onPickForPreset }: Mode
       )}
       <div data-ui="model-picker-list" ref={listRef}>
         {listRows.length === 0 ? (
-          <p data-ui="helper">{loading ? 'Loading…' : 'No matches.'}</p>
+          <p data-ui="helper" data-tone={error ? 'danger' : undefined}>
+            {loading ? 'Loading…' : error ? `Could not load models: ${error}` : 'No matches.'}
+          </p>
         ) : (
           <div
             data-ui="model-picker-list-inner"

@@ -1,40 +1,13 @@
-import type Dexie from 'dexie'
 import type { Table, Transaction } from 'dexie'
-import type {
-  Attachment,
-  AttachmentBlob,
-  AttachmentReferenceEdge,
-  DraftRow,
-  MessageAttachmentRef,
-} from '../core/types'
+import type { AttachmentBlob, DraftRow, MessageAttachmentRef } from '../core/types'
 import type { SettingsRow } from '../store/db-rows'
 import type { MessageHeaderRow } from '../store/message-storage'
-import { rebuildAttachmentReferenceEdges } from './attachment-reference-edges'
 import { forEachTableBatch } from './batched-table'
 
 const ATTACHMENT_REFS_BACKFILL_KEY = 'backfill:attachment-refs-v1'
 
 export function attachmentRefsBackfillMarker(): SettingsRow {
   return { key: ATTACHMENT_REFS_BACKFILL_KEY, value: 1 }
-}
-
-export async function migrateAttachmentRefRows(db: Dexie): Promise<void> {
-  const messages = db.table<MessageHeaderRow, string>('messages')
-  const drafts = db.table<DraftRow, string>('drafts')
-  const attachments = db.table<Attachment, string>('attachments')
-  const edges = db.table<
-    AttachmentReferenceEdge,
-    [AttachmentReferenceEdge['ownerKind'], string, string]
-  >('attachmentRefEdges')
-  const settings = db.table<SettingsRow, string>('settings')
-  const marker = await settings.get(ATTACHMENT_REFS_BACKFILL_KEY)
-  if (marker?.value === 1) return
-
-  await db.transaction('rw', messages, drafts, attachments, edges, settings, async (tx) => {
-    await normalizeAttachmentRefOwners(tx)
-    await rebuildAttachmentReferenceEdges(tx)
-    await settings.put(attachmentRefsBackfillMarker())
-  })
 }
 
 export async function normalizeAttachmentRefOwners(tx: Transaction): Promise<void> {

@@ -1,7 +1,22 @@
 import { expect } from 'vitest'
+import { createBranchPath } from '../../src/core/branch-session'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
-import type { Chat, Message } from '../../src/core/types'
-import { ExpectedLeafChangedError, type WorkspaceRepository } from '../../src/store/repository'
+import {
+  fixedConversationSelectionTarget,
+  resolvingConversationSelectionTarget,
+} from '../../src/core/messages'
+import type { Chat } from '../../src/core/types'
+import type {
+  CommitEnvelope,
+  ReadEnvelope,
+  WorkspaceCommand,
+  WorkspaceCommandResult,
+  WorkspaceQuery,
+  WorkspaceQueryResult,
+  WorkspaceRepository,
+} from '../../src/store/workspace-protocol'
+import { runWorkspaceAction, runWorkspaceRead } from '../../src/store/workspace-runtime'
+import { putTestChat } from './chats'
 
 function contractChat(id: string): Chat {
   return {
@@ -15,6 +30,7 @@ function contractChat(id: string): Chat {
     totalCostUsd: 0,
     metaVersion: 0,
     summaryVersion: 0,
+    structuralVersion: 0,
     settings: cloneDefaultChatSettings(),
     lastUpdatedLeafId: null,
     lastBranchUpdatedAt: 1,
@@ -25,236 +41,301 @@ function contractChat(id: string): Chat {
   }
 }
 
-function contractMessage(
-  chatId: string,
-  id: string,
-  parentId: string | null,
-  siblingIndex: number,
-  createdAt: number,
-): Message {
-  return {
-    id,
-    chatId,
-    parentId,
-    siblingIndex,
-    turnId: `turn-${id}`,
-    turnIndex: createdAt,
-    createdAt,
-    role: createdAt % 2 === 0 ? 'assistant' : 'user',
-    origin: createdAt % 2 === 0 ? 'generated' : 'user',
-    content: [{ type: 'text', text: `body ${id}` }],
-    nodeVersion: 0,
-    deleted: false,
-  }
+function read<Q extends WorkspaceQuery>(
+  repository: WorkspaceRepository,
+  query: Q,
+): Promise<ReadEnvelope<WorkspaceQueryResult<Q>>> {
+  return runWorkspaceRead('repository-query', (permit) => repository.query(permit, query))
+}
+
+function write<C extends WorkspaceCommand>(
+  repository: WorkspaceRepository,
+  command: C,
+): Promise<CommitEnvelope<WorkspaceCommandResult<C>>> {
+  return runWorkspaceAction('maintenance', (permit) => repository.execute(permit, command))
 }
 
 export async function expectWorkspaceRepositoryCoreContract(
   repository: WorkspaceRepository,
 ): Promise<void> {
-  const before = await repository.getWorkspaceMeta()
-  const chat = await repository.createChat(contractChat('contract-chat'))
-  expect(await repository.getChat(chat.id)).toEqual(chat)
-  expect((await repository.listChats()).map((row) => row.id)).toContain(chat.id)
-  const afterCreate = await repository.getWorkspaceMeta()
+  const before = await read(repository, { kind: 'workspace.meta' })
+  const chat = await putTestChat(contractChat('contract-chat'))
+  expect((await read(repository, { kind: 'chat.get', chatId: chat.id })).value).toEqual(chat)
+  const afterCreate = await read(repository, { kind: 'workspace.meta' })
   expect(afterCreate.workspaceId).toBe(before.workspaceId)
-  expect(afterCreate.backendKind).not.toBe('unknown')
-  expect(afterCreate.mutationCounter).toBeGreaterThan(before.mutationCounter)
+  expect(afterCreate.replacementEpoch).toBe(before.replacementEpoch)
+  expect(afterCreate.value.backendKind).not.toBe('unknown')
 
-  const root = contractMessage(chat.id, 'contract-root', null, 0, 1)
-  const older = contractMessage(chat.id, 'contract-older', root.id, 0, 2)
-  const newer = contractMessage(chat.id, 'contract-newer', root.id, 1, 3)
-  const mutation = await repository.runMutation(
-    [
-      { kind: 'message', messageId: root.id },
-      { kind: 'message', messageId: older.id },
-      { kind: 'message', messageId: newer.id },
-      { kind: 'children', chatId: chat.id, parentId: null },
-      { kind: 'children', chatId: chat.id, parentId: root.id },
-    ],
-    async (context) => {
-      await context.putMessage(root)
-      await context.putMessage(older)
-      await context.putMessage(newer)
-      return 'committed'
+  const rootCommit = await write(repository, {
+    kind: 'message.import',
+    input: {
+      chatId: chat.id,
+      slot: { kind: 'at-end' },
+      activeLeafId: null,
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'body contract-root' }] }],
+      now: 1,
     },
-  )
-  expect(mutation.value).toBe('committed')
-  expect(mutation.affectedMessageIds).toEqual([root.id, older.id, newer.id])
-  expect(mutation.chatVersions[chat.id]).toBeDefined()
-  expect(await repository.getMessage(root.id)).toEqual(
-    expect.objectContaining({ ...root, attachmentRefs: [] }),
-  )
-  expect(await repository.getMessageTextPreview(root.id)).toBe('body contract-root')
-  expect(await repository.getMessageHeader(root.id)).toEqual(
-    expect.objectContaining({ id: root.id, textPreview: 'body contract-root' }),
-  )
-  const revisionSnapshot = await repository.getSendContextRevisionSnapshot(chat.id, [
-    newer.id,
-    'contract-missing',
-    root.id,
-  ])
-  expect(revisionSnapshot.chat?.settings).toEqual(chat.settings)
-  expect(revisionSnapshot.headers.map((header) => header?.id)).toEqual([
-    newer.id,
-    undefined,
-    root.id,
-  ])
-
-  const defaultSnapshot = await repository.getActiveBranchSnapshot(chat.id, {})
-  expect(defaultSnapshot.branch.map((message) => message.id)).toEqual([root.id, newer.id])
-  const pageMeasurements: Array<{ pageHeaderRowsRead: number; bodyRowsRead: number }> = []
-  const pinnedPageResult = await repository.getKnownBranchPageSnapshot(
-    chat.id,
-    [root.id, older.id],
-    {
-      offset: -1,
-      limit: 1,
-      onMeasure: (measurement) => pageMeasurements.push(measurement),
+  })
+  const root = rootCommit.value.presentations[0]
+  if (!root) throw new Error('ExpectedRootPresentation')
+  const olderCommit = await write(repository, {
+    kind: 'message.import',
+    input: {
+      chatId: chat.id,
+      slot: { kind: 'at-end' },
+      activeLeafId: root.message.id,
+      messages: [{ role: 'assistant', content: [{ type: 'text', text: 'body contract-older' }] }],
+      now: 2,
     },
-  )
-  expect(pinnedPageResult.kind).toBe('ready')
-  if (pinnedPageResult.kind !== 'ready') throw new Error('expected ready branch page')
-  expect(pinnedPageResult.snapshot.pageHeaders.map((message) => message.id)).toEqual([older.id])
-  expect(pinnedPageResult.snapshot.pageMessages.map((message) => message.id)).toEqual([older.id])
-  expect(pinnedPageResult.snapshot.pageOffset).toBe(1)
-  expect(pinnedPageResult.snapshot.branchLength).toBe(2)
-  expect(pageMeasurements).toEqual([{ pageHeaderRowsRead: 1, bodyRowsRead: 1 }])
-  await expect(
-    repository.getKnownBranchPageSnapshot(chat.id, [], { offset: -1, limit: 1 }),
-  ).resolves.toMatchObject({ kind: 'stale-path', reason: 'empty-path' })
-  await expect(
-    repository.getKnownBranchPageSnapshot(chat.id, [root.id, older.id, newer.id], {
-      offset: 1,
-      limit: 2,
-    }),
-  ).resolves.toMatchObject({
-    kind: 'stale-path',
-    reason: 'non-contiguous',
-    messageId: newer.id,
   })
-
-  await expect(
-    repository.getKnownBranchPageSnapshot(chat.id, [root.id, root.id], {
-      offset: 0,
-      limit: 2,
-    }),
-  ).resolves.toMatchObject({ kind: 'stale-path', reason: 'duplicate-id', messageId: root.id })
-  await expect(
-    repository.getKnownBranchPageSnapshot(chat.id, ['contract-missing'], {
-      offset: -1,
-      limit: 1,
-    }),
-  ).resolves.toMatchObject({
-    kind: 'stale-path',
-    reason: 'missing-header',
-    messageId: 'contract-missing',
+  const older = olderCommit.value.presentations[0]
+  if (!older) throw new Error('ExpectedOlderPresentation')
+  const newerCommit = await write(repository, {
+    kind: 'message.import',
+    input: {
+      chatId: chat.id,
+      slot: { kind: 'sibling', messageId: older.message.id },
+      activeLeafId: older.message.id,
+      messages: [{ role: 'assistant', content: [{ type: 'text', text: 'body contract-newer' }] }],
+      now: 3,
+    },
   })
-  await expect(
-    repository.getKnownBranchPageSnapshot('contract-other-chat', [root.id], {
-      offset: -1,
-      limit: 1,
-    }),
-  ).resolves.toMatchObject({ kind: 'stale-path', reason: 'wrong-chat', messageId: root.id })
-  await expect(
-    repository.getKnownBranchPageSnapshot(chat.id, [older.id], { offset: -1, limit: 1 }),
-  ).resolves.toMatchObject({ kind: 'stale-path', reason: 'non-root', messageId: older.id })
-  await expect(
-    repository.getKnownBranchPageSnapshot(chat.id, [root.id, older.id, newer.id], {
-      offset: -1,
-      limit: 1,
-    }),
-  ).resolves.toMatchObject({ kind: 'stale-path', reason: 'non-contiguous', messageId: newer.id })
-
-  await repository.runMutation(
-    [
-      { kind: 'message', messageId: older.id },
-      { kind: 'children', chatId: chat.id, parentId: root.id },
-    ],
-    async (context) => context.putMessage({ ...older, deleted: true }),
+  const newer = newerCommit.value.presentations[0]
+  if (!newer) throw new Error('ExpectedNewerPresentation')
+  expect(rootCommit.receipt.messageRevisions.map((revision) => revision.header.id)).toContain(
+    root.message.id,
   )
-  await expect(
-    repository.getKnownBranchPageSnapshot(chat.id, [root.id, older.id], {
-      offset: -1,
-      limit: 1,
-    }),
-  ).resolves.toMatchObject({ kind: 'stale-path', reason: 'deleted-header', messageId: older.id })
-}
-
-export async function expectWorkspaceRepositoryRollbackContract(
-  repository: WorkspaceRepository,
-): Promise<void> {
-  const chat = await repository.createChat(contractChat('rollback-chat'))
-  const message = contractMessage(chat.id, 'rollback-message', null, 0, 1)
-  const before = await repository.getWorkspaceMeta()
-  await expect(
-    repository.runMutation(
-      [
-        { kind: 'message', messageId: message.id },
-        { kind: 'children', chatId: chat.id, parentId: null },
-      ],
-      async (context) => {
-        await context.putMessage(message)
-        throw new Error('contract rollback')
-      },
-    ),
-  ).rejects.toThrow('contract rollback')
-  expect(await repository.getMessage(message.id)).toBeUndefined()
-  expect((await repository.getWorkspaceMeta()).mutationCounter).toBe(before.mutationCounter)
-}
-
-export async function expectWorkspaceRepositoryExpectedLeafAppendContract(
-  repository: WorkspaceRepository,
-): Promise<void> {
-  const chat = await repository.createChat(contractChat('expected-leaf-chat'))
-  const rootTemplate = contractMessage(chat.id, 'expected-leaf-root', null, 0, 1)
-  const { parentId, siblingIndex, nodeVersion, deleted, ...root } = rootTemplate
-  void parentId
-  void siblingIndex
-  void nodeVersion
-  void deleted
-  await repository.appendMessageToExpectedLeaf({ expectedLeafId: null, message: root })
-
-  const candidate = (id: string, createdAt: number) => {
-    const template = contractMessage(chat.id, id, root.id, 0, createdAt)
-    const {
-      parentId: ignoredParent,
-      siblingIndex: ignoredSiblingIndex,
-      nodeVersion: ignoredNodeVersion,
-      deleted: ignoredDeleted,
-      ...message
-    } = template
-    void ignoredParent
-    void ignoredSiblingIndex
-    void ignoredNodeVersion
-    void ignoredDeleted
-    return repository.appendMessageToExpectedLeaf({ expectedLeafId: root.id, message })
+  expect(olderCommit.receipt.messageRevisions.map((revision) => revision.header.id)).toContain(
+    older.message.id,
+  )
+  expect(newerCommit.receipt.messageRevisions.map((revision) => revision.header.id)).toContain(
+    newer.message.id,
+  )
+  for (const [commit, messageId] of [
+    [rootCommit, root.message.id],
+    [olderCommit, older.message.id],
+    [newerCommit, newer.message.id],
+  ] as const) {
+    const revision = commit.receipt.messageRevisions.find(
+      (candidate) => candidate.header.id === messageId,
+    )
+    const committedChat = commit.receipt.chats.find((candidate) => candidate.id === chat.id)
+    expect(revision?.structuralVersion).toBe(committedChat?.structuralVersion)
+    expect(revision?.header).toEqual(expect.objectContaining({ id: messageId, chatId: chat.id }))
   }
 
-  const before = await repository.getWorkspaceMeta()
-  const settled = await Promise.allSettled([
-    candidate('expected-leaf-a', 2),
-    candidate('expected-leaf-b', 3),
+  const rootPresentation = (
+    await read(repository, { kind: 'message.presentation', messageId: root.message.id })
+  ).value
+  expect(rootPresentation?.message).toEqual(
+    expect.objectContaining({ id: root.message.id, attachmentRefs: [] }),
+  )
+  expect(rootPresentation?.header).toEqual(expect.objectContaining({ id: root.message.id }))
+  const rootPreview = (
+    await read(repository, {
+      kind: 'message.preview-window',
+      targets: [{ messageId: root.message.id, bodyVersion: rootPresentation?.bodyVersion ?? -1 }],
+    })
+  ).value[0]
+  expect(rootPreview?.text).toBe('body contract-root')
+
+  const [revisionChat, revisionTopology] = await Promise.all([
+    read(repository, { kind: 'chat.get', chatId: chat.id }),
+    read(repository, { kind: 'message.headers-by-chat', chatId: chat.id }),
   ])
-  const fulfilled = settled.filter(
-    (result): result is PromiseFulfilledResult<Awaited<ReturnType<typeof candidate>>> =>
-      result.status === 'fulfilled',
+  expect(revisionChat.value?.settings).toEqual(chat.settings)
+  expect(revisionTopology.value.kind).toBe('ready')
+  if (revisionTopology.value.kind !== 'ready') {
+    throw new Error('ExpectedReadyContractTopology')
+  }
+  expect(revisionTopology.value.chat.settings).toEqual(chat.settings)
+  expect(revisionTopology.value.structuralVersion).toBe(
+    revisionTopology.value.chat.structuralVersion,
   )
-  const rejected = settled.filter(
-    (result): result is PromiseRejectedResult => result.status === 'rejected',
+  expect(new Set(revisionTopology.value.headers.map((header) => header.id))).toEqual(
+    new Set([root.message.id, older.message.id, newer.message.id]),
   )
-  expect(fulfilled).toHaveLength(1)
-  expect(rejected).toHaveLength(1)
-  expect(rejected[0]?.reason).toBeInstanceOf(ExpectedLeafChangedError)
+  expect(revisionTopology.value.headers.some((header) => header.id === 'contract-missing')).toBe(
+    false,
+  )
 
-  const winnerId = fulfilled[0]?.value.message.id
-  const loserId = winnerId === 'expected-leaf-a' ? 'expected-leaf-b' : 'expected-leaf-a'
-  expect(await repository.getMessage(loserId)).toBeUndefined()
-  const children = await repository.listChildHeaders(chat.id, root.id)
-  expect(children.filter((row) => !row.deleted).map((row) => row.id)).toEqual([winnerId])
-  expect(new Set(children.map((row) => row.siblingIndex)).size).toBe(children.length)
-  expect((await repository.getChat(chat.id))?.lastUpdatedLeafId).toBe(winnerId)
-  expect((await repository.getWorkspaceMeta()).mutationCounter).toBe(before.mutationCounter + 1)
+  const defaultSelection = (
+    await read(repository, {
+      kind: 'branch.open',
+      chatId: chat.id,
+      target: resolvingConversationSelectionTarget({ kind: 'default' }),
+      bodyDemand: 'terminal',
+    })
+  ).value
+  expect(defaultSelection.kind).toBe('ready')
+  if (defaultSelection.kind !== 'ready') throw new Error('ExpectedReadyDefaultSelection')
+  expect(defaultSelection.proof.pathHeaders.map((message) => message.id)).toEqual([
+    root.message.id,
+    newer.message.id,
+  ])
 
-  await expect(candidate('expected-leaf-stale', 4)).rejects.toBeInstanceOf(ExpectedLeafChangedError)
-  expect(await repository.getMessage('expected-leaf-stale')).toBeUndefined()
+  const olderSelection = (
+    await read(repository, {
+      kind: 'branch.open',
+      chatId: chat.id,
+      target: fixedConversationSelectionTarget(
+        { kind: 'tip', messageId: older.message.id },
+        older.message.id,
+      ),
+      bodyDemand: 'terminal',
+    })
+  ).value
+  expect(olderSelection.kind).toBe('ready')
+  if (olderSelection.kind !== 'ready') throw new Error('ExpectedReadyPinnedSelection')
+  const olderPath = createBranchPath(olderSelection.proof.pathHeaders)
+  const pinnedPage = await read(repository, {
+    kind: 'branch.page-structure',
+    chatId: chat.id,
+    resolvedTipId: older.message.id,
+    structuralVersion: olderSelection.proof.structuralVersion,
+    window: olderPath.window({ offset: -1, limit: 1 }),
+  })
+  expect(pinnedPage.value.kind).toBe('ready')
+  if (pinnedPage.value.kind !== 'ready') throw new Error('ExpectedReadyBranchPage')
+  expect(pinnedPage.value.snapshot.pageHeaders.map((message) => message.id)).toEqual([
+    older.message.id,
+  ])
+  expect(pinnedPage.value.snapshot.pageOffset).toBe(1)
+  expect(pinnedPage.value.snapshot.branchLength).toBe(2)
+  const pinnedMaterial = (
+    await read(repository, {
+      kind: 'message.presentations',
+      messageIds: pinnedPage.value.snapshot.pageHeaders.map((header) => header.id),
+    })
+  ).value
+  expect(pinnedMaterial.map((presentation) => presentation?.message.id)).toEqual([older.message.id])
+
+  const [rootHeader, olderHeader] = olderSelection.proof.pathHeaders
+  const newerHeader = newer.header
+  if (!rootHeader || !olderHeader) throw new Error('ExpectedPinnedHeaders')
+  await expect(
+    read(repository, {
+      kind: 'branch.page-structure',
+      chatId: chat.id,
+      resolvedTipId: older.message.id,
+      structuralVersion: olderSelection.proof.structuralVersion,
+      window: {
+        branchLength: 0,
+        offset: 0,
+        limit: 1,
+        boundaryParentId: null,
+        nodes: [],
+      },
+    }),
+  ).resolves.toMatchObject({ value: { kind: 'stale-path', reason: 'empty-path' } })
+  await expect(
+    read(repository, {
+      kind: 'branch.page-structure',
+      chatId: chat.id,
+      resolvedTipId: root.message.id,
+      structuralVersion: olderSelection.proof.structuralVersion,
+      window: {
+        branchLength: 2,
+        offset: 0,
+        limit: 2,
+        boundaryParentId: null,
+        nodes: [rootHeader, rootHeader],
+      },
+    }),
+  ).resolves.toMatchObject({
+    value: { kind: 'stale-path', reason: 'duplicate-id', messageId: root.message.id },
+  })
+  await expect(
+    read(repository, {
+      kind: 'branch.page-structure',
+      chatId: chat.id,
+      resolvedTipId: 'contract-missing',
+      structuralVersion: olderSelection.proof.structuralVersion,
+      window: {
+        branchLength: 1,
+        offset: 0,
+        limit: 1,
+        boundaryParentId: null,
+        nodes: [{ ...rootHeader, id: 'contract-missing' }],
+      },
+    }),
+  ).resolves.toMatchObject({
+    value: { kind: 'stale-path', reason: 'missing-header', messageId: 'contract-missing' },
+  })
+  const otherChat = await putTestChat(contractChat('contract-other-chat'))
+  await expect(
+    read(repository, {
+      kind: 'branch.page-structure',
+      chatId: otherChat.id,
+      resolvedTipId: root.message.id,
+      structuralVersion: otherChat.structuralVersion,
+      window: {
+        branchLength: 1,
+        offset: 0,
+        limit: 1,
+        boundaryParentId: null,
+        nodes: [rootHeader],
+      },
+    }),
+  ).resolves.toMatchObject({
+    value: { kind: 'stale-path', reason: 'wrong-chat', messageId: root.message.id },
+  })
+  await expect(
+    read(repository, {
+      kind: 'branch.page-structure',
+      chatId: chat.id,
+      resolvedTipId: older.message.id,
+      structuralVersion: olderSelection.proof.structuralVersion,
+      window: {
+        branchLength: 1,
+        offset: 0,
+        limit: 1,
+        boundaryParentId: null,
+        nodes: [olderHeader],
+      },
+    }),
+  ).resolves.toMatchObject({
+    value: { kind: 'stale-path', reason: 'non-root', messageId: older.message.id },
+  })
+  await expect(
+    read(repository, {
+      kind: 'branch.page-structure',
+      chatId: chat.id,
+      resolvedTipId: newer.message.id,
+      structuralVersion: olderSelection.proof.structuralVersion,
+      window: {
+        branchLength: 3,
+        offset: 0,
+        limit: 3,
+        boundaryParentId: null,
+        nodes: [rootHeader, olderHeader, newerHeader],
+      },
+    }),
+  ).resolves.toMatchObject({
+    value: { kind: 'stale-path', reason: 'non-contiguous', messageId: newer.message.id },
+  })
+
+  const deleteCommit = await write(repository, {
+    kind: 'message.delete',
+    mode: 'single',
+    input: {
+      chatId: chat.id,
+      messageId: older.message.id,
+      activeLeafId: older.message.id,
+      now: 4,
+    },
+  })
+  const deletedChat = deleteCommit.receipt.chats.find((row) => row.id === chat.id)
+  if (!deletedChat) throw new Error('ExpectedDeletedChatReceipt')
+  await expect(
+    read(repository, {
+      kind: 'branch.page-structure',
+      chatId: chat.id,
+      resolvedTipId: older.message.id,
+      structuralVersion: deletedChat.structuralVersion,
+      window: olderPath.window({ offset: -1, limit: 1 }),
+    }),
+  ).resolves.toMatchObject({
+    value: { kind: 'stale-path', reason: 'deleted-header', messageId: older.message.id },
+  })
 }

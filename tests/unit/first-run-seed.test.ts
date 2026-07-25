@@ -1,65 +1,96 @@
 import Dexie from 'dexie'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { cloneDefaultChatSettings, resolveDefaultModel } from '../../src/core/defaults'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
-import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
-import { runFirstRunSeed } from '../../src/store/first-run-seed'
+import { __resetBrowserRepositoryForTests } from '../../src/store/browser-repo'
+import { configurationApplication } from '../../src/store/configuration-application'
+import { __resetDbForTests, getDb } from '../../src/store/db'
 import { __resetKeyCacheForTests, resolveKey } from '../../src/store/keys'
-import { listPresets } from '../../src/store/presets'
-import { listProfiles } from '../../src/store/profiles'
+import { createBrowserWorkspaceSuiteOwner } from '../helpers/browser-workspace-suite'
 
 const DB_NAME = 'natter'
+const workspaceSuite = createBrowserWorkspaceSuiteOwner()
+
+beforeAll(async () => {
+  await resetAll()
+  await workspaceSuite.open()
+})
 
 async function resetAll() {
   __resetBroadcastForTests()
   __resetKeyCacheForTests()
+  __resetBrowserRepositoryForTests()
   __resetDbForTests()
   await Dexie.delete(DB_NAME)
 }
 
-beforeEach(async () => {
-  await resetAll()
-  await openDb()
-})
+async function clearFirstConnectionRows() {
+  __resetKeyCacheForTests()
+  __resetBrowserRepositoryForTests()
+  const db = getDb()
+  await db.transaction(
+    'rw',
+    [
+      db.keys,
+      db.profiles,
+      db.presets,
+      db.configurationLinks,
+      db.configurationProfileCatalogRows,
+      db.configurationPresetCatalogRows,
+    ],
+    async () => {
+      await Promise.all([
+        db.keys.clear(),
+        db.profiles.clear(),
+        db.presets.clear(),
+        db.configurationLinks.clear(),
+        db.configurationProfileCatalogRows.clear(),
+        db.configurationPresetCatalogRows.clear(),
+      ])
+    },
+  )
+}
 
-afterEach(async () => {
+beforeEach(clearFirstConnectionRows)
+
+afterAll(async () => {
+  await workspaceSuite.dispose()
   await resetAll()
 })
 
 describe('resolveDefaultModel', () => {
   it('prefers the first canonical candidate present in the live list', () => {
-    const chosen = resolveDefaultModel([
-      { id: 'openai/gpt-5.4' },
-      { id: 'anthropic/claude-opus-4.7' },
-    ])
-    expect(chosen).toBe('anthropic/claude-opus-4.7')
+    expect(
+      resolveDefaultModel([{ id: 'openai/gpt-5.6-sol' }, { id: 'anthropic/claude-opus-4.8' }]),
+    ).toBe('anthropic/claude-opus-4.8')
   })
 
   it('skips a candidate that expires within 60 days', () => {
     const now = Date.parse('2026-04-18T00:00:00Z')
     const within30 = new Date(now + 30 * 24 * 60 * 60 * 1000).toISOString()
-    const chosen = resolveDefaultModel(
-      [{ id: 'anthropic/claude-opus-4.7', expirationDate: within30 }, { id: 'openai/gpt-5.4' }],
-      { now },
-    )
-    expect(chosen).toBe('openai/gpt-5.4')
+    expect(
+      resolveDefaultModel(
+        [
+          { id: 'anthropic/claude-opus-4.8', expirationDate: within30 },
+          { id: 'openai/gpt-5.6-sol' },
+        ],
+        { now },
+      ),
+    ).toBe('openai/gpt-5.6-sol')
   })
 
-  it('falls back to the first tool-capable model when no canonical candidate is present', () => {
-    const chosen = resolveDefaultModel([
-      { id: 'misc/noop' },
-      { id: 'misc/toolish', supportedParameters: ['tools'] },
-    ])
-    expect(chosen).toBe('misc/toolish')
-  })
-
-  it('falls back to the first listed model as the final resort', () => {
-    const chosen = resolveDefaultModel([{ id: 'misc/only' }])
-    expect(chosen).toBe('misc/only')
+  it('falls back to the first fresh tool-capable model, then the first listed model', () => {
+    expect(
+      resolveDefaultModel([
+        { id: 'misc/noop' },
+        { id: 'misc/toolish', supportedParameters: ['tools'] },
+      ]),
+    ).toBe('misc/toolish')
+    expect(resolveDefaultModel([{ id: 'misc/only' }])).toBe('misc/only')
   })
 })
 
-describe('runFirstRunSeed', () => {
+describe('first connection creation', () => {
   it('creates exactly one key, one profile, and one preset', async () => {
     const result = await runFirstRunSeed({
       apiKey: 'sk-or-v1-realkey-abcdef',
@@ -109,8 +140,8 @@ describe('runFirstRunSeed', () => {
 
   it('the seed preset is MRU-eligible via listPresets', async () => {
     const result = await runFirstRunSeed({ apiKey: 'sk-or-v1-mru' })
-    const profiles = await listProfiles()
-    const presets = await listPresets()
+    const profiles = await getDb().profiles.toArray()
+    const presets = await getDb().presets.toArray()
     expect(profiles.map((p) => p.id)).toEqual([result.profile.id])
     expect(presets.map((p) => p.id)).toEqual([result.preset.id])
   })
@@ -122,3 +153,26 @@ describe('runFirstRunSeed', () => {
     expect(fresh.systemPrompt).toBe('')
   })
 })
+
+async function runFirstRunSeed(input: {
+  apiKey: string
+  model?: string
+  passphrase?: string
+  passphraseHint?: string
+}) {
+  const result = await configurationApplication.createConnection({
+    name: 'OpenRouter',
+    kind: 'openrouter',
+    baseUrl: 'https://openrouter.ai/api/v1',
+    plaintextKey: input.apiKey,
+    keyName: 'OpenRouter',
+    ...(input.passphrase === undefined ? {} : { passphrase: input.passphrase }),
+    ...(input.passphraseHint === undefined ? {} : { passphraseHint: input.passphraseHint }),
+    initialPresetName: 'OpenRouter default',
+    initialPresetModel: input.model ?? '',
+  })
+  if (result.kind !== 'connection-saved' || !result.key || !result.initialPreset) {
+    throw new Error('FirstConnectionAtomicCreateFailed')
+  }
+  return { key: result.key, profile: result.profile, preset: result.initialPreset }
+}

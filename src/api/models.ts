@@ -8,32 +8,27 @@
 // Fetchers here are environment-neutral (no Dexie, no React). Hooks layer
 // in caching + reactivity.
 
-import type { ConnectionProfile } from '../core/types'
+import type { ConnectionHttpProfile } from '../core/types'
 import { buildHeaders, fetchWithTimeout, readErrorResponseJson, readResponseJson } from './client'
 import { normalizeError } from './errors'
 
 interface DiscoveryContext {
-  profile: ConnectionProfile
+  profile: ConnectionHttpProfile
   apiKey: string
 }
 
-function modelsUrl(profile: ConnectionProfile, query: ModelsQueryString): string {
+function modelsUrl(profile: ConnectionHttpProfile, query: ModelsQueryString): string {
   const base = normalizedBaseUrl(profile)
   const search = stringifyQuery(query)
   return search ? `${base}/models?${search}` : `${base}/models`
 }
 
-function endpointsUrl(profile: ConnectionProfile, modelId: string): string {
+function endpointsUrl(profile: ConnectionHttpProfile, modelId: string): string {
   const base = normalizedBaseUrl(profile)
   return `${base}/models/${modelId}/endpoints`
 }
 
-function providersUrl(profile: ConnectionProfile): string {
-  const base = normalizedBaseUrl(profile)
-  return `${base}/providers`
-}
-
-function normalizedBaseUrl(profile: ConnectionProfile): string {
+function normalizedBaseUrl(profile: ConnectionHttpProfile): string {
   const base = profile.baseUrl.replace(/\/+$/, '')
   if (profile.kind === 'google' && !/\/openai$/i.test(base)) {
     return `${base}/openai`
@@ -95,11 +90,4 @@ export async function fetchEndpoints(
   opts: { signal?: AbortSignal; timeoutMs?: number } = {},
 ): Promise<unknown> {
   return fetchJson(endpointsUrl(ctx.profile, modelId), ctx, opts)
-}
-
-export async function fetchProviders(
-  ctx: DiscoveryContext,
-  opts: { signal?: AbortSignal; timeoutMs?: number } = {},
-): Promise<unknown> {
-  return fetchJson(providersUrl(ctx.profile), ctx, opts)
 }

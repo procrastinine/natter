@@ -1,4 +1,3 @@
-import { normalizeAttachmentRefs } from '../../store/attachment-refs'
 import type {
   AttachmentRef,
   ChatSettings,
@@ -59,11 +58,22 @@ function pushLiveRefs(
   candidates: Candidate[],
   ownerId: AttachmentContextOwnerId,
   refs: readonly AttachmentRef[] | undefined,
-  owner: Parameters<typeof normalizeAttachmentRefs>[1],
 ): void {
-  for (const ref of normalizeAttachmentRefs(refs, owner)) {
+  for (const ref of refs ?? []) {
     if (ref.deletedAt !== undefined || ref.includeInContext === false) continue
-    candidates.push({ ownerId, ref })
+    candidates.push({
+      ownerId,
+      ref: {
+        refId: ref.refId,
+        attachmentId: ref.attachmentId,
+        includeInContext: true,
+        presentation: ref.presentation,
+        ...(ref.tokenEstimate ? { tokenEstimate: ref.tokenEstimate } : {}),
+        ...(ref.missingResolution ? { missingResolution: ref.missingResolution } : {}),
+        createdAt: ref.createdAt,
+        updatedAt: ref.updatedAt,
+      },
+    })
   }
 }
 
@@ -80,20 +90,14 @@ export function resolveAttachmentContextRefs(input: {
   for (const message of input.messages) {
     if (message.deleted || message.hiddenFromContext) continue
     if (strategy === 'echo-user-only' && message.role !== 'user') continue
-    pushLiveRefs(candidates, message.id, message.attachmentRefs, {
-      messageId: message.id,
-      createdAt: message.createdAt,
-    })
+    pushLiveRefs(candidates, message.id, message.attachmentRefs)
   }
 
   const draft = input.draft
   if (draft?.refs && draft.refs.length > 0) {
     const draftRole = draft.role ?? 'user'
     if (strategy !== 'echo-user-only' || draftRole === 'user') {
-      pushLiveRefs(candidates, DRAFT_ATTACHMENT_CONTEXT_ID, draft.refs, {
-        draftChatId: DRAFT_ATTACHMENT_CONTEXT_ID,
-        createdAt: draft.createdAt ?? 0,
-      })
+      pushLiveRefs(candidates, DRAFT_ATTACHMENT_CONTEXT_ID, draft.refs)
     }
   }
 

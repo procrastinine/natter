@@ -3,17 +3,11 @@
 // - "before" / "after" / "after-all" / "sibling": explicit tree insertion
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { cursorKeyOf } from '../../core/active-path'
-import { createCursorOverlay } from '../../core/cursor-overlay'
-import { type PasteImportSlot, pasteImport } from '../../core/messages'
-import type { ChatId, ContentItem, CursorMap, MessageRole } from '../../core/types'
+import { conversationActions } from '../../app/conversation-actions'
+import type { PasteImportSlot } from '../../core/messages'
+import type { ChatId, MessageRole } from '../../core/types'
 import { newId } from '../../lib/ulid'
 import { useAnnouncementStore } from '../../store/zustand/announcementStore'
-import {
-  type CommittedPathProducer,
-  type NavigationIntent,
-  useChatStore,
-} from '../../store/zustand/chatStore'
 import { CloseIcon, TrashIcon } from '../icons/Icon'
 import { Button, IconButton } from '../primitives/Button'
 import { Dialog } from '../primitives/Dialog'
@@ -25,8 +19,6 @@ interface ImportModalProps {
   // actually clicks Import.
   chatId: ChatId | null
   slot: PasteImportSlot
-  cursor: Readonly<CursorMap>
-  presentationWindowLimit: number
   // Initial role for the first row; defaults to "user" because the common
   // path is "paste a user turn from another app."
   defaultRole?: MessageRole
@@ -34,10 +26,7 @@ interface ImportModalProps {
   // null, invoked ONCE on commit to materialize the chat row, right
   // before the import mutation runs. Cancel / close never calls it;
   // route-level temporary-chat cleanup owns empty-row disposal.
-  materializeChat?: () => Promise<{
-    chatId: ChatId
-    navigationIntent: NavigationIntent | null
-  }>
+  materializeChat?: () => Promise<{ chatId: ChatId } | null>
   onClose: () => void
   onDone?: () => void
 }
@@ -70,8 +59,6 @@ function slotLabel(slot: PasteImportSlot): string {
 export function ImportModal({
   chatId,
   slot,
-  cursor,
-  presentationWindowLimit,
   defaultRole = 'user',
   materializeChat,
   onClose,
@@ -121,15 +108,6 @@ export function ImportModal({
       return
     }
     let effectiveChatId: ChatId | null = chatId
-    let committedPathProducer: CommittedPathProducer | null = null
-    if (effectiveChatId !== null) {
-      const chatStore = useChatStore.getState()
-      const navigationIntent = chatStore.beginNavigationIntent(effectiveChatId)
-      committedPathProducer = chatStore.registerCommittedPathProducer(
-        effectiveChatId,
-        navigationIntent,
-      )
-    }
     setBusy(true)
     setError(null)
     try {
@@ -138,43 +116,14 @@ export function ImportModal({
           throw new Error('import: no chat to write into and no materializeChat callback')
         }
         const materialized = await materializeChat()
+        if (!materialized) return
         effectiveChatId = materialized.chatId
-        if (materialized.navigationIntent !== null) {
-          committedPathProducer = useChatStore
-            .getState()
-            .registerCommittedPathProducer(effectiveChatId, materialized.navigationIntent)
-        }
       }
-      const operationCursor = createCursorOverlay(
-        useChatStore.getState().getCursor(effectiveChatId) ?? cursor,
-      )
-      const result = await pasteImport({
+      await conversationActions.importMessages({
         chatId: effectiveChatId,
         slot,
-        cursor: operationCursor,
-        presentationWindowLimit,
-        messages: cleaned.map((r) => ({
-          role: r.role,
-          content: [{ type: 'text', text: r.text } satisfies ContentItem],
-        })),
+        messages: cleaned,
       })
-      if (committedPathProducer !== null) {
-        const selections: CursorMap = {}
-        for (const header of result.selectedPathHeaders) {
-          selections[cursorKeyOf(header.parentId)] = header.id
-        }
-        const selectedLeafId = result.selectedPathHeaders.at(-1)?.id
-        if (selectedLeafId !== undefined) {
-          useChatStore
-            .getState()
-            .selectCommittedPathForProducer(effectiveChatId, committedPathProducer, selections, {
-              phase: 'terminal',
-              pathHeaders: result.selectedPathHeaders,
-              structuralHeaders: result.structuralHeaders,
-              presentations: result.presentations,
-            })
-        }
-      }
       useAnnouncementStore.getState().announce({
         text: `Imported ${cleaned.length} ${cleaned.length === 1 ? 'message' : 'messages'} (${slotLabel(slot)}).`,
       })
@@ -183,12 +132,9 @@ export function ImportModal({
     } catch (err) {
       setError(err instanceof Error ? `Import failed: ${err.message}` : 'Import failed.')
     } finally {
-      if (effectiveChatId !== null && committedPathProducer !== null) {
-        useChatStore.getState().sealCommittedPathProducer(effectiveChatId, committedPathProducer)
-      }
       setBusy(false)
     }
-  }, [busy, rows, chatId, slot, cursor, presentationWindowLimit, materializeChat, onDone, onClose])
+  }, [busy, rows, chatId, slot, materializeChat, onDone, onClose])
 
   const roleOptions = useMemo(() => ROLE_OPTIONS, [])
 

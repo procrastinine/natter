@@ -56,7 +56,7 @@ Image, PDF, audio, and video attachments with per-modality token estimation. Fol
 |---|---|---|
 | Shipped | Message-tree swipes, deep links, and in-place editing | `src/ui/chat/BranchControls.tsx`, `src/core/active-path.ts`, `src/core/messages.ts`, `tests/e2e/render-window.spec.ts`, `tests/unit/active-path.test.ts`, `tests/unit/messages.test.ts` |
 | Shipped | Native Anthropic Messages and Gemini transports | `src/core/api-choice.ts`, `src/api/anthropic-messages.ts`, `src/api/gemini-native.ts`, `tests/unit/api-choice.test.ts`, `tests/unit/api-anthropic-messages.test.ts`, `tests/unit/api-gemini-native.test.ts` |
-| Shipped | Explicit provider-hosted tools and returned tool evidence | `src/core/send-planning.ts`, `tests/e2e/provider-tool-fixture-replay.spec.ts` |
+| Shipped | Explicit provider-hosted tools and returned tool evidence | `src/store/request-planning.ts`, `src/api/request-transforms.ts`, `tests/e2e/provider-tool-fixture-replay.spec.ts` |
 | Partial | Auto-title status schema and persistence | `src/core/types.ts`, `src/store/chats.ts`, `src/store/db.ts`, `tests/unit/db-schema.test.ts`; background title generation is not complete |
 | Shipped | Alternate branch-tree navigator | `src/ui/chat/BranchTreeView.tsx`, `src/ui/chat/BranchTreeInspector.tsx`, `src/core/branch-tree-layout.ts`, `tests/e2e/branch-tree.spec.ts`, `tests/unit/branch-tree-view.test.tsx` |
 | Planned | Client-side/manual tool execution and approvals | No client-side executor or approval flow is shipped yet |
@@ -71,13 +71,13 @@ pnpm dev
 
 ## Verification
 
-Run `pnpm check:ci` for the clean, non-writing Biome check. The broader source checks are `pnpm typecheck`, `pnpm lint:semantic`, `pnpm test:run`, and `pnpm build`. The checked build rejects unexpected distribution paths and unsafe artifacts, including invalid module-entry topology. `pnpm perf:report` reports delivery ratchets and the zero-dependency-cycle gate; CI treats that performance step as advisory, while wall time and heap measurements remain informational.
+Run `pnpm check:ci` for the clean, non-writing Biome check. The broader source checks are `pnpm typecheck`, `pnpm lint:semantic`, `pnpm test:run`, and `pnpm build`. The checked build rejects unexpected distribution paths and unsafe artifacts, including invalid module-entry topology. `pnpm perf:report` reports delivery ratchets without treating historical byte counts as product laws; topology, dependency cycles, and supplied stream-run failures remain blocking. Wall time and heap measurements remain informational.
 
-GitHub Pages publication is intentionally independent from the quality workflow. Only dependency installation, the production-artifact startup smoke (which builds the Pages artifact), artifact upload, and the Pages deployment itself can block publication. Verification still runs on pull requests and `main`; unit tests plus the exhaustive built-artifact browser suite are correctness gates, while peer, formatting/lint, dead-code, and performance findings are advisory so findings remain visible without holding the published site stale. Playwright starts a standalone loopback fake-provider process for deterministic HTTP/SSE cases; the application contains no fake transport or test stream entry point.
+GitHub Pages publication is intentionally independent from the quality workflow. Only dependency installation, the production-artifact startup smoke (which invokes the same checked `pnpm build` as every other browser run), artifact upload, and the Pages deployment itself can block publication. Verification still runs on pull requests and `main`; unit tests plus the exhaustive built-artifact browser suite are correctness gates, while peer, formatting/lint, dead-code, and performance findings are advisory so findings remain visible without holding the published site stale. Playwright starts a standalone loopback fake-provider process for deterministic HTTP/SSE cases; the application contains no fake transport or test stream entry point.
 
 Application behavior uses the same code paths under `pnpm dev` and the built artifact. The one deliberate runtime-default exception is the OpenRouter provider-privacy scrape: Vite development can use its same-origin `/_or_scrape` proxy, while a static production deployment performs no live scrape unless a CORS proxy is configured in Settings. This exception does not affect chat, branch, storage, navigation, or streaming state.
 
-`pnpm dev` is the normal unbundled Vite/HMR environment, so its request count and decoded source are intentionally much larger than the minified application. Use `pnpm preview` when testing production-like delivery weight. With either server running, `pnpm perf:delivery dev <url>` or `pnpm perf:delivery preview <url>` records a fresh Chromium context. Preview enforces production request/byte budgets; dev reports request/byte/time/heap measurements without rewarding bundled modules or disabled development tooling. Both modes fail on runtime/network diagnostics or cold-loading a forbidden lazy feature. The frequently used per-chat settings pane stays in the eager graph; Markdown, tree, global settings, storage, and import chunks must stay out of a cold load. The shared ratchets live in `scripts/performance-baseline.json` so the build, report, and browser measurement do not drift.
+`pnpm dev` is the normal unbundled Vite/HMR environment, so its request count and decoded source are intentionally much larger than the minified application. Use `pnpm preview` when testing production-like delivery weight. With either server running, `pnpm perf:delivery dev <url>` or `pnpm perf:delivery preview <url>` records a fresh Chromium context. Preview compares production request/byte measurements with recorded ratchets; dev reports request/byte/time/heap measurements without rewarding bundled modules or disabled development tooling. Ratchet overruns are review findings, while both modes fail on runtime/network diagnostics or cold-loading a forbidden lazy feature. The frequently used per-chat settings pane, small global-settings modal, and fixed configuration-preferences projection stay eager; Markdown/message rendering, branch tree, storage, message import, and the heavy interchange validation/backend handlers stay out of a cold load until their surface or explicit action needs them. The shared ratchets live in `scripts/performance-baseline.json` so the build, report, and browser measurement do not drift.
 
 ## Scripts
 
@@ -85,7 +85,6 @@ Application behavior uses the same code paths under `pnpm dev` and the built art
 |---|---|
 | `pnpm dev` | Vite dev server |
 | `pnpm build` | checked production bundle in `dist/` with type and distribution-policy gates |
-| `pnpm build:pages` | artifact-only production bundle used by GitHub Pages |
 | `pnpm preview` | serve the built bundle locally |
 | `pnpm fake-provider` | standalone loopback LLM API server with bounded generated and scripted streaming scenarios |
 | `pnpm test` | Vitest in watch mode |
@@ -103,8 +102,8 @@ Application behavior uses the same code paths under `pnpm dev` and the built art
 | `pnpm deps:peers` | verify installed peer-dependency compatibility |
 | `pnpm deps:outdated` | list dependency updates visible under the current pnpm policy |
 | `pnpm perf:stream [url] [regens] [text chars] [reasoning chars] [turns] [reloads]` | headless loopback fake-stream profiler; run the dev server separately |
-| `pnpm perf:delivery <dev\|preview> <url>` | fresh-browser delivery report; preview enforces request/byte budgets, while both modes reject diagnostics and forbidden cold-loads |
-| `pnpm perf:report` | machine-readable distribution, named lazy-chunk, duplication, and dependency-cycle report; enforces delivery budgets and fails on any current cycle |
+| `pnpm perf:delivery <dev\|preview> <url>` | fresh-browser delivery report; preview compares request/byte ratchets, while both modes reject diagnostics and forbidden cold-loads |
+| `pnpm perf:report` | machine-readable distribution, named lazy-chunk, duplication, and dependency-cycle report; records delivery-ratchet overruns and fails on hard topology/cycle/stream boundaries |
 | `pnpm format` | Biome format (write) |
 | `pnpm check` | Biome lint + format + organize imports |
 

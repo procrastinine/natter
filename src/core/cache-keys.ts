@@ -1,4 +1,13 @@
-import type { ModelsQuery } from './types'
+import type { ConnectionKind, ModelsQuery } from './types'
+
+const OPENROUTER_CATALOG_QUERY: ModelsQuery = Object.freeze({
+  outputModalities: Object.freeze(['text', 'image', 'audio', 'file', 'video']),
+})
+const DIRECT_CATALOG_QUERY: ModelsQuery = Object.freeze({})
+
+export function modelCatalogQueryForConnectionKind(kind: ConnectionKind): ModelsQuery {
+  return kind === 'openrouter' ? OPENROUTER_CATALOG_QUERY : DIRECT_CATALOG_QUERY
+}
 
 // Stable key for the `/models` cache. Two queries with different
 // `supported_parameters` must produce different keys. Order-insensitive on both

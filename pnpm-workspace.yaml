@@ -5,6 +5,9 @@ minimumReleaseAge: 1440
 trustPolicy: no-downgrade
 blockExoticSubdeps: true
 strictDepBuilds: true
+overrides:
+  mermaid>marked: 17.0.6
+  cytoscape-cose-bilkent>cose-base: 2.2.0
 updateConfig:
   ignoreDependencies:
     - '@typescript/native'

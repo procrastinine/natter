@@ -4,14 +4,34 @@ import { splitAssistantStream } from '../../src/api/assistant-lanes'
 import type { AssistantStreamChunk } from '../../src/api/assistant-stream'
 import type { GeminiStreamChunk } from '../../src/api/gemini-types'
 import {
-  type StreamLaneEvent,
   splitAnthropicStream,
   splitChatStream,
   splitGeminiStream,
   splitResponsesStream,
 } from '../../src/api/stream-transforms'
 import type { ChatStreamChunk, ResponsesStreamChunk } from '../../src/api/types'
-import type { ApiRoute } from '../../src/core/api-choice'
+import {
+  type AssistantAttemptContract,
+  sealAssistantAttemptContract,
+} from '../../src/core/api-choice'
+import type { StreamLaneEvent } from '../../src/core/generation-stream-live-events'
+import {
+  ANTHROPIC_PROVIDER_OUTPUT_CONTRACT,
+  GOOGLE_PROVIDER_OUTPUT_CONTRACT,
+  OPENAI_RESPONSES_PROVIDER_OUTPUT_CONTRACT,
+} from '../../src/core/provider-tool-context'
+import {
+  anthropicReasoningContract,
+  anthropicRouteContract,
+  chatReasoningContract,
+  chatRouteContract,
+  geminiReasoningContract,
+  geminiRouteContract,
+  responsesReasoningContract,
+  responsesRouteContract,
+  textRouteContract,
+  videoRouteContract,
+} from '../helpers/reasoning-contracts'
 
 type LaneTransport = 'openai-chat' | 'openai-responses' | 'gemini-native' | 'anthropic'
 
@@ -31,24 +51,46 @@ function splitDirectly(
 ): AsyncIterable<StreamLaneEvent> {
   const source = fromChunks(chunks)
   if (transport === 'openai-responses') {
-    return splitResponsesStream(source as AsyncIterable<ResponsesStreamChunk>)
+    return splitResponsesStream(
+      source as AsyncIterable<ResponsesStreamChunk>,
+      responsesReasoningContract(),
+      OPENAI_RESPONSES_PROVIDER_OUTPUT_CONTRACT,
+    )
   }
   if (transport === 'gemini-native') {
-    return splitGeminiStream(source as AsyncIterable<GeminiStreamChunk>)
+    return splitGeminiStream(
+      source as AsyncIterable<GeminiStreamChunk>,
+      geminiReasoningContract(),
+      GOOGLE_PROVIDER_OUTPUT_CONTRACT,
+    )
   }
   if (transport === 'anthropic') {
-    return splitAnthropicStream(source as AsyncIterable<AnthropicStreamChunk>)
+    return splitAnthropicStream(
+      source as AsyncIterable<AnthropicStreamChunk>,
+      anthropicReasoningContract(),
+      ANTHROPIC_PROVIDER_OUTPUT_CONTRACT,
+    )
   }
-  return splitChatStream(source as AsyncIterable<ChatStreamChunk>)
+  return splitChatStream(source as AsyncIterable<ChatStreamChunk>, {
+    reasoning: chatReasoningContract(),
+  })
+}
+
+function routeForTransport(transport: LaneTransport): AssistantAttemptContract {
+  if (transport === 'openai-responses') return responsesRouteContract()
+  if (transport === 'gemini-native') return geminiRouteContract()
+  if (transport === 'anthropic') return anthropicRouteContract()
+  return chatRouteContract()
 }
 
 async function expectExactRouting(input: {
   transport: LaneTransport
   chunks: readonly AssistantStreamChunk[]
-  hint?: ApiRoute['transport']
 }): Promise<StreamLaneEvent[]> {
   const expected = await collect(splitDirectly(input.transport, input.chunks))
-  const actual = await collect(splitAssistantStream(fromChunks(input.chunks), input.hint))
+  const actual = await collect(
+    splitAssistantStream(fromChunks(input.chunks), routeForTransport(input.transport)),
+  )
   expect(actual).toEqual(expected)
   return actual
 }
@@ -63,13 +105,82 @@ describe('splitAssistantStream', () => {
       yield { type: 'delta', chunk: { choices: [{ delta: { content: 'second' } }] } }
     })()
 
-    const events = await collect(splitAssistantStream(source, 'openai-responses'))
+    const events = await collect(splitAssistantStream(source, chatRouteContract()))
 
     expect(events).toEqual([
       { lane: 'text', text: 'first' },
       { lane: 'text', text: 'second' },
     ])
     expect(yielded).toBe(2)
+  })
+
+  it('preserves unexpected visible reasoning and reports one bounded contract mismatch', async () => {
+    const base = chatRouteContract({
+      carrier: 'openrouter-reasoning-details',
+      originDialect: 'openrouter-chat',
+      targetFormat: 'anthropic-claude-v1',
+    })
+    const contract = sealAssistantAttemptContract(base, {
+      disclosure: 'absent',
+      unexpectedVisibleKind: 'text',
+      reason: 'request-display',
+    })
+    const events = await collect(
+      splitAssistantStream(
+        fromChunks<AssistantStreamChunk>([
+          {
+            type: 'delta',
+            chunk: {
+              choices: [
+                {
+                  index: 0,
+                  delta: {
+                    reasoning_details: [
+                      {
+                        type: 'reasoning.encrypted',
+                        id: 'carrier-only',
+                        format: 'anthropic-claude-v1',
+                        data: 'opaque',
+                      },
+                    ],
+                  },
+                },
+              ],
+            },
+          },
+          { type: 'delta', chunk: { choices: [{ index: 0, delta: { reasoning: 'first' } }] } },
+          { type: 'delta', chunk: { choices: [{ index: 0, delta: { reasoning: 'second' } }] } },
+        ]),
+        contract,
+      ),
+    )
+
+    const mismatches = events.filter(
+      (event) =>
+        event.lane === 'integrity' && event.integrity.eventType === 'unexpected-visible-reasoning',
+    )
+    expect(mismatches).toEqual([
+      {
+        lane: 'integrity',
+        integrity: {
+          category: 'malformed-event-shape',
+          adapter: 'chat-completions',
+          eventType: 'unexpected-visible-reasoning',
+          count: 1,
+          fingerprint: 'visibility-contract:chat-completions:text',
+          characterCount: 5,
+        },
+      },
+    ])
+    const reasoning = events
+      .filter((event) => event.lane === 'reasoning-observation')
+      .flatMap((event) => event.batch.observations)
+    expect(reasoning.some((observation) => observation.kind === 'carrier')).toBe(true)
+    expect(
+      reasoning
+        .filter((observation) => observation.kind === 'visible')
+        .map((observation) => observation.value),
+    ).toEqual(['first', 'second'])
   })
 
   const taggedCases: Array<{
@@ -127,13 +238,12 @@ describe('splitAssistantStream', () => {
   ]
 
   for (const testCase of taggedCases) {
-    it(`uses the ${testCase.name} first-chunk tag ahead of a contradictory hint`, async () => {
-      const events = await expectExactRouting({
-        transport: testCase.transport,
-        chunks: testCase.chunks,
-        hint: testCase.transport === 'openai-chat' ? 'openai-responses' : 'openai-chat',
-      })
-      expect(events.some((event) => event.lane === 'text')).toBe(true)
+    it(`rejects a ${testCase.name} first chunk that contradicts the admitted route`, async () => {
+      const contradictory =
+        testCase.transport === 'openai-chat' ? responsesRouteContract() : chatRouteContract()
+      await expect(
+        collect(splitAssistantStream(fromChunks(testCase.chunks), contradictory)),
+      ).rejects.toThrow('AssistantStreamTransportMismatch')
     })
   }
 
@@ -193,50 +303,64 @@ describe('splitAssistantStream', () => {
   ]
 
   for (const testCase of bufferedCases) {
-    it(`detects a buffered ${testCase.name} result ahead of a contradictory hint`, async () => {
+    it(`routes a buffered ${testCase.name} result through its admitted route`, async () => {
       const chunks = [
         { type: 'buffered_result', result: testCase.result },
       ] as unknown as AssistantStreamChunk[]
       const events = await expectExactRouting({
         transport: testCase.transport,
         chunks,
-        hint: testCase.transport === 'openai-chat' ? 'openai-responses' : 'openai-chat',
       })
-      expect(events.some((event) => event.lane === 'text')).toBe(true)
+      expect(
+        events.some(
+          (event) =>
+            event.lane === 'text' ||
+            (event.lane === 'result-snapshot' &&
+              event.payload.kind === 'replace' &&
+              event.payload.textParts.some((part) => part.text.length > 0)),
+        ),
+      ).toBe(true)
     })
   }
 
   for (const testCase of taggedCases) {
-    it(`uses the ${testCase.name} route hint after an ambiguous keepalive`, async () => {
+    it(`uses the admitted ${testCase.name} route after an ambiguous keepalive`, async () => {
       const chunks: AssistantStreamChunk[] = [
         { type: 'keepalive', comment: 'processing' },
         ...testCase.chunks,
       ]
-      const hint: ApiRoute['transport'] =
-        testCase.transport === 'openai-chat' ? 'openai-text' : testCase.transport
       const events = await expectExactRouting({
         transport: testCase.transport,
         chunks,
-        hint,
       })
       expect(events[0]).toEqual({ lane: 'keepalive', comment: 'processing' })
       expect(events.some((event) => event.lane === 'text')).toBe(true)
     })
   }
 
-  for (const hint of [undefined, 'openai-chat', 'openrouter-video'] as const) {
-    it(`falls back to chat lanes for an ambiguous first chunk with ${hint ?? 'no'} hint`, async () => {
+  for (const contract of [chatRouteContract(), textRouteContract(), videoRouteContract()]) {
+    it(`uses ${contract.transport} for an ambiguous chat-shaped first chunk`, async () => {
       const chunks: AssistantStreamChunk[] = [
         { type: 'keepalive', comment: 'processing' },
         { type: 'delta', chunk: { choices: [{ delta: { content: 'chat fallback' } }] } },
       ]
-      await expectExactRouting({
-        transport: 'openai-chat',
-        chunks,
-        ...(hint === undefined ? {} : { hint }),
-      })
+      const expected = await collect(splitDirectly('openai-chat', chunks))
+      await expect(collect(splitAssistantStream(fromChunks(chunks), contract))).resolves.toEqual(
+        expected,
+      )
     })
   }
+
+  it('rejects a non-empty stream without an admitted route contract', async () => {
+    await expect(
+      collect(
+        splitAssistantStream(
+          fromChunks<AssistantStreamChunk>([{ type: 'keepalive', comment: 'processing' }]),
+          null,
+        ),
+      ),
+    ).rejects.toThrow('AssistantStreamContractMissing')
+  })
 
   it('emits nothing for an empty source', async () => {
     let opened = 0
@@ -251,7 +375,9 @@ describe('splitAssistantStream', () => {
       },
     }
 
-    await expect(collect(splitAssistantStream(source, 'anthropic'))).resolves.toEqual([])
+    await expect(collect(splitAssistantStream(source, anthropicRouteContract()))).resolves.toEqual(
+      [],
+    )
     expect(opened).toBe(1)
   })
 
@@ -262,6 +388,7 @@ describe('splitAssistantStream', () => {
           fromChunks<AssistantStreamChunk>([
             { type: 'transport_terminal', evidence: 'done-sentinel' },
           ]),
+          chatRouteContract(),
         ),
       ),
     ).resolves.toEqual([{ lane: 'terminal', evidence: 'done-sentinel' }])

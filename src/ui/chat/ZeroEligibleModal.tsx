@@ -8,37 +8,45 @@
 // from a zero-eligible state other than the user's explicit choice.
 
 import { useRef } from 'react'
+import { definePresentationInteraction } from '../../app/presentation-interactions'
 import type { ChatId } from '../../core/types'
-import { getChat, updateChatSettings } from '../../store/chats'
-import { chatRowDependencies } from '../../store/reactive-dependencies'
-import { useRepositoryQuery } from '../../store/reactive-query'
+import { usePresentationInteraction } from '../../hooks/usePresentationInteraction'
+import { configurationApplication } from '../../store/configuration-application'
 import { useUiStore } from '../../store/zustand/uiStore'
 import { Button } from '../primitives/Button'
 import { Dialog } from '../primitives/Dialog'
 
 interface ZeroEligibleModalProps {
   chatId: ChatId
+  modelLabel?: string
 }
 
-export function ZeroEligibleModal({ chatId }: ZeroEligibleModalProps) {
-  const chat = useRepositoryQuery(
-    JSON.stringify(['chat', chatId]),
-    () => getChat(chatId),
-    undefined,
-    chatRowDependencies(chatId),
-  )
+const disableParetoInteractionCapability = definePresentationInteraction<ChatId>({
+  id: 'privacy.disable-pareto',
+  label: 'Disable Pareto filter',
+  concurrency: 'reject',
+  lifetime: 'workspace-tab',
+})
+
+export function ZeroEligibleModal({ chatId, modelLabel }: ZeroEligibleModalProps) {
   const dismiss = useUiStore((s) => s.setZeroEligibleChatId)
   const okRef = useRef<HTMLButtonElement | null>(null)
-  if (!chat) return null
+  const visibleModelLabel = modelLabel || 'this model'
+  const disableParetoInteraction = usePresentationInteraction(disableParetoInteractionCapability)
 
-  const modelLabel = chat.settings.model || 'this model'
-
-  const close = () => dismiss(null)
-  const disablePareto = async () => {
-    await updateChatSettings(chatId, {
-      privacy: { ...chat.settings.privacy, paretoFilter: false },
+  const close = () => {
+    dismiss(null)
+    return undefined
+  }
+  const disablePareto = () => {
+    disableParetoInteraction.run({
+      target: chatId,
+      action: () =>
+        configurationApplication.patchChatSettingsFields(chatId, [
+          { path: ['privacy', 'paretoFilter'], value: false },
+        ]),
+      commit: close,
     })
-    close()
   }
 
   return (
@@ -57,14 +65,18 @@ export function ZeroEligibleModal({ chatId }: ZeroEligibleModalProps) {
       </header>
       <div data-ui="zero-eligible-body">
         <p>
-          Every provider for <code>{modelLabel}</code> either trains on prompts, retains for an
-          unknown period, or was manually ignored. The request was blocked, the chat won&rsquo;t
+          Every provider for <code>{visibleModelLabel}</code> either trains on prompts, retains for
+          an unknown period, or was manually ignored. The request was blocked, the chat won&rsquo;t
           silently route to a training provider.
         </p>
         <p data-ui="helper">Pick a fix:</p>
       </div>
       <footer data-ui="zero-eligible-actions">
-        <Button data-ui="field-inline-action" onClick={() => void disablePareto()}>
+        <Button
+          data-ui="field-inline-action"
+          disabled={disableParetoInteraction.isPending(chatId)}
+          onClick={disablePareto}
+        >
           Disable Pareto for this chat
         </Button>
         <Button data-ui="field-inline-action" onClick={close}>

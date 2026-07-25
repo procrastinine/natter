@@ -1,43 +1,74 @@
 import Dexie from 'dexie'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { createChat } from '../helpers/chats'
+import 'fake-indexeddb/auto'
+import { IDBFactory } from 'fake-indexeddb'
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
-import type { Chat, ChatSettings, PresetId, ProfileId } from '../../src/core/types'
+import type { ChatPreset, ChatSettings, PresetId, ProfileId } from '../../src/core/types'
 import { newId } from '../../src/lib/ulid'
-import { __resetBroadcastForTests, type BroadcastEvent, onEvent } from '../../src/store/broadcast'
-import { getBrowserRepository } from '../../src/store/browser-repo'
-import { __resetDbForTests, getDb, openDb } from '../../src/store/db'
-import { __resetKeyCacheForTests, createKey } from '../../src/store/keys'
+import { __resetBroadcastForTests, subscribeWorkspaceChanges } from '../../src/store/broadcast'
+import { __resetBrowserRepositoryForTests } from '../../src/store/browser-repo'
 import {
-  archivePreset,
-  bumpPresetLastUsedAt,
-  createPreset,
-  deletePreset,
-  duplicatePreset,
-  exportPreset,
-  getPreset,
-  listPresets,
-  PresetMissingError,
-  pickMruPreset,
-  pickMruPresetForProfile,
-  pickPreferredPreset,
-  reorderPresets,
-  unarchivePreset,
-  updatePreset,
-} from '../../src/store/presets'
-import { createProfile, ProfileMissingError } from '../../src/store/profiles'
+  openBrowserWorkspace,
+  shutdownBrowserWorkspace,
+} from '../../src/store/browser-workspace-lifecycle'
+import { getChat } from '../../src/store/chats'
+import { configurationApplication } from '../../src/store/configuration-application'
+import { __resetDbForTests, getDb } from '../../src/store/db'
+import { exportWorkspaceBackup, restoreWorkspaceBackup } from '../../src/store/import-export'
+import { interchangeApplication } from '../../src/store/interchange-application'
+import { __resetKeyCacheForTests, createKey } from '../../src/store/keys'
+import type {
+  ConfigurationActiveSelectionProjection,
+  WorkspaceChange,
+  WorkspaceDependency,
+  WorkspaceQuery,
+  WorkspaceQueryResult,
+} from '../../src/store/workspace-protocol'
+import {
+  __resetWorkspaceRepositoryForTests,
+  getWorkspaceRepository,
+} from '../../src/store/workspace-repository'
+import { runWorkspaceRead } from '../../src/store/workspace-runtime'
+import { createConfigurationProfile } from '../helpers/configuration'
 
 const DB_NAME = 'natter'
 
-async function resetAll() {
+let emptyWorkspaceBackup: Awaited<ReturnType<typeof exportWorkspaceBackup>>
+
+beforeAll(async () => {
+  ;(globalThis as unknown as { indexedDB: IDBFactory }).indexedDB = new IDBFactory()
+  __resetWorkspaceRepositoryForTests()
+  __resetBrowserRepositoryForTests()
   __resetBroadcastForTests()
   __resetKeyCacheForTests()
   __resetDbForTests()
   await Dexie.delete(DB_NAME)
+  await openBrowserWorkspace()
+  emptyWorkspaceBackup = await exportWorkspaceBackup()
+})
+
+beforeEach(async () => {
+  __resetKeyCacheForTests()
+  await restoreWorkspaceBackup(emptyWorkspaceBackup, { now: 1 })
+})
+
+afterAll(async () => {
+  await shutdownBrowserWorkspace()
+  __resetKeyCacheForTests()
+})
+
+async function query<Q extends WorkspaceQuery>(request: Q): Promise<WorkspaceQueryResult<Q>> {
+  return runWorkspaceRead('repository-query', (permit) =>
+    getWorkspaceRepository()
+      .query(permit, request, { signal: permit.signal })
+      .then((envelope) => envelope.value),
+  )
 }
 
 async function fakeProfileId(name = 'P'): Promise<ProfileId> {
   const key = await createKey({ name, plaintextKey: 'sk-x' })
-  const profile = await createProfile({
+  const profile = await createConfigurationProfile({
     name,
     kind: 'openrouter',
     baseUrl: 'https://x',
@@ -47,284 +78,386 @@ async function fakeProfileId(name = 'P'): Promise<ProfileId> {
 }
 
 function settingsFor(profileId: ProfileId): ChatSettings {
-  const s = cloneDefaultChatSettings()
-  s.profileId = profileId
-  s.model = 'anthropic/claude-opus-4.7'
-  return s
+  const settings = cloneDefaultChatSettings()
+  settings.profileId = profileId
+  settings.model = 'anthropic/claude-opus-4.7'
+  return settings
 }
 
-async function seedChatReferencingPreset(profileId: ProfileId, presetId: PresetId): Promise<Chat> {
-  const db = await openDb()
-  const chat: Chat = {
-    id: newId(),
-    title: 'T',
-    titleStatus: 'untitled',
-    createdAt: 1,
-    updatedAt: 1,
-    lastViewedAt: 1,
-    wordCount: 0,
-    totalCostUsd: 0,
-    metaVersion: 0,
-    summaryVersion: 0,
-    settings: settingsFor(profileId),
-    presetId,
-    lastUpdatedLeafId: null,
-    lastBranchUpdatedAt: 1,
-    archived: false,
-    pinned: false,
-    folderId: null,
-    tags: [],
+async function createPreset(input: {
+  name: string
+  connectionProfileId: ProfileId
+  settings?: ChatSettings
+  now?: number
+  lastUsedAt?: number
+}): Promise<ChatPreset> {
+  const id = newId()
+  const result = await configurationApplication.execute({
+    kind: 'chat-preset.create',
+    preset: {
+      id,
+      name: input.name,
+      connectionProfileId: input.connectionProfileId,
+      settings: input.settings ?? settingsFor(input.connectionProfileId),
+      ...(input.lastUsedAt === undefined ? {} : { lastUsedAt: input.lastUsedAt }),
+    },
+    now: input.now ?? Date.now(),
+  })
+  if (result.kind !== 'chat-preset-saved') throw new Error(`PresetCreateFailed:${id}`)
+  return result.preset
+}
+
+function getPreset(presetId: PresetId): Promise<ChatPreset | undefined> {
+  return getDb().presets.get(presetId)
+}
+
+async function listPresets(includeArchived = false): Promise<ChatPreset[]> {
+  if (includeArchived) return getDb().presets.toArray()
+  const orderedIds: PresetId[] = []
+  let cursor: string | undefined
+  do {
+    const page = await query({
+      kind: 'configuration.preset-catalog-page',
+      request: {
+        direction: 'forward',
+        limit: 256,
+        ...(cursor ? { cursor } : {}),
+      },
+    })
+    if (page.kind !== 'page') throw new Error(`PresetCatalogReadFailed:${page.kind}`)
+    orderedIds.push(...page.rows.map((row) => row.id))
+    cursor = page.nextCursor
+  } while (cursor)
+  const presets = await getDb().presets.bulkGet(orderedIds)
+  return presets.filter((preset): preset is ChatPreset => preset !== undefined)
+}
+
+function resolveSeed(
+  input: { profileId?: ProfileId | null; presetId?: PresetId | null } = {},
+): Promise<ConfigurationActiveSelectionProjection> {
+  return query({
+    kind: 'configuration.active-selection',
+    target: {
+      kind: 'new-chat',
+      profileId: input.profileId ?? null,
+      presetId: input.presetId ?? null,
+      fallback: 'full',
+      promptPresets: [],
+      textTemplateId: null,
+    },
+  })
+}
+
+function changedDependencies(changes: readonly WorkspaceChange[]): WorkspaceDependency[] {
+  return changes.flatMap((change) => {
+    if (change.kind === 'replace') return [{ kind: 'workspace' } satisfies WorkspaceDependency]
+    if (change.kind === 'invalidate') {
+      return change.dependencies === 'all'
+        ? [{ kind: 'workspace' } satisfies WorkspaceDependency]
+        : [...change.dependencies]
+    }
+    return [...change.delta.invalidations]
+  })
+}
+
+function changedFacts(changes: readonly WorkspaceChange[]) {
+  return changes.flatMap((change) => (change.kind === 'commit' ? change.delta.facts : []))
+}
+
+function mergedPresetDependency(dependencies: readonly WorkspaceDependency[]) {
+  const presetDependencies = dependencies.filter(
+    (dependency): dependency is Extract<WorkspaceDependency, { readonly kind: 'preset' }> =>
+      dependency.kind === 'preset',
+  )
+  return {
+    presetIds: [...new Set(presetDependencies.flatMap((dependency) => dependency.presetIds ?? []))],
+    facets: [...new Set(presetDependencies.flatMap((dependency) => dependency.facets ?? []))],
   }
-  await db.chats.put(chat)
-  return chat
 }
 
-beforeEach(async () => {
-  await resetAll()
-  await openDb()
-})
-
-afterEach(async () => {
-  await resetAll()
-})
-
-describe('createPreset', () => {
-  it('pins settings.profileId to connectionProfileId and broadcasts preset-mutated', async () => {
+describe('chat preset configuration commands', () => {
+  it('creates a profile-aligned preset and publishes one compact preset invalidation', async () => {
     const profileId = await fakeProfileId()
-    const seen: BroadcastEvent[] = []
-    const unsub = onEvent((ev) => seen.push(ev))
-    const s = cloneDefaultChatSettings()
-    // Intentionally wrong to verify the helper aligns it.
-    s.profileId = 'stale'
+    const drifted = cloneDefaultChatSettings()
+    drifted.profileId = 'stale'
+    const changes: WorkspaceChange[] = []
+    const unsubscribe = subscribeWorkspaceChanges((change) => changes.push(change))
+
     const preset = await createPreset({
       name: 'OpenRouter default',
       connectionProfileId: profileId,
-      settings: s,
+      settings: drifted,
     })
-    unsub()
+    unsubscribe()
+
     expect(preset.settings.profileId).toBe(profileId)
     expect(preset.settings.providerPrefs).toEqual({ sort: 'price' })
-    expect(seen).toContainEqual({ kind: 'preset-mutated', presetId: preset.id })
+    expect(changes.filter((change) => change.kind === 'commit')).toHaveLength(1)
+    const presetDependency = mergedPresetDependency(changedDependencies(changes))
+    expect(presetDependency.presetIds).toEqual([preset.id])
+    expect(presetDependency.facets).toEqual(
+      expect.arrayContaining([
+        'selected-detail',
+        'catalog-membership',
+        'catalog-order',
+        'catalog-display',
+        'usage',
+      ]),
+    )
   })
 
-  it('rejects a preset whose connectionProfileId does not exist', async () => {
+  it('rejects a preset whose connection profile does not exist', async () => {
     await expect(
-      createPreset({
-        name: 'ghost',
-        connectionProfileId: 'missing',
-        settings: settingsFor('missing'),
+      configurationApplication.execute({
+        kind: 'chat-preset.create',
+        preset: {
+          id: newId(),
+          name: 'ghost',
+          connectionProfileId: 'missing',
+          settings: settingsFor('missing'),
+        },
+        now: 100,
       }),
-    ).rejects.toBeInstanceOf(ProfileMissingError)
-  })
-})
-
-describe('updatePreset', () => {
-  it('keeps settings.profileId in sync with connectionProfileId on re-pin', async () => {
-    const a = await fakeProfileId('A')
-    const b = await fakeProfileId('B')
-    const preset = await createPreset({
-      name: 'P',
-      connectionProfileId: a,
-      settings: settingsFor(a),
-    })
-    const next = await updatePreset(preset.id, { connectionProfileId: b })
-    expect(next.connectionProfileId).toBe(b)
-    expect(next.settings.profileId).toBe(b)
+    ).rejects.toThrow('ConfigurationMissing:profile:missing')
   })
 
-  it('ignores the caller-provided settings.profileId and forces it to the current connection', async () => {
-    const a = await fakeProfileId('A')
-    const preset = await createPreset({
-      name: 'P',
-      connectionProfileId: a,
-      settings: settingsFor(a),
-    })
+  it('re-pins settings to the selected profile and normalizes a replacement snapshot', async () => {
+    const profileA = await fakeProfileId('A')
+    const profileB = await fakeProfileId('B')
+    const preset = await createPreset({ name: 'P', connectionProfileId: profileA })
     const drifted = settingsFor('wrong')
     delete drifted.providerPrefs
-    const next = await updatePreset(preset.id, { settings: drifted })
-    expect(next.settings.profileId).toBe(a)
-    expect(next.settings.providerPrefs).toEqual({ sort: 'price' })
-  })
 
-  it('rejects an update to a missing preset', async () => {
-    await expect(updatePreset('missing', { name: 'x' })).rejects.toBeInstanceOf(PresetMissingError)
-  })
-})
-
-describe('listPresets', () => {
-  it('hides archived presets from pickers but keeps them available with includeArchived', async () => {
-    const profileId = await fakeProfileId()
-    const live = await createPreset({
-      name: 'live',
-      connectionProfileId: profileId,
-      settings: settingsFor(profileId),
-    })
-    const shelved = await createPreset({
-      name: 'shelved',
-      connectionProfileId: profileId,
-      settings: settingsFor(profileId),
-    })
-    await archivePreset(shelved.id)
-    const visible = await listPresets()
-    expect(visible.map((p) => p.id)).toEqual([live.id])
-    const all = await listPresets({ includeArchived: true })
-    expect(all.map((p) => p.id).sort()).toEqual([live.id, shelved.id].sort())
-  })
-
-  it('archived presets still resolve for existing chats via getPreset', async () => {
-    const profileId = await fakeProfileId()
-    const preset = await createPreset({
-      name: 'live',
-      connectionProfileId: profileId,
-      settings: settingsFor(profileId),
-    })
-    await archivePreset(preset.id)
-    expect((await getPreset(preset.id))?.id).toBe(preset.id)
-  })
-
-  it('orders visible presets by manual sortIndex', async () => {
-    const profileId = await fakeProfileId()
-    const first = await createPreset({
-      name: 'first',
-      connectionProfileId: profileId,
-      settings: settingsFor(profileId),
-      now: 100,
-      sortIndex: 20,
-    })
-    const second = await createPreset({
-      name: 'second',
-      connectionProfileId: profileId,
-      settings: settingsFor(profileId),
+    const result = await configurationApplication.execute({
+      kind: 'chat-preset.update',
+      presetId: preset.id,
+      patch: { connectionProfileId: profileB, settings: drifted },
       now: 200,
-      sortIndex: 10,
     })
 
-    expect((await listPresets()).map((p) => p.id)).toEqual([second.id, first.id])
-  })
-})
-
-describe('reorderPresets', () => {
-  it('persists drag order without changing MRU default selection', async () => {
-    const profileId = await fakeProfileId()
-    const olderMru = await createPreset({
-      name: 'older-mru',
-      connectionProfileId: profileId,
-      settings: settingsFor(profileId),
-      lastUsedAt: 1000,
-    })
-    const newestMru = await createPreset({
-      name: 'newest-mru',
-      connectionProfileId: profileId,
-      settings: settingsFor(profileId),
-      lastUsedAt: 9000,
-    })
-    const neverUsed = await createPreset({
-      name: 'never-used',
-      connectionProfileId: profileId,
-      settings: settingsFor(profileId),
-    })
-
-    await reorderPresets([neverUsed.id, olderMru.id, newestMru.id], { now: 300 })
-
-    expect((await listPresets()).map((p) => p.id)).toEqual([
-      neverUsed.id,
-      olderMru.id,
-      newestMru.id,
-    ])
-    expect((await pickMruPreset())?.id).toBe(newestMru.id)
-    expect((await getPreset(neverUsed.id))?.updatedAt).toBe(300)
+    expect(result.kind).toBe('chat-preset-saved')
+    if (result.kind !== 'chat-preset-saved') return
+    expect(result.preset.connectionProfileId).toBe(profileB)
+    expect(result.preset.settings.profileId).toBe(profileB)
+    expect(result.preset.settings.providerPrefs).toEqual({ sort: 'price' })
   })
 
-  it('rejects missing preset ids', async () => {
-    await expect(reorderPresets(['missing'])).rejects.toBeInstanceOf(PresetMissingError)
+  it('rejects updates and reorders that reference missing presets', async () => {
+    await expect(
+      configurationApplication.execute({
+        kind: 'chat-preset.update',
+        presetId: 'missing',
+        patch: { name: 'x' },
+        now: 100,
+      }),
+    ).rejects.toThrow('ConfigurationMissing:chat-preset:missing')
+    await expect(configurationApplication.moveChatPreset('missing', null, 100)).rejects.toThrow(
+      'ConfigurationMissing:chat-preset:missing',
+    )
   })
-})
 
-describe('duplicatePreset', () => {
-  it('clones into a new id with suffixed name and reset lifecycle fields', async () => {
+  it('duplicates into a new live preset and resets MRU lifecycle state', async () => {
     const profileId = await fakeProfileId()
     const source = await createPreset({
       name: 'base',
       connectionProfileId: profileId,
-      settings: settingsFor(profileId),
-      lastUsedAt: 1000,
+      lastUsedAt: 1_000,
     })
-    const copy = await duplicatePreset(source.id)
-    expect(copy.id).not.toBe(source.id)
-    expect(copy.name).toBe('base (copy)')
-    expect(copy.lastUsedAt).toBeUndefined()
-    expect(copy.archived).toBe(false)
-    expect(copy.settings.model).toBe(source.settings.model)
+    const copyId = newId()
+    const result = await configurationApplication.execute({
+      kind: 'chat-preset.duplicate',
+      sourceId: source.id,
+      copyId,
+      now: 200,
+    })
+
+    expect(result.kind).toBe('chat-preset-saved')
+    if (result.kind !== 'chat-preset-saved') return
+    expect(result.preset).toMatchObject({ id: copyId, name: 'base (copy)', archived: false })
+    expect(result.preset.lastUsedAt).toBeUndefined()
+    expect(result.preset.settings).toEqual(source.settings)
   })
 })
 
-describe('deletePreset', () => {
-  it('clears chat.presetId for referencing chats and broadcasts preset-deleted', async () => {
+describe('chat preset catalog, archive, order, and MRU selection', () => {
+  it('keeps archived rows addressable while excluding them from picker projections', async () => {
     const profileId = await fakeProfileId()
-    const preset = await createPreset({
-      name: 'base',
-      connectionProfileId: profileId,
-      settings: settingsFor(profileId),
-    })
-    const chat = await seedChatReferencingPreset(profileId, preset.id)
-    const seen: BroadcastEvent[] = []
-    const unsub = onEvent((ev) => seen.push(ev))
-    await deletePreset(preset.id)
-    unsub()
-    expect(seen.some((ev) => ev.kind === 'preset-deleted' && ev.presetId === preset.id)).toBe(true)
-    const row = await getDb().chats.get(chat.id)
-    expect(row?.presetId).toBeUndefined()
-    expect(row?.settings.profileId).toBe(profileId) // settings stay intact
+    const live = await createPreset({ name: 'live', connectionProfileId: profileId })
+    const shelved = await createPreset({ name: 'shelved', connectionProfileId: profileId })
+    await configurationApplication.archiveChatPreset(shelved.id, 300)
+
+    expect((await listPresets()).map((preset) => preset.id)).toEqual([live.id])
+    expect((await listPresets(true)).map((preset) => preset.id).sort()).toEqual(
+      [live.id, shelved.id].sort(),
+    )
+    expect((await getPreset(shelved.id))?.archived).toBe(true)
+
+    await configurationApplication.unarchiveChatPreset(shelved.id, 400)
+    expect((await getPreset(shelved.id))?.archived).toBe(false)
   })
 
-  it('commits all breadcrumb clears with one workspace version and accurate chat versions', async () => {
+  it('uses the typed preset order for display without changing the MRU new-chat seed', async () => {
     const profileId = await fakeProfileId()
-    const preset = await createPreset({
-      name: 'base',
+    const olderMru = await createPreset({
+      name: 'older-mru',
       connectionProfileId: profileId,
-      settings: settingsFor(profileId),
+      lastUsedAt: 1_000,
     })
-    const first = await seedChatReferencingPreset(profileId, preset.id)
-    const second = await seedChatReferencingPreset(profileId, preset.id)
-    const repo = getBrowserRepository()
-    const beforeWorkspace = await repo.getWorkspaceMeta()
-    const seen: BroadcastEvent[] = []
-    const unsubscribe = onEvent((event) => seen.push(event))
+    const newestMru = await createPreset({
+      name: 'newest-mru',
+      connectionProfileId: profileId,
+      lastUsedAt: 9_000,
+    })
+    const neverUsed = await createPreset({ name: 'never-used', connectionProfileId: profileId })
 
-    await deletePreset(preset.id, { now: 500 })
+    await configurationApplication.moveChatPreset(neverUsed.id, null, 300)
 
-    unsubscribe()
-    const rows = await getDb().chats.bulkGet([first.id, second.id])
-    expect(rows).toMatchObject([
-      { id: first.id, metaVersion: 1, summaryVersion: 1, updatedAt: 500 },
-      { id: second.id, metaVersion: 1, summaryVersion: 1, updatedAt: 500 },
+    expect((await listPresets()).map((preset) => preset.id)).toEqual([
+      neverUsed.id,
+      olderMru.id,
+      newestMru.id,
     ])
-    expect(await getDb().presets.get(preset.id)).toBeUndefined()
-    expect((await repo.getWorkspaceMeta()).mutationCounter).toBe(
-      beforeWorkspace.mutationCounter + 1,
+    expect((await resolveSeed()).preset?.id).toBe(newestMru.id)
+    expect((await getPreset(neverUsed.id))?.updatedAt).toBe(neverUsed.updatedAt)
+  })
+
+  it('falls back to the oldest live preset and returns no preset for an empty catalog', async () => {
+    expect((await resolveSeed()).preset).toBeNull()
+    const profileId = await fakeProfileId()
+    const first = await createPreset({ name: 'first', connectionProfileId: profileId, now: 100 })
+    await createPreset({ name: 'second', connectionProfileId: profileId, now: 200 })
+    expect((await resolveSeed()).preset?.id).toBe(first.id)
+  })
+
+  it('honors a remembered live preset, then a remembered profile, before workspace MRU', async () => {
+    const profileA = await fakeProfileId('A')
+    const profileB = await fakeProfileId('B')
+    const scoped = await createPreset({
+      name: 'scoped',
+      connectionProfileId: profileA,
+      lastUsedAt: 1_000,
+    })
+    const globalMru = await createPreset({
+      name: 'global-mru',
+      connectionProfileId: profileB,
+      lastUsedAt: 9_000,
+    })
+
+    expect(
+      (
+        await resolveSeed({
+          profileId: profileA,
+          presetId: scoped.id,
+        })
+      ).preset?.id,
+    ).toBe(scoped.id)
+    expect((await resolveSeed({ profileId: profileA })).preset?.id).toBe(scoped.id)
+    expect((await resolveSeed()).preset?.id).toBe(globalMru.id)
+  })
+
+  it('touches MRU monotonically and publishes the compact cross-tab dependency', async () => {
+    const profileId = await fakeProfileId()
+    const old = await createPreset({
+      name: 'old',
+      connectionProfileId: profileId,
+      lastUsedAt: 1_000,
+    })
+    await createPreset({ name: 'new', connectionProfileId: profileId, lastUsedAt: 5_000 })
+    const changes: WorkspaceChange[] = []
+    const unsubscribe = subscribeWorkspaceChanges((change) => changes.push(change))
+
+    await configurationApplication.execute({
+      kind: 'chat-preset.touch',
+      presetId: old.id,
+      now: 9_999,
+    })
+    unsubscribe()
+
+    expect((await resolveSeed()).preset?.id).toBe(old.id)
+    expect(changedDependencies(changes)).toContainEqual({
+      kind: 'preset',
+      presetIds: [old.id],
+      facets: ['usage'],
+    })
+  })
+})
+
+describe('chat preset references and atomicity', () => {
+  it('deletes a preset and clears every chat breadcrumb in one compact commit', async () => {
+    const profileId = await fakeProfileId()
+    const preset = await createPreset({ name: 'base', connectionProfileId: profileId })
+    const first = await createChat({
+      title: 'first',
+      settings: settingsFor(profileId),
+      presetId: preset.id,
+      now: 100,
+    })
+    const second = await createChat({
+      title: 'second',
+      settings: settingsFor(profileId),
+      presetId: preset.id,
+      now: 100,
+    })
+    const changes: WorkspaceChange[] = []
+    const unsubscribe = subscribeWorkspaceChanges((change) => changes.push(change))
+
+    await configurationApplication.deleteChatPreset(preset.id, 500)
+    unsubscribe()
+
+    const rows = await Promise.all([getChat(first.id), getChat(second.id)])
+    for (const row of rows) {
+      expect(row?.presetId).toBeUndefined()
+      expect(row?.settings.profileId).toBe(profileId)
+      expect(row).toMatchObject({
+        configurationVersion: 1,
+        metaVersion: 1,
+        summaryVersion: 1,
+      })
+    }
+    expect(rows.map((row) => row?.updatedAt).sort()).toEqual([500, 501])
+    expect(await getPreset(preset.id)).toBeUndefined()
+    expect(changes.filter((change) => change.kind === 'commit')).toHaveLength(1)
+    const dependencies = changedDependencies(changes)
+    const presetDependency = mergedPresetDependency(dependencies)
+    const chatDependency = dependencies.find((dependency) => dependency.kind === 'chat')
+    const sidebarDependency = dependencies.find((dependency) => dependency.kind === 'sidebar')
+    expect(presetDependency.presetIds).toEqual([preset.id])
+    expect(presetDependency.facets).toEqual(
+      expect.arrayContaining([
+        'selected-detail',
+        'catalog-membership',
+        'catalog-order',
+        'catalog-display',
+        'usage',
+      ]),
     )
-    const chatEvents = seen.filter((event) => event.kind === 'chat-mutated')
-    expect(chatEvents).toHaveLength(2)
-    expect(chatEvents.every((event) => event.metaVersion === 1 && event.summaryVersion === 1)).toBe(
-      true,
+    expect(chatDependency?.chatIds).toEqual(expect.arrayContaining([first.id, second.id]))
+    expect(sidebarDependency?.chatIds).toEqual(expect.arrayContaining([first.id, second.id]))
+    expect(changedFacts(changes)).toEqual(
+      expect.arrayContaining([
+        { kind: 'sidebar-row-changed', chatId: first.id },
+        { kind: 'sidebar-row-changed', chatId: second.id },
+      ]),
     )
   })
 
-  it('rolls back every row, workspace version, and event when a middle write fails', async () => {
+  it('rolls back the preset, all chat breadcrumbs, and cross-tab publication on failure', async () => {
     const profileId = await fakeProfileId()
-    const preset = await createPreset({
-      name: 'base',
-      connectionProfileId: profileId,
+    const preset = await createPreset({ name: 'base', connectionProfileId: profileId })
+    const first = await createChat({
       settings: settingsFor(profileId),
+      presetId: preset.id,
+      now: 100,
     })
-    const first = await seedChatReferencingPreset(profileId, preset.id)
-    const second = await seedChatReferencingPreset(profileId, preset.id)
-    const repo = getBrowserRepository()
-    const beforeWorkspace = await repo.getWorkspaceMeta()
-    const beforeChats = await getDb().chats.bulkGet([first.id, second.id])
-    const beforePreset = await getDb().presets.get(preset.id)
-    const seen: BroadcastEvent[] = []
-    const unsubscribe = onEvent((event) => seen.push(event))
+    const second = await createChat({
+      settings: settingsFor(profileId),
+      presetId: preset.id,
+      now: 100,
+    })
+    const beforeChats = await Promise.all([getChat(first.id), getChat(second.id)])
+    const beforePreset = await getPreset(preset.id)
+    const changes: WorkspaceChange[] = []
+    const unsubscribe = subscribeWorkspaceChanges((change) => changes.push(change))
     let updates = 0
     const failSecondUpdate = () => {
       updates += 1
@@ -332,190 +465,105 @@ describe('deletePreset', () => {
     }
     getDb().chats.hook.updating.subscribe(failSecondUpdate)
 
-    await expect(deletePreset(preset.id, { now: 500 })).rejects.toThrow(
-      'injected breadcrumb failure',
-    )
+    try {
+      await expect(configurationApplication.deleteChatPreset(preset.id, 500)).rejects.toThrow(
+        'injected breadcrumb failure',
+      )
+    } finally {
+      getDb().chats.hook.updating.unsubscribe(failSecondUpdate)
+      unsubscribe()
+    }
 
-    getDb().chats.hook.updating.unsubscribe(failSecondUpdate)
-    unsubscribe()
-    expect(await getDb().chats.bulkGet([first.id, second.id])).toEqual(beforeChats)
-    expect(await getDb().presets.get(preset.id)).toEqual(beforePreset)
-    expect((await repo.getWorkspaceMeta()).mutationCounter).toBe(beforeWorkspace.mutationCounter)
-    expect(seen).toEqual([])
+    expect(await Promise.all([getChat(first.id), getChat(second.id)])).toEqual(beforeChats)
+    expect(await getPreset(preset.id)).toEqual(beforePreset)
+    expect(changes).toEqual([])
   })
 })
 
-describe('pickMruPreset', () => {
-  it('picks the non-archived preset with the greatest lastUsedAt', async () => {
-    const profileId = await fakeProfileId()
-    const older = await createPreset({
-      name: 'older',
-      connectionProfileId: profileId,
-      settings: settingsFor(profileId),
-      lastUsedAt: 1000,
-    })
-    await createPreset({
-      name: 'newer',
-      connectionProfileId: profileId,
-      settings: settingsFor(profileId),
-      lastUsedAt: 5000,
-    })
-    const archivedNewest = await createPreset({
-      name: 'archived-but-newest',
-      connectionProfileId: profileId,
-      settings: settingsFor(profileId),
-      lastUsedAt: 9000,
-    })
-    await archivePreset(archivedNewest.id)
-    const mru = await pickMruPreset()
-    expect(mru?.name).toBe('newer')
-    // archived=newest must be ignored even though its lastUsedAt is largest.
-    expect(mru?.lastUsedAt).toBe(5000)
-    expect(older.lastUsedAt).toBe(1000)
+describe('chat settings configuration ownership', () => {
+  it('removes optional top-level fields when a patch explicitly supplies undefined', async () => {
+    const settings = cloneDefaultChatSettings()
+    settings.verbosity = 'high'
+    const chat = await createChat({ settings, now: 100 })
+
+    expect(
+      await configurationApplication.patchChatSettings(
+        chat.id,
+        { verbosity: undefined },
+        { now: 200 },
+      ),
+    ).toBe(true)
+
+    const updated = await getChat(chat.id)
+    expect(updated?.settings.verbosity).toBeUndefined()
+    expect('verbosity' in (updated?.settings ?? {})).toBe(false)
   })
 
-  it('falls back to the oldest non-archived preset when none has lastUsedAt', async () => {
-    const profileId = await fakeProfileId()
-    const first = await createPreset({
-      name: 'first',
-      connectionProfileId: profileId,
-      settings: settingsFor(profileId),
+  it('replaces the full settings snapshot and drops fields omitted by the replacement', async () => {
+    const settings = cloneDefaultChatSettings()
+    settings.providerPrefs = { sort: 'throughput' }
+    settings.verbosity = 'high'
+    const chat = await createChat({ settings, now: 100 })
+    const replacement = cloneDefaultChatSettings()
+    replacement.providerPrefs = { sort: 'price' }
+
+    expect(
+      await configurationApplication.replaceChatSettings(chat.id, replacement, { now: 200 }),
+    ).toBe(true)
+
+    const updated = await getChat(chat.id)
+    expect(updated?.settings.providerPrefs).toEqual({ sort: 'price' })
+    expect(updated?.settings.verbosity).toBeUndefined()
+  })
+
+  it('applies settings and presetId atomically without rewriting an identical repeat', async () => {
+    const profileA = await fakeProfileId('A')
+    const profileB = await fakeProfileId('B')
+    const original = await createPreset({ name: 'original', connectionProfileId: profileA })
+    const targetSettings = settingsFor(profileB)
+    targetSettings.model = 'openai/gpt-5.4-nano'
+    targetSettings.providerPrefs = { sort: 'price' }
+    const target = await createPreset({
+      name: 'target',
+      connectionProfileId: profileB,
+      settings: targetSettings,
+    })
+    const chat = await createChat({
+      settings: settingsFor(profileA),
+      presetId: original.id,
       now: 100,
     })
-    await createPreset({
-      name: 'second',
-      connectionProfileId: profileId,
-      settings: settingsFor(profileId),
-      now: 200,
-    })
-    const mru = await pickMruPreset()
-    expect(mru?.id).toBe(first.id)
-  })
 
-  it('returns null when there are no presets at all', async () => {
-    expect(await pickMruPreset()).toBeNull()
-  })
+    expect(await configurationApplication.applyChatPreset(chat.id, target.id, 500)).toBe(true)
+    const applied = await getChat(chat.id)
+    expect(applied?.presetId).toBe(target.id)
+    expect(applied?.settings).toEqual(target.settings)
+    expect(applied?.updatedAt).toBe(500)
 
-  it('scopes MRU selection to a single profile when requested', async () => {
-    const a = await fakeProfileId('A')
-    const b = await fakeProfileId('B')
-    await createPreset({
-      name: 'a-old',
-      connectionProfileId: a,
-      settings: settingsFor(a),
-      lastUsedAt: 1000,
-    })
-    const aNew = await createPreset({
-      name: 'a-new',
-      connectionProfileId: a,
-      settings: settingsFor(a),
-      lastUsedAt: 5000,
-    })
-    await createPreset({
-      name: 'b-newest',
-      connectionProfileId: b,
-      settings: settingsFor(b),
-      lastUsedAt: 9000,
-    })
-    expect((await pickMruPresetForProfile(a))?.id).toBe(aNew.id)
-  })
-
-  it('prefers the last-viewed preset over workspace-global MRU', async () => {
-    const a = await fakeProfileId('A')
-    const b = await fakeProfileId('B')
-    const viewed = await createPreset({
-      name: 'viewed',
-      connectionProfileId: a,
-      settings: settingsFor(a),
-      lastUsedAt: 1000,
-    })
-    await createPreset({
-      name: 'global-mru',
-      connectionProfileId: b,
-      settings: settingsFor(b),
-      lastUsedAt: 9000,
-    })
-    expect((await pickPreferredPreset({ presetId: viewed.id, profileId: a }))?.id).toBe(viewed.id)
-  })
-
-  it('prefers the last-viewed profile over workspace-global MRU when preset is absent', async () => {
-    const a = await fakeProfileId('A')
-    const b = await fakeProfileId('B')
-    const scoped = await createPreset({
-      name: 'scoped',
-      connectionProfileId: a,
-      settings: settingsFor(a),
-      lastUsedAt: 1000,
-    })
-    await createPreset({
-      name: 'global-mru',
-      connectionProfileId: b,
-      settings: settingsFor(b),
-      lastUsedAt: 9000,
-    })
-    expect((await pickPreferredPreset({ profileId: a }))?.id).toBe(scoped.id)
+    expect(await configurationApplication.applyChatPreset(chat.id, target.id, 900)).toBe(false)
+    expect((await getChat(chat.id))?.updatedAt).toBe(500)
   })
 })
 
-describe('bumpPresetLastUsedAt', () => {
-  it('promotes a preset to MRU without broadcasting', async () => {
-    const profileId = await fakeProfileId()
-    const old = await createPreset({
-      name: 'old',
-      connectionProfileId: profileId,
-      settings: settingsFor(profileId),
-      lastUsedAt: 1000,
-    })
-    const newer = await createPreset({
-      name: 'new',
-      connectionProfileId: profileId,
-      settings: settingsFor(profileId),
-      lastUsedAt: 5000,
-    })
-    const seen: BroadcastEvent[] = []
-    const unsub = onEvent((ev) => seen.push(ev))
-    await bumpPresetLastUsedAt(old.id, 9999)
-    unsub()
-    const mru = await pickMruPreset()
-    expect(mru?.id).toBe(old.id)
-    expect(newer.lastUsedAt).toBe(5000)
-    expect(seen.filter((ev) => ev.kind === 'preset-mutated')).toEqual([])
-  })
-})
-
-describe('archive / unarchive', () => {
-  it('round-trips archived state', async () => {
-    const profileId = await fakeProfileId()
-    const preset = await createPreset({
-      name: 'p',
-      connectionProfileId: profileId,
-      settings: settingsFor(profileId),
-    })
-    await archivePreset(preset.id)
-    expect((await getPreset(preset.id))?.archived).toBe(true)
-    await unarchivePreset(preset.id)
-    expect((await getPreset(preset.id))?.archived).toBe(false)
-  })
-})
-
-describe('exportPreset', () => {
-  it('omits lifecycle + archived state and includes a connectionSketch without key material', async () => {
+describe('chat preset interchange', () => {
+  it('exports the portable payload without lifecycle or key material', async () => {
     const profileId = await fakeProfileId('OpenRouter')
     const preset = await createPreset({
       name: 'p',
       connectionProfileId: profileId,
-      settings: settingsFor(profileId),
-      lastUsedAt: 9000,
+      lastUsedAt: 9_000,
     })
-    await archivePreset(preset.id)
-    const exported = await exportPreset(preset.id)
-    expect(exported.schemaVersion).toBe(1)
-    expect(JSON.stringify(exported).includes('apiKeyRef')).toBe(false)
-    const body = exported.preset as unknown as Record<string, unknown>
-    expect(body.lastUsedAt).toBeUndefined()
-    expect(body.archived).toBeUndefined()
-    expect(exported.connectionSketch.name).toBe('OpenRouter')
-    expect(exported.connectionSketch.kind).toBe('openrouter')
-    expect(exported.connectionSketch.baseUrl).toBe('https://x')
+    await configurationApplication.archiveChatPreset(preset.id, 300)
+
+    const exported = await interchangeApplication.exportChatPreset(preset.id)
+    expect(exported.exportSchemaVersion).toBe(2)
+    expect(JSON.stringify(exported)).not.toContain('apiKeyRef')
+    expect(exported.payload).not.toHaveProperty('lastUsedAt')
+    expect(exported.payload).not.toHaveProperty('archived')
+    expect(exported.payload.connectionSketch).toMatchObject({
+      name: 'OpenRouter',
+      kind: 'openrouter',
+      baseUrl: 'https://x',
+    })
   })
 })

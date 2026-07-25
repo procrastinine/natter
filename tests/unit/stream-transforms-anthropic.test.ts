@@ -1,11 +1,18 @@
 import { describe, expect, it } from 'vitest'
 import type { AnthropicStreamChunk } from '../../src/api/anthropic-types'
-import { type StreamLaneEvent, splitAnthropicStream } from '../../src/api/stream-transforms'
-import {
-  applyStreamAccumulatorEvent,
-  createStreamAccumulator,
-  projectStreamAccumulatorFinal,
-} from '../../src/core/stream-accumulator'
+import { splitAnthropicStream as splitAnthropicStreamWithContract } from '../../src/api/stream-transforms'
+import type { StreamLaneEvent } from '../../src/core/generation-stream-live-events'
+import { ANTHROPIC_PROVIDER_OUTPUT_CONTRACT } from '../../src/core/provider-tool-context'
+import { anthropicReasoningContract } from '../helpers/reasoning-contracts'
+import { collectReasoningObservations, foldStreamLaneEvents } from '../helpers/reasoning-events'
+
+function splitAnthropicStream(source: Parameters<typeof splitAnthropicStreamWithContract>[0]) {
+  return splitAnthropicStreamWithContract(
+    source,
+    anthropicReasoningContract(),
+    ANTHROPIC_PROVIDER_OUTPUT_CONTRACT,
+  )
+}
 
 async function* asAsync<T>(items: Iterable<T>): AsyncIterable<T> {
   for (const item of items) yield item
@@ -147,11 +154,7 @@ describe('splitAnthropicStream', () => {
       },
     ])
 
-    const accumulator = createStreamAccumulator({ initialContent: [], now: 0 })
-    for (const [index, lane] of toolCalls.entries()) {
-      applyStreamAccumulatorEvent(accumulator, lane, index + 1)
-    }
-    expect(projectStreamAccumulatorFinal(accumulator).toolCalls).toEqual([
+    expect(foldStreamLaneEvents(toolCalls).final.toolCalls).toEqual([
       {
         id: 'toolu_1',
         type: 'function',
@@ -194,20 +197,49 @@ describe('splitAnthropicStream', () => {
     ]
     const lanes = await collect(splitAnthropicStream(asAsync(chunks)))
 
-    const reasoning = lanes.filter(
-      (lane): lane is Extract<StreamLaneEvent, { lane: 'reasoning' }> => lane.lane === 'reasoning',
+    const operations = collectReasoningObservations(lanes)
+    const visible = operations.filter((operation) => operation.kind === 'visible')
+    const carriers = operations.filter((operation) => operation.kind === 'carrier')
+    expect(visible).toHaveLength(1)
+    expect(visible[0]).toMatchObject({
+      kind: 'visible',
+      value: 'signed thought',
+      visibleKind: 'text',
+      format: 'anthropic-claude-v1',
+    })
+    expect(visible[0]?.source).toMatchObject({ dialect: 'anthropic-messages', blockIndex: 0 })
+    expect(carriers).toHaveLength(2)
+    expect(carriers.every((operation) => operation.update === 'set')).toBe(true)
+    expect(carriers.every((operation) => operation.value === 'sig_1')).toBe(true)
+    expect(new Set(carriers.map((operation) => JSON.stringify(operation.memberAliases))).size).toBe(
+      1,
     )
-    expect(reasoning.some((lane) => lane.textDelta === 'signed thought')).toBe(true)
+    expect(carriers[0]).toMatchObject({
+      carrierKind: 'anthropic-signature',
+      format: 'anthropic-claude-v1',
+      binding: {
+        visibleKind: 'text',
+      },
+    })
+    expect(carriers[0]?.binding?.source).toMatchObject({
+      dialect: 'anthropic-messages',
+      blockIndex: 0,
+    })
+    const folded = foldStreamLaneEvents(lanes)
+    const envelope = folded.final.reasoningEnvelope
+    expect(envelope?.visible).toEqual([
+      expect.objectContaining({ kind: 'text', text: 'signed thought' }),
+    ])
+    expect(envelope?.carriers).toEqual([
+      expect.objectContaining({ kind: 'anthropic-signature', signature: 'sig_1' }),
+    ])
     expect(
-      reasoning.some((lane) =>
-        lane.details?.some(
-          (detail) =>
-            Boolean(detail) &&
-            typeof detail === 'object' &&
-            (detail as { format?: unknown }).format === 'anthropic-claude-v1',
-        ),
+      folded.canonical.flatMap((event) =>
+        event.lane === 'reasoning'
+          ? event.mutations.filter((mutation) => mutation.kind === 'carrier-set')
+          : [],
       ),
-    ).toBe(true)
+    ).toHaveLength(1)
 
     const serverToolOutputs = lanes.filter((lane) => lane.lane === 'server-tool-output')
     expect(serverToolOutputs).toEqual([
@@ -221,6 +253,10 @@ describe('splitAnthropicStream', () => {
         itemType: 'web_search_tool_result',
         itemId: 'srvtoolu_1',
       }),
+    ])
+    expect(folded.final.providerOutputItems?.map((item) => item.type)).toEqual([
+      'server_tool_use',
+      'web_search_tool_result',
     ])
     expect(lanes.some((lane) => lane.lane === 'text' && lane.text === 'final')).toBe(true)
   })
@@ -267,37 +303,123 @@ describe('splitAnthropicStream', () => {
       },
     ]
     const lanes = await collect(splitAnthropicStream(asAsync(chunks)))
-    const reasoning = lanes.filter(
-      (lane): lane is Extract<StreamLaneEvent, { lane: 'reasoning' }> => lane.lane === 'reasoning',
-    )
-    const emittedThinkingCharacters = reasoning.reduce(
-      (total, lane) => total + (lane.textDelta?.length ?? 0),
+    const operations = collectReasoningObservations(lanes)
+    const visible = operations.filter((operation) => operation.kind === 'visible')
+    const carriers = operations.filter((operation) => operation.kind === 'carrier')
+    const emittedThinkingCharacters = visible.reduce(
+      (total, operation) => total + operation.value.length,
       0,
     )
     expect(emittedThinkingCharacters).toBe(part.length * partCount)
-    expect(reasoning.at(-1)?.details).toEqual([
-      {
-        type: 'reasoning.text',
-        id: 'text#anthropic-reasoning-0',
-        index: 0,
-        format: 'anthropic-claude-v1',
-        signature: 'signature-tail',
-      },
-    ])
+    expect(new Set(visible.map((operation) => JSON.stringify(operation.memberAliases))).size).toBe(
+      1,
+    )
+    const carrierAppends = carriers.filter((operation) => operation.update === 'append')
+    const carrierSets = carriers.filter((operation) => operation.update === 'set')
+    expect(carrierAppends.map((operation) => operation.value).join('')).toBe('signature-tail')
+    expect(carrierSets.map((operation) => operation.value)).toEqual(['signature-tail'])
+    expect(new Set(carriers.map((operation) => JSON.stringify(operation.memberAliases))).size).toBe(
+      1,
+    )
 
-    const accumulator = createStreamAccumulator({ initialContent: [], now: 0 })
-    for (const [index, lane] of reasoning.entries()) {
-      applyStreamAccumulatorEvent(accumulator, lane, index + 1)
-    }
-    expect(projectStreamAccumulatorFinal(accumulator).reasoningDetails).toEqual([
-      {
-        type: 'reasoning.text',
-        id: 'text#anthropic-reasoning-0',
-        index: 0,
-        format: 'anthropic-claude-v1',
+    const folded = foldStreamLaneEvents(lanes)
+    const envelope = folded.final.reasoningEnvelope
+    expect(envelope?.visible).toEqual([
+      expect.objectContaining({
+        kind: 'text',
         text: part.repeat(partCount),
-        signature: 'signature-tail',
-      },
+        format: 'anthropic-claude-v1',
+      }),
     ])
+    expect(envelope?.carriers).toEqual([
+      expect.objectContaining({
+        kind: 'anthropic-signature',
+        signature: 'signature-tail',
+        bindsVisiblePartId: envelope?.visible[0]?.id,
+      }),
+    ])
+    expect(
+      folded.canonical.flatMap((event) =>
+        event.lane === 'reasoning'
+          ? event.mutations.filter((mutation) => mutation.kind === 'carrier-set')
+          : [],
+      ),
+    ).toHaveLength(0)
+  })
+
+  it('keeps multiple thinking and redacted blocks as distinct visible members and carriers', async () => {
+    const chunks: AnthropicStreamChunk[] = [
+      {
+        type: 'buffered_result',
+        result: {
+          id: 'msg_multi_thinking',
+          stop_reason: 'end_turn',
+          content: [
+            { type: 'thinking', thinking: 'first thought', signature: 'sig-first' },
+            { type: 'redacted_thinking', data: 'redacted-carrier' },
+            { type: 'thinking', thinking: 'second thought', signature: 'sig-second' },
+          ],
+        },
+      },
+    ]
+    const lanes = await collect(splitAnthropicStream(asAsync(chunks)))
+    const envelope = foldStreamLaneEvents(lanes).final.reasoningEnvelope
+    expect(envelope?.visible.map((part) => [part.source.blockIndex, part.text])).toEqual([
+      [0, 'first thought'],
+      [2, 'second thought'],
+    ])
+    expect(envelope?.carriers.map((carrier) => [carrier.source.blockIndex, carrier.kind])).toEqual([
+      [0, 'anthropic-signature'],
+      [1, 'anthropic-redacted'],
+      [2, 'anthropic-signature'],
+    ])
+    expect(new Set(envelope?.visible.map((part) => part.id)).size).toBe(2)
+    expect(new Set(envelope?.carriers.map((carrier) => carrier.id)).size).toBe(3)
+  })
+
+  it('projects equivalent streamed and buffered thinking into the same final envelope', async () => {
+    const streamed: AnthropicStreamChunk[] = [
+      {
+        type: 'anthropic_event',
+        event: {
+          type: 'content_block_start',
+          index: 0,
+          content_block: { type: 'thinking', thinking: '' },
+        },
+      },
+      {
+        type: 'anthropic_event',
+        event: {
+          type: 'content_block_delta',
+          index: 0,
+          delta: { type: 'thinking_delta', thinking: 'same thought' },
+        },
+      },
+      {
+        type: 'anthropic_event',
+        event: {
+          type: 'content_block_delta',
+          index: 0,
+          delta: { type: 'signature_delta', signature: 'same-signature' },
+        },
+      },
+      { type: 'anthropic_event', event: { type: 'content_block_stop', index: 0 } },
+    ]
+    const buffered: AnthropicStreamChunk[] = [
+      {
+        type: 'buffered_result',
+        result: {
+          id: 'msg_buffered_equivalent',
+          content: [{ type: 'thinking', thinking: 'same thought', signature: 'same-signature' }],
+        },
+      },
+    ]
+    const streamedEnvelope = foldStreamLaneEvents(
+      await collect(splitAnthropicStream(asAsync(streamed))),
+    ).final.reasoningEnvelope
+    const bufferedEnvelope = foldStreamLaneEvents(
+      await collect(splitAnthropicStream(asAsync(buffered))),
+    ).final.reasoningEnvelope
+    expect(streamedEnvelope).toEqual(bufferedEnvelope)
   })
 })

@@ -26,28 +26,6 @@ function katexWoff2Only() {
   }
 }
 
-const STATEFUL_RUNTIME_PATHS = [
-  '/src/api/',
-  '/src/app/',
-  '/src/backcompat/',
-  '/src/core/',
-  '/src/hooks/',
-  '/src/lib/',
-  '/src/store/',
-]
-
-function fullReloadStatefulRuntime() {
-  return {
-    name: 'natter:full-reload-stateful-runtime',
-    handleHotUpdate(ctx: { file: string; server: { ws: { send(payload: unknown): void } } }) {
-      const file = ctx.file.replaceAll('\\', '/')
-      if (!STATEFUL_RUNTIME_PATHS.some((path) => file.includes(path))) return
-      ctx.server.ws.send({ type: 'full-reload', path: '*' })
-      return []
-    },
-  }
-}
-
 function browserDevtools() {
   return {
     name: 'natter:browser-devtools',
@@ -70,13 +48,7 @@ export default defineConfig(({ command, mode }) => {
     // Relative asset URLs keep the exported bundle portable across static hosts
     // and subpaths instead of assuming deployment at `/`.
     base: './',
-    plugins: [
-      browserDevtools(),
-      fullReloadStatefulRuntime(),
-      katexWoff2Only(),
-      react(),
-      tailwindcss(),
-    ],
+    plugins: [browserDevtools(), katexWoff2Only(), react(), tailwindcss()],
     server: {
       port: 5173,
       ...(isViteDevServer
@@ -112,6 +84,11 @@ export default defineConfig(({ command, mode }) => {
     },
     test: {
       environment: 'jsdom',
+      environmentOptions: {
+        jsdom: {
+          url: 'http://localhost/',
+        },
+      },
       setupFiles: ['./tests/setup.ts'],
       include: [
         'tests/unit/**/*.{test,spec}.{ts,tsx}',
@@ -128,6 +105,8 @@ export default defineConfig(({ command, mode }) => {
       // between parallel test files. Forks give each file its own process and
       // keep that leakage out of tests that assert on event fan-out.
       pool: 'forks',
+      execArgv: ['--no-experimental-webstorage'],
+      maxWorkers: 2,
     },
   }
 })

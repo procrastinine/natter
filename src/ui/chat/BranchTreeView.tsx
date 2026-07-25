@@ -12,37 +12,45 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
 } from 'react'
+import type { ConversationMutationSettlement } from '../../app/presentation-interactions'
 import { chatHref } from '../../app/router'
-import { type MessageTreeProjection, resolveActiveLeafIdProjected } from '../../core/active-path'
 import {
   type BranchTreeLayout,
   type BranchTreeLayoutNode,
   layoutBranchTree,
 } from '../../core/branch-tree-layout'
-import type { ChatId, CursorMap, Message, MessageId, MessageRole } from '../../core/types'
-import type { StructuralMessageHeader } from '../../hooks/useBranchUrlSync'
-import type { MessageAttachmentRefMutation } from '../../store/attachments'
-import { onEvent } from '../../store/broadcast'
+import { pendingGenerationCapability } from '../../core/interaction-capability'
+import type {
+  ChatId,
+  Message,
+  MessageId,
+  MessageRole,
+  ProviderOutputMemberRef,
+  ReasoningMemberRef,
+} from '../../core/types'
 import {
-  type MessageHeaderRow,
-  previewTextFromContent,
-  rebaseHydratedMessageHeader,
-} from '../../store/message-storage'
-import { primaryKeys } from '../../store/reactive-dependencies'
-import { useRepositoryPresentationQuery } from '../../store/reactive-query'
-import type { MessagePresentationSnapshot, WorkspaceRepository } from '../../store/repository'
-import { getStreamClientId } from '../../store/stream-leases'
-import { getWorkspaceRepository } from '../../store/workspace-repository'
-import {
-  currentStreamAdmissionRevision,
-  isStreamRelevantToSelectedPath,
-  mostRecentlyAdmittedStream,
-  streamOriginatesFromTabNavigation,
-  useActiveStreamsForChat,
-  useStreamStore,
-  wasStreamAdmittedBy,
-} from '../../store/zustand/streamStore'
+  useConversationInspectorDemand,
+  useConversationTreePreviewDemand,
+} from '../../hooks/useConversationFrame'
+import { attemptStopCapability } from '../../store/attempt-controller'
+import { branchTreeSearchTarget } from '../../store/branch-tree-search-session'
+import { branchTreeSessionWorkspace } from '../../store/branch-tree-session-workspace'
+import { conversationController as defaultConversationController } from '../../store/conversation-controller'
+import { rebaseHydratedMessageHeader } from '../../store/message-storage'
+import type {
+  AttemptExecutionRecord,
+  BranchTreeSearchSource,
+  ConversationController,
+  ConversationTreeSurface,
+  GenerationCapabilityFrame,
+  GenerationStartResult,
+  MessageAttachmentRefMutation,
+  MessageHeaderRow,
+  RequestableAttemptStopCapability,
+  TreePreviewTarget,
+} from '../../store/presentation-contracts'
 import {
   ChevronIcon,
   CloseIcon,
@@ -72,10 +80,6 @@ const EXPANDED_LAYOUT = {
   padding: 64,
 } as const
 
-const PREVIEW_CACHE_LIMIT = 256
-const PREVIEW_TEXT_MAX_CHARS = 960
-const PREVIEW_CACHE_CHAR_LIMIT = PREVIEW_CACHE_LIMIT * PREVIEW_TEXT_MAX_CHARS
-const EXPANDED_PREVIEW_CONCURRENCY = 6
 const VIEWPORT_OVERSCAN_X = 240
 const VIEWPORT_OVERSCAN_ROWS = 1
 const DEFAULT_INSPECTOR_RATIO = 0.38
@@ -87,6 +91,22 @@ const INSPECTOR_NARROW_BREAKPOINT_PX = 760
 const TREE_DESKTOP_MIN_PX = 260
 const TREE_NARROW_MIN_PX = 112
 const INSPECTOR_SEPARATOR_PX = 7
+const EMPTY_MESSAGE_ID_SET: ReadonlySet<MessageId> = Object.freeze(new Set<MessageId>())
+const EMPTY_MESSAGE_IDS: readonly MessageId[] = Object.freeze([])
+const EMPTY_TARGETED_ATTEMPTS: readonly TargetedAttempt[] = Object.freeze([])
+const EMPTY_BRANCH_TREE_LAYOUT: BranchTreeLayout = Object.freeze({
+  nodes: [],
+  byId: new Map(),
+  childrenByParent: new Map(),
+  rowsByDepth: [],
+  width: 0,
+  height: 0,
+  maxDepth: 0,
+})
+const EMPTY_CONNECTOR_INDEX: ConnectorIndex = Object.freeze({
+  sharedByDepth: [],
+  childrenByDepth: [],
+})
 
 const BranchTreeInspector = lazy(() =>
   import('./BranchTreeInspector').then((module) => ({ default: module.BranchTreeInspector })),
@@ -95,108 +115,71 @@ const BranchTreePreview = lazy(() =>
   import('./BranchTreePreview').then((module) => ({ default: module.BranchTreePreview })),
 )
 
-type BranchTreeComputation =
-  | 'render'
-  | 'layout'
-  | 'connector-index'
-  | 'preview-complete'
-  | 'preview-publish'
+type BranchTreeComputation = 'render' | 'layout' | 'connector-index'
 type BranchTreeComputationProbe = (operation: BranchTreeComputation) => void
 let branchTreeComputationProbe: BranchTreeComputationProbe | undefined
 
-function setBranchTreeComputationProbeForTests(
-  probe: BranchTreeComputationProbe | undefined,
+export function observeBranchTreeComputations(
+  observer: BranchTreeComputationProbe | undefined,
 ): void {
-  if (import.meta.env.MODE === 'test') branchTreeComputationProbe = probe
+  branchTreeComputationProbe = observer
 }
 
-export type BranchTreeRepository = Pick<
-  WorkspaceRepository,
-  'getMessagePresentationSnapshot' | 'getMessageTextPreview' | 'searchChatMessageText'
->
+export type BranchTreeRepository = BranchTreeSearchSource
 
 interface BranchTreeHeaderLookup {
   get(messageId: MessageId): MessageHeaderRow | undefined
+  has(messageId: MessageId): boolean
 }
 
-interface SearchRevisionState {
-  versions: ReadonlyMap<MessageId, number>
-  value: number
-  active: boolean
-  headersSource: readonly MessageHeaderRow[] | null
-  latestHeaderSource: BranchTreeHeaderLookup | undefined
-  frozenIds: ReadonlySet<MessageId>
-}
-
-interface CompactPreviewRequest {
-  controller: AbortController
-  header: MessageHeaderRow
-  key: string
-}
-
-interface QueuedCompactPreview {
-  header: MessageHeaderRow
-  key: string
-}
-
-type BranchTreeAction = (messageId: MessageId) => void | Promise<void>
-type BranchTreeEditAction = (message: Message, text: string) => void | Promise<void>
-type BranchTreeMessageAction = (message: Message) => void | Promise<void>
-export interface BranchTreeRequestTicket {
-  readonly navigationRevision: string
-  readonly completion: Promise<MessageId | undefined>
-}
-type BranchTreeRequestAction = (message: Message) => BranchTreeRequestTicket | undefined
-type BranchTreeEditRequestAction = (
+type BranchTreeAction = (messageId: MessageId, observedTipId?: MessageId) => void | Promise<void>
+type BranchTreeEditAction = (message: Message, text: string) => ConversationMutationSettlement
+type BranchTreeGenerationEditAction = (message: Message, text: string) => GenerationStartResult
+type BranchTreeMessageMutationAction = (message: Message) => ConversationMutationSettlement
+type BranchTreeGenerationMessageAction = (message: Message) => GenerationStartResult
+type BranchTreeProviderOutputAction = (
   message: Message,
-  text: string,
-) => BranchTreeRequestTicket | undefined
-type BranchTreeMessageIndexedAction = (message: Message, index: number) => void | Promise<void>
+  member: ProviderOutputMemberRef,
+) => ConversationMutationSettlement
+type BranchTreeReasoningAction = (
+  message: Message,
+  member: ReasoningMemberRef,
+) => ConversationMutationSettlement
 type BranchTreeMessageAttachmentAction = (
   message: Message,
   mutation: MessageAttachmentRefMutation,
 ) => void | Promise<void>
 
 export interface BranchTreeViewProps {
-  chatId: ChatId
-  headers: readonly MessageHeaderRow[]
-  latestHeaderById?: BranchTreeHeaderLookup
-  presentationHeaderById?: BranchTreeHeaderLookup
-  changedHeaderKeys?: readonly string[] | null
-  changedHeaders?: readonly (MessageHeaderRow | undefined)[] | null
-  projection: MessageTreeProjection<StructuralMessageHeader>
-  cursor: CursorMap
+  binding: ConversationTreeSurface
+  attempts: readonly AttemptExecutionRecord[]
+  viewportActive: boolean
   expanded: boolean
   previewFontFamily?: string
   selectedNodeId?: MessageId | null
+  conversationController?: ConversationController
   repository?: BranchTreeRepository
-  presentationSnapshots?: ReadonlyMap<MessageId, MessagePresentationSnapshot>
-  verifyPresentationSnapshotIds?: ReadonlySet<MessageId>
-  onPresentationSnapshotVerified?: (
-    messageId: MessageId,
-    snapshot: MessagePresentationSnapshot,
-  ) => void
   onActivateNode: BranchTreeAction
   onSelectNode?: (messageId: MessageId | null) => void
   onInsertAtSharedTrunk?: (parentId: MessageId | null) => void | Promise<void>
   onInsertAtChildLeg?: (childId: MessageId) => void | Promise<void>
   onInsertAfterLeaf?: BranchTreeAction
   onEditMessage?: BranchTreeEditAction
-  onEditAndSendMessage?: BranchTreeEditRequestAction
-  onDeleteNode?: BranchTreeAction
-  onRegenerateMessage?: BranchTreeRequestAction
-  onContinueMessage?: BranchTreeRequestAction
-  onForkMessage?: BranchTreeMessageAction
-  onToggleMessageContextVisibility?: BranchTreeMessageAction
+  onEditAndSendMessage?: BranchTreeGenerationEditAction
+  onDeleteNode?: BranchTreeMessageMutationAction
+  onRegenerateMessage?: BranchTreeGenerationMessageAction
+  onContinueMessage?: BranchTreeGenerationMessageAction
+  onForkMessage?: BranchTreeMessageMutationAction
+  onToggleMessageContextVisibility?: BranchTreeMessageMutationAction
   onMutateMessageAttachmentRef?: BranchTreeMessageAttachmentAction
-  onToggleReasoningDetailHidden?: BranchTreeMessageIndexedAction
-  onToggleProviderOutputItemHidden?: BranchTreeMessageIndexedAction
-  onAbort?: (streamId: string) => void
-  followActiveStreamOnMount?: boolean
-  navigationRevision?: string
-  hasConnection?: boolean
+  onToggleReasoningDetailHidden?: BranchTreeReasoningAction
+  onToggleProviderOutputItemHidden?: BranchTreeProviderOutputAction
+  onRequestStop?: (capability: RequestableAttemptStopCapability) => void
+  generationCapabilityFrame: GenerationCapabilityFrame
   className?: string
 }
+
+type ActiveBranchTreeViewProps = BranchTreeViewProps
 
 interface Viewport {
   left: number
@@ -205,22 +188,15 @@ interface Viewport {
   height: number
 }
 
-interface PreviewCacheEntry {
-  text: string
-}
-
 interface ActivePreview {
-  key: string
   messageId: MessageId
-  text?: string
-  failed?: boolean
 }
 
 type InspectedMessageSnapshot =
   | {
       id: MessageId
       bodyVersion: number
-      status: 'loading' | 'missing' | 'failed'
+      status: 'loading'
     }
   | {
       id: MessageId
@@ -238,31 +214,25 @@ interface PanGesture {
   moved: boolean
 }
 
-interface PendingRequestLeafFollow {
-  token: number
-  navigationRevision: string
-  initialStreamIds: ReadonlySet<string>
+type TargetedAttempt = AttemptExecutionRecord
+
+function latestAttempt(
+  attempts: readonly AttemptExecutionRecord[],
+  messageId?: MessageId,
+): AttemptExecutionRecord | undefined {
+  let selected: AttemptExecutionRecord | undefined
+  for (const attempt of attempts) {
+    if (messageId !== undefined && attempt.messageId !== messageId) continue
+    if (!selected || attempt.admissionSequence > selected.admissionSequence) selected = attempt
+  }
+  return selected
 }
 
-interface EntryStreamFollow {
-  chatId: ChatId
-  admissionRevision: number
-  acceptInitialHydration: boolean
-  streamIds: ReadonlySet<string>
-  messageIds: ReadonlySet<MessageId>
-  acceptHydratedStream: boolean
-  state: 'pending' | 'done' | 'cancelled'
-}
-
-function pendingRequestMatchesToken(
-  pending: PendingRequestLeafFollow | null,
-  token: number,
-): boolean {
-  return pending?.token === token
-}
-
-function cancelEntryStreamFollow(follow: EntryStreamFollow | null): void {
-  if (follow?.state === 'pending') follow.state = 'cancelled'
+function latestTargetAttempt(
+  attempts: readonly AttemptExecutionRecord[],
+  messageId: MessageId | null,
+): AttemptExecutionRecord | undefined {
+  return messageId ? latestAttempt(attempts, messageId) : undefined
 }
 
 interface SharedConnector {
@@ -334,33 +304,8 @@ function pointerHitsScrollbarGutter(
   )
 }
 
-function sameRevisionMap(
-  left: ReadonlyMap<MessageId, number>,
-  right: ReadonlyMap<MessageId, number>,
-): boolean {
-  if (left.size !== right.size) return false
-  for (const [id, version] of left) {
-    if (right.get(id) !== version) return false
-  }
-  return true
-}
-
 function roleLabel(role: MessageRole): string {
   return role.charAt(0).toLocaleUpperCase() + role.slice(1)
-}
-
-function headerHasPendingGeneration(header: MessageHeaderRow): boolean {
-  return header.generation?.status === 'streaming' && header.generation.finishedAt === undefined
-}
-
-function sameHeaderStructure(left: MessageHeaderRow, right: MessageHeaderRow): boolean {
-  return (
-    left.id === right.id &&
-    left.chatId === right.chatId &&
-    left.parentId === right.parentId &&
-    left.siblingIndex === right.siblingIndex &&
-    left.deleted === right.deleted
-  )
 }
 
 function lowerBoundNodeX(row: readonly BranchTreeLayoutNode[], target: number): number {
@@ -480,71 +425,15 @@ function connectorIndexFor(layout: BranchTreeLayout): ConnectorIndex {
   }
 }
 
-function isAbortError(error: unknown): boolean {
-  return error instanceof Error && error.name === 'AbortError'
-}
-
-function isRepositoryLifecycleError(error: unknown): boolean {
-  const candidate = error as { name?: unknown; inner?: { name?: unknown } } | null
-  return (
-    candidate?.name === 'AbortError' ||
-    candidate?.name === 'DatabaseClosedError' ||
-    candidate?.inner?.name === 'AbortError' ||
-    candidate?.inner?.name === 'DatabaseClosedError'
-  )
-}
-
-function storePreview(cache: Map<string, PreviewCacheEntry>, key: string, text: string): string {
-  const retainedText =
-    text.length > PREVIEW_TEXT_MAX_CHARS ? `${text.slice(0, PREVIEW_TEXT_MAX_CHARS - 1)}…` : text
-  cache.delete(key)
-  cache.set(key, { text: retainedText })
-  let retainedChars = 0
-  for (const entry of cache.values()) retainedChars += entry.text.length
-  while (cache.size > PREVIEW_CACHE_LIMIT || retainedChars > PREVIEW_CACHE_CHAR_LIMIT) {
-    const oldest = cache.keys().next().value
-    if (oldest === undefined) break
-    retainedChars -= cache.get(oldest)?.text.length ?? 0
-    cache.delete(oldest)
-  }
-  return retainedText
-}
-
-function runAction(action: (() => void | Promise<void>) | undefined): void {
-  if (!action) return
-  void Promise.resolve(action())
-}
-
-function exactPresentationForHeader(
-  presentations: ReadonlyMap<MessageId, MessagePresentationSnapshot> | undefined,
-  header: Pick<MessageHeaderRow, 'bodyVersion' | 'chatId' | 'id'> | undefined,
-): MessagePresentationSnapshot | undefined {
-  if (!header) return undefined
-  const presentation = presentations?.get(header.id)
-  return presentation?.bodyVersion === header.bodyVersion &&
-    presentation.message.id === header.id &&
-    presentation.message.chatId === header.chatId &&
-    !presentation.message.deleted
-    ? presentation
-    : undefined
-}
-
-const BranchTreeViewComponent = memo(function BranchTreeView({
-  chatId,
-  headers,
-  latestHeaderById,
-  presentationHeaderById,
-  changedHeaderKeys,
-  changedHeaders,
-  projection,
-  cursor,
+const ActiveBranchTreeView = memo(function ActiveBranchTreeView({
+  viewportActive,
+  binding,
+  attempts,
   expanded,
   previewFontFamily = treePreviewFontFamily(),
   selectedNodeId,
-  repository = getWorkspaceRepository(),
-  presentationSnapshots,
-  verifyPresentationSnapshotIds,
-  onPresentationSnapshotVerified,
+  conversationController: injectedController,
+  repository,
   onActivateNode,
   onSelectNode,
   onInsertAtSharedTrunk,
@@ -560,344 +449,139 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
   onMutateMessageAttachmentRef,
   onToggleReasoningDetailHidden,
   onToggleProviderOutputItemHidden,
-  onAbort,
-  followActiveStreamOnMount = false,
-  navigationRevision = '0',
-  hasConnection = false,
+  onRequestStop,
+  generationCapabilityFrame,
   className,
-}: BranchTreeViewProps) {
-  if (import.meta.env.MODE === 'test') branchTreeComputationProbe?.('render')
+}: ActiveBranchTreeViewProps) {
+  branchTreeComputationProbe?.('render')
+  const bodyActive = viewportActive && binding.currency === 'current'
+  const controller = injectedController ?? defaultConversationController
+  const chatId = binding.seal.chatId
+  const exactHeaderById = binding.headers
+  const headerChangeRevision = binding.headerChangeRevision
+  const changedHeaderKeys = binding.changedHeaderKeys
+  const projection = binding.topology
+  const acceptedPath = binding.spine.path
+  const workspaceRevision = `${binding.seal.workspaceId}:${binding.seal.replacementEpoch}`
   const workspaceRef = useRef<HTMLDivElement | null>(null)
   const scrollRef = useRef<HTMLDivElement | null>(null)
-  const centerNodeRef = useRef<(messageId: MessageId) => void>(() => undefined)
+  const centerNodeRef = useRef<(messageId: MessageId) => boolean>(() => false)
   const searchInputRef = useRef<HTMLInputElement | null>(null)
-  const previewCacheRef = useRef<Map<string, PreviewCacheEntry>>(new Map())
-  const pendingPreviewsRef = useRef<Map<string, Promise<string>>>(new Map())
-  const expandedPreviewQueueRef = useRef<Map<string, MessageHeaderRow>>(new Map())
-  const expandedPreviewInFlightKeysRef = useRef<Set<string>>(new Set())
-  const compactPreviewInFlightRef = useRef<CompactPreviewRequest | null>(null)
-  const compactPreviewQueuedRef = useRef<QueuedCompactPreview | null>(null)
-  const pumpCompactPreviewQueueRef = useRef<() => void>(() => undefined)
-  const previewRevisionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const activePreviewKeyRef = useRef<string | null>(null)
-  const previewScopeEpochRef = useRef(0)
-  const workspaceRevisionRef = useRef(0)
+  const committedHeaderDeliveryRef = useRef<{
+    chatId: ChatId
+    source: BranchTreeHeaderLookup
+    revision: number
+  } | null>(null)
+  const deliveredChangedHeaderKeys = (() => {
+    const previous = committedHeaderDeliveryRef.current
+    if (!previous) return null
+    if (
+      previous.chatId === chatId &&
+      previous.source === exactHeaderById &&
+      previous.revision === headerChangeRevision
+    ) {
+      return EMPTY_MESSAGE_IDS
+    }
+    return previous.chatId === chatId && previous.revision + 1 === headerChangeRevision
+      ? changedHeaderKeys
+      : null
+  })()
+  useLayoutEffect(() => {
+    committedHeaderDeliveryRef.current = {
+      chatId,
+      source: exactHeaderById,
+      revision: headerChangeRevision,
+    }
+  }, [chatId, exactHeaderById, headerChangeRevision])
   const viewportFrameRef = useRef<number | null>(null)
   const inspectorResizeFrameRef = useRef<number | null>(null)
   const pendingInspectorClientXRef = useRef<number | null>(null)
   const resizingInspectorRef = useRef(false)
   const initialCenterKeyRef = useRef('')
   const lastExternalSelectionRef = useRef<MessageId | null>(null)
-  const previewScopeRef = useRef({ chatId, repository })
-  const presentationSnapshotsRef = useRef(presentationSnapshots)
-  presentationSnapshotsRef.current = presentationSnapshots
   const selectionScopeChatIdRef = useRef(chatId)
   const panGestureRef = useRef<PanGesture | null>(null)
   const suppressCanvasClickRef = useRef(false)
-  const searchRevisionRef = useRef<SearchRevisionState>({
-    versions: new Map(),
-    value: 0,
-    active: false,
-    headersSource: null,
-    latestHeaderSource: undefined,
-    frozenIds: new Set(),
-  })
-  const currentMatchIdRef = useRef<MessageId | null>(null)
   const inspectedMessageIdRef = useRef<MessageId | null>(null)
-  const retainedInspectedMessageRef = useRef<{
-    workspaceRevision: number
-    repository: BranchTreeRepository
-    chatId: ChatId
-    id: MessageId
-    bodyVersion: number
-    message: Message
-  } | null>(null)
-  const requestLeafFollowTokenRef = useRef(0)
-  const pendingRequestLeafFollowRef = useRef<PendingRequestLeafFollow | null>(null)
-  const entryStreamFollowRef = useRef<EntryStreamFollow | null>(null)
-  const lastSearchQueryRef = useRef('')
+  const handledSearchRevealRef = useRef(0)
+  const searchWasActiveRef = useRef(false)
   const [viewport, setViewport] = useState<Viewport>(EMPTY_VIEWPORT)
   const [workspaceWidth, setWorkspaceWidth] = useState(EMPTY_VIEWPORT.width)
   const [inspectorRatio, setInspectorRatio] = useState(DEFAULT_INSPECTOR_RATIO)
   const [resizingInspector, setResizingInspector] = useState(false)
   const [panningCanvas, setPanningCanvas] = useState(false)
-  const [workspaceRevision, setWorkspaceRevision] = useState(0)
-  const [, setPreviewRevision] = useState(0)
   const [activePreview, setActivePreview] = useState<ActivePreview | null>(null)
   const [localSelectedNodeId, setLocalSelectedNodeId] = useState<MessageId | null>(null)
   const [hoveredConnectorKey, setHoveredConnectorKey] = useState<string | null>(null)
   const [query, setQuery] = useState('')
-  const chatStreams = useActiveStreamsForChat(chatId)
-  const activeStreamTargetIds = useMemo(() => {
-    const ids = new Set<MessageId>()
-    for (const stream of chatStreams) if (stream.messageId) ids.add(stream.messageId)
-    return ids
-  }, [chatStreams])
-  const retainedHeaderById = useMemo(
-    () => new Map(headers.map((header) => [header.id, header])),
-    [headers],
+  const [actionError, setActionError] = useState<string | null>(null)
+  const targetedAttempts = useMemo(
+    () => (bodyActive ? attempts : EMPTY_TARGETED_ATTEMPTS),
+    [attempts, bodyActive],
   )
-  const persistedStreamTargetsRef = useRef<{
-    headersSource: readonly MessageHeaderRow[] | null
-    latestHeaderSource: BranchTreeHeaderLookup | undefined
-    ids: ReadonlySet<MessageId>
-  }>({ headersSource: null, latestHeaderSource: undefined, ids: new Set() })
-  const persistedStreamTargetIds = useMemo(() => {
-    const previous = persistedStreamTargetsRef.current
-    if (
-      previous.headersSource !== headers ||
-      (changedHeaderKeys === null && previous.latestHeaderSource !== latestHeaderById)
-    ) {
-      const ids = new Set<MessageId>()
-      for (const retained of headers) {
-        const exact = latestHeaderById?.get(retained.id) ?? retained
-        if (headerHasPendingGeneration(exact)) ids.add(retained.id)
-      }
-      persistedStreamTargetsRef.current = {
-        headersSource: headers,
-        latestHeaderSource: latestHeaderById,
-        ids,
-      }
-      return ids
-    }
-    if (
-      !changedHeaderKeys ||
-      !changedHeaders ||
-      changedHeaderKeys.length !== changedHeaders.length
-    ) {
-      persistedStreamTargetsRef.current = {
-        headersSource: headers,
-        latestHeaderSource: latestHeaderById,
-        ids: previous.ids,
-      }
-      return previous.ids
-    }
-    let next: Set<MessageId> | null = null
-    for (let index = 0; index < changedHeaderKeys.length; index += 1) {
-      const id = changedHeaderKeys[index] as MessageId
-      if (!retainedHeaderById.has(id)) continue
-      const changed = latestHeaderById?.get(id) ?? changedHeaders[index]
-      const pending = changed ? headerHasPendingGeneration(changed) : false
-      if (pending === previous.ids.has(id)) continue
-      next ??= new Set(previous.ids)
-      if (pending) next.add(id)
-      else next.delete(id)
-    }
-    persistedStreamTargetsRef.current = {
-      headersSource: headers,
-      latestHeaderSource: latestHeaderById,
-      ids: next ?? previous.ids,
-    }
-    return persistedStreamTargetsRef.current.ids
-  }, [changedHeaderKeys, changedHeaders, headers, latestHeaderById, retainedHeaderById])
-  const busyMessageIds = useMemo(() => {
-    if (persistedStreamTargetIds.size === 0) return activeStreamTargetIds
-    const ids = new Set(activeStreamTargetIds)
-    for (const id of persistedStreamTargetIds) ids.add(id)
+  const activeAttemptTargetIds = useMemo(() => {
+    const ids = new Set<MessageId>()
+    for (const attempt of targetedAttempts) ids.add(attempt.messageId)
     return ids
-  }, [activeStreamTargetIds, persistedStreamTargetIds])
+  }, [targetedAttempts])
+  const busyMessageIds = activeAttemptTargetIds
+  const busyMessageIdsRef = useRef<ReadonlySet<MessageId>>(busyMessageIds)
+  busyMessageIdsRef.current = busyMessageIds
   const deferredQuery = useDeferredValue(query)
   const normalizedQuery = deferredQuery.trim()
-  const [matches, setMatches] = useState<MessageId[]>([])
-  const [matchIndex, setMatchIndex] = useState(-1)
-  const currentMatchId = matchIndex < 0 ? null : (matches[matchIndex] ?? null)
-  const [searching, setSearching] = useState(false)
-  const [searchFailed, setSearchFailed] = useState(false)
-  currentMatchIdRef.current = currentMatchId
-
-  const resetPreviewScope = useCallback(() => {
-    previewScopeEpochRef.current += 1
-    previewCacheRef.current = new Map()
-    pendingPreviewsRef.current = new Map()
-    expandedPreviewQueueRef.current.clear()
-    expandedPreviewInFlightKeysRef.current = new Set()
-    compactPreviewQueuedRef.current = null
-    compactPreviewInFlightRef.current?.controller.abort()
-    activePreviewKeyRef.current = null
-    if (previewRevisionTimerRef.current !== null) {
-      clearTimeout(previewRevisionTimerRef.current)
-      previewRevisionTimerRef.current = null
-    }
-    setActivePreview(null)
-  }, [])
-
-  useEffect(
-    () =>
-      onEvent((event) => {
-        if (event.kind !== 'workspace-replaced') return
-        resetPreviewScope()
-        workspaceRevisionRef.current += 1
-        setWorkspaceRevision(workspaceRevisionRef.current)
-      }),
-    [resetPreviewScope],
+  const searchSession = branchTreeSessionWorkspace.searchFor(repository)
+  const searchSnapshot = useSyncExternalStore(
+    searchSession.subscribe,
+    searchSession.getSnapshot,
+    searchSession.getSnapshot,
   )
+  const visibleSearchSnapshot =
+    bodyActive &&
+    searchWasActiveRef.current &&
+    searchSnapshot?.workspaceId === binding.seal.workspaceId &&
+    searchSnapshot.replacementEpoch === binding.seal.replacementEpoch &&
+    searchSnapshot.chatId === chatId &&
+    searchSnapshot.query === normalizedQuery
+      ? searchSnapshot
+      : null
+  const matches = visibleSearchSnapshot?.matches ?? EMPTY_MESSAGE_IDS
+  const matchIndex = visibleSearchSnapshot?.currentIndex ?? -1
+  const currentMatchId = visibleSearchSnapshot?.currentMatchId ?? null
+  const searching = visibleSearchSnapshot?.status === 'searching'
+  const searchFailed = visibleSearchSnapshot?.status === 'error'
+  const searchInteractive = visibleSearchSnapshot?.interactive ?? normalizedQuery.length === 0
 
-  const searchRevision = useMemo(() => {
-    const previous = searchRevisionRef.current
-    if (normalizedQuery.length === 0) {
-      previous.active = false
-      return previous.value
-    }
-
-    const exactHeader = (messageId: MessageId) =>
-      latestHeaderById?.get(messageId) ?? retainedHeaderById.get(messageId)
-    const requiresFullRebuild =
-      !previous.active ||
-      previous.headersSource !== headers ||
-      (changedHeaderKeys === null && previous.latestHeaderSource !== latestHeaderById)
-    let versions = previous.versions
-    let changed = false
-
-    if (requiresFullRebuild) {
-      const next = new Map<MessageId, number>()
-      for (const retained of headers) {
-        const exact = exactHeader(retained.id) ?? retained
-        next.set(
-          retained.id,
-          busyMessageIds.has(retained.id)
-            ? (previous.versions.get(retained.id) ?? exact.bodyVersion)
-            : exact.bodyVersion,
-        )
-      }
-      changed = !sameRevisionMap(previous.versions, next)
-      versions = next
-    } else {
-      const update: { next: Map<MessageId, number> | null } = { next: null }
-      const setVersion = (messageId: MessageId, bodyVersion: number) => {
-        if ((update.next ?? versions).get(messageId) === bodyVersion) return
-        update.next ??= new Map(versions)
-        update.next.set(messageId, bodyVersion)
-        changed = true
-      }
-      if (
-        changedHeaderKeys &&
-        changedHeaders &&
-        changedHeaderKeys.length === changedHeaders.length
-      ) {
-        for (let index = 0; index < changedHeaderKeys.length; index += 1) {
-          const messageId = changedHeaderKeys[index] as MessageId
-          if (busyMessageIds.has(messageId) || !retainedHeaderById.has(messageId)) continue
-          const exact = exactHeader(messageId) ?? changedHeaders[index]
-          if (exact) setVersion(messageId, exact.bodyVersion)
-        }
-      }
-      for (const messageId of previous.frozenIds) {
-        if (busyMessageIds.has(messageId) || !retainedHeaderById.has(messageId)) continue
-        const exact = exactHeader(messageId)
-        if (exact) setVersion(messageId, exact.bodyVersion)
-      }
-      versions = update.next ?? versions
-    }
-
-    const value = previous.value + (changed ? 1 : 0)
-    searchRevisionRef.current = {
-      versions,
-      value,
-      active: true,
-      headersSource: headers,
-      latestHeaderSource: latestHeaderById,
-      frozenIds: new Set(busyMessageIds),
-    }
-    return value
-  }, [
-    busyMessageIds,
-    changedHeaderKeys,
-    changedHeaders,
-    headers,
-    latestHeaderById,
-    normalizedQuery,
-    retainedHeaderById,
-  ])
+  useEffect(() => {
+    void workspaceRevision
+    setActivePreview(null)
+  }, [workspaceRevision])
 
   const layoutOptions = expanded ? EXPANDED_LAYOUT : COMPACT_LAYOUT
+  const viewportDemandKey = `${chatId}:${expanded ? 'expanded' : 'compact'}`
   const layout = useMemo(() => {
-    if (import.meta.env.MODE === 'test') branchTreeComputationProbe?.('layout')
-    return layoutBranchTree(projection.nodes, layoutOptions)
-  }, [layoutOptions, projection])
-  const headerById = useMemo(
-    () => ({
-      get(messageId: MessageId): MessageHeaderRow | undefined {
-        const presentationHeader = presentationHeaderById?.get(messageId)
-        if (presentationHeader) return presentationHeader
-        const retained = retainedHeaderById.get(messageId)
-        const latest = latestHeaderById?.get(messageId)
-        if (!retained) return latest
-        if (!latest) return retained
-        if (!sameHeaderStructure(retained, latest) && latest.nodeVersion >= retained.nodeVersion) {
-          return latest
-        }
-        const retainedStrictlyDominates =
-          (retained.nodeVersion > latest.nodeVersion &&
-            retained.bodyVersion >= latest.bodyVersion) ||
-          (retained.bodyVersion > latest.bodyVersion && retained.nodeVersion >= latest.nodeVersion)
-        return retainedStrictlyDominates ? retained : latest
-      },
-    }),
-    [latestHeaderById, presentationHeaderById, retainedHeaderById],
-  )
+    if (!bodyActive) return EMPTY_BRANCH_TREE_LAYOUT
+    branchTreeComputationProbe?.('layout')
+    return layoutBranchTree(projection, layoutOptions)
+  }, [bodyActive, layoutOptions, projection])
+  const headerById = exactHeaderById
   const headerByIdRef = useRef(headerById)
   headerByIdRef.current = headerById
   const connectorIndex = useMemo(() => {
-    if (import.meta.env.MODE === 'test') branchTreeComputationProbe?.('connector-index')
+    if (!bodyActive) return EMPTY_CONNECTOR_INDEX
+    branchTreeComputationProbe?.('connector-index')
     return connectorIndexFor(layout)
-  }, [layout])
-  const activeLeafId = useMemo(
-    () => resolveActiveLeafIdProjected(projection, cursor),
-    [cursor, projection],
-  )
-  const activePathIds = useMemo(() => {
-    const path = new Set<MessageId>()
-    let currentId = activeLeafId
-    while (currentId !== null) {
-      if (path.has(currentId)) break
-      path.add(currentId)
-      currentId = layout.byId.get(currentId)?.parentId ?? null
-    }
-    return path
-  }, [activeLeafId, layout])
-  const knownHeaderMessageIds = useMemo(() => new Set(projection.byId.keys()), [projection])
-  const selectedPathStreams = useMemo(
+  }, [bodyActive, layout])
+  const acceptedLeaf = acceptedPath.leaf
+  const activeLeafId = acceptedLeaf ? acceptedLeaf.id : null
+  const activePathIds = bodyActive ? acceptedPath.messageIds : EMPTY_MESSAGE_ID_SET
+  const selectedPathAttempts = useMemo(
     () =>
-      chatStreams.filter((stream) =>
-        isStreamRelevantToSelectedPath(
-          stream,
-          activePathIds,
-          knownHeaderMessageIds,
-          navigationRevision,
-          getStreamClientId(),
-        ),
-      ),
-    [activePathIds, chatStreams, knownHeaderMessageIds, navigationRevision],
+      activePathIds.size > 0
+        ? targetedAttempts.filter((attempt) => activePathIds.has(attempt.messageId))
+        : [],
+    [activePathIds, targetedAttempts],
   )
-  const selectedPersistedStreamTargetIds = useMemo(() => {
-    const ids = new Set<MessageId>()
-    for (const id of persistedStreamTargetIds) if (activePathIds.has(id)) ids.add(id)
-    return ids
-  }, [activePathIds, persistedStreamTargetIds])
-  if (entryStreamFollowRef.current?.chatId !== chatId) {
-    entryStreamFollowRef.current = {
-      chatId,
-      admissionRevision: currentStreamAdmissionRevision(),
-      acceptInitialHydration: headers.length === 0,
-      streamIds: new Set(selectedPathStreams.map((stream) => stream.streamId)),
-      messageIds: new Set(selectedPersistedStreamTargetIds),
-      acceptHydratedStream:
-        followActiveStreamOnMount ||
-        selectedPathStreams.length > 0 ||
-        selectedPersistedStreamTargetIds.size > 0,
-      state: selectedNodeId === undefined ? 'pending' : 'cancelled',
-    }
-  }
-  const entryStreamFollow = entryStreamFollowRef.current
-  if (
-    entryStreamFollow.state === 'pending' &&
-    (followActiveStreamOnMount ||
-      selectedPathStreams.length > 0 ||
-      selectedPersistedStreamTargetIds.size > 0)
-  ) {
-    entryStreamFollow.acceptHydratedStream = true
-  }
-  const generationBusy = selectedPathStreams.length > 0 || selectedPersistedStreamTargetIds.size > 0
+  const generationBusy = selectedPathAttempts.length > 0
   const activeChildByParent = useMemo(() => {
     const active = new Map<MessageId, MessageId>()
     for (const id of activePathIds) {
@@ -923,12 +607,17 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
   const inspectedMessageId = liveSelectedHeader?.id ?? null
   const selectedBodyVersion = liveSelectedHeader?.bodyVersion ?? null
   inspectedMessageIdRef.current = inspectedMessageId
-  const toolbarStream = useMemo(() => {
-    const inspected = chatStreams.find((stream) => stream.messageId === inspectedMessageId)
-    const activeLeaf = chatStreams.find((stream) => stream.messageId === activeLeafId)
-    const selectedPath = mostRecentlyAdmittedStream(selectedPathStreams)
+  useConversationInspectorDemand(bodyActive ? chatId : null, inspectedMessageId, controller)
+  const toolbarAttempt = useMemo(() => {
+    const inspected = latestTargetAttempt(targetedAttempts, inspectedMessageId)
+    const activeLeaf = latestTargetAttempt(targetedAttempts, activeLeafId)
+    const selectedPath = latestAttempt(selectedPathAttempts)
     return inspected ?? activeLeaf ?? selectedPath
-  }, [activeLeafId, chatStreams, inspectedMessageId, selectedPathStreams])
+  }, [activeLeafId, inspectedMessageId, selectedPathAttempts, targetedAttempts])
+  const toolbarStopCapability = useMemo(
+    () => attemptStopCapability(toolbarAttempt),
+    [toolbarAttempt],
+  )
   const planeWidth = Math.max(layout.width, viewport.width)
   const planeHeight = Math.max(layout.height, viewport.height)
   const graphOffsetX = Math.max(0, (planeWidth - layout.width) / 2)
@@ -972,6 +661,7 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
   }, [readViewport])
 
   useLayoutEffect(() => {
+    if (!bodyActive) return
     readViewport()
     const element = scrollRef.current
     if (!element) return
@@ -987,49 +677,55 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
         viewportFrameRef.current = null
       }
     }
-  }, [readViewport, scheduleViewportRead])
+  }, [bodyActive, readViewport, scheduleViewportRead])
 
   const centerNode = useCallback(
-    (messageId: MessageId) => {
+    (messageId: MessageId): boolean => {
       const element = scrollRef.current
       const node = layout.byId.get(messageId)
-      if (!element || !node) return
+      if (!element || !node) return false
       const width = element.clientWidth || EMPTY_VIEWPORT.width
       const height = element.clientHeight || EMPTY_VIEWPORT.height
       element.scrollLeft = Math.max(0, graphOffsetX + node.x + node.width / 2 - width / 2)
       element.scrollTop = Math.max(0, node.y + node.height / 2 - height / 2)
       readViewport()
+      return true
     },
     [graphOffsetX, layout, readViewport],
   )
   centerNodeRef.current = centerNode
 
   useLayoutEffect(() => {
+    if (!bodyActive) return
     const focusNodeId = inspectedMessageId ?? currentMatchId ?? activeLeafId
-    const centerKey = `${chatId}:${expanded ? 'expanded' : 'compact'}`
-    if (initialCenterKeyRef.current === centerKey || !focusNodeId) return
+    if (initialCenterKeyRef.current === viewportDemandKey || !focusNodeId) return
     if (!layout.byId.has(focusNodeId)) return
-    initialCenterKeyRef.current = centerKey
-    centerNode(focusNodeId)
-  }, [activeLeafId, centerNode, chatId, currentMatchId, expanded, inspectedMessageId, layout])
+    if (!centerNode(focusNodeId)) return
+    initialCenterKeyRef.current = viewportDemandKey
+  }, [
+    activeLeafId,
+    bodyActive,
+    centerNode,
+    currentMatchId,
+    inspectedMessageId,
+    layout,
+    viewportDemandKey,
+  ])
 
   useEffect(() => {
+    if (!bodyActive) return
     if (selectedNodeId === null) {
-      cancelEntryStreamFollow(entryStreamFollowRef.current)
       lastExternalSelectionRef.current = null
       return
     }
     if (selectedNodeId === undefined || lastExternalSelectionRef.current === selectedNodeId) return
-    cancelEntryStreamFollow(entryStreamFollowRef.current)
     lastExternalSelectionRef.current = selectedNodeId
     centerNode(selectedNodeId)
-  }, [centerNode, selectedNodeId])
+  }, [bodyActive, centerNode, selectedNodeId])
 
   useEffect(() => {
     if (selectionScopeChatIdRef.current === chatId) return
     selectionScopeChatIdRef.current = chatId
-    requestLeafFollowTokenRef.current += 1
-    pendingRequestLeafFollowRef.current = null
     setLocalSelectedNodeId(null)
   }, [chatId])
 
@@ -1041,280 +737,32 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
     workspace.style.setProperty('--branch-tree-canvas-min-width', `${inspectorBounds.canvasMin}px`)
   }, [inspectorBounds.canvasMin, inspectorBounds.min, inspectorWidth])
 
-  const directInspectedPresentation = exactPresentationForHeader(
-    presentationSnapshots,
-    liveSelectedHeader,
-  )
-  const verifyDirectInspectedPresentation =
-    directInspectedPresentation !== undefined &&
-    inspectedMessageId !== null &&
-    verifyPresentationSnapshotIds?.has(inspectedMessageId) === true
-
-  // The local one-body retention below bridges versioned reads without keeping
-  // an idle hydrated-body query cache or remounting the inspector.
-  const queriedInspectedMessage = useRepositoryPresentationQuery<InspectedMessageSnapshot | null>(
-    JSON.stringify([
-      'branch-tree-inspector',
-      workspaceRevision,
-      chatId,
-      inspectedMessageId,
-      selectedBodyVersion,
-      verifyDirectInspectedPresentation ? (liveSelectedHeader?.nodeVersion ?? null) : null,
-      verifyDirectInspectedPresentation,
-    ]),
-    async (signal) => {
-      if (!inspectedMessageId) return null
-      if (directInspectedPresentation && !verifyDirectInspectedPresentation) {
-        return {
-          id: inspectedMessageId,
-          bodyVersion: directInspectedPresentation.bodyVersion,
-          status: 'ready',
-          message: directInspectedPresentation.message,
-        }
-      }
-      try {
-        const snapshot = await repository.getMessagePresentationSnapshot(inspectedMessageId, {
-          signal,
-        })
-        if (!snapshot || snapshot.message.chatId !== chatId || snapshot.message.deleted) {
-          return {
+  const exactInspectedPresentation = binding.inspector.exact
+  const retainedInspectedPresentation = binding.inspector.retained
+  const exactInspectorBodyReady =
+    exactInspectedPresentation?.message.id === inspectedMessageId &&
+    exactInspectedPresentation.bodyVersion === selectedBodyVersion
+  const selectedInspectedPresentation = exactInspectorBodyReady
+    ? exactInspectedPresentation
+    : retainedInspectedPresentation?.message.id === inspectedMessageId &&
+        retainedInspectedPresentation.bodyVersion === selectedBodyVersion
+      ? retainedInspectedPresentation
+      : null
+  const inspectedMessage: InspectedMessageSnapshot | null =
+    inspectedMessageId === null || selectedBodyVersion === null
+      ? null
+      : selectedInspectedPresentation
+        ? {
             id: inspectedMessageId,
-            bodyVersion: selectedBodyVersion as number,
-            status: 'missing',
+            bodyVersion: selectedInspectedPresentation.bodyVersion,
+            status: 'ready',
+            message: selectedInspectedPresentation.message,
           }
-        }
-        return {
-          id: inspectedMessageId,
-          bodyVersion: snapshot.bodyVersion,
-          status: 'ready',
-          message: snapshot.message,
-        }
-      } catch (error) {
-        if (signal.aborted || isRepositoryLifecycleError(error)) throw error
-        return {
-          id: inspectedMessageId,
-          bodyVersion: selectedBodyVersion as number,
-          status: 'failed',
-        }
-      }
-    },
-    inspectedMessageId
-      ? {
-          id: inspectedMessageId,
-          bodyVersion: selectedBodyVersion as number,
-          status: 'loading',
-        }
-      : null,
-    inspectedMessageId ? primaryKeys('messageBodies', inspectedMessageId) : [],
-  )
-  const inspectedMessage = directInspectedPresentation
-    ? {
-        id: directInspectedPresentation.message.id,
-        bodyVersion: directInspectedPresentation.bodyVersion,
-        status: 'ready' as const,
-        message: directInspectedPresentation.message,
-      }
-    : queriedInspectedMessage
-
-  useEffect(() => {
-    if (
-      !verifyDirectInspectedPresentation ||
-      !inspectedMessageId ||
-      queriedInspectedMessage?.status !== 'ready' ||
-      queriedInspectedMessage.id !== inspectedMessageId
-    ) {
-      return
-    }
-    onPresentationSnapshotVerified?.(inspectedMessageId, {
-      message: queriedInspectedMessage.message,
-      bodyVersion: queriedInspectedMessage.bodyVersion,
-    })
-  }, [
-    inspectedMessageId,
-    onPresentationSnapshotVerified,
-    queriedInspectedMessage,
-    verifyDirectInspectedPresentation,
-  ])
-
-  useEffect(() => {
-    if (
-      previewScopeRef.current.chatId === chatId &&
-      previewScopeRef.current.repository === repository
-    ) {
-      return
-    }
-    previewScopeRef.current = { chatId, repository }
-    resetPreviewScope()
-  }, [chatId, repository, resetPreviewScope])
-
-  const previewKeyFor = useCallback(
-    (header: MessageHeaderRow) =>
-      `${workspaceRevision}\u0000${previewScopeEpochRef.current}\u0000${chatId}\u0000${header.id}\u0000${header.bodyVersion}`,
-    [chatId, workspaceRevision],
-  )
-
-  const cachedPreviewFor = useCallback(
-    (header: MessageHeaderRow): string | undefined => {
-      const key = previewKeyFor(header)
-      const cached = previewCacheRef.current.get(key)
-      return cached?.text
-    },
-    [previewKeyFor],
-  )
-
-  const loadPreview = useCallback(
-    (header: MessageHeaderRow): Promise<string> => {
-      const key = previewKeyFor(header)
-      const cache = previewCacheRef.current
-      const cached = cache.get(key)
-      if (cached) {
-        cache.delete(key)
-        cache.set(key, cached)
-        return Promise.resolve(cached.text)
-      }
-      const pending = pendingPreviewsRef.current.get(key)
-      if (pending) return pending
-      const pendingPreviews = pendingPreviewsRef.current
-      const directPresentation = exactPresentationForHeader(
-        presentationSnapshotsRef.current,
-        header,
-      )
-      const request = Promise.resolve(
-        directPresentation
-          ? previewTextFromContent(directPresentation.message.content, PREVIEW_TEXT_MAX_CHARS)
-          : repository.getMessageTextPreview(header.id, { maxChars: PREVIEW_TEXT_MAX_CHARS }),
-      )
-        .then((text) => text ?? '')
-        .then((text) => storePreview(cache, key, text))
-        .finally(() => pendingPreviews.delete(key))
-      pendingPreviews.set(key, request)
-      return request
-    },
-    [previewKeyFor, repository],
-  )
-
-  const pumpCompactPreviewQueue = useCallback(() => {
-    if (compactPreviewInFlightRef.current) return
-    const queued = compactPreviewQueuedRef.current
-    if (!queued || activePreviewKeyRef.current !== queued.key) {
-      compactPreviewQueuedRef.current = null
-      return
-    }
-    compactPreviewQueuedRef.current = null
-    const controller = new AbortController()
-    const request: CompactPreviewRequest = {
-      controller,
-      header: queued.header,
-      key: queued.key,
-    }
-    compactPreviewInFlightRef.current = request
-    const cache = previewCacheRef.current
-    const directPresentation = exactPresentationForHeader(
-      presentationSnapshotsRef.current,
-      request.header,
-    )
-    const read = directPresentation
-      ? Promise.resolve(
-          previewTextFromContent(directPresentation.message.content, PREVIEW_TEXT_MAX_CHARS),
-        )
-      : repository
-          .getMessageTextPreview(request.header.id, {
-            maxChars: PREVIEW_TEXT_MAX_CHARS,
-            signal: controller.signal,
-          })
-          .then((text) => text ?? '')
-    void read
-      .then((text) => {
-        if (controller.signal.aborted || previewCacheRef.current !== cache) return
-        const currentHeader = headerByIdRef.current.get(request.header.id)
-        if (!currentHeader || previewKeyFor(currentHeader) !== request.key) return
-        const retained = storePreview(cache, request.key, text)
-        if (activePreviewKeyRef.current === request.key) {
-          setActivePreview({
-            key: request.key,
-            messageId: request.header.id,
-            text: retained,
-          })
-        }
-      })
-      .catch(() => {
-        if (
-          !controller.signal.aborted &&
-          previewCacheRef.current === cache &&
-          activePreviewKeyRef.current === request.key
-        ) {
-          const currentHeader = headerByIdRef.current.get(request.header.id)
-          if (currentHeader && previewKeyFor(currentHeader) === request.key) {
-            setActivePreview({
-              key: request.key,
-              messageId: request.header.id,
-              failed: true,
-            })
+        : {
+            id: inspectedMessageId,
+            bodyVersion: selectedBodyVersion,
+            status: 'loading',
           }
-        }
-      })
-      .finally(() => {
-        if (compactPreviewInFlightRef.current === request) {
-          compactPreviewInFlightRef.current = null
-        }
-        pumpCompactPreviewQueueRef.current()
-      })
-  }, [previewKeyFor, repository])
-  pumpCompactPreviewQueueRef.current = pumpCompactPreviewQueue
-
-  const queueCompactPreview = useCallback(
-    (header: MessageHeaderRow, key: string) => {
-      const inFlight = compactPreviewInFlightRef.current
-      if (inFlight?.key === key && !inFlight.controller.signal.aborted) return
-      compactPreviewQueuedRef.current = { header, key }
-      if (inFlight) inFlight.controller.abort()
-      pumpCompactPreviewQueue()
-    },
-    [pumpCompactPreviewQueue],
-  )
-
-  const cancelCompactPreview = useCallback((key?: string) => {
-    if (!key || compactPreviewQueuedRef.current?.key === key) {
-      compactPreviewQueuedRef.current = null
-    }
-    const inFlight = compactPreviewInFlightRef.current
-    if (inFlight && (!key || inFlight.key === key)) inFlight.controller.abort()
-  }, [])
-
-  const schedulePreviewRevision = useCallback(() => {
-    if (previewRevisionTimerRef.current !== null) return
-    previewRevisionTimerRef.current = setTimeout(() => {
-      previewRevisionTimerRef.current = null
-      if (import.meta.env.MODE === 'test') branchTreeComputationProbe?.('preview-publish')
-      setPreviewRevision((revision) => revision + 1)
-    }, 0)
-  }, [])
-
-  const pumpExpandedPreviewQueue = useCallback(() => {
-    const queue = expandedPreviewQueueRef.current
-    const inFlight = expandedPreviewInFlightKeysRef.current
-    while (inFlight.size < EXPANDED_PREVIEW_CONCURRENCY) {
-      const next = queue.entries().next().value
-      if (!next) return
-      const [key, header] = next
-      queue.delete(key)
-      inFlight.add(key)
-      const cache = previewCacheRef.current
-      void loadPreview(header)
-        .catch(() => {
-          if (previewCacheRef.current === cache) {
-            storePreview(cache, key, 'Preview unavailable')
-          }
-        })
-        .finally(() => {
-          if (import.meta.env.MODE === 'test') branchTreeComputationProbe?.('preview-complete')
-          inFlight.delete(key)
-          if (expandedPreviewInFlightKeysRef.current !== inFlight) return
-          schedulePreviewRevision()
-          pumpExpandedPreviewQueue()
-        })
-    }
-  }, [loadPreview, schedulePreviewRevision])
 
   const rowStride = layoutOptions.nodeHeight + layoutOptions.verticalGap
   const firstVisibleDepth = Math.max(
@@ -1376,294 +824,194 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
     visibleMinX,
   ])
 
-  useEffect(() => {
-    const queue = expandedPreviewQueueRef.current
-    queue.clear()
-    if (!expanded) return
-    const inFlight = expandedPreviewInFlightKeysRef.current
-    for (const node of visibleNodes) {
-      const header = headerById.get(node.id)
-      if (!header || busyMessageIds.has(node.id) || cachedPreviewFor(header) !== undefined) continue
-      const key = previewKeyFor(header)
-      if (!inFlight.has(key)) queue.set(key, header)
+  const previewTargets = useMemo<TreePreviewTarget[]>(() => {
+    if (!bodyActive) return []
+    const targetIds = expanded
+      ? visibleNodes.map((node) => node.id)
+      : activePreview
+        ? [activePreview.messageId]
+        : []
+    const targets: TreePreviewTarget[] = []
+    for (const messageId of targetIds) {
+      const header = headerById.get(messageId)
+      if (!header || busyMessageIds.has(messageId)) continue
+      targets.push({ messageId, bodyVersion: header.bodyVersion })
     }
-    pumpExpandedPreviewQueue()
-  }, [
-    cachedPreviewFor,
-    busyMessageIds,
-    expanded,
-    headerById,
-    previewKeyFor,
-    pumpExpandedPreviewQueue,
-    visibleNodes,
-  ])
+    return targets
+  }, [activePreview, bodyActive, busyMessageIds, expanded, headerById, visibleNodes])
 
-  useEffect(
-    () => () => {
-      expandedPreviewQueueRef.current.clear()
-      compactPreviewQueuedRef.current = null
-      compactPreviewInFlightRef.current?.controller.abort()
-      if (previewRevisionTimerRef.current !== null) clearTimeout(previewRevisionTimerRef.current)
-      previewRevisionTimerRef.current = null
+  useConversationTreePreviewDemand(bodyActive ? chatId : null, previewTargets, controller)
+
+  const previewTextFor = useCallback(
+    (header: MessageHeaderRow): string | undefined => {
+      const preview = binding.previews.get(header.id)
+      return preview?.bodyVersion === header.bodyVersion ? preview.text : undefined
     },
-    [],
+    [binding.previews],
   )
 
   const openPreview = useCallback(
     (header: MessageHeaderRow) => {
       if (expanded) return
-      if (busyMessageIds.has(header.id)) {
-        cancelCompactPreview()
-        const key = `streaming\u0000${chatId}\u0000${header.id}`
-        activePreviewKeyRef.current = key
-        setActivePreview({ key, messageId: header.id, text: 'Streaming response…' })
-        return
-      }
-      const key = previewKeyFor(header)
-      const previousKey = activePreviewKeyRef.current
-      if (previousKey !== key) cancelCompactPreview(previousKey ?? undefined)
-      activePreviewKeyRef.current = key
-      const cached = cachedPreviewFor(header)
-      setActivePreview({
-        key,
-        messageId: header.id,
-        ...(cached === undefined ? {} : { text: cached }),
-      })
-      if (cached !== undefined) return
-      queueCompactPreview(header, key)
+      setActivePreview((current) =>
+        current?.messageId === header.id ? current : { messageId: header.id },
+      )
     },
-    [
-      busyMessageIds,
-      cachedPreviewFor,
-      cancelCompactPreview,
-      chatId,
-      expanded,
-      previewKeyFor,
-      queueCompactPreview,
-    ],
+    [expanded],
   )
 
   useEffect(() => {
-    if (expanded) {
-      if (!activePreview) return
-      cancelCompactPreview()
-      activePreviewKeyRef.current = null
-      setActivePreview(null)
+    if (!activePreview || (bodyActive && !expanded && headerById.has(activePreview.messageId))) {
       return
     }
-    if (!activePreview) return
-    const currentHeader = headerById.get(activePreview.messageId)
-    if (!currentHeader) {
-      cancelCompactPreview(activePreview.key)
-      activePreviewKeyRef.current = null
-      setActivePreview(null)
-      return
-    }
-    const currentKey = busyMessageIds.has(currentHeader.id)
-      ? `streaming\u0000${chatId}\u0000${currentHeader.id}`
-      : previewKeyFor(currentHeader)
-    if (currentKey !== activePreview.key) openPreview(currentHeader)
-  }, [
-    activePreview,
-    busyMessageIds,
-    cancelCompactPreview,
-    chatId,
-    expanded,
-    headerById,
-    openPreview,
-    previewKeyFor,
-  ])
+    setActivePreview(null)
+  }, [activePreview, bodyActive, expanded, headerById])
 
-  const closePreview = useCallback(
-    (messageId: MessageId) => {
-      if (activePreview?.messageId !== messageId) return
-      cancelCompactPreview(activePreview.key)
-      activePreviewKeyRef.current = null
-      setActivePreview(null)
-    },
-    [activePreview, cancelCompactPreview],
-  )
-
-  const cancelAutomaticFollow = useCallback(() => {
-    cancelEntryStreamFollow(entryStreamFollowRef.current)
-    requestLeafFollowTokenRef.current += 1
-    pendingRequestLeafFollowRef.current = null
+  const closePreview = useCallback((messageId: MessageId) => {
+    setActivePreview((current) => (current?.messageId === messageId ? null : current))
   }, [])
+
+  const automaticRevealId =
+    binding.currency === 'current' && binding.reveal?.chatId === chatId ? binding.reveal.id : null
+  const cancelAutomaticReveal = useCallback(() => {
+    if (automaticRevealId) controller.consumePresentationReveal(automaticRevealId, 'tree')
+  }, [automaticRevealId, controller])
 
   const selectMessage = useCallback(
     (messageId: MessageId) => {
-      cancelCompactPreview()
-      activePreviewKeyRef.current = null
       setActivePreview(null)
       setLocalSelectedNodeId(messageId)
       lastExternalSelectionRef.current = messageId
       onSelectNode?.(messageId)
     },
-    [cancelCompactPreview, onSelectNode],
+    [onSelectNode],
   )
 
   const inspectMessage = useCallback(
     (messageId: MessageId) => {
-      cancelAutomaticFollow()
+      cancelAutomaticReveal()
       selectMessage(messageId)
     },
-    [cancelAutomaticFollow, selectMessage],
+    [cancelAutomaticReveal, selectMessage],
   )
 
   const inspectAndCenterMessage = useCallback(
-    (messageId: MessageId) => {
+    (messageId: MessageId): boolean => {
       selectMessage(messageId)
-      centerNodeRef.current(messageId)
+      return centerNodeRef.current(messageId)
     },
     [selectMessage],
   )
 
-  const runRequestAndFollowLeaf = useCallback(
-    async (action: () => BranchTreeRequestTicket | undefined): Promise<void> => {
-      cancelAutomaticFollow()
-      const token = requestLeafFollowTokenRef.current + 1
-      requestLeafFollowTokenRef.current = token
-      const ticket = action()
-      if (!ticket) return
-      pendingRequestLeafFollowRef.current = {
-        token,
-        navigationRevision: ticket.navigationRevision,
-        initialStreamIds: new Set(useStreamStore.getState().listStreamIds()),
-      }
-      try {
-        const targetId = await ticket.completion
-        if (pendingRequestMatchesToken(pendingRequestLeafFollowRef.current, token) && targetId) {
-          pendingRequestLeafFollowRef.current = null
-          inspectAndCenterMessage(targetId)
-        }
-      } finally {
-        if (pendingRequestMatchesToken(pendingRequestLeafFollowRef.current, token)) {
-          pendingRequestLeafFollowRef.current = null
-        }
-      }
-    },
-    [cancelAutomaticFollow, inspectAndCenterMessage],
-  )
-
-  useEffect(() => {
-    const pending = pendingRequestLeafFollowRef.current
-    if (!pending || !activeLeafId) return
-    for (const stream of chatStreams) {
-      if (
-        stream.messageId !== activeLeafId ||
-        !streamOriginatesFromTabNavigation(
-          stream,
-          pending.navigationRevision,
-          getStreamClientId(),
-        ) ||
-        pending.initialStreamIds.has(stream.streamId)
-      ) {
-        continue
-      }
-      pendingRequestLeafFollowRef.current = null
-      inspectAndCenterMessage(activeLeafId)
+  const revealEffect = bodyActive ? binding.reveal : null
+  useLayoutEffect(() => {
+    if (
+      !revealEffect ||
+      revealEffect.chatId !== chatId ||
+      !layout.byId.has(revealEffect.targetMessageId)
+    ) {
       return
     }
-  }, [activeLeafId, chatStreams, inspectAndCenterMessage])
+    if (!inspectAndCenterMessage(revealEffect.targetMessageId)) return
+    controller.consumePresentationReveal(revealEffect.id, 'tree')
+  }, [chatId, controller, inspectAndCenterMessage, layout, revealEffect])
 
-  useEffect(() => {
-    const follow = entryStreamFollowRef.current
-    if (!follow || follow.chatId !== chatId || follow.state !== 'pending' || !activeLeafId) return
-    const streams = selectedPathStreams.filter(
-      (candidate) =>
-        (follow.streamIds.has(candidate.streamId) ||
-          (follow.acceptHydratedStream &&
-            (follow.acceptInitialHydration ||
-              wasStreamAdmittedBy(candidate.streamId, follow.admissionRevision)))) &&
-        candidate.messageId !== undefined &&
-        activePathIds.has(candidate.messageId) &&
-        layout.byId.has(candidate.messageId),
-    )
-    const stream =
-      streams.find((candidate) => candidate.messageId === activeLeafId) ??
-      mostRecentlyAdmittedStream(streams)
-    const messageId =
-      stream?.messageId ??
-      (follow.messageIds.has(activeLeafId) && layout.byId.has(activeLeafId)
-        ? activeLeafId
-        : undefined)
-    if (!messageId) return
-    follow.state = 'done'
-    inspectAndCenterMessage(messageId)
-  }, [activeLeafId, activePathIds, chatId, inspectAndCenterMessage, layout, selectedPathStreams])
-
-  useEffect(() => {
-    if (normalizedQuery.length === 0) {
-      lastSearchQueryRef.current = ''
-      setMatches([])
-      setMatchIndex(-1)
-      setSearching(false)
-      setSearchFailed(false)
+  const searchSyncRef = useRef<{
+    session: typeof searchSession
+    workspaceId: string
+    replacementEpoch: number
+    chatId: ChatId
+    query: string
+    topology: typeof projection
+    headerSource: BranchTreeHeaderLookup
+    busyIds: ReadonlySet<MessageId>
+  } | null>(null)
+  useLayoutEffect(() => {
+    searchSession.setActive(bodyActive)
+    if (!bodyActive) {
+      searchWasActiveRef.current = false
       return
     }
-    const queryChanged = lastSearchQueryRef.current !== normalizedQuery
-    lastSearchQueryRef.current = normalizedQuery
-    const previousCurrentId = currentMatchIdRef.current
-    const previousInspectedId = inspectedMessageIdRef.current
-    const requestRevision = searchRevision
-    const requestWorkspaceRevision = workspaceRevision
-    const controller = new AbortController()
-    setSearching(true)
-    setSearchFailed(false)
-    if (queryChanged) {
-      setMatches([])
-      setMatchIndex(-1)
+    const workspaceId = binding.seal.workspaceId
+    const previous = searchSyncRef.current
+    const fullSync =
+      !searchWasActiveRef.current ||
+      previous === null ||
+      previous.session !== searchSession ||
+      previous.workspaceId !== workspaceId ||
+      previous.replacementEpoch !== binding.seal.replacementEpoch ||
+      previous.chatId !== chatId ||
+      previous.query !== normalizedQuery ||
+      previous.topology !== projection
+    searchWasActiveRef.current = true
+    const targetsFor = (messageIds: readonly MessageId[]) =>
+      messageIds.flatMap((messageId) => {
+        const header = exactHeaderById.get(messageId)
+        if (!header) return []
+        const target = branchTreeSearchTarget(header)
+        return [{ ...target, pending: target.pending || busyMessageIds.has(messageId) }]
+      })
+    if (fullSync) {
+      searchSession.request({
+        workspaceId,
+        replacementEpoch: binding.seal.replacementEpoch,
+        chatId,
+        query: normalizedQuery,
+        targets: targetsFor(layout.nodes.map((node) => node.id)),
+      })
+    } else if (normalizedQuery.length > 0) {
+      const headerSourceChanged = previous.headerSource !== exactHeaderById
+      if (deliveredChangedHeaderKeys == null && headerSourceChanged) {
+        searchSession.replaceTopology(targetsFor(layout.nodes.map((node) => node.id)))
+      } else {
+        const changedIds = new Set<MessageId>(deliveredChangedHeaderKeys ?? [])
+        for (const messageId of previous.busyIds) {
+          if (!busyMessageIds.has(messageId)) changedIds.add(messageId)
+        }
+        for (const messageId of busyMessageIds) {
+          if (!previous.busyIds.has(messageId)) changedIds.add(messageId)
+        }
+        if (changedIds.size > 0) searchSession.observeTargets(targetsFor([...changedIds]))
+      }
     }
-    void repository
-      .searchChatMessageText(chatId, normalizedQuery, { signal: controller.signal })
-      .then((ids) => {
-        if (
-          controller.signal.aborted ||
-          requestRevision !== searchRevisionRef.current.value ||
-          requestWorkspaceRevision !== workspaceRevisionRef.current
-        ) {
-          return
-        }
-        const hitIds = new Set(ids)
-        const ordered = layout.nodes.filter((node) => hitIds.has(node.id)).map((node) => node.id)
-        const retainedIndex = queryChanged ? -1 : ordered.indexOf(previousCurrentId ?? '')
-        const nextIndex = ordered.length === 0 ? -1 : Math.max(0, retainedIndex)
-        const nextMessageId = nextIndex < 0 ? undefined : ordered[nextIndex]
-        setMatches(ordered)
-        setMatchIndex(nextIndex)
-        setSearching(false)
-        if (queryChanged && nextMessageId) {
-          inspectAndCenterMessage(nextMessageId)
-        } else if (
-          nextMessageId &&
-          previousCurrentId &&
-          previousInspectedId === previousCurrentId &&
-          nextMessageId !== previousCurrentId
-        ) {
-          inspectAndCenterMessage(nextMessageId)
-        }
-      })
-      .catch((error: unknown) => {
-        if (controller.signal.aborted || isAbortError(error)) return
-        if (queryChanged) {
-          setMatches([])
-          setMatchIndex(-1)
-        }
-        setSearching(false)
-        setSearchFailed(true)
-      })
-    return () => controller.abort()
+    searchSession.setInspectedMessageId(inspectedMessageId)
+    searchSyncRef.current = {
+      session: searchSession,
+      workspaceId,
+      replacementEpoch: binding.seal.replacementEpoch,
+      chatId,
+      query: normalizedQuery,
+      topology: projection,
+      headerSource: exactHeaderById,
+      busyIds: busyMessageIds,
+    }
   }, [
+    bodyActive,
+    busyMessageIds,
+    deliveredChangedHeaderKeys,
     chatId,
-    inspectAndCenterMessage,
+    binding.seal.replacementEpoch,
+    binding.seal.workspaceId,
+    exactHeaderById,
+    inspectedMessageId,
     layout,
     normalizedQuery,
-    repository,
-    searchRevision,
-    workspaceRevision,
+    projection,
+    searchSession,
   ])
 
   useEffect(() => {
+    if (!bodyActive) return
+    const revealRevision = visibleSearchSnapshot?.revealRevision ?? 0
+    if (revealRevision === 0 || revealRevision === handledSearchRevealRef.current) return
+    handledSearchRevealRef.current = revealRevision
+    if (visibleSearchSnapshot?.currentMatchId) {
+      inspectAndCenterMessage(visibleSearchSnapshot.currentMatchId)
+    }
+  }, [bodyActive, inspectAndCenterMessage, visibleSearchSnapshot])
+
+  useEffect(() => {
+    if (!bodyActive) return
     const focusSearch = (event: KeyboardEvent) => {
       if (
         !(event.metaKey || event.ctrlKey) ||
@@ -1678,26 +1026,38 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
     }
     window.addEventListener('keydown', focusSearch)
     return () => window.removeEventListener('keydown', focusSearch)
-  }, [])
+  }, [bodyActive])
 
   const goToMatch = useCallback(
     (direction: -1 | 1) => {
-      if (matches.length === 0) return
-      cancelAutomaticFollow()
-      const current = matchIndex < 0 ? 0 : matchIndex
-      const next = (current + direction + matches.length) % matches.length
-      setMatchIndex(next)
-      const messageId = matches[next]
-      if (messageId) inspectAndCenterMessage(messageId)
+      cancelAutomaticReveal()
+      const messageId = searchSession.move(direction)
+      if (!messageId) return
+      handledSearchRevealRef.current = searchSession.getSnapshot()?.revealRevision ?? 0
+      inspectAndCenterMessage(messageId)
     },
-    [cancelAutomaticFollow, inspectAndCenterMessage, matchIndex, matches],
+    [cancelAutomaticReveal, inspectAndCenterMessage, searchSession],
   )
 
   const clearSelection = useCallback(() => {
-    cancelAutomaticFollow()
+    cancelAutomaticReveal()
     setLocalSelectedNodeId(null)
     onSelectNode?.(null)
-  }, [cancelAutomaticFollow, onSelectNode])
+  }, [cancelAutomaticReveal, onSelectNode])
+
+  const settleBranchTreeAction = useCallback(
+    async (label: string, action: () => void | Promise<void>): Promise<void> => {
+      try {
+        await action()
+        setActionError(null)
+      } catch (error) {
+        setActionError(
+          `${label} failed: ${error instanceof Error ? error.message : 'Unknown error'}`,
+        )
+      }
+    },
+    [],
+  )
 
   useEffect(() => {
     if (!inspectedMessageId) return
@@ -1712,10 +1072,12 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
 
   const activateNode = useCallback(
     (messageId: MessageId) => {
-      cancelAutomaticFollow()
-      runAction(() => onActivateNode(messageId))
+      cancelAutomaticReveal()
+      return settleBranchTreeAction('Open branch', () =>
+        onActivateNode(messageId, layout.byId.get(messageId)?.newestLeafId),
+      )
     },
-    [cancelAutomaticFollow, onActivateNode],
+    [cancelAutomaticReveal, layout, onActivateNode, settleBranchTreeAction],
   )
 
   const setInspectorWidthFromClientX = useCallback((clientX: number) => {
@@ -1890,102 +1252,98 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
 
   const matchSet = useMemo(() => new Set(matches), [matches])
   const previewNode = activePreview ? layout.byId.get(activePreview.messageId) : undefined
+  const activePreviewHeader = activePreview ? headerById.get(activePreview.messageId) : undefined
+  const activePreviewText = activePreviewHeader
+    ? busyMessageIds.has(activePreviewHeader.id)
+      ? 'Streaming response…'
+      : previewTextFor(activePreviewHeader)
+    : undefined
   const readyInspectedMessage =
     inspectedMessage?.status === 'ready' &&
     inspectedMessage.bodyVersion === selectedBodyVersion &&
     inspectedMessage.message.id === liveSelectedHeader?.id
       ? inspectedMessage
       : undefined
-  if (readyInspectedMessage) {
-    retainedInspectedMessageRef.current = {
-      workspaceRevision,
-      repository,
-      chatId,
-      id: readyInspectedMessage.id,
-      bodyVersion: readyInspectedMessage.bodyVersion,
-      message: readyInspectedMessage.message,
-    }
-  }
-  const retainedInspectedMessage = retainedInspectedMessageRef.current
-  const retainedInspectorMatchesSelection =
-    retainedInspectedMessage?.workspaceRevision === workspaceRevision &&
-    retainedInspectedMessage.repository === repository &&
-    retainedInspectedMessage.chatId === chatId &&
-    retainedInspectedMessage.id === inspectedMessageId &&
-    retainedInspectedMessage.bodyVersion === selectedBodyVersion
-  const inspectorBody = readyInspectedMessage
-    ? readyInspectedMessage.message
-    : retainedInspectorMatchesSelection
-      ? retainedInspectedMessage.message
-      : undefined
-  const inspectorBodyVersion = readyInspectedMessage
-    ? readyInspectedMessage.bodyVersion
-    : retainedInspectorMatchesSelection
-      ? retainedInspectedMessage.bodyVersion
-      : undefined
+  const inspectorBody = readyInspectedMessage?.message
+  const inspectorBodyVersion = readyInspectedMessage?.bodyVersion
   const inspectorMessage = useMemo<Message | undefined>(() => {
     if (!inspectorBody || liveSelectedHeader?.id !== inspectorBody.id) return undefined
     return rebaseHydratedMessageHeader(inspectorBody, liveSelectedHeader)
   }, [inspectorBody, liveSelectedHeader])
+  const inspectorEditResendCapability =
+    inspectorMessage?.role === 'user'
+      ? generationCapabilityFrame.capability({
+          kind: 'edit-resend',
+          chatId,
+          targetUserId: inspectorMessage.id,
+        })
+      : pendingGenerationCapability('prompt-path')
+  const inspectorRegenerateCapability =
+    inspectorMessage?.role === 'assistant'
+      ? generationCapabilityFrame.capability({
+          kind: 'regenerate',
+          chatId,
+          targetAssistantId: inspectorMessage.id,
+        })
+      : pendingGenerationCapability('prompt-path')
+  const inspectorContinueCapability =
+    inspectorMessage?.role === 'assistant'
+      ? generationCapabilityFrame.capability({
+          kind: 'continue',
+          chatId,
+          targetAssistantId: inspectorMessage.id,
+        })
+      : pendingGenerationCapability('prompt-path')
   const handleInspectorActivate = useCallback(() => {
-    if (inspectedMessageId) activateNode(inspectedMessageId)
+    if (inspectedMessageId) void activateNode(inspectedMessageId)
   }, [activateNode, inspectedMessageId])
-  const handleInspectorEditAndSend = useCallback(
-    (message: Message, text: string) =>
-      runRequestAndFollowLeaf(() => onEditAndSendMessage?.(message, text)),
-    [onEditAndSendMessage, runRequestAndFollowLeaf],
-  )
-  const handleInspectorDelete = useCallback(() => {
-    if (inspectedMessageId) runAction(() => onDeleteNode?.(inspectedMessageId))
-  }, [inspectedMessageId, onDeleteNode])
-  const handleInspectorRegenerate = useCallback(() => {
-    if (inspectorMessage) {
-      return runRequestAndFollowLeaf(() => onRegenerateMessage?.(inspectorMessage))
+  const inspectorMessageActions = useMemo(() => {
+    if (!inspectorMessage) return {}
+    return {
+      ...(onDeleteNode ? { onDelete: () => onDeleteNode(inspectorMessage) } : {}),
+      ...(onForkMessage ? { onForkChat: () => onForkMessage(inspectorMessage) } : {}),
+      ...(onToggleMessageContextVisibility
+        ? {
+            onToggleContextVisibility: () => onToggleMessageContextVisibility(inspectorMessage),
+          }
+        : {}),
+      ...(onMutateMessageAttachmentRef
+        ? {
+            onMutateAttachmentRef: (mutation: MessageAttachmentRefMutation) =>
+              onMutateMessageAttachmentRef(inspectorMessage, mutation),
+          }
+        : {}),
+      ...(onToggleReasoningDetailHidden
+        ? {
+            onToggleReasoningDetailHidden: (member: ReasoningMemberRef) =>
+              onToggleReasoningDetailHidden(inspectorMessage, member),
+          }
+        : {}),
+      ...(onToggleProviderOutputItemHidden
+        ? {
+            onToggleProviderOutputItemHidden: (member: ProviderOutputMemberRef) =>
+              onToggleProviderOutputItemHidden(inspectorMessage, member),
+          }
+        : {}),
     }
-  }, [inspectorMessage, onRegenerateMessage, runRequestAndFollowLeaf])
-  const handleInspectorContinue = useCallback(() => {
-    if (inspectorMessage) {
-      return runRequestAndFollowLeaf(() => onContinueMessage?.(inspectorMessage))
-    }
-  }, [inspectorMessage, onContinueMessage, runRequestAndFollowLeaf])
-  const handleInspectorFork = useCallback(() => {
-    if (inspectorMessage) runAction(() => onForkMessage?.(inspectorMessage))
-  }, [inspectorMessage, onForkMessage])
-  const handleInspectorContextVisibility = useCallback(() => {
-    if (inspectorMessage) {
-      runAction(() => onToggleMessageContextVisibility?.(inspectorMessage))
-    }
-  }, [inspectorMessage, onToggleMessageContextVisibility])
-  const handleInspectorAttachmentMutation = useCallback(
-    (mutation: MessageAttachmentRefMutation) => {
-      if (inspectorMessage) {
-        runAction(() => onMutateMessageAttachmentRef?.(inspectorMessage, mutation))
-      }
-    },
-    [inspectorMessage, onMutateMessageAttachmentRef],
-  )
-  const handleInspectorReasoningVisibility = useCallback(
-    (index: number) => {
-      if (inspectorMessage) {
-        runAction(() => onToggleReasoningDetailHidden?.(inspectorMessage, index))
-      }
-    },
-    [inspectorMessage, onToggleReasoningDetailHidden],
-  )
-  const handleInspectorProviderItemVisibility = useCallback(
-    (index: number) => {
-      if (inspectorMessage) {
-        runAction(() => onToggleProviderOutputItemHidden?.(inspectorMessage, index))
-      }
-    },
-    [inspectorMessage, onToggleProviderOutputItemHidden],
-  )
+  }, [
+    inspectorMessage,
+    onDeleteNode,
+    onForkMessage,
+    onMutateMessageAttachmentRef,
+    onToggleMessageContextVisibility,
+    onToggleProviderOutputItemHidden,
+    onToggleReasoningDetailHidden,
+  ])
 
   return (
     <section
       className={className}
       data-ui="branch-tree-view"
       data-expanded={expanded}
+      data-presentation-only={!bodyActive || undefined}
+      inert={!bodyActive || undefined}
+      aria-busy={!bodyActive || undefined}
       aria-label="Chat tree"
     >
       <div data-ui="branch-tree-toolbar">
@@ -2003,7 +1361,7 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
             aria-busy={searching}
             data-ui="branch-tree-search-input"
             onChange={(event) => {
-              cancelAutomaticFollow()
+              cancelAutomaticReveal()
               setQuery(event.currentTarget.value)
             }}
             onKeyDown={(event) => {
@@ -2014,7 +1372,7 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
                 if (query.length > 0) {
                   event.preventDefault()
                   event.stopPropagation()
-                  cancelAutomaticFollow()
+                  cancelAutomaticReveal()
                   setQuery('')
                 }
               }
@@ -2026,7 +1384,7 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
               aria-label="Clear tree search"
               data-ui="branch-tree-search-clear"
               onClick={() => {
-                cancelAutomaticFollow()
+                cancelAutomaticReveal()
                 setQuery('')
                 searchInputRef.current?.focus()
               }}
@@ -2053,7 +1411,7 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
             type="button"
             aria-label="Previous matching message"
             data-ui="branch-tree-search-nav"
-            disabled={matches.length === 0}
+            disabled={!searchInteractive || matches.length === 0}
             onClick={() => goToMatch(-1)}
           >
             <ChevronIcon size={15} rotate={180} />
@@ -2062,25 +1420,46 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
             type="button"
             aria-label="Next matching message"
             data-ui="branch-tree-search-nav"
-            disabled={matches.length === 0}
+            disabled={!searchInteractive || matches.length === 0}
             onClick={() => goToMatch(1)}
           >
             <ChevronIcon size={15} />
           </Button>
         </search>
-        {toolbarStream && onAbort ? (
+        {toolbarStopCapability ? (
           <Button
             type="button"
             data-ui="branch-tree-stop"
-            aria-label="Stop generating"
-            title="Stop generating"
-            onClick={() => onAbort(toolbarStream.streamId)}
+            aria-label={
+              toolbarStopCapability.kind === 'requestable' ? 'Stop generating' : 'Stop requested'
+            }
+            title={
+              toolbarStopCapability.kind === 'requestable' ? 'Stop generating' : 'Stop requested'
+            }
+            disabled={toolbarStopCapability.kind !== 'requestable' || !onRequestStop}
+            onClick={() => {
+              if (toolbarStopCapability.kind === 'requestable') {
+                onRequestStop?.(toolbarStopCapability)
+              }
+            }}
           >
             <StopIcon size={14} />
-            <span>Stop</span>
+            <span>
+              {toolbarStopCapability.kind === 'requestable'
+                ? 'Stop'
+                : toolbarStopCapability.kind === 'requesting'
+                  ? 'Stop requested…'
+                  : 'Stopping…'}
+            </span>
           </Button>
         ) : null}
       </div>
+
+      {actionError ? (
+        <div role="alert" data-ui="branch-tree-action-error">
+          {actionError}
+        </div>
+      ) : null}
 
       <div
         ref={workspaceRef}
@@ -2172,7 +1551,9 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
                             }}
                             onBlur={() => setHoveredConnectorKey(null)}
                             onActivate={() => {
-                              runAction(() => onInsertAtSharedTrunk(connector.parentId))
+                              void settleBranchTreeAction('Insert message', () =>
+                                onInsertAtSharedTrunk(connector.parentId),
+                              )
                             }}
                           >
                             {streamBusy ? (
@@ -2212,7 +1593,9 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
                             }}
                             onBlur={() => setHoveredConnectorKey(null)}
                             onActivate={() => {
-                              runAction(() => onInsertAtChildLeg(connector.childId))
+                              void settleBranchTreeAction('Insert message', () =>
+                                onInsertAtChildLeg(connector.childId),
+                              )
                             }}
                           >
                             {streamBusy ? (
@@ -2255,7 +1638,9 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
                             }}
                             onBlur={() => setHoveredConnectorKey(null)}
                             onActivate={() => {
-                              runAction(() => onInsertAfterLeaf(node.id))
+                              void settleBranchTreeAction('Insert message', () =>
+                                onInsertAfterLeaf(node.id),
+                              )
                             }}
                           >
                             {streamBusy ? (
@@ -2286,7 +1671,7 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
                     const header = headerById.get(node.id)
                     if (!header) return null
                     const streaming = busyMessageIds.has(node.id)
-                    const cachedPreview = streaming ? undefined : cachedPreviewFor(header)
+                    const cachedPreview = streaming ? undefined : previewTextFor(header)
                     const previewText = streaming
                       ? 'Streaming response…'
                       : cachedPreview === undefined
@@ -2302,7 +1687,7 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
                     return (
                       <g key={node.id} transform={`translate(${node.x} ${node.y})`}>
                         <a
-                          href={chatHref(chatId, node.id)}
+                          href={chatHref(chatId, node.newestLeafId)}
                           rel="noopener"
                           data-ui="branch-tree-node"
                           data-message-id={node.id}
@@ -2332,7 +1717,7 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
                           }}
                           onDoubleClick={(event) => {
                             event.preventDefault()
-                            activateNode(node.id)
+                            void activateNode(node.id)
                           }}
                           onPointerEnter={() => openPreview(header)}
                           onPointerLeave={(event) => {
@@ -2356,11 +1741,6 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
                                 text={previewText}
                                 width={node.width}
                                 fontFamily={previewFontFamily}
-                                cacheKey={
-                                  streaming || cachedPreview === undefined
-                                    ? undefined
-                                    : previewKeyFor(header)
-                                }
                               />
                             </Suspense>
                           ) : null}
@@ -2381,8 +1761,7 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
                       <BranchTreePreview
                         kind="hover"
                         role={previewNode.source.role}
-                        text={activePreview.text}
-                        failed={activePreview.failed}
+                        text={activePreviewText}
                         node={previewNode}
                         viewport={viewport}
                         graphOffsetX={graphOffsetX}
@@ -2432,43 +1811,31 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
                   <BranchTreeInspector
                     key={inspectorMessage.id}
                     message={inspectorMessage}
+                    presentationFence={binding.seal}
                     bodyVersion={inspectorBodyVersion as number}
-                    bodyReady={readyInspectedMessage !== undefined}
+                    bodyReady={exactInspectorBodyReady}
                     searchQuery={normalizedQuery}
                     searchMatched={matchSet.has(inspectedMessageId)}
-                    hasConnection={hasConnection}
+                    editResendCapability={inspectorEditResendCapability}
+                    regenerateCapability={inspectorRegenerateCapability}
+                    continueCapability={inspectorContinueCapability}
                     streamOnActivePath={activePathIds.has(inspectedMessageId)}
                     onClose={clearSelection}
                     onActivate={handleInspectorActivate}
                     {...(onEditMessage ? { onEdit: onEditMessage } : {})}
-                    {...(onEditAndSendMessage ? { onEditAndSend: handleInspectorEditAndSend } : {})}
-                    {...(onDeleteNode ? { onDelete: handleInspectorDelete } : {})}
-                    {...(onRegenerateMessage ? { onRegenerate: handleInspectorRegenerate } : {})}
-                    {...(onContinueMessage ? { onContinue: handleInspectorContinue } : {})}
-                    {...(onForkMessage ? { onForkChat: handleInspectorFork } : {})}
-                    {...(onToggleMessageContextVisibility
-                      ? { onToggleContextVisibility: handleInspectorContextVisibility }
+                    {...(onEditAndSendMessage ? { onEditAndSend: onEditAndSendMessage } : {})}
+                    {...(onRegenerateMessage
+                      ? { onRegenerate: () => onRegenerateMessage(inspectorMessage) }
                       : {})}
-                    {...(onMutateMessageAttachmentRef
-                      ? { onMutateAttachmentRef: handleInspectorAttachmentMutation }
+                    {...(onContinueMessage
+                      ? { onContinue: () => onContinueMessage(inspectorMessage) }
                       : {})}
-                    {...(onToggleReasoningDetailHidden
-                      ? { onToggleReasoningDetailHidden: handleInspectorReasoningVisibility }
-                      : {})}
-                    {...(onToggleProviderOutputItemHidden
-                      ? {
-                          onToggleProviderOutputItemHidden: handleInspectorProviderItemVisibility,
-                        }
-                      : {})}
+                    {...inspectorMessageActions}
                   />
                 </Suspense>
               ) : (
-                <div role="status" data-ui="branch-tree-inspector-status" data-state="error">
-                  {inspectedMessage.status === 'missing'
-                    ? 'This message is no longer available.'
-                    : inspectedMessage.status === 'failed'
-                      ? 'Could not load this message.'
-                      : 'Loading message…'}
+                <div role="status" data-ui="branch-tree-inspector-status">
+                  Loading message…
                 </div>
               )}
             </div>
@@ -2479,12 +1846,7 @@ const BranchTreeViewComponent = memo(function BranchTreeView({
   )
 })
 
-export const BranchTreeView = BranchTreeViewComponent as typeof BranchTreeViewComponent & {
-  __setComputationProbeForTests: (probe: BranchTreeComputationProbe | undefined) => void
-}
-if (import.meta.env.MODE === 'test') {
-  BranchTreeView.__setComputationProbeForTests = setBranchTreeComputationProbeForTests
-}
+export const BranchTreeView = ActiveBranchTreeView
 
 function BranchTreeAddMarker({
   ui,

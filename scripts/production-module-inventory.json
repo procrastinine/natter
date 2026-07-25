@@ -1,0 +1,887 @@
+{
+  "schemaVersion": 1,
+  "classifications": [
+    {
+      "domain": "provider-io",
+      "layer": "boundary-types",
+      "responsibility": "Validate provider payloads, normalize errors, and define transport-facing types and stream integrity state.",
+      "paths": [
+        "src/api/anthropic-types.ts",
+        "src/api/errors.ts",
+        "src/api/gemini-types.ts",
+        "src/api/provider-json-boundary.ts",
+        "src/api/stream-integrity.ts",
+        "src/api/types.ts"
+      ]
+    },
+    {
+      "domain": "provider-io",
+      "layer": "request-adapter",
+      "responsibility": "Prepare provider request options and transform domain request plans into provider wire shapes.",
+      "paths": [
+        "src/api/call-opts.ts",
+        "src/api/deferred-request.ts",
+        "src/api/request-transforms.ts"
+      ]
+    },
+    {
+      "domain": "provider-io",
+      "layer": "transport-adapter",
+      "responsibility": "Execute provider-specific generation protocols without owning application generation state.",
+      "paths": [
+        "src/api/anthropic-messages.ts",
+        "src/api/chat-completions.ts",
+        "src/api/gemini-native.ts",
+        "src/api/responses.ts",
+        "src/api/text-completions.ts",
+        "src/api/video-generation.ts"
+      ]
+    },
+    {
+      "domain": "provider-io",
+      "layer": "stream-adapter",
+      "responsibility": "Provide the unified assistant stream facade and translate SSE/provider events into normalized lanes and generated output.",
+      "paths": [
+        "src/api/assistant-lanes.ts",
+        "src/api/assistant-stream.ts",
+        "src/api/generated-output.ts",
+        "src/api/provider-stream-runtime.ts",
+        "src/api/sse.ts",
+        "src/api/stream-transforms.ts"
+      ]
+    },
+    {
+      "domain": "provider-discovery",
+      "layer": "transport-adapter",
+      "responsibility": "Fetch provider catalogs, endpoint metadata, probes, and privacy metadata through the external API boundary.",
+      "paths": [
+        "src/api/client.ts",
+        "src/api/models.ts",
+        "src/api/privacy-scrape.ts",
+        "src/api/probe.ts",
+        "src/api/providers.ts"
+      ]
+    },
+    {
+      "domain": "application-shell",
+      "layer": "composition",
+      "responsibility": "Compose the browser application, workspace lifecycle, and top-level shell surfaces.",
+      "paths": ["src/app/App.tsx", "src/app/Shell.tsx", "src/app/WorkspaceBootstrap.tsx"]
+    },
+    {
+      "domain": "application-shell",
+      "layer": "application",
+      "responsibility": "Translate route and conversation UI intents into application navigation and conversation actions.",
+      "paths": [
+        "src/app/conversation-actions-capability.ts",
+        "src/app/conversation-actions.ts",
+        "src/app/router.ts"
+      ]
+    },
+    {
+      "domain": "schema-evolution",
+      "layer": "migration",
+      "responsibility": "Run version-gated legacy data normalization and one-time repair before current-schema runtime use.",
+      "paths": [
+        "src/backcompat/attachment-header-projection.ts",
+        "src/backcompat/attachment-reference-edges.ts",
+        "src/backcompat/attachment-refs.ts",
+        "src/backcompat/batched-table.ts",
+        "src/backcompat/browser-writer-lock.ts",
+        "src/backcompat/canonical-stream-event-v1.ts",
+        "src/backcompat/chat-preview-projection.ts",
+        "src/backcompat/chat-settings.ts",
+        "src/backcompat/chat-sidebar-projection.ts",
+        "src/backcompat/child-lists.ts",
+        "src/backcompat/generated-output-attachments.ts",
+        "src/backcompat/generation-attempt-outcomes.ts",
+        "src/backcompat/generation-stream-events-v1.ts",
+        "src/backcompat/global-settings.ts",
+        "src/backcompat/import-export.ts",
+        "src/backcompat/message-body-split.ts",
+        "src/backcompat/message-body-version.ts",
+        "src/backcompat/message-header-projections.ts",
+        "src/backcompat/message-request-context-version.ts",
+        "src/backcompat/persisted-stream-event-v1.ts",
+        "src/backcompat/preset-sort-order.ts",
+        "src/backcompat/provider-api-modes.ts",
+        "src/backcompat/provider-output-items.ts",
+        "src/backcompat/provider-settings-migration.ts",
+        "src/backcompat/provider-tools.ts",
+        "src/backcompat/reasoning-carriers-v80.ts",
+        "src/backcompat/reasoning-contract-normalizer-v92.ts",
+        "src/backcompat/reasoning-envelope-v1.ts",
+        "src/backcompat/reasoning-envelope-v89.ts",
+        "src/backcompat/reasoning-journal-persistence-v93.ts",
+        "src/backcompat/run-once.ts",
+        "src/backcompat/saved-text-template-rows.ts",
+        "src/backcompat/storage-compaction-control.ts",
+        "src/backcompat/storage-compaction-state-v2.ts",
+        "src/backcompat/stream-journal-frames.ts",
+        "src/backcompat/stream-journal-semantics-v89.ts",
+        "src/backcompat/stream-lease-attempts.ts",
+        "src/backcompat/stream-lease-schema-versions.ts",
+        "src/backcompat/token-calibration-global.ts",
+        "src/backcompat/wave-a-derived-storage-v94.ts",
+        "src/backcompat/wave-a-message-storage-v94.ts",
+        "src/backcompat/wave-a-preset-order-v94.ts",
+        "src/backcompat/wave-a-storage-capabilities-v94.ts",
+        "src/backcompat/wave-a-storage-epoch-v94.ts",
+        "src/backcompat/wave-a-stream-storage-v94.ts",
+        "src/backcompat/workspace-meta.ts",
+        "src/store/browser-workspace-derived-repair.ts"
+      ]
+    },
+    {
+      "domain": "provider-configuration",
+      "layer": "capability-registry",
+      "responsibility": "Define static direct-provider capability facts that live discovery cannot supply.",
+      "paths": [
+        "src/capabilities/anthropic.ts",
+        "src/capabilities/custom.ts",
+        "src/capabilities/google.ts",
+        "src/capabilities/index.ts",
+        "src/capabilities/llama-server.ts",
+        "src/capabilities/openai.ts",
+        "src/capabilities/types.ts"
+      ]
+    },
+    {
+      "domain": "conversation",
+      "layer": "domain-model",
+      "responsibility": "Define branch identity, tree topology, cursor semantics, structural operations, and message projections as pure domain logic.",
+      "paths": [
+        "src/core/active-branch-spine.ts",
+        "src/core/active-path.ts",
+        "src/core/branch-flatten.ts",
+        "src/core/branch-session.ts",
+        "src/core/branch-tree-layout.ts",
+        "src/core/chat-fork.ts",
+        "src/core/chat-metadata.ts",
+        "src/core/child-list-state.ts",
+        "src/core/message-content.ts",
+        "src/core/message-topology.ts",
+        "src/core/message-tree-index.ts",
+        "src/core/messages.ts",
+        "src/core/tree-ops.ts"
+      ]
+    },
+    {
+      "domain": "generation",
+      "layer": "domain-model",
+      "responsibility": "Define generation attempts, context assembly, prompt budgeting, streaming accumulation, and token accounting independently of storage and UI.",
+      "paths": [
+        "src/core/api-choice.ts",
+        "src/core/assistant-planning-resources.ts",
+        "src/core/attempt-outcome.ts",
+        "src/core/context-budget.ts",
+        "src/core/context-cutoff.ts",
+        "src/core/context-selection.ts",
+        "src/core/continuation-attempt.ts",
+        "src/core/continuation-content.ts",
+        "src/core/continue-prompts.ts",
+        "src/core/canonical-stream-event.ts",
+        "src/core/generation-stream-events.ts",
+        "src/core/generation-stream-live-events.ts",
+        "src/core/media-context-tokens.ts",
+        "src/core/media-tokens.ts",
+        "src/core/outbound-reasoning.ts",
+        "src/core/prompt-context.ts",
+        "src/core/prompt-size.ts",
+        "src/core/reasoning-envelope.ts",
+        "src/core/reasoning-observation.ts",
+        "src/core/stream-accumulator.ts",
+        "src/core/token-calibration.ts",
+        "src/core/token-guards.ts",
+        "src/core/tokens.ts",
+        "src/core/transcript-work-budget.ts"
+      ]
+    },
+    {
+      "domain": "presentation-state",
+      "layer": "domain-model",
+      "responsibility": "Define exact pending, absent, ready, and blocked interaction capability semantics shared by application and presentation layers.",
+      "paths": ["src/core/interaction-capability.ts"]
+    },
+    {
+      "domain": "attachments",
+      "layer": "domain-model",
+      "responsibility": "Define attachment references, processing, media context, generated-output localization, content annotations, and image allowlisting.",
+      "paths": [
+        "src/core/attachment-refs.ts",
+        "src/core/attachments/context.ts",
+        "src/core/attachments/openrouter.ts",
+        "src/core/attachments/process.ts",
+        "src/core/attachments/process-runtime.ts",
+        "src/core/attachments/stored-openrouter.ts",
+        "src/core/attachments/types.ts",
+        "src/core/content-annotations.ts",
+        "src/core/generated-output-localization.ts",
+        "src/core/image-allowlist.ts"
+      ]
+    },
+    {
+      "domain": "provider-configuration",
+      "layer": "domain-policy",
+      "responsibility": "Own model selection, provider identity, privacy, reasoning, defaults, settings, and provider-quirk policy.",
+      "paths": [
+        "src/core/cache-keys.ts",
+        "src/core/capabilities.ts",
+        "src/core/connection-defaults.ts",
+        "src/core/connection-dispatch-proof.ts",
+        "src/core/cors-proxy.ts",
+        "src/core/defaults.ts",
+        "src/core/global-settings.ts",
+        "src/core/key-dispatch-proof.ts",
+        "src/core/latest-models.ts",
+        "src/core/model-ids.ts",
+        "src/core/model-predicates.ts",
+        "src/core/model-selection.ts",
+        "src/core/effective-endpoint-routing.ts",
+        "src/core/privacy-fallbacks.ts",
+        "src/core/privacy-filter.ts",
+        "src/core/privacy.ts",
+        "src/core/provider-defaults.ts",
+        "src/core/provider-hosted-tools.ts",
+        "src/core/provider-identity.ts",
+        "src/core/provider-tool-context.ts",
+        "src/core/quirks.ts",
+        "src/core/reasoning-inline.ts",
+        "src/core/reasoning.ts",
+        "src/core/rendering-preferences.ts",
+        "src/core/stale-reasoning.ts",
+        "src/core/text-templates.ts"
+      ]
+    },
+    {
+      "domain": "interchange",
+      "layer": "domain-model",
+      "responsibility": "Define portable workspace/chat interchange schemas, validation, flattening, attachment reachability, and credential envelopes.",
+      "paths": [
+        "src/core/import-export/attachment-reachability.ts",
+        "src/core/import-export/errors.ts",
+        "src/core/import-export/flatten.ts",
+        "src/core/import-export/row-validation.ts",
+        "src/core/import-export/schema.ts",
+        "src/core/import-export/workspace-credentials.ts",
+        "src/core/import-export/workspace-validation.ts"
+      ]
+    },
+    {
+      "domain": "catalog",
+      "layer": "domain-policy",
+      "responsibility": "Define pure query parsing, sidebar ordering, and lightweight text metrics used by catalog and presentation surfaces.",
+      "paths": ["src/core/search-query.ts", "src/core/sidebar-sort.ts", "src/core/word-count.ts"]
+    },
+    {
+      "domain": "shared-contracts",
+      "layer": "boundary-types",
+      "responsibility": "Define current-schema cross-domain data contracts.",
+      "paths": ["src/core/types.ts"]
+    },
+    {
+      "domain": "conversation",
+      "layer": "presentation-adapter",
+      "responsibility": "Bind React to active branch frames, per-tab cursors, transcript demand, and stream projections.",
+      "paths": [
+        "src/hooks/useActiveBranchFrame.ts",
+        "src/hooks/useConversationCursor.ts",
+        "src/hooks/useConversationFrame.ts",
+        "src/hooks/useMessageStreamProjection.ts"
+      ]
+    },
+    {
+      "domain": "provider-configuration",
+      "layer": "presentation-adapter",
+      "responsibility": "Bind React to model discovery, configuration preferences, settled edits, prompt estimates, and text-template state.",
+      "paths": [
+        "src/hooks/model-catalog-projection.ts",
+        "src/hooks/useConfigurationCatalog.ts",
+        "src/hooks/useConfigurationPreferences.ts",
+        "src/hooks/useModelCatalog.ts",
+        "src/hooks/usePromptEstimateContext.ts",
+        "src/hooks/useSettledConfigurationEdit.ts",
+        "src/hooks/useStreamStablePromptEstimate.ts",
+        "src/hooks/useTextTemplateLibrary.ts"
+      ]
+    },
+    {
+      "domain": "catalog",
+      "layer": "presentation-adapter",
+      "responsibility": "Bind React to sidebar, storage, and attachment catalog application sessions.",
+      "paths": [
+        "src/hooks/useAttachmentSearchSession.ts",
+        "src/hooks/useCatalogApplication.ts",
+        "src/hooks/useStorageCatalogApplication.ts"
+      ]
+    },
+    {
+      "domain": "shared-runtime",
+      "layer": "platform-adapter",
+      "responsibility": "Wrap browser lifecycle, storage, cancellation, publication, cooperative yielding, and destructive storage primitives.",
+      "paths": [
+        "src/lib/abort.ts",
+        "src/lib/browser-storage.ts",
+        "src/lib/origin-storage-names.ts",
+        "src/lib/page-lifecycle.ts",
+        "src/lib/preload-recovery.ts",
+        "src/lib/react-publication.ts",
+        "src/lib/storage-wipe.ts",
+        "src/lib/yield-to-event-loop.ts"
+      ]
+    },
+    {
+      "domain": "diagnostics",
+      "layer": "observability",
+      "responsibility": "Provide bounded debug telemetry, redaction, assertions, and error normalization without owning product state.",
+      "paths": [
+        "src/lib/assert.ts",
+        "src/lib/debug-scroll.ts",
+        "src/lib/debug-streams.ts",
+        "src/lib/diagnostic-redaction.ts",
+        "src/lib/error.ts"
+      ]
+    },
+    {
+      "domain": "shared-runtime",
+      "layer": "data-structure",
+      "responsibility": "Provide bounded reusable identifiers and persistent collection primitives.",
+      "paths": ["src/lib/persistent-string-map.ts", "src/lib/same-value.ts", "src/lib/ulid.ts"]
+    },
+    {
+      "domain": "attachments",
+      "layer": "application",
+      "responsibility": "Coordinate attachment commands, catalog projections, search/detail sessions, and media object lifetimes.",
+      "paths": [
+        "src/store/attachment-application.ts",
+        "src/store/attachment-bulk-delete.ts",
+        "src/store/attachment-catalog-projection.ts",
+        "src/store/attachment-catalog-workspace.ts",
+        "src/store/attachment-detail-session.ts",
+        "src/store/attachment-object-url.ts",
+        "src/store/attachment-projection-controller.ts",
+        "src/store/attachment-search-session.ts",
+        "src/store/generated-output-localization-capability.ts"
+      ]
+    },
+    {
+      "domain": "attachments",
+      "layer": "persistence",
+      "responsibility": "Own attachment bytes, reference indexes, integrity repair, storage codecs, and generated-output localization writes.",
+      "paths": [
+        "src/store/attachment-integrity-maintenance.ts",
+        "src/store/attachment-reference-edges.ts",
+        "src/store/attachment-refs.ts",
+        "src/store/attachment-storage.ts",
+        "src/store/attachments.ts",
+        "src/store/byte-owner-mutation.ts",
+        "src/store/generated-images.ts",
+        "src/store/generated-output-localization-runtime.ts"
+      ]
+    },
+    {
+      "domain": "generation",
+      "layer": "application",
+      "responsibility": "Own attempt admission, planning, execution, projections, recovery, and the stable presentation-facing attempt controller.",
+      "paths": [
+        "src/store/attempt-controller.ts",
+        "src/store/attempt-availability.ts",
+        "src/store/attempt-control-application.ts",
+        "src/store/attempt-terminalization.ts",
+        "src/store/attempt-workspace.ts",
+        "src/store/generation-admission-controller.ts",
+        "src/store/generation-admission.ts",
+        "src/store/generation-attempt-runner.ts",
+        "src/store/generation-capability-controller.ts",
+        "src/store/generation-engine.ts",
+        "src/store/generation-planning-reader.ts",
+        "src/store/generation-prompt-material.ts",
+        "src/store/generation-projection.ts",
+        "src/store/request-plan-diagnostics.ts",
+        "src/store/request-planning.ts",
+        "src/store/request-privacy-planning.ts",
+        "src/store/send-context.ts",
+        "src/store/stream-recovery-capability.ts"
+      ]
+    },
+    {
+      "domain": "generation",
+      "layer": "persistence",
+      "responsibility": "Persist streaming journals, leases, chunk commits, recovery state, and token calibration under transaction ordering.",
+      "paths": [
+        "src/store/quota.ts",
+        "src/store/persisted-stream-event.ts",
+        "src/store/stream-chunk-writer.ts",
+        "src/store/stream-journal-codec.ts",
+        "src/store/stream-journal-integrity.ts",
+        "src/store/stream-journal-storage.ts",
+        "src/store/stream-lease-policy.ts",
+        "src/store/stream-leases.ts",
+        "src/store/stream-recovery.ts",
+        "src/store/token-calibration.ts"
+      ]
+    },
+    {
+      "domain": "conversation",
+      "layer": "application",
+      "responsibility": "Coordinate conversation commands, branch/tree sessions, selection, metadata, fork/export, and structural undo.",
+      "paths": [
+        "src/store/branch-flatten.ts",
+        "src/store/branch-text.ts",
+        "src/store/branch-tree-search-contract.ts",
+        "src/store/branch-tree-search-runtime.ts",
+        "src/store/branch-tree-search-session.ts",
+        "src/store/branch-tree-session-workspace.ts",
+        "src/store/chat-export.ts",
+        "src/store/chat-fork.ts",
+        "src/store/chat-metadata-application.ts",
+        "src/store/conversation-command-client.ts",
+        "src/store/conversation-controller.ts",
+        "src/store/conversation-destination-seal.ts",
+        "src/store/conversation-repository-adapter.ts",
+        "src/store/conversation-route-owner.ts",
+        "src/store/conversation-workspace.ts",
+        "src/store/structural-undo-contract.ts",
+        "src/store/structural-undo-repository.ts",
+        "src/store/transcript-window.ts"
+      ]
+    },
+    {
+      "domain": "conversation",
+      "layer": "persistence",
+      "responsibility": "Persist message bodies, topology projections, chat metadata, active spines, and storage ownership invariants.",
+      "paths": [
+        "src/store/browser-active-branch-spine.ts",
+        "src/store/chat-storage-codec.ts",
+        "src/store/chat-storage-ownership.ts",
+        "src/store/chats.ts",
+        "src/store/child-list-projection.ts",
+        "src/store/message-command-repository.ts",
+        "src/store/message-storage.ts"
+      ]
+    },
+    {
+      "domain": "catalog",
+      "layer": "application",
+      "responsibility": "Own browse/search transitions and bounded sidebar, message-corpus, and tab-local catalog sessions.",
+      "paths": [
+        "src/store/catalog-application.ts",
+        "src/store/catalog-query-transition.ts",
+        "src/store/catalog-session-workspace.ts",
+        "src/store/chat-search.ts",
+        "src/store/message-corpus-search.ts",
+        "src/store/message-search-service.ts",
+        "src/store/search-session.ts",
+        "src/store/sidebar-session.ts",
+        "src/store/tab-catalog-session.ts"
+      ]
+    },
+    {
+      "domain": "catalog",
+      "layer": "projection",
+      "responsibility": "Build bounded browser catalog and sidebar projections without hydrating cold message bodies.",
+      "paths": [
+        "src/store/browser-catalog-queries.ts",
+        "src/store/chat-sidebar-projection.ts",
+        "src/store/sidebar-preferences.ts"
+      ]
+    },
+    {
+      "domain": "organization",
+      "layer": "persistence",
+      "responsibility": "Persist chat folders and tags used by catalog organization.",
+      "paths": ["src/store/folders.ts", "src/store/tags.ts"]
+    },
+    {
+      "domain": "provider-configuration",
+      "layer": "application",
+      "responsibility": "Own configuration commands, target projections, onboarding/probes, discovery coordination, preferences, and new-chat seeds.",
+      "paths": [
+        "src/store/configuration-application.ts",
+        "src/store/configuration-catalog-projection.ts",
+        "src/store/configuration-catalog-session.ts",
+        "src/store/configuration-command-client.ts",
+        "src/store/configuration-controller.ts",
+        "src/store/configuration-discovery-coordinator.ts",
+        "src/store/configuration-domain-contract.ts",
+        "src/store/configuration-domain.ts",
+        "src/store/configuration-errors.ts",
+        "src/store/configuration-profile-usage-projection.ts",
+        "src/store/configuration-workspace.ts",
+        "src/store/connection-onboarding.ts",
+        "src/store/connection-probe-application.ts",
+        "src/store/connection-probe-capability.ts",
+        "src/store/connection-probe-contract.ts",
+        "src/store/connection-probe-planning.ts",
+        "src/store/connection-runtime.ts",
+        "src/store/new-chat-seed.ts",
+        "src/store/preferences-application.ts",
+        "src/store/prompt-estimate-context-controller.ts",
+        "src/store/prompt-estimate-context-workspace.ts"
+      ]
+    },
+    {
+      "domain": "provider-configuration",
+      "layer": "persistence",
+      "responsibility": "Persist configuration, keys, text templates, and bounded model/privacy discovery caches.",
+      "paths": [
+        "src/store/browser-configuration-domain.ts",
+        "src/store/discovery-cache-policy.ts",
+        "src/store/discovery-cache-storage.ts",
+        "src/store/discovery-service.ts",
+        "src/store/global-settings.ts",
+        "src/store/key-preparation-contract.ts",
+        "src/store/keys.ts",
+        "src/store/models-cache.ts",
+        "src/store/preset-order.ts",
+        "src/store/privacy-cache.ts",
+        "src/store/settings.ts",
+        "src/store/text-template-storage.ts"
+      ]
+    },
+    {
+      "domain": "interchange",
+      "layer": "application",
+      "responsibility": "Coordinate portable import/export validation, browser persistence, and user-facing interchange operations.",
+      "paths": [
+        "src/store/browser-import-export.ts",
+        "src/store/import-export-contract.ts",
+        "src/store/import-export.ts",
+        "src/store/interchange-application.ts"
+      ]
+    },
+    {
+      "domain": "workspace",
+      "layer": "repository-adapter",
+      "responsibility": "Implement browser repository queries/mutations, physical schema, reactive reads, key ranges, and transaction-safe database access.",
+      "paths": [
+        "src/store/browser-command-mutation-journal.ts",
+        "src/store/browser-catalog-command-runtime.ts",
+        "src/store/browser-domain-mutations.ts",
+        "src/store/browser-generation-command-runtime.ts",
+        "src/store/browser-lock-record.ts",
+        "src/store/browser-mutation-plan.ts",
+        "src/store/browser-mutation-runtime.ts",
+        "src/store/browser-query-pages.ts",
+        "src/store/browser-repo.ts",
+        "src/store/browser-workspace-schema-v94.ts",
+        "src/store/bounded-idb-cursor.ts",
+        "src/store/chat-row-transition.ts",
+        "src/store/db-rows.ts",
+        "src/store/db.ts",
+        "src/store/indexeddb-key-ranges.ts",
+        "src/store/physical-storage-tables.ts",
+        "src/store/repository.ts"
+      ]
+    },
+    {
+      "domain": "workspace",
+      "layer": "coordination",
+      "responsibility": "Coordinate multi-tab broadcast, locks, transaction activity/order, and recovery retry scheduling.",
+      "paths": [
+        "src/store/broadcast.ts",
+        "src/store/locks.ts",
+        "src/store/recovery-retry-scheduler.ts",
+        "src/store/transaction-activity.ts",
+        "src/store/transaction-order.ts"
+      ]
+    },
+    {
+      "domain": "workspace",
+      "layer": "lifecycle-runtime",
+      "responsibility": "Own database selection/replacement, workspace runtime state, session ownership, presentation publication, and protocol boundaries.",
+      "paths": [
+        "src/store/browser-workspace-bootstrap-authority.ts",
+        "src/store/browser-workspace-contract.ts",
+        "src/store/browser-workspace-database-control.ts",
+        "src/store/browser-workspace-database-selection.ts",
+        "src/store/browser-workspace-lifecycle.ts",
+        "src/store/browser-workspace-maintenance-contract.ts",
+        "src/store/browser-workspace-open-contract.ts",
+        "src/store/browser-workspace-replacement-runner.ts",
+        "src/store/browser-workspace-replacement-transition.ts",
+        "src/store/browser-workspace-replacement.ts",
+        "src/store/browser-workspace-slot-coordination.ts",
+        "src/store/mounted-projection-lifecycle.ts",
+        "src/store/workspace-change-boundary.ts",
+        "src/store/workspace-effect-hub.ts",
+        "src/store/workspace-local-evidence.ts",
+        "src/store/workspace-meta.ts",
+        "src/store/workspace-presentation-lifecycle.ts",
+        "src/store/workspace-protocol.ts",
+        "src/store/workspace-repository.ts",
+        "src/store/workspace-runtime-control.ts",
+        "src/store/workspace-runtime.ts",
+        "src/store/workspace-session-owner.ts",
+        "src/store/workspace-shell-application.ts",
+        "src/store/workspace-tab-session.ts"
+      ]
+    },
+    {
+      "domain": "storage-administration",
+      "layer": "application",
+      "responsibility": "Own storage inspection, chat catalog sessions, retention, compaction state, size estimation, and explicit administration commands.",
+      "paths": [
+        "src/store/browser-workspace-compaction.ts",
+        "src/store/browser-workspace-database-cleanup.ts",
+        "src/store/browser-workspace-orphan-reclamation.ts",
+        "src/store/storage-administration.ts",
+        "src/store/storage-application.ts",
+        "src/store/storage-catalog-session-workspace.ts",
+        "src/store/storage-chat-catalog-session.ts",
+        "src/store/storage-compaction-state.ts",
+        "src/store/storage-maintenance-runtime.ts",
+        "src/store/storage-overview-controller.ts",
+        "src/store/storage-retention-state.ts",
+        "src/store/storage-size-estimate.ts"
+      ]
+    },
+    {
+      "domain": "presentation-state",
+      "layer": "tab-local-state",
+      "responsibility": "Store ephemeral interaction ownership, announcements, toasts, and shell UI preferences local to the current tab.",
+      "paths": [
+        "src/store/presentation-interaction-controller.ts",
+        "src/store/zustand/announcementStore.ts",
+        "src/store/zustand/toastStore.ts",
+        "src/store/zustand/uiStore.ts"
+      ]
+    },
+    {
+      "domain": "presentation-state",
+      "layer": "application",
+      "responsibility": "Compose the single presentation interaction runtime and expose application-owned capabilities to presentation adapters.",
+      "paths": ["src/app/presentation-interactions.ts"]
+    },
+    {
+      "domain": "presentation-state",
+      "layer": "boundary-types",
+      "responsibility": "Expose presentation-facing workspace and interaction contracts without implementation imports in UI modules.",
+      "paths": ["src/store/presentation-contracts.ts"]
+    },
+    {
+      "domain": "presentation-state",
+      "layer": "presentation-adapter",
+      "responsibility": "Bind React to the application-owned presentation interaction runtime through typed capabilities.",
+      "paths": ["src/hooks/usePresentationInteraction.ts"]
+    },
+    {
+      "domain": "attachments",
+      "layer": "presentation",
+      "responsibility": "Render attachment drafts, pickers, previews, references, catalog rows, and media/object URL lifecycles.",
+      "paths": [
+        "src/ui/attachments/AttachmentDraftTray.tsx",
+        "src/ui/attachments/AttachmentPicker.tsx",
+        "src/ui/attachments/AttachmentPreview.tsx",
+        "src/ui/attachments/AttachmentRefChips.tsx",
+        "src/ui/attachments/format.ts",
+        "src/ui/attachments/useAttachmentCatalogRows.ts",
+        "src/ui/attachments/useAttachmentDrafts.ts",
+        "src/ui/attachments/useAttachmentMedia.ts",
+        "src/ui/attachments/useAttachmentObjectUrl.ts",
+        "src/ui/attachments/useAttachmentResolver.ts"
+      ]
+    },
+    {
+      "domain": "conversation",
+      "layer": "presentation",
+      "responsibility": "Render the transcript, branch tree, composer, editing/actions, streaming output, rich content, notices, and chat header controls.",
+      "paths": [
+        "src/ui/chat/BannerTray.tsx",
+        "src/ui/chat/BranchControls.tsx",
+        "src/ui/chat/BranchTreeInspector.tsx",
+        "src/ui/chat/BranchTreeInspectorSearch.ts",
+        "src/ui/chat/BranchTreePreview.tsx",
+        "src/ui/chat/BranchTreeView.tsx",
+        "src/ui/chat/ChatHeader.tsx",
+        "src/ui/chat/CitationLink.tsx",
+        "src/ui/chat/CodeBlock.tsx",
+        "src/ui/chat/Composer.tsx",
+        "src/ui/chat/ConfirmDeleteDialog.tsx",
+        "src/ui/chat/EditTreeToolbar.tsx",
+        "src/ui/chat/EmptyState.tsx",
+        "src/ui/chat/FocusModeToggle.tsx",
+        "src/ui/chat/HeaderPrivacyBadge.tsx",
+        "src/ui/chat/ImportModal.tsx",
+        "src/ui/chat/InlineEditor.tsx",
+        "src/ui/chat/MarkdownView.tsx",
+        "src/ui/chat/Message.tsx",
+        "src/ui/chat/MessageActions.tsx",
+        "src/ui/chat/MessageContent.tsx",
+        "src/ui/chat/MessageHeader.tsx",
+        "src/ui/chat/MessageInfo.tsx",
+        "src/ui/chat/MessageList.tsx",
+        "src/ui/chat/MessageStreamOverflow.tsx",
+        "src/ui/chat/PrefillSettingsPrompt.tsx",
+        "src/ui/chat/ProfileGlyph.tsx",
+        "src/ui/chat/ReasoningBlock.tsx",
+        "src/ui/chat/ScrollRegion.tsx",
+        "src/ui/chat/ToastTray.tsx",
+        "src/ui/chat/ToolEvidenceBlock.tsx",
+        "src/ui/chat/TreeDensityToggle.tsx",
+        "src/ui/chat/ZeroEligibleModal.tsx",
+        "src/ui/chat/composer-draft-state.ts",
+        "src/ui/chat/lazy-mermaid-plugin.ts",
+        "src/ui/chat/shiki-code-plugin.ts"
+      ]
+    },
+    {
+      "domain": "provider-configuration",
+      "layer": "presentation",
+      "responsibility": "Render connection identity and destructive connection confirmation at the active-chat header boundary.",
+      "paths": ["src/ui/header/ConnectionDeleteDialog.tsx", "src/ui/header/ConnectionHeader.tsx"]
+    },
+    {
+      "domain": "presentation-system",
+      "layer": "presentation",
+      "responsibility": "Provide the shared icon vocabulary used by product surfaces.",
+      "paths": ["src/ui/icons/Icon.tsx"]
+    },
+    {
+      "domain": "interchange",
+      "layer": "presentation-adapter",
+      "responsibility": "Serialize and download chat/workspace JSON without embedding persistence logic in components.",
+      "paths": ["src/ui/import-export/chat-download.ts", "src/ui/import-export/json-file.ts"]
+    },
+    {
+      "domain": "presentation-system",
+      "layer": "presentation",
+      "responsibility": "Provide shared accessible controls, dialogs, live regions, SVG actions, and virtualization spacers.",
+      "paths": [
+        "src/ui/primitives/Button.tsx",
+        "src/ui/primitives/ConfirmDialog.tsx",
+        "src/ui/primitives/Dialog.tsx",
+        "src/ui/primitives/LiveRegions.tsx",
+        "src/ui/primitives/SvgAction.tsx",
+        "src/ui/primitives/virtual-spacer.ts"
+      ]
+    },
+    {
+      "domain": "provider-configuration",
+      "layer": "presentation",
+      "responsibility": "Render global/chat settings, connection management, model/provider selection, prompt templates, privacy, rendering, and performance preferences.",
+      "paths": [
+        "src/ui/settings/AppearanceSettings.tsx",
+        "src/ui/settings/CachingPanel.tsx",
+        "src/ui/settings/ChatModelPanel.tsx",
+        "src/ui/settings/ConnectionsSettings.tsx",
+        "src/ui/settings/ContextPanel.tsx",
+        "src/ui/settings/GeneralSettings.tsx",
+        "src/ui/settings/GlobalSettingsModal.tsx",
+        "src/ui/settings/ImageAllowlistPanel.tsx",
+        "src/ui/settings/InfoDisclosure.tsx",
+        "src/ui/settings/LlamaServerSection.tsx",
+        "src/ui/settings/ModelPicker.tsx",
+        "src/ui/settings/ParamForm.tsx",
+        "src/ui/settings/PerformanceSettings.tsx",
+        "src/ui/settings/PrivacySection.tsx",
+        "src/ui/settings/PromptPresetEditor.tsx",
+        "src/ui/settings/PromptsTab.tsx",
+        "src/ui/settings/ProviderPicker.tsx",
+        "src/ui/settings/RenderingSettings.tsx",
+        "src/ui/settings/TextTemplateSection.tsx",
+        "src/ui/settings/provider-picker-rows.ts"
+      ]
+    },
+    {
+      "domain": "catalog",
+      "layer": "presentation",
+      "responsibility": "Render the virtualized chat catalog and organization controls.",
+      "paths": ["src/ui/sidebar/ChatList.tsx", "src/ui/sidebar/chat-organization.ts"]
+    },
+    {
+      "domain": "storage-administration",
+      "layer": "presentation",
+      "responsibility": "Render storage estimates, persistence status, import/export, cleanup, and chat storage administration.",
+      "paths": [
+        "src/ui/storage/StorageChatsSurface.tsx",
+        "src/ui/storage/StorageView.tsx",
+        "src/ui/storage/storage-surface-shared.ts"
+      ]
+    },
+    {
+      "domain": "application-shell",
+      "layer": "composition-root",
+      "responsibility": "Mount the browser application and install application-wide runtime services.",
+      "paths": ["src/main.tsx"]
+    },
+    {
+      "domain": "build-environment",
+      "layer": "boundary-types",
+      "responsibility": "Expose Vite environment declarations to the TypeScript build only.",
+      "paths": ["src/vite-env.d.ts"]
+    }
+  ],
+  "ingress": [
+    {
+      "path": "src/main.tsx",
+      "kind": "browser-entry",
+      "audience": "browser-runtime"
+    },
+    {
+      "path": "src/app/WorkspaceBootstrap.tsx",
+      "kind": "workspace-composition",
+      "audience": "application-shell"
+    },
+    {
+      "path": "src/app/router.ts",
+      "kind": "navigation-boundary",
+      "audience": "application-shell"
+    },
+    {
+      "path": "src/api/client.ts",
+      "kind": "provider-api-facade",
+      "audience": "generation-and-discovery"
+    },
+    {
+      "path": "src/api/assistant-stream.ts",
+      "kind": "generation-transport-facade",
+      "audience": "generation-engine"
+    },
+    {
+      "path": "src/store/workspace-protocol.ts",
+      "kind": "workspace-port-contract",
+      "audience": "application-and-repository-adapters"
+    },
+    {
+      "path": "src/store/workspace-repository.ts",
+      "kind": "workspace-repository-facade",
+      "audience": "application-services"
+    },
+    {
+      "path": "src/store/workspace-runtime.ts",
+      "kind": "workspace-runtime-facade",
+      "audience": "workspace-bootstrap"
+    },
+    {
+      "path": "src/store/conversation-command-client.ts",
+      "kind": "conversation-command-port",
+      "audience": "conversation-presentation"
+    },
+    {
+      "path": "src/store/configuration-command-client.ts",
+      "kind": "configuration-command-port",
+      "audience": "configuration-presentation"
+    },
+    {
+      "path": "src/store/generation-engine.ts",
+      "kind": "generation-application-port",
+      "audience": "conversation-actions"
+    },
+    {
+      "path": "src/store/catalog-application.ts",
+      "kind": "catalog-application-port",
+      "audience": "catalog-presentation"
+    },
+    {
+      "path": "src/store/storage-application.ts",
+      "kind": "storage-administration-port",
+      "audience": "storage-presentation"
+    },
+    {
+      "path": "src/store/interchange-application.ts",
+      "kind": "interchange-application-port",
+      "audience": "import-export-presentation"
+    }
+  ]
+}

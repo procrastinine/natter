@@ -1,12 +1,13 @@
-import type { ApiError } from '../api/errors'
 import { toPersistedAttemptFailure } from './attempt-outcome'
 import { projectStreamAccumulatorFinalMetadata, type StreamAccumulator } from './stream-accumulator'
 import type {
   AbortReason,
-  ContinuationAttempt,
+  ContinuationAttemptDraft,
   ContinuationAttemptStatus,
   ContinuationAttemptStrategy,
   GenerationMeta,
+  PersistedInboundReasoningVisibility,
+  PersistedReasoningCarryForward,
 } from './types'
 
 export interface BuildContinuationAttemptInput {
@@ -17,15 +18,16 @@ export interface BuildContinuationAttemptInput {
   apiUsed?: GenerationMeta['apiUsed']
   startedAt: number
   finishedAt: number
+  reasoningCarryForward: PersistedReasoningCarryForward
+  reasoningVisibility: PersistedInboundReasoningVisibility
   accumulator: StreamAccumulator
   abortReason?: AbortReason
-  error?: Pick<ApiError, 'code' | 'message' | 'httpStatus'>
-  unappliedText?: string
+  error?: { code: number | string; message: string; httpStatus?: number }
 }
 
 export function buildContinuationAttempt(
   input: BuildContinuationAttemptInput,
-): ContinuationAttempt {
+): ContinuationAttemptDraft {
   const { accumulator } = input
   const final = projectStreamAccumulatorFinalMetadata(accumulator)
   const error = input.error ?? accumulator.midStreamError
@@ -45,6 +47,8 @@ export function buildContinuationAttempt(
     startedAt: input.startedAt,
     finishedAt: input.finishedAt,
     costSource: 'stream',
+    reasoningCarryForward: input.reasoningCarryForward,
+    reasoningVisibility: input.reasoningVisibility,
     ...(accumulator.generationId ? { generationId: accumulator.generationId } : {}),
     ...(accumulator.provider ? { provider: accumulator.provider } : {}),
     ...(accumulator.firstTextAt !== undefined ? { firstTextAt: accumulator.firstTextAt } : {}),
@@ -59,20 +63,15 @@ export function buildContinuationAttempt(
     ...(accumulator.finishReason
       ? {
           finishReason: accumulator.finishReason as NonNullable<
-            ContinuationAttempt['finishReason']
+            ContinuationAttemptDraft['finishReason']
           >,
         }
       : {}),
     ...(input.abortReason ? { abortReason: input.abortReason } : {}),
-    ...(input.unappliedText ? { unappliedText: input.unappliedText } : {}),
     ...(error ? { error: toPersistedAttemptFailure(error, 'provider') } : {}),
-    ...(final.reasoningDetails
-      ? { reasoningDetails: structuredClone(final.reasoningDetails) }
-      : {}),
-    ...(final.toolCalls ? { toolCalls: structuredClone(final.toolCalls) } : {}),
+    ...(final.reasoningEnvelope ? { reasoningEnvelope: final.reasoningEnvelope } : {}),
+    ...(final.toolCalls ? { toolCalls: final.toolCalls } : {}),
     ...(final.phase !== undefined ? { phase: final.phase } : {}),
-    ...(final.providerOutputItems
-      ? { providerOutputItems: structuredClone(final.providerOutputItems) }
-      : {}),
+    ...(final.providerOutputItems ? { providerOutputItems: final.providerOutputItems } : {}),
   }
 }

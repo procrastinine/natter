@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { fetchEndpoints, fetchModels, fetchProviders } from '../../src/api/models'
+import { fetchEndpoints, fetchModels } from '../../src/api/models'
 import {
   normalizeEndpoint,
   normalizeEndpointsResponse,
@@ -248,12 +248,6 @@ describe('fetch adapters', () => {
     expect(fetchSpy.mock.calls[0]?.[0]).toBe(
       'https://openrouter.ai/api/v1/models/anthropic/claude-opus-4.7/endpoints',
     )
-  })
-
-  it('fetchProviders hits the /providers endpoint', async () => {
-    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(jsonResponse({ data: [] }))
-    await fetchProviders({ profile: makeProfile(), apiKey: 'sk-test' })
-    expect(fetchSpy.mock.calls[0]?.[0]).toBe('https://openrouter.ai/api/v1/providers')
   })
 
   it('raises an ApiError on non-2xx', async () => {

@@ -1,28 +1,159 @@
-import type { ChatId, ContentItem, Message, MessageId } from '../core/types'
+import type Dexie from 'dexie'
+import type { DBCore, DBCoreMutateRequest, Middleware } from 'dexie'
+import { normalizeAttachmentRefs } from '../core/attachment-refs'
+import { type AppliedMessageView, createAppliedMessageView } from '../core/continuation-content'
+import { messageTreeIndexFields } from '../core/message-tree-index'
+import type { MessageHeaderRow as CoreMessageHeaderRow } from '../core/messages'
+import {
+  EMPTY_MESSAGE_CONTEXT_ROUTE_FACTS,
+  messageContextRouteFactsFromView,
+} from '../core/reasoning'
+import type { ChatId, ContentItem, Message, MessageAttachmentRef, MessageId } from '../core/types'
 import { countMessagesWords } from '../core/word-count'
+import { sameValue } from '../lib/same-value'
 
 type MessageBodyKey =
   | 'content'
-  | 'reasoningDetails'
+  | 'reasoningEnvelope'
   | 'toolCalls'
   | 'refusal'
   | 'phase'
-  | 'responsesEchoItem'
   | 'providerOutputItems'
   | 'continuationAttempts'
 
 export type MessageBodyFields = Pick<Message, MessageBodyKey>
 
-interface GenerationServerToolOutput {
-  index: number
-  output: unknown
+export type MessageHeaderRow = CoreMessageHeaderRow
+
+export function branchTreeSearchTarget(header: MessageHeaderRow) {
+  return {
+    id: header.id,
+    nodeVersion: header.nodeVersion,
+    bodyVersion: header.bodyVersion,
+    pending: false,
+    deleted: header.deleted,
+  }
 }
 
-export type MessageHeaderRow = Omit<Message, MessageBodyKey> & {
-  requestContextVersion: number
-  bodyVersion: number
-  bodyWordCount: number
-  textPreview: string
+export type StructuralMessageHeader = Pick<
+  MessageHeaderRow,
+  'id' | 'chatId' | 'parentId' | 'siblingIndex' | 'createdAt' | 'deleted' | 'role'
+>
+
+export function toStructuralMessageHeader(
+  header: StructuralMessageHeader,
+): StructuralMessageHeader {
+  return Object.freeze({
+    id: header.id,
+    chatId: header.chatId,
+    parentId: header.parentId,
+    siblingIndex: header.siblingIndex,
+    createdAt: header.createdAt,
+    deleted: header.deleted,
+    role: header.role,
+  })
+}
+
+export function sameMessageHeaderStructure(
+  left: StructuralMessageHeader,
+  right: StructuralMessageHeader,
+): boolean {
+  return (
+    left.id === right.id &&
+    left.chatId === right.chatId &&
+    left.parentId === right.parentId &&
+    left.siblingIndex === right.siblingIndex &&
+    left.createdAt === right.createdAt &&
+    left.deleted === right.deleted &&
+    left.role === right.role
+  )
+}
+
+export type MessageHeaderRevisionRelation =
+  | 'older'
+  | 'identical'
+  | 'compatible-newer'
+  | 'structural-newer'
+  | 'invalid-regression'
+  | 'version-collision'
+
+export function sameMessageHeaderValue(left: MessageHeaderRow, right: MessageHeaderRow): boolean {
+  return sameValue(left, right)
+}
+
+export function differingMessageHeaderFields(
+  left: MessageHeaderRow,
+  right: MessageHeaderRow,
+): readonly (keyof MessageHeaderRow)[] {
+  const keys = new Set<keyof MessageHeaderRow>([
+    ...(Object.keys(left) as Array<keyof MessageHeaderRow>),
+    ...(Object.keys(right) as Array<keyof MessageHeaderRow>),
+  ])
+  return Object.freeze([...keys].filter((key) => !sameValue(left[key], right[key])))
+}
+
+export function canonicalMessageHeaderRow(header: MessageHeaderRow): MessageHeaderRow {
+  const canonical = structuredClone(header)
+  canonical.attachmentRefs = canonicalMessageAttachmentRefs(canonical)
+  return canonical
+}
+
+export function installMessageStorageCodec(db: Dexie): void {
+  db.use(messageStorageCodecMiddleware)
+}
+
+const messageStorageCodecMiddleware: Middleware<DBCore> = {
+  stack: 'dbcore',
+  name: 'MessageStorageCodec',
+  level: 2,
+  create: (down) => ({
+    ...down,
+    table: (tableName) => {
+      const table = down.table(tableName)
+      if (tableName !== 'messages') return table
+      return {
+        ...table,
+        mutate: (request) => table.mutate(canonicalMessageMutation(request)),
+      }
+    },
+  }),
+}
+
+function canonicalMessageMutation(request: DBCoreMutateRequest): DBCoreMutateRequest {
+  if (request.type !== 'add' && request.type !== 'put') return request
+  const sourceValues = request.values as unknown[]
+  const values = sourceValues.map((value) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return value
+    const header = value as Record<string, unknown>
+    if (Array.isArray(header.attachmentRefs)) return value
+    return { ...header, attachmentRefs: [] }
+  })
+  return values.every((value, index) => value === sourceValues[index])
+    ? request
+    : { ...request, values }
+}
+
+function canonicalMessageAttachmentRefs(
+  header: Pick<MessageHeaderRow, 'attachmentRefs' | 'createdAt' | 'id'>,
+): MessageAttachmentRef[] {
+  return normalizeAttachmentRefs(header.attachmentRefs, {
+    messageId: header.id,
+    createdAt: header.createdAt,
+  })
+}
+
+export function classifyMessageHeaderRevision(
+  incoming: MessageHeaderRow,
+  current: MessageHeaderRow,
+): MessageHeaderRevisionRelation {
+  const nodeDelta = incoming.nodeVersion - current.nodeVersion
+  const bodyDelta = incoming.bodyVersion - current.bodyVersion
+  if (nodeDelta === 0 && bodyDelta === 0) {
+    return sameMessageHeaderValue(incoming, current) ? 'identical' : 'version-collision'
+  }
+  if (nodeDelta <= 0 && bodyDelta <= 0) return 'older'
+  if (nodeDelta < 0 || bodyDelta < 0) return 'invalid-regression'
+  return sameMessageHeaderStructure(incoming, current) ? 'compatible-newer' : 'structural-newer'
 }
 
 export interface MessagePresentation {
@@ -31,81 +162,34 @@ export interface MessagePresentation {
   readonly bodyVersion: number
 }
 
-export function messageHeaderTreeKey(headers: readonly MessageHeaderRow[]): string {
-  return headers
-    .map((message) =>
-      [
-        message.id,
-        message.nodeVersion,
-        message.parentId ?? '',
-        message.siblingIndex,
-        message.createdAt,
-        message.deleted ? 1 : 0,
-      ].join(':'),
-    )
-    .join('|')
-}
-
 export interface MessageBodyRow extends MessageBodyFields {
   id: MessageId
   chatId: ChatId
   bodyVersion: number
   updatedAt: number
-  generationServerToolOutputs?: GenerationServerToolOutput[]
+}
+
+export interface MessageTextPreviewRow {
+  id: MessageId
+  chatId: ChatId
+  bodyVersion: number
+  text: string
 }
 
 export const MESSAGE_BODY_KEYS: readonly MessageBodyKey[] = [
   'content',
-  'reasoningDetails',
+  'reasoningEnvelope',
   'toolCalls',
   'refusal',
   'phase',
-  'responsesEchoItem',
   'providerOutputItems',
   'continuationAttempts',
 ]
 
 const CHAT_PREVIEW_MAX_CHARS = 240
-export const MESSAGE_TEXT_PREVIEW_MAX_CHARS = 4_096
+export const MESSAGE_TEXT_PREVIEW_MAX_CHARS = 1_024
 
 const WHITESPACE = /\s/
-const SEARCH_TEXT_CHUNK_CHARS = 64 * 1024
-
-export function contentIncludesCaseInsensitiveText(
-  content: readonly ContentItem[],
-  query: string,
-  signal?: AbortSignal,
-): boolean {
-  const needle = query.toLocaleLowerCase()
-  if (needle.length === 0) return false
-  const retainedLength = needle.length - 1
-  let trailing = ''
-  let sawText = false
-
-  const scan = (text: string): boolean => {
-    for (let offset = 0; offset < text.length; offset += SEARCH_TEXT_CHUNK_CHARS) {
-      if (signal?.aborted) throw new DOMException('Search aborted', 'AbortError')
-      const lowered = text.slice(offset, offset + SEARCH_TEXT_CHUNK_CHARS).toLocaleLowerCase()
-      if (lowered.includes(needle)) return true
-      if (trailing && `${trailing}${lowered.slice(0, retainedLength)}`.includes(needle)) return true
-      if (retainedLength > 0) {
-        trailing =
-          lowered.length >= retainedLength
-            ? lowered.slice(-retainedLength)
-            : `${trailing}${lowered}`.slice(-retainedLength)
-      }
-    }
-    return false
-  }
-
-  for (const item of content) {
-    if (item.type !== 'text' && item.type !== 'output_text') continue
-    if (sawText && scan('\n')) return true
-    sawText = true
-    if (scan(item.text)) return true
-  }
-  return false
-}
 
 export function previewTextFromContent(
   content: readonly ContentItem[],
@@ -185,25 +269,30 @@ export function previewTextsByChat(
 export function splitMessageForStorage(
   message: Message,
   options: { bodyVersion?: number; requestContextVersion?: number; updatedAt?: number } = {},
-): { header: MessageHeaderRow; body: MessageBodyRow } {
+): { header: MessageHeaderRow; body: MessageBodyRow; preview: MessageTextPreviewRow } {
   const {
     content,
-    reasoningDetails,
+    reasoningEnvelope,
     toolCalls,
     refusal,
     phase,
-    responsesEchoItem,
     providerOutputItems,
     continuationAttempts,
     ...headerFields
   } = message
-  const header = structuredClone({
-    ...headerFields,
-    requestContextVersion: options.requestContextVersion ?? message.nodeVersion,
-    bodyVersion: options.bodyVersion ?? message.nodeVersion,
-    bodyWordCount: 0,
-    textPreview: '',
-  }) as MessageHeaderRow
+  const header = canonicalMessageHeaderRow(
+    structuredClone({
+      ...headerFields,
+      requestContextVersion: options.requestContextVersion ?? message.nodeVersion,
+      bodyVersion: options.bodyVersion ?? message.nodeVersion,
+      bodyWordCount: 0,
+      bodyTextCharCount: 0,
+      bodyMediaCount: 0,
+      bodyRenderCost: 0,
+      contextRouteFacts: EMPTY_MESSAGE_CONTEXT_ROUTE_FACTS,
+      ...messageTreeIndexFields(message),
+    }),
+  )
   const body: MessageBodyRow = {
     id: message.id,
     chatId: message.chatId,
@@ -213,27 +302,39 @@ export function splitMessageForStorage(
     content: structuredClone(content),
   }
 
-  if (reasoningDetails !== undefined) {
-    body.reasoningDetails = structuredClone(reasoningDetails)
+  if (reasoningEnvelope !== undefined) {
+    body.reasoningEnvelope = structuredClone(reasoningEnvelope)
   }
   if (toolCalls !== undefined) body.toolCalls = structuredClone(toolCalls)
   if (refusal !== undefined) body.refusal = refusal
   if (phase !== undefined) body.phase = phase
-  if (responsesEchoItem !== undefined) {
-    body.responsesEchoItem = structuredClone(responsesEchoItem)
-  }
   if (providerOutputItems !== undefined) {
     body.providerOutputItems = structuredClone(providerOutputItems)
   }
   if (continuationAttempts !== undefined) {
     body.continuationAttempts = structuredClone(continuationAttempts)
   }
-  syncMessageHeaderProjections(header, body, { replaceGenerationServerToolOutputs: true })
+  const preview = syncMessageHeaderProjections(header, body)
 
-  return { header, body }
+  return { header, body, preview }
 }
 
 export function hydrateMessage(header: MessageHeaderRow, body: MessageBodyRow): Message {
+  return hydrateMessageRows(header, body, true)
+}
+
+export function hydrateMessageWithOwnedBody(
+  header: MessageHeaderRow,
+  body: MessageBodyRow,
+): Message {
+  return hydrateMessageRows(header, body, false)
+}
+
+function hydrateMessageRows(
+  header: MessageHeaderRow,
+  body: MessageBodyRow,
+  cloneBody: boolean,
+): Message {
   if (header.id !== body.id) throw new Error(`MessageBodyMismatch:${header.id}:${body.id}`)
   if (header.chatId !== body.chatId) {
     throw new Error(`MessageBodyChatMismatch:${header.id}:${header.chatId}:${body.chatId}`)
@@ -248,29 +349,38 @@ export function hydrateMessage(header: MessageHeaderRow, body: MessageBodyRow): 
     requestContextVersion: _requestContextVersion,
     bodyVersion: _bodyVersion,
     bodyWordCount: _bodyWordCount,
-    textPreview: _textPreview,
+    bodyTextCharCount: _bodyTextCharCount,
+    bodyMediaCount: _bodyMediaCount,
+    bodyRenderCost: _bodyRenderCost,
+    contextRouteFacts: _contextRouteFacts,
+    treeParentKey: _treeParentKey,
+    treeLive: _treeLive,
     ...headerFields
   } = structuredClone(header)
   const message: Message = {
     ...headerFields,
-    content: structuredClone(body.content),
+    content: cloneBody ? structuredClone(body.content) : body.content,
   }
-  if (body.reasoningDetails !== undefined) {
-    message.reasoningDetails = structuredClone(body.reasoningDetails)
+  if (body.reasoningEnvelope !== undefined) {
+    message.reasoningEnvelope = cloneBody
+      ? structuredClone(body.reasoningEnvelope)
+      : body.reasoningEnvelope
   }
-  if (body.toolCalls !== undefined) message.toolCalls = structuredClone(body.toolCalls)
+  if (body.toolCalls !== undefined) {
+    message.toolCalls = cloneBody ? structuredClone(body.toolCalls) : body.toolCalls
+  }
   if (body.refusal !== undefined) message.refusal = body.refusal
   if (body.phase !== undefined) message.phase = body.phase
-  if (body.responsesEchoItem !== undefined) {
-    message.responsesEchoItem = structuredClone(body.responsesEchoItem)
-  }
   if (body.providerOutputItems !== undefined) {
-    message.providerOutputItems = structuredClone(body.providerOutputItems)
+    message.providerOutputItems = cloneBody
+      ? structuredClone(body.providerOutputItems)
+      : body.providerOutputItems
   }
   if (body.continuationAttempts !== undefined) {
-    message.continuationAttempts = structuredClone(body.continuationAttempts)
+    message.continuationAttempts = cloneBody
+      ? structuredClone(body.continuationAttempts)
+      : body.continuationAttempts
   }
-  restoreGenerationServerToolOutputs(message, body.generationServerToolOutputs)
   return message
 }
 
@@ -279,24 +389,15 @@ export function rebaseHydratedMessageHeader(message: Message, header: MessageHea
     requestContextVersion: _requestContextVersion,
     bodyVersion: _bodyVersion,
     bodyWordCount: _bodyWordCount,
-    textPreview: _textPreview,
+    bodyTextCharCount: _bodyTextCharCount,
+    bodyMediaCount: _bodyMediaCount,
+    bodyRenderCost: _bodyRenderCost,
+    contextRouteFacts: _contextRouteFacts,
+    treeParentKey: _treeParentKey,
+    treeLive: _treeLive,
     ...headerFields
   } = header
-  const next: Message = { ...message, ...headerFields }
-  const canonicalGeneration = headerFields.generation
-  const headerTools = canonicalGeneration?.serverTools
-  const hydratedTools = message.generation?.serverTools
-  if (!canonicalGeneration || !headerTools || !hydratedTools) return next
-  next.generation = {
-    ...canonicalGeneration,
-    serverTools: headerTools.map((tool, index) => {
-      const hydrated = hydratedTools[index]
-      return hydrated && Object.hasOwn(hydrated, 'output')
-        ? { ...tool, output: hydrated.output }
-        : tool
-    }),
-  }
-  return next
+  return { ...message, ...headerFields }
 }
 
 export function previewTextFromStoredProjection(
@@ -308,47 +409,89 @@ export function previewTextFromStoredProjection(
   return `${textPreview.slice(0, limit - 1)}…`
 }
 
-function moveGenerationServerToolOutputsToBody(
-  header: MessageHeaderRow,
-  body: MessageBodyRow,
-): void {
-  const outputs = takeGenerationServerToolOutputs(header)
-  if (outputs.length > 0) body.generationServerToolOutputs = outputs
-}
-
 export function syncMessageHeaderProjections(
   header: MessageHeaderRow,
   body: MessageBodyRow,
-  options: { replaceGenerationServerToolOutputs?: boolean } = {},
-): void {
+): MessageTextPreviewRow {
+  const appliedView = createAppliedMessageView(body)
   header.bodyWordCount = countMessagesWords([body as unknown as Message])
-  header.textPreview = previewTextFromContent(body.content, MESSAGE_TEXT_PREVIEW_MAX_CHARS)
-  if (!options.replaceGenerationServerToolOutputs) return
-  delete body.generationServerToolOutputs
-  moveGenerationServerToolOutputsToBody(header, body)
+  const metrics = projectMessageBodyRenderMetrics(header, body, appliedView)
+  header.bodyTextCharCount = metrics.textCharCount
+  header.bodyMediaCount = metrics.mediaCount
+  header.bodyRenderCost = metrics.renderCost
+  header.contextRouteFacts = messageContextRouteFactsFromView(appliedView)
+  return projectMessageTextPreview(header, body)
 }
 
-function takeGenerationServerToolOutputs(header: MessageHeaderRow): GenerationServerToolOutput[] {
-  const tools = header.generation?.serverTools
-  if (!tools) return []
-  const outputs: GenerationServerToolOutput[] = []
-  for (const [index, tool] of tools.entries()) {
-    if (!Object.hasOwn(tool, 'output')) continue
-    outputs.push({ index, output: structuredClone(tool.output) })
-    delete tool.output
+export interface MessageBodyRenderMetrics {
+  readonly textCharCount: number
+  readonly mediaCount: number
+  readonly renderCost: number
+}
+
+const RENDER_TEXT_CHARS_PER_UNIT = 120
+const RENDER_MEDIA_UNITS = 24
+const RENDER_ROW_UNITS = 8
+
+export function projectMessageBodyRenderMetrics(
+  header: Pick<MessageHeaderRow, 'attachmentRefs'>,
+  body: Pick<
+    MessageBodyRow,
+    'content' | 'reasoningEnvelope' | 'refusal' | 'toolCalls' | 'continuationAttempts'
+  >,
+  appliedView: AppliedMessageView = createAppliedMessageView(body),
+): MessageBodyRenderMetrics {
+  let textCharCount = 0
+  let auxiliaryTextChars = body.refusal?.length ?? 0
+  let mediaCount = 0
+  let textBlocks = 0
+  for (const item of body.content) {
+    if (item.type === 'text' || item.type === 'output_text') {
+      textCharCount += item.text.length
+      textBlocks += 1
+    } else if (item.type === 'audio_output') {
+      auxiliaryTextChars += item.transcript?.length ?? 0
+      mediaCount += 1
+    } else {
+      mediaCount += 1
+    }
   }
-  return outputs
+  for (const attempt of appliedView.attempts) {
+    for (const part of attempt.reasoningEnvelope?.visible ?? []) {
+      auxiliaryTextChars += part.text.length
+    }
+    for (const call of attempt.toolCalls ?? []) {
+      auxiliaryTextChars += call.function.name.length + call.function.arguments.length
+    }
+  }
+  for (const ref of header.attachmentRefs ?? []) {
+    if (ref.deletedAt === undefined) mediaCount += 1
+  }
+  const renderCost = Math.max(
+    1,
+    RENDER_ROW_UNITS +
+      Math.ceil((textCharCount + auxiliaryTextChars) / RENDER_TEXT_CHARS_PER_UNIT) +
+      mediaCount * RENDER_MEDIA_UNITS +
+      textBlocks,
+  )
+  return { textCharCount, mediaCount, renderCost }
 }
 
-function restoreGenerationServerToolOutputs(
-  message: Message,
-  outputs: readonly GenerationServerToolOutput[] | undefined,
-): void {
-  const tools = message.generation?.serverTools
-  if (!tools || !outputs) return
-  for (const entry of outputs) {
-    const tool = tools[entry.index]
-    if (tool) tool.output = structuredClone(entry.output)
+export function projectMessageTextPreview(
+  header: MessageHeaderRow,
+  body: MessageBodyRow,
+): MessageTextPreviewRow {
+  if (header.id !== body.id || header.chatId !== body.chatId) {
+    throw new Error(`MessagePreviewIdentityMismatch:${header.id}:${body.id}`)
+  }
+  if (header.bodyVersion !== body.bodyVersion) {
+    throw new Error(`MessagePreviewVersionMismatch:${header.id}`)
+  }
+  return {
+    id: header.id,
+    chatId: header.chatId,
+    bodyVersion: body.bodyVersion,
+    text: previewTextFromContent(body.content, MESSAGE_TEXT_PREVIEW_MAX_CHARS),
   }
 }
 

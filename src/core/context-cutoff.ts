@@ -40,6 +40,7 @@ import {
   resolveAttachmentContextRefs,
 } from './attachments/context'
 import { resolveContextCap, UNLIMITED_CONTEXT } from './context-budget'
+import { groupUserAnchoredContextItems, selectContextPairs } from './context-selection'
 import {
   type AttachmentResolver,
   mediaTokensForMessage,
@@ -156,23 +157,16 @@ function addToBucket(bucket: PairBucket, m: Message, c: MessageCost): void {
 }
 
 function groupPath(visible: readonly Message[], opts: MessageCostOptions): GroupedPath {
-  const preamble = emptyBucket()
-  const pairs: PairBucket[] = []
-  let current: PairBucket | null = null
-  for (const m of visible) {
-    const c = messageCost(m, opts)
-    if (m.role === 'user') {
-      if (current) pairs.push(current)
-      current = emptyBucket()
-      addToBucket(current, m, c)
-    } else if (current) {
-      addToBucket(current, m, c)
-    } else {
-      addToBucket(preamble, m, c)
-    }
+  const grouped = groupUserAnchoredContextItems(visible)
+  const bucketFor = (messages: readonly Message[]) => {
+    const bucket = emptyBucket()
+    for (const message of messages) addToBucket(bucket, message, messageCost(message, opts))
+    return bucket
   }
-  if (current) pairs.push(current)
-  return { preamble, pairs }
+  return {
+    preamble: bucketFor(grouped.preamble),
+    pairs: grouped.pairs.map(bucketFor),
+  }
 }
 
 interface CutoffPlanInput {
@@ -367,35 +361,20 @@ export function computeCutoffPlan(input: CutoffPlanInput): CutoffPlan {
   const available =
     cutoff - systemTokens - grouped.preamble.tokens - draftTokens - draftMediaTokens - reserveTokens
 
-  let N = Math.min(keepFirstPairs, totalPairs)
-  let headTokens = 0
-  for (let i = 0; i < N; i += 1) {
-    const bucket = grouped.pairs[i]
-    if (bucket) headTokens += bucket.tokens
-  }
-  while (N > 0 && headTokens > available) {
-    N -= 1
-    const dropped = grouped.pairs[N]
-    if (dropped) headTokens -= dropped.tokens
-  }
-
-  const remaining = Math.max(0, available - headTokens)
-  let tailStart = totalPairs
-  let tailTokens = 0
-  for (let i = totalPairs - 1; i >= N; i -= 1) {
-    const bucket = grouped.pairs[i]
-    if (!bucket) continue
-    if (tailTokens + bucket.tokens > remaining) break
-    tailTokens += bucket.tokens
-    tailStart = i
-  }
+  const selection = selectContextPairs({
+    pairCount: totalPairs,
+    keepFirstPairs,
+    requiredTailPairs: totalPairs > 0 ? 1 : 0,
+    availableTokens: available,
+    pairCost: ({ pairIndex }) => grouped.pairs[pairIndex]?.tokens ?? 0,
+  })
 
   const keptPairs: PairBucket[] = []
-  for (let i = 0; i < N; i += 1) {
+  for (let i = 0; i < selection.headPairCount; i += 1) {
     const b = grouped.pairs[i]
     if (b) keptPairs.push(b)
   }
-  for (let i = tailStart; i < totalPairs; i += 1) {
+  for (let i = selection.tailStart; i < totalPairs; i += 1) {
     const b = grouped.pairs[i]
     if (b) keptPairs.push(b)
   }
@@ -410,8 +389,8 @@ export function computeCutoffPlan(input: CutoffPlanInput): CutoffPlan {
     reserveTokens,
     cutoff,
     available,
-    N,
-    totalPairs - tailStart,
+    selection.headPairCount,
+    totalPairs - selection.tailStart,
   )
 }
 

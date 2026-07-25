@@ -1,6 +1,12 @@
 import { readFileSync } from 'node:fs'
 import { expect, type Page, test } from './fixtures'
-import { type IndexedDbDump, importIndexedDbDump } from './helpers'
+import {
+  activeWorkspaceDatabaseName,
+  firstChatId,
+  type IndexedDbDump,
+  importIndexedDbDump,
+  readChatRow,
+} from './helpers'
 
 const dumpPath = process.env.NATTER_IDB_DUMP
 const ANTHROPIC_MODEL = 'anthropic/claude-opus-4.7'
@@ -50,33 +56,15 @@ test('restored IndexedDB dump can check the exact Anthropic provider row', async
   await row.getByLabel('Use Anthropic (anthropic)', { exact: true }).click()
   await expect(row).toHaveAttribute('data-allowed', 'true')
 
-  const state = await page.evaluate(async () => {
-    const chatId = window.location.hash.match(/^#\/chat\/([^/?#]+)/)?.[1]
-    if (!chatId) throw new Error('missing chat id')
-    const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const req = indexedDB.open('natter')
-      req.onsuccess = () => resolve(req.result)
-      req.onerror = () => reject(req.error)
-    })
-    try {
-      return await new Promise<unknown>((resolve, reject) => {
-        const tx = db.transaction('chats', 'readonly')
-        const req = tx.objectStore('chats').get(chatId)
-        req.onsuccess = () => {
-          const chat = req.result as
-            | { settings?: { privacy?: unknown; providerPrefs?: unknown } }
-            | undefined
-          resolve({
-            privacy: chat?.settings?.privacy,
-            providerPrefs: chat?.settings?.providerPrefs,
-          })
-        }
-        req.onerror = () => reject(req.error)
-      })
-    } finally {
-      db.close()
-    }
-  })
+  const chatId = page.url().match(/#\/chat\/([^/?#]+)/u)?.[1]
+  if (!chatId) throw new Error('missing chat id')
+  const chat = (await readChatRow(page, chatId)) as {
+    settings?: { privacy?: unknown; providerPrefs?: unknown }
+  }
+  const state = {
+    privacy: chat.settings?.privacy,
+    providerPrefs: chat.settings?.providerPrefs,
+  }
   expect(JSON.stringify(state)).toContain('"ignoreOverridesFilter":true')
   expect(JSON.stringify(state)).not.toContain('"ignoreProviders":["Anthropic"]')
   expect(consoleLines).toEqual([])
@@ -87,9 +75,10 @@ async function legacyProviderSettingsSummary(page: Page): Promise<{
   legacyPresets: string[]
   legacyDisplayRefs: string[]
 }> {
-  return page.evaluate(async () => {
+  const databaseName = await activeWorkspaceDatabaseName(page)
+  return page.evaluate(async (databaseName) => {
     const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const req = indexedDB.open('natter')
+      const req = indexedDB.open(databaseName)
       req.onsuccess = () => resolve(req.result)
       req.onerror = () => reject(req.error)
     })
@@ -160,35 +149,11 @@ async function legacyProviderSettingsSummary(page: Page): Promise<{
         }
       }
     }
-  })
+  }, databaseName)
 }
 
 async function openMostRecentChat(page: Page): Promise<void> {
-  const chatId = await page.evaluate(async () => {
-    const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const req = indexedDB.open('natter')
-      req.onsuccess = () => resolve(req.result)
-      req.onerror = () => reject(req.error)
-    })
-    try {
-      return await new Promise<string>((resolve, reject) => {
-        const tx = db.transaction('chats', 'readonly')
-        const req = tx.objectStore('chats').getAll()
-        req.onsuccess = () => {
-          const rows = (
-            req.result as Array<{
-              id: string
-              updatedAt?: number
-            }>
-          ).sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))
-          resolve(rows[0]?.id ?? '')
-        }
-        req.onerror = () => reject(req.error)
-      })
-    } finally {
-      db.close()
-    }
-  })
+  const chatId = await firstChatId(page)
   if (!chatId) throw new Error('No chat found in IndexedDB dump')
   await page.goto(`/#/chat/${chatId}`)
 }

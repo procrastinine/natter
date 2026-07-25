@@ -1,4 +1,5 @@
 import { describe, expectTypeOf, it } from 'vitest'
+import type { ConversationAppendSelectionTransition } from '../../src/core/messages'
 import type {
   Attachment,
   ChatProviderToolSettings,
@@ -18,8 +19,46 @@ import type {
   ToolExecution,
   TraceMetadata,
 } from '../../src/core/types'
+import type { sendNewChat } from '../../src/store/conversation-command-client'
+import type { ConversationRouteHandoff } from '../../src/store/conversation-controller'
+import type {
+  GenerationIntent,
+  GenerationStartResult,
+  PreparedGeneration,
+  PreparedNewChatGeneration,
+} from '../../src/store/generation-engine'
+import type { CommittedConversationTransition } from '../../src/store/repository'
+import type { AttemptPrepareResult } from '../../src/store/workspace-protocol'
 
 describe('Phase 0 type additions', () => {
+  it('makes every prepared new chat expose an explicit route-delivery outcome', () => {
+    expectTypeOf<PreparedNewChatGeneration>().toMatchTypeOf<PreparedGeneration>()
+    type RoutedPreparedNewChat = Extract<PreparedNewChatGeneration, { readonly kind: 'handoff' }>
+    expectTypeOf<RoutedPreparedNewChat['handoff']>().toEqualTypeOf<ConversationRouteHandoff>()
+    expectTypeOf<
+      Extract<PreparedNewChatGeneration, { readonly kind: 'superseded' }>
+    >().toMatchTypeOf<PreparedGeneration>()
+    type NewChatIntent = Extract<GenerationIntent, { readonly kind: 'new-chat-send' }>
+    type NewChatStart = ReturnType<typeof sendNewChat>
+    expectTypeOf<NewChatStart>().toEqualTypeOf<GenerationStartResult<NewChatIntent>>()
+    expectTypeOf<
+      Awaited<Extract<NewChatStart, { readonly kind: 'started' }>['handle']['prepared']>
+    >().toEqualTypeOf<PreparedNewChatGeneration>()
+  })
+
+  it('carries generation selection as one serializable append transition', () => {
+    type PreparedSelecting = Extract<
+      AttemptPrepareResult,
+      { selectionTransition: ConversationAppendSelectionTransition }
+    >
+    expectTypeOf<
+      PreparedSelecting['selectionTransition']
+    >().toEqualTypeOf<ConversationAppendSelectionTransition>()
+    expectTypeOf<
+      CommittedConversationTransition['transition']
+    >().toEqualTypeOf<ConversationAppendSelectionTransition>()
+  })
+
   it('ConnectionProfile carries the kind + managementApiKeyRef fields', () => {
     expectTypeOf<ConnectionProfile['kind']>().toEqualTypeOf<
       'openrouter' | 'openai-compatible' | 'anthropic' | 'google' | 'llama-server' | 'custom'

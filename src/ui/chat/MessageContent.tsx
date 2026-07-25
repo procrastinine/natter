@@ -1,38 +1,45 @@
 import { useMemo } from 'react'
-import type { AttachmentBlob, AttachmentRef, ContentItem, MessageId } from '../../core/types'
-import { liveAttachmentRefs } from '../../store/attachment-refs'
-import type { MessageAttachmentRefMutation } from '../../store/attachments'
-import { attachmentBundleDependencies } from '../../store/reactive-dependencies'
-import { useRepositoryQuery } from '../../store/reactive-query'
-import type { AttachmentBundle } from '../../store/repository'
-import { getWorkspaceRepository } from '../../store/workspace-repository'
+import {
+  attachmentMutationInteraction,
+  attachmentMutationTarget,
+} from '../../app/presentation-interactions'
+import { liveAttachmentRefs } from '../../core/attachment-refs'
+import {
+  type CitationDisplayTarget,
+  planCitationDisplay,
+  safeCitationUrl,
+} from '../../core/content-annotations'
+import type { AttachmentRef, ContentItem, MessageId } from '../../core/types'
+import { usePresentationInteraction } from '../../hooks/usePresentationInteraction'
+import type {
+  AttachmentMediaProjection,
+  MessageAttachmentRefMutation,
+} from '../../store/presentation-contracts'
+import { useAttachmentMedia } from '../attachments/useAttachmentMedia'
+import { useAttachmentObjectUrl } from '../attachments/useAttachmentObjectUrl'
 import { EyeIcon, EyeOffIcon } from '../icons/Icon'
 import { Button } from '../primitives/Button'
 import { MarkdownView } from './MarkdownView'
 import type { MessageCollapseMode } from './MessageStreamOverflow'
 
 interface MessageContentProps {
-  content: ContentItem[]
+  content: readonly ContentItem[]
   text: string
   textSegments?: readonly string[] | undefined
   streaming?: boolean
+  renderRevision?: string | number | undefined
   collapseMode?: MessageCollapseMode
   messageId?: MessageId | undefined
   attachmentRefs?: readonly AttachmentRef[] | undefined
-  onMutateAttachmentRef?:
-    | ((mutation: MessageAttachmentRefMutation) => void | Promise<void>)
-    | undefined
+  onMutateAttachmentRef?: MessageAttachmentMutationAction | undefined
 }
+
+type MessageAttachmentMutationAction = (
+  mutation: MessageAttachmentRefMutation,
+) => void | Promise<void>
 
 const COMPACT_PREVIEW_CHARS = 8_000
 const PEEK_PREVIEW_CHARS = 160
-const MAX_OUTPUT_OBJECT_URL_CACHE = 128
-
-const outputObjectUrlCache = new Map<
-  string,
-  { url: string; contentHash: string; sizeBytes: number }
->()
-const outputObjectUrlApi: Partial<Pick<typeof URL, 'createObjectURL' | 'revokeObjectURL'>> = URL
 
 export function messageTextSegmentsFromContent(content: readonly ContentItem[]): string[] {
   if (content.length === 1) {
@@ -51,6 +58,7 @@ export function MessageContent({
   text,
   textSegments,
   streaming = false,
+  renderRevision,
   collapseMode = 'full',
   messageId,
   attachmentRefs,
@@ -63,7 +71,12 @@ export function MessageContent({
   const images = useMemo(() => outputImagesFromContent(content), [content])
   const audios = useMemo(() => outputAudiosFromContent(content), [content])
   const videos = useMemo(() => outputVideosFromContent(content), [content])
+  const files = useMemo(() => outputFilesFromContent(content), [content])
   const mediaRefs = useMemo(() => liveAttachmentRefs(attachmentRefs), [attachmentRefs])
+  const mediaRefByAttachmentId = useMemo(
+    () => new Map(mediaRefs.map((ref) => [ref.attachmentId, ref])),
+    [mediaRefs],
+  )
   const compactText = useMemo(
     () =>
       collapseMode === 'compact'
@@ -73,17 +86,55 @@ export function MessageContent({
         : '',
     [collapseMode, text, markdownSegments],
   )
+  const hasRenderableCitations = useMemo(
+    () =>
+      content.some(
+        (item) =>
+          item.type === 'output_text' &&
+          item.annotations?.some(
+            (annotation) =>
+              annotation.type === 'file_citation' ||
+              (annotation.type === 'url_citation' && safeCitationUrl(annotation.url)),
+          ),
+      ),
+    [content],
+  )
+  const fullCitationProjection = useMemo(
+    () =>
+      collapseMode === 'full' && hasRenderableCitations
+        ? citationProjectionFromContent(content)
+        : EMPTY_CITATION_PROJECTION,
+    [collapseMode, content, hasRenderableCitations],
+  )
+  const compactCitationProjection = useMemo(() => {
+    if (collapseMode !== 'compact' || !hasRenderableCitations) return undefined
+    const truncated = compactText.endsWith('\n\n...')
+    const rawLength = compactText.length - (truncated ? '\n\n...'.length : 0)
+    const projection = citationProjectionFromContent(content, rawLength)
+    return {
+      ...projection,
+      markdown: `${projection.markdown}${truncated ? '\n\n...' : ''}`,
+    }
+  }, [collapseMode, compactText, content, hasRenderableCitations])
   const peekText = useMemo(
     () =>
       collapseMode === 'peek'
         ? markdownSegments
           ? previewFirstLineFromSegments(
               markdownSegments,
-              images.length + audios.length + videos.length,
+              images.length + audios.length + videos.length + files.length,
             )
-          : previewFirstLine(text, images.length + audios.length + videos.length)
+          : previewFirstLine(text, images.length + audios.length + videos.length + files.length)
         : '',
-    [collapseMode, text, markdownSegments, images.length, audios.length, videos.length],
+    [
+      collapseMode,
+      text,
+      markdownSegments,
+      images.length,
+      audios.length,
+      videos.length,
+      files.length,
+    ],
   )
   if (collapseMode === 'peek') {
     return (
@@ -96,24 +147,37 @@ export function MessageContent({
     return (
       <div data-ui="message-body" data-role="content" data-overflow="compact">
         {compactText.length > 0 ? (
-          <MarkdownView content={compactText} streaming={streaming} />
+          <MarkdownView
+            content={compactCitationProjection?.markdown ?? compactText}
+            streaming={streaming}
+            renderRevision={renderRevision}
+            {...(compactCitationProjection
+              ? { citationTargets: compactCitationProjection.targets }
+              : {})}
+          />
         ) : null}
         <OutputImages
           images={images}
           messageId={messageId}
-          attachmentRefs={mediaRefs}
+          attachmentRefs={mediaRefByAttachmentId}
           onMutateAttachmentRef={onMutateAttachmentRef}
         />
         <OutputAudios
           audios={audios}
           messageId={messageId}
-          attachmentRefs={mediaRefs}
+          attachmentRefs={mediaRefByAttachmentId}
           onMutateAttachmentRef={onMutateAttachmentRef}
         />
         <OutputVideos
           videos={videos}
           messageId={messageId}
-          attachmentRefs={mediaRefs}
+          attachmentRefs={mediaRefByAttachmentId}
+          onMutateAttachmentRef={onMutateAttachmentRef}
+        />
+        <OutputFiles
+          files={files}
+          messageId={messageId}
+          attachmentRefs={mediaRefByAttachmentId}
           onMutateAttachmentRef={onMutateAttachmentRef}
         />
       </div>
@@ -122,28 +186,81 @@ export function MessageContent({
   return (
     <div data-ui="message-body" data-role="content">
       {textLength > 0 ? (
-        <MarkdownView content={text} contentSegments={markdownSegments} streaming={streaming} />
+        <MarkdownView
+          content={
+            fullCitationProjection.targets.length > 0 ? fullCitationProjection.markdown : text
+          }
+          contentSegments={
+            fullCitationProjection.targets.length > 0
+              ? fullCitationProjection.segments
+              : markdownSegments
+          }
+          streaming={streaming}
+          renderRevision={renderRevision}
+          citationTargets={fullCitationProjection.targets}
+        />
       ) : null}
       <OutputImages
         images={images}
         messageId={messageId}
-        attachmentRefs={mediaRefs}
+        attachmentRefs={mediaRefByAttachmentId}
         onMutateAttachmentRef={onMutateAttachmentRef}
       />
       <OutputAudios
         audios={audios}
         messageId={messageId}
-        attachmentRefs={mediaRefs}
+        attachmentRefs={mediaRefByAttachmentId}
         onMutateAttachmentRef={onMutateAttachmentRef}
       />
       <OutputVideos
         videos={videos}
         messageId={messageId}
-        attachmentRefs={mediaRefs}
+        attachmentRefs={mediaRefByAttachmentId}
+        onMutateAttachmentRef={onMutateAttachmentRef}
+      />
+      <OutputFiles
+        files={files}
+        messageId={messageId}
+        attachmentRefs={mediaRefByAttachmentId}
         onMutateAttachmentRef={onMutateAttachmentRef}
       />
     </div>
   )
+}
+
+interface CitationMarkdownProjection {
+  readonly markdown: string
+  readonly segments: readonly string[]
+  readonly targets: readonly CitationDisplayTarget[]
+}
+
+const EMPTY_CITATION_PROJECTION: CitationMarkdownProjection = Object.freeze({
+  markdown: '',
+  segments: Object.freeze([]),
+  targets: Object.freeze([]),
+})
+
+function citationProjectionFromContent(
+  content: readonly ContentItem[],
+  maxRawChars = Number.POSITIVE_INFINITY,
+): CitationMarkdownProjection {
+  const segments: string[] = []
+  const targets: CitationDisplayTarget[] = []
+  let remaining = maxRawChars
+  for (const [index, item] of content.entries()) {
+    if (item.type !== 'text' && item.type !== 'output_text') continue
+    if (remaining <= 0) break
+    const text = item.text.slice(0, remaining)
+    const annotations =
+      item.type === 'output_text'
+        ? item.annotations?.filter((annotation) => annotation.endIndex <= text.length)
+        : undefined
+    const plan = planCitationDisplay(text, annotations, `m${index}`, targets.length)
+    segments.push(plan.markdown)
+    targets.push(...plan.targets)
+    remaining -= text.length
+  }
+  return { markdown: segments.join(''), segments, targets }
 }
 
 function previewSliceFromSegments(segments: readonly string[], maxChars: number): string {
@@ -179,24 +296,28 @@ function previewSlice(text: string, maxChars: number): string {
 function outputImagesFromContent(content: readonly ContentItem[]) {
   return content.filter(
     (item): item is Extract<ContentItem, { type: 'output_image' }> =>
-      item.type === 'output_image' &&
-      ((typeof item.url === 'string' && item.url.length > 0) || Boolean(item.attachmentId)),
+      item.type === 'output_image' && Boolean(item.attachmentId),
   )
 }
 
 function outputAudiosFromContent(content: readonly ContentItem[]) {
   return content.filter(
     (item): item is Extract<ContentItem, { type: 'audio_output' }> =>
-      item.type === 'audio_output' &&
-      ((typeof item.url === 'string' && item.url.length > 0) || Boolean(item.attachmentId)),
+      item.type === 'audio_output' && Boolean(item.attachmentId),
   )
 }
 
 function outputVideosFromContent(content: readonly ContentItem[]) {
   return content.filter(
     (item): item is Extract<ContentItem, { type: 'output_video' }> =>
-      item.type === 'output_video' &&
-      ((typeof item.url === 'string' && item.url.length > 0) || Boolean(item.attachmentId)),
+      item.type === 'output_video' && Boolean(item.attachmentId),
+  )
+}
+
+function outputFilesFromContent(content: readonly ContentItem[]) {
+  return content.filter(
+    (item): item is Extract<ContentItem, { type: 'file' }> =>
+      item.type === 'file' && Boolean(item.attachmentId),
   )
 }
 
@@ -208,21 +329,17 @@ function OutputImages({
 }: {
   images: Array<Extract<ContentItem, { type: 'output_image' }>>
   messageId?: MessageId | undefined
-  attachmentRefs: ReturnType<typeof liveAttachmentRefs>
-  onMutateAttachmentRef?:
-    | ((mutation: MessageAttachmentRefMutation) => void | Promise<void>)
-    | undefined
+  attachmentRefs: ReadonlyMap<string, ReturnType<typeof liveAttachmentRefs>[number]>
+  onMutateAttachmentRef?: MessageAttachmentMutationAction | undefined
 }) {
   if (images.length === 0) return null
   return (
     <div data-ui="message-output-images">
       {images.map((image, index) => {
-        const ref = image.attachmentId
-          ? attachmentRefs.find((candidate) => candidate.attachmentId === image.attachmentId)
-          : undefined
+        const ref = image.attachmentId ? attachmentRefs.get(image.attachmentId) : undefined
         return (
           <OutputImage
-            key={image.attachmentId ?? image.url}
+            key={image.attachmentId}
             image={image}
             index={index}
             messageId={messageId}
@@ -243,21 +360,17 @@ function OutputAudios({
 }: {
   audios: Array<Extract<ContentItem, { type: 'audio_output' }>>
   messageId?: MessageId | undefined
-  attachmentRefs: ReturnType<typeof liveAttachmentRefs>
-  onMutateAttachmentRef?:
-    | ((mutation: MessageAttachmentRefMutation) => void | Promise<void>)
-    | undefined
+  attachmentRefs: ReadonlyMap<string, ReturnType<typeof liveAttachmentRefs>[number]>
+  onMutateAttachmentRef?: MessageAttachmentMutationAction | undefined
 }) {
   if (audios.length === 0) return null
   return (
     <div data-ui="message-output-media-list" data-media="audio">
       {audios.map((audio, index) => {
-        const ref = audio.attachmentId
-          ? attachmentRefs.find((candidate) => candidate.attachmentId === audio.attachmentId)
-          : undefined
+        const ref = audio.attachmentId ? attachmentRefs.get(audio.attachmentId) : undefined
         return (
           <OutputAudio
-            key={audio.attachmentId ?? audio.url}
+            key={audio.attachmentId}
             audio={audio}
             index={index}
             messageId={messageId}
@@ -278,21 +391,17 @@ function OutputVideos({
 }: {
   videos: Array<Extract<ContentItem, { type: 'output_video' }>>
   messageId?: MessageId | undefined
-  attachmentRefs: ReturnType<typeof liveAttachmentRefs>
-  onMutateAttachmentRef?:
-    | ((mutation: MessageAttachmentRefMutation) => void | Promise<void>)
-    | undefined
+  attachmentRefs: ReadonlyMap<string, ReturnType<typeof liveAttachmentRefs>[number]>
+  onMutateAttachmentRef?: MessageAttachmentMutationAction | undefined
 }) {
   if (videos.length === 0) return null
   return (
     <div data-ui="message-output-media-list" data-media="video">
       {videos.map((video, index) => {
-        const ref = video.attachmentId
-          ? attachmentRefs.find((candidate) => candidate.attachmentId === video.attachmentId)
-          : undefined
+        const ref = video.attachmentId ? attachmentRefs.get(video.attachmentId) : undefined
         return (
           <OutputVideo
-            key={video.attachmentId ?? video.url}
+            key={video.attachmentId}
             video={video}
             index={index}
             messageId={messageId}
@@ -301,6 +410,33 @@ function OutputVideos({
           />
         )
       })}
+    </div>
+  )
+}
+
+function OutputFiles({
+  files,
+  messageId,
+  attachmentRefs,
+  onMutateAttachmentRef,
+}: {
+  files: Array<Extract<ContentItem, { type: 'file' }>>
+  messageId?: MessageId | undefined
+  attachmentRefs: ReadonlyMap<string, ReturnType<typeof liveAttachmentRefs>[number]>
+  onMutateAttachmentRef?: MessageAttachmentMutationAction | undefined
+}) {
+  if (files.length === 0) return null
+  return (
+    <div data-ui="message-output-media-list" data-media="file">
+      {files.map((file, index) => (
+        <OutputFile
+          key={file.attachmentId ?? `${file.filename}:${index}`}
+          file={file}
+          messageId={messageId}
+          attachmentRef={file.attachmentId ? attachmentRefs.get(file.attachmentId) : undefined}
+          onMutateAttachmentRef={onMutateAttachmentRef}
+        />
+      ))}
     </div>
   )
 }
@@ -316,25 +452,14 @@ function OutputImage({
   index: number
   messageId?: MessageId | undefined
   attachmentRef?: ReturnType<typeof liveAttachmentRefs>[number] | undefined
-  onMutateAttachmentRef?:
-    | ((mutation: MessageAttachmentRefMutation) => void | Promise<void>)
-    | undefined
+  onMutateAttachmentRef?: MessageAttachmentMutationAction | undefined
 }) {
-  const bundle = useRepositoryQuery(
-    JSON.stringify(['attachment-bundle', image.attachmentId ?? null]),
-    async () => {
-      if (!image.attachmentId) return undefined
-      return getWorkspaceRepository().getAttachmentBundle(image.attachmentId)
-    },
-    undefined,
-    attachmentBundleDependencies(image.attachmentId),
-  )
-  const blob = useMemo(() => selectOutputImageBlob(bundle), [bundle])
-  const objectUrl = useMemo(() => objectUrlForOutputBlob(blob), [blob])
+  const mediaSnapshot = useAttachmentMedia(image.attachmentId, 'message-output')
+  const media = mediaSnapshot.media
+  const objectUrl = useAttachmentObjectUrl(media?.blob, mediaSnapshot.workspaceFence)
 
-  const remoteUrl = remoteAttachmentUrl(bundle)
-  const src = objectUrl ?? remoteUrl ?? image.url
-  const alt = image.prompt ?? bundle?.attachment.filename ?? `Generated image ${index + 1}`
+  const src = image.attachmentId ? attachmentMediaUrl(media, objectUrl) : undefined
+  const alt = image.prompt ?? media?.attachment.filename ?? `Generated image ${index + 1}`
   return (
     <figure
       data-ui="message-output-image"
@@ -344,6 +469,7 @@ function OutputImage({
       {src ? <img src={src} alt={alt} /> : <span data-ui="message-output-image-missing" />}
       {messageId && attachmentRef ? (
         <OutputMediaContextToggle
+          messageId={messageId}
           attachmentRef={attachmentRef}
           noun="image"
           onMutateAttachmentRef={onMutateAttachmentRef}
@@ -363,23 +489,13 @@ function OutputAudio({
   index: number
   messageId?: MessageId | undefined
   attachmentRef?: ReturnType<typeof liveAttachmentRefs>[number] | undefined
-  onMutateAttachmentRef?:
-    | ((mutation: MessageAttachmentRefMutation) => void | Promise<void>)
-    | undefined
+  onMutateAttachmentRef?: MessageAttachmentMutationAction | undefined
 }) {
-  const bundle = useRepositoryQuery(
-    JSON.stringify(['attachment-bundle', audio.attachmentId ?? null]),
-    async () => {
-      if (!audio.attachmentId) return undefined
-      return getWorkspaceRepository().getAttachmentBundle(audio.attachmentId)
-    },
-    undefined,
-    attachmentBundleDependencies(audio.attachmentId),
-  )
-  const blob = useMemo(() => selectOutputImageBlob(bundle), [bundle])
-  const objectUrl = useMemo(() => objectUrlForOutputBlob(blob), [blob])
+  const mediaSnapshot = useAttachmentMedia(audio.attachmentId, 'message-output')
+  const media = mediaSnapshot.media
+  const objectUrl = useAttachmentObjectUrl(media?.blob, mediaSnapshot.workspaceFence)
 
-  const src = objectUrl ?? remoteAttachmentUrl(bundle) ?? audio.url
+  const src = audio.attachmentId ? attachmentMediaUrl(media, objectUrl) : undefined
   return (
     <figure
       data-ui="message-output-media"
@@ -394,6 +510,7 @@ function OutputAudio({
       {audio.transcript ? <figcaption>{audio.transcript}</figcaption> : null}
       {messageId && attachmentRef ? (
         <OutputMediaContextToggle
+          messageId={messageId}
           attachmentRef={attachmentRef}
           noun="audio"
           onMutateAttachmentRef={onMutateAttachmentRef}
@@ -414,24 +531,14 @@ function OutputVideo({
   index: number
   messageId?: MessageId | undefined
   attachmentRef?: ReturnType<typeof liveAttachmentRefs>[number] | undefined
-  onMutateAttachmentRef?:
-    | ((mutation: MessageAttachmentRefMutation) => void | Promise<void>)
-    | undefined
+  onMutateAttachmentRef?: MessageAttachmentMutationAction | undefined
 }) {
-  const bundle = useRepositoryQuery(
-    JSON.stringify(['attachment-bundle', video.attachmentId ?? null]),
-    async () => {
-      if (!video.attachmentId) return undefined
-      return getWorkspaceRepository().getAttachmentBundle(video.attachmentId)
-    },
-    undefined,
-    attachmentBundleDependencies(video.attachmentId),
-  )
-  const blob = useMemo(() => selectOutputImageBlob(bundle), [bundle])
-  const objectUrl = useMemo(() => objectUrlForOutputBlob(blob), [blob])
+  const mediaSnapshot = useAttachmentMedia(video.attachmentId, 'message-output')
+  const media = mediaSnapshot.media
+  const objectUrl = useAttachmentObjectUrl(media?.blob, mediaSnapshot.workspaceFence)
 
-  const src = objectUrl ?? remoteAttachmentUrl(bundle) ?? video.url
-  const title = video.prompt ?? bundle?.attachment.filename ?? `Generated video ${index + 1}`
+  const src = video.attachmentId ? attachmentMediaUrl(media, objectUrl) : undefined
+  const title = video.prompt ?? media?.attachment.filename ?? `Generated video ${index + 1}`
   return (
     <figure
       data-ui="message-output-media"
@@ -445,6 +552,7 @@ function OutputVideo({
       ) : null}
       {messageId && attachmentRef ? (
         <OutputMediaContextToggle
+          messageId={messageId}
           attachmentRef={attachmentRef}
           noun="video"
           onMutateAttachmentRef={onMutateAttachmentRef}
@@ -454,17 +562,61 @@ function OutputVideo({
   )
 }
 
+function OutputFile({
+  file,
+  messageId,
+  attachmentRef,
+  onMutateAttachmentRef,
+}: {
+  file: Extract<ContentItem, { type: 'file' }>
+  messageId?: MessageId | undefined
+  attachmentRef?: ReturnType<typeof liveAttachmentRefs>[number] | undefined
+  onMutateAttachmentRef?: MessageAttachmentMutationAction | undefined
+}) {
+  const mediaSnapshot = useAttachmentMedia(file.attachmentId, 'message-output')
+  const media = mediaSnapshot.media
+  const objectUrl = useAttachmentObjectUrl(media?.blob, mediaSnapshot.workspaceFence)
+  const href = file.attachmentId ? attachmentMediaUrl(media, objectUrl) : undefined
+  const filename = media?.attachment.filename ?? file.filename
+  return (
+    <figure
+      data-ui="message-output-media"
+      data-media="file"
+      data-context={attachmentRef?.includeInContext === false ? 'excluded' : 'included'}
+      data-has-context-toggle={messageId && attachmentRef ? 'true' : undefined}
+    >
+      {href ? (
+        <a href={href} download={objectUrl ? filename : undefined}>
+          {filename}
+        </a>
+      ) : (
+        filename
+      )}
+      {messageId && attachmentRef ? (
+        <OutputMediaContextToggle
+          messageId={messageId}
+          attachmentRef={attachmentRef}
+          noun="file"
+          onMutateAttachmentRef={onMutateAttachmentRef}
+        />
+      ) : null}
+    </figure>
+  )
+}
+
 function OutputMediaContextToggle({
+  messageId,
   attachmentRef,
   noun,
   onMutateAttachmentRef,
 }: {
+  messageId: MessageId
   attachmentRef: ReturnType<typeof liveAttachmentRefs>[number]
-  noun: 'image' | 'audio' | 'video'
-  onMutateAttachmentRef?:
-    | ((mutation: MessageAttachmentRefMutation) => void | Promise<void>)
-    | undefined
+  noun: 'image' | 'audio' | 'video' | 'file'
+  onMutateAttachmentRef?: MessageAttachmentMutationAction | undefined
 }) {
+  const mutationInteraction = usePresentationInteraction(attachmentMutationInteraction)
+  const mutationTarget = attachmentMutationTarget({ messageId, refId: attachmentRef.refId })
   return (
     <Button
       type="button"
@@ -480,66 +632,43 @@ function OutputMediaContextToggle({
           ? `Hide this generated ${noun} from future context`
           : `Include this generated ${noun} in future context`
       }
-      onClick={() =>
-        void onMutateAttachmentRef?.({
-          kind: 'visibility',
-          refId: attachmentRef.refId,
-          includeInContext: !attachmentRef.includeInContext,
+      onClick={() => {
+        if (!onMutateAttachmentRef) return
+        mutationInteraction.run({
+          target: mutationTarget,
+          action: () =>
+            onMutateAttachmentRef({
+              kind: 'visibility',
+              refId: attachmentRef.refId,
+              includeInContext: !attachmentRef.includeInContext,
+            }),
         })
+      }}
+      disabled={
+        onMutateAttachmentRef === undefined || mutationInteraction.isPending(mutationTarget)
       }
-      disabled={onMutateAttachmentRef === undefined}
     >
       {attachmentRef.includeInContext ? <EyeIcon size={14} /> : <EyeOffIcon size={14} />}
     </Button>
   )
 }
 
-function selectOutputImageBlob(bundle: AttachmentBundle | undefined): AttachmentBlob | undefined {
-  return (
-    bundle?.blobs.find((blob) => blob.role === 'original') ??
-    bundle?.blobs.find((blob) => blob.role === 'normalized') ??
-    bundle?.blobs[0]
-  )
-}
-
-function objectUrlForOutputBlob(blob: AttachmentBlob | undefined): string | undefined {
-  if (
-    !blob ||
-    !(blob.blob instanceof Blob) ||
-    typeof outputObjectUrlApi.createObjectURL !== 'function'
-  ) {
-    return undefined
-  }
-  const cached = outputObjectUrlCache.get(blob.id)
-  if (cached && cached.contentHash === blob.contentHash && cached.sizeBytes === blob.sizeBytes) {
-    return cached.url
-  }
-  if (cached) outputObjectUrlApi.revokeObjectURL?.(cached.url)
-  const url = outputObjectUrlApi.createObjectURL(blob.blob)
-  outputObjectUrlCache.set(blob.id, {
-    url,
-    contentHash: blob.contentHash,
-    sizeBytes: blob.sizeBytes,
-  })
-  trimOutputObjectUrlCache()
-  return url
-}
-
-function trimOutputObjectUrlCache(): void {
-  while (outputObjectUrlCache.size > MAX_OUTPUT_OBJECT_URL_CACHE) {
-    const oldestKey = outputObjectUrlCache.keys().next().value
-    if (!oldestKey) return
-    const oldest = outputObjectUrlCache.get(oldestKey)
-    if (oldest) outputObjectUrlApi.revokeObjectURL?.(oldest.url)
-    outputObjectUrlCache.delete(oldestKey)
-  }
-}
-
-function remoteAttachmentUrl(bundle: AttachmentBundle | undefined): string | undefined {
-  const attachment = bundle?.attachment
+function remoteAttachmentUrl(media: AttachmentMediaProjection | undefined): string | undefined {
+  const attachment = media?.attachment
   if (!attachment) return undefined
   if (attachment.storage.kind === 'remote-url') return attachment.storage.url
   return undefined
+}
+
+function attachmentMediaUrl(
+  media: AttachmentMediaProjection | undefined,
+  objectUrl: string | undefined,
+): string | undefined {
+  const localBlobUsable =
+    typeof Blob !== 'undefined' &&
+    media?.blob?.blob instanceof Blob &&
+    typeof URL.createObjectURL === 'function'
+  return localBlobUsable ? objectUrl : remoteAttachmentUrl(media)
 }
 
 function previewFirstLine(text: string, mediaCount: number): string {

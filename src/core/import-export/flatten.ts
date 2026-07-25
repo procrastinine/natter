@@ -10,7 +10,7 @@ const PROMPT_PIN_KEYS = [
 ] as const satisfies readonly (keyof ChatSettings)[]
 
 interface FlattenChatSettingsOptions {
-  savedTextTemplates?: readonly SavedTextTemplate[]
+  savedTextTemplate?: SavedTextTemplate
 }
 
 export function flattenChatSettingsForPortableExport(
@@ -19,7 +19,7 @@ export function flattenChatSettingsForPortableExport(
 ): ChatSettings {
   const next = structuredClone(settings)
   stripPromptPresetPins(next)
-  flattenTextTemplate(next, options.savedTextTemplates ?? [])
+  flattenTextTemplate(next, options.savedTextTemplate)
 
   // User-defined tool registry rows are not portable until the registry has
   // its own export block. Provider-hosted tool settings remain portable.
@@ -38,14 +38,14 @@ export function stripPromptPresetPins(settings: ChatSettings): ChatSettings {
 
 function flattenTextTemplate(
   settings: ChatSettings,
-  savedTextTemplates: readonly SavedTextTemplate[],
+  savedTextTemplate: SavedTextTemplate | undefined,
 ): void {
   const id = settings.textTemplate
   if (!id || id === 'default' || id === 'custom') return
   if (TEXT_TEMPLATES[id]) return
   if (!id.startsWith('user:')) return
 
-  const saved = savedTextTemplates.find((row) => row.id === id)
+  const saved = savedTextTemplate?.id === id ? savedTextTemplate : undefined
   settings.textTemplate = 'custom'
   settings.customTextTemplate = structuredClone(
     saved?.config ?? settings.customTextTemplate ?? EMPTY_TEXT_TEMPLATE,

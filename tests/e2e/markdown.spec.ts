@@ -57,6 +57,23 @@ test('renders a streamed code fence with a copy/download toolbar once closed', a
   await expect(assistant.locator('pre')).toContainText('const x = 1')
 })
 
+test('keeps oversized code bounded until Highlight anyway is explicit', async ({ page }) => {
+  const finalLine = 'oversized-code-final-line'
+  const code = `\`\`\`ts\n${'x\n'.repeat(10_001)}${finalLine}\n\`\`\``
+  await mockChatCompletions(page, {
+    body: buildSseBody([{ id: 'oversized-code', content: code, finish: 'stop' }]),
+  })
+  await createChatAndOpen(page)
+  await sendMessage(page, 'show a very large code block')
+
+  const assistant = page.locator('[data-ui="message"][data-role="assistant"]').first()
+  const bounded = assistant.locator('[data-ui="code-block"][data-overflow="truncated"]')
+  await expect(bounded).toBeVisible()
+  await expect(bounded).not.toContainText(finalLine)
+  await bounded.getByRole('button', { name: 'Highlight anyway' }).click()
+  await expect(assistant.locator('[data-streamdown="code-block"]')).toContainText(finalLine)
+})
+
 test('blocked images from unlisted origins render a blocked-image stub', async ({ page }) => {
   const md = '![evil pixel](https://tracker.example.com/pixel.gif)'
   await mockChatCompletions(page, {

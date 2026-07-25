@@ -206,6 +206,14 @@ const COMPACT_PROBE_BODIES: Record<string, Record<string, unknown>> = {
 
 const scenarios = new Set<FakeStreamScenario>()
 
+interface ProviderFixtureExpectation {
+  id: string
+  expectedText: string
+  expectedToolTypes: string[]
+  expectedInfoLabels: string[]
+  expectedPayloadText: string
+}
+
 test.beforeEach(async ({ page }) => {
   await clearIndexedDb(page)
   await page.evaluate(() => {
@@ -223,70 +231,76 @@ test.afterEach(async () => {
 test('OpenAI Responses hosted-tool fixtures cross the provider boundary into the UI', async ({
   page,
 }) => {
-  await replayProviderFixture(page, {
-    id: 'openai-web-search',
-    expectedText: 'platform.openai.com',
-    expectedToolTypes: ['web_search_call'],
-    expectedInfoLabels: ['web search'],
-    expectedPayloadText: 'platform.openai.com/api/docs',
-  })
-  await replayProviderFixture(page, {
-    id: 'openai-code-interpreter',
-    expectedText: '55',
-    expectedToolTypes: ['code_interpreter_call'],
-    expectedInfoLabels: ['code interpreter'],
-    expectedPayloadText: '"logs": "55"',
-  })
-  await replayProviderFixture(page, {
-    id: 'openai-shell',
-    expectedText: 'natter-shape-probe.',
-    expectedToolTypes: ['shell_call', 'shell_call_output'],
-    expectedInfoLabels: ['shell', 'shell output'],
-    expectedPayloadText: '"stdout": "natter-shape-probe."',
-  })
+  await replayProviderFixtures(page, [
+    {
+      id: 'openai-web-search',
+      expectedText: 'platform.openai.com',
+      expectedToolTypes: ['web_search_call'],
+      expectedInfoLabels: ['web search'],
+      expectedPayloadText: 'platform.openai.com/api/docs',
+    },
+    {
+      id: 'openai-code-interpreter',
+      expectedText: '55',
+      expectedToolTypes: ['code_interpreter_call'],
+      expectedInfoLabels: ['code interpreter'],
+      expectedPayloadText: '"logs": "55"',
+    },
+    {
+      id: 'openai-shell',
+      expectedText: 'natter-shape-probe.',
+      expectedToolTypes: ['shell_call', 'shell_call_output'],
+      expectedInfoLabels: ['shell', 'shell output'],
+      expectedPayloadText: '"stdout": "natter-shape-probe."',
+    },
+  ])
 })
 
 test('Google native tool fixtures cross the provider boundary into the UI', async ({ page }) => {
-  await replayProviderFixture(page, {
-    id: 'google-code-execution',
-    expectedText: '55',
-    expectedToolTypes: ['google:code_execution'],
-    expectedInfoLabels: ['code execution'],
-    expectedPayloadText: 'OUTCOME_OK',
-  })
+  await replayProviderFixtures(page, [
+    {
+      id: 'google-code-execution',
+      expectedText: '55',
+      expectedToolTypes: ['google:code_execution'],
+      expectedInfoLabels: ['code execution'],
+      expectedPayloadText: 'OUTCOME_OK',
+    },
+  ])
 })
 
 test('Anthropic Messages hosted-tool fixtures cross the provider boundary into the UI', async ({
   page,
 }) => {
-  await replayProviderFixture(page, {
-    id: 'anthropic-web-search',
-    expectedText: 'platform.openai.com',
-    expectedToolTypes: ['server_tool_use', 'web_search_tool_result'],
-    expectedInfoLabels: ['server tool use', 'web search result'],
-    expectedPayloadText: 'platform.openai.com',
-  })
-  await replayProviderFixture(page, {
-    id: 'anthropic-web-fetch',
-    expectedText: 'example.com',
-    expectedToolTypes: ['server_tool_use', 'web_fetch_tool_result'],
-    expectedInfoLabels: ['server tool use', 'web fetch result'],
-    expectedPayloadText: 'Example Domain',
-  })
-  await replayProviderFixture(page, {
-    id: 'anthropic-code-execution',
-    expectedText: '55',
-    expectedToolTypes: ['server_tool_use', 'bash_code_execution_tool_result'],
-    expectedInfoLabels: ['server tool use', 'code execution result'],
-    expectedPayloadText: '"stdout": "55\\n"',
-  })
-  await replayProviderFixture(page, {
-    id: 'anthropic-advisor',
-    expectedText: '2+2 equals 4',
-    expectedToolTypes: ['server_tool_use', 'advisor_tool_result'],
-    expectedInfoLabels: ['server tool use', 'advisor result'],
-    expectedPayloadText: 'advisor_result',
-  })
+  await replayProviderFixtures(page, [
+    {
+      id: 'anthropic-web-search',
+      expectedText: 'platform.openai.com',
+      expectedToolTypes: ['server_tool_use', 'web_search_tool_result'],
+      expectedInfoLabels: ['server tool use', 'web search result'],
+      expectedPayloadText: 'platform.openai.com',
+    },
+    {
+      id: 'anthropic-web-fetch',
+      expectedText: 'example.com',
+      expectedToolTypes: ['server_tool_use', 'web_fetch_tool_result'],
+      expectedInfoLabels: ['server tool use', 'web fetch result'],
+      expectedPayloadText: 'Example Domain',
+    },
+    {
+      id: 'anthropic-code-execution',
+      expectedText: '55',
+      expectedToolTypes: ['server_tool_use', 'bash_code_execution_tool_result'],
+      expectedInfoLabels: ['server tool use', 'code execution result'],
+      expectedPayloadText: '"stdout": "55\\n"',
+    },
+    {
+      id: 'anthropic-advisor',
+      expectedText: '2+2 equals 4',
+      expectedToolTypes: ['server_tool_use', 'advisor_tool_result'],
+      expectedInfoLabels: ['server tool use', 'advisor result'],
+      expectedPayloadText: 'advisor_result',
+    },
+  ])
 })
 
 test('tool evidence supports per-item visibility while Edit remains content-only', async ({
@@ -374,18 +388,51 @@ test('tool evidence keeps long stdout horizontally scrollable in narrow layouts'
   expect(metrics.height).toBeLessThanOrEqual(Math.max(40, metrics.lineHeight * 2.2))
 })
 
-async function replayProviderFixture(
+async function replayProviderFixtures(
   page: Page,
-  input: {
-    id: string
-    expectedText: string
-    expectedToolTypes: string[]
-    expectedInfoLabels: string[]
-    expectedPayloadText: string
-  },
+  inputs: ProviderFixtureExpectation[],
 ): Promise<void> {
-  const result = await startProviderFixture(page, input.id)
+  const transports = inputs.map((input) => fixtureTransport(input.id))
+  const transport = transports[0]
+  if (!transport) return
+  for (const candidate of transports) expect(candidate).toEqual(transport)
+  const scenario = await createFakeStreamScenario({
+    responses: inputs.map((input) => ({
+      method: 'POST',
+      path: transport.path,
+      json: loadProbeBody(input.id),
+    })),
+  })
+  scenarios.add(scenario)
+  await clearIndexedDb(page)
+  await seedFirstRun(page, { model: transport.profile.model })
+  await retargetOnlyProfileToFakeProvider(page, scenario.providerBaseUrl, transport.profile)
+  await scenario.snapshot()
 
+  for (const [index, input] of inputs.entries()) {
+    await createChatAndOpen(page)
+    await sendMessage(page, `Replay ${input.id} fixture.`)
+    await expect(page.locator('[data-ui="chat-row"]')).toHaveCount(index + 1)
+    const chatId = await firstChatId(page)
+    expect(chatId).not.toBe('')
+    await waitForAssistantGenerationFinished(page, chatId)
+    await expect(page.locator('[data-ui="abort"]')).toHaveCount(0)
+    await expect.poll(async () => (await scenario.snapshot()).activeStreams).toBe(0)
+    const snapshot = await scenario.snapshot()
+    expect(
+      snapshot.requests.filter(
+        (request) => request.method === 'POST' && request.path === transport.path,
+      ),
+    ).toHaveLength(index + 1)
+    await assertProviderFixture(page, input, chatId)
+  }
+}
+
+async function assertProviderFixture(
+  page: Page,
+  input: ProviderFixtureExpectation,
+  chatId: string,
+): Promise<void> {
   const assistant = page.locator('[data-ui="message"][data-role="assistant"]').last()
   await expect(assistant.locator('[data-ui="message-body"]')).toContainText(input.expectedText)
   const evidence = assistant.locator('[data-ui="tool-evidence"]')
@@ -394,19 +441,18 @@ async function replayProviderFixture(
   for (const label of input.expectedInfoLabels) {
     await expect(evidence).toContainText(new RegExp(escapeRegExp(label), 'i'))
   }
+  for (const raw of await evidence.locator('[data-ui="tool-evidence-raw"]').all()) {
+    await raw.locator('summary').click()
+  }
   await expect(evidence).toContainText(input.expectedPayloadText)
 
   await assistant.locator('[data-action="info"]').click()
   const info = assistant.locator('[data-ui="message-info"]')
   await expect(info).toContainText('Tool calls')
   for (const label of input.expectedInfoLabels) await expect(info).toContainText(label)
-  for (const details of await info.locator('[data-ui="tool-call"]').all()) {
-    await details.locator('summary').click()
-    await expect(details.locator('pre')).toBeVisible()
-  }
-  await expect(info).toContainText(input.expectedPayloadText)
+  await expect(info.locator('[data-ui="tool-call"]').first()).toBeVisible()
 
-  const rows = await readMessages(page, result.chatId)
+  const rows = await readMessages(page, chatId)
   const storedAssistant = rows.filter((row) => row.role === 'assistant').at(-1) as
     | { generation?: { serverTools?: Array<{ type?: string }> } }
     | undefined

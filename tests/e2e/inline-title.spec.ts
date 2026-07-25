@@ -6,6 +6,7 @@ import {
   createChatAndSend,
   firstChatId,
   mockChatCompletions,
+  readChatRow,
   seedFirstRun,
   sendMessage,
   waitForAssistantGenerationFinished,
@@ -34,23 +35,7 @@ test('pencil opens the inline editor; Enter commits and sets titleStatus=manual'
   await editor.press('Enter')
   await expect(page.locator('[data-ui="chat-title-label"]')).toHaveText('Branching deep-dive')
   const chatId = await firstChatId(page)
-  const row = await page.evaluate(async (id) => {
-    const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const req = indexedDB.open('natter')
-      req.onsuccess = () => resolve(req.result)
-      req.onerror = () => reject(req.error)
-    })
-    try {
-      return await new Promise<Record<string, unknown>>((resolve, reject) => {
-        const tx = db.transaction('chats', 'readonly')
-        const req = tx.objectStore('chats').get(id)
-        req.onsuccess = () => resolve(req.result as Record<string, unknown>)
-        req.onerror = () => reject(req.error)
-      })
-    } finally {
-      db.close()
-    }
-  }, chatId)
+  const row = await readChatRow(page, chatId)
   expect(row.title).toBe('Branching deep-dive')
   expect(row.titleStatus).toBe('manual')
 })
@@ -144,21 +129,5 @@ test('title commit bumps updatedAt + metaVersion, leaves branch state untouched,
 })
 
 async function readChat(page: Page, chatId: string): Promise<Record<string, unknown>> {
-  return page.evaluate(async (id) => {
-    const db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const req = indexedDB.open('natter')
-      req.onsuccess = () => resolve(req.result)
-      req.onerror = () => reject(req.error)
-    })
-    try {
-      return await new Promise<Record<string, unknown>>((resolve, reject) => {
-        const tx = db.transaction('chats', 'readonly')
-        const req = tx.objectStore('chats').get(id)
-        req.onsuccess = () => resolve(req.result as Record<string, unknown>)
-        req.onerror = () => reject(req.error)
-      })
-    } finally {
-      db.close()
-    }
-  }, chatId)
+  return readChatRow(page, chatId)
 }

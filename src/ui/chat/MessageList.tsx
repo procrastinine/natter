@@ -1,227 +1,87 @@
 import {
   lazy,
   memo,
+  type ReactNode,
   Suspense,
-  type SyntheticEvent,
   useCallback,
   useEffect,
-  useLayoutEffect,
   useMemo,
   useRef,
   useState,
 } from 'react'
+import { type ConversationDeleteMode, conversationActions } from '../../app/conversation-actions'
 import {
-  beginRouteIntent,
-  cancelRouteIntent,
-  chatHref,
-  isRouteIntentCurrent,
-  navigateForIntent,
-} from '../../app/router'
-import { cursorKeyOf, indexById, type MessageTreeProjection } from '../../core/active-path'
+  type ConversationMutationIntent,
+  conversationMutationInteraction,
+  conversationMutationTarget,
+} from '../../app/presentation-interactions'
 import type { EffectiveCapability } from '../../core/capabilities'
-import { computeBranchTitle, forkChatFromMessage } from '../../core/chat-fork'
+import type { ChatSettingsPatch } from '../../core/chat-metadata'
+import { resolveCutoff } from '../../core/context-cutoff'
+import { groupUserAnchoredContextItems, selectContextPairs } from '../../core/context-selection'
+import type { PrefillPlan } from '../../core/effective-endpoint-routing'
 import type { LongMessageDisplayMode, RenderWindowLoadMode } from '../../core/global-settings'
-import { swipeProjected } from '../../core/messages'
+import {
+  generationCapabilityAvailable,
+  pendingGenerationCapability,
+} from '../../core/interaction-capability'
 import { UNLIMITED_CONTEXT } from '../../core/prompt-size'
-import { prefillClassFor } from '../../core/quirks'
 import type {
-  ChatId,
   ChatSettings,
-  CursorMap,
   MessageAttachmentRef,
   MessageId,
   MessageRole,
   Message as MessageRow,
-  ModelEndpoint,
+  ProviderOutputMemberRef,
+  ReasoningMemberRef,
 } from '../../core/types'
-import type { StructuralMessageHeader } from '../../hooks/useBranchUrlSync'
-import { useChat } from '../../hooks/useChat'
+import { navigateConversationMessage } from '../../hooks/useConversationCursor'
+import { usePresentationInteraction } from '../../hooks/usePresentationInteraction'
+import { useStreamStableBranchPath } from '../../hooks/useStreamStablePromptEstimate'
+import type {
+  ConversationTranscriptSurface,
+  GenerationCapabilityFrame,
+  MessageAttachmentRefMutation,
+  MessageHeaderRow,
+  TotalPresentationInteractionPromise,
+  TranscriptBodyWindowRow,
+  WorkspaceFence,
+} from '../../store/presentation-contracts'
 import {
-  continueFromMessage,
-  dismissMessageGenerationNotice,
-  editAndResend,
-  editInPlace,
-  type MessageOpsContext,
-  mutateMessageAttachmentReference,
-  regenerateFromMessage,
-  toggleMessageContextHidden,
-  toggleProviderOutputItemHidden,
-  toggleReasoningDetailHidden,
-} from '../../hooks/useMessageOps'
-import type { MessageAttachmentRefMutation } from '../../store/attachments'
-import { getChat, listChatSidebarRows } from '../../store/chats'
-import type { MessageHeaderRow } from '../../store/message-storage'
-import type { ActiveBranchWindowSnapshot } from '../../store/repository'
+  transcriptBodyPageRows,
+  transcriptBodyWindowFindRow,
+  transcriptBodyWindowPages,
+  transcriptBodyWindowRows,
+} from '../../store/transcript-window'
 import { announceVariantPosition } from '../../store/zustand/announcementStore'
-import { useChatStore } from '../../store/zustand/chatStore'
-import { useToastStore } from '../../store/zustand/toastStore'
 import { Button } from '../primitives/Button'
-import type { BranchNavigationContext } from './BranchControls'
 import { Message } from './Message'
 import type { InsertSlot } from './MessageActions'
 import { PrefillSettingsPrompt } from './PrefillSettingsPrompt'
+import { useScrollRegionState } from './ScrollRegion'
 
 const ImportModal = lazy(() =>
   import('./ImportModal').then((module) => ({ default: module.ImportModal })),
 )
 
 interface MessageListProps {
-  chatId: ChatId
+  binding: ConversationTranscriptSurface
   chatSettings: ChatSettings
-  hasConnection: boolean
+  generationCapabilityFrame: GenerationCapabilityFrame
   capability?: EffectiveCapability
-  prefillRecommendationEndpoints?: readonly ModelEndpoint[]
+  prefillPlan: PrefillPlan
   longMessageDisplayMode?: LongMessageDisplayMode
-  messageRenderWindowSize: number
+  messageInitialRenderWork: number
   messageRenderWindowLoadMode: RenderWindowLoadMode
-  branchSnapshot: ActiveBranchWindowSnapshot | null
-  treeProjection: MessageTreeProjection<StructuralMessageHeader>
-  authoritativePathHeaders?: readonly MessageHeaderRow[]
-  presentationOnly?: boolean
-  allowPresentationStreamProjection?: boolean
+  contextPreviewFrozen?: boolean
+  transcriptLoadFailed?: boolean
   onLoadOlderMessages: () => void
 }
-
-// Stable reference so `useChatStore(selector)` doesn't allocate a fresh `{}`
-// every render — that triggers React 19's infinite-rerender detection via
-// `useSyncExternalStore` (getSnapshot must return a stable value).
-const EMPTY_CURSOR: CursorMap = Object.freeze({})
-const EMPTY_ENDPOINTS: readonly ModelEndpoint[] = Object.freeze([])
-const EMPTY_MESSAGE_HEADERS: readonly MessageHeaderRow[] = Object.freeze([])
 
 interface InsertTarget {
   messageId: MessageId
   slot: InsertSlot
   defaultRole: MessageRole
-}
-
-interface PrependViewportAnchor {
-  readonly anchorMessageId: MessageId
-  readonly initialWindowOffset: number
-  readonly active: boolean
-  readonly retained: boolean
-  activate(input: { windowOffset: number; anchorMessageId: MessageId | undefined }): void
-  dispose(): void
-}
-
-const PREPEND_ANCHOR_TOLERANCE_PX = 0.5
-const PREPEND_CANCEL_EVENTS = ['wheel', 'touchmove', 'pointerdown', 'keydown'] as const
-const PASSIVE_LISTENER = { passive: true }
-
-function createPrependViewportAnchor({
-  element,
-  container,
-  anchorMessageId,
-  initialWindowOffset,
-  onDispose,
-}: {
-  element: HTMLElement
-  container: HTMLDivElement
-  anchorMessageId: MessageId
-  initialWindowOffset: number
-  onDispose: (anchor: PrependViewportAnchor) => void
-}): PrependViewportAnchor {
-  const targetTop = element.getBoundingClientRect().top
-  let active = false
-  let disposed = false
-  let frame: number | null = null
-  let acceptedScrollTop = container.scrollTop
-  let resizeObserver: ResizeObserver | null = null
-
-  const dispose = () => {
-    if (disposed) return
-    disposed = true
-    resizeObserver?.disconnect()
-    resizeObserver = null
-    if (frame !== null) cancelAnimationFrame(frame)
-    frame = null
-    container.removeEventListener('scroll', cancelForUserScroll)
-    for (const event of PREPEND_CANCEL_EVENTS) {
-      container.removeEventListener(event, cancelForUserIntent)
-    }
-    onDispose(anchor)
-  }
-
-  const correct = () => {
-    if (!element.isConnected || !container.isConnected) {
-      dispose()
-      return false
-    }
-    const delta = element.getBoundingClientRect().top - targetTop
-    if (Math.abs(delta) <= PREPEND_ANCHOR_TOLERANCE_PX) return false
-    container.scrollTop += delta
-    acceptedScrollTop = container.scrollTop
-    return true
-  }
-
-  const schedule = () => {
-    if (disposed || !active || frame !== null) return
-    frame = requestAnimationFrame(() => {
-      frame = null
-      correct()
-    })
-  }
-
-  function cancelForUserIntent() {
-    dispose()
-  }
-
-  function cancelForUserScroll() {
-    if (Math.abs(container.scrollTop - acceptedScrollTop) <= PREPEND_ANCHOR_TOLERANCE_PX) return
-    dispose()
-  }
-
-  container.addEventListener('scroll', cancelForUserScroll, PASSIVE_LISTENER)
-  for (const event of PREPEND_CANCEL_EVENTS) {
-    container.addEventListener(event, cancelForUserIntent, PASSIVE_LISTENER)
-  }
-
-  const anchor: PrependViewportAnchor = {
-    anchorMessageId,
-    initialWindowOffset,
-    get active() {
-      return active
-    },
-    get retained() {
-      return element.isConnected && element.getAttribute('data-message-id') === anchorMessageId
-    },
-    activate({ windowOffset, anchorMessageId }) {
-      if (disposed) return
-      const prependedCount = initialWindowOffset - windowOffset
-      if (
-        active ||
-        prependedCount <= 0 ||
-        anchorMessageId !== anchor.anchorMessageId ||
-        !element.isConnected ||
-        element.getAttribute('data-message-id') !== anchor.anchorMessageId
-      ) {
-        if (!active) dispose()
-        return
-      }
-      active = true
-      if (typeof ResizeObserver !== 'undefined') {
-        resizeObserver = new ResizeObserver(schedule)
-        let candidate = element.previousElementSibling
-        for (let index = 0; index < prependedCount && candidate; index += 1) {
-          resizeObserver.observe(candidate)
-          candidate = candidate.previousElementSibling
-        }
-      }
-      correct()
-      schedule()
-    },
-    dispose,
-  }
-  return anchor
-}
-
-type MessageListIndexOperation = 'path-index'
-let messageListIndexProbe: ((operation: MessageListIndexOperation) => void) | undefined
-
-export function __setMessageListIndexProbeForTests(
-  probe: ((operation: MessageListIndexOperation) => void) | undefined,
-): void {
-  messageListIndexProbe = probe
 }
 
 // Pick the conversational counterpart of a role. user↔assistant is the
@@ -237,67 +97,66 @@ function oppositeRole(role: MessageRole): MessageRole {
 // chat width) on the Shell don't cascade into a re-render of the
 // markdown-heavy children.
 export const MessageList = memo(function MessageList({
-  chatId,
+  binding,
   chatSettings,
-  hasConnection,
+  generationCapabilityFrame,
   capability,
-  prefillRecommendationEndpoints = EMPTY_ENDPOINTS,
+  prefillPlan,
   longMessageDisplayMode = 'full',
-  messageRenderWindowSize,
+  messageInitialRenderWork,
   messageRenderWindowLoadMode,
-  branchSnapshot,
-  treeProjection,
-  authoritativePathHeaders,
-  presentationOnly = false,
-  allowPresentationStreamProjection = false,
+  contextPreviewFrozen = false,
+  transcriptLoadFailed = false,
   onLoadOlderMessages,
 }: MessageListProps) {
-  const cursor = useChatStore((state) => state.getCursor(chatId) ?? EMPTY_CURSOR)
-  const messages = useStableMessageRows(branchSnapshot?.branchWindow ?? [])
-  const branchHeaders = branchSnapshot?.branchHeaders ?? EMPTY_MESSAGE_HEADERS
-  const activePathHeaders = authoritativePathHeaders ?? branchHeaders
-  const pathById = useMemo(() => {
-    messageListIndexProbe?.('path-index')
-    return indexById(messages)
-  }, [messages])
-  const { liveByParent } = treeProjection
-  const branchContext: BranchNavigationContext = treeProjection
-  const visiblePath = messages
-  const hiddenOlderCount = branchSnapshot?.windowOffset ?? 0
-  const branchLength =
-    authoritativePathHeaders?.length ?? branchSnapshot?.branchLength ?? visiblePath.length
-  const path = visiblePath
-  const hasAnyReasoningDetails = useMemo(
-    () => path.some((m) => (m.reasoningDetails?.length ?? 0) > 0),
-    [path],
-  )
-  const { sendFrom } = useChat()
-  const pushToast = useToastStore((s) => s.push)
+  const chatId = binding.seal.chatId
+  const branchSnapshot = binding.window
+  const branchSpine = binding.spine
+  const activePath = binding.spine.path
+  const presentationOnly = binding.currency !== 'current'
+  const hiddenOlderCount = branchSnapshot.offset
+  const staleBodyCount = branchSnapshot.staleBodyCount
+  const canRetryLoadedBodies = transcriptLoadFailed && staleBodyCount > 0
+  const branchLength = activePath.length
   const [insertTarget, setInsertTarget] = useState<InsertTarget | null>(null)
   // Track the set of user-message ids whose content was edited in THIS
   // tab session; used to surface the "stale reply?" hint under their
   // next assistant on the active path. The stale-session lives only in
   // memory — reloads wipe it per §10.6 "Edit action" session-local hint.
   const [staleHintFor, setStaleHintFor] = useState<Set<MessageId>>(() => new Set())
-
-  const opsCtx = useMemo<MessageOpsContext>(() => ({ chatId, sendFrom }), [chatId, sendFrom])
+  const contextPreviewPath = useStreamStableBranchPath(activePath, contextPreviewFrozen)
+  const { run: runConversationMutationInteraction } = usePresentationInteraction(
+    conversationMutationInteraction,
+    { observePending: false },
+  )
+  const runConversationMutation = useCallback(
+    (
+      intent: ConversationMutationIntent,
+      action: () => Promise<void>,
+      commit?: () => void,
+    ): TotalPresentationInteractionPromise<void> => {
+      const target = conversationMutationTarget(intent)
+      if (!commit) return runConversationMutationInteraction({ target, action }).settled
+      return runConversationMutationInteraction({
+        target,
+        action,
+        commit: () => {
+          commit()
+          return undefined
+        },
+      }).settled
+    },
+    [runConversationMutationInteraction],
+  )
 
   // Prefill UI gating for the inline editor's "Save & Send" path. The
   // button hides on `unsupported` models (Claude ≥ 4.6 / OpenAI / gpt-oss);
   // on every other class it shows up next to Save & Send.
-  const prefillSupported = chatSettings.model
-    ? prefillClassFor(chatSettings.model) !== 'unsupported'
-    : false
+  const prefillSupported = prefillPlan.availability !== 'unsupported'
   const prefillSettingsPrompt = useMemo(
     () =>
-      prefillSupported ? (
-        <PrefillSettingsPrompt
-          chatId={chatId}
-          settings={chatSettings}
-          endpoints={prefillRecommendationEndpoints}
-        />
-      ) : undefined,
-    [chatId, chatSettings, prefillRecommendationEndpoints, prefillSupported],
+      prefillSupported ? <PrefillSettingsPrompt chatId={chatId} plan={prefillPlan} /> : undefined,
+    [chatId, prefillPlan, prefillSupported],
   )
   // Track the focused message id via a ref; the DOM's `:focus-within` +
   // `data-message-id` tuple on each <article> identifies which message the
@@ -305,7 +164,7 @@ export const MessageList = memo(function MessageList({
   // clicked" without forcing a controlled-selection state.
   const listRef = useRef<HTMLDivElement | null>(null)
   const loadOlderRef = useRef<HTMLDivElement | null>(null)
-  const pendingPrependAnchorRef = useRef<PrependViewportAnchor | null>(null)
+  const scrollRegionState = useScrollRegionState()
   const focusedMessageId = useCallback((): MessageId | null => {
     const el = listRef.current?.querySelector<HTMLElement>('[data-ui="message"]:focus-within')
     return el?.getAttribute('data-message-id') ?? null
@@ -315,172 +174,98 @@ export const MessageList = memo(function MessageList({
     if (presentationOnly) setInsertTarget(null)
   }, [presentationOnly])
 
+  const handleBeginEdit = useCallback(
+    (presentationFence: WorkspaceFence, message: MessageRow) =>
+      conversationActions.beginMessageEditSession(presentationFence, message.chatId, message.id),
+    [],
+  )
+
   const handleEditInPlace = useCallback(
-    async (m: MessageRow, text: string) => {
-      await editInPlace(chatId, m, text, {
-        ...(authoritativePathHeaders ? { pathHeaders: authoritativePathHeaders } : {}),
-      })
-      if (m.role === 'user') {
-        setStaleHintFor((prev) => {
-          if (prev.has(m.id)) return prev
-          const next = new Set(prev)
-          next.add(m.id)
-          return next
-        })
-      }
-    },
-    [authoritativePathHeaders, chatId],
+    (m: MessageRow, text: string) =>
+      runConversationMutation(
+        { kind: 'edit', chatId, messageId: m.id },
+        () => conversationActions.editMessage(chatId, m, text),
+        m.role === 'user'
+          ? () => {
+              setStaleHintFor((prev) => {
+                if (prev.has(m.id)) return prev
+                const next = new Set(prev)
+                next.add(m.id)
+                return next
+              })
+            }
+          : undefined,
+      ),
+    [chatId, runConversationMutation],
   )
   const handleToggleReasoningHidden = useCallback(
-    async (m: MessageRow, detailIndex: number) => {
-      try {
-        await toggleReasoningDetailHidden(chatId, m.id, detailIndex, {
-          ...(authoritativePathHeaders ? { pathHeaders: authoritativePathHeaders } : {}),
-        })
-      } catch (error) {
-        pushToast({
-          level: 'danger',
-          text: `Reasoning visibility update failed: ${error instanceof Error ? error.message : 'unknown error'}`,
-        })
-      }
-    },
-    [authoritativePathHeaders, chatId, pushToast],
+    (m: MessageRow, member: ReasoningMemberRef) =>
+      runConversationMutation({ kind: 'reasoning', chatId, messageId: m.id, member }, () =>
+        conversationActions.toggleReasoning(chatId, m, member),
+      ),
+    [chatId, runConversationMutation],
   )
   const handleToggleToolHidden = useCallback(
-    async (m: MessageRow, itemIndex: number) => {
-      try {
-        await toggleProviderOutputItemHidden(chatId, m.id, itemIndex, {
-          ...(authoritativePathHeaders ? { pathHeaders: authoritativePathHeaders } : {}),
-        })
-      } catch (error) {
-        pushToast({
-          level: 'danger',
-          text: `Tool visibility update failed: ${error instanceof Error ? error.message : 'unknown error'}`,
-        })
-      }
-    },
-    [authoritativePathHeaders, chatId, pushToast],
+    (m: MessageRow, member: ProviderOutputMemberRef) =>
+      runConversationMutation({ kind: 'provider-output', chatId, messageId: m.id, member }, () =>
+        conversationActions.toggleProviderOutput(chatId, m, member),
+      ),
+    [chatId, runConversationMutation],
   )
   const handleToggleContextVisibility = useCallback(
-    async (m: MessageRow) => {
-      await toggleMessageContextHidden(chatId, m.id, {
-        ...(authoritativePathHeaders ? { pathHeaders: authoritativePathHeaders } : {}),
-      })
-    },
-    [authoritativePathHeaders, chatId],
+    (m: MessageRow) =>
+      runConversationMutation({ kind: 'context', chatId, messageId: m.id }, () =>
+        conversationActions.toggleContext(chatId, m),
+      ),
+    [chatId, runConversationMutation],
   )
   const handleDismissGenerationNotice = useCallback(
-    async (m: MessageRow) => {
-      await dismissMessageGenerationNotice(chatId, m.id, {
-        ...(authoritativePathHeaders ? { pathHeaders: authoritativePathHeaders } : {}),
-      })
-    },
-    [authoritativePathHeaders, chatId],
+    (m: MessageRow) =>
+      runConversationMutation({ kind: 'generation-notice', chatId, messageId: m.id }, () =>
+        conversationActions.dismissGenerationNotice(chatId, m),
+      ),
+    [chatId, runConversationMutation],
   )
   const handleMutateAttachmentRef = useCallback(
-    async (m: MessageRow, mutation: MessageAttachmentRefMutation) => {
-      await mutateMessageAttachmentReference(chatId, m.id, mutation, {
-        ...(authoritativePathHeaders ? { pathHeaders: authoritativePathHeaders } : {}),
-      })
-    },
-    [authoritativePathHeaders, chatId],
+    (m: MessageRow, mutation: MessageAttachmentRefMutation) =>
+      conversationActions.mutateAttachment(m, mutation),
+    [],
   )
 
   const handleEditAndSend = useCallback(
-    async (
+    (
       m: MessageRow,
       text: string,
       opts?: { prefillText?: string; attachmentRefs?: MessageAttachmentRef[] },
-    ) => {
-      try {
-        const prefillText = opts?.prefillText ?? ''
-        await editAndResend(opsCtx, m, text, {
-          ...(prefillText.length > 0
-            ? { prefillContent: [{ type: 'text', text: prefillText }] }
-            : {}),
-          ...(opts?.attachmentRefs ? { attachmentRefs: opts.attachmentRefs } : {}),
-        })
-      } catch (err) {
-        pushToast({
-          level: 'danger',
-          text: err instanceof Error ? `Send failed: ${err.message}` : 'Send failed.',
-        })
-      }
-    },
-    [opsCtx, pushToast],
+    ) => conversationActions.editAndResend(chatId, m, text, opts),
+    [chatId],
   )
 
   const handleRegenerate = useCallback(
-    async (m: MessageRow) => {
-      try {
-        await regenerateFromMessage(opsCtx, m)
-      } catch (err) {
-        pushToast({
-          level: 'danger',
-          text: err instanceof Error ? `Regenerate failed: ${err.message}` : 'Regenerate failed.',
-        })
-      }
-    },
-    [opsCtx, pushToast],
+    (m: MessageRow, options?: { settingsPatch?: ChatSettingsPatch }) =>
+      conversationActions.regenerate(chatId, m, options),
+    [chatId],
   )
 
   const handleContinue = useCallback(
-    async (m: MessageRow) => {
-      try {
-        await continueFromMessage(opsCtx, m)
-      } catch (err) {
-        pushToast({
-          level: 'danger',
-          text: err instanceof Error ? `Continue failed: ${err.message}` : 'Continue failed.',
-        })
-      }
-    },
-    [opsCtx, pushToast],
+    (m: MessageRow) => conversationActions.continueMessage(chatId, m),
+    [chatId],
   )
 
   const handleForkChat = useCallback(
-    async (m: MessageRow) => {
-      const routeIntent = beginRouteIntent()
-      try {
-        const sourceChat = await getChat(chatId)
-        if (!sourceChat) {
-          pushToast({ level: 'danger', text: 'Chat not found.' })
-          return
-        }
-        const existing = await listChatSidebarRows()
-        const defaultTitle = computeBranchTitle(
-          sourceChat.title,
-          existing.map((c) => c.title),
-        )
-        if (!isRouteIntentCurrent(routeIntent)) return
-        const chosen =
-          typeof window !== 'undefined'
-            ? window.prompt('Name the new chat:', defaultTitle)
-            : defaultTitle
-        if (chosen === null) return
-        const title = chosen.trim() || defaultTitle
-        const currentCursor = useChatStore.getState().getCursor(chatId) ?? EMPTY_CURSOR
-        const result = await forkChatFromMessage({
-          chatId,
-          messageId: m.id,
-          title,
-          cursor: currentCursor,
-        })
-        pushToast({
-          level: 'success',
-          text: `Forked to "${title}" (${result.messageCount} messages).`,
-        })
-        navigateForIntent(routeIntent, chatHref(result.chatId))
-      } catch (err) {
-        pushToast({
-          level: 'danger',
-          text: err instanceof Error ? `Fork failed: ${err.message}` : 'Fork failed.',
-        })
-      } finally {
-        cancelRouteIntent(routeIntent)
-      }
-    },
-    [chatId, pushToast],
+    (m: MessageRow) =>
+      runConversationMutation({ kind: 'fork', chatId, messageId: m.id }, () =>
+        conversationActions.forkMessage(chatId, m),
+      ),
+    [chatId, runConversationMutation],
+  )
+
+  const handleDeleteMessage = useCallback(
+    (m: MessageRow, mode: ConversationDeleteMode, roleMismatch = false) =>
+      runConversationMutation({ kind: 'delete', chatId }, () =>
+        conversationActions.deleteMessage(chatId, m.id, mode, roleMismatch),
+      ),
+    [chatId, runConversationMutation],
   )
 
   // Smart role defaults per the user's "insert should be smart" rule:
@@ -508,28 +293,38 @@ export const MessageList = memo(function MessageList({
       if (isTyping) return
       const focusedId = focusedMessageId()
       if (!focusedId) return
-      const focused = pathById.get(focusedId)
-      if (!focused) return
+      const focusedRow = transcriptBodyWindowFindRow(branchSnapshot, focusedId)
+      if (!focusedRow) return
+      const focused = focusedRow.message
       if (e.key === '[' || e.key === ']') {
         e.preventDefault()
-        const direction = e.key === '[' ? -1 : 1
-        const base = useChatStore.getState().getCursor(chatId) ?? {}
-        const { cursorUpdates } = swipeProjected({
-          projection: treeProjection,
-          targetId: focusedId,
-          direction,
-          cursor: base,
-        })
-        const chosenId = cursorUpdates[cursorKeyOf(focused.parentId)]
-        useChatStore.getState().navigateWithCursorPatch(chatId, cursorUpdates)
-        if (chosenId) {
-          const siblings = liveByParent.get(focused.parentId) ?? []
-          const targetIndex = siblings.findIndex((candidate) => candidate.id === chosenId)
-          if (targetIndex >= 0) announceVariantPosition(targetIndex, siblings.length)
-        }
+        const slot = branchSpine.forkFor(focusedId)
+        if (!slot || slot.liveCount < 2) return
+        const movingBackward = e.key === '['
+        const chosenId = movingBackward
+          ? (slot.previousMessageId ?? slot.lastMessageId)
+          : (slot.nextMessageId ?? slot.firstMessageId)
+        const targetIndex = movingBackward
+          ? (slot.position - 1 + slot.liveCount) % slot.liveCount
+          : (slot.position + 1) % slot.liveCount
+        navigateConversationMessage(chatId, chosenId)
+        announceVariantPosition(targetIndex, slot.liveCount)
         return
       }
-      if (e.key === 'R' && e.shiftKey && (e.metaKey || e.ctrlKey) && focused.role === 'assistant') {
+      if (
+        e.key === 'R' &&
+        e.shiftKey &&
+        (e.metaKey || e.ctrlKey) &&
+        focused.role === 'assistant' &&
+        focusedRow.bodyExact &&
+        generationCapabilityAvailable(
+          generationCapabilityFrame.capability({
+            kind: 'regenerate',
+            chatId,
+            targetAssistantId: focused.id,
+          }),
+        )
+      ) {
         e.preventDefault()
         void handleRegenerate(focused)
       }
@@ -537,116 +332,43 @@ export const MessageList = memo(function MessageList({
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [
+    branchSnapshot,
+    branchSpine,
     chatId,
-    pathById,
-    liveByParent,
-    treeProjection,
     focusedMessageId,
+    generationCapabilityFrame,
     handleRegenerate,
     presentationOnly,
   ])
 
-  const activePathIndexById = useMemo(() => {
-    const indexes = new Map<MessageId, number>()
-    for (let index = 0; index < activePathHeaders.length; index += 1) {
-      const header = activePathHeaders[index]
-      if (header) indexes.set(header.id, index)
-    }
-    return indexes
-  }, [activePathHeaders])
-
   const roleMismatchIdsOnPath = useMemo(() => {
     const set = new Set<MessageId>()
-    for (let i = 1; i < activePathHeaders.length; i += 1) {
-      const prev = activePathHeaders[i - 1]
-      const cur = activePathHeaders[i]
-      if (!prev || !cur) continue
-      if (prev.role === cur.role) {
-        set.add(cur.id)
-      }
+    for (const { header } of transcriptBodyWindowRows(branchSnapshot)) {
+      const prev = header.parentId ? activePath.get(header.parentId) : undefined
+      if (prev?.role === header.role) set.add(header.id)
     }
     return set
-  }, [activePathHeaders])
+  }, [activePath, branchSnapshot])
 
   const excludedIds = useMemo(() => {
-    return computeExcludedIds(activePathHeaders, pathById, chatSettings, capability)
-  }, [activePathHeaders, pathById, chatSettings, capability])
-  const effectiveRenderedMessageCount = visiblePath.length
+    return computeExcludedIds(
+      contextPreviewPath?.materializeNodes() ?? [],
+      chatSettings,
+      capability,
+    )
+  }, [capability, chatSettings, contextPreviewPath])
+  const effectiveRenderedMessageCount = branchSnapshot.rowCount
   const loadOlderMessages = useCallback(() => {
     if (presentationOnly) return
-    if (hiddenOlderCount <= 0) return
-    const container = listRef.current?.closest<HTMLDivElement>('[data-ui="scroll-region"]')
-    const observed = listRef.current
-    const element = observed?.querySelector<HTMLElement>('[data-ui="message"]')
-    const anchorMessageId = element?.getAttribute('data-message-id') as MessageId | null
-    pendingPrependAnchorRef.current?.dispose()
-    if (container && observed && element && anchorMessageId) {
-      const anchor = createPrependViewportAnchor({
-        element,
-        container,
-        anchorMessageId,
-        initialWindowOffset: hiddenOlderCount,
-        onDispose: (disposedAnchor) => {
-          if (pendingPrependAnchorRef.current === disposedAnchor) {
-            pendingPrependAnchorRef.current = null
-          }
-        },
-      })
-      pendingPrependAnchorRef.current = anchor
-    }
+    if (hiddenOlderCount <= 0 && !canRetryLoadedBodies) return
     onLoadOlderMessages()
-  }, [hiddenOlderCount, onLoadOlderMessages, presentationOnly])
-
-  useLayoutEffect(() => {
-    const anchor = pendingPrependAnchorRef.current
-    if (!anchor) return
-    if (anchor.active) {
-      const anchorIndex = anchor.initialWindowOffset - hiddenOlderCount
-      if (
-        !anchor.retained ||
-        anchorIndex < 0 ||
-        visiblePath[anchorIndex]?.id !== anchor.anchorMessageId
-      ) {
-        anchor.dispose()
-      }
-      return
-    }
-    if (hiddenOlderCount === anchor.initialWindowOffset) {
-      if (!anchor.retained || visiblePath[0]?.id !== anchor.anchorMessageId) {
-        anchor.dispose()
-      }
-      return
-    }
-    const prependedCount = anchor.initialWindowOffset - hiddenOlderCount
-    if (prependedCount <= 0) {
-      anchor.dispose()
-      return
-    }
-    anchor.activate({
-      windowOffset: hiddenOlderCount,
-      anchorMessageId: visiblePath[prependedCount]?.id,
-    })
-  }, [hiddenOlderCount, visiblePath])
-
-  const prependAnchorScope = `${chatId}\u0000${messageRenderWindowLoadMode}\u0000${messageRenderWindowSize}`
-  const previousPrependAnchorScopeRef = useRef(prependAnchorScope)
-  useLayoutEffect(() => {
-    if (previousPrependAnchorScopeRef.current === prependAnchorScope) return
-    previousPrependAnchorScopeRef.current = prependAnchorScope
-    pendingPrependAnchorRef.current?.dispose()
-  }, [prependAnchorScope])
-
-  useEffect(
-    () => () => {
-      pendingPrependAnchorRef.current?.dispose()
-    },
-    [],
-  )
+  }, [canRetryLoadedBodies, hiddenOlderCount, onLoadOlderMessages, presentationOnly])
 
   useEffect(() => {
     if (presentationOnly) return
     if (messageRenderWindowLoadMode !== 'auto') return
     if (hiddenOlderCount <= 0) return
+    if (scrollRegionState !== 'pinned') return
     if (typeof IntersectionObserver === 'undefined') return
     const target = loadOlderRef.current
     const root = listRef.current?.closest<HTMLDivElement>('[data-ui="scroll-region"]')
@@ -659,37 +381,138 @@ export const MessageList = memo(function MessageList({
     )
     observer.observe(target)
     return () => observer.disconnect()
-  }, [hiddenOlderCount, loadOlderMessages, messageRenderWindowLoadMode, presentationOnly])
+  }, [
+    hiddenOlderCount,
+    loadOlderMessages,
+    messageRenderWindowLoadMode,
+    presentationOnly,
+    scrollRegionState,
+  ])
 
-  const blockPresentationInteraction = useCallback(
-    (event: SyntheticEvent) => {
-      if (!presentationOnly) return
-      event.preventDefault()
-      event.stopPropagation()
+  const renderMessageRow = useCallback(
+    ({ message: m, bodyVersion, bodyExact }: TranscriptBodyWindowRow): ReactNode => {
+      const showStaleHint =
+        m.role === 'assistant' && m.parentId !== null && staleHintFor.has(m.parentId)
+      const branchContext = branchSpine.forkFor(m.id)
+      const hasSiblingVariants = (branchContext?.liveCount ?? 0) > 1
+      const editResendCapability =
+        m.role === 'user'
+          ? generationCapabilityFrame.capability({
+              kind: 'edit-resend',
+              chatId,
+              targetUserId: m.id,
+            })
+          : pendingGenerationCapability('prompt-path')
+      const regenerateCapability =
+        m.role === 'assistant'
+          ? generationCapabilityFrame.capability({
+              kind: 'regenerate',
+              chatId,
+              targetAssistantId: m.id,
+            })
+          : pendingGenerationCapability('prompt-path')
+      const continueCapability =
+        m.role === 'assistant'
+          ? generationCapabilityFrame.capability({
+              kind: 'continue',
+              chatId,
+              targetAssistantId: m.id,
+            })
+          : pendingGenerationCapability('prompt-path')
+      return (
+        <Message
+          key={m.id}
+          chatId={chatId}
+          message={m}
+          bodyVersion={bodyVersion}
+          bodyExact={bodyExact}
+          {...(hasSiblingVariants && branchContext ? { branchContext } : {})}
+          editResendCapability={editResendCapability}
+          regenerateCapability={regenerateCapability}
+          continueCapability={continueCapability}
+          presentationOnly={presentationOnly}
+          presentationFence={binding.seal}
+          onBeginEdit={handleBeginEdit}
+          onEditInPlace={handleEditInPlace}
+          onToggleContextVisibility={handleToggleContextVisibility}
+          onDismissGenerationNotice={handleDismissGenerationNotice}
+          onMutateAttachmentRef={handleMutateAttachmentRef}
+          onToggleReasoningDetailHidden={handleToggleReasoningHidden}
+          onToggleProviderOutputItemHidden={handleToggleToolHidden}
+          {...(m.role === 'user'
+            ? {
+                onEditAndSend: handleEditAndSend,
+                ...(prefillSupported
+                  ? {
+                      showPrefillButton: true,
+                      defaultPrefill: chatSettings.defaultPrefill ?? '',
+                      prefillSettingsPrompt,
+                    }
+                  : {}),
+              }
+            : {})}
+          {...(m.role === 'assistant'
+            ? {
+                onRegenerate: handleRegenerate,
+                onContinue: handleContinue,
+              }
+            : {})}
+          onForkChat={handleForkChat}
+          onDeleteMessage={handleDeleteMessage}
+          onInsert={openInsert}
+          {...(roleMismatchIdsOnPath.has(m.id) ? { roleMismatch: true } : {})}
+          {...(showStaleHint ? { staleReplyHint: true } : {})}
+          {...(excludedIds.has(m.id) ? { excludedFromContext: true } : {})}
+          longMessageDisplayMode={longMessageDisplayMode}
+        />
+      )
     },
-    [presentationOnly],
+    [
+      binding.seal,
+      branchSpine,
+      chatId,
+      chatSettings.defaultPrefill,
+      excludedIds,
+      generationCapabilityFrame,
+      handleContinue,
+      handleBeginEdit,
+      handleDismissGenerationNotice,
+      handleEditAndSend,
+      handleEditInPlace,
+      handleDeleteMessage,
+      handleForkChat,
+      handleMutateAttachmentRef,
+      handleRegenerate,
+      handleToggleContextVisibility,
+      handleToggleReasoningHidden,
+      handleToggleToolHidden,
+      longMessageDisplayMode,
+      openInsert,
+      prefillSettingsPrompt,
+      prefillSupported,
+      presentationOnly,
+      roleMismatchIdsOnPath,
+      staleHintFor,
+    ],
   )
 
   return (
     <div
       data-ui="message-list"
+      data-chat-id={chatId}
       role="log"
       aria-live={presentationOnly ? 'off' : 'polite'}
       aria-relevant="additions"
       ref={listRef}
-      data-render-window-size={messageRenderWindowSize}
+      data-initial-render-work={messageInitialRenderWork}
       data-rendered-count={effectiveRenderedMessageCount}
       data-total-count={branchLength}
-      inert={presentationOnly || undefined}
+      data-branch-counts="known"
       aria-busy={presentationOnly || undefined}
       data-presentation-only={presentationOnly || undefined}
-      onClickCapture={blockPresentationInteraction}
-      onAuxClickCapture={blockPresentationInteraction}
-      onContextMenuCapture={blockPresentationInteraction}
-      onKeyDownCapture={blockPresentationInteraction}
-      onSubmitCapture={blockPresentationInteraction}
+      inert={presentationOnly || undefined}
     >
-      {hiddenOlderCount > 0 ? (
+      {hiddenOlderCount > 0 || canRetryLoadedBodies ? (
         <div ref={loadOlderRef} data-ui="message-window-load">
           <Button
             type="button"
@@ -697,69 +520,14 @@ export const MessageList = memo(function MessageList({
             onClick={loadOlderMessages}
             disabled={presentationOnly}
           >
-            Load more
+            {transcriptLoadFailed ? 'Retry' : 'Load more'}
           </Button>
-          <span>{hiddenOlderCount} older</span>
+          {hiddenOlderCount > 0 ? <span>{hiddenOlderCount} older</span> : null}
         </div>
       ) : null}
-      {visiblePath.map((m, visibleIndex) => {
-        const activePathIndex = activePathIndexById.get(m.id)
-        const bodyVersion = branchHeaders[hiddenOlderCount + visibleIndex]?.bodyVersion as number
-        const prev =
-          activePathIndex !== undefined && activePathIndex > 0
-            ? activePathHeaders[activePathIndex - 1]
-            : undefined
-        const showStaleHint = m.role === 'assistant' && prev && staleHintFor.has(prev.id)
-        const hasSiblingVariants = (liveByParent.get(m.parentId)?.length ?? 0) > 1
-        return (
-          <Message
-            key={m.id}
-            chatId={chatId}
-            message={m}
-            bodyVersion={bodyVersion}
-            {...(hasSiblingVariants ? { branchContext } : {})}
-            hasAnyReasoningDetails={m.generation?.error ? hasAnyReasoningDetails : false}
-            hasConnection={hasConnection}
-            presentationOnly={presentationOnly}
-            allowPresentationStreamProjection={allowPresentationStreamProjection}
-            onEditInPlace={handleEditInPlace}
-            onToggleContextVisibility={handleToggleContextVisibility}
-            onDismissGenerationNotice={handleDismissGenerationNotice}
-            onMutateAttachmentRef={handleMutateAttachmentRef}
-            onToggleReasoningDetailHidden={handleToggleReasoningHidden}
-            onToggleProviderOutputItemHidden={handleToggleToolHidden}
-            {...(m.role === 'user'
-              ? {
-                  onEditAndSend: handleEditAndSend,
-                  ...(prefillSupported
-                    ? {
-                        showPrefillButton: true,
-                        defaultPrefill: chatSettings.defaultPrefill ?? '',
-                        prefillSettingsPrompt,
-                      }
-                    : {}),
-                }
-              : {})}
-            {...(m.role === 'assistant'
-              ? {
-                  onRegenerate: handleRegenerate,
-                  // Continue is offered on EVERY assistant — completed,
-                  // aborted, or errored — so the user can extend any
-                  // response in place. Original generation and reasoning
-                  // metadata stay untouched.
-                  onContinue: handleContinue,
-                }
-              : {})}
-            onForkChat={handleForkChat}
-            onInsert={openInsert}
-            {...(capability ? { capability } : {})}
-            {...(roleMismatchIdsOnPath.has(m.id) ? { roleMismatch: true } : {})}
-            {...(showStaleHint ? { staleReplyHint: true } : {})}
-            {...(excludedIds.has(m.id) ? { excludedFromContext: true } : {})}
-            longMessageDisplayMode={longMessageDisplayMode}
-          />
-        )
-      })}
+      {[...transcriptBodyWindowPages(branchSnapshot)].flatMap((page) =>
+        [...transcriptBodyPageRows(page)].map(renderMessageRow),
+      )}
       {insertTarget ? (
         <Suspense
           fallback={
@@ -774,11 +542,6 @@ export const MessageList = memo(function MessageList({
               kind: insertTarget.slot,
               messageId: insertTarget.messageId,
             }}
-            cursor={cursor}
-            presentationWindowLimit={Math.max(
-              1,
-              branchSnapshot?.windowLimit ?? messageRenderWindowSize,
-            )}
             defaultRole={insertTarget.defaultRole}
             onClose={() => setInsertTarget(null)}
             onDone={() => setInsertTarget(null)}
@@ -789,48 +552,15 @@ export const MessageList = memo(function MessageList({
   )
 })
 
-function useStableMessageRows(messages: readonly MessageRow[]): readonly MessageRow[] {
-  const rowCacheRef = useRef(new Map<MessageId, { nodeVersion: number; message: MessageRow }>())
-  const arrayCacheRef = useRef<readonly MessageRow[]>([])
-
-  return useMemo(() => {
-    const nextCache = new Map<MessageId, { nodeVersion: number; message: MessageRow }>()
-    const nextRows = messages.map((message) => {
-      const cached = rowCacheRef.current.get(message.id)
-      if (cached && cached.nodeVersion === message.nodeVersion) {
-        nextCache.set(message.id, cached)
-        return cached.message
-      }
-      const next = { nodeVersion: message.nodeVersion, message }
-      nextCache.set(message.id, next)
-      return message
-    })
-    rowCacheRef.current = nextCache
-    const prevRows = arrayCacheRef.current
-    if (
-      prevRows.length === nextRows.length &&
-      prevRows.every((message, index) => message === nextRows[index])
-    ) {
-      return prevRows
-    }
-    arrayCacheRef.current = nextRows
-    return nextRows
-  }, [messages])
-}
-
 // Compute which messages would be trimmed out of the next request given
 // the chat's context settings. Uses a chars/4 approximation — the real
 // tokenizer machinery lives in core/prompt-size but this runs per render
 // so cheap wins. Result drives the dashed-ring on profile glyphs.
 //
-// Algorithm:
-// - System prompt tokens are taken off the budget up front.
-// - The first `keepFirstPairs * 2` messages are pinned.
-// - The walk goes backward from the end, accumulating, until the budget
-//   overflows; everything untouched is "excluded".
 type ContextEstimateRow = Pick<
   MessageHeaderRow,
   | 'id'
+  | 'role'
   | 'hiddenFromContext'
   | 'originalCharCount'
   | 'charCountDelta'
@@ -840,31 +570,22 @@ type ContextEstimateRow = Pick<
 
 function computeExcludedIds(
   path: readonly ContextEstimateRow[],
-  hydratedById: ReadonlyMap<MessageId, MessageRow>,
   settings: ChatSettings,
   capability?: EffectiveCapability,
 ): Set<MessageId> {
   const out = new Set<MessageId>()
   if (path.length === 0) return out
-  // Live provider cap beats stale defaults. Without capability, exclusion
-  // can't be honestly computed, so the trim-cost side is skipped (only
-  // hiddenFromContext messages are marked). The 128k fallback formerly
-  // carried here produced false "excluded" rings on 1M-context Gemini
-  // models whenever the chat grew past 128k.
-  const providerCap = capability?.maxPromptTokens ?? capability?.contextLength
-  const customMaxStored = settings.customMaxContext
-  // `-1` means the user opted out of the local cap; no trim markers.
-  if (customMaxStored === UNLIMITED_CONTEXT) {
-    for (const m of path) if (m.hiddenFromContext) out.add(m.id)
-    return out
+  for (const message of path) {
+    if (message.hiddenFromContext) out.add(message.id)
   }
-  const modelCap = customMaxStored ?? providerCap
+  if (settings.contextStrategy.kind !== 'sliding_window') return out
+  const providerCap = capability?.maxPromptTokens ?? capability?.contextLength
+  const cutoff = resolveCutoff(settings, providerCap ?? null)
+  if (!Number.isFinite(cutoff)) return out
   const maxCompletionStored = settings.maxCompletionTokens
   const maxCompletion =
     maxCompletionStored === UNLIMITED_CONTEXT ? 0 : (maxCompletionStored ?? 4096)
-  const budget = modelCap !== undefined ? Math.max(0, modelCap - maxCompletion) : undefined
-  const strategy = settings.contextStrategy
-  const keepFirst = Math.max(0, (strategy.keepFirstPairs ?? 0) * 2)
+  const budget = Math.max(0, cutoff - maxCompletion)
   const tokensFor = (m: ContextEstimateRow): number | undefined => {
     if (typeof m.cachedTokenEstimate === 'number' && Number.isFinite(m.cachedTokenEstimate)) {
       return Math.max(0, Math.ceil(m.cachedTokenEstimate))
@@ -879,43 +600,40 @@ function computeExcludedIds(
           : 0
       return Math.ceil(Math.max(0, m.originalCharCount + delta) / 4)
     }
-    const hydrated = hydratedById.get(m.id)
-    // Cold headers intentionally omit bodies. Do not hydrate an unestimated
-    // legacy row or guess from its truncated preview just to draw a trim ring.
-    if (!hydrated) return undefined
-    let chars = 0
-    for (const item of hydrated.content) {
-      if (item.type === 'text' || item.type === 'output_text') chars += item.text.length
-    }
-    return Math.ceil(chars / 4)
+    return undefined
   }
-  // User-hidden messages are unconditionally excluded — they don't occupy
-  // any budget either. Filter them out of the working set first.
   const eligible = path.filter((m) => !m.hiddenFromContext)
-  for (const m of path) if (m.hiddenFromContext) out.add(m.id)
-  // No budget means trim-based exclusion can't be computed, only the
-  // hiddenFromContext set stays.
-  if (budget === undefined) return out
-
-  const sysTokens = Math.ceil(settings.systemPrompt.length / 4)
-  let spent = sysTokens
-  const kept = new Set<MessageId>()
-  for (let i = 0; i < Math.min(keepFirst, eligible.length); i += 1) {
-    const m = eligible[i]
-    if (!m) continue
-    const cost = tokensFor(m)
-    if (cost === undefined) return out
-    spent += cost
-    kept.add(m.id)
+  const grouped = groupUserAnchoredContextItems(eligible)
+  const bucketCost = (messages: readonly ContextEstimateRow[]): number | undefined => {
+    let total = 0
+    for (const message of messages) {
+      const cost = tokensFor(message)
+      if (cost === undefined) return undefined
+      total += cost
+    }
+    return total
   }
-  for (let i = eligible.length - 1; i >= keepFirst; i -= 1) {
-    const m = eligible[i]
-    if (!m) continue
-    const cost = tokensFor(m)
+  const preambleTokens = bucketCost(grouped.preamble)
+  if (preambleTokens === undefined) return out
+  const pairCosts: number[] = []
+  for (const pair of grouped.pairs) {
+    const cost = bucketCost(pair)
     if (cost === undefined) return out
-    if (spent + cost > budget) break
-    spent += cost
-    kept.add(m.id)
+    pairCosts.push(cost)
+  }
+  const selection = selectContextPairs({
+    pairCount: grouped.pairs.length,
+    keepFirstPairs: settings.contextStrategy.keepFirstPairs ?? 0,
+    availableTokens: budget - Math.ceil(settings.systemPrompt.length / 4) - preambleTokens,
+    pairCost: ({ pairIndex }) => pairCosts[pairIndex] ?? 0,
+  })
+  const kept = new Set<MessageId>()
+  for (const message of grouped.preamble) kept.add(message.id)
+  for (let index = 0; index < selection.headPairCount; index += 1) {
+    for (const message of grouped.pairs[index] ?? []) kept.add(message.id)
+  }
+  for (let index = selection.tailStart; index < grouped.pairs.length; index += 1) {
+    for (const message of grouped.pairs[index] ?? []) kept.add(message.id)
   }
   for (const m of eligible) if (!kept.has(m.id)) out.add(m.id)
   return out

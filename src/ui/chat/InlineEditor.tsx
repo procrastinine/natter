@@ -1,12 +1,5 @@
-// In-place edit surface for a single message. Plaintext for content; a
-// "Reasoning" advanced disclosure exposes each text-/summary-type
-// reasoning detail for inline editing (encrypted entries stay read-only
-// because their opaque carrier is provider-native and not safe to hand-
-// edit).
-//
-// The action row at the bottom mirrors the composer Send slot: edge-to-
-// edge full-width buttons with no internal padding. Save is the primary
-// action, Save & Send is the accent action for user messages.
+// In-place edit surface for a single message. Message edits own content only;
+// reasoning and provider output have their own visibility actions.
 
 import {
   type KeyboardEvent,
@@ -17,46 +10,35 @@ import {
   useRef,
   useState,
 } from 'react'
+import { generationCapabilityBlockedReason } from '../../core/interaction-capability'
+import type { AttachmentRef, MessageAttachmentRef } from '../../core/types'
+import { isPageHidingAbortError } from '../../lib/page-lifecycle'
 import type {
-  AttachmentRef,
-  ContentItem,
-  MessageAttachmentRef,
-  ProviderOutputDialect,
-  ProviderOutputItem,
-  ReasoningDetail,
-} from '../../core/types'
+  GenerationStartResult,
+  TotalPresentationInteractionPromise,
+} from '../../store/presentation-contracts'
 import { useAnnouncementStore } from '../../store/zustand/announcementStore'
 import { AttachmentDraftTray } from '../attachments/AttachmentDraftTray'
 import { AttachmentPicker } from '../attachments/AttachmentPicker'
 import { useAttachmentDrafts } from '../attachments/useAttachmentDrafts'
 import { DatabaseIcon, PaperclipIcon, PrefillIcon } from '../icons/Icon'
-import { Button, IconButton } from '../primitives/Button'
+import { Button } from '../primitives/Button'
+import { useScrollRegionCommands } from './ScrollRegion'
 
 interface InlineEditorProps {
   initial: string
-  onSave: (
-    text: string,
-    reasoning?: ReasoningDetail[],
-    attachmentRefs?: MessageAttachmentRef[],
-    providerOutputItems?: ProviderOutputItem[],
-  ) => void | Promise<void>
+  onSave: (text: string) => TotalPresentationInteractionPromise<void>
   onCancel: () => void
   onSaveAndSend?: (
     text: string,
     opts?: { prefillText?: string; attachmentRefs?: MessageAttachmentRef[] },
-  ) => void | Promise<void>
+  ) => GenerationStartResult
+  saveDisabled?: boolean
   saveAndSendDisabled?: boolean
   saveAndSendDisabledReason?: string
   ariaLabel?: string
-  // Optional starting reasoning-details list. When provided, the
-  // "Reasoning" disclosure is rendered; on save, the edited list is
-  // passed back via onSave's second argument. Keep reference stable
-  // across renders to avoid resetting the disclosure state.
-  initialReasoning?: ReasoningDetail[]
-  initialProviderOutputItems?: ProviderOutputItem[]
   initialAttachmentRefs?: readonly AttachmentRef[] | undefined
   attachmentsEnabled?: boolean
-  saveContentOnly?: boolean
   // Prefill toggle for Save & Send. Only applied to user messages
   // (assistants don't have a "send" path). Hidden when the model doesn't
   // support prefill. Empty / whitespace-only prefill text is treated as
@@ -69,31 +51,8 @@ interface InlineEditorProps {
 const MIN_TEXTAREA_ROWS = 6
 const MAX_TEXTAREA_PX = 600
 
-// Extract the single plaintext run from a message's content array. Phase 8.1
-// only edits text lanes; multi-modal content stays untouched on commit.
-export function plaintextOf(content: readonly ContentItem[]): string {
-  return content
-    .map((item) => (item.type === 'text' || item.type === 'output_text' ? item.text : ''))
-    .join('')
-}
-
-export function writeTextInto(prev: readonly ContentItem[], nextText: string): ContentItem[] {
-  let replaced = false
-  const out: ContentItem[] = []
-  for (const item of prev) {
-    if (item.type === 'text' || item.type === 'output_text') {
-      if (!replaced) {
-        out.push({ ...item, text: nextText })
-        replaced = true
-      }
-      continue
-    }
-    out.push(item)
-  }
-  if (!replaced) {
-    out.push({ type: 'text', text: nextText })
-  }
-  return out
+interface InlineEditorSession {
+  active: boolean
 }
 
 function autosize(el: HTMLTextAreaElement | null): void {
@@ -103,227 +62,26 @@ function autosize(el: HTMLTextAreaElement | null): void {
   el.style.height = `${next}px`
 }
 
-type EditableReasoning =
-  | {
-      kind: 'text'
-      text: string
-      index: number
-      hidden: boolean
-      original: ReasoningDetail | null
-    }
-  | {
-      kind: 'summary'
-      summary: string
-      index: number
-      hidden: boolean
-      original: ReasoningDetail | null
-    }
-  | {
-      kind: 'encrypted'
-      index: number
-      hidden: boolean
-      original: ReasoningDetail
-      bytes: number
-    }
-
-type EditableToolCall = {
-  editorId: string
-  dialect: ProviderOutputDialect
-  type: string
-  outputIndex: string
-  hidden: boolean
-  rawText: string
-  original: ProviderOutputItem | null
-  originalRawText: string
-}
-
-let nextToolCallEditorRowId = 0
-
-function allocateToolCallEditorId(): string {
-  nextToolCallEditorRowId += 1
-  return `tool-call-editor-${nextToolCallEditorRowId}`
-}
-
-function toEditable(list: ReasoningDetail[]): EditableReasoning[] {
-  return list.map((detail, i) => {
-    const hidden = detail.hidden === true
-    if (detail.type === 'reasoning.text') {
-      return {
-        kind: 'text',
-        text: detail.text ?? '',
-        index: detail.index ?? i,
-        hidden,
-        original: detail,
-      }
-    }
-    if (detail.type === 'reasoning.summary') {
-      return {
-        kind: 'summary',
-        summary: detail.summary,
-        index: detail.index ?? i,
-        hidden,
-        original: detail,
-      }
-    }
-    return {
-      kind: 'encrypted',
-      index: detail.index ?? i,
-      hidden,
-      original: detail,
-      bytes: new Blob([detail.data]).size,
-    }
-  })
-}
-
-function toEditableToolCalls(list: ProviderOutputItem[]): EditableToolCall[] {
-  return list.map((item) => {
-    const rawText = formatToolItemForEdit(item.item)
-    return {
-      editorId: allocateToolCallEditorId(),
-      dialect: item.dialect,
-      type: item.type,
-      outputIndex: item.outputIndex === undefined ? '' : String(item.outputIndex),
-      hidden: item.hidden === true,
-      rawText,
-      original: item,
-      originalRawText: rawText,
-    }
-  })
-}
-
-function fromEditable(list: EditableReasoning[]): ReasoningDetail[] {
-  return list.map((row) => {
-    if (row.kind === 'text') {
-      // `original` is null for rows the user added via "Add reasoning entry".
-      // Synthesize a minimal reasoning.text detail with the current index so
-      // downstream merge/filter logic treats it like any other entry.
-      const base = row.original ?? { type: 'reasoning.text', index: row.index }
-      return {
-        ...base,
-        type: 'reasoning.text',
-        text: row.text,
-        hidden: row.hidden || undefined,
-      } as ReasoningDetail
-    }
-    if (row.kind === 'summary') {
-      const base = row.original ?? { type: 'reasoning.summary', index: row.index, summary: '' }
-      return {
-        ...base,
-        type: 'reasoning.summary',
-        summary: row.summary,
-        hidden: row.hidden || undefined,
-      } as ReasoningDetail
-    }
-    return {
-      ...row.original,
-      hidden: row.hidden || undefined,
-    } as ReasoningDetail
-  })
-}
-
-function fromEditableToolCalls(list: EditableToolCall[]): ProviderOutputItem[] {
-  return list.map((row) => {
-    const outputIndex = parseOutputIndex(row.outputIndex)
-    const type = row.type.trim() || 'manual_tool_call'
-    const item = parseToolItemFromEdit(row.rawText)
-    const changed =
-      row.original === null ||
-      row.dialect !== row.original.dialect ||
-      type !== row.original.type ||
-      outputIndex !== row.original.outputIndex ||
-      row.rawText !== row.originalRawText
-    const outputItem =
-      row.original && changed ? preserveProviderSealedFields(row.original.item, item) : item
-    return {
-      dialect: row.dialect,
-      type,
-      ...(outputIndex !== undefined ? { outputIndex } : {}),
-      ...(row.hidden ? { hidden: true } : {}),
-      ...(row.original?.edited === true || changed ? { edited: true } : {}),
-      item: outputItem,
-    }
-  })
-}
-
-const PROVIDER_SEALED_FIELD_NAMES = new Set(['encrypted_content', 'thoughtSignature', 'signature'])
-
-function preserveProviderSealedFields(original: unknown, edited: unknown): unknown {
-  if (!original || typeof original !== 'object') return edited
-  if (!edited || typeof edited !== 'object') return edited
-  if (Array.isArray(original)) {
-    if (!Array.isArray(edited)) return edited
-    return edited.map((child, index) => preserveProviderSealedFields(original[index], child))
-  }
-  if (Array.isArray(edited)) return edited
-  const next: Record<string, unknown> = { ...(edited as Record<string, unknown>) }
-  for (const [key, originalChild] of Object.entries(original)) {
-    if (PROVIDER_SEALED_FIELD_NAMES.has(key)) {
-      next[key] = originalChild
-      continue
-    }
-    if (key in next) {
-      next[key] = preserveProviderSealedFields(originalChild, next[key])
-    }
-  }
-  return next
-}
-
-function formatToolItemForEdit(value: unknown): string {
-  if (typeof value === 'string') return value
-  try {
-    return JSON.stringify(value, null, 2)
-  } catch {
-    return String(value)
-  }
-}
-
-function parseToolItemFromEdit(raw: string): unknown {
-  const trimmed = raw.trim()
-  if (trimmed.length === 0) return ''
-  try {
-    return JSON.parse(trimmed)
-  } catch {
-    return raw
-  }
-}
-
-function parseOutputIndex(raw: string): number | undefined {
-  const trimmed = raw.trim()
-  if (trimmed.length === 0) return undefined
-  const parsed = Number(trimmed)
-  return Number.isInteger(parsed) && parsed >= 0 ? parsed : undefined
-}
-
 export function InlineEditor({
   initial,
   onSave,
   onCancel,
   onSaveAndSend,
+  saveDisabled,
   saveAndSendDisabled,
   saveAndSendDisabledReason,
   ariaLabel,
-  initialReasoning,
-  initialProviderOutputItems,
   initialAttachmentRefs,
   attachmentsEnabled = true,
-  saveContentOnly = false,
   showPrefillButton,
   defaultPrefill,
   prefillSettingsPrompt,
 }: InlineEditorProps) {
   const [text, setText] = useState(initial)
   const [busy, setBusy] = useState(false)
-  const [reasoningOpen, setReasoningOpen] = useState(false)
-  const [reasoning, setReasoning] = useState<EditableReasoning[]>(() =>
-    toEditable(initialReasoning ?? []),
-  )
-  const [toolCallsOpen, setToolCallsOpen] = useState(false)
-  const [toolCalls, setToolCalls] = useState<EditableToolCall[]>(() =>
-    toEditableToolCalls(initialProviderOutputItems ?? []),
-  )
+  const [saveAndSendError, setSaveAndSendError] = useState<string | null>(null)
   const attachments = useAttachmentDrafts(attachmentsEnabled ? initialAttachmentRefs : undefined)
   const {
-    initialAttachmentRefs: startingAttachmentRefs,
     attachmentRefs,
     attachmentRows,
     uploads,
@@ -339,8 +97,33 @@ export function InlineEditor({
   const [prefillText, setPrefillText] = useState(defaultPrefill ?? '')
   const textareaRef = useRef<HTMLTextAreaElement | null>(null)
   const actionsRef = useRef<HTMLDivElement | null>(null)
+  const scrollRegionCommands = useScrollRegionCommands()
   const prefillTextareaRef = useRef<HTMLTextAreaElement | null>(null)
+  const sessionRef = useRef<InlineEditorSession>({ active: false })
+  const onCancelRef = useRef(onCancel)
   const uploadingAttachments = uploads.some((upload) => upload.state === 'uploading')
+
+  useLayoutEffect(() => {
+    onCancelRef.current = onCancel
+  }, [onCancel])
+  useLayoutEffect(() => {
+    const session = sessionRef.current
+    session.active = true
+    return () => {
+      session.active = false
+    }
+  }, [])
+  const sessionIsCurrent = useCallback(
+    (session: InlineEditorSession) => sessionRef.current === session && session.active,
+    [],
+  )
+  const dismissIfCurrent = useCallback(
+    (session: InlineEditorSession) => {
+      if (!sessionIsCurrent(session)) return
+      onCancelRef.current()
+    },
+    [sessionIsCurrent],
+  )
 
   useEffect(() => {
     const el = textareaRef.current
@@ -353,52 +136,14 @@ export function InlineEditor({
     el.focus({ preventScroll: true })
     const end = el.value.length
     el.setSelectionRange(end, end)
-    if (typeof actionsRef.current?.scrollIntoView === 'function') {
-      actionsRef.current.scrollIntoView({ block: 'nearest', behavior: 'auto' })
-    }
-  }, [])
+    const actions = actionsRef.current
+    if (actions) scrollRegionCommands?.revealNearest(actions)
+  }, [scrollRegionCommands])
   // biome-ignore lint/correctness/useExhaustiveDependencies: text changes alter textarea scrollHeight.
   useLayoutEffect(() => {
     autosize(textareaRef.current)
   }, [text])
 
-  const run = useCallback(
-    async (
-      action: (
-        text: string,
-        reasoning?: ReasoningDetail[],
-        attachmentRefs?: MessageAttachmentRef[],
-        providerOutputItems?: ProviderOutputItem[],
-      ) => void | Promise<void>,
-    ) => {
-      // Empty messages are allowed — both Save (in place) and Save & Send
-      // commit whatever the user typed, including an empty string.
-      // Messages may legitimately be empty (placeholder turn, deliberate
-      // blank). The only place empty is blocked is the composer prompt
-      // input, where "send empty" has no well-defined meaning.
-      if (busy || uploadingAttachments) return
-      setBusy(true)
-      try {
-        const nextReasoning = initialReasoning ? fromEditable(reasoning) : undefined
-        const nextToolCalls = initialProviderOutputItems
-          ? fromEditableToolCalls(toolCalls)
-          : undefined
-        await action(text, nextReasoning, attachmentRefs, nextToolCalls)
-      } finally {
-        setBusy(false)
-      }
-    },
-    [
-      text,
-      busy,
-      uploadingAttachments,
-      initialReasoning,
-      reasoning,
-      attachmentRefs,
-      initialProviderOutputItems,
-      toolCalls,
-    ],
-  )
   const togglePrefill = useCallback(() => {
     if (prefillOpen) {
       setPrefillOpen(false)
@@ -413,55 +158,80 @@ export function InlineEditor({
   // flagging the "this reply may be stale" hint on downstream
   // assistant messages. Save & Send deliberately bypasses this check;
   // the user may want to re-send even when the text is unchanged.
-  const isUnchanged = useCallback(() => {
-    if (text !== initial) return false
-    if (saveContentOnly) return true
-    if (JSON.stringify(startingAttachmentRefs) !== JSON.stringify(attachmentRefs)) return false
-    if (!initialReasoning) return true
-    const nextReasoning = fromEditable(reasoning)
-    if (JSON.stringify(initialReasoning) !== JSON.stringify(nextReasoning)) return false
-    if (!initialProviderOutputItems) return true
-    const nextToolCalls = fromEditableToolCalls(toolCalls)
-    return JSON.stringify(initialProviderOutputItems) === JSON.stringify(nextToolCalls)
-  }, [
-    text,
-    initial,
-    saveContentOnly,
-    initialReasoning,
-    reasoning,
-    startingAttachmentRefs,
-    attachmentRefs,
-    initialProviderOutputItems,
-    toolCalls,
-  ])
+  const isUnchanged = useCallback(() => text === initial, [text, initial])
   const commitSave = useCallback(() => {
+    if (saveDisabled || busy || uploadingAttachments) return
     if (isUnchanged()) {
       onCancel()
       return
     }
-    return run(async (...args) => {
-      try {
-        await onSave(...args)
-        useAnnouncementStore.getState().announce({ text: 'Message saved.' })
-      } catch (error) {
-        useAnnouncementStore.getState().announce({
-          text: 'Edit failed.',
-          priority: 'assertive',
-        })
-        throw error
-      }
+    setBusy(true)
+    const session = sessionRef.current
+    const settlement = onSave(text)
+    void settlement.then((outcome) => {
+      if (!sessionIsCurrent(session)) return
+      setBusy(false)
+      if (outcome.kind !== 'succeeded') return
+      useAnnouncementStore.getState().announce({ text: 'Message saved.' })
+      dismissIfCurrent(session)
     })
-  }, [isUnchanged, onCancel, run, onSave])
+    return settlement
+  }, [
+    busy,
+    dismissIfCurrent,
+    isUnchanged,
+    onCancel,
+    onSave,
+    saveDisabled,
+    sessionIsCurrent,
+    text,
+    uploadingAttachments,
+  ])
   const commitSaveAndSend = useCallback(() => {
-    if (!onSaveAndSend || saveAndSendDisabled) return
+    if (!onSaveAndSend || saveAndSendDisabled || busy || uploadingAttachments) return
     const prefillOut = prefillOpen && prefillText.trim().length > 0 ? prefillText : ''
-    return run((next, _reasoning, attachmentRefs) =>
-      onSaveAndSend(next, {
-        ...(prefillOut.length > 0 ? { prefillText: prefillOut } : {}),
-        ...(attachmentRefs && attachmentRefs.length > 0 ? { attachmentRefs } : {}),
-      }),
-    )
-  }, [run, onSaveAndSend, saveAndSendDisabled, prefillOpen, prefillText])
+    setSaveAndSendError(null)
+    const start = onSaveAndSend(text, {
+      ...(prefillOut.length > 0 ? { prefillText: prefillOut } : {}),
+      ...(attachmentRefs.length > 0 ? { attachmentRefs } : {}),
+    })
+    if (start.kind === 'not-started') {
+      setSaveAndSendError(
+        generationCapabilityBlockedReason(start.capability, 'edit-resend') ?? null,
+      )
+      return
+    }
+    setBusy(true)
+    const session = sessionRef.current
+    void (async () => {
+      try {
+        await start.handle.prepared
+        dismissIfCurrent(session)
+      } catch (error) {
+        if (isPageHidingAbortError(error)) return
+        const completed = await start.handle.completed
+        if (sessionIsCurrent(session) && completed.outcome === 'error') {
+          setSaveAndSendError(
+            completed.error?.message ??
+              (error instanceof Error ? error.message : 'Generation preparation failed.'),
+          )
+        }
+      } finally {
+        if (sessionIsCurrent(session)) setBusy(false)
+      }
+    })()
+  }, [
+    attachmentRefs,
+    busy,
+    dismissIfCurrent,
+    onSaveAndSend,
+    prefillOpen,
+    prefillText,
+    saveAndSendDisabled,
+    sessionIsCurrent,
+    text,
+    uploadingAttachments,
+  ])
 
   const handleKey = useCallback(
     (e: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -482,63 +252,16 @@ export function InlineEditor({
     [commitSave, commitSaveAndSend, onCancel, onSaveAndSend, saveAndSendDisabled],
   )
 
-  const showReasoningSection = initialReasoning !== undefined
-  const showToolCallSection = initialProviderOutputItems !== undefined
-  const nextReasoningIndex = () => {
-    const indices = reasoning.map((r) => r.index)
-    return indices.length === 0 ? 0 : Math.max(...indices) + 1
-  }
-  const addReasoningRow = (kind: 'text' | 'summary') => {
-    const idx = nextReasoningIndex()
-    setReasoning((prev) =>
-      kind === 'text'
-        ? [...prev, { kind: 'text', text: '', index: idx, hidden: false, original: null }]
-        : [...prev, { kind: 'summary', summary: '', index: idx, hidden: false, original: null }],
-    )
-    setReasoningOpen(true)
-  }
-  const deleteRow = (rowIndex: number) => {
-    setReasoning((prev) => prev.filter((_, i) => i !== rowIndex))
-  }
-  const toggleHidden = (rowIndex: number) => {
-    setReasoning((prev) => prev.map((r, i) => (i === rowIndex ? { ...r, hidden: !r.hidden } : r)))
-  }
-  const nextToolCallIndex = () => {
-    const indices = toolCalls
-      .map((r) => parseOutputIndex(r.outputIndex))
-      .filter((value): value is number => value !== undefined)
-    return indices.length === 0 ? 0 : Math.max(...indices) + 1
-  }
-  const addToolCallRow = () => {
-    setToolCalls((prev) => [
-      ...prev,
-      {
-        editorId: allocateToolCallEditorId(),
-        dialect: 'unknown',
-        type: 'manual_tool_call',
-        outputIndex: String(nextToolCallIndex()),
-        hidden: false,
-        rawText: '{}',
-        original: null,
-        originalRawText: '{}',
-      },
-    ])
-    setToolCallsOpen(true)
-  }
-  const deleteToolCallRow = (rowIndex: number) => {
-    setToolCalls((prev) => prev.filter((_, i) => i !== rowIndex))
-  }
-  const toggleToolCallHidden = (rowIndex: number) => {
-    setToolCalls((prev) => prev.map((r, i) => (i === rowIndex ? { ...r, hidden: !r.hidden } : r)))
-  }
-
   return (
     <div data-ui="inline-editor" aria-busy={busy || undefined}>
       <textarea
         ref={textareaRef}
         data-ui="inline-editor-input"
         value={text}
-        onChange={(e) => setText(e.target.value)}
+        onChange={(e) => {
+          setText(e.target.value)
+          setSaveAndSendError(null)
+        }}
         onKeyDown={handleKey}
         aria-label={ariaLabel ?? 'Edit message'}
         rows={MIN_TEXTAREA_ROWS}
@@ -551,96 +274,16 @@ export function InlineEditor({
             ref={prefillTextareaRef}
             data-ui="inline-editor-prefill"
             value={prefillText}
-            onChange={(e) => setPrefillText(e.target.value)}
+            onChange={(e) => {
+              setPrefillText(e.target.value)
+              setSaveAndSendError(null)
+            }}
             placeholder="Assistant prefill — the model continues from this text…"
             rows={3}
             disabled={busy}
             aria-label="Assistant prefill text"
           />
         </>
-      ) : null}
-      {showReasoningSection ? (
-        <details
-          data-ui="inline-editor-reasoning"
-          open={reasoningOpen || reasoning.length === 0}
-          onToggle={(e) => setReasoningOpen((e.target as HTMLDetailsElement).open)}
-        >
-          <summary>Reasoning ({reasoning.length})</summary>
-          <div data-ui="inline-editor-reasoning-list">
-            {reasoning.map((row, i) => (
-              <ReasoningEditorRow
-                key={`${row.kind}-${row.index}`}
-                row={row}
-                busy={busy}
-                onChangeText={(next) =>
-                  setReasoning((prev) =>
-                    prev.map((p, idx) =>
-                      idx === i && p.kind === 'text' ? { ...p, text: next } : p,
-                    ),
-                  )
-                }
-                onChangeSummary={(next) =>
-                  setReasoning((prev) =>
-                    prev.map((p, idx) =>
-                      idx === i && p.kind === 'summary' ? { ...p, summary: next } : p,
-                    ),
-                  )
-                }
-                onToggleHidden={() => toggleHidden(i)}
-                onDelete={() => deleteRow(i)}
-              />
-            ))}
-          </div>
-          <AddReasoningEntry busy={busy} onAdd={addReasoningRow} />
-        </details>
-      ) : null}
-      {showToolCallSection ? (
-        <details
-          data-ui="inline-editor-tool-calls"
-          open={toolCallsOpen || toolCalls.length === 0}
-          onToggle={(e) => setToolCallsOpen((e.target as HTMLDetailsElement).open)}
-        >
-          <summary>Tool calls ({toolCalls.length})</summary>
-          <div data-ui="inline-editor-tool-call-list">
-            {toolCalls.map((row, i) => (
-              <ToolCallEditorRow
-                key={row.editorId}
-                row={row}
-                busy={busy}
-                onChangeDialect={(next) =>
-                  setToolCalls((prev) =>
-                    prev.map((p, idx) => (idx === i ? { ...p, dialect: next } : p)),
-                  )
-                }
-                onChangeType={(next) =>
-                  setToolCalls((prev) =>
-                    prev.map((p, idx) => (idx === i ? { ...p, type: next } : p)),
-                  )
-                }
-                onChangeOutputIndex={(next) =>
-                  setToolCalls((prev) =>
-                    prev.map((p, idx) => (idx === i ? { ...p, outputIndex: next } : p)),
-                  )
-                }
-                onChangeRawText={(next) =>
-                  setToolCalls((prev) =>
-                    prev.map((p, idx) => (idx === i ? { ...p, rawText: next } : p)),
-                  )
-                }
-                onToggleHidden={() => toggleToolCallHidden(i)}
-                onDelete={() => deleteToolCallRow(i)}
-              />
-            ))}
-          </div>
-          <Button
-            type="button"
-            data-ui="inline-editor-tool-call-add-button"
-            onClick={addToolCallRow}
-            disabled={busy}
-          >
-            + Add tool call
-          </Button>
-        </details>
       ) : null}
       {attachmentsEnabled && (attachmentRefs.length > 0 || uploads.length > 0) ? (
         <AttachmentDraftTray
@@ -733,8 +376,14 @@ export function InlineEditor({
           appearance="surface"
           geometry="flush"
           onClick={() => void commitSave()}
-          disabled={busy || uploadingAttachments}
-          title={uploadingAttachments ? 'Uploading attachments' : 'Save in place (⌘⏎)'}
+          disabled={busy || uploadingAttachments || saveDisabled}
+          title={
+            uploadingAttachments
+              ? 'Uploading attachments'
+              : saveDisabled
+                ? 'Preparing this edit'
+                : 'Save in place (⌘⏎)'
+          }
         >
           Save
         </Button>
@@ -759,282 +408,21 @@ export function InlineEditor({
           </Button>
         ) : null}
       </div>
+      {saveAndSendError ? (
+        <div data-ui="inline-editor-generation-error" role="alert">
+          {saveAndSendError}
+        </div>
+      ) : null}
       {attachmentsEnabled && pickerOpen ? (
         <AttachmentPicker
+          sessionSurface="picker-inline-editor"
           title="Use stored attachment"
           onClose={() => setPickerOpen(false)}
           onPick={(attachment) => {
             addAttachment(attachment)
-            setPickerOpen(false)
           }}
         />
       ) : null}
     </div>
-  )
-}
-
-function ReasoningEditorRow({
-  row,
-  busy,
-  onChangeText,
-  onChangeSummary,
-  onToggleHidden,
-  onDelete,
-}: {
-  row: EditableReasoning
-  busy: boolean
-  onChangeText: (next: string) => void
-  onChangeSummary: (next: string) => void
-  onToggleHidden: () => void
-  onDelete: () => void
-}) {
-  const label =
-    row.kind === 'encrypted'
-      ? `Encrypted #${row.index}`
-      : row.kind === 'summary'
-        ? `Summary #${row.index}`
-        : `Reasoning text #${row.index}`
-  return (
-    <div
-      data-ui="inline-editor-reasoning-row"
-      data-kind={row.kind}
-      data-hidden={row.hidden ? 'true' : undefined}
-    >
-      <div data-ui="inline-editor-reasoning-row-header">
-        <span data-ui="inline-editor-reasoning-label">{label}</span>
-        <div data-ui="inline-editor-reasoning-row-actions">
-          <IconButton
-            type="button"
-            data-ui="icon-button"
-            data-compact
-            data-pressed={row.hidden ? 'true' : undefined}
-            onClick={onToggleHidden}
-            disabled={busy}
-            aria-label={row.hidden ? 'Unhide reasoning entry' : 'Hide reasoning entry'}
-            title={
-              row.hidden
-                ? 'Hidden — preserved on disk, not sent on next turn. Click to unhide.'
-                : 'Hide this reasoning entry (kept on disk, skipped on echo).'
-            }
-          >
-            {row.hidden ? <EyeOffIcon /> : <EyeIcon />}
-          </IconButton>
-          <IconButton
-            type="button"
-            data-ui="icon-button"
-            data-compact
-            tone="danger"
-            onClick={onDelete}
-            disabled={busy}
-            aria-label="Delete reasoning entry"
-            title="Delete this reasoning entry"
-          >
-            <TrashSmallIcon />
-          </IconButton>
-        </div>
-      </div>
-      {row.kind === 'encrypted' ? (
-        <span data-ui="inline-editor-reasoning-readonly">{row.bytes} bytes (read-only)</span>
-      ) : (
-        <textarea
-          data-ui="inline-editor-reasoning-input"
-          value={row.kind === 'text' ? row.text : row.summary}
-          onChange={(e) =>
-            row.kind === 'text' ? onChangeText(e.target.value) : onChangeSummary(e.target.value)
-          }
-          rows={4}
-          disabled={busy || row.hidden}
-          aria-label={`Edit ${label}`}
-        />
-      )}
-    </div>
-  )
-}
-
-function ToolCallEditorRow({
-  row,
-  busy,
-  onChangeDialect,
-  onChangeType,
-  onChangeOutputIndex,
-  onChangeRawText,
-  onToggleHidden,
-  onDelete,
-}: {
-  row: EditableToolCall
-  busy: boolean
-  onChangeDialect: (next: ProviderOutputDialect) => void
-  onChangeType: (next: string) => void
-  onChangeOutputIndex: (next: string) => void
-  onChangeRawText: (next: string) => void
-  onToggleHidden: () => void
-  onDelete: () => void
-}) {
-  return (
-    <div
-      data-ui="inline-editor-tool-call-row"
-      data-hidden={row.hidden ? 'true' : undefined}
-      data-edited={row.original?.edited === true ? 'true' : undefined}
-    >
-      <div data-ui="inline-editor-reasoning-row-header">
-        <span data-ui="inline-editor-reasoning-label">
-          {row.type || 'Tool call'} · {row.dialect}
-        </span>
-        <div data-ui="inline-editor-reasoning-row-actions">
-          <IconButton
-            type="button"
-            data-ui="icon-button"
-            data-compact
-            data-pressed={row.hidden ? 'true' : undefined}
-            onClick={onToggleHidden}
-            disabled={busy}
-            aria-label={row.hidden ? 'Unhide tool call' : 'Hide tool call'}
-            title={
-              row.hidden
-                ? 'Hidden — preserved on disk, not sent on next turn. Click to unhide.'
-                : 'Hide this tool call or result (kept on disk, skipped on context replay).'
-            }
-          >
-            {row.hidden ? <EyeOffIcon /> : <EyeIcon />}
-          </IconButton>
-          <IconButton
-            type="button"
-            data-ui="icon-button"
-            data-compact
-            tone="danger"
-            onClick={onDelete}
-            disabled={busy}
-            aria-label="Delete tool call"
-            title="Delete this tool call"
-          >
-            <TrashSmallIcon />
-          </IconButton>
-        </div>
-      </div>
-      <div data-ui="inline-editor-tool-call-meta">
-        <label>
-          <span>Dialect</span>
-          <select
-            value={row.dialect}
-            onChange={(e) => onChangeDialect(e.target.value as ProviderOutputDialect)}
-            disabled={busy || row.hidden}
-            aria-label="Tool call dialect"
-          >
-            <option value="unknown">unknown</option>
-            <option value="openai-responses">openai-responses</option>
-            <option value="openrouter-responses">openrouter-responses</option>
-            <option value="google-gemini">google-gemini</option>
-            <option value="anthropic-claude">anthropic-claude</option>
-          </select>
-        </label>
-        <label>
-          <span>Type</span>
-          <input
-            value={row.type}
-            onChange={(e) => onChangeType(e.target.value)}
-            disabled={busy || row.hidden}
-            aria-label="Tool call type"
-          />
-        </label>
-        <label>
-          <span>Index</span>
-          <input
-            value={row.outputIndex}
-            onChange={(e) => onChangeOutputIndex(e.target.value)}
-            disabled={busy || row.hidden}
-            inputMode="numeric"
-            aria-label="Tool call output index"
-          />
-        </label>
-      </div>
-      <textarea
-        data-ui="inline-editor-tool-call-input"
-        value={row.rawText}
-        onChange={(e) => onChangeRawText(e.target.value)}
-        rows={5}
-        disabled={busy || row.hidden}
-        aria-label="Edit tool call JSON or text"
-      />
-    </div>
-  )
-}
-
-function AddReasoningEntry({
-  busy,
-  onAdd,
-}: {
-  busy: boolean
-  onAdd: (kind: 'text' | 'summary') => void
-}) {
-  const [kind, setKind] = useState<'text' | 'summary'>('text')
-  return (
-    <div data-ui="inline-editor-reasoning-add">
-      <select
-        data-ui="inline-editor-reasoning-kind"
-        value={kind}
-        onChange={(e) => setKind(e.target.value as 'text' | 'summary')}
-        disabled={busy}
-        aria-label="New reasoning kind"
-      >
-        <option value="text">Reasoning text</option>
-        <option value="summary">Summary</option>
-      </select>
-      <Button
-        type="button"
-        data-ui="inline-editor-reasoning-add-button"
-        onClick={() => onAdd(kind)}
-        disabled={busy}
-      >
-        + Add reasoning entry
-      </Button>
-    </div>
-  )
-}
-
-function EyeIcon() {
-  return (
-    <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false" width="13" height="13">
-      <path
-        d="M1.5 8s2.5-4.5 6.5-4.5S14.5 8 14.5 8 12 12.5 8 12.5 1.5 8 1.5 8z"
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="1.2"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
-      <circle cx="8" cy="8" r="2" fill="none" stroke="currentColor" strokeWidth="1.2" />
-    </svg>
-  )
-}
-
-function EyeOffIcon() {
-  return (
-    <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false" width="13" height="13">
-      <path
-        d="M1.5 8s2.5-4.5 6.5-4.5S14.5 8 14.5 8 12 12.5 8 12.5 1.5 8 1.5 8z"
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="1.2"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        opacity="0.55"
-      />
-      <path d="M2 2l12 12" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" />
-    </svg>
-  )
-}
-
-function TrashSmallIcon() {
-  return (
-    <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false" width="13" height="13">
-      <path
-        d="M3 4.5h10M6.5 4.5V3a1 1 0 0 1 1-1h1a1 1 0 0 1 1 1v1.5M4 4.5l.7 8.5a1 1 0 0 0 1 .9h4.6a1 1 0 0 0 1-.9l.7-8.5M6.8 7v4M9.2 7v4"
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="1.2"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
-    </svg>
   )
 }

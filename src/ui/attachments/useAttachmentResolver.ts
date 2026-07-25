@@ -1,53 +1,62 @@
-import { useMemo } from 'react'
+import { useEffect, useMemo, useSyncExternalStore } from 'react'
 import {
   attachmentContextIds,
   attachmentContextPolicyForSettings,
 } from '../../core/attachments/context'
 import type { AttachmentResolver } from '../../core/prompt-size'
-import type { Attachment, AttachmentRef, ChatSettings, Message } from '../../core/types'
-import { attachmentMapDependencies } from '../../store/reactive-dependencies'
-import { useRepositoryQuery } from '../../store/reactive-query'
-import { getWorkspaceRepository } from '../../store/workspace-repository'
+import type {
+  Attachment,
+  AttachmentId,
+  AttachmentRef,
+  ChatSettings,
+  Message,
+} from '../../core/types'
+import { attachmentContextController } from '../../store/attachment-catalog-workspace'
 
-const EMPTY_ATTACHMENT_MAP = new Map<string, Attachment>()
+const EMPTY_ATTACHMENTS: readonly Attachment[] = Object.freeze([])
+const EMPTY_ATTACHMENT_IDS: readonly AttachmentId[] = Object.freeze([])
 
 export function useAttachmentResolverForContext(input: {
   settings: ChatSettings | undefined
   messages: readonly Message[]
+  baseAttachments?: readonly Attachment[] | undefined
   draftAttachmentRefs?: readonly AttachmentRef[] | undefined
   enabled?: boolean
 }): AttachmentResolver | undefined {
-  const idsKey = useMemo(() => {
-    if (input.enabled === false || !input.settings) return ''
+  const contextIds = useMemo(() => {
+    if (input.enabled === false || !input.settings) return []
     return attachmentContextIds({
       messages: input.messages,
       policy: attachmentContextPolicyForSettings(input.settings),
       ...(input.draftAttachmentRefs
         ? { draft: { refs: input.draftAttachmentRefs, role: 'user' as const } }
         : {}),
-    }).join('|')
+    })
   }, [input.enabled, input.settings, input.messages, input.draftAttachmentRefs])
 
-  const attachments = useRepositoryQuery(
-    JSON.stringify(['attachment-map', idsKey]),
-    async () => {
-      if (!idsKey) return EMPTY_ATTACHMENT_MAP
-      const repo = getWorkspaceRepository()
-      const rows = await Promise.all(
-        idsKey.split('|').map(async (id) => [id, await repo.getAttachment(id)] as const),
-      )
-      const map = new Map<string, Attachment>()
-      for (const [id, row] of rows) {
-        if (row) map.set(id, row)
-      }
-      return map
-    },
-    EMPTY_ATTACHMENT_MAP,
-    attachmentMapDependencies(idsKey ? idsKey.split('|') : []),
+  const baseAttachments = input.baseAttachments ?? EMPTY_ATTACHMENTS
+  const baseById = useMemo(
+    () => new Map(baseAttachments.map((attachment) => [attachment.id, attachment] as const)),
+    [baseAttachments],
   )
+  const missingIdsIdentity = useMemo(
+    () => JSON.stringify(contextIds.filter((id) => !baseById.has(id))),
+    [baseById, contextIds],
+  )
+  const missingIds = useMemo(
+    () => JSON.parse(missingIdsIdentity) as AttachmentId[],
+    [missingIdsIdentity],
+  )
+  const demand = useMemo(
+    () =>
+      attachmentContextController.demand(missingIds.length > 0 ? missingIds : EMPTY_ATTACHMENT_IDS),
+    [missingIds],
+  )
+  const attachments = useSyncExternalStore(demand.subscribe, demand.getSnapshot, demand.getSnapshot)
+  useEffect(() => () => demand.release(), [demand])
 
   return useMemo(() => {
-    if (!idsKey) return undefined
-    return (id) => attachments.get(id)
-  }, [idsKey, attachments])
+    if (contextIds.length === 0) return undefined
+    return (id) => baseById.get(id) ?? attachments.rowsById.get(id)
+  }, [attachments.rowsById, baseById, contextIds])
 }

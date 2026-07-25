@@ -1,12 +1,17 @@
 import '@testing-library/jest-dom/vitest'
 import 'fake-indexeddb/auto'
 import { cleanup } from '@testing-library/react'
-import { afterEach } from 'vitest'
-import { resetPostCommitTasksForTests } from '../src/core/post-commit-task'
-import { __resetRepositoryQueriesForTests } from '../src/store/reactive-query'
+import { afterEach, vi } from 'vitest'
+import { getBrowserRepository } from '../src/store/browser-repo'
+import { resetMountedRepositoryProjectionsForTests } from '../src/store/mounted-projection-lifecycle'
+import { installWorkspaceRepositoryFactory } from '../src/store/workspace-repository'
+import { resetLoadedWorkspaceSessionOwnersForTests } from '../src/store/workspace-session-owner'
+
+installWorkspaceRepositoryFactory(getBrowserRepository)
 
 afterEach(() => {
+  vi.useRealTimers()
   cleanup()
-  resetPostCommitTasksForTests()
-  __resetRepositoryQueriesForTests()
+  resetLoadedWorkspaceSessionOwnersForTests()
+  resetMountedRepositoryProjectionsForTests()
 })

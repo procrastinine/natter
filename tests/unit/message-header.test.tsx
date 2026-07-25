@@ -1,24 +1,77 @@
 import { act, fireEvent, render, waitFor } from '@testing-library/react'
 import type { ComponentProps } from 'react'
-import { afterEach, describe, expect, it, vi } from 'vitest'
-import { effectiveCapabilityFromEndpoints } from '../../src/core/capabilities'
-import type { Message as MessageRow, ModelEndpoint } from '../../src/core/types'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import {
+  AVAILABLE_GENERATION_CAPABILITY,
+  type GenerationCapability,
+  generationNotStarted,
+  unavailableGenerationCapability,
+} from '../../src/core/interaction-capability'
+import { projectReasoningPresentation } from '../../src/core/reasoning-envelope'
+import type { Message as MessageRow } from '../../src/core/types'
+import { attemptController } from '../../src/store/attempt-controller'
 import type * as GeneratedImagesModule from '../../src/store/generated-images'
-import { getStreamClientId } from '../../src/store/stream-leases'
-import { useStreamStore } from '../../src/store/zustand/streamStore'
+import type { WorkspaceFence } from '../../src/store/repository'
 import { useToastStore } from '../../src/store/zustand/toastStore'
 import { Message as ChatMessageComponent } from '../../src/ui/chat/Message'
 import { MessageHeader } from '../../src/ui/chat/MessageHeader'
 import { MessageInfo } from '../../src/ui/chat/MessageInfo'
 import { ReasoningBlock } from '../../src/ui/chat/ReasoningBlock'
+import { ToolEvidenceBlock } from '../../src/ui/chat/ToolEvidenceBlock'
+import {
+  observeTestAttempt,
+  publishTestLiveProjection,
+  removeTestAttempt,
+  resetAttemptControllerForTests,
+} from '../helpers/attempt-controller'
+import { succeededInteractionSettlement } from '../helpers/presentation-interactions'
+import {
+  liveReasoningFromDetailsForTest,
+  reasoningEnvelopeFromDetailsForTest,
+} from '../helpers/reasoning-events'
 
-function ChatMessage(
-  props: Omit<ComponentProps<typeof ChatMessageComponent>, 'bodyVersion'> & {
-    bodyVersion?: number
-  },
-) {
+type ChatMessageTestProps = Omit<
+  ComponentProps<typeof ChatMessageComponent>,
+  | 'bodyVersion'
+  | 'editResendCapability'
+  | 'regenerateCapability'
+  | 'continueCapability'
+  | 'presentationFence'
+  | 'onBeginEdit'
+  | 'onDeleteMessage'
+  | 'onEditInPlace'
+> & {
+  bodyVersion?: number
+  generationCapability?: GenerationCapability
+  onBeginEdit?: ComponentProps<typeof ChatMessageComponent>['onBeginEdit']
+  onDeleteMessage?: ComponentProps<typeof ChatMessageComponent>['onDeleteMessage']
+  onEditInPlace?: ComponentProps<typeof ChatMessageComponent>['onEditInPlace']
+  presentationFence?: WorkspaceFence
+}
+
+const CONNECTION_MISSING_CAPABILITY = unavailableGenerationCapability('connection-missing')
+let presentationFence: WorkspaceFence = { workspaceId: 'message-header-tests', replacementEpoch: 0 }
+
+function ChatMessage({
+  bodyVersion,
+  generationCapability = CONNECTION_MISSING_CAPABILITY,
+  presentationFence: explicitPresentationFence,
+  ...props
+}: ChatMessageTestProps) {
   return (
-    <ChatMessageComponent {...props} bodyVersion={props.bodyVersion ?? props.message.nodeVersion} />
+    <ChatMessageComponent
+      {...props}
+      bodyVersion={bodyVersion ?? props.message.nodeVersion}
+      editResendCapability={generationCapability}
+      regenerateCapability={generationCapability}
+      continueCapability={generationCapability}
+      presentationFence={explicitPresentationFence ?? presentationFence}
+      onDeleteMessage={props.onDeleteMessage ?? succeededInteractionSettlement}
+      onEditInPlace={props.onEditInPlace ?? succeededInteractionSettlement}
+      onBeginEdit={
+        props.onBeginEdit ?? (() => ({ admitted: Promise.resolve(), release: () => undefined }))
+      }
+    />
   )
 }
 
@@ -36,8 +89,12 @@ vi.mock('../../src/store/generated-images', async (importOriginal) => {
   }
 })
 
+beforeEach(() => {
+  presentationFence = resetAttemptControllerForTests()
+})
+
 afterEach(() => {
-  useStreamStore.getState().reset()
+  resetAttemptControllerForTests()
   useToastStore.getState().reset()
   generatedImageMocks.schedule.mockClear()
   generatedImageMocks.normalize.mockClear()
@@ -72,6 +129,8 @@ function makeAssistant(overrides: Partial<MessageRow> = {}): MessageRow {
       },
       cost: 0.0123,
       costSource: 'stream',
+      reasoningCarryForward: 'none',
+      reasoningVisibility: { disclosure: 'visible', visibleKind: 'text' },
       startedAt: Date.now() - 60_000,
       reasoningStartedAt: Date.now() - 58_000,
       firstTextAt: Date.now() - 55_000,
@@ -95,16 +154,6 @@ function makeUser(overrides: Partial<MessageRow> = {}): MessageRow {
     content: [{ type: 'text', text: 'say hi' }],
     nodeVersion: 1,
     deleted: false,
-    ...overrides,
-  }
-}
-
-function makeEndpoint(overrides: Partial<ModelEndpoint> = {}): ModelEndpoint {
-  return {
-    provider_name: 'OpenAI',
-    supported_parameters: ['reasoning', 'max_tokens'],
-    context_length: 128000,
-    pricing: {},
     ...overrides,
   }
 }
@@ -180,7 +229,10 @@ describe('MessageInfo (revealed by ⓘ — full factual record)', () => {
 
   it('falls back to reasoning chars when token breakdown is unavailable', () => {
     const msg = makeAssistant({
-      reasoningDetails: [{ type: 'reasoning.encrypted', data: 'abcdef' }],
+      reasoningEnvelope: reasoningEnvelopeFromDetailsForTest(
+        [{ type: 'reasoning.encrypted', data: 'abcdef', format: 'unknown' }],
+        'unknown',
+      ),
     })
     if (msg.generation?.usage?.completion_tokens_details) {
       delete msg.generation.usage.completion_tokens_details.reasoning_tokens
@@ -192,10 +244,19 @@ describe('MessageInfo (revealed by ⓘ — full factual record)', () => {
 
   it('counts overlap-looking reasoning rows independently', () => {
     const msg = makeAssistant({
-      reasoningDetails: [
-        { type: 'reasoning.text', index: 0, text: 'Let' },
-        { type: 'reasoning.text', index: 0, text: 'Let me' },
-      ],
+      reasoningEnvelope: reasoningEnvelopeFromDetailsForTest(
+        [
+          { type: 'reasoning.text', id: 'first', index: 0, text: 'Let', format: 'unknown' },
+          {
+            type: 'reasoning.text',
+            id: 'second',
+            index: 0,
+            text: 'Let me',
+            format: 'unknown',
+          },
+        ],
+        'unknown',
+      ),
     })
     if (msg.generation?.usage?.completion_tokens_details) {
       delete msg.generation.usage.completion_tokens_details.reasoning_tokens
@@ -205,15 +266,10 @@ describe('MessageInfo (revealed by ⓘ — full factual record)', () => {
     expect(container.textContent).toMatch(/text 9/)
   })
 
-  it('renders persisted hosted-tool evidence in message info', () => {
+  it('renders compact hosted-tool metadata and lazily opens canonical raw evidence', () => {
     const msg = makeAssistant()
     if (!msg.generation) throw new Error('expected generation metadata')
-    const serializeOutput = vi.fn(() => ({
-      type: 'openrouter:web_fetch',
-      url: 'https://openrouter.ai/',
-      title: 'OpenRouter',
-      content: 'The Unified Interface For LLMs',
-    }))
+    const serializeOutput = vi.fn(() => ({ replaced: true }))
     msg.generation.serverTools = [
       {
         type: 'openrouter:web_fetch',
@@ -221,22 +277,46 @@ describe('MessageInfo (revealed by ⓘ — full factual record)', () => {
         id: 'wf_1',
         status: 'completed',
         outputIndex: 0,
-        output: { toJSON: serializeOutput },
       },
     ]
-    const { container } = render(<MessageInfo message={msg} />)
+    msg.providerOutputItems = [
+      {
+        dialect: 'openrouter-responses',
+        type: 'openrouter:web_fetch',
+        captureId: 'wf_1',
+        outputIndex: 0,
+        item: {
+          type: 'openrouter:web_fetch',
+          url: 'https://openrouter.ai/',
+          title: 'OpenRouter',
+          content: 'The Unified Interface For LLMs',
+          toJSON: serializeOutput,
+        },
+      },
+    ]
+    const { container } = render(
+      <>
+        <MessageInfo message={msg} />
+        <ToolEvidenceBlock message={msg} />
+      </>,
+    )
     expect(container.textContent).toMatch(/Tool calls/)
     expect(container.textContent).toMatch(/web fetch/)
     expect(container.textContent).toMatch(/wf_1/)
     expect(container.textContent).not.toMatch(/The Unified Interface For LLMs/)
     expect(serializeOutput).not.toHaveBeenCalled()
 
-    const toolDetails = container.querySelector('details[data-ui="tool-call"]')
+    const toolDetails = container.querySelector('details[data-ui="tool-evidence"]')
     if (!(toolDetails instanceof HTMLDetailsElement)) throw new Error('tool details missing')
     toolDetails.open = true
     fireEvent(toolDetails, new Event('toggle'))
 
-    expect(serializeOutput).toHaveBeenCalledOnce()
+    const rawDetails = container.querySelector('details[data-ui="tool-evidence-raw"]')
+    if (!(rawDetails instanceof HTMLDetailsElement)) throw new Error('raw tool details missing')
+    rawDetails.open = true
+    fireEvent(rawDetails, new Event('toggle'))
+
+    expect(serializeOutput).not.toHaveBeenCalled()
     expect(container.textContent).toMatch(/The Unified Interface For LLMs/)
   })
 })
@@ -252,66 +332,75 @@ describe('Message hidden-reasoning footer', () => {
         model: 'openai/o3',
         requestedModel: 'openai/o3',
         apiUsed: 'chat',
+        reasoningVisibility: {
+          disclosure: 'absent',
+          unexpectedVisibleKind: 'summary',
+          reason: 'api-mode',
+        },
       },
-      reasoningDetails: [],
     })
-    const currentCapability = effectiveCapabilityFromEndpoints('anthropic/claude-haiku-4.5', [
-      makeEndpoint({ supported_parameters: ['reasoning'] }),
-    ])
-    const { container } = render(
-      <ChatMessage
-        chatId={msg.chatId}
-        message={msg}
-        hasAnyReasoningDetails={false}
-        hasConnection={false}
-        capability={currentCapability}
-        onEditInPlace={async () => {}}
-      />,
-    )
+    const { container } = render(<ChatMessage chatId={msg.chatId} message={msg} />)
     expect(container.querySelector('[data-ui="message-hidden-reasoning"]')?.textContent).toMatch(
       /reasoned internally/i,
     )
   })
 
   it('hides one raw reasoning row without rewriting adjacent or tool rows', () => {
-    const reasoningDetails: NonNullable<MessageRow['reasoningDetails']> = [
-      {
-        type: 'reasoning.text',
-        id: 'block-a',
-        index: 0,
-        format: 'unknown',
-        text: 'abcd',
-      },
-      { type: 'reasoning.text', id: 'tool_call-1', index: 0, text: 'tool carrier' },
-      {
-        type: 'reasoning.text',
-        id: 'block-b',
-        index: 0,
-        format: 'anthropic-claude-v1',
-        text: 'abcdX',
-        signature: 'signature-b',
-      },
-    ]
-    const msg = makeAssistant({ reasoningDetails })
-    const onEditInPlace = vi.fn(async () => {})
-    const onToggleReasoningDetailHidden = vi.fn(async () => {})
+    const reasoningEnvelope = reasoningEnvelopeFromDetailsForTest(
+      [
+        {
+          type: 'reasoning.text',
+          id: 'block-a',
+          index: 0,
+          format: 'unknown',
+          text: 'abcd',
+        },
+        {
+          type: 'reasoning.text',
+          id: 'tool_call-1',
+          index: 0,
+          text: 'tool carrier',
+          format: 'unknown',
+        },
+        {
+          type: 'reasoning.text',
+          id: 'block-b',
+          index: 0,
+          format: 'anthropic-claude-v1',
+          text: 'abcdX',
+          signature: 'signature-b',
+        },
+      ],
+      'unknown',
+    )
+    const blockB = reasoningEnvelope.visible.find((part) => part.text === 'abcdX')
+    if (!blockB) throw new Error('expected block-b reasoning member')
+    const msg = makeAssistant({ reasoningEnvelope })
+    const onEditInPlace = vi.fn(() => succeededInteractionSettlement())
+    const onToggleReasoningDetailHidden = vi.fn(() => succeededInteractionSettlement())
     const { container } = render(
       <ChatMessage
         chatId={msg.chatId}
         message={msg}
-        hasAnyReasoningDetails
-        hasConnection={false}
         onEditInPlace={onEditInPlace}
         onToggleReasoningDetailHidden={onToggleReasoningDetailHidden}
       />,
     )
+    const reasoning = container.querySelector('[data-ui="reasoning"]')
+    if (!(reasoning instanceof HTMLDetailsElement)) throw new Error('reasoning details missing')
+    reasoning.open = true
+    fireEvent(reasoning, new Event('toggle'))
 
     const hideButtons = container.querySelectorAll('[data-ui="reasoning-row-hide"]')
     expect(hideButtons).toHaveLength(2)
     fireEvent.click(hideButtons[1] as HTMLElement)
 
     expect(onEditInPlace).not.toHaveBeenCalled()
-    expect(onToggleReasoningDetailHidden).toHaveBeenCalledWith(msg, 2)
+    expect(onToggleReasoningDetailHidden).toHaveBeenCalledWith(msg, {
+      kind: 'visible',
+      id: blockB.id,
+      owner: { kind: 'generation' },
+    })
   })
 })
 
@@ -320,11 +409,7 @@ describe('Message content refresh', () => {
     const first = makeAssistant({ content: [{ type: 'text', text: 'Body version one' }] })
     const props = {
       chatId: first.chatId,
-      hasAnyReasoningDetails: false,
-      hasSiblingVariants: false,
-      cursor: {},
-      hasConnection: false,
-      onEditInPlace: async () => {},
+      onEditInPlace: succeededInteractionSettlement,
     }
     const { container, rerender } = render(<ChatMessage {...props} message={first} />)
 
@@ -366,39 +451,47 @@ describe('Message presentation-only snapshots', () => {
     generation.status = 'streaming'
 
     act(() => {
-      useStreamStore.getState().setActive({
+      observeTestAttempt({
         streamId: 'final-persistence-order-stream',
-        replacementEpoch: 0,
         chatId: message.chatId,
         messageId: message.id,
-        attemptKind: 'generation',
-        startedAt: generation.startedAt,
-        ownerClientId: getStreamClientId(),
-      })
-      useStreamStore.getState().setLiveSnapshot({
-        streamId: 'final-persistence-order-stream',
-        replacementEpoch: 0,
-        chatId: message.chatId,
-        messageId: message.id,
-        content: [{ type: 'output_text', text: 'Final live text.' }],
-        textLength: 16,
-        reasoningLength: 0,
-        updatedAt: generation.startedAt + 1,
+        kind: 'generation',
       })
     })
 
     const props = {
       chatId: message.chatId,
-      hasAnyReasoningDetails: false,
-      hasConnection: false,
-      onEditInPlace: async () => {},
+      onEditInPlace: succeededInteractionSettlement,
     }
     const view = render(<ChatMessage {...props} message={message} />)
+    act(() => {
+      publishTestLiveProjection({
+        streamId: 'final-persistence-order-stream',
+        chatId: message.chatId,
+        messageId: message.id,
+        content: [{ type: 'output_text', text: 'Final live text.' }],
+        updatedAt: generation.startedAt + 1,
+      })
+    })
     const body = () => view.container.querySelector('[data-ui="message-body"]')
 
     await waitFor(() => expect(body()).toHaveTextContent('Final live text.'))
     expect(body()).not.toHaveTextContent('Old persisted placeholder.')
 
+    const attempt = attemptController.get('final-persistence-order-stream')
+    if (!attempt?.messageId) throw new Error('expected final persistence attempt')
+    act(() => {
+      attemptController.registerTargetCommitHandoff({
+        ...presentationFence,
+        streamId: attempt.streamId,
+        chatId: attempt.chatId,
+        messageId: attempt.messageId,
+        attemptKind: attempt.kind,
+        admissionSequence: attempt.admissionSequence,
+        leaseRevision: attempt.leaseRevision + 1,
+        bodyVersion: 2,
+      })
+    })
     view.rerender(
       <ChatMessage
         {...props}
@@ -408,21 +501,24 @@ describe('Message presentation-only snapshots', () => {
           nodeVersion: message.nodeVersion + 1,
         })}
         presentationOnly
-        allowPresentationStreamProjection
       />,
     )
 
-    await waitFor(() => expect(body()).toHaveTextContent('Canonical persisted text.'))
-    expect(body()).not.toHaveTextContent('Final live text.')
+    expect(body()).toHaveTextContent('Final live text.')
     expect(body()).not.toHaveTextContent('Old persisted placeholder.')
 
-    act(() =>
-      useStreamStore.getState().clearLiveSnapshot(message.id, 'final-persistence-order-stream', 0),
-    )
-    expect(body()).toHaveTextContent('Canonical persisted text.')
-    expect(body()).not.toHaveTextContent('Final live text.')
-
-    act(() => useStreamStore.getState().clearActive('final-persistence-order-stream', 0))
+    act(() => {
+      attemptController.publishExactTargetPresentations([
+        {
+          ...presentationFence,
+          streamId: attempt.streamId,
+          chatId: attempt.chatId,
+          messageId: attempt.messageId,
+          bodyVersion: 2,
+        },
+      ])
+    })
+    await waitFor(() => expect(body()).toHaveTextContent('Canonical persisted text.'))
     expect(body()).toHaveTextContent('Canonical persisted text.')
     expect(body()).not.toHaveTextContent('Final live text.')
   })
@@ -436,10 +532,9 @@ describe('Message presentation-only snapshots', () => {
       <ChatMessage
         chatId={message.chatId}
         message={message}
-        hasAnyReasoningDetails={false}
-        hasConnection
+        generationCapability={AVAILABLE_GENERATION_CAPABILITY}
         presentationOnly
-        onEditInPlace={async () => {}}
+        onEditInPlace={succeededInteractionSettlement}
       />,
     )
 
@@ -468,11 +563,10 @@ describe('Message presentation-only snapshots', () => {
       <ChatMessage
         chatId={message.chatId}
         message={message}
-        hasAnyReasoningDetails
-        hasConnection
+        generationCapability={AVAILABLE_GENERATION_CAPABILITY}
         presentationOnly
-        onEditInPlace={async () => {}}
-        onRegenerate={async () => {}}
+        onEditInPlace={succeededInteractionSettlement}
+        onRegenerate={() => generationNotStarted(CONNECTION_MISSING_CAPABILITY)}
       />,
     )
 
@@ -482,35 +576,35 @@ describe('Message presentation-only snapshots', () => {
 })
 
 describe('Message streaming info surface', () => {
-  it('marks the streaming message busy until its stream ends', () => {
+  it('marks the streaming message busy until its active attempt ends', async () => {
     const msg = makeAssistant()
+    observeTestAttempt({
+      streamId: 'message-busy-stream',
+      chatId: msg.chatId,
+      messageId: msg.id,
+      kind: 'generation',
+    })
     const props = {
       chatId: msg.chatId,
       message: msg,
-      hasAnyReasoningDetails: false,
-      hasConnection: false,
-      onEditInPlace: async () => {},
+      onEditInPlace: succeededInteractionSettlement,
     }
-    const view = render(<ChatMessage {...props} streaming />)
+    const view = render(<ChatMessage {...props} />)
 
     expect(view.container.querySelector('[data-ui="message"]')).toHaveAttribute('aria-busy', 'true')
 
-    view.rerender(<ChatMessage {...props} streaming={false} />)
+    await act(async () => {
+      removeTestAttempt('message-busy-stream')
+    })
 
-    expect(view.container.querySelector('[data-ui="message"]')).not.toHaveAttribute('aria-busy')
+    await waitFor(() =>
+      expect(view.container.querySelector('[data-ui="message"]')).not.toHaveAttribute('aria-busy'),
+    )
   })
 
   it('keeps MessageInfo unmounted until the info action is clicked', () => {
     const msg = makeAssistant()
-    const { container } = render(
-      <ChatMessage
-        chatId={msg.chatId}
-        message={msg}
-        hasAnyReasoningDetails={false}
-        hasConnection={false}
-        onEditInPlace={async () => {}}
-      />,
-    )
+    const { container } = render(<ChatMessage chatId={msg.chatId} message={msg} />)
 
     expect(container.querySelector('[data-ui="message-info"]')).toBeNull()
   })
@@ -518,55 +612,49 @@ describe('Message streaming info surface', () => {
   it('uses the live streaming snapshot as the message-info source while open', () => {
     const msg = makeAssistant({
       content: [{ type: 'output_text', text: '' }],
-      reasoningDetails: [],
     })
     const generation = msg.generation
     if (!generation) throw new Error('expected generation metadata')
-    useStreamStore.getState().setActive({
+    observeTestAttempt({
       streamId: 'stream-live',
-      replacementEpoch: 0,
       chatId: msg.chatId,
       messageId: msg.id,
-      attemptKind: 'continuation',
-      startedAt: generation.startedAt,
-      ownerClientId: getStreamClientId(),
-    })
-    useStreamStore.getState().setLiveSnapshot({
-      streamId: 'stream-live',
-      replacementEpoch: 0,
-      chatId: msg.chatId,
-      messageId: msg.id,
-      content: [{ type: 'output_text', text: 'live streamed words' }],
-      reasoningRows: [
-        {
-          detail: { type: 'reasoning.text', text: '' },
-          valueSections: ['thinking ', 'live'],
-        },
-      ],
-      generation: {
-        ...generation,
-        provider: 'Live Provider',
-        usage: {
-          prompt_tokens: 5,
-          completion_tokens: 11,
-          total_tokens: 16,
-        },
-      },
-      textLength: 19,
-      reasoningLength: 13,
-      updatedAt: generation.startedAt + 1000,
+      kind: 'continuation',
     })
 
-    const { container, getByRole } = render(
-      <ChatMessage
-        chatId={msg.chatId}
-        message={msg}
-        hasAnyReasoningDetails={false}
-        hasConnection={false}
-        onEditInPlace={async () => {}}
-      />,
-    )
+    const { container, getByRole } = render(<ChatMessage chatId={msg.chatId} message={msg} />)
+    act(() => {
+      publishTestLiveProjection({
+        streamId: 'stream-live',
+        chatId: msg.chatId,
+        messageId: msg.id,
+        content: [{ type: 'output_text', text: 'live streamed words' }],
+        reasoning: liveReasoningFromDetailsForTest(
+          [
+            {
+              type: 'reasoning.text',
+              format: 'unknown',
+              text: 'thinking live',
+            },
+          ],
+          'unknown',
+        ),
+        generation: {
+          ...generation,
+          provider: 'Live Provider',
+          usage: {
+            prompt_tokens: 5,
+            completion_tokens: 11,
+            total_tokens: 16,
+          },
+        },
+        textLength: 19,
+        reasoningLength: 13,
+        updatedAt: generation.startedAt + 1000,
+      })
+    })
 
+    expect(container.querySelector('[data-ui="message-action-row"]')).not.toBeNull()
     fireEvent.click(getByRole('button', { name: 'Show message info' }))
 
     const text = container.querySelector('[data-ui="message-info"]')?.textContent ?? ''
@@ -582,24 +670,14 @@ describe('Message streaming info surface', () => {
   it('surfaces a status banner when this message is streaming in another tab', () => {
     const msg = makeAssistant({ content: [] })
     delete msg.generation
-    useStreamStore.getState().setActive({
+    observeTestAttempt({
       streamId: 'remote-stream',
-      replacementEpoch: 0,
       chatId: msg.chatId,
       messageId: msg.id,
-      startedAt: 1,
-      ownerClientId: 'other-tab',
+      local: false,
     })
 
-    const { container } = render(
-      <ChatMessage
-        chatId={msg.chatId}
-        message={msg}
-        hasAnyReasoningDetails={false}
-        hasConnection={false}
-        onEditInPlace={async () => {}}
-      />,
-    )
+    const { container } = render(<ChatMessage chatId={msg.chatId} message={msg} />)
 
     expect(container.querySelector('[data-ui="message-stream-remote"]')?.textContent).toMatch(
       /currently streaming in another tab/i,
@@ -627,6 +705,9 @@ describe('Message streaming info surface', () => {
         status: 'done',
         startedAt: generation.finishedAt ?? generation.startedAt,
         finishedAt: (generation.finishedAt ?? generation.startedAt) + 1,
+        reasoningCarryForward: 'none',
+        reasoningVisibility: { disclosure: 'unknown' },
+        application: { kind: 'applied' },
       },
     ]
 
@@ -634,10 +715,9 @@ describe('Message streaming info surface', () => {
       <ChatMessage
         chatId={msg.chatId}
         message={msg}
-        hasAnyReasoningDetails={false}
-        hasConnection
-        onEditInPlace={async () => {}}
-        onContinue={async () => {}}
+        generationCapability={AVAILABLE_GENERATION_CAPABILITY}
+        onEditInPlace={succeededInteractionSettlement}
+        onContinue={() => generationNotStarted(CONNECTION_MISSING_CAPABILITY)}
       />,
     )
 
@@ -703,10 +783,29 @@ describe('ReasoningBlock', () => {
   it('renders overlap-looking persisted reasoning as distinct rows', () => {
     const { container } = render(
       <ReasoningBlock
-        details={[
-          { type: 'reasoning.text', index: 0, text: 'Let' },
-          { type: 'reasoning.text', index: 0, text: 'Let me' },
-        ]}
+        presentation={projectReasoningPresentation({
+          kind: 'durable',
+          owner: { kind: 'generation' },
+          envelope: reasoningEnvelopeFromDetailsForTest(
+            [
+              {
+                type: 'reasoning.text',
+                id: 'first',
+                index: 0,
+                text: 'Let',
+                format: 'unknown',
+              },
+              {
+                type: 'reasoning.text',
+                id: 'second',
+                index: 0,
+                text: 'Let me',
+                format: 'unknown',
+              },
+            ],
+            'unknown',
+          ),
+        })}
       />,
     )
     expect(container.querySelector('[data-reasoning-count="2"]')).toBeTruthy()

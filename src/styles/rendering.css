@@ -16,6 +16,10 @@
   display: contents;
 }
 
+[data-ui="markdown-progressive-prefix"] {
+  height: var(--virtual-spacer-height, 0);
+}
+
 [data-ui="markdown"] h1,
 [data-ui="markdown"] h2,
 [data-ui="markdown"] h3,

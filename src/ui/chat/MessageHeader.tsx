@@ -1,7 +1,9 @@
+import { type AppliedMessageView, createAppliedMessageView } from '../../core/continuation-content'
 import type { Message as MessageRow } from '../../core/types'
 
 interface MessageHeaderProps {
   message: MessageRow
+  appliedView?: AppliedMessageView
 }
 
 const ROLE_LABEL: Record<MessageRow['role'], string> = {
@@ -22,15 +24,16 @@ const PHASE_LABEL: Record<'commentary' | 'final_answer', string> = {
 // right-aligned chips with the model id, completion-token count, and the
 // Responses-API `phase`. The full factual record (timestamps, costs,
 // breakdowns) still lives in the info disclosure on the action row.
-export function MessageHeader({ message }: MessageHeaderProps) {
+export function MessageHeader({ message, appliedView }: MessageHeaderProps) {
+  const view = appliedView ?? createAppliedMessageView(message)
   const isAssistant = message.role === 'assistant'
-  const gen = message.generation
+  const gen = view.latestAttempt.metadata
   const model = isAssistant ? gen?.model : undefined
   const completionTok = isAssistant ? gen?.usage?.completion_tokens : undefined
   // `phase` is only meaningful on Responses-API turns (apiUsed === 'responses').
   // Chat-completions and Gemini turns never carry it; hide the chip entirely
   // rather than display "unset" noise.
-  const phase = isAssistant && gen?.apiUsed === 'responses' ? message.phase : undefined
+  const phase = isAssistant && gen?.apiUsed === 'responses' ? view.phase : undefined
   const roleLabel = ROLE_LABEL[message.role]
   return (
     <header data-ui="message-header">

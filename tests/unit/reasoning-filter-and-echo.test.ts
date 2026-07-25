@@ -9,9 +9,42 @@
 //     proxy flips between them — both should round-trip cleanly).
 
 import { describe, expect, it } from 'vitest'
-import { filterReasoningForInclude } from '../../src/core/reasoning'
-import { toResponses } from '../../src/core/transforms'
-import type { ChatSettings, Message, ReasoningDetail, ReasoningInclude } from '../../src/core/types'
+import { toResponses as toResponsesWithContract } from '../../src/api/request-transforms'
+import { cloneDefaultChatSettings } from '../../src/core/defaults'
+import { OPENAI_RESPONSES_PROVIDER_OUTPUT_CONTRACT } from '../../src/core/provider-tool-context'
+import type {
+  ChatSettings,
+  Message,
+  ReasoningDetail,
+  ReasoningFormat,
+  ReasoningInclude,
+} from '../../src/core/types'
+import {
+  compileChatReasoningDetailsForTest,
+  responsesReasoningContractForSettings,
+  TEST_UNSUPPORTED_PREFILL_PLAN,
+} from '../helpers/reasoning-contracts'
+import { reasoningEnvelopeFromDetailsForTest } from '../helpers/reasoning-events'
+
+function filterReasoningForInclude(
+  details: readonly ReasoningDetail[],
+  include: ReasoningInclude,
+  targetFormat: ReasoningFormat | undefined,
+  options: { acceptsAnthropicRedactedThinking?: boolean } = {},
+) {
+  return compileChatReasoningDetailsForTest(details, include, targetFormat, options)
+}
+
+function toResponses(
+  settings: Parameters<typeof toResponsesWithContract>[0],
+  path: Parameters<typeof toResponsesWithContract>[1],
+) {
+  return toResponsesWithContract(settings, path, {
+    reasoning: responsesReasoningContractForSettings(settings),
+    providerOutput: OPENAI_RESPONSES_PROVIDER_OUTPUT_CONTRACT,
+    prefillPlan: TEST_UNSUPPORTED_PREFILL_PLAN,
+  })
+}
 
 function detail(d: Partial<ReasoningDetail> & { type: ReasoningDetail['type'] }): ReasoningDetail {
   return d as ReasoningDetail
@@ -175,32 +208,24 @@ describe('filterReasoningForInclude — format compatibility', () => {
 
 // Minimal settings/message builder for the echo-item test.
 function baseSettings(): ChatSettings {
-  return {
-    model: 'openai/gpt-5.4-nano',
-    profileId: 'p1',
-    systemPrompt: '',
-    systemRole: 'system',
-    sampling: {},
-    reasoning: {
-      mode: 'explicit',
-      summary: 'off',
-      include: { encrypted: false, summary: false, text: false },
-    },
-    allowFallbacks: true,
-    contextStrategy: { kind: 'off' },
-    toolCallContext: { include: true },
-    protocol: 'chat',
-    api: 'auto',
-    tools: { enabled: false, functions: [] },
-    responses: { store: false },
-  } as unknown as ChatSettings
+  const settings = cloneDefaultChatSettings()
+  settings.model = 'openai/gpt-5.4-nano'
+  settings.profileId = 'p1'
+  settings.systemPrompt = ''
+  settings.reasoning = {
+    mode: 'off',
+    exclude: false,
+    summary: 'off',
+    include: { encrypted: false, summary: false, text: false },
+  }
+  return settings
 }
 
 function baseAssistantMessage(): Message {
   return {
-    id: 'm1' as Message['id'],
-    chatId: 'c1' as Message['chatId'],
-    turnId: 't1' as Message['turnId'],
+    id: 'm1',
+    chatId: 'c1',
+    turnId: 't1',
     turnIndex: 0,
     parentId: null,
     siblingIndex: 0,
@@ -208,13 +233,29 @@ function baseAssistantMessage(): Message {
     origin: 'generated',
     content: [{ type: 'output_text', text: 'hi' }],
     createdAt: 0,
-    responsesEchoItem: {
-      type: 'reasoning',
-      id: 'rs_123',
-      encrypted_content: 'blob',
-      summary: [{ type: 'summary_text', text: 'visible reasoning summary' }],
-    },
-  } as unknown as Message
+    reasoningEnvelope: reasoningEnvelopeFromDetailsForTest(
+      [
+        {
+          type: 'reasoning.encrypted',
+          format: 'openai-responses-v1',
+          data: 'blob',
+          providerItemId: 'rs_123',
+          providerOutputIndex: 0,
+        },
+        {
+          type: 'reasoning.summary',
+          format: 'openai-responses-v1',
+          summary: 'visible reasoning summary',
+          providerItemId: 'rs_123',
+          providerOutputIndex: 0,
+          providerSummaryIndex: 0,
+        },
+      ],
+      'openai-responses',
+    ),
+    nodeVersion: 0,
+    deleted: false,
+  }
 }
 
 describe('toResponses — empty echo-item stripping', () => {

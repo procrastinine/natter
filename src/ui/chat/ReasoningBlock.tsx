@@ -13,21 +13,17 @@
 // - after the stream finishes, the panel stays in whatever state the user
 //   last chose.
 //
-// Per-row hide toggle: each displayed entry carries its index in `details`
-// so the reader can mark an individual block `hidden: true` from the view.
-// Hidden blocks remain on disk but are filtered out of the next-turn echo
-// via `filterReasoningForInclude`.
+// Per-row hide toggles address stable envelope member identities. Hidden
+// members remain on disk but are omitted from the next-turn wire projection.
 
-import { memo, useEffect, useMemo, useRef, useState } from 'react'
-import { normalizeReasoningDetails } from '../../core/reasoning'
-import type { StreamAccumulatorLiveReasoningRow } from '../../core/stream-accumulator'
-import type { ReasoningDetail } from '../../core/types'
+import { memo, useEffect, useRef, useState } from 'react'
+import type { ConversationMutationSettlement } from '../../app/presentation-interactions'
+import type { ReasoningPresentation } from '../../core/reasoning-envelope'
+import type { ReasoningMemberRef } from '../../core/types'
 import { Button } from '../primitives/Button'
 
 interface ReasoningBlockProps {
-  details: ReasoningDetail[]
-  detailsNormalized?: boolean
-  liveRows?: readonly StreamAccumulatorLiveReasoningRow[]
+  presentation: ReasoningPresentation
   streaming?: boolean
   deferContentUntilOpen?: boolean
   // True when the message body already has visible content. Drives the
@@ -37,84 +33,21 @@ interface ReasoningBlockProps {
   hasContent?: boolean
   // Caller-supplied toggle for per-row hide. When omitted, the eye icons
   // don't render (read-only view).
-  onToggleHidden?: (detailIndex: number) => void
+  onToggleHidden?: (member: ReasoningMemberRef) => ConversationMutationSettlement
   toggleHiddenDisabled?: boolean
 }
 
-type PartitionEntry<T extends ReasoningDetail> = T & {
-  __detailIndex: number
-  __valueSections?: readonly string[]
-}
-
-interface Partitioned {
-  text: PartitionEntry<Extract<ReasoningDetail, { type: 'reasoning.text' }>>[]
-  summary: PartitionEntry<Extract<ReasoningDetail, { type: 'reasoning.summary' }>>[]
-  encrypted: PartitionEntry<Extract<ReasoningDetail, { type: 'reasoning.encrypted' }>>[]
-}
-
-let reasoningPartitionProbe: (() => void) | undefined
-
-export function __setReasoningPartitionProbeForTests(probe: (() => void) | undefined): void {
-  reasoningPartitionProbe = probe
-}
-
-function partitionReasoning(
-  details: ReasoningDetail[],
-  liveRows: readonly StreamAccumulatorLiveReasoningRow[] | undefined,
-  detailsNormalized: boolean,
-): Partitioned {
-  reasoningPartitionProbe?.()
-  const text: Partitioned['text'] = []
-  const summary: Partitioned['summary'] = []
-  const encrypted: Partitioned['encrypted'] = []
-  // The normalizer only relabels individual rows, so indices remain mapped
-  // to storage. Tool-call signatures share the wire array but are not
-  // reasoning and stay out of this display without being removed on disk.
-  const normalized = liveRows || detailsNormalized ? details : normalizeReasoningDetails(details)
-  for (let i = 0; i < normalized.length; i += 1) {
-    const entry = normalized[i]
-    if (!entry || entry.id?.startsWith('tool_')) continue
-    const valueSections = liveRows?.[i]?.valueSections
-    if (entry.type === 'reasoning.text') {
-      text.push({
-        ...entry,
-        __detailIndex: i,
-        ...(valueSections ? { __valueSections: valueSections } : {}),
-      })
-    } else if (entry.type === 'reasoning.summary') {
-      summary.push({
-        ...entry,
-        __detailIndex: i,
-        ...(valueSections ? { __valueSections: valueSections } : {}),
-      })
-    } else {
-      encrypted.push({
-        ...entry,
-        __detailIndex: i,
-        ...(valueSections ? { __valueSections: valueSections } : {}),
-      })
-    }
-  }
-  return { text, summary, encrypted }
-}
-
 export const ReasoningBlock = memo(function ReasoningBlock({
-  details,
-  detailsNormalized = false,
-  liveRows,
+  presentation,
   streaming = false,
   deferContentUntilOpen = false,
   hasContent = false,
   onToggleHidden,
   toggleHiddenDisabled = false,
 }: ReasoningBlockProps) {
-  const parts = useMemo(
-    () => partitionReasoning(details, liveRows, detailsNormalized),
-    [details, detailsNormalized, liveRows],
-  )
-  const total = parts.text.length + parts.summary.length + parts.encrypted.length
-  const format = reasoningFormatTag(parts)
-  const canToggle = typeof onToggleHidden === 'function'
+  const parts = presentation
+  const total = presentation.rowCount
+  const format = presentation.kind
 
   // Auto-expand on first chunk while streaming; auto-collapse once content
   // starts unless the user has pinned the panel. `pinnedOpen` sticks on
@@ -135,15 +68,10 @@ export const ReasoningBlock = memo(function ReasoningBlock({
     lastHadContentRef.current = hasContent
   }, [streaming, hasContent, pinnedOpen])
 
-  const totalEncryptedBytes = parts.encrypted.reduce(
-    (acc, entry) =>
-      acc +
-      (entry.__valueSections?.reduce((sum, section) => sum + section.length, 0) ??
-        entry.data.length),
-    0,
-  )
+  const totalEncryptedBytes = presentation.preservedCarrierBytes
+  const carrierNotice = reasoningCarrierNotice(presentation)
 
-  if (details.length === 0 || total === 0) return null
+  if (!presentation.hasReasoning) return null
 
   return (
     <details
@@ -153,20 +81,20 @@ export const ReasoningBlock = memo(function ReasoningBlock({
       data-pinned={pinnedOpen ? 'true' : undefined}
       open={open}
       onToggle={(e) => {
-        const isOpen = e.currentTarget.open
-        setOpen(isOpen)
-        setPinnedOpen(true)
+        setOpen(e.currentTarget.open)
+        if (e.nativeEvent.isTrusted) setPinnedOpen(true)
       }}
     >
       <summary data-ui="reasoning-summary">
         <span data-ui="reasoning-title">Reasoning</span>
-        <span data-ui="reasoning-count">· {total}</span>
-        {totalEncryptedBytes > 0 ? (
+        {total > 0 ? <span data-ui="reasoning-count">· {total}</span> : null}
+        {carrierNotice ? (
           <span
             data-ui="reasoning-lock"
-            title={`Encrypted reasoning preserved — ${formatBytes(totalEncryptedBytes)}`}
+            data-kind={carrierNotice.kind}
+            title={`${carrierNotice.label} — ${formatBytes(totalEncryptedBytes)}`}
             role="img"
-            aria-label={`Encrypted reasoning preserved, ${formatBytes(totalEncryptedBytes)}`}
+            aria-label={`${carrierNotice.label}, ${formatBytes(totalEncryptedBytes)}`}
           >
             <LockIcon />
           </span>
@@ -179,31 +107,45 @@ export const ReasoningBlock = memo(function ReasoningBlock({
         <div data-ui="reasoning-details">
           {parts.summary.length > 0 ? (
             <NestedSection kind="summary" label="Summary" defaultOpen>
-              {parts.summary.map((entry, idx) => (
+              {parts.summary.map((entry) => (
                 <ReasoningRow
-                  key={keyFor(entry, 'summary', idx)}
+                  key={keyFor(entry.owner, entry.part, 'summary')}
                   kind="summary"
-                  hidden={entry.hidden === true}
+                  hidden={entry.part.hidden === true}
                   toggleHiddenDisabled={toggleHiddenDisabled}
-                  {...(canToggle
-                    ? { onToggleHidden: () => onToggleHidden(entry.__detailIndex) }
+                  {...(onToggleHidden
+                    ? {
+                        onToggleHidden: () =>
+                          onToggleHidden({
+                            owner: entry.owner,
+                            kind: 'visible',
+                            id: entry.part.id,
+                          }),
+                      }
                     : {})}
                 >
-                  {reasoningText(entry, entry.summary, 'Empty summary.')}
+                  {reasoningText(entry, entry.text, 'Empty summary.')}
                 </ReasoningRow>
               ))}
             </NestedSection>
           ) : null}
           {parts.text.length > 0 ? (
             <NestedSection kind="text" label="Details" defaultOpen={parts.summary.length === 0}>
-              {parts.text.map((entry, idx) => (
+              {parts.text.map((entry) => (
                 <ReasoningRow
-                  key={keyFor(entry, 'text', idx)}
+                  key={keyFor(entry.owner, entry.part, 'text')}
                   kind="text"
-                  hidden={entry.hidden === true}
+                  hidden={entry.part.hidden === true}
                   toggleHiddenDisabled={toggleHiddenDisabled}
-                  {...(canToggle
-                    ? { onToggleHidden: () => onToggleHidden(entry.__detailIndex) }
+                  {...(onToggleHidden
+                    ? {
+                        onToggleHidden: () =>
+                          onToggleHidden({
+                            owner: entry.owner,
+                            kind: 'visible',
+                            id: entry.part.id,
+                          }),
+                      }
                     : {})}
                 >
                   {reasoningText(entry, entry.text, 'Empty reasoning block.')}
@@ -211,22 +153,29 @@ export const ReasoningBlock = memo(function ReasoningBlock({
               ))}
             </NestedSection>
           ) : null}
-          {parts.encrypted.length > 0 ? (
+          {parts.opaque.length > 0 ? (
             <NestedSection kind="encrypted" label="Encrypted" defaultOpen>
-              {parts.encrypted.map((entry, idx) => (
+              {parts.opaque.map((entry) => (
                 <ReasoningRow
-                  key={keyFor(entry, 'encrypted', idx)}
+                  key={keyFor(entry.owner, entry.carrier, 'encrypted')}
                   kind="encrypted"
-                  hidden={entry.hidden === true}
+                  hidden={entry.carrier.hidden === true}
                   toggleHiddenDisabled={toggleHiddenDisabled}
-                  {...(canToggle
-                    ? { onToggleHidden: () => onToggleHidden(entry.__detailIndex) }
+                  {...(onToggleHidden
+                    ? {
+                        onToggleHidden: () =>
+                          onToggleHidden({
+                            owner: entry.owner,
+                            kind: 'carrier',
+                            id: entry.carrier.id,
+                          }),
+                      }
                     : {})}
                 >
                   <LockIcon />
                   <em>
-                    Encrypted reasoning preserved — {formatBytes(entry.data.length)}
-                    {entry.format ? ` · ${entry.format}` : ''}
+                    Encrypted reasoning preserved — {formatBytes(entry.valueLength)} ·{' '}
+                    {entry.carrier.format}
                   </em>
                 </ReasoningRow>
               ))}
@@ -247,7 +196,7 @@ function ReasoningRow({
 }: {
   kind: 'summary' | 'text' | 'encrypted'
   hidden: boolean
-  onToggleHidden?: () => void
+  onToggleHidden?: () => ConversationMutationSettlement
   toggleHiddenDisabled?: boolean
   children: React.ReactNode
 }) {
@@ -268,7 +217,9 @@ function ReasoningRow({
           type="button"
           data-ui="reasoning-row-hide"
           data-pressed={hidden ? 'true' : undefined}
-          onClick={onToggleHidden}
+          onClick={() => {
+            void onToggleHidden()
+          }}
           disabled={toggleHiddenDisabled}
           aria-label={hidden ? 'Unhide this reasoning block' : 'Hide this reasoning block'}
           title={
@@ -338,14 +289,24 @@ function NestedSection({
   )
 }
 
-function reasoningFormatTag(parts: Partitioned): 'encrypted' | 'summary' | 'plaintext' {
-  if (parts.encrypted.length > 0) return 'encrypted'
-  if (parts.summary.length > 0 && parts.text.length === 0) return 'summary'
-  return 'plaintext'
+function keyFor(owner: ReasoningMemberRef['owner'], entry: { id: string }, kind: string): string {
+  const ownerKey = owner.kind === 'generation' ? 'generation' : `continuation:${owner.streamId}`
+  return `${ownerKey}:${kind}:${entry.id}`
 }
 
-function keyFor(entry: ReasoningDetail, kind: string, index: number): string {
-  return entry.id ?? `reasoning-${kind}-${index}`
+function reasoningCarrierNotice(
+  presentation: ReasoningPresentation,
+): Readonly<{ kind: 'authentication' | 'encrypted' | 'mixed'; label: string }> | undefined {
+  const hasAuthentication = presentation.authenticationCarrierBytes > 0
+  const hasEncrypted = presentation.opaqueCarrierBytes > 0
+  if (hasAuthentication && hasEncrypted) {
+    return { kind: 'mixed', label: 'Encrypted reasoning and authentication preserved' }
+  }
+  if (hasAuthentication) {
+    return { kind: 'authentication', label: 'Reasoning authentication preserved' }
+  }
+  if (hasEncrypted) return { kind: 'encrypted', label: 'Encrypted reasoning preserved' }
+  return undefined
 }
 
 function textOrFallback(raw: string | null | undefined, fallback: string): string {
@@ -355,14 +316,22 @@ function textOrFallback(raw: string | null | undefined, fallback: string): strin
 }
 
 function reasoningText(
-  entry: { __valueSections?: readonly string[] },
+  entry: {
+    valueSections?: readonly string[]
+    pendingValue?: string
+    valueLength: number
+  },
   raw: string | null | undefined,
   fallback: string,
 ): React.ReactNode {
-  if (!entry.__valueSections) return textOrFallback(raw, fallback)
-  return entry.__valueSections.some((section) => /\S/u.test(section))
-    ? entry.__valueSections
-    : fallback
+  if (!entry.valueSections) return textOrFallback(raw, fallback)
+  if (entry.valueLength === 0) return fallback
+  return (
+    <>
+      {entry.valueSections}
+      {entry.pendingValue}
+    </>
+  )
 }
 
 function formatBytes(n: number): string {

@@ -14,6 +14,7 @@
 // `/props` lives at the server root, not under `/v1`. A llama-server connection
 // profile's `baseUrl` typically ends in `/v1`; `llamaServerRoot()` strips it.
 
+import type { OpaqueServerRenderedPrompt } from '../core/text-templates'
 import type { ConnectionProfile } from '../core/types'
 import { fetchWithTimeout, readResponseJson } from './client'
 import { ApiError } from './errors'
@@ -168,9 +169,9 @@ interface ApplyTemplateMessage {
 
 export async function applyServerTemplate(
   profile: Pick<ConnectionProfile, 'baseUrl'>,
-  messages: ApplyTemplateMessage[],
+  messages: readonly ApplyTemplateMessage[],
   opts: ProbeOptions = {},
-): Promise<string> {
+): Promise<OpaqueServerRenderedPrompt> {
   const root = llamaServerRoot(profile.baseUrl)
   const url = `${root}/apply-template`
   const init: RequestInit = {
@@ -191,5 +192,5 @@ export async function applyServerTemplate(
   if (prompt === null) {
     throw new Error('apply-template returned no prompt string')
   }
-  return prompt
+  return { kind: 'opaque-server-rendered-prompt', prompt }
 }

@@ -1,59 +1,41 @@
-import { render } from '@testing-library/react'
-import { afterEach, describe, expect, it } from 'vitest'
+import { act, render } from '@testing-library/react'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { unavailableGenerationCapability } from '../../src/core/interaction-capability'
 import type { Message as MessageRow } from '../../src/core/types'
-import { useStreamStore } from '../../src/store/zustand/streamStore'
+import { attemptController } from '../../src/store/attempt-controller'
+import type { WorkspaceFence } from '../../src/store/presentation-contracts'
 import { Message as ChatMessageComponent } from '../../src/ui/chat/Message'
-import {
-  collapseProfileFor,
-  DEFAULT_OVERFLOW_THRESHOLD,
-  MessageStreamOverflow,
-  nextCollapseMode,
-} from '../../src/ui/chat/MessageStreamOverflow'
+import { collapseProfileFor, nextCollapseMode } from '../../src/ui/chat/MessageStreamOverflow'
+import { observeTestAttempt, resetAttemptControllerForTests } from '../helpers/attempt-controller'
+import { succeededInteractionSettlement } from '../helpers/presentation-interactions'
 
-const ChatMessage = (props: Omit<Parameters<typeof ChatMessageComponent>[0], 'bodyVersion'>) => (
-  <ChatMessageComponent {...props} bodyVersion={props.message.nodeVersion} />
+const ChatMessage = (
+  props: Omit<
+    Parameters<typeof ChatMessageComponent>[0],
+    'bodyVersion' | 'onBeginEdit' | 'onDeleteMessage' | 'onEditInPlace'
+  > & {
+    onDeleteMessage?: Parameters<typeof ChatMessageComponent>[0]['onDeleteMessage']
+    onEditInPlace?: Parameters<typeof ChatMessageComponent>[0]['onEditInPlace']
+  },
+) => (
+  <ChatMessageComponent
+    {...props}
+    bodyVersion={props.message.nodeVersion}
+    onDeleteMessage={props.onDeleteMessage ?? succeededInteractionSettlement}
+    onEditInPlace={props.onEditInPlace ?? succeededInteractionSettlement}
+    onBeginEdit={() => ({ admitted: Promise.resolve(), release: () => undefined })}
+  />
 )
 
-afterEach(() => {
-  useStreamStore.getState().reset()
+const CONNECTION_MISSING = unavailableGenerationCapability('connection-missing')
+let presentationFence: WorkspaceFence
+
+beforeEach(() => {
+  presentationFence = resetAttemptControllerForTests()
 })
 
-describe('MessageStreamOverflow', () => {
-  it('renders the full children in full mode', () => {
-    const { container } = render(
-      <MessageStreamOverflow
-        collapseMode="full"
-        fullChildren={<div>full</div>}
-        compactChildren={<div>compact</div>}
-        peekChildren={<div>peek</div>}
-      />,
-    )
-    expect(container.textContent).toBe('full')
-  })
-
-  it('renders the compact children in compact mode', () => {
-    const { container } = render(
-      <MessageStreamOverflow
-        collapseMode="compact"
-        fullChildren={<div>full-sample</div>}
-        compactChildren={<div>compact-sample</div>}
-        peekChildren={<div>peek-sample</div>}
-      />,
-    )
-    expect(container.textContent).toBe('compact-sample')
-  })
-
-  it('renders the peek children in peek mode', () => {
-    const { container } = render(
-      <MessageStreamOverflow
-        collapseMode="peek"
-        fullChildren={<div>full-sample</div>}
-        compactChildren={<div>compact-sample</div>}
-        peekChildren={<div>peek-sample</div>}
-      />,
-    )
-    expect(container.textContent).toBe('peek-sample')
-  })
+afterEach(() => {
+  resetAttemptControllerForTests()
 })
 
 describe('collapseProfileFor', () => {
@@ -116,25 +98,24 @@ describe('nextCollapseMode', () => {
 describe('Message active-stream overflow behavior', () => {
   it('does not auto-compact an oversized assistant message while its stream is active', () => {
     const message = assistantMessage({
-      content: [{ type: 'output_text', text: 'x'.repeat(DEFAULT_OVERFLOW_THRESHOLD + 1) }],
+      content: [{ type: 'output_text', text: 'x'.repeat(20_001) }],
     })
-    useStreamStore.getState().setActive({
+    observeTestAttempt({
       streamId: 'stream-1',
-      replacementEpoch: 0,
       chatId: message.chatId,
       messageId: message.id,
-      startedAt: 1,
-      ownerClientId: 'test',
     })
 
     const { container } = render(
       <ChatMessage
         chatId={message.chatId}
         message={message}
-        hasAnyReasoningDetails={false}
-        hasConnection={false}
+        editResendCapability={CONNECTION_MISSING}
+        regenerateCapability={CONNECTION_MISSING}
+        continueCapability={CONNECTION_MISSING}
+        presentationFence={presentationFence}
         longMessageDisplayMode="compact"
-        onEditInPlace={async () => {}}
+        onEditInPlace={succeededInteractionSettlement}
       />,
     )
 
@@ -144,6 +125,73 @@ describe('Message active-stream overflow behavior', () => {
     expect(
       container.querySelector('[data-ui="markdown"]')?.getAttribute('data-streaming'),
     ).toBeNull()
+  })
+
+  it('does not collapse or remount an oversized message when its active stream finalizes', () => {
+    const message = assistantMessage({
+      content: [{ type: 'output_text', text: 'x'.repeat(20_001) }],
+    })
+    observeTestAttempt({
+      streamId: 'stream-1',
+      chatId: message.chatId,
+      messageId: message.id,
+    })
+
+    const props = {
+      chatId: message.chatId,
+      message,
+      editResendCapability: CONNECTION_MISSING,
+      regenerateCapability: CONNECTION_MISSING,
+      continueCapability: CONNECTION_MISSING,
+      presentationFence,
+      longMessageDisplayMode: 'compact' as const,
+      onEditInPlace: succeededInteractionSettlement,
+    }
+    const view = render(<ChatMessage {...props} />)
+    const markdown = view.container.querySelector<HTMLElement>('[data-ui="markdown"]')
+    if (!markdown) throw new Error('missing active stream markdown')
+    markdown.dataset.finalizationAnchor = 'retained'
+
+    const attempt = attemptController.get('stream-1')
+    if (!attempt?.messageId) throw new Error('missing overflow attempt')
+    act(() => {
+      attemptController.registerTargetCommitHandoff({
+        ...presentationFence,
+        streamId: attempt.streamId,
+        chatId: attempt.chatId,
+        messageId: attempt.messageId,
+        attemptKind: attempt.kind,
+        admissionSequence: attempt.admissionSequence,
+        leaseRevision: attempt.leaseRevision + 1,
+        bodyVersion: message.nodeVersion + 1,
+      })
+    })
+    view.rerender(
+      <ChatMessage
+        {...props}
+        message={{
+          ...message,
+          nodeVersion: message.nodeVersion + 1,
+        }}
+      />,
+    )
+    act(() => {
+      attemptController.publishExactTargetPresentations([
+        {
+          ...presentationFence,
+          streamId: attempt.streamId,
+          chatId: attempt.chatId,
+          messageId: attempt.messageId,
+          bodyVersion: message.nodeVersion + 1,
+        },
+      ])
+    })
+
+    expect(view.container.querySelector('[data-ui="message"]')).toHaveAttribute(
+      'data-collapse-mode',
+      'full',
+    )
+    expect(view.container.querySelector('[data-finalization-anchor="retained"]')).toBe(markdown)
   })
 })
 

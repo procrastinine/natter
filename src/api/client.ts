@@ -1,15 +1,22 @@
-// Fetch wrapper — header merge, timeout, abort, GET retry, key-fallback chain.
+// Fetch wrapper — header merge, timeout, abort, and key-fallback chain.
 //
 // This file is environment-neutral (no `window`, no IDB, no DOM). Both the
 // in-tab engine and the daemon engine build import it directly.
 
-import type { ConnectionProfile } from '../core/types'
+import type { ConnectionHttpProfile, ConnectionProfile } from '../core/types'
 import { raceWithAbortSignal } from '../lib/abort'
+import {
+  logStreamDebug,
+  logStreamDebugError,
+  logStreamDebugRequestAttempt,
+  type StreamDebugTrace,
+  snapshotStreamDebugRequest,
+  startStreamDebug,
+} from '../lib/debug-streams'
 import type { CallOpts } from './call-opts'
 import { ApiError, normalizeError } from './errors'
 
 const DEFAULT_TIMEOUT_MS = 120_000
-const DEFAULT_RETRY_CAP_MS = 5_000
 
 interface ResponseBodyContract {
   readonly deadline: number | undefined
@@ -26,7 +33,7 @@ function monotonicNow(): number {
 type TargetAddressSpace = 'local' | 'loopback'
 type LocalNetworkRequestInit = RequestInit & { targetAddressSpace?: TargetAddressSpace }
 
-function isAnthropicBrowserOriginProfile(profile: ConnectionProfile): boolean {
+function isAnthropicBrowserOriginProfile(profile: ConnectionHttpProfile): boolean {
   if (profile.kind === 'anthropic') return true
   try {
     return new URL(profile.baseUrl).host === 'api.anthropic.com'
@@ -46,7 +53,7 @@ function isAnthropicBrowserOriginProfile(profile: ConnectionProfile): boolean {
 // profile's `kind` because the same Google profile can serve BOTH transports
 // depending on the chat's API mode.
 export function buildHeaders(
-  profile: ConnectionProfile,
+  profile: ConnectionHttpProfile,
   apiKey: string,
   opts: {
     overrideHeaders?: Record<string, string>
@@ -97,8 +104,8 @@ function setHeader(headers: Record<string, string>, name: string, value: string)
   headers[name] = value
 }
 
-export function hasExplicitAuthHeaderOverride(
-  profile: ConnectionProfile,
+function hasExplicitAuthHeaderOverride(
+  profile: ConnectionHttpProfile,
   overrideHeaders: Record<string, string> | undefined,
   authHeaderName: 'Authorization' | 'x-goog-api-key' | 'x-api-key',
 ): boolean {
@@ -231,7 +238,11 @@ export function releaseResponseBodyTimeout(response: Response): void {
   responseBodyContracts.delete(response)
 }
 
-export async function readResponseText(response: Response): Promise<string> {
+async function consumeResponseBody<T>(
+  response: Response,
+  consume: (chunk: Uint8Array) => void,
+  finish: () => T,
+): Promise<T> {
   const contract = responseBodyContracts.get(response)
   responseBodyContracts.delete(response)
 
@@ -280,8 +291,6 @@ export async function readResponseText(response: Response): Promise<string> {
     }
   }
 
-  const decoder = new TextDecoder()
-  const parts: string[] = []
   try {
     for (;;) {
       let result: ReadableStreamReadResult<Uint8Array>
@@ -296,10 +305,9 @@ export async function readResponseText(response: Response): Promise<string> {
       if (signal?.aborted) throw bufferedBodyFailure('abort')
       if (interruptedBy === 'timeout') throw bufferedBodyFailure('timeout')
       if (result.done) break
-      parts.push(decoder.decode(result.value, { stream: true }))
+      consume(result.value)
     }
-    parts.push(decoder.decode())
-    return parts.join('')
+    return finish()
   } finally {
     if (timer) clearTimeout(timer)
     signal?.removeEventListener('abort', onAbort)
@@ -309,6 +317,28 @@ export async function readResponseText(response: Response): Promise<string> {
       // A failed/canceled reader may still be settling; cancellation above released the body.
     }
   }
+}
+
+export function readResponseText(response: Response): Promise<string> {
+  const decoder = new TextDecoder()
+  const parts: string[] = []
+  return consumeResponseBody(
+    response,
+    (chunk) => parts.push(decoder.decode(chunk, { stream: true })),
+    () => {
+      parts.push(decoder.decode())
+      return parts.join('')
+    },
+  )
+}
+
+export function readResponseBlob(response: Response): Promise<Blob> {
+  const parts: BlobPart[] = []
+  return consumeResponseBody(
+    response,
+    (chunk) => parts.push(chunk as Uint8Array<ArrayBuffer>),
+    () => new Blob(parts, { type: response.headers.get('content-type') ?? '' }),
+  )
 }
 
 export async function readResponseJson<T>(response: Response): Promise<T> {
@@ -329,70 +359,6 @@ export async function readErrorResponseJson(response: Response): Promise<unknown
     }
     return { error: { code: response.status, message: response.statusText } }
   }
-}
-
-function isRetryableStatus(status: number): boolean {
-  return status === 408 || status === 429 || status === 502 || status === 503
-}
-
-function abortableDelay(ms: number, signal: AbortSignal | undefined): Promise<void> {
-  if (signal?.aborted) return Promise.reject(bufferedBodyFailure('abort'))
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(done, ms)
-    const onAbort = () => {
-      clearTimeout(timer)
-      signal?.removeEventListener('abort', onAbort)
-      reject(bufferedBodyFailure('abort'))
-    }
-    function done() {
-      signal?.removeEventListener('abort', onAbort)
-      resolve()
-    }
-    signal?.addEventListener('abort', onAbort, { once: true })
-  })
-}
-
-export function computeBackoffMs(
-  attempt: number,
-  baseMs: number,
-  capMs = DEFAULT_RETRY_CAP_MS,
-): number {
-  return Math.min(baseMs * 2 ** attempt, capMs)
-}
-
-// Idempotent GET retry. Stops as soon as it gets a 2xx or a non-retryable
-// status; otherwise backs off and tries again up to `attempts`. `attempts`
-// is the TOTAL number of calls, not additional retries — attempts=1 means
-// one call, zero retries. On final failure, returns the last Response (if
-// any) or re-throws the last ApiError.
-export async function fetchWithRetry(
-  url: string,
-  init: RequestInit,
-  opts: CallOpts = {},
-): Promise<Response> {
-  const attempts = Math.max(1, opts.retry?.attempts ?? 1)
-  const baseBackoff = opts.retry?.backoffMs ?? 250
-  let lastError: ApiError | undefined
-  for (let i = 0; i < attempts; i += 1) {
-    try {
-      const init2: RequestInit = { ...init }
-      const res = await fetchWithTimeout(url, init2, {
-        ...(opts.signal ? { signal: opts.signal } : {}),
-        ...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
-      })
-      if (res.ok || !isRetryableStatus(res.status)) return res
-      lastError = undefined
-      if (i === attempts - 1) return res
-      cancelUnusedResponseBody(res)
-    } catch (e) {
-      if (!(e instanceof ApiError) || !e.retryable) throw e
-      lastError = e
-      if (i === attempts - 1) throw e
-    }
-    await abortableDelay(computeBackoffMs(i, baseBackoff), opts.signal)
-  }
-  if (lastError) throw lastError
-  throw new Error('fetchWithRetry: unreachable')
 }
 
 function cancelUnusedResponseBody(response: Response): void {
@@ -428,9 +394,14 @@ interface KeyFallbackRequest {
   init: RequestInit
 }
 
+interface KeyFallbackOptions<Candidate> {
+  signal?: AbortSignal
+  timeoutMs?: number
+  onAttemptResponse?: (result: KeyFallbackResult<Candidate>) => void
+}
+
 export interface ApiKeyCandidate {
   readonly resolve: () => string | Promise<string>
-  readonly markUsed?: () => void | Promise<void>
 }
 
 export interface ApiKeyDispatchContext {
@@ -480,7 +451,7 @@ export async function fetchWithKeyFallback<Candidate>(
     candidate: Candidate,
     candidateIndex: number,
   ) => KeyFallbackRequest | Promise<KeyFallbackRequest>,
-  opts: { signal?: AbortSignal; timeoutMs?: number } = {},
+  opts: KeyFallbackOptions<Candidate> = {},
 ): Promise<KeyFallbackResult<Candidate>> {
   if (candidates.length === 0) {
     throw new Error('fetchWithKeyFallback: at least one candidate is required')
@@ -492,6 +463,7 @@ export async function fetchWithKeyFallback<Candidate>(
     throwIfAborted(opts.signal)
     const res = await fetchWithTimeout(url, init, opts)
     const result = { response: res, candidate, candidateIndex: i }
+    opts.onAttemptResponse?.(result)
     if (res.ok || res.bodyUsed || !isKeyFallbackTrigger(res)) return result
     if (i === candidates.length - 1) return result
     // Non-last rotate trigger: cancel the body to free the socket before
@@ -515,7 +487,7 @@ type ApiKeyRequestBuilder = (
 export function fetchWithApiKeyFallback(
   ctx: ApiKeyDispatchContext,
   build: ApiKeyRequestBuilder,
-  opts: { signal?: AbortSignal; timeoutMs?: number } = {},
+  opts: KeyFallbackOptions<ApiKeyCandidate> = {},
 ): Promise<ApiKeyFallbackResult> {
   return fetchWithApiKeyFallbackImpl(ctx, build, opts)
 }
@@ -523,21 +495,23 @@ export function fetchWithApiKeyFallback(
 async function fetchWithApiKeyFallbackImpl(
   ctx: ApiKeyDispatchContext,
   buildRequest: ApiKeyRequestBuilder | undefined,
-  opts: { signal?: AbortSignal; timeoutMs?: number },
+  opts: KeyFallbackOptions<ApiKeyCandidate>,
 ): Promise<ApiKeyFallbackResult> {
   const legacyCandidate: ApiKeyCandidate = { resolve: () => ctx.apiKey }
   const candidates =
     ctx.apiKeyCandidates && ctx.apiKeyCandidates.length > 0
       ? ctx.apiKeyCandidates
       : [legacyCandidate]
-  const resolvedKeys = new Map<number, string>()
+  let resolvedCandidateIndex = -1
+  let resolvedApiKey: string | undefined
   let result: KeyFallbackResult<ApiKeyCandidate>
   try {
     result = await fetchWithKeyFallback(
       candidates,
       async (candidate, candidateIndex) => {
         const apiKey = await runAbortableRequestStep(candidate.resolve, opts.signal)
-        resolvedKeys.set(candidateIndex, apiKey)
+        resolvedCandidateIndex = candidateIndex
+        resolvedApiKey = apiKey
         return (buildRequest as ApiKeyRequestBuilder)(apiKey, candidate, candidateIndex)
       },
       opts,
@@ -545,18 +519,151 @@ async function fetchWithApiKeyFallbackImpl(
   } finally {
     buildRequest = undefined
   }
-  const apiKey = resolvedKeys.get(result.candidateIndex)
-  if (apiKey === undefined) {
+  if (resolvedCandidateIndex !== result.candidateIndex || resolvedApiKey === undefined) {
     throw new Error('fetchWithApiKeyFallback: selected candidate was not resolved')
   }
+  const apiKey = resolvedApiKey
   if (result.response.ok) {
-    await ctx.onKeyCandidateSelected?.(result.candidate, result.candidateIndex, apiKey)
     try {
-      const marked = result.candidate.markUsed?.()
-      void Promise.resolve(marked).catch(() => {})
-    } catch {
-      // Key-use metadata is best-effort and must not discard a provider response.
+      await runAbortableRequestStep(
+        () => ctx.onKeyCandidateSelected?.(result.candidate, result.candidateIndex, apiKey),
+        opts.signal,
+      )
+    } catch (error) {
+      cancelUnusedResponseBody(result.response)
+      throw error
     }
   }
   return { ...result, apiKey }
+}
+
+export interface ProviderDispatchResult {
+  readonly response: Response
+  readonly debugTrace: StreamDebugTrace | null
+  readonly selectedApiKey: string
+}
+
+export function dispatchProviderJsonRequest<Request>(input: {
+  readonly adapter: string
+  readonly context: ApiKeyDispatchContext & { readonly profile: ConnectionProfile }
+  readonly url: string
+  readonly request: Request
+  readonly opts: CallOpts
+  readonly authHeaderName: 'Authorization' | 'x-goog-api-key' | 'x-api-key'
+  readonly authScheme?: 'bearer' | 'gemini-native' | 'anthropic-native'
+  readonly fixedHeaders?: Readonly<Record<string, string>>
+}): Promise<ProviderDispatchResult> {
+  const overrideHeaders = mergeRequestHeaders(input.fixedHeaders, input.opts.overrideHeaders)
+  return dispatchJsonWithApiKeyFallback({
+    adapter: input.adapter,
+    ...(input.opts.diagnosticId ? { diagnosticId: input.opts.diagnosticId } : {}),
+    profile: input.context.profile,
+    authContext: hasExplicitAuthHeaderOverride(
+      input.context.profile,
+      overrideHeaders,
+      input.authHeaderName,
+    )
+      ? { apiKey: input.context.apiKey }
+      : input.context,
+    url: input.url,
+    body: JSON.stringify(input.request),
+    request: input.request,
+    buildHeaders: (apiKey) =>
+      buildHeaders(input.context.profile, apiKey, {
+        method: 'POST',
+        ...(input.authScheme ? { authScheme: input.authScheme } : {}),
+        ...(overrideHeaders ? { overrideHeaders } : {}),
+      }),
+    ...(input.opts.signal ? { signal: input.opts.signal } : {}),
+    ...(input.opts.timeoutMs !== undefined ? { timeoutMs: input.opts.timeoutMs } : {}),
+  })
+}
+
+function mergeRequestHeaders(
+  fixed: Readonly<Record<string, string>> | undefined,
+  overrides: Readonly<Record<string, string>> | undefined,
+): Record<string, string> | undefined {
+  if (!fixed && !overrides) return undefined
+  return { ...(fixed ?? {}), ...(overrides ?? {}) }
+}
+
+function dispatchJsonWithApiKeyFallback(input: {
+  readonly adapter: string
+  readonly diagnosticId?: string
+  readonly profile: ConnectionProfile
+  readonly authContext: ApiKeyDispatchContext
+  readonly url: string
+  readonly body: string
+  readonly request: unknown
+  readonly buildHeaders: (
+    apiKey: string,
+    candidate: ApiKeyCandidate,
+    candidateIndex: number,
+  ) => Record<string, string>
+  readonly signal?: AbortSignal
+  readonly timeoutMs?: number
+}): Promise<ProviderDispatchResult> {
+  const debugRequest = snapshotStreamDebugRequest(input.profile, input.request)
+  let debugTrace: StreamDebugTrace | null = null
+  const fallbackOptions: KeyFallbackOptions<ApiKeyCandidate> = {
+    ...(input.signal ? { signal: input.signal } : {}),
+    ...(input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {}),
+  }
+  if (debugRequest !== null) {
+    fallbackOptions.onAttemptResponse = ({ response, candidateIndex }) => {
+      if (!debugTrace) return
+      logStreamDebug(debugTrace, 'response-head', {
+        attemptIndex: candidateIndex,
+        status: response.status,
+        contentType: response.headers.get('content-type'),
+        generationId:
+          response.headers.get('x-generation-id') ??
+          response.headers.get('x-request-id') ??
+          response.headers.get('anthropic-request-id') ??
+          undefined,
+      })
+    }
+  }
+  const fetched = fetchWithApiKeyFallback(
+    input.authContext,
+    (apiKey, candidate, candidateIndex) => {
+      const headers = input.buildHeaders(apiKey, candidate, candidateIndex)
+      if (debugRequest !== null) {
+        if (debugTrace) {
+          logStreamDebugRequestAttempt(debugTrace, {
+            url: input.url,
+            headers,
+            attemptIndex: candidateIndex,
+          })
+        } else {
+          debugTrace = startStreamDebug({
+            adapter: input.adapter,
+            ...(input.diagnosticId ? { diagnosticId: input.diagnosticId } : {}),
+            profile: input.profile,
+            url: input.url,
+            request: debugRequest,
+            headers,
+            attemptIndex: candidateIndex,
+          })
+        }
+      }
+      return { url: input.url, init: { method: 'POST', headers, body: input.body } }
+    },
+    fallbackOptions,
+  )
+  return fetched.then(
+    async ({ response, apiKey }) => {
+      const result = { response, debugTrace, selectedApiKey: apiKey }
+      if (response.ok) return result
+      const errorBody = await readErrorResponseJson(response)
+      if (debugTrace) {
+        logStreamDebug(debugTrace, 'error', { status: response.status, body: errorBody })
+      }
+      throw normalizeError(errorBody, { midStream: false, httpStatus: response.status })
+    },
+    (error: unknown) => {
+      if (debugTrace) logStreamDebugError(debugTrace, error)
+      throw error
+    },
+  )
 }

@@ -18,50 +18,156 @@
 //     (`reasoningPreservationFormat`, `preferApi`, `requiresResponsesApi`).
 
 import { hasEnabledHostedTools, isOpenAiDirectProfile } from './provider-hosted-tools'
-import { isTextCompletionsSelectableFor, responsesSupportFor } from './quirks'
-import { normalizeReasoningSettings } from './reasoning'
+import {
+  ANTHROPIC_PROVIDER_OUTPUT_CONTRACT,
+  type AttemptProviderOutputContract,
+  GOOGLE_PROVIDER_OUTPUT_CONTRACT,
+  OPENAI_RESPONSES_PROVIDER_OUTPUT_CONTRACT,
+  OPENROUTER_RESPONSES_PROVIDER_OUTPUT_CONTRACT,
+  TEXT_PROVIDER_OUTPUT_CONTRACT,
+} from './provider-tool-context'
+import {
+  isTextCompletionsSelectableFor,
+  reasoningVisibilityPolicyFromQuirks,
+  responsesSupportFor,
+} from './quirks'
+import {
+  type AttemptReasoningContract,
+  type InboundReasoningVisibility,
+  type MessageContextRouteFacts,
+  type ReasoningPolicy,
+  type ReasoningVisibilityPolicy,
+  type RoutedReasoningContract,
+  reasoningCarrierReplayDecision,
+  reasoningPolicyForSettings,
+  sealAttemptReasoningContract,
+} from './reasoning'
 import type {
   ApiVariant,
   ChatSettings,
   ConnectionProfile,
   GenerationMeta,
-  Message,
+  KnownReasoningFormat,
   ReasoningFormat,
+  ReasoningProducerBridge,
 } from './types'
 
-type ApiRouteKind =
-  | 'chat-completions'
-  | 'text-completions'
-  | 'responses'
-  | 'gemini-generate'
-  | 'anthropic-messages'
-  | 'video-generation'
+export type ApiRoute =
+  | { kind: 'chat-completions'; transport: 'openai-chat'; reason: string }
+  | { kind: 'text-completions'; transport: 'openai-text'; reason: string }
+  | { kind: 'responses'; transport: 'openai-responses'; reason: string }
+  | { kind: 'gemini-generate'; transport: 'gemini-native'; reason: string }
+  | { kind: 'anthropic-messages'; transport: 'anthropic'; reason: string }
+  | { kind: 'video-generation'; transport: 'openrouter-video'; reason: string }
 
-type ApiTransport =
-  | 'openai-chat'
-  | 'openai-text'
-  | 'openai-responses'
-  | 'gemini-native'
-  | 'anthropic'
-  | 'openrouter-video'
+type ReasoningContractFor<
+  Target extends KnownReasoningFormat | null,
+  Carrier extends RoutedReasoningContract['carrier'],
+  Origin extends RoutedReasoningContract['originDialect'],
+> = RoutedReasoningContract<Target, Carrier, Origin>
 
-export interface ApiRoute {
-  kind: ApiRouteKind
-  transport: ApiTransport
-  // Human-readable rationale tag — the UI uses this to label "Auto — chat
-  // completions" vs "Auto — Responses (required by gpt-5.4)".
-  reason: string
+type OpenAiReasoningFormat =
+  | 'openai-responses-v1'
+  | 'azure-openai-responses-v1'
+  | 'xai-responses-v1'
+
+export type ResponsesReasoningContract =
+  | ReasoningContractFor<OpenAiReasoningFormat, 'responses-items', 'openrouter-responses'>
+  | ReasoningContractFor<OpenAiReasoningFormat, 'responses-items', 'openai-responses'>
+
+export type AssistantRouteContract =
+  | (Extract<ApiRoute, { transport: 'openai-text' | 'openrouter-video' }> & {
+      readonly reasoning: ReasoningContractFor<null, 'plaintext-only', 'inline'>
+      readonly providerOutput: Extract<AttemptProviderOutputContract, { captureDialect: null }>
+    })
+  | (Extract<ApiRoute, { transport: 'gemini-native' }> & {
+      readonly reasoning: ReasoningContractFor<'google-gemini-v1', 'gemini-parts', 'gemini-native'>
+      readonly providerOutput: Extract<
+        AttemptProviderOutputContract,
+        { captureDialect: 'google-gemini' }
+      >
+    })
+  | (Extract<ApiRoute, { transport: 'anthropic' }> & {
+      readonly reasoning: ReasoningContractFor<
+        'anthropic-claude-v1',
+        'anthropic-blocks',
+        'anthropic-messages'
+      >
+      readonly providerOutput: Extract<
+        AttemptProviderOutputContract,
+        { captureDialect: 'anthropic-claude' }
+      >
+    })
+  | (Extract<ApiRoute, { transport: 'openai-responses' }> & {
+      readonly reasoning: ReasoningContractFor<
+        OpenAiReasoningFormat,
+        'responses-items',
+        'openai-responses'
+      >
+      readonly providerOutput: Extract<
+        AttemptProviderOutputContract,
+        { captureDialect: 'openai-responses' }
+      >
+    })
+  | (Extract<ApiRoute, { transport: 'openai-chat' }> & {
+      readonly reasoning: ReasoningContractFor<
+        KnownReasoningFormat | null,
+        'plaintext-only',
+        'openai-chat'
+      >
+      readonly providerOutput: Extract<AttemptProviderOutputContract, { captureDialect: null }>
+    })
+  | (Extract<ApiRoute, { transport: 'openai-responses' }> & {
+      readonly reasoning: ReasoningContractFor<
+        OpenAiReasoningFormat,
+        'responses-items',
+        'openrouter-responses'
+      >
+      readonly providerOutput: Extract<
+        AttemptProviderOutputContract,
+        { captureDialect: 'openrouter-responses' }
+      >
+    })
+  | (Extract<ApiRoute, { transport: 'openai-chat' }> & {
+      readonly reasoning: ReasoningContractFor<
+        KnownReasoningFormat | null,
+        'openrouter-reasoning-details',
+        'openrouter-chat'
+      >
+      readonly providerOutput: Extract<AttemptProviderOutputContract, { captureDialect: null }>
+    })
+
+type SealAssistantRouteAttempt<Route extends AssistantRouteContract> =
+  Route extends AssistantRouteContract
+    ? Route['reasoning'] extends RoutedReasoningContract<infer Target, infer Carrier, infer Origin>
+      ? Omit<Route, 'reasoning'> & {
+          readonly reasoning: AttemptReasoningContract<Target, Carrier, Origin>
+        }
+      : never
+    : never
+
+export type AssistantAttemptContract = SealAssistantRouteAttempt<AssistantRouteContract>
+
+export function assistantRouteContractKey(route: AssistantRouteContract): string {
+  return JSON.stringify(route)
 }
 
-export function apiUsedForRoute(
-  route: ApiRoute | null | undefined,
-  useTextProtocol = false,
-): GenerationMeta['apiUsed'] {
-  if (useTextProtocol || route?.kind === 'text-completions') return 'completion'
-  if (route?.kind === 'responses') return 'responses'
-  if (route?.kind === 'gemini-generate') return 'gemini-native'
-  if (route?.kind === 'anthropic-messages') return 'anthropic-messages'
-  if (route?.kind === 'video-generation') return 'video-generation'
+export function sealAssistantAttemptContract<Route extends AssistantRouteContract>(
+  route: Route,
+  inboundVisibility: InboundReasoningVisibility,
+): SealAssistantRouteAttempt<Route> {
+  return Object.freeze({
+    ...route,
+    reasoning: sealAttemptReasoningContract(route.reasoning, inboundVisibility),
+  }) as SealAssistantRouteAttempt<Route>
+}
+
+export function apiUsedForRoute(route: ApiRoute): NonNullable<GenerationMeta['apiUsed']> {
+  if (route.kind === 'text-completions') return 'completion'
+  if (route.kind === 'responses') return 'responses'
+  if (route.kind === 'gemini-generate') return 'gemini-native'
+  if (route.kind === 'anthropic-messages') return 'anthropic-messages'
+  if (route.kind === 'video-generation') return 'video-generation'
   return 'chat'
 }
 
@@ -72,22 +178,198 @@ export interface RouterCapabilities {
     requiresResponsesApi?: boolean
     preferApi?: 'chat' | 'responses'
     reasoningPreservationFormat?: ReasoningFormat
-    reasoningHidden?: boolean
-    hiddenReasoningOnChatApi?: boolean
+    reasoningVisibility?: ReasoningVisibilityPolicy
+    acceptsAnthropicRedactedThinking?: boolean
   }
   outputModalities?: ReadonlySet<string>
+}
+
+export function resolveAssistantRouteContract(
+  profile: ConnectionProfile,
+  settings: ChatSettings,
+  contextFacts: MessageContextRouteFacts,
+  caps: RouterCapabilities,
+): AssistantRouteContract {
+  const policy = reasoningPolicyForSettings(settings, {
+    ...(caps.quirks.acceptsAnthropicRedactedThinking !== undefined
+      ? {
+          acceptsAnthropicRedactedThinking: caps.quirks.acceptsAnthropicRedactedThinking,
+        }
+      : {}),
+  })
+  const responsesReasoning = responsesReasoningContractFor(profile, caps, policy)
+  const route =
+    settings.protocol === 'text' && profile.kind === 'llama-server'
+      ? openAiText('llama-server text protocol')
+      : chooseApi(profile, settings, contextFacts, caps, policy, responsesReasoning)
+  if (route.transport === 'openai-text' || route.transport === 'openrouter-video') {
+    return Object.freeze({
+      ...route,
+      reasoning: reasoningContractForTarget(policy, null, 'plaintext-only', 'inline', 'inline', {
+        kind: 'uniform',
+        visibleKind: 'text',
+      }),
+      providerOutput: TEXT_PROVIDER_OUTPUT_CONTRACT,
+    })
+  }
+  if (route.transport === 'gemini-native') {
+    return Object.freeze({
+      ...route,
+      reasoning: reasoningContractForTarget(
+        policy,
+        'google-gemini-v1',
+        'gemini-parts',
+        'gemini-native',
+        'google-direct',
+        reasoningVisibilityPolicyFromQuirks(caps.quirks),
+      ),
+      providerOutput: GOOGLE_PROVIDER_OUTPUT_CONTRACT,
+    })
+  }
+  if (route.transport === 'anthropic') {
+    return Object.freeze({
+      ...route,
+      reasoning: reasoningContractForTarget(
+        policy,
+        'anthropic-claude-v1',
+        'anthropic-blocks',
+        'anthropic-messages',
+        'anthropic-direct',
+        reasoningVisibilityPolicyFromQuirks(caps.quirks),
+      ),
+      providerOutput: ANTHROPIC_PROVIDER_OUTPUT_CONTRACT,
+    })
+  }
+  if (route.transport === 'openai-responses') {
+    if (responsesReasoning.originDialect === 'openrouter-responses') {
+      return Object.freeze({
+        ...route,
+        reasoning: responsesReasoning,
+        providerOutput: OPENROUTER_RESPONSES_PROVIDER_OUTPUT_CONTRACT,
+      })
+    }
+    return Object.freeze({
+      ...route,
+      reasoning: responsesReasoning,
+      providerOutput: OPENAI_RESPONSES_PROVIDER_OUTPUT_CONTRACT,
+    })
+  }
+  if (profile.kind === 'openrouter') {
+    return Object.freeze({
+      ...route,
+      reasoning: reasoningContractForTarget(
+        policy,
+        knownReasoningFormat(caps.quirks.reasoningPreservationFormat),
+        'openrouter-reasoning-details',
+        'openrouter-chat',
+        'openrouter',
+        reasoningVisibilityPolicyFromQuirks(caps.quirks),
+      ),
+      providerOutput: TEXT_PROVIDER_OUTPUT_CONTRACT,
+    })
+  }
+  return Object.freeze({
+    ...route,
+    reasoning: reasoningContractForTarget(
+      policy,
+      knownReasoningFormat(caps.quirks.reasoningPreservationFormat),
+      'plaintext-only',
+      'openai-chat',
+      producerBridgeForProfile(profile),
+      reasoningVisibilityPolicyFromQuirks(caps.quirks),
+    ),
+    providerOutput: TEXT_PROVIDER_OUTPUT_CONTRACT,
+  })
+}
+
+export function responsesReasoningContractFor(
+  profile: ConnectionProfile,
+  caps: RouterCapabilities,
+  policy: ReasoningPolicy,
+): ResponsesReasoningContract {
+  const targetFormat = responsesReasoningFormat(profile, caps.quirks.reasoningPreservationFormat)
+  return profile.kind === 'openrouter'
+    ? reasoningContractForTarget(
+        policy,
+        targetFormat,
+        'responses-items',
+        'openrouter-responses',
+        'openrouter',
+        reasoningVisibilityPolicyFromQuirks(caps.quirks),
+      )
+    : reasoningContractForTarget(
+        policy,
+        targetFormat,
+        'responses-items',
+        'openai-responses',
+        producerBridgeForProfile(profile),
+        reasoningVisibilityPolicyFromQuirks(caps.quirks),
+      )
+}
+
+function reasoningContractForTarget<
+  Target extends KnownReasoningFormat | null,
+  Carrier extends RoutedReasoningContract['carrier'],
+  Origin extends RoutedReasoningContract['originDialect'],
+>(
+  policy: ReasoningPolicy,
+  targetFormat: Target,
+  carrier: Carrier,
+  originDialect: Origin,
+  producerBridge: ReasoningProducerBridge,
+  visibilityPolicy: ReasoningVisibilityPolicy,
+): RoutedReasoningContract<Target, Carrier, Origin> {
+  return Object.freeze({
+    ...policy,
+    targetFormat,
+    carrier,
+    originDialect,
+    producerBridge,
+    visibilityPolicy: Object.freeze({ ...visibilityPolicy }),
+  })
+}
+
+function producerBridgeForProfile(profile: ConnectionProfile): ReasoningProducerBridge {
+  if (profile.kind === 'openrouter') return 'openrouter'
+  if (profile.kind === 'google') return 'google-direct'
+  if (profile.kind === 'anthropic') return 'anthropic-direct'
+  if (isAzureOpenAiConnection(profile)) return 'azure-openai'
+  if (isOpenAiDirectProfile(profile)) return 'openai-direct'
+  return profile.kind === 'custom' || profile.kind === 'openai-compatible' ? 'custom' : 'unknown'
+}
+
+function responsesReasoningFormat(
+  profile: ConnectionProfile,
+  modelFormat: ReasoningFormat | undefined,
+): OpenAiReasoningFormat {
+  if (modelFormat === 'xai-responses-v1') return modelFormat
+  if (profile.kind === 'openrouter' || isAzureOpenAiConnection(profile)) {
+    return 'azure-openai-responses-v1'
+  }
+  return 'openai-responses-v1'
+}
+
+function knownReasoningFormat(value: ReasoningFormat | undefined): KnownReasoningFormat | null {
+  return value && value !== 'unknown' ? value : null
+}
+
+function isAzureOpenAiConnection(profile: ConnectionProfile): boolean {
+  if (profile.kind !== 'openai-compatible' && profile.kind !== 'custom') return false
+  try {
+    return new URL(profile.baseUrl).hostname.toLowerCase().endsWith('.openai.azure.com')
+  } catch {
+    return false
+  }
 }
 
 export function chooseApi(
   profile: ConnectionProfile,
   settings: ChatSettings,
-  path: readonly Message[],
+  contextFacts: MessageContextRouteFacts,
   caps: RouterCapabilities,
+  reasoning: ReasoningPolicy,
+  responsesReasoning: ResponsesReasoningContract,
 ): ApiRoute {
-  // Defensive read: settings patches may replace the full `reasoning`
-  // block with a partial object; normalize so step 6 below can read
-  // `include.encrypted`.
-  const reasoning = normalizeReasoningSettings(settings.reasoning)
   const pin: ApiVariant = settings.api
   const support = responsesSupportFor(settings.model)
 
@@ -151,7 +433,7 @@ export function chooseApi(
   // Step 5 — prior server-tool output on the path (web_search_call, etc.).
   // Chat completions can't round-trip those items, so the route must stay
   // on Responses for continuity.
-  if (hasResponsesServerToolArtifact(path) && canRunResponses(profile)) {
+  if (contextFacts.hasOpenAiResponsesProviderOutput && canRunResponses(profile)) {
     return openAiResponses('prior server-tool output requires Responses for round-trip')
   }
 
@@ -161,22 +443,16 @@ export function chooseApi(
   if (
     reasoning.include.encrypted &&
     canRunResponses(profile) &&
-    hasPriorOpenAiEncryptedReasoning(path) &&
-    isOpenAiResponsesFormat(caps.quirks.reasoningPreservationFormat)
+    contextFacts.reasoningCarriers.some(
+      (fact) => reasoningCarrierReplayDecision(fact, responsesReasoning).kind === 'replay',
+    )
   ) {
     return openAiResponses('prior encrypted reasoning requires Responses to round-trip')
   }
 
-  // Step 9 — OpenRouter default for OpenAI-family models. Per user
-  // directive: on an OpenRouter connection, default to Responses whenever
-  // the model is an OpenAI-family model that supports Responses. Non-OpenAI
-  // models (Claude, Gemini, DeepSeek, etc.) stay on chat-completions since
-  // /responses on OR just relays to chat anyway and adds no value.
-  if (profile.kind === 'openrouter' && support === 'both') {
-    return openAiResponses('OpenRouter: OpenAI-family model defaults to Responses')
-  }
-
-  // Step 10 — default.
+  // Step 9 — default. OpenRouter stays on Chat Completions unless an explicit
+  // pin, model requirement, hosted-tool output, or compatible encrypted
+  // reasoning carrier selected Responses above.
   return openAiChat('default (chat completions)')
 }
 
@@ -195,54 +471,6 @@ function canRunResponses(profile: ConnectionProfile): boolean {
 
 function canRunTextCompletions(profile: ConnectionProfile, modelId: string): boolean {
   return profile.kind === 'openrouter' && isTextCompletionsSelectableFor(modelId)
-}
-
-function isOpenAiResponsesFormat(fmt: ReasoningFormat | undefined): boolean {
-  return (
-    fmt === 'openai-responses-v1' ||
-    fmt === 'azure-openai-responses-v1' ||
-    fmt === 'xai-responses-v1'
-  )
-}
-
-// True when the path carries any assistant message with a
-// `responsesEchoItem.type` outside the standard `message` | `reasoning` pair
-// — that means the prior turn used a server tool (web_search_call,
-// file_search_call, image_generation_call, code_interpreter_call,
-// computer_call, mcp_tool_call) whose output can't be expressed on
-// chat-completions.
-function hasResponsesServerToolArtifact(path: readonly Message[]): boolean {
-  for (const m of path) {
-    const itemType = m.responsesEchoItem?.type
-    if (
-      itemType &&
-      itemType !== 'message' &&
-      itemType !== 'reasoning' &&
-      itemType !== 'function_call' &&
-      itemType !== 'function_call_output'
-    ) {
-      return true
-    }
-  }
-  return false
-}
-
-function hasPriorOpenAiEncryptedReasoning(path: readonly Message[]): boolean {
-  for (const m of path) {
-    if (!m.reasoningDetails) continue
-    for (const d of m.reasoningDetails) {
-      if (d.type !== 'reasoning.encrypted') continue
-      if (d.id?.startsWith('tool_')) continue
-      // Accept any OpenAI-family carrier; the router only asks "should
-      // the route stay on Responses to round-trip it?" — the transform
-      // decides the exact `include:` list from `format`.
-      if (isOpenAiResponsesFormat(d.format)) return true
-      // If the carrier has no `format`, assume compatible (the ingest path
-      // may have dropped it). Better to preserve than to discard.
-      if (!d.format) return true
-    }
-  }
-  return false
 }
 
 function openAiChat(reason: string): ApiRoute {

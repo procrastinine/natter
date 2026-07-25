@@ -56,78 +56,157 @@ export interface EffectiveCapability {
   singleProviderPin?: string
   // Passthrough quirks for the UI.
   quirks: ReturnType<typeof quirksFor>
-}
-
-function minDefined(values: Array<number | undefined>): number | undefined {
-  let min: number | undefined
-  for (const v of values) {
-    if (v === undefined) continue
-    if (min === undefined || v < min) min = v
-  }
-  return min
-}
-
-function maxDefined(values: Array<number | undefined>): number | undefined {
-  let max: number | undefined
-  for (const v of values) {
-    if (v === undefined) continue
-    if (max === undefined || v > max) max = v
-  }
-  return max
+  // Direct endpoint capability evidence. Absence means unknown.
+  prefill?: CapabilityDescriptor['prefill']
 }
 
 function positiveCap(value: number | undefined): number | undefined {
   return value !== undefined && value > 0 ? value : undefined
 }
 
-function intersectStringArrays(lists: Array<readonly string[]>): Set<string> {
-  if (lists.length === 0) return new Set()
-  const first = lists[0]
-  if (!first) return new Set()
-  const out = new Set<string>(first)
-  for (let i = 1; i < lists.length; i += 1) {
-    const next = new Set(lists[i])
-    for (const item of out) {
-      if (!next.has(item)) out.delete(item)
-    }
-  }
-  return out
+function applyParameterQuirks(
+  supportedParameters: Set<string>,
+  quirks: ReturnType<typeof quirksFor>,
+): void {
+  if (!quirks.dropsSamplingParams) return
+  supportedParameters.delete('temperature')
+  supportedParameters.delete('top_p')
+  supportedParameters.delete('top_k')
 }
 
-function unionStringArrays(lists: Array<readonly string[]>): Set<string> {
-  const out = new Set<string>()
-  for (const list of lists) for (const item of list) out.add(item)
-  return out
+export interface EffectiveCapabilityAccumulator {
+  readonly endpointCount: number
+  add(endpoint: ModelEndpoint): void
+  finish(): EffectiveCapability
 }
 
-function collectModalities(
-  endpoints: ModelEndpoint[],
-  kind: 'input_modalities' | 'output_modalities',
-  fallbackArchitecture?: ModelEndpoint['architecture'],
-): Set<string> {
-  const out = new Set<string>()
-  for (const m of fallbackArchitecture?.[kind] ?? []) out.add(m)
-  for (const ep of endpoints) {
-    const arr = ep.architecture?.[kind]
-    if (!arr) continue
-    for (const m of arr) out.add(m)
-  }
-  return out
-}
+export function createEffectiveCapabilityAccumulator(
+  modelId: string,
+  opts: { strict?: boolean; architecture?: ModelEndpoint['architecture'] } = {},
+): EffectiveCapabilityAccumulator {
+  const strict = opts.strict === true
+  const supportedParameters = new Set<string>()
+  const inputModalities = new Set(opts.architecture?.input_modalities ?? [])
+  const outputModalities = new Set(opts.architecture?.output_modalities ?? [])
+  let endpointCount = 0
+  let contextLength: number | undefined
+  let maxPromptTokens: number | undefined
+  let maxCompletionTokens: number | undefined
+  let supportsImplicitCaching = true
+  let promptPriceMin: number | undefined
+  let promptPriceMax: number | undefined
+  let completionPriceMin: number | undefined
+  let completionPriceMax: number | undefined
+  let singleProviderPin: string | undefined
+  let finished = false
 
-function pricingRange(
-  endpoints: ModelEndpoint[],
-  key: 'prompt' | 'completion',
-): { min: number; max: number } | undefined {
-  const nums: number[] = []
-  for (const ep of endpoints) {
-    const raw = ep.pricing[key]
-    if (raw === undefined) continue
-    const n = Number(raw)
-    if (Number.isFinite(n)) nums.push(n)
+  const aggregateCap = (current: number | undefined, value: number | undefined) => {
+    if (value === undefined) return current
+    if (current === undefined) return value
+    return strict ? Math.min(current, value) : Math.max(current, value)
   }
-  if (nums.length === 0) return undefined
-  return { min: Math.min(...nums), max: Math.max(...nums) }
+  const aggregatePrice = (
+    value: string | undefined,
+    min: number | undefined,
+    max: number | undefined,
+  ): readonly [number | undefined, number | undefined] => {
+    if (value === undefined) return [min, max]
+    const parsed = Number(value)
+    if (!Number.isFinite(parsed)) return [min, max]
+    return [
+      min === undefined ? parsed : Math.min(min, parsed),
+      max === undefined ? parsed : Math.max(max, parsed),
+    ]
+  }
+
+  return {
+    get endpointCount() {
+      return endpointCount
+    },
+    add(endpoint) {
+      if (finished) throw new Error('EffectiveCapabilityAccumulatorFinished')
+      if (strict) {
+        if (endpointCount === 0) {
+          for (const parameter of endpoint.supported_parameters) {
+            supportedParameters.add(parameter)
+          }
+        } else {
+          const next = new Set(endpoint.supported_parameters)
+          for (const parameter of supportedParameters) {
+            if (!next.has(parameter)) supportedParameters.delete(parameter)
+          }
+        }
+      } else {
+        for (const parameter of endpoint.supported_parameters) supportedParameters.add(parameter)
+      }
+      for (const modality of endpoint.architecture?.input_modalities ?? []) {
+        inputModalities.add(modality)
+      }
+      for (const modality of endpoint.architecture?.output_modalities ?? []) {
+        outputModalities.add(modality)
+      }
+      contextLength = aggregateCap(contextLength, positiveCap(endpoint.context_length))
+      maxPromptTokens = aggregateCap(maxPromptTokens, positiveCap(endpoint.max_prompt_tokens))
+      maxCompletionTokens = aggregateCap(
+        maxCompletionTokens,
+        positiveCap(endpoint.max_completion_tokens),
+      )
+      supportsImplicitCaching &&= endpoint.supports_implicit_caching === true
+      ;[promptPriceMin, promptPriceMax] = aggregatePrice(
+        endpoint.pricing.prompt,
+        promptPriceMin,
+        promptPriceMax,
+      )
+      ;[completionPriceMin, completionPriceMax] = aggregatePrice(
+        endpoint.pricing.completion,
+        completionPriceMin,
+        completionPriceMax,
+      )
+      endpointCount += 1
+      singleProviderPin = endpointCount === 1 ? providerRoutingRef(endpoint) : undefined
+    },
+    finish() {
+      if (finished) throw new Error('EffectiveCapabilityAccumulatorFinished')
+      finished = true
+      const quirks = quirksFor(modelId)
+      applyParameterQuirks(supportedParameters, quirks)
+      const cap: EffectiveCapability = {
+        supportedParameters,
+        allowedEffort: allowedEffortFor(modelId),
+        allowedVerbosity: allowedVerbosityFor(modelId),
+        inputModalities,
+        outputModalities,
+        supportsImplicitCaching: endpointCount > 0 && supportsImplicitCaching,
+        quirks,
+      }
+      if (contextLength !== undefined) cap.contextLength = contextLength
+      if (maxPromptTokens !== undefined) cap.maxPromptTokens = maxPromptTokens
+      if (maxCompletionTokens !== undefined) cap.maxCompletionTokens = maxCompletionTokens
+      if (promptPriceMin !== undefined || completionPriceMin !== undefined) {
+        cap.pricingMin = {
+          ...(promptPriceMin !== undefined ? { prompt: promptPriceMin } : {}),
+          ...(completionPriceMin !== undefined ? { completion: completionPriceMin } : {}),
+        }
+      }
+      if (
+        promptPriceMin !== undefined ||
+        promptPriceMax !== undefined ||
+        completionPriceMin !== undefined ||
+        completionPriceMax !== undefined
+      ) {
+        cap.pricingRange = {
+          ...(promptPriceMin !== undefined && promptPriceMax !== undefined
+            ? { prompt: { min: promptPriceMin, max: promptPriceMax } }
+            : {}),
+          ...(completionPriceMin !== undefined && completionPriceMax !== undefined
+            ? { completion: { min: completionPriceMin, max: completionPriceMax } }
+            : {}),
+        }
+      }
+      if (singleProviderPin !== undefined) cap.singleProviderPin = singleProviderPin
+      return cap
+    },
+  }
 }
 
 // Resolve capabilities from a set of /endpoints rows (OpenRouter). The
@@ -143,52 +222,9 @@ export function effectiveCapabilityFromEndpoints(
   endpoints: ModelEndpoint[],
   opts: { strict?: boolean; architecture?: ModelEndpoint['architecture'] } = {},
 ): EffectiveCapability {
-  const supportedLists = endpoints.map((e) => e.supported_parameters)
-  const supportedParameters = opts.strict
-    ? intersectStringArrays(supportedLists)
-    : unionStringArrays(supportedLists)
-  const inputModalities = collectModalities(endpoints, 'input_modalities', opts.architecture)
-  const outputModalities = collectModalities(endpoints, 'output_modalities', opts.architecture)
-  // Upper bound: expose the largest context / completion caps across
-  // retained providers, so the user's sliders go as high as any provider
-  // can accommodate. In strict mode the intersection-caller narrows the
-  // provider set first; without strict, OpenRouter's fallback routing
-  // skips providers that can't handle the requested values.
-  const numericAgg = opts.strict ? minDefined : maxDefined
-  const contextLength = numericAgg(endpoints.map((e) => positiveCap(e.context_length)))
-  const maxPromptTokens = numericAgg(endpoints.map((e) => positiveCap(e.max_prompt_tokens)))
-  const maxCompletionTokens = numericAgg(endpoints.map((e) => positiveCap(e.max_completion_tokens)))
-  const supportsImplicitCaching =
-    endpoints.length > 0 && endpoints.every((e) => e.supports_implicit_caching === true)
-  const pr = pricingRange(endpoints, 'prompt')
-  const pc = pricingRange(endpoints, 'completion')
-  const pricingMin: { prompt?: number; completion?: number } = {}
-  if (pr) pricingMin.prompt = pr.min
-  if (pc) pricingMin.completion = pc.min
-  const pricingRangeObj: {
-    prompt?: { min: number; max: number }
-    completion?: { min: number; max: number }
-  } = {}
-  if (pr) pricingRangeObj.prompt = pr
-  if (pc) pricingRangeObj.completion = pc
-  const q = quirksFor(modelId)
-  const cap: EffectiveCapability = {
-    supportedParameters,
-    allowedEffort: allowedEffortFor(modelId),
-    allowedVerbosity: allowedVerbosityFor(modelId),
-    inputModalities,
-    outputModalities,
-    supportsImplicitCaching,
-    quirks: q,
-  }
-  if (contextLength !== undefined) cap.contextLength = contextLength
-  if (maxPromptTokens !== undefined) cap.maxPromptTokens = maxPromptTokens
-  if (maxCompletionTokens !== undefined) cap.maxCompletionTokens = maxCompletionTokens
-  if (Object.keys(pricingMin).length > 0) cap.pricingMin = pricingMin
-  if (Object.keys(pricingRangeObj).length > 0) cap.pricingRange = pricingRangeObj
-  if (endpoints.length === 1 && endpoints[0])
-    cap.singleProviderPin = providerRoutingRef(endpoints[0])
-  return cap
+  const accumulator = createEffectiveCapabilityAccumulator(modelId, opts)
+  for (const endpoint of endpoints) accumulator.add(endpoint)
+  return accumulator.finish()
 }
 
 // Resolve from a bundled descriptor (non-OpenRouter or unknown OR model).
@@ -200,6 +236,7 @@ export function effectiveCapabilityFromDescriptor(
   const inputModalities = new Set(descriptor.architecture?.inputModalities ?? ['text'])
   const outputModalities = new Set(descriptor.architecture?.outputModalities ?? ['text'])
   const q = quirksFor(modelId)
+  applyParameterQuirks(supportedParameters, q)
   const cap: EffectiveCapability = {
     supportedParameters,
     allowedEffort: allowedEffortFor(modelId),
@@ -215,6 +252,7 @@ export function effectiveCapabilityFromDescriptor(
   if (contextLength !== undefined) cap.contextLength = contextLength
   if (maxPromptTokens !== undefined) cap.maxPromptTokens = maxPromptTokens
   if (maxCompletionTokens !== undefined) cap.maxCompletionTokens = maxCompletionTokens
+  if (descriptor.prefill) cap.prefill = descriptor.prefill
   const promptPrice = Number(descriptor.pricing?.prompt)
   const completionPrice = Number(descriptor.pricing?.completion)
   if (Number.isFinite(promptPrice) || Number.isFinite(completionPrice)) {
@@ -226,7 +264,7 @@ export function effectiveCapabilityFromDescriptor(
   return cap
 }
 
-// Validation result for the stored ChatSettings against an effective cap.
+// Validation result for a ChatSettings snapshot against an effective cap.
 interface ValidationIssue {
   kind: 'dropped-param' | 'clamped-enum' | 'clamped-numeric'
   field: string
@@ -242,7 +280,7 @@ interface ValidationResult {
 }
 
 // Numeric and enum fields the validator knows how to clamp.
-const SAMPLING_PARAM_WIRE: Record<SamplingKey, string> = {
+const SAMPLING_PARAMETER_WIRE_KEYS: Readonly<Record<SamplingKey, string>> = Object.freeze({
   temperature: 'temperature',
   top_p: 'top_p',
   top_k: 'top_k',
@@ -269,15 +307,22 @@ const SAMPLING_PARAM_WIRE: Record<SamplingKey, string> = {
   dry_allowed_length: 'dry_allowed_length',
   dry_penalty_last_n: 'dry_penalty_last_n',
   n_keep: 'n_keep',
+})
+
+export function samplingParameterWireKey(key: string): string {
+  return key in SAMPLING_PARAMETER_WIRE_KEYS
+    ? SAMPLING_PARAMETER_WIRE_KEYS[key as SamplingKey]
+    : key
 }
 
 function isSamplingKey(k: string): k is SamplingKey {
-  return k in SAMPLING_PARAM_WIRE
+  return k in SAMPLING_PARAMETER_WIRE_KEYS
 }
 
-// Drop any stored sampling key not in supportedParameters; clamp enum values
-// that fell out of the allowed sets; clamp numeric caps. Returns an updated
-// ChatSettings plus a list of user-visible issues.
+// Drop any snapshot sampling key not in supportedParameters; clamp enum values
+// that fell out of the allowed sets; clamp numeric caps. Callers use the
+// returned copy as a request/UI projection and do not overwrite the durable
+// preference reservoir merely because a capability was observed.
 export function validateChatSettings(
   stored: ChatSettings,
   cap: EffectiveCapability,
@@ -287,7 +332,7 @@ export function validateChatSettings(
   const nextSampling: Partial<Record<SamplingKey, number>> = { ...stored.sampling }
   for (const key of Object.keys(stored.sampling)) {
     if (!isSamplingKey(key)) continue
-    const wire = SAMPLING_PARAM_WIRE[key]
+    const wire = SAMPLING_PARAMETER_WIRE_KEYS[key]
     if (!cap.supportedParameters.has(wire)) {
       issues.push({
         kind: 'dropped-param',

@@ -21,7 +21,9 @@ export function isOpenAiDirectBaseUrl(baseUrl: string): boolean {
   }
 }
 
-export function defaultApiForProfile(profile: ConnectionProfile): ApiVariant {
+export function defaultApiForProfile(
+  profile: Pick<ConnectionProfile, 'kind' | 'baseUrl'>,
+): ApiVariant {
   if (profile.kind === 'openai-compatible' && isOpenAiDirectBaseUrl(profile.baseUrl)) {
     return 'responses'
   }

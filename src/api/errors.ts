@@ -4,22 +4,13 @@
 // `retryable` flag is a HINT for the UI's retry button; the actual retry policy
 // (GET backoff, key fallback chain) lives in `client.ts`.
 
-export type ApiErrorKind =
-  | 'network'
-  | 'timeout'
-  | 'abort'
-  | 'bad_request'
-  | 'unauthorized'
-  | 'payment_required'
-  | 'moderation'
-  | 'rate_limited'
-  | 'provider_error'
-  | 'no_provider_available'
-  | 'validation'
-  | 'protocol'
-  | 'storage'
-  | 'integrity'
-  | 'internal'
+import type { AttemptTerminalFailure } from '../core/attempt-outcome'
+import type {
+  GenerationFailureKindV2,
+  GenerationStreamFailureV2,
+} from '../core/generation-stream-events'
+
+export type ApiErrorKind = GenerationFailureKindV2
 
 interface ApiErrorShape {
   kind: ApiErrorKind
@@ -49,6 +40,30 @@ export class ApiError extends Error implements ApiErrorShape {
     this.midStream = shape.midStream
     this.retryable = shape.retryable
   }
+}
+
+export function apiErrorFromAttemptTerminalFailure(failure: AttemptTerminalFailure): ApiError {
+  return new ApiError({
+    kind: failure.kind,
+    code: failure.code,
+    message: failure.message,
+    ...(failure.statusCode !== undefined ? { httpStatus: failure.statusCode } : {}),
+    midStream: failure.midStream ?? false,
+    retryable: failure.retryable ?? false,
+  })
+}
+
+export function apiErrorFromGenerationStreamFailure(failure: GenerationStreamFailureV2): ApiError {
+  if (failure instanceof ApiError) return failure
+  return new ApiError({
+    kind: failure.kind,
+    code: failure.code,
+    message: failure.message,
+    ...(failure.httpStatus === undefined ? {} : { httpStatus: failure.httpStatus }),
+    ...(failure.metadata === undefined ? {} : { metadata: failure.metadata }),
+    midStream: failure.midStream,
+    retryable: failure.retryable,
+  })
 }
 
 export interface NormalizeCtx {

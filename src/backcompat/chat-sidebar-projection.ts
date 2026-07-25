@@ -3,7 +3,7 @@ import type { Chat, ChatId } from '../core/types'
 import {
   type ChatSidebarProjectionRow,
   chatSidebarProjectionRow,
-  chatSidebarProjectionSettings,
+  legacyChatSidebarProjectionSettings,
 } from '../store/chat-sidebar-projection'
 import type { SettingsRow } from '../store/db-rows'
 import { forEachTableBatch } from './batched-table'
@@ -17,5 +17,5 @@ export async function migrateChatSidebarProjection(tx: Transaction): Promise<voi
   })
   await tx
     .table<SettingsRow, string>('settings')
-    .bulkPut(chatSidebarProjectionSettings(stats.rowCount))
+    .bulkPut(legacyChatSidebarProjectionSettings(stats.rowCount))
 }

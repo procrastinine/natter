@@ -1,10 +1,6 @@
-import type { Message } from '../../src/core/types'
-import {
-  previewTextFromStoredProjection,
-  splitMessageForStorage,
-} from '../../src/store/message-storage'
+import { importPortableChatThroughUi } from '../../scripts/workspace-provider-fixture.mjs'
 import { expect, test } from './fixtures'
-import { clearIndexedDb, rebuildSidebarProjection, seedFirstRun } from './helpers'
+import { clearIndexedDb, seedFirstRun } from './helpers'
 
 test.beforeEach(async ({ page }) => {
   await clearIndexedDb(page)
@@ -18,7 +14,7 @@ test('canonicalized Claude reasoning renders once in the UI and shows reasoning 
   const now = Date.now()
   const userId = 'reasoning-user'
   const assistantId = 'reasoning-assistant'
-  const sourceMessages: Message[] = [
+  const sourceMessages = [
     {
       id: userId,
       chatId,
@@ -61,71 +57,13 @@ test('canonicalized Claude reasoning renders once in the UI and shows reasoning 
       },
     },
   ]
-  const storedMessages = sourceMessages.map((message) => splitMessageForStorage(message))
-  const wordCount = storedMessages.reduce((total, stored) => total + stored.header.bodyWordCount, 0)
-  const previewText = previewTextFromStoredProjection(storedMessages[0]?.header.textPreview ?? '')
-
-  await page.evaluate(
-    async ({ activeChatId, assistantId, now, previewText, storedMessages, wordCount }) => {
-      const db = await new Promise<IDBDatabase>((resolve, reject) => {
-        const req = indexedDB.open('natter')
-        req.onsuccess = () => resolve(req.result)
-        req.onerror = () => reject(req.error)
-      })
-      try {
-        await new Promise<void>((resolve, reject) => {
-          const tx = db.transaction(['presets', 'messages', 'messageBodies', 'chats'], 'readwrite')
-          const chats = tx.objectStore('chats')
-          const messages = tx.objectStore('messages')
-          const messageBodies = tx.objectStore('messageBodies')
-          const presets = tx.objectStore('presets')
-          const getPresetsReq = presets.getAll()
-          getPresetsReq.onsuccess = () => {
-            const preset = (
-              getPresetsReq.result as Array<{ id: string; settings?: Record<string, unknown> }>
-            )[0]
-            if (!preset?.settings) {
-              reject(new Error('missing seed preset'))
-              return
-            }
-            chats.put({
-              id: activeChatId,
-              title: 'Reasoning test',
-              titleStatus: 'manual',
-              createdAt: now,
-              updatedAt: now + 1,
-              lastViewedAt: now + 1,
-              wordCount,
-              totalCostUsd: 0,
-              metaVersion: 0,
-              summaryVersion: 0,
-              settings: preset.settings,
-              presetId: preset.id,
-              lastUpdatedLeafId: assistantId,
-              lastBranchUpdatedAt: now + 1,
-              archived: false,
-              pinned: false,
-              folderId: null,
-              tags: [],
-              previewText,
-            })
-            for (const stored of storedMessages) {
-              messages.put(stored.header)
-              messageBodies.put(stored.body)
-            }
-          }
-          tx.oncomplete = () => resolve()
-          tx.onerror = () => reject(tx.error)
-          tx.onabort = () => reject(tx.error)
-        })
-      } finally {
-        db.close()
-      }
-    },
-    { activeChatId: chatId, assistantId, now, previewText, storedMessages, wordCount },
-  )
-  await rebuildSidebarProjection(page)
-  await page.goto(`/#/chat/${chatId}`)
+  const imported = await importPortableChatThroughUi(page, {
+    sourceChatId: chatId,
+    title: 'Reasoning test',
+    createdAt: now,
+    messages: sourceMessages,
+  })
+  await page.goto(`/#/chat/${imported.chatId}`)
 
   const assistant = page.locator('[data-ui="message"][data-role="assistant"]').first()
   await assistant.locator('[data-ui="reasoning-summary"]').click()

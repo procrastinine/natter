@@ -8,6 +8,7 @@ import {
   prefillClassFor,
   quirksFor,
   reasoningToggleableFor,
+  reasoningVisibilityPolicyFor,
 } from '../../src/core/quirks'
 
 describe('quirks registry', () => {
@@ -158,6 +159,16 @@ describe('quirks registry', () => {
     ])
   })
 
+  it('drops deprecated sampling only for Gemini 3.6 Flash and 3.5 Flash Lite', () => {
+    for (const model of ['google/gemini-3.6-flash', 'models/gemini-3.5-flash-lite']) {
+      expect(quirksFor(model).dropsSamplingParams).toBe(true)
+    }
+
+    for (const model of ['google/gemini-3.5-flash', 'google/gemini-3.1-flash-lite-preview']) {
+      expect(quirksFor(model).dropsSamplingParams).toBeUndefined()
+    }
+  })
+
   it('picks the longest matching prefix, not the first', () => {
     // "claude-sonnet-4.6" must not pick up "claude-opus-4.6"'s cacheMinTokens.
     expect(cacheMinTokensFor('anthropic/claude-sonnet-4.6')).toBe(2048)
@@ -186,6 +197,8 @@ describe('quirks registry', () => {
     expect(prefillClassFor('openai/gpt-oss-120b')).toBe('unsupported')
     expect(prefillClassFor('google/gemini-3.1-flash-lite-preview')).toBe('native')
     expect(prefillClassFor('google/gemini-3.5-flash')).toBe('native')
+    expect(prefillClassFor('google/gemini-3.5-flash-lite')).toBe('unsupported')
+    expect(prefillClassFor('google/gemini-3.6-flash')).toBe('unsupported')
     expect(prefillClassFor('deepseek/deepseek-r1')).toBe('oss-reasoning-required')
     expect(prefillClassFor('z-ai/glm-5.1')).toBe('oss-toggleable')
   })
@@ -254,9 +267,18 @@ describe('quirks registry', () => {
     expect(quirksFor('deepseekx/something').reasoningInlineTags).toBeUndefined()
   })
 
-  it('o-series reasoning is hidden but effort superset unchanged', () => {
-    expect(quirksFor('openai/o1').reasoningHidden).toBe(true)
-    expect(quirksFor('openai/o3-mini').reasoningHidden).toBe(true)
-    expect(quirksFor('openai/o4-mini').reasoningHidden).toBe(true)
+  it('o-series reasoning is hidden only on chat routes', () => {
+    expect(reasoningVisibilityPolicyFor('openai/o1')).toEqual({
+      kind: 'hidden-on-chat',
+      otherwise: 'summary',
+    })
+    expect(reasoningVisibilityPolicyFor('openai/o3-mini')).toEqual({
+      kind: 'hidden-on-chat',
+      otherwise: 'summary',
+    })
+    expect(reasoningVisibilityPolicyFor('openai/o4-mini')).toEqual({
+      kind: 'hidden-on-chat',
+      otherwise: 'summary',
+    })
   })
 })

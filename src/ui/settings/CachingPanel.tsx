@@ -11,10 +11,16 @@
 // understands why pinning may appear disabled there.
 
 import { useCallback } from 'react'
+import {
+  configurationWriteInteraction,
+  configurationWriteTarget,
+} from '../../app/presentation-interactions'
 import type { EffectiveCapability } from '../../core/capabilities'
 import { cacheMinTokensFor } from '../../core/quirks'
 import type { AnthropicCacheSettings, Chat, ConnectionKind } from '../../core/types'
-import { updateChatSettings } from '../../store/chats'
+import { usePresentationInteraction } from '../../hooks/usePresentationInteraction'
+import { useSettledChatSettingsEdit } from '../../hooks/useSettledConfigurationEdit'
+import { configurationApplication } from '../../store/configuration-application'
 import { Button } from '../primitives/Button'
 import { InfoDisclosure } from './InfoDisclosure'
 
@@ -59,17 +65,41 @@ function familyFor(chat: Chat, capability: EffectiveCapability | null): Family {
 }
 
 export function CachingPanel({ chat, capability, connectionKind }: CachingPanelProps) {
+  const { run: runConfigurationWrite } = usePresentationInteraction(configurationWriteInteraction, {
+    observePending: false,
+  })
   const family = familyFor(chat, capability)
   const cache = chat.settings.anthropicCache
   const setCache = useCallback(
     (patch: Partial<AnthropicCacheSettings>) => {
-      void updateChatSettings(chat.id, {
-        anthropicCache: { ...cache, ...patch },
+      const fields = Object.entries(patch)
+      runConfigurationWrite({
+        target: configurationWriteTarget(
+          chat.id,
+          fields
+            .map(([key]) => `anthropicCache.${key}`)
+            .sort()
+            .join('+'),
+        ),
+        action: () =>
+          configurationApplication.patchChatSettingsFields(
+            chat.id,
+            fields.map(([key, value]) => ({
+              path: ['anthropicCache', key],
+              value,
+            })),
+          ),
       })
     },
-    [chat.id, cache],
+    [chat.id, runConfigurationWrite],
   )
   const cacheMin = cacheMinTokensFor(chat.settings.model)
+  const breakpointIndex = useSettledChatSettingsEdit({
+    chatId: chat.id,
+    fieldKey: 'anthropicCache.breakpointIndex',
+    storedValue: cache.breakpointIndex ?? -2,
+    patches: (value) => [{ path: ['anthropicCache', 'breakpointIndex'], value }],
+  })
 
   // Hide the section entirely when there's nothing for the user to
   // configure — unsupported model, implicit caching (OpenAI), or no model
@@ -84,8 +114,6 @@ export function CachingPanel({ chat, capability, connectionKind }: CachingPanelP
   // last assistant turn is a cache hit (prefix up to the last user turn is
   // stable). `-1` caches through the last message. Positive values: pin
   // exactly the first N messages.
-  const breakpointIndex = cache.breakpointIndex ?? -2
-
   return (
     <div data-ui="settings-section" data-ui-section={`caching-${family}`}>
       <h3>Caching</h3>
@@ -135,12 +163,13 @@ export function CachingPanel({ chat, capability, connectionKind }: CachingPanelP
           </span>
           <input
             type="number"
-            value={breakpointIndex}
+            value={breakpointIndex.value}
             step={1}
             onChange={(e) => {
               const v = Number(e.target.value)
-              if (Number.isFinite(v)) setCache({ breakpointIndex: Math.round(v) })
+              if (Number.isFinite(v)) breakpointIndex.setValue(Math.round(v))
             }}
+            onBlur={breakpointIndex.onBlur}
           />
         </label>
       ) : null}

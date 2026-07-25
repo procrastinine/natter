@@ -1,40 +1,110 @@
 import { act, fireEvent, render } from '@testing-library/react'
-import { createRef } from 'react'
+import { type ComponentProps, createRef, type ReactNode, useEffect } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { ScrollRegion, type ScrollRegionHandle } from '../../src/ui/chat/ScrollRegion'
+import {
+  ScrollRegion,
+  type ScrollRegionCommands,
+  type ScrollRegionHandle,
+  useScrollRegionCommands,
+} from '../../src/ui/chat/ScrollRegion'
 
-describe('ScrollRegion programmatic intent ledger', () => {
-  let frameId = 0
-  let frames: Array<{ id: number; callback: FrameRequestCallback }>
+type RegionProps = Omit<ComponentProps<typeof ScrollRegion>, 'children'>
+type ViewportTransition = Parameters<ScrollRegionHandle['prepareLayoutChange']>[0]
+
+interface ResizeObserverFixture {
+  callback: ResizeObserverCallback
+  active: boolean
+}
+
+interface RegionFixture {
+  region: HTMLElement
+  ref: React.RefObject<ScrollRegionHandle | null>
+  commands(): ScrollRegionCommands
+  setClientHeight(value: number): void
+  setHeight(value: number): void
+  rerender(props?: Partial<RegionProps>, children?: ReactNode): void
+}
+
+function CommandProbe({
+  onCommands,
+}: {
+  onCommands: (commands: ScrollRegionCommands | null) => void
+}) {
+  const commands = useScrollRegionCommands()
+  useEffect(() => {
+    onCommands(commands)
+  }, [commands, onCommands])
+  return (
+    <article data-ui="message" data-message-id="command-target">
+      content
+    </article>
+  )
+}
+
+describe('ScrollRegion continuity lease', () => {
+  let resizeObservers: ResizeObserverFixture[]
 
   beforeEach(() => {
-    frames = []
-    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
-      frameId += 1
-      frames.push({ id: frameId, callback })
-      return frameId
-    })
-    vi.stubGlobal('cancelAnimationFrame', (id: number) => {
-      frames = frames.filter((frame) => frame.id !== id)
-    })
+    resizeObservers = []
+    vi.stubGlobal(
+      'ResizeObserver',
+      class {
+        private readonly fixture: ResizeObserverFixture
+
+        constructor(callback: ResizeObserverCallback) {
+          this.fixture = { callback, active: false }
+          resizeObservers.push(this.fixture)
+        }
+
+        observe() {
+          this.fixture.active = true
+        }
+
+        disconnect() {
+          this.fixture.active = false
+        }
+      },
+    )
   })
 
   afterEach(() => {
     vi.unstubAllGlobals()
   })
 
-  function setup() {
+  function deliverResize(): void {
+    for (const observer of resizeObservers) {
+      if (observer.active) observer.callback([], {} as ResizeObserver)
+    }
+  }
+
+  function setup(
+    initialProps: Partial<RegionProps> = {},
+    initialChildren: ReactNode = <div>content</div>,
+  ): RegionFixture {
     const ref = createRef<ScrollRegionHandle>()
-    const renderView = () => (
-      <ScrollRegion ref={ref} streamActive autoScrollOnStream>
-        <div>content</div>
+    const observedCommands: ScrollRegionCommands[] = []
+    const recordCommands = (commands: ScrollRegionCommands | null) => {
+      if (commands) observedCommands.push(commands)
+    }
+    let props: RegionProps = {
+      resetKey: 'chat-a',
+      selectionKey: 'tail-a',
+      viewportRevision: 0,
+      ...initialProps,
+    }
+    let children = initialChildren
+    const view = () => (
+      <ScrollRegion ref={ref} {...props}>
+        <CommandProbe onCommands={recordCommands} />
+        {children}
       </ScrollRegion>
     )
-    const { container, rerender } = render(renderView())
-    const region = container.querySelector<HTMLElement>('[data-ui="scroll-region"]')
+    const rendered = render(view())
+    const region = rendered.container.querySelector<HTMLElement>('[data-ui="scroll-region"]')
     if (!region || !ref.current) throw new Error('ScrollRegion fixture did not mount')
+    let clientHeight = 100
     let scrollHeight = 100
-    Object.defineProperty(region, 'clientHeight', { configurable: true, get: () => 100 })
+    Object.defineProperty(region, 'clientHeight', { configurable: true, get: () => clientHeight })
     Object.defineProperty(region, 'scrollHeight', {
       configurable: true,
       get: () => scrollHeight,
@@ -44,253 +114,522 @@ describe('ScrollRegion programmatic intent ledger', () => {
       writable: true,
       value: 0,
     })
-    scrollHeight = 200
-    rerender(renderView())
-    act(() => {
-      while (frames.length > 0) runNextFrame()
-      scrollHeight = 100
-      ref.current?.scrollToBottom({ smooth: false })
-      while (frames.length > 0) runNextFrame()
-    })
+    region.getBoundingClientRect = () => rect({ top: 0, bottom: clientHeight })
+
     return {
       region,
       ref,
+      commands() {
+        const commands = observedCommands.at(-1)
+        if (!commands) throw new Error('ScrollRegion commands did not mount')
+        return commands
+      },
+      setClientHeight(value: number) {
+        clientHeight = value
+      },
       setHeight(value: number) {
         scrollHeight = value
       },
-      rerender,
+      rerender(nextProps = {}, nextChildren = children) {
+        props = { ...props, ...nextProps }
+        children = nextChildren
+        rendered.rerender(view())
+      },
     }
   }
 
-  function runNextFrame(): void {
-    const frame = frames.shift()
-    if (frame) frame.callback(performance.now())
+  function acquireOpen(fixture: RegionFixture, height = 1_100): void {
+    act(() => {
+      fixture.setHeight(height)
+      fixture.rerender()
+    })
+    expect(fixture.region.scrollTop).toBe(height - 100)
+    act(() => deliverResize())
+    expect(fixture.ref.current?.getState()).toBe('follow')
   }
 
-  it('accepts delayed instant events in target order', () => {
-    const { region, ref, setHeight } = setup()
+  async function pinByWheel(fixture: RegionFixture, top = 200): Promise<void> {
     act(() => {
-      setHeight(700)
-      ref.current?.scrollToBottom({ smooth: false })
-      setHeight(1100)
-      ref.current?.scrollToBottom({ smooth: false })
-      region.scrollTop = 600
-      fireEvent.scroll(region)
+      fireEvent.wheel(fixture.region)
+      fixture.region.scrollTop = top
+      fireEvent.scroll(fixture.region)
     })
-    expect(region.dataset.scrollState).toBe('follow')
-
-    act(() => {
-      region.scrollTop = 1000
-      fireEvent.scroll(region)
-    })
-    expect(region.dataset.scrollState).toBe('follow')
-  })
-
-  it('accepts one coalesced event at the newest target', () => {
-    const { region, ref, setHeight } = setup()
-    act(() => {
-      setHeight(700)
-      ref.current?.scrollToBottom({ smooth: false })
-      setHeight(1100)
-      ref.current?.scrollToBottom({ smooth: false })
-      region.scrollTop = 1000
-      fireEvent.scroll(region)
-    })
-    expect(region.dataset.scrollState).toBe('follow')
-  })
-
-  it('pins an unmatched native scroll even while intents are pending', async () => {
-    const { region, ref, setHeight } = setup()
-    act(() => {
-      setHeight(1100)
-      ref.current?.scrollToBottom({ smooth: false })
-      region.scrollTop = 125
-      fireEvent.scroll(region)
-    })
-    expect(ref.current?.getState()).toBe('pinned')
+    expect(fixture.ref.current?.getState()).toBe('pinned')
     await act(nextTask)
-    expect(region.dataset.scrollState).toBe('pinned')
-  })
+    expect(fixture.region.dataset.scrollState).toBe('pinned')
+  }
 
-  it('pins a native jump back to the pre-assignment position when the bottom event was coalesced', async () => {
-    const { region, ref, setHeight } = setup()
+  it('acquires the finite open destination and preserves it across delayed layout', () => {
+    const fixture = setup()
+    acquireOpen(fixture)
+
     act(() => {
-      setHeight(1100)
-      ref.current?.scrollToBottom({ smooth: false })
-      region.scrollTop = 0
-      fireEvent.scroll(region)
+      fixture.setHeight(1_400)
+      deliverResize()
     })
-    expect(ref.current?.getState()).toBe('pinned')
-    await act(nextTask)
-    expect(region.dataset.scrollState).toBe('pinned')
+
+    expect(fixture.region.scrollTop).toBe(1_300)
+    expect(fixture.region.dataset.scrollState).toBe('follow')
   })
 
-  it('pins native movement even when layout measures it before the scroll event', async () => {
-    const { region, ref, rerender, setHeight } = setup()
+  it('rebinds a same-chat workspace epoch without reopening or moving a pinned viewport', async () => {
+    const fixture = setup({ workspaceEpoch: 0 })
+    acquireOpen(fixture)
+    const target = fixture.region.querySelector<HTMLElement>('[data-message-id="command-target"]')
+    if (!target) throw new Error('Continuity target did not mount')
+    let documentBottom = 280
+    target.getBoundingClientRect = () =>
+      rect({
+        top: documentBottom - 120 - fixture.region.scrollTop,
+        bottom: documentBottom - fixture.region.scrollTop,
+      })
+    await pinByWheel(fixture)
+
     act(() => {
-      setHeight(1100)
-      ref.current?.scrollToBottom({ smooth: false })
-      region.scrollTop = 125
-      rerender(
-        <ScrollRegion ref={ref} streamActive autoScrollOnStream>
-          <div>layout observed the moved viewport</div>
-        </ScrollRegion>,
+      fixture.rerender({ workspaceEpoch: 1 })
+    })
+
+    expect(fixture.region.scrollTop).toBe(200)
+    expect(fixture.ref.current?.getState()).toBe('pinned')
+    expect(
+      fixture.ref.current?.prepareLayoutChange({
+        workspaceEpoch: 1,
+        chatId: 'chat-a',
+        revision: 1,
+        fromSelectionKey: 'tail-a',
+        toSelectionKey: 'tail-a',
+        kind: 'content',
+      }),
+    ).toEqual({ kind: 'prepared' })
+
+    act(() => {
+      documentBottom += 300
+      fixture.setHeight(1_400)
+      fixture.rerender({ viewportRevision: 1 })
+      deliverResize()
+    })
+
+    expect(fixture.region.scrollTop).toBe(500)
+    expect(fixture.ref.current?.getState()).toBe('pinned')
+  })
+
+  it('acquires a reveal before its suffix arrives, then settles the ready destination', () => {
+    const consumed = vi.fn()
+    const fixture = setup({ onRevealClaimConsumed: consumed })
+    acquireOpen(fixture)
+
+    act(() => {
+      fixture.rerender({
+        revealClaimKey: 'save-send',
+        revealClaimTargetMessageId: 'new-tail',
+      })
+    })
+    expect(fixture.region.scrollTop).toBe(1_000)
+    expect(consumed).not.toHaveBeenCalled()
+
+    act(() => {
+      fixture.setHeight(1_500)
+      fixture.rerender(
+        {
+          selectionKey: 'new-tail',
+        },
+        <article data-ui="message" data-message-id="new-tail">
+          replacement suffix
+        </article>,
       )
-      fireEvent.scroll(region)
-      while (frames.length > 0) runNextFrame()
+      deliverResize()
     })
-    expect(region.scrollTop).toBe(125)
-    expect(ref.current?.getState()).toBe('pinned')
-    await act(nextTask)
-    expect(region.dataset.scrollState).toBe('pinned')
+    expect(fixture.region.scrollTop).toBe(1_400)
+    expect(consumed).toHaveBeenCalledTimes(1)
+
+    act(() => {
+      fixture.setHeight(1_800)
+      deliverResize()
+    })
+    expect(fixture.region.scrollTop).toBe(1_700)
   })
 
-  it('follows the first transient upward clamp while a replacement tail settles', () => {
-    const { region, ref, rerender, setHeight } = setup()
+  it('owns an old-to-new reveal transition before the replacement suffix publishes', () => {
+    const fixture = setup()
+    acquireOpen(fixture)
+
+    expect(
+      fixture.ref.current?.prepareLayoutChange({
+        workspaceEpoch: 0,
+        chatId: 'chat-a',
+        revision: 1,
+        fromSelectionKey: 'tail-a',
+        toSelectionKey: 'new-tail',
+        kind: 'reveal',
+        revealTargetMessageId: 'new-tail',
+      }),
+    ).toEqual({ kind: 'prepared' })
+
     act(() => {
-      setHeight(1100)
-      ref.current?.scrollToBottom({ smooth: false })
-      while (frames.length > 0) runNextFrame()
-      setHeight(1200)
-      rerender(
-        <ScrollRegion ref={ref} streamActive autoScrollOnStream streamFollowKey="new-tail">
-          <div>replacement tail</div>
-        </ScrollRegion>,
+      fixture.setHeight(1_500)
+      fixture.rerender(
+        {
+          selectionKey: 'new-tail',
+          viewportRevision: 1,
+        },
+        <article data-ui="message" data-message-id="new-tail">
+          replacement suffix
+        </article>,
       )
+      deliverResize()
     })
-    act(() => {
-      region.scrollTop = 825
-      fireEvent.scroll(region)
-    })
-    expect(ref.current?.getState()).toBe('follow')
 
-    act(() => {
-      while (frames.length > 0) runNextFrame()
-    })
-    expect(region.scrollTop).toBe(1100)
-    expect(region.dataset.scrollState).toBe('follow')
+    expect(fixture.region.scrollTop).toBe(1_400)
+    expect(fixture.ref.current?.getState()).toBe('follow')
   })
 
-  it('lets a local stream claim follow once, then honors later manual scrolling', async () => {
-    const { region, ref, rerender, setHeight } = setup()
-    act(() => {
-      setHeight(1200)
-      ref.current?.scrollToBottom({ smooth: false })
-      region.scrollTop = 250
-      fireEvent.scroll(region)
-    })
-    expect(ref.current?.getState()).toBe('pinned')
+  it('continues following the selected stream through delayed content growth', () => {
+    const fixture = setup()
+    acquireOpen(fixture)
 
     act(() => {
-      rerender(
-        <ScrollRegion
-          ref={ref}
-          streamActive
-          autoScrollOnStream
-          streamFollowKey="local-tail"
-          streamFollowClaimKey="local-stream"
-        >
-          <div>local replacement tail</div>
-        </ScrollRegion>,
-      )
+      fixture.setHeight(1_200)
+      fixture.rerender({
+        streamActive: true,
+        autoScrollOnStream: true,
+        streamFollowKey: 'stream-a',
+        streamFollowTargetMessageId: 'tail-a',
+      })
+      deliverResize()
     })
-    expect(region.scrollTop).toBe(1100)
-    expect(ref.current?.getState()).toBe('follow')
+    expect(fixture.region.scrollTop).toBe(1_100)
 
     act(() => {
-      region.scrollTop = 400
-      fireEvent.wheel(region)
-      fireEvent.scroll(region)
+      fixture.setHeight(1_500)
+      deliverResize()
     })
-    expect(ref.current?.getState()).toBe('pinned')
+    expect(fixture.region.scrollTop).toBe(1_400)
+    expect(fixture.ref.current?.getState()).toBe('follow')
+  })
+
+  it('keeps bottom continuity when the viewport height changes', () => {
+    const fixture = setup()
+    acquireOpen(fixture)
+
+    act(() => {
+      fixture.setClientHeight(60)
+      deliverResize()
+    })
+
+    expect(fixture.region.scrollTop).toBe(1_040)
+    expect(fixture.ref.current?.getState()).toBe('follow')
+  })
+
+  it('settles a smooth manual jump only after it acquires the bottom', async () => {
+    const fixture = setup()
+    acquireOpen(fixture)
+    await pinByWheel(fixture)
+    const scrollTo = vi.fn()
+    Object.defineProperty(fixture.region, 'scrollTo', {
+      configurable: true,
+      value: scrollTo,
+    })
+
+    act(() => fixture.ref.current?.scrollToBottom({ smooth: true }))
+    expect(scrollTo).toHaveBeenCalledWith({ top: 1_000, behavior: 'smooth' })
+    expect(fixture.ref.current?.getState()).toBe('follow')
+
+    act(() => {
+      fixture.region.scrollTop = 600
+      fireEvent.scroll(fixture.region)
+      fixture.region.scrollTop = 1_000
+      fireEvent.scroll(fixture.region)
+      fixture.region.dispatchEvent(new Event('scrollend'))
+      fixture.setHeight(1_400)
+      deliverResize()
+    })
+
+    expect(fixture.region.scrollTop).toBe(1_300)
+    expect(fixture.ref.current?.getState()).toBe('follow')
+  })
+
+  it.each([
+    ['wheel', (region: HTMLElement) => fireEvent.wheel(region)],
+    ['touch', (region: HTMLElement) => fireEvent.touchMove(region)],
+    ['scrollbar', (region: HTMLElement) => fireEvent.pointerDown(region)],
+    ['keyboard', (region: HTMLElement) => fireEvent.keyDown(region, { key: 'PageUp' })],
+  ])('lets explicit %s input cancel stream ownership synchronously', async (_name, cancel) => {
+    const fixture = setup({
+      streamActive: true,
+      autoScrollOnStream: true,
+      streamFollowKey: 'stream-a',
+    })
+    acquireOpen(fixture)
+
+    act(() => {
+      cancel(fixture.region)
+      fixture.region.scrollTop = 300
+      fireEvent.scroll(fixture.region)
+    })
+    expect(fixture.ref.current?.getState()).toBe('pinned')
     await act(nextTask)
-    expect(region.dataset.scrollState).toBe('pinned')
+
+    act(() => {
+      fixture.setHeight(1_500)
+      deliverResize()
+    })
+    expect(fixture.region.scrollTop).toBe(300)
+    expect(fixture.region.dataset.scrollState).toBe('pinned')
   })
 
-  it('does not recognize an old target after its rendering-batch cleanup', async () => {
-    const { region, ref, setHeight } = setup()
+  it('pins an unmatched native scroll even while programmatic intents are pending', async () => {
+    const fixture = setup()
+    acquireOpen(fixture)
+
     act(() => {
-      setHeight(700)
-      ref.current?.scrollToBottom({ smooth: false })
-      runNextFrame()
-      setHeight(1100)
-      ref.current?.scrollToBottom({ smooth: false })
-      region.scrollTop = 600
-      fireEvent.scroll(region)
+      fixture.region.scrollTop = 125
+      fireEvent.scroll(fixture.region)
     })
-    expect(ref.current?.getState()).toBe('pinned')
+    expect(fixture.ref.current?.getState()).toBe('pinned')
     await act(nextTask)
-    expect(region.dataset.scrollState).toBe('pinned')
+    expect(fixture.region.dataset.scrollState).toBe('pinned')
   })
 
-  it('keeps a target recorded after an older cleanup was scheduled', () => {
-    const { region, ref, setHeight } = setup()
+  it('pins a native jump to the pre-assignment position after a coalesced bottom event', async () => {
+    const fixture = setup()
+    acquireOpen(fixture)
+
     act(() => {
-      setHeight(700)
-      ref.current?.scrollToBottom({ smooth: false })
-      setHeight(1100)
-      ref.current?.scrollToBottom({ smooth: false })
-      runNextFrame()
-      region.scrollTop = 1000
-      fireEvent.scroll(region)
+      fixture.region.scrollTop = 0
+      fireEvent.scroll(fixture.region)
     })
-    expect(region.dataset.scrollState).toBe('follow')
+    expect(fixture.ref.current?.getState()).toBe('pinned')
+    await act(nextTask)
+    expect(fixture.region.dataset.scrollState).toBe('pinned')
   })
 
-  it('coalesces resize and subtree mutation signals into one reconciliation frame', () => {
-    let resizeCallback: ResizeObserverCallback | undefined
-    let mutationCallback: MutationCallback | undefined
-    vi.stubGlobal(
-      'ResizeObserver',
-      class {
-        constructor(callback: ResizeObserverCallback) {
-          resizeCallback = callback
-        }
-        observe() {}
-        disconnect() {}
-      },
-    )
-    vi.stubGlobal(
-      'MutationObserver',
-      class {
-        constructor(callback: MutationCallback) {
-          mutationCallback = callback
-        }
-        observe() {}
-        disconnect() {}
-      },
-    )
-    const { region, setHeight } = setup()
+  it('pins native movement even when layout observes it before the scroll event', async () => {
+    const fixture = setup()
+    acquireOpen(fixture)
 
     act(() => {
-      setHeight(300)
-      resizeCallback?.([], {} as ResizeObserver)
-      mutationCallback?.([], {} as MutationObserver)
-      resizeCallback?.([], {} as ResizeObserver)
+      fixture.region.scrollTop = 125
+      fixture.rerender({}, <div>layout observed the moved viewport</div>)
+      fireEvent.scroll(fixture.region)
     })
-    expect(frames).toHaveLength(1)
-
-    act(() => runNextFrame())
-    expect(region.dataset.scrollState).toBe('follow')
+    expect(fixture.region.scrollTop).toBe(125)
+    expect(fixture.ref.current?.getState()).toBe('pinned')
+    await act(nextTask)
+    expect(fixture.region.dataset.scrollState).toBe('pinned')
   })
 
   it('does not treat a stationary Firefox content-growth scroll event as user intent', async () => {
-    const { region, rerender, setHeight } = setup()
+    const fixture = setup({ streamActive: true, autoScrollOnStream: true })
+
+    act(() => deliverResize())
     act(() => {
-      setHeight(300)
-      rerender(
-        <ScrollRegion streamActive autoScrollOnStream>
-          <div>grown content</div>
-        </ScrollRegion>,
-      )
-      fireEvent.scroll(region)
+      fixture.setHeight(300)
+      fixture.rerender({}, <div>grown content</div>)
+      fireEvent.scroll(fixture.region)
     })
 
-    expect(region.scrollTop).toBe(0)
+    expect(fixture.region.scrollTop).toBe(200)
     await act(nextTask)
-    expect(region.dataset.scrollState).toBe('follow')
+    expect(fixture.ref.current?.getState()).toBe('follow')
+  })
+
+  it('accepts delayed instant scroll events in recorded target order', () => {
+    const fixture = setup()
+    acquireOpen(fixture)
+
+    act(() => {
+      fixture.setHeight(700)
+      fixture.ref.current?.scrollToBottom({ smooth: false })
+      fixture.setHeight(1_100)
+      fixture.ref.current?.scrollToBottom({ smooth: false })
+      fixture.region.scrollTop = 600
+      fireEvent.scroll(fixture.region)
+    })
+    expect(fixture.ref.current?.getState()).toBe('follow')
+
+    act(() => {
+      fixture.region.scrollTop = 1_000
+      fireEvent.scroll(fixture.region)
+    })
+    expect(fixture.ref.current?.getState()).toBe('follow')
+  })
+
+  it('accepts a coalesced instant event at the newest recorded target', () => {
+    const fixture = setup()
+    acquireOpen(fixture)
+
+    act(() => {
+      fixture.setHeight(700)
+      fixture.ref.current?.scrollToBottom({ smooth: false })
+      fixture.setHeight(1_100)
+      fixture.ref.current?.scrollToBottom({ smooth: false })
+      fixture.region.scrollTop = 1_000
+      fireEvent.scroll(fixture.region)
+    })
+
+    expect(fixture.ref.current?.getState()).toBe('follow')
+  })
+
+  it('keeps the command port stable across reactive follow-state changes', async () => {
+    const observed: ScrollRegionCommands[] = []
+    const record = (commands: ScrollRegionCommands | null) => {
+      if (commands) observed.push(commands)
+    }
+    const fixture = setup({}, <CommandProbe onCommands={record} />)
+    acquireOpen(fixture)
+    expect(observed).toHaveLength(1)
+
+    await pinByWheel(fixture)
+
+    expect(observed).toHaveLength(1)
+  })
+
+  it('uses a prepared viewport revision to preserve a pinned message edge pre-paint', async () => {
+    const fixture = setup()
+    acquireOpen(fixture)
+    const target = fixture.region.querySelector<HTMLElement>('[data-message-id="command-target"]')
+    if (!target) throw new Error('Prepared transition target did not mount')
+    let documentBottom = 280
+    target.getBoundingClientRect = () =>
+      rect({
+        top: documentBottom - 120 - fixture.region.scrollTop,
+        bottom: documentBottom - fixture.region.scrollTop,
+      })
+    await pinByWheel(fixture)
+
+    const transition: ViewportTransition = {
+      workspaceEpoch: 0,
+      chatId: 'chat-a',
+      revision: 1,
+      fromSelectionKey: 'tail-a',
+      toSelectionKey: 'tail-a',
+      kind: 'prepend',
+    }
+    act(() => {
+      fixture.ref.current?.prepareLayoutChange(transition)
+      documentBottom += 300
+      fixture.setHeight(1_400)
+      fixture.rerender({ viewportRevision: 1 })
+    })
+
+    expect(fixture.region.scrollTop).toBe(500)
+    expect(target.getBoundingClientRect().bottom).toBe(80)
+    expect(fixture.ref.current?.getState()).toBe('pinned')
+  })
+
+  it('ignores a prepared transition for a different selection authority', async () => {
+    const fixture = setup()
+    acquireOpen(fixture)
+    await pinByWheel(fixture)
+
+    act(() => {
+      fixture.ref.current?.prepareLayoutChange({
+        workspaceEpoch: 0,
+        chatId: 'chat-a',
+        revision: 1,
+        fromSelectionKey: 'other-tail',
+        toSelectionKey: 'other-tail',
+        kind: 'content',
+      })
+      fixture.setHeight(1_400)
+      fixture.rerender({ viewportRevision: 1 })
+    })
+
+    expect(fixture.region.scrollTop).toBe(200)
+    expect(fixture.ref.current?.getState()).toBe('pinned')
+  })
+
+  it('preserves an explicit layout anchor through delayed ResizeObserver geometry', async () => {
+    const fixture = setup()
+    acquireOpen(fixture)
+    const target = fixture.region.querySelector<HTMLElement>('[data-message-id="command-target"]')
+    if (!target) throw new Error('Layout anchor target did not mount')
+    let documentBottom = 720
+    target.getBoundingClientRect = () =>
+      rect({
+        top: documentBottom - 120 - fixture.region.scrollTop,
+        bottom: documentBottom - fixture.region.scrollTop,
+      })
+    await pinByWheel(fixture)
+    expect(fixture.commands().captureLayoutAnchor({ element: target, edge: 'bottom' })).toBe(true)
+
+    act(() => {
+      documentBottom += 300
+      fixture.setHeight(1_400)
+      deliverResize()
+    })
+
+    expect(fixture.region.scrollTop).toBe(500)
+    expect(target.getBoundingClientRect().bottom).toBe(520)
+    expect(fixture.ref.current?.getState()).toBe('pinned')
+  })
+
+  it('reveals the nearest message and preserves its viewport coordinate', async () => {
+    const fixture = setup()
+    acquireOpen(fixture)
+    await pinByWheel(fixture)
+    const target = fixture.region.querySelector<HTMLElement>('[data-message-id="command-target"]')
+    if (!target) throw new Error('Reveal target did not mount')
+    let documentBottom = 620
+    target.getBoundingClientRect = () =>
+      rect({
+        top: documentBottom - 120 - fixture.region.scrollTop,
+        bottom: documentBottom - fixture.region.scrollTop,
+      })
+
+    act(() => {
+      expect(fixture.commands().revealNearest(target)).toBe(true)
+    })
+    expect(fixture.region.scrollTop).toBe(520)
+    expect(target.getBoundingClientRect().bottom).toBe(100)
+
+    act(() => {
+      documentBottom += 200
+      fixture.setHeight(1_300)
+      deliverResize()
+    })
+    expect(fixture.region.scrollTop).toBe(720)
+    expect(target.getBoundingClientRect().bottom).toBe(100)
+  })
+
+  it('uses ResizeObserver as the sole delayed-layout observer', async () => {
+    const fixture = setup()
+    acquireOpen(fixture)
+    const target = fixture.region.querySelector<HTMLElement>('[data-message-id="command-target"]')
+    if (!target) throw new Error('Delayed layout target did not mount')
+    let documentBottom = 280
+    target.getBoundingClientRect = () =>
+      rect({
+        top: documentBottom - 120 - fixture.region.scrollTop,
+        bottom: documentBottom - fixture.region.scrollTop,
+      })
+    await pinByWheel(fixture)
+
+    act(() => {
+      documentBottom += 300
+      fixture.setHeight(1_400)
+      deliverResize()
+    })
+
+    expect(fixture.region.scrollTop).toBe(500)
+    expect(target.getBoundingClientRect().bottom).toBe(80)
+    expect(fixture.ref.current?.getState()).toBe('pinned')
   })
 })
+
+function rect({ top, bottom }: { top: number; bottom: number }): DOMRect {
+  return {
+    x: 0,
+    y: top,
+    top,
+    right: 0,
+    bottom,
+    left: 0,
+    width: 0,
+    height: bottom - top,
+    toJSON: () => ({}),
+  }
+}
 
 function nextTask(): Promise<void> {
   return new Promise((resolve) => {

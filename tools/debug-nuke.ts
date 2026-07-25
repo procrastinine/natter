@@ -5,8 +5,8 @@ export function installDebugNuke(): void {
       __nuke: (opts?: { skipReload?: boolean }) => Promise<void>
     }
   ).__nuke = async (opts) => {
-    const { wipeSiteStorage } = await import('../src/lib/storage-wipe')
-    await wipeSiteStorage(opts)
+    const { clearLocalWorkspaceStorage } = await import('../src/store/storage-administration')
+    await clearLocalWorkspaceStorage(opts)
   }
   console.info(
     '%c[debug] window.__nuke() — wipe IDB / storage / cookies / cache and reload.',

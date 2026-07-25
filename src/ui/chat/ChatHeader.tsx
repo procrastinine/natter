@@ -1,13 +1,10 @@
 import { type ReactNode, useCallback, useEffect, useRef, useState } from 'react'
-import { exportChatAsTxt, triggerBrowserDownload } from '../../core/chat-export'
 import { aggregateCalibrationSamples } from '../../core/token-calibration'
-import type { ChatId, CursorMap, TokenCalibrationSample } from '../../core/types'
-import { getChat, setChatTagsFromNames, setManualTitle } from '../../store/chats'
-import { exportChat } from '../../store/import-export'
-import { chatRowDependencies } from '../../store/reactive-dependencies'
-import { useRepositoryQuery } from '../../store/reactive-query'
-import { listTags } from '../../store/tags'
-import { useChatStore } from '../../store/zustand/chatStore'
+import type { Chat, MessageId, TokenCalibrationSample } from '../../core/types'
+import type { UsePrivacyRoutingResult } from '../../hooks/useModelCatalog'
+import { catalogApplication } from '../../store/catalog-application'
+import { listTags, setChatTagsFromNames } from '../../store/chat-metadata-application'
+import { interchangeApplication } from '../../store/interchange-application'
 import { useToastStore } from '../../store/zustand/toastStore'
 import {
   BranchTreeIcon,
@@ -21,6 +18,7 @@ import {
   StructureEditIcon,
   TagIcon,
 } from '../icons/Icon'
+import { exportChatAsTxt, triggerBrowserDownload } from '../import-export/chat-download'
 import {
   importExportErrorMessage,
   natterJsonFilename,
@@ -40,13 +38,10 @@ function calibrationEntries(
   return Object.entries(aggregateCalibrationSamples(samples)).sort(([a], [b]) => a.localeCompare(b))
 }
 
-// Stable empty reference so useChatStore's selector doesn't allocate a fresh
-// `{}` every render — React 19's useSyncExternalStore detects that as an
-// infinite loop ("getSnapshot should be cached").
-const EMPTY_CURSOR: CursorMap = Object.freeze({})
-
 interface ChatHeaderProps {
-  chatId: ChatId | null
+  chat: Chat | undefined
+  paintedBranchLeafId: MessageId | null | undefined
+  presentationOnly?: boolean
   settingsOpen: boolean
   onToggleSettings: () => void
   editTreeActive?: boolean
@@ -55,10 +50,13 @@ interface ChatHeaderProps {
   onTreeViewIntent?: () => void
   onToggleTreeView?: () => void
   mobileConnectionControl?: ReactNode
+  privacyRouting: UsePrivacyRoutingResult
 }
 
 export function ChatHeader({
-  chatId,
+  chat,
+  paintedBranchLeafId,
+  presentationOnly = false,
   settingsOpen,
   onToggleSettings,
   editTreeActive,
@@ -67,16 +65,9 @@ export function ChatHeader({
   onTreeViewIntent,
   onToggleTreeView,
   mobileConnectionControl,
+  privacyRouting,
 }: ChatHeaderProps) {
-  const chat = useRepositoryQuery(
-    JSON.stringify(['chat', chatId]),
-    () => (chatId ? getChat(chatId) : Promise.resolve(undefined)),
-    undefined,
-    chatRowDependencies(chatId),
-  )
-  const cursor = useChatStore((s) =>
-    chatId ? (s.getCursor(chatId) ?? EMPTY_CURSOR) : EMPTY_CURSOR,
-  )
+  const chatId = chat?.id ?? null
   const [editing, setEditing] = useState(false)
   const [draftTitle, setDraftTitle] = useState('')
   const [showInfo, setShowInfo] = useState(false)
@@ -112,7 +103,7 @@ export function ChatHeader({
     setEditing(false)
     setDraftTitle('')
   }, [])
-  const commitEdit = useCallback(async () => {
+  const commitEdit = useCallback(() => {
     if (!chat) return
     const trimmed = draftTitle.trim()
     if (trimmed.length === 0) {
@@ -124,20 +115,23 @@ export function ChatHeader({
     }
     // Whether or not the title actually changed, exit edit mode silently.
     // "Unchanged" is not an error worth surfacing to the user.
-    await setManualTitle(chat.id, trimmed)
     setEditing(false)
     setDraftTitle('')
-  }, [chat, draftTitle, cancelEdit])
+    void catalogApplication.chat.setManualTitle(chat.id, trimmed).catch((error: unknown) => {
+      console.error('Failed to update chat title', error)
+      pushToast({ level: 'danger', text: 'Failed to update chat title.' })
+    })
+  }, [chat, draftTitle, cancelEdit, pushToast])
 
   const handleDownload = useCallback(async () => {
-    if (!chat) return
-    const { filename, content } = await exportChatAsTxt(chat.id, cursor)
+    if (!chat || paintedBranchLeafId === undefined) return
+    const { filename, content } = await exportChatAsTxt(chat.id, paintedBranchLeafId)
     triggerBrowserDownload(filename, content)
-  }, [chat, cursor])
+  }, [chat, paintedBranchLeafId])
   const handleExportJson = useCallback(async () => {
     if (!chat) return
     try {
-      const envelope = await exportChat(chat.id)
+      const envelope = await interchangeApplication.exportChat(chat.id)
       triggerJsonDownload(
         natterJsonFilename('chat', chat.title || 'Untitled chat', chat.id),
         envelope,
@@ -199,7 +193,11 @@ export function ChatHeader({
   }
 
   return (
-    <>
+    <span
+      data-ui="chat-header-content"
+      data-presentation-only={presentationOnly || undefined}
+      inert={presentationOnly || undefined}
+    >
       {editing ? (
         <input
           ref={inputRef}
@@ -293,7 +291,7 @@ export function ChatHeader({
         <TagIcon size={18} />
       </IconButton>
       <span data-ui="desktop-header-privacy">
-        <HeaderPrivacyBadge chatId={chat.id} />
+        <HeaderPrivacyBadge chat={chat} routing={privacyRouting} />
       </span>
       <IconButton
         type="button"
@@ -301,6 +299,7 @@ export function ChatHeader({
         data-role="chat-download"
         aria-label="Download chat as .txt"
         title="Download chat (.txt)"
+        disabled={paintedBranchLeafId === undefined}
         onClick={() => void handleDownload()}
       >
         <DownloadIcon size={18} />
@@ -360,6 +359,7 @@ export function ChatHeader({
             <Button
               type="button"
               data-ui="mobile-menu-action"
+              disabled={!chat}
               onClick={() => {
                 beginEdit()
                 setMobileMenuOpen(false)
@@ -420,7 +420,7 @@ export function ChatHeader({
             </Button>
             <div data-ui="mobile-menu-action" data-kind="privacy">
               <span data-ui="mobile-menu-action-icon">
-                <HeaderPrivacyBadge chatId={chat.id} />
+                <HeaderPrivacyBadge chat={chat} routing={privacyRouting} />
               </span>
               <span>Privacy</span>
             </div>
@@ -513,7 +513,7 @@ export function ChatHeader({
           </dl>
         </div>
       ) : null}
-    </>
+    </span>
   )
 }
 

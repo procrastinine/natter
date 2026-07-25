@@ -2,7 +2,7 @@ import { create } from 'zustand'
 
 export type AnnouncementPriority = 'polite' | 'assertive'
 
-export interface AnnouncementInput {
+interface AnnouncementInput {
   text: string
   priority?: AnnouncementPriority
   eventKey?: string

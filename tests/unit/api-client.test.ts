@@ -1,10 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   buildHeaders,
-  computeBackoffMs,
   fetchWithApiKeyFallback,
   fetchWithKeyFallback,
-  fetchWithRetry,
   fetchWithTimeout,
   isKeyFallbackTrigger,
   readErrorResponseJson,
@@ -341,116 +339,6 @@ describe('fetchWithTimeout', () => {
     stream?.enqueue(new TextEncoder().encode('data: late\n\n'))
     stream?.close()
     await expect(eventsPromise).resolves.toEqual([{ kind: 'data', data: 'late' }])
-  })
-})
-
-describe('fetchWithRetry (GET)', () => {
-  it('stops on the first 2xx and returns it', async () => {
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce(new Response('', { status: 503 }))
-      .mockResolvedValueOnce(new Response('ok', { status: 200 }))
-    vi.stubGlobal('fetch', fetchMock)
-    const res = await fetchWithRetry(
-      'https://x',
-      { method: 'GET' },
-      { retry: { attempts: 3, backoffMs: 1 } },
-    )
-    expect(res.status).toBe(200)
-    expect(fetchMock).toHaveBeenCalledTimes(2)
-  })
-
-  it('returns the final non-ok response after exhausting attempts', async () => {
-    const fetchMock = vi.fn().mockResolvedValue(new Response('', { status: 503 }))
-    vi.stubGlobal('fetch', fetchMock)
-    const res = await fetchWithRetry(
-      'https://x',
-      { method: 'GET' },
-      { retry: { attempts: 3, backoffMs: 1 } },
-    )
-    expect(res.status).toBe(503)
-    expect(fetchMock).toHaveBeenCalledTimes(3)
-  })
-
-  it('cancels an unused retryable response body before opening the next request', async () => {
-    const cancel = vi.fn()
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce(
-        new Response(
-          new ReadableStream({
-            cancel,
-          }),
-          { status: 503 },
-        ),
-      )
-      .mockResolvedValueOnce(new Response('ok', { status: 200 }))
-    vi.stubGlobal('fetch', fetchMock)
-
-    await expect(
-      fetchWithRetry('https://x', { method: 'GET' }, { retry: { attempts: 2, backoffMs: 1 } }),
-    ).resolves.toMatchObject({ status: 200 })
-    expect(cancel).toHaveBeenCalledOnce()
-  })
-
-  it('does not retry on non-retryable statuses (400, 404)', async () => {
-    const fetchMock = vi.fn().mockResolvedValue(new Response('', { status: 404 }))
-    vi.stubGlobal('fetch', fetchMock)
-    const res = await fetchWithRetry(
-      'https://x',
-      { method: 'GET' },
-      { retry: { attempts: 5, backoffMs: 1 } },
-    )
-    expect(res.status).toBe(404)
-    expect(fetchMock).toHaveBeenCalledTimes(1)
-  })
-
-  it('stops after the configured attempt count when network errors keep firing', async () => {
-    vi.stubGlobal(
-      'fetch',
-      vi.fn(() => Promise.reject(new TypeError('fetch failed'))),
-    )
-    await expect(
-      fetchWithRetry('https://x', { method: 'GET' }, { retry: { attempts: 2, backoffMs: 1 } }),
-    ).rejects.toBeInstanceOf(ApiError)
-    // fetch was called twice total — not three, not one.
-    expect((globalThis.fetch as unknown as { mock: { calls: unknown[] } }).mock.calls.length).toBe(
-      2,
-    )
-  })
-
-  it('computes exponential backoff capped at 5000ms', () => {
-    expect(computeBackoffMs(0, 250)).toBe(250)
-    expect(computeBackoffMs(1, 250)).toBe(500)
-    expect(computeBackoffMs(2, 250)).toBe(1000)
-    // 250 * 2^6 = 16000 → capped.
-    expect(computeBackoffMs(6, 250)).toBe(5000)
-  })
-
-  it('aborts immediately during retry backoff without opening another request', async () => {
-    vi.useFakeTimers()
-    const fetchMock = vi.fn(async () => new Response('', { status: 503 }))
-    vi.stubGlobal('fetch', fetchMock)
-    const controller = new AbortController()
-    const promise = fetchWithRetry(
-      'https://x',
-      { method: 'GET' },
-      {
-        signal: controller.signal,
-        retry: { attempts: 3, backoffMs: 30_000 },
-      },
-    )
-    await vi.advanceTimersByTimeAsync(0)
-    expect(fetchMock).toHaveBeenCalledOnce()
-    controller.abort()
-
-    await expect(promise).rejects.toMatchObject({
-      kind: 'abort',
-      code: 'ABORTED',
-      midStream: false,
-      retryable: false,
-    })
-    expect(fetchMock).toHaveBeenCalledOnce()
   })
 })
 

@@ -1,14 +1,12 @@
 import { describe, expect, it } from 'vitest'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
-import { parseSidebarSortMode, SIDEBAR_SORT_OPTIONS } from '../../src/core/sidebar-sort'
-import type { Chat, ChatFolder } from '../../src/core/types'
 import {
-  buildCreatedAtGroups,
-  buildSidebarEntries,
-  formatSidebarRowMeta,
-  shouldRenderCreatedAtGroups,
-  sortChats,
-} from '../../src/ui/sidebar/chat-organization'
+  parseSidebarSortMode,
+  SIDEBAR_SORT_OPTIONS,
+  sidebarTitleSortKey,
+} from '../../src/core/sidebar-sort'
+import type { Chat } from '../../src/core/types'
+import { formatSidebarRowMeta, sortChats } from '../../src/ui/sidebar/chat-organization'
 
 function chat(
   id: string,
@@ -16,7 +14,7 @@ function chat(
   folderId: string | null = null,
   patch: Partial<Chat> = {},
 ): Chat {
-  return {
+  const row: Chat = {
     id,
     title: id,
     titleStatus: 'manual',
@@ -27,6 +25,7 @@ function chat(
     totalCostUsd: 0,
     metaVersion: 0,
     summaryVersion: 0,
+    structuralVersion: 0,
     settings: cloneDefaultChatSettings(),
     lastUpdatedLeafId: null,
     lastBranchUpdatedAt: updatedAt,
@@ -35,56 +34,11 @@ function chat(
     folderId,
     tags: [],
     previewText: id,
-    ...patch,
   }
-}
-
-function folder(id: string, updatedAt: number): ChatFolder {
-  return {
-    id,
-    name: id,
-    sortIndex: updatedAt,
-    createdAt: updatedAt,
-    updatedAt,
-  }
+  return Object.assign(row, patch)
 }
 
 describe('sidebar organization helpers', () => {
-  it('sorts folders by the most recently updated child for default descending sort', () => {
-    const entries = buildSidebarEntries(
-      [chat('old-loose', 1), chat('folder-old', 2, 'folder'), chat('folder-new', 10, 'folder')],
-      [folder('folder', 5)],
-      'updatedAt-desc',
-    )
-
-    expect(
-      entries.map((entry) => (entry.kind === 'folder' ? entry.folder.id : entry.chat.id)),
-    ).toEqual(['folder', 'old-loose'])
-    expect(entries[0]).toMatchObject({ kind: 'folder', sortValue: 10 })
-  })
-
-  it('sorts folders by the least recently updated child for ascending sort', () => {
-    const entries = buildSidebarEntries(
-      [chat('loose', 5), chat('folder-old', 1, 'folder'), chat('folder-new', 10, 'folder')],
-      [folder('folder', 8)],
-      'updatedAt-asc',
-    )
-
-    expect(
-      entries.map((entry) => (entry.kind === 'folder' ? entry.folder.id : entry.chat.id)),
-    ).toEqual(['folder', 'loose'])
-    expect(entries[0]).toMatchObject({ kind: 'folder', sortValue: 1 })
-  })
-
-  it('keeps empty folders visible using the folder fallback timestamp', () => {
-    const entries = buildSidebarEntries([chat('loose', 1)], [folder('empty', 20)], 'updatedAt-desc')
-
-    expect(
-      entries.map((entry) => (entry.kind === 'folder' ? entry.folder.id : entry.chat.id)),
-    ).toEqual(['empty', 'loose'])
-    expect(entries[0]).toMatchObject({ kind: 'folder', sortValue: 20, chats: [] })
-  })
-
   it('accepts current persisted sort values and rejects legacy or unknown values', () => {
     expect(parseSidebarSortMode('updated-desc')).toBe('updatedAt-desc')
     expect(parseSidebarSortMode('updated-asc')).toBe('updatedAt-desc')
@@ -105,15 +59,15 @@ describe('sidebar organization helpers', () => {
     )
 
     for (const option of SIDEBAR_SORT_OPTIONS) {
-      const first = sortChats(rows, option.mode, { locale: 'en-US' }).map((row) => row.id)
-      const second = sortChats(rows, option.mode, { locale: 'en-US' }).map((row) => row.id)
+      const first = sortChats(rows, option.mode).map((row) => row.id)
+      const second = sortChats(rows, option.mode).map((row) => row.id)
       expect(first, option.mode).toEqual(second)
       expect(first.slice(0, 2).sort(), option.mode).toEqual(['chat-07', 'chat-33'])
       expect(new Set(first).size, option.mode).toBe(50)
     }
   })
 
-  it('uses Intl.Collator title sorting with locale and numeric comparison', () => {
+  it('uses one environment-independent canonical title key', () => {
     const rows = [
       chat('ten', 1, null, { title: 'Topic 10' }),
       chat('two', 1, null, { title: 'Topic 2' }),
@@ -121,58 +75,12 @@ describe('sidebar organization helpers', () => {
       chat('z', 1, null, { title: 'Zulu' }),
     ]
 
-    expect(sortChats(rows, 'title-asc', { locale: 'en-US' }).map((row) => row.id)).toEqual([
-      'a',
-      'two',
-      'ten',
-      'z',
-    ])
-    expect(sortChats(rows, 'title-asc', { locale: 'de-DE' }).map((row) => row.id)).toEqual([
-      'a',
-      'two',
-      'ten',
-      'z',
-    ])
-  })
-
-  it('keeps pinned chats and folders above the active sort bucket', () => {
-    const entries = buildSidebarEntries(
-      [
-        chat('new-loose', 100),
-        chat('pinned-old', 1, null, { pinned: true }),
-        chat('folder-pinned', 2, 'folder', { pinned: true }),
-        chat('folder-new', 200, 'folder'),
-      ],
-      [folder('folder', 10)],
-      'updatedAt-desc',
+    expect(sortChats(rows, 'title-asc').map((row) => row.id)).toEqual(['ten', 'two', 'z', 'a'])
+    expect(sidebarTitleSortKey('  ')).toBe('untitled chat')
+    expect(sidebarTitleSortKey('\uff34\uff45\uff53\uff54')).toBe('test')
+    expect(sidebarTitleSortKey(`${'a'.repeat(255)}\ud83e\uddea-trailing`)).toBe(
+      `${'a'.repeat(255)}\ud83e\uddea`,
     )
-
-    expect(
-      entries.map((entry) => (entry.kind === 'folder' ? entry.folder.id : entry.chat.id)),
-    ).toEqual(['folder', 'pinned-old', 'new-loose'])
-    expect(entries[0]).toMatchObject({ kind: 'folder', pinned: true })
-  })
-
-  it('renders created-at time groups only for created sorts', () => {
-    const now = new Date('2026-04-26T12:00:00').getTime()
-    const day = 86_400_000
-    const rows = sortChats(
-      [
-        chat('today', 1, 'folder', { createdAt: now }),
-        chat('yesterday', 1, 'folder', { createdAt: now - day }),
-        chat('older', 1, 'folder', { createdAt: now - day * 40 }),
-      ],
-      'createdAt-desc',
-    )
-
-    expect(shouldRenderCreatedAtGroups('createdAt-desc')).toBe(true)
-    expect(shouldRenderCreatedAtGroups('totalCostUsd-desc')).toBe(false)
-    expect(buildCreatedAtGroups(rows, 'createdAt-desc', now).map((group) => group.label)).toEqual([
-      'Today',
-      'Yesterday',
-      'Older',
-    ])
-    expect(buildCreatedAtGroups(rows, 'updatedAt-desc', now)).toEqual([])
   })
 
   it('formats row metadata for the active sort key', () => {

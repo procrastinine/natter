@@ -1,10 +1,12 @@
-// Reasoning echo in `toChatCompletions` and the standalone
-// `filterReasoningForInclude` helper.
+// Reasoning echo through the selected Chat Completions route contract.
 
 import { describe, expect, it } from 'vitest'
+import {
+  buildChatMessages as buildChatMessagesWithContract,
+  toChatCompletions as toChatCompletionsWithContract,
+} from '../../src/api/request-transforms'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
-import { filterReasoningForInclude } from '../../src/core/reasoning'
-import { buildChatMessages, toChatCompletions } from '../../src/core/transforms'
+import { TEXT_PROVIDER_OUTPUT_CONTRACT } from '../../src/core/provider-tool-context'
 import type {
   ChatSettings,
   Message,
@@ -13,11 +15,70 @@ import type {
   ReasoningInclude,
   ToolCall,
 } from '../../src/core/types'
+import {
+  chatReasoningContractForSettings,
+  compileChatReasoningDetailsForTest,
+  TEST_ASSISTANT_TAIL_PREFILL_PLAN,
+} from '../helpers/reasoning-contracts'
+import { reasoningEnvelopeFromDetailsForTest } from '../helpers/reasoning-events'
+
+type ChatOptions = Omit<
+  Parameters<typeof toChatCompletionsWithContract>[2],
+  'reasoning' | 'providerOutput' | 'prefillPlan'
+> & {
+  reasoning?: Parameters<typeof toChatCompletionsWithContract>[2]['reasoning']
+  providerOutput?: Parameters<typeof toChatCompletionsWithContract>[2]['providerOutput']
+  prefillPlan?: Parameters<typeof toChatCompletionsWithContract>[2]['prefillPlan']
+}
+
+function toChatCompletions(
+  settings: Parameters<typeof toChatCompletionsWithContract>[0],
+  path: Parameters<typeof toChatCompletionsWithContract>[1],
+  options: ChatOptions = {},
+) {
+  return toChatCompletionsWithContract(settings, path, {
+    ...options,
+    reasoning: options.reasoning ?? chatReasoningContractForSettings(settings),
+    providerOutput: options.providerOutput ?? TEXT_PROVIDER_OUTPUT_CONTRACT,
+    prefillPlan: options.prefillPlan ?? TEST_ASSISTANT_TAIL_PREFILL_PLAN,
+  })
+}
+
+type BuildMessagesOptions = Omit<
+  Parameters<typeof buildChatMessagesWithContract>[2],
+  'reasoning' | 'providerOutput' | 'prefillPlan'
+> & {
+  reasoning?: Parameters<typeof buildChatMessagesWithContract>[2]['reasoning']
+  providerOutput?: Parameters<typeof buildChatMessagesWithContract>[2]['providerOutput']
+  prefillPlan?: Parameters<typeof buildChatMessagesWithContract>[2]['prefillPlan']
+}
+
+function buildChatMessages(
+  settings: Parameters<typeof buildChatMessagesWithContract>[0],
+  path: Parameters<typeof buildChatMessagesWithContract>[1],
+  options: BuildMessagesOptions = {},
+) {
+  return buildChatMessagesWithContract(settings, path, {
+    ...options,
+    reasoning: options.reasoning ?? chatReasoningContractForSettings(settings),
+    providerOutput: options.providerOutput ?? TEXT_PROVIDER_OUTPUT_CONTRACT,
+    prefillPlan: options.prefillPlan ?? TEST_ASSISTANT_TAIL_PREFILL_PLAN,
+  })
+}
+
+function filterReasoningForInclude(
+  details: readonly unknown[],
+  include: ReasoningInclude,
+  targetFormat: ReasoningFormat | undefined,
+  options: { acceptsAnthropicRedactedThinking?: boolean } = {},
+) {
+  return compileChatReasoningDetailsForTest(details, include, targetFormat, options)
+}
 
 function assistantWithReasoning(
   id: string,
   text: string,
-  details: ReasoningDetail[],
+  details: readonly unknown[],
   toolCalls?: ToolCall[],
 ): Message {
   return {
@@ -31,7 +92,7 @@ function assistantWithReasoning(
     role: 'assistant',
     origin: 'generated',
     content: [{ type: 'text', text }],
-    reasoningDetails: details,
+    reasoningEnvelope: reasoningEnvelopeFromDetailsForTest(details, 'openrouter-chat'),
     ...(toolCalls !== undefined ? { toolCalls } : {}),
     nodeVersion: 0,
     deleted: false,
@@ -71,9 +132,20 @@ function withInclude(
   return { ...s, ...overrides }
 }
 
+function nativeAnthropicReasoning(
+  settings: Pick<ChatSettings, 'reasoning'>,
+  acceptsAnthropicRedactedThinking = false,
+) {
+  return chatReasoningContractForSettings(settings, {
+    targetFormat: 'anthropic-claude-v1',
+    carrier: 'openrouter-reasoning-details',
+    acceptsAnthropicRedactedThinking,
+  })
+}
+
 describe('filterReasoningForInclude', () => {
   it('drops tool-call signatures (id starts with tool_)', () => {
-    const details: ReasoningDetail[] = [
+    const details: unknown[] = [
       { type: 'reasoning.text', id: 'tool_123', text: 'bogus' },
       { type: 'reasoning.text', id: 'r_1', text: 'real' },
     ]
@@ -82,7 +154,9 @@ describe('filterReasoningForInclude', () => {
       { encrypted: false, summary: true, text: true },
       'anthropic-claude-v1',
     )
-    expect(kept).toEqual([{ type: 'reasoning.text', id: 'r_1', text: 'real' }])
+    expect(kept).toEqual([
+      expect.objectContaining({ type: 'reasoning.text', id: 'r_1', text: 'real' }),
+    ])
   })
 
   it('keeps encrypted only when include.encrypted AND format matches (Anthropic redacted gate opt-in)', () => {
@@ -150,17 +224,24 @@ describe('filterReasoningForInclude', () => {
 
   it('keeps encrypted when stored format is missing and route is compatible', () => {
     // `format` absent on the carrier → trust include flag + route format.
-    const detail: ReasoningDetail = { type: 'reasoning.encrypted', id: 'r_c', data: 'b' }
+    const detail: unknown = { type: 'reasoning.encrypted', id: 'r_c', data: 'b' }
     const kept = filterReasoningForInclude(
       [detail],
       { encrypted: true, summary: false, text: false },
       'openai-responses-v1',
     )
-    expect(kept).toEqual([detail])
+    expect(kept).toEqual([
+      expect.objectContaining({
+        type: 'reasoning.encrypted',
+        id: 'r_c',
+        data: 'b',
+        format: 'openai-responses-v1',
+      }),
+    ])
   })
 
   it('summary and text flags gate independently', () => {
-    const details: ReasoningDetail[] = [
+    const details: unknown[] = [
       { type: 'reasoning.summary', id: 'r_s', summary: 'gist' },
       { type: 'reasoning.text', id: 'r_t', text: 'verbose' },
     ]
@@ -168,20 +249,20 @@ describe('filterReasoningForInclude', () => {
       filterReasoningForInclude(
         details,
         { encrypted: false, summary: true, text: false },
-        undefined,
+        'anthropic-claude-v1',
       ),
-    ).toEqual([{ type: 'reasoning.summary', id: 'r_s', summary: 'gist' }])
+    ).toEqual([expect.objectContaining({ type: 'reasoning.summary', id: 'r_s', summary: 'gist' })])
     expect(
       filterReasoningForInclude(
         details,
         { encrypted: false, summary: false, text: true },
-        undefined,
+        'anthropic-claude-v1',
       ),
-    ).toEqual([{ type: 'reasoning.text', id: 'r_t', text: 'verbose' }])
+    ).toEqual([expect.objectContaining({ type: 'reasoning.text', id: 'r_t', text: 'verbose' })])
   })
 
   it('all-false drops everything', () => {
-    const details: ReasoningDetail[] = [
+    const details: unknown[] = [
       { type: 'reasoning.text', id: 'r_t', text: 'a' },
       { type: 'reasoning.summary', id: 'r_s', summary: 'b' },
       { type: 'reasoning.encrypted', id: 'r_e', data: 'c', format: 'anthropic-claude-v1' },
@@ -228,9 +309,7 @@ describe('filterReasoningForInclude', () => {
     expect(droppedByFormatMismatch).toEqual([])
   })
 
-  it('reasoning.text WITHOUT signature is plaintext — gated by include.text', () => {
-    // OpenRouter-Gemini repackages the summary as a reasoning.text detail with
-    // no signature. Default (text:false) drops it.
+  it('normalizes unsigned Gemini reasoning.text as a summary before include gating', () => {
     const openRouterGeminiSummary: ReasoningDetail = {
       type: 'reasoning.text',
       id: 'r_s',
@@ -245,13 +324,25 @@ describe('filterReasoningForInclude', () => {
     )
     expect(dropped).toEqual([])
 
-    // text:true keeps it.
-    const kept = filterReasoningForInclude(
+    const stillDropped = filterReasoningForInclude(
       [openRouterGeminiSummary],
       { encrypted: true, summary: false, text: true },
       'google-gemini-v1',
     )
-    expect(kept).toEqual([openRouterGeminiSummary])
+    expect(stillDropped).toEqual([])
+
+    const kept = filterReasoningForInclude(
+      [openRouterGeminiSummary],
+      { encrypted: true, summary: true, text: false },
+      'google-gemini-v1',
+    )
+    expect(kept).toEqual([
+      expect.objectContaining({
+        type: 'reasoning.summary',
+        id: 'r_s',
+        summary: 'summary of thinking',
+      }),
+    ])
   })
 })
 
@@ -262,8 +353,18 @@ describe('buildChatMessages / toChatCompletions — reasoning echo', () => {
     const path: Message[] = [
       userMessage('u1', 'hello'),
       assistantWithReasoning('a1', 'hi!', [
-        { type: 'reasoning.text', id: 'r_t', text: 'thinking...' }, // no signature → plaintext
-        { type: 'reasoning.summary', id: 'r_s', summary: 'summary' },
+        {
+          type: 'reasoning.text',
+          id: 'r_t',
+          format: 'anthropic-claude-v1',
+          text: 'thinking...',
+        },
+        {
+          type: 'reasoning.summary',
+          id: 'r_s',
+          format: 'anthropic-claude-v1',
+          summary: 'summary',
+        },
       ]),
       userMessage('u2', 'go on'),
     ]
@@ -273,15 +374,25 @@ describe('buildChatMessages / toChatCompletions — reasoning echo', () => {
     // to wrapping reasoning in a `<think>…</think>` block in content (since
     // OR strips reasoning_details for unknown-format models).
     const messages = buildChatMessages(settings, path, {
-      reasoningPreservationFormat: 'anthropic-claude-v1',
+      reasoning: nativeAnthropicReasoning(settings),
     })
     expect(messages).toHaveLength(3)
     const echoed = messages[1] as Record<string, unknown>
     expect(echoed.role).toBe('assistant')
     expect(echoed.content).toBe('hi!')
     expect(echoed.reasoning_details).toEqual([
-      { type: 'reasoning.text', id: 'r_t', text: 'thinking...' },
-      { type: 'reasoning.summary', id: 'r_s', summary: 'summary' },
+      {
+        type: 'reasoning.text',
+        id: 'r_t',
+        format: 'anthropic-claude-v1',
+        text: 'thinking...',
+      },
+      {
+        type: 'reasoning.summary',
+        id: 'r_s',
+        format: 'anthropic-claude-v1',
+        summary: 'summary',
+      },
     ])
   })
 
@@ -326,7 +437,11 @@ describe('buildChatMessages / toChatCompletions — reasoning echo', () => {
     const kept = buildChatMessages(
       withInclude({ encrypted: true, summary: false, text: false }),
       path,
-      { reasoningPreservationFormat: 'anthropic-claude-v1' },
+      {
+        reasoning: nativeAnthropicReasoning(
+          withInclude({ encrypted: true, summary: false, text: false }),
+        ),
+      },
     )
     const keptEchoed = kept[1] as Record<string, unknown>
     expect(keptEchoed.reasoning_details).toEqual([
@@ -343,7 +458,11 @@ describe('buildChatMessages / toChatCompletions — reasoning echo', () => {
     const dropped = buildChatMessages(
       withInclude({ encrypted: false, summary: false, text: true }),
       path,
-      { reasoningPreservationFormat: 'anthropic-claude-v1' },
+      {
+        reasoning: nativeAnthropicReasoning(
+          withInclude({ encrypted: false, summary: false, text: true }),
+        ),
+      },
     )
     const droppedEchoed = dropped[1] as Record<string, unknown>
     expect(droppedEchoed).not.toHaveProperty('reasoning_details')
@@ -388,8 +507,10 @@ describe('buildChatMessages / toChatCompletions — reasoning echo', () => {
       withInclude({ encrypted: true, summary: false, text: false }),
       path,
       {
-        reasoningPreservationFormat: 'anthropic-claude-v1',
-        acceptsAnthropicRedactedThinking: true,
+        reasoning: nativeAnthropicReasoning(
+          withInclude({ encrypted: true, summary: false, text: false }),
+          true,
+        ),
       },
     )
     const echoed = messages[1] as Record<string, unknown>
@@ -487,14 +608,23 @@ describe('echoAsThinkTags — universal-compat transport', () => {
     const path: Message[] = [
       userMessage('u1', 'hi'),
       assistantWithReasoning('a1', 'reply', [
-        { type: 'reasoning.summary', id: 'r_s', summary: 'brief' },
+        {
+          type: 'reasoning.summary',
+          id: 'r_s',
+          format: 'anthropic-claude-v1',
+          summary: 'brief',
+        },
         { type: 'reasoning.text', id: 'r_t', text: 'verbose chain' },
       ]),
     ]
     const messages = buildChatMessages(
       withEchoAsThink({ encrypted: false, summary: true, text: true }, true),
       path,
-      { reasoningPreservationFormat: 'anthropic-claude-v1' },
+      {
+        reasoning: nativeAnthropicReasoning(
+          withEchoAsThink({ encrypted: false, summary: true, text: true }, true),
+        ),
+      },
     )
     const echoed = messages[1] as Record<string, unknown>
     expect(echoed).not.toHaveProperty('reasoning_details')
@@ -518,8 +648,10 @@ describe('echoAsThinkTags — universal-compat transport', () => {
       withEchoAsThink({ encrypted: true, summary: true, text: false }, true),
       path,
       {
-        reasoningPreservationFormat: 'anthropic-claude-v1',
-        acceptsAnthropicRedactedThinking: true,
+        reasoning: nativeAnthropicReasoning(
+          withEchoAsThink({ encrypted: true, summary: true, text: false }, true),
+          true,
+        ),
       },
     )
     const echoed = messages[1] as Record<string, unknown>
@@ -549,7 +681,11 @@ describe('echoAsThinkTags — universal-compat transport', () => {
     const messages = buildChatMessages(
       withEchoAsThink({ encrypted: true, summary: false, text: true }, true),
       path,
-      { reasoningPreservationFormat: 'anthropic-claude-v1' },
+      {
+        reasoning: nativeAnthropicReasoning(
+          withEchoAsThink({ encrypted: true, summary: false, text: true }, true),
+        ),
+      },
     )
     const echoed = messages[1] as Record<string, unknown>
     expect(echoed.reasoning_details).toEqual([
@@ -578,8 +714,10 @@ describe('echoAsThinkTags — universal-compat transport', () => {
       withEchoAsThink({ encrypted: true, summary: false, text: false }, true),
       path,
       {
-        reasoningPreservationFormat: 'anthropic-claude-v1',
-        acceptsAnthropicRedactedThinking: true,
+        reasoning: nativeAnthropicReasoning(
+          withEchoAsThink({ encrypted: true, summary: false, text: false }, true),
+          true,
+        ),
       },
     )
     const echoed = messages[1] as Record<string, unknown>
@@ -595,18 +733,32 @@ describe('echoAsThinkTags — universal-compat transport', () => {
     const path: Message[] = [
       userMessage('u1', 'hi'),
       assistantWithReasoning('a1', 'reply', [
-        { type: 'reasoning.summary', id: 'r_s', summary: 'brief' },
+        {
+          type: 'reasoning.summary',
+          id: 'r_s',
+          format: 'anthropic-claude-v1',
+          summary: 'brief',
+        },
       ]),
     ]
     const messages = buildChatMessages(
       withInclude({ encrypted: false, summary: true, text: false }),
       path,
-      { reasoningPreservationFormat: 'anthropic-claude-v1' },
+      {
+        reasoning: nativeAnthropicReasoning(
+          withInclude({ encrypted: false, summary: true, text: false }),
+        ),
+      },
     )
     const echoed = messages[1] as Record<string, unknown>
     expect(echoed.content).toBe('reply')
     expect(echoed.reasoning_details).toEqual([
-      { type: 'reasoning.summary', id: 'r_s', summary: 'brief' },
+      {
+        type: 'reasoning.summary',
+        id: 'r_s',
+        format: 'anthropic-claude-v1',
+        summary: 'brief',
+      },
     ])
   })
 })

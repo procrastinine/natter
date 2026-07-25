@@ -45,7 +45,8 @@ export function installPreloadErrorRecovery(
   const reload = options.reload ?? (() => target.location.reload())
   const onPreloadError = (event: Event) => {
     try {
-      const storage = options.storage ?? target.sessionStorage
+      const storage = options.storage ?? browserSessionStorage(target)
+      if (!storage) throw new Error('SessionStorageUnavailable')
       if (storage.getItem(PRELOAD_RECOVERY_BUILD_KEY) === buildToken) return
       storage.setItem(PRELOAD_RECOVERY_BUILD_KEY, buildToken)
     } catch {
@@ -57,3 +58,5 @@ export function installPreloadErrorRecovery(
   target.addEventListener('vite:preloadError', onPreloadError)
   return () => target.removeEventListener('vite:preloadError', onPreloadError)
 }
+
+import { browserSessionStorage } from './browser-storage'

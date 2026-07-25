@@ -1,16 +1,14 @@
 import { describe, expect, it } from 'vitest'
+import { cloneDefaultChatSettings, UNKNOWN_POLICY } from '../../src/core/defaults'
 import {
-  cloneDefaultChatSettings,
-  cloneDefaultPrivacyPrefs,
-  DEFAULT_CHAT_SETTINGS,
-  DEFAULT_PRIVACY_PREFS,
-  SEED_DEFAULT_MODEL_CANDIDATES,
-  UNKNOWN_POLICY,
-} from '../../src/core/defaults'
+  CURRENT_OPENROUTER_MODEL_IDS,
+  LATEST_OPENROUTER_MODEL_IDS,
+  OPENROUTER_PROBE_MODEL_IDS,
+} from '../../src/core/latest-models'
 
 describe('defaults', () => {
   it('DEFAULT_CHAT_SETTINGS matches the Phase 0 snapshot', () => {
-    expect(DEFAULT_CHAT_SETTINGS).toMatchInlineSnapshot(`
+    expect(cloneDefaultChatSettings()).toMatchInlineSnapshot(`
       {
         "allowFallbacks": true,
         "anthropicCache": {
@@ -92,7 +90,7 @@ describe('defaults', () => {
   })
 
   it('DEFAULT_PRIVACY_PREFS is privacy-first', () => {
-    expect(DEFAULT_PRIVACY_PREFS).toEqual({
+    expect(cloneDefaultChatSettings().privacy).toEqual({
       denyDataCollection: true,
       zdrOnly: false,
       paretoFilter: true,
@@ -112,13 +110,6 @@ describe('defaults', () => {
     })
   })
 
-  it('DEFAULT_CHAT_SETTINGS is frozen to prevent accidental mutation', () => {
-    expect(Object.isFrozen(DEFAULT_CHAT_SETTINGS)).toBe(true)
-    expect(Object.isFrozen(DEFAULT_CHAT_SETTINGS.reasoning)).toBe(true)
-    expect(Object.isFrozen(DEFAULT_CHAT_SETTINGS.contextStrategy)).toBe(true)
-    expect(Object.isFrozen(DEFAULT_CHAT_SETTINGS.privacy)).toBe(true)
-  })
-
   it('cloneDefaultChatSettings returns an independent deep copy', () => {
     const a = cloneDefaultChatSettings()
     const b = cloneDefaultChatSettings()
@@ -127,24 +118,40 @@ describe('defaults', () => {
     expect(a.reasoning).not.toBe(b.reasoning)
     a.reasoning.mode = 'off'
     expect(b.reasoning.mode).toBe('default')
-    expect(DEFAULT_CHAT_SETTINGS.reasoning.mode).toBe('default')
+    expect(cloneDefaultChatSettings().reasoning.mode).toBe('default')
   })
 
-  it('cloneDefaultPrivacyPrefs yields an independent copy', () => {
-    const a = cloneDefaultPrivacyPrefs()
+  it('clones default privacy preferences independently', () => {
+    const a = cloneDefaultChatSettings().privacy
     a.paretoFilter = false
-    expect(DEFAULT_PRIVACY_PREFS.paretoFilter).toBe(true)
+    expect(cloneDefaultChatSettings().privacy.paretoFilter).toBe(true)
   })
 
-  it('SEED_DEFAULT_MODEL_CANDIDATES matches the first-run seed preference list', () => {
-    expect(SEED_DEFAULT_MODEL_CANDIDATES).toMatchInlineSnapshot(`
-      [
-        "anthropic/claude-opus-4.7",
-        "openai/gpt-5.4",
-        "google/gemini-3.1-pro",
-        "z-ai/glm-5.1",
-      ]
-    `)
-    expect(Object.isFrozen(SEED_DEFAULT_MODEL_CANDIDATES)).toBe(true)
+  it('keeps current and upcoming OpenRouter model preferences separate and immutable', () => {
+    expect(CURRENT_OPENROUTER_MODEL_IDS).toEqual([
+      'anthropic/claude-opus-4.8',
+      'anthropic/claude-sonnet-5',
+      'anthropic/claude-fable-5',
+      'openai/gpt-5.6-sol',
+      'google/gemini-3.6-flash',
+      'google/gemini-3.5-flash-lite',
+      'z-ai/glm-5.2',
+      'moonshotai/kimi-k3',
+    ])
+    expect(LATEST_OPENROUTER_MODEL_IDS).toEqual([
+      ...CURRENT_OPENROUTER_MODEL_IDS,
+      'google/gemini-3.5-pro',
+    ])
+    expect(OPENROUTER_PROBE_MODEL_IDS).toEqual([
+      'google/gemini-3.5-flash-lite',
+      'z-ai/glm-5.2',
+      'moonshotai/kimi-k3',
+      'google/gemini-3.6-flash',
+      'openai/gpt-5.6-luna',
+      'anthropic/claude-haiku-4.5',
+    ])
+    expect(Object.isFrozen(CURRENT_OPENROUTER_MODEL_IDS)).toBe(true)
+    expect(Object.isFrozen(LATEST_OPENROUTER_MODEL_IDS)).toBe(true)
+    expect(Object.isFrozen(OPENROUTER_PROBE_MODEL_IDS)).toBe(true)
   })
 })

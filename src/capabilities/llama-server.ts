@@ -60,6 +60,7 @@ const LLAMA_SERVER_PARAMETERS: readonly string[] = [
 export const DEFAULT_LLAMA_SERVER_CAPABILITY: CapabilityDescriptor = {
   supportedParameters: [...LLAMA_SERVER_PARAMETERS],
   streaming: 'supported',
+  prefill: { kind: 'assistant-tail', marker: 'none' },
   // Context baseline. The real number comes from the probe's /v1/models
   // response (meta.n_ctx_train) — this just keeps the Context tab sliders
   // functional before the probe lands.

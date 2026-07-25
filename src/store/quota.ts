@@ -1,5 +1,6 @@
 export const QUOTA_WARN_RATIO = 0.8
 export const QUOTA_HARD_WARN_RATIO = 0.95
+const STORAGE_PROBE_TIMEOUT_MS = 3_000
 
 type QuotaLevel = 'ok' | 'warn' | 'hard-warn'
 type PersistenceHelpBrowser = 'chromium' | 'safari' | 'other'
@@ -18,6 +19,19 @@ export interface QuotaSnapshot {
   usageDetails: Record<string, number>
 }
 
+export type StorageProbeStatus = 'checking' | 'ready' | 'unavailable' | 'error'
+
+export type StorageProbeResult<T> =
+  | { status: 'ready'; value: T }
+  | { status: 'unavailable' }
+  | { status: 'error'; reason: 'timeout' | 'failed' }
+
+export type StorageProbeState<T> = { status: 'checking' } | StorageProbeResult<T>
+
+export interface StorageProbeOptions {
+  timeoutMs?: number
+}
+
 function storageManager(): StorageManager | undefined {
   if (typeof navigator === 'undefined') return undefined
   return (navigator as { storage?: StorageManager }).storage
@@ -31,21 +45,62 @@ export function classifyQuota(usage: number, quota: number): QuotaLevel {
   return 'ok'
 }
 
-export async function estimateQuota(): Promise<QuotaSnapshot | null> {
+function storageProbeTimeout(options: StorageProbeOptions | undefined): number {
+  const requested = options?.timeoutMs
+  return typeof requested === 'number' && Number.isFinite(requested) && requested >= 0
+    ? requested
+    : STORAGE_PROBE_TIMEOUT_MS
+}
+
+async function runStorageProbe<T>(
+  operation: (() => Promise<T>) | undefined,
+  options?: StorageProbeOptions,
+): Promise<StorageProbeResult<T>> {
+  if (!operation) return { status: 'unavailable' }
+
+  let timeoutId: ReturnType<typeof setTimeout> | undefined
+  const operationResult = Promise.resolve()
+    .then(operation)
+    .then<StorageProbeResult<T>, StorageProbeResult<T>>(
+      (value) => ({ status: 'ready', value }),
+      () => ({ status: 'error', reason: 'failed' }),
+    )
+  const timeoutResult = new Promise<StorageProbeResult<T>>((resolve) => {
+    timeoutId = setTimeout(
+      () => resolve({ status: 'error', reason: 'timeout' }),
+      storageProbeTimeout(options),
+    )
+  })
+
+  try {
+    return await Promise.race([operationResult, timeoutResult])
+  } finally {
+    if (timeoutId !== undefined) clearTimeout(timeoutId)
+  }
+}
+
+export async function probeQuota(
+  options?: StorageProbeOptions,
+): Promise<StorageProbeResult<QuotaSnapshot>> {
   const storage = storageManager()
-  if (!storage || typeof storage.estimate !== 'function') return null
-  const est = await storage.estimate()
-  const usage = est.usage ?? 0
-  const quota = est.quota ?? 0
-  const usageDetails = normalizeUsageDetails(
-    (est as StorageEstimate & { usageDetails?: Record<string, unknown> }).usageDetails,
+  const result = await runStorageProbe(
+    storage && typeof storage.estimate === 'function' ? () => storage.estimate() : undefined,
+    options,
   )
+  if (result.status !== 'ready') return result
+  const usage = result.value.usage ?? 0
+  const quota = result.value.quota ?? 0
   return {
-    usage,
-    quota,
-    ratio: quota > 0 ? usage / quota : 0,
-    level: classifyQuota(usage, quota),
-    usageDetails,
+    status: 'ready',
+    value: {
+      usage,
+      quota,
+      ratio: quota > 0 ? usage / quota : 0,
+      level: classifyQuota(usage, quota),
+      usageDetails: normalizeUsageDetails(
+        (result.value as StorageEstimate & { usageDetails?: Record<string, unknown> }).usageDetails,
+      ),
+    },
   }
 }
 
@@ -91,7 +146,9 @@ export function storagePersistenceNotificationMayHelp(): boolean {
   return browser === 'chromium' || browser === 'safari'
 }
 
-export async function requestNotificationPermissionForStoragePersistence(): Promise<StoragePersistenceNotificationPermission> {
+export async function requestNotificationPermissionForStoragePersistence(
+  options?: StorageProbeOptions,
+): Promise<StoragePersistenceNotificationPermission> {
   if (!storagePersistenceNotificationMayHelp()) return 'skipped'
   const notificationApi = (
     globalThis as {
@@ -108,35 +165,43 @@ export async function requestNotificationPermissionForStoragePersistence(): Prom
     return notificationApi.permission
   }
   if (notificationApi.permission !== 'default') return 'unsupported'
-  try {
-    return await notificationApi.requestPermission()
-  } catch {
-    return 'error'
-  }
+  const requestPermission = notificationApi.requestPermission
+  const result = await runStorageProbe(() => requestPermission.call(notificationApi), options)
+  return result.status === 'ready' ? result.value : 'error'
 }
 
 // Best-effort request for persistent storage. Browsers may prompt the user or
 // grant silently depending on engagement / install state. Safe to call any
 // number of times; calling from a non-interactive context is a no-op in most
 // browsers.
-export async function requestPersist(): Promise<boolean> {
+export async function probePersistRequest(
+  options?: StorageProbeOptions,
+): Promise<StorageProbeResult<boolean>> {
   const storage = storageManager()
-  if (!storage || typeof storage.persist !== 'function') return false
-  try {
-    return await storage.persist()
-  } catch {
-    return false
-  }
+  return runStorageProbe(
+    storage && typeof storage.persist === 'function' ? () => storage.persist() : undefined,
+    options,
+  )
 }
 
-export async function isPersisted(): Promise<boolean> {
+export async function requestPersist(options?: StorageProbeOptions): Promise<boolean> {
+  const result = await probePersistRequest(options)
+  return result.status === 'ready' ? result.value : false
+}
+
+export async function probePersisted(
+  options?: StorageProbeOptions,
+): Promise<StorageProbeResult<boolean>> {
   const storage = storageManager()
-  if (!storage || typeof storage.persisted !== 'function') return false
-  try {
-    return await storage.persisted()
-  } catch {
-    return false
-  }
+  return runStorageProbe(
+    storage && typeof storage.persisted === 'function' ? () => storage.persisted() : undefined,
+    options,
+  )
+}
+
+export async function isPersisted(options?: StorageProbeOptions): Promise<boolean> {
+  const result = await probePersisted(options)
+  return result.status === 'ready' ? result.value : false
 }
 
 let persistOncePromise: Promise<boolean> | null = null

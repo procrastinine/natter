@@ -28,7 +28,7 @@ import { fetchWithTimeout, readResponseText } from './client'
 import { ApiError, normalizeError } from './errors'
 
 interface PrivacyScrapeContext {
-  // Workspace-global CORS-proxy config. Required — `core/privacy-request.ts`
+  // Workspace-global CORS-proxy config. Required by request privacy planning.
   // and `usePrivacyPolicies` resolve it before calling the scrape so this
   // module never touches IDB itself (keeps it daemon-portable).
   proxy: CorsProxyConfig

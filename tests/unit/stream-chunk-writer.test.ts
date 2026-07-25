@@ -1,35 +1,90 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import { ApiError } from '../../src/api/errors'
-import type { StreamLaneEvent } from '../../src/api/stream-transforms'
+import { canonicalStreamEventV2FromUnknown } from '../../src/core/canonical-stream-event'
+import type {
+  CanonicalStreamEventV2,
+  OpaqueReasoningCarrierDescriptorV2,
+  ReasoningVisiblePartV2,
+} from '../../src/core/generation-stream-events'
 import {
   applyStreamAccumulatorEvent,
   createStreamAccumulator,
   projectStreamAccumulatorFinal,
   replayStreamAccumulator,
+  streamAccumulatorReasoningLength,
 } from '../../src/core/stream-accumulator'
-import type { StreamChunkRow } from '../../src/store/repository'
 import {
-  createStreamChunkWriter,
-  type StreamChunkAppendPort,
+  type StreamJournalFrameAppendPort as CanonicalStreamJournalFrameAppendPort,
+  createStreamJournalWriter as createCanonicalStreamJournalWriter,
+  SHARED_APPEND_MAX_CONCURRENT_OWNERS,
 } from '../../src/store/stream-chunk-writer'
+import {
+  reserveWorkspaceChild,
+  runWorkspaceAction,
+  type WorkspaceWritePermit,
+  workspaceRuntimeInternal,
+} from '../../src/store/workspace-runtime'
+import {
+  createLogicalStreamJournalAppendAdapter,
+  type TestSemanticJournalRow,
+} from '../helpers/stream-journal'
+
+interface LogicalStreamJournalAppendPort {
+  appendStreamChunks(rows: readonly TestSemanticJournalRow[]): Promise<void>
+}
+
+const canonicalPorts = new WeakMap<
+  LogicalStreamJournalAppendPort,
+  CanonicalStreamJournalFrameAppendPort
+>()
+const activeWriters = new Set<ReturnType<typeof createCanonicalStreamJournalWriter>>()
+let writerRootPermit: WorkspaceWritePermit | undefined
+let writerRootLifetime: ReturnType<typeof deferred<void>> | undefined
+let writerRootTask: Promise<void> | undefined
+
+beforeAll(async () => {
+  const fence = { workspaceId: 'stream-chunk-writer-tests', replacementEpoch: 0 }
+  workspaceRuntimeInternal.beginReconciliation(fence)
+  workspaceRuntimeInternal.finishReconciliation(fence)
+  const ready = deferred<void>()
+  writerRootLifetime = deferred<void>()
+  writerRootTask = runWorkspaceAction('conversation-generation', async (permit) => {
+    writerRootPermit = permit
+    ready.resolve(undefined)
+    await writerRootLifetime?.promise
+  })
+  await ready.promise
+})
 
 afterEach(() => {
+  for (const writer of activeWriters) writer.release()
+  activeWriters.clear()
   vi.useRealTimers()
+})
+
+afterAll(async () => {
+  writerRootLifetime?.resolve(undefined)
+  await writerRootTask
+  workspaceRuntimeInternal.beginQuiesce()
+  await workspaceRuntimeInternal.awaitDrain()
+  workspaceRuntimeInternal.markQuiesced()
+  workspaceRuntimeInternal.seal()
 })
 
 describe('stream chunk writer', () => {
   it('serializes recoverable lanes, deduplicates metadata, and assigns contiguous rows', async () => {
-    const batches: StreamChunkRow[][] = []
-    const appendStreamChunks = vi.fn(async (rows: readonly StreamChunkRow[]) => {
+    const batches: TestSemanticJournalRow[][] = []
+    const appendStreamChunks = vi.fn(async (rows: readonly TestSemanticJournalRow[]) => {
       batches.push(structuredClone([...rows]))
     })
     const writer = createWriter({ appendStreamChunks }, 100)
     const hostedItem = {
       lane: 'output-item-added',
+      dialect: 'openai-responses',
       outputIndex: 2,
       item: { type: 'web_search_call', id: 'tool-1', status: 'in_progress' },
-    } satisfies StreamLaneEvent
-    const textEvent = { lane: 'text', text: 'first' } satisfies StreamLaneEvent
+    } satisfies CanonicalStreamEventV2
+    const textEvent = { lane: 'text', text: 'first' } satisfies CanonicalStreamEventV2
 
     writer.append(
       { lane: 'meta', generationId: 'generation-1', model: 'model-1', provider: 'provider-1' },
@@ -46,6 +101,7 @@ describe('stream chunk writer', () => {
     writer.append(
       {
         lane: 'output-item-done',
+        dialect: 'openai-responses',
         outputIndex: 0,
         item: { type: 'message', id: 'message-1' },
       },
@@ -100,6 +156,7 @@ describe('stream chunk writer', () => {
       { lane: 'meta', model: 'model-2' },
       {
         lane: 'output-item-added',
+        dialect: 'openai-responses',
         outputIndex: 2,
         item: { type: 'web_search_call', id: 'tool-1', status: 'in_progress' },
       },
@@ -120,7 +177,7 @@ describe('stream chunk writer', () => {
   })
 
   it('persists only bounded allowlisted stream error fields', async () => {
-    const batches: StreamChunkRow[][] = []
+    const batches: TestSemanticJournalRow[][] = []
     const writer = createWriter(
       {
         appendStreamChunks: async (rows) => {
@@ -167,7 +224,7 @@ describe('stream chunk writer', () => {
   })
 
   it('persists only the sanitized integrity event', async () => {
-    const batches: StreamChunkRow[][] = []
+    const batches: TestSemanticJournalRow[][] = []
     const writer = createWriter(
       {
         appendStreamChunks: async (rows) => {
@@ -209,7 +266,7 @@ describe('stream chunk writer', () => {
 
   it('uses the 150 ms trailing flush schedule and settlement drains buffered rows', async () => {
     vi.useFakeTimers()
-    const appendStreamChunks = vi.fn(async (_rows: readonly StreamChunkRow[]) => {})
+    const appendStreamChunks = vi.fn(async (_rows: readonly TestSemanticJournalRow[]) => {})
     const writer = createWriter({ appendStreamChunks }, 1_000)
 
     writer.append({ lane: 'text', text: 'delayed' }, 1_001)
@@ -230,15 +287,29 @@ describe('stream chunk writer', () => {
   })
 
   it.each([
-    ['text', { lane: 'text', text: 'x'.repeat(128 * 1024) } satisfies StreamLaneEvent],
+    ['text', { lane: 'text', text: 'x'.repeat(128 * 1024) } satisfies CanonicalStreamEventV2],
     [
       'reasoning fragments',
       {
         lane: 'reasoning',
-        textDelta: 'x'.repeat(64 * 1024),
-        summaryDelta: 'y'.repeat(32 * 1024),
-        encryptedDelta: 'z'.repeat(32 * 1024),
-      } satisfies StreamLaneEvent,
+        mutations: [
+          {
+            kind: 'visible-append',
+            part: reasoningPart('budget:text'),
+            delta: 'x'.repeat(64 * 1024),
+          },
+          {
+            kind: 'visible-append',
+            part: reasoningPart('budget:summary', 'summary'),
+            delta: 'y'.repeat(32 * 1024),
+          },
+          {
+            kind: 'carrier-append',
+            carrier: reasoningCarrier('budget:carrier'),
+            delta: 'z'.repeat(32 * 1024),
+          },
+        ],
+      } satisfies CanonicalStreamEventV2,
     ],
     [
       'audio fragments',
@@ -246,11 +317,11 @@ describe('stream chunk writer', () => {
         lane: 'audio-output',
         dataDelta: 'x'.repeat(96 * 1024),
         transcriptDelta: 'y'.repeat(32 * 1024),
-      } satisfies StreamLaneEvent,
+      } satisfies CanonicalStreamEventV2,
     ],
   ])('flushes immediately at the text budget for %s', async (_name, event) => {
     vi.useFakeTimers()
-    const appendStreamChunks = vi.fn(async (_rows: readonly StreamChunkRow[]) => {})
+    const appendStreamChunks = vi.fn(async (_rows: readonly TestSemanticJournalRow[]) => {})
     const writer = createWriter({ appendStreamChunks }, 500)
 
     writer.append(event, 501)
@@ -262,7 +333,7 @@ describe('stream chunk writer', () => {
 
   it('flushes immediately at 256 logical rows after coalescing them', async () => {
     vi.useFakeTimers()
-    const appendStreamChunks = vi.fn(async (_rows: readonly StreamChunkRow[]) => {})
+    const appendStreamChunks = vi.fn(async (_rows: readonly TestSemanticJournalRow[]) => {})
     const writer = createWriter({ appendStreamChunks }, 2_000)
 
     for (let index = 0; index < 255; index += 1) {
@@ -282,56 +353,41 @@ describe('stream chunk writer', () => {
   })
 
   it('replays coalesced exact append lanes identically, including reasoning timing', async () => {
-    const trace: Array<{ event: StreamLaneEvent; createdAt: number }> = [
+    const reasoningText = reasoningPart('reasoning-0:text')
+    const reasoningSummary = reasoningPart('reasoning-0:summary:0', 'summary')
+    const trace: Array<{ event: CanonicalStreamEventV2; createdAt: number }> = [
       {
         event: {
           lane: 'reasoning',
-          textDelta: 'ab',
-          chunkId: 'reason-1',
-          outputIndex: 0,
-          itemId: 'reasoning-0',
+          mutations: [{ kind: 'visible-append', part: reasoningText, delta: 'ab' }],
         },
         createdAt: 101,
       },
       {
         event: {
           lane: 'reasoning',
-          textDelta: 'ab',
-          chunkId: 'reason-2',
-          outputIndex: 0,
-          itemId: 'reasoning-0',
+          mutations: [{ kind: 'visible-append', part: reasoningText, delta: 'ab' }],
         },
         createdAt: 102,
       },
       {
         event: {
           lane: 'reasoning',
-          textDelta: 'bc',
-          chunkId: 'reason-3',
-          outputIndex: 0,
-          itemId: 'reasoning-0',
+          mutations: [{ kind: 'visible-append', part: reasoningText, delta: 'bc' }],
         },
         createdAt: 103,
       },
       {
         event: {
           lane: 'reasoning',
-          summaryDelta: 'sum',
-          chunkId: 'summary-1',
-          outputIndex: 0,
-          itemId: 'reasoning-0',
-          summaryIndex: 0,
+          mutations: [{ kind: 'visible-append', part: reasoningSummary, delta: 'sum' }],
         },
         createdAt: 104,
       },
       {
         event: {
           lane: 'reasoning',
-          summaryDelta: 'mary',
-          chunkId: 'summary-2',
-          outputIndex: 0,
-          itemId: 'reasoning-0',
-          summaryIndex: 0,
+          mutations: [{ kind: 'visible-append', part: reasoningSummary, delta: 'mary' }],
         },
         createdAt: 105,
       },
@@ -349,7 +405,7 @@ describe('stream chunk writer', () => {
       },
       { event: { lane: 'finish', finishReason: 'stop' }, createdAt: 109 },
     ]
-    const rows: StreamChunkRow[] = []
+    const rows: TestSemanticJournalRow[] = []
     const writer = createWriter(
       {
         appendStreamChunks: async (batch) => {
@@ -363,21 +419,25 @@ describe('stream chunk writer', () => {
     await writer.settle()
 
     const original = replayStreamAccumulator({ initialContent: [], now: 100, entries: trace })
-    const coalesced = replayStreamAccumulator({ initialContent: [], now: 100, entries: rows })
+    const coalesced = replayStreamAccumulator({
+      initialContent: [],
+      now: 100,
+      entries: replayEntries(rows),
+    })
     expect(coalesced.final).toEqual(original.final)
     expect({
       firstTextAt: coalesced.accumulator.firstTextAt,
       reasoningStartedAt: coalesced.accumulator.reasoningStartedAt,
       reasoningFinishedAt: coalesced.accumulator.reasoningFinishedAt,
       textLength: coalesced.accumulator.textLength,
-      reasoningLength: coalesced.accumulator.reasoningLength,
+      reasoningLength: streamAccumulatorReasoningLength(coalesced.accumulator),
       finishReason: coalesced.accumulator.finishReason,
     }).toEqual({
       firstTextAt: original.accumulator.firstTextAt,
       reasoningStartedAt: original.accumulator.reasoningStartedAt,
       reasoningFinishedAt: original.accumulator.reasoningFinishedAt,
       textLength: original.accumulator.textLength,
-      reasoningLength: original.accumulator.reasoningLength,
+      reasoningLength: streamAccumulatorReasoningLength(original.accumulator),
       finishReason: original.accumulator.finishReason,
     })
     expect(rows).toHaveLength(6)
@@ -385,26 +445,58 @@ describe('stream chunk writer', () => {
     expect(rows.map((row) => row.event)).toEqual([
       {
         lane: 'reasoning',
-        textDelta: 'ababbc',
-        outputIndex: 0,
-        itemId: 'reasoning-0',
+        mutations: [{ kind: 'visible-append', part: reasoningText, delta: 'ababbc' }],
+        observed: { firstAt: 101, lastAt: 101 },
       },
-      { lane: 'reasoning' },
+      { lane: 'reasoning', mutations: [], observed: { firstAt: 103, lastAt: 103 } },
       {
         lane: 'reasoning',
-        summaryDelta: 'summary',
-        outputIndex: 0,
-        itemId: 'reasoning-0',
-        summaryIndex: 0,
+        mutations: [{ kind: 'visible-append', part: reasoningSummary, delta: 'summary' }],
+        observed: { firstAt: 104, lastAt: 104 },
       },
-      { lane: 'reasoning' },
+      { lane: 'reasoning', mutations: [], observed: { firstAt: 105, lastAt: 105 } },
       { lane: 'text', text: 'xyxyyz', outputIndex: 1, contentIndex: 0 },
       { lane: 'finish', finishReason: 'stop' },
     ])
   })
 
+  it('coalesces opaque carrier appends without retaining semantic identity maps', async () => {
+    const rows: TestSemanticJournalRow[] = []
+    const writer = createWriter(
+      {
+        appendStreamChunks: async (batch) => {
+          rows.push(...structuredClone([...batch]))
+        },
+      },
+      100,
+    )
+    const carrier = reasoningCarrier('reasoning-0')
+    writer.append(
+      { lane: 'reasoning', mutations: [{ kind: 'carrier-append', carrier, delta: 'abc' }] },
+      101,
+    )
+    writer.append(
+      { lane: 'reasoning', mutations: [{ kind: 'carrier-append', carrier, delta: 'def' }] },
+      102,
+    )
+
+    expect(writer.inspect()).not.toHaveProperty('trackedReasoningRows')
+    expect(writer.inspect()).not.toHaveProperty('trackedReasoningIds')
+    await writer.settle()
+
+    const replayed = replayStreamAccumulator({
+      initialContent: [],
+      now: 100,
+      entries: replayEntries(rows),
+    })
+    expect(replayed.final.reasoningEnvelope?.carriers).toEqual([{ ...carrier, data: 'abcdef' }])
+    expect(replayed.accumulator.reasoningStartedAt).toBe(101)
+    expect(replayed.accumulator.reasoningFinishedAt).toBe(102)
+    expect(rows).toHaveLength(2)
+  })
+
   it('keeps distinct reasoning and text output targets as separate rows', async () => {
-    const rows: StreamChunkRow[] = []
+    const rows: TestSemanticJournalRow[] = []
     const writer = createWriter(
       {
         appendStreamChunks: async (batch) => {
@@ -414,22 +506,24 @@ describe('stream chunk writer', () => {
       100,
     )
 
-    writer.append({ lane: 'reasoning', textDelta: 'one', itemId: 'one', outputIndex: 0 }, 101)
-    writer.append({ lane: 'reasoning', textDelta: 'two', itemId: 'two', outputIndex: 0 }, 102)
+    const one = reasoningPart('one')
+    const two = reasoningPart('two')
+    writer.append(reasoningAppend(one, 'one'), 101)
+    writer.append(reasoningAppend(two, 'two'), 102)
     writer.append({ lane: 'text', text: 'left', outputIndex: 0, contentIndex: 0 }, 103)
     writer.append({ lane: 'text', text: 'right', outputIndex: 0, contentIndex: 1 }, 104)
     await writer.settle()
 
     expect(rows.map((row) => row.event)).toEqual([
-      { lane: 'reasoning', textDelta: 'one', itemId: 'one', outputIndex: 0 },
-      { lane: 'reasoning', textDelta: 'two', itemId: 'two', outputIndex: 0 },
+      reasoningAppend(one, 'one', 101),
+      reasoningAppend(two, 'two', 102),
       { lane: 'text', text: 'left', outputIndex: 0, contentIndex: 0 },
       { lane: 'text', text: 'right', outputIndex: 0, contentIndex: 1 },
     ])
   })
 
-  it('coalesces generic structured detail deltas exactly but never Anthropic snapshots', async () => {
-    const rows: StreamChunkRow[] = []
+  it('coalesces canonical appends exactly but never drops authoritative sets', async () => {
+    const rows: TestSemanticJournalRow[] = []
     const writer = createWriter(
       {
         appendStreamChunks: async (batch) => {
@@ -442,43 +536,17 @@ describe('stream chunk writer', () => {
       { length: 1_000 },
       (_, index) => ['ha', 'ha', 'prefix-tail', 'tail-next'][index % 4] as string,
     )
-    const trace: Array<{ event: StreamLaneEvent; createdAt: number }> = []
+    const appended = reasoningPart('generic')
+    const authoritative = reasoningPart('claude-row')
+    const trace: Array<{ event: CanonicalStreamEventV2; createdAt: number }> = []
     for (const [index, text] of pieces.entries()) {
-      const event: StreamLaneEvent = {
-        lane: 'reasoning',
-        detailsMode: 'delta',
-        details: [{ type: 'reasoning.text', index: 0, format: 'unknown', text }],
-      }
+      const event = reasoningAppend(appended, text)
       trace.push({ event, createdAt: 101 + index })
       writer.append(event, 101 + index)
     }
-    const snapshots: StreamLaneEvent[] = [
-      {
-        lane: 'reasoning',
-        detailsMode: 'snapshot',
-        details: [
-          {
-            type: 'reasoning.text',
-            id: 'claude-row',
-            index: 1,
-            format: 'anthropic-claude-v1',
-            text: 'first snapshot',
-          },
-        ],
-      },
-      {
-        lane: 'reasoning',
-        detailsMode: 'snapshot',
-        details: [
-          {
-            type: 'reasoning.text',
-            id: 'claude-row',
-            index: 1,
-            format: 'anthropic-claude-v1',
-            text: 'authoritative snapshot',
-          },
-        ],
-      },
+    const snapshots: CanonicalStreamEventV2[] = [
+      reasoningSet(authoritative, 'first snapshot'),
+      reasoningSet(authoritative, 'authoritative snapshot'),
     ]
     for (const [index, event] of snapshots.entries()) {
       trace.push({ event, createdAt: 1_101 + index })
@@ -488,35 +556,28 @@ describe('stream chunk writer', () => {
     await writer.settle()
 
     const original = replayStreamAccumulator({ initialContent: [], now: 100, entries: trace })
-    const replayed = replayStreamAccumulator({ initialContent: [], now: 100, entries: rows })
+    const replayed = replayStreamAccumulator({
+      initialContent: [],
+      now: 100,
+      entries: replayEntries(rows),
+    })
     expect(replayed.final).toEqual(original.final)
     expect(replayed.accumulator.reasoningFinishedAt).toBe(original.accumulator.reasoningFinishedAt)
-    expect(replayed.final.reasoningDetails).toEqual([
-      {
-        type: 'reasoning.text',
-        index: 0,
-        format: 'unknown',
-        text: pieces.join(''),
-      },
-      {
-        type: 'reasoning.text',
-        id: 'claude-row',
-        index: 1,
-        format: 'anthropic-claude-v1',
-        text: 'authoritative snapshot',
-      },
+    expect(replayed.final.reasoningEnvelope?.visible).toEqual([
+      { ...appended, text: pieces.join('') },
+      { ...authoritative, text: 'authoritative snapshot' },
     ])
     expect(rows.length).toBeLessThan(12)
     expect(
       rows.filter((row) => {
-        const event = row.event as StreamLaneEvent
-        return event.lane === 'reasoning' && event.detailsMode === 'snapshot'
+        const event = row.event as CanonicalStreamEventV2
+        return event.lane === 'reasoning' && event.mutations[0]?.kind === 'visible-set'
       }),
     ).toHaveLength(2)
   })
 
-  it('coalesces details-only Claude deltas without changing their append semantics', async () => {
-    const rows: StreamChunkRow[] = []
+  it('coalesces one canonical Claude reasoning part without changing append semantics', async () => {
+    const rows: TestSemanticJournalRow[] = []
     const writer = createWriter(
       {
         appendStreamChunks: async (batch) => {
@@ -526,26 +587,27 @@ describe('stream chunk writer', () => {
       100,
     )
     const pieces = Array.from({ length: 1_000 }, (_, index) => 'x'.repeat((index % 10) + 1))
+    const part = reasoningPart('claude-stable')
     for (const [index, text] of pieces.entries()) {
-      writer.append(
-        {
-          lane: 'reasoning',
-          detailsMode: 'delta',
-          details: [{ type: 'reasoning.text', index: 0, format: 'anthropic-claude-v1', text }],
-        },
-        101 + index,
-      )
+      writer.append(reasoningAppend(part, text), 101 + index)
     }
 
     await writer.settle()
 
     expect(rows.length).toBeLessThan(12)
-    const replayed = replayStreamAccumulator({ initialContent: [], now: 100, entries: rows })
-    expect(replayed.final.reasoningDetails?.[0]).toMatchObject({ text: pieces.join('') })
+    const replayed = replayStreamAccumulator({
+      initialContent: [],
+      now: 100,
+      entries: replayEntries(rows),
+    })
+    expect(replayed.final.reasoningEnvelope?.visible[0]).toEqual({
+      ...part,
+      text: pieces.join(''),
+    })
   })
 
-  it('journals prefix-growing cumulative reasoning in replay-equivalent linear space', async () => {
-    const rows: StreamChunkRow[] = []
+  it('journals canonical reasoning suffixes in replay-equivalent linear space', async () => {
+    const rows: TestSemanticJournalRow[] = []
     const writer = createWriter(
       {
         appendStreamChunks: async (batch) => {
@@ -556,25 +618,10 @@ describe('stream chunk writer', () => {
     )
     const original = createStreamAccumulator({ initialContent: [], now: 100 })
     const chunkCount = 10_000
-    let cumulative = ''
+    const part = reasoningPart('claude-reasoning')
 
     for (let index = 0; index < chunkCount; index += 1) {
-      cumulative += String(index % 10)
-      const event: StreamLaneEvent = {
-        lane: 'reasoning',
-        detailsMode: 'cumulative',
-        details: [
-          {
-            type: 'reasoning.text',
-            id: 'claude-reasoning',
-            index: 0,
-            format: 'anthropic-claude-v1',
-            text: cumulative,
-            ...(index === 0 ? { hidden: true } : {}),
-            ...(index === chunkCount - 1 ? { signature: 'final-signature' } : {}),
-          },
-        ],
-      }
+      const event = reasoningAppend(part, String(index % 10))
       const createdAt = 101 + index
       applyStreamAccumulatorEvent(original, event, createdAt)
       writer.append(event, createdAt)
@@ -582,35 +629,27 @@ describe('stream chunk writer', () => {
 
     await writer.settle()
 
-    const replayed = replayStreamAccumulator({ initialContent: [], now: 100, entries: rows })
+    const replayed = replayStreamAccumulator({
+      initialContent: [],
+      now: 100,
+      entries: replayEntries(rows),
+    })
     expect(replayed.final).toEqual(projectStreamAccumulatorFinal(original))
     expect(replayed.accumulator.reasoningFinishedAt).toBe(100 + chunkCount)
     expect(replayed.accumulator.reasoningFinishedAt).toBe(original.reasoningFinishedAt)
-    expect(replayed.final.reasoningDetails).toEqual([
-      {
-        type: 'reasoning.text',
-        id: 'claude-reasoning',
-        index: 0,
-        format: 'anthropic-claude-v1',
-        text: cumulative,
-        signature: 'final-signature',
-        hidden: true,
-      },
+    expect(replayed.final.reasoningEnvelope?.visible).toEqual([
+      { ...part, text: Array.from({ length: chunkCount }, (_, index) => index % 10).join('') },
     ])
     const persistedReasoningCharacters = rows.reduce((sum, row) => {
-      const event = row.event as StreamLaneEvent
+      const event = row.event as CanonicalStreamEventV2
       if (event.lane !== 'reasoning') return sum
       return (
         sum +
-        (event.details ?? []).reduce<number>((detailSum, raw) => {
-          if (!raw || typeof raw !== 'object') return detailSum
-          const detail = raw as { text?: unknown; summary?: unknown; data?: unknown }
-          return (
-            detailSum +
-            (typeof detail.text === 'string' ? detail.text.length : 0) +
-            (typeof detail.summary === 'string' ? detail.summary.length : 0) +
-            (typeof detail.data === 'string' ? detail.data.length : 0)
-          )
+        event.mutations.reduce((length, mutation) => {
+          if (mutation.kind === 'visible-append' || mutation.kind === 'carrier-append') {
+            return length + mutation.delta.length
+          }
+          return length
         }, 0)
       )
     }, 0)
@@ -618,7 +657,7 @@ describe('stream chunk writer', () => {
     expect(rows.length).toBeLessThan(100)
   })
 
-  it('indexes adversarial changing reasoning ids without per-event row scans or alias growth', async () => {
+  it('does not retain identity maps for adversarial changing reasoning ids', async () => {
     let persistedRows = 0
     const writer = createWriter(
       {
@@ -631,62 +670,32 @@ describe('stream chunk writer', () => {
     const rowCount = 20_000
 
     for (let index = 0; index < rowCount; index += 1) {
-      writer.append(
-        {
-          lane: 'reasoning',
-          detailsMode: 'delta',
-          details: [
-            {
-              type: 'reasoning.text',
-              id: `changing-id-${index}`,
-              index: 0,
-              format: 'unknown',
-              text: 'x',
-            },
-          ],
-        },
-        101 + index,
-      )
+      writer.append(reasoningAppend(reasoningPart(`changing-id-${index}`), 'x'), 101 + index)
     }
 
-    expect(writer.inspect()).toMatchObject({
-      trackedReasoningRows: rowCount,
-      trackedReasoningIds: rowCount,
-    })
+    expect(writer.inspect()).not.toHaveProperty('trackedReasoningRows')
+    expect(writer.inspect()).not.toHaveProperty('trackedReasoningIds')
     await writer.settle()
 
     expect(persistedRows).toBe(rowCount)
   })
 
-  it('keeps one canonical reasoning identity for a long stable-id stream', async () => {
+  it('coalesces one stable reasoning identity without retaining an identity map', async () => {
     const writer = createWriter({ appendStreamChunks: async () => undefined }, 100)
     const chunkCount = 20_000
+    const part = reasoningPart('stable-reasoning-id')
 
     for (let index = 0; index < chunkCount; index += 1) {
-      writer.append(
-        {
-          lane: 'reasoning',
-          detailsMode: 'delta',
-          details: [
-            {
-              type: 'reasoning.text',
-              id: 'stable-reasoning-id',
-              index: 0,
-              format: 'unknown',
-              text: 'x',
-            },
-          ],
-        },
-        101 + index,
-      )
+      writer.append(reasoningAppend(part, 'x'), 101 + index)
     }
 
-    expect(writer.inspect()).toMatchObject({ trackedReasoningRows: 1, trackedReasoningIds: 1 })
+    expect(writer.inspect()).not.toHaveProperty('trackedReasoningRows')
+    expect(writer.inspect()).not.toHaveProperty('trackedReasoningIds')
     await writer.settle()
   })
 
-  it('replays an equal cumulative mirror after a scalar delta without duplication', async () => {
-    const rows: StreamChunkRow[] = []
+  it('replays a canonical replacement after prior appends without duplication', async () => {
+    const rows: TestSemanticJournalRow[] = []
     const writer = createWriter(
       {
         appendStreamChunks: async (batch) => {
@@ -695,21 +704,22 @@ describe('stream chunk writer', () => {
       },
       100,
     )
-    const trace: Array<{ event: StreamLaneEvent; createdAt: number }> = [
+    const part = reasoningPart('replacement')
+    const trace: Array<{ event: CanonicalStreamEventV2; createdAt: number }> = [
       {
-        event: {
-          lane: 'reasoning',
-          detailsMode: 'delta',
-          details: [{ type: 'reasoning.text', index: 0, text: 'a' }],
-        },
+        event: reasoningAppend(part, 'a'),
         createdAt: 101,
       },
-      { event: { lane: 'reasoning', textDelta: 'b' }, createdAt: 102 },
+      { event: reasoningAppend(part, 'b'), createdAt: 102 },
       {
         event: {
           lane: 'reasoning',
-          detailsMode: 'cumulative',
-          details: [{ type: 'reasoning.text', index: 0, text: 'ab' }],
+          mutations: [
+            {
+              kind: 'replace',
+              envelope: { schemaVersion: 2, visible: [{ ...part, text: 'ab' }], carriers: [] },
+            },
+          ],
         },
         createdAt: 103,
       },
@@ -719,13 +729,17 @@ describe('stream chunk writer', () => {
     await writer.settle()
 
     const original = replayStreamAccumulator({ initialContent: [], now: 100, entries: trace })
-    const replayed = replayStreamAccumulator({ initialContent: [], now: 100, entries: rows })
+    const replayed = replayStreamAccumulator({
+      initialContent: [],
+      now: 100,
+      entries: replayEntries(rows),
+    })
     expect(replayed.final).toEqual(original.final)
-    expect(replayed.final.reasoningDetails?.[0]).toMatchObject({ text: 'ab' })
+    expect(replayed.final.reasoningEnvelope?.visible[0]).toEqual({ ...part, text: 'ab' })
   })
 
   it('bounds coalescing sections and reduces a 100k plus 100k trace to twelve rows', async () => {
-    const rows: StreamChunkRow[] = []
+    const rows: TestSemanticJournalRow[] = []
     const writer = createWriter(
       {
         appendStreamChunks: async (batch) => {
@@ -737,12 +751,10 @@ describe('stream chunk writer', () => {
     const chunkChars = 128
     const laneChars = 100_000
     const chunksPerLane = Math.ceil(laneChars / chunkChars)
+    const part = reasoningPart('bounded')
     for (let index = 0; index < chunksPerLane; index += 1) {
       const length = Math.min(chunkChars, laneChars - index * chunkChars)
-      writer.append(
-        { lane: 'reasoning', textDelta: 'r'.repeat(length), chunkId: `reason-${index}` },
-        101 + index,
-      )
+      writer.append(reasoningAppend(part, 'r'.repeat(length)), 101 + index)
     }
     for (let index = 0; index < chunksPerLane; index += 1) {
       const length = Math.min(chunkChars, laneChars - index * chunkChars)
@@ -758,20 +770,28 @@ describe('stream chunk writer', () => {
     expect(rows).toHaveLength(12)
     expect(
       rows.reduce((sum, row) => {
-        const event = row.event as StreamLaneEvent
+        const event = row.event as CanonicalStreamEventV2
         return sum + (event.lane === 'text' ? event.text.length : 0)
       }, 0),
     ).toBe(laneChars)
     expect(
       rows.reduce((sum, row) => {
-        const event = row.event as StreamLaneEvent
-        return sum + (event.lane === 'reasoning' ? (event.textDelta?.length ?? 0) : 0)
+        const event = row.event as CanonicalStreamEventV2
+        if (event.lane !== 'reasoning') return sum
+        return (
+          sum +
+          event.mutations.reduce(
+            (length, mutation) =>
+              length + (mutation.kind === 'visible-append' ? mutation.delta.length : 0),
+            0,
+          )
+        )
       }, 0),
     ).toBe(laneChars)
   })
 
   it('coalesces a million-character tool-call lane and crash-replays every argument byte', async () => {
-    const rows: StreamChunkRow[] = []
+    const rows: TestSemanticJournalRow[] = []
     const writer = createWriter(
       {
         appendStreamChunks: async (batch) => {
@@ -799,8 +819,14 @@ describe('stream chunk writer', () => {
 
     expect(fragment.length * chunks).toBeGreaterThan(1_000_000)
     expect(rows.length).toBeLessThan(chunks / 100)
-    expect(rows.every((row) => (row.event as StreamLaneEvent).lane === 'tool-call')).toBe(true)
-    const replayed = replayStreamAccumulator({ initialContent: [], now: 100, entries: rows })
+    expect(rows.every((row) => (row.event as CanonicalStreamEventV2).lane === 'tool-call')).toBe(
+      true,
+    )
+    const replayed = replayStreamAccumulator({
+      initialContent: [],
+      now: 100,
+      entries: replayEntries(rows),
+    })
     expect(replayed.final.toolCalls).toEqual([
       {
         id: 'call-long',
@@ -811,7 +837,7 @@ describe('stream chunk writer', () => {
   })
 
   it('never coalesces across a successful flush boundary', async () => {
-    const batches: StreamChunkRow[][] = []
+    const batches: TestSemanticJournalRow[][] = []
     const writer = createWriter(
       {
         appendStreamChunks: async (rows) => {
@@ -837,8 +863,8 @@ describe('stream chunk writer', () => {
   it('requeues a failed batch ahead of rows received during the write', async () => {
     vi.useFakeTimers()
     const firstWrite = deferred<void>()
-    const batches: StreamChunkRow[][] = []
-    const appendStreamChunks = vi.fn((rows: readonly StreamChunkRow[]) => {
+    const batches: TestSemanticJournalRow[][] = []
+    const appendStreamChunks = vi.fn((rows: readonly TestSemanticJournalRow[]) => {
       batches.push([...rows])
       return batches.length === 1 ? firstWrite.promise : Promise.resolve()
     })
@@ -846,7 +872,7 @@ describe('stream chunk writer', () => {
 
     writer.append({ lane: 'text', text: 'first' }, 101)
     const flush = writer.flush()
-    expect(writer.inspect()).toMatchObject({ status: 'flushing', bufferedRows: 0 })
+    expect(writer.inspect()).toMatchObject({ status: 'flushing', bufferedRows: 1 })
     writer.append({ lane: 'text', text: 'second' }, 102)
     writer.flush({ mode: 'scheduled', now: 102 })
     firstWrite.reject(new Error('write failed'))
@@ -860,23 +886,22 @@ describe('stream chunk writer', () => {
     expect(degraded.failure).toBeInstanceOf(Error)
     if (!(degraded.failure instanceof Error)) throw new Error('expected writer failure')
     expect(degraded.failure.message).toBe('write failed')
-    await writer.flush()
+    await writer.settle()
 
-    expect(batches).toHaveLength(2)
+    expect(batches).toHaveLength(3)
     expect(batches[0]?.map((row) => row.event)).toEqual([{ lane: 'text', text: 'first' }])
-    expect(batches[1]?.map((row) => row.event)).toEqual([
-      { lane: 'text', text: 'first' },
-      { lane: 'text', text: 'second' },
-    ])
-    expect(batches[1]?.map((row) => row.seq)).toEqual([0, 1])
+    expect(batches[1]?.map((row) => row.event)).toEqual([{ lane: 'text', text: 'first' }])
+    expect(batches[2]?.map((row) => row.event)).toEqual([{ lane: 'text', text: 'second' }])
+    expect(batches.map((batch) => batch.map((row) => row.seq))).toEqual([[0], [0], [1]])
+    expect(batches[1]?.[0]).toEqual(batches[0]?.[0])
     expect(writer.inspect()).toMatchObject({ status: 'open', bufferedRows: 0 })
   })
 
   it('retries already-materialized coalesced rows without copying or reordering their tail', async () => {
     vi.useFakeTimers()
     const firstWrite = deferred<void>()
-    const batches: StreamChunkRow[][] = []
-    const appendStreamChunks = vi.fn((rows: readonly StreamChunkRow[]) => {
+    const batches: TestSemanticJournalRow[][] = []
+    const appendStreamChunks = vi.fn((rows: readonly TestSemanticJournalRow[]) => {
       batches.push(structuredClone([...rows]))
       return batches.length === 1 ? firstWrite.promise : Promise.resolve()
     })
@@ -891,25 +916,30 @@ describe('stream chunk writer', () => {
     firstWrite.reject(new Error('write failed'))
 
     await expect(flush).rejects.toThrow('write failed')
-    await writer.flush()
+    await writer.settle()
 
     expect(batches.map((batch) => batch.map((row) => row.event))).toEqual([
       [{ lane: 'text', text: 'abc' }],
-      [
-        { lane: 'text', text: 'abc' },
-        { lane: 'text', text: 'de' },
-      ],
+      [{ lane: 'text', text: 'abc' }],
+      [{ lane: 'text', text: 'de' }],
     ])
-    expect(batches[1]?.map((row) => row.seq)).toEqual([0, 1])
+    expect(
+      batches
+        .slice(1)
+        .flat()
+        .map((row) => row.seq),
+    ).toEqual([0, 1])
     expect(batches[1]?.[0]).toEqual(batches[0]?.[0])
   })
 
-  it('batches independent stream writers that flush through the same port instance', async () => {
+  it('starts independent stream owners concurrently through the same port instance', async () => {
     const write = deferred<void>()
-    const batches: StreamChunkRow[][] = []
-    const port: StreamChunkAppendPort = {
-      appendStreamChunks: vi.fn((rows: readonly StreamChunkRow[]) => {
+    const bothStarted = deferred<void>()
+    const batches: TestSemanticJournalRow[][] = []
+    const port: LogicalStreamJournalAppendPort = {
+      appendStreamChunks: vi.fn((rows: readonly TestSemanticJournalRow[]) => {
         batches.push(structuredClone([...rows]))
+        if (batches.length === 2) bothStarted.resolve(undefined)
         return write.promise
       }),
     }
@@ -928,19 +958,22 @@ describe('stream chunk writer', () => {
     const firstFlush = first.flush()
     const secondFlush = second.flush()
     expect(port.appendStreamChunks).not.toHaveBeenCalled()
-    await Promise.resolve()
+    await bothStarted.promise
 
-    expect(port.appendStreamChunks).toHaveBeenCalledTimes(1)
-    expect(batches[0]?.map((row) => row.streamId)).toEqual(['stream-1', 'stream-2'])
+    expect(port.appendStreamChunks).toHaveBeenCalledTimes(2)
+    expect(batches.map((batch) => batch.map((row) => row.streamId))).toEqual([
+      ['stream-1'],
+      ['stream-2'],
+    ])
     write.resolve()
 
     await expect(Promise.all([firstFlush, secondFlush])).resolves.toEqual([undefined, undefined])
   })
 
   it('bounds the aggregate transaction size across many ready writers', async () => {
-    const batches: StreamChunkRow[][] = []
-    const port: StreamChunkAppendPort = {
-      appendStreamChunks: vi.fn(async (rows: readonly StreamChunkRow[]) => {
+    const batches: TestSemanticJournalRow[][] = []
+    const port: LogicalStreamJournalAppendPort = {
+      appendStreamChunks: vi.fn(async (rows: readonly TestSemanticJournalRow[]) => {
         batches.push(structuredClone([...rows]))
       }),
     }
@@ -965,12 +998,16 @@ describe('stream chunk writer', () => {
     expect(new Set(batches.flat().map((row) => row.streamId)).size).toBe(writers.length)
   })
 
-  it('starts the next same-port batch immediately after an in-flight write', async () => {
+  it('starts the next same-port owner without waiting for an in-flight owner', async () => {
     const writes = [deferred<void>(), deferred<void>()]
-    const batches: StreamChunkRow[][] = []
-    const port: StreamChunkAppendPort = {
-      appendStreamChunks: vi.fn((rows: readonly StreamChunkRow[]) => {
+    const firstStarted = deferred<void>()
+    const secondStarted = deferred<void>()
+    const batches: TestSemanticJournalRow[][] = []
+    const port: LogicalStreamJournalAppendPort = {
+      appendStreamChunks: vi.fn((rows: readonly TestSemanticJournalRow[]) => {
         batches.push(structuredClone([...rows]))
+        if (batches.length === 1) firstStarted.resolve(undefined)
+        if (batches.length === 2) secondStarted.resolve(undefined)
         return writes[batches.length - 1]?.promise ?? Promise.resolve()
       }),
     }
@@ -986,16 +1023,17 @@ describe('stream chunk writer', () => {
     first.append({ lane: 'text', text: 'first' }, 101)
 
     const firstFlush = first.flush()
-    await Promise.resolve()
+    await firstStarted.promise
     expect(port.appendStreamChunks).toHaveBeenCalledTimes(1)
 
     second.append({ lane: 'text', text: 'second' }, 102)
     const secondFlush = second.flush()
-    await Promise.resolve()
+    expect(second.inspect()).toMatchObject({ status: 'flushing' })
     expect(port.appendStreamChunks).toHaveBeenCalledTimes(1)
 
     writes[0]?.resolve()
     await firstFlush
+    await secondStarted.promise
     expect(port.appendStreamChunks).toHaveBeenCalledTimes(2)
     expect(batches.map((batch) => batch[0]?.streamId)).toEqual(['stream-1', 'stream-2'])
 
@@ -1005,12 +1043,16 @@ describe('stream chunk writer', () => {
 
   it('applies lossless backpressure while an append is pending', async () => {
     const firstWrite = deferred<void>()
-    const committed: StreamChunkRow[] = []
+    const firstWriteStarted = deferred<void>()
+    const committed: TestSemanticJournalRow[] = []
     let writes = 0
-    const port: StreamChunkAppendPort = {
-      appendStreamChunks: vi.fn(async (rows: readonly StreamChunkRow[]) => {
+    const port: LogicalStreamJournalAppendPort = {
+      appendStreamChunks: vi.fn(async (rows: readonly TestSemanticJournalRow[]) => {
         writes += 1
-        if (writes === 1) await firstWrite.promise
+        if (writes === 1) {
+          firstWriteStarted.resolve(undefined)
+          await firstWrite.promise
+        }
         committed.push(...structuredClone([...rows]))
       }),
     }
@@ -1018,7 +1060,7 @@ describe('stream chunk writer', () => {
 
     writer.append({ lane: 'text', text: 'a'.repeat(128 * 1024) }, 101)
     writer.flush({ mode: 'scheduled', now: 101 })
-    await drainMicrotasks()
+    await firstWriteStarted.promise
     expect(port.appendStreamChunks).toHaveBeenCalledTimes(1)
 
     let pressure: Promise<void> | undefined
@@ -1050,7 +1092,7 @@ describe('stream chunk writer', () => {
     const replay = replayStreamAccumulator({
       initialContent: [],
       now: 100,
-      entries: committed,
+      entries: replayEntries(committed),
     })
     expect(replay.final.content).toEqual([
       { type: 'output_text', text: `${'a'.repeat(128 * 1024)}${appendedTail}` },
@@ -1058,11 +1100,11 @@ describe('stream chunk writer', () => {
   })
 
   it('retries one transient append failure under backpressure without dropping the stream tail', async () => {
-    const committed: StreamChunkRow[] = []
+    const committed: TestSemanticJournalRow[] = []
     let writes = 0
     const writer = createWriter(
       {
-        appendStreamChunks: vi.fn(async (rows: readonly StreamChunkRow[]) => {
+        appendStreamChunks: vi.fn(async (rows: readonly TestSemanticJournalRow[]) => {
           writes += 1
           if (writes === 1) throw new Error('transient IndexedDB failure')
           committed.push(...structuredClone([...rows]))
@@ -1079,19 +1121,35 @@ describe('stream chunk writer', () => {
 
     expect(writes).toBe(2)
     expect(writer.inspect()).toMatchObject({ status: 'open', bufferedRows: 0, bufferedBytes: 0 })
-    const replay = replayStreamAccumulator({ initialContent: [], now: 100, entries: committed })
+    const replay = replayStreamAccumulator({
+      initialContent: [],
+      now: 100,
+      entries: replayEntries(committed),
+    })
     expect(replay.final.content).toEqual([{ type: 'output_text', text: 'x'.repeat(512) }])
   })
 
   it('bounds and exactly drains 100 writers sharing one slow append port', async () => {
-    const firstWrite = deferred<void>()
-    const committed: StreamChunkRow[] = []
+    const firstWave = deferred<void>()
+    const concurrencyLimitReached = deferred<void>()
+    const committed: TestSemanticJournalRow[] = []
     let writes = 0
-    const port: StreamChunkAppendPort = {
-      appendStreamChunks: vi.fn(async (rows: readonly StreamChunkRow[]) => {
+    let active = 0
+    let peakActive = 0
+    const port: LogicalStreamJournalAppendPort = {
+      appendStreamChunks: vi.fn(async (rows: readonly TestSemanticJournalRow[]) => {
         writes += 1
-        if (writes === 1) await firstWrite.promise
-        committed.push(...structuredClone([...rows]))
+        active += 1
+        peakActive = Math.max(peakActive, active)
+        if (active === SHARED_APPEND_MAX_CONCURRENT_OWNERS) {
+          concurrencyLimitReached.resolve(undefined)
+        }
+        try {
+          await firstWave.promise
+          committed.push(...structuredClone([...rows]))
+        } finally {
+          active -= 1
+        }
       }),
     }
     const writers = Array.from({ length: 100 }, (_, index) =>
@@ -1111,8 +1169,8 @@ describe('stream chunk writer', () => {
       }
       writer.flush({ mode: 'scheduled', now: 356 })
     }
-    await drainMicrotasks()
-    expect(port.appendStreamChunks).toHaveBeenCalledTimes(1)
+    await concurrencyLimitReached.promise
+    expect(port.appendStreamChunks).toHaveBeenCalledTimes(SHARED_APPEND_MAX_CONCURRENT_OWNERS)
 
     const pressure = writers.map((writer) => {
       for (let index = 0; index < 512; index += 1) {
@@ -1121,15 +1179,16 @@ describe('stream chunk writer', () => {
       }
       const waiting = writer.backpressure()
       expect(waiting).toBeInstanceOf(Promise)
-      expect(writer.inspect()).toMatchObject({ bufferedRows: 512 })
+      expect(writer.inspect()).toMatchObject({ bufferedRows: 768 })
       return waiting as Promise<void>
     })
 
-    firstWrite.resolve()
+    firstWave.resolve()
     await Promise.all(pressure)
     await Promise.all(writers.map((writer) => writer.settle()))
 
-    expect(port.appendStreamChunks).toHaveBeenCalledTimes(2)
+    expect(writes).toBe(200)
+    expect(peakActive).toBe(SHARED_APPEND_MAX_CONCURRENT_OWNERS)
     for (let index = 0; index < writers.length; index += 1) {
       const rows = committed.filter((row) => row.streamId === `stream-${index}`)
       expect(rows.map((row) => row.seq)).toEqual([0, 1, 2])
@@ -1146,14 +1205,27 @@ describe('stream chunk writer', () => {
     }
   })
 
-  it('drains shared requests across queue compaction boundaries in bounded FIFO batches', async () => {
-    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+  it('bounds owner concurrency while draining shared requests across queue compaction boundaries', async () => {
     const batchSizes: number[] = []
     const committedStreamIds: string[] = []
-    const port: StreamChunkAppendPort = {
-      appendStreamChunks: vi.fn(async (rows: readonly StreamChunkRow[]) => {
-        batchSizes.push(rows.length)
-        committedStreamIds.push(...rows.map((row) => row.streamId))
+    const firstWave = deferred<void>()
+    const concurrencyLimitReached = deferred<void>()
+    let active = 0
+    let peakActive = 0
+    const port: LogicalStreamJournalAppendPort = {
+      appendStreamChunks: vi.fn(async (rows: readonly TestSemanticJournalRow[]) => {
+        active += 1
+        peakActive = Math.max(peakActive, active)
+        if (active === SHARED_APPEND_MAX_CONCURRENT_OWNERS) {
+          concurrencyLimitReached.resolve(undefined)
+        }
+        try {
+          await firstWave.promise
+          batchSizes.push(rows.length)
+          committedStreamIds.push(...rows.map((row) => row.streamId))
+        } finally {
+          active -= 1
+        }
       }),
     }
     const writerCount = 4_097
@@ -1171,21 +1243,31 @@ describe('stream chunk writer', () => {
       return writer
     })
 
-    await Promise.all(writers.map((writer) => writer.flush()))
+    const flushes = writers.map((writer) => writer.flush())
+    await concurrencyLimitReached.promise
+    expect(peakActive).toBe(SHARED_APPEND_MAX_CONCURRENT_OWNERS)
+    expect(port.appendStreamChunks).toHaveBeenCalledTimes(SHARED_APPEND_MAX_CONCURRENT_OWNERS)
+    firstWave.resolve()
+    await Promise.all(flushes)
 
-    expect(batchSizes).toEqual([2_048, 2_048, 1])
-    expect(committedStreamIds).toEqual(
-      Array.from({ length: writerCount }, (_, index) => `compaction-stream-${index}`),
+    expect(batchSizes).toHaveLength(writerCount)
+    expect(batchSizes.every((size) => size === 1)).toBe(true)
+    expect(new Set(committedStreamIds)).toEqual(
+      new Set(Array.from({ length: writerCount }, (_, index) => `compaction-stream-${index}`)),
     )
   })
 
-  it('drains later same-port calls after an in-flight batch fails', async () => {
+  it('isolates an in-flight owner failure from a later same-port owner', async () => {
     const firstWrite = deferred<void>()
+    const firstStarted = deferred<void>()
+    const secondStarted = deferred<void>()
     const failure = new Error('first transaction failed')
-    const batches: StreamChunkRow[][] = []
-    const port: StreamChunkAppendPort = {
-      appendStreamChunks: vi.fn((rows: readonly StreamChunkRow[]) => {
+    const batches: TestSemanticJournalRow[][] = []
+    const port: LogicalStreamJournalAppendPort = {
+      appendStreamChunks: vi.fn((rows: readonly TestSemanticJournalRow[]) => {
         batches.push(structuredClone([...rows]))
+        if (batches.length === 1) firstStarted.resolve(undefined)
+        if (batches.length === 2) secondStarted.resolve(undefined)
         return batches.length === 1 ? firstWrite.promise : Promise.resolve()
       }),
     }
@@ -1201,7 +1283,7 @@ describe('stream chunk writer', () => {
     first.append({ lane: 'text', text: 'first' }, 101)
 
     const firstFlush = first.flush()
-    await Promise.resolve()
+    await firstStarted.promise
     expect(port.appendStreamChunks).toHaveBeenCalledTimes(1)
 
     second.append({ lane: 'text', text: 'second' }, 102)
@@ -1209,6 +1291,7 @@ describe('stream chunk writer', () => {
     firstWrite.reject(failure)
 
     await expect(firstFlush).rejects.toBe(failure)
+    await secondStarted.promise
     await expect(secondFlush).resolves.toBeUndefined()
     expect(port.appendStreamChunks).toHaveBeenCalledTimes(2)
     expect(batches.map((batch) => batch[0]?.streamId)).toEqual(['stream-1', 'stream-2'])
@@ -1218,9 +1301,11 @@ describe('stream chunk writer', () => {
 
   it('lets independent stream writers flush concurrently through different port instances', async () => {
     const writes = [deferred<void>(), deferred<void>()]
-    const batches: StreamChunkRow[][] = []
-    const appendStreamChunks = vi.fn((rows: readonly StreamChunkRow[]) => {
+    const bothStarted = deferred<void>()
+    const batches: TestSemanticJournalRow[][] = []
+    const appendStreamChunks = vi.fn((rows: readonly TestSemanticJournalRow[]) => {
       batches.push(structuredClone([...rows]))
+      if (batches.length === 2) bothStarted.resolve(undefined)
       return writes[batches.length - 1]?.promise ?? Promise.resolve()
     })
     const first = createWriter({ appendStreamChunks }, 100)
@@ -1237,7 +1322,7 @@ describe('stream chunk writer', () => {
 
     const firstFlush = first.flush()
     const secondFlush = second.flush()
-    await Promise.resolve()
+    await bothStarted.promise
     expect(appendStreamChunks).toHaveBeenCalledTimes(2)
     expect(batches.map((batch) => batch[0]?.streamId)).toEqual(['stream-1', 'stream-2'])
     writes[0]?.resolve()
@@ -1246,12 +1331,12 @@ describe('stream chunk writer', () => {
     await expect(Promise.all([firstFlush, secondFlush])).resolves.toEqual([undefined, undefined])
   })
 
-  it('rejects a failed shared batch and retries every writer without row loss or reordering', async () => {
+  it('isolates a failed owner and retries it without row loss or reordering', async () => {
     const failure = new Error('shared transaction failed')
-    const batches: StreamChunkRow[][] = []
-    const committed: StreamChunkRow[] = []
-    const port: StreamChunkAppendPort = {
-      appendStreamChunks: vi.fn(async (rows: readonly StreamChunkRow[]) => {
+    const batches: TestSemanticJournalRow[][] = []
+    const committed: TestSemanticJournalRow[] = []
+    const port: LogicalStreamJournalAppendPort = {
+      appendStreamChunks: vi.fn(async (rows: readonly TestSemanticJournalRow[]) => {
         const batch = structuredClone([...rows])
         batches.push(batch)
         if (batches.length === 1) throw failure
@@ -1272,39 +1357,46 @@ describe('stream chunk writer', () => {
 
     const firstAttempt = await Promise.allSettled([first.flush(), second.flush()])
 
-    expect(firstAttempt).toEqual([
-      { status: 'rejected', reason: failure },
-      { status: 'rejected', reason: failure },
-    ])
-    expect(batches[0]?.map((row) => `${row.streamId}:${row.seq}`)).toEqual([
-      'stream-1:0',
-      'stream-2:0',
-    ])
+    expect(firstAttempt[0]).toEqual({ status: 'rejected', reason: failure })
+    expect(firstAttempt[1]).toEqual({ status: 'fulfilled', value: undefined })
+    expect(
+      batches.slice(0, 2).map((batch) => batch.map((row) => `${row.streamId}:${row.seq}`)),
+    ).toEqual([['stream-1:0'], ['stream-2:0']])
     first.append({ lane: 'text', text: 'first-b' }, 103)
     second.append({ lane: 'text', text: 'second-b' }, 104)
 
     await Promise.all([first.settle(), second.settle()])
 
-    expect(port.appendStreamChunks).toHaveBeenCalledTimes(2)
-    expect(batches[1]?.map((row) => `${row.streamId}:${row.seq}`)).toEqual([
-      'stream-1:0',
-      'stream-1:1',
-      'stream-2:0',
-      'stream-2:1',
+    expect(port.appendStreamChunks).toHaveBeenCalledTimes(5)
+    expect(
+      batches
+        .filter((batch) => batch[0]?.streamId === 'stream-1')
+        .map((batch) => batch.map((row) => row.seq)),
+    ).toEqual([[0], [0], [1]])
+    expect(
+      batches
+        .filter((batch) => batch[0]?.streamId === 'stream-2')
+        .map((batch) => batch.map((row) => row.seq)),
+    ).toEqual([[0], [1]])
+    expect(
+      committed.filter((row) => row.streamId === 'stream-1').map((row) => [row.seq, row.event]),
+    ).toEqual([
+      [0, { lane: 'text', text: 'first-a' }],
+      [1, { lane: 'text', text: 'first-b' }],
     ])
-    expect(committed.map((row) => [row.streamId, row.seq, row.event])).toEqual([
-      ['stream-1', 0, { lane: 'text', text: 'first-a' }],
-      ['stream-1', 1, { lane: 'text', text: 'first-b' }],
-      ['stream-2', 0, { lane: 'text', text: 'second-a' }],
-      ['stream-2', 1, { lane: 'text', text: 'second-b' }],
+    expect(
+      committed.filter((row) => row.streamId === 'stream-2').map((row) => [row.seq, row.event]),
+    ).toEqual([
+      [0, { lane: 'text', text: 'second-a' }],
+      [1, { lane: 'text', text: 'second-b' }],
     ])
   })
 
   it('isolates a stale stream fence without failing a healthy writer in the shared batch', async () => {
-    const committed: StreamChunkRow[] = []
+    const committed: TestSemanticJournalRow[] = []
     const batches: string[][] = []
-    const port: StreamChunkAppendPort = {
-      appendStreamChunks: vi.fn(async (rows: readonly StreamChunkRow[]) => {
+    const port: LogicalStreamJournalAppendPort = {
+      appendStreamChunks: vi.fn(async (rows: readonly TestSemanticJournalRow[]) => {
         batches.push(rows.map((row) => row.streamId))
         if (rows.some((row) => row.streamId === 'stream-stale')) {
           throw new Error('StreamFenceLost:stream-stale')
@@ -1341,11 +1433,7 @@ describe('stream chunk writer', () => {
     if (!(staleReason instanceof Error)) throw new Error('expected stale writer error')
     expect(staleReason.message).toBe('StreamFenceLost:stream-stale')
     expect(results[1]).toEqual({ status: 'fulfilled', value: undefined })
-    expect(batches).toEqual([
-      ['stream-stale', 'stream-healthy'],
-      ['stream-stale'],
-      ['stream-healthy'],
-    ])
+    expect(batches).toEqual([['stream-stale'], ['stream-healthy']])
     expect(committed.map((row) => [row.streamId, row.seq, row.event])).toEqual([
       ['stream-healthy', 0, { lane: 'text', text: 'healthy' }],
     ])
@@ -1356,8 +1444,8 @@ describe('stream chunk writer', () => {
   it('settlement retries one failed in-flight write and persists its concurrent tail', async () => {
     vi.useFakeTimers()
     const firstWrite = deferred<void>()
-    const batches: StreamChunkRow[][] = []
-    const appendStreamChunks = vi.fn((rows: readonly StreamChunkRow[]) => {
+    const batches: TestSemanticJournalRow[][] = []
+    const appendStreamChunks = vi.fn((rows: readonly TestSemanticJournalRow[]) => {
       batches.push([...rows])
       return batches.length === 1 ? firstWrite.promise : Promise.resolve()
     })
@@ -1372,10 +1460,8 @@ describe('stream chunk writer', () => {
     await expect(settlement).resolves.toBeUndefined()
     expect(batches.map((batch) => batch.map((row) => row.event))).toEqual([
       [{ lane: 'text', text: 'first' }],
-      [
-        { lane: 'text', text: 'first' },
-        { lane: 'text', text: 'second' },
-      ],
+      [{ lane: 'text', text: 'first' }],
+      [{ lane: 'text', text: 'second' }],
     ])
     expect(writer.inspect()).toMatchObject({ status: 'open', bufferedRows: 0 })
     expect(vi.getTimerCount()).toBe(0)
@@ -1383,8 +1469,8 @@ describe('stream chunk writer', () => {
 
   it('settlement retries a transient failure from its own forced flush', async () => {
     vi.useFakeTimers()
-    const batches: StreamChunkRow[][] = []
-    const appendStreamChunks = vi.fn(async (rows: readonly StreamChunkRow[]) => {
+    const batches: TestSemanticJournalRow[][] = []
+    const appendStreamChunks = vi.fn(async (rows: readonly TestSemanticJournalRow[]) => {
       batches.push([...rows])
       if (batches.length === 1) throw new Error('transient write failure')
     })
@@ -1403,8 +1489,8 @@ describe('stream chunk writer', () => {
 
   it('requeues a synchronously thrown port failure', async () => {
     const failure = new Error('synchronous write failure')
-    const batches: StreamChunkRow[][] = []
-    const appendStreamChunks = vi.fn((rows: readonly StreamChunkRow[]): Promise<void> => {
+    const batches: TestSemanticJournalRow[][] = []
+    const appendStreamChunks = vi.fn((rows: readonly TestSemanticJournalRow[]): Promise<void> => {
       batches.push([...rows])
       if (batches.length === 1) throw failure
       return Promise.resolve()
@@ -1419,8 +1505,8 @@ describe('stream chunk writer', () => {
   })
 
   it('checkpoint retries one transient write before acknowledging a visible prefix', async () => {
-    const batches: StreamChunkRow[][] = []
-    const appendStreamChunks = vi.fn(async (rows: readonly StreamChunkRow[]) => {
+    const batches: TestSemanticJournalRow[][] = []
+    const appendStreamChunks = vi.fn(async (rows: readonly TestSemanticJournalRow[]) => {
       batches.push([...rows])
       if (batches.length === 1) throw new Error('transient write failure')
     })
@@ -1441,7 +1527,7 @@ describe('stream chunk writer', () => {
     const firstFailure = new Error('first write failed')
     const permanentFailure = new Error('storage unavailable')
     const appendStreamChunks = vi
-      .fn<StreamChunkAppendPort['appendStreamChunks']>()
+      .fn<LogicalStreamJournalAppendPort['appendStreamChunks']>()
       .mockRejectedValueOnce(firstFailure)
       .mockRejectedValue(permanentFailure)
     const writer = createWriter({ appendStreamChunks }, 100)
@@ -1466,7 +1552,7 @@ describe('stream chunk writer', () => {
 
   it('bounds degraded recovery buffering by row count', async () => {
     vi.useFakeTimers()
-    const appendStreamChunks = vi.fn(async (_rows: readonly StreamChunkRow[]) => {
+    const appendStreamChunks = vi.fn(async (_rows: readonly TestSemanticJournalRow[]) => {
       throw new Error('write failed')
     })
     const writer = createWriter({ appendStreamChunks }, 100)
@@ -1484,7 +1570,7 @@ describe('stream chunk writer', () => {
       }
     }
 
-    expect(capacityError).toMatchObject({ name: 'StreamChunkRecoveryCapacityError' })
+    expect(capacityError).toMatchObject({ name: 'StreamJournalRecoveryCapacityError' })
     expect(writer.inspect()).toMatchObject({
       status: 'failed',
       bufferedRows: 2_048,
@@ -1492,14 +1578,14 @@ describe('stream chunk writer', () => {
     })
     expect(vi.getTimerCount()).toBe(0)
     expect(() => writer.append({ lane: 'text', text: 'too late' }, 10_000)).toThrow(
-      'Stream chunk recovery buffer exceeded',
+      'Stream journal recovery buffer exceeded',
     )
     await expect(writer.settle()).rejects.toBe(capacityError)
   })
 
   it('bounds degraded recovery buffering by estimated bytes', async () => {
     vi.useFakeTimers()
-    const appendStreamChunks = vi.fn(async (_rows: readonly StreamChunkRow[]) => {
+    const appendStreamChunks = vi.fn(async (_rows: readonly TestSemanticJournalRow[]) => {
       throw new Error('write failed')
     })
     const writer = createWriter({ appendStreamChunks }, 100)
@@ -1508,7 +1594,7 @@ describe('stream chunk writer', () => {
     await expect(writer.flush()).rejects.toThrow('write failed')
 
     expect(() => writer.append({ lane: 'text', text: 'x'.repeat(2 * 1024 * 1024) }, 102)).toThrow(
-      'Stream chunk recovery buffer exceeded',
+      'Stream journal recovery buffer exceeded',
     )
     const failed = writer.inspect()
     expect(failed).toMatchObject({
@@ -1517,13 +1603,13 @@ describe('stream chunk writer', () => {
     })
     expect(failed.failure).toBeInstanceOf(Error)
     if (!(failed.failure instanceof Error)) throw new Error('expected recovery capacity error')
-    expect(failed.failure.name).toBe('StreamChunkRecoveryCapacityError')
+    expect(failed.failure.name).toBe('StreamJournalRecoveryCapacityError')
     expect(vi.getTimerCount()).toBe(0)
   })
 
   it('release cancels timers, closes acceptance, and cannot be reopened by a late failure', async () => {
     vi.useFakeTimers()
-    const delayedAppend = vi.fn(async (_rows: readonly StreamChunkRow[]) => {})
+    const delayedAppend = vi.fn(async (_rows: readonly TestSemanticJournalRow[]) => {})
     const delayedWriter = createWriter({ appendStreamChunks: delayedAppend }, 100)
     delayedWriter.append({ lane: 'text', text: 'delayed' }, 101)
     delayedWriter.flush({ mode: 'scheduled', now: 101 })
@@ -1534,7 +1620,7 @@ describe('stream chunk writer', () => {
     expect(delayedAppend).not.toHaveBeenCalled()
 
     const write = deferred<void>()
-    const appendStreamChunks = vi.fn((_rows: readonly StreamChunkRow[]) => write.promise)
+    const appendStreamChunks = vi.fn((_rows: readonly TestSemanticJournalRow[]) => write.promise)
     const writer = createWriter({ appendStreamChunks }, 100)
 
     writer.append({ lane: 'text', text: 'first' }, 300)
@@ -1551,14 +1637,14 @@ describe('stream chunk writer', () => {
     expect(appendStreamChunks).toHaveBeenCalledTimes(1)
     expect(writer.inspect().status).toBe('closed')
     expect(() => writer.append({ lane: 'text', text: 'too late' }, 301)).toThrow(
-      'Stream chunk writer is closed',
+      'Stream journal writer is closed',
     )
-    await expect(writer.flush()).rejects.toThrow('Stream chunk writer is closed')
+    await expect(writer.flush()).rejects.toThrow('Stream journal writer is closed')
     expect(appendStreamChunks).toHaveBeenCalledTimes(1)
   })
 })
 
-function createWriter(port: StreamChunkAppendPort, now: number) {
+function createWriter(port: LogicalStreamJournalAppendPort, now: number) {
   return createStreamChunkWriter({
     port,
     chatId: 'chat-1',
@@ -1569,11 +1655,97 @@ function createWriter(port: StreamChunkAppendPort, now: number) {
   })
 }
 
+function createStreamChunkWriter(
+  input: Omit<Parameters<typeof createCanonicalStreamJournalWriter>[0], 'permit' | 'port'> & {
+    port: LogicalStreamJournalAppendPort
+  },
+) {
+  if (!writerRootPermit) throw new Error('StreamChunkWriterTestRuntimeNotReady')
+  let canonicalPort = canonicalPorts.get(input.port)
+  if (!canonicalPort) {
+    canonicalPort = createLogicalStreamJournalAppendAdapter({
+      append: (rows) => input.port.appendStreamChunks(rows),
+    })
+    canonicalPorts.set(input.port, canonicalPort)
+  }
+  const writer = createCanonicalStreamJournalWriter({
+    ...input,
+    permit: reserveWorkspaceChild(writerRootPermit, 'stream-writer'),
+    port: canonicalPort,
+  })
+  activeWriters.add(writer)
+  return writer
+}
+
+function replayEntries(rows: readonly TestSemanticJournalRow[]) {
+  return rows.map(({ event, createdAt }) => {
+    const canonical = canonicalStreamEventV2FromUnknown(event)
+    if (!canonical) throw new Error('TestSemanticJournalEventInvalid')
+    return { event: canonical, createdAt }
+  })
+}
+
+function reasoningPart(
+  identity: string,
+  kind: ReasoningVisiblePartV2['kind'] = 'text',
+): Omit<ReasoningVisiblePartV2, 'text'> {
+  return {
+    id: `visible:${identity}`,
+    groupId: `group:${identity}`,
+    kind,
+    format: 'openai-responses-v1',
+    source: {
+      dialect: 'openai-responses',
+      bridge: 'openai-direct',
+      itemId: identity,
+      outputIndex: 0,
+    },
+  }
+}
+
+function reasoningCarrier(identity: string): OpaqueReasoningCarrierDescriptorV2 {
+  return {
+    id: `carrier:${identity}`,
+    groupId: `group:${identity}`,
+    kind: 'responses-encrypted',
+    format: 'openai-responses-v1',
+    source: {
+      dialect: 'openai-responses',
+      bridge: 'openai-direct',
+      itemId: identity,
+      outputIndex: 0,
+    },
+  }
+}
+
+function reasoningAppend(
+  part: Omit<ReasoningVisiblePartV2, 'text'>,
+  delta: string,
+  observedAt?: number,
+): CanonicalStreamEventV2 {
+  return {
+    lane: 'reasoning',
+    mutations: [{ kind: 'visible-append', part, delta }],
+    ...(observedAt === undefined ? {} : { observed: { firstAt: observedAt, lastAt: observedAt } }),
+  }
+}
+
+function reasoningSet(
+  part: Omit<ReasoningVisiblePartV2, 'text'>,
+  text: string,
+): CanonicalStreamEventV2 {
+  return {
+    lane: 'reasoning',
+    mutations: [{ kind: 'visible-set', part: { ...part, text } }],
+  }
+}
+
 function testFence(streamId: string) {
   return {
     ownerClientId: 'test-client',
     fenceToken: `fence:${streamId}`,
     replacementEpoch: 0,
+    admissionSequence: 1,
   }
 }
 

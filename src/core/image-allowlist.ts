@@ -2,6 +2,8 @@
 // that are trusted not to ship tracking pixels. User-added origins are
 // persisted under `settings['image-allowlist']` and appended at render time.
 
+export const IMAGE_ALLOWLIST_KEY = 'image-allowlist'
+
 export const DEFAULT_IMAGE_ORIGINS: readonly string[] = Object.freeze([
   'https://openrouter.ai',
   'https://*.openrouter.ai',
@@ -11,6 +13,13 @@ export const DEFAULT_IMAGE_ORIGINS: readonly string[] = Object.freeze([
   'data:',
   'blob:',
 ])
+
+export function customImageOriginsFromStored(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  return [
+    ...new Set(value.filter((origin): origin is string => typeof origin === 'string' && !!origin)),
+  ]
+}
 
 export function isImageOriginAllowed(url: string, allowed: readonly string[]): boolean {
   if (!url) return false

@@ -4,20 +4,19 @@
 // - validateSample() is pure — covers ingest gates (physical bounds,
 //   family bounds, outliers, short samples, bad input).
 // - charsPerToken() is pure — covers tier fallbacks + final clamp.
-// - addSampleToChatAndGlobal() mutates + writes global; the global
-//   store is stubbed via an in-memory fake (no IDB in unit tests).
+// - record updates are pure; repository atomicity is covered separately.
 // - freshTokenEstimate() is pure — covers div-by-zero + clamp.
 
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { describe, expect, it } from 'vitest'
 import {
   canonicalizeTokenCalibrationSamples,
   rebuildGlobalCalibration,
 } from '../../src/backcompat/token-calibration-global'
 import { tokenCalibrationKey } from '../../src/core/model-ids'
 import {
-  addAcceptedSampleToGlobal,
-  addSampleToChatAndGlobal,
+  addSampleToChat,
   aggregateCalibrationSamples,
+  applyAcceptedSamplesToGlobalRecord,
   applyValidatedSample,
   calibrationFieldsForCreate,
   calibrationFieldsForEdit,
@@ -28,17 +27,16 @@ import {
   derivePromptSampleFromBasis,
   FRAMING_PER_MESSAGE,
   freshTokenEstimate,
+  globalTokenCalibrationFromStored,
   MIN_SAMPLE_CHARS,
   MIN_SAMPLES_CHAT,
   MIN_SAMPLES_GLOBAL,
   messageTextCharCount,
   OUTLIER_FACTOR,
   RATIO_BOUNDS,
-  readTokenCalibrationGlobal,
-  subtractSamplesFromTokenCalibrationGlobal,
+  subtractCalibrationSamplesFromGlobalRecord,
   tokenizerFamilyForModel,
   validateSample,
-  writeTokenCalibrationGlobal,
 } from '../../src/core/token-calibration'
 import type {
   Chat,
@@ -46,43 +44,10 @@ import type {
   GlobalTokenCalibration,
   Message,
   ReasoningDetail,
+  ReasoningOriginDialect,
   TokenCalibrationSample,
 } from '../../src/core/types'
-
-// Fake settings backend. The real one is in ../../src/store/settings.ts
-// and hits Dexie. Unit tests don't boot Dexie; the module is swapped
-// out under a vi.mock.
-vi.mock('../../src/store/settings', () => {
-  const state = new Map<string, unknown>()
-  return {
-    async getSetting<T>(key: string): Promise<T | undefined> {
-      return state.get(key) as T | undefined
-    },
-    async setSetting<T>(key: string, value: T): Promise<void> {
-      state.set(key, value)
-    },
-    async updateSetting<T>(
-      key: string,
-      updater: (current: T | undefined) => T | undefined | Promise<T | undefined>,
-    ): Promise<T | undefined> {
-      const next = await updater(state.get(key) as T | undefined)
-      if (next === undefined) state.delete(key)
-      else state.set(key, next)
-      return next
-    },
-    async deleteSetting(key: string): Promise<void> {
-      state.delete(key)
-    },
-    __reset(): void {
-      state.clear()
-    },
-  }
-})
-
-beforeEach(async () => {
-  const mod = (await import('../../src/store/settings')) as unknown as { __reset(): void }
-  mod.__reset()
-})
+import { reasoningEnvelopeFromDetailsForTest } from '../helpers/reasoning-events'
 
 function emptySample(): TokenCalibrationSample {
   return { totalTextChars: 0, totalTextTokens: 0, sampleCount: 0, updatedAt: 0 }
@@ -491,10 +456,10 @@ describe('charsPerToken — tiered fallback', () => {
   })
 })
 
-describe('addSampleToChatAndGlobal', () => {
-  it('writes per-chat sample AND rolls up to global', async () => {
+describe('calibration record updates', () => {
+  it('applies one accepted sample to the chat and global records', () => {
     const chat = { tokenCalibration: {} } as Pick<Chat, 'tokenCalibration'>
-    const outcome = await addSampleToChatAndGlobal(chat, 'openai/gpt-4o', 350, 100, 1_000)
+    const outcome = addSampleToChat(chat, 'openai/gpt-4o', 350, 100, 1_000)
     expect(outcome.accepted).toBe(true)
     expect(chat.tokenCalibration?.[tokenCalibrationKey('openai/gpt-4o')]).toEqual({
       totalTextChars: 350,
@@ -503,7 +468,12 @@ describe('addSampleToChatAndGlobal', () => {
       lastRatio: 3.5,
       updatedAt: 1_000,
     })
-    const global = await readTokenCalibrationGlobal()
+    const global = applyAcceptedSamplesToGlobalRecord(
+      undefined,
+      'openai/gpt-4o',
+      [{ chars: 350, tokens: 100 }],
+      1_000,
+    )
     expect(global.byModel[tokenCalibrationKey('openai/gpt-4o')]).toEqual({
       totalTextChars: 350,
       totalTextTokens: 100,
@@ -513,17 +483,17 @@ describe('addSampleToChatAndGlobal', () => {
     })
   })
 
-  it('skips invalid samples without mutating', async () => {
+  it('skips invalid chat samples without mutating', () => {
     const chat = { tokenCalibration: {} } as Pick<Chat, 'tokenCalibration'>
-    const outcome = await addSampleToChatAndGlobal(chat, 'openai/gpt-4o', 10, 100)
+    const outcome = addSampleToChat(chat, 'openai/gpt-4o', 10, 100)
     expect(outcome.accepted).toBe(false)
     expect(chat.tokenCalibration?.[tokenCalibrationKey('openai/gpt-4o')]?.sampleCount ?? 0).toBe(0)
   })
 
-  it('accumulates across multiple calls', async () => {
+  it('accumulates across multiple chat updates', () => {
     const chat = { tokenCalibration: {} } as Pick<Chat, 'tokenCalibration'>
-    await addSampleToChatAndGlobal(chat, 'openai/gpt-4o', 350, 100, 1_000)
-    await addSampleToChatAndGlobal(chat, 'openai/gpt-4o', 1_400, 400, 2_000)
+    addSampleToChat(chat, 'openai/gpt-4o', 350, 100, 1_000)
+    addSampleToChat(chat, 'openai/gpt-4o', 1_400, 400, 2_000)
     // 350+1400 = 1750 chars, 100+400 = 500 tokens, 2 samples.
     expect(chat.tokenCalibration?.[tokenCalibrationKey('openai/gpt-4o')]).toMatchObject({
       totalTextChars: 1_750,
@@ -702,7 +672,11 @@ describe('derivePromptSample', () => {
 })
 
 describe('deriveCompletionSample', () => {
-  function assistant(text: string, details?: ReasoningDetail[]): Message {
+  function assistant(
+    text: string,
+    details?: ReasoningDetail[],
+    dialect: ReasoningOriginDialect = 'openai-responses',
+  ): Message {
     return {
       id: 'msg-a',
       chatId: 'c',
@@ -714,7 +688,9 @@ describe('deriveCompletionSample', () => {
       role: 'assistant',
       origin: 'generated',
       content: [{ type: 'output_text', text }],
-      ...(details ? { reasoningDetails: details } : {}),
+      ...(details
+        ? { reasoningEnvelope: reasoningEnvelopeFromDetailsForTest(details, dialect) }
+        : {}),
       nodeVersion: 0,
       deleted: false,
     }
@@ -752,9 +728,17 @@ describe('deriveCompletionSample', () => {
     // DeepSeek-R1 style: the reasoning was emitted inside the completion
     // stream and billed as completion_tokens.
     const sample = deriveCompletionSample({
-      assistantMessage: assistant('answer'.repeat(10), [
-        { type: 'reasoning.text', text: 'verbose reasoning text '.repeat(10) },
-      ]),
+      assistantMessage: assistant(
+        'answer'.repeat(10),
+        [
+          {
+            type: 'reasoning.text',
+            format: 'unknown',
+            text: 'verbose reasoning text '.repeat(10),
+          },
+        ],
+        'inline',
+      ),
       usage: {
         prompt_tokens: 0,
         completion_tokens: 80,
@@ -768,9 +752,18 @@ describe('deriveCompletionSample', () => {
 
   it('does not count tool-prefixed reasoning rows as inline completion text', () => {
     const sample = deriveCompletionSample({
-      assistantMessage: assistant('answer', [
-        { type: 'reasoning.text', id: 'tool_call-1', text: 'tool signature'.repeat(100) },
-      ]),
+      assistantMessage: assistant(
+        'answer',
+        [
+          {
+            type: 'reasoning.text',
+            id: 'tool_call-1',
+            format: 'unknown',
+            text: 'tool signature'.repeat(100),
+          },
+        ],
+        'inline',
+      ),
       usage: {
         prompt_tokens: 0,
         completion_tokens: 10,
@@ -1016,7 +1009,7 @@ describe('persistence round-trip', () => {
     expect(global.byModel['broken/key']).toBeUndefined()
   })
 
-  it('writeTokenCalibrationGlobal / readTokenCalibrationGlobal preserves shape', async () => {
+  it('normalizes a valid global record without changing its shape', () => {
     const value: GlobalTokenCalibration = {
       version: 1,
       updatedAt: 42,
@@ -1030,31 +1023,25 @@ describe('persistence round-trip', () => {
         },
       },
     }
-    await writeTokenCalibrationGlobal(value)
-    const readBack = await readTokenCalibrationGlobal()
+    const readBack = globalTokenCalibrationFromStored(value)
     expect(readBack.version).toBe(1)
     expect(readBack.byModel[tokenCalibrationKey('openai/gpt-4o')]?.sampleCount).toBe(4)
   })
 
-  it('reads empty when no settings key is set', async () => {
-    const empty = await readTokenCalibrationGlobal()
+  it('reads empty when no stored record exists', () => {
+    const empty = globalTokenCalibrationFromStored(undefined)
     expect(empty.version).toBe(1)
     expect(Object.keys(empty.byModel).length).toBe(0)
   })
 
-  it('normalizes malformed stored payload', async () => {
-    // Hypothetical: prior version stored a bad shape; the read must not crash.
-    const settings = (await import('../../src/store/settings')) as unknown as {
-      setSetting<T>(key: string, value: T): Promise<void>
-    }
-    await settings.setSetting('global:token-calibration', { version: 'oops' })
-    const read = await readTokenCalibrationGlobal()
+  it('normalizes malformed stored payload', () => {
+    const read = globalTokenCalibrationFromStored({ version: 'oops' })
     expect(read.version).toBe(1)
     expect(Object.keys(read.byModel).length).toBe(0)
   })
 
-  it('normalizes legacy exact-model global rows onto bucket keys on read', async () => {
-    await writeTokenCalibrationGlobal({
+  it('normalizes legacy exact-model global rows onto bucket keys on read', () => {
+    const readBack = globalTokenCalibrationFromStored({
       version: 1,
       updatedAt: 7,
       byModel: {
@@ -1066,7 +1053,6 @@ describe('persistence round-trip', () => {
         },
       },
     })
-    const readBack = await readTokenCalibrationGlobal()
     expect(readBack.byModel['oss:kimi-k2']).toMatchObject({
       totalTextChars: 300,
       totalTextTokens: 100,
@@ -1075,8 +1061,8 @@ describe('persistence round-trip', () => {
     expect(readBack.byModel['moonshotai/kimi-k2.6']).toBeUndefined()
   })
 
-  it('rolls accepted per-chat samples into global without a second ingest gate', async () => {
-    await writeTokenCalibrationGlobal({
+  it('rolls accepted per-chat samples into global without a second ingest gate', () => {
+    const stored: GlobalTokenCalibration = {
       version: 1,
       updatedAt: 10,
       byModel: {
@@ -1087,11 +1073,14 @@ describe('persistence round-trip', () => {
           updatedAt: 10,
         },
       },
-    })
+    }
 
-    await addAcceptedSampleToGlobal('openai/gpt-4o', 50, 20, 20)
-
-    const readBack = await readTokenCalibrationGlobal()
+    const readBack = applyAcceptedSamplesToGlobalRecord(
+      stored,
+      'openai/gpt-4o',
+      [{ chars: 50, tokens: 20 }],
+      20,
+    )
     expect(readBack.byModel[tokenCalibrationKey('openai/gpt-4o')]).toMatchObject({
       totalTextChars: 400,
       totalTextTokens: 120,
@@ -1101,8 +1090,8 @@ describe('persistence round-trip', () => {
     })
   })
 
-  it('subtracts cleared per-chat samples from the global materialized rollup', async () => {
-    await writeTokenCalibrationGlobal({
+  it('subtracts cleared per-chat samples from the global materialized rollup', () => {
+    const stored: GlobalTokenCalibration = {
       version: 1,
       updatedAt: 10,
       byModel: {
@@ -1119,9 +1108,10 @@ describe('persistence round-trip', () => {
           updatedAt: 10,
         },
       },
-    })
+    }
 
-    await subtractSamplesFromTokenCalibrationGlobal(
+    const readBack = subtractCalibrationSamplesFromGlobalRecord(
+      stored,
       {
         'openai/gpt-4o': {
           totalTextChars: 250,
@@ -1132,8 +1122,6 @@ describe('persistence round-trip', () => {
       },
       30,
     )
-
-    const readBack = await readTokenCalibrationGlobal()
     expect(readBack.byModel[tokenCalibrationKey('openai/gpt-4o')]).toMatchObject({
       totalTextChars: 750,
       totalTextTokens: 200,
@@ -1145,8 +1133,8 @@ describe('persistence round-trip', () => {
     ).toBe(3)
   })
 
-  it('removes a global family when subtracting all remaining chat samples', async () => {
-    await writeTokenCalibrationGlobal({
+  it('removes a global family when subtracting all remaining chat samples', () => {
+    const stored: GlobalTokenCalibration = {
       version: 1,
       updatedAt: 10,
       byModel: {
@@ -1157,9 +1145,10 @@ describe('persistence round-trip', () => {
           updatedAt: 10,
         },
       },
-    })
+    }
 
-    await subtractSamplesFromTokenCalibrationGlobal(
+    const readBack = subtractCalibrationSamplesFromGlobalRecord(
+      stored,
       {
         [tokenCalibrationKey('openai/gpt-4o')]: {
           totalTextChars: 500,
@@ -1170,8 +1159,6 @@ describe('persistence round-trip', () => {
       },
       30,
     )
-
-    const readBack = await readTokenCalibrationGlobal()
     expect(readBack.byModel[tokenCalibrationKey('openai/gpt-4o')]).toBeUndefined()
   })
 })

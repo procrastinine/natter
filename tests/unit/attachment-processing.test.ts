@@ -3,19 +3,18 @@ import { existsSync, readFileSync } from 'node:fs'
 import { basename, join } from 'node:path'
 import { DecompressionStream as NodeDecompressionStream } from 'node:stream/web'
 import { beforeAll, describe, expect, it } from 'vitest'
+import {
+  buildOpenRouterContentPart,
+  buildOpenRouterPdfPlugin,
+} from '../../src/core/attachments/openrouter'
+import { processAttachment } from '../../src/core/attachments/process'
+import { classifyAttachment, sniffMime } from '../../src/core/attachments/process-runtime'
 import type {
   AttachmentArtifact,
   AttachmentKind,
   ProcessAttachmentResult,
-} from '../../src/core/attachments'
-import {
-  AttachmentLibrary,
-  buildOpenRouterContentPart,
-  buildOpenRouterPdfPlugin,
-  classifyAttachment,
-  processAttachment,
-  sniffMime,
-} from '../../src/core/attachments'
+} from '../../src/core/attachments/types'
+import { AttachmentLibrary } from '../helpers/attachment-library'
 
 interface ManifestEntry {
   path: string

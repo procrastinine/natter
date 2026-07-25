@@ -1,13 +1,26 @@
 import { describe, expect, it, vi } from 'vitest'
-import { buildBranchCacheRow } from '../../src/core/branch-flatten'
+import { messageRenderableText, messageRenderableTextSegments } from '../../src/core/branch-flatten'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
-import type { Chat, ChatBranchCache, ChatFolder, ChatTag, Message } from '../../src/core/types'
+import {
+  compileSearchText,
+  type MessageCorpusSearchRequest,
+  type MessageCorpusSearchResult,
+  scanSearchTextSegments,
+} from '../../src/core/search-query'
+import type { Chat, ChatFolder, ChatTag, Message } from '../../src/core/types'
 import {
   type ChatSearchUpdate,
   DEFAULT_SEARCH_FILTERS,
   searchChats,
 } from '../../src/store/chat-search'
-import type { ChatBranchCacheWriteGuard, WorkspaceRepository } from '../../src/store/repository'
+import { splitMessageForStorage } from '../../src/store/message-storage'
+import type {
+  WorkspaceQuery,
+  WorkspaceReadAuthority,
+  WorkspaceRepository,
+} from '../../src/store/workspace-protocol'
+
+const authority = { signal: new AbortController().signal } as WorkspaceReadAuthority
 
 function chat(overrides: Partial<Chat> & Pick<Chat, 'id'>): Chat {
   const { id, ...rest } = overrides
@@ -21,7 +34,8 @@ function chat(overrides: Partial<Chat> & Pick<Chat, 'id'>): Chat {
     wordCount: 0,
     totalCostUsd: 0,
     metaVersion: 0,
-    summaryVersion: 0,
+    summaryVersion: 1,
+    structuralVersion: 1,
     settings: cloneDefaultChatSettings(),
     lastUpdatedLeafId: null,
     lastBranchUpdatedAt: 1,
@@ -52,576 +66,437 @@ function message(overrides: Partial<Message> & Pick<Message, 'id' | 'chatId'>): 
   }
 }
 
-function folder(overrides: Partial<ChatFolder> & Pick<ChatFolder, 'id' | 'name'>): ChatFolder {
-  const { id, name, ...rest } = overrides
-  return {
-    id,
-    name,
-    sortIndex: 0,
-    createdAt: 1,
-    updatedAt: 1,
-    ...rest,
-  }
+function folder(id: string, name: string): ChatFolder {
+  return { id, name, sortIndex: 0, createdAt: 1, updatedAt: 1 }
 }
 
-function tag(overrides: Partial<ChatTag> & Pick<ChatTag, 'id' | 'name'>): ChatTag {
-  const { id, name, ...rest } = overrides
-  return {
-    id,
-    name,
-    nameLower: name.toLocaleLowerCase(),
-    createdAt: 1,
-    updatedAt: 1,
-    ...rest,
-  }
+function tag(id: string, name: string): ChatTag {
+  return { id, name, nameLower: name.toLocaleLowerCase(), createdAt: 1, updatedAt: 1 }
 }
 
-function repo(input: {
+interface RepositoryFixture {
+  readonly repo: WorkspaceRepository
+  readonly query: ReturnType<
+    typeof vi.fn<
+      (
+        authority: unknown,
+        request: WorkspaceQuery,
+      ) => Promise<{ workspaceId: string; replacementEpoch: number; value: unknown }>
+    >
+  >
+  readonly execute: ReturnType<typeof vi.fn<() => void>>
+}
+
+function repository(input: {
   chats: Chat[]
   folders?: ChatFolder[]
   tags?: ChatTag[]
-  messages?: Record<string, Message[] | Promise<Message[]>>
-  branches?: Record<string, Message[] | Promise<Message[]>>
-  caches?: Record<string, ChatBranchCache | undefined>
-}): WorkspaceRepository & {
-  getChatBranchCache: ReturnType<typeof vi.fn>
-  putChatBranchCache: ReturnType<typeof vi.fn>
-  listMessages: ReturnType<typeof vi.fn>
-  getBranchByLeaf: ReturnType<typeof vi.fn>
-} {
+  messages?: Record<string, Message[]>
+  branches?: Record<string, Message[]>
+  beforeQuery?: (query: WorkspaceQuery) => Promise<void> | void
+}): RepositoryFixture {
   const chats = new Map(input.chats.map((row) => [row.id, row]))
-  const caches = new Map<string, ChatBranchCache | undefined>(Object.entries(input.caches ?? {}))
-  const repository = {
-    listChats: vi.fn(async () => [...chats.values()]),
-    getChat: vi.fn(async (chatId: string) => chats.get(chatId)),
-    getWorkspaceMeta: vi.fn(async () => ({
-      workspaceId: 'test-workspace',
-      backendKind: 'unknown' as const,
-      lastMutationAt: 0,
-      mutationCounter: 0,
-      replacementEpoch: 0,
-    })),
-    listFolders: vi.fn(async () => input.folders ?? []),
-    listTags: vi.fn(async () => input.tags ?? []),
-    getChatBranchCache: vi.fn(async (chatId: string) => caches.get(chatId)),
-    putChatBranchCache: vi.fn(async (cache: ChatBranchCache) => {
-      caches.set(cache.chatId, cache)
-      return cache
-    }),
-    deleteChatBranchCache: vi.fn(async (chatId: string) => caches.delete(chatId)),
-    listMessages: vi.fn(async (chatId: string) => input.messages?.[chatId] ?? []),
-    getBranchByLeaf: vi.fn(
-      async (chatId: string) => input.branches?.[chatId] ?? input.messages?.[chatId] ?? [],
-    ),
-  }
-  return repository as unknown as WorkspaceRepository & {
-    getChatBranchCache: ReturnType<typeof vi.fn>
-    putChatBranchCache: ReturnType<typeof vi.fn>
-    listMessages: ReturnType<typeof vi.fn>
-    getBranchByLeaf: ReturnType<typeof vi.fn>
+  const branchPresentations = new Map(
+    Object.entries(input.branches ?? {}).map(([chatId, rows]) => [
+      chatId,
+      rows.map((row) => {
+        const { header } = splitMessageForStorage(row)
+        return { header, message: row, bodyVersion: header.bodyVersion }
+      }),
+    ]),
+  )
+  const query = vi.fn(async (_authority: unknown, request: WorkspaceQuery) => {
+    await input.beforeQuery?.(request)
+    if (
+      request.kind !== 'sidebar.catalog-page' &&
+      request.kind !== 'sidebar.rows-by-id' &&
+      request.kind !== 'folder.list' &&
+      request.kind !== 'tag.list' &&
+      request.kind !== 'chat.get' &&
+      request.kind !== 'branch.open' &&
+      request.kind !== 'branch.page-structure' &&
+      request.kind !== 'message.presentations' &&
+      request.kind !== 'message.search-corpus'
+    ) {
+      throw new Error(`UnexpectedQuery:${request.kind}`)
+    }
+    let value: unknown
+    switch (request.kind) {
+      case 'sidebar.catalog-page':
+        value = { rows: input.chats }
+        break
+      case 'sidebar.rows-by-id':
+        value = request.chatIds.map((chatId) => chats.get(chatId))
+        break
+      case 'folder.list':
+        value = input.folders ?? []
+        break
+      case 'tag.list':
+        value = input.tags ?? []
+        break
+      case 'chat.get':
+        value = chats.get(request.chatId)
+        break
+      case 'branch.open': {
+        const currentChat = chats.get(request.chatId)
+        const presentations = branchPresentations.get(request.chatId) ?? []
+        value = currentChat
+          ? {
+              kind: 'ready',
+              chat: currentChat,
+              target: request.target,
+              proof: {
+                chatId: request.chatId,
+                structuralVersion: currentChat.structuralVersion,
+                tipId: currentChat.lastUpdatedLeafId,
+                pathHeaders: presentations.map((presentation) => presentation.header),
+              },
+              presentations: [],
+            }
+          : { kind: 'missing', chatId: request.chatId, target: request.target }
+        break
+      }
+      case 'branch.page-structure': {
+        value = {
+          kind: 'ready',
+          snapshot: {
+            chatId: request.chatId,
+            pageHeaders: request.window.nodes,
+            pageOffset: request.window.offset,
+            pageLimit: request.window.limit,
+            branchLength: request.window.branchLength,
+          },
+        }
+        break
+      }
+      case 'message.presentations': {
+        const byId = new Map(
+          [...branchPresentations.values()]
+            .flat()
+            .map((presentation) => [presentation.header.id, presentation] as const),
+        )
+        value = request.messageIds.map((messageId) => byId.get(messageId))
+        break
+      }
+      case 'message.search-corpus':
+        value = searchCorpus(input.messages?.[request.request.chatId] ?? [], request.request)
+        break
+    }
+    return { workspaceId: 'workspace', replacementEpoch: 0, value }
+  })
+  const execute = vi.fn()
+  return {
+    repo: {
+      query,
+      execute,
+      replace: vi.fn(),
+      subscribeChanges: vi.fn(() => () => undefined),
+    } as unknown as WorkspaceRepository,
+    query,
+    execute,
   }
 }
 
-describe('chat search backend', () => {
-  it('streams title hits before body scans complete', async () => {
-    let releaseMessages!: () => void
-    const slowMessages = new Promise<Message[]>((resolve) => {
-      releaseMessages = () =>
-        resolve([
-          message({
-            id: 'body-message',
-            chatId: 'body',
-            content: [{ type: 'text', text: 'alpha body hit' }],
-          }),
-        ])
-    })
-    const repository = repo({
-      chats: [
-        chat({ id: 'title', title: 'alpha title', lastUpdatedLeafId: null }),
-        chat({
-          id: 'body',
-          title: 'body',
-          lastUpdatedLeafId: 'body-message',
-          lastBranchUpdatedAt: 5,
-        }),
-      ],
-      messages: { body: slowMessages },
-    })
-    const updates: ChatSearchUpdate[] = []
+function searchCorpus(
+  messages: readonly Message[],
+  request: MessageCorpusSearchRequest,
+): MessageCorpusSearchResult {
+  const compiled = compileSearchText(request.clauses)
+  const live = messages.filter((row) => !row.deleted).sort(compareMessages)
+  const corpusSegments = [
+    ...(request.prefixFields ?? []).map((field) => field.text),
+    ...live.flatMap((row) => [...messageRenderableTextSegments(row)]),
+  ]
+  const matching = live.filter(
+    (row) => scanSearchTextSegments(messageRenderableTextSegments(row), compiled).matches,
+  )
+  const positive = live.filter(
+    (row) => scanSearchTextSegments(messageRenderableTextSegments(row), compiled).firstPositive,
+  )
+  const firstPositive = live
+    .map((row) => ({
+      row,
+      scan: scanSearchTextSegments(messageRenderableTextSegments(row), compiled),
+    }))
+    .find(({ scan }) => scan.firstPositive)
+  const firstMatch = firstPositive?.scan.firstPositive
+  const newestMatching = matching.at(-1)
+  const newestPositive = positive.at(-1)
+  return {
+    clauseHits: scanSearchTextSegments(corpusSegments, compiled).clauseHits,
+    matchingMessageIds: request.collectMatchingMessageIds ? matching.map((row) => row.id) : [],
+    ...(newestMatching ? { newestMatchingMessageId: newestMatching.id } : {}),
+    ...(newestPositive ? { newestPositiveMessageId: newestPositive.id } : {}),
+    ...(firstPositive && firstMatch
+      ? {
+          firstPositiveExcerpt: {
+            messageId: firstPositive.row.id,
+            text: messageRenderableText(firstPositive.row),
+            matchIndex: firstMatch.index,
+            matchLength: firstMatch.length,
+            messageMatchIndex: firstMatch.index,
+            prefixTruncated: false,
+            suffixTruncated: false,
+          },
+        }
+      : {}),
+  }
+}
 
-    const promise = searchChats({
-      queryId: 'q-stream',
-      query: 'alpha',
-      repo: repository,
+function compareMessages(left: Message, right: Message): number {
+  return left.createdAt - right.createdAt || left.id.localeCompare(right.id)
+}
+
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve: () => void = () => {}
+  const promise = new Promise<void>((done) => {
+    resolve = done
+  })
+  return { promise, resolve }
+}
+
+describe('chat search backend', () => {
+  it('streams title hits before a different chat branch page resolves', async () => {
+    const bodyGate = deferred()
+    const updates: ChatSearchUpdate[] = []
+    const body = message({
+      id: 'body-message',
+      chatId: 'body',
+      content: [{ type: 'text', text: 'needle in body' }],
+    })
+    const fixture = repository({
+      chats: [
+        chat({ id: 'title', title: 'needle title' }),
+        chat({ id: 'body', title: 'other', lastUpdatedLeafId: body.id }),
+      ],
+      branches: { body: [body] },
+      beforeQuery: (request) =>
+        request.kind === 'branch.page-structure' && request.chatId === 'body'
+          ? bodyGate.promise
+          : undefined,
+    })
+
+    const pending = searchChats({
+      queryId: 'query',
+      query: 'needle',
+      repo: fixture.repo,
+      authority,
       concurrency: 1,
       onUpdate: (update) => updates.push(update),
     })
-    await new Promise((resolve) => setTimeout(resolve, 0))
-
-    const titleHit = updates.find(
-      (update): update is Extract<ChatSearchUpdate, { kind: 'hit' }> =>
-        update.kind === 'hit' && update.result.chatId === 'title',
-    )
-    expect(titleHit?.queryId).toBe('q-stream')
-    expect(titleHit?.completedCount).toBe(1)
-    expect(titleHit?.result.source).toBe('title')
+    await vi.waitFor(() => {
+      expect(
+        updates.some((update) => update.kind === 'hit' && update.result.chatId === 'title'),
+      ).toBe(true)
+    })
     expect(updates.some((update) => update.kind === 'done')).toBe(false)
 
-    releaseMessages()
-    const output = await promise
+    bodyGate.resolve()
+    const output = await pending
     expect(output.results.map((result) => result.chatId).sort()).toEqual(['body', 'title'])
   })
 
-  it('keeps title-only search away from cache and message reads', async () => {
-    const repository = repo({
-      chats: [chat({ id: 'title', title: 'needle title', lastUpdatedLeafId: 'm' })],
+  it('streams title hits before an all-branches corpus query resolves', async () => {
+    const corpusGate = deferred()
+    const updates: ChatSearchUpdate[] = []
+    const body = message({
+      id: 'body-message',
+      chatId: 'body',
+      content: [{ type: 'text', text: 'needle in body' }],
+    })
+    const fixture = repository({
+      chats: [
+        chat({ id: 'title', title: 'needle title' }),
+        chat({ id: 'body', title: 'other', lastUpdatedLeafId: body.id }),
+      ],
+      messages: { body: [body] },
+      branches: { body: [body] },
+      beforeQuery: (request) =>
+        request.kind === 'message.search-corpus' && request.request.chatId === 'body'
+          ? corpusGate.promise
+          : undefined,
     })
 
-    const output = await searchChats({
-      queryId: 'q-title',
+    const pending = searchChats({
+      queryId: 'query',
       query: 'needle',
-      repo: repository,
-      filters: { ...DEFAULT_SEARCH_FILTERS, titleOnly: true },
+      scope: 'all-branches',
+      repo: fixture.repo,
+      authority,
+      concurrency: 1,
+      onUpdate: (update) => updates.push(update),
     })
+    await vi.waitFor(() => {
+      expect(
+        updates.some((update) => update.kind === 'hit' && update.result.chatId === 'title'),
+      ).toBe(true)
+    })
+    expect(updates.some((update) => update.kind === 'done')).toBe(false)
 
-    expect(output.results).toHaveLength(1)
-    expect(repository.getChatBranchCache).not.toHaveBeenCalled()
-    expect(repository.listMessages).not.toHaveBeenCalled()
-    expect(repository.getBranchByLeaf).not.toHaveBeenCalled()
+    corpusGate.resolve()
+    const output = await pending
+    expect(output.results.map((result) => result.chatId).sort()).toEqual(['body', 'title'])
   })
 
-  it('refreshes a missing default-mode branch cache through the repository', async () => {
+  it('keeps title-only search away from branch and message reads', async () => {
+    const fixture = repository({ chats: [chat({ id: 'title', title: 'needle' })] })
+
+    const output = await searchChats({
+      queryId: 'query',
+      query: 'needle',
+      filters: { ...DEFAULT_SEARCH_FILTERS, titleOnly: true },
+      repo: fixture.repo,
+      authority,
+    })
+
+    expect(output.results).toMatchObject([{ chatId: 'title', source: 'title' }])
+    expect(
+      fixture.query.mock.calls.some(
+        ([, request]) =>
+          request.kind === 'branch.open' ||
+          request.kind === 'branch.page-structure' ||
+          request.kind === 'message.presentations' ||
+          request.kind === 'message.search-corpus',
+      ),
+    ).toBe(false)
+  })
+
+  it('searches the canonical last-updated branch without any derived write', async () => {
     const user = message({
       id: 'user',
-      chatId: 'cached',
-      content: [{ type: 'text', text: 'hello' }],
+      chatId: 'chat',
+      content: [{ type: 'text', text: 'prefix' }],
     })
     const assistant = message({
       id: 'assistant',
-      chatId: 'cached',
-      parentId: 'user',
-      role: 'assistant',
-      createdAt: 2,
-      content: [{ type: 'output_text', text: 'body needle appears here' }],
-    })
-    const offBranch = message({
-      id: 'off-branch',
-      chatId: 'cached',
-      parentId: 'user',
-      siblingIndex: 1,
-      role: 'assistant',
-      createdAt: 3,
-      content: [{ type: 'output_text', text: 'unselected body' }],
-    })
-    const repository = repo({
-      chats: [
-        chat({
-          id: 'cached',
-          title: 'cache',
-          lastUpdatedLeafId: 'assistant',
-          lastBranchUpdatedAt: 10,
-        }),
-      ],
-      messages: { cached: [user, assistant, offBranch] },
-      branches: { cached: [user, assistant] },
-    })
-
-    const output = await searchChats({
-      queryId: 'q-cache',
-      query: 'needle',
-      repo: repository,
-      concurrency: 1,
-    })
-
-    expect(repository.putChatBranchCache).toHaveBeenCalledTimes(1)
-    expect(repository.getBranchByLeaf).toHaveBeenCalledWith('cached', 'assistant')
-    expect(repository.listMessages).not.toHaveBeenCalled()
-    const written = repository.putChatBranchCache.mock.calls[0]?.[0] as ChatBranchCache
-    expect(written).toEqual(
-      buildBranchCacheRow({
-        chatId: 'cached',
-        branchLeafId: 'assistant',
-        messages: [user, assistant, offBranch],
-        generatedAt: written.generatedAt,
-      }),
-    )
-    expect(output.results).toMatchObject([
-      {
-        chatId: 'cached',
-        source: 'branch-cache',
-        branchLeafId: 'assistant',
-      },
-    ])
-    expect(output.results[0]?.snippet).toContain('needle')
-    const highlight = output.results[0]?.highlightRanges[0]
-    expect(output.results[0]?.snippet.slice(highlight?.start, highlight?.end)).toBe('needle')
-  })
-
-  it('preserves phrase matching across metadata and branch-cache field boundaries', async () => {
-    const repository = repo({
-      chats: [
-        chat({
-          id: 'field-boundary',
-          title: 'alpha',
-          lastUpdatedLeafId: 'leaf',
-          lastBranchUpdatedAt: 10,
-        }),
-      ],
-      caches: {
-        'field-boundary': {
-          chatId: 'field-boundary',
-          branchLeafId: 'leaf',
-          generatedAt: 10,
-          textContent: 'beta body',
-          previewText: 'beta body',
-          messageCount: 1,
-          wordCount: 2,
-          messageTimestamps: [{ id: 'leaf', createdAt: 1, editedAt: 1 }],
-        },
-      },
-    })
-
-    const output = await searchChats({
-      queryId: 'q-field-boundary',
-      query: '"alpha\nbeta"',
-      repo: repository,
-    })
-
-    expect(output.results).toMatchObject([
-      {
-        chatId: 'field-boundary',
-        source: 'title',
-        snippet: 'alpha',
-        highlightRanges: [],
-      },
-    ])
-  })
-
-  it('normalizes one large selected-branch cache exactly once without a combined corpus copy', async () => {
-    const textContent = `${'large transcript '.repeat(32_768)}needle at the end`
-    const repository = repo({
-      chats: [
-        chat({
-          id: 'large-cache',
-          title: 'metadata',
-          lastUpdatedLeafId: 'leaf',
-          lastBranchUpdatedAt: 10,
-        }),
-      ],
-      caches: {
-        'large-cache': {
-          chatId: 'large-cache',
-          branchLeafId: 'leaf',
-          generatedAt: 10,
-          textContent,
-          previewText: 'needle at the end',
-          messageCount: 1,
-          wordCount: 65_540,
-          messageTimestamps: [{ id: 'leaf', createdAt: 1, editedAt: 1 }],
-        },
-      },
-    })
-    const original = String.prototype.toLocaleLowerCase
-    const normalizedLengths: number[] = []
-    const lowerSpy = vi.spyOn(String.prototype, 'toLocaleLowerCase').mockImplementation(function (
-      this: string,
-      locales?: Intl.LocalesArgument,
-    ) {
-      normalizedLengths.push(String(this).length)
-      return locales === undefined
-        ? original.call(String(this))
-        : original.call(String(this), locales)
-    })
-
-    try {
-      const output = await searchChats({
-        queryId: 'q-large-cache',
-        query: 'needle',
-        repo: repository,
-      })
-
-      expect(output.results).toHaveLength(1)
-      expect(normalizedLengths.filter((length) => length >= textContent.length)).toEqual([
-        textContent.length,
-      ])
-    } finally {
-      lowerSpy.mockRestore()
-    }
-  })
-
-  it('does not write branch cache rows in all-branches mode', async () => {
-    const repository = repo({
-      chats: [
-        chat({
-          id: 'branches',
-          title: 'branch chat',
-          lastUpdatedLeafId: 'latest',
-          lastBranchUpdatedAt: 10,
-        }),
-      ],
-      messages: {
-        branches: [
-          message({
-            id: 'older',
-            chatId: 'branches',
-            createdAt: 2,
-            content: [{ type: 'text', text: 'branchword older' }],
-          }),
-          message({
-            id: 'latest-match',
-            chatId: 'branches',
-            createdAt: 5,
-            content: [{ type: 'text', text: 'branchword latest' }],
-          }),
-        ],
-      },
-    })
-
-    const output = await searchChats({
-      queryId: 'q-all',
-      query: 'branchword',
-      repo: repository,
-      scope: 'all-branches',
-      concurrency: 1,
-    })
-
-    expect(repository.putChatBranchCache).not.toHaveBeenCalled()
-    expect(output.results).toMatchObject([
-      {
-        chatId: 'branches',
-        source: 'all-branches',
-        messageId: 'latest-match',
-      },
-    ])
-  })
-
-  it('retries a same-leaf cache rebuild when the chat changes before the guarded write', async () => {
-    const oldChat = chat({
-      id: 'cache-race',
-      lastUpdatedLeafId: 'assistant',
-      lastBranchUpdatedAt: 10,
-      summaryVersion: 1,
-    })
-    const newChat = { ...oldChat, lastBranchUpdatedAt: 20, summaryVersion: 2 }
-    const user = message({
-      id: 'user',
-      chatId: oldChat.id,
-      content: [{ type: 'text', text: 'question' }],
-    })
-    const oldAssistant = message({
-      id: 'assistant',
-      chatId: oldChat.id,
+      chatId: 'chat',
       parentId: user.id,
-      role: 'assistant',
       createdAt: 2,
-      content: [{ type: 'output_text', text: 'old body' }],
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_text', text: 'needle here' }],
     })
-    const newAssistant = {
-      ...oldAssistant,
-      content: [{ type: 'output_text' as const, text: 'new needle body' }],
-    }
-    let current = oldChat
-    let branch = [user, oldAssistant]
-    const putChatBranchCache = vi.fn(
-      async (cache: ChatBranchCache, _expected: ChatBranchCacheWriteGuard) => {
-        if (putChatBranchCache.mock.calls.length === 1) {
-          current = newChat
-          branch = [user, newAssistant]
-          return undefined
-        }
-        return cache
-      },
-    )
-    const repository = {
-      listChats: vi.fn(async () => [oldChat]),
-      getChat: vi.fn(async () => current),
-      getWorkspaceMeta: vi.fn(async () => ({
-        workspaceId: 'test-workspace',
-        backendKind: 'unknown' as const,
-        lastMutationAt: 0,
-        mutationCounter: 0,
-        replacementEpoch: 0,
-      })),
-      listFolders: vi.fn(async () => []),
-      listTags: vi.fn(async () => []),
-      getChatBranchCache: vi.fn(async () => undefined),
-      getBranchByLeaf: vi.fn(async () => branch),
-      putChatBranchCache,
-    } as unknown as WorkspaceRepository
-
-    const output = await searchChats({
-      queryId: 'same-leaf-cas-retry',
-      query: 'new needle',
-      repo: repository,
-      concurrency: 1,
-    })
-
-    expect(putChatBranchCache).toHaveBeenCalledTimes(2)
-    expect(putChatBranchCache.mock.calls[0]?.[1]).toEqual({
-      branchLeafId: 'assistant',
-      lastBranchUpdatedAt: 10,
-      summaryVersion: 1,
-      replacementEpoch: 0,
-    })
-    expect(putChatBranchCache.mock.calls[1]?.[1]).toEqual({
-      branchLeafId: 'assistant',
-      lastBranchUpdatedAt: 20,
-      summaryVersion: 2,
-      replacementEpoch: 0,
-    })
-    expect(output.results).toMatchObject([
-      { chatId: oldChat.id, source: 'branch-cache', branchLeafId: 'assistant' },
-    ])
-  })
-
-  it('returns the all-branches navigation target even when the snippet source is title', async () => {
-    const repository = repo({
-      chats: [
-        chat({
-          id: 'branches',
-          title: 'alpha title',
-          lastUpdatedLeafId: 'latest',
-          lastBranchUpdatedAt: 10,
-        }),
-      ],
-      messages: {
-        branches: [
-          message({
-            id: 'matching-message',
-            chatId: 'branches',
-            createdAt: 5,
-            content: [{ type: 'text', text: 'alpha beta inside an older branch' }],
-          }),
-        ],
-      },
+    const fixture = repository({
+      chats: [chat({ id: 'chat', lastUpdatedLeafId: assistant.id })],
+      branches: { chat: [user, assistant] },
     })
 
     const output = await searchChats({
-      queryId: 'q-title-plus-body',
-      query: 'alpha beta',
-      repo: repository,
-      scope: 'all-branches',
-      concurrency: 1,
+      queryId: 'query',
+      query: 'needle',
+      repo: fixture.repo,
+      authority,
     })
 
     expect(output.results).toMatchObject([
-      {
-        chatId: 'branches',
-        source: 'title',
-        messageId: 'matching-message',
-      },
+      { chatId: 'chat', source: 'last-updated-branch', branchLeafId: 'assistant' },
     ])
+    expect(fixture.execute).not.toHaveBeenCalled()
+    expect(
+      fixture.query.mock.calls.some(([, request]) => request.kind === 'branch.page-structure'),
+    ).toBe(true)
+    expect(
+      fixture.query.mock.calls.some(([, request]) => request.kind === 'message.presentations'),
+    ).toBe(true)
   })
 
-  it('pins the last-updated leaf when an all-branches hit already matches that branch', async () => {
-    const repository = repo({
-      chats: [
-        chat({
-          id: 'branches',
-          title: 'branch chat',
-          lastUpdatedLeafId: 'latest',
-          lastBranchUpdatedAt: 10,
-        }),
-      ],
-      caches: {
-        branches: {
-          chatId: 'branches',
-          branchLeafId: 'latest',
-          generatedAt: 12,
-          textContent: 'branchword already on last branch',
-          previewText: 'branchword already on last branch',
-          messageCount: 1,
-          wordCount: 5,
-          messageTimestamps: [{ id: 'latest', createdAt: 10, editedAt: 10 }],
-        },
-      },
-      messages: {
-        branches: [
-          message({
-            id: 'older-match',
-            chatId: 'branches',
-            createdAt: 5,
-            content: [{ type: 'text', text: 'branchword older branch' }],
-          }),
-        ],
-      },
+  it('finds off-branch text and returns the exact all-branches navigation target', async () => {
+    const latest = message({
+      id: 'latest',
+      chatId: 'chat',
+      createdAt: 1,
+      content: [{ type: 'text', text: 'latest text' }],
+    })
+    const matching = message({
+      id: 'matching',
+      chatId: 'chat',
+      createdAt: 2,
+      content: [{ type: 'text', text: 'off branch needle' }],
+    })
+    const fixture = repository({
+      chats: [chat({ id: 'chat', lastUpdatedLeafId: latest.id })],
+      messages: { chat: [latest, matching] },
+      branches: { chat: [latest] },
     })
 
     const output = await searchChats({
-      queryId: 'q-last-branch',
-      query: 'branchword',
-      repo: repository,
+      queryId: 'query',
+      query: 'needle',
       scope: 'all-branches',
-      concurrency: 1,
+      repo: fixture.repo,
+      authority,
     })
 
-    expect(output.results).toMatchObject([{ chatId: 'branches', branchLeafId: 'latest' }])
+    expect(output.results).toMatchObject([
+      { chatId: 'chat', source: 'all-branches', messageId: 'matching' },
+    ])
+    expect(fixture.execute).not.toHaveBeenCalled()
+  })
+
+  it('pins the canonical leaf when all-branches text also matches it', async () => {
+    const latest = message({
+      id: 'latest',
+      chatId: 'chat',
+      content: [{ type: 'text', text: 'needle on latest branch' }],
+    })
+    const fixture = repository({
+      chats: [chat({ id: 'chat', lastUpdatedLeafId: latest.id })],
+      messages: { chat: [latest] },
+      branches: { chat: [latest] },
+    })
+
+    const output = await searchChats({
+      queryId: 'query',
+      query: 'needle',
+      scope: 'all-branches',
+      repo: fixture.repo,
+      authority,
+    })
+
+    expect(output.results).toMatchObject([
+      { chatId: 'chat', source: 'all-branches', branchLeafId: 'latest' },
+    ])
     expect(output.results[0]).not.toHaveProperty('messageId')
   })
 
-  it('searches folder and tag metadata and honors operators', async () => {
-    const work = folder({ id: 'folder-work', name: 'Work' })
-    const research = tag({ id: 'tag-research', name: 'Research' })
-    const repository = repo({
-      chats: [
-        chat({
-          id: 'match',
-          title: 'notes',
-          folderId: work.id,
-          tags: [research.id],
-          pinned: true,
-        }),
-        chat({ id: 'miss', title: 'notes', pinned: true }),
-      ],
-      folders: [work],
-      tags: [research],
-    })
-
-    const filtered = await searchChats({
-      queryId: 'q-filter',
-      query: 'tag:research folder:work is:pinned',
-      repo: repository,
-    })
-    const plainTag = await searchChats({
-      queryId: 'q-tag',
-      query: 'research',
-      repo: repository,
-    })
-
-    expect(filtered.results.map((result) => result.chatId)).toEqual(['match'])
-    expect(plainTag.results).toMatchObject([{ chatId: 'match', source: 'tag' }])
-  })
-
-  it('does not emit title hits until body negatives have been checked', async () => {
-    const repository = repo({
-      chats: [
-        chat({
-          id: 'negative',
-          title: 'alpha title',
-          lastUpdatedLeafId: 'm',
-          lastBranchUpdatedAt: 5,
-        }),
-      ],
-      messages: {
-        negative: [
-          message({
-            id: 'm',
-            chatId: 'negative',
-            content: [{ type: 'text', text: 'beta appears in the body' }],
-          }),
-        ],
-      },
+  it('searches folder and tag metadata while honoring operators', async () => {
+    const fixture = repository({
+      chats: [chat({ id: 'chat', title: 'Roadmap', folderId: 'work', tags: ['research'] })],
+      folders: [folder('work', 'Work')],
+      tags: [tag('research', 'Research')],
     })
 
     const output = await searchChats({
-      queryId: 'q-negative',
-      query: 'alpha -beta',
-      repo: repository,
-      concurrency: 1,
+      queryId: 'query',
+      query: 'folder:work tag:research roadmap',
+      repo: fixture.repo,
+      authority,
+    })
+
+    expect(output.results).toMatchObject([{ chatId: 'chat', source: 'title' }])
+  })
+
+  it('does not emit a title hit until negative body clauses are checked', async () => {
+    const row = message({
+      id: 'message',
+      chatId: 'chat',
+      content: [{ type: 'text', text: 'forbidden' }],
+    })
+    const updates: ChatSearchUpdate[] = []
+    const fixture = repository({
+      chats: [chat({ id: 'chat', title: 'needle title', lastUpdatedLeafId: row.id })],
+      branches: { chat: [row] },
+    })
+
+    const output = await searchChats({
+      queryId: 'query',
+      query: 'needle -forbidden',
+      repo: fixture.repo,
+      authority,
+      onUpdate: (update) => updates.push(update),
     })
 
     expect(output.results).toEqual([])
-    expect(repository.getBranchByLeaf).toHaveBeenCalledWith('negative', 'm')
-    expect(repository.listMessages).not.toHaveBeenCalled()
+    expect(updates.some((update) => update.kind === 'hit')).toBe(false)
   })
 })
