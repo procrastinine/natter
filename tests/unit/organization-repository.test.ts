@@ -396,7 +396,19 @@ async function prepareGeneration(
               target: { kind: 'root' },
               childSlot: 'empty',
             },
-            claim: { chatId, leafId: null, headers: [] },
+            claim: {
+              chatId,
+              structuralVersion: claimedChat.structuralVersion,
+              leafId: null,
+              headers: [],
+              placementSlot: {
+                parentId: null,
+                slotVersion: 0,
+                liveCount: 0,
+                nextSiblingIndex: 0,
+              },
+              targetTurn: null,
+            },
           },
           configurationClaim: {
             configurationVersion: claimedChat.configurationVersion ?? 0,
@@ -408,8 +420,18 @@ async function prepareGeneration(
             preferredDispatchKeyId: null,
             workspaceSettingOverrides: [],
           },
-          user,
-          assistant,
+          placement: {
+            chatId,
+            structuralVersion: claimedChat.structuralVersion,
+            createdAt: startedAt,
+            slot: {
+              parentId: null,
+              slotVersion: 0,
+              liveCount: 0,
+              nextSiblingIndex: 0,
+            },
+            messages: [user, assistant],
+          },
         },
       })
     } catch (error) {

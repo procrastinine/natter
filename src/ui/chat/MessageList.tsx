@@ -84,7 +84,10 @@ interface InsertTarget {
   defaultRole: MessageRole
 }
 
-type RenderableMessageRow = TranscriptBodyWindowRow & {
+type RenderableMessageRow = Pick<
+  TranscriptBodyWindowRow,
+  'message' | 'bodyVersion' | 'bodyExact'
+> & {
   readonly intentOnly?: boolean
 }
 
@@ -538,10 +541,9 @@ export const MessageList = memo(function MessageList({
       {[...transcriptBodyWindowPages(branchSnapshot)].flatMap((page) =>
         [...transcriptBodyPageRows(page)].map(renderMessageRow),
       )}
-      {binding.intentPresentations.map((presentation, index) =>
+      {binding.intentPresentations.map((presentation) =>
         renderMessageRow({
           ...presentation,
-          pathIndex: branchLength + index,
           bodyExact: true,
           intentOnly: true,
         }),

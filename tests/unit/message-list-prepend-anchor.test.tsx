@@ -3,6 +3,7 @@ import { createRef } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   createActiveBranchSpine,
+  emptyActiveBranchChildSlot,
   type VersionedActiveBranchSpine,
 } from '../../src/core/active-branch-spine'
 import { type BranchPathDescriptor, createBranchPath } from '../../src/core/branch-session'
@@ -275,6 +276,7 @@ function branchFixture(count: number): BranchFixture {
     structuralVersion: 0,
     resolvedLeafId: headers.at(-1)?.id ?? null,
     headers,
+    terminalChildSlot: emptyActiveBranchChildSlot(headers.at(-1)?.id ?? null),
   })
   const seal: ConversationTranscriptSurface['seal'] = Object.freeze({
     workspaceId: 'message-list-anchor-workspace',

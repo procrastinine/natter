@@ -204,6 +204,9 @@ export const MODULE_COLLECTION_CONTRACTS = Object.freeze({
         'src/backcompat/canonical-stream-event-v1.ts#REASONING_FORMATS_V1',
         'src/backcompat/canonical-stream-event-v1.ts#REASONING_ORIGIN_DIALECTS_V1',
         'src/backcompat/canonical-stream-event-v1.ts#SERVER_TOOL_SOURCES',
+        'src/backcompat/import-export.ts#importedGenerationApis',
+        'src/backcompat/import-export.ts#importedGenerationCostSources',
+        'src/backcompat/import-export.ts#importedGenerationDeliveries',
         'src/backcompat/reasoning-carriers-v80.ts#REASONING_FORMATS_V80',
         'src/backcompat/reasoning-contract-normalizer-v92.ts#REASONING_BRIDGES',
         'src/backcompat/reasoning-contract-normalizer-v92.ts#REASONING_DIALECTS',
@@ -251,6 +254,7 @@ export const MODULE_COLLECTION_CONTRACTS = Object.freeze({
         'src/store/browser-repo.ts#STREAM_FINISH_CLEANUP_OPERATION',
         'src/store/browser-repo.ts#STREAM_JOURNAL_INTEGRITY_OPERATION',
         'src/store/browser-repo.ts#TERMINAL_STREAM_RETENTION_OPERATION',
+        'src/store/conversation-controller.ts#EMPTY_CONVERSATION_MESSAGE_PRESENTATIONS',
         'src/store/conversation-controller.ts#EMPTY_EXACT_TARGET_PRESENTATION_RECEIPTS',
         'src/store/stream-journal-codec.ts#STREAM_JOURNAL_COMMIT_FRAME_KEYS',
         'src/store/stream-journal-codec.ts#STREAM_JOURNAL_INLINE_FRAME_KEYS',
@@ -567,12 +571,6 @@ export const MODULE_COLLECTION_CONTRACTS = Object.freeze({
     bound: 'immutable default filters',
     cleanup: 'process-lifetime immutable value; no runtime entries',
     scope: 'module-static',
-  },
-  'src/store/chat-storage-codec.ts#currentChatTransactionByRow': {
-    bound: 'one weak transaction-identity association per live authoritative chat row',
-    cleanup:
-      'row collection releases the weak entry; the branded row remains local to its command transaction',
-    scope: 'module-transaction-brand-registry',
   },
   'src/store/db.ts#waveAUpgradePreflights': {
     bound: 'one preflight result per reachable opening database',
@@ -1381,6 +1379,7 @@ export const CONTROLLER_COLLECTION_CONTRACTS = Object.freeze({
   'src/store/conversation-controller.ts#TabConversationController': {
     fields: [
       'blockedReads',
+      'generationIntentPresentations',
       'inspectorDemands',
       'listeners',
       'operationClaimCountsByChat',
@@ -1394,9 +1393,9 @@ export const CONTROLLER_COLLECTION_CONTRACTS = Object.freeze({
       'transcriptRetentions',
     ],
     bound:
-      'active chat, mounted projection demands and exact retained-message claims, active or blocked reads, unfinished operation claims, and unconsumed route handoffs keyed by exact synchronous route-owner ID; inactive sessions are persisted then evicted once they have no operation claim',
+      'active chat, mounted projection demands and exact retained-message claims, active or blocked reads, unfinished operation claims and exact generation-intent presentations, and unconsumed route handoffs keyed by exact synchronous route-owner ID; inactive sessions are persisted then evicted once they have no operation claim',
     cleanup:
-      'read completion or abort, mounted-owner cleanup, and retention-claim release remove transient entries; claim terminal or cancel and handoff consume or cancel remove exact owners; chat deletion or workspace reconciliation clears all chat-scoped maps',
+      'read completion or abort, mounted-owner cleanup, and retention-claim release remove transient entries; generation settlement, claim terminal or cancel, and handoff consume or cancel remove exact owners; chat deletion or workspace reconciliation clears all chat-scoped maps',
     scope: 'owner-instance',
   },
   'src/store/conversation-repository-adapter.ts#ConversationEffectAccumulator': {

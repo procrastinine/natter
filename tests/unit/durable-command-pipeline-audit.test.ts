@@ -91,8 +91,8 @@ describe('durable command commit pipeline audit', () => {
       pipelineRecords: 109,
       requiredStages: 15,
       stageCells: 1635,
-      gapCells: 123,
-      observedCells: 1512,
+      gapCells: 117,
+      observedCells: 1518,
       manualMarkerOwners: 0,
       manualMarkerCalls: 0,
       directTransactionOwners: 2,
@@ -101,10 +101,10 @@ describe('durable command commit pipeline audit', () => {
       problems: [],
     })
     expect(result.report.gapStageCounts).toMatchObject({
-      tables: 27,
+      tables: 25,
       physicalWrites: 3,
-      receiptDelta: 27,
-      idempotence: 27,
+      receiptDelta: 25,
+      idempotence: 25,
       bounds: 39,
     })
     expect(result.report.physicalTables).toHaveLength(45)
@@ -122,7 +122,7 @@ describe('durable command commit pipeline audit', () => {
     expect(result.status).toBe(1)
     expect(result.report.structurallyValid).toBe(true)
     expect(result.report.ok).toBe(false)
-    expect(result.report.gapCells).toBe(123)
+    expect(result.report.gapCells).toBe(117)
   })
 
   it('does not credit a declared capability until its exact command route consumes it', () => {
@@ -211,6 +211,14 @@ describe('durable command commit pipeline audit', () => {
             readonly variant: 'attachment.delete-if-unreferenced'
             readonly commonKernel: Readonly<Record<string, boolean>>
           }
+          readonly attachmentDeleteMany: {
+            readonly variant: 'attachment.delete-many'
+            readonly commonKernel: Readonly<Record<string, boolean>>
+          }
+          readonly attachmentReap: {
+            readonly variant: 'attachment.reap'
+            readonly commonKernel: Readonly<Record<string, boolean>>
+          }
         }
         readonly capabilities: Readonly<
           Record<
@@ -289,6 +297,14 @@ describe('durable command commit pipeline audit', () => {
         Boolean,
       ),
     ).toBe(true)
+    expect(family.fixedReceiptFamily.attachmentDeleteMany.variant).toBe('attachment.delete-many')
+    expect(
+      Object.values(family.fixedReceiptFamily.attachmentDeleteMany.commonKernel).every(Boolean),
+    ).toBe(true)
+    expect(family.fixedReceiptFamily.attachmentReap.variant).toBe('attachment.reap')
+    expect(
+      Object.values(family.fixedReceiptFamily.attachmentReap.commonKernel).every(Boolean),
+    ).toBe(true)
     expect(
       Object.entries(family.fixedReceiptFamily.commonKernel)
         .filter(([name]) => name !== 'constructorFacts')
@@ -355,6 +371,18 @@ describe('durable command commit pipeline audit', () => {
       boundsProved: false,
       idempotenceProved: true,
     })
+    expect(family.capabilities['attachment.delete-many']).toMatchObject({
+      exactEffectsProved: true,
+      tablesProved: true,
+      boundsProved: false,
+      idempotenceProved: true,
+    })
+    expect(family.capabilities['attachment.reap']).toMatchObject({
+      exactEffectsProved: true,
+      tablesProved: true,
+      boundsProved: false,
+      idempotenceProved: true,
+    })
     expect(Object.values(family.capabilities)).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
@@ -369,8 +397,8 @@ describe('durable command commit pipeline audit', () => {
     )
     expect(runAudit('inventory').report.gapStageCounts).toMatchObject({
       physicalWrites: 3,
-      receiptDelta: 27,
-      idempotence: 27,
+      receiptDelta: 25,
+      idempotence: 25,
     })
 
     const semanticCapabilities = { ...facts.semanticCapabilities }
@@ -740,14 +768,14 @@ describe('durable command commit pipeline audit', () => {
         overrides: {
           'src/store/browser-mutation-runtime.ts': replaceOwnerSource(
             mutationRuntimeSource,
-            'deleteAttachmentBytes: async (attachmentId, reason, deletionNow) => {',
-            'deleteAttachmentBlobs: async (attachmentId) => {',
+            'const deleteAttachmentBytesForHeader = async (',
+            'const ctx: MutationContext = {',
             'absorbSemanticOperationReceiptFragment(tx, catalogReceipt.fragment)',
             'void catalogReceipt.fragment',
           ),
         },
         common: 'exactEffectReceipt',
-        reopened: ['attachment.bytes.delete:receiptDelta'],
+        reopened: ['attachment.bytes.delete:receiptDelta', 'attachment.delete-many:receiptDelta'],
       },
       {
         name: 'application submission iteration',
@@ -1175,7 +1203,10 @@ describe('durable command commit pipeline audit', () => {
           ),
         },
         common: 'exactEffectReceipt',
-        reopened: ['attachment.delete-if-unreferenced:receiptDelta'],
+        reopened: [
+          'attachment.delete-if-unreferenced:receiptDelta',
+          'attachment.delete-many:receiptDelta',
+        ],
       },
       {
         name: 'application submission iteration',
@@ -1219,6 +1250,336 @@ describe('durable command commit pipeline audit', () => {
         },
         common: 'typedReplayPolicy',
         reopened: ['attachment.delete-if-unreferenced:idempotence'],
+      },
+    ] as const
+
+    for (const scenario of cases) {
+      const result = reopenedFrom(scenario.overrides)
+      expect(result.common[scenario.common], scenario.name).toBe(false)
+      expect(result.reopened, scenario.name).toEqual(scenario.reopened)
+      expect(result.gapCells, scenario.name).toBe(baseline.gapCells + scenario.reopened.length)
+    }
+  }, 300_000)
+
+  it('reopens only the delete-many cells owned by each omitted guarantee', async () => {
+    const baseline = evaluateDurableCommandPipeline(
+      canonicalInventory,
+      'inventory',
+      { detail: true },
+      sourceFacts,
+    ) as DurableCommandPipelineReport & {
+      readonly gaps: readonly {
+        readonly scope: string
+        readonly variant: string
+        readonly stage: string
+      }[]
+    }
+    const browserRepoSource = readFileSync(resolve(ROOT, 'src/store/browser-repo.ts'), 'utf8')
+    const mutationRuntimeSource = readFileSync(
+      resolve(ROOT, 'src/store/browser-mutation-runtime.ts'),
+      'utf8',
+    )
+    const attachmentBulkDeleteSource = readFileSync(
+      resolve(ROOT, 'src/store/attachment-bulk-delete.ts'),
+      'utf8',
+    )
+    const mutationPlanSource = readFileSync(
+      resolve(ROOT, 'src/store/browser-mutation-plan.ts'),
+      'utf8',
+    )
+    const { createProductionTypeScriptProgram } = (await import(TYPESCRIPT_SOURCE_URL)) as {
+      createProductionTypeScriptProgram(
+        root?: string,
+        options?: {
+          readonly sourceTextOverrides?: Readonly<Record<string, string>>
+        },
+      ): unknown
+    }
+    const replaceOwnerSource = (
+      source: string,
+      startToken: string,
+      endToken: string,
+      target: string,
+      replacement: string,
+    ): string => {
+      const start = source.indexOf(startToken)
+      const end = source.indexOf(endToken, start)
+      expect(start).toBeGreaterThanOrEqual(0)
+      expect(end).toBeGreaterThan(start)
+      const owner = source.slice(start, end)
+      expect(owner).toContain(target)
+      return source.slice(0, start) + owner.replace(target, replacement) + source.slice(end)
+    }
+    const baselineKeys = new Set(
+      baseline.gaps.map(({ scope, variant, stage }) => `${scope}:${variant}:${stage}`),
+    )
+    const reopenedFrom = (
+      sourceTextOverrides: Readonly<Record<string, string>>,
+    ): {
+      readonly common: Readonly<Record<string, boolean>>
+      readonly reopened: readonly string[]
+      readonly gapCells: number
+    } => {
+      const facts = buildDurableCommandPipelineSourceFacts({
+        program: createProductionTypeScriptProgram(ROOT, { sourceTextOverrides }),
+      }) as {
+        readonly scopeDerivedMutationFamily: {
+          readonly fixedReceiptFamily: {
+            readonly attachmentDeleteMany: {
+              readonly commonKernel: Readonly<Record<string, boolean>>
+            }
+          }
+        }
+      }
+      const result = evaluateDurableCommandPipeline(
+        canonicalInventory,
+        'inventory',
+        { detail: true },
+        facts,
+      ) as DurableCommandPipelineReport & {
+        readonly gaps: readonly {
+          readonly scope: string
+          readonly variant: string
+          readonly stage: string
+        }[]
+      }
+      return {
+        common:
+          facts.scopeDerivedMutationFamily.fixedReceiptFamily.attachmentDeleteMany.commonKernel,
+        reopened: result.gaps
+          .filter(({ scope, variant, stage }) => !baselineKeys.has(`${scope}:${variant}:${stage}`))
+          .map(({ variant, stage }) => `${variant}:${stage}`)
+          .sort(),
+        gapCells: result.gapCells,
+      }
+    }
+    const cases = [
+      {
+        name: 'typed transaction-local disposition',
+        overrides: {
+          'src/store/browser-repo.ts': replaceOwnerSource(
+            browserRepoSource,
+            'private async deleteManyAttachments(',
+            'private async reapAttachments(',
+            'ctx.deleteAttachmentForStorage(',
+            'ctx.deleteAttachmentBytes(',
+          ),
+        },
+        common: 'oneSemanticRoute',
+        reopened: ['attachment.delete-many:receiptDelta', 'attachment.delete-many:tables'],
+      },
+      {
+        name: 'bounded reference-presence receipt',
+        overrides: {
+          'src/store/browser-mutation-runtime.ts': replaceOwnerSource(
+            mutationRuntimeSource,
+            'const readAttachmentDispositionState = async (',
+            'const requireConsistentAttachmentDispositionState = (',
+            'rowCount: firstReference ? 1 : 0,',
+            'rowCount: 0,',
+          ),
+        },
+        common: 'exactPhysicalReads',
+        reopened: ['attachment.delete-many:receiptDelta', 'attachment.delete-many:tables'],
+      },
+      {
+        name: 'pre-read catalog receipt reuse',
+        overrides: {
+          'src/store/browser-mutation-runtime.ts': replaceOwnerSource(
+            mutationRuntimeSource,
+            'deleteAttachmentForStorage: async (attachmentId, reason, deletionNow) => {',
+            'putAttachment: async (attachment) => {',
+            'deletionNow,\n            current.catalogRow,',
+            'deletionNow,\n            undefined,',
+          ),
+        },
+        common: 'exactEffectReceipt',
+        reopened: ['attachment.delete-many:receiptDelta'],
+      },
+      {
+        name: 'non-overlapping application slices',
+        overrides: {
+          'src/store/attachment-bulk-delete.ts': replaceOwnerSource(
+            attachmentBulkDeleteSource,
+            'export async function executeAttachmentBulkDelete(',
+            'function normalizeSearch(',
+            '.slice(index, index + BULK_DELETE_COMMAND_SIZE)',
+            '.slice(0, BULK_DELETE_COMMAND_SIZE)',
+          ),
+        },
+        common: 'oneApplicationSubmission',
+        reopened: ['attachment.delete-many:idempotence'],
+      },
+      {
+        name: 'typed non-replayable policy',
+        overrides: {
+          'src/store/browser-mutation-plan.ts': replaceOwnerSource(
+            mutationPlanSource,
+            "case 'attachment.delete-many':",
+            "case 'attachment.reap':",
+            "replayReason: 'non-replayable'",
+            "replayReason: 'unfenced-relative-update'",
+          ),
+        },
+        common: 'typedReplayPolicy',
+        reopened: ['attachment.delete-many:idempotence'],
+      },
+    ] as const
+
+    for (const scenario of cases) {
+      const result = reopenedFrom(scenario.overrides)
+      expect(result.common[scenario.common], scenario.name).toBe(false)
+      expect(result.reopened, scenario.name).toEqual(scenario.reopened)
+      expect(result.gapCells, scenario.name).toBe(baseline.gapCells + scenario.reopened.length)
+    }
+  }, 300_000)
+
+  it('reopens the attachment-reap cells when its typed page contract is weakened', async () => {
+    const baseline = evaluateDurableCommandPipeline(
+      canonicalInventory,
+      'inventory',
+      { detail: true },
+      sourceFacts,
+    ) as DurableCommandPipelineReport & {
+      readonly gaps: readonly {
+        readonly scope: string
+        readonly variant: string
+        readonly stage: string
+      }[]
+    }
+    const browserRepoSource = readFileSync(resolve(ROOT, 'src/store/browser-repo.ts'), 'utf8')
+    const mutationRuntimeSource = readFileSync(
+      resolve(ROOT, 'src/store/browser-mutation-runtime.ts'),
+      'utf8',
+    )
+    const { createProductionTypeScriptProgram } = (await import(TYPESCRIPT_SOURCE_URL)) as {
+      createProductionTypeScriptProgram(
+        root?: string,
+        options?: {
+          readonly sourceTextOverrides?: Readonly<Record<string, string>>
+        },
+      ): unknown
+    }
+    const replaceOwnerSource = (
+      source: string,
+      startToken: string,
+      endToken: string,
+      target: string,
+      replacement: string,
+    ): string => {
+      const start = source.indexOf(startToken)
+      const end = source.indexOf(endToken, start)
+      expect(start).toBeGreaterThanOrEqual(0)
+      expect(end).toBeGreaterThan(start)
+      const owner = source.slice(start, end)
+      expect(owner).toContain(target)
+      return source.slice(0, start) + owner.replace(target, replacement) + source.slice(end)
+    }
+    const baselineKeys = new Set(
+      baseline.gaps.map(({ scope, variant, stage }) => `${scope}:${variant}:${stage}`),
+    )
+    const reopenedFrom = (
+      sourceTextOverrides: Readonly<Record<string, string>>,
+    ): {
+      readonly common: Readonly<Record<string, boolean>>
+      readonly reopened: readonly string[]
+      readonly gapCells: number
+    } => {
+      const facts = buildDurableCommandPipelineSourceFacts({
+        program: createProductionTypeScriptProgram(ROOT, { sourceTextOverrides }),
+      }) as {
+        readonly scopeDerivedMutationFamily: {
+          readonly fixedReceiptFamily: {
+            readonly attachmentReap: {
+              readonly commonKernel: Readonly<Record<string, boolean>>
+            }
+          }
+        }
+      }
+      const result = evaluateDurableCommandPipeline(
+        canonicalInventory,
+        'inventory',
+        { detail: true },
+        facts,
+      ) as DurableCommandPipelineReport & {
+        readonly gaps: readonly {
+          readonly scope: string
+          readonly variant: string
+          readonly stage: string
+        }[]
+      }
+      return {
+        common: facts.scopeDerivedMutationFamily.fixedReceiptFamily.attachmentReap.commonKernel,
+        reopened: result.gaps
+          .filter(({ scope, variant, stage }) => !baselineKeys.has(`${scope}:${variant}:${stage}`))
+          .map(({ variant, stage }) => `${variant}:${stage}`)
+          .sort(),
+        gapCells: result.gapCells,
+      }
+    }
+    const cases = [
+      {
+        name: 'command-lifetime preflight receipt',
+        overrides: {
+          'src/store/browser-repo.ts': replaceOwnerSource(
+            browserRepoSource,
+            'async function readAttachmentReapPlan(',
+            'function protocolDiscoveryCacheEvictions(',
+            'rowCount: plan.candidates.length,',
+            'rowCount: 0,',
+          ),
+        },
+        common: 'exactPreflightReceipt',
+        reopened: ['attachment.reap:receiptDelta', 'attachment.reap:tables'],
+      },
+      {
+        name: 'shared bounded disposition snapshot',
+        overrides: {
+          'src/store/browser-mutation-runtime.ts': replaceOwnerSource(
+            mutationRuntimeSource,
+            'const readAttachmentDispositionState = async (',
+            'const requireConsistentAttachmentDispositionState = (',
+            '.first()',
+            '.toArray()',
+          ),
+        },
+        common: 'sharedCurrentStateTransition',
+        reopened: [
+          'attachment.delete-if-unreferenced:receiptDelta',
+          'attachment.delete-if-unreferenced:tables',
+          'attachment.delete-many:receiptDelta',
+          'attachment.delete-many:tables',
+          'attachment.reap:receiptDelta',
+          'attachment.reap:tables',
+        ],
+      },
+      {
+        name: 'retention-state receipt absorption',
+        overrides: {
+          'src/store/browser-repo.ts': replaceOwnerSource(
+            browserRepoSource,
+            'private async reapAttachments(',
+            'private async putDraftRow(',
+            'receipt.absorb(await commitStorageRetentionPage(tx, cycle, outcome))',
+            'await commitStorageRetentionPage(tx, cycle, outcome)',
+          ),
+        },
+        common: 'exactTransactionReceipt',
+        reopened: ['attachment.reap:receiptDelta'],
+      },
+      {
+        name: 'durable page replay identity',
+        overrides: {
+          'src/store/browser-repo.ts': replaceOwnerSource(
+            browserRepoSource,
+            'function attachmentReapReplayPlan(',
+            'async function readAttachmentReapPlan(',
+            "owner: 'storage-retention:attachment-reap'",
+            "owner: 'storage-retention:other'",
+          ),
+        },
+        common: 'typedDurableReplay',
+        reopened: ['attachment.reap:idempotence'],
       },
     ] as const
 

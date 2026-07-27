@@ -10,6 +10,7 @@ import type {
   ActiveBranchSelection,
   VersionedActiveBranchSpine,
 } from '../../src/core/active-branch-spine'
+import { emptyActiveBranchChildSlot } from '../../src/core/active-branch-spine'
 import type { BranchPathWindow } from '../../src/core/branch-session'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import type {
@@ -40,6 +41,7 @@ import type {
   ConversationForksResult,
   ConversationTopologyResult,
 } from '../../src/store/workspace-protocol'
+import { testChildSlotsForHeaders } from '../helpers/message-storage'
 
 const FENCE: Readonly<{ workspaceId: string; replacementEpoch: number }> = Object.freeze({
   workspaceId: 'router-controller-workspace',
@@ -138,13 +140,16 @@ class ProjectionSource implements ConversationProjectionSource {
       this.envelope(this.children(parentId)[position]?.header.id ?? null),
   )
   readonly loadTopology = vi.fn(
-    async (): Promise<ConversationReadEnvelope<ConversationTopologyResult>> =>
-      this.envelope({
+    async (): Promise<ConversationReadEnvelope<ConversationTopologyResult>> => {
+      const headers = [...this.rows.values()].map((row) => row.header)
+      return this.envelope({
         kind: 'ready',
         chat: structuredClone(this.currentChat),
         structuralVersion: this.currentChat.structuralVersion,
-        headers: [...this.rows.values()].map((row) => row.header),
-      }),
+        headers,
+        childSlots: testChildSlotsForHeaders(CHAT_ID, headers),
+      })
+    },
   )
   readonly loadTranscriptPage = vi.fn(
     async (
@@ -219,6 +224,7 @@ class ProjectionSource implements ConversationProjectionSource {
       },
       presentations: tip ? [tip] : [],
       forks: path.map((row) => this.forkFor(row.header.id)),
+      terminalChildSlot: emptyActiveBranchChildSlot(tipId),
     }
   }
 
@@ -260,6 +266,7 @@ class ProjectionSource implements ConversationProjectionSource {
           },
           presentations: [],
           forks: [],
+          terminalChildSlot: emptyActiveBranchChildSlot(null),
         }),
       )
     }
@@ -286,6 +293,7 @@ class ProjectionSource implements ConversationProjectionSource {
         },
         presentations: [tip],
         forks: path.map((row) => this.forkFor(row.header.id)),
+        terminalChildSlot: emptyActiveBranchChildSlot(targetId),
       }),
     )
   }
@@ -365,6 +373,8 @@ class ProjectionSource implements ConversationProjectionSource {
       slotVersion: siblings.reduce((sum, row) => sum + row.header.nodeVersion + 1, 0),
       position,
       liveCount: siblings.length,
+      nextSiblingIndex:
+        Math.max(...siblings.map((row) => row.header.siblingIndex)) + 1,
       previousMessageId: siblings[position - 1]?.header.id ?? null,
       nextMessageId: siblings[position + 1]?.header.id ?? null,
       firstMessageId: siblings[0]?.header.id as MessageId,

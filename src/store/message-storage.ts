@@ -1,7 +1,11 @@
 import type Dexie from 'dexie'
 import type { DBCore, DBCoreMutateRequest, Middleware } from 'dexie'
+import { findLastUpdatedLeafId } from '../core/active-path'
 import { normalizeAttachmentRefs } from '../core/attachment-refs'
+import { buildBranchMessages } from '../core/branch-flatten'
+import { buildChildSlotProjection, type ChildSlotProjection } from '../core/child-list-state'
 import { type AppliedMessageView, createAppliedMessageView } from '../core/continuation-content'
+import { assertCanonicalGeneratedOutputMessage } from '../core/generated-output-localization'
 import { messageTreeIndexFields } from '../core/message-tree-index'
 import type { MessageHeaderRow as CoreMessageHeaderRow } from '../core/messages'
 import {
@@ -176,6 +180,61 @@ export interface MessageTextPreviewRow {
   text: string
 }
 
+export type CurrentMessageCustodyDisposition =
+  | { readonly kind: 'available' }
+  | { readonly kind: 'preserve' }
+  | {
+      readonly kind: 'reserved-attempt-target'
+      readonly messageId: MessageId
+      readonly streamId: string
+    }
+
+export interface CurrentMessageTransition {
+  readonly storage: {
+    readonly header: MessageHeaderRow
+    readonly body: MessageBodyRow
+    readonly preview: MessageTextPreviewRow
+  }
+  readonly attachmentOwner: {
+    readonly ownerKind: 'message'
+    readonly ownerId: MessageId
+    readonly chatId: ChatId
+    readonly previousRefs: readonly MessageAttachmentRef[] | undefined
+    readonly nextRefs: readonly MessageAttachmentRef[] | undefined
+  }
+  readonly summary: {
+    readonly wordCount: number
+    readonly costUsd: number
+    readonly previewCandidate: string | undefined
+  }
+  readonly structural: {
+    readonly messageId: MessageId
+    readonly chatId: ChatId
+    readonly parentId: MessageId | null
+    readonly siblingIndex: number
+    readonly createdAt: number
+    readonly deleted: boolean
+    readonly role: Message['role']
+  }
+  readonly timestamp: {
+    readonly kind: 'exact' | 'transaction-allocated'
+    readonly createdAt: number
+  }
+  readonly custody: CurrentMessageCustodyDisposition
+}
+
+export interface CurrentMessageGraphTransition {
+  readonly messages: readonly Message[]
+  readonly transitions: readonly CurrentMessageTransition[]
+  readonly childSlots: ChildSlotProjection
+  readonly lastUpdatedLeafId: MessageId | null
+  readonly branchMessages: readonly Message[]
+  readonly branchTransitions: readonly CurrentMessageTransition[]
+  readonly wordCount: number
+  readonly totalCostUsd: number
+  readonly previewText: string
+}
+
 export const MESSAGE_BODY_KEYS: readonly MessageBodyKey[] = [
   'content',
   'reasoningEnvelope',
@@ -317,6 +376,108 @@ export function splitMessageForStorage(
   const preview = syncMessageHeaderProjections(header, body)
 
   return { header, body, preview }
+}
+
+export function compileCurrentMessageTransition(
+  message: Message,
+  options: {
+    readonly bodyVersion?: number
+    readonly requestContextVersion?: number
+    readonly updatedAt?: number
+    readonly previousAttachmentRefs?: readonly MessageAttachmentRef[] | undefined
+    readonly custody: CurrentMessageCustodyDisposition
+    readonly timestamp: 'exact' | 'transaction-allocated'
+  },
+): CurrentMessageTransition {
+  assertCanonicalGeneratedOutputMessage(message.content, message.attachmentRefs, message.id)
+  const storage = splitMessageForStorage(message, options)
+  if (
+    options.custody.kind === 'reserved-attempt-target' &&
+    options.custody.messageId !== message.id
+  ) {
+    throw new Error(
+      `CurrentMessageAttemptCustodyMismatch:${message.id}:${options.custody.messageId}`,
+    )
+  }
+  const generationStatus = message.generation?.status
+  if (
+    (generationStatus === 'preparing' || generationStatus === 'streaming') &&
+    options.custody.kind === 'available'
+  ) {
+    throw new Error(`CurrentMessageAttemptCustodyMissing:${message.id}`)
+  }
+  return Object.freeze({
+    storage: Object.freeze(storage),
+    attachmentOwner: Object.freeze({
+      ownerKind: 'message',
+      ownerId: message.id,
+      chatId: message.chatId,
+      previousRefs: options.previousAttachmentRefs,
+      nextRefs: message.attachmentRefs,
+    }),
+    summary: Object.freeze({
+      wordCount: message.deleted ? 0 : storage.header.bodyWordCount,
+      costUsd: message.deleted ? 0 : (message.generation?.cost ?? 0),
+      previewCandidate:
+        !message.deleted && message.role === 'user' ? storage.preview.text : undefined,
+    }),
+    structural: Object.freeze({
+      messageId: message.id,
+      chatId: message.chatId,
+      parentId: message.parentId,
+      siblingIndex: message.siblingIndex,
+      createdAt: message.createdAt,
+      deleted: message.deleted,
+      role: message.role,
+    }),
+    timestamp: Object.freeze({ kind: options.timestamp, createdAt: message.createdAt }),
+    custody: options.custody,
+  })
+}
+
+export function compileCurrentMessageGraphTransition(
+  chatId: ChatId,
+  messages: readonly Message[],
+  updatedAt: number,
+): CurrentMessageGraphTransition {
+  for (const message of messages) {
+    if (message.chatId !== chatId) {
+      throw new Error(`CurrentMessageGraphChatMismatch:${chatId}:${message.id}:${message.chatId}`)
+    }
+  }
+  const transitions = messages.map((message) =>
+    compileCurrentMessageTransition(message, {
+      updatedAt,
+      timestamp: 'exact',
+      custody: { kind: 'available' },
+    }),
+  )
+  const transitionById = new Map(
+    transitions.map((transition) => [transition.storage.header.id, transition]),
+  )
+  const lastUpdatedLeafId = findLastUpdatedLeafId(messages)
+  const branchMessages = buildBranchMessages(messages, lastUpdatedLeafId)
+  return Object.freeze({
+    messages,
+    transitions: Object.freeze(transitions),
+    childSlots: buildChildSlotProjection(chatId, messages, { updatedAt }),
+    lastUpdatedLeafId,
+    branchMessages: Object.freeze(branchMessages),
+    branchTransitions: Object.freeze(
+      branchMessages.map((message) => {
+        const transition = transitionById.get(message.id)
+        if (!transition) throw new Error(`CurrentMessageTransitionMissing:${message.id}`)
+        return transition
+      }),
+    ),
+    wordCount: branchMessages.reduce((total, message) => {
+      const transition = transitionById.get(message.id)
+      if (!transition) throw new Error(`CurrentMessageTransitionMissing:${message.id}`)
+      return total + transition.summary.wordCount
+    }, 0),
+    totalCostUsd: transitions.reduce((total, transition) => total + transition.summary.costUsd, 0),
+    previewText: previewTextFromMessages(messages),
+  })
 }
 
 export function hydrateMessage(header: MessageHeaderRow, body: MessageBodyRow): Message {

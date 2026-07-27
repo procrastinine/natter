@@ -14,7 +14,6 @@ import {
   type ChatSidebarProjectionTransition,
   emptyChatSidebarProjectionMutationReceipt,
 } from './chat-sidebar-projection'
-import { currentChatRowForTransaction, type TransactionCurrentChat } from './chat-storage-codec'
 import {
   CONFIGURATION_LINK_MUTATION_TRANSACTION_CAPABILITY,
   CONFIGURATION_PROFILE_MANAGER_STATE_ID,
@@ -42,19 +41,19 @@ export const CHAT_ROW_LINKED_TRANSACTION_CAPABILITY = physicalStorageTables(
 
 const chatRowWriteTransitionBrand: unique symbol = Symbol('ChatRowWriteTransition')
 
-export type ChatRowWriteTransitionInput =
+type ChatRowWriteTransitionInput =
   | {
       readonly kind: 'add-linked'
       readonly next: Chat
     }
   | {
       readonly kind: 'replace-linked'
-      readonly previous: TransactionCurrentChat
+      readonly previous: Chat
       readonly next: Chat
     }
   | {
       readonly kind: 'replace-preserving-links'
-      readonly previous: TransactionCurrentChat
+      readonly previous: Chat
       readonly next: Chat
     }
 
@@ -65,12 +64,12 @@ type ChatRowWriteTransition = (
     }
   | {
       readonly kind: 'replace-linked'
-      readonly previous: TransactionCurrentChat
+      readonly previous: Chat
       readonly next: Chat
     }
   | {
       readonly kind: 'replace-preserving-links'
-      readonly previous: TransactionCurrentChat
+      readonly previous: Chat
       readonly next: Chat
     }
 ) & {
@@ -79,7 +78,10 @@ type ChatRowWriteTransition = (
 
 export interface LinkedChatRowMutationReceipt {
   readonly links: ConfigurationOwnerLinkMutationReceipt
+  readonly chatWrites: ChatRowWriteMutationReceipt['chatWrites']
+  readonly linkPhases: ChatRowWriteMutationReceipt['linkPhases']
   readonly sidebar: ChatSidebarProjectionMutationReceipt
+  readonly fragment: SemanticOperationReceiptFragment<ChatRowWriteReceiptTableName>
 }
 
 type ChatRowWriteReceiptTableName =
@@ -106,32 +108,22 @@ export interface ChatRowWriteMutationReceipt<
   readonly fragment: SemanticOperationReceiptFragment<Tables>
 }
 
-function chatRowWriteTransition(
-  tx: Transaction,
-  input: ChatRowWriteTransitionInput,
-): ChatRowWriteTransition {
-  if (input.kind === 'add-linked') {
-    return Object.freeze({ ...input, [chatRowWriteTransitionBrand]: true as const })
-  }
-  return Object.freeze({
-    ...input,
-    previous: currentChatRowForTransaction(tx, input.previous),
-    [chatRowWriteTransitionBrand]: true as const,
-  })
+function chatRowWriteTransition(input: ChatRowWriteTransitionInput): ChatRowWriteTransition {
+  return Object.freeze({ ...input, [chatRowWriteTransitionBrand]: true as const })
 }
 
-export function applyChatRowWriteTransitions(
+function applyChatRowWriteTransitions(
   tx: Transaction,
   inputs: readonly Extract<
     ChatRowWriteTransitionInput,
     { readonly kind: 'replace-preserving-links' }
   >[],
 ): Promise<ChatRowWriteMutationReceipt<ChatRowPreservingReceiptTableName>>
-export function applyChatRowWriteTransitions(
+function applyChatRowWriteTransitions(
   tx: Transaction,
   inputs: readonly ChatRowWriteTransitionInput[],
 ): Promise<ChatRowWriteMutationReceipt>
-export async function applyChatRowWriteTransitions(
+async function applyChatRowWriteTransitions(
   tx: Transaction,
   inputs: readonly ChatRowWriteTransitionInput[],
 ): Promise<ChatRowWriteMutationReceipt> {
@@ -144,7 +136,7 @@ export async function applyChatRowWriteTransitions(
       fragment: semanticOperationReceiptFragment<ChatRowWriteReceiptTableName>({}),
     })
   }
-  const transitions = inputs.map((input) => chatRowWriteTransition(tx, input))
+  const transitions = inputs.map(chatRowWriteTransition)
   const ids = new Set<ChatId>()
   const additions: Chat[] = []
   const linkedReplacements: Chat[] = []
@@ -209,26 +201,192 @@ export async function applyChatRowWriteTransitions(
   })
 }
 
-export async function applyLinkedChatRowReplacement(
-  tx: Transaction,
-  previous: TransactionCurrentChat,
-  next: Chat,
-): Promise<LinkedChatRowMutationReceipt> {
-  return applyLinkedChatRowReplacements(tx, [{ previous, next }])
+export interface TransactionChatMutationReader {
+  read(chatId: ChatId): Promise<Chat | undefined>
+  readWithEvidence(chatId: ChatId): Promise<{
+    readonly chat: Chat | undefined
+    readonly requestCount: 0 | 1
+    readonly rowCount: 0 | 1
+  }>
+  readMany(chatIds: readonly ChatId[]): Promise<readonly (Chat | undefined)[]>
+  readAll(): Promise<readonly Chat[]>
+  readFolder(folderId: NonNullable<Chat['folderId']>): Promise<readonly Chat[]>
 }
 
-export async function applyLinkedChatRowReplacements(
-  tx: Transaction,
-  inputs: readonly { readonly previous: TransactionCurrentChat; readonly next: Chat }[],
-): Promise<LinkedChatRowMutationReceipt> {
-  const receipt = await applyChatRowWriteTransitions(
-    tx,
-    inputs.map(({ previous, next }) => ({ kind: 'replace-linked', previous, next })),
-  )
-  return Object.freeze({
-    links: receipt.linkPhases[0] ?? emptyConfigurationOwnerLinkMutationReceipt(),
-    sidebar: receipt.sidebar,
-  })
+export interface PreservingChatMutationOwner extends TransactionChatMutationReader {
+  replace(chatId: ChatId, update: (current: Readonly<Chat>) => Chat): Chat
+  commit(): Promise<ChatRowWriteMutationReceipt<ChatRowPreservingReceiptTableName>>
+}
+
+export interface LinkedChatMutationOwner extends TransactionChatMutationReader {
+  add(next: Chat): Promise<void>
+  replaceLinked(chatId: ChatId, update: (current: Readonly<Chat>) => Chat): Chat
+  replacePreserving(chatId: ChatId, update: (current: Readonly<Chat>) => Chat): Chat
+  commit(): Promise<LinkedChatRowMutationReceipt>
+}
+
+type StagedReplacementKind = 'replace-linked' | 'replace-preserving-links'
+
+class TransactionChatMutationOwner implements LinkedChatMutationOwner {
+  readonly #original = new Map<ChatId, Chat | undefined>()
+  readonly #current = new Map<ChatId, Chat | undefined>()
+  readonly #staged = new Map<
+    ChatId,
+    {
+      readonly previous: Chat
+      readonly kind: StagedReplacementKind
+      readonly next: Chat
+    }
+  >()
+  readonly #additions = new Map<ChatId, Chat>()
+  #committed = false
+  readonly tx: Transaction
+  readonly linked: boolean
+
+  constructor(tx: Transaction, linked: boolean) {
+    this.tx = tx
+    this.linked = linked
+  }
+
+  async read(chatId: ChatId): Promise<Chat | undefined> {
+    return (await this.readWithEvidence(chatId)).chat
+  }
+
+  async readWithEvidence(chatId: ChatId): Promise<{
+    readonly chat: Chat | undefined
+    readonly requestCount: 0 | 1
+    readonly rowCount: 0 | 1
+  }> {
+    this.#assertOpen()
+    const requestCount = this.#original.has(chatId) ? 0 : 1
+    if (requestCount === 1) {
+      const row = await this.tx.table<Chat, ChatId>('chats').get(chatId)
+      this.#register(chatId, row)
+    }
+    const chat = this.#current.get(chatId)
+    return { chat, requestCount, rowCount: requestCount === 1 && chat ? 1 : 0 }
+  }
+
+  async readMany(chatIds: readonly ChatId[]): Promise<readonly (Chat | undefined)[]> {
+    this.#assertOpen()
+    const missing = [...new Set(chatIds.filter((chatId) => !this.#original.has(chatId)))]
+    if (missing.length > 0) {
+      const rows = await this.tx.table<Chat, ChatId>('chats').bulkGet(missing)
+      for (const [index, chatId] of missing.entries()) this.#register(chatId, rows[index])
+    }
+    return chatIds.map((chatId) => this.#current.get(chatId))
+  }
+
+  async readAll(): Promise<readonly Chat[]> {
+    this.#assertOpen()
+    const rows = await this.tx.table<Chat, ChatId>('chats').toArray()
+    for (const row of rows) this.#register(row.id, row)
+    return rows.map((row) => this.#current.get(row.id) as Chat)
+  }
+
+  async readFolder(folderId: NonNullable<Chat['folderId']>): Promise<readonly Chat[]> {
+    this.#assertOpen()
+    const rows = await this.tx
+      .table<Chat, ChatId>('chats')
+      .where('folderId')
+      .equals(folderId)
+      .toArray()
+    for (const row of rows) this.#register(row.id, row)
+    return rows.map((row) => this.#current.get(row.id) as Chat)
+  }
+
+  async add(next: Chat): Promise<void> {
+    this.#assertOpen()
+    if (!this.linked) throw new Error('ChatMutationLinkedWriteNotAllowed')
+    if (this.#current.get(next.id) || this.#additions.has(next.id)) {
+      throw new Error(`ChatMutationAddDuplicate:${next.id}`)
+    }
+    if (!this.#original.has(next.id)) this.#register(next.id, undefined)
+    this.#additions.set(next.id, next)
+    this.#current.set(next.id, next)
+  }
+
+  replaceLinked(chatId: ChatId, update: (current: Readonly<Chat>) => Chat): Chat {
+    if (!this.linked) throw new Error('ChatMutationLinkedWriteNotAllowed')
+    return this.#replace(chatId, 'replace-linked', update)
+  }
+
+  replacePreserving(chatId: ChatId, update: (current: Readonly<Chat>) => Chat): Chat {
+    return this.#replace(chatId, 'replace-preserving-links', update)
+  }
+
+  async commit(): Promise<LinkedChatRowMutationReceipt> {
+    this.#assertOpen()
+    this.#committed = true
+    const receipt = await applyChatRowWriteTransitions(this.tx, [
+      ...[...this.#additions.values()].map((next) => ({ kind: 'add-linked' as const, next })),
+      ...this.#staged.values(),
+    ])
+    if (receipt.linkPhases.length > 1) throw new Error('ChatMutationMixedLinkPhasesUnsupported')
+    return Object.freeze({
+      links: receipt.linkPhases[0] ?? emptyConfigurationOwnerLinkMutationReceipt(),
+      chatWrites: receipt.chatWrites,
+      linkPhases: receipt.linkPhases,
+      sidebar: receipt.sidebar,
+      fragment: receipt.fragment,
+    })
+  }
+
+  #replace(
+    chatId: ChatId,
+    kind: StagedReplacementKind,
+    update: (current: Readonly<Chat>) => Chat,
+  ): Chat {
+    this.#assertOpen()
+    const current = this.#current.get(chatId)
+    if (!this.#original.has(chatId)) throw new Error(`ChatMutationCurrentNotRead:${chatId}`)
+    if (!current) throw new Error(`ChatMutationCurrentMissing:${chatId}`)
+    const next = update(current)
+    if (next.id !== chatId) throw new Error(`ChatMutationIdentityMismatch:${chatId}:${next.id}`)
+    if (this.#additions.has(chatId)) {
+      this.#additions.set(chatId, next)
+      this.#current.set(chatId, next)
+      return next
+    }
+    const previous = this.#original.get(chatId)
+    if (!previous) throw new Error(`ChatMutationCurrentMissing:${chatId}`)
+    const priorStage = this.#staged.get(chatId)
+    this.#staged.set(chatId, {
+      previous,
+      kind: priorStage?.kind === 'replace-linked' ? priorStage.kind : kind,
+      next,
+    })
+    this.#current.set(chatId, next)
+    return next
+  }
+
+  #register(chatId: ChatId, row: Chat | undefined): void {
+    if (this.#original.has(chatId)) return
+    this.#original.set(chatId, row)
+    this.#current.set(chatId, row)
+  }
+
+  #assertOpen(): void {
+    if (this.#committed) throw new Error('ChatMutationOwnerCommitted')
+  }
+}
+
+export function openPreservingChatMutation(tx: Transaction): PreservingChatMutationOwner {
+  const owner = new TransactionChatMutationOwner(tx, false)
+  return {
+    read: (chatId) => owner.read(chatId),
+    readWithEvidence: (chatId) => owner.readWithEvidence(chatId),
+    readMany: (chatIds) => owner.readMany(chatIds),
+    readAll: () => owner.readAll(),
+    readFolder: (folderId) => owner.readFolder(folderId),
+    replace: (chatId, update) => owner.replacePreserving(chatId, update),
+    commit: () =>
+      owner.commit() as Promise<ChatRowWriteMutationReceipt<ChatRowPreservingReceiptTableName>>,
+  }
+}
+
+export function openLinkedChatMutation(tx: Transaction): LinkedChatMutationOwner {
+  return new TransactionChatMutationOwner(tx, true)
 }
 
 function chatRowWriteMutationReceiptFragment(

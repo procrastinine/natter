@@ -477,6 +477,124 @@ describe('generation intent outbound-path and body-I/O contract', () => {
     expect(regenerateWireText).not.toContain('mutated system')
   })
 
+  it('commits the exact nonzero-sibling regenerate placement shown at admission', async () => {
+    const chat = await createChat({ settings: boundedSettings() })
+    const path = await seedLinear(chat.id, [
+      { role: 'user', text: 'regenerate exact placement parent' },
+      { role: 'assistant', text: 'regenerate exact placement target' },
+    ])
+    const target = required(path.at(-1), 'regenerate placement target')
+    await executeMessageCommand({
+      kind: 'message.insert-sibling',
+      input: {
+        chatId: chat.id,
+        targetId: target.id,
+        role: 'assistant',
+        content: [{ type: 'output_text', text: 'existing sibling' }],
+      },
+    })
+    const intent = {
+      kind: 'regenerate' as const,
+      chatId: chat.id,
+      targetAssistantId: target.id,
+    }
+    let releaseProvider: () => void = () => undefined
+    const providerGate = new Promise<void>((resolve) => {
+      releaseProvider = resolve
+    })
+    const presented = vi.spyOn(conversationController, 'presentGenerationIntent')
+    let immediate: Message | undefined
+    let committed: Message | undefined
+    let preparedAssistantId: MessageId | undefined
+    try {
+      const handle = await startControlledGeneration(intent, {
+        profile: profile(),
+        openStream: () => gatedCompletedStream(providerGate, 'replacement answer'),
+      })
+      immediate = required(presented.mock.calls.at(-1)?.[1].messages.at(-1), 'immediate placement')
+      const prepared = await handle.prepared
+      preparedAssistantId = prepared.assistantMessageId
+      committed = required(
+        (await readTestMessages(chat.id)).find(
+          (message) => message.id === prepared.assistantMessageId,
+        ),
+        'committed placement',
+      )
+      releaseProvider()
+      await expect(handle.completed).resolves.toMatchObject({ outcome: 'done' })
+    } finally {
+      presented.mockRestore()
+      releaseProvider()
+    }
+    const exactImmediate = required(immediate, 'captured immediate placement')
+    const exactCommitted = required(committed, 'captured committed placement')
+    expect(exactImmediate.siblingIndex).toBe(2)
+    expect(exactCommitted.id).toBe(preparedAssistantId)
+    const {
+      generation: immediateGeneration,
+      nodeVersion: immediateNodeVersion,
+      ...immediateMessage
+    } = exactImmediate
+    const {
+      generation: committedGeneration,
+      nodeVersion: committedNodeVersion,
+      ...committedMessage
+    } = exactCommitted
+    expect(committedMessage).toEqual(immediateMessage)
+    expect(immediateNodeVersion).toBe(0)
+    expect(committedNodeVersion).toBeGreaterThan(0)
+    const { reasoningVisibility: _immediateVisibility, ...immediateProvenance } = required(
+      immediateGeneration,
+      'immediate generation',
+    )
+    expect(committedGeneration).toMatchObject({
+      ...immediateProvenance,
+      status: 'streaming',
+    })
+  })
+
+  it.each([
+    'send',
+    'regenerate',
+    'continue',
+  ] as const)('%s remains eligible after re-reading an imported chain from durable storage', async (kind) => {
+    const chat = await createChat({
+      settings: boundedSettings({ continueSystemPrompt: '', continueUserPrompt: '' }),
+    })
+    const path = await seedLinear(chat.id, [
+      { role: 'user', text: 'imported generation parent' },
+      { role: 'assistant', text: 'imported assistant without generation metadata' },
+    ])
+    const durablePath = await readTestMessages(chat.id)
+    const user = required(
+      durablePath.find((message) => message.id === path.at(-2)?.id),
+      'durable imported user',
+    )
+    const assistant = required(
+      durablePath.find((message) => message.id === path.at(-1)?.id),
+      'durable imported assistant',
+    )
+    expect(user.origin).toBe('imported')
+    expect(assistant.origin).toBe('imported')
+    expect(assistant.generation).toBeUndefined()
+
+    const intent: GenerationIntent =
+      kind === 'send'
+        ? {
+            kind,
+            chatId: chat.id,
+            expectedLeafId: assistant.id,
+            content: [{ type: 'text', text: 'send after imported chain' }],
+          }
+        : { kind, chatId: chat.id, targetAssistantId: assistant.id }
+    const result = await runToCompletion(intent, () =>
+      completedStream(`${kind} after imported chain`),
+    )
+
+    expect(result.completed).toMatchObject({ outcome: 'done' })
+    expect(result.completed.error).toBeUndefined()
+  })
+
   it('retains one frozen first submit while destination selection settles', async () => {
     const chat = await createChat({ settings: boundedSettings() })
     const path = await seedLinear(chat.id, [

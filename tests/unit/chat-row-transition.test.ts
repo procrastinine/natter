@@ -5,11 +5,9 @@ import type { Chat, ChatId } from '../../src/core/types'
 import { runBrowserCommandTransaction } from '../../src/store/browser-command-mutation-journal'
 import { deleteBrowserWorkspaceCompactionState } from '../../src/store/browser-workspace-database-control'
 import {
-  applyChatRowWriteTransitions,
-  applyLinkedChatRowReplacements,
   CHAT_ROW_LINKED_TRANSACTION_CAPABILITY,
   CHAT_ROW_PRESERVING_LINKS_TRANSACTION_CAPABILITY,
-  type ChatRowWriteTransitionInput,
+  openLinkedChatMutation,
 } from '../../src/store/chat-row-transition'
 import {
   accumulateChatSidebarAggregateRows,
@@ -19,11 +17,6 @@ import {
   createChatSidebarAggregateAccumulator,
   materializeChatSidebarAggregateRows,
 } from '../../src/store/chat-sidebar-projection'
-import {
-  readCurrentChatForTransaction,
-  readCurrentChatRowsForTransaction,
-  type TransactionCurrentChat,
-} from '../../src/store/chat-storage-codec'
 import { buildChat } from '../../src/store/chats'
 import { createDbForTests, type NatterDb } from '../../src/store/db'
 import {
@@ -182,7 +175,7 @@ describe('chat row transition', () => {
     )
 
     const committed = await executeLinkedReplacements(db, async (tx) => {
-      const current = await readCurrentChatRowsForTransaction(
+      const current = await currentChats(
         tx,
         previous.map(({ id }) => id),
       )
@@ -215,24 +208,25 @@ describe('chat row transition', () => {
     ])
   })
 
-  it('rejects duplicate linked replacement identities before mutating the batch', async () => {
+  it('coalesces repeated linked replacements into one authoritative write', async () => {
     const db = await openDatabase()
     const previous = chat('duplicate-receipt')
     await executeTransitions(db, LINKED_PLAN, [{ kind: 'add-linked', next: previous }])
     const before = await transitionState(db, previous.id)
 
-    await expect(
-      executeLinkedReplacements(db, async (tx) => {
-        const current = await currentChat(tx, previous.id)
-        const next = { ...current, title: 'must not be written' }
-        return [
-          { previous: current, next },
-          { previous: current, next },
-        ]
-      }),
-    ).rejects.toThrow(`ChatRowWriteTransitionDuplicate:${previous.id}`)
+    const committed = await executeLinkedReplacements(db, async (tx) => {
+      const current = await currentChat(tx, previous.id)
+      return [
+        { previous: current, next: { ...current, title: 'first' } },
+        { previous: current, next: { ...current, title: 'final' } },
+      ]
+    })
 
-    expect(await transitionState(db, previous.id)).toEqual(before)
+    expect(committed.value.chatWrites).toEqual([
+      { chatId: previous.id, transition: 'replace-linked' },
+    ])
+    expect((await db.chats.get(previous.id))?.title).toBe('final')
+    expect(await transitionState(db, previous.id)).not.toEqual(before)
   })
 
   it('rejects a preserving-links lie before any transition in the mixed batch mutates', async () => {
@@ -317,20 +311,35 @@ describe('chat row transition', () => {
     )
   })
 
-  it('rejects a prior that was not read by the exact write transaction', async () => {
+  it('does not use a stale UI snapshot as write eligibility or overwrite current fields', async () => {
     const db = await openDatabase()
-    const previous = chat('foreign-prior')
+    const previous = chat('stale-ui-snapshot')
     await executeTransitions(db, LINKED_PLAN, [{ kind: 'add-linked', next: previous }])
-
-    await expect(
-      executeTransitions(db, PRESERVING_PLAN, [
+    await executeTransitions(db, PRESERVING_PLAN, async (tx) => {
+      const current = await currentChat(tx, previous.id)
+      return [
         {
           kind: 'replace-preserving-links',
-          previous: previous as TransactionCurrentChat,
-          next: { ...previous, title: 'stale' },
+          previous: current,
+          next: { ...current, tokenCalibration: { concurrent: calibration(3) } },
         },
-      ]),
-    ).rejects.toThrow(`ChatRowPriorNotCurrentTransaction:${previous.id}`)
+      ]
+    })
+    const staleUiSnapshot = structuredClone(previous)
+    await executeTransitions(db, PRESERVING_PLAN, async (tx) => {
+      const current = await currentChat(tx, staleUiSnapshot.id)
+      return [
+        {
+          kind: 'replace-preserving-links',
+          previous: current,
+          next: { ...current, title: 'accepted current write' },
+        },
+      ]
+    })
+    expect(await db.chats.get(previous.id)).toMatchObject({
+      title: 'accepted current write',
+      tokenCalibration: { concurrent: calibration(3) },
+    })
   })
 
   it('keeps linked additions bounded by pages rather than by a 128-row semantic cap', async () => {
@@ -382,7 +391,7 @@ describe('chat row transition', () => {
 
     await expect(
       executeTransitions(db, LINKED_PLAN, async (tx) => {
-        const current = await readCurrentChatRowsForTransaction(
+        const current = await currentChats(
           tx,
           rows.map((row) => row.id),
         )
@@ -428,18 +437,12 @@ describe('chat row transition', () => {
       },
     }))
     try {
-      const currentRows = await readCurrentChatRowsForTransaction(
-        recording.transaction,
-        rows.map((row) => row.id),
-      )
-      await applyChatRowWriteTransitions(
-        recording.transaction,
-        nextRows.map(({ next }, index) => ({
-          kind: 'replace-preserving-links' as const,
-          previous: currentRows[index] as TransactionCurrentChat,
-          next,
-        })),
-      )
+      const chatMutation = openLinkedChatMutation(recording.transaction)
+      await chatMutation.readMany(rows.map((row) => row.id))
+      for (const { previous, next } of nextRows) {
+        chatMutation.replacePreserving(previous.id, () => next)
+      }
+      await chatMutation.commit()
     } finally {
       recording.abortForTest()
     }
@@ -483,12 +486,12 @@ async function executeTransitions(
   db: NatterDb,
   plan: PhysicalTransactionPlan,
   transitionInput:
-    | readonly ChatRowWriteTransitionInput[]
+    | readonly TestChatRowWriteTransitionInput[]
     | ((
         tx: Transaction,
       ) =>
-        | readonly ChatRowWriteTransitionInput[]
-        | Promise<readonly ChatRowWriteTransitionInput[]>),
+        | readonly TestChatRowWriteTransitionInput[]
+        | Promise<readonly TestChatRowWriteTransitionInput[]>),
 ) {
   return db.transaction(
     'rw',
@@ -499,7 +502,20 @@ async function executeTransitions(
         const fenced = bindFencedTransaction(tx, plan)
         const transitions =
           typeof transitionInput === 'function' ? await transitionInput(fenced) : transitionInput
-        return applyChatRowWriteTransitions(fenced, transitions)
+        const chatMutation = openLinkedChatMutation(fenced)
+        for (const transition of transitions) {
+          if (transition.kind === 'add-linked') {
+            await chatMutation.add(transition.next)
+            continue
+          }
+          await chatMutation.read(transition.next.id)
+          if (transition.kind === 'replace-linked') {
+            chatMutation.replaceLinked(transition.next.id, () => transition.next)
+          } else {
+            chatMutation.replacePreserving(transition.next.id, () => transition.next)
+          }
+        }
+        return chatMutation.commit()
       })
       assertPhysicalTransactionTablesDeclared(plan, committed.facts.tableNames)
       return committed
@@ -510,12 +526,12 @@ async function executeTransitions(
 async function executeLinkedReplacements(
   db: NatterDb,
   replacementInput:
-    | readonly { readonly previous: TransactionCurrentChat; readonly next: Chat }[]
+    | readonly { readonly previous: Chat; readonly next: Chat }[]
     | ((
         tx: Transaction,
       ) =>
-        | readonly { readonly previous: TransactionCurrentChat; readonly next: Chat }[]
-        | Promise<readonly { readonly previous: TransactionCurrentChat; readonly next: Chat }[]>),
+        | readonly { readonly previous: Chat; readonly next: Chat }[]
+        | Promise<readonly { readonly previous: Chat; readonly next: Chat }[]>),
 ) {
   return db.transaction(
     'rw',
@@ -526,7 +542,12 @@ async function executeLinkedReplacements(
         const fenced = bindFencedTransaction(tx, LINKED_PLAN)
         const replacements =
           typeof replacementInput === 'function' ? await replacementInput(fenced) : replacementInput
-        return applyLinkedChatRowReplacements(fenced, replacements)
+        const chatMutation = openLinkedChatMutation(fenced)
+        await chatMutation.readMany(replacements.map(({ next }) => next.id))
+        for (const { next } of replacements) {
+          chatMutation.replaceLinked(next.id, () => next)
+        }
+        return chatMutation.commit()
       })
       assertPhysicalTransactionTablesDeclared(LINKED_PLAN, committed.facts.tableNames)
       return committed
@@ -534,11 +555,27 @@ async function executeLinkedReplacements(
   )
 }
 
-async function currentChat(tx: Transaction, chatId: ChatId): Promise<TransactionCurrentChat> {
-  const row = await readCurrentChatForTransaction(tx, chatId)
+async function currentChat(tx: Transaction, chatId: ChatId): Promise<Chat> {
+  const row = await tx.table<Chat, ChatId>('chats').get(chatId)
   if (!row) throw new Error(`MissingCurrentChat:${chatId}`)
   return row
 }
+
+async function currentChats(tx: Transaction, chatIds: readonly ChatId[]): Promise<Chat[]> {
+  const rows = await tx.table<Chat, ChatId>('chats').bulkGet([...chatIds])
+  return rows.map((row, index) => {
+    if (!row) throw new Error(`MissingCurrentChat:${chatIds[index] as ChatId}`)
+    return row
+  })
+}
+
+type TestChatRowWriteTransitionInput =
+  | { readonly kind: 'add-linked'; readonly next: Chat }
+  | {
+      readonly kind: 'replace-linked' | 'replace-preserving-links'
+      readonly previous: Chat
+      readonly next: Chat
+    }
 
 function calibration(updatedAt: number) {
   return {

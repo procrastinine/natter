@@ -5,6 +5,7 @@ import type {
   ActiveBranchForkTarget,
   ActiveBranchSelection,
 } from '../../src/core/active-branch-spine'
+import { emptyActiveBranchChildSlot } from '../../src/core/active-branch-spine'
 import type { BranchPathWindow } from '../../src/core/branch-session'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import {
@@ -39,6 +40,7 @@ import {
 } from '../../src/store/conversation-controller'
 import { type MessageHeaderRow, splitMessageForStorage } from '../../src/store/message-storage'
 import { transcriptBodyWindowRows } from '../../src/store/transcript-window'
+import { testChildSlotsForHeaders } from '../helpers/message-storage'
 
 const CHAT_ID = 'chat-background-fill'
 const FENCE = Object.freeze({ workspaceId: 'workspace-background-fill', replacementEpoch: 0 })
@@ -492,6 +494,7 @@ class DestinationFirstProjectionSource implements ConversationProjectionSource {
       },
       presentations: destination ? [destination] : [],
       forks: path.map((row) => singletonFork(row.header)),
+      terminalChildSlot: emptyActiveBranchChildSlot(destination?.header.id ?? null),
     }
     this.pendingSelectionValue = this.envelope(sealConversationSelection(provedSelection))
     return this.selectionRead.promise
@@ -522,11 +525,13 @@ class DestinationFirstProjectionSource implements ConversationProjectionSource {
   }
 
   async loadTopology() {
+    const headers = this.presentations.map((row) => row.header)
     return this.envelope({
       kind: 'ready' as const,
       chat: chat(this.rows.at(-1)?.id ?? null),
       structuralVersion: 1,
-      headers: this.presentations.map((row) => row.header),
+      headers,
+      childSlots: testChildSlotsForHeaders(CHAT_ID, headers),
     })
   }
 
@@ -643,6 +648,7 @@ function singletonFork(header: MessageHeaderRow): ActiveBranchForkSlot {
     slotVersion: header.nodeVersion + 1,
     position: 0,
     liveCount: 1,
+    nextSiblingIndex: 1,
     previousMessageId: null,
     nextMessageId: null,
     firstMessageId: header.id,

@@ -13,7 +13,7 @@ import {
   type MessagePresentation,
 } from '../core/messages'
 import type { Chat, ChatId, ChildListState, ChildSlotMember, MessageId } from '../core/types'
-import { readActiveBranchForkSlotsForHeadersInTransaction } from './active-branch-fork-storage'
+import { readActiveBranchPathSlotFrameInTransaction } from './active-branch-fork-storage'
 import { proveConversationSelectionFromExactPath } from './conversation-destination-seal'
 import { exactCompoundPrefixBetween } from './indexeddb-key-ranges'
 import {
@@ -533,6 +533,15 @@ export async function resolveConversationOpenReceipt(
   let retryTarget = receipt.retryTarget
   try {
     if (receipt.terminalHint.kind === 'empty') {
+      const slotFrame = await access.runFrame(['childLists'], (tx) =>
+        readActiveBranchPathSlotFrameInTransaction(
+          tx,
+          receipt.chat.id,
+          Object.freeze([]),
+          owned.signal,
+        ),
+      )
+      if (slotFrame.kind === 'stale') throw new ConversationOpenFrameStaleError()
       if (bodyDemand === 'terminal' && onTerminalPoint) {
         onTerminalPoint(
           Object.freeze({
@@ -550,6 +559,7 @@ export async function resolveConversationOpenReceipt(
         exactPathHeaders: Object.freeze([]),
         presentations: Object.freeze([]),
         forks: Object.freeze([]),
+        terminalChildSlot: slotFrame.value.terminalChildSlot,
         snapshotOwnership: 'adopt',
       })
     }
@@ -630,13 +640,13 @@ export async function resolveConversationOpenReceipt(
         reason: path.reason,
       })
     }
-    const forksPromise = access.runFrame(['childLists', 'childSlotMembers'], (tx) =>
-      readActiveBranchForkSlotsForHeadersInTransaction(tx, path.rows, owned.signal),
+    const slotFramePromise = access.runFrame(['childLists', 'childSlotMembers'], (tx) =>
+      readActiveBranchPathSlotFrameInTransaction(tx, receipt.chat.id, path.rows, owned.signal),
     )
-    ownedLegs.push(forksPromise)
-    const [terminalPoint, forkFrame] = await Promise.all([terminalPointPromise, forksPromise])
+    ownedLegs.push(slotFramePromise)
+    const [terminalPoint, slotFrame] = await Promise.all([terminalPointPromise, slotFramePromise])
     throwIfAborted(signal)
-    if (forkFrame.kind === 'stale') throw new ConversationOpenFrameStaleError()
+    if (slotFrame.kind === 'stale') throw new ConversationOpenFrameStaleError()
     return proveConversationSelectionFromExactPath({
       chat: receipt.chat,
       target: receipt.target,
@@ -646,7 +656,8 @@ export async function resolveConversationOpenReceipt(
         terminalPoint?.kind === 'tip-point'
           ? Object.freeze([terminalPoint.presentation])
           : Object.freeze([]),
-      forks: forkFrame.value,
+      forks: slotFrame.value.forks,
+      terminalChildSlot: slotFrame.value.terminalChildSlot,
       snapshotOwnership: 'adopt',
     })
   } catch (error) {

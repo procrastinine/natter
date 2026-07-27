@@ -56,10 +56,9 @@ import {
   replaceSemanticByteOwner,
 } from './byte-owner-mutation'
 import {
-  applyChatRowWriteTransitions,
   CHAT_ROW_PRESERVING_LINKS_TRANSACTION_CAPABILITY,
+  openPreservingChatMutation,
 } from './chat-row-transition'
-import { readCurrentChatForTransaction } from './chat-storage-codec'
 import {
   CONFIGURATION_PRESET_RECENCY_TRANSACTION_CAPABILITY,
   CONFIGURATION_PROFILE_CATALOG_TRANSACTION_CAPABILITY,
@@ -254,8 +253,6 @@ export async function prepareBrowserAttempt(
     appendValidatedGenerationPromptPath,
     assertNewChatAttemptRow,
     preparedGenerationPrompt,
-    preparedMessage,
-    requiredPromptPathSlot,
     requiredPromptPathTarget,
     resolveGenerationPromptPathProof,
   } = support
@@ -268,7 +265,11 @@ export async function prepareBrowserAttempt(
   ) {
     throw new Error(`AttemptPromptPathRequirementMismatch:${input.lease.streamId}`)
   }
-  const assistant = input.strategy === 'continue' ? undefined : input.assistant
+  const placement = input.strategy === 'continue' ? undefined : input.placement
+  const assistant = placement?.messages.find(
+    (message) => message.id === input.lease.messageId && message.role === 'assistant',
+  )
+  const user = placement?.messages.find((message) => message.role === 'user')
   const targetMessageId =
     requirement.target.kind === 'root' ? undefined : requirement.target.messageId
   const assistantId = assistant?.id ?? targetMessageId
@@ -293,17 +294,12 @@ export async function prepareBrowserAttempt(
       : {}),
   }
   const planningExpectation = input.configurationClaim
-  if ('user' in input) {
-    support.assertPreparedAttemptMessage(input.user, input.lease, 'user', 'user')
-  }
+  if (user) support.assertPreparedAttemptMessage(user, input.lease, 'user', 'user')
   if (assistant) {
     support.assertPreparedAttemptMessage(assistant, input.lease, 'assistant', 'generated')
   }
   const attachmentIds = new Set<AttachmentId>()
-  for (const message of [
-    ...('user' in input ? [input.user] : []),
-    ...(assistant ? [assistant] : []),
-  ]) {
+  for (const message of [...(user ? [user] : []), ...(assistant ? [assistant] : [])]) {
     if (message.chatId !== chatId) throw new Error(`AttemptMessageChatMismatch:${message.id}`)
     for (const ref of message.attachmentRefs ?? []) attachmentIds.add(ref.attachmentId)
   }
@@ -315,7 +311,7 @@ export async function prepareBrowserAttempt(
       attachmentId,
     })),
   ]
-  if ('user' in input) scopes.push({ kind: 'message', messageId: input.user.id })
+  if (user) scopes.push({ kind: 'message', messageId: user.id })
   if (input.strategy !== 'continue') scopes.push({ kind: 'chat-topology', chatId })
   if (targetMessageId) scopes.push({ kind: 'message', messageId: targetMessageId })
   const configurationLinkTransition = persistsCapturedConfiguration
@@ -354,7 +350,7 @@ export async function prepareBrowserAttempt(
       }
       const selectionBase = Object.freeze({
         chatId,
-        structuralVersion: currentChat.structuralVersion,
+        structuralVersion: input.promptPath.claim.structuralVersion,
         tipId: promptPath.leafId,
       })
       if (input.configurationClaim.presetId === null) delete planningChat.presetId
@@ -422,7 +418,21 @@ export async function prepareBrowserAttempt(
         }
       }
 
-      const preparedAssistantInput = input.assistant
+      const preparedAssistantInput = assistant
+      if (!placement || !preparedAssistantInput) {
+        throw new Error(`AttemptPlacementMissing:${input.lease.streamId}`)
+      }
+      if (
+        placement.chatId !== chatId ||
+        placement.structuralVersion !== input.promptPath.claim.structuralVersion ||
+        placement.createdAt !== input.lease.startedAt ||
+        placement.slot?.parentId !== input.promptPath.claim.placementSlot?.parentId ||
+        placement.slot?.slotVersion !== input.promptPath.claim.placementSlot?.slotVersion ||
+        placement.slot?.liveCount !== input.promptPath.claim.placementSlot?.liveCount ||
+        placement.slot?.nextSiblingIndex !== input.promptPath.claim.placementSlot?.nextSiblingIndex
+      ) {
+        throw new GenerationPlanningSeedChangedError(chatId)
+      }
       support.assertPreparedAttemptMessage(
         preparedAssistantInput,
         input.lease,
@@ -432,73 +442,24 @@ export async function prepareBrowserAttempt(
       if (await ctx.getMessageHeader(preparedAssistantInput.id)) {
         throw new Error(`AttemptAssistantAlreadyExists:${preparedAssistantInput.id}`)
       }
-      let user: Message | undefined
-      let parentId: MessageId | null
-      let siblingIndex: number
-      let assistantTurnId = preparedAssistantInput.turnId
-      let assistantTurnIndex = preparedAssistantInput.turnIndex
-
-      if (input.strategy === 'send' || input.strategy === 'new-chat-send') {
-        if (await ctx.getMessageHeader(input.user.id)) {
-          throw new Error(`AttemptUserAlreadyExists:${input.user.id}`)
-        }
-        const slot = requiredPromptPathSlot(promptPath, chatId)
-        user = preparedMessage(
-          { ...input.user, turnIndex: 0 },
-          promptPath.leafId,
-          slot.nextSiblingIndex,
-        )
-        user = await ctx.putMessage(user)
-        parentId = user.id
-        siblingIndex = 0
-      } else if (input.strategy === 'edit-resend') {
+      if (user && (await ctx.getMessageHeader(user.id))) {
+        throw new Error(`AttemptUserAlreadyExists:${user.id}`)
+      }
+      if (
+        input.strategy === 'edit-resend' ||
+        input.strategy === 'reply' ||
+        input.strategy === 'regenerate'
+      ) {
         requiredPromptPathTarget(promptPath, chatId)
-        if (await ctx.getMessageHeader(input.user.id)) {
-          throw new Error(`AttemptUserAlreadyExists:${input.user.id}`)
-        }
-        const slot = requiredPromptPathSlot(promptPath, chatId)
-        user = preparedMessage(
-          { ...input.user, turnIndex: 0 },
-          promptPath.leafId,
-          slot.nextSiblingIndex,
-        )
-        user = await ctx.putMessage(user)
-        parentId = user.id
-        siblingIndex = 0
-      } else if (input.strategy === 'reply') {
-        const parent = requiredPromptPathTarget(promptPath, chatId)
-        const slot = requiredPromptPathSlot(promptPath, chatId)
-        parentId = parent.id
-        siblingIndex = slot.nextSiblingIndex
-        assistantTurnId = parent.turnId
-        assistantTurnIndex = parent.turnIndex + 1
-      } else {
-        requiredPromptPathTarget(promptPath, chatId)
-        const slot = requiredPromptPathSlot(promptPath, chatId)
-        parentId = promptPath.leafId
-        siblingIndex = slot.nextSiblingIndex
-        assistantTurnIndex = 0
       }
-
-      if (user) {
-        assistantTurnId = user.turnId
-        assistantTurnIndex = user.turnIndex + 1
-      }
-      const pairedAssistant = {
-        ...preparedAssistantInput,
-        turnId: assistantTurnId,
-        turnIndex: assistantTurnIndex,
-        generation: {
-          ...preparedAssistantInput.generation,
-          model: attemptSettings.model,
-          requestedModel: attemptSettings.model,
-        },
-      }
-      const preparedAssistant = preparedMessage(pairedAssistant, parentId, siblingIndex)
-      const committedAssistant = await ctx.putMessage(preparedAssistant)
       const committedUser = user
+        ? await ctx.putMessage(user, { creationTimestamp: 'preserve' })
+        : undefined
+      const committedAssistant = await ctx.putMessage(preparedAssistantInput, {
+        creationTimestamp: 'preserve',
+      })
       const headers = await ctx.getMessageHeaders(
-        user ? [user.id, preparedAssistant.id] : [preparedAssistant.id],
+        committedUser ? [committedUser.id, preparedAssistantInput.id] : [preparedAssistantInput.id],
       )
       if (headers.some((header) => !header)) {
         throw new Error(`AttemptPreparedHeaderMissing:${input.lease.streamId}`)
@@ -512,7 +473,7 @@ export async function prepareBrowserAttempt(
       const planningPath = committedUserHeader
         ? appendValidatedGenerationPromptPath(promptPath, committedUserHeader)
         : promptPath
-      const planningLeafId = committedUserHeader?.id ?? parentId
+      const planningLeafId = committedUserHeader?.id ?? preparedAssistantInput.parentId
       const committedAssistantHeader = headers.find(
         (header) => header?.id === committedAssistant.id,
       )
@@ -589,6 +550,7 @@ export async function prepareBrowserAttempt(
         { kind: 'tip', messageId: value.assistant.id },
         value.assistant.id,
       )
+      const pathSlotFrame = await ctx.readFinalActiveBranchPathSlotFrame(chatId, value.headers)
       const selectionTransition = Object.freeze({
         kind: 'append-transition' as const,
         chat: committedChat,
@@ -600,7 +562,8 @@ export async function prepareBrowserAttempt(
         }),
         base: value.selectionBase,
         suffixHeaders: Object.freeze(value.headers),
-        forks: await ctx.readFinalActiveBranchForks(value.headers),
+        forks: pathSlotFrame.forks,
+        terminalChildSlot: pathSlotFrame.terminalChildSlot,
         presentations: Object.freeze(knownPresentations),
         fallback: Object.freeze({
           prefixHeaders: value.prompt.headers,
@@ -1163,8 +1126,9 @@ export async function commitBrowserGenerationMetadata(
         const plan = evidence.calibration
         recordGenerationMetadataPrimaryRead(physicalReads, 'chats')
         recordGenerationMetadataPrimaryRead(physicalReads, 'settings')
+        const chatMutation = openPreservingChatMutation(tx)
         const [chat, globalRow] = await Promise.all([
-          readCurrentChatForTransaction(tx, lease.chatId),
+          chatMutation.read(lease.chatId),
           settings.get(GLOBAL_TOKEN_CALIBRATION_KEY),
         ])
         const header = terminalGenerationHeader
@@ -1268,13 +1232,11 @@ export async function commitBrowserGenerationMetadata(
             }
           }
           if (acceptedSamples.length > 0) {
-            const transition = await applyChatRowWriteTransitions(tx, [
-              {
-                kind: 'replace-preserving-links',
-                previous: chat,
-                next: { ...chat, tokenCalibration: staged.tokenCalibration },
-              },
-            ])
+            chatMutation.replace(lease.chatId, (current) => ({
+              ...current,
+              tokenCalibration: staged.tokenCalibration,
+            }))
+            const transition = await chatMutation.commit()
             boundSemanticOperationExactReceiptAccumulator<GenerationMetadataTable>(tx)?.absorb(
               transition.fragment,
             )

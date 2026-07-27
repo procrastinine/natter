@@ -69,16 +69,11 @@ import {
   replaceTextTemplateByteOwner,
 } from './byte-owner-mutation'
 import {
-  applyLinkedChatRowReplacement,
-  applyLinkedChatRowReplacements,
   CHAT_ROW_LINKED_TRANSACTION_CAPABILITY,
+  type LinkedChatMutationOwner,
   type LinkedChatRowMutationReceipt,
+  openLinkedChatMutation,
 } from './chat-row-transition'
-import {
-  readCurrentChatForTransaction,
-  readOptionalCurrentChatRowsForTransaction,
-  type TransactionCurrentChat,
-} from './chat-storage-codec'
 import {
   applyConfigurationPresetCatalogProjectionDeletion,
   applyConfigurationPresetCatalogProjectionTransition,
@@ -1626,7 +1621,8 @@ function executeChatSelectionOperation<Result>(
 
 async function selectedChatConfigurationTransition(
   tx: FencedTransaction<PhysicalStorageTableName>,
-  current: TransactionCurrentChat,
+  chatMutation: LinkedChatMutationOwner,
+  current: Chat,
   transformed: Chat,
   now: number,
 ): Promise<ChatConfigurationOperationReceipt> {
@@ -1634,7 +1630,8 @@ async function selectedChatConfigurationTransition(
     return chatConfigurationOperationReceipt(current, current)
   }
   const written = await configuredChat(tx, current, transformed, now)
-  const transition = await applyLinkedChatRowReplacement(tx, current, written)
+  chatMutation.replaceLinked(current.id, () => written)
+  const transition = await chatMutation.commit()
   return chatConfigurationOperationReceipt(current, written, transition)
 }
 
@@ -2455,9 +2452,11 @@ async function commitConfigurationTargetFanoutOperation(
     ConfigurationTargetFanoutOperationReceipt
   >
 > {
+  const chatMutation = openLinkedChatMutation(tx)
   if (command.kind === 'text-template.delete') {
     return commitTextTemplateTargetFanout(
       tx,
+      chatMutation,
       command,
       input,
       current as SavedTextTemplate | undefined,
@@ -2489,14 +2488,12 @@ async function commitConfigurationTargetFanoutOperation(
   ]) as ChatId[]
   const presetReadIds = sortedUnique(linkedPresetIds) as PresetId[]
   const [chatRows, presetRows] = await Promise.all([
-    chatReadIds.length > 0
-      ? readOptionalCurrentChatRowsForTransaction(tx, chatReadIds)
-      : Promise.resolve([]),
+    chatReadIds.length > 0 ? chatMutation.readMany(chatReadIds) : Promise.resolve([]),
     presetReadIds.length > 0
       ? tx.table<ChatPreset, PresetId>('presets').bulkGet(presetReadIds)
       : Promise.resolve([]),
   ])
-  const chatsById = new Map<ChatId, TransactionCurrentChat>()
+  const chatsById = new Map<ChatId, Chat>()
   for (const [index, chatId] of chatReadIds.entries()) {
     const chat = chatRows[index]
     if (chat) chatsById.set(chatId, chat)
@@ -2535,16 +2532,13 @@ async function commitConfigurationTargetFanoutOperation(
   }
 
   const slot = promptPresetSlotForKind(promptPreset.kind)
-  const stagedChats = new Map<
-    ChatId,
-    { readonly previous: TransactionCurrentChat; readonly transformed: Chat }
-  >()
+  const stagedChats = new Map<ChatId, { readonly previous: Chat; readonly transformed: Chat }>()
   const stagedPresets = new Map<
     PresetId,
     { readonly previous: ChatPreset; readonly next: ChatPreset }
   >()
   for (const chatId of linkedChatIds) {
-    const previous = chatsById.get(chatId) as TransactionCurrentChat
+    const previous = chatsById.get(chatId) as Chat
     const settings = { ...previous.settings }
     if (textChanged) {
       ;(settings as unknown as Record<string, unknown>)[slot.textKey] = nextSource?.text
@@ -2573,7 +2567,7 @@ async function commitConfigurationTargetFanoutOperation(
     })
   }
   if (command.kind === 'prompt-preset.overwrite-and-pin') {
-    const previous = chatsById.get(command.chatId) as TransactionCurrentChat
+    const previous = chatsById.get(command.chatId) as Chat
     const staged = stagedChats.get(command.chatId)
     const transformed = staged?.transformed ?? previous
     const settings = { ...transformed.settings }
@@ -2615,7 +2609,7 @@ async function commitConfigurationTargetFanoutOperation(
       : emptyConfigurationOwnerLinkMutationReceipt()
 
   const chatClock = new TransactionChatUpdateClock()
-  const chatWrites: Array<{ readonly previous: TransactionCurrentChat; readonly next: Chat }> = []
+  const chatWrites: Array<{ readonly previous: Chat; readonly next: Chat }> = []
   for (const { previous, transformed } of [...stagedChats.values()].sort((left, right) =>
     left.previous.id.localeCompare(right.previous.id),
   )) {
@@ -2624,8 +2618,10 @@ async function commitConfigurationTargetFanoutOperation(
       next: await configuredChat(tx, previous, transformed, command.now, chatClock),
     })
   }
-  const chats =
-    chatWrites.length > 0 ? await applyLinkedChatRowReplacements(tx, chatWrites) : undefined
+  for (const { previous, next } of chatWrites) {
+    chatMutation.replaceLinked(previous.id, () => next)
+  }
+  const chats = chatWrites.length > 0 ? await chatMutation.commit() : undefined
   const writtenChatIds = chatWrites.map(({ next }) => next.id)
   const affectedPresetIds = nextPresets.map(({ id }) => id)
   const selectedChat = input.selectedChatId ? chatsById.get(input.selectedChatId) : undefined
@@ -2675,6 +2671,7 @@ async function commitConfigurationTargetFanoutOperation(
 
 async function commitTextTemplateTargetFanout(
   tx: FencedTransaction<PhysicalStorageTableName>,
+  chatMutation: LinkedChatMutationOwner,
   command: Extract<ConfigurationDomainCommand, { kind: 'text-template.delete' }>,
   input: ConfigurationTargetFanoutOperationInput,
   previousTemplate: SavedTextTemplate | undefined,
@@ -2697,9 +2694,7 @@ async function commitTextTemplateTargetFanout(
       .map(({ ownerId }) => ownerId as PresetId),
   ) as PresetId[]
   const [chatRows, presetRows] = await Promise.all([
-    chatReadIds.length > 0
-      ? readOptionalCurrentChatRowsForTransaction(tx, chatReadIds)
-      : Promise.resolve([]),
+    chatReadIds.length > 0 ? chatMutation.readMany(chatReadIds) : Promise.resolve([]),
     presetReadIds.length > 0
       ? tx.table<ChatPreset, PresetId>('presets').bulkGet(presetReadIds)
       : Promise.resolve([]),
@@ -2732,8 +2727,8 @@ async function commitTextTemplateTargetFanout(
       : emptyConfigurationOwnerLinkMutationReceipt()
 
   const chatClock = new TransactionChatUpdateClock()
-  const chatWrites: Array<{ readonly previous: TransactionCurrentChat; readonly next: Chat }> = []
-  for (const previous of chatRows as TransactionCurrentChat[]) {
+  const chatWrites: Array<{ readonly previous: Chat; readonly next: Chat }> = []
+  for (const previous of chatRows as Chat[]) {
     const transformed = withModelResolutionCancellation(
       {
         ...previous,
@@ -2746,8 +2741,10 @@ async function commitTextTemplateTargetFanout(
       next: await configuredChat(tx, previous, transformed, command.now, chatClock),
     })
   }
-  const chats =
-    chatWrites.length > 0 ? await applyLinkedChatRowReplacements(tx, chatWrites) : undefined
+  for (const { previous, next } of chatWrites) {
+    chatMutation.replaceLinked(previous.id, () => next)
+  }
+  const chats = chatWrites.length > 0 ? await chatMutation.commit() : undefined
   const writtenChatIds = chatWrites.map(({ next }) => next.id)
 
   if (previousTemplate) {
@@ -3682,6 +3679,7 @@ async function commitConnectionDeleteOperation(
     ConnectionDeleteOperationReceipt
   >
 > {
+  const chatMutation = openLinkedChatMutation(tx)
   if (input.replacementProfileId === input.profileId) {
     return semanticOperationExecution(
       { kind: 'invalid', reason: 'profile-reassign-self' } as const,
@@ -3771,9 +3769,7 @@ async function commitConnectionDeleteOperation(
         presetReadIds.length > 0
           ? tx.table<ChatPreset, PresetId>('presets').bulkGet(presetReadIds)
           : Promise.resolve([]),
-        chatReadIds.length > 0
-          ? readOptionalCurrentChatRowsForTransaction(tx, chatReadIds)
-          : Promise.resolve([]),
+        chatReadIds.length > 0 ? chatMutation.readMany(chatReadIds) : Promise.resolve([]),
       ])
     : [[], []]
   if (presetRows.some((preset) => !preset) || chatRows.some((chat) => !chat)) {
@@ -3811,8 +3807,8 @@ async function commitConnectionDeleteOperation(
   }
 
   const chatClock = new TransactionChatUpdateClock()
-  const chatWrites: Array<{ readonly previous: TransactionCurrentChat; readonly next: Chat }> = []
-  for (const previous of chatRows as TransactionCurrentChat[]) {
+  const chatWrites: Array<{ readonly previous: Chat; readonly next: Chat }> = []
+  for (const previous of chatRows as Chat[]) {
     const transformed = withModelResolutionCancellation(
       {
         ...previous,
@@ -3828,8 +3824,10 @@ async function commitConnectionDeleteOperation(
       next: await configuredChat(tx, previous, transformed, command.now, chatClock),
     })
   }
-  const chats =
-    chatWrites.length > 0 ? await applyLinkedChatRowReplacements(tx, chatWrites) : undefined
+  for (const { previous, next } of chatWrites) {
+    chatMutation.replaceLinked(previous.id, () => next)
+  }
+  const chats = chatWrites.length > 0 ? await chatMutation.commit() : undefined
   const writtenChatIds = chatWrites.map(({ next }) => next.id)
 
   const profileLinks = await deleteLinkedSemanticByteOwner(tx, 'profiles', profile.id, profile)
@@ -4191,9 +4189,8 @@ async function commitConnectionEditOperation(
     keyReceipt = keyMaterialOperationReceipt(existing, existing, 'none')
   }
 
-  const resetChat = input.resetChatId
-    ? await readCurrentChatForTransaction(tx, input.resetChatId)
-    : undefined
+  const chatMutation = openLinkedChatMutation(tx)
+  const resetChat = input.resetChatId ? await chatMutation.read(input.resetChatId) : undefined
   if (input.resetChatId) {
     recordConnectionProfileLifecyclePhysicalRead(tx, {
       tableName: 'chats',
@@ -4253,6 +4250,7 @@ async function commitConnectionEditOperation(
     )
     resetChatReceipt = await selectedChatConfigurationTransition(
       tx,
+      chatMutation,
       resetChat,
       transformed,
       command.now,
@@ -5386,8 +5384,9 @@ async function switchChatProfile(
     command.kind,
     input,
     async (tx) => {
+      const chatMutation = openLinkedChatMutation(tx)
       const [currentChat, currentProfile, currentKey] = await Promise.all([
-        readCurrentChatForTransaction(tx, command.chatId),
+        chatMutation.read(command.chatId),
         tx.table<ConnectionProfile, ProfileId>('profiles').get(command.profileId),
         command.requestKeyId
           ? tx.table<KeyRecord, KeyId>('keys').get(command.requestKeyId)
@@ -5458,6 +5457,7 @@ async function switchChatProfile(
       }
       const chat = await selectedChatConfigurationTransition(
         tx,
+        chatMutation,
         currentChat,
         switchedProfileChat(
           currentChat,
@@ -5561,8 +5561,9 @@ async function resolveChatModel(
     command.kind,
     input,
     async (tx) => {
+      const chatMutation = openLinkedChatMutation(tx)
       const [currentChat, currentProfile, currentKey, modelsHeader] = await Promise.all([
-        readCurrentChatForTransaction(tx, command.chatId),
+        chatMutation.read(command.chatId),
         tx.table<ConnectionProfile, ProfileId>('profiles').get(command.target.profileId),
         command.requestKeyId
           ? tx.table<KeyRecord, KeyId>('keys').get(command.requestKeyId)
@@ -5654,6 +5655,7 @@ async function resolveChatModel(
       )
       const chat = await selectedChatConfigurationTransition(
         tx,
+        chatMutation,
         currentChat,
         transformed,
         command.now,
@@ -5705,7 +5707,8 @@ async function mutateChatConfiguration(
         SemanticOperationExactReceipt<ChatRowLinkedTable>
       >
     > => {
-      const current = await readCurrentChatForTransaction(tx, chatId)
+      const chatMutation = openLinkedChatMutation(tx)
+      const current = await chatMutation.read(chatId)
       if (!current) {
         return semanticOperationExecution(
           { kind: 'missing', entity: 'chat', id: chatId } as const,
@@ -5726,7 +5729,8 @@ async function mutateChatConfiguration(
         )
       }
       const written = await configuredChat(tx, current, transformed, now)
-      const transition = await applyLinkedChatRowReplacement(tx, current, written)
+      chatMutation.replaceLinked(chatId, () => written)
+      const transition = await chatMutation.commit()
       return semanticOperationExecution(
         chatUpdatedResult(written, true),
         exactReceipt(chatConfigurationOperationReceipt(current, written, transition)),
@@ -6065,8 +6069,9 @@ async function createAndSelectTextTemplate(
   return executeChatSelectionOperation<
     ConfigurationDomainResult<'text-template.create-and-select'>
   >(commandMeta, command.kind, input, async (tx) => {
+    const chatMutation = openLinkedChatMutation(tx)
     const [chat, currentTemplate] = await Promise.all([
-      readCurrentChatForTransaction(tx, command.chatId),
+      chatMutation.read(command.chatId),
       tx.table<SavedTextTemplate, TextTemplateId>('textTemplates').get(command.template.id),
     ])
     if (!chat) {
@@ -6092,6 +6097,7 @@ async function createAndSelectTextTemplate(
     await addTextTemplateByteOwner(tx, template)
     const chatReceipt = await selectedChatConfigurationTransition(
       tx,
+      chatMutation,
       chat,
       withModelResolutionCancellation(
         {
@@ -6523,6 +6529,7 @@ async function deleteChatPreset(
     operationKind,
     input,
     async (tx) => {
+      const chatMutation = openLinkedChatMutation(tx)
       const preset = await tx.table<ChatPreset, PresetId>('presets').get(command.presetId)
       if (!preset) {
         return semanticOperationExecution(
@@ -6542,10 +6549,7 @@ async function deleteChatPreset(
       const chatReadIds = sortedUnique(
         targetLinks.map(({ ownerId }) => ownerId as ChatId),
       ) as ChatId[]
-      const chatRows =
-        chatReadIds.length > 0
-          ? await readOptionalCurrentChatRowsForTransaction(tx, chatReadIds)
-          : []
+      const chatRows = chatReadIds.length > 0 ? await chatMutation.readMany(chatReadIds) : []
       if (chatRows.some((chat) => !chat)) {
         const missingIndex = chatRows.findIndex((chat) => !chat)
         const missingId = chatReadIds[missingIndex]
@@ -6555,10 +6559,10 @@ async function deleteChatPreset(
 
       const chatClock = new TransactionChatUpdateClock()
       const chatWrites: Array<{
-        readonly previous: TransactionCurrentChat
+        readonly previous: Chat
         readonly next: Chat
       }> = []
-      for (const previous of chatRows as TransactionCurrentChat[]) {
+      for (const previous of chatRows as Chat[]) {
         const transformed = { ...previous }
         delete transformed.presetId
         chatWrites.push({
@@ -6566,8 +6570,10 @@ async function deleteChatPreset(
           next: await configuredChat(tx, previous, transformed, command.now, chatClock),
         })
       }
-      const chats =
-        chatWrites.length > 0 ? await applyLinkedChatRowReplacements(tx, chatWrites) : undefined
+      for (const { previous, next } of chatWrites) {
+        chatMutation.replaceLinked(previous.id, () => next)
+      }
+      const chats = chatWrites.length > 0 ? await chatMutation.commit() : undefined
       const writtenChatIds = chatWrites.map(({ next }) => next.id)
       const order =
         preset.archived === true
@@ -6655,9 +6661,10 @@ async function createAndLinkChatPreset(
     operationKind,
     input,
     async (tx) => {
+      const chatMutation = openLinkedChatMutation(tx)
       const [profile, chat, currentPreset] = await Promise.all([
         tx.table<ConnectionProfile, ProfileId>('profiles').get(profileId),
-        readCurrentChatForTransaction(tx, command.chatId),
+        chatMutation.read(command.chatId),
         tx.table<ChatPreset, PresetId>('presets').get(provisional.id),
       ])
       if (!profile) {
@@ -6708,6 +6715,7 @@ async function createAndLinkChatPreset(
       )
       const chatReceipt = await selectedChatConfigurationTransition(
         tx,
+        chatMutation,
         chat,
         withModelResolutionCancellation({ ...chat, presetId: preset.id }, true),
         command.now,
@@ -6750,8 +6758,9 @@ async function applyChatPreset(
     command.kind,
     input,
     async (tx) => {
+      const chatMutation = openLinkedChatMutation(tx)
       const [chat, preset] = await Promise.all([
-        readCurrentChatForTransaction(tx, command.chatId),
+        chatMutation.read(command.chatId),
         tx.table<ChatPreset, PresetId>('presets').get(command.presetId),
       ])
       if (!preset) {
@@ -6775,6 +6784,7 @@ async function applyChatPreset(
       }
       const chatReceipt = await selectedChatConfigurationTransition(
         tx,
+        chatMutation,
         chat,
         withModelResolutionCancellation(
           {
@@ -6828,10 +6838,11 @@ async function saveChatPreset(
     operationKind,
     input,
     async (tx) => {
+      const chatMutation = openLinkedChatMutation(tx)
       const [preset, profile, chat] = await Promise.all([
         tx.table<ChatPreset, PresetId>('presets').get(command.presetId),
         tx.table<ConnectionProfile, ProfileId>('profiles').get(profileId),
-        chatId ? readCurrentChatForTransaction(tx, chatId) : Promise.resolve(undefined),
+        chatId ? chatMutation.read(chatId) : Promise.resolve(undefined),
       ])
       const unchangedChat = chat
         ? chatConfigurationOperationReceipt(chat, chat)
@@ -6894,6 +6905,7 @@ async function saveChatPreset(
         chat && command.chatModel
           ? await selectedChatConfigurationTransition(
               tx,
+              chatMutation,
               chat,
               withModelResolutionCancellation(
                 {
@@ -6975,8 +6987,9 @@ async function loadAndPinPrompt(
     command.kind,
     input,
     async (tx) => {
+      const chatMutation = openLinkedChatMutation(tx)
       const [chat, currentPreset] = await Promise.all([
-        readCurrentChatForTransaction(tx, command.chatId),
+        chatMutation.read(command.chatId),
         tx.table<PromptPreset, PromptPresetId>('promptPresets').get(command.presetId),
       ])
       if (!chat) {
@@ -7015,6 +7028,7 @@ async function loadAndPinPrompt(
       }
       const chatReceipt = await selectedChatConfigurationTransition(
         tx,
+        chatMutation,
         chat,
         withModelResolutionCancellation({ ...chat, settings }, true),
         command.now,
@@ -7066,8 +7080,9 @@ async function createAndPinPrompt(
     command.kind,
     input,
     async (tx) => {
+      const chatMutation = openLinkedChatMutation(tx)
       const [chat, currentPreset] = await Promise.all([
-        readCurrentChatForTransaction(tx, command.chatId),
+        chatMutation.read(command.chatId),
         tx.table<PromptPreset, PromptPresetId>('promptPresets').get(command.preset.id),
       ])
       if (!chat) {
@@ -7102,6 +7117,7 @@ async function createAndPinPrompt(
       ;(settings as unknown as Record<string, unknown>)[slot.pinKey] = preset.id
       const chatReceipt = await selectedChatConfigurationTransition(
         tx,
+        chatMutation,
         chat,
         withModelResolutionCancellation({ ...chat, settings }, true),
         command.now,

@@ -1,11 +1,7 @@
 import type { Collection, Table, Transaction } from 'dexie'
-import { findLastUpdatedLeafId } from '../core/active-path'
 import { sha256Hex as sha256BytesHex } from '../core/attachments/process'
-import { buildBranchMessages } from '../core/branch-flatten'
 import { chatTagNameLower } from '../core/chat-metadata'
-import { buildChildSlotProjection, type ChildSlotProjection } from '../core/child-list-state'
 import {
-  assertCanonicalGeneratedOutputMessage,
   isGeneratedOutputLocalizationJob,
   withGeneratedOutputLocalizationState,
 } from '../core/generated-output-localization'
@@ -65,7 +61,6 @@ import type {
   PromptPresetKind,
   TagId,
 } from '../core/types'
-import { countMessagesWords } from '../core/word-count'
 import { newId } from '../lib/ulid'
 import {
   ATTACHMENT_CATALOG_MUTATION_TRANSACTION_CAPABILITY,
@@ -94,8 +89,8 @@ import {
   putChatTagByteOwners,
 } from './byte-owner-mutation'
 import {
-  applyChatRowWriteTransitions,
   CHAT_ROW_LINKED_TRANSACTION_CAPABILITY,
+  openLinkedChatMutation,
 } from './chat-row-transition'
 import {
   accumulateChatSidebarAggregateRows,
@@ -141,12 +136,13 @@ import type {
   RestoreWorkspaceBackupResult,
 } from './import-export-contract'
 import {
+  type CurrentMessageTransition,
+  compileCurrentMessageGraphTransition,
+  compileCurrentMessageTransition,
   hydrateMessages,
   type MessageBodyRow,
   type MessageHeaderRow,
-  previewTextFromMessages,
   previewTextsByChat,
-  splitMessageForStorage,
 } from './message-storage'
 import { physicalStorageTables } from './physical-storage-tables'
 import {
@@ -533,12 +529,9 @@ export class BrowserImportExportHandler {
             attachmentIdMap,
           }),
         )
-        const branchLeafId = findLastUpdatedLeafId(messages)
-        const branchMessages = buildBranchMessages(messages, branchLeafId)
-        const totalCostUsd = messages.reduce(
-          (total, message) => total + (message.deleted ? 0 : (message.generation?.cost ?? 0)),
-          0,
-        )
+        const messageGraph = compileCurrentMessageGraphTransition(chatId, messages, now)
+        const branchLeafId = messageGraph.lastUpdatedLeafId
+        const branchMessages = messageGraph.branchMessages
         const settings = normalizedImportedSettings(
           payload.chat.settings,
           resolvedProfile.profileId,
@@ -547,8 +540,6 @@ export class BrowserImportExportHandler {
         const folderId = folderResult.folderId
         const tagResult = await ensurePortableTags(tx, payload.tags, now)
         const tagIds = tagResult.tagIds
-        const childSlots = childSlotsForMessages(chatId, messages, now)
-
         const chat: Chat = {
           id: chatId,
           title: payload.chat.title,
@@ -556,8 +547,8 @@ export class BrowserImportExportHandler {
           createdAt: now,
           updatedAt: now,
           lastViewedAt: now,
-          wordCount: countMessagesWords(branchMessages),
-          totalCostUsd,
+          wordCount: messageGraph.wordCount,
+          totalCostUsd: messageGraph.totalCostUsd,
           metaVersion: 0,
           summaryVersion: 0,
           structuralVersion: messages.length === 0 ? 0 : 1,
@@ -574,21 +565,23 @@ export class BrowserImportExportHandler {
             ? { favoriteModels: [...payload.chat.favoriteModels] }
             : {}),
           ...(payload.chat.recentModels ? { recentModels: [...payload.chat.recentModels] } : {}),
-          previewText: previewTextFromMessages(messages),
+          previewText: messageGraph.previewText,
         }
-        await applyChatRowWriteTransitions(tx, [{ kind: 'add-linked', next: chat }])
-        await storeNewMessagesInPages(tx, messages)
-        await replaceMessageAttachmentReferenceOwnersInPages(tx, messages, now)
-        await bulkAddInPages(tx.table<ChildListState, string>('childLists'), childSlots.states)
+        const chatMutation = openLinkedChatMutation(tx)
+        await chatMutation.add(chat)
+        await chatMutation.commit()
+        await storeNewMessageTransitionsInPages(tx, messageGraph.transitions)
+        await replaceMessageAttachmentReferenceOwnersInPages(tx, messageGraph.transitions, now)
+        await bulkAddInPages(
+          tx.table<ChildListState, string>('childLists'),
+          messageGraph.childSlots.states,
+        )
         await bulkAddInPages(
           tx.table<ChildSlotMember, MessageId>('childSlotMembers'),
-          childSlots.members,
+          messageGraph.childSlots.members,
         )
-        const branchPathStorage = branchMessages.map((message) => ({
-          message,
-          storage: splitMessageForStorage(message),
-        }))
-        const branchTip = branchPathStorage.at(-1)
+        const branchTip = messageGraph.branchTransitions.at(-1)
+        const branchTipMessage = branchMessages.at(-1)
         const destination = await proveConversationSelectionInTransaction(tx, {
           chat,
           target: fixedConversationSelectionTarget(
@@ -596,16 +589,19 @@ export class BrowserImportExportHandler {
             branchLeafId,
           ),
           tipId: branchLeafId,
-          exactPathHeaders: branchPathStorage.map(({ storage }) => storage.header),
-          presentations: branchTip
-            ? [
-                {
-                  header: branchTip.storage.header,
-                  message: branchTip.message,
-                  bodyVersion: branchTip.storage.header.bodyVersion,
-                },
-              ]
-            : [],
+          exactPathHeaders: messageGraph.branchTransitions.map(
+            (transition) => transition.storage.header,
+          ),
+          presentations:
+            branchTip && branchTipMessage
+              ? [
+                  {
+                    header: branchTip.storage.header,
+                    message: branchTipMessage,
+                    bodyVersion: branchTip.storage.header.bodyVersion,
+                  },
+                ]
+              : [],
         })
         return {
           chatId,
@@ -1096,18 +1092,12 @@ async function restorePreparedBrowserWorkspaceRows(
   await storeMessagesInPages(
     db,
     payload.messages,
+    now,
     preactivationCheckpoint,
     recordRestoredValues,
     runTransaction,
   )
   await restoreBulkPut(db.drafts, payload.drafts)
-  await replaceMessageAttachmentReferenceOwnersInRestoreTransactions(
-    db,
-    payload.messages,
-    now,
-    preactivationCheckpoint,
-    runTransaction,
-  )
   for (const page of pages(payload.drafts)) {
     preactivationCheckpoint()
     await runTransaction(
@@ -1572,85 +1562,9 @@ async function hydrateAllStoredMessagesInPages(db: NatterDb): Promise<Message[]>
 async function storeMessagesInPages(
   db: NatterDb,
   messages: readonly Message[],
-  preactivationCheckpoint: () => void = () => undefined,
-  recordStoredValues: (values: readonly unknown[]) => void = () => undefined,
-  runTransaction?: <T>(
-    tables: readonly Table[],
-    operation: (tx: Transaction) => Promise<T>,
-  ) => Promise<T>,
-): Promise<void> {
-  for (const page of pages(messages)) {
-    preactivationCheckpoint()
-    for (const message of page) {
-      assertCanonicalGeneratedOutputMessage(message.content, message.attachmentRefs, message.id)
-    }
-    const split = page.map((message) => splitMessageForStorage(message))
-    const headers = split.map((row) => row.header)
-    const bodies = split.map((row) => row.body)
-    const previews = split.map((row) => row.preview)
-    const write = async (tx?: Transaction) => {
-      await (tx?.table('messages') ?? db.messages).bulkPut(headers)
-      await (tx?.table('messageBodies') ?? db.messageBodies).bulkPut(bodies)
-      await (tx?.table('messagePreviews') ?? db.messagePreviews).bulkPut(previews)
-    }
-    if (runTransaction) {
-      await runTransaction([db.messages, db.messageBodies, db.messagePreviews], (tx) => write(tx))
-    } else await write()
-    recordStoredValues(headers)
-    recordStoredValues(bodies)
-    recordStoredValues(previews)
-    recordTableWrite(split.length)
-    recordTableWrite(split.length)
-    recordTableWrite(split.length)
-  }
-}
-
-async function storeNewMessagesInPages(
-  tx: Transaction,
-  messages: readonly Message[],
-): Promise<void> {
-  const headers = tx.table<MessageHeaderRow, MessageId>('messages')
-  const bodies = tx.table<MessageBodyRow, MessageId>('messageBodies')
-  const previews = tx.table('messagePreviews')
-  for (const page of pages(messages)) {
-    for (const message of page) {
-      assertCanonicalGeneratedOutputMessage(message.content, message.attachmentRefs, message.id)
-    }
-    const split = page.map((message) => splitMessageForStorage(message))
-    await headers.bulkAdd(split.map((row) => row.header))
-    await bodies.bulkAdd(split.map((row) => row.body))
-    await previews.bulkAdd(split.map((row) => row.preview))
-    recordTableWrite(split.length)
-    recordTableWrite(split.length)
-    recordTableWrite(split.length)
-  }
-}
-
-async function replaceMessageAttachmentReferenceOwnersInPages(
-  tx: Parameters<typeof applyAttachmentReferenceOwnerTransitions>[0],
-  messages: readonly Message[],
-  now: number,
-): Promise<void> {
-  for (const page of pages(messages)) {
-    await applyAttachmentReferenceOwnerTransitions(
-      tx,
-      page.map((message) => ({
-        ownerKind: 'message' as const,
-        ownerId: message.id,
-        chatId: message.chatId,
-        previousRefs: undefined,
-        nextRefs: message.attachmentRefs,
-      })),
-      now,
-    )
-  }
-}
-
-async function replaceMessageAttachmentReferenceOwnersInRestoreTransactions(
-  db: NatterDb,
-  messages: readonly Message[],
   now: number,
   preactivationCheckpoint: () => void,
+  recordStoredValues: (values: readonly unknown[]) => void,
   runTransaction: <T>(
     tables: readonly Table[],
     operation: (tx: Transaction) => Promise<T>,
@@ -1658,25 +1572,73 @@ async function replaceMessageAttachmentReferenceOwnersInRestoreTransactions(
 ): Promise<void> {
   for (const page of pages(messages)) {
     preactivationCheckpoint()
+    const transitions = page.map((message) =>
+      compileCurrentMessageTransition(message, {
+        updatedAt: now,
+        timestamp: 'exact',
+        custody: { kind: 'available' },
+      }),
+    )
+    const headers = transitions.map((transition) => transition.storage.header)
+    const bodies = transitions.map((transition) => transition.storage.body)
+    const previews = transitions.map((transition) => transition.storage.preview)
     await runTransaction(
       [
+        db.messages,
+        db.messageBodies,
+        db.messagePreviews,
         db.attachmentRefEdges,
         db.attachments,
         db.attachmentCatalogRows,
         db.attachmentCatalogAggregate,
       ],
-      (tx) =>
-        applyAttachmentReferenceOwnerTransitions(
+      async (tx) => {
+        await tx.table('messages').bulkPut(headers)
+        await tx.table('messageBodies').bulkPut(bodies)
+        await tx.table('messagePreviews').bulkPut(previews)
+        await applyAttachmentReferenceOwnerTransitions(
           tx,
-          page.map((message) => ({
-            ownerKind: 'message' as const,
-            ownerId: message.id,
-            chatId: message.chatId,
-            previousRefs: undefined,
-            nextRefs: message.attachmentRefs,
-          })),
+          transitions.map((transition) => transition.attachmentOwner),
           now,
-        ).then(() => undefined),
+        )
+      },
+    )
+    recordStoredValues(headers)
+    recordStoredValues(bodies)
+    recordStoredValues(previews)
+    recordTableWrite(transitions.length)
+    recordTableWrite(transitions.length)
+    recordTableWrite(transitions.length)
+  }
+}
+
+async function storeNewMessageTransitionsInPages(
+  tx: Transaction,
+  transitions: readonly CurrentMessageTransition[],
+): Promise<void> {
+  const headers = tx.table<MessageHeaderRow, MessageId>('messages')
+  const bodies = tx.table<MessageBodyRow, MessageId>('messageBodies')
+  const previews = tx.table('messagePreviews')
+  for (const page of pages(transitions)) {
+    await headers.bulkAdd(page.map((transition) => transition.storage.header))
+    await bodies.bulkAdd(page.map((transition) => transition.storage.body))
+    await previews.bulkAdd(page.map((transition) => transition.storage.preview))
+    recordTableWrite(page.length)
+    recordTableWrite(page.length)
+    recordTableWrite(page.length)
+  }
+}
+
+async function replaceMessageAttachmentReferenceOwnersInPages(
+  tx: Parameters<typeof applyAttachmentReferenceOwnerTransitions>[0],
+  transitions: readonly CurrentMessageTransition[],
+  now: number,
+): Promise<void> {
+  for (const page of pages(transitions)) {
+    await applyAttachmentReferenceOwnerTransitions(
+      tx,
+      page.map((transition) => transition.attachmentOwner),
+      now,
     )
   }
 }
@@ -2237,14 +2199,6 @@ function remapAttachmentRef(
     refId: newId(),
     attachmentId: attachmentIdMap[ref.attachmentId] ?? ref.attachmentId,
   }
-}
-
-function childSlotsForMessages(
-  chatId: string,
-  messages: readonly Message[],
-  updatedAt: number,
-): ChildSlotProjection {
-  return buildChildSlotProjection(chatId, messages, { updatedAt })
 }
 
 function sortMessages(messages: Message[]): Message[] {

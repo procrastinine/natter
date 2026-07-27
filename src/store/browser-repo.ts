@@ -90,6 +90,7 @@ import { countMessagesWords } from '../core/word-count'
 import { assertNever } from '../lib/assert'
 import { sameOrderedValues, sameValue, stableStringify } from '../lib/same-value'
 import { newId } from '../lib/ulid'
+import { readActiveBranchForksInTransaction } from './active-branch-fork-storage'
 import { ATTACHMENT_CATALOG_MUTATION_TRANSACTION_CAPABILITY } from './attachment-catalog-projection'
 import {
   ATTACHMENT_INTEGRITY_TRANSACTION_CAPABILITY,
@@ -98,7 +99,6 @@ import {
 import { liveAttachmentRefs, normalizeAttachmentRefs } from './attachment-refs'
 import { type AttachmentHeaderRow, hydrateAttachment } from './attachment-storage'
 import { subscribeWorkspaceChanges } from './broadcast'
-import { readActiveBranchForksInTransaction } from './active-branch-fork-storage'
 import {
   type ConversationOpenFrameStore,
   readActiveBranchChildAtPositionInTransaction,
@@ -165,8 +165,8 @@ import {
 } from './browser-workspace-maintenance-contract'
 import { addPhysicalStorageRows, putPhysicalStorageRow } from './byte-owner-mutation'
 import {
-  applyChatRowWriteTransitions,
   CHAT_ROW_LINKED_TRANSACTION_CAPABILITY,
+  openLinkedChatMutation,
 } from './chat-row-transition'
 import { readTemporaryChatIdPage } from './chat-storage-codec'
 import {
@@ -1510,6 +1510,88 @@ function requiredUnreferencedAt(attachment: AttachmentHeaderRow): number {
   return attachment.unreferencedAt
 }
 
+const ATTACHMENT_REAP_PREFLIGHT_TRANSACTION_PLAN = physicalTransactionPlan(
+  physicalStorageTables('attachments', 'storageRetentionState'),
+)
+const attachmentReapPlanBrand: unique symbol = Symbol('AttachmentReapPlan')
+
+interface AttachmentReapPlan {
+  readonly cycle: StorageRetentionCycle<'attachment-reap'>
+  readonly limit: number
+  readonly candidates: readonly {
+    readonly id: AttachmentId
+    readonly unreferencedAt: number
+  }[]
+  readonly [attachmentReapPlanBrand]: true
+}
+
+function attachmentReapReplayPlan(
+  cycle: StorageRetentionCycle<'attachment-reap'>,
+  limit: number,
+): SemanticOperationReplayPlan {
+  return {
+    kind: 'durable-page-resume',
+    owner: 'storage-retention:attachment-reap',
+    cycle: cycle.cycleNow,
+    revision: cycle.expectedRevision,
+    cursor: stableStringify(cycle.cursor ?? null),
+    doneMarker: `cutoff:${cycle.cutoff}`,
+    limit,
+  }
+}
+
+async function readAttachmentReapPlan(
+  commit: BrowserCommandSessionPort,
+  now: number,
+  maxAgeMs: number,
+  limit: number,
+): Promise<AttachmentReapPlan> {
+  return commit.readSemanticOperationPreflight(
+    ATTACHMENT_REAP_PREFLIGHT_TRANSACTION_PLAN,
+    async (tx) => {
+      const state = await readStorageRetentionState(tx, 'attachment-reap')
+      const cycle = storageRetentionCycle(state, now, maxAgeMs)
+      const lower = cycle.cursor ? [0, cycle.cursor.unreferencedAt, cycle.cursor.attachmentId] : [0]
+      const rows = await tx
+        .table<AttachmentHeaderRow, AttachmentId>('attachments')
+        .where('[refCount+unreferencedAt+id]')
+        .between(lower, [0, cycle.cutoff], false, false)
+        .limit(limit)
+        .toArray()
+      return Object.freeze({
+        cycle,
+        limit,
+        candidates: Object.freeze(
+          rows.map((row) =>
+            Object.freeze({
+              id: row.id,
+              unreferencedAt: requiredUnreferencedAt(row),
+            }),
+          ),
+        ),
+        [attachmentReapPlanBrand]: true as const,
+      })
+    },
+    (plan) => [
+      {
+        tableName: 'storageRetentionState',
+        indexKind: 'primary',
+        operation: 'get',
+        requestCount: 1,
+        rowCount: 1,
+      },
+      {
+        tableName: 'attachments',
+        indexKind: 'secondary',
+        indexName: '[refCount+unreferencedAt+id]',
+        operation: 'query',
+        requestCount: 1,
+        rowCount: plan.candidates.length,
+      },
+    ],
+  )
+}
+
 function protocolDiscoveryCacheEvictions(
   evictions: readonly StorageDiscoveryCacheEviction[],
 ): DiscoveryCacheEviction[] {
@@ -1911,6 +1993,18 @@ async function resolveGenerationPromptPathProof(
         slot.firstLiveChildId ?? undefined,
       )
     }
+    const claimedSlot = proof.claim.placementSlot
+    if (
+      !claimedSlot ||
+      claimedSlot.parentId !== leafId ||
+      claimedSlot.slotVersion !== slot.version ||
+      claimedSlot.liveCount !== slot.liveCount ||
+      claimedSlot.nextSiblingIndex !== slot.nextSiblingIndex
+    ) {
+      throw new GenerationPlanningSeedChangedError(chatId)
+    }
+  } else if (proof.claim.placementSlot !== null) {
+    throw new GenerationPlanningSeedChangedError(chatId)
   }
   return {
     ...path,
@@ -1926,14 +2020,6 @@ function requiredPromptPathTarget(
 ): MessageHeaderRow {
   if (!path.targetHeader) throw new GenerationPlanningSeedChangedError(chatId)
   return path.targetHeader
-}
-
-function requiredPromptPathSlot(
-  path: ResolvedGenerationPromptPath,
-  chatId: ChatId,
-): ChildListState {
-  if (!path.slot) throw new GenerationPlanningSeedChangedError(chatId)
-  return path.slot
 }
 
 function semanticEffectKindsForMutationFacts(
@@ -3799,8 +3885,8 @@ async function reserveStreamLeaseTarget(
 async function assertStreamLeaseWorkspaceTarget(
   tx: Transaction,
   lease: Pick<StreamLeaseRow, 'streamId' | 'chatId' | 'messageId' | 'attemptKind'>,
+  chat: Chat | undefined,
 ): Promise<void> {
-  const chat = await tx.table<Chat, ChatId>('chats').get(lease.chatId)
   if (!chat) throw new ChatMissingError(lease.chatId)
   const target = await tx.table<MessageHeaderRow, MessageId>('messages').get(lease.messageId)
   if (lease.attemptKind === 'generation' && target) {
@@ -4024,11 +4110,6 @@ function recordMessageHeaderSummaryDeltas(
   }
   state.totalCostDelta += costDelta
   return wordCountDelta !== 0 || costDelta !== 0
-}
-
-function recordNewMessageSummary(state: ChatMutationState, message: Message): void {
-  state.wordCountDeltas.set(message.id, countMessagesWords([message]))
-  state.totalCostDelta += messageCost(message)
 }
 
 function requireChatMetadataPatch(patch: ChatMetadataPatch): ChatMetadataPatch {
@@ -4704,7 +4785,6 @@ const browserMutationSharedInternals: BrowserMutationSharedInternals = Object.fr
   readBranchPathInTransaction,
   recordMessageHeaderSummaryDeltas,
   recordMessageSummaryDeltas,
-  recordNewMessageSummary,
   replacementMessageBody,
   requireChatMetadataPatch,
   requiredStreamPostCommitEvidence,
@@ -5720,7 +5800,9 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
           ...(source.presetId ? { presetId: source.presetId } : {}),
         }
 
-        await applyChatRowWriteTransitions(tx, [{ kind: 'add-linked', next: chat }])
+        const chatMutation = openLinkedChatMutation(tx)
+        await chatMutation.add(chat)
+        await chatMutation.commit()
         const storageRows = messages.map((message) =>
           splitMessageForStorage(message, {
             updatedAt: now,
@@ -7628,9 +7710,12 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     throwIfReadonlyAborted(signal, 'Conversation topology read aborted')
     const db = await this.openDb()
     const initial = await this.readConversationStructuralFrame(db, permit, chatId, signal)
-    const headers = initial.chat
-      ? await readChatMessageHeaderPages(db, chatId, signal ? { signal } : {})
-      : []
+    const [headers, childSlots] = initial.chat
+      ? await Promise.all([
+          readChatMessageHeaderPages(db, chatId, signal ? { signal } : {}),
+          db.childLists.where('chatId').equals(chatId).toArray(),
+        ])
+      : [[], []]
     const final = await this.readConversationStructuralFrame(db, permit, chatId, signal)
     const value: ConversationTopologyResult =
       initial.chat === undefined
@@ -7645,6 +7730,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
               chat: structuredClone(final.chat),
               structuralVersion: final.chat.structuralVersion,
               headers: Object.freeze(headers.map(cloneMessageHeader)),
+              childSlots: Object.freeze(childSlots.map((state) => structuredClone(state))),
             })
     return {
       workspaceId: final.workspace.workspaceId,
@@ -8272,19 +8358,22 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
         const stubbedAttachmentIds: AttachmentId[] = []
         const absentAttachmentIds: AttachmentId[] = []
         for (const attachmentId of attachmentIds) {
-          const current = await ctx.getAttachment(attachmentId)
-          if (!current) {
-            absentAttachmentIds.push(attachmentId)
-            continue
+          const disposition = await ctx.deleteAttachmentForStorage(
+            attachmentId,
+            input.reason,
+            input.now,
+          )
+          switch (disposition) {
+            case 'deleted':
+              deletedAttachmentIds.push(attachmentId)
+              break
+            case 'stubbed':
+              stubbedAttachmentIds.push(attachmentId)
+              break
+            case 'absent':
+              absentAttachmentIds.push(attachmentId)
+              break
           }
-          const counts = await ctx.countAttachmentReferences(attachmentId)
-          if (counts.occurrences === 0) {
-            await ctx.deleteAttachment(attachmentId)
-            deletedAttachmentIds.push(attachmentId)
-            continue
-          }
-          await ctx.deleteAttachmentBytes(attachmentId, input.reason, input.now)
-          stubbedAttachmentIds.push(attachmentId)
         }
         return { deletedAttachmentIds, stubbedAttachmentIds, absentAttachmentIds }
       },
@@ -8305,10 +8394,9 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     commit: BrowserCommandCommit,
   ): Promise<AttachmentReapResult> {
     const limit = boundedMaintenanceLimit(requestedLimit ?? MAX_STORAGE_MAINTENANCE_BATCH)
-    const db = await this.openDb()
-    const state = await readStorageRetentionState(db, 'attachment-reap')
-    const cycle = storageRetentionCycle(state, now, maxAgeMs)
-    const candidates = await this.listAttachmentReapCandidates(cycle.cutoff, cycle.cursor, limit)
+    const plan = await readAttachmentReapPlan(commit, now, maxAgeMs, limit)
+    if (plan[attachmentReapPlanBrand] !== true) throw new Error('AttachmentReapPlanInvalid')
+    const { candidates, cycle } = plan
     const candidateIds = candidates.map((candidate) => candidate.id)
     type AttachmentReapPageOutcome =
       | { readonly done: false; readonly cursor?: AttachmentReapCursor }
@@ -8318,18 +8406,10 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
       async (ctx) => {
         const deleted: AttachmentId[] = []
         for (const attachmentId of candidateIds) {
-          const counts = await ctx.countAttachmentReferences(attachmentId)
-          const current = await ctx.getAttachmentReclamationState(attachmentId)
-          if (
-            !current.exists ||
-            current.unreferencedAt === null ||
-            current.unreferencedAt >= cycle.cutoff ||
-            counts.occurrences > 0
-          ) {
-            continue
+          const disposition = await ctx.reapAttachmentIfEligible(attachmentId, cycle.cutoff)
+          if (disposition === 'deleted') {
+            deleted.push(attachmentId)
           }
-          await ctx.deleteAttachment(attachmentId)
-          deleted.push(attachmentId)
         }
         return deleted
       },
@@ -8339,13 +8419,20 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
       {
         access: {
           readTableNames: ['attachments'],
-          writeTableNames: ['storageRetentionState'],
+          writeTableNames: ['attachmentIntegrityState', 'storageRetentionState'],
+        },
+        receipt: {
+          exactOccurrence: true,
+          replay: attachmentReapReplayPlan(cycle, limit),
         },
         async commit(tx) {
+          const receipt =
+            boundSemanticOperationExactReceiptAccumulator<BrowserMutationTableName>(tx)
+          if (!receipt) throw new Error('AttachmentReapExactReceiptAccumulatorMissing')
           const last = candidates.at(-1)
           const cursor = last
             ? {
-                unreferencedAt: requiredUnreferencedAt(last),
+                unreferencedAt: last.unreferencedAt,
                 attachmentId: last.id,
               }
             : cycle.cursor
@@ -8355,6 +8442,14 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
             .where('[refCount+unreferencedAt+id]')
             .between(lower, [0, cycle.cutoff], false, false)
             .first()
+          receipt.physicalRead({
+            tableName: 'attachments',
+            indexKind: 'secondary',
+            indexName: '[refCount+unreferencedAt+id]',
+            operation: 'query',
+            requestCount: 1,
+            rowCount: nextDue ? 1 : 0,
+          })
           let outcome: AttachmentReapPageOutcome
           if (nextDue) {
             outcome = { done: false, ...(cursor ? { cursor } : {}) }
@@ -8363,6 +8458,14 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
               .where('[refCount+unreferencedAt+id]')
               .between([0, cycle.cutoff], [0, []], true, false)
               .first()
+            receipt.physicalRead({
+              tableName: 'attachments',
+              indexKind: 'secondary',
+              indexName: '[refCount+unreferencedAt+id]',
+              operation: 'query',
+              requestCount: 1,
+              rowCount: deferred ? 1 : 0,
+            })
             outcome = {
               done: true,
               ...(typeof deferred?.unreferencedAt === 'number'
@@ -8370,7 +8473,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
                 : {}),
             }
           }
-          await commitStorageRetentionPage(tx, cycle, outcome)
+          receipt.absorb(await commitStorageRetentionPage(tx, cycle, outcome))
           return outcome
         },
       },
@@ -9044,20 +9147,6 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     return row?.id
   }
 
-  private async listAttachmentReapCandidates(
-    cutoff: number,
-    after: AttachmentReapCursor | undefined,
-    limit: number,
-  ): Promise<AttachmentHeaderRow[]> {
-    const db = await this.openDb()
-    const lower = after ? [0, after.unreferencedAt, after.attachmentId] : [0]
-    return db.attachments
-      .where('[refCount+unreferencedAt+id]')
-      .between(lower, [0, cutoff], false, false)
-      .limit(limit)
-      .toArray()
-  }
-
   async listAttachmentReferenceEdges(
     attachmentId: AttachmentId,
   ): Promise<AttachmentReferenceEdge[]> {
@@ -9295,20 +9384,6 @@ function continuationGlobalCalibration(value: unknown): GlobalTokenCalibration |
   return structuredClone(calibration as GlobalTokenCalibration)
 }
 
-function preparedMessage(
-  message: Message,
-  parentId: MessageId | null,
-  siblingIndex: number,
-): Message {
-  return {
-    ...structuredClone(message),
-    parentId,
-    siblingIndex,
-    nodeVersion: 0,
-    deleted: false,
-  }
-}
-
 function preparedGenerationPrompt(
   leafId: MessageId | null,
   canonicalHeaders: ValidatedGenerationPromptPathHeaders,
@@ -9428,8 +9503,6 @@ const browserGenerationCommandSupport: BrowserGenerationCommandSupport = Object.
   persistPreparedAttachmentBundleInMutation,
   preparedAttachmentIdentityMatches,
   preparedGenerationPrompt,
-  preparedMessage,
-  requiredPromptPathSlot,
   requiredPromptPathTarget,
   resolveGenerationPromptPathProof,
   stableStringify,

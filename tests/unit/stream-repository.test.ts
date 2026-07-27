@@ -1328,8 +1328,11 @@ async function continuationPrepareInput(input: {
       },
       claim: {
         chatId: input.chatId,
+        structuralVersion: chat.structuralVersion,
         leafId: input.targetAssistantId,
         headers: promptHeaders,
+        placementSlot: null,
+        targetTurn: null,
       },
     },
     configurationClaim: {

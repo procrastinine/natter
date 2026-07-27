@@ -1,4 +1,5 @@
 import type {
+  ActiveBranchChildSlot,
   ActiveBranchForkSlot,
   ActiveBranchForkTarget,
   ActiveBranchSelection,
@@ -14,6 +15,7 @@ import {
   createBranchPath,
   emptyBranchPath,
 } from '../core/branch-session'
+import { childListKey } from '../core/child-list-state'
 import type { GenerationCapabilityTarget } from '../core/interaction-capability'
 import {
   createMessageTopologyIndex,
@@ -39,7 +41,7 @@ import {
   transcriptRowFloorBudget,
   transcriptTailSpan,
 } from '../core/transcript-work-budget'
-import type { Chat, ChatId, Message, MessageId } from '../core/types'
+import type { Chat, ChatId, ChildListState, Message, MessageId } from '../core/types'
 import { browserSessionStorage } from '../lib/browser-storage'
 import { PersistentStringMap } from '../lib/persistent-string-map'
 import { newId } from '../lib/ulid'
@@ -64,7 +66,6 @@ import {
   type StructuralMessageHeader,
   sameMessageHeaderValue,
   sameMessageHeaderStructure as sameStructuralHeader,
-  splitMessageForStorage,
   toStructuralMessageHeader,
 } from './message-storage'
 import type {
@@ -237,7 +238,7 @@ interface ConversationTranscriptBindingPayload {
   readonly window: ConversationTranscriptFrame
   readonly selectionEpoch: number
   readonly viewportRevision: number
-  readonly intentPresentations: readonly ConversationMessagePresentation[]
+  readonly intentPresentations: readonly GenerationIntentMessagePresentation[]
 }
 
 interface ConversationTreeBindingPayload {
@@ -330,6 +331,11 @@ export interface ConversationPresentationResourcePort {
 }
 
 export type ConversationMessagePresentation = TranscriptBodyPresentation
+
+export interface GenerationIntentMessagePresentation {
+  readonly message: Message
+  readonly bodyVersion: 0
+}
 
 export type ConversationTranscriptPage = TranscriptBodyPage
 export type ConversationTranscriptFrame = TranscriptBodyWindow
@@ -860,6 +866,7 @@ type ActiveTopologyState =
       readonly projection: MessageTreeProjection<StructuralMessageHeader>
       readonly headerById: ReadonlyMap<MessageId, MessageHeaderRow>
       readonly headers: ConversationMessageHeaderLookup
+      readonly childSlots: ReadonlyMap<string, ActiveBranchChildSlot>
       readonly provedPathIdentity: object | null
     }
 
@@ -954,7 +961,7 @@ const EMPTY_TOPOLOGY = createMessageTopologyIndex<StructuralMessageHeader>([], T
 const EMPTY_STRUCTURAL_TOPOLOGY = structuralTopologyView(EMPTY_TOPOLOGY)
 const EMPTY_CONVERSATION_MESSAGE_PRESENTATIONS = Object.freeze(
   [],
-) as readonly ConversationMessagePresentation[]
+) as readonly GenerationIntentMessagePresentation[]
 const ABSENT_TOPOLOGY: ActiveTopologyState = Object.freeze({ kind: 'absent' })
 const FULL_PROJECTION_REFRESH: ConversationProjectionRefresh = Object.freeze({
   chat: true,
@@ -1124,7 +1131,7 @@ class TabConversationController implements ConversationController {
     {
       readonly claim: SessionSelectingConversationOperationClaim
       readonly baseLeafId: MessageId | null
-      readonly presentations: readonly ConversationMessagePresentation[]
+      readonly presentations: readonly GenerationIntentMessagePresentation[]
     }
   >()
   private readonly pendingRouteHandoffsByOwnerId = new Map<
@@ -1677,16 +1684,14 @@ class TabConversationController implements ConversationController {
     ) {
       return
     }
-    const presentations = Object.freeze(
+    const presentations: readonly GenerationIntentMessagePresentation[] = Object.freeze(
       input.messages.map((message) => {
         if (message.chatId !== claim.chatId) {
           throw new Error(`GenerationIntentPresentationChatMismatch:${message.id}`)
         }
-        const { header } = splitMessageForStorage(message)
         return Object.freeze({
-          header,
-          message: structuredClone(message),
-          bodyVersion: header.bodyVersion,
+          message,
+          bodyVersion: 0 as const,
         })
       }),
     )
@@ -1914,11 +1919,25 @@ class TabConversationController implements ConversationController {
   private admitChildSlots(evidenceRows: readonly WorkspaceLocalChildSlotEvidence[]): void {
     const active = this.active
     const spine = this.presentedSpine()
-    if (!active || !spine || evidenceRows.length === 0) return
+    if (!active || evidenceRows.length === 0) return
+    if (active.topology.kind === 'exact') {
+      const childSlots = new Map(active.topology.childSlots)
+      for (const { state } of evidenceRows) {
+        if (state.chatId === active.chatId) {
+          childSlots.set(state.id, childSlotProofFromState(state))
+        }
+      }
+      active.topology = Object.freeze({ ...active.topology, childSlots })
+    }
+    if (!spine) return
     const updates: ActiveBranchForkSlot[] = []
+    let nextSpine = spine
     for (const evidence of evidenceRows) {
       const { state } = evidence
       if (state.chatId !== active.chatId) continue
+      if (state.parentId === spine.resolvedLeafId) {
+        nextSpine = nextSpine.replaceTerminalChildSlot(childSlotProofFromState(state))
+      }
       const selected = spine.path.childOf(state.parentId)
       if (!selected) continue
       if (evidence.removedMessageIds.includes(selected.id)) continue
@@ -1954,6 +1973,7 @@ class TabConversationController implements ConversationController {
           slotVersion: state.version,
           position: member.position,
           liveCount: state.liveCount,
+          nextSiblingIndex: state.nextSiblingIndex,
           previousMessageId: member.previousMessageId,
           nextMessageId: member.nextMessageId,
           firstMessageId: state.firstLiveChildId,
@@ -1961,11 +1981,11 @@ class TabConversationController implements ConversationController {
         }),
       )
     }
-    if (updates.length === 0) return
+    if (updates.length === 0 && nextSpine === spine) return
     let forkFacts = active.forks
     for (const update of updates) forkFacts = forkFacts.set(update.selectedMessageId, update)
     active.forks = forkFacts
-    const nextSpine = spine.replaceForks(updates)
+    nextSpine = nextSpine.replaceForks(updates)
     if (nextSpine !== spine) {
       active.destination = replacePresentedDestinationSpine(active.destination, nextSpine)
     }
@@ -2518,6 +2538,7 @@ class TabConversationController implements ConversationController {
       chatId: active.chatId,
       destination,
       topology: active.topology.kind === 'exact' ? active.topology.index : null,
+      topologyChildSlots: active.topology.kind === 'exact' ? active.topology.childSlots : new Map(),
       topologyLoaded: active.topology.kind === 'exact',
       topologyFailed: active.failure?.kind === 'topology',
       headers: active.headers,
@@ -2598,7 +2619,17 @@ class TabConversationController implements ConversationController {
   private sealAppendSelectionTransition(
     transition: ConversationAppendSelectionTransition,
   ): SealedConversationSelection {
-    const { base, chat, fallback, forks, presentations, proof, suffixHeaders, target } = transition
+    const {
+      base,
+      chat,
+      fallback,
+      forks,
+      presentations,
+      proof,
+      suffixHeaders,
+      target,
+      terminalChildSlot,
+    } = transition
     if (
       chat.id !== proof.chatId ||
       base.chatId !== proof.chatId ||
@@ -2658,6 +2689,7 @@ class TabConversationController implements ConversationController {
         proof,
         presentations,
         forks,
+        terminalChildSlot,
       }),
       path,
       forks,
@@ -3377,6 +3409,7 @@ class TabConversationController implements ConversationController {
           nextIndex,
           active.topology.headerById,
           carriedProof,
+          active.topology.childSlots,
         )
       }
     }
@@ -4183,7 +4216,7 @@ class TabConversationController implements ConversationController {
           current.headers = PersistentStringMap.empty()
           current.compactableHeaderIds.clear()
           current.forks = PersistentStringMap.empty()
-          current.topology = exactTopologyState(0, EMPTY_TOPOLOGY, new Map(), null)
+          current.topology = exactTopologyState(0, EMPTY_TOPOLOGY, new Map(), null, new Map())
           this.recordHeaderChanges(removedHeaderIds)
           this.beginSelectionResolution(false)
           this.requestDestination(current.chatId)
@@ -4199,6 +4232,7 @@ class TabConversationController implements ConversationController {
           return
         }
         const byId = new Map(result.headers.map((header) => [header.id, header] as const))
+        const childSlots = topologyChildSlots(result.chat.id, result.headers, result.childSlots)
         let snapshotSuperseded = false
         for (const [messageId, header] of current.headers) {
           const loaded = byId.get(messageId)
@@ -4262,6 +4296,7 @@ class TabConversationController implements ConversationController {
               nextTopology,
               acceptedById,
               topologySpine.path.identity,
+              childSlots,
             )
             this.rebaseTranscriptToSpine(
               topologySpine,
@@ -4273,6 +4308,7 @@ class TabConversationController implements ConversationController {
               nextTopology,
               acceptedById,
               null,
+              childSlots,
             )
             this.beginSelectionResolution(false)
             this.requestDestination(current.chatId)
@@ -4283,6 +4319,7 @@ class TabConversationController implements ConversationController {
             nextTopology,
             acceptedById,
             null,
+            childSlots,
           )
         }
         this.compactExactHeaders()
@@ -5482,8 +5519,8 @@ class TabConversationController implements ConversationController {
   private presentedGenerationIntents(
     chatId: ChatId,
     leafId: MessageId | null,
-  ): readonly ConversationMessagePresentation[] {
-    let matched: readonly ConversationMessagePresentation[] | null = null
+  ): readonly GenerationIntentMessagePresentation[] {
+    let matched: readonly GenerationIntentMessagePresentation[] | null = null
     for (const pending of this.generationIntentPresentations.values()) {
       if (
         pending.claim.chatId === chatId &&
@@ -5955,6 +5992,7 @@ function exactTopologyState(
   index: MessageTopologyIndex<StructuralMessageHeader>,
   headerById: ReadonlyMap<MessageId, MessageHeaderRow>,
   provedPathIdentity: object | null,
+  childSlots: ReadonlyMap<string, ActiveBranchChildSlot>,
 ): ActiveTopologyState {
   if (!Number.isSafeInteger(structuralVersion) || structuralVersion < 0) {
     throw new Error('ConversationTopologyStructuralVersionInvalid')
@@ -5971,8 +6009,43 @@ function exactTopologyState(
     projection: structuralTopologyView(index),
     headerById,
     headers: messageHeaderLookup(headerById),
+    childSlots,
     provedPathIdentity,
   })
+}
+
+function topologyChildSlots(
+  chatId: ChatId,
+  headers: readonly MessageHeaderRow[],
+  states: readonly ChildListState[],
+): ReadonlyMap<string, ActiveBranchChildSlot> {
+  const childSlots = new Map<string, ActiveBranchChildSlot>()
+  for (const state of states) {
+    if (
+      state.chatId !== chatId ||
+      state.id !== childListKey(chatId, state.parentId) ||
+      !Number.isSafeInteger(state.version) ||
+      state.version < 0 ||
+      !Number.isSafeInteger(state.liveCount) ||
+      state.liveCount < 0 ||
+      !Number.isSafeInteger(state.nextSiblingIndex) ||
+      state.nextSiblingIndex < state.liveCount ||
+      (state.liveCount === 0) !== (state.firstLiveChildId === null) ||
+      (state.liveCount === 0) !== (state.lastLiveChildId === null)
+    ) {
+      throw new Error(`ConversationTopologyChildSlotInvalid:${state.id}`)
+    }
+    childSlots.set(state.id, childSlotProofFromState(state))
+  }
+  for (const parentId of [null, ...headers.map((header) => header.id)]) {
+    const key = childListKey(chatId, parentId)
+    if (childSlots.has(key)) continue
+    childSlots.set(
+      key,
+      Object.freeze({ parentId, slotVersion: 0, liveCount: 0, nextSiblingIndex: 0 }),
+    )
+  }
+  return childSlots
 }
 
 function withExactTopologyHeaders(
@@ -6256,6 +6329,7 @@ interface ConversationPromptPathFrameInput {
   readonly chatId: ChatId
   readonly destination: ConversationDestinationProjection
   readonly topology: MessageTopologyIndex<StructuralMessageHeader> | null
+  readonly topologyChildSlots: ReadonlyMap<string, ActiveBranchChildSlot>
   readonly topologyLoaded: boolean
   readonly topologyFailed: boolean
   readonly headers: PersistentStringMap<MessageHeaderRow>
@@ -6267,6 +6341,7 @@ function createConversationPromptPathFrame({
   chatId,
   destination,
   topology,
+  topologyChildSlots,
   topologyLoaded,
   topologyFailed,
   headers,
@@ -6379,7 +6454,7 @@ function createConversationPromptPathFrame({
     capture: (
       requirement: Extract<GenerationPromptPathRequirement, { readonly surface: 'chat' }>,
     ) => {
-      if (requirementCapability(requirement) !== 'available') return null
+      if (requirementCapability(requirement) !== 'available' || !spine) return null
       let leafId = requirement.target.kind === 'root' ? null : requirement.target.messageId
       if (requirement.target.kind === 'exclude') {
         const target = header(requirement.target.messageId)
@@ -6388,10 +6463,38 @@ function createConversationPromptPathFrame({
       }
       const capturedHeaders = pathHeaders(leafId)
       if (!capturedHeaders) return null
+      const placementSlot =
+        requirement.childSlot === 'none'
+          ? null
+          : leafId === spine.resolvedLeafId
+            ? spine.terminalChildSlot
+            : (topologyChildSlots.get(childListKey(chatId, leafId)) ??
+              (requirement.target.kind === 'exclude'
+                ? (spine.forkFor(requirement.target.messageId) ?? null)
+                : null))
+      if (requirement.childSlot !== 'none' && !placementSlot) return null
+      const target =
+        requirement.target.kind === 'root' ? null : header(requirement.target.messageId)
+      if (requirement.target.kind !== 'root' && !target) return null
       return Object.freeze({
         claim: Object.freeze({
           chatId,
+          structuralVersion: spine.structuralVersion,
           leafId,
+          placementSlot: placementSlot
+            ? Object.freeze({
+                parentId: placementSlot.parentId,
+                slotVersion: placementSlot.slotVersion,
+                liveCount: placementSlot.liveCount,
+                nextSiblingIndex: placementSlot.nextSiblingIndex,
+              })
+            : null,
+          targetTurn: target
+            ? Object.freeze({
+                turnId: target.turnId,
+                turnIndex: target.turnIndex,
+              })
+            : null,
           headers: Object.freeze(
             capturedHeaders.map((capturedHeader) =>
               Object.freeze({
@@ -6552,6 +6655,7 @@ function activeBranchSpineFromTopology(
       structuralVersion,
       resolvedLeafId: null,
       headers: Object.freeze([]),
+      terminalChildSlot: current.terminalChildSlot,
     })
   }
   const reversed: MessageHeaderRow[] = []
@@ -6571,6 +6675,16 @@ function activeBranchSpineFromTopology(
     structuralVersion,
     resolvedLeafId: current.resolvedLeafId,
     headers: Object.freeze(reversed),
+    terminalChildSlot: current.terminalChildSlot,
+  })
+}
+
+function childSlotProofFromState(state: ChildListState): ActiveBranchChildSlot {
+  return Object.freeze({
+    parentId: state.parentId,
+    slotVersion: state.version,
+    liveCount: state.liveCount,
+    nextSiblingIndex: state.nextSiblingIndex,
   })
 }
 

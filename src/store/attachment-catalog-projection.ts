@@ -92,9 +92,10 @@ export async function putAttachmentCatalogProjectionFromHeader(
   tx: Transaction,
   header: AttachmentHeaderRow,
   previousHeader: AttachmentHeaderRow | undefined,
+  options?: { readonly previous: AttachmentCatalogProjectionRow },
 ): Promise<AttachmentCatalogReferenceMutationReceipt> {
   const table = tx.table<AttachmentCatalogProjectionRow, AttachmentId>('attachmentCatalogRows')
-  const previous = await table.get(header.id)
+  const previous = options?.previous ?? (await table.get(header.id))
   if ((previousHeader === undefined) !== (previous === undefined)) {
     throw new Error(`AttachmentCatalogHeaderStateMismatch:${header.id}`)
   }
@@ -109,7 +110,7 @@ export async function putAttachmentCatalogProjectionFromHeader(
   await putPhysicalStorageRow(tx, 'attachmentCatalogRows', next, previous)
   const aggregate = await applyAttachmentCatalogAggregateDeltas(tx, [{ previous, next }])
   return attachmentCatalogReferenceMutationReceipt(
-    [header.id],
+    options ? [] : [header.id],
     [header.id],
     aggregate.read,
     aggregate.written,

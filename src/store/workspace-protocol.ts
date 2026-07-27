@@ -1,4 +1,5 @@
 import type {
+  ActiveBranchChildSlot,
   ActiveBranchForkSlot,
   ActiveBranchForkTarget,
   ActiveBranchTargetUnavailableReason,
@@ -36,6 +37,7 @@ import type {
   MessageBodyMutationInput,
   PasteImportInput,
   PasteImportResult,
+  PreparedMessagePlacementFrame,
 } from '../core/messages'
 
 import { RENDERING_PREFERENCES_KEY, type RenderingPreferences } from '../core/rendering-preferences'
@@ -1032,8 +1034,14 @@ export type GenerationPromptPathHeaderClaim = GenerationMessageReadProof
 
 export interface GenerationPromptPathClaim {
   readonly chatId: ChatId
+  readonly structuralVersion: number
   readonly leafId: MessageId | null
   readonly headers: readonly GenerationPromptPathHeaderClaim[]
+  readonly placementSlot: ActiveBranchChildSlot | null
+  readonly targetTurn: {
+    readonly turnId: string
+    readonly turnIndex: number
+  } | null
 }
 
 export type GenerationPromptPathRequirement =
@@ -1121,32 +1129,29 @@ export type PrepareAttemptInput = (
       strategy: 'new-chat-send'
       chat: Chat
       lease: StreamLeaseAdmission
-      user: Message
-      assistant: Message
+      placement: PreparedMessagePlacementFrame
       configurationClaim: PrepareAttemptConfigurationClaim
     }
   | ({
       strategy: 'send'
       lease: StreamLeaseAdmission
-      user: Message
-      assistant: Message
+      placement: PreparedMessagePlacementFrame
     } & ExistingChatPrepareConfiguration)
   | ({
       strategy: 'reply'
       lease: StreamLeaseAdmission
-      assistant: Message
+      placement: PreparedMessagePlacementFrame
     } & ExistingChatPrepareConfiguration)
   | ({
       strategy: 'regenerate'
       lease: StreamLeaseAdmission
-      assistant: Message
+      placement: PreparedMessagePlacementFrame
       persistCapturedConfiguration?: true
     } & ExistingChatPrepareConfiguration)
   | ({
       strategy: 'edit-resend'
       lease: StreamLeaseAdmission
-      user: Message
-      assistant: Message
+      placement: PreparedMessagePlacementFrame
     } & ExistingChatPrepareConfiguration)
   | ({
       strategy: 'continue'
@@ -1889,6 +1894,7 @@ export type ConversationTopologyResult =
       readonly chat: Chat
       readonly structuralVersion: number
       readonly headers: readonly MessageHeaderRow[]
+      readonly childSlots: readonly ChildListState[]
     }
   | { readonly kind: 'stale' }
   | { readonly kind: 'missing'; readonly chatId: ChatId }

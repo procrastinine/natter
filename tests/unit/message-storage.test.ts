@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest'
 import type { ContinuationAttempt, Message } from '../../src/core/types'
 import {
   canonicalMessageHeaderRow,
+  compileCurrentMessageGraphTransition,
+  compileCurrentMessageTransition,
   hydrateMessage,
   hydrateMessages,
   MESSAGE_BODY_KEYS,
@@ -177,6 +179,89 @@ function message(overrides: Partial<Message> = {}): Message {
 }
 
 describe('message storage split', () => {
+  it('compiles current storage, graph, summary, attachment, and custody facts once', () => {
+    const user = message({
+      id: 'user-1',
+      parentId: null,
+      siblingIndex: 0,
+      turnId: 'turn-user',
+      turnIndex: 0,
+      createdAt: 10,
+      role: 'user',
+      origin: 'imported',
+      content: [{ type: 'text', text: 'imported question' }],
+      nodeVersion: 0,
+    })
+    delete user.generation
+    const assistant = message({
+      id: 'assistant-1',
+      parentId: user.id,
+      siblingIndex: 0,
+      turnId: 'turn-assistant',
+      turnIndex: 0,
+      createdAt: 11,
+      role: 'assistant',
+      origin: 'imported',
+      content: [{ type: 'output_text', text: 'imported answer' }],
+      nodeVersion: 0,
+    })
+    delete assistant.generation
+    const graph = compileCurrentMessageGraphTransition(user.chatId, [user, assistant], 20)
+
+    expect(graph).toMatchObject({
+      lastUpdatedLeafId: assistant.id,
+      wordCount: 4,
+      totalCostUsd: 0,
+      previewText: 'imported question',
+    })
+    expect(graph.branchMessages.map((entry) => entry.id)).toEqual([user.id, assistant.id])
+    expect(graph.childSlots.states).toEqual([
+      expect.objectContaining({ chatId: user.chatId, parentId: null, liveCount: 1 }),
+      expect.objectContaining({ chatId: user.chatId, parentId: user.id, liveCount: 1 }),
+    ])
+    expect(graph.transitions).toEqual([
+      expect.objectContaining({
+        structural: expect.objectContaining({ messageId: user.id, parentId: null }),
+        custody: { kind: 'available' },
+        timestamp: { kind: 'exact', createdAt: user.createdAt },
+      }),
+      expect.objectContaining({
+        structural: expect.objectContaining({ messageId: assistant.id, parentId: user.id }),
+        custody: { kind: 'available' },
+        timestamp: { kind: 'exact', createdAt: assistant.createdAt },
+      }),
+    ])
+  })
+
+  it('requires exact admitted custody for a newly active attempt target', () => {
+    const generation = message().generation
+    if (!generation) throw new Error('expected generation fixture')
+    const active = message({
+      generation: {
+        ...generation,
+        status: 'preparing',
+      },
+    })
+    delete active.generation?.finishedAt
+
+    expect(() =>
+      compileCurrentMessageTransition(active, {
+        timestamp: 'exact',
+        custody: { kind: 'available' },
+      }),
+    ).toThrow(`CurrentMessageAttemptCustodyMissing:${active.id}`)
+    expect(() =>
+      compileCurrentMessageTransition(active, {
+        timestamp: 'exact',
+        custody: {
+          kind: 'reserved-attempt-target',
+          messageId: active.id,
+          streamId: 'stream-1',
+        },
+      }),
+    ).not.toThrow()
+  })
+
   it('canonicalizes absent attachment refs at the storage split boundary', () => {
     const source = message()
     delete source.attachmentRefs

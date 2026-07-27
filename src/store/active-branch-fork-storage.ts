@@ -1,12 +1,19 @@
 import type { Transaction } from 'dexie'
 import {
+  type ActiveBranchChildSlot,
   type ActiveBranchForkSlot,
   type ActiveBranchForkTarget,
+  activeBranchChildSlotFromState,
   materializeActiveBranchForkSlots,
 } from '../core/active-branch-spine'
 import { childListKey } from '../core/child-list-state'
 import type { ChatId, ChildListState, ChildSlotMember, MessageId } from '../core/types'
 import type { MessageHeaderRow } from './message-storage'
+
+export interface ActiveBranchPathSlotFrame {
+  readonly forks: readonly ActiveBranchForkSlot[]
+  readonly terminalChildSlot: ActiveBranchChildSlot
+}
 
 export async function readActiveBranchForksInTransaction(
   tx: Transaction,
@@ -57,6 +64,39 @@ export async function readActiveBranchForkSlotsForHeadersInTransaction(
     states,
     members,
   )
+}
+
+export async function readActiveBranchPathSlotFrameInTransaction(
+  tx: Transaction,
+  chatId: ChatId,
+  headers: readonly MessageHeaderRow[],
+  signal?: AbortSignal,
+): Promise<ActiveBranchPathSlotFrame> {
+  const terminalId = headers.at(-1)?.id ?? null
+  throwIfAborted(signal)
+  const [members, states] = await Promise.all([
+    headers.length === 0
+      ? Promise.resolve([])
+      : tx
+          .table<ChildSlotMember, MessageId>('childSlotMembers')
+          .bulkGet(headers.map((header) => header.id)),
+    tx
+      .table<ChildListState, string>('childLists')
+      .bulkGet([
+        ...headers.map((header) => childListKey(chatId, header.parentId)),
+        childListKey(chatId, terminalId),
+      ]),
+  ])
+  throwIfAborted(signal)
+  const forkStates = states.slice(0, headers.length)
+  const terminalState = states.at(-1)
+  return Object.freeze({
+    forks:
+      headers.length === 0
+        ? Object.freeze([])
+        : materializeActiveBranchForkSlots(chatId, headers, forkStates, members),
+    terminalChildSlot: activeBranchChildSlotFromState(chatId, terminalId, terminalState),
+  })
 }
 
 function throwIfAborted(signal: AbortSignal | undefined): void {

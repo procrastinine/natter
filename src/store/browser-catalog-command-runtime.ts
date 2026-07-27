@@ -43,23 +43,17 @@ import {
   putTokenCalibrationSettingByteOwner,
 } from './byte-owner-mutation'
 import {
-  applyChatRowWriteTransitions,
   CHAT_ROW_LINKED_TRANSACTION_CAPABILITY,
   CHAT_ROW_PRESERVING_LINKS_TRANSACTION_CAPABILITY,
   type ChatRowWriteMutationReceipt,
+  openLinkedChatMutation,
+  openPreservingChatMutation,
 } from './chat-row-transition'
 import {
   CHAT_SIDEBAR_FOLDER_EXTREMA_READ_REQUEST_LIMIT,
   type ChatSidebarProjectionRow,
 } from './chat-sidebar-projection'
-import {
-  readAllCurrentChatsForTransaction,
-  readArchivedChatIdPage,
-  readCurrentChatForTransaction,
-  readCurrentChatsInFolderForTransaction,
-  readOptionalCurrentChatRowsForTransaction,
-  type TransactionCurrentChat,
-} from './chat-storage-codec'
+import { readArchivedChatIdPage } from './chat-storage-codec'
 import {
   CHAT_CLOSURE_BATCH_LIMIT,
   CHAT_CLOSURE_TRANSACTION_CAPABILITY,
@@ -1068,7 +1062,8 @@ async function patchSingleChatMetadataRow<
     | undefined,
 ): Promise<ChatMetadataWriteResult<boolean>> {
   const changed = await commit.executeSemanticOperation(descriptor, { chatId }, async (tx) => {
-    const current = await readCurrentChatForTransaction(tx, chatId)
+    const chatMutation = openPreservingChatMutation(tx)
+    const current = await chatMutation.read(chatId)
     if (!current) {
       return semanticOperationExecution(undefined, singleChatMetadataReceipt(undefined, false))
     }
@@ -1086,13 +1081,8 @@ async function patchSingleChatMetadataRow<
       summaryVersion: current.summaryVersion + (change.touchSummary ? 1 : 0),
       updatedAt,
     }
-    const transition = await applyChatRowWriteTransitions(tx, [
-      {
-        kind: 'replace-preserving-links',
-        previous: current,
-        next,
-      },
-    ])
+    chatMutation.replace(chatId, () => next)
+    const transition = await chatMutation.commit()
     return semanticOperationExecution(
       next,
       singleChatMetadataReceipt(transition, updatedAtClockRead),
@@ -1134,10 +1124,11 @@ export async function setChatsArchived(
     CHAT_SET_ARCHIVED_OPERATION,
     plan,
     async (tx) => {
-      const rows = await readOptionalCurrentChatRowsForTransaction(tx, plan.chatIds)
+      const chatMutation = openLinkedChatMutation(tx)
+      const rows = await chatMutation.readMany(plan.chatIds)
       const currentResourceNames: string[] = []
       const pending: Array<{
-        readonly current: TransactionCurrentChat
+        readonly current: Chat
         readonly projected: Chat
       }> = []
       for (const current of rows) {
@@ -1152,7 +1143,7 @@ export async function setChatsArchived(
         throw new ChatSetArchivedLinkPlanChangedError()
       }
       const updatedAtClock = new TransactionChatUpdateClock()
-      const writes: Array<{ readonly current: TransactionCurrentChat; readonly next: Chat }> = []
+      const writes: Array<{ readonly current: Chat; readonly next: Chat }> = []
       for (const { current, projected } of pending) {
         writes.push({
           current,
@@ -1164,14 +1155,10 @@ export async function setChatsArchived(
           },
         })
       }
-      const transition = await applyChatRowWriteTransitions(
-        tx,
-        writes.map(({ current, next }) => ({
-          kind: 'replace-linked' as const,
-          previous: current,
-          next,
-        })),
-      )
+      for (const { current, next } of writes) {
+        chatMutation.replaceLinked(current.id, () => next)
+      }
+      const transition = await chatMutation.commit()
       return semanticOperationExecution(
         writes.map(({ next }) => next),
         chatSetArchivedReceipt(plan, transition, writes.length > 0),
@@ -1242,7 +1229,8 @@ export async function moveChatRowsToFolder(
     )
   }
   return commit.executeSemanticOperation(CHAT_MOVE_TO_FOLDER_OPERATION, plan, async (tx) => {
-    const rows = await readOptionalCurrentChatRowsForTransaction(tx, plan.chatIds)
+    const chatMutation = openPreservingChatMutation(tx)
+    const rows = await chatMutation.readMany(plan.chatIds)
     if (
       !sameOrderedValues(
         plan.linkedResourceNames,
@@ -1252,8 +1240,7 @@ export async function moveChatRowsToFolder(
       throw new ChatMoveToFolderPlanChangedError()
     }
     const pending = rows.filter(
-      (row): row is TransactionCurrentChat =>
-        row !== undefined && (row.folderId ?? null) !== plan.folderId,
+      (row): row is Chat => row !== undefined && (row.folderId ?? null) !== plan.folderId,
     )
     if (pending.length === 0) {
       const accumulator =
@@ -1287,7 +1274,7 @@ export async function moveChatRowsToFolder(
     }
     const changedChats: Chat[] = []
     const updatedAtClock = new TransactionChatUpdateClock()
-    const writes: Array<{ previous: TransactionCurrentChat; next: Chat }> = []
+    const writes: Array<{ previous: Chat; next: Chat }> = []
     for (const row of pending) {
       const next: Chat = {
         ...row,
@@ -1299,14 +1286,8 @@ export async function moveChatRowsToFolder(
       writes.push({ previous: row, next })
       changedChats.push(next)
     }
-    const transition = await applyChatRowWriteTransitions(
-      tx,
-      writes.map(({ previous, next }) => ({
-        kind: 'replace-preserving-links',
-        previous,
-        next,
-      })),
-    )
+    for (const { previous, next } of writes) chatMutation.replace(previous.id, () => next)
+    const transition = await chatMutation.commit()
     absorbSemanticOperationReceiptFragment(tx, transition.fragment)
     if (folder) {
       const touchedFolder = {
@@ -1355,8 +1336,9 @@ export async function setChatRowsTagsFromNames(
         deletedTagIds: [],
       })
       if (uniqueChatIds.length === 0) return emptyResult()
-      const targets = (await readOptionalCurrentChatRowsForTransaction(tx, uniqueChatIds)).filter(
-        (chat): chat is TransactionCurrentChat => chat !== undefined,
+      const chatMutation = openPreservingChatMutation(tx)
+      const targets = (await chatMutation.readMany(uniqueChatIds)).filter(
+        (chat): chat is Chat => chat !== undefined,
       )
       if (targets.length === 0) return emptyResult()
 
@@ -1390,7 +1372,7 @@ export async function setChatRowsTagsFromNames(
 
       const changedChats: Chat[] = []
       const candidateTagIds = new Set<TagId>()
-      const writes: Array<{ previous: TransactionCurrentChat; next: Chat }> = []
+      const writes: Array<{ previous: Chat; next: Chat }> = []
       const selectedTagIdSet = new Set(selectedTagIds)
       for (const row of targets) {
         if (sameOrderedIds(row.tags, selectedTagIds)) continue
@@ -1405,14 +1387,8 @@ export async function setChatRowsTagsFromNames(
         writes.push({ previous: row, next })
         changedChats.push(next)
       }
-      await applyChatRowWriteTransitions(
-        tx,
-        writes.map(({ previous, next }) => ({
-          kind: 'replace-preserving-links',
-          previous,
-          next,
-        })),
-      )
+      for (const { previous, next } of writes) chatMutation.replace(previous.id, () => next)
+      await chatMutation.commit()
 
       if (changedChats.length > 0) {
         for (const tagId of selectedTagIds) {
@@ -1484,7 +1460,8 @@ export async function clearChatCalibration(
     CHAT_CALIBRATION_CLEAR_OPERATION,
     { chatIds: [command.chatId] },
     async (tx) => {
-      const current = await readCurrentChatForTransaction(tx, command.chatId)
+      const chatMutation = openPreservingChatMutation(tx)
+      const current = await chatMutation.read(command.chatId)
       if (!current) {
         return semanticOperationExecution(
           {
@@ -1526,9 +1503,8 @@ export async function clearChatCalibration(
         tokenCalibration,
         tokenCalibrationGeneration: nextChatCalibrationGeneration(current),
       }
-      const transition = await applyChatRowWriteTransitions(tx, [
-        { kind: 'replace-preserving-links', previous: current, next: nextChat },
-      ])
+      chatMutation.replace(command.chatId, () => nextChat)
+      const transition = await chatMutation.commit()
       const settings = tx.table<SettingsRow, string>('settings')
       const global = await settings.get(GLOBAL_TOKEN_CALIBRATION_KEY)
       await putTokenCalibrationSettingByteOwner(
@@ -1585,7 +1561,8 @@ async function clearCalibrationEverywhereTransaction(
     { kind: 'chat.calibration.clear-family' | 'chat.calibration.clear-all' }
   >,
 ) {
-  const rows = await readAllCurrentChatsForTransaction(tx)
+  const chatMutation = openPreservingChatMutation(tx)
+  const rows = await chatMutation.readAll()
   let chatCount = 0
   const changedChats = rows.map((row) => {
     const cleared =
@@ -1602,14 +1579,8 @@ async function clearCalibrationEverywhereTransaction(
       tokenCalibrationGeneration: nextChatCalibrationGeneration(row),
     }
   })
-  const transition = await applyChatRowWriteTransitions(
-    tx,
-    changedChats.map((next, index) => ({
-      kind: 'replace-preserving-links' as const,
-      previous: rows[index] as TransactionCurrentChat,
-      next,
-    })),
-  )
+  for (const next of changedChats) chatMutation.replace(next.id, () => next)
+  const transition = await chatMutation.commit()
   const settings = tx.table<SettingsRow, string>('settings')
   const stored = await settings.get(GLOBAL_TOKEN_CALIBRATION_KEY)
   const clearedGlobal =
@@ -1806,10 +1777,11 @@ export async function ensureFolderAndMoveChats(
         ...(input.color ? { color: input.color } : {}),
       }
       const created = matched === undefined
-      const rows = await readOptionalCurrentChatRowsForTransaction(tx, uniqueChatIds)
+      const chatMutation = openPreservingChatMutation(tx)
+      const rows = await chatMutation.readMany(uniqueChatIds)
       const changes: EnsureFolderAndMoveChatsResult['changes'] = []
       const updatedAtClock = new TransactionChatUpdateClock()
-      const writes: Array<{ previous: TransactionCurrentChat; next: Chat }> = []
+      const writes: Array<{ previous: Chat; next: Chat }> = []
       for (const row of rows) {
         if (!row || (row.folderId ?? null) === folder.id) continue
         const next: Chat = {
@@ -1828,14 +1800,8 @@ export async function ensureFolderAndMoveChats(
           nextArchived: row.archived,
         })
       }
-      await applyChatRowWriteTransitions(
-        tx,
-        writes.map(({ previous, next }) => ({
-          kind: 'replace-preserving-links',
-          previous,
-          next,
-        })),
-      )
+      for (const { previous, next } of writes) chatMutation.replace(previous.id, () => next)
+      await chatMutation.commit()
       const touchedFolder: ChatFolder = {
         ...folder,
         lastUsedAt: Math.max(folder.lastUsedAt ?? 0, now),
@@ -1869,13 +1835,14 @@ export async function deleteFolder(
     const folders = tx.table<ChatFolder, FolderId>('folders')
     const folder = await folders.get(folderId)
     if (!folder) return { deleted: false, affectedChatIds: [], changes: [] }
-    const rows = [...(await readCurrentChatsInFolderForTransaction(tx, folderId))]
+    const chatMutation = openLinkedChatMutation(tx)
+    const rows = [...(await chatMutation.readFolder(folderId))]
     rows.sort((left, right) => left.id.localeCompare(right.id))
     await deleteChatFolderByteOwner(tx, folder)
     const changedChats: Chat[] = []
     const changes: DeleteFolderResult['changes'] = []
     const updatedAtClock = new TransactionChatUpdateClock()
-    const writes: Array<{ previous: TransactionCurrentChat; next: Chat }> = []
+    const writes: Array<{ previous: Chat; next: Chat }> = []
     for (const row of rows) {
       const archived = chatDisposition === 'archive' ? true : row.archived
       const next: Chat = {
@@ -1896,17 +1863,14 @@ export async function deleteFolder(
         nextArchived: archived,
       })
     }
-    await applyChatRowWriteTransitions(
-      tx,
-      writes.map(({ previous, next }) => ({
-        kind:
-          chatDisposition === 'archive'
-            ? ('replace-linked' as const)
-            : ('replace-preserving-links' as const),
-        previous,
-        next,
-      })),
-    )
+    for (const { previous, next } of writes) {
+      if (chatDisposition === 'archive') {
+        chatMutation.replaceLinked(previous.id, () => next)
+      } else {
+        chatMutation.replacePreserving(previous.id, () => next)
+      }
+    }
+    await chatMutation.commit()
     return {
       deleted: true,
       affectedChatIds: changedChats.map((chat) => chat.id),

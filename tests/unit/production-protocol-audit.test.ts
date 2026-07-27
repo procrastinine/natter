@@ -113,7 +113,7 @@ describe('production workspace protocol audit', () => {
 
     expect(report).toMatchObject({
       ok: true,
-      sourceFiles: 473,
+      sourceFiles: 474,
       roots: {
         variants: 15,
         exclusiveVariants: 2,

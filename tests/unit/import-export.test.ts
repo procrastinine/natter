@@ -548,6 +548,37 @@ async function prepareBlockingAttempt(
       workspaceSettingOverrides: [],
     }
     const configurationLinkTransition = testChatConfigurationLinkTransition(seeded.chat)
+    const sendTurnId = newId()
+    const reservedUser = message({
+      id: 'reserved-send-user',
+      chatId: seeded.chat.id,
+      role: 'user',
+      parentId: seeded.assistantMessage.id,
+      turnId: sendTurnId,
+      turnIndex: 0,
+      createdAt: startedAt,
+      content: [{ type: 'text', text: 'Admitted send' }],
+    })
+    const reservedAssistant = message({
+      id: assistantMessageId,
+      chatId: seeded.chat.id,
+      role: 'assistant',
+      parentId: reservedUser.id,
+      turnId: sendTurnId,
+      turnIndex: 1,
+      createdAt: startedAt,
+      content: [],
+      generation: {
+        model: seeded.chat.settings.model,
+        requestedModel: seeded.chat.settings.model,
+        status: 'preparing',
+        integrity: 'clean',
+        costSource: 'stream',
+        reasoningCarryForward: 'none',
+        reasoningVisibility: { disclosure: 'unknown' },
+        startedAt,
+      },
+    })
     const input =
       kind === 'Continue'
         ? ({
@@ -569,8 +600,11 @@ async function prepareBlockingAttempt(
               },
               claim: {
                 chatId: seeded.chat.id,
+                structuralVersion: seeded.chat.structuralVersion,
                 leafId: seeded.assistantMessage.id,
                 headers: promptHeaders,
+                placementSlot: null,
+                targetTurn: null,
               },
             },
           } as const)
@@ -593,35 +627,33 @@ async function prepareBlockingAttempt(
               },
               claim: {
                 chatId: seeded.chat.id,
+                structuralVersion: seeded.chat.structuralVersion,
                 leafId: seeded.assistantMessage.id,
                 headers: promptHeaders,
+                placementSlot: {
+                  parentId: seeded.assistantMessage.id,
+                  slotVersion: 0,
+                  liveCount: 0,
+                  nextSiblingIndex: 0,
+                },
+                targetTurn: {
+                  turnId: seeded.assistantMessage.turnId,
+                  turnIndex: seeded.assistantMessage.turnIndex,
+                },
               },
             },
-            user: message({
-              id: 'reserved-send-user',
+            placement: {
               chatId: seeded.chat.id,
-              role: 'user',
-              parentId: seeded.assistantMessage.id,
+              structuralVersion: seeded.chat.structuralVersion,
               createdAt: startedAt,
-              content: [{ type: 'text', text: 'Admitted send' }],
-            }),
-            assistant: message({
-              id: assistantMessageId,
-              chatId: seeded.chat.id,
-              role: 'assistant',
-              createdAt: startedAt,
-              content: [],
-              generation: {
-                model: seeded.chat.settings.model,
-                requestedModel: seeded.chat.settings.model,
-                status: 'preparing',
-                integrity: 'clean',
-                costSource: 'stream',
-                reasoningCarryForward: 'none',
-                reasoningVisibility: { disclosure: 'unknown' },
-                startedAt,
+              slot: {
+                parentId: seeded.assistantMessage.id,
+                slotVersion: 0,
+                liveCount: 0,
+                nextSiblingIndex: 0,
               },
-            }),
+              messages: [reservedUser, reservedAssistant],
+            },
           } as const)
     await getWorkspaceRepository().execute(permit, { kind: 'attempt.prepare', input })
   })
@@ -2723,11 +2755,31 @@ describe('workspace backup restore', () => {
       })
       expect(await destination.messages.count()).toBe(257)
       expect(await destination.presets.count()).toBe(257)
-      const messageScope = JSON.stringify(['messageBodies', 'messagePreviews', 'messages'])
+      const messageScope = JSON.stringify([
+        'attachmentCatalogAggregate',
+        'attachmentCatalogRows',
+        'attachmentRefEdges',
+        'attachments',
+        'messageBodies',
+        'messagePreviews',
+        'messages',
+      ])
       const messageTransactions = records.filter(
         (record) => JSON.stringify(record.tables) === messageScope,
       )
       expect(messageTransactions).toHaveLength(3)
+      expect(
+        records.filter(
+          (record) =>
+            JSON.stringify(record.tables) ===
+            JSON.stringify([
+              'attachmentCatalogAggregate',
+              'attachmentCatalogRows',
+              'attachmentRefEdges',
+              'attachments',
+            ]),
+        ),
+      ).toEqual([])
       const clearScope = [...PHYSICAL_STORAGE_TABLE_NAMES]
         .filter((name) => name !== 'browserLocks' && name !== 'workspaceFence')
         .sort()

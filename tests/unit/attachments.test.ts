@@ -500,6 +500,111 @@ describe('attachment backend storage', () => {
     expect(await getAttachmentBundle(ignored.attachment.id)).toBeDefined()
   })
 
+  it('applies each delete-many disposition once in one exact attachment transaction', async () => {
+    const chat = await seedChat()
+    const message = makeMessage(chat.id)
+    await putMessage(message)
+    const deleted = await ingestAttachmentBytes({
+      blob: bytes('delete-many deleted'),
+      filename: 'delete-many-deleted.txt',
+      now: 30,
+    })
+    const stubbed = await ingestAttachmentBytes({
+      blob: bytes('delete-many stubbed'),
+      filename: 'delete-many-stubbed.txt',
+      now: 31,
+    })
+    await addExistingAttachmentRef({
+      messageId: message.id,
+      attachmentId: stubbed.attachment.id,
+      now: 32,
+    })
+    const absentAttachmentId = newId()
+    const catalogBefore = await getDb().attachmentCatalogAggregate.get('workspace')
+    const expectedCatalogRevision = catalogBefore?.projectionRevision ?? 0
+    const backend = new RecordingLockBackend()
+    __setLockBackendForTests(backend)
+
+    const command = {
+      kind: 'attachment.delete-many' as const,
+      input: {
+        attachmentIds: [
+          deleted.attachment.id,
+          stubbed.attachment.id,
+          absentAttachmentId,
+          deleted.attachment.id,
+        ],
+        expectedCatalogRevision,
+        reason: 'deleted' as const,
+        now: 33,
+      },
+    }
+    const committed = await execute(command)
+
+    expect(committed.value).toEqual({
+      deletedAttachmentIds: [deleted.attachment.id],
+      stubbedAttachmentIds: [stubbed.attachment.id],
+      absentAttachmentIds: [absentAttachmentId],
+      catalogRevision: expectedCatalogRevision + 2,
+    })
+    expect(backend.logicalRuns[0]).toEqual(
+      [
+        `attachment:${absentAttachmentId}`,
+        `attachment:${deleted.attachment.id}`,
+        `attachment:${stubbed.attachment.id}`,
+      ].sort(),
+    )
+    expect(backend.transactionTableRuns[0]).toEqual([
+      'attachmentArtifacts',
+      'attachmentBlobs',
+      'attachmentCatalogAggregate',
+      'attachmentCatalogRows',
+      'attachmentJobs',
+      'attachmentRefEdges',
+      'attachments',
+    ])
+    expect(await getAttachmentBundle(deleted.attachment.id)).toBeUndefined()
+    expect((await getAttachmentBundle(stubbed.attachment.id))?.attachment.storage.kind).toBe(
+      'missing',
+    )
+    await expect(execute(command)).rejects.toThrow(
+      `AttachmentCatalogRevisionChanged:${expectedCatalogRevision}:${expectedCatalogRevision + 2}`,
+    )
+  })
+
+  it('rolls back an earlier delete-many disposition when a later catalog row is invalid', async () => {
+    const first = await ingestAttachmentBytes({
+      blob: bytes('delete-many rollback first'),
+      filename: 'delete-many-rollback-first.txt',
+      now: 40,
+    })
+    const invalid = await ingestAttachmentBytes({
+      blob: bytes('delete-many rollback invalid'),
+      filename: 'delete-many-rollback-invalid.txt',
+      now: 41,
+    })
+    const firstBefore = await getAttachmentBundle(first.attachment.id)
+    const invalidBefore = await getAttachmentBundle(invalid.attachment.id)
+    await getDb().attachmentCatalogRows.delete(invalid.attachment.id)
+    const expectedCatalogRevision =
+      (await getDb().attachmentCatalogAggregate.get('workspace'))?.projectionRevision ?? 0
+
+    await expect(
+      execute({
+        kind: 'attachment.delete-many',
+        input: {
+          attachmentIds: [first.attachment.id, invalid.attachment.id],
+          expectedCatalogRevision,
+          reason: 'deleted',
+          now: 42,
+        },
+      }),
+    ).rejects.toThrow(`AttachmentCatalogRowMissing:${invalid.attachment.id}`)
+
+    expect(await getAttachmentBundle(first.attachment.id)).toEqual(firstBefore)
+    expect(await getAttachmentBundle(invalid.attachment.id)).toEqual(invalidBefore)
+  })
+
   it('aborts a bulk delete before its first atomic batch without changing membership', async () => {
     const attachment = await ingestAttachmentBytes({
       blob: bytes('cancelled'),
@@ -976,9 +1081,11 @@ describe('attachment backend storage', () => {
       deleted: false,
       refs: { messages: 1, drafts: 0 },
     })
-    expect(referencedBackend.logicalRuns).toEqual([
-      [`attachment:${referencedTarget.attachment.id}`],
-    ])
+    expect(
+      referencedBackend.logicalRuns.filter((run) =>
+        run.some((resource) => resource.startsWith('attachment:')),
+      ),
+    ).toEqual([[`attachment:${referencedTarget.attachment.id}`]])
     expect(await getAttachmentBundle(referencedTarget.attachment.id)).toEqual(referencedBefore)
     expect(await getDb().attachmentCatalogAggregate.get('workspace')).toEqual(
       catalogBeforeReferencedProbe,

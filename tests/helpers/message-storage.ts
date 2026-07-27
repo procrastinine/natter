@@ -1,7 +1,6 @@
 import { findLastUpdatedLeafId } from '../../src/core/active-path'
 import { buildChildSlotProjection } from '../../src/core/child-list-state'
 import type {
-  Chat,
   ChatId,
   ChildListState,
   ChildSlotMember,
@@ -19,13 +18,9 @@ import {
   MESSAGE_PREVIEW_DERIVED_REPAIR_TRANSACTION_CAPABILITY,
 } from '../../src/store/browser-workspace-derived-repair'
 import {
-  applyChatRowWriteTransitions,
   CHAT_ROW_PRESERVING_LINKS_TRANSACTION_CAPABILITY,
+  openPreservingChatMutation,
 } from '../../src/store/chat-row-transition'
-import {
-  readCurrentChatForTransaction,
-  type TransactionCurrentChat,
-} from '../../src/store/chat-storage-codec'
 import { getDb } from '../../src/store/db'
 import {
   hydrateMessage,
@@ -60,6 +55,13 @@ type TestMessageWriteTable =
 
 type TestMessageWriteTransaction = FencedTransaction<TestMessageWriteTable>
 
+export function testChildSlotsForHeaders(
+  chatId: ChatId,
+  headers: readonly MessageHeaderRow[],
+): readonly ChildListState[] {
+  return buildChildSlotProjection(chatId, headers, { updatedAt: 0 }).states
+}
+
 export async function putTestMessages(rows: readonly Message[]): Promise<void> {
   if (rows.length === 0) return
   const split = rows.map((row) => splitMessageForStorage(row))
@@ -84,7 +86,7 @@ export async function putTestMessages(rows: readonly Message[]): Promise<void> {
           })),
         )
         await reconcileAttachmentRefCountsForRepair(tx, dirtyAttachmentIds, Date.now())
-        const chatTransitions: Array<{ previous: TransactionCurrentChat; next: Chat }> = []
+        const chatMutation = openPreservingChatMutation(tx)
         for (const chatId of new Set(rows.map((row) => row.chatId))) {
           const headers = await tx
             .table<MessageHeaderRow, MessageId>('messages')
@@ -106,7 +108,7 @@ export async function putTestMessages(rows: readonly Message[]): Promise<void> {
           await tx
             .table<ChildSlotMember, string>('childSlotMembers')
             .bulkPut([...projection.members])
-          const chat = await readCurrentChatForTransaction(tx, chatId)
+          const chat = await chatMutation.read(chatId)
           if (!chat) continue
           const messages = await readTestMessagesFromTransaction(tx, chatId, headers)
           const next = {
@@ -119,16 +121,9 @@ export async function putTestMessages(rows: readonly Message[]): Promise<void> {
               0,
             ),
           }
-          chatTransitions.push({ previous: chat, next })
+          chatMutation.replace(chatId, () => next)
         }
-        await applyChatRowWriteTransitions(
-          tx,
-          chatTransitions.map(({ previous, next }) => ({
-            kind: 'replace-preserving-links',
-            previous,
-            next,
-          })),
-        )
+        await chatMutation.commit()
       })
       assertPhysicalTransactionTablesDeclared(TEST_MESSAGE_WRITE_PLAN, committed.facts.tableNames)
     },

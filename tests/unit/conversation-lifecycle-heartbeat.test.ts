@@ -4,6 +4,7 @@ import type {
   ActiveBranchForkTarget,
   ActiveBranchSelection,
 } from '../../src/core/active-branch-spine'
+import { emptyActiveBranchChildSlot } from '../../src/core/active-branch-spine'
 import type { BranchPathWindow } from '../../src/core/branch-session'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import {
@@ -31,6 +32,7 @@ import type {
   ConversationForksResult,
   ConversationTopologyResult,
 } from '../../src/store/workspace-protocol'
+import { testChildSlotsForHeaders } from '../helpers/message-storage'
 
 const FENCE = Object.freeze({ workspaceId: 'workspace-a', replacementEpoch: 0 })
 const CHAT_ID = 'chat-a'
@@ -195,6 +197,7 @@ class TestProjectionSource implements ConversationProjectionSource {
             }),
           ),
         ),
+        terminalChildSlot: emptyActiveBranchChildSlot(tipId),
       }
       return this.envelope(sealConversationSelection(destination))
     },
@@ -235,11 +238,13 @@ class TestProjectionSource implements ConversationProjectionSource {
       this.nextTopologyGate = null
       if (gate) await gate.promise
       if (signal.aborted) throw signal.reason
+      const headers = Object.freeze([...this.rows.values()].map((row) => row.header))
       return this.envelope({
         kind: 'ready',
         chat: structuredClone(this.currentChat),
         structuralVersion: this.currentChat.structuralVersion,
-        headers: Object.freeze([...this.rows.values()].map((row) => row.header)),
+        headers,
+        childSlots: testChildSlotsForHeaders(CHAT_ID, headers),
       })
     },
   )
@@ -350,6 +355,8 @@ class TestProjectionSource implements ConversationProjectionSource {
       slotVersion: siblings.reduce((sum, row) => sum + row.header.nodeVersion + 1, 0),
       position,
       liveCount: siblings.length,
+      nextSiblingIndex:
+        Math.max(...siblings.map((row) => row.header.siblingIndex)) + 1,
       previousMessageId: siblings[position - 1]?.header.id ?? null,
       nextMessageId: siblings[position + 1]?.header.id ?? null,
       firstMessageId: first.header.id,

@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest'
-import { createActiveBranchSpineFromPath } from '../../src/core/active-branch-spine'
+import {
+  createActiveBranchSpineFromPath,
+  emptyActiveBranchChildSlot,
+} from '../../src/core/active-branch-spine'
 import type { BranchPathDescriptor } from '../../src/core/branch-session'
 import { createBranchPath, emptyBranchPath } from '../../src/core/branch-session'
 import { messageTreeIndexFields } from '../../src/core/message-tree-index'
@@ -70,6 +73,7 @@ function conversationFrame(
             structuralVersion: 0,
             resolvedLeafId: path.leaf?.id ?? null,
             path,
+            terminalChildSlot: emptyActiveBranchChildSlot(path.leaf?.id ?? null),
           }),
         }
       : { kind: 'unresolved', retained: null },

@@ -2,10 +2,9 @@ import type { Transaction } from 'dexie'
 import type { Chat, ChatId } from '../../src/core/types'
 import { runBrowserCommandTransaction } from '../../src/store/browser-command-mutation-journal'
 import {
-  applyChatRowWriteTransitions,
   CHAT_ROW_LINKED_TRANSACTION_CAPABILITY,
+  openLinkedChatMutation,
 } from '../../src/store/chat-row-transition'
-import { readCurrentChatForTransaction } from '../../src/store/chat-storage-codec'
 import { buildChat, type CreateChatInput } from '../../src/store/chats'
 import { getDb } from '../../src/store/db'
 import {
@@ -31,20 +30,19 @@ export async function putTestChats(chats: readonly Chat[]): Promise<void> {
   if (chats.length === 0) return
   const rows = chats.map((chat) => structuredClone(chat))
   await runTestChatWrite(async (tx) => {
-    await applyChatRowWriteTransitions(
-      tx,
-      rows.map((next) => ({ kind: 'add-linked', next })),
-    )
+    const chatMutation = openLinkedChatMutation(tx)
+    for (const next of rows) await chatMutation.add(next)
+    await chatMutation.commit()
   })
 }
 
 export async function updateChatForTest(chatId: ChatId, patch: Partial<Chat>): Promise<void> {
   await runTestChatWrite(async (tx) => {
-    const current = await readCurrentChatForTransaction(tx, chatId)
+    const chatMutation = openLinkedChatMutation(tx)
+    const current = await chatMutation.read(chatId)
     if (!current) throw new Error(`MissingTestChat:${chatId}`)
-    await applyChatRowWriteTransitions(tx, [
-      { kind: 'replace-linked', previous: current, next: { ...current, ...patch } },
-    ])
+    chatMutation.replaceLinked(chatId, (row) => ({ ...row, ...patch }))
+    await chatMutation.commit()
   })
 }
 

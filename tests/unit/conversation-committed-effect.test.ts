@@ -3,6 +3,7 @@ import type {
   ActiveBranchForkSlot,
   ActiveBranchSelection,
 } from '../../src/core/active-branch-spine'
+import { emptyActiveBranchChildSlot } from '../../src/core/active-branch-spine'
 import { childListKey } from '../../src/core/child-list-state'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import {
@@ -128,12 +129,14 @@ function destination(
         slotVersion: row.header.nodeVersion + 1,
         position: 0,
         liveCount: 1,
+        nextSiblingIndex: 1,
         previousMessageId: null,
         nextMessageId: null,
         firstMessageId: row.header.id,
         lastMessageId: row.header.id,
       })),
     ),
+    terminalChildSlot: emptyActiveBranchChildSlot(tip.header.id),
   })
 }
 
@@ -449,6 +452,7 @@ it('extends an accepted long path from only the committed suffix', async () => {
         slotVersion: 1,
         position: 0,
         liveCount: 1,
+        nextSiblingIndex: 1,
         previousMessageId: null,
         nextMessageId: null,
         firstMessageId: user.header.id,
@@ -460,12 +464,14 @@ it('extends an accepted long path from only the committed suffix', async () => {
         slotVersion: 1,
         position: 0,
         liveCount: 1,
+        nextSiblingIndex: 1,
         previousMessageId: null,
         nextMessageId: null,
         firstMessageId: assistant.header.id,
         lastMessageId: assistant.header.id,
       }),
     ]),
+    terminalChildSlot: emptyActiveBranchChildSlot(assistant.header.id),
     presentations: Object.freeze([user, assistant]),
     fallback: Object.freeze({
       prefixHeaders: fallbackPrefix,
@@ -607,8 +613,8 @@ it('publishes a regenerate transition with the exact new sibling slot and no for
     version: 2,
     updatedAt: 3,
     liveCount: 2,
-    lastLiveChildId: newAssistant.header.id,
     nextSiblingIndex: 2,
+    lastLiveChildId: newAssistant.header.id,
   })
   const expectedFork = Object.freeze({
     parentId: parent.header.id,
@@ -616,6 +622,7 @@ it('publishes a regenerate transition with the exact new sibling slot and no for
     slotVersion: 2,
     position: 1,
     liveCount: 2,
+    nextSiblingIndex: 2,
     previousMessageId: oldAssistant.header.id,
     nextMessageId: null,
     firstMessageId: oldAssistant.header.id,
@@ -641,6 +648,7 @@ it('publishes a regenerate transition with the exact new sibling slot and no for
     }),
     suffixHeaders: Object.freeze([newAssistant.header]),
     forks: Object.freeze([expectedFork]),
+    terminalChildSlot: emptyActiveBranchChildSlot(newAssistant.header.id),
     presentations: Object.freeze([newAssistant]),
     fallback: Object.freeze({
       prefixHeaders: Object.freeze([parent.header]),

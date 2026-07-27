@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   type ActiveBranchForkSlot,
   createActiveBranchSpineFromPath,
+  emptyActiveBranchChildSlot,
 } from '../../src/core/active-branch-spine'
 import type { MessageTreeProjection } from '../../src/core/active-path'
 import { createBranchPath } from '../../src/core/branch-session'
@@ -59,6 +60,7 @@ import {
   createInteractionSettlementHarness,
   succeededInteractionSettlement,
 } from '../helpers/presentation-interactions'
+import { testChildSlotsForHeaders } from '../helpers/message-storage'
 import { reasoningEnvelopeFromDetailsForTest } from '../helpers/reasoning-events'
 
 const attachmentCatalogState = vi.hoisted(() => ({
@@ -460,6 +462,7 @@ const BranchTreeView = Object.assign(
                 forks: path
                   .materializeNodes()
                   .map((header) => forkForHeader(header, currentRef.current.headers)),
+                terminalChildSlot: emptyActiveBranchChildSlot(path.leaf?.id ?? null),
               },
               path,
             ),
@@ -503,6 +506,7 @@ const BranchTreeView = Object.assign(
             chat: testChat(chatId, structuralVersion, newestLeafId(currentRef.current.headers)),
             structuralVersion,
             headers,
+            childSlots: testChildSlotsForHeaders(chatId, headers),
           })
         },
         loadTranscriptPage: async () =>
@@ -699,6 +703,7 @@ const BranchTreeView = Object.assign(
           structuralVersion: topologyVersionRef.current.version,
           resolvedLeafId: acceptedPath.leaf?.id ?? null,
           path: acceptedPath,
+          terminalChildSlot: emptyActiveBranchChildSlot(acceptedPath.leaf?.id ?? null),
         }),
       [acceptedPath, props.chatId],
     )
@@ -955,6 +960,7 @@ function forkForHeader(
     slotVersion: siblings.reduce((sum, sibling) => sum + sibling.nodeVersion + 1, 0),
     position,
     liveCount: siblings.length,
+    nextSiblingIndex: Math.max(...siblings.map((sibling) => sibling.siblingIndex)) + 1,
     previousMessageId: siblings[position - 1]?.id ?? null,
     nextMessageId: siblings[position + 1]?.id ?? null,
     firstMessageId: siblings[0]?.id as MessageId,

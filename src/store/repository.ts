@@ -1,4 +1,3 @@
-import type { ActiveBranchForkSlot } from '../core/active-branch-spine'
 import { type AttemptTerminalReceipt, isAttemptTerminalReceipt } from '../core/attempt-outcome'
 import type { AppliedMessageSemanticEffect } from '../core/continuation-content'
 import type {
@@ -51,6 +50,7 @@ import type {
   TextTemplateConfig,
   TokenCalibrationSample,
 } from '../core/types'
+import type { ActiveBranchPathSlotFrame } from './active-branch-fork-storage'
 import {
   type MessageBodyFields,
   type MessageHeaderRow,
@@ -1151,6 +1151,7 @@ export type ChatMetadataPatch = Partial<
 export interface PutMessageOptions {
   touchChatSummary?: boolean
   semanticEffect?: AppliedMessageSemanticEffect
+  creationTimestamp?: 'preserve'
 }
 
 export type MessageBodyPatch = {
@@ -1215,9 +1216,6 @@ export interface MutationContext {
   getChildSlotMembers(messageIds: readonly MessageId[]): Promise<Array<ChildSlotMember | undefined>>
   getAttachment(attachmentId: AttachmentId): Promise<Attachment | undefined>
   readonly getAttachmentCatalogRevision: () => Promise<number>
-  getAttachmentReclamationState(
-    attachmentId: AttachmentId,
-  ): Promise<{ exists: boolean; unreferencedAt: number | null }>
   findAttachmentIdByContentHash(
     filename: string,
     contentHash: string,
@@ -1230,6 +1228,15 @@ export interface MutationContext {
   deleteAttachmentIfUnreferenced(
     attachmentId: AttachmentId,
   ): Promise<{ deleted: boolean; refs: { messages: number; drafts: number } }>
+  deleteAttachmentForStorage(
+    attachmentId: AttachmentId,
+    reason: AttachmentMissingReason,
+    now: number,
+  ): Promise<'deleted' | 'stubbed' | 'absent'>
+  reapAttachmentIfEligible(
+    attachmentId: AttachmentId,
+    cutoff: number,
+  ): Promise<'deleted' | 'retained' | 'repair-required' | 'absent'>
   putAttachment(attachment: Attachment): Promise<void>
   deleteAttachment(attachmentId: AttachmentId): Promise<void>
   countAttachmentReferences(
@@ -1260,9 +1267,10 @@ export interface MutationContext {
 
 export interface MutationFinalizationContext extends MessageMutationFinalizationContext {
   readonly getAttachmentCatalogRevision: () => Promise<number>
-  readFinalActiveBranchForks(
+  readFinalActiveBranchPathSlotFrame(
+    chatId: ChatId,
     headers: readonly MessageHeaderRow[],
-  ): Promise<readonly ActiveBranchForkSlot[]>
+  ): Promise<ActiveBranchPathSlotFrame>
   sealExactConversationDestination(input: {
     readonly chat: Chat
     readonly target: ConversationSelectionProofTarget

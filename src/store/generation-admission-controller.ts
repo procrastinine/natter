@@ -6,6 +6,7 @@ import {
   pendingGenerationCapability,
   unavailableGenerationCapability,
 } from '../core/interaction-capability'
+import type { PreparedMessagePlacementFrame } from '../core/messages'
 import { UNKNOWN_INBOUND_REASONING_VISIBILITY } from '../core/reasoning'
 import type { AttachmentRef, ChatId, ContentItem, Message, MessageId } from '../core/types'
 import { newId } from '../lib/ulid'
@@ -170,6 +171,7 @@ export interface GenerationAdmissionPayload {
   readonly promptPath: GenerationPromptPathProof
   readonly promptMaterial: GenerationPromptMaterialLease
   readonly intent: GenerationIntent
+  readonly placement: PreparedMessagePlacementFrame
 }
 
 export type {
@@ -314,6 +316,15 @@ class TabGenerationAdmissionController implements GenerationAdmissionController 
         capturedIntent.kind === 'edit-resend'
           ? newId()
           : undefined
+      const placement = prepareGenerationMessagePlacementFrame({
+        intent: capturedIntent,
+        chatId,
+        assistantMessageId,
+        userMessageId,
+        model: configuration.settings.model,
+        promptPath: capturedPrompt.proof,
+        createdAt: Date.now(),
+      })
       if (capturedIntent.kind === 'continue') {
         const claimedTarget = attemptController.claimTarget(
           workspace,
@@ -377,6 +388,7 @@ class TabGenerationAdmissionController implements GenerationAdmissionController 
           promptPath: capturedPrompt.proof,
           promptMaterial: capturedPrompt.material,
           intent: capturedIntent,
+          placement,
         }),
         targetClaim,
       })
@@ -386,13 +398,7 @@ class TabGenerationAdmissionController implements GenerationAdmissionController 
         capturedIntent.kind !== 'continue' &&
         capturedIntent.kind !== 'new-chat-send'
       ) {
-        const messages = generationIntentPresentationMessages({
-          claim,
-          intent: capturedIntent,
-          baseLeafId: capturedPrompt.proof.claim.leafId,
-          model: configuration.settings.model,
-          createdAt: Date.now(),
-        })
+        const messages = placement.messages
         const destination = conversationController.resolveOperationDestination(claim.steering)
         if (messages.length > 0 && destination.kind === 'ready') {
           conversationController.presentGenerationIntent(claim.steering, {
@@ -669,7 +675,19 @@ function captureGenerationPromptPath(
     return Object.freeze({
       proof: Object.freeze({
         requirement,
-        claim: Object.freeze({ chatId, leafId: null, headers: Object.freeze([]) }),
+        claim: Object.freeze({
+          chatId,
+          structuralVersion: 0,
+          leafId: null,
+          headers: Object.freeze([]),
+          placementSlot: Object.freeze({
+            parentId: null,
+            slotVersion: 0,
+            liveCount: 0,
+            nextSiblingIndex: 0,
+          }),
+          targetTurn: null,
+        }),
       }),
       material: createGenerationPromptMaterialLease(workspace, chatId, []),
     })
@@ -697,111 +715,97 @@ function releaseAdmissionTargetClaim(state: GenerationAdmissionState): void {
   state.targetClaim = null
 }
 
-function generationIntentPresentationMessages(input: {
-  readonly claim: Exclude<
-    GenerationAdmissionClaim,
-    { readonly strategy: 'continue' | 'new-chat-send' }
-  >
-  readonly intent: Exclude<ExistingChatGenerationIntent, { readonly kind: 'continue' }>
-  readonly baseLeafId: MessageId | null
+function prepareGenerationMessagePlacementFrame(input: {
+  readonly intent: GenerationIntent
+  readonly chatId: ChatId
+  readonly assistantMessageId: MessageId
+  readonly userMessageId: MessageId | undefined
   readonly model: string
   readonly createdAt: number
-}): readonly Message[] {
-  if (!input.model) return Object.freeze([])
-  const user = input.claim.userMessageId
-    ? preparedUserMessage({
-        id: input.claim.userMessageId,
-        chatId: input.claim.chatId,
-        content:
-          input.intent.kind === 'send' || input.intent.kind === 'edit-resend'
-            ? input.intent.content
-            : [],
-        ...(input.intent.kind === 'send' || input.intent.kind === 'edit-resend'
-          ? input.intent.attachmentRefs
-            ? { attachmentRefs: input.intent.attachmentRefs }
-            : {}
-          : {}),
-        createdAt: input.createdAt,
-      })
-    : undefined
-  const visualUser = user
-    ? Object.freeze({
-        ...user,
-        parentId: input.baseLeafId,
-        siblingIndex: 0,
-      })
-    : undefined
-  const assistant = preparedAssistantMessage({
-    id: input.claim.assistantMessageId,
-    chatId: input.claim.chatId,
-    content: input.intent.prefillContent ?? [],
-    model: input.model,
-    createdAt: input.createdAt,
-  })
-  const visualAssistant = Object.freeze({
-    ...assistant,
-    parentId: visualUser?.id ?? input.baseLeafId,
-    siblingIndex: 0,
-    ...(visualUser ? { turnId: visualUser.turnId, turnIndex: visualUser.turnIndex + 1 } : {}),
-  })
-  return Object.freeze([...(visualUser ? [visualUser] : []), visualAssistant])
-}
-
-export function preparedUserMessage(input: {
-  id: MessageId
-  chatId: ChatId
-  content: readonly ContentItem[]
-  attachmentRefs?: readonly AttachmentRef[]
-  createdAt: number
-}): Message {
-  return {
-    id: input.id,
-    chatId: input.chatId,
-    parentId: null,
-    siblingIndex: 0,
-    turnId: newId(),
-    turnIndex: 0,
-    createdAt: input.createdAt,
-    role: 'user',
-    origin: 'user',
-    content: structuredClone([...input.content]),
-    ...(input.attachmentRefs ? { attachmentRefs: structuredClone([...input.attachmentRefs]) } : {}),
-    nodeVersion: 0,
-    deleted: false,
+  readonly promptPath: GenerationPromptPathProof
+}): PreparedMessagePlacementFrame {
+  const { claim } = input.promptPath
+  if (input.intent.kind === 'continue') {
+    return Object.freeze({
+      chatId: input.chatId,
+      structuralVersion: claim.structuralVersion,
+      createdAt: input.createdAt,
+      slot: null,
+      messages: Object.freeze([]),
+    })
   }
-}
-
-export function preparedAssistantMessage(input: {
-  id: MessageId
-  chatId: ChatId
-  content: readonly ContentItem[]
-  model: string
-  createdAt: number
-}): Message {
-  return {
-    id: input.id,
+  if (!input.model) throw new Error(`GenerationModelNotSelected:${input.chatId}`)
+  const slot = claim.placementSlot
+  if (!slot) throw new Error(`GenerationPlacementSlotMissing:${input.chatId}`)
+  const turnId = input.intent.kind === 'reply' ? claim.targetTurn?.turnId : newId()
+  if (!turnId) throw new Error(`GenerationPlacementTargetTurnMissing:${input.chatId}`)
+  const user =
+    input.userMessageId === undefined
+      ? undefined
+      : Object.freeze({
+          id: input.userMessageId,
+          chatId: input.chatId,
+          parentId: claim.leafId,
+          siblingIndex: slot.nextSiblingIndex,
+          turnId,
+          turnIndex: 0,
+          createdAt: input.createdAt,
+          role: 'user' as const,
+          origin: 'user' as const,
+          content: structuredClone(
+            input.intent.kind === 'new-chat-send' ||
+              input.intent.kind === 'send' ||
+              input.intent.kind === 'edit-resend'
+              ? [...input.intent.content]
+              : [],
+          ),
+          ...(input.intent.kind === 'new-chat-send' ||
+          input.intent.kind === 'send' ||
+          input.intent.kind === 'edit-resend'
+            ? input.intent.attachmentRefs
+              ? { attachmentRefs: structuredClone([...input.intent.attachmentRefs]) }
+              : { attachmentRefs: [] }
+            : {}),
+          nodeVersion: 0,
+          deleted: false,
+        } satisfies Message)
+  const assistant = Object.freeze({
+    id: input.assistantMessageId,
     chatId: input.chatId,
-    parentId: null,
-    siblingIndex: 0,
-    turnId: newId(),
-    turnIndex: 0,
+    parentId: user?.id ?? claim.leafId,
+    siblingIndex: user ? 0 : slot.nextSiblingIndex,
+    turnId,
+    turnIndex:
+      user !== undefined
+        ? 1
+        : input.intent.kind === 'reply'
+          ? (claim.targetTurn?.turnIndex ?? -1) + 1
+          : 0,
     createdAt: input.createdAt,
-    role: 'assistant',
-    origin: 'generated',
-    content: structuredClone([...input.content]),
+    role: 'assistant' as const,
+    origin: 'generated' as const,
+    content: structuredClone([...(input.intent.prefillContent ?? [])]),
+    attachmentRefs: [],
     generation: {
       model: input.model,
       requestedModel: input.model,
-      status: 'preparing',
-      integrity: 'clean',
-      costSource: 'stream',
+      status: 'preparing' as const,
+      integrity: 'clean' as const,
+      costSource: 'stream' as const,
       startedAt: input.createdAt,
-      reasoningCarryForward: 'none',
+      reasoningCarryForward: 'none' as const,
       reasoningVisibility: UNKNOWN_INBOUND_REASONING_VISIBILITY,
     },
     nodeVersion: 0,
     deleted: false,
-  }
+  } satisfies Message)
+  return Object.freeze({
+    chatId: input.chatId,
+    structuralVersion: claim.structuralVersion,
+    createdAt: input.createdAt,
+    slot: Object.freeze({ ...slot }),
+    messages: Object.freeze([...(user ? [user] : []), assistant]),
+  })
 }
 
 function generationAdmissionErrorFor(capability: GenerationCapability): GenerationAdmissionError {

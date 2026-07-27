@@ -31,8 +31,7 @@ import {
 } from '../../src/store/attachment-storage'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
 import { __resetBrowserRepositoryForTests } from '../../src/store/browser-repo'
-import { applyChatRowWriteTransitions } from '../../src/store/chat-row-transition'
-import { readCurrentChatRowsForTransaction } from '../../src/store/chat-storage-codec'
+import { openPreservingChatMutation } from '../../src/store/chat-row-transition'
 
 import { __resetDbForTests, getDb } from '../../src/store/db'
 import type { SettingsRow } from '../../src/store/db-rows'
@@ -857,11 +856,11 @@ async function seedChat(
       db.childSlotMembers,
     ],
     async (tx) => {
-      const [currentChat] = await readCurrentChatRowsForTransaction(tx, [chat.id])
+      const chatMutation = openPreservingChatMutation(tx)
+      const currentChat = await chatMutation.read(chat.id)
       if (!currentChat) throw new Error(`MissingCurrentChat:${chat.id}`)
-      await applyChatRowWriteTransitions(tx, [
-        { kind: 'replace-preserving-links', previous: currentChat, next: nextChat },
-      ])
+      chatMutation.replace(chat.id, () => nextChat)
+      await chatMutation.commit()
       await db.messages.bulkPut(stored.map((row) => row.header))
       await db.messageBodies.bulkPut(stored.map((row) => row.body))
       await db.messagePreviews.bulkPut(stored.map((row) => row.preview))

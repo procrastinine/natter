@@ -988,7 +988,6 @@ describe('storage retention', () => {
         unreferencedAt: Date.now() - 2 * DAY_MS,
       })
     await markIntegrityPending()
-    const attachmentIndexReads = vi.spyOn(getDb().attachments, 'where')
 
     startMaintenance()
     await vi.waitFor(
@@ -1000,11 +999,10 @@ describe('storage retention', () => {
     closeStorageMaintenanceRuntime()
     await awaitStorageMaintenanceRuntimeIdle()
 
-    expect(
-      attachmentIndexReads.mock.calls.filter(
-        ([index]) => typeof index === 'string' && index === '[refCount+unreferencedAt+id]',
-      ),
-    ).toHaveLength(3)
+    expect(await getDb().storageRetentionState.get('attachment-reap')).toMatchObject({
+      phase: 'idle',
+      revision: 3,
+    })
     expect(await getDb().attachmentIntegrityState.get('workspace')).toEqual(
       expect.objectContaining({ phase: 'complete' }),
     )

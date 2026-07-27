@@ -396,8 +396,11 @@ async function continuationPrepareInput(
       },
       claim: {
         chatId: deepPath.chat.id,
+        structuralVersion: deepPath.chat.structuralVersion,
         leafId: deepPath.targetId,
         headers: deepPath.claims,
+        placementSlot: null,
+        targetTurn: null,
       },
     },
     configurationClaim: {

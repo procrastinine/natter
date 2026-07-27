@@ -1,5 +1,5 @@
 import type { Transaction } from 'dexie'
-import type { ActiveBranchForkSlot } from '../core/active-branch-spine'
+import type { ActiveBranchChildSlot, ActiveBranchForkSlot } from '../core/active-branch-spine'
 import { readLiveBranchPath } from '../core/branch-session'
 import type {
   ConversationProvedSelection,
@@ -8,7 +8,7 @@ import type {
 } from '../core/messages'
 import { TreeChangedError } from '../core/tree-ops'
 import type { Chat, MessageId } from '../core/types'
-import { readActiveBranchForkSlotsForHeadersInTransaction } from './active-branch-fork-storage'
+import { readActiveBranchPathSlotFrameInTransaction } from './active-branch-fork-storage'
 import { canonicalMessageHeaderRow, type MessageHeaderRow } from './message-storage'
 
 export interface ConversationSelectionProofInput {
@@ -17,6 +17,7 @@ export interface ConversationSelectionProofInput {
   readonly tipId: MessageId | null
   readonly exactPathHeaders?: readonly MessageHeaderRow[]
   readonly forks?: readonly ActiveBranchForkSlot[]
+  readonly terminalChildSlot?: ActiveBranchChildSlot
   readonly presentations?: readonly MessagePresentation[]
   readonly snapshotOwnership?: 'clone' | 'adopt'
 }
@@ -40,12 +41,17 @@ export async function proveConversationSelectionInTransaction(
     pathHeaders = result.rows
   }
   const exactPathHeaders = pathHeaders ?? Object.freeze([])
-  const forks =
-    input.forks ?? (await readActiveBranchForkSlotsForHeadersInTransaction(tx, exactPathHeaders))
+  const slotFrame =
+    input.forks && input.terminalChildSlot
+      ? null
+      : await readActiveBranchPathSlotFrameInTransaction(tx, chat.id, exactPathHeaders)
+  const forks = input.forks ?? slotFrame!.forks
+  const terminalChildSlot = input.terminalChildSlot ?? slotFrame!.terminalChildSlot
   return proveConversationSelectionFromExactPath({
     ...input,
     exactPathHeaders,
     forks,
+    terminalChildSlot,
   })
 }
 
@@ -53,6 +59,7 @@ export function proveConversationSelectionFromExactPath(
   input: ConversationSelectionProofInput & {
     readonly exactPathHeaders: readonly MessageHeaderRow[]
     readonly forks: readonly ActiveBranchForkSlot[]
+    readonly terminalChildSlot: ActiveBranchChildSlot
   },
 ): ConversationProvedSelection {
   const {
@@ -61,6 +68,7 @@ export function proveConversationSelectionFromExactPath(
     tipId,
     exactPathHeaders,
     forks,
+    terminalChildSlot,
     presentations = [],
     snapshotOwnership = 'clone',
   } = input
@@ -81,6 +89,7 @@ export function proveConversationSelectionFromExactPath(
       }),
       presentations: Object.freeze([]),
       forks: Object.freeze([]),
+      terminalChildSlot: Object.freeze({ ...terminalChildSlot }),
     })
   }
 
@@ -153,5 +162,6 @@ export function proveConversationSelectionFromExactPath(
     proof,
     presentations: Object.freeze(exactPresentations),
     forks: Object.freeze(forks.map((fork) => Object.freeze({ ...fork }))),
+    terminalChildSlot: Object.freeze({ ...terminalChildSlot }),
   })
 }

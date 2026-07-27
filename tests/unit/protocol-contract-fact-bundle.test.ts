@@ -424,7 +424,7 @@ describe('production protocol fact bundle', () => {
     expect(siteIds(bundle.locality.configurationUnion.constructorSites)).toEqual(
       siteIds(bundle.configuration.commandUnion.constructorSites),
     )
-    expect(bundle.snapshot.sourceFiles).toBe(473)
+    expect(bundle.snapshot.sourceFiles).toBe(474)
     expect(report.reports['tab-cross-tab-locality']).toMatchObject({
       ok: false,
       surfaces: 20,

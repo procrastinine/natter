@@ -63,8 +63,6 @@ import {
   type GenerationIntent,
   generationAdmissionController,
   type NewChatGenerationIntent,
-  preparedAssistantMessage,
-  preparedUserMessage,
   type SelectedSendGenerationIntent,
 } from './generation-admission-controller'
 import {
@@ -458,7 +456,11 @@ async function runGeneration(input: {
     terminalPermit = activeTerminalPermit
     terminalPermitOwned = true
     const preparedIntent = admission.intent
-    const leaseAdmission = preparedStreamLeaseAdmission(input, preparedIntent, input.now())
+    const leaseAdmission = preparedStreamLeaseAdmission(
+      input,
+      preparedIntent,
+      admission.placement.createdAt,
+    )
     leasePermitOwned = false
     ownershipReservation = await reserveStreamOwnership(activeLeasePermit, leaseAdmission, () =>
       input.controller.abort(),
@@ -762,7 +764,7 @@ async function prepareAttempt(input: {
 }): Promise<PreparedAttemptState> {
   const intent = input.admission.intent
   const configuration = input.admission.configuration
-  const createdAt = input.lease.startedAt
+  const createdAt = input.admission.placement.createdAt
   const chat =
     intent.kind === 'new-chat-send'
       ? createChatRow({
@@ -777,40 +779,11 @@ async function prepareAttempt(input: {
   if (!settings.profileId) throw new Error(`GenerationProfileNotSelected:${input.chatId}`)
   if (!settings.model) throw new Error(`GenerationModelNotSelected:${input.chatId}`)
 
-  const user = input.userMessageId
-    ? preparedUserMessage({
-        id: input.userMessageId,
-        chatId: input.chatId,
-        content:
-          intent.kind === 'new-chat-send' || intent.kind === 'send' || intent.kind === 'edit-resend'
-            ? intent.content
-            : [],
-        ...(intent.kind === 'new-chat-send' ||
-        intent.kind === 'send' ||
-        intent.kind === 'edit-resend'
-          ? intent.attachmentRefs
-            ? { attachmentRefs: intent.attachmentRefs }
-            : {}
-          : {}),
-        createdAt,
-      })
-    : undefined
-  const assistant =
-    intent.kind === 'continue'
-      ? undefined
-      : preparedAssistantMessage({
-          id: input.assistantMessageId,
-          chatId: input.chatId,
-          content: intent.prefillContent ?? [],
-          model: settings.model,
-          createdAt,
-        })
   const prepareInput = prepareCommandInput(
     intent,
     chat,
     input.lease,
-    user,
-    assistant,
+    input.admission.placement,
     configuration,
     input.admission.promptPath,
   )
@@ -877,8 +850,7 @@ function prepareCommandInput(
   intent: GenerationIntent,
   chat: Chat | undefined,
   lease: PrepareAttemptInput['lease'],
-  user: Message | undefined,
-  assistant: Message | undefined,
+  placement: GenerationAdmissionPayload['placement'],
   configuration: GenerationAdmissionPayload['configuration'],
   promptPath: GenerationAdmissionPayload['promptPath'],
 ): PrepareAttemptInput {
@@ -920,8 +892,7 @@ function prepareCommandInput(
             : {}),
         },
         lease,
-        user: required(user),
-        assistant: required(assistant),
+        placement,
       }
     case 'send':
       return {
@@ -929,8 +900,7 @@ function prepareCommandInput(
         promptPath,
         ...required(existingChatConfiguration),
         lease,
-        user: required(user),
-        assistant: required(assistant),
+        placement,
       }
     case 'reply':
       return {
@@ -938,7 +908,7 @@ function prepareCommandInput(
         promptPath,
         ...required(existingChatConfiguration),
         lease,
-        assistant: required(assistant),
+        placement,
       }
     case 'regenerate':
       return {
@@ -946,7 +916,7 @@ function prepareCommandInput(
         promptPath,
         ...required(existingChatConfiguration),
         lease,
-        assistant: required(assistant),
+        placement,
         ...(intent.settingsPatch ? { persistCapturedConfiguration: true } : {}),
       }
     case 'edit-resend':
@@ -955,8 +925,7 @@ function prepareCommandInput(
         promptPath,
         ...required(existingChatConfiguration),
         lease,
-        user: required(user),
-        assistant: required(assistant),
+        placement,
       }
     case 'continue':
       return {

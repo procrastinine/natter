@@ -49,7 +49,7 @@ import type {
   ProfileId,
 } from '../core/types'
 import { sameOrderedValues } from '../lib/same-value'
-import { readActiveBranchForkSlotsForHeadersInTransaction } from './active-branch-fork-storage'
+import { readActiveBranchPathSlotFrameInTransaction } from './active-branch-fork-storage'
 import {
   ATTACHMENT_CATALOG_AGGREGATE_ID,
   type AttachmentCatalogAggregateRow,
@@ -57,6 +57,7 @@ import {
   deleteAttachmentCatalogProjection,
   putAttachmentCatalogProjectionFromHeader,
 } from './attachment-catalog-projection'
+import { markAttachmentIntegrityRepairPending } from './attachment-integrity-maintenance'
 import {
   applyAttachmentReferenceOwnerTransitions,
   attachmentReferenceCounts,
@@ -70,6 +71,7 @@ import {
 } from './attachment-storage'
 import {
   type BrowserCommandMessageRevisionFact,
+  recordBrowserCommandAttachmentIntegrityMaintenance,
   recordBrowserCommandAttachmentReferenceState,
   recordBrowserCommandInvalidation,
   recordBrowserCommandMessageRevisions,
@@ -108,8 +110,7 @@ import {
   replaceAttachmentByteOwnerBundle,
   replaceMessageBody,
 } from './byte-owner-mutation'
-import { applyChatRowWriteTransitions } from './chat-row-transition'
-import { readCurrentChatForTransaction } from './chat-storage-codec'
+import { openLinkedChatMutation } from './chat-row-transition'
 import { maintainChildSlotProjections } from './child-list-projection'
 import {
   configurationRequestRevisionFor,
@@ -121,11 +122,11 @@ import type { SettingsRow } from './db-rows'
 import { readDiscoveryCacheRow } from './discovery-cache-storage'
 import { generationAdmissionDecision } from './generation-admission'
 import {
+  compileCurrentMessageTransition,
   type MessageBodyRow,
   type MessageHeaderRow,
   type MessageTextPreviewRow,
   projectMessageTextPreview,
-  splitMessageForStorage,
   syncMessageHeaderProjections,
 } from './message-storage'
 import type {
@@ -383,7 +384,6 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
     readBranchPathInTransaction,
     recordMessageHeaderSummaryDeltas,
     recordMessageSummaryDeltas,
-    recordNewMessageSummary,
     replacementMessageBody,
     requireChatMetadataPatch,
     requiredStreamPostCommitEvidence,
@@ -403,6 +403,7 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
     scopes,
     options,
     transactionExtension?.access,
+    transactionExtension?.receipt,
   )
   if (options?.streamTargetCommit && !options.streamFence) {
     throw new Error(`StreamTargetCommitFenceMissing:${options.streamTargetCommit.streamId}`)
@@ -457,6 +458,13 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
         const aggregate = await tx
           .table<AttachmentCatalogAggregateRow, string>('attachmentCatalogAggregate')
           .get(ATTACHMENT_CATALOG_AGGREGATE_ID)
+        receiptAccumulator.physicalRead({
+          tableName: 'attachmentCatalogAggregate',
+          indexKind: 'primary',
+          operation: 'get',
+          requestCount: 1,
+          rowCount: 1,
+        })
         if (!aggregate) throw new Error('AttachmentCatalogAggregateMissing')
         if (aggregate.projectionRevision !== expected) {
           throw new Error(
@@ -478,33 +486,35 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
         for (const read of reads) receiptAccumulator.physicalRead(read)
       }
       let ownedStreamLease: StreamLeaseRow | undefined
+      const chatMutation = openLinkedChatMutation(tx)
       if (options?.initialChat) {
         const initialChat = structuredClone(options.initialChat)
-        const chatTable = tx.table<Chat, ChatId>('chats')
-        const existing = await chatTable.get(initialChat.id)
+        const initialRead = await chatMutation.readWithEvidence(initialChat.id)
+        const existing = initialRead.chat
         if (commandCommit.command.kind === 'chat.materialize-temporary') {
           receiptAccumulator.physicalRead({
             tableName: 'chats',
             indexKind: 'primary',
             operation: 'get',
-            requestCount: 1,
+            requestCount: initialRead.requestCount,
             rowCount: 1,
           })
         }
         if (existing) {
           throw new Error(`AttemptInitialChatAlreadyExists:${initialChat.id}`)
         }
-        const transition = await applyChatRowWriteTransitions(tx, [
-          { kind: 'add-linked', next: initialChat },
-        ])
-        absorbSemanticOperationReceiptFragment(tx, transition.fragment)
+        await chatMutation.add(initialChat)
       }
       if (options?.streamAdmission) {
         const incoming = options.streamAdmission
         const table = tx.table<StreamLeaseRow, string>('streamLeases')
         const existing = await table.get(incoming.streamId)
         commandCommit.assertReplacementEpoch(incoming.replacementEpoch)
-        await assertStreamLeaseWorkspaceTarget(tx, incoming)
+        await assertStreamLeaseWorkspaceTarget(
+          tx,
+          incoming,
+          await chatMutation.read(incoming.chatId),
+        )
         if (existing && existing.chatId !== incoming.chatId) {
           throw new Error(`StreamLeaseChatMismatch:${incoming.streamId}`)
         }
@@ -652,15 +662,16 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
       const ensureChatState = async (chatId: ChatId): Promise<ChatMutationState> => {
         const existing = chatStates.get(chatId)
         if (existing) return existing
-        const beforeChat = await readCurrentChatForTransaction(tx, chatId)
+        const chatRead = await chatMutation.readWithEvidence(chatId)
+        const beforeChat = chatRead.chat
         if (!beforeChat) throw new ChatMissingError(chatId)
-        if (operationPlan.descriptor.exactPhysicalReads) {
+        if (operationPlan.descriptor.exactPhysicalReads && chatRead.requestCount > 0) {
           receiptAccumulator.physicalRead({
             tableName: 'chats',
             indexKind: 'primary',
             operation: 'get',
-            requestCount: 1,
-            rowCount: 1,
+            requestCount: chatRead.requestCount,
+            rowCount: chatRead.rowCount,
           })
         }
         const state: ChatMutationState = {
@@ -876,6 +887,223 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
         })
       }
 
+      const deleteAttachmentBytesForHeader = async (
+        attachmentId: AttachmentId,
+        header: AttachmentHeaderRow,
+        reason: AttachmentMissingReason,
+        deletionNow: number,
+        catalogRow?: AttachmentCatalogProjectionRow,
+      ): Promise<Attachment> => {
+        const [artifacts, jobs] = await Promise.all([
+          tx
+            .table<AttachmentArtifact, string>('attachmentArtifacts')
+            .where('attachmentId')
+            .equals(attachmentId)
+            .toArray(),
+          tx
+            .table<AttachmentJob, string>('attachmentJobs')
+            .where('attachmentId')
+            .equals(attachmentId)
+            .toArray(),
+        ])
+        receiptAccumulator.physicalRead({
+          tableName: 'attachmentArtifacts',
+          indexKind: 'secondary',
+          indexName: 'attachmentId',
+          operation: 'query',
+          requestCount: 1,
+          rowCount: artifacts.length,
+        })
+        receiptAccumulator.physicalRead({
+          tableName: 'attachmentJobs',
+          indexKind: 'secondary',
+          indexName: 'attachmentId',
+          operation: 'query',
+          requestCount: 1,
+          rowCount: jobs.length,
+        })
+        const retainedArtifacts = artifacts.filter((artifact) => artifact.kind !== 'blob')
+        const deletedArtifacts = artifacts.filter((artifact) => artifact.kind === 'blob')
+        const retainedArtifactIds = new Set(
+          retainedArtifacts.map((artifact) => artifact.artifactId),
+        )
+        const deletedJobs: AttachmentJob[] = []
+        const updatedJobs: AttachmentJob[] = []
+        const previousUpdatedJobs: AttachmentJob[] = []
+        for (const job of jobs) {
+          const outputArtifactIds = job.outputArtifactIds.filter((id) =>
+            retainedArtifactIds.has(id),
+          )
+          if (job.outputArtifactIds.length > 0 && outputArtifactIds.length === 0) {
+            deletedJobs.push(job)
+          } else if (!sameOrderedValues(outputArtifactIds, job.outputArtifactIds)) {
+            previousUpdatedJobs.push(job)
+            updatedJobs.push({ ...job, outputArtifactIds, updatedAt: deletionNow })
+          }
+        }
+        const deletedBlobCount = await deleteAttachmentBlobRows(tx, attachmentId, header)
+        receiptAccumulator.physicalRead({
+          tableName: 'attachmentBlobs',
+          indexKind: 'secondary',
+          indexName: 'attachmentId',
+          operation: 'query',
+          requestCount: 1,
+          rowCount: deletedBlobCount,
+        })
+        await deletePhysicalStorageRows(
+          tx,
+          'attachmentArtifacts',
+          deletedArtifacts.map((artifact) => artifact.artifactId),
+          deletedArtifacts,
+        )
+        await deletePhysicalStorageRows(
+          tx,
+          'attachmentJobs',
+          deletedJobs.map((job) => job.id),
+          deletedJobs,
+        )
+        await putPhysicalStorageRows(tx, 'attachmentJobs', updatedJobs, previousUpdatedJobs)
+        if (deletedJobs.length > 0 || updatedJobs.length > 0) {
+          recordBrowserCommandInvalidation(tx, {
+            kind: 'attachment-job',
+            attachmentIds: [attachmentId],
+            jobIds: [...deletedJobs, ...updatedJobs].map((job) => job.id),
+          })
+        }
+        const current = hydrateAttachment(header, artifacts)
+        const processing = current.processing.flatMap((state) => {
+          const outputArtifactIds = state.outputArtifactIds.filter((id) =>
+            retainedArtifactIds.has(id),
+          )
+          return state.outputArtifactIds.length > 0 && outputArtifactIds.length === 0
+            ? []
+            : [{ ...state, outputArtifactIds }]
+        })
+        const next = missingAttachmentAfterByteDeletion(
+          current,
+          reason,
+          deletionNow,
+          retainedArtifacts,
+          processing,
+        )
+        const unchangedHeader = splitAttachmentForStorage(
+          next,
+          header.wireVersion,
+          header.unreferencedAt,
+        )
+        const payloadChanged =
+          deletedBlobCount > 0 ||
+          deletedArtifacts.length > 0 ||
+          deletedJobs.length > 0 ||
+          updatedJobs.length > 0
+        if (!payloadChanged && stableStringify(unchangedHeader) === stableStringify(header)) {
+          return current
+        }
+        const nextHeader = { ...unchangedHeader, wireVersion: header.wireVersion + 1 }
+        await putAttachmentHeaderByteOwner(tx, nextHeader, header)
+        const catalogReceipt = await putAttachmentCatalogProjectionFromHeader(
+          tx,
+          nextHeader,
+          header,
+          catalogRow ? { previous: catalogRow } : undefined,
+        )
+        absorbSemanticOperationReceiptFragment(tx, catalogReceipt.fragment)
+        recordBrowserCommandAttachmentReferenceState(tx, {
+          attachmentId,
+          initial: { exists: true, refCount: header.refCount },
+          final: { exists: true, refCount: nextHeader.refCount },
+          projectionChanged: true,
+        })
+        return hydrateAttachment(nextHeader, retainedArtifacts)
+      }
+
+      const readAttachmentDispositionState = async (
+        attachmentId: AttachmentId,
+      ): Promise<
+        | { readonly kind: 'absent' }
+        | {
+            readonly kind: 'present'
+            readonly header: AttachmentHeaderRow
+            readonly catalogRow: AttachmentCatalogProjectionRow | undefined
+            readonly firstReference: AttachmentReferenceEdge | undefined
+          }
+      > => {
+        const header = await tx
+          .table<AttachmentHeaderRow, AttachmentId>('attachments')
+          .get(attachmentId)
+        receiptAccumulator.physicalRead({
+          tableName: 'attachments',
+          indexKind: 'primary',
+          operation: 'get',
+          requestCount: 1,
+          rowCount: 1,
+        })
+        if (!header) return { kind: 'absent' }
+        const catalogRow = await tx
+          .table<AttachmentCatalogProjectionRow, AttachmentId>('attachmentCatalogRows')
+          .get(attachmentId)
+        receiptAccumulator.physicalRead({
+          tableName: 'attachmentCatalogRows',
+          indexKind: 'primary',
+          operation: 'get',
+          requestCount: 1,
+          rowCount: 1,
+        })
+        const firstReference = await tx
+          .table<AttachmentReferenceEdge>('attachmentRefEdges')
+          .where('attachmentId')
+          .equals(attachmentId)
+          .first()
+        receiptAccumulator.physicalRead({
+          tableName: 'attachmentRefEdges',
+          indexKind: 'secondary',
+          indexName: 'attachmentId',
+          operation: 'query',
+          requestCount: 1,
+          rowCount: firstReference ? 1 : 0,
+        })
+        return { kind: 'present', header, catalogRow, firstReference }
+      }
+      let attachmentIntegrityRepairRequested = false
+
+      const requestAttachmentIntegrityRepair = async (): Promise<void> => {
+        if (attachmentIntegrityRepairRequested) return
+        await markAttachmentIntegrityRepairPending(tx)
+        receiptAccumulator.physicalRead({
+          tableName: 'attachmentCatalogAggregate',
+          indexKind: 'primary',
+          operation: 'get',
+          requestCount: 1,
+          rowCount: 1,
+        })
+        receiptAccumulator.physicalRead({
+          tableName: 'attachmentIntegrityState',
+          indexKind: 'primary',
+          operation: 'get',
+          requestCount: 1,
+          rowCount: 1,
+        })
+        recordBrowserCommandAttachmentIntegrityMaintenance(tx)
+        attachmentIntegrityRepairRequested = true
+      }
+
+      const requireConsistentAttachmentDispositionState = (
+        attachmentId: AttachmentId,
+        state: Exclude<
+          Awaited<ReturnType<typeof readAttachmentDispositionState>>,
+          { kind: 'absent' }
+        >,
+      ) => {
+        if (!state.catalogRow) throw new Error(`AttachmentCatalogRowMissing:${attachmentId}`)
+        if (
+          state.header.refCount !== state.catalogRow.refCount ||
+          (state.firstReference !== undefined) !== state.catalogRow.refCount > 0
+        ) {
+          throw new Error(`AttachmentReferenceProjectionMismatch:${attachmentId}`)
+        }
+        return { ...state, catalogRow: state.catalogRow }
+      }
+
       const ctx: MutationContext = {
         getChat: async (chatId) => {
           const state = chatStates.get(chatId)
@@ -975,7 +1203,7 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
         },
 
         putMessage: async (message, options: PutMessageOptions = {}) => {
-          const { touchChatSummary = true, semanticEffect } = options
+          const { touchChatSummary = true, semanticEffect, creationTimestamp } = options
           assertCanonicalGeneratedOutputMessage(message.content, message.attachmentRefs, message.id)
           const headerTable = tx.table<MessageHeaderRow, MessageId>('messages')
           const previewTable = tx.table<MessageTextPreviewRow, MessageId>('messagePreviews')
@@ -992,11 +1220,15 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
             assertExistingMessageIdentity(existing, clone)
             if (!existingBody) throw new Error(`MessageBodyMissing:${clone.id}`)
             const comparable = { ...clone, nodeVersion: existing.nodeVersion }
-            const comparableSplit = splitMessageForStorage(comparable, {
+            const comparableTransition = compileCurrentMessageTransition(comparable, {
               bodyVersion: existing.bodyVersion,
               requestContextVersion: existing.requestContextVersion,
               updatedAt: existingBody.updatedAt,
+              previousAttachmentRefs: existing.attachmentRefs,
+              timestamp: 'exact',
+              custody: { kind: 'preserve' },
             })
+            const comparableSplit = comparableTransition.storage
             const headerChanged =
               stableStringify(existing) !== stableStringify(comparableSplit.header)
             const bodyChanged =
@@ -1045,14 +1277,17 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
             const requestContextVersion =
               existing.requestContextVersion + (semantics.requestContextChanged ? 1 : 0)
             let header: MessageHeaderRow
-            let storage: ReturnType<typeof splitMessageForStorage> | undefined
+            let transition: ReturnType<typeof compileCurrentMessageTransition> | undefined
             if (bodyChanged) {
-              storage = splitMessageForStorage(clone, {
+              transition = compileCurrentMessageTransition(clone, {
                 bodyVersion: existing.bodyVersion + 1,
                 requestContextVersion,
                 updatedAt: now,
+                previousAttachmentRefs: existing.attachmentRefs,
+                timestamp: 'exact',
+                custody: { kind: 'preserve' },
               })
-              header = storage.header
+              header = transition.storage.header
             } else {
               header = {
                 ...comparableSplit.header,
@@ -1061,16 +1296,15 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
                 bodyVersion: existing.bodyVersion,
               }
             }
-            await syncAttachmentReferenceOwner({
-              ownerKind: 'message',
-              ownerId: clone.id,
-              chatId: clone.chatId,
-              previousRefs: existing.attachmentRefs,
-              nextRefs: clone.attachmentRefs,
-            })
+            await syncAttachmentReferenceOwner(
+              transition?.attachmentOwner ?? comparableTransition.attachmentOwner,
+            )
             await putPhysicalStorageRow(tx, 'messages', header, existing)
-            if (storage) {
-              await replaceMessageBody(tx, storage.body, { kind: 'row', row: existingBody })
+            if (transition) {
+              await replaceMessageBody(tx, transition.storage.body, {
+                kind: 'row',
+                row: existingBody,
+              })
               const previousPreview = await previewTable.get(clone.id)
               receiptAccumulator.physicalRead({
                 tableName: 'messagePreviews',
@@ -1079,17 +1313,24 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
                 requestCount: 1,
                 rowCount: 1,
               })
-              await putPhysicalStorageRow(tx, 'messagePreviews', storage.preview, previousPreview)
+              await putPhysicalStorageRow(
+                tx,
+                'messagePreviews',
+                transition.storage.preview,
+                previousPreview,
+              )
             }
             messageHeaderReads.set(clone.id, header)
-            messageBodyReads.set(clone.id, storage?.body ?? existingBody)
+            messageBodyReads.set(clone.id, transition?.storage.body ?? existingBody)
           } else {
             if (!touchChatSummary) {
               throw new Error(`DeferredMessageWriteRequiresExistingRow:${clone.id}`)
             }
             const summaryState = state as ChatMutationState
             summaryState.structuralVersionDirty = true
-            clone.createdAt = await messageCreationClock.next(tx, clone.chatId, now)
+            if (creationTimestamp !== 'preserve') {
+              clone.createdAt = await messageCreationClock.next(tx, clone.chatId, now)
+            }
             const expectedLeafId =
               summaryState.incrementalAppends.at(-1)?.id ??
               summaryState.beforeChat.lastUpdatedLeafId
@@ -1108,26 +1349,36 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
               await ensureStructuralSummaryContext(summaryState)
             }
             assertScope({ kind: 'children', chatId, parentId: clone.parentId })
-            const { header, body, preview } = splitMessageForStorage(clone, { updatedAt: now })
-            recordHeaderBeforeWrite(summaryState, clone.id, undefined)
-            await syncAttachmentReferenceOwner({
-              ownerKind: 'message',
-              ownerId: clone.id,
-              chatId: clone.chatId,
-              previousRefs: undefined,
-              nextRefs: clone.attachmentRefs,
+            const reservedTarget =
+              admittedTargetLease?.messageId === clone.id ? admittedTargetLease : undefined
+            const transition = compileCurrentMessageTransition(clone, {
+              updatedAt: now,
+              timestamp: creationTimestamp === 'preserve' ? 'exact' : 'transaction-allocated',
+              custody: reservedTarget
+                ? {
+                    kind: 'reserved-attempt-target',
+                    messageId: reservedTarget.messageId,
+                    streamId: reservedTarget.streamId,
+                  }
+                : { kind: 'available' },
             })
+            const { header, body, preview } = transition.storage
+            recordHeaderBeforeWrite(summaryState, clone.id, undefined)
+            await syncAttachmentReferenceOwner(transition.attachmentOwner)
             await addPhysicalStorageRow(tx, 'messages', header)
             await insertMessageBody(tx, body)
             await addPhysicalStorageRow(tx, 'messagePreviews', preview)
             messageHeaderReads.set(clone.id, header)
             messageBodyReads.set(clone.id, body)
-            if (clone.role === 'user') summaryState.previewDirty = true
-            recordNewMessageSummary(summaryState, clone)
+            if (transition.summary.previewCandidate !== undefined) {
+              summaryState.previewDirty = true
+            }
+            summaryState.wordCountDeltas.set(clone.id, transition.summary.wordCount)
+            summaryState.totalCostDelta += transition.summary.costUsd
             if (incrementalAppend) {
               summaryState.incrementalAppends.push(clone)
             }
-            await bumpChildList(chatId, clone.parentId)
+            await bumpChildList(chatId, transition.structural.parentId)
           }
 
           if (touchChatSummary && state && messageSummaryChanged) {
@@ -1452,17 +1703,15 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
           const aggregate = await tx
             .table<AttachmentCatalogAggregateRow, string>('attachmentCatalogAggregate')
             .get(ATTACHMENT_CATALOG_AGGREGATE_ID)
+          receiptAccumulator.physicalRead({
+            tableName: 'attachmentCatalogAggregate',
+            indexKind: 'primary',
+            operation: 'get',
+            requestCount: 1,
+            rowCount: 1,
+          })
           if (!aggregate) throw new Error('AttachmentCatalogAggregateMissing')
           return aggregate.projectionRevision
-        },
-
-        getAttachmentReclamationState: async (attachmentId) => {
-          const header = await tx
-            .table<AttachmentHeaderRow, AttachmentId>('attachments')
-            .get(attachmentId)
-          return header
-            ? { exists: true, unreferencedAt: header.unreferencedAt }
-            : { exists: false, unreferencedAt: null }
         },
 
         findAttachmentIdByContentHash: async (filename, contentHash, excludeId) => {
@@ -1590,56 +1839,57 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
 
         deleteAttachmentIfUnreferenced: async (attachmentId) => {
           assertScope({ kind: 'attachment', attachmentId })
-          const existing = await tx
-            .table<AttachmentHeaderRow, AttachmentId>('attachments')
-            .get(attachmentId)
-          receiptAccumulator.physicalRead({
-            tableName: 'attachments',
-            indexKind: 'primary',
-            operation: 'get',
-            requestCount: 1,
-            rowCount: 1,
-          })
-          if (!existing) {
+          const state = await readAttachmentDispositionState(attachmentId)
+          if (state.kind === 'absent') {
             return { deleted: false, refs: { messages: 0, drafts: 0 } }
           }
-          const catalogRow = await tx
-            .table<AttachmentCatalogProjectionRow, AttachmentId>('attachmentCatalogRows')
-            .get(attachmentId)
-          receiptAccumulator.physicalRead({
-            tableName: 'attachmentCatalogRows',
-            indexKind: 'primary',
-            operation: 'get',
-            requestCount: 1,
-            rowCount: 1,
-          })
-          if (!catalogRow) throw new Error(`AttachmentCatalogRowMissing:${attachmentId}`)
-          const firstReference = await tx
-            .table<AttachmentReferenceEdge>('attachmentRefEdges')
-            .where('attachmentId')
-            .equals(attachmentId)
-            .first()
-          receiptAccumulator.physicalRead({
-            tableName: 'attachmentRefEdges',
-            indexKind: 'secondary',
-            indexName: 'attachmentId',
-            operation: 'query',
-            requestCount: 1,
-            rowCount: firstReference ? 1 : 0,
-          })
-          if (
-            existing.refCount !== catalogRow.refCount ||
-            (firstReference !== undefined) !== catalogRow.refCount > 0
-          ) {
-            throw new Error(`AttachmentReferenceProjectionMismatch:${attachmentId}`)
-          }
+          const current = requireConsistentAttachmentDispositionState(attachmentId, state)
           const refs = {
-            messages: catalogRow.messageRefCount,
-            drafts: catalogRow.draftRefCount,
+            messages: current.catalogRow.messageRefCount,
+            drafts: current.catalogRow.draftRefCount,
           }
-          if (firstReference) return { deleted: false, refs }
-          await deleteAttachmentOwnerBundle(attachmentId, existing, catalogRow)
+          if (current.firstReference) return { deleted: false, refs }
+          await deleteAttachmentOwnerBundle(attachmentId, current.header, current.catalogRow)
           return { deleted: true, refs }
+        },
+
+        deleteAttachmentForStorage: async (attachmentId, reason, deletionNow) => {
+          assertScope({ kind: 'attachment', attachmentId })
+          const state = await readAttachmentDispositionState(attachmentId)
+          if (state.kind === 'absent') return 'absent'
+          const current = requireConsistentAttachmentDispositionState(attachmentId, state)
+          if (!current.firstReference) {
+            await deleteAttachmentOwnerBundle(attachmentId, current.header, current.catalogRow)
+            return 'deleted'
+          }
+          await deleteAttachmentBytesForHeader(
+            attachmentId,
+            current.header,
+            reason,
+            deletionNow,
+            current.catalogRow,
+          )
+          return 'stubbed'
+        },
+
+        reapAttachmentIfEligible: async (attachmentId, cutoff) => {
+          assertScope({ kind: 'attachment', attachmentId })
+          const state = await readAttachmentDispositionState(attachmentId)
+          if (state.kind === 'absent') return 'absent'
+          if (
+            state.firstReference ||
+            !state.catalogRow ||
+            state.header.refCount !== state.catalogRow.refCount ||
+            (state.firstReference !== undefined) !== state.catalogRow.refCount > 0
+          ) {
+            await requestAttachmentIntegrityRepair()
+            return 'repair-required'
+          }
+          if (state.header.unreferencedAt === null || state.header.unreferencedAt >= cutoff) {
+            return 'retained'
+          }
+          await deleteAttachmentOwnerBundle(attachmentId, state.header, state.catalogRow)
+          return 'deleted'
         },
 
         putAttachment: async (attachment) => {
@@ -1708,126 +1958,7 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
             rowCount: 1,
           })
           if (!header) return undefined
-          const [artifacts, jobs] = await Promise.all([
-            tx
-              .table<AttachmentArtifact, string>('attachmentArtifacts')
-              .where('attachmentId')
-              .equals(attachmentId)
-              .toArray(),
-            tx
-              .table<AttachmentJob, string>('attachmentJobs')
-              .where('attachmentId')
-              .equals(attachmentId)
-              .toArray(),
-          ])
-          receiptAccumulator.physicalRead({
-            tableName: 'attachmentArtifacts',
-            indexKind: 'secondary',
-            indexName: 'attachmentId',
-            operation: 'query',
-            requestCount: 1,
-            rowCount: artifacts.length,
-          })
-          receiptAccumulator.physicalRead({
-            tableName: 'attachmentJobs',
-            indexKind: 'secondary',
-            indexName: 'attachmentId',
-            operation: 'query',
-            requestCount: 1,
-            rowCount: jobs.length,
-          })
-          const retainedArtifacts = artifacts.filter((artifact) => artifact.kind !== 'blob')
-          const deletedArtifacts = artifacts.filter((artifact) => artifact.kind === 'blob')
-          const retainedArtifactIds = new Set(
-            retainedArtifacts.map((artifact) => artifact.artifactId),
-          )
-          const deletedJobs: AttachmentJob[] = []
-          const updatedJobs: AttachmentJob[] = []
-          const previousUpdatedJobs: AttachmentJob[] = []
-          for (const job of jobs) {
-            const outputArtifactIds = job.outputArtifactIds.filter((id) =>
-              retainedArtifactIds.has(id),
-            )
-            if (job.outputArtifactIds.length > 0 && outputArtifactIds.length === 0) {
-              deletedJobs.push(job)
-            } else if (!sameOrderedValues(outputArtifactIds, job.outputArtifactIds)) {
-              previousUpdatedJobs.push(job)
-              updatedJobs.push({ ...job, outputArtifactIds, updatedAt: deletionNow })
-            }
-          }
-          const deletedBlobCount = await deleteAttachmentBlobRows(tx, attachmentId, header)
-          receiptAccumulator.physicalRead({
-            tableName: 'attachmentBlobs',
-            indexKind: 'secondary',
-            indexName: 'attachmentId',
-            operation: 'query',
-            requestCount: 1,
-            rowCount: deletedBlobCount,
-          })
-          await deletePhysicalStorageRows(
-            tx,
-            'attachmentArtifacts',
-            deletedArtifacts.map((artifact) => artifact.artifactId),
-            deletedArtifacts,
-          )
-          await deletePhysicalStorageRows(
-            tx,
-            'attachmentJobs',
-            deletedJobs.map((job) => job.id),
-            deletedJobs,
-          )
-          await putPhysicalStorageRows(tx, 'attachmentJobs', updatedJobs, previousUpdatedJobs)
-          if (deletedJobs.length > 0 || updatedJobs.length > 0) {
-            recordBrowserCommandInvalidation(tx, {
-              kind: 'attachment-job',
-              attachmentIds: [attachmentId],
-              jobIds: [...deletedJobs, ...updatedJobs].map((job) => job.id),
-            })
-          }
-          const current = hydrateAttachment(header, artifacts)
-          const processing = current.processing.flatMap((state) => {
-            const outputArtifactIds = state.outputArtifactIds.filter((id) =>
-              retainedArtifactIds.has(id),
-            )
-            return state.outputArtifactIds.length > 0 && outputArtifactIds.length === 0
-              ? []
-              : [{ ...state, outputArtifactIds }]
-          })
-          const next = missingAttachmentAfterByteDeletion(
-            current,
-            reason,
-            deletionNow,
-            retainedArtifacts,
-            processing,
-          )
-          const unchangedHeader = splitAttachmentForStorage(
-            next,
-            header.wireVersion,
-            header.unreferencedAt,
-          )
-          const payloadChanged =
-            deletedBlobCount > 0 ||
-            deletedArtifacts.length > 0 ||
-            deletedJobs.length > 0 ||
-            updatedJobs.length > 0
-          if (!payloadChanged && stableStringify(unchangedHeader) === stableStringify(header)) {
-            return current
-          }
-          const nextHeader = { ...unchangedHeader, wireVersion: header.wireVersion + 1 }
-          await putAttachmentHeaderByteOwner(tx, nextHeader, header)
-          const catalogReceipt = await putAttachmentCatalogProjectionFromHeader(
-            tx,
-            nextHeader,
-            header,
-          )
-          absorbSemanticOperationReceiptFragment(tx, catalogReceipt.fragment)
-          recordBrowserCommandAttachmentReferenceState(tx, {
-            attachmentId,
-            initial: { exists: true, refCount: header.refCount },
-            final: { exists: true, refCount: nextHeader.refCount },
-            projectionChanged: true,
-          })
-          return hydrateAttachment(nextHeader, retainedArtifacts)
+          return deleteAttachmentBytesForHeader(attachmentId, header, reason, deletionNow)
         },
 
         deleteAttachmentBlobs: async (attachmentId) => {
@@ -2385,12 +2516,11 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
           ) {
             throw new GenerationPlanningSeedChangedError(chatId)
           }
-          const transition = await applyChatRowWriteTransitions(tx, [
-            configurationLinkTransition
-              ? { kind: 'replace-linked', previous: current, next: patched }
-              : { kind: 'replace-preserving-links', previous: current, next: patched },
-          ])
-          absorbSemanticOperationReceiptFragment(tx, transition.fragment)
+          if (configurationLinkTransition) {
+            chatMutation.replaceLinked(chatId, () => patched)
+          } else {
+            chatMutation.replacePreserving(chatId, () => patched)
+          }
           affectedChatIds.push(chatId)
         }
         finalizedChats.set(chatId, patched)
@@ -2400,6 +2530,10 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
           structuralVersion: patched.structuralVersion,
         }
       }
+      if (affectedChatIds.length > 0 || options?.initialChat) {
+        const transition = await chatMutation.commit()
+        absorbSemanticOperationReceiptFragment(tx, transition.fragment)
+      }
 
       const finalizationContext: MutationFinalizationContext = Object.freeze({
         getFinalChat: (chatId: ChatId) => {
@@ -2407,8 +2541,10 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
           return Promise.resolve(chat ? structuredClone(chat) : undefined)
         },
         getAttachmentCatalogRevision: ctx.getAttachmentCatalogRevision,
-        readFinalActiveBranchForks: (headers: readonly MessageHeaderRow[]) =>
-          readActiveBranchForkSlotsForHeadersInTransaction(tx, headers),
+        readFinalActiveBranchPathSlotFrame: (
+          chatId: ChatId,
+          headers: readonly MessageHeaderRow[],
+        ) => readActiveBranchPathSlotFrameInTransaction(tx, chatId, headers),
         sealCommittedDestination: (
           input: Parameters<MutationFinalizationContext['sealCommittedDestination']>[0],
         ) =>

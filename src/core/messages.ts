@@ -1,5 +1,6 @@
 import { newId } from '../lib/ulid'
 import {
+  type ActiveBranchChildSlot,
   type ActiveBranchForkSlot,
   type ActiveBranchSelection,
   createActiveBranchSpine,
@@ -62,6 +63,14 @@ export interface MessagePresentation {
   readonly bodyVersion: number
 }
 
+export interface PreparedMessagePlacementFrame {
+  readonly chatId: ChatId
+  readonly structuralVersion: number
+  readonly createdAt: number
+  readonly slot: ActiveBranchChildSlot | null
+  readonly messages: readonly Message[]
+}
+
 export interface MessageMutationContext {
   getMessage(messageId: MessageId): Promise<Message | undefined>
   getMessageHeader(messageId: MessageId): Promise<MessageHeaderRow | undefined>
@@ -71,7 +80,13 @@ export interface MessageMutationContext {
   getChildList(chatId: ChatId, parentId: MessageId | null): Promise<ChildListState>
   getChildLists(chatId: ChatId, parentIds: readonly (MessageId | null)[]): Promise<ChildListState[]>
   getChildSlotMembers(messageIds: readonly MessageId[]): Promise<Array<ChildSlotMember | undefined>>
-  putMessage(message: Message, options?: { readonly touchChatSummary?: boolean }): Promise<Message>
+  putMessage(
+    message: Message,
+    options?: {
+      readonly touchChatSummary?: boolean
+      readonly creationTimestamp?: 'preserve'
+    },
+  ): Promise<Message>
   patchMessageStructure(
     messageId: MessageId,
     patch: Partial<Pick<MessageHeaderRow, 'deleted' | 'parentId' | 'siblingIndex'>>,
@@ -149,6 +164,7 @@ export interface ConversationSelectionFrame {
   readonly proof: ConversationPathProofIdentity
   readonly presentations: readonly MessagePresentation[]
   readonly forks: readonly ActiveBranchForkSlot[]
+  readonly terminalChildSlot: ActiveBranchChildSlot
 }
 
 export interface ConversationProvedSelection extends ConversationSelectionFrame {
@@ -163,6 +179,7 @@ export interface ConversationAppendSelectionTransition {
   readonly base: ConversationPathProofIdentity
   readonly suffixHeaders: readonly MessageHeaderRow[]
   readonly forks: readonly ActiveBranchForkSlot[]
+  readonly terminalChildSlot: ActiveBranchChildSlot
   readonly presentations: readonly MessagePresentation[]
   readonly fallback: {
     readonly prefixHeaders: readonly MessageHeaderRow[]
@@ -215,6 +232,7 @@ export function sealConversationSelection(
       structuralVersion: proof.structuralVersion,
       resolvedLeafId: proof.tipId,
       path: acceptedPath,
+      terminalChildSlot: selection.terminalChildSlot,
     })
   } else if (SEALED_CONVERSATION_SELECTION in selection) {
     spine = (selection as SealedConversationSelection).spine
@@ -225,6 +243,7 @@ export function sealConversationSelection(
       structuralVersion: proof.structuralVersion,
       resolvedLeafId: proof.tipId,
       headers: pathHeaders,
+      terminalChildSlot: selection.terminalChildSlot,
     })
   }
   const forks: Iterable<ActiveBranchForkSlot> = acceptedForks ?? selection.forks
@@ -254,6 +273,7 @@ export function sealConversationSelection(
     }),
     presentations: selection.presentations,
     forks: Object.freeze([...spine.forkSlots()]),
+    terminalChildSlot: spine.terminalChildSlot,
     [SEALED_CONVERSATION_SELECTION]: true as const,
     spine,
   })

@@ -1,6 +1,9 @@
 import { fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { createActiveBranchSpine } from '../../src/core/active-branch-spine'
+import {
+  createActiveBranchSpine,
+  emptyActiveBranchChildSlot,
+} from '../../src/core/active-branch-spine'
 import type { Message } from '../../src/core/types'
 import { splitMessageForStorage } from '../../src/store/message-storage'
 import { useAnnouncementStore } from '../../src/store/zustand/announcementStore'
@@ -52,6 +55,7 @@ describe('BranchControls accessibility', () => {
       structuralVersion: 1,
       resolvedLeafId: first.id,
       headers: [firstHeader],
+      terminalChildSlot: emptyActiveBranchChildSlot(first.id),
     }).replaceForks([
       {
         parentId: null,
@@ -59,6 +63,7 @@ describe('BranchControls accessibility', () => {
         slotVersion: 1,
         position: 0,
         liveCount: 2,
+        nextSiblingIndex: 2,
         previousMessageId: null,
         nextMessageId: second.id,
         firstMessageId: first.id,

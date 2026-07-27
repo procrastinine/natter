@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest'
-import { createActiveBranchSpine } from '../../src/core/active-branch-spine'
+import {
+  createActiveBranchSpine,
+  emptyActiveBranchChildSlot,
+} from '../../src/core/active-branch-spine'
 import {
   compareLiveLeafRecency,
   findLastUpdatedLeafId,
@@ -54,6 +57,7 @@ function exactSpine(messages: readonly Message[], leafId: MessageId) {
     structuralVersion: 1,
     resolvedLeafId: leafId,
     headers,
+    terminalChildSlot: emptyActiveBranchChildSlot(leafId),
   })
 }
 

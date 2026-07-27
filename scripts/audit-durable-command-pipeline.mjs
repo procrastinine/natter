@@ -21,6 +21,7 @@ const BROWSER_REPO_PATH = 'src/store/browser-repo.ts'
 const BROWSER_CATALOG_COMMAND_RUNTIME_PATH = 'src/store/browser-catalog-command-runtime.ts'
 const CHATS_PATH = 'src/store/chats.ts'
 const ATTACHMENTS_PATH = 'src/store/attachments.ts'
+const ATTACHMENT_BULK_DELETE_PATH = 'src/store/attachment-bulk-delete.ts'
 const BROWSER_IMPORT_EXPORT_PATH = 'src/store/browser-import-export.ts'
 const CONFIGURATION_HANDLER_PATH = 'src/store/browser-configuration-domain.ts'
 const CONFIGURATION_APPLICATION_PATH = 'src/store/configuration-application.ts'
@@ -1512,9 +1513,10 @@ function singleChatMetadataCapabilityFacts(
       !resourceText.includes('linkedResourceNames'),
     oneTransactionLocalExecutor:
       executorText.includes('commit.executeSemanticOperation(descriptor, { chatId }') &&
-      executorText.includes(".table<Chat, ChatId>('chats').get(chatId)") &&
-      executorText.includes('applyChatRowWriteTransitions(tx, [') &&
-      executorText.includes("kind: 'replace-preserving-links'") &&
+      executorText.includes('const chatMutation = openPreservingChatMutation(tx)') &&
+      executorText.includes('const current = await chatMutation.read(chatId)') &&
+      executorText.includes('chatMutation.replace(chatId, () => next)') &&
+      executorText.includes('const transition = await chatMutation.commit()') &&
       executorText.includes('semanticOperationExecution(') &&
       executorText.includes('singleChatMetadataReceipt(') &&
       !executorText.includes('NatterDb') &&
@@ -1688,11 +1690,12 @@ function chatSetArchivedCapabilityFacts(program, catalogSource, browserRepoSourc
       countOccurrences(routeText, 'readChatSetArchivedPlan(') === 1 &&
       countOccurrences(routeText, 'commit.executeSemanticOperation(') === 1 &&
       countOccurrences(routeText, 'commit.completeSemanticOperation(') === 1 &&
-      routeText.includes(".table<Chat, ChatId>('chats').bulkGet([...plan.chatIds])") &&
+      routeText.includes('const chatMutation = openLinkedChatMutation(tx)') &&
+      routeText.includes('const rows = await chatMutation.readMany(plan.chatIds)') &&
       routeText.includes('normalizeNamedLocks(currentResourceNames)') &&
       routeText.includes('throw new ChatSetArchivedLinkPlanChangedError()') &&
-      routeText.includes('applyChatRowWriteTransitions(') &&
-      routeText.includes("kind: 'replace-linked' as const") &&
+      routeText.includes('chatMutation.replaceLinked(current.id, () => next)') &&
+      routeText.includes('const transition = await chatMutation.commit()') &&
       routeText.includes('semanticOperationExecution(') &&
       !routeText.includes('for (;;)') &&
       !routeText.includes('catch (') &&
@@ -1858,10 +1861,13 @@ function chatCalibrationCapabilityFacts(program, catalogSource, outputProblems) 
       mutationJournalSource.getText().includes('requiredFinalChatState(journal, chatId)') &&
       !mutationJournalSource.getText().includes("tx.table<Chat, ChatId>('chats').bulkGet(chatIds)"),
     atomicFanoutAdmitted:
-      fanoutTransactionText.includes('await chats.toArray()') &&
+      fanoutTransactionText.includes('const chatMutation = openPreservingChatMutation(tx)') &&
+      fanoutTransactionText.includes('const rows = await chatMutation.readAll()') &&
       fanoutTransactionText.includes('const changedChats = rows.map(') &&
-      fanoutTransactionText.includes('applyChatRowWriteTransitions(') &&
-      fanoutTransactionText.includes('changedChats.map(') &&
+      fanoutTransactionText.includes(
+        'for (const next of changedChats) chatMutation.replace(next.id, () => next)',
+      ) &&
+      fanoutTransactionText.includes('const transition = await chatMutation.commit()') &&
       fanoutPlanText.match(/Number\.MAX_SAFE_INTEGER/gu)?.length === 8,
   }
   const singleFiniteBounds =
@@ -2541,9 +2547,10 @@ function chatOrganizationCapabilityFacts(program, catalogSource, workspaceUnion,
       tagsText.includes('CHAT_SET_TAGS_FROM_NAMES_OPERATION'),
     transactionLocalSelection:
       moveText.includes("table<ChatFolder, FolderId>('folders').get(plan.folderId)") &&
-      moveText.includes("table<Chat, ChatId>('chats').bulkGet([...plan.chatIds])") &&
-      tagsText.includes("table<Chat, ChatId>('chats')") &&
-      tagsText.includes('chats.bulkGet(uniqueChatIds)'),
+      moveText.includes('const chatMutation = openPreservingChatMutation(tx)') &&
+      moveText.includes('const rows = await chatMutation.readMany(plan.chatIds)') &&
+      tagsText.includes('const chatMutation = openPreservingChatMutation(tx)') &&
+      tagsText.includes('await chatMutation.readMany(uniqueChatIds)'),
     candidateShapedTagWork:
       tagsText.includes("tags.where('nameLower').anyOf(nameKeys).toArray()") &&
       tagsText.includes("chats.where('tags').anyOf(candidateIds).uniqueKeys()") &&
@@ -2894,7 +2901,9 @@ function chatForkCapabilityFacts(browserRepoSource, outputProblems) {
       'exactPathHeaders: storageRows.map(({ header }) => header)',
     ),
     oneLinkedAttachmentAwareCommit:
-      command.includes("applyChatRowWriteTransitions(tx, [{ kind: 'add-linked', next: chat }])") &&
+      command.includes('const chatMutation = openLinkedChatMutation(tx)') &&
+      command.includes('await chatMutation.add(chat)') &&
+      command.includes('await chatMutation.commit()') &&
       command.includes('applyAttachmentReferenceOwnerTransitions('),
     noLegacyPlanning:
       !command.includes('.withLocks(') &&
@@ -2994,7 +3003,9 @@ function interchangeImportCapabilityFacts(importSource, workspaceUnion, outputPr
     importSource,
     'replaceMessageAttachmentReferenceOwnersInPages',
   ).getText(importSource)
-  const messageWrites = findFunction(importSource, 'storeNewMessagesInPages').getText(importSource)
+  const messageWrites = findFunction(importSource, 'storeNewMessageTransitionsInPages').getText(
+    importSource,
+  )
   const commonKernel = {
     exactVariants:
       variants.length === expectedVariants.length &&
@@ -3066,11 +3077,9 @@ function interchangeImportCapabilityFacts(importSource, workspaceUnion, outputPr
         text.includes('Date.now()'),
       ),
     boundedTranscriptWrites:
-      messageWrites.includes('for (const page of pages(messages))') &&
+      messageWrites.includes('for (const page of pages(transitions))') &&
       messageWrites.includes('bulkAdd(') &&
-      chatMethod.includes(
-        'exactPathHeaders: branchPathStorage.map(({ storage }) => storage.header)',
-      ),
+      chatMethod.includes('exactPathHeaders: messageGraph.branchTransitions.map('),
     noLegacyPlanning:
       !routeText.includes('.withLocks(') &&
       !routeText.includes('for (;;)') &&
@@ -3220,10 +3229,12 @@ function folderCapabilityFacts(program, catalogSource, workspaceUnion, outputPro
       deleteText.includes('commit.executeSemanticOperation(descriptor'),
     transactionLocalFolderMembership:
       ensureText.includes('await folders.each(') &&
-      ensureText.includes("table<Chat, ChatId>('chats').bulkGet(uniqueChatIds)") &&
-      ensureText.includes('applyChatRowWriteTransitions(') &&
-      deleteText.includes(".where('folderId').equals(folderId).toArray()") &&
-      deleteText.includes('applyChatRowWriteTransitions('),
+      ensureText.includes('const chatMutation = openPreservingChatMutation(tx)') &&
+      ensureText.includes('const rows = await chatMutation.readMany(uniqueChatIds)') &&
+      ensureText.includes('await chatMutation.commit()') &&
+      deleteText.includes('const chatMutation = openLinkedChatMutation(tx)') &&
+      deleteText.includes('await chatMutation.readFolder(folderId)') &&
+      deleteText.includes('await chatMutation.commit()'),
     boundedVariantIo:
       createText.includes('await table.get(folder.id)') &&
       updateText.includes('await table.get(folderId)') &&
@@ -3346,9 +3357,10 @@ function generationMetadataCapabilityFacts(program, workspaceUnion, outputProble
     catalogProjectionSource,
     'putConfigurationPresetRecencyCatalogProjection',
   ).getText(catalogProjectionSource)
-  const chatTransitionText = findFunction(chatRowSource, 'applyChatRowWriteTransitions').getText(
+  const chatTransitionText = findFunctionImplementation(
     chatRowSource,
-  )
+    'applyChatRowWriteTransitions',
+  ).getText(chatRowSource)
   const resourceProofText = findFunction(
     protocolSource,
     'generationPostCommitMetadataResourceProof',
@@ -3421,14 +3433,17 @@ function generationMetadataCapabilityFacts(program, workspaceUnion, outputProble
       executorText.includes('const projection = await putConfigurationProfileCatalogProjection') &&
       executorText.includes('projection.aggregateIds.length') &&
       executorText.includes('await putConfigurationPresetRecencyCatalogProjection') &&
-      executorText.includes('applyChatRowWriteTransitions(tx, [') &&
+      executorText.includes('const chatMutation = openPreservingChatMutation(tx)') &&
+      executorText.includes('chatMutation.read(lease.chatId)') &&
+      executorText.includes('const transition = await chatMutation.commit()') &&
       profileProjectionText.includes(
         'table<ConfigurationProfileCatalogProjectionRow, ProfileId>(',
       ) &&
       profileProjectionText.includes('.get(profile.id)') &&
       presetProjectionText.includes('table<ConfigurationPresetCatalogProjectionRow, PresetId>(') &&
       presetProjectionText.includes('.get(preset.id)') &&
-      chatTransitionText.includes('absorbSemanticOperationReceiptFragment(tx, fragment)'),
+      chatTransitionText.includes('const fragment = chatRowWriteMutationReceiptFragment') &&
+      executorText.includes('transition.fragment'),
     projectionDerivedPublication:
       browserRepoSource.getText().includes('function sidebarChatIdsForMutationFacts(') &&
       browserRepoSource.getText().includes("mutation.tableName !== 'chatSidebarRows'") &&
@@ -3465,12 +3480,13 @@ function generationMetadataCapabilityFacts(program, workspaceUnion, outputProble
     boundedNestedInputs:
       resourceProofText.includes('[RECENT_MODEL_RECENCY_KEY, RECENT_MODELS_KEY]') &&
       resourceProofText.includes('[GLOBAL_TOKEN_CALIBRATION_KEY]') &&
-      executorText.includes('applyChatRowWriteTransitions(tx, [') &&
+      executorText.includes('chatMutation.replace(lease.chatId, (current) => ({') &&
       executorText.includes("recordGenerationMetadataPrimaryRead(physicalReads, 'settings', 2)") &&
-      executorText.includes("kind: 'replace-preserving-links'") &&
+      executorText.includes('const transition = await chatMutation.commit()') &&
       chatTransitionText.includes(
         'chatRowWriteMutationReceiptFragment(chatWrites, linkPhases, sidebar)',
       ) &&
+      executorText.includes('transition.fragment') &&
       profileProjectionText.includes('.get(profile.id)') &&
       presetProjectionText.includes('.get(preset.id)'),
     byteBoundsExplicitlyOpen: planText.match(/maxBytes: Number\.MAX_SAFE_INTEGER/gu)?.length === 2,
@@ -3792,9 +3808,13 @@ function configurationChatCapabilityFacts(
       callResolvesTo(checker, call, semanticPortExecute),
   )
   const executorText = executor.getText(configurationSource)
-  const chatRowText = findFunction(chatRowSource, 'applyLinkedChatRowReplacements').getText(
-    chatRowSource,
-  )
+  const chatRowText = [
+    findClass(chatRowSource, 'TransactionChatMutationOwner'),
+    findFunctionImplementation(chatRowSource, 'applyChatRowWriteTransitions'),
+    findFunction(chatRowSource, 'chatRowWriteMutationReceiptFragment'),
+  ]
+    .map((owner) => owner.getText(chatRowSource))
+    .join('\n')
   const linkTransitionText = findFunction(
     byteOwnerSource,
     'applyConfigurationOwnerLinkTransitions',
@@ -3919,9 +3939,12 @@ function configurationChatCapabilityFacts(
       executor.parameters[0]?.name.getText(configurationSource) === 'operationKind' &&
       identifierCount(executor, 'db') === 0 &&
       identifierCount(executor, '_db') === 0,
-    primaryReadOwned: executorText.includes(".table<Chat, ChatId>('chats').get(chatId)"),
+    primaryReadOwned:
+      executorText.includes('const chatMutation = openLinkedChatMutation(tx)') &&
+      executorText.includes('const current = await chatMutation.read(chatId)'),
     linkedWritesOwned:
-      executorText.includes('applyLinkedChatRowReplacement') &&
+      executorText.includes('chatMutation.replaceLinked(chatId, () => written)') &&
+      executorText.includes('const transition = await chatMutation.commit()') &&
       chatRowText.includes('replaceLinkedSemanticByteOwnerBatch') &&
       chatRowText.includes('applyChatSidebarProjectionTransitions'),
     dynamicFanoutOwned:
@@ -3931,9 +3954,10 @@ function configurationChatCapabilityFacts(
       sidebarTransitionText.includes('commitChatSidebarProjectionCandidates') &&
       sidebarCommitText.includes('applyChatSidebarProjectionDeltas') &&
       sidebarDeltaText.includes('readFolderSortExtrema') &&
-      chatRowText.includes('const links = await replaceLinkedSemanticByteOwnerBatch') &&
+      chatRowText.includes('await replaceLinkedSemanticByteOwnerBatch') &&
       chatRowText.includes('const sidebar = await applyChatSidebarProjectionTransitions') &&
-      chatRowText.includes('return Object.freeze({ links, sidebar })'),
+      chatRowText.includes('const fragment = chatRowWriteMutationReceiptFragment') &&
+      chatRowText.includes('return Object.freeze({'),
     noExternalPreflight:
       !executorText.includes('executeRevalidatedConfigurationPlan') &&
       !executorText.includes('readConfigurationLinksForOwner') &&
@@ -3948,7 +3972,8 @@ function configurationChatCapabilityFacts(
       'observePhysicalReads: semanticOperation?.descriptor.exactPhysicalReads !== undefined',
     ),
     boundedPhysicalIo:
-      executorText.includes(".table<Chat, ChatId>('chats').get(chatId)") &&
+      executorText.includes('const chatMutation = openLinkedChatMutation(tx)') &&
+      executorText.includes('const current = await chatMutation.read(chatId)') &&
       linkTransitionText.includes('CONFIGURATION_OWNER_LINK_BATCH_SIZE') &&
       profileUsageText.includes('CONFIGURATION_OWNER_LINK_BATCH_SIZE') &&
       linkedPhysicalReadText.includes('requestCount: transition.links.ownerQueryRequests') &&
@@ -4440,7 +4465,10 @@ function configurationPresetLifecycleCapabilityFacts(
       routeText.includes('removePresetOrderEntry') &&
       routeText.includes('applyConfigurationPresetCatalogProjectionDeletion') &&
       routeText.includes('readTargetLinksFromTransaction') &&
-      routeText.includes('applyLinkedChatRowReplacements') &&
+      routeText.includes('const chatMutation = openLinkedChatMutation(tx)') &&
+      routeText.includes('chatMutation.readMany(') &&
+      routeText.includes('chatMutation.replaceLinked(') &&
+      routeText.includes('chatMutation.commit()') &&
       linkAdditionText.includes('ConfigurationOwnerLinkMutationReceipt') &&
       linkReplacementText.includes('ConfigurationOwnerLinkMutationReceipt') &&
       presetOrderSource.getText().includes('PresetOrderMutationReceipt'),
@@ -4728,11 +4756,15 @@ function configurationChatSelectionCapabilityFacts(
       receiptAssertionText.includes('receipt.sourceMutation') &&
       receiptAssertionText.includes('receipt.projection'),
     transactionLocalTransitions:
-      routeText.includes("tx.table<Chat, ChatId>('chats').get") &&
+      routeText.includes('const chatMutation = openLinkedChatMutation(tx)') &&
+      routeText.includes('chatMutation.read(command.chatId)') &&
       routeText.includes('selectedChatConfigurationTransition') &&
       routeText.includes('applyConfigurationPromptPresetRecencyCatalogProjectionTransition') &&
       routeText.includes('applyConfigurationPromptPresetCatalogProjectionTransition') &&
-      selectedChatTransitionText.includes('applyLinkedChatRowReplacement'),
+      selectedChatTransitionText.includes(
+        'chatMutation.replaceLinked(current.id, () => written)',
+      ) &&
+      selectedChatTransitionText.includes('const transition = await chatMutation.commit()'),
     projectionReadsSubtracted:
       !recencyProjectionText.includes('.table') &&
       !recencyProjectionText.includes('.get(') &&
@@ -4986,13 +5018,17 @@ function configurationChatRequestTargetCapabilityFacts(
       receiptAssertionText.includes('configurationLinksForProfile') &&
       receiptAssertionText.includes('receipt.profileProjection'),
     transactionLocalTransitions:
-      routeText.includes("tx.table<Chat, ChatId>('chats').get") &&
+      routeText.includes('const chatMutation = openLinkedChatMutation(tx)') &&
+      routeText.includes('chatMutation.read(command.chatId)') &&
       routeText.includes("tx.table<ConnectionProfile, ProfileId>('profiles').get") &&
       routeText.includes("tx.table<KeyRecord, KeyId>('keys').get") &&
       routeText.includes('selectedChatConfigurationTransition') &&
       routeText.includes('replaceLinkedSemanticByteOwnerPreservingLinksBatch') &&
       routeText.includes('applyConfigurationProfileCatalogProjectionTransition') &&
-      selectedChatTransitionText.includes('applyLinkedChatRowReplacement'),
+      selectedChatTransitionText.includes(
+        'chatMutation.replaceLinked(current.id, () => written)',
+      ) &&
+      selectedChatTransitionText.includes('const transition = await chatMutation.commit()'),
     projectionReadsSubtracted:
       !profileProjectionText.includes('.table') && !profileProjectionText.includes('.get('),
     noLegacyTerminal:
@@ -5270,10 +5306,12 @@ function configurationTargetFanoutCapabilityFacts(
       receiptAssertionText.includes('receipt.chats.sidebar.mutatedRowIds'),
     transactionLocalTransitions:
       commitText.includes('readTargetLinksFromTransaction') &&
-      commitText.includes("tx.table<Chat, ChatId>('chats').bulkGet(chatReadIds)") &&
+      commitText.includes('const chatMutation = openLinkedChatMutation(tx)') &&
+      commitText.includes('chatMutation.readMany(chatReadIds)') &&
       commitText.includes("tx.table<ChatPreset, PresetId>('presets').bulkGet(presetReadIds)") &&
       commitText.includes('replaceLinkedSemanticByteOwnerBatch') &&
-      commitText.includes('applyLinkedChatRowReplacements') &&
+      commitText.includes('chatMutation.replaceLinked(previous.id, () => next)') &&
+      commitText.includes('chatMutation.commit()') &&
       commitText.includes('applyConfigurationPromptPresetCatalogProjectionTransition') &&
       commitText.includes('applyConfigurationPromptPresetCatalogProjectionDeletion') &&
       textTemplateCommitText.includes('deleteTextTemplateByteOwner'),
@@ -5865,9 +5903,11 @@ function configurationConnectionDeleteCapabilityFacts(
     transactionLocalTransitions:
       commitText.includes('readTargetLinksFromTransaction') &&
       commitText.includes("tx.table<ChatPreset, PresetId>('presets').bulkGet(presetReadIds)") &&
-      commitText.includes("tx.table<Chat, ChatId>('chats').bulkGet(chatReadIds)") &&
+      commitText.includes('const chatMutation = openLinkedChatMutation(tx)') &&
+      commitText.includes('chatMutation.readMany(chatReadIds)') &&
       commitText.includes('replaceLinkedSemanticByteOwnerBatch') &&
-      commitText.includes('applyLinkedChatRowReplacements') &&
+      commitText.includes('chatMutation.replaceLinked(previous.id, () => next)') &&
+      commitText.includes('chatMutation.commit()') &&
       commitText.includes('deleteLinkedSemanticByteOwner') &&
       commitText.includes('applyConfigurationProfileCatalogProjectionDeletion') &&
       commitText.includes('clearDiscoveryCacheProfileRows'),
@@ -6336,6 +6376,8 @@ function scopeDerivedMutationCapabilityFacts(
   const attachmentCatalogSource = exactSource(program, 'src/store/attachment-catalog-projection.ts')
   const byteOwnerSource = exactSource(program, BYTE_OWNER_MUTATION_PATH)
   const attachmentsSource = exactSource(program, ATTACHMENTS_PATH)
+  const attachmentBulkDeleteSource = exactSource(program, ATTACHMENT_BULK_DELETE_PATH)
+  const storageMaintenanceSource = exactSource(program, 'src/store/storage-maintenance-runtime.ts')
   const chatRowSource = exactSource(program, 'src/store/chat-row-transition.ts')
   const sidebarProjectionSource = exactSource(program, 'src/store/chat-sidebar-projection.ts')
   const profileUsageProjectionSource = exactSource(
@@ -6419,6 +6461,7 @@ function scopeDerivedMutationCapabilityFacts(
         variant !== 'attachment.bytes.delete' &&
         variant !== 'attachment.bundle.write' &&
         variant !== 'attachment.delete-if-unreferenced' &&
+        variant !== 'attachment.delete-many' &&
         !body.includes('return undefined'),
     )
     .map(([variant]) => variant)
@@ -6590,23 +6633,9 @@ function scopeDerivedMutationCapabilityFacts(
     callResolvesTo(checker, call, repositoryPutDraft),
   )
   const runtimePutDraft = findNestedObjectPropertyFunction(runBrowserMutation, 'putDraft')
-  const runtimePutDraftCalls = executableCalls(runtimePutDraft)
   const syncAttachmentReferenceOwner = findNestedVariableFunction(
     runBrowserMutation,
     'syncAttachmentReferenceOwner',
-  )
-  const runtimeSyncCalls = runtimePutDraftCalls.filter((call) =>
-    callResolvesTo(checker, call, syncAttachmentReferenceOwner),
-  )
-  const runtimeSyncInput = runtimeSyncCalls[0]?.arguments[0]
-    ? unwrap(runtimeSyncCalls[0].arguments[0])
-    : undefined
-  const runtimeSyncInputObject =
-    runtimeSyncInput && ts.isObjectLiteralExpression(runtimeSyncInput)
-      ? runtimeSyncInput
-      : undefined
-  const runtimePutDraftByteOwnerCalls = runtimePutDraftCalls.filter((call) =>
-    callResolvesTo(checker, call, findFunction(byteOwnerSource, 'putDraftByteOwner')),
   )
   const applyAttachmentTransitionsOwner = findFunction(
     attachmentReferenceSource,
@@ -6615,10 +6644,6 @@ function scopeDerivedMutationCapabilityFacts(
   const attachmentTransitionReceiptOwner = findFunction(
     attachmentReferenceSource,
     'attachmentReferenceTransitionReceipt',
-  )
-  const requireAttachmentTargetsOwner = findFunction(
-    attachmentReferenceSource,
-    'requireAttachmentTargets',
   )
   const applyAttachmentReferenceDeltasOwner = findFunction(
     attachmentReferenceSource,
@@ -6803,38 +6828,40 @@ function scopeDerivedMutationCapabilityFacts(
         )
         .includes("scope.kind === 'draft'"),
     constructivePhysicalAccess:
-      runtimeSyncCalls.length === 1 &&
-      runtimePutDraftByteOwnerCalls.length === 1 &&
-      !callHasIterationAncestor(runtimeSyncCalls[0], runtimePutDraft) &&
-      !callHasIterationAncestor(runtimePutDraftByteOwnerCalls[0], runtimePutDraft) &&
-      objectPropertyInitializer(runtimeSyncInputObject, 'ownerKind')?.getText(
-        mutationRuntimeSource,
-      ) === "'draft'" &&
-      objectPropertyInitializer(runtimeSyncInputObject, 'ownerId')?.getText(
-        mutationRuntimeSource,
-      ) === 'normalized.chatId' &&
-      objectPropertyInitializer(runtimeSyncInputObject, 'chatId')?.getText(
-        mutationRuntimeSource,
-      ) === 'normalized.chatId' &&
-      objectPropertyInitializer(runtimeSyncInputObject, 'previousRefs')?.getText(
-        mutationRuntimeSource,
-      ) === 'existing?.attachmentRefs' &&
-      objectPropertyInitializer(runtimeSyncInputObject, 'nextRefs')?.getText(
-        mutationRuntimeSource,
-      ) === 'normalized.attachmentRefs' &&
-      runtimeSyncInputObject
-        ?.getText(mutationRuntimeSource)
-        .includes('{ validateUnchangedTargets: true }') === true &&
-      executableCalls(syncAttachmentReferenceOwner).filter((call) =>
-        callResolvesTo(checker, call, applyAttachmentTransitionsOwner),
-      ).length === 1 &&
-      transitionCalls.filter((call) => callResolvesTo(checker, call, requireAttachmentTargetsOwner))
-        .length === 1 &&
+      countOccurrences(
+        runtimePutDraft.getText(mutationRuntimeSource),
+        'await syncAttachmentReferenceOwner({',
+      ) === 1 &&
+      countOccurrences(
+        runtimePutDraft.getText(mutationRuntimeSource),
+        'await putDraftByteOwner(tx, normalized, existing)',
+      ) === 1 &&
+      runtimePutDraft.getText(mutationRuntimeSource).includes("ownerKind: 'draft'") &&
+      runtimePutDraft.getText(mutationRuntimeSource).includes('ownerId: normalized.chatId') &&
+      runtimePutDraft.getText(mutationRuntimeSource).includes('chatId: normalized.chatId') &&
+      runtimePutDraft
+        .getText(mutationRuntimeSource)
+        .includes('previousRefs: existing?.attachmentRefs') &&
+      runtimePutDraft
+        .getText(mutationRuntimeSource)
+        .includes('nextRefs: normalized.attachmentRefs') &&
+      runtimePutDraft
+        .getText(mutationRuntimeSource)
+        .includes('draftOptions?.validateAttachmentTargets') &&
+      runtimePutDraft
+        .getText(mutationRuntimeSource)
+        .includes('{ validateUnchangedTargets: true }') &&
+      !runtimePutDraft.getText(mutationRuntimeSource).includes('for (') &&
+      !runtimePutDraft.getText(mutationRuntimeSource).includes('while (') &&
+      syncAttachmentReferenceOwner
+        .getText(mutationRuntimeSource)
+        .includes('await applyAttachmentReferenceOwnerTransitions(tx, [input], now,') &&
+      attachmentTransitionText.includes('await requireAttachmentTargets(tx, [...nextTargetIds])') &&
       runBrowserMutationText.includes(
         'const draftReads = new Map<ChatId, DraftRow | undefined>()',
       ) &&
       runBrowserMutationText.includes("tableName: 'drafts'") &&
-      runBrowserMutationText.includes('if (operationPlan.descriptor.exactPhysicalReads)') &&
+      runBrowserMutationText.includes('if (operationPlan.descriptor.exactPhysicalReads &&') &&
       requireAttachmentTargetsText.includes(
         "table<AttachmentHeaderRow, AttachmentId>('attachments')",
       ) &&
@@ -6922,6 +6949,10 @@ function scopeDerivedMutationCapabilityFacts(
     runBrowserMutation,
     'deleteAttachmentBytes',
   )
+  const runtimeDeleteAttachmentBytesForHeader = findNestedVariableFunction(
+    runBrowserMutation,
+    'deleteAttachmentBytesForHeader',
+  )
   const deleteReferencedAttachmentBytes = findFunction(
     attachmentsSource,
     'deleteReferencedAttachmentBytes',
@@ -6942,7 +6973,10 @@ function scopeDerivedMutationCapabilityFacts(
   const attachmentBytesContextCalls = attachmentBytesCallbackCalls.filter((call) =>
     callResolvesTo(checker, call, repositoryDeleteAttachmentBytes),
   )
-  const runtimeAttachmentBytesCalls = executableCalls(runtimeDeleteAttachmentBytes)
+  const runtimeAttachmentBytesCalls = [
+    ...executableCalls(runtimeDeleteAttachmentBytes),
+    ...executableCalls(runtimeDeleteAttachmentBytesForHeader),
+  ]
   const runtimeAttachmentBytesPhysicalReads = runtimeAttachmentBytesCalls
     .filter(
       (call) =>
@@ -7139,7 +7173,7 @@ function scopeDerivedMutationCapabilityFacts(
       attachmentBytesHeaderWriteCalls.length === 1 &&
       attachmentBytesCatalogWriteCalls.length === 1 &&
       attachmentBytesWriterCalls.every(
-        (call) => !callHasIterationAncestor(call, runtimeDeleteAttachmentBytes),
+        (call) => !callHasIterationAncestor(call, runtimeDeleteAttachmentBytesForHeader),
       ),
     exactEffectReceipt:
       attachmentBytesReceiptAbsorbCalls.length === 1 &&
@@ -7188,6 +7222,14 @@ function scopeDerivedMutationCapabilityFacts(
       !runtimeDeleteAttachmentBytes.getText(mutationRuntimeSource).includes('setTimeout(') &&
       !runtimeDeleteAttachmentBytes.getText(mutationRuntimeSource).includes('.withLocks(') &&
       !runtimeDeleteAttachmentBytes.getText(mutationRuntimeSource).includes('catch (') &&
+      !runtimeDeleteAttachmentBytesForHeader.getText(mutationRuntimeSource).includes('for (;;)') &&
+      !runtimeDeleteAttachmentBytesForHeader
+        .getText(mutationRuntimeSource)
+        .includes('setTimeout(') &&
+      !runtimeDeleteAttachmentBytesForHeader
+        .getText(mutationRuntimeSource)
+        .includes('.withLocks(') &&
+      !runtimeDeleteAttachmentBytesForHeader.getText(mutationRuntimeSource).includes('catch (') &&
       !runtimeDeleteAttachmentBytes
         .getText(mutationRuntimeSource)
         .includes('recordObsoleteByteOwnerValues('),
@@ -7195,12 +7237,14 @@ function scopeDerivedMutationCapabilityFacts(
       runtimeDeleteAttachmentBytes
         .getText(mutationRuntimeSource)
         .includes('if (!header) return undefined') &&
-      runtimeDeleteAttachmentBytes
+      runtimeDeleteAttachmentBytesForHeader
         .getText(mutationRuntimeSource)
         .includes(
           'if (!payloadChanged && stableStringify(unchangedHeader) === stableStringify(header))',
         ) &&
-      runtimeDeleteAttachmentBytes.getText(mutationRuntimeSource).includes('return current'),
+      runtimeDeleteAttachmentBytesForHeader
+        .getText(mutationRuntimeSource)
+        .includes('return current'),
     ...attachmentBytesRuntimeSingleAttempt,
   })
   for (const [name, proved] of Object.entries(attachmentBytesCommon)) {
@@ -7544,6 +7588,10 @@ function scopeDerivedMutationCapabilityFacts(
     runBrowserMutation,
     'deleteAttachmentOwnerBundle',
   )
+  const runtimeReadAttachmentDispositionState = findNestedVariableFunction(
+    runBrowserMutation,
+    'readAttachmentDispositionState',
+  )
   const applicationDeleteAttachmentIfUnreferenced = findFunction(
     attachmentsSource,
     'deleteUnreferencedAttachment',
@@ -7568,6 +7616,7 @@ function scopeDerivedMutationCapabilityFacts(
   const runtimeAttachmentDeleteBundleCalls = executableCalls(runtimeDeleteAttachmentOwnerBundle)
   const runtimeAttachmentDeletePhysicalReads = [
     ...runtimeAttachmentDeleteCalls,
+    ...executableCalls(runtimeReadAttachmentDispositionState),
     ...runtimeAttachmentDeleteBundleCalls,
   ]
     .filter(
@@ -7683,8 +7732,13 @@ function scopeDerivedMutationCapabilityFacts(
       compileScopesText.includes("builder.addMutationTable('attachments', 'attachment')"),
     exactPhysicalReads:
       runtimeAttachmentDeletePhysicalReads.length === 6 &&
-      hasAttachmentDeletePhysicalRead('attachments', 'primary', 'get', '1') &&
-      hasAttachmentDeletePhysicalRead('attachmentCatalogRows', 'primary', 'get', '1') &&
+      hasAttachmentDeletePhysicalRead('attachments', 'primary', 'get', 'header ? 1 : 0') &&
+      hasAttachmentDeletePhysicalRead(
+        'attachmentCatalogRows',
+        'primary',
+        'get',
+        'catalogRow ? 1 : 0',
+      ) &&
       hasAttachmentDeletePhysicalRead(
         'attachmentRefEdges',
         'secondary',
@@ -7771,20 +7825,20 @@ function scopeDerivedMutationCapabilityFacts(
       !attachmentDeleteOwner.getText(browserRepoSource).includes('setTimeout(') &&
       !attachmentDeleteOwner.getText(browserRepoSource).includes('.withLocks(') &&
       !attachmentDeleteOwner.getText(browserRepoSource).includes('catch (') &&
-      runtimeDeleteAttachmentIfUnreferenced
+      runtimeReadAttachmentDispositionState
         .getText(mutationRuntimeSource)
         .includes(".where('attachmentId')") &&
-      runtimeDeleteAttachmentIfUnreferenced.getText(mutationRuntimeSource).includes('.first()') &&
-      !runtimeDeleteAttachmentIfUnreferenced
+      runtimeReadAttachmentDispositionState.getText(mutationRuntimeSource).includes('.first()') &&
+      !runtimeReadAttachmentDispositionState
         .getText(mutationRuntimeSource)
         .includes('.toArray()') &&
-      !runtimeDeleteAttachmentIfUnreferenced
+      !runtimeReadAttachmentDispositionState
         .getText(mutationRuntimeSource)
         .includes('attachmentReferenceCounts(') &&
-      !runtimeDeleteAttachmentIfUnreferenced
+      !runtimeReadAttachmentDispositionState
         .getText(mutationRuntimeSource)
         .includes('requireNoAttachmentReferences(') &&
-      !runtimeDeleteAttachmentIfUnreferenced
+      !runtimeReadAttachmentDispositionState
         .getText(mutationRuntimeSource)
         .includes('hydrateStoredAttachment(') &&
       !runtimeDeleteAttachmentIfUnreferenced.getText(mutationRuntimeSource).includes('for (;;)') &&
@@ -7814,6 +7868,392 @@ function scopeDerivedMutationCapabilityFacts(
     attachmentDeleteCommon.runningRuntimeSingleInvoke &&
     attachmentDeleteCommon.waitingRuntimeSingleInvoke &&
     attachmentDeleteCommon.admittedRootSingleInvoke
+  const attachmentDeleteManyOwner = findMethod(
+    browserRepoSource,
+    'BrowserWorkspaceRepository',
+    'deleteManyAttachments',
+  )
+  const repositoryDeleteAttachmentForStorage = findInterfaceMethod(
+    repositorySource,
+    'MutationContext',
+    'deleteAttachmentForStorage',
+  )
+  const runtimeDeleteAttachmentForStorage = findNestedObjectPropertyFunction(
+    runBrowserMutation,
+    'deleteAttachmentForStorage',
+  )
+  const runtimeGetAttachmentCatalogRevision = findNestedObjectPropertyFunction(
+    runBrowserMutation,
+    'getAttachmentCatalogRevision',
+  )
+  const executeAttachmentBulkDelete = findFunction(
+    attachmentBulkDeleteSource,
+    'executeAttachmentBulkDelete',
+  )
+  const attachmentDeleteManyConstructors = constructors.get('attachment.delete-many') ?? []
+  const attachmentDeleteManyOwnerCalls = executableCalls(attachmentDeleteManyOwner)
+  const attachmentDeleteManyRunMutationCalls = attachmentDeleteManyOwnerCalls.filter((call) =>
+    callResolvesTo(checker, call, repositoryRunMutation),
+  )
+  const attachmentDeleteManyRunMutationCall = attachmentDeleteManyRunMutationCalls[0]
+  const attachmentDeleteManyMutationCallback = attachmentDeleteManyRunMutationCall?.arguments[1]
+    ? unwrap(attachmentDeleteManyRunMutationCall.arguments[1])
+    : undefined
+  const attachmentDeleteManyCallbackCalls =
+    attachmentDeleteManyMutationCallback && ts.isFunctionLike(attachmentDeleteManyMutationCallback)
+      ? executableCalls(attachmentDeleteManyMutationCallback)
+      : []
+  const attachmentDeleteManyContextCalls = attachmentDeleteManyCallbackCalls.filter((call) =>
+    callResolvesTo(checker, call, repositoryDeleteAttachmentForStorage),
+  )
+  const runtimeAttachmentDeleteManyCalls = executableCalls(runtimeDeleteAttachmentForStorage)
+  const runtimeAttachmentDeleteManyPhysicalReads = executableCalls(
+    runtimeReadAttachmentDispositionState,
+  )
+    .filter(
+      (call) =>
+        call.expression.getText(mutationRuntimeSource) === 'receiptAccumulator.physicalRead',
+    )
+    .map((call) => (call.arguments[0] ? unwrap(call.arguments[0]) : undefined))
+    .filter((node) => node && ts.isObjectLiteralExpression(node))
+  const hasAttachmentDeleteManyPhysicalRead = (
+    tableName,
+    indexKind,
+    operation,
+    rowCount,
+    indexName = undefined,
+  ) =>
+    runtimeAttachmentDeleteManyPhysicalReads.some(
+      (read) =>
+        objectPropertyInitializer(read, 'tableName')?.getText(mutationRuntimeSource) ===
+          `'${tableName}'` &&
+        objectPropertyInitializer(read, 'indexKind')?.getText(mutationRuntimeSource) ===
+          `'${indexKind}'` &&
+        objectPropertyInitializer(read, 'operation')?.getText(mutationRuntimeSource) ===
+          `'${operation}'` &&
+        (indexName === undefined ||
+          objectPropertyInitializer(read, 'indexName')?.getText(mutationRuntimeSource) ===
+            `'${indexName}'`) &&
+        objectPropertyInitializer(read, 'requestCount')?.getText(mutationRuntimeSource) === '1' &&
+        objectPropertyInitializer(read, 'rowCount')?.getText(mutationRuntimeSource) === rowCount,
+    )
+  const attachmentDeleteManyBundleCalls = runtimeAttachmentDeleteManyCalls.filter((call) =>
+    callResolvesTo(checker, call, runtimeDeleteAttachmentOwnerBundle),
+  )
+  const attachmentDeleteManyBytesCalls = runtimeAttachmentDeleteManyCalls.filter((call) =>
+    callResolvesTo(checker, call, runtimeDeleteAttachmentBytesForHeader),
+  )
+  const attachmentDeleteManyApplicationCalls = executableCalls(executeAttachmentBulkDelete)
+  const attachmentDeleteManyActionCalls = attachmentDeleteManyApplicationCalls.filter(
+    (call) => call.expression.getText(attachmentBulkDeleteSource) === 'runWorkspaceAction',
+  )
+  const attachmentDeleteManyActionCallback = attachmentDeleteManyActionCalls[0]?.arguments[1]
+    ? unwrap(attachmentDeleteManyActionCalls[0].arguments[1])
+    : undefined
+  const attachmentDeleteManyExecuteCalls =
+    attachmentDeleteManyActionCallback && ts.isFunctionLike(attachmentDeleteManyActionCallback)
+      ? executableCalls(attachmentDeleteManyActionCallback).filter((call) =>
+          call.expression.getText(attachmentBulkDeleteSource).endsWith('.execute'),
+        )
+      : []
+  const attachmentDeleteManyRuntimeSingleAttempt = workspaceRuntimeSingleAttemptFacts(program)
+  const attachmentDeleteManyRuntimeText =
+    runtimeDeleteAttachmentForStorage.getText(mutationRuntimeSource)
+  const attachmentDeleteManyApplicationText = executeAttachmentBulkDelete.getText(
+    attachmentBulkDeleteSource,
+  )
+  const attachmentDeleteManyCommon = Object.freeze({
+    exactOccurrencePolicy:
+      fixedPolicyBodies.get('attachment.delete-many')?.includes('exactOccurrence: true') === true &&
+      mutationPlanSource
+        .getText()
+        .includes('receiptPolicy?.exactOccurrence || receiptPolicy?.exactPlan'),
+    typedReplayPolicy:
+      fixedPolicyBodies
+        .get('attachment.delete-many')
+        ?.includes("replayReason: 'non-replayable'") === true,
+    oneSemanticRoute:
+      attachmentDeleteManyRunMutationCalls.length === 1 &&
+      attachmentDeleteManyContextCalls.length === 1 &&
+      attachmentDeleteManyRunMutationCall?.arguments[0]
+        ?.getText(browserRepoSource)
+        .includes("({ kind: 'attachment', attachmentId })") === true &&
+      attachmentDeleteManyContextCalls[0]?.arguments[0]?.getText(browserRepoSource) ===
+        'attachmentId' &&
+      attachmentDeleteManyContextCalls[0]?.arguments[1]?.getText(browserRepoSource) ===
+        'input.reason' &&
+      attachmentDeleteManyContextCalls[0]?.arguments[2]?.getText(browserRepoSource) ===
+        'input.now' &&
+      countOccurrences(
+        attachmentDeleteManyOwner.getText(browserRepoSource),
+        'ctx.deleteAttachmentForStorage(',
+      ) === 1 &&
+      !attachmentDeleteManyOwner.getText(browserRepoSource).includes('ctx.getAttachment(') &&
+      !attachmentDeleteManyOwner
+        .getText(browserRepoSource)
+        .includes('ctx.countAttachmentReferences(') &&
+      !attachmentDeleteManyOwner.getText(browserRepoSource).includes('ctx.deleteAttachment(') &&
+      !attachmentDeleteManyOwner.getText(browserRepoSource).includes('ctx.deleteAttachmentBytes('),
+    completeAttachmentTransactionProfile:
+      !scopeProfileText.includes("command.kind === 'attachment.delete-many'") &&
+      compileScopesText.includes("['attachmentCatalogAggregate', 'attachmentCatalogRows']") &&
+      compileScopesText.includes(
+        "builder.addMutationTables(['attachmentArtifacts', 'attachmentBlobs'], 'attachment')",
+      ) &&
+      compileScopesText.includes("builder.addMutationTable('attachmentJobs', 'attachment-job')") &&
+      compileScopesText.includes("builder.addMutationTable('attachmentRefEdges', 'attachment')") &&
+      compileScopesText.includes("builder.addMutationTable('attachments', 'attachment')"),
+    exactPhysicalReads:
+      runtimeAttachmentDeleteManyPhysicalReads.length === 3 &&
+      hasAttachmentDeleteManyPhysicalRead('attachments', 'primary', 'get', 'header ? 1 : 0') &&
+      hasAttachmentDeleteManyPhysicalRead(
+        'attachmentCatalogRows',
+        'primary',
+        'get',
+        'catalogRow ? 1 : 0',
+      ) &&
+      hasAttachmentDeleteManyPhysicalRead(
+        'attachmentRefEdges',
+        'secondary',
+        'query',
+        'firstReference ? 1 : 0',
+        'attachmentId',
+      ) &&
+      runtimeGetAttachmentCatalogRevision
+        .getText(mutationRuntimeSource)
+        .includes("tableName: 'attachmentCatalogAggregate'") &&
+      runBrowserMutationText.includes('if (options?.expectedAttachmentCatalogRevision') &&
+      runBrowserMutationText.includes("tableName: 'attachmentCatalogAggregate'"),
+    currentStateTransition:
+      attachmentDeleteManyBundleCalls.length === 1 &&
+      attachmentDeleteManyBytesCalls.length === 1 &&
+      attachmentDeleteManyBundleCalls[0]?.arguments[1]?.getText(mutationRuntimeSource) ===
+        'current.header' &&
+      attachmentDeleteManyBytesCalls[0]?.arguments[1]?.getText(mutationRuntimeSource) ===
+        'current.header' &&
+      runtimeReadAttachmentDispositionState.getText(mutationRuntimeSource).includes('.first()') &&
+      !attachmentDeleteManyRuntimeText.includes('.toArray()') &&
+      !attachmentDeleteManyRuntimeText.includes('hydrateStoredAttachment(') &&
+      !attachmentDeleteManyRuntimeText.includes('attachmentReferenceCounts(') &&
+      !attachmentDeleteManyRuntimeText.includes('requireNoAttachmentReferences('),
+    exactEffectReceipt:
+      attachmentDeleteCommon.exactEffectReceipt &&
+      attachmentBytesCommon.exactEffectReceipt &&
+      attachmentDeleteManyBundleCalls[0]?.arguments[2]?.getText(mutationRuntimeSource) ===
+        'current.catalogRow' &&
+      attachmentDeleteManyBytesCalls[0]?.arguments[4]?.getText(mutationRuntimeSource) ===
+        'current.catalogRow' &&
+      attachmentDeleteManyRuntimeText.includes(
+        'await deleteAttachmentOwnerBundle(attachmentId, current.header, current.catalogRow)',
+      ) &&
+      attachmentDeleteManyRuntimeText.includes('await deleteAttachmentBytesForHeader('),
+    oneApplicationSubmission:
+      attachmentDeleteManyConstructors.length === 1 &&
+      attachmentDeleteManyConstructors[0]?.path === ATTACHMENT_BULK_DELETE_PATH &&
+      attachmentDeleteManyConstructors[0]?.owner === 'executeAttachmentBulkDelete' &&
+      attachmentDeleteManyActionCalls.length === 1 &&
+      attachmentDeleteManyExecuteCalls.length === 1 &&
+      countOccurrences(attachmentDeleteManyApplicationText, '.execute(') === 1 &&
+      attachmentDeleteManyApplicationText.includes('index += BULK_DELETE_COMMAND_SIZE') &&
+      attachmentDeleteManyApplicationText.includes(
+        '.slice(index, index + BULK_DELETE_COMMAND_SIZE)',
+      ) &&
+      attachmentDeleteManyApplicationText.includes(
+        'expectedCatalogRevision = result.catalogRevision',
+      ) &&
+      attachmentDeleteManyApplicationText.includes('AttachmentBulkDeleteCursorDidNotAdvance') &&
+      !attachmentDeleteManyApplicationText.includes('catch (') &&
+      !attachmentDeleteManyApplicationText.includes('setTimeout(') &&
+      !attachmentDeleteManyApplicationText.includes('return executeAttachmentBulkDelete('),
+    noRetryOrBroadPlanning:
+      !attachmentDeleteManyOwner.getText(browserRepoSource).includes('for (;;)') &&
+      !attachmentDeleteManyOwner.getText(browserRepoSource).includes('setTimeout(') &&
+      !attachmentDeleteManyOwner.getText(browserRepoSource).includes('.withLocks(') &&
+      !attachmentDeleteManyOwner.getText(browserRepoSource).includes('catch (') &&
+      !attachmentDeleteManyRuntimeText.includes('for (;;)') &&
+      !attachmentDeleteManyRuntimeText.includes('setTimeout(') &&
+      !attachmentDeleteManyRuntimeText.includes('.withLocks(') &&
+      !attachmentDeleteManyRuntimeText.includes('catch ('),
+    ...attachmentDeleteManyRuntimeSingleAttempt,
+  })
+  for (const [name, proved] of Object.entries(attachmentDeleteManyCommon)) {
+    if (!proved) outputProblems.push(`attachment delete-many mutation family missing ${name}`)
+  }
+  const attachmentDeleteManyTablesProved =
+    commonConsumed &&
+    attachmentDeleteManyCommon.oneSemanticRoute &&
+    attachmentDeleteManyCommon.completeAttachmentTransactionProfile &&
+    attachmentDeleteManyCommon.exactPhysicalReads &&
+    attachmentDeleteManyCommon.currentStateTransition &&
+    attachmentDeleteManyCommon.noRetryOrBroadPlanning
+  const attachmentDeleteManyReceiptProved =
+    attachmentDeleteManyTablesProved &&
+    attachmentDeleteManyCommon.exactOccurrencePolicy &&
+    attachmentDeleteManyCommon.exactEffectReceipt
+  const attachmentDeleteManyReplayProved =
+    commonConsumed &&
+    attachmentDeleteManyCommon.typedReplayPolicy &&
+    attachmentDeleteManyCommon.oneApplicationSubmission &&
+    attachmentDeleteManyCommon.runningRuntimeSingleInvoke &&
+    attachmentDeleteManyCommon.waitingRuntimeSingleInvoke &&
+    attachmentDeleteManyCommon.admittedRootSingleInvoke
+  const attachmentReapOwner = findMethod(
+    browserRepoSource,
+    'BrowserWorkspaceRepository',
+    'reapAttachments',
+  )
+  const attachmentReapPlanOwner = findFunction(browserRepoSource, 'readAttachmentReapPlan')
+  const attachmentReapReplayOwner = findFunction(browserRepoSource, 'attachmentReapReplayPlan')
+  const storageRetentionCommitOwner = findFunction(browserRepoSource, 'commitStorageRetentionPage')
+  const repositoryReapAttachment = findInterfaceMethod(
+    repositorySource,
+    'MutationContext',
+    'reapAttachmentIfEligible',
+  )
+  const runtimeReapAttachment = findNestedObjectPropertyFunction(
+    runBrowserMutation,
+    'reapAttachmentIfEligible',
+  )
+  const attachmentReapRunMutationCalls = executableCalls(attachmentReapOwner).filter((call) =>
+    callResolvesTo(checker, call, repositoryRunMutation),
+  )
+  const attachmentReapRunMutationCall = attachmentReapRunMutationCalls[0]
+  const attachmentReapCallback = attachmentReapRunMutationCall?.arguments[1]
+    ? unwrap(attachmentReapRunMutationCall.arguments[1])
+    : undefined
+  const attachmentReapContextCalls =
+    attachmentReapCallback && ts.isFunctionLike(attachmentReapCallback)
+      ? executableCalls(attachmentReapCallback).filter((call) =>
+          callResolvesTo(checker, call, repositoryReapAttachment),
+        )
+      : []
+  const attachmentReapExtension = attachmentReapRunMutationCall?.arguments[5]
+    ? unwrap(attachmentReapRunMutationCall.arguments[5])
+    : undefined
+  const attachmentReapExtensionText = attachmentReapExtension?.getText(browserRepoSource) ?? ''
+  const attachmentReapOwnerText = attachmentReapOwner.getText(browserRepoSource)
+  const attachmentReapPlanText = attachmentReapPlanOwner.getText(browserRepoSource)
+  const attachmentReapReplayText = attachmentReapReplayOwner.getText(browserRepoSource)
+  const runtimeReapAttachmentText = runtimeReapAttachment.getText(mutationRuntimeSource)
+  const runtimeAttachmentDispositionText =
+    runtimeReadAttachmentDispositionState.getText(mutationRuntimeSource)
+  const storageRetentionCommitText = storageRetentionCommitOwner.getText(browserRepoSource)
+  const attachmentReapConstructors = constructors.get('attachment.reap') ?? []
+  const storageMaintenanceText = storageMaintenanceSource.getText()
+  const attachmentReapCommon = Object.freeze({
+    oneTypedPreflight:
+      countOccurrences(attachmentReapOwnerText, 'readAttachmentReapPlan(') === 1 &&
+      countOccurrences(attachmentReapPlanText, 'commit.readSemanticOperationPreflight(') === 1 &&
+      countOccurrences(
+        attachmentReapPlanText,
+        "readStorageRetentionState(tx, 'attachment-reap')",
+      ) === 1 &&
+      countOccurrences(attachmentReapPlanText, ".where('[refCount+unreferencedAt+id]')") === 1 &&
+      attachmentReapPlanText.includes('.limit(limit)') &&
+      attachmentReapPlanText.includes('.toArray()') &&
+      !attachmentReapOwnerText.includes('this.openDb()') &&
+      !browserRepoSource.getText().includes('listAttachmentReapCandidates'),
+    exactPreflightReceipt:
+      browserRepoSource
+        .getText()
+        .includes("physicalStorageTables('attachments', 'storageRetentionState')") &&
+      attachmentReapPlanText.includes("tableName: 'storageRetentionState'") &&
+      attachmentReapPlanText.includes("indexKind: 'primary'") &&
+      attachmentReapPlanText.includes("tableName: 'attachments'") &&
+      attachmentReapPlanText.includes("indexName: '[refCount+unreferencedAt+id]'") &&
+      attachmentReapPlanText.includes('rowCount: plan.candidates.length'),
+    oneSemanticRoute:
+      attachmentReapRunMutationCalls.length === 1 &&
+      attachmentReapContextCalls.length === 1 &&
+      attachmentReapContextCalls[0]?.arguments[0]?.getText(browserRepoSource) === 'attachmentId' &&
+      attachmentReapContextCalls[0]?.arguments[1]?.getText(browserRepoSource) === 'cycle.cutoff' &&
+      countOccurrences(attachmentReapOwnerText, 'ctx.reapAttachmentIfEligible(') === 1 &&
+      !attachmentReapOwnerText.includes('ctx.getAttachmentReclamationState(') &&
+      !attachmentReapOwnerText.includes('ctx.countAttachmentReferences(') &&
+      !attachmentReapOwnerText.includes('ctx.deleteAttachment('),
+    sharedCurrentStateTransition:
+      countOccurrences(runtimeReapAttachmentText, 'readAttachmentDispositionState(') === 1 &&
+      countOccurrences(runtimeReapAttachmentText, 'deleteAttachmentOwnerBundle(') === 1 &&
+      runtimeAttachmentDispositionText.includes(".where('attachmentId')") &&
+      runtimeAttachmentDispositionText.includes('.first()') &&
+      !runtimeAttachmentDispositionText.includes('.toArray()') &&
+      !runtimeAttachmentDispositionText.includes('attachmentReferenceCounts(') &&
+      runtimeReapAttachmentText.includes('state.firstReference') &&
+      runtimeReapAttachmentText.includes('!state.catalogRow') &&
+      runtimeReapAttachmentText.includes('state.header.unreferencedAt >= cutoff') &&
+      runtimeReapAttachmentText.includes(
+        'deleteAttachmentOwnerBundle(attachmentId, state.header, state.catalogRow)',
+      ),
+    exactTransactionReceipt:
+      countOccurrences(attachmentReapExtensionText, "indexName: '[refCount+unreferencedAt+id]'") ===
+        2 &&
+      countOccurrences(attachmentReapExtensionText, 'receipt.physicalRead({') === 2 &&
+      attachmentReapExtensionText.includes(
+        'receipt.absorb(await commitStorageRetentionPage(tx, cycle, outcome))',
+      ) &&
+      storageRetentionCommitText.includes("tableName: 'storageRetentionState'") &&
+      storageRetentionCommitText.includes("operation: 'get'") &&
+      storageRetentionCommitText.includes("operation: 'write'"),
+    completeTransactionProfile:
+      compileScopesText.includes("['attachmentCatalogAggregate', 'attachmentCatalogRows']") &&
+      compileScopesText.includes(
+        "builder.addMutationTables(['attachmentArtifacts', 'attachmentBlobs'], 'attachment')",
+      ) &&
+      compileScopesText.includes("builder.addMutationTable('attachmentJobs', 'attachment-job')") &&
+      compileScopesText.includes("builder.addMutationTable('attachmentRefEdges', 'attachment')") &&
+      compileScopesText.includes("builder.addMutationTable('attachments', 'attachment')") &&
+      attachmentReapExtensionText.includes("readTableNames: ['attachments']") &&
+      attachmentReapExtensionText.includes("writeTableNames: ['storageRetentionState']"),
+    exactEffectReceipt:
+      attachmentDeleteCommon.exactEffectReceipt &&
+      runtimeReapAttachmentText.includes(
+        'deleteAttachmentOwnerBundle(attachmentId, state.header, state.catalogRow)',
+      ),
+    typedDurableReplay:
+      attachmentReapExtensionText.includes('exactOccurrence: true') &&
+      attachmentReapExtensionText.includes('attachmentReapReplayPlan(cycle, limit)') &&
+      attachmentReapReplayText.includes("kind: 'durable-page-resume'") &&
+      attachmentReapReplayText.includes("owner: 'storage-retention:attachment-reap'") &&
+      attachmentReapReplayText.includes('cycle: cycle.cycleNow') &&
+      attachmentReapReplayText.includes('revision: cycle.expectedRevision') &&
+      attachmentReapReplayText.includes('cursor: stableStringify(cycle.cursor ?? null)') &&
+      attachmentReapReplayText.includes('doneMarker: `cutoff:${cycle.cutoff}`') &&
+      attachmentReapReplayText.includes('limit') &&
+      mutationPlanSource.getText().includes('extensionReceipt?: {') &&
+      mutationPlanSource.getText().includes('replayPlan: extensionReceipt.replay') &&
+      runBrowserMutationText.includes('transactionExtension?.receipt'),
+    oneMaintenanceIngress:
+      attachmentReapConstructors.length === 1 &&
+      attachmentReapConstructors[0]?.path === 'src/store/storage-maintenance-runtime.ts' &&
+      attachmentReapConstructors[0]?.owner === 'StorageMaintenanceController.<computed-method>' &&
+      countOccurrences(storageMaintenanceText, "kind: 'attachment.reap'") === 1,
+    noRetryOrBroadPlanning:
+      !attachmentReapOwnerText.includes('for (;;)') &&
+      !attachmentReapOwnerText.includes('setTimeout(') &&
+      !attachmentReapOwnerText.includes('catch (') &&
+      !attachmentReapPlanText.includes('for (;;)') &&
+      !runtimeReapAttachmentText.includes('for (;;)') &&
+      !runtimeReapAttachmentText.includes('setTimeout('),
+  })
+  for (const [name, proved] of Object.entries(attachmentReapCommon)) {
+    if (!proved) outputProblems.push(`attachment reap mutation family missing ${name}`)
+  }
+  const attachmentReapTablesProved =
+    commonConsumed &&
+    attachmentReapCommon.oneTypedPreflight &&
+    attachmentReapCommon.exactPreflightReceipt &&
+    attachmentReapCommon.oneSemanticRoute &&
+    attachmentReapCommon.sharedCurrentStateTransition &&
+    attachmentReapCommon.completeTransactionProfile &&
+    attachmentReapCommon.noRetryOrBroadPlanning
+  const attachmentReapReceiptProved =
+    attachmentReapTablesProved &&
+    attachmentReapCommon.exactTransactionReceipt &&
+    attachmentReapCommon.exactEffectReceipt
+  const attachmentReapReplayProved =
+    commonConsumed &&
+    attachmentReapCommon.typedDurableReplay &&
+    attachmentReapCommon.oneMaintenanceIngress
   const presentationMessageCommon = Object.freeze({
     exhaustiveTypedAccess:
       messageVariants.length === 4 &&
@@ -7922,12 +8362,12 @@ function scopeDerivedMutationCapabilityFacts(
         runBrowserMutationText,
         "commandCommit.command.kind === 'chat.materialize-temporary'",
       ) === 1 &&
-      countOccurrences(
-        runBrowserMutationText,
-        'if (operationPlan.descriptor.exactPhysicalReads)',
-      ) === 2 &&
+      runBrowserMutationText.includes(
+        'const initialRead = await chatMutation.readWithEvidence(initialChat.id)',
+      ) &&
       runBrowserMutationText.includes("tableName: 'chats'") &&
       runBrowserMutationText.includes("operation: 'get'") &&
+      runBrowserMutationText.includes('requestCount: initialRead.requestCount') &&
       runBrowserMutationText.includes('receiptAccumulator.physicalRead({'),
     admittedInputBounds:
       materializeExactPlanText.includes('const links = configurationLinksForChat(initialChat)') &&
@@ -8066,9 +8506,8 @@ function scopeDerivedMutationCapabilityFacts(
       startClaimedGenerationText.includes(
         'const { streamId, chatId, assistantMessageId, userMessageId } = claim',
       ) &&
-      runGenerationText.includes(
-        'const leaseAdmission = preparedStreamLeaseAdmission(input, preparedIntent, input.now())',
-      ) &&
+      runGenerationText.includes('const leaseAdmission = preparedStreamLeaseAdmission(') &&
+      runGenerationText.includes('admission.placement.createdAt,') &&
       runGenerationText.includes(
         'preparedState = await prepareAttempt({ ...input, admission, lease: leaseAdmission })',
       ),
@@ -8267,7 +8706,9 @@ function scopeDerivedMutationCapabilityFacts(
         (variant === 'draft.put' && draftPutReceiptProved) ||
         (variant === 'attachment.bytes.delete' && attachmentBytesReceiptProved) ||
         (variant === 'attachment.bundle.write' && attachmentBundleReceiptProved) ||
-        (variant === 'attachment.delete-if-unreferenced' && attachmentDeleteReceiptProved),
+        (variant === 'attachment.delete-if-unreferenced' && attachmentDeleteReceiptProved) ||
+        (variant === 'attachment.delete-many' && attachmentDeleteManyReceiptProved) ||
+        (variant === 'attachment.reap' && attachmentReapReceiptProved),
       tablesProved:
         (messageVariants.includes(variant) && presentationMessageProved) ||
         (variant === 'chat.materialize-temporary' && materializeProved) ||
@@ -8277,7 +8718,9 @@ function scopeDerivedMutationCapabilityFacts(
         (variant === 'draft.put' && draftPutTablesProved) ||
         (variant === 'attachment.bytes.delete' && attachmentBytesTablesProved) ||
         (variant === 'attachment.bundle.write' && attachmentBundleTablesProved) ||
-        (variant === 'attachment.delete-if-unreferenced' && attachmentDeleteTablesProved),
+        (variant === 'attachment.delete-if-unreferenced' && attachmentDeleteTablesProved) ||
+        (variant === 'attachment.delete-many' && attachmentDeleteManyTablesProved) ||
+        (variant === 'attachment.reap' && attachmentReapTablesProved),
       boundsProved:
         (messageVariants.includes(variant) && presentationMessageProved) ||
         (variant === 'chat.materialize-temporary' && materializeProved) ||
@@ -8291,7 +8734,9 @@ function scopeDerivedMutationCapabilityFacts(
         (variant === 'draft.put' && draftPutReplayProved) ||
         (variant === 'attachment.bytes.delete' && attachmentBytesReplayProved) ||
         (variant === 'attachment.bundle.write' && attachmentBundleReplayProved) ||
-        (variant === 'attachment.delete-if-unreferenced' && attachmentDeleteReplayProved),
+        (variant === 'attachment.delete-if-unreferenced' && attachmentDeleteReplayProved) ||
+        (variant === 'attachment.delete-many' && attachmentDeleteManyReplayProved) ||
+        (variant === 'attachment.reap' && attachmentReapReplayProved),
     })
     routeFacts[variant] = Object.freeze({
       entries: Object.freeze(route.entries),
@@ -8349,6 +8794,14 @@ function scopeDerivedMutationCapabilityFacts(
       attachmentDeleteIfUnreferenced: Object.freeze({
         variant: 'attachment.delete-if-unreferenced',
         commonKernel: attachmentDeleteCommon,
+      }),
+      attachmentDeleteMany: Object.freeze({
+        variant: 'attachment.delete-many',
+        commonKernel: attachmentDeleteManyCommon,
+      }),
+      attachmentReap: Object.freeze({
+        variant: 'attachment.reap',
+        commonKernel: attachmentReapCommon,
       }),
     }),
     capabilities: Object.freeze(capabilities),

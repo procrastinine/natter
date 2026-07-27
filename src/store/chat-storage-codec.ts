@@ -1,5 +1,5 @@
 import type Dexie from 'dexie'
-import type { CreatingHookContext, Table, Transaction, UpdatingHookContext } from 'dexie'
+import type { CreatingHookContext, Table, UpdatingHookContext } from 'dexie'
 import type { Chat, ChatId } from '../core/types'
 import { exactCompoundPrefixBetween } from './indexeddb-key-ranges'
 import type { TemporaryChatCursor } from './storage-retention-state'
@@ -11,13 +11,6 @@ export interface ChatStoragePhysicalIndexFields {
 }
 
 type ChatStorageRow = Chat & ChatStoragePhysicalIndexFields
-
-const transactionCurrentChatBrand: unique symbol = Symbol('TransactionCurrentChat')
-const transactionCurrentChatRuntimeBrand = Symbol.for('natter.TransactionCurrentChat')
-
-export type TransactionCurrentChat = Chat & {
-  readonly [transactionCurrentChatBrand]: true
-}
 
 export interface ChatIdPage {
   readonly chatIds: readonly ChatId[]
@@ -74,58 +67,6 @@ export function installChatStorageCodec(db: Dexie): void {
     },
   )
   chats.hook('reading', (stored) => publicChat(stored))
-}
-
-export function currentChatRowForTransaction(tx: Transaction, row: Chat): TransactionCurrentChat {
-  if (transactionCurrentChatIdentity(row) !== transactionIdentity(tx)) {
-    throw new Error(`ChatRowPriorNotCurrentTransaction:${row.id}`)
-  }
-  return row as TransactionCurrentChat
-}
-
-export async function readCurrentChatForTransaction(
-  tx: Transaction,
-  id: ChatId,
-): Promise<TransactionCurrentChat | undefined> {
-  const row = await tx.table<Chat, ChatId>('chats').get(id)
-  if (!row) return undefined
-  markCurrentChatRow(row, transactionIdentity(tx))
-  return row as TransactionCurrentChat
-}
-
-export async function readCurrentChatRowsForTransaction(
-  tx: Transaction,
-  ids: readonly ChatId[],
-): Promise<readonly TransactionCurrentChat[]> {
-  const rows = await readOptionalCurrentChatRowsForTransaction(tx, ids)
-  return rows.map((row, index) => {
-    if (!row) throw new Error(`ChatRowPriorMissing:${ids[index] as ChatId}`)
-    return row
-  })
-}
-
-export async function readOptionalCurrentChatRowsForTransaction(
-  tx: Transaction,
-  ids: readonly ChatId[],
-): Promise<readonly (TransactionCurrentChat | undefined)[]> {
-  const rows = await tx.table<Chat, ChatId>('chats').bulkGet([...ids])
-  return markCurrentChatRows(tx, rows)
-}
-
-export async function readAllCurrentChatsForTransaction(
-  tx: Transaction,
-): Promise<readonly TransactionCurrentChat[]> {
-  return markCurrentChatRows(tx, await tx.table<Chat, ChatId>('chats').toArray())
-}
-
-export async function readCurrentChatsInFolderForTransaction(
-  tx: Transaction,
-  folderId: NonNullable<Chat['folderId']>,
-): Promise<readonly TransactionCurrentChat[]> {
-  return markCurrentChatRows(
-    tx,
-    await tx.table<Chat, ChatId>('chats').where('folderId').equals(folderId).toArray(),
-  )
 }
 
 export async function readArchivedChatIdPage(
@@ -248,43 +189,4 @@ function publicChat(stored: ChatStorageRow | undefined): Chat | undefined {
     ...chat
   } = stored
   return chat
-}
-
-function transactionIdentity(tx: Transaction): object {
-  const identity: unknown = tx.idbtrans
-  if (!identity || (typeof identity !== 'object' && typeof identity !== 'function')) {
-    throw new Error('ChatRowTransactionIdentityMissing')
-  }
-  return identity
-}
-
-function markCurrentChatRows(tx: Transaction, rows: readonly Chat[]): TransactionCurrentChat[]
-function markCurrentChatRows(
-  tx: Transaction,
-  rows: readonly (Chat | undefined)[],
-): Array<TransactionCurrentChat | undefined>
-function markCurrentChatRows(
-  tx: Transaction,
-  rows: readonly (Chat | undefined)[],
-): Array<TransactionCurrentChat | undefined> {
-  const identity = transactionIdentity(tx)
-  return rows.map((row) => {
-    if (!row) return undefined
-    markCurrentChatRow(row, identity)
-    return row as TransactionCurrentChat
-  })
-}
-
-function markCurrentChatRow(row: Chat, identity: object): void {
-  Object.defineProperty(row, transactionCurrentChatRuntimeBrand, {
-    configurable: true,
-    enumerable: false,
-    value: identity,
-  })
-}
-
-function transactionCurrentChatIdentity(row: Chat): object | undefined {
-  return (row as Chat & { readonly [transactionCurrentChatRuntimeBrand]?: object })[
-    transactionCurrentChatRuntimeBrand
-  ]
 }

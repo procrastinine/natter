@@ -52,6 +52,7 @@ import type {
 const MUTATION_TABLE_ORDER = [
   'attachmentCatalogAggregate',
   'attachmentCatalogRows',
+  'attachmentIntegrityState',
   'attachmentArtifacts',
   'attachmentBlobs',
   'attachmentJobs',
@@ -151,6 +152,10 @@ export function planMutationSemanticOperation(
   scopes: readonly MutationScope[],
   options?: WorkspaceMutationOptions,
   extensionAccess?: BrowserMutationTransactionAccess,
+  extensionReceipt?: {
+    readonly exactOccurrence: true
+    readonly replay: SemanticOperationReplayPlan
+  },
 ): BrowserMutationSemanticOperationPlan {
   const storageProfile =
     command.kind === 'draft.put'
@@ -159,7 +164,18 @@ export function planMutationSemanticOperation(
         ? 'attachment-payload'
         : 'complete'
   const plan = mutationInfrastructurePlan(scopes, options, extensionAccess, storageProfile)
-  const receiptPolicy = scopeDerivedMutationReceiptPolicy(command, options)
+  const fixedReceiptPolicy = scopeDerivedMutationReceiptPolicy(command, options)
+  if (fixedReceiptPolicy && extensionReceipt) {
+    throw new Error(`MutationReceiptCapabilityDuplicated:${command.kind}`)
+  }
+  const receiptPolicy =
+    fixedReceiptPolicy ??
+    (extensionReceipt
+      ? {
+          exactOccurrence: extensionReceipt.exactOccurrence,
+          replayPlan: extensionReceipt.replay,
+        }
+      : undefined)
   const exactPlan = receiptPolicy?.exactPlan
   const replayPlan = receiptPolicy?.replayPlan
   const replayContract = receiptPolicy?.replayReason
@@ -290,6 +306,11 @@ function scopeDerivedMutationReceiptPolicy(
         exactOccurrence: true,
         replayReason: 'unfenced-relative-update',
       }
+    case 'attachment.delete-many':
+      return {
+        exactOccurrence: true,
+        replayReason: 'non-replayable',
+      }
     case 'attempt.finalize':
       return {
         replayPlan: attemptFinalizeReplayPlan(command.input),
@@ -298,7 +319,6 @@ function scopeDerivedMutationReceiptPolicy(
       return {
         exactPlan: attemptDispatchExactPlan(command.input),
       }
-    case 'attachment.delete-many':
     case 'attachment.reap':
     case 'attachment.ref.add':
     case 'attachment.ref.detach':

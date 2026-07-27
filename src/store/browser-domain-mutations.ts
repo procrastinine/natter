@@ -20,7 +20,6 @@ import type {
   BrowserMutationTableName,
   BrowserMutationTransactionAccess,
 } from './browser-mutation-plan'
-import type { TransactionCurrentChat } from './chat-storage-codec'
 import type { MessageBodyRow, MessageHeaderRow } from './message-storage'
 import type {
   FencedTransaction,
@@ -48,6 +47,7 @@ import type {
   SemanticOperationDescriptor,
   SemanticOperationExactPhysicalRead,
   SemanticOperationKind,
+  SemanticOperationReplayPlan,
   SemanticOperationRunner,
 } from './semantic-operation-capability'
 import type {
@@ -82,7 +82,7 @@ export interface ResolvedGenerationPromptPath extends ValidatedGenerationPromptP
 }
 
 export interface ChatMutationState {
-  beforeChat: TransactionCurrentChat
+  beforeChat: Chat
   structuralSummaryDirty: boolean
   structuralVersionDirty: boolean
   previousBranchIds?: ReadonlySet<MessageId>
@@ -117,6 +117,10 @@ export interface BrowserMutationOperations {
 
 export interface BrowserMutationTransactionExtension<Value, Result> {
   readonly access: BrowserMutationTransactionAccess
+  readonly receipt?: {
+    readonly exactOccurrence: true
+    readonly replay: SemanticOperationReplayPlan
+  }
   commit(tx: FencedTransaction<BrowserMutationTableName>, value: Value): Promise<Result> | Result
 }
 
@@ -139,6 +143,7 @@ export interface BrowserMutationSharedInternals {
     this: void,
     tx: Transaction,
     lease: Pick<StreamLeaseRow, 'streamId' | 'chatId' | 'messageId' | 'attemptKind'>,
+    chat: Chat | undefined,
   ): Promise<void>
   branchHeaderWordCount(this: void, headers: readonly MessageHeaderRow[]): number
   calibrationUsageFromPostCommit(this: void, usage: StreamPostCommitUsageEvidence): ChatUsage
@@ -209,7 +214,6 @@ export interface BrowserMutationSharedInternals {
     before: Message,
     after: Message,
   ): boolean
-  recordNewMessageSummary(this: void, state: ChatMutationState, message: Message): void
   replacementMessageBody(
     this: void,
     header: MessageHeaderRow,
@@ -324,17 +328,6 @@ export interface BrowserGenerationCommandSupport {
     messageProofs: readonly GenerationMessageReadProof[],
     knownPresentations: readonly [] | readonly [MessagePresentation],
   ): PreparedGenerationPrompt
-  preparedMessage(
-    this: void,
-    message: Message,
-    parentId: MessageId | null,
-    siblingIndex: number,
-  ): Message
-  requiredPromptPathSlot(
-    this: void,
-    path: ResolvedGenerationPromptPath,
-    chatId: ChatId,
-  ): ChildListState
   requiredPromptPathTarget(
     this: void,
     path: ResolvedGenerationPromptPath,
