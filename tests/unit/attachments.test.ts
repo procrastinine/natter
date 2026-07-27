@@ -4,6 +4,7 @@ import { IDBFactory } from 'fake-indexeddb'
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import type {
+  Attachment,
   AttachmentArtifact,
   AttachmentBlob,
   AttachmentJob,
@@ -145,6 +146,44 @@ class PausableFirstLockBackend implements LockBackend {
   }
 }
 
+class RecordingLockBackend implements LockBackend {
+  readonly kind = 'web-locks' as const
+  readonly logicalRuns: string[][] = []
+  readonly transactionTableRuns: string[][] = []
+
+  run<T>(logicalNames: readonly string[], fn: Parameters<LockBackend['run']>[1]): Promise<T> {
+    this.logicalRuns.push([...logicalNames].sort())
+    return Promise.resolve(
+      fn({
+        kind: this.kind,
+        logicalNames,
+        runTransaction: (db, tables, write) => {
+          this.transactionTableRuns.push(
+            tables.map((table) => (typeof table === 'string' ? table : table.name)).sort(),
+          )
+          return db.transaction(
+            'rw',
+            tables.map((table) => db.table(typeof table === 'string' ? table : table.name)),
+            write,
+          )
+        },
+      }) as Promise<T>,
+    )
+  }
+
+  async runAuthoritativeCommandSession<T>(
+    _database: Dexie,
+    operation: (session: AuthoritativeCommandLockSession) => Promise<T> | T,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<T> {
+    if (options.signal?.aborted) throw options.signal.reason
+    return operation({
+      kind: this.kind,
+      withResourceLocks: (resourceNames, child) => this.run(resourceNames, child),
+    })
+  }
+}
+
 beforeAll(async () => {
   ;(globalThis as unknown as { indexedDB: IDBFactory }).indexedDB = new IDBFactory()
   __resetWorkspaceRepositoryForTests()
@@ -192,6 +231,66 @@ async function seedChat(id = newId()): Promise<Chat> {
 
 function bytes(content: string): Blob {
   return new Blob([new TextEncoder().encode(content)])
+}
+
+function largeAttachmentPayload(attachment: Attachment, generation: 'old' | 'new') {
+  const blobs = Array.from({ length: 129 }, (_, index): AttachmentBlob => {
+    const blob = bytes(`${generation}-blob-${index}`)
+    return {
+      id: `${attachment.id}:${generation}:blob:${index}`,
+      attachmentId: attachment.id,
+      role: index === 0 ? 'original' : 'thumbnail',
+      mime: 'application/octet-stream',
+      contentHash: `${generation}-hash-${index}`,
+      sizeBytes: blob.size,
+      blob,
+      createdAt: generation === 'old' ? 12 : 20,
+    }
+  })
+  const artifacts = Array.from(
+    { length: 129 },
+    (_, index): AttachmentArtifact => ({
+      kind: 'text',
+      artifactId: `${attachment.id}:${generation}:artifact:${index}`,
+      attachmentId: attachment.id,
+      processorId: `${generation}-processor-${index}`,
+      text: `${generation}-text-${index}`,
+      charCount: `${generation}-text-${index}`.length,
+      createdAt: generation === 'old' ? 12 : 20,
+    }),
+  )
+  const jobs = Array.from(
+    { length: 129 },
+    (_, index): AttachmentJob => ({
+      id: `${attachment.id}:${generation}:job:${index}`,
+      attachmentId: attachment.id,
+      processorId: `${generation}-processor-${index}`,
+      inputHash: `${generation}-input-${index}`,
+      status: 'succeeded',
+      finishedAt: generation === 'old' ? 12 : 20,
+      outputArtifactIds: [artifacts[index]?.artifactId ?? 'missing'],
+      updatedAt: generation === 'old' ? 12 : 20,
+    }),
+  )
+  return {
+    attachment: {
+      ...attachment,
+      contentHash: `${generation}-bundle-hash`,
+      updatedAt: generation === 'old' ? 12 : 20,
+      storage: { kind: 'local-blob' as const, blobId: blobs[0]?.id ?? 'missing' },
+      artifacts,
+      processing: jobs.map(({ processorId, inputHash, status, finishedAt, outputArtifactIds }) => ({
+        processorId,
+        inputHash,
+        status,
+        finishedAt: finishedAt ?? 0,
+        outputArtifactIds,
+      })),
+    },
+    blobs,
+    artifacts,
+    jobs,
+  }
 }
 
 function attachmentRef(attachmentId: string, createdAt = 1): MessageAttachmentRef {
@@ -695,7 +794,218 @@ describe('attachment backend storage', () => {
     expect(await getDb().attachments.count()).toBe(2)
   })
 
+  it('replaces large attachment bundles in one narrow batch and rolls back sidecar collisions', async () => {
+    const target = await ingestAttachmentBytes({
+      blob: bytes('bundle target'),
+      filename: 'bundle-target.txt',
+      now: 10,
+    })
+    const unrelated = await ingestAttachmentBytes({
+      blob: bytes('bundle unrelated'),
+      filename: 'bundle-unrelated.txt',
+      now: 11,
+    })
+    await execute({
+      kind: 'attachment.bundle.write',
+      input: { bundle: largeAttachmentPayload(target.attachment, 'old'), mode: 'replace' },
+    })
+    const headerBefore = await getDb().attachments.get(target.attachment.id)
+    const catalogBefore = await getDb().attachmentCatalogAggregate.get('workspace')
+    const unrelatedBefore = await getAttachmentBundle(unrelated.attachment.id)
+    const backend = new RecordingLockBackend()
+    __setLockBackendForTests(backend)
+    const replacement = largeAttachmentPayload(target.attachment, 'new')
+
+    const committed = await execute({
+      kind: 'attachment.bundle.write',
+      input: { bundle: replacement, mode: 'replace' },
+    })
+
+    expect(committed.value).toEqual({
+      attachmentId: target.attachment.id,
+      outcome: 'written',
+      attachment: expect.objectContaining({
+        id: target.attachment.id,
+        refCount: target.attachment.refCount,
+      }),
+    })
+    expect(backend.logicalRuns).toHaveLength(1)
+    expect(backend.logicalRuns[0]).toEqual([`attachment:${target.attachment.id}`])
+    expect(backend.transactionTableRuns).toEqual([
+      [
+        'attachmentArtifacts',
+        'attachmentBlobs',
+        'attachmentCatalogAggregate',
+        'attachmentCatalogRows',
+        'attachmentJobs',
+        'attachments',
+      ],
+    ])
+    const stored = await getAttachmentBundle(target.attachment.id)
+    expect(stored?.blobs).toHaveLength(129)
+    expect(stored?.artifacts).toHaveLength(129)
+    expect(stored?.jobs).toHaveLength(129)
+    expect(stored?.blobs.every((row) => row.id.includes(':new:'))).toBe(true)
+    expect(stored?.artifacts.every((row) => row.artifactId.includes(':new:'))).toBe(true)
+    expect(stored?.jobs.every((row) => row.id.includes(':new:'))).toBe(true)
+    const headerAfter = await getDb().attachments.get(target.attachment.id)
+    const catalogAfter = await getDb().attachmentCatalogAggregate.get('workspace')
+    expect(headerAfter?.wireVersion).toBe((headerBefore?.wireVersion ?? 0) + 1)
+    expect(catalogAfter?.projectionRevision).toBe((catalogBefore?.projectionRevision ?? 0) + 1)
+    expect(await getAttachmentBundle(unrelated.attachment.id)).toEqual(unrelatedBefore)
+
+    const unrelatedBlob = unrelatedBefore?.blobs[0]
+    const replacementBlob = replacement.blobs[0]
+    if (!unrelatedBlob) throw new Error('expected unrelated blob')
+    if (!replacementBlob) throw new Error('expected replacement blob')
+    await expect(
+      execute({
+        kind: 'attachment.bundle.write',
+        input: {
+          bundle: {
+            ...replacement,
+            blobs: [{ ...replacementBlob, id: unrelatedBlob.id }],
+          },
+          mode: 'replace',
+        },
+      }),
+    ).rejects.toThrow()
+    expect((await getDb().attachments.get(target.attachment.id))?.wireVersion).toBe(
+      headerAfter?.wireVersion,
+    )
+    expect(await getAttachmentBundle(target.attachment.id)).toEqual(stored)
+    expect(await getAttachmentBundle(unrelated.attachment.id)).toEqual(unrelatedBefore)
+  })
+
+  it('deletes an unreferenced large bundle in one transaction and rolls back a late catalog failure', async () => {
+    const target = await ingestAttachmentBytes({
+      blob: bytes('delete target'),
+      filename: 'delete-target.txt',
+      now: 10,
+    })
+    const unrelated = await ingestAttachmentBytes({
+      blob: bytes('delete unrelated'),
+      filename: 'delete-unrelated.txt',
+      now: 11,
+    })
+    await execute({
+      kind: 'attachment.bundle.write',
+      input: {
+        bundle: largeAttachmentPayload(target.attachment, 'old'),
+        mode: 'replace',
+      },
+    })
+    const unrelatedBefore = await getAttachmentBundle(unrelated.attachment.id)
+    const catalogBefore = await getDb().attachmentCatalogAggregate.get('workspace')
+    const backend = new RecordingLockBackend()
+    __setLockBackendForTests(backend)
+
+    const committed = await execute({
+      kind: 'attachment.delete-if-unreferenced',
+      attachmentId: target.attachment.id,
+    })
+
+    expect(committed.value).toEqual({
+      deleted: true,
+      refs: { messages: 0, drafts: 0 },
+    })
+    expect(backend.logicalRuns[0]).toEqual([`attachment:${target.attachment.id}`])
+    expect(backend.transactionTableRuns[0]).toEqual([
+      'attachmentArtifacts',
+      'attachmentBlobs',
+      'attachmentCatalogAggregate',
+      'attachmentCatalogRows',
+      'attachmentJobs',
+      'attachmentRefEdges',
+      'attachments',
+    ])
+    expect(await getAttachmentBundle(target.attachment.id)).toBeUndefined()
+    expect(
+      await getDb().attachmentBlobs.where('attachmentId').equals(target.attachment.id).count(),
+    ).toBe(0)
+    expect(
+      await getDb().attachmentArtifacts.where('attachmentId').equals(target.attachment.id).count(),
+    ).toBe(0)
+    expect(
+      await getDb().attachmentJobs.where('attachmentId').equals(target.attachment.id).count(),
+    ).toBe(0)
+    expect(await getAttachmentBundle(unrelated.attachment.id)).toEqual(unrelatedBefore)
+    expect((await getDb().attachmentCatalogAggregate.get('workspace'))?.projectionRevision).toBe(
+      (catalogBefore?.projectionRevision ?? 0) + 1,
+    )
+    expect(committed.delta.invalidations).toEqual(
+      expect.arrayContaining([
+        { kind: 'attachment', attachmentIds: [target.attachment.id] },
+        {
+          kind: 'attachment-job',
+          attachmentIds: [target.attachment.id],
+          jobIds: expect.arrayContaining([
+            `${target.attachment.id}:old:job:0`,
+            `${target.attachment.id}:old:job:128`,
+          ]),
+        },
+      ]),
+    )
+    const catalogAfter = await getDb().attachmentCatalogAggregate.get('workspace')
+    await expect(deleteUnreferencedAttachment(target.attachment.id)).resolves.toEqual({
+      deleted: false,
+      refs: { messages: 0, drafts: 0 },
+    })
+    expect(await getDb().attachmentCatalogAggregate.get('workspace')).toEqual(catalogAfter)
+
+    __setLockBackendForTests(null)
+    const referencedTarget = await ingestAttachmentBytes({
+      blob: bytes('referenced target'),
+      filename: 'referenced-target.txt',
+      now: 12,
+    })
+    const chat = await seedChat()
+    await putMessage(
+      makeMessage(
+        chat.id,
+        Array.from({ length: 129 }, (_, index) =>
+          attachmentRef(referencedTarget.attachment.id, index + 1),
+        ),
+      ),
+    )
+    const referencedBefore = await getAttachmentBundle(referencedTarget.attachment.id)
+    const catalogBeforeReferencedProbe = await getDb().attachmentCatalogAggregate.get('workspace')
+    const referencedBackend = new RecordingLockBackend()
+    __setLockBackendForTests(referencedBackend)
+    await expect(deleteUnreferencedAttachment(referencedTarget.attachment.id)).resolves.toEqual({
+      deleted: false,
+      refs: { messages: 1, drafts: 0 },
+    })
+    expect(referencedBackend.logicalRuns).toEqual([
+      [`attachment:${referencedTarget.attachment.id}`],
+    ])
+    expect(await getAttachmentBundle(referencedTarget.attachment.id)).toEqual(referencedBefore)
+    expect(await getDb().attachmentCatalogAggregate.get('workspace')).toEqual(
+      catalogBeforeReferencedProbe,
+    )
+
+    __setLockBackendForTests(null)
+    const rollbackTarget = await ingestAttachmentBytes({
+      blob: bytes('rollback target'),
+      filename: 'rollback-target.txt',
+      now: 13,
+    })
+    const rollbackBefore = await getAttachmentBundle(rollbackTarget.attachment.id)
+    await getDb().attachmentCatalogRows.delete(rollbackTarget.attachment.id)
+    const aggregateBeforeFailure = await getDb().attachmentCatalogAggregate.get('workspace')
+    await expect(deleteUnreferencedAttachment(rollbackTarget.attachment.id)).rejects.toThrow(
+      `AttachmentCatalogRowMissing:${rollbackTarget.attachment.id}`,
+    )
+    expect(await getAttachmentBundle(rollbackTarget.attachment.id)).toEqual(rollbackBefore)
+    expect(await getDb().attachmentCatalogAggregate.get('workspace')).toEqual(
+      aggregateBeforeFailure,
+    )
+  })
+
   it('replaces bytes in-place unless the uploaded file already exists', async () => {
+    const chat = await seedChat()
+    const message = makeMessage(chat.id)
+    await putMessage(message)
     const target = await ingestAttachmentBytes({
       blob: bytes('old bytes'),
       filename: 'target.txt',
@@ -704,6 +1014,11 @@ describe('attachment backend storage', () => {
     const existing = await ingestAttachmentBytes({
       blob: bytes('existing bytes'),
       filename: 'existing.txt',
+      now: 11,
+    })
+    await addExistingAttachmentRef({
+      messageId: message.id,
+      attachmentId: target.attachment.id,
       now: 11,
     })
 
@@ -716,8 +1031,10 @@ describe('attachment backend storage', () => {
     expect(replaced.reusedExisting).toBe(false)
     expect(replaced.bundle.attachment.id).toBe(target.attachment.id)
     expect(replaced.bundle.attachment.createdAt).toBe(target.attachment.createdAt)
+    expect(replaced.bundle.attachment.refCount).toBe(1)
     expect(replaced.bundle.attachment.contentHash).not.toBe(target.attachment.contentHash)
     expect((await getAttachmentBundle(target.attachment.id))?.blobs).toHaveLength(1)
+    expect((await getAttachmentBundle(target.attachment.id))?.attachment.refCount).toBe(1)
 
     const reused = await replaceAttachmentBytes({
       attachmentId: target.attachment.id,
@@ -990,7 +1307,252 @@ describe('attachment backend storage', () => {
     await expectAttachmentReferenceInvariants(getDb())
   })
 
+  it('deletes every owned payload row in one narrow transition without truncation or replay writes', async () => {
+    const bundle = await ingestAttachmentBytes({
+      blob: bytes('large owner payload'),
+      filename: 'large-owner.txt',
+      now: 10,
+    })
+    const unrelated = await ingestAttachmentBytes({
+      blob: bytes('unrelated payload'),
+      filename: 'unrelated.txt',
+      now: 11,
+    })
+    const header = await getDb().attachments.get(bundle.attachment.id)
+    if (header?.storage.kind !== 'local-blob') throw new Error('expected local header')
+    const originalBlobId = header.storage.blobId
+    const retainedArtifacts = Array.from(
+      { length: 129 },
+      (_, index): AttachmentArtifact => ({
+        kind: 'text',
+        artifactId: `${bundle.attachment.id}:retained:${index}`,
+        attachmentId: bundle.attachment.id,
+        processorId: `text-${index}`,
+        text: `retained-${index}`,
+        charCount: `retained-${index}`.length,
+        createdAt: 12,
+      }),
+    )
+    const deletedArtifacts = Array.from(
+      { length: 129 },
+      (_, index): AttachmentArtifact => ({
+        kind: 'blob',
+        artifactId: `${bundle.attachment.id}:deleted:${index}`,
+        attachmentId: bundle.attachment.id,
+        processorId: `blob-${index}`,
+        blobId: index === 0 ? originalBlobId : `${bundle.attachment.id}:blob:${index}`,
+        createdAt: 12,
+      }),
+    )
+    const blobs = Array.from({ length: 129 }, (_, index): AttachmentBlob => {
+      const blob = bytes(`b${index}`)
+      return {
+        id: index === 0 ? originalBlobId : `${bundle.attachment.id}:blob:${index}`,
+        attachmentId: bundle.attachment.id,
+        role: 'original',
+        mime: 'application/octet-stream',
+        contentHash: `hash-${index}`,
+        sizeBytes: blob.size,
+        blob,
+        createdAt: 12,
+      }
+    })
+    const deletedJobs = Array.from(
+      { length: 129 },
+      (_, index): AttachmentJob => ({
+        id: `${bundle.attachment.id}:deleted-job:${index}`,
+        attachmentId: bundle.attachment.id,
+        processorId: `deleted-job-${index}`,
+        inputHash: `input-${index}`,
+        status: 'succeeded',
+        finishedAt: 12,
+        outputArtifactIds: [deletedArtifacts[index]?.artifactId ?? 'missing'],
+        updatedAt: 12,
+      }),
+    )
+    const updatedJobs = Array.from(
+      { length: 129 },
+      (_, index): AttachmentJob => ({
+        id: `${bundle.attachment.id}:updated-job:${index}`,
+        attachmentId: bundle.attachment.id,
+        processorId: `updated-job-${index}`,
+        inputHash: `input-${index}`,
+        status: 'succeeded',
+        finishedAt: 12,
+        outputArtifactIds: [
+          retainedArtifacts[index]?.artifactId ?? 'missing',
+          deletedArtifacts[index]?.artifactId ?? 'missing',
+        ],
+        updatedAt: 12,
+      }),
+    )
+    await getDb().transaction(
+      'rw',
+      [
+        getDb().attachments,
+        getDb().attachmentArtifacts,
+        getDb().attachmentBlobs,
+        getDb().attachmentJobs,
+      ],
+      async () => {
+        await Promise.all([
+          getDb().attachmentArtifacts.where('attachmentId').equals(bundle.attachment.id).delete(),
+          getDb().attachmentBlobs.where('attachmentId').equals(bundle.attachment.id).delete(),
+          getDb().attachmentJobs.where('attachmentId').equals(bundle.attachment.id).delete(),
+        ])
+        await Promise.all([
+          getDb().attachmentArtifacts.bulkPut([...retainedArtifacts, ...deletedArtifacts]),
+          getDb().attachmentBlobs.bulkPut(blobs),
+          getDb().attachmentJobs.bulkPut([...deletedJobs, ...updatedJobs]),
+        ])
+        await getDb().attachments.put({
+          ...header,
+          artifactIds: [...retainedArtifacts, ...deletedArtifacts].map(
+            (artifact) => artifact.artifactId,
+          ),
+          processing: [...deletedJobs, ...updatedJobs].map(
+            ({ processorId, inputHash, status, outputArtifactIds }) => ({
+              processorId,
+              inputHash,
+              status,
+              finishedAt: 12,
+              outputArtifactIds,
+            }),
+          ),
+          thumbnailBlobId: blobs.at(-1)?.id ?? originalBlobId,
+        })
+      },
+    )
+    const headerBefore = await getDb().attachments.get(bundle.attachment.id)
+    const catalogBefore = await getDb().attachmentCatalogAggregate.get('workspace')
+    const unrelatedBefore = await getAttachmentBundle(unrelated.attachment.id)
+    const backend = new RecordingLockBackend()
+    __setLockBackendForTests(backend)
+
+    const first = await execute({
+      kind: 'attachment.bytes.delete',
+      input: {
+        attachmentId: bundle.attachment.id,
+        reason: 'deleted',
+        now: 20,
+      },
+    })
+
+    expect(first.value?.storage).toMatchObject({
+      kind: 'missing',
+      reason: 'deleted',
+      lastKnownBlobId: originalBlobId,
+    })
+    expect(first.value?.artifacts).toHaveLength(129)
+    expect(first.value?.artifacts.every((artifact) => artifact.kind === 'text')).toBe(true)
+    expect(backend.logicalRuns).toEqual([[`attachment:${bundle.attachment.id}`]])
+    expect(backend.transactionTableRuns).toEqual([
+      [
+        'attachmentArtifacts',
+        'attachmentBlobs',
+        'attachmentCatalogAggregate',
+        'attachmentCatalogRows',
+        'attachmentJobs',
+        'attachments',
+      ],
+    ])
+    const stored = await getAttachmentBundle(bundle.attachment.id)
+    expect(stored?.blobs).toEqual([])
+    expect(stored?.artifacts).toHaveLength(129)
+    expect(stored?.jobs).toHaveLength(129)
+    expect(stored?.jobs.every((job) => job.outputArtifactIds.length === 1)).toBe(true)
+    expect(stored?.jobs.every((job) => job.updatedAt === 20)).toBe(true)
+    const headerAfter = await getDb().attachments.get(bundle.attachment.id)
+    const catalogAfter = await getDb().attachmentCatalogAggregate.get('workspace')
+    expect(headerAfter?.wireVersion).toBe((headerBefore?.wireVersion ?? 0) + 1)
+    expect(catalogAfter?.projectionRevision).toBe((catalogBefore?.projectionRevision ?? 0) + 1)
+    expect(first.delta.invalidations).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: 'attachment',
+          attachmentIds: [bundle.attachment.id],
+        }),
+        expect.objectContaining({
+          kind: 'attachment-job',
+          attachmentIds: [bundle.attachment.id],
+        }),
+      ]),
+    )
+    expect(await getAttachmentBundle(unrelated.attachment.id)).toEqual(unrelatedBefore)
+
+    const second = await execute({
+      kind: 'attachment.bytes.delete',
+      input: {
+        attachmentId: bundle.attachment.id,
+        reason: 'deleted',
+        now: 20,
+      },
+    })
+    expect(second.delta.invalidations).toEqual([])
+    expect((await getDb().attachments.get(bundle.attachment.id))?.wireVersion).toBe(
+      headerAfter?.wireVersion,
+    )
+    expect((await getDb().attachmentCatalogAggregate.get('workspace'))?.projectionRevision).toBe(
+      catalogAfter?.projectionRevision,
+    )
+
+    const absent = await execute({
+      kind: 'attachment.bytes.delete',
+      input: {
+        attachmentId: 'absent-attachment',
+        reason: 'deleted',
+        now: 21,
+      },
+    })
+    expect(absent.value).toBeUndefined()
+    expect(absent.delta.invalidations).toEqual([])
+  })
+
   it('keeps duplicate deletion and replacement races internally consistent', async () => {
+    const deleteThenReplace = await ingestAttachmentBytes({
+      blob: bytes('delete then replace old bytes'),
+      filename: 'delete-then-replace.txt',
+      now: 8,
+    })
+    await deleteReferencedAttachmentBytes(deleteThenReplace.attachment.id, 'deleted', 18)
+    const deleteThenReplacement = await replaceAttachmentBytes({
+      attachmentId: deleteThenReplace.attachment.id,
+      blob: bytes('delete then replace new bytes'),
+      filename: 'delete-then-replace.txt',
+      now: 19,
+    })
+    const deleteThenReplaceStored = await getAttachmentBundle(deleteThenReplace.attachment.id)
+    expect(deleteThenReplaceStored?.attachment.storage).toEqual(
+      deleteThenReplacement.bundle.attachment.storage,
+    )
+    expect(deleteThenReplaceStored?.blobs).toHaveLength(1)
+    await expectAttachmentBundleInvariants(deleteThenReplace.attachment.id)
+
+    const replaceThenDelete = await ingestAttachmentBytes({
+      blob: bytes('replace then delete old bytes'),
+      filename: 'replace-then-delete.txt',
+      now: 8,
+    })
+    const replaceThenDeletion = await replaceAttachmentBytes({
+      attachmentId: replaceThenDelete.attachment.id,
+      blob: bytes('replace then delete new bytes'),
+      filename: 'replace-then-delete.txt',
+      now: 19,
+    })
+    if (replaceThenDeletion.bundle.attachment.storage.kind !== 'local-blob') {
+      throw new Error('expected replacement bytes')
+    }
+    await deleteReferencedAttachmentBytes(replaceThenDelete.attachment.id, 'deleted', 20)
+    const replaceThenDeleteStored = await getAttachmentBundle(replaceThenDelete.attachment.id)
+    expect(replaceThenDeleteStored?.attachment.storage).toEqual({
+      kind: 'missing',
+      reason: 'deleted',
+      missingSince: 20,
+      lastKnownBlobId: replaceThenDeletion.bundle.attachment.storage.blobId,
+    })
+    expect(replaceThenDeleteStored?.blobs).toEqual([])
+    await expectAttachmentBundleInvariants(replaceThenDelete.attachment.id)
+
     const bundle = await ingestAttachmentBytes({
       blob: bytes('old bytes'),
       filename: 'race.txt',
@@ -1052,9 +1614,10 @@ describe('attachment backend storage', () => {
     })
     await backend.waitForSecondRun()
     backend.releaseFirst()
-    await Promise.all([first, second])
+    const [, secondResult] = await Promise.all([first, second])
 
     const stored = await getAttachmentBundle(bundle.attachment.id)
+    expect(stored?.attachment.contentHash).toBe(secondResult.bundle.attachment.contentHash)
     expect(stored?.blobs).toHaveLength(1)
     expect(stored?.blobs[0]?.id).toBe(
       stored?.attachment.storage.kind === 'local-blob'

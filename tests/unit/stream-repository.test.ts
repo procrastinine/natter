@@ -1,6 +1,7 @@
 import Dexie, { type Transaction } from 'dexie'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { AttemptTerminalReceipt } from '../../src/core/attempt-outcome'
+import { createChatRow } from '../../src/core/chat-metadata'
 import { connectionDispatchProfileProof } from '../../src/core/connection-dispatch-proof'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import type {
@@ -17,6 +18,7 @@ import {
   openBrowserWorkspace,
   shutdownBrowserWorkspace,
 } from '../../src/store/browser-workspace-lifecycle'
+import { configurationApplication } from '../../src/store/configuration-application'
 import { importMessagesOp } from '../../src/store/conversation-command-client'
 import { __resetDbForTests, getDb } from '../../src/store/db'
 import type { MessageHeaderRow } from '../../src/store/message-storage'
@@ -34,19 +36,21 @@ import {
 } from '../../src/store/repository'
 import { STREAM_LEASE_TTL_MS } from '../../src/store/stream-lease-policy'
 import { getStreamClientId } from '../../src/store/stream-leases'
-import type {
-  AttemptDispatchResult,
-  AttemptPrepareResult,
-  CommitEnvelope,
-  WorkspaceCommand,
-  WorkspaceCommandResult,
+import {
+  type AttemptDispatchResult,
+  type AttemptPrepareResult,
+  type CommitEnvelope,
+  generationPostCommitMetadataResourceProof,
+  type WorkspaceCommand,
+  type WorkspaceCommandResult,
 } from '../../src/store/workspace-protocol'
 import {
   __resetWorkspaceRepositoryForTests,
   getWorkspaceRepository,
 } from '../../src/store/workspace-repository'
 import { runWorkspaceAction, runWorkspaceRead } from '../../src/store/workspace-runtime'
-import { createChat } from '../helpers/chats'
+import { createChat, updateChatForTest } from '../helpers/chats'
+import { testChatConfigurationLinkTransition } from '../helpers/configuration'
 import { installGenerationProfile } from '../helpers/generation-engine'
 import {
   decodeTestStreamJournalFrames,
@@ -291,6 +295,7 @@ describe('browser stream repository protocol', () => {
         heartbeat: {
           streamId: stale.streamId,
           fence: leaseFence(stale),
+          expectedRevision: stale.revision,
           heartbeatAt: STARTED_AT + 20_001,
         },
       }),
@@ -301,7 +306,6 @@ describe('browser stream repository protocol', () => {
     await expect(
       execute({
         kind: 'stream.finish-cleanup',
-        chatId: stale.chatId,
         streamId: stale.streamId,
         fence: leaseFence(stale),
       }),
@@ -320,15 +324,18 @@ describe('browser stream repository protocol', () => {
     )
     const writer = active.lease
     const handedOffAt = STARTED_AT + 1
-    const handedOff = await execute({
+    const handoffCommand = {
       kind: 'stream.handoff-recovery',
       input: {
         streamId: writer.streamId,
         fence: leaseFence(writer),
+        handoffId: 'handoff-stream-command',
         handedOffAt,
         reason: 'finalize-failed',
       },
-    })
+    } as const
+    const handedOff = await execute(handoffCommand)
+    const replayed = await execute(handoffCommand)
 
     expect(handedOff).toMatchObject({
       streamId: writer.streamId,
@@ -339,6 +346,7 @@ describe('browser stream repository protocol', () => {
       admissionSequence: writer.admissionSequence,
       revision: writer.revision + 1,
     })
+    expect(replayed).toEqual(handedOff)
     expect(streamLeaseHasWriteFence(handedOff)).toBe(false)
     await expect(
       execute({
@@ -346,6 +354,7 @@ describe('browser stream repository protocol', () => {
         heartbeat: {
           streamId: writer.streamId,
           fence: leaseFence(writer),
+          expectedRevision: writer.revision,
           heartbeatAt: handedOffAt + 1,
         },
       }),
@@ -672,7 +681,10 @@ describe('browser stream repository protocol', () => {
         outcome: 'accepted',
         lease: {
           phase: 'terminal-decided',
-          terminal: terminalOnlyDecided.terminal,
+          terminal: {
+            finishedAt: terminalStopInput.requestedAt,
+            decision: { outcome: 'abort', abortReason: 'user' },
+          },
           stopControl: {
             requestId: terminalStopInput.requestId,
             reason: 'user',
@@ -680,6 +692,48 @@ describe('browser stream repository protocol', () => {
         },
       },
     })
+  })
+
+  it('replays the same dispatch as one fenced convergent command', async () => {
+    const seeded = await seedTargets(1)
+    const prepared = await prepareContinuation({
+      streamId: 'dispatch-replay',
+      chatId: seeded.chatId,
+      targetAssistantId: requiredTarget(seeded, 0).id,
+    })
+    const command = continuationDispatchCommand(prepared, prepared.lease.startedAt + 1)
+    const first = await executeCommit(command)
+    const replayed = await executeCommit(command)
+
+    expect(replayed.value).toEqual(first.value)
+    expect(replayed.delta).toEqual({ facts: [], invalidations: [] })
+  })
+
+  it('replays the same terminal projection as one fenced convergent command', async () => {
+    const seeded = await seedTargets(1)
+    const prepared = await prepareContinuation({
+      streamId: 'finalize-replay',
+      chatId: seeded.chatId,
+      targetAssistantId: requiredTarget(seeded, 0).id,
+    })
+    const active = (await dispatchContinuation(prepared, prepared.lease.startedAt + 1)).lease
+    const decided = await execute({
+      kind: 'attempt.seal-terminal',
+      input: terminalSealInput(active, active.startedAt + 2),
+    })
+    const command = {
+      kind: 'attempt.finalize',
+      input: continuationTerminal(decided, decided.terminal),
+    } as const
+    const first = await executeCommit(command)
+    const replayed = await executeCommit(command)
+
+    expect(first.value.outcome).toBe('committed')
+    expect(replayed.value).toEqual({
+      ...first.value,
+      outcome: 'already-canonical',
+    })
+    expect(replayed.delta).toEqual({ facts: [], invalidations: [] })
   })
 
   it('requires the sealed receipt before canonicalization and rejects a mismatched receipt', async () => {
@@ -724,7 +778,11 @@ describe('browser stream repository protocol', () => {
     const canonical = await canonicalizeContinuation(first.prepared, STARTED_AT + 3)
     await execute({
       kind: 'generation.post-commit-metadata',
-      input: { streamId: canonical.streamId, fence: leaseFence(canonical) },
+      input: {
+        streamId: canonical.streamId,
+        fence: leaseFence(canonical),
+        resourceProof: generationPostCommitMetadataResourceProof(canonical),
+      },
     })
 
     const second = await prepareContinuation({
@@ -750,6 +808,48 @@ describe('browser stream repository protocol', () => {
     expect(await streamFrames(first.lease.streamId, 0)).toEqual([])
   })
 
+  it('advances preset recency once when generation metadata commits', async () => {
+    const presetId = 'generation-recency-preset'
+    const preset = await configurationApplication.createChatPreset({
+      presetId,
+      name: 'Generation recency',
+      profileId: profile().id,
+      settings: settings(),
+      lastUsedAt: 1,
+      now: 1,
+    })
+    if (preset.kind !== 'chat-preset-saved') throw new Error('PresetCreateFailed')
+    const seeded = await seedTargets(1)
+    await updateChatForTest(seeded.chatId, { presetId })
+    const active = await activeContinuation(
+      'generation-recency-stream',
+      seeded.chatId,
+      requiredTarget(seeded, 0),
+    )
+    const canonical = await canonicalizeContinuation(active.prepared, STARTED_AT + 3)
+    const command = {
+      kind: 'generation.post-commit-metadata',
+      input: {
+        streamId: canonical.streamId,
+        fence: leaseFence(canonical),
+        resourceProof: generationPostCommitMetadataResourceProof(canonical),
+      },
+    } as const
+
+    const first = await executeCommit(command)
+    const repeated = await executeCommit(command)
+
+    expect(first.value.outcome).toBe('applied')
+    expect(repeated.value.outcome).toBe('already-applied')
+    expect((await getDb().presets.get(presetId))?.lastUsedAt).toBe(canonical.postCommit.usedAt)
+    expect(first.delta.invalidations).toContainEqual({
+      kind: 'preset',
+      presetIds: [presetId],
+      facets: ['usage'],
+    })
+    expect(repeated.delta.invalidations).toEqual([])
+  })
+
   it('keeps one target lease across one hundred canonical continuation admissions', async () => {
     const seeded = await seedTargets(1)
     const target = requiredTarget(seeded, 0)
@@ -768,7 +868,11 @@ describe('browser stream repository protocol', () => {
         const canonical = await canonicalizeContinuation(prepared, STARTED_AT + 101 + index * 2)
         await execute({
           kind: 'generation.post-commit-metadata',
-          input: { streamId: canonical.streamId, fence: leaseFence(canonical) },
+          input: {
+            streamId: canonical.streamId,
+            fence: leaseFence(canonical),
+            resourceProof: generationPostCommitMetadataResourceProof(canonical),
+          },
         })
         const cleanupAnchor = required(
           await streamLease(canonical.streamId),
@@ -888,6 +992,7 @@ describe('browser stream repository protocol', () => {
       heartbeat: {
         streamId: active.lease.streamId,
         fence: leaseFence(active.lease),
+        expectedRevision: active.lease.revision,
         heartbeatAt: active.lease.heartbeatAt + 20_000,
       },
     })
@@ -906,14 +1011,17 @@ describe('browser stream repository protocol', () => {
     const canonical = await canonicalizeContinuation(active.prepared, STARTED_AT + 40_000)
     const metadata = await execute({
       kind: 'generation.post-commit-metadata',
-      input: { streamId: canonical.streamId, fence: leaseFence(canonical) },
+      input: {
+        streamId: canonical.streamId,
+        fence: leaseFence(canonical),
+        resourceProof: generationPostCommitMetadataResourceProof(canonical),
+      },
     })
     expect(metadata.outcome).toBe('applied')
     const cleanupLease = required(await streamLease(canonical.streamId), 'cleanup lease')
     const beforeCleanup = await workspaceMeta()
     const finishCommit = await executeCommit({
       kind: 'stream.finish-cleanup',
-      chatId: cleanupLease.chatId,
       streamId: cleanupLease.streamId,
       fence: leaseFence(cleanupLease),
     })
@@ -939,12 +1047,135 @@ describe('browser stream repository protocol', () => {
       heartbeat: {
         streamId: before.streamId,
         fence: leaseFence(before),
+        expectedRevision: before.revision,
         heartbeatAt,
       },
     })
 
     expect(renewed.heartbeatAt).toBe(heartbeatAt)
     expect(renewed.revision).toBe(before.revision + 1)
+  })
+
+  it('does not let a delayed heartbeat replay overwrite a newer renewal', async () => {
+    const seeded = await seedTargets(1)
+    const active = await activeContinuation(
+      'delayed-renewal-stream',
+      seeded.chatId,
+      requiredTarget(seeded, 0),
+    )
+    const before = required(await streamLease(active.lease.streamId), 'lease before renewals')
+    if (!streamLeaseHasWriteFence(before)) throw new Error('ExpectedFencedTestLease')
+    const firstHeartbeat = {
+      streamId: before.streamId,
+      fence: leaseFence(before),
+      expectedRevision: before.revision,
+      heartbeatAt: before.heartbeatAt + 20_000,
+    }
+    const first = await execute({ kind: 'stream.renew', heartbeat: firstHeartbeat })
+    if (!streamLeaseHasWriteFence(first)) throw new Error('ExpectedRenewedFencedTestLease')
+    const second = await execute({
+      kind: 'stream.renew',
+      heartbeat: {
+        streamId: first.streamId,
+        fence: leaseFence(first),
+        expectedRevision: first.revision,
+        heartbeatAt: first.heartbeatAt + 20_000,
+      },
+    })
+
+    const replayed = await execute({ kind: 'stream.renew', heartbeat: firstHeartbeat })
+
+    expect(replayed).toEqual(second)
+    expect(await streamLease(before.streamId)).toEqual(second)
+  })
+
+  it('replays a committed journal append without overwriting newer lease freshness', async () => {
+    const seeded = await seedTargets(1)
+    const active = await activeContinuation(
+      'delayed-append-stream',
+      seeded.chatId,
+      requiredTarget(seeded, 0),
+    )
+    const frames = await encodeTestStreamJournalEntries({
+      streamId: active.lease.streamId,
+      chatId: active.lease.chatId,
+      messageId: active.lease.messageId,
+      fence: leaseFence(active.lease),
+      entries: [
+        {
+          createdAt: STARTED_AT + 1,
+          event: { lane: 'text', text: 'committed once' },
+        },
+      ],
+    })
+    const appendCommand = {
+      kind: 'stream.append-journal-frames',
+      frames,
+      observedAt: STARTED_AT + 20_000,
+    } as const
+    await executeCommit(appendCommand)
+    const appended = required(await streamLease(active.lease.streamId), 'appended lease')
+    if (!streamLeaseHasWriteFence(appended)) throw new Error('ExpectedAppendedFencedTestLease')
+    const renewed = await execute({
+      kind: 'stream.renew',
+      heartbeat: {
+        streamId: appended.streamId,
+        fence: leaseFence(appended),
+        expectedRevision: appended.revision,
+        heartbeatAt: appended.heartbeatAt + 20_000,
+      },
+    })
+
+    const replayed = await executeCommit(appendCommand)
+
+    expect(replayed.delta).toEqual({ facts: [], invalidations: [] })
+    expect(await streamLease(active.lease.streamId)).toEqual(renewed)
+    expect((await streamFrames(active.lease.streamId, 0)).map((frame) => frame.id)).toEqual(
+      frames.map((frame) => frame.id),
+    )
+  })
+
+  it('resumes a lost cleanup page without exceeding the shared row bound', async () => {
+    const seeded = await seedTargets(1)
+    const active = await activeContinuation(
+      'paged-cleanup-stream',
+      seeded.chatId,
+      requiredTarget(seeded, 0),
+    )
+    await appendStreamText(
+      active.lease,
+      Array.from({ length: 129 }, (_, index) => ({
+        text: `${index}`,
+        createdAt: STARTED_AT + index + 1,
+      })),
+    )
+    const canonical = await canonicalizeContinuation(active.prepared, STARTED_AT + 200)
+    await execute({
+      kind: 'generation.post-commit-metadata',
+      input: {
+        streamId: canonical.streamId,
+        fence: leaseFence(canonical),
+        resourceProof: generationPostCommitMetadataResourceProof(canonical),
+      },
+    })
+    const cleanupLease = required(await streamLease(canonical.streamId), 'paged cleanup lease')
+    const command = {
+      kind: 'stream.finish-cleanup',
+      streamId: cleanupLease.streamId,
+      fence: leaseFence(cleanupLease),
+    } as const
+    const deletedPages: number[] = []
+
+    for (;;) {
+      const committed = await executeCommit(command)
+      deletedPages.push(committed.value.deletedFrames)
+      expect(committed.value.deletedFrames).toBeLessThanOrEqual(64)
+      if (committed.value.done) break
+    }
+
+    expect(deletedPages).toEqual([64, 64, 1])
+    expect(await streamLease(cleanupLease.streamId)).toBeUndefined()
+    expect(await streamFrames(cleanupLease.streamId, Number.MAX_SAFE_INTEGER)).toEqual([])
   })
 
   it('piggybacks lease freshness on chunk persistence and invalidates a stale recovery snapshot', async () => {
@@ -964,7 +1195,7 @@ describe('browser stream repository protocol', () => {
 
     const refreshed = required(await streamLease(active.lease.streamId), 'refreshed lease')
     expect(refreshed.heartbeatAt).toBe(STARTED_AT + 50_000)
-    expect(refreshed.revision).toBe(beforeAppend.revision + 1)
+    expect(refreshed.revision).toBe(beforeAppend.revision)
     await expect(
       execute({
         kind: 'stream.claim-recovery',
@@ -988,13 +1219,16 @@ describe('browser stream repository protocol', () => {
     const canonical = await canonicalizeContinuation(first, STARTED_AT + 2)
     await execute({
       kind: 'generation.post-commit-metadata',
-      input: { streamId: canonical.streamId, fence: leaseFence(canonical) },
+      input: {
+        streamId: canonical.streamId,
+        fence: leaseFence(canonical),
+        resourceProof: generationPostCommitMetadataResourceProof(canonical),
+      },
     })
     const cleanupLease = required(await streamLease(canonical.streamId), 'first cleanup lease')
     const oldFence = leaseFence(cleanupLease)
     await execute({
       kind: 'stream.finish-cleanup',
-      chatId: cleanupLease.chatId,
       streamId: cleanupLease.streamId,
       fence: oldFence,
     })
@@ -1010,7 +1244,6 @@ describe('browser stream repository protocol', () => {
     await expect(
       execute({
         kind: 'stream.finish-cleanup',
-        chatId: replacement.lease.chatId,
         streamId: replacement.lease.streamId,
         fence: oldFence,
       }),
@@ -1068,12 +1301,19 @@ async function continuationPrepareInput(input: {
     heartbeatAt: startedAt,
     attemptKind: 'continuation',
   })
-  const chat = await getDb().chats.get(input.chatId)
+  const chat =
+    (await getDb().chats.get(input.chatId)) ??
+    createChatRow({
+      id: input.chatId,
+      settings: settings(),
+      now: startedAt,
+    })
   const promptHeaders = await promptPathHeaderClaims(input.targetAssistantId)
   const selectedProfile = profile()
   return {
     strategy: 'continue',
     lease,
+    configurationLinkTransition: testChatConfigurationLinkTransition(chat),
     promptPath: {
       requirement: {
         kind: 'continue',
@@ -1159,6 +1399,13 @@ async function dispatchContinuation(
   prepared: AttemptPrepareResult,
   dispatchedAt: number,
 ): Promise<AttemptDispatchResult> {
+  return execute(continuationDispatchCommand(prepared, dispatchedAt))
+}
+
+function continuationDispatchCommand(
+  prepared: AttemptPrepareResult,
+  dispatchedAt: number,
+): Extract<WorkspaceCommand, { kind: 'attempt.dispatch' }> {
   if (prepared.strategy !== 'continue') throw new Error('expected continuation preparation')
   const generation: DispatchedGenerationMeta = {
     model: MODEL,
@@ -1181,6 +1428,10 @@ async function dispatchContinuation(
     input: {
       streamId: prepared.lease.streamId,
       fence: leaseFence(prepared.lease),
+      target: {
+        messageId: prepared.lease.messageId,
+        attemptKind: prepared.lease.attemptKind,
+      },
       readSet: {
         chatId: prepared.lease.chatId,
         messages: prepared.prompt.messageProofs,
@@ -1194,7 +1445,7 @@ async function dispatchContinuation(
       },
     },
   }
-  return execute(command)
+  return command
 }
 
 async function canonicalizeContinuation(
@@ -1241,6 +1492,7 @@ function continuationTerminal(
   return {
     kind: 'continuation',
     streamId: lease.streamId,
+    chatId: lease.chatId,
     fence: leaseFence(lease),
     messageId: lease.messageId,
     terminal,
@@ -1322,14 +1574,17 @@ async function appendStreamTextCommit(
     startPhysicalSeq: startSeq,
     startLogicalSeq: startSeq,
   })
-  return executeCommit({ kind: 'stream.append-journal-frames', frames })
+  return executeCommit({
+    kind: 'stream.append-journal-frames',
+    frames,
+    observedAt: Date.now(),
+  })
 }
 
 async function finishStream(lease: StreamLeaseRow): Promise<void> {
   for (;;) {
     const result = await execute({
       kind: 'stream.finish-cleanup',
-      chatId: lease.chatId,
       streamId: lease.streamId,
       fence: leaseFence(lease),
     })

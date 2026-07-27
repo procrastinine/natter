@@ -14,7 +14,6 @@ import {
 import {
   mergeMessageContextRouteFacts,
   persistedReasoningCarryForwardFromEvidence,
-  UNKNOWN_INBOUND_REASONING_VISIBILITY,
 } from '../core/reasoning'
 import { createStreamAccumulator, messageHasToolArtifacts } from '../core/stream-accumulator'
 import {
@@ -64,6 +63,8 @@ import {
   type GenerationIntent,
   generationAdmissionController,
   type NewChatGenerationIntent,
+  preparedAssistantMessage,
+  preparedUserMessage,
   type SelectedSendGenerationIntent,
 } from './generation-admission-controller'
 import {
@@ -612,6 +613,7 @@ async function runGeneration(input: {
                     ? {
                         kind: 'continuation',
                         streamId: input.streamId,
+                        chatId: input.chatId,
                         messageId: input.assistantMessageId,
                         fence: (streamLease as StreamLeaseHandle).fence,
                         accumulator,
@@ -632,6 +634,7 @@ async function runGeneration(input: {
                     : {
                         kind: 'generation',
                         streamId: input.streamId,
+                        chatId: input.chatId,
                         messageId: input.assistantMessageId,
                         fence: (streamLease as StreamLeaseHandle).fence,
                         accumulator,
@@ -895,6 +898,7 @@ function prepareCommandInput(
               ? { savedTextTemplate: configuration.savedTextTemplate }
               : {}),
           },
+          configurationLinkTransition: configuration.configurationLinkTransition,
         }
       : undefined
   switch (intent.kind) {
@@ -1126,6 +1130,10 @@ async function planAndDispatch(
       input: {
         streamId: input.streamId,
         fence: streamLease.fence,
+        target: {
+          messageId: streamLease.lease.messageId,
+          attemptKind: streamLease.lease.attemptKind,
+        },
         readSet: {
           chatId: input.chatId,
           messages: proofMessages,
@@ -1381,63 +1389,6 @@ function completionFromAttempt(
     outcome: result.outcome,
     ...(result.finishReason ? { finishReason: result.finishReason as FinishReason } : {}),
     ...(result.error ? { error: result.error } : {}),
-  }
-}
-
-function preparedUserMessage(input: {
-  id: MessageId
-  chatId: ChatId
-  content: readonly ContentItem[]
-  attachmentRefs?: readonly AttachmentRef[]
-  createdAt: number
-}): Message {
-  return {
-    id: input.id,
-    chatId: input.chatId,
-    parentId: null,
-    siblingIndex: 0,
-    turnId: newId(),
-    turnIndex: 0,
-    createdAt: input.createdAt,
-    role: 'user',
-    origin: 'user',
-    content: structuredClone([...input.content]),
-    ...(input.attachmentRefs ? { attachmentRefs: structuredClone([...input.attachmentRefs]) } : {}),
-    nodeVersion: 0,
-    deleted: false,
-  }
-}
-
-function preparedAssistantMessage(input: {
-  id: MessageId
-  chatId: ChatId
-  content: readonly ContentItem[]
-  model: string
-  createdAt: number
-}): Message {
-  return {
-    id: input.id,
-    chatId: input.chatId,
-    parentId: null,
-    siblingIndex: 0,
-    turnId: newId(),
-    turnIndex: 0,
-    createdAt: input.createdAt,
-    role: 'assistant',
-    origin: 'generated',
-    content: structuredClone([...input.content]),
-    generation: {
-      model: input.model,
-      requestedModel: input.model,
-      status: 'preparing',
-      integrity: 'clean',
-      costSource: 'stream',
-      startedAt: input.createdAt,
-      reasoningCarryForward: 'none',
-      reasoningVisibility: UNKNOWN_INBOUND_REASONING_VISIBILITY,
-    },
-    nodeVersion: 0,
-    deleted: false,
   }
 }
 

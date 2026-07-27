@@ -473,6 +473,7 @@ function conversationCommittedEffectsForDelta(
       case 'setting':
       case 'stream-lease':
       case 'stream-chunks':
+      case 'model-resolution':
       case 'discovery-cache':
       case 'storage-maintenance':
         break

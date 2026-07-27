@@ -341,6 +341,7 @@ function transcriptBinding(
     window,
     selectionEpoch: 0,
     viewportRevision,
+    intentPresentations: Object.freeze([]),
     reveal: null,
   })
 }

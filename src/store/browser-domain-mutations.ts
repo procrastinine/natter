@@ -16,7 +16,11 @@ import type {
   MutationScope,
 } from '../core/types'
 import type { AttachmentHeaderRow } from './attachment-storage'
-import type { BrowserMutationTableName } from './browser-mutation-plan'
+import type {
+  BrowserMutationTableName,
+  BrowserMutationTransactionAccess,
+} from './browser-mutation-plan'
+import type { TransactionCurrentChat } from './chat-storage-codec'
 import type { MessageBodyRow, MessageHeaderRow } from './message-storage'
 import type {
   FencedTransaction,
@@ -41,6 +45,12 @@ import type {
   WorkspaceMutationResult,
 } from './repository'
 import type {
+  SemanticOperationDescriptor,
+  SemanticOperationExactPhysicalRead,
+  SemanticOperationKind,
+  SemanticOperationRunner,
+} from './semantic-operation-capability'
+import type {
   GenerationPlanningSnapshot,
   GenerationPromptPathClaim,
   GenerationPromptPathProof,
@@ -49,6 +59,7 @@ import type {
   PreparedAttachmentBundle,
   PreparedGenerationPrompt,
   StorageMaintenanceRequestTaskKind,
+  WorkspaceCommand,
 } from './workspace-protocol'
 
 export const VALIDATED_GENERATION_PROMPT_PATH_HEADERS = Symbol(
@@ -71,7 +82,7 @@ export interface ResolvedGenerationPromptPath extends ValidatedGenerationPromptP
 }
 
 export interface ChatMutationState {
-  beforeChat: Chat
+  beforeChat: TransactionCurrentChat
   structuralSummaryDirty: boolean
   structuralVersionDirty: boolean
   previousBranchIds?: ReadonlySet<MessageId>
@@ -91,6 +102,7 @@ export interface ChatMutationState {
 }
 
 export interface BrowserMutationOperations {
+  getOwnedStreamLease(streamId: string): StreamLeaseRow
   validateGenerationPromptPathClaim(
     chatId: ChatId,
     claim: GenerationPromptPathClaim,
@@ -104,7 +116,7 @@ export interface BrowserMutationOperations {
 }
 
 export interface BrowserMutationTransactionExtension<Value, Result> {
-  readonly tableNames: readonly BrowserMutationTableName[]
+  readonly access: BrowserMutationTransactionAccess
   commit(tx: FencedTransaction<BrowserMutationTableName>, value: Value): Promise<Result> | Result
 }
 
@@ -259,28 +271,14 @@ export interface BrowserMutationRunnerPort {
 }
 
 export interface BrowserMutationCommandPort extends BrowserCommandSessionPort {
+  readonly command: WorkspaceCommand
+  readonly operationKind: WorkspaceCommand['kind']
   assertReplacementEpoch(expectedReplacementEpoch: number): void
 }
 
-export interface BrowserGenerationCommandPort extends BrowserMutationRunnerPort {
-  getStreamLease(streamId: string): Promise<StreamLeaseRow | undefined>
-}
+export type BrowserGenerationCommandPort = BrowserMutationRunnerPort
 
 export interface BrowserGenerationCommandSupport {
-  readonly GENERATION_METADATA_TRANSACTION: PhysicalTransactionPlan<
-    | 'configurationProfileCatalogRows'
-    | 'chatSidebarAggregates'
-    | 'chatSidebarRows'
-    | 'chats'
-    | 'configurationCatalogAggregates'
-    | 'configurationPresetCatalogRows'
-    | 'keys'
-    | 'messages'
-    | 'presets'
-    | 'profiles'
-    | 'settings'
-    | 'streamLeases'
-  >
   appendValidatedGenerationPromptPath(
     this: void,
     path: ValidatedGenerationPromptPath,
@@ -307,7 +305,6 @@ export interface BrowserGenerationCommandSupport {
     origin: 'user',
   ): void
   calibrationUsageFromPostCommit(this: void, usage: StreamPostCommitUsageEvidence): ChatUsage
-  chatConfigurationTargetResourceNames(this: void, chat: Chat): string[]
   chatTokenCalibrationGeneration(this: void, chat: Pick<Chat, 'tokenCalibrationGeneration'>): number
   cloneMessageHeader(this: void, message: MessageHeaderRow): MessageHeaderRow
   continuationGlobalCalibration(this: void, value: unknown): GlobalTokenCalibration | undefined
@@ -366,7 +363,29 @@ export interface BrowserLockedCommandPort {
   ): Promise<T>
 }
 
-export interface BrowserCommandSessionPort {
+export interface BrowserSemanticCommandPort<Kind extends SemanticOperationKind> {
+  executeSemanticOperation<Tables extends PhysicalStorageTableName, ResourceInput, Receipt, T>(
+    descriptor: SemanticOperationDescriptor<Kind, Tables, ResourceInput, Receipt>,
+    resourceInput: ResourceInput,
+    operation: SemanticOperationRunner<Tables, T, Receipt>,
+  ): Promise<T>
+  completeSemanticOperation<Tables extends PhysicalStorageTableName, ResourceInput, Receipt, T>(
+    descriptor: SemanticOperationDescriptor<Kind, Tables, ResourceInput, Receipt>,
+    resourceInput: ResourceInput,
+    value: T,
+    receipt: Receipt,
+  ): Promise<T>
+}
+
+export interface BrowserCommandSessionPort
+  extends BrowserSemanticCommandPort<SemanticOperationKind> {
+  readSemanticOperationPreflight<Tables extends PhysicalStorageTableName, T>(
+    plan: PhysicalTransactionPlan<Tables>,
+    operation: (tx: FencedTransaction<Tables>) => Promise<T> | T,
+    exactPhysicalReads?: (
+      value: T,
+    ) => readonly (SemanticOperationExactPhysicalRead & { readonly tableName: Tables })[],
+  ): Promise<T>
   withLocks<T>(
     resourceNames: readonly string[],
     operation: (locked: BrowserLockedCommandPort) => Promise<T> | T,

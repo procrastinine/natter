@@ -51,6 +51,11 @@ import {
 import type { SettingsRow } from './db-rows'
 import type { MessageBodyRow, MessageHeaderRow } from './message-storage'
 import type { PhysicalStorageTableName } from './physical-storage-tables'
+import {
+  boundSemanticOperationExactReceiptAccumulator,
+  type SemanticOperationExactReceiptAccumulator,
+  type SemanticOperationPhysicalWriteOperation,
+} from './semantic-operation-capability'
 import { accumulateStorageCompactionDebt } from './storage-compaction-state'
 import {
   estimateAttachmentPayloadProjectionStorageBytes,
@@ -86,14 +91,41 @@ type ConfigurationOwnerLinkTransition =
   | RepairDeleteConfigurationOwnerLinkTransition
 
 const profileUsageRevisionTransactions = new WeakSet<object>()
-const CONFIGURATION_OWNER_LINK_BATCH_SIZE = 128
+export const CONFIGURATION_OWNER_LINK_BATCH_SIZE = 128
+
+export interface ConfigurationOwnerLinkMutationReceipt {
+  readonly ownerQueryRequests: number
+  readonly ownerQueryRowCount: number
+  readonly removedLinkIds: readonly string[]
+  readonly writtenLinkIds: readonly string[]
+  readonly profileUsageReadRequests: number
+  readonly profileUsageMutations: readonly {
+    readonly profileId: ProfileId
+    readonly operation: 'write' | 'delete'
+  }[]
+  readonly profileManagerRevisionChanged: boolean
+}
+
+export function emptyConfigurationOwnerLinkMutationReceipt(): ConfigurationOwnerLinkMutationReceipt {
+  return Object.freeze({
+    ownerQueryRequests: 0,
+    ownerQueryRowCount: 0,
+    removedLinkIds: Object.freeze([]),
+    writtenLinkIds: Object.freeze([]),
+    profileUsageReadRequests: 0,
+    profileUsageMutations: Object.freeze([]),
+    profileManagerRevisionChanged: false,
+  })
+}
 
 export async function addPhysicalStorageRow<Row, Key>(
   tx: Transaction,
   tableName: PhysicalStorageTableName,
   next: Row,
 ): Promise<void> {
-  await tx.table<Row, Key>(tableName).add(next)
+  const receipt = recordConstructivePhysicalWrite(tx, tableName, 'add', [next])
+  const key = await tx.table<Row, Key>(tableName).add(next)
+  recordConstructivePhysicalKeys(receipt, tableName, 'write', [key])
 }
 
 export async function addPhysicalStorageRows<Row, Key>(
@@ -102,7 +134,9 @@ export async function addPhysicalStorageRows<Row, Key>(
   next: readonly Row[],
 ): Promise<void> {
   if (next.length === 0) return
+  const receipt = recordConstructivePhysicalWrite(tx, tableName, 'add', next)
   await tx.table<Row, Key>(tableName).bulkAdd([...next])
+  recordConstructivePhysicalRows(receipt, tx, tableName, 'write', next)
 }
 
 export async function putPhysicalStorageRow<Row, Key>(
@@ -113,11 +147,24 @@ export async function putPhysicalStorageRow<Row, Key>(
 ): Promise<void> {
   const table = tx.table<Row, Key>(tableName)
   if (!previous) {
-    await table.add(next)
+    const receipt = recordConstructivePhysicalWrite(tx, tableName, 'add', [next])
+    const key = await table.add(next)
+    recordConstructivePhysicalKeys(receipt, tableName, 'write', [key])
     return
   }
-  await recordObsoleteByteOwnerValues(tx, [previous])
-  await table.put(next)
+  await replacePhysicalStorageRow<Row, Key>(tx, tableName, next, previous)
+}
+
+export async function replacePhysicalStorageRow<Row, Key>(
+  tx: Transaction,
+  tableName: PhysicalStorageTableName,
+  next: Row,
+  previous: Row | undefined,
+): Promise<void> {
+  if (previous !== undefined) await recordObsoleteByteOwnerValues(tx, [previous])
+  const receipt = recordConstructivePhysicalWrite(tx, tableName, 'put', [next])
+  const key = await tx.table<Row, Key>(tableName).put(next)
+  recordConstructivePhysicalKeys(receipt, tableName, 'write', [key])
 }
 
 export async function putPhysicalStorageRows<Row, Key>(
@@ -128,7 +175,9 @@ export async function putPhysicalStorageRows<Row, Key>(
 ): Promise<void> {
   if (next.length === 0) return
   await recordObsoleteByteOwnerValues(tx, replaced)
+  const receipt = recordConstructivePhysicalWrite(tx, tableName, 'put', next)
   await tx.table<Row, Key>(tableName).bulkPut([...next])
+  recordConstructivePhysicalRows(receipt, tx, tableName, 'write', next)
 }
 
 export async function putChatFolderByteOwner(
@@ -187,7 +236,18 @@ export async function deletePhysicalStorageRows<Row, Key>(
   if (keys.length === 0) return
   recordBrowserCommandPhysicalDeletionRows(tx, tableName, keys, previous)
   await recordObsoleteByteOwnerValues(tx, previous)
+  await deletePhysicalStorageKeys<Row, Key>(tx, tableName, keys)
+}
+
+export async function deletePhysicalStorageKeys<Row, Key>(
+  tx: Transaction,
+  tableName: PhysicalStorageTableName,
+  keys: readonly Key[],
+): Promise<void> {
+  if (keys.length === 0) return
+  const receipt = recordConstructivePhysicalWrite(tx, tableName, 'delete', keys)
   await tx.table<Row, Key>(tableName).bulkDelete([...keys])
+  recordConstructivePhysicalKeys(receipt, tableName, 'delete', keys)
 }
 
 export async function deletePhysicalStorageCollection<Row, Key>(
@@ -205,8 +265,77 @@ export async function deletePhysicalStorageCollection<Row, Key>(
   })
   recordBrowserCommandPhysicalDeletionRows(tx, tableName, keys, rows)
   await recordObsoleteByteOwnerBytes(tx, obsoleteBytes)
-  if (keys.length > 0) await tx.table<Row, Key>(tableName).bulkDelete(keys)
+  if (keys.length > 0) {
+    await deletePhysicalStorageKeys<Row, Key>(tx, tableName, keys)
+  }
   return keys.length
+}
+
+function recordConstructivePhysicalKeys(
+  receipt: SemanticOperationExactReceiptAccumulator<PhysicalStorageTableName> | undefined,
+  tableName: PhysicalStorageTableName,
+  mutationOperation: 'write' | 'delete',
+  keys: readonly unknown[],
+): void {
+  if (!receipt) return
+  for (const key of keys) {
+    receipt.physicalMutation({ tableName, operation: mutationOperation, key })
+  }
+}
+
+function recordConstructivePhysicalRows<Row>(
+  receipt: SemanticOperationExactReceiptAccumulator<PhysicalStorageTableName> | undefined,
+  tx: Transaction,
+  tableName: PhysicalStorageTableName,
+  mutationOperation: 'write' | 'delete',
+  rows: readonly Row[],
+): void {
+  if (!receipt) return
+  const keyPath = tx.table(tableName).schema.primKey.keyPath
+  if (keyPath === null || keyPath === undefined) {
+    throw new Error(`SemanticOperationPhysicalKeyPathMissing:${tableName}`)
+  }
+  const keyPaths = Array.isArray(keyPath) ? keyPath : [keyPath]
+  const keys = rows.map((row) => {
+    const values = keyPaths.map((path) => physicalStorageRowKeyPathValue(row, path))
+    return values.length === 1 ? values[0] : values
+  })
+  recordConstructivePhysicalKeys(receipt, tableName, mutationOperation, keys)
+}
+
+function recordConstructivePhysicalWrite(
+  tx: Transaction,
+  tableName: PhysicalStorageTableName,
+  operation: SemanticOperationPhysicalWriteOperation,
+  values: readonly unknown[],
+): SemanticOperationExactReceiptAccumulator<PhysicalStorageTableName> | undefined {
+  const receipt = boundSemanticOperationExactReceiptAccumulator<PhysicalStorageTableName>(tx)
+  if (!receipt) return undefined
+  let estimatedBytes = 0
+  for (const value of values) {
+    estimatedBytes = saturatingAdd(estimatedBytes, estimateStoredValueBytes(value))
+  }
+  receipt.physicalWrite({
+    tableName,
+    operation,
+    requestCount: 1,
+    rowCount: values.length,
+    maxRequestRows: values.length,
+    estimatedBytes,
+  })
+  return receipt
+}
+
+function physicalStorageRowKeyPathValue(row: unknown, keyPath: string): unknown {
+  let value = row
+  for (const key of keyPath.split('.')) {
+    if (typeof value !== 'object' || value === null || !Object.hasOwn(value, key)) {
+      throw new Error(`SemanticOperationPhysicalKeyMissing:${keyPath}`)
+    }
+    value = (value as Record<string, unknown>)[key]
+  }
+  if (value === undefined) throw new Error(`SemanticOperationPhysicalKeyMissing:${keyPath}`)
+  return value
 }
 
 export async function deleteChatOwnedPhysicalStorageCollectionWithKnownBytes<
@@ -227,17 +356,23 @@ export async function deleteChatOwnedPhysicalStorageCollectionWithKnownBytes<
     ownerIds,
   })
   await recordObsoleteByteOwnerBytes(tx, obsoleteBytes)
-  if (keys.length > 0) await tx.table<Row, Key>(tableName).bulkDelete(keys)
+  if (keys.length > 0) {
+    await deletePhysicalStorageKeys<Row, Key>(tx, tableName, keys)
+  }
   return keys.length
 }
 
 async function applyConfigurationOwnerLinkTransitions(
   tx: Transaction,
   transitions: readonly ConfigurationOwnerLinkTransition[],
-): Promise<void> {
-  if (transitions.length === 0) return
+): Promise<ConfigurationOwnerLinkMutationReceipt> {
+  if (transitions.length === 0) return emptyConfigurationOwnerLinkMutationReceipt()
   assertConfigurationOwnerLinkTransitions(transitions)
   const usageDeltas = new Map<ProfileId, ConfigurationProfileUsageDelta>()
+  const removedLinkIds: string[] = []
+  const writtenLinkIds: string[] = []
+  let ownerQueryRequests = 0
+  let ownerQueryRowCount = 0
   for (let offset = 0; offset < transitions.length; offset += CONFIGURATION_OWNER_LINK_BATCH_SIZE) {
     const batch = transitions.slice(offset, offset + CONFIGURATION_OWNER_LINK_BATCH_SIZE)
     const nextLinks = batch.flatMap((transition) => [...transition.next])
@@ -249,6 +384,8 @@ async function applyConfigurationOwnerLinkTransitions(
       .where('ownerKey')
       .anyOf(batchOwnerKeys)
       .toArray()
+    ownerQueryRequests += 1
+    ownerQueryRowCount += storedLinks.length
     const storedByOwner = configurationLinksByOwnerKey(storedLinks)
     for (const transition of batch) {
       const ownerKey = configurationOwnerKey(transition.ownerKind, transition.ownerId)
@@ -270,6 +407,7 @@ async function applyConfigurationOwnerLinkTransitions(
     const storedById = uniqueConfigurationLinksById(storedLinks)
     const nextById = uniqueConfigurationLinksById(nextLinks)
     const removed = storedLinks.filter((link) => !nextById.has(link.id))
+    removedLinkIds.push(...removed.map((link) => link.id))
     await deletePhysicalStorageRows(
       tx,
       'configurationLinks',
@@ -280,6 +418,7 @@ async function applyConfigurationOwnerLinkTransitions(
       const stored = storedById.get(link.id)
       return !stored || !sameConfigurationValue(stored, link)
     })
+    writtenLinkIds.push(...changed.map((link) => link.id))
     await putPhysicalStorageRows(
       tx,
       'configurationLinks',
@@ -290,27 +429,39 @@ async function applyConfigurationOwnerLinkTransitions(
       }),
     )
   }
-  await applyConfigurationProfileUsageDeltas(tx, [...usageDeltas.values()])
+  const usage = await applyConfigurationProfileUsageDeltas(tx, [...usageDeltas.values()])
+  return Object.freeze({
+    ownerQueryRequests,
+    ownerQueryRowCount,
+    removedLinkIds: Object.freeze(removedLinkIds.sort()),
+    writtenLinkIds: Object.freeze(writtenLinkIds.sort()),
+    profileUsageReadRequests: usage.readRequests,
+    profileUsageMutations: usage.mutations,
+    profileManagerRevisionChanged: usage.profileManagerRevisionChanged,
+  })
 }
 
 async function addConfigurationOwnerLinks(
   tx: Transaction,
   transitions: readonly ExactConfigurationOwnerLinkTransition[],
-): Promise<void> {
-  if (transitions.length === 0) return
+): Promise<ConfigurationOwnerLinkMutationReceipt> {
+  if (transitions.length === 0) return emptyConfigurationOwnerLinkMutationReceipt()
   assertConfigurationOwnerLinkTransitions(transitions)
   if (transitions.some((transition) => transition.previous.length !== 0)) {
     throw new Error('ConfigurationOwnerLinkAdditionPreviousNotEmpty')
   }
   uniqueConfigurationLinksById(transitions.flatMap((transition) => [...transition.next]))
   const usageDeltas = new Map<ProfileId, ConfigurationProfileUsageDelta>()
+  const writtenLinkIds: string[] = []
   for (let offset = 0; offset < transitions.length; offset += CONFIGURATION_OWNER_LINK_BATCH_SIZE) {
     const batch = transitions.slice(offset, offset + CONFIGURATION_OWNER_LINK_BATCH_SIZE)
+    const links = batch.flatMap((transition) => transition.next)
     await addPhysicalStorageRows(
       tx,
       'configurationLinks',
-      batch.flatMap((transition) => transition.next.map((link) => structuredClone(link))),
+      links.map((link) => structuredClone(link)),
     )
+    writtenLinkIds.push(...links.map((link) => link.id))
     for (const transition of batch) {
       addConfigurationProfileUsageDeltas(
         usageDeltas,
@@ -318,7 +469,16 @@ async function addConfigurationOwnerLinks(
       )
     }
   }
-  await applyConfigurationProfileUsageDeltas(tx, [...usageDeltas.values()])
+  const usage = await applyConfigurationProfileUsageDeltas(tx, [...usageDeltas.values()])
+  return Object.freeze({
+    ownerQueryRequests: 0,
+    ownerQueryRowCount: 0,
+    removedLinkIds: Object.freeze([]),
+    writtenLinkIds: Object.freeze(writtenLinkIds.sort()),
+    profileUsageReadRequests: usage.readRequests,
+    profileUsageMutations: usage.mutations,
+    profileManagerRevisionChanged: usage.profileManagerRevisionChanged,
+  })
 }
 
 function assertConfigurationOwnerLinkTransitions(
@@ -405,14 +565,33 @@ function addConfigurationProfileUsageDeltas(
 async function applyConfigurationProfileUsageDeltas(
   tx: Transaction,
   deltas: readonly ConfigurationProfileUsageDelta[],
-): Promise<void> {
-  if (deltas.length === 0) return
+): Promise<{
+  readonly readRequests: number
+  readonly mutations: readonly {
+    readonly profileId: ProfileId
+    readonly operation: 'write' | 'delete'
+  }[]
+  readonly profileManagerRevisionChanged: boolean
+}> {
+  if (deltas.length === 0) {
+    return {
+      readRequests: 0,
+      mutations: Object.freeze([]),
+      profileManagerRevisionChanged: false,
+    }
+  }
   const table = tx.table<ConfigurationProfileUsageProjectionRow, ProfileId>(
     'configurationProfileUsageRows',
   )
+  const mutations: Array<{
+    readonly profileId: ProfileId
+    readonly operation: 'write' | 'delete'
+  }> = []
+  let readRequests = 0
   for (let offset = 0; offset < deltas.length; offset += CONFIGURATION_OWNER_LINK_BATCH_SIZE) {
     const batch = deltas.slice(offset, offset + CONFIGURATION_OWNER_LINK_BATCH_SIZE)
     const previousRows = await table.bulkGet(batch.map((delta) => delta.id))
+    readRequests += 1
     const deletedIds: ProfileId[] = []
     const deletedRows: ConfigurationProfileUsageProjectionRow[] = []
     const writtenRows: ConfigurationProfileUsageProjectionRow[] = []
@@ -454,8 +633,13 @@ async function applyConfigurationProfileUsageDeltas(
     }
     await deletePhysicalStorageRows(tx, 'configurationProfileUsageRows', deletedIds, deletedRows)
     await putPhysicalStorageRows(tx, 'configurationProfileUsageRows', writtenRows, replacedRows)
+    mutations.push(
+      ...deletedIds.map((profileId) => ({ profileId, operation: 'delete' as const })),
+      ...writtenRows.map(({ id: profileId }) => ({ profileId, operation: 'write' as const })),
+    )
   }
   const transactionIdentity = tx.idbtrans as unknown as object
+  let profileManagerRevisionChanged = false
   if (!profileUsageRevisionTransactions.has(transactionIdentity)) {
     profileUsageRevisionTransactions.add(transactionIdentity)
     const states = tx.table<ConfigurationProfileManagerStateRow, string>(
@@ -469,7 +653,19 @@ async function applyConfigurationProfileUsageDeltas(
       { ...state, revision: state.revision + 1 },
       state,
     )
-    recordBrowserCommandInvalidation(tx, { kind: 'profile', facets: ['dependent-counts'] })
+    recordBrowserCommandInvalidation(tx, {
+      kind: 'profile',
+      profileIds: deltas.map((delta) => delta.id),
+      facets: ['dependent-counts'],
+    })
+    profileManagerRevisionChanged = true
+  }
+  return {
+    readRequests,
+    mutations: Object.freeze(
+      mutations.sort((left, right) => left.profileId.localeCompare(right.profileId)),
+    ),
+    profileManagerRevisionChanged,
   }
 }
 
@@ -516,8 +712,8 @@ export async function addLinkedSemanticByteOwner<
   tx: Transaction,
   tableName: TableName,
   next: LinkedSemanticByteOwnerRows[TableName],
-): Promise<void> {
-  await addLinkedSemanticByteOwnerBatch(tx, tableName, [next])
+): Promise<ConfigurationOwnerLinkMutationReceipt> {
+  return addLinkedSemanticByteOwnerBatch(tx, tableName, [next])
 }
 
 export async function addLinkedSemanticByteOwnerBatch<
@@ -526,16 +722,16 @@ export async function addLinkedSemanticByteOwnerBatch<
   tx: Transaction,
   tableName: TableName,
   next: readonly LinkedSemanticByteOwnerRows[TableName][],
-): Promise<void> {
-  if (next.length === 0) return
+): Promise<ConfigurationOwnerLinkMutationReceipt> {
+  if (next.length === 0) return emptyConfigurationOwnerLinkMutationReceipt()
   const ids = new Set<string>()
   for (const row of next) {
     if (ids.has(row.id)) throw new Error(`SemanticByteOwnerBatchIdentityDuplicate:${tableName}`)
     ids.add(row.id)
   }
-  await tx.table<AllSemanticByteOwnerRow, string>(tableName).bulkAdd([...next])
+  await addPhysicalStorageRows<AllSemanticByteOwnerRow, string>(tx, tableName, next)
   for (const row of next) recordSemanticConfigurationMutation(tx, tableName, undefined, row)
-  await addConfigurationOwnerLinks(
+  return addConfigurationOwnerLinks(
     tx,
     next.map((row) => linkedSemanticByteOwnerTransition(tableName, undefined, row)),
   )
@@ -546,7 +742,7 @@ async function addSemanticByteOwnerRaw<TableName extends AllSemanticByteOwnerTab
   tableName: TableName,
   next: AllSemanticByteOwnerRow,
 ): Promise<void> {
-  await tx.table<AllSemanticByteOwnerRow, string>(tableName).add(next)
+  await addPhysicalStorageRow<AllSemanticByteOwnerRow, string>(tx, tableName, next)
   recordSemanticConfigurationMutation(tx, tableName, undefined, next)
 }
 
@@ -566,13 +762,8 @@ export async function replaceLinkedSemanticByteOwner<
   tableName: TableName,
   next: LinkedSemanticByteOwnerRows[TableName],
   previous: LinkedSemanticByteOwnerRows[TableName],
-): Promise<void> {
-  await replaceSemanticByteOwnerRaw(tx, tableName, next, previous)
-  if (!sameLinkedSemanticByteOwnerLinks(tableName, previous, next)) {
-    await applyConfigurationOwnerLinkTransitions(tx, [
-      linkedSemanticByteOwnerTransition(tableName, previous, next),
-    ])
-  }
+): Promise<ConfigurationOwnerLinkMutationReceipt> {
+  return replaceLinkedSemanticByteOwnerBatch(tx, tableName, [next], [previous])
 }
 
 async function replaceSemanticByteOwnerRaw<TableName extends AllSemanticByteOwnerTableName>(
@@ -582,8 +773,7 @@ async function replaceSemanticByteOwnerRaw<TableName extends AllSemanticByteOwne
   previous: AllSemanticByteOwnerRow,
 ): Promise<void> {
   if (next.id !== previous.id) throw new Error(`SemanticByteOwnerIdentityMismatch:${tableName}`)
-  await recordObsoleteByteOwnerValues(tx, [previous])
-  await tx.table<AllSemanticByteOwnerRow, string>(tableName).put(next)
+  await replacePhysicalStorageRow<AllSemanticByteOwnerRow, string>(tx, tableName, next, previous)
   recordSemanticConfigurationMutation(tx, tableName, previous, next)
 }
 
@@ -616,9 +806,9 @@ export async function deleteLinkedSemanticByteOwner<
   tableName: TableName,
   key: LinkedSemanticByteOwnerKeys[TableName],
   previous: LinkedSemanticByteOwnerRows[TableName],
-): Promise<void> {
+): Promise<ConfigurationOwnerLinkMutationReceipt> {
   await deleteSemanticByteOwnerRaw(tx, tableName, key, previous)
-  await applyConfigurationOwnerLinkTransitions(tx, [
+  return applyConfigurationOwnerLinkTransitions(tx, [
     linkedSemanticByteOwnerTransition(tableName, previous, undefined),
   ])
 }
@@ -635,8 +825,12 @@ export async function deleteLinkedSemanticByteOwnerBatchRepairingLinks<
     throw new Error(`SemanticByteOwnerBatchIdentityMismatch:${tableName}`)
   }
   const ownerKind = linkedSemanticByteOwnerKind(tableName)
-  await recordObsoleteByteOwnerValues(tx, previous)
-  await tx.table<AllSemanticByteOwnerRow, string>(tableName).bulkDelete([...keys] as string[])
+  await deletePhysicalStorageRows<AllSemanticByteOwnerRow, string>(
+    tx,
+    tableName,
+    keys as string[],
+    previous,
+  )
   for (const row of previous) recordSemanticConfigurationMutation(tx, tableName, row, undefined)
   await applyConfigurationOwnerLinkTransitions(
     tx,
@@ -659,8 +853,7 @@ async function deleteSemanticByteOwnerRaw<TableName extends AllSemanticByteOwner
   previous: AllSemanticByteOwnerRow,
 ): Promise<void> {
   if (previous.id !== key) throw new Error(`SemanticByteOwnerIdentityMismatch:${tableName}`)
-  await recordObsoleteByteOwnerValues(tx, [previous])
-  await tx.table<AllSemanticByteOwnerRow, string>(tableName).delete(key)
+  await deletePhysicalStorageRows<AllSemanticByteOwnerRow, string>(tx, tableName, [key], [previous])
   recordSemanticConfigurationMutation(tx, tableName, previous, undefined)
 }
 
@@ -671,7 +864,7 @@ export async function replaceLinkedSemanticByteOwnerBatch<
   tableName: TableName,
   next: readonly LinkedSemanticByteOwnerRows[TableName][],
   previous: readonly LinkedSemanticByteOwnerRows[TableName][],
-): Promise<void> {
+): Promise<ConfigurationOwnerLinkMutationReceipt> {
   await replaceSemanticByteOwnerBatchRaw(tx, tableName, next, previous)
   const transitions = next.flatMap((row, index) => {
     const previousRow = previous[index]
@@ -679,7 +872,7 @@ export async function replaceLinkedSemanticByteOwnerBatch<
       ? []
       : [linkedSemanticByteOwnerTransition(tableName, previousRow, row)]
   })
-  await applyConfigurationOwnerLinkTransitions(tx, transitions)
+  return applyConfigurationOwnerLinkTransitions(tx, transitions)
 }
 
 export async function replaceLinkedSemanticByteOwnerPreservingLinksBatch<
@@ -723,8 +916,7 @@ async function replaceSemanticByteOwnerBatchRaw<TableName extends AllSemanticByt
   ) {
     throw new Error(`SemanticByteOwnerBatchIdentityMismatch:${tableName}`)
   }
-  await recordObsoleteByteOwnerValues(tx, previous)
-  await tx.table<AllSemanticByteOwnerRow, string>(tableName).bulkPut([...next])
+  await putPhysicalStorageRows<AllSemanticByteOwnerRow, string>(tx, tableName, next, previous)
   for (let index = 0; index < next.length; index += 1) {
     recordSemanticConfigurationMutation(tx, tableName, previous[index], next[index])
   }
@@ -822,11 +1014,8 @@ export async function putUserSettingByteOwner(
   assertUserSettingKey(next.key)
   if (previous) {
     assertUserSettingKey(previous.key)
-    await recordObsoleteByteOwnerValues(tx, [previous])
   }
-  const table = tx.table<SettingsRow, string>('settings')
-  if (previous) await table.put(next)
-  else await table.add(next)
+  await putPhysicalStorageRow<SettingsRow, string>(tx, 'settings', next, previous)
   recordBrowserCommandOwnerInvalidation(tx, { kind: 'setting', keys: [next.key] })
 }
 
@@ -847,8 +1036,7 @@ export async function putUserSettingByteOwners(
   for (const row of next) assertUserSettingKey(row.key)
   const replaced = previous.filter((row): row is SettingsRow => row !== undefined)
   for (const row of replaced) assertUserSettingKey(row.key)
-  await recordObsoleteByteOwnerValues(tx, replaced)
-  await tx.table<SettingsRow, string>('settings').bulkPut([...next])
+  await putPhysicalStorageRows<SettingsRow, string>(tx, 'settings', next, replaced)
   recordBrowserCommandOwnerInvalidation(tx, {
     kind: 'setting',
     keys: next.map((row) => row.key),
@@ -860,8 +1048,7 @@ export async function deleteUserSettingByteOwner(
   previous: SettingsRow,
 ): Promise<void> {
   assertUserSettingKey(previous.key)
-  await recordObsoleteByteOwnerValues(tx, [previous])
-  await tx.table<SettingsRow, string>('settings').delete(previous.key)
+  await deletePhysicalStorageRows<SettingsRow, string>(tx, 'settings', [previous.key], [previous])
   recordBrowserCommandOwnerInvalidation(tx, { kind: 'setting', keys: [previous.key] })
 }
 
@@ -873,10 +1060,7 @@ export async function putTokenCalibrationSettingByteOwner(
   if (previous && previous.key !== next.key) {
     throw new Error('TokenCalibrationSettingKeyMismatch')
   }
-  await recordObsoleteByteOwnerValues(tx, [previous])
-  const table = tx.table<SettingsRow, string>('settings')
-  if (previous) await table.put(next)
-  else await table.add(next)
+  await putPhysicalStorageRow<SettingsRow, string>(tx, 'settings', next, previous)
   recordBrowserCommandOwnerInvalidation(tx, { kind: 'setting', keys: [next.key] })
 }
 
@@ -902,7 +1086,7 @@ export function recordObsoleteByteOwnerBytes(
 }
 
 export async function insertMessageBody(tx: Transaction, body: MessageBodyRow): Promise<void> {
-  await tx.table<MessageBodyRow, string>('messageBodies').add(body)
+  await addPhysicalStorageRow<MessageBodyRow, string>(tx, 'messageBodies', body)
 }
 
 export async function replaceMessageBody(
@@ -917,14 +1101,14 @@ export async function replaceMessageBody(
     throw new Error('MessageBodyIdentityMismatch')
   }
   if (previous.kind === 'row') {
-    await recordObsoleteByteOwnerValues(tx, [previous.row])
+    await replacePhysicalStorageRow<MessageBodyRow, string>(tx, 'messageBodies', body, previous.row)
   } else {
     await recordObsoleteByteOwnerBytes(
       tx,
       estimateMessageBodyProjectionStorageBytes(previous.header),
     )
+    await replacePhysicalStorageRow<MessageBodyRow, string>(tx, 'messageBodies', body, undefined)
   }
-  await tx.table<MessageBodyRow, string>('messageBodies').put(body)
 }
 
 export async function deleteChatAuxiliaryByteOwners(
@@ -944,7 +1128,7 @@ export async function deleteChatAuxiliaryByteOwners(
       input.messageBodyProjectionBytes,
     ),
     deletedDraftChatIds.length > 0
-      ? tx.table('drafts').bulkDelete(deletedDraftChatIds)
+      ? deletePhysicalStorageKeys<DraftRow, string>(tx, 'drafts', deletedDraftChatIds)
       : Promise.resolve(),
   ])
   if (deletedDraftChatIds.length > 0) {
@@ -972,14 +1156,7 @@ export async function putDraftByteOwner(
   previous: DraftRow | undefined,
 ): Promise<void> {
   if (previous && previous.chatId !== next.chatId) throw new Error('DraftByteOwnerIdentityMismatch')
-  const table = tx.table<DraftRow, string>('drafts')
-  if (!previous) {
-    await table.add(next)
-    recordBrowserCommandOwnerInvalidation(tx, { kind: 'draft', chatIds: [next.chatId] })
-    return
-  }
-  await recordObsoleteByteOwnerValues(tx, [previous])
-  await table.put(next)
+  await putPhysicalStorageRow<DraftRow, string>(tx, 'drafts', next, previous)
   recordBrowserCommandOwnerInvalidation(tx, { kind: 'draft', chatIds: [next.chatId] })
 }
 
@@ -987,7 +1164,7 @@ export async function addTextTemplateByteOwner(
   tx: Transaction,
   template: SavedTextTemplate,
 ): Promise<void> {
-  await tx.table<SavedTextTemplate, TextTemplateId>('textTemplates').add(template)
+  await addPhysicalStorageRow<SavedTextTemplate, TextTemplateId>(tx, 'textTemplates', template)
   recordBrowserCommandOwnerInvalidation(tx, {
     kind: 'text-template',
     templateIds: [template.id],
@@ -1000,8 +1177,12 @@ export async function replaceTextTemplateByteOwner(
   previous: SavedTextTemplate,
 ): Promise<void> {
   if (next.id !== previous.id) throw new Error('TextTemplateByteOwnerIdentityMismatch')
-  await recordObsoleteByteOwnerValues(tx, [previous])
-  await tx.table<SavedTextTemplate, TextTemplateId>('textTemplates').put(next)
+  await replacePhysicalStorageRow<SavedTextTemplate, TextTemplateId>(
+    tx,
+    'textTemplates',
+    next,
+    previous,
+  )
   recordBrowserCommandOwnerInvalidation(tx, { kind: 'text-template', templateIds: [next.id] })
 }
 
@@ -1010,8 +1191,12 @@ export async function deleteTextTemplateByteOwner(
   templateId: TextTemplateId,
   previous: SavedTextTemplate,
 ): Promise<void> {
-  await recordObsoleteByteOwnerValues(tx, [previous])
-  await tx.table<SavedTextTemplate, TextTemplateId>('textTemplates').delete(templateId)
+  await deletePhysicalStorageRows<SavedTextTemplate, TextTemplateId>(
+    tx,
+    'textTemplates',
+    [templateId],
+    [previous],
+  )
   recordBrowserCommandOwnerInvalidation(tx, { kind: 'text-template', templateIds: [templateId] })
 }
 
@@ -1036,18 +1221,7 @@ export async function putAttachmentHeaderByteOwner(
   previous: AttachmentHeaderRow | undefined,
 ): Promise<void> {
   if (previous && previous.id !== next.id) throw new Error('AttachmentHeaderIdentityMismatch')
-  const table = tx.table<AttachmentHeaderRow, AttachmentId>('attachments')
-  if (!previous) {
-    await table.add(next)
-    recordBrowserCommandAttachmentRow(tx, next.id, true)
-    recordBrowserCommandOwnerInvalidation(tx, {
-      kind: 'attachment',
-      attachmentIds: [next.id],
-    })
-    return
-  }
-  await recordObsoleteByteOwnerValues(tx, [previous])
-  await table.put(next)
+  await putPhysicalStorageRow<AttachmentHeaderRow, AttachmentId>(tx, 'attachments', next, previous)
   recordBrowserCommandAttachmentRow(tx, next.id, true)
   recordBrowserCommandOwnerInvalidation(tx, { kind: 'attachment', attachmentIds: [next.id] })
 }
@@ -1056,8 +1230,12 @@ export async function deleteAttachmentHeaderByteOwner(
   tx: Transaction,
   previous: AttachmentHeaderRow,
 ): Promise<void> {
-  await recordObsoleteByteOwnerValues(tx, [previous])
-  await tx.table<AttachmentHeaderRow, AttachmentId>('attachments').delete(previous.id)
+  await deletePhysicalStorageRows<AttachmentHeaderRow, AttachmentId>(
+    tx,
+    'attachments',
+    [previous.id],
+    [previous],
+  )
   recordBrowserCommandAttachmentRow(tx, previous.id, false)
   recordBrowserCommandOwnerInvalidation(tx, {
     kind: 'attachment',
@@ -1076,8 +1254,7 @@ export async function replaceAttachmentHeaderByteOwnerBatch(
   ) {
     throw new Error('AttachmentHeaderBatchIdentityMismatch')
   }
-  await recordObsoleteByteOwnerValues(tx, previous)
-  await tx.table<AttachmentHeaderRow, AttachmentId>('attachments').bulkPut([...next])
+  await putPhysicalStorageRows<AttachmentHeaderRow, AttachmentId>(tx, 'attachments', next, previous)
   for (const row of next) recordBrowserCommandAttachmentRow(tx, row.id, true)
   recordBrowserCommandOwnerInvalidation(tx, {
     kind: 'attachment',
@@ -1152,16 +1329,68 @@ export async function deleteAttachmentByteOwnerBundle(
   attachmentId: AttachmentId,
   header: AttachmentHeaderRow,
 ): Promise<{ blobs: number; artifacts: number; jobs: number }> {
-  const [blobs, artifacts, jobs] = await Promise.all([
-    deleteAttachmentRows(tx, 'attachmentBlobs', attachmentId),
-    deleteAttachmentRows(tx, 'attachmentArtifacts', attachmentId),
-    deleteAttachmentRows(tx, 'attachmentJobs', attachmentId),
+  return replaceAttachmentByteOwnerBundle(tx, attachmentId, header, {
+    blobs: [],
+    artifacts: [],
+    jobs: [],
+  })
+}
+
+export async function replaceAttachmentByteOwnerBundle(
+  tx: Transaction,
+  attachmentId: AttachmentId,
+  header: AttachmentHeaderRow | undefined,
+  next: {
+    readonly blobs: readonly AttachmentBlob[]
+    readonly artifacts: readonly AttachmentArtifact[]
+    readonly jobs: readonly AttachmentJob[]
+  },
+): Promise<{ blobs: number; artifacts: number; jobs: number }> {
+  if (
+    next.blobs.some((row) => row.attachmentId !== attachmentId) ||
+    next.artifacts.some((row) => row.attachmentId !== attachmentId) ||
+    next.jobs.some((row) => row.attachmentId !== attachmentId)
+  ) {
+    throw new Error(`AttachmentPayloadIdentityMismatch:${attachmentId}`)
+  }
+  const [blobKeys, artifactKeys, jobKeys] = await Promise.all([
+    attachmentRowKeys(tx, 'attachmentBlobs', attachmentId),
+    attachmentRowKeys(tx, 'attachmentArtifacts', attachmentId),
+    attachmentRowKeys(tx, 'attachmentJobs', attachmentId),
   ])
+  recordBrowserCommandAttachmentPayloadDeletion(tx, 'attachmentBlobs', blobKeys, attachmentId)
+  recordBrowserCommandAttachmentPayloadDeletion(
+    tx,
+    'attachmentArtifacts',
+    artifactKeys,
+    attachmentId,
+  )
+  recordBrowserCommandAttachmentPayloadDeletion(tx, 'attachmentJobs', jobKeys, attachmentId)
+  await Promise.all([
+    deletePhysicalStorageKeys(tx, 'attachmentBlobs', blobKeys),
+    deletePhysicalStorageKeys(tx, 'attachmentArtifacts', artifactKeys),
+    deletePhysicalStorageKeys(tx, 'attachmentJobs', jobKeys),
+  ])
+  const blobs = blobKeys.length
+  const artifacts = artifactKeys.length
+  const jobs = jobKeys.length
   const obsoleteBytes = saturatingAdd(
-    estimateAttachmentPayloadProjectionStorageBytes(header),
+    header ? estimateAttachmentPayloadProjectionStorageBytes(header) : 0,
     estimateDeletedCompactRowsStorageBytes(blobs + artifacts + jobs),
   )
   await recordObsoleteByteOwnerBytes(tx, obsoleteBytes)
+  await Promise.all([
+    addAttachmentBlobByteOwners(tx, next.blobs),
+    addAttachmentArtifactByteOwners(tx, next.artifacts),
+    addAttachmentByteOwners(tx, 'attachmentJobs', next.jobs),
+  ])
+  if (jobs > 0 || next.jobs.length > 0) {
+    recordBrowserCommandOwnerInvalidation(tx, {
+      kind: 'attachment-job',
+      attachmentIds: [attachmentId],
+      jobIds: [...jobKeys, ...next.jobs.map((job) => job.id)],
+    })
+  }
   return { blobs, artifacts, jobs }
 }
 
@@ -1229,8 +1458,7 @@ async function addAttachmentByteOwners<Row>(
   tableName: AttachmentByteOwnerTableName,
   rows: readonly Row[],
 ): Promise<void> {
-  if (rows.length === 0) return
-  await tx.table<Row, string>(tableName).bulkAdd([...rows])
+  await addPhysicalStorageRows<Row, string>(tx, tableName, rows)
 }
 
 async function putAttachmentByteOwner<Row>(
@@ -1239,13 +1467,7 @@ async function putAttachmentByteOwner<Row>(
   next: Row,
   previous: Row | undefined,
 ): Promise<void> {
-  const table = tx.table<Row, string>(tableName)
-  if (!previous) {
-    await table.add(next)
-    return
-  }
-  await recordObsoleteByteOwnerValues(tx, [previous])
-  await table.put(next)
+  await putPhysicalStorageRow<Row, string>(tx, tableName, next, previous)
 }
 
 async function deleteAttachmentByteOwner<Row>(
@@ -1254,8 +1476,7 @@ async function deleteAttachmentByteOwner<Row>(
   key: string,
   previous: Row,
 ): Promise<void> {
-  await recordObsoleteByteOwnerValues(tx, [previous])
-  await tx.table<Row, string>(tableName).delete(key)
+  await deletePhysicalStorageRows<Row, string>(tx, tableName, [key], [previous])
 }
 
 function deleteAttachmentRows(
@@ -1263,17 +1484,24 @@ function deleteAttachmentRows(
   tableName: AttachmentByteOwnerTableName,
   attachmentId: AttachmentId,
 ): Promise<number> {
+  return attachmentRowKeys(tx, tableName, attachmentId).then(async (keys) => {
+    if (keys.length === 0) return 0
+    recordBrowserCommandAttachmentPayloadDeletion(tx, tableName, keys, attachmentId)
+    await deletePhysicalStorageKeys(tx, tableName, keys)
+    return keys.length
+  })
+}
+
+function attachmentRowKeys(
+  tx: Transaction,
+  tableName: AttachmentByteOwnerTableName,
+  attachmentId: AttachmentId,
+): Promise<string[]> {
   return tx
     .table<AttachmentBlob | AttachmentArtifact | AttachmentJob, string>(tableName)
     .where('attachmentId')
     .equals(attachmentId)
     .primaryKeys()
-    .then(async (keys) => {
-      if (keys.length === 0) return 0
-      recordBrowserCommandAttachmentPayloadDeletion(tx, tableName, keys, attachmentId)
-      await tx.table(tableName).bulkDelete(keys)
-      return keys.length
-    })
 }
 
 function saturatingAdd(left: number, right: number): number {

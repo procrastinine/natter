@@ -130,6 +130,7 @@ import {
   createConfigurationProfile,
   createConfigurationPromptPreset,
   listConfigurationChatPresets,
+  testChatConfigurationLinkTransition,
 } from '../helpers/configuration'
 import { deleteNatterIndexedDatabasesForTests } from '../helpers/fake-indexeddb'
 import {
@@ -546,12 +547,14 @@ async function prepareBlockingAttempt(
       preferredDispatchKeyId: null,
       workspaceSettingOverrides: [],
     }
+    const configurationLinkTransition = testChatConfigurationLinkTransition(seeded.chat)
     const input =
       kind === 'Continue'
         ? ({
             strategy: 'continue',
             lease,
             configurationClaim,
+            configurationLinkTransition,
             promptPath: {
               requirement: {
                 kind: 'continue',
@@ -575,6 +578,7 @@ async function prepareBlockingAttempt(
             strategy: 'send',
             lease,
             configurationClaim,
+            configurationLinkTransition,
             promptPath: {
               requirement: {
                 kind: 'send',
@@ -1100,6 +1104,27 @@ describe('chat export/import', () => {
       seeded.userMessage.attachmentRefs?.[0]?.refId,
     )
     expect(fileItem(importedUser?.content ?? []).attachmentId).toBe(seeded.sourceAttachmentId)
+    await expectAttachmentReferenceInvariants(db)
+  })
+
+  it('deduplicates shared catalogs and attachments across concurrent chat imports', async () => {
+    const seeded = await seedPortableChat()
+    const exported = await exportChat(seeded.chat.id)
+    await reopenEmptyWorkspace()
+
+    const imports = await Promise.all([
+      importChat(exported, { targetProfileId: null, now: 1_001 }),
+      importChat(exported, { targetProfileId: null, now: 1_002 }),
+    ])
+    const db = getDb()
+    const attachments = await db.attachments.toArray()
+
+    expect(new Set(imports.map(({ chatId }) => chatId)).size).toBe(2)
+    expect(await db.chats.count()).toBe(2)
+    expect(await db.folders.count()).toBe(1)
+    expect(await db.tags.count()).toBe(1)
+    expect(attachments).toHaveLength(1)
+    expect(attachments[0]?.refCount).toBe(2)
     await expectAttachmentReferenceInvariants(db)
   })
 
@@ -3046,6 +3071,89 @@ describe('workspace backup restore', () => {
 
     expect(stableBackupPayload(reopened.payload)).toEqual(stableBackupPayload(migrated.payload))
     await expectAttachmentReferenceInvariants(getDb())
+  })
+
+  it('removes impossible runtime custody and recomputes the authoritative leaf at import', async () => {
+    const seeded = await seedPortableChat()
+    const exported = await exportWorkspaceBackup()
+    const chat = must(exported.payload.chats[0], 'chat')
+    const assistant = must(
+      exported.payload.messages.find((message) => message.id === seeded.assistantMessage.id),
+      'assistant',
+    )
+    chat.lastUpdatedLeafId = seeded.userMessage.id
+    assistant.generation = {
+      ...must(assistant.generation, 'generation'),
+      status: 'streaming',
+    }
+
+    const migrated = migrateNatterExportEnvelope(exported)
+
+    if (migrated.objectKind !== 'workspace-backup') throw new Error('expected workspace backup')
+    expect(must(migrated.payload.chats[0], 'migrated chat').lastUpdatedLeafId).toBe(
+      seeded.assistantMessage.id,
+    )
+    expect(
+      must(
+        migrated.payload.messages.find((message) => message.id === seeded.assistantMessage.id),
+        'migrated assistant',
+      ).generation,
+    ).toMatchObject({
+      status: 'interrupted',
+      abortReason: 'tab-close',
+      finishedAt: assistant.generation.finishedAt,
+    })
+    expect('streamLeases' in migrated.payload).toBe(false)
+  })
+
+  it('canonicalizes salvageable historical generation metadata before chat and workspace export', async () => {
+    const seeded = await seedPortableChat()
+    const header = must(await getDb().messages.get(seeded.assistantMessage.id), 'assistant header')
+    const generation = {
+      ...must(header.generation, 'generation'),
+      apiUsed: 'openrouter',
+      delivery: 'legacy-stream',
+      costSource: 'legacy',
+      status: 'complete',
+      integrity: 'unknown',
+      reasoningCarryForward: 'legacy',
+      reasoningVisibility: null,
+      startedAt: undefined,
+      model: undefined,
+      requestedModel: undefined,
+    } as unknown as NonNullable<Message['generation']>
+    await getDb().messages.put({ ...header, generation })
+
+    const chat = await exportChat(seeded.chat.id)
+    const workspace = await exportWorkspaceBackup()
+    const chatGeneration = must(
+      chat.payload.messages.find((message) => message.id === seeded.assistantMessage.id)
+        ?.generation,
+      'chat generation',
+    )
+    const workspaceGeneration = must(
+      workspace.payload.messages.find((message) => message.id === seeded.assistantMessage.id)
+        ?.generation,
+      'workspace generation',
+    )
+
+    for (const canonical of [chatGeneration, workspaceGeneration]) {
+      expect(canonical).toMatchObject({
+        status: 'done',
+        integrity: 'clean',
+        startedAt: 60,
+        reasoningCarryForward: 'unknown',
+        reasoningVisibility: { disclosure: 'unknown' },
+      })
+      expect(canonical).not.toHaveProperty('apiUsed')
+      expect(canonical).not.toHaveProperty('delivery')
+      expect(canonical).not.toHaveProperty('costSource')
+      expect(canonical).not.toHaveProperty('model')
+      expect(canonical).not.toHaveProperty('requestedModel')
+    }
+    await expect(restoreWorkspaceBackup(workspace, { now: 4_000 })).resolves.toMatchObject({
+      chatCount: 1,
+    })
   })
 
   it('returns a current large backup by identity without cloning unchanged payload nodes', async () => {

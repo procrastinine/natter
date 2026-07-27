@@ -1,12 +1,17 @@
 import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
-import type { Message, MessageAttachmentRef } from '../../src/core/types'
+import type { Attachment, Message, MessageAttachmentRef } from '../../src/core/types'
 import { NATTER_INDEXED_DATABASE_NAMES } from '../../src/lib/origin-storage-names'
+import {
+  attachmentCatalogProjectionRow,
+  emptyAttachmentCatalogAggregateRow,
+} from '../../src/store/attachment-catalog-projection'
 import {
   markAttachmentIntegrityRepairPending,
   pendingAttachmentIntegrityState,
 } from '../../src/store/attachment-integrity-maintenance'
+import { splitAttachmentForStorage } from '../../src/store/attachment-storage'
 import { ingestAttachmentBytes } from '../../src/store/attachments'
 import {
   createMutationScopeChecker,
@@ -816,6 +821,114 @@ describe('storage retention', () => {
     })
   })
 
+  it('replaces 129 draft edges without hydrating artifacts or touching unrelated attachments', async () => {
+    const chat = buildChat({
+      id: 'draft-edge-scale',
+      settings: cloneDefaultChatSettings(),
+      now: 1,
+    })
+    await putTestChat(chat)
+    const attachment = (id: string): Attachment => ({
+      id,
+      kind: 'document',
+      mime: 'text/plain',
+      filename: `${id}.txt`,
+      origin: 'user-upload',
+      createdAt: 1,
+      updatedAt: 1,
+      storage: { kind: 'missing', reason: 'import-missing', missingSince: 1 },
+      artifacts: [],
+      processing: [],
+      refCount: 0,
+    })
+    const firstIds = Array.from(
+      { length: 129 },
+      (_, index) => `draft-scale-first-${String(index).padStart(3, '0')}`,
+    )
+    const secondIds = Array.from(
+      { length: 129 },
+      (_, index) => `draft-scale-second-${String(index).padStart(3, '0')}`,
+    )
+    const headers = [...firstIds, ...secondIds].map((id) =>
+      splitAttachmentForStorage(attachment(id), 0, 1),
+    )
+    await getDb().attachments.bulkPut(headers)
+    await getDb().attachmentCatalogRows.bulkPut(
+      headers.map((header) =>
+        attachmentCatalogProjectionRow(header, {
+          refCount: 0,
+          messageRefCount: 0,
+          draftRefCount: 0,
+          visibleRefCount: 0,
+        }),
+      ),
+    )
+    await getDb().attachmentCatalogAggregate.put({
+      ...emptyAttachmentCatalogAggregateRow(),
+      totalCount: headers.length,
+      activeCount: headers.length,
+      unreferencedCount: headers.length,
+      missingCount: headers.length,
+    })
+    const unrelated = await ingestAttachmentBytes({
+      blob: new Blob(['unrelated-scale'], { type: 'text/plain' }),
+      filename: 'unrelated-scale.txt',
+      now: 1,
+    })
+    const firstRefs = firstIds.map((attachmentId, index) => ({
+      ...attachmentRef(attachmentId, 2),
+      refId: `first-scale-${String(index).padStart(3, '0')}`,
+    }))
+    const secondRefs = secondIds.map((attachmentId, index) => ({
+      ...attachmentRef(attachmentId, 3),
+      refId: `second-scale-${String(index).padStart(3, '0')}`,
+    }))
+    await putDraft(chat.id, firstRefs, null, 2)
+    const unrelatedBefore = await getDb().attachments.get(unrelated.attachment.id)
+
+    const replacementCommand = {
+      kind: 'draft.put' as const,
+      input: {
+        draft: {
+          chatId: chat.id,
+          text: 'scaled',
+          attachmentRefs: secondRefs,
+          updatedAt: 3,
+        },
+        expectedUpdatedAt: 2,
+      },
+    }
+    const replacement = await runWorkspaceAction('attachment', (permit) =>
+      getBrowserRepository().execute(permit, replacementCommand),
+    )
+
+    expect(
+      replacement.delta.invalidations.find((invalidation) => invalidation.kind === 'attachment'),
+    ).toEqual({
+      kind: 'attachment',
+      attachmentIds: [...firstIds, ...secondIds].sort(),
+    })
+    expect(await getDb().attachmentRefEdges.where('attachmentId').anyOf(firstIds).count()).toBe(0)
+    expect(await getDb().attachmentRefEdges.where('attachmentId').anyOf(secondIds).count()).toBe(
+      129,
+    )
+    expect(await getDb().drafts.get(chat.id)).toMatchObject({
+      text: 'scaled',
+      attachmentRefs: secondRefs,
+      updatedAt: 3,
+    })
+    expect(await getDb().attachments.get(unrelated.attachment.id)).toEqual(unrelatedBefore)
+
+    await expect(
+      runWorkspaceAction('attachment', (permit) =>
+        getBrowserRepository().execute(permit, replacementCommand),
+      ),
+    ).rejects.toThrow(`DraftChanged:${chat.id}`)
+    expect(await getDb().attachmentRefEdges.where('attachmentId').anyOf(secondIds).count()).toBe(
+      129,
+    )
+  }, 30_000)
+
   it('never reaps before the complete persisted integrity cycle reaches a later live owner', async () => {
     const chat = buildChat({
       id: 'integrity-gates-reap',
@@ -948,6 +1061,7 @@ describe('storage retention', () => {
     const frames: CanonicalStreamJournalFrameRow[] = []
     const leases: StreamLeaseRow[] = []
     const retainedStreamIds = new Set<string>()
+    let expectedDeletedFrames = 0
     for (let index = 0; index < 70; index += 1) {
       const streamId = `stream-${String(index).padStart(3, '0')}`
       const lease = testGenerationLease({
@@ -964,10 +1078,18 @@ describe('storage retention', () => {
         phase: 'reserved',
         postCommit: { usedAt: index, profileId: 'profile' },
       })
-      frames.push(...(await journalFramesForLease(lease, ['first', 'second'])))
+      const streamFrames = await journalFramesForLease(
+        lease,
+        index === 1
+          ? Array.from({ length: 129 }, (_, frameIndex) => `orphan-${frameIndex}`)
+          : ['first', 'second'],
+      )
+      frames.push(...streamFrames)
       if (index % 3 === 0) {
         retainedStreamIds.add(streamId)
         leases.push(lease)
+      } else {
+        expectedDeletedFrames += streamFrames.length
       }
     }
     await db.streamChunks.bulkPut(frames)
@@ -988,9 +1110,8 @@ describe('storage retention', () => {
     }
 
     expect(scans.every((scan) => scan.scannedStreamIds <= 32)).toBe(true)
-    expect(scans.reduce((total, scan) => total + scan.deletedFrames, 0)).toBe(
-      (70 - retainedStreamIds.size) * 2,
-    )
+    expect(scans.every((scan) => scan.deletedFrames <= 32)).toBe(true)
+    expect(scans.reduce((total, scan) => total + scan.deletedFrames, 0)).toBe(expectedDeletedFrames)
     expect(fullTableRead).not.toHaveBeenCalled()
     const remaining = new Set((await db.streamChunks.orderBy('streamId').uniqueKeys()).map(String))
     expect(remaining).toEqual(retainedStreamIds)
@@ -1107,7 +1228,14 @@ describe('storage retention', () => {
       metadataPending,
       metadataCommitted,
     ]) {
-      journalFrames.push(...(await journalFramesForLease(lease, ['recoverable'])))
+      journalFrames.push(
+        ...(await journalFramesForLease(
+          lease,
+          lease.streamId === 'metadata-committed-stream'
+            ? Array.from({ length: 129 }, (_, index) => `recoverable-${index}`)
+            : ['recoverable'],
+        )),
+      )
     }
     await db.streamChunks.bulkPut(journalFrames)
     const commits = []
@@ -1124,6 +1252,7 @@ describe('storage retention', () => {
       if (commit.value.done) break
     }
 
+    expect(commits.every((commit) => commit.value.deletedFrames <= 32)).toBe(true)
     const deletedByCaller = commits.flatMap((commit) => commit.value.deletedStreamIds)
     expect(deletedByCaller.length).toBeGreaterThan(0)
     expect(
@@ -1225,7 +1354,7 @@ describe('storage retention', () => {
       { kind: 'attachment', attachmentId: 'attachment' },
     ])
     expect(attachmentPlan).not.toContain('messages')
-    const expectedDeclared = new Set([...attachmentPlan, 'browserLocks'])
+    const expectedDeclared = new Set([...attachmentPlan, 'browserLocks', 'storageRetentionState'])
     const attachmentMutationAccesses = storeAccesses.filter(
       ({ declared }) =>
         declared.length === expectedDeclared.size &&
@@ -1339,7 +1468,7 @@ describe('storage retention', () => {
       resolveMutationTableNames([], {
         generationReadSet: { chatId: 'chat', messages: [], attachments: [] },
       }),
-    ).toEqual(['chats', 'messages'])
+    ).toEqual(['messages'])
     expect(
       resolveMutationTableNames([], {
         generationReadSet: {
@@ -1348,13 +1477,11 @@ describe('storage retention', () => {
           attachments: [{ attachmentId: 'attachment', wireVersion: 1 }],
         },
       }),
-    ).toEqual(['attachments', 'chats', 'messages'])
+    ).toEqual(['attachments', 'messages'])
     expect(resolveMutationTableNames([], { captureGenerationPlanningSnapshot: true })).toEqual([
-      'chats',
       'discoveryPayloads',
       'discoveryPayloadMetadata',
       'endpoints',
-      'messages',
       'models',
       'keys',
       'profiles',

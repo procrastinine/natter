@@ -460,6 +460,7 @@ interface TranscriptContinuityState {
   listRemoved: boolean
   listReplaced: boolean
   loadingSeen: boolean
+  branchControlCounts: number[]
   messageCounts: number[]
 }
 
@@ -476,6 +477,7 @@ export interface TranscriptContinuityResult {
   messageCountDecreased: boolean
   messageCountsIncludeZero: boolean
   minimumMessageCount: number
+  minimumBranchControlCount: number
   commonPrefixDisconnectedIds?: string[]
   commonPrefixReplacedIds?: string[]
   messageCountBelowExpectedCommonPrefix?: boolean
@@ -511,6 +513,7 @@ export async function startMessageCountRecorder(
       listRemoved: false,
       listReplaced: false,
       loadingSeen: false,
+      branchControlCounts: [],
       messageCounts: [],
     }
     const sample = () => {
@@ -522,6 +525,9 @@ export async function startMessageCountRecorder(
         currentMessages.map((message) => [message.getAttribute('data-message-id'), message]),
       )
       state.messageCounts.push(currentMessages.length)
+      state.branchControlCounts.push(
+        currentList?.querySelectorAll('[data-ui="branch-controls"]').length ?? 0,
+      )
       state.listRemoved ||= !state.list.isConnected
       state.listReplaced ||= currentList !== state.list
       state.anchorRemoved ||= !state.anchor.isConnected
@@ -563,6 +569,9 @@ export async function stopMessageCountRecorder(page: Page): Promise<TranscriptCo
     if (!state) throw new Error('Transcript continuity recorder not started')
     const currentList = state.content.querySelector('[data-ui="message-list"]')
     state.messageCounts.push(currentList?.querySelectorAll('[data-ui="message"]').length ?? 0)
+    state.branchControlCounts.push(
+      currentList?.querySelectorAll('[data-ui="branch-controls"]').length ?? 0,
+    )
     state.listRemoved ||= !state.list.isConnected
     state.listReplaced ||= currentList !== state.list
     state.anchorRemoved ||= !state.anchor.isConnected
@@ -580,6 +589,7 @@ export async function stopMessageCountRecorder(page: Page): Promise<TranscriptCo
       messageCountDecreased: state.messageCounts.some((count) => count < initialMessageCount),
       messageCountsIncludeZero: state.messageCounts.includes(0),
       minimumMessageCount: Math.min(...state.messageCounts),
+      minimumBranchControlCount: Math.min(...state.branchControlCounts),
       ...(expectedCommonPrefixCount === null
         ? {}
         : {

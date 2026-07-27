@@ -11,9 +11,9 @@ export function splitAttachmentForStorage(
   wireVersion = 0,
   unreferencedAt = attachment.refCount === 0 ? Date.now() : null,
 ): AttachmentHeaderRow {
-  const { artifacts, ...fields } = structuredClone(attachment)
+  const { artifacts, ...fields } = attachment
   return {
-    ...fields,
+    ...structuredClone(fields),
     artifactIds: artifacts.map((artifact) => artifact.artifactId),
     wireVersion,
     unreferencedAt,

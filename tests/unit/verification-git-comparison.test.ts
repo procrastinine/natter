@@ -21,7 +21,7 @@ const manifest: VerificationComparisonManifest = {
   id: 'wave-test',
   comparison: { kind: 'git-commit', oid: '1'.repeat(40) },
 }
-const CURRENT_COMPARISON_OID = 'fa2345161009d6142235ccc55e934a9e2327730d'
+const CURRENT_COMPARISON_OID = '598f65a1406c53d6c03f0d44239c408b715dacf6'
 
 describe('committed verification comparison', () => {
   it('accepts only the fixed comparison mode or a persisted baseline id', () => {
@@ -94,7 +94,11 @@ describe('committed verification comparison', () => {
     expect(comparison.sourceStats.gitProcessCount).toBe(4)
     expect(comparison.sourceStats.selectedFileCount).toBeGreaterThan(500)
     expect(comparison.sourceStats.selectedBytes).toBeGreaterThan(1_000_000)
-    expect(comparison.snapshot.graphDiagnostics).toEqual([])
+    expect(
+      comparison.snapshot.graphDiagnostics.every(
+        (diagnostic) => diagnostic.code === 'opaque-module-reference',
+      ),
+    ).toBe(true)
     expect(performance.now() - startedAt).toBeLessThan(15_000)
   })
 

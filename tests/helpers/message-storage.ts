@@ -22,6 +22,10 @@ import {
   applyChatRowWriteTransitions,
   CHAT_ROW_PRESERVING_LINKS_TRANSACTION_CAPABILITY,
 } from '../../src/store/chat-row-transition'
+import {
+  readCurrentChatForTransaction,
+  type TransactionCurrentChat,
+} from '../../src/store/chat-storage-codec'
 import { getDb } from '../../src/store/db'
 import {
   hydrateMessage,
@@ -79,8 +83,8 @@ export async function putTestMessages(rows: readonly Message[]): Promise<void> {
             refs: row.attachmentRefs,
           })),
         )
-        await reconcileAttachmentRefCountsForRepair(tx, dirtyAttachmentIds)
-        const chatTransitions: Array<{ previous: Chat; next: Chat }> = []
+        await reconcileAttachmentRefCountsForRepair(tx, dirtyAttachmentIds, Date.now())
+        const chatTransitions: Array<{ previous: TransactionCurrentChat; next: Chat }> = []
         for (const chatId of new Set(rows.map((row) => row.chatId))) {
           const headers = await tx
             .table<MessageHeaderRow, MessageId>('messages')
@@ -102,7 +106,7 @@ export async function putTestMessages(rows: readonly Message[]): Promise<void> {
           await tx
             .table<ChildSlotMember, string>('childSlotMembers')
             .bulkPut([...projection.members])
-          const chat = await tx.table<Chat, ChatId>('chats').get(chatId)
+          const chat = await readCurrentChatForTransaction(tx, chatId)
           if (!chat) continue
           const messages = await readTestMessagesFromTransaction(tx, chatId, headers)
           const next = {

@@ -7,8 +7,6 @@ import {
 import { contentHasUnmaterializedGeneratedOutput } from '../core/generated-output-localization'
 import {
   advanceRecentModelState,
-  CORS_PROXY_SECRET_KEY,
-  CORS_PROXY_URL_KEY,
   RECENT_MODEL_RECENCY_KEY,
   RECENT_MODELS_KEY,
   TOKEN_CALIBRATION_MODE_KEY,
@@ -29,7 +27,6 @@ import {
 import type {
   AttachmentId,
   Chat,
-  ChatId,
   ChatPreset,
   ChatVersions,
   ConnectionProfile,
@@ -58,13 +55,24 @@ import {
   replaceLinkedSemanticByteOwner,
   replaceSemanticByteOwner,
 } from './byte-owner-mutation'
-import { applyChatRowWriteTransitions } from './chat-row-transition'
 import {
+  applyChatRowWriteTransitions,
+  CHAT_ROW_PRESERVING_LINKS_TRANSACTION_CAPABILITY,
+} from './chat-row-transition'
+import { readCurrentChatForTransaction } from './chat-storage-codec'
+import {
+  CONFIGURATION_PRESET_RECENCY_TRANSACTION_CAPABILITY,
+  CONFIGURATION_PROFILE_CATALOG_TRANSACTION_CAPABILITY,
   putConfigurationPresetRecencyCatalogProjection,
   putConfigurationProfileCatalogProjection,
 } from './configuration-catalog-projection'
 import type { SettingsRow } from './db-rows'
 import type { MessageHeaderRow } from './message-storage'
+import {
+  type CapabilityTables,
+  type FencedTransaction,
+  physicalStorageTables,
+} from './physical-storage-tables'
 import {
   ChatMissingError,
   commitStreamLeaseMetadata,
@@ -79,18 +87,161 @@ import {
   type WriterActiveStreamLeaseRow,
   type WriterReservedStreamLeaseRow,
 } from './repository'
-import { putStreamLeaseByteOwner } from './stream-journal-storage'
-import type {
-  AttemptDispatchInput,
-  AttemptDispatchResult,
-  AttemptFinalizeResult,
-  AttemptPrepareResult,
-  AttemptTerminalProjection,
-  GenerationPostCommitMetadataInput,
-  GenerationPostCommitMetadataResult,
-  MessagePresentation,
-  PrepareAttemptInput,
+import {
+  boundSemanticOperationExactReceiptAccumulator,
+  type SemanticOperationExactPhysicalRead,
+  type SemanticOperationExactReceipt,
+  type SemanticOperationReplayPlan,
+  semanticOperationDescriptor,
+  semanticOperationExactPlan,
+  semanticOperationExactReceipt,
+  semanticOperationExactReceiptContracts,
+  semanticOperationExactReceiptReplayContract,
+  semanticOperationExecution,
+} from './semantic-operation-capability'
+import {
+  putStreamLeaseByteOwner,
+  STREAM_LEASE_MUTATION_TRANSACTION_CAPABILITY,
+} from './stream-journal-storage'
+import {
+  type AttemptDispatchInput,
+  type AttemptDispatchResult,
+  type AttemptFinalizeResult,
+  type AttemptPrepareResult,
+  type AttemptTerminalProjection,
+  type GenerationPostCommitMetadataInput,
+  type GenerationPostCommitMetadataResult,
+  generationPostCommitMetadataResourceProof,
+  type MessagePresentation,
+  type PrepareAttemptInput,
 } from './workspace-protocol'
+
+const GENERATION_METADATA_TRANSACTION_CAPABILITY = physicalStorageTables(
+  ...CONFIGURATION_PROFILE_CATALOG_TRANSACTION_CAPABILITY.tableNames,
+  ...CONFIGURATION_PRESET_RECENCY_TRANSACTION_CAPABILITY.tableNames,
+  ...STREAM_LEASE_MUTATION_TRANSACTION_CAPABILITY.tableNames,
+  ...CHAT_ROW_PRESERVING_LINKS_TRANSACTION_CAPABILITY.tableNames,
+  'keys',
+  'messages',
+  'presets',
+  'profiles',
+  'settings',
+)
+type GenerationMetadataTable = CapabilityTables<typeof GENERATION_METADATA_TRANSACTION_CAPABILITY>
+
+function generationMetadataReplayPlan(
+  input: GenerationPostCommitMetadataInput,
+): SemanticOperationReplayPlan {
+  return {
+    kind: 'fenced-convergent',
+    owner: `stream:${input.streamId}`,
+    fence: [
+      input.fence.ownerClientId,
+      input.fence.fenceToken,
+      input.fence.replacementEpoch,
+      input.fence.admissionSequence,
+    ],
+    desired: [
+      'metadata-committed',
+      input.resourceProof.chatId,
+      input.resourceProof.messageId,
+      input.resourceProof.profileId,
+      input.resourceProof.presetId ?? null,
+      input.resourceProof.selectedKeyId ?? null,
+      ...input.resourceProof.settingKeys,
+    ],
+    alreadyApplied: 'return-current-or-conflict',
+  }
+}
+
+function generationMetadataExactPlan(input: GenerationPostCommitMetadataInput) {
+  return semanticOperationExactPlan({
+    replay: generationMetadataReplayPlan(input),
+    bounds: {
+      reads: {
+        maxRequests: 14,
+        maxRows: 14,
+        maxBatchRows: 1,
+        maxBytes: Number.MAX_SAFE_INTEGER,
+      },
+      writes: {
+        maxRequests: 13,
+        maxRows: 14,
+        maxBatchRows: 2,
+        maxBytes: Number.MAX_SAFE_INTEGER,
+      },
+    },
+  })
+}
+
+function recordGenerationMetadataPrimaryRead(
+  reads: Array<SemanticOperationExactPhysicalRead & { tableName: GenerationMetadataTable }>,
+  tableName: GenerationMetadataTable,
+  requestCount = 1,
+): void {
+  if (requestCount === 0) return
+  const existing = reads.find(
+    (read) =>
+      read.tableName === tableName &&
+      read.indexKind === 'primary' &&
+      read.operation === 'get' &&
+      read.indexName === undefined,
+  )
+  if (existing) {
+    const index = reads.indexOf(existing)
+    reads[index] = {
+      ...existing,
+      requestCount: existing.requestCount + requestCount,
+      rowCount: existing.rowCount + requestCount,
+    }
+    return
+  }
+  reads.push({
+    tableName,
+    indexKind: 'primary',
+    operation: 'get',
+    requestCount,
+    rowCount: requestCount,
+  })
+}
+
+function generationMetadataExactReceipt(
+  tx: FencedTransaction<GenerationMetadataTable>,
+  input: GenerationPostCommitMetadataInput,
+  physicalReads: readonly (SemanticOperationExactPhysicalRead & {
+    tableName: GenerationMetadataTable
+  })[],
+): SemanticOperationExactReceipt<GenerationMetadataTable> {
+  const accumulator = boundSemanticOperationExactReceiptAccumulator<GenerationMetadataTable>(tx)
+  if (!accumulator) throw new Error('GenerationMetadataExactReceiptAccumulatorMissing')
+  const fragment = accumulator.snapshotFragment()
+  return semanticOperationExactReceipt(generationMetadataExactPlan(input), {
+    dependencies: fragment.dependencies,
+    physicalMutations: fragment.physicalMutations,
+    physicalReads: [...fragment.physicalReads, ...physicalReads],
+  })
+}
+
+const GENERATION_METADATA_OPERATION = semanticOperationDescriptor({
+  operationKind: 'generation.post-commit-metadata',
+  transaction: GENERATION_METADATA_TRANSACTION_CAPABILITY,
+  resources: (input: GenerationPostCommitMetadataInput) => [
+    `stream-journal:${input.streamId}`,
+    `chat-meta:${input.resourceProof.chatId}`,
+    `message:${input.resourceProof.messageId}`,
+    `profile:${input.resourceProof.profileId}`,
+    ...(input.resourceProof.presetId ? [`preset:${input.resourceProof.presetId}`] : []),
+    ...(input.resourceProof.selectedKeyId ? [`key:${input.resourceProof.selectedKeyId}`] : []),
+    ...input.resourceProof.settingKeys.map((key) => `setting:${key}`),
+  ],
+  permittedWrites: GENERATION_METADATA_TRANSACTION_CAPABILITY.tableNames,
+  requiredWritesWhenMutated: ['streamLeases'],
+  ...semanticOperationExactReceiptContracts<
+    GenerationPostCommitMetadataInput,
+    GenerationMetadataTable
+  >(),
+  replay: semanticOperationExactReceiptReplayContract(generationMetadataReplayPlan),
+})
 
 export async function prepareBrowserAttempt(
   repository: BrowserGenerationCommandPort,
@@ -102,7 +253,6 @@ export async function prepareBrowserAttempt(
   const {
     appendValidatedGenerationPromptPath,
     assertNewChatAttemptRow,
-    chatConfigurationTargetResourceNames,
     preparedGenerationPrompt,
     preparedMessage,
     requiredPromptPathSlot,
@@ -142,12 +292,6 @@ export async function prepareBrowserAttempt(
       ? { recentModelId: attemptSettings.model }
       : {}),
   }
-  const planningSettingKeys = [
-    GLOBAL_TOKEN_CALIBRATION_KEY,
-    TOKEN_CALIBRATION_MODE_KEY,
-    CORS_PROXY_URL_KEY,
-    CORS_PROXY_SECRET_KEY,
-  ]
   const planningExpectation = input.configurationClaim
   if ('user' in input) {
     support.assertPreparedAttemptMessage(input.user, input.lease, 'user', 'user')
@@ -174,6 +318,13 @@ export async function prepareBrowserAttempt(
   if ('user' in input) scopes.push({ kind: 'message', messageId: input.user.id })
   if (input.strategy !== 'continue') scopes.push({ kind: 'chat-topology', chatId })
   if (targetMessageId) scopes.push({ kind: 'message', messageId: targetMessageId })
+  const configurationLinkTransition = persistsCapturedConfiguration
+    ? {
+        chatId,
+        expectedResourceNames: input.configurationLinkTransition.expectedResourceNames,
+        nextResourceNames: input.configurationLinkTransition.nextResourceNames,
+      }
+    : undefined
 
   const mutation = await repository.runMutation(
     scopes,
@@ -402,24 +553,12 @@ export async function prepareBrowserAttempt(
     {
       ...(input.strategy === 'new-chat-send' ? { initialChat: input.chat } : {}),
       captureGenerationPlanningSnapshot: true,
-      ...(persistsCapturedConfiguration ? { configurationLinkChatId: chatId } : {}),
+      planningProfileId: input.configurationClaim.profile.profileId,
+      ...(configurationLinkTransition ? { configurationLinkTransition } : {}),
       promoteChatId: chatId,
       workspaceFence: { replacementEpoch },
       streamAdmission: input.lease,
       streamAdmissionPostCommit: postCommit,
-      additionalLockNames: [
-        ...(input.strategy === 'new-chat-send'
-          ? [
-              'chat-catalog',
-              ...chatConfigurationTargetResourceNames(input.chat),
-              ...(input.chat.folderId ? [`folder:${input.chat.folderId}`] : []),
-              ...(input.chat.tags.length > 0 ? ['tag-catalog'] : []),
-            ]
-          : []),
-        `profile:${input.configurationClaim.profile.profileId}`,
-        ...planningSettingKeys.map((key) => `setting:${key}`),
-        `stream-journal:${input.lease.streamId}`,
-      ],
     },
     commit,
     async (ctx, value) => {
@@ -513,15 +652,13 @@ export async function dispatchBrowserAttempt(
   replacementEpoch: number,
   commit: BrowserMutationCommandPort,
 ): Promise<AttemptDispatchResult> {
-  const lease = await repository.getStreamLease(input.streamId)
-  if (!lease) throw new Error(`StreamFenceLost:${input.streamId}`)
-  if (lease.attemptKind === 'continuation' && !input.continuation) {
+  if (input.target.attemptKind === 'continuation' && !input.continuation) {
     throw new Error(`ContinuationDispatchMetadataMissing:${input.streamId}`)
   }
-  if (lease.attemptKind === 'generation' && input.continuation) {
+  if (input.target.attemptKind === 'generation' && input.continuation) {
     throw new Error(`GenerationDispatchHasContinuationMetadata:${input.streamId}`)
   }
-  if (lease.attemptKind === 'continuation' && input.postCommitCalibration) {
+  if (input.target.attemptKind === 'continuation' && input.postCommitCalibration) {
     throw new Error(`ContinuationDispatchHasCalibration:${input.streamId}`)
   }
   if (
@@ -534,14 +671,14 @@ export async function dispatchBrowserAttempt(
   if (
     continuationProof &&
     (continuationProof.streamId !== input.streamId ||
-      continuationProof.messageId !== lease.messageId)
+      continuationProof.messageId !== input.target.messageId)
   ) {
     throw new Error(`ContinuationPrepareProofMismatch:${input.streamId}`)
   }
   const streamTargetCommit: StreamTargetCommit = input.continuation
     ? {
         streamId: input.streamId,
-        messageId: lease.messageId,
+        messageId: input.target.messageId,
         attemptKind: 'continuation',
         targetCommittedAt: input.dispatchedAt,
         requestedModel: input.generation.requestedModel,
@@ -554,7 +691,7 @@ export async function dispatchBrowserAttempt(
       }
     : {
         streamId: input.streamId,
-        messageId: lease.messageId,
+        messageId: input.target.messageId,
         attemptKind: 'generation',
         targetCommittedAt: input.dispatchedAt,
         requestedModel: input.generation.requestedModel,
@@ -566,19 +703,22 @@ export async function dispatchBrowserAttempt(
           : {}),
       }
   const mutation = await repository.runMutation(
-    [{ kind: 'message', messageId: lease.messageId }],
+    [{ kind: 'message', messageId: input.target.messageId }],
     async (ctx) => {
       if (input.continuation) {
-        const target = await ctx.getMessageHeader(lease.messageId)
+        const target = await ctx.getMessageHeader(input.target.messageId)
         if (!target || target.bodyVersion !== input.continuation.prepareProof.baseBodyVersion) {
-          throw new Error(`ContinuationTargetChanged:${lease.messageId}`)
+          throw new Error(`ContinuationTargetChanged:${input.target.messageId}`)
         }
       }
       const header =
-        lease.attemptKind === 'generation'
-          ? await ctx.transitionMessageGenerationForDispatch(lease.messageId, input.generation)
-          : await ctx.getMessageHeader(lease.messageId)
-      if (!header) throw new Error(`AttemptDispatchTargetMissing:${lease.messageId}`)
+        input.target.attemptKind === 'generation'
+          ? await ctx.transitionMessageGenerationForDispatch(
+              input.target.messageId,
+              input.generation,
+            )
+          : await ctx.getMessageHeader(input.target.messageId)
+      if (!header) throw new Error(`AttemptDispatchTargetMissing:${input.target.messageId}`)
       return header
     },
     {
@@ -586,7 +726,6 @@ export async function dispatchBrowserAttempt(
       generationReadSet: input.readSet,
       streamFence: { streamId: input.streamId, fence: input.fence },
       streamTargetCommit,
-      additionalLockNames: [`stream-journal:${input.streamId}`],
     },
     commit,
   )
@@ -616,55 +755,59 @@ export async function finalizeBrowserAttempt(
   ) {
     throw new Error(`AttemptFinalizeGeneratedOutputNotCanonical:${input.messageId}`)
   }
-  const lease = await repository.getStreamLease(input.streamId)
-  if (!lease) throw new Error(`StreamFenceLost:${input.streamId}`)
-  if (lease.messageId !== input.messageId || lease.attemptKind !== input.kind) {
-    throw new Error(`AttemptFinalizeIdentityMismatch:${input.streamId}`)
-  }
-  if (
-    lease.phase !== 'terminal-decided' &&
-    lease.phase !== 'canonical' &&
-    lease.phase !== 'metadata-committed'
-  ) {
-    throw new Error(`AttemptFinalizeBeforeTerminalDecision:${input.streamId}`)
-  }
-  if (
-    lease.phase === 'terminal-decided' &&
-    stableStringify(lease.terminal) !== stableStringify(input.terminal)
-  ) {
-    throw new Error(`AttemptTerminalDecisionConflict:${input.streamId}`)
-  }
-  const reasoningCarryForward = streamLeaseReasoningCarryForward(lease)
-  if (
-    (input.kind === 'generation'
-      ? input.generation.reasoningCarryForward
-      : input.attempt.reasoningCarryForward) !== reasoningCarryForward
-  ) {
-    throw new Error(`AttemptFinalizeReasoningCarryForwardConflict:${input.streamId}`)
-  }
-  const reasoningVisibility = streamLeaseReasoningVisibility(lease)
-  if (
-    stableStringify(
-      input.kind === 'generation'
-        ? input.generation.reasoningVisibility
-        : input.attempt.reasoningVisibility,
-    ) !== stableStringify(reasoningVisibility)
-  ) {
-    throw new Error(`AttemptFinalizeReasoningVisibilityConflict:${input.streamId}`)
-  }
   const generatedAttachmentIds =
     input.kind === 'generation'
       ? (input.generatedOutput?.attachmentBundles.map((bundle) => bundle.attachment.id) ?? [])
       : []
   const mutation = await repository.runMutation(
     dedupeMutationScopes([
+      { kind: 'chat-meta', chatId: input.chatId },
       { kind: 'message', messageId: input.messageId },
       ...generatedAttachmentIds.map((attachmentId) => ({
         kind: 'attachment' as const,
         attachmentId,
       })),
     ]),
-    async (ctx) => {
+    async (ctx, operations) => {
+      const lease = operations.getOwnedStreamLease(input.streamId)
+      if (
+        lease.chatId !== input.chatId ||
+        lease.messageId !== input.messageId ||
+        lease.attemptKind !== input.kind
+      ) {
+        throw new Error(`AttemptFinalizeIdentityMismatch:${input.streamId}`)
+      }
+      if (
+        lease.phase !== 'terminal-decided' &&
+        lease.phase !== 'canonical' &&
+        lease.phase !== 'metadata-committed'
+      ) {
+        throw new Error(`AttemptFinalizeBeforeTerminalDecision:${input.streamId}`)
+      }
+      if (
+        lease.phase === 'terminal-decided' &&
+        stableStringify(lease.terminal) !== stableStringify(input.terminal)
+      ) {
+        throw new Error(`AttemptTerminalDecisionConflict:${input.streamId}`)
+      }
+      const reasoningCarryForward = streamLeaseReasoningCarryForward(lease)
+      if (
+        (input.kind === 'generation'
+          ? input.generation.reasoningCarryForward
+          : input.attempt.reasoningCarryForward) !== reasoningCarryForward
+      ) {
+        throw new Error(`AttemptFinalizeReasoningCarryForwardConflict:${input.streamId}`)
+      }
+      const reasoningVisibility = streamLeaseReasoningVisibility(lease)
+      if (
+        stableStringify(
+          input.kind === 'generation'
+            ? input.generation.reasoningVisibility
+            : input.attempt.reasoningVisibility,
+        ) !== stableStringify(reasoningVisibility)
+      ) {
+        throw new Error(`AttemptFinalizeReasoningVisibilityConflict:${input.streamId}`)
+      }
       const header = await ctx.getMessageHeader(input.messageId)
       if (
         !header ||
@@ -869,7 +1012,6 @@ export async function finalizeBrowserAttempt(
             settingReadKeys: [GLOBAL_TOKEN_CALIBRATION_KEY, TOKEN_CALIBRATION_MODE_KEY],
           }
         : {}),
-      additionalLockNames: [`stream-journal:${input.streamId}`],
     },
     commit,
   )
@@ -881,7 +1023,6 @@ export async function finalizeBrowserAttempt(
 }
 
 export async function commitBrowserGenerationMetadata(
-  repository: BrowserGenerationCommandPort,
   support: BrowserGenerationCommandSupport,
   input: GenerationPostCommitMetadataInput,
   replacementEpoch: number,
@@ -892,56 +1033,50 @@ export async function commitBrowserGenerationMetadata(
     calibrationUsageFromPostCommit,
     chatTokenCalibrationGeneration,
     cloneMessageHeader,
-    GENERATION_METADATA_TRANSACTION,
     monotonicTimestamp,
     stableStringify,
     streamFenceMatches,
   } = support
-  const snapshot = await repository.getStreamLease(input.streamId)
-  const snapshotPostCommit = snapshot?.postCommit
-  const snapshotFinal = snapshotPostCommit?.final
-  const settingLockNames = [
-    ...(snapshotPostCommit?.recentModelId !== undefined
-      ? [RECENT_MODELS_KEY, RECENT_MODEL_RECENCY_KEY]
-      : []),
-    ...(snapshotPostCommit?.calibration ? [GLOBAL_TOKEN_CALIBRATION_KEY] : []),
-  ].map((key) => `setting:${key}`)
-  const lockNames = [
-    `stream-journal:${input.streamId}`,
-    ...(snapshot ? [`message:${snapshot.messageId}`, `chat-meta:${snapshot.chatId}`] : []),
-    ...(snapshotPostCommit ? [`profile:${snapshotPostCommit.profileId}`] : []),
-    ...(snapshotPostCommit?.presetId ? [`preset:${snapshotPostCommit.presetId}`] : []),
-    ...(snapshotFinal?.selectedKeyId ? [`key:${snapshotFinal.selectedKeyId}`] : []),
-    ...settingLockNames,
-  ]
-  const transactionResult = await commit.withLocks(lockNames, (locked) =>
-    locked.runTransaction(GENERATION_METADATA_TRANSACTION, async (tx) => {
+  const transactionResult = await commit.executeSemanticOperation(
+    GENERATION_METADATA_OPERATION,
+    input,
+    async (tx) => {
+      const physicalReads: Array<
+        SemanticOperationExactPhysicalRead & { tableName: GenerationMetadataTable }
+      > = []
+      const finish = (value: GenerationPostCommitMetadataResult) =>
+        semanticOperationExecution(value, generationMetadataExactReceipt(tx, input, physicalReads))
       const leases = tx.table<StreamLeaseRow, string>('streamLeases')
+      recordGenerationMetadataPrimaryRead(physicalReads, 'streamLeases')
       const lease = await leases.get(input.streamId)
       if (!streamFenceMatches(lease, input.fence, replacementEpoch)) {
-        return { outcome: 'stale' as const }
+        return finish({ outcome: 'stale' as const })
       }
       if (lease.phase !== 'canonical' && lease.phase !== 'metadata-committed') {
-        return { outcome: 'stale' as const }
+        return finish({ outcome: 'stale' as const })
       }
       const evidence = lease.postCommit
       const finalEvidence = evidence.final
       if (
-        !snapshot ||
-        snapshot.chatId !== lease.chatId ||
-        snapshot.messageId !== lease.messageId ||
-        stableStringify(snapshot.postCommit) !== stableStringify(evidence)
+        stableStringify(generationPostCommitMetadataResourceProof(lease)) !==
+        stableStringify(input.resourceProof)
       ) {
-        return { outcome: 'stale' as const }
+        return finish({ outcome: 'stale' as const })
       }
       if (lease.phase === 'metadata-committed') {
-        return { outcome: 'already-applied' as const, lease: structuredClone(lease) }
+        return finish({ outcome: 'already-applied' as const, lease: structuredClone(lease) })
       }
 
       const settingKeys: string[] = []
       const usedAt = evidence.usedAt
       const calibrationAt = Math.max(lease.canonicalAt, usedAt)
       const requestDispatched = lease.dispatch !== null
+      if (
+        lease.attemptKind === 'generation' &&
+        (evidence.recentModelId !== undefined || evidence.calibration !== undefined)
+      ) {
+        recordGenerationMetadataPrimaryRead(physicalReads, 'messages')
+      }
       const terminalGenerationHeader =
         lease.attemptKind === 'generation' &&
         (evidence.recentModelId !== undefined || evidence.calibration !== undefined)
@@ -952,6 +1087,7 @@ export async function commitBrowserGenerationMetadata(
         terminalGenerationHeader.generation?.status === 'done' &&
         terminalGenerationHeader.generation.finishedAt === lease.canonicalAt
       const profiles = tx.table<ConnectionProfile, ProfileId>('profiles')
+      recordGenerationMetadataPrimaryRead(physicalReads, 'profiles')
       const profile = await profiles.get(evidence.profileId)
       if (
         requestDispatched &&
@@ -960,21 +1096,30 @@ export async function commitBrowserGenerationMetadata(
       ) {
         const touched = { ...profile, lastUsedAt: usedAt }
         await replaceLinkedSemanticByteOwner(tx, 'profiles', touched, profile)
-        await putConfigurationProfileCatalogProjection(tx, touched)
+        const projection = await putConfigurationProfileCatalogProjection(tx, touched)
+        recordGenerationMetadataPrimaryRead(physicalReads, 'configurationProfileCatalogRows')
+        recordGenerationMetadataPrimaryRead(
+          physicalReads,
+          'configurationCatalogAggregates',
+          projection.aggregateIds.length,
+        )
       }
 
       if (requestDispatched && evidence.presetId) {
         const presets = tx.table<ChatPreset, PresetId>('presets')
+        recordGenerationMetadataPrimaryRead(physicalReads, 'presets')
         const preset = await presets.get(evidence.presetId)
         if (preset && monotonicTimestamp(preset.lastUsedAt, usedAt) !== preset.lastUsedAt) {
           const touched = { ...preset, lastUsedAt: usedAt }
           await replaceLinkedSemanticByteOwner(tx, 'presets', touched, preset)
           await putConfigurationPresetRecencyCatalogProjection(tx, touched)
+          recordGenerationMetadataPrimaryRead(physicalReads, 'configurationPresetCatalogRows')
         }
       }
 
       if (finalEvidence.selectedKeyId) {
         const keys = tx.table<KeyRecord, KeyId>('keys')
+        recordGenerationMetadataPrimaryRead(physicalReads, 'keys')
         const key = await keys.get(finalEvidence.selectedKeyId)
         if (key && monotonicTimestamp(key.lastUsedAt, usedAt) !== key.lastUsedAt) {
           await replaceSemanticByteOwner(tx, 'keys', { ...key, lastUsedAt: usedAt }, key)
@@ -983,6 +1128,7 @@ export async function commitBrowserGenerationMetadata(
 
       const settings = tx.table<SettingsRow, string>('settings')
       if (evidence.recentModelId !== undefined && generationCompleted) {
+        recordGenerationMetadataPrimaryRead(physicalReads, 'settings', 2)
         const [publicRow, recencyRow] = await Promise.all([
           settings.get(RECENT_MODELS_KEY),
           settings.get(RECENT_MODEL_RECENCY_KEY),
@@ -1015,8 +1161,10 @@ export async function commitBrowserGenerationMetadata(
       let chatVersions: ChatVersions | undefined
       if (evidence.calibration && lease.attemptKind === 'generation') {
         const plan = evidence.calibration
+        recordGenerationMetadataPrimaryRead(physicalReads, 'chats')
+        recordGenerationMetadataPrimaryRead(physicalReads, 'settings')
         const [chat, globalRow] = await Promise.all([
-          tx.table<Chat, ChatId>('chats').get(lease.chatId),
+          readCurrentChatForTransaction(tx, lease.chatId),
           settings.get(GLOBAL_TOKEN_CALIBRATION_KEY),
         ])
         const header = terminalGenerationHeader
@@ -1120,13 +1268,16 @@ export async function commitBrowserGenerationMetadata(
             }
           }
           if (acceptedSamples.length > 0) {
-            await applyChatRowWriteTransitions(tx, [
+            const transition = await applyChatRowWriteTransitions(tx, [
               {
                 kind: 'replace-preserving-links',
                 previous: chat,
                 next: { ...chat, tokenCalibration: staged.tokenCalibration },
               },
             ])
+            boundSemanticOperationExactReceiptAccumulator<GenerationMetadataTable>(tx)?.absorb(
+              transition.fragment,
+            )
             await putTokenCalibrationSettingByteOwner(
               tx,
               {
@@ -1155,7 +1306,7 @@ export async function commitBrowserGenerationMetadata(
       if (committedMessageRevision) {
         recordBrowserCommandMessageRevisions(tx, [committedMessageRevision])
       }
-      return {
+      return finish({
         outcome: 'applied' as const,
         lease: structuredClone(committedLease),
         chatId: lease.chatId,
@@ -1167,8 +1318,8 @@ export async function commitBrowserGenerationMetadata(
         calibration,
         ...(chatVersions ? { chatVersions } : {}),
         ...(committedHeader ? { header: committedHeader } : {}),
-      }
-    }),
+      })
+    },
   )
   return transactionResult
 }

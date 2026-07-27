@@ -732,7 +732,7 @@ describe('owned stream lease lifetime', () => {
     })
     __setWorkspaceRepositoryForTests(repositoryWithExecute(execute))
     const capability = attemptStopCapability(attemptController.getExecution('stream-1'))
-    if (!capability || capability.kind !== 'requestable') {
+    if (capability?.kind !== 'requestable') {
       throw new Error('ExpectedRequestableStopCapability')
     }
 
@@ -789,7 +789,7 @@ describe('owned stream lease lifetime', () => {
     const handle = await adoptLeaseOwnership(currentLease, abortTransport)
     observeLocalLease(currentLease)
     const capability = attemptStopCapability(attemptController.getExecution('stream-1'))
-    if (!capability || capability.kind !== 'requestable') {
+    if (capability?.kind !== 'requestable') {
       throw new Error('ExpectedRequestableStopCapability')
     }
 
@@ -804,7 +804,7 @@ describe('owned stream lease lifetime', () => {
     await handle.retire({ mode: 'handoff', reason: 'finalize-failed' })
   })
 
-  it('retains its exact level-triggered Stop intent when the durable command fails', async () => {
+  it('returns a failed uncommitted Stop intent to a requestable state', async () => {
     attemptController.replaceWorkspace(FENCE)
     const currentLease = lease()
     observeLocalLease(currentLease)
@@ -818,7 +818,7 @@ describe('owned stream lease lifetime', () => {
       }),
     )
     const capability = attemptStopCapability(attemptController.getExecution('stream-1'))
-    if (!capability || capability.kind !== 'requestable') {
+    if (capability?.kind !== 'requestable') {
       throw new Error('ExpectedRequestableStopCapability')
     }
 
@@ -829,7 +829,7 @@ describe('owned stream lease lifetime', () => {
     )
     await expect(request.completed).rejects.toBe(failure)
     expect(attemptStopCapability(attemptController.getExecution('stream-1'))?.kind).toBe(
-      'requesting',
+      'requestable',
     )
   })
 

@@ -197,11 +197,14 @@ export function canonicalStreamJournalFrameBatch(
   }
   const frames: CanonicalStreamJournalFrameRow[] = []
   let streamId: string | undefined
+  let previousSeq = -1
   let bytes = 0
   for (const value of values) {
     const frame = requireCanonicalStreamJournalFrame(value)
     streamId ??= frame.streamId
     if (frame.streamId !== streamId) throw new Error('StreamJournalAppendBatchMixedStreams')
+    if (frame.seq <= previousSeq) throw new Error('StreamJournalAppendBatchOrderInvalid')
+    previousSeq = frame.seq
     bytes = saturatingAdd(bytes, estimateStreamJournalV83FrameStorageBytes(frame))
     if (bytes > STREAM_JOURNAL_APPEND_MAX_BYTES) {
       throw new Error(`StreamJournalAppendBatchByteBudgetExceeded:${bytes}`)

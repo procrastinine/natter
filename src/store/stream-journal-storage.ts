@@ -1,9 +1,16 @@
 import { sameValue } from '../lib/same-value'
 import {
   recordBrowserCommandOwnerInvalidation,
+  recordBrowserCommandPhysicalDeletionRows,
   recordBrowserCommandStreamJournalRetirementPage,
 } from './browser-command-mutation-journal'
-import { recordObsoleteByteOwnerBytes, recordObsoleteByteOwnerValues } from './byte-owner-mutation'
+import {
+  addPhysicalStorageRow,
+  addPhysicalStorageRows,
+  deletePhysicalStorageKeys,
+  recordObsoleteByteOwnerBytes,
+  replacePhysicalStorageRow,
+} from './byte-owner-mutation'
 import { exactCompoundPrefixBetween } from './indexeddb-key-ranges'
 import {
   type CapabilityTables,
@@ -22,6 +29,10 @@ import {
   streamLeaseMatchesWriteFence,
 } from './repository'
 import {
+  type SemanticOperationReceiptFragment,
+  semanticOperationReceiptFragment,
+} from './semantic-operation-capability'
+import {
   estimateStoredValueBytes,
   estimateStreamJournalFrameStorageBytes,
 } from './storage-size-estimate'
@@ -34,12 +45,9 @@ import {
   sameStreamJournalWriterAuthority,
   streamJournalWriterAuthority,
 } from './stream-journal-codec'
-import {
-  STREAM_LEASE_HEARTBEAT_COALESCE_MS,
-  STREAM_LEASE_HEARTBEAT_MS,
-} from './stream-lease-policy'
+import { STREAM_LEASE_HEARTBEAT_COALESCE_MS } from './stream-lease-policy'
 
-const STREAM_JOURNAL_DELETE_PAGE_ROWS = 64
+export const STREAM_JOURNAL_RETIREMENT_MAX_ROWS = 64
 
 export const STREAM_LEASE_MUTATION_TRANSACTION_CAPABILITY = physicalStorageTables('streamLeases')
 export const STREAM_JOURNAL_MUTATION_TRANSACTION_CAPABILITY = physicalStorageTables(
@@ -56,17 +64,24 @@ type StreamJournalMutationTransaction = FencedTransaction<
 
 type ActiveFencedStreamLease = FencedStreamLeaseRow & { readonly phase: 'active' }
 
+export interface StreamJournalAppendResult {
+  readonly lease?: ActiveFencedStreamLease
+  readonly authority: StreamJournalWriterAuthority
+  readonly acceptedFrameIds: readonly string[]
+  readonly appendedFrameIds: readonly string[]
+  readonly lookupFrameIds: readonly string[]
+  readonly receipt: SemanticOperationReceiptFragment<'streamLeases' | 'streamChunks'>
+}
+
 export async function putStreamLeaseByteOwner(
   tx: StreamLeaseMutationTransaction,
   next: StreamLeaseRow,
   previous: StreamLeaseRow | undefined,
 ): Promise<void> {
-  const leases = tx.table<StreamLeaseRow, string>('streamLeases')
   if (!previous) {
-    await leases.add(next)
+    await addPhysicalStorageRow<StreamLeaseRow, string>(tx, 'streamLeases', next)
   } else {
-    await recordObsoleteByteOwnerValues(tx, [previous])
-    await leases.put(next)
+    await replacePhysicalStorageRow<StreamLeaseRow, string>(tx, 'streamLeases', next, previous)
   }
   recordBrowserCommandOwnerInvalidation(tx, {
     kind: 'stream-lease',
@@ -85,7 +100,7 @@ export async function appendStreamJournalFrames(
   tx: StreamJournalMutationTransaction,
   frames: CanonicalStreamJournalFrameBatch,
   observedAt: number,
-): Promise<ActiveFencedStreamLease | undefined> {
+): Promise<StreamJournalAppendResult> {
   if (!Number.isSafeInteger(observedAt) || observedAt < 0) {
     throw new Error('StreamJournalObservedAtInvalid')
   }
@@ -101,27 +116,33 @@ export async function appendStreamJournalFrames(
   const leases = tx.table<StreamLeaseRow, string>('streamLeases')
   const lease = requireActiveStreamJournalAppendLease(await leases.get(streamId), identity)
   const streamFrames = tx.table<StreamJournalFrameRow, string>('streamChunks')
-  const existingRows = await streamFrames.bulkGet(frames.map((frame) => frame.id))
-  const newFrames: CanonicalStreamJournalFrameRow[] = []
-  for (let index = 0; index < frames.length; index += 1) {
-    const frame = frames[index]
-    if (!frame) continue
-    const existing = existingRows[index]
-    if (existing) {
-      const canonicalExisting = requireCanonicalStreamJournalFrame(existing)
-      if (!sameValue(canonicalExisting, frame) || frame.seq > (lease.journalMaxSeq ?? -1)) {
-        throw new Error(`StreamJournalFrameConflict:${frame.streamId}:${frame.seq}`)
-      }
-      continue
-    }
-    if (frame.seq <= (lease.journalMaxSeq ?? -1)) {
+  const journalMaxSeq = lease.journalMaxSeq ?? -1
+  const overlapFrames = frames.filter((frame) => frame.seq <= journalMaxSeq)
+  const newFrames = frames.filter((frame) => frame.seq > journalMaxSeq)
+  const lookupFrameIds = overlapFrames.map((frame) => frame.id)
+  if (newFrames.length > 0 && journalMaxSeq >= 0) {
+    const tailId = streamJournalFrameId(streamId, journalMaxSeq)
+    if (!lookupFrameIds.includes(tailId)) lookupFrameIds.push(tailId)
+  }
+  const existingRows = lookupFrameIds.length === 0 ? [] : await streamFrames.bulkGet(lookupFrameIds)
+  const existingById = new Map(
+    lookupFrameIds.flatMap((id, index) => {
+      const row = existingRows[index]
+      return row ? ([[id, row]] as const) : []
+    }),
+  )
+  for (const frame of overlapFrames) {
+    const existing = existingById.get(frame.id)
+    if (!existing) {
       throw new Error(`StreamJournalFrameMissing:${frame.streamId}:${frame.seq}`)
     }
-    newFrames.push(frame)
+    if (!sameValue(requireCanonicalStreamJournalFrame(existing), frame)) {
+      throw new Error(`StreamJournalFrameConflict:${frame.streamId}:${frame.seq}`)
+    }
   }
   let previous: CanonicalStreamJournalFrameRow | undefined
-  if (newFrames.length > 0 && (lease.journalMaxSeq ?? -1) >= 0) {
-    const row = await streamFrames.get(streamJournalFrameId(streamId, lease.journalMaxSeq ?? 0))
+  if (newFrames.length > 0 && journalMaxSeq >= 0) {
+    const row = existingById.get(streamJournalFrameId(streamId, journalMaxSeq))
     if (!row) throw streamJournalAppendInvariantError(streamId, 'previous-frame')
     previous = requireCanonicalStreamJournalFrame(row)
   }
@@ -131,43 +152,116 @@ export async function appendStreamJournalFrames(
     previous = frame
     appendedBytes = saturatingAdd(appendedBytes, estimateStreamJournalFrameStorageBytes(frame))
   }
-  const elapsed = observedAt - lease.heartbeatAt
-  const renewHeartbeat =
-    elapsed < 0 || elapsed >= STREAM_LEASE_HEARTBEAT_MS - STREAM_LEASE_HEARTBEAT_COALESCE_MS
-  if (newFrames.length === 0 && !renewHeartbeat) return undefined
+  const refreshHeartbeat =
+    newFrames.length > 0 && observedAt - lease.heartbeatAt > STREAM_LEASE_HEARTBEAT_COALESCE_MS
+  if (newFrames.length === 0) {
+    return streamJournalAppendResult(lease, frames, [], lookupFrameIds, false)
+  }
+  const appendedTail = newFrames.at(-1)
+  if (!appendedTail) throw streamJournalAdvanceInvariantError(streamId, 'appended-tail')
   const next = requireStreamLeaseRow({
     ...lease,
-    ...(previous === undefined
-      ? {}
-      : {
-          journalMaxSeq: previous.seq,
-          journalStorageBytes: saturatingAdd(lease.journalStorageBytes ?? 0, appendedBytes),
-        }),
-    ...(renewHeartbeat
-      ? { heartbeatAt: observedAt, revision: nextStreamLeaseRevision(lease) }
-      : {}),
+    journalMaxSeq: appendedTail.seq,
+    journalStorageBytes: saturatingAdd(lease.journalStorageBytes ?? 0, appendedBytes),
+    ...(refreshHeartbeat ? { heartbeatAt: observedAt } : {}),
   })
   if (next.phase !== 'active' || next.custody === 'recovery-pending') {
     throw streamJournalAdvanceInvariantError(streamId, 'constructed-state')
   }
-  await recordObsoleteByteOwnerBytes(tx, estimateStoredValueBytes(lease))
-  await leases.put(next)
-  if (newFrames.length > 0) await streamFrames.bulkAdd(newFrames)
-  if (newFrames.length > 0) {
-    recordBrowserCommandOwnerInvalidation(tx, {
-      kind: 'stream-chunks',
-      chatId: next.chatId,
-      streamIds: [streamId],
-    })
-  }
-  if (next.heartbeatAt !== lease.heartbeatAt || next.revision !== lease.revision) {
+  await replacePhysicalStorageRow<StreamLeaseRow, string>(tx, 'streamLeases', next, lease)
+  await addPhysicalStorageRows<CanonicalStreamJournalFrameRow, string>(
+    tx,
+    'streamChunks',
+    newFrames,
+  )
+  recordBrowserCommandOwnerInvalidation(tx, {
+    kind: 'stream-chunks',
+    chatId: next.chatId,
+    streamIds: [streamId],
+  })
+  if (next.heartbeatAt !== lease.heartbeatAt) {
     recordBrowserCommandOwnerInvalidation(tx, {
       kind: 'stream-lease',
       chatId: next.chatId,
       streamIds: [streamId],
     })
   }
-  return next
+  return streamJournalAppendResult(next, frames, newFrames, lookupFrameIds, refreshHeartbeat)
+}
+
+function streamJournalAppendResult(
+  lease: ActiveFencedStreamLease,
+  frames: CanonicalStreamJournalFrameBatch,
+  appendedFrames: readonly CanonicalStreamJournalFrameRow[],
+  lookupFrameIds: readonly string[],
+  heartbeatChanged: boolean,
+): StreamJournalAppendResult {
+  const dependencies = [
+    ...(appendedFrames.length > 0
+      ? [
+          {
+            kind: 'stream-chunks' as const,
+            chatId: lease.chatId,
+            streamIds: [lease.streamId],
+          },
+        ]
+      : []),
+    ...(heartbeatChanged
+      ? [
+          {
+            kind: 'stream-lease' as const,
+            chatId: lease.chatId,
+            streamIds: [lease.streamId],
+          },
+        ]
+      : []),
+  ]
+  return Object.freeze({
+    ...(appendedFrames.length > 0 ? { lease } : {}),
+    authority: streamJournalWriterAuthority(lease),
+    acceptedFrameIds: Object.freeze(frames.map((frame) => frame.id)),
+    appendedFrameIds: Object.freeze(appendedFrames.map((frame) => frame.id)),
+    lookupFrameIds: Object.freeze([...lookupFrameIds]),
+    receipt: semanticOperationReceiptFragment({
+      dependencies,
+      physicalMutations: [
+        ...(appendedFrames.length > 0
+          ? [
+              {
+                tableName: 'streamLeases' as const,
+                operation: 'write' as const,
+                key: lease.streamId,
+              },
+            ]
+          : []),
+        ...appendedFrames.map((frame) => ({
+          tableName: 'streamChunks' as const,
+          operation: 'write' as const,
+          key: frame.id,
+        })),
+      ],
+      physicalReads: [
+        {
+          tableName: 'streamLeases',
+          indexKind: 'primary',
+          operation: 'get',
+          requestCount: 1,
+          rowCount: 1,
+        },
+        ...(lookupFrameIds.length > 0
+          ? [
+              {
+                tableName: 'streamChunks' as const,
+                indexKind: 'primary' as const,
+                operation: 'get-many' as const,
+                requestCount: 1,
+                rowCount: lookupFrameIds.length,
+              },
+            ]
+          : []),
+      ],
+    }),
+  })
 }
 
 export type StreamJournalRetirementRequest =
@@ -175,6 +269,7 @@ export type StreamJournalRetirementRequest =
       readonly kind: 'owned-metadata-committed'
       readonly streamId: string
       readonly fence: StreamWriteFence
+      readonly maxFrameRows: number
     }
   | {
       readonly kind: 'retention-candidate'
@@ -182,8 +277,13 @@ export type StreamJournalRetirementRequest =
       readonly expectedRevision: number
       readonly expectedTerminalRetentionAt: number
       readonly cutoff: number
+      readonly maxFrameRows: number
     }
-  | { readonly kind: 'lease-absent-stream'; readonly streamId: string }
+  | {
+      readonly kind: 'lease-absent-stream'
+      readonly streamId: string
+      readonly maxFrameRows: number
+    }
   | { readonly kind: 'orphan-chat-closure'; readonly chatIds: readonly string[] }
 
 export interface StreamJournalRetirementResult {
@@ -207,12 +307,26 @@ export type StreamJournalRetirementPageResult = StreamJournalRetirementResult &
       }
   )
 
+export type StreamJournalRetirementPageTransition =
+  | {
+      readonly kind: 'single-stream'
+      readonly result: StreamJournalRetirementPageResult
+      readonly receipt: SemanticOperationReceiptFragment<'streamLeases' | 'streamChunks'>
+    }
+  | {
+      readonly kind: 'orphan-chat-closure'
+      readonly result: StreamJournalRetirementPageResult
+    }
+
 export async function retireStreamJournalOwnershipPage(
   tx: StreamJournalMutationTransaction,
   request: StreamJournalRetirementRequest,
-): Promise<StreamJournalRetirementPageResult> {
+): Promise<StreamJournalRetirementPageTransition> {
   if (request.kind === 'orphan-chat-closure') {
-    return retireOrphanChatStreamJournalPage(tx, request.chatIds)
+    return {
+      kind: 'orphan-chat-closure',
+      result: await retireOrphanChatStreamJournalPage(tx, request.chatIds),
+    }
   }
   return retireOneStreamJournalPage(tx, request)
 }
@@ -220,8 +334,9 @@ export async function retireStreamJournalOwnershipPage(
 async function retireOneStreamJournalPage(
   tx: StreamJournalMutationTransaction,
   request: Exclude<StreamJournalRetirementRequest, { kind: 'orphan-chat-closure' }>,
-): Promise<StreamJournalRetirementPageResult> {
+): Promise<Extract<StreamJournalRetirementPageTransition, { kind: 'single-stream' }>> {
   const { streamId } = request
+  const maxFrameRows = boundedStreamJournalRetirementRows(request.maxFrameRows)
   const frames = tx.table<StreamJournalFrameRow, string>('streamChunks')
   const leases = tx.table<StreamLeaseRow, string>('streamLeases')
   const [lease, rows] = await Promise.all([
@@ -229,18 +344,46 @@ async function retireOneStreamJournalPage(
     frames
       .where('streamId')
       .equals(streamId)
-      .limit(STREAM_JOURNAL_DELETE_PAGE_ROWS + 1)
+      .limit(maxFrameRows + 1)
       .toArray(),
   ])
-  if (!lease && rows.length === 0) return completedStreamJournalRetirementPage()
+  const physicalReads = [
+    {
+      tableName: 'streamLeases' as const,
+      indexKind: 'primary' as const,
+      operation: 'get' as const,
+      requestCount: 1,
+      rowCount: 1,
+    },
+    {
+      tableName: 'streamChunks' as const,
+      indexKind: 'secondary' as const,
+      indexName: 'streamId',
+      operation: 'query' as const,
+      requestCount: 1,
+      rowCount: rows.length,
+    },
+  ]
+  if (!lease && rows.length === 0) {
+    return singleStreamJournalRetirementTransition(
+      completedStreamJournalRetirementPage(),
+      semanticOperationReceiptFragment({ physicalReads }),
+    )
+  }
   const ineligible = streamJournalRetirementIneligibility(request, lease, rows.length > 0)
-  if (ineligible) return ineligibleStreamJournalRetirementPage(ineligible)
-  const page = rows.slice(0, STREAM_JOURNAL_DELETE_PAGE_ROWS)
-  const done = rows.length <= STREAM_JOURNAL_DELETE_PAGE_ROWS
+  if (ineligible) {
+    return singleStreamJournalRetirementTransition(
+      ineligibleStreamJournalRetirementPage(ineligible),
+      semanticOperationReceiptFragment({ physicalReads }),
+    )
+  }
+  const page = rows.slice(0, maxFrameRows)
+  const done = rows.length <= maxFrameRows
   let measuredJournalBytes = 0
   const frameIds = page.map((frame) => frame.id)
+  let frameMutationAddress: string | undefined
   if (frameIds.length > 0) {
-    recordBrowserCommandStreamJournalRetirementPage(tx, frameIds, {
+    frameMutationAddress = recordBrowserCommandStreamJournalRetirementPage(tx, frameIds, {
       kind: 'stream',
       streamId,
       ...(lease ? { chatId: lease.chatId } : {}),
@@ -258,10 +401,13 @@ async function retireOneStreamJournalPage(
         estimateStreamJournalFrameStorageBytes(frame),
       )
     }
-    await frames.bulkDelete(frameIds)
+    await deletePhysicalStorageKeys<StreamJournalFrameRow, string>(tx, 'streamChunks', frameIds)
   }
   const deleteLease = done && lease !== undefined && request.kind !== 'lease-absent-stream'
-  if (deleteLease) await leases.delete(streamId)
+  if (deleteLease) {
+    recordBrowserCommandPhysicalDeletionRows(tx, 'streamLeases', [streamId], [lease])
+    await deletePhysicalStorageKeys<StreamLeaseRow, string>(tx, 'streamLeases', [streamId])
+  }
   const obsoleteBytes = saturatingAdd(
     measuredJournalBytes,
     deleteLease ? estimateStoredValueBytes(lease) : 0,
@@ -281,13 +427,59 @@ async function retireOneStreamJournalPage(
       streamIds: [streamId],
     })
   }
-  return {
-    outcome: done ? 'complete' : 'progress',
-    deletedFrames: frameIds.length,
-    deletedLeases: deleteLease ? 1 : 0,
-    obsoleteBytes,
-    done,
-  } as StreamJournalRetirementPageResult
+  return singleStreamJournalRetirementTransition(
+    {
+      outcome: done ? 'complete' : 'progress',
+      deletedFrames: frameIds.length,
+      deletedLeases: deleteLease ? 1 : 0,
+      obsoleteBytes,
+      done,
+    } as StreamJournalRetirementPageResult,
+    semanticOperationReceiptFragment({
+      dependencies: [
+        ...(frameIds.length > 0
+          ? [
+              {
+                kind: 'stream-chunks' as const,
+                ...(lease ? { chatId: lease.chatId } : {}),
+                streamIds: [streamId],
+              },
+            ]
+          : []),
+        ...(deleteLease
+          ? [
+              {
+                kind: 'stream-lease' as const,
+                chatId: lease.chatId,
+                streamIds: [streamId],
+              },
+            ]
+          : []),
+      ],
+      physicalMutations: [
+        ...(frameMutationAddress
+          ? [
+              {
+                tableName: 'streamChunks' as const,
+                operation: 'delete-group' as const,
+                address: frameMutationAddress,
+                affectedRows: frameIds.length,
+              },
+            ]
+          : []),
+        ...(deleteLease
+          ? [
+              {
+                tableName: 'streamLeases' as const,
+                operation: 'delete' as const,
+                key: streamId,
+              },
+            ]
+          : []),
+      ],
+      physicalReads,
+    }),
+  )
 }
 
 async function retireOrphanChatStreamJournalPage(
@@ -312,10 +504,10 @@ async function retireOrphanChatStreamJournalPage(
   const rows = await frames
     .where('chatId')
     .anyOf(chatIds)
-    .limit(STREAM_JOURNAL_DELETE_PAGE_ROWS + 1)
+    .limit(STREAM_JOURNAL_RETIREMENT_MAX_ROWS + 1)
     .toArray()
-  const page = rows.slice(0, STREAM_JOURNAL_DELETE_PAGE_ROWS)
-  const done = rows.length <= STREAM_JOURNAL_DELETE_PAGE_ROWS
+  const page = rows.slice(0, STREAM_JOURNAL_RETIREMENT_MAX_ROWS)
+  const done = rows.length <= STREAM_JOURNAL_RETIREMENT_MAX_ROWS
   const canonical = page.map(requireCanonicalStreamJournalFrame)
   const frameIds = canonical.map((frame) => frame.id)
   if (frameIds.length > 0) {
@@ -329,7 +521,7 @@ async function retireOrphanChatStreamJournalPage(
       }
       obsoleteBytes = saturatingAdd(obsoleteBytes, estimateStreamJournalFrameStorageBytes(frame))
     }
-    await frames.bulkDelete(frameIds)
+    await deletePhysicalStorageKeys<StreamJournalFrameRow, string>(tx, 'streamChunks', frameIds)
   }
   await recordObsoleteByteOwnerBytes(tx, obsoleteBytes)
   if (frameIds.length > 0) {
@@ -388,6 +580,24 @@ function ineligibleStreamJournalRetirementPage(
   }
 }
 
+function singleStreamJournalRetirementTransition(
+  result: StreamJournalRetirementPageResult,
+  receipt: SemanticOperationReceiptFragment<'streamLeases' | 'streamChunks'>,
+): Extract<StreamJournalRetirementPageTransition, { kind: 'single-stream' }> {
+  return Object.freeze({
+    kind: 'single-stream',
+    result: Object.freeze(result),
+    receipt,
+  })
+}
+
+function boundedStreamJournalRetirementRows(value: number): number {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error('StreamJournalRetirementLimitInvalid')
+  }
+  return Math.min(value, STREAM_JOURNAL_RETIREMENT_MAX_ROWS)
+}
+
 function streamJournalAppendInvariantError(streamId: string, reason: string): Error {
   return new Error(`StreamJournalAppendInvariantError:${streamId}:${reason}`)
 }
@@ -414,13 +624,6 @@ function requireActiveStreamJournalAppendLease(
 
 function streamJournalAdvanceInvariantError(streamId: string, reason: string): Error {
   return new Error(`StreamJournalAdvanceInvariantError:${streamId}:${reason}`)
-}
-
-function nextStreamLeaseRevision(lease: Pick<StreamLeaseRow, 'streamId' | 'revision'>): number {
-  if (lease.revision >= Number.MAX_SAFE_INTEGER) {
-    throw streamJournalAdvanceInvariantError(lease.streamId, 'revision-exhausted')
-  }
-  return lease.revision + 1
 }
 
 function saturatingAdd(left: number, right: number): number {

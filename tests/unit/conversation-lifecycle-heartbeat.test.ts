@@ -187,6 +187,14 @@ class TestProjectionSource implements ConversationProjectionSource {
           pathHeaders: Object.freeze(path.map((row) => row.header)),
         },
         presentations: Object.freeze(tip ? [tip] : []),
+        forks: Object.freeze(
+          path.map((row) =>
+            this.forkFor({
+              parentId: row.header.parentId,
+              selectedMessageId: row.header.id,
+            }),
+          ),
+        ),
       }
       return this.envelope(sealConversationSelection(destination))
     },

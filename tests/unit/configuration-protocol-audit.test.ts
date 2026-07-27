@@ -53,32 +53,31 @@ beforeAll(async () => {
 }, 30_000)
 
 describe('nested configuration protocol audit', () => {
-  it('closes the known protocol structure while keeping unreachable operations visible', () => {
+  it('closes the current protocol structure with every operation reachable', () => {
     const result = runAudit('inventory')
 
     expect(result.status).toBe(0)
     expect(result.report).toMatchObject({
       ok: true,
       structurallyValid: true,
-      commandVariants: 51,
-      constructorSites: 44,
-      reachableCommands: 41,
+      commandVariants: 44,
+      constructorSites: 47,
+      reachableCommands: 44,
       resultVariants: 13,
-      resultConstructorSites: 143,
-      resultMappings: 51,
+      resultConstructorSites: 107,
+      resultMappings: 44,
       problems: [],
     })
-    expect(result.report.gaps).toHaveLength(10)
-    expect(result.report.gaps.map((gap) => gap.variant)).toContain('chat-preset.duplicate')
+    expect(result.report.gaps).toEqual([])
   })
 
-  it('makes the ten unresolved operations fatal only in enforcement mode', () => {
+  it('passes enforcement mode with no unresolved operations', () => {
     const result = runAudit('enforce')
 
-    expect(result.status).toBe(1)
-    expect(result.report.ok).toBe(false)
+    expect(result.status).toBe(0)
+    expect(result.report.ok).toBe(true)
     expect(result.report.structurallyValid).toBe(true)
-    expect(result.report.gaps).toHaveLength(10)
+    expect(result.report.gaps).toEqual([])
   })
 
   it('rejects a stale or missing command classification', () => {

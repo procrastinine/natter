@@ -3,7 +3,10 @@ import 'fake-indexeddb/auto'
 import { IDBFactory } from 'fake-indexeddb'
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
-import type { Chat } from '../../src/core/types'
+import { tokenCalibrationKey } from '../../src/core/model-ids'
+import { EMPTY_TEXT_TEMPLATE, type SavedTextTemplate } from '../../src/core/text-templates'
+import { GLOBAL_TOKEN_CALIBRATION_KEY } from '../../src/core/token-calibration'
+import type { Chat, KeyRecord } from '../../src/core/types'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
 import {
   __getBrowserWorkspaceSessionRepositoryForTests,
@@ -105,6 +108,292 @@ afterAll(async () => {
 describe('browser WorkspaceRepository protocol contract', () => {
   it('satisfies the reusable stamped query/command/branch contract', async () => {
     await expectWorkspaceRepositoryCoreContract(getBrowserRepository())
+  })
+
+  it('executes chat metadata commands through exact semantic capabilities', async () => {
+    const repository = getBrowserRepository()
+    await putTestChat(sessionChat('semantic-chat'))
+
+    const viewed = await write(repository, {
+      kind: 'chat.touch-viewed',
+      chatId: 'semantic-chat',
+      now: 2,
+    })
+    expect(viewed.delta).toMatchObject({
+      facts: [{ kind: 'sidebar-row-changed', chatId: 'semantic-chat' }],
+      invalidations: expect.arrayContaining([
+        { kind: 'chat', chatIds: ['semantic-chat'] },
+        { kind: 'sidebar', chatIds: ['semantic-chat'] },
+      ]),
+    })
+
+    await expect(
+      write(repository, {
+        kind: 'chat.set-manual-title',
+        chatId: 'semantic-chat',
+        title: 'Semantic title',
+        now: 3,
+      }),
+    ).resolves.toMatchObject({ value: { value: true } })
+
+    await expect(
+      write(repository, {
+        kind: 'chat.set-archived',
+        chatIds: ['semantic-chat'],
+        archived: true,
+        now: 4,
+      }),
+    ).resolves.toMatchObject({ value: { value: ['semantic-chat'] } })
+
+    expect(
+      (await read(repository, { kind: 'chat.get', chatId: 'semantic-chat' })).value,
+    ).toMatchObject({
+      title: 'Semantic title',
+      titleStatus: 'manual',
+      lastViewedAt: 2,
+      archived: true,
+    })
+  })
+
+  it('clears chat calibration through one semantic transaction without catalog planning', async () => {
+    const repository = getBrowserRepository()
+    const calibrationKey = tokenCalibrationKey('openai/gpt-5.4-nano')
+    const sample = {
+      totalTextChars: 400,
+      totalTextTokens: 100,
+      sampleCount: 2,
+      updatedAt: 1,
+    }
+    await putTestChat({
+      ...sessionChat('calibration-chat'),
+      tokenCalibration: { [calibrationKey]: sample },
+      tokenCalibrationGeneration: 0,
+    })
+    await getDb().settings.put({
+      key: GLOBAL_TOKEN_CALIBRATION_KEY,
+      value: {
+        version: 1,
+        updatedAt: 1,
+        byModel: { [calibrationKey]: sample },
+      },
+    })
+
+    const result = await write(repository, {
+      kind: 'chat.calibration.clear',
+      chatId: 'calibration-chat',
+      calibrationKey,
+      now: 2,
+    })
+
+    expect(result).toMatchObject({
+      effectScope: 'workspace',
+      value: {
+        value: true,
+        affectedChatIds: ['calibration-chat'],
+      },
+      delta: {
+        invalidations: expect.arrayContaining([
+          { kind: 'chat', chatIds: ['calibration-chat'] },
+          { kind: 'setting', keys: [GLOBAL_TOKEN_CALIBRATION_KEY] },
+        ]),
+      },
+    })
+    expect(await getDb().chats.get('calibration-chat')).toMatchObject({
+      tokenCalibration: {},
+      tokenCalibrationGeneration: 1,
+    })
+    expect(await getDb().settings.get(GLOBAL_TOKEN_CALIBRATION_KEY)).toMatchObject({
+      value: { byModel: {} },
+    })
+
+    await expect(
+      write(repository, {
+        kind: 'chat.calibration.clear',
+        chatId: 'missing-calibration-chat',
+        now: 3,
+      }),
+    ).resolves.toMatchObject({
+      effectScope: 'none',
+      value: { value: false, affectedChatIds: [] },
+    })
+
+    await putTestChat({
+      ...sessionChat('calibration-family-chat'),
+      tokenCalibration: { [calibrationKey]: sample },
+      tokenCalibrationGeneration: 0,
+    })
+    await getDb().settings.put({
+      key: GLOBAL_TOKEN_CALIBRATION_KEY,
+      value: {
+        version: 1,
+        updatedAt: 3,
+        byModel: { [calibrationKey]: sample },
+      },
+    })
+    await expect(
+      write(repository, {
+        kind: 'chat.calibration.clear-family',
+        calibrationKey,
+        now: 4,
+      }),
+    ).resolves.toMatchObject({
+      effectScope: 'workspace',
+      value: { value: { globalChanged: true, chatCount: 1 } },
+    })
+    await expect(
+      write(repository, {
+        kind: 'chat.calibration.clear-all',
+        now: 5,
+      }),
+    ).resolves.toMatchObject({
+      effectScope: 'workspace',
+      value: { value: { globalChanged: false, chatCount: 0 } },
+    })
+  })
+
+  it('publishes exact single and paired setting effects and no effect for replayed no-ops', async () => {
+    const repository = getBrowserRepository()
+    const setting = {
+      kind: 'configuration.execute' as const,
+      input: {
+        kind: 'global-preference.set' as const,
+        key: 'test:exact-setting',
+        value: { enabled: true },
+        now: 2,
+      },
+    }
+
+    await expect(write(repository, setting)).resolves.toMatchObject({
+      effectScope: 'workspace',
+      delta: {
+        facts: [],
+        invalidations: [{ kind: 'setting', keys: ['test:exact-setting'] }],
+      },
+    })
+    await expect(write(repository, setting)).resolves.toMatchObject({
+      effectScope: 'none',
+      delta: { facts: [], invalidations: [] },
+    })
+    await getDb().settings.bulkPut([
+      { key: 'global:recent-models', value: ['model-a'] },
+      {
+        key: 'global:recent-model-recency-v1',
+        value: {
+          version: 1,
+          entries: [{ modelId: 'model-a', usedAt: 3, streamId: 'stream-a' }],
+        },
+      },
+    ])
+
+    const clearRecentModels = {
+      kind: 'configuration.execute' as const,
+      input: {
+        kind: 'recent-model.clear' as const,
+        now: 4,
+      },
+    }
+    await expect(write(repository, clearRecentModels)).resolves.toMatchObject({
+      effectScope: 'workspace',
+      delta: {
+        facts: [],
+        invalidations: [
+          {
+            kind: 'setting',
+            keys: ['global:recent-model-recency-v1', 'global:recent-models'],
+          },
+        ],
+      },
+    })
+    await expect(write(repository, clearRecentModels)).resolves.toMatchObject({
+      effectScope: 'none',
+      delta: {
+        facts: [],
+        invalidations: [],
+      },
+    })
+  })
+
+  it('publishes exact single-row configuration effects and none for replayed no-ops', async () => {
+    const repository = getBrowserRepository()
+    const key: KeyRecord = {
+      id: 'semantic-key',
+      name: 'Semantic key',
+      ciphertext: 'ciphertext',
+      iv: 'iv',
+      salt: 'salt',
+      algorithm: 'AES-GCM-256',
+      kdf: { name: 'PBKDF2', iterations: 200_000, hash: 'SHA-256' },
+      obscuredPreview: '••••',
+      materialRevision: 1,
+      createdAt: 1,
+    }
+    await getDb().keys.put(key)
+
+    const touchKey = {
+      kind: 'configuration.execute' as const,
+      input: { kind: 'key.touch' as const, keyId: key.id, now: 2 },
+    }
+    await expect(write(repository, touchKey)).resolves.toMatchObject({
+      effectScope: 'workspace',
+      delta: {
+        facts: [],
+        invalidations: [{ kind: 'key', keyIds: [key.id], facets: ['usage'] }],
+      },
+    })
+    await expect(write(repository, touchKey)).resolves.toMatchObject({
+      effectScope: 'none',
+      delta: { facts: [], invalidations: [] },
+    })
+
+    const template: SavedTextTemplate = {
+      id: 'user:semantic-template',
+      name: 'Semantic template',
+      config: { ...EMPTY_TEXT_TEMPLATE, template: 'semantic' },
+      createdAt: 3,
+      updatedAt: 3,
+    }
+    const createTemplate = {
+      kind: 'configuration.execute' as const,
+      input: { kind: 'text-template.create' as const, template, now: 3 },
+    }
+    await expect(write(repository, createTemplate)).resolves.toMatchObject({
+      effectScope: 'workspace',
+      delta: {
+        facts: [],
+        invalidations: [{ kind: 'text-template', templateIds: [template.id] }],
+      },
+    })
+    await expect(write(repository, createTemplate)).resolves.toMatchObject({
+      effectScope: 'none',
+      delta: { facts: [], invalidations: [] },
+      value: { kind: 'conflict', reason: 'link-changed' },
+    })
+
+    const updateTemplate = {
+      kind: 'configuration.execute' as const,
+      input: {
+        kind: 'text-template.update' as const,
+        templateId: template.id,
+        patch: { name: 'Renamed template' },
+        now: 4,
+      },
+    }
+    await expect(write(repository, updateTemplate)).resolves.toMatchObject({
+      effectScope: 'workspace',
+      delta: {
+        facts: [],
+        invalidations: [{ kind: 'text-template', templateIds: [template.id] }],
+      },
+    })
+    await expect(
+      write(repository, {
+        ...updateTemplate,
+        input: { ...updateTemplate.input, now: 5 },
+      }),
+    ).resolves.toMatchObject({
+      effectScope: 'none',
+      delta: { facts: [], invalidations: [] },
+    })
   })
 
   it('keeps one commit-delivery wrapper per selected repository target', () => {

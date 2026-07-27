@@ -44,13 +44,14 @@ import {
   type StreamLeaseLocalApplications,
   streamWriteFenceForLease,
 } from './stream-leases'
-import type {
-  AttemptFinalizeResult,
-  AttemptTerminalProjection,
-  GenerationPostCommitMetadataResult,
-  StreamFinishCleanupResult,
-  WorkspaceLocalCommitApplication,
-  WorkspaceRepository,
+import {
+  type AttemptFinalizeResult,
+  type AttemptTerminalProjection,
+  type GenerationPostCommitMetadataResult,
+  generationPostCommitMetadataResourceProof,
+  type StreamFinishCleanupResult,
+  type WorkspaceLocalCommitApplication,
+  type WorkspaceRepository,
 } from './workspace-protocol'
 import type { WorkspaceWritePermit } from './workspace-runtime'
 
@@ -105,6 +106,7 @@ export interface AttemptTerminalOwner {
 
 interface AttemptTerminalProjectionBase {
   readonly streamId: string
+  readonly chatId: ChatId
   readonly messageId: MessageId
   readonly fence: StreamWriteFence
   readonly accumulator: StreamAccumulator
@@ -174,6 +176,7 @@ export async function projectAttemptTerminal(
         return {
           kind: 'continuation',
           streamId: input.streamId,
+          chatId: input.chatId,
           fence: input.fence,
           messageId: input.messageId,
           terminal: receipt,
@@ -275,6 +278,7 @@ export async function projectAttemptTerminal(
       return {
         kind: 'generation',
         streamId: input.streamId,
+        chatId: input.chatId,
         fence: input.fence,
         messageId: input.messageId,
         terminal: receipt,
@@ -476,13 +480,19 @@ function createWriterAttemptTerminalPort(input: {
         throw new AttemptTerminalSealError('finalize-failed', error)
       }
     },
-    canonicalize: (projection) =>
-      commitCanonicalAttempt({
+    canonicalize: async (projection) => {
+      const finalized = await commitCanonicalAttempt({
         repository: input.repository(),
         permit: input.permit,
         lease: input.handle.lease,
         projection,
-      }),
+      })
+      if (!streamLeaseHasWriteFence(finalized.lease)) {
+        throw new Error(`AttemptTerminalLeaseFenceMissing:${finalized.lease.streamId}`)
+      }
+      await input.handle.adoptTargetCommit(finalized.lease)
+      return finalized
+    },
     commitMetadata: () => input.handle.commitPostCommitMetadata(),
     retire: async () => {
       const stopped = await input.handle.retire({
@@ -546,6 +556,7 @@ function createRecoveryAttemptTerminalPort(input: {
           input: {
             streamId: lease.streamId,
             fence: streamWriteFenceForLease(lease),
+            resourceProof: generationPostCommitMetadataResourceProof(lease),
           },
         },
         {
@@ -566,7 +577,6 @@ function createRecoveryAttemptTerminalPort(input: {
       const cleanup = await finishStreamCleanup({
         repository: input.repository,
         permit: input.permit,
-        chatId: lease.chatId,
         streamId: lease.streamId,
         fence: streamWriteFenceForLease(lease),
         application: (committed) => applyStreamCleanup(committed, lease.streamId),

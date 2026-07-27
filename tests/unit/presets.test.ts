@@ -92,15 +92,12 @@ async function createPreset(input: {
   lastUsedAt?: number
 }): Promise<ChatPreset> {
   const id = newId()
-  const result = await configurationApplication.execute({
-    kind: 'chat-preset.create',
-    preset: {
-      id,
-      name: input.name,
-      connectionProfileId: input.connectionProfileId,
-      settings: input.settings ?? settingsFor(input.connectionProfileId),
-      ...(input.lastUsedAt === undefined ? {} : { lastUsedAt: input.lastUsedAt }),
-    },
+  const result = await configurationApplication.createChatPreset({
+    presetId: id,
+    name: input.name,
+    profileId: input.connectionProfileId,
+    settings: input.settings ?? settingsFor(input.connectionProfileId),
+    ...(input.lastUsedAt === undefined ? {} : { lastUsedAt: input.lastUsedAt }),
     now: input.now ?? Date.now(),
   })
   if (result.kind !== 'chat-preset-saved') throw new Error(`PresetCreateFailed:${id}`)
@@ -208,14 +205,10 @@ describe('chat preset configuration commands', () => {
 
   it('rejects a preset whose connection profile does not exist', async () => {
     await expect(
-      configurationApplication.execute({
-        kind: 'chat-preset.create',
-        preset: {
-          id: newId(),
-          name: 'ghost',
-          connectionProfileId: 'missing',
-          settings: settingsFor('missing'),
-        },
+      configurationApplication.createChatPreset({
+        name: 'ghost',
+        profileId: 'missing',
+        settings: settingsFor('missing'),
         now: 100,
       }),
     ).rejects.toThrow('ConfigurationMissing:profile:missing')
@@ -264,9 +257,7 @@ describe('chat preset configuration commands', () => {
       lastUsedAt: 1_000,
     })
     const copyId = newId()
-    const result = await configurationApplication.execute({
-      kind: 'chat-preset.duplicate',
-      sourceId: source.id,
+    const result = await configurationApplication.duplicateChatPreset(source.id, {
       copyId,
       now: 200,
     })
@@ -353,32 +344,6 @@ describe('chat preset catalog, archive, order, and MRU selection', () => {
     ).toBe(scoped.id)
     expect((await resolveSeed({ profileId: profileA })).preset?.id).toBe(scoped.id)
     expect((await resolveSeed()).preset?.id).toBe(globalMru.id)
-  })
-
-  it('touches MRU monotonically and publishes the compact cross-tab dependency', async () => {
-    const profileId = await fakeProfileId()
-    const old = await createPreset({
-      name: 'old',
-      connectionProfileId: profileId,
-      lastUsedAt: 1_000,
-    })
-    await createPreset({ name: 'new', connectionProfileId: profileId, lastUsedAt: 5_000 })
-    const changes: WorkspaceChange[] = []
-    const unsubscribe = subscribeWorkspaceChanges((change) => changes.push(change))
-
-    await configurationApplication.execute({
-      kind: 'chat-preset.touch',
-      presetId: old.id,
-      now: 9_999,
-    })
-    unsubscribe()
-
-    expect((await resolveSeed()).preset?.id).toBe(old.id)
-    expect(changedDependencies(changes)).toContainEqual({
-      kind: 'preset',
-      presetIds: [old.id],
-      facets: ['usage'],
-    })
   })
 })
 

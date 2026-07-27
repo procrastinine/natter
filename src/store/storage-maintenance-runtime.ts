@@ -346,6 +346,7 @@ class StorageMaintenanceController {
         return this.#runRepositorySlice({
           kind: 'maintenance.reconcile-attachment-integrity',
           limit: MAINTENANCE_BATCH_SIZE,
+          now: Date.now(),
         }).then((result) =>
           result.kind === 'result' && !result.value.done ? CONTINUE : done(result),
         )

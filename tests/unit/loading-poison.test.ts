@@ -858,8 +858,9 @@ async function seedChat(
     ],
     async (tx) => {
       const [currentChat] = await readCurrentChatRowsForTransaction(tx, [chat.id])
+      if (!currentChat) throw new Error(`MissingCurrentChat:${chat.id}`)
       await applyChatRowWriteTransitions(tx, [
-        { kind: 'replace-preserving-links', previous: currentChat as Chat, next: nextChat },
+        { kind: 'replace-preserving-links', previous: currentChat, next: nextChat },
       ])
       await db.messages.bulkPut(stored.map((row) => row.header))
       await db.messageBodies.bulkPut(stored.map((row) => row.body))

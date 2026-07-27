@@ -11,7 +11,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build && node scripts/verify-dist.mjs",
-    "preview": "vite preview",
+    "preview": "pnpm build && vite preview",
     "fake-provider": "node scripts/fake-stream-server.mjs",
     "test": "vitest",
     "test:run": "node scripts/audit-protocol-contracts.mjs --mode inventory --facts-output test-results/protocol-contract-facts.json --mutation-output test-results/protocol-contract-mutation-proof.json && vitest run",

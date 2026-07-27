@@ -31,6 +31,13 @@ export const PROTOCOL_STAGE_SWITCHES = Object.freeze([
     'Discovery cache writes share one guarded cache mutation implementation.',
   ),
   stage(
+    'src/store/browser-mutation-plan.ts#scopeDerivedMutationReceiptPolicy|command|1',
+    'command',
+    'semantic-receipt-policy',
+    'repository-protocol',
+    'Every command explicitly selects a scope-derived receipt policy or declares that it has none.',
+  ),
+  stage(
     'src/store/discovery-service.ts#publishDiscoveryRow|command|1',
     'command',
     'domain-publication',

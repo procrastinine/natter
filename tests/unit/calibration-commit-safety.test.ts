@@ -303,6 +303,7 @@ describe('calibration metadata commits', () => {
     await expect(handle.completed).resolves.toMatchObject({ outcome: 'done' })
 
     expect(postCommitCalls).toBe(1)
+    expect((await readGlobalPreferences()).recentModels).toEqual([MODEL])
     expect(replay).toMatchObject({
       effectScope: 'none',
       value: { outcome: 'already-applied' },
@@ -362,6 +363,13 @@ describe('calibration metadata commits', () => {
     expect(physical.commit.delta.invalidations).not.toContainEqual(
       expect.objectContaining({ kind: 'message-body', chatId: chat.id }),
     )
+    expect(physical.commit.delta.invalidations).not.toContainEqual(
+      expect.objectContaining({ kind: 'sidebar', chatIds: [chat.id] }),
+    )
+    expect(physical.commit.delta.facts).not.toContainEqual({
+      kind: 'sidebar-row-changed',
+      chatId: chat.id,
+    })
   })
 
   it('does not publish model recency when dispatch fails after attempt preparation', async () => {

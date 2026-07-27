@@ -53,6 +53,18 @@ export function forceEquivalentModelIdForConnection(
   return normalizeForcedModelIdForConnection(identity.slug, kind)
 }
 
+export function resolveModelIdFromCatalog(
+  sourceModelId: string,
+  kind: ConnectionKind,
+  candidates: readonly ModelCandidate[],
+): string {
+  return (
+    forceEquivalentModelIdForConnection(sourceModelId, kind, candidates) ??
+    (candidates.length === 1 ? candidates[0]?.id : '') ??
+    ''
+  )
+}
+
 export function modelLooksForeignForProfile(kind: ConnectionKind, modelId: string): boolean {
   const provider = deterministicStructuralModelIdentity(modelId).provider
   if (!provider) return false

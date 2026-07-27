@@ -47,10 +47,13 @@ export function requestAttemptStop(
   })
   interruptClaimedLocalAttemptTransport(claimed)
   const completed = runWorkspaceActionAtFence('stream-control', claimed, (permit) =>
-    getWorkspaceRepository()
-      .execute(permit, { kind: 'attempt.request-stop', input })
-      .then((committed) => applyCommittedStopResult(claimed, committed.value)),
+    getWorkspaceRepository().execute(permit, { kind: 'attempt.request-stop', input }),
   )
+    .catch((error: unknown) => {
+      attemptController.resetStopRequest(claimed)
+      throw error
+    })
+    .then((committed) => applyCommittedStopResult(claimed, committed.value))
   return Object.freeze({
     kind: 'attempt-stop-request',
     requestId,

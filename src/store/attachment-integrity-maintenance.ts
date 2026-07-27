@@ -57,6 +57,7 @@ export interface AttachmentIntegrityStateRow {
 export async function reconcileAttachmentIntegrityPage(
   tx: Transaction,
   requestedLimit: number,
+  observedAt: number,
 ): Promise<AttachmentIntegrityMaintenanceResult> {
   const limit = Math.max(1, Math.min(128, Math.floor(requestedLimit)))
   const states = tx.table<AttachmentIntegrityStateRow, string>('attachmentIntegrityState')
@@ -71,7 +72,7 @@ export async function reconcileAttachmentIntegrityPage(
     case 'edges':
       return reconcileEdgePage(tx, state, limit)
     case 'attachments':
-      return reconcileAttachmentPage(tx, state, limit)
+      return reconcileAttachmentPage(tx, state, limit, observedAt)
     case 'catalog':
       return reconcileCatalogPage(tx, state, limit)
     case 'aggregate':
@@ -291,11 +292,12 @@ async function reconcileAttachmentPage(
   tx: Transaction,
   state: AttachmentIntegrityStateRow,
   limit: number,
+  observedAt: number,
 ): Promise<AttachmentIntegrityMaintenanceResult> {
   const table = tx.table<AttachmentHeaderRow, AttachmentId>('attachments')
   const page = await readPrimaryPage(table, state.afterAttachmentId, limit)
   const ids = page.map((attachment) => attachment.id)
-  await reconcileAttachmentRefCountsForRepair(tx, ids)
+  await reconcileAttachmentRefCountsForRepair(tx, ids, observedAt)
   const done = page.length < limit
   await putPhysicalStorageRow(
     tx,

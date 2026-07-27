@@ -176,6 +176,7 @@ describe('target recovery kind arbitration', () => {
       getWorkspaceRepository().execute(permit, {
         kind: 'stream.append-journal-frames',
         frames,
+        observedAt: STARTED_AT + 4,
       }),
     )
 
@@ -732,6 +733,7 @@ async function appendStreamText(lease: StreamLeaseRow, texts: readonly string[])
     getWorkspaceRepository().execute(permit, {
       kind: 'stream.append-journal-frames',
       frames,
+      observedAt: lease.startedAt + texts.length + 1,
     }),
   )
 }

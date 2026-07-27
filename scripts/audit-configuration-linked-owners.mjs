@@ -20,9 +20,13 @@ const LINKED_WRITERS = new Set([
   'replaceLinkedSemanticByteOwnerPreservingLinksBatch',
 ])
 const CHAT_ROW_WRITE_OWNER = 'src/store/chat-row-transition.ts#applyChatRowWriteTransitions'
+const CHAT_ROW_RECEIPT_OWNER = 'src/store/chat-row-transition.ts#applyLinkedChatRowReplacements'
 const CHAT_ROW_DELETE_OWNER = 'src/store/chat-storage-ownership.ts#deleteChatClosure'
 const PROJECTION_API_OWNERS = new Map([
-  ['applyChatSidebarProjectionTransitions', new Set([CHAT_ROW_WRITE_OWNER])],
+  [
+    'applyChatSidebarProjectionTransitions',
+    new Set([CHAT_ROW_WRITE_OWNER, CHAT_ROW_RECEIPT_OWNER]),
+  ],
   [
     'rebuildChatSidebarProjectionRowsInTransaction',
     new Set(['src/store/browser-workspace-derived-repair.ts#<module>']),
@@ -92,7 +96,11 @@ for (const path of productionSourceFiles(SRC)) {
       const expectedOwner = name.startsWith('deleteLinked')
         ? CHAT_ROW_DELETE_OWNER
         : CHAT_ROW_WRITE_OWNER
-      if (owner !== expectedOwner) {
+      const allowedOwners =
+        expectedOwner === CHAT_ROW_WRITE_OWNER
+          ? new Set([CHAT_ROW_WRITE_OWNER, CHAT_ROW_RECEIPT_OWNER])
+          : new Set([expectedOwner])
+      if (!allowedOwners.has(owner)) {
         problems.push(
           problem(source, node, `${name} chat owner is ${owner}, expected ${expectedOwner}`),
         )
@@ -139,10 +147,21 @@ if (
 }
 
 const repoSource = readFileSync(resolve(SRC, 'store/browser-repo.ts'), 'utf8')
+const modelResolutionTargetTemplate = [
+  '`configuration-target:',
+  '$',
+  '{input.modelResolutionTargetKey}`',
+].join('')
 if (
-  !repoSource.includes('configurationTargetResourceNamesForLinks(configurationLinksForChat(chat))')
+  !repoSource.includes('...(input.modelResolutionTargetKey') ||
+  !repoSource.includes(modelResolutionTargetTemplate)
 ) {
-  problems.push('browser-repo.ts: chat target locks do not derive from canonical chat links')
+  problems.push('browser-repo.ts: pending model publication lacks its exact target resource')
+}
+if (
+  repoSource.includes('configurationTargetResourceNamesForLinks(configurationLinksForChat(chat))')
+) {
+  problems.push('browser-repo.ts: retired dynamic chat-link target resource planning')
 }
 
 const catalogProjectionSource = readFileSync(

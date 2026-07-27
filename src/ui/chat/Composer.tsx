@@ -538,11 +538,14 @@ export function Composer({
       return
     }
     if (submission.kind === 'not-started') return
+    setComposerText((current) => (current === submittedDraft ? '' : current))
     setSubmitting(true)
     try {
       const outcome = await submission.completion
-      if (outcome.kind !== 'prepared') return
-      setComposerText((current) => (current === submittedDraft ? '' : current))
+      if (outcome.kind !== 'prepared') {
+        setComposerText((current) => (current.length === 0 ? submittedDraft : current))
+        return
+      }
       if (!attachmentsDisabled && refsOut.length > 0) consumeAttachments(refsOut)
       if (prefillOut.length > 0) {
         setPrefillText((current) => (current === prefillOut ? (defaultPrefill ?? '') : current))

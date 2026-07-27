@@ -5,7 +5,7 @@ import { VERIFICATION_SNAPSHOT_SCHEMA_VERSION } from './verification-snapshot-sc
 export const TEST_COMPILER_COHORT_DESCRIPTOR = deepFreeze({
   schemaVersion: 1,
   assignment: {
-    waveId: 'wave-a-cut-6-runnable-snapshot',
+    waveId: 'wave-b-cut-1-semantic-operation-capabilities',
     sourceObligation: 'adapt-preserved-tests-to-current-contract',
   },
   compiler: {

@@ -256,9 +256,18 @@ function validateWorkspaceLocalCommitEvidence(
       throw new Error(`WorkspaceLocalConstructionReceiptMissing:${chatId}`)
     }
   }
+  const invalidatedChatIds = new Set<ChatId>()
+  let allChatsInvalidated = false
+  for (const invalidation of delta.invalidations) {
+    if (invalidation.kind !== 'chat') continue
+    if (!invalidation.chatIds) allChatsInvalidated = true
+    else {
+      for (const chatId of invalidation.chatIds) invalidatedChatIds.add(chatId)
+    }
+  }
   for (const chatId of receiptChatIds) {
-    if (!changedSidebarIds.has(chatId)) {
-      throw new Error(`WorkspaceLocalChatFactMismatch:${chatId}`)
+    if (!allChatsInvalidated && !invalidatedChatIds.has(chatId)) {
+      throw new Error(`WorkspaceLocalChatInvalidationMissing:${chatId}`)
     }
   }
   for (const chatId of changedSidebarIds) {

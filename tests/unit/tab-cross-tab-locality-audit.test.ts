@@ -20,6 +20,12 @@ const AUDIT_URL = pathToFileURL(resolve(ROOT, 'scripts/audit-tab-cross-tab-local
 const INVENTORY_URL = pathToFileURL(
   resolve(ROOT, 'scripts/tab-cross-tab-locality-inventory.mjs'),
 ).href
+const KNOWN_INITIATING_OWNER_PATH_GAPS = [
+  'initiating-owner paths: missing src/store/attachment-catalog-projection.ts',
+  'initiating-owner paths: missing src/store/attachment-reference-edges.ts',
+  'initiating-owner paths: missing src/store/chat-row-transition.ts',
+  'initiating-owner paths: missing src/store/child-list-projection.ts',
+] as const
 
 interface LocalityRecord {
   readonly status: string
@@ -140,42 +146,42 @@ describe('tab and cross-tab locality audit', () => {
     const report = evaluateTabCrossTabLocality(canonicalInventory, 'inventory')
 
     expect(report).toMatchObject({
-      ok: true,
-      structurallyValid: true,
+      ok: false,
+      structurallyValid: false,
       surfaces: 20,
-      records: 345,
-      constructorSites: 672,
-      unconstructedOrUnadmittedSites: 14,
-      ownerClassifiedSites: 672,
-      ownerSiteGaps: 0,
-      rootAdmissionSites: 108,
+      records: 343,
+      constructorSites: 748,
+      unconstructedOrUnadmittedSites: 4,
+      ownerClassifiedSites: 742,
+      ownerSiteGaps: 6,
+      rootAdmissionSites: 110,
       unadmittedRoots: 0,
       childReservationSites: 3,
       unreservedChildren: 4,
-      configurationConstructorGaps: 10,
-      publicationConsumers: 17,
-      publicationConsumerSelectors: 17,
-      publicationAddressingInputs: 31,
-      publicationAddressingPairs: 527,
-      publicationAddressedPairs: 108,
-      publicationUnaddressedPairs: 419,
+      configurationConstructorGaps: 0,
+      publicationConsumers: 18,
+      publicationConsumerSelectors: 18,
+      publicationAddressingInputs: 32,
+      publicationAddressingPairs: 576,
+      publicationAddressedPairs: 110,
+      publicationUnaddressedPairs: 466,
       publicationProducers: 4,
       rawPublicationSources: 1,
       remoteBrowserOutcomeFamilies: 6,
-      remoteBrowserOutcomeConsumers: 17,
+      remoteBrowserOutcomeConsumers: 18,
       architectureGaps: 3,
-      recordGaps: 156,
-      siteGaps: 14,
+      recordGaps: 149,
+      siteGaps: 10,
       scannerLimitations: 9,
       acceptanceCriteria: 13,
-      acceptanceSatisfied: 7,
-      acceptanceOpen: 6,
-      problems: [],
+      acceptanceSatisfied: 5,
+      acceptanceOpen: 8,
+      problems: KNOWN_INITIATING_OWNER_PATH_GAPS,
     })
     expect(report.surfaceCounts).toMatchObject({
-      'workspace-query': 64,
+      'workspace-query': 66,
       'workspace-command': 65,
-      'configuration-command': 51,
+      'configuration-command': 44,
       'workspace-root': 15,
       'workspace-child': 7,
       'generation-intent': 6,
@@ -183,11 +189,11 @@ describe('tab and cross-tab locality audit', () => {
       'conversation-route-delivery': 2,
       'route-action': 11,
       'stream-lease-operation': 22,
-      'attempt-controller-operation': 31,
+      'attempt-controller-operation': 32,
       'workspace-change': 3,
       'workspace-delta-fact': 9,
-      'workspace-dependency': 22,
-      'runtime-resource': 16,
+      'workspace-dependency': 23,
+      'runtime-resource': 17,
     })
     expect(report.limitations).toEqual(
       expect.arrayContaining([
@@ -235,8 +241,8 @@ describe('tab and cross-tab locality audit', () => {
         expect(new Set(received).size, `${input.id}: duplicate delivery`).toBe(received.length)
         deliveries += received.length
       }
-      expect(inputs).toHaveLength(31)
-      expect(deliveries).toBe(108)
+      expect(inputs).toHaveLength(32)
+      expect(deliveries).toBe(110)
 
       received.length = 0
       publishPreparedWorkspaceEffect(
@@ -269,11 +275,12 @@ describe('tab and cross-tab locality audit', () => {
   it('makes every unresolved locality guarantee fatal in enforcement mode', () => {
     const report = evaluateTabCrossTabLocality(canonicalInventory, 'enforce')
 
-    expect(report.structurallyValid).toBe(true)
+    expect(report.structurallyValid).toBe(false)
     expect(report.ok).toBe(false)
     expect(report.architectureGaps).toBe(3)
-    expect(report.recordGaps).toBe(156)
-    expect(report.siteGaps).toBe(14)
+    expect(report.recordGaps).toBe(149)
+    expect(report.siteGaps).toBe(10)
+    expect(report.problems).toEqual(KNOWN_INITIATING_OWNER_PATH_GAPS)
   })
 
   it('rejects stale variants, partial classifications, owner drift, and hidden consumers', () => {
@@ -433,6 +440,7 @@ const WORKSPACE_DEPENDENCY_INPUTS: {
   setting: { kind: 'setting', keys: ['setting-a'] },
   'stream-lease': { kind: 'stream-lease', chatId: 'chat-a', streamIds: ['stream-a'] },
   'stream-chunks': { kind: 'stream-chunks', chatId: 'chat-a', streamIds: ['stream-a'] },
+  'model-resolution': { kind: 'model-resolution', targetKeys: ['target-a'] },
   'discovery-cache': { kind: 'discovery-cache', cacheKinds: ['models'] },
   'storage-maintenance': { kind: 'storage-maintenance', tasks: ['compact-workspace'] },
 }

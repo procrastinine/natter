@@ -43,6 +43,7 @@ import {
   getWorkspaceRepository,
 } from '../../src/store/workspace-repository'
 import { runWorkspaceAction, runWorkspaceRead } from '../../src/store/workspace-runtime'
+import { testChatConfigurationLinkTransition } from '../helpers/configuration'
 import { testStreamLeaseAdmission } from '../helpers/stream-leases'
 
 const DB_NAME = 'natter'
@@ -97,14 +98,11 @@ async function createChatPreset(
   settings: ChatSettings,
 ): Promise<ChatPreset> {
   const presetId = newId()
-  const result = await configurationApplication.execute({
-    kind: 'chat-preset.create',
-    preset: {
-      id: presetId,
-      name: 'Template bundle',
-      connectionProfileId: profile.id,
-      settings,
-    },
+  const result = await configurationApplication.createChatPreset({
+    presetId,
+    name: 'Template bundle',
+    profileId: profile.id,
+    settings,
     now: 30,
   })
   if (result.kind !== 'chat-preset-saved') {
@@ -440,6 +438,7 @@ async function captureGenerationPlanningSnapshot(
       kind: 'attempt.prepare',
       input: {
         strategy: 'send',
+        configurationLinkTransition: testChatConfigurationLinkTransition(chat),
         lease: testStreamLeaseAdmission({
           streamId,
           chatId,

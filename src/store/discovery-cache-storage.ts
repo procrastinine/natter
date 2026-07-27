@@ -3,12 +3,13 @@ import {
   recordBrowserCommandDiscoveryCacheMaintenance,
   recordBrowserCommandOwnerInvalidation,
 } from './browser-command-mutation-journal'
+import { boundedMaintenanceLimit } from './browser-workspace-maintenance-contract'
 import {
-  deletePhysicalStorageCollection,
+  addPhysicalStorageRow,
+  deletePhysicalStorageKeys,
   deletePhysicalStorageRows,
   putPhysicalStorageRow,
   recordObsoleteByteOwnerBytes,
-  recordObsoleteByteOwnerValues,
 } from './byte-owner-mutation'
 import type {
   CachedEndpointsRow,
@@ -23,9 +24,17 @@ import type {
   DiscoveryPayloadStorageRow,
 } from './db-rows'
 import { exactCompoundPrefixBetween } from './indexeddb-key-ranges'
-import { physicalStorageTables } from './physical-storage-tables'
+import { type PhysicalStorageTableName, physicalStorageTables } from './physical-storage-tables'
+import type {
+  SemanticOperationExactReceiptAccumulator,
+  SemanticOperationReplayPlan,
+} from './semantic-operation-capability'
 import { estimateStoredValueBytes } from './storage-size-estimate'
-import { type DiscoveryCacheKind, discoveryCacheKey } from './workspace-protocol'
+import {
+  type DiscoveryCacheKind,
+  discoveryCacheKey,
+  type WorkspaceDependency,
+} from './workspace-protocol'
 
 export const DISCOVERY_CACHE_MUTATION_TRANSACTION_CAPABILITY = physicalStorageTables(
   'discoveryCacheState',
@@ -92,7 +101,30 @@ export interface DiscoveryCacheMaintenanceResult {
   readonly deletedPayloads: number
   readonly evictions: readonly DiscoveryCacheEviction[]
   readonly done: boolean
+  readonly replay: SemanticOperationReplayPlan
 }
+
+export interface DiscoveryCacheProfileClearReceipt {
+  readonly profileId: string
+  readonly deleted: number
+  readonly evictions: readonly DiscoveryCacheEviction[]
+  readonly repairRequired: boolean
+}
+
+export interface DiscoveryCacheReadEvidence<Row> {
+  readonly row: Row | undefined
+  readonly headerFound: boolean
+  readonly metadataFound: boolean
+  readonly payloadFound: boolean
+  readonly storageRow?:
+    | CachedModelsStorageRow
+    | CachedEndpointsStorageRow
+    | CachedPrivacyPolicyStorageRow
+  readonly metadata?: DiscoveryPayloadMetadataStorageRow
+}
+
+type DiscoveryCacheReceiptAccumulator =
+  SemanticOperationExactReceiptAccumulator<PhysicalStorageTableName>
 
 const DISCOVERY_CACHE_STATE_ID = 'global' as const
 const DISCOVERY_CACHE_STATE_FORMAT_VERSION = 1 as const
@@ -138,14 +170,33 @@ export async function readDiscoveryCacheRow<T extends DiscoveryCacheStorageTable
   tableName: T,
   key: string | [string, string],
 ): Promise<PublicRowByTable[T] | undefined> {
+  return (await readDiscoveryCacheRowWithEvidence(tx, tableName, key)).row
+}
+
+export async function readDiscoveryCacheRowWithEvidence<T extends DiscoveryCacheStorageTable>(
+  tx: Transaction,
+  tableName: T,
+  key: string | [string, string],
+  receipt?: DiscoveryCacheReceiptAccumulator,
+): Promise<DiscoveryCacheReadEvidence<PublicRowByTable[T]>> {
   const stored = await tx.table<StorageRowByTable[T], string | [string, string]>(tableName).get(key)
-  if (!stored) return undefined
+  recordDiscoveryCacheRead(receipt, tableName, 'primary', undefined, 'get', 1, 1)
+  if (!stored) {
+    return {
+      row: undefined,
+      headerFound: false,
+      metadataFound: false,
+      payloadFound: false,
+    }
+  }
   const [metadata, payload] = await Promise.all([
     tx
       .table<DiscoveryPayloadMetadataStorageRow, string>('discoveryPayloadMetadata')
       .get(stored.payloadId),
     tx.table<DiscoveryPayloadStorageRow, string>('discoveryPayloads').get(stored.payloadId),
   ])
+  recordDiscoveryCacheRead(receipt, 'discoveryPayloadMetadata', 'primary', undefined, 'get', 1, 1)
+  recordDiscoveryCacheRead(receipt, 'discoveryPayloads', 'primary', undefined, 'get', 1, 1)
   if (
     !metadata ||
     !payload ||
@@ -153,10 +204,24 @@ export async function readDiscoveryCacheRow<T extends DiscoveryCacheStorageTable
     metadata.byteLength !== stored.payloadByteLength ||
     payload.byteLength !== stored.payloadByteLength
   ) {
-    return undefined
+    return {
+      row: undefined,
+      headerFound: true,
+      metadataFound: metadata !== undefined,
+      payloadFound: payload !== undefined,
+      storageRow: stored,
+      ...(metadata ? { metadata } : {}),
+    }
   }
   const decoded = JSON.parse(payload.canonicalJson) as unknown
-  return hydratePublicRow(tableName, stored, decoded)
+  return {
+    row: hydratePublicRow(tableName, stored, decoded),
+    headerFound: true,
+    metadataFound: true,
+    payloadFound: true,
+    storageRow: stored,
+    metadata,
+  }
 }
 
 function discoveryStorageRow<T extends DiscoveryCacheStorageTable>(
@@ -189,7 +254,12 @@ export async function putDiscoveryCacheRow<T extends DiscoveryCacheStorageTable>
   tableName: T,
   row: PublicRowByTable[T],
   prepared: PreparedDiscoveryPayload,
+  options: {
+    readonly knownCurrent?: DiscoveryCacheReadEvidence<PublicRowByTable[T]>
+    readonly receipt?: DiscoveryCacheReceiptAccumulator
+  } = {},
 ): Promise<DiscoveryCachePutResult> {
+  const { knownCurrent, receipt } = options
   if (!prepared.cacheable) {
     return {
       accepted: true,
@@ -199,9 +269,13 @@ export async function putDiscoveryCacheRow<T extends DiscoveryCacheStorageTable>
       evictions: [],
     }
   }
-  const state = await readValidatedState(tx)
+  const storedState = await tx
+    .table<DiscoveryCacheStateStorageRow, string>('discoveryCacheState')
+    .get(DISCOVERY_CACHE_STATE_ID)
+  recordDiscoveryCacheRead(receipt, 'discoveryCacheState', 'primary', undefined, 'get', 1, 1)
+  const state = isDiscoveryCacheState(storedState) && storedState.valid ? storedState : undefined
   if (!state) {
-    await createMissingDiscoveryCacheRepairState(tx)
+    await createMissingDiscoveryCacheRepairState(tx, storedState, receipt)
     return {
       accepted: true,
       cacheChanged: false,
@@ -212,20 +286,39 @@ export async function putDiscoveryCacheRow<T extends DiscoveryCacheStorageTable>
   }
   const table = tx.table<StorageRowByTable[T], [string, string]>(tableName)
   const key = primaryKeyForPublicRow(tableName, row)
-  const currentStorage = await table.get(key)
+  const currentStorage = knownCurrent
+    ? (knownCurrent.storageRow as StorageRowByTable[T] | undefined)
+    : await table.get(key)
+  if (!knownCurrent) {
+    recordDiscoveryCacheRead(receipt, tableName, 'primary', undefined, 'get', 1, 1)
+  }
   const nextStorage = discoveryStorageRow(tableName, row, prepared)
   const metadataTable = tx.table<DiscoveryPayloadMetadataStorageRow, string>(
     'discoveryPayloadMetadata',
   )
-  const affectedMetadata = await metadataTable.bulkGet([
+  const knownMetadata = knownCurrent?.metadata
+  const metadataIds = [
     ...new Set([currentStorage?.payloadId, nextStorage.payloadId].filter(isString)),
-  ])
+  ]
+  const missingMetadataIds = metadataIds.filter((id) => knownMetadata?.id !== id)
+  const fetchedMetadata =
+    missingMetadataIds.length === 0 ? [] : await metadataTable.bulkGet(missingMetadataIds)
+  recordDiscoveryCacheRead(
+    receipt,
+    'discoveryPayloadMetadata',
+    'primary',
+    undefined,
+    'get-many',
+    missingMetadataIds.length > 0 ? 1 : 0,
+    missingMetadataIds.length,
+  )
+  const affectedMetadata = [...(knownMetadata ? [knownMetadata] : []), ...fetchedMetadata]
   const metadataById = new Map(
     affectedMetadata.flatMap((metadata) => (metadata ? [[metadata.id, metadata] as const] : [])),
   )
   const previousMetadataById = new Map(metadataById)
   if (currentStorage && !metadataById.has(currentStorage.payloadId)) {
-    await markStateInvalid(tx)
+    await markStateInvalid(tx, state, receipt)
     return {
       accepted: true,
       cacheChanged: false,
@@ -236,7 +329,7 @@ export async function putDiscoveryCacheRow<T extends DiscoveryCacheStorageTable>
   }
   const existingNextMetadata = metadataById.get(nextStorage.payloadId)
   if (existingNextMetadata && existingNextMetadata.byteLength !== nextStorage.payloadByteLength) {
-    await markStateInvalid(tx)
+    await markStateInvalid(tx, state, receipt)
     return {
       accepted: true,
       cacheChanged: false,
@@ -255,8 +348,31 @@ export async function putDiscoveryCacheRow<T extends DiscoveryCacheStorageTable>
     incrementProjectedPayload(projected, projectedRefs, prepared, row.fetchedAt)
   }
   if (!currentStorage) projected.headerCounts[tableName] += 1
-  const profileCount =
-    (await table.where('profileId').equals(row.profileId).count()) + (currentStorage ? 0 : 1)
+  const storedProfileKeys = await table
+    .where('profileId')
+    .equals(row.profileId)
+    .limit(DISCOVERY_CACHE_LIMITS.perProfileRows[tableName] + 1)
+    .primaryKeys()
+  recordDiscoveryCacheRead(
+    receipt,
+    tableName,
+    'secondary',
+    'profileId',
+    'query',
+    1,
+    storedProfileKeys.length,
+  )
+  if (storedProfileKeys.length > DISCOVERY_CACHE_LIMITS.perProfileRows[tableName]) {
+    await markStateInvalid(tx, state, receipt)
+    return {
+      accepted: true,
+      cacheChanged: false,
+      cached: false,
+      repairRequired: true,
+      evictions: [],
+    }
+  }
+  const profileCount = storedProfileKeys.length + (currentStorage ? 0 : 1)
   const selected: EvictionCandidate[] = []
   let projectedProfileCount = profileCount
   if (exceedsLimits(projected, tableName, projectedProfileCount)) {
@@ -266,17 +382,27 @@ export async function putDiscoveryCacheRow<T extends DiscoveryCacheStorageTable>
       row.profileId,
       key,
       DISCOVERY_CACHE_LIMITS.maxEvictionsPerWrite + 1,
+      receipt,
     )
-    const candidateMetadata = await metadataTable.bulkGet([
-      ...new Set(candidates.map((candidate) => candidate.row.payloadId)),
-    ])
+    const candidatePayloadIds = [...new Set(candidates.map((candidate) => candidate.row.payloadId))]
+    const candidateMetadata =
+      candidatePayloadIds.length === 0 ? [] : await metadataTable.bulkGet(candidatePayloadIds)
+    recordDiscoveryCacheRead(
+      receipt,
+      'discoveryPayloadMetadata',
+      'primary',
+      undefined,
+      'get-many',
+      candidatePayloadIds.length > 0 ? 1 : 0,
+      candidatePayloadIds.length,
+    )
     for (const metadata of candidateMetadata) {
       if (!metadata) continue
       if (!projectedRefs.has(metadata.id)) projectedRefs.set(metadata.id, { ...metadata })
       if (!previousMetadataById.has(metadata.id)) previousMetadataById.set(metadata.id, metadata)
     }
     if (candidateMetadata.some((metadata) => metadata === undefined)) {
-      await markStateInvalid(tx)
+      await markStateInvalid(tx, state, receipt)
       return {
         accepted: true,
         cacheChanged: false,
@@ -317,15 +443,22 @@ export async function putDiscoveryCacheRow<T extends DiscoveryCacheStorageTable>
   }
 
   const changed = stableStringify(currentStorage) !== stableStringify(nextStorage)
-  for (const candidate of selected) {
-    await recordObsoleteByteOwnerValues(tx, [candidate.row])
-    await tx.table(candidate.tableName).delete(primaryKey(candidate.tableName, candidate.row))
+  for (const selectedTableName of TABLE_ORDER) {
+    const rows = selected.flatMap((candidate) =>
+      candidate.tableName === selectedTableName ? [candidate.row] : [],
+    )
+    if (rows.length === 0) continue
+    await deletePhysicalStorageRows(
+      tx,
+      selectedTableName,
+      rows.map((selectedRow) => primaryKey(selectedTableName, selectedRow)),
+      rows,
+    )
   }
   if (changed) await putPhysicalStorageRow(tx, tableName, nextStorage, currentStorage)
   if (!existingNextMetadata) {
-    const payloads = tx.table<DiscoveryPayloadStorageRow, string>('discoveryPayloads')
-    if (!(await payloadBodyExists(tx, prepared.id))) {
-      await payloads.add({
+    if (!(await payloadBodyExists(tx, prepared.id, receipt))) {
+      await addPhysicalStorageRow<DiscoveryPayloadStorageRow, string>(tx, 'discoveryPayloads', {
         id: prepared.id,
         canonicalJson: prepared.canonicalJson,
         byteLength: prepared.byteLength,
@@ -334,15 +467,15 @@ export async function putDiscoveryCacheRow<T extends DiscoveryCacheStorageTable>
   }
   for (const [payloadId, metadata] of projectedRefs) {
     if (metadata.referenceCount <= 0) {
-      await deleteDiscoveryPayload(tx, payloadId, metadata)
+      await deleteDiscoveryPayload(tx, payloadId, metadata, undefined, receipt)
       continue
     }
     await putDiscoveryPayloadMetadata(tx, metadata, previousMetadataById.get(payloadId))
   }
-  await writeState(tx, projected, state)
+  await writeState(tx, projected, state, receipt)
   const evictions = selected.map(evictionForCandidate)
-  recordDiscoveryCacheEvictions(tx, evictions)
-  if (changed) recordDiscoveryCacheRowInvalidation(tx, tableName, nextStorage)
+  recordDiscoveryCacheEvictions(tx, evictions, receipt)
+  if (changed) recordDiscoveryCacheRowInvalidation(tx, tableName, nextStorage, receipt)
   return {
     accepted: true,
     cacheChanged: changed,
@@ -356,22 +489,28 @@ export async function deleteDiscoveryCacheRow(
   tx: Transaction,
   tableName: DiscoveryCacheStorageTable,
   key: [string, string],
+  receipt?: DiscoveryCacheReceiptAccumulator,
 ): Promise<{ deleted: boolean; evictions: readonly DiscoveryCacheEviction[] }> {
   const table = tx.table<StorageRowByTable[typeof tableName], [string, string]>(tableName)
   const current = await table.get(key)
+  recordDiscoveryCacheRead(receipt, tableName, 'primary', undefined, 'get', 1, 1)
   if (!current) return { deleted: false, evictions: [] }
-  await recordObsoleteByteOwnerValues(tx, [current])
-  await table.delete(key)
-  const state = await readValidatedState(tx)
+  await deletePhysicalStorageRows(tx, tableName, [key], [current])
+  const storedState = await tx
+    .table<DiscoveryCacheStateStorageRow, string>('discoveryCacheState')
+    .get(DISCOVERY_CACHE_STATE_ID)
+  recordDiscoveryCacheRead(receipt, 'discoveryCacheState', 'primary', undefined, 'get', 1, 1)
+  const state = isDiscoveryCacheState(storedState) && storedState.valid ? storedState : undefined
   if (!state) {
-    await deletePayloadIfUnreferenced(tx, current.payloadId)
-    await markStateInvalid(tx)
+    await deletePayloadIfUnreferenced(tx, current.payloadId, receipt)
+    await markStateInvalid(tx, storedState, receipt)
   } else {
     const metadata = await tx
       .table<DiscoveryPayloadMetadataStorageRow, string>('discoveryPayloadMetadata')
       .get(current.payloadId)
+    recordDiscoveryCacheRead(receipt, 'discoveryPayloadMetadata', 'primary', undefined, 'get', 1, 1)
     if (!metadata) {
-      await markStateInvalid(tx)
+      await markStateInvalid(tx, state, receipt)
     } else {
       const projected = cloneStateTotals(state)
       const refs = new Map([[metadata.id, { ...metadata }]])
@@ -379,15 +518,15 @@ export async function deleteDiscoveryCacheRow(
       decrementProjectedPayload(projected, refs, current.payloadId)
       const next = refs.get(current.payloadId)
       if (!next || next.referenceCount <= 0) {
-        await deleteDiscoveryPayload(tx, current.payloadId, metadata)
+        await deleteDiscoveryPayload(tx, current.payloadId, metadata, undefined, receipt)
       } else {
         await putDiscoveryPayloadMetadata(tx, next, metadata)
       }
-      await writeState(tx, projected, state)
+      await writeState(tx, projected, state, receipt)
     }
   }
   const evictions = [evictionForStorageRow(tableName, current)]
-  recordDiscoveryCacheEvictions(tx, evictions)
+  recordDiscoveryCacheEvictions(tx, evictions, receipt)
   return {
     deleted: true,
     evictions,
@@ -398,9 +537,10 @@ export async function clearDiscoveryCacheProfileRows(
   tx: Transaction,
   tableNames: readonly DiscoveryCacheStorageTable[],
   profileId: string,
-): Promise<{ deleted: number; evictions: readonly DiscoveryCacheEviction[] }> {
+  receipt?: DiscoveryCacheReceiptAccumulator,
+): Promise<DiscoveryCacheProfileClearReceipt> {
   recordDiscoveryCacheProfileInvalidations(tx, tableNames, profileId)
-  const state = await readValidatedState(tx)
+  const state = await readValidatedState(tx, receipt)
   const boundedRows = await Promise.all(
     tableNames.map((tableName) =>
       tx
@@ -411,6 +551,19 @@ export async function clearDiscoveryCacheProfileRows(
         .toArray(),
     ),
   )
+  for (let index = 0; index < tableNames.length; index += 1) {
+    const tableName = tableNames[index]
+    if (!tableName) continue
+    recordDiscoveryCacheRead(
+      receipt,
+      tableName,
+      'secondary',
+      'profileId',
+      'query',
+      1,
+      boundedRows[index]?.length ?? 0,
+    )
+  }
   if (
     !state ||
     tableNames.some(
@@ -418,16 +571,8 @@ export async function clearDiscoveryCacheProfileRows(
         (boundedRows[index]?.length ?? 0) > DISCOVERY_CACHE_LIMITS.perProfileRows[tableName],
     )
   ) {
-    let deleted = 0
-    for (const tableName of tableNames) {
-      deleted += await deletePhysicalStorageCollection(
-        tx,
-        tableName,
-        tx.table(tableName).where('profileId').equals(profileId),
-      )
-    }
-    await markStateInvalid(tx)
-    return { deleted, evictions: [] }
+    await markStateInvalid(tx, null, receipt)
+    return { profileId, deleted: 0, evictions: [], repairRequired: true }
   }
   const rows: Array<{
     tableName: DiscoveryCacheStorageTable
@@ -437,14 +582,24 @@ export async function clearDiscoveryCacheProfileRows(
     const selected = boundedRows[index] ?? []
     rows.push(...selected.map((row) => ({ tableName, row })))
   }
-  if (rows.length === 0) return { deleted: 0, evictions: [] }
+  if (rows.length === 0) {
+    return { profileId, deleted: 0, evictions: [], repairRequired: false }
+  }
   const projected = cloneStateTotals(state)
   const metadataTable = tx.table<DiscoveryPayloadMetadataStorageRow, string>(
     'discoveryPayloadMetadata',
   )
-  const metadataRows = await metadataTable.bulkGet([
-    ...new Set(rows.map(({ row }) => row.payloadId)),
-  ])
+  const payloadIds = [...new Set(rows.map(({ row }) => row.payloadId))]
+  const metadataRows = await metadataTable.bulkGet(payloadIds)
+  recordDiscoveryCacheRead(
+    receipt,
+    'discoveryPayloadMetadata',
+    'primary',
+    undefined,
+    'get-many',
+    1,
+    payloadIds.length,
+  )
   if (metadataRows.some((metadata) => metadata === undefined)) {
     for (const tableName of tableNames) {
       const tableRows = rows.flatMap(({ tableName: rowTableName, row }) =>
@@ -457,8 +612,8 @@ export async function clearDiscoveryCacheProfileRows(
         tableRows,
       )
     }
-    await markStateInvalid(tx)
-    return { deleted: rows.length, evictions: [] }
+    await markStateInvalid(tx, null, receipt)
+    return { profileId, deleted: rows.length, evictions: [], repairRequired: true }
   }
   const refs = new Map(
     metadataRows.flatMap((metadata) => (metadata ? [[metadata.id, { ...metadata }] as const] : [])),
@@ -483,28 +638,34 @@ export async function clearDiscoveryCacheProfileRows(
   }
   for (const [payloadId, metadata] of refs) {
     if (metadata.referenceCount <= 0) {
-      await deleteDiscoveryPayload(tx, payloadId, metadata)
+      await deleteDiscoveryPayload(tx, payloadId, metadata, undefined, receipt)
     } else {
       await putDiscoveryPayloadMetadata(tx, metadata, previousMetadataById.get(payloadId))
     }
   }
-  await writeState(tx, projected, state)
+  await writeState(tx, projected, state, receipt)
   const evictions = rows.map(({ tableName, row }) => evictionForStorageRow(tableName, row))
+  recordDiscoveryCacheEvictions(tx, evictions, receipt)
   return {
+    profileId,
     deleted: rows.length,
     evictions,
+    repairRequired: false,
   }
 }
 
 export async function maintainDiscoveryCache(
   tx: Transaction,
   requestedLimit: number,
+  receipt?: DiscoveryCacheReceiptAccumulator,
 ): Promise<DiscoveryCacheMaintenanceResult> {
-  const limit = Math.max(1, Math.min(Math.floor(requestedLimit), 128))
+  const limit = boundedMaintenanceLimit(requestedLimit)
   const stateTable = tx.table<DiscoveryCacheStateStorageRow, string>('discoveryCacheState')
   const storedState = await stateTable.get(DISCOVERY_CACHE_STATE_ID)
+  recordDiscoveryCacheRead(receipt, 'discoveryCacheState', 'primary', undefined, 'get', 1, 1)
+  const replay = discoveryCacheMaintenanceReplay(storedState, limit)
   if (isDiscoveryCacheState(storedState) && storedState.valid && !storedState.audit) {
-    return { scanned: 0, deletedPayloads: 0, evictions: [], done: true }
+    return { scanned: 0, deletedPayloads: 0, evictions: [], done: true, replay }
   }
   recordBrowserCommandDiscoveryCacheMaintenance(tx)
   const baseState = isDiscoveryCacheState(storedState)
@@ -514,16 +675,57 @@ export async function maintainDiscoveryCache(
   let scanned = 0
   let deletedPayloads = 0
   const evictions: DiscoveryCacheEviction[] = []
+  const headerRepairCandidates = await readBoundedDiscoveryHeaderRepairCandidates(tx, receipt)
+  if (headerRepairCandidates.length > 0) {
+    const selected = headerRepairCandidates.slice(0, limit)
+    for (const tableName of TABLE_ORDER) {
+      const rows = selected.flatMap((candidate) =>
+        candidate.tableName === tableName ? [candidate.row] : [],
+      )
+      if (rows.length === 0) continue
+      await deletePhysicalStorageRows(
+        tx,
+        tableName,
+        rows.map((row) => primaryKey(tableName, row)),
+        rows,
+      )
+    }
+    const repairEvictions = selected.map(evictionForCandidate)
+    recordDiscoveryCacheEvictions(tx, repairEvictions, receipt)
+    await putPhysicalStorageRow(
+      tx,
+      'discoveryCacheState',
+      { ...emptyDiscoveryCacheState(false), audit: emptyAudit() },
+      storedState,
+    )
+    return {
+      scanned: selected.length,
+      deletedPayloads: 0,
+      evictions: repairEvictions,
+      done: false,
+      replay,
+    }
+  }
   while (scanned < limit) {
     if (isHeaderPhase(audit.phase)) {
-      const page = await readHeaderAuditPage(tx, audit.phase, audit.afterKey, limit - scanned)
+      const page = await readHeaderAuditPage(
+        tx,
+        audit.phase,
+        audit.afterKey,
+        limit - scanned,
+        receipt,
+      )
       scanned += page.rows.length
       for (const row of page.rows) {
         if (row.valid) {
-          audit.headerCounts[audit.phase] += 1
+          audit.headerCounts[audit.phase] = saturatingAdd(audit.headerCounts[audit.phase], 1)
         } else {
-          await recordObsoleteByteOwnerValues(tx, [row.row])
-          await tx.table(audit.phase).delete(primaryKey(audit.phase, row.row))
+          await deletePhysicalStorageRows(
+            tx,
+            audit.phase,
+            [primaryKey(audit.phase, row.row)],
+            [row.row],
+          )
           evictions.push(evictionForStorageRow(audit.phase, row.row))
         }
       }
@@ -535,25 +737,30 @@ export async function maintainDiscoveryCache(
       continue
     }
     if (audit.phase === 'metadata') {
-      const page = await readMetadataAuditPage(tx, audit.afterKey, limit - scanned)
+      const page = await readMetadataAuditPage(tx, audit.afterKey, limit - scanned, receipt)
       scanned += page.rows.length
       for (const row of page.rows) {
-        const referenceCount = await countPayloadReferences(tx, row.id)
-        const bodyExists = await payloadBodyExists(tx, row.id)
+        if (!isDiscoveryPayloadMetadata(row)) {
+          await deleteDiscoveryPayload(tx, row.id, null, undefined, receipt)
+          deletedPayloads += 1
+          continue
+        }
+        const referenceCount = await countPayloadReferences(tx, row.id, receipt)
+        const bodyExists = await payloadBodyExists(tx, row.id, receipt)
         if (
           referenceCount === 0 ||
           !bodyExists ||
           row.byteLength > DISCOVERY_CACHE_LIMITS.maxPayloadByteLength
         ) {
-          await deleteDiscoveryPayload(tx, row.id, row)
+          await deleteDiscoveryPayload(tx, row.id, row, bodyExists, receipt)
           deletedPayloads += 1
           continue
         }
         if (row.referenceCount !== referenceCount) {
           await putDiscoveryPayloadMetadata(tx, { ...row, referenceCount }, row)
         }
-        audit.payloadCount += 1
-        audit.payloadByteLength += row.byteLength
+        audit.payloadCount = saturatingAdd(audit.payloadCount, 1)
+        audit.payloadByteLength = saturatingAdd(audit.payloadByteLength, row.byteLength)
       }
       if (page.nextAfterKey !== undefined) {
         audit.afterKey = page.nextAfterKey
@@ -562,10 +769,10 @@ export async function maintainDiscoveryCache(
       audit = advanceAudit(audit)
       continue
     }
-    const page = await readPayloadBodyAuditPage(tx, audit.afterKey, limit - scanned)
+    const page = await readPayloadBodyAuditPage(tx, audit.afterKey, limit - scanned, receipt)
     scanned += page.ids.length
     for (const id of page.orphanIds) {
-      await deleteDiscoveryPayload(tx, id)
+      await deleteDiscoveryPayload(tx, id, null, true, receipt)
       deletedPayloads += 1
     }
     if (page.nextAfterKey !== undefined) {
@@ -581,8 +788,8 @@ export async function maintainDiscoveryCache(
       payloadByteLength: audit.payloadByteLength,
     }
     await putPhysicalStorageRow(tx, 'discoveryCacheState', completed, storedState)
-    recordDiscoveryCacheEvictions(tx, evictions)
-    return { scanned, deletedPayloads, evictions, done: true }
+    recordDiscoveryCacheEvictions(tx, evictions, receipt)
+    return { scanned, deletedPayloads, evictions, done: true, replay }
   }
   await putPhysicalStorageRow(
     tx,
@@ -594,50 +801,70 @@ export async function maintainDiscoveryCache(
     },
     storedState,
   )
-  recordDiscoveryCacheEvictions(tx, evictions)
-  return { scanned, deletedPayloads, evictions, done: false }
+  recordDiscoveryCacheEvictions(tx, evictions, receipt)
+  return { scanned, deletedPayloads, evictions, done: false, replay }
 }
 
 async function readValidatedState(
   tx: Transaction,
+  receipt?: DiscoveryCacheReceiptAccumulator,
 ): Promise<DiscoveryCacheStateStorageRow | undefined> {
   const table = tx.table<DiscoveryCacheStateStorageRow, string>('discoveryCacheState')
   const state = await table.get(DISCOVERY_CACHE_STATE_ID)
+  recordDiscoveryCacheRead(receipt, 'discoveryCacheState', 'primary', undefined, 'get', 1, 1)
   if (!isDiscoveryCacheState(state) || !state.valid) return undefined
   return state
 }
 
-async function createMissingDiscoveryCacheRepairState(tx: Transaction): Promise<void> {
-  const current = await tx
-    .table<DiscoveryCacheStateStorageRow, string>('discoveryCacheState')
-    .get(DISCOVERY_CACHE_STATE_ID)
+async function createMissingDiscoveryCacheRepairState(
+  tx: Transaction,
+  current: DiscoveryCacheStateStorageRow | undefined,
+  receipt?: DiscoveryCacheReceiptAccumulator,
+): Promise<void> {
   if (isDiscoveryCacheState(current) && !current.valid) return
-  await markStateInvalid(tx)
+  await markStateInvalid(tx, current, receipt)
 }
 
-function recordDiscoveryCacheRepairRequest(tx: Transaction): void {
-  recordBrowserCommandOwnerInvalidation(tx, {
+function recordDiscoveryCacheRepairRequest(
+  tx: Transaction,
+  receipt?: DiscoveryCacheReceiptAccumulator,
+): void {
+  const dependency = {
     kind: 'storage-maintenance',
     tasks: ['prune-discovery-cache'],
-  })
+  } as const satisfies WorkspaceDependency
+  recordBrowserCommandOwnerInvalidation(tx, dependency)
+  receipt?.dependency(dependency)
 }
 
-async function markStateInvalid(tx: Transaction): Promise<void> {
-  const table = tx.table<DiscoveryCacheStateStorageRow, string>('discoveryCacheState')
-  const current = await table.get(DISCOVERY_CACHE_STATE_ID)
+async function markStateInvalid(
+  tx: Transaction,
+  knownCurrent: DiscoveryCacheStateStorageRow | undefined | null,
+  receipt?: DiscoveryCacheReceiptAccumulator,
+): Promise<void> {
+  const current =
+    knownCurrent === null
+      ? await tx
+          .table<DiscoveryCacheStateStorageRow, string>('discoveryCacheState')
+          .get(DISCOVERY_CACHE_STATE_ID)
+      : knownCurrent
+  if (knownCurrent === null) {
+    recordDiscoveryCacheRead(receipt, 'discoveryCacheState', 'primary', undefined, 'get', 1, 1)
+  }
   const base = isDiscoveryCacheState(current) ? current : emptyDiscoveryCacheState(false)
   const { audit: _audit, ...withoutAudit } = base
   const next = { ...withoutAudit, valid: false }
   if (stableStringify(current) !== stableStringify(next)) {
     await putPhysicalStorageRow(tx, 'discoveryCacheState', next, current)
   }
-  recordDiscoveryCacheRepairRequest(tx)
+  recordDiscoveryCacheRepairRequest(tx, receipt)
 }
 
 async function writeState(
   tx: Transaction,
   state: Pick<DiscoveryCacheStateStorageRow, 'headerCounts' | 'payloadCount' | 'payloadByteLength'>,
   previous: DiscoveryCacheStateStorageRow | undefined,
+  _receipt?: DiscoveryCacheReceiptAccumulator,
 ): Promise<void> {
   const next: DiscoveryCacheStateStorageRow = {
     id: DISCOVERY_CACHE_STATE_ID,
@@ -704,12 +931,57 @@ interface EvictionCandidate {
   row: CachedModelsStorageRow | CachedEndpointsStorageRow | CachedPrivacyPolicyStorageRow
 }
 
+async function readBoundedDiscoveryHeaderRepairCandidates(
+  tx: Transaction,
+  receipt?: DiscoveryCacheReceiptAccumulator,
+): Promise<EvictionCandidate[]> {
+  const candidates: EvictionCandidate[] = []
+  for (const tableName of TABLE_ORDER) {
+    const globalLimit = DISCOVERY_CACHE_LIMITS.globalRows[tableName]
+    const rows = await tx
+      .table<StorageRowByTable[typeof tableName], [string, string]>(tableName)
+      .orderBy('fetchedAt')
+      .limit(globalLimit + 1)
+      .toArray()
+    recordDiscoveryCacheRead(receipt, tableName, 'secondary', 'fetchedAt', 'query', 1, rows.length)
+    candidates.push(
+      ...rows
+        .filter((row) => !isDiscoveryCacheHeaderRow(tableName, row))
+        .map((row) => ({ tableName, row })),
+    )
+    if (rows.length > globalLimit) {
+      const oldest = rows[0]
+      if (oldest) candidates.push({ tableName, row: oldest })
+      continue
+    }
+    const rowsByProfile = new Map<string, StorageRowByTable[typeof tableName][]>()
+    for (const row of rows) {
+      if (!isDiscoveryCacheHeaderRow(tableName, row)) continue
+      const profileRows = rowsByProfile.get(row.profileId) ?? []
+      profileRows.push(row)
+      rowsByProfile.set(row.profileId, profileRows)
+    }
+    const profileLimit = DISCOVERY_CACHE_LIMITS.perProfileRows[tableName]
+    for (const profileRows of rowsByProfile.values()) {
+      candidates.push(
+        ...profileRows
+          .slice(0, Math.max(0, profileRows.length - profileLimit))
+          .map((row) => ({ tableName, row })),
+      )
+    }
+  }
+  const unique = new Map<string, EvictionCandidate>()
+  for (const candidate of candidates) unique.set(candidateKey(candidate), candidate)
+  return [...unique.values()].sort(compareEvictionCandidates)
+}
+
 async function readEvictionCandidates(
   tx: Transaction,
   targetTable: DiscoveryCacheStorageTable,
   profileId: string,
   protectedKey: [string, string],
   limit: number,
+  receipt?: DiscoveryCacheReceiptAccumulator,
 ): Promise<EvictionCandidate[]> {
   const candidates: EvictionCandidate[] = []
   for (const tableName of TABLE_ORDER) {
@@ -718,6 +990,7 @@ async function readEvictionCandidates(
       .orderBy('fetchedAt')
       .limit(limit)
       .toArray()
+    recordDiscoveryCacheRead(receipt, tableName, 'secondary', 'fetchedAt', 'query', 1, rows.length)
     candidates.push(...rows.map((row) => ({ tableName, row })))
   }
   const profileRows = await tx
@@ -726,6 +999,15 @@ async function readEvictionCandidates(
     .between(...exactCompoundPrefixBetween([profileId]))
     .limit(limit)
     .toArray()
+  recordDiscoveryCacheRead(
+    receipt,
+    targetTable,
+    'secondary',
+    '[profileId+fetchedAt]',
+    'query',
+    1,
+    profileRows.length,
+  )
   candidates.push(...profileRows.map((row) => ({ tableName: targetTable, row })))
   const byKey = new Map<string, EvictionCandidate>()
   for (const candidate of candidates) {
@@ -816,6 +1098,7 @@ async function readHeaderAuditPage(
   tableName: DiscoveryCacheStorageTable,
   afterKey: string | [string, string] | undefined,
   limit: number,
+  receipt?: DiscoveryCacheReceiptAccumulator,
 ): Promise<{
   rows: Array<{
     row: CachedModelsStorageRow | CachedEndpointsStorageRow | CachedPrivacyPolicyStorageRow
@@ -833,12 +1116,15 @@ async function readHeaderAuditPage(
   )
     .limit(limit + 1)
     .toArray()
+  recordDiscoveryCacheRead(receipt, tableName, 'primary', undefined, 'query', 1, rows.length)
   const page = rows.slice(0, limit)
   const payloadIds = [...new Set(page.map((row) => row.payloadId))]
   const [metadata, bodyIds] = await Promise.all([
-    tx
-      .table<DiscoveryPayloadMetadataStorageRow, string>('discoveryPayloadMetadata')
-      .bulkGet(payloadIds),
+    payloadIds.length === 0
+      ? Promise.resolve([] as Array<DiscoveryPayloadMetadataStorageRow | undefined>)
+      : tx
+          .table<DiscoveryPayloadMetadataStorageRow, string>('discoveryPayloadMetadata')
+          .bulkGet(payloadIds),
     payloadIds.length === 0
       ? Promise.resolve([] as string[])
       : (tx
@@ -847,6 +1133,24 @@ async function readHeaderAuditPage(
           .anyOf(payloadIds)
           .primaryKeys() as Promise<string[]>),
   ])
+  recordDiscoveryCacheRead(
+    receipt,
+    'discoveryPayloadMetadata',
+    'primary',
+    undefined,
+    'get-many',
+    payloadIds.length > 0 ? 1 : 0,
+    payloadIds.length,
+  )
+  recordDiscoveryCacheRead(
+    receipt,
+    'discoveryPayloads',
+    'primary',
+    undefined,
+    'open-cursor',
+    payloadIds.length > 0 ? 1 : 0,
+    bodyIds.length,
+  )
   const metadataById = new Map(metadata.flatMap((row) => (row ? [[row.id, row] as const] : [])))
   const bodies = new Set(bodyIds)
   return {
@@ -871,6 +1175,7 @@ async function readMetadataAuditPage(
   tx: Transaction,
   afterKey: string | [string, string] | undefined,
   limit: number,
+  receipt?: DiscoveryCacheReceiptAccumulator,
 ): Promise<{ rows: DiscoveryPayloadMetadataStorageRow[]; nextAfterKey?: string }> {
   const table = tx.table<DiscoveryPayloadMetadataStorageRow, string>('discoveryPayloadMetadata')
   const rows = await (afterKey === undefined
@@ -879,6 +1184,15 @@ async function readMetadataAuditPage(
   )
     .limit(limit + 1)
     .toArray()
+  recordDiscoveryCacheRead(
+    receipt,
+    'discoveryPayloadMetadata',
+    'primary',
+    undefined,
+    'query',
+    1,
+    rows.length,
+  )
   const page = rows.slice(0, limit)
   const last = page.at(-1)
   return {
@@ -891,6 +1205,7 @@ async function readPayloadBodyAuditPage(
   tx: Transaction,
   afterKey: string | [string, string] | undefined,
   limit: number,
+  receipt?: DiscoveryCacheReceiptAccumulator,
 ): Promise<{ ids: string[]; orphanIds: string[]; nextAfterKey?: string }> {
   const table = tx.table<DiscoveryPayloadStorageRow, string>('discoveryPayloads')
   const ids = await (afterKey === undefined
@@ -899,6 +1214,15 @@ async function readPayloadBodyAuditPage(
   )
     .limit(limit + 1)
     .primaryKeys()
+  recordDiscoveryCacheRead(
+    receipt,
+    'discoveryPayloads',
+    'primary',
+    undefined,
+    'query',
+    1,
+    ids.length,
+  )
   const page = ids.slice(0, limit)
   const metadataIds =
     page.length === 0
@@ -908,6 +1232,15 @@ async function readPayloadBodyAuditPage(
           .where(':id')
           .anyOf(page)
           .primaryKeys()
+  recordDiscoveryCacheRead(
+    receipt,
+    'discoveryPayloadMetadata',
+    'primary',
+    undefined,
+    'open-cursor',
+    page.length > 0 ? 1 : 0,
+    metadataIds.length,
+  )
   const retained = new Set(metadataIds)
   const last = page.at(-1)
   return {
@@ -917,49 +1250,99 @@ async function readPayloadBodyAuditPage(
   }
 }
 
-async function countPayloadReferences(tx: Transaction, payloadId: string): Promise<number> {
+async function countPayloadReferences(
+  tx: Transaction,
+  payloadId: string,
+  receipt?: DiscoveryCacheReceiptAccumulator,
+): Promise<number> {
   const counts = await Promise.all(
     TABLE_ORDER.map((tableName) =>
       tx.table(tableName).where('payloadId').equals(payloadId).count(),
     ),
   )
+  for (const [index, count] of counts.entries()) {
+    recordDiscoveryCacheRead(
+      receipt,
+      TABLE_ORDER[index] as DiscoveryCacheStorageTable,
+      'secondary',
+      'payloadId',
+      'count',
+      1,
+      count,
+    )
+  }
   return counts.reduce((total, count) => total + count, 0)
 }
 
-async function payloadBodyExists(tx: Transaction, payloadId: string): Promise<boolean> {
-  return (
-    (await tx
-      .table<DiscoveryPayloadStorageRow, string>('discoveryPayloads')
-      .where(':id')
-      .equals(payloadId)
-      .limit(1)
-      .count()) > 0
-  )
+async function payloadBodyExists(
+  tx: Transaction,
+  payloadId: string,
+  receipt?: DiscoveryCacheReceiptAccumulator,
+): Promise<boolean> {
+  const count = await tx
+    .table<DiscoveryPayloadStorageRow, string>('discoveryPayloads')
+    .where(':id')
+    .equals(payloadId)
+    .limit(1)
+    .count()
+  recordDiscoveryCacheRead(receipt, 'discoveryPayloads', 'primary', undefined, 'count', 1, count)
+  return count > 0
 }
 
-async function deletePayloadIfUnreferenced(tx: Transaction, payloadId: string): Promise<boolean> {
-  if ((await countPayloadReferences(tx, payloadId)) > 0) return false
-  return deleteDiscoveryPayload(tx, payloadId)
+async function deletePayloadIfUnreferenced(
+  tx: Transaction,
+  payloadId: string,
+  receipt?: DiscoveryCacheReceiptAccumulator,
+): Promise<boolean> {
+  const references = await Promise.all(
+    TABLE_ORDER.map((tableName) =>
+      tx.table(tableName).where('payloadId').equals(payloadId).limit(1).primaryKeys(),
+    ),
+  )
+  for (const [index, keys] of references.entries()) {
+    recordDiscoveryCacheRead(
+      receipt,
+      TABLE_ORDER[index] as DiscoveryCacheStorageTable,
+      'secondary',
+      'payloadId',
+      'query',
+      1,
+      keys.length,
+    )
+  }
+  if (references.some((keys) => keys.length > 0)) return false
+  return deleteDiscoveryPayload(tx, payloadId, undefined, undefined, receipt)
 }
 
 async function deleteDiscoveryPayload(
   tx: Transaction,
   payloadId: string,
-  knownMetadata?: DiscoveryPayloadMetadataStorageRow,
+  knownMetadata?: DiscoveryPayloadMetadataStorageRow | null,
+  knownBodyExists?: boolean,
+  receipt?: DiscoveryCacheReceiptAccumulator,
 ): Promise<boolean> {
   const [metadata, bodyExists] = await Promise.all([
-    knownMetadata
-      ? Promise.resolve(knownMetadata)
+    knownMetadata !== undefined
+      ? Promise.resolve(knownMetadata ?? undefined)
       : tx
           .table<DiscoveryPayloadMetadataStorageRow, string>('discoveryPayloadMetadata')
           .get(payloadId),
-    payloadBodyExists(tx, payloadId),
+    knownBodyExists === undefined
+      ? payloadBodyExists(tx, payloadId, receipt)
+      : Promise.resolve(knownBodyExists),
   ])
+  if (knownMetadata === undefined) {
+    recordDiscoveryCacheRead(receipt, 'discoveryPayloadMetadata', 'primary', undefined, 'get', 1, 1)
+  }
   await Promise.all([
-    tx
-      .table<DiscoveryPayloadMetadataStorageRow, string>('discoveryPayloadMetadata')
-      .delete(payloadId),
-    tx.table<DiscoveryPayloadStorageRow, string>('discoveryPayloads').delete(payloadId),
+    deletePhysicalStorageKeys<DiscoveryPayloadMetadataStorageRow, string>(
+      tx,
+      'discoveryPayloadMetadata',
+      [payloadId],
+    ),
+    deletePhysicalStorageKeys<DiscoveryPayloadStorageRow, string>(tx, 'discoveryPayloads', [
+      payloadId,
+    ]),
   ])
   const obsoleteBytes = metadata
     ? estimateStoredValueBytes(metadata) + (bodyExists ? metadata.byteLength : 0)
@@ -974,10 +1357,7 @@ async function putDiscoveryPayloadMetadata(
   previous: DiscoveryPayloadMetadataStorageRow | undefined,
 ): Promise<void> {
   if (previous && stableStringify(previous) === stableStringify(next)) return
-  await recordObsoleteByteOwnerValues(tx, [previous])
-  const table = tx.table<DiscoveryPayloadMetadataStorageRow, string>('discoveryPayloadMetadata')
-  if (previous) await table.put(next)
-  else await table.add(next)
+  await putPhysicalStorageRow(tx, 'discoveryPayloadMetadata', next, previous)
 }
 
 function canonicalJsonForStorage(tableName: DiscoveryCacheStorageTable, payload: unknown): string {
@@ -1073,42 +1453,100 @@ function recordDiscoveryCacheProfileInvalidations(
   tx: Transaction,
   tableNames: readonly DiscoveryCacheStorageTable[],
   profileId: string,
+  receipt?: DiscoveryCacheReceiptAccumulator,
 ): void {
-  recordBrowserCommandOwnerInvalidation(tx, {
+  const dependency = {
     kind: 'discovery-cache',
     cacheKinds: [...new Set(tableNames.map(discoveryCacheKindForStorageTable))],
     profileIds: [profileId],
-  })
+  } as const satisfies WorkspaceDependency
+  recordBrowserCommandOwnerInvalidation(tx, dependency)
+  receipt?.dependency(dependency)
 }
 
 function recordDiscoveryCacheRowInvalidation(
   tx: Transaction,
   tableName: DiscoveryCacheStorageTable,
   row: CachedModelsStorageRow | CachedEndpointsStorageRow | CachedPrivacyPolicyStorageRow,
+  receipt?: DiscoveryCacheReceiptAccumulator,
 ): void {
   const cacheKind = discoveryCacheKindForStorageTable(tableName)
   const eviction = evictionForStorageRow(tableName, row)
-  recordBrowserCommandOwnerInvalidation(tx, {
+  const dependency = {
     kind: 'discovery-cache',
     cacheKinds: [cacheKind],
     profileIds: [eviction.profileId],
     keys: [discoveryCacheKey(cacheKind, eviction.profileId, eviction.discriminator)],
-  })
+  } as const satisfies WorkspaceDependency
+  recordBrowserCommandOwnerInvalidation(tx, dependency)
+  receipt?.dependency(dependency)
 }
 
 function recordDiscoveryCacheEvictions(
   tx: Transaction,
   evictions: readonly DiscoveryCacheEviction[],
+  receipt?: DiscoveryCacheReceiptAccumulator,
 ): void {
   for (const eviction of evictions) {
     const cacheKind = discoveryCacheKindForStorageTable(eviction.tableName)
-    recordBrowserCommandOwnerInvalidation(tx, {
+    const dependency = {
       kind: 'discovery-cache',
       cacheKinds: [cacheKind],
       profileIds: [eviction.profileId],
       keys: [discoveryCacheKey(cacheKind, eviction.profileId, eviction.discriminator)],
-    })
+    } as const satisfies WorkspaceDependency
+    recordBrowserCommandOwnerInvalidation(tx, dependency)
+    receipt?.dependency(dependency)
   }
+}
+
+function discoveryCacheMaintenanceReplay(
+  state: DiscoveryCacheStateStorageRow | undefined,
+  limit: number,
+): SemanticOperationReplayPlan {
+  const current = isDiscoveryCacheState(state) ? state : undefined
+  return {
+    kind: 'durable-page-resume',
+    owner: 'discovery-cache:maintenance',
+    cycle: current?.formatVersion ?? 'missing',
+    revision: stableStringify(
+      current
+        ? {
+            valid: current.valid,
+            headerCounts: current.headerCounts,
+            payloadCount: current.payloadCount,
+            payloadByteLength: current.payloadByteLength,
+          }
+        : null,
+    ),
+    cursor: stableStringify(current?.audit ?? null),
+    doneMarker: current?.valid === true && !current.audit ? 'valid' : 'audit-required',
+    limit,
+  }
+}
+
+function recordDiscoveryCacheRead(
+  receipt: DiscoveryCacheReceiptAccumulator | undefined,
+  tableName:
+    | 'discoveryCacheState'
+    | 'discoveryPayloadMetadata'
+    | 'discoveryPayloads'
+    | DiscoveryCacheStorageTable,
+  indexKind: 'primary' | 'secondary',
+  indexName: string | undefined,
+  operation: 'get' | 'get-many' | 'query' | 'open-cursor' | 'count',
+  requestCount: number,
+  rowCount: number,
+): void {
+  if (!receipt || requestCount === 0) return
+  receipt.physicalRead({
+    tableName,
+    indexKind,
+    ...(indexName ? { indexName } : {}),
+    operation,
+    requestCount,
+    rowCount,
+  })
 }
 
 function candidateKey(candidate: EvictionCandidate): string {
@@ -1140,15 +1578,76 @@ function isDiscoveryCacheState(value: unknown): value is DiscoveryCacheStateStor
     state.id === DISCOVERY_CACHE_STATE_ID &&
     state.formatVersion === DISCOVERY_CACHE_STATE_FORMAT_VERSION &&
     typeof state.valid === 'boolean' &&
-    isFiniteNonNegative(state.payloadCount) &&
-    isFiniteNonNegative(state.payloadByteLength) &&
+    isSafeNonNegative(state.payloadCount) &&
+    isSafeNonNegative(state.payloadByteLength) &&
     !!state.headerCounts &&
-    TABLE_ORDER.every((tableName) => isFiniteNonNegative(state.headerCounts?.[tableName]))
+    TABLE_ORDER.every((tableName) => isSafeNonNegative(state.headerCounts?.[tableName])) &&
+    (state.audit === undefined || isDiscoveryCacheAudit(state.audit))
   )
 }
 
-function isFiniteNonNegative(value: unknown): value is number {
-  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+function isDiscoveryCacheAudit(value: unknown): value is DiscoveryCacheAuditStorageRow {
+  if (!value || typeof value !== 'object') return false
+  const audit = value as Partial<DiscoveryCacheAuditStorageRow>
+  if (
+    !audit.phase ||
+    !['models', 'endpoints', 'privacyPolicies', 'metadata', 'payloads'].includes(audit.phase) ||
+    !audit.headerCounts ||
+    !TABLE_ORDER.every((tableName) => isSafeNonNegative(audit.headerCounts?.[tableName])) ||
+    !isSafeNonNegative(audit.payloadCount) ||
+    !isSafeNonNegative(audit.payloadByteLength)
+  ) {
+    return false
+  }
+  if (audit.afterKey === undefined) return true
+  return isHeaderPhase(audit.phase)
+    ? Array.isArray(audit.afterKey) &&
+        audit.afterKey.length === 2 &&
+        audit.afterKey.every((part) => typeof part === 'string')
+    : typeof audit.afterKey === 'string'
+}
+
+function isDiscoveryCacheHeaderRow(
+  tableName: DiscoveryCacheStorageTable,
+  value: unknown,
+): value is CachedModelsStorageRow | CachedEndpointsStorageRow | CachedPrivacyPolicyStorageRow {
+  if (!value || typeof value !== 'object') return false
+  const row = value as Partial<
+    CachedModelsStorageRow | CachedEndpointsStorageRow | CachedPrivacyPolicyStorageRow
+  >
+  const discriminator =
+    tableName === 'models'
+      ? (row as Partial<CachedModelsStorageRow>).queryKey
+      : (row as Partial<CachedEndpointsStorageRow>).modelId
+  return (
+    typeof row.profileId === 'string' &&
+    typeof row.profileRevision === 'string' &&
+    typeof discriminator === 'string' &&
+    typeof row.payloadId === 'string' &&
+    isSafeNonNegative(row.fetchedAt) &&
+    isSafeNonNegative(row.payloadByteLength) &&
+    row.payloadByteLength <= DISCOVERY_CACHE_LIMITS.maxPayloadByteLength
+  )
+}
+
+function isDiscoveryPayloadMetadata(value: unknown): boolean {
+  if (!value || typeof value !== 'object') return false
+  const metadata = value as Partial<DiscoveryPayloadMetadataStorageRow>
+  return (
+    typeof metadata.id === 'string' &&
+    isSafeNonNegative(metadata.byteLength) &&
+    metadata.byteLength <= DISCOVERY_CACHE_LIMITS.maxPayloadByteLength &&
+    isSafeNonNegative(metadata.referenceCount) &&
+    isSafeNonNegative(metadata.lastReferencedAt)
+  )
+}
+
+function isSafeNonNegative(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+}
+
+function saturatingAdd(left: number, right: number): number {
+  return Math.min(Number.MAX_SAFE_INTEGER, left + right)
 }
 
 function isPrivacyPayload(value: unknown): value is { policies: unknown; fetchedAt?: unknown } {

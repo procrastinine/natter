@@ -28,7 +28,10 @@ import { exportWorkspaceBackup, restoreWorkspaceBackup } from '../../src/store/i
 import { __resetKeyCacheForTests, createKey } from '../../src/store/keys'
 import type { WorkspaceChange, WorkspaceDependency } from '../../src/store/workspace-protocol'
 import { __resetWorkspaceRepositoryForTests } from '../../src/store/workspace-repository'
-import { createConfigurationProfile } from '../helpers/configuration'
+import {
+  createConfigurationProfile,
+  createConfigurationPromptPreset,
+} from '../helpers/configuration'
 
 const DB_NAME = 'natter'
 
@@ -80,24 +83,7 @@ async function createPromptPreset(input: {
   text: string
   now?: number
 }): Promise<PromptPreset> {
-  const now = input.now ?? Date.now()
-  const preset: PromptPreset = {
-    id: newId(),
-    kind: input.kind,
-    name: input.name,
-    text: input.text,
-    createdAt: now,
-    updatedAt: now,
-  }
-  const result = await configurationApplication.execute({
-    kind: 'prompt-preset.put',
-    preset,
-    now,
-  })
-  if (result.kind !== 'prompt-preset-saved' || !result.preset) {
-    throw new Error(`PromptPresetCreateFailed:${preset.id}`)
-  }
-  return result.preset
+  return createConfigurationPromptPreset(input)
 }
 
 async function createChatPreset(input: {
@@ -107,14 +93,11 @@ async function createChatPreset(input: {
   now?: number
 }): Promise<ChatPreset> {
   const id = newId()
-  const result = await configurationApplication.execute({
-    kind: 'chat-preset.create',
-    preset: {
-      id,
-      name: input.name ?? 'bundle',
-      connectionProfileId: input.profileId,
-      settings: input.settings,
-    },
+  const result = await configurationApplication.createChatPreset({
+    presetId: id,
+    name: input.name ?? 'bundle',
+    profileId: input.profileId,
+    settings: input.settings,
     now: input.now ?? Date.now(),
   })
   if (result.kind !== 'chat-preset-saved') throw new Error(`ChatPresetCreateFailed:${id}`)
@@ -154,15 +137,22 @@ function changedFacts(changes: readonly WorkspaceChange[]) {
 
 describe('prompt preset catalog commands', () => {
   it('creates a preset and publishes one compact prompt-preset invalidation', async () => {
+    const chat = await createChat({ now: 100 })
     const changes: WorkspaceChange[] = []
     const unsubscribe = subscribeWorkspaceChanges((change) => changes.push(change))
 
-    const preset = await createPromptPreset({
+    const result = await configurationApplication.createAndPinPromptPreset({
+      chatId: chat.id,
       kind: 'system',
       name: 'My sysprompt',
       text: 'You are helpful.',
+      now: 200,
     })
     unsubscribe()
+    if (result.kind !== 'prompt-preset-saved' || !result.preset) {
+      throw new Error('PromptPresetCreateFailed')
+    }
+    const preset = result.preset
 
     const promptPresetDependency = changedDependencies(changes).find(
       (dependency) => dependency.kind === 'prompt-preset',
@@ -185,6 +175,33 @@ describe('prompt preset catalog commands', () => {
     )
   })
 
+  it('rolls back the prompt row when its derived catalog write fails', async () => {
+    const preset = await createPromptPreset({
+      kind: 'system',
+      name: 'Catalog rollback',
+      text: 'Body',
+      now: 100,
+    })
+    const changes: WorkspaceChange[] = []
+    const unsubscribe = subscribeWorkspaceChanges((change) => changes.push(change))
+    const rejectProjection = () => {
+      throw new Error('injected catalog projection failure')
+    }
+    getDb().configurationPromptPresetCatalogRows.hook.updating.subscribe(rejectProjection)
+
+    try {
+      await expect(
+        configurationApplication.renamePromptPreset(preset.id, 'Changed', 200),
+      ).rejects.toThrow('injected catalog projection failure')
+    } finally {
+      getDb().configurationPromptPresetCatalogRows.hook.updating.unsubscribe(rejectProjection)
+      unsubscribe()
+    }
+
+    expect(await getPromptPreset(preset.id)).toEqual(preset)
+    expect(changes).toEqual([])
+  })
+
   it('filters by kind and presents rows in name order', async () => {
     const system = await createPromptPreset({ kind: 'system', name: 'Zed', text: 's' })
     const alpha = await createPromptPreset({ kind: 'system', name: 'alpha', text: 'a' })
@@ -198,15 +215,10 @@ describe('prompt preset catalog commands', () => {
     expect(await listPromptPresets()).toHaveLength(4)
   })
 
-  it('rejects updates to a missing prompt preset', async () => {
-    await expect(
-      configurationApplication.execute({
-        kind: 'prompt-preset.update',
-        presetId: 'missing',
-        patch: { text: 'x' },
-        now: 100,
-      }),
-    ).rejects.toThrow('ConfigurationMissing:prompt-preset:missing')
+  it('rejects renames to a missing prompt preset', async () => {
+    await expect(configurationApplication.renamePromptPreset('missing', 'x', 100)).rejects.toThrow(
+      'ConfigurationMissing:prompt-preset:missing',
+    )
   })
 })
 
@@ -264,12 +276,7 @@ describe('prompt preset pin propagation', () => {
     const changes: WorkspaceChange[] = []
     const unsubscribe = subscribeWorkspaceChanges((change) => changes.push(change))
 
-    await configurationApplication.execute({
-      kind: 'prompt-preset.update',
-      presetId: preset.id,
-      patch: { text: 'new' },
-      now: 500,
-    })
+    await configurationApplication.overwriteAndPinPromptPreset(pinnedA.id, preset.id, 'new', 500)
     unsubscribe()
 
     const rowA = await getChat(pinnedA.id)
@@ -330,12 +337,12 @@ describe('prompt preset pin propagation', () => {
       now: 100,
     })
 
-    await configurationApplication.execute({
-      kind: 'prompt-preset.update',
-      presetId: preset.id,
-      patch: { text: 'new continue' },
-      now: 500,
-    })
+    await configurationApplication.overwriteAndPinPromptPreset(
+      chat.id,
+      preset.id,
+      'new continue',
+      500,
+    )
 
     const updated = await getChat(chat.id)
     expect(updated?.settings.continueSystemPrompt).toBe('new continue')
@@ -384,12 +391,7 @@ describe('prompt preset pin propagation', () => {
 
     try {
       await expect(
-        configurationApplication.execute({
-          kind: 'prompt-preset.update',
-          presetId: preset.id,
-          patch: { text: 'new' },
-          now: 500,
-        }),
+        configurationApplication.overwriteAndPinPromptPreset(first.id, preset.id, 'new', 500),
       ).rejects.toThrow('injected prompt cascade failure')
     } finally {
       getDb().chats.hook.updating.unsubscribe(failSecondUpdate)

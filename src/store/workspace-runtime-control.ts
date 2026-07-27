@@ -27,6 +27,7 @@ export const WORKSPACE_RUNTIME_RESOURCE_IDS = Object.freeze([
   'conversation-workspace',
   'attachment-catalog-workspace',
   'configuration-workspace',
+  'configuration-model-resolution',
   'stream-recovery',
   'generated-output-localization',
   'storage-maintenance',
@@ -130,6 +131,7 @@ type WorkspaceRuntimeCoreResourceId =
 
 type WorkspaceRuntimeBackgroundResourceId =
   | 'attempt-workspace'
+  | 'configuration-model-resolution'
   | 'stream-recovery'
   | 'generated-output-localization'
   | 'storage-maintenance'
@@ -842,6 +844,7 @@ export function createWorkspaceRuntimeControlKernel(runtime: WorkspaceRuntimeKer
   ): id is WorkspaceRuntimeBackgroundResourceId {
     return (
       id === 'attempt-workspace' ||
+      id === 'configuration-model-resolution' ||
       id === 'stream-recovery' ||
       id === 'generated-output-localization' ||
       id === 'storage-maintenance'

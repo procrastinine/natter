@@ -25,6 +25,7 @@ const storageCompactionRequestListeners = new Set<() => void>()
 const STORAGE_COMPACTION_RECOVERY_INTENT_PREFIX = 'natter:storage-compaction-intent:v1:'
 const STORAGE_COMPACTION_RECOVERY_COORDINATION_RESOURCE = 'storage-compaction-recovery:v1'
 const STORAGE_COMPACTION_INTENT_OWNER_RESOURCE_PREFIX = 'storage-compaction-intent-owner:v1:'
+const STORAGE_COMPACTION_WRITE_ADMISSION = Symbol('StorageCompactionWriteAdmission')
 const STORAGE_COMPACTION_DEBT_RETRY_BASE_MS = 1_000
 const STORAGE_COMPACTION_DEBT_RETRY_MAX_MS = 60_000
 const STORAGE_COMPACTION_DEBT_FLUSH_BYTES = 1024 * 1024
@@ -47,6 +48,12 @@ let physicalMutationIntentOwnerStart: {
 let physicalMutationIntentOwnerController: AbortController | null = null
 let physicalMutationIntentOwnerTask: Promise<void> = Promise.resolve()
 let physicalMutationIntentOwnerFailure: unknown = null
+let storageCompactionWriteAdmission:
+  | {
+      readonly databaseName: string
+      readonly task: Promise<StorageCompactionWriteAdmission>
+    }
+  | undefined
 
 type CompletedPhysicalMutationLedger = PhysicalMutationLedger
 
@@ -69,6 +76,13 @@ interface StorageCompactionRecoveryIntent {
 interface StorageCompactionRecoveryOptions {
   readonly isOwnerLive?: (tabId: string) => Promise<boolean>
   readonly signal?: AbortSignal
+}
+
+export interface StorageCompactionWriteAdmission {
+  readonly kind: 'storage-compaction-write-admission'
+  readonly databaseName: string
+  readonly commandPhysicalReads: 0
+  readonly [STORAGE_COMPACTION_WRITE_ADMISSION]: true
 }
 
 export function storageCompactionRecoveryIntentKey(tabId: string): string {
@@ -155,16 +169,20 @@ export async function recoverStorageCompactionDebtIntents(
   db: Dexie,
   options: StorageCompactionRecoveryOptions = {},
 ): Promise<boolean> {
+  if (options.signal?.aborted) throw storageCompactionError(options.signal.reason)
   if (readStorageCompactionRecoveryIntents().length === 0) return false
   return withCoordinationLock(
     STORAGE_COMPACTION_RECOVERY_COORDINATION_RESOURCE,
     async () => {
+      if (options.signal?.aborted) throw storageCompactionError(options.signal.reason)
       const intents = readStorageCompactionRecoveryIntents()
       const stale: StorageCompactionRecoveryIntent[] = []
       for (const intent of intents) {
+        if (options.signal?.aborted) throw storageCompactionError(options.signal.reason)
         const live = options.isOwnerLive
           ? await options.isOwnerLive(intent.tabId)
           : await storageCompactionIntentOwnerIsLive(db, intent.tabId)
+        if (options.signal?.aborted) throw storageCompactionError(options.signal.reason)
         if (!live) stale.push(intent)
       }
       if (stale.length === 0) return false
@@ -282,13 +300,32 @@ export function startStorageCompactionIntentOwner(db: Dexie): Promise<void> {
   return task
 }
 
+export function activateStorageCompactionWriteAdmission(db: Dexie): void {
+  if (storageCompactionWriteAdmission) {
+    throw new Error('StorageCompactionWriteAdmissionAlreadyActive')
+  }
+  const admission = {
+    databaseName: db.name,
+    task: startStorageCompactionIntentOwner(db).then(() =>
+      Object.freeze({
+        kind: 'storage-compaction-write-admission' as const,
+        databaseName: db.name,
+        commandPhysicalReads: 0 as const,
+        [STORAGE_COMPACTION_WRITE_ADMISSION]: true as const,
+      }),
+    ),
+  }
+  storageCompactionWriteAdmission = admission
+  void admission.task.catch(() => undefined)
+}
+
 async function startStorageCompactionIntentOwnerOnce(
   db: Dexie,
   controller: AbortController,
 ): Promise<void> {
   if (physicalMutationIntentOwnerController?.signal.aborted) await physicalMutationIntentOwnerTask
   if (controller.signal.aborted) throw storageCompactionError(controller.signal.reason)
-  await recoverStorageCompactionDebtIntents(db)
+  await recoverStorageCompactionDebtIntents(db, { signal: controller.signal })
   if (storageCompactionOwnerAborted(controller)) {
     throw storageCompactionError(controller.signal.reason)
   }
@@ -323,11 +360,23 @@ async function startStorageCompactionIntentOwnerOnce(
   if (startFailure) throw storageCompactionError(startFailure)
 }
 
-export function awaitStorageCompactionWriteAdmission(db: Dexie): Promise<void> {
-  return startStorageCompactionIntentOwner(db)
+export async function awaitStorageCompactionWriteAdmission(): Promise<StorageCompactionWriteAdmission> {
+  const admission = storageCompactionWriteAdmission
+  if (!admission) throw new Error('StorageCompactionWriteAdmissionInactive')
+  const receipt = await admission.task
+  if (storageCompactionWriteAdmission !== admission) {
+    throw new Error('StorageCompactionWriteAdmissionClosed')
+  }
+  const failure = storageCompactionIntentOwnerFailure()
+  if (failure) throw storageCompactionError(failure)
+  if (!physicalMutationIntentOwnerController) {
+    throw new Error('StorageCompactionWriteAdmissionOwnershipLost')
+  }
+  return receipt
 }
 
 export function stopStorageCompactionIntentOwner(): void {
+  storageCompactionWriteAdmission = undefined
   physicalMutationIntentOwnerStart?.controller.abort(
     new Error('StorageCompactionIntentOwnerStopped'),
   )
@@ -345,7 +394,8 @@ export function assertStorageCompactionIntentOwnerClosed(): void {
   if (
     physicalMutationIntentOwnerStart ||
     physicalMutationIntentOwnerController ||
-    physicalMutationIntentOwnerFailure
+    physicalMutationIntentOwnerFailure ||
+    storageCompactionWriteAdmission
   ) {
     throw new Error('StorageCompactionIntentOwnerNotClosed')
   }
@@ -375,6 +425,7 @@ export async function __resetStorageCompactionStateForTests(): Promise<void> {
   physicalMutationIntentOwnerController = null
   physicalMutationIntentOwnerTask = Promise.resolve()
   physicalMutationIntentOwnerFailure = null
+  storageCompactionWriteAdmission = undefined
   storageCompactionRequestListeners.clear()
 }
 

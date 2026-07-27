@@ -71,7 +71,7 @@ export interface MessageMutationContext {
   getChildList(chatId: ChatId, parentId: MessageId | null): Promise<ChildListState>
   getChildLists(chatId: ChatId, parentIds: readonly (MessageId | null)[]): Promise<ChildListState[]>
   getChildSlotMembers(messageIds: readonly MessageId[]): Promise<Array<ChildSlotMember | undefined>>
-  putMessage(message: Message): Promise<Message>
+  putMessage(message: Message, options?: { readonly touchChatSummary?: boolean }): Promise<Message>
   patchMessageStructure(
     messageId: MessageId,
     patch: Partial<Pick<MessageHeaderRow, 'deleted' | 'parentId' | 'siblingIndex'>>,
@@ -148,6 +148,7 @@ export interface ConversationSelectionFrame {
   readonly target: ConversationSelectionProofTarget
   readonly proof: ConversationPathProofIdentity
   readonly presentations: readonly MessagePresentation[]
+  readonly forks: readonly ActiveBranchForkSlot[]
 }
 
 export interface ConversationProvedSelection extends ConversationSelectionFrame {
@@ -226,11 +227,7 @@ export function sealConversationSelection(
       headers: pathHeaders,
     })
   }
-  const forks: Iterable<ActiveBranchForkSlot> =
-    acceptedForks ??
-    (SEALED_CONVERSATION_SELECTION in selection
-      ? (selection as SealedConversationSelection).spine.forkSlots()
-      : Object.freeze([]))
+  const forks: Iterable<ActiveBranchForkSlot> = acceptedForks ?? selection.forks
   spine = spine.replaceForks(forks)
   for (const presentation of selection.presentations) {
     const header = spine.path.get(presentation.header.id)
@@ -256,6 +253,7 @@ export function sealConversationSelection(
       tipId: proof.tipId,
     }),
     presentations: selection.presentations,
+    forks: Object.freeze([...spine.forkSlots()]),
     [SEALED_CONVERSATION_SELECTION]: true as const,
     spine,
   })
@@ -327,6 +325,29 @@ export type MessageBodyMutationInput =
   | { kind: 'message.toggle-context'; chatId: ChatId; messageId: MessageId }
   | { kind: 'message.dismiss-generation-notice'; chatId: ChatId; messageId: MessageId }
 
+export interface MessageBodyMutationCapability {
+  readonly access: 'presentation'
+  readonly replayReason: 'unfenced-relative-update' | 'non-replayable'
+  readonly summary: 'preserves' | 'updates'
+}
+
+export function messageBodyMutationCapability(
+  input: MessageBodyMutationInput,
+): MessageBodyMutationCapability {
+  switch (input.kind) {
+    case 'message.toggle-reasoning-detail':
+    case 'message.toggle-provider-output-item':
+    case 'message.toggle-context':
+      return {
+        access: 'presentation',
+        replayReason: 'unfenced-relative-update',
+        summary: 'preserves',
+      }
+    case 'message.dismiss-generation-notice':
+      return { access: 'presentation', replayReason: 'non-replayable', summary: 'preserves' }
+  }
+}
+
 const ZERO_VERSIONS: ChatVersions = {
   metaVersion: 0,
   summaryVersion: 0,
@@ -345,8 +366,11 @@ function versionsFor<T>(result: MessageMutationResult<T>, chatId: ChatId): ChatV
   return result.chatVersions[chatId] ?? ZERO_VERSIONS
 }
 
-function messageScope(messageId: MessageId): MutationScope {
-  return { kind: 'message', messageId }
+function messageScope(
+  messageId: MessageId,
+  access?: Extract<MutationScope, { kind: 'message' }>['access'],
+): MutationScope {
+  return { kind: 'message', messageId, ...(access ? { access } : {}) }
 }
 
 function childrenScope(chatId: ChatId, parentId: MessageId | null): MutationScope {
@@ -893,93 +917,99 @@ export async function mutateMessageBodyInRepository(
   repo: MessageMutationRepository,
   input: MessageBodyMutationInput,
 ): Promise<MessagePresentation | undefined> {
-  const result = await repo.runMutation([messageScope(input.messageId)], async (ctx) => {
-    const current = await ctx.getMessage(input.messageId)
-    if (!current || current.chatId !== input.chatId || current.deleted) return undefined
+  const capability = messageBodyMutationCapability(input)
+  const result = await repo.runMutation(
+    [messageScope(input.messageId, capability.access)],
+    async (ctx) => {
+      const current = await ctx.getMessage(input.messageId)
+      if (!current || current.chatId !== input.chatId || current.deleted) return undefined
 
-    let next: Message | undefined
-    switch (input.kind) {
-      case 'message.toggle-reasoning-detail': {
-        if (input.member.owner.kind === 'generation') {
-          const envelope = current.reasoningEnvelope
-          if (!envelope) return undefined
-          const reasoningEnvelope = toggleReasoningMember(envelope, input.member)
+      let next: Message | undefined
+      switch (input.kind) {
+        case 'message.toggle-reasoning-detail': {
+          if (input.member.owner.kind === 'generation') {
+            const envelope = current.reasoningEnvelope
+            if (!envelope) return undefined
+            const reasoningEnvelope = toggleReasoningMember(envelope, input.member)
+            if (!reasoningEnvelope) return undefined
+            next = { ...current, reasoningEnvelope }
+            break
+          }
+          const streamId = input.member.owner.streamId
+          const attempts = current.continuationAttempts
+          const attemptIndex = attempts?.findIndex(
+            (attempt) => attempt.application.kind === 'applied' && attempt.streamId === streamId,
+          )
+          if (!attempts || attemptIndex === undefined || attemptIndex < 0) return undefined
+          const attempt = attempts[attemptIndex]
+          if (!attempt?.reasoningEnvelope) return undefined
+          const reasoningEnvelope = toggleReasoningMember(attempt.reasoningEnvelope, input.member)
           if (!reasoningEnvelope) return undefined
-          next = { ...current, reasoningEnvelope }
+          const nextAttempts = [...attempts]
+          nextAttempts[attemptIndex] = { ...attempt, reasoningEnvelope }
+          next = { ...current, continuationAttempts: nextAttempts }
           break
         }
-        const streamId = input.member.owner.streamId
-        const attempts = current.continuationAttempts
-        const attemptIndex = attempts?.findIndex(
-          (attempt) => attempt.application.kind === 'applied' && attempt.streamId === streamId,
-        )
-        if (!attempts || attemptIndex === undefined || attemptIndex < 0) return undefined
-        const attempt = attempts[attemptIndex]
-        if (!attempt?.reasoningEnvelope) return undefined
-        const reasoningEnvelope = toggleReasoningMember(attempt.reasoningEnvelope, input.member)
-        if (!reasoningEnvelope) return undefined
-        const nextAttempts = [...attempts]
-        nextAttempts[attemptIndex] = { ...attempt, reasoningEnvelope }
-        next = { ...current, continuationAttempts: nextAttempts }
-        break
-      }
-      case 'message.toggle-provider-output-item': {
-        if (input.member.owner.kind === 'generation') {
-          const items = current.providerOutputItems
+        case 'message.toggle-provider-output-item': {
+          if (input.member.owner.kind === 'generation') {
+            const items = current.providerOutputItems
+            const item = items?.[input.member.itemIndex]
+            if (!items || !item) return undefined
+            const nextItem = { ...item }
+            if (nextItem.hidden === true) delete nextItem.hidden
+            else nextItem.hidden = true
+            const nextItems = [...items]
+            nextItems[input.member.itemIndex] = nextItem
+            next = { ...current, providerOutputItems: nextItems }
+            break
+          }
+          const streamId = input.member.owner.streamId
+          const attempts = current.continuationAttempts
+          const attemptIndex = attempts?.findIndex(
+            (attempt) => attempt.application.kind === 'applied' && attempt.streamId === streamId,
+          )
+          if (!attempts || attemptIndex === undefined || attemptIndex < 0) return undefined
+          const attempt = attempts[attemptIndex]
+          const items = attempt?.providerOutputItems
           const item = items?.[input.member.itemIndex]
-          if (!items || !item) return undefined
+          if (!attempt || !items || !item) return undefined
           const nextItem = { ...item }
           if (nextItem.hidden === true) delete nextItem.hidden
           else nextItem.hidden = true
           const nextItems = [...items]
           nextItems[input.member.itemIndex] = nextItem
-          next = { ...current, providerOutputItems: nextItems }
+          const nextAttempts = [...attempts]
+          nextAttempts[attemptIndex] = { ...attempt, providerOutputItems: nextItems }
+          next = { ...current, continuationAttempts: nextAttempts }
           break
         }
-        const streamId = input.member.owner.streamId
-        const attempts = current.continuationAttempts
-        const attemptIndex = attempts?.findIndex(
-          (attempt) => attempt.application.kind === 'applied' && attempt.streamId === streamId,
-        )
-        if (!attempts || attemptIndex === undefined || attemptIndex < 0) return undefined
-        const attempt = attempts[attemptIndex]
-        const items = attempt?.providerOutputItems
-        const item = items?.[input.member.itemIndex]
-        if (!attempt || !items || !item) return undefined
-        const nextItem = { ...item }
-        if (nextItem.hidden === true) delete nextItem.hidden
-        else nextItem.hidden = true
-        const nextItems = [...items]
-        nextItems[input.member.itemIndex] = nextItem
-        const nextAttempts = [...attempts]
-        nextAttempts[attemptIndex] = { ...attempt, providerOutputItems: nextItems }
-        next = { ...current, continuationAttempts: nextAttempts }
-        break
-      }
-      case 'message.toggle-context':
-        next = { ...current, hiddenFromContext: !current.hiddenFromContext }
-        break
-      case 'message.dismiss-generation-notice': {
-        const generation = current.generation
-        if (
-          !generation ||
-          (generation.abortReason === undefined && generation.error === undefined)
-        ) {
-          return undefined
+        case 'message.toggle-context':
+          next = { ...current, hiddenFromContext: !current.hiddenFromContext }
+          break
+        case 'message.dismiss-generation-notice': {
+          const generation = current.generation
+          if (
+            !generation ||
+            (generation.abortReason === undefined && generation.error === undefined)
+          ) {
+            return undefined
+          }
+          const nextGeneration = { ...generation }
+          delete (nextGeneration as { abortReason?: unknown }).abortReason
+          delete (nextGeneration as { error?: unknown }).error
+          next = { ...current, generation: nextGeneration }
+          break
         }
-        const nextGeneration = { ...generation }
-        delete (nextGeneration as { abortReason?: unknown }).abortReason
-        delete (nextGeneration as { error?: unknown }).error
-        next = { ...current, generation: nextGeneration }
-        break
       }
-    }
 
-    const message = await ctx.putMessage(next)
-    const header = await ctx.getMessageHeader(input.messageId)
-    if (!header) return undefined
-    return { header, message, bodyVersion: header.bodyVersion }
-  })
+      const message = await ctx.putMessage(next, {
+        touchChatSummary: capability.summary !== 'preserves',
+      })
+      const header = await ctx.getMessageHeader(input.messageId)
+      if (!header) return undefined
+      return { header, message, bodyVersion: header.bodyVersion }
+    },
+  )
   return result.value
 }
 
@@ -1088,7 +1118,7 @@ export async function pasteImportInRepository(
   const insertedTailId = newMessageIds.at(-1) as MessageId
   const attachmentIds = input.messages.flatMap((message) => message.attachmentRefs ?? [])
   const scopes: MutationScope[] = [
-    ...newMessageIds.map(messageScope),
+    ...newMessageIds.map((messageId) => messageScope(messageId)),
     ...newMessageIds.slice(0, -1).map((messageId) => childrenScope(input.chatId, messageId)),
     ...attachmentIdScopes(attachmentIds),
   ]

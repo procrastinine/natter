@@ -452,37 +452,36 @@ function assertToolCalls(value: unknown, label: string): void {
 
 function assertGeneration(value: unknown, current: boolean): void {
   const row = object(value, 'generation')
-  const preparing = row.status === 'preparing'
   optionalString(row.id, 'generation.id')
-  if (preparing) {
+  if (!current) {
+    optionalString(row.model, 'generation.model')
+    optionalString(row.requestedModel, 'generation.requestedModel')
+    optionalString(row.apiUsed, 'generation.apiUsed')
+    optionalString(row.delivery, 'generation.delivery')
+  } else {
     optionalString(row.model, 'generation.model')
     optionalString(row.requestedModel, 'generation.requestedModel')
     optionalEnumValue(row.apiUsed, GENERATION_APIS, 'generation.apiUsed')
     optionalEnumValue(row.delivery, new Set(['streaming', 'buffered']), 'generation.delivery')
-  } else {
-    string(row.model, 'generation.model')
-    string(row.requestedModel, 'generation.requestedModel')
-    enumValue(row.apiUsed, GENERATION_APIS, 'generation.apiUsed')
-    enumValue(row.delivery, new Set(['streaming', 'buffered']), 'generation.delivery')
   }
-  if (row.status !== undefined) enumValue(row.status, GENERATION_STATUSES, 'generation.status')
-  if (row.integrity !== undefined) {
+  if (!current) optionalString(row.status, 'generation.status')
+  else if (row.status !== undefined) enumValue(row.status, GENERATION_STATUSES, 'generation.status')
+  if (!current) {
+    optionalString(row.integrity, 'generation.integrity')
+  } else if (row.integrity !== undefined) {
     enumValue(row.integrity, new Set(['clean', 'degraded', 'failed']), 'generation.integrity')
   }
-  if (preparing) {
+  if (!current) {
+    optionalString(row.costSource, 'generation.costSource')
+  } else {
     optionalEnumValue(
       row.costSource,
       new Set(['stream', 'generation-endpoint', 'estimated']),
       'generation.costSource',
     )
-  } else {
-    enumValue(
-      row.costSource,
-      new Set(['stream', 'generation-endpoint', 'estimated']),
-      'generation.costSource',
-    )
   }
-  finite(row.startedAt, 'generation.startedAt')
+  if (current) finite(row.startedAt, 'generation.startedAt')
+  else optionalFinite(row.startedAt, 'generation.startedAt')
   optionalFinite(row.finishedAt, 'generation.finishedAt')
   optionalFinite(row.cost, 'generation.cost')
   if (current && !isPersistedReasoningCarryForward(row.reasoningCarryForward)) {

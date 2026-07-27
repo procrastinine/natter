@@ -5,6 +5,7 @@ import {
   applyChatRowWriteTransitions,
   CHAT_ROW_LINKED_TRANSACTION_CAPABILITY,
 } from '../../src/store/chat-row-transition'
+import { readCurrentChatForTransaction } from '../../src/store/chat-storage-codec'
 import { buildChat, type CreateChatInput } from '../../src/store/chats'
 import { getDb } from '../../src/store/db'
 import {
@@ -29,17 +30,17 @@ export async function putTestChat(chat: Chat): Promise<Chat> {
 export async function putTestChats(chats: readonly Chat[]): Promise<void> {
   if (chats.length === 0) return
   const rows = chats.map((chat) => structuredClone(chat))
-  await runTestChatWrite((tx) =>
-    applyChatRowWriteTransitions(
+  await runTestChatWrite(async (tx) => {
+    await applyChatRowWriteTransitions(
       tx,
       rows.map((next) => ({ kind: 'add-linked', next })),
-    ),
-  )
+    )
+  })
 }
 
 export async function updateChatForTest(chatId: ChatId, patch: Partial<Chat>): Promise<void> {
   await runTestChatWrite(async (tx) => {
-    const current = await tx.table<Chat, ChatId>('chats').get(chatId)
+    const current = await readCurrentChatForTransaction(tx, chatId)
     if (!current) throw new Error(`MissingTestChat:${chatId}`)
     await applyChatRowWriteTransitions(tx, [
       { kind: 'replace-linked', previous: current, next: { ...current, ...patch } },

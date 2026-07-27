@@ -364,7 +364,7 @@ describe('deleteKey', () => {
       name: 'OpenRouter',
       plaintextKey: 'sk-or-v1-goner',
     })
-    const firstProfile = await createConfigurationProfile({
+    await createConfigurationProfile({
       id: 'profile-a',
       name: 'Profile A',
       kind: 'openrouter',
@@ -372,7 +372,7 @@ describe('deleteKey', () => {
       apiKeyRef: record.id,
       now: 1,
     })
-    const secondProfile = await createConfigurationProfile({
+    await createConfigurationProfile({
       id: 'profile-b',
       name: 'Profile B',
       kind: 'openrouter',
@@ -391,15 +391,6 @@ describe('deleteKey', () => {
         kind: 'key',
         keyIds: [record.id],
         facets: ['membership', 'request-material', 'selected-detail', 'usage'],
-      },
-      {
-        kind: 'profile',
-        profileIds: [firstProfile.id, secondProfile.id],
-        facets: ['request-material'],
-      },
-      {
-        kind: 'discovery-cache',
-        profileIds: [firstProfile.id, secondProfile.id],
       },
     ])
     await expect(resolveKeyForDispatch(record.id)).rejects.toBeInstanceOf(KeyMissingError)

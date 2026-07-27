@@ -16,6 +16,7 @@ import { DEFAULT_CORS_PROXY_URL, DEV_CORS_PROXY_URL } from '../../src/core/cors-
 import {
   defaultCorsProxyUrlForRuntime,
   GLOBAL_PREFERENCE_KEYS,
+  PINNED_MODELS_KEY,
 } from '../../src/core/global-settings'
 import {
   normalizeCollapsedSidebarFolderIds,
@@ -28,7 +29,12 @@ import { __resetBroadcastForTests, subscribeWorkspaceChanges } from '../../src/s
 import { __resetBrowserRepositoryForTests } from '../../src/store/browser-repo'
 import { configurationApplication } from '../../src/store/configuration-application'
 import { __resetDbForTests, getDb } from '../../src/store/db'
-import type { CachedModelsRow, SettingsRow } from '../../src/store/db-rows'
+import type {
+  CachedModelsRow,
+  CachedModelsStorageRow,
+  CachedPrivacyPolicyRow,
+  SettingsRow,
+} from '../../src/store/db-rows'
 import { ENDPOINTS_TTL_MS, isFresh, MODELS_TTL_MS } from '../../src/store/discovery-cache-policy'
 import {
   DISCOVERY_CACHE_LIMITS,
@@ -47,14 +53,22 @@ import {
   writeSidebarRenderWindowLoadMode,
   writeSidebarRenderWindowSize,
 } from '../../src/store/global-settings'
-import { getCachedEndpoints, getCachedModels } from '../../src/store/models-cache'
+import {
+  clearCachedModels,
+  getCachedEndpoints,
+  getCachedModels,
+} from '../../src/store/models-cache'
 import { getCachedPrivacyPolicy } from '../../src/store/privacy-cache'
 import { getSetting } from '../../src/store/settings'
 import {
   setSidebarFolderCollapsed,
   writeSidebarSortMode,
 } from '../../src/store/sidebar-preferences'
-import type { WorkspaceChange, WorkspaceDependency } from '../../src/store/workspace-protocol'
+import {
+  connectionDiscoveryRevisionKey,
+  type WorkspaceChange,
+  type WorkspaceDependency,
+} from '../../src/store/workspace-protocol'
 import {
   __resetWorkspaceRepositoryForTests,
   getWorkspaceRepository,
@@ -152,6 +166,43 @@ describe('models-cache', () => {
     expect((await getCachedModels('P2', {}))?.payload).toBe('b')
   })
 
+  it('executes direct model-cache deletion exactly and leaves immediate replay inert', async () => {
+    await putCachedModels('P1', {}, { data: [{ id: 'model' }] }, 1)
+
+    await clearCachedModels('P1', {})
+    await clearCachedModels('P1', {})
+
+    expect(await getCachedModels('P1', {})).toBeUndefined()
+    expect(await getDb().discoveryPayloadMetadata.count()).toBe(0)
+    expect(await getDb().discoveryPayloads.count()).toBe(0)
+  })
+
+  it('retains a payload with many corrupt-state references using one-key existence probes', async () => {
+    const db = getDb()
+    await putCachedModels('P1', {}, { data: [{ id: 'shared/model' }] }, 1)
+    const modelRow = await db.models.get(['P1', modelsCacheKey({})])
+    expect(modelRow).toBeDefined()
+    if (!modelRow) return
+    await db.endpoints.bulkPut(
+      Array.from({ length: 100 }, (_, index) => ({
+        profileId: `reference-profile-${index}`,
+        profileRevision: 'revision',
+        modelId: `model-${index}`,
+        fetchedAt: index,
+        payloadId: modelRow.payloadId,
+        payloadByteLength: modelRow.payloadByteLength,
+      })),
+    )
+    await db.discoveryPayloadMetadata.update(modelRow.payloadId, { referenceCount: 101 })
+    await db.discoveryCacheState.update('global', { valid: false })
+
+    await clearCachedModels('P1', {})
+
+    expect(await db.models.get(['P1', modelsCacheKey({})])).toBeUndefined()
+    expect(await db.discoveryPayloads.get(modelRow.payloadId)).toBeDefined()
+    expect(await db.discoveryPayloadMetadata.get(modelRow.payloadId)).toBeDefined()
+  })
+
   it('stores one immutable payload for repeated large refreshes without rereading its body', async () => {
     const payload = { data: [{ id: 'large', description: 'x'.repeat(1024 * 1024) }] }
     const payloadGet = vi.spyOn(getDb().discoveryPayloads, 'get')
@@ -191,6 +242,53 @@ describe('models-cache', () => {
     expect(await getDb().discoveryPayloads.count()).toBe(
       DISCOVERY_CACHE_LIMITS.perProfileRows.models,
     )
+  })
+
+  it('rejects a put against an over-cap profile snapshot and requests bounded repair', async () => {
+    const db = getDb()
+    await db.models.bulkPut(
+      Array.from(
+        { length: DISCOVERY_CACHE_LIMITS.perProfileRows.models + 1 },
+        (_, index): CachedModelsStorageRow => ({
+          profileId: 'corrupt-over-cap-profile',
+          profileRevision: 'revision',
+          queryKey: `existing-${index}`,
+          fetchedAt: index,
+          payloadId: `missing-${index}`,
+          payloadByteLength: 2,
+        }),
+      ),
+    )
+    await db.discoveryCacheState.put({
+      id: 'global',
+      formatVersion: 1,
+      valid: true,
+      headerCounts: {
+        models: DISCOVERY_CACHE_LIMITS.perProfileRows.models + 1,
+        endpoints: 0,
+        privacyPolicies: 0,
+      },
+      payloadCount: 0,
+      payloadByteLength: 0,
+    })
+
+    const result = await putDiscoveryRowForTest('models', {
+      profileId: 'corrupt-over-cap-profile',
+      profileRevision: 'revision',
+      queryKey: 'new',
+      fetchedAt: 100,
+      payload: { data: [{ id: 'new/model' }] },
+    })
+
+    expect(result).toMatchObject({
+      cached: false,
+      cacheChanged: false,
+      repairRequired: true,
+    })
+    expect(await db.models.where('profileId').equals('corrupt-over-cap-profile').count()).toBe(
+      DISCOVERY_CACHE_LIMITS.perProfileRows.models + 1,
+    )
+    expect(await db.discoveryCacheState.get('global')).toMatchObject({ valid: false })
   })
 
   it('deduplicates payload bytes across cache keys while retaining exact reference counts', async () => {
@@ -381,6 +479,99 @@ describe('models-cache', () => {
     expect(bodyGet).not.toHaveBeenCalled()
   })
 
+  it('resumes a 129-row invalid-cache audit in 64-row durable pages and becomes inert', async () => {
+    const db = getDb()
+    await db.discoveryPayloads.bulkPut(
+      Array.from({ length: 129 }, (_, index) => ({
+        id: `orphan-body-${index.toString().padStart(3, '0')}`,
+        canonicalJson: '{}',
+        byteLength: 2,
+      })),
+    )
+    await db.discoveryCacheState.put({
+      id: 'global',
+      formatVersion: 1,
+      valid: false,
+      headerCounts: { models: 0, endpoints: 0, privacyPolicies: 0 },
+      payloadCount: 0,
+      payloadByteLength: 0,
+    })
+
+    const pages = []
+    for (;;) {
+      const page = await maintainDiscoveryCacheForTest(64)
+      pages.push(page)
+      if (page.done) break
+    }
+
+    expect(pages.map((page) => page.scanned)).toEqual([64, 64, 1])
+    expect(pages.every((page) => page.scanned <= 64)).toBe(true)
+    expect(pages.reduce((total, page) => total + page.deletedPayloads, 0)).toBe(129)
+    expect(await db.discoveryPayloads.count()).toBe(0)
+    expect(await maintainDiscoveryCacheForTest(64)).toEqual({
+      scanned: 0,
+      deletedPayloads: 0,
+      evictions: [],
+      done: true,
+    })
+  })
+
+  it('repairs an over-cap cache from a malformed durable cursor without unbounded reads', async () => {
+    const db = getDb()
+    const payloadId = 'shared-over-cap-payload'
+    await db.discoveryPayloads.put({ id: payloadId, canonicalJson: '{}', byteLength: 2 })
+    await db.discoveryPayloadMetadata.put({
+      id: payloadId,
+      byteLength: 2,
+      referenceCount: DISCOVERY_CACHE_LIMITS.globalRows.models + 1,
+      lastReferencedAt: 1,
+    })
+    await db.models.bulkPut(
+      Array.from(
+        { length: DISCOVERY_CACHE_LIMITS.globalRows.models + 1 },
+        (_, index): CachedModelsStorageRow => ({
+          profileId: `profile-${index}`,
+          profileRevision: 'revision',
+          queryKey: 'query',
+          fetchedAt: index,
+          payloadId,
+          payloadByteLength: 2,
+        }),
+      ),
+    )
+    await db.discoveryCacheState.put({
+      id: 'global',
+      formatVersion: 1,
+      valid: false,
+      headerCounts: { models: 0, endpoints: 0, privacyPolicies: 0 },
+      payloadCount: 0,
+      payloadByteLength: 0,
+      audit: {
+        phase: 'metadata',
+        afterKey: ['wrong', 'cursor'],
+        headerCounts: { models: 0, endpoints: 0, privacyPolicies: 0 },
+        payloadCount: 0,
+        payloadByteLength: 0,
+      },
+    } as never)
+
+    const pages = []
+    for (;;) {
+      const page = await maintainDiscoveryCacheForTest(8)
+      pages.push(page)
+      if (page.done) break
+    }
+
+    expect(pages[0]).toMatchObject({ scanned: 1, done: false })
+    expect(pages.every((page) => page.scanned <= 8)).toBe(true)
+    expect(await db.models.count()).toBe(DISCOVERY_CACHE_LIMITS.globalRows.models)
+    expect(await db.discoveryPayloadMetadata.get(payloadId)).toMatchObject({ referenceCount: 64 })
+    expect(await db.discoveryCacheState.get('global')).toMatchObject({
+      valid: true,
+      headerCounts: { models: 64, endpoints: 0, privacyPolicies: 0 },
+    })
+  })
+
   it('trusts the current transactional totals and skips completed maintenance scans', async () => {
     const wholeTableCounts = vi.spyOn(IDBObjectStore.prototype, 'count')
     await putDiscoveryRowForTest('models', {
@@ -461,6 +652,43 @@ describe('privacy-cache', () => {
     expect(await getCachedPrivacyPolicy('P1', 'a')).toBeUndefined()
     expect(await getCachedPrivacyPolicy('P2', 'a')).toBeDefined()
   })
+
+  it('reuses the guarded current row while replacing a privacy cache entry', async () => {
+    const modelId = 'anthropic/claude-opus-4.7'
+    await putCachedPrivacyPolicy('P1', modelId, { policies: [{ training: false }] }, 1)
+    const previous = await getCachedPrivacyPolicy('P1', modelId)
+    expect(previous).toBeDefined()
+
+    await runWorkspaceAction('cache-refresh', async (permit) => {
+      const snapshot = (
+        await getWorkspaceRepository().query(permit, {
+          kind: 'configuration.discovery-snapshot',
+          profileId: 'P1',
+        })
+      ).value
+      if (!snapshot) throw new Error('DiscoveryProfileMissing:P1')
+      const row: CachedPrivacyPolicyRow = {
+        profileId: 'P1',
+        profileRevision: connectionDiscoveryRevisionKey(snapshot.revision),
+        modelId,
+        fetchedAt: 2,
+        payload: { policies: [{ training: true }] },
+      }
+      await getWorkspaceRepository().execute(permit, {
+        kind: 'discovery.privacy.put',
+        row,
+        guard: {
+          expectedProfileRevision: snapshot.revision,
+          expectedCurrent: previous ?? null,
+        },
+      })
+    })
+
+    expect(await getCachedPrivacyPolicy('P1', modelId)).toMatchObject({
+      fetchedAt: 2,
+      payload: { policies: [{ training: true }] },
+    })
+  })
 })
 
 describe('settings', () => {
@@ -483,14 +711,17 @@ describe('settings', () => {
     expect(changedDependencies(seen)).toContainEqual({ kind: 'setting', keys: ['theme'] })
   })
 
-  it('the configuration delete command removes the row and publishes the same invalidation', async () => {
-    await setGlobalPreference('theme', 'dark')
+  it('semantic membership removal updates pinned models and publishes its exact invalidation', async () => {
+    await setPinnedModel('model-a', true)
     const seen: WorkspaceChange[] = []
     const unsub = subscribeWorkspaceChanges((change) => seen.push(change))
-    await deleteGlobalPreference('theme')
+    await setPinnedModel('model-a', false)
     unsub()
-    expect(await getSetting('theme')).toBeUndefined()
-    expect(changedDependencies(seen)).toContainEqual({ kind: 'setting', keys: ['theme'] })
+    expect((await readGlobalPreferences()).pinnedModels).not.toContain('model-a')
+    expect(changedDependencies(seen)).toContainEqual({
+      kind: 'setting',
+      keys: [PINNED_MODELS_KEY],
+    })
   })
 
   it('semantic set membership preserves concurrent pinned-model additions', async () => {
@@ -578,14 +809,6 @@ async function setGlobalPreference(key: string, value: unknown): Promise<void> {
     kind: 'global-preference.set',
     key,
     value,
-    now: Date.now(),
-  })
-}
-
-async function deleteGlobalPreference(key: string): Promise<void> {
-  await configurationApplication.execute({
-    kind: 'global-preference.delete',
-    key,
     now: Date.now(),
   })
 }

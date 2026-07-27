@@ -16,7 +16,11 @@ import {
 } from './configuration-profile-usage-projection'
 import { scalarCompoundIndexBetween } from './indexeddb-key-ranges'
 import { physicalStorageTables } from './physical-storage-tables'
-import { bumpPresetCatalogRevision } from './preset-order'
+import {
+  bumpPresetCatalogRevision,
+  emptyPresetOrderMutationReceipt,
+  type PresetOrderMutationReceipt,
+} from './preset-order'
 import type {
   ConfigurationPresetCatalogRow,
   ConfigurationProfileCatalogRow,
@@ -41,6 +45,21 @@ export const CONFIGURATION_PROMPT_PRESET_CATALOG_TRANSACTION_CAPABILITY = physic
 export const CONFIGURATION_PROMPT_PRESET_RECENCY_TRANSACTION_CAPABILITY = physicalStorageTables(
   'configurationPromptPresetCatalogRows',
 )
+
+export interface ConfigurationCatalogProjectionMutationReceipt {
+  readonly projectionTable:
+    | 'configurationProfileCatalogRows'
+    | 'configurationPresetCatalogRows'
+    | 'configurationPromptPresetCatalogRows'
+  readonly projectionId: string
+  readonly projectionMutation: 'write' | 'delete' | 'none'
+  readonly aggregateIds: readonly string[]
+}
+
+export interface ConfigurationPresetCatalogMutationReceipt {
+  readonly projection: ConfigurationCatalogProjectionMutationReceipt
+  readonly order: PresetOrderMutationReceipt
+}
 
 export interface ConfigurationProfileCatalogProjectionRow extends ConfigurationProfileCatalogRow {
   readonly archived: boolean
@@ -206,20 +225,51 @@ async function updateConfigurationCatalogState(
 export async function putConfigurationProfileCatalogProjection(
   transaction: Transaction,
   profile: ConnectionProfile,
-): Promise<void> {
+): Promise<ConfigurationCatalogProjectionMutationReceipt> {
   const next = configurationProfileCatalogProjectionRow(profile)
   const previous = await transaction
     .table<ConfigurationProfileCatalogProjectionRow, ProfileId>('configurationProfileCatalogRows')
     .get(profile.id)
-  if (previous && sameProfileProjection(previous, next)) return
+  return applyConfigurationProfileCatalogProjectionRows(transaction, previous, next)
+}
+
+export function applyConfigurationProfileCatalogProjectionTransition(
+  transaction: Transaction,
+  previous: ConnectionProfile | undefined,
+  next: ConnectionProfile,
+): Promise<ConfigurationCatalogProjectionMutationReceipt> {
+  return applyConfigurationProfileCatalogProjectionRows(
+    transaction,
+    previous ? configurationProfileCatalogProjectionRow(previous) : undefined,
+    configurationProfileCatalogProjectionRow(next),
+  )
+}
+
+async function applyConfigurationProfileCatalogProjectionRows(
+  transaction: Transaction,
+  previous: ConfigurationProfileCatalogProjectionRow | undefined,
+  next: ConfigurationProfileCatalogProjectionRow,
+): Promise<ConfigurationCatalogProjectionMutationReceipt> {
+  if (previous && sameProfileProjection(previous, next)) {
+    return configurationCatalogProjectionMutationReceipt(
+      'configurationProfileCatalogRows',
+      next.id,
+      'none',
+    )
+  }
+  const aggregateIds: string[] = []
   await putPhysicalStorageRow(transaction, 'configurationProfileCatalogRows', next, previous)
-  if (!previous) await updateConfigurationCatalogAggregate(transaction, 1)
+  if (!previous) {
+    await updateConfigurationCatalogAggregate(transaction, 1)
+    aggregateIds.push(CONFIGURATION_CATALOG_AGGREGATE_ID)
+  }
   if (!previous || !sameProfileManagerProjection(previous, next)) {
     await updateConfigurationCatalogState(
       transaction,
       CONFIGURATION_PROFILE_MANAGER_STATE_ID,
       previous ? 0 : 1,
     )
+    aggregateIds.push(CONFIGURATION_PROFILE_MANAGER_STATE_ID)
   }
   const previousActive = previous?.activeKey === 1
   const nextActive = next.activeKey === 1
@@ -229,16 +279,32 @@ export async function putConfigurationProfileCatalogProjection(
       CONFIGURATION_PROFILE_CATALOG_STATE_ID,
       previousActive === nextActive ? 0 : nextActive ? 1 : -1,
     )
+    aggregateIds.push(CONFIGURATION_PROFILE_CATALOG_STATE_ID)
   }
+  return configurationCatalogProjectionMutationReceipt(
+    'configurationProfileCatalogRows',
+    next.id,
+    'write',
+    aggregateIds,
+  )
 }
 
-export async function deleteConfigurationProfileCatalogProjection(
+export function applyConfigurationProfileCatalogProjectionDeletion(
+  transaction: Transaction,
+  previous: ConnectionProfile,
+): Promise<ConfigurationCatalogProjectionMutationReceipt> {
+  return deleteConfigurationProfileCatalogProjectionRow(
+    transaction,
+    previous.id,
+    configurationProfileCatalogProjectionRow(previous),
+  )
+}
+
+async function deleteConfigurationProfileCatalogProjectionRow(
   transaction: Transaction,
   profileId: ProfileId,
-): Promise<void> {
-  const previous = await transaction
-    .table<ConfigurationProfileCatalogProjectionRow, ProfileId>('configurationProfileCatalogRows')
-    .get(profileId)
+  previous: ConfigurationProfileCatalogProjectionRow | undefined,
+): Promise<ConfigurationCatalogProjectionMutationReceipt> {
   await deletePhysicalStorageRows(
     transaction,
     'configurationProfileCatalogRows',
@@ -252,6 +318,18 @@ export async function deleteConfigurationProfileCatalogProjection(
       await updateConfigurationCatalogState(transaction, CONFIGURATION_PROFILE_CATALOG_STATE_ID, -1)
     }
   }
+  return configurationCatalogProjectionMutationReceipt(
+    'configurationProfileCatalogRows',
+    profileId,
+    previous ? 'delete' : 'none',
+    previous
+      ? [
+          CONFIGURATION_CATALOG_AGGREGATE_ID,
+          CONFIGURATION_PROFILE_MANAGER_STATE_ID,
+          ...(previous.activeKey === 1 ? [CONFIGURATION_PROFILE_CATALOG_STATE_ID] : []),
+        ]
+      : [],
+  )
 }
 
 export interface ConfigurationPresetCatalogProjectionRow extends ConfigurationPresetCatalogRow {
@@ -281,50 +359,147 @@ export function configurationPresetCatalogProjectionRow(
 export async function putConfigurationPresetCatalogProjection(
   transaction: Transaction,
   preset: ChatPreset,
-): Promise<void> {
+): Promise<ConfigurationPresetCatalogMutationReceipt> {
   const next = configurationPresetCatalogProjectionRow(preset)
   const previous = await transaction
     .table<ConfigurationPresetCatalogProjectionRow, PresetId>('configurationPresetCatalogRows')
     .get(preset.id)
-  if (previous && samePresetProjection(previous, next)) return
+  return applyConfigurationPresetCatalogProjectionRows(transaction, previous, next)
+}
+
+export function applyConfigurationPresetCatalogProjectionTransition(
+  transaction: Transaction,
+  previous: ChatPreset | undefined,
+  next: ChatPreset,
+): Promise<ConfigurationPresetCatalogMutationReceipt> {
+  return applyConfigurationPresetCatalogProjectionRows(
+    transaction,
+    previous ? configurationPresetCatalogProjectionRow(previous) : undefined,
+    configurationPresetCatalogProjectionRow(next),
+  )
+}
+
+async function applyConfigurationPresetCatalogProjectionRows(
+  transaction: Transaction,
+  previous: ConfigurationPresetCatalogProjectionRow | undefined,
+  next: ConfigurationPresetCatalogProjectionRow,
+): Promise<ConfigurationPresetCatalogMutationReceipt> {
+  if (previous && samePresetProjection(previous, next)) {
+    return {
+      projection: configurationCatalogProjectionMutationReceipt(
+        'configurationPresetCatalogRows',
+        next.id,
+        'none',
+      ),
+      order: emptyPresetOrderMutationReceipt(next.id),
+    }
+  }
   const catalogChanged = !previous || !samePresetCatalogViewProjection(previous, next)
   await putPhysicalStorageRow(transaction, 'configurationPresetCatalogRows', next, previous)
-  if (catalogChanged && (previous?.activeKey === 1 || next.activeKey === 1)) {
-    await bumpPresetCatalogRevision(transaction)
+  const order =
+    catalogChanged && (previous?.activeKey === 1 || next.activeKey === 1)
+      ? await bumpPresetCatalogRevision(transaction, next.id)
+      : emptyPresetOrderMutationReceipt(next.id)
+  return {
+    projection: configurationCatalogProjectionMutationReceipt(
+      'configurationPresetCatalogRows',
+      next.id,
+      'write',
+    ),
+    order,
   }
 }
 
 export async function putConfigurationPresetRecencyCatalogProjection(
   transaction: Transaction,
   preset: ChatPreset,
-): Promise<void> {
+): Promise<ConfigurationCatalogProjectionMutationReceipt> {
   const next = configurationPresetCatalogProjectionRow(preset)
   const previous = await transaction
     .table<ConfigurationPresetCatalogProjectionRow, PresetId>('configurationPresetCatalogRows')
     .get(preset.id)
   if (!previous) throw new Error(`ConfigurationPresetCatalogProjectionMissing:${preset.id}`)
+  return applyConfigurationPresetRecencyCatalogProjectionRows(transaction, previous, next)
+}
+
+export function applyConfigurationPresetRecencyCatalogProjectionTransition(
+  transaction: Transaction,
+  previous: ChatPreset,
+  next: ChatPreset,
+): Promise<ConfigurationCatalogProjectionMutationReceipt> {
+  return applyConfigurationPresetRecencyCatalogProjectionRows(
+    transaction,
+    configurationPresetCatalogProjectionRow(previous),
+    configurationPresetCatalogProjectionRow(next),
+  )
+}
+
+async function applyConfigurationPresetRecencyCatalogProjectionRows(
+  transaction: Transaction,
+  previous: ConfigurationPresetCatalogProjectionRow,
+  next: ConfigurationPresetCatalogProjectionRow,
+): Promise<ConfigurationCatalogProjectionMutationReceipt> {
   if (!samePresetCatalogViewProjection(previous, next)) {
-    throw new Error(`ConfigurationPresetRecencyProjectionChangedCatalog:${preset.id}`)
+    throw new Error(`ConfigurationPresetRecencyProjectionChangedCatalog:${next.id}`)
   }
-  if (samePresetProjection(previous, next)) return
+  if (samePresetProjection(previous, next)) {
+    return configurationCatalogProjectionMutationReceipt(
+      'configurationPresetCatalogRows',
+      next.id,
+      'none',
+    )
+  }
   await putPhysicalStorageRow(transaction, 'configurationPresetCatalogRows', next, previous)
+  return configurationCatalogProjectionMutationReceipt(
+    'configurationPresetCatalogRows',
+    next.id,
+    'write',
+  )
 }
 
 export async function deleteConfigurationPresetCatalogProjection(
   transaction: Transaction,
   presetId: PresetId,
-): Promise<void> {
+): Promise<ConfigurationPresetCatalogMutationReceipt> {
   const previous = await transaction
     .table<ConfigurationPresetCatalogProjectionRow, PresetId>('configurationPresetCatalogRows')
     .get(presetId)
+  return deleteConfigurationPresetCatalogProjectionRow(transaction, presetId, previous)
+}
+
+export function applyConfigurationPresetCatalogProjectionDeletion(
+  transaction: Transaction,
+  previous: ChatPreset,
+): Promise<ConfigurationPresetCatalogMutationReceipt> {
+  return deleteConfigurationPresetCatalogProjectionRow(
+    transaction,
+    previous.id,
+    configurationPresetCatalogProjectionRow(previous),
+  )
+}
+
+async function deleteConfigurationPresetCatalogProjectionRow(
+  transaction: Transaction,
+  presetId: PresetId,
+  previous: ConfigurationPresetCatalogProjectionRow | undefined,
+): Promise<ConfigurationPresetCatalogMutationReceipt> {
   await deletePhysicalStorageRows(
     transaction,
     'configurationPresetCatalogRows',
     [presetId],
     previous ? [previous] : [],
   )
-  if (previous?.activeKey === 1) {
-    await bumpPresetCatalogRevision(transaction)
+  const order =
+    previous?.activeKey === 1
+      ? await bumpPresetCatalogRevision(transaction, presetId)
+      : emptyPresetOrderMutationReceipt(presetId)
+  return {
+    projection: configurationCatalogProjectionMutationReceipt(
+      'configurationPresetCatalogRows',
+      presetId,
+      previous ? 'delete' : 'none',
+    ),
+    order,
   }
 }
 
@@ -350,14 +525,41 @@ export function configurationPromptPresetCatalogProjectionRow(
 export async function putConfigurationPromptPresetCatalogProjection(
   transaction: Transaction,
   preset: PromptPreset,
-): Promise<void> {
+): Promise<ConfigurationCatalogProjectionMutationReceipt> {
   const next = configurationPromptPresetCatalogProjectionRow(preset)
   const previous = await transaction
     .table<ConfigurationPromptPresetCatalogProjectionRow, PromptPresetId>(
       'configurationPromptPresetCatalogRows',
     )
     .get(preset.id)
-  if (previous && samePromptPresetProjection(previous, next)) return
+  return applyConfigurationPromptPresetCatalogProjectionRows(transaction, previous, next)
+}
+
+export function applyConfigurationPromptPresetCatalogProjectionTransition(
+  transaction: Transaction,
+  previous: PromptPreset | undefined,
+  next: PromptPreset,
+): Promise<ConfigurationCatalogProjectionMutationReceipt> {
+  return applyConfigurationPromptPresetCatalogProjectionRows(
+    transaction,
+    previous ? configurationPromptPresetCatalogProjectionRow(previous) : undefined,
+    configurationPromptPresetCatalogProjectionRow(next),
+  )
+}
+
+async function applyConfigurationPromptPresetCatalogProjectionRows(
+  transaction: Transaction,
+  previous: ConfigurationPromptPresetCatalogProjectionRow | undefined,
+  next: ConfigurationPromptPresetCatalogProjectionRow,
+): Promise<ConfigurationCatalogProjectionMutationReceipt> {
+  if (previous && samePromptPresetProjection(previous, next)) {
+    return configurationCatalogProjectionMutationReceipt(
+      'configurationPromptPresetCatalogRows',
+      next.id,
+      'none',
+    )
+  }
+  const aggregateIds: string[] = []
   await putPhysicalStorageRow(transaction, 'configurationPromptPresetCatalogRows', next, previous)
   if (!previous) {
     await updateConfigurationCatalogState(
@@ -365,30 +567,40 @@ export async function putConfigurationPromptPresetCatalogProjection(
       configurationPromptPresetCatalogStateId(next.kind),
       1,
     )
+    aggregateIds.push(configurationPromptPresetCatalogStateId(next.kind))
   } else if (previous.kind !== next.kind) {
     await updateConfigurationCatalogState(
       transaction,
       configurationPromptPresetCatalogStateId(previous.kind),
       -1,
     )
+    aggregateIds.push(configurationPromptPresetCatalogStateId(previous.kind))
     await updateConfigurationCatalogState(
       transaction,
       configurationPromptPresetCatalogStateId(next.kind),
       1,
     )
+    aggregateIds.push(configurationPromptPresetCatalogStateId(next.kind))
   } else if (!samePromptPresetCatalogViewProjection(previous, next)) {
     await updateConfigurationCatalogState(
       transaction,
       configurationPromptPresetCatalogStateId(next.kind),
       0,
     )
+    aggregateIds.push(configurationPromptPresetCatalogStateId(next.kind))
   }
+  return configurationCatalogProjectionMutationReceipt(
+    'configurationPromptPresetCatalogRows',
+    next.id,
+    'write',
+    aggregateIds,
+  )
 }
 
 export async function putConfigurationPromptPresetRecencyCatalogProjection(
   transaction: Transaction,
   preset: PromptPreset,
-): Promise<void> {
+): Promise<ConfigurationCatalogProjectionMutationReceipt> {
   const next = configurationPromptPresetCatalogProjectionRow(preset)
   const previous = await transaction
     .table<ConfigurationPromptPresetCatalogProjectionRow, PromptPresetId>(
@@ -396,22 +608,72 @@ export async function putConfigurationPromptPresetRecencyCatalogProjection(
     )
     .get(preset.id)
   if (!previous) throw new Error(`ConfigurationPromptPresetCatalogProjectionMissing:${preset.id}`)
+  return applyConfigurationPromptPresetRecencyCatalogProjectionRows(transaction, previous, next)
+}
+
+export function applyConfigurationPromptPresetRecencyCatalogProjectionTransition(
+  transaction: Transaction,
+  previous: PromptPreset,
+  next: PromptPreset,
+): Promise<ConfigurationCatalogProjectionMutationReceipt> {
+  return applyConfigurationPromptPresetRecencyCatalogProjectionRows(
+    transaction,
+    configurationPromptPresetCatalogProjectionRow(previous),
+    configurationPromptPresetCatalogProjectionRow(next),
+  )
+}
+
+async function applyConfigurationPromptPresetRecencyCatalogProjectionRows(
+  transaction: Transaction,
+  previous: ConfigurationPromptPresetCatalogProjectionRow,
+  next: ConfigurationPromptPresetCatalogProjectionRow,
+): Promise<ConfigurationCatalogProjectionMutationReceipt> {
   if (!samePromptPresetCatalogViewProjection(previous, next)) {
-    throw new Error(`ConfigurationPromptPresetRecencyProjectionChangedCatalog:${preset.id}`)
+    throw new Error(`ConfigurationPromptPresetRecencyProjectionChangedCatalog:${next.id}`)
   }
-  if (samePromptPresetProjection(previous, next)) return
+  if (samePromptPresetProjection(previous, next)) {
+    return configurationCatalogProjectionMutationReceipt(
+      'configurationPromptPresetCatalogRows',
+      next.id,
+      'none',
+    )
+  }
   await putPhysicalStorageRow(transaction, 'configurationPromptPresetCatalogRows', next, previous)
+  return configurationCatalogProjectionMutationReceipt(
+    'configurationPromptPresetCatalogRows',
+    next.id,
+    'write',
+  )
 }
 
 export async function deleteConfigurationPromptPresetCatalogProjection(
   transaction: Transaction,
   presetId: PromptPresetId,
-): Promise<void> {
+): Promise<ConfigurationCatalogProjectionMutationReceipt> {
   const previous = await transaction
     .table<ConfigurationPromptPresetCatalogProjectionRow, PromptPresetId>(
       'configurationPromptPresetCatalogRows',
     )
     .get(presetId)
+  return deleteConfigurationPromptPresetCatalogProjectionRow(transaction, presetId, previous)
+}
+
+export function applyConfigurationPromptPresetCatalogProjectionDeletion(
+  transaction: Transaction,
+  previous: PromptPreset,
+): Promise<ConfigurationCatalogProjectionMutationReceipt> {
+  return deleteConfigurationPromptPresetCatalogProjectionRow(
+    transaction,
+    previous.id,
+    configurationPromptPresetCatalogProjectionRow(previous),
+  )
+}
+
+async function deleteConfigurationPromptPresetCatalogProjectionRow(
+  transaction: Transaction,
+  presetId: PromptPresetId,
+  previous: ConfigurationPromptPresetCatalogProjectionRow | undefined,
+): Promise<ConfigurationCatalogProjectionMutationReceipt> {
   await deletePhysicalStorageRows(
     transaction,
     'configurationPromptPresetCatalogRows',
@@ -425,6 +687,12 @@ export async function deleteConfigurationPromptPresetCatalogProjection(
       -1,
     )
   }
+  return configurationCatalogProjectionMutationReceipt(
+    'configurationPromptPresetCatalogRows',
+    presetId,
+    previous ? 'delete' : 'none',
+    previous ? [configurationPromptPresetCatalogStateId(previous.kind)] : [],
+  )
 }
 
 function sameProfileProjection(
@@ -503,4 +771,18 @@ function samePromptPresetCatalogViewProjection(
   right: ConfigurationPromptPresetCatalogProjectionRow,
 ): boolean {
   return left.kind === right.kind && left.name === right.name && left.createdAt === right.createdAt
+}
+
+function configurationCatalogProjectionMutationReceipt(
+  projectionTable: ConfigurationCatalogProjectionMutationReceipt['projectionTable'],
+  projectionId: string,
+  projectionMutation: ConfigurationCatalogProjectionMutationReceipt['projectionMutation'],
+  aggregateIds: readonly string[] = [],
+): ConfigurationCatalogProjectionMutationReceipt {
+  return Object.freeze({
+    projectionTable,
+    projectionId,
+    projectionMutation,
+    aggregateIds: Object.freeze([...aggregateIds]),
+  })
 }

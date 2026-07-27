@@ -457,6 +457,9 @@ const BranchTreeView = Object.assign(
                   tipId: path.leaf?.id ?? null,
                 },
                 presentations: [],
+                forks: path
+                  .materializeNodes()
+                  .map((header) => forkForHeader(header, currentRef.current.headers)),
               },
               path,
             ),

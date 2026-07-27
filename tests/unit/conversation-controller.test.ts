@@ -281,6 +281,7 @@ class TestProjectionSource implements ConversationProjectionSource {
         pathHeaders: path.map((row) => row.header),
       },
       presentations,
+      forks: path.map((row) => this.forkFor(row.header.id)),
     }
   }
 
@@ -328,6 +329,7 @@ class TestProjectionSource implements ConversationProjectionSource {
             pathHeaders: [],
           },
           presentations: [],
+          forks: [],
         }),
       )
     }
@@ -353,6 +355,7 @@ class TestProjectionSource implements ConversationProjectionSource {
           pathHeaders: path.map((row) => row.header),
         },
         presentations: [terminal],
+        forks: path.map((row) => this.forkFor(row.header.id)),
       }),
     )
   }
@@ -966,6 +969,17 @@ describe('conversation controller', () => {
         pathHeaders: [importedRoot.header, importedTip.header],
       },
       presentations: [importedTip],
+      forks: [importedRoot, importedTip].map((row) => ({
+        parentId: row.header.parentId,
+        selectedMessageId: row.header.id,
+        slotVersion: row.header.nodeVersion + 1,
+        position: 0,
+        liveCount: 1,
+        previousMessageId: null,
+        nextMessageId: null,
+        firstMessageId: row.header.id,
+        lastMessageId: row.header.id,
+      })),
     }
     const operation = controller.claimOperation({
       chatId: importedChatId,

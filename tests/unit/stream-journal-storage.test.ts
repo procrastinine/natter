@@ -22,7 +22,7 @@ import {
   persistStreamEventV2,
 } from '../../src/store/persisted-stream-event'
 import type { StreamLeaseRow, StreamWriteFence } from '../../src/store/repository'
-import { streamLeaseHasWriteFence } from '../../src/store/repository'
+import { requireStreamLeaseRow, streamLeaseHasWriteFence } from '../../src/store/repository'
 import {
   awaitStorageCompactionDebtIdle,
   readStorageCompactionState,
@@ -304,10 +304,12 @@ describe('stream journal byte ownership', () => {
     const appended = await runTestStreamJournalTransaction(db, (tx) =>
       appendStreamJournalFrames(tx, canonicalTestStreamJournalBatch(frames), 1),
     )
-    expect(appended).toMatchObject({
+    expect(appended.lease).toMatchObject({
       journalMaxSeq: frames.at(-1)?.seq,
       journalStorageBytes,
     })
+    expect(appended.lookupFrameIds).toEqual([])
+    expect(appended.appendedFrameIds).toEqual(frames.map((frame) => frame.id))
     await awaitStorageCompactionDebtIdle()
     expect((await db.streamChunks.toArray()).map((row) => row.id)).toEqual(
       frames.map((frame) => frame.id),
@@ -318,7 +320,14 @@ describe('stream journal byte ownership', () => {
     const duplicate = await runTestStreamJournalTransaction(db, (tx) =>
       appendStreamJournalFrames(tx, canonicalTestStreamJournalBatch(frames), 1),
     )
-    expect(duplicate).toBeUndefined()
+    expect(duplicate.lease).toBeUndefined()
+    expect(duplicate).toMatchObject({
+      acceptedFrameIds: frames.map((frame) => frame.id),
+      appendedFrameIds: [],
+      lookupFrameIds: frames.map((frame) => frame.id),
+    })
+    expect(duplicate.receipt.dependencies).toEqual([])
+    expect(duplicate.receipt.physicalMutations).toEqual([])
     await awaitStorageCompactionDebtIdle()
     expect(await readStorageCompactionState(db)).toEqual(afterAppend)
 
@@ -347,9 +356,10 @@ describe('stream journal byte ownership', () => {
         kind: 'owned-metadata-committed',
         streamId: metadata.streamId,
         fence,
+        maxFrameRows: 64,
       }),
     )
-    expect(retired).toEqual({
+    expect(retired.result).toEqual({
       outcome: 'complete',
       done: true,
       deletedFrames: frames.length,
@@ -365,7 +375,101 @@ describe('stream journal byte ownership', () => {
     expect(await db.streamLeases.count()).toBe(0)
   })
 
-  it('retires more than one physical page without deleting the lease early', async () => {
+  it('loads only overlap and tail rows while replay appends only a contiguous suffix', async () => {
+    db = createDbForTests(`natter-stream-journal-lookup-${crypto.randomUUID()}`)
+    await db.open()
+    const lease = streamLease({ streamId: 'stream:lookup' })
+    const frames = await encodeTestStreamJournalEntries({
+      streamId: lease.streamId,
+      chatId: lease.chatId,
+      messageId: lease.messageId,
+      fence: leaseFence(lease),
+      entries: Array.from({ length: 5 }, (_, index) => ({
+        createdAt: index + 1,
+        event: { lane: 'text', text: `${index}` },
+      })),
+    })
+    await db.streamLeases.add(lease)
+    const firstFrame = frames[0]
+    const thirdFrame = frames[2]
+    if (!firstFrame || !thirdFrame) throw new Error('ExpectedFiveStreamJournalFrames')
+
+    expect(() => canonicalTestStreamJournalBatch([firstFrame, firstFrame])).toThrow(
+      'StreamJournalAppendBatchOrderInvalid',
+    )
+    const first = await runTestStreamJournalTransaction(db, (tx) =>
+      appendStreamJournalFrames(tx, canonicalTestStreamJournalBatch(frames.slice(0, 1)), 1),
+    )
+    expect(first.lookupFrameIds).toEqual([])
+
+    const fresh = await runTestStreamJournalTransaction(db, (tx) =>
+      appendStreamJournalFrames(tx, canonicalTestStreamJournalBatch(frames.slice(1, 3)), 2),
+    )
+    expect(fresh.lookupFrameIds).toEqual([firstFrame.id])
+    expect(fresh.appendedFrameIds).toEqual(frames.slice(1, 3).map((frame) => frame.id))
+
+    const mixed = await runTestStreamJournalTransaction(db, (tx) =>
+      appendStreamJournalFrames(tx, canonicalTestStreamJournalBatch(frames.slice(2)), 3),
+    )
+    expect(mixed.lookupFrameIds).toEqual([thirdFrame.id])
+    expect(mixed.appendedFrameIds).toEqual(frames.slice(3).map((frame) => frame.id))
+
+    const replay = await runTestStreamJournalTransaction(db, (tx) =>
+      appendStreamJournalFrames(tx, canonicalTestStreamJournalBatch(frames.slice(2)), 4),
+    )
+    expect(replay.lease).toBeUndefined()
+    expect(replay.lookupFrameIds).toEqual(frames.slice(2).map((frame) => frame.id))
+    expect(replay.appendedFrameIds).toEqual([])
+    expect((await db.streamChunks.toArray()).map((frame) => frame.id)).toEqual(
+      frames.map((frame) => frame.id),
+    )
+  })
+
+  it('does not let append replay or clock rollback regress lease freshness', async () => {
+    db = createDbForTests(`natter-stream-journal-freshness-${crypto.randomUUID()}`)
+    await db.open()
+    const lease = streamLease({ streamId: 'stream:freshness' })
+    const frames = await encodeTestStreamJournalEntries({
+      streamId: lease.streamId,
+      chatId: lease.chatId,
+      messageId: lease.messageId,
+      fence: leaseFence(lease),
+      entries: [
+        { createdAt: 1, event: { lane: 'text', text: 'first' } },
+        { createdAt: 2, event: { lane: 'text', text: 'second' } },
+      ],
+    })
+    await db.streamLeases.add(lease)
+    const secondFrame = frames[1]
+    if (!secondFrame) throw new Error('ExpectedTwoStreamJournalFrames')
+    const first = await runTestStreamJournalTransaction(db, (tx) =>
+      appendStreamJournalFrames(tx, canonicalTestStreamJournalBatch(frames.slice(0, 1)), 1_000),
+    )
+    expect(first.lease).toMatchObject({ heartbeatAt: 1_000, revision: lease.revision })
+
+    const renewed = requireStreamLeaseRow({
+      ...(await db.streamLeases.get(lease.streamId)),
+      heartbeatAt: 2_000,
+      revision: lease.revision + 1,
+    })
+    await db.streamLeases.put(renewed)
+    const replay = await runTestStreamJournalTransaction(db, (tx) =>
+      appendStreamJournalFrames(tx, canonicalTestStreamJournalBatch(frames.slice(0, 1)), 1_000),
+    )
+    expect(replay.lease).toBeUndefined()
+    expect(await db.streamLeases.get(lease.streamId)).toEqual(renewed)
+
+    const clockRollback = await runTestStreamJournalTransaction(db, (tx) =>
+      appendStreamJournalFrames(tx, canonicalTestStreamJournalBatch(frames.slice(1)), 1_500),
+    )
+    expect(clockRollback.lease).toMatchObject({
+      heartbeatAt: renewed.heartbeatAt,
+      revision: renewed.revision,
+      journalMaxSeq: secondFrame.seq,
+    })
+  })
+
+  it('retires by the requested page size without deleting the lease early', async () => {
     db = createDbForTests(`natter-stream-journal-pages-${crypto.randomUUID()}`)
     await db.open()
     const lease = streamLease({ streamId: 'paged-stream' })
@@ -375,7 +479,7 @@ describe('stream journal byte ownership', () => {
       chatId: lease.chatId,
       messageId: lease.messageId,
       fence,
-      entries: Array.from({ length: 130 }, (_, index) => ({
+      entries: Array.from({ length: 129 }, (_, index) => ({
         createdAt: index + 1,
         event: { lane: 'text', text: `${index}` },
       })),
@@ -393,15 +497,25 @@ describe('stream journal byte ownership', () => {
           kind: 'owned-metadata-committed',
           streamId: metadata.streamId,
           fence,
+          maxFrameRows: 32,
         }),
       )
-      pages.push(page.deletedFrames)
-      obsoleteBytes += page.obsoleteBytes
-      if (page.done) break
+      expect(page.kind).toBe('single-stream')
+      pages.push(page.result.deletedFrames)
+      obsoleteBytes += page.result.obsoleteBytes
+      if (page.kind === 'single-stream') {
+        expect(
+          page.receipt.physicalReads.find((read) => read.tableName === 'streamChunks')?.rowCount,
+        ).toBeLessThanOrEqual(33)
+        expect(
+          page.receipt.physicalMutations.find((mutation) => mutation.operation === 'delete-group'),
+        ).toMatchObject({ affectedRows: page.result.deletedFrames })
+      }
+      if (page.result.done) break
       expect(await db.streamLeases.get(metadata.streamId)).toEqual(metadata)
     }
 
-    expect(pages).toEqual([64, 64, 2])
+    expect(pages).toEqual([32, 32, 32, 32, 1])
     expect(obsoleteBytes).toBe(frameStorageBytes(frames) + estimateStoredValueBytes(metadata))
     await awaitStorageCompactionDebtIdle()
     const after = await readStorageCompactionState(db)
@@ -438,6 +552,7 @@ describe('stream journal byte ownership', () => {
           kind: 'owned-metadata-committed',
           streamId: lease.streamId,
           fence: leaseFence(lease),
+          maxFrameRows: 64,
         }),
       ),
     ).rejects.toThrow(`StreamJournalAppendInvariantError:${lease.streamId}:retirement-identity`)

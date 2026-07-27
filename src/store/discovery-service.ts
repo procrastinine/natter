@@ -1,6 +1,5 @@
 import { fetchEndpoints, fetchModels, type ModelsQueryString } from '../api/models'
 import { fetchPrivacyScrape, readCachedPrivacyPayload } from '../api/privacy-scrape'
-import { normalizeModelsResponse } from '../api/providers'
 import { modelsCacheKey } from '../core/cache-keys'
 import { connectionHttpProfile } from '../core/connection-dispatch-proof'
 import type { CorsProxyConfig } from '../core/cors-proxy'
@@ -10,6 +9,7 @@ import type {
   ModelsQuery,
   ProfileId,
 } from '../core/types'
+import { requestConfigurationModelResolution } from './configuration-model-resolution-capability'
 import type { CachedEndpointsRow, CachedModelsRow, CachedPrivacyPolicyRow } from './db-rows'
 import {
   EMPTY_PRIVACY_POLICY_RETRY_MS,
@@ -97,6 +97,7 @@ async function resolveModelsDiscovery(
         revision,
       )
       if (cacheSatisfiesRefresh(cached?.fetchedAt, MODELS_TTL_MS, options)) {
+        requestConfigurationModelResolution()
         return cached as CachedModelsRow
       }
       let payload: unknown
@@ -122,11 +123,11 @@ async function resolveModelsDiscovery(
         fetchedAt: Date.now(),
         payload,
       }
-      await publishDiscoveryRow(authority, target.revision, {
+      const publication = await publishDiscoveryRow(authority, target.revision, {
         kind: 'discovery.models.put',
         row,
-        modelIds: normalizeModelsResponse(payload).map((model) => model.id),
       })
+      if (publication && !publication.cached) requestConfigurationModelResolution(row)
       return row
     },
   )
@@ -302,18 +303,19 @@ async function publishDiscoveryRow(
   authority: WorkspaceWriteAuthority,
   revision: ConfigurationRequestRevision,
   command:
-    | { kind: 'discovery.models.put'; row: CachedModelsRow; modelIds: readonly string[] }
+    | { kind: 'discovery.models.put'; row: CachedModelsRow }
     | { kind: 'discovery.endpoints.put'; row: CachedEndpointsRow }
     | { kind: 'discovery.privacy.put'; row: CachedPrivacyPolicyRow },
   expectedCurrent?: CachedPrivacyPolicyRow | null,
-): Promise<void> {
+): Promise<import('./workspace-protocol').DiscoveryModelsPutResult | undefined> {
   switch (command.kind) {
     case 'discovery.models.put':
-      await getWorkspaceRepository().execute(authority, {
-        ...command,
-        guard: { expectedProfileRevision: revision },
-      })
-      return
+      return getWorkspaceRepository()
+        .execute(authority, {
+          ...command,
+          guard: { expectedProfileRevision: revision },
+        })
+        .then((envelope) => envelope.value)
     case 'discovery.endpoints.put':
       await getWorkspaceRepository().execute(authority, {
         ...command,

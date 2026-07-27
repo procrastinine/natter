@@ -12,6 +12,10 @@ import type {
   AttachmentCatalogProcessingSummary,
   AttachmentCatalogRow,
 } from './repository'
+import {
+  type SemanticOperationReceiptFragment,
+  semanticOperationReceiptFragment,
+} from './semantic-operation-capability'
 
 export const ATTACHMENT_CATALOG_MUTATION_TRANSACTION_CAPABILITY = physicalStorageTables(
   'attachments',
@@ -48,6 +52,16 @@ export interface AttachmentCatalogReferenceDelta {
   readonly nextHeader: AttachmentHeaderRow
 }
 
+export interface AttachmentCatalogReferenceMutationReceipt {
+  readonly rowReadIds: readonly AttachmentId[]
+  readonly rowWriteIds: readonly AttachmentId[]
+  readonly aggregateRead: boolean
+  readonly aggregateWrite: boolean
+  readonly fragment: SemanticOperationReceiptFragment<
+    'attachmentCatalogRows' | 'attachmentCatalogAggregate'
+  >
+}
+
 export const ATTACHMENT_CATALOG_AGGREGATE_ID = 'workspace'
 
 export interface AttachmentCatalogAggregateRow extends AttachmentCatalogAggregate {
@@ -78,7 +92,7 @@ export async function putAttachmentCatalogProjectionFromHeader(
   tx: Transaction,
   header: AttachmentHeaderRow,
   previousHeader: AttachmentHeaderRow | undefined,
-): Promise<void> {
+): Promise<AttachmentCatalogReferenceMutationReceipt> {
   const table = tx.table<AttachmentCatalogProjectionRow, AttachmentId>('attachmentCatalogRows')
   const previous = await table.get(header.id)
   if ((previousHeader === undefined) !== (previous === undefined)) {
@@ -93,25 +107,43 @@ export async function putAttachmentCatalogProjectionFromHeader(
   }
   const next = attachmentCatalogProjectionRow(header, summary)
   await putPhysicalStorageRow(tx, 'attachmentCatalogRows', next, previous)
-  await applyAttachmentCatalogAggregateDeltas(tx, [{ previous, next }])
+  const aggregate = await applyAttachmentCatalogAggregateDeltas(tx, [{ previous, next }])
+  return attachmentCatalogReferenceMutationReceipt(
+    [header.id],
+    [header.id],
+    aggregate.read,
+    aggregate.written,
+    'get',
+  )
 }
 
 export async function deleteAttachmentCatalogProjection(
   tx: Transaction,
   attachmentId: AttachmentId,
-): Promise<void> {
+  options?: { readonly previous: AttachmentCatalogProjectionRow },
+): Promise<AttachmentCatalogReferenceMutationReceipt> {
   const table = tx.table<AttachmentCatalogProjectionRow, AttachmentId>('attachmentCatalogRows')
-  const previous = await table.get(attachmentId)
+  const previous = options?.previous ?? (await table.get(attachmentId))
   if (!previous) throw new Error(`AttachmentCatalogRowMissing:${attachmentId}`)
   await deletePhysicalStorageRows(tx, 'attachmentCatalogRows', [attachmentId], [previous])
-  await applyAttachmentCatalogAggregateDeltas(tx, [{ previous, next: undefined }])
+  const aggregate = await applyAttachmentCatalogAggregateDeltas(tx, [{ previous, next: undefined }])
+  return attachmentCatalogReferenceMutationReceipt(
+    options ? [] : [attachmentId],
+    [attachmentId],
+    aggregate.read,
+    aggregate.written,
+    'get',
+    'delete',
+  )
 }
 
 export async function applyAttachmentCatalogReferenceDeltas(
   tx: Transaction,
   deltas: readonly AttachmentCatalogReferenceDelta[],
-): Promise<void> {
-  if (deltas.length === 0) return
+): Promise<AttachmentCatalogReferenceMutationReceipt> {
+  if (deltas.length === 0) {
+    return attachmentCatalogReferenceMutationReceipt([], [], false, false)
+  }
   const table = tx.table<AttachmentCatalogProjectionRow, AttachmentId>('attachmentCatalogRows')
   const previousRows = await table.bulkGet(deltas.map((delta) => delta.attachmentId))
   const nextRows: AttachmentCatalogProjectionRow[] = []
@@ -148,7 +180,13 @@ export async function applyAttachmentCatalogReferenceDeltas(
     nextRows,
     previousRows.filter((row): row is AttachmentCatalogProjectionRow => row !== undefined),
   )
-  await applyAttachmentCatalogAggregateDeltas(tx, changes)
+  const aggregate = await applyAttachmentCatalogAggregateDeltas(tx, changes)
+  return attachmentCatalogReferenceMutationReceipt(
+    deltas.map(({ attachmentId }) => attachmentId),
+    nextRows.map(({ id }) => id),
+    aggregate.read,
+    aggregate.written,
+  )
 }
 
 async function applyAttachmentCatalogAggregateDeltas(
@@ -157,8 +195,8 @@ async function applyAttachmentCatalogAggregateDeltas(
     previous: AttachmentCatalogProjectionRow | undefined
     next: AttachmentCatalogProjectionRow | undefined
   }[],
-): Promise<void> {
-  if (changes.length === 0) return
+): Promise<{ readonly read: boolean; readonly written: boolean }> {
+  if (changes.length === 0) return { read: false, written: false }
   const table = tx.table<AttachmentCatalogAggregateRow, string>('attachmentCatalogAggregate')
   const previous = await table.get(ATTACHMENT_CATALOG_AGGREGATE_ID)
   const current = previous ?? emptyAttachmentCatalogAggregateRow()
@@ -168,7 +206,7 @@ async function applyAttachmentCatalogAggregateDeltas(
   }
   if (current.integrityPending) {
     await putPhysicalStorageRow(tx, 'attachmentCatalogAggregate', updated, previous)
-    return
+    return { read: true, written: true }
   }
   for (const { previous, next } of changes) {
     const before = previous ? attachmentCatalogContribution(previous) : null
@@ -182,6 +220,67 @@ async function applyAttachmentCatalogAggregateDeltas(
     }
   }
   await putPhysicalStorageRow(tx, 'attachmentCatalogAggregate', updated, previous)
+  return { read: true, written: true }
+}
+
+function attachmentCatalogReferenceMutationReceipt(
+  rowReadIds: readonly AttachmentId[],
+  rowWriteIds: readonly AttachmentId[],
+  aggregateRead: boolean,
+  aggregateWrite: boolean,
+  rowReadOperation: 'get' | 'get-many' = 'get-many',
+  rowMutationOperation: 'write' | 'delete' = 'write',
+): AttachmentCatalogReferenceMutationReceipt {
+  return Object.freeze({
+    rowReadIds: Object.freeze([...rowReadIds]),
+    rowWriteIds: Object.freeze([...rowWriteIds]),
+    aggregateRead,
+    aggregateWrite,
+    fragment: semanticOperationReceiptFragment({
+      dependencies:
+        rowWriteIds.length > 0 ? [{ kind: 'attachment', attachmentIds: [...rowWriteIds] }] : [],
+      physicalMutations: [
+        ...rowWriteIds.map((key) => ({
+          tableName: 'attachmentCatalogRows' as const,
+          operation: rowMutationOperation,
+          key,
+        })),
+        ...(aggregateWrite
+          ? [
+              {
+                tableName: 'attachmentCatalogAggregate' as const,
+                operation: 'write' as const,
+                key: ATTACHMENT_CATALOG_AGGREGATE_ID,
+              },
+            ]
+          : []),
+      ],
+      physicalReads: [
+        ...(rowReadIds.length > 0
+          ? [
+              {
+                tableName: 'attachmentCatalogRows' as const,
+                indexKind: 'primary' as const,
+                operation: rowReadOperation,
+                requestCount: 1,
+                rowCount: rowReadIds.length,
+              },
+            ]
+          : []),
+        ...(aggregateRead
+          ? [
+              {
+                tableName: 'attachmentCatalogAggregate' as const,
+                indexKind: 'primary' as const,
+                operation: 'get' as const,
+                requestCount: 1,
+                rowCount: 1,
+              },
+            ]
+          : []),
+      ],
+    }),
+  })
 }
 
 function nextAttachmentCatalogProjectionRevision(value: number): number {

@@ -217,10 +217,12 @@ export class BrowserWorkspaceActivationOutcomeUncertainError extends AggregateEr
 }
 
 export async function readBrowserWorkspaceDatabaseManifest(): Promise<BrowserWorkspaceDatabaseManifest> {
+  const stored = await withControlDb((db) => db.manifests.get(CONTROL_MANIFEST_ID))
+  if (stored !== undefined) return requireManifest(stored)
   return withControlDb((db) =>
     db.transaction('rw', db.manifests, async () => {
-      const stored = await db.manifests.get(CONTROL_MANIFEST_ID)
-      if (stored !== undefined) return requireManifest(stored)
+      const current = await db.manifests.get(CONTROL_MANIFEST_ID)
+      if (current !== undefined) return requireManifest(current)
       const initial = initialManifest()
       await db.manifests.put(initial)
       return initial

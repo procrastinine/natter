@@ -27,7 +27,7 @@ describe('legacy test architecture migration ledger', () => {
     expect(cohort).toMatchObject({
       schemaVersion: 1,
       assignment: {
-        waveId: 'wave-a-cut-6-runnable-snapshot',
+        waveId: 'wave-b-cut-1-semantic-operation-capabilities',
         sourceObligation: 'adapt-preserved-tests-to-current-contract',
       },
       candidateId: 'candidate-test',

@@ -132,8 +132,8 @@ async function parseWorkspaceBackupEnvelope(value: unknown): Promise<WorkspaceBa
   return result
 }
 
-export function exportChat(chatId: ChatId): Promise<ChatExportEnvelope> {
-  return runWorkspaceRead(
+export async function exportChat(chatId: ChatId): Promise<ChatExportEnvelope> {
+  const value = await runWorkspaceRead(
     'import-export',
     async (permit) =>
       (
@@ -143,6 +143,9 @@ export function exportChat(chatId: ChatId): Promise<ChatExportEnvelope> {
         })
       ).value,
   )
+  const envelope = migrateNatterExportEnvelope(value)
+  assertEnvelopeKind(envelope, 'chat')
+  return envelope
 }
 
 export async function importChat(
@@ -234,8 +237,8 @@ export function importConnectionProfile(
   })
 }
 
-export function exportWorkspaceBackup(): Promise<WorkspaceBackupEnvelope> {
-  return runWorkspaceRead(
+export async function exportWorkspaceBackup(): Promise<WorkspaceBackupEnvelope> {
+  const value = await runWorkspaceRead(
     'import-export',
     async (permit) =>
       (
@@ -244,6 +247,9 @@ export function exportWorkspaceBackup(): Promise<WorkspaceBackupEnvelope> {
         })
       ).value,
   )
+  const envelope = migrateNatterExportEnvelope(value)
+  assertEnvelopeKind(envelope, 'workspace-backup')
+  return envelope
 }
 
 export async function exportWorkspaceBackupDocument<T>(

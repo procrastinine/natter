@@ -256,6 +256,7 @@ async function projectRecoveredGeneration(
   return projectAttemptTerminal({
     kind: 'generation',
     streamId: lease.streamId,
+    chatId: lease.chatId,
     messageId: lease.messageId,
     fence: streamWriteFenceForLease(lease),
     accumulator: replayed.accumulator,
@@ -317,6 +318,7 @@ async function projectRecoveredContinuation(
   return projectAttemptTerminal({
     kind: 'continuation',
     streamId: lease.streamId,
+    chatId: lease.chatId,
     messageId: lease.messageId,
     fence: streamWriteFenceForLease(lease),
     accumulator: replayed.accumulator,

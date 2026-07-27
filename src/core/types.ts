@@ -1594,7 +1594,7 @@ export interface KeyRecord {
 export type MutationScope =
   | { kind: 'chat-meta'; chatId: ChatId }
   | { kind: 'chat-topology'; chatId: ChatId }
-  | { kind: 'message'; messageId: MessageId }
+  | { kind: 'message'; messageId: MessageId; access?: 'presentation' }
   | { kind: 'children'; chatId: ChatId; parentId: MessageId | null }
   | { kind: 'draft'; chatId: ChatId }
   | { kind: 'attachment'; attachmentId: AttachmentId }

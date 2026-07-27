@@ -9,17 +9,17 @@ import {
   type StreamWriteFence,
   streamLeaseHasWriteFence,
   type WorkspaceFence,
-  type WriterActiveStreamLeaseRow,
 } from './repository'
 import { STREAM_LEASE_HEARTBEAT_MS } from './stream-lease-policy'
 import { subscribeWorkspaceEffects, WORKSPACE_EFFECT_RECOVERY_OWNED } from './workspace-effect-hub'
-import type {
-  AttemptSealTerminalInput,
-  GenerationPostCommitMetadataResult,
-  StreamFinishCleanupResult,
-  WorkspaceDeltaFact,
-  WorkspaceLocalCommitApplication,
-  WorkspaceRepository,
+import {
+  type AttemptSealTerminalInput,
+  type GenerationPostCommitMetadataResult,
+  generationPostCommitMetadataResourceProof,
+  type StreamFinishCleanupResult,
+  type WorkspaceDeltaFact,
+  type WorkspaceLocalCommitApplication,
+  type WorkspaceRepository,
 } from './workspace-protocol'
 import { getWorkspaceRepository } from './workspace-repository'
 import {
@@ -110,7 +110,7 @@ export interface StreamLeaseHandle {
   readonly streamId: string
   readonly fence: StreamWriteFence
   readonly lease: FencedStreamLeaseRow
-  adoptTargetCommit(lease: WriterActiveStreamLeaseRow): Promise<StreamWriteFence>
+  adoptTargetCommit(lease: FencedStreamLeaseRow): Promise<StreamWriteFence>
   noteSelectedKey(selectedKeyId: KeyId): Promise<void>
   sealTerminal(
     input: Omit<AttemptSealTerminalInput, 'streamId' | 'fence'>,
@@ -463,8 +463,7 @@ async function adoptPreparedStreamLeaseInternal(
       throw error
     }
     if (
-      !observed ||
-      observed.custody !== 'writer' ||
+      observed?.custody !== 'writer' ||
       observed.streamId !== lease.streamId ||
       observed.chatId !== lease.chatId ||
       observed.messageId !== lease.messageId ||
@@ -592,7 +591,6 @@ export function streamWriteFenceForLease(lease: FencedStreamLeaseRow): StreamWri
 export async function finishStreamCleanup(input: {
   readonly repository: WorkspaceRepository
   readonly permit: WorkspaceWritePermit
-  readonly chatId: ChatId
   readonly streamId: string
   readonly fence: StreamWriteFence
   readonly application: WorkspaceLocalCommitApplication<StreamFinishCleanupResult>
@@ -604,7 +602,6 @@ export async function finishStreamCleanup(input: {
       input.permit,
       {
         kind: 'stream.finish-cleanup',
-        chatId: input.chatId,
         streamId: input.streamId,
         fence: input.fence,
       },
@@ -628,7 +625,7 @@ function leaseHandle(writer: ActiveLeaseWriter): StreamLeaseHandle {
     get lease() {
       return writer.lease
     },
-    adoptTargetCommit: (lease: WriterActiveStreamLeaseRow) =>
+    adoptTargetCommit: (lease: FencedStreamLeaseRow) =>
       enqueueWriterOperation(writer, () => {
         assertWriterEpochCurrent(writer)
         assertSameOwnedLease(writer, lease)
@@ -674,6 +671,7 @@ function leaseHandle(writer: ActiveLeaseWriter): StreamLeaseHandle {
             input: {
               streamId: writer.input.streamId,
               fence: writerFence(writer),
+              resourceProof: generationPostCommitMetadataResourceProof(writer.lease),
             },
           },
           {
@@ -763,6 +761,7 @@ async function handoffOwnedLease(
       input: {
         streamId: writer.input.streamId,
         fence: writerFence(writer),
+        handoffId: newId(),
         handedOffAt: Date.now(),
         reason,
       },
@@ -832,6 +831,7 @@ function enqueueLeaseWrite(writer: ActiveLeaseWriter): Promise<void> {
       heartbeat: {
         streamId: writer.lease.streamId,
         fence: streamWriteFenceForLease(writer.lease),
+        expectedRevision: writer.lease.revision,
         heartbeatAt: Date.now(),
       },
     })
@@ -1030,7 +1030,6 @@ function retireLeaseWriter(
           const result = await finishStreamCleanup({
             repository: writer.repo,
             permit: writer.runtimePermit,
-            chatId: writer.input.chatId,
             streamId: writer.input.streamId,
             fence: writerFence(writer),
             application: writer.applications.cleanup,

@@ -1340,6 +1340,7 @@ function resourcePhase(id: string): TestResourcePhase {
     return 'inbound'
   }
   if (
+    id === 'configuration-model-resolution' ||
     id === 'stream-recovery' ||
     id === 'generated-output-localization' ||
     id === 'storage-maintenance' ||
@@ -1364,6 +1365,7 @@ function isCoreResourcePhase(phase: TestResourcePhase): boolean {
 function isBackgroundResourceId(id: string): boolean {
   return (
     id === 'attempt-workspace' ||
+    id === 'configuration-model-resolution' ||
     id === 'stream-recovery' ||
     id === 'generated-output-localization' ||
     id === 'storage-maintenance'

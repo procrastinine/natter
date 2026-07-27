@@ -1,6 +1,7 @@
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { join, relative, sep } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { createChatRow } from '../../src/core/chat-metadata'
 import { __resetBroadcastForTests, subscribeWorkspaceChanges } from '../../src/store/broadcast'
 import {
   __resetWorkspaceEffectHubForTests,
@@ -124,6 +125,55 @@ describe('workspace local commit delivery', () => {
     unsubscribe()
   })
 
+  it('accepts a chat receipt without fabricating an unchanged sidebar fact', async () => {
+    const commit = envelope({
+      receipt: {
+        chats: [createChatRow({ id: 'chat-a', now: 1 })],
+        constructions: [],
+        messageRevisions: [],
+        childSlots: [],
+      },
+    })
+    __setWorkspaceRepositoryForTests(fakeRepository(commit))
+    const diagnostic = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const effect = vi.fn()
+    const unsubscribe = subscribeWorkspaceEffects({
+      owner: 'chat-receipt-test',
+      replacements: false,
+      impactKinds: ['chat'],
+      apply: effect,
+      recover: () => WORKSPACE_EFFECT_RECOVERY_OWNED,
+    })
+
+    await expect(getWorkspaceRepository().execute(AUTHORITY, command())).resolves.toBe(commit)
+
+    expect(diagnostic).not.toHaveBeenCalled()
+    expect(effect).toHaveBeenCalledOnce()
+    expect(effect.mock.calls[0]?.[0]).toMatchObject({
+      kind: 'changed',
+      cause: 'commit',
+    })
+    unsubscribe()
+  })
+
+  it('rejects a sidebar fact without its final chat receipt', async () => {
+    const commit = envelope({
+      delta: {
+        facts: [{ kind: 'sidebar-row-changed', chatId: 'chat-a' }],
+        invalidations: [{ kind: 'sidebar', chatIds: ['chat-a'] }],
+      },
+    })
+    __setWorkspaceRepositoryForTests(fakeRepository(commit))
+    const diagnostic = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    await expect(getWorkspaceRepository().execute(AUTHORITY, command())).resolves.toBe(commit)
+
+    expect(diagnostic).toHaveBeenCalledWith(
+      'Workspace local commit projection failed',
+      expect.objectContaining({ owner: 'evidence', commandKind: 'chat.set-manual-title' }),
+    )
+  })
+
   it('routes a terminal target fact and its exact body dependency to separate owners', async () => {
     const commit = envelope({
       delta: {
@@ -203,6 +253,7 @@ describe('workspace local commit delivery', () => {
     await getWorkspaceRepository().execute(AUTHORITY, {
       kind: 'stream.append-journal-frames',
       frames: [],
+      observedAt: 0,
     })
 
     expect(exact).not.toHaveBeenCalled()
@@ -400,6 +451,7 @@ function envelope(
     readonly value?: unknown
     readonly effectScope?: CommitEnvelope<unknown>['effectScope']
     readonly delta?: CommitEnvelope<unknown>['delta']
+    readonly receipt?: CommitEnvelope<unknown>['receipt']
   } = {},
 ): CommitEnvelope<unknown> {
   return {
@@ -408,7 +460,7 @@ function envelope(
     commitId: 'commit-a',
     effectScope: input.effectScope ?? 'workspace',
     value: input.value,
-    receipt: {
+    receipt: input.receipt ?? {
       chats: [],
       constructions: [],
       messageRevisions: [],

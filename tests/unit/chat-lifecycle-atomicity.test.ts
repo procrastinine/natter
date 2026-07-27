@@ -111,6 +111,47 @@ function orphanChunks(chatId: string) {
 }
 
 describe('authoritative temporary chat lifecycle', () => {
+  it('materializes one temporary chat with its maintenance dependency in the same commit', async () => {
+    const commit = await execute({
+      kind: 'chat.materialize-temporary',
+      input: {
+        chatId: 'temporary-materialized',
+        settings: cloneDefaultChatSettings(),
+        now: 100,
+      },
+    })
+
+    expect(commit.value.destination.chat.id).toBe('temporary-materialized')
+    expect(commit.receipt.constructions).toHaveLength(1)
+    expect(commit.delta.invalidations).toContainEqual({
+      kind: 'storage-maintenance',
+      tasks: ['prune-empty-drafts'],
+    })
+
+    const linkedSettings = {
+      ...cloneDefaultChatSettings(),
+      profileId: 'profile-linked',
+      systemPromptPresetId: 'system-linked',
+      appendPromptPresetId: 'append-linked',
+      continueSystemPromptPresetId: 'continue-system-linked',
+      continueUserPromptPresetId: 'continue-user-linked',
+      defaultPrefillPresetId: 'prefill-linked',
+      textTemplate: 'template-linked',
+    }
+    const linkedCommit = await execute({
+      kind: 'chat.materialize-temporary',
+      input: {
+        chatId: 'temporary-materialized-linked',
+        settings: linkedSettings,
+        presetId: 'preset-linked',
+        now: 101,
+      },
+    })
+
+    expect(linkedCommit.value.destination.chat.id).toBe('temporary-materialized-linked')
+    expect(linkedCommit.receipt.constructions).toHaveLength(1)
+  })
+
   it('keeps permanent and non-empty temporary chats during cleanup', async () => {
     const permanent = await seedChat({
       id: 'permanent-empty',

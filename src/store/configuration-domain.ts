@@ -12,7 +12,10 @@ import {
   CORS_PROXY_URL_KEY,
   TOKEN_CALIBRATION_MODE_KEY,
 } from '../core/global-settings'
-import { forceEquivalentModelIdForConnection } from '../core/model-selection'
+import {
+  forceEquivalentModelIdForConnection,
+  resolveModelIdFromCatalog,
+} from '../core/model-selection'
 import { defaultApiForProfile, withProfileApiDefaults } from '../core/provider-defaults'
 import { RENDERING_PREFERENCES_KEY } from '../core/rendering-preferences'
 import {
@@ -181,6 +184,18 @@ export interface ConfigurationApplication {
     lastUsedAt?: number
     now?: number
   }): Promise<ConfigurationDomainResult<'chat-preset.create-and-link'>>
+  createChatPreset(input: {
+    presetId?: PresetId
+    name: string
+    profileId: ProfileId
+    settings: ChatSettings
+    lastUsedAt?: number
+    now?: number
+  }): Promise<ConfigurationDomainResult<'chat-preset.create'>>
+  duplicateChatPreset(
+    sourceId: PresetId,
+    options?: { copyId?: PresetId; name?: string; now?: number },
+  ): Promise<ConfigurationDomainResult<'chat-preset.duplicate'>>
   applyChatPreset(chatId: ChatId, presetId: PresetId, now?: number): Promise<boolean>
   saveChatPreset(input: {
     presetId: PresetId
@@ -246,6 +261,7 @@ export interface ConfigurationApplication {
   ): Promise<ConfigurationDomainResult<'prompt-preset.overwrite-and-pin'>>
   createAndPinPromptPreset(input: {
     chatId: ChatId
+    presetId?: PromptPresetId
     kind: PromptPresetKind
     name: string
     text: string
@@ -423,8 +439,10 @@ export function createConfigurationApplication(
       return result.kind === 'chat-updated' && result.changed
     },
     async switchChatProfile(input) {
-      for (;;) {
-        if (input.isCurrent && !input.isCurrent()) return { kind: 'configuration-noop' }
+      for (const canRebase of PROFILE_SWITCH_PLAN_ATTEMPTS) {
+        if (input.isCurrent && !input.isCurrent()) {
+          return { kind: 'configuration-noop' } as const
+        }
         const plan = await dependencies.loadProfileSwitchPlan(input.chatId, input.profileId)
         if (!plan) {
           throw new ConfigurationDomainError({
@@ -433,12 +451,17 @@ export function createConfigurationApplication(
             id: input.chatId,
           })
         }
-        if (input.isCurrent && !input.isCurrent()) return { kind: 'configuration-noop' }
+        if (input.isCurrent && !input.isCurrent()) {
+          return { kind: 'configuration-noop' } as const
+        }
         const model = profileSwitchModel(plan)
         const command: ConfigurationChatSwitchCommand = {
           kind: 'chat.switch-profile',
           chatId: input.chatId,
           profileId: input.profileId,
+          requestKeyId: plan.requestKeyId,
+          previousProfileId: plan.chat.settings.profileId,
+          previousModelResolutionTarget: plan.chat.modelResolution?.target ?? null,
           target: plan.target,
           api: defaultApiForProfile(plan.profile),
           model,
@@ -446,20 +469,25 @@ export function createConfigurationApplication(
           now: input.now ?? Date.now(),
         }
         const pending = stagePendingConfigurationCommand(command, dependencies.pendingConfiguration)
-        const result = await dependencies.port.execute(command)
-        if (
-          result.kind === 'conflict' ||
-          (result.kind === 'invalid' && result.reason === 'model-resolution-target-mismatch')
-        ) {
-          acknowledgePendingConfigurationCommand(pending, result, dependencies.pendingConfiguration)
-          continue
+        let result: ConfigurationDomainResult<'chat.switch-profile'>
+        try {
+          result = await dependencies.port.execute(command)
+        } catch (error) {
+          rejectPendingConfigurationCommand(pending, dependencies.pendingConfiguration)
+          throw error
         }
-        if (result.kind === 'missing' || result.kind === 'invalid') {
+        if (
+          result.kind === 'missing' ||
+          (result.kind === 'invalid' && result.reason !== 'model-resolution-target-mismatch')
+        ) {
+          rejectPendingConfigurationCommand(pending, dependencies.pendingConfiguration)
           throw new ConfigurationDomainError(result)
         }
         acknowledgePendingConfigurationCommand(pending, result, dependencies.pendingConfiguration)
+        if (canRebase && profileSwitchNeedsFreshPlan(result)) continue
         return result
       }
+      throw new Error('ProfileSwitchAttemptSequenceExhausted')
     },
     createAndLinkChatPreset(input) {
       const now = input.now ?? Date.now()
@@ -474,6 +502,29 @@ export function createConfigurationApplication(
           ...(input.lastUsedAt === undefined ? {} : { lastUsedAt: input.lastUsedAt }),
         },
         now,
+      })
+    },
+    createChatPreset(input) {
+      const now = input.now ?? Date.now()
+      return execute({
+        kind: 'chat-preset.create',
+        preset: {
+          id: input.presetId ?? newId(),
+          name: input.name,
+          connectionProfileId: input.profileId,
+          settings: structuredClone(input.settings),
+          ...(input.lastUsedAt === undefined ? {} : { lastUsedAt: input.lastUsedAt }),
+        },
+        now,
+      })
+    },
+    duplicateChatPreset(sourceId, options = {}) {
+      return execute({
+        kind: 'chat-preset.duplicate',
+        sourceId,
+        copyId: options.copyId ?? newId(),
+        ...(options.name === undefined ? {} : { name: options.name }),
+        now: options.now ?? Date.now(),
       })
     },
     async applyChatPreset(chatId, presetId, now = Date.now()) {
@@ -564,7 +615,7 @@ export function createConfigurationApplication(
         kind: 'prompt-preset.create-and-pin',
         chatId: input.chatId,
         preset: {
-          id: newId(),
+          id: input.presetId ?? newId(),
           kind: input.kind,
           name: input.name,
           text: input.text,
@@ -638,6 +689,7 @@ const REQUEST_PREPARATION_SETTING_KEYS = new Set<string>([
   CORS_PROXY_URL_KEY,
   CORS_PROXY_SECRET_KEY,
 ])
+const PROFILE_SWITCH_PLAN_ATTEMPTS = [true, false] as const
 
 type PendingConfigurationCommand = Extract<
   ConfigurationDomainCommand,
@@ -860,6 +912,17 @@ function rejectPendingConfigurationCommand(
   pending.rejectPendingConfiguration(staged.chatId, staged.acknowledgement)
 }
 
+function profileSwitchNeedsFreshPlan(
+  result:
+    | ConfigurationDomainResult<'chat.switch-profile'>
+    | Extract<ConfigurationDomainResult, { kind: 'configuration-noop' }>,
+): boolean {
+  return (
+    result.kind === 'conflict' ||
+    (result.kind === 'invalid' && result.reason === 'model-resolution-target-mismatch')
+  )
+}
+
 function profileSwitchModel(
   plan: ConfigurationProfileSwitchPlan,
 ): ConfigurationChatSwitchCommand['model'] {
@@ -869,6 +932,12 @@ function profileSwitchModel(
     : null
   const candidates =
     cachedCandidates ?? listBundledEntries(plan.profile.kind).map((entry) => ({ id: entry.id }))
+  if (cachedCandidates) {
+    return {
+      kind: 'resolved',
+      id: resolveModelIdFromCatalog(sourceModelId, plan.profile.kind, candidates),
+    }
+  }
   const equivalent = sourceModelId
     ? forceEquivalentModelIdForConnection(sourceModelId, plan.profile.kind, candidates)
     : null
@@ -876,7 +945,6 @@ function profileSwitchModel(
   if (candidates.length === 1 && candidates[0]) {
     return { kind: 'resolved', id: candidates[0].id }
   }
-  if (cachedCandidates) return { kind: 'resolved', id: '' }
   return {
     kind: 'pending',
     immediateId: '',

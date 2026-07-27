@@ -1,13 +1,22 @@
 import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import type { ChatId, MessageId } from '../../src/core/types'
 import {
   installBrowserCommandMutationJournal,
+  recordBrowserCommandInvalidation,
+  recordBrowserCommandOwnerInvalidation,
   runBrowserCommandTransaction,
 } from '../../src/store/browser-command-mutation-journal'
 import { deleteChatOwnedPhysicalStorageCollectionWithKnownBytes } from '../../src/store/byte-owner-mutation'
 import { NatterDb } from '../../src/store/db'
 import { createIndexedDbLockBackend } from '../../src/store/locks'
 import type { MessageBodyRow } from '../../src/store/message-storage'
+import type { PhysicalStorageTableName } from '../../src/store/physical-storage-tables'
+import {
+  type SemanticOperationReceiptFragment,
+  withSemanticOperationExactReceiptAccumulator,
+} from '../../src/store/semantic-operation-capability'
+import { estimateStoredValueBytes } from '../../src/store/storage-size-estimate'
 import {
   localTransactionActivityStats,
   resumeLocalTransactionAdmissions,
@@ -32,6 +41,235 @@ afterEach(async () => {
 })
 
 describe('browser command mutation journal', () => {
+  it('routes every invalidation producer into the bound exact receipt', async () => {
+    const db = await openDatabase()
+    const chatId = 'chat' as ChatId
+    const messageId = 'message' as MessageId
+
+    const result = await db.transaction('rw', db.table('rows'), (tx) =>
+      runBrowserCommandTransaction(tx, (tracked) =>
+        withSemanticOperationExactReceiptAccumulator<
+          PhysicalStorageTableName,
+          SemanticOperationReceiptFragment<PhysicalStorageTableName>
+        >(tracked, (receipt) => {
+          recordBrowserCommandInvalidation(tracked, {
+            kind: 'message-header',
+            chatId,
+            messageIds: [messageId],
+          })
+          recordBrowserCommandOwnerInvalidation(tracked, {
+            kind: 'stream-lease',
+            chatId,
+            streamIds: ['stream'],
+          })
+          return receipt.snapshotFragment()
+        }),
+      ),
+    )
+
+    expect(result.value.dependencies).toEqual([
+      { kind: 'message-header', chatId, messageIds: [messageId] },
+      { kind: 'stream-lease', chatId, streamIds: ['stream'] },
+    ])
+    expect(result.facts.invalidations).toEqual(result.value.dependencies)
+  })
+
+  it('observes exact primary and secondary reads only when requested', async () => {
+    const db = await openDatabase()
+    const storedRows = [
+      { id: 'one', value: 1 },
+      { id: 'two', value: 2 },
+      { id: 'three', value: 3 },
+    ]
+    await db.table('rows').bulkPut(storedRows)
+    const firstBytes = estimateStoredValueBytes(storedRows[0])
+    const allBytes = storedRows.reduce((total, row) => total + estimateStoredValueBytes(row), 0)
+
+    const observed = await db.transaction('r', db.table('rows'), (tx) =>
+      runBrowserCommandTransaction(
+        tx,
+        async (tracked) => {
+          await tracked.table('rows').get('one')
+          await tracked.table('rows').get('missing')
+          await tracked.table('rows').bulkGet(['one', 'missing'])
+          await tracked.table('rows').where('value').above(0).toArray()
+          await tracked.table('rows').where('value').above(1).count()
+          await tracked
+            .table('rows')
+            .where('value')
+            .above(0)
+            .each(() => undefined)
+        },
+        { observePhysicalReads: true },
+      ),
+    )
+
+    expect(observed.facts.physicalReads).toEqual(
+      expect.arrayContaining([
+        {
+          tableName: 'rows',
+          indexKind: 'primary',
+          operation: 'get',
+          requestCount: 2,
+          rowCount: 2,
+          maxRequestRows: 1,
+          estimatedBytes: firstBytes,
+        },
+        {
+          tableName: 'rows',
+          indexKind: 'primary',
+          operation: 'get-many',
+          requestCount: 1,
+          rowCount: 2,
+          maxRequestRows: 2,
+          estimatedBytes: firstBytes,
+        },
+        {
+          tableName: 'rows',
+          indexKind: 'secondary',
+          indexName: 'value',
+          operation: 'query',
+          requestCount: 1,
+          rowCount: 3,
+          maxRequestRows: 3,
+          estimatedBytes: allBytes,
+        },
+        {
+          tableName: 'rows',
+          indexKind: 'secondary',
+          indexName: 'value',
+          operation: 'count',
+          requestCount: 1,
+          rowCount: 2,
+          maxRequestRows: 2,
+          estimatedBytes: 0,
+        },
+        {
+          tableName: 'rows',
+          indexKind: 'secondary',
+          indexName: 'value',
+          operation: 'open-cursor',
+          requestCount: 1,
+          rowCount: 3,
+          maxRequestRows: 3,
+          estimatedBytes: allBytes,
+        },
+      ]),
+    )
+    expect(observed.facts.physicalReads).toHaveLength(5)
+
+    const unobserved = await db.transaction('r', db.table('rows'), (tx) =>
+      runBrowserCommandTransaction(tx, (tracked) => tracked.table('rows').get('one')),
+    )
+    expect(unobserved.facts.physicalReads).toEqual([])
+  })
+
+  it('includes mutation-internal identity reads in command physical work', async () => {
+    const db = await openDatabase()
+    await db.table('rows').put({ id: 'one', value: 1 })
+
+    const result = await db.transaction('rw', db.table('rows'), (tx) =>
+      runBrowserCommandTransaction(tx, (tracked) => tracked.table('rows').delete('one'), {
+        observePhysicalReads: true,
+      }),
+    )
+
+    expect(result.facts.physicalReads).toEqual([
+      {
+        tableName: 'rows',
+        indexKind: 'primary',
+        operation: 'get-many',
+        requestCount: 1,
+        rowCount: 1,
+        maxRequestRows: 1,
+        estimatedBytes: estimateStoredValueBytes({ id: 'one', value: 1 }),
+      },
+    ])
+    expect(result.facts.finalizationPhysicalReads).toEqual([])
+    expect(result.facts.physicalMutations).toEqual([
+      expect.objectContaining({ tableName: 'rows', key: 'one', operation: 'delete' }),
+    ])
+  })
+
+  it('observes write request shape only when requested', async () => {
+    const db = await openDatabase()
+    const rows = [
+      { id: 'one', value: 'a' },
+      { id: 'two', value: 'bb' },
+    ]
+
+    const observed = await db.transaction('rw', db.table('rows'), (tx) =>
+      runBrowserCommandTransaction(
+        tx,
+        async (tracked) => {
+          await tracked.table('rows').bulkPut(rows)
+          await tracked.table('rows').delete('one')
+        },
+        { observePhysicalWrites: true },
+      ),
+    )
+
+    expect(observed.facts.physicalWrites).toEqual([
+      {
+        tableName: 'rows',
+        operation: 'put',
+        requestCount: 1,
+        rowCount: 2,
+        maxRequestRows: 2,
+      },
+      {
+        tableName: 'rows',
+        operation: 'delete',
+        requestCount: 1,
+        rowCount: 1,
+        maxRequestRows: 1,
+      },
+    ])
+
+    const unobserved = await db.transaction('rw', db.table('rows'), (tx) =>
+      runBrowserCommandTransaction(tx, (tracked) =>
+        tracked.table('rows').put({ id: 'three', value: 'ccc' }),
+      ),
+    )
+    expect(unobserved.facts.physicalWrites).toEqual([])
+  })
+
+  it('keeps submitted write work distinct from successful mutation identities', async () => {
+    const db = await openDatabase()
+    await db.table('rows').add({ id: 'existing', value: 'old' })
+    const submitted = [
+      { id: 'existing', value: 'conflict' },
+      { id: 'inserted', value: 'new' },
+    ]
+
+    const result = await db.transaction('rw', db.table('rows'), (tx) =>
+      runBrowserCommandTransaction(
+        tx,
+        async (tracked) => {
+          await tracked
+            .table('rows')
+            .bulkAdd(submitted)
+            .catch(() => undefined)
+        },
+        { observePhysicalWrites: true },
+      ),
+    )
+
+    expect(result.facts.physicalWrites).toEqual([
+      {
+        tableName: 'rows',
+        operation: 'add',
+        requestCount: 1,
+        rowCount: 2,
+        maxRequestRows: 2,
+      },
+    ])
+    expect(result.facts.physicalMutations).toEqual([
+      expect.objectContaining({ key: 'inserted', operation: 'write' }),
+    ])
+    expect(result.facts.successfulMutations).toBe(1)
+  })
+
   it('returns transaction-local facts only after a non-empty mutation commits', async () => {
     const db = await openDatabase()
 
@@ -253,7 +491,7 @@ describe('browser command mutation journal', () => {
 async function openDatabase(): Promise<Dexie> {
   const db = new Dexie(`browser-command-journal-${crypto.randomUUID()}`)
   installBrowserCommandMutationJournal(db)
-  db.version(1).stores({ rows: 'id' })
+  db.version(1).stores({ rows: 'id,value' })
   databases.push(db)
   await db.open()
   return db

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
-import { DEFAULT_GLOBAL_PREFERENCES } from '../../src/core/global-settings'
+import { DEFAULT_GLOBAL_PREFERENCES, PINNED_MODELS_KEY } from '../../src/core/global-settings'
 import { DEFAULT_RENDERING_PREFS } from '../../src/core/rendering-preferences'
 import {
   DEFAULT_SIDEBAR_SORT_MODE,
@@ -27,10 +27,12 @@ import {
 import type { ConfigurationDomainPort } from '../../src/store/configuration-domain-contract'
 import { buildConnectionProfile } from '../../src/store/configuration-domain-contract'
 import type { ConversationSnapshot } from '../../src/store/conversation-controller'
+import { prepareLocalWorkspaceChange } from '../../src/store/workspace-effect-hub'
 import type {
   ConfigurationActiveSelectionProjection,
   ConfigurationSelectionQueryTarget,
   ConfigurationShellProjection,
+  WorkspaceDependency,
 } from '../../src/store/workspace-protocol'
 
 let epoch = 0
@@ -225,12 +227,121 @@ describe('configuration controller publication', () => {
     const application = createConfigurationApplication(dependencies)
 
     const operation = application.execute(proof.command)
+    expect(port.execute).toHaveBeenCalledTimes(1)
     expect(proof.projected()).toEqual(proof.expected)
     completion.resolve(proof.result as never)
     await operation
 
+    expect(port.execute).toHaveBeenCalledTimes(1)
     expect(proof.projected()).toEqual(proof.expected)
     expect(configurationController.pendingWorkspaceSetting(proof.result.key)).toBeUndefined()
+  })
+
+  it('submits a relative setting command exactly once while its result is pending', async () => {
+    const completion = deferred<never>()
+    const execute = vi.fn(() => completion.promise)
+    const application = createConfigurationApplication({
+      port: { execute: execute as ConfigurationDomainPort['execute'] },
+      async prepareKey() {
+        throw new Error('UnexpectedKeyPreparation')
+      },
+      async loadProfileSwitchPlan() {
+        return undefined
+      },
+    })
+    const command = {
+      kind: 'pinned-model.move',
+      modelId: 'model-b',
+      delta: -1,
+      now: 1,
+    } as const
+
+    const operation = application.execute(command)
+    expect(execute).toHaveBeenCalledTimes(1)
+    expect(execute).toHaveBeenCalledWith(command)
+    completion.resolve({
+      kind: 'workspace-setting-saved',
+      key: PINNED_MODELS_KEY,
+      value: ['model-b', 'model-a'],
+      changed: true,
+    } as never)
+
+    await expect(operation).resolves.toMatchObject({
+      kind: 'workspace-setting-saved',
+      key: PINNED_MODELS_KEY,
+    })
+    expect(execute).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('profile switch admission', () => {
+  it('rebases once and returns an explicit conflict when both exact attempts lose', async () => {
+    const profile = profileFixture('profile-switch-target')
+    const firstPlan = {
+      chat: chatFixture('profile-switch-chat', settingsFixture(profile)),
+      profile: { kind: profile.kind, baseUrl: profile.baseUrl },
+      target: requestRevision(profile.id),
+      requestKeyId: null,
+    }
+    const secondPlan = {
+      ...firstPlan,
+      chat: {
+        ...firstPlan.chat,
+        configurationVersion: 7,
+      },
+      target: {
+        ...firstPlan.target,
+        requestRevision: 2,
+      },
+    }
+    const execute = vi.fn(() =>
+      Promise.resolve({
+        kind: 'conflict',
+        reason: 'configuration-version',
+        currentVersion: 2,
+      } as never),
+    )
+    const loadProfileSwitchPlan = vi
+      .fn()
+      .mockResolvedValueOnce(firstPlan)
+      .mockResolvedValueOnce(secondPlan)
+    const application = createConfigurationApplication({
+      port: { execute: execute as ConfigurationDomainPort['execute'] },
+      async prepareKey() {
+        throw new Error('UnexpectedKeyPreparation')
+      },
+      loadProfileSwitchPlan,
+    })
+
+    await expect(
+      application.switchChatProfile({
+        chatId: firstPlan.chat.id,
+        profileId: profile.id,
+        now: 10,
+      }),
+    ).resolves.toEqual({
+      kind: 'conflict',
+      reason: 'configuration-version',
+      currentVersion: 2,
+    })
+    expect(loadProfileSwitchPlan).toHaveBeenCalledTimes(2)
+    expect(execute).toHaveBeenCalledTimes(2)
+    expect(execute).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        kind: 'chat.switch-profile',
+        expectedConfigurationVersion: 0,
+        target: firstPlan.target,
+      }),
+    )
+    expect(execute).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        kind: 'chat.switch-profile',
+        expectedConfigurationVersion: 7,
+        target: secondPlan.target,
+      }),
+    )
   })
 })
 
@@ -452,6 +563,60 @@ describe('sealed target-qualified generation configuration', () => {
     configurationController.stagePromptField('chat-B', 'system', 'inactive prompt')
     expect(configurationController.getSnapshot().frame.generation).toBe(frame)
     expect(resolveChat('chat-A')).toBe(resolution)
+  })
+
+  it('reloads a settled selection only for one of its exact dispatch keys', async () => {
+    const profile = profileFixture('profile-key-dependency')
+    profile.apiKeyRef = 'active-key'
+    const settings = settingsFixture(profile)
+    configurationController.rememberSeed({ profileId: profile.id, presetId: null, settings })
+    const loadActiveSelection = vi.fn(async () =>
+      selectionFixture(profile, {
+        dispatchKeyRevisions: [{ keyId: 'active-key', materialRevision: 1 }],
+      }),
+    )
+    await configurationController.setProjectionSource(projectionSource({ loadActiveSelection }))
+    await waitForSelectionStatus('ready')
+    const settledCalls = loadActiveSelection.mock.calls.length
+
+    publishWorkspaceEffect([
+      { kind: 'key', keyIds: ['unrelated-key'], facets: ['request-material'] },
+    ])
+    await settle()
+    expect(loadActiveSelection).toHaveBeenCalledTimes(settledCalls)
+
+    publishWorkspaceEffect([{ kind: 'key', keyIds: ['active-key'], facets: ['request-material'] }])
+    await waitForController(() => loadActiveSelection.mock.calls.length === settledCalls + 1)
+  })
+
+  it('uses a broad key fence only while the active selection is unresolved', async () => {
+    const profile = profileFixture('profile-key-pending')
+    profile.apiKeyRef = 'pending-key'
+    const settings = settingsFixture(profile)
+    configurationController.rememberSeed({ profileId: profile.id, presetId: null, settings })
+    let first = true
+    const loadActiveSelection = vi.fn(
+      (_target: ConfigurationSelectionQueryTarget, signal: AbortSignal) => {
+        if (!first) {
+          return Promise.resolve(
+            selectionFixture(profile, {
+              dispatchKeyRevisions: [{ keyId: 'pending-key', materialRevision: 1 }],
+            }),
+          )
+        }
+        first = false
+        return new Promise<ConfigurationActiveSelectionProjection>((_resolve, reject) => {
+          signal.addEventListener('abort', () => reject(signal.reason), { once: true })
+        })
+      },
+    )
+    await configurationController.setProjectionSource(projectionSource({ loadActiveSelection }))
+    await waitForController(() => loadActiveSelection.mock.calls.length === 1)
+
+    publishWorkspaceEffect([{ kind: 'key', keyIds: ['any-key'], facets: ['request-material'] }])
+
+    await waitForController(() => loadActiveSelection.mock.calls.length === 2)
+    await waitForSelectionStatus('ready')
   })
 
   it.each([
@@ -695,6 +860,14 @@ function observeChat(chat: Chat): void {
     activeChatId: chat.id,
     active: { chatId: chat.id, chat } as NonNullable<ConversationSnapshot['active']>,
   })
+}
+
+function publishWorkspaceEffect(dependencies: readonly WorkspaceDependency[]): void {
+  const fence = configurationController.getSnapshot().workspaceFence
+  if (!fence) throw new Error('ConfigurationWorkspaceMissing')
+  configurationController.observeWorkspaceEffect(
+    prepareLocalWorkspaceChange({ kind: 'invalidate', ...fence, dependencies }).effect,
+  )
 }
 
 function textTemplate(label: string): TextTemplateConfig {

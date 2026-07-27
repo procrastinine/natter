@@ -5,14 +5,31 @@ import ts from 'typescript'
 
 const DEFAULT_ROOT = resolve(import.meta.dirname, '..')
 
-export function createProductionTypeScriptProgram(root = DEFAULT_ROOT) {
+export function createProductionTypeScriptProgram(root = DEFAULT_ROOT, options = {}) {
   const configPath = resolve(root, 'tsconfig.app.json')
   const config = ts.readConfigFile(configPath, (path) => readFileSync(path, 'utf8'))
   if (config.error) {
     throw new Error(ts.flattenDiagnosticMessageText(config.error.messageText, '\n'))
   }
   const parsed = ts.parseJsonConfigFileContent(config.config, ts.sys, root, undefined, configPath)
-  return ts.createProgram({ rootNames: parsed.fileNames, options: parsed.options })
+  const overrides = new Map(
+    Object.entries(options.sourceTextOverrides ?? {}).map(([path, text]) => [
+      resolve(root, path),
+      text,
+    ]),
+  )
+  if (overrides.size === 0) {
+    return ts.createProgram({ rootNames: parsed.fileNames, options: parsed.options })
+  }
+  const host = ts.createCompilerHost(parsed.options)
+  const getSourceFile = host.getSourceFile.bind(host)
+  host.getSourceFile = (fileName, languageVersion, onError, shouldCreateNewSourceFile) => {
+    const text = overrides.get(resolve(fileName))
+    return text === undefined
+      ? getSourceFile(fileName, languageVersion, onError, shouldCreateNewSourceFile)
+      : ts.createSourceFile(fileName, text, languageVersion, true)
+  }
+  return ts.createProgram({ rootNames: parsed.fileNames, options: parsed.options, host })
 }
 
 export function productionTypeScriptSources(program, root = DEFAULT_ROOT) {

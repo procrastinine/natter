@@ -27,6 +27,10 @@ import {
   shutdownBrowserWorkspace,
 } from '../../src/store/browser-workspace-lifecycle'
 import { importMessagesOp } from '../../src/store/conversation-command-client'
+import {
+  type ConversationPresentationResourcePort,
+  conversationController,
+} from '../../src/store/conversation-controller'
 import { __resetDbForTests, getDb } from '../../src/store/db'
 import {
   createGenerationEngine,
@@ -116,6 +120,13 @@ type ExecuteInterceptor = (
 ) => Promise<unknown>
 
 let executeInterceptor: ExecuteInterceptor | undefined
+let releasePresentationResources: () => void = () => undefined
+
+const READY_PRESENTATION_RESOURCES: ConversationPresentationResourcePort = Object.freeze({
+  get: () => Object.freeze({ kind: 'ready' }),
+  request: () => undefined,
+  subscribe: () => () => undefined,
+})
 
 async function reset(): Promise<void> {
   __resetWorkspaceRepositoryForTests()
@@ -128,6 +139,9 @@ async function reset(): Promise<void> {
 beforeEach(async () => {
   await reset()
   await openBrowserWorkspace()
+  releasePresentationResources = conversationController.installPresentationResourcePort(
+    READY_PRESENTATION_RESOURCES,
+  )
   const target = getBrowserRepository()
   const next = target.execute.bind(target)
   __setWorkspaceRepositoryForTests(
@@ -174,12 +188,107 @@ afterEach(async () => {
   vi.restoreAllMocks()
   vi.unstubAllGlobals()
   executeInterceptor = undefined
+  releasePresentationResources()
+  releasePresentationResources = () => undefined
   __resetWorkspaceRepositoryForTests()
   await shutdownBrowserWorkspace()
   await reset()
 })
 
 describe('generation lifecycle contract', () => {
+  it('publishes send and regenerate intent rows before durable prepare and adopts their ids', async () => {
+    const chat = await createChat({ settings: settings() })
+    let releasePrepare: () => void = () => undefined
+    let prepareStarted: () => void = () => undefined
+    let prepareGate = new Promise<void>((resolve) => {
+      releasePrepare = resolve
+    })
+    let prepareObserved = new Promise<void>((resolve) => {
+      prepareStarted = resolve
+    })
+    executeInterceptor = async (permit, command, next) => {
+      if (command.kind === 'attempt.prepare') {
+        prepareStarted()
+        await prepareGate
+      }
+      return next(permit, command)
+    }
+
+    const send = await start(
+      {
+        kind: 'send',
+        chatId: chat.id,
+        expectedLeafId: null,
+        content: [{ type: 'text', text: 'intent-owned prompt' }],
+      },
+      () => finiteStream(completionChunk('intent-owned answer')),
+    )
+    await prepareObserved
+    let intentIds: string[] = []
+    try {
+      const sendBinding = currentTranscriptBinding()
+      expect(sendBinding.intentPresentations.map(({ message }) => message)).toMatchObject([
+        {
+          chatId: chat.id,
+          role: 'user',
+          content: [{ type: 'text', text: 'intent-owned prompt' }],
+        },
+        {
+          chatId: chat.id,
+          role: 'assistant',
+          content: [],
+          generation: { status: 'preparing' },
+        },
+      ])
+      expect(await messages(chat.id)).toEqual([])
+      intentIds = sendBinding.intentPresentations.map(({ message }) => message.id)
+    } finally {
+      releasePrepare()
+    }
+    const sendPrepared = await send.prepared
+    expect([sendPrepared.userMessageId, sendPrepared.assistantMessageId]).toEqual(intentIds)
+    await send.completed
+    expect(currentTranscriptBinding().intentPresentations).toEqual([])
+
+    prepareGate = new Promise<void>((resolve) => {
+      releasePrepare = resolve
+    })
+    prepareObserved = new Promise<void>((resolve) => {
+      prepareStarted = resolve
+    })
+    const regenerate = await start(
+      {
+        kind: 'regenerate',
+        chatId: chat.id,
+        targetAssistantId: sendPrepared.assistantMessageId,
+      },
+      () => finiteStream(completionChunk('regenerated answer')),
+    )
+    await prepareObserved
+    let regeneratedIntentId: string | undefined
+    try {
+      const regenerateBinding = currentTranscriptBinding()
+      expect(regenerateBinding.intentPresentations).toHaveLength(1)
+      expect(regenerateBinding.intentPresentations[0]?.message).toMatchObject({
+        chatId: chat.id,
+        role: 'assistant',
+        content: [],
+        generation: { status: 'preparing' },
+      })
+      expect(
+        (await messages(chat.id)).find((message) => message.id === sendPrepared.assistantMessageId)
+          ?.content,
+      ).toEqual([{ type: 'output_text', text: 'intent-owned answer' }])
+      regeneratedIntentId = regenerateBinding.intentPresentations[0]?.message.id
+    } finally {
+      releasePrepare()
+    }
+    const regeneratePrepared = await regenerate.prepared
+    expect(regeneratePrepared.assistantMessageId).toBe(regeneratedIntentId)
+    await regenerate.completed
+    expect(currentTranscriptBinding().intentPresentations).toEqual([])
+  })
+
   it('rolls back the whole admission when attempt.prepare fails before publication', async () => {
     const chat = await createChat({ settings: settings() })
     executeInterceptor = async (permit, command, next) => {
@@ -1394,6 +1503,14 @@ describe('generation lifecycle contract', () => {
     expect((await message(target.id))?.continuationAttempts).toHaveLength(1)
   })
 })
+
+function currentTranscriptBinding() {
+  const target = conversationController.getSnapshot().active?.presentation.target
+  if (target?.kind !== 'ready' || target.binding.surface !== 'transcript') {
+    throw new Error('Current transcript binding unavailable')
+  }
+  return target.binding
+}
 
 async function start(
   intent: GenerationIntent,

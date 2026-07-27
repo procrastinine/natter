@@ -726,7 +726,7 @@ function MessageInner({
         ) : null}
         {null}
         <div data-ui="message-action-row">
-          {branchContext && !presentationOnly ? (
+          {branchContext ? (
             <BranchControls chatId={chatId} message={message} context={branchContext} />
           ) : (
             <span data-ui="message-action-row-spacer" />

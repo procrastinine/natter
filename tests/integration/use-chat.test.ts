@@ -2817,7 +2817,6 @@ describe('sendText — token calibration sample ingest', () => {
           },
         ),
     })
-
     await within(downloadStarted, 'generated-output download start')
     const result = await within(sendPromise, 'canonical generated-output commit')
     expect(result.outcome).toBe('done')
@@ -3778,7 +3777,6 @@ describe('recoverOrphans', () => {
         runWorkspaceAction('conversation-generation', (permit) =>
           getWorkspaceRepository().execute(permit, {
             kind: 'stream.finish-cleanup',
-            chatId: chat.id,
             streamId: predecessor.streamId,
             fence: streamWriteFenceForLease(predecessor),
           }),
@@ -3852,7 +3850,6 @@ describe('recoverOrphans', () => {
         runWorkspaceAction('conversation-generation', (permit) =>
           getWorkspaceRepository().execute(permit, {
             kind: 'stream.finish-cleanup',
-            chatId: chat.id,
             streamId: predecessor.streamId,
             fence: streamWriteFenceForLease(predecessor),
           }),
@@ -3864,7 +3861,6 @@ describe('recoverOrphans', () => {
         runWorkspaceAction('conversation-generation', (permit) =>
           getWorkspaceRepository().execute(permit, {
             kind: 'stream.finish-cleanup',
-            chatId: chat.id,
             streamId: predecessor.streamId,
             fence: streamWriteFenceForLease(predecessor),
           }),

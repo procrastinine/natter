@@ -3,6 +3,7 @@ import { join, relative, sep } from 'node:path'
 import ts from 'typescript'
 import { describe, expect, it } from 'vitest'
 import { resolveMutationTableNames } from '../../src/store/browser-mutation-plan'
+import { buildChat } from '../../src/store/chats'
 import {
   PHYSICAL_STORAGE_BOUNDARY_FILES,
   PHYSICAL_STORAGE_POLICY,
@@ -158,7 +159,7 @@ describe('byte-owner mutation boundary', () => {
 
   it('keeps the post-commit debt ledger out of semantic mutation scopes', () => {
     const semanticPlans = [
-      resolveMutationTableNames([], { initialChat: {} as never }),
+      resolveMutationTableNames([], { initialChat: buildChat() }),
       resolveMutationTableNames([], { promoteChatId: 'chat' }),
       resolveMutationTableNames([{ kind: 'chat-meta', chatId: 'chat' }]),
       resolveMutationTableNames([{ kind: 'children', chatId: 'chat', parentId: null }]),

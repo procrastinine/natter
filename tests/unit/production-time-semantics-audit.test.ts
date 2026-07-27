@@ -108,22 +108,22 @@ describe('production temporal semantics meta-audit', () => {
         schedulers: 56,
         durations: 48,
         asyncRaces: 6,
-        retryLoops: 106,
+        retryLoops: 91,
         maintenanceCommands: 6,
       },
-      semanticSiteCount: 222,
-      groupCount: 40,
-      statusCounts: { covered: 205, gap: 17 },
+      semanticSiteCount: 207,
+      groupCount: 41,
+      statusCounts: { covered: 206, gap: 1 },
       readinessProofCount: 1,
       readinessGapCount: 0,
-      criticalGapCount: 17,
+      criticalGapCount: 1,
       problems: [],
     })
-    expect(report.gaps.some((gap) => gap['group'] === 'unbounded-revision-revalidation')).toBe(true)
+    expect(report.gaps.some((gap) => gap.group === 'unbounded-revision-revalidation')).toBe(true)
     expect(report.readinessProofs).toHaveLength(1)
     const readinessProof = report.readinessProofs[0]
-    expect(readinessProof?.['group']).toBe('active-stream-reload-first-gesture-browser-proof')
-    expect(readinessProof?.['timerRelationship']).toBe('source-closed-browser-proof-closed')
+    expect(readinessProof?.group).toBe('active-stream-reload-first-gesture-browser-proof')
+    expect(readinessProof?.timerRelationship).toBe('source-closed-browser-proof-closed')
     expect(readinessProof?.evidence).toContainEqual({
       path: 'src/app/WorkspaceBootstrap.tsx',
       locator: 'data-presentation="nonblocking"',
@@ -140,7 +140,7 @@ describe('production temporal semantics meta-audit', () => {
     ])
     expect(report.readinessGaps).toEqual([])
     expect(report.limitations).toHaveLength(4)
-    expect(report.sites).toHaveLength(222)
+    expect(report.sites).toHaveLength(207)
     expect(
       report.sites.every(
         (site) =>
@@ -156,7 +156,7 @@ describe('production temporal semantics meta-audit', () => {
 
     expect(report.ok).toBe(false)
     expect(report.structurallyValid).toBe(true)
-    expect(report.gaps).toHaveLength(17)
+    expect(report.gaps).toHaveLength(1)
     expect(report.problems).toEqual([])
   })
 

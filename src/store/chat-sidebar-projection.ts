@@ -7,6 +7,7 @@ import type {
 import { sidebarTitleSortKey } from '../core/sidebar-sort'
 import type { Chat, ChatId, ChatSidebarRow, FolderId } from '../core/types'
 import { sameValue } from '../lib/same-value'
+import { recordBrowserCommandInvalidation } from './browser-command-mutation-journal'
 import {
   deletePhysicalStorageRows,
   putPhysicalStorageRow,
@@ -29,6 +30,7 @@ export const CHAT_SIDEBAR_AGGREGATE_ID = 'workspace'
 export const CHAT_SIDEBAR_PROJECTION_ROW_VERSION = 4
 const CHAT_SIDEBAR_AGGREGATE_VERSION = 2
 export const CHAT_SIDEBAR_PROJECTION_MARKER_VERSION = 5
+export const CHAT_SIDEBAR_FOLDER_EXTREMA_READ_REQUEST_LIMIT = 24
 const REBUILD_BATCH_SIZE = 128
 const ROOT_FOLDER_KEY = '\u0000root'
 
@@ -318,11 +320,41 @@ export type ChatSidebarProjectionTransition =
       readonly next: Chat
     }
 
+export interface ChatSidebarProjectionMutationReceipt {
+  readonly rowReadRequests: number
+  readonly rowReadCount: number
+  readonly mutatedRowIds: readonly ChatId[]
+  readonly aggregateReadRequests: number
+  readonly aggregateReadCount: number
+  readonly aggregateMutations: readonly {
+    readonly id: string
+    readonly operation: 'write' | 'delete'
+  }[]
+  readonly extremaReads: readonly {
+    readonly indexName: string
+    readonly operation: 'query' | 'open-cursor'
+    readonly requestCount: number
+    readonly rowCount: number
+  }[]
+}
+
+export function emptyChatSidebarProjectionMutationReceipt(): ChatSidebarProjectionMutationReceipt {
+  return Object.freeze({
+    rowReadRequests: 0,
+    rowReadCount: 0,
+    mutatedRowIds: Object.freeze([]),
+    aggregateReadRequests: 0,
+    aggregateReadCount: 0,
+    aggregateMutations: Object.freeze([]),
+    extremaReads: Object.freeze([]),
+  })
+}
+
 export async function applyChatSidebarProjectionTransitions(
   tx: Transaction,
   transitions: readonly ChatSidebarProjectionTransition[],
-): Promise<void> {
-  if (transitions.length === 0) return
+): Promise<ChatSidebarProjectionMutationReceipt> {
+  if (transitions.length === 0) return emptyChatSidebarProjectionMutationReceipt()
   const ids = new Set<ChatId>()
   const candidates: ChatSidebarProjectionCandidate[] = []
   for (const transition of transitions) {
@@ -341,7 +373,7 @@ export async function applyChatSidebarProjectionTransitions(
     if (sameValue(previous, next)) continue
     candidates.push({ expected: { kind: 'exact', row: previous }, next })
   }
-  await commitChatSidebarProjectionCandidates(tx, candidates)
+  return commitChatSidebarProjectionCandidates(tx, candidates)
 }
 
 type ChatSidebarProjectionCandidate = {
@@ -360,8 +392,8 @@ type ChatSidebarProjectionChange = {
 async function commitChatSidebarProjectionCandidates(
   tx: Transaction,
   candidates: readonly ChatSidebarProjectionCandidate[],
-): Promise<void> {
-  if (candidates.length === 0) return
+): Promise<ChatSidebarProjectionMutationReceipt> {
+  if (candidates.length === 0) return emptyChatSidebarProjectionMutationReceipt()
   const table = tx.table<ChatSidebarProjectionRow, ChatId>('chatSidebarRows')
   const currentRows = await table.bulkGet(candidates.map((candidate) => candidate.next.id))
   const changes: ChatSidebarProjectionChange[] = []
@@ -383,7 +415,13 @@ async function commitChatSidebarProjectionCandidates(
     if (current !== undefined && sameValue(current, candidate.next)) continue
     changes.push({ previous: current, next: candidate.next })
   }
-  if (changes.length === 0) return
+  if (changes.length === 0) {
+    return Object.freeze({
+      ...emptyChatSidebarProjectionMutationReceipt(),
+      rowReadRequests: 1,
+      rowReadCount: candidates.length,
+    })
+  }
   const { workspace, folders } = await readAffectedChatSidebarAggregates(tx, changes)
   await putPhysicalStorageRows(
     tx,
@@ -391,7 +429,16 @@ async function commitChatSidebarProjectionCandidates(
     changes.map((change) => change.next as ChatSidebarProjectionRow),
     changes.flatMap((change) => (change.previous ? [change.previous] : [])),
   )
-  await applyChatSidebarProjectionDeltas(tx, changes, workspace, folders)
+  const delta = await applyChatSidebarProjectionDeltas(tx, changes, workspace, folders)
+  return Object.freeze({
+    rowReadRequests: 1,
+    rowReadCount: candidates.length,
+    mutatedRowIds: Object.freeze(changes.flatMap(({ next }) => (next ? [next.id] : [])).sort()),
+    aggregateReadRequests: 1,
+    aggregateReadCount: 1 + folders.size,
+    aggregateMutations: delta.aggregateMutations,
+    extremaReads: delta.extremaReads,
+  })
 }
 
 export async function deleteChatSidebarProjections(
@@ -421,6 +468,7 @@ export async function deleteChatSidebarProjections(
     )
   }
   await applyChatSidebarProjectionDeltas(tx, changes, workspace, folders)
+  recordBrowserCommandInvalidation(tx, { kind: 'sidebar', chatIds: ids })
 }
 
 export async function rebuildChatSidebarProjectionRowsInTransaction(
@@ -503,8 +551,13 @@ async function applyChatSidebarProjectionDeltas(
   changes: readonly ChatSidebarProjectionChange[],
   currentWorkspace?: ChatSidebarWorkspaceAggregateRow,
   currentFolders?: ReadonlyMap<string, ChatSidebarFolderAggregateRow | undefined>,
-): Promise<void> {
-  if (changes.length === 0) return
+): Promise<{
+  readonly aggregateMutations: ChatSidebarProjectionMutationReceipt['aggregateMutations']
+  readonly extremaReads: ChatSidebarProjectionMutationReceipt['extremaReads']
+}> {
+  if (changes.length === 0) {
+    return { aggregateMutations: Object.freeze([]), extremaReads: Object.freeze([]) }
+  }
   const table = tx.table<ChatSidebarAggregateProjectionRow, string>('chatSidebarAggregates')
   const current = currentWorkspace ?? (await table.get(CHAT_SIDEBAR_AGGREGATE_ID))
   if (!isValidChatSidebarWorkspaceAggregateRow(current)) {
@@ -539,10 +592,21 @@ async function applyChatSidebarProjectionDeltas(
   if (!isValidChatSidebarWorkspaceAggregateRow(updated)) {
     throw new Error('ChatSidebarAggregateDeltaInvalid')
   }
+  const aggregateMutations: Array<{
+    readonly id: string
+    readonly operation: 'write' | 'delete'
+  }> = []
+  const extremaReads: Array<ChatSidebarProjectionMutationReceipt['extremaReads'][number]> = []
   if (!sameValue(updated, current)) {
     await putPhysicalStorageRow(tx, 'chatSidebarAggregates', updated, current)
+    aggregateMutations.push({ id: updated.id, operation: 'write' })
   }
-  if (folderChanges.size === 0) return
+  if (folderChanges.size === 0) {
+    return {
+      aggregateMutations: Object.freeze(aggregateMutations),
+      extremaReads: Object.freeze(extremaReads),
+    }
+  }
   const entries = [...folderChanges]
   const ids = entries.map(([folderKey]) => chatSidebarFolderAggregateId(folderKey))
   const storedFolders = currentFolders
@@ -588,7 +652,9 @@ async function applyChatSidebarProjectionDeltas(
     if (nextAggregate.visibleCount === 0) {
       nextAggregate.sortExtrema = null
     } else if (removedExtremum) {
-      nextAggregate.sortExtrema = await readFolderSortExtrema(tx, folderKey)
+      const read = await readFolderSortExtrema(tx, folderKey)
+      nextAggregate.sortExtrema = read.extrema
+      extremaReads.push(...read.reads)
     } else {
       for (const change of groupedChanges) {
         if (change.next && isVisibleSidebarRow(change.next)) {
@@ -604,6 +670,16 @@ async function applyChatSidebarProjectionDeltas(
   }
   await putPhysicalStorageRows(tx, 'chatSidebarAggregates', puts, replaced)
   await deletePhysicalStorageRows(tx, 'chatSidebarAggregates', deletes, deleted)
+  aggregateMutations.push(
+    ...puts.map((row) => ({ id: row.id, operation: 'write' as const })),
+    ...deletes.map((id) => ({ id, operation: 'delete' as const })),
+  )
+  return {
+    aggregateMutations: Object.freeze(
+      aggregateMutations.sort((left, right) => left.id.localeCompare(right.id)),
+    ),
+    extremaReads: Object.freeze(extremaReads),
+  }
 }
 
 function addWorkspaceContribution(
@@ -757,7 +833,10 @@ function finiteOrFallback(value: unknown, fallback: unknown): number {
 async function readFolderSortExtrema(
   tx: Transaction,
   folderKey: string,
-): Promise<SidebarSortExtrema> {
+): Promise<{
+  readonly extrema: SidebarSortExtrema
+  readonly reads: ChatSidebarProjectionMutationReceipt['extremaReads']
+}> {
   const table = tx.table<ChatSidebarProjectionRow, ChatId>('chatSidebarRows')
   const [updatedAt, createdAt, lastViewedAt, totalCostUsd, wordCount, title] = await Promise.all([
     readFolderFieldExtremum<number>(
@@ -797,7 +876,21 @@ async function readFolderSortExtrema(
       '[folderKey+visibleKey+pinnedKey+titleSortKey+id]',
     ),
   ])
-  return { updatedAt, createdAt, lastViewedAt, totalCostUsd, wordCount, title }
+  return {
+    extrema: {
+      updatedAt: updatedAt.extremum,
+      createdAt: createdAt.extremum,
+      lastViewedAt: lastViewedAt.extremum,
+      totalCostUsd: totalCostUsd.extremum,
+      wordCount: wordCount.extremum,
+      title: title.extremum,
+    },
+    reads: Object.freeze(
+      [updatedAt, createdAt, lastViewedAt, totalCostUsd, wordCount, title].flatMap(
+        ({ reads }) => reads,
+      ),
+    ),
+  }
 }
 
 async function readFolderFieldExtremum<T extends number | string>(
@@ -805,17 +898,19 @@ async function readFolderFieldExtremum<T extends number | string>(
   folderKey: string,
   field: SidebarSortField,
   indexName: string,
-): Promise<SidebarSortExtremum<T>> {
-  const rows = (
-    await Promise.all(
-      ([0, 1] as const).flatMap((pinnedKey) => {
-        const collection = table
-          .where(indexName)
-          .between(...exactCompoundPrefixBetween([folderKey, 1, pinnedKey]))
-        return [collection.first(), collection.last()]
-      }),
-    )
-  ).filter((row): row is ChatSidebarProjectionRow => row !== undefined)
+): Promise<{
+  readonly extremum: SidebarSortExtremum<T>
+  readonly reads: ChatSidebarProjectionMutationReceipt['extremaReads']
+}> {
+  const results = await Promise.all(
+    ([0, 1] as const).flatMap((pinnedKey) => {
+      const collection = table
+        .where(indexName)
+        .between(...exactCompoundPrefixBetween([folderKey, 1, pinnedKey]))
+      return [collection.first(), collection.last()]
+    }),
+  )
+  const rows = results.filter((row): row is ChatSidebarProjectionRow => row !== undefined)
   const first = rows[0]
   if (!first) throw new Error('ChatSidebarFolderExtremumMissing')
   let min = sidebarSortValues(first)[field] as T
@@ -825,7 +920,23 @@ async function readFolderFieldExtremum<T extends number | string>(
     if (value < min) min = value
     if (value > max) max = value
   }
-  return { min, max }
+  return {
+    extremum: { min, max },
+    reads: Object.freeze([
+      {
+        indexName,
+        operation: 'query',
+        requestCount: 2,
+        rowCount: results.filter((row, index) => index % 2 === 0 && row !== undefined).length,
+      },
+      {
+        indexName,
+        operation: 'open-cursor',
+        requestCount: 2,
+        rowCount: results.filter((row, index) => index % 2 === 1 && row !== undefined).length,
+      },
+    ]),
+  }
 }
 
 function isValidChatSidebarSortExtrema(value: unknown): value is SidebarSortExtrema {

@@ -84,6 +84,10 @@ interface InsertTarget {
   defaultRole: MessageRole
 }
 
+type RenderableMessageRow = TranscriptBodyWindowRow & {
+  readonly intentOnly?: boolean
+}
+
 // Pick the conversational counterpart of a role. user↔assistant is the
 // natural "next line of dialogue" pairing; system / tool / developer
 // stay as themselves because their counterparts aren't well-defined.
@@ -357,7 +361,7 @@ export const MessageList = memo(function MessageList({
       capability,
     )
   }, [capability, chatSettings, contextPreviewPath])
-  const effectiveRenderedMessageCount = branchSnapshot.rowCount
+  const effectiveRenderedMessageCount = branchSnapshot.rowCount + binding.intentPresentations.length
   const loadOlderMessages = useCallback(() => {
     if (presentationOnly) return
     if (hiddenOlderCount <= 0 && !canRetryLoadedBodies) return
@@ -390,7 +394,13 @@ export const MessageList = memo(function MessageList({
   ])
 
   const renderMessageRow = useCallback(
-    ({ message: m, bodyVersion, bodyExact }: TranscriptBodyWindowRow): ReactNode => {
+    ({
+      message: m,
+      bodyVersion,
+      bodyExact,
+      intentOnly = false,
+    }: RenderableMessageRow): ReactNode => {
+      const rowPresentationOnly = presentationOnly || intentOnly
       const showStaleHint =
         m.role === 'assistant' && m.parentId !== null && staleHintFor.has(m.parentId)
       const branchContext = branchSpine.forkFor(m.id)
@@ -430,7 +440,7 @@ export const MessageList = memo(function MessageList({
           editResendCapability={editResendCapability}
           regenerateCapability={regenerateCapability}
           continueCapability={continueCapability}
-          presentationOnly={presentationOnly}
+          presentationOnly={rowPresentationOnly}
           presentationFence={binding.seal}
           onBeginEdit={handleBeginEdit}
           onEditInPlace={handleEditInPlace}
@@ -527,6 +537,14 @@ export const MessageList = memo(function MessageList({
       ) : null}
       {[...transcriptBodyWindowPages(branchSnapshot)].flatMap((page) =>
         [...transcriptBodyPageRows(page)].map(renderMessageRow),
+      )}
+      {binding.intentPresentations.map((presentation, index) =>
+        renderMessageRow({
+          ...presentation,
+          pathIndex: branchLength + index,
+          bodyExact: true,
+          intentOnly: true,
+        }),
       )}
       {insertTarget ? (
         <Suspense

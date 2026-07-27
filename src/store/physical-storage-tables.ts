@@ -51,6 +51,30 @@ export const PHYSICAL_STORAGE_TABLE_NAMES = [
 
 export type PhysicalStorageTableName = (typeof PHYSICAL_STORAGE_TABLE_NAMES)[number]
 
+export function encodePhysicalStorageKey(value: unknown): string {
+  if (typeof value === 'string') return `s:${value.length}:${value}`
+  if (typeof value === 'number') return `n:${Object.is(value, -0) ? '-0' : String(value)}`
+  if (value instanceof Date) return `d:${value.getTime()}`
+  if (Array.isArray(value)) return `a:[${value.map(encodePhysicalStorageKey).join(',')}]`
+  if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) {
+    const bytes =
+      value instanceof ArrayBuffer
+        ? new Uint8Array(value)
+        : new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
+    let encoded = 'b:'
+    for (const byte of bytes) encoded += byte.toString(16).padStart(2, '0')
+    return encoded
+  }
+  throw new Error('PhysicalStorageKeyInvalid')
+}
+
+export function physicalStorageMutationAddress(
+  tableName: PhysicalStorageTableName,
+  key: unknown,
+): string {
+  return `${tableName}\u0000${encodePhysicalStorageKey(key)}`
+}
+
 export type PhysicalStorageSchemaClass = 'canonical' | 'repairable'
 export type PhysicalStorageDataClass =
   | 'authoritative'

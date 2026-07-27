@@ -121,6 +121,19 @@ function destination(
       pathHeaders: Object.freeze(rows.map((row) => row.header)),
     }),
     presentations: Object.freeze([tip]),
+    forks: Object.freeze(
+      rows.map((row) => ({
+        parentId: row.header.parentId,
+        selectedMessageId: row.header.id,
+        slotVersion: row.header.nodeVersion + 1,
+        position: 0,
+        liveCount: 1,
+        previousMessageId: null,
+        nextMessageId: null,
+        firstMessageId: row.header.id,
+        lastMessageId: row.header.id,
+      })),
+    ),
   })
 }
 

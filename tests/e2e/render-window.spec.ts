@@ -190,6 +190,7 @@ test('send and regenerate keep the transcript mounted while the branch window re
     loadingSeen: false,
     messageCountDecreased: false,
     messageCountsIncludeZero: false,
+    minimumBranchControlCount: 0,
     minimumMessageCount: expect.any(Number),
   })
 
@@ -310,6 +311,7 @@ test('send and regenerate keep the transcript mounted while the branch window re
     loadingSeen: false,
     messageCountDecreased: false,
     messageCountsIncludeZero: false,
+    minimumBranchControlCount: 0,
     minimumMessageCount: expect.any(Number),
   })
 })
@@ -421,15 +423,25 @@ test('branch swipe preserves common-prefix DOM identity without loading or blank
   const destinationUser = selectedBranchIsA ? 'branch B user' : 'branch A user'
   const destinationAssistant = selectedBranchIsA ? 'branch B assistant' : 'branch A assistant'
   const swipeLabel = selectedBranchIsA ? 'Next variant' : 'First variant'
+  const returnLabel = selectedBranchIsA ? 'Previous variant' : 'Last variant'
 
   await startMessageCountRecorder(page, { commonPrefixMessageIds })
   await messages.filter({ hasText: selectedUser }).getByLabel(swipeLabel).click()
   await expect(messages.nth(1)).toContainText(destinationUser)
   await expect(messages.nth(2)).toContainText(destinationAssistant)
+  const destinationPosition = selectedBranchIsA ? '2 / 2' : '1 / 2'
+  await expect(messages.nth(1).locator('[data-ui="branch-controls"]')).toContainText(
+    destinationPosition,
+  )
+  await messages.nth(1).getByLabel(returnLabel).click()
+  await expect(messages.nth(1)).toContainText(selectedUser)
+  const returnPosition = selectedBranchIsA ? '1 / 2' : '2 / 2'
+  await expect(messages.nth(1).locator('[data-ui="branch-controls"]')).toContainText(returnPosition)
 
   const continuity = await stopMessageCountRecorder(page)
   expectCommonPrefixContinuity(continuity, commonPrefixMessageIds.length)
   expect(continuity.messageCountsIncludeZero).toBe(false)
+  expect(continuity.minimumBranchControlCount).toBeGreaterThan(0)
   await expect(messages).toHaveCount(3)
 })
 
@@ -648,7 +660,7 @@ test('a folder larger than one page expands gap-free without stealing the top-fi
     .toBe(expectedChatIds.size)
   expect([...collected].sort()).toEqual([...expectedChatIds].sort())
   expect(maximumMountedRows).toBeLessThanOrEqual(80)
-  expect(await readMessageBodyReadCounter(page)).toBe(0)
+  expect(await readMessageBodyReadCounter(page)).toEqual({ calls: [], reads: 0 })
 })
 
 test('virtualized sidebar bottom tracks mixed folder and tag row heights', async ({ page }) => {
@@ -1226,9 +1238,13 @@ async function seedLargeFolderRows(
 async function installMessageBodyReadCounter(page: Page): Promise<void> {
   await page.addInitScript(() => {
     type CounterWindow = Window & {
-      __messageBodyReadCounter?: { reads: number }
+      __messageBodyReadCounter?: {
+        calls: string[]
+        compactionReads: number
+        reads: number
+      }
     }
-    const counter = { reads: 0 }
+    const counter = { calls: [] as string[], compactionReads: 0, reads: 0 }
     ;(window as CounterWindow).__messageBodyReadCounter = counter
     const wrap = (
       prototype: object,
@@ -1252,7 +1268,14 @@ async function installMessageBodyReadCounter(page: Page): Promise<void> {
             this: IDBObjectStore | IDBIndex,
             ...args: unknown[]
           ): IDBRequest<unknown> {
-            if (storeName(this) === 'messageBodies') counter.reads += 1
+            if (storeName(this) === 'messageBodies') {
+              const call = `${method}\n${new Error().stack ?? ''}`
+              if (call.includes('/browser-workspace-compaction-')) counter.compactionReads += 1
+              else {
+                counter.reads += 1
+                if (counter.calls.length < 20) counter.calls.push(call)
+              }
+            }
             return Reflect.apply(implementation, this, args) as IDBRequest<unknown>
           },
         })
@@ -1267,23 +1290,35 @@ async function resetMessageBodyReadCounter(page: Page): Promise<void> {
   await page.evaluate(() => {
     const counter = (
       window as Window & {
-        __messageBodyReadCounter?: { reads: number }
+        __messageBodyReadCounter?: {
+          calls: string[]
+          compactionReads: number
+          reads: number
+        }
       }
     ).__messageBodyReadCounter
     if (!counter) throw new Error('MessageBodyReadCounterMissing')
+    counter.calls.length = 0
+    counter.compactionReads = 0
     counter.reads = 0
   })
 }
 
-async function readMessageBodyReadCounter(page: Page): Promise<number> {
+async function readMessageBodyReadCounter(
+  page: Page,
+): Promise<{ readonly calls: readonly string[]; readonly reads: number }> {
   return page.evaluate(() => {
     const counter = (
       window as Window & {
-        __messageBodyReadCounter?: { reads: number }
+        __messageBodyReadCounter?: {
+          calls: string[]
+          compactionReads: number
+          reads: number
+        }
       }
     ).__messageBodyReadCounter
     if (!counter) throw new Error('MessageBodyReadCounterMissing')
-    return counter.reads
+    return { calls: [...counter.calls], reads: counter.reads }
   })
 }
 

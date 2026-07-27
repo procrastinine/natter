@@ -1,4 +1,6 @@
+import type { Transaction } from 'dexie'
 import type {
+  Chat,
   ChatPreset,
   ChatSettings,
   ConnectionProfile,
@@ -8,15 +10,51 @@ import type {
   PromptPresetKind,
 } from '../../src/core/types'
 import { newId } from '../../src/lib/ulid'
+import { runBrowserCommandTransaction } from '../../src/store/browser-command-mutation-journal'
+import { addSemanticByteOwner } from '../../src/store/byte-owner-mutation'
 import { configurationApplication } from '../../src/store/configuration-application'
+import {
+  applyConfigurationPromptPresetCatalogProjectionTransition,
+  CONFIGURATION_PROMPT_PRESET_CATALOG_TRANSACTION_CAPABILITY,
+} from '../../src/store/configuration-catalog-projection'
 import { executeConfigurationCommand } from '../../src/store/configuration-command-client'
 import {
   buildConnectionProfile,
   type ConfigurationProfileDraftInput,
+  chatConfigurationTargetResourceNames,
 } from '../../src/store/configuration-domain-contract'
 import { getDb } from '../../src/store/db'
+import {
+  assertPhysicalTransactionTablesDeclared,
+  bindFencedTransaction,
+  physicalStorageTables,
+  physicalTransactionPlan,
+} from '../../src/store/physical-storage-tables'
 import { readPresetOrderIds } from '../../src/store/preset-order'
+import { registerPhysicalMutationTransaction } from '../../src/store/storage-compaction-state'
 import type { WorkspaceWriteAuthority } from '../../src/store/workspace-protocol'
+
+const TEST_PROMPT_PRESET_WRITE_PLAN = physicalTransactionPlan(
+  physicalStorageTables('promptPresets'),
+  CONFIGURATION_PROMPT_PRESET_CATALOG_TRANSACTION_CAPABILITY,
+)
+
+export function testChatConfigurationLinkTransition(
+  chat: Chat,
+  settings: ChatSettings = chat.settings,
+): {
+  readonly expectedResourceNames: readonly string[]
+  readonly nextResourceNames: readonly string[]
+} {
+  return {
+    expectedResourceNames: chatConfigurationTargetResourceNames(chat),
+    nextResourceNames: chatConfigurationTargetResourceNames({
+      id: chat.id,
+      settings,
+      ...(chat.presetId ? { presetId: chat.presetId } : {}),
+    }),
+  }
+}
 
 export async function createConfigurationProfile(
   input: ConfigurationProfileDraftInput,
@@ -56,15 +94,12 @@ export async function createConfigurationChatPreset(input: {
 }): Promise<ChatPreset> {
   const id = input.id ?? newId()
   const now = input.now ?? Date.now()
-  const result = await configurationApplication.execute({
-    kind: 'chat-preset.create',
-    preset: {
-      id,
-      name: input.name,
-      connectionProfileId: input.connectionProfileId,
-      settings: input.settings,
-      ...(input.lastUsedAt === undefined ? {} : { lastUsedAt: input.lastUsedAt }),
-    },
+  const result = await configurationApplication.createChatPreset({
+    presetId: id,
+    name: input.name,
+    profileId: input.connectionProfileId,
+    settings: input.settings,
+    ...(input.lastUsedAt === undefined ? {} : { lastUsedAt: input.lastUsedAt }),
     now,
   })
   if (result.kind !== 'chat-preset-saved') throw new Error(`ChatPresetCreateFailed:${id}`)
@@ -139,13 +174,27 @@ export async function createConfigurationPromptPreset(input: {
     updatedAt: now,
     ...(input.lastUsedAt === undefined ? {} : { lastUsedAt: input.lastUsedAt }),
   }
-  const result = await configurationApplication.execute({
-    kind: 'prompt-preset.put',
-    preset,
-    now,
+  await runTestPromptPresetWrite(async (tx) => {
+    await addSemanticByteOwner(tx, 'promptPresets', preset)
+    await applyConfigurationPromptPresetCatalogProjectionTransition(tx, undefined, preset)
   })
-  if (result.kind !== 'prompt-preset-saved' || !result.preset) {
-    throw new Error(`PromptPresetCreateFailed:${preset.id}`)
-  }
-  return result.preset
+  return preset
+}
+
+async function runTestPromptPresetWrite(operation: (tx: Transaction) => Promise<void>) {
+  const db = getDb()
+  await db.transaction(
+    'rw',
+    TEST_PROMPT_PRESET_WRITE_PLAN.tableNames.map((tableName) => db.table(tableName)),
+    async (raw) => {
+      registerPhysicalMutationTransaction(raw)
+      const committed = await runBrowserCommandTransaction(raw, (tx) =>
+        operation(bindFencedTransaction(tx, TEST_PROMPT_PRESET_WRITE_PLAN)),
+      )
+      assertPhysicalTransactionTablesDeclared(
+        TEST_PROMPT_PRESET_WRITE_PLAN,
+        committed.facts.tableNames,
+      )
+    },
+  )
 }

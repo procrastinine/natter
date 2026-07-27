@@ -1,6 +1,6 @@
-import Dexie, { type Table } from 'dexie'
+import Dexie from 'dexie'
 import { recordBrowserCommandBackfillSettingMutation } from './browser-command-mutation-journal'
-import { recordObsoleteByteOwnerValues } from './byte-owner-mutation'
+import { putPhysicalStorageRow } from './byte-owner-mutation'
 import type { SettingsRow } from './db-rows'
 import {
   type CapabilityTables,
@@ -8,6 +8,12 @@ import {
   physicalStorageTables,
 } from './physical-storage-tables'
 import type { StreamJournalFrameRow, StreamLeaseRow } from './repository'
+import {
+  createSemanticOperationExactReceiptAccumulator,
+  type SemanticOperationExactReceiptAccumulator,
+  type SemanticOperationReceiptFragment,
+  type SemanticOperationReplayPlan,
+} from './semantic-operation-capability'
 import { retireStreamJournalOwnershipPage } from './stream-journal-storage'
 
 export const STREAM_JOURNAL_INTEGRITY_SETTING_KEY = 'backfill:stream-journal-integrity-v1'
@@ -38,13 +44,17 @@ export type StreamJournalIntegrityPlan =
       readonly completeAfterRetirement: boolean
     }
 
-export class StreamJournalIntegrityPlanChangedError extends Error {}
-
 export interface StreamJournalIntegrityResult {
   readonly scannedStreamIds: number
   readonly deletedStreamIds: readonly string[]
   readonly deletedFrames: number
   readonly done: boolean
+}
+
+export interface StreamJournalIntegrityTransition {
+  readonly result: StreamJournalIntegrityResult
+  readonly replay: SemanticOperationReplayPlan
+  readonly receipt: SemanticOperationReceiptFragment<'settings' | 'streamLeases' | 'streamChunks'>
 }
 
 export function completedStreamJournalIntegritySetting(): SettingsRow {
@@ -61,27 +71,38 @@ export function pendingStreamJournalIntegritySetting(): SettingsRow {
   }
 }
 
-export async function readStreamJournalIntegrityPlan(source: {
-  table<Row, Key>(name: string): { get(key: Key): Promise<Row | undefined> }
-}): Promise<StreamJournalIntegrityPlan> {
-  const row = await source
-    .table<SettingsRow, string>('settings')
-    .get(STREAM_JOURNAL_INTEGRITY_SETTING_KEY)
-  return streamJournalIntegrityPlan(parseStreamJournalIntegrityState(row?.value))
-}
-
 export async function reconcileStreamJournalIntegrityPage(
   tx: StreamJournalIntegrityTransaction,
   requestedLimit: number,
-  expectedPlan: Exclude<StreamJournalIntegrityPlan, { kind: 'complete' }>,
-): Promise<StreamJournalIntegrityResult> {
+): Promise<StreamJournalIntegrityTransition> {
   const limit = Math.max(1, Math.min(128, Math.floor(requestedLimit)))
+  const receipt = createSemanticOperationExactReceiptAccumulator<
+    'settings' | 'streamLeases' | 'streamChunks'
+  >()
   const settings = tx.table<SettingsRow, string>('settings')
   const row = await settings.get(STREAM_JOURNAL_INTEGRITY_SETTING_KEY)
   if (!row) throw new Error('StreamJournalIntegrityStateInvalid')
+  receipt.physicalRead({
+    tableName: 'settings',
+    indexKind: 'primary',
+    operation: 'get',
+    requestCount: 1,
+    rowCount: 1,
+  })
   const state = parseStreamJournalIntegrityState(row.value)
-  if (!sameStreamJournalIntegrityPlan(streamJournalIntegrityPlan(state), expectedPlan)) {
-    throw new StreamJournalIntegrityPlanChangedError()
+  const expectedPlan = streamJournalIntegrityPlan(state)
+  if (expectedPlan.kind === 'complete') {
+    return streamJournalIntegrityTransition(
+      state,
+      limit,
+      {
+        scannedStreamIds: 0,
+        deletedStreamIds: [],
+        deletedFrames: 0,
+        done: true,
+      },
+      receipt,
+    )
   }
   if (expectedPlan.kind === 'retire') {
     if (
@@ -89,39 +110,58 @@ export async function reconcileStreamJournalIntegrityPage(
       state.streamId !== expectedPlan.streamId ||
       state.completeAfterRetirement !== expectedPlan.completeAfterRetirement
     ) {
-      throw new StreamJournalIntegrityPlanChangedError()
+      throw new Error(`StreamJournalIntegrityStateInvalid:${state.streamId ?? 'missing-stream'}`)
     }
     const retired = await retireStreamJournalOwnershipPage(tx, {
       kind: 'lease-absent-stream',
       streamId: state.streamId,
+      maxFrameRows: limit,
     })
-    if (retired.outcome === 'ineligible' && retired.reason !== 'lease-present') {
+    if (retired.kind !== 'single-stream') throw new Error('StreamJournalIntegrityReceiptMissing')
+    receipt.absorb(retired.receipt)
+    if (retired.result.outcome === 'ineligible' && retired.result.reason !== 'lease-present') {
       throw new Error(`StreamJournalIntegrityRetirementInvalid:${state.streamId}`)
     }
-    if (retired.outcome === 'progress') {
-      return {
-        scannedStreamIds: 0,
-        deletedStreamIds: [],
-        deletedFrames: retired.deletedFrames,
-        done: false,
-      }
+    if (retired.result.outcome === 'progress') {
+      return streamJournalIntegrityTransition(
+        state,
+        limit,
+        {
+          scannedStreamIds: 0,
+          deletedStreamIds: [],
+          deletedFrames: retired.result.deletedFrames,
+          done: false,
+        },
+        receipt,
+      )
     }
     const done = state.completeAfterRetirement === true
     await writeStreamJournalIntegrityState(
       tx,
-      settings,
       row,
       done
         ? completedStreamJournalIntegrityState()
         : pendingStreamJournalIntegrityState(state.streamId),
     )
-    return {
-      scannedStreamIds: 0,
-      deletedStreamIds:
-        retired.outcome === 'complete' && retired.deletedFrames > 0 ? [state.streamId] : [],
-      deletedFrames: retired.deletedFrames,
-      done,
-    }
+    receipt.physicalMutation({
+      tableName: 'settings',
+      operation: 'write',
+      key: STREAM_JOURNAL_INTEGRITY_SETTING_KEY,
+    })
+    return streamJournalIntegrityTransition(
+      state,
+      limit,
+      {
+        scannedStreamIds: 0,
+        deletedStreamIds:
+          retired.result.outcome === 'complete' && retired.result.deletedFrames > 0
+            ? [state.streamId]
+            : [],
+        deletedFrames: retired.result.deletedFrames,
+        done,
+      },
+      receipt,
+    )
   }
   const streamIds = (await tx
     .table<StreamJournalFrameRow, string>('streamChunks')
@@ -129,49 +169,128 @@ export async function reconcileStreamJournalIntegrityPage(
     .above(expectedPlan.afterStreamId ?? Dexie.minKey)
     .limit(limit)
     .uniqueKeys()) as string[]
+  receipt.physicalRead({
+    tableName: 'streamChunks',
+    indexKind: 'secondary',
+    indexName: 'streamId',
+    operation: 'open-cursor',
+    requestCount: 1,
+    rowCount: streamIds.length,
+  })
   const leases = await tx.table<StreamLeaseRow, string>('streamLeases').bulkGet(streamIds)
-  const orphanIndex = leases.findIndex((lease) => lease === undefined)
+  receipt.physicalRead({
+    tableName: 'streamLeases',
+    indexKind: 'primary',
+    operation: 'get-many',
+    requestCount: 1,
+    rowCount: streamIds.length,
+  })
+  const orphanIndex = leases.indexOf(undefined)
   if (orphanIndex >= 0) {
     const streamId = streamIds[orphanIndex]
     if (!streamId) throw new Error('StreamJournalIntegrityStreamIdMissing')
-    await writeStreamJournalIntegrityState(tx, settings, row, {
+    await writeStreamJournalIntegrityState(tx, row, {
       version: STREAM_JOURNAL_INTEGRITY_VERSION,
       phase: 'retiring',
       streamId,
       completeAfterRetirement: orphanIndex === streamIds.length - 1 && streamIds.length < limit,
     })
-    return {
-      scannedStreamIds: orphanIndex + 1,
-      deletedStreamIds: [],
-      deletedFrames: 0,
-      done: false,
-    }
+    receipt.physicalMutation({
+      tableName: 'settings',
+      operation: 'write',
+      key: STREAM_JOURNAL_INTEGRITY_SETTING_KEY,
+    })
+    return streamJournalIntegrityTransition(
+      state,
+      limit,
+      {
+        scannedStreamIds: orphanIndex + 1,
+        deletedStreamIds: [],
+        deletedFrames: 0,
+        done: false,
+      },
+      receipt,
+    )
   }
   const done = streamIds.length < limit
   await writeStreamJournalIntegrityState(
     tx,
-    settings,
     row,
     done
       ? completedStreamJournalIntegrityState()
       : pendingStreamJournalIntegrityState(streamIds.at(-1)),
   )
+  receipt.physicalMutation({
+    tableName: 'settings',
+    operation: 'write',
+    key: STREAM_JOURNAL_INTEGRITY_SETTING_KEY,
+  })
+  return streamJournalIntegrityTransition(
+    state,
+    limit,
+    {
+      scannedStreamIds: streamIds.length,
+      deletedStreamIds: [],
+      deletedFrames: 0,
+      done,
+    },
+    receipt,
+  )
+}
+
+function streamJournalIntegrityTransition(
+  state: StreamJournalIntegrityState,
+  limit: number,
+  result: StreamJournalIntegrityResult,
+  receipt: SemanticOperationExactReceiptAccumulator<'settings' | 'streamLeases' | 'streamChunks'>,
+): StreamJournalIntegrityTransition {
+  return Object.freeze({
+    result: Object.freeze({
+      ...result,
+      deletedStreamIds: Object.freeze([...result.deletedStreamIds]),
+    }),
+    replay: streamJournalIntegrityReplayPlan(state, limit),
+    receipt: receipt.sealFragment(),
+  })
+}
+
+function streamJournalIntegrityReplayPlan(
+  state: StreamJournalIntegrityState,
+  limit: number,
+): SemanticOperationReplayPlan {
+  const cursor =
+    state.phase === 'pending'
+      ? (state.afterStreamId ?? null)
+      : state.phase === 'retiring'
+        ? (state.streamId ?? null)
+        : null
   return {
-    scannedStreamIds: streamIds.length,
-    deletedStreamIds: [],
-    deletedFrames: 0,
-    done,
+    kind: 'durable-page-resume',
+    owner: 'stream-journal-integrity',
+    cycle: STREAM_JOURNAL_INTEGRITY_VERSION,
+    revision: state.phase,
+    cursor,
+    doneMarker:
+      state.phase === 'complete'
+        ? 'complete'
+        : state.phase === 'retiring' && state.completeAfterRetirement
+          ? 'complete-after-retirement'
+          : 'pending',
+    limit,
   }
 }
 
 async function writeStreamJournalIntegrityState(
   tx: StreamJournalIntegrityTransaction,
-  settings: Table<SettingsRow, string>,
   previous: SettingsRow,
   state: StreamJournalIntegrityState,
 ): Promise<void> {
-  await recordObsoleteByteOwnerValues(tx, [previous])
-  await settings.put({ key: STREAM_JOURNAL_INTEGRITY_SETTING_KEY, value: state })
+  await putPhysicalStorageRow<SettingsRow, string>(
+    tx,
+    'settings',
+    { key: STREAM_JOURNAL_INTEGRITY_SETTING_KEY, value: state },
+    previous,
+  )
   recordBrowserCommandBackfillSettingMutation(tx, STREAM_JOURNAL_INTEGRITY_SETTING_KEY)
 }
 
@@ -208,21 +327,6 @@ function streamJournalIntegrityPlan(
     kind: 'scan',
     ...(state.afterStreamId === undefined ? {} : { afterStreamId: state.afterStreamId }),
   }
-}
-
-function sameStreamJournalIntegrityPlan(
-  left: StreamJournalIntegrityPlan,
-  right: StreamJournalIntegrityPlan,
-): boolean {
-  if (left.kind !== right.kind) return false
-  if (left.kind === 'complete' || right.kind === 'complete') return true
-  if (left.kind === 'retire' && right.kind === 'retire') {
-    return (
-      left.streamId === right.streamId &&
-      left.completeAfterRetirement === right.completeAfterRetirement
-    )
-  }
-  return left.kind === 'scan' && right.kind === 'scan' && left.afterStreamId === right.afterStreamId
 }
 
 function parseStreamJournalIntegrityState(value: unknown): StreamJournalIntegrityState {

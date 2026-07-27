@@ -5,11 +5,7 @@ import { messageRenderableTextSemanticsEqual } from '../core/branch-flatten'
 import { type BranchPathWindow, readLiveBranchPath } from '../core/branch-session'
 import { modelCatalogQueryForConnectionKind, modelsCacheKey } from '../core/cache-keys'
 import { computeBranchTitle } from '../core/chat-fork'
-import {
-  chatSettingsPromptPresetReferences,
-  normalizeChatSettings,
-  sameOrderedIds,
-} from '../core/chat-metadata'
+import { chatSettingsPromptPresetReferences } from '../core/chat-metadata'
 import { connectionDispatchKeyRefs, connectionHttpProfile } from '../core/connection-dispatch-proof'
 import {
   type AppliedMessageSemanticEffect,
@@ -37,7 +33,6 @@ import {
   fixedConversationSelectionTarget,
   type MessageMutationRepository,
 } from '../core/messages'
-import { forceEquivalentModelIdForConnection } from '../core/model-selection'
 import {
   normalizeRenderingPreferences,
   RENDERING_PREFERENCES_KEY,
@@ -65,7 +60,6 @@ import type {
   AttachmentArtifact,
   AttachmentId,
   AttachmentJob,
-  AttachmentMissingReason,
   AttachmentReferenceEdge,
   Chat,
   ChatFolder,
@@ -104,10 +98,10 @@ import {
 import { liveAttachmentRefs, normalizeAttachmentRefs } from './attachment-refs'
 import { type AttachmentHeaderRow, hydrateAttachment } from './attachment-storage'
 import { subscribeWorkspaceChanges } from './broadcast'
+import { readActiveBranchForksInTransaction } from './active-branch-fork-storage'
 import {
   type ConversationOpenFrameStore,
   readActiveBranchChildAtPositionInTransaction,
-  readActiveBranchForksInTransaction,
   readConversationOpenInitialReceiptInTransaction,
   resolveConversationOpenReceipt,
 } from './browser-active-branch-spine'
@@ -169,30 +163,19 @@ import {
   boundedMaintenanceLimit,
   MAX_STORAGE_MAINTENANCE_BATCH,
 } from './browser-workspace-maintenance-contract'
-import {
-  addPhysicalStorageRow,
-  addPhysicalStorageRows,
-  insertMessageBody,
-  putPhysicalStorageRow,
-} from './byte-owner-mutation'
+import { addPhysicalStorageRows, putPhysicalStorageRow } from './byte-owner-mutation'
 import {
   applyChatRowWriteTransitions,
   CHAT_ROW_LINKED_TRANSACTION_CAPABILITY,
-  CHAT_ROW_PRESERVING_LINKS_TRANSACTION_CAPABILITY,
 } from './chat-row-transition'
 import { readTemporaryChatIdPage } from './chat-storage-codec'
 import {
   CHAT_CLOSURE_BATCH_LIMIT,
   CHAT_CLOSURE_TRANSACTION_CAPABILITY,
-  ChatClosurePlanChangedError,
-  deletePlannedEmptyDraftChats,
-  emptyDraftChatClosureLockNames,
-  planEmptyDraftChatClosure,
+  deleteEligibleEmptyDraftChatClosure,
 } from './chat-storage-ownership'
 import {
-  CONFIGURATION_PRESET_RECENCY_TRANSACTION_CAPABILITY,
   CONFIGURATION_PROFILE_CATALOG_STATE_ID,
-  CONFIGURATION_PROFILE_CATALOG_TRANSACTION_CAPABILITY,
   type ConfigurationCatalogStateRow,
   type ConfigurationPresetCatalogProjectionRow,
   type ConfigurationProfileCatalogProjectionRow,
@@ -230,12 +213,14 @@ import type {
 } from './db-rows'
 import {
   DISCOVERY_CACHE_MUTATION_TRANSACTION_CAPABILITY,
+  type DiscoveryCacheReadEvidence,
   type DiscoveryCacheStorageTable,
   deleteDiscoveryCacheRow,
   maintainDiscoveryCache,
   prepareDiscoveryPayload,
   putDiscoveryCacheRow,
   readDiscoveryCacheRow,
+  readDiscoveryCacheRowWithEvidence,
   type DiscoveryCacheEviction as StorageDiscoveryCacheEviction,
   type DiscoveryCachePutResult as StorageDiscoveryCachePutResult,
 } from './discovery-cache-storage'
@@ -243,8 +228,6 @@ import { exactCompoundPrefixBetween, scalarCompoundIndexBetween } from './indexe
 import {
   type AuthoritativeCommandLockSession,
   type LockGrant,
-  normalizeNamedLocks,
-  scopeResourceName,
   withSharedAuthoritativeCommandSession,
 } from './locks'
 import {
@@ -312,6 +295,7 @@ import type {
   MutationFinalizationContext,
   StreamJournalFrameRow,
   StreamLeaseAdmission,
+  StreamLeaseHandoffReason,
   StreamLeaseHeartbeat,
   StreamLeaseRow,
   StreamPostCommitEvidence,
@@ -338,6 +322,48 @@ import {
   WorkspaceReplacementFenceError,
 } from './repository'
 import {
+  assertSemanticOperationCommandLifetimeReceipt,
+  assertSemanticOperationEffectKinds,
+  assertSemanticOperationExactInvalidations,
+  assertSemanticOperationExactPhysicalMutations,
+  assertSemanticOperationExactPhysicalReads,
+  assertSemanticOperationExactPhysicalWrites,
+  assertSemanticOperationReplay,
+  assertSemanticOperationWrites,
+  attachSemanticOperationExactPhysicalReads,
+  attachSemanticOperationPhysicalIo,
+  boundSemanticOperationExactReceiptAccumulator,
+  collectSemanticOperationPhysicalWrites,
+  configurationSemanticOperationKind,
+  createSemanticOperationExactReceiptAccumulator,
+  type SemanticOperationCommandLifetimeReceipt,
+  type SemanticOperationDescriptor,
+  type SemanticOperationExactPhysicalRead,
+  type SemanticOperationExactReceipt,
+  type SemanticOperationExecution,
+  type SemanticOperationKind,
+  type SemanticOperationPhysicalBounds,
+  type SemanticOperationPhysicalRead,
+  type SemanticOperationReceiptFragment,
+  type SemanticOperationReplayPlan,
+  type SemanticOperationReplayToken,
+  type SemanticOperationRunner,
+  semanticOperationCommandLifetimeReceipt,
+  semanticOperationCommandLifetimeReceiptWithPhysicalReads,
+  semanticOperationCommandLifetimeReceiptWithPreflight,
+  semanticOperationDelegationCapability,
+  semanticOperationDescriptor,
+  semanticOperationExactPlan,
+  semanticOperationExactReceipt,
+  semanticOperationExactReceiptContracts,
+  semanticOperationExactReceiptReplayContract,
+  semanticOperationExactReceiptReplayProofContract,
+  semanticOperationExecution,
+  semanticOperationExecutionParts,
+  semanticOperationReceiptFragment,
+  semanticOperationResourceNames,
+} from './semantic-operation-capability'
+import {
   awaitStorageCompactionWriteAdmission,
   registerPhysicalMutationTransaction,
 } from './storage-compaction-state'
@@ -352,26 +378,30 @@ import {
   type StorageRetentionTask,
   storageRetentionCycle,
 } from './storage-retention-state'
-import { canonicalStreamJournalFrameBatch } from './stream-journal-codec'
 import {
-  readStreamJournalIntegrityPlan,
+  canonicalStreamJournalFrameBatch,
+  STREAM_JOURNAL_APPEND_MAX_ROWS,
+  type StreamJournalWriterAuthority,
+  streamJournalWriterAuthority,
+} from './stream-journal-codec'
+import {
   reconcileStreamJournalIntegrityPage,
   STREAM_JOURNAL_INTEGRITY_TRANSACTION_CAPABILITY,
-  StreamJournalIntegrityPlanChangedError,
 } from './stream-journal-integrity'
 import {
   appendStreamJournalFrames as persistStreamJournalFrames,
   putStreamLeaseByteOwner,
   retireStreamJournalOwnershipPage,
   STREAM_JOURNAL_MUTATION_TRANSACTION_CAPABILITY,
+  STREAM_JOURNAL_RETIREMENT_MAX_ROWS,
   STREAM_LEASE_MUTATION_TRANSACTION_CAPABILITY,
 } from './stream-journal-storage'
 import { STREAM_LEASE_HEARTBEAT_COALESCE_MS } from './stream-lease-policy'
 import { applyStructuralSnapshotInRepository } from './structural-undo-repository'
 import { readTextTemplateCatalog } from './text-template-storage'
-import { nextChatUpdatedAtInTransaction, TransactionChatUpdateClock } from './transaction-order'
+import { nextChatUpdatedAtInTransaction } from './transaction-order'
 import { WorkspaceLocalChildSlotAccumulator } from './workspace-local-evidence'
-import { readBrowserWorkspaceMeta, readBrowserWorkspaceMetaFromTransaction } from './workspace-meta'
+import { readBrowserWorkspaceMetaFromTransaction } from './workspace-meta'
 import type {
   AttachmentBundleWriteInput,
   AttachmentBundleWriteResult,
@@ -413,6 +443,8 @@ import type {
   ConfigurationConnectionManagerRow,
   ConfigurationDiscoveryPayloadProjection,
   ConfigurationDiscoveryPayloadToken,
+  ConfigurationModelResolutionHead,
+  ConfigurationModelResolutionPage,
   ConfigurationPreferencesProjection,
   ConfigurationPresetCatalogPage,
   ConfigurationPresetCatalogRow,
@@ -475,60 +507,979 @@ import {
   CONFIGURATION_CATALOG_MAX_ADDRESSED_ROWS,
   CONFIGURATION_CATALOG_MAX_PAGE_SIZE,
   CONFIGURATION_CATALOG_MAX_REFRESH_ANCHORS,
+  CONFIGURATION_MODEL_RESOLUTION_PAGE_SIZE,
   connectionDiscoveryRevisionKey,
   normalizeWorkspaceDependencies,
   workspaceDependenciesForDeltaFact,
 } from './workspace-protocol'
 import { assertWorkspaceExecutionPermit, assertWorkspaceReadPermit } from './workspace-runtime'
 
-const STREAM_LEASE_TRANSACTION = physicalTransactionPlan(
-  STREAM_LEASE_MUTATION_TRANSACTION_CAPABILITY,
+const CONFIGURATION_COMMAND_SEMANTIC_DELEGATION = semanticOperationDelegationCapability<
+  Extract<WorkspaceCommand, { kind: 'configuration.execute' }>,
+  ReturnType<typeof configurationSemanticOperationKind>
+>({
+  operationKind: 'configuration.execute',
+  childOperationKind: (command) => configurationSemanticOperationKind(command.input.kind),
+})
+
+function workspaceCommandSemanticOperationKind(command: WorkspaceCommand): SemanticOperationKind {
+  if (command.kind === CONFIGURATION_COMMAND_SEMANTIC_DELEGATION.operationKind) {
+    return CONFIGURATION_COMMAND_SEMANTIC_DELEGATION.childOperationKind(command)
+  }
+  return command.kind
+}
+
+const DISCOVERY_CACHE_ROW_WRITE_TRANSACTION_CAPABILITY = physicalStorageTables(
+  ...DISCOVERY_CACHE_MUTATION_TRANSACTION_CAPABILITY.tableNames,
+  'keys',
+  'profiles',
 )
-const STREAM_JOURNAL_TRANSACTION = physicalTransactionPlan(
-  STREAM_JOURNAL_MUTATION_TRANSACTION_CAPABILITY,
-)
-const STREAM_JOURNAL_INTEGRITY_TRANSACTION = physicalTransactionPlan(
-  STREAM_JOURNAL_INTEGRITY_TRANSACTION_CAPABILITY,
-)
-const DISCOVERY_CACHE_TRANSACTION = physicalTransactionPlan(
-  DISCOVERY_CACHE_MUTATION_TRANSACTION_CAPABILITY,
-)
-const DISCOVERY_CACHE_ROW_WRITE_TRANSACTION = physicalTransactionPlan(
-  DISCOVERY_CACHE_MUTATION_TRANSACTION_CAPABILITY,
-  physicalStorageTables('keys', 'profiles'),
-)
-const DISCOVERY_MODELS_WRITE_TRANSACTION = physicalTransactionPlan(
-  DISCOVERY_CACHE_MUTATION_TRANSACTION_CAPABILITY,
-  CHAT_ROW_LINKED_TRANSACTION_CAPABILITY,
-  physicalStorageTables('keys', 'profiles'),
-)
-const ATTACHMENT_INTEGRITY_TRANSACTION = physicalTransactionPlan(
-  ATTACHMENT_INTEGRITY_TRANSACTION_CAPABILITY,
-)
+interface DiscoveryCacheOperationInput {
+  readonly kind: DiscoveryCacheCommand['kind']
+  readonly profileId: ProfileId
+  readonly discriminator: string
+  readonly targetKey: string | null
+}
+
+function discoveryCacheOperationTransaction(kind: DiscoveryCacheCommand['kind']) {
+  switch (kind) {
+    case 'discovery.models.put':
+    case 'discovery.endpoints.put':
+    case 'discovery.privacy.put':
+      return DISCOVERY_CACHE_ROW_WRITE_TRANSACTION_CAPABILITY
+    case 'discovery.models.delete':
+      return DISCOVERY_CACHE_MUTATION_TRANSACTION_CAPABILITY
+  }
+}
+
+function discoveryCacheOperationTable(kind: DiscoveryCacheCommand['kind']) {
+  switch (kind) {
+    case 'discovery.models.put':
+    case 'discovery.models.delete':
+      return 'models' as const
+    case 'discovery.endpoints.put':
+      return 'endpoints' as const
+    case 'discovery.privacy.put':
+      return 'privacyPolicies' as const
+  }
+}
+
+function discoveryCacheOperationDescriptor(kind: DiscoveryCacheCommand['kind']) {
+  const transaction = discoveryCacheOperationTransaction(kind)
+  return semanticOperationDescriptor({
+    operationKind: kind,
+    transaction,
+    resources: (input: DiscoveryCacheOperationInput) => [
+      'discovery-cache:retention',
+      `discovery-cache:${discoveryCacheOperationTable(input.kind)}:${input.profileId}`,
+      ...(input.targetKey ? [`configuration-target:${input.targetKey}`] : []),
+    ],
+    permittedWrites: transaction.tableNames,
+    requiredWritesWhenMutated: [],
+    ...semanticOperationExactReceiptContracts<
+      DiscoveryCacheOperationInput,
+      PhysicalStorageTableName
+    >(),
+    replay: semanticOperationExactReceiptReplayProofContract<DiscoveryCacheOperationInput>(
+      (input, receipt) => assertDirectDiscoveryCacheReplayProof(input.kind, receipt),
+    ),
+  })
+}
+
+const DISCOVERY_CACHE_PUT_OPERATION_BOUNDS = Object.freeze({
+  reads: Object.freeze({
+    maxRequests: 79,
+    maxRows: 851,
+    maxBatchRows: 260,
+    maxBytes: Number.MAX_SAFE_INTEGER,
+  }),
+  writes: Object.freeze({
+    maxRequests: 137,
+    maxRows: 198,
+    maxBatchRows: 64,
+    maxBytes: Number.MAX_SAFE_INTEGER,
+  }),
+})
+
+const DISCOVERY_CACHE_DELETE_OPERATION_BOUNDS = Object.freeze({
+  reads: Object.freeze({
+    maxRequests: 7,
+    maxRows: 7,
+    maxBatchRows: 1,
+    maxBytes: Number.MAX_SAFE_INTEGER,
+  }),
+  writes: Object.freeze({
+    maxRequests: 4,
+    maxRows: 4,
+    maxBatchRows: 1,
+    maxBytes: Number.MAX_SAFE_INTEGER,
+  }),
+})
+
+function discoveryCacheMaintenanceOperationBounds(limit: number): SemanticOperationPhysicalBounds {
+  const boundedLimit = boundedMaintenanceLimit(limit)
+  return {
+    reads: {
+      maxRequests: 8 + 4 * boundedLimit,
+      maxRows: 1_093 + 1_090 * boundedLimit,
+      maxBatchRows: 513,
+      maxBytes: Number.MAX_SAFE_INTEGER,
+    },
+    writes: {
+      maxRequests: 2 * boundedLimit + 1,
+      maxRows: 2 * boundedLimit + 1,
+      maxBatchRows: 1,
+      maxBytes: Number.MAX_SAFE_INTEGER,
+    },
+  }
+}
+
+function assertDirectDiscoveryCacheReplayProof(
+  kind: DiscoveryCacheCommand['kind'],
+  receipt: SemanticOperationExactReceipt,
+): void {
+  const replay = receipt.plan.replay
+  if (replay.kind !== 'single-attempt' || replay.reason !== 'unfenced-relative-update') {
+    throw new Error(`DiscoveryCacheReplayProofMismatch:${kind}`)
+  }
+}
+
+function requireDiscoveryCacheReceiptAccumulator(tx: object) {
+  const receipt = boundSemanticOperationExactReceiptAccumulator<PhysicalStorageTableName>(tx)
+  if (!receipt) throw new Error('DiscoveryCacheExactReceiptAccumulatorMissing')
+  return receipt
+}
+
+function discoveryCacheExactReceipt(
+  receipt: ReturnType<typeof requireDiscoveryCacheReceiptAccumulator>,
+  replay: SemanticOperationReplayPlan,
+  bounds: SemanticOperationPhysicalBounds,
+): SemanticOperationExactReceipt<PhysicalStorageTableName> {
+  const fragment = receipt.snapshotFragment()
+  return semanticOperationExactReceipt(
+    semanticOperationExactPlan({
+      replay,
+      bounds,
+    }),
+    {
+      dependencies: fragment.dependencies,
+      physicalMutations: fragment.physicalMutations,
+      physicalReads: fragment.physicalReads,
+    },
+  )
+}
+
 const STORAGE_RETENTION_STATE_TRANSACTION_CAPABILITY =
   physicalStorageTables('storageRetentionState')
-const TERMINAL_STREAM_RETENTION_TRANSACTION = physicalTransactionPlan(
-  STREAM_JOURNAL_MUTATION_TRANSACTION_CAPABILITY,
-  STORAGE_RETENTION_STATE_TRANSACTION_CAPABILITY,
+const TERMINAL_STREAM_RETENTION_TRANSACTION_CAPABILITY = physicalStorageTables(
+  ...STREAM_JOURNAL_MUTATION_TRANSACTION_CAPABILITY.tableNames,
+  ...STORAGE_RETENTION_STATE_TRANSACTION_CAPABILITY.tableNames,
 )
-const GENERATION_METADATA_TRANSACTION = physicalTransactionPlan(
-  CONFIGURATION_PROFILE_CATALOG_TRANSACTION_CAPABILITY,
-  CONFIGURATION_PRESET_RECENCY_TRANSACTION_CAPABILITY,
-  STREAM_LEASE_MUTATION_TRANSACTION_CAPABILITY,
-  CHAT_ROW_PRESERVING_LINKS_TRANSACTION_CAPABILITY,
-  physicalStorageTables('keys', 'messages', 'presets', 'profiles', 'settings'),
+const EMPTY_DRAFT_RETENTION_TRANSACTION_CAPABILITY = physicalStorageTables(
+  ...CHAT_CLOSURE_TRANSACTION_CAPABILITY.tableNames,
+  ...STORAGE_RETENTION_STATE_TRANSACTION_CAPABILITY.tableNames,
 )
-const FORK_CHAT_TRANSACTION = physicalTransactionPlan(
-  ATTACHMENT_CATALOG_MUTATION_TRANSACTION_CAPABILITY,
-  CHAT_ROW_LINKED_TRANSACTION_CAPABILITY,
-  physicalStorageTables(
+
+interface StreamJournalIntegrityResourceInput {
+  readonly limit: number
+}
+
+interface TerminalStreamRetentionResourceInput {
+  readonly limit: number
+}
+
+interface TerminalStreamRetentionResult {
+  readonly scanned: number
+  readonly deletedStreamIds: string[]
+  readonly deletedFrames: number
+  readonly earliestDeferredAt?: number
+  readonly done: boolean
+}
+
+function assertDurablePageReplayProof(
+  owner: 'stream-journal-integrity' | 'storage-retention:terminal-stream-prune',
+  limit: number,
+  receipt: SemanticOperationExactReceipt,
+): void {
+  const replay = receipt.plan.replay
+  if (replay.kind !== 'durable-page-resume' || replay.owner !== owner || replay.limit !== limit) {
+    throw new Error(`DurablePageReplayProofMismatch:${owner}`)
+  }
+}
+
+const STREAM_JOURNAL_INTEGRITY_OPERATION_BOUNDS = {
+  reads: {
+    maxRequests: 3,
+    maxRows: 1 + 2 * MAX_STORAGE_MAINTENANCE_BATCH,
+    maxBatchRows: MAX_STORAGE_MAINTENANCE_BATCH,
+    maxBytes: Number.MAX_SAFE_INTEGER,
+  },
+  writes: {
+    maxRequests: 2,
+    maxRows: STREAM_JOURNAL_RETIREMENT_MAX_ROWS + 1,
+    maxBatchRows: STREAM_JOURNAL_RETIREMENT_MAX_ROWS,
+    maxBytes: Number.MAX_SAFE_INTEGER,
+  },
+} as const
+
+const STREAM_JOURNAL_INTEGRITY_OPERATION = semanticOperationDescriptor({
+  operationKind: 'maintenance.reconcile-stream-journal-integrity',
+  transaction: STREAM_JOURNAL_INTEGRITY_TRANSACTION_CAPABILITY,
+  resources: () => ['stream-journal-integrity:maintenance'],
+  permittedWrites: STREAM_JOURNAL_INTEGRITY_TRANSACTION_CAPABILITY.tableNames,
+  requiredWritesWhenMutated: [],
+  ...semanticOperationExactReceiptContracts<
+    StreamJournalIntegrityResourceInput,
+    'settings' | 'streamLeases' | 'streamChunks'
+  >(),
+  replay: semanticOperationExactReceiptReplayProofContract<StreamJournalIntegrityResourceInput>(
+    (input, receipt) =>
+      assertDurablePageReplayProof('stream-journal-integrity', input.limit, receipt),
+  ),
+})
+
+const TERMINAL_STREAM_RETENTION_OPERATION_BOUNDS = {
+  reads: {
+    maxRequests: 5,
+    maxRows: STREAM_JOURNAL_RETIREMENT_MAX_ROWS + 5,
+    maxBatchRows: STREAM_JOURNAL_RETIREMENT_MAX_ROWS + 1,
+    maxBytes: Number.MAX_SAFE_INTEGER,
+  },
+  writes: {
+    maxRequests: 3,
+    maxRows: STREAM_JOURNAL_RETIREMENT_MAX_ROWS + 2,
+    maxBatchRows: STREAM_JOURNAL_RETIREMENT_MAX_ROWS,
+    maxBytes: Number.MAX_SAFE_INTEGER,
+  },
+} as const
+
+function terminalStreamRetentionReplayPlan(
+  cycle: StorageRetentionCycle<'terminal-stream-prune'>,
+  limit: number,
+): SemanticOperationReplayPlan {
+  return {
+    kind: 'durable-page-resume',
+    owner: 'storage-retention:terminal-stream-prune',
+    cycle: cycle.cycleNow,
+    revision: cycle.expectedRevision,
+    cursor: stableStringify(cycle.cursor ?? null),
+    doneMarker: `cutoff:${cycle.cutoff}`,
+    limit,
+  }
+}
+
+const TERMINAL_STREAM_RETENTION_OPERATION = semanticOperationDescriptor({
+  operationKind: 'maintenance.prune-terminal-stream-journals',
+  transaction: TERMINAL_STREAM_RETENTION_TRANSACTION_CAPABILITY,
+  resources: () => ['storage-retention:terminal-stream-prune'],
+  permittedWrites: TERMINAL_STREAM_RETENTION_TRANSACTION_CAPABILITY.tableNames,
+  requiredWritesWhenMutated: [],
+  ...semanticOperationExactReceiptContracts<
+    TerminalStreamRetentionResourceInput,
+    'storageRetentionState' | 'streamLeases' | 'streamChunks'
+  >(),
+  replay: semanticOperationExactReceiptReplayProofContract<TerminalStreamRetentionResourceInput>(
+    (input, receipt) =>
+      assertDurablePageReplayProof('storage-retention:terminal-stream-prune', input.limit, receipt),
+  ),
+})
+
+const EMPTY_DRAFT_RETENTION_OPERATION = semanticOperationDescriptor({
+  operationKind: 'maintenance.prune-empty-draft-chats',
+  transaction: EMPTY_DRAFT_RETENTION_TRANSACTION_CAPABILITY,
+  resources: () => ['storage-retention:empty-draft-prune'],
+  permittedWrites: EMPTY_DRAFT_RETENTION_TRANSACTION_CAPABILITY.tableNames,
+  requiredWritesWhenMutated: [],
+  effects: {
+    kind: 'effect-kinds',
+    permitted: ['attachment', 'chat', 'draft', 'profile', 'setting', 'sidebar', 'stream-chunks'],
+    requiredWhenMutated: () => [],
+  },
+})
+
+interface DiscoveryCacheMaintenanceResourceInput {
+  readonly limit: number
+}
+
+function assertDiscoveryCacheMaintenanceReplayProof(
+  input: DiscoveryCacheMaintenanceResourceInput,
+  receipt: SemanticOperationExactReceipt,
+): void {
+  const replay = receipt.plan.replay
+  if (
+    replay.kind !== 'durable-page-resume' ||
+    replay.owner !== 'discovery-cache:maintenance' ||
+    replay.limit !== input.limit
+  ) {
+    throw new Error('DiscoveryCacheMaintenanceReplayProofMismatch')
+  }
+}
+
+const DISCOVERY_CACHE_MAINTENANCE_OPERATION = semanticOperationDescriptor({
+  operationKind: 'maintenance.prune-discovery-cache',
+  transaction: DISCOVERY_CACHE_MUTATION_TRANSACTION_CAPABILITY,
+  resources: () => ['discovery-cache:retention'],
+  permittedWrites: DISCOVERY_CACHE_MUTATION_TRANSACTION_CAPABILITY.tableNames,
+  requiredWritesWhenMutated: [],
+  ...semanticOperationExactReceiptContracts<
+    DiscoveryCacheMaintenanceResourceInput,
+    PhysicalStorageTableName
+  >(),
+  replay: semanticOperationExactReceiptReplayProofContract<DiscoveryCacheMaintenanceResourceInput>(
+    assertDiscoveryCacheMaintenanceReplayProof,
+  ),
+})
+
+const ATTACHMENT_INTEGRITY_OPERATION = semanticOperationDescriptor({
+  operationKind: 'maintenance.reconcile-attachment-integrity',
+  transaction: ATTACHMENT_INTEGRITY_TRANSACTION_CAPABILITY,
+  resources: () => ['attachment-integrity:maintenance'],
+  permittedWrites: ATTACHMENT_INTEGRITY_TRANSACTION_CAPABILITY.tableNames,
+  requiredWritesWhenMutated: [],
+  effects: {
+    kind: 'effect-kinds',
+    permitted: ['attachment'],
+    requiredWhenMutated: () => ['attachment'],
+  },
+})
+
+interface StreamOperationResourceInput {
+  readonly streamId: string
+}
+
+interface StreamLeaseOperationResourceInput extends StreamOperationResourceInput {
+  readonly replay: SemanticOperationReplayPlan
+}
+
+interface StreamJournalAppendResourceInput extends StreamOperationResourceInput {
+  readonly replay: SemanticOperationReplayPlan
+}
+
+function streamOperationResourceNames(input: StreamOperationResourceInput): readonly string[] {
+  return [`stream-journal:${input.streamId}`]
+}
+
+function streamLeaseOperationDescriptor<
+  const Kind extends
+    | 'attempt.request-stop'
+    | 'attempt.seal-terminal'
+    | 'stream.note-selected-key'
+    | 'stream.renew'
+    | 'stream.handoff-recovery'
+    | 'stream.claim-recovery',
+>(operationKind: Kind, replayContract: 'exact' | 'receipt-proof' | undefined = undefined) {
+  return semanticOperationDescriptor({
+    operationKind,
+    transaction: STREAM_LEASE_MUTATION_TRANSACTION_CAPABILITY,
+    resources: streamOperationResourceNames,
+    permittedWrites: STREAM_LEASE_MUTATION_TRANSACTION_CAPABILITY.tableNames,
+    requiredWritesWhenMutated: ['streamLeases'],
+    ...semanticOperationExactReceiptContracts<StreamLeaseOperationResourceInput, 'streamLeases'>(),
+    ...(replayContract === 'exact'
+      ? {
+          replay: semanticOperationExactReceiptReplayContract<StreamLeaseOperationResourceInput>(
+            ({ replay }) => replay,
+          ),
+        }
+      : replayContract === 'receipt-proof'
+        ? {
+            replay:
+              semanticOperationExactReceiptReplayProofContract<StreamLeaseOperationResourceInput>(
+                assertStreamLeaseReplayProof,
+              ),
+          }
+        : {}),
+  })
+}
+
+const STREAM_LEASE_OPERATION_BOUNDS = Object.freeze({
+  reads: Object.freeze({
+    maxRequests: 1,
+    maxRows: 1,
+    maxBatchRows: 1,
+    maxBytes: Number.MAX_SAFE_INTEGER,
+  }),
+  writes: Object.freeze({
+    maxRequests: 1,
+    maxRows: 1,
+    maxBatchRows: 1,
+    maxBytes: Number.MAX_SAFE_INTEGER,
+  }),
+})
+
+const STREAM_JOURNAL_APPEND_OPERATION_BOUNDS = Object.freeze({
+  reads: Object.freeze({
+    maxRequests: 2,
+    maxRows: STREAM_JOURNAL_APPEND_MAX_ROWS + 1,
+    maxBatchRows: STREAM_JOURNAL_APPEND_MAX_ROWS,
+    maxBytes: Number.MAX_SAFE_INTEGER,
+  }),
+  writes: Object.freeze({
+    maxRequests: 2,
+    maxRows: STREAM_JOURNAL_APPEND_MAX_ROWS + 1,
+    maxBatchRows: STREAM_JOURNAL_APPEND_MAX_ROWS,
+    maxBytes: Number.MAX_SAFE_INTEGER,
+  }),
+})
+
+function streamWriteFenceReplayTokens(
+  fence: StreamWriteFence,
+): readonly SemanticOperationReplayToken[] {
+  return [fence.ownerClientId, fence.fenceToken, fence.replacementEpoch, fence.admissionSequence]
+}
+
+function streamJournalAppendReplayPlan(
+  authority: StreamJournalWriterAuthority,
+  frameIds: readonly string[],
+): SemanticOperationReplayPlan {
+  return {
+    kind: 'append-by-key',
+    owner: `stream:${authority.streamId}`,
+    fence: [
+      authority.ownerClientId,
+      authority.fenceToken,
+      authority.replacementEpoch,
+      authority.admissionSequence,
+    ],
+    keys: frameIds,
+    equality: 'canonical-equal-or-conflict',
+    lifecycle: 'active-writer',
+  }
+}
+
+function selectedKeyReplayPlan(
+  streamId: string,
+  fence: readonly SemanticOperationReplayToken[],
+  selectedKeyId: string,
+): SemanticOperationReplayPlan {
+  return {
+    kind: 'fenced-convergent',
+    owner: `stream:${streamId}`,
+    fence,
+    desired: [selectedKeyId],
+    alreadyApplied: 'return-current-or-conflict',
+  }
+}
+
+function observedSelectedKeyReplayPlan(lease: StreamLeaseRow): SemanticOperationReplayPlan {
+  if (!streamLeaseHasWriteFence(lease)) {
+    throw new Error(`StreamSelectedKeyReplayFenceMissing:${lease.streamId}`)
+  }
+  const evidence = requiredStreamPostCommitEvidence(lease)
+  const selectedKeyId = evidence.selectedKeyId ?? evidence.final?.selectedKeyId
+  if (!selectedKeyId) throw new Error(`StreamSelectedKeyReplayValueMissing:${lease.streamId}`)
+  return selectedKeyReplayPlan(lease.streamId, streamWriteFenceReplayTokens(lease), selectedKeyId)
+}
+
+function handoffReplayPlan(
+  streamId: string,
+  replacementEpoch: number,
+  admissionSequence: number,
+  handoffId: string,
+  handedOffAt: number,
+  reason: StreamLeaseHandoffReason,
+): SemanticOperationReplayPlan {
+  return {
+    kind: 'fenced-convergent',
+    owner: `stream:${streamId}`,
+    fence: [replacementEpoch, admissionSequence],
+    desired: [handoffId, handedOffAt, reason],
+    alreadyApplied: 'return-current-or-conflict',
+  }
+}
+
+function observedHandoffReplayPlan(lease: StreamLeaseRow): SemanticOperationReplayPlan {
+  if (lease.custody !== 'recovery-pending') {
+    throw new Error(`StreamHandoffReplayCustodyInvalid:${lease.streamId}`)
+  }
+  return handoffReplayPlan(
+    lease.streamId,
+    lease.replacementEpoch,
+    lease.admissionSequence,
+    lease.handoffId,
+    lease.handedOffAt,
+    lease.handoffReason,
+  )
+}
+
+function assertStreamLeaseReplayProof(
+  input: StreamLeaseOperationResourceInput,
+  receipt: SemanticOperationExactReceipt,
+): void {
+  const expected = input.replay
+  const observed = receipt.plan.replay
+  if (expected.kind === 'compare-and-swap' && observed.kind === 'compare-and-swap') {
+    if (
+      expected.outcome !== 'request' ||
+      expected.owner !== observed.owner ||
+      observed.outcome === 'request'
+    ) {
+      throw new Error('StreamLeaseReplayProofMismatch')
+    }
+    if (observed.outcome === 'applied') {
+      if (
+        stableStringify(expected.expected) !== stableStringify(observed.expected) ||
+        stableStringify(expected.desired) !== stableStringify(observed.desired) ||
+        receipt.physicalMutations.length === 0
+      ) {
+        throw new Error('StreamLeaseReplayProofMismatch')
+      }
+      return
+    }
+    if (receipt.physicalMutations.length !== 0) {
+      throw new Error('StreamLeaseReplayProofMismatch')
+    }
+    return
+  }
+  if (expected.kind === 'level-triggered-merge' && observed.kind === 'level-triggered-merge') {
+    if (
+      expected.outcome !== 'request' ||
+      expected.owner !== observed.owner ||
+      stableStringify(expected.desired) !== stableStringify(observed.desired) ||
+      observed.outcome === 'request'
+    ) {
+      throw new Error('StreamLeaseReplayProofMismatch')
+    }
+    if (observed.outcome === 'applied') {
+      if (
+        stableStringify(expected.target) !== stableStringify(observed.target) ||
+        receipt.physicalMutations.length === 0
+      ) {
+        throw new Error('StreamLeaseReplayProofMismatch')
+      }
+      return
+    }
+    if (
+      (observed.outcome === 'already-applied' || observed.outcome === 'terminal') &&
+      stableStringify(expected.target) !== stableStringify(observed.target)
+    ) {
+      throw new Error('StreamLeaseReplayProofMismatch')
+    }
+    if (receipt.physicalMutations.length !== 0) {
+      throw new Error('StreamLeaseReplayProofMismatch')
+    }
+    return
+  }
+  if (expected.kind === 'caller-at-most-once' && observed.kind === 'caller-at-most-once') {
+    if (
+      expected.outcome !== 'request' ||
+      expected.owner !== observed.owner ||
+      expected.localConvergence !== observed.localConvergence ||
+      expected.recovery !== observed.recovery ||
+      stableStringify(expected.target) !== stableStringify(observed.target) ||
+      observed.outcome === 'request'
+    ) {
+      throw new Error('StreamLeaseReplayProofMismatch')
+    }
+    if ((observed.outcome === 'applied') !== receipt.physicalMutations.length > 0) {
+      throw new Error('StreamLeaseReplayProofMismatch')
+    }
+    return
+  }
+  throw new Error('StreamLeaseReplayProofMismatch')
+}
+
+function renewReplayPlan(
+  streamId: string,
+  expected: readonly SemanticOperationReplayToken[],
+  desired: readonly SemanticOperationReplayToken[],
+  outcome: 'request' | 'applied' | 'rejected',
+): SemanticOperationReplayPlan {
+  return {
+    kind: 'compare-and-swap',
+    owner: `stream:${streamId}`,
+    expected,
+    desired,
+    outcome,
+  }
+}
+
+function requestedRenewReplayPlan(heartbeat: StreamLeaseHeartbeat): SemanticOperationReplayPlan {
+  return renewReplayPlan(
+    heartbeat.streamId,
+    [
+      heartbeat.fence.replacementEpoch,
+      heartbeat.fence.admissionSequence,
+      heartbeat.expectedRevision,
+    ],
+    [heartbeat.heartbeatAt],
+    'request',
+  )
+}
+
+function observedRenewReplayPlan(
+  current: StreamLeaseRow | undefined,
+  decision: StreamLeaseOperationDecision<StreamLeaseRow>,
+): SemanticOperationReplayPlan {
+  const next = decision.next
+  if (next) {
+    return renewReplayPlan(
+      next.streamId,
+      [next.replacementEpoch, next.admissionSequence, next.revision - 1],
+      [next.heartbeatAt ?? null],
+      'applied',
+    )
+  }
+  return renewReplayPlan(
+    decision.value.streamId,
+    current ? [current.replacementEpoch, current.admissionSequence, current.revision] : [],
+    [decision.value.heartbeatAt ?? null],
+    'rejected',
+  )
+}
+
+function claimRecoveryReplayPlan(
+  streamId: string,
+  expected: readonly SemanticOperationReplayToken[],
+  outcome: 'request' | 'applied' | 'rejected',
+): SemanticOperationReplayPlan {
+  return {
+    kind: 'compare-and-swap',
+    owner: `stream:${streamId}`,
+    expected,
+    desired: ['claim-recovery'],
+    outcome,
+  }
+}
+
+function requestedClaimRecoveryReplayPlan(expected: StreamLeaseRow): SemanticOperationReplayPlan {
+  return claimRecoveryReplayPlan(
+    expected.streamId,
+    [expected.replacementEpoch, expected.admissionSequence, expected.revision],
+    'request',
+  )
+}
+
+function observedClaimRecoveryReplayPlan(
+  current: StreamLeaseRow | undefined,
+  decision: StreamLeaseOperationDecision<StreamLeaseRow | undefined>,
+  streamId: string,
+): SemanticOperationReplayPlan {
+  const next = decision.next
+  if (next) {
+    return claimRecoveryReplayPlan(
+      next.streamId,
+      [next.replacementEpoch, next.admissionSequence, next.revision - 1],
+      'applied',
+    )
+  }
+  return claimRecoveryReplayPlan(
+    streamId,
+    current ? [current.replacementEpoch, current.admissionSequence, current.revision] : [],
+    'rejected',
+  )
+}
+
+function attemptStopTarget(
+  value: Pick<
+    AttemptRequestStopInput,
+    'chatId' | 'messageId' | 'attemptKind' | 'replacementEpoch' | 'admissionSequence'
+  >,
+): readonly SemanticOperationReplayToken[] {
+  return [
+    value.chatId,
+    value.messageId,
+    value.attemptKind,
+    value.replacementEpoch,
+    value.admissionSequence,
+  ]
+}
+
+function attemptStopReplayPlan(
+  streamId: string,
+  target: readonly SemanticOperationReplayToken[],
+  outcome: 'request' | 'applied' | 'already-applied' | 'terminal' | 'stale' | 'missing',
+): SemanticOperationReplayPlan {
+  return {
+    kind: 'level-triggered-merge',
+    owner: `stream:${streamId}`,
+    target,
+    desired: ['stop-requested'],
+    outcome,
+  }
+}
+
+function observedAttemptStopReplayPlan(
+  current: StreamLeaseRow | undefined,
+  decision: StreamLeaseOperationDecision<AttemptRequestStopResult>,
+  streamId: string,
+): SemanticOperationReplayPlan {
+  const lease = decision.next ?? ('lease' in decision.value ? decision.value.lease : current)
+  const outcome =
+    decision.value.outcome === 'accepted'
+      ? 'applied'
+      : decision.value.outcome === 'already-requested'
+        ? 'already-applied'
+        : decision.value.outcome
+  return attemptStopReplayPlan(streamId, lease ? attemptStopTarget(lease) : [], outcome)
+}
+
+function attemptTerminalReplayPlan(
+  streamId: string,
+  target: readonly SemanticOperationReplayToken[],
+  outcome: 'request' | 'applied' | 'already-applied',
+): SemanticOperationReplayPlan {
+  return {
+    kind: 'caller-at-most-once',
+    owner: `stream:${streamId}`,
+    target,
+    localConvergence: 'canonical-equal-or-conflict',
+    recovery: 'resume-from-durable-phase',
+    outcome,
+  }
+}
+
+function observedAttemptTerminalReplayPlan(
+  lease: TerminalDecidedStreamLeaseRow,
+  didApply: boolean,
+): SemanticOperationReplayPlan {
+  if (!streamLeaseHasWriteFence(lease)) {
+    throw new Error('AttemptTerminalReplayFenceMissing')
+  }
+  return attemptTerminalReplayPlan(
+    lease.streamId,
+    streamWriteFenceReplayTokens(lease),
+    didApply ? 'applied' : 'already-applied',
+  )
+}
+
+interface StreamLeaseOperationDecision<Result> {
+  readonly value: Result
+  readonly next?: StreamLeaseRow
+}
+
+async function executeStreamLeaseOperation<Result>(
+  commit: BrowserCommandCommit,
+  descriptor: SemanticOperationDescriptor<
+    SemanticOperationKind,
+    'streamLeases',
+    StreamLeaseOperationResourceInput,
+    SemanticOperationExactReceipt<'streamLeases'>
+  >,
+  streamId: string,
+  replay: SemanticOperationReplayPlan,
+  decide: (
+    current: StreamLeaseRow | undefined,
+  ) => Promise<StreamLeaseOperationDecision<Result>> | StreamLeaseOperationDecision<Result>,
+  observedReplay?: (
+    current: StreamLeaseRow | undefined,
+    decision: StreamLeaseOperationDecision<Result>,
+  ) => SemanticOperationReplayPlan,
+): Promise<Result> {
+  return commit.executeSemanticOperation(descriptor, { streamId, replay }, async (tx) => {
+    const current = await tx.table<StreamLeaseRow, string>('streamLeases').get(streamId)
+    const decision = await decide(current)
+    if (decision.next) await putStreamLeaseByteOwner(tx, decision.next, current)
+    return semanticOperationExecution(
+      decision.value,
+      semanticOperationExactReceipt(
+        semanticOperationExactPlan({
+          replay: observedReplay ? observedReplay(current, decision) : replay,
+          bounds: STREAM_LEASE_OPERATION_BOUNDS,
+        }),
+        {
+          dependencies: decision.next
+            ? [
+                {
+                  kind: 'stream-lease',
+                  chatId: decision.next.chatId,
+                  streamIds: [streamId],
+                },
+              ]
+            : [],
+          physicalMutations: decision.next
+            ? [{ tableName: 'streamLeases', operation: 'write', key: streamId }]
+            : [],
+          physicalReads: [
+            {
+              tableName: 'streamLeases',
+              indexKind: 'primary',
+              operation: 'get',
+              requestCount: 1,
+              rowCount: 1,
+            },
+          ],
+        },
+      ),
+    )
+  })
+}
+
+const ATTEMPT_REQUEST_STOP_OPERATION = streamLeaseOperationDescriptor(
+  'attempt.request-stop',
+  'receipt-proof',
+)
+const ATTEMPT_SEAL_TERMINAL_OPERATION = streamLeaseOperationDescriptor(
+  'attempt.seal-terminal',
+  'receipt-proof',
+)
+const STREAM_NOTE_SELECTED_KEY_OPERATION = streamLeaseOperationDescriptor(
+  'stream.note-selected-key',
+  'exact',
+)
+const STREAM_RENEW_OPERATION = streamLeaseOperationDescriptor('stream.renew', 'receipt-proof')
+const STREAM_HANDOFF_RECOVERY_OPERATION = streamLeaseOperationDescriptor(
+  'stream.handoff-recovery',
+  'exact',
+)
+const STREAM_CLAIM_RECOVERY_OPERATION = streamLeaseOperationDescriptor(
+  'stream.claim-recovery',
+  'receipt-proof',
+)
+
+const STREAM_APPEND_JOURNAL_FRAMES_OPERATION = semanticOperationDescriptor({
+  operationKind: 'stream.append-journal-frames',
+  transaction: STREAM_JOURNAL_MUTATION_TRANSACTION_CAPABILITY,
+  resources: streamOperationResourceNames,
+  permittedWrites: STREAM_JOURNAL_MUTATION_TRANSACTION_CAPABILITY.tableNames,
+  requiredWritesWhenMutated: ['streamLeases'],
+  ...semanticOperationExactReceiptContracts<
+    StreamJournalAppendResourceInput,
+    'streamLeases' | 'streamChunks'
+  >(),
+  replay: semanticOperationExactReceiptReplayContract<StreamJournalAppendResourceInput>(
+    ({ replay }) => replay,
+  ),
+})
+
+interface StreamFinishCleanupResourceInput {
+  readonly streamId: string
+  readonly fence: StreamWriteFence
+  readonly maxFrameRows: number
+  readonly replay: SemanticOperationReplayPlan
+}
+
+function streamFinishCleanupReplayPlan(
+  streamId: string,
+  fence: StreamWriteFence,
+  maxFrameRows: number,
+  outcome: 'request' | 'applied' | 'already-applied',
+): SemanticOperationReplayPlan {
+  return {
+    kind: 'level-triggered-merge',
+    owner: `stream:${streamId}`,
+    target: streamWriteFenceReplayTokens(fence),
+    desired: ['journal-absent', maxFrameRows],
+    outcome,
+  }
+}
+
+function assertStreamFinishCleanupReplayProof(
+  input: StreamFinishCleanupResourceInput,
+  receipt: SemanticOperationExactReceipt,
+): void {
+  const expected = input.replay
+  const observed = receipt.plan.replay
+  if (
+    expected.kind !== 'level-triggered-merge' ||
+    expected.outcome !== 'request' ||
+    observed.kind !== 'level-triggered-merge' ||
+    observed.outcome === 'request' ||
+    stableStringify({
+      owner: expected.owner,
+      target: expected.target,
+      desired: expected.desired,
+    }) !==
+      stableStringify({
+        owner: observed.owner,
+        target: observed.target,
+        desired: observed.desired,
+      }) ||
+    (observed.outcome === 'applied') !== receipt.physicalMutations.length > 0
+  ) {
+    throw new Error('StreamFinishCleanupReplayProofMismatch')
+  }
+}
+
+const STREAM_FINISH_CLEANUP_OPERATION_BOUNDS = {
+  reads: {
+    maxRequests: 2,
+    maxRows: STREAM_JOURNAL_RETIREMENT_MAX_ROWS + 2,
+    maxBatchRows: STREAM_JOURNAL_RETIREMENT_MAX_ROWS + 1,
+    maxBytes: Number.MAX_SAFE_INTEGER,
+  },
+  writes: {
+    maxRequests: 2,
+    maxRows: STREAM_JOURNAL_RETIREMENT_MAX_ROWS + 1,
+    maxBatchRows: STREAM_JOURNAL_RETIREMENT_MAX_ROWS,
+    maxBytes: Number.MAX_SAFE_INTEGER,
+  },
+} as const
+
+const STREAM_FINISH_CLEANUP_OPERATION = semanticOperationDescriptor({
+  operationKind: 'stream.finish-cleanup',
+  transaction: STREAM_JOURNAL_MUTATION_TRANSACTION_CAPABILITY,
+  resources: streamOperationResourceNames,
+  permittedWrites: STREAM_JOURNAL_MUTATION_TRANSACTION_CAPABILITY.tableNames,
+  requiredWritesWhenMutated: [],
+  ...semanticOperationExactReceiptContracts<
+    StreamFinishCleanupResourceInput,
+    'streamLeases' | 'streamChunks'
+  >(),
+  replay: semanticOperationExactReceiptReplayProofContract<StreamFinishCleanupResourceInput>(
+    assertStreamFinishCleanupReplayProof,
+  ),
+})
+const FORK_CHAT_TRANSACTION_CAPABILITY = physicalStorageTables(
+  ...ATTACHMENT_CATALOG_MUTATION_TRANSACTION_CAPABILITY.tableNames,
+  ...CHAT_ROW_LINKED_TRANSACTION_CAPABILITY.tableNames,
+  'childLists',
+  'childSlotMembers',
+  'messages',
+  'messageBodies',
+  'messagePreviews',
+)
+interface ChatForkResourceInput {
+  readonly sourceChatId: ChatId
+  readonly targetMessageId: MessageId
+  readonly destinationChatId: ChatId
+}
+
+function chatForkResourceNames(input: ChatForkResourceInput): readonly string[] {
+  return [
+    `chat-meta:${input.sourceChatId}`,
+    `message-topology:${input.sourceChatId}`,
+    `message:${input.targetMessageId}`,
+    `chat-meta:${input.destinationChatId}`,
+    `message-topology:${input.destinationChatId}`,
+  ]
+}
+
+const CHAT_FORK_OPERATION = semanticOperationDescriptor({
+  operationKind: 'chat.fork',
+  transaction: FORK_CHAT_TRANSACTION_CAPABILITY,
+  resources: chatForkResourceNames,
+  permittedWrites: FORK_CHAT_TRANSACTION_CAPABILITY.tableNames,
+  requiredWritesWhenMutated: [
+    'chats',
     'childLists',
     'childSlotMembers',
     'messages',
     'messageBodies',
     'messagePreviews',
-  ),
-)
+  ],
+  effects: {
+    kind: 'effect-kinds',
+    permitted: [
+      'attachment',
+      'chat',
+      'child-slot',
+      'message-body',
+      'message-header',
+      'message-preview',
+      'profile',
+      'sidebar',
+    ],
+    requiredWhenMutated: () => [
+      'chat',
+      'child-slot',
+      'message-body',
+      'message-header',
+      'message-preview',
+      'sidebar',
+    ],
+  },
+})
 type BrowserInterchangeQuery = Extract<WorkspaceQuery, { kind: `interchange.${string}` }>
 type BrowserConversationEnvelopeQuery = Extract<
   WorkspaceQuery,
@@ -591,27 +1542,13 @@ function emptyDiscoveryCachePutResult(): DiscoveryCachePutResult {
   }
 }
 
-class ModelResolutionPublicationPlanChangedError extends Error {}
-
-async function pendingModelResolutionChatIds(
-  table: Table<ConfigurationLink, string>,
-  targetKey: string,
-): Promise<ChatId[]> {
-  const links = await table.where('targetKey').equals(targetKey).toArray()
-  return [
-    ...new Set(links.flatMap((link) => (link.ownerKind === 'chat' ? [link.ownerId] : []))),
-  ].sort()
-}
-
-class TerminalStreamRetentionPlanChangedError extends Error {}
-
 async function commitStorageRetentionPage<Task extends StorageRetentionTask>(
   tx: Transaction,
   cycle: StorageRetentionCycle<Task>,
   outcome:
     | { readonly done: false; readonly cursor?: StorageRetentionCursor<Task> }
     | { readonly done: true; readonly earliestDeferredAt?: number },
-): Promise<void> {
+): Promise<SemanticOperationReceiptFragment<'storageRetentionState'>> {
   const previous = await readStorageRetentionState(tx, cycle.task)
   assertStorageRetentionCycleCurrent(previous, cycle)
   const next = advanceStorageRetentionState(cycle, outcome)
@@ -622,6 +1559,24 @@ async function commitStorageRetentionPage<Task extends StorageRetentionTask>(
     previous,
   )
   recordBrowserCommandStorageRetentionMutation(tx, cycle.task)
+  return semanticOperationReceiptFragment({
+    physicalMutations: [
+      {
+        tableName: 'storageRetentionState',
+        operation: 'write',
+        key: cycle.task,
+      },
+    ],
+    physicalReads: [
+      {
+        tableName: 'storageRetentionState',
+        indexKind: 'primary',
+        operation: 'get',
+        requestCount: 1,
+        rowCount: 1,
+      },
+    ],
+  })
 }
 
 export function __messageRequestContextChangedForTests(
@@ -865,16 +1820,6 @@ async function readMessageTextPreviewWindow(
   return rows
 }
 
-async function hydrateStoredMessages(
-  headers: readonly MessageHeaderRow[],
-  bodyTable: Table<MessageBodyRow, MessageId>,
-): Promise<Message[]> {
-  const bodies = (await bodyTable.bulkGet(headers.map((header) => header.id))).filter(
-    (row): row is MessageBodyRow => row !== undefined,
-  )
-  return hydrateMessages(headers.map(cloneMessageHeader), bodies)
-}
-
 function cloneDraft(draft: DraftRow): DraftRow {
   const cloned = structuredClone(draft)
   cloned.attachmentRefs = normalizeAttachmentRefs(cloned.attachmentRefs, {
@@ -991,6 +1936,96 @@ function requiredPromptPathSlot(
   return path.slot
 }
 
+function semanticEffectKindsForMutationFacts(
+  facts: BrowserCommandMutationFacts,
+): ReadonlySet<WorkspaceDependency['kind']> {
+  const kinds = new Set<WorkspaceDependency['kind']>(
+    facts.invalidations.map((dependency) => dependency.kind),
+  )
+  if (facts.chatStates.length > 0) {
+    kinds.add('chat')
+  }
+  if (sidebarChatIdsForMutationFacts(facts).length > 0) kinds.add('sidebar')
+  for (const fact of facts.chatStates) {
+    if (!fact.initialExists && fact.chat) {
+      kinds.add('message-header')
+      kinds.add('message-body')
+      kinds.add('message-preview')
+      kinds.add('child-slot')
+    }
+  }
+  if (facts.attachmentRows.length > 0 || facts.attachmentReferenceStates.length > 0) {
+    kinds.add('attachment')
+  }
+  if (facts.childSlots.length > 0) kinds.add('child-slot')
+  for (const revision of facts.messageRevisions) {
+    kinds.add('message-header')
+    if (!revision.before || revision.before.bodyVersion !== revision.header.bodyVersion) {
+      kinds.add('message-body')
+      kinds.add('message-preview')
+    }
+    if (
+      !revision.before ||
+      revision.before.parentId !== revision.header.parentId ||
+      revision.before.siblingIndex !== revision.header.siblingIndex ||
+      revision.before.deleted !== revision.header.deleted
+    ) {
+      kinds.add('child-slot')
+    }
+  }
+  return kinds
+}
+
+function semanticDependenciesForMutationFacts(
+  facts: BrowserCommandMutationFacts,
+): readonly WorkspaceDependency[] {
+  const chatIds = facts.chatStates.map((fact) => fact.chatId)
+  const sidebarChatIds = sidebarChatIdsForMutationFacts(facts)
+  return normalizeWorkspaceDependencies([
+    ...facts.invalidations,
+    ...(chatIds.length > 0 ? [{ kind: 'chat' as const, chatIds }] : []),
+    ...(sidebarChatIds.length > 0 ? [{ kind: 'sidebar' as const, chatIds: sidebarChatIds }] : []),
+    ...facts.childSlots.map(({ state }) => ({
+      kind: 'child-slot' as const,
+      chatId: state.chatId,
+      parentIds: [state.parentId],
+    })),
+    ...facts.messageRevisions.flatMap((revision) => [
+      {
+        kind: 'message-header' as const,
+        chatId: revision.header.chatId,
+        messageIds: [revision.header.id],
+      },
+      ...(!revision.before || revision.before.bodyVersion !== revision.header.bodyVersion
+        ? [
+            {
+              kind: 'message-body' as const,
+              chatId: revision.header.chatId,
+              messageIds: [revision.header.id],
+            },
+            {
+              kind: 'message-preview' as const,
+              chatId: revision.header.chatId,
+              messageIds: [revision.header.id],
+            },
+          ]
+        : []),
+    ]),
+  ])
+}
+
+function sidebarChatIdsForMutationFacts(facts: BrowserCommandMutationFacts): readonly ChatId[] {
+  const chatIds = new Set(facts.chatStates.map(({ chatId }) => chatId))
+  return [
+    ...new Set(
+      facts.physicalMutations.flatMap((mutation) => {
+        if (mutation.tableName !== 'chatSidebarRows' || typeof mutation.key !== 'string') return []
+        return chatIds.has(mutation.key) ? [mutation.key as ChatId] : []
+      }),
+    ),
+  ].sort()
+}
+
 class BrowserCommandCommit implements BrowserCommandSessionPort {
   private readonly committedMutationTables = new Set<string>()
   private readonly physicalMutationsByAddress = new Map<string, BrowserCommandPhysicalMutation>()
@@ -1017,6 +2052,12 @@ class BrowserCommandCommit implements BrowserCommandSessionPort {
   private readonly lockSession: AuthoritativeCommandLockSession
   private readonly workspaceId: string
   private readonly replacementEpoch: number
+  readonly command: WorkspaceCommand
+  readonly operationKind: WorkspaceCommand['kind']
+  private readonly semanticOperationKind: SemanticOperationKind
+  private commandLifetimeReceipt: SemanticOperationCommandLifetimeReceipt
+  private executionMode: 'legacy' | 'semantic' | undefined
+  private semanticOperationCommitted = false
   readonly commitId: string
 
   constructor(
@@ -1025,18 +2066,169 @@ class BrowserCommandCommit implements BrowserCommandSessionPort {
     workspaceId: string,
     replacementEpoch: number,
     commitId: string,
+    command: WorkspaceCommand,
+    semanticOperationKind: SemanticOperationKind,
+    commandLifetimeReceipt: SemanticOperationCommandLifetimeReceipt,
   ) {
     this.db = db
     this.lockSession = lockSession
     this.workspaceId = workspaceId
     this.replacementEpoch = replacementEpoch
     this.commitId = commitId
+    this.command = command
+    this.operationKind = command.kind
+    this.semanticOperationKind = semanticOperationKind
+    this.commandLifetimeReceipt = commandLifetimeReceipt
+  }
+
+  executeSemanticOperation<Tables extends PhysicalStorageTableName, ResourceInput, Receipt, T>(
+    descriptor: SemanticOperationDescriptor<SemanticOperationKind, Tables, ResourceInput, Receipt>,
+    resourceInput: ResourceInput,
+    operation: SemanticOperationRunner<Tables, T, Receipt>,
+  ): Promise<T> {
+    const mismatch = this.semanticOperationMismatch(descriptor)
+    if (mismatch) return Promise.reject(mismatch)
+    this.executionMode = 'semantic'
+    this.semanticOperationCommitted = true
+    const resourceNames = semanticOperationResourceNames(descriptor, resourceInput)
+    return this.lockSession.withResourceLocks(resourceNames, async (grant) => {
+      return this.runTransaction(grant, descriptor.transaction, operation, {
+        descriptor,
+        resourceInput,
+        unwrap: (execution) => semanticOperationExecutionParts<T, Receipt>(execution),
+      })
+    })
+  }
+
+  completeSemanticOperation<Tables extends PhysicalStorageTableName, ResourceInput, Receipt, T>(
+    descriptor: SemanticOperationDescriptor<SemanticOperationKind, Tables, ResourceInput, Receipt>,
+    resourceInput: ResourceInput,
+    value: T,
+    receipt: Receipt,
+  ): Promise<T> {
+    const mismatch = this.semanticOperationMismatch(descriptor)
+    if (mismatch) return Promise.reject(mismatch)
+    this.executionMode = 'semantic'
+    this.semanticOperationCommitted = true
+    const executableReceipt = attachSemanticOperationPhysicalIo(
+      attachSemanticOperationExactPhysicalReads(
+        receipt,
+        this.commandLifetimeReceipt.exactPhysicalReads,
+      ),
+      undefined,
+      this.commandLifetimeReceipt.physicalReads,
+    )
+    assertSemanticOperationReplay(descriptor, resourceInput, executableReceipt)
+    assertSemanticOperationExactInvalidations(
+      descriptor,
+      resourceInput,
+      [],
+      false,
+      executableReceipt,
+    )
+    assertSemanticOperationExactPhysicalMutations(
+      descriptor,
+      resourceInput,
+      [],
+      0,
+      executableReceipt,
+    )
+    assertSemanticOperationExactPhysicalReads(
+      descriptor,
+      resourceInput,
+      this.commandLifetimeReceipt.physicalReads,
+      this.commandLifetimeReceipt.physicalReads.length > 0,
+      executableReceipt,
+    )
+    assertSemanticOperationExactPhysicalWrites(
+      descriptor,
+      resourceInput,
+      [],
+      false,
+      executableReceipt,
+    )
+    return Promise.resolve(value)
+  }
+
+  async readSemanticOperationPreflight<Tables extends PhysicalStorageTableName, T>(
+    plan: PhysicalTransactionPlan<Tables>,
+    operation: (tx: FencedTransaction<Tables>) => Promise<T> | T,
+    exactPhysicalReads?: (
+      value: T,
+    ) => readonly (SemanticOperationExactPhysicalRead & { readonly tableName: Tables })[],
+  ): Promise<T> {
+    assertSemanticOperationCommandLifetimeReceipt(this.commandLifetimeReceipt, {
+      workspaceId: this.workspaceId,
+      replacementEpoch: this.replacementEpoch,
+      databaseName: this.db.name,
+    })
+    if (this.executionMode !== undefined || this.semanticOperationCommitted) {
+      throw new Error('SemanticOperationPreflightAfterExecution')
+    }
+    const result = await this.db.transaction(
+      'r',
+      plan.tableNames.map((tableName) => this.db.table(tableName)),
+      async (tx) =>
+        runBrowserCommandTransaction(
+          tx,
+          (transaction) => operation(bindFencedTransaction(transaction, plan)),
+          { observePhysicalReads: true, observePhysicalWrites: true },
+        ),
+    )
+    assertPhysicalTransactionTablesDeclared(plan, result.facts.tableNames)
+    if (
+      result.facts.successfulMutations !== 0 ||
+      result.facts.physicalMutations.length !== 0 ||
+      result.facts.physicalWrites.length !== 0 ||
+      result.facts.invalidations.length !== 0
+    ) {
+      throw new Error('SemanticOperationPreflightMutationForbidden')
+    }
+    this.commandLifetimeReceipt = exactPhysicalReads
+      ? semanticOperationCommandLifetimeReceiptWithPreflight(
+          this.commandLifetimeReceipt,
+          result.facts.physicalReads as readonly SemanticOperationPhysicalRead[],
+          exactPhysicalReads(result.value),
+        )
+      : semanticOperationCommandLifetimeReceiptWithPhysicalReads(
+          this.commandLifetimeReceipt,
+          result.facts.physicalReads as readonly SemanticOperationPhysicalRead[],
+        )
+    return result.value
+  }
+
+  private semanticOperationMismatch<
+    Tables extends PhysicalStorageTableName,
+    ResourceInput,
+    Receipt,
+  >(
+    descriptor: SemanticOperationDescriptor<SemanticOperationKind, Tables, ResourceInput, Receipt>,
+  ): Error | undefined {
+    assertSemanticOperationCommandLifetimeReceipt(this.commandLifetimeReceipt, {
+      workspaceId: this.workspaceId,
+      replacementEpoch: this.replacementEpoch,
+      databaseName: this.db.name,
+    })
+    if (descriptor.operationKind !== this.semanticOperationKind) {
+      return new Error(
+        `SemanticOperationKindMismatch:${this.semanticOperationKind}:${descriptor.operationKind}`,
+      )
+    }
+    if (this.executionMode === 'legacy') {
+      return new Error('SemanticOperationMixedWithLegacyTransaction')
+    }
+    if (this.semanticOperationCommitted) return new Error('SemanticOperationAlreadyCommitted')
+    return undefined
   }
 
   withLocks<T>(
     resourceNames: readonly string[],
     operation: (locked: BrowserLockedCommandPort) => Promise<T> | T,
   ): Promise<T> {
+    if (this.executionMode === 'semantic') {
+      return Promise.reject(new Error('LegacyTransactionMixedWithSemanticOperation'))
+    }
+    this.executionMode = 'legacy'
     return this.lockSession.withResourceLocks(resourceNames, async (grant) => {
       let active = true
       const locked: BrowserLockedCommandPort = Object.freeze({
@@ -1056,18 +2248,104 @@ class BrowserCommandCommit implements BrowserCommandSessionPort {
     })
   }
 
-  private async runTransaction<Tables extends PhysicalStorageTableName, T>(
+  private async runTransaction<
+    Tables extends PhysicalStorageTableName,
+    RawResult,
+    ResourceInput = never,
+    Receipt = undefined,
+    PublicResult = RawResult,
+  >(
     grant: LockGrant,
     plan: PhysicalTransactionPlan<Tables>,
-    operation: (tx: FencedTransaction<Tables>) => Promise<T> | T,
-  ): Promise<T> {
+    operation: (tx: FencedTransaction<Tables>) => Promise<RawResult> | RawResult,
+    semanticOperation?: {
+      readonly descriptor: SemanticOperationDescriptor<
+        SemanticOperationKind,
+        Tables,
+        ResourceInput,
+        Receipt
+      >
+      readonly resourceInput: ResourceInput
+      unwrap(value: RawResult): { readonly value: PublicResult; readonly receipt: Receipt }
+    },
+  ): Promise<PublicResult> {
     const committed = await grant.runTransaction(this.db, plan.tableNames, async (tx) => {
       registerPhysicalMutationTransaction(tx)
-      const result = await runBrowserCommandTransaction(tx, (transaction) =>
-        operation(bindFencedTransaction(transaction, plan)),
+      const result = await runBrowserCommandTransaction(
+        tx,
+        (transaction) => {
+          const fencedTransaction = bindFencedTransaction(transaction, plan)
+          return collectSemanticOperationPhysicalWrites(
+            fencedTransaction,
+            semanticOperation?.descriptor.exactPhysicalWrites?.receiptSource,
+            () => operation(fencedTransaction),
+          )
+        },
+        {
+          observePhysicalReads: semanticOperation?.descriptor.exactPhysicalReads !== undefined,
+          observePhysicalWrites: semanticOperation?.descriptor.exactPhysicalWrites !== undefined,
+        },
       )
       assertPhysicalTransactionTablesDeclared(plan, result.facts.tableNames)
-      return result
+      if (semanticOperation) {
+        const { descriptor, resourceInput, unwrap } = semanticOperation
+        const execution = unwrap(result.value.value)
+        const physicalReads = [
+          ...this.commandLifetimeReceipt.physicalReads,
+          ...result.facts.physicalReads,
+        ]
+        const receipt = attachSemanticOperationPhysicalIo(
+          attachSemanticOperationExactPhysicalReads(
+            execution.receipt,
+            this.commandLifetimeReceipt.exactPhysicalReads,
+          ),
+          result.value.fragment,
+          physicalReads,
+        )
+        const tableNames = new Set(result.facts.tableNames)
+        const didMutateStorage = result.facts.successfulMutations > 0
+        assertSemanticOperationReplay(descriptor, resourceInput, receipt)
+        assertSemanticOperationWrites(descriptor, tableNames, didMutateStorage)
+        assertSemanticOperationEffectKinds(
+          descriptor,
+          semanticEffectKindsForMutationFacts(result.facts),
+          tableNames,
+          didMutateStorage,
+        )
+        assertSemanticOperationExactInvalidations(
+          descriptor,
+          resourceInput,
+          semanticDependenciesForMutationFacts(result.facts),
+          didMutateStorage,
+          receipt,
+        )
+        assertSemanticOperationExactPhysicalMutations(
+          descriptor,
+          resourceInput,
+          result.facts.physicalMutations,
+          result.facts.successfulMutations,
+          receipt,
+        )
+        assertSemanticOperationExactPhysicalReads(
+          descriptor,
+          resourceInput,
+          physicalReads,
+          true,
+          receipt,
+        )
+        assertSemanticOperationExactPhysicalWrites(
+          descriptor,
+          resourceInput,
+          result.facts.physicalWrites,
+          true,
+          receipt,
+        )
+        return { value: execution.value, facts: result.facts }
+      }
+      return {
+        value: result.value.value as unknown as PublicResult,
+        facts: result.facts,
+      }
     })
     this.recordCommittedMutationFacts(committed.facts)
     return committed.value
@@ -1239,6 +2517,13 @@ class BrowserCommandCommit implements BrowserCommandSessionPort {
     const constructions: Chat[] = []
     const constructedChatIds = new Set<ChatId>()
     const deletedChatIds = new Set<ChatId>()
+    const sidebarChatIds = new Set(
+      [...this.physicalMutationsByAddress.values()].flatMap((mutation) =>
+        mutation.tableName === 'chatSidebarRows' && typeof mutation.key === 'string'
+          ? [mutation.key as ChatId]
+          : [],
+      ),
+    )
     const entries = [...this.chatsById.entries()].sort(([left], [right]) =>
       left.localeCompare(right),
     )
@@ -1249,7 +2534,10 @@ class BrowserCommandCommit implements BrowserCommandSessionPort {
       }
       if (!finalChat) {
         if (!initialExists) continue
-        facts.push({ kind: 'chat-deleted', chatId }, { kind: 'sidebar-row-deleted', chatId })
+        facts.push({ kind: 'chat-deleted', chatId })
+        if (sidebarChatIds.has(chatId)) {
+          facts.push({ kind: 'sidebar-row-deleted', chatId })
+        }
         deletedChatIds.add(chatId)
         ordinaryChatIds.push(chatId)
         continue
@@ -1260,7 +2548,9 @@ class BrowserCommandCommit implements BrowserCommandSessionPort {
         constructedChatIds.add(chatId)
         continue
       }
-      facts.push({ kind: 'sidebar-row-changed', chatId })
+      if (sidebarChatIds.has(chatId)) {
+        facts.push({ kind: 'sidebar-row-changed', chatId })
+      }
       ordinaryChatIds.push(chatId)
       receiptChats.push(structuredClone(finalChat))
     }
@@ -1271,7 +2561,14 @@ class BrowserCommandCommit implements BrowserCommandSessionPort {
           ? []
           : [
               Object.freeze({ kind: 'chat' as const, chatIds: ordinaryChatIds }),
-              Object.freeze({ kind: 'sidebar' as const, chatIds: ordinaryChatIds }),
+              ...(sidebarChatIds.size > 0
+                ? [
+                    Object.freeze({
+                      kind: 'sidebar' as const,
+                      chatIds: ordinaryChatIds.filter((chatId) => sidebarChatIds.has(chatId)),
+                    }),
+                  ]
+                : []),
             ],
       ),
       receiptChats: Object.freeze(receiptChats),
@@ -1911,32 +3208,6 @@ async function readConfigurationPrivacyPayload(
   return row ? { kind: 'loaded', token, row } : { kind: 'missing' }
 }
 
-function sameTemporaryChatPage(
-  left: Awaited<ReturnType<typeof readTemporaryChatIdPage>>,
-  right: Awaited<ReturnType<typeof readTemporaryChatIdPage>>,
-): boolean {
-  return (
-    sameOrderedValues(left.chatIds, right.chatIds) &&
-    left.done === right.done &&
-    left.earliestDeferredAt === right.earliestDeferredAt &&
-    left.nextCursor?.chatId === right.nextCursor?.chatId &&
-    left.nextCursor?.retentionAt === right.nextCursor?.retentionAt
-  )
-}
-
-interface ForkWritePlan {
-  sourceMessageIds: MessageId[]
-  sourceParentIds: Array<MessageId | null>
-  liveAttachmentIds: AttachmentId[]
-  destinationChatId: ChatId
-  destinationMessageIds: MessageId[]
-  destinationParentIds: Array<MessageId | null>
-  sourceLinkResourceNames: string[]
-  scopes: MutationScope[]
-}
-
-class ForkWritePlanChangedError extends Error {}
-
 async function readForkLivePathHeaders(
   table: Table<MessageHeaderRow, MessageId>,
   chatId: ChatId,
@@ -1951,12 +3222,6 @@ async function readForkLivePathHeaders(
     throw new Error(`fork: ${result.reason} at message ${result.messageId}`)
   }
   return result.rows.map(cloneMessageHeader)
-}
-
-function forkLiveAttachmentIds(rows: readonly Pick<Message, 'attachmentRefs'>[]): AttachmentId[] {
-  return rows.flatMap((row) =>
-    liveAttachmentRefs(row.attachmentRefs).map((ref) => ref.attachmentId),
-  )
 }
 
 function mutationScopeKey(scope: MutationScope): string {
@@ -1999,6 +3264,64 @@ function attachmentOwnerScopes(
       attachmentId,
     })),
   ])
+}
+
+const DRAFT_PUT_PREFLIGHT_TRANSACTION_PLAN = physicalTransactionPlan(
+  physicalStorageTables('drafts'),
+)
+const draftPutPlanBrand: unique symbol = Symbol('DraftPutPlan')
+
+interface DraftPutPlan {
+  readonly chatId: ChatId
+  readonly expectedUpdatedAt: number | null
+  readonly previousAttachmentIds: readonly AttachmentId[]
+  readonly nextAttachmentIds: readonly AttachmentId[]
+  readonly [draftPutPlanBrand]: true
+}
+
+export class DraftPutPlanChangedError extends Error {
+  readonly chatId: ChatId
+
+  constructor(chatId: ChatId) {
+    super(`DraftPutPlanChanged:${chatId}`)
+    this.name = 'DraftPutPlanChangedError'
+    this.chatId = chatId
+  }
+}
+
+function draftPutAttachmentIds(
+  refs: readonly MessageAttachmentRef[] | undefined,
+): readonly AttachmentId[] {
+  return Object.freeze([...new Set(liveAttachmentRefs(refs).map((ref) => ref.attachmentId))].sort())
+}
+
+async function readDraftPutPlan(
+  commit: BrowserCommandSessionPort,
+  input: { readonly draft: DraftRow; readonly expectedUpdatedAt: number | null },
+): Promise<DraftPutPlan> {
+  const previous = await commit.readSemanticOperationPreflight(
+    DRAFT_PUT_PREFLIGHT_TRANSACTION_PLAN,
+    (tx) => tx.table<DraftRow, ChatId>('drafts').get(input.draft.chatId),
+    (_row) => [
+      {
+        tableName: 'drafts',
+        indexKind: 'primary',
+        operation: 'get',
+        requestCount: 1,
+        rowCount: 1,
+      },
+    ],
+  )
+  if ((previous?.updatedAt ?? null) !== input.expectedUpdatedAt) {
+    throw new Error(`DraftChanged:${input.draft.chatId}`)
+  }
+  return Object.freeze({
+    chatId: input.draft.chatId,
+    expectedUpdatedAt: input.expectedUpdatedAt,
+    previousAttachmentIds: draftPutAttachmentIds(previous?.attachmentRefs),
+    nextAttachmentIds: draftPutAttachmentIds(input.draft.attachmentRefs),
+    [draftPutPlanBrand]: true as const,
+  })
 }
 
 async function attachmentOwnerMessage(
@@ -2312,117 +3635,20 @@ function replaceGeneratedPollingVideoRefs(
   }
 }
 
-function missingAttachmentAfterByteDeletion(
-  attachment: Attachment,
-  reason: AttachmentMissingReason,
-  now: number,
-  artifacts: AttachmentArtifact[],
-  processing: Attachment['processing'],
-): Attachment {
-  const lastKnownBlobId =
-    attachment.storage.kind === 'local-blob'
-      ? attachment.storage.blobId
-      : attachment.storage.kind === 'missing'
-        ? attachment.storage.lastKnownBlobId
-        : undefined
-  const next: Attachment = {
-    ...attachment,
-    updatedAt: now,
-    storage: {
-      kind: 'missing',
-      reason,
-      missingSince: now,
-      ...(lastKnownBlobId ? { lastKnownBlobId } : {}),
-    },
-    artifacts,
-    processing,
-  }
-  delete next.thumbnailBlobId
-  return next
-}
-
-function sameForkPlanSource(plan: ForkWritePlan, rows: readonly Message[]): boolean {
-  return (
-    sameOrderedValues(
-      plan.sourceMessageIds,
-      rows.map((row) => row.id),
-    ) &&
-    sameOrderedValues(
-      plan.sourceParentIds,
-      rows.map((row) => row.parentId),
-    ) &&
-    sameOrderedValues([...plan.liveAttachmentIds].sort(), forkLiveAttachmentIds(rows).sort())
-  )
-}
-
-async function planForkWrite(
-  db: NatterDb,
-  input: ForkChatFromMessageInput,
-  destinationChatId: ChatId,
-): Promise<ForkWritePlan> {
-  const sourcePlan = await db.transaction('r', [db.chats, db.messages], async (tx: Transaction) => {
-    const source = await tx.table<Chat, ChatId>('chats').get(input.chatId)
-    if (!source) {
-      throw new Error(`fork: source chat ${input.chatId} not found`)
-    }
-    return {
-      headers: await readForkLivePathHeaders(
-        tx.table<MessageHeaderRow, MessageId>('messages'),
-        input.chatId,
-        input.messageId,
-      ),
-      sourceLinkResourceNames: normalizeNamedLocks(chatConfigurationTargetResourceNames(source)),
-    }
-  })
-  const { headers } = sourcePlan
-  if (headers.length === 0) throw new Error('fork: no ancestors to copy')
-
-  const destinationMessageIds = headers.map(() => newId())
-  const destinationIdBySourceId = new Map(
-    headers.map((row, index) => [row.id, destinationMessageIds[index] as MessageId]),
-  )
-  const destinationParentIds = headers.map((row) =>
-    row.parentId ? (destinationIdBySourceId.get(row.parentId) ?? null) : null,
-  )
-  const scopes: MutationScope[] = [
-    { kind: 'chat-meta', chatId: input.chatId },
-    { kind: 'chat-meta', chatId: destinationChatId },
-  ]
-  for (const row of headers) scopes.push({ kind: 'message', messageId: row.id })
-  for (const messageId of destinationMessageIds) scopes.push({ kind: 'message', messageId })
-  for (const parentId of destinationParentIds) {
-    scopes.push({ kind: 'children', chatId: destinationChatId, parentId })
-  }
-  const liveAttachmentIds = forkLiveAttachmentIds(headers)
-  for (const attachmentId of new Set(liveAttachmentIds)) {
-    scopes.push({ kind: 'attachment', attachmentId })
-  }
-
-  return {
-    sourceMessageIds: headers.map((row) => row.id),
-    sourceParentIds: headers.map((row) => row.parentId),
-    liveAttachmentIds,
-    destinationChatId,
-    destinationMessageIds,
-    destinationParentIds,
-    sourceLinkResourceNames: sourcePlan.sourceLinkResourceNames,
-    scopes,
-  }
-}
-
 function cloneForkMessages(
   ancestors: readonly Message[],
-  plan: ForkWritePlan,
+  destinationChatId: ChatId,
+  destinationMessageIds: readonly MessageId[],
   now: number,
 ): Message[] {
   const destinationIdBySourceId = new Map(
-    ancestors.map((row, index) => [row.id, plan.destinationMessageIds[index] as MessageId]),
+    ancestors.map((row, index) => [row.id, destinationMessageIds[index] as MessageId]),
   )
   const destinationTurnIdBySourceTurnId = new Map<string, string>()
   return ancestors.map((source, index) => {
     const clone = structuredClone(source)
-    clone.id = plan.destinationMessageIds[index] as MessageId
-    clone.chatId = plan.destinationChatId
+    clone.id = destinationMessageIds[index] as MessageId
+    clone.chatId = destinationChatId
     clone.parentId = source.parentId ? (destinationIdBySourceId.get(source.parentId) ?? null) : null
     clone.siblingIndex = 0
     let destinationTurnId = destinationTurnIdBySourceTurnId.get(source.turnId)
@@ -2557,7 +3783,12 @@ async function reserveStreamLeaseTarget(
   const leaseTable = tx.table<StreamLeaseRow, string>('streamLeases')
   const competing = await leaseTable.where('targetOwnerKey').equals(incoming.messageId).first()
   if (competing) throw new StreamTargetBusyError(incoming.messageId)
-  await settings.put({ key: 'stream-admission-sequence', value: admissionSequence })
+  await putPhysicalStorageRow(
+    tx,
+    'settings',
+    { key: 'stream-admission-sequence', value: admissionSequence },
+    sequenceRow,
+  )
   recordBrowserCommandInvalidation(tx, {
     kind: 'setting',
     keys: ['stream-admission-sequence'],
@@ -3332,6 +4563,8 @@ function workspaceDependencyCoversPhysicalMutation(
         (!dependency.streamIds ||
           (mutation.streamId !== undefined && dependency.streamIds.includes(mutation.streamId)))
       )
+    case 'model-resolution':
+      return false
     case 'discovery-cache':
       if (physicalEffectGroupCovers(dependency.kind, mutation.tableName)) return true
       return (
@@ -3636,17 +4869,25 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     command: C,
   ): Promise<CommitEnvelope<WorkspaceCommandResult<C>>> {
     assertWorkspaceExecutionPermit(permit)
-    const db = await this.openDb()
-    await awaitStorageCompactionWriteAdmission(db)
+    const db = this.session.runOperation((database) => database)
+    const admission = await awaitStorageCompactionWriteAdmission()
     return withSharedAuthoritativeCommandSession(db, async (lockSession) => {
-      const durable = await readBrowserWorkspaceMeta(db)
-      assertPermitFence(permit, durable)
+      const workspace = this.session.getWorkspaceFence()
+      assertPermitFence(permit, workspace)
+      const commandLifetimeReceipt = semanticOperationCommandLifetimeReceipt(
+        workspace,
+        db.name,
+        admission,
+      )
       const commit = new BrowserCommandCommit(
         db,
         lockSession,
         permit.workspaceId,
         permit.replacementEpoch,
         newId(),
+        command,
+        workspaceCommandSemanticOperationKind(command),
+        commandLifetimeReceipt,
       )
       const value = (await this.dispatchCommand(
         command,
@@ -3794,6 +5035,15 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
         )
       case 'configuration.profile-switch-plan':
         return this.getConfigurationProfileSwitchPlan(query.chatId, query.profileId)
+      case 'configuration.model-resolution-head':
+        return this.getConfigurationModelResolutionHead(frame.signal)
+      case 'configuration.model-resolution-page':
+        return this.getConfigurationModelResolutionPage(
+          query.profileId,
+          query.profileRevision,
+          query.knownModels,
+          frame.signal,
+        )
       case 'configuration.profile-catalog-page':
         return this.getConfigurationProfileCatalogPage(query.request, frame.signal)
       case 'configuration.preset-catalog-page':
@@ -4047,7 +5297,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
       case 'stream.claim-recovery':
         return this.claimStreamLeaseForRecovery(command.expected, command.now, commit)
       case 'stream.append-journal-frames':
-        return this.appendStreamJournalFrames(command.frames, commit)
+        return this.appendStreamJournalFrames(command.frames, command.observedAt, commit)
       case 'stream.finish-cleanup':
         return this.deleteStreamJournal(
           command.streamId,
@@ -4071,7 +5321,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
       case 'maintenance.prune-discovery-cache':
         return this.pruneDiscoveryCache(command.limit, commit)
       case 'maintenance.reconcile-attachment-integrity':
-        return this.reconcileAttachmentIntegrity(command.limit, commit)
+        return this.reconcileAttachmentIntegrity(command.limit, command.now, commit)
       case 'attachment.bundle.write':
         return this.writeAttachmentBundle(command.input, commit)
       case 'attachment.ref.add':
@@ -4111,7 +5361,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
         const { executeConfigurationCommandInBrowser } = await import(
           './browser-configuration-domain'
         )
-        return executeConfigurationCommandInBrowser(await this.openDb(), command.input, commit)
+        return executeConfigurationCommandInBrowser(command.input, commit)
       }
       case 'folder.create':
         return this.createFolder(command.input, commit)
@@ -4181,10 +5431,17 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     if (!Number.isSafeInteger(input.finishedAt) || input.finishedAt < 0) {
       throw new Error(`AttemptTerminalTimestampInvalid:${input.streamId}`)
     }
-    return commit.withLocks([`stream-journal:${input.streamId}`], (locked) =>
-      locked.runTransaction(STREAM_LEASE_TRANSACTION, async (tx) => {
-        const leases = tx.table<StreamLeaseRow, string>('streamLeases')
-        const lease = await leases.get(input.streamId)
+    const replay = attemptTerminalReplayPlan(
+      input.streamId,
+      streamWriteFenceReplayTokens(input.fence),
+      'request',
+    )
+    return executeStreamLeaseOperation<TerminalDecidedStreamLeaseRow>(
+      commit,
+      ATTEMPT_SEAL_TERMINAL_OPERATION,
+      input.streamId,
+      replay,
+      (lease) => {
         assertOwnedStreamFence(lease, input.fence, replacementEpoch, input.streamId)
         const terminal = {
           version: 1 as const,
@@ -4201,7 +5458,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
           if (stableStringify(lease.terminal) !== stableStringify(terminal)) {
             throw new Error(`AttemptTerminalDecisionConflict:${input.streamId}`)
           }
-          return structuredClone(lease)
+          return { value: structuredClone(lease) }
         }
         if (lease.phase !== 'reserved' && lease.phase !== 'active') {
           throw new Error(`AttemptTerminalSealPhaseInvalid:${input.streamId}:${lease.phase}`)
@@ -4216,9 +5473,10 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
         if (decided.phase !== 'terminal-decided' || !streamLeaseHasWriteFence(decided)) {
           throw new Error(`AttemptTerminalSealInvalid:${input.streamId}`)
         }
-        await putStreamLeaseByteOwner(tx, decided, lease)
-        return structuredClone(decided)
-      }),
+        return { value: structuredClone(decided), next: decided }
+      },
+      (_current, decision) =>
+        observedAttemptTerminalReplayPlan(decision.value, decision.next !== undefined),
     )
   }
 
@@ -4231,11 +5489,14 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
       throw new Error(`AttemptStopRequestInvalid:${input.streamId}`)
     }
     if (input.replacementEpoch !== replacementEpoch) return { outcome: 'stale' }
-    return commit.withLocks([`stream-journal:${input.streamId}`], (locked) =>
-      locked.runTransaction(STREAM_LEASE_TRANSACTION, async (tx) => {
-        const leases = tx.table<StreamLeaseRow, string>('streamLeases')
-        const lease = await leases.get(input.streamId)
-        if (!lease) return { outcome: 'missing' } as const
+    const replay = attemptStopReplayPlan(input.streamId, attemptStopTarget(input), 'request')
+    return executeStreamLeaseOperation<AttemptRequestStopResult>(
+      commit,
+      ATTEMPT_REQUEST_STOP_OPERATION,
+      input.streamId,
+      replay,
+      (lease) => {
+        if (!lease) return { value: { outcome: 'missing' } as const }
         if (
           lease.chatId !== input.chatId ||
           lease.messageId !== input.messageId ||
@@ -4243,19 +5504,37 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
           lease.replacementEpoch !== input.replacementEpoch ||
           lease.admissionSequence !== input.admissionSequence
         ) {
-          return { outcome: 'stale', lease: structuredClone(lease) } as const
+          return {
+            value: { outcome: 'stale', lease: structuredClone(lease) } as const,
+          }
         }
         if (lease.phase === 'canonical' || lease.phase === 'metadata-committed') {
-          return { outcome: 'terminal', lease: structuredClone(lease) } as const
+          return {
+            value: { outcome: 'terminal', lease: structuredClone(lease) } as const,
+          }
         }
         if (lease.stopControl) {
-          return { outcome: 'already-requested', lease: structuredClone(lease) } as const
+          return {
+            value: { outcome: 'already-requested', lease: structuredClone(lease) } as const,
+          }
         }
         if (lease.controlRevision >= Number.MAX_SAFE_INTEGER) {
           throw new Error(`StreamLeaseControlRevisionExhausted:${input.streamId}`)
         }
+        const terminal =
+          lease.phase === 'terminal-decided'
+            ? {
+                ...lease.terminal,
+                finishedAt: Math.max(lease.terminal.finishedAt, input.requestedAt),
+                decision: {
+                  outcome: 'abort' as const,
+                  abortReason: input.reason,
+                },
+              }
+            : undefined
         const stopped = requireStreamLeaseRow({
           ...lease,
+          ...(terminal ? { terminal } : {}),
           revision: nextStreamLeaseRevision(lease),
           controlRevision: lease.controlRevision + 1,
           stopControl: {
@@ -4265,9 +5544,12 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
             reason: input.reason,
           },
         })
-        await putStreamLeaseByteOwner(tx, stopped, lease)
-        return { outcome: 'accepted', lease: structuredClone(stopped) } as const
-      }),
+        return {
+          value: { outcome: 'accepted', lease: structuredClone(stopped) } as const,
+          next: stopped,
+        }
+      },
+      (current, decision) => observedAttemptStopReplayPlan(current, decision, input.streamId),
     )
   }
 
@@ -4293,7 +5575,6 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
   ): Promise<GenerationPostCommitMetadataResult> {
     const { commitBrowserGenerationMetadata } = await import('./browser-generation-command-runtime')
     return commitBrowserGenerationMetadata(
-      this,
       browserGenerationCommandSupport,
       input,
       replacementEpoch,
@@ -4306,10 +5587,16 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     replacementEpoch: number,
     commit: BrowserCommandCommit,
   ): Promise<StreamLeaseRow> {
-    return commit.withLocks([`stream-journal:${input.streamId}`], (locked) =>
-      locked.runTransaction(STREAM_LEASE_TRANSACTION, async (tx) => {
-        const leases = tx.table<StreamLeaseRow, string>('streamLeases')
-        const lease = await leases.get(input.streamId)
+    return executeStreamLeaseOperation<StreamLeaseRow>(
+      commit,
+      STREAM_NOTE_SELECTED_KEY_OPERATION,
+      input.streamId,
+      selectedKeyReplayPlan(
+        input.streamId,
+        streamWriteFenceReplayTokens(input.fence),
+        input.selectedKeyId,
+      ),
+      (lease) => {
         assertOwnedStreamFence(lease, input.fence, replacementEpoch, input.streamId)
         if (!streamLeaseHasCommittedTarget(lease)) {
           throw new Error(`StreamSelectedKeyBeforeDispatch:${input.streamId}`)
@@ -4324,14 +5611,16 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
           lease.phase === 'canonical' ||
           lease.phase === 'metadata-committed'
         ) {
-          if (recordedKeyId === input.selectedKeyId) return structuredClone(lease)
+          if (recordedKeyId === input.selectedKeyId) {
+            return { value: structuredClone(lease) }
+          }
           throw new Error(`StreamSelectedKeyAfterTerminalDecision:${input.streamId}`)
         }
         if (
           evidence.selectedKeyId === input.selectedKeyId &&
           (evidence.final === undefined || evidence.final.selectedKeyId === input.selectedKeyId)
         ) {
-          return structuredClone(lease)
+          return { value: structuredClone(lease) }
         }
         const noted = requireStreamLeaseRow({
           ...lease,
@@ -4349,9 +5638,14 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
               : {}),
           },
         })
-        await putStreamLeaseByteOwner(tx, noted, lease)
-        return structuredClone(noted)
-      }),
+        return { value: structuredClone(noted), next: noted }
+      },
+      (lease, decision) => {
+        const resultingLease = decision.next ?? lease
+        if (!resultingLease)
+          throw new Error(`StreamSelectedKeyReplayLeaseMissing:${input.streamId}`)
+        return observedSelectedKeyReplayPlan(resultingLease)
+      },
     )
   }
 
@@ -4359,7 +5653,6 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     input: ForkChatFromMessageInput,
     commit: BrowserCommandCommit,
   ): Promise<ForkChatFromMessageResult> {
-    const db = await this.openDb()
     const [
       { buildChildSlotProjection },
       { applyAttachmentReferenceOwnerTransitions },
@@ -4371,127 +5664,133 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     ])
     const destinationChatId = input.destinationChatId ?? newId()
     const now = input.now ?? Date.now()
+    return commit.executeSemanticOperation(
+      CHAT_FORK_OPERATION,
+      {
+        sourceChatId: input.chatId,
+        targetMessageId: input.messageId,
+        destinationChatId,
+      },
+      async (tx) => {
+        const chatTable = tx.table<Chat, ChatId>('chats')
+        const source = await chatTable.get(input.chatId)
+        if (!source) throw new Error(`fork: source chat ${input.chatId} not found`)
+        if (await chatTable.get(destinationChatId)) {
+          throw new Error(`fork: destination chat ${destinationChatId} already exists`)
+        }
 
-    for (;;) {
-      const plan = await planForkWrite(db, input, destinationChatId)
-      try {
-        const result = await commit.withLocks(
-          ['chat-catalog', ...plan.sourceLinkResourceNames, ...plan.scopes.map(scopeResourceName)],
-          async (locked) =>
-            locked.runTransaction(FORK_CHAT_TRANSACTION, async (tx) => {
-              const chatTable = tx.table<Chat, ChatId>('chats')
-              const source = await chatTable.get(input.chatId)
-              if (!source) throw new Error(`fork: source chat ${input.chatId} not found`)
-              if (
-                !sameOrderedValues(
-                  plan.sourceLinkResourceNames,
-                  normalizeNamedLocks(chatConfigurationTargetResourceNames(source)),
-                )
-              ) {
-                throw new ForkWritePlanChangedError()
-              }
-              if (await chatTable.get(destinationChatId)) {
-                throw new Error(`fork: destination chat ${destinationChatId} already exists`)
-              }
-
-              const headers = await readForkLivePathHeaders(
-                tx.table<MessageHeaderRow, MessageId>('messages'),
-                input.chatId,
-                input.messageId,
-              )
-              const ancestors = await hydrateStoredMessages(
-                headers,
-                tx.table<MessageBodyRow, MessageId>('messageBodies'),
-              )
-              if (!sameForkPlanSource(plan, ancestors)) throw new ForkWritePlanChangedError()
-
-              const messages = cloneForkMessages(ancestors, plan, now)
-              const lastUpdatedLeafId = findLastUpdatedLeafId(messages)
-              const selectedTipId = messages.at(-1)?.id ?? null
-              const updatedAt = await nextChatUpdatedAtInTransaction(tx, now)
-              const chat: Chat = {
-                id: destinationChatId,
-                title: input.title,
-                titleStatus: 'manual',
-                createdAt: now,
-                updatedAt,
-                lastViewedAt: now,
-                wordCount: countMessagesWords(messages),
-                totalCostUsd: computeTotalCostUsd(messages),
-                metaVersion: 0,
-                summaryVersion: 1,
-                structuralVersion: messages.length === 0 ? 0 : 1,
-                settings: structuredClone(source.settings),
-                lastUpdatedLeafId,
-                lastBranchUpdatedAt: updatedAt,
-                archived: false,
-                pinned: false,
-                folderId: null,
-                tags: [],
-                previewText: previewTextFromMessages(messages),
-                ...(source.presetId ? { presetId: source.presetId } : {}),
-              }
-
-              await applyChatRowWriteTransitions(tx, [{ kind: 'add-linked', next: chat }])
-              let selectedTipPresentation: MessagePresentation | undefined
-              for (const message of messages) {
-                const storage = splitMessageForStorage(message, {
-                  updatedAt: now,
-                })
-                const header = storage.header
-                const { body, preview } = storage
-                await addPhysicalStorageRow(tx, 'messages', header)
-                await insertMessageBody(tx, body)
-                await addPhysicalStorageRow(tx, 'messagePreviews', preview)
-                if (message.id === selectedTipId) {
-                  selectedTipPresentation = {
-                    header,
-                    message,
-                    bodyVersion: header.bodyVersion,
-                  }
-                }
-              }
-              const childProjection = buildChildSlotProjection(destinationChatId, messages, {
-                updatedAt: now,
-                defaultVersion: 1,
-              })
-              await addPhysicalStorageRows(tx, 'childLists', childProjection.states)
-              await addPhysicalStorageRows(tx, 'childSlotMembers', childProjection.members)
-              const destination = await proveConversationSelectionInTransaction(tx, {
-                chat,
-                target: fixedConversationSelectionTarget(
-                  selectedTipId === null
-                    ? { kind: 'default' }
-                    : { kind: 'tip', messageId: selectedTipId },
-                  selectedTipId,
-                ),
-                tipId: selectedTipId,
-                presentations: selectedTipPresentation ? [selectedTipPresentation] : [],
-              })
-              await applyAttachmentReferenceOwnerTransitions(
-                tx,
-                messages.map((message) => ({
-                  ownerKind: 'message' as const,
-                  ownerId: message.id,
-                  chatId: message.chatId,
-                  previousRefs: undefined,
-                  nextRefs: message.attachmentRefs,
-                })),
-                now,
-              )
-              return {
-                chatId: destinationChatId,
-                messageCount: messages.length,
-                destination,
-              }
-            }),
+        const headers = await readForkLivePathHeaders(
+          tx.table<MessageHeaderRow, MessageId>('messages'),
+          input.chatId,
+          input.messageId,
         )
-        return result
-      } catch (error) {
-        if (error instanceof ForkWritePlanChangedError) continue
-        throw error
-      }
-    }
+        if (headers.length === 0) throw new Error('fork: no ancestors to copy')
+        const bodies = await tx
+          .table<MessageBodyRow, MessageId>('messageBodies')
+          .bulkGet(headers.map((header) => header.id))
+        const ancestors = hydrateMessages(
+          headers,
+          bodies.filter((body): body is MessageBodyRow => body !== undefined),
+        )
+        const destinationMessageIds = ancestors.map(() => newId())
+        const messages = cloneForkMessages(ancestors, destinationChatId, destinationMessageIds, now)
+        const lastUpdatedLeafId = findLastUpdatedLeafId(messages)
+        const selectedTipId = messages.at(-1)?.id ?? null
+        const updatedAt = await nextChatUpdatedAtInTransaction(tx, now)
+        const chat: Chat = {
+          id: destinationChatId,
+          title: input.title,
+          titleStatus: 'manual',
+          createdAt: now,
+          updatedAt,
+          lastViewedAt: now,
+          wordCount: countMessagesWords(messages),
+          totalCostUsd: computeTotalCostUsd(messages),
+          metaVersion: 0,
+          summaryVersion: 1,
+          structuralVersion: 1,
+          settings: structuredClone(source.settings),
+          lastUpdatedLeafId,
+          lastBranchUpdatedAt: updatedAt,
+          archived: false,
+          pinned: false,
+          folderId: null,
+          tags: [],
+          previewText: previewTextFromMessages(messages),
+          ...(source.presetId ? { presetId: source.presetId } : {}),
+        }
+
+        await applyChatRowWriteTransitions(tx, [{ kind: 'add-linked', next: chat }])
+        const storageRows = messages.map((message) =>
+          splitMessageForStorage(message, {
+            updatedAt: now,
+          }),
+        )
+        await Promise.all([
+          addPhysicalStorageRows(
+            tx,
+            'messages',
+            storageRows.map(({ header }) => header),
+          ),
+          addPhysicalStorageRows(
+            tx,
+            'messageBodies',
+            storageRows.map(({ body }) => body),
+          ),
+          addPhysicalStorageRows(
+            tx,
+            'messagePreviews',
+            storageRows.map(({ preview }) => preview),
+          ),
+        ])
+        const childProjection = buildChildSlotProjection(destinationChatId, messages, {
+          updatedAt: now,
+          defaultVersion: 1,
+        })
+        await Promise.all([
+          addPhysicalStorageRows(tx, 'childLists', childProjection.states),
+          addPhysicalStorageRows(tx, 'childSlotMembers', childProjection.members),
+        ])
+        const selectedStorage = storageRows.at(-1)
+        const destination = await proveConversationSelectionInTransaction(tx, {
+          chat,
+          target: fixedConversationSelectionTarget(
+            selectedTipId === null
+              ? { kind: 'default' }
+              : { kind: 'tip', messageId: selectedTipId },
+            selectedTipId,
+          ),
+          tipId: selectedTipId,
+          exactPathHeaders: storageRows.map(({ header }) => header),
+          presentations:
+            selectedStorage && selectedTipId
+              ? [
+                  {
+                    header: selectedStorage.header,
+                    message: messages[messages.length - 1] as Message,
+                    bodyVersion: selectedStorage.header.bodyVersion,
+                  },
+                ]
+              : [],
+        })
+        await applyAttachmentReferenceOwnerTransitions(
+          tx,
+          messages.map((message) => ({
+            ownerKind: 'message' as const,
+            ownerId: message.id,
+            chatId: message.chatId,
+            previousRefs: undefined,
+            nextRefs: message.attachmentRefs,
+          })),
+          now,
+        )
+        return {
+          chatId: destinationChatId,
+          messageCount: messages.length,
+          destination,
+        }
+      },
+    )
   }
 
   private async nextForkTitle(baseTitle: string): Promise<string> {
@@ -4518,14 +5817,13 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
   async discardEmptyDraftChats(
     input: {
       chatIds: readonly ChatId[]
-      exceptChatId?: ChatId | null
       now?: number
       staleBefore?: number
     },
     commit: BrowserCommandCommit,
   ): Promise<DeleteArchivedChatMetadataResult> {
     const runtime = await import('./browser-catalog-command-runtime')
-    return runtime.discardEmptyDraftChats(await this.openDb(), input, commit)
+    return runtime.discardEmptyDraftChats(input, commit)
   }
 
   private async pruneEmptyDraftChats(
@@ -4537,78 +5835,53 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     commit: BrowserCommandCommit,
   ) {
     const limit = Math.min(boundedMaintenanceLimit(input.limit), CHAT_CLOSURE_BATCH_LIMIT)
-    const db = await this.openDb()
-    for (;;) {
-      const state = await readStorageRetentionState(db, 'empty-draft-prune')
-      const cycle = storageRetentionCycle(state, input.now, input.maxAgeMs)
-      const page = await readTemporaryChatIdPage(db, {
-        ...(cycle.cursor === undefined ? {} : { after: cycle.cursor }),
-        cutoff: cycle.cutoff,
-        limit,
-      })
-      const plan = await planEmptyDraftChatClosure(db, page.chatIds, cycle.cutoff)
-      try {
-        return await commit.withLocks(
-          emptyDraftChatClosureLockNames(plan, ['storage-retention:empty-draft-prune']),
-          (locked) =>
-            locked.runTransaction(
-              physicalTransactionPlan(
-                CHAT_CLOSURE_TRANSACTION_CAPABILITY,
-                physicalStorageTables('storageRetentionState'),
-              ),
-              async (tx) => {
-                const currentState = await readStorageRetentionState(tx, 'empty-draft-prune')
-                assertStorageRetentionCycleCurrent(currentState, cycle)
-                const currentPage = await readTemporaryChatIdPage(tx, {
-                  ...(cycle.cursor === undefined ? {} : { after: cycle.cursor }),
-                  cutoff: cycle.cutoff,
-                  limit,
-                })
-                if (!sameTemporaryChatPage(page, currentPage)) {
-                  throw new ChatClosurePlanChangedError()
-                }
-                const closure = await deletePlannedEmptyDraftChats(
-                  tx,
-                  plan,
-                  cycle.cutoff,
-                  cycle.cycleNow,
-                )
-                const next = advanceStorageRetentionState(
-                  cycle,
-                  page.done
-                    ? {
-                        done: true,
-                        ...(page.earliestDeferredAt === undefined
-                          ? {}
-                          : { earliestDeferredAt: page.earliestDeferredAt }),
-                      }
-                    : {
-                        done: false,
-                        ...(page.nextCursor === undefined ? {} : { cursor: page.nextCursor }),
-                      },
-                )
-                await putPhysicalStorageRow<
-                  StorageRetentionStateRowFor<'empty-draft-prune'>,
-                  StorageRetentionTask
-                >(tx, 'storageRetentionState', next, currentState)
-                recordBrowserCommandStorageRetentionMutation(tx, 'empty-draft-prune')
-                return {
-                  deletedChatIds: closure.deletedChatIds,
-                  affectedAttachmentIds: closure.affectedAttachmentIds,
-                  scannedChatIds: page.chatIds.length,
-                  ...(page.earliestDeferredAt === undefined
-                    ? {}
-                    : { earliestDeferredAt: page.earliestDeferredAt }),
-                  done: page.done,
-                }
-              },
-            ),
+    return commit.executeSemanticOperation(
+      EMPTY_DRAFT_RETENTION_OPERATION,
+      undefined,
+      async (tx) => {
+        const currentState = await readStorageRetentionState(tx, 'empty-draft-prune')
+        const cycle = storageRetentionCycle(currentState, input.now, input.maxAgeMs)
+        const page = await readTemporaryChatIdPage(tx, {
+          ...(cycle.cursor === undefined ? {} : { after: cycle.cursor }),
+          cutoff: cycle.cutoff,
+          limit,
+        })
+        const closure = await deleteEligibleEmptyDraftChatClosure(
+          tx,
+          page.chatIds,
+          cycle.cutoff,
+          cycle.cycleNow,
         )
-      } catch (error) {
-        if (error instanceof ChatClosurePlanChangedError) continue
-        throw error
-      }
-    }
+        const next = advanceStorageRetentionState(
+          cycle,
+          page.done
+            ? {
+                done: true,
+                ...(page.earliestDeferredAt === undefined
+                  ? {}
+                  : { earliestDeferredAt: page.earliestDeferredAt }),
+              }
+            : {
+                done: false,
+                ...(page.nextCursor === undefined ? {} : { cursor: page.nextCursor }),
+              },
+        )
+        await putPhysicalStorageRow<
+          StorageRetentionStateRowFor<'empty-draft-prune'>,
+          StorageRetentionTask
+        >(tx, 'storageRetentionState', next, currentState)
+        recordBrowserCommandStorageRetentionMutation(tx, 'empty-draft-prune')
+        return {
+          deletedChatIds: closure.deletedChatIds,
+          affectedAttachmentIds: closure.affectedAttachmentIds,
+          scannedChatIds: page.chatIds.length,
+          ...(page.earliestDeferredAt === undefined
+            ? {}
+            : { earliestDeferredAt: page.earliestDeferredAt }),
+          done: page.done,
+        }
+      },
+    )
   }
 
   private async getConnectionDiscoverySnapshot(profileId: ProfileId) {
@@ -4917,15 +6190,136 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
             ...(chat.configurationVersion === undefined
               ? {}
               : { configurationVersion: chat.configurationVersion }),
+            ...(chat.modelResolution === undefined
+              ? {}
+              : { modelResolution: structuredClone(chat.modelResolution) }),
           },
           profile: { kind: profile.kind, baseUrl: profile.baseUrl },
           target,
+          requestKeyId: profile.apiKeyRef ?? null,
           ...(cachedModels?.profileRevision === connectionDiscoveryRevisionKey(target)
             ? { cachedModels: structuredClone(cachedModels) }
             : {}),
         }
       },
     )
+  }
+
+  private async getConfigurationModelResolutionPage(
+    profileId: ProfileId,
+    requestedProfileRevision: string,
+    knownModels: ConfigurationDiscoveryPayloadToken | undefined,
+    signal?: AbortSignal,
+  ): Promise<ConfigurationModelResolutionPage> {
+    signal?.throwIfAborted()
+    const db = await this.openDb()
+    return db.transaction(
+      'r',
+      [
+        db.chats,
+        db.configurationLinks,
+        db.discoveryPayloadMetadata,
+        db.discoveryPayloads,
+        db.keys,
+        db.models,
+        db.profiles,
+      ],
+      async (tx: Transaction) => {
+        const profile = await tx.table<ConnectionProfile, ProfileId>('profiles').get(profileId)
+        if (!profile) return { kind: 'unavailable' }
+        const key = profile.apiKeyRef
+          ? await tx.table<KeyRecord, KeyId>('keys').get(profile.apiKeyRef)
+          : undefined
+        const target = configurationRequestRevisionFor(profile, key)
+        const queryKey = modelsCacheKey(modelCatalogQueryForConnectionKind(profile.kind))
+        const [models, links] = await Promise.all([
+          readConfigurationModelsPayload(
+            tx,
+            [profileId, queryKey],
+            connectionDiscoveryRevisionKey(target),
+            knownModels,
+          ),
+          tx
+            .table<ConfigurationLink, string>('configurationLinks')
+            .where('targetKey')
+            .equals(configurationTargetKey('model-resolution', requestedProfileRevision))
+            .limit(CONFIGURATION_MODEL_RESOLUTION_PAGE_SIZE)
+            .toArray(),
+        ])
+        const chatIds = [
+          ...new Set(
+            links.flatMap((link) => (link.ownerKind === 'chat' ? [link.ownerId as ChatId] : [])),
+          ),
+        ]
+        const chats =
+          chatIds.length === 0 ? [] : await tx.table<Chat, ChatId>('chats').bulkGet(chatIds)
+        const pending = chats.flatMap((chat) => {
+          const resolution = chat?.modelResolution
+          if (
+            !chat ||
+            !resolution ||
+            resolution.target.profileId !== profileId ||
+            configurationRequestRevisionKey(resolution.target) !== requestedProfileRevision ||
+            (chat.configurationVersion ?? 0) !== resolution.expectedConfigurationVersion
+          ) {
+            return []
+          }
+          return [
+            {
+              chatId: chat.id,
+              intentId: resolution.intentId,
+              target: resolution.target,
+              sourceModelId: resolution.sourceModelId,
+              expectedConfigurationVersion: resolution.expectedConfigurationVersion,
+            },
+          ]
+        })
+        signal?.throwIfAborted()
+        return {
+          kind: 'ready',
+          profileKind: profile.kind,
+          target,
+          requestKeyId: profile.apiKeyRef ?? null,
+          models,
+          pending,
+          pageFull: links.length === CONFIGURATION_MODEL_RESOLUTION_PAGE_SIZE,
+        }
+      },
+    )
+  }
+
+  private async getConfigurationModelResolutionHead(
+    signal?: AbortSignal,
+  ): Promise<ConfigurationModelResolutionHead> {
+    signal?.throwIfAborted()
+    const db = await this.openDb()
+    return db.transaction('r', [db.chats, db.configurationLinks], async (tx: Transaction) => {
+      const link = await tx
+        .table<ConfigurationLink, string>('configurationLinks')
+        .where('targetKey')
+        .between('model-resolution:', 'model-resolution:\uffff', true, true)
+        .first()
+      if (!link) return { kind: 'empty' }
+      if (link.ownerKind !== 'chat') return { kind: 'blocked', linkId: link.id }
+      const chat = await tx.table<Chat, ChatId>('chats').get(link.ownerId as ChatId)
+      const pending = chat?.modelResolution
+      if (
+        !chat ||
+        !pending ||
+        configurationTargetKey(
+          'model-resolution',
+          configurationRequestRevisionKey(pending.target),
+        ) !== link.targetKey
+      ) {
+        return { kind: 'blocked', linkId: link.id }
+      }
+      signal?.throwIfAborted()
+      return {
+        kind: 'pending',
+        profileId: pending.target.profileId,
+        profileRevision: configurationRequestRevisionKey(pending.target),
+      }
+    })
   }
 
   private async getConfigurationProfileCatalogPage(
@@ -5152,13 +6546,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
   ): Promise<boolean | number | DiscoveryCachePutResult | DiscoveryModelsPutResult> {
     switch (command.kind) {
       case 'discovery.models.put':
-        return this.putModelsDiscoveryCacheRow(
-          command.row,
-          command.modelIds,
-          command.guard,
-          replacementEpoch,
-          commit,
-        )
+        return this.putModelsDiscoveryCacheRow(command.row, command.guard, replacementEpoch, commit)
       case 'discovery.endpoints.put':
         return this.putDiscoveryCacheRow(
           'endpoints',
@@ -5190,151 +6578,143 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
 
   private async putModelsDiscoveryCacheRow(
     row: CachedModelsRow,
-    modelIds: readonly string[],
     guard: DiscoveryCacheWriteGuard<CachedModelsRow> | undefined,
     replacementEpoch: number,
     commit: BrowserCommandCommit,
   ): Promise<DiscoveryModelsPutResult> {
     commit.assertReplacementEpoch(replacementEpoch)
-    const db = await this.openDb()
     const preparedPayload = await prepareDiscoveryPayload('models', row.payload)
-    const targetKey = configurationTargetKey('model-resolution', row.profileRevision)
-    for (;;) {
-      const plannedChatIds = await pendingModelResolutionChatIds(db.configurationLinks, targetKey)
-      try {
-        return await commit.withLocks(
-          [
-            'discovery-cache:retention',
-            `discovery-cache:models:${row.profileId}`,
-            `configuration-target:${targetKey}`,
-            ...plannedChatIds.map((chatId) => `chat-meta:${chatId}`),
-          ],
-          (locked) =>
-            locked.runTransaction(DISCOVERY_MODELS_WRITE_TRANSACTION, async (tx) => {
-              const currentProfile =
-                (await tx.table<ConnectionProfile, ProfileId>('profiles').get(row.profileId)) ??
-                null
-              const currentKey = currentProfile?.apiKeyRef
-                ? await tx.table<KeyRecord, KeyId>('keys').get(currentProfile.apiKeyRef)
-                : undefined
-              const currentRevision = currentProfile
-                ? configurationRequestRevisionFor(currentProfile, currentKey)
-                : null
-              if (
-                guard?.expectedProfileRevision !== undefined &&
-                stableStringify(currentRevision) !==
-                  stableStringify(guard.expectedProfileRevision ?? null)
-              ) {
-                return {
-                  accepted: false,
-                  cacheChanged: false,
-                  cached: false,
-                  repairRequired: false,
-                  evictions: [],
-                  resolvedChatIds: [],
-                }
-              }
-              if (
-                currentProfile &&
-                currentRevision &&
-                row.profileRevision !== connectionDiscoveryRevisionKey(currentRevision)
-              ) {
-                throw new Error(`DiscoveryCacheRowRevisionMismatch:${row.profileId}`)
-              }
-
-              const primaryKey: [ProfileId, string] = [row.profileId, row.queryKey]
-              if (guard?.expectedCurrent !== undefined) {
-                const current = await readDiscoveryCacheRow(tx, 'models', primaryKey)
-                if (
-                  stableStringify(current ?? null) !==
-                  stableStringify(guard.expectedCurrent ?? null)
-                ) {
-                  return {
-                    accepted: false,
-                    cacheChanged: false,
-                    cached: false,
-                    repairRequired: false,
-                    evictions: [],
-                    resolvedChatIds: [],
-                  }
-                }
-              }
-              const storageResult = await putDiscoveryCacheRow(tx, 'models', row, preparedPayload)
-
-              const currentChatIds = await pendingModelResolutionChatIds(
-                tx.table<ConfigurationLink, string>('configurationLinks'),
-                targetKey,
-              )
-              if (!sameOrderedIds(plannedChatIds, currentChatIds)) {
-                throw new ModelResolutionPublicationPlanChangedError()
-              }
-              const resolvedChatIds: ChatId[] = []
-              if (
-                currentProfile &&
-                row.queryKey ===
-                  modelsCacheKey(modelCatalogQueryForConnectionKind(currentProfile.kind))
-              ) {
-                const candidates = [...new Set(modelIds)].map((id) => ({ id }))
-                const chats = tx.table<Chat, ChatId>('chats')
-                const currentChats = await chats.bulkGet(currentChatIds)
-                const updatedAtClock = new TransactionChatUpdateClock()
-                const writes: Array<{ previous: Chat; next: Chat }> = []
-                for (const chat of currentChats) {
-                  const pending = chat?.modelResolution
-                  if (
-                    !chat ||
-                    !pending ||
-                    pending.target.profileId !== currentProfile.id ||
-                    configurationRequestRevisionKey(pending.target) !== row.profileRevision ||
-                    (chat.configurationVersion ?? 0) !== pending.expectedConfigurationVersion
-                  ) {
-                    continue
-                  }
-                  const resolvedModel =
-                    forceEquivalentModelIdForConnection(
-                      pending.sourceModelId,
-                      currentProfile.kind,
-                      candidates,
-                    ) ?? (candidates.length === 1 ? candidates[0]?.id : '')
-                  const written: Chat = {
-                    ...chat,
-                    settings: normalizeChatSettings({
-                      ...chat.settings,
-                      model: resolvedModel ?? '',
-                    }),
-                    configurationVersion: (chat.configurationVersion ?? 0) + 1,
-                    metaVersion: chat.metaVersion + 1,
-                    summaryVersion: chat.summaryVersion + 1,
-                    updatedAt: await updatedAtClock.next(tx, row.fetchedAt),
-                  }
-                  delete written.modelResolution
-                  writes.push({ previous: chat, next: written })
-                  resolvedChatIds.push(chat.id)
-                }
-                await applyChatRowWriteTransitions(
-                  tx,
-                  writes.map(({ previous, next }) => ({
-                    kind: 'replace-linked',
-                    previous,
-                    next,
-                  })),
-                )
-              }
-              return {
-                accepted: true,
-                cacheChanged: storageResult.cacheChanged,
-                cached: storageResult.cached,
-                repairRequired: storageResult.repairRequired,
-                evictions: protocolDiscoveryCacheEvictions(storageResult.evictions),
-                resolvedChatIds,
-              }
-            }),
-        )
-      } catch (error) {
-        if (error instanceof ModelResolutionPublicationPlanChangedError) continue
-        throw error
-      }
+    const input: DiscoveryCacheOperationInput = {
+      kind: 'discovery.models.put',
+      profileId: row.profileId,
+      discriminator: row.queryKey,
+      targetKey: configurationTargetKey('model-resolution', row.profileRevision),
     }
+    return commit.executeSemanticOperation(
+      discoveryCacheOperationDescriptor(input.kind),
+      input,
+      async (
+        tx,
+      ): Promise<
+        SemanticOperationExecution<
+          DiscoveryModelsPutResult,
+          SemanticOperationExactReceipt<PhysicalStorageTableName>
+        >
+      > => {
+        const receipt = requireDiscoveryCacheReceiptAccumulator(tx)
+        const currentProfile =
+          (await tx.table<ConnectionProfile, ProfileId>('profiles').get(row.profileId)) ?? null
+        receipt.physicalRead({
+          tableName: 'profiles',
+          indexKind: 'primary',
+          operation: 'get',
+          requestCount: 1,
+          rowCount: 1,
+        })
+        const currentKey = currentProfile?.apiKeyRef
+          ? await tx.table<KeyRecord, KeyId>('keys').get(currentProfile.apiKeyRef)
+          : undefined
+        if (currentProfile?.apiKeyRef) {
+          receipt.physicalRead({
+            tableName: 'keys',
+            indexKind: 'primary',
+            operation: 'get',
+            requestCount: 1,
+            rowCount: 1,
+          })
+        }
+        const currentRevision = currentProfile
+          ? configurationRequestRevisionFor(currentProfile, currentKey)
+          : null
+        if (
+          guard?.expectedProfileRevision !== undefined &&
+          stableStringify(currentRevision) !==
+            stableStringify(guard.expectedProfileRevision ?? null)
+        ) {
+          return semanticOperationExecution(
+            {
+              accepted: false,
+              cacheChanged: false,
+              cached: false,
+              repairRequired: false,
+              evictions: [],
+            },
+            discoveryCacheExactReceipt(
+              receipt,
+              {
+                kind: 'single-attempt',
+                reason: 'unfenced-relative-update',
+              },
+              DISCOVERY_CACHE_PUT_OPERATION_BOUNDS,
+            ),
+          )
+        }
+        if (
+          currentProfile &&
+          currentRevision &&
+          row.profileRevision !== connectionDiscoveryRevisionKey(currentRevision)
+        ) {
+          throw new Error(`DiscoveryCacheRowRevisionMismatch:${row.profileId}`)
+        }
+
+        const primaryKey: [ProfileId, string] = [row.profileId, row.queryKey]
+        let knownCurrent: DiscoveryCacheReadEvidence<CachedModelsRow> | undefined
+        if (guard?.expectedCurrent !== undefined) {
+          knownCurrent = await readDiscoveryCacheRowWithEvidence(tx, 'models', primaryKey, receipt)
+          if (
+            stableStringify(knownCurrent.row ?? null) !==
+            stableStringify(guard.expectedCurrent ?? null)
+          ) {
+            return semanticOperationExecution(
+              {
+                accepted: false,
+                cacheChanged: false,
+                cached: false,
+                repairRequired: false,
+                evictions: [],
+              },
+              discoveryCacheExactReceipt(
+                receipt,
+                {
+                  kind: 'single-attempt',
+                  reason: 'unfenced-relative-update',
+                },
+                DISCOVERY_CACHE_PUT_OPERATION_BOUNDS,
+              ),
+            )
+          }
+        }
+        const storageResult = await putDiscoveryCacheRow(tx, 'models', row, preparedPayload, {
+          ...(knownCurrent ? { knownCurrent } : {}),
+          receipt,
+        })
+        if (storageResult.accepted) {
+          const dependency = {
+            kind: 'model-resolution',
+            targetKeys: [configurationTargetKey('model-resolution', row.profileRevision)],
+          } as const
+          receipt.dependency(dependency)
+          recordBrowserCommandInvalidation(tx, dependency)
+        }
+        return semanticOperationExecution(
+          {
+            accepted: true,
+            cacheChanged: storageResult.cacheChanged,
+            cached: storageResult.cached,
+            repairRequired: storageResult.repairRequired,
+            evictions: protocolDiscoveryCacheEvictions(storageResult.evictions),
+          },
+          discoveryCacheExactReceipt(
+            receipt,
+            {
+              kind: 'single-attempt',
+              reason: 'unfenced-relative-update',
+            },
+            DISCOVERY_CACHE_PUT_OPERATION_BOUNDS,
+          ),
+        )
+      },
+    )
   }
 
   private async putDiscoveryCacheRow<Row extends CachedEndpointsRow | CachedPrivacyPolicyRow>(
@@ -5347,47 +6727,112 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
   ): Promise<DiscoveryCachePutResult> {
     commit.assertReplacementEpoch(replacementEpoch)
     const preparedPayload = await prepareDiscoveryPayload(tableName, row.payload)
-    return commit.withLocks(
-      ['discovery-cache:retention', `discovery-cache:${tableName}:${row.profileId}`],
-      (locked) =>
-        locked.runTransaction(DISCOVERY_CACHE_ROW_WRITE_TRANSACTION, async (tx) => {
-          if (guard && 'expectedProfileRevision' in guard) {
-            const currentProfile =
-              (await tx.table<ConnectionProfile, ProfileId>('profiles').get(row.profileId)) ?? null
-            const currentKey = currentProfile?.apiKeyRef
-              ? await tx.table<KeyRecord, KeyId>('keys').get(currentProfile.apiKeyRef)
-              : undefined
-            const currentRevision = currentProfile
-              ? configurationRequestRevisionFor(currentProfile, currentKey)
-              : null
-            if (
-              stableStringify(currentRevision) !==
-              stableStringify(guard.expectedProfileRevision ?? null)
-            ) {
-              return emptyDiscoveryCachePutResult()
-            }
-            if (
-              currentProfile &&
-              'profileRevision' in row &&
-              currentRevision &&
-              row.profileRevision !== connectionDiscoveryRevisionKey(currentRevision)
-            ) {
-              throw new Error(`DiscoveryCacheRowRevisionMismatch:${row.profileId}`)
-            }
+    const kind =
+      tableName === 'endpoints'
+        ? ('discovery.endpoints.put' as const)
+        : ('discovery.privacy.put' as const)
+    const input: DiscoveryCacheOperationInput = {
+      kind,
+      profileId: row.profileId,
+      discriminator: row.modelId,
+      targetKey: null,
+    }
+    return commit.executeSemanticOperation(
+      discoveryCacheOperationDescriptor(kind),
+      input,
+      async (tx) => {
+        const receipt = requireDiscoveryCacheReceiptAccumulator(tx)
+        if (guard && 'expectedProfileRevision' in guard) {
+          const currentProfile =
+            (await tx.table<ConnectionProfile, ProfileId>('profiles').get(row.profileId)) ?? null
+          receipt.physicalRead({
+            tableName: 'profiles',
+            indexKind: 'primary',
+            operation: 'get',
+            requestCount: 1,
+            rowCount: 1,
+          })
+          const currentKey = currentProfile?.apiKeyRef
+            ? await tx.table<KeyRecord, KeyId>('keys').get(currentProfile.apiKeyRef)
+            : undefined
+          if (currentProfile?.apiKeyRef) {
+            receipt.physicalRead({
+              tableName: 'keys',
+              indexKind: 'primary',
+              operation: 'get',
+              requestCount: 1,
+              rowCount: 1,
+            })
           }
-          if (guard && 'expectedCurrent' in guard) {
-            const current = (await readDiscoveryCacheRow(tx, tableName, primaryKey)) as
-              | Row
-              | undefined
-            if (
-              stableStringify(current ?? null) !== stableStringify(guard.expectedCurrent ?? null)
-            ) {
-              return emptyDiscoveryCachePutResult()
-            }
+          const currentRevision = currentProfile
+            ? configurationRequestRevisionFor(currentProfile, currentKey)
+            : null
+          if (
+            stableStringify(currentRevision) !==
+            stableStringify(guard.expectedProfileRevision ?? null)
+          ) {
+            return semanticOperationExecution(
+              emptyDiscoveryCachePutResult(),
+              discoveryCacheExactReceipt(
+                receipt,
+                {
+                  kind: 'single-attempt',
+                  reason: 'unfenced-relative-update',
+                },
+                DISCOVERY_CACHE_PUT_OPERATION_BOUNDS,
+              ),
+            )
           }
-          const result = await putDiscoveryCacheRow(tx, tableName, row, preparedPayload)
-          return protocolDiscoveryCachePutResult(result)
-        }),
+          if (
+            currentProfile &&
+            'profileRevision' in row &&
+            currentRevision &&
+            row.profileRevision !== connectionDiscoveryRevisionKey(currentRevision)
+          ) {
+            throw new Error(`DiscoveryCacheRowRevisionMismatch:${row.profileId}`)
+          }
+        }
+        let knownCurrent: DiscoveryCacheReadEvidence<Row> | undefined
+        if (guard && 'expectedCurrent' in guard) {
+          knownCurrent = (await readDiscoveryCacheRowWithEvidence(
+            tx,
+            tableName,
+            primaryKey,
+            receipt,
+          )) as DiscoveryCacheReadEvidence<Row>
+          if (
+            stableStringify(knownCurrent.row ?? null) !==
+            stableStringify(guard.expectedCurrent ?? null)
+          ) {
+            return semanticOperationExecution(
+              emptyDiscoveryCachePutResult(),
+              discoveryCacheExactReceipt(
+                receipt,
+                {
+                  kind: 'single-attempt',
+                  reason: 'unfenced-relative-update',
+                },
+                DISCOVERY_CACHE_PUT_OPERATION_BOUNDS,
+              ),
+            )
+          }
+        }
+        const result = await putDiscoveryCacheRow(tx, tableName, row, preparedPayload, {
+          ...(knownCurrent ? { knownCurrent } : {}),
+          receipt,
+        })
+        return semanticOperationExecution(
+          protocolDiscoveryCachePutResult(result),
+          discoveryCacheExactReceipt(
+            receipt,
+            {
+              kind: 'single-attempt',
+              reason: 'unfenced-relative-update',
+            },
+            DISCOVERY_CACHE_PUT_OPERATION_BOUNDS,
+          ),
+        )
+      },
     )
   }
 
@@ -5399,13 +6844,30 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     commit: BrowserCommandCommit,
   ): Promise<boolean> {
     commit.assertReplacementEpoch(replacementEpoch)
-    return commit.withLocks(
-      ['discovery-cache:retention', `discovery-cache:${tableName}:${profileId}`],
-      (locked) =>
-        locked.runTransaction(DISCOVERY_CACHE_TRANSACTION, async (tx) => {
-          const result = await deleteDiscoveryCacheRow(tx, tableName, primaryKey)
-          return result.deleted
-        }),
+    const input: DiscoveryCacheOperationInput = {
+      kind: 'discovery.models.delete',
+      profileId,
+      discriminator: primaryKey[1],
+      targetKey: null,
+    }
+    return commit.executeSemanticOperation(
+      discoveryCacheOperationDescriptor(input.kind),
+      input,
+      async (tx) => {
+        const receipt = requireDiscoveryCacheReceiptAccumulator(tx)
+        const result = await deleteDiscoveryCacheRow(tx, tableName, primaryKey, receipt)
+        return semanticOperationExecution(
+          result.deleted,
+          discoveryCacheExactReceipt(
+            receipt,
+            {
+              kind: 'single-attempt',
+              reason: 'unfenced-relative-update',
+            },
+            DISCOVERY_CACHE_DELETE_OPERATION_BOUNDS,
+          ),
+        )
+      },
     )
   }
 
@@ -5431,23 +6893,32 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
   ): Promise<StreamLeaseRow> {
     const { fence } = heartbeat
     commit.assertReplacementEpoch(fence.replacementEpoch)
-    const row = await commit.withLocks([`stream-journal:${heartbeat.streamId}`], (locked) =>
-      locked.runTransaction(STREAM_LEASE_TRANSACTION, async (tx) => {
-        const table = tx.table<StreamLeaseRow, string>('streamLeases')
-        const existing = await table.get(heartbeat.streamId)
+    if (!Number.isSafeInteger(heartbeat.expectedRevision) || heartbeat.expectedRevision < 0) {
+      throw new Error(`StreamLeaseHeartbeatRevisionInvalid:${heartbeat.streamId}`)
+    }
+    const replay = requestedRenewReplayPlan(heartbeat)
+    const row = await executeStreamLeaseOperation<StreamLeaseRow>(
+      commit,
+      STREAM_RENEW_OPERATION,
+      heartbeat.streamId,
+      replay,
+      (existing) => {
         assertOwnedStreamFence(existing, fence, fence.replacementEpoch, heartbeat.streamId)
+        if (existing.revision !== heartbeat.expectedRevision) {
+          return { value: structuredClone(existing) }
+        }
         const elapsed = heartbeat.heartbeatAt - existing.heartbeatAt
         if (elapsed >= 0 && elapsed <= STREAM_LEASE_HEARTBEAT_COALESCE_MS) {
-          return structuredClone(existing)
+          return { value: structuredClone(existing) }
         }
         const renewed = requireStreamLeaseRow({
           ...existing,
           heartbeatAt: heartbeat.heartbeatAt,
           revision: nextStreamLeaseRevision(existing),
         })
-        await putStreamLeaseByteOwner(tx, renewed, existing)
-        return renewed
-      }),
+        return { value: renewed, next: renewed }
+      },
+      observedRenewReplayPlan,
     )
     return row
   }
@@ -5458,10 +6929,13 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     commit: BrowserCommandCommit,
   ): Promise<StreamLeaseRow | undefined> {
     commit.assertReplacementEpoch(expected.replacementEpoch)
-    return commit.withLocks([`stream-journal:${expected.streamId}`], (locked) =>
-      locked.runTransaction(STREAM_LEASE_TRANSACTION, async (tx) => {
-        const table = tx.table<StreamLeaseRow, string>('streamLeases')
-        const existing = await table.get(expected.streamId)
+    const replay = requestedClaimRecoveryReplayPlan(expected)
+    return executeStreamLeaseOperation<StreamLeaseRow | undefined>(
+      commit,
+      STREAM_CLAIM_RECOVERY_OPERATION,
+      expected.streamId,
+      replay,
+      (existing) => {
         if (
           !existing ||
           existing.replacementEpoch !== expected.replacementEpoch ||
@@ -5477,7 +6951,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
             expected.custody === 'recovery-pending' &&
             existing.handoffId !== expected.handoffId)
         ) {
-          return undefined
+          return { value: undefined }
         }
         const {
           custody: _custody,
@@ -5497,9 +6971,9 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
           heartbeatAt: now,
           revision: nextStreamLeaseRevision(existing),
         })
-        await putStreamLeaseByteOwner(tx, claimed, existing)
-        return claimed
-      }),
+        return { value: claimed, next: claimed }
+      },
+      (current, decision) => observedClaimRecoveryReplayPlan(current, decision, expected.streamId),
     )
   }
 
@@ -5509,10 +6983,31 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     commit: BrowserCommandCommit,
   ): Promise<StreamLeaseRow> {
     commit.assertReplacementEpoch(replacementEpoch)
-    return commit.withLocks([`stream-journal:${input.streamId}`], (locked) =>
-      locked.runTransaction(STREAM_LEASE_TRANSACTION, async (tx) => {
-        const table = tx.table<StreamLeaseRow, string>('streamLeases')
-        const existing = await table.get(input.streamId)
+    const replay = handoffReplayPlan(
+      input.streamId,
+      input.fence.replacementEpoch,
+      input.fence.admissionSequence,
+      input.handoffId,
+      input.handedOffAt,
+      input.reason,
+    )
+    return executeStreamLeaseOperation<StreamLeaseRow>(
+      commit,
+      STREAM_HANDOFF_RECOVERY_OPERATION,
+      input.streamId,
+      replay,
+      (existing) => {
+        if (existing?.custody === 'recovery-pending' && existing.handoffId === input.handoffId) {
+          if (
+            existing.replacementEpoch !== input.fence.replacementEpoch ||
+            existing.admissionSequence !== input.fence.admissionSequence ||
+            existing.handedOffAt !== input.handedOffAt ||
+            existing.handoffReason !== input.reason
+          ) {
+            throw new Error(`StreamHandoffReplayConflict:${input.streamId}`)
+          }
+          return { value: structuredClone(existing) }
+        }
         assertOwnedStreamFence(existing, input.fence, replacementEpoch, input.streamId)
         if (existing.custody !== 'writer') {
           throw new Error(`StreamHandoffCustodyInvalid:${input.streamId}`)
@@ -5527,14 +7022,14 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
         const handedOff = requireStreamLeaseRow({
           ...leaseState,
           custody: 'recovery-pending',
-          handoffId: newId(),
+          handoffId: input.handoffId,
           handedOffAt: input.handedOffAt,
           handoffReason: input.reason,
           revision: nextStreamLeaseRevision(existing),
         })
-        await putStreamLeaseByteOwner(tx, handedOff, existing)
-        return handedOff
-      }),
+        return { value: handedOff, next: handedOff }
+      },
+      (_current, decision) => observedHandoffReplayPlan(decision.value),
     )
   }
 
@@ -5567,16 +7062,43 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
 
   async appendStreamJournalFrames(
     frames: readonly StreamJournalFrameRow[],
+    observedAt: number,
     commit: BrowserCommandCommit,
   ): Promise<void> {
     if (frames.length === 0) return
+    if (!Number.isSafeInteger(observedAt) || observedAt < 0) {
+      throw new Error('StreamJournalObservedAtInvalid')
+    }
     const batch = canonicalStreamJournalFrameBatch(frames)
-    const streamId = batch[0]?.streamId
-    if (!streamId) throw new Error('StreamJournalAppendBatchEmpty')
-    await commit.withLocks([`stream-journal:${streamId}`], (locked) =>
-      locked.runTransaction(STREAM_JOURNAL_TRANSACTION, (tx) =>
-        persistStreamJournalFrames(tx, batch, Date.now()),
+    const first = batch[0]
+    if (!first) throw new Error('StreamJournalAppendBatchEmpty')
+    const authority = streamJournalWriterAuthority(first)
+    const resource = {
+      streamId: authority.streamId,
+      replay: streamJournalAppendReplayPlan(
+        authority,
+        batch.map((frame) => frame.id),
       ),
+    }
+    await commit.executeSemanticOperation(
+      STREAM_APPEND_JOURNAL_FRAMES_OPERATION,
+      resource,
+      async (tx) => {
+        const transition = await persistStreamJournalFrames(tx, batch, observedAt)
+        return semanticOperationExecution(
+          undefined,
+          semanticOperationExactReceipt(
+            semanticOperationExactPlan({
+              replay: streamJournalAppendReplayPlan(
+                transition.authority,
+                transition.acceptedFrameIds,
+              ),
+              bounds: STREAM_JOURNAL_APPEND_OPERATION_BOUNDS,
+            }),
+            transition.receipt,
+          ),
+        )
+      },
     )
   }
 
@@ -5589,25 +7111,53 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     commit: BrowserCommandCommit,
   ): Promise<{ deletedLease: boolean; deletedFrames: number; done: boolean }> {
     commit.assertReplacementEpoch(options.replacementEpoch)
-    return commit.withLocks([`stream-journal:${streamId}`], (locked) =>
-      locked.runTransaction(STREAM_JOURNAL_TRANSACTION, async (tx) => {
-        const page = await retireStreamJournalOwnershipPage(tx, {
+    const maxFrameRows = STREAM_JOURNAL_RETIREMENT_MAX_ROWS
+    const resourceInput: StreamFinishCleanupResourceInput = {
+      streamId,
+      fence: options.streamFence,
+      maxFrameRows,
+      replay: streamFinishCleanupReplayPlan(streamId, options.streamFence, maxFrameRows, 'request'),
+    }
+    return commit.executeSemanticOperation(
+      STREAM_FINISH_CLEANUP_OPERATION,
+      resourceInput,
+      async (tx) => {
+        const transition = await retireStreamJournalOwnershipPage(tx, {
           kind: 'owned-metadata-committed',
           streamId,
           fence: options.streamFence,
+          maxFrameRows,
         })
+        if (transition.kind !== 'single-stream') {
+          throw new Error(`StreamCleanupReceiptMissing:${streamId}`)
+        }
+        const page = transition.result
         if (page.outcome === 'ineligible') {
           if (page.reason === 'not-metadata-committed') {
             throw new Error(`StreamCleanupBeforeMetadata:${streamId}`)
           }
           throw new Error(`StreamFenceLost:${streamId}`)
         }
-        return {
-          deletedLease: page.deletedLeases > 0,
-          deletedFrames: page.deletedFrames,
-          done: page.done,
-        }
-      }),
+        return semanticOperationExecution(
+          {
+            deletedLease: page.deletedLeases > 0,
+            deletedFrames: page.deletedFrames,
+            done: page.done,
+          },
+          semanticOperationExactReceipt(
+            semanticOperationExactPlan({
+              replay: streamFinishCleanupReplayPlan(
+                streamId,
+                options.streamFence,
+                maxFrameRows,
+                page.deletedFrames > 0 || page.deletedLeases > 0 ? 'applied' : 'already-applied',
+              ),
+              bounds: STREAM_FINISH_CLEANUP_OPERATION_BOUNDS,
+            }),
+            transition.receipt,
+          ),
+        )
+      },
     )
   }
 
@@ -5621,37 +7171,26 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     done: boolean
   }> {
     const limit = boundedMaintenanceLimit(requestedLimit)
-    const db = await this.openDb()
-    for (;;) {
-      const plan = await readStreamJournalIntegrityPlan(db)
-      if (plan.kind === 'complete') {
-        return {
-          scannedStreamIds: 0,
-          deletedStreamIds: [],
-          deletedFrames: 0,
-          done: true,
-        }
-      }
-      try {
-        return await commit.withLocks(
-          [
-            'stream-journal-integrity:maintenance',
-            ...(plan.kind === 'retire' ? [`stream-journal:${plan.streamId}`] : []),
-          ],
-          (locked) =>
-            locked.runTransaction(STREAM_JOURNAL_INTEGRITY_TRANSACTION, async (tx) => {
-              const result = await reconcileStreamJournalIntegrityPage(tx, limit, plan)
-              return {
-                ...result,
-                deletedStreamIds: [...result.deletedStreamIds],
-              }
+    return commit.executeSemanticOperation(
+      STREAM_JOURNAL_INTEGRITY_OPERATION,
+      { limit },
+      async (tx) => {
+        const transition = await reconcileStreamJournalIntegrityPage(tx, limit)
+        return semanticOperationExecution(
+          {
+            ...transition.result,
+            deletedStreamIds: [...transition.result.deletedStreamIds],
+          },
+          semanticOperationExactReceipt(
+            semanticOperationExactPlan({
+              replay: transition.replay,
+              bounds: STREAM_JOURNAL_INTEGRITY_OPERATION_BOUNDS,
             }),
+            transition.receipt,
+          ),
         )
-      } catch (error) {
-        if (error instanceof StreamJournalIntegrityPlanChangedError) continue
-        throw error
-      }
-    }
+      },
+    )
   }
 
   private async pruneTerminalStreamJournals(
@@ -5659,129 +7198,171 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     maxAgeMs: number,
     requestedLimit: number,
     commit: BrowserCommandCommit,
-  ): Promise<{
-    scanned: number
-    deletedStreamIds: string[]
-    deletedFrames: number
-    earliestDeferredAt?: number
-    done: boolean
-  }> {
-    boundedMaintenanceLimit(requestedLimit)
-    const db = await this.openDb()
-    for (;;) {
-      const state = await readStorageRetentionState(db, 'terminal-stream-prune')
-      const cycle = storageRetentionCycle(state, now, maxAgeMs)
-      const lower = cycle.cursor ? [cycle.cursor.terminalRetentionAt, cycle.cursor.streamId] : []
-      const candidate = await db.streamLeases
-        .where('[terminalRetentionAt+streamId]')
-        .between(lower, [cycle.cutoff], false, false)
-        .first()
-      try {
-        return await commit.withLocks(
-          [
-            'storage-retention:terminal-stream-prune',
-            ...(candidate ? [`stream-journal:${candidate.streamId}`] : []),
-          ],
-          (locked) =>
-            locked.runTransaction(TERMINAL_STREAM_RETENTION_TRANSACTION, async (tx) => {
-              const currentState = await readStorageRetentionState(tx, 'terminal-stream-prune')
-              if (currentState.revision !== cycle.expectedRevision) {
-                throw new TerminalStreamRetentionPlanChangedError()
-              }
-              const leases = tx.table<StreamLeaseRow, string>('streamLeases')
-              const current = await leases
-                .where('[terminalRetentionAt+streamId]')
-                .between(lower, [cycle.cutoff], false, false)
-                .first()
-              if (
-                current?.streamId !== candidate?.streamId ||
-                current?.revision !== candidate?.revision ||
-                current?.terminalRetentionAt !== candidate?.terminalRetentionAt
-              ) {
-                throw new TerminalStreamRetentionPlanChangedError()
-              }
-              if (!current) {
-                const deferred = await leases
-                  .where('[terminalRetentionAt+streamId]')
-                  .aboveOrEqual([cycle.cutoff])
-                  .first()
-                const earliestDeferredAt = deferred?.terminalRetentionAt
-                await commitStorageRetentionPage(tx, cycle, {
-                  done: true,
-                  ...(earliestDeferredAt === undefined ? {} : { earliestDeferredAt }),
-                })
-                return {
-                  scanned: 0,
-                  deletedStreamIds: [],
-                  deletedFrames: 0,
-                  ...(earliestDeferredAt === undefined ? {} : { earliestDeferredAt }),
-                  done: true,
-                }
-              }
-              if (current.terminalRetentionAt === undefined) {
-                throw new TerminalStreamRetentionPlanChangedError()
-              }
-              const page = await retireStreamJournalOwnershipPage(tx, {
-                kind: 'retention-candidate',
-                streamId: current.streamId,
-                expectedRevision: current.revision,
-                expectedTerminalRetentionAt: current.terminalRetentionAt,
-                cutoff: cycle.cutoff,
-              })
-              if (page.outcome === 'ineligible') {
-                throw new TerminalStreamRetentionPlanChangedError()
-              }
-              if (page.outcome === 'complete') {
-                await commitStorageRetentionPage(tx, cycle, {
-                  done: false,
-                  cursor: {
-                    terminalRetentionAt: current.terminalRetentionAt,
-                    streamId: current.streamId,
-                  },
-                })
-              }
-              return {
-                scanned: 1,
-                deletedStreamIds: page.deletedLeases > 0 ? [current.streamId] : [],
-                deletedFrames: page.deletedFrames,
-                done: false,
-              }
+  ): Promise<TerminalStreamRetentionResult> {
+    const limit = Math.min(
+      boundedMaintenanceLimit(requestedLimit),
+      STREAM_JOURNAL_RETIREMENT_MAX_ROWS,
+    )
+    return commit.executeSemanticOperation(
+      TERMINAL_STREAM_RETENTION_OPERATION,
+      { limit },
+      async (tx) => {
+        const receipt = createSemanticOperationExactReceiptAccumulator<
+          'storageRetentionState' | 'streamLeases' | 'streamChunks'
+        >()
+        const state = await readStorageRetentionState(tx, 'terminal-stream-prune')
+        receipt.physicalRead({
+          tableName: 'storageRetentionState',
+          indexKind: 'primary',
+          operation: 'get',
+          requestCount: 1,
+          rowCount: 1,
+        })
+        const cycle = storageRetentionCycle(state, now, maxAgeMs)
+        const leases = tx.table<StreamLeaseRow, string>('streamLeases')
+        const lower = cycle.cursor ? [cycle.cursor.terminalRetentionAt, cycle.cursor.streamId] : []
+        const current = await leases
+          .where('[terminalRetentionAt+streamId]')
+          .between(lower, [cycle.cutoff], false, false)
+          .first()
+        receipt.physicalRead({
+          tableName: 'streamLeases',
+          indexKind: 'secondary',
+          indexName: '[terminalRetentionAt+streamId]',
+          operation: 'query',
+          requestCount: 1,
+          rowCount: current ? 1 : 0,
+        })
+        if (!current) {
+          const deferred = await leases
+            .where('[terminalRetentionAt+streamId]')
+            .aboveOrEqual([cycle.cutoff])
+            .first()
+          receipt.physicalRead({
+            tableName: 'streamLeases',
+            indexKind: 'secondary',
+            indexName: '[terminalRetentionAt+streamId]',
+            operation: 'query',
+            requestCount: 1,
+            rowCount: deferred ? 1 : 0,
+          })
+          const earliestDeferredAt = deferred?.terminalRetentionAt
+          receipt.absorb(
+            await commitStorageRetentionPage(tx, cycle, {
+              done: true,
+              ...(earliestDeferredAt === undefined ? {} : { earliestDeferredAt }),
             }),
+          )
+          const result: TerminalStreamRetentionResult = {
+            scanned: 0,
+            deletedStreamIds: [],
+            deletedFrames: 0,
+            ...(earliestDeferredAt === undefined ? {} : { earliestDeferredAt }),
+            done: true,
+          }
+          return semanticOperationExecution(
+            result,
+            receipt.seal(
+              semanticOperationExactPlan({
+                replay: terminalStreamRetentionReplayPlan(cycle, limit),
+                bounds: TERMINAL_STREAM_RETENTION_OPERATION_BOUNDS,
+              }),
+            ),
+          )
+        }
+        if (current.terminalRetentionAt === undefined) {
+          throw new Error(`TerminalStreamRetentionTimestampMissing:${current.streamId}`)
+        }
+        const transition = await retireStreamJournalOwnershipPage(tx, {
+          kind: 'retention-candidate',
+          streamId: current.streamId,
+          expectedRevision: current.revision,
+          expectedTerminalRetentionAt: current.terminalRetentionAt,
+          cutoff: cycle.cutoff,
+          maxFrameRows: limit,
+        })
+        if (transition.kind !== 'single-stream') {
+          throw new Error(`TerminalStreamRetentionReceiptMissing:${current.streamId}`)
+        }
+        receipt.absorb(transition.receipt)
+        const page = transition.result
+        if (page.outcome === 'ineligible') {
+          throw new Error(`TerminalStreamRetentionCandidateInvalid:${current.streamId}`)
+        }
+        if (page.outcome === 'complete') {
+          receipt.absorb(
+            await commitStorageRetentionPage(tx, cycle, {
+              done: false,
+              cursor: {
+                terminalRetentionAt: current.terminalRetentionAt,
+                streamId: current.streamId,
+              },
+            }),
+          )
+        }
+        const result: TerminalStreamRetentionResult = {
+          scanned: 1,
+          deletedStreamIds: page.deletedLeases > 0 ? [current.streamId] : [],
+          deletedFrames: page.deletedFrames,
+          done: false,
+        }
+        return semanticOperationExecution(
+          result,
+          receipt.seal(
+            semanticOperationExactPlan({
+              replay: terminalStreamRetentionReplayPlan(cycle, limit),
+              bounds: TERMINAL_STREAM_RETENTION_OPERATION_BOUNDS,
+            }),
+          ),
         )
-      } catch (error) {
-        if (error instanceof TerminalStreamRetentionPlanChangedError) continue
-        throw error
-      }
-    }
+      },
+    )
   }
 
   private async pruneDiscoveryCache(
     requestedLimit: number,
     commit: BrowserCommandCommit,
   ): Promise<DiscoveryCacheMaintenanceResult> {
-    return commit.withLocks(['discovery-cache:retention'], (locked) =>
-      locked.runTransaction(DISCOVERY_CACHE_TRANSACTION, async (tx) => {
-        const result = await maintainDiscoveryCache(tx, requestedLimit)
-        return {
-          scanned: result.scanned,
-          deletedPayloads: result.deletedPayloads,
-          evictions: protocolDiscoveryCacheEvictions(result.evictions),
-          done: result.done,
-        }
-      }),
+    const limit = boundedMaintenanceLimit(requestedLimit)
+    return commit.executeSemanticOperation(
+      DISCOVERY_CACHE_MAINTENANCE_OPERATION,
+      { limit },
+      async (tx) => {
+        const receipt = requireDiscoveryCacheReceiptAccumulator(tx)
+        const result = await maintainDiscoveryCache(tx, limit, receipt)
+        return semanticOperationExecution(
+          {
+            scanned: result.scanned,
+            deletedPayloads: result.deletedPayloads,
+            evictions: protocolDiscoveryCacheEvictions(result.evictions),
+            done: result.done,
+          },
+          discoveryCacheExactReceipt(
+            receipt,
+            result.replay,
+            discoveryCacheMaintenanceOperationBounds(limit),
+          ),
+        )
+      },
     )
   }
 
   private async reconcileAttachmentIntegrity(
     requestedLimit: number,
+    now: number,
     commit: BrowserCommandCommit,
   ): Promise<AttachmentIntegrityMaintenanceResult> {
     const limit = boundedMaintenanceLimit(requestedLimit)
-    return commit.withLocks(['attachment-integrity:maintenance'], (locked) =>
-      locked.runTransaction(ATTACHMENT_INTEGRITY_TRANSACTION, async (tx) => {
-        const result = await reconcileAttachmentIntegrityPage(tx, limit)
+    if (!Number.isSafeInteger(now) || now < 0) {
+      throw new Error('AttachmentIntegrityObservedAtInvalid')
+    }
+    return commit.executeSemanticOperation(
+      ATTACHMENT_INTEGRITY_OPERATION,
+      undefined,
+      async (tx) => {
+        const result = await reconcileAttachmentIntegrityPage(tx, limit, now)
         return result
-      }),
+      },
     )
   }
 
@@ -5796,7 +7377,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     commit: BrowserCommandCommit,
   ): Promise<ChatMetadataWriteResult<readonly ChatId[]>> {
     const runtime = await import('./browser-catalog-command-runtime')
-    return runtime.setChatsArchived(await this.openDb(), chatIds, archived, now, commit)
+    return runtime.setChatsArchived(chatIds, archived, now, commit)
   }
 
   private async touchChatViewed(
@@ -5805,7 +7386,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     commit: BrowserCommandCommit,
   ): Promise<ChatMetadataWriteResult<boolean>> {
     const runtime = await import('./browser-catalog-command-runtime')
-    return runtime.touchChatViewed(await this.openDb(), chatId, now, commit)
+    return runtime.touchChatViewed(chatId, now, commit)
   }
 
   private async setChatManualTitle(
@@ -5815,7 +7396,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     commit: BrowserCommandCommit,
   ): Promise<ChatMetadataWriteResult<boolean>> {
     const runtime = await import('./browser-catalog-command-runtime')
-    return runtime.setChatManualTitle(await this.openDb(), chatId, title, now, commit)
+    return runtime.setChatManualTitle(chatId, title, now, commit)
   }
 
   private async moveChatRowsToFolder(
@@ -5825,7 +7406,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     commit: BrowserCommandCommit,
   ): Promise<ChatMetadataWriteResult<boolean>> {
     const runtime = await import('./browser-catalog-command-runtime')
-    return runtime.moveChatRowsToFolder(await this.openDb(), chatIds, folderId, now, commit)
+    return runtime.moveChatRowsToFolder(chatIds, folderId, now, commit)
   }
 
   private async setChatRowsTagsFromNames(
@@ -5854,7 +7435,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     commit: BrowserCommandCommit,
   ): Promise<ChatCalibrationEverywhereResult> {
     const runtime = await import('./browser-catalog-command-runtime')
-    return runtime.clearCalibrationEverywhere(await this.openDb(), command, commit)
+    return runtime.clearCalibrationEverywhere(command, commit)
   }
 
   private async deleteArchivedChatRows(
@@ -5863,7 +7444,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     commit: BrowserCommandCommit,
   ): Promise<DeleteArchivedChatMetadataResult> {
     const runtime = await import('./browser-catalog-command-runtime')
-    return runtime.deleteArchivedChatRows(await this.openDb(), chatIds, now, commit)
+    return runtime.deleteArchivedChatRows(chatIds, now, commit)
   }
 
   private async emptyArchivedChatRows(
@@ -5871,7 +7452,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     commit: BrowserCommandCommit,
   ) {
     const runtime = await import('./browser-catalog-command-runtime')
-    return runtime.emptyArchivedChatRows(await this.openDb(), input, commit)
+    return runtime.emptyArchivedChatRows(input, commit)
   }
 
   async listFolders(): Promise<ChatFolder[]> {
@@ -5898,7 +7479,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     commit: BrowserCommandCommit,
   ): Promise<EnsureFolderAndMoveChatsResult> {
     const runtime = await import('./browser-catalog-command-runtime')
-    return runtime.ensureFolderAndMoveChats(await this.openDb(), input, commit)
+    return runtime.ensureFolderAndMoveChats(input, commit)
   }
 
   async deleteFolder(
@@ -5908,7 +7489,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     commit: BrowserCommandCommit,
   ): Promise<DeleteFolderResult> {
     const runtime = await import('./browser-catalog-command-runtime')
-    return runtime.deleteFolder(await this.openDb(), folderId, chatDisposition, now, commit)
+    return runtime.deleteFolder(folderId, chatDisposition, now, commit)
   }
 
   async listTags(): Promise<ChatTag[]> {
@@ -6390,37 +7971,18 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     commit: BrowserCommandCommit,
   ): Promise<AttachmentBundleWriteResult> {
     const { bundle, mode } = input
-    const contentLock = bundle.attachment.contentHash
-      ? `attachment-content:${bundle.attachment.contentHash}:${bundle.attachment.filename}`
-      : `attachment-id:${bundle.attachment.id}`
     const mutation = await this.runMutation(
       [{ kind: 'attachment', attachmentId: bundle.attachment.id }],
-      async (ctx) => {
-        if ((mode === 'dedupe' || mode === 'dedupe-or-replace') && bundle.attachment.contentHash) {
-          const duplicateId = await ctx.findAttachmentIdByContentHash(
-            bundle.attachment.filename,
-            bundle.attachment.contentHash,
-          )
-          if (duplicateId) {
-            return { attachmentId: duplicateId, outcome: 'existing' as const }
+      (ctx) => ctx.writeAttachmentBundle(bundle, mode),
+      (mode === 'dedupe' || mode === 'dedupe-or-replace') && bundle.attachment.contentHash
+        ? {
+            attachmentContentIdentity: {
+              attachmentId: bundle.attachment.id,
+              contentHash: bundle.attachment.contentHash,
+              filename: bundle.attachment.filename,
+            },
           }
-        }
-        const current = await ctx.getAttachment(bundle.attachment.id)
-        if (current && (mode === 'put-if-absent' || mode === 'dedupe')) {
-          return { attachmentId: current.id, outcome: 'existing' as const }
-        }
-        if ((mode === 'replace' || mode === 'dedupe-or-replace') && !current) {
-          throw new Error(`AttachmentMissing:${bundle.attachment.id}`)
-        }
-        if (current && (mode === 'replace' || mode === 'dedupe-or-replace' || mode === 'put')) {
-          await ctx.deleteAttachmentBlobs(current.id)
-          await ctx.deleteAttachmentArtifacts(current.id)
-          await ctx.deleteAttachmentJobs(current.id)
-        }
-        await persistPreparedAttachmentBundleInMutation(ctx, bundle, current)
-        return { attachmentId: bundle.attachment.id, outcome: 'written' as const }
-      },
-      { additionalLockNames: [contentLock] },
+        : undefined,
       commit,
     )
     return mutation.value
@@ -6675,56 +8237,11 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
   ): Promise<Attachment | undefined> {
     const mutation = await this.runMutation(
       [{ kind: 'attachment', attachmentId: input.attachmentId }],
-      async (ctx) => {
-        const current = await ctx.getAttachment(input.attachmentId)
-        if (!current) return undefined
-        return this.deleteAttachmentBytesInMutation(ctx, current, input.reason, input.now)
-      },
+      (ctx) => ctx.deleteAttachmentBytes(input.attachmentId, input.reason, input.now),
       undefined,
       commit,
     )
     return mutation.value
-  }
-
-  private async deleteAttachmentBytesInMutation(
-    ctx: MutationContext,
-    current: Attachment,
-    reason: AttachmentDeleteBytesInput['reason'],
-    now: number,
-  ): Promise<Attachment> {
-    const [artifacts, jobs] = await Promise.all([
-      ctx.getAttachmentArtifacts(current.id),
-      ctx.getAttachmentJobs(current.id),
-    ])
-    const retainedArtifacts = artifacts.filter((artifact) => artifact.kind !== 'blob')
-    const retainedArtifactIds = new Set(retainedArtifacts.map((artifact) => artifact.artifactId))
-    await ctx.deleteAttachmentBlobs(current.id)
-    for (const artifact of artifacts) {
-      if (artifact.kind === 'blob') await ctx.deleteAttachmentArtifact(artifact.artifactId)
-    }
-    for (const job of jobs) {
-      const outputArtifactIds = job.outputArtifactIds.filter((id) => retainedArtifactIds.has(id))
-      if (job.outputArtifactIds.length > 0 && outputArtifactIds.length === 0) {
-        await ctx.deleteAttachmentJob(job.id)
-      } else if (!sameOrderedValues(outputArtifactIds, job.outputArtifactIds)) {
-        await ctx.putAttachmentJob({ ...job, outputArtifactIds, updatedAt: now })
-      }
-    }
-    const processing = current.processing.flatMap((state) => {
-      const outputArtifactIds = state.outputArtifactIds.filter((id) => retainedArtifactIds.has(id))
-      return state.outputArtifactIds.length > 0 && outputArtifactIds.length === 0
-        ? []
-        : [{ ...state, outputArtifactIds }]
-    })
-    const next = missingAttachmentAfterByteDeletion(
-      current,
-      reason,
-      now,
-      retainedArtifacts,
-      processing,
-    )
-    await ctx.putAttachment(next)
-    return next
   }
 
   private async deleteAttachmentIfUnreferenced(
@@ -6733,15 +8250,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
   ): Promise<AttachmentDeleteIfUnreferencedResult> {
     const mutation = await this.runMutation(
       [{ kind: 'attachment', attachmentId }],
-      async (ctx) => {
-        const counts = await ctx.countAttachmentReferences(attachmentId)
-        const refs = { messages: counts.messages, drafts: counts.drafts }
-        if (counts.occurrences > 0 || !(await ctx.getAttachment(attachmentId))) {
-          return { deleted: false, refs }
-        }
-        await ctx.deleteAttachment(attachmentId)
-        return { deleted: true, refs }
-      },
+      (ctx) => ctx.deleteAttachmentIfUnreferenced(attachmentId),
       undefined,
       commit,
     )
@@ -6774,7 +8283,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
             deletedAttachmentIds.push(attachmentId)
             continue
           }
-          await this.deleteAttachmentBytesInMutation(ctx, current, input.reason, input.now)
+          await ctx.deleteAttachmentBytes(attachmentId, input.reason, input.now)
           stubbedAttachmentIds.push(attachmentId)
         }
         return { deletedAttachmentIds, stubbedAttachmentIds, absentAttachmentIds }
@@ -6828,7 +8337,10 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
       commit,
       undefined,
       {
-        tableNames: ['attachments', 'storageRetentionState'],
+        access: {
+          readTableNames: ['attachments'],
+          writeTableNames: ['storageRetentionState'],
+        },
         async commit(tx) {
           const last = candidates.at(-1)
           const cursor = last
@@ -6878,24 +8390,24 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     input: { draft: DraftRow; expectedUpdatedAt: number | null },
     commit: BrowserCommandCommit,
   ): Promise<DraftRow> {
-    const observed = await this.getDraft(input.draft.chatId)
-    const attachmentIds = new Set([
-      ...liveAttachmentRefs(observed?.attachmentRefs).map((ref) => ref.attachmentId),
-      ...liveAttachmentRefs(input.draft.attachmentRefs).map((ref) => ref.attachmentId),
-    ])
+    const plan = await readDraftPutPlan(commit, input)
+    const attachmentIds = [...plan.previousAttachmentIds, ...plan.nextAttachmentIds]
     const mutation = await this.runMutation(
-      attachmentOwnerScopes({ kind: 'draft', chatId: input.draft.chatId }, [...attachmentIds]),
+      attachmentOwnerScopes({ kind: 'draft', chatId: input.draft.chatId }, attachmentIds),
       async (ctx, mutation) => {
         const current = await ctx.getDraft(input.draft.chatId)
         if ((current?.updatedAt ?? null) !== input.expectedUpdatedAt) {
           throw new Error(`DraftChanged:${input.draft.chatId}`)
         }
-        for (const attachmentId of liveAttachmentRefs(input.draft.attachmentRefs).map(
-          (ref) => ref.attachmentId,
-        )) {
-          if (!(await ctx.getAttachment(attachmentId))) {
-            throw new Error(`AttachmentMissing:${attachmentId}`)
-          }
+        if (
+          plan[draftPutPlanBrand] !== true ||
+          plan.chatId !== input.draft.chatId ||
+          !sameOrderedValues(
+            draftPutAttachmentIds(current?.attachmentRefs),
+            plan.previousAttachmentIds,
+          )
+        ) {
+          throw new DraftPutPlanChangedError(input.draft.chatId)
         }
         const draft = {
           ...input.draft,
@@ -6908,11 +8420,11 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
           (current.text.trim().length > 0 || current.attachmentRefs.length > 0) &&
           draft.text.trim().length === 0 &&
           draft.attachmentRefs.length === 0
-        await ctx.putDraft(draft)
+        await ctx.putDraft(draft, { validateAttachmentTargets: true })
         if (becameEmpty) mutation.requestStorageMaintenance('prune-empty-drafts')
         return { draft, becameEmpty }
       },
-      undefined,
+      { storageMaintenanceTasks: ['prune-empty-drafts'] },
       commit,
     )
     return mutation.value.draft
@@ -6950,7 +8462,9 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
       commit,
       undefined,
       {
-        tableNames: ['attachmentRefEdges', 'chats'],
+        access: {
+          readTableNames: ['attachmentRefEdges', 'chats'],
+        },
         commit: (tx, value) =>
           value
             ? this.generatedOutputLocalizationProfileIds(tx, attachmentId)
@@ -7901,13 +9415,11 @@ function assertNewChatAttemptRow(chat: Chat, chatId: ChatId): void {
 }
 
 const browserGenerationCommandSupport: BrowserGenerationCommandSupport = Object.freeze({
-  GENERATION_METADATA_TRANSACTION,
   appendValidatedGenerationPromptPath,
   applyMessageCalibrationPatch,
   assertNewChatAttemptRow,
   assertPreparedAttemptMessage,
   calibrationUsageFromPostCommit,
-  chatConfigurationTargetResourceNames,
   chatTokenCalibrationGeneration,
   cloneMessageHeader,
   continuationGlobalCalibration,

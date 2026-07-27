@@ -18,7 +18,14 @@ import {
   projectAttemptTerminal,
 } from '../../src/store/attempt-terminalization'
 import { __resetBroadcastForTests, subscribeWorkspaceChanges } from '../../src/store/broadcast'
-import { __resetBrowserRepositoryForTests } from '../../src/store/browser-repo'
+import {
+  ChatMoveToFolderPlanChangedError,
+  ChatSetArchivedLinkPlanChangedError,
+} from '../../src/store/browser-catalog-command-runtime'
+import {
+  __resetBrowserRepositoryForTests,
+  DraftPutPlanChangedError,
+} from '../../src/store/browser-repo'
 import {
   openBrowserWorkspace,
   shutdownBrowserWorkspace,
@@ -41,6 +48,12 @@ import {
 } from '../../src/store/configuration-profile-usage-projection'
 import { __resetDbForTests, getDb } from '../../src/store/db'
 import { exportWorkspaceBackup, restoreWorkspaceBackup } from '../../src/store/import-export'
+import {
+  __setLockBackendForTests,
+  type AuthoritativeCommandLockSession,
+  type LockBackend,
+  type LockGrant,
+} from '../../src/store/locks'
 import {
   type StreamLeaseRow,
   streamLeaseReasoningCarryForward,
@@ -73,7 +86,8 @@ import {
   type WorkspaceRootKind,
 } from '../../src/store/workspace-runtime'
 import { expectAttachmentReferenceInvariants } from '../helpers/attachment-reference-invariants'
-import { putTestChat } from '../helpers/chats'
+import { putTestChat, putTestChats, updateChatForTest } from '../helpers/chats'
+import { testChatConfigurationLinkTransition } from '../helpers/configuration'
 import { putTestMessages, readTestMessageHeader } from '../helpers/message-storage'
 import { encodeTestStreamJournalEntries } from '../helpers/stream-journal'
 import { testStreamLeaseAdmission } from '../helpers/stream-leases'
@@ -83,6 +97,51 @@ const PROFILE_ID = 'organization-test-profile'
 const MODEL_ID = 'organization/test-model'
 
 let emptyWorkspaceBackup: Awaited<ReturnType<typeof exportWorkspaceBackup>>
+
+class BeforeFirstResourceLockBackend implements LockBackend {
+  readonly kind = 'web-locks' as const
+  readonly logicalNames: string[][] = []
+  readonly transactionTableNames: string[][] = []
+  private readonly beforeFirst: () => Promise<void>
+  private calls = 0
+
+  constructor(beforeFirst: () => Promise<void>) {
+    this.beforeFirst = beforeFirst
+  }
+
+  async run<T>(
+    logicalNames: readonly string[],
+    fn: (grant: LockGrant) => Promise<T> | T,
+  ): Promise<T> {
+    this.logicalNames.push([...logicalNames])
+    if (this.calls === 0) await this.beforeFirst()
+    this.calls += 1
+    return fn({
+      kind: 'web-locks',
+      logicalNames,
+      runTransaction: (db, tables, operation) => {
+        this.transactionTableNames.push(
+          tables.map((table) => (typeof table === 'string' ? table : table.name)),
+        )
+        return db.transaction(
+          'rw',
+          tables.map((table) => db.table(typeof table === 'string' ? table : table.name)),
+          operation,
+        )
+      },
+    })
+  }
+
+  async runAuthoritativeCommandSession<T>(
+    _database: Dexie,
+    operation: (session: AuthoritativeCommandLockSession) => Promise<T> | T,
+  ): Promise<T> {
+    return operation({
+      kind: 'web-locks',
+      withResourceLocks: (resourceNames, child) => this.run(resourceNames, child),
+    })
+  }
+}
 
 async function resetAll(): Promise<void> {
   __resetWorkspaceRepositoryForTests()
@@ -99,10 +158,12 @@ beforeAll(async () => {
 })
 
 beforeEach(async () => {
+  __setLockBackendForTests(null)
   await restoreWorkspaceBackup(emptyWorkspaceBackup, { now: 1 })
 })
 
 afterAll(async () => {
+  __setLockBackendForTests(null)
   await shutdownBrowserWorkspace()
   await resetAll()
 })
@@ -185,7 +246,11 @@ async function seedAttachment(overrides: Partial<Attachment> = {}): Promise<Atta
     },
     'attachment',
   )
-  expect(commit.value).toEqual({ attachmentId: attachment.id, outcome: 'written' })
+  expect(commit.value).toEqual({
+    attachmentId: attachment.id,
+    outcome: 'written',
+    attachment,
+  })
   const stored = await query({ kind: 'attachment.get', attachmentId: attachment.id })
   if (!stored) throw new Error(`SeedAttachmentMissing:${attachment.id}`)
   return stored
@@ -299,6 +364,18 @@ async function prepareGeneration(
     const chat = await getDb().chats.get(chatId)
     const profile = await getDb().profiles.get(PROFILE_ID)
     if (!profile) throw new Error(`PreparedProfileMissing:${PROFILE_ID}`)
+    const claimedChat =
+      chat ??
+      buildChat({
+        id: chatId,
+        title: 'Deleted generation target',
+        settings: {
+          ...cloneDefaultChatSettings(),
+          profileId: PROFILE_ID,
+          model: MODEL_ID,
+        },
+        now: startedAt,
+      })
     const child = reserveWorkspaceChild(permit, 'stream-lease')
     const reservation = await reserveStreamOwnership(child, admission, () => {})
     let prepared: CommitEnvelope<
@@ -310,6 +387,7 @@ async function prepareGeneration(
         input: {
           strategy: 'send',
           lease: admission,
+          configurationLinkTransition: testChatConfigurationLinkTransition(claimedChat),
           promptPath: {
             requirement: {
               kind: 'send',
@@ -321,13 +399,9 @@ async function prepareGeneration(
             claim: { chatId, leafId: null, headers: [] },
           },
           configurationClaim: {
-            configurationVersion: chat?.configurationVersion ?? 0,
-            settings: chat?.settings ?? {
-              ...cloneDefaultChatSettings(),
-              profileId: PROFILE_ID,
-              model: MODEL_ID,
-            },
-            presetId: chat?.presetId ?? null,
+            configurationVersion: claimedChat.configurationVersion ?? 0,
+            settings: claimedChat.settings,
+            presetId: claimedChat.presetId ?? null,
             profile: connectionDispatchProfileProof(profile, MODEL_ID),
             requestRevision: configurationRequestRevisionFor(profile, undefined),
             dispatchKeyRevisions: [],
@@ -376,6 +450,7 @@ async function finishPreparedGeneration(active: {
         projectAttemptTerminal({
           kind: 'generation',
           streamId: active.lease.streamId,
+          chatId: active.lease.chatId,
           messageId: active.lease.messageId,
           fence: active.handle.fence,
           accumulator: createStreamAccumulator({ initialContent: [], now: active.lease.startedAt }),
@@ -425,6 +500,27 @@ describe('organization repository contract', () => {
       color: '#abcdef',
     })
     expect(updated.delta.invalidations).toEqual([{ kind: 'folder', folderIds: [created.value.id] }])
+    expect(changes).toHaveLength(2)
+    const unchanged = await execute({
+      kind: 'folder.update',
+      folderId: created.value.id,
+      patch: { name: 'Pinned', color: '#abcdef', now: 12 },
+    })
+    expect(unchanged).toMatchObject({
+      effectScope: 'none',
+      value: { id: created.value.id, name: 'Pinned', color: '#abcdef' },
+      delta: { facts: [], invalidations: [] },
+    })
+    const missingUpdate = await execute({
+      kind: 'folder.update',
+      folderId: 'missing',
+      patch: { name: 'Missing', now: 12 },
+    })
+    expect(missingUpdate).toMatchObject({
+      effectScope: 'none',
+      value: undefined,
+      delta: { facts: [], invalidations: [] },
+    })
     expect(changes).toHaveLength(2)
     expect(await query({ kind: 'folder.list' })).toEqual([
       expect.objectContaining({ id: created.value.id, name: 'Pinned', color: '#abcdef' }),
@@ -526,14 +622,404 @@ describe('organization repository contract', () => {
       facts: [{ kind: 'sidebar-row-changed', chatId: chat.id }],
       invalidations: [
         { kind: 'folder', folderIds: [folder.id] },
-        { kind: 'profile', facets: ['dependent-counts'] },
+        {
+          kind: 'profile',
+          profileIds: [PROFILE_ID],
+          facets: ['dependent-counts'],
+        },
         { kind: 'chat', chatIds: [chat.id] },
         { kind: 'sidebar', chatIds: [chat.id] },
       ],
     })
   })
 
-  it('assigns chat tags by name, creates missing tags, and prunes unused tags atomically', async () => {
+  it('reuses the first matching folder and moves only the requested chats atomically', async () => {
+    await execute({
+      kind: 'folder.create',
+      input: { id: 'folder-later', name: 'Done', sortIndex: 20, now: 1 },
+    })
+    const preferred = (
+      await execute({
+        kind: 'folder.create',
+        input: { id: 'folder-first', name: ' done ', sortIndex: 10, now: 2 },
+      })
+    ).value
+    const first = await seedChat({ id: 'folder-move-a' })
+    const second = await seedChat({ id: 'folder-move-b' })
+    const unrelated = await seedChat({ id: 'folder-move-unrelated' })
+
+    const commit = await execute({
+      kind: 'folder.ensure-and-move-chats',
+      input: {
+        id: 'folder-unused-id',
+        name: 'DONE',
+        chatIds: [second.id, 'missing-chat', first.id, second.id],
+        now: 30,
+      },
+    })
+
+    expect(commit.value).toEqual({
+      folder: expect.objectContaining({
+        id: preferred.id,
+        name: preferred.name,
+        lastUsedAt: 30,
+        updatedAt: 30,
+      }),
+      created: false,
+      affectedChatIds: [first.id, second.id],
+      changes: [
+        {
+          chatId: first.id,
+          previousFolderId: null,
+          nextFolderId: preferred.id,
+          previousArchived: false,
+          nextArchived: false,
+        },
+        {
+          chatId: second.id,
+          previousFolderId: null,
+          nextFolderId: preferred.id,
+          previousArchived: false,
+          nextArchived: false,
+        },
+      ],
+    })
+    expect((await query({ kind: 'chat.get', chatId: first.id }))?.folderId).toBe(preferred.id)
+    expect((await query({ kind: 'chat.get', chatId: second.id }))?.folderId).toBe(preferred.id)
+    expect((await query({ kind: 'chat.get', chatId: unrelated.id }))?.folderId).toBeNull()
+    expect(await getDb().folders.get('folder-unused-id')).toBeUndefined()
+    expect(commit.delta.invalidations).toEqual([
+      { kind: 'folder', folderIds: [preferred.id] },
+      { kind: 'chat', chatIds: [first.id, second.id] },
+      { kind: 'sidebar', chatIds: [first.id, second.id] },
+    ])
+  })
+
+  it('moves selected chats with one transaction-local destination check', async () => {
+    const source = (
+      await execute({
+        kind: 'folder.create',
+        input: { id: 'move-source', name: 'Source', now: 1 },
+      })
+    ).value
+    const destination = (
+      await execute({
+        kind: 'folder.create',
+        input: { id: 'move-destination', name: 'Destination', now: 2 },
+      })
+    ).value
+    const selected = await seedChat({ id: 'move-selected', folderId: source.id })
+    const unrelated = await seedChat({ id: 'move-unrelated', folderId: source.id })
+
+    const missing = await execute(
+      {
+        kind: 'chat.move-to-folder',
+        chatIds: [selected.id],
+        folderId: 'missing-folder',
+        now: 10,
+      },
+      'chat-metadata',
+    )
+    expect(missing).toMatchObject({
+      effectScope: 'none',
+      value: { value: false, affectedChatIds: [] },
+      delta: { facts: [], invalidations: [] },
+    })
+
+    const moved = await execute(
+      {
+        kind: 'chat.move-to-folder',
+        chatIds: [selected.id, 'missing-chat', selected.id],
+        folderId: destination.id,
+        now: 11,
+      },
+      'chat-metadata',
+    )
+    expect(moved.value).toMatchObject({
+      value: true,
+      affectedChatIds: [selected.id],
+    })
+    expect((await query({ kind: 'chat.get', chatId: selected.id }))?.folderId).toBe(destination.id)
+    expect((await query({ kind: 'chat.get', chatId: unrelated.id }))?.folderId).toBe(source.id)
+    expect(await getDb().folders.get(source.id)).toEqual(source)
+    expect(await getDb().folders.get(destination.id)).toMatchObject({
+      id: destination.id,
+      lastUsedAt: 11,
+      updatedAt: 11,
+    })
+
+    const replay = await execute(
+      {
+        kind: 'chat.move-to-folder',
+        chatIds: [selected.id],
+        folderId: destination.id,
+        now: 11,
+      },
+      'chat-metadata',
+    )
+    expect(replay).toMatchObject({
+      effectScope: 'none',
+      value: { value: false, affectedChatIds: [] },
+      delta: { facts: [], invalidations: [] },
+    })
+
+    const topLevel = await execute(
+      {
+        kind: 'chat.move-to-folder',
+        chatIds: [selected.id],
+        folderId: null,
+        now: 12,
+      },
+      'chat-metadata',
+    )
+    expect(topLevel.value).toMatchObject({
+      value: true,
+      affectedChatIds: [selected.id],
+    })
+    expect((await query({ kind: 'chat.get', chatId: selected.id }))?.folderId).toBeNull()
+
+    const empty = await execute(
+      {
+        kind: 'chat.move-to-folder',
+        chatIds: [],
+        folderId: destination.id,
+        now: 13,
+      },
+      'chat-metadata',
+    )
+    expect(empty).toMatchObject({
+      effectScope: 'none',
+      value: { value: false, affectedChatIds: [] },
+      delta: { facts: [], invalidations: [] },
+    })
+  })
+
+  it('moves more than 128 selected chats with input-shaped work and no unrelated writes', async () => {
+    const count = 129
+    const folders = Array.from({ length: count }, (_, index) => ({
+      id: `move-scale-source-${String(index).padStart(3, '0')}`,
+      name: `Source ${index}`,
+      sortIndex: index,
+      createdAt: 1,
+      updatedAt: 1,
+    }))
+    const destination = {
+      id: 'move-scale-destination',
+      name: 'Destination',
+      sortIndex: count,
+      createdAt: 1,
+      updatedAt: 1,
+    }
+    await getDb().folders.bulkPut([...folders, destination])
+    const targets = folders.map((folder, index) => ({
+      ...buildChat({
+        id: `move-scale-target-${String(index).padStart(3, '0')}`,
+        title: `zz target ${index}`,
+        settings: {
+          ...cloneDefaultChatSettings(),
+          profileId: PROFILE_ID,
+          model: MODEL_ID,
+        },
+        now: 10_000 + index,
+      }),
+      folderId: folder.id,
+      previewText: 'target',
+      lastViewedAt: 10_000 + index,
+      totalCostUsd: 100 + index,
+      wordCount: 1_000 + index,
+    }))
+    const residents = folders.map((folder, index) => ({
+      ...buildChat({
+        id: `move-scale-resident-${String(index).padStart(3, '0')}`,
+        title: `aa resident ${index}`,
+        settings: {
+          ...cloneDefaultChatSettings(),
+          profileId: PROFILE_ID,
+          model: MODEL_ID,
+        },
+        now: 100 + index,
+      }),
+      folderId: folder.id,
+      previewText: 'resident',
+      lastViewedAt: 100 + index,
+      totalCostUsd: 1,
+      wordCount: 1,
+    }))
+    const unrelated = Array.from({ length: 1 }, (_, index) =>
+      buildChat({
+        id: `move-scale-unrelated-${String(index).padStart(3, '0')}`,
+        title: 'Unrelated',
+        settings: {
+          ...cloneDefaultChatSettings(),
+          profileId: PROFILE_ID,
+          model: MODEL_ID,
+        },
+        now: 20_000 + index,
+      }),
+    )
+    await putTestChats([...targets, ...residents, ...unrelated])
+
+    const moved = await execute(
+      {
+        kind: 'chat.move-to-folder',
+        chatIds: [...targets.map(({ id }) => id), 'move-scale-missing', targets[0]?.id ?? ''],
+        folderId: destination.id,
+        now: 30_000,
+      },
+      'chat-metadata',
+    )
+
+    expect(moved.value).toMatchObject({
+      value: true,
+      affectedChatIds: targets.map(({ id }) => id),
+    })
+    expect(await getDb().chats.get(targets[0]?.id ?? '')).toMatchObject({
+      folderId: destination.id,
+    })
+    expect(await getDb().chats.get(residents[0]?.id ?? '')).toMatchObject({
+      folderId: folders[0]?.id,
+    })
+    expect(await getDb().chats.get(unrelated[0]?.id ?? '')).toMatchObject({
+      folderId: null,
+    })
+
+    const replay = await execute(
+      {
+        kind: 'chat.move-to-folder',
+        chatIds: targets.map(({ id }) => id),
+        folderId: destination.id,
+        now: 30_000,
+      },
+      'chat-metadata',
+    )
+    expect(replay).toMatchObject({
+      effectScope: 'none',
+      value: { value: false, affectedChatIds: [] },
+      delta: { facts: [], invalidations: [] },
+    })
+  }, 15_000)
+
+  it('rejects one stale move preflight without retrying or writing the destination', async () => {
+    const source = (
+      await execute({
+        kind: 'folder.create',
+        input: { id: 'move-stale-source', name: 'Source', now: 1 },
+      })
+    ).value
+    const intervening = (
+      await execute({
+        kind: 'folder.create',
+        input: { id: 'move-stale-intervening', name: 'Intervening', now: 2 },
+      })
+    ).value
+    const destination = (
+      await execute({
+        kind: 'folder.create',
+        input: { id: 'move-stale-destination', name: 'Destination', now: 3 },
+      })
+    ).value
+    const chat = await seedChat({ id: 'move-stale-chat', folderId: source.id })
+    const backend = new BeforeFirstResourceLockBackend(async () => {
+      await updateChatForTest(chat.id, { folderId: intervening.id })
+    })
+    __setLockBackendForTests(backend)
+
+    await expect(
+      execute(
+        {
+          kind: 'chat.move-to-folder',
+          chatIds: [chat.id],
+          folderId: destination.id,
+          now: 20,
+        },
+        'chat-metadata',
+      ),
+    ).rejects.toBeInstanceOf(ChatMoveToFolderPlanChangedError)
+
+    expect(backend.logicalNames).toHaveLength(1)
+    expect(await getDb().chats.get(chat.id)).toMatchObject({
+      folderId: intervening.id,
+      metaVersion: chat.metaVersion,
+      summaryVersion: chat.summaryVersion,
+    })
+    expect(await getDb().folders.get(destination.id)).toEqual(destination)
+  })
+
+  it('rejects one stale draft preflight without retrying or overwriting the intervening draft', async () => {
+    const chat = await seedChat({ id: 'draft-stale-chat' })
+    const first = await seedAttachment({ id: 'draft-stale-first' })
+    const intervening = await seedAttachment({ id: 'draft-stale-intervening' })
+    const submitted = await seedAttachment({ id: 'draft-stale-submitted' })
+    await execute(
+      {
+        kind: 'draft.put',
+        input: {
+          draft: {
+            chatId: chat.id,
+            text: 'first',
+            attachmentRefs: [attachmentRef(first.id)],
+            updatedAt: 2,
+          },
+          expectedUpdatedAt: null,
+        },
+      },
+      'attachment',
+    )
+    const interveningDraft = {
+      chatId: chat.id,
+      text: 'intervening',
+      attachmentRefs: [attachmentRef(intervening.id)],
+      updatedAt: 2,
+    }
+    const backend = new BeforeFirstResourceLockBackend(async () => {
+      await getDb().drafts.put(interveningDraft)
+    })
+    __setLockBackendForTests(backend)
+
+    await expect(
+      execute(
+        {
+          kind: 'draft.put',
+          input: {
+            draft: {
+              chatId: chat.id,
+              text: 'submitted',
+              attachmentRefs: [attachmentRef(submitted.id)],
+              updatedAt: 3,
+            },
+            expectedUpdatedAt: 2,
+          },
+        },
+        'attachment',
+      ),
+    ).rejects.toBeInstanceOf(DraftPutPlanChangedError)
+
+    expect(backend.logicalNames).toEqual([
+      [`attachment:${first.id}`, `attachment:${submitted.id}`, `draft:${chat.id}`].sort(),
+    ])
+    expect(backend.transactionTableNames).toEqual([
+      [
+        'attachmentCatalogAggregate',
+        'attachmentCatalogRows',
+        'attachmentRefEdges',
+        'attachments',
+        'drafts',
+      ],
+    ])
+    expect(await getDb().drafts.get(chat.id)).toEqual(interveningDraft)
+    expect(
+      await getDb()
+        .attachmentRefEdges.where('[ownerKind+ownerId]')
+        .equals(['draft', chat.id])
+        .count(),
+    ).toBe(1)
+    expect(await getDb().attachmentRefEdges.where('attachmentId').equals(first.id).count()).toBe(1)
+    expect(
+      await getDb().attachmentRefEdges.where('attachmentId').equals(submitted.id).count(),
+    ).toBe(0)
+  })
+
+  it('assigns tags, prunes removed candidates, and leaves unrelated orphans untouched', async () => {
     const keep = {
       id: 'tag-keep',
       name: 'Keep',
@@ -548,7 +1034,14 @@ describe('organization repository contract', () => {
       createdAt: 2,
       updatedAt: 2,
     }
-    await getDb().tags.bulkPut([keep, unused])
+    const unrelatedOrphan = {
+      id: 'tag-unrelated-orphan',
+      name: 'Unrelated orphan',
+      nameLower: 'unrelated orphan',
+      createdAt: 3,
+      updatedAt: 3,
+    }
+    await getDb().tags.bulkPut([keep, unused, unrelatedOrphan])
     const chat = await seedChat({ tags: [keep.id, unused.id] })
     const other = await seedChat({ tags: [keep.id] })
 
@@ -572,6 +1065,7 @@ describe('organization repository contract', () => {
     expect(stored?.metaVersion).toBe(chat.metaVersion + 1)
     expect((await query({ kind: 'chat.get', chatId: other.id }))?.tags).toEqual([keep.id])
     expect(await getDb().tags.get(unused.id)).toBeUndefined()
+    expect(await getDb().tags.get(unrelatedOrphan.id)).toEqual(unrelatedOrphan)
     expect(commit.receipt.chats).toEqual([expect.objectContaining({ id: chat.id })])
     expect(commit.delta.invalidations).toEqual([
       { kind: 'tag', tagIds: [newTag.id, keep.id] },
@@ -869,7 +1363,11 @@ describe('organization repository contract', () => {
     expect(archived.delta).toEqual({
       facts: [{ kind: 'sidebar-row-changed', chatId: chat.id }],
       invalidations: [
-        { kind: 'profile', facets: ['dependent-counts'] },
+        {
+          kind: 'profile',
+          profileIds: [PROFILE_ID],
+          facets: ['dependent-counts'],
+        },
         { kind: 'chat', chatIds: [chat.id] },
         { kind: 'sidebar', chatIds: [chat.id] },
       ],
@@ -891,10 +1389,166 @@ describe('organization repository contract', () => {
     expect(restored.delta).toEqual({
       facts: [{ kind: 'sidebar-row-changed', chatId: chat.id }],
       invalidations: [
-        { kind: 'profile', facets: ['dependent-counts'] },
+        {
+          kind: 'profile',
+          profileIds: [PROFILE_ID],
+          facets: ['dependent-counts'],
+        },
         { kind: 'chat', chatIds: [chat.id] },
         { kind: 'sidebar', chatIds: [chat.id] },
       ],
+    })
+  })
+
+  it('archives a maximally linked chat once from duplicate and missing input ids', async () => {
+    const chat = await seedChat({
+      id: 'archive-max-links',
+      presetId: 'archive-preset',
+      settings: {
+        ...cloneDefaultChatSettings(),
+        profileId: PROFILE_ID,
+        model: MODEL_ID,
+        systemPromptPresetId: 'archive-system',
+        appendPromptPresetId: 'archive-append',
+        continueSystemPromptPresetId: 'archive-continue-system',
+        continueUserPromptPresetId: 'archive-continue-user',
+        defaultPrefillPresetId: 'archive-prefill',
+        textTemplate: 'user:archive-template',
+      },
+      modelResolution: {
+        intentId: 'archive-resolution',
+        target: {
+          profileId: PROFILE_ID,
+          requestRevision: 1,
+          key: { kind: 'missing' },
+        },
+        sourceModelId: MODEL_ID,
+        expectedConfigurationVersion: 0,
+      },
+    })
+    const db = getDb()
+    const ownerKey = configurationOwnerKey('chat', chat.id)
+    expect(await db.configurationLinks.where('ownerKey').equals(ownerKey).count()).toBe(9)
+
+    const archived = await execute(
+      {
+        kind: 'chat.set-archived',
+        chatIds: [chat.id, 'archive-missing', chat.id],
+        archived: true,
+        now: 200,
+      },
+      'chat-metadata',
+    )
+
+    expect(archived.value.value).toEqual([chat.id])
+    expect(await db.configurationLinks.where('ownerKey').equals(ownerKey).count()).toBe(9)
+    expect(await db.chats.get(chat.id)).toMatchObject({ archived: true })
+
+    const noOp = await execute(
+      {
+        kind: 'chat.set-archived',
+        chatIds: [chat.id, chat.id],
+        archived: true,
+        now: 201,
+      },
+      'chat-metadata',
+    )
+
+    expect(noOp.value.value).toEqual([])
+    expect(noOp.delta).toEqual({ facts: [], invalidations: [] })
+  })
+
+  it('bounds archive work by admitted ids across link batches, not unrelated chats', async () => {
+    const targets = Array.from({ length: 129 }, (_, index) => ({
+      ...buildChat({
+        id: `archive-target-${String(index).padStart(3, '0')}`,
+        title: 'Target',
+        presetId: `archive-preset-${index}`,
+        settings: {
+          ...cloneDefaultChatSettings(),
+          profileId: `archive-profile-${index}`,
+          model: MODEL_ID,
+          systemPromptPresetId: `archive-system-${index}`,
+          appendPromptPresetId: `archive-append-${index}`,
+          continueSystemPromptPresetId: `archive-continue-system-${index}`,
+          continueUserPromptPresetId: `archive-continue-user-${index}`,
+          defaultPrefillPresetId: `archive-prefill-${index}`,
+          textTemplate: `user:archive-template-${index}`,
+        },
+        now: 100 + index,
+      }),
+      folderId: `archive-folder-${index}`,
+      modelResolution: {
+        intentId: `archive-resolution-${index}`,
+        target: {
+          profileId: `archive-resolution-profile-${index}`,
+          requestRevision: index + 1,
+          key: { kind: 'missing' as const },
+        },
+        sourceModelId: MODEL_ID,
+        expectedConfigurationVersion: 0,
+      },
+    }))
+    const unrelated = Array.from({ length: 257 }, (_, index) =>
+      buildChat({
+        id: `archive-unrelated-${String(index).padStart(3, '0')}`,
+        title: 'Unrelated',
+        settings: {
+          ...cloneDefaultChatSettings(),
+          profileId: PROFILE_ID,
+          model: MODEL_ID,
+        },
+        now: 1_000 + index,
+      }),
+    )
+    await putTestChats([...targets, ...unrelated])
+
+    const archived = await execute(
+      {
+        kind: 'chat.set-archived',
+        chatIds: targets.map(({ id }) => id),
+        archived: true,
+        now: 2_000,
+      },
+      'chat-metadata',
+    )
+
+    expect(archived.value.value).toEqual(targets.map(({ id }) => id))
+    expect(await getDb().chats.get(targets[0]?.id ?? '')).toMatchObject({ archived: true })
+    expect(await getDb().chats.get(unrelated[0]?.id ?? '')).toMatchObject({ archived: false })
+  }, 15_000)
+
+  it('rejects one stale archive preflight without retrying or writing archive state', async () => {
+    const chat = await seedChat({ id: 'archive-stale-plan' })
+    const replacementProfileId = 'archive-replacement-profile'
+    const backend = new BeforeFirstResourceLockBackend(async () => {
+      await updateChatForTest(chat.id, {
+        settings: {
+          ...chat.settings,
+          profileId: replacementProfileId,
+        },
+      })
+    })
+    __setLockBackendForTests(backend)
+
+    await expect(
+      execute(
+        {
+          kind: 'chat.set-archived',
+          chatIds: [chat.id],
+          archived: true,
+          now: 200,
+        },
+        'chat-metadata',
+      ),
+    ).rejects.toBeInstanceOf(ChatSetArchivedLinkPlanChangedError)
+
+    expect(backend.logicalNames).toHaveLength(1)
+    expect(await getDb().chats.get(chat.id)).toMatchObject({
+      archived: false,
+      metaVersion: chat.metaVersion,
+      summaryVersion: chat.summaryVersion,
+      settings: { profileId: replacementProfileId },
     })
   })
 

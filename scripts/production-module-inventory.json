@@ -506,6 +506,7 @@
         "src/store/configuration-domain-contract.ts",
         "src/store/configuration-domain.ts",
         "src/store/configuration-errors.ts",
+        "src/store/configuration-model-resolution-capability.ts",
         "src/store/configuration-profile-usage-projection.ts",
         "src/store/configuration-workspace.ts",
         "src/store/connection-onboarding.ts",
@@ -571,7 +572,8 @@
         "src/store/db.ts",
         "src/store/indexeddb-key-ranges.ts",
         "src/store/physical-storage-tables.ts",
-        "src/store/repository.ts"
+        "src/store/repository.ts",
+        "src/store/semantic-operation-capability.ts"
       ]
     },
     {

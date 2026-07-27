@@ -406,6 +406,72 @@ describe('body edits', () => {
     expect(visibleAgain.value.message.reasoningEnvelope?.carriers[0]?.hidden).toBeUndefined()
   })
 
+  it('keeps presentation-only message actions out of chat and sidebar finalization', async () => {
+    const chat = await seedChat()
+    const row = message(chat.id, {
+      id: 'presentation-only-actions',
+      role: 'assistant',
+      origin: 'generated',
+      providerOutputItems: [
+        {
+          dialect: 'openai-responses',
+          type: 'reasoning',
+          item: { id: 'provider-reasoning', encrypted_content: 'opaque' },
+        },
+      ],
+      generation: {
+        id: 'presentation-generation',
+        model: 'openai/gpt-5.4',
+        requestedModel: 'openai/gpt-5.4',
+        apiUsed: 'responses',
+        delivery: 'streaming',
+        costSource: 'stream',
+        reasoningCarryForward: 'carrier',
+        reasoningVisibility: { disclosure: 'visible', visibleKind: 'summary' },
+        startedAt: 100,
+        finishedAt: 110,
+        error: {
+          category: 'network',
+          code: 'NETWORK',
+          message: 'interrupted',
+          retryable: true,
+          midStream: true,
+        },
+      },
+    })
+    await append(row, null)
+    const chatBefore = await getChat(chat.id)
+
+    const provider = await execute({
+      kind: 'message.toggle-provider-output-item',
+      chatId: chat.id,
+      messageId: row.id,
+      member: { owner: { kind: 'generation' }, itemIndex: 0 },
+    })
+    if (!provider.value) throw new Error('ProviderOutputToggleMissing')
+    expect(provider.value.message.providerOutputItems?.[0]?.hidden).toBe(true)
+
+    const context = await execute({
+      kind: 'message.toggle-context',
+      chatId: chat.id,
+      messageId: row.id,
+    })
+    if (!context.value) throw new Error('ContextToggleMissing')
+    expect(context.value.message.hiddenFromContext).toBe(true)
+
+    const dismissed = await execute({
+      kind: 'message.dismiss-generation-notice',
+      chatId: chat.id,
+      messageId: row.id,
+    })
+    if (!dismissed.value) throw new Error('GenerationNoticeDismissMissing')
+    expect(dismissed.value.message.generation?.error).toBeUndefined()
+    expect(await getChat(chat.id)).toEqual(chatBefore)
+    expect(provider.receipt.chats).toEqual([])
+    expect(context.receipt.chats).toEqual([])
+    expect(dismissed.receipt.chats).toEqual([])
+  })
+
   it('preserves an explicit empty attachment-ref list for content that still cites an attachment', async () => {
     const chat = await seedChat()
     const attachment = await buildAttachment({

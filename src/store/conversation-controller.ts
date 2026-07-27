@@ -64,6 +64,7 @@ import {
   type StructuralMessageHeader,
   sameMessageHeaderValue,
   sameMessageHeaderStructure as sameStructuralHeader,
+  splitMessageForStorage,
   toStructuralMessageHeader,
 } from './message-storage'
 import type {
@@ -236,6 +237,7 @@ interface ConversationTranscriptBindingPayload {
   readonly window: ConversationTranscriptFrame
   readonly selectionEpoch: number
   readonly viewportRevision: number
+  readonly intentPresentations: readonly ConversationMessagePresentation[]
 }
 
 interface ConversationTreeBindingPayload {
@@ -950,6 +952,9 @@ const TOPOLOGY_OPTIONS: MessageTopologyOptions<StructuralMessageHeader> = {
 
 const EMPTY_TOPOLOGY = createMessageTopologyIndex<StructuralMessageHeader>([], TOPOLOGY_OPTIONS)
 const EMPTY_STRUCTURAL_TOPOLOGY = structuralTopologyView(EMPTY_TOPOLOGY)
+const EMPTY_CONVERSATION_MESSAGE_PRESENTATIONS = Object.freeze(
+  [],
+) as readonly ConversationMessagePresentation[]
 const ABSENT_TOPOLOGY: ActiveTopologyState = Object.freeze({ kind: 'absent' })
 const FULL_PROJECTION_REFRESH: ConversationProjectionRefresh = Object.freeze({
   chat: true,
@@ -1016,6 +1021,13 @@ export interface ConversationController {
   resolveOperationDestination(
     claim: SessionSelectingConversationOperationClaim,
   ): ClaimedConversationDestination
+  presentGenerationIntent(
+    claim: SessionSelectingConversationOperationClaim,
+    input: {
+      readonly baseLeafId: MessageId | null
+      readonly messages: readonly Message[]
+    },
+  ): void
   claimSelectedDestination(input: {
     chatId: ChatId
     workspaceFence?: WorkspaceFence
@@ -1107,6 +1119,14 @@ class TabConversationController implements ConversationController {
   private readonly sessions = new Map<ChatId, ChatSession>()
   private readonly operationClaims = new Map<string, ConversationOperationClaim>()
   private readonly operationClaimCountsByChat = new Map<ChatId, number>()
+  private readonly generationIntentPresentations = new Map<
+    string,
+    {
+      readonly claim: SessionSelectingConversationOperationClaim
+      readonly baseLeafId: MessageId | null
+      readonly presentations: readonly ConversationMessagePresentation[]
+    }
+  >()
   private readonly pendingRouteHandoffsByOwnerId = new Map<
     string,
     PendingConversationRouteHandoff
@@ -1321,9 +1341,7 @@ class TabConversationController implements ConversationController {
         }
         session.selectionRevision += 1
         session.intent = conversationSelectionIntent(seed.target.selection)
-        const admission = this.admitSealedSelection(session, seed, {
-          deferForkRead: true,
-        })
+        const admission = this.admitSealedSelection(session, seed)
         if (admission.kind === 'structural-conflict') {
           this.beginSelectionResolution(false)
           handoffReadPlan = EMPTY_PENDING_HANDOFF_READ_PLAN_WITH_DESTINATION
@@ -1640,6 +1658,44 @@ class TabConversationController implements ConversationController {
       case 'failed':
         return Object.freeze({ kind: 'failed' })
     }
+  }
+
+  presentGenerationIntent(
+    claim: SessionSelectingConversationOperationClaim,
+    input: {
+      readonly baseLeafId: MessageId | null
+      readonly messages: readonly Message[]
+    },
+  ): void {
+    const active = this.active
+    if (
+      !this.operationClaimIsCurrent(claim) ||
+      this.activeChatId !== claim.chatId ||
+      active?.chatId !== claim.chatId ||
+      active.destination.kind !== 'ready' ||
+      active.destination.spine.resolvedLeafId !== input.baseLeafId
+    ) {
+      return
+    }
+    const presentations = Object.freeze(
+      input.messages.map((message) => {
+        if (message.chatId !== claim.chatId) {
+          throw new Error(`GenerationIntentPresentationChatMismatch:${message.id}`)
+        }
+        const { header } = splitMessageForStorage(message)
+        return Object.freeze({
+          header,
+          message: structuredClone(message),
+          bodyVersion: header.bodyVersion,
+        })
+      }),
+    )
+    if (presentations.length === 0) return
+    this.generationIntentPresentations.set(
+      claim.id,
+      Object.freeze({ claim, baseLeafId: input.baseLeafId, presentations }),
+    )
+    this.publish()
   }
 
   claimSelectedDestination(input: {
@@ -2018,6 +2074,9 @@ class TabConversationController implements ConversationController {
       if (claim.chatId === chatId) this.operationClaims.delete(claimId)
     }
     this.operationClaimCountsByChat.delete(chatId)
+    for (const [claimId, presentation] of this.generationIntentPresentations) {
+      if (presentation.claim.chatId === chatId) this.generationIntentPresentations.delete(claimId)
+    }
     for (const [ownerId, pending] of this.pendingRouteHandoffsByOwnerId) {
       if (pending.seed.chat.id === chatId) this.deletePendingRouteHandoff(ownerId)
     }
@@ -2049,6 +2108,7 @@ class TabConversationController implements ConversationController {
     if (!sameLogicalWorkspace) this.sessions.clear()
     this.operationClaims.clear()
     this.operationClaimCountsByChat.clear()
+    this.generationIntentPresentations.clear()
     this.transcriptRetentions.clear()
     this.clearPendingRouteHandoffs()
     this.activeChatId = null
@@ -2469,6 +2529,7 @@ class TabConversationController implements ConversationController {
   private releaseOperationClaim(claim: ConversationOperationClaim, recover = true): boolean {
     if (this.operationClaims.get(claim.id) !== claim) return false
     this.operationClaims.delete(claim.id)
+    this.generationIntentPresentations.delete(claim.id)
     const remaining = (this.operationClaimCountsByChat.get(claim.chatId) ?? 1) - 1
     if (remaining === 0) this.operationClaimCountsByChat.delete(claim.chatId)
     else this.operationClaimCountsByChat.set(claim.chatId, remaining)
@@ -2596,6 +2657,7 @@ class TabConversationController implements ConversationController {
         target,
         proof,
         presentations,
+        forks,
       }),
       path,
       forks,
@@ -2891,13 +2953,12 @@ class TabConversationController implements ConversationController {
     proof: ConversationPathProofIdentity,
     presentations: readonly ConversationMessagePresentation[],
     spine: VersionedActiveBranchSpine<MessageHeaderRow>,
-    options: { readonly deferForkRead: boolean },
   ): void {
     const active = this.active
     if (!active || active.chatId !== proof.chatId) return
     this.cancelSelectionAttempt()
     if (proof.tipId === null) {
-      this.acceptSelectedSpine(session, spine, options)
+      this.acceptSelectedSpine(session, spine)
       const empty = emptyTranscriptBodyWindow(proof.chatId, spine.path)
       active.transcript = readyTranscriptState(active.transcript.selectionEpoch, empty)
     } else {
@@ -2909,7 +2970,7 @@ class TabConversationController implements ConversationController {
         previousPath,
       )
       active.transcript = retainTranscriptState(active.transcript)
-      this.acceptSelectedSpine(session, spine, options)
+      this.acceptSelectedSpine(session, spine)
       if (transition.kind === 'exact') {
         active.transcript = readyTranscriptState(
           active.transcript.selectionEpoch,
@@ -2988,7 +3049,6 @@ class TabConversationController implements ConversationController {
   private admitSealedSelection(
     session: ChatSession,
     destinationInput: SealedConversationSelection,
-    options: { readonly deferForkRead?: boolean } = {},
   ): SelectionAdmissionResult {
     const admitted = this.admitSealedSelectionFrame(destinationInput)
     if (!admitted) {
@@ -3007,9 +3067,7 @@ class TabConversationController implements ConversationController {
     } else if (!chatMetadataReceiptDominates(active.chat, admitted.chat)) {
       throw new Error(`ConversationDestinationChatVersionDiverged:${admitted.chat.id}`)
     }
-    this.installCommittedSelection(session, admitted.proof, admitted.presentations, spine, {
-      deferForkRead: options.deferForkRead === true,
-    })
+    this.installCommittedSelection(session, admitted.proof, admitted.presentations, spine)
     if (admitted.presentations.length > 0) {
       this.applyAdmittedMessageRevisions(
         admitted.presentations.map((presentation) => ({
@@ -3877,7 +3935,6 @@ class TabConversationController implements ConversationController {
   private acceptSelectedSpine(
     session: ChatSession,
     spine: VersionedActiveBranchSpine<MessageHeaderRow>,
-    options: { readonly deferForkRead: boolean } = { deferForkRead: false },
   ): void {
     const previousPath = this.presentedSpine()?.path ?? null
     this.cancelRead('transcript')
@@ -3889,23 +3946,16 @@ class TabConversationController implements ConversationController {
       )
     }
     if (this.active?.chatId === spine.chatId) {
-      const projectedForks: ActiveBranchForkSlot[] = []
-      for (const [messageId, fork] of this.active.forks) {
-        const selected = spine.path.get(messageId)
-        if (!selected || selected.parentId !== fork.parentId) continue
-        projectedForks.push(fork)
-      }
-      const projectedSpine = spine.replaceForks(projectedForks)
       let retainedForks = PersistentStringMap.empty<ActiveBranchForkSlot>()
-      for (const fork of projectedSpine.forkSlots()) {
+      for (const fork of spine.forkSlots()) {
         retainedForks = retainedForks.set(fork.selectedMessageId, fork)
       }
       this.active.forks = retainedForks
-      this.active.destination = Object.freeze({ kind: 'ready', spine: projectedSpine })
+      this.active.destination = Object.freeze({ kind: 'ready', spine })
       const releasedHeaderIds: MessageId[] = []
       let headers = this.active.headers
       for (const [messageId, header] of headers) {
-        const selected = projectedSpine.path.get(messageId)
+        const selected = spine.path.get(messageId)
         if (!selected) continue
         const relation = classifyMessageHeaderRevision(header, selected)
         if (relation === 'invalid-regression' || relation === 'version-collision') {
@@ -3921,9 +3971,8 @@ class TabConversationController implements ConversationController {
         this.recordHeaderChanges(releasedHeaderIds)
       }
       for (const messageId of this.active.compactableHeaderIds) {
-        if (projectedSpine.path.has(messageId)) this.active.compactableHeaderIds.delete(messageId)
+        if (spine.path.has(messageId)) this.active.compactableHeaderIds.delete(messageId)
       }
-      spine = projectedSpine
     }
     if (this.active) this.proveTopologyPath(this.active, spine)
     session.cursor = session.cursor.accept(spine.path, previousPath)
@@ -3932,13 +3981,6 @@ class TabConversationController implements ConversationController {
     )
     this.compactExactHeaders()
     this.rebaseTranscriptToSpine(spine)
-    const visibleWindow = this.active ? presentedTranscriptWindow(this.active.transcript) : null
-    const visibleParents = visibleWindow
-      ? [...transcriptBodyWindowRows(visibleWindow)].map((row) => row.header.parentId)
-      : spine.path.leaf
-        ? [spine.path.leaf.parentId]
-        : []
-    if (!options.deferForkRead) this.requestForkUpdates(visibleParents)
   }
 
   private rebaseTranscriptToSpine(
@@ -5388,6 +5430,7 @@ class TabConversationController implements ConversationController {
         window: transcript.window,
         selectionEpoch: transcript.selectionEpoch,
         viewportRevision: presentation.viewportRevision,
+        intentPresentations: this.presentedGenerationIntents(active.chatId, spine.resolvedLeafId),
         currency: 'current',
         reveal: presentation.reveal,
       })
@@ -5434,6 +5477,26 @@ class TabConversationController implements ConversationController {
       ),
     })
     return Object.freeze({ kind: 'ready', binding })
+  }
+
+  private presentedGenerationIntents(
+    chatId: ChatId,
+    leafId: MessageId | null,
+  ): readonly ConversationMessagePresentation[] {
+    let matched: readonly ConversationMessagePresentation[] | null = null
+    for (const pending of this.generationIntentPresentations.values()) {
+      if (
+        pending.claim.chatId === chatId &&
+        pending.baseLeafId === leafId &&
+        this.operationClaimIsCurrent(pending.claim)
+      ) {
+        matched =
+          matched === null
+            ? pending.presentations
+            : Object.freeze([...matched, ...pending.presentations])
+      }
+    }
+    return matched ?? EMPTY_CONVERSATION_MESSAGE_PRESENTATIONS
   }
 
   private retainedTreeInspector(
@@ -6080,7 +6143,8 @@ function sameConversationBindingPayload(
     ? incoming.surface === 'transcript' &&
         current.window === incoming.window &&
         current.selectionEpoch === incoming.selectionEpoch &&
-        current.viewportRevision === incoming.viewportRevision
+        current.viewportRevision === incoming.viewportRevision &&
+        current.intentPresentations === incoming.intentPresentations
     : incoming.surface === 'tree' &&
         current.headers === incoming.headers &&
         current.topology === incoming.topology &&

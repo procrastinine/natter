@@ -6,6 +6,7 @@ import { runBrowserCommandTransaction } from '../../src/store/browser-command-mu
 import { deleteBrowserWorkspaceCompactionState } from '../../src/store/browser-workspace-database-control'
 import {
   applyChatRowWriteTransitions,
+  applyLinkedChatRowReplacements,
   CHAT_ROW_LINKED_TRANSACTION_CAPABILITY,
   CHAT_ROW_PRESERVING_LINKS_TRANSACTION_CAPABILITY,
   type ChatRowWriteTransitionInput,
@@ -18,7 +19,11 @@ import {
   createChatSidebarAggregateAccumulator,
   materializeChatSidebarAggregateRows,
 } from '../../src/store/chat-sidebar-projection'
-import { readCurrentChatRowsForTransaction } from '../../src/store/chat-storage-codec'
+import {
+  readCurrentChatForTransaction,
+  readCurrentChatRowsForTransaction,
+  type TransactionCurrentChat,
+} from '../../src/store/chat-storage-codec'
 import { buildChat } from '../../src/store/chats'
 import { createDbForTests, type NatterDb } from '../../src/store/db'
 import {
@@ -123,6 +128,18 @@ describe('chat row transition', () => {
     expect(committed.facts.chatStates).toEqual([
       { chatId: previous.id, chat: next, initialExists: true },
     ])
+    expect(tableCallCount(bulkGet, 'chats')).toBe(0)
+    expect(committed.value.chatWrites).toEqual([
+      { chatId: previous.id, transition: 'replace-preserving-links' },
+    ])
+    expect(committed.value.linkPhases).toEqual([])
+    expect(committed.value.fragment.dependencies).toEqual([
+      { kind: 'chat', chatIds: [previous.id] },
+    ])
+    expect(committed.value.fragment.physicalMutations).toEqual([
+      { tableName: 'chats', operation: 'write', key: previous.id },
+    ])
+    expect(committed.value.fragment.physicalReads).toEqual([])
     for (const tableName of ['chatSidebarRows', 'chatSidebarAggregates']) {
       expect(tableCallCount(bulkGet, tableName)).toBe(0)
       expect(tableCallCount(bulkPut, tableName)).toBe(0)
@@ -151,6 +168,69 @@ describe('chat row transition', () => {
         { kind: 'replace-linked', previous: await currentChat(tx, previous.id), next },
       ]),
     ).rejects.toThrow(`ConfigurationOwnerLinkPreviousMismatch:chat:${previous.id}`)
+
+    expect(await transitionState(db, previous.id)).toEqual(before)
+  })
+
+  it('returns one exact composed receipt for a linked replacement batch', async () => {
+    const db = await openDatabase()
+    const previous = [chat('receipt-a'), chat('receipt-b')]
+    await executeTransitions(
+      db,
+      LINKED_PLAN,
+      previous.map((next) => ({ kind: 'add-linked' as const, next })),
+    )
+
+    const committed = await executeLinkedReplacements(db, async (tx) => {
+      const current = await readCurrentChatRowsForTransaction(
+        tx,
+        previous.map(({ id }) => id),
+      )
+      return current.map((row, index) => {
+        return {
+          previous: row,
+          next: {
+            ...row,
+            title: `updated ${index}`,
+            settings: { ...row.settings, profileId: 'profile-b' },
+            configurationVersion: (row.configurationVersion ?? 0) + 1,
+            metaVersion: row.metaVersion + 1,
+            summaryVersion: row.summaryVersion + 1,
+            updatedAt: 10 + index,
+          },
+        }
+      })
+    })
+
+    expect(committed.value.links.removedLinkIds).toEqual([])
+    expect(committed.value.links.writtenLinkIds).toHaveLength(2)
+    expect(committed.value.links.profileUsageMutations.map(({ profileId }) => profileId)).toEqual([
+      'profile-a',
+      'profile-b',
+    ])
+    expect(committed.value.sidebar.mutatedRowIds).toEqual(['receipt-a', 'receipt-b'])
+    expect(committed.facts.chatStates.map(({ chatId }) => chatId)).toEqual([
+      'receipt-a',
+      'receipt-b',
+    ])
+  })
+
+  it('rejects duplicate linked replacement identities before mutating the batch', async () => {
+    const db = await openDatabase()
+    const previous = chat('duplicate-receipt')
+    await executeTransitions(db, LINKED_PLAN, [{ kind: 'add-linked', next: previous }])
+    const before = await transitionState(db, previous.id)
+
+    await expect(
+      executeLinkedReplacements(db, async (tx) => {
+        const current = await currentChat(tx, previous.id)
+        const next = { ...current, title: 'must not be written' }
+        return [
+          { previous: current, next },
+          { previous: current, next },
+        ]
+      }),
+    ).rejects.toThrow(`ChatRowWriteTransitionDuplicate:${previous.id}`)
 
     expect(await transitionState(db, previous.id)).toEqual(before)
   })
@@ -244,7 +324,11 @@ describe('chat row transition', () => {
 
     await expect(
       executeTransitions(db, PRESERVING_PLAN, [
-        { kind: 'replace-preserving-links', previous, next: { ...previous, title: 'stale' } },
+        {
+          kind: 'replace-preserving-links',
+          previous: previous as TransactionCurrentChat,
+          next: { ...previous, title: 'stale' },
+        },
       ]),
     ).rejects.toThrow(`ChatRowPriorNotCurrentTransaction:${previous.id}`)
   })
@@ -298,9 +382,11 @@ describe('chat row transition', () => {
 
     await expect(
       executeTransitions(db, LINKED_PLAN, async (tx) => {
-        const current = await tx.table<Chat, ChatId>('chats').bulkGet(rows.map((row) => row.id))
-        return current.map((previous, index) => {
-          if (!previous) throw new Error(`MissingCurrentChat:${rows[index]?.id}`)
+        const current = await readCurrentChatRowsForTransaction(
+          tx,
+          rows.map((row) => row.id),
+        )
+        return current.map((previous) => {
           return {
             kind: 'replace-linked' as const,
             previous,
@@ -350,7 +436,7 @@ describe('chat row transition', () => {
         recording.transaction,
         nextRows.map(({ next }, index) => ({
           kind: 'replace-preserving-links' as const,
-          previous: currentRows[index] as Chat,
+          previous: currentRows[index] as TransactionCurrentChat,
           next,
         })),
       )
@@ -413,7 +499,7 @@ async function executeTransitions(
         const fenced = bindFencedTransaction(tx, plan)
         const transitions =
           typeof transitionInput === 'function' ? await transitionInput(fenced) : transitionInput
-        await applyChatRowWriteTransitions(fenced, transitions)
+        return applyChatRowWriteTransitions(fenced, transitions)
       })
       assertPhysicalTransactionTablesDeclared(plan, committed.facts.tableNames)
       return committed
@@ -421,8 +507,35 @@ async function executeTransitions(
   )
 }
 
-async function currentChat(tx: Transaction, chatId: ChatId): Promise<Chat> {
-  const row = await tx.table<Chat, ChatId>('chats').get(chatId)
+async function executeLinkedReplacements(
+  db: NatterDb,
+  replacementInput:
+    | readonly { readonly previous: TransactionCurrentChat; readonly next: Chat }[]
+    | ((
+        tx: Transaction,
+      ) =>
+        | readonly { readonly previous: TransactionCurrentChat; readonly next: Chat }[]
+        | Promise<readonly { readonly previous: TransactionCurrentChat; readonly next: Chat }[]>),
+) {
+  return db.transaction(
+    'rw',
+    LINKED_PLAN.tableNames.map((tableName) => db.table(tableName)),
+    async (raw) => {
+      registerPhysicalMutationTransaction(raw)
+      const committed = await runBrowserCommandTransaction(raw, async (tx) => {
+        const fenced = bindFencedTransaction(tx, LINKED_PLAN)
+        const replacements =
+          typeof replacementInput === 'function' ? await replacementInput(fenced) : replacementInput
+        return applyLinkedChatRowReplacements(fenced, replacements)
+      })
+      assertPhysicalTransactionTablesDeclared(LINKED_PLAN, committed.facts.tableNames)
+      return committed
+    },
+  )
+}
+
+async function currentChat(tx: Transaction, chatId: ChatId): Promise<TransactionCurrentChat> {
+  const row = await readCurrentChatForTransaction(tx, chatId)
   if (!row) throw new Error(`MissingCurrentChat:${chatId}`)
   return row
 }

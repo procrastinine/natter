@@ -2,17 +2,26 @@ import type { Transaction } from 'dexie'
 import type { AttachmentId, AttachmentRef, AttachmentReferenceEdge, ChatId } from '../core/types'
 import {
   type AttachmentCatalogReferenceDelta,
+  type AttachmentCatalogReferenceMutationReceipt,
   applyAttachmentCatalogReferenceDeltas,
   readAttachmentCatalogRepairSnapshot,
   refreshAttachmentCatalogProjectionsForRepair,
 } from './attachment-catalog-projection'
 import type { AttachmentHeaderRow } from './attachment-storage'
-import { recordBrowserCommandAttachmentReferenceState } from './browser-command-mutation-journal'
+import {
+  recordBrowserCommandAttachmentReferenceState,
+  recordBrowserCommandOwnerInvalidation,
+} from './browser-command-mutation-journal'
 import {
   deletePhysicalStorageRows,
   putPhysicalStorageRows,
   replaceAttachmentHeaderByteOwnerBatch,
 } from './byte-owner-mutation'
+import {
+  absorbSemanticOperationReceiptFragment,
+  type SemanticOperationReceiptFragment,
+  semanticOperationReceiptFragment,
+} from './semantic-operation-capability'
 
 export interface AttachmentReferenceOwner {
   ownerKind: AttachmentReferenceEdge['ownerKind']
@@ -32,6 +41,35 @@ export interface AttachmentReferenceOwnerTransition {
 export interface AttachmentReferenceMutationEffects {
   readonly changedAttachmentIds: readonly AttachmentId[]
   readonly newlyUnreferencedAttachmentIds: readonly AttachmentId[]
+}
+
+type AttachmentReferenceReceiptTableName =
+  | 'attachments'
+  | 'attachmentRefEdges'
+  | 'attachmentCatalogRows'
+  | 'attachmentCatalogAggregate'
+
+export interface AttachmentReferenceTransitionReceipt extends AttachmentReferenceMutationEffects {
+  readonly targetReadIds: readonly AttachmentId[]
+  readonly removedEdgeKeys: readonly (readonly [
+    AttachmentReferenceEdge['ownerKind'],
+    string,
+    string,
+  ])[]
+  readonly writtenEdgeKeys: readonly (readonly [
+    AttachmentReferenceEdge['ownerKind'],
+    string,
+    string,
+  ])[]
+  readonly headerReadIds: readonly AttachmentId[]
+  readonly headerWriteIds: readonly AttachmentId[]
+  readonly fragment: SemanticOperationReceiptFragment<AttachmentReferenceReceiptTableName>
+}
+
+interface AttachmentReferenceDeltaReceipt extends AttachmentReferenceMutationEffects {
+  readonly headerReadIds: readonly AttachmentId[]
+  readonly headerWriteIds: readonly AttachmentId[]
+  readonly catalog: AttachmentCatalogReferenceMutationReceipt
 }
 
 interface AttachmentOwnerReferenceSummary {
@@ -88,9 +126,9 @@ export async function applyAttachmentReferenceOwnerTransitions(
   transitions: readonly AttachmentReferenceOwnerTransition[],
   observedAt: number,
   assertAttachmentScope?: (attachmentId: AttachmentId) => void,
-): Promise<AttachmentReferenceMutationEffects> {
+): Promise<AttachmentReferenceTransitionReceipt> {
   if (transitions.length === 0) {
-    return { changedAttachmentIds: [], newlyUnreferencedAttachmentIds: [] }
+    return attachmentReferenceTransitionReceipt([], [], [], emptyAttachmentReferenceDeltaReceipt())
   }
   const ownerKeys = new Set<string>()
   const planned = transitions.map((transition) => {
@@ -164,7 +202,14 @@ export async function applyAttachmentReferenceOwnerTransitions(
     }
   }
   if (deltas.size === 0 && removedEdges.length === 0 && changedEdges.length === 0) {
-    return { changedAttachmentIds: [], newlyUnreferencedAttachmentIds: [] }
+    const receipt = attachmentReferenceTransitionReceipt(
+      [...nextTargetIds],
+      [],
+      [],
+      emptyAttachmentReferenceDeltaReceipt(),
+    )
+    absorbSemanticOperationReceiptFragment(tx, receipt.fragment)
+    return receipt
   }
 
   await deletePhysicalStorageRows(
@@ -174,17 +219,28 @@ export async function applyAttachmentReferenceOwnerTransitions(
     removedEdges,
   )
   await putPhysicalStorageRows(tx, 'attachmentRefEdges', changedEdges, replacedEdges)
-  return applyAttachmentReferenceDeltas(tx, [...deltas.values()], observedAt)
+  const deltasReceipt = await applyAttachmentReferenceDeltas(tx, [...deltas.values()], observedAt)
+  const receipt = attachmentReferenceTransitionReceipt(
+    [...nextTargetIds],
+    removedEdges,
+    changedEdges,
+    deltasReceipt,
+  )
+  for (const dependency of receipt.fragment.dependencies) {
+    recordBrowserCommandOwnerInvalidation(tx, dependency)
+  }
+  absorbSemanticOperationReceiptFragment(tx, receipt.fragment)
+  return receipt
 }
 
 async function applyAttachmentReferenceDeltas(
   tx: Transaction,
   deltas: readonly MutableAttachmentReferenceDelta[],
   observedAt: number,
-): Promise<AttachmentReferenceMutationEffects> {
+): Promise<AttachmentReferenceDeltaReceipt> {
   const attachmentIds = deltas.map((delta) => delta.attachmentId)
   if (attachmentIds.length === 0) {
-    return { changedAttachmentIds: [], newlyUnreferencedAttachmentIds: [] }
+    return emptyAttachmentReferenceDeltaReceipt()
   }
   const previousHeaders = await tx
     .table<AttachmentHeaderRow, AttachmentId>('attachments')
@@ -221,8 +277,111 @@ async function applyAttachmentReferenceDeltas(
   if (changedNextHeaders.length > 0) {
     await replaceAttachmentHeaderByteOwnerBatch(tx, changedNextHeaders, changedPreviousHeaders)
   }
-  await applyAttachmentCatalogReferenceDeltas(tx, catalogDeltas)
-  return { changedAttachmentIds: attachmentIds, newlyUnreferencedAttachmentIds }
+  const catalog = await applyAttachmentCatalogReferenceDeltas(tx, catalogDeltas)
+  return {
+    changedAttachmentIds: Object.freeze(attachmentIds),
+    newlyUnreferencedAttachmentIds: Object.freeze(newlyUnreferencedAttachmentIds),
+    headerReadIds: Object.freeze(attachmentIds),
+    headerWriteIds: Object.freeze(changedNextHeaders.map(({ id }) => id)),
+    catalog,
+  }
+}
+
+function emptyAttachmentReferenceDeltaReceipt(): AttachmentReferenceDeltaReceipt {
+  return {
+    changedAttachmentIds: Object.freeze([]),
+    newlyUnreferencedAttachmentIds: Object.freeze([]),
+    headerReadIds: Object.freeze([]),
+    headerWriteIds: Object.freeze([]),
+    catalog: Object.freeze({
+      rowReadIds: Object.freeze([]),
+      rowWriteIds: Object.freeze([]),
+      aggregateRead: false,
+      aggregateWrite: false,
+      fragment: semanticOperationReceiptFragment<
+        'attachmentCatalogRows' | 'attachmentCatalogAggregate'
+      >({}),
+    }),
+  }
+}
+
+function attachmentReferenceTransitionReceipt(
+  targetReadIds: readonly AttachmentId[],
+  removedEdges: readonly AttachmentReferenceEdge[],
+  writtenEdges: readonly AttachmentReferenceEdge[],
+  delta: AttachmentReferenceDeltaReceipt,
+): AttachmentReferenceTransitionReceipt {
+  const removedEdgeKeys = removedEdges.map(
+    ({ ownerKind, ownerId, refId }) => [ownerKind, ownerId, refId] as const,
+  )
+  const writtenEdgeKeys = writtenEdges.map(
+    ({ ownerKind, ownerId, refId }) => [ownerKind, ownerId, refId] as const,
+  )
+  const mutationAttachmentIds = [
+    ...new Set([
+      ...delta.changedAttachmentIds,
+      ...removedEdges.map(({ attachmentId }) => attachmentId),
+      ...writtenEdges.map(({ attachmentId }) => attachmentId),
+    ]),
+  ].sort()
+  return Object.freeze({
+    changedAttachmentIds: Object.freeze([...delta.changedAttachmentIds]),
+    newlyUnreferencedAttachmentIds: Object.freeze([...delta.newlyUnreferencedAttachmentIds]),
+    targetReadIds: Object.freeze([...targetReadIds]),
+    removedEdgeKeys: Object.freeze(removedEdgeKeys),
+    writtenEdgeKeys: Object.freeze(writtenEdgeKeys),
+    headerReadIds: Object.freeze([...delta.headerReadIds]),
+    headerWriteIds: Object.freeze([...delta.headerWriteIds]),
+    fragment: semanticOperationReceiptFragment({
+      dependencies:
+        mutationAttachmentIds.length > 0
+          ? [{ kind: 'attachment', attachmentIds: mutationAttachmentIds }]
+          : [],
+      physicalMutations: [
+        ...removedEdgeKeys.map((key) => ({
+          tableName: 'attachmentRefEdges' as const,
+          operation: 'delete' as const,
+          key,
+        })),
+        ...writtenEdgeKeys.map((key) => ({
+          tableName: 'attachmentRefEdges' as const,
+          operation: 'write' as const,
+          key,
+        })),
+        ...delta.headerWriteIds.map((key) => ({
+          tableName: 'attachments' as const,
+          operation: 'write' as const,
+          key,
+        })),
+        ...delta.catalog.fragment.physicalMutations,
+      ],
+      physicalReads: [
+        ...(targetReadIds.length > 0
+          ? [
+              {
+                tableName: 'attachments' as const,
+                indexKind: 'primary' as const,
+                operation: 'get-many' as const,
+                requestCount: 1,
+                rowCount: targetReadIds.length,
+              },
+            ]
+          : []),
+        ...(delta.headerReadIds.length > 0
+          ? [
+              {
+                tableName: 'attachments' as const,
+                indexKind: 'primary' as const,
+                operation: 'get-many' as const,
+                requestCount: 1,
+                rowCount: delta.headerReadIds.length,
+              },
+            ]
+          : []),
+        ...delta.catalog.fragment.physicalReads,
+      ],
+    }),
+  })
 }
 
 export async function replaceAttachmentReferenceOwnersForRepair(
@@ -347,6 +506,7 @@ export async function deleteAttachmentReferenceEdgesForChats(
 export async function reconcileAttachmentRefCountsForRepair(
   tx: Transaction,
   attachmentIds: Iterable<AttachmentId>,
+  observedAt: number,
 ): Promise<void> {
   const ids = [...new Set(attachmentIds)]
   if (ids.length === 0) return
@@ -354,7 +514,6 @@ export async function reconcileAttachmentRefCountsForRepair(
   const attachments = snapshot.headers
   const nextHeaders = [...attachments]
   const changed: AttachmentHeaderRow[] = []
-  const observedAt = Date.now()
   for (let index = 0; index < ids.length; index += 1) {
     const attachmentId = ids[index] as AttachmentId
     const attachment = attachments[index]

@@ -18,10 +18,18 @@ import { createDbForTests, type NatterDb } from '../../src/store/db'
 import { resumeLockRuntime } from '../../src/store/locks'
 import type { MessageBodyRow } from '../../src/store/message-storage'
 import {
+  assertSemanticOperationCommandLifetimeReceipt,
+  semanticOperationCommandLifetimeReceipt,
+  semanticOperationCommandLifetimeReceiptWithPhysicalReads,
+  semanticOperationCommandLifetimeReceiptWithPreflight,
+} from '../../src/store/semantic-operation-capability'
+import {
   __resetStorageCompactionStateForTests,
+  activateStorageCompactionWriteAdmission,
   assertStorageCompactionDebtRuntimeClosed,
   awaitStorageCompactionDebtIdle,
   awaitStorageCompactionIntentOwnerIdle,
+  awaitStorageCompactionWriteAdmission,
   closeStorageCompactionDebtRuntime,
   finishStorageCompactionDebtRuntimeClosure,
   publishStorageCompactionRequest,
@@ -599,5 +607,147 @@ describe('storage compaction state', () => {
         .filter((row) => row.name.includes('storage-compaction-intent-owner:v1:'))
         .count(),
     ).toBe(0)
+  })
+
+  it('starts write admission once and makes every command await the same zero-I/O receipt', async () => {
+    const currentDb = createDbForTests(`natter-compaction-admission-${crypto.randomUUID()}`)
+    db = currentDb
+    await currentDb.open()
+
+    await expect(awaitStorageCompactionWriteAdmission()).rejects.toThrow(
+      'StorageCompactionWriteAdmissionInactive',
+    )
+    activateStorageCompactionWriteAdmission(currentDb)
+    const first = await awaitStorageCompactionWriteAdmission()
+    const second = await awaitStorageCompactionWriteAdmission()
+
+    expect(first).toBe(second)
+    expect(first).toMatchObject({
+      kind: 'storage-compaction-write-admission',
+      databaseName: currentDb.name,
+      commandPhysicalReads: 0,
+    })
+    const lifetime = semanticOperationCommandLifetimeReceipt(
+      { workspaceId: 'workspace', replacementEpoch: 4 },
+      currentDb.name,
+      first,
+    )
+    expect(lifetime.physicalReads).toEqual([])
+    expect(() =>
+      assertSemanticOperationCommandLifetimeReceipt(lifetime, {
+        workspaceId: 'workspace',
+        replacementEpoch: 4,
+        databaseName: currentDb.name,
+      }),
+    ).not.toThrow()
+    expect(() =>
+      assertSemanticOperationCommandLifetimeReceipt(lifetime, {
+        workspaceId: 'workspace',
+        replacementEpoch: 5,
+        databaseName: currentDb.name,
+      }),
+    ).toThrow('SemanticOperationCommandLifetimeReceiptInvalid')
+    const withPreflight = semanticOperationCommandLifetimeReceiptWithPhysicalReads(lifetime, [
+      {
+        tableName: 'configurationLinks',
+        indexKind: 'secondary',
+        indexName: 'ownerKey',
+        operation: 'open-cursor',
+        requestCount: 2,
+        rowCount: 129,
+        maxRequestRows: 128,
+        estimatedBytes: 8_192,
+      },
+    ])
+    expect(withPreflight.physicalReads).toEqual([
+      expect.objectContaining({
+        tableName: 'configurationLinks',
+        requestCount: 2,
+        rowCount: 129,
+        maxRequestRows: 128,
+      }),
+    ])
+    expect(() =>
+      assertSemanticOperationCommandLifetimeReceipt(withPreflight, {
+        workspaceId: 'workspace',
+        replacementEpoch: 4,
+        databaseName: currentDb.name,
+      }),
+    ).not.toThrow()
+    expect(() =>
+      semanticOperationCommandLifetimeReceiptWithPhysicalReads(lifetime, [
+        {
+          tableName: 'configurationLinks',
+          indexKind: 'secondary',
+          indexName: 'ownerKey',
+          operation: 'open-cursor',
+          requestCount: 1,
+          rowCount: 1,
+          maxRequestRows: Number.POSITIVE_INFINITY,
+          estimatedBytes: 1,
+        },
+      ]),
+    ).toThrow('SemanticOperationPhysicalCountInvalid:commandLifetimeReadBatch')
+    const withExactPreflight = semanticOperationCommandLifetimeReceiptWithPreflight(
+      lifetime,
+      [
+        {
+          tableName: 'drafts',
+          indexKind: 'primary',
+          operation: 'get',
+          requestCount: 1,
+          rowCount: 1,
+          maxRequestRows: 1,
+          estimatedBytes: 64,
+        },
+      ],
+      [
+        {
+          tableName: 'drafts',
+          indexKind: 'primary',
+          operation: 'get',
+          requestCount: 1,
+          rowCount: 1,
+        },
+      ],
+    )
+    expect(withExactPreflight.physicalReads).toEqual([
+      expect.objectContaining({
+        tableName: 'drafts',
+        requestCount: 1,
+        rowCount: 1,
+        estimatedBytes: 64,
+      }),
+    ])
+    expect(withExactPreflight.exactPhysicalReads).toEqual([
+      {
+        tableName: 'drafts',
+        indexKind: 'primary',
+        operation: 'get',
+        requestCount: 1,
+        rowCount: 1,
+      },
+    ])
+    expect(() =>
+      semanticOperationCommandLifetimeReceiptWithPreflight(
+        lifetime,
+        [],
+        [
+          {
+            tableName: 'drafts',
+            indexKind: 'primary',
+            operation: 'get',
+            requestCount: 1,
+            rowCount: Number.POSITIVE_INFINITY,
+          },
+        ],
+      ),
+    ).toThrow('SemanticOperationPhysicalCountInvalid:commandLifetimeExactReadRows')
+
+    stopStorageCompactionIntentOwner()
+    await expect(awaitStorageCompactionWriteAdmission()).rejects.toThrow(
+      'StorageCompactionWriteAdmissionInactive',
+    )
+    await awaitStorageCompactionIntentOwnerIdle()
   })
 })

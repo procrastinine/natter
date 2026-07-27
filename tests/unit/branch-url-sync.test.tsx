@@ -218,6 +218,7 @@ class ProjectionSource implements ConversationProjectionSource {
         pathHeaders: path.map((row) => row.header),
       },
       presentations: tip ? [tip] : [],
+      forks: path.map((row) => this.forkFor(row.header.id)),
     }
   }
 
@@ -258,6 +259,7 @@ class ProjectionSource implements ConversationProjectionSource {
             pathHeaders: [],
           },
           presentations: [],
+          forks: [],
         }),
       )
     }
@@ -283,6 +285,7 @@ class ProjectionSource implements ConversationProjectionSource {
           pathHeaders: path.map((row) => row.header),
         },
         presentations: [tip],
+        forks: path.map((row) => this.forkFor(row.header.id)),
       }),
     )
   }

@@ -46,6 +46,14 @@ import {
 } from './browser-workspace-slot-coordination'
 import { configurationController } from './configuration-controller'
 import {
+  abortConfigurationModelResolutionCapability,
+  activateConfigurationModelResolutionCapability,
+  assertConfigurationModelResolutionCapabilityClosed,
+  attachConfigurationModelResolutionCapability,
+  awaitConfigurationModelResolutionCapabilityIdle,
+  closeConfigurationModelResolutionCapability,
+} from './configuration-model-resolution-capability'
+import {
   assertConfigurationWorkspaceClosed,
   attachConfigurationWorkspace,
   disposeConfigurationWorkspace,
@@ -98,6 +106,7 @@ import {
 } from './mounted-projection-lifecycle'
 import { type WorkspaceFence, WorkspaceSessionClosedError } from './repository'
 import {
+  activateStorageCompactionWriteAdmission,
   assertStorageCompactionDebtRuntimeClosed,
   assertStorageCompactionIntentOwnerClosed,
   awaitStorageCompactionDebtIdle,
@@ -281,6 +290,17 @@ function createBrowserWorkspaceResourceManifest(
       assertClosed: assertConfigurationWorkspaceClosed,
       attach: attachConfigurationWorkspace,
     },
+    'configuration-model-resolution': {
+      id: 'configuration-model-resolution',
+      phase: 'producer',
+      closeAdmissions: closeConfigurationModelResolutionCapability,
+      abort: abortConfigurationModelResolutionCapability,
+      awaitIdle: awaitConfigurationModelResolutionCapabilityIdle,
+      assertClosed: assertConfigurationModelResolutionCapabilityClosed,
+      attach: attachConfigurationModelResolutionCapability,
+      prerequisites: [],
+      activate: activateConfigurationModelResolutionCapability,
+    },
     'stream-recovery': {
       id: 'stream-recovery',
       phase: 'producer',
@@ -339,7 +359,7 @@ function createBrowserWorkspaceResourceManifest(
       abort: () => {},
       awaitIdle: awaitBrowserWorkspaceRepositoryCapabilitiesIdle,
       assertClosed: assertBrowserWorkspaceRepositoryCapabilitiesClosed,
-      resume: resumeBrowserWorkspaceRepositoryAdmissions,
+      resume: resumeBrowserWorkspaceRepositoryCapabilities,
     },
     'workspace-locks': {
       id: 'workspace-locks',
@@ -546,6 +566,12 @@ async function awaitBrowserWorkspaceRepositoryCapabilitiesIdle(): Promise<void> 
 function assertBrowserWorkspaceRepositoryCapabilitiesClosed(): void {
   assertBrowserWorkspaceRepositoryAdmissionsClosed()
   assertStorageCompactionIntentOwnerClosed()
+}
+
+function resumeBrowserWorkspaceRepositoryCapabilities(): void {
+  const session = getBrowserWorkspaceSession()
+  session.runOperation((db) => activateStorageCompactionWriteAdmission(db))
+  resumeBrowserWorkspaceRepositoryAdmissions()
 }
 
 function startStorageMaintenanceCapabilities(): void {

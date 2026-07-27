@@ -135,6 +135,9 @@ export interface ConfigurationChatSwitchCommand extends ConfigurationCommandBase
   readonly kind: 'chat.switch-profile'
   readonly chatId: ChatId
   readonly profileId: ProfileId
+  readonly requestKeyId: KeyId | null
+  readonly previousProfileId: ProfileId
+  readonly previousModelResolutionTarget: ConfigurationRequestRevision | null
   readonly target: ConfigurationRequestRevision
   readonly api: ChatSettings['api']
   readonly model:
@@ -151,8 +154,26 @@ interface ConfigurationChatResolveModelCommand extends ConfigurationCommandBase 
   readonly kind: 'chat.resolve-model'
   readonly chatId: ChatId
   readonly intentId: string
+  readonly requestKeyId: KeyId | null
   readonly target: ConfigurationRequestRevision
+  readonly pendingTarget: ConfigurationRequestRevision
   readonly modelId: string
+  readonly catalog:
+    | {
+        readonly kind: 'cached'
+        readonly queryKey: string
+        readonly profileRevision: string
+        readonly payloadId: string
+        readonly payloadByteLength: number
+        readonly fetchedAt: number
+      }
+    | {
+        readonly kind: 'transient'
+        readonly queryKey: string
+        readonly profileRevision: string
+        readonly catalogId: string
+        readonly fetchedAt: number
+      }
   readonly expectedConfigurationVersion: number
 }
 
@@ -215,11 +236,6 @@ interface ConfigurationGlobalPreferenceSetCommand extends ConfigurationCommandBa
   readonly value: unknown
 }
 
-interface ConfigurationGlobalPreferenceDeleteCommand extends ConfigurationCommandBase {
-  readonly kind: 'global-preference.delete'
-  readonly key: string
-}
-
 interface ConfigurationPinnedModelMembershipCommand extends ConfigurationCommandBase {
   readonly kind: 'pinned-model.set-membership'
   readonly modelId: string
@@ -230,16 +246,6 @@ interface ConfigurationPinnedModelMoveCommand extends ConfigurationCommandBase {
   readonly kind: 'pinned-model.move'
   readonly modelId: string
   readonly delta: -1 | 1
-}
-
-interface ConfigurationPinnedModelClearCommand extends ConfigurationCommandBase {
-  readonly kind: 'pinned-model.clear'
-}
-
-interface ConfigurationRecentModelBumpCommand extends ConfigurationCommandBase {
-  readonly kind: 'recent-model.bump'
-  readonly modelId: string
-  readonly limit: number
 }
 
 interface ConfigurationRecentModelClearCommand extends ConfigurationCommandBase {
@@ -315,11 +321,6 @@ interface ConfigurationChatPresetSetArchivedCommand extends ConfigurationCommand
   readonly archived: boolean
 }
 
-interface ConfigurationChatPresetTouchCommand extends ConfigurationCommandBase {
-  readonly kind: 'chat-preset.touch'
-  readonly presetId: PresetId
-}
-
 interface ConfigurationChatPresetDeleteCommand extends ConfigurationCommandBase {
   readonly kind: 'chat-preset.delete'
   readonly presetId: PresetId
@@ -381,25 +382,6 @@ interface ConfigurationPromptRenameCommand extends ConfigurationCommandBase {
   readonly name: string
 }
 
-interface ConfigurationPromptPutCommand extends ConfigurationCommandBase {
-  readonly kind: 'prompt-preset.put'
-  readonly preset: PromptPreset
-}
-
-interface ConfigurationPromptUpdateCommand extends ConfigurationCommandBase {
-  readonly kind: 'prompt-preset.update'
-  readonly presetId: PromptPresetId
-  readonly patch: {
-    readonly name?: string
-    readonly text?: string
-  }
-}
-
-interface ConfigurationPromptTouchCommand extends ConfigurationCommandBase {
-  readonly kind: 'prompt-preset.touch'
-  readonly presetId: PromptPresetId
-}
-
 interface ConfigurationPromptDeleteCommand extends ConfigurationCommandBase {
   readonly kind: 'prompt-preset.delete'
   readonly presetId: PromptPresetId
@@ -425,11 +407,8 @@ type ConfigurationDomainCommandUnion =
   | ConfigurationSamplePromptsDismissCommand
   | ConfigurationInstallSecretEnsureCommand
   | ConfigurationGlobalPreferenceSetCommand
-  | ConfigurationGlobalPreferenceDeleteCommand
   | ConfigurationPinnedModelMembershipCommand
   | ConfigurationPinnedModelMoveCommand
-  | ConfigurationPinnedModelClearCommand
-  | ConfigurationRecentModelBumpCommand
   | ConfigurationRecentModelClearCommand
   | ConfigurationSidebarSortCommand
   | ConfigurationSidebarFolderCommand
@@ -443,7 +422,6 @@ type ConfigurationDomainCommandUnion =
   | ConfigurationChatPresetDuplicateCommand
   | ConfigurationChatPresetMoveCommand
   | ConfigurationChatPresetSetArchivedCommand
-  | ConfigurationChatPresetTouchCommand
   | ConfigurationChatPresetDeleteCommand
   | ConfigurationChatPresetApplyCommand
   | ConfigurationChatPresetSaveCommand
@@ -451,10 +429,7 @@ type ConfigurationDomainCommandUnion =
   | ConfigurationPromptLoadAndPinCommand
   | ConfigurationPromptOverwriteAndPinCommand
   | ConfigurationPromptCreateAndPinCommand
-  | ConfigurationPromptPutCommand
-  | ConfigurationPromptUpdateCommand
   | ConfigurationPromptRenameCommand
-  | ConfigurationPromptTouchCommand
   | ConfigurationPromptDeleteCommand
 
 export type ConfigurationDomainCommandKind = ConfigurationDomainCommandUnion['kind']
@@ -572,6 +547,7 @@ type ConfigurationDomainResultUnion =
         | 'preset-profile-mismatch'
         | 'prompt-kind-mismatch'
         | 'model-resolution-target-mismatch'
+        | 'model-resolution-catalog-changed'
         | 'coupled-setting-command-required'
         | 'preset-order-anchor-self'
         | 'preset-order-target-archived'
@@ -619,11 +595,8 @@ interface ConfigurationDomainCommandMap {
   'sample-prompts.set-dismissed': ConfigurationSamplePromptsDismissCommand
   'install-secret.ensure': ConfigurationInstallSecretEnsureCommand
   'global-preference.set': ConfigurationGlobalPreferenceSetCommand
-  'global-preference.delete': ConfigurationGlobalPreferenceDeleteCommand
   'pinned-model.set-membership': ConfigurationPinnedModelMembershipCommand
   'pinned-model.move': ConfigurationPinnedModelMoveCommand
-  'pinned-model.clear': ConfigurationPinnedModelClearCommand
-  'recent-model.bump': ConfigurationRecentModelBumpCommand
   'recent-model.clear': ConfigurationRecentModelClearCommand
   'sidebar-preference.set-sort': ConfigurationSidebarSortCommand
   'sidebar-preference.set-folder-collapsed': ConfigurationSidebarFolderCommand
@@ -637,7 +610,6 @@ interface ConfigurationDomainCommandMap {
   'chat-preset.duplicate': ConfigurationChatPresetDuplicateCommand
   'chat-preset.move': ConfigurationChatPresetMoveCommand
   'chat-preset.set-archived': ConfigurationChatPresetSetArchivedCommand
-  'chat-preset.touch': ConfigurationChatPresetTouchCommand
   'chat-preset.delete': ConfigurationChatPresetDeleteCommand
   'chat-preset.apply': ConfigurationChatPresetApplyCommand
   'chat-preset.save': ConfigurationChatPresetSaveCommand
@@ -646,9 +618,6 @@ interface ConfigurationDomainCommandMap {
   'prompt-preset.overwrite-and-pin': ConfigurationPromptOverwriteAndPinCommand
   'prompt-preset.create-and-pin': ConfigurationPromptCreateAndPinCommand
   'prompt-preset.rename': ConfigurationPromptRenameCommand
-  'prompt-preset.put': ConfigurationPromptPutCommand
-  'prompt-preset.update': ConfigurationPromptUpdateCommand
-  'prompt-preset.touch': ConfigurationPromptTouchCommand
   'prompt-preset.delete': ConfigurationPromptDeleteCommand
 }
 
@@ -679,11 +648,8 @@ interface ConfigurationDomainResultMap {
   'sample-prompts.set-dismissed': WorkspaceSettingSavedResult | ConfigurationCommandFailure
   'install-secret.ensure': WorkspaceSettingSavedResult | ConfigurationCommandFailure
   'global-preference.set': WorkspaceSettingSavedResult | ConfigurationCommandFailure
-  'global-preference.delete': WorkspaceSettingSavedResult | ConfigurationCommandFailure
   'pinned-model.set-membership': WorkspaceSettingSavedResult | ConfigurationCommandFailure
   'pinned-model.move': WorkspaceSettingSavedResult | ConfigurationCommandFailure
-  'pinned-model.clear': WorkspaceSettingSavedResult | ConfigurationCommandFailure
-  'recent-model.bump': WorkspaceSettingSavedResult | ConfigurationCommandFailure
   'recent-model.clear': WorkspaceSettingSavedResult | ConfigurationCommandFailure
   'sidebar-preference.set-sort': WorkspaceSettingSavedResult | ConfigurationCommandFailure
   'sidebar-preference.set-folder-collapsed':
@@ -717,10 +683,6 @@ interface ConfigurationDomainResultMap {
     | ChatPresetSavedResult
     | ResultOfKind<'configuration-noop'>
     | ConfigurationCommandFailure
-  'chat-preset.touch':
-    | ChatPresetSavedResult
-    | ResultOfKind<'configuration-noop'>
-    | ConfigurationCommandFailure
   'chat-preset.delete':
     | ChatPresetSavedResult
     | ResultOfKind<'configuration-noop'>
@@ -738,9 +700,6 @@ interface ConfigurationDomainResultMap {
   'prompt-preset.overwrite-and-pin': PromptPresetSavedResult | ConfigurationCommandFailure
   'prompt-preset.create-and-pin': PromptPresetSavedResult | ConfigurationCommandFailure
   'prompt-preset.rename': PromptPresetSavedResult | ConfigurationCommandFailure
-  'prompt-preset.put': PromptPresetSavedResult | ConfigurationCommandFailure
-  'prompt-preset.update': PromptPresetSavedResult | ConfigurationCommandFailure
-  'prompt-preset.touch': PromptPresetSavedResult | ConfigurationCommandFailure
   'prompt-preset.delete': PromptPresetSavedResult | ConfigurationCommandFailure
 }
 
@@ -761,9 +720,8 @@ export type ConfigurationDomainResult<
   Kind extends ConfigurationDomainCommandKind = ConfigurationDomainCommandKind,
 > = ConfigurationDomainResultMap[Kind]
 
-export type ConfigurationDomainHandlerMap<Context, Meta> = {
+export type ConfigurationDomainHandlerMap<Meta> = {
   readonly [Kind in ConfigurationDomainCommandKind]: (
-    context: Context,
     command: ConfigurationDomainCommandMap[Kind],
     meta: Meta,
   ) => Promise<ConfigurationDomainResultMap[Kind]>
@@ -921,7 +879,21 @@ export function profileRequestMaterialChanged(
   return !sameConfigurationValue(profileRequestMaterial(current), profileRequestMaterial(next))
 }
 
-export function configurationLinksForChat(chat: Chat): ConfigurationLink[] {
+type ChatConfigurationLinkSource = Pick<Chat, 'id' | 'settings'> &
+  Partial<Pick<Chat, 'presetId' | 'archived' | 'modelResolution'>>
+
+const CHAT_SETTINGS_PROMPT_PRESET_LINK_SLOTS = Object.freeze([
+  ['system-prompt', 'systemPromptPresetId'],
+  ['append-prompt', 'appendPromptPresetId'],
+  ['continue-system-prompt', 'continueSystemPromptPresetId'],
+  ['continue-user-prompt', 'continueUserPromptPresetId'],
+  ['prefill-prompt', 'defaultPrefillPresetId'],
+] as const)
+
+export const CHAT_CONFIGURATION_LINK_SLOT_LIMIT =
+  1 + 1 + CHAT_SETTINGS_PROMPT_PRESET_LINK_SLOTS.length + 1 + 1
+
+export function configurationLinksForChat(chat: ChatConfigurationLinkSource): ConfigurationLink[] {
   const links = configurationLinksForSettings(
     'chat',
     chat.id,
@@ -944,7 +916,7 @@ export function configurationLinksForChat(chat: Chat): ConfigurationLink[] {
   return links
 }
 
-export function chatConfigurationTargetResourceNames(chat: Chat): string[] {
+export function chatConfigurationTargetResourceNames(chat: ChatConfigurationLinkSource): string[] {
   return configurationTargetResourceNamesForLinks(configurationLinksForChat(chat))
 }
 
@@ -967,20 +939,15 @@ function configurationLinksForSettings(
   profileId = settings.profileId,
   ownerActive = true,
 ): ConfigurationLink[] {
-  const links = [
-    configurationLink(ownerKind, ownerId, 'profile', profileId, 'profile', ownerActive),
-  ]
+  const links: ConfigurationLink[] = []
+  if (profileId.length > 0) {
+    links.push(configurationLink(ownerKind, ownerId, 'profile', profileId, 'profile', ownerActive))
+  }
   if (ownerKind === 'chat' && presetId) {
     links.push(configurationLink(ownerKind, ownerId, 'chat-preset', presetId, 'breadcrumb'))
   }
-  const pins: Array<[string, PromptPresetId | undefined]> = [
-    ['system-prompt', settings.systemPromptPresetId],
-    ['append-prompt', settings.appendPromptPresetId],
-    ['continue-system-prompt', settings.continueSystemPromptPresetId],
-    ['continue-user-prompt', settings.continueUserPromptPresetId],
-    ['prefill-prompt', settings.defaultPrefillPresetId],
-  ]
-  for (const [slot, promptPresetId] of pins) {
+  for (const [slot, field] of CHAT_SETTINGS_PROMPT_PRESET_LINK_SLOTS) {
+    const promptPresetId: PromptPresetId | undefined = settings[field]
     if (promptPresetId) {
       links.push(configurationLink(ownerKind, ownerId, 'prompt-preset', promptPresetId, slot))
     }

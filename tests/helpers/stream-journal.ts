@@ -142,6 +142,7 @@ export async function appendTestStreamJournalEvents(
     getWorkspaceRepository().execute(permit, {
       kind: 'stream.append-journal-frames',
       frames,
+      observedAt: lease.startedAt + events.length + 1,
     }),
   )
 }

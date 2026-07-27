@@ -37,6 +37,26 @@ export interface PresetOrderMembershipRow {
   readonly blockId: string
 }
 
+export interface PresetOrderMutationReceipt {
+  readonly presetId: PresetId
+  readonly changed: boolean
+  readonly reads: readonly PresetOrderPhysicalRead[]
+  readonly mutations: readonly PresetOrderPhysicalMutation[]
+}
+
+export interface PresetOrderPhysicalRead {
+  readonly tableName: 'presetOrderState' | 'presetOrderBlocks' | 'presetOrderMembership'
+  readonly operation: 'get' | 'get-many'
+  readonly requestCount: number
+  readonly rowCount: number
+}
+
+export interface PresetOrderPhysicalMutation {
+  readonly tableName: 'presetOrderState' | 'presetOrderBlocks' | 'presetOrderMembership'
+  readonly operation: 'write' | 'delete'
+  readonly key: string
+}
+
 interface MutablePresetOrderState {
   id: typeof PRESET_ORDER_STATE_ID
   revision: number
@@ -67,8 +87,11 @@ export function emptyPresetOrderState(): PresetOrderStateRow {
   }
 }
 
-export async function bumpPresetCatalogRevision(tx: Transaction): Promise<void> {
-  if (!claimPresetCatalogRevision(tx)) return
+export async function bumpPresetCatalogRevision(
+  tx: Transaction,
+  presetId: PresetId,
+): Promise<PresetOrderMutationReceipt> {
+  if (!claimPresetCatalogRevision(tx)) return emptyPresetOrderMutationReceipt(presetId)
   const table = tx.table<PresetOrderStateRow, typeof PRESET_ORDER_STATE_ID>('presetOrderState')
   const current = await table.get(PRESET_ORDER_STATE_ID)
   if (!current) throw new Error('PresetOrderStateMissing')
@@ -78,9 +101,33 @@ export async function bumpPresetCatalogRevision(tx: Transaction): Promise<void> 
     { ...current, revision: current.revision + 1 },
     current,
   )
+  const reads: readonly PresetOrderPhysicalRead[] = Object.freeze([
+    {
+      tableName: 'presetOrderState',
+      operation: 'get',
+      requestCount: 1,
+      rowCount: 1,
+    },
+  ])
+  const mutations: readonly PresetOrderPhysicalMutation[] = Object.freeze([
+    {
+      tableName: 'presetOrderState',
+      operation: 'write',
+      key: PRESET_ORDER_STATE_ID,
+    },
+  ])
+  return Object.freeze({
+    presetId,
+    changed: true,
+    reads,
+    mutations,
+  })
 }
 
-export async function appendPresetOrderEntry(tx: Transaction, presetId: PresetId): Promise<void> {
+export async function appendPresetOrderEntry(
+  tx: Transaction,
+  presetId: PresetId,
+): Promise<PresetOrderMutationReceipt> {
   const mutation = new PresetOrderMutation(tx)
   if (await mutation.locate(presetId)) throw new Error(`PresetOrderMembershipDuplicate:${presetId}`)
   await mutation.bumpCatalogRevision()
@@ -89,15 +136,16 @@ export async function appendPresetOrderEntry(tx: Transaction, presetId: PresetId
     ? ((await mutation.loadBlock(state.tailBlockId)).presetIds.at(-1) ?? null)
     : null
   await mutation.insertAfter(presetId, afterPresetId, true)
-  await mutation.commit()
+  const receipt = await mutation.commit(presetId)
   recordPresetOrderChanged(tx, presetId)
+  return receipt
 }
 
 export async function movePresetOrderEntry(
   tx: Transaction,
   presetId: PresetId,
   afterPresetId: PresetId | null,
-): Promise<boolean> {
+): Promise<PresetOrderMutationReceipt> {
   const mutation = new PresetOrderMutation(tx)
   const current = await mutation.locate(presetId)
   if (!current) throw new Error(`PresetOrderMembershipMissing:${presetId}`)
@@ -105,23 +153,38 @@ export async function movePresetOrderEntry(
   if (afterPresetId && !(await mutation.locate(afterPresetId))) {
     throw new Error(`PresetOrderAnchorMissing:${afterPresetId}`)
   }
-  if ((await mutation.predecessor(current)) === afterPresetId) return false
+  if ((await mutation.predecessor(current)) === afterPresetId) {
+    return mutation.receipt(presetId, [])
+  }
   await mutation.bumpCatalogRevision()
   await mutation.removeLocated(current, false)
   await mutation.insertAfter(presetId, afterPresetId, false)
-  await mutation.commit()
+  const receipt = await mutation.commit(presetId)
   recordPresetOrderChanged(tx, presetId)
-  return true
+  return receipt
 }
 
-export async function removePresetOrderEntry(tx: Transaction, presetId: PresetId): Promise<void> {
+export async function removePresetOrderEntry(
+  tx: Transaction,
+  presetId: PresetId,
+): Promise<PresetOrderMutationReceipt> {
   const mutation = new PresetOrderMutation(tx)
   const current = await mutation.locate(presetId)
   if (!current) throw new Error(`PresetOrderMembershipMissing:${presetId}`)
   await mutation.bumpCatalogRevision()
   await mutation.removeLocated(current, true)
-  await mutation.commit()
+  const receipt = await mutation.commit(presetId)
   recordPresetOrderChanged(tx, presetId)
+  return receipt
+}
+
+export function emptyPresetOrderMutationReceipt(presetId: PresetId): PresetOrderMutationReceipt {
+  return Object.freeze({
+    presetId,
+    changed: false,
+    reads: Object.freeze([]),
+    mutations: Object.freeze([]),
+  })
 }
 
 export async function buildPresetOrderOnEmptyTables(
@@ -265,6 +328,11 @@ class PresetOrderMutation {
   private state: MutablePresetOrderState | undefined
   private readonly originalBlocks = new Map<string, PresetOrderBlockRow | undefined>()
   private readonly blocks = new Map<string, MutablePresetOrderBlock | null>()
+  private stateGetRequests = 0
+  private blockGetRequests = 0
+  private membershipGetRequests = 0
+  private membershipGetManyRequests = 0
+  private membershipGetManyRows = 0
 
   constructor(tx: Transaction) {
     this.tx = tx
@@ -272,6 +340,7 @@ class PresetOrderMutation {
 
   async loadState(): Promise<MutablePresetOrderState> {
     if (this.state) return this.state
+    this.stateGetRequests += 1
     const current = await this.tx
       .table<PresetOrderStateRow, typeof PRESET_ORDER_STATE_ID>('presetOrderState')
       .get(PRESET_ORDER_STATE_ID)
@@ -293,6 +362,7 @@ class PresetOrderMutation {
       if (!loaded) throw new Error(`PresetOrderBlockDeleted:${blockId}`)
       return loaded
     }
+    this.blockGetRequests += 1
     const current = await this.tx
       .table<PresetOrderBlockRow, string>('presetOrderBlocks')
       .get(blockId)
@@ -309,6 +379,7 @@ class PresetOrderMutation {
       const index = block.presetIds.indexOf(presetId)
       if (index >= 0) return { block, index }
     }
+    this.membershipGetRequests += 1
     const membership = await this.tx
       .table<PresetOrderMembershipRow, PresetId>('presetOrderMembership')
       .get(presetId)
@@ -369,7 +440,8 @@ class PresetOrderMutation {
     }
   }
 
-  async commit(): Promise<void> {
+  async commit(presetId: PresetId): Promise<PresetOrderMutationReceipt> {
+    const mutations: PresetOrderPhysicalMutation[] = []
     const state = this.state
     if (state && (!this.originalState || !sameState(this.originalState, state))) {
       await putPhysicalStorageRow(
@@ -378,6 +450,11 @@ class PresetOrderMutation {
         Object.freeze({ ...state }),
         this.originalState,
       )
+      mutations.push({
+        tableName: 'presetOrderState',
+        operation: 'write',
+        key: PRESET_ORDER_STATE_ID,
+      })
     }
 
     const affectedPresetIds = new Set<PresetId>()
@@ -388,9 +465,19 @@ class PresetOrderMutation {
       if (!current) {
         if (previous) {
           await deletePhysicalStorageRows(this.tx, 'presetOrderBlocks', [blockId], [previous])
+          mutations.push({
+            tableName: 'presetOrderBlocks',
+            operation: 'delete',
+            key: blockId,
+          })
         }
       } else if (!previous || !sameBlock(previous, current)) {
         await putPhysicalStorageRow(this.tx, 'presetOrderBlocks', frozenBlock(current), previous)
+        mutations.push({
+          tableName: 'presetOrderBlocks',
+          operation: 'write',
+          key: blockId,
+        })
       }
     }
 
@@ -398,6 +485,8 @@ class PresetOrderMutation {
     const membershipTable = this.tx.table<PresetOrderMembershipRow, PresetId>(
       'presetOrderMembership',
     )
+    this.membershipGetManyRequests += 1
+    this.membershipGetManyRows += affected.length
     const previousMemberships = await membershipTable.bulkGet(affected)
     const nextMemberships = new Map<PresetId, PresetOrderMembershipRow>()
     for (const block of this.blocks.values()) {
@@ -428,6 +517,64 @@ class PresetOrderMutation {
     }
     await putPhysicalStorageRows(this.tx, 'presetOrderMembership', puts, replaced)
     await deletePhysicalStorageRows(this.tx, 'presetOrderMembership', deletes, deletedRows)
+    mutations.push(
+      ...puts.map(({ presetId: changedPresetId }) => ({
+        tableName: 'presetOrderMembership' as const,
+        operation: 'write' as const,
+        key: changedPresetId,
+      })),
+      ...deletes.map((changedPresetId) => ({
+        tableName: 'presetOrderMembership' as const,
+        operation: 'delete' as const,
+        key: changedPresetId,
+      })),
+    )
+    return this.receipt(presetId, mutations)
+  }
+
+  receipt(
+    presetId: PresetId,
+    mutations: readonly PresetOrderPhysicalMutation[],
+  ): PresetOrderMutationReceipt {
+    const reads: PresetOrderPhysicalRead[] = []
+    if (this.stateGetRequests > 0) {
+      reads.push({
+        tableName: 'presetOrderState',
+        operation: 'get',
+        requestCount: this.stateGetRequests,
+        rowCount: this.stateGetRequests,
+      })
+    }
+    if (this.blockGetRequests > 0) {
+      reads.push({
+        tableName: 'presetOrderBlocks',
+        operation: 'get',
+        requestCount: this.blockGetRequests,
+        rowCount: this.blockGetRequests,
+      })
+    }
+    if (this.membershipGetRequests > 0) {
+      reads.push({
+        tableName: 'presetOrderMembership',
+        operation: 'get',
+        requestCount: this.membershipGetRequests,
+        rowCount: this.membershipGetRequests,
+      })
+    }
+    if (this.membershipGetManyRequests > 0) {
+      reads.push({
+        tableName: 'presetOrderMembership',
+        operation: 'get-many',
+        requestCount: this.membershipGetManyRequests,
+        rowCount: this.membershipGetManyRows,
+      })
+    }
+    return Object.freeze({
+      presetId,
+      changed: mutations.length > 0,
+      reads: Object.freeze(reads),
+      mutations: Object.freeze([...mutations]),
+    })
   }
 
   private createBlock(

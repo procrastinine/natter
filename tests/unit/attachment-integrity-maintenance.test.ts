@@ -239,6 +239,7 @@ async function reconcilePage(limit: number): Promise<AttachmentIntegrityMaintena
   return (await execute({
     kind: 'maintenance.reconcile-attachment-integrity',
     limit,
+    now: Date.now(),
   })) as AttachmentIntegrityMaintenanceResult
 }
 

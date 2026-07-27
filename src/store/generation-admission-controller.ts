@@ -6,7 +6,8 @@ import {
   pendingGenerationCapability,
   unavailableGenerationCapability,
 } from '../core/interaction-capability'
-import type { AttachmentRef, ChatId, ContentItem, MessageId } from '../core/types'
+import { UNKNOWN_INBOUND_REASONING_VISIBILITY } from '../core/reasoning'
+import type { AttachmentRef, ChatId, ContentItem, Message, MessageId } from '../core/types'
 import { newId } from '../lib/ulid'
 import {
   type AttemptTargetAdmissionClaim,
@@ -161,6 +162,10 @@ export interface GenerationAdmissionPayload {
         readonly kind: 'chat'
         readonly chatId: ChatId
         readonly configurationVersion: number
+        readonly configurationLinkTransition: {
+          readonly expectedResourceNames: readonly string[]
+          readonly nextResourceNames: readonly string[]
+        }
       })
   readonly promptPath: GenerationPromptPathProof
   readonly promptMaterial: GenerationPromptMaterialLease
@@ -375,6 +380,27 @@ class TabGenerationAdmissionController implements GenerationAdmissionController 
         }),
         targetClaim,
       })
+      if (
+        claim.strategy !== 'continue' &&
+        claim.strategy !== 'new-chat-send' &&
+        capturedIntent.kind !== 'continue' &&
+        capturedIntent.kind !== 'new-chat-send'
+      ) {
+        const messages = generationIntentPresentationMessages({
+          claim,
+          intent: capturedIntent,
+          baseLeafId: capturedPrompt.proof.claim.leafId,
+          model: configuration.settings.model,
+          createdAt: Date.now(),
+        })
+        const destination = conversationController.resolveOperationDestination(claim.steering)
+        if (messages.length > 0 && destination.kind === 'ready') {
+          conversationController.presentGenerationIntent(claim.steering, {
+            baseLeafId: destination.expectedLeafId,
+            messages,
+          })
+        }
+      }
       if (selectedAdmission) {
         configurationController.cancelSelectedGenerationConfiguration(
           selectedAdmission.configuration,
@@ -624,6 +650,7 @@ function captureGenerationConfiguration(
     kind: 'chat' as const,
     chatId,
     configurationVersion: resolution.configurationVersion,
+    configurationLinkTransition: resolution.configurationLinkTransition,
     ...claim,
   })
 }
@@ -668,6 +695,113 @@ function releaseAdmissionTargetClaim(state: GenerationAdmissionState): void {
   if (!state.targetClaim) return
   attemptController.releaseTargetClaim(state.targetClaim)
   state.targetClaim = null
+}
+
+function generationIntentPresentationMessages(input: {
+  readonly claim: Exclude<
+    GenerationAdmissionClaim,
+    { readonly strategy: 'continue' | 'new-chat-send' }
+  >
+  readonly intent: Exclude<ExistingChatGenerationIntent, { readonly kind: 'continue' }>
+  readonly baseLeafId: MessageId | null
+  readonly model: string
+  readonly createdAt: number
+}): readonly Message[] {
+  if (!input.model) return Object.freeze([])
+  const user = input.claim.userMessageId
+    ? preparedUserMessage({
+        id: input.claim.userMessageId,
+        chatId: input.claim.chatId,
+        content:
+          input.intent.kind === 'send' || input.intent.kind === 'edit-resend'
+            ? input.intent.content
+            : [],
+        ...(input.intent.kind === 'send' || input.intent.kind === 'edit-resend'
+          ? input.intent.attachmentRefs
+            ? { attachmentRefs: input.intent.attachmentRefs }
+            : {}
+          : {}),
+        createdAt: input.createdAt,
+      })
+    : undefined
+  const visualUser = user
+    ? Object.freeze({
+        ...user,
+        parentId: input.baseLeafId,
+        siblingIndex: 0,
+      })
+    : undefined
+  const assistant = preparedAssistantMessage({
+    id: input.claim.assistantMessageId,
+    chatId: input.claim.chatId,
+    content: input.intent.prefillContent ?? [],
+    model: input.model,
+    createdAt: input.createdAt,
+  })
+  const visualAssistant = Object.freeze({
+    ...assistant,
+    parentId: visualUser?.id ?? input.baseLeafId,
+    siblingIndex: 0,
+    ...(visualUser ? { turnId: visualUser.turnId, turnIndex: visualUser.turnIndex + 1 } : {}),
+  })
+  return Object.freeze([...(visualUser ? [visualUser] : []), visualAssistant])
+}
+
+export function preparedUserMessage(input: {
+  id: MessageId
+  chatId: ChatId
+  content: readonly ContentItem[]
+  attachmentRefs?: readonly AttachmentRef[]
+  createdAt: number
+}): Message {
+  return {
+    id: input.id,
+    chatId: input.chatId,
+    parentId: null,
+    siblingIndex: 0,
+    turnId: newId(),
+    turnIndex: 0,
+    createdAt: input.createdAt,
+    role: 'user',
+    origin: 'user',
+    content: structuredClone([...input.content]),
+    ...(input.attachmentRefs ? { attachmentRefs: structuredClone([...input.attachmentRefs]) } : {}),
+    nodeVersion: 0,
+    deleted: false,
+  }
+}
+
+export function preparedAssistantMessage(input: {
+  id: MessageId
+  chatId: ChatId
+  content: readonly ContentItem[]
+  model: string
+  createdAt: number
+}): Message {
+  return {
+    id: input.id,
+    chatId: input.chatId,
+    parentId: null,
+    siblingIndex: 0,
+    turnId: newId(),
+    turnIndex: 0,
+    createdAt: input.createdAt,
+    role: 'assistant',
+    origin: 'generated',
+    content: structuredClone([...input.content]),
+    generation: {
+      model: input.model,
+      requestedModel: input.model,
+      status: 'preparing',
+      integrity: 'clean',
+      costSource: 'stream',
+      startedAt: input.createdAt,
+      reasoningCarryForward: 'none',
+      reasoningVisibility: UNKNOWN_INBOUND_REASONING_VISIBILITY,
+    },
+    nodeVersion: 0,
+    deleted: false,
+  }
 }
 
 function generationAdmissionErrorFor(capability: GenerationCapability): GenerationAdmissionError {

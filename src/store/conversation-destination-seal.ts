@@ -1,4 +1,5 @@
 import type { Transaction } from 'dexie'
+import type { ActiveBranchForkSlot } from '../core/active-branch-spine'
 import { readLiveBranchPath } from '../core/branch-session'
 import type {
   ConversationProvedSelection,
@@ -7,6 +8,7 @@ import type {
 } from '../core/messages'
 import { TreeChangedError } from '../core/tree-ops'
 import type { Chat, MessageId } from '../core/types'
+import { readActiveBranchForkSlotsForHeadersInTransaction } from './active-branch-fork-storage'
 import { canonicalMessageHeaderRow, type MessageHeaderRow } from './message-storage'
 
 export interface ConversationSelectionProofInput {
@@ -14,6 +16,7 @@ export interface ConversationSelectionProofInput {
   readonly target: ConversationSelectionProofTarget
   readonly tipId: MessageId | null
   readonly exactPathHeaders?: readonly MessageHeaderRow[]
+  readonly forks?: readonly ActiveBranchForkSlot[]
   readonly presentations?: readonly MessagePresentation[]
   readonly snapshotOwnership?: 'clone' | 'adopt'
 }
@@ -22,8 +25,8 @@ export async function proveConversationSelectionInTransaction(
   tx: Transaction,
   input: ConversationSelectionProofInput,
 ): Promise<ConversationProvedSelection> {
-  const { chat, tipId, exactPathHeaders } = input
-  let pathHeaders = exactPathHeaders
+  const { chat, tipId } = input
+  let pathHeaders = input.exactPathHeaders
   if (tipId !== null && !pathHeaders) {
     const messages = tx.table<MessageHeaderRow, MessageId>('messages')
     const result = await readLiveBranchPath({
@@ -36,15 +39,20 @@ export async function proveConversationSelectionInTransaction(
     }
     pathHeaders = result.rows
   }
+  const exactPathHeaders = pathHeaders ?? Object.freeze([])
+  const forks =
+    input.forks ?? (await readActiveBranchForkSlotsForHeadersInTransaction(tx, exactPathHeaders))
   return proveConversationSelectionFromExactPath({
     ...input,
-    exactPathHeaders: pathHeaders ?? Object.freeze([]),
+    exactPathHeaders,
+    forks,
   })
 }
 
 export function proveConversationSelectionFromExactPath(
   input: ConversationSelectionProofInput & {
     readonly exactPathHeaders: readonly MessageHeaderRow[]
+    readonly forks: readonly ActiveBranchForkSlot[]
   },
 ): ConversationProvedSelection {
   const {
@@ -52,12 +60,13 @@ export function proveConversationSelectionFromExactPath(
     target,
     tipId,
     exactPathHeaders,
+    forks,
     presentations = [],
     snapshotOwnership = 'clone',
   } = input
   const ownedChat = snapshotOwnership === 'adopt' ? chat : structuredClone(chat)
   if (tipId === null) {
-    if (exactPathHeaders.length > 0 || presentations.length > 0) {
+    if (exactPathHeaders.length > 0 || presentations.length > 0 || forks.length > 0) {
       throw new TreeChangedError(chat.id, 'empty committed branch contains rows')
     }
     return Object.freeze({
@@ -71,6 +80,7 @@ export function proveConversationSelectionFromExactPath(
         pathHeaders: Object.freeze([]),
       }),
       presentations: Object.freeze([]),
+      forks: Object.freeze([]),
     })
   }
 
@@ -94,6 +104,15 @@ export function proveConversationSelectionFromExactPath(
   const tipHeader = pathHeaders.at(-1)
   if (!tipHeader || tipHeader.id !== tipId) {
     throw new TreeChangedError(chat.id, `committed tip ${tipId} unavailable`)
+  }
+  if (
+    forks.length !== pathHeaders.length ||
+    forks.some((fork, index) => {
+      const header = pathHeaders[index]
+      return !header || fork.selectedMessageId !== header.id || fork.parentId !== header.parentId
+    })
+  ) {
+    throw new TreeChangedError(chat.id, `committed fork frame ${tipId} unavailable`)
   }
 
   const exactPresentations: MessagePresentation[] = []
@@ -133,5 +152,6 @@ export function proveConversationSelectionFromExactPath(
     target,
     proof,
     presentations: Object.freeze(exactPresentations),
+    forks: Object.freeze(forks.map((fork) => Object.freeze({ ...fork }))),
   })
 }

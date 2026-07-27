@@ -13,7 +13,6 @@ import type {
   MessageId,
   TokenCalibrationSample,
 } from '../core/types'
-import { sameOrderedValues } from '../lib/same-value'
 import { deleteAttachmentReferenceEdgesForChats } from './attachment-reference-edges'
 import {
   deleteChatAuxiliaryByteOwners,
@@ -23,12 +22,9 @@ import {
   putTokenCalibrationSettingByteOwner,
 } from './byte-owner-mutation'
 import { deleteChatSidebarProjections } from './chat-sidebar-projection'
-import { chatConfigurationTargetResourceNames } from './configuration-domain-contract'
 import { CONFIGURATION_LINK_MUTATION_TRANSACTION_CAPABILITY } from './configuration-profile-usage-projection'
-import type { NatterDb } from './db'
 import type { SettingsRow } from './db-rows'
 import { exactCompoundPrefixBetween } from './indexeddb-key-ranges'
-import { normalizeNamedLocks } from './locks'
 import type { MessageHeaderRow } from './message-storage'
 import {
   type CapabilityTables,
@@ -74,80 +70,56 @@ export interface DeleteChatClosureResult {
   readonly affectedAttachmentIds: readonly AttachmentId[]
 }
 
-export interface EmptyDraftChatClosurePlanEntry {
-  readonly chatId: ChatId
-  readonly configurationResourceNames: readonly string[]
-}
-
-export class ChatClosurePlanChangedError extends Error {}
-
-export async function planEmptyDraftChatClosure(
-  db: NatterDb,
-  chatIds: readonly ChatId[],
-  staleBefore: number | undefined,
-): Promise<readonly EmptyDraftChatClosurePlanEntry[]> {
-  const rows = await db.chats.bulkGet([...new Set(chatIds)])
-  return rows.flatMap((chat) => {
-    if (!chat || !isEmptyMaterializedDraftChat(chat, staleBefore)) return []
-    return [
-      {
-        chatId: chat.id,
-        configurationResourceNames: normalizeNamedLocks(chatConfigurationTargetResourceNames(chat)),
-      },
-    ]
-  })
-}
-
-export function emptyDraftChatClosureLockNames(
-  plan: readonly EmptyDraftChatClosurePlanEntry[],
-  extra: readonly string[] = [],
-): string[] {
-  return normalizeNamedLocks([
-    'chat-catalog',
-    'tag-catalog',
-    `setting:${GLOBAL_TOKEN_CALIBRATION_KEY}`,
-    ...extra,
-    ...plan.flatMap((entry) => [
-      `chat-meta:${entry.chatId}`,
-      `draft:${entry.chatId}`,
-      ...entry.configurationResourceNames,
-    ]),
-  ])
-}
-
-export async function deletePlannedEmptyDraftChats(
+export async function deleteEligibleEmptyDraftChatClosure(
   tx: ChatClosureTransaction,
-  plan: readonly EmptyDraftChatClosurePlanEntry[],
+  requestedChatIds: readonly ChatId[],
   staleBefore: number | undefined,
   now: number,
 ): Promise<DeleteChatClosureResult> {
-  const chats = tx.table<Chat, ChatId>('chats')
-  const messages = tx.table<MessageHeaderRow, MessageId>('messages')
-  const drafts = tx.table<DraftRow, ChatId>('drafts')
-  const streams = tx.table<StreamLeaseRow, string>('streamLeases')
-  const edges = tx.table<AttachmentReferenceEdge>('attachmentRefEdges')
-  const eligible: ChatId[] = []
-  for (const entry of plan) {
-    const chat = await chats.get(entry.chatId)
-    if (!chat || !isEmptyMaterializedDraftChat(chat, staleBefore)) continue
-    if (
-      !sameOrderedValues(
-        entry.configurationResourceNames,
-        normalizeNamedLocks(chatConfigurationTargetResourceNames(chat)),
-      )
-    ) {
-      throw new ChatClosurePlanChangedError()
-    }
-    const [message, draft, stream, edge] = await Promise.all([
-      messages.where('chatId').equals(entry.chatId).first(),
-      drafts.get(entry.chatId),
-      streams.where('chatId').equals(entry.chatId).first(),
-      edges.where('chatId').equals(entry.chatId).first(),
-    ])
-    if (message || !isEmptyDraftRow(draft) || stream || edge) continue
-    eligible.push(entry.chatId)
-  }
-  return deleteChatClosure(tx, eligible, now)
+  const uniqueIds = [...new Set(requestedChatIds)]
+  if (uniqueIds.length === 0) return emptyDeleteChatClosureResult()
+  const rows = await tx.table<Chat, ChatId>('chats').bulkGet(uniqueIds)
+  const candidates = rows.filter(
+    (chat): chat is Chat => chat !== undefined && isEmptyMaterializedDraftChat(chat, staleBefore),
+  )
+  if (candidates.length === 0) return emptyDeleteChatClosureResult()
+  const candidateIds = candidates.map((chat) => chat.id)
+  const [messageChatIds, drafts, edgeChatIds] = await Promise.all([
+    tx
+      .table<MessageHeaderRow, MessageId>('messages')
+      .where('chatId')
+      .anyOf(candidateIds)
+      .uniqueKeys() as Promise<ChatId[]>,
+    tx.table<DraftRow, ChatId>('drafts').bulkGet(candidateIds),
+    tx
+      .table<AttachmentReferenceEdge>('attachmentRefEdges')
+      .where('chatId')
+      .anyOf(candidateIds)
+      .uniqueKeys() as Promise<ChatId[]>,
+  ])
+  const messageChats = new Set(messageChatIds)
+  const edgeChats = new Set(edgeChatIds)
+  const eligible = candidates.filter(
+    (chat, index) =>
+      !messageChats.has(chat.id) && !edgeChats.has(chat.id) && isEmptyDraftRow(drafts[index]),
+  )
+  return deleteKnownChatClosure(tx, eligible, now, 'skip')
+}
+
+export async function deleteArchivedChatClosure(
+  tx: ChatClosureTransaction,
+  requestedChatIds: readonly ChatId[],
+  now: number,
+): Promise<DeleteChatClosureResult> {
+  const uniqueIds = [...new Set(requestedChatIds)]
+  if (uniqueIds.length === 0) return emptyDeleteChatClosureResult()
+  const rows = await tx.table<Chat, ChatId>('chats').bulkGet(uniqueIds)
+  return deleteKnownChatClosure(
+    tx,
+    rows.filter((chat): chat is Chat => chat?.archived === true),
+    now,
+    'reject',
+  )
 }
 
 function isEmptyDraftRow(draft: DraftRow | undefined): boolean {
@@ -176,20 +148,36 @@ export async function deleteChatClosure(
 ): Promise<DeleteChatClosureResult> {
   const uniqueIds = [...new Set(requestedChatIds)]
   if (uniqueIds.length === 0) return emptyDeleteChatClosureResult()
-  const chatTable = tx.table<Chat, ChatId>('chats')
-  const chats = (await chatTable.bulkGet(uniqueIds)).filter(
+  const chats = (await tx.table<Chat, ChatId>('chats').bulkGet(uniqueIds)).filter(
     (chat): chat is Chat => chat !== undefined,
   )
+  return deleteKnownChatClosure(tx, chats, now, 'reject')
+}
+
+async function deleteKnownChatClosure(
+  tx: ChatClosureTransaction,
+  candidates: readonly Chat[],
+  now: number,
+  activeLeasePolicy: 'reject' | 'skip',
+): Promise<DeleteChatClosureResult> {
+  if (candidates.length === 0) return emptyDeleteChatClosureResult()
+  const candidateIds = candidates.map((chat) => chat.id)
+  const activeLeases = await tx
+    .table<StreamLeaseRow, string>('streamLeases')
+    .where('chatId')
+    .anyOf(candidateIds)
+    .toArray()
+  if (activeLeasePolicy === 'reject' && activeLeases.length > 0) {
+    const activeLease = activeLeases[0] as StreamLeaseRow
+    throw new ChatStreamBusyError(activeLease.chatId, activeLease.streamId)
+  }
+  const leasedChatIds = new Set(activeLeases.map((lease) => lease.chatId))
+  const chats =
+    activeLeasePolicy === 'skip'
+      ? candidates.filter((chat) => !leasedChatIds.has(chat.id))
+      : [...candidates]
   if (chats.length === 0) return emptyDeleteChatClosureResult()
   const deletedChatIds = chats.map((chat) => chat.id)
-  for (const chatId of deletedChatIds) {
-    const activeLease = await tx
-      .table<StreamLeaseRow, string>('streamLeases')
-      .where('[chatId+streamId]')
-      .between(...exactCompoundPrefixBetween([chatId]))
-      .first()
-    if (activeLease) throw new ChatStreamBusyError(chatId, activeLease.streamId)
-  }
 
   const affectedAttachmentIds = await deleteAttachmentReferenceEdgesForChats(
     tx,
@@ -228,10 +216,10 @@ export async function deleteChatClosure(
       kind: 'orphan-chat-closure',
       chatIds: deletedChatIds,
     })
-    if (retired.outcome === 'ineligible') {
+    if (retired.result.outcome === 'ineligible') {
       throw new Error('OrphanStreamJournalLeasePresent')
     }
-    if (retired.done) break
+    if (retired.result.done) break
   }
   await deleteChatAuxiliaryByteOwners(tx, { chatIds: deletedChatIds, messageBodyProjectionBytes })
   for (const chatId of deletedChatIds) {

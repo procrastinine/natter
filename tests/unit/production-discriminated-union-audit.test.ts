@@ -184,7 +184,6 @@ describe('production discriminated-union meta-audit', () => {
     expect(baseline.constructionGaps.map((gap) => gap.id)).toEqual(
       expect.arrayContaining([
         'src/store/attempt-controller.ts#AttemptRecord|kind',
-        'src/store/browser-configuration-domain.ts#PreparedConfigurationCommand|kind',
         'src/store/configuration-controller.ts#ConfigurationFrameRetention|kind',
         'src/store/conversation-controller.ts#ConversationOperationClaim|steering',
         'src/store/conversation-controller.ts#SelectingConversationOperationClaim|selectionDelivery',

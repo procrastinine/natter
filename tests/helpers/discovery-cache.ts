@@ -1,5 +1,4 @@
 import Dexie from 'dexie'
-import { normalizeModelsResponse } from '../../src/api/providers'
 import { modelsCacheKey } from '../../src/core/cache-keys'
 import type { ModelsQuery, ProfileId } from '../../src/core/types'
 import { getDb } from '../../src/store/db'
@@ -28,7 +27,6 @@ export function putCachedModels(
         fetchedAt,
         payload,
       },
-      modelIds: normalizeModelsResponse(payload).map((model) => model.id),
       guard: { expectedProfileRevision: snapshot.revision },
     })
   })

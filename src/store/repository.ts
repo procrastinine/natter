@@ -22,6 +22,7 @@ import type {
   AttachmentId,
   AttachmentJob,
   AttachmentKind,
+  AttachmentMissingReason,
   AttachmentOrigin,
   AttachmentReferenceEdge,
   AttachmentStorage,
@@ -87,6 +88,27 @@ export class ChatMissingError extends Error {
     this.chatId = chatId
   }
 }
+
+export type StorageMaintenanceTaskKind =
+  | 'recover-compaction-intents'
+  | 'clean-replacement-database'
+  | 'reconcile-attachment-integrity'
+  | 'reconcile-stream-integrity'
+  | 'reclaim-inactive-databases'
+  | 'reap-attachments'
+  | 'prune-terminal-streams'
+  | 'prune-empty-drafts'
+  | 'prune-discovery-cache'
+  | 'compact-workspace'
+
+export type StorageMaintenanceRequestTaskKind = Extract<
+  StorageMaintenanceTaskKind,
+  | 'reap-attachments'
+  | 'prune-terminal-streams'
+  | 'prune-empty-drafts'
+  | 'prune-discovery-cache'
+  | 'compact-workspace'
+>
 
 export type BranchTargetUnavailableReason =
   | 'message-missing'
@@ -248,7 +270,12 @@ export interface WorkspaceMutationOptions {
   promoteChatId?: ChatId
   generationReadSet?: GenerationPromptReadSet
   captureGenerationPlanningSnapshot?: boolean
-  configurationLinkChatId?: ChatId
+  planningProfileId?: ProfileId
+  configurationLinkTransition?: {
+    readonly chatId: ChatId
+    readonly expectedResourceNames: readonly string[]
+    readonly nextResourceNames: readonly string[]
+  }
   streamAdmission?: StreamLeaseAdmission
   streamAdmissionPostCommit?: StreamPostCommitEvidence
   streamFence?: {
@@ -269,7 +296,12 @@ export interface WorkspaceMutationOptions {
   }
   expectedAttachmentCatalogRevision?: number
   settingReadKeys?: readonly string[]
-  additionalLockNames?: readonly string[]
+  attachmentContentIdentity?: {
+    readonly attachmentId: AttachmentId
+    readonly contentHash?: string
+    readonly filename: string
+  }
+  storageMaintenanceTasks?: readonly StorageMaintenanceRequestTaskKind[]
   fastCurrentLeafSummaryTarget?: MessageId
 }
 
@@ -836,6 +868,7 @@ export type StreamLeaseAdmission = Pick<
 export interface StreamLeaseHeartbeat {
   streamId: string
   fence: StreamWriteFence
+  expectedRevision: number
   heartbeatAt: number
 }
 
@@ -1009,10 +1042,28 @@ export interface AttachmentJobSummary {
 
 export interface AttachmentBundle {
   attachment: Attachment
-  blobs: AttachmentBlob[]
-  artifacts: AttachmentArtifact[]
-  jobs: AttachmentJob[]
+  blobs: readonly AttachmentBlob[]
+  artifacts: readonly AttachmentArtifact[]
+  jobs: readonly AttachmentJob[]
 }
+
+export type AttachmentBundleWriteMode =
+  | 'put'
+  | 'put-if-absent'
+  | 'dedupe'
+  | 'replace'
+  | 'dedupe-or-replace'
+
+export type AttachmentBundleWriteResult =
+  | {
+      attachmentId: AttachmentId
+      outcome: 'written'
+      attachment: Attachment
+    }
+  | {
+      attachmentId: AttachmentId
+      outcome: 'existing'
+    }
 
 export interface AttachmentDispatchBundle {
   bundle: AttachmentBundle
@@ -1172,12 +1223,24 @@ export interface MutationContext {
     contentHash: string,
     excludeId?: AttachmentId,
   ): Promise<AttachmentId | undefined>
+  writeAttachmentBundle(
+    bundle: AttachmentBundle,
+    mode: AttachmentBundleWriteMode,
+  ): Promise<AttachmentBundleWriteResult>
+  deleteAttachmentIfUnreferenced(
+    attachmentId: AttachmentId,
+  ): Promise<{ deleted: boolean; refs: { messages: number; drafts: number } }>
   putAttachment(attachment: Attachment): Promise<void>
   deleteAttachment(attachmentId: AttachmentId): Promise<void>
   countAttachmentReferences(
     attachmentId: AttachmentId,
   ): Promise<{ messages: number; drafts: number; occurrences: number }>
   getAttachmentReferenceEdges(attachmentId: AttachmentId): Promise<AttachmentReferenceEdge[]>
+  deleteAttachmentBytes(
+    attachmentId: AttachmentId,
+    reason: AttachmentMissingReason,
+    now: number,
+  ): Promise<Attachment | undefined>
   deleteAttachmentBlobs(attachmentId: AttachmentId): Promise<void>
   deleteAttachmentArtifacts(attachmentId: AttachmentId): Promise<void>
   deleteAttachmentJobs(attachmentId: AttachmentId): Promise<void>
@@ -1189,7 +1252,10 @@ export interface MutationContext {
   putAttachmentJob(job: AttachmentJob, options?: { affectsWire?: boolean }): Promise<void>
   deleteAttachmentJob(jobId: string): Promise<void>
   getDraft(chatId: ChatId): Promise<DraftRow | undefined>
-  putDraft(draft: DraftRow): Promise<void>
+  putDraft(
+    draft: DraftRow,
+    options?: { readonly validateAttachmentTargets?: boolean },
+  ): Promise<void>
 }
 
 export interface MutationFinalizationContext extends MessageMutationFinalizationContext {

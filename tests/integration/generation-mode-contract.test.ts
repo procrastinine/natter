@@ -35,7 +35,7 @@ import { type MessageBodyRow, splitMessageForStorage } from '../../src/store/mes
 import { getWorkspaceRepository } from '../../src/store/workspace-repository'
 import { runWorkspaceRead } from '../../src/store/workspace-runtime'
 import { CONVERSATION_SESSION_PREFIX } from '../../src/store/workspace-tab-session'
-import { createChat } from '../helpers/chats'
+import { createChat, updateChatForTest } from '../helpers/chats'
 import { putCachedEndpoints, putCachedPrivacyPolicy } from '../helpers/discovery-cache'
 import { installGenerationProfile, startControlledGeneration } from '../helpers/generation-engine'
 import { executeMessageCommand } from '../helpers/message-commands'
@@ -508,6 +508,56 @@ describe('generation mode contract', () => {
       content: [{ type: 'output_text', text: 'regenerated answer' }],
     })
     expect(storedSelection(chat.id)).toEqual({ kind: 'tip', messageId: result.assistantMessageId })
+  })
+
+  it('persists regenerated settings while removing the superseded resolution link', async () => {
+    const chat = await createChat({ settings: settings() })
+    const [, target] = await seedLinear(chat.id, [
+      { role: 'user', text: 'same question' },
+      { role: 'assistant', text: 'old answer' },
+    ])
+    await updateChatForTest(chat.id, {
+      modelResolution: {
+        intentId: 'superseded-resolution',
+        target: {
+          profileId: profile().id,
+          requestRevision: 0,
+          key: { kind: 'missing' },
+        },
+        sourceModelId: CHAT_MODEL,
+        expectedConfigurationVersion: 0,
+      },
+    })
+
+    const result = await run(
+      {
+        kind: 'regenerate',
+        chatId: chat.id,
+        targetAssistantId: required(target, 'target assistant').id,
+        settingsPatch: { systemPrompt: 'persisted by regenerate' },
+      },
+      captureOpen([], 'regenerated answer'),
+    )
+
+    expect(result.error?.message).toBeUndefined()
+    expect(result).toMatchObject({ outcome: 'done' })
+    const stored = await getChat(chat.id)
+    expect(stored).toMatchObject({
+      settings: { systemPrompt: 'persisted by regenerate' },
+    })
+    expect(stored?.modelResolution).toBeUndefined()
+    const links = await getDb()
+      .configurationLinks.where('ownerKey')
+      .equals(`chat:${chat.id}`)
+      .toArray()
+    expect(links.some((link) => link.targetKind === 'model-resolution')).toBe(false)
+    expect(links.filter((link) => link.targetKind === 'profile')).toMatchObject([
+      { targetId: profile().id },
+    ])
+    expect(await getDb().configurationProfileUsageRows.get(profile().id)).toMatchObject({
+      chatCount: 1,
+      activeChatCount: 1,
+    })
   })
 
   it('Continue appends in place while preserving original provenance and tree identity', async () => {

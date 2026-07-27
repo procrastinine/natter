@@ -898,7 +898,11 @@ describe('StorageView', () => {
   })
 
   it('selects and applies a bulk action to every matching chat beyond the retained page', async () => {
-    const seed = buildChat({ id: 'chat-000', title: 'Chat 000', now: 1 })
+    const initial = buildChat({ id: 'chat-000', title: 'Chat 000', now: 1 })
+    const seed: Chat = {
+      ...initial,
+      settings: { ...initial.settings, profileId: 'profile-bulk-selection' },
+    }
     const chats: Chat[] = Array.from({ length: 205 }, (_, index) => ({
       ...seed,
       id: `chat-${index.toString().padStart(3, '0')}`,

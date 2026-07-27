@@ -25,7 +25,7 @@ const skipBuild = process.env.E2E_SKIP_BUILD === '1'
 const outputDir = process.env.E2E_PLAYWRIGHT_OUTPUT_DIR ?? 'test-results/playwright-results'
 const applicationServerCommand = [
   ...(skipBuild ? [] : [`${packageManagerCommand} build`]),
-  `${packageManagerCommand} preview --host ${host} --port ${port} --strictPort`,
+  `${packageManagerCommand} exec vite preview --host ${host} --port ${port} --strictPort`,
 ].join(' && ')
 const devServerCommand = `${packageManagerCommand} dev --host ${host} --port ${devPort} --strictPort`
 const devPreviewParitySpec = /dev-preview-parity\.spec\.ts$/u

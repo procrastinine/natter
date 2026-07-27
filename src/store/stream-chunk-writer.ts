@@ -50,6 +50,7 @@ export const workspaceStreamJournalFrameAppendPort: StreamJournalFrameAppendPort
     await getWorkspaceRepository().execute(permit, {
       kind: 'stream.append-journal-frames',
       frames,
+      observedAt: Date.now(),
     })
   },
 })

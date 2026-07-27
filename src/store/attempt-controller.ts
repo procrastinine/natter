@@ -201,6 +201,7 @@ export interface AttemptController {
     capability: RequestableAttemptStopCapability,
     request: AttemptPendingStopRequest,
   ): AttemptExecutionRecord | undefined
+  resetStopRequest(claimed: AttemptExecutionRecord): boolean
   removeStopRequest(claimed: AttemptExecutionRecord): boolean
   setPhase(streamId: string, phase: AttemptExecutionPhase): AttemptExecutionRecord | undefined
   setLiveProjectionRequester(
@@ -640,6 +641,19 @@ class TabAttemptController implements AttemptController {
   removeStopRequest(claimed: AttemptExecutionRecord): boolean {
     const current = this.getExecution(claimed.streamId)
     return samePendingStopClaim(current, claimed) ? this.remove(current.streamId, current) : false
+  }
+
+  resetStopRequest(claimed: AttemptExecutionRecord): boolean {
+    const current = this.getExecution(claimed.streamId)
+    if (!samePendingStopClaim(current, claimed)) return false
+    return (
+      this.patchExecution(current.streamId, (attempt) =>
+        reduceExecutionRecord(attempt, {
+          phase: attempt.phase,
+          stopIntent: null,
+        }),
+      ) !== undefined
+    )
   }
 
   setPhase(streamId: string, phase: AttemptExecutionPhase): AttemptExecutionRecord | undefined {
@@ -1413,7 +1427,7 @@ function reduceExecutionRecord(
   current: AttemptExecutionRecord,
   input: {
     readonly phase: AttemptExecutionPhase
-    readonly stopIntent?: AttemptStopIntent
+    readonly stopIntent?: AttemptStopIntent | null
   },
 ): AttemptExecutionRecord {
   const lease = current.availability.lease
@@ -1427,7 +1441,7 @@ function reduceExecutionRecord(
     ownershipLock: current.ownershipLock,
     ...(input.stopIntent
       ? { stopIntent: input.stopIntent }
-      : retainedStopIntent
+      : input.stopIntent !== null && retainedStopIntent
         ? { stopIntent: retainedStopIntent }
         : {}),
     wallNow: Date.now(),

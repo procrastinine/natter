@@ -1,3 +1,4 @@
+import { findLastUpdatedLeafId } from '../core/active-path'
 import {
   normalizeContentAnnotations,
   normalizeMessageContentAnnotations,
@@ -21,6 +22,7 @@ import {
   savedTextTemplatesStoredValueIsCanonical,
 } from '../core/text-templates'
 import type {
+  Chat,
   ContentAnnotation,
   ContinuationAttempt,
   ContinuationAttemptApplication,
@@ -76,6 +78,7 @@ export function migrateNatterExportEnvelope(value: unknown): NatterExportEnvelop
     const messages = mapChanged(repairedValue.payload.messages, (message) =>
       normalizeImportedMessageOutcomes(message, contextByChatId.get(message.chatId)),
     )
+    const chats = normalizeWorkspaceChatLeaves(repairedValue.payload.chats, messages)
     const attachments = retainReachableIncomingAttachments(repairedValue.payload.attachments, {
       messages,
       drafts: repairedValue.payload.drafts,
@@ -92,11 +95,13 @@ export function migrateNatterExportEnvelope(value: unknown): NatterExportEnvelop
     }
     const changed =
       messages !== repairedValue.payload.messages ||
+      chats !== repairedValue.payload.chats ||
       attachments !== repairedValue.payload.attachments ||
       settings !== repairedValue.payload.settings
     const payload = changed
       ? refreshedWorkspaceManifest({
           ...repairedValue.payload,
+          chats,
           messages,
           attachments,
           settings,
@@ -261,13 +266,13 @@ function normalizeImportedMessageOutcomes(
   input: Message,
   context: ReasoningAttemptV92Context = {},
 ): Message {
-  const content = normalizeMessageContentAnnotations(
-    input.content,
-    annotationSourceForImportedMessage(input),
-  )
   const normalizedGeneration = input.generation
     ? normalizeImportedGeneration(input.generation)
     : undefined
+  const content = normalizeMessageContentAnnotations(
+    input.content,
+    annotationSourceForApi(normalizedGeneration?.apiUsed),
+  )
   const continuationAttempts = input.continuationAttempts
     ? mapChanged(input.continuationAttempts, (attempt) =>
         normalizeImportedContinuationAttempt(attempt, context),
@@ -316,11 +321,124 @@ function stripImportedServerToolOutputs(
 }
 
 function normalizeImportedGeneration(input: GenerationMeta): GenerationMeta {
-  const outcome = normalizeGenerationMetaOutcome(input)
-  const carryForward = isPersistedReasoningCarryForward(outcome.reasoningCarryForward)
-    ? outcome
-    : { ...outcome, reasoningCarryForward: 'unknown' as const }
+  const transport = normalizeImportedGenerationTransport(input)
+  const outcome = normalizeGenerationMetaOutcome(transport)
+  const terminal =
+    outcome.status === 'preparing' || outcome.status === 'streaming'
+      ? importedInterruptedGeneration(outcome)
+      : outcome
+  const carryForward = isPersistedReasoningCarryForward(terminal.reasoningCarryForward)
+    ? terminal
+    : { ...terminal, reasoningCarryForward: 'unknown' as const }
   return normalizeGenerationReasoningContractV92(carryForward)
+}
+
+const importedGenerationApis = new Set<NonNullable<GenerationMeta['apiUsed']>>([
+  'chat',
+  'responses',
+  'gemini-native',
+  'anthropic-messages',
+  'completion',
+  'video-generation',
+])
+
+const importedGenerationDeliveries = new Set<NonNullable<GenerationMeta['delivery']>>([
+  'streaming',
+  'buffered',
+])
+
+const importedGenerationCostSources = new Set<NonNullable<GenerationMeta['costSource']>>([
+  'stream',
+  'generation-endpoint',
+  'estimated',
+])
+
+function normalizeImportedGenerationTransport(input: GenerationMeta): GenerationMeta {
+  const raw = input as GenerationMeta & Record<string, unknown>
+  const apiUsed = importedGenerationApi(raw.apiUsed)
+  const delivery = importedGenerationDeliveries.has(
+    raw.delivery as NonNullable<GenerationMeta['delivery']>,
+  )
+    ? (raw.delivery as NonNullable<GenerationMeta['delivery']>)
+    : undefined
+  const costSource = importedGenerationCostSources.has(
+    raw.costSource as NonNullable<GenerationMeta['costSource']>,
+  )
+    ? (raw.costSource as NonNullable<GenerationMeta['costSource']>)
+    : undefined
+  const startedAt =
+    typeof raw.startedAt === 'number' && Number.isFinite(raw.startedAt)
+      ? raw.startedAt
+      : typeof raw.finishedAt === 'number' && Number.isFinite(raw.finishedAt)
+        ? raw.finishedAt
+        : 0
+  if (
+    input.apiUsed === apiUsed &&
+    input.delivery === delivery &&
+    input.costSource === costSource &&
+    input.startedAt === startedAt
+  ) {
+    return input
+  }
+  const normalized: GenerationMeta = { ...input, startedAt }
+  if (typeof raw.model !== 'string' || raw.model.length === 0) delete normalized.model
+  if (typeof raw.requestedModel !== 'string' || raw.requestedModel.length === 0) {
+    delete normalized.requestedModel
+  }
+  if (apiUsed === undefined) delete normalized.apiUsed
+  else normalized.apiUsed = apiUsed
+  if (delivery === undefined) delete normalized.delivery
+  else normalized.delivery = delivery
+  if (costSource === undefined) delete normalized.costSource
+  else normalized.costSource = costSource
+  return normalized
+}
+
+function importedGenerationApi(value: unknown): GenerationMeta['apiUsed'] {
+  if (importedGenerationApis.has(value as NonNullable<GenerationMeta['apiUsed']>)) {
+    return value as NonNullable<GenerationMeta['apiUsed']>
+  }
+  if (
+    value === 'openai-responses' ||
+    value === 'openrouter-responses' ||
+    value === 'responses-api'
+  ) {
+    return 'responses'
+  }
+  if (value === 'google' || value === 'gemini' || value === 'google-gemini') {
+    return 'gemini-native'
+  }
+  if (value === 'anthropic' || value === 'claude') return 'anthropic-messages'
+  if (value === 'text') return 'completion'
+  if (value === 'video') return 'video-generation'
+  return undefined
+}
+
+function importedInterruptedGeneration(input: GenerationMeta): GenerationMeta {
+  const generation: GenerationMeta = {
+    ...input,
+    status: 'interrupted',
+    finishedAt: input.finishedAt ?? input.startedAt,
+    abortReason: 'tab-close',
+  }
+  delete generation.error
+  return generation
+}
+
+function normalizeWorkspaceChatLeaves(
+  chats: readonly Chat[],
+  messages: readonly Message[],
+): Chat[] {
+  const messagesByChatId = new Map<string, Message[]>()
+  for (const message of messages) {
+    const rows = messagesByChatId.get(message.chatId)
+    if (rows) rows.push(message)
+    else messagesByChatId.set(message.chatId, [message])
+  }
+  return mapChanged(chats, (chat) => {
+    const lastUpdatedLeafId = findLastUpdatedLeafId(messagesByChatId.get(chat.id) ?? [])
+    return chat.lastUpdatedLeafId === lastUpdatedLeafId ? chat : { ...chat, lastUpdatedLeafId }
+  })
 }
 
 function normalizeImportedContinuationAttempt(
@@ -374,10 +492,6 @@ function canonicalImportedProviderOutputItems(input: {
   const serverTools = input.generation?.serverTools ?? input.serverTools ?? []
   const migrated = providerOutputItemsFromLegacyServerTools(serverTools)
   return mergeLegacyProviderOutputItems(input.providerOutputItems, migrated)
-}
-
-function annotationSourceForImportedMessage(input: Message) {
-  return annotationSourceForApi(input.generation?.apiUsed)
 }
 
 function annotationSourceForApi(apiUsed: GenerationMeta['apiUsed'] | undefined) {

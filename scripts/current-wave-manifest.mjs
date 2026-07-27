@@ -1,11 +1,11 @@
 import { TEST_COMPILER_COHORT_DESCRIPTOR } from './test-compiler-cohort.mjs'
 
 export const currentWaveManifest = Object.freeze({
-  id: 'wave-a-cut-6-runnable-snapshot',
+  id: 'wave-b-cut-1-semantic-operation-capabilities',
   mode: 'coherence/gate',
   comparison: Object.freeze({
     kind: 'git-commit',
-    oid: 'fa2345161009d6142235ccc55e934a9e2327730d',
+    oid: '598f65a1406c53d6c03f0d44239c408b715dacf6',
   }),
   roots: Object.freeze(['src']),
   requiredFiles: Object.freeze([
@@ -16,6 +16,14 @@ export const currentWaveManifest = Object.freeze({
     'src/store/workspace-effect-hub.ts',
     'src/store/workspace-repository.ts',
     'src/store/browser-command-mutation-journal.ts',
+    'src/store/browser-mutation-plan.ts',
+    'src/store/browser-mutation-runtime.ts',
+    'src/store/browser-configuration-domain.ts',
+    'src/store/browser-domain-mutations.ts',
+    'src/store/browser-catalog-command-runtime.ts',
+    'src/store/browser-generation-command-runtime.ts',
+    'src/store/configuration-model-resolution-capability.ts',
+    'src/store/semantic-operation-capability.ts',
     'src/store/browser-repo.ts',
     'src/store/conversation-repository-adapter.ts',
     'src/store/conversation-controller.ts',

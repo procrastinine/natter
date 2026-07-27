@@ -1,6 +1,11 @@
 import type ts from 'typescript'
 
-export function createProductionTypeScriptProgram(root?: string): ts.Program
+export function createProductionTypeScriptProgram(
+  root?: string,
+  options?: {
+    readonly sourceTextOverrides?: Readonly<Record<string, string>>
+  },
+): ts.Program
 export function productionTypeScriptSources(
   program: ts.Program,
   root?: string,

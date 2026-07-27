@@ -1862,8 +1862,15 @@ class BrowserWorkspaceSessionImpl implements BrowserWorkspaceSession {
     this.databaseOpenInFlight -= 1
   }
 
-  verifySchema(): void {
+  verifySchema(preflight: BrowserWorkspaceSchemaPreflight): void {
     if (this.schemaVerified) return
+    if (
+      preflight.physicalVersion === this.database.backendDB().version &&
+      preflight.repairStores.length === 0
+    ) {
+      this.schemaVerified = true
+      return
+    }
     verifyBrowserWorkspaceSchema(this.database, this.registeredSchema)
     this.schemaVerified = true
   }
@@ -2245,11 +2252,11 @@ async function openSessionDatabase(
         session.endDatabaseOpen()
       }
     }
+    assertCurrent()
+    session.verifySchema(preflight)
   } finally {
     if (blocked) db.on.blocked.unsubscribe(blocked)
   }
-  assertCurrent()
-  session.verifySchema()
   return db
 }
 

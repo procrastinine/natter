@@ -102,7 +102,6 @@ async function discardEmptyDraftChats(
       {
         kind: 'chat.discard-empty-drafts',
         chatIds: batch,
-        exceptChatId: null,
         now,
       },
       options,

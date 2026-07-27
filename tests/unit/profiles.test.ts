@@ -9,19 +9,38 @@ import {
 import 'fake-indexeddb/auto'
 import { IDBFactory } from 'fake-indexeddb'
 import { beforeAll, beforeEach, describe, expect, it } from 'vitest'
+import { modelCatalogQueryForConnectionKind } from '../../src/core/cache-keys'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import type { Chat, ConnectionProfile, KeyId, ProfileId } from '../../src/core/types'
 import { newId } from '../../src/lib/ulid'
 import { __resetBroadcastForTests, subscribeWorkspaceChanges } from '../../src/store/broadcast'
 import { __resetBrowserRepositoryForTests } from '../../src/store/browser-repo'
+import {
+  openBrowserWorkspace,
+  shutdownBrowserWorkspace,
+} from '../../src/store/browser-workspace-lifecycle'
 import { archiveChat } from '../../src/store/chats'
 import { configurationApplication } from '../../src/store/configuration-application'
+import { executeConfigurationCommand } from '../../src/store/configuration-command-client'
+import {
+  type ConfigurationChatSwitchCommand,
+  configurationRequestRevisionFor,
+  configurationRequestRevisionKey,
+} from '../../src/store/configuration-domain-contract'
+import {
+  awaitConfigurationModelResolutionCapabilityIdle,
+  closeConfigurationModelResolutionCapability,
+} from '../../src/store/configuration-model-resolution-capability'
 import { __resetDbForTests, getDb } from '../../src/store/db'
 import { exportWorkspaceBackup, restoreWorkspaceBackup } from '../../src/store/import-export'
 import { interchangeApplication } from '../../src/store/interchange-application'
 import { __resetKeyCacheForTests, createKey, getKey } from '../../src/store/keys'
 
-import type { WorkspaceChange, WorkspaceDependency } from '../../src/store/workspace-protocol'
+import {
+  CONFIGURATION_MODEL_RESOLUTION_PAGE_SIZE,
+  type WorkspaceChange,
+  type WorkspaceDependency,
+} from '../../src/store/workspace-protocol'
 import {
   __resetWorkspaceRepositoryForTests,
   getWorkspaceRepository,
@@ -92,6 +111,84 @@ async function seedChatWithProfile(profileId: ProfileId): Promise<Chat> {
   const settings = cloneDefaultChatSettings()
   settings.profileId = profileId
   return createChat({ id: newId(), title: 'T', settings, now: 1 })
+}
+
+async function seedPendingProfileSwitch(): Promise<{
+  readonly chat: Chat
+  readonly command: ConfigurationChatSwitchCommand
+  readonly intentId: string
+  readonly modelId: string
+  readonly targetProfile: ConnectionProfile
+}> {
+  const keyId = await fakeKeyId('switch-order-key')
+  const sourceProfile = await createProfile({
+    name: 'Switch order source',
+    kind: 'openrouter',
+    baseUrl: 'https://openrouter.ai/api/v1',
+    apiKeyRef: keyId,
+    now: 2,
+  })
+  const targetProfile = await createProfile({
+    name: 'Switch order target',
+    kind: 'openrouter',
+    baseUrl: 'https://openrouter.ai/api/v1',
+    apiKeyRef: keyId,
+    now: 3,
+  })
+  const modelId = 'anthropic/claude-haiku-4.5'
+  const settings = cloneDefaultChatSettings()
+  settings.profileId = sourceProfile.id
+  settings.model = modelId
+  const chat = await createChat({
+    id: newId(),
+    title: 'Switch order chat',
+    settings,
+    now: 4,
+  })
+  const targetKey = await getDb().keys.get(keyId)
+  if (!targetKey) throw new Error(`SwitchOrderKeyMissing:${keyId}`)
+  const target = configurationRequestRevisionFor(targetProfile, targetKey)
+  const intentId = newId()
+  return {
+    chat,
+    intentId,
+    modelId,
+    targetProfile,
+    command: {
+      kind: 'chat.switch-profile',
+      chatId: chat.id,
+      profileId: targetProfile.id,
+      requestKeyId: keyId,
+      previousProfileId: sourceProfile.id,
+      previousModelResolutionTarget: null,
+      target,
+      api: 'chat',
+      model: {
+        kind: 'pending',
+        immediateId: '',
+        resolution: {
+          intentId,
+          target,
+          sourceModelId: modelId,
+          expectedConfigurationVersion: 1,
+        },
+      },
+      expectedConfigurationVersion: 0,
+      now: 5,
+    },
+  }
+}
+
+async function readModelResolutionPage(profileId: ProfileId, profileRevision: string) {
+  return runWorkspaceRead('repository-query', (permit) =>
+    getWorkspaceRepository()
+      .query(permit, {
+        kind: 'configuration.model-resolution-page',
+        profileId,
+        profileRevision,
+      })
+      .then((envelope) => envelope.value),
+  )
 }
 
 beforeAll(async () => {
@@ -199,6 +296,137 @@ describe('listProfiles / getProfile', () => {
     expect(visible.map((p) => p.id)).toEqual([a.id])
     const all = await listProfiles({ includeArchived: true })
     expect(all.map((p) => p.id).sort()).toEqual([a.id, b.id].sort())
+  })
+})
+
+describe('profile switch model publication ordering', () => {
+  it('resolves a stale pending switch from a models publication that committed first', async () => {
+    const fixture = await seedPendingProfileSwitch()
+    await putCachedModels(
+      fixture.targetProfile.id,
+      modelCatalogQueryForConnectionKind(fixture.targetProfile.kind),
+      { data: [{ id: fixture.modelId }] },
+      6,
+    )
+
+    await expect(executeConfigurationCommand(fixture.command)).resolves.toMatchObject({
+      kind: 'chat-updated',
+      changed: true,
+      chat: {
+        settings: { profileId: fixture.targetProfile.id, model: fixture.modelId },
+      },
+    })
+    expect((await getDb().chats.get(fixture.chat.id))?.modelResolution).toBeUndefined()
+  })
+
+  it('lets a later models publication resolve a pending switch that committed first', async () => {
+    const fixture = await seedPendingProfileSwitch()
+    await expect(executeConfigurationCommand(fixture.command)).resolves.toMatchObject({
+      kind: 'chat-updated',
+      changed: true,
+      chat: {
+        settings: { profileId: fixture.targetProfile.id, model: '' },
+        modelResolution: { intentId: fixture.intentId },
+      },
+    })
+
+    await putCachedModels(
+      fixture.targetProfile.id,
+      modelCatalogQueryForConnectionKind(fixture.targetProfile.kind),
+      { data: [{ id: fixture.modelId }] },
+      6,
+    )
+    await awaitConfigurationModelResolutionCapabilityIdle()
+
+    expect(await getDb().chats.get(fixture.chat.id)).toMatchObject({
+      settings: { profileId: fixture.targetProfile.id, model: fixture.modelId },
+      configurationVersion: 2,
+    })
+    expect((await getDb().chats.get(fixture.chat.id))?.modelResolution).toBeUndefined()
+  })
+
+  it('cold-starts and drains more than one fixed model-resolution page', async () => {
+    const fixture = await seedPendingProfileSwitch()
+    const pending = [fixture]
+    for (let index = 1; index <= CONFIGURATION_MODEL_RESOLUTION_PAGE_SIZE; index += 1) {
+      const settings = cloneDefaultChatSettings()
+      settings.profileId = fixture.command.previousProfileId
+      settings.model = fixture.modelId
+      const chat = await createChat({
+        id: newId(),
+        title: `Switch order chat ${index}`,
+        settings,
+        now: 4 + index,
+      })
+      const intentId = newId()
+      pending.push({
+        ...fixture,
+        chat,
+        intentId,
+        command: {
+          ...fixture.command,
+          chatId: chat.id,
+          model: {
+            kind: 'pending',
+            immediateId: '',
+            resolution: {
+              intentId,
+              target: fixture.command.target,
+              sourceModelId: fixture.modelId,
+              expectedConfigurationVersion: 1,
+            },
+          },
+          now: 5 + index,
+        },
+      })
+    }
+    for (const entry of pending) {
+      await expect(executeConfigurationCommand(entry.command)).resolves.toMatchObject({
+        kind: 'chat-updated',
+        changed: true,
+        chat: { modelResolution: { intentId: entry.intentId } },
+      })
+    }
+    await awaitConfigurationModelResolutionCapabilityIdle()
+
+    const profileRevision = configurationRequestRevisionKey(fixture.command.target)
+    const firstPage = await readModelResolutionPage(fixture.targetProfile.id, profileRevision)
+    expect(firstPage).toMatchObject({
+      kind: 'ready',
+      pageFull: true,
+    })
+    if (firstPage.kind !== 'ready') throw new Error('ModelResolutionPageUnavailable')
+    expect(firstPage.pending).toHaveLength(CONFIGURATION_MODEL_RESOLUTION_PAGE_SIZE)
+
+    closeConfigurationModelResolutionCapability()
+    let lifecycleRestored = false
+    try {
+      await putCachedModels(
+        fixture.targetProfile.id,
+        modelCatalogQueryForConnectionKind(fixture.targetProfile.kind),
+        { data: [{ id: fixture.modelId }] },
+        6,
+      )
+      expect((await getDb().chats.get(fixture.chat.id))?.modelResolution).toBeDefined()
+
+      await shutdownBrowserWorkspace()
+      await openBrowserWorkspace()
+      lifecycleRestored = true
+      await awaitConfigurationModelResolutionCapabilityIdle()
+
+      const stored = await getDb().chats.bulkGet(pending.map((entry) => entry.chat.id))
+      expect(stored).toHaveLength(CONFIGURATION_MODEL_RESOLUTION_PAGE_SIZE + 1)
+      expect(
+        stored.every(
+          (chat) => chat?.settings.model === fixture.modelId && chat.modelResolution === undefined,
+        ),
+      ).toBe(true)
+    } finally {
+      if (!lifecycleRestored) {
+        await shutdownBrowserWorkspace()
+        await openBrowserWorkspace()
+      }
+    }
   })
 })
 
@@ -729,6 +957,25 @@ describe('connection interchange', () => {
     expect(profile?.apiKeyRef).toBeUndefined()
     expect(profile?.apiKeyFallbackRefs).toBeUndefined()
     expect(profile?.managementApiKeyRef).toBeUndefined()
+  })
+
+  it('serializes concurrent same-name imports without a catalog-wide lock', async () => {
+    const source = await createProfile({
+      name: 'Concurrent portable',
+      kind: 'openrouter',
+      baseUrl: 'https://openrouter.ai/api/v1',
+    })
+    const envelope = await interchangeApplication.exportConnectionProfile(source.id)
+
+    const imports = await Promise.all([
+      interchangeApplication.importConnectionProfile(envelope, { now: 701 }),
+      interchangeApplication.importConnectionProfile(envelope, { now: 702 }),
+    ])
+    const names = await Promise.all(
+      imports.map(async ({ profileId }) => (await getProfile(profileId))?.name),
+    )
+
+    expect(names.sort()).toEqual(['Concurrent portable (2)', 'Concurrent portable (3)'])
   })
 })
 

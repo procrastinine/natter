@@ -14,6 +14,7 @@ const ROOT = resolve(import.meta.dirname, '..')
 const PRIMARY_DISCRIMINANT_PRIORITY = Object.freeze([
   'kind',
   'type',
+  'operation',
   'objectKind',
   'outcome',
   'status',

@@ -1,6 +1,7 @@
 import type Dexie from 'dexie'
 import type {
   DBCore,
+  DBCoreIndex,
   DBCoreKeyRange,
   DBCoreMutateRequest,
   DBCoreMutateResponse,
@@ -16,9 +17,11 @@ import {
   type MessagePresentation,
   sameMessageHeaderValue,
 } from './message-storage'
-import type { PhysicalStorageTableName } from './physical-storage-tables'
+import { encodePhysicalStorageKey, type PhysicalStorageTableName } from './physical-storage-tables'
 import { streamJournalFrameStreamId } from './repository'
+import { boundSemanticOperationExactReceiptAccumulator } from './semantic-operation-capability'
 import type { StorageRetentionTask } from './storage-retention-state'
+import { estimateStoredValueBytes } from './storage-size-estimate'
 import { WorkspaceLocalChildSlotAccumulator } from './workspace-local-evidence'
 import type { WorkspaceDependency, WorkspaceLocalChildSlotEvidence } from './workspace-protocol'
 
@@ -29,6 +32,9 @@ const installedDatabases = new WeakSet<Dexie>()
 interface MutableMutationJournal {
   readonly tableNames: Set<string>
   readonly physicalMutations: Map<string, BrowserCommandPhysicalMutation>
+  readonly physicalWrites?: BrowserCommandPhysicalWrite[]
+  readonly physicalReads?: Map<string, MutableBrowserCommandPhysicalRead>
+  readonly finalizationPhysicalReads?: Map<string, MutableBrowserCommandPhysicalRead>
   readonly physicalOwnerScopes: Map<string, BrowserCommandPhysicalOwnerScope>
   readonly internalMutationEvidence: Set<string>
   readonly physicalMutationHints: Map<string, BrowserCommandPhysicalMutationHint>
@@ -39,7 +45,11 @@ interface MutableMutationJournal {
   readonly childSlots: Map<string, WorkspaceLocalChildSlotAccumulator>
   readonly chatIds: Set<ChatId>
   readonly initialChatExistsById: Map<ChatId, boolean>
+  readonly finalChatById: Map<ChatId, Chat | null>
+  readonly handledKeyRequestMaterialIds: Set<string>
   successfulMutations: number
+  observePhysicalReads: boolean
+  physicalReadPhase: 'command' | 'finalization'
 }
 
 interface BrowserCommandPhysicalMutationHint {
@@ -79,6 +89,9 @@ interface MutableAttachmentReferenceStateFact {
 export interface BrowserCommandMutationFacts {
   readonly tableNames: readonly string[]
   readonly physicalMutations: readonly BrowserCommandPhysicalMutation[]
+  readonly physicalWrites: readonly BrowserCommandPhysicalWrite[]
+  readonly physicalReads: readonly BrowserCommandPhysicalRead[]
+  readonly finalizationPhysicalReads: readonly BrowserCommandPhysicalRead[]
   readonly physicalOwnerScopes: readonly BrowserCommandPhysicalOwnerScope[]
   readonly internalMutationEvidence: readonly string[]
   readonly invalidations: readonly WorkspaceDependency[]
@@ -88,6 +101,43 @@ export interface BrowserCommandMutationFacts {
   readonly childSlots: readonly WorkspaceLocalChildSlotEvidence[]
   readonly chatStates: readonly BrowserCommandChatStateFact[]
   readonly successfulMutations: number
+}
+
+export type BrowserCommandPhysicalReadOperation =
+  | 'get'
+  | 'get-many'
+  | 'query'
+  | 'open-cursor'
+  | 'count'
+
+export interface BrowserCommandPhysicalRead {
+  readonly tableName: string
+  readonly indexKind: 'primary' | 'secondary'
+  readonly indexName?: string
+  readonly operation: BrowserCommandPhysicalReadOperation
+  readonly requestCount: number
+  readonly rowCount: number
+  readonly maxRequestRows: number
+  readonly estimatedBytes: number
+}
+
+export interface BrowserCommandPhysicalWrite {
+  readonly tableName: string
+  readonly operation: 'add' | 'put' | 'delete'
+  readonly requestCount: number
+  readonly rowCount: number
+  readonly maxRequestRows: number
+}
+
+interface MutableBrowserCommandPhysicalRead {
+  readonly tableName: string
+  readonly indexKind: 'primary' | 'secondary'
+  readonly indexName?: string
+  readonly operation: BrowserCommandPhysicalReadOperation
+  requestCount: number
+  rowCount: number
+  maxRequestRows: number
+  estimatedBytes: number
 }
 
 export interface BrowserCommandPhysicalMutation {
@@ -155,6 +205,10 @@ export function installBrowserCommandMutationJournal(db: Dexie): void {
 export async function runBrowserCommandTransaction<T>(
   tx: Transaction,
   operation: (tx: Transaction) => Promise<T> | T,
+  options: {
+    readonly observePhysicalReads?: boolean
+    readonly observePhysicalWrites?: boolean
+  } = {},
 ): Promise<BrowserCommandTransactionResult<T>> {
   if (!installedDatabases.has(tx.db)) throw new Error('BrowserCommandMutationJournalMissing')
   const transaction = tx.idbtrans as unknown as DBCoreTransaction
@@ -162,6 +216,9 @@ export async function runBrowserCommandTransaction<T>(
   const journal: MutableMutationJournal = {
     tableNames: new Set<string>(),
     physicalMutations: new Map(),
+    ...(options.observePhysicalWrites ? { physicalWrites: [] } : {}),
+    ...(options.observePhysicalReads ? { physicalReads: new Map() } : {}),
+    ...(options.observePhysicalReads ? { finalizationPhysicalReads: new Map() } : {}),
     physicalOwnerScopes: new Map(),
     internalMutationEvidence: new Set(),
     physicalMutationHints: new Map(),
@@ -172,15 +229,19 @@ export async function runBrowserCommandTransaction<T>(
     childSlots: new Map(),
     chatIds: new Set(),
     initialChatExistsById: new Map(),
+    finalChatById: new Map(),
+    handledKeyRequestMaterialIds: new Set(),
     successfulMutations: 0,
+    observePhysicalReads: options.observePhysicalReads === true,
+    physicalReadPhase: 'command',
   }
   journals.set(transaction, journal)
   try {
     const value = await operation(tx)
+    journal.physicalReadPhase = 'finalization'
     await recordKeyRequestMaterialDependents(tx, journal)
     const chatIds = [...journal.chatIds]
-    const chatRows =
-      chatIds.length === 0 ? [] : await tx.table<Chat, ChatId>('chats').bulkGet(chatIds)
+    journal.observePhysicalReads = false
     return {
       value,
       facts: Object.freeze({
@@ -189,6 +250,19 @@ export async function runBrowserCommandTransaction<T>(
           [...journal.physicalMutations.values()].map((mutation) =>
             Object.freeze(structuredClone(mutation)),
           ),
+        ),
+        physicalWrites: Object.freeze(
+          [...(journal.physicalWrites ?? [])].map((write) => Object.freeze({ ...write })),
+        ),
+        physicalReads: Object.freeze(
+          [...(journal.physicalReads?.values() ?? [])]
+            .map((read) => Object.freeze({ ...read }))
+            .sort(comparePhysicalReads),
+        ),
+        finalizationPhysicalReads: Object.freeze(
+          [...(journal.finalizationPhysicalReads?.values() ?? [])]
+            .map((read) => Object.freeze({ ...read }))
+            .sort(comparePhysicalReads),
         ),
         physicalOwnerScopes: Object.freeze(
           [...journal.physicalOwnerScopes.values()].map((scope) =>
@@ -229,8 +303,8 @@ export async function runBrowserCommandTransaction<T>(
           }),
         ),
         chatStates: Object.freeze(
-          chatIds.map((chatId, index) => {
-            const chat = chatRows[index]
+          chatIds.map((chatId) => {
+            const chat = requiredFinalChatState(journal, chatId)
             return Object.freeze({
               chatId,
               chat: chat ? structuredClone(chat) : null,
@@ -259,7 +333,9 @@ async function recordKeyRequestMaterialDependents(
     ) {
       continue
     }
-    for (const keyId of dependency.keyIds) keyIds.add(keyId)
+    for (const keyId of dependency.keyIds) {
+      if (!journal.handledKeyRequestMaterialIds.has(keyId)) keyIds.add(keyId)
+    }
   }
   if (keyIds.size === 0) return
   const links = await tx
@@ -318,6 +394,27 @@ export function recordBrowserCommandMessageRevisions(
       structuralVersion: revision.structuralVersion,
       ...(retainedPresentation ? { presentation: structuredClone(retainedPresentation) } : {}),
     })
+    boundSemanticOperationExactReceiptAccumulator(tx)?.dependency(
+      {
+        kind: 'message-header',
+        chatId: revision.header.chatId,
+        messageIds: [revision.header.id],
+      },
+      ...(!revision.before || revision.before.bodyVersion !== revision.header.bodyVersion
+        ? [
+            {
+              kind: 'message-body' as const,
+              chatId: revision.header.chatId,
+              messageIds: [revision.header.id],
+            },
+            {
+              kind: 'message-preview' as const,
+              chatId: revision.header.chatId,
+              messageIds: [revision.header.id],
+            },
+          ]
+        : []),
+    )
   }
 }
 
@@ -369,7 +466,7 @@ export function recordBrowserCommandAttachmentPayloadDeletion(
   const journal = requireMutationJournal(tx)
   for (const key of keys) {
     journal.physicalMutationHints.set(
-      `${tableName}\u0000${encodePhysicalMutationKey(key)}`,
+      `${tableName}\u0000${encodePhysicalStorageKey(key)}`,
       Object.freeze({ attachmentId }),
     )
   }
@@ -411,7 +508,7 @@ export function recordBrowserCommandPhysicalDeletionOwnerScope(
   const transaction = tx.idbtrans as unknown as DBCoreTransaction
   const journal = journals.get(transaction)
   if (!journal) return
-  const id = `chat:${ownerIds.map(encodePhysicalMutationKey).join('|')}`
+  const id = `chat:${ownerIds.map(encodePhysicalStorageKey).join('|')}`
   const nextScope = Object.freeze({ id, kind: 'chat' as const, ownerIds: Object.freeze(ownerIds) })
   const previousScope = journal.physicalOwnerScopes.get(id)
   if (previousScope && !sameValue(previousScope, nextScope)) {
@@ -419,7 +516,7 @@ export function recordBrowserCommandPhysicalDeletionOwnerScope(
   }
   journal.physicalOwnerScopes.set(id, nextScope)
   for (const key of keys) {
-    const address = `${tableName}\u0000${encodePhysicalMutationKey(key)}`
+    const address = `${tableName}\u0000${encodePhysicalStorageKey(key)}`
     const previous = journal.physicalMutationHints.get(address)
     journal.physicalMutationHints.set(
       address,
@@ -435,8 +532,8 @@ export function recordBrowserCommandStreamJournalRetirementPage(
   scope:
     | { readonly kind: 'stream'; readonly streamId: string; readonly chatId?: ChatId }
     | { readonly kind: 'orphan-chat-closure'; readonly chatIds: readonly ChatId[] },
-): void {
-  if (keys.length === 0) return
+): string | undefined {
+  if (keys.length === 0) return undefined
   const journal = requireMutationJournal(tx)
   const ownerScopeId =
     scope.kind === 'orphan-chat-closure'
@@ -447,7 +544,7 @@ export function recordBrowserCommandStreamJournalRetirementPage(
       : undefined
   const groupAddress =
     scope.kind === 'stream'
-      ? `streamChunks\u0000stream:${encodePhysicalMutationKey(scope.streamId)}`
+      ? `streamChunks\u0000stream:${encodePhysicalStorageKey(scope.streamId)}`
       : `streamChunks\u0000owner:${ownerScopeId}`
   for (const key of keys) {
     const streamId = streamJournalFrameStreamId(key)
@@ -455,7 +552,7 @@ export function recordBrowserCommandStreamJournalRetirementPage(
     if (scope.kind === 'stream' && streamId !== scope.streamId) {
       throw new Error(`BrowserCommandStreamJournalRetirementScopeMismatch:${scope.streamId}`)
     }
-    const address = `streamChunks\u0000${encodePhysicalMutationKey(key)}`
+    const address = `streamChunks\u0000${encodePhysicalStorageKey(key)}`
     const previous = journal.physicalMutationHints.get(address)
     journal.physicalMutationHints.set(
       address,
@@ -469,6 +566,7 @@ export function recordBrowserCommandStreamJournalRetirementPage(
       }),
     )
   }
+  return groupAddress
 }
 
 export function recordBrowserCommandAttachmentReferenceState(
@@ -515,6 +613,20 @@ export function recordBrowserCommandInvalidation(
   const journal = journals.get(transaction)
   if (!journal) throw new Error('BrowserCommandMutationJournalMissing')
   journal.invalidations.push(invalidation)
+  boundSemanticOperationExactReceiptAccumulator(tx)?.dependency(invalidation)
+}
+
+export function recordBrowserCommandKeyRequestMaterialAffectedSet(
+  tx: Transaction,
+  keyId: string,
+): void {
+  const transaction = tx.idbtrans as unknown as DBCoreTransaction
+  const journal = journals.get(transaction)
+  if (!journal) throw new Error('BrowserCommandMutationJournalMissing')
+  if (journal.handledKeyRequestMaterialIds.has(keyId)) {
+    throw new Error(`BrowserCommandKeyRequestMaterialAffectedSetAlreadyHandled:${keyId}`)
+  }
+  journal.handledKeyRequestMaterialIds.add(keyId)
 }
 
 export function recordBrowserCommandOwnerInvalidation(
@@ -523,6 +635,7 @@ export function recordBrowserCommandOwnerInvalidation(
 ): void {
   const transaction = tx.idbtrans as unknown as DBCoreTransaction
   journals.get(transaction)?.invalidations.push(invalidation)
+  boundSemanticOperationExactReceiptAccumulator(tx)?.dependency(invalidation)
 }
 
 const browserCommandMutationMiddleware: Middleware<DBCore> = {
@@ -535,23 +648,131 @@ const browserCommandMutationMiddleware: Middleware<DBCore> = {
       const table = down.table(tableName)
       return {
         ...table,
+        get: async (request) => {
+          const result = await table.get(request)
+          recordPhysicalRead(request.trans, tableName, 'get', undefined, 1, 1, 'single', result)
+          return result
+        },
+        getMany: async (request) => {
+          const result = await table.getMany(request)
+          recordPhysicalRead(
+            request.trans,
+            tableName,
+            'get-many',
+            undefined,
+            request.keys.length,
+            request.keys.length,
+            'many',
+            result,
+          )
+          return result
+        },
+        query: async (request) => {
+          const result = await table.query(request)
+          recordPhysicalRead(
+            request.trans,
+            tableName,
+            'query',
+            request.query.index,
+            result.result.length,
+            result.result.length,
+            'many',
+            result.result,
+          )
+          return result
+        },
+        count: async (request) => {
+          const result = await table.count(request)
+          recordPhysicalRead(
+            request.trans,
+            tableName,
+            'count',
+            request.query.index,
+            result,
+            result,
+            'none',
+            undefined,
+          )
+          return result
+        },
+        openCursor: async (request) => {
+          const observePhysicalReads = journals.get(request.trans)?.observePhysicalReads === true
+          const cursor = await table.openCursor(request)
+          if (!observePhysicalReads) return cursor
+          if (!cursor) {
+            recordPhysicalRead(
+              request.trans,
+              tableName,
+              'open-cursor',
+              request.query.index,
+              0,
+              0,
+              'none',
+              undefined,
+            )
+            return null
+          }
+          let requestRows = 0
+          const start = cursor.start.bind(cursor)
+          cursor.start = (callback) =>
+            start(() => {
+              requestRows += 1
+              recordPhysicalRead(
+                request.trans,
+                tableName,
+                'open-cursor',
+                request.query.index,
+                1,
+                requestRows,
+                'single',
+                cursor.value,
+                false,
+              )
+              callback()
+            })
+          recordPhysicalRead(
+            request.trans,
+            tableName,
+            'open-cursor',
+            request.query.index,
+            0,
+            0,
+            'none',
+            undefined,
+          )
+          return cursor
+        },
         mutate: async (request) => {
           const journal = journals.get(request.trans)
           if (!journal) return table.mutate(request)
           if (request.type === 'deleteRange' && request.range.type !== DBCORE_RANGE_NEVER) {
             throw new Error(`BrowserCommandExactDeleteRangeForbidden:${tableName}`)
           }
-          const deletedValues =
+          const shouldReadDeletedValues =
             request.type === 'delete' &&
             !DELETE_KEY_HAS_REQUIRED_IDENTITY.has(tableName) &&
             !request.keys.every((key) =>
               journal.physicalMutationHints.has(
-                `${tableName}\u0000${encodePhysicalMutationKey(key)}`,
+                `${tableName}\u0000${encodePhysicalStorageKey(key)}`,
               ),
             )
-              ? await table.getMany({ trans: request.trans, keys: request.keys })
-              : undefined
+          const deletedValues = shouldReadDeletedValues
+            ? await table.getMany({ trans: request.trans, keys: request.keys })
+            : undefined
+          if (shouldReadDeletedValues) {
+            recordPhysicalRead(
+              request.trans,
+              tableName,
+              'get-many',
+              undefined,
+              request.keys.length,
+              request.keys.length,
+              'many',
+              deletedValues,
+            )
+          }
           const requested = requestedMutationCount(request)
+          if (requested > 0) recordPhysicalWriteRequest(journal, tableName, request)
           try {
             const response = await table.mutate(request)
             if (requested === 0) return response
@@ -574,7 +795,7 @@ const browserCommandMutationMiddleware: Middleware<DBCore> = {
             if (request.type === 'delete') {
               for (const key of request.keys) {
                 journal.physicalMutationHints.delete(
-                  `${tableName}\u0000${encodePhysicalMutationKey(key)}`,
+                  `${tableName}\u0000${encodePhysicalStorageKey(key)}`,
                 )
               }
             }
@@ -585,8 +806,80 @@ const browserCommandMutationMiddleware: Middleware<DBCore> = {
   }),
 }
 
+function recordPhysicalRead(
+  transaction: DBCoreTransaction,
+  tableName: string,
+  operation: BrowserCommandPhysicalReadOperation,
+  requestedIndex: DBCoreIndex | undefined,
+  rowCount: number,
+  requestRows: number,
+  payloadKind: 'none' | 'single' | 'many',
+  payload: unknown,
+  countRequest = true,
+): void {
+  const journal = journals.get(transaction)
+  if (!journal?.observePhysicalReads) return
+  const physicalReads =
+    journal.physicalReadPhase === 'command'
+      ? journal.physicalReads
+      : journal.finalizationPhysicalReads
+  if (!physicalReads) return
+  const physicalIndex = requestedIndex?.lowLevelIndex ?? requestedIndex
+  const primary =
+    !physicalIndex || physicalIndex.isPrimaryKey === true || physicalIndex.name === null
+  const indexName = primary ? undefined : physicalIndex.name
+  if (!primary && !indexName) throw new Error(`BrowserCommandPhysicalReadIndexMissing:${tableName}`)
+  const estimatedBytes =
+    payloadKind === 'none'
+      ? 0
+      : payloadKind === 'single'
+        ? payload === undefined
+          ? 0
+          : estimateStoredValueBytes(payload)
+        : estimatePresentStoredValues((payload as readonly unknown[] | undefined) ?? [])
+  const address = `${tableName}\u0000${primary ? ':id' : indexName}\u0000${operation}`
+  const current = physicalReads.get(address)
+  if (current) {
+    if (countRequest) current.requestCount = saturatingCount(current.requestCount, 1)
+    current.rowCount = saturatingCount(current.rowCount, rowCount)
+    current.maxRequestRows = Math.max(current.maxRequestRows, requestRows)
+    current.estimatedBytes = saturatingCount(current.estimatedBytes, estimatedBytes)
+    return
+  }
+  physicalReads.set(address, {
+    tableName,
+    indexKind: primary ? 'primary' : 'secondary',
+    ...(indexName ? { indexName } : {}),
+    operation,
+    requestCount: countRequest ? 1 : 0,
+    rowCount,
+    maxRequestRows: requestRows,
+    estimatedBytes,
+  })
+}
+
+function estimatePresentStoredValues(values: readonly unknown[]): number {
+  let estimatedBytes = 0
+  for (const value of values) {
+    if (value === undefined) continue
+    estimatedBytes = saturatingCount(estimatedBytes, estimateStoredValueBytes(value))
+  }
+  return estimatedBytes
+}
+
+function comparePhysicalReads(
+  left: BrowserCommandPhysicalRead,
+  right: BrowserCommandPhysicalRead,
+): number {
+  return `${left.tableName}\u0000${left.indexName ?? ':id'}\u0000${left.operation}`.localeCompare(
+    `${right.tableName}\u0000${right.indexName ?? ':id'}\u0000${right.operation}`,
+  )
+}
+
 const DELETE_KEY_HAS_REQUIRED_IDENTITY = new Set([
   'childSlotMembers',
+  'discoveryPayloadMetadata',
+  'discoveryPayloads',
   'messageBodies',
   'messagePreviews',
   'streamChunks',
@@ -604,7 +897,7 @@ function requireMutationJournal(tx: Transaction): MutableMutationJournal {
 
 function recordInternalMutationAddress(tx: Transaction, tableName: string, key: unknown): void {
   requireMutationJournal(tx).internalMutationEvidence.add(
-    `${tableName}\u0000${encodePhysicalMutationKey(key)}`,
+    `${tableName}\u0000${encodePhysicalStorageKey(key)}`,
   )
 }
 
@@ -651,10 +944,27 @@ function recordSuccessfulPhysicalMutations(
       key,
       value,
       request.type === 'delete' ? 'delete' : 'write',
-      hints.get(`${tableName}\u0000${encodePhysicalMutationKey(key)}`),
+      hints.get(`${tableName}\u0000${encodePhysicalStorageKey(key)}`),
     )
     journal.physicalMutations.set(mutation.address, mutation)
   }
+}
+
+function recordPhysicalWriteRequest(
+  journal: MutableMutationJournal,
+  tableName: string,
+  request: DBCoreMutateRequest,
+): void {
+  if (!journal.physicalWrites || request.type === 'deleteRange') return
+  const rowCount = request.type === 'delete' ? request.keys.length : request.values.length
+  if (rowCount === 0) return
+  journal.physicalWrites.push({
+    tableName,
+    operation: request.type,
+    requestCount: 1,
+    rowCount,
+    maxRequestRows: rowCount,
+  })
 }
 
 function recordSuccessfulStreamJournalRetirements(
@@ -669,7 +979,7 @@ function recordSuccessfulStreamJournalRetirements(
     if (typeof key !== 'string') throw new Error('BrowserCommandStreamJournalFrameKeyInvalid')
     const streamId = streamJournalFrameStreamId(key)
     if (!streamId) throw new Error(`BrowserCommandStreamJournalFrameIdentityInvalid:${key}`)
-    const hint = hints.get(`streamChunks\u0000${encodePhysicalMutationKey(key)}`)
+    const hint = hints.get(`streamChunks\u0000${encodePhysicalStorageKey(key)}`)
     const address = hint?.mutationGroupAddress
     if (!hint || !address) {
       throw new Error(`BrowserCommandStreamJournalRetirementMissing:${streamId}`)
@@ -755,18 +1065,18 @@ function physicalMutationIdentity(
   const keyIds = hint?.keyIds ?? physicalConfigurationIds(tableName, rowId, row, 'key')
   const templateIds =
     hint?.templateIds ?? physicalConfigurationIds(tableName, rowId, row, 'text-template')
-  const address = `${tableName}\u0000${encodePhysicalMutationKey(key)}`
+  const address = `${tableName}\u0000${encodePhysicalStorageKey(key)}`
   return Object.freeze({
     tableName,
     address,
     operation,
     key: structuredClone(key),
-    ...(rowId ? { rowId } : {}),
+    ...(rowId !== undefined ? { rowId } : {}),
     ...(hint?.ownerScopeId ? { ownerScopeId: hint.ownerScopeId } : {}),
     ...(chatId ? { chatId } : {}),
     ...(messageId ? { messageId } : {}),
     ...(attachmentId ? { attachmentId } : {}),
-    ...(profileId ? { profileId } : {}),
+    ...(profileId !== undefined ? { profileId } : {}),
     ...(profileIds.length > 0 ? { profileIds } : {}),
     ...(presetIds.length > 0 ? { presetIds } : {}),
     ...(promptPresetIds.length > 0 ? { promptPresetIds } : {}),
@@ -828,7 +1138,7 @@ function physicalConfigurationIds(
       (tableName === 'promptPresets' || tableName === 'configurationPromptPresetCatalogRows')) ||
     (kind === 'key' && tableName === 'keys') ||
     (kind === 'text-template' && tableName === 'textTemplates')
-  if (directTable && rowId) ids.add(rowId)
+  if (directTable && rowId !== undefined) ids.add(rowId)
   if (row?.ownerKind === kind && typeof row.ownerId === 'string') ids.add(row.ownerId)
   if (row?.targetKind === kind && typeof row.targetId === 'string') ids.add(row.targetId)
   return Object.freeze([...ids].sort())
@@ -840,23 +1150,6 @@ const MESSAGE_IDENTITY_TABLES = new Set([
   'messagePreviews',
   'childSlotMembers',
 ])
-
-function encodePhysicalMutationKey(value: unknown): string {
-  if (typeof value === 'string') return `s:${value.length}:${value}`
-  if (typeof value === 'number') return `n:${Object.is(value, -0) ? '-0' : String(value)}`
-  if (value instanceof Date) return `d:${value.getTime()}`
-  if (Array.isArray(value)) return `a:[${value.map(encodePhysicalMutationKey).join(',')}]`
-  if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) {
-    const bytes =
-      value instanceof ArrayBuffer
-        ? new Uint8Array(value)
-        : new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
-    let encoded = 'b:'
-    for (const byte of bytes) encoded += byte.toString(16).padStart(2, '0')
-    return encoded
-  }
-  throw new Error('BrowserCommandPhysicalMutationKeyInvalid')
-}
 
 function recordSuccessfulChatMutations(
   journal: MutableMutationJournal,
@@ -871,6 +1164,7 @@ function recordSuccessfulChatMutations(
         const chatId = (value as { id?: unknown }).id
         if (typeof chatId !== 'string') throw new Error('BrowserCommandChatMutationIdMissing')
         journal.chatIds.add(chatId)
+        journal.finalChatById.set(chatId, value as Chat)
         if (!journal.initialChatExistsById.has(chatId)) {
           journal.initialChatExistsById.set(chatId, request.type !== 'add')
         }
@@ -881,6 +1175,7 @@ function recordSuccessfulChatMutations(
         if (response.failures[index]) return
         if (typeof key !== 'string') throw new Error('BrowserCommandChatMutationKeyInvalid')
         journal.chatIds.add(key)
+        journal.finalChatById.set(key, null)
         if (!journal.initialChatExistsById.has(key)) {
           journal.initialChatExistsById.set(key, true)
         }
@@ -895,6 +1190,12 @@ function requiredInitialChatExistence(journal: MutableMutationJournal, chatId: C
   const exists = journal.initialChatExistsById.get(chatId)
   if (exists === undefined) throw new Error(`BrowserCommandChatInitialStateMissing:${chatId}`)
   return exists
+}
+
+function requiredFinalChatState(journal: MutableMutationJournal, chatId: ChatId): Chat | null {
+  const chat = journal.finalChatById.get(chatId)
+  if (chat === undefined) throw new Error(`BrowserCommandChatFinalStateMissing:${chatId}`)
+  return chat
 }
 
 function requestedMutationCount(request: DBCoreMutateRequest): number {

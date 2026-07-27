@@ -7,6 +7,10 @@ export const UNION_INVENTORY_SCHEMA_VERSION = 2
 
 export const PRODUCTION_DISCRIMINATED_UNION_SEMANTICS = Object.freeze({
   roleOverrides: Object.freeze([
+    role(
+      'src/store/semantic-operation-capability.ts#SemanticOperationExactPhysicalMutation|operation',
+      'data',
+    ),
     role('src/store/conversation-controller.ts#ConversationDestinationProjection|kind', 'state'),
     role('src/store/conversation-controller.ts#ConversationTranscriptProjection|kind', 'state'),
     role('src/store/conversation-controller.ts#ClaimedConversationDestination|kind', 'state'),
@@ -21,6 +25,7 @@ export const PRODUCTION_DISCRIMINATED_UNION_SEMANTICS = Object.freeze({
     role('src/store/generation-engine.ts#PreparedNewChatGeneration|kind', 'result'),
     role('src/store/generation-admission-controller.ts#ResolvedSettlingAdmission|kind', 'result'),
     role('src/store/storage-retention-state.ts#StorageRetentionStateRowFor|phase', 'state'),
+    role('src/store/workspace-protocol.ts#ConfigurationModelResolutionHead|kind', 'result'),
     role('src/core/types.ts#ReasoningDetail|type', 'data'),
     role('src/core/messages.ts#PasteImportSlot|kind', 'data'),
     role('src/store/repository.ts#StreamTargetCommit|attemptKind', 'data'),
@@ -43,10 +48,6 @@ export const PRODUCTION_DISCRIMINATED_UNION_SEMANTICS = Object.freeze({
     family(
       'src/store/conversation-controller.ts#ClaimedSelectedConversationPromptPath|kind',
       'src/store/conversation-controller.ts#ClaimedConversationDestination|kind',
-    ),
-    family(
-      'src/store/browser-configuration-domain.ts#ConfigurationMutationFailure|kind',
-      'src/store/configuration-domain-contract.ts#ConfigurationDomainResultUnion|kind',
     ),
     family(
       'src/store/chat-row-transition.ts#ChatRowWriteTransition|kind',

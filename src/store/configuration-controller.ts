@@ -8,7 +8,10 @@ import {
   normalizeChatSettings,
   sameChatSettings,
 } from '../core/chat-metadata'
-import { connectionDispatchProfileProof } from '../core/connection-dispatch-proof'
+import {
+  connectionDispatchKeyRefs,
+  connectionDispatchProfileProof,
+} from '../core/connection-dispatch-proof'
 import { cloneDefaultChatSettings } from '../core/defaults'
 import {
   corsProxyConfigFromPrefs,
@@ -51,7 +54,10 @@ import {
   type ConfigurationDiscoverySnapshot,
   type ConfigurationDiscoverySurface,
 } from './configuration-discovery-coordinator'
-import { configurationRequestRevisionKey } from './configuration-domain-contract'
+import {
+  chatConfigurationTargetResourceNames,
+  configurationRequestRevisionKey,
+} from './configuration-domain-contract'
 import type { ConversationSnapshot } from './conversation-controller'
 import type { WorkspaceFence } from './repository'
 import type { WorkspaceEffect } from './workspace-effect-hub'
@@ -114,6 +120,10 @@ export type ActiveConfigurationTarget =
       readonly settings: ChatSettings
       readonly profileId: ProfileId | null
       readonly presetId: PresetId | null
+      readonly configurationLinkProof: {
+        readonly expectedResourceNames: readonly string[]
+        readonly persistedPresetId: PresetId | null
+      }
     }
 
 export type ActiveConfigurationSelectionTarget = Exclude<
@@ -230,6 +240,10 @@ export type ActiveGenerationConfigurationResolution =
       readonly kind: 'chat'
       readonly chatId: ChatId
       readonly configurationVersion: number
+      readonly configurationLinkTransition: {
+        readonly expectedResourceNames: readonly string[]
+        readonly nextResourceNames: readonly string[]
+      }
       readonly claim: ActiveGenerationConfigurationClaim
     }
 
@@ -1780,6 +1794,10 @@ class TabConfigurationController implements ConfigurationController {
         profileId: settings.profileId || null,
         presetId:
           replacement?.presetId === undefined ? (chat.presetId ?? null) : replacement.presetId,
+        configurationLinkProof: {
+          expectedResourceNames: chatConfigurationTargetResourceNames(chat),
+          persistedPresetId: chat.presetId ?? null,
+        },
       })
     }
     if (!this.seed.settings) return Object.freeze({ kind: 'none' })
@@ -2269,10 +2287,7 @@ class TabConfigurationController implements ConfigurationController {
     if (
       selectionTarget &&
       workspaceDependenciesOverlap(
-        workspaceQueryDependencies({
-          kind: 'configuration.active-selection',
-          target: configurationSelectionQueryTarget(selectionTarget),
-        }),
+        activeSelectionWorkspaceDependencies(selectionTarget, this.frameSelection),
         dependencies,
       )
     ) {
@@ -2674,6 +2689,18 @@ function createActiveGenerationConfigurationFrame({
           kind: 'chat' as const,
           chatId: target.chatId,
           configurationVersion: target.configurationVersion,
+          configurationLinkTransition: Object.freeze({
+            expectedResourceNames: target.configurationLinkProof.expectedResourceNames,
+            nextResourceNames: Object.freeze(
+              chatConfigurationTargetResourceNames({
+                id: target.chatId,
+                settings,
+                ...(target.configurationLinkProof.persistedPresetId
+                  ? { presetId: target.configurationLinkProof.persistedPresetId }
+                  : {}),
+              }),
+            ),
+          }),
           claim,
         })
       : Object.freeze({
@@ -2798,6 +2825,12 @@ function sameActiveConfigurationTarget(
       left.overlayRevision === right.overlayRevision &&
       left.profileId === right.profileId &&
       left.presetId === right.presetId &&
+      left.configurationLinkProof.persistedPresetId ===
+        right.configurationLinkProof.persistedPresetId &&
+      sameStringArray(
+        left.configurationLinkProof.expectedResourceNames,
+        right.configurationLinkProof.expectedResourceNames,
+      ) &&
       sameChatSettings(left.settings, right.settings)
     )
   }
@@ -2855,7 +2888,21 @@ function freezeActiveConfigurationTarget<T extends ActiveConfigurationTarget>(ta
   return Object.freeze({
     ...target,
     settings: normalizeChatSettings(structuredClone(target.settings)),
+    ...(target.kind === 'chat'
+      ? {
+          configurationLinkProof: Object.freeze({
+            ...target.configurationLinkProof,
+            expectedResourceNames: Object.freeze([
+              ...target.configurationLinkProof.expectedResourceNames,
+            ]),
+          }),
+        }
+      : {}),
   }) as T
+}
+
+function sameStringArray(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index])
 }
 
 function freezeActiveConfigurationSelection(
@@ -3193,6 +3240,24 @@ function currentSelectionFromSlot(
     return { target: slot.target, value: slot.retained.value }
   }
   return null
+}
+
+function activeSelectionWorkspaceDependencies(
+  target: ActiveConfigurationSelectionTarget,
+  slot: ConfigurationSelectionFrameSlot,
+): readonly WorkspaceDependency[] {
+  const dependencies = workspaceQueryDependencies({
+    kind: 'configuration.active-selection',
+    target: configurationSelectionQueryTarget(target),
+  })
+  const selection = currentSelectionFromSlot(slot)
+  if (!selection) {
+    return [...dependencies, { kind: 'key', facets: ['request-material'] }]
+  }
+  const keyIds = selection.value.profile ? connectionDispatchKeyRefs(selection.value.profile) : []
+  return keyIds.length === 0
+    ? dependencies
+    : [...dependencies, { kind: 'key', keyIds, facets: ['request-material'] }]
 }
 
 function currentModelFromSlot(

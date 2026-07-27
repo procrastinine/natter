@@ -491,6 +491,7 @@ class DestinationFirstProjectionSource implements ConversationProjectionSource {
         pathHeaders: path.map((row) => row.header),
       },
       presentations: destination ? [destination] : [],
+      forks: path.map((row) => singletonFork(row.header)),
     }
     this.pendingSelectionValue = this.envelope(sealConversationSelection(provedSelection))
     return this.selectionRead.promise

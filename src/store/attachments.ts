@@ -207,7 +207,7 @@ export async function ingestAttachmentBytes(
     input.id === undefined ? 'dedupe' : 'put-if-absent',
   )
   return result.outcome === 'written'
-    ? bundle
+    ? { ...bundle, attachment: result.attachment }
     : ((await getAttachmentBundle(result.attachmentId)) ?? bundle)
 }
 
@@ -237,8 +237,6 @@ export async function replaceAttachmentBytes(
   input: ReplaceAttachmentBytesInput,
 ): Promise<ReplaceAttachmentBytesResult> {
   const bytes = new Uint8Array(await input.blob.arrayBuffer())
-  const current = await getAttachmentBundle(input.attachmentId)
-  if (!current) throw new Error(`AttachmentMissing:${input.attachmentId}`)
 
   const processed = await processAttachment({
     id: input.attachmentId,
@@ -250,12 +248,17 @@ export async function replaceAttachmentBytes(
     ...(input.now !== undefined ? { now: input.now } : {}),
   })
   const bundle = bundleFromProcessed(processed, input.blob)
-  bundle.attachment.createdAt = current.attachment.createdAt
-  bundle.attachment.refCount = current.attachment.refCount
   const result = await writeAttachmentBundle(bundle, 'dedupe-or-replace')
-  if (result.outcome === 'written') return { bundle, reusedExisting: false }
+  if (result.outcome === 'written') {
+    return {
+      bundle: { ...bundle, attachment: result.attachment },
+      reusedExisting: false,
+    }
+  }
+  const existing = await getAttachmentBundle(result.attachmentId)
+  if (!existing) throw new Error(`AttachmentMissing:${result.attachmentId}`)
   return {
-    bundle: (await getAttachmentBundle(result.attachmentId)) ?? current,
+    bundle: existing,
     reusedExisting: true,
   }
 }
@@ -270,7 +273,7 @@ export async function createRemoteAttachment(
     input.id === undefined ? 'put' : 'put-if-absent',
   )
   return result.outcome === 'written'
-    ? attachment
+    ? result.attachment
     : ((await getAttachment(result.attachmentId)) ?? attachment)
 }
 

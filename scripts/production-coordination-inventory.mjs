@@ -244,6 +244,13 @@ export const MODULE_COLLECTION_CONTRACTS = Object.freeze({
         'src/core/reasoning.ts#REASONING_FORMATS',
         'src/store/attempt-controller.ts#EMPTY_EXECUTIONS',
         'src/store/branch-tree-search-session.ts#EMPTY_MATCHES',
+        'src/store/browser-catalog-command-runtime.ts#FOLDER_ENSURE_AND_MOVE_CHATS_OPERATION',
+        'src/store/browser-repo.ts#ATTACHMENT_INTEGRITY_OPERATION',
+        'src/store/browser-repo.ts#DISCOVERY_CACHE_MAINTENANCE_OPERATION',
+        'src/store/browser-repo.ts#EMPTY_DRAFT_RETENTION_OPERATION',
+        'src/store/browser-repo.ts#STREAM_FINISH_CLEANUP_OPERATION',
+        'src/store/browser-repo.ts#STREAM_JOURNAL_INTEGRITY_OPERATION',
+        'src/store/browser-repo.ts#TERMINAL_STREAM_RETENTION_OPERATION',
         'src/store/conversation-controller.ts#EMPTY_EXACT_TARGET_PRESENTATION_RECEIPTS',
         'src/store/stream-journal-codec.ts#STREAM_JOURNAL_COMMIT_FRAME_KEYS',
         'src/store/stream-journal-codec.ts#STREAM_JOURNAL_INLINE_FRAME_KEYS',
@@ -536,6 +543,11 @@ export const MODULE_COLLECTION_CONTRACTS = Object.freeze({
     cleanup: 'exact application-owner unsubscribe removes each listener',
     scope: 'module-registry',
   },
+  'src/store/browser-configuration-domain.ts#CONNECTION_REQUEST_MATERIAL_PATCH_KEYS': {
+    bound: 'static connection request-material field lookup',
+    cleanup: 'process-lifetime immutable value; no runtime entries',
+    scope: 'module-static',
+  },
   'src/store/browser-repo.ts#CALIBRATION_MESSAGE_PATCH_KEYS': {
     bound: 'static mutation guard',
     cleanup: 'process-lifetime immutable value; no runtime entries',
@@ -577,6 +589,11 @@ export const MODULE_COLLECTION_CONTRACTS = Object.freeze({
     bound: 'static preference lookup',
     cleanup: 'process-lifetime immutable value; no runtime entries',
     scope: 'module-static',
+  },
+  'src/store/configuration-model-resolution-capability.ts#transientCatalogs': {
+    bound: 'at most 16 uncached model catalogs for the active workspace',
+    cleanup: 'workspace capability closure clears the map; insertion evicts the oldest entry',
+    scope: 'module-workspace-capability',
   },
   'src/store/connection-probe-application.ts#PROBE_MODEL_CANDIDATES': {
     bound: 'static probe fallback',
@@ -937,6 +954,12 @@ export const MODULE_COLLECTION_CONTRACTS = Object.freeze({
     cleanup: 'transaction collection releases weak entries',
     scope: 'module-transaction-registry',
   },
+  'src/store/semantic-operation-capability.ts#semanticOperationReceiptAccumulators': {
+    bound: 'one weak exact-receipt accumulator per live semantic transaction',
+    cleanup:
+      'the transaction wrapper unbinds in finally and deletes the weak entry; transaction collection is a fallback',
+    scope: 'module-transaction-registry',
+  },
   'src/store/storage-compaction-state.ts#physicalMutationTransactionDatabaseNames': {
     bound: 'one weak database-name association per live physical mutation transaction',
     cleanup:
@@ -1088,6 +1111,13 @@ export const MODULE_COLLECTION_CONTRACTS = Object.freeze({
 })
 
 export const CONTROLLER_COLLECTION_CONTRACTS = Object.freeze({
+  'src/store/browser-mutation-plan.ts#MutationInfrastructureBuilder': {
+    fields: ['effectsByTable', 'permittedEffects', 'tableNames', 'writableTableNames'],
+    bound: 'fixed physical tables and effect kinds for one command-plan compilation',
+    cleanup:
+      'command completion releases the compiled-plan closure, its task-local builder, and all four indexes',
+    scope: 'owner-instance',
+  },
   'src/backcompat/reasoning-envelope-v89.ts#LinearIdAllocator': {
     fields: ['used'],
     bound: 'one finite migration envelope plus synthesized collision IDs',

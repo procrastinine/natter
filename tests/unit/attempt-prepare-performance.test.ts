@@ -42,6 +42,7 @@ import {
   runWorkspaceRead,
 } from '../../src/store/workspace-runtime'
 import { createChat } from '../helpers/chats'
+import { testChatConfigurationLinkTransition } from '../helpers/configuration'
 import { installGenerationProfile } from '../helpers/generation-engine'
 import { testStreamLeaseAdmission } from '../helpers/stream-leases'
 
@@ -380,6 +381,7 @@ async function continuationPrepareInput(
   return {
     strategy: 'continue',
     lease,
+    configurationLinkTransition: testChatConfigurationLinkTransition(deepPath.chat),
     promptPath: {
       requirement: {
         kind: 'continue',

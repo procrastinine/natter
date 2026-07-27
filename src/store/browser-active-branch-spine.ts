@@ -1,11 +1,8 @@
 import type { Table, Transaction } from 'dexie'
 import type {
-  ActiveBranchForkSlot,
-  ActiveBranchForkTarget,
   ActiveBranchSelection,
   ActiveBranchTargetUnavailable,
 } from '../core/active-branch-spine'
-import { materializeActiveBranchForkSlots } from '../core/active-branch-spine'
 import { compareLiveLeafRecency } from '../core/active-path'
 import { childListKey, validateChildSlotProjection } from '../core/child-list-state'
 import { treeParentKey } from '../core/message-tree-index'
@@ -16,6 +13,7 @@ import {
   type MessagePresentation,
 } from '../core/messages'
 import type { Chat, ChatId, ChildListState, ChildSlotMember, MessageId } from '../core/types'
+import { readActiveBranchForkSlotsForHeadersInTransaction } from './active-branch-fork-storage'
 import { proveConversationSelectionFromExactPath } from './conversation-destination-seal'
 import { exactCompoundPrefixBetween } from './indexeddb-key-ranges'
 import {
@@ -551,6 +549,7 @@ export async function resolveConversationOpenReceipt(
         tipId: null,
         exactPathHeaders: Object.freeze([]),
         presentations: Object.freeze([]),
+        forks: Object.freeze([]),
         snapshotOwnership: 'adopt',
       })
     }
@@ -631,8 +630,13 @@ export async function resolveConversationOpenReceipt(
         reason: path.reason,
       })
     }
-    const terminalPoint = await terminalPointPromise
+    const forksPromise = access.runFrame(['childLists', 'childSlotMembers'], (tx) =>
+      readActiveBranchForkSlotsForHeadersInTransaction(tx, path.rows, owned.signal),
+    )
+    ownedLegs.push(forksPromise)
+    const [terminalPoint, forkFrame] = await Promise.all([terminalPointPromise, forksPromise])
     throwIfAborted(signal)
+    if (forkFrame.kind === 'stale') throw new ConversationOpenFrameStaleError()
     return proveConversationSelectionFromExactPath({
       chat: receipt.chat,
       target: receipt.target,
@@ -642,6 +646,7 @@ export async function resolveConversationOpenReceipt(
         terminalPoint?.kind === 'tip-point'
           ? Object.freeze([terminalPoint.presentation])
           : Object.freeze([]),
+      forks: forkFrame.value,
       snapshotOwnership: 'adopt',
     })
   } catch (error) {
@@ -720,34 +725,6 @@ async function classifyLiveLeafInTransaction(
     : 'leaf'
 }
 
-export async function readActiveBranchForksInTransaction(
-  tx: Transaction,
-  chatId: ChatId,
-  targets: readonly ActiveBranchForkTarget[],
-  signal?: AbortSignal,
-): Promise<readonly ActiveBranchForkSlot[]> {
-  if (targets.length === 0) return Object.freeze([])
-  throwIfAborted(signal)
-  const headers = await tx
-    .table<MessageHeaderRow, MessageId>('messages')
-    .bulkGet(targets.map((target) => target.selectedMessageId))
-  throwIfAborted(signal)
-  const selectedHeaders = headers.map((header, index) => {
-    const target = targets[index] as ActiveBranchForkTarget
-    if (
-      !header ||
-      header.id !== target.selectedMessageId ||
-      header.chatId !== chatId ||
-      header.parentId !== target.parentId ||
-      header.deleted
-    ) {
-      throw new Error(`ActiveBranchForkTargetInvalid:${target.selectedMessageId}`)
-    }
-    return header
-  })
-  return readActiveBranchForkSlotsForHeadersInTransaction(tx, selectedHeaders, signal)
-}
-
 export async function readActiveBranchChildAtPositionInTransaction(
   tx: Transaction,
   chatId: ChatId,
@@ -812,25 +789,6 @@ function validSelectedHeader(
   }
   if (header.deleted) return { kind: 'unavailable', selection, reason: 'message-deleted' }
   return { kind: 'ready', header }
-}
-
-export async function readActiveBranchForkSlotsForHeadersInTransaction(
-  tx: Transaction,
-  headers: readonly MessageHeaderRow[],
-  signal?: AbortSignal,
-): Promise<readonly ActiveBranchForkSlot[]> {
-  if (headers.length === 0) return Object.freeze([])
-  const [members, states] = await Promise.all([
-    tx
-      .table<ChildSlotMember, MessageId>('childSlotMembers')
-      .bulkGet(headers.map((header) => header.id)),
-    tx
-      .table<ChildListState, string>('childLists')
-      .bulkGet(headers.map((header) => childListKey(header.chatId, header.parentId))),
-  ])
-  throwIfAborted(signal)
-  const firstHeader = headers[0] as MessageHeaderRow
-  return materializeActiveBranchForkSlots(firstHeader.chatId, headers, states, members)
 }
 
 function ownedConversationReadSignal(parent: AbortSignal | undefined): {

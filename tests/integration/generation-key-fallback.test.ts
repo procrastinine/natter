@@ -375,6 +375,7 @@ describe('production generation key fallback', () => {
   it('recovers accepted-key metadata from the lease after post-commit interruption', async () => {
     const chat = await createChat({ settings: settings() })
     const repository = getBrowserRepository()
+    let prepareCalls = 0
     let interrupted = false
     const wrapped = new Proxy({} as WorkspaceRepository, {
       get(_target, property) {
@@ -389,6 +390,7 @@ describe('production generation key fallback', () => {
           command: Parameters<WorkspaceRepository['execute']>[1],
           options: Parameters<WorkspaceRepository['execute']>[2],
         ) => {
+          if (command.kind === 'attempt.prepare') prepareCalls += 1
           if (command.kind === 'generation.post-commit-metadata' && !interrupted) {
             interrupted = true
             throw new Error('post-commit interrupted')
@@ -406,6 +408,7 @@ describe('production generation key fallback', () => {
     const handle = await startSend(chat.id, 'recover key metadata', testNow())
 
     await expect(handle.completed).resolves.toMatchObject({ outcome: 'done' })
+    expect(prepareCalls).toBe(1)
     expect(interrupted).toBe(true)
     expect((await getKey('key-fallback'))?.lastUsedAt).toBeUndefined()
     const interruptedLeases = await leasesFor(chat.id)
@@ -415,12 +418,14 @@ describe('production generation key fallback', () => {
     expect(interruptedLeases[0]?.postCommit.selectedKeyId).toBe('key-fallback')
 
     __resetWorkspaceRepositoryForTests()
+    __setWorkspaceRepositoryForTests(wrapped)
     let recovery: Awaited<ReturnType<typeof recoverStreamOrphan>> = 'deferred'
     await eventually(async () => {
       recovery = await recoverStreamOrphan({ streamId: handle.streamId }, testNow(60_000))
       expect(recovery).not.toBe('deferred')
     })
     expect(['recovered', 'resolved']).toContain(recovery)
+    expect(prepareCalls).toBe(1)
     expect((await getKey('key-fallback'))?.lastUsedAt).toBeDefined()
     expect(await leasesFor(chat.id)).toEqual([])
   })

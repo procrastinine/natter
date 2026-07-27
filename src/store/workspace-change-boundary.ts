@@ -478,6 +478,9 @@ function validateDependency(value: unknown): asserts value is WorkspaceDependenc
       validateOptionalId(value.chatId)
       validateOptionalIds(value.streamIds)
       return
+    case 'model-resolution':
+      validateOptionalIds(value.targetKeys)
+      return
     case 'discovery-cache':
       validateOptionalIds(value.cacheKinds)
       validateOptionalIds(value.profileIds)
