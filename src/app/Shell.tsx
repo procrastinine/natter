@@ -782,10 +782,19 @@ export function Shell() {
   }, [])
 
   const ownGenerationSubmission = useCallback(
-    (action: (signal: AbortSignal) => Promise<void>): ComposerSubmission => {
+    (
+      action: (control: {
+        readonly signal: AbortSignal
+        readonly admit: () => void
+      }) => Promise<void>,
+    ): ComposerSubmission => {
+      let resolveAdmission!: () => void
+      const admitted = new Promise<void>((resolve) => {
+        resolveAdmission = resolve
+      })
       const claim = runGenerationSubmit({
         target: 'composer',
-        action: ({ signal }) => action(signal),
+        action: ({ signal }) => action({ signal, admit: resolveAdmission }),
       })
       const completion = (async (): Promise<ComposerSubmissionOutcome> => {
         const outcome = await claim.settled
@@ -799,7 +808,15 @@ export function Shell() {
             return Object.freeze({ kind: 'not-prepared', reason: outcome.kind })
         }
       })()
-      return Object.freeze({ kind: 'started', completion })
+      const admission = Promise.race([
+        admitted.then(() => Object.freeze({ kind: 'admitted' as const })),
+        claim.settled.then((outcome) =>
+          outcome.kind === 'succeeded'
+            ? Object.freeze({ kind: 'admitted' as const })
+            : Object.freeze({ kind: 'not-admitted' as const, reason: outcome.kind }),
+        ),
+      ])
+      return Object.freeze({ kind: 'started', admission, completion })
     },
     [runGenerationSubmit],
   )
@@ -811,7 +828,7 @@ export function Shell() {
     ): ComposerSubmission => {
       if (!activeChatId) throw new Error('SendActiveChatMissing')
       const prefillText = opts?.prefillText ?? ''
-      return ownGenerationSubmission(async (signal) => {
+      return ownGenerationSubmission(async ({ signal, admit }) => {
         const admission = generationCapabilityController.claimSelectedSend(activeChatId)
         let admissionTransferred = false
         try {
@@ -830,6 +847,7 @@ export function Shell() {
           )
           admissionTransferred = true
           const handle = await handlePromise
+          admit()
           preloadMessageList()
           await handle.prepared
         } finally {
@@ -848,7 +866,7 @@ export function Shell() {
       opts?: { prefillText?: string; attachmentRefs?: MessageAttachmentRef[] },
     ): ComposerSubmission => {
       const prefillText = opts?.prefillText ?? ''
-      return ownGenerationSubmission(async (signal) => {
+      return ownGenerationSubmission(async ({ signal, admit }) => {
         const routeIntent = beginRouteIntent()
         try {
           const conversationActions = await loadConversationActions()
@@ -863,6 +881,7 @@ export function Shell() {
                 : {}),
             },
           )
+          admit()
           const prepared = await handle.prepared
           if (prepared.kind === 'handoff') {
             navigateToChatForIntent(routeIntent, prepared.chatId, prepared.handoff)
@@ -882,13 +901,14 @@ export function Shell() {
         capability: pendingGenerationCapability('prompt-path'),
       })
     }
-    return ownGenerationSubmission(async (signal) => {
+    return ownGenerationSubmission(async ({ signal, admit }) => {
       const conversationActions = await loadConversationActions()
       const handle = await conversationActions.replyToMessageWhenCapabilitySettles(
         activeChatId,
         trailingUserMessage.id,
         signal,
       )
+      admit()
       await handle.prepared
     })
   }, [activeChatId, ownGenerationSubmission, trailingUserMessage])

@@ -102,6 +102,31 @@ export function canonicalMessageHeaderRow(header: MessageHeaderRow): MessageHead
   return canonical
 }
 
+export function transitionMessageAttachmentRefs(
+  header: MessageHeaderRow,
+  attachmentRefs: readonly MessageAttachmentRef[],
+): MessageHeaderRow {
+  const previousLiveCount = (header.attachmentRefs ?? []).reduce(
+    (count, ref) => count + Number(ref.deletedAt === undefined),
+    0,
+  )
+  const nextLiveCount = attachmentRefs.reduce(
+    (count, ref) => count + Number(ref.deletedAt === undefined),
+    0,
+  )
+  const mediaDelta = nextLiveCount - previousLiveCount
+  const next = canonicalMessageHeaderRow({
+    ...header,
+    attachmentRefs: structuredClone([...attachmentRefs]),
+    nodeVersion: header.nodeVersion + 1,
+    requestContextVersion: header.requestContextVersion + 1,
+    bodyMediaCount: Math.max(0, header.bodyMediaCount + mediaDelta),
+    bodyRenderCost: Math.max(1, header.bodyRenderCost + mediaDelta * RENDER_MEDIA_UNITS),
+  })
+  delete next.cachedMediaTokens
+  return next
+}
+
 export function installMessageStorageCodec(db: Dexie): void {
   db.use(messageStorageCodecMiddleware)
 }
@@ -180,9 +205,9 @@ export interface MessageTextPreviewRow {
   text: string
 }
 
-export type CurrentMessageCustodyDisposition =
+export type CurrentMessageCustody =
   | { readonly kind: 'available' }
-  | { readonly kind: 'preserve' }
+  | { readonly kind: 'preserve-existing' }
   | {
       readonly kind: 'reserved-attempt-target'
       readonly messageId: MessageId
@@ -220,7 +245,13 @@ export interface CurrentMessageTransition {
     readonly kind: 'exact' | 'transaction-allocated'
     readonly createdAt: number
   }
-  readonly custody: CurrentMessageCustodyDisposition
+  readonly custody: CurrentMessageCustody
+}
+
+export interface CurrentMessageUpdateCandidate {
+  readonly transition: CurrentMessageTransition
+  readonly headerChanged: boolean
+  readonly bodyChanged: boolean
 }
 
 export interface CurrentMessageGraphTransition {
@@ -385,7 +416,7 @@ export function compileCurrentMessageTransition(
     readonly requestContextVersion?: number
     readonly updatedAt?: number
     readonly previousAttachmentRefs?: readonly MessageAttachmentRef[] | undefined
-    readonly custody: CurrentMessageCustodyDisposition
+    readonly custody: CurrentMessageCustody
     readonly timestamp: 'exact' | 'transaction-allocated'
   },
 ): CurrentMessageTransition {
@@ -432,6 +463,61 @@ export function compileCurrentMessageTransition(
     }),
     timestamp: Object.freeze({ kind: options.timestamp, createdAt: message.createdAt }),
     custody: options.custody,
+  })
+}
+
+export function compileCurrentMessageUpdateCandidate(
+  message: Message,
+  existingHeader: MessageHeaderRow,
+  existingBody: MessageBodyRow,
+): CurrentMessageUpdateCandidate {
+  const transition = compileCurrentMessageTransition(
+    { ...message, nodeVersion: existingHeader.nodeVersion },
+    {
+      bodyVersion: existingHeader.bodyVersion,
+      requestContextVersion: existingHeader.requestContextVersion,
+      updatedAt: existingBody.updatedAt,
+      previousAttachmentRefs: existingHeader.attachmentRefs,
+      timestamp: 'exact',
+      custody: { kind: 'preserve-existing' },
+    },
+  )
+  return Object.freeze({
+    transition,
+    headerChanged: !sameValue(existingHeader, transition.storage.header),
+    bodyChanged: !sameValue(existingBody, transition.storage.body),
+  })
+}
+
+export function finalizeCurrentMessageUpdateTransition(
+  candidate: CurrentMessageUpdateCandidate,
+  versions: {
+    readonly nodeVersion: number
+    readonly requestContextVersion: number
+    readonly bodyVersion: number
+    readonly bodyUpdatedAt: number
+  },
+): CurrentMessageTransition {
+  const { transition } = candidate
+  return Object.freeze({
+    ...transition,
+    storage: Object.freeze({
+      header: {
+        ...transition.storage.header,
+        nodeVersion: versions.nodeVersion,
+        requestContextVersion: versions.requestContextVersion,
+        bodyVersion: versions.bodyVersion,
+      },
+      body: {
+        ...transition.storage.body,
+        bodyVersion: versions.bodyVersion,
+        updatedAt: versions.bodyUpdatedAt,
+      },
+      preview: {
+        ...transition.storage.preview,
+        bodyVersion: versions.bodyVersion,
+      },
+    }),
   })
 }
 

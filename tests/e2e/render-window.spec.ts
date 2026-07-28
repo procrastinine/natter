@@ -7,6 +7,7 @@ import { expect, type Locator, type Page, test } from './fixtures'
 import {
   buildSseBody,
   clearIndexedDb,
+  holdIndexedDbStoreGate,
   seedFirstRun,
   seedLinearChat,
   sendMessage,
@@ -129,11 +130,11 @@ test('send and regenerate keep the transcript mounted while the branch window re
   await expect.poll(() => page.locator('[data-ui="message"]').count()).toBeGreaterThanOrEqual(10)
 
   await startMessageCountRecorder(page)
-  await sendMessage(page, 'new prompt')
-  await sendRequested
   let appendedUserId: string
   let appendedAssistantId: string
+  const releaseSendStorage = await holdIndexedDbStoreGate(page, ['messages'])
   try {
+    await sendMessage(page, 'new prompt')
     const appendedUser = page.locator('[data-ui="message"][data-role="user"]').last()
     const appendedAssistant = page.locator('[data-ui="message"][data-role="assistant"]').last()
     await expect(appendedUser).toContainText('new prompt')
@@ -159,6 +160,12 @@ test('send and regenerate keep the transcript mounted while the branch window re
       },
       { userId, assistantId },
     )
+    expect(requestCount).toBe(0)
+  } finally {
+    await releaseSendStorage()
+  }
+  try {
+    await sendRequested
   } finally {
     releaseSend()
   }
@@ -218,14 +225,14 @@ test('send and regenerate keep the transcript mounted while the branch window re
     win.__tailAssistantObserver.observe(document.body, { childList: true, subtree: true })
     sample()
   })
-  await page
-    .locator('[data-ui="message"][data-role="assistant"]')
-    .last()
-    .locator('[data-action="regenerate"]')
-    .click()
   let regeneratedId: string
+  const releaseRegenerateStorage = await holdIndexedDbStoreGate(page, ['messages'])
   try {
-    await regenerateRequested
+    await page
+      .locator('[data-ui="message"][data-role="assistant"]')
+      .last()
+      .locator('[data-action="regenerate"]')
+      .click()
     const regeneratedMessage = page.locator('[data-ui="message"][data-role="assistant"]').last()
     await expect
       .poll(() => regeneratedMessage.getAttribute('data-message-id'))
@@ -268,6 +275,12 @@ test('send and regenerate keep the transcript mounted while the branch window re
     const firstRegenerated = tailSamples.indexOf(regeneratedId)
     expect(firstRegenerated).toBeGreaterThanOrEqual(0)
     expect(tailSamples.slice(firstRegenerated)).not.toContain(previousAssistantId)
+    expect(requestCount).toBe(1)
+  } finally {
+    await releaseRegenerateStorage()
+  }
+  try {
+    await regenerateRequested
   } finally {
     releaseRegenerate()
   }
@@ -314,6 +327,7 @@ test('send and regenerate keep the transcript mounted while the branch window re
     minimumBranchControlCount: 0,
     minimumMessageCount: expect.any(Number),
   })
+  expect(requestCount).toBe(2)
 })
 
 test('trailing-user Reply appends without replacing the mounted transcript prefix', async ({
@@ -432,6 +446,9 @@ test('branch swipe preserves common-prefix DOM identity without loading or blank
   const destinationPosition = selectedBranchIsA ? '2 / 2' : '1 / 2'
   await expect(messages.nth(1).locator('[data-ui="branch-controls"]')).toContainText(
     destinationPosition,
+  )
+  await expect(page.locator('[data-ui="message-list"]')).not.toHaveAttribute(
+    'data-presentation-only',
   )
   await messages.nth(1).getByLabel(returnLabel).click()
   await expect(messages.nth(1)).toContainText(selectedUser)

@@ -1,6 +1,6 @@
 // Attachment facade. Persistence stays behind WorkspaceRepository.
 
-import { createAttachmentRef, normalizeAttachmentRefs } from '../core/attachment-refs'
+import { createAttachmentRef } from '../core/attachment-refs'
 import {
   fileExtension,
   processAttachment,
@@ -28,12 +28,11 @@ import type {
   MessageId,
 } from '../core/types'
 import { newId } from '../lib/ulid'
+import type { MessageHeaderRow } from './message-storage'
 import type {
   AttachmentMediaProjection,
   AttachmentMediaPurpose,
   AttachmentReferenceRow,
-  AttachmentRefOwner,
-  MessagePresentation,
   PreparedAttachmentBundle,
   WorkspaceReadAuthority,
 } from './workspace-protocol'
@@ -104,14 +103,25 @@ interface AddAttachmentRefInput extends AttachmentRefTarget {
 
 interface RelinkAttachmentRefInput extends AttachmentRefTarget {
   refId: string
+  expectedAttachmentId: AttachmentId
   newAttachmentId: AttachmentId
   now?: number
 }
 
 export type MessageAttachmentRefMutation =
-  | { kind: 'visibility'; refId: string; includeInContext: boolean }
-  | { kind: 'detach'; refId: string }
-  | { kind: 'relink'; refId: string; newAttachmentId: AttachmentId }
+  | {
+      kind: 'visibility'
+      refId: string
+      expectedAttachmentId: AttachmentId
+      includeInContext: boolean
+    }
+  | { kind: 'detach'; refId: string; expectedAttachmentId: AttachmentId }
+  | {
+      kind: 'relink'
+      refId: string
+      expectedAttachmentId: AttachmentId
+      newAttachmentId: AttachmentId
+    }
 
 interface BatchRelinkAttachmentRefsInput {
   oldAttachmentId: AttachmentId
@@ -380,11 +390,9 @@ export async function addExistingAttachmentRef(
   input: AddAttachmentRefInput,
 ): Promise<MessageAttachmentRef> {
   const now = input.now ?? Date.now()
-  const target = await resolveAttachmentRefOwner(input)
+  const owner = attachmentRefMutationOwner(input)
   const created = createAttachmentRef(input.attachmentId, {
-    ...(target.owner.kind === 'message'
-      ? { messageId: target.owner.messageId }
-      : { draftChatId: target.owner.chatId }),
+    ...(owner.kind === 'message' ? { messageId: owner.messageId } : { draftChatId: owner.chatId }),
     createdAt: now,
   })
   const ref =
@@ -395,7 +403,7 @@ export async function addExistingAttachmentRef(
     getWorkspaceRepository().execute(permit, {
       kind: 'attachment.ref.add',
       input: {
-        owner: target.owner,
+        owner,
         ref,
         ...(input.afterRefId ? { afterRefId: input.afterRefId } : {}),
         now,
@@ -407,18 +415,21 @@ export async function addExistingAttachmentRef(
 }
 
 export async function setAttachmentRefVisibility(
-  targetInput: AttachmentRefTarget & { refId: string; includeInContext: boolean; now?: number },
+  targetInput: AttachmentRefTarget & {
+    refId: string
+    expectedAttachmentId: AttachmentId
+    includeInContext: boolean
+    now?: number
+  },
 ): Promise<MessageAttachmentRef> {
   const now = targetInput.now ?? Date.now()
-  const target = await resolveAttachmentRefOwner(targetInput)
-  const expected = requireAttachmentRef(target.refs, targetInput.refId)
   const commit = await runWorkspaceAction('attachment', (permit) =>
     getWorkspaceRepository().execute(permit, {
       kind: 'attachment.ref.set-visibility',
       input: {
-        owner: target.owner,
+        owner: attachmentRefMutationOwner(targetInput),
         refId: targetInput.refId,
-        expectedAttachmentId: expected.attachmentId,
+        expectedAttachmentId: targetInput.expectedAttachmentId,
         includeInContext: targetInput.includeInContext,
         now,
       },
@@ -429,19 +440,20 @@ export async function setAttachmentRefVisibility(
 }
 
 export async function detachAttachmentRef(
-  input: AttachmentRefTarget & { refId: string; now?: number },
+  input: AttachmentRefTarget & {
+    refId: string
+    expectedAttachmentId: AttachmentId
+    now?: number
+  },
 ): Promise<void> {
   const now = input.now ?? Date.now()
-  const target = await resolveAttachmentRefOwner(input)
-  const expected = target.refs.find((ref) => ref.refId === input.refId)
-  if (!expected) return
   await runWorkspaceAction('attachment', (permit) =>
     getWorkspaceRepository().execute(permit, {
       kind: 'attachment.ref.detach',
       input: {
-        owner: target.owner,
+        owner: attachmentRefMutationOwner(input),
         refId: input.refId,
-        expectedAttachmentId: expected.attachmentId,
+        expectedAttachmentId: input.expectedAttachmentId,
         now,
       },
     }),
@@ -452,6 +464,7 @@ export async function relinkAttachmentRef(
   input: RelinkAttachmentRefInput,
 ): Promise<MessageAttachmentRef> {
   const result = await mutateAttachmentReferenceTargets({
+    oldAttachmentId: input.expectedAttachmentId,
     newAttachmentId: input.newAttachmentId,
     refs: [input],
     ...(input.now !== undefined ? { now: input.now } : {}),
@@ -466,53 +479,54 @@ export async function mutateMessageAttachmentRef(input: {
   messageId: MessageId
   mutation: MessageAttachmentRefMutation
   now?: number
-}): Promise<MessagePresentation | undefined> {
-  const target = await resolveAttachmentRefOwner({ messageId: input.messageId })
-  if (target.owner.kind !== 'message' || target.owner.chatId !== input.chatId) return undefined
-  const expected = target.refs.find((ref) => ref.refId === input.mutation.refId)
-  if (!expected) return undefined
+}): Promise<MessageHeaderRow | undefined> {
   const now = input.now ?? Date.now()
+  const owner = {
+    kind: 'message' as const,
+    messageId: input.messageId,
+    expectedChatId: input.chatId,
+  }
   return runWorkspaceAction('attachment', async (permit) => {
     if (input.mutation.kind === 'visibility') {
       const commit = await getWorkspaceRepository().execute(permit, {
         kind: 'attachment.ref.set-visibility',
         input: {
-          owner: target.owner,
+          owner,
           refId: input.mutation.refId,
-          expectedAttachmentId: expected.attachmentId,
+          expectedAttachmentId: input.mutation.expectedAttachmentId,
           includeInContext: input.mutation.includeInContext,
           now,
         },
       })
-      return commit.value.presentation
+      return commit.value.header
     }
     if (input.mutation.kind === 'detach') {
       const commit = await getWorkspaceRepository().execute(permit, {
         kind: 'attachment.ref.detach',
         input: {
-          owner: target.owner,
+          owner,
           refId: input.mutation.refId,
-          expectedAttachmentId: expected.attachmentId,
+          expectedAttachmentId: input.mutation.expectedAttachmentId,
           now,
         },
       })
-      return commit.value.presentation
+      return commit.value.header
     }
     const commit = await getWorkspaceRepository().execute(permit, {
       kind: 'attachment.ref.relink',
       input: {
         refs: [
           {
-            owner: target.owner,
+            owner,
             refId: input.mutation.refId,
-            expectedAttachmentId: expected.attachmentId,
+            expectedAttachmentId: input.mutation.expectedAttachmentId,
           },
         ],
         newAttachmentId: input.mutation.newAttachmentId,
         now,
       },
     })
-    return commit.value.presentations[0]
+    return commit.value.headers[0]
   })
 }
 
@@ -523,20 +537,16 @@ export async function batchRelinkAttachmentRefs(
 }
 
 async function mutateAttachmentReferenceTargets(
-  input: Omit<BatchRelinkAttachmentRefsInput, 'oldAttachmentId'> & {
-    oldAttachmentId?: AttachmentId
+  input: BatchRelinkAttachmentRefsInput & {
     supersedeAttachmentId?: AttachmentId
   },
 ): Promise<MessageAttachmentRef[]> {
   const now = input.now ?? Date.now()
-  const targets = await Promise.all(input.refs.map(resolveAttachmentRefOwner))
-  const refs = targets.map((target, index) => {
-    const spec = input.refs[index]
-    if (!spec) throw new Error('AttachmentRelinkTargetMismatch')
-    const expectedAttachmentId =
-      input.oldAttachmentId ?? requireAttachmentRef(target.refs, spec.refId).attachmentId
-    return { owner: target.owner, refId: spec.refId, expectedAttachmentId }
-  })
+  const refs = input.refs.map((spec) => ({
+    owner: attachmentRefMutationOwner(spec),
+    refId: spec.refId,
+    expectedAttachmentId: input.oldAttachmentId,
+  }))
   const commit = await runWorkspaceAction('attachment', (permit) =>
     getWorkspaceRepository().execute(permit, {
       kind: 'attachment.ref.relink',
@@ -808,61 +818,14 @@ function canonicalKind(kind: AttachmentKind): AttachmentKind {
   return kind === 'file' ? 'other' : kind
 }
 
-async function resolveAttachmentRefOwner(input: AttachmentRefTarget): Promise<{
-  owner: AttachmentRefOwner
-  refs: MessageAttachmentRef[]
-}> {
+function attachmentRefMutationOwner(
+  input: AttachmentRefTarget,
+): { kind: 'message'; messageId: MessageId } | { kind: 'draft'; chatId: ChatId } {
   if (input.messageId) {
-    const presentation = await runWorkspaceRead('repository-query', (permit) =>
-      getWorkspaceRepository()
-        .query(
-          permit,
-          { kind: 'message.presentation', messageId: input.messageId as MessageId },
-          { signal: permit.signal },
-        )
-        .then((envelope) => envelope.value),
-    )
-    if (!presentation || presentation.header.deleted) {
-      throw new Error(`MessageMissing:${input.messageId}`)
-    }
-    return {
-      owner: {
-        kind: 'message',
-        chatId: presentation.header.chatId,
-        messageId: presentation.header.id,
-      },
-      refs: normalizeAttachmentRefs(presentation.header.attachmentRefs, {
-        messageId: presentation.header.id,
-        createdAt: presentation.header.createdAt,
-      }),
-    }
+    return { kind: 'message', messageId: input.messageId }
   }
   if (input.draftChatId) {
-    const draft = await runWorkspaceRead('repository-query', (permit) =>
-      getWorkspaceRepository()
-        .query(
-          permit,
-          { kind: 'draft.get', chatId: input.draftChatId as ChatId },
-          { signal: permit.signal },
-        )
-        .then((envelope) => envelope.value),
-    )
-    return {
-      owner: { kind: 'draft', chatId: input.draftChatId },
-      refs: normalizeAttachmentRefs(draft?.attachmentRefs, {
-        draftChatId: input.draftChatId,
-        createdAt: draft?.updatedAt ?? 0,
-      }),
-    }
+    return { kind: 'draft', chatId: input.draftChatId }
   }
   throw new Error('AttachmentRefTargetMissing')
-}
-
-function requireAttachmentRef(
-  refs: readonly MessageAttachmentRef[],
-  refId: string,
-): MessageAttachmentRef {
-  const ref = refs.find((candidate) => candidate.refId === refId)
-  if (!ref || ref.deletedAt !== undefined) throw new Error(`AttachmentRefMissing:${refId}`)
-  return ref
 }

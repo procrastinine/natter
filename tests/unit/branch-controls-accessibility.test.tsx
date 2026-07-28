@@ -84,4 +84,42 @@ describe('BranchControls accessibility', () => {
       'Variant 2 of 2.',
     ])
   })
+
+  it('owns a primary pointer jump before click without dispatching it twice', () => {
+    const first = message('message-a', 0)
+    const second = message('message-b', 1)
+    const context = createActiveBranchSpine({
+      chatId: CHAT_ID,
+      structuralVersion: 1,
+      resolvedLeafId: first.id,
+      headers: [splitMessageForStorage(first).header],
+      terminalChildSlot: emptyActiveBranchChildSlot(first.id),
+    }).replaceForks([
+      {
+        parentId: null,
+        selectedMessageId: first.id,
+        slotVersion: 1,
+        position: 0,
+        liveCount: 2,
+        nextSiblingIndex: 2,
+        previousMessageId: null,
+        nextMessageId: second.id,
+        firstMessageId: first.id,
+        lastMessageId: second.id,
+      },
+    ])
+    const fork = context.forkFor(first.id)
+    if (!fork) throw new Error('missing fork')
+    render(<BranchControls chatId={CHAT_ID} message={first} context={fork} />)
+
+    const next = screen.getByRole('link', { name: 'Next variant' })
+    fireEvent.pointerDown(next, { button: 0 })
+    fireEvent.click(next, { button: 0, detail: 1 })
+
+    expect(cursor.navigateMessage).toHaveBeenCalledTimes(1)
+    expect(cursor.navigateMessage).toHaveBeenCalledWith(CHAT_ID, second.id)
+    expect(useAnnouncementStore.getState().polite.map((event) => event.text)).toEqual([
+      'Variant 2 of 2.',
+    ])
+  })
 })

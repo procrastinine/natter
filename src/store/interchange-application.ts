@@ -30,6 +30,14 @@ async function importChat(
   return (await import('./import-export')).importChat(value, options, apply)
 }
 
+async function importChats(
+  values: readonly unknown[],
+  options: readonly ImportChatOptions[] = [],
+  apply?: (results: readonly ConversationCommittedResult<ImportChatResult>[]) => void,
+): Promise<readonly ConversationCommittedResult<ImportChatResult>[]> {
+  return (await import('./import-export')).importChats(values, options, apply)
+}
+
 async function exportChatPreset(presetId: PresetId): Promise<ChatPresetExportEnvelope> {
   return (await import('./import-export')).exportChatPreset(presetId)
 }
@@ -83,6 +91,7 @@ async function exportLastUpdatedChatText(
 export const interchangeApplication = Object.freeze({
   exportChat,
   importChat,
+  importChats,
   exportChatPreset,
   importChatPreset,
   exportConnectionProfile,

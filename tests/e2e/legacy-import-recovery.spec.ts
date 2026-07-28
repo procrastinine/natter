@@ -1,4 +1,5 @@
 import type { BrowserContext } from '@playwright/test'
+import { strToU8, zipSync } from 'fflate'
 import { expect, test } from './fixtures'
 import { clearIndexedDb } from './helpers'
 
@@ -6,6 +7,8 @@ const LEGACY_CREATED_AT = 1_720_000_000_000
 const LEGACY_PROFILE_ID = 'legacy-dangling-key-profile'
 const LEGACY_CHAT_TITLE = 'Legacy two-message chat'
 const LEGACY_MODEL_ID = 'anthropic/claude-opus-4.8'
+
+test.describe.configure({ mode: 'serial' })
 
 test.beforeEach(async ({ page }) => {
   await clearIndexedDb(page)
@@ -118,6 +121,66 @@ test('legacy storage-v25 workspace and portable chat recover through public impo
 
   await page.reload()
   await expectLegacyTranscript(page)
+  await expect(page.locator('[data-ui="workspace-bootstrap"][data-state="failed"]')).toHaveCount(0)
+})
+
+test('chat ZIP import is atomic and its current rows survive reload', async ({
+  expectRuntimeDiagnostic,
+  page,
+}) => {
+  expectRuntimeDiagnostic({
+    category: 'console-other',
+    source: 'console',
+    level: 'error',
+    message: 'Failed to import chat JSON/ZIP',
+    count: 1,
+  })
+  await page.goto('/')
+  await expect(page.locator('[data-ui="app-shell"]')).toBeVisible()
+  const alpha = renamedLegacyPortableChat('Atomic Alpha', 'alpha')
+  const beta = renamedLegacyPortableChat('Atomic Beta', 'beta')
+  const importInput = page.locator('[data-ui="sidebar-chat-import-input"]')
+
+  await importInput.setInputFiles({
+    name: 'malformed-later.zip',
+    mimeType: 'application/zip',
+    buffer: Buffer.from(
+      zipSync({
+        'alpha.json': strToU8(JSON.stringify(alpha)),
+        'zeta.json': strToU8(JSON.stringify({ objectKind: 'chat' })),
+      }),
+    ),
+  })
+
+  await expect(page.locator('[data-ui="toast"][data-tone="danger"]')).toBeVisible()
+  await expect(page.locator('[data-ui="chat-row"]')).toHaveCount(0)
+
+  await importInput.setInputFiles({
+    name: 'two-chats.zip',
+    mimeType: 'application/zip',
+    buffer: Buffer.from(
+      zipSync({
+        'alpha.json': strToU8(JSON.stringify(alpha)),
+        'beta.json': strToU8(JSON.stringify(beta)),
+      }),
+    ),
+  })
+
+  await expect(
+    page.locator('[data-ui="toast"]').filter({ hasText: 'Imported 2 chats.' }),
+  ).toBeVisible()
+  await expect(page.locator('[data-ui="chat-row"]')).toHaveCount(2)
+  await expect(page.locator('[data-ui="chat-row"][data-active="true"]')).toContainText(
+    'Atomic Beta',
+  )
+  await expect(page.locator('[data-ui="message"]')).toHaveCount(2)
+
+  await page.reload()
+  await expect(page.locator('[data-ui="chat-row"]')).toHaveCount(2)
+  await expect(page.locator('[data-ui="chat-row"][data-active="true"]')).toContainText(
+    'Atomic Beta',
+  )
+  await expect(page.locator('[data-ui="message"]')).toHaveCount(2)
   await expect(page.locator('[data-ui="workspace-bootstrap"][data-state="failed"]')).toHaveCount(0)
 })
 
@@ -347,6 +410,17 @@ function legacyPortableChat() {
       },
     },
   }
+}
+
+function renamedLegacyPortableChat(title: string, suffix: string) {
+  const value = legacyPortableChat()
+  const sourceChatId = `legacy-portable-source-${suffix}`
+  value.payload.chat = { ...value.payload.chat, sourceChatId, title }
+  value.payload.messages = value.payload.messages.map((message) => ({
+    ...message,
+    chatId: sourceChatId,
+  }))
+  return value
 }
 
 function legacyChatSettings() {

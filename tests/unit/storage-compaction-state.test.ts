@@ -2,6 +2,7 @@ import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { BROWSER_WORKSPACE_CONTROL_DATABASE_NAME } from '../../src/lib/origin-storage-names'
 import { runBrowserCommandTransaction } from '../../src/store/browser-command-mutation-journal'
+import { browserWorkspaceCatchupTransactionTableNames } from '../../src/store/browser-workspace-catchup-journal'
 import {
   applyUnslottedBrowserWorkspaceReplacementStorageBaseline,
   claimBrowserWorkspaceCompactionAttempt,
@@ -454,21 +455,24 @@ describe('storage compaction state', () => {
     }
     await db.messageBodies.bulkAdd([...rows, survivor])
 
-    const result = await db.transaction('rw', db.messageBodies, (tx) =>
-      runBrowserCommandTransaction(tx, async () => {
-        const collection = tx
-          .table<MessageBodyRow, string>('messageBodies')
-          .where('chatId')
-          .equals('chat-a')
-        const each = vi.spyOn(collection, 'each')
-        const toArray = vi.spyOn(collection, 'toArray')
-        const primaryKeys = vi.spyOn(collection, 'primaryKeys')
-        const deleted = await deletePhysicalStorageCollection(tx, 'messageBodies', collection)
-        expect(each).toHaveBeenCalledTimes(1)
-        expect(toArray).not.toHaveBeenCalled()
-        expect(primaryKeys).not.toHaveBeenCalled()
-        return deleted
-      }),
+    const result = await db.transaction(
+      'rw',
+      browserWorkspaceCatchupTransactionTableNames(['messageBodies']),
+      (tx) =>
+        runBrowserCommandTransaction(tx, async () => {
+          const collection = tx
+            .table<MessageBodyRow, string>('messageBodies')
+            .where('chatId')
+            .equals('chat-a')
+          const each = vi.spyOn(collection, 'each')
+          const toArray = vi.spyOn(collection, 'toArray')
+          const primaryKeys = vi.spyOn(collection, 'primaryKeys')
+          const deleted = await deletePhysicalStorageCollection(tx, 'messageBodies', collection)
+          expect(each).toHaveBeenCalledTimes(1)
+          expect(toArray).not.toHaveBeenCalled()
+          expect(primaryKeys).not.toHaveBeenCalled()
+          return deleted
+        }),
     )
     await awaitStorageCompactionDebtIdle()
 

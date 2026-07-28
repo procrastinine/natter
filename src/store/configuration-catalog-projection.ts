@@ -422,18 +422,6 @@ export async function putConfigurationPresetRecencyCatalogProjection(
   return applyConfigurationPresetRecencyCatalogProjectionRows(transaction, previous, next)
 }
 
-export function applyConfigurationPresetRecencyCatalogProjectionTransition(
-  transaction: Transaction,
-  previous: ChatPreset,
-  next: ChatPreset,
-): Promise<ConfigurationCatalogProjectionMutationReceipt> {
-  return applyConfigurationPresetRecencyCatalogProjectionRows(
-    transaction,
-    configurationPresetCatalogProjectionRow(previous),
-    configurationPresetCatalogProjectionRow(next),
-  )
-}
-
 async function applyConfigurationPresetRecencyCatalogProjectionRows(
   transaction: Transaction,
   previous: ConfigurationPresetCatalogProjectionRow,
@@ -455,16 +443,6 @@ async function applyConfigurationPresetRecencyCatalogProjectionRows(
     next.id,
     'write',
   )
-}
-
-export async function deleteConfigurationPresetCatalogProjection(
-  transaction: Transaction,
-  presetId: PresetId,
-): Promise<ConfigurationPresetCatalogMutationReceipt> {
-  const previous = await transaction
-    .table<ConfigurationPresetCatalogProjectionRow, PresetId>('configurationPresetCatalogRows')
-    .get(presetId)
-  return deleteConfigurationPresetCatalogProjectionRow(transaction, presetId, previous)
 }
 
 export function applyConfigurationPresetCatalogProjectionDeletion(
@@ -520,19 +498,6 @@ export function configurationPromptPresetCatalogProjectionRow(
     ...(preset.lastUsedAt === undefined ? {} : { lastUsedAt: preset.lastUsedAt }),
     nameSortKey: configurationCatalogNameSortKey(preset.name),
   }
-}
-
-export async function putConfigurationPromptPresetCatalogProjection(
-  transaction: Transaction,
-  preset: PromptPreset,
-): Promise<ConfigurationCatalogProjectionMutationReceipt> {
-  const next = configurationPromptPresetCatalogProjectionRow(preset)
-  const previous = await transaction
-    .table<ConfigurationPromptPresetCatalogProjectionRow, PromptPresetId>(
-      'configurationPromptPresetCatalogRows',
-    )
-    .get(preset.id)
-  return applyConfigurationPromptPresetCatalogProjectionRows(transaction, previous, next)
 }
 
 export function applyConfigurationPromptPresetCatalogProjectionTransition(
@@ -597,20 +562,6 @@ async function applyConfigurationPromptPresetCatalogProjectionRows(
   )
 }
 
-export async function putConfigurationPromptPresetRecencyCatalogProjection(
-  transaction: Transaction,
-  preset: PromptPreset,
-): Promise<ConfigurationCatalogProjectionMutationReceipt> {
-  const next = configurationPromptPresetCatalogProjectionRow(preset)
-  const previous = await transaction
-    .table<ConfigurationPromptPresetCatalogProjectionRow, PromptPresetId>(
-      'configurationPromptPresetCatalogRows',
-    )
-    .get(preset.id)
-  if (!previous) throw new Error(`ConfigurationPromptPresetCatalogProjectionMissing:${preset.id}`)
-  return applyConfigurationPromptPresetRecencyCatalogProjectionRows(transaction, previous, next)
-}
-
 export function applyConfigurationPromptPresetRecencyCatalogProjectionTransition(
   transaction: Transaction,
   previous: PromptPreset,
@@ -644,18 +595,6 @@ async function applyConfigurationPromptPresetRecencyCatalogProjectionRows(
     next.id,
     'write',
   )
-}
-
-export async function deleteConfigurationPromptPresetCatalogProjection(
-  transaction: Transaction,
-  presetId: PromptPresetId,
-): Promise<ConfigurationCatalogProjectionMutationReceipt> {
-  const previous = await transaction
-    .table<ConfigurationPromptPresetCatalogProjectionRow, PromptPresetId>(
-      'configurationPromptPresetCatalogRows',
-    )
-    .get(presetId)
-  return deleteConfigurationPromptPresetCatalogProjectionRow(transaction, presetId, previous)
 }
 
 export function applyConfigurationPromptPresetCatalogProjectionDeletion(

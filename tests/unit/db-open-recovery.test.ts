@@ -1,7 +1,21 @@
 import 'fake-indexeddb/auto'
 import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { createChatRow } from '../../src/core/chat-metadata'
+import { readBrowserWorkspaceDatabaseManifest } from '../../src/store/browser-workspace-database-control'
 import type { BrowserWorkspaceOpenProgress } from '../../src/store/browser-workspace-open-contract'
+import { WAVE_A_V94_STORES } from '../../src/store/browser-workspace-schema-v94'
+import {
+  BROWSER_WORKSPACE_CURRENT_COMPLETION_KEY,
+  isBrowserWorkspaceCurrentCompletionValueV97,
+  WAVE_B_V97_STORES,
+} from '../../src/store/browser-workspace-schema-v97'
+import {
+  __resetBrowserWorkspaceSlotCoordinatorForTests,
+  disposeBrowserWorkspaceSlotCoordinator,
+  installBrowserWorkspaceSlotCoordinator,
+} from '../../src/store/browser-workspace-slot-coordination'
+import { ensureBrowserWorkspaceCurrentForSelection } from '../../src/store/browser-workspace-startup-repair'
 import {
   __resetBrowserWorkspaceFatalInvalidationOwnerForTests,
   __resetDbForTests,
@@ -19,6 +33,32 @@ import {
 } from '../../src/store/db'
 import { installFreshFakeIndexedDbForTests } from '../helpers/fake-indexeddb'
 
+const originalBroadcastChannel = globalThis.BroadcastChannel
+const originalLocks = Object.getOwnPropertyDescriptor(navigator, 'locks')
+
+class ImmediateLockManager {
+  request<T>(
+    name: string,
+    options: { mode: 'shared' | 'exclusive'; ifAvailable?: boolean; signal?: AbortSignal },
+    callback: (lock: Lock) => Promise<T> | T,
+  ): Promise<T> {
+    return Promise.resolve(callback({ name, mode: options.mode }))
+  }
+}
+
+class SilentBroadcastChannel extends EventTarget {
+  readonly name: string
+
+  constructor(name: string) {
+    super()
+    this.name = name
+  }
+
+  close(): void {}
+
+  postMessage(): void {}
+}
+
 beforeEach(() => {
   __resetBrowserWorkspaceFatalInvalidationOwnerForTests()
   __resetDbForTests({ admissionsOpen: true })
@@ -26,6 +66,13 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  __resetBrowserWorkspaceSlotCoordinatorForTests()
+  Object.defineProperty(globalThis, 'BroadcastChannel', {
+    configurable: true,
+    value: originalBroadcastChannel,
+  })
+  if (originalLocks) Object.defineProperty(navigator, 'locks', originalLocks)
+  else Reflect.deleteProperty(navigator, 'locks')
   vi.restoreAllMocks()
   __resetDbForTests({ admissionsOpen: true })
   __resetBrowserWorkspaceFatalInvalidationOwnerForTests()
@@ -158,7 +205,7 @@ describe('openDb recovery events', () => {
     const candidate = new NatterDb(name)
     try {
       await prepareBrowserWorkspaceSchema(candidate)
-      expect(metadataTransactions).toBe(2)
+      expect(metadataTransactions).toBe(3)
       expect(closedWithActiveMetadata).toBe(false)
     } finally {
       candidate.close()
@@ -166,7 +213,7 @@ describe('openDb recovery events', () => {
     }
   })
 
-  it('does not inherit the verification cache across a replacement physical session', async () => {
+  it('uses the selected completion proof without a full-schema transaction after session reopen', async () => {
     await openDb()
     const invalidated = invalidateBrowserWorkspaceSession()
     if (!invalidated) throw new Error('ExpectedInvalidatedBrowserWorkspaceSession')
@@ -185,8 +232,7 @@ describe('openDb recovery events', () => {
       )
     })
 
-    expect(schemaVerificationTransactions.length).toBeGreaterThan(0)
-    const initialVerificationTransactionCount = schemaVerificationTransactions.length
+    expect(schemaVerificationTransactions).toHaveLength(0)
     await Promise.all(Array.from({ length: 64 }, () => openDb()))
     expect(
       transactionSpy.mock.results.filter((result) => {
@@ -197,102 +243,207 @@ describe('openDb recovery events', () => {
             replacement.tables.length
         )
       }),
-    ).toHaveLength(initialVerificationTransactionCount)
+    ).toHaveLength(0)
   })
 
-  it('repairs missing derived stores before runtime and preserves canonical rows', async () => {
-    const db = await openDb()
-    await db.settings.put({ key: 'canonical-proof', value: 'preserved' })
-    const damagedVersion = currentRawVersion() + 1
-    __resetDbForTests({ admissionsOpen: true })
-    await upgradeRawDatabase('natter', damagedVersion, (database) => {
-      database.deleteObjectStore('attachmentCatalogRows')
+  it('normalizes observed v95.8 rows on an inactive destination and deletes only the old slot', async () => {
+    const legacy = new Dexie('natter')
+    legacy.version(95.8).stores(WAVE_A_V94_STORES)
+    await legacy.open()
+    await legacy.table('settings').bulkPut([
+      { key: 'canonical-proof', value: 'preserved' },
+      { key: 'global:auto-scroll', value: true },
+      {
+        key: 'workspace-meta',
+        value: { workspaceId: 'inactive-repair-workspace', replacementEpoch: 4 },
+      },
+      ...Array.from({ length: 130 }, (_, index) => ({
+        key: `page-proof:${index.toString().padStart(3, '0')}`,
+        value: index,
+      })),
+      { key: 'page-proof:oversized', value: 'x'.repeat(1024 * 1024 + 1) },
+    ])
+    legacy.close()
+
+    const progress: BrowserWorkspaceOpenProgress[] = []
+    const proof = await runStartupRepair((event) => progress.push(event))
+    expect(proof).toMatchObject({
+      databaseName: 'natter-workspace-a',
+      activationSequence: 1,
+      physicalVersion: 970,
     })
-
-    const repaired = await openDb()
-
-    expect(repaired.backendDB().objectStoreNames.contains('attachmentCatalogRows')).toBe(true)
+    expect(await readBrowserWorkspaceDatabaseManifest()).toEqual({
+      id: 'workspace',
+      activeDatabaseName: 'natter-workspace-a',
+      activationSequence: 1,
+    })
+    const repaired = new NatterDb(proof.databaseName)
+    await repaired.open()
     expect((await repaired.settings.get('canonical-proof'))?.value).toBe('preserved')
-    expect(Math.round(repaired.verno * 10)).toBe(damagedVersion + 1)
-  })
-
-  it('repairs drifted derived indexes at a monotonic physical version', async () => {
-    await openDb()
-    const damagedVersion = currentRawVersion() + 1
-    __resetDbForTests({ admissionsOpen: true })
-    await upgradeRawDatabase('natter', damagedVersion, (_database, transaction) => {
-      transaction.objectStore('attachmentCatalogRows').deleteIndex('refCount')
-    })
-
-    const repaired = await openDb()
-
-    expect(repaired.attachmentCatalogRows.schema.indexes.map((index) => index.src)).toContain(
-      'refCount',
+    expect(await repaired.settings.get('global:auto-scroll')).toBeUndefined()
+    expect((await repaired.settings.get('global:auto-scroll-stream'))?.value).toBe(true)
+    expect((await repaired.settings.get('page-proof:oversized'))?.value).toHaveLength(
+      1024 * 1024 + 1,
     )
-    expect(Math.round(repaired.verno * 10)).toBe(damagedVersion + 1)
+    expect(await repaired.workspaceFence.get('global')).toEqual({
+      id: 'global',
+      workspaceId: 'inactive-repair-workspace',
+      replacementEpoch: 4,
+    })
+    expect(
+      isBrowserWorkspaceCurrentCompletionValueV97(
+        (await repaired.settings.get(BROWSER_WORKSPACE_CURRENT_COMPLETION_KEY))?.value,
+      ),
+    ).toBe(true)
+    repaired.close()
+    const copyPages = progress.filter(
+      (event): event is Extract<BrowserWorkspaceOpenProgress, { kind: 'database-upgrade' }> =>
+        event.kind === 'database-upgrade' &&
+        event.phase === 'inactive-copy' &&
+        event.operation === 'copy-settings',
+    )
+    let priorRows = 0
+    let priorBytes = 0
+    for (const page of copyPages) {
+      const pageRows = page.processedRows - priorRows
+      const pageBytes = page.processedBytes - priorBytes
+      expect(pageRows).toBeLessThanOrEqual(64)
+      if (pageBytes > 1024 * 1024) expect(pageRows).toBe(1)
+      priorRows = page.processedRows
+      priorBytes = page.processedBytes
+    }
+    expect((await indexedDB.databases()).map((database) => database.name)).not.toContain('natter')
   })
 
-  it('converges concurrent tab opens on one monotonic repair version', async () => {
-    const name = 'concurrent-derived-repair'
-    const seed = new NatterDb(name)
-    await seed.open()
-    await seed.settings.put({ key: 'canonical-proof', value: 'both-tabs' })
-    const damagedVersion = Math.round(seed.verno * 10) + 1
-    seed.close()
-    await upgradeRawDatabase(name, damagedVersion, (database) => {
-      database.deleteObjectStore('attachmentCatalogRows')
-    })
-    const tabA = new NatterDb(name)
-    const tabB = new NatterDb(name)
+  it('rebuilds poisoned derived rows after a missing current marker without changing the epoch', async () => {
+    const source = new NatterDb('natter')
+    await source.open()
+    await source.settings.put({ key: 'canonical-proof', value: 'current-source' })
+    await source.chatSidebarRows.put({ id: 'poison', title: 'poison' } as never)
+    await source.settings.delete(BROWSER_WORKSPACE_CURRENT_COMPLETION_KEY)
+    source.close()
 
-    await Promise.all([prepareBrowserWorkspaceSchema(tabA), prepareBrowserWorkspaceSchema(tabB)])
-    await Promise.all([tabA.open(), tabB.open()])
-
-    expect(Math.round(tabA.verno * 10)).toBe(damagedVersion + 1)
-    expect(Math.round(tabB.verno * 10)).toBe(damagedVersion + 1)
-    expect((await tabA.settings.get('canonical-proof'))?.value).toBe('both-tabs')
-    expect((await tabB.settings.get('canonical-proof'))?.value).toBe('both-tabs')
-    tabA.close()
-    tabB.close()
-    await Dexie.delete(name)
+    const proof = await runStartupRepair()
+    const repaired = new NatterDb(proof.databaseName)
+    await repaired.open()
+    expect(repaired.verno).toBe(97)
+    expect((await repaired.settings.get('canonical-proof'))?.value).toBe('current-source')
+    expect(await repaired.chatSidebarRows.get('poison')).toBeUndefined()
+    repaired.close()
   })
 
-  it('drops only explicitly retired stores during automatic schema repair', async () => {
-    await openDb()
-    const damagedVersion = currentRawVersion() + 1
-    __resetDbForTests({ admissionsOpen: true })
-    await upgradeRawDatabase('natter', damagedVersion, (database) => {
-      database.createObjectStore('chatBranchCache', { keyPath: 'chatId' })
+  it('repairs an earlier v97 completion marker and reclaims empty-profile derived rows', async () => {
+    const source = new Dexie('natter')
+    source.version(97).stores({
+      ...WAVE_B_V97_STORES,
+      attachmentRefEdges:
+        '&[ownerKind+ownerId+refId], attachmentId, [attachmentId+ownerKind], [attachmentId+chatId], [ownerKind+ownerId], chatId',
     })
+    await source.open()
+    const chat = createChatRow({ id: 'unconfigured-chat' })
+    await source.transaction(
+      'rw',
+      [
+        source.table('chats'),
+        source.table('configurationLinks'),
+        source.table('configurationProfileUsageRows'),
+        source.table('settings'),
+      ],
+      async () => {
+        await source.table('chats').put(chat)
+        await source.table('configurationLinks').put({
+          id: `chat:${chat.id}:profile`,
+          ownerKind: 'chat',
+          ownerId: chat.id,
+          ownerKey: `chat:${chat.id}`,
+          targetKind: 'profile',
+          targetId: '',
+          targetKey: 'profile:',
+          slot: 'profile',
+          ownerActive: true,
+        })
+        await source.table('configurationProfileUsageRows').put({
+          id: '',
+          presetCount: 0,
+          activePresetCount: 0,
+          chatCount: 1,
+          activeChatCount: 1,
+        })
+        await source.table('settings').put({
+          key: BROWSER_WORKSPACE_CURRENT_COMPLETION_KEY,
+          value: {
+            formatVersion: 2,
+            storageVersion: 97,
+            phase: 'canonical-and-derived-complete',
+          },
+        })
+      },
+    )
+    source.close()
 
-    const repaired = await openDb()
-
-    expect(repaired.backendDB().objectStoreNames.contains('chatBranchCache')).toBe(false)
+    const proof = await runStartupRepair()
+    const repaired = new NatterDb(proof.databaseName)
+    await repaired.open()
+    expect(repaired.verno).toBe(97)
+    expect(await repaired.chats.get(chat.id)).toMatchObject({
+      id: chat.id,
+      settings: { profileId: '' },
+    })
+    expect(await repaired.configurationLinks.where('targetKey').equals('profile:').count()).toBe(0)
+    expect(await repaired.configurationProfileUsageRows.get('')).toBeUndefined()
+    expect(repaired.attachmentRefEdges.schema.indexes.map((index) => index.src)).toContain(
+      '[attachmentId+ownerKind+ownerId+refId]',
+    )
+    expect(
+      isBrowserWorkspaceCurrentCompletionValueV97(
+        (await repaired.settings.get(BROWSER_WORKSPACE_CURRENT_COMPLETION_KEY))?.value,
+      ),
+    ).toBe(true)
+    repaired.close()
   })
 
-  it('fails safely when a canonical store is missing', async () => {
-    await openDb()
-    const damagedVersion = currentRawVersion() + 1
-    __resetDbForTests({ admissionsOpen: true })
-    await upgradeRawDatabase('natter', damagedVersion, (database) => {
-      database.deleteObjectStore('messages')
+  it('keeps a malformed authoritative source selected when inactive normalization fails', async () => {
+    const legacy = new Dexie('natter')
+    legacy.version(95.8).stores(WAVE_A_V94_STORES)
+    await legacy.open()
+    await legacy.table('settings').put({ key: 'canonical-proof', value: 'still-source' })
+    await legacy.table('messages').put({
+      id: 'message-poison',
+      chatId: 'chat-poison',
+      bodyVersion: 0,
+      nodeVersion: 0,
+      requestContextVersion: 0,
     })
+    legacy.close()
 
-    await expect(openDb()).rejects.toThrow(
-      'BrowserWorkspaceSchemaIntegrity:canonical-stores-missing:messages',
+    await expect(runStartupRepair()).rejects.toThrow('WaveAMessageBodyMissing:message-poison')
+    expect(await readBrowserWorkspaceDatabaseManifest()).toEqual({
+      id: 'workspace',
+      activeDatabaseName: 'natter',
+      activationSequence: 0,
+    })
+    const source = await openRawDatabase('natter')
+    expect(
+      await requestValue(
+        source.transaction('settings', 'readonly').objectStore('settings').get('canonical-proof'),
+      ),
+    ).toEqual({ key: 'canonical-proof', value: 'still-source' })
+    source.close()
+    expect((await indexedDB.databases()).map((database) => database.name)).not.toContain(
+      'natter-workspace-a',
     )
   })
 
-  it('fails safely without deleting an unclassified extra store', async () => {
+  it('rejects a future physical version without deleting its unclassified rows', async () => {
     await openDb()
-    const damagedVersion = currentRawVersion() + 1
+    const futureVersion = currentRawVersion() + 1
     __resetDbForTests({ admissionsOpen: true })
-    await upgradeRawDatabase('natter', damagedVersion, (database) => {
+    await upgradeRawDatabase('natter', futureVersion, (database) => {
       database.createObjectStore('unknownUserRows', { keyPath: 'id' })
     })
 
     await expect(openDb()).rejects.toThrow(
-      'BrowserWorkspaceSchemaIntegrity:unexpected-stores:unknownUserRows',
+      `BrowserWorkspaceSchemaIntegrity:future-version:${futureVersion}`,
     )
     __resetDbForTests({ admissionsOpen: true })
     const physical = await openRawDatabase('natter')
@@ -358,6 +509,33 @@ describe('openDb recovery events', () => {
     expect(fatal).not.toHaveBeenCalled()
   })
 })
+
+async function runStartupRepair(onProgress?: (progress: BrowserWorkspaceOpenProgress) => void) {
+  Object.defineProperty(globalThis, 'BroadcastChannel', {
+    configurable: true,
+    value: SilentBroadcastChannel,
+  })
+  Object.defineProperty(navigator, 'locks', {
+    configurable: true,
+    value: new ImmediateLockManager(),
+  })
+  const coordinator = installBrowserWorkspaceSlotCoordinator({
+    validateQuiesce: async () => false,
+    reconcile: async () => undefined,
+  })
+  try {
+    return await ensureBrowserWorkspaceCurrentForSelection(new AbortController().signal, onProgress)
+  } finally {
+    disposeBrowserWorkspaceSlotCoordinator(coordinator)
+  }
+}
+
+function requestValue<T>(request: IDBRequest<T>): Promise<T> {
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result)
+    request.onerror = () => reject(request.error)
+  })
+}
 
 function openRawDatabase(name: string, version?: number): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {

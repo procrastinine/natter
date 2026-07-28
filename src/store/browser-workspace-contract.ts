@@ -1,3 +1,4 @@
+import type { Transaction } from 'dexie'
 import type { BrowserWorkspaceReplacementStorageBaseline } from './browser-workspace-database-control'
 import type { NatterDb } from './db'
 import type { LockGrant } from './locks'
@@ -10,6 +11,7 @@ export interface BrowserWorkspaceSnapshot {
 export interface BrowserWorkspacePreparedReplacement<T> {
   workspace: BrowserWorkspaceSnapshot
   storageBaseline: BrowserWorkspaceReplacementStorageBaseline
+  publication?: 'replace' | 'deferred'
   value: T
 }
 
@@ -37,3 +39,25 @@ export type BrowserWorkspaceReplacementOperation<T> = (
   db: NatterDb,
   context: BrowserWorkspaceReplacementContext,
 ) => Promise<BrowserWorkspacePreparedReplacement<T>>
+
+export interface BrowserWorkspaceOnlineReplacementContext {
+  readonly sourceDatabaseName: string
+  readonly destinationDatabaseName: string
+  readonly signal: AbortSignal
+  readonly preactivationCheckpoint: () => void
+  readonly withSourceDatabase: <T>(operation: (source: NatterDb) => Promise<T>) => Promise<T>
+  readonly runDestinationTransaction: <T>(
+    tableNames: readonly string[],
+    operation: (transaction: Transaction) => Promise<T> | T,
+  ) => Promise<T>
+}
+
+export interface BrowserWorkspaceOnlineReplacementOperation<Prepared, T> {
+  prepare(db: NatterDb, context: BrowserWorkspaceOnlineReplacementContext): Promise<Prepared>
+  abandon?(sourceDatabaseName: string): Promise<void>
+  commit(
+    db: NatterDb,
+    context: BrowserWorkspaceReplacementContext,
+    prepared: Prepared,
+  ): Promise<BrowserWorkspacePreparedReplacement<T>>
+}

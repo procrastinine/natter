@@ -404,6 +404,11 @@ class TabGenerationAdmissionController implements GenerationAdmissionController 
           conversationController.presentGenerationIntent(claim.steering, {
             baseLeafId: destination.expectedLeafId,
             messages,
+            ...(capturedIntent.kind === 'regenerate'
+              ? { replacesFromMessageId: capturedIntent.targetAssistantId }
+              : capturedIntent.kind === 'edit-resend'
+                ? { replacesFromMessageId: capturedIntent.targetUserId }
+                : {}),
           })
         }
       }

@@ -216,6 +216,7 @@ describe('focused interaction surfaces', () => {
     expect(onMutateMessageRef).toHaveBeenCalledWith({
       kind: 'visibility',
       refId: 'ref-1',
+      expectedAttachmentId: 'attachment-1',
       includeInContext: false,
     })
   })

@@ -183,7 +183,7 @@ async function drainQueueProbes(cycle: GeneratedOutputLocalizationCapabilityCycl
       workPresent =
         envelope.workspaceId === cycle.fence.workspaceId &&
         envelope.replacementEpoch === cycle.fence.replacementEpoch &&
-        (envelope.value.readyJobIds.length > 0 || envelope.value.nextWakeAt !== undefined)
+        (envelope.value.readyJobs.length > 0 || envelope.value.nextWakeAt !== undefined)
     } finally {
       cycle.completedRevision = revision
     }

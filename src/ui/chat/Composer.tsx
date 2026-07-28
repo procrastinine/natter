@@ -110,8 +110,19 @@ export type ComposerSubmissionOutcome =
       readonly reason: 'cancelled' | 'failed' | 'rejected-pending' | 'superseded'
     }
 
+export type ComposerSubmissionAdmission =
+  | { readonly kind: 'admitted' }
+  | {
+      readonly kind: 'not-admitted'
+      readonly reason: 'cancelled' | 'failed' | 'rejected-pending' | 'superseded'
+    }
+
 export type ComposerSubmission =
-  | { readonly kind: 'started'; readonly completion: Promise<ComposerSubmissionOutcome> }
+  | {
+      readonly kind: 'started'
+      readonly admission: Promise<ComposerSubmissionAdmission>
+      readonly completion: Promise<ComposerSubmissionOutcome>
+    }
   | { readonly kind: 'not-started'; readonly capability: NonReadyGenerationCapability }
 
 type AutoSizeVariant = 'normal' | 'focus'
@@ -538,9 +549,11 @@ export function Composer({
       return
     }
     if (submission.kind === 'not-started') return
-    setComposerText((current) => (current === submittedDraft ? '' : current))
     setSubmitting(true)
     try {
+      const admission = await submission.admission
+      if (admission.kind !== 'admitted') return
+      setComposerText((current) => (current === submittedDraft ? '' : current))
       const outcome = await submission.completion
       if (outcome.kind !== 'prepared') {
         setComposerText((current) => (current.length === 0 ? submittedDraft : current))
@@ -552,6 +565,7 @@ export function Composer({
       }
     } catch (err) {
       if (isPageHidingAbortError(err)) return
+      setComposerText((current) => (current.length === 0 ? submittedDraft : current))
       console.error('composer submit failed', err)
     } finally {
       setSubmitting(false)

@@ -74,6 +74,7 @@ import {
   splitMessageForStorage,
 } from '../../src/store/message-storage'
 import { persistedStreamEventV2FromUnknown } from '../../src/store/persisted-stream-event'
+import { BROWSER_WORKSPACE_CATCHUP_JOURNAL_TABLE_NAMES } from '../../src/store/physical-storage-tables'
 import { readPresetOrderIds } from '../../src/store/preset-order'
 import type { StreamLeaseRow } from '../../src/store/repository'
 import { estimateStreamJournalFrameStorageBytes } from '../../src/store/storage-size-estimate'
@@ -155,6 +156,7 @@ describe('Dexie schema', () => {
         'presetOrderMembership',
         'presetOrderState',
         'promptPresets',
+        ...BROWSER_WORKSPACE_CATCHUP_JOURNAL_TABLE_NAMES,
         'settings',
         'storageRetentionState',
         'streamChunks',
@@ -180,6 +182,7 @@ describe('Dexie schema', () => {
       'attachmentId',
       '[attachmentId+ownerKind]',
       '[attachmentId+chatId]',
+      '[attachmentId+ownerKind+ownerId+refId]',
       '[ownerKind+ownerId]',
       'chatId',
     ])
@@ -210,6 +213,7 @@ describe('Dexie schema', () => {
     expect(db.configurationLinks.schema.indexes.map((index) => index.src)).toEqual([
       'ownerKey',
       'targetKey',
+      '[targetKey+id]',
     ])
     expect(db.textTemplates.schema.indexes.map((index) => index.src)).toEqual([
       '[createdAt+id+name+updatedAt]',

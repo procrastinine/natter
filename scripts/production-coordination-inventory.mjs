@@ -62,6 +62,9 @@ const MODULE_MUTABLE_IDS = Object.freeze([
   'src/store/browser-workspace-lifecycle.ts#nextOpenAttemptId',
   'src/store/browser-workspace-lifecycle.ts#shutdownTransition',
   'src/store/browser-workspace-lifecycle.ts#terminalLifecycleFinalization',
+  'src/store/configuration-model-resolution-capability.ts#activeCycle',
+  'src/store/configuration-model-resolution-capability.ts#attachedFence',
+  'src/store/configuration-model-resolution-capability.ts#unsubscribeEffects',
   'src/store/browser-workspace-replacement-runner.ts#reopenBrowserWorkspace',
   'src/store/browser-workspace-slot-coordination.ts#activeLease',
   'src/store/browser-workspace-slot-coordination.ts#coordinatorOwner',
@@ -73,6 +76,7 @@ const MODULE_MUTABLE_IDS = Object.freeze([
   'src/store/db.ts#browserWorkspaceRepositoryAdmissionsOpen',
   'src/store/db.ts#browserWorkspaceRepositoryIdlePromise',
   'src/store/db.ts#configuredBrowserWorkspaceDatabaseName',
+  'src/store/db.ts#configuredBrowserWorkspaceCurrentPhysicalVersion',
   'src/store/db.ts#currentSession',
   'src/store/db.ts#invalidatedSession',
   'src/store/db.ts#nextSessionGeneration',
@@ -127,6 +131,7 @@ const MODULE_MUTABLE_IDS = Object.freeze([
   'src/store/storage-compaction-state.ts#physicalMutationLedgers',
   'src/store/storage-compaction-state.ts#physicalMutationTransactionDatabaseNames',
   'src/store/storage-compaction-state.ts#resolvePhysicalMutationDebtIdle',
+  'src/store/storage-compaction-state.ts#storageCompactionWriteAdmission',
   'src/store/storage-maintenance-runtime.ts#storageMaintenanceRuntimeState',
   'src/store/stream-leases.ts#currentWorkspaceFence',
   'src/store/stream-leases.ts#heartbeatDeadline',
@@ -1286,10 +1291,19 @@ export const CONTROLLER_COLLECTION_CONTRACTS = Object.freeze({
       'messageRevisionsById',
       'physicalMutationsByAddress',
       'physicalOwnerScopesById',
+      'readConflictAddresses',
+      'readConflictScopes',
     ],
     bound:
       'physical addresses, owner scopes, rows, revisions, child slots, and invalidations touched by one authoritative repository command',
     cleanup: 'command completion releases the commit accumulator and every transaction-local index',
+    scope: 'owner-instance',
+  },
+  'src/store/chat-row-transition.ts#TransactionChatMutationOwner': {
+    fields: ['#additions', '#current', '#original', '#staged'],
+    bound: 'one command transaction retained row transition per explicitly addressed chat identity',
+    cleanup:
+      'commit seals and releases the transaction-local owner; rollback releases all staged and original rows',
     scope: 'owner-instance',
   },
   'src/store/catalog-application.ts#CatalogTabController': {
@@ -1732,6 +1746,30 @@ const LIFECYCLE_EXTERNAL_INGRESS_CONTRACTS = exactSiteContracts([
   },
   {
     ids: [
+      'src/app/conversation-actions.ts|awaitConversationImportWorkspace|subscribeWorkspaceRuntimeState|1',
+    ],
+    scope: 'one-conversation-import-readiness-wait',
+    bound: 'one temporary runtime-state subscription for one route-owned import intent',
+    installation:
+      'chat import installs the listener only while the conversation owner has no reconciled workspace',
+    removalOwner: 'the request-local settlement, terminal-state, or route-abort disposer',
+    cleanup:
+      'settlement removes the exact runtime and conversation subscriptions plus the route-owner abort callback',
+  },
+  {
+    ids: [
+      'src/store/browser-workspace-replacement-runner.ts|awaitOnlineReplacementAuthority|subscribeWorkspaceRuntimeIdle|1',
+      'src/store/browser-workspace-replacement-runner.ts|awaitOnlineReplacementAuthority|subscribeWorkspaceRuntimeState|1',
+    ],
+    scope: 'one-online-replacement-promotion-wait',
+    bound: 'two temporary event subscriptions for one exact staged replacement attempt',
+    installation:
+      'online preparation installs both only while it waits for the runtime to become promotable',
+    removalOwner: 'the request-local settlement or abort disposer',
+    cleanup: 'settlement removes both exact subscriptions and the optional abort listener',
+  },
+  {
+    ids: [
       'src/store/generation-admission-controller.ts|subscribeGenerationAdmissionPublication|subscribeWorkspaceRuntimeState|1',
     ],
     scope: 'one-generation-admission-capability-wait',
@@ -1894,15 +1932,15 @@ const LIFECYCLE_DIRECT_CALL_CONTRACTS = exactSiteContracts([
   },
   {
     ids: [
-      'src/store/browser-workspace-lifecycle.ts|quiesce|shutdownBrowserWorkspaceWhenIdle|1',
+      'src/store/browser-workspace-lifecycle.ts|reconcileBrowserWorkspaceSlotTransition|shutdownBrowserWorkspaceWhenIdle|1',
       'src/store/browser-workspace-lifecycle.ts|raceWithAbortSignal<callback>|resumeBrowserWorkspace|1',
     ],
-    scope: 'cross-tab-slot-callback-edge',
-    stage: 'remote-slot-resume-or-idle-quiesce',
+    scope: 'cross-tab-slot-reconciliation-edge',
+    stage: 'remote-slot-durable-reconciliation',
     ownership: 'reference-transferred-and-awaited-by-consumer',
-    bound: 'one quiesce/resume callback pair in the page-lifetime slot coordinator',
+    bound: 'one journal-authorized reconcile callback in the page-lifetime slot coordinator',
     cleanup:
-      'the slot coordinator serializes and awaits each callback on its tracked inbound promise chain',
+      'the slot coordinator serializes and awaits shutdown, durable recovery, and resume on its tracked inbound promise chain',
   },
   {
     ids: [
@@ -2236,19 +2274,23 @@ const LIFECYCLE_DIRECT_CALL_CONTRACTS = exactSiteContracts([
   },
   {
     ids: [
+      'src/store/browser-workspace-replacement-runner.ts|promote|launchCommandFanoutWorkspaceRuntimeReplacementNow|1',
       'src/store/browser-workspace-replacement-runner.ts|promote|launchImportExportWorkspaceRuntimeReplacementNow|1',
       'src/store/browser-workspace-replacement-runner.ts|promote|tryLaunchMaintenanceWorkspaceRuntimeReplacementIfIdle|1',
+      'src/store/browser-workspace-replacement-runner.ts|promote|tryLaunchMaintenanceWorkspaceRuntimeReplacementIfIdle|2',
     ],
     scope: 'workspace-replacement-call-edge',
     stage: 'replacement-root-atomic-promotion-and-quiesce',
     ownership: 'synchronous-result-captured',
-    bound: 'one of two typed atomic replacement-root promotions per admitted replacement selection',
+    bound:
+      'one typed command, import-export, or maintenance replacement-root promotion per admitted replacement selection',
     cleanup:
       'the exact promoted authority supplies cancellation to every replacement admission boundary',
   },
   {
     ids: [
       'src/store/browser-workspace-replacement-runner.ts|performBrowserWorkspaceReplacementLaunch|getWorkspaceRuntimeControlSnapshot|1',
+      'src/store/browser-workspace-replacement-runner.ts|attempt|getWorkspaceRuntimeControlSnapshot|1',
       'src/store/browser-workspace-replacement-runner.ts|runGatedBrowserWorkspaceReplacementAttempt|getWorkspaceRuntimeControlSnapshot|1',
       'src/store/browser-workspace-replacement-runner.ts|runGatedBrowserWorkspaceReplacementAttempt|getWorkspaceRuntimeControlSnapshot|2',
     ],
@@ -2576,7 +2618,7 @@ export const MUTABLE_MODULE_CONTRACTS = Object.freeze({
   'src/store/db.ts': {
     scope: 'physical-database-session-runtime',
     bound:
-      'one exact fatal-invalidation owner, database singleton, current/invalidated session pair, admissions, and idle barrier',
+      'one exact fatal-invalidation owner, configured database/current-version proof, database singleton, current/invalidated session pair, admissions, and idle barrier',
     cleanup:
       'session closure drains operations while exact lifecycle release prevents old queued invalidations from reaching a successor',
   },
@@ -2591,6 +2633,13 @@ export const MUTABLE_MODULE_CONTRACTS = Object.freeze({
       'one attached fence, effect subscription, active scalar probe cycle, cached runtime import, and resumed flag',
     cleanup:
       'resource close aborts the exact probe, removes its subscription, closes a resumed runtime, and awaitIdle drains the probe, import, and localization runtime',
+  },
+  'src/store/configuration-model-resolution-capability.ts': {
+    scope: 'workspace-model-resolution-capability',
+    bound:
+      'one attached fence, effect subscription, active scalar cycle, and bounded transient catalog cache',
+    cleanup:
+      'resource close aborts the exact cycle, removes its subscription, and clears transient catalogs before workspace replacement',
   },
   'src/store/locks.ts': {
     scope: 'workspace-lock-runtime',
@@ -2822,6 +2871,7 @@ export const LIFECYCLE_PRIMITIVE_MODULES = Object.freeze({
     'finishWorkspaceRuntimeReconciliation',
     'getWorkspaceRuntimeControlSnapshot',
     'installWorkspaceRuntimeResources',
+    'launchCommandFanoutWorkspaceRuntimeReplacementNow',
     'launchImportExportWorkspaceRuntimeReplacementNow',
     'noteWorkspaceRuntimeGatedChange',
     'resumeWorkspaceRuntimeResources',

@@ -33,6 +33,7 @@ export const TEMPORAL_SEMANTIC_GROUPS = Object.freeze([
       'none',
     ),
     {
+      asyncRaces: ['src/app/Shell.tsx|ownGenerationSubmission|Promise.race|1'],
       retryLoops: [
         'src/store/generation-admission-controller.ts|settleCapturedAdmission|ForStatement|unbounded|1',
       ],
@@ -246,6 +247,7 @@ export const TEMPORAL_SEMANTIC_GROUPS = Object.freeze([
     {
       retryLoops: [
         'src/store/browser-workspace-database-selection.ts|selectBrowserWorkspaceDatabase|ForStatement|unbounded|1',
+        'src/store/browser-workspace-startup-repair.ts|settlePendingBrowserWorkspaceReplacement|ForStatement|unbounded|1',
       ],
     },
   ),
@@ -832,12 +834,17 @@ export const TEMPORAL_SEMANTIC_GROUPS = Object.freeze([
     {
       retryLoops: [
         'src/store/browser-import-export.ts|tablePages|ForStatement|unbounded|1',
+        'src/store/browser-catalog-command-runtime.ts|clearCalibrationEverywhereTransaction|ForStatement|unbounded|1',
+        'src/store/browser-configuration-domain.ts|readConfigurationTargetFanoutLinks|ForStatement|unbounded|1',
         'src/store/browser-query-pages.ts|readChatMessageHeaderPages|ForStatement|unbounded|1',
         'src/store/browser-query-pages.ts|readChildHeaderPages|ForStatement|unbounded|1',
         'src/store/browser-query-pages.ts|readStringPrimaryKeyPages|ForStatement|unbounded|1',
         'src/store/browser-query-pages.ts|readStreamLeasePages|ForStatement|unbounded|1',
         'src/store/browser-workspace-derived-repair.ts|rebuildChildSlotDerivedState|ForStatement|unbounded|1',
         'src/store/browser-workspace-derived-repair.ts|forEachPrimaryPage|ForStatement|unbounded|1',
+        'src/store/browser-workspace-staged-fanout.ts|copyStagedWorkspace|ForStatement|unbounded|1',
+        'src/store/browser-workspace-staged-fanout.ts|drainStagedWorkspaceCatchup|ForStatement|unbounded|1',
+        'src/store/browser-workspace-startup-repair.ts|copyCanonicalBrowserWorkspaceRows|ForStatement|unbounded|1',
         'src/store/chat-search.ts|iterateSearchSidebarPages|ForStatement|unbounded|1',
         'src/store/chat-sidebar-projection.ts|rebuildChatSidebarProjectionRowsInTransaction|ForStatement|unbounded|1',
         'src/store/chat-storage-ownership.ts|deleteKnownChatClosure|ForStatement|unbounded|1',
@@ -847,24 +854,6 @@ export const TEMPORAL_SEMANTIC_GROUPS = Object.freeze([
         'src/store/stream-recovery.ts|replayRecoveredStreamJournal|ForStatement|unbounded|1',
       ],
       asyncRaces: ['src/store/chat-search.ts|add|Promise.race|1'],
-    },
-  ),
-  gap(
-    'unbounded-revision-revalidation',
-    semantics(
-      'Exact revisions and fenced transaction evidence preserve safety, but the caller-visible command retries immediately until its unlocked plan matches current state.',
-      'caller-visible durable command completion',
-      'command-local under cross-tab contention',
-      'browser repository, import, and configuration command',
-      'Transaction rollback prevents partial commits, but the open-ended loop has no caller cancellation/backoff contract.',
-      'Unbounded retry consumer of typed changed-plan outcomes; no fixed maximum is correct, but cooperative/cancelable liveness is not proved.',
-      'A successful fenced revalidation is progress; repeated concurrent mutations can invalidate every proposal.',
-      'none',
-    ),
-    ['durable-correctness'],
-    'Fencing proves safety but not liveness or event-loop fairness. These immediate unbounded loops can monopolize a user command under sustained multi-tab mutation, and there is no shared cancel/yield policy proving that unrelated controls remain responsive.',
-    {
-      retryLoops: ['src/store/browser-repo.ts|expandGeneratedOutputVideo|ForStatement|unbounded|1'],
     },
   ),
   covered(
@@ -925,7 +914,10 @@ export const TEMPORAL_SEMANTIC_GROUPS = Object.freeze([
         'src/store/storage-compaction-state.ts|STORAGE_COMPACTION_DEBT_RETRY_BASE_MS|1_000',
         'src/store/storage-compaction-state.ts|STORAGE_COMPACTION_DEBT_RETRY_MAX_MS|60_000',
       ],
-      retryLoops: ['src/store/browser-workspace-compaction.ts|copyTable|ForStatement|unbounded|1'],
+      retryLoops: [
+        'src/store/browser-workspace-compaction.ts|copyTable|ForStatement|unbounded|1',
+        'src/store/browser-workspace-compaction.ts|drainBrowserWorkspaceCatchup|ForStatement|unbounded|1',
+      ],
     },
   ),
 ])

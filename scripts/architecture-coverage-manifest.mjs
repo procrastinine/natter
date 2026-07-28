@@ -177,7 +177,7 @@ export const ARCHITECTURE_PROOFS = Object.freeze([
     'storage-reclamation-browser-tests',
     'browser-test',
     'tests/e2e/storage-reclamation.spec.ts',
-    "test('normal use retries real compaction debt and preserves two-tab work across the slot switch'",
+    "test('normal use catches up foreground work without repeating the physical copy and preserves two-tab state'",
     [
       'attachments',
       'conversation',

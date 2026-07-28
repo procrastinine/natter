@@ -302,12 +302,13 @@ function normalizeImportedMessageOutcomes(
   ) {
     return input
   }
-  const message: Message = carrier
-  if (content !== input.content) message.content = content
-  if (generation !== undefined) message.generation = generation
-  if (continuationAttempts !== undefined) message.continuationAttempts = continuationAttempts
-  if (providerOutputItems !== undefined) message.providerOutputItems = providerOutputItems
-  return message
+  return {
+    ...carrier,
+    ...(content !== input.content ? { content } : {}),
+    ...(generation !== undefined ? { generation } : {}),
+    ...(continuationAttempts !== undefined ? { continuationAttempts } : {}),
+    ...(providerOutputItems !== undefined ? { providerOutputItems } : {}),
+  }
 }
 
 function stripImportedServerToolOutputs(

@@ -2,8 +2,15 @@
 
 import Dexie, { type Table, type Transaction } from 'dexie'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { buildChildSlotProjection } from '../../src/core/child-list-state'
 import { resolvingConversationSelectionTarget } from '../../src/core/messages'
-import type { Chat, Message, MessageId } from '../../src/core/types'
+import type {
+  Chat,
+  ChildListState,
+  ChildSlotMember,
+  Message,
+  MessageId,
+} from '../../src/core/types'
 import {
   type BranchSelectionReadMeasurement,
   type ConversationOpenFrameStore,
@@ -22,6 +29,8 @@ const SAMPLE_COUNT = 3
 
 interface BranchSelectionBenchmarkDatabase extends Dexie {
   messages: Table<MessageHeaderRow, MessageId>
+  childLists: Table<ChildListState, string>
+  childSlotMembers: Table<ChildSlotMember, MessageId>
 }
 
 interface SelectionSample {
@@ -42,18 +51,22 @@ beforeAll(async () => {
   db = new Dexie(
     `active-branch-selection-benchmark-${crypto.randomUUID()}`,
   ) as BranchSelectionBenchmarkDatabase
-  db.version(1).stores({ messages: 'id,chatId,[chatId+createdAt+id]' })
+  db.version(1).stores({
+    messages: 'id,chatId,[chatId+createdAt+id]',
+    childLists: 'id,chatId',
+    childSlotMembers: 'id,chatId',
+  })
   await db.open()
 
   for (const depth of DEPTHS) {
     const scenario = linearScenario(`depth-${depth}`, depth)
     scenarios.set(`depth-${depth}`, scenario)
-    await db.messages.bulkPut(scenario.headers)
+    await seedScenario(scenario)
   }
 
   const widthControl = linearScenario('width-control', WIDTH_CONTROL_DEPTH, WIDTH_CONTROL_ROWS)
   scenarios.set('width-control', widthControl)
-  await db.messages.bulkPut(widthControl.headers)
+  await seedScenario(widthControl)
 })
 
 afterAll(async () => {
@@ -103,8 +116,14 @@ describe.skipIf(!RUN_BENCHMARK)('active branch selection read benchmark', () => 
 
     const depthControl = results.find((result) => result.name === 'depth-128')
     const widthResult = results.find((result) => result.name === 'depth-128-width-8192')
+    const shallowResult = results.find((result) => result.name === 'depth-8')
     expect(depthControl).toBeDefined()
     expect(widthResult).toBeDefined()
+    expect(shallowResult?.measurement).toMatchObject({
+      pathFrames: 1,
+      slotFrames: 1,
+      forkSlotsRead: 8,
+    })
     expect(widthResult?.measurement.physicalHeaderReadRequests).toBe(
       depthControl?.measurement.physicalHeaderReadRequests,
     )
@@ -243,11 +262,38 @@ function runReadFrame<T>(
   stores: readonly ConversationOpenFrameStore[],
   read: (tx: Transaction) => Promise<T>,
 ) {
-  expect(stores).toEqual(['messages'])
-  return db.transaction('r', db.messages, async (tx) => ({
+  const tables = stores.map((store) => {
+    switch (store) {
+      case 'messages':
+        return db.messages
+      case 'childLists':
+        return db.childLists
+      case 'childSlotMembers':
+        return db.childSlotMembers
+      case 'messageBodies':
+        throw new Error('BenchmarkDoesNotReadMessageBodies')
+      default:
+        throw new Error('BenchmarkStoreUnsupported')
+    }
+  })
+  return db.transaction('r', tables, async (tx) => ({
     kind: 'ready' as const,
     value: await read(tx),
   }))
+}
+
+async function seedScenario(scenario: {
+  readonly chat: Chat
+  readonly headers: readonly MessageHeaderRow[]
+}): Promise<void> {
+  const projection = buildChildSlotProjection(scenario.chat.id, scenario.headers, {
+    updatedAt: 1,
+  })
+  await db.transaction('rw', [db.messages, db.childLists, db.childSlotMembers], async () => {
+    await db.messages.bulkPut(scenario.headers)
+    await db.childLists.bulkPut(projection.states)
+    await db.childSlotMembers.bulkPut(projection.members)
+  })
 }
 
 function linearScenario(prefix: string, depth: number, unrelatedWidth = 0) {

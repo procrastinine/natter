@@ -3,6 +3,7 @@ import 'fake-indexeddb/auto'
 import { IDBFactory } from 'fake-indexeddb'
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
+import { withGeneratedOutputLocalizationJob } from '../../src/core/generated-output-localization'
 import type {
   Attachment,
   AttachmentArtifact,
@@ -25,10 +26,12 @@ import {
   countLiveRefs,
   deleteReferencedAttachmentBytes,
   deleteUnreferencedAttachment,
+  detachAttachmentRef,
   getAttachmentBundle,
   ingestAttachmentBytes,
   listAttachmentReferences,
   mutateMessageAttachmentRef,
+  prepareRemoteAttachment,
   putAttachment,
   putWorkspaceDraft,
   relinkAttachmentRef,
@@ -169,6 +172,45 @@ class RecordingLockBackend implements LockBackend {
         },
       }) as Promise<T>,
     )
+  }
+
+  async runAuthoritativeCommandSession<T>(
+    _database: Dexie,
+    operation: (session: AuthoritativeCommandLockSession) => Promise<T> | T,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<T> {
+    if (options.signal?.aborted) throw options.signal.reason
+    return operation({
+      kind: this.kind,
+      withResourceLocks: (resourceNames, child) => this.run(resourceNames, child),
+    })
+  }
+}
+
+class BeforeFirstResourceLockBackend implements LockBackend {
+  readonly kind = 'web-locks' as const
+  private readonly beforeFirst: () => Promise<void>
+  private pending = true
+
+  constructor(beforeFirst: () => Promise<void>) {
+    this.beforeFirst = beforeFirst
+  }
+
+  async run<T>(logicalNames: readonly string[], fn: Parameters<LockBackend['run']>[1]): Promise<T> {
+    if (this.pending) {
+      this.pending = false
+      await this.beforeFirst()
+    }
+    return fn({
+      kind: this.kind,
+      logicalNames,
+      runTransaction: (db, tables, write) =>
+        db.transaction(
+          'rw',
+          tables.map((table) => db.table(typeof table === 'string' ? table : table.name)),
+          write,
+        ),
+    }) as Promise<T>
   }
 
   async runAuthoritativeCommandSession<T>(
@@ -359,7 +401,7 @@ async function getMessage(messageId: string): Promise<Message | undefined> {
 }
 
 async function getDraft(chatId: string) {
-  return (await query({ kind: 'draft.get', chatId })).value
+  return getDb().drafts.get(chatId)
 }
 
 type TestAttachmentSearchRequest = AttachmentCatalogSearchRequest & {
@@ -932,7 +974,7 @@ describe('attachment backend storage', () => {
       attachment: expect.objectContaining({
         id: target.attachment.id,
         refCount: target.attachment.refCount,
-      }),
+      }) as unknown,
     })
     expect(backend.logicalRuns).toHaveLength(1)
     expect(backend.logicalRuns[0]).toEqual([`attachment:${target.attachment.id}`])
@@ -1047,7 +1089,7 @@ describe('attachment backend storage', () => {
           jobIds: expect.arrayContaining([
             `${target.attachment.id}:old:job:0`,
             `${target.attachment.id}:old:job:128`,
-          ]),
+          ]) as unknown,
         },
       ]),
     )
@@ -1186,6 +1228,7 @@ describe('attachment backend storage', () => {
     const hidden = await setAttachmentRefVisibility({
       messageId: message.id,
       refId: ref.refId,
+      expectedAttachmentId: first.attachment.id,
       includeInContext: false,
       now: 21,
     })
@@ -1195,6 +1238,7 @@ describe('attachment backend storage', () => {
     const relinked = await relinkAttachmentRef({
       messageId: message.id,
       refId: ref.refId,
+      expectedAttachmentId: first.attachment.id,
       newAttachmentId: second.attachment.id,
       now: 22,
     })
@@ -1249,15 +1293,20 @@ describe('attachment backend storage', () => {
     const hidden = await mutateMessageAttachmentRef({
       chatId: chat.id,
       messageId: message.id,
-      mutation: { kind: 'visibility', refId: ref.refId, includeInContext: false },
+      mutation: {
+        kind: 'visibility',
+        refId: ref.refId,
+        expectedAttachmentId: first.attachment.id,
+        includeInContext: false,
+      },
       now: 13,
     })
-    expect(hidden?.message.attachmentRefs?.[0]).toMatchObject({
+    expect(hidden?.attachmentRefs?.[0]).toMatchObject({
       refId: ref.refId,
       includeInContext: false,
     })
-    expect(hidden?.bodyVersion).toBe(hidden?.header.bodyVersion)
-    expect(hidden?.message.nodeVersion).toBe(hidden?.header.nodeVersion)
+    expect(hidden?.bodyVersion).toBe(message.nodeVersion)
+    expect(hidden?.nodeVersion).toBe(message.nodeVersion + 2)
 
     const relinked = await mutateMessageAttachmentRef({
       chatId: chat.id,
@@ -1265,22 +1314,131 @@ describe('attachment backend storage', () => {
       mutation: {
         kind: 'relink',
         refId: ref.refId,
+        expectedAttachmentId: first.attachment.id,
         newAttachmentId: second.attachment.id,
       },
       now: 14,
     })
-    expect(relinked?.message.attachmentRefs?.[0]?.attachmentId).toBe(second.attachment.id)
+    expect(relinked?.attachmentRefs?.[0]?.attachmentId).toBe(second.attachment.id)
     expect((await getDb().attachments.get(first.attachment.id))?.refCount).toBe(0)
     expect((await getDb().attachments.get(second.attachment.id))?.refCount).toBe(1)
 
     const detached = await mutateMessageAttachmentRef({
       chatId: chat.id,
       messageId: message.id,
-      mutation: { kind: 'detach', refId: ref.refId },
+      mutation: {
+        kind: 'detach',
+        refId: ref.refId,
+        expectedAttachmentId: second.attachment.id,
+      },
       now: 15,
     })
-    expect(detached?.message.attachmentRefs).toEqual([])
+    expect(detached?.attachmentRefs).toEqual([])
     expect((await getDb().attachments.get(second.attachment.id))?.refCount).toBe(0)
+  })
+
+  it('mutates rendered attachment refs through the transaction-owned path', async () => {
+    const chat = await seedChat()
+    const message = makeMessage(chat.id)
+    await putMessage(message)
+    const first = await ingestAttachmentBytes({
+      blob: bytes('first direct reference'),
+      filename: 'first-direct.txt',
+      now: 10,
+    })
+    const second = await ingestAttachmentBytes({
+      blob: bytes('second direct reference'),
+      filename: 'second-direct.txt',
+      now: 11,
+    })
+    const ref = await addExistingAttachmentRef({
+      messageId: message.id,
+      attachmentId: first.attachment.id,
+      now: 12,
+    })
+    await setAttachmentRefVisibility({
+      messageId: message.id,
+      refId: ref.refId,
+      expectedAttachmentId: first.attachment.id,
+      includeInContext: false,
+      now: 13,
+    })
+    await relinkAttachmentRef({
+      messageId: message.id,
+      refId: ref.refId,
+      expectedAttachmentId: first.attachment.id,
+      newAttachmentId: second.attachment.id,
+      now: 14,
+    })
+    await detachAttachmentRef({
+      messageId: message.id,
+      refId: ref.refId,
+      expectedAttachmentId: second.attachment.id,
+      now: 15,
+    })
+
+    expect((await getDb().attachments.get(first.attachment.id))?.refCount).toBe(0)
+    expect((await getDb().attachments.get(second.attachment.id))?.refCount).toBe(0)
+    await expectAttachmentReferenceInvariants(getDb())
+  })
+
+  it('updates message attachment headers without reading the cold body', async () => {
+    const chat = await seedChat()
+    const message = makeMessage(chat.id)
+    await putMessage(message)
+    await getDb().messageBodies.delete(message.id)
+    const stored = await ingestAttachmentBytes({
+      blob: bytes('header-only attachment'),
+      filename: 'header-only.txt',
+      now: 10,
+    })
+
+    await addExistingAttachmentRef({
+      messageId: message.id,
+      attachmentId: stored.attachment.id,
+      now: 11,
+    })
+
+    expect((await getDb().messages.get(message.id))?.attachmentRefs).toHaveLength(1)
+    expect(await getDb().messageBodies.get(message.id)).toBeUndefined()
+  })
+
+  it('does not revalidate an unrelated stale target on the same owner', async () => {
+    const chat = await seedChat()
+    const message = makeMessage(chat.id)
+    await putMessage(message)
+    const current = await ingestAttachmentBytes({
+      blob: bytes('current attachment'),
+      filename: 'current.txt',
+      now: 10,
+    })
+    const stale = await ingestAttachmentBytes({
+      blob: bytes('stale attachment'),
+      filename: 'stale.txt',
+      now: 11,
+    })
+    const currentRef = await addExistingAttachmentRef({
+      messageId: message.id,
+      attachmentId: current.attachment.id,
+      now: 12,
+    })
+    await addExistingAttachmentRef({
+      messageId: message.id,
+      attachmentId: stale.attachment.id,
+      now: 13,
+    })
+    await getDb().attachments.delete(stale.attachment.id)
+
+    const updated = await setAttachmentRefVisibility({
+      messageId: message.id,
+      refId: currentRef.refId,
+      expectedAttachmentId: current.attachment.id,
+      includeInContext: false,
+      now: 14,
+    })
+
+    expect(updated.includeInContext).toBe(false)
+    expect((await getDb().attachments.get(current.attachment.id))?.refCount).toBe(1)
   })
 
   it('atomically removes blob-derived pointers while retaining independent artifacts', async () => {
@@ -1741,6 +1899,117 @@ describe('attachment backend storage', () => {
     )
     await expectAttachmentBundleInvariants(bundle.attachment.id)
   })
+
+  it('returns a changed video-owner plan once without spinning or writing replacements', async () => {
+    const chat = await seedChat()
+    const attachmentId = newId()
+    const readyAt = Date.now() + 60_000
+    const source = withGeneratedOutputLocalizationJob(
+      prepareRemoteAttachment({
+        id: attachmentId,
+        url: 'https://media.example.test/jobs/video-1',
+        filename: 'generated-video.mp4',
+        mime: 'video/mp4',
+        kind: 'video',
+        origin: 'generated-output',
+        now: readyAt,
+      }),
+      readyAt,
+    )
+    await execute({
+      kind: 'attachment.bundle.write',
+      input: { bundle: source, mode: 'put' },
+    })
+    const ref = attachmentRef(attachmentId, readyAt + 1)
+    const message: Message = {
+      ...makeMessage(chat.id, [ref]),
+      content: [{ type: 'output_video', attachmentId }],
+    }
+    await putMessage(message)
+    const job = source.jobs[0]
+    if (!job) throw new Error('ExpectedGeneratedOutputLocalizationJob')
+    const leaseId = 'video-lease'
+    const mismatched = await execute({
+      kind: 'generated-output.localization-claim',
+      input: {
+        jobId: job.id,
+        attachmentId: newId(),
+        leaseId: 'wrong-target-lease',
+        now: readyAt,
+        leaseExpiresAt: readyAt + 1_000,
+      },
+    })
+    expect(mismatched.value).toBeUndefined()
+    expect(await getDb().attachmentJobs.get(job.id)).toEqual(job)
+    expect(await getDb().attachments.get(attachmentId)).toMatchObject({
+      id: attachmentId,
+      origin: 'generated-output',
+      storage: { kind: 'remote-url', url: job.task?.expectedSourceUrl },
+    })
+    const claim = await execute({
+      kind: 'generated-output.localization-claim',
+      input: {
+        jobId: job.id,
+        attachmentId,
+        leaseId,
+        now: readyAt,
+        leaseExpiresAt: readyAt + 1_000,
+      },
+    })
+    expect(claim.value?.job).toMatchObject({ id: job.id, leaseId, status: 'running' })
+
+    const replacementId = `${attachmentId}:resolved:1`
+    const replacement = prepareRemoteAttachment({
+      id: replacementId,
+      url: 'https://media.example.test/generated-video.mp4',
+      filename: 'generated-video-1.mp4',
+      mime: 'video/mp4',
+      kind: 'video',
+      origin: 'generated-output',
+      now: readyAt + 1,
+    })
+    const lateOwnerId = newId()
+    __setLockBackendForTests(
+      new BeforeFirstResourceLockBackend(async () => {
+        await getDb().attachmentRefEdges.put({
+          ownerKind: 'message',
+          ownerId: lateOwnerId,
+          chatId: chat.id,
+          refId: 'late-video-ref',
+          attachmentId,
+          ordinal: 0,
+          includeInContext: true,
+          refUpdatedAt: readyAt + 1,
+        })
+      }),
+    )
+
+    const expanded = await execute({
+      kind: 'generated-output.video-expand',
+      input: {
+        jobId: job.id,
+        attachmentId,
+        leaseId,
+        attachmentBundles: [replacement],
+        now: readyAt + 1,
+      },
+    })
+
+    expect(expanded.value).toEqual({
+      outcome: 'plan-changed',
+      attachmentId,
+      presentations: [],
+      drafts: [],
+      changedAttachmentIds: [],
+    })
+    expect(await getAttachmentBundle(replacementId)).toBeUndefined()
+    expect((await getAttachmentBundle(attachmentId))?.jobs).toContainEqual(
+      expect.objectContaining({ id: job.id, leaseId, status: 'running' }),
+    )
+    expect(await getMessage(message.id)).toMatchObject({
+      content: [{ type: 'output_video', attachmentId }],
+    })
+  })
 })
 
 describe('attachment refcounts under repository mutations', () => {
@@ -1774,7 +2043,11 @@ describe('attachment refcounts under repository mutations', () => {
     await mutateMessageAttachmentRef({
       chatId: chat.id,
       messageId: message.id,
-      mutation: { kind: 'detach', refId: ref.refId },
+      mutation: {
+        kind: 'detach',
+        refId: ref.refId,
+        expectedAttachmentId: attachment.id,
+      },
       now: 3,
     })
     expect((await getDb().attachments.get(attachment.id))?.refCount).toBe(0)

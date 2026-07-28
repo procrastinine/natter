@@ -1,6 +1,8 @@
 import type { BrowserWorkspaceDatabaseName } from '../lib/origin-storage-names'
 
 export type BrowserWorkspaceMigrationPhase =
+  | 'inactive-copy'
+  | 'inactive-activation'
   | 'completion-markers-reset'
   | 'singletons'
   | 'configuration-and-chats'

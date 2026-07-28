@@ -120,6 +120,7 @@ import {
   type DiscoveryCacheReadEvidence,
   readDiscoveryCacheRowWithEvidence,
 } from './discovery-cache-storage'
+import { exactCompoundPrefixBetween } from './indexeddb-key-ranges'
 import {
   type CapabilityTables,
   type FencedTransaction,
@@ -138,10 +139,12 @@ import {
 import {
   boundSemanticOperationExactReceiptAccumulator,
   configurationSemanticOperationKind,
+  createSemanticOperationExactReceiptAccumulator,
   type SemanticOperationExactPhysicalRead,
   type SemanticOperationExactPlan,
   type SemanticOperationExactReceipt,
   type SemanticOperationExecution,
+  type SemanticOperationReceiptFragment,
   semanticOperationDescriptor,
   semanticOperationExactPlan,
   semanticOperationExactReceipt,
@@ -149,6 +152,7 @@ import {
   semanticOperationExactReceiptReplayContract,
   semanticOperationExactReceiptReplayProofContract,
   semanticOperationExecution,
+  semanticOperationReceiptFragment,
 } from './semantic-operation-capability'
 import { TransactionChatUpdateClock } from './transaction-order'
 import {
@@ -266,14 +270,15 @@ interface ConfigurationTargetFanoutOperationReceipt {
   readonly sourceMutation: 'write' | 'delete' | 'none'
   readonly sourceProjection: ConfigurationCatalogProjectionMutationReceipt | undefined
   readonly targetQueryExecuted: boolean
+  readonly targetQueryRequests: number
   readonly targetLinkIds: readonly string[]
+  readonly chatReadRequests: number
   readonly chatReadIds: readonly ChatId[]
+  readonly presetReadRequests: number
   readonly presetReadIds: readonly PresetId[]
-  readonly previousPresets: readonly ChatPreset[]
-  readonly nextPresets: readonly ChatPreset[]
-  readonly presetLinks: ConfigurationOwnerLinkMutationReceipt
+  readonly writtenPresetIds: readonly PresetId[]
   readonly writtenChatIds: readonly ChatId[]
-  readonly chats: LinkedChatRowMutationReceipt | undefined
+  readonly targetFragment: SemanticOperationReceiptFragment<PhysicalStorageTableName>
 }
 
 type ConnectionProfileLifecycleOperationKind =
@@ -338,15 +343,15 @@ interface ConnectionDeleteOperationReceipt {
   readonly replacementQueryExecuted: boolean
   readonly usage: ConfigurationProfileUsageProjectionRow
   readonly targetQueryExecuted: boolean
+  readonly targetQueryRequests: number
   readonly targetLinkIds: readonly string[]
+  readonly presetReadRequests: number
   readonly presetReadIds: readonly PresetId[]
+  readonly chatReadRequests: number
   readonly chatReadIds: readonly ChatId[]
-  readonly previousPresets: readonly ChatPreset[]
-  readonly nextPresets: readonly ChatPreset[]
-  readonly presetLinks: ConfigurationOwnerLinkMutationReceipt
-  readonly presetCatalogs: readonly ConfigurationPresetCatalogMutationReceipt[]
+  readonly writtenPresetIds: readonly PresetId[]
   readonly writtenChatIds: readonly ChatId[]
-  readonly chats: LinkedChatRowMutationReceipt | undefined
+  readonly targetFragment: SemanticOperationReceiptFragment<PhysicalStorageTableName>
   readonly profileLinks: ConfigurationOwnerLinkMutationReceipt
   readonly profileCatalog: ConfigurationCatalogProjectionMutationReceipt | undefined
   readonly discovery: DiscoveryCacheProfileClearReceipt | undefined
@@ -1052,7 +1057,6 @@ function assertKeyMaterialOperationReceipt(
   receipt: KeyMaterialOperationReceipt,
 ): void {
   if (
-    receipt?.[KEY_MATERIAL_OPERATION_RECEIPT] !== true ||
     (receipt.previous?.id ?? receipt.next?.id ?? keyId) !== keyId ||
     (receipt.mutation !== 'none') !== didMutateStorage
   ) {
@@ -1147,7 +1151,6 @@ function assertChatConfigurationOperationReceipt(
       configurationLinksForChat(receipt.next),
     )
   if (
-    receipt?.[CHAT_CONFIGURATION_OPERATION_RECEIPT] !== true ||
     (receipt.previous !== undefined && receipt.previous.id !== chatId) ||
     (receipt.next !== undefined && receipt.next.id !== chatId) ||
     (receipt.mutation === 'write') !== didMutateStorage ||
@@ -1457,7 +1460,7 @@ function chatSelectionOperationExactReceipt(
             ? [
                 {
                   kind: 'text-template' as const,
-                  templateIds: [receipt.sourceId as TextTemplateId],
+                  templateIds: [receipt.sourceId],
                 },
               ]
             : []),
@@ -2018,10 +2021,6 @@ function configurationTargetFanoutOperationReceiptCompiler(
     ) => {
       assertConfigurationTargetFanoutOperationReceipt(input, didMutateStorage, receipt)
       if (!didMutateStorage) return []
-      const profileIds = sortedUnique([
-        ...receipt.presetLinks.profileUsageMutations.map(({ profileId }) => profileId),
-        ...(receipt.chats?.links.profileUsageMutations.map(({ profileId }) => profileId) ?? []),
-      ])
       return normalizeWorkspaceDependencies([
         ...(receipt.sourceKind === 'prompt-preset' && receipt.sourceMutation !== 'none'
           ? workspaceDependenciesForConfigurationSemanticMutation({
@@ -2034,23 +2033,7 @@ function configurationTargetFanoutOperationReceiptCompiler(
         (receipt.sourceMutation !== 'none' || receipt.targetLinkIds.length > 0)
           ? [{ kind: 'text-template' as const, templateIds: [receipt.sourceId] }]
           : []),
-        ...receipt.previousPresets.flatMap((previous, index) =>
-          workspaceDependenciesForConfigurationSemanticMutation({
-            kind: 'preset' as const,
-            previous,
-            next: receipt.nextPresets[index],
-          }),
-        ),
-        ...linkedChatTransitionsDependencies(receipt.writtenChatIds, receipt.chats),
-        ...(profileIds.length > 0
-          ? [
-              {
-                kind: 'profile' as const,
-                profileIds,
-                facets: ['dependent-counts' as const],
-              },
-            ]
-          : []),
+        ...receipt.targetFragment.dependencies,
       ])
     },
     physicalMutations: (
@@ -2105,46 +2088,13 @@ function configurationTargetFanoutOperationReceiptCompiler(
           operation: 'write' as const,
           key,
         })),
-        ...receipt.nextPresets.map(({ id: key }) => ({
-          tableName: 'presets' as const,
-          operation: 'write' as const,
-          key,
-        })),
-        ...receipt.presetLinks.removedLinkIds.map((key) => ({
-          tableName: 'configurationLinks' as const,
-          operation: 'delete' as const,
-          key,
-        })),
-        ...receipt.presetLinks.writtenLinkIds.map((key) => ({
-          tableName: 'configurationLinks' as const,
-          operation: 'write' as const,
-          key,
-        })),
-        ...receipt.presetLinks.profileUsageMutations.map(({ profileId: key, operation }) => ({
-          tableName: 'configurationProfileUsageRows' as const,
-          operation,
-          key,
-        })),
-        ...(receipt.presetLinks.profileManagerRevisionChanged
-          ? [
-              {
-                tableName: 'configurationCatalogAggregates' as const,
-                operation: 'write' as const,
-                key: CONFIGURATION_PROFILE_MANAGER_STATE_ID,
-              },
-            ]
-          : []),
-        ...(receipt.chats
-          ? linkedChatTransitionsPhysicalMutations(receipt.writtenChatIds, receipt.chats)
-          : []),
+        ...receipt.targetFragment.physicalMutations,
       ]
     },
     physicalReads: (receipt: ConfigurationTargetFanoutOperationReceipt) => {
       assertConfigurationTargetFanoutOperationReceipt(
         input,
-        receipt.sourceMutation !== 'none' ||
-          receipt.nextPresets.length > 0 ||
-          receipt.writtenChatIds.length > 0,
+        configurationTargetFanoutDidMutate(receipt),
         receipt,
       )
       return aggregateExactPhysicalReads([
@@ -2163,9 +2113,9 @@ function configurationTargetFanoutOperationReceiptCompiler(
               {
                 tableName: 'configurationLinks' as const,
                 indexKind: 'secondary' as const,
-                indexName: 'targetKey',
+                indexName: '[targetKey+id]',
                 operation: 'query' as const,
-                requestCount: 1,
+                requestCount: receipt.targetQueryRequests,
                 rowCount: receipt.targetLinkIds.length,
               },
             ]
@@ -2176,7 +2126,7 @@ function configurationTargetFanoutOperationReceiptCompiler(
                 tableName: 'chats' as const,
                 indexKind: 'primary' as const,
                 operation: 'get-many' as const,
-                requestCount: 1,
+                requestCount: receipt.chatReadRequests,
                 rowCount: receipt.chatReadIds.length,
               },
             ]
@@ -2187,7 +2137,7 @@ function configurationTargetFanoutOperationReceiptCompiler(
                 tableName: 'presets' as const,
                 indexKind: 'primary' as const,
                 operation: 'get-many' as const,
-                requestCount: 1,
+                requestCount: receipt.presetReadRequests,
                 rowCount: receipt.presetReadIds.length,
               },
             ]
@@ -2203,41 +2153,7 @@ function configurationTargetFanoutOperationReceiptCompiler(
               },
             ]
           : []),
-        ...(receipt.presetLinks.ownerQueryRequests > 0
-          ? [
-              {
-                tableName: 'configurationLinks' as const,
-                indexKind: 'secondary' as const,
-                indexName: 'ownerKey',
-                operation: 'open-cursor' as const,
-                requestCount: receipt.presetLinks.ownerQueryRequests,
-                rowCount: receipt.presetLinks.ownerQueryRowCount,
-              },
-            ]
-          : []),
-        ...(receipt.presetLinks.profileUsageReadRequests > 0
-          ? [
-              {
-                tableName: 'configurationProfileUsageRows' as const,
-                indexKind: 'primary' as const,
-                operation: 'get-many' as const,
-                requestCount: receipt.presetLinks.profileUsageReadRequests,
-                rowCount: receipt.presetLinks.profileUsageMutations.length,
-              },
-            ]
-          : []),
-        ...(receipt.presetLinks.profileManagerRevisionChanged
-          ? [
-              {
-                tableName: 'configurationCatalogAggregates' as const,
-                indexKind: 'primary' as const,
-                operation: 'get' as const,
-                requestCount: 1,
-                rowCount: 1,
-              },
-            ]
-          : []),
-        ...linkedChatTransitionPhysicalReads(receipt.chats),
+        ...receipt.targetFragment.physicalReads,
       ])
     },
   })
@@ -2291,10 +2207,7 @@ function configurationTargetFanoutOperationExactReceipt(
   input: ConfigurationTargetFanoutOperationInput,
   receipt: ConfigurationTargetFanoutOperationReceipt,
 ): SemanticOperationExactReceipt<PhysicalStorageTableName> {
-  const didMutateStorage =
-    receipt.sourceMutation !== 'none' ||
-    receipt.nextPresets.length > 0 ||
-    receipt.writtenChatIds.length > 0
+  const didMutateStorage = configurationTargetFanoutDidMutate(receipt)
   const compiler = configurationTargetFanoutOperationReceiptCompiler(input)
   return semanticOperationExactReceipt(plan, {
     dependencies: compiler.dependencies(didMutateStorage, receipt),
@@ -2303,21 +2216,40 @@ function configurationTargetFanoutOperationExactReceipt(
   })
 }
 
+function configurationTargetFanoutDidMutate(
+  receipt: ConfigurationTargetFanoutOperationReceipt,
+): boolean {
+  return receipt.sourceMutation !== 'none' || receipt.targetFragment.physicalMutations.length > 0
+}
+
 function assertConfigurationTargetFanoutOperationReceipt(
   input: ConfigurationTargetFanoutOperationInput,
   didMutateStorage: boolean,
   receipt: ConfigurationTargetFanoutOperationReceipt,
 ): void {
   const sourceChanged = receipt.sourceMutation !== 'none'
-  const presetIds = receipt.previousPresets.map(({ id }) => id)
-  const nextPresetIds = receipt.nextPresets.map(({ id }) => id)
+  const writtenPresetIds = new Set(receipt.writtenPresetIds)
+  const writtenChatIds = new Set(receipt.writtenChatIds)
   const readPresetIds = new Set(receipt.presetReadIds)
-  const chatChanged = receipt.writtenChatIds.length > 0
-  const presetChanged = receipt.nextPresets.length > 0
-  const removedTargetLinks = new Set([
-    ...receipt.presetLinks.removedLinkIds,
-    ...(receipt.chats?.links.removedLinkIds ?? []),
-  ])
+  const readChatIds = new Set(receipt.chatReadIds)
+  const physicalMutations = receipt.targetFragment.physicalMutations
+  const removedTargetLinks = new Set(
+    physicalMutations.flatMap((mutation) =>
+      mutation.tableName === 'configurationLinks' && mutation.operation === 'delete'
+        ? [mutation.key]
+        : [],
+    ),
+  )
+  const physicallyWrittenPresetIds = new Set(
+    physicalMutations.flatMap((mutation) =>
+      mutation.tableName === 'presets' && mutation.operation === 'write' ? [mutation.key] : [],
+    ),
+  )
+  const physicallyWrittenChatIds = new Set(
+    physicalMutations.flatMap((mutation) =>
+      mutation.tableName === 'chats' && mutation.operation === 'write' ? [mutation.key] : [],
+    ),
+  )
   if (
     receipt.operationKind !== input.operationKind ||
     receipt.sourceKind !== input.sourceKind ||
@@ -2333,13 +2265,27 @@ function assertConfigurationTargetFanoutOperationReceipt(
     (receipt.sourceMutation === 'delete' &&
       (receipt.previousSource === undefined || receipt.nextSource !== undefined)) ||
     (receipt.sourceMutation === 'none' && receipt.nextSource !== receipt.previousSource) ||
-    !sameConfigurationValue(presetIds, nextPresetIds) ||
-    presetIds.some((id) => !readPresetIds.has(id)) ||
-    chatChanged !== (receipt.chats !== undefined) ||
-    (receipt.chats !== undefined &&
-      !sameConfigurationValue(receipt.chats.sidebar.mutatedRowIds, receipt.writtenChatIds)) ||
-    didMutateStorage !== (sourceChanged || presetChanged || chatChanged) ||
-    (!receipt.targetQueryExecuted && receipt.targetLinkIds.length > 0) ||
+    !sameConfigurationValue(receipt.targetLinkIds, sortedUnique(receipt.targetLinkIds)) ||
+    !sameConfigurationValue(receipt.chatReadIds, sortedUnique(receipt.chatReadIds)) ||
+    !sameConfigurationValue(receipt.presetReadIds, sortedUnique(receipt.presetReadIds)) ||
+    !sameConfigurationValue(receipt.writtenChatIds, sortedUnique(receipt.writtenChatIds)) ||
+    !sameConfigurationValue(receipt.writtenPresetIds, sortedUnique(receipt.writtenPresetIds)) ||
+    receipt.writtenPresetIds.some(
+      (id) => !readPresetIds.has(id) || !physicallyWrittenPresetIds.has(id),
+    ) ||
+    receipt.writtenChatIds.some(
+      (id) => !readChatIds.has(id) || !physicallyWrittenChatIds.has(id),
+    ) ||
+    physicallyWrittenPresetIds.size !== writtenPresetIds.size ||
+    physicallyWrittenChatIds.size !== writtenChatIds.size ||
+    didMutateStorage !== configurationTargetFanoutDidMutate(receipt) ||
+    (!receipt.targetQueryExecuted &&
+      (receipt.targetQueryRequests !== 0 || receipt.targetLinkIds.length > 0)) ||
+    (receipt.targetQueryExecuted && receipt.targetQueryRequests < 1) ||
+    (receipt.chatReadIds.length === 0) !== (receipt.chatReadRequests === 0) ||
+    (receipt.chatReadIds.length > 0 && receipt.chatReadRequests < 1) ||
+    (receipt.presetReadIds.length === 0) !== (receipt.presetReadRequests === 0) ||
+    (receipt.presetReadIds.length > 0 && receipt.presetReadRequests < 1) ||
     ((input.operationKind === 'prompt-preset.delete' ||
       input.operationKind === 'text-template.delete') &&
       receipt.targetLinkIds.some((id) => !removedTargetLinks.has(id)))
@@ -2372,14 +2318,15 @@ function configurationTargetFanoutOperationReceipt(
     sourceMutation: values.sourceMutation ?? 'none',
     sourceProjection: values.sourceProjection,
     targetQueryExecuted: values.targetQueryExecuted ?? false,
+    targetQueryRequests: values.targetQueryRequests ?? 0,
     targetLinkIds: Object.freeze([...(values.targetLinkIds ?? [])]),
+    chatReadRequests: values.chatReadRequests ?? 0,
     chatReadIds: Object.freeze([...(values.chatReadIds ?? [])]),
+    presetReadRequests: values.presetReadRequests ?? 0,
     presetReadIds: Object.freeze([...(values.presetReadIds ?? [])]),
-    previousPresets: Object.freeze([...(values.previousPresets ?? [])]),
-    nextPresets: Object.freeze([...(values.nextPresets ?? [])]),
-    presetLinks: values.presetLinks ?? emptyConfigurationOwnerLinkMutationReceipt(),
+    writtenPresetIds: Object.freeze([...(values.writtenPresetIds ?? [])]),
     writtenChatIds: Object.freeze([...(values.writtenChatIds ?? [])]),
-    chats: values.chats,
+    targetFragment: values.targetFragment ?? semanticOperationReceiptFragment({}),
   })
 }
 
@@ -2397,12 +2344,8 @@ function executeConfigurationTargetFanoutOperation<
     async (tx) => {
       const current =
         input.sourceKind === 'prompt-preset'
-          ? await tx
-              .table<PromptPreset, PromptPresetId>('promptPresets')
-              .get(input.sourceId as PromptPresetId)
-          : await tx
-              .table<SavedTextTemplate, TextTemplateId>('textTemplates')
-              .get(input.sourceId as TextTemplateId)
+          ? await tx.table<PromptPreset, PromptPresetId>('promptPresets').get(input.sourceId)
+          : await tx.table<SavedTextTemplate, TextTemplateId>('textTemplates').get(input.sourceId)
       if (!current && input.sourceKind === 'prompt-preset') {
         return semanticOperationExecution(
           { kind: 'missing', entity: 'prompt-preset', id: input.sourceId } as const,
@@ -2441,6 +2384,136 @@ function nextPromptPresetTargetSource(
   }
 }
 
+const CONFIGURATION_TARGET_FANOUT_PAGE_SIZE = 64
+
+async function readConfigurationTargetFanoutLinks(
+  tx: Transaction,
+  kind: ConfigurationLink['targetKind'],
+  id: string,
+): Promise<{
+  readonly links: readonly ConfigurationLink[]
+  readonly requestCount: number
+}> {
+  const table = tx.table<ConfigurationLink, string>('configurationLinks')
+  const targetKey = configurationTargetKey(kind, id)
+  const [, upper] = exactCompoundPrefixBetween([targetKey])
+  const links: ConfigurationLink[] = []
+  let afterId: string | undefined
+  let requestCount = 0
+  for (;;) {
+    const page = await table
+      .where('[targetKey+id]')
+      .between(
+        afterId === undefined ? [targetKey] : [targetKey, afterId],
+        upper,
+        afterId === undefined,
+        false,
+      )
+      .limit(CONFIGURATION_TARGET_FANOUT_PAGE_SIZE)
+      .toArray()
+    requestCount += 1
+    links.push(...page)
+    if (page.length < CONFIGURATION_TARGET_FANOUT_PAGE_SIZE) break
+    afterId = page[page.length - 1]?.id
+  }
+  return { links: Object.freeze(links), requestCount }
+}
+
+function configurationTargetFanoutPages<Value>(
+  values: readonly Value[],
+): readonly (readonly Value[])[] {
+  const pages: Value[][] = []
+  for (let offset = 0; offset < values.length; offset += CONFIGURATION_TARGET_FANOUT_PAGE_SIZE) {
+    pages.push(values.slice(offset, offset + CONFIGURATION_TARGET_FANOUT_PAGE_SIZE))
+  }
+  return pages
+}
+
+function configurationPresetTargetMutationFragment(
+  presetIds: readonly PresetId[],
+  links: ConfigurationOwnerLinkMutationReceipt,
+): SemanticOperationReceiptFragment<PhysicalStorageTableName> {
+  return semanticOperationReceiptFragment({
+    physicalMutations: [
+      ...presetIds.map((key) => ({
+        tableName: 'presets' as const,
+        operation: 'write' as const,
+        key,
+      })),
+      ...links.removedLinkIds.map((key) => ({
+        tableName: 'configurationLinks' as const,
+        operation: 'delete' as const,
+        key,
+      })),
+      ...links.writtenLinkIds.map((key) => ({
+        tableName: 'configurationLinks' as const,
+        operation: 'write' as const,
+        key,
+      })),
+      ...links.profileUsageMutations.map(({ profileId: key, operation }) => ({
+        tableName: 'configurationProfileUsageRows' as const,
+        operation,
+        key,
+      })),
+      ...(links.profileManagerRevisionChanged
+        ? [
+            {
+              tableName: 'configurationCatalogAggregates' as const,
+              operation: 'write' as const,
+              key: CONFIGURATION_PROFILE_MANAGER_STATE_ID,
+            },
+          ]
+        : []),
+    ],
+    physicalReads: [
+      ...(links.ownerQueryRequests > 0
+        ? [
+            {
+              tableName: 'configurationLinks' as const,
+              indexKind: 'secondary' as const,
+              indexName: 'ownerKey',
+              operation: 'open-cursor' as const,
+              requestCount: links.ownerQueryRequests,
+              rowCount: links.ownerQueryRowCount,
+            },
+          ]
+        : []),
+      ...(links.profileUsageReadRequests > 0
+        ? [
+            {
+              tableName: 'configurationProfileUsageRows' as const,
+              indexKind: 'primary' as const,
+              operation: 'get-many' as const,
+              requestCount: links.profileUsageReadRequests,
+              rowCount: links.profileUsageMutations.length,
+            },
+          ]
+        : []),
+      ...(links.profileManagerRevisionChanged
+        ? [
+            {
+              tableName: 'configurationCatalogAggregates' as const,
+              indexKind: 'primary' as const,
+              operation: 'get' as const,
+              requestCount: 1,
+              rowCount: 1,
+            },
+          ]
+        : []),
+    ],
+  })
+}
+
+function configurationTargetPhysicalFragment(
+  fragment: SemanticOperationReceiptFragment<PhysicalStorageTableName>,
+): SemanticOperationReceiptFragment<PhysicalStorageTableName> {
+  return semanticOperationReceiptFragment({
+    physicalMutations: fragment.physicalMutations,
+    physicalReads: fragment.physicalReads,
+    physicalWrites: fragment.physicalWrites,
+  })
+}
+
 async function commitConfigurationTargetFanoutOperation(
   tx: FencedTransaction<PhysicalStorageTableName>,
   command: ConfigurationTargetFanoutOperationCommand,
@@ -2452,11 +2525,9 @@ async function commitConfigurationTargetFanoutOperation(
     ConfigurationTargetFanoutOperationReceipt
   >
 > {
-  const chatMutation = openLinkedChatMutation(tx)
   if (command.kind === 'text-template.delete') {
     return commitTextTemplateTargetFanout(
       tx,
-      chatMutation,
       command,
       input,
       current as SavedTextTemplate | undefined,
@@ -2472,114 +2543,198 @@ async function commitConfigurationTargetFanoutOperation(
         : ('write' as const)
   const textChanged = nextSource !== undefined && nextSource.text !== promptPreset.text
   const targetQueryExecuted = textChanged || command.kind === 'prompt-preset.delete'
-  const targetLinks = targetQueryExecuted
-    ? await readTargetLinksFromTransaction(tx, 'prompt-preset', promptPreset.id)
-    : []
+  const targetQuery = targetQueryExecuted
+    ? await readConfigurationTargetFanoutLinks(tx, 'prompt-preset', promptPreset.id)
+    : { links: Object.freeze([]), requestCount: 0 }
+  const targetLinks = targetQuery.links
   const targetLinkIds = targetLinks.map(({ id }) => id).sort()
-  const linkedChatIds = targetLinks
-    .filter(({ ownerKind }) => ownerKind === 'chat')
-    .map(({ ownerId }) => ownerId as ChatId)
-  const linkedPresetIds = targetLinks
-    .filter(({ ownerKind }) => ownerKind === 'chat-preset')
-    .map(({ ownerId }) => ownerId as PresetId)
+  for (const link of targetLinks) {
+    if (link.ownerKind !== 'chat' && link.ownerKind !== 'chat-preset') {
+      throw new Error(`ConfigurationLinkOwnerUnsupported:${link.ownerKey}`)
+    }
+  }
+  const linkedChatIds = sortedUnique(
+    targetLinks.filter(({ ownerKind }) => ownerKind === 'chat').map(({ ownerId }) => ownerId),
+  )
+  const linkedPresetIds = sortedUnique(
+    targetLinks
+      .filter(({ ownerKind }) => ownerKind === 'chat-preset')
+      .map(({ ownerId }) => ownerId),
+  )
   const chatReadIds = sortedUnique([
     ...linkedChatIds,
     ...(input.selectedChatId ? [input.selectedChatId] : []),
-  ]) as ChatId[]
-  const presetReadIds = sortedUnique(linkedPresetIds) as PresetId[]
-  const [chatRows, presetRows] = await Promise.all([
-    chatReadIds.length > 0 ? chatMutation.readMany(chatReadIds) : Promise.resolve([]),
-    presetReadIds.length > 0
-      ? tx.table<ChatPreset, PresetId>('presets').bulkGet(presetReadIds)
-      : Promise.resolve([]),
   ])
-  const chatsById = new Map<ChatId, Chat>()
-  for (const [index, chatId] of chatReadIds.entries()) {
-    const chat = chatRows[index]
-    if (chat) chatsById.set(chatId, chat)
-  }
-  const presetsById = new Map<PresetId, ChatPreset>()
-  for (const [index, presetId] of presetReadIds.entries()) {
-    const preset = presetRows[index]
-    if (preset) presetsById.set(presetId, preset)
-  }
-  if (input.selectedChatId && !chatsById.has(input.selectedChatId)) {
-    return semanticOperationExecution(
-      { kind: 'missing', entity: 'chat', id: input.selectedChatId } as const,
-      configurationTargetFanoutOperationReceipt(input, {
-        previousSource: promptPreset,
-        targetQueryExecuted,
-        targetLinkIds,
-        chatReadIds,
-        presetReadIds,
-      }),
-    )
-  }
-  for (const link of targetLinks) {
-    if (link.ownerKind === 'chat') {
-      if (!chatsById.has(link.ownerId)) {
-        throw new Error(`ConfigurationLinkOwnerMissing:${link.ownerKey}`)
-      }
-      continue
+  const presetReadIds = sortedUnique(linkedPresetIds)
+  const slot = promptPresetSlotForKind(promptPreset.kind)
+  const targetFragment = createSemanticOperationExactReceiptAccumulator<PhysicalStorageTableName>()
+  const chatClock = new TransactionChatUpdateClock()
+  const linkedChatIdSet = new Set(linkedChatIds)
+  const writtenChatIds: ChatId[] = []
+  const writtenPresetIds: PresetId[] = []
+  const sidebarChatIds = new Set<ChatId>()
+  const affectedProfileIds = new Set<ProfileId>()
+  let chatReadRequests = 0
+  let presetReadRequests = 0
+  let selectedConfigurationVersion: number | undefined
+
+  const processChatPage = async (page: readonly ChatId[]): Promise<boolean> => {
+    if (page.length === 0) return true
+    const chatMutation = openLinkedChatMutation(tx)
+    const chatRows = await chatMutation.readMany(page)
+    chatReadRequests += 1
+    if (chatRows.some((chat) => !chat)) {
+      const missingIndex = chatRows.findIndex((chat) => !chat)
+      const missingId = page[missingIndex] as ChatId
+      if (missingId === input.selectedChatId) return false
+      const link = targetLinks.find(
+        ({ ownerKind, ownerId }) => ownerKind === 'chat' && ownerId === missingId,
+      )
+      throw new Error(`ConfigurationLinkOwnerMissing:${link?.ownerKey ?? missingId}`)
     }
-    if (link.ownerKind === 'chat-preset') {
-      if (!presetsById.has(link.ownerId)) {
-        throw new Error(`ConfigurationLinkOwnerMissing:${link.ownerKey}`)
+    let pageChanged = false
+    for (const previous of chatRows as readonly Chat[]) {
+      const linked = linkedChatIdSet.has(previous.id)
+      const settings = { ...previous.settings }
+      if (linked && textChanged) {
+        ;(settings as unknown as Record<string, unknown>)[slot.textKey] = nextSource.text
       }
-      continue
+      if (linked && command.kind === 'prompt-preset.delete') {
+        delete (settings as Partial<ChatSettings>)[slot.pinKey]
+      }
+      if (command.kind === 'prompt-preset.overwrite-and-pin' && previous.id === command.chatId) {
+        ;(settings as unknown as Record<string, unknown>)[slot.textKey] = command.text
+        ;(settings as unknown as Record<string, unknown>)[slot.pinKey] = promptPreset.id
+      }
+      const transformed = withModelResolutionCancellation({ ...previous, settings }, true)
+      if (!chatConfigurationChanged(previous, transformed)) {
+        if (previous.id === input.selectedChatId) {
+          selectedConfigurationVersion = previous.configurationVersion ?? 0
+        }
+        continue
+      }
+      const next = await configuredChat(tx, previous, transformed, command.now, chatClock)
+      chatMutation.replaceLinked(previous.id, () => next)
+      writtenChatIds.push(previous.id)
+      pageChanged = true
+      if (previous.id === input.selectedChatId) {
+        selectedConfigurationVersion = next.configurationVersion ?? 0
+      }
     }
-    throw new Error(`ConfigurationLinkOwnerUnsupported:${link.ownerKey}`)
+    if (pageChanged) {
+      const receipt = await chatMutation.commit()
+      targetFragment.absorb(configurationTargetPhysicalFragment(receipt.fragment))
+      if (
+        receipt.sidebar.mutatedRowIds.length > 0 ||
+        receipt.sidebar.aggregateMutations.length > 0
+      ) {
+        for (const { chatId } of receipt.chatWrites) sidebarChatIds.add(chatId)
+      }
+      for (const { profileId } of receipt.links.profileUsageMutations) {
+        affectedProfileIds.add(profileId)
+      }
+    }
+    return true
   }
 
-  const slot = promptPresetSlotForKind(promptPreset.kind)
-  const stagedChats = new Map<ChatId, { readonly previous: Chat; readonly transformed: Chat }>()
-  const stagedPresets = new Map<
-    PresetId,
-    { readonly previous: ChatPreset; readonly next: ChatPreset }
-  >()
-  for (const chatId of linkedChatIds) {
-    const previous = chatsById.get(chatId) as Chat
-    const settings = { ...previous.settings }
-    if (textChanged) {
-      ;(settings as unknown as Record<string, unknown>)[slot.textKey] = nextSource?.text
-    }
-    if (command.kind === 'prompt-preset.delete') {
-      delete (settings as Partial<ChatSettings>)[slot.pinKey]
-    }
-    const transformed = withModelResolutionCancellation({ ...previous, settings }, true)
-    if (chatConfigurationChanged(previous, transformed)) {
-      stagedChats.set(chatId, { previous, transformed })
+  if (input.selectedChatId) {
+    const selectedExists = await processChatPage([input.selectedChatId])
+    if (!selectedExists) {
+      return semanticOperationExecution(
+        { kind: 'missing', entity: 'chat', id: input.selectedChatId } as const,
+        configurationTargetFanoutOperationReceipt(input, {
+          previousSource: promptPreset,
+          targetQueryExecuted,
+          targetQueryRequests: targetQuery.requestCount,
+          targetLinkIds,
+          chatReadRequests,
+          chatReadIds: [input.selectedChatId],
+        }),
+      )
     }
   }
-  for (const presetId of linkedPresetIds) {
-    const previous = presetsById.get(presetId) as ChatPreset
-    const settings = { ...previous.settings }
-    if (textChanged) {
-      ;(settings as unknown as Record<string, unknown>)[slot.textKey] = nextSource?.text
+  const remainingChatIds = input.selectedChatId
+    ? chatReadIds.filter((chatId) => chatId !== input.selectedChatId)
+    : chatReadIds
+  for (const page of configurationTargetFanoutPages(remainingChatIds)) {
+    await processChatPage(page)
+  }
+
+  for (const page of configurationTargetFanoutPages(presetReadIds)) {
+    const rows = await tx.table<ChatPreset, PresetId>('presets').bulkGet([...page])
+    presetReadRequests += 1
+    if (rows.some((preset) => !preset)) {
+      const missingIndex = rows.findIndex((preset) => !preset)
+      const missingId = page[missingIndex] as PresetId
+      const link = targetLinks.find(
+        ({ ownerKind, ownerId }) => ownerKind === 'chat-preset' && ownerId === missingId,
+      )
+      throw new Error(`ConfigurationLinkOwnerMissing:${link?.ownerKey ?? missingId}`)
     }
-    if (command.kind === 'prompt-preset.delete') {
-      delete (settings as Partial<ChatSettings>)[slot.pinKey]
+    const previousRows = rows as ChatPreset[]
+    const nextRows: ChatPreset[] = []
+    const changedPreviousRows: ChatPreset[] = []
+    for (const previous of previousRows) {
+      const settings = { ...previous.settings }
+      if (textChanged) {
+        ;(settings as unknown as Record<string, unknown>)[slot.textKey] = nextSource.text
+      }
+      if (command.kind === 'prompt-preset.delete') {
+        delete (settings as Partial<ChatSettings>)[slot.pinKey]
+      }
+      if (sameChatSettings(previous.settings, settings)) continue
+      changedPreviousRows.push(previous)
+      nextRows.push({ ...previous, settings, updatedAt: command.now })
     }
-    if (sameChatSettings(previous.settings, settings)) continue
-    stagedPresets.set(presetId, {
-      previous,
-      next: { ...previous, settings, updatedAt: command.now },
+    if (nextRows.length === 0) continue
+    const links = await replaceLinkedSemanticByteOwnerBatch(
+      tx,
+      'presets',
+      nextRows,
+      changedPreviousRows,
+    )
+    const pageIds = nextRows.map(({ id }) => id)
+    writtenPresetIds.push(...pageIds)
+    for (const { profileId } of links.profileUsageMutations) affectedProfileIds.add(profileId)
+    targetFragment.absorb(configurationPresetTargetMutationFragment(pageIds, links))
+  }
+
+  if (writtenChatIds.length > 0) {
+    targetFragment.physicalRead({
+      tableName: 'chats',
+      indexKind: 'secondary',
+      indexName: 'updatedAt',
+      operation: 'query',
+      requestCount: 1,
+      rowCount: 1,
     })
   }
-  if (command.kind === 'prompt-preset.overwrite-and-pin') {
-    const previous = chatsById.get(command.chatId) as Chat
-    const staged = stagedChats.get(command.chatId)
-    const transformed = staged?.transformed ?? previous
-    const settings = { ...transformed.settings }
-    ;(settings as unknown as Record<string, unknown>)[slot.textKey] = command.text
-    ;(settings as unknown as Record<string, unknown>)[slot.pinKey] = promptPreset.id
-    const selected = withModelResolutionCancellation({ ...transformed, settings }, true)
-    if (chatConfigurationChanged(previous, selected)) {
-      stagedChats.set(command.chatId, { previous, transformed: selected })
-    } else {
-      stagedChats.delete(command.chatId)
-    }
-  }
+  targetFragment.dependency(
+    ...(writtenChatIds.length > 0
+      ? [{ kind: 'chat' as const, chatIds: [...writtenChatIds].sort() }]
+      : []),
+    ...(sidebarChatIds.size > 0
+      ? [{ kind: 'sidebar' as const, chatIds: [...sidebarChatIds].sort() }]
+      : []),
+    ...(writtenPresetIds.length > 0
+      ? [
+          {
+            kind: 'preset' as const,
+            presetIds: [...writtenPresetIds].sort(),
+            facets: ['selected-detail' as const],
+          },
+        ]
+      : []),
+    ...(affectedProfileIds.size > 0
+      ? [
+          {
+            kind: 'profile' as const,
+            profileIds: [...affectedProfileIds].sort(),
+            facets: ['dependent-counts' as const],
+          },
+        ]
+      : []),
+  )
 
   let sourceProjection: ConfigurationCatalogProjectionMutationReceipt | undefined
   if (sourceMutation === 'write') {
@@ -2596,58 +2751,28 @@ async function commitConfigurationTargetFanoutOperation(
       promptPreset,
     )
   }
-
-  const previousPresets = [...stagedPresets.values()]
-    .map(({ previous }) => previous)
-    .sort((left, right) => left.id.localeCompare(right.id))
-  const nextPresets = previousPresets.map(
-    ({ id }) => (stagedPresets.get(id) as { readonly next: ChatPreset }).next,
-  )
-  const presetLinks =
-    nextPresets.length > 0
-      ? await replaceLinkedSemanticByteOwnerBatch(tx, 'presets', nextPresets, previousPresets)
-      : emptyConfigurationOwnerLinkMutationReceipt()
-
-  const chatClock = new TransactionChatUpdateClock()
-  const chatWrites: Array<{ readonly previous: Chat; readonly next: Chat }> = []
-  for (const { previous, transformed } of [...stagedChats.values()].sort((left, right) =>
-    left.previous.id.localeCompare(right.previous.id),
-  )) {
-    chatWrites.push({
-      previous,
-      next: await configuredChat(tx, previous, transformed, command.now, chatClock),
-    })
-  }
-  for (const { previous, next } of chatWrites) {
-    chatMutation.replaceLinked(previous.id, () => next)
-  }
-  const chats = chatWrites.length > 0 ? await chatMutation.commit() : undefined
-  const writtenChatIds = chatWrites.map(({ next }) => next.id)
-  const affectedPresetIds = nextPresets.map(({ id }) => id)
-  const selectedChat = input.selectedChatId ? chatsById.get(input.selectedChatId) : undefined
-  const writtenSelectedChat = input.selectedChatId
-    ? chatWrites.find(({ next }) => next.id === input.selectedChatId)?.next
-    : undefined
+  writtenChatIds.sort()
+  writtenPresetIds.sort()
+  const sealedTargetFragment = targetFragment.sealFragment()
   const result =
     command.kind === 'prompt-preset.overwrite-and-pin'
       ? {
           kind: 'prompt-preset-saved' as const,
           preset: nextSource as PromptPreset,
           chatId: command.chatId,
-          configurationVersion:
-            writtenSelectedChat?.configurationVersion ?? selectedChat?.configurationVersion ?? 0,
+          configurationVersion: selectedConfigurationVersion ?? 0,
           affectedChatIds: writtenChatIds,
-          affectedPresetIds,
+          affectedPresetIds: writtenPresetIds,
           affectedChatCount: writtenChatIds.length,
-          affectedPresetCount: affectedPresetIds.length,
+          affectedPresetCount: writtenPresetIds.length,
         }
       : {
           kind: 'prompt-preset-saved' as const,
           ...(nextSource ? { preset: nextSource } : {}),
           affectedChatIds: writtenChatIds,
-          affectedPresetIds,
+          affectedPresetIds: writtenPresetIds,
           affectedChatCount: writtenChatIds.length,
-          affectedPresetCount: affectedPresetIds.length,
+          affectedPresetCount: writtenPresetIds.length,
         }
   return semanticOperationExecution(
     result,
@@ -2657,21 +2782,21 @@ async function commitConfigurationTargetFanoutOperation(
       sourceMutation,
       sourceProjection,
       targetQueryExecuted,
+      targetQueryRequests: targetQuery.requestCount,
       targetLinkIds,
+      chatReadRequests,
       chatReadIds,
+      presetReadRequests,
       presetReadIds,
-      previousPresets,
-      nextPresets,
-      presetLinks,
+      writtenPresetIds,
       writtenChatIds,
-      chats,
+      targetFragment: sealedTargetFragment,
     }),
   )
 }
 
 async function commitTextTemplateTargetFanout(
   tx: FencedTransaction<PhysicalStorageTableName>,
-  chatMutation: LinkedChatMutationOwner,
   command: Extract<ConfigurationDomainCommand, { kind: 'text-template.delete' }>,
   input: ConfigurationTargetFanoutOperationInput,
   previousTemplate: SavedTextTemplate | undefined,
@@ -2681,88 +2806,144 @@ async function commitTextTemplateTargetFanout(
     ConfigurationTargetFanoutOperationReceipt
   >
 > {
-  const targetLinks = await readTargetLinksFromTransaction(tx, 'text-template', input.sourceId)
+  const targetQuery = await readConfigurationTargetFanoutLinks(tx, 'text-template', input.sourceId)
+  const targetLinks = targetQuery.links
   const targetLinkIds = targetLinks.map(({ id }) => id).sort()
-  const chatReadIds = sortedUnique(
-    targetLinks
-      .filter(({ ownerKind }) => ownerKind === 'chat')
-      .map(({ ownerId }) => ownerId as ChatId),
-  ) as ChatId[]
-  const presetReadIds = sortedUnique(
-    targetLinks
-      .filter(({ ownerKind }) => ownerKind === 'chat-preset')
-      .map(({ ownerId }) => ownerId as PresetId),
-  ) as PresetId[]
-  const [chatRows, presetRows] = await Promise.all([
-    chatReadIds.length > 0 ? chatMutation.readMany(chatReadIds) : Promise.resolve([]),
-    presetReadIds.length > 0
-      ? tx.table<ChatPreset, PresetId>('presets').bulkGet(presetReadIds)
-      : Promise.resolve([]),
-  ])
-  if (chatRows.some((chat) => !chat) || presetRows.some((preset) => !preset)) {
-    const missing = targetLinks.find((link) =>
-      link.ownerKind === 'chat'
-        ? !chatRows[chatReadIds.indexOf(link.ownerId as ChatId)]
-        : !presetRows[presetReadIds.indexOf(link.ownerId as PresetId)],
-    )
-    throw new Error(`ConfigurationLinkOwnerMissing:${missing?.ownerKey ?? input.sourceId}`)
-  }
   for (const link of targetLinks) {
     if (link.ownerKind !== 'chat' && link.ownerKind !== 'chat-preset') {
       throw new Error(`ConfigurationLinkOwnerInvalid:${link.ownerKey}`)
     }
   }
-
-  const previousPresets = presetRows as ChatPreset[]
-  const nextPresets = previousPresets.map(
-    (preset): ChatPreset => ({
-      ...preset,
-      settings: { ...preset.settings, textTemplate: 'chatml' },
-      updatedAt: command.now,
-    }),
+  const chatReadIds = sortedUnique(
+    targetLinks.filter(({ ownerKind }) => ownerKind === 'chat').map(({ ownerId }) => ownerId),
   )
-  const presetLinks =
-    nextPresets.length > 0
-      ? await replaceLinkedSemanticByteOwnerBatch(tx, 'presets', nextPresets, previousPresets)
-      : emptyConfigurationOwnerLinkMutationReceipt()
-
+  const presetReadIds = sortedUnique(
+    targetLinks
+      .filter(({ ownerKind }) => ownerKind === 'chat-preset')
+      .map(({ ownerId }) => ownerId),
+  )
+  const targetFragment = createSemanticOperationExactReceiptAccumulator<PhysicalStorageTableName>()
   const chatClock = new TransactionChatUpdateClock()
-  const chatWrites: Array<{ readonly previous: Chat; readonly next: Chat }> = []
-  for (const previous of chatRows as Chat[]) {
-    const transformed = withModelResolutionCancellation(
-      {
-        ...previous,
-        settings: { ...previous.settings, textTemplate: 'chatml' },
-      },
-      true,
+  const writtenChatIds: ChatId[] = []
+  const writtenPresetIds: PresetId[] = []
+  const sidebarChatIds = new Set<ChatId>()
+  const affectedProfileIds = new Set<ProfileId>()
+  let chatReadRequests = 0
+  let presetReadRequests = 0
+  for (const page of configurationTargetFanoutPages(chatReadIds)) {
+    const chatMutation = openLinkedChatMutation(tx)
+    const rows = await chatMutation.readMany(page)
+    chatReadRequests += 1
+    if (rows.some((chat) => !chat)) {
+      const missingIndex = rows.findIndex((chat) => !chat)
+      const missingId = page[missingIndex] as ChatId
+      const link = targetLinks.find(
+        ({ ownerKind, ownerId }) => ownerKind === 'chat' && ownerId === missingId,
+      )
+      throw new Error(`ConfigurationLinkOwnerMissing:${link?.ownerKey ?? missingId}`)
+    }
+    for (const previous of rows as readonly Chat[]) {
+      const transformed = withModelResolutionCancellation(
+        {
+          ...previous,
+          settings: { ...previous.settings, textTemplate: 'chatml' },
+        },
+        true,
+      )
+      const next = await configuredChat(tx, previous, transformed, command.now, chatClock)
+      chatMutation.replaceLinked(previous.id, () => next)
+      writtenChatIds.push(previous.id)
+    }
+    const receipt = await chatMutation.commit()
+    targetFragment.absorb(configurationTargetPhysicalFragment(receipt.fragment))
+    if (receipt.sidebar.mutatedRowIds.length > 0 || receipt.sidebar.aggregateMutations.length > 0) {
+      for (const { chatId } of receipt.chatWrites) sidebarChatIds.add(chatId)
+    }
+    for (const { profileId } of receipt.links.profileUsageMutations) {
+      affectedProfileIds.add(profileId)
+    }
+  }
+  for (const page of configurationTargetFanoutPages(presetReadIds)) {
+    const rows = await tx.table<ChatPreset, PresetId>('presets').bulkGet([...page])
+    presetReadRequests += 1
+    if (rows.some((preset) => !preset)) {
+      const missingIndex = rows.findIndex((preset) => !preset)
+      const missingId = page[missingIndex] as PresetId
+      const link = targetLinks.find(
+        ({ ownerKind, ownerId }) => ownerKind === 'chat-preset' && ownerId === missingId,
+      )
+      throw new Error(`ConfigurationLinkOwnerMissing:${link?.ownerKey ?? missingId}`)
+    }
+    const previousRows = rows as ChatPreset[]
+    const nextRows = previousRows.map(
+      (preset): ChatPreset => ({
+        ...preset,
+        settings: { ...preset.settings, textTemplate: 'chatml' },
+        updatedAt: command.now,
+      }),
     )
-    chatWrites.push({
-      previous,
-      next: await configuredChat(tx, previous, transformed, command.now, chatClock),
+    const links = await replaceLinkedSemanticByteOwnerBatch(tx, 'presets', nextRows, previousRows)
+    const pageIds = nextRows.map(({ id }) => id)
+    writtenPresetIds.push(...pageIds)
+    for (const { profileId } of links.profileUsageMutations) affectedProfileIds.add(profileId)
+    targetFragment.absorb(configurationPresetTargetMutationFragment(pageIds, links))
+  }
+  if (writtenChatIds.length > 0) {
+    targetFragment.physicalRead({
+      tableName: 'chats',
+      indexKind: 'secondary',
+      indexName: 'updatedAt',
+      operation: 'query',
+      requestCount: 1,
+      rowCount: 1,
     })
   }
-  for (const { previous, next } of chatWrites) {
-    chatMutation.replaceLinked(previous.id, () => next)
-  }
-  const chats = chatWrites.length > 0 ? await chatMutation.commit() : undefined
-  const writtenChatIds = chatWrites.map(({ next }) => next.id)
+  targetFragment.dependency(
+    ...(writtenChatIds.length > 0
+      ? [{ kind: 'chat' as const, chatIds: [...writtenChatIds].sort() }]
+      : []),
+    ...(sidebarChatIds.size > 0
+      ? [{ kind: 'sidebar' as const, chatIds: [...sidebarChatIds].sort() }]
+      : []),
+    ...(writtenPresetIds.length > 0
+      ? [
+          {
+            kind: 'preset' as const,
+            presetIds: [...writtenPresetIds].sort(),
+            facets: ['selected-detail' as const],
+          },
+        ]
+      : []),
+    ...(affectedProfileIds.size > 0
+      ? [
+          {
+            kind: 'profile' as const,
+            profileIds: [...affectedProfileIds].sort(),
+            facets: ['dependent-counts' as const],
+          },
+        ]
+      : []),
+  )
 
   if (previousTemplate) {
     await deleteTextTemplateByteOwner(tx, previousTemplate.id, previousTemplate)
   }
 
+  writtenChatIds.sort()
+  writtenPresetIds.sort()
   const receipt = configurationTargetFanoutOperationReceipt(input, {
     previousSource: previousTemplate,
     sourceMutation: previousTemplate ? 'delete' : 'none',
     targetQueryExecuted: true,
+    targetQueryRequests: targetQuery.requestCount,
     targetLinkIds,
+    chatReadRequests,
     chatReadIds,
+    presetReadRequests,
     presetReadIds,
-    previousPresets,
-    nextPresets,
-    presetLinks,
+    writtenPresetIds,
     writtenChatIds,
-    chats,
+    targetFragment: targetFragment.sealFragment(),
   })
   return semanticOperationExecution(
     {
@@ -2771,7 +2952,7 @@ async function commitTextTemplateTargetFanout(
       changed: previousTemplate !== undefined || targetLinks.length > 0,
       deleted: previousTemplate !== undefined,
       affectedChatIds: writtenChatIds,
-      affectedPresetIds: nextPresets.map(({ id }) => id),
+      affectedPresetIds: writtenPresetIds,
     } as const,
     receipt,
   )
@@ -3347,8 +3528,7 @@ function connectionDeleteOperationDependencies(
   receipt: ConnectionDeleteOperationReceipt,
 ): readonly WorkspaceDependency[] {
   const profileIds = sortedUnique([
-    ...receipt.presetLinks.profileUsageMutations.map(({ profileId }) => profileId),
-    ...(receipt.chats?.links.profileUsageMutations.map(({ profileId }) => profileId) ?? []),
+    ...receipt.profileLinks.profileUsageMutations.map(({ profileId }) => profileId),
   ])
   return normalizeWorkspaceDependencies([
     ...workspaceDependenciesForConfigurationSemanticMutation({
@@ -3356,14 +3536,7 @@ function connectionDeleteOperationDependencies(
       previous: receipt.previousProfile,
       next: undefined,
     }),
-    ...receipt.previousPresets.flatMap((previous, index) =>
-      workspaceDependenciesForConfigurationSemanticMutation({
-        kind: 'preset' as const,
-        previous,
-        next: receipt.nextPresets[index],
-      }),
-    ),
-    ...linkedChatTransitionsDependencies(receipt.writtenChatIds, receipt.chats),
+    ...receipt.targetFragment.dependencies,
     ...receipt.keys
       .filter(({ deleted }) => deleted)
       .flatMap(({ previous }) =>
@@ -3423,15 +3596,15 @@ function connectionDeleteOperationReceipt(
     replacementQueryExecuted: values.replacementQueryExecuted ?? false,
     usage: values.usage ?? emptyConfigurationProfileUsageProjectionRow(input.profileId),
     targetQueryExecuted: values.targetQueryExecuted ?? false,
+    targetQueryRequests: values.targetQueryRequests ?? 0,
     targetLinkIds: Object.freeze([...(values.targetLinkIds ?? [])]),
+    presetReadRequests: values.presetReadRequests ?? 0,
     presetReadIds: Object.freeze([...(values.presetReadIds ?? [])]),
+    chatReadRequests: values.chatReadRequests ?? 0,
     chatReadIds: Object.freeze([...(values.chatReadIds ?? [])]),
-    previousPresets: Object.freeze([...(values.previousPresets ?? [])]),
-    nextPresets: Object.freeze([...(values.nextPresets ?? [])]),
-    presetLinks: values.presetLinks ?? emptyConfigurationOwnerLinkMutationReceipt(),
-    presetCatalogs: Object.freeze([...(values.presetCatalogs ?? [])]),
+    writtenPresetIds: Object.freeze([...(values.writtenPresetIds ?? [])]),
     writtenChatIds: Object.freeze([...(values.writtenChatIds ?? [])]),
-    chats: values.chats,
+    targetFragment: values.targetFragment ?? semanticOperationReceiptFragment({}),
     profileLinks: values.profileLinks ?? emptyConfigurationOwnerLinkMutationReceipt(),
     profileCatalog: values.profileCatalog,
     discovery: values.discovery,
@@ -3446,16 +3619,25 @@ function assertConnectionDeleteOperationReceipt(
   receipt: ConnectionDeleteOperationReceipt,
 ): void {
   const sourceDeleted = receipt.profileCatalog !== undefined
-  const previousPresetIds = receipt.previousPresets.map(({ id }) => id)
-  const nextPresetIds = receipt.nextPresets.map(({ id }) => id)
-  const removedTargetLinks = new Set([
-    ...receipt.presetLinks.removedLinkIds,
-    ...receipt.presetLinks.writtenLinkIds,
-    ...(receipt.chats?.links.removedLinkIds ?? []),
-    ...(receipt.chats?.links.writtenLinkIds ?? []),
-  ])
+  const removedTargetLinks = new Set(
+    receipt.targetFragment.physicalMutations.flatMap((mutation) =>
+      mutation.tableName === 'configurationLinks' &&
+      (mutation.operation === 'delete' || mutation.operation === 'write')
+        ? [mutation.key]
+        : [],
+    ),
+  )
+  const physicallyWrittenPresetIds = new Set(
+    receipt.targetFragment.physicalMutations.flatMap((mutation) =>
+      mutation.tableName === 'presets' && mutation.operation === 'write' ? [mutation.key] : [],
+    ),
+  )
+  const physicallyWrittenChatIds = new Set(
+    receipt.targetFragment.physicalMutations.flatMap((mutation) =>
+      mutation.tableName === 'chats' && mutation.operation === 'write' ? [mutation.key] : [],
+    ),
+  )
   if (
-    receipt.operationKind !== 'connection.delete' ||
     receipt.profileId !== input.profileId ||
     receipt.replacementProfileId !== input.replacementProfileId ||
     (receipt.previousProfile !== undefined && !receipt.sourceQueryExecuted) ||
@@ -3468,13 +3650,26 @@ function assertConnectionDeleteOperationReceipt(
     sourceDeleted !== (receipt.discovery !== undefined) ||
     sourceDeleted !== (receipt.fallbackProfileId !== undefined) ||
     sourceDeleted !== receipt.profileLinks.ownerQueryRequests > 0 ||
-    !sameConfigurationValue(previousPresetIds, nextPresetIds) ||
-    previousPresetIds.some((id) => !receipt.presetReadIds.includes(id)) ||
-    receipt.presetCatalogs.length !== receipt.nextPresets.length ||
-    receipt.writtenChatIds.length > 0 !== (receipt.chats !== undefined) ||
-    (receipt.chats !== undefined &&
-      !sameConfigurationValue(receipt.chats.sidebar.mutatedRowIds, receipt.writtenChatIds)) ||
-    (!receipt.targetQueryExecuted && receipt.targetLinkIds.length > 0) ||
+    !sameConfigurationValue(receipt.targetLinkIds, sortedUnique(receipt.targetLinkIds)) ||
+    !sameConfigurationValue(receipt.presetReadIds, sortedUnique(receipt.presetReadIds)) ||
+    !sameConfigurationValue(receipt.chatReadIds, sortedUnique(receipt.chatReadIds)) ||
+    !sameConfigurationValue(receipt.writtenPresetIds, sortedUnique(receipt.writtenPresetIds)) ||
+    !sameConfigurationValue(receipt.writtenChatIds, sortedUnique(receipt.writtenChatIds)) ||
+    receipt.writtenPresetIds.some(
+      (id) => !receipt.presetReadIds.includes(id) || !physicallyWrittenPresetIds.has(id),
+    ) ||
+    receipt.writtenChatIds.some(
+      (id) => !receipt.chatReadIds.includes(id) || !physicallyWrittenChatIds.has(id),
+    ) ||
+    physicallyWrittenPresetIds.size !== receipt.writtenPresetIds.length ||
+    physicallyWrittenChatIds.size !== receipt.writtenChatIds.length ||
+    (!receipt.targetQueryExecuted &&
+      (receipt.targetQueryRequests !== 0 || receipt.targetLinkIds.length > 0)) ||
+    (receipt.targetQueryExecuted && receipt.targetQueryRequests < 1) ||
+    (receipt.presetReadIds.length === 0) !== (receipt.presetReadRequests === 0) ||
+    (receipt.presetReadIds.length > 0 && receipt.presetReadRequests < 1) ||
+    (receipt.chatReadIds.length === 0) !== (receipt.chatReadRequests === 0) ||
+    (receipt.chatReadIds.length > 0 && receipt.chatReadRequests < 1) ||
     receipt.targetLinkIds.some((id) => !removedTargetLinks.has(id)) ||
     receipt.keys.some(
       ({ targetQueryExecuted, remainingProfileIds, previous, deleted }) =>
@@ -3489,11 +3684,9 @@ function assertConnectionDeleteOperationReceipt(
         discovery: receipt.discovery !== undefined,
         fallback: receipt.fallbackProfileId !== undefined,
         profileOwnerQueries: receipt.profileLinks.ownerQueryRequests,
-        previousPresetIds,
-        nextPresetIds,
-        presetCatalogs: receipt.presetCatalogs.length,
+        readPresets: receipt.presetReadIds.length,
+        writtenPresets: receipt.writtenPresetIds.length,
         writtenChats: receipt.writtenChatIds.length,
-        hasChats: receipt.chats !== undefined,
         targetLinks: receipt.targetLinkIds.length,
         removedTargetLinks: removedTargetLinks.size,
         keys: receipt.keys.map(({ keyId, remainingProfileIds, previous, deleted }) => ({
@@ -3555,9 +3748,9 @@ function connectionDeleteOperationPhysicalReads(
           {
             tableName: 'configurationLinks' as const,
             indexKind: 'secondary' as const,
-            indexName: 'targetKey',
+            indexName: '[targetKey+id]',
             operation: 'query' as const,
-            requestCount: 1,
+            requestCount: receipt.targetQueryRequests,
             rowCount: receipt.targetLinkIds.length,
           },
         ]
@@ -3568,7 +3761,7 @@ function connectionDeleteOperationPhysicalReads(
             tableName: 'presets' as const,
             indexKind: 'primary' as const,
             operation: 'get-many' as const,
-            requestCount: 1,
+            requestCount: receipt.presetReadRequests,
             rowCount: receipt.presetReadIds.length,
           },
         ]
@@ -3579,14 +3772,12 @@ function connectionDeleteOperationPhysicalReads(
             tableName: 'chats' as const,
             indexKind: 'primary' as const,
             operation: 'get-many' as const,
-            requestCount: 1,
+            requestCount: receipt.chatReadRequests,
             rowCount: receipt.chatReadIds.length,
           },
         ]
       : []),
-    ...configurationOwnerLinkPhysicalReads(receipt.presetLinks),
-    ...receipt.presetCatalogs.flatMap(connectionDeleteCatalogPhysicalReads),
-    ...linkedChatTransitionPhysicalReads(receipt.chats),
+    ...receipt.targetFragment.physicalReads,
     ...configurationOwnerLinkPhysicalReads(receipt.profileLinks),
     ...configurationCatalogProjectionPhysicalReads(receipt.profileCatalog),
     ...(receipt.fallbackProfileId !== undefined && input.replacementProfileId === null
@@ -3605,7 +3796,7 @@ function connectionDeleteOperationPhysicalReads(
       {
         tableName: 'configurationLinks' as const,
         indexKind: 'secondary' as const,
-        indexName: 'targetKey',
+        indexName: '[targetKey+id]',
         operation: 'query' as const,
         requestCount: 1,
         rowCount: remainingProfileIds.length,
@@ -3679,7 +3870,6 @@ async function commitConnectionDeleteOperation(
     ConnectionDeleteOperationReceipt
   >
 > {
-  const chatMutation = openLinkedChatMutation(tx)
   if (input.replacementProfileId === input.profileId) {
     return semanticOperationExecution(
       { kind: 'invalid', reason: 'profile-reassign-self' } as const,
@@ -3742,9 +3932,10 @@ async function commitConnectionDeleteOperation(
     )
   }
 
-  const targetLinks = input.replacementProfileId
-    ? await readTargetLinksFromTransaction(tx, 'profile', profile.id)
-    : []
+  const targetQuery = input.replacementProfileId
+    ? await readConfigurationTargetFanoutLinks(tx, 'profile', profile.id)
+    : { links: Object.freeze([]), requestCount: 0 }
+  const targetLinks = targetQuery.links
   for (const link of targetLinks) {
     if (link.ownerKind !== 'chat-preset' && link.ownerKind !== 'chat') {
       throw new Error(`ConfigurationLinkOwnerInvalid:${link.ownerKey}`)
@@ -3754,81 +3945,113 @@ async function commitConnectionDeleteOperation(
   const presetReadIds = sortedUnique(
     targetLinks
       .filter(({ ownerKind }) => ownerKind === 'chat-preset')
-      .map(({ ownerId }) => ownerId as PresetId),
-  ) as PresetId[]
+      .map(({ ownerId }) => ownerId),
+  )
   const chatReadIds = sortedUnique(
-    targetLinks
-      .filter(({ ownerKind }) => ownerKind === 'chat')
-      .map(({ ownerId }) => ownerId as ChatId),
-  ) as ChatId[]
+    targetLinks.filter(({ ownerKind }) => ownerKind === 'chat').map(({ ownerId }) => ownerId),
+  )
   if (usage.presetCount !== presetReadIds.length || usage.chatCount !== chatReadIds.length) {
     throw new Error(`ConfigurationProfileUsageIntegrityError:${profile.id}`)
   }
-  const [presetRows, chatRows] = input.replacementProfileId
-    ? await Promise.all([
-        presetReadIds.length > 0
-          ? tx.table<ChatPreset, PresetId>('presets').bulkGet(presetReadIds)
-          : Promise.resolve([]),
-        chatReadIds.length > 0 ? chatMutation.readMany(chatReadIds) : Promise.resolve([]),
-      ])
-    : [[], []]
-  if (presetRows.some((preset) => !preset) || chatRows.some((chat) => !chat)) {
-    const missing = targetLinks.find((link) =>
-      link.ownerKind === 'chat-preset'
-        ? !presetRows[presetReadIds.indexOf(link.ownerId as PresetId)]
-        : !chatRows[chatReadIds.indexOf(link.ownerId as ChatId)],
-    )
-    throw new Error(`ConfigurationLinkOwnerMissing:${missing?.ownerKey ?? profile.id}`)
-  }
-
-  const previousPresets = presetRows as ChatPreset[]
-  const nextPresets = input.replacementProfileId
-    ? previousPresets.map(
-        (preset): ChatPreset => ({
-          ...preset,
-          connectionProfileId: input.replacementProfileId as ProfileId,
-          settings: {
-            ...preset.settings,
-            profileId: input.replacementProfileId as ProfileId,
-          },
-          updatedAt: command.now,
-        }),
+  const targetFragment = createSemanticOperationExactReceiptAccumulator<PhysicalStorageTableName>()
+  const writtenPresetIds: PresetId[] = []
+  const writtenChatIds: ChatId[] = []
+  const sidebarChatIds = new Set<ChatId>()
+  let presetReadRequests = 0
+  let chatReadRequests = 0
+  for (const page of configurationTargetFanoutPages(presetReadIds)) {
+    const rows = await tx.table<ChatPreset, PresetId>('presets').bulkGet([...page])
+    presetReadRequests += 1
+    if (rows.some((preset) => !preset)) {
+      const missingIndex = rows.findIndex((preset) => !preset)
+      const missingId = page[missingIndex] as PresetId
+      const link = targetLinks.find(
+        ({ ownerKind, ownerId }) => ownerKind === 'chat-preset' && ownerId === missingId,
       )
-    : []
-  const presetLinks =
-    nextPresets.length > 0
-      ? await replaceLinkedSemanticByteOwnerBatch(tx, 'presets', nextPresets, previousPresets)
-      : emptyConfigurationOwnerLinkMutationReceipt()
-  const presetCatalogs: ConfigurationPresetCatalogMutationReceipt[] = []
-  for (const [index, next] of nextPresets.entries()) {
-    presetCatalogs.push(
-      await applyConfigurationPresetCatalogProjectionTransition(tx, previousPresets[index], next),
-    )
-  }
-
-  const chatClock = new TransactionChatUpdateClock()
-  const chatWrites: Array<{ readonly previous: Chat; readonly next: Chat }> = []
-  for (const previous of chatRows as Chat[]) {
-    const transformed = withModelResolutionCancellation(
-      {
-        ...previous,
+      throw new Error(`ConfigurationLinkOwnerMissing:${link?.ownerKey ?? missingId}`)
+    }
+    const previousRows = rows as ChatPreset[]
+    const nextRows = previousRows.map(
+      (preset): ChatPreset => ({
+        ...preset,
+        connectionProfileId: input.replacementProfileId as ProfileId,
         settings: {
-          ...previous.settings,
+          ...preset.settings,
           profileId: input.replacementProfileId as ProfileId,
         },
-      },
-      true,
+        updatedAt: command.now,
+      }),
     )
-    chatWrites.push({
-      previous,
-      next: await configuredChat(tx, previous, transformed, command.now, chatClock),
+    const links = await replaceLinkedSemanticByteOwnerBatch(tx, 'presets', nextRows, previousRows)
+    const pageIds = nextRows.map(({ id }) => id)
+    writtenPresetIds.push(...pageIds)
+    targetFragment.absorb(configurationPresetTargetMutationFragment(pageIds, links))
+    for (const [index, next] of nextRows.entries()) {
+      const catalog = await applyConfigurationPresetCatalogProjectionTransition(
+        tx,
+        previousRows[index],
+        next,
+      )
+      targetFragment.absorb(
+        semanticOperationReceiptFragment({
+          physicalReads: connectionDeleteCatalogPhysicalReads(catalog),
+        }),
+      )
+    }
+  }
+  const chatClock = new TransactionChatUpdateClock()
+  for (const page of configurationTargetFanoutPages(chatReadIds)) {
+    const chatMutation = openLinkedChatMutation(tx)
+    const rows = await chatMutation.readMany(page)
+    chatReadRequests += 1
+    if (rows.some((chat) => !chat)) {
+      const missingIndex = rows.findIndex((chat) => !chat)
+      const missingId = page[missingIndex] as ChatId
+      const link = targetLinks.find(
+        ({ ownerKind, ownerId }) => ownerKind === 'chat' && ownerId === missingId,
+      )
+      throw new Error(`ConfigurationLinkOwnerMissing:${link?.ownerKey ?? missingId}`)
+    }
+    for (const previous of rows as readonly Chat[]) {
+      const transformed = withModelResolutionCancellation(
+        {
+          ...previous,
+          settings: {
+            ...previous.settings,
+            profileId: input.replacementProfileId as ProfileId,
+          },
+        },
+        true,
+      )
+      const next = await configuredChat(tx, previous, transformed, command.now, chatClock)
+      chatMutation.replaceLinked(previous.id, () => next)
+      writtenChatIds.push(previous.id)
+    }
+    const receipt = await chatMutation.commit()
+    targetFragment.absorb(configurationTargetPhysicalFragment(receipt.fragment))
+    if (receipt.sidebar.mutatedRowIds.length > 0 || receipt.sidebar.aggregateMutations.length > 0) {
+      for (const { chatId } of receipt.chatWrites) sidebarChatIds.add(chatId)
+    }
+  }
+  if (writtenChatIds.length > 0) {
+    targetFragment.physicalRead({
+      tableName: 'chats',
+      indexKind: 'secondary',
+      indexName: 'updatedAt',
+      operation: 'query',
+      requestCount: 1,
+      rowCount: 1,
     })
   }
-  for (const { previous, next } of chatWrites) {
-    chatMutation.replaceLinked(previous.id, () => next)
-  }
-  const chats = chatWrites.length > 0 ? await chatMutation.commit() : undefined
-  const writtenChatIds = chatWrites.map(({ next }) => next.id)
+  targetFragment.dependency(
+    ...(writtenChatIds.length > 0
+      ? [{ kind: 'chat' as const, chatIds: [...writtenChatIds].sort() }]
+      : []),
+    ...(sidebarChatIds.size > 0
+      ? [{ kind: 'sidebar' as const, chatIds: [...sidebarChatIds].sort() }]
+      : []),
+  )
+  const sealedTargetFragment = targetFragment.sealFragment()
 
   const profileLinks = await deleteLinkedSemanticByteOwner(tx, 'profiles', profile.id, profile)
   const profileCatalog = await applyConfigurationProfileCatalogProjectionDeletion(tx, profile)
@@ -3844,17 +4067,16 @@ async function commitConnectionDeleteOperation(
   const keyIds = sortedUnique(
     configurationLinksForProfile(profile)
       .filter(({ targetKind }) => targetKind === 'key')
-      .map(({ targetId }) => targetId as KeyId),
-  ) as KeyId[]
+      .map(({ targetId }) => targetId),
+  )
   const keys: ConnectionDeleteKeyReceipt[] = []
   const keyTable = tx.table<KeyRecord, KeyId>('keys')
   for (const keyId of keyIds) {
-    const remainingLinks = await readTargetLinksFromTransaction(tx, 'key', keyId)
-    const remainingProfileIds = sortedUnique(
-      remainingLinks
-        .filter(({ ownerKind }) => ownerKind === 'profile')
-        .map(({ ownerId }) => ownerId as ProfileId),
-    ) as ProfileId[]
+    const remainingLink = await readFirstTargetLinkFromTransaction(tx, 'key', keyId)
+    if (remainingLink && remainingLink.ownerKind !== 'profile') {
+      throw new Error(`ConfigurationLinkOwnerInvalid:${remainingLink.ownerKey}`)
+    }
+    const remainingProfileIds = remainingLink ? ([remainingLink.ownerId] as const) : []
     const previous = remainingProfileIds.length === 0 ? await keyTable.get(keyId) : undefined
     if (previous) await deleteSemanticByteOwner(tx, 'keys', keyId, previous)
     keys.push({
@@ -3873,15 +4095,15 @@ async function commitConnectionDeleteOperation(
     replacementQueryExecuted: input.replacementProfileId !== null,
     usage,
     targetQueryExecuted: input.replacementProfileId !== null,
+    targetQueryRequests: targetQuery.requestCount,
     targetLinkIds,
+    presetReadRequests,
     presetReadIds,
+    chatReadRequests,
     chatReadIds,
-    previousPresets,
-    nextPresets,
-    presetLinks,
-    presetCatalogs,
+    writtenPresetIds: writtenPresetIds.sort(),
     writtenChatIds,
-    ...(chats ? { chats } : {}),
+    targetFragment: sealedTargetFragment,
     profileLinks,
     profileCatalog,
     discovery,
@@ -3921,11 +4143,11 @@ async function commitConnectionProfileLifecycleOperation(
   }
 }
 
-async function finalizeConnectionKeyTransition(
+function finalizeConnectionKeyTransition(
   tx: FencedTransaction<PhysicalStorageTableName>,
   previous: KeyRecord | undefined,
   next: KeyRecord,
-): Promise<KeyMaterialOperationReceipt> {
+): KeyMaterialOperationReceipt {
   const receipt = keyMaterialOperationReceipt(previous, next, 'write')
   recordBrowserCommandKeyRequestMaterialAffectedSet(tx, next.id)
   return receipt
@@ -4059,7 +4281,7 @@ async function commitConnectionCreateOperation(
     })
   }
   const keyReceipt = writtenKey
-    ? await finalizeConnectionKeyTransition(tx, currentKey, writtenKey)
+    ? finalizeConnectionKeyTransition(tx, currentKey, writtenKey)
     : input.keyIdToValidate
       ? keyMaterialOperationReceipt(currentKey, currentKey, 'none')
       : undefined
@@ -4212,11 +4434,7 @@ async function commitConnectionEditOperation(
     )
   }
   if (replacementKeyNext) {
-    keyReceipt = await finalizeConnectionKeyTransition(
-      tx,
-      replacementKeyPrevious,
-      replacementKeyNext,
-    )
+    keyReceipt = finalizeConnectionKeyTransition(tx, replacementKeyPrevious, replacementKeyNext)
   }
   const fallbackProfileId =
     current.archived !== true && written.archived === true
@@ -4483,9 +4701,8 @@ function assertCatalogedConfigurationOperationReceipt(
   receipt: CatalogedConfigurationOperationReceipt,
 ): void {
   const definition = catalogedConfigurationOperationDefinition(operationKind)
-  const projection = receipt?.projection
+  const projection = receipt.projection
   if (
-    receipt?.[CATALOGED_CONFIGURATION_OPERATION_RECEIPT] !== true ||
     input.entityKind !== definition.entityKind ||
     receipt.entityKind !== definition.entityKind ||
     (receipt.previous !== undefined && receipt.previous.id !== input.entityId) ||
@@ -4542,7 +4759,7 @@ function catalogedConfigurationOperationReceipt(
     next,
     entityMutation: projection ? ('write' as const) : ('none' as const),
     projection,
-  }) as CatalogedConfigurationOperationReceipt
+  })
 }
 
 async function executeCatalogedConfigurationOperation<
@@ -6546,9 +6763,7 @@ async function deleteChatPreset(
         }
       }
       const targetLinkIds = targetLinks.map(({ id }) => id).sort()
-      const chatReadIds = sortedUnique(
-        targetLinks.map(({ ownerId }) => ownerId as ChatId),
-      ) as ChatId[]
+      const chatReadIds = sortedUnique(targetLinks.map(({ ownerId }) => ownerId))
       const chatRows = chatReadIds.length > 0 ? await chatMutation.readMany(chatReadIds) : []
       if (chatRows.some((chat) => !chat)) {
         const missingIndex = chatRows.findIndex((chat) => !chat)
@@ -7228,6 +7443,18 @@ async function readTargetLinksFromTransaction(
     .where('targetKey')
     .equals(configurationTargetKey(kind, id))
     .toArray()
+}
+
+async function readFirstTargetLinkFromTransaction(
+  tx: Transaction,
+  kind: ConfigurationLink['targetKind'],
+  id: string,
+): Promise<ConfigurationLink | undefined> {
+  return tx
+    .table<ConfigurationLink, string>('configurationLinks')
+    .where('[targetKey+id]')
+    .between(...exactCompoundPrefixBetween([configurationTargetKey(kind, id)]))
+    .first()
 }
 
 function configurationLockNames(

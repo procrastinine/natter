@@ -85,8 +85,8 @@ import {
   assertBrowserWorkspaceBootstrapAuthorityOwned,
   type BrowserWorkspaceBootstrapAuthority,
 } from './browser-workspace-bootstrap-authority'
+import { probeBrowserWorkspaceCurrent } from './browser-workspace-current-probe'
 import { readExistingIndexedDb } from './browser-workspace-database-control'
-import { rebuildCurrentBrowserWorkspaceDerivedStateInTransaction } from './browser-workspace-derived-repair'
 import type {
   BrowserWorkspaceMigrationProgress,
   BrowserWorkspaceOpenOptions,
@@ -97,6 +97,13 @@ import {
   WAVE_A_V94_STORES,
   waveACompletionSettingsV94,
 } from './browser-workspace-schema-v94'
+import {
+  BROWSER_WORKSPACE_CURRENT_COMPLETION_KEY,
+  browserWorkspaceCurrentCompletionSettingV97,
+  isBrowserWorkspaceCurrentCompletionValueV97,
+  WAVE_B_STORAGE_VERSION,
+  WAVE_B_V97_STORES,
+} from './browser-workspace-schema-v97'
 import {
   CHAT_SIDEBAR_AGGREGATE_ID,
   type ChatSidebarAggregateProjectionRow,
@@ -132,6 +139,7 @@ import {
   type MessageTextPreviewRow,
 } from './message-storage'
 import {
+  BROWSER_WORKSPACE_CATCHUP_JOURNAL_TABLE_NAMES,
   CANONICAL_PHYSICAL_STORAGE_TABLE_NAMES,
   REPAIRABLE_PHYSICAL_STORAGE_TABLE_NAMES,
 } from './physical-storage-tables'
@@ -162,7 +170,7 @@ import {
 
 export type { SettingsRow } from './db-rows'
 
-export const CURRENT_DB_VERSION = WAVE_A_STORAGE_VERSION
+export const CURRENT_DB_VERSION = WAVE_B_STORAGE_VERSION
 
 export class NatterDb extends Dexie {
   chats!: Table<Chat, string>
@@ -240,9 +248,11 @@ interface BrowserWorkspaceStoreManifest {
 }
 
 type BrowserWorkspaceSchemaManifest = readonly BrowserWorkspaceStoreManifest[]
-type BrowserWorkspaceStoreSpec = Readonly<Record<string, string | null>>
 
-const CANONICAL_BROWSER_WORKSPACE_STORES = new Set<string>(CANONICAL_PHYSICAL_STORAGE_TABLE_NAMES)
+const CANONICAL_BROWSER_WORKSPACE_STORES = new Set<string>([
+  ...CANONICAL_PHYSICAL_STORAGE_TABLE_NAMES,
+  ...BROWSER_WORKSPACE_CATCHUP_JOURNAL_TABLE_NAMES,
+])
 const DERIVED_BROWSER_WORKSPACE_STORES = new Set<string>(REPAIRABLE_PHYSICAL_STORAGE_TABLE_NAMES)
 const RETIRED_BROWSER_WORKSPACE_STORES = new Set([
   'chatBranchCache',
@@ -255,7 +265,6 @@ const CURRENT_BROWSER_WORKSPACE_NATIVE_VERSION = CURRENT_DB_VERSION * 10
 
 interface BrowserWorkspaceSchemaPreflight {
   readonly physicalVersion?: number
-  readonly repairVersion?: number
   readonly repairStores: readonly string[]
   readonly compactionControlTransferPrepared: boolean
 }
@@ -304,17 +313,6 @@ function registeredBrowserWorkspaceSchema(db: NatterDb): BrowserWorkspaceSchemaM
         }),
       )
       .sort((left, right) => left.name.localeCompare(right.name)),
-  )
-}
-
-function registeredBrowserWorkspaceStoreSpec(db: NatterDb): BrowserWorkspaceStoreSpec {
-  return Object.freeze(
-    Object.fromEntries(
-      db.tables.map((table) => [
-        table.name,
-        [table.schema.primKey.src, ...table.schema.indexes.map((index) => index.src)].join(', '),
-      ]),
-    ),
   )
 }
 
@@ -386,15 +384,27 @@ async function preflightBrowserWorkspaceSchema(
   db: NatterDb,
   expected: BrowserWorkspaceSchemaManifest,
 ): Promise<BrowserWorkspaceSchemaPreflight> {
-  const physical = await readPhysicalBrowserWorkspaceSchema(db.name)
-  if (!physical) {
+  const current = await probeBrowserWorkspaceCurrent(db.name)
+  if (current.kind === 'absent') {
     return {
       repairStores: Object.freeze([]),
       compactionControlTransferPrepared: false,
     }
   }
+  if (current.kind === 'future') {
+    throw new BrowserWorkspaceSchemaIntegrityError(`future-version:${current.physicalVersion}`)
+  }
+  if (current.kind === 'current') {
+    return {
+      physicalVersion: current.physicalVersion,
+      repairStores: Object.freeze([]),
+      compactionControlTransferPrepared: false,
+    }
+  }
+  const physical = await readPhysicalBrowserWorkspaceSchema(db.name)
+  if (!physical) throw new BrowserWorkspaceSchemaIntegrityError('preflight-database-missing')
   const compactionControlTransferPrepared =
-    physical.version >= 250 && physical.version < WAVE_A_STORAGE_VERSION * 10
+    physical.version >= 250 && physical.version < CURRENT_BROWSER_WORKSPACE_NATIVE_VERSION
       ? await prepareWaveACompactionControlTransfer(db.name)
       : false
   // Older authored versions may legitimately predate a canonical store; only
@@ -454,11 +464,16 @@ async function preflightBrowserWorkspaceSchema(
     }
   }
   const repairable = Object.freeze([...derivedRepairStores].sort())
+  if (physical.version >= CURRENT_BROWSER_WORKSPACE_NATIVE_VERSION && repairable.length > 0) {
+    throw new BrowserWorkspaceSchemaIntegrityError(
+      `current-derived-repair-required:${repairable.join(',')}`,
+    )
+  }
+  if (physical.version === CURRENT_BROWSER_WORKSPACE_NATIVE_VERSION) {
+    throw new BrowserWorkspaceSchemaIntegrityError('current-completion-missing')
+  }
   return {
     physicalVersion: physical.version,
-    ...(physical.version >= CURRENT_BROWSER_WORKSPACE_NATIVE_VERSION && repairable.length > 0
-      ? { repairVersion: physical.version + 1 }
-      : {}),
     repairStores: repairable,
     compactionControlTransferPrepared,
   }
@@ -1549,11 +1564,44 @@ export function registerSchema(db: Dexie): void {
       })
       await migration.finalizeWaveAStorageEpochRowsV94(tx, result, reportProgress)
     })
+
+  db.version(WAVE_B_STORAGE_VERSION)
+    .stores(WAVE_B_V97_STORES)
+    .upgrade(async (tx) => {
+      const preflight = waveAUpgradePreflights.get(db)
+      if ((preflight?.physicalVersion ?? 0) > WAVE_A_STORAGE_VERSION * 10) {
+        const migration = await Dexie.waitFor(import('../backcompat/wave-a-storage-epoch-v94'))
+        const report = waveAUpgradeProgressPorts.get(db)
+        const reportProgress = report
+          ? (progress: BrowserWorkspaceMigrationProgress) =>
+              report({
+                kind: 'database-upgrade',
+                databaseName: db.name as BrowserWorkspaceDatabaseName,
+                ...(preflight?.physicalVersion === undefined
+                  ? {}
+                  : { fromVersion: preflight.physicalVersion / 10 }),
+                targetVersion: WAVE_B_STORAGE_VERSION,
+                ...progress,
+              })
+          : undefined
+        const result = await migration.migrateWaveAStorageEpochRowsV94(tx, {
+          observedAt: preflight?.observedAt ?? Date.now(),
+          recordObsoleteBytes: (byteLength) => accumulateStorageCompactionDebt(tx, byteLength),
+          compactionControlTransferPrepared: preflight?.compactionControlTransferPrepared === true,
+          ...(reportProgress ? { reportProgress } : {}),
+        })
+        await migration.finalizeWaveAStorageEpochRowsV94(tx, result, reportProgress)
+      }
+      await tx
+        .table<SettingsRow, string>('settings')
+        .put(browserWorkspaceCurrentCompletionSettingV97())
+    })
 }
 
 function freshWorkspaceSettingsRows(): SettingsRow[] {
   return [
     ...waveACompletionSettingsV94(),
+    browserWorkspaceCurrentCompletionSettingV97(),
     { key: RECENT_MODELS_KEY, value: [] },
     { key: RECENT_MODEL_RECENCY_KEY, value: emptyRecentModelRecency() },
   ]
@@ -1567,6 +1615,7 @@ export { childListKey } from '../core/child-list-state'
 
 let singleton: NatterDb | null = null
 let configuredBrowserWorkspaceDatabaseName: BrowserWorkspaceDatabaseName | null = null
+let configuredBrowserWorkspaceCurrentPhysicalVersion: number | null = null
 let currentSession: BrowserWorkspaceSessionImpl | null = null
 let invalidatedSession: BrowserWorkspaceSessionImpl | null = null
 let browserWorkspaceAdmissionsOpen = false
@@ -1632,6 +1681,55 @@ export async function recreateAndVerifyBrowserWorkspaceDatabase(name = 'natter')
   }
 }
 
+export async function normalizeInactiveBrowserWorkspaceDatabase(
+  databaseName: BrowserWorkspaceDatabaseName,
+  options: {
+    readonly fromVersion: number
+    readonly onProgress?: (progress: BrowserWorkspaceOpenProgress) => void
+  },
+): Promise<void> {
+  const compactionControlTransferPrepared =
+    await prepareWaveACompactionControlTransfer(databaseName)
+  const db = new NatterDb(databaseName)
+  const registeredSchema = registeredBrowserWorkspaceSchema(db)
+  try {
+    await db.open()
+    await db.transaction('rw', db.tables, async (tx) => {
+      const migration = await Dexie.waitFor(import('../backcompat/wave-a-storage-epoch-v94'))
+      const reportProgress = options.onProgress
+        ? (progress: BrowserWorkspaceMigrationProgress) =>
+            options.onProgress?.({
+              kind: 'database-upgrade',
+              databaseName,
+              fromVersion: options.fromVersion / 10,
+              targetVersion: WAVE_B_STORAGE_VERSION,
+              ...progress,
+            })
+        : undefined
+      await tx
+        .table<SettingsRow, string>('settings')
+        .delete(BROWSER_WORKSPACE_CURRENT_COMPLETION_KEY)
+      const result = await migration.migrateWaveAStorageEpochRowsV94(tx, {
+        observedAt: Date.now(),
+        recordObsoleteBytes: (byteLength) => accumulateStorageCompactionDebt(tx, byteLength),
+        compactionControlTransferPrepared,
+        ...(reportProgress ? { reportProgress } : {}),
+      })
+      await migration.finalizeWaveAStorageEpochRowsV94(tx, result, reportProgress)
+      await tx
+        .table<SettingsRow, string>('settings')
+        .put(browserWorkspaceCurrentCompletionSettingV97())
+    })
+    verifyBrowserWorkspaceSchema(db, registeredSchema)
+    const completion = await db.settings.get(BROWSER_WORKSPACE_CURRENT_COMPLETION_KEY)
+    if (!isBrowserWorkspaceCurrentCompletionValueV97(completion?.value)) {
+      throw new BrowserWorkspaceSchemaIntegrityError('current-completion')
+    }
+  } finally {
+    db.close()
+  }
+}
+
 async function verifyFreshBrowserWorkspace(db: NatterDb): Promise<void> {
   await readBrowserWorkspaceMeta(db)
   const expectedSettings = freshWorkspaceSettingsRows()
@@ -1690,6 +1788,7 @@ export function getDb(): NatterDb {
 
 export function configureBrowserWorkspaceDatabaseName(
   databaseName: BrowserWorkspaceDatabaseName,
+  currentPhysicalVersion?: number,
 ): void {
   if (singleton && singleton.name !== databaseName) {
     throw new Error(
@@ -1697,6 +1796,7 @@ export function configureBrowserWorkspaceDatabaseName(
     )
   }
   configuredBrowserWorkspaceDatabaseName = databaseName
+  configuredBrowserWorkspaceCurrentPhysicalVersion = currentPhysicalVersion ?? null
 }
 
 export function getConfiguredBrowserWorkspaceDatabaseName(): BrowserWorkspaceDatabaseName {
@@ -1738,7 +1838,6 @@ class BrowserWorkspaceSessionImpl implements BrowserWorkspaceSession {
   readonly databaseName: string
   readonly database: NatterDb
   readonly registeredSchema: BrowserWorkspaceSchemaManifest
-  readonly registeredStoreSpec: BrowserWorkspaceStoreSpec
   schemaPreflight: Promise<BrowserWorkspaceSchemaPreflight> | null = null
   schemaRegistrationConfigured = false
   private state: BrowserWorkspaceSessionState = 'current'
@@ -1757,7 +1856,6 @@ class BrowserWorkspaceSessionImpl implements BrowserWorkspaceSession {
     this.database = database
     this.fatalInvalidationOwner = browserWorkspaceFatalInvalidationOwner
     this.registeredSchema = registeredBrowserWorkspaceSchema(database)
-    this.registeredStoreSpec = registeredBrowserWorkspaceStoreSpec(database)
     database.on.close.subscribe(this.receiveDatabaseClose)
     database.on.versionchange.subscribe(this.receiveDatabaseVersionChange)
   }
@@ -2177,12 +2275,11 @@ function configurePreflightBrowserWorkspaceSchema(
 ): void {
   if (session.schemaRegistrationConfigured) return
   session.schemaRegistrationConfigured = true
-  registerPreflightBrowserWorkspaceSchema(session.database, session.registeredStoreSpec, preflight)
+  registerPreflightBrowserWorkspaceSchema(session.database, preflight)
 }
 
 function registerPreflightBrowserWorkspaceSchema(
   database: NatterDb,
-  registeredStoreSpec: BrowserWorkspaceStoreSpec,
   preflight: BrowserWorkspaceSchemaPreflight,
 ): void {
   waveAUpgradePreflights.set(database, {
@@ -2196,24 +2293,15 @@ function registerPreflightBrowserWorkspaceSchema(
   if (physicalVersion === undefined || physicalVersion < CURRENT_BROWSER_WORKSPACE_NATIVE_VERSION) {
     return
   }
-  if (preflight.repairVersion !== undefined) {
-    const repairSpec: Record<string, string | null> = { ...registeredStoreSpec }
-    for (const retired of RETIRED_BROWSER_WORKSPACE_STORES) repairSpec[retired] = null
-    database
-      .version(preflight.repairVersion / 10)
-      .stores(repairSpec)
-      .upgrade(rebuildCurrentBrowserWorkspaceDerivedStateInTransaction)
-    return
-  }
   if (physicalVersion > CURRENT_BROWSER_WORKSPACE_NATIVE_VERSION) {
-    database.version(physicalVersion / 10).stores(registeredStoreSpec)
+    throw new BrowserWorkspaceSchemaIntegrityError(`future-version:${physicalVersion}`)
   }
 }
 
 export async function prepareBrowserWorkspaceSchema(db: NatterDb): Promise<void> {
   const registeredSchema = registeredBrowserWorkspaceSchema(db)
   const preflight = await preflightBrowserWorkspaceSchema(db, registeredSchema)
-  registerPreflightBrowserWorkspaceSchema(db, registeredBrowserWorkspaceStoreSpec(db), preflight)
+  registerPreflightBrowserWorkspaceSchema(db, preflight)
 }
 
 async function openSessionDatabase(
@@ -2230,7 +2318,15 @@ async function openSessionDatabase(
       kind: 'schema-preflight',
       databaseName: session.databaseName as BrowserWorkspaceDatabaseName,
     })
-    session.schemaPreflight ??= preflightBrowserWorkspaceSchema(db, session.registeredSchema)
+    session.schemaPreflight ??=
+      configuredBrowserWorkspaceDatabaseName === session.databaseName &&
+      configuredBrowserWorkspaceCurrentPhysicalVersion !== null
+        ? Promise.resolve({
+            physicalVersion: configuredBrowserWorkspaceCurrentPhysicalVersion,
+            repairStores: Object.freeze([]),
+            compactionControlTransferPrepared: false,
+          })
+        : preflightBrowserWorkspaceSchema(db, session.registeredSchema)
     const preflight = await session.schemaPreflight
     assertCurrent()
     configurePreflightBrowserWorkspaceSchema(session, preflight)
@@ -2292,6 +2388,7 @@ function __forceCloseDbForTests(
   else singleton?.close()
   singleton = null
   configuredBrowserWorkspaceDatabaseName = databaseName
+  configuredBrowserWorkspaceCurrentPhysicalVersion = null
   browserWorkspaceAdmissionsOpen = admissionsOpen
   browserWorkspaceRepositoryAdmissionsOpen = admissionsOpen
 }

@@ -4,6 +4,7 @@ import {
   type EditMessageInput,
   type EditMessageResult,
   editMessageContentInRepository as editMessageContentInCoreRepository,
+  type MessageEditPreflightReader,
   type MessageMutationRepository,
 } from '../core/messages'
 import {
@@ -20,12 +21,8 @@ export {
   pasteImportInRepository,
 } from '../core/messages'
 
-export interface MessageCommandSettingsReader {
-  getSettings(keys: readonly string[]): Promise<ReadonlyMap<string, unknown>>
-}
-
 export async function captureEditMessageCalibration(
-  reader: MessageCommandSettingsReader,
+  reader: Pick<MessageEditPreflightReader, 'getSettings'>,
 ): Promise<EditMessageCalibrationSnapshot> {
   const rows = await reader.getSettings([GLOBAL_TOKEN_CALIBRATION_KEY, TOKEN_CALIBRATION_MODE_KEY])
   return {
@@ -37,9 +34,6 @@ export async function captureEditMessageCalibration(
 export function editMessageContentInRepository(
   repo: MessageMutationRepository,
   input: EditMessageInput,
-  settings: MessageCommandSettingsReader,
 ): Promise<EditMessageResult> {
-  return editMessageContentInCoreRepository(repo, input, () =>
-    captureEditMessageCalibration(settings),
-  )
+  return editMessageContentInCoreRepository(repo, input, captureEditMessageCalibration)
 }

@@ -103,8 +103,9 @@ export function closeConfigurationModelResolutionCapability(): void {
   transientCatalogs.clear()
 }
 
-export const abortConfigurationModelResolutionCapability =
-  closeConfigurationModelResolutionCapability
+export function abortConfigurationModelResolutionCapability(): void {
+  closeConfigurationModelResolutionCapability()
+}
 
 export async function awaitConfigurationModelResolutionCapabilityIdle(): Promise<void> {
   for (;;) {

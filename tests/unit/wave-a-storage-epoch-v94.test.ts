@@ -26,6 +26,10 @@ import type {
 } from '../../src/core/types'
 import { waveACompletionSettingsV94 } from '../../src/store/browser-workspace-schema-v94'
 import {
+  BROWSER_WORKSPACE_CURRENT_COMPLETION_KEY,
+  WAVE_B_V97_STORES,
+} from '../../src/store/browser-workspace-schema-v97'
+import {
   type ChatSidebarProjectionRow,
   chatSidebarFolderKey,
   isValidChatSidebarProjectionRow,
@@ -38,6 +42,10 @@ import {
 } from '../../src/store/db'
 import type { SettingsRow } from '../../src/store/db-rows'
 import { type MessageHeaderRow, splitMessageForStorage } from '../../src/store/message-storage'
+import {
+  BROWSER_WORKSPACE_CATCHUP_JOURNAL_TABLE_NAMES,
+  BROWSER_WORKSPACE_CATCHUP_SOURCE_TABLE_NAMES,
+} from '../../src/store/physical-storage-tables'
 import type { WorkspaceFence } from '../../src/store/repository'
 import type { StorageRetentionStateRow } from '../../src/store/storage-retention-state'
 import {
@@ -47,6 +55,15 @@ import {
 } from '../helpers/wave-a-observed-storage-v25-v93'
 
 const databaseNames: string[] = []
+const OBSERVED_WAVE_B_V96_STORES = Object.freeze({
+  ...WAVE_A_V94_STORES,
+  ...Object.fromEntries(
+    BROWSER_WORKSPACE_CATCHUP_SOURCE_TABLE_NAMES.map((tableName) => [
+      `replacementCatchup__${tableName}`,
+      '&id',
+    ]),
+  ),
+})
 
 afterEach(async () => {
   await Promise.all(databaseNames.splice(0).map((name) => Dexie.delete(name)))
@@ -78,8 +95,11 @@ describe('Wave A final storage epoch migration', () => {
   })
 
   it('opens every committed-wave physical manifest through the one production cutover', async () => {
-    const expectedTables = Object.keys(activeStoreSpec(WAVE_A_V94_STORES)).sort()
-    const completionKeys = waveACompletionSettingsV94().map((row) => row.key)
+    const expectedTables = Object.keys(activeStoreSpec(WAVE_B_V97_STORES)).sort()
+    const completionKeys = [
+      ...waveACompletionSettingsV94().map((row) => row.key),
+      BROWSER_WORKSPACE_CURRENT_COMPLETION_KEY,
+    ]
 
     for (const { firstVersion, lastVersion } of observedWaveAStorageCohorts()) {
       const name = databaseName()
@@ -139,6 +159,54 @@ describe('Wave A final storage epoch migration', () => {
       await db.settings.bulkGet(waveACompletionSettingsV94().map((row) => row.key)),
     ).not.toContain(undefined)
     db.close()
+  })
+
+  it.each([
+    95, 95.1, 95.2, 95.3, 95.4, 95.5, 95.6, 95.7, 95.8, 96,
+  ])('opens observed current v%s data through the one fixed Wave-B epoch and reopens it in place', async (observedVersion) => {
+    const name = databaseName()
+    const observed = new Dexie(name)
+    observed
+      .version(observedVersion)
+      .stores(observedVersion === 96 ? OBSERVED_WAVE_B_V96_STORES : WAVE_A_V94_STORES)
+    await observed.open()
+    await observed.table('settings').put({
+      key: 'manifest-proof:wave-b-sentinel',
+      value: { observedVersion },
+    })
+    observed.close()
+
+    const migrated = createDbForTests(name)
+    await prepareBrowserWorkspaceSchema(migrated)
+    await migrated.open()
+
+    expect(migrated.verno).toBe(CURRENT_DB_VERSION)
+    expect(migrated.tables.map((table) => table.name).sort()).toEqual(
+      Object.keys(activeStoreSpec(WAVE_B_V97_STORES)).sort(),
+    )
+    expect(await migrated.settings.get('manifest-proof:wave-b-sentinel')).toEqual({
+      key: 'manifest-proof:wave-b-sentinel',
+      value: { observedVersion },
+    })
+    expect(
+      await Promise.all(
+        BROWSER_WORKSPACE_CATCHUP_JOURNAL_TABLE_NAMES.map((tableName) =>
+          migrated.table(tableName).count(),
+        ),
+      ),
+    ).toEqual(BROWSER_WORKSPACE_CATCHUP_JOURNAL_TABLE_NAMES.map(() => 0))
+    expect(await migrated.settings.get(BROWSER_WORKSPACE_CURRENT_COMPLETION_KEY)).toBeDefined()
+    migrated.close()
+
+    const reopened = createDbForTests(name)
+    await prepareBrowserWorkspaceSchema(reopened)
+    await reopened.open()
+    expect(reopened.verno).toBe(CURRENT_DB_VERSION)
+    expect(await reopened.settings.get('manifest-proof:wave-b-sentinel')).toEqual({
+      key: 'manifest-proof:wave-b-sentinel',
+      value: { observedVersion },
+    })
+    reopened.close()
   })
 
   it('atomically rolls back a late mixed 4,096-row cutover and retries the same production database', async () => {
@@ -482,7 +550,7 @@ describe('Wave A final storage epoch migration', () => {
     await db.open()
 
     expect(db.verno).toBe(CURRENT_DB_VERSION)
-    expect(db.tables).toHaveLength(45)
+    expect(db.tables).toHaveLength(88)
     expect(await db.settings.get('storage-compaction-state-v1')).toBeUndefined()
     expect((await db.settings.get('backfill:storage-compaction-control-v1'))?.value).toBe(true)
     expect(

@@ -107,6 +107,7 @@ import type {
   ImportChatOptions,
   ImportChatPresetOptions,
   ImportChatPresetResult,
+  ImportChatRequest,
   ImportChatResult,
   ImportConnectionProfileOptions,
   ImportConnectionProfileResult,
@@ -723,6 +724,7 @@ interface DeleteChatClosurePageResult extends DeleteChatClosureMetadataResult {
 
 interface EmptyDraftChatClosurePageResult extends DeleteChatClosureMetadataResult {
   readonly scannedChatIds: number
+  readonly retiredStreamFrames: number
   readonly earliestDeferredAt?: number
   readonly done: boolean
 }
@@ -1297,6 +1299,10 @@ export type AttachmentRefOwner =
   | { kind: 'message'; chatId: ChatId; messageId: MessageId }
   | { kind: 'draft'; chatId: ChatId }
 
+export type AttachmentRefMutationOwner =
+  | { kind: 'message'; messageId: MessageId; expectedChatId?: ChatId }
+  | { kind: 'draft'; chatId: ChatId }
+
 export interface AttachmentReferenceRow {
   ownerKind: 'message' | 'draft'
   chatId: ChatId
@@ -1324,14 +1330,14 @@ export interface AttachmentBundleWriteInput {
 export type { AttachmentBundleWriteResult }
 
 export interface AttachmentRefAddInput {
-  owner: AttachmentRefOwner
+  owner: AttachmentRefMutationOwner
   ref: MessageAttachmentRef
   afterRefId?: string
   now: number
 }
 
 export interface AttachmentRefVisibilityInput {
-  owner: AttachmentRefOwner
+  owner: AttachmentRefMutationOwner
   refId: string
   expectedAttachmentId: AttachmentId
   includeInContext: boolean
@@ -1339,14 +1345,14 @@ export interface AttachmentRefVisibilityInput {
 }
 
 export interface AttachmentRefDetachInput {
-  owner: AttachmentRefOwner
+  owner: AttachmentRefMutationOwner
   refId: string
   expectedAttachmentId: AttachmentId
   now: number
 }
 
 interface AttachmentRefRelinkSpec {
-  owner: AttachmentRefOwner
+  owner: AttachmentRefMutationOwner
   refId: string
   expectedAttachmentId: AttachmentId
 }
@@ -1360,13 +1366,13 @@ export interface AttachmentRefRelinkInput {
 
 export interface AttachmentRefWriteResult {
   ref?: MessageAttachmentRef
-  presentation?: MessagePresentation
+  header?: MessageHeaderRow
   draft?: DraftRow
 }
 
 export interface AttachmentRefRelinkResult {
   refs: readonly MessageAttachmentRef[]
-  presentations: readonly MessagePresentation[]
+  headers: readonly MessageHeaderRow[]
   drafts: readonly DraftRow[]
 }
 
@@ -1428,8 +1434,13 @@ export interface GeneratedOutputPreparedWrite {
 }
 
 export interface GeneratedOutputLocalizationQueueSnapshot {
-  readyJobIds: readonly string[]
+  readyJobs: readonly GeneratedOutputLocalizationTarget[]
   nextWakeAt?: number
+}
+
+export interface GeneratedOutputLocalizationTarget {
+  jobId: string
+  attachmentId: AttachmentId
 }
 
 export interface GeneratedOutputLocalizationClaim {
@@ -1440,6 +1451,7 @@ export interface GeneratedOutputLocalizationClaim {
 
 export interface GeneratedOutputLocalizationClaimInput {
   jobId: string
+  attachmentId: AttachmentId
   leaseId: string
   now: number
   leaseExpiresAt: number
@@ -1447,6 +1459,7 @@ export interface GeneratedOutputLocalizationClaimInput {
 
 export interface GeneratedOutputLocalizationRetryInput {
   jobId: string
+  attachmentId: AttachmentId
   leaseId: string
   error: { code: string; message: string }
   nextAttemptAt: number
@@ -1455,6 +1468,7 @@ export interface GeneratedOutputLocalizationRetryInput {
 
 export interface GeneratedOutputLocalizationFailInput {
   jobId: string
+  attachmentId: AttachmentId
   leaseId: string
   error: { code: string; message: string }
   now: number
@@ -1462,6 +1476,7 @@ export interface GeneratedOutputLocalizationFailInput {
 
 export interface GeneratedOutputLocalizationCompleteInput {
   jobId: string
+  attachmentId: AttachmentId
   leaseId: string
   bundle: PreparedAttachmentBundle
   now: number
@@ -1469,6 +1484,7 @@ export interface GeneratedOutputLocalizationCompleteInput {
 
 export interface GeneratedOutputVideoExpandInput {
   jobId: string
+  attachmentId: AttachmentId
   leaseId: string
   attachmentBundles: readonly PreparedAttachmentBundle[]
   now: number
@@ -1479,7 +1495,7 @@ export type GeneratedOutputLocalizationJobResult =
   | { outcome: 'stale' | 'missing'; attachmentId?: AttachmentId }
 
 export interface GeneratedOutputVideoExpandResult {
-  outcome: 'committed' | 'stale' | 'missing'
+  outcome: 'committed' | 'stale' | 'missing' | 'plan-changed'
   attachmentId?: AttachmentId
   presentations: readonly MessagePresentation[]
   drafts: readonly DraftRow[]
@@ -1980,7 +1996,6 @@ type AttachmentQuery =
   | { kind: 'attachment.references'; attachmentId: AttachmentId }
   | { kind: 'attachment.reference-rows'; attachmentId: AttachmentId }
   | { kind: 'generated-output.localization-queue'; now: number; limit: number }
-  | { kind: 'draft.get'; chatId: ChatId }
 
 type DiscoveryQuery =
   | { kind: 'discovery.models'; profileId: ProfileId; queryKey: string }
@@ -2377,8 +2392,6 @@ export function workspaceQueryDependencies(query: WorkspaceQuery): readonly Work
       ]
     case 'generated-output.localization-queue':
       return [{ kind: 'attachment-job' }]
-    case 'draft.get':
-      return [{ kind: 'draft', chatIds: [query.chatId] }]
     case 'discovery.models':
       return [
         {
@@ -2655,30 +2668,24 @@ export type WorkspaceQueryResult<Q extends WorkspaceQuery> = Q extends { kind: '
                                                                                                                               }
                                                                                                                             ? GeneratedOutputLocalizationQueueSnapshot
                                                                                                                             : Q extends {
-                                                                                                                                  kind: 'draft.get'
+                                                                                                                                  kind: 'discovery.models'
                                                                                                                                 }
                                                                                                                               ?
-                                                                                                                                  | DraftRow
+                                                                                                                                  | CachedModelsRow
                                                                                                                                   | undefined
                                                                                                                               : Q extends {
-                                                                                                                                    kind: 'discovery.models'
+                                                                                                                                    kind: 'discovery.endpoints'
                                                                                                                                   }
                                                                                                                                 ?
-                                                                                                                                    | CachedModelsRow
+                                                                                                                                    | CachedEndpointsRow
                                                                                                                                     | undefined
                                                                                                                                 : Q extends {
-                                                                                                                                      kind: 'discovery.endpoints'
+                                                                                                                                      kind: 'discovery.privacy'
                                                                                                                                     }
                                                                                                                                   ?
-                                                                                                                                      | CachedEndpointsRow
+                                                                                                                                      | CachedPrivacyPolicyRow
                                                                                                                                       | undefined
-                                                                                                                                  : Q extends {
-                                                                                                                                        kind: 'discovery.privacy'
-                                                                                                                                      }
-                                                                                                                                    ?
-                                                                                                                                        | CachedPrivacyPolicyRow
-                                                                                                                                        | undefined
-                                                                                                                                    : never
+                                                                                                                                  : never
 
 type OrganizationCommand =
   | { kind: 'folder.create'; input: CreateFolderInput }
@@ -2774,6 +2781,10 @@ export type WorkspaceCommand =
       options: ImportChatOptions
     }
   | {
+      kind: 'interchange.import-chat'
+      imports: readonly ImportChatRequest[]
+    }
+  | {
       kind: 'interchange.import-chat-preset'
       envelope: ChatPresetExportEnvelope
       options: ImportChatPresetOptions
@@ -2855,209 +2866,218 @@ export type WorkspaceCommand =
 
 export type WorkspaceCommandResult<C extends WorkspaceCommand> = C extends {
   kind: 'interchange.import-chat'
+  imports: readonly ImportChatRequest[]
 }
-  ? ImportChatResult
-  : C extends { kind: 'interchange.import-chat-preset' }
-    ? ImportChatPresetResult
-    : C extends { kind: 'interchange.import-connection-profile' }
-      ? ImportConnectionProfileResult
-      : C extends { kind: 'chat.discard-empty-drafts' }
-        ? DeleteChatClosureMetadataResult
-        : C extends { kind: 'chat.materialize-temporary' }
-          ? MaterializeTemporaryChatResult
-          : C extends { kind: 'chat.set-archived' }
-            ? ChatMetadataWriteResult<readonly ChatId[]>
-            : C extends { kind: 'chat.delete-archived' }
-              ? DeleteArchivedChatMetadataResult
-              : C extends { kind: 'chat.empty-archive' }
-                ? DeleteChatClosurePageResult
-                : C extends { kind: 'chat.move-to-folder' }
-                  ? ChatMetadataWriteResult<boolean>
-                  : C extends { kind: 'chat.set-tags-from-names' }
-                    ? ChatTagAssignmentResult
-                    : C extends {
-                          kind:
-                            | 'chat.touch-viewed'
-                            | 'chat.set-manual-title'
-                            | 'chat.calibration.clear'
-                        }
-                      ? ChatMetadataWriteResult<boolean>
+  ? readonly ImportChatResult[]
+  : C extends {
+        kind: 'interchange.import-chat'
+      }
+    ? ImportChatResult
+    : C extends { kind: 'interchange.import-chat-preset' }
+      ? ImportChatPresetResult
+      : C extends { kind: 'interchange.import-connection-profile' }
+        ? ImportConnectionProfileResult
+        : C extends { kind: 'chat.discard-empty-drafts' }
+          ? DeleteChatClosureMetadataResult
+          : C extends { kind: 'chat.materialize-temporary' }
+            ? MaterializeTemporaryChatResult
+            : C extends { kind: 'chat.set-archived' }
+              ? ChatMetadataWriteResult<readonly ChatId[]>
+              : C extends { kind: 'chat.delete-archived' }
+                ? DeleteArchivedChatMetadataResult
+                : C extends { kind: 'chat.empty-archive' }
+                  ? DeleteChatClosurePageResult
+                  : C extends { kind: 'chat.move-to-folder' }
+                    ? ChatMetadataWriteResult<boolean>
+                    : C extends { kind: 'chat.set-tags-from-names' }
+                      ? ChatTagAssignmentResult
                       : C extends {
-                            kind: 'chat.calibration.clear-family' | 'chat.calibration.clear-all'
+                            kind:
+                              | 'chat.touch-viewed'
+                              | 'chat.set-manual-title'
+                              | 'chat.calibration.clear'
                           }
-                        ? ChatCalibrationEverywhereResult
-                        : C extends { kind: 'chat.fork' }
-                          ? ForkChatFromMessageResult
-                          : C extends { kind: 'message.edit-content' }
-                            ? EditMessageResult
-                            : C extends {
-                                  kind:
-                                    | 'message.toggle-reasoning-detail'
-                                    | 'message.toggle-provider-output-item'
-                                    | 'message.toggle-context'
-                                    | 'message.dismiss-generation-notice'
-                                }
-                              ? MessagePresentation | undefined
-                              : C extends { kind: 'message.import' }
-                                ? PasteImportResult
-                                : C extends { kind: 'message.delete' }
-                                  ? DeleteResult
-                                  : C extends { kind: 'message.restore-structure' }
-                                    ? StructuralSnapshotPresentation
-                                    : C extends { kind: 'attempt.prepare' }
-                                      ? AttemptPrepareResult
-                                      : C extends { kind: 'attempt.dispatch' }
-                                        ? AttemptDispatchResult
-                                        : C extends { kind: 'attempt.request-stop' }
-                                          ? AttemptRequestStopResult
-                                          : C extends { kind: 'attempt.seal-terminal' }
-                                            ? TerminalDecidedStreamLeaseRow
-                                            : C extends { kind: 'attempt.finalize' }
-                                              ? AttemptFinalizeResult
-                                              : C extends {
-                                                    kind: 'generation.post-commit-metadata'
-                                                  }
-                                                ? GenerationPostCommitMetadataResult
-                                                : C extends { kind: 'stream.note-selected-key' }
-                                                  ? StreamLeaseRow
-                                                  : C extends { kind: 'stream.renew' }
+                        ? ChatMetadataWriteResult<boolean>
+                        : C extends {
+                              kind: 'chat.calibration.clear-family' | 'chat.calibration.clear-all'
+                            }
+                          ? ChatCalibrationEverywhereResult
+                          : C extends { kind: 'chat.fork' }
+                            ? ForkChatFromMessageResult
+                            : C extends { kind: 'message.edit-content' }
+                              ? EditMessageResult
+                              : C extends {
+                                    kind:
+                                      | 'message.toggle-reasoning-detail'
+                                      | 'message.toggle-provider-output-item'
+                                      | 'message.toggle-context'
+                                      | 'message.dismiss-generation-notice'
+                                  }
+                                ? MessagePresentation | undefined
+                                : C extends { kind: 'message.import' }
+                                  ? PasteImportResult
+                                  : C extends { kind: 'message.delete' }
+                                    ? DeleteResult
+                                    : C extends { kind: 'message.restore-structure' }
+                                      ? StructuralSnapshotPresentation
+                                      : C extends { kind: 'attempt.prepare' }
+                                        ? AttemptPrepareResult
+                                        : C extends { kind: 'attempt.dispatch' }
+                                          ? AttemptDispatchResult
+                                          : C extends { kind: 'attempt.request-stop' }
+                                            ? AttemptRequestStopResult
+                                            : C extends { kind: 'attempt.seal-terminal' }
+                                              ? TerminalDecidedStreamLeaseRow
+                                              : C extends { kind: 'attempt.finalize' }
+                                                ? AttemptFinalizeResult
+                                                : C extends {
+                                                      kind: 'generation.post-commit-metadata'
+                                                    }
+                                                  ? GenerationPostCommitMetadataResult
+                                                  : C extends { kind: 'stream.note-selected-key' }
                                                     ? StreamLeaseRow
-                                                    : C extends { kind: 'stream.handoff-recovery' }
+                                                    : C extends { kind: 'stream.renew' }
                                                       ? StreamLeaseRow
-                                                      : C extends { kind: 'stream.claim-recovery' }
-                                                        ? StreamLeaseRow | undefined
+                                                      : C extends {
+                                                            kind: 'stream.handoff-recovery'
+                                                          }
+                                                        ? StreamLeaseRow
                                                         : C extends {
-                                                              kind: 'stream.append-journal-frames'
+                                                              kind: 'stream.claim-recovery'
                                                             }
-                                                          ? undefined
+                                                          ? StreamLeaseRow | undefined
                                                           : C extends {
-                                                                kind: 'stream.finish-cleanup'
+                                                                kind: 'stream.append-journal-frames'
                                                               }
-                                                            ? StreamFinishCleanupResult
+                                                            ? undefined
                                                             : C extends {
-                                                                  kind: 'maintenance.reconcile-stream-journal-integrity'
+                                                                  kind: 'stream.finish-cleanup'
                                                                 }
-                                                              ? {
-                                                                  scannedStreamIds: number
-                                                                  deletedStreamIds: string[]
-                                                                  deletedFrames: number
-                                                                  done: boolean
-                                                                }
+                                                              ? StreamFinishCleanupResult
                                                               : C extends {
-                                                                    kind: 'maintenance.prune-terminal-stream-journals'
+                                                                    kind: 'maintenance.reconcile-stream-journal-integrity'
                                                                   }
                                                                 ? {
-                                                                    scanned: number
+                                                                    scannedStreamIds: number
                                                                     deletedStreamIds: string[]
                                                                     deletedFrames: number
-                                                                    earliestDeferredAt?: number
                                                                     done: boolean
                                                                   }
                                                                 : C extends {
-                                                                      kind: 'maintenance.prune-empty-draft-chats'
+                                                                      kind: 'maintenance.prune-terminal-stream-journals'
                                                                     }
-                                                                  ? EmptyDraftChatClosurePageResult
+                                                                  ? {
+                                                                      scanned: number
+                                                                      deletedStreamIds: string[]
+                                                                      deletedFrames: number
+                                                                      earliestDeferredAt?: number
+                                                                      done: boolean
+                                                                    }
                                                                   : C extends {
-                                                                        kind: 'attachment.bundle.write'
+                                                                        kind: 'maintenance.prune-empty-draft-chats'
                                                                       }
-                                                                    ? AttachmentBundleWriteResult
+                                                                    ? EmptyDraftChatClosurePageResult
                                                                     : C extends {
-                                                                          kind:
-                                                                            | 'attachment.ref.add'
-                                                                            | 'attachment.ref.set-visibility'
-                                                                            | 'attachment.ref.detach'
+                                                                          kind: 'attachment.bundle.write'
                                                                         }
-                                                                      ? AttachmentRefWriteResult
+                                                                      ? AttachmentBundleWriteResult
                                                                       : C extends {
-                                                                            kind: 'attachment.ref.relink'
+                                                                            kind:
+                                                                              | 'attachment.ref.add'
+                                                                              | 'attachment.ref.set-visibility'
+                                                                              | 'attachment.ref.detach'
                                                                           }
-                                                                        ? AttachmentRefRelinkResult
+                                                                        ? AttachmentRefWriteResult
                                                                         : C extends {
-                                                                              kind: 'attachment.bytes.delete'
+                                                                              kind: 'attachment.ref.relink'
                                                                             }
-                                                                          ? Attachment | undefined
+                                                                          ? AttachmentRefRelinkResult
                                                                           : C extends {
-                                                                                kind: 'attachment.delete-if-unreferenced'
+                                                                                kind: 'attachment.bytes.delete'
                                                                               }
-                                                                            ? AttachmentDeleteIfUnreferencedResult
+                                                                            ? Attachment | undefined
                                                                             : C extends {
-                                                                                  kind: 'attachment.reap'
+                                                                                  kind: 'attachment.delete-if-unreferenced'
                                                                                 }
-                                                                              ? AttachmentReapResult
+                                                                              ? AttachmentDeleteIfUnreferencedResult
                                                                               : C extends {
-                                                                                    kind: 'attachment.delete-many'
+                                                                                    kind: 'attachment.reap'
                                                                                   }
-                                                                                ? AttachmentDeleteManyResult
+                                                                                ? AttachmentReapResult
                                                                                 : C extends {
-                                                                                      kind: 'draft.put'
+                                                                                      kind: 'attachment.delete-many'
                                                                                     }
-                                                                                  ? DraftRow
+                                                                                  ? AttachmentDeleteManyResult
                                                                                   : C extends {
-                                                                                        kind: 'generated-output.localization-claim'
+                                                                                        kind: 'draft.put'
                                                                                       }
-                                                                                    ?
-                                                                                        | GeneratedOutputLocalizationClaim
-                                                                                        | undefined
+                                                                                    ? DraftRow
                                                                                     : C extends {
-                                                                                          kind:
-                                                                                            | 'generated-output.localization-retry'
-                                                                                            | 'generated-output.localization-fail'
-                                                                                            | 'generated-output.localization-complete'
+                                                                                          kind: 'generated-output.localization-claim'
                                                                                         }
-                                                                                      ? GeneratedOutputLocalizationJobResult
+                                                                                      ?
+                                                                                          | GeneratedOutputLocalizationClaim
+                                                                                          | undefined
                                                                                       : C extends {
-                                                                                            kind: 'generated-output.video-expand'
+                                                                                            kind:
+                                                                                              | 'generated-output.localization-retry'
+                                                                                              | 'generated-output.localization-fail'
+                                                                                              | 'generated-output.localization-complete'
                                                                                           }
-                                                                                        ? GeneratedOutputVideoExpandResult
+                                                                                        ? GeneratedOutputLocalizationJobResult
                                                                                         : C extends {
-                                                                                              kind: 'discovery.models.delete'
+                                                                                              kind: 'generated-output.video-expand'
                                                                                             }
-                                                                                          ? boolean
+                                                                                          ? GeneratedOutputVideoExpandResult
                                                                                           : C extends {
-                                                                                                kind: 'discovery.models.put'
+                                                                                                kind: 'discovery.models.delete'
                                                                                               }
-                                                                                            ? DiscoveryModelsPutResult
+                                                                                            ? boolean
                                                                                             : C extends {
-                                                                                                  kind:
-                                                                                                    | 'discovery.endpoints.put'
-                                                                                                    | 'discovery.privacy.put'
+                                                                                                  kind: 'discovery.models.put'
                                                                                                 }
-                                                                                              ? DiscoveryCachePutResult
+                                                                                              ? DiscoveryModelsPutResult
                                                                                               : C extends {
-                                                                                                    kind: 'maintenance.prune-discovery-cache'
+                                                                                                    kind:
+                                                                                                      | 'discovery.endpoints.put'
+                                                                                                      | 'discovery.privacy.put'
                                                                                                   }
-                                                                                                ? DiscoveryCacheMaintenanceResult
+                                                                                                ? DiscoveryCachePutResult
                                                                                                 : C extends {
-                                                                                                      kind: 'configuration.execute'
-                                                                                                      input: infer Input extends
-                                                                                                        ConfigurationDomainCommand
+                                                                                                      kind: 'maintenance.prune-discovery-cache'
                                                                                                     }
-                                                                                                  ? ConfigurationDomainResult<
-                                                                                                      Input['kind']
-                                                                                                    >
+                                                                                                  ? DiscoveryCacheMaintenanceResult
                                                                                                   : C extends {
-                                                                                                        kind: 'folder.create'
+                                                                                                        kind: 'configuration.execute'
+                                                                                                        input: infer Input extends
+                                                                                                          ConfigurationDomainCommand
                                                                                                       }
-                                                                                                    ? ChatFolder
+                                                                                                    ? ConfigurationDomainResult<
+                                                                                                        Input['kind']
+                                                                                                      >
                                                                                                     : C extends {
-                                                                                                          kind: 'folder.update'
+                                                                                                          kind: 'folder.create'
                                                                                                         }
-                                                                                                      ?
-                                                                                                          | ChatFolder
-                                                                                                          | undefined
+                                                                                                      ? ChatFolder
                                                                                                       : C extends {
-                                                                                                            kind: 'folder.delete'
+                                                                                                            kind: 'folder.update'
                                                                                                           }
-                                                                                                        ? DeleteFolderResult
+                                                                                                        ?
+                                                                                                            | ChatFolder
+                                                                                                            | undefined
                                                                                                         : C extends {
-                                                                                                              kind: 'folder.ensure-and-move-chats'
+                                                                                                              kind: 'folder.delete'
                                                                                                             }
-                                                                                                          ? EnsureFolderAndMoveChatsResult
+                                                                                                          ? DeleteFolderResult
                                                                                                           : C extends {
-                                                                                                                kind: 'maintenance.reconcile-attachment-integrity'
+                                                                                                                kind: 'folder.ensure-and-move-chats'
                                                                                                               }
-                                                                                                            ? AttachmentIntegrityMaintenanceResult
-                                                                                                            : never
+                                                                                                            ? EnsureFolderAndMoveChatsResult
+                                                                                                            : C extends {
+                                                                                                                  kind: 'maintenance.reconcile-attachment-integrity'
+                                                                                                                }
+                                                                                                              ? AttachmentIntegrityMaintenanceResult
+                                                                                                              : never
 
 export type WorkspaceReplacement = {
   kind: 'interchange.restore-workspace-backup'

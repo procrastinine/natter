@@ -7,7 +7,10 @@ import {
   beginBrowserWorkspaceBootstrap,
   finishBrowserWorkspaceBootstrap,
 } from '../../src/store/browser-workspace-bootstrap-authority'
-import { cleanPendingBrowserWorkspaceDatabase } from '../../src/store/browser-workspace-database-cleanup'
+import {
+  cleanPendingBrowserWorkspaceDatabase,
+  recoverQuiescedBrowserWorkspaceReplacement,
+} from '../../src/store/browser-workspace-database-cleanup'
 import {
   abandonPreparedBrowserWorkspaceDatabase,
   activatePreparedBrowserWorkspaceDatabase,
@@ -23,7 +26,11 @@ import {
   releaseOpeningBrowserWorkspaceDatabaseSelection,
 } from '../../src/store/browser-workspace-database-selection'
 import { __resetBrowserWorkspaceSlotCoordinatorForTests } from '../../src/store/browser-workspace-slot-coordination'
-import { __resetDbForTests, getConfiguredBrowserWorkspaceDatabaseName } from '../../src/store/db'
+import {
+  __resetDbForTests,
+  getConfiguredBrowserWorkspaceDatabaseName,
+  recreateAndVerifyBrowserWorkspaceDatabase,
+} from '../../src/store/db'
 
 const originalLocks = Object.getOwnPropertyDescriptor(navigator, 'locks')
 const storageBaseline = { kind: 'reset', liveBytes: 0 } as const
@@ -195,6 +202,7 @@ describe('browser workspace database control', () => {
   })
 
   it('opens the authoritative source before reclaiming an abandoned prepared slot', async () => {
+    await recreateAndVerifyBrowserWorkspaceDatabase('natter')
     const prepared = await beginBrowserWorkspaceDatabaseReplacement()
     const partial = await openRawDatabase(prepared.destinationDatabaseName)
     partial.close()
@@ -220,6 +228,7 @@ describe('browser workspace database control', () => {
   })
 
   it('opens the committed source while a replacement still owns selection', async () => {
+    await recreateAndVerifyBrowserWorkspaceDatabase('natter')
     const prepared = await beginBrowserWorkspaceDatabaseReplacement()
     const partial = await openRawDatabase(prepared.destinationDatabaseName)
     partial.close()
@@ -249,11 +258,9 @@ describe('browser workspace database control', () => {
   })
 
   it('reopens the activated destination before asynchronously cleaning the old source', async () => {
-    const source = await openRawDatabase('natter')
-    source.close()
+    await recreateAndVerifyBrowserWorkspaceDatabase('natter')
     const prepared = await beginBrowserWorkspaceDatabaseReplacement()
-    const destination = await openRawDatabase(prepared.destinationDatabaseName)
-    destination.close()
+    await recreateAndVerifyBrowserWorkspaceDatabase(prepared.destinationDatabaseName)
     await activatePreparedBrowserWorkspaceDatabase(prepared, storageBaseline)
 
     await prepareSelection()
@@ -277,12 +284,73 @@ describe('browser workspace database control', () => {
     expect((await readBrowserWorkspaceDatabaseManifest()).pending).toBeUndefined()
   })
 
-  it('keeps active-slot selection ready while old-slot deletion waits on a peer', async () => {
+  it('waits on durable selection ownership then resumes before discarding an abandoned destination', async () => {
+    const prepared = await beginBrowserWorkspaceDatabaseReplacement()
+    const destination = await openRawDatabase(prepared.destinationDatabaseName)
+    destination.close()
+    const locks = new HeldSelectionGateLockManager()
+    Object.defineProperty(navigator, 'locks', { configurable: true, value: locks })
+    let settled = false
+    const recovery = recoverQuiescedBrowserWorkspaceReplacement(prepared).finally(() => {
+      settled = true
+    })
+
+    await Promise.resolve()
+    expect(settled).toBe(false)
+    expect(await Dexie.exists(prepared.destinationDatabaseName)).toBe(true)
+
+    locks.release()
+    await expect(recovery).resolves.toEqual({
+      kind: 'uncommitted',
+      databaseName: prepared.sourceDatabaseName,
+      activationSequence: 0,
+    })
+    expect(await Dexie.exists(prepared.destinationDatabaseName)).toBe(true)
+    expect((await readBrowserWorkspaceDatabaseManifest()).pending).toEqual({
+      ...prepared,
+      phase: 'discard',
+    })
+
+    await expect(cleanPendingBrowserWorkspaceDatabase()).resolves.toMatchObject({
+      status: 'cleaned',
+      phase: 'discard',
+      databaseName: prepared.destinationDatabaseName,
+    })
+    expect(await Dexie.exists(prepared.destinationDatabaseName)).toBe(false)
+  })
+
+  it('recovers an activated quiesced peer before obsolete source cleanup', async () => {
     const source = await openRawDatabase('natter')
     source.close()
     const prepared = await beginBrowserWorkspaceDatabaseReplacement()
     const destination = await openRawDatabase(prepared.destinationDatabaseName)
     destination.close()
+    await activatePreparedBrowserWorkspaceDatabase(prepared, storageBaseline)
+
+    await expect(recoverQuiescedBrowserWorkspaceReplacement(prepared)).resolves.toEqual({
+      kind: 'committed',
+      databaseName: prepared.destinationDatabaseName,
+      activationSequence: 1,
+    })
+    expect(await Dexie.exists(prepared.sourceDatabaseName)).toBe(true)
+    expect(await Dexie.exists(prepared.destinationDatabaseName)).toBe(true)
+    expect((await readBrowserWorkspaceDatabaseManifest()).pending).toEqual({
+      ...prepared,
+      phase: 'cleanup',
+    })
+
+    await expect(cleanPendingBrowserWorkspaceDatabase()).resolves.toMatchObject({
+      status: 'cleaned',
+      phase: 'cleanup',
+      databaseName: prepared.sourceDatabaseName,
+    })
+    expect(await Dexie.exists(prepared.sourceDatabaseName)).toBe(false)
+  })
+
+  it('keeps active-slot selection ready while old-slot deletion waits on a peer', async () => {
+    await recreateAndVerifyBrowserWorkspaceDatabase('natter')
+    const prepared = await beginBrowserWorkspaceDatabaseReplacement()
+    await recreateAndVerifyBrowserWorkspaceDatabase(prepared.destinationDatabaseName)
     await activatePreparedBrowserWorkspaceDatabase(prepared, storageBaseline)
     const locks = new DeferredExclusiveSlotLockManager()
     Object.defineProperty(navigator, 'locks', { configurable: true, value: locks })

@@ -335,6 +335,8 @@ export type ConversationMessagePresentation = TranscriptBodyPresentation
 export interface GenerationIntentMessagePresentation {
   readonly message: Message
   readonly bodyVersion: 0
+  readonly replacesFromMessageId?: MessageId
+  readonly fork?: ActiveBranchForkSlot
 }
 
 export type ConversationTranscriptPage = TranscriptBodyPage
@@ -1033,6 +1035,7 @@ export interface ConversationController {
     input: {
       readonly baseLeafId: MessageId | null
       readonly messages: readonly Message[]
+      readonly replacesFromMessageId?: MessageId
     },
   ): void
   claimSelectedDestination(input: {
@@ -1429,6 +1432,9 @@ class TabConversationController implements ConversationController {
     session.intent = conversationSelectionIntent(selection)
     this.beginSelectionResolution()
     this.persistSession(input.chatId)
+    if (input.kind === 'message') {
+      this.navigationPort?.replaceConversationUrl(input.chatId, input.messageId)
+    }
     this.publish()
     if (input.kind === 'sibling-position') {
       this.requestSiblingNavigation(session, input.parentId, input.position)
@@ -1672,6 +1678,7 @@ class TabConversationController implements ConversationController {
     input: {
       readonly baseLeafId: MessageId | null
       readonly messages: readonly Message[]
+      readonly replacesFromMessageId?: MessageId
     },
   ): void {
     const active = this.active
@@ -1684,14 +1691,39 @@ class TabConversationController implements ConversationController {
     ) {
       return
     }
+    const replacedFork = input.replacesFromMessageId
+      ? active.destination.spine.forkFor(input.replacesFromMessageId)
+      : undefined
     const presentations: readonly GenerationIntentMessagePresentation[] = Object.freeze(
-      input.messages.map((message) => {
+      input.messages.map((message, index) => {
         if (message.chatId !== claim.chatId) {
           throw new Error(`GenerationIntentPresentationChatMismatch:${message.id}`)
         }
+        const fork =
+          index === 0 &&
+          replacedFork &&
+          message.parentId === replacedFork.parentId &&
+          message.siblingIndex >= replacedFork.nextSiblingIndex
+            ? Object.freeze({
+                parentId: replacedFork.parentId,
+                selectedMessageId: message.id,
+                slotVersion: replacedFork.slotVersion,
+                position: replacedFork.liveCount,
+                liveCount: replacedFork.liveCount + 1,
+                nextSiblingIndex: message.siblingIndex + 1,
+                previousMessageId: replacedFork.lastMessageId,
+                nextMessageId: null,
+                firstMessageId: replacedFork.firstMessageId,
+                lastMessageId: message.id,
+              })
+            : undefined
         return Object.freeze({
           message,
           bodyVersion: 0 as const,
+          ...(index === 0 && input.replacesFromMessageId
+            ? { replacesFromMessageId: input.replacesFromMessageId }
+            : {}),
+          ...(fork ? { fork } : {}),
         })
       }),
     )
@@ -3813,8 +3845,15 @@ class TabConversationController implements ConversationController {
       parentIds === true
         ? this.presentedTranscriptForkParentIds(acceptedWindow)
         : this.relevantPresentedTranscriptForkParentIds(parentIds, acceptedWindow)
-    if (demandedParentIds.length === 0) return
-    for (const parentId of demandedParentIds) this.pendingForkParentIds.add(parentId)
+    const refreshParentIds =
+      reason === 'workspace-change'
+        ? demandedParentIds
+        : demandedParentIds.filter((parentId) => {
+            const selected = this.activeSpine()?.path.childOf(parentId)
+            return selected !== undefined && !this.activeSpine()?.forkFor(selected.id)
+          })
+    if (refreshParentIds.length === 0) return
+    for (const parentId of refreshParentIds) this.pendingForkParentIds.add(parentId)
     if (reason === 'workspace-change') this.cancelRead('forks')
     if (this.reads.has('forks')) return
     this.readPendingForkUpdates()
@@ -5979,7 +6018,10 @@ class TabConversationController implements ConversationController {
     if (!port || !active || !session || !path) return
     const arrival = port.getArrival()
     if (arrival.route?.chatId !== active.chatId) return
-    const leafId = path.leaf?.id
+    const durableLeafId = path.leaf?.id ?? null
+    const intentLeafId = this.presentedGenerationIntents(active.chatId, durableLeafId).at(-1)
+      ?.message.id
+    const leafId = intentLeafId ?? durableLeafId
     const key = `${active.chatId}:${leafId ?? ''}`
     if (this.lastProjectedRouteKey === key) return
     this.lastProjectedRouteKey = key

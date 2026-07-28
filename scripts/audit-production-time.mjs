@@ -216,7 +216,9 @@ const CLOCK_INVENTORY = {
     ids: [
       'src/backcompat/attachment-refs.ts|migrateLegacyAttachmentStorage|Date.now|1',
       'src/store/db.ts|registerSchema|Date.now|1',
+      'src/store/db.ts|registerSchema|Date.now|2',
       'src/store/db.ts|registerPreflightBrowserWorkspaceSchema|Date.now|1',
+      'src/store/db.ts|normalizeInactiveBrowserWorkspaceDatabase|Date.now|1',
     ],
   },
   'external-deadline-freshness': {
@@ -261,6 +263,7 @@ const CLOCK_INVENTORY = {
       'src/store/storage-maintenance-runtime.ts|#runAttachmentRetentionSlice|Date.now|1',
       'src/store/storage-maintenance-runtime.ts|#runTerminalRetentionSlice|Date.now|1',
       'src/store/storage-maintenance-runtime.ts|#runDraftRetentionSlice|Date.now|1',
+      'src/store/storage-maintenance-runtime.ts|#requestStartupWork|Date.now|1',
       'src/store/storage-maintenance-runtime.ts|#recordFailure|Date.now|1',
       'src/store/storage-maintenance-runtime.ts|#scheduleNextWake|Date.now|1',
       'src/store/stream-lease-policy.ts|classifyStreamLeaseWallClockFreshness|Date.now|1',
@@ -298,7 +301,7 @@ const CLOCK_INVENTORY = {
       'src/store/attachments.ts|mutateAttachmentReferenceTargets|Date.now|1',
       'src/store/attachments.ts|deleteReferencedAttachmentBytes|Date.now|1',
       'src/store/attachment-bulk-delete.ts|executeAttachmentBulkDelete|Date.now|1',
-      'src/store/browser-import-export.ts|importChat|Date.now|1',
+      'src/store/browser-import-export.ts|prepareChatImport|Date.now|1',
       'src/store/browser-import-export.ts|importConnectionProfile|Date.now|1',
       'src/store/browser-import-export.ts|importChatPreset|Date.now|1',
       'src/store/browser-import-export.ts|commitPreparedBrowserWorkspaceBackup|Date.now|1',
@@ -310,8 +313,8 @@ const CLOCK_INVENTORY = {
       'src/store/browser-catalog-command-runtime.ts|updateFolder|Date.now|1',
       'src/store/browser-catalog-command-runtime.ts|ensureFolderAndMoveChats|Date.now|1',
       'src/store/browser-repo.ts|mutateSingleAttachmentReference|Date.now|1',
+      'src/store/generation-admission-controller.ts|claimCaptured|Date.now|1',
       'src/store/browser-mutation-runtime.ts|runBrowserMutation|Date.now|1',
-      'src/store/browser-workspace-derived-repair.ts|rebuildAttachmentDerivedState|Date.now|1',
       'src/store/browser-workspace-derived-repair.ts|rebuildChildSlotDerivedState|Date.now|1',
       'src/store/browser-workspace-replacement.ts|restoreBrowserWorkspaceBackup|Date.now|1',
       'src/store/browser-workspace-replacement.ts|restoreBrowserWorkspaceBackup|Date.now|2',
@@ -506,6 +509,11 @@ const ASYNC_RACE_INVENTORY = {
       'src/store/locks.ts|runOwned|Promise.race|1',
     ],
   },
+  'generation-admission-settlement': {
+    rationale:
+      'The UI waits for either explicit generation admission or final claim settlement; both are outcomes of the same owned claim, and settlement resolves non-admission without a clock or detached work.',
+    ids: ['src/app/Shell.tsx|ownGenerationSubmission|Promise.race|1'],
+  },
 }
 
 const RETRY_LOOP_INVENTORY = {
@@ -526,16 +534,12 @@ const RETRY_LOOP_INVENTORY = {
       'src/store/request-planning.ts|prepareAssistantRequestPlanFromContextSelection|ForStatement|unbounded|1',
     ],
   },
-  'revision-revalidation-loop': {
-    rationale:
-      'An unlocked read only proposes lock/table scope; the fenced transaction revalidates exact revision/evidence and retries solely on its typed changed-plan outcome.',
-    ids: ['src/store/browser-repo.ts|expandGeneratedOutputVideo|ForStatement|unbounded|1'],
-  },
   'workspace-slot-revalidation': {
     rationale:
       'Startup reads the committed active slot, acquires its shared lease, and confirms the active database plus activation sequence. A failed confirmation proves an actual committed slot transition; the attempt authority cancels lock acquisition and every retry releases its exact lease.',
     ids: [
       'src/store/browser-workspace-database-selection.ts|selectBrowserWorkspaceDatabase|ForStatement|unbounded|1',
+      'src/store/browser-workspace-startup-repair.ts|settlePendingBrowserWorkspaceReplacement|ForStatement|unbounded|1',
     ],
   },
   'bounded-pagination-scan': {
@@ -550,13 +554,19 @@ const RETRY_LOOP_INVENTORY = {
       'src/store/attachment-bulk-delete.ts|executeAttachmentBulkDelete|ForStatement|bounded|1',
       'src/store/attachment-bulk-delete.ts|planAttachmentBulkDelete|ForStatement|bounded|1',
       'src/store/browser-import-export.ts|tablePages|ForStatement|unbounded|1',
+      'src/store/browser-catalog-command-runtime.ts|clearCalibrationEverywhereTransaction|ForStatement|unbounded|1',
+      'src/store/browser-configuration-domain.ts|readConfigurationTargetFanoutLinks|ForStatement|unbounded|1',
       'src/store/browser-query-pages.ts|readChatMessageHeaderPages|ForStatement|unbounded|1',
       'src/store/browser-query-pages.ts|readChildHeaderPages|ForStatement|unbounded|1',
       'src/store/browser-query-pages.ts|readStringPrimaryKeyPages|ForStatement|unbounded|1',
       'src/store/browser-query-pages.ts|readStreamLeasePages|ForStatement|unbounded|1',
       'src/store/browser-workspace-compaction.ts|copyTable|ForStatement|unbounded|1',
+      'src/store/browser-workspace-compaction.ts|drainBrowserWorkspaceCatchup|ForStatement|unbounded|1',
       'src/store/browser-workspace-derived-repair.ts|rebuildChildSlotDerivedState|ForStatement|unbounded|1',
       'src/store/browser-workspace-derived-repair.ts|forEachPrimaryPage|ForStatement|unbounded|1',
+      'src/store/browser-workspace-staged-fanout.ts|copyStagedWorkspace|ForStatement|unbounded|1',
+      'src/store/browser-workspace-staged-fanout.ts|drainStagedWorkspaceCatchup|ForStatement|unbounded|1',
+      'src/store/browser-workspace-startup-repair.ts|copyCanonicalBrowserWorkspaceRows|ForStatement|unbounded|1',
       'src/store/chat-search.ts|iterateSearchSidebarPages|ForStatement|unbounded|1',
       'src/store/chat-storage-ownership.ts|deleteKnownChatClosure|ForStatement|unbounded|1',
       'src/store/chat-sidebar-projection.ts|rebuildChatSidebarProjectionRowsInTransaction|ForStatement|unbounded|1',

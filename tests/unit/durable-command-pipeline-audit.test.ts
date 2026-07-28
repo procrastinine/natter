@@ -48,6 +48,16 @@ interface DurableCommandPipelineReport {
   readonly directTransactionOwners: number
   readonly directTransactionCalls: number
   readonly semanticCapabilityCommands: number
+  readonly finiteClassifiedBoundCells: number
+  readonly stagedClassifiedBoundCells: number
+  readonly carriedBoundCells: number
+  readonly carriedBounds: readonly {
+    readonly scope: string
+    readonly variant: string
+    readonly kind: 'carried'
+    readonly findingId: string
+    readonly owner: string
+  }[]
   readonly gapStageCounts: Readonly<Record<string, number>>
   readonly physicalTables: string[]
   readonly limitations: string[]
@@ -84,46 +94,260 @@ describe('durable command commit pipeline audit', () => {
       ok: true,
       structurallyValid: true,
       workspaceCommands: 65,
-      workspaceConstructorSites: 74,
+      workspaceConstructorSites: 75,
       configurationCommands: 44,
       configurationConstructorSites: 47,
       configurationConstructorGaps: 0,
       pipelineRecords: 109,
       requiredStages: 15,
       stageCells: 1635,
-      gapCells: 117,
-      observedCells: 1518,
+      gapCells: 0,
+      observedCells: 1635,
       manualMarkerOwners: 0,
       manualMarkerCalls: 0,
       directTransactionOwners: 2,
       directTransactionCalls: 3,
       semanticCapabilityCommands: 109,
+      finiteClassifiedBoundCells: 11,
+      stagedClassifiedBoundCells: 28,
+      carriedBoundCells: 0,
       problems: [],
     })
     expect(result.report.gapStageCounts).toMatchObject({
-      tables: 25,
-      physicalWrites: 3,
-      receiptDelta: 25,
-      idempotence: 25,
-      bounds: 39,
+      tables: 0,
+      physicalWrites: 0,
+      receiptDelta: 0,
+      idempotence: 0,
+      bounds: 0,
     })
     expect(result.report.physicalTables).toHaveLength(45)
     expect(result.report.limitations).toEqual(
       expect.arrayContaining([
-        expect.stringContaining('command-to-helper-to-table completeness remains unproven'),
-        expect.stringContaining('semantic meaning of each mutated table is not inferred'),
+        expect.stringContaining('finite bounds prove command-lifetime request and row cardinality'),
+        expect.stringContaining('exact 28 former carries use the B2.2 staged'),
+        expect.stringContaining('Zero pipeline gaps is B2.2 source closure'),
       ]),
     )
   })
 
-  it('makes the explicit architectural gaps fatal in enforcement mode', () => {
+  it('passes enforcement only after every command is finite or staged through B2.2', () => {
     const result = runAudit('enforce')
 
-    expect(result.status).toBe(1)
+    expect(result.status).toBe(0)
     expect(result.report.structurallyValid).toBe(true)
-    expect(result.report.ok).toBe(false)
-    expect(result.report.gapCells).toBe(117)
+    expect(result.report.ok).toBe(true)
+    expect(result.report.gapCells).toBe(0)
   })
+
+  it('classifies all remaining bounds through the one B2.2 staged owner', () => {
+    const facts = sourceFacts as {
+      readonly b16BoundsClassification: {
+        readonly finiteVariants: readonly string[]
+        readonly stagedVariants: readonly string[]
+        readonly carriedVariants: readonly string[]
+        readonly classifications: Readonly<
+          Record<
+            string,
+            | { readonly kind: 'finite'; readonly proof: string }
+            | {
+                readonly kind: 'staged'
+                readonly findingId: string
+                readonly owner: string
+                readonly proof: string
+              }
+          >
+        >
+      }
+      readonly semanticCapabilities: Readonly<
+        Record<
+          string,
+          {
+            readonly boundsProved: boolean
+            readonly boundsClassification?: { readonly kind: string; readonly proof: string }
+            readonly boundsDisposition?: {
+              readonly kind: string
+              readonly findingId: string
+              readonly owner: string
+            }
+          }
+        >
+      >
+    }
+    const classification = facts.b16BoundsClassification
+
+    expect(classification.finiteVariants).toEqual([
+      'attempt.finalize',
+      'attempt.prepare',
+      'chat.delete-archived',
+      'chat.discard-empty-drafts',
+      'chat.empty-archive',
+      'chat.set-tags-from-names',
+      'draft.put',
+      'interchange.import-chat',
+      'interchange.import-chat-preset',
+      'interchange.import-connection-profile',
+      'message.edit-content',
+    ])
+    expect(classification.stagedVariants).toHaveLength(28)
+    expect(classification.carriedVariants).toEqual([])
+    expect(
+      Object.values(classification.classifications).filter(({ kind }) => kind === 'finite'),
+    ).toHaveLength(11)
+    expect(
+      Object.values(classification.classifications).filter(({ kind }) => kind === 'staged'),
+    ).toHaveLength(28)
+    for (const variant of classification.finiteVariants) {
+      expect(facts.semanticCapabilities[variant]).toMatchObject({
+        boundsProved: true,
+        boundsClassification: classification.classifications[variant],
+      })
+      expect(facts.semanticCapabilities[variant]?.boundsDisposition).toBeUndefined()
+    }
+    for (const variant of classification.stagedVariants) {
+      expect(facts.semanticCapabilities[variant]).toMatchObject({
+        boundsProved: true,
+        boundsClassification: classification.classifications[variant],
+      })
+      expect(facts.semanticCapabilities[variant]?.boundsDisposition).toBeUndefined()
+    }
+
+    const report = runAudit('enforce').report
+    expect(report.stagedClassifiedBoundCells).toBe(28)
+    expect(report.carriedBounds).toEqual([])
+  })
+
+  it('reopens a bound when its finite or staged proof is removed', () => {
+    const facts = sourceFacts as {
+      readonly semanticCapabilities: Readonly<Record<string, Readonly<Record<string, unknown>>>>
+    }
+    const withoutFiniteProof = evaluateDurableCommandPipeline(
+      canonicalInventory,
+      'inventory',
+      { detail: true },
+      {
+        ...(sourceFacts as object),
+        semanticCapabilities: {
+          ...facts.semanticCapabilities,
+          'message.edit-content': {
+            ...facts.semanticCapabilities['message.edit-content'],
+            boundsProved: false,
+          },
+        },
+      },
+    ) as DurableCommandPipelineReport & {
+      readonly gaps: readonly { readonly variant: string; readonly stage: string }[]
+    }
+    const withoutStagedProof = evaluateDurableCommandPipeline(
+      canonicalInventory,
+      'inventory',
+      { detail: true },
+      {
+        ...(sourceFacts as object),
+        semanticCapabilities: {
+          ...facts.semanticCapabilities,
+          'connection.delete': {
+            ...facts.semanticCapabilities['connection.delete'],
+            boundsProved: false,
+            boundsClassification: undefined,
+          },
+        },
+      },
+    ) as DurableCommandPipelineReport & {
+      readonly gaps: readonly { readonly variant: string; readonly stage: string }[]
+    }
+
+    expect(withoutFiniteProof.gaps).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ variant: 'message.edit-content', stage: 'bounds' }),
+      ]),
+    )
+    expect(withoutStagedProof.gaps).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ variant: 'connection.delete', stage: 'bounds' }),
+      ]),
+    )
+  })
+
+  it('derives the exact 28 variants from one bounded staged-fanout owner', () => {
+    const facts = sourceFacts as {
+      readonly stagedFanoutFamily: {
+        readonly variants: readonly string[]
+        readonly workspaceVariants: readonly string[]
+        readonly configurationVariants: readonly string[]
+        readonly commonKernel: Readonly<Record<string, boolean>>
+        readonly consumed: boolean
+      }
+    }
+
+    expect(facts.stagedFanoutFamily.variants).toHaveLength(28)
+    expect(facts.stagedFanoutFamily.workspaceVariants).toHaveLength(24)
+    expect(facts.stagedFanoutFamily.configurationVariants).toEqual([
+      'connection.delete',
+      'prompt-preset.delete',
+      'prompt-preset.overwrite-and-pin',
+      'text-template.delete',
+    ])
+    expect(Object.values(facts.stagedFanoutFamily.commonKernel).every(Boolean)).toBe(true)
+    expect(facts.stagedFanoutFamily.consumed).toBe(true)
+  })
+
+  it('rejects a staged inventory, page guard, and budget guard removed together', async () => {
+    const commandSource = readFileSync(
+      resolve(ROOT, 'src/store/browser-staged-fanout-command.ts'),
+      'utf8',
+    )
+    const stagedSource = readFileSync(
+      resolve(ROOT, 'src/store/browser-workspace-staged-fanout.ts'),
+      'utf8',
+    )
+    const repoSource = readFileSync(resolve(ROOT, 'src/store/browser-repo.ts'), 'utf8')
+    const { createProductionTypeScriptProgram } = (await import(TYPESCRIPT_SOURCE_URL)) as {
+      createProductionTypeScriptProgram(
+        root: string,
+        options: { sourceTextOverrides: Readonly<Record<string, string>> },
+      ): unknown
+    }
+    expect(commandSource).toContain("  'connection.delete',")
+    expect(stagedSource).toContain('rows.length >= STAGED_COPY_MAX_PAGE_ROWS')
+    expect(repoSource).toContain('isBrowserCommandFanoutBudgetExceededError(error)')
+
+    const mutated = buildDurableCommandPipelineSourceFacts({
+      program: createProductionTypeScriptProgram(ROOT, {
+        sourceTextOverrides: {
+          'src/store/browser-staged-fanout-command.ts': commandSource.replace(
+            "  'connection.delete',",
+            '',
+          ),
+          'src/store/browser-workspace-staged-fanout.ts': stagedSource.replaceAll(
+            'rows.length >= STAGED_COPY_MAX_PAGE_ROWS',
+            'rows.length >= Number.MAX_SAFE_INTEGER',
+          ),
+          'src/store/browser-repo.ts': repoSource.replace(
+            'isBrowserCommandFanoutBudgetExceededError(error)',
+            'false',
+          ),
+        },
+      }),
+    }) as {
+      readonly stagedFanoutFamily: {
+        readonly commonKernel: Readonly<Record<string, boolean>>
+        readonly consumed: boolean
+      }
+      readonly sourceArchitectureProblems: readonly string[]
+    }
+
+    expect(mutated.stagedFanoutFamily.commonKernel.exactVariantInventory).toBe(false)
+    expect(mutated.stagedFanoutFamily.commonKernel.boundedSourceDestinationCopy).toBe(false)
+    expect(mutated.stagedFanoutFamily.commonKernel.adaptiveAtomicAdmission).toBe(false)
+    expect(mutated.stagedFanoutFamily.consumed).toBe(false)
+    expect(mutated.sourceArchitectureProblems).toEqual(
+      expect.arrayContaining([
+        'staged fanout family missing exactVariantInventory',
+        'staged fanout family missing boundedSourceDestinationCopy',
+        'staged fanout family missing adaptiveAtomicAdmission',
+      ]),
+    )
+  }, 30_000)
 
   it('does not credit a declared capability until its exact command route consumes it', () => {
     const facts = sourceFacts as {
@@ -219,6 +443,14 @@ describe('durable command commit pipeline audit', () => {
             readonly variant: 'attachment.reap'
             readonly commonKernel: Readonly<Record<string, boolean>>
           }
+          readonly attachmentReference: {
+            readonly variants: readonly string[]
+            readonly commonKernel: Readonly<Record<string, boolean>>
+          }
+          readonly messageCommandExact: {
+            readonly variants: readonly string[]
+            readonly commonKernel: Readonly<Record<string, boolean>>
+          }
         }
         readonly capabilities: Readonly<
           Record<
@@ -305,6 +537,40 @@ describe('durable command commit pipeline audit', () => {
     expect(
       Object.values(family.fixedReceiptFamily.attachmentReap.commonKernel).every(Boolean),
     ).toBe(true)
+    expect(family.fixedReceiptFamily.attachmentReference.variants).toEqual([
+      'attachment.ref.add',
+      'attachment.ref.detach',
+      'attachment.ref.relink',
+      'attachment.ref.set-visibility',
+    ])
+    expect(
+      Object.values(family.fixedReceiptFamily.attachmentReference.commonKernel).every(Boolean),
+    ).toBe(true)
+    for (const variant of family.fixedReceiptFamily.attachmentReference.variants) {
+      expect(family.capabilities[variant]).toMatchObject({
+        exactEffectsProved: true,
+        tablesProved: true,
+        boundsProved: false,
+        idempotenceProved: true,
+      })
+    }
+    expect(family.fixedReceiptFamily.messageCommandExact.variants).toEqual([
+      'message.delete',
+      'message.edit-content',
+      'message.import',
+      'message.restore-structure',
+    ])
+    expect(
+      Object.values(family.fixedReceiptFamily.messageCommandExact.commonKernel).every(Boolean),
+    ).toBe(true)
+    for (const variant of family.fixedReceiptFamily.messageCommandExact.variants) {
+      expect(family.capabilities[variant]).toMatchObject({
+        exactEffectsProved: true,
+        tablesProved: true,
+        boundsProved: false,
+        idempotenceProved: true,
+      })
+    }
     expect(
       Object.entries(family.fixedReceiptFamily.commonKernel)
         .filter(([name]) => name !== 'constructorFacts')
@@ -324,7 +590,7 @@ describe('durable command commit pipeline audit', () => {
       family.fixedReceiptFamily.messageVariants.every(
         (variant) =>
           family.capabilities[variant]?.tablesProved === true &&
-          family.capabilities[variant]?.boundsProved === true,
+          family.capabilities[variant].boundsProved === true,
       ),
     ).toBe(true)
     expect(family.capabilities['attempt.dispatch']).toMatchObject({
@@ -396,9 +662,9 @@ describe('durable command commit pipeline audit', () => {
       ]),
     )
     expect(runAudit('inventory').report.gapStageCounts).toMatchObject({
-      physicalWrites: 3,
-      receiptDelta: 25,
-      idempotence: 25,
+      physicalWrites: 0,
+      receiptDelta: 0,
+      idempotence: 0,
     })
 
     const semanticCapabilities = { ...facts.semanticCapabilities }
@@ -442,6 +708,177 @@ describe('durable command commit pipeline audit', () => {
       (runAudit('inventory').report.gapStageCounts.idempotence ?? 0) + 8,
     )
   })
+
+  it('reopens only the attachment-reference cells owned by each omitted source guarantee', async () => {
+    const baseline = evaluateDurableCommandPipeline(
+      canonicalInventory,
+      'inventory',
+      { detail: true },
+      sourceFacts,
+    ) as DurableCommandPipelineReport & {
+      readonly gaps: readonly {
+        readonly scope: string
+        readonly variant: string
+        readonly stage: string
+      }[]
+    }
+    const browserRepoPath = resolve(ROOT, 'src/store/browser-repo.ts')
+    const browserRepoSource = readFileSync(browserRepoPath, 'utf8')
+    const mutationRuntimePath = resolve(ROOT, 'src/store/browser-mutation-runtime.ts')
+    const mutationRuntimeSource = readFileSync(mutationRuntimePath, 'utf8')
+    const attachmentReferencePath = resolve(ROOT, 'src/store/attachment-reference-edges.ts')
+    const attachmentReferenceSource = readFileSync(attachmentReferencePath, 'utf8')
+    const mutationPlanPath = resolve(ROOT, 'src/store/browser-mutation-plan.ts')
+    const mutationPlanSource = readFileSync(mutationPlanPath, 'utf8')
+    const { createProductionTypeScriptProgram } = (await import(TYPESCRIPT_SOURCE_URL)) as {
+      createProductionTypeScriptProgram(
+        root?: string,
+        options?: {
+          readonly sourceTextOverrides?: Readonly<Record<string, string>>
+        },
+      ): unknown
+    }
+    const replaceOwnerSource = (
+      source: string,
+      startToken: string,
+      endToken: string,
+      target: string,
+      replacement: string,
+    ): string => {
+      const start = source.indexOf(startToken)
+      const end = source.indexOf(endToken, start)
+      expect(start).toBeGreaterThanOrEqual(0)
+      expect(end).toBeGreaterThan(start)
+      const owner = source.slice(start, end)
+      expect(owner).toContain(target)
+      return source.slice(0, start) + owner.replace(target, replacement) + source.slice(end)
+    }
+    const baselineKeys = new Set(
+      baseline.gaps.map(({ scope, variant, stage }) => `${scope}:${variant}:${stage}`),
+    )
+    const reopenedFrom = (
+      sourceTextOverrides: Readonly<Record<string, string>>,
+    ): {
+      readonly common: Readonly<Record<string, boolean>>
+      readonly reopened: readonly string[]
+      readonly gapCells: number
+    } => {
+      const facts = buildDurableCommandPipelineSourceFacts({
+        program: createProductionTypeScriptProgram(ROOT, { sourceTextOverrides }),
+      }) as {
+        readonly scopeDerivedMutationFamily: {
+          readonly fixedReceiptFamily: {
+            readonly attachmentReference: {
+              readonly commonKernel: Readonly<Record<string, boolean>>
+            }
+          }
+        }
+      }
+      const result = evaluateDurableCommandPipeline(
+        canonicalInventory,
+        'inventory',
+        { detail: true },
+        facts,
+      ) as DurableCommandPipelineReport & {
+        readonly gaps: readonly {
+          readonly scope: string
+          readonly variant: string
+          readonly stage: string
+        }[]
+      }
+      return {
+        common:
+          facts.scopeDerivedMutationFamily.fixedReceiptFamily.attachmentReference.commonKernel,
+        reopened: result.gaps
+          .filter(({ scope, variant, stage }) => !baselineKeys.has(`${scope}:${variant}:${stage}`))
+          .map(({ variant, stage }) => `${variant}:${stage}`)
+          .sort(),
+        gapCells: result.gapCells,
+      }
+    }
+    const attachmentReceiptGaps = [
+      'attachment.ref.add:receiptDelta',
+      'attachment.ref.detach:receiptDelta',
+      'attachment.ref.relink:receiptDelta',
+      'attachment.ref.set-visibility:receiptDelta',
+    ]
+    const attachmentTableGaps = [
+      'attachment.ref.add:tables',
+      'attachment.ref.detach:tables',
+      'attachment.ref.relink:tables',
+      'attachment.ref.set-visibility:tables',
+    ]
+    const cases = [
+      {
+        name: 'single transaction owner',
+        overrides: {
+          'src/store/browser-repo.ts': replaceOwnerSource(
+            browserRepoSource,
+            'private async addAttachmentReference(',
+            'private async setAttachmentReferenceVisibility(',
+            'applyAttachmentReferenceOwnerMutations(',
+            'applyAttachmentReferenceMutations(',
+          ),
+        },
+        common: 'oneTransactionOwner',
+        reopened: [...attachmentReceiptGaps, ...attachmentTableGaps].sort(),
+      },
+      {
+        name: 'header-only message transition',
+        overrides: {
+          'src/store/browser-mutation-runtime.ts': replaceOwnerSource(
+            mutationRuntimeSource,
+            'replaceMessageAttachmentRefs: async (messageId, attachmentRefs) => {',
+            'patchMessageStructure: async',
+            "putPhysicalStorageRow(tx, 'messages', next, existing)",
+            "putPhysicalStorageRow(tx, 'messages', existing, next)",
+          ),
+        },
+        common: 'headerOnlyMessageTransition',
+        reopened: [...attachmentReceiptGaps, ...attachmentTableGaps].sort(),
+      },
+      {
+        name: 'exact attachment transition',
+        overrides: {
+          'src/store/attachment-reference-edges.ts': replaceOwnerSource(
+            attachmentReferenceSource,
+            'export async function applyAttachmentReferenceOwnerTransitions(',
+            'async function applyAttachmentReferenceDeltas(',
+            'const deltasReceipt = await applyAttachmentReferenceDeltas(',
+            'const attachmentDeltasReceipt = await applyAttachmentReferenceDeltas(',
+          ),
+        },
+        common: 'exactAttachmentTransition',
+        reopened: attachmentReceiptGaps,
+      },
+      {
+        name: 'typed replay policies',
+        overrides: {
+          'src/store/browser-mutation-plan.ts': replaceOwnerSource(
+            mutationPlanSource,
+            "case 'attachment.ref.relink':",
+            "case 'attempt.finalize':",
+            "replayReason: 'non-replayable'",
+            "replayReason: 'unfenced-relative-update'",
+          ),
+        },
+        common: 'typedReplayPolicies',
+        reopened: [
+          'attachment.ref.add:idempotence',
+          'attachment.ref.detach:idempotence',
+          'attachment.ref.relink:idempotence',
+          'attachment.ref.set-visibility:idempotence',
+        ],
+      },
+    ] as const
+
+    for (const scenario of cases) {
+      const result = reopenedFrom(scenario.overrides)
+      expect(result.common[scenario.common], scenario.name).toBe(false)
+      expect(result.reopened, scenario.name).toEqual(scenario.reopened)
+      expect(result.gapCells, scenario.name).toBe(baseline.gapCells + scenario.reopened.length)
+    }
+  }, 180_000)
 
   it('reopens only the draft cells owned by each omitted source guarantee', async () => {
     const baseline = evaluateDurableCommandPipeline(
@@ -538,7 +975,7 @@ describe('durable command commit pipeline audit', () => {
           'src/store/browser-repo.ts': replaceOwnerSource(
             browserRepoSource,
             'async function readDraftPutPlan(',
-            'async function attachmentOwnerMessage(',
+            'async function attachmentOwnerMessageHeader(',
             "operation: 'get',",
             "operation: 'query',",
           ),
@@ -589,7 +1026,13 @@ describe('durable command commit pipeline audit', () => {
           ),
         },
         common: 'constructiveExactReceipt',
-        reopened: ['draft.put:receiptDelta'],
+        reopened: [
+          'attachment.ref.add:receiptDelta',
+          'attachment.ref.detach:receiptDelta',
+          'attachment.ref.relink:receiptDelta',
+          'attachment.ref.set-visibility:receiptDelta',
+          'draft.put:receiptDelta',
+        ],
       },
       {
         name: 'application submission iteration',
@@ -619,7 +1062,7 @@ describe('durable command commit pipeline audit', () => {
           ),
         },
         common: 'oneApplicationSubmission',
-        reopened: ['draft.put:idempotence'],
+        reopened: ['draft.put:bounds', 'draft.put:idempotence'],
       },
       {
         name: 'typed replay policy',
@@ -741,9 +1184,9 @@ describe('durable command commit pipeline audit', () => {
             'export function planMutationSemanticOperation(',
             'function scopeDerivedMutationReceiptPolicy(',
             `: command.kind === 'attachment.bytes.delete' || command.kind === 'attachment.bundle.write'
-        ? 'attachment-payload'`,
+          ? 'attachment-payload'`,
             `: command.kind === 'attachment.bundle.write'
-        ? 'attachment-payload'`,
+          ? 'attachment-payload'`,
           ),
         },
         common: 'narrowTransactionProfile',
@@ -929,9 +1372,9 @@ describe('durable command commit pipeline audit', () => {
             'export function planMutationSemanticOperation(',
             'function scopeDerivedMutationReceiptPolicy(',
             `: command.kind === 'attachment.bytes.delete' || command.kind === 'attachment.bundle.write'
-        ? 'attachment-payload'`,
+          ? 'attachment-payload'`,
             `: command.kind === 'attachment.bytes.delete'
-        ? 'attachment-payload'`,
+          ? 'attachment-payload'`,
           ),
         },
         common: 'narrowTransactionProfile',
@@ -1158,13 +1601,13 @@ describe('durable command commit pipeline audit', () => {
         ],
       },
       {
-        name: 'bounded reference probe receipt',
+        name: 'complete payload read receipt',
         overrides: {
           'src/store/browser-mutation-runtime.ts': replaceOwnerSource(
             mutationRuntimeSource,
-            'deleteAttachmentIfUnreferenced: async (attachmentId) => {',
-            'putAttachment: async (attachment) => {',
-            'rowCount: firstReference ? 1 : 0,',
+            'const deleteAttachmentOwnerBundle = async (',
+            'const ctx: MutationContext = {',
+            'rowCount: deleted.blobs,',
             'rowCount: 0,',
           ),
         },
@@ -1206,6 +1649,7 @@ describe('durable command commit pipeline audit', () => {
         reopened: [
           'attachment.delete-if-unreferenced:receiptDelta',
           'attachment.delete-many:receiptDelta',
+          'attachment.reap:receiptDelta',
         ],
       },
       {
@@ -1380,7 +1824,12 @@ describe('durable command commit pipeline audit', () => {
           ),
         },
         common: 'exactPhysicalReads',
-        reopened: ['attachment.delete-many:receiptDelta', 'attachment.delete-many:tables'],
+        reopened: [
+          'attachment.delete-if-unreferenced:receiptDelta',
+          'attachment.delete-if-unreferenced:tables',
+          'attachment.delete-many:receiptDelta',
+          'attachment.delete-many:tables',
+        ],
       },
       {
         name: 'pre-read catalog receipt reuse',
@@ -2124,7 +2573,7 @@ describe('durable command commit pipeline audit', () => {
     expect(result.gapCells).toBe(baseline.gapCells + reopenedGaps.length)
   }, 30_000)
 
-  it('derives calibration receipts while keeping workspace fanout explicitly open', () => {
+  it('derives page-shaped calibration receipts before staged classification', () => {
     const facts = sourceFacts as {
       readonly chatCalibrationFamily: {
         readonly variants: readonly string[]
@@ -2138,7 +2587,6 @@ describe('durable command commit pipeline audit', () => {
               readonly boundsProved: boolean
               readonly byteBoundsProved: boolean
               readonly idempotenceProved: boolean
-              readonly boundsDisposition?: string
             }
           >
         >
@@ -2165,7 +2613,6 @@ describe('durable command commit pipeline audit', () => {
         boundsProved: false,
         byteBoundsProved: false,
         idempotenceProved: true,
-        boundsDisposition: 'admitted-atomic-calibration-fanout',
       })
     }
   })
@@ -2694,7 +3141,6 @@ describe('durable command commit pipeline audit', () => {
             string,
             {
               readonly boundsProved: boolean
-              readonly boundsDisposition: string
             }
           >
         >
@@ -2716,7 +3162,6 @@ describe('durable command commit pipeline audit', () => {
     for (const capability of Object.values(family.capabilities)) {
       expect(capability).toMatchObject({
         boundsProved: false,
-        boundsDisposition: 'admitted-atomic-target-fanout',
       })
     }
     expect(facts.constructorsByConfigurationVariant['prompt-preset.delete']).not.toHaveLength(0)
@@ -3051,18 +3496,19 @@ describe('durable command commit pipeline audit', () => {
     expect(Object.values(family.commonKernel).every(Boolean)).toBe(true)
     expect(family.capabilities['folder.ensure-and-move-chats']).toMatchObject({
       consumed: true,
-      physicalWritesProved: false,
-      exactEffectsProved: false,
-      tablesProved: false,
+      physicalWritesProved: true,
+      exactEffectsProved: true,
+      tablesProved: true,
       boundsProved: false,
+      idempotenceProved: true,
     })
     expect(family.capabilities['folder.delete']).toMatchObject({
       consumed: true,
       physicalWritesProved: true,
-      exactEffectsProved: false,
-      tablesProved: false,
+      exactEffectsProved: true,
+      tablesProved: true,
       boundsProved: false,
-      idempotenceProved: false,
+      idempotenceProved: true,
     })
     for (const kind of family.fixedRowVariants) {
       expect(family.capabilities[kind]).toMatchObject({
@@ -3255,9 +3701,10 @@ describe('durable command commit pipeline audit', () => {
     expect(family.capabilities['chat.set-tags-from-names']).toMatchObject({
       consumed: true,
       physicalWritesProved: true,
-      exactEffectsProved: false,
-      tablesProved: false,
+      exactEffectsProved: true,
+      tablesProved: true,
       boundsProved: false,
+      idempotenceProved: true,
     })
   })
 
@@ -3292,9 +3739,10 @@ describe('durable command commit pipeline audit', () => {
       expect(capability).toMatchObject({
         consumed: true,
         physicalWritesProved: true,
-        exactEffectsProved: false,
-        tablesProved: false,
+        exactEffectsProved: true,
+        tablesProved: true,
         boundsProved: false,
+        idempotenceProved: true,
       })
     }
   })
@@ -3327,10 +3775,206 @@ describe('durable command commit pipeline audit', () => {
       owner: 'CHAT_FORK_OPERATION',
       consumed: true,
       physicalWritesProved: true,
-      exactEffectsProved: false,
-      tablesProved: false,
+      exactEffectsProved: true,
+      tablesProved: true,
       boundsProved: false,
+      idempotenceProved: true,
     })
+  })
+
+  it('derives maintenance reconciliation from final transaction occurrence receipts', () => {
+    const facts = sourceFacts as {
+      readonly maintenanceOccurrenceFamily: {
+        readonly variants: readonly string[]
+        readonly facts: Readonly<Record<string, Readonly<Record<string, boolean>>>>
+        readonly capabilities: Readonly<
+          Record<
+            string,
+            {
+              readonly consumed: boolean
+              readonly physicalWritesProved: boolean
+              readonly exactPhysicalWritesProved: boolean
+              readonly exactEffectsProved: boolean
+              readonly tablesProved: boolean
+              readonly boundsProved: boolean
+              readonly idempotenceProved: boolean
+            }
+          >
+        >
+      }
+    }
+    const family = facts.maintenanceOccurrenceFamily
+
+    expect(family.variants).toEqual([
+      'maintenance.prune-empty-draft-chats',
+      'maintenance.reconcile-attachment-integrity',
+    ])
+    for (const variant of family.variants) {
+      expect(Object.values(family.facts[variant] ?? {}).every(Boolean)).toBe(true)
+      expect(family.capabilities[variant]).toMatchObject({
+        consumed: true,
+        physicalWritesProved: true,
+        exactPhysicalWritesProved: true,
+        exactEffectsProved: true,
+        tablesProved: true,
+        boundsProved: false,
+        idempotenceProved: true,
+      })
+    }
+  })
+
+  it('derives generated-output localization from explicit targets and one exact occurrence', () => {
+    const facts = sourceFacts as {
+      readonly generatedOutputLocalizationFamily: {
+        readonly variants: readonly string[]
+        readonly commonKernel: Readonly<Record<string, boolean>>
+        readonly runtimeSubmitFacts: Readonly<Record<string, boolean>>
+        readonly exactOccurrencePolicies: Readonly<Record<string, boolean>>
+        readonly capabilities: Readonly<
+          Record<
+            string,
+            {
+              readonly physicalWritesProved: boolean
+              readonly exactPhysicalWritesProved: boolean
+              readonly exactEffectsProved: boolean
+              readonly tablesProved: boolean
+              readonly boundsProved: boolean
+              readonly byteBoundsProved: boolean
+              readonly idempotenceProved: boolean
+            }
+          >
+        >
+      }
+    }
+    const family = facts.generatedOutputLocalizationFamily
+
+    expect(family.variants).toEqual([
+      'generated-output.localization-claim',
+      'generated-output.localization-complete',
+      'generated-output.localization-fail',
+      'generated-output.localization-retry',
+      'generated-output.video-expand',
+    ])
+    expect(Object.values(family.commonKernel).every(Boolean)).toBe(true)
+    expect(Object.values(family.runtimeSubmitFacts).every(Boolean)).toBe(true)
+    expect(Object.values(family.exactOccurrencePolicies).every(Boolean)).toBe(true)
+    for (const variant of family.variants) {
+      expect(family.capabilities[variant]).toMatchObject({
+        physicalWritesProved: true,
+        exactPhysicalWritesProved: true,
+        exactEffectsProved: true,
+        tablesProved: true,
+        boundsProved: false,
+        byteBoundsProved: false,
+        idempotenceProved: true,
+      })
+    }
+  })
+
+  it('reopens only the generated-output occurrence cells when its proof is absent', () => {
+    const facts = sourceFacts as {
+      readonly semanticCapabilities: Readonly<Record<string, Readonly<Record<string, unknown>>>>
+      readonly generatedOutputLocalizationFamily: {
+        readonly variants: readonly string[]
+      }
+    }
+    const semanticCapabilities = { ...facts.semanticCapabilities }
+    for (const variant of facts.generatedOutputLocalizationFamily.variants) {
+      semanticCapabilities[variant] = {
+        ...semanticCapabilities[variant],
+        exactEffectsProved: false,
+        tablesProved: false,
+        idempotenceProved: false,
+      }
+    }
+    const result = evaluateDurableCommandPipeline(
+      canonicalInventory,
+      'inventory',
+      {},
+      { ...(sourceFacts as object), semanticCapabilities },
+    )
+    const baseline = runAudit('inventory').report
+
+    expect(result.gapCells).toBe(baseline.gapCells + 15)
+    expect(result.gapStageCounts).toMatchObject({
+      tables: (baseline.gapStageCounts.tables ?? 0) + 5,
+      receiptDelta: (baseline.gapStageCounts.receiptDelta ?? 0) + 5,
+      idempotence: (baseline.gapStageCounts.idempotence ?? 0) + 5,
+    })
+  })
+
+  it('reopens the exact occurrence cells when their generated capability proof is absent', () => {
+    const facts = sourceFacts as {
+      readonly semanticCapabilities: Readonly<Record<string, Readonly<Record<string, unknown>>>>
+    }
+    const variants = [
+      'chat.delete-archived',
+      'chat.discard-empty-drafts',
+      'chat.empty-archive',
+      'chat.fork',
+      'chat.set-tags-from-names',
+      'folder.delete',
+      'folder.ensure-and-move-chats',
+      'maintenance.prune-empty-draft-chats',
+      'maintenance.reconcile-attachment-integrity',
+    ] as const
+    const semanticCapabilities = { ...facts.semanticCapabilities }
+    for (const variant of variants) {
+      semanticCapabilities[variant] = {
+        ...semanticCapabilities[variant],
+        physicalWritesProved: false,
+        exactEffectsProved: false,
+        tablesProved: false,
+        idempotenceProved: false,
+      }
+    }
+    const result = evaluateDurableCommandPipeline(
+      canonicalInventory,
+      'inventory',
+      { detail: true },
+      { ...(sourceFacts as object), semanticCapabilities },
+    ) as DurableCommandPipelineReport & {
+      readonly gaps: readonly {
+        readonly scope: string
+        readonly variant: string
+        readonly stage: string
+      }[]
+    }
+
+    const baseline = evaluateDurableCommandPipeline(
+      canonicalInventory,
+      'inventory',
+      { detail: true },
+      sourceFacts,
+    ) as DurableCommandPipelineReport & {
+      readonly gaps: readonly {
+        readonly scope: string
+        readonly variant: string
+        readonly stage: string
+      }[]
+    }
+    const baselineKeys = new Set(
+      baseline.gaps.map(({ scope, variant, stage }) => `${scope}:${variant}:${stage}`),
+    )
+    const reopened = result.gaps
+      .filter(
+        ({ scope, variant, stage }) =>
+          scope === 'workspace' &&
+          variants.includes(variant as never) &&
+          !baselineKeys.has(`${scope}:${variant}:${stage}`),
+      )
+      .map(({ variant, stage }) => `${variant}:${stage}`)
+    expect(reopened).toHaveLength(variants.length * 4)
+    for (const variant of variants) {
+      expect(reopened).toEqual(
+        expect.arrayContaining([
+          `${variant}:tables`,
+          `${variant}:physicalWrites`,
+          `${variant}:receiptDelta`,
+          `${variant}:idempotence`,
+        ]),
+      )
+    }
   })
 
   it('derives interchange imports from transaction-local indexed resolution', () => {
@@ -3338,6 +3982,7 @@ describe('durable command commit pipeline audit', () => {
       readonly interchangeImportFamily: {
         readonly variants: readonly string[]
         readonly commonKernel: Readonly<Record<string, boolean>>
+        readonly occurrence: Readonly<Record<string, boolean>>
         readonly capabilities: Readonly<
           Record<
             string,
@@ -3347,6 +3992,7 @@ describe('durable command commit pipeline audit', () => {
               readonly exactEffectsProved: boolean
               readonly tablesProved: boolean
               readonly boundsProved: boolean
+              readonly idempotenceProved: boolean
             }
           >
         >
@@ -3360,16 +4006,124 @@ describe('durable command commit pipeline audit', () => {
       'interchange.import-connection-profile',
     ])
     expect(Object.values(family.commonKernel).every(Boolean)).toBe(true)
+    expect(Object.values(family.occurrence).every(Boolean)).toBe(true)
     for (const capability of Object.values(family.capabilities)) {
       expect(capability).toMatchObject({
         consumed: true,
         physicalWritesProved: true,
-        exactEffectsProved: false,
-        tablesProved: false,
+        exactEffectsProved: true,
+        tablesProved: true,
         boundsProved: false,
+        idempotenceProved: true,
       })
     }
   })
+
+  it('reopens exactly the interchange and message exact cells when their source contracts drift', async () => {
+    const { createProductionTypeScriptProgram } = (await import(TYPESCRIPT_SOURCE_URL)) as {
+      createProductionTypeScriptProgram(
+        root?: string,
+        options?: {
+          readonly sourceTextOverrides?: Readonly<Record<string, string>>
+        },
+      ): unknown
+    }
+    const current = evaluateDurableCommandPipeline(
+      canonicalInventory,
+      'inventory',
+      { detail: true },
+      sourceFacts,
+    ) as DurableCommandPipelineReport & {
+      readonly gaps: readonly {
+        readonly scope: string
+        readonly variant: string
+        readonly stage: string
+      }[]
+    }
+    const currentKeys = new Set(
+      current.gaps.map(({ scope, variant, stage }) => `${scope}:${variant}:${stage}`),
+    )
+
+    const importPath = resolve(ROOT, 'src/store/browser-import-export.ts')
+    const importSource = readFileSync(importPath, 'utf8')
+    expect(importSource.match(/semanticOperationExactReceiptContracts</gu)).toHaveLength(3)
+    const mutationPlanPath = resolve(ROOT, 'src/store/browser-mutation-plan.ts')
+    const mutationPlanSource = readFileSync(mutationPlanPath, 'utf8')
+    const editPolicy = `case 'message.edit-content':
+      return {
+        exactOccurrence: true,`
+    expect(mutationPlanSource).toContain(editPolicy)
+    const browserRepoPath = resolve(ROOT, 'src/store/browser-repo.ts')
+    const browserRepoSource = readFileSync(browserRepoPath, 'utf8')
+    expect(browserRepoSource).toContain(
+      `const MESSAGE_STRUCTURE_PREFLIGHT_TRANSACTION_PLAN = physicalTransactionPlan(
+  physicalStorageTables('messages'),
+)`,
+    )
+
+    const mutatedFacts = buildDurableCommandPipelineSourceFacts({
+      program: createProductionTypeScriptProgram(ROOT, {
+        sourceTextOverrides: {
+          'src/store/browser-import-export.ts': importSource.replaceAll(
+            'semanticOperationExactReceiptContracts<',
+            'semanticOperationUntrackedReceiptContracts<',
+          ),
+          'src/store/browser-mutation-plan.ts': mutationPlanSource.replace(
+            editPolicy,
+            editPolicy.replace('exactOccurrence: true', 'exactOccurrence: false'),
+          ),
+          'src/store/browser-repo.ts': browserRepoSource.replace(
+            `const MESSAGE_STRUCTURE_PREFLIGHT_TRANSACTION_PLAN = physicalTransactionPlan(
+  physicalStorageTables('messages'),
+)`,
+            `const MESSAGE_STRUCTURE_PREFLIGHT_TRANSACTION_PLAN = physicalTransactionPlan(
+  physicalStorageTables('messages', 'chats'),
+)`,
+          ),
+        },
+      }),
+    })
+    const result = evaluateDurableCommandPipeline(
+      canonicalInventory,
+      'inventory',
+      { detail: true },
+      mutatedFacts,
+    ) as DurableCommandPipelineReport & {
+      readonly gaps: readonly {
+        readonly scope: string
+        readonly variant: string
+        readonly stage: string
+      }[]
+    }
+    const variants = [
+      'interchange.import-chat',
+      'interchange.import-chat-preset',
+      'interchange.import-connection-profile',
+      'message.delete',
+      'message.edit-content',
+      'message.import',
+      'message.restore-structure',
+    ]
+    const reopened = result.gaps
+      .filter(
+        ({ scope, variant, stage }) =>
+          scope === 'workspace' &&
+          variants.includes(variant) &&
+          !currentKeys.has(`${scope}:${variant}:${stage}`),
+      )
+      .map(({ variant, stage }) => `${variant}:${stage}`)
+      .sort()
+    expect(reopened).toEqual(
+      [
+        ...variants.flatMap((variant) => [
+          `${variant}:idempotence`,
+          `${variant}:receiptDelta`,
+          `${variant}:tables`,
+        ]),
+        'message.edit-content:bounds',
+      ].sort(),
+    )
+  }, 60_000)
 
   it('derives preset-order move from its consumed literal capability', () => {
     const facts = sourceFacts as {
@@ -3434,11 +4188,10 @@ describe('durable command commit pipeline audit', () => {
     expect(result.report.problems).toEqual(
       expect.arrayContaining([
         'workspace command pipeline variants: missing chat.touch-viewed',
-        'workspace chat.fork: pipeline stages: missing tables',
-        'workspace chat.fork: missing stage tables',
         'workspace chat.fork: dispatch handler missing notARealTouchHandler',
         'workspace chat.fork: transaction-derived write detection must be observed',
         'workspace chat.fork: committed-write broadcast must be observed',
+        'workspace chat.touch-viewed: constructor stage must match reachable typed sites',
         'write-detection architecture must use the transaction-local mutation journal',
         'transaction-local write detection must remain observed',
         'transaction-local write detection needs proof',

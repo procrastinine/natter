@@ -36,6 +36,7 @@ const DB_NAME = 'natter'
 function started(completion: Promise<void> = Promise.resolve()): ComposerSubmission {
   return Object.freeze({
     kind: 'started',
+    admission: Promise.resolve(Object.freeze({ kind: 'admitted' })),
     completion: completion.then(
       (): ComposerSubmissionOutcome => Object.freeze({ kind: 'prepared' }),
     ),
@@ -191,7 +192,19 @@ describe('Composer', () => {
       settle = resolve
     })
     const { container } = render(
-      <Composer onSubmit={() => Object.freeze({ kind: 'started', completion })} />,
+      <Composer
+        onSubmit={() =>
+          Object.freeze({
+            kind: 'started',
+            admission: completion.then((outcome) =>
+              outcome.kind === 'prepared'
+                ? Object.freeze({ kind: 'admitted' as const })
+                : Object.freeze({ kind: 'not-admitted' as const, reason: outcome.reason }),
+            ),
+            completion,
+          })
+        }
+      />,
     )
     const input = screen.getByRole('textbox')
     fireEvent.change(input, { target: { value: 'retain rejected submit' } })
@@ -205,12 +218,23 @@ describe('Composer', () => {
     expect(input).toHaveValue('retain rejected submit')
   })
 
-  it('owns one pending first submit and clears only after preparation succeeds', async () => {
+  it('owns one pending first submit and clears only after admission', async () => {
+    let admit: () => void = () => undefined
+    const admission = new Promise<void>((resolve) => {
+      admit = resolve
+    })
     let resolvePreparation: () => void = () => undefined
     const completion = new Promise<void>((resolve) => {
       resolvePreparation = resolve
     })
-    const onSubmit = vi.fn(() => started(completion))
+    const onSubmit = vi.fn(
+      (): ComposerSubmission =>
+        Object.freeze({
+          kind: 'started',
+          admission: admission.then(() => Object.freeze({ kind: 'admitted' })),
+          completion: completion.then(() => Object.freeze({ kind: 'prepared' })),
+        }),
+    )
     const { container } = render(
       <Composer
         generationCapability={pendingGenerationCapability('prompt-path')}
@@ -226,6 +250,9 @@ describe('Composer', () => {
 
     expect(onSubmit).toHaveBeenCalledOnce()
     expect(input).toHaveValue('retain until prepared')
+    admit()
+    await waitFor(() => expect(input).toHaveValue(''))
+    expect(input).toHaveValue('')
     resolvePreparation()
     await waitFor(() => expect(input).toHaveValue(''))
   })
@@ -313,7 +340,7 @@ describe('Composer', () => {
     fireEvent.change(input, { target: { value: 'leaving page' } })
     try {
       fireEvent.submit(container.querySelector('[data-ui="composer"]') as HTMLFormElement)
-      await waitFor(() => expect(input).toHaveValue('leaving page'))
+      await waitFor(() => expect(input).toHaveValue(''))
       expect(consoleError).not.toHaveBeenCalled()
     } finally {
       window.dispatchEvent(new Event('pageshow'))

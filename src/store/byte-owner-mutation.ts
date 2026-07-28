@@ -52,9 +52,8 @@ import type { SettingsRow } from './db-rows'
 import type { MessageBodyRow, MessageHeaderRow } from './message-storage'
 import type { PhysicalStorageTableName } from './physical-storage-tables'
 import {
-  boundSemanticOperationExactReceiptAccumulator,
+  recordSemanticOperationExactPhysicalWrite,
   type SemanticOperationExactReceiptAccumulator,
-  type SemanticOperationPhysicalWriteOperation,
 } from './semantic-operation-capability'
 import { accumulateStorageCompactionDebt } from './storage-compaction-state'
 import {
@@ -123,7 +122,7 @@ export async function addPhysicalStorageRow<Row, Key>(
   tableName: PhysicalStorageTableName,
   next: Row,
 ): Promise<void> {
-  const receipt = recordConstructivePhysicalWrite(tx, tableName, 'add', [next])
+  const receipt = recordSemanticOperationExactPhysicalWrite(tx, tableName, 'add', [next])
   const key = await tx.table<Row, Key>(tableName).add(next)
   recordConstructivePhysicalKeys(receipt, tableName, 'write', [key])
 }
@@ -134,7 +133,7 @@ export async function addPhysicalStorageRows<Row, Key>(
   next: readonly Row[],
 ): Promise<void> {
   if (next.length === 0) return
-  const receipt = recordConstructivePhysicalWrite(tx, tableName, 'add', next)
+  const receipt = recordSemanticOperationExactPhysicalWrite(tx, tableName, 'add', next)
   await tx.table<Row, Key>(tableName).bulkAdd([...next])
   recordConstructivePhysicalRows(receipt, tx, tableName, 'write', next)
 }
@@ -147,7 +146,7 @@ export async function putPhysicalStorageRow<Row, Key>(
 ): Promise<void> {
   const table = tx.table<Row, Key>(tableName)
   if (!previous) {
-    const receipt = recordConstructivePhysicalWrite(tx, tableName, 'add', [next])
+    const receipt = recordSemanticOperationExactPhysicalWrite(tx, tableName, 'add', [next])
     const key = await table.add(next)
     recordConstructivePhysicalKeys(receipt, tableName, 'write', [key])
     return
@@ -162,7 +161,7 @@ export async function replacePhysicalStorageRow<Row, Key>(
   previous: Row | undefined,
 ): Promise<void> {
   if (previous !== undefined) await recordObsoleteByteOwnerValues(tx, [previous])
-  const receipt = recordConstructivePhysicalWrite(tx, tableName, 'put', [next])
+  const receipt = recordSemanticOperationExactPhysicalWrite(tx, tableName, 'put', [next])
   const key = await tx.table<Row, Key>(tableName).put(next)
   recordConstructivePhysicalKeys(receipt, tableName, 'write', [key])
 }
@@ -175,7 +174,7 @@ export async function putPhysicalStorageRows<Row, Key>(
 ): Promise<void> {
   if (next.length === 0) return
   await recordObsoleteByteOwnerValues(tx, replaced)
-  const receipt = recordConstructivePhysicalWrite(tx, tableName, 'put', next)
+  const receipt = recordSemanticOperationExactPhysicalWrite(tx, tableName, 'put', next)
   await tx.table<Row, Key>(tableName).bulkPut([...next])
   recordConstructivePhysicalRows(receipt, tx, tableName, 'write', next)
 }
@@ -245,7 +244,7 @@ export async function deletePhysicalStorageKeys<Row, Key>(
   keys: readonly Key[],
 ): Promise<void> {
   if (keys.length === 0) return
-  const receipt = recordConstructivePhysicalWrite(tx, tableName, 'delete', keys)
+  const receipt = recordSemanticOperationExactPhysicalWrite(tx, tableName, 'delete', keys)
   await tx.table<Row, Key>(tableName).bulkDelete([...keys])
   recordConstructivePhysicalKeys(receipt, tableName, 'delete', keys)
 }
@@ -292,7 +291,7 @@ function recordConstructivePhysicalRows<Row>(
 ): void {
   if (!receipt) return
   const keyPath = tx.table(tableName).schema.primKey.keyPath
-  if (keyPath === null || keyPath === undefined) {
+  if (keyPath === undefined) {
     throw new Error(`SemanticOperationPhysicalKeyPathMissing:${tableName}`)
   }
   const keyPaths = Array.isArray(keyPath) ? keyPath : [keyPath]
@@ -301,29 +300,6 @@ function recordConstructivePhysicalRows<Row>(
     return values.length === 1 ? values[0] : values
   })
   recordConstructivePhysicalKeys(receipt, tableName, mutationOperation, keys)
-}
-
-function recordConstructivePhysicalWrite(
-  tx: Transaction,
-  tableName: PhysicalStorageTableName,
-  operation: SemanticOperationPhysicalWriteOperation,
-  values: readonly unknown[],
-): SemanticOperationExactReceiptAccumulator<PhysicalStorageTableName> | undefined {
-  const receipt = boundSemanticOperationExactReceiptAccumulator<PhysicalStorageTableName>(tx)
-  if (!receipt) return undefined
-  let estimatedBytes = 0
-  for (const value of values) {
-    estimatedBytes = saturatingAdd(estimatedBytes, estimateStoredValueBytes(value))
-  }
-  receipt.physicalWrite({
-    tableName,
-    operation,
-    requestCount: 1,
-    rowCount: values.length,
-    maxRequestRows: values.length,
-    estimatedBytes,
-  })
-  return receipt
 }
 
 function physicalStorageRowKeyPathValue(row: unknown, keyPath: string): unknown {
@@ -653,13 +629,13 @@ async function applyConfigurationProfileUsageDeltas(
       { ...state, revision: state.revision + 1 },
       state,
     )
-    recordBrowserCommandInvalidation(tx, {
-      kind: 'profile',
-      profileIds: deltas.map((delta) => delta.id),
-      facets: ['dependent-counts'],
-    })
     profileManagerRevisionChanged = true
   }
+  recordBrowserCommandInvalidation(tx, {
+    kind: 'profile',
+    profileIds: deltas.map((delta) => delta.id),
+    facets: ['dependent-counts'],
+  })
   return {
     readRequests,
     mutations: Object.freeze(
@@ -825,12 +801,7 @@ export async function deleteLinkedSemanticByteOwnerBatchRepairingLinks<
     throw new Error(`SemanticByteOwnerBatchIdentityMismatch:${tableName}`)
   }
   const ownerKind = linkedSemanticByteOwnerKind(tableName)
-  await deletePhysicalStorageRows<AllSemanticByteOwnerRow, string>(
-    tx,
-    tableName,
-    keys as string[],
-    previous,
-  )
+  await deletePhysicalStorageRows<AllSemanticByteOwnerRow, string>(tx, tableName, keys, previous)
   for (const row of previous) recordSemanticConfigurationMutation(tx, tableName, row, undefined)
   await applyConfigurationOwnerLinkTransitions(
     tx,

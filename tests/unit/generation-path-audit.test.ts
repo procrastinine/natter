@@ -142,14 +142,25 @@ describe('generation request path audit', () => {
     }
   })
 
-  it('routes every browser configuration lock and fenced transaction through one revalidated plan executor', () => {
+  it('routes every browser configuration operation through one semantic plan executor', () => {
     const configuration = withoutComments(
       readFileSync(resolve(SRC_ROOT, 'store/browser-configuration-domain.ts'), 'utf8'),
     )
-    expect(configuration.match(/\bcommandMeta\.withLocks\s*\(/gu)).toHaveLength(1)
-    expect(configuration.match(/\blocked\.runTransaction\s*\(/gu)).toHaveLength(1)
-    expect(configuration.match(/for\s*\(;;\)\s*\{/gu)).toHaveLength(1)
-    expect(configuration).toContain('revalidateConfigurationRequestTarget')
+    const browser = withoutComments(
+      readFileSync(resolve(SRC_ROOT, 'store/browser-repo.ts'), 'utf8'),
+    )
+    expect(configuration.match(/\bcommandMeta\.executeSemanticOperation\s*[<(]/gu)).toHaveLength(14)
+    expect(configuration).not.toMatch(/\bcommandMeta\.withLocks\s*\(/u)
+    expect(configuration).not.toMatch(/\blocked\.runTransaction\s*\(/u)
+    expect(configuration).not.toMatch(/\.transaction\s*\(/u)
+    expect(browser).toContain(
+      'return this.lockSession.withResourceLocks(resourceNames, async (grant) => {',
+    )
+    expect(browser).toContain(
+      'return this.runTransaction(grant, descriptor.transaction, operation, {',
+    )
+    expect(configuration).toContain('chatRequestTargetOperationDescriptor')
+    expect(configuration).toContain('semanticOperationExactReceiptReplayProofContract')
     expect(configuration).toContain("'chat-preset.apply': applyChatPreset")
   })
 

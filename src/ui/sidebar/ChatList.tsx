@@ -16,11 +16,7 @@ import {
   useRef,
   useState,
 } from 'react'
-import type { CommittedConversationImport } from '../../app/conversation-actions'
-import {
-  type ConversationActions,
-  loadConversationActions,
-} from '../../app/conversation-actions-capability'
+import { loadConversationActions } from '../../app/conversation-actions-capability'
 import { definePresentationInteraction } from '../../app/presentation-interactions'
 import {
   beginRouteIntent,
@@ -85,9 +81,9 @@ const sidebarArchiveInteraction = definePresentationInteraction<ChatId>({
 
 import { exportLastUpdatedChatAsTxt, triggerBrowserDownload } from '../import-export/chat-download'
 import {
-  forEachJsonOrZipFile,
   importExportErrorMessage,
   natterJsonFilename,
+  readJsonOrZipFile,
   triggerJsonDownload,
 } from '../import-export/json-file'
 import { Button, IconButton } from '../primitives/Button'
@@ -621,66 +617,43 @@ export const ChatList = memo(function ChatList({
       const routeIntent = beginRouteIntent()
       setImportingChat(true)
       try {
-        const imported = {
-          count: 0,
-          last: null as CommittedConversationImport | null,
-        }
-        let conversationActions: ConversationActions | null = null
-        let importError: unknown
         try {
           const actions = await loadConversationActions()
-          conversationActions = actions
-          await forEachJsonOrZipFile(file, async (value) => {
-            const committed = await actions.commitConversationImport(
-              value,
-              routeIntentOwner(routeIntent),
-            )
-            if (imported.last?.routeDelivery.kind === 'handoff') {
-              imported.last.routeDelivery.handoff.cancel()
-            }
-            imported.last = committed
-            imported.count += 1
-          })
-        } catch (error) {
-          importError = error
-        }
-        if (imported.count === 0) {
-          if (importError !== undefined) {
-            console.error('Failed to import chat JSON/ZIP', importError)
-            pushToast({ level: 'danger', text: importExportErrorMessage(importError) })
-          }
-          return
-        }
-        if (importError === undefined) {
+          const values = await readJsonOrZipFile(file)
+          const committed = await actions.commitConversationImports(
+            values,
+            routeIntentOwner(routeIntent),
+          )
+          const importedCount = committed.results.length
           pushToast({
             level: 'success',
-            text: imported.count === 1 ? 'Imported chat.' : `Imported ${imported.count} chats.`,
+            text: importedCount === 1 ? 'Imported chat.' : `Imported ${importedCount} chats.`,
             durationMs: 2500,
           })
-        } else {
-          console.error('Chat import stopped after committed entries', importError)
-          pushToast({
-            level: 'danger',
-            text: `Imported ${imported.count} before another file failed: ${importExportErrorMessage(importError)}`,
-          })
-        }
-        if (imported.last && conversationActions && isRouteIntentCurrent(routeIntent)) {
-          try {
-            const delivery = conversationActions.acceptCommittedConversationImport(imported.last)
-            if (delivery.kind === 'handoff') {
-              navigateToChatForIntent(routeIntent, imported.last.result.chatId, delivery.handoff)
+          if (isRouteIntentCurrent(routeIntent)) {
+            try {
+              const delivery = actions.acceptCommittedConversationImports(committed)
+              if (delivery.kind === 'handoff') {
+                const last = committed.results.at(-1)
+                if (!last) throw new Error('ConversationImportCommittedResultMissing')
+                navigateToChatForIntent(routeIntent, last.chatId, delivery.handoff)
+              }
+            } catch (error) {
+              if (committed.routeDelivery.kind === 'handoff') {
+                committed.routeDelivery.handoff.cancel()
+              }
+              console.error('Chat import committed but its local navigation handoff failed', error)
+              pushToast({
+                level: 'warning',
+                text: 'The chats were imported, but the last chat could not be opened automatically.',
+              })
             }
-          } catch (error) {
-            console.error('Chat import committed but its local navigation handoff failed', error)
-            pushToast({
-              level: 'danger',
-              text: 'The chat was imported, but could not be opened automatically.',
-            })
+          } else if (committed.routeDelivery.kind === 'handoff') {
+            committed.routeDelivery.handoff.cancel()
           }
-        } else {
-          if (imported.last?.routeDelivery.kind === 'handoff') {
-            imported.last.routeDelivery.handoff.cancel()
-          }
+        } catch (error) {
+          console.error('Failed to import chat JSON/ZIP', error)
+          pushToast({ level: 'danger', text: importExportErrorMessage(error) })
         }
       } finally {
         cancelRouteIntent(routeIntent)

@@ -1,4 +1,11 @@
-import { type KeyboardEvent, type MouseEvent, useEffect, useRef, useState } from 'react'
+import {
+  type KeyboardEvent,
+  type MouseEvent,
+  type PointerEvent,
+  useEffect,
+  useRef,
+  useState,
+} from 'react'
 import { chatHref } from '../../app/router'
 import type { ActiveBranchForkSlot } from '../../core/active-branch-spine'
 import type { ChatId, Message } from '../../core/types'
@@ -23,6 +30,7 @@ export function BranchControls({ chatId, message, context }: BranchControlsProps
   const [draft, setDraft] = useState('')
   const inputRef = useRef<HTMLInputElement | null>(null)
   const committedRef = useRef(false)
+  const pointerJumpRef = useRef<string | null>(null)
 
   useEffect(() => {
     if (!editing) return
@@ -45,6 +53,16 @@ export function BranchControls({ chatId, message, context }: BranchControlsProps
     (targetId: string, position: number) => (event: MouseEvent<HTMLAnchorElement>) => {
       if (hasModifiedActivation(event)) return
       event.preventDefault()
+      if (event.detail > 0 && pointerJumpRef.current === targetId) {
+        pointerJumpRef.current = null
+        return
+      }
+      jumpTo(targetId, position)
+    }
+  const handleJumpPointerDown =
+    (targetId: string, position: number) => (event: PointerEvent<HTMLAnchorElement>) => {
+      if (hasModifiedActivation(event)) return
+      pointerJumpRef.current = targetId
       jumpTo(targetId, position)
     }
 
@@ -122,6 +140,7 @@ export function BranchControls({ chatId, message, context }: BranchControlsProps
           rel="noopener"
           aria-label="First variant"
           title="Jump to first variant"
+          onPointerDown={handleJumpPointerDown(slot.firstMessageId, 0)}
           onClick={handleJumpAnchor(slot.firstMessageId, 0)}
         >
           «
@@ -143,6 +162,7 @@ export function BranchControls({ chatId, message, context }: BranchControlsProps
           rel="noopener"
           aria-label="Previous variant"
           title="Previous variant ( [ )"
+          onPointerDown={handleJumpPointerDown(slot.previousMessageId, slot.position - 1)}
           onClick={handleJumpAnchor(slot.previousMessageId, slot.position - 1)}
         >
           ‹
@@ -197,6 +217,7 @@ export function BranchControls({ chatId, message, context }: BranchControlsProps
           rel="noopener"
           aria-label="Next variant"
           title="Next variant ( ] )"
+          onPointerDown={handleJumpPointerDown(slot.nextMessageId, slot.position + 1)}
           onClick={handleJumpAnchor(slot.nextMessageId, slot.position + 1)}
         >
           ›
@@ -218,6 +239,7 @@ export function BranchControls({ chatId, message, context }: BranchControlsProps
           rel="noopener"
           aria-label="Last variant"
           title="Jump to last variant"
+          onPointerDown={handleJumpPointerDown(slot.lastMessageId, slot.liveCount - 1)}
           onClick={handleJumpAnchor(slot.lastMessageId, slot.liveCount - 1)}
         >
           »
@@ -227,7 +249,9 @@ export function BranchControls({ chatId, message, context }: BranchControlsProps
   )
 }
 
-function hasModifiedActivation(event: MouseEvent<HTMLAnchorElement>): boolean {
+function hasModifiedActivation(
+  event: MouseEvent<HTMLAnchorElement> | PointerEvent<HTMLAnchorElement>,
+): boolean {
   return (
     event.defaultPrevented ||
     event.button !== 0 ||

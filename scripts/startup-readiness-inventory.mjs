@@ -253,6 +253,12 @@ export const STARTUP_RUNTIME_RESOURCES = Object.freeze([
     'src/store/browser-workspace-lifecycle.ts',
   ),
   resource(
+    'configuration-model-resolution',
+    'producer',
+    ['attach', 'activate'],
+    'src/store/browser-workspace-lifecycle.ts',
+  ),
+  resource(
     'stream-recovery',
     'producer',
     ['attach', 'activate'],

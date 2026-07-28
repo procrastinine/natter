@@ -224,9 +224,9 @@ describe('generation lifecycle contract', () => {
       () => finiteStream(completionChunk('intent-owned answer')),
     )
     await prepareObserved
-    let intentIds: string[] = []
+    const sendBinding = currentTranscriptBinding()
+    const intentIds = sendBinding.intentPresentations.map(({ message }) => message.id)
     try {
-      const sendBinding = currentTranscriptBinding()
       expect(sendBinding.intentPresentations.map(({ message }) => message)).toMatchObject([
         {
           chatId: chat.id,
@@ -241,7 +241,6 @@ describe('generation lifecycle contract', () => {
         },
       ])
       expect(await messages(chat.id)).toEqual([])
-      intentIds = sendBinding.intentPresentations.map(({ message }) => message.id)
     } finally {
       releasePrepare()
     }
@@ -275,11 +274,21 @@ describe('generation lifecycle contract', () => {
         content: [],
         generation: { status: 'preparing' },
       })
+      expect(regenerateBinding.intentPresentations[0]?.replacesFromMessageId).toBe(
+        sendPrepared.assistantMessageId,
+      )
+      regeneratedIntentId = regenerateBinding.intentPresentations[0]?.message.id
+      expect(regenerateBinding.intentPresentations[0]?.fork).toMatchObject({
+        selectedMessageId: regeneratedIntentId,
+        position: 1,
+        liveCount: 2,
+        previousMessageId: sendPrepared.assistantMessageId,
+        nextMessageId: null,
+      })
       expect(
         (await messages(chat.id)).find((message) => message.id === sendPrepared.assistantMessageId)
           ?.content,
       ).toEqual([{ type: 'output_text', text: 'intent-owned answer' }])
-      regeneratedIntentId = regenerateBinding.intentPresentations[0]?.message.id
     } finally {
       releasePrepare()
     }

@@ -51,7 +51,11 @@ import type {
   RegenerateMessageOptions,
   WorkspaceFence,
 } from '../store/presentation-contracts'
-import { runWorkspaceActionAtFence } from '../store/workspace-runtime'
+import {
+  getWorkspaceRuntimeState,
+  runWorkspaceActionAtFence,
+  subscribeWorkspaceRuntimeState,
+} from '../store/workspace-runtime'
 import { useToastStore } from '../store/zustand/toastStore'
 import { useUiStore } from '../store/zustand/uiStore'
 import { ConversationActionUnavailableError } from './presentation-interactions'
@@ -141,9 +145,9 @@ export interface ConversationImportInput {
   }[]
 }
 
-export interface CommittedConversationImport {
-  readonly kind: 'conversation-import-committed'
-  readonly result: ConversationCommittedResult<ImportChatResult>
+export interface CommittedConversationImports {
+  readonly kind: 'conversation-imports-committed'
+  readonly results: readonly ConversationCommittedResult<ImportChatResult>[]
   readonly routeDelivery: ConversationRouteDelivery
 }
 
@@ -166,12 +170,16 @@ async function runConversationAction(label: string, action: () => Promise<void>)
   }
 }
 
-async function commitConversationImport(
-  value: unknown,
+async function commitConversationImports(
+  values: readonly unknown[],
   routeOwner: ConversationRouteOwner,
-  options: ImportChatOptions = {},
-): Promise<CommittedConversationImport> {
-  const chatId = newId()
+  options: readonly ImportChatOptions[] = [],
+): Promise<CommittedConversationImports> {
+  if (values.length === 0) throw new Error('ConversationImportBatchEmpty')
+  await awaitConversationImportWorkspace(routeOwner)
+  const chatIds = values.map(() => newId())
+  const chatId = chatIds.at(-1)
+  if (!chatId) throw new Error('ConversationImportDestinationMissing')
   const operation = conversationController.claimOperation({
     chatId,
     steering: 'select-result',
@@ -181,21 +189,30 @@ async function commitConversationImport(
   let routeDelivery: ConversationRouteDelivery | undefined
   let routeHandoffTransferred = false
   try {
-    const result = await interchangeApplication.importChat(
-      value,
-      { ...options, destinationChatId: chatId },
+    const results = await interchangeApplication.importChats(
+      values,
+      chatIds.map((destinationChatId, index) => ({
+        ...options[index],
+        destinationChatId,
+      })),
       (committed) => {
+        const selected = committed.at(-1)
+        if (!selected) throw new Error('ConversationImportCommittedResultMissing')
         const receipt = conversationController.acceptLocalResult(operation, {
           kind: 'select-committed',
-          receipt: committed,
-          committedEffect: committed.committedEffect,
+          receipt: selected,
+          committedEffect: selected.committedEffect,
         })
         if (receipt.accepted) routeDelivery = receipt.routeDelivery
       },
     )
-    if (!routeDelivery) throw new Error('ConversationImportRouteDeliveryMissing')
-    routeHandoffTransferred = routeDelivery.kind === 'handoff'
-    return Object.freeze({ kind: 'conversation-import-committed', result, routeDelivery })
+    const committedRouteDelivery = routeDelivery ?? Object.freeze({ kind: 'superseded' as const })
+    routeHandoffTransferred = committedRouteDelivery.kind === 'handoff'
+    return Object.freeze({
+      kind: 'conversation-imports-committed',
+      results,
+      routeDelivery: committedRouteDelivery,
+    })
   } finally {
     if (!routeHandoffTransferred && routeDelivery?.kind === 'handoff') {
       routeDelivery.handoff.cancel()
@@ -204,8 +221,58 @@ async function commitConversationImport(
   }
 }
 
-function acceptCommittedConversationImport(
-  commit: CommittedConversationImport,
+function awaitConversationImportWorkspace(routeOwner: ConversationRouteOwner): Promise<void> {
+  if (conversationController.getSnapshot().workspaceId !== null) return Promise.resolve()
+  if (routeOwner.signal.aborted)
+    return Promise.reject(conversationImportAbortError(routeOwner.signal))
+  const runtimeState = getWorkspaceRuntimeState()
+  if (runtimeState === 'FAILED_CLOSED' || runtimeState === 'SEALED') {
+    return Promise.reject(new Error('The workspace is unavailable. Reload before importing.'))
+  }
+  return new Promise<void>((resolve, reject) => {
+    let settled = false
+    let unsubscribeConversation: () => void = () => undefined
+    let unsubscribeRuntime: () => void = () => undefined
+    const cleanup = () => {
+      unsubscribeConversation()
+      unsubscribeRuntime()
+      routeOwner.signal.removeEventListener('abort', inspect)
+    }
+    const settle = (publish: () => void) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      publish()
+    }
+    const inspect = () => {
+      if (routeOwner.signal.aborted) {
+        settle(() => reject(conversationImportAbortError(routeOwner.signal)))
+        return
+      }
+      if (conversationController.getSnapshot().workspaceId !== null) {
+        settle(resolve)
+        return
+      }
+      const state = getWorkspaceRuntimeState()
+      if (state === 'FAILED_CLOSED' || state === 'SEALED') {
+        settle(() => reject(new Error('The workspace is unavailable. Reload before importing.')))
+      }
+    }
+    unsubscribeConversation = conversationController.subscribe(inspect)
+    unsubscribeRuntime = subscribeWorkspaceRuntimeState(inspect)
+    routeOwner.signal.addEventListener('abort', inspect, { once: true })
+    inspect()
+  })
+}
+
+function conversationImportAbortError(signal: AbortSignal): Error {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new Error('Conversation import aborted.', { cause: signal.reason })
+}
+
+function acceptCommittedConversationImports(
+  commit: CommittedConversationImports,
 ): ConversationRouteDelivery {
   return commit.routeDelivery
 }
@@ -218,8 +285,8 @@ export const conversationActions = {
   sendNewChatWhenCapabilitySettles,
   replyToMessage,
   replyToMessageWhenCapabilitySettles,
-  commitConversationImport,
-  acceptCommittedConversationImport,
+  commitConversationImports,
+  acceptCommittedConversationImports,
 
   async editMessage(chatId: ChatId, message: Message, text: string): Promise<void> {
     try {

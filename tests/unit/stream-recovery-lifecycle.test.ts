@@ -20,7 +20,7 @@ import {
   streamRecoveryDiagnosticsSnapshot,
   streamRecoveryRuntimeSnapshot,
 } from '../../src/store/stream-recovery'
-import type { WorkspaceRepository } from '../../src/store/workspace-protocol'
+import type { WorkspaceCommand, WorkspaceRepository } from '../../src/store/workspace-protocol'
 import {
   __resetWorkspaceRepositoryForTests,
   __setWorkspaceRepositoryForTests,
@@ -144,11 +144,13 @@ class ObservableExclusiveLockManager {
 
 interface LeaseQueryProbe {
   completed(): number
+  nextCommandCompletion(kind: WorkspaceCommand['kind']): Promise<void>
 }
 
 function installLeaseQueryProbe(): LeaseQueryProbe {
   const target = getBrowserRepository()
   let completed = 0
+  const commandWaiters = new Map<WorkspaceCommand['kind'], Set<() => void>>()
   const repository: WorkspaceRepository = {
     query: async (permit, query, options) => {
       const result = await target.query(permit, query, options)
@@ -161,13 +163,25 @@ function installLeaseQueryProbe(): LeaseQueryProbe {
       }
       return result
     },
-    execute: target.execute.bind(target),
+    execute: async (permit, command, options) => {
+      const result = await target.execute(permit, command, options)
+      const waiters = commandWaiters.get(command.kind)
+      commandWaiters.delete(command.kind)
+      for (const resolve of waiters ?? []) resolve()
+      return result
+    },
     replace: target.replace.bind(target),
     subscribeChanges: target.subscribeChanges.bind(target),
   }
   __setWorkspaceRepositoryForTests(repository)
   return {
     completed: () => completed,
+    nextCommandCompletion: (kind) =>
+      new Promise<void>((resolve) => {
+        const waiters = commandWaiters.get(kind) ?? new Set<() => void>()
+        waiters.add(resolve)
+        commandWaiters.set(kind, waiters)
+      }),
   }
 }
 
@@ -306,13 +320,14 @@ describe('stream recovery lifecycle ownership', () => {
         expect(manager.requestCount(lockName)).toBe(2)
       }
 
+      const completedBeforeRelease = probe.completed()
+      const cleanupCompleted = probe.nextCommandCompletion('stream.finish-cleanup')
       release()
-      await vi.waitFor(
-        async () => {
-          expect(await getDb().streamLeases.get(lease.streamId)).toBeUndefined()
-        },
-        { timeout: 1_000, interval: 5 },
-      )
+      await vi.waitFor(() => {
+        expect(probe.completed()).toBeGreaterThan(completedBeforeRelease)
+      })
+      await cleanupCompleted
+      expect(await getDb().streamLeases.get(lease.streamId)).toBeUndefined()
       expect(manager.pendingCount(lockName)).toBe(0)
     } finally {
       release()

@@ -473,8 +473,7 @@ class TestProjectionSource implements ConversationProjectionSource {
       slotVersion: siblings.reduce((sum, row) => sum + row.header.nodeVersion + 1, 0),
       position,
       liveCount: siblings.length,
-      nextSiblingIndex:
-        Math.max(...siblings.map((row) => row.header.siblingIndex)) + 1,
+      nextSiblingIndex: Math.max(...siblings.map((row) => row.header.siblingIndex)) + 1,
       previousMessageId: siblings[position - 1]?.header.id ?? null,
       nextMessageId: siblings[position + 1]?.header.id ?? null,
       firstMessageId: siblings[0]?.header.id as MessageId,
@@ -1417,6 +1416,10 @@ describe('conversation controller', () => {
       chatId: CHAT_ID,
       kind: 'message',
       messageId: branchA.id,
+    })
+    expect(navigation.replacements.at(-1)).toEqual({
+      chatId: CHAT_ID,
+      targetMessageId: branchA.id,
     })
     await settle()
 
@@ -3121,7 +3124,7 @@ describe('conversation controller', () => {
     expect(source.loadPreviews).not.toHaveBeenCalled()
   })
 
-  it('loads forks for every parent admitted by the first demanded transcript window', async () => {
+  it('reuses exact selection forks for every parent in the first demanded transcript window', async () => {
     const root = message('root', null, 0, 'root', 1)
     const left = message('left', root.id, 0, 'left', 2)
     const leftTip = message('left-tip', left.id, 0, 'left tip', 3)
@@ -3158,11 +3161,7 @@ describe('conversation controller', () => {
       liveCount: 2,
       nextMessageId: right.id,
     })
-    expect(
-      source.loadForks.mock.calls.some(([, , targets]) =>
-        targets.some((target) => target.parentId === root.id),
-      ),
-    ).toBe(true)
+    expect(source.loadForks).not.toHaveBeenCalled()
     controller.setTranscriptDemand(owner, null)
   })
 })

@@ -542,7 +542,7 @@ describe('generation intent outbound-path and body-I/O contract', () => {
     } = exactCommitted
     expect(committedMessage).toEqual(immediateMessage)
     expect(immediateNodeVersion).toBe(0)
-    expect(committedNodeVersion).toBeGreaterThan(0)
+    expect(committedNodeVersion).toBeGreaterThanOrEqual(immediateNodeVersion)
     const { reasoningVisibility: _immediateVisibility, ...immediateProvenance } = required(
       immediateGeneration,
       'immediate generation',

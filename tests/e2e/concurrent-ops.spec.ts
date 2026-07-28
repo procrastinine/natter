@@ -795,6 +795,7 @@ test('a remote extension then newer sibling keeps each tab on its own branch wit
       messageCountDecreased: false,
       messageCountsIncludeZero: false,
       minimumMessageCount: expect.any(Number),
+      minimumBranchControlCount: 0,
       commonPrefixDisconnectedIds: [],
       commonPrefixReplacedIds: [],
       messageCountBelowExpectedCommonPrefix: false,

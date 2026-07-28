@@ -9,7 +9,9 @@ import {
   sameBrowserWorkspaceReplacementJournal,
 } from './browser-workspace-database-control'
 import {
+  type BrowserWorkspaceSlotTransition,
   tryWithBrowserWorkspaceSelectionGate,
+  withBrowserWorkspaceSelectionGate,
   withExclusiveBrowserWorkspaceSlots,
 } from './browser-workspace-slot-coordination'
 
@@ -22,6 +24,23 @@ export type BrowserWorkspaceDatabaseCleanupResult =
       readonly databaseName: string
     }
   | { readonly status: 'changed' }
+
+export type QuiescedBrowserWorkspaceReplacementRecovery =
+  | {
+      readonly kind: 'committed'
+      readonly databaseName: string
+      readonly activationSequence: number
+    }
+  | {
+      readonly kind: 'uncommitted'
+      readonly databaseName: string
+      readonly activationSequence: number
+    }
+  | {
+      readonly kind: 'advanced'
+      readonly databaseName: string
+      readonly activationSequence: number
+    }
 
 export async function cleanPendingBrowserWorkspaceDatabase(
   signal?: AbortSignal,
@@ -36,21 +55,60 @@ export async function cleanPendingBrowserWorkspaceDatabase(
     if (claimed.kind === 'changed') return { status: 'changed' }
     journal = claimed.journal
   }
-  const databaseName = obsoleteDatabaseName(journal)
-  return withExclusiveBrowserWorkspaceSlots(
-    [databaseName],
-    async () => {
-      if (signal?.aborted) throw signal.reason
-      const confirmed = await readBrowserWorkspaceDatabaseManifest()
-      if (!sameBrowserWorkspaceReplacementJournal(confirmed.pending, journal)) {
-        return { status: 'changed' as const }
+  return cleanJournaledBrowserWorkspaceDatabase(journal, signal)
+}
+
+export function recoverQuiescedBrowserWorkspaceReplacement(
+  transition: BrowserWorkspaceSlotTransition,
+  signal?: AbortSignal,
+): Promise<QuiescedBrowserWorkspaceReplacementRecovery> {
+  return withBrowserWorkspaceSelectionGate(async () => {
+    if (signal?.aborted) throw signal.reason
+    let manifest = await readBrowserWorkspaceDatabaseManifest()
+    let journal = manifest.pending
+    if (journal?.phase === 'preparing' && sameBrowserWorkspaceSlotTransition(journal, transition)) {
+      await abandonPreparedBrowserWorkspaceDatabase(journal)
+      manifest = await readBrowserWorkspaceDatabaseManifest()
+      journal = manifest.pending
+      if (
+        journal?.phase !== 'discard' ||
+        !sameBrowserWorkspaceSlotTransition(journal, transition)
+      ) {
+        throw new Error('BrowserWorkspaceQuiescedRecoveryJournalChanged')
       }
-      await Dexie.delete(databaseName)
-      if (signal?.aborted) throw signal.reason
-      await completeBrowserWorkspaceDatabaseCleanup(journal)
-      return { status: 'cleaned' as const, phase: journal.phase, databaseName }
-    },
-    signal,
+    }
+    if (journal && !sameBrowserWorkspaceSlotTransition(journal, transition)) {
+      return {
+        kind: 'advanced',
+        databaseName: manifest.activeDatabaseName,
+        activationSequence: manifest.activationSequence,
+      }
+    }
+    const recovery = {
+      databaseName: manifest.activeDatabaseName,
+      activationSequence: manifest.activationSequence,
+    }
+    if (manifest.activeDatabaseName === transition.destinationDatabaseName) {
+      return { kind: 'committed', ...recovery }
+    }
+    if (manifest.activeDatabaseName === transition.sourceDatabaseName) {
+      return { kind: 'uncommitted', ...recovery }
+    }
+    return { kind: 'advanced', ...recovery }
+  }, signal)
+}
+
+function sameBrowserWorkspaceSlotTransition(
+  journal:
+    | BrowserWorkspaceReplacementPreparing
+    | BrowserWorkspaceReplacementDiscard
+    | BrowserWorkspaceReplacementCleanup,
+  transition: BrowserWorkspaceSlotTransition,
+): boolean {
+  return (
+    journal.nonce === transition.nonce &&
+    journal.sourceDatabaseName === transition.sourceDatabaseName &&
+    journal.destinationDatabaseName === transition.destinationDatabaseName
   )
 }
 
@@ -80,4 +138,26 @@ function obsoleteDatabaseName(
   journal: BrowserWorkspaceReplacementDiscard | BrowserWorkspaceReplacementCleanup,
 ): BrowserWorkspaceReplacementDiscard['destinationDatabaseName'] {
   return journal.phase === 'discard' ? journal.destinationDatabaseName : journal.sourceDatabaseName
+}
+
+function cleanJournaledBrowserWorkspaceDatabase(
+  journal: BrowserWorkspaceReplacementDiscard | BrowserWorkspaceReplacementCleanup,
+  signal?: AbortSignal,
+): Promise<BrowserWorkspaceDatabaseCleanupResult> {
+  const databaseName = obsoleteDatabaseName(journal)
+  return withExclusiveBrowserWorkspaceSlots(
+    [databaseName],
+    async () => {
+      if (signal?.aborted) throw signal.reason
+      const confirmed = await readBrowserWorkspaceDatabaseManifest()
+      if (!sameBrowserWorkspaceReplacementJournal(confirmed.pending, journal)) {
+        return { status: 'changed' as const }
+      }
+      await Dexie.delete(databaseName)
+      if (signal?.aborted) throw signal.reason
+      await completeBrowserWorkspaceDatabaseCleanup(journal)
+      return { status: 'cleaned' as const, phase: journal.phase, databaseName }
+    },
+    signal,
+  )
 }

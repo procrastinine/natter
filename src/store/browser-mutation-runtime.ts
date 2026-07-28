@@ -71,7 +71,7 @@ import {
 } from './attachment-storage'
 import {
   type BrowserCommandMessageRevisionFact,
-  recordBrowserCommandAttachmentIntegrityMaintenance,
+  recordBrowserCommandAttachmentIntegrityRepairRequest,
   recordBrowserCommandAttachmentReferenceState,
   recordBrowserCommandInvalidation,
   recordBrowserCommandMessageRevisions,
@@ -123,11 +123,14 @@ import { readDiscoveryCacheRow } from './discovery-cache-storage'
 import { generationAdmissionDecision } from './generation-admission'
 import {
   compileCurrentMessageTransition,
+  compileCurrentMessageUpdateCandidate,
+  finalizeCurrentMessageUpdateTransition,
   type MessageBodyRow,
   type MessageHeaderRow,
   type MessageTextPreviewRow,
   projectMessageTextPreview,
   syncMessageHeaderProjections,
+  transitionMessageAttachmentRefs,
 } from './message-storage'
 import type {
   AttachmentBundle,
@@ -423,6 +426,9 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
   ) {
     throw new Error(`StreamCanonicalCommitFenceMismatch:${options.streamCanonicalCommit.streamId}`)
   }
+  if (options?.allowMissingCanonicalChatId && !options.streamCanonicalCommit) {
+    throw new Error('MissingCanonicalChatAllowanceWithoutCommit')
+  }
   if (options?.workspaceFence) {
     commandCommit.assertReplacementEpoch(options.workspaceFence.replacementEpoch)
   }
@@ -580,6 +586,12 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
         }
         ownedStreamLease = lease
         if (
+          options.allowMissingCanonicalChatId &&
+          lease.chatId !== options.allowMissingCanonicalChatId
+        ) {
+          throw new Error(`MissingCanonicalChatAllowanceMismatch:${lease.streamId}`)
+        }
+        if (
           !options.streamTargetCommit &&
           !options.streamCanonicalCommit &&
           !streamLeaseHasCommittedTarget(lease)
@@ -589,6 +601,7 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
       }
       const { assertScope } = operationPlan
       const chatStates = new Map<ChatId, ChatMutationState>()
+      const absentChatIds = new Set<ChatId>()
       const draftReads = new Map<ChatId, DraftRow | undefined>()
       const messageCreationClock = new TransactionMessageCreationClock()
       const dirtyChildLists = new Map<string, ChildListState>()
@@ -654,17 +667,27 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
         if (!scopes.some((scope) => scope.kind === 'attachment')) {
           throw new Error(`UndeclaredAttachmentReferenceScope:${input.ownerKind}:${input.ownerId}`)
         }
-        await applyAttachmentReferenceOwnerTransitions(tx, [input], now, (attachmentId) =>
-          assertScope({ kind: 'attachment', attachmentId }),
+        await applyAttachmentReferenceOwnerTransitions(
+          tx,
+          [input],
+          now,
+          (attachmentId) => assertScope({ kind: 'attachment', attachmentId }),
+          input.validateUnchangedTargets === true,
         )
       }
 
-      const ensureChatState = async (chatId: ChatId): Promise<ChatMutationState> => {
+      const loadChatState = async (
+        chatId: ChatId,
+        allowMissing: boolean,
+      ): Promise<ChatMutationState | undefined> => {
         const existing = chatStates.get(chatId)
         if (existing) return existing
+        if (absentChatIds.has(chatId)) {
+          if (allowMissing) return undefined
+          throw new ChatMissingError(chatId)
+        }
         const chatRead = await chatMutation.readWithEvidence(chatId)
         const beforeChat = chatRead.chat
-        if (!beforeChat) throw new ChatMissingError(chatId)
         if (operationPlan.descriptor.exactPhysicalReads && chatRead.requestCount > 0) {
           receiptAccumulator.physicalRead({
             tableName: 'chats',
@@ -673,6 +696,11 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
             requestCount: chatRead.requestCount,
             rowCount: chatRead.rowCount,
           })
+        }
+        if (!beforeChat) {
+          absentChatIds.add(chatId)
+          if (allowMissing) return undefined
+          throw new ChatMissingError(chatId)
         }
         const state: ChatMutationState = {
           beforeChat,
@@ -693,6 +721,12 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
           changedMessageIds: new Set<MessageId>(),
         }
         chatStates.set(chatId, state)
+        return state
+      }
+
+      const ensureChatState = async (chatId: ChatId): Promise<ChatMutationState> => {
+        const state = await loadChatState(chatId, false)
+        if (!state) throw new ChatMissingError(chatId)
         return state
       }
 
@@ -725,7 +759,7 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
           scope.kind === 'chat-topology' ||
           scope.kind === 'children'
         ) {
-          await ensureChatState(scope.chatId)
+          await loadChatState(scope.chatId, options?.allowMissingCanonicalChatId === scope.chatId)
         }
       }
 
@@ -1083,7 +1117,7 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
           requestCount: 1,
           rowCount: 1,
         })
-        recordBrowserCommandAttachmentIntegrityMaintenance(tx)
+        recordBrowserCommandAttachmentIntegrityRepairRequest(tx)
         attachmentIntegrityRepairRequested = true
       }
 
@@ -1107,6 +1141,7 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
       const ctx: MutationContext = {
         getChat: async (chatId) => {
           const state = chatStates.get(chatId)
+          if (absentChatIds.has(chatId)) return undefined
           if (!state) return tx.table<Chat, ChatId>('chats').get(chatId)
           return materializeChatMutationState(state)
         },
@@ -1219,20 +1254,9 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
           if (existing) {
             assertExistingMessageIdentity(existing, clone)
             if (!existingBody) throw new Error(`MessageBodyMissing:${clone.id}`)
-            const comparable = { ...clone, nodeVersion: existing.nodeVersion }
-            const comparableTransition = compileCurrentMessageTransition(comparable, {
-              bodyVersion: existing.bodyVersion,
-              requestContextVersion: existing.requestContextVersion,
-              updatedAt: existingBody.updatedAt,
-              previousAttachmentRefs: existing.attachmentRefs,
-              timestamp: 'exact',
-              custody: { kind: 'preserve' },
-            })
-            const comparableSplit = comparableTransition.storage
-            const headerChanged =
-              stableStringify(existing) !== stableStringify(comparableSplit.header)
-            const bodyChanged =
-              stableStringify(existingBody) !== stableStringify(comparableSplit.body)
+            const candidate = compileCurrentMessageUpdateCandidate(clone, existing, existingBody)
+            const comparableSplit = candidate.transition.storage
+            const { headerChanged, bodyChanged } = candidate
             if (!headerChanged && !bodyChanged) {
               return hydrateStoredMessage(existing, existingBody)
             }
@@ -1265,42 +1289,27 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
               previewState.previewDirty = true
             }
             if (touchChatSummary) {
-              messageSummaryChanged = recordMessageSummaryDeltas(
+              messageSummaryChanged = recordMessageHeaderSummaryDeltas(
                 state,
                 clone.id,
-                hydrateStoredMessage(existing, existingBody),
-                clone,
+                existing,
+                comparableSplit.header,
               )
             }
             recordHeaderBeforeWrite(state, clone.id, existing)
             clone.nodeVersion = existing.nodeVersion + 1
             const requestContextVersion =
               existing.requestContextVersion + (semantics.requestContextChanged ? 1 : 0)
-            let header: MessageHeaderRow
-            let transition: ReturnType<typeof compileCurrentMessageTransition> | undefined
-            if (bodyChanged) {
-              transition = compileCurrentMessageTransition(clone, {
-                bodyVersion: existing.bodyVersion + 1,
-                requestContextVersion,
-                updatedAt: now,
-                previousAttachmentRefs: existing.attachmentRefs,
-                timestamp: 'exact',
-                custody: { kind: 'preserve' },
-              })
-              header = transition.storage.header
-            } else {
-              header = {
-                ...comparableSplit.header,
-                nodeVersion: clone.nodeVersion,
-                requestContextVersion,
-                bodyVersion: existing.bodyVersion,
-              }
-            }
-            await syncAttachmentReferenceOwner(
-              transition?.attachmentOwner ?? comparableTransition.attachmentOwner,
-            )
+            const transition = finalizeCurrentMessageUpdateTransition(candidate, {
+              nodeVersion: clone.nodeVersion,
+              requestContextVersion,
+              bodyVersion: existing.bodyVersion + (bodyChanged ? 1 : 0),
+              bodyUpdatedAt: bodyChanged ? now : existingBody.updatedAt,
+            })
+            const { header } = transition.storage
+            await syncAttachmentReferenceOwner(transition.attachmentOwner)
             await putPhysicalStorageRow(tx, 'messages', header, existing)
-            if (transition) {
+            if (bodyChanged) {
               await replaceMessageBody(tx, transition.storage.body, {
                 kind: 'row',
                 row: existingBody,
@@ -1321,7 +1330,7 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
               )
             }
             messageHeaderReads.set(clone.id, header)
-            messageBodyReads.set(clone.id, transition?.storage.body ?? existingBody)
+            messageBodyReads.set(clone.id, bodyChanged ? transition.storage.body : existingBody)
           } else {
             if (!touchChatSummary) {
               throw new Error(`DeferredMessageWriteRequiresExistingRow:${clone.id}`)
@@ -1388,6 +1397,28 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
           }
           affectedMessageIds.add(clone.id)
           return clone
+        },
+
+        replaceMessageAttachmentRefs: async (messageId, attachmentRefs) => {
+          assertScope({ kind: 'message', messageId })
+          const existing = await readMessageHeader(messageId)
+          if (!existing) return undefined
+          const next = transitionMessageAttachmentRefs(existing, attachmentRefs)
+          if (stableStringify(existing.attachmentRefs) === stableStringify(next.attachmentRefs)) {
+            return cloneMessageHeader(existing)
+          }
+          await syncAttachmentReferenceOwner({
+            ownerKind: 'message',
+            ownerId: messageId,
+            chatId: existing.chatId,
+            previousRefs: existing.attachmentRefs,
+            nextRefs: next.attachmentRefs,
+          })
+          recordHeaderBeforeWrite(undefined, messageId, existing)
+          await putPhysicalStorageRow(tx, 'messages', next, existing)
+          messageHeaderReads.set(messageId, next)
+          affectedMessageIds.add(messageId)
+          return cloneMessageHeader(next)
         },
 
         patchMessageStructure: async (messageId, patch: MessageStructurePatch): Promise<void> => {
@@ -1880,7 +1911,7 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
             state.firstReference ||
             !state.catalogRow ||
             state.header.refCount !== state.catalogRow.refCount ||
-            (state.firstReference !== undefined) !== state.catalogRow.refCount > 0
+            state.catalogRow.refCount > 0
           ) {
             await requestAttachmentIntegrityRepair()
             return 'repair-required'
@@ -1997,6 +2028,9 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
             .where('attachmentId')
             .equals(attachmentId)
             .toArray(),
+
+        getAttachmentJob: async (jobId) =>
+          tx.table<AttachmentJob, string>('attachmentJobs').get(jobId),
 
         getAttachmentJobs: async (attachmentId) =>
           tx
@@ -2124,7 +2158,7 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
       const structuralProjectionChanges = []
       for (const state of chatStates.values()) {
         for (const [messageId, before] of state.headersBeforeWrites) {
-          const current = await tx.table<MessageHeaderRow, MessageId>('messages').get(messageId)
+          const current = await readMessageHeader(messageId)
           if (
             before &&
             current &&

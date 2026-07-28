@@ -56,11 +56,11 @@ import {
   removeTestAttempt,
   resetAttemptControllerForTests,
 } from '../helpers/attempt-controller'
+import { testChildSlotsForHeaders } from '../helpers/message-storage'
 import {
   createInteractionSettlementHarness,
   succeededInteractionSettlement,
 } from '../helpers/presentation-interactions'
-import { testChildSlotsForHeaders } from '../helpers/message-storage'
 import { reasoningEnvelopeFromDetailsForTest } from '../helpers/reasoning-events'
 
 const attachmentCatalogState = vi.hoisted(() => ({

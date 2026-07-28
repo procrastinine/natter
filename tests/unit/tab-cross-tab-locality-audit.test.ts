@@ -20,13 +20,6 @@ const AUDIT_URL = pathToFileURL(resolve(ROOT, 'scripts/audit-tab-cross-tab-local
 const INVENTORY_URL = pathToFileURL(
   resolve(ROOT, 'scripts/tab-cross-tab-locality-inventory.mjs'),
 ).href
-const KNOWN_INITIATING_OWNER_PATH_GAPS = [
-  'initiating-owner paths: missing src/store/attachment-catalog-projection.ts',
-  'initiating-owner paths: missing src/store/attachment-reference-edges.ts',
-  'initiating-owner paths: missing src/store/chat-row-transition.ts',
-  'initiating-owner paths: missing src/store/child-list-projection.ts',
-] as const
-
 interface LocalityRecord {
   readonly status: string
   readonly forbiddenRemoteSteering: readonly string[]
@@ -146,15 +139,15 @@ describe('tab and cross-tab locality audit', () => {
     const report = evaluateTabCrossTabLocality(canonicalInventory, 'inventory')
 
     expect(report).toMatchObject({
-      ok: false,
-      structurallyValid: false,
+      ok: true,
+      structurallyValid: true,
       surfaces: 20,
       records: 343,
-      constructorSites: 748,
+      constructorSites: 762,
       unconstructedOrUnadmittedSites: 4,
-      ownerClassifiedSites: 742,
-      ownerSiteGaps: 6,
-      rootAdmissionSites: 110,
+      ownerClassifiedSites: 762,
+      ownerSiteGaps: 0,
+      rootAdmissionSites: 111,
       unadmittedRoots: 0,
       childReservationSites: 3,
       unreservedChildren: 4,
@@ -171,18 +164,18 @@ describe('tab and cross-tab locality audit', () => {
       remoteBrowserOutcomeConsumers: 18,
       architectureGaps: 3,
       recordGaps: 149,
-      siteGaps: 10,
+      siteGaps: 4,
       scannerLimitations: 9,
       acceptanceCriteria: 13,
-      acceptanceSatisfied: 5,
-      acceptanceOpen: 8,
-      problems: KNOWN_INITIATING_OWNER_PATH_GAPS,
+      acceptanceSatisfied: 7,
+      acceptanceOpen: 6,
+      problems: [],
     })
     expect(report.surfaceCounts).toMatchObject({
-      'workspace-query': 66,
+      'workspace-query': 65,
       'workspace-command': 65,
       'configuration-command': 44,
-      'workspace-root': 15,
+      'workspace-root': 16,
       'workspace-child': 7,
       'generation-intent': 6,
       'conversation-selection-delivery': 2,
@@ -275,12 +268,12 @@ describe('tab and cross-tab locality audit', () => {
   it('makes every unresolved locality guarantee fatal in enforcement mode', () => {
     const report = evaluateTabCrossTabLocality(canonicalInventory, 'enforce')
 
-    expect(report.structurallyValid).toBe(false)
+    expect(report.structurallyValid).toBe(true)
     expect(report.ok).toBe(false)
     expect(report.architectureGaps).toBe(3)
     expect(report.recordGaps).toBe(149)
-    expect(report.siteGaps).toBe(10)
-    expect(report.problems).toEqual(KNOWN_INITIATING_OWNER_PATH_GAPS)
+    expect(report.siteGaps).toBe(4)
+    expect(report.problems).toEqual([])
   })
 
   it('rejects stale variants, partial classifications, owner drift, and hidden consumers', () => {

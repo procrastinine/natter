@@ -46,7 +46,6 @@ export interface BrowserWorkspaceReplacementTransitionController<T> {
   readonly phase: () => BrowserWorkspaceReplacementTransitionPhase
   readonly hasDisposition: () => boolean
   readonly ownAbandon: (operation: () => Promise<void>) => void
-  readonly ownPeerResume: (operation: () => Promise<void> | void) => void
   readonly beginQuiescing: () => void
   readonly markQuiesced: () => void
   readonly beginWriting: () => void
@@ -70,7 +69,6 @@ export function createBrowserWorkspaceReplacementTransitionController<T>(
 ): BrowserWorkspaceReplacementTransitionController<T> {
   let phase: BrowserWorkspaceReplacementTransitionPhase = 'admitted'
   let abandon: (() => Promise<void>) | null = null
-  let resume: (() => Promise<void> | void) | null = null
   let commit: BrowserWorkspaceReplacementCommit<T> | null = null
   let disposition: 'committed' | 'uncommitted' | 'unknown' | null = null
   let dispositionError: unknown
@@ -97,12 +95,6 @@ export function createBrowserWorkspaceReplacementTransitionController<T>(
         throw new Error('BrowserWorkspaceReplacementAbandonOwnerInvalid')
       }
       abandon = operation
-    },
-    ownPeerResume: (operation) => {
-      if (phase !== 'admitted' || resume) {
-        throw new Error('BrowserWorkspaceReplacementPeerResumeOwnerInvalid')
-      }
-      resume = operation
     },
     beginQuiescing: () => transition('admitted', 'quiescing'),
     markQuiesced: () => transition('quiescing', 'quiesced'),
@@ -176,7 +168,6 @@ export function createBrowserWorkspaceReplacementTransitionController<T>(
         commit,
         originalWorkspace: ports.originalWorkspace,
         initialFailures: selectionFailures,
-        resume,
         reopen: ports.reopen,
         publish: ports.publish,
       }).then((outcome) => {
@@ -196,7 +187,6 @@ async function finalizeBrowserWorkspaceReplacement<T>(input: {
   readonly commit: BrowserWorkspaceReplacementCommit<T> | null
   readonly originalWorkspace: BrowserWorkspaceSnapshot
   readonly initialFailures: readonly unknown[]
-  readonly resume: (() => Promise<void> | void) | null
   readonly reopen: () => Promise<BrowserWorkspaceSnapshot>
   readonly publish: (commit: BrowserWorkspaceReplacementCommit<T>) => Promise<void> | void
 }): Promise<BrowserWorkspaceReplacementOutcome<T>> {
@@ -213,11 +203,12 @@ async function finalizeBrowserWorkspaceReplacement<T>(input: {
     )
   }
 
-  const recovery = await Promise.allSettled([
-    input.reopen(),
-    Promise.resolve().then(() => input.resume?.()),
-  ])
-  const reopened = recovery[0]
+  const reopened = await Promise.resolve()
+    .then(input.reopen)
+    .then(
+      (value) => ({ status: 'fulfilled', value }) as const,
+      (reason: unknown) => ({ status: 'rejected', reason }) as const,
+    )
   if (reopened.status === 'rejected') {
     failures.push(reopened.reason)
   } else if (input.disposition !== 'unknown') {
@@ -229,9 +220,6 @@ async function finalizeBrowserWorkspaceReplacement<T>(input: {
       failures.push(new Error('BrowserWorkspaceReplacementReopenFenceMismatch'))
     }
   }
-  const resumed = recovery[1]
-  if (resumed.status === 'rejected') failures.push(resumed.reason)
-
   if (input.disposition === 'committed') {
     const committed = input.commit as BrowserWorkspaceReplacementCommit<T>
     return failures.length === 0
@@ -263,6 +251,7 @@ function copyPreparedReplacement<T>(
   return {
     workspace: { ...prepared.workspace },
     storageBaseline: { ...prepared.storageBaseline },
+    ...(prepared.publication ? { publication: prepared.publication } : {}),
     value: prepared.value,
   }
 }

@@ -75,26 +75,27 @@
       "cleanupRestoreObligation": "Close both raw database handles and let afterEach delete the isolated physical workspace after the upgrade assertions.",
       "publicUiCannotExpress": "The browser journey must construct an exact observed intermediate physical schema and sentinel row before current code opens and upgrades it.",
       "siteIds": [
-        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20upgrades%20once%20and%20opens%20in%20Chromium%3Ecallback%3Aonupgradeneeded::operation=indexeddb.createIndex::mode=versionchange::store=%3Cdynamic%3E%40index%3A%3Cdynamic%3E::occurrence=1",
-        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20upgrades%20once%20and%20opens%20in%20Chromium%3Ecallback%3Aonupgradeneeded::operation=indexeddb.database.create-object-store::mode=versionchange::store=%3Cdynamic%3E::occurrence=1",
-        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20upgrades%20once%20and%20opens%20in%20Chromium::operation=indexeddb.database.close::mode=-::store=-::occurrence=1",
-        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20upgrades%20once%20and%20opens%20in%20Chromium::operation=indexeddb.database.close::mode=-::store=-::occurrence=2",
-        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20upgrades%20once%20and%20opens%20in%20Chromium::operation=indexeddb.database.transaction::mode=readonly::store=settings::occurrence=1",
-        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20upgrades%20once%20and%20opens%20in%20Chromium::operation=indexeddb.database.transaction::mode=readwrite::store=settings::occurrence=1",
-        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20upgrades%20once%20and%20opens%20in%20Chromium::operation=indexeddb.factory.delete-database::mode=-::store=-::occurrence=1",
-        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20upgrades%20once%20and%20opens%20in%20Chromium::operation=indexeddb.factory.open::mode=-::store=-::occurrence=1",
-        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20upgrades%20once%20and%20opens%20in%20Chromium::operation=indexeddb.factory.open::mode=-::store=-::occurrence=2",
-        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20upgrades%20once%20and%20opens%20in%20Chromium::operation=indexeddb.get::mode=readonly::store=settings::occurrence=1",
-        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20upgrades%20once%20and%20opens%20in%20Chromium::operation=indexeddb.put::mode=readwrite::store=settings::occurrence=1",
-        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20upgrades%20once%20and%20opens%20in%20Chromium::operation=indexeddb.transaction.object-store::mode=readonly::store=settings::occurrence=1",
-        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20upgrades%20once%20and%20opens%20in%20Chromium::operation=indexeddb.transaction.object-store::mode=readwrite::store=settings::occurrence=1"
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20and%20opens%20in%20Chromium%3Ecallback%3Aonupgradeneeded::operation=indexeddb.createIndex::mode=versionchange::store=%3Cdynamic%3E%40index%3A%3Cdynamic%3E::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20and%20opens%20in%20Chromium%3Ecallback%3Aonupgradeneeded::operation=indexeddb.database.create-object-store::mode=versionchange::store=%3Cdynamic%3E::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20and%20opens%20in%20Chromium::operation=indexeddb.database.close::mode=-::store=-::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20and%20opens%20in%20Chromium::operation=indexeddb.database.close::mode=-::store=-::occurrence=2",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20and%20opens%20in%20Chromium::operation=indexeddb.database.transaction::mode=readonly::store=settings::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20and%20opens%20in%20Chromium::operation=indexeddb.database.transaction::mode=readwrite::store=settings::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20and%20opens%20in%20Chromium::operation=indexeddb.factory.delete-database::mode=-::store=-::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20and%20opens%20in%20Chromium::operation=indexeddb.factory.enumerate-databases::mode=-::store=-::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20and%20opens%20in%20Chromium::operation=indexeddb.factory.open::mode=-::store=-::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20and%20opens%20in%20Chromium::operation=indexeddb.factory.open::mode=-::store=-::occurrence=2",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20and%20opens%20in%20Chromium::operation=indexeddb.get::mode=readonly::store=settings::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20and%20opens%20in%20Chromium::operation=indexeddb.put::mode=readwrite::store=settings::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20and%20opens%20in%20Chromium::operation=indexeddb.transaction.object-store::mode=readonly::store=settings::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20and%20opens%20in%20Chromium::operation=indexeddb.transaction.object-store::mode=readwrite::store=settings::occurrence=1"
       ],
       "cleanupEvidence": {
         "siteIds": [
           "tests/e2e/startup-recovery.spec.ts::owner=hook%3AafterEach::operation=fixture.clear-indexeddb::mode=-::store=-::occurrence=1",
-          "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20upgrades%20once%20and%20opens%20in%20Chromium::operation=fixture.playwright-context-teardown::mode=-::store=-::occurrence=1",
-          "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20upgrades%20once%20and%20opens%20in%20Chromium::operation=indexeddb.database.close::mode=-::store=-::occurrence=1",
-          "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20upgrades%20once%20and%20opens%20in%20Chromium::operation=indexeddb.database.close::mode=-::store=-::occurrence=2"
+          "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20and%20opens%20in%20Chromium::operation=fixture.playwright-context-teardown::mode=-::store=-::occurrence=1",
+          "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20and%20opens%20in%20Chromium::operation=indexeddb.database.close::mode=-::store=-::occurrence=1",
+          "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20and%20opens%20in%20Chromium::operation=indexeddb.database.close::mode=-::store=-::occurrence=2"
         ],
         "fixtureOwners": [],
         "processOwned": false
@@ -172,6 +173,29 @@
         "kind": "none",
         "targets": []
       },
+      "cleanupRestoreObligation": "Use one readonly chat transaction, close the exact raw database handle, and leave the staged destination workspace unchanged.",
+      "publicUiCannotExpress": "The catch-up proof requires the exact chat title in the inactive destination database before activation, which the public UI cannot address.",
+      "siteIds": [
+        "tests/e2e/storage-reclamation.spec.ts::owner=function%3AreadChatTitleFromDatabase::operation=indexeddb.database.close::mode=-::store=-::occurrence=1",
+        "tests/e2e/storage-reclamation.spec.ts::owner=function%3AreadChatTitleFromDatabase::operation=indexeddb.database.transaction::mode=readonly::store=chats::occurrence=1",
+        "tests/e2e/storage-reclamation.spec.ts::owner=function%3AreadChatTitleFromDatabase::operation=indexeddb.factory.open::mode=-::store=-::occurrence=1",
+        "tests/e2e/storage-reclamation.spec.ts::owner=function%3AreadChatTitleFromDatabase::operation=indexeddb.get::mode=readonly::store=chats::occurrence=1",
+        "tests/e2e/storage-reclamation.spec.ts::owner=function%3AreadChatTitleFromDatabase::operation=indexeddb.transaction.object-store::mode=readonly::store=chats::occurrence=1"
+      ],
+      "cleanupEvidence": {
+        "siteIds": [
+          "tests/e2e/storage-reclamation.spec.ts::owner=function%3AreadChatTitleFromDatabase::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+        ],
+        "fixtureOwners": [],
+        "processOwned": false
+      }
+    },
+    {
+      "purpose": "read-only-assertion",
+      "mutationScope": {
+        "kind": "none",
+        "targets": []
+      },
       "cleanupRestoreObligation": "Use a readonly streamLeases transaction, close the opened IndexedDB handle, and leave all durable browser state unchanged.",
       "publicUiCannotExpress": "The ownership proof requires the exact persisted lease phase and owner identity, which the public UI deliberately summarizes.",
       "siteIds": [
@@ -198,9 +222,9 @@
       "cleanupRestoreObligation": "Read browser quota estimates as attached telemetry only and leave every origin storage namespace unchanged.",
       "publicUiCannotExpress": "The public storage UI projects logical live and reclaimable bytes, while origin-wide browser quota estimates are nondeterministic diagnostic telemetry.",
       "siteIds": [
-        "tests/e2e/storage-reclamation.spec.ts::owner=test%3Anormal%20use%20retries%20real%20compaction%20debt%20and%20preserves%20two-tab%20work%20across%20the%20slot%20switch::operation=storage-manager.estimate::mode=-::store=%3Corigin%3E::occurrence=1",
-        "tests/e2e/storage-reclamation.spec.ts::owner=test%3Anormal%20use%20retries%20real%20compaction%20debt%20and%20preserves%20two-tab%20work%20across%20the%20slot%20switch::operation=storage-manager.estimate::mode=-::store=%3Corigin%3E::occurrence=2",
-        "tests/e2e/storage-reclamation.spec.ts::owner=test%3Anormal%20use%20retries%20real%20compaction%20debt%20and%20preserves%20two-tab%20work%20across%20the%20slot%20switch::operation=storage-manager.estimate::mode=-::store=%3Corigin%3E::occurrence=3"
+        "tests/e2e/storage-reclamation.spec.ts::owner=test%3Anormal%20use%20catches%20up%20foreground%20work%20without%20repeating%20the%20physical%20copy%20and%20preserves%20two-tab%20state::operation=storage-manager.estimate::mode=-::store=%3Corigin%3E::occurrence=1",
+        "tests/e2e/storage-reclamation.spec.ts::owner=test%3Anormal%20use%20catches%20up%20foreground%20work%20without%20repeating%20the%20physical%20copy%20and%20preserves%20two-tab%20state::operation=storage-manager.estimate::mode=-::store=%3Corigin%3E::occurrence=2",
+        "tests/e2e/storage-reclamation.spec.ts::owner=test%3Anormal%20use%20catches%20up%20foreground%20work%20without%20repeating%20the%20physical%20copy%20and%20preserves%20two-tab%20state::operation=storage-manager.estimate::mode=-::store=%3Corigin%3E::occurrence=3"
       ]
     },
     {

@@ -232,6 +232,39 @@ export const REPAIRABLE_PHYSICAL_STORAGE_TABLE_NAMES = physicalStorageTableNames
   (entry) => entry.schema === 'repairable',
 )
 
+export const BROWSER_WORKSPACE_MUTATION_JOURNAL_SOURCE_TABLE_NAMES = Object.freeze(
+  PHYSICAL_STORAGE_TABLE_NAMES.filter(
+    (name) => name !== 'browserLocks' && name !== 'workspaceFence',
+  ),
+)
+
+export type BrowserWorkspaceMutationJournalSourceTableName =
+  (typeof BROWSER_WORKSPACE_MUTATION_JOURNAL_SOURCE_TABLE_NAMES)[number]
+
+export const BROWSER_WORKSPACE_CATCHUP_SOURCE_TABLE_NAMES = physicalStorageTableNamesWith(
+  (entry) => entry.compaction === 'copy' || entry.compaction === 'filtered-copy',
+) as readonly BrowserWorkspaceMutationJournalSourceTableName[]
+
+export type BrowserWorkspaceCatchupJournalTableName =
+  `replacementCatchup__${BrowserWorkspaceMutationJournalSourceTableName}`
+
+export const BROWSER_WORKSPACE_CATCHUP_JOURNAL_TABLE_NAMES = Object.freeze(
+  BROWSER_WORKSPACE_MUTATION_JOURNAL_SOURCE_TABLE_NAMES.map(
+    browserWorkspaceCatchupJournalTableName,
+  ),
+)
+
+export const ALL_PHYSICAL_STORAGE_TABLE_NAMES = Object.freeze([
+  ...PHYSICAL_STORAGE_TABLE_NAMES,
+  ...BROWSER_WORKSPACE_CATCHUP_JOURNAL_TABLE_NAMES,
+])
+
+export function browserWorkspaceCatchupJournalTableName(
+  sourceTableName: BrowserWorkspaceMutationJournalSourceTableName,
+): BrowserWorkspaceCatchupJournalTableName {
+  return `replacementCatchup__${sourceTableName}`
+}
+
 export type SettingsCompactionDisposition = 'copy' | 'rebuild' | 'drop' | 'unknown'
 
 export function settingsCompactionDisposition(key: string): SettingsCompactionDisposition {

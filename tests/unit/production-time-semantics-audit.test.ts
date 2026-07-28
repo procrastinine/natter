@@ -107,19 +107,19 @@ describe('production temporal semantics meta-audit', () => {
       baseCounts: {
         schedulers: 56,
         durations: 48,
-        asyncRaces: 6,
-        retryLoops: 91,
+        asyncRaces: 7,
+        retryLoops: 97,
         maintenanceCommands: 6,
       },
-      semanticSiteCount: 207,
-      groupCount: 41,
-      statusCounts: { covered: 206, gap: 1 },
+      semanticSiteCount: 214,
+      groupCount: 40,
+      statusCounts: { covered: 214, gap: 0 },
       readinessProofCount: 1,
       readinessGapCount: 0,
-      criticalGapCount: 1,
+      criticalGapCount: 0,
       problems: [],
     })
-    expect(report.gaps.some((gap) => gap.group === 'unbounded-revision-revalidation')).toBe(true)
+    expect(report.gaps).toEqual([])
     expect(report.readinessProofs).toHaveLength(1)
     const readinessProof = report.readinessProofs[0]
     expect(readinessProof?.group).toBe('active-stream-reload-first-gesture-browser-proof')
@@ -140,7 +140,7 @@ describe('production temporal semantics meta-audit', () => {
     ])
     expect(report.readinessGaps).toEqual([])
     expect(report.limitations).toHaveLength(4)
-    expect(report.sites).toHaveLength(207)
+    expect(report.sites).toHaveLength(214)
     expect(
       report.sites.every(
         (site) =>
@@ -151,13 +151,26 @@ describe('production temporal semantics meta-audit', () => {
     ).toBe(true)
   })
 
-  it('makes semantic gaps fatal only in enforce mode', () => {
-    const report = runAudit('enforce')
+  it('makes an explicit semantic gap fatal only in enforce mode', () => {
+    const groups = mutateGroups('workspace-runtime-transition-admission', (group) => ({
+      ...group,
+      status: 'gap',
+      criticalOutcomes: ['shell-clickability'],
+      gapRationale: 'Synthetic meta-audit gap.',
+    }))
+    const inventory = runAudit('inventory', { groups })
+    const enforce = runAudit('enforce', { groups })
+    const expectedGapCount = Object.values(
+      groups.find((group) => group.id === 'workspace-runtime-transition-admission')?.sites ?? {},
+    ).flat().length
 
-    expect(report.ok).toBe(false)
-    expect(report.structurallyValid).toBe(true)
-    expect(report.gaps).toHaveLength(1)
-    expect(report.problems).toEqual([])
+    expect(inventory.ok).toBe(true)
+    expect(inventory.structurallyValid).toBe(true)
+    expect(inventory.gaps).toHaveLength(expectedGapCount)
+    expect(enforce.ok).toBe(false)
+    expect(enforce.structurallyValid).toBe(true)
+    expect(enforce.gaps).toHaveLength(expectedGapCount)
+    expect(enforce.problems).toEqual([])
   })
 
   it('rejects stale exact evidence for the closed first-gesture browser proof', () => {
@@ -245,15 +258,16 @@ describe('production temporal semantics meta-audit', () => {
   })
 
   it('rejects laundering a shell, navigation, projection, durability, or run-once time path as covered', () => {
-    const groups = mutateGroups('unbounded-revision-revalidation', (group) => {
-      const { gapRationale: _gapRationale, ...coveredGroup } = group
-      return { ...coveredGroup, status: 'covered' }
-    })
+    const groups = mutateGroups('workspace-runtime-transition-admission', (group) => ({
+      ...group,
+      status: 'covered',
+      criticalOutcomes: ['shell-clickability'],
+    }))
     const report = runAudit('inventory', { groups })
 
     expect(report.ok).toBe(false)
     expect(report.problems).toContain(
-      'groups:unbounded-revision-revalidation: critical temporal path must remain an explicit gap',
+      'groups:workspace-runtime-transition-admission: critical temporal path must remain an explicit gap',
     )
   })
 

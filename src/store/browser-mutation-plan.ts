@@ -160,9 +160,14 @@ export function planMutationSemanticOperation(
   const storageProfile =
     command.kind === 'draft.put'
       ? 'draft-reference-update'
-      : command.kind === 'attachment.bytes.delete' || command.kind === 'attachment.bundle.write'
-        ? 'attachment-payload'
-        : 'complete'
+      : command.kind === 'attachment.ref.add' ||
+          command.kind === 'attachment.ref.detach' ||
+          command.kind === 'attachment.ref.relink' ||
+          command.kind === 'attachment.ref.set-visibility'
+        ? 'attachment-reference-update'
+        : command.kind === 'attachment.bytes.delete' || command.kind === 'attachment.bundle.write'
+          ? 'attachment-payload'
+          : 'complete'
   const plan = mutationInfrastructurePlan(scopes, options, extensionAccess, storageProfile)
   const fixedReceiptPolicy = scopeDerivedMutationReceiptPolicy(command, options)
   if (fixedReceiptPolicy && extensionReceipt) {
@@ -311,6 +316,55 @@ function scopeDerivedMutationReceiptPolicy(
         exactOccurrence: true,
         replayReason: 'non-replayable',
       }
+    case 'attachment.ref.add':
+      return {
+        exactOccurrence: true,
+        replayReason: 'random-identity',
+      }
+    case 'attachment.ref.detach':
+    case 'attachment.ref.set-visibility':
+      return {
+        exactOccurrence: true,
+        replayReason: 'unfenced-relative-update',
+      }
+    case 'attachment.ref.relink':
+      return {
+        exactOccurrence: true,
+        replayReason: 'non-replayable',
+      }
+    case 'message.edit-content':
+      return {
+        exactOccurrence: true,
+        replayReason: 'unfenced-relative-update',
+      }
+    case 'message.import':
+      return {
+        exactOccurrence: true,
+        replayReason: 'random-identity',
+      }
+    case 'message.delete':
+    case 'message.restore-structure':
+      return {
+        exactOccurrence: true,
+        replayReason: 'non-replayable',
+      }
+    case 'generated-output.localization-claim':
+      return {
+        exactOccurrence: true,
+        replayReason: 'random-identity',
+      }
+    case 'generated-output.localization-complete':
+    case 'generated-output.localization-fail':
+    case 'generated-output.localization-retry':
+      return {
+        exactOccurrence: true,
+        replayReason: 'unfenced-relative-update',
+      }
+    case 'generated-output.video-expand':
+      return {
+        exactOccurrence: true,
+        replayReason: 'non-replayable',
+      }
     case 'attempt.finalize':
       return {
         replayPlan: attemptFinalizeReplayPlan(command.input),
@@ -320,10 +374,6 @@ function scopeDerivedMutationReceiptPolicy(
         exactPlan: attemptDispatchExactPlan(command.input),
       }
     case 'attachment.reap':
-    case 'attachment.ref.add':
-    case 'attachment.ref.detach':
-    case 'attachment.ref.relink':
-    case 'attachment.ref.set-visibility':
     case 'attempt.request-stop':
     case 'attempt.seal-terminal':
     case 'chat.calibration.clear':
@@ -347,11 +397,6 @@ function scopeDerivedMutationReceiptPolicy(
     case 'folder.delete':
     case 'folder.ensure-and-move-chats':
     case 'folder.update':
-    case 'generated-output.localization-claim':
-    case 'generated-output.localization-complete':
-    case 'generated-output.localization-fail':
-    case 'generated-output.localization-retry':
-    case 'generated-output.video-expand':
     case 'generation.post-commit-metadata':
     case 'interchange.import-chat':
     case 'interchange.import-chat-preset':
@@ -361,10 +406,6 @@ function scopeDerivedMutationReceiptPolicy(
     case 'maintenance.prune-terminal-stream-journals':
     case 'maintenance.reconcile-attachment-integrity':
     case 'maintenance.reconcile-stream-journal-integrity':
-    case 'message.delete':
-    case 'message.edit-content':
-    case 'message.import':
-    case 'message.restore-structure':
     case 'stream.append-journal-frames':
     case 'stream.claim-recovery':
     case 'stream.finish-cleanup':
@@ -387,8 +428,8 @@ function materializeTemporaryChatExactPlan(
     replay: { kind: 'single-attempt', reason: 'random-identity' },
     bounds: {
       reads: {
-        maxRequests: 5 + 2 * profileLinks,
-        maxRows: 5 + 2 * profileLinks,
+        maxRequests: 6 + 2 * profileLinks,
+        maxRows: 6 + 2 * profileLinks,
         maxBatchRows: 1,
         maxBytes: Number.MAX_SAFE_INTEGER,
       },
@@ -486,7 +527,11 @@ interface MutationInfrastructurePlan {
   readonly assertScope: (scope: MutationScope) => void
 }
 
-type MutationScopeStorageProfile = 'complete' | 'draft-reference-update' | 'attachment-payload'
+type MutationScopeStorageProfile =
+  | 'complete'
+  | 'draft-reference-update'
+  | 'attachment-reference-update'
+  | 'attachment-payload'
 
 function mutationInfrastructurePlan(
   scopes: readonly MutationScope[],
@@ -622,23 +667,19 @@ function addChatCapabilityTables<Tables extends BrowserMutationTableName>(
       builder.addReadTable(tableName)
       continue
     }
-    switch (tableName) {
-      case 'chats':
-        builder.addMutationTable(tableName, 'chat')
-        break
-      case 'chatSidebarAggregates':
-      case 'chatSidebarRows':
-        builder.addMutationTable(tableName, 'sidebar')
-        break
-      case 'configurationLinks':
-        builder.addMutationTable(tableName)
-        break
-      case 'configurationCatalogAggregates':
-      case 'configurationProfileUsageRows':
-        builder.addMutationTable(tableName, 'profile')
-        break
-      default:
-        builder.addReadTable(tableName)
+    if (tableName === 'chats') {
+      builder.addMutationTable(tableName, 'chat')
+    } else if (tableName === 'chatSidebarAggregates' || tableName === 'chatSidebarRows') {
+      builder.addMutationTable(tableName, 'sidebar')
+    } else if (tableName === 'configurationLinks') {
+      builder.addMutationTable(tableName)
+    } else if (
+      tableName === 'configurationCatalogAggregates' ||
+      tableName === 'configurationProfileUsageRows'
+    ) {
+      builder.addMutationTable(tableName, 'profile')
+    } else {
+      builder.addReadTable(tableName)
     }
   }
 }
@@ -664,7 +705,10 @@ function compileMutationScopes(
           ['attachmentCatalogAggregate', 'attachmentCatalogRows'],
           'attachment',
         )
-        if (storageProfile !== 'draft-reference-update') {
+        if (
+          storageProfile !== 'draft-reference-update' &&
+          storageProfile !== 'attachment-reference-update'
+        ) {
           builder.addMutationTables(['attachmentArtifacts', 'attachmentBlobs'], 'attachment')
           builder.addMutationTable('attachmentJobs', 'attachment-job')
         }
@@ -695,6 +739,11 @@ function compileMutationScopes(
         builder.addMutationTable('drafts', 'draft')
         break
       case 'message':
+        if (storageProfile === 'attachment-reference-update') {
+          builder.addReadTable('chats')
+          builder.addMutationTable('messages', 'message-header')
+          break
+        }
         if (scope.access === 'presentation') {
           builder.addReadTable('chats')
         } else {

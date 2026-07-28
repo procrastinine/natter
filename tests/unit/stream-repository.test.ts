@@ -1336,9 +1336,9 @@ async function continuationPrepareInput(input: {
       },
     },
     configurationClaim: {
-      configurationVersion: chat?.configurationVersion ?? 0,
-      settings: chat?.settings ?? settings(),
-      presetId: chat?.presetId ?? null,
+      configurationVersion: chat.configurationVersion ?? 0,
+      settings: chat.settings,
+      presetId: chat.presetId ?? null,
       profile: connectionDispatchProfileProof(selectedProfile, MODEL),
       requestRevision: {
         profileId: selectedProfile.id,

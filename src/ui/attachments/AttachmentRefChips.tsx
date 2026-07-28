@@ -115,12 +115,14 @@ export function AttachmentRefChips({
                           return onMutateMessageRef?.({
                             kind: 'visibility',
                             refId: ref.refId,
+                            expectedAttachmentId: ref.attachmentId,
                             includeInContext: !ref.includeInContext,
                           })
                         }
                         await setAttachmentRefVisibility({
                           draftChatId: draftChatId as ChatId,
                           refId: ref.refId,
+                          expectedAttachmentId: ref.attachmentId,
                           includeInContext: !ref.includeInContext,
                         })
                       },
@@ -158,11 +160,16 @@ export function AttachmentRefChips({
                       target: mutationTarget,
                       action: async () => {
                         if (messageId) {
-                          return onMutateMessageRef?.({ kind: 'detach', refId: ref.refId })
+                          return onMutateMessageRef?.({
+                            kind: 'detach',
+                            refId: ref.refId,
+                            expectedAttachmentId: ref.attachmentId,
+                          })
                         }
                         await detachAttachmentRef({
                           draftChatId: draftChatId as ChatId,
                           refId: ref.refId,
+                          expectedAttachmentId: ref.attachmentId,
                         })
                       },
                     })
@@ -190,10 +197,13 @@ export function AttachmentRefChips({
             ...(messageId ? { messageId } : { draftChatId: draftChatId as ChatId }),
           })}
           onPick={async (attachment) => {
+            const currentRef = liveRefs.find((ref) => ref.refId === replaceRefId)
+            if (!currentRef) throw new Error(`AttachmentRefMissing:${replaceRefId}`)
             if (messageId) {
               await onMutateMessageRef?.({
                 kind: 'relink',
                 refId: replaceRefId,
+                expectedAttachmentId: currentRef.attachmentId,
                 newAttachmentId: attachment.id,
               })
               return
@@ -201,6 +211,7 @@ export function AttachmentRefChips({
             await relinkAttachmentRef({
               draftChatId: draftChatId as ChatId,
               refId: replaceRefId,
+              expectedAttachmentId: currentRef.attachmentId,
               newAttachmentId: attachment.id,
             })
           }}

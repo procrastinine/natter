@@ -1,5 +1,6 @@
 import type { Transaction } from 'dexie'
 import type { AttachmentId, AttachmentReferenceEdge } from '../core/types'
+import { sameValue } from '../lib/same-value'
 import type { AttachmentHeaderRow } from './attachment-storage'
 import {
   deletePhysicalStorageRows,
@@ -326,9 +327,9 @@ export async function refreshAttachmentCatalogProjectionsForRepair(
   tx: Transaction,
   attachmentIds: Iterable<AttachmentId>,
   suppliedSnapshot?: AttachmentCatalogRepairSnapshot,
-): Promise<void> {
+): Promise<readonly AttachmentId[]> {
   const ids = [...new Set(attachmentIds)]
-  if (ids.length === 0) return
+  if (ids.length === 0) return []
   const catalog = tx.table<AttachmentCatalogProjectionRow, AttachmentId>('attachmentCatalogRows')
   const [snapshot, previousRows] = await Promise.all([
     suppliedSnapshot ?? readAttachmentCatalogRepairSnapshot(tx, ids),
@@ -345,22 +346,31 @@ export async function refreshAttachmentCatalogProjectionsForRepair(
         )
       : undefined,
   )
-  const deletedIds = ids.filter((_, index) => snapshot.headers[index] === undefined)
-  const deletedRows = previousRows.filter(
-    (row, index): row is AttachmentCatalogProjectionRow =>
-      snapshot.headers[index] === undefined && row !== undefined,
+  const changes = ids.flatMap((id, index) => {
+    const previous = previousRows[index]
+    const next = nextRows[index]
+    return sameValue(previous, next) ? [] : [{ id, previous, next }]
+  })
+  const deleted = changes.filter(
+    (
+      change,
+    ): change is {
+      id: AttachmentId
+      previous: AttachmentCatalogProjectionRow
+      next: undefined
+    } => change.previous !== undefined && change.next === undefined,
   )
+  const stored = changes.flatMap(({ next }) => (next ? [next] : []))
+  const replaced = changes.flatMap(({ previous }) => (previous ? [previous] : []))
+  const deletedIds = deleted.map(({ id }) => id)
+  const deletedRows = deleted.map(({ previous }) => previous)
   await deletePhysicalStorageRows(tx, 'attachmentCatalogRows', deletedIds, deletedRows)
-  const stored = nextRows.filter((row): row is AttachmentCatalogProjectionRow => row !== undefined)
-  const replaced = previousRows.filter(
-    (row, index): row is AttachmentCatalogProjectionRow =>
-      nextRows[index] !== undefined && row !== undefined,
-  )
   await putPhysicalStorageRows(tx, 'attachmentCatalogRows', stored, replaced)
   await applyAttachmentCatalogAggregateDeltas(
     tx,
-    ids.map((_, index) => ({ previous: previousRows[index], next: nextRows[index] })),
+    changes.map(({ previous, next }) => ({ previous, next })),
   )
+  return changes.map(({ id }) => id)
 }
 
 export async function readAttachmentCatalogRepairSnapshot(
@@ -481,25 +491,6 @@ export function publicAttachmentCatalogRow(
     storage: structuredClone(publicRow.storage),
     ...(publicRow.dimensions ? { dimensions: { ...publicRow.dimensions } } : {}),
     processing: publicRow.processing.map((state) => ({ ...state })),
-  }
-}
-
-export function attachmentReferenceSummaryFromEdges(
-  edges: readonly AttachmentReferenceEdge[],
-): AttachmentReferenceSummary {
-  const messageOwners = new Set<string>()
-  const draftOwners = new Set<string>()
-  let visibleRefCount = 0
-  for (const edge of edges) {
-    if (edge.ownerKind === 'message') messageOwners.add(edge.ownerId)
-    else draftOwners.add(edge.ownerId)
-    if (edge.includeInContext) visibleRefCount += 1
-  }
-  return {
-    refCount: edges.length,
-    messageRefCount: messageOwners.size,
-    draftRefCount: draftOwners.size,
-    visibleRefCount,
   }
 }
 

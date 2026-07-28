@@ -11,6 +11,7 @@ import { ingestAttachmentBytes } from '../../src/store/attachments'
 import {
   __resetBrowserRepositoryForTests,
   getBrowserRepository,
+  tryExecuteBrowserWorkspaceCommandWithinFanoutBudget,
 } from '../../src/store/browser-repo'
 import {
   openBrowserWorkspace,
@@ -115,7 +116,7 @@ describe('attachment integrity maintenance', () => {
     const wholeAttachmentRead = vi.spyOn(db.attachments, 'toArray')
     const pages: AttachmentIntegrityMaintenanceResult[] = []
     for (;;) {
-      const result = await reconcilePage(1)
+      const result = await reconcilePageWithinDirectBudget(1)
       pages.push(result)
       if (result.done) break
     }
@@ -168,7 +169,7 @@ describe('attachment integrity maintenance', () => {
       execute({
         kind: 'attachment.ref.detach',
         input: {
-          owner: { kind: 'message', chatId: chat.id, messageId },
+          owner: { kind: 'message', messageId, expectedChatId: chat.id },
           refId: ref.refId,
           expectedAttachmentId: attachmentId,
           now: 3,
@@ -184,7 +185,7 @@ describe('attachment integrity maintenance', () => {
     await expectAttachmentReferenceInvariants(getDb())
   })
 
-  it('visits a many-ref owner once instead of replaying its full edge set per edge page', async () => {
+  it('pages both directions of a high-fanout reference graph by actual edge rows', async () => {
     const chat = await seedChat()
     const refs: MessageAttachmentRef[] = []
     for (let index = 0; index < 33; index += 1) {
@@ -193,25 +194,18 @@ describe('attachment integrity maintenance', () => {
     await appendMessageWithRefs(chat, refs)
     const db = getDb()
     await db.attachmentIntegrityState.put(pendingAttachmentIntegrityState())
-    const ownerCursors: string[] = []
-    const openCursor = IDBIndex.prototype.openCursor
-    vi.spyOn(IDBIndex.prototype, 'openCursor').mockImplementation(function (
-      this: IDBIndex,
-      ...args
-    ) {
-      if (this.name === '[ownerKind+ownerId]') ownerCursors.push(this.name)
-      return openCursor.apply(this, args)
-    })
     const pages: AttachmentIntegrityMaintenanceResult[] = []
     for (;;) {
       const result = await reconcilePage(1)
       pages.push(result)
-      if (result.phase === 'attachments') break
+      if (result.done) break
     }
 
     expect(pages.every((page) => page.scanned <= 1)).toBe(true)
-    expect(ownerCursors).toHaveLength(1)
+    expect(pages.filter((page) => page.phase === 'messages')).toHaveLength(34)
     expect(pages.filter((page) => page.phase === 'edges').length).toBe(34)
+    expect(pages.filter((page) => page.phase === 'attachments')).toHaveLength(34)
+    await expectAttachmentReferenceInvariants(db)
   })
 })
 
@@ -241,6 +235,25 @@ async function reconcilePage(limit: number): Promise<AttachmentIntegrityMaintena
     limit,
     now: Date.now(),
   })) as AttachmentIntegrityMaintenanceResult
+}
+
+async function reconcilePageWithinDirectBudget(
+  limit: number,
+): Promise<AttachmentIntegrityMaintenanceResult> {
+  return runWorkspaceAction('maintenance', async (permit) => {
+    const admission = await tryExecuteBrowserWorkspaceCommandWithinFanoutBudget(
+      permit,
+      {
+        kind: 'maintenance.reconcile-attachment-integrity',
+        limit,
+        now: Date.now(),
+      },
+      { maxReadRows: 64, maxWriteRows: 64, maxBytes: 1024 * 1024 },
+    )
+    expect(admission.kind).toBe('committed')
+    if (admission.kind !== 'committed') throw new Error('AttachmentIntegrityUnexpectedStaging')
+    return admission.execution.commit.value
+  })
 }
 
 async function seedChat(): Promise<Chat> {

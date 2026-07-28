@@ -43,6 +43,7 @@ import {
   putTokenCalibrationSettingByteOwner,
 } from './byte-owner-mutation'
 import {
+  applyPreservingChatRowReplacements,
   CHAT_ROW_LINKED_TRANSACTION_CAPABILITY,
   CHAT_ROW_PRESERVING_LINKS_TRANSACTION_CAPABILITY,
   type ChatRowWriteMutationReceipt,
@@ -86,6 +87,7 @@ import type {
 import {
   absorbSemanticOperationReceiptFragment,
   boundSemanticOperationExactReceiptAccumulator,
+  createSemanticOperationExactReceiptAccumulator,
   type SemanticOperationDescriptor,
   type SemanticOperationExactPhysicalRead,
   type SemanticOperationExactPlan,
@@ -93,10 +95,12 @@ import {
   type SemanticOperationReceiptFragment,
   semanticOperationCallerSingleAttemptReplayContract,
   semanticOperationDescriptor,
+  semanticOperationExactOccurrenceReceipt,
   semanticOperationExactPlan,
   semanticOperationExactReceipt,
   semanticOperationExactReceiptContracts,
   semanticOperationExecution,
+  semanticOperationReceiptFragment,
 } from './semantic-operation-capability'
 import { TransactionChatUpdateClock } from './transaction-order'
 import {
@@ -238,15 +242,12 @@ const CHAT_SET_TAGS_FROM_NAMES_OPERATION = semanticOperationDescriptor({
   resources: chatMetadataResourceNames,
   permittedWrites: CHAT_TAG_TRANSACTION_CAPABILITY.tableNames,
   requiredWritesWhenMutated: ['chats'],
-  effects: {
-    kind: 'effect-kinds',
-    permitted: ['chat', 'sidebar', 'tag'],
-    requiredWhenMutated: (tableNames) => [
-      'chat',
-      'sidebar',
-      ...(tableNames.has('tags') ? (['tag'] as const) : []),
-    ],
-  },
+  ...semanticOperationExactReceiptContracts<
+    ChatMetadataResourceInput,
+    PhysicalStorageTableName,
+    undefined
+  >(),
+  replay: semanticOperationCallerSingleAttemptReplayContract('random-identity'),
 })
 const CHAT_CALIBRATION_TRANSACTION_CAPABILITY = physicalStorageTables(
   ...CHAT_ROW_PRESERVING_LINKS_TRANSACTION_CAPABILITY.tableNames,
@@ -348,6 +349,8 @@ const CHAT_CALIBRATION_FANOUT_EXACT_PLAN = semanticOperationExactPlan({
   },
 })
 
+const CHAT_CALIBRATION_FANOUT_PAGE_SIZE = 64
+
 interface ChatClosureResourceInput {
   readonly chatIds: readonly ChatId[]
 }
@@ -370,19 +373,18 @@ function emptyArchiveResourceNames(input: EmptyArchiveResourceInput): readonly s
   ]
 }
 
-const CHAT_CLOSURE_EFFECTS = {
-  kind: 'effect-kinds',
-  permitted: ['attachment', 'chat', 'draft', 'profile', 'setting', 'sidebar', 'stream-chunks'],
-  requiredWhenMutated: () => ['chat', 'sidebar'] as const,
-} as const
-
 const CHAT_DISCARD_EMPTY_DRAFTS_OPERATION = semanticOperationDescriptor({
   operationKind: 'chat.discard-empty-drafts',
   transaction: CHAT_CLOSURE_TRANSACTION_CAPABILITY,
   resources: chatClosureResourceNames,
   permittedWrites: CHAT_CLOSURE_TRANSACTION_CAPABILITY.tableNames,
   requiredWritesWhenMutated: ['chats'],
-  effects: CHAT_CLOSURE_EFFECTS,
+  ...semanticOperationExactReceiptContracts<
+    ChatClosureResourceInput,
+    PhysicalStorageTableName,
+    undefined
+  >(),
+  replay: semanticOperationCallerSingleAttemptReplayContract('unfenced-relative-update'),
 })
 
 const CHAT_DELETE_ARCHIVED_OPERATION = semanticOperationDescriptor({
@@ -391,7 +393,12 @@ const CHAT_DELETE_ARCHIVED_OPERATION = semanticOperationDescriptor({
   resources: chatClosureResourceNames,
   permittedWrites: CHAT_CLOSURE_TRANSACTION_CAPABILITY.tableNames,
   requiredWritesWhenMutated: ['chats'],
-  effects: CHAT_CLOSURE_EFFECTS,
+  ...semanticOperationExactReceiptContracts<
+    ChatClosureResourceInput,
+    PhysicalStorageTableName,
+    undefined
+  >(),
+  replay: semanticOperationCallerSingleAttemptReplayContract('unfenced-relative-update'),
 })
 
 const CHAT_EMPTY_ARCHIVE_OPERATION = semanticOperationDescriptor({
@@ -400,7 +407,12 @@ const CHAT_EMPTY_ARCHIVE_OPERATION = semanticOperationDescriptor({
   resources: emptyArchiveResourceNames,
   permittedWrites: CHAT_CLOSURE_TRANSACTION_CAPABILITY.tableNames,
   requiredWritesWhenMutated: ['chats'],
-  effects: CHAT_CLOSURE_EFFECTS,
+  ...semanticOperationExactReceiptContracts<
+    EmptyArchiveResourceInput,
+    PhysicalStorageTableName,
+    undefined
+  >(),
+  replay: semanticOperationCallerSingleAttemptReplayContract('unfenced-relative-update'),
 })
 
 const FOLDER_TRANSACTION_CAPABILITY = physicalStorageTables('folders')
@@ -486,14 +498,12 @@ const FOLDER_ENSURE_AND_MOVE_CHATS_OPERATION = semanticOperationDescriptor({
   resources: ensureFolderResourceNames,
   permittedWrites: CHAT_FOLDER_TRANSACTION_CAPABILITY.tableNames,
   requiredWritesWhenMutated: [],
-  effects: {
-    kind: 'effect-kinds',
-    permitted: ['chat', 'folder', 'sidebar'],
-    requiredWhenMutated: (tableNames) => [
-      ...(tableNames.has('folders') ? (['folder'] as const) : []),
-      ...(tableNames.has('chats') ? (['chat', 'sidebar'] as const) : []),
-    ],
-  },
+  ...semanticOperationExactReceiptContracts<
+    EnsureFolderResourceInput,
+    PhysicalStorageTableName,
+    undefined
+  >(),
+  replay: semanticOperationCallerSingleAttemptReplayContract('random-identity'),
 })
 
 const FOLDER_DELETE_MOVE_TOP_LEVEL_OPERATION = semanticOperationDescriptor({
@@ -502,14 +512,12 @@ const FOLDER_DELETE_MOVE_TOP_LEVEL_OPERATION = semanticOperationDescriptor({
   resources: deleteFolderResourceNames,
   permittedWrites: CHAT_FOLDER_TRANSACTION_CAPABILITY.tableNames,
   requiredWritesWhenMutated: ['folders'],
-  effects: {
-    kind: 'effect-kinds',
-    permitted: ['chat', 'folder', 'sidebar'],
-    requiredWhenMutated: (tableNames) => [
-      'folder',
-      ...(tableNames.has('chats') ? (['chat', 'sidebar'] as const) : []),
-    ],
-  },
+  ...semanticOperationExactReceiptContracts<
+    FolderRowResourceInput,
+    PhysicalStorageTableName,
+    undefined
+  >(),
+  replay: semanticOperationCallerSingleAttemptReplayContract('unfenced-relative-update'),
 })
 
 const FOLDER_DELETE_ARCHIVE_OPERATION = semanticOperationDescriptor({
@@ -518,15 +526,12 @@ const FOLDER_DELETE_ARCHIVE_OPERATION = semanticOperationDescriptor({
   resources: deleteFolderResourceNames,
   permittedWrites: CHAT_FOLDER_LINK_TRANSACTION_CAPABILITY.tableNames,
   requiredWritesWhenMutated: ['folders'],
-  effects: {
-    kind: 'effect-kinds',
-    permitted: ['chat', 'folder', 'preset', 'profile', 'prompt-preset', 'sidebar', 'text-template'],
-    requiredWhenMutated: (tableNames) => [
-      'folder',
-      ...(tableNames.has('chats') ? (['chat', 'sidebar'] as const) : []),
-      ...(tableNames.has('configurationProfileUsageRows') ? (['profile'] as const) : []),
-    ],
-  },
+  ...semanticOperationExactReceiptContracts<
+    FolderRowResourceInput,
+    PhysicalStorageTableName,
+    undefined
+  >(),
+  replay: semanticOperationCallerSingleAttemptReplayContract('unfenced-relative-update'),
 })
 
 export class ChatSetArchivedLinkPlanChangedError extends Error {}
@@ -618,6 +623,22 @@ export async function materializeTemporaryChat(
         }),
       }
     },
+    {
+      access: {
+        readTableNames: ['childLists'],
+      },
+      commit: (tx) => {
+        const receipt = boundSemanticOperationExactReceiptAccumulator<PhysicalStorageTableName>(tx)
+        if (!receipt) throw new Error('TemporaryChatExactReceiptAccumulatorMissing')
+        receipt.physicalRead({
+          tableName: 'childLists',
+          indexKind: 'primary',
+          operation: 'get-many',
+          requestCount: 1,
+          rowCount: 1,
+        })
+      },
+    },
   )
   return result.value
 }
@@ -638,7 +659,11 @@ export async function discardEmptyDraftChats(
   const closure = await commit.executeSemanticOperation(
     CHAT_DISCARD_EMPTY_DRAFTS_OPERATION,
     { chatIds },
-    (tx) => deleteEligibleEmptyDraftChatClosure(tx, chatIds, input.staleBefore, now),
+    async (tx) =>
+      semanticOperationExecution(
+        await deleteEligibleEmptyDraftChatClosure(tx, chatIds, input.staleBefore, now),
+        semanticOperationExactOccurrenceReceipt<PhysicalStorageTableName>(tx),
+      ),
   )
   return {
     deletedChatIds: closure.deletedChatIds,
@@ -748,11 +773,7 @@ function chatSetArchivedReceipt(
   transition: ChatRowWriteMutationReceipt | undefined,
   updatedAtClockRead: boolean,
 ): SemanticOperationExactReceipt<PhysicalStorageTableName> {
-  if (
-    plan[chatSetArchivedPlanBrand] !== true ||
-    !Number.isSafeInteger(plan.configurationLinkCount) ||
-    plan.configurationLinkCount < 0
-  ) {
+  if (!Number.isSafeInteger(plan.configurationLinkCount) || plan.configurationLinkCount < 0) {
     throw new Error('ChatSetArchivedPlanInvalid')
   }
   const fragment = transition?.fragment
@@ -868,9 +889,6 @@ function chatMoveToFolderReceipt(
     readonly updatedAtClock: boolean
   },
 ): SemanticOperationExactReceipt<PhysicalStorageTableName> {
-  if (plan[chatMoveToFolderPlanBrand] !== true) {
-    throw new Error('ChatMoveToFolderPlanInvalid')
-  }
   return semanticOperationExactReceipt(plan.exactPlan, {
     dependencies: fragment?.dependencies ?? [],
     physicalMutations: fragment?.physicalMutations ?? [],
@@ -990,12 +1008,12 @@ function chatCalibrationReceipt(
   plan: SemanticOperationExactPlan,
   chatRead: {
     readonly operation: 'get' | 'query'
+    readonly requestCount?: number
     readonly rowCount: number
   },
-  transition: ChatRowWriteMutationReceipt | undefined,
+  fragment: SemanticOperationReceiptFragment<PhysicalStorageTableName> | undefined,
   settingRead: boolean,
 ): SemanticOperationExactReceipt<PhysicalStorageTableName> {
-  const fragment = transition?.fragment
   const settingTouched = settingRead
   return semanticOperationExactReceipt(plan, {
     dependencies: normalizeWorkspaceDependencies([
@@ -1021,7 +1039,7 @@ function chatCalibrationReceipt(
         tableName: 'chats' as const,
         indexKind: 'primary' as const,
         operation: chatRead.operation,
-        requestCount: 1,
+        requestCount: chatRead.requestCount ?? 1,
         rowCount: chatRead.rowCount,
       },
       ...(fragment?.physicalReads ?? []),
@@ -1328,6 +1346,11 @@ export async function setChatRowsTagsFromNames(
       linkedResourceNames: nameKeys.map((nameKey) => `tag-name:${nameKey}`),
     },
     async (tx) => {
+      const complete = (value: ChatTagAssignmentResult) =>
+        semanticOperationExecution(
+          value,
+          semanticOperationExactOccurrenceReceipt<PhysicalStorageTableName>(tx),
+        )
       const emptyResult = (): ChatTagAssignmentResult => ({
         value: [],
         affectedChatIds: [],
@@ -1335,12 +1358,12 @@ export async function setChatRowsTagsFromNames(
         affectedTagIds: [],
         deletedTagIds: [],
       })
-      if (uniqueChatIds.length === 0) return emptyResult()
+      if (uniqueChatIds.length === 0) return complete(emptyResult())
       const chatMutation = openPreservingChatMutation(tx)
       const targets = (await chatMutation.readMany(uniqueChatIds)).filter(
         (chat): chat is Chat => chat !== undefined,
       )
-      if (targets.length === 0) return emptyResult()
+      if (targets.length === 0) return complete(emptyResult())
 
       const chats = tx.table<Chat, ChatId>('chats')
       const tags = tx.table<ChatTag, TagId>('tags')
@@ -1441,13 +1464,13 @@ export async function setChatRowsTagsFromNames(
       await deleteChatTagByteOwners(tx, deletedTags)
       const chatVersions: Record<ChatId, ChatVersions> = {}
       for (const chat of changedChats) chatVersions[chat.id] = chatVersionsFor(chat)
-      return {
+      return complete({
         value: selectedTagIds,
         affectedChatIds: changedChats.map((chat) => chat.id),
         chatVersions,
         affectedTagIds: [...affectedTagIds],
         deletedTagIds,
-      }
+      })
     },
   )
 }
@@ -1526,7 +1549,7 @@ export async function clearChatCalibration(
         chatCalibrationReceipt(
           CHAT_CALIBRATION_CLEAR_EXACT_PLAN,
           { operation: 'get', rowCount: 1 },
-          transition,
+          transition.fragment,
           true,
         ),
       )
@@ -1561,26 +1584,57 @@ async function clearCalibrationEverywhereTransaction(
     { kind: 'chat.calibration.clear-family' | 'chat.calibration.clear-all' }
   >,
 ) {
-  const chatMutation = openPreservingChatMutation(tx)
-  const rows = await chatMutation.readAll()
+  const receiptAccumulator =
+    createSemanticOperationExactReceiptAccumulator<PhysicalStorageTableName>()
   let chatCount = 0
-  const changedChats = rows.map((row) => {
-    const cleared =
-      command.kind === 'chat.calibration.clear-all'
-        ? {
-            changed: Object.keys(row.tokenCalibration ?? {}).length > 0,
-            samples: {},
-          }
-        : calibrationRecordWithoutFamily(row.tokenCalibration, command.calibrationKey)
-    if (cleared.changed) chatCount += 1
-    return {
-      ...row,
-      tokenCalibration: cleared.samples,
-      tokenCalibrationGeneration: nextChatCalibrationGeneration(row),
+  let chatReadRequests = 0
+  let chatReadRows = 0
+  let afterChatId: ChatId | undefined
+  const affectedChatIds: ChatId[] = []
+  const chatVersions: Record<ChatId, ChatVersions> = {}
+  const chats = tx.table<Chat, ChatId>('chats')
+  for (;;) {
+    const rows = await (afterChatId === undefined
+      ? chats.orderBy(':id')
+      : chats.where(':id').above(afterChatId)
+    )
+      .limit(CHAT_CALIBRATION_FANOUT_PAGE_SIZE)
+      .toArray()
+    chatReadRequests += 1
+    chatReadRows += rows.length
+    if (rows.length === 0) break
+    const replacements = rows.map((row) => {
+      const cleared =
+        command.kind === 'chat.calibration.clear-all'
+          ? {
+              changed: Object.keys(row.tokenCalibration ?? {}).length > 0,
+              samples: {},
+            }
+          : calibrationRecordWithoutFamily(row.tokenCalibration, command.calibrationKey)
+      if (cleared.changed) chatCount += 1
+      const next = {
+        ...row,
+        tokenCalibration: cleared.samples,
+        tokenCalibrationGeneration: nextChatCalibrationGeneration(row),
+      }
+      affectedChatIds.push(next.id)
+      chatVersions[next.id] = chatVersionsFor(next)
+      return { previous: row, next }
+    })
+    const page = await applyPreservingChatRowReplacements(tx, replacements)
+    if (page.fragment.dependencies.some((dependency) => dependency.kind !== 'chat')) {
+      throw new Error('ChatCalibrationPageDependencyUnexpected')
     }
-  })
-  for (const next of changedChats) chatMutation.replace(next.id, () => next)
-  const transition = await chatMutation.commit()
+    receiptAccumulator.absorb(
+      semanticOperationReceiptFragment({
+        physicalMutations: page.fragment.physicalMutations,
+        physicalReads: page.fragment.physicalReads,
+        physicalWrites: page.fragment.physicalWrites,
+      }),
+    )
+    afterChatId = rows.at(-1)?.id
+    if (afterChatId === undefined) throw new Error('ChatCalibrationPageIdentityMissing')
+  }
   const settings = tx.table<SettingsRow, string>('settings')
   const stored = await settings.get(GLOBAL_TOKEN_CALIBRATION_KEY)
   const clearedGlobal =
@@ -1592,20 +1646,18 @@ async function clearCalibrationEverywhereTransaction(
     { key: GLOBAL_TOKEN_CALIBRATION_KEY, value: clearedGlobal.value },
     stored,
   )
-  const chatVersions: Record<ChatId, ChatVersions> = {}
-  for (const chat of changedChats) {
-    chatVersions[chat.id] = chatVersionsFor(chat)
-  }
+  receiptAccumulator.dependency({ kind: 'chat', chatIds: affectedChatIds })
+  const transitionFragment = receiptAccumulator.sealFragment()
   return semanticOperationExecution(
     {
       value: { globalChanged: clearedGlobal.changed, chatCount },
-      affectedChatIds: changedChats.map((chat) => chat.id),
+      affectedChatIds,
       chatVersions,
     } satisfies ChatCalibrationEverywhereResult,
     chatCalibrationReceipt(
       CHAT_CALIBRATION_FANOUT_EXACT_PLAN,
-      { operation: 'query', rowCount: rows.length },
-      transition,
+      { operation: 'query', requestCount: chatReadRequests, rowCount: chatReadRows },
+      transitionFragment,
       true,
     ),
   )
@@ -1631,7 +1683,11 @@ export async function deleteArchivedChatRows(
   const result = await commit.executeSemanticOperation(
     CHAT_DELETE_ARCHIVED_OPERATION,
     { chatIds: uniqueChatIds },
-    (tx) => deleteArchivedChatClosure(tx, uniqueChatIds, now),
+    async (tx) =>
+      semanticOperationExecution(
+        await deleteArchivedChatClosure(tx, uniqueChatIds, now),
+        semanticOperationExactOccurrenceReceipt<PhysicalStorageTableName>(tx),
+      ),
   )
   return {
     deletedChatIds: result.deletedChatIds,
@@ -1653,13 +1709,16 @@ export async function emptyArchivedChatRows(
         limit,
       })
       const result = await deleteArchivedChatClosure(tx, page.chatIds, input.now)
-      return {
-        deletedChatIds: result.deletedChatIds,
-        affectedAttachmentIds: result.affectedAttachmentIds,
-        scannedChatIds: page.chatIds.length,
-        ...(page.nextAfterChatId === undefined ? {} : { nextAfterChatId: page.nextAfterChatId }),
-        done: page.done,
-      }
+      return semanticOperationExecution(
+        {
+          deletedChatIds: result.deletedChatIds,
+          affectedAttachmentIds: result.affectedAttachmentIds,
+          scannedChatIds: page.chatIds.length,
+          ...(page.nextAfterChatId === undefined ? {} : { nextAfterChatId: page.nextAfterChatId }),
+          done: page.done,
+        },
+        semanticOperationExactOccurrenceReceipt<PhysicalStorageTableName>(tx),
+      )
     },
   )
 }
@@ -1811,12 +1870,15 @@ export async function ensureFolderAndMoveChats(
         await putChatFolderByteOwner(tx, touchedFolder, matched)
         folder = touchedFolder
       }
-      return {
-        folder,
-        created,
-        affectedChatIds: changes.map((change) => change.chatId),
-        changes,
-      }
+      return semanticOperationExecution(
+        {
+          folder,
+          created,
+          affectedChatIds: changes.map((change) => change.chatId),
+          changes,
+        },
+        semanticOperationExactOccurrenceReceipt<PhysicalStorageTableName>(tx),
+      )
     },
   )
 }
@@ -1832,9 +1894,14 @@ export async function deleteFolder(
       ? FOLDER_DELETE_ARCHIVE_OPERATION
       : FOLDER_DELETE_MOVE_TOP_LEVEL_OPERATION
   return commit.executeSemanticOperation(descriptor, { folderId }, async (tx) => {
+    const complete = (value: DeleteFolderResult) =>
+      semanticOperationExecution(
+        value,
+        semanticOperationExactOccurrenceReceipt<PhysicalStorageTableName>(tx),
+      )
     const folders = tx.table<ChatFolder, FolderId>('folders')
     const folder = await folders.get(folderId)
-    if (!folder) return { deleted: false, affectedChatIds: [], changes: [] }
+    if (!folder) return complete({ deleted: false, affectedChatIds: [], changes: [] })
     const chatMutation = openLinkedChatMutation(tx)
     const rows = [...(await chatMutation.readFolder(folderId))]
     rows.sort((left, right) => left.id.localeCompare(right.id))
@@ -1871,10 +1938,10 @@ export async function deleteFolder(
       }
     }
     await chatMutation.commit()
-    return {
+    return complete({
       deleted: true,
       affectedChatIds: changedChats.map((chat) => chat.id),
       changes,
-    }
+    })
   })
 }

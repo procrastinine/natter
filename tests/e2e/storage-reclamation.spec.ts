@@ -3,10 +3,11 @@ import { createFakeStreamScenario, retargetOnlyProfileToFakeProvider } from './f
 import { createChatUiJourneyProfile, expect, type Page, test } from './fixtures'
 import {
   activeWorkspaceDatabaseName,
+  buildSseBody,
   clearIndexedDb,
   createChatAndOpen,
   firstChatId,
-  holdIndexedDbStoreGate,
+  mockChatCompletions,
   seedFirstRun,
   sendMessage,
 } from './helpers'
@@ -58,6 +59,122 @@ interface WorkspaceCompactionSnapshot {
 }
 
 const COMPACTION_DEBT_BYTES = 66 * 1024 * 1024
+const WORKSPACE_SELECTION_LOCK = 'natter:workspace-slot-selection:v1'
+
+interface BrowserLockHandle {
+  readonly id: string
+  readonly name: string
+}
+
+async function queueBrowserLock(
+  page: Page,
+  name: string,
+  mode: 'shared' | 'exclusive',
+): Promise<BrowserLockHandle> {
+  const id = crypto.randomUUID()
+  await page.evaluate(
+    ({ id, mode, name }) => {
+      interface BrowserLockRecord {
+        acquired: boolean
+        failure: string | null
+        release(): void
+        completion: Promise<void>
+      }
+      const scope = window as typeof window & {
+        __e2eBrowserLocks?: Map<string, BrowserLockRecord>
+      }
+      const locks = scope.__e2eBrowserLocks ?? new Map<string, BrowserLockRecord>()
+      scope.__e2eBrowserLocks = locks
+      let releaseHold!: () => void
+      const hold = new Promise<void>((resolve) => {
+        releaseHold = resolve
+      })
+      const record: BrowserLockRecord = {
+        acquired: false,
+        failure: null,
+        release: releaseHold,
+        completion: Promise.resolve(),
+      }
+      locks.set(id, record)
+      record.completion = navigator.locks
+        .request(name, { mode }, async (lock) => {
+          if (!lock) throw new Error(`BrowserLockUnavailable:${name}`)
+          record.acquired = true
+          await hold
+        })
+        .catch((error: unknown) => {
+          record.failure = error instanceof Error ? error.message : String(error)
+        })
+    },
+    { id, mode, name },
+  )
+  return { id, name }
+}
+
+async function browserLockState(
+  page: Page,
+  handle: BrowserLockHandle,
+): Promise<{ acquired: boolean; failure: string | null; pending: boolean }> {
+  return page.evaluate(async ({ id, name }) => {
+    const scope = window as typeof window & {
+      __e2eBrowserLocks?: Map<
+        string,
+        { acquired: boolean; failure: string | null; completion: Promise<void>; release(): void }
+      >
+    }
+    const record = scope.__e2eBrowserLocks?.get(id)
+    if (!record) throw new Error(`BrowserLockMissing:${id}`)
+    const snapshot = await navigator.locks.query()
+    return {
+      acquired: record.acquired,
+      failure: record.failure,
+      pending: snapshot.pending?.some((lock) => lock.name === name) ?? false,
+    }
+  }, handle)
+}
+
+async function releaseBrowserLock(page: Page, handle: BrowserLockHandle): Promise<void> {
+  await page.evaluate(async ({ id }) => {
+    const scope = window as typeof window & {
+      __e2eBrowserLocks?: Map<
+        string,
+        { acquired: boolean; failure: string | null; completion: Promise<void>; release(): void }
+      >
+    }
+    const record = scope.__e2eBrowserLocks?.get(id)
+    if (!record) return
+    record.release()
+    await record.completion
+    scope.__e2eBrowserLocks?.delete(id)
+    if (record.failure) throw new Error(record.failure)
+  }, handle)
+}
+
+function workspaceSlotLock(databaseName: string): string {
+  return `natter:workspace-slot:${databaseName}`
+}
+
+async function navigatorLockSnapshot(page: Page): Promise<{ held: string[]; pending: string[] }> {
+  return page.evaluate(async () => {
+    const snapshot = await navigator.locks.query()
+    return {
+      held: snapshot.held?.flatMap((lock) => (lock.name ? [lock.name] : [])) ?? [],
+      pending: snapshot.pending?.flatMap((lock) => (lock.name ? [lock.name] : [])) ?? [],
+    }
+  })
+}
+
+async function expectBranchControlsReady(page: Page, branchId: string): Promise<void> {
+  const message = page.locator(`[data-ui="message"][data-message-id="${branchId}"]`)
+  await expect(message).toBeVisible()
+  const controls = message.locator('[data-ui="branch-controls"]')
+  await expect(controls).toBeVisible()
+  await expect(controls.locator('[data-ui="branch-count"]')).toHaveText('2 / 2')
+  await expect(controls.locator('[data-role="first"]')).toHaveCount(1)
+  await expect(controls.locator('[data-role="prev"]')).toHaveCount(1)
+  await expect(controls.locator('[data-role="next"]')).toHaveCount(1)
+  await expect(controls.locator('[data-role="last"]')).toHaveCount(1)
+}
 
 async function readWorkspaceControlSnapshot(
   page: Page,
@@ -121,7 +238,34 @@ async function readWorkspaceControlSnapshot(
   }, sourceDatabaseName)
 }
 
-test('normal use retries real compaction debt and preserves two-tab work across the slot switch', async ({
+async function readChatTitleFromDatabase(
+  page: Page,
+  databaseName: string,
+  chatId: string,
+): Promise<string | null> {
+  return page.evaluate(
+    async ({ databaseName, chatId }) => {
+      const database = await new Promise<IDBDatabase>((resolve, reject) => {
+        const request = indexedDB.open(databaseName)
+        request.onsuccess = () => resolve(request.result)
+        request.onerror = () => reject(request.error)
+      })
+      try {
+        const row = await new Promise<{ title?: unknown } | undefined>((resolve, reject) => {
+          const request = database.transaction('chats', 'readonly').objectStore('chats').get(chatId)
+          request.onsuccess = () => resolve(request.result as { title?: unknown } | undefined)
+          request.onerror = () => reject(request.error)
+        })
+        return typeof row?.title === 'string' ? row.title : null
+      } finally {
+        database.close()
+      }
+    },
+    { databaseName, chatId },
+  )
+}
+
+test('normal use catches up foreground work without repeating the physical copy and preserves two-tab state', async ({
   page,
   uiJourney,
 }, testInfo) => {
@@ -147,7 +291,6 @@ test('normal use retries real compaction debt and preserves two-tab work across 
   })
   let peer: Page | undefined
   let manager: Page | undefined
-  let releaseCopyGate: () => Promise<void> = async () => undefined
   try {
     await retargetOnlyProfileToFakeProvider(page, scenario.providerBaseUrl)
     await createChatAndOpen(page)
@@ -242,8 +385,11 @@ test('normal use retries real compaction debt and preserves two-tab work across 
         activeCompaction: {
           knownReclaimableBytes: expect.any(Number),
           requestRevision: 1,
-          attemptedRevision: 0,
+          attemptedRevision: 1,
           completedRevision: 0,
+        },
+        pending: {
+          phase: 'preparing',
         },
       })
     const before = await readWorkspaceControlSnapshot(page)
@@ -253,16 +399,15 @@ test('normal use retries real compaction debt and preserves two-tab work across 
     expect(await scenario.snapshot()).toMatchObject({ activeStreams: 1, requestCount: 1 })
     const afterDebtEstimate = await page.evaluate(() => navigator.storage.estimate())
 
+    const titleBeforeCatchup = await readChatTitleFromDatabase(
+      page,
+      before.activeDatabaseName,
+      chatId,
+    )
+    if (titleBeforeCatchup === null) throw new Error('StorageCompactionTitleMissing')
     await page.locator('[data-role="chat-title-edit"]').click()
     const titleEditor = page.locator('[data-ui="chat-title-editor"]')
-    await titleEditor.fill('Compaction retry stayed interactive')
-    releaseCopyGate = await holdIndexedDbStoreGate(page, ['attachmentBlobs'])
-    await scenario.release()
-    await expect
-      .poll(() => scenario.snapshot().then((snapshot) => snapshot.activeStreams), {
-        timeout: 30_000,
-      })
-      .toBe(0)
+    await titleEditor.fill('Compaction catch-up stayed interactive')
     await expect
       .poll(() => readWorkspaceControlSnapshot(page), { timeout: 30_000 })
       .toMatchObject({
@@ -278,13 +423,30 @@ test('normal use retries real compaction debt and preserves two-tab work across 
           completedRevision: 0,
         },
       })
+    const preparing = await readWorkspaceControlSnapshot(page)
+    if (!preparing.pending) throw new Error('StorageCompactionPreparingJournalMissing')
+    await expect
+      .poll(
+        () =>
+          readChatTitleFromDatabase(page, preparing.pending?.destinationDatabaseName ?? '', chatId),
+        { timeout: 60_000 },
+      )
+      .toBe(titleBeforeCatchup)
 
     await titleEditor.press('Enter')
     await expect(page.locator('[data-ui="chat-title-label"]')).toHaveText(
-      'Compaction retry stayed interactive',
+      'Compaction catch-up stayed interactive',
     )
-    await releaseCopyGate()
-    releaseCopyGate = async () => undefined
+    await expect
+      .poll(() => readChatTitleFromDatabase(page, before.activeDatabaseName, chatId))
+      .toBe('Compaction catch-up stayed interactive')
+
+    await scenario.release()
+    await expect
+      .poll(() => scenario.snapshot().then((snapshot) => snapshot.activeStreams), {
+        timeout: 30_000,
+      })
+      .toBe(0)
 
     await expect
       .poll(() => readWorkspaceControlSnapshot(page, before.activeDatabaseName), {
@@ -295,9 +457,9 @@ test('normal use retries real compaction debt and preserves two-tab work across 
         pending: null,
         activeCompaction: {
           knownReclaimableBytes: expect.any(Number),
-          requestRevision: 2,
-          attemptedRevision: 2,
-          completedRevision: 2,
+          requestRevision: expect.any(Number),
+          attemptedRevision: expect.any(Number),
+          completedRevision: expect.any(Number),
         },
       })
     await expect
@@ -314,6 +476,13 @@ test('normal use retries real compaction debt and preserves two-tab work across 
         sourceCompaction: null,
       })
     const committed = await readWorkspaceControlSnapshot(page, before.activeDatabaseName)
+    expect(committed.activeCompaction?.requestRevision).toBeGreaterThanOrEqual(1)
+    expect(committed.activeCompaction?.attemptedRevision).toBe(
+      committed.activeCompaction?.requestRevision,
+    )
+    expect(committed.activeCompaction?.completedRevision).toBe(
+      committed.activeCompaction?.requestRevision,
+    )
     expect(
       committed.activeCompaction?.knownReclaimableBytes ?? Number.POSITIVE_INFINITY,
     ).toBeLessThan(STORAGE_COMPACTION_MIN_RECLAIMABLE_BYTES)
@@ -339,7 +508,7 @@ test('normal use retries real compaction debt and preserves two-tab work across 
 
     await Promise.all([page.reload(), streamPage.reload()])
     await expect(page.locator('[data-ui="chat-title-label"]')).toHaveText(
-      'Compaction retry stayed interactive',
+      'Compaction catch-up stayed interactive',
     )
     await expect(page.locator('[data-ui="composer-input"]')).toHaveValue(draft)
     await expect.poll(() => page.evaluate(() => window.location.hash)).toBe(pinnedRoute)
@@ -370,9 +539,229 @@ test('normal use retries real compaction debt and preserves two-tab work across 
       contentType: 'application/json',
     })
   } finally {
-    await releaseCopyGate().catch(() => undefined)
     await Promise.allSettled([peer?.close(), manager?.close(), scenario.dispose()])
     await Promise.allSettled([unlink(firstUploadPath), unlink(replacementUploadPath)])
+  }
+})
+
+test('durable replacement state recovers crashed owners and serializes competing tabs', async ({
+  context,
+  page,
+}, testInfo) => {
+  testInfo.setTimeout(150_000)
+  await clearIndexedDb(page)
+  await mockChatCompletions(page, {
+    body: buildSseBody([
+      { id: 'replacement-crash-response', content: 'durable replacement branch' },
+      { finish: 'stop' },
+    ]),
+  })
+  await seedFirstRun(page)
+  await createChatAndOpen(page)
+  await sendMessage(page, 'create durable replacement branches')
+  const firstBranch = page.locator('[data-ui="message"][data-role="assistant"]').last()
+  await expect(firstBranch.locator('[data-ui="message-body"]')).toHaveText(
+    'durable replacement branch',
+  )
+  await firstBranch.locator('[data-action="regenerate"]').click()
+  const secondBranch = page.locator('[data-ui="message"][data-role="assistant"]').last()
+  await expect(secondBranch.locator('[data-ui="branch-count"]')).toHaveText('2 / 2')
+  const chatId = await firstChatId(page)
+  const branchId = await secondBranch.getAttribute('data-message-id')
+  if (!branchId) throw new Error('ReplacementCrashBranchMissing')
+  const branchRoute = `/#/chat/${chatId}/message/${branchId}`
+  const backupPath = testInfo.outputPath('replacement-crash-workspace.json')
+  await page.goto('/#/storage')
+  const downloadPromise = page.waitForEvent('download')
+  await page.getByRole('button', { name: 'Export all' }).click()
+  await page.getByRole('button', { name: 'Export sensitive backup' }).click()
+  await (await downloadPromise).saveAs(backupPath)
+  await page.goto(branchRoute)
+  await expectBranchControlsReady(page, branchId)
+
+  let preactivationInitiator: Page | undefined
+  let postactivationInitiator: Page | undefined
+  let firstCompetitor: Page | undefined
+  let secondCompetitor: Page | undefined
+  let sourceBlocker: BrowserLockHandle | undefined
+  let destinationBlocker: BrowserLockHandle | undefined
+  let selectionBlocker: BrowserLockHandle | undefined
+  try {
+    const preactivationSource = await readWorkspaceControlSnapshot(page)
+    sourceBlocker = await queueBrowserLock(
+      page,
+      workspaceSlotLock(preactivationSource.activeDatabaseName),
+      'shared',
+    )
+    await expect
+      .poll(() => browserLockState(page, sourceBlocker as BrowserLockHandle))
+      .toMatchObject({
+        acquired: true,
+        failure: null,
+      })
+    preactivationInitiator = await context.newPage()
+    await preactivationInitiator.goto('/#/storage')
+    preactivationInitiator.once('dialog', (dialog) => dialog.accept())
+    await preactivationInitiator
+      .locator('[data-ui="storage-workspace-import-input"]')
+      .setInputFiles(backupPath)
+    await expect
+      .poll(() => readWorkspaceControlSnapshot(page))
+      .toMatchObject({
+        activeDatabaseName: preactivationSource.activeDatabaseName,
+        activationSequence: preactivationSource.activationSequence,
+        pending: {
+          phase: 'preparing',
+          sourceDatabaseName: preactivationSource.activeDatabaseName,
+        },
+      })
+    await expect
+      .poll(() =>
+        browserLockState(page, {
+          id: sourceBlocker?.id ?? '',
+          name: workspaceSlotLock(preactivationSource.activeDatabaseName),
+        }),
+      )
+      .toMatchObject({ failure: null })
+    await expect
+      .poll(async () => {
+        const snapshot = await navigatorLockSnapshot(page)
+        return snapshot.pending.includes(workspaceSlotLock(preactivationSource.activeDatabaseName))
+      })
+      .toBe(true)
+    await preactivationInitiator.close()
+    preactivationInitiator = undefined
+    await expect
+      .poll(() => readWorkspaceControlSnapshot(page), { timeout: 30_000 })
+      .toMatchObject({
+        activeDatabaseName: preactivationSource.activeDatabaseName,
+        activationSequence: preactivationSource.activationSequence,
+        pending: null,
+      })
+    await releaseBrowserLock(page, sourceBlocker)
+    sourceBlocker = undefined
+    await expectBranchControlsReady(page, branchId)
+
+    const postactivationSource = await readWorkspaceControlSnapshot(page)
+    const destinationDatabaseName =
+      postactivationSource.activeDatabaseName === 'natter-workspace-a'
+        ? 'natter-workspace-b'
+        : 'natter-workspace-a'
+    destinationBlocker = await queueBrowserLock(
+      page,
+      workspaceSlotLock(destinationDatabaseName),
+      'shared',
+    )
+    await expect
+      .poll(() => browserLockState(page, destinationBlocker as BrowserLockHandle))
+      .toMatchObject({ acquired: true, failure: null })
+    postactivationInitiator = await context.newPage()
+    await postactivationInitiator.goto('/#/storage')
+    postactivationInitiator.once('dialog', (dialog) => dialog.accept())
+    await postactivationInitiator
+      .locator('[data-ui="storage-workspace-import-input"]')
+      .setInputFiles(backupPath)
+    await expect
+      .poll(() => readWorkspaceControlSnapshot(page))
+      .toMatchObject({
+        activeDatabaseName: postactivationSource.activeDatabaseName,
+        activationSequence: postactivationSource.activationSequence,
+        pending: {
+          phase: 'preparing',
+          sourceDatabaseName: postactivationSource.activeDatabaseName,
+          destinationDatabaseName,
+        },
+      })
+    selectionBlocker = await queueBrowserLock(page, WORKSPACE_SELECTION_LOCK, 'exclusive')
+    await expect
+      .poll(() => navigatorLockSnapshot(page))
+      .toMatchObject({ pending: expect.arrayContaining([WORKSPACE_SELECTION_LOCK]) })
+    await releaseBrowserLock(page, destinationBlocker)
+    destinationBlocker = undefined
+    await expect
+      .poll(() => browserLockState(page, selectionBlocker as BrowserLockHandle), {
+        timeout: 30_000,
+      })
+      .toMatchObject({ acquired: true, failure: null })
+    await expect
+      .poll(() => readWorkspaceControlSnapshot(page))
+      .toMatchObject({
+        activeDatabaseName: destinationDatabaseName,
+        activationSequence: postactivationSource.activationSequence + 1,
+      })
+    await postactivationInitiator.close()
+    postactivationInitiator = undefined
+    await releaseBrowserLock(page, selectionBlocker)
+    selectionBlocker = undefined
+    await expect
+      .poll(
+        () =>
+          readWorkspaceControlSnapshot(page, postactivationSource.activeDatabaseName).then(
+            (snapshot) => ({
+              activeDatabaseName: snapshot.activeDatabaseName,
+              activationSequence: snapshot.activationSequence,
+              databaseNames: snapshot.databaseNames,
+              pending: snapshot.pending,
+            }),
+          ),
+        { timeout: 30_000 },
+      )
+      .toEqual({
+        activeDatabaseName: destinationDatabaseName,
+        activationSequence: postactivationSource.activationSequence + 1,
+        databaseNames: expect.not.arrayContaining([postactivationSource.activeDatabaseName]),
+        pending: null,
+      })
+    await expectBranchControlsReady(page, branchId)
+
+    const beforeCompetition = await readWorkspaceControlSnapshot(page)
+    firstCompetitor = await context.newPage()
+    secondCompetitor = await context.newPage()
+    await Promise.all([firstCompetitor.goto('/#/storage'), secondCompetitor.goto('/#/storage')])
+    firstCompetitor.once('dialog', (dialog) => dialog.accept())
+    secondCompetitor.once('dialog', (dialog) => dialog.accept())
+    await Promise.all([
+      firstCompetitor
+        .locator('[data-ui="storage-workspace-import-input"]')
+        .setInputFiles(backupPath),
+      secondCompetitor
+        .locator('[data-ui="storage-workspace-import-input"]')
+        .setInputFiles(backupPath),
+    ])
+    await expect
+      .poll(() => readWorkspaceControlSnapshot(page), { timeout: 60_000 })
+      .toMatchObject({
+        activationSequence: beforeCompetition.activationSequence + 2,
+        pending: null,
+      })
+    const competed = await readWorkspaceControlSnapshot(page)
+    await expect
+      .poll(() =>
+        Promise.all([
+          activeWorkspaceDatabaseName(page),
+          activeWorkspaceDatabaseName(firstCompetitor as Page),
+          activeWorkspaceDatabaseName(secondCompetitor as Page),
+        ]),
+      )
+      .toEqual([
+        competed.activeDatabaseName,
+        competed.activeDatabaseName,
+        competed.activeDatabaseName,
+      ])
+    await expectBranchControlsReady(page, branchId)
+  } finally {
+    if (selectionBlocker) await releaseBrowserLock(page, selectionBlocker).catch(() => undefined)
+    if (destinationBlocker) {
+      await releaseBrowserLock(page, destinationBlocker).catch(() => undefined)
+    }
+    if (sourceBlocker) await releaseBrowserLock(page, sourceBlocker).catch(() => undefined)
+    await Promise.allSettled([
+      preactivationInitiator?.close(),
+      postactivationInitiator?.close(),
+      firstCompetitor?.close(),
+      secondCompetitor?.close(),
+    ])
+    await unlink(backupPath).catch(() => undefined)
   }
 })
 

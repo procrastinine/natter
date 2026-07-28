@@ -10,9 +10,8 @@ const committed: BrowserWorkspacePreparedReplacement<{ chatCount: number }> = {
 }
 
 describe('browser workspace replacement transition', () => {
-  it('abandons a preactivation failure and restores both local and peer readiness once', async () => {
+  it('abandons a preactivation failure and restores local readiness once', async () => {
     const abandon = vi.fn(async () => undefined)
-    const resume = vi.fn(async () => undefined)
     const reopen = vi.fn(async () => originalWorkspace)
     const publish = vi.fn()
     const transition = createBrowserWorkspaceReplacementTransitionController({
@@ -21,7 +20,6 @@ describe('browser workspace replacement transition', () => {
       publish,
     })
     transition.ownAbandon(abandon)
-    transition.ownPeerResume(resume)
     const primary = new Error('copy failed')
     transition.markUncommitted(primary)
     await transition.settleSelection()
@@ -32,7 +30,6 @@ describe('browser workspace replacement transition', () => {
     })
     expect(abandon).toHaveBeenCalledOnce()
     expect(reopen).toHaveBeenCalledOnce()
-    expect(resume).toHaveBeenCalledOnce()
     expect(publish).not.toHaveBeenCalled()
   })
 
@@ -50,13 +47,11 @@ describe('browser workspace replacement transition', () => {
     expect(effects.abandon).not.toHaveBeenCalled()
     expect(effects.publish).toHaveBeenCalledOnce()
     expect(effects.reopen).toHaveBeenCalledOnce()
-    expect(effects.resume).toHaveBeenCalledOnce()
   })
 
   it('attempts every committed finalizer and retains every failure', async () => {
     const publishFailure = new Error('publish failed')
     const reopenFailure = new Error('reopen failed')
-    const resumeFailure = new Error('resume failed')
     const abandon = vi.fn(async () => undefined)
     const publish = vi.fn(async () => {
       throw publishFailure
@@ -64,16 +59,12 @@ describe('browser workspace replacement transition', () => {
     const reopen = vi.fn(async () => {
       throw reopenFailure
     })
-    const resume = vi.fn(async () => {
-      throw resumeFailure
-    })
     const transition = createBrowserWorkspaceReplacementTransitionController({
       originalWorkspace,
       reopen,
       publish,
     })
     transition.ownAbandon(abandon)
-    transition.ownPeerResume(resume)
     advanceToCommitting(transition)
     transition.markCommitted(committed)
     await transition.settleSelection()
@@ -81,12 +72,11 @@ describe('browser workspace replacement transition', () => {
     await expect(transition.finalize()).resolves.toEqual({
       kind: 'committed-recovery-required',
       commit: committed,
-      failures: [publishFailure, reopenFailure, resumeFailure],
+      failures: [publishFailure, reopenFailure],
     })
     expect(abandon).not.toHaveBeenCalled()
     expect(publish).toHaveBeenCalledOnce()
     expect(reopen).toHaveBeenCalledOnce()
-    expect(resume).toHaveBeenCalledOnce()
   })
 
   it('never guesses rollback or publication after an uncertain activation', async () => {
@@ -103,10 +93,9 @@ describe('browser workspace replacement transition', () => {
     expect(effects.abandon).not.toHaveBeenCalled()
     expect(effects.publish).not.toHaveBeenCalled()
     expect(effects.reopen).toHaveBeenCalledOnce()
-    expect(effects.resume).toHaveBeenCalledOnce()
   })
 
-  it('retains rollback and reopen failures while still resuming peers once', async () => {
+  it('retains rollback and reopen failures', async () => {
     const primary = new Error('copy failed')
     const abandonFailure = new Error('discard journal failed')
     const reopenFailure = new Error('reopen failed')
@@ -116,14 +105,12 @@ describe('browser workspace replacement transition', () => {
     const reopen = vi.fn(async () => {
       throw reopenFailure
     })
-    const resume = vi.fn(async () => undefined)
     const transition = createBrowserWorkspaceReplacementTransitionController({
       originalWorkspace,
       reopen,
       publish: vi.fn(),
     })
     transition.ownAbandon(abandon)
-    transition.ownPeerResume(resume)
     transition.markUncommitted(primary)
     await transition.settleSelection()
 
@@ -133,7 +120,6 @@ describe('browser workspace replacement transition', () => {
     })
     expect(abandon).toHaveBeenCalledOnce()
     expect(reopen).toHaveBeenCalledOnce()
-    expect(resume).toHaveBeenCalledOnce()
   })
 
   it('memoizes terminal finalization and rejects a durability downgrade', async () => {
@@ -153,13 +139,11 @@ describe('browser workspace replacement transition', () => {
     expect(right).toBe(left)
     expect(effects.publish).toHaveBeenCalledOnce()
     expect(effects.reopen).toHaveBeenCalledOnce()
-    expect(effects.resume).toHaveBeenCalledOnce()
   })
 })
 
 function effectsFor(reopenedWorkspace: typeof originalWorkspace) {
   const abandon = vi.fn(async () => undefined)
-  const resume = vi.fn(async () => undefined)
   const reopen = vi.fn(async () => reopenedWorkspace)
   const publish = vi.fn()
   const transition = createBrowserWorkspaceReplacementTransitionController({
@@ -168,8 +152,7 @@ function effectsFor(reopenedWorkspace: typeof originalWorkspace) {
     publish,
   })
   transition.ownAbandon(abandon)
-  transition.ownPeerResume(resume)
-  return { transition, abandon, resume, reopen, publish }
+  return { transition, abandon, reopen, publish }
 }
 
 function advanceToCommitting(

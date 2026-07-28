@@ -111,7 +111,7 @@ export const WORKSPACE_COMMAND_PIPELINES = Object.freeze({
   'generated-output.localization-retry': pipeline('retryGeneratedOutputLocalization'),
   'generated-output.video-expand': pipeline('expandGeneratedOutputVideo'),
   'generation.post-commit-metadata': pipeline('commitGenerationMetadata'),
-  'interchange.import-chat': pipeline('importChat'),
+  'interchange.import-chat': pipeline('importChats'),
   'interchange.import-chat-preset': pipeline('importChatPreset'),
   'interchange.import-connection-profile': pipeline('importConnectionProfile'),
   'maintenance.prune-discovery-cache': pipeline('pruneDiscoveryCache'),

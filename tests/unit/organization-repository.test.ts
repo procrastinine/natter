@@ -1,5 +1,5 @@
 import Dexie from 'dexie'
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { connectionDispatchProfileProof } from '../../src/core/connection-dispatch-proof'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import { createStreamAccumulator } from '../../src/core/stream-accumulator'
@@ -59,6 +59,7 @@ import {
   streamLeaseReasoningCarryForward,
   streamLeaseReasoningVisibility,
 } from '../../src/store/repository'
+import { readStorageRetentionState } from '../../src/store/storage-retention-state'
 import {
   adoptPreparedStreamLease,
   getStreamClientId,
@@ -686,7 +687,7 @@ describe('organization repository contract', () => {
         name: preferred.name,
         lastUsedAt: 30,
         updatedAt: 30,
-      }),
+      }) as unknown,
       created: false,
       affectedChatIds: [first.id, second.id],
       changes: [
@@ -987,6 +988,12 @@ describe('organization repository contract', () => {
       },
       'attachment',
     )
+    await vi.waitFor(async () => {
+      expect(await readStorageRetentionState(getDb(), 'attachment-reap')).toMatchObject({
+        phase: 'idle',
+        revision: 1,
+      })
+    })
     const interveningDraft = {
       chatId: chat.id,
       text: 'intervening',
@@ -1135,7 +1142,7 @@ describe('organization repository contract', () => {
     })
     expect(await query({ kind: 'chat.get', chatId: archived.id })).toBeUndefined()
     expect(await getDb().messages.get(archivedMessage.id)).toBeUndefined()
-    expect(await query({ kind: 'draft.get', chatId: archived.id })).toBeUndefined()
+    expect(await getDb().drafts.get(archived.id)).toBeUndefined()
     expect(await query({ kind: 'chat.get', chatId: live.id })).toBeDefined()
     expect((await query({ kind: 'attachment.get', attachmentId: attachment.id }))?.refCount).toBe(0)
     expect(commit.delta.facts).toEqual([

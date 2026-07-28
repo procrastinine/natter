@@ -17,13 +17,6 @@ const ROOT = resolve(__dirname, '../..')
 const BUNDLE_URL = pathToFileURL(resolve(ROOT, 'scripts/production-protocol-fact-bundle.mjs')).href
 const AUDIT_URL = pathToFileURL(resolve(ROOT, 'scripts/audit-protocol-contracts.mjs')).href
 const STAGE_MANIFEST_URL = pathToFileURL(resolve(ROOT, 'scripts/protocol-stage-inventory.mjs')).href
-const KNOWN_LOCALITY_INITIATING_OWNER_PATH_GAPS = [
-  'initiating-owner paths: missing src/store/attachment-catalog-projection.ts',
-  'initiating-owner paths: missing src/store/attachment-reference-edges.ts',
-  'initiating-owner paths: missing src/store/chat-row-transition.ts',
-  'initiating-owner paths: missing src/store/child-list-projection.ts',
-] as const
-
 interface AuditedUnionSubject {
   readonly name: string
   readonly id: string
@@ -289,16 +282,16 @@ describe('production protocol fact bundle', () => {
 
   it('builds one source snapshot and keeps all six protocol views relationally identical', () => {
     expect(mutationProof.construction).toEqual({ programCreations: 1, unionDiscoveries: 1 })
-    expect(report.ok).toBe(false)
+    expect(report.ok).toBe(true)
     expect(report).toMatchObject({
       schemaVersion: 1,
-      structurallyValid: false,
-      inventoryComplete: false,
-      manifestFresh: false,
+      structurallyValid: true,
+      inventoryComplete: true,
+      manifestFresh: true,
       guaranteeClosed: false,
       runtimeProved: null,
     })
-    expect(report.gaps).toHaveLength(3)
+    expect(report.gaps).toHaveLength(2)
     expect(report.snapshot).toEqual(bundle.snapshot)
     expect(bundle.snapshot.digest).toBe(modules.fileDigest(ROOT))
     expect(
@@ -343,12 +336,12 @@ describe('production protocol fact bundle', () => {
           .auditedUnionSubjects,
       )
     }
-    expect(bundle.auditCapabilities.flatMap((capability) => capability.roots)).toHaveLength(22)
+    expect(bundle.auditCapabilities.flatMap((capability) => capability.roots)).toHaveLength(24)
     expect(
       new Set(
         bundle.auditCapabilities.flatMap((capability) => capability.roots.map((root) => root.id)),
       ).size,
-    ).toBe(15)
+    ).toBe(17)
     expect(bundle.production.protocols.WorkspaceCommand.variants).toEqual(
       bundle.stages.variants.command,
     )
@@ -424,22 +417,22 @@ describe('production protocol fact bundle', () => {
     expect(siteIds(bundle.locality.configurationUnion.constructorSites)).toEqual(
       siteIds(bundle.configuration.commandUnion.constructorSites),
     )
-    expect(bundle.snapshot.sourceFiles).toBe(474)
+    expect(bundle.snapshot.sourceFiles).toBe(481)
     expect(report.reports['tab-cross-tab-locality']).toMatchObject({
-      ok: false,
+      ok: true,
       surfaces: 20,
       records: 343,
-      constructorSites: 749,
+      constructorSites: 762,
       architectureGaps: 3,
       recordGaps: 149,
-      siteGaps: 10,
-      problems: KNOWN_LOCALITY_INITIATING_OWNER_PATH_GAPS,
+      siteGaps: 4,
+      problems: [],
     })
     expect(report.reports['production-discriminated-unions']).toMatchObject({
       ok: true,
-      discoveredCount: 459,
-      controlProtocolCount: 214,
-      gapCount: 175,
+      discoveredCount: 464,
+      controlProtocolCount: 219,
+      gapCount: 177,
       constructionGapCount: 9,
       violations: [],
     })
@@ -458,18 +451,18 @@ describe('production protocol fact bundle', () => {
 
     expect(enforced).toMatchObject({
       ok: false,
-      structurallyValid: false,
-      inventoryComplete: false,
-      manifestFresh: false,
+      structurallyValid: true,
+      inventoryComplete: true,
+      manifestFresh: true,
       guaranteeClosed: false,
       runtimeProved: null,
     })
-    expect(enforced.gaps).toHaveLength(3)
+    expect(enforced.gaps).toHaveLength(2)
     expect(enforced.reports['production-discriminated-unions'].ok).toBe(false)
     expect(enforced.reports['production-protocol'].ok).toBe(true)
     expect(enforced.reports['protocol-stage-coverage'].ok).toBe(true)
     expect(enforced.reports['configuration-protocol'].ok).toBe(true)
-    expect(enforced.reports['durable-command-pipeline'].ok).toBe(false)
+    expect(enforced.reports['durable-command-pipeline'].ok).toBe(true)
     expect(enforced.reports['tab-cross-tab-locality'].ok).toBe(false)
   })
 

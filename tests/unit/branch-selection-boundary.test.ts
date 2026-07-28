@@ -126,7 +126,7 @@ describe('branch selection architecture boundary', () => {
     expect(resolver).not.toMatch(/where\('chatId'\)\.equals\([^)]*\)\.toArray\(\)/)
   })
 
-  it('keeps a provisional destination point separate from the interactive sealed binding', () => {
+  it('keeps a provisional destination point separate while branch selection stays interactive', () => {
     const controller = source('src/store/conversation-controller.ts')
     const shell = source('src/app/Shell.tsx')
     const messages = source('src/ui/chat/MessageList.tsx')
@@ -153,7 +153,13 @@ describe('branch selection architecture boundary', () => {
     expect(shell).toContain('{transcriptFocusMode ? null : displayedTranscriptComposer}')
     expect(messages).toContain('data-branch-counts="known"')
     expect(messages).toContain("const presentationOnly = binding.currency !== 'current'")
-    expect(messages).toContain('inert={presentationOnly || undefined}')
+    expect(messages).not.toContain('inert={presentationOnly || undefined}')
+    expect(messages).toContain("if (e.key === '[' || e.key === ']')")
+    expect(messages.indexOf("if (e.key === '[' || e.key === ']'")).toBeLessThan(
+      messages.indexOf('if (presentationOnly) return', messages.indexOf('const onKey')),
+    )
+    expect(messages).toContain('const rowPresentationOnly = presentationOnly || intentOnly')
+    expect(messages).toContain('presentationOnly={rowPresentationOnly}')
   })
 })
 

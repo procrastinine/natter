@@ -6,7 +6,7 @@ import {
   type BrowserWorkspaceSlotLeaseHandle,
   browserWorkspaceSlotSwitchingSupported,
   disposeBrowserWorkspaceSlotCoordinator,
-  installBrowserWorkspaceSlotCoordinator,
+  installBrowserWorkspaceSlotCoordinator as installSlotCoordinator,
   releaseBrowserWorkspaceSlotLease,
   tryWithBrowserWorkspaceSelectionGate,
   withBrowserWorkspaceSelectionGate,
@@ -16,6 +16,15 @@ import {
 const originalBroadcastChannel = globalThis.BroadcastChannel
 const originalLocks = Object.getOwnPropertyDescriptor(navigator, 'locks')
 let activeSlotLease: BrowserWorkspaceSlotLeaseHandle | null = null
+
+function installBrowserWorkspaceSlotCoordinator(
+  lifecycle: Omit<Parameters<typeof installSlotCoordinator>[0], 'validateQuiesce'>,
+) {
+  return installSlotCoordinator({
+    validateQuiesce: async () => true,
+    ...lifecycle,
+  })
+}
 
 class ImmediateLockManager {
   request<T>(
@@ -126,16 +135,14 @@ describe('browser workspace slot coordination', () => {
     vi.restoreAllMocks()
   })
 
-  it('resumes a quiesced peer only for the matching durable transition nonce', async () => {
+  it('reconciles a quiesced peer once for the matching durable transition', async () => {
     const transitions: string[] = []
-    installBrowserWorkspaceSlotCoordinator({
-      quiesce: async () => {
-        transitions.push('quiesce')
+    installSlotCoordinator({
+      validateQuiesce: async (transition) => transition.nonce === 'current-transition',
+      reconcile: async (transition) => {
+        transitions.push(`reconcile:${transition.nonce}`)
         if (activeSlotLease) await releaseBrowserWorkspaceSlotLease(activeSlotLease)
         activeSlotLease = null
-      },
-      resume: async () => {
-        transitions.push('resume')
       },
     })
     activeSlotLease = await acquireBrowserWorkspaceSlotLease('natter')
@@ -145,30 +152,57 @@ describe('browser workspace slot coordination', () => {
     channel.receive({
       kind: 'quiesce',
       senderId: 'peer',
-      nonce: 'current-transition',
-      sourceDatabaseName: 'natter',
-      destinationDatabaseName: 'natter-workspace-a',
-    })
-    await expect.poll(() => transitions).toEqual(['quiesce'])
-
-    channel.receive({
-      kind: 'resume',
-      senderId: 'peer',
       nonce: 'stale-transition',
       sourceDatabaseName: 'natter',
       destinationDatabaseName: 'natter-workspace-a',
     })
     await Promise.resolve()
-    expect(transitions).toEqual(['quiesce'])
+    await Promise.resolve()
+    expect(transitions).toEqual([])
 
     channel.receive({
-      kind: 'resume',
+      kind: 'quiesce',
       senderId: 'peer',
       nonce: 'current-transition',
       sourceDatabaseName: 'natter',
       destinationDatabaseName: 'natter-workspace-a',
     })
-    await expect.poll(() => transitions).toEqual(['quiesce', 'resume'])
+    await expect.poll(() => transitions).toEqual(['reconcile:current-transition'])
+
+    channel.receive({
+      kind: 'quiesce',
+      senderId: 'peer',
+      nonce: 'current-transition',
+      sourceDatabaseName: 'natter',
+      destinationDatabaseName: 'natter-workspace-a',
+    })
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(transitions).toEqual(['reconcile:current-transition'])
+  })
+
+  it('ignores a quiesce message not admitted by the durable slot journal', async () => {
+    const reconcile = vi.fn(async () => undefined)
+    const validateQuiesce = vi.fn(async () => false)
+    installSlotCoordinator({
+      validateQuiesce,
+      reconcile,
+    })
+    activeSlotLease = await acquireBrowserWorkspaceSlotLease('natter')
+    const channel = FakeBroadcastChannel.instances[0]
+    if (!channel) throw new Error('slot channel missing')
+    const transition = {
+      nonce: 'foreign-storage-partition',
+      sourceDatabaseName: 'natter' as const,
+      destinationDatabaseName: 'natter-workspace-a' as const,
+    }
+
+    channel.receive({ kind: 'quiesce', senderId: 'peer', ...transition })
+    await expect.poll(() => validateQuiesce.mock.calls.length).toBe(1)
+    expect(validateQuiesce).toHaveBeenCalledWith(transition, expect.any(AbortSignal))
+    await Promise.resolve()
+
+    expect(reconcile).not.toHaveBeenCalled()
   })
 
   it('keeps installation failure-atomic and releases only the exact coordinator owner', () => {
@@ -178,27 +212,23 @@ describe('browser workspace slot coordination', () => {
 
     expect(() =>
       installBrowserWorkspaceSlotCoordinator({
-        quiesce: async () => {},
-        resume: async () => {},
+        reconcile: async () => {},
       }),
     ).toThrow('storage-listener-failed')
     addEventListener.mockRestore()
 
     const ownerA = installBrowserWorkspaceSlotCoordinator({
-      quiesce: async () => {},
-      resume: async () => {},
+      reconcile: async () => {},
     })
     expect(() =>
       installBrowserWorkspaceSlotCoordinator({
-        quiesce: async () => {},
-        resume: async () => {},
+        reconcile: async () => {},
       }),
     ).toThrow('BrowserWorkspaceSlotCoordinatorAlreadyInstalled')
     disposeBrowserWorkspaceSlotCoordinator(ownerA)
 
     const ownerB = installBrowserWorkspaceSlotCoordinator({
-      quiesce: async () => {},
-      resume: async () => {},
+      reconcile: async () => {},
     })
     disposeBrowserWorkspaceSlotCoordinator(ownerA)
     disposeBrowserWorkspaceSlotCoordinator(ownerB)
@@ -251,11 +281,10 @@ describe('browser workspace slot coordination', () => {
     let ownerACalls = 0
     let ownerBCalls = 0
     const ownerA = installBrowserWorkspaceSlotCoordinator({
-      quiesce: async () => {
+      reconcile: async () => {
         ownerACalls += 1
         await ownerAGate
       },
-      resume: async () => {},
     })
     activeSlotLease = await acquireBrowserWorkspaceSlotLease('natter')
     const channelA = FakeBroadcastChannel.instances[0]
@@ -273,10 +302,9 @@ describe('browser workspace slot coordination', () => {
     channelA.receive(message('owner-a-queued'))
     disposeBrowserWorkspaceSlotCoordinator(ownerA)
     const ownerB = installBrowserWorkspaceSlotCoordinator({
-      quiesce: async () => {
+      reconcile: async () => {
         ownerBCalls += 1
       },
-      resume: async () => {},
     })
     channelA.receive(message('owner-a-stale-channel'))
 
@@ -300,12 +328,11 @@ describe('browser workspace slot coordination', () => {
     let ownerBCalls = 0
     const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
     const ownerA = installBrowserWorkspaceSlotCoordinator({
-      quiesce: async (signal) => {
+      reconcile: async (_transition, signal) => {
         ownerACalls += 1
         capturedSignals.push(signal)
         await neverSettles
       },
-      resume: async () => {},
     })
     activeSlotLease = await acquireBrowserWorkspaceSlotLease('natter')
     const channelA = FakeBroadcastChannel.instances[0]
@@ -324,10 +351,9 @@ describe('browser workspace slot coordination', () => {
     expect(capturedSignals[0]?.aborted).toBe(true)
 
     const ownerB = installBrowserWorkspaceSlotCoordinator({
-      quiesce: async () => {
+      reconcile: async () => {
         ownerBCalls += 1
       },
-      resume: async () => {},
     })
     channelA.receive({
       kind: 'quiesce',

@@ -1246,15 +1246,34 @@ async function readReactiveState(
         const bodyById = new Map(
           (bodies as Array<{ id: string; content?: unknown }>).map((body) => [body.id, body]),
         )
-        const messages = (
-          headers as Array<{
-            id: string
-            role: string
-            createdAt: number
-            generation?: { abortReason?: string }
-          }>
-        )
-          .sort((left, right) => left.createdAt - right.createdAt)
+        type Header = {
+          id: string
+          parentId: string | null
+          role: string
+          createdAt: number
+          turnIndex: number
+          generation?: { abortReason?: string }
+        }
+        const headerRows = headers as Header[]
+        const headerById = new Map(headerRows.map((header) => [header.id, header]))
+        const depthById = new Map<string, number>()
+        const depth = (header: Header): number => {
+          const known = depthById.get(header.id)
+          if (known !== undefined) return known
+          const parent = header.parentId ? headerById.get(header.parentId) : undefined
+          const value: number = parent ? depth(parent) + 1 : 0
+          depthById.set(header.id, value)
+          return value
+        }
+        const messages = headerRows
+          .sort((left, right) => {
+            return (
+              depth(left) - depth(right) ||
+              left.turnIndex - right.turnIndex ||
+              left.createdAt - right.createdAt ||
+              left.id.localeCompare(right.id)
+            )
+          })
           .map((header) => ({
             role: header.role,
             content: bodyById.get(header.id)?.content,

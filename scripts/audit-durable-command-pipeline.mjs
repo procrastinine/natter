@@ -17,6 +17,10 @@ const ATTEMPT_MUTATION_COMMAND_UNION_ID =
   'src/store/workspace-protocol.ts#AttemptMutationCommand|kind'
 const CONFIGURATION_COMMAND_UNION_ID =
   'src/store/configuration-domain-contract.ts#ConfigurationDomainCommandUnion|kind'
+const BROWSER_COMMAND_FANOUT_ADMISSION_UNION_ID =
+  'src/store/browser-repo.ts#BrowserCommandFanoutAdmission|kind'
+const BROWSER_WORKSPACE_REPLACEMENT_WORK_UNION_ID =
+  'src/store/browser-workspace-replacement-runner.ts#BrowserWorkspaceReplacementWork|kind'
 const BROWSER_REPO_PATH = 'src/store/browser-repo.ts'
 const BROWSER_CATALOG_COMMAND_RUNTIME_PATH = 'src/store/browser-catalog-command-runtime.ts'
 const CHATS_PATH = 'src/store/chats.ts'
@@ -33,10 +37,16 @@ const PRESET_ORDER_PATH = 'src/store/preset-order.ts'
 const MUTATION_JOURNAL_PATH = 'src/store/browser-command-mutation-journal.ts'
 const DATABASE_PATH = 'src/store/db.ts'
 const BROWSER_WORKSPACE_LIFECYCLE_PATH = 'src/store/browser-workspace-lifecycle.ts'
+const BROWSER_WORKSPACE_REPLACEMENT_RUNNER_PATH =
+  'src/store/browser-workspace-replacement-runner.ts'
+const BROWSER_STAGED_FANOUT_COMMAND_PATH = 'src/store/browser-staged-fanout-command.ts'
+const BROWSER_WORKSPACE_STAGED_FANOUT_PATH = 'src/store/browser-workspace-staged-fanout.ts'
 const STORAGE_COMPACTION_STATE_PATH = 'src/store/storage-compaction-state.ts'
 const WORKSPACE_REPOSITORY_PATH = 'src/store/workspace-repository.ts'
 const WORKSPACE_EFFECT_HUB_PATH = 'src/store/workspace-effect-hub.ts'
 const SEMANTIC_OPERATION_CAPABILITY_PATH = 'src/store/semantic-operation-capability.ts'
+const GENERATED_OUTPUT_LOCALIZATION_RUNTIME_PATH =
+  'src/store/generated-output-localization-runtime.ts'
 const ATTEMPT_TERMINALIZATION_PATH = 'src/store/attempt-terminalization.ts'
 const GENERATION_ENGINE_PATH = 'src/store/generation-engine.ts'
 const BROWSER_GENERATION_COMMAND_RUNTIME_PATH = 'src/store/browser-generation-command-runtime.ts'
@@ -56,6 +66,19 @@ const COMMAND_TRANSACTION_BOUNDARY_PATHS = [
   'src/store/browser-domain-mutations.ts',
 ]
 const VALID_STAGE_STATUSES = new Set(['observed', 'gap'])
+const B16_BOUNDS_CARRY_OWNERS = Object.freeze({
+  'F-B1-08': 'B2',
+  'F-B1-09': 'B2',
+  'F-B1-10': 'B2',
+  'F-B1-14': 'B2',
+})
+const GENERATED_OUTPUT_LOCALIZATION_VARIANTS = Object.freeze([
+  'generated-output.localization-claim',
+  'generated-output.localization-complete',
+  'generated-output.localization-fail',
+  'generated-output.localization-retry',
+  'generated-output.video-expand',
+])
 
 const EXPECTED_PIPELINE_STAGES = Object.freeze([
   'constructor',
@@ -89,6 +112,14 @@ export function buildDurableCommandPipelineSourceFacts(options = {}) {
     ATTEMPT_MUTATION_COMMAND_UNION_ID,
   )
   const configurationUnion = exactUnion(discoveredUnions.unions, CONFIGURATION_COMMAND_UNION_ID)
+  const fanoutAdmissionUnion = exactUnion(
+    discoveredUnions.unions,
+    BROWSER_COMMAND_FANOUT_ADMISSION_UNION_ID,
+  )
+  const replacementWorkUnion = exactUnion(
+    discoveredUnions.unions,
+    BROWSER_WORKSPACE_REPLACEMENT_WORK_UNION_ID,
+  )
   const browserRepoSource = exactSource(program, BROWSER_REPO_PATH)
   const sourceArchitectureProblems = []
   const commandLifetimeReceipt = commandLifetimeReceiptFacts(
@@ -172,6 +203,17 @@ export function buildDurableCommandPipelineSourceFacts(options = {}) {
     }
     semanticCapabilities.set(kind, capability)
   }
+  const maintenanceOccurrenceFamily = maintenanceOccurrenceCapabilityFacts(
+    browserRepoSource,
+    sourceArchitectureProblems,
+  )
+  for (const [kind, capability] of Object.entries(maintenanceOccurrenceFamily.capabilities)) {
+    if (semanticCapabilities.has(kind)) {
+      sourceArchitectureProblems.push(`semantic operation capability duplicated ${kind}`)
+      continue
+    }
+    semanticCapabilities.set(kind, capability)
+  }
   const scopeDerivedMutationFamily = scopeDerivedMutationCapabilityFacts(
     program,
     browserRepoSource,
@@ -187,6 +229,21 @@ export function buildDurableCommandPipelineSourceFacts(options = {}) {
       continue
     }
     semanticCapabilities.set(kind, capability)
+  }
+  const generatedOutputLocalizationFamily = generatedOutputLocalizationCapabilityFacts(
+    program,
+    browserRepoSource,
+    workspaceUnion,
+    scopeDerivedMutationFamily.commonKernel,
+    sourceArchitectureProblems,
+  )
+  for (const [kind, capability] of Object.entries(generatedOutputLocalizationFamily.capabilities)) {
+    const base = semanticCapabilities.get(kind)
+    if (!base) {
+      sourceArchitectureProblems.push(`generated output localization capability missing ${kind}`)
+      continue
+    }
+    semanticCapabilities.set(kind, Object.freeze({ ...base, ...capability }))
   }
   const configurationSettingFamily = configurationSettingCapabilityFacts(
     program,
@@ -482,6 +539,31 @@ export function buildDurableCommandPipelineSourceFacts(options = {}) {
     }
     semanticCapabilities.set(kind, capability)
   }
+  const stagedFanoutFamily = stagedFanoutCapabilityFacts(
+    program,
+    browserRepoSource,
+    fanoutAdmissionUnion,
+    replacementWorkUnion,
+    sourceArchitectureProblems,
+  )
+  const b16BoundsClassification = classifyB16RemainingBounds(
+    semanticCapabilities,
+    {
+      chatCalibrationFamily,
+      maintenanceOccurrenceFamily,
+      scopeDerivedMutationFamily,
+      generatedOutputLocalizationFamily,
+      configurationTargetFanoutFamily,
+      configurationConnectionDeleteFamily,
+      folderFamily,
+      chatOrganizationFamily,
+      chatClosureFamily,
+      chatForkFamily,
+      interchangeImportFamily,
+      stagedFanoutFamily,
+    },
+    sourceArchitectureProblems,
+  )
   validateTransactionDerivedWriteSource(
     browserRepoSource,
     exactSource(program, MUTATION_JOURNAL_PATH),
@@ -495,6 +577,8 @@ export function buildDurableCommandPipelineSourceFacts(options = {}) {
       [
         ['workspace', workspaceUnion],
         ['configuration', configurationUnion],
+        ['fanout-admission', fanoutAdmissionUnion],
+        ['replacement-work', replacementWorkUnion],
       ].map(([name, union]) => Object.freeze({ name, id: union.id })),
     ),
     workspaceUnion,
@@ -518,7 +602,9 @@ export function buildDurableCommandPipelineSourceFacts(options = {}) {
     streamLeaseOperationFamily,
     streamJournalAppendFamily,
     streamJournalRetirementFamily,
+    maintenanceOccurrenceFamily,
     scopeDerivedMutationFamily,
+    generatedOutputLocalizationFamily,
     configurationSettingFamily,
     configurationEntityRowFamily,
     configurationKeyMaterialFamily,
@@ -539,6 +625,8 @@ export function buildDurableCommandPipelineSourceFacts(options = {}) {
     chatClosureFamily,
     chatForkFamily,
     interchangeImportFamily,
+    stagedFanoutFamily,
+    b16BoundsClassification,
     sourceArchitectureProblems: Object.freeze(sourceArchitectureProblems.sort()),
     physicalTables: Object.freeze(
       literalArrayValues(
@@ -547,6 +635,427 @@ export function buildDurableCommandPipelineSourceFacts(options = {}) {
       ),
     ),
   })
+}
+
+function stagedFanoutCapabilityFacts(
+  program,
+  browserRepoSource,
+  fanoutAdmissionUnion,
+  replacementWorkUnion,
+  outputProblems,
+) {
+  const commandSource = exactSource(program, BROWSER_STAGED_FANOUT_COMMAND_PATH)
+  const stagedSource = exactSource(program, BROWSER_WORKSPACE_STAGED_FANOUT_PATH)
+  const replacementSource = exactSource(program, BROWSER_WORKSPACE_REPLACEMENT_RUNNER_PATH)
+  const mutationJournalSource = exactSource(program, MUTATION_JOURNAL_PATH)
+  const executeText = findMethod(
+    browserRepoSource,
+    'BrowserWorkspaceRepository',
+    'execute',
+  ).getText(browserRepoSource)
+  const budgetText = findMethod(
+    browserRepoSource,
+    'BrowserWorkspaceRepository',
+    'tryExecuteCommandWithinFanoutBudget',
+  ).getText(browserRepoSource)
+  const stagedExecuteText = findMethod(
+    browserRepoSource,
+    'BrowserWorkspaceRepository',
+    'executeStagedCommand',
+  ).getText(browserRepoSource)
+  const databaseExecuteText = findMethod(
+    browserRepoSource,
+    'BrowserWorkspaceRepository',
+    'executeCommandInDatabase',
+  ).getText(browserRepoSource)
+  const operationText = findFunction(stagedSource, 'stagedFanoutOperation').getText(stagedSource)
+  const copyText = findFunction(stagedSource, 'copyStagedWorkspace').getText(stagedSource)
+  const copyPageText = findFunction(stagedSource, 'readStagedCopyPage').getText(stagedSource)
+  const catchupText = findFunction(stagedSource, 'drainStagedWorkspaceCatchup').getText(
+    stagedSource,
+  )
+  const catchupPageText = findFunction(stagedSource, 'readStagedCatchupPage').getText(stagedSource)
+  const conflictText = findFunction(stagedSource, 'assertNoStagedCommandConflict').getText(
+    stagedSource,
+  )
+  const replacementLaunchText = findFunction(
+    replacementSource,
+    'runGatedBrowserWorkspaceReplacementAttempt',
+  ).getText(replacementSource)
+  const workspaceVariants = literalArrayValues(commandSource, 'STAGED_WORKSPACE_COMMAND_KINDS')
+  const configurationVariants = literalArrayValues(
+    commandSource,
+    'STAGED_CONFIGURATION_COMMAND_KINDS',
+  )
+  const semanticVariants = literalArrayValues(
+    commandSource,
+    'BROWSER_WORKSPACE_STAGED_FANOUT_SEMANTIC_VARIANTS',
+  )
+  const commonKernel = Object.freeze({
+    exactVariantInventory:
+      workspaceVariants.length === 24 &&
+      configurationVariants.length === 4 &&
+      semanticVariants.length === 28 &&
+      new Set(semanticVariants).size === semanticVariants.length,
+    exactFanoutAdmissionProtocol:
+      sameSortedValues(fanoutAdmissionUnion.variants, ['committed', 'staging-required']) &&
+      budgetText.includes("kind: 'committed'") &&
+      budgetText.includes("kind: 'staging-required'") &&
+      executeText.includes("admission.kind === 'committed'") &&
+      executeText.includes('executeBrowserWorkspaceStagedFanoutCommand'),
+    exactReplacementWorkProtocol:
+      sameSortedValues(replacementWorkUnion.variants, ['online', 'quiesced']) &&
+      replacementSource.getText().includes('quiescedBrowserWorkspaceReplacementWork(operation)') &&
+      replacementSource.getText().includes('onlineBrowserWorkspaceReplacementWork(operation)') &&
+      replacementLaunchText.includes("work.kind === 'online'") &&
+      replacementLaunchText.includes("work.kind === 'quiesced'"),
+    adaptiveAtomicAdmission:
+      tokensInOrder(executeText, [
+        'isBrowserWorkspaceStagedFanoutCommand(command)',
+        'browserWorkspaceSlotSwitchingSupported()',
+        'this.tryExecuteCommandWithinFanoutBudget(',
+        "admission.kind === 'committed'",
+        'executeBrowserWorkspaceStagedFanoutCommand',
+      ]) &&
+      budgetText.includes('isBrowserCommandFanoutBudgetExceededError(error)') &&
+      budgetText.includes("return { kind: 'staging-required' }") &&
+      databaseExecuteText.includes('fanoutBudget') &&
+      mutationJournalSource.getText().includes('BrowserCommandFanoutBudgetExceededError') &&
+      mutationJournalSource.getText().includes('fanoutReadRows') &&
+      mutationJournalSource.getText().includes('fanoutWriteRows') &&
+      mutationJournalSource.getText().includes('fanoutBytes'),
+    boundedSourceDestinationCopy:
+      copyText.includes('readStagedCopyPage(') &&
+      copyText.includes('bulkPut(page.rows)') &&
+      copyText.includes('page.lastPrimaryKey') &&
+      copyPageText.includes('rows.length >= STAGED_COPY_MAX_PAGE_ROWS') &&
+      copyPageText.includes('STAGED_COPY_MAX_PAGE_BYTES') &&
+      copyPageText.includes('IDBKeyRange.lowerBound(after, true)') &&
+      copyPageText.includes('estimateStoredValueBytes(cursor.value)'),
+    replacementScopedCatchup:
+      operationText.includes('activateBrowserWorkspaceCatchupJournals(source)') &&
+      operationText.match(/drainStagedWorkspaceCatchup\(/gu)?.length === 3 &&
+      operationText.includes("mode: 'online'") &&
+      operationText.includes("mode: 'final'") &&
+      operationText.includes('deactivateSourceCatchupJournals') &&
+      catchupText.includes('STAGED_FINAL_CATCHUP_MAX_ROWS') &&
+      catchupText.includes('STAGED_FINAL_CATCHUP_MAX_BYTES') &&
+      catchupPageText.includes('STAGED_COPY_MAX_PAGE_ROWS') &&
+      catchupPageText.includes('STAGED_COPY_MAX_PAGE_BYTES'),
+    exactConflictClosure:
+      operationText.includes('conflictEvidence: execution.conflictEvidence') &&
+      operationText.includes('conflictEvidence: prepared.execution.conflictEvidence') &&
+      conflictText.includes('evidence.readAddresses') &&
+      conflictText.includes('evidence.mutationAddresses') &&
+      conflictText.includes('evidence.readScopes') &&
+      conflictText.includes('BrowserWorkspaceStagedCommandConflict'),
+    oneDestinationCommand:
+      countOccurrences(operationText, 'executeBrowserCommandInStagedDatabase(') === 1 &&
+      stagedExecuteText.includes('stagedCommandLockSession(db)') &&
+      stagedExecuteText.includes('stagedStorageCompactionWriteAdmission(db.name)') &&
+      stagedExecuteText.includes('false') &&
+      databaseExecuteText.includes('retainFullChatStates') &&
+      operationText.includes('prepared.execution.commit') &&
+      operationText.includes("publication: 'deferred' as const"),
+    sourceCanonicalUnchangedOnFailure:
+      operationText.includes('context.withSourceDatabase(async (source) => {') &&
+      operationText.includes('executeBrowserCommandInStagedDatabase(\n          destination,') &&
+      !operationText.includes('executeBrowserCommandInStagedDatabase(\n          source,') &&
+      operationText.includes('abandon: (sourceDatabaseName) =>') &&
+      operationText.includes('deactivateSourceCatchupJournals(sourceDatabaseName)'),
+    noTimerOrProvenanceGate: ![executeText, budgetText, operationText, copyText, catchupText].some(
+      (text) => text.includes('setTimeout(') || text.includes('WeakMap'),
+    ),
+  })
+  for (const [name, consumed] of Object.entries(commonKernel)) {
+    if (!consumed) outputProblems.push(`staged fanout family missing ${name}`)
+  }
+  return Object.freeze({
+    variants: Object.freeze(semanticVariants),
+    workspaceVariants: Object.freeze(workspaceVariants),
+    configurationVariants: Object.freeze(configurationVariants),
+    commonKernel,
+    consumed: Object.values(commonKernel).every(Boolean),
+  })
+}
+
+function classifyB16RemainingBounds(semanticCapabilities, families, outputProblems) {
+  const {
+    chatCalibrationFamily,
+    maintenanceOccurrenceFamily,
+    scopeDerivedMutationFamily,
+    generatedOutputLocalizationFamily,
+    configurationTargetFanoutFamily,
+    configurationConnectionDeleteFamily,
+    folderFamily,
+    chatOrganizationFamily,
+    chatClosureFamily,
+    chatForkFamily,
+    interchangeImportFamily,
+    stagedFanoutFamily,
+  } = families
+  const fixed = scopeDerivedMutationFamily.fixedReceiptFamily
+  const finiteCohorts = Object.freeze([
+    Object.freeze({
+      proof: 'scope-derived:attempt-prepare',
+      variants: Object.freeze([fixed.attemptPrepare.variant]),
+      proved:
+        proofKeysComplete(fixed.attemptPrepare.commonKernel, [
+          'noExternalChatPreflight',
+          'exactTableCompilation',
+        ]) &&
+        proofKeysComplete(fixed.attemptPrepare.replayCommonKernel, [
+          'oneCommandSubmission',
+          'oneGenerationOccurrence',
+          'runningRuntimeSingleInvoke',
+          'waitingRuntimeSingleInvoke',
+          'admittedRootSingleInvoke',
+        ]),
+    }),
+    Object.freeze({
+      proof: 'scope-derived:attempt-finalize',
+      variants: Object.freeze([fixed.attemptFinalize.variant]),
+      proved: proofKeysComplete(fixed.attemptFinalize.commonKernel, [
+        'noExternalLeasePreflight',
+        'transactionOwnsLeaseIdentity',
+        'exactResourceScope',
+      ]),
+    }),
+    Object.freeze({
+      proof: 'scope-derived:draft-put',
+      variants: Object.freeze([fixed.draftPut.variant]),
+      proved: proofKeysComplete(fixed.draftPut.commonKernel, [
+        'narrowTransactionProfile',
+        'oneApplicationSubmission',
+        'noRetryOrBroadPlanning',
+        'runningRuntimeSingleInvoke',
+        'waitingRuntimeSingleInvoke',
+        'admittedRootSingleInvoke',
+      ]),
+    }),
+    Object.freeze({
+      proof: 'scope-derived:message-edit',
+      variants: Object.freeze(['message.edit-content']),
+      proved: proofKeysComplete(fixed.messageCommandExact.commonKernel, [
+        'onePreflightPerCommandPath',
+        'targetShapedCachedReads',
+        'singlePassExistingMessageCompiler',
+        'exactOccurrencePolicies',
+        'noRetryOrBroadLock',
+      ]),
+    }),
+    Object.freeze({
+      proof: 'catalog:chat-set-tags',
+      variants: Object.freeze(['chat.set-tags-from-names']),
+      proved:
+        proofKeysComplete(chatOrganizationFamily.commonKernel, [
+          'transactionLocalSelection',
+          'candidateShapedTagWork',
+          'noLegacyPlanning',
+        ]) &&
+        proofKeysComplete(chatOrganizationFamily.tagsOccurrence, [
+          'exactOccurrenceExecution',
+          'noRetryOrLegacyBoundary',
+        ]),
+    }),
+    Object.freeze({
+      proof: 'catalog:bounded-chat-closure-page',
+      variants: chatClosureFamily.variants,
+      proved:
+        proofKeysComplete(chatClosureFamily.commonKernel, [
+          'transactionLocalEligibility',
+          'oneClosureOwner',
+          'boundedCommandWork',
+          'noLegacyPlanning',
+        ]) &&
+        proofKeysComplete(chatClosureFamily.occurrence, [
+          'exactOccurrenceExecution',
+          'noRetryOrLegacyBoundary',
+        ]),
+    }),
+    Object.freeze({
+      proof: 'interchange:admitted-envelope',
+      variants: interchangeImportFamily.variants,
+      proved:
+        proofKeysComplete(interchangeImportFamily.commonKernel, [
+          'transactionLocalResolution',
+          'indexedCatalogResolution',
+          'boundedTranscriptWrites',
+          'singleCurrentGraphCompiler',
+          'noLegacyPlanning',
+        ]) &&
+        proofKeysComplete(interchangeImportFamily.occurrence, [
+          'exactOccurrenceExecution',
+          'noRetryOrLegacyBoundary',
+        ]),
+    }),
+  ])
+  const stagedCohorts = Object.freeze([
+    Object.freeze({
+      findingId: 'F-B1-08',
+      variants: configurationConnectionDeleteFamily.variants,
+    }),
+    Object.freeze({
+      findingId: 'F-B1-09',
+      variants: configurationTargetFanoutFamily.variants,
+    }),
+    Object.freeze({
+      findingId: 'F-B1-10',
+      variants: Object.freeze(
+        chatCalibrationFamily.variants.filter((variant) => variant !== 'chat.calibration.clear'),
+      ),
+    }),
+    Object.freeze({
+      findingId: 'F-B1-14',
+      variants: Object.freeze([
+        fixed.attachmentBytesDelete.variant,
+        fixed.attachmentBundleWrite.variant,
+        fixed.attachmentDeleteIfUnreferenced.variant,
+        fixed.attachmentDeleteMany.variant,
+        fixed.attachmentReap.variant,
+        ...fixed.attachmentReference.variants,
+        ...generatedOutputLocalizationFamily.variants,
+        ...fixed.messageCommandExact.variants.filter(
+          (variant) => variant !== 'message.edit-content',
+        ),
+        ...folderFamily.variants.filter(
+          (variant) => variant !== 'folder.create' && variant !== 'folder.update',
+        ),
+        ...maintenanceOccurrenceFamily.variants,
+        ...chatForkFamily.variants,
+      ]),
+    }),
+  ])
+  compareExact(
+    'B2.2 staged fanout variants',
+    [...stagedFanoutFamily.variants].sort(),
+    stagedCohorts.flatMap(({ variants }) => [...variants]).sort(),
+    outputProblems,
+  )
+  const openVariants = [...semanticCapabilities]
+    .filter(([, capability]) => capability.boundsProved !== true)
+    .map(([variant]) => variant)
+    .sort()
+  const classifications = new Map()
+  for (const cohort of finiteCohorts) {
+    for (const variant of cohort.variants) {
+      classifyFiniteBound(
+        semanticCapabilities,
+        classifications,
+        variant,
+        cohort.proof,
+        cohort.proved,
+        outputProblems,
+      )
+    }
+  }
+  for (const cohort of stagedCohorts) {
+    for (const variant of cohort.variants) {
+      classifyStagedBound(
+        semanticCapabilities,
+        classifications,
+        variant,
+        cohort.findingId,
+        stagedFanoutFamily.consumed,
+        outputProblems,
+      )
+    }
+  }
+  compareExact(
+    'B1.6.7 bounds classifications',
+    openVariants,
+    [...classifications.keys()].sort(),
+    outputProblems,
+  )
+  const finiteVariants = [...classifications]
+    .filter(([, classification]) => classification.kind === 'finite')
+    .map(([variant]) => variant)
+    .sort()
+  const stagedVariants = [...classifications]
+    .filter(([, classification]) => classification.kind === 'staged')
+    .map(([variant]) => variant)
+    .sort()
+  if (finiteVariants.length !== 11 || stagedVariants.length !== 28) {
+    outputProblems.push(
+      `B2.2 bounds classification count expected finite=11/staged=28, found finite=${finiteVariants.length}/staged=${stagedVariants.length}`,
+    )
+  }
+  return Object.freeze({
+    finiteVariants: Object.freeze(finiteVariants),
+    stagedVariants: Object.freeze(stagedVariants),
+    carriedVariants: Object.freeze([]),
+    classifications: frozenScalarRecord(classifications),
+  })
+}
+
+function classifyFiniteBound(
+  semanticCapabilities,
+  classifications,
+  variant,
+  proof,
+  cohortProved,
+  outputProblems,
+) {
+  const capability = semanticCapabilities.get(variant)
+  if (!capability) {
+    outputProblems.push(`B1.6.7 finite bounds capability missing ${variant}`)
+    return
+  }
+  if (!cohortProved || capability.boundsProved === true) {
+    outputProblems.push(`B1.6.7 finite bounds proof incomplete ${variant}`)
+    return
+  }
+  const classification = Object.freeze({ kind: 'finite', proof })
+  classifications.set(variant, classification)
+  semanticCapabilities.set(
+    variant,
+    Object.freeze({
+      ...capability,
+      boundsProved: true,
+      boundsClassification: classification,
+    }),
+  )
+}
+
+function classifyStagedBound(
+  semanticCapabilities,
+  classifications,
+  variant,
+  findingId,
+  stagedOwnerProved,
+  outputProblems,
+) {
+  const capability = semanticCapabilities.get(variant)
+  const owner = B16_BOUNDS_CARRY_OWNERS[findingId]
+  if (!capability || !owner) {
+    outputProblems.push(`B2.2 staged bounds capability invalid ${variant}:${findingId}`)
+    return
+  }
+  if (!stagedOwnerProved || capability.boundsProved === true) {
+    outputProblems.push(`B2.2 staged bounds proof incomplete ${variant}:${findingId}`)
+    return
+  }
+  const classification = Object.freeze({
+    kind: 'staged',
+    findingId,
+    carriedFrom: owner,
+    owner: 'B2.2',
+    proof: 'generic-bounded-staged-fanout',
+  })
+  classifications.set(variant, classification)
+  const { boundsDisposition: _legacyBoundsDisposition, ...baseCapability } = capability
+  semanticCapabilities.set(
+    variant,
+    Object.freeze({
+      ...baseCapability,
+      boundsProved: true,
+      boundsClassification: classification,
+    }),
+  )
+}
+
+function proofKeysComplete(record, keys) {
+  return keys.every((key) => record[key] === true)
 }
 
 export function evaluateDurableCommandPipeline(
@@ -587,15 +1096,11 @@ export function evaluateDurableCommandPipeline(
   const semanticCapabilities = new Map(
     Object.entries(semanticCapabilityRecord ?? {}).map(([variant, capability]) => [
       variant,
-      commandLifetimeProved
-        ? capability
-        : Object.freeze({
-            ...capability,
-            tablesProved: false,
-            boundsProved: false,
-          }),
+      commandLifetimeProved ? capability : capabilityWithoutCommandLifetimeProof(capability),
     ]),
   )
+  const problems = []
+  validateBoundsDispositions(semanticCapabilities, problems)
   const effectiveWorkspacePipelines = applySemanticCapabilityStages(
     WORKSPACE_COMMAND_PIPELINES,
     semanticCapabilities,
@@ -604,7 +1109,6 @@ export function evaluateDurableCommandPipeline(
     CONFIGURATION_COMMAND_PIPELINES,
     semanticCapabilities,
   )
-  const problems = []
   compareExact(
     'workspace command pipeline variants',
     workspaceUnion.variants,
@@ -741,6 +1245,20 @@ export function evaluateDurableCommandPipeline(
   const gapStageCounts = Object.fromEntries(
     requiredStages.map((stage) => [stage, gaps.filter((gap) => gap.stage === stage).length]),
   )
+  const workspaceVariants = new Set(workspaceUnion.variants)
+  const carriedBounds = Object.freeze(
+    [...semanticCapabilities].flatMap(([variant, capability]) =>
+      capability.boundsDisposition
+        ? [
+            Object.freeze({
+              scope: workspaceVariants.has(variant) ? 'workspace' : 'configuration',
+              variant,
+              ...capability.boundsDisposition,
+            }),
+          ]
+        : [],
+    ),
+  )
   const structurallyValid = problems.length === 0
   return Object.freeze({
     mode,
@@ -766,14 +1284,15 @@ export function evaluateDurableCommandPipeline(
     semanticCapabilityCommands: semanticCapabilities.size,
     physicalTables: facts.physicalTables,
     gapStageCounts,
+    finiteClassifiedBoundCells: facts.b16BoundsClassification?.finiteVariants.length ?? 0,
+    stagedClassifiedBoundCells: facts.b16BoundsClassification?.stagedVariants.length ?? 0,
+    carriedBoundCells: carriedBounds.length,
+    carriedBounds,
     ...(options.detail ? { records: allRecords, gaps } : {}),
     limitations: Object.freeze([
-      'Transaction table guards prove only tables declared by a selected helper; command-to-helper-to-table completeness remains unproven.',
-      'Transaction-local mutation facts close write detection, but the exact semantic meaning of each mutated table is not inferred from bytes alone.',
-      'Physical evidence is checked against the generic commit envelope, but exact command-to-semantic-effect completeness remains a per-command gap.',
-      'A permitted-write guard does not close physical-write completeness until the command capability requires its primary writes.',
-      'Effect-kind guards do not close receipt/delta completeness until exact dependency identities, facets, keys, and cardinality are capability-derived.',
-      'Retry idempotence and work/memory bounds remain explicit gaps until each command has executable proof.',
+      'B1 finite bounds prove command-lifetime request and row cardinality; exact retained-byte ceilings remain a later storage measurement obligation.',
+      'The exact 28 former carries use the B2.2 staged copy/catch-up/activation owner; B2.3 crash/reopen and competing-tab replacement outcomes remain separate closure obligations.',
+      'Zero pipeline gaps is B2.2 source closure, not B5 unchanged-candidate/browser/large-store durability closure.',
     ]),
     problems: Object.freeze(problems.sort()),
   })
@@ -806,10 +1325,10 @@ function configurationEnvelopeCapabilityFacts(
     browserRepoSource,
     'workspaceCommandSemanticOperationKind',
   ).getText(browserRepoSource)
-  const repositoryExecuteText = findMethod(
+  const databaseExecuteText = findMethod(
     browserRepoSource,
     'BrowserWorkspaceRepository',
-    'execute',
+    'executeCommandInDatabase',
   ).getText(browserRepoSource)
   const envelopeText = [dispatchBody, executorText].join('\n')
   const commonKernel = {
@@ -830,9 +1349,9 @@ function configurationEnvelopeCapabilityFacts(
       ) &&
       kindResolverText.includes('return command.kind'),
     exactEnvelopeCommitIdentity:
-      countOccurrences(repositoryExecuteText, 'workspaceCommandSemanticOperationKind(command)') ===
+      countOccurrences(databaseExecuteText, 'workspaceCommandSemanticOperationKind(command)') ===
         1 &&
-      !repositoryExecuteText.includes(
+      !databaseExecuteText.includes(
         "command.kind === 'configuration.execute'\n          ? configurationSemanticOperationKind",
       ),
     exactEnvelopeDispatch:
@@ -1246,8 +1765,14 @@ function applySemanticCapabilityStages(records, capabilities) {
                 }
               : {}),
             rollback: observedStage(`${proof}:fenced-transaction`),
-            ...(capability.boundsProved
-              ? { bounds: observedStage(`${proof}:bounded-physical-io`) }
+            ...(capability.boundsProved || capability.boundsDisposition
+              ? {
+                  bounds: observedStage(
+                    capability.boundsProved
+                      ? `${proof}:bounded-physical-io`
+                      : `${proof}:bounds-carried:${capability.boundsDisposition.findingId}:${capability.boundsDisposition.owner}`,
+                  ),
+                }
               : {}),
             ...(capability.idempotenceProved
               ? { idempotence: observedStage(`${proof}:replay-policy`) }
@@ -1257,6 +1782,33 @@ function applySemanticCapabilityStages(records, capabilities) {
       }),
     ),
   )
+}
+
+function capabilityWithoutCommandLifetimeProof(capability) {
+  const {
+    boundsDisposition: _boundsDisposition,
+    boundsClassification: _boundsClassification,
+    ...unproved
+  } = capability
+  return Object.freeze({
+    ...unproved,
+    tablesProved: false,
+    boundsProved: false,
+  })
+}
+
+function validateBoundsDispositions(capabilities, problems) {
+  for (const [variant, capability] of capabilities) {
+    const disposition = capability.boundsDisposition
+    if (!disposition) continue
+    if (
+      disposition.kind !== 'carried' ||
+      B16_BOUNDS_CARRY_OWNERS[disposition.findingId] !== disposition.owner ||
+      capability.boundsProved === true
+    ) {
+      problems.push(`semantic operation ${variant}: invalid bounds disposition`)
+    }
+  }
 }
 
 function observedStage(proof) {
@@ -1314,6 +1866,8 @@ function semanticOperationCapabilityFacts(program, outputProblems) {
           'STREAM_FINISH_CLEANUP_OPERATION',
           'STREAM_JOURNAL_INTEGRITY_OPERATION',
           'TERMINAL_STREAM_RETENTION_OPERATION',
+          'EMPTY_DRAFT_RETENTION_OPERATION',
+          'ATTACHMENT_INTEGRITY_OPERATION',
         ].includes(owner)
       ) {
         return
@@ -1548,7 +2102,7 @@ function singleChatMetadataCapabilityFacts(
       planText.match(/maxBytes: Number\.MAX_SAFE_INTEGER/gu)?.length === 2,
     finalizationReadFree:
       journalTransactionText.includes('finalChatById: new Map()') &&
-      journalTransactionText.includes('requiredFinalChatState(journal, chatId)') &&
+      journalTransactionText.includes('finalChatState(journal, chatId)') &&
       !journalTransactionText.includes('bulkGet(chatIds)'),
     callerSingleAttemptOwned: Object.values(callerSingleAttempt).every(Boolean),
     noRepositoryDatabasePreopen: variants.every(([, , method]) => {
@@ -1858,16 +2412,15 @@ function chatCalibrationCapabilityFacts(program, catalogSource, outputProblems) 
     callerSingleAttemptOwned: Object.values(callerSingleAttempt).every(Boolean),
     finalizationReadSubtracted:
       mutationJournalSource.getText().includes('finalChatById: Map<ChatId, Chat | null>') &&
-      mutationJournalSource.getText().includes('requiredFinalChatState(journal, chatId)') &&
+      mutationJournalSource.getText().includes('finalChatState(journal, chatId)') &&
       !mutationJournalSource.getText().includes("tx.table<Chat, ChatId>('chats').bulkGet(chatIds)"),
     atomicFanoutAdmitted:
-      fanoutTransactionText.includes('const chatMutation = openPreservingChatMutation(tx)') &&
-      fanoutTransactionText.includes('const rows = await chatMutation.readAll()') &&
-      fanoutTransactionText.includes('const changedChats = rows.map(') &&
-      fanoutTransactionText.includes(
-        'for (const next of changedChats) chatMutation.replace(next.id, () => next)',
-      ) &&
-      fanoutTransactionText.includes('const transition = await chatMutation.commit()') &&
+      fanoutTransactionText.includes('CHAT_CALIBRATION_FANOUT_PAGE_SIZE') &&
+      fanoutTransactionText.includes("chats.where(':id').above(afterChatId)") &&
+      fanoutTransactionText.includes('.limit(CHAT_CALIBRATION_FANOUT_PAGE_SIZE)') &&
+      fanoutTransactionText.includes('applyPreservingChatRowReplacements(tx, replacements)') &&
+      fanoutTransactionText.includes('receiptAccumulator.absorb(') &&
+      fanoutTransactionText.includes('receiptAccumulator.dependency(') &&
       fanoutPlanText.match(/Number\.MAX_SAFE_INTEGER/gu)?.length === 8,
   }
   const singleFiniteBounds =
@@ -1901,9 +2454,6 @@ function chatCalibrationCapabilityFacts(program, catalogSource, outputProblems) 
             boundsProved: kind === 'chat.calibration.clear' && consumed,
             byteBoundsProved: false,
             idempotenceProved: consumed,
-            ...(kind === 'chat.calibration.clear'
-              ? {}
-              : { boundsDisposition: 'admitted-atomic-calibration-fanout' }),
           }),
         ]),
       ),
@@ -2504,6 +3054,367 @@ function streamJournalRetirementCapabilityFacts(program, browserRepoSource, outp
   })
 }
 
+function exactOccurrenceCapabilityFacts(descriptorTexts, commandTexts, replayEvidence) {
+  const descriptors = Array.isArray(descriptorTexts) ? descriptorTexts : [descriptorTexts]
+  const commands = Array.isArray(commandTexts) ? commandTexts : [commandTexts]
+  return Object.freeze({
+    exactReceiptContracts: descriptors.every(
+      (text) =>
+        text.includes('semanticOperationExactReceiptContracts<') && text.includes('undefined'),
+    ),
+    exactOccurrenceExecution: commands.every(
+      (text) =>
+        text.includes('semanticOperationExactOccurrenceReceipt<') &&
+        text.includes('semanticOperationExecution('),
+    ),
+    explicitReplay:
+      descriptors.every((text) => text.includes(replayEvidence.descriptor)) &&
+      commands.every((text) => text.includes(replayEvidence.execution)),
+    noRetryOrLegacyBoundary: commands.every(
+      (text) =>
+        !text.includes('for (;;)') &&
+        !text.includes('setTimeout(') &&
+        !text.includes('.withLocks(') &&
+        !text.includes('catch ('),
+    ),
+  })
+}
+
+function maintenanceOccurrenceCapabilityFacts(browserRepoSource, outputProblems) {
+  const variants = Object.freeze([
+    {
+      kind: 'maintenance.prune-empty-draft-chats',
+      owner: 'EMPTY_DRAFT_RETENTION_OPERATION',
+      transaction: 'EMPTY_DRAFT_RETENTION_TRANSACTION_CAPABILITY',
+      command: 'pruneEmptyDraftChats',
+      replay: 'emptyDraftRetentionReplayPlan(',
+    },
+    {
+      kind: 'maintenance.reconcile-attachment-integrity',
+      owner: 'ATTACHMENT_INTEGRITY_OPERATION',
+      transaction: 'ATTACHMENT_INTEGRITY_TRANSACTION_CAPABILITY',
+      command: 'reconcileAttachmentIntegrity',
+      replay: 'attachmentIntegrityReplayPlan(',
+    },
+  ])
+  const capabilities = {}
+  const facts = {}
+  for (const variant of variants) {
+    const descriptor = findVariableInitializer(browserRepoSource, variant.owner).getText(
+      browserRepoSource,
+    )
+    const command = findMethod(
+      browserRepoSource,
+      'BrowserWorkspaceRepository',
+      variant.command,
+    ).getText(browserRepoSource)
+    const occurrence = exactOccurrenceCapabilityFacts(descriptor, command, {
+      descriptor: 'semanticOperationExactReceiptReplayProofContract<',
+      execution: variant.replay,
+    })
+    const common = Object.freeze({
+      literalDescriptor: descriptor.includes(`operationKind: '${variant.kind}'`),
+      exactTransaction:
+        descriptor.includes(`transaction: ${variant.transaction}`) &&
+        descriptor.includes(`permittedWrites: ${variant.transaction}.tableNames`),
+      transactionLocalState:
+        variant.kind === 'maintenance.prune-empty-draft-chats'
+          ? command.includes('readStorageRetentionState(tx,') &&
+            command.includes('deleteEligibleEmptyDraftChatClosure(')
+          : command.includes('reconcileAttachmentIntegrityPage(tx,'),
+      ...occurrence,
+    })
+    for (const [name, proved] of Object.entries(common)) {
+      if (!proved) outputProblems.push(`${variant.kind} occurrence receipt missing ${name}`)
+    }
+    const proved = Object.values(common).every(Boolean)
+    facts[variant.kind] = common
+    capabilities[variant.kind] = Object.freeze({
+      path: BROWSER_REPO_PATH,
+      owner: variant.owner,
+      transaction: variant.transaction,
+      consumed: proved,
+      physicalWritesProved: proved,
+      exactPhysicalWritesProved: proved,
+      exactEffectsProved: proved,
+      tablesProved: proved,
+      boundsProved: false,
+      byteBoundsProved: false,
+      idempotenceProved: proved,
+    })
+  }
+  return Object.freeze({
+    variants: Object.freeze(variants.map(({ kind }) => kind)),
+    facts: Object.freeze(facts),
+    capabilities: Object.freeze(capabilities),
+  })
+}
+
+function generatedOutputLocalizationCapabilityFacts(
+  program,
+  browserRepoSource,
+  workspaceUnion,
+  scopeCommonKernel,
+  outputProblems,
+) {
+  const protocolSource = exactSource(program, 'src/store/workspace-protocol.ts')
+  const runtimeSource = exactSource(program, GENERATED_OUTPUT_LOCALIZATION_RUNTIME_PATH)
+  const mutationPlanSource = exactSource(program, 'src/store/browser-mutation-plan.ts')
+  const mutationRuntimeSource = exactSource(program, 'src/store/browser-mutation-runtime.ts')
+  const protocolInterfaceText = (name) => {
+    const declaration = protocolSource.statements.find(
+      (statement) => ts.isInterfaceDeclaration(statement) && statement.name.text === name,
+    )
+    if (!declaration) throw new Error(`interface not found: ${name}`)
+    return declaration.getText(protocolSource)
+  }
+  const declaredVariants = workspaceUnion.variants.filter((variant) =>
+    variant.startsWith('generated-output.'),
+  )
+  compareExact(
+    'generated output localization variants',
+    GENERATED_OUTPUT_LOCALIZATION_VARIANTS,
+    declaredVariants,
+    outputProblems,
+  )
+  const repositoryOwners = Object.freeze({
+    'generated-output.localization-claim': 'claimGeneratedOutputLocalization',
+    'generated-output.localization-complete': 'completeGeneratedOutputLocalization',
+    'generated-output.localization-fail': 'failGeneratedOutputLocalization',
+    'generated-output.localization-retry': 'retryGeneratedOutputLocalization',
+    'generated-output.video-expand': 'expandGeneratedOutputVideo',
+  })
+  const runtimeOwners = Object.freeze({
+    'generated-output.localization-claim': 'processJobWithPermit',
+    'generated-output.localization-complete': 'processRemoteDownload',
+    'generated-output.localization-fail': 'failClaim',
+    'generated-output.localization-retry': 'retryClaim',
+    'generated-output.video-expand': 'processVideoPollingJob',
+  })
+  const replayReasons = Object.freeze({
+    'generated-output.localization-claim': 'random-identity',
+    'generated-output.localization-complete': 'unfenced-relative-update',
+    'generated-output.localization-fail': 'unfenced-relative-update',
+    'generated-output.localization-retry': 'unfenced-relative-update',
+    'generated-output.video-expand': 'non-replayable',
+  })
+  const repositoryMethods = Object.fromEntries(
+    GENERATED_OUTPUT_LOCALIZATION_VARIANTS.map((variant) => [
+      variant,
+      findMethod(browserRepoSource, 'BrowserWorkspaceRepository', repositoryOwners[variant]),
+    ]),
+  )
+  const repositoryTexts = Object.fromEntries(
+    Object.entries(repositoryMethods).map(([variant, method]) => [
+      variant,
+      method.getText(browserRepoSource),
+    ]),
+  )
+  const runtimeFunctions = Object.fromEntries(
+    GENERATED_OUTPUT_LOCALIZATION_VARIANTS.map((variant) => [
+      variant,
+      findFunction(runtimeSource, runtimeOwners[variant]),
+    ]),
+  )
+  const runtimeTexts = Object.fromEntries(
+    Object.entries(runtimeFunctions).map(([variant, owner]) => [
+      variant,
+      owner.getText(runtimeSource),
+    ]),
+  )
+  const receiptPolicy = findFunction(mutationPlanSource, 'scopeDerivedMutationReceiptPolicy')
+  const policyBodies = switchCaseBodiesForExpression(
+    receiptPolicy,
+    'command.kind',
+    mutationPlanSource,
+  )
+  const queueText = findMethod(
+    browserRepoSource,
+    'BrowserWorkspaceRepository',
+    'getGeneratedOutputLocalizationQueue',
+  ).getText(browserRepoSource)
+  const videoPlanText = findFunction(
+    browserRepoSource,
+    'readGeneratedOutputVideoExpansionPlan',
+  ).getText(browserRepoSource)
+  const videoRepositoryText = repositoryTexts['generated-output.video-expand']
+  const videoRuntimeText = runtimeTexts['generated-output.video-expand']
+  const scopeKernelProved = Object.values(scopeCommonKernel).every(Boolean)
+  const runtimeSubmitFacts = Object.fromEntries(
+    GENERATED_OUTPUT_LOCALIZATION_VARIANTS.map((variant) => {
+      const owner = runtimeFunctions[variant]
+      const submits = executableCalls(owner).filter((call) =>
+        call.expression.getText(runtimeSource).endsWith('.execute'),
+      )
+      return [
+        variant,
+        submits.length === 1 &&
+          !callHasIterationAncestor(submits[0], owner) &&
+          countOccurrences(runtimeTexts[variant], `kind: '${variant}'`) === 1,
+      ]
+    }),
+  )
+  const exactOccurrencePolicies = Object.fromEntries(
+    GENERATED_OUTPUT_LOCALIZATION_VARIANTS.map((variant) => {
+      const body = policyBodies.get(variant) ?? ''
+      return [
+        variant,
+        body.includes('exactOccurrence: true') &&
+          body.includes(`replayReason: '${replayReasons[variant]}'`),
+      ]
+    }),
+  )
+  const commonKernel = Object.freeze({
+    exactFamily:
+      declaredVariants.length === GENERATED_OUTPUT_LOCALIZATION_VARIANTS.length &&
+      GENERATED_OUTPUT_LOCALIZATION_VARIANTS.every((variant) => declaredVariants.includes(variant)),
+    typedTarget:
+      protocolInterfaceText('GeneratedOutputLocalizationTarget').includes('jobId: string') &&
+      protocolInterfaceText('GeneratedOutputLocalizationTarget').includes(
+        'attachmentId: AttachmentId',
+      ) &&
+      [
+        'GeneratedOutputLocalizationClaimInput',
+        'GeneratedOutputLocalizationCompleteInput',
+        'GeneratedOutputLocalizationFailInput',
+        'GeneratedOutputLocalizationRetryInput',
+        'GeneratedOutputVideoExpandInput',
+      ].every(
+        (name) =>
+          protocolInterfaceText(name).includes('jobId: string') &&
+          protocolInterfaceText(name).includes('attachmentId: AttachmentId'),
+      ),
+    queueCarriesTarget:
+      queueText.includes('.toArray()') &&
+      !queueText.includes('.primaryKeys()') &&
+      queueText.includes('readyJobs: [...pending, ...expired].map((job) => ({') &&
+      queueText.includes('jobId: job.id') &&
+      queueText.includes('attachmentId: job.attachmentId'),
+    runtimeCarriesTarget:
+      runtimeSource
+        .getText()
+        .includes(
+          'for (const target of snapshot.readyJobs.slice(0, slots)) startJob(target, cycle)',
+        ) &&
+      runtimeTexts['generated-output.localization-claim'].includes(
+        'input: { ...target, leaseId, now, leaseExpiresAt: now + LEASE_TTL_MS }',
+      ) &&
+      GENERATED_OUTPUT_LOCALIZATION_VARIANTS.filter(
+        (variant) => variant !== 'generated-output.localization-claim',
+      ).every((variant) => runtimeTexts[variant].includes('attachmentId')),
+    noExternalJobLookup:
+      !browserRepoSource.getText().includes('generatedOutputLocalizationAttachmentId') &&
+      GENERATED_OUTPUT_LOCALIZATION_VARIANTS.every(
+        (variant) => !repositoryTexts[variant].includes('this.openDb('),
+      ),
+    transactionPrimaryJobLookup:
+      GENERATED_OUTPUT_LOCALIZATION_VARIANTS.every(
+        (variant) =>
+          repositoryTexts[variant].includes('await ctx.getAttachmentJob(input.jobId)') &&
+          repositoryTexts[variant].includes('job?.attachmentId !== attachmentId') &&
+          !repositoryTexts[variant].includes('ctx.getAttachmentJobs('),
+      ) &&
+      mutationRuntimeSource
+        .getText()
+        .includes(
+          "getAttachmentJob: async (jobId) =>\n          tx.table<AttachmentJob, string>('attachmentJobs').get(jobId)",
+        ),
+    oneSemanticMutation: GENERATED_OUTPUT_LOCALIZATION_VARIANTS.every(
+      (variant) =>
+        countOccurrences(repositoryTexts[variant], 'this.runMutation(') === 1 &&
+        !repositoryTexts[variant].includes('.withLocks('),
+    ),
+    oneExactOccurrenceReceipt:
+      scopeKernelProved &&
+      scopeCommonKernel.oneExactOccurrenceReceipt &&
+      scopeCommonKernel.exactPhysicalWriteReceipt &&
+      scopeCommonKernel.runtimeTableFence,
+    explicitReplay:
+      GENERATED_OUTPUT_LOCALIZATION_VARIANTS.every((variant) => exactOccurrencePolicies[variant]) &&
+      mutationPlanSource.getText().includes('semanticOperationCallerSingleAttemptReplayContract<'),
+    runtimeSingleSubmit:
+      GENERATED_OUTPUT_LOCALIZATION_VARIANTS.every((variant) => runtimeSubmitFacts[variant]) &&
+      Object.values(workspaceRuntimeSingleAttemptFacts(program)).every(Boolean),
+    typedVideoPreflight:
+      videoPlanText.includes('commit.readSemanticOperationPreflight(') &&
+      videoPlanText.includes("physicalStorageTables('attachmentRefEdges')") === false &&
+      browserRepoSource
+        .getText()
+        .includes(
+          "const GENERATED_OUTPUT_VIDEO_PREFLIGHT_TRANSACTION_PLAN = physicalTransactionPlan(\n  physicalStorageTables('attachmentRefEdges'),\n)",
+        ) &&
+      videoPlanText.includes(".table<AttachmentReferenceEdge, string>('attachmentRefEdges')") &&
+      videoPlanText.includes(".where('attachmentId')") &&
+      videoPlanText.includes("indexName: 'attachmentId'"),
+    noVideoRetryLoop:
+      countOccurrences(
+        videoRepositoryText,
+        'readGeneratedOutputVideoExpansionPlan(commit, attachmentId)',
+      ) === 1 &&
+      countOccurrences(videoRepositoryText, 'this.runMutation(') === 1 &&
+      !videoRepositoryText.includes('for (;;)') &&
+      !videoRepositoryText.includes('catch (') &&
+      !browserRepoSource.getText().includes('GeneratedOutputLocalizationPlanChangedError'),
+    planChangedBeforeWrites: tokensInOrder(videoRepositoryText, [
+      'const currentEdges = await ctx.getAttachmentReferenceEdges(attachmentId)',
+      "outcome: 'plan-changed' as const",
+      'const replacementIds = input.attachmentBundles.map(',
+      'await persistPreparedAttachmentBundleInMutation(ctx, bundle)',
+    ]),
+    typedPlanChangedLifecycle:
+      protocolInterfaceText('GeneratedOutputVideoExpandResult').includes(
+        "'committed' | 'stale' | 'missing' | 'plan-changed'",
+      ) &&
+      countOccurrences(videoRuntimeText, "expansion.outcome === 'plan-changed'") === 1 &&
+      tokensInOrder(videoRuntimeText, [
+        "if (expansion.outcome === 'plan-changed')",
+        'await retryClaim(',
+        "'video-expansion-plan-changed'",
+        '0,',
+        'false,',
+      ]),
+  })
+  for (const [name, proved] of Object.entries(commonKernel)) {
+    if (!proved) outputProblems.push(`generated output localization family missing ${name}`)
+  }
+  const exactOccurrenceProved =
+    commonKernel.exactFamily &&
+    commonKernel.typedTarget &&
+    commonKernel.queueCarriesTarget &&
+    commonKernel.runtimeCarriesTarget &&
+    commonKernel.noExternalJobLookup &&
+    commonKernel.transactionPrimaryJobLookup &&
+    commonKernel.oneSemanticMutation &&
+    commonKernel.oneExactOccurrenceReceipt
+  const replayProved =
+    exactOccurrenceProved &&
+    commonKernel.explicitReplay &&
+    commonKernel.runtimeSingleSubmit &&
+    commonKernel.noVideoRetryLoop &&
+    commonKernel.typedPlanChangedLifecycle
+  const capabilities = Object.fromEntries(
+    GENERATED_OUTPUT_LOCALIZATION_VARIANTS.map((variant) => [
+      variant,
+      Object.freeze({
+        physicalWritesProved: exactOccurrenceProved,
+        exactPhysicalWritesProved: exactOccurrenceProved,
+        exactEffectsProved: exactOccurrenceProved,
+        tablesProved: exactOccurrenceProved,
+        boundsProved: false,
+        byteBoundsProved: false,
+        idempotenceProved: replayProved,
+      }),
+    ]),
+  )
+  return Object.freeze({
+    variants: GENERATED_OUTPUT_LOCALIZATION_VARIANTS,
+    commonKernel,
+    runtimeSubmitFacts: Object.freeze(runtimeSubmitFacts),
+    exactOccurrencePolicies: Object.freeze(exactOccurrencePolicies),
+    capabilities: Object.freeze(capabilities),
+  })
+}
+
 function chatOrganizationCapabilityFacts(program, catalogSource, workspaceUnion, outputProblems) {
   const moveDescriptor = findVariableInitializer(
     catalogSource,
@@ -2653,10 +3564,19 @@ function chatOrganizationCapabilityFacts(program, catalogSource, workspaceUnion,
   const moveExactReceiptProved =
     moveConsumed && moveToFolder.exactTypedDescriptor && moveToFolder.exactReceipt
   const moveTablesProved = moveExactReceiptProved && moveToFolder.typedCommandLifetimePreflight
+  const tagsOccurrence = exactOccurrenceCapabilityFacts(tagsDescriptor, tagsText, {
+    descriptor: "semanticOperationCallerSingleAttemptReplayContract('random-identity')",
+    execution: 'semanticOperationExactOccurrenceReceipt<',
+  })
+  for (const [name, proved] of Object.entries(tagsOccurrence)) {
+    if (!proved) outputProblems.push(`chat set-tags occurrence receipt missing ${name}`)
+  }
+  const tagsExactReceiptProved = consumed && Object.values(tagsOccurrence).every(Boolean)
   return Object.freeze({
     variants: Object.freeze(['chat.move-to-folder', 'chat.set-tags-from-names']),
     commonKernel: Object.freeze(commonKernel),
     moveToFolder: Object.freeze(moveToFolder),
+    tagsOccurrence,
     capabilities: Object.freeze({
       'chat.move-to-folder': Object.freeze({
         path: BROWSER_CATALOG_COMMAND_RUNTIME_PATH,
@@ -2681,10 +3601,12 @@ function chatOrganizationCapabilityFacts(program, catalogSource, workspaceUnion,
         transaction: 'CHAT_TAG_TRANSACTION_CAPABILITY',
         consumed,
         physicalWritesProved: true,
-        exactPhysicalWritesProved: false,
-        exactEffectsProved: false,
-        tablesProved: false,
+        exactPhysicalWritesProved: tagsExactReceiptProved,
+        exactEffectsProved: tagsExactReceiptProved,
+        tablesProved: tagsExactReceiptProved,
         boundsProved: false,
+        byteBoundsProved: false,
+        idempotenceProved: tagsExactReceiptProved,
       }),
     }),
   })
@@ -2708,9 +3630,6 @@ function chatClosureCapabilityFacts(
     catalogSource,
     'CHAT_EMPTY_ARCHIVE_OPERATION',
   ).getText(catalogSource)
-  const effects = findVariableInitializer(catalogSource, 'CHAT_CLOSURE_EFFECTS').getText(
-    catalogSource,
-  )
   const discardText = findFunction(catalogSource, 'discardEmptyDraftChats').getText(catalogSource)
   const deleteText = findFunction(catalogSource, 'deleteArchivedChatRows').getText(catalogSource)
   const emptyText = findFunction(catalogSource, 'emptyArchivedChatRows').getText(catalogSource)
@@ -2750,15 +3669,11 @@ function chatClosureCapabilityFacts(
       [discardDescriptor, deleteDescriptor, emptyDescriptor].every((descriptor) =>
         descriptor.includes('transaction: CHAT_CLOSURE_TRANSACTION_CAPABILITY'),
       ),
-    sharedTypedEffects:
-      [discardDescriptor, deleteDescriptor, emptyDescriptor].every((descriptor) =>
-        descriptor.includes('effects: CHAT_CLOSURE_EFFECTS'),
-      ) &&
-      effects.includes("'chat'") &&
-      effects.includes("'sidebar'") &&
-      effects.includes("'attachment'") &&
-      effects.includes("'profile'") &&
-      effects.includes("'setting'"),
+    sharedTypedEffects: [discardDescriptor, deleteDescriptor, emptyDescriptor].every(
+      (descriptor) =>
+        descriptor.includes('semanticOperationExactReceiptContracts<') &&
+        descriptor.includes('undefined'),
+    ),
     exactIntentResources:
       discardDescriptor.includes('resources: chatClosureResourceNames') &&
       deleteDescriptor.includes('resources: chatClosureResourceNames') &&
@@ -2778,10 +3693,12 @@ function chatClosureCapabilityFacts(
       emptyText.includes('readArchivedChatIdPage(tx,') &&
       emptyText.includes('deleteArchivedChatClosure(tx, page.chatIds, input.now)'),
     oneClosureOwner:
-      emptyEligibilityText.includes("deleteKnownChatClosure(tx, eligible, now, 'skip')") &&
+      emptyEligibilityText.includes('deleteKnownChatClosure(') &&
+      emptyEligibilityText.includes('options.maxStreamJournalPages ?? Number.POSITIVE_INFINITY') &&
       archivedEligibilityText.includes('deleteKnownChatClosure(') &&
       closureText.includes("table<StreamLeaseRow, string>('streamLeases')") &&
       closureText.includes('.anyOf(candidateIds)') &&
+      closureText.includes('retireStreamJournalOwnershipPage(') &&
       closureText.includes('deleteLinkedSemanticByteOwnerBatchRepairingLinks('),
     boundedCommandWork:
       discardText.includes('CHAT_CLOSURE_BATCH_LIMIT') &&
@@ -2800,6 +3717,18 @@ function chatClosureCapabilityFacts(
     if (!consumed) outputProblems.push(`chat closure family missing ${name}`)
   }
   const consumed = Object.values(commonKernel).every(Boolean)
+  const occurrence = exactOccurrenceCapabilityFacts(
+    [discardDescriptor, deleteDescriptor, emptyDescriptor],
+    [discardText, deleteText, emptyText],
+    {
+      descriptor: "semanticOperationCallerSingleAttemptReplayContract('unfenced-relative-update')",
+      execution: 'semanticOperationExactOccurrenceReceipt<',
+    },
+  )
+  for (const [name, proved] of Object.entries(occurrence)) {
+    if (!proved) outputProblems.push(`chat closure occurrence receipt missing ${name}`)
+  }
+  const exactReceiptProved = consumed && Object.values(occurrence).every(Boolean)
   return Object.freeze({
     variants: Object.freeze([
       'chat.delete-archived',
@@ -2807,6 +3736,7 @@ function chatClosureCapabilityFacts(
       'chat.empty-archive',
     ]),
     commonKernel: Object.freeze(commonKernel),
+    occurrence,
     capabilities: Object.freeze({
       'chat.discard-empty-drafts': Object.freeze({
         path: BROWSER_CATALOG_COMMAND_RUNTIME_PATH,
@@ -2814,10 +3744,12 @@ function chatClosureCapabilityFacts(
         transaction: 'CHAT_CLOSURE_TRANSACTION_CAPABILITY',
         consumed,
         physicalWritesProved: true,
-        exactPhysicalWritesProved: false,
-        exactEffectsProved: false,
-        tablesProved: false,
+        exactPhysicalWritesProved: exactReceiptProved,
+        exactEffectsProved: exactReceiptProved,
+        tablesProved: exactReceiptProved,
         boundsProved: false,
+        byteBoundsProved: false,
+        idempotenceProved: exactReceiptProved,
       }),
       'chat.delete-archived': Object.freeze({
         path: BROWSER_CATALOG_COMMAND_RUNTIME_PATH,
@@ -2825,10 +3757,12 @@ function chatClosureCapabilityFacts(
         transaction: 'CHAT_CLOSURE_TRANSACTION_CAPABILITY',
         consumed,
         physicalWritesProved: true,
-        exactPhysicalWritesProved: false,
-        exactEffectsProved: false,
-        tablesProved: false,
+        exactPhysicalWritesProved: exactReceiptProved,
+        exactEffectsProved: exactReceiptProved,
+        tablesProved: exactReceiptProved,
         boundsProved: false,
+        byteBoundsProved: false,
+        idempotenceProved: exactReceiptProved,
       }),
       'chat.empty-archive': Object.freeze({
         path: BROWSER_CATALOG_COMMAND_RUNTIME_PATH,
@@ -2836,10 +3770,12 @@ function chatClosureCapabilityFacts(
         transaction: 'CHAT_CLOSURE_TRANSACTION_CAPABILITY',
         consumed,
         physicalWritesProved: true,
-        exactPhysicalWritesProved: false,
-        exactEffectsProved: false,
-        tablesProved: false,
+        exactPhysicalWritesProved: exactReceiptProved,
+        exactEffectsProved: exactReceiptProved,
+        tablesProved: exactReceiptProved,
         boundsProved: false,
+        byteBoundsProved: false,
+        idempotenceProved: exactReceiptProved,
       }),
     }),
   })
@@ -2919,9 +3855,18 @@ function chatForkCapabilityFacts(browserRepoSource, outputProblems) {
     if (!consumed) outputProblems.push(`chat fork missing ${name}`)
   }
   const consumed = Object.values(commonKernel).every(Boolean)
+  const occurrence = exactOccurrenceCapabilityFacts(descriptor, command, {
+    descriptor: "semanticOperationCallerSingleAttemptReplayContract('random-identity')",
+    execution: 'semanticOperationExactOccurrenceReceipt<',
+  })
+  for (const [name, proved] of Object.entries(occurrence)) {
+    if (!proved) outputProblems.push(`chat fork occurrence receipt missing ${name}`)
+  }
+  const exactReceiptProved = consumed && Object.values(occurrence).every(Boolean)
   return Object.freeze({
     variants: Object.freeze(['chat.fork']),
     commonKernel: Object.freeze(commonKernel),
+    occurrence,
     capabilities: Object.freeze({
       'chat.fork': Object.freeze({
         path: BROWSER_REPO_PATH,
@@ -2929,10 +3874,12 @@ function chatForkCapabilityFacts(browserRepoSource, outputProblems) {
         transaction: 'FORK_CHAT_TRANSACTION_CAPABILITY',
         consumed,
         physicalWritesProved: true,
-        exactPhysicalWritesProved: false,
-        exactEffectsProved: false,
-        tablesProved: false,
+        exactPhysicalWritesProved: exactReceiptProved,
+        exactEffectsProved: exactReceiptProved,
+        tablesProved: exactReceiptProved,
         boundsProved: false,
+        byteBoundsProved: false,
+        idempotenceProved: exactReceiptProved,
       }),
     }),
   })
@@ -2974,6 +3921,13 @@ function interchangeImportCapabilityFacts(importSource, workspaceUnion, outputPr
   const chatMethod = findMethod(importSource, 'BrowserImportExportHandler', 'importChat').getText(
     importSource,
   )
+  const chatBatchMethod = findMethod(
+    importSource,
+    'BrowserImportExportHandler',
+    'importChats',
+  ).getText(importSource)
+  const prepareChat = findFunction(importSource, 'prepareChatImport').getText(importSource)
+  const storeChat = findFunction(importSource, 'storePreparedChatImport').getText(importSource)
   const presetMethod = findMethod(
     importSource,
     'BrowserImportExportHandler',
@@ -2984,7 +3938,14 @@ function interchangeImportCapabilityFacts(importSource, workspaceUnion, outputPr
     'BrowserImportExportHandler',
     'importConnectionProfile',
   ).getText(importSource)
-  const routeText = [chatMethod, presetMethod, profileMethod].join('\n')
+  const routeText = [
+    chatMethod,
+    chatBatchMethod,
+    prepareChat,
+    storeChat,
+    presetMethod,
+    profileMethod,
+  ].join('\n')
   const profileResolution = findFunction(importSource, 'resolveProfileId').getText(importSource)
   const folderResolution = findFunction(importSource, 'ensurePortableFolder').getText(importSource)
   const tagResolution = findFunction(importSource, 'ensurePortableTags').getText(importSource)
@@ -3006,6 +3967,7 @@ function interchangeImportCapabilityFacts(importSource, workspaceUnion, outputPr
   const messageWrites = findFunction(importSource, 'storeNewMessageTransitionsInPages').getText(
     importSource,
   )
+  const bulkWrites = findFunction(importSource, 'bulkAddInPages').getText(importSource)
   const commonKernel = {
     exactVariants:
       variants.length === expectedVariants.length &&
@@ -3013,14 +3975,10 @@ function interchangeImportCapabilityFacts(importSource, workspaceUnion, outputPr
     exactTypedDescriptors:
       chatDescriptor.includes("operationKind: 'interchange.import-chat'") &&
       chatDescriptor.includes('transaction: IMPORT_CHAT_TRANSACTION_CAPABILITY') &&
-      chatDescriptor.includes("'attachment-job'") &&
-      chatDescriptor.includes("'chats'") &&
       presetDescriptor.includes("operationKind: 'interchange.import-chat-preset'") &&
       presetDescriptor.includes('transaction: IMPORT_CHAT_PRESET_TRANSACTION_CAPABILITY') &&
-      presetDescriptor.includes("'presets'") &&
       profileDescriptor.includes("operationKind: 'interchange.import-connection-profile'") &&
-      profileDescriptor.includes('transaction: IMPORT_CONNECTION_PROFILE_TRANSACTION_CAPABILITY') &&
-      profileDescriptor.includes("'profiles'"),
+      profileDescriptor.includes('transaction: IMPORT_CONNECTION_PROFILE_TRANSACTION_CAPABILITY'),
     exactIntentResources:
       chatResources.includes('chat-meta:') &&
       chatResources.includes('message-topology:') &&
@@ -3033,18 +3991,20 @@ function interchangeImportCapabilityFacts(importSource, workspaceUnion, outputPr
       profileResolutionResources.includes('configuration-target:profile:') &&
       profileResolutionResources.includes('profile-match:'),
     everyRouteConsumesSemanticOwner:
-      chatMethod.includes('commit.executeSemanticOperation(') &&
-      chatMethod.includes('IMPORT_CHAT_OPERATION') &&
+      chatMethod.includes('this.importChats(') &&
+      chatBatchMethod.includes('commit.executeSemanticOperation(') &&
+      chatBatchMethod.includes('IMPORT_CHAT_OPERATION') &&
       presetMethod.includes('commit.executeSemanticOperation(') &&
       presetMethod.includes('IMPORT_CHAT_PRESET_OPERATION') &&
       profileMethod.includes('commit.executeSemanticOperation(') &&
       profileMethod.includes('IMPORT_CONNECTION_PROFILE_OPERATION'),
     transactionLocalResolution:
-      chatMethod.includes('async (tx) =>') &&
-      chatMethod.includes('resolveProfileId(') &&
-      chatMethod.includes('findExistingAttachment(') &&
-      chatMethod.includes('ensurePortableFolder(') &&
-      chatMethod.includes('ensurePortableTags(') &&
+      chatBatchMethod.includes('async (tx) =>') &&
+      chatBatchMethod.includes('storePreparedChatImport(') &&
+      storeChat.includes('resolveProfileId(') &&
+      storeChat.includes('findExistingAttachment(') &&
+      storeChat.includes('ensurePortableFolder(') &&
+      storeChat.includes('ensurePortableTags(') &&
       presetMethod.includes('async (tx) =>') &&
       presetMethod.includes('resolveProfileId(') &&
       profileMethod.includes('async (tx) =>') &&
@@ -3064,7 +4024,9 @@ function interchangeImportCapabilityFacts(importSource, workspaceUnion, outputPr
       presetNameResolution.includes('.each(') &&
       !presetNameResolution.includes('.toArray('),
     singlePersistedClock:
-      countOccurrences(chatMethod, 'Date.now()') === 1 &&
+      countOccurrences(prepareChat, 'Date.now()') === 1 &&
+      !chatBatchMethod.includes('Date.now()') &&
+      !storeChat.includes('Date.now()') &&
       countOccurrences(presetMethod, 'Date.now()') === 1 &&
       countOccurrences(profileMethod, 'Date.now()') === 1 &&
       attachmentPreparation.includes(
@@ -3079,7 +4041,18 @@ function interchangeImportCapabilityFacts(importSource, workspaceUnion, outputPr
     boundedTranscriptWrites:
       messageWrites.includes('for (const page of pages(transitions))') &&
       messageWrites.includes('bulkAdd(') &&
-      chatMethod.includes('exactPathHeaders: messageGraph.branchTransitions.map('),
+      storeChat.includes('exactPathHeaders: messageGraph.branchTransitions.map('),
+    singleCurrentGraphCompiler:
+      countOccurrences(storeChat, 'compileCurrentMessageGraphTransition(') === 1 &&
+      countOccurrences(storeChat, 'remapImportedMessage(') === 1 &&
+      !storeChat.includes('compileCurrentMessageTransition('),
+    constructiveDirectWriteReceipt:
+      countOccurrences(messageWrites, 'recordSemanticOperationExactPhysicalWrite(') === 3 &&
+      bulkWrites.includes('recordSemanticOperationExactPhysicalWrite(') &&
+      storeChat.includes("tx.table<ChildListState, string>('childLists')") &&
+      storeChat.includes("'childLists'") &&
+      storeChat.includes("tx.table<ChildSlotMember, MessageId>('childSlotMembers')") &&
+      storeChat.includes("'childSlotMembers'"),
     noLegacyPlanning:
       !routeText.includes('.withLocks(') &&
       !routeText.includes('for (;;)') &&
@@ -3094,9 +4067,22 @@ function interchangeImportCapabilityFacts(importSource, workspaceUnion, outputPr
     if (!consumed) outputProblems.push(`interchange imports missing ${name}`)
   }
   const consumed = Object.values(commonKernel).every(Boolean)
+  const occurrence = exactOccurrenceCapabilityFacts(
+    [chatDescriptor, presetDescriptor, profileDescriptor],
+    [chatBatchMethod, presetMethod, profileMethod],
+    {
+      descriptor: "semanticOperationCallerSingleAttemptReplayContract('random-identity')",
+      execution: 'semanticOperationExactOccurrenceReceipt<',
+    },
+  )
+  for (const [name, proved] of Object.entries(occurrence)) {
+    if (!proved) outputProblems.push(`interchange imports occurrence receipt missing ${name}`)
+  }
+  const exactReceiptProved = consumed && Object.values(occurrence).every(Boolean)
   return Object.freeze({
     variants: Object.freeze(variants),
     commonKernel: Object.freeze(commonKernel),
+    occurrence,
     capabilities: Object.freeze(
       Object.fromEntries(
         expectedVariants.map((variant) => [
@@ -3117,10 +4103,12 @@ function interchangeImportCapabilityFacts(importSource, workspaceUnion, outputPr
                   : 'IMPORT_CONNECTION_PROFILE_TRANSACTION_CAPABILITY',
             consumed,
             physicalWritesProved: true,
-            exactPhysicalWritesProved: false,
-            exactEffectsProved: false,
-            tablesProved: false,
+            exactPhysicalWritesProved: exactReceiptProved,
+            exactEffectsProved: exactReceiptProved,
+            tablesProved: exactReceiptProved,
             boundsProved: false,
+            byteBoundsProved: false,
+            idempotenceProved: exactReceiptProved,
           }),
         ]),
       ),
@@ -3294,9 +4282,35 @@ function folderCapabilityFacts(program, catalogSource, workspaceUnion, outputPro
     commonKernel.fixedRowFamilyDerived &&
     commonKernel.fixedRowExactReceipts &&
     commonKernel.fixedRowBounds
+  const ensureOccurrence = exactOccurrenceCapabilityFacts(ensureDescriptor, ensureText, {
+    descriptor: "semanticOperationCallerSingleAttemptReplayContract('random-identity')",
+    execution: 'semanticOperationExactOccurrenceReceipt<',
+  })
+  const deleteOccurrence = exactOccurrenceCapabilityFacts(
+    [deleteMoveDescriptor, deleteArchiveDescriptor],
+    deleteText,
+    {
+      descriptor: "semanticOperationCallerSingleAttemptReplayContract('unfenced-relative-update')",
+      execution: 'semanticOperationExactOccurrenceReceipt<',
+    },
+  )
+  for (const [name, proved] of Object.entries(ensureOccurrence)) {
+    if (!proved) outputProblems.push(`folder ensure occurrence receipt missing ${name}`)
+  }
+  for (const [name, proved] of Object.entries(deleteOccurrence)) {
+    if (!proved) outputProblems.push(`folder delete occurrence receipt missing ${name}`)
+  }
+  const ensureExactReceiptProved = consumed && Object.values(ensureOccurrence).every(Boolean)
+  const deleteExactReceiptProved = consumed && Object.values(deleteOccurrence).every(Boolean)
   const capabilities = {}
   for (const variant of variants) {
     const fixedRow = fixedRowVariants.includes(variant)
+    const exactOccurrenceProved =
+      variant === 'folder.ensure-and-move-chats'
+        ? ensureExactReceiptProved
+        : variant === 'folder.delete'
+          ? deleteExactReceiptProved
+          : false
     capabilities[variant] = Object.freeze({
       path: BROWSER_CATALOG_COMMAND_RUNTIME_PATH,
       owner:
@@ -3314,13 +4328,13 @@ function folderCapabilityFacts(program, catalogSource, workspaceUnion, outputPro
             ? 'CHAT_FOLDER_TRANSACTION_CAPABILITY'
             : 'CHAT_FOLDER_TRANSACTION_CAPABILITY/CHAT_FOLDER_LINK_TRANSACTION_CAPABILITY',
       consumed,
-      physicalWritesProved: variant !== 'folder.ensure-and-move-chats',
-      exactPhysicalWritesProved: fixedRow && fixedRowExactEffectsProved,
-      exactEffectsProved: fixedRow && fixedRowExactEffectsProved,
-      tablesProved: fixedRow && fixedRowExactEffectsProved,
+      physicalWritesProved: fixedRow || exactOccurrenceProved,
+      exactPhysicalWritesProved: (fixedRow && fixedRowExactEffectsProved) || exactOccurrenceProved,
+      exactEffectsProved: (fixedRow && fixedRowExactEffectsProved) || exactOccurrenceProved,
+      tablesProved: (fixedRow && fixedRowExactEffectsProved) || exactOccurrenceProved,
       boundsProved: fixedRow && fixedRowBoundsProved,
       byteBoundsProved: false,
-      idempotenceProved: fixedRow && fixedRowReplayProved,
+      idempotenceProved: (fixedRow && fixedRowReplayProved) || exactOccurrenceProved,
     })
   }
   return Object.freeze({
@@ -3328,6 +4342,8 @@ function folderCapabilityFacts(program, catalogSource, workspaceUnion, outputPro
     fixedRowVariants: Object.freeze(fixedRowVariants),
     constructorFacts: Object.freeze(constructorFacts),
     commonKernel: Object.freeze(commonKernel),
+    ensureOccurrence,
+    deleteOccurrence,
     capabilities: Object.freeze(capabilities),
   })
 }
@@ -3777,7 +4793,6 @@ function configurationChatCapabilityFacts(
     descriptorCall?.arguments[0] ? unwrap(descriptorCall.arguments[0]) : undefined,
     configurationSource,
   )
-  const effects = objectPropertyInitializer(definition, 'effects')
   const physicalMutations = objectPropertyInitializer(definition, 'exactPhysicalMutations')
   const physicalReads = objectPropertyInitializer(definition, 'exactPhysicalReads')
   const descriptorText = descriptor.getText(configurationSource)
@@ -3873,16 +4888,11 @@ function configurationChatCapabilityFacts(
       return calls.length === 1 && calls[0]?.arguments[3]?.getText(configurationSource) === expected
     }),
     exactEffects:
-      ((effects !== undefined &&
-        validSemanticEffects(unwrap(effects)) &&
-        effects.getText(configurationSource).includes('ChatConfigurationOperationReceipt') &&
-        effects.getText(configurationSource).includes('linkedChatTransitionDependencies')) ||
-        (exactReceiptFactory.contractBound &&
-          exactReceiptFactory.receiptText.includes('linkedChatTransitionDependencies') &&
-          exactReceiptFactory.receiptText.includes('physicalMutations:'))) &&
+      exactReceiptFactory.contractBound &&
+      exactReceiptFactory.receiptText.includes('linkedChatTransitionDependencies') &&
+      exactReceiptFactory.receiptText.includes('physicalMutations:') &&
       linkedDependencyText.includes('transition.links.profileUsageMutations.map') &&
-      ((physicalMutations !== undefined && physicalReads !== undefined) ||
-        exactReceiptFactory.receiptBound),
+      exactReceiptFactory.receiptBound,
     exactPhysicalMutations:
       exactTables.every((tableName) =>
         linkedPhysicalMutationText.includes(`tableName: '${tableName}'`),
@@ -4072,7 +5082,6 @@ function configurationCatalogedRowCapabilityFacts(
     descriptorCall?.arguments[0] ? unwrap(descriptorCall.arguments[0]) : undefined,
     configurationSource,
   )
-  const effects = objectPropertyInitializer(definition, 'effects')
   const physicalMutations = objectPropertyInitializer(definition, 'exactPhysicalMutations')
   const physicalReads = objectPropertyInitializer(definition, 'exactPhysicalReads')
   const resources = objectPropertyInitializer(definition, 'resources')
@@ -4131,16 +5140,11 @@ function configurationCatalogedRowCapabilityFacts(
         ?.getText(configurationSource)
         .includes('catalogedConfigurationEntityResourceName(entityKind, entityId)') === true,
     exactEffects:
-      (effects !== undefined &&
-        validSemanticEffects(unwrap(effects)) &&
-        effects.getText(configurationSource).includes('CatalogedConfigurationOperationReceipt') &&
-        physicalMutations !== undefined &&
-        physicalReads !== undefined) ||
-      (exactReceiptFactory.contractBound &&
-        exactReceiptFactory.receiptText.includes(
-          'catalogedConfigurationOperationDependencies(receipt)',
-        ) &&
-        exactReceiptFactory.receiptText.includes('physicalMutations:')),
+      exactReceiptFactory.contractBound &&
+      exactReceiptFactory.receiptText.includes(
+        'catalogedConfigurationOperationDependencies(receipt)',
+      ) &&
+      exactReceiptFactory.receiptText.includes('physicalMutations:'),
     exactReceiptWrites:
       (physicalMutations?.getText(configurationSource).includes('receipt.projection') === true &&
         physicalMutations
@@ -4614,7 +5618,6 @@ function configurationChatSelectionCapabilityFacts(
   const routeText = expectedVariants
     .map((variant) => roots.get(variant).getText(configurationSource))
     .join('\n')
-  const descriptorText = descriptor.getText(configurationSource)
   const executorText = executor.getText(configurationSource)
   const transactionText = findFunction(
     configurationSource,
@@ -4908,7 +5911,6 @@ function configurationChatRequestTargetCapabilityFacts(
   const routeText = expectedVariants
     .map((variant) => roots.get(variant).getText(configurationSource))
     .join('\n')
-  const descriptorText = descriptor.getText(configurationSource)
   const executorText = executor.getText(configurationSource)
   const transactionText = findFunction(
     configurationSource,
@@ -5157,7 +6159,6 @@ function configurationTargetFanoutCapabilityFacts(
     descriptorCall?.arguments[0] ? unwrap(descriptorCall.arguments[0]) : undefined,
     configurationSource,
   )
-  const effects = objectPropertyInitializer(definition, 'effects')
   const physicalMutations = objectPropertyInitializer(definition, 'exactPhysicalMutations')
   const physicalReads = objectPropertyInitializer(definition, 'exactPhysicalReads')
   const resources = objectPropertyInitializer(definition, 'resources')
@@ -5183,12 +6184,15 @@ function configurationTargetFanoutCapabilityFacts(
   const routeText = expectedVariants
     .map((variant) => roots.get(variant).getText(configurationSource))
     .join('\n')
-  const descriptorText = descriptor.getText(configurationSource)
   const executorText = executor.getText(configurationSource)
   const commitText = commit.getText(configurationSource)
   const textTemplateCommitText = findFunction(
     configurationSource,
     'commitTextTemplateTargetFanout',
+  ).getText(configurationSource)
+  const targetPageText = findFunction(
+    configurationSource,
+    'readConfigurationTargetFanoutLinks',
   ).getText(configurationSource)
   const familyText = [routeText, executorText, commitText, textTemplateCommitText].join('\n')
   const transactionText = findFunction(
@@ -5248,24 +6252,14 @@ function configurationTargetFanoutCapabilityFacts(
       resources.getText(configurationSource).includes(chatResourceFragment) &&
       !resources.getText(configurationSource).includes('configurationOwnerLockName'),
     exactEffects:
-      (effects !== undefined &&
-        validSemanticEffects(unwrap(effects)) &&
-        descriptorText.includes('ConfigurationTargetFanoutOperationReceipt') &&
-        descriptorText.includes('workspaceDependenciesForConfigurationSemanticMutation') &&
-        descriptorText.includes('linkedChatTransitionsDependencies') &&
-        descriptorText.includes('receipt.presetLinks.profileUsageMutations')) ||
-      (exactReceiptFactory.contractBound &&
-        receiptCompilerText.includes('workspaceDependenciesForConfigurationSemanticMutation') &&
-        receiptCompilerText.includes('linkedChatTransitionsDependencies') &&
-        receiptCompilerText.includes('receipt.presetLinks.profileUsageMutations')),
+      exactReceiptFactory.contractBound &&
+      receiptCompilerText.includes('workspaceDependenciesForConfigurationSemanticMutation') &&
+      receiptCompilerText.includes('receipt.targetFragment.dependencies'),
     exactReceiptWrites: [
       'receipt.sourceMutation',
       'projection?.projectionMutation',
       'projection?.aggregateIds',
-      'receipt.nextPresets',
-      'receipt.presetLinks.removedLinkIds',
-      'receipt.presetLinks.writtenLinkIds',
-      'linkedChatTransitionsPhysicalMutations',
+      'receipt.targetFragment.physicalMutations',
     ].every(
       (fragment) =>
         physicalMutationText.includes(fragment) || receiptCompilerText.includes(fragment),
@@ -5274,11 +6268,13 @@ function configurationTargetFanoutCapabilityFacts(
       "'promptPresets'",
       "'textTemplates'",
       'receipt.targetQueryExecuted',
-      "indexName: 'targetKey'",
+      "indexName: '[targetKey+id]'",
+      'receipt.targetQueryRequests',
       'receipt.chatReadIds.length',
+      'receipt.chatReadRequests',
       'receipt.presetReadIds.length',
-      'receipt.presetLinks.ownerQueryRequests',
-      'linkedChatTransitionPhysicalReads',
+      'receipt.presetReadRequests',
+      'receipt.targetFragment.physicalReads',
       'aggregateExactPhysicalReads',
     ].every(
       (fragment) => physicalReadText.includes(fragment) || receiptCompilerText.includes(fragment),
@@ -5299,22 +6295,31 @@ function configurationTargetFanoutCapabilityFacts(
         'configurationTargetFanoutOperationDescriptor(input)',
     routeExecutorExact: [...routeExecutorCalls.values()].every((calls) => calls.length === 1),
     receiptBound:
-      receiptText.includes('emptyConfigurationOwnerLinkMutationReceipt') &&
+      receiptText.includes('semanticOperationReceiptFragment({})') &&
       receiptAssertionText.includes('receipt.targetLinkIds') &&
       receiptAssertionText.includes('removedTargetLinks') &&
       receiptAssertionText.includes('receipt.sourceProjection') &&
-      receiptAssertionText.includes('receipt.chats.sidebar.mutatedRowIds'),
+      receiptAssertionText.includes('receipt.targetFragment.physicalMutations') &&
+      receiptAssertionText.includes('receipt.writtenChatIds') &&
+      receiptAssertionText.includes('receipt.writtenPresetIds'),
     transactionLocalTransitions:
-      commitText.includes('readTargetLinksFromTransaction') &&
+      commitText.includes('readConfigurationTargetFanoutLinks') &&
+      commitText.includes('configurationTargetFanoutPages(') &&
       commitText.includes('const chatMutation = openLinkedChatMutation(tx)') &&
-      commitText.includes('chatMutation.readMany(chatReadIds)') &&
-      commitText.includes("tx.table<ChatPreset, PresetId>('presets').bulkGet(presetReadIds)") &&
+      commitText.includes('chatMutation.readMany(page)') &&
+      commitText.includes("tx.table<ChatPreset, PresetId>('presets').bulkGet([...page])") &&
       commitText.includes('replaceLinkedSemanticByteOwnerBatch') &&
       commitText.includes('chatMutation.replaceLinked(previous.id, () => next)') &&
-      commitText.includes('chatMutation.commit()') &&
+      commitText.includes('targetFragment.absorb(') &&
       commitText.includes('applyConfigurationPromptPresetCatalogProjectionTransition') &&
       commitText.includes('applyConfigurationPromptPresetCatalogProjectionDeletion') &&
+      textTemplateCommitText.includes('configurationTargetFanoutPages(') &&
       textTemplateCommitText.includes('deleteTextTemplateByteOwner'),
+    boundedTargetPages:
+      targetPageText.includes("where('[targetKey+id]')") &&
+      targetPageText.includes('CONFIGURATION_TARGET_FANOUT_PAGE_SIZE') &&
+      targetPageText.includes('.limit(CONFIGURATION_TARGET_FANOUT_PAGE_SIZE)') &&
+      targetPageText.includes('requestCount += 1'),
     projectionReadsSubtracted:
       !deletionProjectionText.includes('.table') &&
       !deletionProjectionText.includes('.get(') &&
@@ -5343,8 +6348,8 @@ function configurationTargetFanoutCapabilityFacts(
         .getText()
         .includes("tx.table<Chat, ChatId>('chats').bulkGet(chatIds)") &&
       mutationJournalSource.getText().includes('finalChatById: Map<ChatId, Chat | null>') &&
-      mutationJournalSource.getText().includes('requiredFinalChatState(journal, chatId)') &&
-      mutationJournalSource.getText().includes('chat ? structuredClone(chat) : null') &&
+      mutationJournalSource.getText().includes('finalChatState(journal, chatId)') &&
+      mutationJournalSource.getText().includes('retainFullChatStates') &&
       mutationJournalSource.getText().includes('finalizationPhysicalReads'),
   }
   for (const [name, consumed] of Object.entries(commonKernel)) {
@@ -5374,7 +6379,6 @@ function configurationTargetFanoutCapabilityFacts(
       exactEffectsProved: true,
       tablesProved: true,
       boundsProved: false,
-      boundsDisposition: 'admitted-atomic-target-fanout',
     })
     routeFacts[variant] = Object.freeze({
       entries: Object.freeze(route.entries),
@@ -5810,6 +6814,10 @@ function configurationConnectionDeleteCapabilityFacts(
     configurationSource,
     'assertConnectionDeleteOperationReceipt',
   ).getText(configurationSource)
+  const targetPageText = findFunction(
+    configurationSource,
+    'readConfigurationTargetFanoutLinks',
+  ).getText(configurationSource)
   const familyText = [
     routeText,
     inputText,
@@ -5859,8 +6867,8 @@ function configurationConnectionDeleteCapabilityFacts(
       effects === undefined &&
       exactReceiptFactory.contractBound &&
       dependencyText.includes('workspaceDependenciesForConfigurationSemanticMutation') &&
-      dependencyText.includes('linkedChatTransitionsDependencies') &&
-      dependencyText.includes('receipt.presetLinks.profileUsageMutations') &&
+      dependencyText.includes('receipt.targetFragment.dependencies') &&
+      dependencyText.includes('receipt.profileLinks.profileUsageMutations') &&
       dependencyText.includes('receipt.discovery') &&
       dependencyText.includes('receipt.keys'),
     exactReceiptWrites:
@@ -5873,12 +6881,15 @@ function configurationConnectionDeleteCapabilityFacts(
       exactReceiptFactory.receiptText.includes('connectionDeleteOperationPhysicalReads') &&
       physicalReadText.includes("tableName: 'profiles'") &&
       physicalReadText.includes("tableName: 'configurationLinks'") &&
-      physicalReadText.includes("indexName: 'targetKey'") &&
+      physicalReadText.includes("indexName: '[targetKey+id]'") &&
+      physicalReadText.includes('receipt.targetQueryRequests') &&
       physicalReadText.includes("tableName: 'presets'") &&
+      physicalReadText.includes('receipt.presetReadRequests') &&
       physicalReadText.includes("tableName: 'chats'") &&
+      physicalReadText.includes('receipt.chatReadRequests') &&
+      physicalReadText.includes('receipt.targetFragment.physicalReads') &&
       physicalReadText.includes('configurationOwnerLinkPhysicalReads') &&
       physicalReadText.includes('configurationCatalogProjectionPhysicalReads') &&
-      physicalReadText.includes('linkedChatTransitionPhysicalReads') &&
       physicalReadText.includes("'[activeKey+mruSortKey+nameSortKey+id]'"),
     typedExactPlan:
       exactReceiptFactory.planBound &&
@@ -5894,26 +6905,39 @@ function configurationConnectionDeleteCapabilityFacts(
     routeExecutorExact:
       reachableCallsResolvingTo(checker, [roots.get('connection.delete')], executor).length === 1,
     receiptBound:
-      receiptText.includes('emptyConfigurationOwnerLinkMutationReceipt') &&
+      receiptText.includes('semanticOperationReceiptFragment({})') &&
       assertionText.includes('receipt.targetLinkIds') &&
+      assertionText.includes('receipt.targetFragment.physicalMutations') &&
+      assertionText.includes('receipt.writtenPresetIds') &&
+      assertionText.includes('receipt.writtenChatIds') &&
       assertionText.includes('receipt.profileLinks') &&
       assertionText.includes('receipt.profileCatalog') &&
       assertionText.includes('receipt.discovery') &&
       assertionText.includes('receipt.keys'),
     transactionLocalTransitions:
-      commitText.includes('readTargetLinksFromTransaction') &&
-      commitText.includes("tx.table<ChatPreset, PresetId>('presets').bulkGet(presetReadIds)") &&
+      commitText.includes('readConfigurationTargetFanoutLinks') &&
+      commitText.includes('configurationTargetFanoutPages(presetReadIds)') &&
+      commitText.includes("tx.table<ChatPreset, PresetId>('presets').bulkGet([...page])") &&
+      commitText.includes('configurationTargetFanoutPages(chatReadIds)') &&
       commitText.includes('const chatMutation = openLinkedChatMutation(tx)') &&
-      commitText.includes('chatMutation.readMany(chatReadIds)') &&
+      commitText.includes('chatMutation.readMany(page)') &&
       commitText.includes('replaceLinkedSemanticByteOwnerBatch') &&
       commitText.includes('chatMutation.replaceLinked(previous.id, () => next)') &&
-      commitText.includes('chatMutation.commit()') &&
+      commitText.includes('targetFragment.absorb(') &&
       commitText.includes('deleteLinkedSemanticByteOwner') &&
       commitText.includes('applyConfigurationProfileCatalogProjectionDeletion') &&
       commitText.includes('clearDiscoveryCacheProfileRows'),
     readsBeforeWrites:
-      commitText.indexOf('const [presetRows, chatRows]') <
-      commitText.indexOf("replaceLinkedSemanticByteOwnerBatch(tx, 'presets'"),
+      commitText.indexOf("tx.table<ChatPreset, PresetId>('presets').bulkGet([...page])") <
+        commitText.indexOf("replaceLinkedSemanticByteOwnerBatch(tx, 'presets'") &&
+      commitText.indexOf('chatMutation.readMany(page)') <
+        commitText.indexOf('chatMutation.replaceLinked(previous.id, () => next)'),
+    boundedTargetPages:
+      targetPageText.includes("where('[targetKey+id]')") &&
+      targetPageText.includes('.limit(CONFIGURATION_TARGET_FANOUT_PAGE_SIZE)') &&
+      commitText.includes('targetQuery.requestCount') &&
+      commitText.includes('presetReadRequests += 1') &&
+      commitText.includes('chatReadRequests += 1'),
     projectionReadsSubtracted:
       !projectionDeletionText.includes('.table') && !projectionDeletionText.includes('.get('),
     exactReceiptOwned:
@@ -6212,7 +7236,12 @@ function commandLifetimeReceiptFacts(program, browserRepoSource, outputProblems)
   const executeText = findMethod(
     browserRepoSource,
     'BrowserWorkspaceRepository',
-    'execute',
+    'executeDirectCommand',
+  ).getText(browserRepoSource)
+  const executeCommandInDatabaseText = findMethod(
+    browserRepoSource,
+    'BrowserWorkspaceRepository',
+    'executeCommandInDatabase',
   ).getText(browserRepoSource)
   const executeSemanticText = findMethod(
     browserRepoSource,
@@ -6274,14 +7303,20 @@ function commandLifetimeReceiptFacts(program, browserRepoSource, outputProblems)
     browserRepoSource,
   )
   const commonKernel = Object.freeze({
-    cachedFenceInsideAuthoritativeGate: tokensInOrder(executeText, [
-      'withSharedAuthoritativeCommandSession(db, async (lockSession) => {',
-      'const workspace = this.session.getWorkspaceFence()',
-      'assertPermitFence(permit, workspace)',
-      'semanticOperationCommandLifetimeReceipt(',
-      'new BrowserCommandCommit(',
-      'this.dispatchCommand(',
-    ]),
+    cachedFenceInsideAuthoritativeGate:
+      tokensInOrder(executeText, [
+        'const db = this.session.runOperation((database) => database)',
+        'const admission = await awaitStorageCompactionWriteAdmission()',
+        'withSharedAuthoritativeCommandSession(db, async (lockSession) => {',
+        'const workspace = this.session.getWorkspaceFence()',
+        'assertPermitFence(permit, workspace)',
+        'this.executeCommandInDatabase(',
+      ]) &&
+      tokensInOrder(executeCommandInDatabaseText, [
+        'semanticOperationCommandLifetimeReceipt(',
+        'new BrowserCommandCommit(',
+        'this.dispatchCommand(',
+      ]),
     noCommandDurableMetaRead:
       !executeText.includes('readBrowserWorkspaceMeta') && !executeText.includes('this.openDb('),
     prestartedWriteAdmission:
@@ -6300,11 +7335,12 @@ function commandLifetimeReceiptFacts(program, browserRepoSource, outputProblems)
         .getText()
         .includes('const SEMANTIC_OPERATION_COMMAND_LIFETIME_RECEIPT = Symbol(') &&
       semanticSource.getText().includes('admission: StorageCompactionWriteAdmission') &&
+      semanticSource.getText().includes('readonly commandPhysicalReads: 0') &&
+      compactionSource.getText().includes('readonly commandPhysicalReads: 0') &&
       receiptText.includes(
         'const physicalReads = Object.freeze([] as readonly SemanticOperationPhysicalRead[])',
       ) &&
-      receiptText.includes('commandPhysicalReads: admission.commandPhysicalReads') &&
-      assertReceiptText.includes('receipt.preconditions[0].commandPhysicalReads !== 0'),
+      receiptText.includes('commandPhysicalReads: admission.commandPhysicalReads'),
     observedPreflightExtension:
       extendReceiptText.includes('aggregateSemanticOperationPhysicalReadIo([') &&
       extendReceiptText.includes('...receipt.physicalReads') &&
@@ -6321,8 +7357,9 @@ function commandLifetimeReceiptFacts(program, browserRepoSource, outputProblems)
       assertReceiptText.includes('receipt.replacementEpoch !== expected.replacementEpoch') &&
       assertReceiptText.includes('receipt.databaseName !== expected.databaseName'),
     boundOnceToCommit:
-      countOccurrences(executeText, 'semanticOperationCommandLifetimeReceipt(') === 1 &&
-      countOccurrences(executeText, 'new BrowserCommandCommit(') === 1 &&
+      countOccurrences(executeCommandInDatabaseText, 'semanticOperationCommandLifetimeReceipt(') ===
+        1 &&
+      countOccurrences(executeCommandInDatabaseText, 'new BrowserCommandCommit(') === 1 &&
       commitClassText.includes(
         'private commandLifetimeReceipt: SemanticOperationCommandLifetimeReceipt',
       ) &&
@@ -6371,6 +7408,8 @@ function scopeDerivedMutationCapabilityFacts(
   const mutationPlanSource = exactSource(program, 'src/store/browser-mutation-plan.ts')
   const mutationJournalSource = exactSource(program, MUTATION_JOURNAL_PATH)
   const repositorySource = exactSource(program, 'src/store/repository.ts')
+  const messageStorageSource = exactSource(program, 'src/store/message-storage.ts')
+  const structuralUndoSource = exactSource(program, 'src/store/structural-undo-repository.ts')
   const semanticSource = exactSource(program, SEMANTIC_OPERATION_CAPABILITY_PATH)
   const attachmentReferenceSource = exactSource(program, 'src/store/attachment-reference-edges.ts')
   const attachmentCatalogSource = exactSource(program, 'src/store/attachment-catalog-projection.ts')
@@ -6454,6 +7493,18 @@ function scopeDerivedMutationCapabilityFacts(
   const runBrowserMutation = findFunction(mutationRuntimeSource, 'runBrowserMutation')
   const runBrowserMutationText = runBrowserMutation.getText(mutationRuntimeSource)
   const messageVariants = [...messageCapabilityBodies.keys()].sort()
+  const attachmentReferenceVariants = Object.freeze([
+    'attachment.ref.add',
+    'attachment.ref.detach',
+    'attachment.ref.relink',
+    'attachment.ref.set-visibility',
+  ])
+  const messageCommandExactVariants = Object.freeze([
+    'message.delete',
+    'message.edit-content',
+    'message.import',
+    'message.restore-structure',
+  ])
   const fixedVariants = [...fixedPolicyBodies]
     .filter(
       ([variant, body]) =>
@@ -6462,6 +7513,9 @@ function scopeDerivedMutationCapabilityFacts(
         variant !== 'attachment.bundle.write' &&
         variant !== 'attachment.delete-if-unreferenced' &&
         variant !== 'attachment.delete-many' &&
+        !GENERATED_OUTPUT_LOCALIZATION_VARIANTS.includes(variant) &&
+        !attachmentReferenceVariants.includes(variant) &&
+        !messageCommandExactVariants.includes(variant) &&
         !body.includes('return undefined'),
     )
     .map(([variant]) => variant)
@@ -6565,6 +7619,228 @@ function scopeDerivedMutationCapabilityFacts(
     fixedReceiptCommon.runningRuntimeSingleInvoke &&
     fixedReceiptCommon.waitingRuntimeSingleInvoke &&
     fixedReceiptCommon.admittedRootSingleInvoke
+  const messageRepositoryInterfaceText = findInterfaceMethod(
+    messagesSource,
+    'MessageMutationRepository',
+    'runMutation',
+  ).parent.getText(messagesSource)
+  const editMessageText = findFunction(messagesSource, 'editMessageContentInRepository').getText(
+    messagesSource,
+  )
+  const pasteImportText = findFunction(messagesSource, 'pasteImportInRepository').getText(
+    messagesSource,
+  )
+  const deletePairText = findFunction(messagesSource, 'deletePairInRepository').getText(
+    messagesSource,
+  )
+  const deleteTurnText = findFunction(messagesSource, 'deleteTurnInRepository').getText(
+    messagesSource,
+  )
+  const deleteSingleText = findFunction(messagesSource, 'deleteSingleMessageInRepository').getText(
+    messagesSource,
+  )
+  const deleteVariantText = findFunction(messagesSource, 'deleteVariantInRepository').getText(
+    messagesSource,
+  )
+  const executeDeleteText = findFunction(messagesSource, 'executeDeleteMutation').getText(
+    messagesSource,
+  )
+  const restoreStructureText = findFunction(
+    structuralUndoSource,
+    'applyStructuralSnapshotInRepository',
+  ).getText(structuralUndoSource)
+  const structurePreflightText = findMethod(
+    browserRepoSource,
+    'BrowserWorkspaceRepository',
+    'readMessageStructurePreflight',
+  ).getText(browserRepoSource)
+  const editPreflightText = findMethod(
+    browserRepoSource,
+    'BrowserWorkspaceRepository',
+    'readMessageEditPreflight',
+  ).getText(browserRepoSource)
+  const preflightReaderText = findFunction(
+    browserRepoSource,
+    'createMessageStructurePreflightReader',
+  ).getText(browserRepoSource)
+  const listChildHeaderRowsText = findFunction(browserRepoSource, 'listChildHeaderRows').getText(
+    browserRepoSource,
+  )
+  const structurePreflightPlanText = findVariableInitializer(
+    browserRepoSource,
+    'MESSAGE_STRUCTURE_PREFLIGHT_TRANSACTION_PLAN',
+  ).getText(browserRepoSource)
+  const editPreflightPlanText = findVariableInitializer(
+    browserRepoSource,
+    'MESSAGE_EDIT_PREFLIGHT_TRANSACTION_PLAN',
+  ).getText(browserRepoSource)
+  const importedMessageText = findFunction(messagesSource, 'importedMessage').getText(
+    messagesSource,
+  )
+  const updateCandidateText = findFunction(
+    messageStorageSource,
+    'compileCurrentMessageUpdateCandidate',
+  ).getText(messageStorageSource)
+  const finalizeUpdateText = findFunction(
+    messageStorageSource,
+    'finalizeCurrentMessageUpdateTransition',
+  ).getText(messageStorageSource)
+  const runtimePutMessageText = findNestedObjectPropertyFunction(
+    runBrowserMutation,
+    'putMessage',
+  ).getText(mutationRuntimeSource)
+  const exactMessagePolicies = new Map(
+    messageCommandExactVariants.map((variant) => [variant, fixedPolicyBodies.get(variant) ?? '']),
+  )
+  const messageCommandExactCommon = Object.freeze({
+    exactVariants:
+      messageCommandExactVariants.length === 4 &&
+      messageCommandExactVariants.every((variant) => declared.includes(variant)),
+    typedCommandLifetimePreflight:
+      messageRepositoryInterfaceText.includes('readStructurePreflight<T>(') &&
+      messageRepositoryInterfaceText.includes('readEditPreflight<T>(') &&
+      messageRepositoryInterfaceText.includes('runMutation<T, U = T>(') &&
+      !messageRepositoryInterfaceText.includes('getMessage(') &&
+      !messageRepositoryInterfaceText.includes('getMessageHeader(') &&
+      !messageRepositoryInterfaceText.includes('listChildHeaders(') &&
+      structurePreflightPlanText.includes("physicalStorageTables('messages')") &&
+      editPreflightPlanText.includes("physicalStorageTables('chats', 'messages', 'settings')"),
+    onePreflightPerCommandPath:
+      countOccurrences(editMessageText, 'repo.readEditPreflight(') === 1 &&
+      countOccurrences(editMessageText, 'repo.runMutation(') === 1 &&
+      countOccurrences(pasteImportText, 'repo.readStructurePreflight(') === 1 &&
+      countOccurrences(pasteImportText, 'repo.runMutation(') === 1 &&
+      countOccurrences(pasteImportText, 'repo.runMutation<') === 1 &&
+      pasteImportText.indexOf('if (input.messages.length === 0)') <
+        pasteImportText.indexOf('repo.readStructurePreflight(') &&
+      [deletePairText, deleteTurnText, deleteSingleText, deleteVariantText].every(
+        (text) => countOccurrences(text, 'repo.readStructurePreflight(') === 1,
+      ) &&
+      countOccurrences(executeDeleteText, 'repo.runMutation<') === 1 &&
+      countOccurrences(restoreStructureText, 'repo.readStructurePreflight(') === 1 &&
+      countOccurrences(restoreStructureText, 'repo.runMutation<') === 1,
+    targetShapedCachedReads:
+      preflightReaderText.includes(
+        'const headers = new Map<MessageId, MessageHeaderRow | undefined>()',
+      ) &&
+      preflightReaderText.includes(
+        'const childSlots = new Map<string, readonly MessageHeaderRow[]>()',
+      ) &&
+      preflightReaderText.includes('messageTable.get(messageId)') &&
+      preflightReaderText.includes('messageTable.bulkGet(missingIds)') &&
+      preflightReaderText.includes('listChildHeaderRows(messageTable, chatId, parentId)') &&
+      listChildHeaderRowsText.includes(".where('[chatId+treeParentKey+siblingIndex+id]')") &&
+      listChildHeaderRowsText.includes(
+        'exactCompoundPrefixBetween([chatId, treeParentKey(parentId)])',
+      ) &&
+      !preflightReaderText.includes("orderBy(':id')") &&
+      !preflightReaderText.includes('.toCollection()'),
+    exactPreflightReceipt:
+      countOccurrences(structurePreflightText, 'commit.readSemanticOperationPreflight(') === 1 &&
+      structurePreflightText.includes('createSemanticOperationExactReceiptAccumulator') &&
+      structurePreflightText.includes('receipt.snapshotFragment().physicalReads') &&
+      countOccurrences(editPreflightText, 'commit.readSemanticOperationPreflight(') === 1 &&
+      editPreflightText.includes('createSemanticOperationExactReceiptAccumulator<') &&
+      editPreflightText.includes('receipt.snapshotFragment().physicalReads') &&
+      Object.values(commandLifetimeReceipt.commonKernel).every(Boolean),
+    plainValueHandoff:
+      preflightReaderText.includes('cloneMessageHeader(') &&
+      editPreflightText.includes('structuredClone(chat)') &&
+      editPreflightText.includes('structuredClone(row.value)') &&
+      ![
+        preflightReaderText,
+        editPreflightText,
+        editMessageText,
+        pasteImportText,
+        executeDeleteText,
+        restoreStructureText,
+      ].some((text) => text.includes('WeakMap') || text.includes('PriorNotCurrentTransaction')),
+    transactionRevalidation:
+      editMessageText.includes('currentHeader.nodeVersion !== target.nodeVersion') &&
+      editMessageText.includes('currentHeader.bodyVersion !== target.bodyVersion') &&
+      editMessageText.includes(
+        'currentHeader.requestContextVersion !== target.requestContextVersion',
+      ) &&
+      pasteImportText.includes('paste active branch changed') &&
+      executeDeleteText.includes('delete active branch changed') &&
+      executeDeleteText.includes('delete children of') &&
+      restoreStructureText.includes('undo target ') &&
+      restoreStructureText.includes('expected.id') &&
+      restoreStructureText.includes('undo children of'),
+    oneImportedMessageConstructor:
+      countOccurrences(messagesSource.getText(), "origin: 'imported'") === 1 &&
+      importedMessageText.includes('prepared.id') &&
+      importedMessageText.includes('prepared.turnId') &&
+      !importedMessageText.includes('newId()') &&
+      countOccurrences(pasteImportText, 'newId()') === 2 &&
+      pasteImportText.indexOf('const preparedMessages = input.messages.map(') <
+        pasteImportText.indexOf('repo.readStructurePreflight('),
+    singlePassExistingMessageCompiler:
+      countOccurrences(updateCandidateText, 'compileCurrentMessageTransition(') === 1 &&
+      !finalizeUpdateText.includes('compileCurrentMessageTransition(') &&
+      countOccurrences(runtimePutMessageText, 'compileCurrentMessageUpdateCandidate(') === 1 &&
+      countOccurrences(runtimePutMessageText, 'finalizeCurrentMessageUpdateTransition(') === 1 &&
+      countOccurrences(runtimePutMessageText, 'readMessageBody(message.id)') === 1 &&
+      runtimePutMessageText.includes('recordMessageHeaderSummaryDeltas(') &&
+      !runtimePutMessageText.includes('hydrateStoredMessage(existing, existingBody).generation'),
+    exactOccurrencePolicies:
+      [...exactMessagePolicies.values()].every((body) => body.includes('exactOccurrence: true')) &&
+      exactMessagePolicies
+        .get('message.edit-content')
+        ?.includes("replayReason: 'unfenced-relative-update'") === true &&
+      exactMessagePolicies.get('message.import')?.includes("replayReason: 'random-identity'") ===
+        true &&
+      ['message.delete', 'message.restore-structure'].every(
+        (variant) =>
+          exactMessagePolicies.get(variant)?.includes("replayReason: 'non-replayable'") === true,
+      ),
+    genericExactOccurrenceReceipt:
+      mutationPlanSource
+        .getText()
+        .includes('receiptPolicy?.exactOccurrence || receiptPolicy?.exactPlan') &&
+      runBrowserMutationText.includes('semanticOperationExactReceipt(operationPlan.exactPlan, {') &&
+      runBrowserMutationText.includes('receiptAccumulator.snapshotFragment()'),
+    noRetryOrBroadLock: [
+      editMessageText,
+      pasteImportText,
+      executeDeleteText,
+      restoreStructureText,
+      structurePreflightText,
+      editPreflightText,
+    ].every(
+      (text) =>
+        !text.includes('for (;;)') &&
+        !text.includes('setTimeout(') &&
+        !text.includes('.withLocks(') &&
+        !text.includes('catch ('),
+    ),
+  })
+  for (const [name, proved] of Object.entries(messageCommandExactCommon)) {
+    if (!proved) outputProblems.push(`message command exact family missing ${name}`)
+  }
+  const messageCommandExactTablesProved =
+    commonConsumed &&
+    messageCommandExactCommon.typedCommandLifetimePreflight &&
+    messageCommandExactCommon.onePreflightPerCommandPath &&
+    messageCommandExactCommon.targetShapedCachedReads &&
+    messageCommandExactCommon.exactPreflightReceipt &&
+    messageCommandExactCommon.plainValueHandoff &&
+    messageCommandExactCommon.transactionRevalidation &&
+    messageCommandExactCommon.noRetryOrBroadLock
+  const messageCommandExactReceiptProved =
+    messageCommandExactTablesProved &&
+    fixedReceiptEffectsProved &&
+    messageCommandExactCommon.exactOccurrencePolicies &&
+    messageCommandExactCommon.genericExactOccurrenceReceipt &&
+    messageCommandExactCommon.oneImportedMessageConstructor &&
+    messageCommandExactCommon.singlePassExistingMessageCompiler
+  const messageCommandExactReplayProved =
+    commonConsumed &&
+    messageCommandExactCommon.exactOccurrencePolicies &&
+    messageCommandExactCommon.noRetryOrBroadLock &&
+    fixedReceiptCommon.runningRuntimeSingleInvoke &&
+    fixedReceiptCommon.waitingRuntimeSingleInvoke &&
+    fixedReceiptCommon.admittedRootSingleInvoke
   const draftPutOwner = findMethod(browserRepoSource, 'BrowserWorkspaceRepository', 'putDraftRow')
   const draftPutText = draftPutOwner.getText(browserRepoSource)
   const draftPutPlanOwner = findFunction(browserRepoSource, 'readDraftPutPlan')
@@ -6658,6 +7934,9 @@ function scopeDerivedMutationCapabilityFacts(
     'recordBrowserCommandOwnerInvalidation',
   )
   const transitionCalls = executableCalls(applyAttachmentTransitionsOwner)
+  const syncAttachmentTransitionCalls = executableCalls(syncAttachmentReferenceOwner).filter(
+    (call) => callResolvesTo(checker, call, applyAttachmentTransitionsOwner),
+  )
   const transitionReceiptCalls = transitionCalls.filter((call) =>
     callResolvesTo(checker, call, attachmentTransitionReceiptOwner),
   )
@@ -6853,10 +8132,12 @@ function scopeDerivedMutationCapabilityFacts(
         .includes('{ validateUnchangedTargets: true }') &&
       !runtimePutDraft.getText(mutationRuntimeSource).includes('for (') &&
       !runtimePutDraft.getText(mutationRuntimeSource).includes('while (') &&
-      syncAttachmentReferenceOwner
-        .getText(mutationRuntimeSource)
-        .includes('await applyAttachmentReferenceOwnerTransitions(tx, [input], now,') &&
-      attachmentTransitionText.includes('await requireAttachmentTargets(tx, [...nextTargetIds])') &&
+      syncAttachmentTransitionCalls.length === 1 &&
+      syncAttachmentTransitionCalls[0]?.arguments[4]?.getText(mutationRuntimeSource) ===
+        'input.validateUnchangedTargets === true' &&
+      attachmentTransitionText.includes(
+        'await requireAttachmentTargets(tx, [...validationTargetIds])',
+      ) &&
       runBrowserMutationText.includes(
         'const draftReads = new Map<ChatId, DraftRow | undefined>()',
       ) &&
@@ -6935,6 +8216,254 @@ function scopeDerivedMutationCapabilityFacts(
     draftPutCommon.runningRuntimeSingleInvoke &&
     draftPutCommon.waitingRuntimeSingleInvoke &&
     draftPutCommon.admittedRootSingleInvoke
+  const addAttachmentReferenceOwner = findMethod(
+    browserRepoSource,
+    'BrowserWorkspaceRepository',
+    'addAttachmentReference',
+  )
+  const setAttachmentReferenceVisibilityOwner = findMethod(
+    browserRepoSource,
+    'BrowserWorkspaceRepository',
+    'setAttachmentReferenceVisibility',
+  )
+  const detachAttachmentReferenceOwner = findMethod(
+    browserRepoSource,
+    'BrowserWorkspaceRepository',
+    'detachAttachmentReference',
+  )
+  const mutateSingleAttachmentReferenceOwner = findMethod(
+    browserRepoSource,
+    'BrowserWorkspaceRepository',
+    'mutateSingleAttachmentReference',
+  )
+  const relinkAttachmentReferencesOwner = findMethod(
+    browserRepoSource,
+    'BrowserWorkspaceRepository',
+    'relinkAttachmentReferences',
+  )
+  const applyAttachmentReferenceOwnerMutationsOwner = findFunction(
+    browserRepoSource,
+    'applyAttachmentReferenceOwnerMutations',
+  )
+  const runtimeReplaceMessageAttachmentRefs = findNestedObjectPropertyFunction(
+    runBrowserMutation,
+    'replaceMessageAttachmentRefs',
+  )
+  const transitionMessageAttachmentRefsOwner = findFunction(
+    messageStorageSource,
+    'transitionMessageAttachmentRefs',
+  )
+  const addExistingAttachmentRefOwner = findFunction(attachmentsSource, 'addExistingAttachmentRef')
+  const setAttachmentRefVisibilityOwner = findFunction(
+    attachmentsSource,
+    'setAttachmentRefVisibility',
+  )
+  const detachAttachmentRefOwner = findFunction(attachmentsSource, 'detachAttachmentRef')
+  const mutateMessageAttachmentRefOwner = findFunction(
+    attachmentsSource,
+    'mutateMessageAttachmentRef',
+  )
+  const mutateAttachmentReferenceTargetsOwner = findFunction(
+    attachmentsSource,
+    'mutateAttachmentReferenceTargets',
+  )
+  const attachmentReferenceApplicationOwners = [
+    addExistingAttachmentRefOwner,
+    setAttachmentRefVisibilityOwner,
+    detachAttachmentRefOwner,
+    mutateMessageAttachmentRefOwner,
+    mutateAttachmentReferenceTargetsOwner,
+  ]
+  const attachmentReferenceApplicationTexts = attachmentReferenceApplicationOwners.map((owner) =>
+    owner.getText(attachmentsSource),
+  )
+  const attachmentReferenceProfileStart = compileScopesText.indexOf(
+    "if (storageProfile === 'attachment-reference-update')",
+  )
+  const attachmentReferenceProfileText =
+    attachmentReferenceProfileStart < 0
+      ? ''
+      : compileScopesText.slice(
+          attachmentReferenceProfileStart,
+          compileScopesText.indexOf('if (scope.access', attachmentReferenceProfileStart),
+        )
+  const attachmentReferenceRuntimeSingleAttempt = workspaceRuntimeSingleAttemptFacts(program)
+  const attachmentReferenceCommon = Object.freeze({
+    exhaustiveTypedFamily:
+      attachmentReferenceVariants.length === 4 &&
+      attachmentReferenceVariants.every((variant) => declared.includes(variant)) &&
+      attachmentReferenceVariants.every((variant) => fixedPolicyBodies.has(variant)) &&
+      workspaceProtocolSource.getText().includes('export type AttachmentRefMutationOwner =') &&
+      workspaceProtocolSource.getText().includes('expectedAttachmentId: AttachmentId'),
+    noExternalPreflight:
+      attachmentReferenceApplicationTexts.every(
+        (text) => !text.includes('runWorkspaceRead(') && !text.includes('.query('),
+      ) &&
+      countOccurrences(addExistingAttachmentRefOwner.getText(attachmentsSource), '.execute(') ===
+        1 &&
+      countOccurrences(setAttachmentRefVisibilityOwner.getText(attachmentsSource), '.execute(') ===
+        1 &&
+      countOccurrences(detachAttachmentRefOwner.getText(attachmentsSource), '.execute(') === 1 &&
+      countOccurrences(
+        mutateAttachmentReferenceTargetsOwner.getText(attachmentsSource),
+        '.execute(',
+      ) === 1 &&
+      countOccurrences(mutateMessageAttachmentRefOwner.getText(attachmentsSource), '.execute(') ===
+        3 &&
+      countOccurrences(
+        mutateMessageAttachmentRefOwner.getText(attachmentsSource),
+        "runWorkspaceAction('attachment'",
+      ) === 1,
+    oneTransactionOwner:
+      countOccurrences(
+        addAttachmentReferenceOwner.getText(browserRepoSource),
+        'applyAttachmentReferenceOwnerMutations(',
+      ) === 1 &&
+      countOccurrences(
+        mutateSingleAttachmentReferenceOwner.getText(browserRepoSource),
+        'applyAttachmentReferenceOwnerMutations(',
+      ) === 1 &&
+      countOccurrences(
+        relinkAttachmentReferencesOwner.getText(browserRepoSource),
+        'applyAttachmentReferenceOwnerMutations(',
+      ) === 1 &&
+      countOccurrences(
+        setAttachmentReferenceVisibilityOwner.getText(browserRepoSource),
+        'this.mutateSingleAttachmentReference(',
+      ) === 1 &&
+      countOccurrences(
+        detachAttachmentReferenceOwner.getText(browserRepoSource),
+        'this.mutateSingleAttachmentReference(',
+      ) === 1 &&
+      applyAttachmentReferenceOwnerMutationsOwner
+        .getText(browserRepoSource)
+        .includes('const ownerKeys = new Set<string>()') &&
+      applyAttachmentReferenceOwnerMutationsOwner
+        .getText(browserRepoSource)
+        .includes('await attachmentOwnerMessageHeader(ctx, mutation.owner)') &&
+      countOccurrences(
+        applyAttachmentReferenceOwnerMutationsOwner.getText(browserRepoSource),
+        'await ctx.getDraft(',
+      ) === 1,
+    headerOnlyMessageTransition:
+      runtimeReplaceMessageAttachmentRefs
+        .getText(mutationRuntimeSource)
+        .includes('const existing = await readMessageHeader(messageId)') &&
+      runtimeReplaceMessageAttachmentRefs
+        .getText(mutationRuntimeSource)
+        .includes('transitionMessageAttachmentRefs(existing, attachmentRefs)') &&
+      runtimeReplaceMessageAttachmentRefs
+        .getText(mutationRuntimeSource)
+        .includes("putPhysicalStorageRow(tx, 'messages', next, existing)") &&
+      runtimeReplaceMessageAttachmentRefs
+        .getText(mutationRuntimeSource)
+        .includes('await syncAttachmentReferenceOwner({') &&
+      !runtimeReplaceMessageAttachmentRefs
+        .getText(mutationRuntimeSource)
+        .includes('readMessageBody') &&
+      !runtimeReplaceMessageAttachmentRefs
+        .getText(mutationRuntimeSource)
+        .includes('messagePreviews') &&
+      !runtimeReplaceMessageAttachmentRefs
+        .getText(mutationRuntimeSource)
+        .includes('ensureChatState') &&
+      transitionMessageAttachmentRefsOwner
+        .getText(messageStorageSource)
+        .includes('requestContextVersion: header.requestContextVersion + 1') &&
+      transitionMessageAttachmentRefsOwner
+        .getText(messageStorageSource)
+        .includes('bodyMediaCount: Math.max(0, header.bodyMediaCount + mediaDelta)') &&
+      transitionMessageAttachmentRefsOwner
+        .getText(messageStorageSource)
+        .includes('delete next.cachedMediaTokens'),
+    narrowTransactionProfile:
+      scopeProfileText.includes("command.kind === 'attachment.ref.add'") &&
+      scopeProfileText.includes("? 'attachment-reference-update'") &&
+      attachmentReferenceProfileText.includes("builder.addReadTable('chats')") &&
+      attachmentReferenceProfileText.includes(
+        "builder.addMutationTable('messages', 'message-header')",
+      ) &&
+      !attachmentReferenceProfileText.includes('messageBodies') &&
+      !attachmentReferenceProfileText.includes('messagePreviews') &&
+      !attachmentReferenceProfileText.includes('streamLeases') &&
+      compileScopesText.includes("storageProfile !== 'attachment-reference-update'"),
+    exactAttachmentTransition:
+      draftPutCommon.constructiveExactReceipt &&
+      transitionCalls.filter((call) =>
+        callResolvesTo(checker, call, applyAttachmentReferenceDeltasOwner),
+      ).length === 1 &&
+      attachmentTransitionText.includes(
+        'await requireAttachmentTargets(tx, [...validationTargetIds])',
+      ) &&
+      attachmentTransitionText.includes(
+        'const deltasReceipt = await applyAttachmentReferenceDeltas(',
+      ) &&
+      !attachmentTransitionText.includes('nextTargetIds') &&
+      runtimeReplaceMessageAttachmentRefs
+        .getText(mutationRuntimeSource)
+        .includes('previousRefs: existing.attachmentRefs') &&
+      runtimeReplaceMessageAttachmentRefs
+        .getText(mutationRuntimeSource)
+        .includes('nextRefs: next.attachmentRefs'),
+    exactResourceScopes:
+      addAttachmentReferenceOwner
+        .getText(browserRepoSource)
+        .includes('attachmentOwnerScopes(input.owner, [input.ref.attachmentId])') &&
+      mutateSingleAttachmentReferenceOwner
+        .getText(browserRepoSource)
+        .includes('attachmentOwnerScopes(owner, [expectedAttachmentId])') &&
+      relinkAttachmentReferencesOwner
+        .getText(browserRepoSource)
+        .includes('input.newAttachmentId') &&
+      relinkAttachmentReferencesOwner
+        .getText(browserRepoSource)
+        .includes('ref.expectedAttachmentId') &&
+      attachmentOwnerScopesOwner.getText(browserRepoSource).includes("kind: 'attachment' as const"),
+    typedReplayPolicies:
+      fixedPolicyBodies.get('attachment.ref.add')?.includes("replayReason: 'random-identity'") ===
+        true &&
+      fixedPolicyBodies
+        .get('attachment.ref.detach')
+        ?.includes("replayReason: 'unfenced-relative-update'") === true &&
+      fixedPolicyBodies
+        .get('attachment.ref.set-visibility')
+        ?.includes("replayReason: 'unfenced-relative-update'") === true &&
+      fixedPolicyBodies.get('attachment.ref.relink')?.includes("replayReason: 'non-replayable'") ===
+        true,
+    oneApplicationSubmission: attachmentReferenceApplicationTexts.every(
+      (text) =>
+        !text.includes('for (;;)') &&
+        !text.includes('setTimeout(') &&
+        !text.includes('.withLocks(') &&
+        !text.includes('catch ('),
+    ),
+    nestedOwnerBoundExplicitlyOpen:
+      applyAttachmentReferenceOwnerMutationsOwner
+        .getText(browserRepoSource)
+        .includes('for (const mutation of mutations)') &&
+      workspaceProtocolSource.getText().includes('refs: readonly AttachmentRefRelinkSpec[]'),
+    ...attachmentReferenceRuntimeSingleAttempt,
+  })
+  for (const [name, proved] of Object.entries(attachmentReferenceCommon)) {
+    if (!proved) outputProblems.push(`attachment reference mutation family missing ${name}`)
+  }
+  const attachmentReferenceTablesProved =
+    commonConsumed &&
+    attachmentReferenceCommon.exhaustiveTypedFamily &&
+    attachmentReferenceCommon.noExternalPreflight &&
+    attachmentReferenceCommon.oneTransactionOwner &&
+    attachmentReferenceCommon.headerOnlyMessageTransition &&
+    attachmentReferenceCommon.narrowTransactionProfile &&
+    attachmentReferenceCommon.exactResourceScopes
+  const attachmentReferenceReceiptProved =
+    attachmentReferenceTablesProved && attachmentReferenceCommon.exactAttachmentTransition
+  const attachmentReferenceReplayProved =
+    commonConsumed &&
+    attachmentReferenceCommon.typedReplayPolicies &&
+    attachmentReferenceCommon.oneApplicationSubmission &&
+    attachmentReferenceCommon.runningRuntimeSingleInvoke &&
+    attachmentReferenceCommon.waitingRuntimeSingleInvoke &&
+    attachmentReferenceCommon.admittedRootSingleInvoke
   const attachmentBytesOwner = findMethod(
     browserRepoSource,
     'BrowserWorkspaceRepository',
@@ -7732,13 +9261,8 @@ function scopeDerivedMutationCapabilityFacts(
       compileScopesText.includes("builder.addMutationTable('attachments', 'attachment')"),
     exactPhysicalReads:
       runtimeAttachmentDeletePhysicalReads.length === 6 &&
-      hasAttachmentDeletePhysicalRead('attachments', 'primary', 'get', 'header ? 1 : 0') &&
-      hasAttachmentDeletePhysicalRead(
-        'attachmentCatalogRows',
-        'primary',
-        'get',
-        'catalogRow ? 1 : 0',
-      ) &&
+      hasAttachmentDeletePhysicalRead('attachments', 'primary', 'get', '1') &&
+      hasAttachmentDeletePhysicalRead('attachmentCatalogRows', 'primary', 'get', '1') &&
       hasAttachmentDeletePhysicalRead(
         'attachmentRefEdges',
         'secondary',
@@ -8005,13 +9529,8 @@ function scopeDerivedMutationCapabilityFacts(
       compileScopesText.includes("builder.addMutationTable('attachments', 'attachment')"),
     exactPhysicalReads:
       runtimeAttachmentDeleteManyPhysicalReads.length === 3 &&
-      hasAttachmentDeleteManyPhysicalRead('attachments', 'primary', 'get', 'header ? 1 : 0') &&
-      hasAttachmentDeleteManyPhysicalRead(
-        'attachmentCatalogRows',
-        'primary',
-        'get',
-        'catalogRow ? 1 : 0',
-      ) &&
+      hasAttachmentDeleteManyPhysicalRead('attachments', 'primary', 'get', '1') &&
+      hasAttachmentDeleteManyPhysicalRead('attachmentCatalogRows', 'primary', 'get', '1') &&
       hasAttachmentDeleteManyPhysicalRead(
         'attachmentRefEdges',
         'secondary',
@@ -8203,7 +9722,9 @@ function scopeDerivedMutationCapabilityFacts(
       compileScopesText.includes("builder.addMutationTable('attachmentRefEdges', 'attachment')") &&
       compileScopesText.includes("builder.addMutationTable('attachments', 'attachment')") &&
       attachmentReapExtensionText.includes("readTableNames: ['attachments']") &&
-      attachmentReapExtensionText.includes("writeTableNames: ['storageRetentionState']"),
+      attachmentReapExtensionText.includes(
+        "writeTableNames: ['attachmentIntegrityState', 'storageRetentionState']",
+      ),
     exactEffectReceipt:
       attachmentDeleteCommon.exactEffectReceipt &&
       runtimeReapAttachmentText.includes(
@@ -8217,7 +9738,8 @@ function scopeDerivedMutationCapabilityFacts(
       attachmentReapReplayText.includes('cycle: cycle.cycleNow') &&
       attachmentReapReplayText.includes('revision: cycle.expectedRevision') &&
       attachmentReapReplayText.includes('cursor: stableStringify(cycle.cursor ?? null)') &&
-      attachmentReapReplayText.includes('doneMarker: `cutoff:${cycle.cutoff}`') &&
+      attachmentReapReplayText.includes('doneMarker: `cutoff:') &&
+      attachmentReapReplayText.includes('cycle.cutoff') &&
       attachmentReapReplayText.includes('limit') &&
       mutationPlanSource.getText().includes('extensionReceipt?: {') &&
       mutationPlanSource.getText().includes('replayPlan: extensionReceipt.replay') &&
@@ -8356,7 +9878,8 @@ function scopeDerivedMutationCapabilityFacts(
       sidebarCapabilityText.includes("'chatSidebarAggregates'") &&
       configurationLinkCapabilityText.includes("'configurationLinks'") &&
       configurationLinkCapabilityText.includes("'configurationProfileUsageRows'") &&
-      configurationLinkCapabilityText.includes("'configurationCatalogAggregates'"),
+      configurationLinkCapabilityText.includes("'configurationCatalogAggregates'") &&
+      materializeRuntimeText.includes("readTableNames: ['childLists']"),
     exactReadReceipt:
       countOccurrences(
         runBrowserMutationText,
@@ -8374,8 +9897,8 @@ function scopeDerivedMutationCapabilityFacts(
       materializeExactPlanText.includes(
         "links.filter((link) => link.targetKind === 'profile').length",
       ) &&
-      materializeExactPlanText.includes('maxRequests: 5 + 2 * profileLinks') &&
-      materializeExactPlanText.includes('maxRows: 5 + 2 * profileLinks') &&
+      materializeExactPlanText.includes('maxRequests: 6 + 2 * profileLinks') &&
+      materializeExactPlanText.includes('maxRows: 6 + 2 * profileLinks') &&
       materializeExactPlanText.includes(
         'maxRequests: 3 + (links.length > 0 ? 1 : 0) + 2 * profileLinks',
       ) &&
@@ -8703,14 +10226,17 @@ function scopeDerivedMutationCapabilityFacts(
       exactPhysicalWritesProved: commonKernel.exactPhysicalWriteReceipt,
       exactEffectsProved:
         (fixedVariants.includes(variant) && fixedReceiptEffectsProved) ||
+        (messageCommandExactVariants.includes(variant) && messageCommandExactReceiptProved) ||
         (variant === 'draft.put' && draftPutReceiptProved) ||
         (variant === 'attachment.bytes.delete' && attachmentBytesReceiptProved) ||
         (variant === 'attachment.bundle.write' && attachmentBundleReceiptProved) ||
         (variant === 'attachment.delete-if-unreferenced' && attachmentDeleteReceiptProved) ||
         (variant === 'attachment.delete-many' && attachmentDeleteManyReceiptProved) ||
-        (variant === 'attachment.reap' && attachmentReapReceiptProved),
+        (variant === 'attachment.reap' && attachmentReapReceiptProved) ||
+        (attachmentReferenceVariants.includes(variant) && attachmentReferenceReceiptProved),
       tablesProved:
         (messageVariants.includes(variant) && presentationMessageProved) ||
+        (messageCommandExactVariants.includes(variant) && messageCommandExactTablesProved) ||
         (variant === 'chat.materialize-temporary' && materializeProved) ||
         (variant === 'attempt.prepare' && attemptPrepareProved) ||
         (variant === 'attempt.dispatch' && attemptDispatchProved) ||
@@ -8720,7 +10246,8 @@ function scopeDerivedMutationCapabilityFacts(
         (variant === 'attachment.bundle.write' && attachmentBundleTablesProved) ||
         (variant === 'attachment.delete-if-unreferenced' && attachmentDeleteTablesProved) ||
         (variant === 'attachment.delete-many' && attachmentDeleteManyTablesProved) ||
-        (variant === 'attachment.reap' && attachmentReapTablesProved),
+        (variant === 'attachment.reap' && attachmentReapTablesProved) ||
+        (attachmentReferenceVariants.includes(variant) && attachmentReferenceTablesProved),
       boundsProved:
         (messageVariants.includes(variant) && presentationMessageProved) ||
         (variant === 'chat.materialize-temporary' && materializeProved) ||
@@ -8728,6 +10255,7 @@ function scopeDerivedMutationCapabilityFacts(
       byteBoundsProved: false,
       idempotenceProved:
         (replayVariants.includes(variant) && fixedReceiptReplayProved) ||
+        (messageCommandExactVariants.includes(variant) && messageCommandExactReplayProved) ||
         (variant === 'attempt.prepare' && attemptPrepareReplayProved) ||
         (variant === 'attempt.dispatch' && attemptDispatchProved) ||
         (variant === 'attempt.finalize' && attemptFinalizeProved) ||
@@ -8736,7 +10264,8 @@ function scopeDerivedMutationCapabilityFacts(
         (variant === 'attachment.bundle.write' && attachmentBundleReplayProved) ||
         (variant === 'attachment.delete-if-unreferenced' && attachmentDeleteReplayProved) ||
         (variant === 'attachment.delete-many' && attachmentDeleteManyReplayProved) ||
-        (variant === 'attachment.reap' && attachmentReapReplayProved),
+        (variant === 'attachment.reap' && attachmentReapReplayProved) ||
+        (attachmentReferenceVariants.includes(variant) && attachmentReferenceReplayProved),
     })
     routeFacts[variant] = Object.freeze({
       entries: Object.freeze(route.entries),
@@ -8802,6 +10331,14 @@ function scopeDerivedMutationCapabilityFacts(
       attachmentReap: Object.freeze({
         variant: 'attachment.reap',
         commonKernel: attachmentReapCommon,
+      }),
+      attachmentReference: Object.freeze({
+        variants: attachmentReferenceVariants,
+        commonKernel: attachmentReferenceCommon,
+      }),
+      messageCommandExact: Object.freeze({
+        variants: messageCommandExactVariants,
+        commonKernel: messageCommandExactCommon,
       }),
     }),
     capabilities: Object.freeze(capabilities),
@@ -10175,7 +11712,15 @@ function literalArrayValues(source, variableName) {
     if (!ts.isVariableStatement(statement)) continue
     for (const declaration of statement.declarationList.declarations) {
       if (!ts.isIdentifier(declaration.name) || declaration.name.text !== variableName) continue
-      const initializer = declaration.initializer ? unwrap(declaration.initializer) : undefined
+      let initializer = declaration.initializer ? unwrap(declaration.initializer) : undefined
+      if (
+        initializer &&
+        ts.isCallExpression(initializer) &&
+        initializer.expression.getText(source) === 'Object.freeze' &&
+        initializer.arguments[0]
+      ) {
+        initializer = unwrap(initializer.arguments[0])
+      }
       if (!initializer || !ts.isArrayLiteralExpression(initializer)) {
         throw new Error(`DurableCommandPipelineArrayInvalid:${variableName}`)
       }
@@ -10476,7 +12021,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
     process.stdout.write(`${JSON.stringify(output, null, 2)}\n`)
   } else {
     process.stdout.write(
-      `Durable command pipeline: workspace=${output.workspaceCommands}, configuration=${output.configurationCommands}, records=${output.pipelineRecords}, cells=${output.stageCells}, gaps=${output.gapCells}, manual-markers=${output.manualMarkerCalls}, direct-transactions=${output.directTransactionCalls}.\n`,
+      `Durable command pipeline: workspace=${output.workspaceCommands}, configuration=${output.configurationCommands}, records=${output.pipelineRecords}, cells=${output.stageCells}, gaps=${output.gapCells}, finite-bounds=${output.finiteClassifiedBoundCells}, staged-bounds=${output.stagedClassifiedBoundCells}, carried-bounds=${output.carriedBoundCells}, manual-markers=${output.manualMarkerCalls}, direct-transactions=${output.directTransactionCalls}.\n`,
     )
     for (const problem of output.problems) process.stderr.write(`  ${problem}\n`)
   }

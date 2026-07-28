@@ -10,6 +10,7 @@ import {
   type BrowserWorkspaceSlotLeaseHandle,
   releaseBrowserWorkspaceSlotLease,
 } from './browser-workspace-slot-coordination'
+import { ensureBrowserWorkspaceCurrentForSelection } from './browser-workspace-startup-repair'
 import { configureBrowserWorkspaceDatabaseName } from './db'
 
 declare const openingBrowserWorkspaceDatabaseSelectionBrand: unique symbol
@@ -101,6 +102,8 @@ async function selectBrowserWorkspaceDatabase(
   for (;;) {
     assertBrowserWorkspaceBootstrapAuthority(authority)
     onProgress?.({ kind: 'database-selection', operation: 'read-active-slot' })
+    const current = await ensureBrowserWorkspaceCurrentForSelection(authority.signal, onProgress)
+    assertBrowserWorkspaceBootstrapAuthority(authority)
     const manifest = await readBrowserWorkspaceDatabaseManifest()
     assertBrowserWorkspaceBootstrapAuthority(authority)
     onProgress?.({
@@ -123,7 +126,9 @@ async function selectBrowserWorkspaceDatabase(
       assertBrowserWorkspaceBootstrapAuthority(authority)
       if (
         confirmed.activeDatabaseName !== manifest.activeDatabaseName ||
-        confirmed.activationSequence !== manifest.activationSequence
+        confirmed.activationSequence !== manifest.activationSequence ||
+        confirmed.activeDatabaseName !== current.databaseName ||
+        confirmed.activationSequence !== current.activationSequence
       ) {
         onProgress?.({
           kind: 'database-selection',
@@ -133,7 +138,7 @@ async function selectBrowserWorkspaceDatabase(
         await releaseBrowserWorkspaceSlotLease(slotLease)
         continue
       }
-      configureBrowserWorkspaceDatabaseName(confirmed.activeDatabaseName)
+      configureBrowserWorkspaceDatabaseName(confirmed.activeDatabaseName, current.physicalVersion)
       const record: BrowserWorkspaceDatabaseSelectionRecord = {
         databaseName: confirmed.activeDatabaseName,
         activationSequence: confirmed.activationSequence,

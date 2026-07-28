@@ -375,6 +375,18 @@ export async function awaitStorageCompactionWriteAdmission(): Promise<StorageCom
   return receipt
 }
 
+export function stagedStorageCompactionWriteAdmission(
+  databaseName: string,
+): StorageCompactionWriteAdmission {
+  if (databaseName.length === 0) throw new Error('StorageCompactionWriteAdmissionDatabaseInvalid')
+  return Object.freeze({
+    kind: 'storage-compaction-write-admission',
+    databaseName,
+    commandPhysicalReads: 0,
+    [STORAGE_COMPACTION_WRITE_ADMISSION]: true as const,
+  })
+}
+
 export function stopStorageCompactionIntentOwner(): void {
   storageCompactionWriteAdmission = undefined
   physicalMutationIntentOwnerStart?.controller.abort(

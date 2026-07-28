@@ -59,6 +59,7 @@ import {
 import { BROWSER_WRITER_LOCK_NAME } from '../../src/store/browser-lock-record'
 import { __resetBrowserRepositoryForTests } from '../../src/store/browser-repo'
 import type { BrowserWorkspaceReplacementMutationGrant } from '../../src/store/browser-workspace-contract'
+import { probeBrowserWorkspaceCurrent } from '../../src/store/browser-workspace-current-probe'
 import {
   migrateBrowserWorkspaceCompactionState,
   readBrowserWorkspaceDatabaseManifest,
@@ -76,6 +77,7 @@ import {
 
 import { configurationApplication } from '../../src/store/configuration-application'
 import { configurationRequestRevisionFor } from '../../src/store/configuration-domain-contract'
+import { CONFIGURATION_PROFILE_MANAGER_STATE_ID } from '../../src/store/configuration-profile-usage-projection'
 import { __resetDbForTests, getDb, NatterDb, openDb } from '../../src/store/db'
 import { configurationDiscoveryApplication } from '../../src/store/discovery-service'
 import {
@@ -85,6 +87,7 @@ import {
   exportWorkspaceBackup,
   importChat,
   importChatPreset,
+  importChats,
   restoreWorkspaceBackup,
   WorkspaceReplacementInProgressError,
 } from '../../src/store/import-export'
@@ -101,7 +104,7 @@ import {
   splitMessageForStorage,
 } from '../../src/store/message-storage'
 import { getCachedModels } from '../../src/store/models-cache'
-import { PHYSICAL_STORAGE_TABLE_NAMES } from '../../src/store/physical-storage-tables'
+import { ALL_PHYSICAL_STORAGE_TABLE_NAMES } from '../../src/store/physical-storage-tables'
 import { getCachedPrivacyPolicy } from '../../src/store/privacy-cache'
 import {
   STREAM_LEASE_TTL_MS,
@@ -1137,6 +1140,102 @@ describe('chat export/import', () => {
     )
     expect(fileItem(importedUser?.content ?? []).attachmentId).toBe(seeded.sourceAttachmentId)
     await expectAttachmentReferenceInvariants(db)
+  })
+
+  it('commits a multi-chat import once or rolls every entry back on parse or storage failure', async () => {
+    const seeded = await seedPortableChat()
+    const exported = await exportChat(seeded.chat.id)
+    const beforeChats = await getDb().chats.count()
+    const duplicateDestination = 'atomic-chat-import'
+
+    await expect(importChats([exported, { objectKind: 'chat' }])).rejects.toThrow()
+
+    expect(await getDb().chats.count()).toBe(beforeChats)
+
+    await expect(
+      importChats(
+        [exported, exported],
+        [
+          { destinationChatId: duplicateDestination, now: 1000 },
+          { destinationChatId: duplicateDestination, now: 1001 },
+        ],
+      ),
+    ).rejects.toThrow()
+
+    expect(await getDb().chats.count()).toBe(beforeChats)
+    expect(await getDb().chats.get(duplicateDestination)).toBeUndefined()
+    expect(await messagesForChat(duplicateDestination)).toEqual([])
+
+    const managerBefore = await getDb().configurationCatalogAggregates.get(
+      CONFIGURATION_PROFILE_MANAGER_STATE_ID,
+    )
+    if (!managerBefore || !('revision' in managerBefore)) {
+      throw new Error('ConfigurationProfileManagerStateMissing')
+    }
+    const imported = await importChats([exported, exported], [{ now: 1100 }, { now: 1101 }])
+    const managerAfter = await getDb().configurationCatalogAggregates.get(
+      CONFIGURATION_PROFILE_MANAGER_STATE_ID,
+    )
+    if (!managerAfter || !('revision' in managerAfter)) {
+      throw new Error('ConfigurationProfileManagerStateMissing')
+    }
+
+    expect(imported).toHaveLength(2)
+    expect(new Set(imported.map((result) => result.chatId)).size).toBe(2)
+    expect(await getDb().chats.count()).toBe(beforeChats + 2)
+    expect(managerAfter.revision).toBe(managerBefore.revision + 1)
+  })
+
+  it('normalizes getter-only imported message rows without provenance eligibility', async () => {
+    const seeded = await seedPortableChat()
+    const exported = await exportChat(seeded.chat.id)
+    const assistant = must(
+      exported.payload.messages.find((row) => row.role === 'assistant'),
+      'exported assistant',
+    )
+    assistant.generation = {
+      status: 'done',
+      model: 'openai/test',
+      startedAt: 1,
+      finishedAt: 2,
+      apiUsed: 'responses',
+      reasoningCarryForward: 'unknown',
+      reasoningVisibility: { disclosure: 'unknown' },
+    }
+    const legacyContent = [
+      {
+        type: 'output_text',
+        text: 'Getter-only citation',
+        annotations: [
+          {
+            type: 'url_citation',
+            start_index: 0,
+            end_index: 6,
+            url: 'https://example.com/getter',
+          },
+        ],
+      } as unknown as ContentItem,
+    ]
+    Object.defineProperty(assistant, 'content', {
+      configurable: true,
+      enumerable: true,
+      get: () => legacyContent,
+    })
+
+    const imported = await importChat(exported, { now: 1200 })
+    const importedAssistant = must(
+      (await messagesForChat(imported.chatId)).find((row) => row.role === 'assistant'),
+      'imported assistant',
+    )
+    const content = importedAssistant.content[0]
+    if (content?.type !== 'output_text') throw new Error('ImportedOutputTextMissing')
+    expect(content.annotations?.[0]).toMatchObject({
+      type: 'url_citation',
+      source: 'openai-responses',
+      startIndex: 0,
+      endIndex: 6,
+      url: 'https://example.com/getter',
+    })
   })
 
   it('deduplicates shared catalogs and attachments across concurrent chat imports', async () => {
@@ -2755,6 +2854,10 @@ describe('workspace backup restore', () => {
       })
       expect(await destination.messages.count()).toBe(257)
       expect(await destination.presets.count()).toBe(257)
+      await expect(probeBrowserWorkspaceCurrent(destination.name)).resolves.toEqual({
+        kind: 'current',
+        physicalVersion: 970,
+      })
       const messageScope = JSON.stringify([
         'attachmentCatalogAggregate',
         'attachmentCatalogRows',
@@ -2780,7 +2883,7 @@ describe('workspace backup restore', () => {
             ]),
         ),
       ).toEqual([])
-      const clearScope = [...PHYSICAL_STORAGE_TABLE_NAMES]
+      const clearScope = [...ALL_PHYSICAL_STORAGE_TABLE_NAMES]
         .filter((name) => name !== 'browserLocks' && name !== 'workspaceFence')
         .sort()
       expect(records.filter((record) => record.tables.length === clearScope.length)).toEqual([
@@ -2791,7 +2894,12 @@ describe('workspace backup restore', () => {
       )
       expect(changedFenceTransactions).toEqual([
         expect.objectContaining({
-          tables: ['attachmentCatalogAggregate', 'attachmentIntegrityState', 'workspaceFence'],
+          tables: [
+            'attachmentCatalogAggregate',
+            'attachmentIntegrityState',
+            'settings',
+            'workspaceFence',
+          ],
           epochBefore,
           epochAfter: epochBefore + 1,
         }),
@@ -3158,11 +3266,12 @@ describe('workspace backup restore', () => {
     expect('streamLeases' in migrated.payload).toBe(false)
   })
 
-  it('canonicalizes salvageable historical generation metadata before chat and workspace export', async () => {
+  it('canonicalizes salvageable historical generation metadata at chat and workspace import', async () => {
     const seeded = await seedPortableChat()
-    const header = must(await getDb().messages.get(seeded.assistantMessage.id), 'assistant header')
+    const chat = await exportChat(seeded.chat.id)
+    const workspace = await exportWorkspaceBackup()
     const generation = {
-      ...must(header.generation, 'generation'),
+      ...must(seeded.assistantMessage.generation, 'generation'),
       apiUsed: 'openrouter',
       delivery: 'legacy-stream',
       costSource: 'legacy',
@@ -3174,19 +3283,29 @@ describe('workspace backup restore', () => {
       model: undefined,
       requestedModel: undefined,
     } as unknown as NonNullable<Message['generation']>
-    await getDb().messages.put({ ...header, generation })
+    must(
+      chat.payload.messages.find((message) => message.id === seeded.assistantMessage.id),
+      'chat assistant',
+    ).generation = generation
+    must(
+      workspace.payload.messages.find((message) => message.id === seeded.assistantMessage.id),
+      'workspace assistant',
+    ).generation = generation
 
-    const chat = await exportChat(seeded.chat.id)
-    const workspace = await exportWorkspaceBackup()
+    const importedChat = await importChat(chat, { now: 4_000 })
     const chatGeneration = must(
-      chat.payload.messages.find((message) => message.id === seeded.assistantMessage.id)
+      (await messagesForChat(importedChat.chatId)).find((message) => message.role === 'assistant')
         ?.generation,
-      'chat generation',
+      'imported chat generation',
     )
+    await expect(restoreWorkspaceBackup(workspace, { now: 4_100 })).resolves.toMatchObject({
+      chatCount: 1,
+    })
     const workspaceGeneration = must(
-      workspace.payload.messages.find((message) => message.id === seeded.assistantMessage.id)
-        ?.generation,
-      'workspace generation',
+      (await messagesForChat(seeded.chat.id)).find(
+        (message) => message.id === seeded.assistantMessage.id,
+      )?.generation,
+      'imported workspace generation',
     )
 
     for (const canonical of [chatGeneration, workspaceGeneration]) {
@@ -3203,9 +3322,6 @@ describe('workspace backup restore', () => {
       expect(canonical).not.toHaveProperty('model')
       expect(canonical).not.toHaveProperty('requestedModel')
     }
-    await expect(restoreWorkspaceBackup(workspace, { now: 4_000 })).resolves.toMatchObject({
-      chatCount: 1,
-    })
   })
 
   it('returns a current large backup by identity without cloning unchanged payload nodes', async () => {

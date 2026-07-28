@@ -547,6 +547,64 @@ describe('workspace runtime resource manifest', () => {
     expect(authority.signal.reason).toBe(reason)
   })
 
+  it('transfers a promoted maintenance root away from producer cancellation', async () => {
+    const { control, runtime } = createRuntimeHarness()
+    installNoopResourceManifest(control)
+    const fence = { workspaceId: 'workspace-maintenance-transfer', replacementEpoch: 0 }
+    runtime.workspaceRuntimeInternal.beginReconciliation(fence)
+    runtime.workspaceRuntimeInternal.finishReconciliation(fence)
+    const producer = new AbortController()
+    let authoritySignal: AbortSignal | undefined
+
+    const maintenance = runtime.tryRunWorkspaceActionIfIdle(
+      'maintenance',
+      (permit) => {
+        const authority = control.launchWorkspaceRuntimeReplacementNow('command-fanout', {
+          lineageId: permit.lineageId,
+          requireIdle: false,
+        })
+        if (!authority) throw new Error('Expected promoted maintenance replacement authority')
+        authoritySignal = authority.signal
+      },
+      { signal: producer.signal },
+    )
+    if (!maintenance) throw new Error('Expected maintenance admission')
+    await maintenance
+
+    producer.abort(new Error('producer resource closed'))
+
+    expect(authoritySignal?.aborted).toBe(false)
+    await control.awaitWorkspaceRuntimeQuiesced()
+  })
+
+  it('promotes the admitted command lineage without a second active root', async () => {
+    const { control, runtime } = createRuntimeHarness()
+    installNoopResourceManifest(control)
+    const fence = { workspaceId: 'workspace-command-fanout', replacementEpoch: 0 }
+    runtime.workspaceRuntimeInternal.beginReconciliation(fence)
+    runtime.workspaceRuntimeInternal.finishReconciliation(fence)
+    let authoritySignal: AbortSignal | undefined
+    let permitSignal: AbortSignal | undefined
+
+    await runtime.runWorkspaceAction('chat-metadata', (permit) => {
+      permitSignal = permit.signal
+      const authority = control.launchWorkspaceRuntimeReplacementNow('command-fanout', {
+        lineageId: permit.lineageId,
+        requireIdle: false,
+      })
+      if (!authority) throw new Error('Expected command fanout replacement authority')
+      authoritySignal = authority.signal
+      expect(control.getWorkspaceRuntimeControlSnapshot().state).toBe('QUIESCING')
+    })
+
+    expect(authoritySignal).toBe(permitSignal)
+    await control.awaitWorkspaceRuntimeQuiesced()
+    expect(control.getWorkspaceRuntimeControlSnapshot()).toMatchObject({
+      state: 'QUIESCED',
+      resourcesQuiesced: true,
+    })
+  })
+
   it('makes maintenance replacement authority options producer-signal-free by type', () => {
     type MaintenanceAuthorityOptions = NonNullable<
       Parameters<typeof tryLaunchMaintenanceWorkspaceRuntimeReplacementIfIdle>[0]

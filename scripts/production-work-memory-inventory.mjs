@@ -118,14 +118,12 @@ export const WORK_MEMORY_EVIDENCE_LINKS = freezeRows([
   },
   {
     id: 'zip-consumer-sequential-release',
-    ownerId: 'src/ui/import-export/json-file.ts#forEachJsonOrZipFile',
-    siteIds: ['src/ui/import-export/json-file.ts|forEachJsonOrZipFile|await-in-traversal|await|1'],
+    ownerId: 'src/ui/import-export/json-file.ts#readJsonOrZipFile',
     testPath: 'tests/unit/json-file.test.ts',
-    testLocator:
-      "it('consumes filename-sorted ZIP values sequentially and releases entry wrappers'",
+    testLocator: "it('returns filename-sorted ZIP values and releases entry wrappers'",
     assertionLocators: ['expect(metrics.parsedZipEntryWrappersReleased).toBe(2)'],
     proof:
-      'The consumer awaits entries sequentially and records release of each parsed wrapper; the fixture does not establish a large-entry peak bound.',
+      'The batch boundary converts filename-sorted parsed entries to values in place and records release of each wrapper after all entries have been parsed; the fixture does not establish a large-entry peak bound.',
   },
   {
     id: 'preset-migration-bounded-materialized-batches',
@@ -236,14 +234,6 @@ export const WORK_MEMORY_RISK_DECISIONS = freezeRows([
     rationale:
       'These scans advance monotonically through depth rows or connector rows already clipped to viewport and overscan bounds; the 2,001-node browser-DOM fixture keeps each rendered collection below its explicit threshold.',
   })),
-  {
-    siteId: 'src/ui/import-export/json-file.ts|forEachJsonOrZipFile|await-in-traversal|await|1',
-    riskKind: 'serial-await-in-traversal',
-    necessity: 'bounded-infrastructure',
-    status: 'accepted',
-    rationale:
-      'Sequential awaiting is intentional backpressure: only one imported document consumer runs at a time and each consumed wrapper is released before the next entry.',
-  },
   {
     siteId: 'src/ui/import-export/json-file.ts|jsonDocumentBlob|allocation|new:Blob|1',
     riskKind: 'retained-or-large-allocation',

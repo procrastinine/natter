@@ -221,12 +221,15 @@ describe('message storage split', () => {
     ])
     expect(graph.transitions).toEqual([
       expect.objectContaining({
-        structural: expect.objectContaining({ messageId: user.id, parentId: null }),
+        structural: expect.objectContaining({ messageId: user.id, parentId: null }) as unknown,
         custody: { kind: 'available' },
         timestamp: { kind: 'exact', createdAt: user.createdAt },
       }),
       expect.objectContaining({
-        structural: expect.objectContaining({ messageId: assistant.id, parentId: user.id }),
+        structural: expect.objectContaining({
+          messageId: assistant.id,
+          parentId: user.id,
+        }) as unknown,
         custody: { kind: 'available' },
         timestamp: { kind: 'exact', createdAt: assistant.createdAt },
       }),

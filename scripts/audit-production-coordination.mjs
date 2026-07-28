@@ -686,6 +686,7 @@ function lifecycleArchitectureViolations(entries) {
         'finishWorkspaceRuntimeReconciliation',
         'getWorkspaceRuntimeControlSnapshot',
         'installWorkspaceRuntimeResources',
+        'launchCommandFanoutWorkspaceRuntimeReplacementNow',
         'launchImportExportWorkspaceRuntimeReplacementNow',
         'noteWorkspaceRuntimeGatedChange',
         'refreshWorkspaceRuntimeReconciliation',

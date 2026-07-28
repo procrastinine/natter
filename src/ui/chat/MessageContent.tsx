@@ -640,6 +640,7 @@ function OutputMediaContextToggle({
             onMutateAttachmentRef({
               kind: 'visibility',
               refId: attachmentRef.refId,
+              expectedAttachmentId: attachmentRef.attachmentId,
               includeInContext: !attachmentRef.includeInContext,
             }),
         })

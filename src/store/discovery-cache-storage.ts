@@ -3,7 +3,6 @@ import {
   recordBrowserCommandDiscoveryCacheMaintenance,
   recordBrowserCommandOwnerInvalidation,
 } from './browser-command-mutation-journal'
-import { boundedMaintenanceLimit } from './browser-workspace-maintenance-contract'
 import {
   addPhysicalStorageRow,
   deletePhysicalStorageKeys,
@@ -29,6 +28,7 @@ import type {
   SemanticOperationExactReceiptAccumulator,
   SemanticOperationReplayPlan,
 } from './semantic-operation-capability'
+import { boundedMaintenanceLimit } from './storage-maintenance-bounds'
 import { estimateStoredValueBytes } from './storage-size-estimate'
 import {
   type DiscoveryCacheKind,
@@ -1601,9 +1601,7 @@ function isDiscoveryCacheAudit(value: unknown): value is DiscoveryCacheAuditStor
   }
   if (audit.afterKey === undefined) return true
   return isHeaderPhase(audit.phase)
-    ? Array.isArray(audit.afterKey) &&
-        audit.afterKey.length === 2 &&
-        audit.afterKey.every((part) => typeof part === 'string')
+    ? Array.isArray(audit.afterKey) && audit.afterKey.every((part) => typeof part === 'string')
     : typeof audit.afterKey === 'string'
 }
 

@@ -25,6 +25,7 @@ import { getCachedPrivacyPolicy } from './privacy-cache'
 import {
   type ConnectionDiscoverySnapshot,
   connectionDiscoveryRevisionKey,
+  type DiscoveryModelsPutResult,
   type WorkspaceReadAuthority,
   type WorkspaceWriteAuthority,
 } from './workspace-protocol'
@@ -307,7 +308,7 @@ async function publishDiscoveryRow(
     | { kind: 'discovery.endpoints.put'; row: CachedEndpointsRow }
     | { kind: 'discovery.privacy.put'; row: CachedPrivacyPolicyRow },
   expectedCurrent?: CachedPrivacyPolicyRow | null,
-): Promise<import('./workspace-protocol').DiscoveryModelsPutResult | undefined> {
+): Promise<DiscoveryModelsPutResult | undefined> {
   switch (command.kind) {
     case 'discovery.models.put':
       return getWorkspaceRepository()

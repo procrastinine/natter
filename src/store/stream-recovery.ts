@@ -734,10 +734,15 @@ export async function awaitStreamRecoveryRuntimeIdle(): Promise<void> {
       coordinator === coordinatorPromise &&
       leaseRead === leaseReadPromise &&
       running === 0 &&
-      recoveryRuns.size === 0
+      recoveryRuns.size === 0 &&
+      queued.size === 0 &&
+      !pumpScheduled &&
+      !fullLeaseScanRequested &&
+      pendingLeaseReads.size === 0
     ) {
       return
     }
+    await Promise.resolve()
   }
 }
 

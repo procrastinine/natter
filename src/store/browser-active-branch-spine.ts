@@ -33,6 +33,8 @@ export interface BranchSelectionReadMeasurement {
   pathHeaderReads: number
   descendantPageReads: number
   descendantRowsRead: number
+  slotFrames: number
+  forkSlotsRead: number
   physicalHeaderReadRequests: number
   physicalHeaderRowsRead: number
   peakCachedHeaderRows: number
@@ -46,6 +48,8 @@ export function createBranchSelectionReadMeasurement(): BranchSelectionReadMeasu
     pathHeaderReads: 0,
     descendantPageReads: 0,
     descendantRowsRead: 0,
+    slotFrames: 0,
+    forkSlotsRead: 0,
     physicalHeaderReadRequests: 0,
     physicalHeaderRowsRead: 0,
     peakCachedHeaderRows: 0,
@@ -542,6 +546,7 @@ export async function resolveConversationOpenReceipt(
         ),
       )
       if (slotFrame.kind === 'stale') throw new ConversationOpenFrameStaleError()
+      if (measurement) measurement.slotFrames += 1
       if (bodyDemand === 'terminal' && onTerminalPoint) {
         onTerminalPoint(
           Object.freeze({
@@ -647,6 +652,10 @@ export async function resolveConversationOpenReceipt(
     const [terminalPoint, slotFrame] = await Promise.all([terminalPointPromise, slotFramePromise])
     throwIfAborted(signal)
     if (slotFrame.kind === 'stale') throw new ConversationOpenFrameStaleError()
+    if (measurement) {
+      measurement.slotFrames += 1
+      measurement.forkSlotsRead += slotFrame.value.forks.length
+    }
     return proveConversationSelectionFromExactPath({
       chat: receipt.chat,
       target: receipt.target,

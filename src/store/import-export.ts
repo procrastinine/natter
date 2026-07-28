@@ -53,7 +53,7 @@ import type {
   RestoreWorkspaceBackupOptions,
   RestoreWorkspaceBackupResult,
 } from './import-export-contract'
-import type { PreparedAttachmentBundle } from './workspace-protocol'
+import type { CommitEnvelope, PreparedAttachmentBundle } from './workspace-protocol'
 import { getWorkspaceRepository } from './workspace-repository'
 import { runWorkspaceAction, runWorkspaceRead } from './workspace-runtime'
 
@@ -70,7 +70,9 @@ export type {
 
 async function parseChatExportEnvelope(value: unknown): Promise<ChatExportEnvelope> {
   const envelope = migrateNatterExportEnvelope(value)
-  assertEnvelopeKind(envelope, 'chat')
+  if (envelope.objectKind !== 'chat') {
+    throw new Error(`ImportObjectKindMismatch:${envelope.objectKind}`)
+  }
   const canonical = await canonicalizeImportedGeneratedOutputs(
     envelope.payload.messages,
     envelope.payload.attachments,
@@ -85,26 +87,31 @@ async function parseChatExportEnvelope(value: unknown): Promise<ChatExportEnvelo
         },
       }
     : envelope
-  assertEnvelopeKind(result, 'chat')
   validatePortableChatGraph(result.payload)
   return result
 }
 
 function parseChatPresetExportEnvelope(value: unknown): ChatPresetExportEnvelope {
   const envelope = migrateNatterExportEnvelope(value)
-  assertEnvelopeKind(envelope, 'chat-preset')
+  if (envelope.objectKind !== 'chat-preset') {
+    throw new Error(`ImportObjectKindMismatch:${envelope.objectKind}`)
+  }
   return envelope
 }
 
 function parseConnectionProfileExportEnvelope(value: unknown): ConnectionProfileExportEnvelope {
   const envelope = migrateNatterExportEnvelope(value)
-  assertEnvelopeKind(envelope, 'connection-profile')
+  if (envelope.objectKind !== 'connection-profile') {
+    throw new Error(`ImportObjectKindMismatch:${envelope.objectKind}`)
+  }
   return envelope
 }
 
 async function parseWorkspaceBackupEnvelope(value: unknown): Promise<WorkspaceBackupEnvelope> {
   const envelope = migrateNatterExportEnvelope(value)
-  assertEnvelopeKind(envelope, 'workspace-backup')
+  if (envelope.objectKind !== 'workspace-backup') {
+    throw new Error(`ImportObjectKindMismatch:${envelope.objectKind}`)
+  }
   const canonical = await canonicalizeImportedGeneratedOutputs(
     envelope.payload.messages,
     envelope.payload.attachments,
@@ -128,12 +135,12 @@ async function parseWorkspaceBackupEnvelope(value: unknown): Promise<WorkspaceBa
     migratedPayload === canonicalized.payload
       ? canonicalized
       : { ...canonicalized, payload: migratedPayload }
-  assertEnvelopeKind(result, 'workspace-backup')
+  validateWorkspaceBackupGraph(result.payload)
   return result
 }
 
 export async function exportChat(chatId: ChatId): Promise<ChatExportEnvelope> {
-  const value = await runWorkspaceRead(
+  return runWorkspaceRead(
     'import-export',
     async (permit) =>
       (
@@ -143,9 +150,6 @@ export async function exportChat(chatId: ChatId): Promise<ChatExportEnvelope> {
         })
       ).value,
   )
-  const envelope = migrateNatterExportEnvelope(value)
-  assertEnvelopeKind(envelope, 'chat')
-  return envelope
 }
 
 export async function importChat(
@@ -175,6 +179,55 @@ export async function importChat(
     )
     return conversationCommittedResult(commit, commit.value.chatId)
   })
+}
+
+export async function importChats(
+  values: readonly unknown[],
+  options: readonly ImportChatOptions[] = [],
+  apply?: (results: readonly ConversationCommittedResult<ImportChatResult>[]) => void,
+): Promise<readonly ConversationCommittedResult<ImportChatResult>[]> {
+  if (values.length === 0) return []
+  const envelopes: ChatExportEnvelope[] = []
+  for (const value of values) envelopes.push(await parseChatExportEnvelope(value))
+  let appliedResults: readonly ConversationCommittedResult<ImportChatResult>[] | undefined
+  const commit = await runWorkspaceAction('import-export', (permit) =>
+    getWorkspaceRepository().execute(
+      permit,
+      {
+        kind: 'interchange.import-chat',
+        imports: envelopes.map((envelope, index) => ({
+          envelope,
+          options: options[index] ?? {},
+        })),
+      },
+      apply
+        ? {
+            localApplications: {
+              conversation: (committed) => {
+                appliedResults = committedChatImportResults(committed)
+                apply(appliedResults)
+                return 'applied'
+              },
+            },
+          }
+        : undefined,
+    ),
+  )
+  return appliedResults ?? committedChatImportResults(commit)
+}
+
+function committedChatImportResults(
+  commit: CommitEnvelope<readonly ImportChatResult[]>,
+): readonly ConversationCommittedResult<ImportChatResult>[] {
+  return commit.value.map((value) =>
+    conversationCommittedResult(
+      {
+        ...commit,
+        value,
+      },
+      value.chatId,
+    ),
+  )
 }
 
 export function exportChatPreset(presetId: PresetId): Promise<ChatPresetExportEnvelope> {
@@ -238,7 +291,7 @@ export function importConnectionProfile(
 }
 
 export async function exportWorkspaceBackup(): Promise<WorkspaceBackupEnvelope> {
-  const value = await runWorkspaceRead(
+  return runWorkspaceRead(
     'import-export',
     async (permit) =>
       (
@@ -247,9 +300,6 @@ export async function exportWorkspaceBackup(): Promise<WorkspaceBackupEnvelope> 
         })
       ).value,
   )
-  const envelope = migrateNatterExportEnvelope(value)
-  assertEnvelopeKind(envelope, 'workspace-backup')
-  return envelope
 }
 
 export async function exportWorkspaceBackupDocument<T>(

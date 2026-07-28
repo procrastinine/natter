@@ -77,6 +77,10 @@ describe('unified tab conversation ownership boundary', () => {
       'app/Shell.tsx',
       'ui/chat/ImportModal.tsx',
       'ui/chat/MessageList.tsx',
+    ])
+    expect(filesContaining(/\bloadConversationActions\s*\(/)).toEqual([
+      'app/Shell.tsx',
+      'app/conversation-actions-capability.ts',
       'ui/sidebar/ChatList.tsx',
     ])
     expect(uiFilesImportingLowerMutationCapabilities()).toEqual([])

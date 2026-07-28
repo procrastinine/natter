@@ -30,6 +30,7 @@ import {
 import { isWorkspaceReplacementRecoveryRequiredError } from '../../core/import-export/errors'
 import type {
   AttachmentBlob,
+  AttachmentId,
   AttachmentKind,
   ChatId,
   ChatSidebarRow,
@@ -1733,11 +1734,13 @@ function filterLabel(filter: ManagerFilter): string {
 
 function referenceTarget(row: AttachmentReferenceRow): {
   refId: string
+  expectedAttachmentId: AttachmentId
   messageId?: MessageId
   draftChatId?: ChatId
 } {
   return {
     refId: row.ref.refId,
+    expectedAttachmentId: row.ref.attachmentId,
     ...(row.ownerKind === 'message'
       ? { messageId: row.messageId as MessageId }
       : { draftChatId: row.draftChatId as ChatId }),

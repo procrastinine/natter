@@ -55,37 +55,34 @@ describe('storage ownership and reclamation architecture audit', () => {
       structurallyValid: true,
       guaranteeClosed: false,
       runtimeProved: null,
-      tableCount: 45,
-      schemaClassCounts: { canonical: 22, repairable: 23 },
+      tableCount: 81,
+      schemaClassCounts: { canonical: 58, repairable: 23 },
       dataClassCounts: {
         authoritative: 18,
         cache: 6,
         derived: 16,
         ephemeral: 1,
-        journal: 4,
+        journal: 40,
       },
       compactionActionCounts: {
         copy: 32,
         drop: 5,
         'filtered-copy': 4,
         'preserve-destination': 1,
-        seed: 3,
+        seed: 39,
       },
-      interchangeActionCounts: { omit: 8, portable: 18, rebuild: 15, seed: 4 },
+      interchangeActionCounts: { omit: 44, portable: 18, rebuild: 15, seed: 4 },
       namespaceCount: 20,
-      lifecycleCount: 18,
+      lifecycleCount: 19,
       coordinationCount: 6,
-      gapCount: 5,
-      acceptanceCount: 9,
+      gapCount: 4,
+      acceptanceCount: 10,
       directWebStorageOwnerCount: 9,
       directBroadcastOwnerCount: 4,
       problems: [],
     })
     expect(result.report.gaps.map((gap) => gap.id)).toEqual(
-      expect.arrayContaining([
-        'compaction-quiesces-whole-runtime',
-        'quota-estimate-cannot-prove-reclamation',
-      ]),
+      expect.arrayContaining(['quota-estimate-cannot-prove-reclamation']),
     )
   })
 
@@ -95,7 +92,7 @@ describe('storage ownership and reclamation architecture audit', () => {
     expect(result.status).toBe(1)
     expect(result.report.ok).toBe(false)
     expect(result.report.structurallyValid).toBe(true)
-    expect(result.report.gapCount).toBe(5)
+    expect(result.report.gapCount).toBe(4)
     expect(result.report.problems).toEqual([])
   })
 

@@ -150,6 +150,14 @@ function deliverLocalCommit<C extends WorkspaceCommand>(
   postWorkspaceChange(change)
 }
 
+export function publishCommittedWorkspaceCommand<C extends WorkspaceCommand>(
+  command: C,
+  commit: CommitEnvelope<WorkspaceCommandResult<C>>,
+  options: WorkspaceCommandExecutionOptions<WorkspaceCommandResult<C>> = {},
+): void {
+  deliverLocalCommit(command, commit, options)
+}
+
 function reportLocalCommitProjectionFailure(
   owner: 'conversation' | 'evidence',
   commandKind: WorkspaceCommand['kind'],

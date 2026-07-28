@@ -1,13 +1,9 @@
 import type { BrowserWorkspaceReplacementCommit } from './browser-workspace-contract'
 
-export const MAX_STORAGE_MAINTENANCE_BATCH = 128
-
-export function boundedMaintenanceLimit(value: number): number {
-  if (!Number.isSafeInteger(value) || value <= 0) {
-    throw new Error('StorageMaintenanceLimitInvalid')
-  }
-  return Math.min(value, MAX_STORAGE_MAINTENANCE_BATCH)
-}
+export {
+  boundedMaintenanceLimit,
+  MAX_STORAGE_MAINTENANCE_BATCH,
+} from './storage-maintenance-bounds'
 
 export interface BrowserWorkspaceReplacementHandoff<T> {
   readonly completion: Promise<BrowserWorkspaceReplacementCommit<T>>

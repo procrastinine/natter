@@ -199,6 +199,7 @@ describe('conversation command non-generation delegation', () => {
     const mutation = {
       kind: 'visibility' as const,
       refId: 'ref-1',
+      expectedAttachmentId: 'attachment-1',
       includeInContext: false,
     }
     mocks.mutateAttachment.mockResolvedValue(undefined)

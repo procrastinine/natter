@@ -129,7 +129,9 @@
         "src/backcompat/wave-a-storage-epoch-v94.ts",
         "src/backcompat/wave-a-stream-storage-v94.ts",
         "src/backcompat/workspace-meta.ts",
-        "src/store/browser-workspace-derived-repair.ts"
+        "src/store/browser-workspace-current-probe.ts",
+        "src/store/browser-workspace-derived-repair.ts",
+        "src/store/browser-workspace-startup-repair.ts"
       ]
     },
     {
@@ -451,6 +453,7 @@
       "layer": "persistence",
       "responsibility": "Persist message bodies, topology projections, chat metadata, active spines, and storage ownership invariants.",
       "paths": [
+        "src/store/active-branch-fork-storage.ts",
         "src/store/browser-active-branch-spine.ts",
         "src/store/chat-storage-codec.ts",
         "src/store/chat-storage-ownership.ts",
@@ -556,8 +559,8 @@
       "layer": "repository-adapter",
       "responsibility": "Implement browser repository queries/mutations, physical schema, reactive reads, key ranges, and transaction-safe database access.",
       "paths": [
-        "src/store/browser-command-mutation-journal.ts",
         "src/store/browser-catalog-command-runtime.ts",
+        "src/store/browser-command-mutation-journal.ts",
         "src/store/browser-domain-mutations.ts",
         "src/store/browser-generation-command-runtime.ts",
         "src/store/browser-lock-record.ts",
@@ -565,7 +568,10 @@
         "src/store/browser-mutation-runtime.ts",
         "src/store/browser-query-pages.ts",
         "src/store/browser-repo.ts",
+        "src/store/browser-staged-fanout-command.ts",
+        "src/store/browser-workspace-catchup-journal.ts",
         "src/store/browser-workspace-schema-v94.ts",
+        "src/store/browser-workspace-schema-v97.ts",
         "src/store/bounded-idb-cursor.ts",
         "src/store/chat-row-transition.ts",
         "src/store/db-rows.ts",
@@ -604,6 +610,7 @@
         "src/store/browser-workspace-replacement-transition.ts",
         "src/store/browser-workspace-replacement.ts",
         "src/store/browser-workspace-slot-coordination.ts",
+        "src/store/browser-workspace-staged-fanout.ts",
         "src/store/mounted-projection-lifecycle.ts",
         "src/store/workspace-change-boundary.ts",
         "src/store/workspace-effect-hub.ts",
@@ -632,6 +639,7 @@
         "src/store/storage-catalog-session-workspace.ts",
         "src/store/storage-chat-catalog-session.ts",
         "src/store/storage-compaction-state.ts",
+        "src/store/storage-maintenance-bounds.ts",
         "src/store/storage-maintenance-runtime.ts",
         "src/store/storage-overview-controller.ts",
         "src/store/storage-retention-state.ts",

@@ -147,29 +147,6 @@ export async function readJsonOrZipFile(file: File): Promise<unknown[]> {
   return values
 }
 
-export async function forEachJsonOrZipFile(
-  file: File,
-  consume: (value: unknown) => void | Promise<void>,
-): Promise<number> {
-  if (!isZipFile(file)) {
-    await consume(await readJsonFile(file))
-    return 1
-  }
-  const entries = await readJsonZipEntries(file)
-  if (entries.length === 0) throw new Error('The selected ZIP does not contain JSON files.')
-  entries.sort((left, right) => left.filename.localeCompare(right.filename))
-  const invalid = entries.find((entry) => entry.error)
-  if (invalid) throw new Error(`${invalid.filename} is not valid JSON.`)
-  const releasedEntries: unknown[] = entries
-  for (let index = 0; index < entries.length; index += 1) {
-    const entry = entries[index] as ParsedJsonZipEntry
-    await consume(entry.value)
-    releasedEntries[index] = undefined
-    jsonIoMetrics.parsedZipEntryWrappersReleased += 1
-  }
-  return entries.length
-}
-
 export function natterJsonFilename(kind: string, label?: string, id?: string): string {
   const timestamp = new Date().toISOString().replaceAll(/[:.]/g, '-')
   const segment = sanitizeFilenameSegment(label ?? id ?? '')
@@ -192,6 +169,9 @@ export function importExportErrorMessage(error: unknown): string {
   }
   if (error instanceof WorkspaceReplacementOutcomeUnknownError) {
     return 'Workspace activation could not be confirmed. Reload to recover before attempting another import.'
+  }
+  if (error instanceof Error && error.message.startsWith('Import')) {
+    return 'The selected file is not a valid Natter export, so nothing was imported.'
   }
   if (error instanceof Error && error.message.trim()) return error.message
   return 'Import/export failed.'

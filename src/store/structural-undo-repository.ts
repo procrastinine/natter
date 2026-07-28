@@ -1,6 +1,6 @@
 import type { ConversationProvedSelection, MessageMutationRepository } from '../core/messages'
 import { TreeChangedError } from '../core/tree-ops'
-import type { AttachmentId, MessageId, MutationScope } from '../core/types'
+import type { MessageId, MutationScope } from '../core/types'
 import type { MessageHeaderRow } from './message-storage'
 import type {
   RestoreStructuralSnapshotInput,
@@ -58,57 +58,59 @@ export async function applyStructuralSnapshotInRepository(
   }
 
   const targetIdList = [...targetIds]
-  const targetRows = await repo.getMessageHeaders(targetIdList)
-  const currentTargets = new Map<MessageId, MessageHeaderRow>()
-  for (let index = 0; index < targetIdList.length; index += 1) {
-    const id = targetIdList[index] as MessageId
-    const row = targetRows[index]
-    if (!row) throw new TreeChangedError(snapshot.chatId, `undo target ${id} unavailable`)
-    if (row.chatId !== snapshot.chatId) {
-      throw new TreeChangedError(snapshot.chatId, `undo target ${id} unavailable`)
-    }
-    currentTargets.set(id, row)
-  }
-
-  const scopes: MutationScope[] = []
-  const affectedParents = new Map<string, MessageId | null>()
-  const addAffectedParent = (parentId: MessageId | null): void => {
-    affectedParents.set(parentSlotKey(parentId), parentId)
-  }
-  for (const row of snapshot.previousRows) {
-    addAffectedParent(row.parentId)
-    addAffectedParent((currentTargets.get(row.id) as MessageHeaderRow).parentId)
-  }
-  for (const id of snapshot.newMessageIds) {
-    addAffectedParent((currentTargets.get(id) as MessageHeaderRow).parentId)
-  }
-
-  const childIdsBeforeByParent = new Map<string, MessageId[]>()
-  const beforeById = new Map<MessageId, MessageHeaderRow>(currentTargets)
-  for (const [key, parentId] of affectedParents) {
-    const children = await repo.listChildHeaders(snapshot.chatId, parentId)
-    childIdsBeforeByParent.set(
-      key,
-      children.map((row) => row.id),
-    )
-    scopes.push({ kind: 'children', chatId: snapshot.chatId, parentId })
-    for (const row of children) {
-      if (row.chatId !== snapshot.chatId) {
-        throw new TreeChangedError(snapshot.chatId, `undo child ${row.id} unavailable`)
+  const { scopes, affectedParents, childIdsBeforeByParent, beforeById } =
+    await repo.readStructurePreflight(async (reader) => {
+      const targetRows = await reader.getMessageHeaders(targetIdList)
+      const currentTargets = new Map<MessageId, MessageHeaderRow>()
+      for (let index = 0; index < targetIdList.length; index += 1) {
+        const id = targetIdList[index] as MessageId
+        const row = targetRows[index]
+        if (!row) throw new TreeChangedError(snapshot.chatId, `undo target ${id} unavailable`)
+        if (row.chatId !== snapshot.chatId) {
+          throw new TreeChangedError(snapshot.chatId, `undo target ${id} unavailable`)
+        }
+        currentTargets.set(id, row)
       }
-      beforeById.set(row.id, row)
-      scopes.push({ kind: 'message', messageId: row.id })
-    }
-  }
-  for (const id of targetIds) scopes.push({ kind: 'message', messageId: id })
 
-  const attachmentIds = new Set<AttachmentId>(snapshot.attachmentIds)
-  for (const row of currentTargets.values()) {
-    for (const ref of row.attachmentRefs ?? []) {
-      if (ref.deletedAt === undefined) attachmentIds.add(ref.attachmentId)
-    }
-  }
-  for (const attachmentId of attachmentIds) scopes.push({ kind: 'attachment', attachmentId })
+      const scopes: MutationScope[] = []
+      const affectedParents = new Map<string, MessageId | null>()
+      const addAffectedParent = (parentId: MessageId | null): void => {
+        affectedParents.set(parentSlotKey(parentId), parentId)
+      }
+      for (const row of snapshot.previousRows) {
+        addAffectedParent(row.parentId)
+        addAffectedParent((currentTargets.get(row.id) as MessageHeaderRow).parentId)
+      }
+      for (const id of snapshot.newMessageIds) {
+        addAffectedParent((currentTargets.get(id) as MessageHeaderRow).parentId)
+      }
+
+      const childIdsBeforeByParent = new Map<string, MessageId[]>()
+      const beforeById = new Map<MessageId, MessageHeaderRow>(currentTargets)
+      for (const [key, parentId] of affectedParents) {
+        const children = await reader.listChildHeaders(snapshot.chatId, parentId)
+        childIdsBeforeByParent.set(
+          key,
+          children.map((row) => row.id),
+        )
+        scopes.push({ kind: 'children', chatId: snapshot.chatId, parentId })
+        for (const row of children) {
+          if (row.chatId !== snapshot.chatId) {
+            throw new TreeChangedError(snapshot.chatId, `undo child ${row.id} unavailable`)
+          }
+          beforeById.set(row.id, row)
+          scopes.push({ kind: 'message', messageId: row.id })
+        }
+      }
+      for (const id of targetIds) scopes.push({ kind: 'message', messageId: id })
+
+      return {
+        scopes: dedupeScopes(scopes),
+        affectedParents,
+        childIdsBeforeByParent,
+        beforeById,
+      }
+    })
 
   const result = await repo.runMutation<
     { structuralHeaders: MessageHeaderRow[] },
@@ -117,7 +119,7 @@ export async function applyStructuralSnapshotInRepository(
       structuralHeaders: MessageHeaderRow[]
     }
   >(
-    dedupeScopes(scopes),
+    scopes,
     async (ctx) => {
       const expectedRows = snapshot.expectedRows ?? []
       const expectedCurrent = await ctx.getMessageHeaders(expectedRows.map((row) => row.id))

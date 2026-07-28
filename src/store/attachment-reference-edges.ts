@@ -3,6 +3,7 @@ import type { AttachmentId, AttachmentRef, AttachmentReferenceEdge, ChatId } fro
 import {
   type AttachmentCatalogReferenceDelta,
   type AttachmentCatalogReferenceMutationReceipt,
+  type AttachmentReferenceSummary,
   applyAttachmentCatalogReferenceDeltas,
   readAttachmentCatalogRepairSnapshot,
   refreshAttachmentCatalogProjectionsForRepair,
@@ -126,17 +127,28 @@ export async function applyAttachmentReferenceOwnerTransitions(
   transitions: readonly AttachmentReferenceOwnerTransition[],
   observedAt: number,
   assertAttachmentScope?: (attachmentId: AttachmentId) => void,
+  validateUnchangedTargets = false,
 ): Promise<AttachmentReferenceTransitionReceipt> {
   if (transitions.length === 0) {
     return attachmentReferenceTransitionReceipt([], [], [], emptyAttachmentReferenceDeltaReceipt())
   }
   const ownerKeys = new Set<string>()
+  const validationTargetIds = new Set<AttachmentId>()
   const planned = transitions.map((transition) => {
     const ownerKey = attachmentOwnerKey(transition.ownerKind, transition.ownerId)
     if (ownerKeys.has(ownerKey)) {
       throw new DuplicateAttachmentReferenceOwnerError(transition.ownerKind, transition.ownerId)
     }
     ownerKeys.add(ownerKey)
+    const nextEdges = edgesForOwner({
+      ownerKind: transition.ownerKind,
+      ownerId: transition.ownerId,
+      chatId: transition.chatId,
+      refs: transition.nextRefs,
+    })
+    if (validateUnchangedTargets) {
+      for (const edge of nextEdges) validationTargetIds.add(edge.attachmentId)
+    }
     return {
       transition,
       previousEdges: edgesForOwner({
@@ -145,20 +157,10 @@ export async function applyAttachmentReferenceOwnerTransitions(
         chatId: transition.chatId,
         refs: transition.previousRefs,
       }),
-      nextEdges: edgesForOwner({
-        ownerKind: transition.ownerKind,
-        ownerId: transition.ownerId,
-        chatId: transition.chatId,
-        refs: transition.nextRefs,
-      }),
+      nextEdges,
     }
   })
-  const nextTargetIds = new Set<AttachmentId>()
-  for (const { nextEdges } of planned) {
-    for (const edge of nextEdges) nextTargetIds.add(edge.attachmentId)
-  }
-  await requireAttachmentTargets(tx, [...nextTargetIds])
-
+  await requireAttachmentTargets(tx, [...validationTargetIds])
   const removedEdges: AttachmentReferenceEdge[] = []
   const changedEdges: AttachmentReferenceEdge[] = []
   const replacedEdges: AttachmentReferenceEdge[] = []
@@ -203,7 +205,7 @@ export async function applyAttachmentReferenceOwnerTransitions(
   }
   if (deltas.size === 0 && removedEdges.length === 0 && changedEdges.length === 0) {
     const receipt = attachmentReferenceTransitionReceipt(
-      [...nextTargetIds],
+      [...validationTargetIds],
       [],
       [],
       emptyAttachmentReferenceDeltaReceipt(),
@@ -221,7 +223,7 @@ export async function applyAttachmentReferenceOwnerTransitions(
   await putPhysicalStorageRows(tx, 'attachmentRefEdges', changedEdges, replacedEdges)
   const deltasReceipt = await applyAttachmentReferenceDeltas(tx, [...deltas.values()], observedAt)
   const receipt = attachmentReferenceTransitionReceipt(
-    [...nextTargetIds],
+    [...validationTargetIds],
     removedEdges,
     changedEdges,
     deltasReceipt,
@@ -507,9 +509,9 @@ export async function reconcileAttachmentRefCountsForRepair(
   tx: Transaction,
   attachmentIds: Iterable<AttachmentId>,
   observedAt: number,
-): Promise<void> {
+): Promise<readonly AttachmentId[]> {
   const ids = [...new Set(attachmentIds)]
-  if (ids.length === 0) return
+  if (ids.length === 0) return []
   const snapshot = await readAttachmentCatalogRepairSnapshot(tx, ids)
   const attachments = snapshot.headers
   const nextHeaders = [...attachments]
@@ -537,10 +539,38 @@ export async function reconcileAttachmentRefCountsForRepair(
       ),
     )
   }
-  await refreshAttachmentCatalogProjectionsForRepair(tx, ids, {
+  const changedCatalogIds = await refreshAttachmentCatalogProjectionsForRepair(tx, ids, {
     headers: nextHeaders,
     summaries: snapshot.summaries,
   })
+  return [...new Set([...changed.map((attachment) => attachment.id), ...changedCatalogIds])]
+}
+
+export async function reconcileAttachmentRefCountSummaryForRepair(
+  tx: Transaction,
+  attachmentId: AttachmentId,
+  summary: AttachmentReferenceSummary,
+  observedAt: number,
+): Promise<readonly AttachmentId[]> {
+  const attachment = await tx
+    .table<AttachmentHeaderRow, AttachmentId>('attachments')
+    .get(attachmentId)
+  if (!attachment) {
+    if (summary.refCount > 0) throw new AttachmentReferenceTargetMissingError(attachmentId)
+    return refreshAttachmentCatalogProjectionsForRepair(tx, [attachmentId], {
+      headers: [undefined],
+      summaries: new Map([[attachmentId, summary]]),
+    })
+  }
+  const reconciled = reconcileAttachmentReferenceCount(attachment, summary.refCount, observedAt)
+  if (reconciled !== attachment) {
+    await replaceAttachmentHeaderByteOwnerBatch(tx, [reconciled], [attachment])
+  }
+  const changedCatalogIds = await refreshAttachmentCatalogProjectionsForRepair(tx, [attachmentId], {
+    headers: [reconciled],
+    summaries: new Map([[attachmentId, summary]]),
+  })
+  return [...new Set([...(reconciled === attachment ? [] : [attachmentId]), ...changedCatalogIds])]
 }
 
 export function reconcileAttachmentReferenceCount(

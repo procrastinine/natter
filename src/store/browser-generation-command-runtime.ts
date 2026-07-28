@@ -771,6 +771,13 @@ export async function finalizeBrowserAttempt(
       ) {
         throw new Error(`AttemptFinalizeReasoningVisibilityConflict:${input.streamId}`)
       }
+      const chat = await ctx.getChat(input.chatId)
+      if (!chat) {
+        return {
+          outcome: 'target-missing' as const,
+          presentation: undefined,
+        }
+      }
       const header = await ctx.getMessageHeader(input.messageId)
       if (
         !header ||
@@ -969,6 +976,7 @@ export async function finalizeBrowserAttempt(
         terminal: input.terminal,
         postCommitFinal: input.postCommit,
       },
+      allowMissingCanonicalChatId: input.chatId,
       fastCurrentLeafSummaryTarget: input.messageId,
       ...(input.kind === 'continuation' && input.continuationText.length > 0
         ? {

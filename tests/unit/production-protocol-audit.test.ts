@@ -113,30 +113,30 @@ describe('production workspace protocol audit', () => {
 
     expect(report).toMatchObject({
       ok: true,
-      sourceFiles: 474,
+      sourceFiles: 481,
       roots: {
-        variants: 15,
+        variants: 16,
         exclusiveVariants: 2,
-        admissionFunctions: 6,
-        finiteAdmissions: 110,
+        admissionFunctions: 7,
+        finiteAdmissions: 111,
         unboundedAdmissions: 0,
         capabilityEscapes: 0,
       },
       problems: [],
     })
     expect(report.protocols.WorkspaceQuery).toMatchObject({
-      ingressSites: 99,
+      ingressSites: 97,
       dependencyProbeSites: 5,
       unclassifiedSites: 0,
       missingIngress: [],
     })
     expect(report.protocols.WorkspaceCommand).toMatchObject({
-      ingressSites: 74,
+      ingressSites: 75,
       dependencyProbeSites: 0,
       unclassifiedSites: 0,
       missingIngress: [],
     })
-    expect(report.protocols.WorkspaceQuery.variants).toHaveLength(66)
+    expect(report.protocols.WorkspaceQuery.variants).toHaveLength(65)
     expect(report.protocols.WorkspaceCommand.variants).toHaveLength(65)
     expect(
       report.roots.admissions.some(

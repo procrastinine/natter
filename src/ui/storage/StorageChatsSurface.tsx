@@ -63,10 +63,10 @@ import {
   triggerBrowserDownload,
 } from '../import-export/chat-download'
 import {
-  forEachJsonOrZipFile,
   importExportErrorMessage,
   natterJsonFilename,
   natterZipFilename,
+  readJsonOrZipFile,
   triggerJsonDownload,
   triggerJsonZipDownload,
 } from '../import-export/json-file'
@@ -501,13 +501,10 @@ export default function ChatsStorageSurface() {
       if (!file) return
       setBusyChatAction('import')
       try {
-        let importedCount = 0
-        let lastChatId = ''
-        await forEachJsonOrZipFile(file, async (value) => {
-          const result = await storageApplication.transfer.importChat(value)
-          importedCount += 1
-          lastChatId = result.chatId
-        })
+        const values = await readJsonOrZipFile(file)
+        const results = await storageApplication.transfer.importChats(values)
+        const importedCount = results.length
+        const lastChatId = results.at(-1)?.chatId ?? ''
         pushToast({
           level: 'success',
           text:

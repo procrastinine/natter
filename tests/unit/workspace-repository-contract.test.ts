@@ -6,13 +6,19 @@ import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import { tokenCalibrationKey } from '../../src/core/model-ids'
 import { EMPTY_TEXT_TEMPLATE, type SavedTextTemplate } from '../../src/core/text-templates'
 import { GLOBAL_TOKEN_CALIBRATION_KEY } from '../../src/core/token-calibration'
-import type { Chat, KeyRecord } from '../../src/core/types'
+import type { Chat, ConnectionProfile, KeyRecord, PromptPreset } from '../../src/core/types'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
 import {
   __getBrowserWorkspaceSessionRepositoryForTests,
   __resetBrowserRepositoryForTests,
+  executeBrowserCommandInStagedDatabase,
   getBrowserRepository,
 } from '../../src/store/browser-repo'
+import { cleanPendingBrowserWorkspaceDatabase } from '../../src/store/browser-workspace-database-cleanup'
+import {
+  beginBrowserWorkspaceDatabaseReplacement,
+  readBrowserWorkspaceDatabaseManifest,
+} from '../../src/store/browser-workspace-database-control'
 import {
   isExpectedBrowserWorkspaceShutdownError,
   openBrowserWorkspace,
@@ -24,11 +30,13 @@ import {
   runBrowserWorkspaceReplacement,
   tryStartBrowserWorkspaceReplacementIfIdle,
 } from '../../src/store/browser-workspace-replacement-runner'
+import { configurationPromptPresetCatalogProjectionRow } from '../../src/store/configuration-catalog-projection'
 import type { ConversationController } from '../../src/store/conversation-controller'
 import { createConversationRepositoryAdapter } from '../../src/store/conversation-repository-adapter'
 import { __resetDbForTests, BrowserWorkspaceSessionClosedError, getDb } from '../../src/store/db'
 import { createWorkspaceMessageMaterialCoordinator } from '../../src/store/generation-prompt-material'
 import { exportWorkspaceBackup, restoreWorkspaceBackup } from '../../src/store/import-export'
+import { readBrowserWorkspaceMeta } from '../../src/store/workspace-meta'
 import type {
   WorkspaceCommand,
   WorkspaceQuery,
@@ -50,7 +58,7 @@ import {
   getWorkspaceRuntimeControlSnapshot,
   launchImportExportWorkspaceRuntimeReplacementNow,
 } from '../../src/store/workspace-runtime-control'
-import { putTestChat } from '../helpers/chats'
+import { putTestChat, putTestChats } from '../helpers/chats'
 import { expectWorkspaceRepositoryCoreContract } from '../helpers/workspace-repository-contract'
 
 let emptyWorkspaceBackup: Awaited<ReturnType<typeof exportWorkspaceBackup>>
@@ -124,7 +132,7 @@ describe('browser WorkspaceRepository protocol contract', () => {
       invalidations: expect.arrayContaining([
         { kind: 'chat', chatIds: ['semantic-chat'] },
         { kind: 'sidebar', chatIds: ['semantic-chat'] },
-      ]),
+      ]) as unknown,
     })
 
     await expect(
@@ -195,7 +203,7 @@ describe('browser WorkspaceRepository protocol contract', () => {
         invalidations: expect.arrayContaining([
           { kind: 'chat', chatIds: ['calibration-chat'] },
           { kind: 'setting', keys: [GLOBAL_TOKEN_CALIBRATION_KEY] },
-        ]),
+        ]) as unknown,
       },
     })
     expect(await getDb().chats.get('calibration-chat')).toMatchObject({
@@ -248,6 +256,239 @@ describe('browser WorkspaceRepository protocol contract', () => {
     ).resolves.toMatchObject({
       effectScope: 'workspace',
       value: { value: { globalChanged: false, chatCount: 0 } },
+    })
+  })
+
+  it('pages staged workspace calibration and publishes identity-only chat evidence', async () => {
+    const calibrationKey = tokenCalibrationKey('staged/calibration-model')
+    const sample = {
+      totalTextChars: 400,
+      totalTextTokens: 100,
+      sampleCount: 2,
+      updatedAt: 1,
+    }
+    const chatIds = Array.from({ length: 130 }, (_, index) => `staged-calibration-${index}`)
+    await getDb().chats.bulkPut(
+      chatIds.map((id) => ({
+        ...sessionChat(id),
+        tokenCalibration: { [calibrationKey]: sample },
+        tokenCalibrationGeneration: 0,
+      })),
+    )
+    const workspace = await readBrowserWorkspaceMeta(getDb())
+
+    const execution = await executeBrowserCommandInStagedDatabase(getDb(), workspace, {
+      kind: 'chat.calibration.clear-family',
+      calibrationKey,
+      now: 10,
+    })
+    const expectedChatIds = [...chatIds].sort()
+
+    expect(execution.commit.value).toMatchObject({
+      value: { globalChanged: false, chatCount: 130 },
+      affectedChatIds: expectedChatIds,
+    })
+    expect(execution.commit.receipt.chats).toEqual([])
+    expect(execution.commit.delta.invalidations).toContainEqual({
+      kind: 'chat',
+      chatIds: expectedChatIds,
+    })
+    expect(await getDb().chats.get(expectedChatIds.at(-1) ?? '')).toMatchObject({
+      tokenCalibration: {},
+      tokenCalibrationGeneration: 1,
+    })
+  })
+
+  it('pages staged prompt target fanout and publishes identity-only chat evidence', async () => {
+    const preset: PromptPreset = {
+      id: 'staged-prompt-fanout',
+      kind: 'system',
+      name: 'Staged prompt fanout',
+      text: 'before',
+      createdAt: 1,
+      updatedAt: 1,
+    }
+    const chatIds = Array.from({ length: 130 }, (_, index) => `staged-prompt-chat-${index}`)
+    await Promise.all([
+      getDb().promptPresets.put(preset),
+      getDb().configurationPromptPresetCatalogRows.put(
+        configurationPromptPresetCatalogProjectionRow(preset),
+      ),
+      putTestChats(
+        chatIds.map((id) => ({
+          ...sessionChat(id),
+          settings: {
+            ...cloneDefaultChatSettings(),
+            systemPrompt: preset.text,
+            systemPromptPresetId: preset.id,
+          },
+        })),
+      ),
+    ])
+    const workspace = await readBrowserWorkspaceMeta(getDb())
+
+    const execution = await executeBrowserCommandInStagedDatabase(getDb(), workspace, {
+      kind: 'configuration.execute',
+      input: {
+        kind: 'prompt-preset.overwrite-and-pin',
+        chatId: chatIds[0] ?? '',
+        presetId: preset.id,
+        text: 'after',
+        now: 10,
+      },
+    })
+    const expectedChatIds = [...chatIds].sort()
+
+    expect(execution.commit.value).toMatchObject({
+      kind: 'prompt-preset-saved',
+      affectedChatIds: expectedChatIds,
+      affectedPresetIds: [],
+      affectedChatCount: 130,
+      affectedPresetCount: 0,
+    })
+    expect(execution.commit.receipt.chats).toEqual([])
+    expect(execution.commit.delta.invalidations).toContainEqual({
+      kind: 'chat',
+      chatIds: expectedChatIds,
+    })
+    expect(
+      await getDb()
+        .configurationLinks.where('targetKey')
+        .equals(`prompt-preset:${preset.id}`)
+        .count(),
+    ).toBe(130)
+    expect(await getDb().chats.get(expectedChatIds.at(-1) ?? '')).toMatchObject({
+      settings: { systemPrompt: 'after', systemPromptPresetId: preset.id },
+      configurationVersion: 1,
+    })
+  })
+
+  it('rolls back every earlier page when a staged destination command fails late', async () => {
+    const preset: PromptPreset = {
+      id: 'failed-staged-prompt',
+      kind: 'system',
+      name: 'Failed staged prompt',
+      text: 'before',
+      createdAt: 1,
+      updatedAt: 1,
+    }
+    const chatIds = Array.from({ length: 130 }, (_, index) => `failed-staged-chat-${index}`)
+    await Promise.all([
+      getDb().promptPresets.put(preset),
+      getDb().configurationPromptPresetCatalogRows.put(
+        configurationPromptPresetCatalogProjectionRow(preset),
+      ),
+      putTestChats(
+        chatIds.map((id) => ({
+          ...sessionChat(id),
+          settings: {
+            ...cloneDefaultChatSettings(),
+            systemPrompt: preset.text,
+            systemPromptPresetId: preset.id,
+          },
+        })),
+      ),
+    ])
+    await getDb().configurationLinks.put({
+      id: 'failed-staged-stale-link',
+      ownerKind: 'chat',
+      ownerId: 'zz-failed-staged-missing-chat',
+      ownerKey: 'chat:zz-failed-staged-missing-chat',
+      targetKind: 'prompt-preset',
+      targetId: preset.id,
+      targetKey: `prompt-preset:${preset.id}`,
+      slot: 'systemPromptPresetId',
+    })
+    const beforeWorkspace = await readBrowserWorkspaceMeta(getDb())
+    const beforeFirstChat = await getDb().chats.get(chatIds[0] ?? '')
+    const beforeLastChat = await getDb().chats.get(chatIds.at(-1) ?? '')
+
+    await expect(
+      executeBrowserCommandInStagedDatabase(getDb(), beforeWorkspace, {
+        kind: 'configuration.execute',
+        input: {
+          kind: 'prompt-preset.overwrite-and-pin',
+          chatId: chatIds[0] ?? '',
+          presetId: preset.id,
+          text: 'after',
+          now: 10,
+        },
+      }),
+    ).rejects.toThrow('ConfigurationLinkOwnerMissing')
+
+    expect(await readBrowserWorkspaceMeta(getDb())).toEqual(beforeWorkspace)
+    expect(await getDb().promptPresets.get(preset.id)).toEqual(preset)
+    expect(await getDb().chats.get(chatIds[0] ?? '')).toEqual(beforeFirstChat)
+    expect(await getDb().chats.get(chatIds.at(-1) ?? '')).toEqual(beforeLastChat)
+  })
+
+  it('pages staged connection reassignment and publishes one identity-only result', async () => {
+    const source: ConnectionProfile = {
+      id: 'staged-source-profile',
+      name: 'Staged source profile',
+      kind: 'openrouter',
+      baseUrl: 'https://openrouter.ai/api/v1',
+      defaultHeaders: {},
+      appTitle: 'natter',
+      appUrl: 'http://localhost',
+      supportsEndpointsApi: true,
+      supportsGenerationApi: true,
+      supportsPrivacyScrape: true,
+      requestRevision: 1,
+      createdAt: 1,
+      updatedAt: 1,
+    }
+    const replacement: ConnectionProfile = {
+      ...source,
+      id: 'staged-replacement-profile',
+      name: 'Staged replacement profile',
+    }
+    const chatIds = Array.from({ length: 130 }, (_, index) => `staged-profile-chat-${index}`)
+    const repository = getBrowserRepository()
+    await write(repository, {
+      kind: 'configuration.execute',
+      input: { kind: 'connection.create', profile: source, now: 1 },
+    })
+    await write(repository, {
+      kind: 'configuration.execute',
+      input: { kind: 'connection.create', profile: replacement, now: 1 },
+    })
+    await putTestChats(
+      chatIds.map((id) => ({
+        ...sessionChat(id),
+        settings: { ...cloneDefaultChatSettings(), profileId: source.id },
+      })),
+    )
+    const workspace = await readBrowserWorkspaceMeta(getDb())
+
+    const execution = await executeBrowserCommandInStagedDatabase(getDb(), workspace, {
+      kind: 'configuration.execute',
+      input: {
+        kind: 'connection.delete',
+        profileId: source.id,
+        reassignTo: replacement.id,
+        now: 10,
+      },
+    })
+    const expectedChatIds = [...chatIds].sort()
+
+    expect(execution.commit.value).toEqual({
+      kind: 'connection-deleted',
+      profileId: source.id,
+      affectedPresetIds: [],
+      affectedChatIds: expectedChatIds,
+      deletedKeyIds: [],
+      fallbackProfileId: replacement.id,
+    })
+    expect(execution.commit.receipt.chats).toEqual([])
+    expect(execution.commit.delta.invalidations).toContainEqual({
+      kind: 'chat',
+      chatIds: expectedChatIds,
+    })
+    expect(await getDb().profiles.get(source.id)).toBeUndefined()
+    expect(await getDb().chats.get(expectedChatIds.at(-1) ?? '')).toMatchObject({
+      settings: { profileId: replacement.id },
+      configurationVersion: 1,
     })
   })
 
@@ -649,6 +890,44 @@ describe('browser WorkspaceRepository protocol contract', () => {
     await owner
     await expect(restoring).resolves.toMatchObject({ chatCount: 0 })
     expect(getWorkspaceRuntimeControlSnapshot().state).toBe('RUNNING')
+  })
+
+  it('claims an abandoned preparing journal before admitting the next required replacement', async () => {
+    const abandoned = await beginBrowserWorkspaceDatabaseReplacement()
+    const abandonedManifest = await readBrowserWorkspaceDatabaseManifest()
+    const before = getWorkspaceRuntimeControlSnapshot()
+    const originalLocks = Object.getOwnPropertyDescriptor(navigator, 'locks')
+    Object.defineProperty(navigator, 'locks', {
+      configurable: true,
+      value: {
+        request: async <T>(
+          _name: string,
+          options: { mode: 'shared' | 'exclusive'; ifAvailable?: boolean },
+          operation: (lock: Lock | null) => Promise<T> | T,
+        ) => operation({ mode: options.mode } as Lock),
+      },
+    })
+    try {
+      await expect(restoreWorkspaceBackup(emptyWorkspaceBackup, { now: 5 })).resolves.toMatchObject(
+        {
+          chatCount: 0,
+        },
+      )
+
+      const manifest = await readBrowserWorkspaceDatabaseManifest()
+      expect(manifest.pending?.nonce).not.toBe(abandoned.nonce)
+      expect(manifest.activeDatabaseName).toBe(abandoned.destinationDatabaseName)
+      expect(manifest.activationSequence).toBe(abandonedManifest.activationSequence + 1)
+      expect(getWorkspaceRuntimeControlSnapshot()).toMatchObject({
+        state: 'RUNNING',
+        workspaceId: before.workspaceId,
+        replacementEpoch: before.replacementEpoch + 1,
+      })
+      await cleanPendingBrowserWorkspaceDatabase()
+    } finally {
+      if (originalLocks) Object.defineProperty(navigator, 'locks', originalLocks)
+      else Reflect.deleteProperty(navigator, 'locks')
+    }
   })
 
   it('carries caller cancellation through a replacement handoff', async () => {

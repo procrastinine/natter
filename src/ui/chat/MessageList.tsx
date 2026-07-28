@@ -15,6 +15,7 @@ import {
   conversationMutationInteraction,
   conversationMutationTarget,
 } from '../../app/presentation-interactions'
+import type { ActiveBranchForkSlot } from '../../core/active-branch-spine'
 import type { EffectiveCapability } from '../../core/capabilities'
 import type { ChatSettingsPatch } from '../../core/chat-metadata'
 import { resolveCutoff } from '../../core/context-cutoff'
@@ -89,6 +90,7 @@ type RenderableMessageRow = Pick<
   'message' | 'bodyVersion' | 'bodyExact'
 > & {
   readonly intentOnly?: boolean
+  readonly fork?: ActiveBranchForkSlot
 }
 
 // Pick the conversational counterpart of a role. user↔assistant is the
@@ -292,7 +294,6 @@ export const MessageList = memo(function MessageList({
   // `⇧⌘R` regenerates the focused assistant. Ignored while typing in a
   // textarea/input so users don't fight with their composer.
   useEffect(() => {
-    if (presentationOnly) return
     const onKey = (e: KeyboardEvent) => {
       if (e.defaultPrevented) return
       const activeTag = (document.activeElement?.tagName ?? '').toLowerCase()
@@ -318,6 +319,7 @@ export const MessageList = memo(function MessageList({
         announceVariantPosition(targetIndex, slot.liveCount)
         return
       }
+      if (presentationOnly) return
       if (
         e.key === 'R' &&
         e.shiftKey &&
@@ -364,7 +366,26 @@ export const MessageList = memo(function MessageList({
       capability,
     )
   }, [capability, chatSettings, contextPreviewPath])
-  const effectiveRenderedMessageCount = branchSnapshot.rowCount + binding.intentPresentations.length
+  const renderableMessageRows = useMemo(() => {
+    const durableRows = [...transcriptBodyWindowPages(branchSnapshot)].flatMap((page) => [
+      ...transcriptBodyPageRows(page),
+    ])
+    const replacementIds = new Set(
+      binding.intentPresentations.flatMap((presentation) =>
+        presentation.replacesFromMessageId ? [presentation.replacesFromMessageId] : [],
+      ),
+    )
+    const replacementOffset = durableRows.findIndex(({ message }) => replacementIds.has(message.id))
+    return [
+      ...(replacementOffset < 0 ? durableRows : durableRows.slice(0, replacementOffset)),
+      ...binding.intentPresentations.map((presentation) => ({
+        ...presentation,
+        bodyExact: true,
+        intentOnly: true,
+      })),
+    ]
+  }, [binding.intentPresentations, branchSnapshot])
+  const effectiveRenderedMessageCount = renderableMessageRows.length
   const loadOlderMessages = useCallback(() => {
     if (presentationOnly) return
     if (hiddenOlderCount <= 0 && !canRetryLoadedBodies) return
@@ -402,11 +423,12 @@ export const MessageList = memo(function MessageList({
       bodyVersion,
       bodyExact,
       intentOnly = false,
+      fork,
     }: RenderableMessageRow): ReactNode => {
       const rowPresentationOnly = presentationOnly || intentOnly
       const showStaleHint =
         m.role === 'assistant' && m.parentId !== null && staleHintFor.has(m.parentId)
-      const branchContext = branchSpine.forkFor(m.id)
+      const branchContext = fork ?? branchSpine.forkFor(m.id)
       const hasSiblingVariants = (branchContext?.liveCount ?? 0) > 1
       const editResendCapability =
         m.role === 'user'
@@ -523,7 +545,6 @@ export const MessageList = memo(function MessageList({
       data-branch-counts="known"
       aria-busy={presentationOnly || undefined}
       data-presentation-only={presentationOnly || undefined}
-      inert={presentationOnly || undefined}
     >
       {hiddenOlderCount > 0 || canRetryLoadedBodies ? (
         <div ref={loadOlderRef} data-ui="message-window-load">
@@ -538,16 +559,7 @@ export const MessageList = memo(function MessageList({
           {hiddenOlderCount > 0 ? <span>{hiddenOlderCount} older</span> : null}
         </div>
       ) : null}
-      {[...transcriptBodyWindowPages(branchSnapshot)].flatMap((page) =>
-        [...transcriptBodyPageRows(page)].map(renderMessageRow),
-      )}
-      {binding.intentPresentations.map((presentation) =>
-        renderMessageRow({
-          ...presentation,
-          bodyExact: true,
-          intentOnly: true,
-        }),
-      )}
+      {renderableMessageRows.map(renderMessageRow)}
       {insertTarget ? (
         <Suspense
           fallback={

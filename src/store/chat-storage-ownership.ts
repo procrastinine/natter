@@ -68,6 +68,8 @@ export interface DeleteChatClosureResult {
   readonly deletedChatIds: readonly ChatId[]
   readonly deletedChats: readonly Chat[]
   readonly affectedAttachmentIds: readonly AttachmentId[]
+  readonly retiredStreamFrames: number
+  readonly streamJournalRetirementPending: boolean
 }
 
 export async function deleteEligibleEmptyDraftChatClosure(
@@ -75,6 +77,7 @@ export async function deleteEligibleEmptyDraftChatClosure(
   requestedChatIds: readonly ChatId[],
   staleBefore: number | undefined,
   now: number,
+  options: { readonly maxStreamJournalPages?: number } = {},
 ): Promise<DeleteChatClosureResult> {
   const uniqueIds = [...new Set(requestedChatIds)]
   if (uniqueIds.length === 0) return emptyDeleteChatClosureResult()
@@ -103,7 +106,13 @@ export async function deleteEligibleEmptyDraftChatClosure(
     (chat, index) =>
       !messageChats.has(chat.id) && !edgeChats.has(chat.id) && isEmptyDraftRow(drafts[index]),
   )
-  return deleteKnownChatClosure(tx, eligible, now, 'skip')
+  return deleteKnownChatClosure(
+    tx,
+    eligible,
+    now,
+    'skip',
+    options.maxStreamJournalPages ?? Number.POSITIVE_INFINITY,
+  )
 }
 
 export async function deleteArchivedChatClosure(
@@ -159,6 +168,7 @@ async function deleteKnownChatClosure(
   candidates: readonly Chat[],
   now: number,
   activeLeasePolicy: 'reject' | 'skip',
+  maxStreamJournalPages = Number.POSITIVE_INFINITY,
 ): Promise<DeleteChatClosureResult> {
   if (candidates.length === 0) return emptyDeleteChatClosureResult()
   const candidateIds = candidates.map((chat) => chat.id)
@@ -178,6 +188,25 @@ async function deleteKnownChatClosure(
       : [...candidates]
   if (chats.length === 0) return emptyDeleteChatClosureResult()
   const deletedChatIds = chats.map((chat) => chat.id)
+  let retiredStreamFrames = 0
+  for (let page = 0; ; page += 1) {
+    const retired = await retireStreamJournalOwnershipPage(tx, {
+      kind: 'orphan-chat-closure',
+      chatIds: deletedChatIds,
+    })
+    if (retired.result.outcome === 'ineligible') {
+      throw new Error('OrphanStreamJournalLeasePresent')
+    }
+    retiredStreamFrames += retired.result.deletedFrames
+    if (retired.result.done) break
+    if (page + 1 >= maxStreamJournalPages) {
+      return {
+        ...emptyDeleteChatClosureResult(),
+        retiredStreamFrames,
+        streamJournalRetirementPending: true,
+      }
+    }
+  }
 
   const affectedAttachmentIds = await deleteAttachmentReferenceEdgesForChats(
     tx,
@@ -211,16 +240,6 @@ async function deleteKnownChatClosure(
     ),
   ])
   await deleteLinkedSemanticByteOwnerBatchRepairingLinks(tx, 'chats', deletedChatIds, chats)
-  for (;;) {
-    const retired = await retireStreamJournalOwnershipPage(tx, {
-      kind: 'orphan-chat-closure',
-      chatIds: deletedChatIds,
-    })
-    if (retired.result.outcome === 'ineligible') {
-      throw new Error('OrphanStreamJournalLeasePresent')
-    }
-    if (retired.result.done) break
-  }
   await deleteChatAuxiliaryByteOwners(tx, { chatIds: deletedChatIds, messageBodyProjectionBytes })
   for (const chatId of deletedChatIds) {
     await Promise.all([
@@ -265,6 +284,8 @@ async function deleteKnownChatClosure(
     deletedChatIds,
     deletedChats: chats.map((chat) => structuredClone(chat)),
     affectedAttachmentIds,
+    retiredStreamFrames,
+    streamJournalRetirementPending: false,
   }
 }
 
@@ -273,7 +294,13 @@ function saturatingAdd(left: number, right: number): number {
 }
 
 function emptyDeleteChatClosureResult(): DeleteChatClosureResult {
-  return { deletedChatIds: [], deletedChats: [], affectedAttachmentIds: [] }
+  return {
+    deletedChatIds: [],
+    deletedChats: [],
+    affectedAttachmentIds: [],
+    retiredStreamFrames: 0,
+    streamJournalRetirementPending: false,
+  }
 }
 
 function combinedCalibrationSamples(

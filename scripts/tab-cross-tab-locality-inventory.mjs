@@ -77,7 +77,6 @@ const QUERY_VARIANTS = Object.freeze([
   'discovery.endpoints',
   'discovery.models',
   'discovery.privacy',
-  'draft.get',
   'folder.list',
   'generated-output.localization-queue',
   'interchange.export-chat',
@@ -359,6 +358,18 @@ export const WORKSPACE_ROOT_LOCALITY = mergeRecords(
     expectedOtherTabBehavior: 'unrelated-streams-remain-live-and-unaffected',
     status: 'observed',
     evidence: 'src/store/attempt-control-application.ts#requestAttemptStop',
+  }),
+  records(['command-fanout'], {
+    initiatingOwner: 'background-command-coordinator',
+    durableScope: 'one-admitted-semantic-operation-and-its-bounded-command-pages',
+    lockTransactionScope: 'workspace-replacement-root-plus-command-specific-locks',
+    localPresentationEffect: 'none-directly',
+    crossTabPublication: 'each-committed-command-publishes-its-exact-delta',
+    forbiddenRemoteSteering: FORBID_REMOTE_STEERING,
+    activeStreamOwnership: 'none',
+    expectedOtherTabBehavior: 'refresh-only-the-published-authoritative-dependencies',
+    status: 'observed',
+    evidence: 'src/store/browser-staged-fanout-command.ts',
   }),
   records(
     [
@@ -809,7 +820,10 @@ export const ROUTE_ACTION_LOCALITY = records(
 export const OWNER_PATH_CLASSIFICATIONS = Object.freeze({
   maintenance: Object.freeze(['src/store/storage-maintenance-runtime.ts']),
   background: Object.freeze([
+    'src/store/attachment-catalog-projection.ts',
     'src/store/attachment-catalog-workspace.ts',
+    'src/store/attachment-integrity-maintenance.ts',
+    'src/store/attachment-reference-edges.ts',
     'src/store/attempt-terminalization.ts',
     'src/store/attempt-workspace.ts',
     'src/store/broadcast.ts',
@@ -824,6 +838,8 @@ export const OWNER_PATH_CLASSIFICATIONS = Object.freeze({
     'src/store/browser-repo.ts',
     'src/store/browser-workspace-replacement-runner.ts',
     'src/store/byte-owner-mutation.ts',
+    'src/store/chat-row-transition.ts',
+    'src/store/child-list-projection.ts',
     'src/store/configuration-workspace.ts',
     'src/store/configuration-model-resolution-capability.ts',
     'src/store/conversation-repository-adapter.ts',
@@ -1007,7 +1023,7 @@ export const REMOTE_LOCALITY_BROWSER_OUTCOME_MATRIX = Object.freeze([
       ),
       remoteBrowserJourney(
         'tests/e2e/storage-reclamation.spec.ts',
-        "test('normal use retries real compaction debt and preserves two-tab work across the slot switch'",
+        "test('normal use catches up foreground work without repeating the physical copy and preserves two-tab state'",
       ),
       remoteBrowserJourney(
         'tests/e2e/storage-reclamation.spec.ts',

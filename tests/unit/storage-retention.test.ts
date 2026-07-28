@@ -21,6 +21,7 @@ import {
   __resetBrowserRepositoryForTests,
   getBrowserRepository,
 } from '../../src/store/browser-repo'
+import { browserWorkspaceCatchupTransactionTableNames } from '../../src/store/browser-workspace-catchup-journal'
 import type * as BrowserWorkspaceCompaction from '../../src/store/browser-workspace-compaction'
 import {
   abandonPreparedBrowserWorkspaceDatabase,
@@ -37,6 +38,11 @@ import {
 } from '../../src/store/browser-workspace-lifecycle'
 import { buildChat } from '../../src/store/chats'
 import { __resetDbForTests, getDb, NatterDb } from '../../src/store/db'
+import {
+  __setLockBackendForTests,
+  type AuthoritativeCommandLockSession,
+  type LockBackend,
+} from '../../src/store/locks'
 import { splitMessageForStorage } from '../../src/store/message-storage'
 import { type StreamLeaseRow, streamLeaseHasWriteFence } from '../../src/store/repository'
 import {
@@ -123,6 +129,56 @@ class SelectiveSlotLockManager {
       if (this.busySlots.has(name)) return Promise.resolve(operation(null))
     }
     return Promise.resolve(operation({ name, mode: options.mode ?? 'exclusive' }))
+  }
+}
+
+class PausableResourceLockBackend implements LockBackend {
+  readonly kind = 'web-locks' as const
+  private enteredResolve: (() => void) | undefined
+  private releaseResolve: (() => void) | undefined
+  private readonly entered = new Promise<void>((resolve) => {
+    this.enteredResolve = resolve
+  })
+  private readonly released = new Promise<void>((resolve) => {
+    this.releaseResolve = resolve
+  })
+
+  waitForLock(): Promise<void> {
+    return this.entered
+  }
+
+  release(): void {
+    this.releaseResolve?.()
+  }
+
+  async run<T>(
+    logicalNames: readonly string[],
+    operation: Parameters<LockBackend['run']>[1],
+  ): Promise<T> {
+    this.enteredResolve?.()
+    await this.released
+    return operation({
+      kind: this.kind,
+      logicalNames,
+      runTransaction: (db, tables, write) =>
+        db.transaction(
+          'rw',
+          tables.map((table) => db.table(typeof table === 'string' ? table : table.name)),
+          write,
+        ),
+    }) as Promise<T>
+  }
+
+  async runAuthoritativeCommandSession<T>(
+    _database: Dexie,
+    operation: (session: AuthoritativeCommandLockSession) => Promise<T> | T,
+    options: { signal?: AbortSignal } = {},
+  ): Promise<T> {
+    if (options.signal?.aborted) throw options.signal.reason
+    return operation({
+      kind: this.kind,
+      withResourceLocks: (resourceNames, child) => this.run(resourceNames, child),
+    })
   }
 }
 
@@ -248,6 +304,7 @@ function startMaintenance(): void {
 }
 
 beforeEach(async () => {
+  __setLockBackendForTests(null)
   maintenanceReplacementDrain = createBrowserWorkspacePromotedReplacementDrain()
   compactionProbe.fail = false
   compactionProbe.calls = 0
@@ -262,6 +319,7 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
+  __setLockBackendForTests(null)
   vi.useRealTimers()
   closeStorageMaintenanceRuntime()
   await awaitStorageMaintenanceRuntimeIdle()
@@ -511,13 +569,14 @@ describe('storage retention', () => {
     diagnostic.mockRestore()
   }, 15_000)
 
-  it('requeues a foreground-preempted copy without new debt and then commits it once', async () => {
+  it('keeps foreground work live without repeating the physical copy', async () => {
     Object.defineProperty(navigator, 'locks', {
       configurable: true,
       value: new ImmediateLockManager(),
     })
     const chat = buildChat({
       id: 'preempted-physical-compaction-chat',
+      title: 'Before catch-up',
       settings: cloneDefaultChatSettings(),
       now: 1,
     })
@@ -535,7 +594,7 @@ describe('storage retention', () => {
     const sourceDatabaseName = getDb().name
     const blocker = new NatterDb(sourceDatabaseName)
     await blocker.open()
-    const holdSourceCopy = blocker.transaction('rw', blocker.attachmentArtifacts, async () => {
+    const holdSourceCopy = blocker.transaction('rw', blocker.textTemplates, async () => {
       markCopyHeld()
       await Dexie.waitFor(copyGate)
     })
@@ -562,13 +621,13 @@ describe('storage retention', () => {
       await vi.waitFor(
         async () => {
           const manifest = await readBrowserWorkspaceDatabaseManifest()
-          expect(compactionProbe.calls).toBeGreaterThanOrEqual(2)
+          expect(compactionProbe.calls).toBe(1)
           expect(
             await readBrowserWorkspaceCompactionState(manifest.activeDatabaseName),
           ).toMatchObject({
-            requestRevision: 2,
-            attemptedRevision: 2,
-            completedRevision: 2,
+            requestRevision: 1,
+            attemptedRevision: 1,
+            completedRevision: 1,
           })
           expect(manifest.activationSequence).toBe(before.activationSequence + 1)
           expect(getWorkspaceRuntimeControlSnapshot().state).toBe('RUNNING')
@@ -614,6 +673,62 @@ describe('storage retention', () => {
 
     expect(await getDb().chats.get(stale.id)).toBeUndefined()
     expect(await getDb().chats.get(recent.id)).toBeDefined()
+  })
+
+  it('retires orphan chat frames in bounded pages before deleting the empty draft', async () => {
+    const chat = buildChat({
+      id: 'stale-empty-chat-with-orphan-frames',
+      settings: cloneDefaultChatSettings(),
+      temporary: true,
+      now: 1,
+    })
+    await putTestChat(chat)
+    const orphan = testGenerationLease({
+      streamId: 'orphan-chat-stream',
+      chatId: chat.id,
+      messageId: 'orphan-chat-message',
+      ownerClientId: 'gone-owner',
+      fenceToken: 'orphan-chat-fence',
+      replacementEpoch: 0,
+      admissionSequence: 1,
+      revision: 1,
+      startedAt: 1,
+      heartbeatAt: 1,
+      phase: 'reserved',
+      postCommit: { usedAt: 1, profileId: 'profile' },
+    })
+    await getDb().streamChunks.bulkPut(
+      await journalFramesForLease(
+        orphan,
+        Array.from({ length: 129 }, (_, index) => `orphan-frame-${index}`),
+      ),
+    )
+
+    const pages = []
+    for (;;) {
+      const commit = await runWorkspaceAction('maintenance', (permit) =>
+        getBrowserRepository().execute(permit, {
+          kind: 'maintenance.prune-empty-draft-chats',
+          now: 100,
+          maxAgeMs: 0,
+          limit: 1,
+        }),
+      )
+      pages.push(commit.value)
+      if (commit.value.done) break
+    }
+
+    expect(pages.map((page) => page.retiredStreamFrames)).toEqual([64, 64, 1])
+    expect(pages.map((page) => page.scannedChatIds)).toEqual([1, 1, 1])
+    expect(pages.slice(0, 2).every((page) => page.deletedChatIds.length === 0)).toBe(true)
+    expect(pages.at(-1)).toMatchObject({
+      deletedChatIds: [chat.id],
+      affectedAttachmentIds: [],
+      retiredStreamFrames: 1,
+      done: true,
+    })
+    expect(await getDb().streamChunks.where('chatId').equals(chat.id).count()).toBe(0)
+    expect(await getDb().chats.get(chat.id)).toBeUndefined()
   })
 
   it('owns transient pass failures with one capped retry deadline instead of disabling retention', async () => {
@@ -964,6 +1079,15 @@ describe('storage retention', () => {
         ).toBe(1)
       },
       { timeout: 2_000 },
+    )
+    expect(await getDb().attachments.get(ingested.attachment.id)).toBeDefined()
+    await vi.waitFor(
+      async () => {
+        expect(await getDb().attachmentIntegrityState.get('workspace')).toEqual(
+          expect.objectContaining({ phase: 'complete' }),
+        )
+      },
+      { timeout: 3_000 },
     )
     closeStorageMaintenanceRuntime()
     await awaitStorageMaintenanceRuntimeIdle()
@@ -1352,7 +1476,14 @@ describe('storage retention', () => {
       { kind: 'attachment', attachmentId: 'attachment' },
     ])
     expect(attachmentPlan).not.toContain('messages')
-    const expectedDeclared = new Set([...attachmentPlan, 'browserLocks', 'storageRetentionState'])
+    const expectedDeclared = new Set(
+      browserWorkspaceCatchupTransactionTableNames([
+        ...attachmentPlan,
+        'attachmentIntegrityState',
+        'browserLocks',
+        'storageRetentionState',
+      ]),
+    )
     const attachmentMutationAccesses = storeAccesses.filter(
       ({ declared }) =>
         declared.length === expectedDeclared.size &&
@@ -1362,6 +1493,89 @@ describe('storage retention', () => {
     const messageAccesses = attachmentMutationAccesses.filter(({ name }) => name === 'messages')
     expect(messageAccesses).toEqual([])
     expect(attachmentMutationAccesses.flatMap(({ declared }) => declared)).not.toContain('messages')
+    expect(attachmentMutationAccesses.flatMap(({ declared }) => declared)).not.toContain(
+      'replacementCatchup__messages',
+    )
+  })
+
+  it('retains a candidate whose reclamation timestamp advances after preflight', async () => {
+    const ingested = await ingestAttachmentBytes({
+      blob: new Blob(['refreshed candidate'], { type: 'text/plain' }),
+      filename: 'refreshed-candidate.txt',
+      now: 1,
+    })
+    await getDb().attachments.update(ingested.attachment.id, { unreferencedAt: 1 })
+    const backend = new PausableResourceLockBackend()
+    __setLockBackendForTests(backend)
+
+    const reaping = runWorkspaceAction('maintenance', (permit) =>
+      getBrowserRepository().execute(permit, {
+        kind: 'attachment.reap',
+        now: 100,
+        maxAgeMs: 0,
+        limit: 1,
+      }),
+    )
+    await backend.waitForLock()
+    await getDb().attachments.update(ingested.attachment.id, { unreferencedAt: 200 })
+    backend.release()
+
+    await expect(reaping).resolves.toMatchObject({
+      value: {
+        scanned: 1,
+        deletedAttachmentIds: [],
+        earliestDeferredAt: 200,
+        done: true,
+      },
+    })
+    expect(await getDb().attachments.get(ingested.attachment.id)).toMatchObject({
+      unreferencedAt: 200,
+    })
+  })
+
+  it('rolls back a reclaimed bundle when the active retention cycle changes before its lock', async () => {
+    const ingested = await ingestAttachmentBytes({
+      blob: new Blob(['revision conflict'], { type: 'text/plain' }),
+      filename: 'revision-conflict.txt',
+      now: 1,
+    })
+    const attachmentId = ingested.attachment.id
+    await getDb().attachments.update(attachmentId, { unreferencedAt: 1 })
+    const before = {
+      header: await getDb().attachments.get(attachmentId),
+      catalog: await getDb().attachmentCatalogRows.get(attachmentId),
+      aggregate: await getDb().attachmentCatalogAggregate.get('workspace'),
+      blobs: await getDb().attachmentBlobs.where('attachmentId').equals(attachmentId).toArray(),
+    }
+    const backend = new PausableResourceLockBackend()
+    __setLockBackendForTests(backend)
+
+    const reaping = runWorkspaceAction('maintenance', (permit) =>
+      getBrowserRepository().execute(permit, {
+        kind: 'attachment.reap',
+        now: 100,
+        maxAgeMs: 0,
+        limit: 1,
+      }),
+    )
+    await backend.waitForLock()
+    await getDb().storageRetentionState.put({
+      task: 'attachment-reap',
+      formatVersion: 1,
+      phase: 'active',
+      revision: 1,
+      cycleNow: 100,
+      cutoff: 100,
+    })
+    backend.release()
+
+    await expect(reaping).rejects.toThrow('StorageRetentionStateChanged:attachment-reap')
+    expect(await getDb().attachments.get(attachmentId)).toEqual(before.header)
+    expect(await getDb().attachmentCatalogRows.get(attachmentId)).toEqual(before.catalog)
+    expect(await getDb().attachmentCatalogAggregate.get('workspace')).toEqual(before.aggregate)
+    expect(
+      await getDb().attachmentBlobs.where('attachmentId').equals(attachmentId).toArray(),
+    ).toEqual(before.blobs)
   })
 
   it('advances past raced candidates and equal timestamps without head-of-line blocking', async () => {

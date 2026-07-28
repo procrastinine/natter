@@ -20,19 +20,17 @@ interface WorkspaceSlotQuiesceMessage {
   readonly destinationDatabaseName: BrowserWorkspaceDatabaseName
 }
 
-interface WorkspaceSlotResumeMessage {
-  readonly kind: 'resume'
-  readonly senderId: string
+type WorkspaceSlotMessage = WorkspaceSlotQuiesceMessage
+
+export interface BrowserWorkspaceSlotTransition {
   readonly nonce: string
   readonly sourceDatabaseName: BrowserWorkspaceDatabaseName
   readonly destinationDatabaseName: BrowserWorkspaceDatabaseName
 }
 
-type WorkspaceSlotMessage = WorkspaceSlotQuiesceMessage | WorkspaceSlotResumeMessage
-
 interface WorkspaceSlotLifecycle {
-  quiesce(signal: AbortSignal): Promise<void>
-  resume(signal: AbortSignal): Promise<void>
+  validateQuiesce(transition: BrowserWorkspaceSlotTransition, signal: AbortSignal): Promise<boolean>
+  reconcile(transition: BrowserWorkspaceSlotTransition, signal: AbortSignal): Promise<void>
 }
 
 declare const browserWorkspaceSlotCoordinatorOwnerBrand: unique symbol
@@ -46,7 +44,6 @@ interface BrowserWorkspaceSlotCoordinatorOwnerRecord {
   readonly controller: AbortController
   readonly disposalReason: Error
   inbound: Promise<void>
-  remoteTransition: Omit<WorkspaceSlotQuiesceMessage, 'kind' | 'senderId'> | null
   channel: BroadcastChannel | null
   channelUnavailable: boolean
   storageListener: ((event: StorageEvent) => void) | null
@@ -92,7 +89,6 @@ export function installBrowserWorkspaceSlotCoordinator(
     controller: new AbortController(),
     disposalReason: new Error('BrowserWorkspaceSlotCoordinatorDisposed'),
     inbound: Promise.resolve(),
-    remoteTransition: null,
     channel: null,
     channelUnavailable: false,
     storageListener: null,
@@ -130,7 +126,6 @@ export function disposeBrowserWorkspaceSlotCoordinator(
       failures.push(error)
     }
   }
-  owner.remoteTransition = null
   if (failures.length > 0) {
     throw new AggregateError(failures, 'BrowserWorkspaceSlotCoordinatorDisposalFailed')
   }
@@ -288,14 +283,6 @@ export function postBrowserWorkspaceSlotQuiesce(message: {
   postSlotMessage({ kind: 'quiesce', senderId, ...message })
 }
 
-export function postBrowserWorkspaceSlotResume(message: {
-  nonce: string
-  sourceDatabaseName: BrowserWorkspaceDatabaseName
-  destinationDatabaseName: BrowserWorkspaceDatabaseName
-}): void {
-  postSlotMessage({ kind: 'resume', senderId, ...message })
-}
-
 export async function withExclusiveBrowserWorkspaceSlots<T>(
   databaseNames: readonly BrowserWorkspaceDatabaseName[],
   operation: () => Promise<T>,
@@ -448,30 +435,19 @@ function receiveSlotMessage(
     .then(async () => {
       assertSlotCoordinatorOwnerActive(owner)
       const target = owner.lifecycle
-      if (value.kind === 'quiesce') {
-        if (activeLease?.databaseName !== value.sourceDatabaseName) return
-        const transition = transitionFromMessage(value)
-        owner.remoteTransition = transition
-        try {
-          await raceWithAbortSignal(
-            () => target.quiesce(owner.controller.signal),
-            owner.controller.signal,
-          )
-          assertSlotCoordinatorOwnerActive(owner)
-        } catch (error) {
-          if (sameTransition(owner.remoteTransition, transition)) owner.remoteTransition = null
-          throw error
-        }
-        return
-      }
+      if (activeLease?.databaseName !== value.sourceDatabaseName) return
       const transition = transitionFromMessage(value)
-      if (!sameTransition(owner.remoteTransition, transition)) return
-      await raceWithAbortSignal(
-        () => target.resume(owner.controller.signal),
+      const valid = await raceWithAbortSignal(
+        () => target.validateQuiesce(transition, owner.controller.signal),
         owner.controller.signal,
       )
       assertSlotCoordinatorOwnerActive(owner)
-      if (sameTransition(owner.remoteTransition, transition)) owner.remoteTransition = null
+      if (!valid) return
+      await raceWithAbortSignal(
+        () => target.reconcile(transition, owner.controller.signal),
+        owner.controller.signal,
+      )
+      assertSlotCoordinatorOwnerActive(owner)
     })
     .catch((error: unknown) => {
       if (!owner.active || coordinatorOwner !== owner) return
@@ -494,7 +470,7 @@ function isSlotMessage(value: unknown): value is WorkspaceSlotMessage {
   if (!value || typeof value !== 'object') return false
   const candidate = value as Partial<WorkspaceSlotMessage>
   return (
-    (candidate.kind === 'quiesce' || candidate.kind === 'resume') &&
+    candidate.kind === 'quiesce' &&
     typeof candidate.senderId === 'string' &&
     typeof candidate.nonce === 'string' &&
     candidate.nonce.length > 0 &&
@@ -508,25 +484,12 @@ function isSlotMessage(value: unknown): value is WorkspaceSlotMessage {
   )
 }
 
-function transitionFromMessage(
-  message: WorkspaceSlotMessage,
-): Omit<WorkspaceSlotQuiesceMessage, 'kind' | 'senderId'> {
+function transitionFromMessage(message: WorkspaceSlotMessage): BrowserWorkspaceSlotTransition {
   return {
     nonce: message.nonce,
     sourceDatabaseName: message.sourceDatabaseName,
     destinationDatabaseName: message.destinationDatabaseName,
   }
-}
-
-function sameTransition(
-  left: Omit<WorkspaceSlotQuiesceMessage, 'kind' | 'senderId'> | null,
-  right: Omit<WorkspaceSlotQuiesceMessage, 'kind' | 'senderId'>,
-): boolean {
-  return (
-    left?.nonce === right.nonce &&
-    left.sourceDatabaseName === right.sourceDatabaseName &&
-    left.destinationDatabaseName === right.destinationDatabaseName
-  )
 }
 
 function slotLockManager(): WorkspaceSlotLockManager | null {

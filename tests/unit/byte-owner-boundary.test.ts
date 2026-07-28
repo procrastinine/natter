@@ -207,7 +207,11 @@ describe('byte-owner mutation boundary', () => {
     expect(importers).toEqual(['store/byte-owner-mutation.ts', 'store/db.ts'])
     expect(
       versionGatedReferences(join(SRC_ROOT, 'store/db.ts'), ['accumulateStorageCompactionDebt']),
-    ).toEqual(['accumulateStorageCompactionDebt@v94'])
+    ).toEqual([
+      'accumulateStorageCompactionDebt@inactive-normalizer',
+      'accumulateStorageCompactionDebt@v94',
+      'accumulateStorageCompactionDebt@v97',
+    ])
 
     const port = readFileSync(join(SRC_ROOT, 'store/byte-owner-mutation.ts'), 'utf8')
     const policy = readFileSync(join(SRC_ROOT, 'store/physical-storage-tables.ts'), 'utf8')
@@ -390,6 +394,8 @@ function dexieVersionLabel(node: ts.Node): number | 'current' | undefined {
         version = 'current'
       } else if (value && ts.isIdentifier(value) && value.text === 'WAVE_A_STORAGE_VERSION') {
         version = 94
+      } else if (value && ts.isIdentifier(value) && value.text === 'WAVE_B_STORAGE_VERSION') {
+        version = 97
       }
       return
     }
@@ -411,12 +417,28 @@ function versionGatedReferences(file: string, names: readonly string[]): string[
   const references: string[] = []
   const visit = (node: ts.Node): void => {
     if (ts.isIdentifier(node) && requested.has(node.text) && !ts.isImportSpecifier(node.parent)) {
-      references.push(`${node.text}@${dexieSchemaContext(node) ?? 'live'}`)
+      references.push(
+        `${node.text}@${
+          dexieSchemaContext(node) ??
+          (ancestorFunctionName(node) === 'normalizeInactiveBrowserWorkspaceDatabase'
+            ? 'inactive-normalizer'
+            : 'live')
+        }`,
+      )
     }
     node.forEachChild(visit)
   }
   visit(sourceFile)
   return references.sort()
+}
+
+function ancestorFunctionName(node: ts.Node): string | undefined {
+  let current = node.parent
+  for (;;) {
+    if (ts.isFunctionDeclaration(current) && current.name) return current.name.text
+    if (ts.isSourceFile(current)) return undefined
+    current = current.parent
+  }
 }
 
 function opensLexicalScope(node: ts.Node): boolean {

@@ -5,19 +5,28 @@ import type {
   DBCoreKeyRange,
   DBCoreMutateRequest,
   DBCoreMutateResponse,
+  DBCoreQueryRequest,
   DBCoreTransaction,
   Middleware,
   Transaction,
 } from 'dexie'
 import type { AttachmentId, Chat, ChatId, MessageId } from '../core/types'
 import { sameValue } from '../lib/same-value'
+import {
+  browserWorkspaceCatchupTransactionTableNames,
+  recordBrowserWorkspaceCatchupMutations,
+} from './browser-workspace-catchup-journal'
 import { type ConfigurationLink, configurationTargetKey } from './configuration-domain-contract'
 import {
   type MessageHeaderRow,
   type MessagePresentation,
   sameMessageHeaderValue,
 } from './message-storage'
-import { encodePhysicalStorageKey, type PhysicalStorageTableName } from './physical-storage-tables'
+import {
+  encodePhysicalStorageKey,
+  type PhysicalStorageTableName,
+  physicalStorageMutationAddress,
+} from './physical-storage-tables'
 import { streamJournalFrameStreamId } from './repository'
 import { boundSemanticOperationExactReceiptAccumulator } from './semantic-operation-capability'
 import type { StorageRetentionTask } from './storage-retention-state'
@@ -29,12 +38,48 @@ const DBCORE_RANGE_NEVER = 4 as DBCoreKeyRange['type']
 const journals = new WeakMap<DBCoreTransaction, MutableMutationJournal>()
 const installedDatabases = new WeakSet<Dexie>()
 
+export interface BrowserCommandFanoutBudget {
+  readonly maxReadRows: number
+  readonly maxWriteRows: number
+  readonly maxBytes: number
+}
+
+export class BrowserCommandFanoutBudgetExceededError extends Error {
+  readonly dimension: 'read-rows' | 'write-rows' | 'bytes'
+  readonly observed: number
+  readonly limit: number
+
+  constructor(dimension: 'read-rows' | 'write-rows' | 'bytes', observed: number, limit: number) {
+    super(`BrowserCommandFanoutBudgetExceeded:${dimension}:${observed}:${limit}`)
+    this.name = 'BrowserCommandFanoutBudgetExceededError'
+    this.dimension = dimension
+    this.observed = observed
+    this.limit = limit
+  }
+}
+
+export function isBrowserCommandFanoutBudgetExceededError(
+  error: unknown,
+): error is BrowserCommandFanoutBudgetExceededError {
+  if (error instanceof BrowserCommandFanoutBudgetExceededError) return true
+  if (error instanceof AggregateError) {
+    return error.errors.some(isBrowserCommandFanoutBudgetExceededError)
+  }
+  return (
+    error instanceof Error &&
+    error.cause !== undefined &&
+    isBrowserCommandFanoutBudgetExceededError(error.cause)
+  )
+}
+
 interface MutableMutationJournal {
   readonly tableNames: Set<string>
   readonly physicalMutations: Map<string, BrowserCommandPhysicalMutation>
   readonly physicalWrites?: BrowserCommandPhysicalWrite[]
   readonly physicalReads?: Map<string, MutableBrowserCommandPhysicalRead>
   readonly finalizationPhysicalReads?: Map<string, MutableBrowserCommandPhysicalRead>
+  readonly readConflictAddresses?: Set<string>
+  readonly readConflictScopes?: Map<string, BrowserCommandReadConflictScope>
   readonly physicalOwnerScopes: Map<string, BrowserCommandPhysicalOwnerScope>
   readonly internalMutationEvidence: Set<string>
   readonly physicalMutationHints: Map<string, BrowserCommandPhysicalMutationHint>
@@ -47,9 +92,16 @@ interface MutableMutationJournal {
   readonly initialChatExistsById: Map<ChatId, boolean>
   readonly finalChatById: Map<ChatId, Chat | null>
   readonly handledKeyRequestMaterialIds: Set<string>
+  readonly catchupActiveByTable: Map<string, boolean>
   successfulMutations: number
   observePhysicalReads: boolean
   physicalReadPhase: 'command' | 'finalization'
+  readonly fanoutBudget?: BrowserCommandFanoutBudget
+  readonly retainFullChatStates: boolean
+  fanoutReadRows: number
+  fanoutWriteRows: number
+  fanoutBytes: number
+  fanoutLargestValueBytes: number
 }
 
 interface BrowserCommandPhysicalMutationHint {
@@ -92,6 +144,8 @@ export interface BrowserCommandMutationFacts {
   readonly physicalWrites: readonly BrowserCommandPhysicalWrite[]
   readonly physicalReads: readonly BrowserCommandPhysicalRead[]
   readonly finalizationPhysicalReads: readonly BrowserCommandPhysicalRead[]
+  readonly readConflictAddresses: readonly string[]
+  readonly readConflictScopes: readonly BrowserCommandReadConflictScope[]
   readonly physicalOwnerScopes: readonly BrowserCommandPhysicalOwnerScope[]
   readonly internalMutationEvidence: readonly string[]
   readonly invalidations: readonly WorkspaceDependency[]
@@ -101,6 +155,14 @@ export interface BrowserCommandMutationFacts {
   readonly childSlots: readonly WorkspaceLocalChildSlotEvidence[]
   readonly chatStates: readonly BrowserCommandChatStateFact[]
   readonly successfulMutations: number
+}
+
+export interface BrowserCommandReadConflictScope {
+  readonly tableName: string
+  readonly indexName?: string
+  readonly keyPath: string | readonly string[] | null
+  readonly range: DBCoreKeyRange
+  readonly anyMutation: boolean
 }
 
 export type BrowserCommandPhysicalReadOperation =
@@ -187,7 +249,7 @@ interface MutableMessageRevisionFact {
 
 export interface BrowserCommandChatStateFact {
   readonly chatId: ChatId
-  readonly chat: Chat | null
+  readonly chat?: Chat | null
   readonly initialExists: boolean
 }
 
@@ -208,6 +270,8 @@ export async function runBrowserCommandTransaction<T>(
   options: {
     readonly observePhysicalReads?: boolean
     readonly observePhysicalWrites?: boolean
+    readonly fanoutBudget?: BrowserCommandFanoutBudget
+    readonly retainFullChatStates?: boolean
   } = {},
 ): Promise<BrowserCommandTransactionResult<T>> {
   if (!installedDatabases.has(tx.db)) throw new Error('BrowserCommandMutationJournalMissing')
@@ -219,6 +283,8 @@ export async function runBrowserCommandTransaction<T>(
     ...(options.observePhysicalWrites ? { physicalWrites: [] } : {}),
     ...(options.observePhysicalReads ? { physicalReads: new Map() } : {}),
     ...(options.observePhysicalReads ? { finalizationPhysicalReads: new Map() } : {}),
+    ...(options.observePhysicalReads ? { readConflictAddresses: new Set() } : {}),
+    ...(options.observePhysicalReads ? { readConflictScopes: new Map() } : {}),
     physicalOwnerScopes: new Map(),
     internalMutationEvidence: new Set(),
     physicalMutationHints: new Map(),
@@ -231,9 +297,16 @@ export async function runBrowserCommandTransaction<T>(
     initialChatExistsById: new Map(),
     finalChatById: new Map(),
     handledKeyRequestMaterialIds: new Set(),
+    catchupActiveByTable: new Map(),
     successfulMutations: 0,
     observePhysicalReads: options.observePhysicalReads === true,
     physicalReadPhase: 'command',
+    ...(options.fanoutBudget ? { fanoutBudget: options.fanoutBudget } : {}),
+    retainFullChatStates: options.retainFullChatStates !== false,
+    fanoutReadRows: 0,
+    fanoutWriteRows: 0,
+    fanoutBytes: 0,
+    fanoutLargestValueBytes: 0,
   }
   journals.set(transaction, journal)
   try {
@@ -263,6 +336,18 @@ export async function runBrowserCommandTransaction<T>(
           [...(journal.finalizationPhysicalReads?.values() ?? [])]
             .map((read) => Object.freeze({ ...read }))
             .sort(comparePhysicalReads),
+        ),
+        readConflictAddresses: Object.freeze([...(journal.readConflictAddresses ?? [])].sort()),
+        readConflictScopes: Object.freeze(
+          [...(journal.readConflictScopes?.values() ?? [])]
+            .map((scope) =>
+              Object.freeze({
+                ...scope,
+                keyPath: cloneReadConflictKeyPath(scope.keyPath),
+                range: Object.freeze(structuredClone(scope.range)),
+              }),
+            )
+            .sort(compareReadConflictScopes),
         ),
         physicalOwnerScopes: Object.freeze(
           [...journal.physicalOwnerScopes.values()].map((scope) =>
@@ -304,10 +389,10 @@ export async function runBrowserCommandTransaction<T>(
         ),
         chatStates: Object.freeze(
           chatIds.map((chatId) => {
-            const chat = requiredFinalChatState(journal, chatId)
+            const chat = finalChatState(journal, chatId)
             return Object.freeze({
               chatId,
-              chat: chat ? structuredClone(chat) : null,
+              ...(chat === undefined ? {} : { chat: chat ? structuredClone(chat) : null }),
               initialExists: requiredInitialChatExistence(journal, chatId),
             })
           }),
@@ -452,9 +537,16 @@ export function recordBrowserCommandDiscoveryCacheMaintenance(tx: Transaction): 
 }
 
 export function recordBrowserCommandAttachmentIntegrityMaintenance(tx: Transaction): void {
-  const journal = requireMutationJournal(tx)
-  journal.internalMutationEvidence.add(INTERNAL_ATTACHMENT_INTEGRITY_MAINTENANCE)
-  journal.invalidations.push({ kind: 'attachment' })
+  requireMutationJournal(tx).internalMutationEvidence.add(INTERNAL_ATTACHMENT_INTEGRITY_MAINTENANCE)
+}
+
+export function recordBrowserCommandAttachmentIntegrityRepairRequest(tx: Transaction): void {
+  recordBrowserCommandAttachmentIntegrityMaintenance(tx)
+  const dependency = {
+    kind: 'storage-maintenance' as const,
+    tasks: ['reconcile-attachment-integrity'] as const,
+  }
+  recordBrowserCommandInvalidation(tx, dependency)
 }
 
 export function recordBrowserCommandAttachmentPayloadDeletion(
@@ -644,17 +736,25 @@ const browserCommandMutationMiddleware: Middleware<DBCore> = {
   level: 3,
   create: (down) => ({
     ...down,
+    transaction: (stores, mode, options) =>
+      down.transaction(
+        mode === 'readwrite' ? [...browserWorkspaceCatchupTransactionTableNames(stores)] : stores,
+        mode,
+        options,
+      ),
     table: (tableName) => {
       const table = down.table(tableName)
       return {
         ...table,
         get: async (request) => {
-          const result = await table.get(request)
+          const result = (await table.get(request)) as unknown
           recordPhysicalRead(request.trans, tableName, 'get', undefined, 1, 1, 'single', result)
+          recordReadConflictKeys(request.trans, tableName, [request.key])
           return result
         },
         getMany: async (request) => {
-          const result = await table.getMany(request)
+          assertFanoutReadRequestWithinBudget(request.trans, request.keys.length)
+          const result = dbCoreResultArray((await table.getMany(request)) as unknown)
           recordPhysicalRead(
             request.trans,
             tableName,
@@ -665,10 +765,11 @@ const browserCommandMutationMiddleware: Middleware<DBCore> = {
             'many',
             result,
           )
+          recordReadConflictKeys(request.trans, tableName, request.keys)
           return result
         },
         query: async (request) => {
-          const result = await table.query(request)
+          const result = await table.query(boundedFanoutQueryRequest(request))
           recordPhysicalRead(
             request.trans,
             tableName,
@@ -679,6 +780,37 @@ const browserCommandMutationMiddleware: Middleware<DBCore> = {
             'many',
             result.result,
           )
+          const physicalIndex = request.query.index.lowLevelIndex ?? request.query.index
+          const primary = physicalIndex.isPrimaryKey === true || physicalIndex.name === null
+          recordReadConflictScope(
+            request.trans,
+            tableName,
+            request.query.index,
+            request.query.range,
+            request.values === false && !primary,
+          )
+          if (request.values === false) {
+            if (primary) {
+              recordReadConflictKeys(
+                request.trans,
+                tableName,
+                dbCoreResultArray(result.result as unknown),
+              )
+            }
+          } else {
+            const extractKey = table.schema.primaryKey.extractKey
+            if (!extractKey && result.result.length > 0) {
+              throw new Error(`BrowserCommandReadConflictPrimaryKeyMissing:${tableName}`)
+            }
+            recordReadConflictKeys(
+              request.trans,
+              tableName,
+              dbCoreResultArray(result.result as unknown).flatMap((value) => {
+                const key = extractKey?.(value) as unknown
+                return key === undefined ? [] : [key]
+              }),
+            )
+          }
           return result
         },
         count: async (request) => {
@@ -693,12 +825,28 @@ const browserCommandMutationMiddleware: Middleware<DBCore> = {
             'none',
             undefined,
           )
+          recordReadConflictScope(
+            request.trans,
+            tableName,
+            request.query.index,
+            request.query.range,
+            true,
+          )
           return result
         },
         openCursor: async (request) => {
-          const observePhysicalReads = journals.get(request.trans)?.observePhysicalReads === true
+          const journal = journals.get(request.trans)
+          const observePhysicalReads = journal?.observePhysicalReads === true
+          const observeFanout = journal?.fanoutBudget !== undefined
           const cursor = await table.openCursor(request)
-          if (!observePhysicalReads) return cursor
+          if (!observePhysicalReads && !observeFanout) return cursor
+          recordReadConflictScope(
+            request.trans,
+            tableName,
+            request.query.index,
+            request.query.range,
+            false,
+          )
           if (!cursor) {
             recordPhysicalRead(
               request.trans,
@@ -717,6 +865,7 @@ const browserCommandMutationMiddleware: Middleware<DBCore> = {
           cursor.start = (callback) =>
             start(() => {
               requestRows += 1
+              recordReadConflictKeys(request.trans, tableName, [cursor.primaryKey])
               recordPhysicalRead(
                 request.trans,
                 tableName,
@@ -772,12 +921,24 @@ const browserCommandMutationMiddleware: Middleware<DBCore> = {
             )
           }
           const requested = requestedMutationCount(request)
-          if (requested > 0) recordPhysicalWriteRequest(journal, tableName, request)
+          if (requested > 0) {
+            consumeFanoutWrite(journal, request)
+            recordPhysicalWriteRequest(journal, tableName, request)
+          }
           try {
             const response = await table.mutate(request)
             if (requested === 0) return response
             const successful = Math.max(0, requested - response.numFailures)
             if (successful === 0) return response
+            await recordBrowserWorkspaceCatchupMutations(
+              down,
+              request.trans,
+              tableName,
+              table.schema.primaryKey.extractKey,
+              request,
+              response,
+              journal.catchupActiveByTable,
+            )
             journal.tableNames.add(tableName)
             journal.successfulMutations += successful
             recordSuccessfulPhysicalMutations(
@@ -818,6 +979,7 @@ function recordPhysicalRead(
   countRequest = true,
 ): void {
   const journal = journals.get(transaction)
+  if (journal) consumeFanoutRead(journal, rowCount, payloadKind, payload)
   if (!journal?.observePhysicalReads) return
   const physicalReads =
     journal.physicalReadPhase === 'command'
@@ -858,6 +1020,144 @@ function recordPhysicalRead(
   })
 }
 
+function boundedFanoutQueryRequest(request: DBCoreQueryRequest): DBCoreQueryRequest {
+  const journal = journals.get(request.trans)
+  const budget = journal?.fanoutBudget
+  if (!journal || !budget) return request
+  const remaining = Math.max(0, budget.maxReadRows - journal.fanoutReadRows)
+  const limit = Math.min(request.limit ?? Number.MAX_SAFE_INTEGER, remaining + 1)
+  return { ...request, limit }
+}
+
+function assertFanoutReadRequestWithinBudget(
+  transaction: DBCoreTransaction,
+  requestedRows: number,
+): void {
+  const journal = journals.get(transaction)
+  const budget = journal?.fanoutBudget
+  if (!journal || !budget) return
+  const observed = saturatingCount(journal.fanoutReadRows, requestedRows)
+  if (observed > budget.maxReadRows) {
+    throw new BrowserCommandFanoutBudgetExceededError('read-rows', observed, budget.maxReadRows)
+  }
+}
+
+function consumeFanoutRead(
+  journal: MutableMutationJournal,
+  rowCount: number,
+  payloadKind: 'none' | 'single' | 'many',
+  payload: unknown,
+): void {
+  const budget = journal.fanoutBudget
+  if (!budget) return
+  const rows = saturatingCount(journal.fanoutReadRows, rowCount)
+  if (rows > budget.maxReadRows) {
+    throw new BrowserCommandFanoutBudgetExceededError('read-rows', rows, budget.maxReadRows)
+  }
+  const values =
+    payloadKind === 'none'
+      ? []
+      : payloadKind === 'single'
+        ? [payload]
+        : ((payload as readonly unknown[] | undefined) ?? [])
+  consumeFanoutValues(journal, values)
+  journal.fanoutReadRows = rows
+}
+
+function consumeFanoutWrite(journal: MutableMutationJournal, request: DBCoreMutateRequest): void {
+  const budget = journal.fanoutBudget
+  if (!budget) return
+  const rowCount = requestedMutationCount(request)
+  const rows = saturatingCount(journal.fanoutWriteRows, rowCount)
+  if (rows > budget.maxWriteRows) {
+    throw new BrowserCommandFanoutBudgetExceededError('write-rows', rows, budget.maxWriteRows)
+  }
+  const values =
+    request.type === 'delete' || request.type === 'deleteRange'
+      ? []
+      : (request.values as readonly unknown[])
+  consumeFanoutValues(journal, values)
+  journal.fanoutWriteRows = rows
+}
+
+function consumeFanoutValues(journal: MutableMutationJournal, values: readonly unknown[]): void {
+  const budget = journal.fanoutBudget
+  if (!budget) return
+  let totalBytes = journal.fanoutBytes
+  let largestValueBytes = journal.fanoutLargestValueBytes
+  for (const value of values) {
+    if (value === undefined) continue
+    const valueBytes = estimateStoredValueBytes(value)
+    totalBytes = saturatingCount(totalBytes, valueBytes)
+    largestValueBytes = Math.max(largestValueBytes, valueBytes)
+  }
+  const boundedBytes = Math.max(0, totalBytes - largestValueBytes)
+  if (boundedBytes > budget.maxBytes) {
+    throw new BrowserCommandFanoutBudgetExceededError('bytes', boundedBytes, budget.maxBytes)
+  }
+  journal.fanoutBytes = totalBytes
+  journal.fanoutLargestValueBytes = largestValueBytes
+}
+
+function recordReadConflictKeys(
+  transaction: DBCoreTransaction,
+  tableName: string,
+  keys: readonly unknown[],
+): void {
+  const addresses = journals.get(transaction)?.readConflictAddresses
+  if (!addresses) return
+  for (const key of keys) {
+    addresses.add(physicalStorageMutationAddress(tableName as PhysicalStorageTableName, key))
+  }
+}
+
+function recordReadConflictScope(
+  transaction: DBCoreTransaction,
+  tableName: string,
+  requestedIndex: DBCoreIndex,
+  range: DBCoreKeyRange,
+  anyMutation: boolean,
+): void {
+  const scopes = journals.get(transaction)?.readConflictScopes
+  if (!scopes) return
+  const physicalIndex = requestedIndex.lowLevelIndex ?? requestedIndex
+  const primary = physicalIndex.isPrimaryKey === true || physicalIndex.name === null
+  const indexName = primary ? undefined : physicalIndex.name
+  if (!primary && !indexName) {
+    throw new Error(`BrowserCommandReadConflictIndexMissing:${tableName}`)
+  }
+  const keyPath = cloneReadConflictKeyPath(physicalIndex.keyPath)
+  const scope: BrowserCommandReadConflictScope = {
+    tableName,
+    ...(indexName ? { indexName } : {}),
+    keyPath,
+    range: Object.freeze(structuredClone(range)),
+    anyMutation,
+  }
+  const key = JSON.stringify([
+    scope.tableName,
+    scope.indexName ?? ':id',
+    scope.keyPath,
+    scope.range,
+  ])
+  const current = scopes.get(key)
+  if (current?.anyMutation || current?.anyMutation === anyMutation) return
+  scopes.set(key, Object.freeze({ ...scope, anyMutation: true }))
+}
+
+function dbCoreResultArray(value: unknown): unknown[] {
+  if (!Array.isArray(value)) throw new Error('BrowserCommandDbCoreResultInvalid')
+  return value
+}
+
+function cloneReadConflictKeyPath(value: unknown): string | readonly string[] | null {
+  if (value === null || typeof value === 'string') return value
+  if (Array.isArray(value) && value.every((part): part is string => typeof part === 'string')) {
+    return Object.freeze([...value])
+  }
+  throw new Error('BrowserCommandReadConflictKeyPathInvalid')
+}
+
 function estimatePresentStoredValues(values: readonly unknown[]): number {
   let estimatedBytes = 0
   for (const value of values) {
@@ -865,6 +1165,20 @@ function estimatePresentStoredValues(values: readonly unknown[]): number {
     estimatedBytes = saturatingCount(estimatedBytes, estimateStoredValueBytes(value))
   }
   return estimatedBytes
+}
+
+function compareReadConflictScopes(
+  left: BrowserCommandReadConflictScope,
+  right: BrowserCommandReadConflictScope,
+): number {
+  return JSON.stringify([
+    left.tableName,
+    left.indexName ?? ':id',
+    left.keyPath,
+    left.range,
+  ]).localeCompare(
+    JSON.stringify([right.tableName, right.indexName ?? ':id', right.keyPath, right.range]),
+  )
 }
 
 function comparePhysicalReads(
@@ -1164,7 +1478,11 @@ function recordSuccessfulChatMutations(
         const chatId = (value as { id?: unknown }).id
         if (typeof chatId !== 'string') throw new Error('BrowserCommandChatMutationIdMissing')
         journal.chatIds.add(chatId)
-        journal.finalChatById.set(chatId, value as Chat)
+        if (journal.retainFullChatStates || request.type === 'add') {
+          journal.finalChatById.set(chatId, value as Chat)
+        } else {
+          journal.finalChatById.delete(chatId)
+        }
         if (!journal.initialChatExistsById.has(chatId)) {
           journal.initialChatExistsById.set(chatId, request.type !== 'add')
         }
@@ -1192,10 +1510,11 @@ function requiredInitialChatExistence(journal: MutableMutationJournal, chatId: C
   return exists
 }
 
-function requiredFinalChatState(journal: MutableMutationJournal, chatId: ChatId): Chat | null {
-  const chat = journal.finalChatById.get(chatId)
-  if (chat === undefined) throw new Error(`BrowserCommandChatFinalStateMissing:${chatId}`)
-  return chat
+function finalChatState(journal: MutableMutationJournal, chatId: ChatId): Chat | null | undefined {
+  if (!journal.chatIds.has(chatId)) {
+    throw new Error(`BrowserCommandChatFinalStateMissing:${chatId}`)
+  }
+  return journal.finalChatById.get(chatId)
 }
 
 function requestedMutationCount(request: DBCoreMutateRequest): number {

@@ -10,7 +10,10 @@ import { newId } from '../lib/ulid'
 import { prepareAttachmentBytes, prepareRemoteAttachment } from './attachments'
 import { resolveCapturedKeyProofForUse } from './keys'
 import { subscribeWorkspaceEffects, WORKSPACE_EFFECT_RECOVERY_OWNED } from './workspace-effect-hub'
-import type { GeneratedOutputLocalizationClaim } from './workspace-protocol'
+import type {
+  GeneratedOutputLocalizationClaim,
+  GeneratedOutputLocalizationTarget,
+} from './workspace-protocol'
 import { getWorkspaceRepository } from './workspace-repository'
 import {
   isWorkspaceRuntimeClosedError,
@@ -139,11 +142,11 @@ async function pump(cycle: number): Promise<void> {
   )
   if (!isCurrent(cycle)) return
   if (snapshot.nextWakeAt !== undefined) scheduleWake(snapshot.nextWakeAt)
-  for (const jobId of snapshot.readyJobIds.slice(0, slots)) startJob(jobId, cycle)
+  for (const target of snapshot.readyJobs.slice(0, slots)) startJob(target, cycle)
 }
 
-function startJob(jobId: string, cycle: number): void {
-  const operation = processJob(jobId, cycle)
+function startJob(target: GeneratedOutputLocalizationTarget, cycle: number): void {
+  const operation = processJob(target, cycle)
     .catch((error) => {
       if (!isWorkspaceRuntimeClosedError(error) && !isAbortError(error)) {
         console.error('Generated output localization failed', error)
@@ -156,13 +159,13 @@ function startJob(jobId: string, cycle: number): void {
   active.add(operation)
 }
 
-async function processJob(jobId: string, cycle: number): Promise<void> {
+async function processJob(target: GeneratedOutputLocalizationTarget, cycle: number): Promise<void> {
   if (!isCurrent(cycle)) return
-  await runWorkspaceAction('attachment', (permit) => processJobWithPermit(jobId, cycle, permit))
+  await runWorkspaceAction('attachment', (permit) => processJobWithPermit(target, cycle, permit))
 }
 
 async function processJobWithPermit(
-  jobId: string,
+  target: GeneratedOutputLocalizationTarget,
   cycle: number,
   permit: WorkspaceWritePermit,
 ): Promise<void> {
@@ -172,13 +175,14 @@ async function processJobWithPermit(
   const claim = await getWorkspaceRepository()
     .execute(permit, {
       kind: 'generated-output.localization-claim',
-      input: { jobId, leaseId, now, leaseExpiresAt: now + LEASE_TTL_MS },
+      input: { ...target, leaseId, now, leaseExpiresAt: now + LEASE_TTL_MS },
     })
     .then((commit) => commit.value)
   if (!claim) return
   if (!isCurrent(cycle)) {
     await retryClaim(
       claim.job.id,
+      claim.attachment.id,
       claim.job.leaseId ?? leaseId,
       {
         code: 'workspace-transition',
@@ -211,6 +215,7 @@ async function processJobWithPermit(
     if (!isCurrent(cycle)) {
       await retryClaim(
         claim.job.id,
+        claim.attachment.id,
         claim.job.leaseId ?? leaseId,
         {
           code: 'workspace-transition',
@@ -225,6 +230,7 @@ async function processJobWithPermit(
     }
     await retryClaim(
       claim.job.id,
+      claim.attachment.id,
       claim.job.leaseId ?? leaseId,
       generatedOutputError(error),
       retryDelay(claim.job.attemptCount),
@@ -260,6 +266,7 @@ async function processRemoteDownload(
     kind: 'generated-output.localization-complete',
     input: {
       jobId: claim.job.id,
+      attachmentId: claim.attachment.id,
       leaseId: claim.job.leaseId ?? '',
       bundle,
       now: Date.now(),
@@ -279,6 +286,7 @@ async function processVideoPollingJob(
   if (snapshot.failureMessage) {
     await failClaim(
       claim.job.id,
+      claim.attachment.id,
       claim.job.leaseId ?? '',
       { code: 'video-generation-failed', message: snapshot.failureMessage },
       cycle,
@@ -289,6 +297,7 @@ async function processVideoPollingJob(
   if (snapshot.urls.length === 0) {
     await retryClaim(
       claim.job.id,
+      claim.attachment.id,
       claim.job.leaseId ?? '',
       {
         code: 'video-generation-pending',
@@ -318,19 +327,38 @@ async function processVideoPollingJob(
     ),
   )
   signal.throwIfAborted()
-  await getWorkspaceRepository().execute(permit, {
-    kind: 'generated-output.video-expand',
-    input: {
-      jobId: claim.job.id,
-      leaseId: claim.job.leaseId ?? '',
-      attachmentBundles: bundles,
-      now,
-    },
-  })
+  const expansion = await getWorkspaceRepository()
+    .execute(permit, {
+      kind: 'generated-output.video-expand',
+      input: {
+        jobId: claim.job.id,
+        attachmentId: claim.attachment.id,
+        leaseId: claim.job.leaseId ?? '',
+        attachmentBundles: bundles,
+        now,
+      },
+    })
+    .then((commit) => commit.value)
+  if (expansion.outcome === 'plan-changed') {
+    await retryClaim(
+      claim.job.id,
+      claim.attachment.id,
+      claim.job.leaseId ?? '',
+      {
+        code: 'video-expansion-plan-changed',
+        message: 'Video references changed while the generated output was being expanded.',
+      },
+      0,
+      cycle,
+      permit,
+      false,
+    )
+  }
 }
 
 async function retryClaim(
   jobId: string,
+  attachmentId: string,
   leaseId: string,
   error: { code: string; message: string },
   delayMs: number,
@@ -344,6 +372,7 @@ async function retryClaim(
     kind: 'generated-output.localization-retry',
     input: {
       jobId,
+      attachmentId,
       leaseId,
       error,
       nextAttemptAt: now + delayMs,
@@ -355,6 +384,7 @@ async function retryClaim(
 
 async function failClaim(
   jobId: string,
+  attachmentId: string,
   leaseId: string,
   error: { code: string; message: string },
   cycle: number,
@@ -363,7 +393,7 @@ async function failClaim(
   if (!isCurrent(cycle)) return
   await getWorkspaceRepository().execute(permit, {
     kind: 'generated-output.localization-fail',
-    input: { jobId, leaseId, error, now: Date.now() },
+    input: { jobId, attachmentId, leaseId, error, now: Date.now() },
   })
 }
 

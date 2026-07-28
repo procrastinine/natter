@@ -7,6 +7,15 @@ export const UNION_INVENTORY_SCHEMA_VERSION = 2
 
 export const PRODUCTION_DISCRIMINATED_UNION_SEMANTICS = Object.freeze({
   roleOverrides: Object.freeze([
+    role('src/store/browser-repo.ts#BrowserCommandFanoutAdmission|kind', 'result'),
+    role(
+      'src/store/browser-workspace-database-cleanup.ts#QuiescedBrowserWorkspaceReplacementRecovery|kind',
+      'result',
+    ),
+    role(
+      'src/store/browser-workspace-replacement-runner.ts#BrowserWorkspaceReplacementWork|kind',
+      'command',
+    ),
     role(
       'src/store/semantic-operation-capability.ts#SemanticOperationExactPhysicalMutation|operation',
       'data',
@@ -59,6 +68,10 @@ export const PRODUCTION_DISCRIMINATED_UNION_SEMANTICS = Object.freeze({
     ),
   ]),
   constructionCompositionReviews: Object.freeze([
+    composition(
+      'src/store/browser-workspace-replacement-runner.ts#BrowserWorkspaceReplacementWork|kind',
+      'The private generic work envelope is constructed only by the two typed replacement-work factories; the durable command audit owns its exact variants and dispatch.',
+    ),
     composition(
       'src/store/repository.ts#StreamLeaseProgress|phase',
       'Private generic phase constituent is composed into StreamLeaseByAttempt and StreamLeaseRow; no standalone constructor is expected.',

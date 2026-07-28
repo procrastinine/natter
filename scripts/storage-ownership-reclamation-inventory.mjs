@@ -2,7 +2,7 @@ const TABLE_GAPS = Object.freeze(['logical-debt-does-not-measure-physical-amplif
 
 const TABLE_TESTS = Object.freeze(['tests/unit/byte-owner-boundary.test.ts'])
 
-export const STORAGE_TABLE_OWNERSHIP = Object.freeze([
+const BASE_STORAGE_TABLE_OWNERSHIP = Object.freeze([
   table('attachmentArtifacts', 'canonical', 'authoritative', 'filtered-copy', 'attachment-domain', {
     ownerPath: 'src/store/attachment-storage.ts',
     sizeDriver: 'Extracted text, generated thumbnails, and processor artifacts per attachment.',
@@ -580,6 +580,34 @@ export const STORAGE_TABLE_OWNERSHIP = Object.freeze([
   ),
 ])
 
+export const STORAGE_TABLE_OWNERSHIP = Object.freeze([
+  ...BASE_STORAGE_TABLE_OWNERSHIP,
+  ...BASE_STORAGE_TABLE_OWNERSHIP.filter(
+    (entry) => entry.compaction === 'copy' || entry.compaction === 'filtered-copy',
+  ).map((entry) =>
+    table(
+      `replacementCatchup__${entry.name}`,
+      'canonical',
+      'journal',
+      'seed',
+      'workspace-replacement-catchup',
+      {
+        ownerPath: 'src/store/browser-workspace-catchup-journal.ts',
+        sizeDriver:
+          'At most one latest changed-key/revision row per source key since staged-copy admission.',
+        debtPolicy: 'specialized-journal-port',
+        retention: 'rebuild-on-repair',
+        rebuild: 'journal-recovery',
+        interchange: 'omitted-from-import',
+        normalReclamation:
+          'All companion journals clear atomically at staged-copy admission; the destination starts empty and obsolete-slot deletion removes any residual source rows.',
+        multiTab: 'workspace-write-lock-changefeed',
+        tests: ['tests/unit/browser-command-mutation-journal.test.ts'],
+      },
+    ),
+  ),
+])
+
 export const ORIGIN_STORAGE_NAMESPACES = Object.freeze([
   namespace('idb-control', 'indexeddb', 'natter-control', 'src/lib/origin-storage-names.ts', {
     ownership: 'Control manifest and replacement journal.',
@@ -587,7 +615,7 @@ export const ORIGIN_STORAGE_NAMESPACES = Object.freeze([
     wipeCoverage: 'known-name-and-enumeration',
   }),
   namespace('idb-workspace-legacy', 'indexeddb', 'natter', 'src/lib/origin-storage-names.ts', {
-    ownership: 'Initial/legacy workspace slot containing all 44 physical workspace tables.',
+    ownership: 'Initial/legacy workspace slot containing every current physical workspace table.',
     normalReclamation:
       'The active slot is retained; every inactive registered slot is exclusively swept by normal background retention.',
     wipeCoverage: 'known-name-and-enumeration',
@@ -841,8 +869,8 @@ export const STORAGE_LIFECYCLE_PATHS = Object.freeze([
   lifecycle(
     'compaction-attempt-release',
     'src/store/browser-workspace-compaction.ts',
-    'const release = await claim.release()',
-    'The exact claimed revision is released only after typed foreground-maintenance preemption; the idempotent capability creates one newer durable request and publishes the existing maintenance wake, while permanent or uncertain outcomes retain the claim.',
+    'function isRetryableBrowserWorkspaceCompactionError(error: unknown): boolean {',
+    'The exact claimed revision is released only after typed maintenance preemption, bounded catch-up overflow, or an unpromoted staged-copy cleanup; the idempotent capability creates one newer durable request and publishes the existing maintenance wake, while permanent or uncertain outcomes retain the claim.',
     [],
   ),
   lifecycle(
@@ -856,7 +884,7 @@ export const STORAGE_LIFECYCLE_PATHS = Object.freeze([
     'bounded-retention-pass',
     'src/store/storage-maintenance-runtime.ts',
     'async #runSlice(task: StorageMaintenanceTask): Promise<StorageMaintenanceSliceOutcome> {',
-    'Batches repair, orphan attachments, terminal stream journals, empty draft chats, and discovery-cache maintenance.',
+    'Batches repair, orphan attachments, terminal stream journals, empty draft chats, and discovery-cache maintenance. Attachment repair persists owner and reverse-reference cursors and caps each page at 16 edge rows or 256 KiB plus one largest row.',
     [],
   ),
   lifecycle(
@@ -877,14 +905,14 @@ export const STORAGE_LIFECYCLE_PATHS = Object.freeze([
     'idle-compaction-admission',
     'src/store/storage-maintenance-runtime.ts',
     'async #runCompactionSlice(): Promise<StorageMaintenanceSliceOutcome> {',
-    'Compaction starts only when the aggregate workspace runtime reports idle.',
-    ['compaction-quiesces-whole-runtime'],
+    'Compaction starts online only when the aggregate workspace runtime reports idle; later foreground work remains admitted while the staged copy catches up.',
+    [],
   ),
   lifecycle(
     'paged-compaction-copy',
     'src/store/browser-workspace-compaction.ts',
     'async function copyBrowserWorkspace(',
-    'Applies the physical manifest: copy actions use 64-row or 1-MiB pages, cache/drop and seed actions avoid source bytes, and repairable projections rebuild from canonical destination rows.',
+    'Applies the physical manifest online in 64-row or 1-MiB pages, catches up per-table changed-key journals, and bounds the final quiesced activation to 256 rows or 4 MiB.',
     ['logical-debt-does-not-measure-physical-amplification'],
   ),
   lifecycle(
@@ -892,6 +920,13 @@ export const STORAGE_LIFECYCLE_PATHS = Object.freeze([
     'src/store/browser-workspace-database-cleanup.ts',
     'export async function cleanPendingBrowserWorkspaceDatabase(',
     'The existing cross-tab retention owner locks only the obsolete slot, revalidates the exact journal, deletes it, and acknowledges cleanup outside workspace readiness.',
+    [],
+  ),
+  lifecycle(
+    'journal-authorized-peer-recovery',
+    'src/store/browser-workspace-database-cleanup.ts',
+    'export function recoverQuiescedBrowserWorkspaceReplacement(',
+    'A quiesced peer queues on the durable selection Web Lock, reconciles preparing or cleanup state from the authoritative manifest, deletes only the obsolete slot, and reopens the selected database without a resume message or timer.',
     [],
   ),
   lifecycle(
@@ -974,12 +1009,6 @@ export const STORAGE_RECLAMATION_GAPS = Object.freeze([
     'expect(measurement.afterDeleteBytes).toBeGreaterThanOrEqual(measurement.beforeBytes)',
     'Chromium may retain origin quota accounting after object-store or database deletion; the app can prove namespace deletion but cannot force or infer engine compaction from StorageManager usage.',
   ),
-  gap(
-    'compaction-quiesces-whole-runtime',
-    'src/store/browser-workspace-replacement-runner.ts',
-    'async function runSlottedBrowserWorkspaceReplacement<T>(',
-    'Compaction enters the aggregate replacement path and quiesces every runtime resource instead of isolating storage copy/switch readiness from painted interaction capability.',
-  ),
 ])
 
 export const STORAGE_RECLAMATION_ACCEPTANCE = Object.freeze([
@@ -992,6 +1021,7 @@ export const STORAGE_RECLAMATION_ACCEPTANCE = Object.freeze([
   'Clear all deletes and verifies every browser namespace available to the origin while reporting unverifiable browser limits honestly.',
   'A real-browser Natter compaction test proves debt, idle admission, slot switch, old-slot deletion, reload, and multi-tab continuity without relying on quota-estimate reduction.',
   'Storage maintenance never gates shell navigation, local drafting, or active stream controls.',
+  'Foreground writes during staged compaction are caught up without repeating the whole copy, and activation quiesces only for a bounded residual journal.',
 ])
 
 function table(name, schemaClass, dataClass, compaction, owner, detail) {

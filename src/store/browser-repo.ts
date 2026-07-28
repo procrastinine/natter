@@ -31,7 +31,9 @@ import {
   type ConversationDestinationPoint,
   type ConversationSelectionProofTarget,
   fixedConversationSelectionTarget,
+  type MessageEditPreflightReader,
   type MessageMutationRepository,
+  type MessageStructurePreflightReader,
 } from '../core/messages'
 import {
   normalizeRenderingPreferences,
@@ -94,6 +96,7 @@ import { readActiveBranchForksInTransaction } from './active-branch-fork-storage
 import { ATTACHMENT_CATALOG_MUTATION_TRANSACTION_CAPABILITY } from './attachment-catalog-projection'
 import {
   ATTACHMENT_INTEGRITY_TRANSACTION_CAPABILITY,
+  type AttachmentIntegrityStateRow,
   reconcileAttachmentIntegrityPage,
 } from './attachment-integrity-maintenance'
 import { liveAttachmentRefs, normalizeAttachmentRefs } from './attachment-refs'
@@ -119,12 +122,15 @@ import {
 } from './browser-catalog-queries'
 import {
   type AttachmentReferenceStateFact,
+  type BrowserCommandFanoutBudget,
   type BrowserCommandMessageRevisionFact,
   type BrowserCommandMutationFacts,
   type BrowserCommandPhysicalMutation,
   type BrowserCommandPhysicalOwnerScope,
+  type BrowserCommandReadConflictScope,
   INTERNAL_ATTACHMENT_INTEGRITY_MAINTENANCE,
   INTERNAL_DISCOVERY_CACHE_MAINTENANCE,
+  isBrowserCommandFanoutBudgetExceededError,
   recordBrowserCommandInvalidation,
   recordBrowserCommandStorageRetentionMutation,
   runBrowserCommandTransaction,
@@ -159,6 +165,11 @@ import {
   readStreamLeasePages,
   readStringPrimaryKeyPages,
 } from './browser-query-pages'
+import {
+  type BrowserStagedCommandConflictEvidence,
+  type BrowserStagedCommandExecution,
+  isBrowserWorkspaceStagedFanoutCommand,
+} from './browser-staged-fanout-command'
 import {
   boundedMaintenanceLimit,
   MAX_STORAGE_MAINTENANCE_BATCH,
@@ -339,7 +350,9 @@ import {
   type SemanticOperationCommandLifetimeReceipt,
   type SemanticOperationDescriptor,
   type SemanticOperationExactPhysicalRead,
+  type SemanticOperationExactPlan,
   type SemanticOperationExactReceipt,
+  type SemanticOperationExactReceiptAccumulator,
   type SemanticOperationExecution,
   type SemanticOperationKind,
   type SemanticOperationPhysicalBounds,
@@ -348,11 +361,13 @@ import {
   type SemanticOperationReplayPlan,
   type SemanticOperationReplayToken,
   type SemanticOperationRunner,
+  semanticOperationCallerSingleAttemptReplayContract,
   semanticOperationCommandLifetimeReceipt,
   semanticOperationCommandLifetimeReceiptWithPhysicalReads,
   semanticOperationCommandLifetimeReceiptWithPreflight,
   semanticOperationDelegationCapability,
   semanticOperationDescriptor,
+  semanticOperationExactOccurrenceReceipt,
   semanticOperationExactPlan,
   semanticOperationExactReceipt,
   semanticOperationExactReceiptContracts,
@@ -366,6 +381,8 @@ import {
 import {
   awaitStorageCompactionWriteAdmission,
   registerPhysicalMutationTransaction,
+  type StorageCompactionWriteAdmission,
+  stagedStorageCompactionWriteAdmission,
 } from './storage-compaction-state'
 import {
   type AttachmentReapCursor,
@@ -415,6 +432,7 @@ import type {
   AttachmentRefAddInput,
   AttachmentRefDetachInput,
   AttachmentReferenceRow,
+  AttachmentRefMutationOwner,
   AttachmentRefOwner,
   AttachmentRefRelinkInput,
   AttachmentRefRelinkResult,
@@ -688,6 +706,14 @@ interface TerminalStreamRetentionResourceInput {
   readonly limit: number
 }
 
+interface EmptyDraftRetentionResourceInput {
+  readonly limit: number
+}
+
+interface AttachmentIntegrityResourceInput {
+  readonly limit: number
+}
+
 interface TerminalStreamRetentionResult {
   readonly scanned: number
   readonly deletedStreamIds: string[]
@@ -697,11 +723,19 @@ interface TerminalStreamRetentionResult {
 }
 
 function assertDurablePageReplayProof(
-  owner: 'stream-journal-integrity' | 'storage-retention:terminal-stream-prune',
+  owner:
+    | 'attachment-integrity:maintenance'
+    | 'stream-journal-integrity'
+    | 'storage-retention:empty-draft-prune'
+    | 'storage-retention:terminal-stream-prune',
   limit: number,
-  receipt: SemanticOperationExactReceipt,
+  receipt: SemanticOperationExactReceipt<
+    PhysicalStorageTableName,
+    SemanticOperationExactPlan | undefined
+  >,
 ): void {
-  const replay = receipt.plan.replay
+  const replay = receipt.replay
+  if (!replay) throw new Error(`DurablePageReplayProofMissing:${owner}`)
   if (replay.kind !== 'durable-page-resume' || replay.owner !== owner || replay.limit !== limit) {
     throw new Error(`DurablePageReplayProofMismatch:${owner}`)
   }
@@ -768,6 +802,36 @@ function terminalStreamRetentionReplayPlan(
   }
 }
 
+function emptyDraftRetentionReplayPlan(
+  cycle: StorageRetentionCycle<'empty-draft-prune'>,
+  limit: number,
+): SemanticOperationReplayPlan {
+  return {
+    kind: 'durable-page-resume',
+    owner: 'storage-retention:empty-draft-prune',
+    cycle: cycle.cycleNow,
+    revision: cycle.expectedRevision,
+    cursor: stableStringify(cycle.cursor ?? null),
+    doneMarker: `cutoff:${cycle.cutoff}`,
+    limit,
+  }
+}
+
+function attachmentIntegrityReplayPlan(
+  state: AttachmentIntegrityStateRow,
+  limit: number,
+): SemanticOperationReplayPlan {
+  return {
+    kind: 'durable-page-resume',
+    owner: 'attachment-integrity:maintenance',
+    cycle: state.repairVersion,
+    revision: stableStringify(state),
+    cursor: state.phase,
+    doneMarker: 'complete',
+    limit,
+  }
+}
+
 const TERMINAL_STREAM_RETENTION_OPERATION = semanticOperationDescriptor({
   operationKind: 'maintenance.prune-terminal-stream-journals',
   transaction: TERMINAL_STREAM_RETENTION_TRANSACTION_CAPABILITY,
@@ -790,11 +854,18 @@ const EMPTY_DRAFT_RETENTION_OPERATION = semanticOperationDescriptor({
   resources: () => ['storage-retention:empty-draft-prune'],
   permittedWrites: EMPTY_DRAFT_RETENTION_TRANSACTION_CAPABILITY.tableNames,
   requiredWritesWhenMutated: [],
-  effects: {
-    kind: 'effect-kinds',
-    permitted: ['attachment', 'chat', 'draft', 'profile', 'setting', 'sidebar', 'stream-chunks'],
-    requiredWhenMutated: () => [],
-  },
+  ...semanticOperationExactReceiptContracts<
+    EmptyDraftRetentionResourceInput,
+    PhysicalStorageTableName,
+    undefined
+  >(),
+  replay: semanticOperationExactReceiptReplayProofContract<
+    EmptyDraftRetentionResourceInput,
+    PhysicalStorageTableName,
+    undefined
+  >((input, receipt) =>
+    assertDurablePageReplayProof('storage-retention:empty-draft-prune', input.limit, receipt),
+  ),
 })
 
 interface DiscoveryCacheMaintenanceResourceInput {
@@ -836,11 +907,18 @@ const ATTACHMENT_INTEGRITY_OPERATION = semanticOperationDescriptor({
   resources: () => ['attachment-integrity:maintenance'],
   permittedWrites: ATTACHMENT_INTEGRITY_TRANSACTION_CAPABILITY.tableNames,
   requiredWritesWhenMutated: [],
-  effects: {
-    kind: 'effect-kinds',
-    permitted: ['attachment'],
-    requiredWhenMutated: () => ['attachment'],
-  },
+  ...semanticOperationExactReceiptContracts<
+    AttachmentIntegrityResourceInput,
+    PhysicalStorageTableName,
+    undefined
+  >(),
+  replay: semanticOperationExactReceiptReplayProofContract<
+    AttachmentIntegrityResourceInput,
+    PhysicalStorageTableName,
+    undefined
+  >((input, receipt) =>
+    assertDurablePageReplayProof('attachment-integrity:maintenance', input.limit, receipt),
+  ),
 })
 
 interface StreamOperationResourceInput {
@@ -1064,8 +1142,6 @@ function assertStreamLeaseReplayProof(
     if (
       expected.outcome !== 'request' ||
       expected.owner !== observed.owner ||
-      expected.localConvergence !== observed.localConvergence ||
-      expected.recovery !== observed.recovery ||
       stableStringify(expected.target) !== stableStringify(observed.target) ||
       observed.outcome === 'request'
     ) {
@@ -1458,27 +1534,12 @@ const CHAT_FORK_OPERATION = semanticOperationDescriptor({
     'messageBodies',
     'messagePreviews',
   ],
-  effects: {
-    kind: 'effect-kinds',
-    permitted: [
-      'attachment',
-      'chat',
-      'child-slot',
-      'message-body',
-      'message-header',
-      'message-preview',
-      'profile',
-      'sidebar',
-    ],
-    requiredWhenMutated: () => [
-      'chat',
-      'child-slot',
-      'message-body',
-      'message-header',
-      'message-preview',
-      'sidebar',
-    ],
-  },
+  ...semanticOperationExactReceiptContracts<
+    ChatForkResourceInput,
+    PhysicalStorageTableName,
+    undefined
+  >(),
+  replay: semanticOperationCallerSingleAttemptReplayContract('random-identity'),
 })
 type BrowserInterchangeQuery = Extract<WorkspaceQuery, { kind: `interchange.${string}` }>
 type BrowserConversationEnvelopeQuery = Extract<
@@ -2106,16 +2167,31 @@ function sidebarChatIdsForMutationFacts(facts: BrowserCommandMutationFacts): rea
     ...new Set(
       facts.physicalMutations.flatMap((mutation) => {
         if (mutation.tableName !== 'chatSidebarRows' || typeof mutation.key !== 'string') return []
-        return chatIds.has(mutation.key) ? [mutation.key as ChatId] : []
+        return chatIds.has(mutation.key) ? [mutation.key] : []
       }),
     ),
   ].sort()
 }
 
+export const BROWSER_COMMAND_DIRECT_FANOUT_BUDGET: BrowserCommandFanoutBudget = Object.freeze({
+  maxReadRows: 64,
+  maxWriteRows: 64,
+  maxBytes: 1024 * 1024,
+})
+
+export type BrowserCommandFanoutAdmission<C extends WorkspaceCommand> =
+  | {
+      readonly kind: 'committed'
+      readonly execution: BrowserStagedCommandExecution<C>
+    }
+  | { readonly kind: 'staging-required' }
+
 class BrowserCommandCommit implements BrowserCommandSessionPort {
   private readonly committedMutationTables = new Set<string>()
   private readonly physicalMutationsByAddress = new Map<string, BrowserCommandPhysicalMutation>()
   private readonly physicalOwnerScopesById = new Map<string, BrowserCommandPhysicalOwnerScope>()
+  private readonly readConflictAddresses = new Set<string>()
+  private readonly readConflictScopes = new Map<string, BrowserCommandReadConflictScope>()
   private readonly internalMutationEvidence = new Set<string>()
   private readonly messageRevisionsById = new Map<
     MessageId,
@@ -2127,7 +2203,7 @@ class BrowserCommandCommit implements BrowserCommandSessionPort {
     }
   >()
   private readonly childSlotsById = new Map<string, WorkspaceLocalChildSlotAccumulator>()
-  private readonly chatsById = new Map<ChatId, Chat | null>()
+  private readonly chatsById = new Map<ChatId, Chat | null | undefined>()
   private readonly initialChatExistsById = new Map<ChatId, boolean>()
   private readonly attachmentReferenceStates = new Map<AttachmentId, AttachmentReferenceStateFact>()
   private readonly attachmentRowsById = new Map<AttachmentId, boolean>()
@@ -2138,6 +2214,8 @@ class BrowserCommandCommit implements BrowserCommandSessionPort {
   private readonly lockSession: AuthoritativeCommandLockSession
   private readonly workspaceId: string
   private readonly replacementEpoch: number
+  private readonly fanoutBudget: BrowserCommandFanoutBudget | undefined
+  private readonly retainFullChatStates: boolean
   readonly command: WorkspaceCommand
   readonly operationKind: WorkspaceCommand['kind']
   private readonly semanticOperationKind: SemanticOperationKind
@@ -2155,6 +2233,8 @@ class BrowserCommandCommit implements BrowserCommandSessionPort {
     command: WorkspaceCommand,
     semanticOperationKind: SemanticOperationKind,
     commandLifetimeReceipt: SemanticOperationCommandLifetimeReceipt,
+    fanoutBudget?: BrowserCommandFanoutBudget,
+    retainFullChatStates = true,
   ) {
     this.db = db
     this.lockSession = lockSession
@@ -2165,6 +2245,8 @@ class BrowserCommandCommit implements BrowserCommandSessionPort {
     this.operationKind = command.kind
     this.semanticOperationKind = semanticOperationKind
     this.commandLifetimeReceipt = commandLifetimeReceipt
+    this.fanoutBudget = fanoutBudget
+    this.retainFullChatStates = retainFullChatStates
   }
 
   executeSemanticOperation<Tables extends PhysicalStorageTableName, ResourceInput, Receipt, T>(
@@ -2258,7 +2340,12 @@ class BrowserCommandCommit implements BrowserCommandSessionPort {
         runBrowserCommandTransaction(
           tx,
           (transaction) => operation(bindFencedTransaction(transaction, plan)),
-          { observePhysicalReads: true, observePhysicalWrites: true },
+          {
+            observePhysicalReads: true,
+            observePhysicalWrites: true,
+            ...(this.fanoutBudget ? { fanoutBudget: this.fanoutBudget } : {}),
+            retainFullChatStates: this.retainFullChatStates,
+          },
         ),
     )
     assertPhysicalTransactionTablesDeclared(plan, result.facts.tableNames)
@@ -2270,6 +2357,7 @@ class BrowserCommandCommit implements BrowserCommandSessionPort {
     ) {
       throw new Error('SemanticOperationPreflightMutationForbidden')
     }
+    this.recordReadConflictFacts(result.facts)
     this.commandLifetimeReceipt = exactPhysicalReads
       ? semanticOperationCommandLifetimeReceiptWithPreflight(
           this.commandLifetimeReceipt,
@@ -2370,16 +2458,21 @@ class BrowserCommandCommit implements BrowserCommandSessionPort {
         {
           observePhysicalReads: semanticOperation?.descriptor.exactPhysicalReads !== undefined,
           observePhysicalWrites: semanticOperation?.descriptor.exactPhysicalWrites !== undefined,
+          ...(this.fanoutBudget ? { fanoutBudget: this.fanoutBudget } : {}),
+          retainFullChatStates: this.retainFullChatStates,
         },
       )
       assertPhysicalTransactionTablesDeclared(plan, result.facts.tableNames)
       if (semanticOperation) {
-        const { descriptor, resourceInput, unwrap } = semanticOperation
-        const execution = unwrap(result.value.value)
+        const { descriptor, resourceInput } = semanticOperation
+        const execution = semanticOperation.unwrap(result.value.value)
         const physicalReads = [
           ...this.commandLifetimeReceipt.physicalReads,
           ...result.facts.physicalReads,
         ]
+        const observedDependencies = semanticDependenciesForMutationFacts(result.facts)
+        const hasExactReceiptSource =
+          descriptor.exactPhysicalWrites?.receiptSource === 'exact-receipt'
         const receipt = attachSemanticOperationPhysicalIo(
           attachSemanticOperationExactPhysicalReads(
             execution.receipt,
@@ -2387,6 +2480,8 @@ class BrowserCommandCommit implements BrowserCommandSessionPort {
           ),
           result.value.fragment,
           physicalReads,
+          hasExactReceiptSource ? observedDependencies : [],
+          hasExactReceiptSource ? result.facts.physicalMutations : [],
         )
         const tableNames = new Set(result.facts.tableNames)
         const didMutateStorage = result.facts.successfulMutations > 0
@@ -2401,7 +2496,7 @@ class BrowserCommandCommit implements BrowserCommandSessionPort {
         assertSemanticOperationExactInvalidations(
           descriptor,
           resourceInput,
-          semanticDependenciesForMutationFacts(result.facts),
+          observedDependencies,
           didMutateStorage,
           receipt,
         )
@@ -2438,6 +2533,7 @@ class BrowserCommandCommit implements BrowserCommandSessionPort {
   }
 
   private recordCommittedMutationFacts(facts: BrowserCommandMutationFacts): void {
+    this.recordReadConflictFacts(facts)
     for (const tableName of facts.tableNames) this.committedMutationTables.add(tableName)
     for (const scope of facts.physicalOwnerScopes) {
       const previous = this.physicalOwnerScopesById.get(scope.id)
@@ -2457,7 +2553,10 @@ class BrowserCommandCommit implements BrowserCommandSessionPort {
       if (!this.initialChatExistsById.has(fact.chatId)) {
         this.initialChatExistsById.set(fact.chatId, fact.initialExists)
       }
-      this.chatsById.set(fact.chatId, fact.chat ? structuredClone(fact.chat) : null)
+      this.chatsById.set(
+        fact.chatId,
+        fact.chat === undefined ? undefined : fact.chat ? structuredClone(fact.chat) : null,
+      )
     }
     for (const fact of facts.attachmentRows) {
       this.attachmentRowsById.set(fact.attachmentId, fact.exists)
@@ -2505,6 +2604,28 @@ class BrowserCommandCommit implements BrowserCommandSessionPort {
         final: fact.final,
         projectionChanged: current.projectionChanged || fact.projectionChanged,
       })
+    }
+  }
+
+  private recordReadConflictFacts(facts: BrowserCommandMutationFacts): void {
+    for (const address of facts.readConflictAddresses) this.readConflictAddresses.add(address)
+    for (const scope of facts.readConflictScopes) {
+      const key = JSON.stringify([
+        scope.tableName,
+        scope.indexName ?? ':id',
+        scope.keyPath,
+        scope.range,
+      ])
+      const current = this.readConflictScopes.get(key)
+      this.readConflictScopes.set(
+        key,
+        current?.anyMutation
+          ? current
+          : structuredClone({
+              ...scope,
+              anyMutation: current?.anyMutation === true || scope.anyMutation,
+            }),
+      )
     }
   }
 
@@ -2606,7 +2727,7 @@ class BrowserCommandCommit implements BrowserCommandSessionPort {
     const sidebarChatIds = new Set(
       [...this.physicalMutationsByAddress.values()].flatMap((mutation) =>
         mutation.tableName === 'chatSidebarRows' && typeof mutation.key === 'string'
-          ? [mutation.key as ChatId]
+          ? [mutation.key]
           : [],
       ),
     )
@@ -2618,13 +2739,21 @@ class BrowserCommandCommit implements BrowserCommandSessionPort {
       if (initialExists === undefined) {
         throw new Error(`BrowserCommandChatInitialStateMissing:${chatId}`)
       }
-      if (!finalChat) {
+      if (finalChat === null) {
         if (!initialExists) continue
         facts.push({ kind: 'chat-deleted', chatId })
         if (sidebarChatIds.has(chatId)) {
           facts.push({ kind: 'sidebar-row-deleted', chatId })
         }
         deletedChatIds.add(chatId)
+        ordinaryChatIds.push(chatId)
+        continue
+      }
+      if (finalChat === undefined) {
+        if (!initialExists) throw new Error(`BrowserCommandChatConstructionMissing:${chatId}`)
+        if (sidebarChatIds.has(chatId)) {
+          facts.push({ kind: 'sidebar-row-changed', chatId })
+        }
         ordinaryChatIds.push(chatId)
         continue
       }
@@ -2723,6 +2852,16 @@ class BrowserCommandCommit implements BrowserCommandSessionPort {
       didMutateStorage: this.committedMutationTables.size > 0,
       extraInvalidations: [...this.extraInvalidations, ...attachmentInvalidations],
     }
+  }
+
+  stagedConflictEvidence(): BrowserStagedCommandConflictEvidence {
+    return Object.freeze({
+      readAddresses: Object.freeze([...this.readConflictAddresses].sort()),
+      readScopes: Object.freeze(
+        [...this.readConflictScopes.values()].map((scope) => structuredClone(scope)),
+      ),
+      mutationAddresses: Object.freeze([...this.physicalMutationsByAddress.keys()].sort()),
+    })
   }
 }
 
@@ -3338,7 +3477,7 @@ function dedupeMutationScopes(scopes: readonly MutationScope[]): MutationScope[]
 }
 
 function attachmentOwnerScopes(
-  owner: AttachmentRefOwner,
+  owner: AttachmentRefMutationOwner,
   attachmentIds: readonly AttachmentId[] = [],
 ): MutationScope[] {
   return dedupeMutationScopes([
@@ -3410,15 +3549,19 @@ async function readDraftPutPlan(
   })
 }
 
-async function attachmentOwnerMessage(
+async function attachmentOwnerMessageHeader(
   ctx: MutationContext,
-  owner: Extract<AttachmentRefOwner, { kind: 'message' }>,
-): Promise<Message> {
-  const message = await ctx.getMessage(owner.messageId)
-  if (!message || message.chatId !== owner.chatId || message.deleted) {
+  owner: Extract<AttachmentRefMutationOwner, { kind: 'message' }>,
+): Promise<MessageHeaderRow> {
+  const header = await ctx.getMessageHeader(owner.messageId)
+  if (
+    !header ||
+    (owner.expectedChatId !== undefined && header.chatId !== owner.expectedChatId) ||
+    header.deleted
+  ) {
     throw new Error(`MessageMissing:${owner.messageId}`)
   }
-  return message
+  return header
 }
 
 function insertAttachmentRef(
@@ -3429,28 +3572,6 @@ function insertAttachmentRef(
   if (!afterRefId) return [...refs, ref]
   const index = refs.findIndex((candidate) => candidate.refId === afterRefId)
   return index < 0 ? [...refs, ref] : [...refs.slice(0, index + 1), ref, ...refs.slice(index + 1)]
-}
-
-function messageWithWorkspaceAttachmentRefs(
-  message: Message,
-  attachmentRefs: readonly MessageAttachmentRef[],
-): Message {
-  const next = { ...message, attachmentRefs: [...attachmentRefs] }
-  delete next.cachedMediaTokens
-  return next
-}
-
-async function attachmentMessageRefResult(
-  ctx: MutationContext,
-  message: Message,
-  ref?: MessageAttachmentRef,
-): Promise<AttachmentRefWriteResult> {
-  const header = await ctx.getMessageHeader(message.id)
-  if (!header) throw new Error(`MessageMissing:${message.id}`)
-  return {
-    ...(ref ? { ref } : {}),
-    presentation: { header, message, bodyVersion: header.bodyVersion },
-  }
 }
 
 function assertExpectedAttachmentReference(
@@ -3466,14 +3587,14 @@ function assertExpectedAttachmentReference(
 function groupAttachmentRelinkSpecs(specs: AttachmentRefRelinkInput['refs']): Map<
   string,
   {
-    owner: AttachmentRefOwner
+    owner: AttachmentRefMutationOwner
     specs: Array<AttachmentRefRelinkInput['refs'][number] & { inputIndex: number }>
   }
 > {
   const groups = new Map<
     string,
     {
-      owner: AttachmentRefOwner
+      owner: AttachmentRefMutationOwner
       specs: Array<AttachmentRefRelinkInput['refs'][number] & { inputIndex: number }>
     }
   >()
@@ -3514,6 +3635,75 @@ function applyAttachmentRelinks(
     if (!matched.has(spec.refId)) throw new Error(`AttachmentRefMissing:${spec.refId}`)
   }
   return next
+}
+
+interface AttachmentReferenceOwnerMutation {
+  readonly owner: AttachmentRefMutationOwner
+  apply(
+    current: MessageHeaderRow | DraftRow | undefined,
+    refs: readonly MessageAttachmentRef[],
+  ): readonly MessageAttachmentRef[] | undefined
+}
+
+interface AttachmentReferenceOwnerMutationResult {
+  readonly header?: MessageHeaderRow
+  readonly draft?: DraftRow
+}
+
+async function applyAttachmentReferenceOwnerMutations(
+  ctx: MutationContext,
+  mutations: readonly AttachmentReferenceOwnerMutation[],
+  now: number,
+): Promise<readonly (AttachmentReferenceOwnerMutationResult | undefined)[]> {
+  const ownerKeys = new Set<string>()
+  const results: Array<AttachmentReferenceOwnerMutationResult | undefined> = []
+  for (const mutation of mutations) {
+    const ownerKey =
+      mutation.owner.kind === 'message'
+        ? `message:${mutation.owner.messageId}`
+        : `draft:${mutation.owner.chatId}`
+    if (ownerKeys.has(ownerKey)) throw new Error(`DuplicateAttachmentRefMutationOwner:${ownerKey}`)
+    ownerKeys.add(ownerKey)
+    if (mutation.owner.kind === 'message') {
+      const header = await attachmentOwnerMessageHeader(ctx, mutation.owner)
+      const refs = normalizeAttachmentRefs(header.attachmentRefs, {
+        messageId: header.id,
+        createdAt: header.createdAt,
+      })
+      const nextRefs = mutation.apply(header, refs)
+      if (!nextRefs) {
+        results.push(undefined)
+        continue
+      }
+      const written = await ctx.replaceMessageAttachmentRefs(header.id, nextRefs)
+      if (!written) throw new Error(`MessageMissing:${header.id}`)
+      results.push({ header: written })
+      continue
+    }
+    const current = await ctx.getDraft(mutation.owner.chatId)
+    const refs = normalizeAttachmentRefs(current?.attachmentRefs, {
+      draftChatId: mutation.owner.chatId,
+      createdAt: current?.updatedAt ?? 0,
+    })
+    const nextRefs = mutation.apply(current, refs)
+    if (!nextRefs) {
+      results.push(undefined)
+      continue
+    }
+    const draft: DraftRow = {
+      ...(current ?? {
+        chatId: mutation.owner.chatId,
+        text: '',
+        attachmentRefs: [],
+        updatedAt: 0,
+      }),
+      attachmentRefs: [...nextRefs],
+      updatedAt: strictlyMonotonicTimestamp(current?.updatedAt ?? 0, now),
+    }
+    await ctx.putDraft(draft)
+    results.push({ draft })
+  }
+  return Object.freeze(results)
 }
 
 async function persistPreparedAttachmentBundleInMutation(
@@ -3634,7 +3824,47 @@ function succeededGeneratedOutputLocalizationJob(job: AttachmentJob, now: number
   return next
 }
 
-class GeneratedOutputLocalizationPlanChangedError extends Error {}
+const GENERATED_OUTPUT_VIDEO_PREFLIGHT_TRANSACTION_PLAN = physicalTransactionPlan(
+  physicalStorageTables('attachmentRefEdges'),
+)
+
+interface GeneratedOutputVideoExpansionPlan {
+  readonly messageIds: readonly MessageId[]
+  readonly draftChatIds: readonly ChatId[]
+}
+
+async function readGeneratedOutputVideoExpansionPlan(
+  commit: BrowserCommandSessionPort,
+  attachmentId: AttachmentId,
+): Promise<GeneratedOutputVideoExpansionPlan> {
+  const edges = await commit.readSemanticOperationPreflight(
+    GENERATED_OUTPUT_VIDEO_PREFLIGHT_TRANSACTION_PLAN,
+    (tx) =>
+      tx
+        .table<AttachmentReferenceEdge, string>('attachmentRefEdges')
+        .where('attachmentId')
+        .equals(attachmentId)
+        .toArray(),
+    (rows) => [
+      {
+        tableName: 'attachmentRefEdges',
+        indexKind: 'secondary',
+        indexName: 'attachmentId',
+        operation: 'query',
+        requestCount: 1,
+        rowCount: rows.length,
+      },
+    ],
+  )
+  return Object.freeze({
+    messageIds: Object.freeze([
+      ...new Set(edges.flatMap((edge) => (edge.ownerKind === 'message' ? [edge.ownerId] : []))),
+    ]),
+    draftChatIds: Object.freeze([
+      ...new Set(edges.flatMap((edge) => (edge.ownerKind === 'draft' ? [edge.chatId] : []))),
+    ]),
+  })
+}
 
 function preparedAttachmentIdentityMatches(current: Attachment, prepared: Attachment): boolean {
   if (
@@ -3958,6 +4188,86 @@ async function listChildHeaderRows(
     .where('[chatId+treeParentKey+siblingIndex+id]')
     .between(...exactCompoundPrefixBetween([chatId, treeParentKey(parentId)]))
     .toArray()
+}
+
+const MESSAGE_STRUCTURE_PREFLIGHT_TRANSACTION_PLAN = physicalTransactionPlan(
+  physicalStorageTables('messages'),
+)
+const MESSAGE_EDIT_PREFLIGHT_TRANSACTION_PLAN = physicalTransactionPlan(
+  physicalStorageTables('chats', 'messages', 'settings'),
+)
+
+interface MessagePreflightExecution<T, Tables extends 'chats' | 'messages' | 'settings'> {
+  readonly value: T
+  readonly physicalReads: readonly (SemanticOperationExactPhysicalRead & {
+    readonly tableName: Tables
+  })[]
+}
+
+function createMessageStructurePreflightReader<Tables extends 'chats' | 'settings'>(
+  tx: FencedTransaction<'messages' | Tables>,
+  receipt: SemanticOperationExactReceiptAccumulator<'messages' | Tables>,
+): MessageStructurePreflightReader {
+  const headers = new Map<MessageId, MessageHeaderRow | undefined>()
+  const childSlots = new Map<string, readonly MessageHeaderRow[]>()
+  const messageTable = tx.table<MessageHeaderRow, MessageId>('messages')
+  return Object.freeze({
+    getMessageHeader: async (messageId: MessageId) => {
+      if (!headers.has(messageId)) {
+        const header = await messageTable.get(messageId)
+        receipt.physicalRead({
+          tableName: 'messages',
+          indexKind: 'primary',
+          operation: 'get',
+          requestCount: 1,
+          rowCount: header ? 1 : 0,
+        })
+        headers.set(messageId, header ? cloneMessageHeader(header) : undefined)
+      }
+      const header = headers.get(messageId)
+      return header ? cloneMessageHeader(header) : undefined
+    },
+    getMessageHeaders: async (messageIds: readonly MessageId[]) => {
+      const missingIds = [...new Set(messageIds.filter((messageId) => !headers.has(messageId)))]
+      if (missingIds.length > 0) {
+        const rows = await messageTable.bulkGet(missingIds)
+        receipt.physicalRead({
+          tableName: 'messages',
+          indexKind: 'primary',
+          operation: 'get-many',
+          requestCount: 1,
+          rowCount: rows.filter(Boolean).length,
+        })
+        for (let index = 0; index < missingIds.length; index += 1) {
+          const row = rows[index]
+          headers.set(missingIds[index] as MessageId, row ? cloneMessageHeader(row) : undefined)
+        }
+      }
+      return messageIds.map((messageId) => {
+        const header = headers.get(messageId)
+        return header ? cloneMessageHeader(header) : undefined
+      })
+    },
+    listChildHeaders: async (chatId: ChatId, parentId: MessageId | null) => {
+      const key = `${chatId}:${treeParentKey(parentId)}`
+      let rows = childSlots.get(key)
+      if (!rows) {
+        const loaded = await listChildHeaderRows(messageTable, chatId, parentId)
+        receipt.physicalRead({
+          tableName: 'messages',
+          indexKind: 'secondary',
+          indexName: '[chatId+treeParentKey+siblingIndex+id]',
+          operation: 'query',
+          requestCount: 1,
+          rowCount: loaded.length,
+        })
+        rows = Object.freeze(loaded.map(cloneMessageHeader))
+        childSlots.set(key, rows)
+        for (const row of rows) headers.set(row.id, row)
+      }
+      return rows.map(cloneMessageHeader)
+    },
+  })
 }
 
 function applyMessageBodyPatch(body: MessageBodyRow, patch: MessageBodyPatch): MessageBodyRow {
@@ -4343,7 +4653,9 @@ function assertPhysicalMutationEvidenceCoverage(
   const settingKeys = new Set<string>()
   const attachmentIds = new Set<AttachmentId>()
   for (const dependency of delta.invalidations) {
-    if (dependency.kind === 'message-preview' && dependency.messageIds) {
+    if (dependency.kind === 'chat' && dependency.chatIds) {
+      for (const chatId of dependency.chatIds) chatIds.add(chatId)
+    } else if (dependency.kind === 'message-preview' && dependency.messageIds) {
       for (const messageId of dependency.messageIds) previewIds.add(messageId)
     } else if (dependency.kind === 'setting' && dependency.keys) {
       for (const key of dependency.keys) settingKeys.add(key)
@@ -4949,92 +5261,179 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     command: C,
   ): Promise<CommitEnvelope<WorkspaceCommandResult<C>>> {
     assertWorkspaceExecutionPermit(permit)
+    if (isBrowserWorkspaceStagedFanoutCommand(command)) {
+      const { browserWorkspaceSlotSwitchingSupported } = await import(
+        './browser-workspace-slot-coordination'
+      )
+      if (browserWorkspaceSlotSwitchingSupported()) {
+        const admission = await this.tryExecuteCommandWithinFanoutBudget(
+          permit,
+          command,
+          BROWSER_COMMAND_DIRECT_FANOUT_BUDGET,
+        )
+        if (admission.kind === 'committed') return admission.execution.commit
+        const { executeBrowserWorkspaceStagedFanoutCommand } = await import(
+          './browser-workspace-staged-fanout'
+        )
+        return executeBrowserWorkspaceStagedFanoutCommand(
+          permit,
+          command,
+          executeBrowserCommandInStagedDatabase,
+        )
+      }
+    }
+    return (await this.executeDirectCommand(permit, command)).commit
+  }
+
+  async tryExecuteCommandWithinFanoutBudget<C extends WorkspaceCommand>(
+    permit: WorkspaceWriteAuthority,
+    command: C,
+    budget: BrowserCommandFanoutBudget,
+  ): Promise<BrowserCommandFanoutAdmission<C>> {
+    try {
+      return {
+        kind: 'committed',
+        execution: await this.executeDirectCommand(permit, command, budget),
+      }
+    } catch (error) {
+      if (isBrowserCommandFanoutBudgetExceededError(error)) {
+        return { kind: 'staging-required' }
+      }
+      throw error
+    }
+  }
+
+  private async executeDirectCommand<C extends WorkspaceCommand>(
+    permit: WorkspaceWriteAuthority,
+    command: C,
+    fanoutBudget?: BrowserCommandFanoutBudget,
+  ): Promise<BrowserStagedCommandExecution<C>> {
+    assertWorkspaceExecutionPermit(permit)
     const db = this.session.runOperation((database) => database)
     const admission = await awaitStorageCompactionWriteAdmission()
     return withSharedAuthoritativeCommandSession(db, async (lockSession) => {
       const workspace = this.session.getWorkspaceFence()
       assertPermitFence(permit, workspace)
-      const commandLifetimeReceipt = semanticOperationCommandLifetimeReceipt(
-        workspace,
-        db.name,
-        admission,
-      )
-      const commit = new BrowserCommandCommit(
+      return this.executeCommandInDatabase(
         db,
+        workspace,
+        command,
         lockSession,
-        permit.workspaceId,
-        permit.replacementEpoch,
-        newId(),
-        command,
-        workspaceCommandSemanticOperationKind(command),
-        commandLifetimeReceipt,
+        admission,
+        fanoutBudget,
       )
-      const value = (await this.dispatchCommand(
-        command,
-        permit.replacementEpoch,
-        commit,
-      )) as WorkspaceCommandResult<C>
-      const chatEvidence = commit.materializeChatEvidence()
-      const messageRevisions = commit
-        .messageRevisions(chatEvidence.constructedChatIds)
-        .filter(
-          (revision) =>
-            !revision.before || !sameMessageHeaderValue(revision.before, revision.header),
-        )
-      const messageDelta = commit.messageDelta(messageRevisions)
-      const attemptTargetFacts = attemptTargetCommittedFacts(command, value)
-      const attemptStopFacts = attemptStopRequestedFacts(command, value)
-      const outcome = commit.finish()
-      const rawDelta: WorkspaceDelta = outcome.didMutateStorage
-        ? {
-            facts: [
-              ...chatEvidence.facts,
-              ...commit.attachmentFacts(),
-              ...messageDelta.facts,
-              ...attemptTargetFacts,
-              ...attemptStopFacts,
-            ],
-            invalidations: normalizeWorkspaceDependencies([
-              ...outcome.extraInvalidations,
-              ...chatEvidence.invalidations,
-              ...messageDelta.invalidations,
-            ]),
-          }
-        : { facts: [], invalidations: [] }
-      const receipt: WorkspaceLocalReceipt = {
-        chats: outcome.didMutateStorage ? chatEvidence.receiptChats : [],
-        constructions: outcome.didMutateStorage ? chatEvidence.constructions : [],
-        messageRevisions,
-        childSlots: outcome.didMutateStorage
-          ? commit.childSlots(chatEvidence.constructedChatIds)
-          : [],
-      }
-      const terminalChatIds = new Set([
-        ...chatEvidence.constructedChatIds,
-        ...chatEvidence.deletedChatIds,
-      ])
-      if (outcome.didMutateStorage) {
-        commit.assertPhysicalEvidenceCoverage(rawDelta, receipt, terminalChatIds)
-      }
-      const delta = outcome.didMutateStorage
-        ? collapseConversationConstructionPublication(rawDelta)
-        : rawDelta
-      const effectScope =
-        rawDelta.facts.length > 0 || rawDelta.invalidations.length > 0
-          ? ('workspace' as const)
-          : ('none' as const)
-      const stamp = {
-        workspaceId: outcome.fence.workspaceId,
-        replacementEpoch: outcome.fence.replacementEpoch,
-        commitId: commit.commitId,
-      }
-      return {
+    })
+  }
+
+  async executeStagedCommand<C extends WorkspaceCommand>(
+    db: NatterDb,
+    workspace: WorkspaceFence,
+    command: C,
+  ): Promise<BrowserStagedCommandExecution<C>> {
+    return this.executeCommandInDatabase(
+      db,
+      workspace,
+      command,
+      stagedCommandLockSession(db),
+      stagedStorageCompactionWriteAdmission(db.name),
+      undefined,
+      false,
+    )
+  }
+
+  private async executeCommandInDatabase<C extends WorkspaceCommand>(
+    db: NatterDb,
+    workspace: WorkspaceFence,
+    command: C,
+    lockSession: AuthoritativeCommandLockSession,
+    admission: StorageCompactionWriteAdmission,
+    fanoutBudget?: BrowserCommandFanoutBudget,
+    retainFullChatStates = true,
+  ): Promise<BrowserStagedCommandExecution<C>> {
+    const commandLifetimeReceipt = semanticOperationCommandLifetimeReceipt(
+      workspace,
+      db.name,
+      admission,
+    )
+    const commit = new BrowserCommandCommit(
+      db,
+      lockSession,
+      workspace.workspaceId,
+      workspace.replacementEpoch,
+      newId(),
+      command,
+      workspaceCommandSemanticOperationKind(command),
+      commandLifetimeReceipt,
+      fanoutBudget,
+      retainFullChatStates,
+    )
+    const value = (await this.dispatchCommand(
+      command,
+      workspace.replacementEpoch,
+      commit,
+    )) as WorkspaceCommandResult<C>
+    const chatEvidence = commit.materializeChatEvidence()
+    const messageRevisions = commit
+      .messageRevisions(chatEvidence.constructedChatIds)
+      .filter(
+        (revision) => !revision.before || !sameMessageHeaderValue(revision.before, revision.header),
+      )
+    const messageDelta = commit.messageDelta(messageRevisions)
+    const attemptTargetFacts = attemptTargetCommittedFacts(command, value)
+    const attemptStopFacts = attemptStopRequestedFacts(command, value)
+    const outcome = commit.finish()
+    const rawDelta: WorkspaceDelta = outcome.didMutateStorage
+      ? {
+          facts: [
+            ...chatEvidence.facts,
+            ...commit.attachmentFacts(),
+            ...messageDelta.facts,
+            ...attemptTargetFacts,
+            ...attemptStopFacts,
+          ],
+          invalidations: normalizeWorkspaceDependencies([
+            ...outcome.extraInvalidations,
+            ...chatEvidence.invalidations,
+            ...messageDelta.invalidations,
+          ]),
+        }
+      : { facts: [], invalidations: [] }
+    const receipt: WorkspaceLocalReceipt = {
+      chats: outcome.didMutateStorage ? chatEvidence.receiptChats : [],
+      constructions: outcome.didMutateStorage ? chatEvidence.constructions : [],
+      messageRevisions,
+      childSlots: outcome.didMutateStorage
+        ? commit.childSlots(chatEvidence.constructedChatIds)
+        : [],
+    }
+    const terminalChatIds = new Set([
+      ...chatEvidence.constructedChatIds,
+      ...chatEvidence.deletedChatIds,
+    ])
+    if (outcome.didMutateStorage) {
+      commit.assertPhysicalEvidenceCoverage(rawDelta, receipt, terminalChatIds)
+    }
+    const delta = outcome.didMutateStorage
+      ? collapseConversationConstructionPublication(rawDelta)
+      : rawDelta
+    const effectScope =
+      rawDelta.facts.length > 0 || rawDelta.invalidations.length > 0
+        ? ('workspace' as const)
+        : ('none' as const)
+    const stamp = {
+      workspaceId: outcome.fence.workspaceId,
+      replacementEpoch: outcome.fence.replacementEpoch,
+      commitId: commit.commitId,
+    }
+    return Object.freeze({
+      commit: {
         ...stamp,
         effectScope,
         value,
         receipt,
         delta,
-      }
+      },
+      conflictEvidence: commit.stagedConflictEvidence(),
     })
   }
 
@@ -5242,8 +5641,6 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
       }
       case 'generated-output.localization-queue':
         return this.getGeneratedOutputLocalizationQueue(query.now, query.limit)
-      case 'draft.get':
-        return this.getDraft(query.chatId)
       case 'discovery.models':
         return this.readDiscoveryCacheRow('models', [query.profileId, query.queryKey])
       case 'discovery.endpoints':
@@ -5255,13 +5652,98 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     }
   }
 
+  private async readMessageStructurePreflight<T>(
+    commit: BrowserCommandCommit,
+    read: (reader: MessageStructurePreflightReader) => Promise<T> | T,
+  ): Promise<T> {
+    const execution = await commit.readSemanticOperationPreflight(
+      MESSAGE_STRUCTURE_PREFLIGHT_TRANSACTION_PLAN,
+      async (tx): Promise<MessagePreflightExecution<T, 'messages'>> => {
+        const receipt = createSemanticOperationExactReceiptAccumulator<'messages'>()
+        const value = await read(createMessageStructurePreflightReader<never>(tx, receipt))
+        return {
+          value,
+          physicalReads: receipt.snapshotFragment().physicalReads,
+        }
+      },
+      ({ physicalReads }) => physicalReads,
+    )
+    return execution.value
+  }
+
+  private async readMessageEditPreflight<T>(
+    commit: BrowserCommandCommit,
+    read: (reader: MessageEditPreflightReader) => Promise<T> | T,
+  ): Promise<T> {
+    const execution = await commit.readSemanticOperationPreflight(
+      MESSAGE_EDIT_PREFLIGHT_TRANSACTION_PLAN,
+      async (tx): Promise<MessagePreflightExecution<T, 'chats' | 'messages' | 'settings'>> => {
+        const receipt = createSemanticOperationExactReceiptAccumulator<
+          'chats' | 'messages' | 'settings'
+        >()
+        const structure = createMessageStructurePreflightReader<'chats' | 'settings'>(tx, receipt)
+        const chats = new Map<ChatId, Chat | undefined>()
+        const settings = new Map<string, unknown>()
+        const knownSettingKeys = new Set<string>()
+        const reader: MessageEditPreflightReader = Object.freeze({
+          ...structure,
+          getChat: async (chatId: ChatId) => {
+            if (!chats.has(chatId)) {
+              const chat = await tx.table<Chat, ChatId>('chats').get(chatId)
+              receipt.physicalRead({
+                tableName: 'chats',
+                indexKind: 'primary',
+                operation: 'get',
+                requestCount: 1,
+                rowCount: chat ? 1 : 0,
+              })
+              chats.set(chatId, chat ? structuredClone(chat) : undefined)
+            }
+            const chat = chats.get(chatId)
+            return chat ? structuredClone(chat) : undefined
+          },
+          getSettings: async (keys: readonly string[]): Promise<ReadonlyMap<string, unknown>> => {
+            const missingKeys = [...new Set(keys.filter((key) => !knownSettingKeys.has(key)))]
+            if (missingKeys.length > 0) {
+              const rows = await tx.table<SettingsRow, string>('settings').bulkGet(missingKeys)
+              receipt.physicalRead({
+                tableName: 'settings',
+                indexKind: 'primary',
+                operation: 'get-many',
+                requestCount: 1,
+                rowCount: rows.filter(Boolean).length,
+              })
+              for (let index = 0; index < missingKeys.length; index += 1) {
+                const key = missingKeys[index] as string
+                const row = rows[index]
+                knownSettingKeys.add(key)
+                if (row) settings.set(key, structuredClone(row.value))
+              }
+            }
+            return new Map<string, unknown>(
+              keys.flatMap((key) =>
+                knownSettingKeys.has(key) && settings.has(key)
+                  ? [[key, structuredClone(settings.get(key))] as const]
+                  : [],
+              ),
+            )
+          },
+        })
+        const value = await read(reader)
+        return {
+          value,
+          physicalReads: receipt.snapshotFragment().physicalReads,
+        }
+      },
+      ({ physicalReads }) => physicalReads,
+    )
+    return execution.value
+  }
+
   private messageMutationRepository(commit: BrowserCommandCommit): MessageMutationRepository {
     return {
-      getChat: (chatId) => this.getChat(chatId),
-      getMessage: (messageId) => this.getMessage(messageId),
-      getMessageHeader: (messageId) => this.getMessageHeader(messageId),
-      getMessageHeaders: (messageIds) => this.getMessageHeaders(messageIds),
-      listChildHeaders: (chatId, parentId) => this.listChildHeaders(chatId, parentId),
+      readStructurePreflight: (read) => this.readMessageStructurePreflight(commit, read),
+      readEditPreflight: (read) => this.readMessageEditPreflight(commit, read),
       runMutation: (scopes, fn, finalize) =>
         this.runMutation(scopes, fn, undefined, commit, finalize),
     }
@@ -5275,10 +5757,10 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     switch (command.kind) {
       case 'interchange.import-chat': {
         const { BrowserImportExportHandler } = await import('./browser-import-export')
-        return new BrowserImportExportHandler(await this.openDb(), commit).importChat(
-          command.envelope,
-          command.options,
-        )
+        const handler = new BrowserImportExportHandler(await this.openDb(), commit)
+        return 'imports' in command
+          ? handler.importChats(command.imports)
+          : handler.importChat(command.envelope, command.options)
       }
       case 'interchange.import-chat-preset': {
         const { BrowserImportExportHandler } = await import('./browser-import-export')
@@ -5321,11 +5803,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
       case 'chat.fork':
         return this.forkChatFromMessage(command.input, commit)
       case 'message.edit-content':
-        return editMessageContentInRepository(
-          this.messageMutationRepository(commit),
-          command.input,
-          this,
-        )
+        return editMessageContentInRepository(this.messageMutationRepository(commit), command.input)
       case 'message.toggle-reasoning-detail':
       case 'message.toggle-provider-output-item':
       case 'message.toggle-context':
@@ -5866,11 +6344,14 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
           })),
           now,
         )
-        return {
-          chatId: destinationChatId,
-          messageCount: messages.length,
-          destination,
-        }
+        return semanticOperationExecution(
+          {
+            chatId: destinationChatId,
+            messageCount: messages.length,
+            destination,
+          },
+          semanticOperationExactOccurrenceReceipt<PhysicalStorageTableName>(tx),
+        )
       },
     )
   }
@@ -5919,7 +6400,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     const limit = Math.min(boundedMaintenanceLimit(input.limit), CHAT_CLOSURE_BATCH_LIMIT)
     return commit.executeSemanticOperation(
       EMPTY_DRAFT_RETENTION_OPERATION,
-      undefined,
+      { limit },
       async (tx) => {
         const currentState = await readStorageRetentionState(tx, 'empty-draft-prune')
         const cycle = storageRetentionCycle(currentState, input.now, input.maxAgeMs)
@@ -5933,35 +6414,49 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
           page.chatIds,
           cycle.cutoff,
           cycle.cycleNow,
+          { maxStreamJournalPages: 1 },
         )
+        const done = !closure.streamJournalRetirementPending && page.done
         const next = advanceStorageRetentionState(
           cycle,
-          page.done
+          closure.streamJournalRetirementPending
             ? {
-                done: true,
-                ...(page.earliestDeferredAt === undefined
-                  ? {}
-                  : { earliestDeferredAt: page.earliestDeferredAt }),
-              }
-            : {
                 done: false,
-                ...(page.nextCursor === undefined ? {} : { cursor: page.nextCursor }),
-              },
+                ...(cycle.cursor === undefined ? {} : { cursor: cycle.cursor }),
+              }
+            : page.done
+              ? {
+                  done: true,
+                  ...(page.earliestDeferredAt === undefined
+                    ? {}
+                    : { earliestDeferredAt: page.earliestDeferredAt }),
+                }
+              : {
+                  done: false,
+                  ...(page.nextCursor === undefined ? {} : { cursor: page.nextCursor }),
+                },
         )
         await putPhysicalStorageRow<
           StorageRetentionStateRowFor<'empty-draft-prune'>,
           StorageRetentionTask
         >(tx, 'storageRetentionState', next, currentState)
         recordBrowserCommandStorageRetentionMutation(tx, 'empty-draft-prune')
-        return {
-          deletedChatIds: closure.deletedChatIds,
-          affectedAttachmentIds: closure.affectedAttachmentIds,
-          scannedChatIds: page.chatIds.length,
-          ...(page.earliestDeferredAt === undefined
-            ? {}
-            : { earliestDeferredAt: page.earliestDeferredAt }),
-          done: page.done,
-        }
+        return semanticOperationExecution(
+          {
+            deletedChatIds: closure.deletedChatIds,
+            affectedAttachmentIds: closure.affectedAttachmentIds,
+            scannedChatIds: page.chatIds.length,
+            retiredStreamFrames: closure.retiredStreamFrames,
+            ...(page.earliestDeferredAt === undefined
+              ? {}
+              : { earliestDeferredAt: page.earliestDeferredAt }),
+            done,
+          },
+          semanticOperationExactOccurrenceReceipt<PhysicalStorageTableName>(
+            tx,
+            emptyDraftRetentionReplayPlan(cycle, limit),
+          ),
+        )
       },
     )
   }
@@ -6329,9 +6824,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
             .toArray(),
         ])
         const chatIds = [
-          ...new Set(
-            links.flatMap((link) => (link.ownerKind === 'chat' ? [link.ownerId as ChatId] : [])),
-          ),
+          ...new Set(links.flatMap((link) => (link.ownerKind === 'chat' ? [link.ownerId] : []))),
         ]
         const chats =
           chatIds.length === 0 ? [] : await tx.table<Chat, ChatId>('chats').bulkGet(chatIds)
@@ -6383,7 +6876,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
         .first()
       if (!link) return { kind: 'empty' }
       if (link.ownerKind !== 'chat') return { kind: 'blocked', linkId: link.id }
-      const chat = await tx.table<Chat, ChatId>('chats').get(link.ownerId as ChatId)
+      const chat = await tx.table<Chat, ChatId>('chats').get(link.ownerId)
       const pending = chat?.modelResolution
       if (
         !chat ||
@@ -6770,14 +7263,12 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
           ...(knownCurrent ? { knownCurrent } : {}),
           receipt,
         })
-        if (storageResult.accepted) {
-          const dependency = {
-            kind: 'model-resolution',
-            targetKeys: [configurationTargetKey('model-resolution', row.profileRevision)],
-          } as const
-          receipt.dependency(dependency)
-          recordBrowserCommandInvalidation(tx, dependency)
-        }
+        const dependency = {
+          kind: 'model-resolution',
+          targetKeys: [configurationTargetKey('model-resolution', row.profileRevision)],
+        } as const
+        receipt.dependency(dependency)
+        recordBrowserCommandInvalidation(tx, dependency)
         return semanticOperationExecution(
           {
             accepted: true,
@@ -7440,10 +7931,16 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     }
     return commit.executeSemanticOperation(
       ATTACHMENT_INTEGRITY_OPERATION,
-      undefined,
+      { limit },
       async (tx) => {
-        const result = await reconcileAttachmentIntegrityPage(tx, limit, now)
-        return result
+        const execution = await reconcileAttachmentIntegrityPage(tx, limit, now)
+        return semanticOperationExecution(
+          execution.result,
+          semanticOperationExactOccurrenceReceipt<PhysicalStorageTableName>(
+            tx,
+            attachmentIntegrityReplayPlan(execution.observedState, limit),
+          ),
+        )
       },
     )
   }
@@ -8082,49 +8579,27 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     const mutation = await this.runMutation(
       scopes,
       async (ctx) => {
-        if (!(await ctx.getAttachment(input.ref.attachmentId))) {
-          throw new Error(`AttachmentMissing:${input.ref.attachmentId}`)
-        }
-        if (input.owner.kind === 'message') {
-          const message = await attachmentOwnerMessage(ctx, input.owner)
-          const refs = normalizeAttachmentRefs(message.attachmentRefs, {
-            messageId: message.id,
-            createdAt: message.createdAt,
-          })
-          if (refs.some((ref) => ref.refId === input.ref.refId)) {
-            throw new Error(`AttachmentRefAlreadyExists:${input.ref.refId}`)
-          }
-          const nextRefs = insertAttachmentRef(refs, input.ref, input.afterRefId)
-          const written = await ctx.putMessage(
-            messageWithWorkspaceAttachmentRefs(message, nextRefs),
+        const [result] = await applyAttachmentReferenceOwnerMutations(
+          ctx,
+          [
             {
-              touchChatSummary: false,
+              owner: input.owner,
+              apply: (_current, refs) => {
+                if (refs.some((ref) => ref.refId === input.ref.refId)) {
+                  throw new Error(`AttachmentRefAlreadyExists:${input.ref.refId}`)
+                }
+                return insertAttachmentRef(refs, input.ref, input.afterRefId)
+              },
             },
-          )
-          return attachmentMessageRefResult(ctx, written, input.ref)
+          ],
+          input.now,
+        )
+        if (!result) throw new Error('AttachmentRefAddResultMissing')
+        return {
+          ref: input.ref,
+          ...(result.header ? { header: result.header } : {}),
+          ...(result.draft ? { draft: result.draft } : {}),
         }
-        const current =
-          (await ctx.getDraft(input.owner.chatId)) ??
-          ({
-            chatId: input.owner.chatId,
-            text: '',
-            attachmentRefs: [],
-            updatedAt: 0,
-          } satisfies DraftRow)
-        const refs = normalizeAttachmentRefs(current.attachmentRefs, {
-          draftChatId: current.chatId,
-          createdAt: current.updatedAt,
-        })
-        if (refs.some((ref) => ref.refId === input.ref.refId)) {
-          throw new Error(`AttachmentRefAlreadyExists:${input.ref.refId}`)
-        }
-        const draft = {
-          ...current,
-          attachmentRefs: insertAttachmentRef(refs, input.ref, input.afterRefId),
-          updatedAt: strictlyMonotonicTimestamp(current.updatedAt, input.now),
-        }
-        await ctx.putDraft(draft)
-        return { ref: input.ref, draft }
       },
       undefined,
       commit,
@@ -8160,7 +8635,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
   }
 
   private async mutateSingleAttachmentReference(
-    owner: AttachmentRefOwner,
+    owner: AttachmentRefMutationOwner,
     expectedAttachmentId: AttachmentId,
     commit: BrowserCommandCommit,
     mutate: (ref: MessageAttachmentRef) => MessageAttachmentRef | undefined,
@@ -8170,49 +8645,34 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     const mutation = await this.runMutation(
       attachmentOwnerScopes(owner, [expectedAttachmentId]),
       async (ctx) => {
-        if (owner.kind === 'message') {
-          const message = await attachmentOwnerMessage(ctx, owner)
-          const refs = normalizeAttachmentRefs(message.attachmentRefs, {
-            messageId: message.id,
-            createdAt: message.createdAt,
-          })
-          const index = refs.findIndex((ref) => ref.refId === refId)
-          if (index < 0) return {}
-          const existing = refs[index] as MessageAttachmentRef
-          assertExpectedAttachmentReference(existing, expectedAttachmentId)
-          const updated = mutate(existing)
-          const nextRefs = [...refs]
-          if (updated) nextRefs[index] = updated
-          else nextRefs.splice(index, 1)
-          const written = await ctx.putMessage(
-            messageWithWorkspaceAttachmentRefs(message, nextRefs),
+        let updated: MessageAttachmentRef | undefined
+        const [result] = await applyAttachmentReferenceOwnerMutations(
+          ctx,
+          [
             {
-              touchChatSummary: false,
+              owner,
+              apply: (current, refs) => {
+                if (!current) return undefined
+                const index = refs.findIndex((ref) => ref.refId === refId)
+                if (index < 0) return undefined
+                const existing = refs[index] as MessageAttachmentRef
+                assertExpectedAttachmentReference(existing, expectedAttachmentId)
+                updated = mutate(existing)
+                const nextRefs = [...refs]
+                if (updated) nextRefs[index] = updated
+                else nextRefs.splice(index, 1)
+                return nextRefs
+              },
             },
-          )
-          return attachmentMessageRefResult(ctx, written, updated)
+          ],
+          now,
+        )
+        if (!result) return {}
+        return {
+          ...(updated ? { ref: updated } : {}),
+          ...(result.header ? { header: result.header } : {}),
+          ...(result.draft ? { draft: result.draft } : {}),
         }
-        const draft = await ctx.getDraft(owner.chatId)
-        if (!draft) return {}
-        const refs = normalizeAttachmentRefs(draft.attachmentRefs, {
-          draftChatId: draft.chatId,
-          createdAt: draft.updatedAt,
-        })
-        const index = refs.findIndex((ref) => ref.refId === refId)
-        if (index < 0) return {}
-        const existing = refs[index] as MessageAttachmentRef
-        assertExpectedAttachmentReference(existing, expectedAttachmentId)
-        const updated = mutate(existing)
-        const nextRefs = [...refs]
-        if (updated) nextRefs[index] = updated
-        else nextRefs.splice(index, 1)
-        const next = {
-          ...draft,
-          attachmentRefs: nextRefs,
-          updatedAt: strictlyMonotonicTimestamp(draft.updatedAt, now),
-        }
-        await ctx.putDraft(next)
-        return { ...(updated ? { ref: updated } : {}), draft: next }
       },
       undefined,
       commit,
@@ -8239,57 +8699,29 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     const mutation = await this.runMutation(
       scopes,
       async (ctx) => {
-        if (!(await ctx.getAttachment(input.newAttachmentId))) {
-          throw new Error(`AttachmentMissing:${input.newAttachmentId}`)
-        }
         const grouped = groupAttachmentRelinkSpecs(input.refs)
         const updatedByInput = new Map<number, MessageAttachmentRef>()
-        const presentations: MessagePresentation[] = []
-        const drafts: DraftRow[] = []
-        for (const group of grouped.values()) {
-          if (group.owner.kind === 'message') {
-            const message = await attachmentOwnerMessage(ctx, group.owner)
-            const refs = normalizeAttachmentRefs(message.attachmentRefs, {
-              messageId: message.id,
-              createdAt: message.createdAt,
-            })
-            const nextRefs = applyAttachmentRelinks(
-              refs,
-              group.specs,
-              input.newAttachmentId,
-              input.now,
-              updatedByInput,
-            )
-            const written = await ctx.putMessage(
-              messageWithWorkspaceAttachmentRefs(message, nextRefs),
-              {
-                touchChatSummary: false,
-              },
-            )
-            const result = await attachmentMessageRefResult(ctx, written)
-            if (result.presentation) presentations.push(result.presentation)
-          } else {
-            const draft = await ctx.getDraft(group.owner.chatId)
-            if (!draft) throw new Error(`DraftMissing:${group.owner.chatId}`)
-            const refs = normalizeAttachmentRefs(draft.attachmentRefs, {
-              draftChatId: draft.chatId,
-              createdAt: draft.updatedAt,
-            })
-            const next = {
-              ...draft,
-              attachmentRefs: applyAttachmentRelinks(
+        const results = await applyAttachmentReferenceOwnerMutations(
+          ctx,
+          [...grouped.values()].map((group) => ({
+            owner: group.owner,
+            apply: (current, refs) => {
+              if (!current && group.owner.kind === 'draft') {
+                throw new Error(`DraftMissing:${group.owner.chatId}`)
+              }
+              return applyAttachmentRelinks(
                 refs,
                 group.specs,
                 input.newAttachmentId,
                 input.now,
                 updatedByInput,
-              ),
-              updatedAt: strictlyMonotonicTimestamp(draft.updatedAt, input.now),
-            }
-            await ctx.putDraft(next)
-            drafts.push(next)
-          }
-        }
+              )
+            },
+          })),
+          input.now,
+        )
+        const headers = results.flatMap((result) => (result?.header ? [result.header] : []))
+        const drafts = results.flatMap((result) => (result?.draft ? [result.draft] : []))
         if (input.supersedeAttachmentId) {
           const superseded = await ctx.getAttachment(input.supersedeAttachmentId)
           if (!superseded) {
@@ -8307,7 +8739,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
             if (!ref) throw new Error(`AttachmentRelinkResultMissing:${index}`)
             return ref
           }),
-          presentations,
+          headers,
           drafts,
         }
       },
@@ -8395,7 +8827,6 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
   ): Promise<AttachmentReapResult> {
     const limit = boundedMaintenanceLimit(requestedLimit ?? MAX_STORAGE_MAINTENANCE_BATCH)
     const plan = await readAttachmentReapPlan(commit, now, maxAgeMs, limit)
-    if (plan[attachmentReapPlanBrand] !== true) throw new Error('AttachmentReapPlanInvalid')
     const { candidates, cycle } = plan
     const candidateIds = candidates.map((candidate) => candidate.id)
     type AttachmentReapPageOutcome =
@@ -8413,7 +8844,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
         }
         return deleted
       },
-      undefined,
+      { storageMaintenanceTasks: ['reconcile-attachment-integrity'] },
       commit,
       undefined,
       {
@@ -8503,7 +8934,6 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
           throw new Error(`DraftChanged:${input.draft.chatId}`)
         }
         if (
-          plan[draftPutPlanBrand] !== true ||
           plan.chatId !== input.draft.chatId ||
           !sameOrderedValues(
             draftPutAttachmentIds(current?.attachmentRefs),
@@ -8537,15 +8967,13 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     input: GeneratedOutputLocalizationClaimInput,
     commit: BrowserCommandCommit,
   ): Promise<GeneratedOutputLocalizationClaim | undefined> {
-    const attachmentId = await this.generatedOutputLocalizationAttachmentId(input.jobId, commit)
-    if (!attachmentId) return undefined
+    const { attachmentId } = input
     const mutation = await this.runMutation(
       [{ kind: 'attachment', attachmentId }],
       async (ctx) => {
         const attachment = await ctx.getAttachment(attachmentId)
-        const job = (await ctx.getAttachmentJobs(attachmentId)).find(
-          (candidate) => candidate.id === input.jobId,
-        )
+        const job = await ctx.getAttachmentJob(input.jobId)
+        if (job?.attachmentId !== attachmentId) return undefined
         if (!attachment || !isGeneratedOutputLocalizationJob(job)) return undefined
         if (!generatedOutputLocalizationSourceMatches(attachment, job)) return undefined
         const claimable =
@@ -8585,16 +9013,14 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     input: GeneratedOutputLocalizationRetryInput,
     commit: BrowserCommandCommit,
   ): Promise<GeneratedOutputLocalizationJobResult> {
-    const attachmentId = await this.generatedOutputLocalizationAttachmentId(input.jobId, commit)
-    if (!attachmentId) return { outcome: 'missing' }
+    const { attachmentId } = input
     const mutation = await this.runMutation(
       [{ kind: 'attachment', attachmentId }],
       async (ctx) => {
         const attachment = await ctx.getAttachment(attachmentId)
-        const job = (await ctx.getAttachmentJobs(attachmentId)).find(
-          (candidate) => candidate.id === input.jobId,
-        )
-        if (!attachment || !job) return { outcome: 'missing' as const }
+        const job = await ctx.getAttachmentJob(input.jobId)
+        if (job?.attachmentId !== attachmentId) return { outcome: 'missing' as const }
+        if (!attachment) return { outcome: 'missing' as const }
         if (!generatedOutputLocalizationLeaseMatches(attachment, job, input.leaseId)) {
           return { outcome: 'stale' as const, attachmentId }
         }
@@ -8613,16 +9039,14 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     input: GeneratedOutputLocalizationFailInput,
     commit: BrowserCommandCommit,
   ): Promise<GeneratedOutputLocalizationJobResult> {
-    const attachmentId = await this.generatedOutputLocalizationAttachmentId(input.jobId, commit)
-    if (!attachmentId) return { outcome: 'missing' }
+    const { attachmentId } = input
     const mutation = await this.runMutation(
       [{ kind: 'attachment', attachmentId }],
       async (ctx) => {
         const attachment = await ctx.getAttachment(attachmentId)
-        const job = (await ctx.getAttachmentJobs(attachmentId)).find(
-          (candidate) => candidate.id === input.jobId,
-        )
-        if (!attachment || !job) return { outcome: 'missing' as const }
+        const job = await ctx.getAttachmentJob(input.jobId)
+        if (job?.attachmentId !== attachmentId) return { outcome: 'missing' as const }
+        if (!attachment) return { outcome: 'missing' as const }
         if (!generatedOutputLocalizationLeaseMatches(attachment, job, input.leaseId)) {
           return { outcome: 'stale' as const, attachmentId }
         }
@@ -8644,16 +9068,14 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     input: GeneratedOutputLocalizationCompleteInput,
     commit: BrowserCommandCommit,
   ): Promise<GeneratedOutputLocalizationJobResult> {
-    const attachmentId = await this.generatedOutputLocalizationAttachmentId(input.jobId, commit)
-    if (!attachmentId) return { outcome: 'missing' }
+    const { attachmentId } = input
     const mutation = await this.runMutation(
       [{ kind: 'attachment', attachmentId }],
       async (ctx) => {
         const attachment = await ctx.getAttachment(attachmentId)
-        const job = (await ctx.getAttachmentJobs(attachmentId)).find(
-          (candidate) => candidate.id === input.jobId,
-        )
-        if (!attachment || !job) return { outcome: 'missing' as const }
+        const job = await ctx.getAttachmentJob(input.jobId)
+        if (job?.attachmentId !== attachmentId) return { outcome: 'missing' as const }
+        if (!attachment) return { outcome: 'missing' as const }
         if (!generatedOutputLocalizationLeaseMatches(attachment, job, input.leaseId)) {
           return { outcome: 'stale' as const, attachmentId }
         }
@@ -8697,171 +9119,150 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     input: GeneratedOutputVideoExpandInput,
     commit: BrowserCommandCommit,
   ): Promise<GeneratedOutputVideoExpandResult> {
-    const attachmentId = await this.generatedOutputLocalizationAttachmentId(input.jobId, commit)
-    if (!attachmentId) {
-      return { outcome: 'missing', presentations: [], drafts: [], changedAttachmentIds: [] }
-    }
+    const { attachmentId } = input
     if (input.attachmentBundles.length === 0) {
       throw new Error(`GeneratedOutputVideoExpansionEmpty:${attachmentId}`)
     }
-    for (;;) {
-      const plannedEdges = await this.listAttachmentReferenceEdges(attachmentId)
-      const messageIds = [
-        ...new Set(
-          plannedEdges.flatMap((edge) => (edge.ownerKind === 'message' ? [edge.ownerId] : [])),
-        ),
-      ]
-      const draftChatIds = [
-        ...new Set(
-          plannedEdges.flatMap((edge) => (edge.ownerKind === 'draft' ? [edge.chatId] : [])),
-        ),
-      ]
-      try {
-        const mutation = await this.runMutation(
-          dedupeMutationScopes([
-            { kind: 'attachment', attachmentId },
-            ...input.attachmentBundles.map((bundle) => ({
-              kind: 'attachment' as const,
-              attachmentId: bundle.attachment.id,
-            })),
-            ...messageIds.map((messageId) => ({ kind: 'message' as const, messageId })),
-            ...draftChatIds.map((chatId) => ({ kind: 'draft' as const, chatId })),
-          ]),
-          async (ctx) => {
-            const attachment = await ctx.getAttachment(attachmentId)
-            const job = (await ctx.getAttachmentJobs(attachmentId)).find(
-              (candidate) => candidate.id === input.jobId,
-            )
-            if (!attachment || !job) {
-              return {
-                outcome: 'missing' as const,
-                presentations: [],
-                drafts: [],
-                changedAttachmentIds: [],
-              }
+    const plan = await readGeneratedOutputVideoExpansionPlan(commit, attachmentId)
+    const mutation = await this.runMutation(
+      dedupeMutationScopes([
+        { kind: 'attachment', attachmentId },
+        ...input.attachmentBundles.map((bundle) => ({
+          kind: 'attachment' as const,
+          attachmentId: bundle.attachment.id,
+        })),
+        ...plan.messageIds.map((messageId) => ({ kind: 'message' as const, messageId })),
+        ...plan.draftChatIds.map((chatId) => ({ kind: 'draft' as const, chatId })),
+      ]),
+      async (ctx) => {
+        const attachment = await ctx.getAttachment(attachmentId)
+        const job = await ctx.getAttachmentJob(input.jobId)
+        if (job?.attachmentId !== attachmentId) {
+          return {
+            outcome: 'missing' as const,
+            presentations: [],
+            drafts: [],
+            changedAttachmentIds: [],
+          }
+        }
+        if (!attachment) {
+          return {
+            outcome: 'missing' as const,
+            presentations: [],
+            drafts: [],
+            changedAttachmentIds: [],
+          }
+        }
+        if (!generatedOutputLocalizationLeaseMatches(attachment, job, input.leaseId)) {
+          return {
+            outcome: 'stale' as const,
+            attachmentId,
+            presentations: [],
+            drafts: [],
+            changedAttachmentIds: [],
+          }
+        }
+        const currentEdges = await ctx.getAttachmentReferenceEdges(attachmentId)
+        const currentMessageIds = [
+          ...new Set(
+            currentEdges.flatMap((edge) => (edge.ownerKind === 'message' ? [edge.ownerId] : [])),
+          ),
+        ]
+        const currentDraftChatIds = [
+          ...new Set(
+            currentEdges.flatMap((edge) => (edge.ownerKind === 'draft' ? [edge.chatId] : [])),
+          ),
+        ]
+        if (
+          currentMessageIds.some((messageId) => !plan.messageIds.includes(messageId)) ||
+          currentDraftChatIds.some((chatId) => !plan.draftChatIds.includes(chatId))
+        ) {
+          return {
+            outcome: 'plan-changed' as const,
+            attachmentId,
+            presentations: [],
+            drafts: [],
+            changedAttachmentIds: [],
+          }
+        }
+        const replacementIds = input.attachmentBundles.map((bundle) => bundle.attachment.id)
+        for (const bundle of input.attachmentBundles) {
+          if (bundle.attachment.origin !== 'generated-output') {
+            throw new Error(`GeneratedOutputVideoExpansionOrigin:${bundle.attachment.id}`)
+          }
+          const existing = await ctx.getAttachment(bundle.attachment.id)
+          if (existing) {
+            if (!preparedAttachmentIdentityMatches(existing, bundle.attachment)) {
+              throw new Error(`GeneratedOutputVideoExpansionCollision:${bundle.attachment.id}`)
             }
-            if (!generatedOutputLocalizationLeaseMatches(attachment, job, input.leaseId)) {
-              return {
-                outcome: 'stale' as const,
-                attachmentId,
-                presentations: [],
-                drafts: [],
-                changedAttachmentIds: [],
-              }
-            }
-            const currentEdges = await ctx.getAttachmentReferenceEdges(attachmentId)
-            const currentMessageIds = [
-              ...new Set(
-                currentEdges.flatMap((edge) =>
-                  edge.ownerKind === 'message' ? [edge.ownerId] : [],
-                ),
-              ),
-            ]
-            const currentDraftChatIds = [
-              ...new Set(
-                currentEdges.flatMap((edge) => (edge.ownerKind === 'draft' ? [edge.chatId] : [])),
-              ),
-            ]
-            if (
-              currentMessageIds.some((messageId) => !messageIds.includes(messageId)) ||
-              currentDraftChatIds.some((chatId) => !draftChatIds.includes(chatId))
-            ) {
-              throw new GeneratedOutputLocalizationPlanChangedError()
-            }
-            const replacementIds = input.attachmentBundles.map((bundle) => bundle.attachment.id)
-            for (const bundle of input.attachmentBundles) {
-              if (bundle.attachment.origin !== 'generated-output') {
-                throw new Error(`GeneratedOutputVideoExpansionOrigin:${bundle.attachment.id}`)
-              }
-              const existing = await ctx.getAttachment(bundle.attachment.id)
-              if (existing) {
-                if (!preparedAttachmentIdentityMatches(existing, bundle.attachment)) {
-                  throw new Error(`GeneratedOutputVideoExpansionCollision:${bundle.attachment.id}`)
-                }
-              } else {
-                await persistPreparedAttachmentBundleInMutation(ctx, bundle)
-              }
-            }
-            const presentations: MessagePresentation[] = []
-            for (const messageId of currentMessageIds) {
-              const message = await ctx.getMessage(messageId)
-              if (!message || message.deleted) continue
-              const content = replaceGeneratedPollingVideoContent(
-                message.content,
-                attachmentId,
-                replacementIds,
-              )
-              const refs = replaceGeneratedPollingVideoRefs(
-                message.attachmentRefs,
-                attachmentId,
-                replacementIds,
-                { kind: 'message', chatId: message.chatId, messageId: message.id },
-                input.now,
-              )
-              if (!content.changed && !refs.changed) continue
-              const presentation = await ctx.patchMessageBody(
-                message.id,
-                { content: content.content },
-                { headerPatch: { attachmentRefs: refs.refs }, touchChatSummary: false },
-              )
-              if (presentation) presentations.push(presentation)
-            }
-            const drafts: DraftRow[] = []
-            for (const chatId of currentDraftChatIds) {
-              const draft = await ctx.getDraft(chatId)
-              if (!draft) continue
-              const refs = replaceGeneratedPollingVideoRefs(
-                draft.attachmentRefs,
-                attachmentId,
-                replacementIds,
-                { kind: 'draft', chatId },
-                input.now,
-              )
-              if (!refs.changed) continue
-              const next = {
-                ...draft,
-                attachmentRefs: refs.refs,
-                updatedAt: strictlyMonotonicTimestamp(draft.updatedAt, input.now),
-              }
-              await ctx.putDraft(next)
-              drafts.push(next)
-            }
-            const counts = await ctx.countAttachmentReferences(attachmentId)
-            if (counts.occurrences === 0) {
-              await ctx.deleteAttachment(attachmentId)
-            } else {
-              await ctx.putAttachmentJob(succeededGeneratedOutputLocalizationJob(job, input.now), {
-                affectsWire: false,
-              })
-            }
-            return {
-              outcome: 'committed' as const,
-              attachmentId,
-              presentations,
-              drafts,
-              changedAttachmentIds: [attachmentId, ...replacementIds],
-            }
-          },
-          undefined,
-          commit,
-        )
-        return mutation.value
-      } catch (error) {
-        if (error instanceof GeneratedOutputLocalizationPlanChangedError) continue
-        throw error
-      }
-    }
-  }
-
-  private async generatedOutputLocalizationAttachmentId(
-    jobId: string,
-    _commit: BrowserCommandCommit,
-  ): Promise<AttachmentId | undefined> {
-    const db = await this.openDb()
-    const row = await db.transaction('r', db.attachmentJobs, async (tx) => {
-      return tx.table<AttachmentJob, string>('attachmentJobs').get(jobId)
-    })
-    return row?.attachmentId
+          } else {
+            await persistPreparedAttachmentBundleInMutation(ctx, bundle)
+          }
+        }
+        const presentations: MessagePresentation[] = []
+        for (const messageId of currentMessageIds) {
+          const message = await ctx.getMessage(messageId)
+          if (!message || message.deleted) continue
+          const content = replaceGeneratedPollingVideoContent(
+            message.content,
+            attachmentId,
+            replacementIds,
+          )
+          const refs = replaceGeneratedPollingVideoRefs(
+            message.attachmentRefs,
+            attachmentId,
+            replacementIds,
+            { kind: 'message', chatId: message.chatId, messageId: message.id },
+            input.now,
+          )
+          if (!content.changed && !refs.changed) continue
+          const presentation = await ctx.patchMessageBody(
+            message.id,
+            { content: content.content },
+            { headerPatch: { attachmentRefs: refs.refs }, touchChatSummary: false },
+          )
+          if (presentation) presentations.push(presentation)
+        }
+        const drafts: DraftRow[] = []
+        for (const chatId of currentDraftChatIds) {
+          const draft = await ctx.getDraft(chatId)
+          if (!draft) continue
+          const refs = replaceGeneratedPollingVideoRefs(
+            draft.attachmentRefs,
+            attachmentId,
+            replacementIds,
+            { kind: 'draft', chatId },
+            input.now,
+          )
+          if (!refs.changed) continue
+          const next = {
+            ...draft,
+            attachmentRefs: refs.refs,
+            updatedAt: strictlyMonotonicTimestamp(draft.updatedAt, input.now),
+          }
+          await ctx.putDraft(next)
+          drafts.push(next)
+        }
+        const counts = await ctx.countAttachmentReferences(attachmentId)
+        if (counts.occurrences === 0) {
+          await ctx.deleteAttachment(attachmentId)
+        } else {
+          await ctx.putAttachmentJob(succeededGeneratedOutputLocalizationJob(job, input.now), {
+            affectsWire: false,
+          })
+        }
+        return {
+          outcome: 'committed' as const,
+          attachmentId,
+          presentations,
+          drafts,
+          changedAttachmentIds: [attachmentId, ...replacementIds],
+        }
+      },
+      undefined,
+      commit,
+    )
+    return mutation.value
   }
 
   private async generatedOutputLocalizationProfileIds(
@@ -9028,7 +9429,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
           true,
         )
         .limit(limit)
-        .primaryKeys()
+        .toArray()
       const remaining = limit - pending.length
       const expired =
         remaining > 0
@@ -9041,7 +9442,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
                 true,
               )
               .limit(remaining)
-              .primaryKeys()
+              .toArray()
           : []
       const [nextPending, nextLease] = await Promise.all([
         db.attachmentJobs
@@ -9068,7 +9469,10 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
         nextLease?.leaseExpiresAt ?? Number.POSITIVE_INFINITY,
       )
       return {
-        readyJobIds: [...pending, ...expired].map(String),
+        readyJobs: [...pending, ...expired].map((job) => ({
+          jobId: job.id,
+          attachmentId: job.attachmentId,
+        })),
         ...(Number.isFinite(nextWakeAt) ? { nextWakeAt } : {}),
       }
     })
@@ -9261,13 +9665,6 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
         return rows
       },
     )
-  }
-
-  async getDraft(chatId: ChatId): Promise<DraftRow | undefined> {
-    return this.openDb().then(async (db) => {
-      const row = await db.drafts.get(chatId)
-      return row ? cloneDraft(row) : undefined
-    })
   }
 
   async runMutation<T, U = T, ExtensionResult = undefined>(
@@ -9626,7 +10023,54 @@ function collapseConversationConstructionPublication(delta: WorkspaceDelta): Wor
   }
 }
 
-let singleton: { repository: WorkspaceRepository; session: BrowserWorkspaceSession } | null = null
+function stagedCommandLockSession(database: NatterDb): AuthoritativeCommandLockSession {
+  return Object.freeze({
+    kind: 'indexeddb-fence' as const,
+    withResourceLocks: async <T>(
+      resourceNames: readonly string[],
+      operation: (grant: LockGrant) => Promise<T> | T,
+    ): Promise<T> =>
+      operation({
+        kind: 'indexeddb-fence',
+        logicalNames: Object.freeze([...new Set(resourceNames)].sort()),
+        runTransaction: (target, tables, transactionOperation) => {
+          if (target !== database) throw new Error('StagedCommandDatabaseChanged')
+          return database.transaction(
+            'rw',
+            tables.map((table) => database.table(typeof table === 'string' ? table : table.name)),
+            transactionOperation,
+          )
+        },
+      }),
+  })
+}
+
+export function executeBrowserCommandInStagedDatabase<C extends WorkspaceCommand>(
+  database: NatterDb,
+  workspace: WorkspaceFence,
+  command: C,
+): Promise<BrowserStagedCommandExecution<C>> {
+  const session: BrowserWorkspaceSession = {
+    generation: 0,
+    databaseName: database.name,
+    isCurrent: () => true,
+    isOpen: () => database.isOpen(),
+    assertCurrent: () => {},
+    bindWorkspaceFence: () => {
+      throw new Error('StagedCommandWorkspaceFenceImmutable')
+    },
+    getWorkspaceFence: () => workspace,
+    open: () => Promise.resolve(database),
+    runOperation: (operation) => operation(database),
+  }
+  return new BrowserWorkspaceRepository(session).executeStagedCommand(database, workspace, command)
+}
+
+let singleton: {
+  repository: WorkspaceRepository
+  session: BrowserWorkspaceSession
+  target: BrowserWorkspaceRepository
+} | null = null
 
 async function replaceBrowserRepository<R extends WorkspaceReplacement>(
   replacement: R,
@@ -9667,12 +10111,16 @@ function bindRepositoryToSession(
 }
 
 function currentBrowserWorkspaceSessionRepository(): WorkspaceRepository {
+  return currentBrowserWorkspaceRepositoryBinding().repository
+}
+
+function currentBrowserWorkspaceRepositoryBinding(): NonNullable<typeof singleton> {
   const session = getBrowserWorkspaceSession()
   if (singleton?.session !== session) {
     const target = new BrowserWorkspaceRepository(session)
-    singleton = { repository: bindRepositoryToSession(target, session), session }
+    singleton = { repository: bindRepositoryToSession(target, session), session, target }
   }
-  return singleton.repository
+  return singleton
 }
 
 const stableBrowserRepository: WorkspaceRepository = Object.freeze({
@@ -9689,6 +10137,17 @@ const stableBrowserRepository: WorkspaceRepository = Object.freeze({
 
 export function getBrowserRepository(): WorkspaceRepository {
   return stableBrowserRepository
+}
+
+export function tryExecuteBrowserWorkspaceCommandWithinFanoutBudget<C extends WorkspaceCommand>(
+  permit: WorkspaceWriteAuthority,
+  command: C,
+  budget: BrowserCommandFanoutBudget = BROWSER_COMMAND_DIRECT_FANOUT_BUDGET,
+): Promise<BrowserCommandFanoutAdmission<C>> {
+  const { session, target } = currentBrowserWorkspaceRepositoryBinding()
+  return runBrowserWorkspaceRepositoryOperation(() =>
+    session.runOperation(() => target.tryExecuteCommandWithinFanoutBudget(permit, command, budget)),
+  )
 }
 
 export function __getBrowserWorkspaceSessionRepositoryForTests(): WorkspaceRepository {

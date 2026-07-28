@@ -138,6 +138,7 @@ describe('MessageContent', () => {
     expect(onMutateAttachmentRef).toHaveBeenCalledWith({
       kind: 'visibility',
       refId: 'generated-ref-1',
+      expectedAttachmentId: 'generated-image-1',
       includeInContext: false,
     })
   })

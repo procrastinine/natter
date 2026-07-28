@@ -108,6 +108,25 @@ export interface ChatRowWriteMutationReceipt<
   readonly fragment: SemanticOperationReceiptFragment<Tables>
 }
 
+export interface PreservingChatRowReplacement {
+  readonly previous: Chat
+  readonly next: Chat
+}
+
+export function applyPreservingChatRowReplacements(
+  tx: Transaction,
+  replacements: readonly PreservingChatRowReplacement[],
+): Promise<ChatRowWriteMutationReceipt<ChatRowPreservingReceiptTableName>> {
+  return applyChatRowWriteTransitions(
+    tx,
+    replacements.map(({ previous, next }) => ({
+      kind: 'replace-preserving-links' as const,
+      previous,
+      next,
+    })),
+  )
+}
+
 function chatRowWriteTransition(input: ChatRowWriteTransitionInput): ChatRowWriteTransition {
   return Object.freeze({ ...input, [chatRowWriteTransitionBrand]: true as const })
 }
@@ -295,7 +314,7 @@ class TransactionChatMutationOwner implements LinkedChatMutationOwner {
     return rows.map((row) => this.#current.get(row.id) as Chat)
   }
 
-  async add(next: Chat): Promise<void> {
+  add(next: Chat): Promise<void> {
     this.#assertOpen()
     if (!this.linked) throw new Error('ChatMutationLinkedWriteNotAllowed')
     if (this.#current.get(next.id) || this.#additions.has(next.id)) {
@@ -304,6 +323,7 @@ class TransactionChatMutationOwner implements LinkedChatMutationOwner {
     if (!this.#original.has(next.id)) this.#register(next.id, undefined)
     this.#additions.set(next.id, next)
     this.#current.set(next.id, next)
+    return Promise.resolve()
   }
 
   replaceLinked(chatId: ChatId, update: (current: Readonly<Chat>) => Chat): Chat {

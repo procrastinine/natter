@@ -42,9 +42,6 @@ export function configurationProfileUsageResourceNamesForLinks(
   )
 }
 
-export const CONFIGURATION_LINK_ROWS_TRANSACTION_CAPABILITY =
-  physicalStorageTables('configurationLinks')
-
 export const CONFIGURATION_LINK_MUTATION_TRANSACTION_CAPABILITY = physicalStorageTables(
   'configurationLinks',
   'configurationProfileUsageRows',

@@ -40,6 +40,7 @@ export const WORKSPACE_ROOT_REPLACEMENT_DISPOSITIONS = Object.freeze({
   'workspace-organization': 'drain',
   configuration: 'drain',
   attachment: 'drain',
+  'command-fanout': 'drain',
   'import-export': 'drain',
   'repository-query': 'cancel',
   'search-session': 'cancel',
@@ -52,7 +53,7 @@ export type WorkspaceRootKind = keyof typeof WORKSPACE_ROOT_REPLACEMENT_DISPOSIT
 
 export type WorkspaceReplacementRootKind = Extract<
   WorkspaceRootKind,
-  'import-export' | 'maintenance'
+  'command-fanout' | 'import-export' | 'maintenance'
 >
 
 type WorkspaceRootSubset<Kind extends WorkspaceRootKind> = Kind
@@ -837,9 +838,24 @@ export function createWorkspaceRuntimeKernel() {
     enterQuiescing: () => void,
   ): WorkspaceReconcileAuthority | null {
     if (options.signal?.aborted) throw options.signal.reason
-    if (state !== 'RUNNING' || (options.requireIdle && !hasNoActiveWork())) return null
+    const matchingRoots = options.lineageId
+      ? [...activeRoots].filter((candidate) => candidate.permit.lineageId === options.lineageId)
+      : []
+    if (matchingRoots.length > 1) {
+      throw new Error(`WorkspaceRuntimeReplacementLineageAmbiguous:${options.lineageId}`)
+    }
+    const promotedRoot = matchingRoots[0]
+    const otherwiseIdle =
+      activeChildren.size === 0 &&
+      activeRoots.size === (promotedRoot === undefined ? 0 : 1) &&
+      activeCount === (promotedRoot === undefined ? 0 : 1)
+    if (state !== 'RUNNING' || (options.requireIdle && !otherwiseIdle)) return null
     const blockerIds = [...activeRoots]
-      .filter((candidate) => WORKSPACE_ROOT_REPLACEMENT_DISPOSITIONS[candidate.kind] === 'block')
+      .filter(
+        (candidate) =>
+          candidate !== promotedRoot &&
+          WORKSPACE_ROOT_REPLACEMENT_DISPOSITIONS[candidate.kind] === 'block',
+      )
       .map((candidate) =>
         candidate.permit.lineageId.startsWith('generation:')
           ? candidate.permit.lineageId.slice('generation:'.length)
@@ -847,7 +863,7 @@ export function createWorkspaceRuntimeKernel() {
       )
       .sort()
     if (blockerIds.length > 0) throw new WorkspaceRuntimeReplacementBlockedError(blockerIds)
-    const root = admitRoot(kind, 'write-root', options)
+    const root = promotedRoot ?? admitRoot(kind, 'write-root', options)
     if (authority) deactivateAuthorityRecord(authority)
     const record = {} as AuthorityPermitRecord
     const next = createPermit<WorkspaceReconcileAuthority>(
@@ -855,12 +871,14 @@ export function createWorkspaceRuntimeKernel() {
       root.controller.signal,
       record,
     )
+    const transferredProducerOwnership = promotedRoot?.kind === 'maintenance'
+    if (transferredProducerOwnership) root.unlink()
     Object.assign(record, {
       type: 'replacement-authority',
       rootKind: kind,
       permit: next,
       controller: root.controller,
-      unlink: root.unlink,
+      unlink: transferredProducerOwnership ? () => {} : root.unlink,
       active: true,
     } satisfies AuthorityPermitRecord)
     root.repositoryAdmissionOpen = false

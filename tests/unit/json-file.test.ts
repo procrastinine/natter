@@ -11,7 +11,6 @@ import {
   __jsonDocumentChunksForTests,
   __jsonIoMaterializationMetricsForTests,
   __resetJsonIoMaterializationMetricsForTests,
-  forEachJsonOrZipFile,
   importExportErrorMessage,
   jsonDocumentBlob,
   jsonEntriesZipBlob,
@@ -51,6 +50,12 @@ describe('workspace replacement recovery diagnostics', () => {
         new WorkspaceReplacementOutcomeUnknownError([new Error('inspection failed')]),
       ),
     ).toContain('could not be confirmed')
+  })
+
+  it('turns internal import validation failures into one actionable boundary error', () => {
+    expect(importExportErrorMessage(new Error('ImportRowInvalid:chat.presetId'))).toBe(
+      'The selected file is not a valid Natter export, so nothing was imported.',
+    )
   })
 })
 
@@ -215,27 +220,23 @@ describe('incremental JSON export', () => {
     expect(metrics.fileDecodedBytes).toBe(file.size)
   })
 
-  it('consumes filename-sorted ZIP values sequentially and releases entry wrappers', async () => {
+  it('returns filename-sorted ZIP values and releases entry wrappers', async () => {
     const blob = await jsonEntriesZipBlob([
       { filename: 'zeta.json', value: { ordinal: 2 } },
       { filename: 'alpha.json', value: { ordinal: 1 } },
     ])
     const file = new File([blob], 'ordered.zip', { type: 'application/zip' })
-    const ordinals: number[] = []
     __resetJsonIoMaterializationMetricsForTests()
 
-    const count = await forEachJsonOrZipFile(file, async (value) => {
-      ordinals.push((value as { ordinal: number }).ordinal)
-    })
+    const values = await readJsonOrZipFile(file)
     const metrics = __jsonIoMaterializationMetricsForTests()
 
-    expect(count).toBe(2)
-    expect(ordinals).toEqual([1, 2])
+    expect(values).toEqual([{ ordinal: 1 }, { ordinal: 2 }])
     expect(metrics.maxParsedZipEntriesRetained).toBe(2)
     expect(metrics.parsedZipEntryWrappersReleased).toBe(2)
   })
 
-  it('validates every ZIP entry before invoking the sequential consumer', async () => {
+  it('rejects the whole ZIP when any JSON entry is invalid', async () => {
     const file = new File(
       [
         zipSync({
@@ -246,12 +247,7 @@ describe('incremental JSON export', () => {
       'invalid-later.zip',
       { type: 'application/zip' },
     )
-    const consume = vi.fn()
-
-    await expect(forEachJsonOrZipFile(file, consume)).rejects.toThrow(
-      'zeta.json is not valid JSON.',
-    )
-    expect(consume).not.toHaveBeenCalled()
+    await expect(readJsonOrZipFile(file)).rejects.toThrow('zeta.json is not valid JSON.')
   })
 
   it('assembles JSON and ZIP blobs from immutable parts without a final byte copy', async () => {

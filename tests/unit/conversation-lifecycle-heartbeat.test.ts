@@ -355,8 +355,7 @@ class TestProjectionSource implements ConversationProjectionSource {
       slotVersion: siblings.reduce((sum, row) => sum + row.header.nodeVersion + 1, 0),
       position,
       liveCount: siblings.length,
-      nextSiblingIndex:
-        Math.max(...siblings.map((row) => row.header.siblingIndex)) + 1,
+      nextSiblingIndex: Math.max(...siblings.map((row) => row.header.siblingIndex)) + 1,
       previousMessageId: siblings[position - 1]?.header.id ?? null,
       nextMessageId: siblings[position + 1]?.header.id ?? null,
       firstMessageId: first.header.id,
@@ -428,6 +427,15 @@ describe('conversation lifecycle heartbeat', () => {
     navigation.arrive('arrival-1', selected.id)
     await settle()
 
+    controller.applyCommittedEffect({
+      ...FENCE,
+      chatId: CHAT_ID,
+      source: 'invalidation',
+      kind: 'changed',
+      structural: { kind: 'none' },
+      refresh: { forkParentIds: [root.id] },
+    })
+    await settle()
     expect(source.loadForks).toHaveBeenCalledTimes(1)
     expect(source.forkSignals[0]?.aborted).toBe(false)
     controller.applyCommittedEffect({

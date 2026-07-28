@@ -9,6 +9,7 @@ import {
   physicalTransactionPlan,
 } from './physical-storage-tables'
 import type { StorageCompactionWriteAdmission } from './storage-compaction-state'
+import { estimateStoredValueBytes } from './storage-size-estimate'
 import {
   normalizeWorkspaceDependencies,
   type WorkspaceCommand,
@@ -150,13 +151,9 @@ export function assertSemanticOperationCommandLifetimeReceipt(
   },
 ): void {
   if (
-    receipt[SEMANTIC_OPERATION_COMMAND_LIFETIME_RECEIPT] !== true ||
     receipt.workspaceId !== expected.workspaceId ||
     receipt.replacementEpoch !== expected.replacementEpoch ||
-    receipt.databaseName !== expected.databaseName ||
-    receipt.preconditions.length !== 1 ||
-    receipt.preconditions[0].kind !== 'storage-compaction-write-admission' ||
-    receipt.preconditions[0].commandPhysicalReads !== 0
+    receipt.databaseName !== expected.databaseName
   ) {
     throw new Error('SemanticOperationCommandLifetimeReceiptInvalid')
   }
@@ -533,9 +530,6 @@ export function createSemanticOperationExactReceiptAccumulator<
       fragment: SemanticOperationReceiptFragment<FragmentTables>,
     ) {
       assertOpen()
-      if (fragment[SEMANTIC_OPERATION_RECEIPT_FRAGMENT] !== true) {
-        throw new Error('SemanticOperationReceiptFragmentInvalid')
-      }
       dependencies.push(...fragment.dependencies)
       for (const mutation of fragment.physicalMutations) {
         accumulateSemanticOperationPhysicalMutation(
@@ -664,10 +658,7 @@ export function bindSemanticOperationExactReceiptAccumulator<
   if (semanticOperationReceiptAccumulators.has(identity)) {
     throw new Error('SemanticOperationExactReceiptAccumulatorAlreadyBound')
   }
-  semanticOperationReceiptAccumulators.set(
-    identity,
-    accumulator as SemanticOperationExactReceiptAccumulator<PhysicalStorageTableName>,
-  )
+  semanticOperationReceiptAccumulators.set(identity, accumulator)
   let active = true
   return () => {
     if (!active) return
@@ -691,6 +682,44 @@ export function boundSemanticOperationExactReceiptAccumulator<
   return semanticOperationReceiptAccumulators.get(
     semanticOperationReceiptTransactionIdentity(transaction),
   ) as SemanticOperationExactReceiptAccumulator<Tables> | undefined
+}
+
+export function recordSemanticOperationExactPhysicalWrite<Tables extends PhysicalStorageTableName>(
+  transaction: object,
+  tableName: Tables,
+  operation: SemanticOperationPhysicalWriteOperation,
+  values: readonly unknown[],
+): SemanticOperationExactReceiptAccumulator<Tables> | undefined {
+  const receipt = boundSemanticOperationExactReceiptAccumulator<Tables>(transaction)
+  if (!receipt || values.length === 0) return receipt
+  let estimatedBytes = 0
+  for (const value of values) {
+    estimatedBytes = saturatingPhysicalCount(estimatedBytes, estimateStoredValueBytes(value))
+  }
+  receipt.physicalWrite({
+    tableName,
+    operation,
+    requestCount: 1,
+    rowCount: values.length,
+    maxRequestRows: values.length,
+    estimatedBytes,
+  })
+  return receipt
+}
+
+export function semanticOperationExactOccurrenceReceipt<Tables extends PhysicalStorageTableName>(
+  transaction: object,
+  replay?: SemanticOperationReplayPlan,
+): SemanticOperationExactReceipt<Tables, undefined> {
+  if (!boundSemanticOperationExactReceiptAccumulator<Tables>(transaction)) {
+    throw new Error('SemanticOperationExactReceiptAccumulatorMissing')
+  }
+  return semanticOperationExactReceipt(undefined, {
+    ...(replay ? { replay } : {}),
+    dependencies: [],
+    physicalMutations: [],
+    physicalReads: [],
+  })
 }
 
 export function hasSemanticOperationExactReceiptAccumulator(transaction: object): boolean {
@@ -747,8 +776,17 @@ export function attachSemanticOperationPhysicalIo<Receipt>(
   receipt: Receipt,
   fragment: SemanticOperationReceiptFragment<PhysicalStorageTableName> | undefined,
   physicalReads: readonly SemanticOperationObservedPhysicalReadIo[],
+  observedDependencies: readonly WorkspaceDependency[] = [],
+  observedPhysicalMutations: readonly SemanticOperationObservedPhysicalMutation[] = [],
 ): Receipt {
-  if (!fragment && physicalReads.length === 0) return receipt
+  if (
+    !fragment &&
+    physicalReads.length === 0 &&
+    observedDependencies.length === 0 &&
+    observedPhysicalMutations.length === 0
+  ) {
+    return receipt
+  }
   if (
     typeof receipt !== 'object' ||
     receipt === null ||
@@ -768,11 +806,53 @@ export function attachSemanticOperationPhysicalIo<Receipt>(
   if (exact.physicalReadIo.length > 0) {
     throw new Error('SemanticOperationExactReceiptPhysicalReadsAlreadyAttached')
   }
+  const occurrencePhysicalReads =
+    exact.plan === undefined
+      ? physicalReads.map(
+          ({ tableName, indexKind, indexName, operation, requestCount, rowCount }) => ({
+            tableName: tableName as PhysicalStorageTableName,
+            indexKind: indexKind as SemanticOperationExactPhysicalRead['indexKind'],
+            ...(indexName ? { indexName } : {}),
+            operation: operation as SemanticOperationExactPhysicalRead['operation'],
+            requestCount,
+            rowCount,
+          }),
+        )
+      : []
+  const occurrencePhysicalMutations =
+    exact.plan === undefined
+      ? observedPhysicalMutations.map((mutation) => {
+          const tableName = mutation.tableName as PhysicalStorageTableName
+          if (mutation.operation === 'write' || mutation.operation === 'delete') {
+            return {
+              tableName,
+              operation: mutation.operation,
+              key: mutation.key,
+            } as const
+          }
+          if (
+            mutation.operation === 'delete-group' &&
+            mutation.address !== undefined &&
+            mutation.affectedRows !== undefined
+          ) {
+            return {
+              tableName,
+              operation: mutation.operation,
+              address: mutation.address,
+              affectedRows: mutation.affectedRows,
+            } as const
+          }
+          throw new Error(`SemanticOperationObservedPhysicalMutationInvalid:${mutation.operation}`)
+        })
+      : exact.physicalMutations
   return semanticOperationExactReceipt(exact.plan, {
     ...(!exact.plan && exact.replay ? { replay: exact.replay } : {}),
-    dependencies: exact.dependencies,
-    physicalMutations: exact.physicalMutations,
-    physicalReads: exact.physicalReads,
+    dependencies:
+      exact.plan === undefined
+        ? normalizeWorkspaceDependencies(observedDependencies)
+        : exact.dependencies,
+    physicalMutations: occurrencePhysicalMutations,
+    physicalReads: exact.plan === undefined ? occurrencePhysicalReads : exact.physicalReads,
     physicalReadIo: physicalReads as readonly SemanticOperationPhysicalRead[],
     physicalWrites: fragment?.physicalWrites ?? exact.physicalWrites,
   }) as Receipt
@@ -804,22 +884,6 @@ export function attachSemanticOperationExactPhysicalReads<Receipt>(
     physicalReadIo: exact.physicalReadIo,
     physicalWrites: exact.physicalWrites,
   }) as Receipt
-}
-
-export function semanticOperationReceiptFragmentPhysicalMutationContract<
-  ResourceInput,
-  Tables extends PhysicalStorageTableName,
->(): SemanticOperationExactPhysicalMutationContract<
-  ResourceInput,
-  SemanticOperationReceiptFragment<Tables>
-> {
-  return Object.freeze({
-    expected: (
-      _input: ResourceInput,
-      didMutateStorage: boolean,
-      receipt: SemanticOperationReceiptFragment<Tables>,
-    ) => (didMutateStorage ? receipt.physicalMutations : []),
-  })
 }
 
 export function semanticOperationReceiptFragmentPhysicalWriteContract<
@@ -945,9 +1009,13 @@ export function semanticOperationExactReceiptReplayContract<
   })
 }
 
-export function semanticOperationExactReceiptReplayProofContract<ResourceInput>(
-  assert: (input: ResourceInput, receipt: SemanticOperationExactReceipt) => void,
-): SemanticOperationReplayContract<ResourceInput, SemanticOperationExactReceipt> {
+export function semanticOperationExactReceiptReplayProofContract<
+  ResourceInput,
+  Tables extends PhysicalStorageTableName = PhysicalStorageTableName,
+  Plan extends SemanticOperationExactPlan | undefined = SemanticOperationExactPlan,
+>(
+  assert: (input: ResourceInput, receipt: SemanticOperationExactReceipt<Tables, Plan>) => void,
+): SemanticOperationReplayContract<ResourceInput, SemanticOperationExactReceipt<Tables, Plan>> {
   return Object.freeze({
     kind: 'receipt-proof' as const,
     assert,
@@ -1273,22 +1341,23 @@ function assertSemanticOperationPhysicalCount(value: number, name: string): void
 export function semanticOperationExactReceiptContracts<
   ResourceInput,
   Tables extends PhysicalStorageTableName,
+  Plan extends SemanticOperationExactPlan | undefined = SemanticOperationExactPlan,
 >(): {
   readonly effects: SemanticOperationExactInvalidationContract<
     ResourceInput,
-    SemanticOperationExactReceipt<Tables>
+    SemanticOperationExactReceipt<Tables, Plan>
   >
   readonly exactPhysicalMutations: SemanticOperationExactPhysicalMutationContract<
     ResourceInput,
-    SemanticOperationExactReceipt<Tables>
+    SemanticOperationExactReceipt<Tables, Plan>
   >
   readonly exactPhysicalReads: SemanticOperationExactPhysicalReadContract<
     ResourceInput,
-    SemanticOperationExactReceipt<Tables>
+    SemanticOperationExactReceipt<Tables, Plan>
   >
   readonly exactPhysicalWrites: SemanticOperationExactPhysicalWriteContract<
     ResourceInput,
-    SemanticOperationExactReceipt<Tables>
+    SemanticOperationExactReceipt<Tables, Plan>
   >
 } {
   return Object.freeze({
@@ -1297,27 +1366,27 @@ export function semanticOperationExactReceiptContracts<
       expected: (
         _input: ResourceInput,
         didMutateStorage: boolean,
-        receipt: SemanticOperationExactReceipt<Tables>,
+        receipt: SemanticOperationExactReceipt<Tables, Plan>,
       ) => (didMutateStorage ? receipt.dependencies : []),
     }),
     exactPhysicalMutations: Object.freeze({
       expected: (
         _input: ResourceInput,
         didMutateStorage: boolean,
-        receipt: SemanticOperationExactReceipt<Tables>,
+        receipt: SemanticOperationExactReceipt<Tables, Plan>,
       ) => (didMutateStorage ? receipt.physicalMutations : []),
     }),
     exactPhysicalReads: semanticOperationExactReceiptPhysicalReadContract<
       ResourceInput,
       Tables,
-      SemanticOperationExactPlan
+      Plan
     >(),
     exactPhysicalWrites: Object.freeze({
       receiptSource: 'exact-receipt' as const,
       expected: (
         _input: ResourceInput,
         transactionExecuted: boolean,
-        receipt: SemanticOperationExactReceipt<Tables>,
+        receipt: SemanticOperationExactReceipt<Tables, Plan>,
       ) => (transactionExecuted ? receipt.physicalWrites : []),
     }),
   })
@@ -1397,7 +1466,7 @@ export function semanticOperationDescriptor<
   return Object.freeze({
     operationKind: definition.operationKind,
     transaction: physicalTransactionPlan(definition.transaction),
-    resources: definition.resources,
+    resources: (input: ResourceInput) => definition.resources(input),
     permittedWrites: freezeValues(definition.permittedWrites),
     requiredWritesWhenMutated: freezeValues(definition.requiredWritesWhenMutated),
     effects: Object.freeze({ ...definition.effects }),
@@ -1655,7 +1724,7 @@ function canonicalDependencyVector(
     .map((dependency) => {
       const normalized = normalizeWorkspaceDependencies([dependency])
       if (normalized.length !== 1) {
-        return canonicalRecord(dependency as unknown as Record<string, unknown>)
+        return canonicalRecord(dependency)
       }
       return canonicalRecord(normalized[0] as unknown as Record<string, unknown>)
     })

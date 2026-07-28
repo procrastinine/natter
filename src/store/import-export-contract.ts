@@ -1,3 +1,4 @@
+import type { ChatExportEnvelope } from '../core/import-export/schema'
 import type { ConversationProvedSelection } from '../core/messages'
 import type { ChatId, PresetId, ProfileId } from '../core/types'
 
@@ -10,6 +11,11 @@ export interface ImportChatOptions {
 export interface ImportChatResult {
   chatId: ChatId
   destination: ConversationProvedSelection
+}
+
+export interface ImportChatRequest {
+  envelope: ChatExportEnvelope
+  options: ImportChatOptions
 }
 
 export interface ImportChatPresetOptions {

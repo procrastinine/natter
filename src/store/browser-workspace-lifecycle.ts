@@ -25,6 +25,8 @@ import {
   cancelBrowserWorkspaceBootstrap,
   finishBrowserWorkspaceBootstrap,
 } from './browser-workspace-bootstrap-authority'
+import { recoverQuiescedBrowserWorkspaceReplacement } from './browser-workspace-database-cleanup'
+import { readBrowserWorkspaceDatabaseManifest } from './browser-workspace-database-control'
 import {
   type ActiveBrowserWorkspaceDatabaseSelection,
   activateBrowserWorkspaceDatabaseSelection,
@@ -33,6 +35,7 @@ import {
   releaseActiveBrowserWorkspaceDatabaseSelection,
   releaseOpeningBrowserWorkspaceDatabaseSelection,
 } from './browser-workspace-database-selection'
+import type { BrowserWorkspaceReplacementHandoff } from './browser-workspace-maintenance-contract'
 import type {
   BrowserWorkspaceOpenOptions,
   BrowserWorkspaceOpenProgress,
@@ -41,6 +44,7 @@ import { installBrowserWorkspaceReplacementReopen } from './browser-workspace-re
 import {
   awaitBrowserWorkspaceSlotCoordinatorIdle,
   type BrowserWorkspaceSlotCoordinatorOwner,
+  type BrowserWorkspaceSlotTransition,
   disposeBrowserWorkspaceSlotCoordinator,
   installBrowserWorkspaceSlotCoordinator,
 } from './browser-workspace-slot-coordination'
@@ -460,8 +464,8 @@ export function installBrowserWorkspaceLifecycle(): void {
       receiveFatalWorkspaceEffectFailure,
     )
     slotCoordinator = installBrowserWorkspaceSlotCoordinator({
-      quiesce: (signal) => shutdownBrowserWorkspaceWhenIdle({ signal }),
-      resume: (signal) => raceWithAbortSignal(() => resumeBrowserWorkspace(), signal),
+      validateQuiesce: validateBrowserWorkspaceSlotQuiesce,
+      reconcile: reconcileBrowserWorkspaceSlotTransition,
     })
     unsubscribeWorkspaceChanges = subscribeWorkspaceApplicationChanges((change) =>
       receiveWorkspaceChange(activity, change),
@@ -529,6 +533,27 @@ export function installBrowserWorkspaceLifecycle(): void {
     browserWorkspaceLifecycleInstallation = { kind: 'failed', error: failure }
     throw failure
   }
+}
+
+async function validateBrowserWorkspaceSlotQuiesce(
+  transition: BrowserWorkspaceSlotTransition,
+): Promise<boolean> {
+  const pending = (await readBrowserWorkspaceDatabaseManifest()).pending
+  return (
+    pending?.phase === 'preparing' &&
+    pending.nonce === transition.nonce &&
+    pending.sourceDatabaseName === transition.sourceDatabaseName &&
+    pending.destinationDatabaseName === transition.destinationDatabaseName
+  )
+}
+
+async function reconcileBrowserWorkspaceSlotTransition(
+  transition: BrowserWorkspaceSlotTransition,
+  signal: AbortSignal,
+): Promise<void> {
+  await shutdownBrowserWorkspaceWhenIdle({ signal })
+  await recoverQuiescedBrowserWorkspaceReplacement(transition, signal)
+  await raceWithAbortSignal(() => resumeBrowserWorkspace(), signal)
 }
 
 function releaseLifecycleInstallationStep(failures: unknown[], release: (() => void) | null): void {
@@ -980,7 +1005,7 @@ export function createBrowserWorkspacePromotedReplacementDrain(): BrowserWorkspa
         !isWorkspaceMaintenancePreemptedError(error) &&
         !(error instanceof DOMException && error.name === 'AbortError')
       ) {
-        console.error('Storage compaction replacement failed', error)
+        console.error('Promoted workspace replacement failed', error)
       }
     } finally {
       finish()
@@ -988,7 +1013,7 @@ export function createBrowserWorkspacePromotedReplacementDrain(): BrowserWorkspa
   }
 
   const handoffs: StorageMaintenanceReplacementHandoffPort = Object.freeze({
-    transfer: (handoff: Parameters<StorageMaintenanceReplacementHandoffPort['transfer']>[0]) => {
+    transfer: <T>(handoff: BrowserWorkspaceReplacementHandoff<T>) => {
       if (!accepting) throw new Error('BrowserWorkspacePromotedReplacementDrainClosed')
       if (activeCount === 0) {
         idle = new Promise<void>((resolve) => {

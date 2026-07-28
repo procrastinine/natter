@@ -307,7 +307,10 @@ describe('semantic operation capabilities', () => {
         true,
       ),
     ).not.toThrow()
-    expect(topology.descriptor.replay).toBeUndefined()
+    expect(topology.descriptor.replay).toEqual({
+      kind: 'caller-single-attempt',
+      plan: { kind: 'single-attempt', reason: 'non-replayable' },
+    })
     const exactOccurrence = semanticOperationExactReceipt(undefined, {
       dependencies: [],
       physicalMutations: [

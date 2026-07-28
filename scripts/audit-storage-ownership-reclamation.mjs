@@ -46,6 +46,7 @@ const REQUIRED_LIFECYCLE_IDS = Object.freeze([
   'idle-compaction-admission',
   'paged-compaction-copy',
   'retention-owned-slot-cleanup',
+  'journal-authorized-peer-recovery',
   'clear-all-origin-wipe',
   'quota-probe',
 ])
@@ -62,7 +63,6 @@ const REQUIRED_GAP_IDS = Object.freeze([
   'logical-debt-does-not-measure-physical-amplification',
   'unknown-historical-databases-unverifiable-without-enumeration',
   'quota-estimate-cannot-prove-reclamation',
-  'compaction-quiesces-whole-runtime',
 ])
 const VALID_DEBT_POLICIES = new Set([
   'typed-owner-port',
@@ -135,18 +135,18 @@ export function auditStorageOwnershipReclamation(root, inventoryModule, initialP
   const acceptance = inventoryModule?.STORAGE_RECLAMATION_ACCEPTANCE
 
   const physicalStoragePath = resolve(root, 'src/store/physical-storage-tables.ts')
-  const physicalTables = discoverStringArray(
+  const basePhysicalTables = discoverStringArray(
     physicalStoragePath,
     'PHYSICAL_STORAGE_TABLE_NAMES',
     problems,
   )
   const classTables = discoverNatterDbTables(resolve(root, 'src/store/db.ts'), problems)
-  if (!sameSortedStrings(physicalTables, classTables)) {
+  if (!sameSortedStrings(basePhysicalTables, classTables)) {
     problems.push(
-      `tables: physical-list=${sorted(physicalTables).join(',')}; NatterDb=${sorted(classTables).join(',')}`,
+      `tables: physical-list=${sorted(basePhysicalTables).join(',')}; NatterDb=${sorted(classTables).join(',')}`,
     )
   }
-  const physicalPolicy = discoverPhysicalStoragePolicy(physicalStoragePath, problems)
+  const basePhysicalPolicy = discoverPhysicalStoragePolicy(physicalStoragePath, problems)
   const physicalPolicyVocabulary = {
     schema: new Set(
       discoverStringUnion(physicalStoragePath, 'PhysicalStorageSchemaClass', problems),
@@ -159,13 +159,15 @@ export function auditStorageOwnershipReclamation(root, inventoryModule, initialP
       discoverStringUnion(physicalStoragePath, 'PhysicalStorageInterchangeAction', problems),
     ),
   }
-  validatePhysicalStoragePolicy(physicalPolicy, physicalPolicyVocabulary, problems)
-  if (!sameSortedStrings(physicalTables, [...physicalPolicy.keys()])) {
+  validatePhysicalStoragePolicy(basePhysicalPolicy, physicalPolicyVocabulary, problems)
+  if (!sameSortedStrings(basePhysicalTables, [...basePhysicalPolicy.keys()])) {
     problems.push('storage-policy: policy keys do not cover every physical table exactly once')
   }
-  if (physicalTables.join('\0') !== [...physicalPolicy.keys()].join('\0')) {
+  if (basePhysicalTables.join('\0') !== [...basePhysicalPolicy.keys()].join('\0')) {
     problems.push('storage-policy: canonical order changed')
   }
+  const physicalPolicy = withCatchupJournalPolicies(basePhysicalPolicy)
+  const physicalTables = [...physicalPolicy.keys()]
   validatePhysicalStoragePolicyConsumers(root, problems)
 
   validateExactIds(tables, physicalTables, 'tables', 'name', problems, true)
@@ -248,9 +250,12 @@ function validateCompactionAttemptRelease(root, problems) {
   const expectations = [
     [
       'src/store/browser-workspace-compaction.ts',
-      'if (!isWorkspaceMaintenancePreemptedError(error) || claim === null) throw error',
+      'if (!isRetryableBrowserWorkspaceCompactionError(error) || attemptState.claim === null)',
     ],
-    ['src/store/browser-workspace-compaction.ts', 'const release = await claim.release()'],
+    [
+      'src/store/browser-workspace-compaction.ts',
+      'const release = await attemptState.claim.release()',
+    ],
     [
       'src/store/browser-workspace-compaction.ts',
       'if (release.released) publishStorageCompactionRequest()',
@@ -269,11 +274,11 @@ function validateCompactionAttemptRelease(root, problems) {
     ],
     [
       'tests/unit/storage-retention.test.ts',
-      "it('requeues a foreground-preempted copy without new debt and then commits it once'",
+      "it('keeps foreground work live without repeating the physical copy'",
     ],
     [
       'tests/e2e/storage-reclamation.spec.ts',
-      "test('normal use retries real compaction debt and preserves two-tab work across the slot switch'",
+      "test('normal use catches up foreground work without repeating the physical copy and preserves two-tab state'",
     ],
   ]
   for (const [path, locator] of expectations) {
@@ -503,8 +508,9 @@ function validateWorkspaceReplacementLifecycle(root, problems) {
 
   for (const [source, token, expected, label] of [
     [control, "readonly phase: 'discard'", 1, 'durable discard journal variant'],
-    [cleanup, 'await abandonPreparedBrowserWorkspaceDatabase(journal)', 1, 'cleanup abandon'],
+    [cleanup, 'await abandonPreparedBrowserWorkspaceDatabase(journal)', 2, 'cleanup abandon'],
     [cleanup, 'withExclusiveBrowserWorkspaceSlots(', 1, 'obsolete-slot lock'],
+    [cleanup, 'withBrowserWorkspaceSelectionGate(', 1, 'peer recovery selection gate'],
     [cleanup, 'await Dexie.delete(databaseName)', 1, 'physical obsolete-slot delete'],
     [
       cleanup,
@@ -527,7 +533,6 @@ function validateWorkspaceReplacementLifecycle(root, problems) {
   }
   for (const [source, token, label] of [
     [selection, 'Dexie.delete(', 'selection physical deletion'],
-    [cleanup, 'withBrowserWorkspaceSelectionGate(', 'cleanup selection gate'],
     [cleanup, 'indexedDB.databases(', 'cleanup namespace enumeration'],
     [replacement, 'completeBrowserWorkspaceDatabaseCleanup(', 'replacement physical cleanup'],
     [replacement, 'Dexie.delete(journal.sourceDatabaseName)', 'committed source deletion'],
@@ -537,6 +542,8 @@ function validateWorkspaceReplacementLifecycle(root, problems) {
   for (const proof of [
     'keeps active-slot selection ready while old-slot deletion waits on a peer',
     'cleans one journaled slot without enumerating or opening workspace stores',
+    'waits on durable selection ownership then resumes before discarding an abandoned destination',
+    'recovers an activated quiesced peer before obsolete source cleanup',
     'attempts every committed finalizer and retains every failure',
     'never guesses rollback or publication after an uncertain activation',
     'memoizes terminal finalization and rejects a durability downgrade',
@@ -670,6 +677,20 @@ function discoverPhysicalStoragePolicy(path, problems) {
   return policies
 }
 
+function withCatchupJournalPolicies(basePolicies) {
+  const policies = new Map(basePolicies)
+  for (const [name, policy] of basePolicies) {
+    if (policy.compaction !== 'copy' && policy.compaction !== 'filtered-copy') continue
+    policies.set(`replacementCatchup__${name}`, {
+      schema: 'canonical',
+      data: 'journal',
+      compaction: 'seed',
+      interchange: 'omit',
+    })
+  }
+  return policies
+}
+
 function discoverStringUnion(path, typeName, problems) {
   const sourceFile = sourceFileFor(path)
   let declaration
@@ -704,6 +725,10 @@ function validatePhysicalStoragePolicy(policies, vocabulary, problems) {
 
 function validatePhysicalStoragePolicyConsumers(root, problems) {
   const db = readFileSync(resolve(root, 'src/store/db.ts'), 'utf8')
+  const mutationJournal = readFileSync(
+    resolve(root, 'src/store/browser-command-mutation-journal.ts'),
+    'utf8',
+  )
   const compaction = readFileSync(
     resolve(root, 'src/store/browser-workspace-compaction.ts'),
     'utf8',
@@ -711,7 +736,7 @@ function validatePhysicalStoragePolicyConsumers(root, problems) {
   for (const [source, token, expected, label] of [
     [
       db,
-      'new Set<string>(CANONICAL_PHYSICAL_STORAGE_TABLE_NAMES)',
+      'const CANONICAL_BROWSER_WORKSPACE_STORES = new Set<string>([',
       1,
       'canonical schema classification',
     ],
@@ -725,6 +750,24 @@ function validatePhysicalStoragePolicyConsumers(root, problems) {
     const actual = countOccurrences(source, token)
     if (actual !== expected) {
       problems.push(`storage-policy-consumer:${label} occurrences=${actual}; expected=${expected}`)
+    }
+  }
+  for (const token of [
+    '...CANONICAL_PHYSICAL_STORAGE_TABLE_NAMES',
+    '...BROWSER_WORKSPACE_CATCHUP_JOURNAL_TABLE_NAMES',
+  ]) {
+    if (countOccurrences(db, token) !== 1) {
+      problems.push(
+        `storage-policy-consumer: canonical schema source occurrences invalid: ${token}`,
+      )
+    }
+  }
+  for (const token of [
+    "mode === 'readwrite'",
+    'browserWorkspaceCatchupTransactionTableNames(stores)',
+  ]) {
+    if (countOccurrences(mutationJournal, token) !== 1) {
+      problems.push(`storage-policy-consumer: automatic catch-up scope invalid: ${token}`)
     }
   }
   if (compaction.includes('COMPACTION_EXCLUDED_TABLES')) {

@@ -173,7 +173,8 @@ test('startup opens the committed source while a live replacement owns selection
   }
 })
 
-test('an observed intermediate v94 workspace upgrades once and opens in Chromium', async ({
+test('an observed intermediate v94 workspace repairs on an inactive slot and opens in Chromium', async ({
+  context,
   page,
 }) => {
   const databaseName = await activeWorkspaceDatabaseName(page)
@@ -229,39 +230,60 @@ test('an observed intermediate v94 workspace upgrades once and opens in Chromium
   )
   await page.unroute(resetRoute)
 
-  await page.goto('/')
-  await expect(page.locator('[data-ui="workspace-bootstrap"]')).toHaveCount(0)
-  await expect(page.locator('[data-ui="app-shell"]')).toBeVisible()
-  await expect
-    .poll(() =>
-      page.evaluate(async (databaseName) => {
-        const database = await new Promise<IDBDatabase>((resolve, reject) => {
-          const request = indexedDB.open(databaseName)
-          request.onsuccess = () => resolve(request.result)
-          request.onerror = () => reject(request.error)
-        })
-        try {
-          const sentinel = await new Promise<unknown>((resolve, reject) => {
-            const request = database
-              .transaction('settings', 'readonly')
-              .objectStore('settings')
-              .get('manifest-proof:chromium-v94')
-            request.onsuccess = () => resolve(request.result)
-            request.onerror = () => reject(request.error)
-          })
-          return { version: database.version, sentinel }
-        } finally {
-          database.close()
-        }
-      }, databaseName),
-    )
-    .toEqual({
-      version: 950,
-      sentinel: {
-        key: 'manifest-proof:chromium-v94',
-        value: 'preserved',
-      },
-    })
+  const competingPage = await context.newPage()
+  try {
+    await Promise.all([page.goto('/'), competingPage.goto('/')])
+    await expect(page.locator('[data-ui="workspace-bootstrap"]')).toHaveCount(0)
+    await expect(competingPage.locator('[data-ui="workspace-bootstrap"]')).toHaveCount(0)
+    await expect(page.locator('[data-ui="app-shell"]')).toBeVisible()
+    await expect(competingPage.locator('[data-ui="app-shell"]')).toBeVisible()
+    const repairedDatabaseName = await activeWorkspaceDatabaseName(page)
+    expect(repairedDatabaseName).not.toBe(databaseName)
+    await expect.poll(() => activeWorkspaceDatabaseName(competingPage)).toBe(repairedDatabaseName)
+    await expect
+      .poll(() =>
+        page.evaluate(
+          async ({ databaseName, repairedDatabaseName }) => {
+            const database = await new Promise<IDBDatabase>((resolve, reject) => {
+              const request = indexedDB.open(repairedDatabaseName)
+              request.onsuccess = () => resolve(request.result)
+              request.onerror = () => reject(request.error)
+            })
+            try {
+              const sentinel = await new Promise<unknown>((resolve, reject) => {
+                const request = database
+                  .transaction('settings', 'readonly')
+                  .objectStore('settings')
+                  .get('manifest-proof:chromium-v94')
+                request.onsuccess = () => resolve(request.result)
+                request.onerror = () => reject(request.error)
+              })
+              return {
+                version: database.version,
+                sentinel,
+                databases: (await indexedDB.databases()).flatMap((entry) =>
+                  entry.name === undefined ? [] : [entry.name],
+                ),
+                databaseName,
+              }
+            } finally {
+              database.close()
+            }
+          },
+          { databaseName, repairedDatabaseName },
+        ),
+      )
+      .toMatchObject({
+        version: 970,
+        sentinel: {
+          key: 'manifest-proof:chromium-v94',
+          value: 'preserved',
+        },
+        databases: expect.not.arrayContaining([databaseName]),
+      })
+  } finally {
+    await competingPage.close()
+  }
 })
 
 test('a poisoned local database shows recovery instead of a blank root', async ({

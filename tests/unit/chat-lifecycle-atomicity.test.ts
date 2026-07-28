@@ -183,7 +183,7 @@ describe('authoritative temporary chat lifecycle', () => {
     expect(await query({ kind: 'chat.get', chatId: withDraft.id })).toMatchObject({
       temporary: true,
     })
-    expect(await query({ kind: 'draft.get', chatId: withDraft.id })).toMatchObject({
+    expect(await getDb().drafts.get(withDraft.id)).toMatchObject({
       text: 'keep this draft',
     })
   })
@@ -212,6 +212,7 @@ describe('authoritative temporary chat lifecycle', () => {
       deletedChatIds: [temporary.id, laterTemporary.id],
       affectedAttachmentIds: [],
       scannedChatIds: 2,
+      retiredStreamFrames: 0,
       done: false,
     })
     const second = await execute({
@@ -224,6 +225,7 @@ describe('authoritative temporary chat lifecycle', () => {
       deletedChatIds: [finalTemporary.id],
       affectedAttachmentIds: [],
       scannedChatIds: 1,
+      retiredStreamFrames: 0,
       done: true,
     })
     expect(await query({ kind: 'chat.get', chatId: permanent.id })).toBeDefined()
@@ -248,6 +250,7 @@ describe('authoritative temporary chat lifecycle', () => {
       deletedChatIds: [],
       affectedAttachmentIds: [],
       scannedChatIds: 0,
+      retiredStreamFrames: 0,
       earliestDeferredAt: 190,
       done: true,
     })

@@ -1290,4 +1290,30 @@ describe('StorageView', () => {
       expect(chats.map((chat) => chat.id).sort()).not.toEqual(['chat-alpha', 'chat-beta'])
     })
   })
+
+  it('leaves IndexedDB unchanged when a later chat in an import ZIP is malformed', async () => {
+    const source = await createChat({ id: 'chat-alpha', title: 'Alpha', now: 1000 })
+    const zip = await jsonEntriesZipBlob([
+      { filename: 'alpha.json', value: await exportChat(source.id) },
+      { filename: 'zeta.json', value: { objectKind: 'chat' } },
+    ])
+    await restoreEmptyWorkspace()
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    const { container } = render(<StorageView route={{ section: 'chats' }} />)
+    const input = container.querySelector<HTMLInputElement>('[data-ui="storage-chat-import-input"]')
+    expect(input).toBeTruthy()
+
+    fireEvent.change(input as HTMLInputElement, {
+      target: {
+        files: [new File([zip], 'chats.zip', { type: 'application/zip' })],
+      },
+    })
+
+    await waitFor(() => {
+      expect(useToastStore.getState().toasts.at(-1)).toMatchObject({ level: 'danger' })
+    })
+    expect(await getDb().chats.count()).toBe(0)
+    expect(errorSpy).toHaveBeenCalledWith('Failed to import chat JSON/ZIP', expect.anything())
+  })
 })

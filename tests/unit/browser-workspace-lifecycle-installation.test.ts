@@ -17,7 +17,10 @@ import {
   claimWorkspaceRuntimeDemandBoundary,
   releaseWorkspaceRuntimeDemandBoundary,
 } from '../../src/store/workspace-runtime'
-import { getWorkspaceRuntimeResourceStatuses } from '../../src/store/workspace-runtime-control'
+import {
+  getWorkspaceRuntimeResourceStatuses,
+  WORKSPACE_RUNTIME_RESOURCE_IDS,
+} from '../../src/store/workspace-runtime-control'
 
 function deferred() {
   let resolve!: () => void
@@ -29,8 +32,8 @@ function deferred() {
 
 it('installs the browser workspace lifecycle atomically and rolls back exact owners', async () => {
   const incumbent = installBrowserWorkspaceSlotCoordinator({
-    quiesce: async () => {},
-    resume: async () => {},
+    validateQuiesce: async () => true,
+    reconcile: async () => {},
   })
   expect(() => installBrowserWorkspaceLifecycle()).toThrow(
     'BrowserWorkspaceSlotCoordinatorAlreadyInstalled',
@@ -44,7 +47,7 @@ it('installs the browser workspace lifecycle atomically and rolls back exact own
 
   disposeBrowserWorkspaceSlotCoordinator(incumbent)
   installBrowserWorkspaceLifecycle()
-  expect(getWorkspaceRuntimeResourceStatuses()).toHaveLength(16)
+  expect(getWorkspaceRuntimeResourceStatuses()).toHaveLength(WORKSPACE_RUNTIME_RESOURCE_IDS.length)
   expect(() => installBrowserWorkspaceLifecycle()).not.toThrow()
 
   const presentation = deferred()

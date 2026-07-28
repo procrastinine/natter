@@ -388,7 +388,7 @@ export const TEST_GUARANTEE_CLAIMS = Object.freeze([
       },
       {
         path: 'tests/unit/composer.test.tsx',
-        locator: "it('owns one pending first submit and clears only after preparation succeeds'",
+        locator: "it('owns one pending first submit and clears only after admission'",
       },
       {
         path: 'tests/e2e/composer.spec.ts',
@@ -491,7 +491,7 @@ export const TEST_GUARANTEE_CLAIMS = Object.freeze([
       {
         path: 'tests/e2e/storage-reclamation.spec.ts',
         locator:
-          "test('normal use retries real compaction debt and preserves two-tab work across the slot switch'",
+          "test('normal use catches up foreground work without repeating the physical copy and preserves two-tab state'",
       },
       {
         path: 'tests/e2e/storage-reclamation.spec.ts',
@@ -511,17 +511,16 @@ export const TEST_GUARANTEE_CLAIMS = Object.freeze([
     status: 'partial',
     requiredProofKinds: ['browser', 'multi-tab', 'performance'],
     rationale:
-      'One public browser journey creates real attachment replacement debt, overlaps a held peer stream, preempts the first copy with a normal title edit, observes the monotonic retry revision, and verifies the committed slot switch, physical source-database deletion, route/cursor/draft continuity, and reload persistence. Browser quota estimates are telemetry rather than a correctness assertion.',
+      'One public browser journey creates real attachment replacement debt, overlaps a held peer stream, writes a normal title after its source table was staged, observes one compaction revision, and verifies catch-up, the committed slot switch, physical source-database deletion, route/cursor/draft continuity, and reload persistence. Browser quota estimates are telemetry rather than a correctness assertion.',
     evidence: [
       {
         path: 'tests/e2e/storage-reclamation.spec.ts',
         locator:
-          "test('normal use retries real compaction debt and preserves two-tab work across the slot switch'",
+          "test('normal use catches up foreground work without repeating the physical copy and preserves two-tab state'",
       },
       {
         path: 'tests/unit/storage-retention.test.ts',
-        locator:
-          "it('requeues a foreground-preempted copy without new debt and then commits it once'",
+        locator: "it('keeps foreground work live without repeating the physical copy'",
       },
     ],
     missing:

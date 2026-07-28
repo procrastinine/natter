@@ -1,4 +1,4 @@
-import type { IndexableType, Table } from 'dexie'
+import type { IndexableType, Table, Transaction } from 'dexie'
 import {
   type BrowserWorkspaceCompactionAttemptClaim,
   claimBrowserWorkspaceCompactionAttempt,
@@ -10,13 +10,22 @@ import type {
 
 export type { BrowserWorkspaceCompactionResult } from './browser-workspace-maintenance-contract'
 
-import { tryStartBrowserWorkspaceReplacementIfIdle } from './browser-workspace-replacement-runner'
+import {
+  activateBrowserWorkspaceCatchupJournals,
+  BROWSER_WORKSPACE_CATCHUP_ACTIVE_ID,
+  type BrowserWorkspaceCatchupJournalRow,
+  deactivateBrowserWorkspaceCatchupJournals,
+} from './browser-workspace-catchup-journal'
+import { tryStartBrowserWorkspaceOnlineReplacementIfIdle } from './browser-workspace-replacement-runner'
 import { browserWorkspaceSlotSwitchingSupported } from './browser-workspace-slot-coordination'
 import { chatSidebarProjectionBackfillMarker } from './chat-sidebar-projection'
-import type { NatterDb } from './db'
+import { NatterDb } from './db'
 import type { SettingsRow } from './db-rows'
-import type { LockGrant } from './locks'
 import {
+  ALL_PHYSICAL_STORAGE_TABLE_NAMES,
+  BROWSER_WORKSPACE_CATCHUP_SOURCE_TABLE_NAMES,
+  type BrowserWorkspaceMutationJournalSourceTableName,
+  browserWorkspaceCatchupJournalTableName,
   PHYSICAL_STORAGE_POLICY,
   PHYSICAL_STORAGE_TABLE_NAMES,
   type PhysicalStorageTableName,
@@ -36,6 +45,28 @@ import {
 
 const COMPACTION_COPY_MAX_PAGE_ROWS = 64
 const COMPACTION_COPY_MAX_PAGE_BYTES = 1024 * 1024
+const COMPACTION_FINAL_CATCHUP_MAX_ROWS = 256
+const COMPACTION_FINAL_CATCHUP_MAX_BYTES = 4 * 1024 * 1024
+
+interface BrowserWorkspaceCompactionPrepared {
+  readonly sourceWorkspace: {
+    readonly workspaceId: string
+    readonly replacementEpoch: number
+  }
+  readonly copied: BrowserWorkspaceCompactionResult
+}
+
+class BrowserWorkspaceCompactionCatchupBudgetExceededError extends Error {
+  constructor(rows: number, bytes: number) {
+    super(`BrowserWorkspaceCompactionCatchupBudgetExceeded:${rows}:${bytes}`)
+    this.name = 'BrowserWorkspaceCompactionCatchupBudgetExceededError'
+  }
+}
+
+type DestinationTransactionRunner = <T>(
+  tableNames: readonly string[],
+  operation: (transaction: Transaction) => Promise<T> | T,
+) => Promise<T>
 
 export function browserWorkspaceCompactionSupported(): boolean {
   return browserWorkspaceSlotSwitchingSupported()
@@ -47,74 +78,123 @@ export async function tryStartBrowserWorkspaceCompaction(
   if (!browserWorkspaceCompactionSupported()) {
     throw new Error('BrowserWorkspaceCompactionUnsupported')
   }
-  let claim: BrowserWorkspaceCompactionAttemptClaim | null = null
-  const started = await tryStartBrowserWorkspaceReplacementIfIdle(
+  const attemptState: { claim: BrowserWorkspaceCompactionAttemptClaim | null } = { claim: null }
+  const started = await tryStartBrowserWorkspaceOnlineReplacementIfIdle(
     async (session) => {
       await awaitStorageCompactionDebtIdle()
       const db = await session.open()
       const state = await readStorageCompactionState(db)
       return state.requestRevision > state.attemptedRevision
     },
-    async (destination, context) => {
-      context.preactivationCheckpoint()
-      if (
-        context.atomicity !== 'slotted-staging' ||
-        context.sourceDatabaseName === context.destinationDatabaseName
-      ) {
-        throw new Error('BrowserWorkspaceCompactionRequiresSlots')
-      }
-      const attempt = await claimBrowserWorkspaceCompactionAttempt(context.sourceDatabaseName)
-      if (attempt.kind !== 'claimed') {
-        throw new Error('BrowserWorkspaceCompactionAttemptAlreadyClaimed')
-      }
-      claim = attempt.claim
-      return context.mutate((grant) =>
-        context.withSourceDatabase(async (source) => {
+    {
+      prepare: async (destination, context): Promise<BrowserWorkspaceCompactionPrepared> => {
+        context.preactivationCheckpoint()
+        if (context.sourceDatabaseName === context.destinationDatabaseName) {
+          throw new Error('BrowserWorkspaceCompactionRequiresSlots')
+        }
+        const attempt = await claimBrowserWorkspaceCompactionAttempt(context.sourceDatabaseName)
+        if (attempt.kind !== 'claimed') {
+          throw new Error('BrowserWorkspaceCompactionAttemptAlreadyClaimed')
+        }
+        attemptState.claim = attempt.claim
+        return context.withSourceDatabase(async (source) => {
+          await activateBrowserWorkspaceCatchupJournals(source)
           const sourceWorkspace = await readBrowserWorkspaceMeta(source)
           context.preactivationCheckpoint()
-          const copied = await copyBrowserWorkspace(
+          let copied = await copyBrowserWorkspace(
             source,
             destination,
-            grant,
+            context.runDestinationTransaction,
             context.signal,
             context.preactivationCheckpoint,
           )
-          let workspace = sourceWorkspace
-          context.preactivationCheckpoint()
-          await grant.runTransaction(
-            destination,
-            [destination.workspaceFence, destination.settings],
-            async (tx) => {
-              const copiedWorkspace = await readBrowserWorkspaceMetaFromTransaction(tx)
-              if (
-                copiedWorkspace.workspaceId !== sourceWorkspace.workspaceId ||
-                copiedWorkspace.replacementEpoch !== sourceWorkspace.replacementEpoch
-              ) {
-                throw new Error('BrowserWorkspaceCompactionCopyChanged')
-              }
-              await tx
-                .table<SettingsRow, string>('settings')
-                .put(chatSidebarProjectionBackfillMarker())
-              workspace = await readBrowserWorkspaceMetaFromTransaction(tx)
+          copied = await drainBrowserWorkspaceCatchup(
+            source,
+            context.runDestinationTransaction,
+            copied,
+            {
+              mode: 'online',
+              signal: context.signal,
+              preactivationCheckpoint: context.preactivationCheckpoint,
             },
           )
-          return {
-            workspace,
-            storageBaseline: { kind: 'carry-source', liveBytes: copied.estimatedLiveBytes },
-            value: copied,
-          }
-        }),
-      )
+          return { sourceWorkspace, copied }
+        })
+      },
+      abandon: (sourceDatabaseName) => deactivateSourceCatchupJournals(sourceDatabaseName),
+      commit: async (destination, context, prepared) => {
+        context.preactivationCheckpoint()
+        if (
+          context.atomicity !== 'slotted-staging' ||
+          context.sourceDatabaseName === context.destinationDatabaseName
+        ) {
+          throw new Error('BrowserWorkspaceCompactionRequiresSlots')
+        }
+        return context.mutate((grant) =>
+          context.withSourceDatabase(async (source) => {
+            const sourceWorkspace = await readBrowserWorkspaceMeta(source)
+            if (
+              sourceWorkspace.workspaceId !== prepared.sourceWorkspace.workspaceId ||
+              sourceWorkspace.replacementEpoch !== prepared.sourceWorkspace.replacementEpoch
+            ) {
+              throw new Error('BrowserWorkspaceCompactionSourceChanged')
+            }
+            let copied = await drainBrowserWorkspaceCatchup(
+              source,
+              (tableNames, operation) => grant.runTransaction(destination, tableNames, operation),
+              prepared.copied,
+              {
+                mode: 'final',
+                signal: context.signal,
+                preactivationCheckpoint: context.preactivationCheckpoint,
+              },
+            )
+            let workspace = sourceWorkspace
+            context.preactivationCheckpoint()
+            await grant.runTransaction(
+              destination,
+              [destination.workspaceFence, destination.settings],
+              async (tx) => {
+                const copiedWorkspace = await readBrowserWorkspaceMetaFromTransaction(tx)
+                if (
+                  copiedWorkspace.workspaceId !== sourceWorkspace.workspaceId ||
+                  copiedWorkspace.replacementEpoch !== sourceWorkspace.replacementEpoch
+                ) {
+                  throw new Error('BrowserWorkspaceCompactionCopyChanged')
+                }
+                await tx
+                  .table<SettingsRow, string>('settings')
+                  .put(chatSidebarProjectionBackfillMarker())
+                workspace = await readBrowserWorkspaceMetaFromTransaction(tx)
+              },
+            )
+            copied = Object.freeze({ ...copied })
+            return {
+              workspace,
+              storageBaseline: { kind: 'carry-source', liveBytes: copied.estimatedLiveBytes },
+              value: copied,
+            }
+          }),
+        )
+      },
     },
     options,
   )
-  if (started.kind !== 'handoff') return started
+  if (started.kind !== 'handoff') {
+    if (started.kind === 'cleanup-required' && attemptState.claim !== null) {
+      const release = await attemptState.claim.release()
+      if (release.released) publishStorageCompactionRequest()
+    }
+    return started
+  }
   return {
     kind: 'handoff',
     handoff: {
       completion: started.handoff.completion.catch(async (error: unknown) => {
-        if (!isWorkspaceMaintenancePreemptedError(error) || claim === null) throw error
-        const release = await claim.release()
+        if (!isRetryableBrowserWorkspaceCompactionError(error) || attemptState.claim === null) {
+          throw error
+        }
+        const release = await attemptState.claim.release()
         if (release.released) publishStorageCompactionRequest()
         throw error
       }),
@@ -125,7 +205,7 @@ export async function tryStartBrowserWorkspaceCompaction(
 async function copyBrowserWorkspace(
   source: NatterDb,
   destination: NatterDb,
-  grant: LockGrant,
+  runDestinationTransaction: DestinationTransactionRunner,
   signal: AbortSignal,
   preactivationCheckpoint: () => void,
 ): Promise<BrowserWorkspaceCompactionResult> {
@@ -144,7 +224,7 @@ async function copyBrowserWorkspace(
     throw new Error('BrowserWorkspaceCompactionSchemaMismatch')
   }
   preactivationCheckpoint()
-  await grant.runTransaction(destination, clearTableNames, (tx) =>
+  await runDestinationTransaction(clearTableNames, (tx) =>
     Promise.all(clearTableNames.map((name) => tx.table(name).clear())).then(() => undefined),
   )
   let copiedRows = 0
@@ -155,7 +235,7 @@ async function copyBrowserWorkspace(
       source,
       name,
       destination.table<unknown, IndexableType>(name),
-      grant,
+      runDestinationTransaction,
       signal,
       preactivationCheckpoint,
     )
@@ -169,7 +249,7 @@ async function copyTable(
   sourceDb: NatterDb,
   tableName: PhysicalStorageTableName,
   destination: Table<unknown, IndexableType>,
-  grant: LockGrant,
+  runDestinationTransaction: DestinationTransactionRunner,
   signal: AbortSignal,
   preactivationCheckpoint: () => void,
 ): Promise<BrowserWorkspaceCompactionResult> {
@@ -192,7 +272,7 @@ async function copyTable(
     }
     if (rows.length > 0) {
       preactivationCheckpoint()
-      await grant.runTransaction(destination.db, [destination], () => destination.bulkPut(rows))
+      await runDestinationTransaction([destination.name], () => destination.bulkPut(rows))
       copiedRows = saturatingAdd(copiedRows, rows.length)
       for (const row of rows) {
         estimatedLiveBytes = saturatingAdd(estimatedLiveBytes, estimateStoredValueBytes(row))
@@ -204,6 +284,203 @@ async function copyTable(
     after = page.lastPrimaryKey
   }
   return { copiedRows, estimatedLiveBytes }
+}
+
+async function drainBrowserWorkspaceCatchup(
+  source: NatterDb,
+  runDestinationTransaction: DestinationTransactionRunner,
+  initial: BrowserWorkspaceCompactionResult,
+  options: {
+    readonly mode: 'online' | 'final'
+    readonly signal: AbortSignal
+    readonly preactivationCheckpoint: () => void
+  },
+): Promise<BrowserWorkspaceCompactionResult> {
+  let copiedRows = initial.copiedRows
+  let estimatedLiveBytes = initial.estimatedLiveBytes
+  let finalRows = 0
+  let finalBytes = 0
+  for (const tableName of BROWSER_WORKSPACE_CATCHUP_SOURCE_TABLE_NAMES) {
+    let after: string | undefined
+    for (;;) {
+      options.preactivationCheckpoint()
+      const page = await readBrowserWorkspaceCatchupPage(source, tableName, after, options.signal)
+      if (page.scannedRows === 0) break
+      if (options.mode === 'final') {
+        finalRows = saturatingAdd(finalRows, page.entries.length)
+        finalBytes = saturatingAdd(finalBytes, page.estimatedBytes)
+        if (
+          finalRows > COMPACTION_FINAL_CATCHUP_MAX_ROWS ||
+          finalBytes > COMPACTION_FINAL_CATCHUP_MAX_BYTES
+        ) {
+          throw new BrowserWorkspaceCompactionCatchupBudgetExceededError(finalRows, finalBytes)
+        }
+      }
+      const applied = await applyBrowserWorkspaceCatchupPage(
+        source,
+        tableName,
+        page.entries,
+        runDestinationTransaction,
+      )
+      copiedRows = adjustCount(copiedRows, applied.rowDelta)
+      estimatedLiveBytes = adjustCount(estimatedLiveBytes, applied.byteDelta)
+      if (options.mode === 'online') {
+        await acknowledgeBrowserWorkspaceCatchupPage(source, tableName, page.entries)
+      }
+      after = page.lastId
+      if (after === undefined) {
+        throw new Error(`BrowserWorkspaceCatchupPrimaryKeyMissing:${tableName}`)
+      }
+    }
+  }
+  return { copiedRows, estimatedLiveBytes }
+}
+
+function isRetryableBrowserWorkspaceCompactionError(error: unknown): boolean {
+  if (
+    isWorkspaceMaintenancePreemptedError(error) ||
+    error instanceof BrowserWorkspaceCompactionCatchupBudgetExceededError
+  ) {
+    return true
+  }
+  if (error instanceof AggregateError) {
+    return error.errors.some(isRetryableBrowserWorkspaceCompactionError)
+  }
+  return (
+    error instanceof Error &&
+    error.cause !== undefined &&
+    isRetryableBrowserWorkspaceCompactionError(error.cause)
+  )
+}
+
+async function readBrowserWorkspaceCatchupPage(
+  source: NatterDb,
+  tableName: BrowserWorkspaceMutationJournalSourceTableName,
+  after: string | undefined,
+  signal: AbortSignal,
+): Promise<{
+  readonly entries: readonly {
+    readonly journal: BrowserWorkspaceCatchupJournalRow
+    readonly sourceValue: unknown
+  }[]
+  readonly lastId?: string
+  readonly scannedRows: number
+  readonly estimatedBytes: number
+}> {
+  if (signal.aborted) throw compactionReadError(signal.reason)
+  const journalName = browserWorkspaceCatchupJournalTableName(tableName)
+  return source.transaction(
+    'r',
+    [source.table(tableName), source.table(journalName)],
+    async (tx) => {
+      const journalTable = tx.table<BrowserWorkspaceCatchupJournalRow, string>(journalName)
+      const rows = await (after === undefined
+        ? journalTable.where(':id').above(BROWSER_WORKSPACE_CATCHUP_ACTIVE_ID)
+        : journalTable.where(':id').above(after)
+      )
+        .limit(COMPACTION_COPY_MAX_PAGE_ROWS)
+        .toArray()
+      const entries: {
+        journal: BrowserWorkspaceCatchupJournalRow
+        sourceValue: unknown
+      }[] = []
+      let estimatedBytes = 0
+      let lastId: string | undefined
+      const sourceTable = tx.table<unknown, IndexableType>(tableName)
+      for (const journal of rows) {
+        if (signal.aborted) throw compactionReadError(signal.reason)
+        const current = await journalTable.get(journal.id)
+        if (current?.revision !== journal.revision) {
+          lastId = journal.id
+          continue
+        }
+        const sourceValue = await sourceTable.get(journal.sourceKey as IndexableType)
+        const rowBytes = sourceValue === undefined ? 0 : estimateStoredValueBytes(sourceValue)
+        if (entries.length > 0 && estimatedBytes + rowBytes > COMPACTION_COPY_MAX_PAGE_BYTES) {
+          break
+        }
+        entries.push({ journal, sourceValue })
+        estimatedBytes = saturatingAdd(estimatedBytes, rowBytes)
+        lastId = journal.id
+        if (estimatedBytes >= COMPACTION_COPY_MAX_PAGE_BYTES) break
+      }
+      return {
+        entries,
+        ...(lastId === undefined ? {} : { lastId }),
+        scannedRows: rows.length,
+        estimatedBytes,
+      }
+    },
+  )
+}
+
+async function deactivateSourceCatchupJournals(sourceDatabaseName: string): Promise<void> {
+  const source = new NatterDb(sourceDatabaseName)
+  try {
+    await source.open()
+    await deactivateBrowserWorkspaceCatchupJournals(source)
+  } finally {
+    source.close()
+  }
+}
+
+async function applyBrowserWorkspaceCatchupPage(
+  source: NatterDb,
+  tableName: BrowserWorkspaceMutationJournalSourceTableName,
+  entries: readonly {
+    readonly journal: BrowserWorkspaceCatchupJournalRow
+    readonly sourceValue: unknown
+  }[],
+  runDestinationTransaction: DestinationTransactionRunner,
+): Promise<{ readonly rowDelta: number; readonly byteDelta: number }> {
+  if (entries.length === 0) return { rowDelta: 0, byteDelta: 0 }
+  const presentValues = entries.flatMap(({ sourceValue }) =>
+    sourceValue === undefined ? [] : [sourceValue],
+  )
+  const retainedValues = new Set(await filterCompactionRows(source, tableName, presentValues))
+  return runDestinationTransaction([tableName], async (tx) => {
+    const table = tx.table<unknown, IndexableType>(tableName)
+    const keys = entries.map(({ journal }) => journal.sourceKey as IndexableType)
+    const previous = await table.bulkGet(keys)
+    const puts: unknown[] = []
+    const deletes: IndexableType[] = []
+    let rowDelta = 0
+    let byteDelta = 0
+    entries.forEach(({ journal, sourceValue }, index) => {
+      const prior = previous[index]
+      const next =
+        sourceValue !== undefined && retainedValues.has(sourceValue) ? sourceValue : undefined
+      if (next === undefined) deletes.push(journal.sourceKey as IndexableType)
+      else puts.push(next)
+      if (prior === undefined && next !== undefined) rowDelta += 1
+      else if (prior !== undefined && next === undefined) rowDelta -= 1
+      byteDelta +=
+        (next === undefined ? 0 : estimateStoredValueBytes(next)) -
+        (prior === undefined ? 0 : estimateStoredValueBytes(prior))
+    })
+    if (puts.length > 0) await table.bulkPut(puts)
+    if (deletes.length > 0) await table.bulkDelete(deletes)
+    return { rowDelta, byteDelta }
+  })
+}
+
+async function acknowledgeBrowserWorkspaceCatchupPage(
+  source: NatterDb,
+  tableName: BrowserWorkspaceMutationJournalSourceTableName,
+  entries: readonly {
+    readonly journal: BrowserWorkspaceCatchupJournalRow
+  }[],
+): Promise<void> {
+  if (entries.length === 0) return
+  const journalName = browserWorkspaceCatchupJournalTableName(tableName)
+  await source.transaction('rw', source.table(journalName), async (tx) => {
+    const table = tx.table<BrowserWorkspaceCatchupJournalRow, string>(journalName)
+    const current = await table.bulkGet(entries.map(({ journal }) => journal.id))
+    const acknowledged = entries.flatMap(({ journal }, index) =>
+      current[index]?.revision === journal.revision ? [journal.id] : [],
+    )
+    if (acknowledged.length > 0) await table.bulkDelete(acknowledged)
+  })
 }
 
 async function filterCompactionRows(
@@ -243,10 +520,9 @@ async function filterCompactionRows(
 
 function assertPhysicalStorageSchema(db: NatterDb): void {
   const actual = new Set(db.tables.map((table) => table.name))
-  const missing = PHYSICAL_STORAGE_TABLE_NAMES.filter((name) => !actual.has(name))
-  const unexpected = [...actual].filter(
-    (name) => !PHYSICAL_STORAGE_TABLE_NAMES.includes(name as PhysicalStorageTableName),
-  )
+  const expected = new Set<string>(ALL_PHYSICAL_STORAGE_TABLE_NAMES)
+  const missing = ALL_PHYSICAL_STORAGE_TABLE_NAMES.filter((name) => !actual.has(name))
+  const unexpected = [...actual].filter((name) => !expected.has(name))
   if (missing.length > 0 || unexpected.length > 0) {
     throw new Error(
       `BrowserWorkspaceCompactionPolicySchemaMismatch:missing=${missing.join(',')}:unexpected=${unexpected.join(',')}`,
@@ -360,4 +636,8 @@ function compactionReadError(reason: unknown): Error {
 
 function saturatingAdd(left: number, right: number): number {
   return Math.min(Number.MAX_SAFE_INTEGER, left + right)
+}
+
+function adjustCount(current: number, delta: number): number {
+  return Math.max(0, Math.min(Number.MAX_SAFE_INTEGER, current + delta))
 }

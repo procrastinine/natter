@@ -31,7 +31,6 @@ import type {
   GlobalTokenCalibration,
   Message,
   MessageId,
-  MessageOrigin,
   MessageRole,
   MutationScope,
   ProviderOutputMemberRef,
@@ -317,11 +316,10 @@ export interface DeleteResult {
 }
 
 export interface MessageMutationRepository {
-  getChat(chatId: ChatId): Promise<Chat | undefined>
-  getMessage(messageId: MessageId): Promise<Message | undefined>
-  getMessageHeader(messageId: MessageId): Promise<MessageHeaderRow | undefined>
-  getMessageHeaders(messageIds: readonly MessageId[]): Promise<Array<MessageHeaderRow | undefined>>
-  listChildHeaders(chatId: ChatId, parentId: MessageId | null): Promise<MessageHeaderRow[]>
+  readStructurePreflight<T>(
+    read: (reader: MessageStructurePreflightReader) => Promise<T> | T,
+  ): Promise<T>
+  readEditPreflight<T>(read: (reader: MessageEditPreflightReader) => Promise<T> | T): Promise<T>
   runMutation<T, U = T>(
     scopes: MutationScope[],
     fn: (ctx: MessageMutationContext) => Promise<T> | T,
@@ -477,9 +475,18 @@ function nextSiblingIndexFromChildren(children: readonly Pick<Message, 'siblingI
   return max + 1
 }
 
-interface MessageHeaderReader {
+export interface MessageHeaderReader {
   getMessageHeader(messageId: MessageId): Promise<MessageHeaderRow | undefined>
   listChildHeaders(chatId: ChatId, parentId: MessageId | null): Promise<MessageHeaderRow[]>
+}
+
+export interface MessageStructurePreflightReader extends MessageHeaderReader {
+  getMessageHeaders(messageIds: readonly MessageId[]): Promise<Array<MessageHeaderRow | undefined>>
+}
+
+export interface MessageEditPreflightReader extends MessageStructurePreflightReader {
+  getChat(chatId: ChatId): Promise<Chat | undefined>
+  getSettings(keys: readonly string[]): Promise<ReadonlyMap<string, unknown>>
 }
 
 function sameHeaderIds(
@@ -870,22 +877,23 @@ export interface EditMessageCalibrationSnapshot {
   mode: TokenCalibrationMode
 }
 
-export type EditMessageCalibrationReader = () => Promise<EditMessageCalibrationSnapshot>
-
 export async function editMessageContentInRepository(
   repo: MessageMutationRepository,
   input: EditMessageInput,
-  readCalibration: EditMessageCalibrationReader,
+  readCalibration: (reader: MessageEditPreflightReader) => Promise<EditMessageCalibrationSnapshot>,
 ): Promise<EditMessageResult> {
   const now = input.now ?? Date.now()
-  const target = await repo.getMessageHeader(input.messageId)
-  if (!target || target.chatId !== input.chatId || target.deleted) {
-    throw new TreeChangedError(input.chatId, `edit target ${input.messageId} unavailable`)
-  }
-  const [chatForRatio, calibration] = await Promise.all([
-    repo.getChat(input.chatId),
-    readCalibration(),
-  ])
+  const { target, chatForRatio, calibration } = await repo.readEditPreflight(async (reader) => {
+    const [target, chatForRatio, calibration] = await Promise.all([
+      reader.getMessageHeader(input.messageId),
+      reader.getChat(input.chatId),
+      readCalibration(reader),
+    ])
+    if (!target || target.chatId !== input.chatId || target.deleted) {
+      throw new TreeChangedError(input.chatId, `edit target ${input.messageId} unavailable`)
+    }
+    return { target, chatForRatio, calibration }
+  })
   const currentModelId = chatForRatio?.settings.model ?? ''
   const calibrationPatch = currentModelId
     ? calibrationFieldsForEdit(
@@ -906,9 +914,19 @@ export async function editMessageContentInRepository(
       ...attachmentScopes(input.attachmentRefs),
     ]),
     async (ctx) => {
-      const current = await ctx.getMessage(input.messageId)
-      if (!current || current.chatId !== input.chatId || current.deleted) {
+      const [current, currentHeader] = await Promise.all([
+        ctx.getMessage(input.messageId),
+        ctx.getMessageHeader(input.messageId),
+      ])
+      if (!current || !currentHeader || current.chatId !== input.chatId || current.deleted) {
         throw new TreeChangedError(input.chatId, `edit target ${input.messageId} unavailable`)
+      }
+      if (
+        currentHeader.nodeVersion !== target.nodeVersion ||
+        currentHeader.bodyVersion !== target.bodyVersion ||
+        currentHeader.requestContextVersion !== target.requestContextVersion
+      ) {
+        throw new TreeChangedError(input.chatId, `edit target ${input.messageId} changed`)
       }
       const next: Message = {
         ...current,
@@ -1084,6 +1102,41 @@ interface PasteImportMessageInput {
   attachmentRefs?: AttachmentId[]
 }
 
+interface PreparedImportedMessage {
+  readonly id: MessageId
+  readonly turnId: string
+  readonly input: PasteImportMessageInput
+}
+
+function importedMessage(
+  chatId: ChatId,
+  prepared: PreparedImportedMessage,
+  placement: {
+    readonly parentId: MessageId | null
+    readonly siblingIndex: number
+    readonly createdAt: number
+  },
+): Message {
+  return withAttachmentRefs(
+    {
+      id: prepared.id,
+      chatId,
+      parentId: placement.parentId,
+      siblingIndex: placement.siblingIndex,
+      turnId: prepared.turnId,
+      turnIndex: 0,
+      createdAt: placement.createdAt,
+      role: prepared.input.role,
+      origin: 'imported',
+      content: prepared.input.content,
+      nodeVersion: 0,
+      deleted: false,
+    },
+    prepared.input.attachmentRefs,
+    placement.createdAt,
+  )
+}
+
 export interface PasteImportInput {
   chatId: ChatId
   slot: PasteImportSlot
@@ -1134,87 +1187,114 @@ export async function pasteImportInRepository(
   }
   const now = input.now ?? Date.now()
   const activeLeafId = input.activeLeafId
-  const newMessageIds = input.messages.map(() => newId())
+  const preparedMessages = input.messages.map(
+    (message): PreparedImportedMessage => ({
+      id: newId(),
+      turnId: newId(),
+      input: message,
+    }),
+  )
+  const newMessageIds = preparedMessages.map(({ id }) => id)
   const insertedTailId = newMessageIds.at(-1) as MessageId
   const attachmentIds = input.messages.flatMap((message) => message.attachmentRefs ?? [])
-  const scopes: MutationScope[] = [
-    ...newMessageIds.map((messageId) => messageScope(messageId)),
-    ...newMessageIds.slice(0, -1).map((messageId) => childrenScope(input.chatId, messageId)),
-    ...attachmentIdScopes(attachmentIds),
-  ]
-  let placementChildren: MessageHeaderRow[] = []
-  let expectedTargetParentId: MessageId | null | undefined
-  const activePathBefore = await readMutationBranchPath(repo, input.chatId, activeLeafId)
-  const activePathIds = new Set(activePathBefore.map((header) => header.id))
-  const afterMessageId = input.slot.kind === 'after' ? input.slot.messageId : undefined
-  const selectedChildId =
-    afterMessageId !== undefined
-      ? activePathBefore.find((header) => header.parentId === afterMessageId)?.id
-      : undefined
+  const {
+    scopes,
+    placementChildren,
+    expectedTargetParentId,
+    activePathBefore,
+    activePathIds,
+    selectedChildId,
+  } = await repo.readStructurePreflight(async (reader) => {
+    const scopes: MutationScope[] = [
+      ...newMessageIds.map((messageId) => messageScope(messageId)),
+      ...newMessageIds.slice(0, -1).map((messageId) => childrenScope(input.chatId, messageId)),
+      ...attachmentIdScopes(attachmentIds),
+    ]
+    let placementChildren: MessageHeaderRow[] = []
+    let expectedTargetParentId: MessageId | null | undefined
+    const activePathBefore = await readMutationBranchPath(reader, input.chatId, activeLeafId)
+    const activePathIds = new Set(activePathBefore.map((header) => header.id))
+    const afterMessageId = input.slot.kind === 'after' ? input.slot.messageId : undefined
+    const selectedChildId =
+      afterMessageId !== undefined
+        ? activePathBefore.find((header) => header.parentId === afterMessageId)?.id
+        : undefined
 
-  if (input.slot.kind === 'at-end') {
-    scopes.push(childrenScope(input.chatId, activeLeafId))
-  } else if (input.slot.kind === 'after-all') {
-    if (input.slot.parentId !== null) {
-      const parent = await repo.getMessageHeader(input.slot.parentId)
-      if (!parent || parent.chatId !== input.chatId || parent.deleted) {
-        throw new TreeChangedError(input.chatId, `paste parent ${input.slot.parentId} unavailable`)
+    if (input.slot.kind === 'at-end') {
+      scopes.push(childrenScope(input.chatId, activeLeafId))
+    } else if (input.slot.kind === 'after-all') {
+      if (input.slot.parentId !== null) {
+        const parent = await reader.getMessageHeader(input.slot.parentId)
+        if (!parent || parent.chatId !== input.chatId || parent.deleted) {
+          throw new TreeChangedError(
+            input.chatId,
+            `paste parent ${input.slot.parentId} unavailable`,
+          )
+        }
+        scopes.push(messageScope(parent.id))
       }
-      scopes.push(messageScope(parent.id))
-    }
-    placementChildren = await repo.listChildHeaders(input.chatId, input.slot.parentId)
-    scopes.push(
-      childrenScope(input.chatId, input.slot.parentId),
-      childrenScope(input.chatId, insertedTailId),
-    )
-    for (const child of placementChildren) {
-      if (!child.deleted) scopes.push(messageScope(child.id))
-    }
-  } else {
-    const target = await repo.getMessageHeader(input.slot.messageId)
-    if (!target || target.chatId !== input.chatId || target.deleted) {
-      throw new TreeChangedError(input.chatId, `paste target ${input.slot.messageId} unavailable`)
-    }
-    scopes.push(messageScope(target.id))
-    if (input.slot.kind === 'sibling') {
-      expectedTargetParentId = target.parentId
-      scopes.push(childrenScope(input.chatId, target.parentId))
-    } else if (input.slot.kind === 'before') {
-      expectedTargetParentId = target.parentId
-      placementChildren = await repo.listChildHeaders(input.chatId, target.parentId)
+      placementChildren = await reader.listChildHeaders(input.chatId, input.slot.parentId)
       scopes.push(
-        ...collectInsertBetweenScopes(
-          input.chatId,
-          target,
-          placementChildren,
-          newMessageIds[0] as MessageId,
-        ),
-      )
-      scopes.push(childrenScope(input.chatId, insertedTailId))
-    } else if (selectedChildId !== undefined) {
-      placementChildren = await repo.listChildHeaders(input.chatId, target.id)
-      const activeDescendant = placementChildren.find(
-        (child) => !child.deleted && child.id === selectedChildId,
-      )
-      if (!activeDescendant) {
-        throw new TreeChangedError(
-          input.chatId,
-          `paste selected child ${selectedChildId} unavailable`,
-        )
-      }
-      scopes.push(
-        ...collectInsertBetweenScopes(
-          input.chatId,
-          activeDescendant,
-          placementChildren,
-          newMessageIds[0] as MessageId,
-        ),
+        childrenScope(input.chatId, input.slot.parentId),
         childrenScope(input.chatId, insertedTailId),
       )
+      for (const child of placementChildren) {
+        if (!child.deleted) scopes.push(messageScope(child.id))
+      }
     } else {
-      scopes.push(childrenScope(input.chatId, target.id))
+      const target = await reader.getMessageHeader(input.slot.messageId)
+      if (!target || target.chatId !== input.chatId || target.deleted) {
+        throw new TreeChangedError(input.chatId, `paste target ${input.slot.messageId} unavailable`)
+      }
+      scopes.push(messageScope(target.id))
+      if (input.slot.kind === 'sibling') {
+        expectedTargetParentId = target.parentId
+        scopes.push(childrenScope(input.chatId, target.parentId))
+      } else if (input.slot.kind === 'before') {
+        expectedTargetParentId = target.parentId
+        placementChildren = await reader.listChildHeaders(input.chatId, target.parentId)
+        scopes.push(
+          ...collectInsertBetweenScopes(
+            input.chatId,
+            target,
+            placementChildren,
+            newMessageIds[0] as MessageId,
+          ),
+        )
+        scopes.push(childrenScope(input.chatId, insertedTailId))
+      } else if (selectedChildId !== undefined) {
+        placementChildren = await reader.listChildHeaders(input.chatId, target.id)
+        const activeDescendant = placementChildren.find(
+          (child) => !child.deleted && child.id === selectedChildId,
+        )
+        if (!activeDescendant) {
+          throw new TreeChangedError(
+            input.chatId,
+            `paste selected child ${selectedChildId} unavailable`,
+          )
+        }
+        scopes.push(
+          ...collectInsertBetweenScopes(
+            input.chatId,
+            activeDescendant,
+            placementChildren,
+            newMessageIds[0] as MessageId,
+          ),
+          childrenScope(input.chatId, insertedTailId),
+        )
+      } else {
+        scopes.push(childrenScope(input.chatId, target.id))
+      }
     }
-  }
+    return {
+      scopes: dedupeScopes(scopes),
+      placementChildren,
+      expectedTargetParentId,
+      activePathBefore,
+      activePathIds,
+      selectedChildId,
+    }
+  })
 
   type PasteMutationValue = {
     effects: StructuralEffects
@@ -1226,7 +1306,7 @@ export async function pasteImportInRepository(
     destination: ConversationProvedSelection
   }
   const result = await repo.runMutation<PasteMutationValue, PasteMutationCommittedValue>(
-    dedupeScopes(scopes),
+    scopes,
     async (ctx) => {
       const activePath = await readMutationBranchPath(ctx, input.chatId, activeLeafId)
       if (!sameStructuralPath(activePathBefore, activePath)) {
@@ -1237,8 +1317,7 @@ export async function pasteImportInRepository(
           ctx,
           input.chatId,
           input.slot.parentId,
-          input.messages,
-          newMessageIds,
+          preparedMessages,
           placementChildren,
           now,
         )
@@ -1269,8 +1348,7 @@ export async function pasteImportInRepository(
         input.chatId,
         input.slot,
         selectedChildId,
-        input.messages[0] as PasteImportMessageInput,
-        newMessageIds[0] as MessageId,
+        preparedMessages[0] as PreparedImportedMessage,
         now,
         effects,
         activeLeafId,
@@ -1283,29 +1361,16 @@ export async function pasteImportInRepository(
       const displacedMessageIds = effects.reparented.map((effect) => effect.id)
       const displacedMessageIdSet = new Set(displacedMessageIds)
       for (let i = 1; i < input.messages.length; i += 1) {
-        const spec = input.messages[i] as PasteImportMessageInput
-        const id = newMessageIds[i] as MessageId
+        const prepared = preparedMessages[i] as PreparedImportedMessage
         const slot = await ctx.getChildList(input.chatId, tail.id)
-        const row: Message = withAttachmentRefs(
-          {
-            id,
-            chatId: input.chatId,
-            parentId: tail.id,
-            siblingIndex: slot.nextSiblingIndex,
-            turnId: newId(),
-            turnIndex: 0,
-            createdAt: now,
-            role: spec.role,
-            origin: 'imported',
-            content: structuredClone(spec.content),
-            nodeVersion: 0,
-            deleted: false,
-          },
-          spec.attachmentRefs,
-        )
+        const row = importedMessage(input.chatId, prepared, {
+          parentId: tail.id,
+          siblingIndex: slot.nextSiblingIndex,
+          createdAt: now,
+        })
         tail = await ctx.putMessage(row)
         writtenMessages.push(tail)
-        effects.newMessageIds.push(id)
+        effects.newMessageIds.push(prepared.id)
       }
 
       if (displacedMessageIds.length > 0 && tail.id !== firstRow.id) {
@@ -1425,8 +1490,7 @@ async function createAfterAllImportedChain(
   ctx: MessageMutationContext,
   chatId: ChatId,
   parentId: MessageId | null,
-  messages: readonly PasteImportMessageInput[],
-  newMessageIds: readonly MessageId[],
+  messages: readonly PreparedImportedMessage[],
   expectedChildren: readonly MessageHeaderRow[],
   now: number,
 ): Promise<{ effects: StructuralEffects; messages: Message[] }> {
@@ -1446,33 +1510,19 @@ async function createAfterAllImportedChain(
   const effects = emptyEffects()
   const writtenMessages: Message[] = []
   let chainParentId = parentId
-  const tailId = newMessageIds.at(-1) as MessageId
+  const tailId = (messages.at(-1) as PreparedImportedMessage).id
 
   for (let index = 0; index < messages.length; index += 1) {
-    const spec = messages[index] as PasteImportMessageInput
-    const id = newMessageIds[index] as MessageId
-    const row = withAttachmentRefs(
-      {
-        id,
-        chatId,
-        parentId: chainParentId,
-        siblingIndex: index === 0 ? nextSiblingIndexFromChildren(currentAllChildren) : 0,
-        turnId: newId(),
-        turnIndex: 0,
-        createdAt: now,
-        role: spec.role,
-        origin: 'imported' as const,
-        content: structuredClone(spec.content),
-        nodeVersion: 0,
-        deleted: false,
-      },
-      spec.attachmentRefs,
-      now,
-    )
+    const prepared = messages[index] as PreparedImportedMessage
+    const row = importedMessage(chatId, prepared, {
+      parentId: chainParentId,
+      siblingIndex: index === 0 ? nextSiblingIndexFromChildren(currentAllChildren) : 0,
+      createdAt: now,
+    })
     const written = await ctx.putMessage(row)
     writtenMessages.push(written)
-    effects.newMessageIds.push(id)
-    chainParentId = id
+    effects.newMessageIds.push(prepared.id)
+    chainParentId = prepared.id
   }
 
   for (let index = 0; index < currentChildren.length; index += 1) {
@@ -1503,8 +1553,7 @@ async function createFirstImported(
   chatId: ChatId,
   slot: Exclude<PasteImportSlot, { kind: 'after-all' }>,
   selectedChildId: MessageId | undefined,
-  spec: PasteImportMessageInput,
-  messageId: MessageId,
+  prepared: PreparedImportedMessage,
   now: number,
   effects: StructuralEffects,
   activeLeafId: MessageId | null,
@@ -1522,23 +1571,11 @@ async function createFirstImported(
     if (slot.liveCount !== 0) {
       throw new TreeChangedError(chatId, `paste leaf ${activeLeafId ?? 'root'} advanced`)
     }
-    const row: Message = withAttachmentRefs(
-      {
-        id: messageId,
-        chatId,
-        parentId: activeLeafId,
-        siblingIndex: slot.nextSiblingIndex,
-        turnId: newId(),
-        turnIndex: 0,
-        createdAt: now,
-        role: spec.role,
-        origin: 'imported',
-        content: structuredClone(spec.content),
-        nodeVersion: 0,
-        deleted: false,
-      },
-      spec.attachmentRefs,
-    )
+    const row = importedMessage(chatId, prepared, {
+      parentId: activeLeafId,
+      siblingIndex: slot.nextSiblingIndex,
+      createdAt: now,
+    })
     const written = await ctx.putMessage(row)
     effects.newMessageIds.push(row.id)
     return written
@@ -1558,23 +1595,11 @@ async function createFirstImported(
 
   if (slot.kind === 'sibling') {
     const siblingSlot = await ctx.getChildList(chatId, target.parentId)
-    const row: Message = withAttachmentRefs(
-      {
-        id: messageId,
-        chatId,
-        parentId: target.parentId,
-        siblingIndex: siblingSlot.nextSiblingIndex,
-        turnId: newId(),
-        turnIndex: 0,
-        createdAt: now,
-        role: spec.role,
-        origin: 'imported',
-        content: structuredClone(spec.content),
-        nodeVersion: 0,
-        deleted: false,
-      },
-      spec.attachmentRefs,
-    )
+    const row = importedMessage(chatId, prepared, {
+      parentId: target.parentId,
+      siblingIndex: siblingSlot.nextSiblingIndex,
+      createdAt: now,
+    })
     const written = await ctx.putMessage(row)
     effects.newMessageIds.push(row.id)
     return written
@@ -1586,16 +1611,8 @@ async function createFirstImported(
       chatId,
       target.parentId,
       target.id,
-      {
-        id: messageId,
-        role: spec.role,
-        origin: 'imported',
-        content: spec.content,
-        createdAt: now,
-        ...(spec.attachmentRefs && spec.attachmentRefs.length > 0
-          ? { attachmentRefs: spec.attachmentRefs }
-          : {}),
-      },
+      prepared,
+      now,
       effects,
       expectedPlacementChildIds,
     )
@@ -1623,38 +1640,18 @@ async function createFirstImported(
       chatId,
       target.id,
       activeDescendant.id,
-      {
-        id: messageId,
-        role: spec.role,
-        origin: 'imported',
-        content: spec.content,
-        createdAt: now,
-        ...(spec.attachmentRefs && spec.attachmentRefs.length > 0
-          ? { attachmentRefs: spec.attachmentRefs }
-          : {}),
-      },
+      prepared,
+      now,
       effects,
       expectedPlacementChildIds,
     )
   }
 
-  const row: Message = withAttachmentRefs(
-    {
-      id: messageId,
-      chatId,
-      parentId: target.id,
-      siblingIndex: childSlot?.nextSiblingIndex ?? 0,
-      turnId: newId(),
-      turnIndex: 0,
-      createdAt: now,
-      role: spec.role,
-      origin: 'imported',
-      content: structuredClone(spec.content),
-      nodeVersion: 0,
-      deleted: false,
-    },
-    spec.attachmentRefs,
-  )
+  const row = importedMessage(chatId, prepared, {
+    parentId: target.id,
+    siblingIndex: childSlot?.nextSiblingIndex ?? 0,
+    createdAt: now,
+  })
   const written = await ctx.putMessage(row)
   effects.newMessageIds.push(row.id)
   return written
@@ -1665,14 +1662,8 @@ async function insertBetweenInner(
   chatId: ChatId,
   parentId: MessageId | null,
   childId: MessageId,
-  spec: {
-    id: MessageId
-    role: MessageRole
-    origin: MessageOrigin
-    content: ContentItem[]
-    attachmentRefs?: readonly AttachmentId[]
-    createdAt: number
-  },
+  prepared: PreparedImportedMessage,
+  now: number,
   effects: StructuralEffects,
   expectedSiblingIds?: readonly MessageId[],
 ): Promise<Message> {
@@ -1691,23 +1682,11 @@ async function insertBetweenInner(
   if (expectedSiblingIds && !sameHeaderIdList(siblings, expectedSiblingIds)) {
     throw new TreeChangedError(chatId, `insert-between children of ${parentId ?? 'root'} changed`)
   }
-  const row: Message = withAttachmentRefs(
-    {
-      id: spec.id,
-      chatId,
-      parentId,
-      siblingIndex: nextSiblingIndexFromChildren(siblings),
-      turnId: newId(),
-      turnIndex: 0,
-      createdAt: spec.createdAt,
-      role: spec.role,
-      origin: spec.origin,
-      content: structuredClone(spec.content),
-      nodeVersion: 0,
-      deleted: false,
-    },
-    spec.attachmentRefs,
-  )
+  const row = importedMessage(chatId, prepared, {
+    parentId,
+    siblingIndex: nextSiblingIndexFromChildren(siblings),
+    createdAt: now,
+  })
   const written = await ctx.putMessage(row)
 
   const peerHeaders = siblings
@@ -1731,19 +1710,21 @@ async function insertBetweenInner(
   return written
 }
 
-function cachedMessageHeaderReader(repo: MessageMutationRepository): MessageHeaderReader {
+function cachedMessageHeaderReader(source: MessageHeaderReader): MessageHeaderReader {
   const headers = new Map<MessageId, MessageHeaderRow | undefined>()
   const children = new Map<string, MessageHeaderRow[]>()
   return {
     getMessageHeader: async (messageId) => {
-      if (!headers.has(messageId)) headers.set(messageId, await repo.getMessageHeader(messageId))
+      if (!headers.has(messageId)) {
+        headers.set(messageId, await source.getMessageHeader(messageId))
+      }
       return headers.get(messageId)
     },
     listChildHeaders: async (chatId, parentId) => {
       const key = `${chatId}:${parentId ?? '__root__'}`
       const known = children.get(key)
       if (known) return known
-      const rows = await repo.listChildHeaders(chatId, parentId)
+      const rows = await source.listChildHeaders(chatId, parentId)
       children.set(key, rows)
       for (const row of rows) headers.set(row.id, row)
       return rows
@@ -1868,30 +1849,41 @@ export async function deletePairInRepository(
   repo: MessageMutationRepository,
   input: DeleteInput,
 ): Promise<DeleteResult> {
-  const reader = cachedMessageHeaderReader(repo)
-  const target = await requireLiveTarget(reader, input.chatId, input.messageId, 'delete-pair')
-  const activeBranchBefore = await readMutationBranchPath(reader, input.chatId, input.activeLeafId)
-  const targetBranchBefore = activeBranchBefore.some((header) => header.id === target.id)
-    ? activeBranchBefore
-    : await readMutationBranchPath(reader, input.chatId, target.id)
-  const selectedChildIds = new Map(
-    targetBranchBefore.map((header) => [header.parentId, header.id] as const),
-  )
-  const userHead = await targetedAncestorWithRole(reader, input.chatId, target, 'user')
-  const members: MessageTreeRow[] = []
-  if (userHead) {
-    members.push(...(await targetedTurnChain(reader, input.chatId, userHead)))
-    members.push(...(await targetedPairFollowers(reader, input.chatId, userHead, selectedChildIds)))
-  } else {
-    members.push(
-      ...(await targetedTurnChain(
+  const { activeBranchBefore, members, plan } = await repo.readStructurePreflight(
+    async (source) => {
+      const reader = cachedMessageHeaderReader(source)
+      const target = await requireLiveTarget(reader, input.chatId, input.messageId, 'delete-pair')
+      const activeBranchBefore = await readMutationBranchPath(
         reader,
         input.chatId,
-        await targetedTurnHead(reader, input.chatId, target),
-      )),
-    )
-  }
-  const plan = await planDeleteMutation(reader, input.chatId, members, input.cascade ?? false)
+        input.activeLeafId,
+      )
+      const targetBranchBefore = activeBranchBefore.some((header) => header.id === target.id)
+        ? activeBranchBefore
+        : await readMutationBranchPath(reader, input.chatId, target.id)
+      const selectedChildIds = new Map(
+        targetBranchBefore.map((header) => [header.parentId, header.id] as const),
+      )
+      const userHead = await targetedAncestorWithRole(reader, input.chatId, target, 'user')
+      const members: MessageTreeRow[] = []
+      if (userHead) {
+        members.push(...(await targetedTurnChain(reader, input.chatId, userHead)))
+        members.push(
+          ...(await targetedPairFollowers(reader, input.chatId, userHead, selectedChildIds)),
+        )
+      } else {
+        members.push(
+          ...(await targetedTurnChain(
+            reader,
+            input.chatId,
+            await targetedTurnHead(reader, input.chatId, target),
+          )),
+        )
+      }
+      const plan = await planDeleteMutation(reader, input.chatId, members, input.cascade ?? false)
+      return { activeBranchBefore, members, plan }
+    },
+  )
   return executeDeleteMutation(repo, input, members, plan, activeBranchBefore)
 }
 
@@ -1899,18 +1891,27 @@ export async function deleteTurnInRepository(
   repo: MessageMutationRepository,
   input: DeleteInput,
 ): Promise<DeleteResult> {
-  const reader = cachedMessageHeaderReader(repo)
-  const target = await requireLiveTarget(reader, input.chatId, input.messageId, 'delete-turn')
-  const activeBranchBefore = await readMutationBranchPath(reader, input.chatId, input.activeLeafId)
-  const head = await targetedTurnHead(reader, input.chatId, target)
-  const slotSiblings = (await reader.listChildHeaders(input.chatId, head.parentId)).filter(
-    (sibling) => !sibling.deleted && sibling.turnIndex === 0,
+  const { activeBranchBefore, members, plan } = await repo.readStructurePreflight(
+    async (source) => {
+      const reader = cachedMessageHeaderReader(source)
+      const target = await requireLiveTarget(reader, input.chatId, input.messageId, 'delete-turn')
+      const activeBranchBefore = await readMutationBranchPath(
+        reader,
+        input.chatId,
+        input.activeLeafId,
+      )
+      const head = await targetedTurnHead(reader, input.chatId, target)
+      const slotSiblings = (await reader.listChildHeaders(input.chatId, head.parentId)).filter(
+        (sibling) => !sibling.deleted && sibling.turnIndex === 0,
+      )
+      const members: MessageTreeRow[] = []
+      for (const variantHead of slotSiblings) {
+        members.push(...(await targetedTurnChain(reader, input.chatId, variantHead)))
+      }
+      const plan = await planDeleteMutation(reader, input.chatId, members, input.cascade ?? false)
+      return { activeBranchBefore, members, plan }
+    },
   )
-  const members: MessageTreeRow[] = []
-  for (const variantHead of slotSiblings) {
-    members.push(...(await targetedTurnChain(reader, input.chatId, variantHead)))
-  }
-  const plan = await planDeleteMutation(reader, input.chatId, members, input.cascade ?? false)
   return executeDeleteMutation(repo, input, members, plan, activeBranchBefore)
 }
 
@@ -1923,11 +1924,20 @@ export async function deleteSingleMessageInRepository(
   repo: MessageMutationRepository,
   input: DeleteInput,
 ): Promise<DeleteResult> {
-  const reader = cachedMessageHeaderReader(repo)
-  const target = await requireLiveTarget(reader, input.chatId, input.messageId, 'delete-single')
-  const activeBranchBefore = await readMutationBranchPath(reader, input.chatId, input.activeLeafId)
-  const members: MessageTreeRow[] = [target]
-  const plan = await planDeleteMutation(reader, input.chatId, members, input.cascade ?? false)
+  const { activeBranchBefore, members, plan } = await repo.readStructurePreflight(
+    async (source) => {
+      const reader = cachedMessageHeaderReader(source)
+      const target = await requireLiveTarget(reader, input.chatId, input.messageId, 'delete-single')
+      const activeBranchBefore = await readMutationBranchPath(
+        reader,
+        input.chatId,
+        input.activeLeafId,
+      )
+      const members: MessageTreeRow[] = [target]
+      const plan = await planDeleteMutation(reader, input.chatId, members, input.cascade ?? false)
+      return { activeBranchBefore, members, plan }
+    },
+  )
   return executeDeleteMutation(repo, input, members, plan, activeBranchBefore)
 }
 
@@ -1935,14 +1945,28 @@ export async function deleteVariantInRepository(
   repo: MessageMutationRepository,
   input: DeleteInput,
 ): Promise<DeleteResult> {
-  const reader = cachedMessageHeaderReader(repo)
-  const target = await requireLiveTarget(reader, input.chatId, input.messageId, 'delete-variant')
-  const activeBranchBefore = await readMutationBranchPath(reader, input.chatId, input.activeLeafId)
-  const members = await targetedTurnChain(
-    reader,
-    input.chatId,
-    await targetedTurnHead(reader, input.chatId, target),
+  const { activeBranchBefore, members, plan } = await repo.readStructurePreflight(
+    async (source) => {
+      const reader = cachedMessageHeaderReader(source)
+      const target = await requireLiveTarget(
+        reader,
+        input.chatId,
+        input.messageId,
+        'delete-variant',
+      )
+      const activeBranchBefore = await readMutationBranchPath(
+        reader,
+        input.chatId,
+        input.activeLeafId,
+      )
+      const members = await targetedTurnChain(
+        reader,
+        input.chatId,
+        await targetedTurnHead(reader, input.chatId, target),
+      )
+      const plan = await planDeleteMutation(reader, input.chatId, members, input.cascade ?? false)
+      return { activeBranchBefore, members, plan }
+    },
   )
-  const plan = await planDeleteMutation(reader, input.chatId, members, input.cascade ?? false)
   return executeDeleteMutation(repo, input, members, plan, activeBranchBefore)
 }

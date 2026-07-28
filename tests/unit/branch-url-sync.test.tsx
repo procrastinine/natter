@@ -373,8 +373,7 @@ class ProjectionSource implements ConversationProjectionSource {
       slotVersion: siblings.reduce((sum, row) => sum + row.header.nodeVersion + 1, 0),
       position,
       liveCount: siblings.length,
-      nextSiblingIndex:
-        Math.max(...siblings.map((row) => row.header.siblingIndex)) + 1,
+      nextSiblingIndex: Math.max(...siblings.map((row) => row.header.siblingIndex)) + 1,
       previousMessageId: siblings[position - 1]?.header.id ?? null,
       nextMessageId: siblings[position + 1]?.header.id ?? null,
       firstMessageId: siblings[0]?.header.id as MessageId,

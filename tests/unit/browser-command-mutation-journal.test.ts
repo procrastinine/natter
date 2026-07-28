@@ -3,15 +3,23 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import type { ChatId, MessageId } from '../../src/core/types'
 import {
   installBrowserCommandMutationJournal,
+  isBrowserCommandFanoutBudgetExceededError,
   recordBrowserCommandInvalidation,
   recordBrowserCommandOwnerInvalidation,
   runBrowserCommandTransaction,
 } from '../../src/store/browser-command-mutation-journal'
+import {
+  activateBrowserWorkspaceCatchupJournals,
+  BROWSER_WORKSPACE_CATCHUP_ACTIVE_ID,
+  browserWorkspaceCatchupTransactionTableNames,
+  deactivateBrowserWorkspaceCatchupJournals,
+} from '../../src/store/browser-workspace-catchup-journal'
 import { deleteChatOwnedPhysicalStorageCollectionWithKnownBytes } from '../../src/store/byte-owner-mutation'
 import { NatterDb } from '../../src/store/db'
 import { createIndexedDbLockBackend } from '../../src/store/locks'
 import type { MessageBodyRow } from '../../src/store/message-storage'
 import type { PhysicalStorageTableName } from '../../src/store/physical-storage-tables'
+import { browserWorkspaceCatchupJournalTableName } from '../../src/store/physical-storage-tables'
 import {
   type SemanticOperationReceiptFragment,
   withSemanticOperationExactReceiptAccumulator,
@@ -157,11 +165,105 @@ describe('browser command mutation journal', () => {
       ]),
     )
     expect(observed.facts.physicalReads).toHaveLength(5)
+    expect(observed.facts.readConflictAddresses).toEqual([
+      'rows\u0000s:3:one',
+      'rows\u0000s:3:two',
+      'rows\u0000s:5:three',
+      'rows\u0000s:7:missing',
+    ])
+    expect(observed.facts.readConflictScopes).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          tableName: 'rows',
+          indexName: 'value',
+          keyPath: 'value',
+          anyMutation: true,
+        }),
+        expect.objectContaining({
+          tableName: 'rows',
+          indexName: 'value',
+          keyPath: 'value',
+          anyMutation: true,
+        }),
+      ]),
+    )
+    expect(observed.facts.readConflictScopes).toHaveLength(2)
 
     const unobserved = await db.transaction('r', db.table('rows'), (tx) =>
       runBrowserCommandTransaction(tx, (tracked) => tracked.table('rows').get('one')),
     )
     expect(unobserved.facts.physicalReads).toEqual([])
+    expect(unobserved.facts.readConflictAddresses).toEqual([])
+    expect(unobserved.facts.readConflictScopes).toEqual([])
+  })
+
+  it('aborts the whole direct transaction before an over-budget fanout can commit', async () => {
+    const db = await openDatabase()
+    await db
+      .table('rows')
+      .bulkPut(Array.from({ length: 100 }, (_, index) => ({ id: `row-${index}`, value: index })))
+    let visited = 0
+
+    const operation = db.transaction('rw', db.table('rows'), (tx) =>
+      runBrowserCommandTransaction(
+        tx,
+        async (tracked) => {
+          await tracked.table('rows').put({ id: 'must-rollback', value: -1 })
+          await tracked
+            .table('rows')
+            .orderBy('value')
+            .each(() => {
+              visited += 1
+            })
+        },
+        {
+          fanoutBudget: { maxReadRows: 8, maxWriteRows: 8, maxBytes: 1024 * 1024 },
+        },
+      ),
+    )
+
+    await expect(operation).rejects.toSatisfy(isBrowserCommandFanoutBudgetExceededError)
+    expect(visited).toBe(8)
+    expect(await db.table('rows').get('must-rollback')).toBeUndefined()
+    expect(await db.table('rows').count()).toBe(100)
+  })
+
+  it('bounds direct work by the page plus its largest physical value', async () => {
+    const db = await openDatabase()
+    const largest = { id: 'largest', value: 'x'.repeat(4_096) }
+    const companion = { id: 'companion', value: 'small' }
+
+    await expect(
+      db.transaction('rw', db.table('rows'), (tx) =>
+        runBrowserCommandTransaction(
+          tx,
+          async (tracked) => {
+            await tracked.table('rows').put(largest)
+            await tracked.table('rows').put(companion)
+          },
+          {
+            fanoutBudget: { maxReadRows: 8, maxWriteRows: 8, maxBytes: 128 },
+          },
+        ),
+      ),
+    ).resolves.toMatchObject({ value: undefined })
+
+    const operation = db.transaction('rw', db.table('rows'), (tx) =>
+      runBrowserCommandTransaction(
+        tx,
+        async (tracked) => {
+          await tracked.table('rows').put({ id: 'second-large', value: 'y'.repeat(4_096) })
+          await tracked.table('rows').put({ id: 'must-rollback', value: 'z'.repeat(4_096) })
+        },
+        {
+          fanoutBudget: { maxReadRows: 8, maxWriteRows: 8, maxBytes: 128 },
+        },
+      ),
+    )
+
+    await expect(operation).rejects.toSatisfy(isBrowserCommandFanoutBudgetExceededError)
+    expect(await db.table('rows').get('second-large')).toBeUndefined()
+    expect(await db.table('rows').get('must-rollback')).toBeUndefined()
   })
 
   it('includes mutation-internal identity reads in command physical work', async () => {
@@ -339,12 +441,12 @@ describe('browser command mutation journal', () => {
     expect(rightResult.facts.physicalMutations).toHaveLength(2)
   })
 
-  it('tracks NatterDb transactions without losing the Dexie transaction context', async () => {
+  it('tracks NatterDb transactions without always-on catch-up write amplification', async () => {
     const db = new NatterDb(`browser-command-journal-natter-${crypto.randomUUID()}`)
     databases.push(db)
     await db.open()
 
-    const result = await db.transaction('rw', [db.profiles, db.settings], (tx) =>
+    const result = await db.transaction('rw', ['profiles', 'settings'], (tx) =>
       runBrowserCommandTransaction(tx, async () => {
         await db.settings.put({ key: 'journal:first', value: 1 })
         await db.settings.put({ key: 'journal:second', value: 2 })
@@ -356,6 +458,100 @@ describe('browser command mutation journal', () => {
       'journal:first',
       'journal:second',
     ])
+    expect(await db.table(browserWorkspaceCatchupJournalTableName('settings')).toArray()).toEqual(
+      [],
+    )
+
+    await activateBrowserWorkspaceCatchupJournals(db)
+    await db.transaction('rw', ['settings'], (tx) =>
+      runBrowserCommandTransaction(tx, () => db.settings.put({ key: 'journal:active', value: 3 })),
+    )
+    expect(await db.table(browserWorkspaceCatchupJournalTableName('settings')).toArray()).toEqual([
+      expect.objectContaining({
+        id: BROWSER_WORKSPACE_CATCHUP_ACTIVE_ID,
+        sourceTableName: 'settings',
+      }),
+      expect.objectContaining({
+        id: 's:14:journal:active',
+        sourceKey: 'journal:active',
+        sourceTableName: 'settings',
+      }),
+    ])
+
+    await deactivateBrowserWorkspaceCatchupJournals(db)
+    await db.transaction('rw', ['settings'], (tx) =>
+      runBrowserCommandTransaction(tx, () =>
+        db.settings.put({ key: 'journal:inactive', value: 4 }),
+      ),
+    )
+    expect(await db.table(browserWorkspaceCatchupJournalTableName('settings')).toArray()).toEqual(
+      [],
+    )
+  })
+
+  it('retains only existing chat identities for staged publication evidence', async () => {
+    const db = new NatterDb(`browser-command-journal-thin-chat-${crypto.randomUUID()}`)
+    databases.push(db)
+    await db.open()
+    await db.table('chats').put({ id: 'existing-chat', title: 'before' })
+
+    const existing = await db.transaction('rw', ['chats'], (tx) =>
+      runBrowserCommandTransaction(
+        tx,
+        () => db.table('chats').put({ id: 'existing-chat', title: 'after' }),
+        { retainFullChatStates: false },
+      ),
+    )
+    expect(existing.facts.chatStates).toEqual([{ chatId: 'existing-chat', initialExists: true }])
+
+    const created = await db.transaction('rw', ['chats'], (tx) =>
+      runBrowserCommandTransaction(
+        tx,
+        () => db.table('chats').add({ id: 'created-chat', title: 'created' }),
+        { retainFullChatStates: false },
+      ),
+    )
+    expect(created.facts.chatStates).toEqual([
+      {
+        chatId: 'created-chat',
+        chat: { id: 'created-chat', title: 'created' },
+        initialExists: false,
+      },
+    ])
+  })
+
+  it('rolls a catch-up key back with its source mutation and preserves disjoint table scopes', async () => {
+    const db = new NatterDb(`browser-command-journal-rollback-${crypto.randomUUID()}`)
+    databases.push(db)
+    await db.open()
+    const tables = browserWorkspaceCatchupTransactionTableNames(['settings'])
+    expect(tables).toEqual(['settings', 'replacementCatchup__settings'])
+    expect(browserWorkspaceCatchupTransactionTableNames(['messages'])).toEqual([
+      'messages',
+      'replacementCatchup__messages',
+    ])
+    await activateBrowserWorkspaceCatchupJournals(db)
+
+    await expect(
+      db.transaction('rw', ['settings'], (tx) =>
+        runBrowserCommandTransaction(tx, async () => {
+          await db.settings.put({ key: 'journal:rolled-back', value: true })
+          throw new Error('rollback')
+        }),
+      ),
+    ).rejects.toThrow('rollback')
+
+    expect(await db.settings.get('journal:rolled-back')).toBeUndefined()
+    expect(
+      await db
+        .table(browserWorkspaceCatchupJournalTableName('settings'))
+        .get('s:19:journal:rolled-back'),
+    ).toBeUndefined()
+    expect(
+      await db
+        .table(browserWorkspaceCatchupJournalTableName('settings'))
+        .get(BROWSER_WORKSPACE_CATCHUP_ACTIVE_ID),
+    ).toBeDefined()
   })
 
   it('tracks the exact transaction behind the IndexedDB lock fence', async () => {
@@ -394,13 +590,7 @@ describe('browser command mutation journal', () => {
 
     const result = await db.transaction(
       'rw',
-      [
-        db.configurationLinks,
-        db.configurationPresetCatalogRows,
-        db.presets,
-        db.profiles,
-        db.settings,
-      ],
+      ['configurationLinks', 'configurationPresetCatalogRows', 'presets', 'profiles', 'settings'],
       (tx) =>
         runBrowserCommandTransaction(tx, async () => {
           await db.profiles.get('missing')
@@ -463,7 +653,7 @@ describe('browser command mutation journal', () => {
       content: [{ type: 'text', text: sentinel }],
     })
 
-    const result = await db.transaction('rw', db.messageBodies, (tx) =>
+    const result = await db.transaction('rw', ['messageBodies'], (tx) =>
       runBrowserCommandTransaction(tx, async () => {
         await deleteChatOwnedPhysicalStorageCollectionWithKnownBytes<MessageBodyRow, string>(
           tx,

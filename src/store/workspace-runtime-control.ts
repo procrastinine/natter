@@ -1028,6 +1028,13 @@ export const launchImportExportWorkspaceRuntimeReplacementNow = createWorkspaceR
   productionWorkspaceRuntimeControl.launchWorkspaceRuntimeReplacementNow,
 )
 
+export const launchCommandFanoutWorkspaceRuntimeReplacementNow =
+  createWorkspaceReplacementAdmission(
+    'command-fanout',
+    false,
+    productionWorkspaceRuntimeControl.launchWorkspaceRuntimeReplacementNow,
+  )
+
 export const tryLaunchMaintenanceWorkspaceRuntimeReplacementIfIdle =
   createWorkspaceReplacementAdmission(
     'maintenance',

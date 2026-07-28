@@ -41,6 +41,7 @@ import type {
   GenerationMeta,
   KeyId,
   Message,
+  MessageAttachmentRef,
   MessageId,
   PersistedInboundReasoningVisibility,
   PersistedReasoningCarryForward,
@@ -103,6 +104,7 @@ export type StorageMaintenanceTaskKind =
 
 export type StorageMaintenanceRequestTaskKind = Extract<
   StorageMaintenanceTaskKind,
+  | 'reconcile-attachment-integrity'
   | 'reap-attachments'
   | 'prune-terminal-streams'
   | 'prune-empty-drafts'
@@ -291,6 +293,7 @@ export interface WorkspaceMutationOptions {
       'selectedKeyId' | 'usage' | 'completionAllowed'
     >
   }
+  allowMissingCanonicalChatId?: ChatId
   workspaceFence?: {
     replacementEpoch: number
   }
@@ -1201,6 +1204,10 @@ export interface MutationContext {
   listMessageHeaders(chatId: ChatId): Promise<MessageHeaderRow[]>
   listChildHeaders(chatId: ChatId, parentId: MessageId | null): Promise<MessageHeaderRow[]>
   putMessage(message: Message, options?: PutMessageOptions): Promise<Message>
+  replaceMessageAttachmentRefs(
+    messageId: MessageId,
+    attachmentRefs: readonly MessageAttachmentRef[],
+  ): Promise<MessageHeaderRow | undefined>
   patchMessageStructure(messageId: MessageId, patch: MessageStructurePatch): Promise<void>
   patchMessageBody(
     messageId: MessageId,
@@ -1252,6 +1259,7 @@ export interface MutationContext {
   deleteAttachmentArtifacts(attachmentId: AttachmentId): Promise<void>
   deleteAttachmentJobs(attachmentId: AttachmentId): Promise<void>
   getAttachmentArtifacts(attachmentId: AttachmentId): Promise<AttachmentArtifact[]>
+  getAttachmentJob(jobId: string): Promise<AttachmentJob | undefined>
   getAttachmentJobs(attachmentId: AttachmentId): Promise<AttachmentJob[]>
   putAttachmentBlob(blob: AttachmentBlob): Promise<void>
   putAttachmentArtifact(artifact: AttachmentArtifact): Promise<void>
@@ -1327,12 +1335,6 @@ export interface DeleteFolderResult {
   deleted: boolean
   affectedChatIds: ChatId[]
   changes: ChatOrganizationFacetChange[]
-}
-
-export interface DeleteArchivedChatsResult {
-  deletedChatIds: ChatId[]
-  deletedChats: Chat[]
-  affectedAttachmentIds: AttachmentId[]
 }
 
 export interface ChatSidebarCatalogRequest {

@@ -39,6 +39,7 @@ import { useToastStore } from '../../src/store/zustand/toastStore'
 import { useUiStore } from '../../src/store/zustand/uiStore'
 import type * as BranchTreeViewModule from '../../src/ui/chat/BranchTreeView'
 import type { BranchTreeViewProps } from '../../src/ui/chat/BranchTreeView'
+import { jsonEntriesZipBlob } from '../../src/ui/import-export/json-file'
 import { createConfigurationProfile } from '../helpers/configuration'
 
 const branchTreeViewProbe = vi.hoisted(() => ({
@@ -146,6 +147,82 @@ describe('controller-backed shell contract', () => {
       expect(chats[1]?.id).not.toBe(source.id)
       expect(window.location.hash).toMatch(/^#\/chat\//)
     })
+  })
+
+  it('keeps a durable sidebar import successful when local route projection fails', async () => {
+    const source = await createChat({ id: 'shell-import-source', title: 'Alpha', now: 10 })
+    const envelope = await exportChat(source.id)
+    const { container } = render(<App />)
+    await waitFor(() => {
+      expect(container.querySelector('[data-ui="sidebar-import-chat"]')).toBeInTheDocument()
+    })
+    const input = container.querySelector<HTMLInputElement>('[data-ui="sidebar-chat-import-input"]')
+    if (!input) throw new Error('SidebarImportInputMissing')
+    const accept = vi
+      .spyOn(conversationController, 'acceptLocalResult')
+      .mockImplementationOnce(() => {
+        throw new Error('local route projection failed')
+      })
+
+    try {
+      fireEvent.change(input, {
+        target: {
+          files: [new File([JSON.stringify(envelope)], 'chat.json', { type: 'application/json' })],
+        },
+      })
+
+      await waitFor(async () => {
+        expect(await getDb().chats.count()).toBe(2)
+        expect(useToastStore.getState().toasts.at(-1)).toMatchObject({
+          level: 'success',
+          text: 'Imported chat.',
+        })
+      })
+      expect(window.location.hash).toBe('#/')
+      expect(errorSpy).toHaveBeenCalledWith(
+        'Workspace local commit projection failed',
+        expect.objectContaining({ commandKind: 'interchange.import-chat' }),
+      )
+    } finally {
+      accept.mockRestore()
+    }
+  })
+
+  it('imports a sidebar ZIP atomically and routes to the final imported chat', async () => {
+    const alpha = await createChat({ id: 'shell-import-alpha', title: 'Alpha', now: 10 })
+    const beta = await createChat({ id: 'shell-import-beta', title: 'Beta', now: 20 })
+    const zip = await jsonEntriesZipBlob([
+      { filename: 'alpha.json', value: await exportChat(alpha.id) },
+      { filename: 'beta.json', value: await exportChat(beta.id) },
+    ])
+    await restoreWorkspaceBackup(emptyWorkspaceBackup, { now: 1 })
+    const { container } = render(<App />)
+    await waitFor(() => {
+      expect(container.querySelector('[data-ui="sidebar-import-chat"]')).toBeInTheDocument()
+    })
+    const input = container.querySelector<HTMLInputElement>('[data-ui="sidebar-chat-import-input"]')
+    if (!input) throw new Error('SidebarImportInputMissing')
+
+    fireEvent.change(input, {
+      target: {
+        files: [new File([zip], 'chats.zip', { type: 'application/zip' })],
+      },
+    })
+
+    await waitFor(async () => {
+      const chats = (await getDb().chats.toArray()).sort((left, right) =>
+        left.title.localeCompare(right.title),
+      )
+      expect(chats.map((chat) => chat.title)).toEqual(['Alpha', 'Beta'])
+      const betaImport = chats[1]
+      expect(betaImport).toBeDefined()
+      expect(window.location.hash).toContain(betaImport?.id)
+      expect(useToastStore.getState().toasts.at(-1)).toMatchObject({
+        level: 'success',
+        text: 'Imported 2 chats.',
+      })
+    })
+    expect(errorSpy).not.toHaveBeenCalled()
   })
 
   it('keeps no-op new-chat visits out of IndexedDB', async () => {
@@ -358,6 +435,7 @@ describe('controller-backed shell contract', () => {
     const mutation: MessageAttachmentRefMutation = {
       kind: 'visibility',
       refId: 'retained-ref',
+      expectedAttachmentId: 'retained-attachment',
       includeInContext: false,
     }
     const mutate = vi.spyOn(conversationActions, 'mutateAttachment').mockResolvedValue(undefined)

@@ -67,6 +67,7 @@ test('large streamed turns do not recycle the transcript after completion', asyn
       messageCountDecreased: false,
       messageCountsIncludeZero: false,
       minimumMessageCount: expect.any(Number),
+      minimumBranchControlCount: 0,
     })
   } finally {
     await scenario.dispose()

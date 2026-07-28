@@ -4,6 +4,7 @@ import { cleanPendingBrowserWorkspaceDatabase } from './browser-workspace-databa
 import type {
   BrowserWorkspaceCompactionResult,
   BrowserWorkspaceReplacementHandoff,
+  BrowserWorkspaceReplacementStart,
 } from './browser-workspace-maintenance-contract'
 import { reclaimInactiveBrowserWorkspaceDatabases } from './browser-workspace-orphan-reclamation'
 import type { NatterDb } from './db'
@@ -18,6 +19,7 @@ import {
   storageCompactionDebtRecoveryPending,
   subscribeStorageCompactionRequests,
 } from './storage-compaction-state'
+import { readStorageRetentionState, type StorageRetentionStateRow } from './storage-retention-state'
 import type { WorkspaceEffect } from './workspace-effect-hub'
 import { subscribeWorkspaceEffects, WORKSPACE_EFFECT_RECOVERY_OWNED } from './workspace-effect-hub'
 import type {
@@ -25,7 +27,11 @@ import type {
   WorkspaceCommand,
   WorkspaceCommandResult,
 } from './workspace-protocol'
-import { getWorkspaceRepository, publishLocalWorkspaceInvalidation } from './workspace-repository'
+import {
+  getWorkspaceRepository,
+  publishCommittedWorkspaceCommand,
+  publishLocalWorkspaceInvalidation,
+} from './workspace-repository'
 import {
   isWorkspaceRuntimeClosedError,
   subscribeWorkspaceRuntimeIdle,
@@ -58,7 +64,7 @@ type StorageMaintenanceSliceOutcome =
   | { readonly kind: 'handoff' }
 
 export interface StorageMaintenanceReplacementHandoffPort {
-  transfer(handoff: BrowserWorkspaceReplacementHandoff<BrowserWorkspaceCompactionResult>): void
+  transfer<T>(handoff: BrowserWorkspaceReplacementHandoff<T>): void
 }
 
 const TASK_PRIORITY = Object.freeze([
@@ -207,7 +213,7 @@ class StorageMaintenanceController {
               return WORKSPACE_EFFECT_RECOVERY_OWNED
             },
           })
-          this.#requestInitialWork()
+          await this.#requestStartupWork()
           this.#schedulePump()
           await waitForAbort(ownerController.signal)
         } finally {
@@ -230,14 +236,108 @@ class StorageMaintenanceController {
     )
   }
 
-  #requestInitialWork(): void {
+  async #requestStartupWork(): Promise<void> {
+    const database = this.#requiredDatabase()
+    const [
+      integrity,
+      attachmentReap,
+      terminalStreams,
+      emptyDrafts,
+      firstAttachment,
+      firstTemporaryChat,
+      firstStreamLease,
+      firstStreamChunk,
+    ] = await database.transaction(
+      'r',
+      [
+        database.attachmentIntegrityState,
+        database.attachments,
+        database.chats,
+        database.storageRetentionState,
+        database.streamChunks,
+        database.streamLeases,
+      ],
+      () =>
+        Promise.all([
+          database.attachmentIntegrityState.get('workspace'),
+          readStorageRetentionState(database, 'attachment-reap'),
+          readStorageRetentionState(database, 'terminal-stream-prune'),
+          readStorageRetentionState(database, 'empty-draft-prune'),
+          database.attachments.orderBy(':id').firstKey(),
+          database.chats
+            .where('[temporaryKey+temporaryRetentionAt+id]')
+            .between([1], [1, []], true, false)
+            .firstKey(),
+          database.streamLeases.orderBy(':id').firstKey(),
+          database.streamChunks.orderBy(':id').firstKey(),
+        ]),
+    )
+    for (const kind of [
+      'recover-compaction-intents',
+      'clean-replacement-database',
+      'reconcile-stream-integrity',
+      'reclaim-inactive-databases',
+      'prune-discovery-cache',
+      'compact-workspace',
+    ] as const) {
+      this.#requestTask(this.#task(kind))
+    }
+    if (!integrity || integrity.phase !== 'complete') {
+      this.#requestTask(this.#task('reconcile-attachment-integrity'))
+    }
+    const now = Date.now()
+    this.#resumeRetentionTask(
+      'reap-attachments',
+      attachmentReap,
+      ORPHAN_ATTACHMENT_AGE_MS,
+      now,
+      firstAttachment !== undefined,
+    )
+    this.#resumeRetentionTask(
+      'prune-terminal-streams',
+      terminalStreams,
+      TERMINAL_STREAM_JOURNAL_AGE_MS,
+      now,
+      firstStreamLease !== undefined || firstStreamChunk !== undefined,
+    )
+    this.#resumeRetentionTask(
+      'prune-empty-drafts',
+      emptyDrafts,
+      EMPTY_DRAFT_CHAT_AGE_MS,
+      now,
+      firstTemporaryChat !== undefined,
+    )
+  }
+
+  #requestAllTasks(): void {
     for (const task of this.#requiredTasks().values()) this.#requestTask(task)
+  }
+
+  #resumeRetentionTask(
+    kind: Extract<
+      StorageMaintenanceTaskKind,
+      'reap-attachments' | 'prune-terminal-streams' | 'prune-empty-drafts'
+    >,
+    state: StorageRetentionStateRow,
+    ageMs: number,
+    now: number,
+    hasPotentialRows: boolean,
+  ): void {
+    const task = this.#task(kind)
+    if (state.phase === 'active' || (state.revision === 0 && hasPotentialRows)) {
+      this.#requestTask(task)
+      return
+    }
+    if (state.earliestDeferredAt === undefined) return
+    const dueAt = state.earliestDeferredAt + ageMs + 1
+    if (dueAt <= now) this.#requestTask(task)
+    else task.nextDueAt = dueAt
   }
 
   #receiveEffect(effect: WorkspaceEffect): void {
     if (this.#closed || !sameWorkspace(effect, this.#fence) || effect.kind === 'replace') return
     if (effect.impactByKind === 'all') {
-      this.#requestInitialWork()
+      this.#requestAllTasks()
     } else {
       for (const dependency of effect.impactByKind['storage-maintenance'] ?? []) {
         for (const kind of dependency.tasks) this.#requestTask(this.#task(kind))
@@ -248,7 +348,7 @@ class StorageMaintenanceController {
 
   #recoverEffect(effect: WorkspaceEffect): void {
     if (this.#closed || !sameWorkspace(effect, this.#fence)) return
-    this.#requestInitialWork()
+    this.#requestAllTasks()
     this.#schedulePump()
   }
 
@@ -347,16 +447,18 @@ class StorageMaintenanceController {
           kind: 'maintenance.reconcile-attachment-integrity',
           limit: MAINTENANCE_BATCH_SIZE,
           now: Date.now(),
-        }).then((result) =>
-          result.kind === 'result' && !result.value.done ? CONTINUE : done(result),
-        )
+        }).then((result) => {
+          if (result.kind === 'handoff') return result
+          return result.kind === 'result' && !result.value.done ? CONTINUE : done(result)
+        })
       case 'reconcile-stream-integrity':
         return this.#runRepositorySlice({
           kind: 'maintenance.reconcile-stream-journal-integrity',
           limit: MAINTENANCE_BATCH_SIZE,
-        }).then((result) =>
-          result.kind === 'result' && !result.value.done ? CONTINUE : done(result),
-        )
+        }).then((result) => {
+          if (result.kind === 'handoff') return result
+          return result.kind === 'result' && !result.value.done ? CONTINUE : done(result)
+        })
       case 'reclaim-inactive-databases':
         return this.#runIdleSlice(async () => {
           const result = await reclaimInactiveBrowserWorkspaceDatabases()
@@ -375,9 +477,10 @@ class StorageMaintenanceController {
         return this.#runRepositorySlice({
           kind: 'maintenance.prune-discovery-cache',
           limit: MAINTENANCE_BATCH_SIZE,
-        }).then((result) =>
-          result.kind === 'result' && !result.value.done ? CONTINUE : done(result),
-        )
+        }).then((result) => {
+          if (result.kind === 'handoff') return result
+          return result.kind === 'result' && !result.value.done ? CONTINUE : done(result)
+        })
       case 'compact-workspace':
         return this.#runCompactionSlice()
     }
@@ -390,7 +493,7 @@ class StorageMaintenanceController {
       maxAgeMs: ORPHAN_ATTACHMENT_AGE_MS,
       limit: MAINTENANCE_BATCH_SIZE,
     })
-    if (result.kind === 'blocked') return result
+    if (result.kind === 'blocked' || result.kind === 'handoff') return result
     if (!result.value.done) return CONTINUE
     return {
       kind: 'done',
@@ -405,7 +508,7 @@ class StorageMaintenanceController {
       maxAgeMs: TERMINAL_STREAM_JOURNAL_AGE_MS,
       limit: MAINTENANCE_BATCH_SIZE,
     })
-    if (result.kind === 'blocked') return result
+    if (result.kind === 'blocked' || result.kind === 'handoff') return result
     if (!result.value.done) return CONTINUE
     return {
       kind: 'done',
@@ -420,7 +523,7 @@ class StorageMaintenanceController {
       maxAgeMs: EMPTY_DRAFT_CHAT_AGE_MS,
       limit: MAINTENANCE_BATCH_SIZE,
     })
-    if (result.kind === 'blocked') return result
+    if (result.kind === 'blocked' || result.kind === 'handoff') return result
     if (!result.value.done) return CONTINUE
     return {
       kind: 'done',
@@ -434,9 +537,15 @@ class StorageMaintenanceController {
     if (state.requestRevision <= state.attemptedRevision) return { kind: 'done' }
     const compaction = await import('./browser-workspace-compaction')
     if (!compaction.browserWorkspaceCompactionSupported()) return { kind: 'done' }
-    const started = await compaction.tryStartBrowserWorkspaceCompaction({
-      signal: this.#ownerSignal(),
-    })
+    let started: BrowserWorkspaceReplacementStart<BrowserWorkspaceCompactionResult>
+    try {
+      started = await compaction.tryStartBrowserWorkspaceCompaction({
+        signal: this.#ownerSignal(),
+      })
+    } catch (error) {
+      this.#requestTask(this.#task('clean-replacement-database'))
+      throw error
+    }
     if (started.kind === 'cleanup-required') {
       this.#requestTask(this.#task('clean-replacement-database'))
       return { kind: 'blocked', on: 'slot' }
@@ -460,15 +569,72 @@ class StorageMaintenanceController {
     command: Command,
   ): Promise<
     | { readonly kind: 'blocked'; readonly on: 'runtime-idle' }
+    | { readonly kind: 'handoff' }
     | { readonly kind: 'result'; readonly value: WorkspaceCommandResult<Command> }
   > {
     const started = tryRunWorkspaceActionIfIdle(
       'maintenance',
-      async (permit) => (await getWorkspaceRepository().execute(permit, command)).value,
+      async (permit) => {
+        const { isBrowserWorkspaceStagedFanoutCommand } = await import(
+          './browser-staged-fanout-command'
+        )
+        const { browserWorkspaceSlotSwitchingSupported } = await import(
+          './browser-workspace-slot-coordination'
+        )
+        if (
+          !isBrowserWorkspaceStagedFanoutCommand(command) ||
+          !browserWorkspaceSlotSwitchingSupported()
+        ) {
+          return {
+            kind: 'result' as const,
+            value: (await getWorkspaceRepository().execute(permit, command)).value,
+          }
+        }
+        const {
+          executeBrowserCommandInStagedDatabase,
+          tryExecuteBrowserWorkspaceCommandWithinFanoutBudget,
+        } = await import('./browser-repo')
+        const admission = await tryExecuteBrowserWorkspaceCommandWithinFanoutBudget(permit, command)
+        if (admission.kind === 'committed') {
+          return {
+            kind: 'direct-commit' as const,
+            commit: admission.execution.commit,
+          }
+        }
+        const { startBrowserWorkspaceStagedFanoutCommand } = await import(
+          './browser-workspace-staged-fanout'
+        )
+        return {
+          kind: 'replacement' as const,
+          started: await startBrowserWorkspaceStagedFanoutCommand(
+            permit,
+            command,
+            executeBrowserCommandInStagedDatabase,
+          ),
+        }
+      },
       { signal: this.#ownerSignal() },
     )
     if (!started) return { kind: 'blocked', on: 'runtime-idle' }
-    return { kind: 'result', value: await started }
+    const outcome = await started
+    if (outcome.kind === 'result') return outcome
+    if (outcome.kind === 'direct-commit') {
+      publishCommittedWorkspaceCommand(command, outcome.commit)
+      return { kind: 'result', value: outcome.commit.value }
+    }
+    if (outcome.started.kind === 'blocked') return { kind: 'blocked', on: 'runtime-idle' }
+    if (outcome.started.kind === 'cleanup-required') {
+      this.#requestTask(this.#task('clean-replacement-database'))
+      throw new Error('BrowserWorkspaceReplacementCleanupRequired')
+    }
+    if (outcome.started.kind === 'skipped') {
+      throw new Error('BrowserWorkspaceReplacementPreflightSkipped')
+    }
+    void outcome.started.handoff.completion
+      .then((replacement) => publishCommittedWorkspaceCommand(command, replacement.value))
+      .catch(() => undefined)
+    this.#replacementHandoffs.transfer(outcome.started.handoff)
+    return { kind: 'handoff' }
   }
 
   #applyOutcome(

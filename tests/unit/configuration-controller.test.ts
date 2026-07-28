@@ -241,7 +241,7 @@ describe('configuration controller publication', () => {
     const completion = deferred<never>()
     const execute = vi.fn(() => completion.promise)
     const application = createConfigurationApplication({
-      port: { execute: execute as ConfigurationDomainPort['execute'] },
+      port: { execute: execute },
       async prepareKey() {
         throw new Error('UnexpectedKeyPreparation')
       },
@@ -306,7 +306,7 @@ describe('profile switch admission', () => {
       .mockResolvedValueOnce(firstPlan)
       .mockResolvedValueOnce(secondPlan)
     const application = createConfigurationApplication({
-      port: { execute: execute as ConfigurationDomainPort['execute'] },
+      port: { execute: execute },
       async prepareKey() {
         throw new Error('UnexpectedKeyPreparation')
       },
