@@ -827,7 +827,7 @@ export const STORAGE_LIFECYCLE_PATHS = Object.freeze([
   lifecycle(
     'nonblocking-pending-selection',
     'src/store/browser-workspace-database-selection.ts',
-    'confirmed.activationSequence !== manifest.activationSequence',
+    'confirmed.activationSequence !== current.activationSequence',
     'Startup validates only the active slot fence and remains ready while discard or cleanup work is pending.',
     [],
   ),

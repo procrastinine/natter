@@ -48,6 +48,8 @@ export function useActiveBranchFrame({
   const visibleBinding = paintedFrame?.binding ?? null
   const transcriptBinding = frame?.presentation.residents.transcript ?? null
   const treeBinding = frame?.presentation.residents.tree ?? null
+  const transcriptPoint =
+    transcriptBinding === null && frame?.transcript.kind === 'point' ? frame.transcript : null
   const activeStreams = useAttemptExecutionsForChat(activeChatId)
   const currentPathMessageIds = currentPath?.messageIds
   const activeBranchTailId = currentPath?.leaf?.id ?? null
@@ -180,6 +182,7 @@ export function useActiveBranchFrame({
     visibleBinding,
     paintedChat: paintedFrame?.chat ?? null,
     transcriptBinding,
+    transcriptPoint,
     treeBinding,
     activeSpine: currentSpine,
     activePath: currentPath,

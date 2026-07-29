@@ -1048,7 +1048,7 @@ function buildInteractionComponentRegistry(root, model) {
     const name = callableDeclarationName(declaration)
     if (!path || !name) return null
     const parameter = declaration.parameters?.[0]
-    const props = parameter ? checker.getTypeAtLocation(parameter).getProperties() : []
+    const props = parameter ? componentPropertiesForType(checker.getTypeAtLocation(parameter)) : []
     const propNames = new Set(props.map((property) => property.name))
     const callableProps = new Set(
       parameter
@@ -1096,6 +1096,18 @@ function buildInteractionComponentRegistry(root, model) {
   }
 }
 
+function componentPropertiesForType(type) {
+  const properties = new Map(type.getProperties().map((property) => [property.name, property]))
+  if (type.isUnionOrIntersection?.()) {
+    for (const member of type.types) {
+      for (const property of componentPropertiesForType(member)) {
+        if (!properties.has(property.name)) properties.set(property.name, property)
+      }
+    }
+  }
+  return [...properties.values()]
+}
+
 function typeCanBeCalled(type) {
   if (type.getCallSignatures().length > 0) return true
   return type.isUnionOrIntersection?.() && type.types.some(typeCanBeCalled)
@@ -1138,6 +1150,20 @@ function discoverDerivedPropsBindings(declaration, component, checker, bindingSl
     changed = false
     walkSourceFile(declaration, (node) => {
       if (!ts.isVariableDeclaration(node) || !node.initializer) return
+      if (ts.isIdentifier(node.name)) {
+        const symbol = canonicalSymbol(checker, checker.getSymbolAtLocation(node.name))
+        const slots = derivedSourceSlots(
+          node.initializer,
+          component,
+          checker,
+          bindingSlots,
+          wholeProps,
+        )
+        if (symbol && slots.length === 1 && !bindingSlots.has(symbol)) {
+          bindingSlots.set(symbol, slots[0])
+          changed = true
+        }
+      }
       const source = wholePropsForExpression(node.initializer, checker, wholeProps)
       if (!source || source.component.id !== component.id) return
       const before = bindingSlots.size + wholeProps.size
@@ -1145,6 +1171,24 @@ function discoverDerivedPropsBindings(declaration, component, checker, bindingSl
       if (bindingSlots.size + wholeProps.size > before) changed = true
     })
   }
+}
+
+function derivedSourceSlots(expression, component, checker, bindingSlots, wholeProps) {
+  const candidate = unwrapExpression(expression)
+  if (!candidate) return []
+  const direct = sourceSlotForNode(candidate, component, checker, { bindingSlots, wholeProps })
+  if (direct) return [direct]
+  if (!ts.isConditionalExpression(candidate)) return []
+  return uniqueSourceSlots([
+    ...derivedSourceSlots(candidate.whenTrue, component, checker, bindingSlots, wholeProps),
+    ...derivedSourceSlots(candidate.whenFalse, component, checker, bindingSlots, wholeProps),
+  ])
+}
+
+function uniqueSourceSlots(slots) {
+  return [
+    ...new Map(slots.map((slot) => [callbackSlotId(slot.component, slot.event), slot])).values(),
+  ]
 }
 
 function collectInteractionAstSites(model, sites) {

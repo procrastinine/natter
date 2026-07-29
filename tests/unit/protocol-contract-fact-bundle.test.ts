@@ -430,10 +430,10 @@ describe('production protocol fact bundle', () => {
     })
     expect(report.reports['production-discriminated-unions']).toMatchObject({
       ok: true,
-      discoveredCount: 464,
-      controlProtocolCount: 218,
-      gapCount: 175,
-      constructionGapCount: 9,
+      discoveredCount: 466,
+      controlProtocolCount: 219,
+      gapCount: 176,
+      constructionGapCount: 10,
       violations: [],
     })
   })

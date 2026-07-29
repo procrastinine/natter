@@ -730,7 +730,12 @@ export type ConfigurationDomainHandlerMap<Meta> = {
 export interface ConfigurationDomainPort {
   execute<Command extends ConfigurationDomainCommand>(
     command: Command,
+    options?: ConfigurationDomainExecutionOptions<ConfigurationDomainResultMap[Command['kind']]>,
   ): Promise<ConfigurationDomainResultMap[Command['kind']]>
+}
+
+export interface ConfigurationDomainExecutionOptions<Result> {
+  readonly localApplication: (result: Result) => 'applied' | 'inactive'
 }
 
 export function buildConnectionProfile(input: ConfigurationProfileDraftInput): ConnectionProfile {

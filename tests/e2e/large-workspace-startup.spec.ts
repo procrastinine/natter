@@ -11,24 +11,35 @@ import {
 import {
   armDestinationFrameBudgetRecorder,
   assertDestinationFrameBudget,
+  assertDestinationPublicationContract,
   comparableDestinationWork,
   type DestinationFrameBudgetSnapshot,
   finishDestinationFrameBudgetRecorder,
   installDestinationFrameBudgetRecorder,
 } from './destination-frame-budget-recorder'
+import { createFakeStreamScenario } from './fake-stream-provider'
+import {
+  clickSidebarToggleWithoutActionabilityWait,
+  installReloadStorageAdministrationBlocker,
+  releaseReloadStorageAdministrationBlocker,
+  reloadStorageAdministrationBlockerState,
+  startForegroundGestureRecorder,
+} from './foreground-gesture'
 import {
   cloneGeneratedWorkspaceBrowserProfile,
   type GeneratedWorkspaceBrowserProfileClone,
   type GeneratedWorkspaceStateName,
   readReusableGeneratedWorkspaceStateManifest,
 } from './generated-workspace-state'
+import { activeWorkspaceDatabaseName } from './helpers'
 
 const ACTIVE_ROUTE = `/#/chat/${GENERATED_WORKSPACE_ACTIVE_CHAT_ID}/message/${GENERATED_WORKSPACE_ACTIVE_TERMINAL_ID}`
 const INITIAL_TRANSCRIPT_FLOOR = 10
 const HANG_BOUND_MS = 45_000
 const ROUTE_SWITCH_OBSERVATION_MS = 1_500
+const INSTRUMENTED_FOREGROUND_GESTURE_BOUND_MS = 75
 
-test.describe.configure({ timeout: 5 * 60_000 })
+test.describe.configure({ mode: 'serial', timeout: 5 * 60_000 })
 
 test('startup work and first interaction stay cardinality-bounded in a 4k-chat workspace', async ({
   baseURL,
@@ -86,6 +97,20 @@ test('startup work and first interaction stay cardinality-bounded in a 4k-chat w
   assertFreshStartup(fresh)
   assertInteractionAndMilestones(control)
   assertInteractionAndMilestones(large)
+  assertCachedSelectionRequestBudget('control', control.probe)
+  assertCachedSelectionRequestBudget('control reload', control.reload.probe)
+  assertCachedSelectionRequestBudget('large', large.probe)
+  assertCachedSelectionRequestBudget('large reload', large.reload.probe)
+  assertTerminalPointBudget('control', control.probe)
+  assertTerminalPointBudget('control reload', control.reload.probe)
+  assertTerminalPointBudget('large', large.probe)
+  assertTerminalPointBudget('large reload', large.reload.probe)
+  assertDemandShapedForkBudget('control', control.probe)
+  assertDemandShapedForkBudget('control reload', control.reload.probe)
+  assertDemandShapedForkBudget('large', large.probe)
+  assertDemandShapedForkBudget('large reload', large.reload.probe)
+  assertFixedConfigurationBudget(control.probe, large.probe)
+  assertFixedConfigurationBudget(control.reload.probe, large.reload.probe)
   assertNoCanonicalWholeTableReadBeforeRunning('control reload', control.reload.probe)
   assertNoCanonicalWholeTableReadBeforeRunning('large reload', large.reload.probe)
 
@@ -147,6 +172,41 @@ test('startup work and first interaction stay cardinality-bounded in a 4k-chat w
   expect(large.diagnostics, 'large browser diagnostics').toEqual([])
 })
 
+test('active-stream reload keeps input and unrelated controls cardinality-independent', async ({
+  baseURL,
+}, testInfo) => {
+  if (!baseURL) throw new Error('GeneratedWorkspaceBaseUrlMissing')
+  const control = await profileActiveStreamReload(baseURL, 'control')
+  const large = await profileActiveStreamReload(baseURL, 'large')
+  const evidence = { control, large }
+  const evidencePath = testInfo.outputPath('large-workspace-active-stream-reload.json')
+  await writeFile(evidencePath, `${JSON.stringify(evidence, null, 2)}\n`)
+  await testInfo.attach('large-workspace-active-stream-reload.json', {
+    path: evidencePath,
+    contentType: 'application/json',
+  })
+
+  for (const [name, profile] of Object.entries(evidence)) {
+    expect(profile.diagnostics, `${name} browser diagnostics`).toEqual([])
+    expect(profile.gesture).toMatchObject({
+      clickCount: 1,
+      shellIdentityStable: true,
+      toggleIdentityStable: true,
+      hitTargetWasToggle: true,
+      openingStillPending: true,
+    })
+    expect(profile.gesture.sidebarTransitions).toEqual([profile.expectedSidebarState])
+    expect(profile.gestureLatencyMs).toBeLessThanOrEqual(INSTRUMENTED_FOREGROUND_GESTURE_BOUND_MS)
+    expect(profile.composerReadyMs).toBeLessThanOrEqual(HANG_BOUND_MS)
+    expect(profile.probe.milestones.coreRunning).toBeDefined()
+    assertNoCanonicalWholeTableReadBeforeRunning(`${name} active-stream reload`, profile.probe)
+  }
+  expect(large.composerReadyMs).toBeLessThanOrEqual(control.composerReadyMs + 100)
+  expect(large.probe.milestones.coreRunning.idb.total).toBe(
+    control.probe.milestones.coreRunning.idb.total,
+  )
+})
+
 interface IdBCountSnapshot {
   readonly total: number
   readonly calls: Readonly<Record<string, number>>
@@ -173,6 +233,7 @@ interface StartupProbeSnapshot {
     readonly coreRunning: StartupMilestone
     readonly maintenanceStarted: StartupMilestone
     readonly routeChatPointPainted: StartupMilestone
+    readonly terminalPointPainted?: StartupMilestone
     readonly terminalPainted: StartupMilestone
     readonly backgroundConverged: StartupMilestone
   }
@@ -193,6 +254,11 @@ interface StartupProbeSnapshot {
     readonly totalDuration: number
     readonly maxDuration: number
   }
+  readonly settingMutations: readonly {
+    readonly method: string
+    readonly key: string
+    readonly at: number
+  }[]
   readonly idb: IdBCountSnapshot
 }
 
@@ -340,6 +406,151 @@ async function profileCachedWorkspace(
     await context?.close().catch(() => undefined)
     await clone.release()
   }
+}
+
+async function profileActiveStreamReload(baseURL: string, name: GeneratedWorkspaceStateName) {
+  const clone = await cloneGeneratedWorkspaceBrowserProfile(name)
+  const scenario = await createFakeStreamScenario({
+    targetChars: 4_096,
+    reasoningChars: 0,
+    chunkChars: 512,
+    initialDelayMs: 15_000,
+    delayMs: 80,
+  })
+  let context: BrowserContext | undefined
+  try {
+    context = await chromium.launchPersistentContext(clone.path, {
+      baseURL,
+      viewport: { width: 1_280, height: 720 },
+    })
+    const diagnostics = collectUnexpectedDiagnostics(context)
+    await installProviderCatalogFixture(context)
+    await installStartupProbe(context)
+    const page = context.pages()[0] ?? (await context.newPage())
+    await page.goto(new URL(ACTIVE_ROUTE, baseURL).href, {
+      waitUntil: 'domcontentloaded',
+      timeout: HANG_BOUND_MS,
+    })
+    await waitForStartupConvergence(page)
+    await retargetGeneratedActiveProfile(page, scenario.providerBaseUrl)
+    await page.reload({ waitUntil: 'domcontentloaded', timeout: HANG_BOUND_MS })
+    await waitForStartupConvergence(page)
+    const composer = page.locator('form[data-ui="composer"]:not([data-presentation-only])')
+    await expect(composer).toBeVisible()
+    await composer.locator('[data-ui="composer-input"]').fill(`active reload ${name}`)
+    await composer.locator('[data-ui="send"]').click()
+    await expect.poll(() => scenario.snapshot().then((state) => state.activeStreams)).toBe(1)
+    await expect(page.locator('[data-ui="abort"]')).toBeVisible()
+
+    await installReloadStorageAdministrationBlocker(page)
+    await page.reload({ waitUntil: 'domcontentloaded', timeout: HANG_BOUND_MS })
+    await page.waitForFunction(
+      () => {
+        const state = (
+          window as Window & {
+            __reloadStorageAdministrationBlocker?: { acquired: boolean; released: boolean }
+          }
+        ).__reloadStorageAdministrationBlocker
+        return (
+          state?.acquired === true &&
+          Boolean(
+            (
+              window as typeof window & {
+                __natterStartupScaleProbe?: {
+                  snapshot(): {
+                    milestones: Partial<StartupProbeSnapshot['milestones']>
+                  }
+                }
+              }
+            ).__natterStartupScaleProbe?.snapshot().milestones.gestureApplied,
+          ) &&
+          document.querySelector('[data-ui="workspace-bootstrap"][data-state="opening"]') !==
+            null &&
+          document.querySelector('[data-ui="app-shell"] [data-role="sidebar-toggle"]') !== null
+        )
+      },
+      undefined,
+      { timeout: HANG_BOUND_MS },
+    )
+    const initialSidebarState = await startForegroundGestureRecorder(page)
+    const expectedSidebarState = initialSidebarState === 'expanded' ? 'collapsed' : 'expanded'
+    const gesture = await clickSidebarToggleWithoutActionabilityWait(page)
+    if (gesture.clickAt === null || gesture.outcomeAt === null) {
+      throw new Error(`ActiveStreamReloadGestureDidNotSettle:${name}`)
+    }
+    expect(await reloadStorageAdministrationBlockerState(page)).toEqual({
+      acquired: true,
+      released: false,
+    })
+
+    const inputStartedAt = performance.now()
+    await releaseReloadStorageAdministrationBlocker(page)
+    await waitForStartupConvergence(page)
+    await expect(composer).toBeVisible()
+    const input = composer.locator('[data-ui="composer-input"]')
+    await input.fill(`ready after active reload ${name}`)
+    await expect(input).toHaveValue(`ready after active reload ${name}`)
+    const composerReadyMs = performance.now() - inputStartedAt
+    await scenario.release()
+    await expect.poll(() => scenario.snapshot().then((state) => state.activeStreams)).toBe(0)
+    return {
+      diagnostics: diagnostics(),
+      expectedSidebarState,
+      gesture,
+      gestureLatencyMs: gesture.outcomeAt - gesture.clickAt,
+      composerReadyMs,
+      probe: await startupProbeSnapshot(page),
+    }
+  } finally {
+    if (context) {
+      const page = context.pages()[0]
+      if (page) await releaseReloadStorageAdministrationBlocker(page).catch(() => undefined)
+    }
+    await scenario.release().catch(() => undefined)
+    await context?.close().catch(() => undefined)
+    await scenario.dispose().catch(() => undefined)
+    await clone.release()
+  }
+}
+
+async function retargetGeneratedActiveProfile(page: Page, providerBaseUrl: string): Promise<void> {
+  const databaseName = await activeWorkspaceDatabaseName(page)
+  await page.evaluate(
+    async ({ chatId, databaseName, providerBaseUrl }) => {
+      const database = await new Promise<IDBDatabase>((resolve, reject) => {
+        const request = indexedDB.open(databaseName)
+        request.onsuccess = () => resolve(request.result)
+        request.onerror = () => reject(request.error)
+      })
+      const requestResult = <T>(request: IDBRequest<T>) =>
+        new Promise<T>((resolve, reject) => {
+          request.onsuccess = () => resolve(request.result)
+          request.onerror = () => reject(request.error)
+        })
+      try {
+        const transaction = database.transaction(['chats', 'profiles'], 'readwrite')
+        const chat = (await requestResult(transaction.objectStore('chats').get(chatId))) as
+          | { settings?: { profileId?: unknown } }
+          | undefined
+        const profileId = chat?.settings?.profileId
+        if (typeof profileId !== 'string') throw new Error('GeneratedActiveProfileIdMissing')
+        const profiles = transaction.objectStore('profiles')
+        const profile = (await requestResult(profiles.get(profileId))) as
+          | Record<string, unknown>
+          | undefined
+        if (!profile) throw new Error('GeneratedActiveProfileMissing')
+        await requestResult(profiles.put({ ...profile, baseUrl: providerBaseUrl }))
+        await new Promise<void>((resolve, reject) => {
+          transaction.oncomplete = () => resolve()
+          transaction.onabort = () => reject(transaction.error)
+          transaction.onerror = () => reject(transaction.error)
+        })
+      } finally {
+        database.close()
+      }
+    },
+    { chatId: GENERATED_WORKSPACE_ACTIVE_CHAT_ID, databaseName, providerBaseUrl },
+  )
 }
 
 async function profileStartup(
@@ -511,6 +722,7 @@ async function installStartupProbe(
         gestureAttempted: false,
         workspacePreflightOpenSuccesses: 0,
         controlManifestReads: 0,
+        settingMutations: [] as { method: string; key: string; at: number }[],
       }
       const mark = (name: string) => {
         if (state.milestones[name]) return
@@ -633,8 +845,25 @@ async function installStartupProbe(
             return `objectStore.${store.name}.${method}${fullSuffix(args)}`
           },
           (receiver, args, result) => {
-            if (method !== 'get') return
             const store = receiver as IDBObjectStore
+            if (
+              store.name === 'settings' &&
+              (method === 'add' || method === 'put' || method === 'delete')
+            ) {
+              const row = args[0]
+              const key =
+                method === 'delete'
+                  ? row
+                  : typeof row === 'object' && row !== null && 'key' in row
+                    ? row.key
+                    : undefined
+              state.settingMutations.push({
+                method,
+                key: String(key),
+                at: performance.now(),
+              })
+            }
+            if (method !== 'get') return
             const key = args[0]
             const milestone =
               store.name === 'workspaceFence' && key === 'global' ? 'bootstrapFenceRead' : null
@@ -740,6 +969,13 @@ async function installStartupProbe(
         }
         const messageList = document.querySelector<HTMLElement>('[data-ui="message-list"]')
         if (
+          targetKind === 'transcript' &&
+          targetPainted &&
+          messageList?.getAttribute('data-presentation-kind') === 'point'
+        ) {
+          mark('terminalPointPainted')
+        }
+        if (
           targetKind === 'empty'
             ? targetPainted && location.hash === '#/new'
             : messageList && location.hash.includes(`/chat/${activeChatId}/`)
@@ -794,8 +1030,9 @@ async function installStartupProbe(
               totalDuration: longTaskTotal,
               maxDuration: Math.max(0, ...state.longTasks),
             },
+            settingMutations: state.settingMutations,
             idb: idbSnapshot(),
-          }) as StartupProbeSnapshot
+          }) as unknown as StartupProbeSnapshot
         },
       }
     },
@@ -929,17 +1166,14 @@ async function measureActiveDestinationFrame(page: Page): Promise<DestinationFra
   await target.click()
   const snapshot = await finishDestinationFrameBudgetRecorder(page)
   assertDestinationFrameBudget(snapshot, { firstPaintMs: 1_500, completeMs: 5_000 })
-  expect(snapshot.publications.map((publication) => publication.renderedCount)).toEqual([
-    1,
-    INITIAL_TRANSCRIPT_FLOOR,
-  ])
+  assertDestinationPublicationContract(snapshot, { point: 'optional' })
   expect(snapshot.publications[0]?.messageIds).toEqual([GENERATED_WORKSPACE_ACTIVE_TERMINAL_ID])
   return snapshot
 }
 
 function destinationMilestoneDuration(
   snapshot: DestinationFrameBudgetSnapshot,
-  milestone: keyof DestinationFrameBudgetSnapshot['milestones'],
+  milestone: 'firstDestinationPaintAt' | 'configuredWindowCompleteAt',
 ): number {
   const at = snapshot.milestones[milestone]
   if (at === null) throw new Error(`DestinationFrameMilestoneMissing:${milestone}`)
@@ -1016,12 +1250,12 @@ function assertStartupStageOrder(name: string, probe: StartupProbeSnapshot): voi
       'shellCommitted',
       'databaseSelectionStarted',
       'databaseManifestRead',
-      'databaseSelectionConfirmed',
       'schemaPreflightCompleted',
       'databaseOpened',
       'bootstrapFenceRead',
       'coreRunning',
     ],
+    ['databaseManifestRead', 'databaseSelectionConfirmed', 'bootstrapFenceRead', 'coreRunning'],
   ] as const satisfies readonly (readonly (keyof StartupProbeSnapshot['milestones'])[])[]
   for (const ordered of orderedBranches) {
     for (let index = 1; index < ordered.length; index += 1) {
@@ -1054,10 +1288,90 @@ function assertStartupStageOrder(name: string, probe: StartupProbeSnapshot): voi
     probe.milestones.terminalPainted.at,
     `${name} terminal after RUNNING`,
   ).toBeGreaterThanOrEqual(probe.milestones.coreRunning.at)
+  if (probe.milestones.terminalPointPainted) {
+    expect(
+      probe.milestones.backgroundConverged.at,
+      `${name} passive fill after provisional terminal point`,
+    ).toBeGreaterThanOrEqual(probe.milestones.terminalPointPainted.at)
+  }
   expect(
     probe.milestones.backgroundConverged.at,
     `${name} convergence after terminal`,
   ).toBeGreaterThanOrEqual(probe.milestones.terminalPainted.at)
+}
+
+function assertCachedSelectionRequestBudget(name: string, probe: StartupProbeSnapshot): void {
+  const calls = probe.milestones.coreRunning.idb.calls
+  expect(calls['factory.open:natter-control'], `${name} control database opens`).toBe(2)
+  expect(
+    calls['database.transaction:manifests:readonly'],
+    `${name} manifest read transactions`,
+  ).toBe(2)
+  expect(calls['objectStore.manifests.get.bounded'], `${name} manifest point reads`).toBe(2)
+}
+
+function assertTerminalPointBudget(name: string, probe: StartupProbeSnapshot): void {
+  const point = probe.milestones.terminalPointPainted
+  expect(point, `${name} provisional terminal point`).toBeDefined()
+  expect(
+    (point?.idb.calls['objectStore.messageBodies.get.bounded'] ?? 0) -
+      (probe.milestones.coreRunning.idb.calls['objectStore.messageBodies.get.bounded'] ?? 0),
+    `${name} terminal point body reads`,
+  ).toBe(1)
+  expect(
+    (point?.idb.calls['database.transaction:messageBodies,messages:readonly'] ?? 0) -
+      (probe.milestones.coreRunning.idb.calls[
+        'database.transaction:messageBodies,messages:readonly'
+      ] ?? 0),
+    `${name} terminal point material transactions`,
+  ).toBe(1)
+}
+
+function assertDemandShapedForkBudget(name: string, probe: StartupProbeSnapshot): void {
+  const convergedCalls = probe.milestones.backgroundConverged.idb.calls
+  const pointCalls = probe.milestones.terminalPointPainted?.idb.calls ?? {}
+  expect(
+    (convergedCalls['objectStore.childSlotMembers.get.bounded'] ?? 0) -
+      (pointCalls['objectStore.childSlotMembers.get.bounded'] ?? 0),
+    `${name} post-point mounted-window fork member reads`,
+  ).toBe(INITIAL_TRANSCRIPT_FLOOR)
+  expect(
+    (convergedCalls['objectStore.childLists.get.bounded'] ?? 0) -
+      (pointCalls['objectStore.childLists.get.bounded'] ?? 0),
+    `${name} post-point terminal plus mounted-window child-list reads`,
+  ).toBe(INITIAL_TRANSCRIPT_FLOOR + 1)
+}
+
+function assertFixedConfigurationBudget(
+  control: StartupProbeSnapshot,
+  large: StartupProbeSnapshot,
+): void {
+  const shape = (probe: StartupProbeSnapshot) => {
+    const calls = probe.milestones.configurationSelectionRead.idb.calls
+    return {
+      shellTransactions:
+        calls['database.transaction:configurationCatalogAggregates,settings:readonly'] ?? 0,
+      selectionTransactions:
+        calls[
+          'database.transaction:configurationPresetCatalogRows,configurationProfileCatalogRows,configurationPromptPresetCatalogRows,keys,presets,profiles,textTemplates:readonly'
+        ] ?? 0,
+      profileGets: calls['objectStore.profiles.get.bounded'] ?? 0,
+      presetGets: calls['objectStore.presets.get.bounded'] ?? 0,
+      keyGets: calls['objectStore.keys.get.bounded'] ?? 0,
+      wholeTableReads: Object.entries(calls).filter(
+        ([key, count]) =>
+          count > 0 &&
+          /^objectStore\.(?:configurationPresetCatalogRows|configurationProfileCatalogRows|configurationPromptPresetCatalogRows|keys|presets|profiles)\.(?:getAll|getAllKeys|openCursor|openKeyCursor)\.full$/u.test(
+            key,
+          ),
+      ),
+    }
+  }
+  const controlShape = shape(control)
+  const largeShape = shape(large)
+  expect(controlShape.selectionTransactions).toBe(1)
+  expect(controlShape.wholeTableReads).toEqual([])
+  expect(largeShape).toEqual(controlShape)
 }
 
 function assertNoCanonicalWholeTableReadBeforeRunning(
@@ -1158,8 +1472,8 @@ function startupComparisons(control: StartupProfile, large: StartupProfile) {
 
 function startupStageBreakdown(probe: StartupProbeSnapshot) {
   const stage = (
-    from: keyof StartupProbeSnapshot['milestones'] | null,
-    to: keyof StartupProbeSnapshot['milestones'],
+    from: Exclude<keyof StartupProbeSnapshot['milestones'], 'terminalPointPainted'> | null,
+    to: Exclude<keyof StartupProbeSnapshot['milestones'], 'terminalPointPainted'>,
   ) => {
     const start = from === null ? { at: 0, idb: { total: 0 } } : probe.milestones[from]
     const end = probe.milestones[to]
@@ -1173,13 +1487,22 @@ function startupStageBreakdown(probe: StartupProbeSnapshot) {
     firstGestureDispatch: stage('shellCommitted', 'gestureDispatched'),
     firstGestureCommit: stage('gestureDispatched', 'gestureApplied'),
     databaseSelectionStart: stage('shellCommitted', 'databaseSelectionStarted'),
-    databaseManifestSelection: stage('databaseSelectionStarted', 'databaseSelectionConfirmed'),
-    schemaPreflight: stage('databaseSelectionConfirmed', 'schemaPreflightCompleted'),
+    databaseManifestSelection: stage('databaseSelectionStarted', 'databaseManifestRead'),
+    databaseSelectionConfirmation: stage('databaseManifestRead', 'databaseSelectionConfirmed'),
+    schemaPreflight: stage('databaseManifestRead', 'schemaPreflightCompleted'),
     databaseOpenAndUpgrade: stage('schemaPreflightCompleted', 'databaseOpened'),
     bootstrapFence: stage('databaseOpened', 'bootstrapFenceRead'),
     runtimeReady: stage('bootstrapFenceRead', 'coreRunning'),
     residentConfiguration: stage('bootstrapFenceRead', 'configurationResidentRead'),
     configurationSelection: stage('configurationResidentRead', 'configurationSelectionRead'),
+    terminalPointPaint: probe.milestones.terminalPointPainted
+      ? {
+          elapsedMs: probe.milestones.terminalPointPainted.at - probe.milestones.coreRunning.at,
+          idbRequests:
+            probe.milestones.terminalPointPainted.idb.total -
+            probe.milestones.coreRunning.idb.total,
+        }
+      : null,
     terminalPaint: stage('coreRunning', 'terminalPainted'),
     backgroundFloor: stage('terminalPainted', 'backgroundConverged'),
     maintenanceStartAfterRunning: stage('coreRunning', 'maintenanceStarted'),

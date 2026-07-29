@@ -1049,8 +1049,10 @@ async function assertSidebarBottomHasNoBlankTail(page: Page, label: string): Pro
 
 async function loadNextSidebarPage(page: Page): Promise<void> {
   const list = page.locator('[data-ui="chat-list"]')
+  const loadMore = page.locator('[data-ui="load-more-sidebar"]')
+  await expect(loadMore).toBeVisible()
   const before = Number((await list.getAttribute('data-rendered-count')) ?? 0)
-  await page.locator('[data-ui="load-more-sidebar"]').click()
+  await loadMore.click()
   await expect
     .poll(async () => Number((await list.getAttribute('data-rendered-count')) ?? 0))
     .toBeGreaterThan(before)

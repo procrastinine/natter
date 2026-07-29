@@ -104,36 +104,29 @@ async function selectBrowserWorkspaceDatabase(
     onProgress?.({ kind: 'database-selection', operation: 'read-active-slot' })
     const current = await ensureBrowserWorkspaceCurrentForSelection(authority.signal, onProgress)
     assertBrowserWorkspaceBootstrapAuthority(authority)
-    const manifest = await readBrowserWorkspaceDatabaseManifest()
-    assertBrowserWorkspaceBootstrapAuthority(authority)
     onProgress?.({
       kind: 'database-selection',
       operation: 'acquire-active-slot',
-      databaseName: manifest.activeDatabaseName,
+      databaseName: current.databaseName,
     })
-    const slotLease = await acquireBrowserWorkspaceSlotLease(
-      manifest.activeDatabaseName,
-      authority.signal,
-    )
+    const slotLease = await acquireBrowserWorkspaceSlotLease(current.databaseName, authority.signal)
     try {
       assertBrowserWorkspaceBootstrapAuthority(authority)
       onProgress?.({
         kind: 'database-selection',
         operation: 'confirm-active-slot',
-        databaseName: manifest.activeDatabaseName,
+        databaseName: current.databaseName,
       })
       const confirmed = await readBrowserWorkspaceDatabaseManifest()
       assertBrowserWorkspaceBootstrapAuthority(authority)
       if (
-        confirmed.activeDatabaseName !== manifest.activeDatabaseName ||
-        confirmed.activationSequence !== manifest.activationSequence ||
         confirmed.activeDatabaseName !== current.databaseName ||
         confirmed.activationSequence !== current.activationSequence
       ) {
         onProgress?.({
           kind: 'database-selection',
           operation: 'retry-changed-slot',
-          databaseName: manifest.activeDatabaseName,
+          databaseName: current.databaseName,
         })
         await releaseBrowserWorkspaceSlotLease(slotLease)
         continue

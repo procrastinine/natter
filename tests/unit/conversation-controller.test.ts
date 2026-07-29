@@ -149,6 +149,7 @@ class TestProjectionSource implements ConversationProjectionSource {
   childPositionCompletionGate: Promise<void> | null = null
   topologyCompletionGate: Promise<void> | null = null
   forkCompletionGate: Promise<void> | null = null
+  selectionForks: 'complete' | 'selected' | 'none' = 'complete'
   readonly childPositionSignals: AbortSignal[] = []
   readonly openSelection = vi.fn(this.readSelection.bind(this))
   readonly loadChat = vi.fn(async (_chatId: ChatId, _signal: AbortSignal) =>
@@ -349,6 +350,12 @@ class TestProjectionSource implements ConversationProjectionSource {
       })
     }
     const terminal = path.at(-1) as ReturnType<typeof presentation>
+    const selectedMessageId =
+      selection.kind === 'default'
+        ? null
+        : selection.kind === 'sibling-position'
+          ? this.children(selection.parentId)[selection.position]?.header.id
+          : selection.messageId
     return this.envelope(
       sealTestSelection({
         kind: 'ready',
@@ -361,7 +368,14 @@ class TestProjectionSource implements ConversationProjectionSource {
           pathHeaders: path.map((row) => row.header),
         },
         presentations: [terminal],
-        forks: path.map((row) => this.forkFor(row.header.id)),
+        forks:
+          this.selectionForks === 'complete'
+            ? path.map((row) => this.forkFor(row.header.id))
+            : this.selectionForks === 'selected' && selectedMessageId
+              ? path
+                  .filter((row) => row.header.id === selectedMessageId)
+                  .map((row) => this.forkFor(row.header.id))
+              : [],
         terminalChildSlot: emptyActiveBranchChildSlot(targetId),
       }),
     )
@@ -1504,6 +1518,43 @@ describe('conversation controller', () => {
         observedTipId: remembered.id,
       },
     })
+  })
+
+  it('retains same-version common forks while the selected fork seals a branch swipe', async () => {
+    const root = message('root', null, 0, 'root', 1)
+    const left = message('left', root.id, 0, 'left', 2)
+    const leftTip = message('left-tip', left.id, 0, 'left tip', 3)
+    const right = message('right', root.id, 1, 'right', 4)
+    const rightTip = message('right-tip', right.id, 0, 'right tip', 5)
+    const { controller, navigation, source } = harness([root, left, leftTip, right, rightTip])
+
+    navigation.arrive('arrival-left', { chatId: CHAT_ID, targetMessageId: leftTip.id })
+    await settle()
+    source.selectionForks = 'selected'
+    let releaseForks = () => {}
+    source.forkCompletionGate = new Promise<void>((resolve) => {
+      releaseForks = resolve
+    })
+
+    controller.navigate({ chatId: CHAT_ID, kind: 'message', messageId: right.id })
+    await settle()
+
+    const spine = presentedSpine(controller)
+    expect(spine.path.materializeIds()).toEqual([root.id, right.id, rightTip.id])
+    expect(spine.forkFor(root.id)).toMatchObject({
+      selectedMessageId: root.id,
+      liveCount: 1,
+    })
+    expect(spine.forkFor(right.id)).toMatchObject({
+      selectedMessageId: right.id,
+      position: 1,
+      liveCount: 2,
+      previousMessageId: left.id,
+    })
+
+    releaseForks()
+    source.forkCompletionGate = null
+    await settle()
   })
 
   it('resolves an in-tab numeric sibling jump before applying that child remembered terminal', async () => {
@@ -3208,13 +3259,14 @@ describe('conversation controller', () => {
     expect(source.loadPreviews).not.toHaveBeenCalled()
   })
 
-  it('reuses exact selection forks for every parent in the first demanded transcript window', async () => {
+  it('loads fork rows only for parents in the first demanded transcript window', async () => {
     const root = message('root', null, 0, 'root', 1)
     const left = message('left', root.id, 0, 'left', 2)
     const leftTip = message('left-tip', left.id, 0, 'left tip', 3)
     const right = message('right', root.id, 1, 'right', 4)
     const rightTip = message('right-tip', right.id, 0, 'right tip', 5)
     const { controller, navigation, source } = harness([root, left, leftTip, right, rightTip])
+    source.selectionForks = 'none'
     let releaseInitialForks = () => {}
     source.forkCompletionGate = new Promise<void>((resolve) => {
       releaseInitialForks = resolve
@@ -3245,7 +3297,11 @@ describe('conversation controller', () => {
       liveCount: 2,
       nextMessageId: right.id,
     })
-    expect(source.loadForks).not.toHaveBeenCalled()
+    expect(
+      source.loadForks.mock.calls.flatMap(([, , targets]) =>
+        targets.map((target) => target.selectedMessageId),
+      ),
+    ).toEqual([leftTip.id, left.id, root.id])
     controller.setTranscriptDemand(owner, null)
   })
 })

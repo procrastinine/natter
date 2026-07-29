@@ -168,6 +168,13 @@ describe('unified tab conversation ownership boundary', () => {
     expect(transcriptProps).not.toEqual(
       expect.arrayContaining(['branchSnapshot', 'branchSpine', 'activePath']),
     )
+    expect(interfacePropertyNames('ui/chat/MessageList.tsx', 'PointMessageListProps')).toEqual([
+      'chatId',
+      'kind',
+      'longMessageDisplayMode',
+      'window',
+      'workspaceFence',
+    ])
     const treeProps = interfacePropertyNames('ui/chat/BranchTreeView.tsx', 'BranchTreeViewProps')
     expect(treeProps.filter((property) => property === 'binding')).toHaveLength(1)
     expect(tree).toContain('binding: ConversationTreeSurface')

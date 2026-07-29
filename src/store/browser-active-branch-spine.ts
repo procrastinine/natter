@@ -12,7 +12,10 @@ import {
   fixedConversationSelectionTarget,
 } from '../core/messages'
 import type { Chat, ChatId, ChildListState, ChildSlotMember, MessageId } from '../core/types'
-import { readActiveBranchPathSlotFrameInTransaction } from './active-branch-fork-storage'
+import {
+  readActiveBranchForkSlotsForHeadersInTransaction,
+  readActiveBranchTerminalChildSlotInTransaction,
+} from './active-branch-fork-storage'
 import { proveConversationSelectionFromExactPath } from './conversation-destination-seal'
 import { exactCompoundPrefixBetween } from './indexeddb-key-ranges'
 import { canonicalMessageHeaderRow, type MessageHeaderRow } from './message-storage'
@@ -529,12 +532,7 @@ export async function resolveConversationOpenReceipt(
   try {
     if (receipt.terminalHint.kind === 'empty') {
       const slotFrame = await access.runFrame(['childLists'], (tx) =>
-        readActiveBranchPathSlotFrameInTransaction(
-          tx,
-          receipt.chat.id,
-          Object.freeze([]),
-          owned.signal,
-        ),
+        readActiveBranchTerminalChildSlotInTransaction(tx, receipt.chat.id, null, owned.signal),
       )
       if (slotFrame.kind === 'stale') throw new ConversationOpenFrameStaleError()
       if (measurement) measurement.slotFrames += 1
@@ -555,7 +553,7 @@ export async function resolveConversationOpenReceipt(
         exactPathHeaders: Object.freeze([]),
         presentations: Object.freeze([]),
         forks: Object.freeze([]),
-        terminalChildSlot: slotFrame.value.terminalChildSlot,
+        terminalChildSlot: slotFrame.value,
         snapshotOwnership: 'adopt',
       })
     }
@@ -628,8 +626,36 @@ export async function resolveConversationOpenReceipt(
         reason: path.reason,
       })
     }
-    const slotFramePromise = access.runFrame(['childLists', 'childSlotMembers'], (tx) =>
-      readActiveBranchPathSlotFrameInTransaction(tx, receipt.chat.id, path.rows, owned.signal),
+    const selectedMessageId =
+      receipt.stableSelection.kind === 'default'
+        ? null
+        : receipt.stableSelection.kind === 'sibling-position'
+          ? receipt.selectedHeader?.id
+          : receipt.stableSelection.messageId
+    const selectedForkHeader =
+      selectedMessageId === null || selectedMessageId === undefined
+        ? undefined
+        : path.rows.find((header) => header.id === selectedMessageId)
+    const slotFramePromise = access.runFrame(
+      selectedForkHeader ? ['childLists', 'childSlotMembers'] : ['childLists'],
+      async (tx) => {
+        const [terminalChildSlot, forks] = await Promise.all([
+          readActiveBranchTerminalChildSlotInTransaction(
+            tx,
+            receipt.chat.id,
+            leafHeader.id,
+            owned.signal,
+          ),
+          selectedForkHeader
+            ? readActiveBranchForkSlotsForHeadersInTransaction(
+                tx,
+                [selectedForkHeader],
+                owned.signal,
+              )
+            : Promise.resolve(Object.freeze([])),
+        ])
+        return Object.freeze({ terminalChildSlot, forks })
+      },
     )
     ownedLegs.push(slotFramePromise)
     const slotFrame = await slotFramePromise

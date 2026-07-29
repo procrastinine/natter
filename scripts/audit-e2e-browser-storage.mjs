@@ -441,6 +441,17 @@ function classifyCleanupEvidenceCall(node) {
   if (expression.name.text === 'reload') {
     return cleanupEvidenceSite('fixture.page.reload', ['reload'])
   }
+  if (
+    expression.name.text === 'release' &&
+    ts.isIdentifier(expression.expression) &&
+    expression.expression.text === 'clone'
+  ) {
+    return cleanupEvidenceSite('fixture.generated-profile-release', [
+      'close-database',
+      'clear-data',
+      'close-resource',
+    ])
+  }
   if (expression.name.text === 'click' && isClearAllLocator(expression.expression)) {
     return cleanupEvidenceSite('fixture.public-clear-all', [
       'delete-database',

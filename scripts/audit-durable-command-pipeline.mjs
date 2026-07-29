@@ -10470,10 +10470,20 @@ function configurationCallerSingleAttemptFacts(program) {
     configurationCommandClientSource,
     'executeConfigurationCommand',
   )
+  const configurationCommandExecute = findNestedVariableFunction(
+    executeConfigurationCommand,
+    'execute',
+  )
   const applicationSubmitCalls = executableCalls(configurationApplicationExecute).filter(
     (call) =>
       call.expression.getText(configurationDomainSource) === 'dependencies.port.execute' &&
       call.arguments[0]?.getText(configurationDomainSource) === 'command',
+  )
+  const commandClientSubmitCalls = executableCalls(configurationCommandExecute).filter(
+    (call) =>
+      call.expression.getText(configurationCommandClientSource).replace(/\s+/gu, '') ===
+        'getWorkspaceRepository().execute' &&
+      call.arguments[0]?.getText(configurationCommandClientSource) === 'permit',
   )
   return Object.freeze({
     productionPortBound: configurationApplicationSource
@@ -10486,10 +10496,8 @@ function configurationCallerSingleAttemptFacts(program) {
         (call) => call.expression.getText(configurationDomainSource) !== 'execute',
       ),
     commandClientSingleSubmit:
-      countOccurrences(
-        executeConfigurationCommand.getText(configurationCommandClientSource),
-        '.execute(permit,',
-      ) === 1 &&
+      commandClientSubmitCalls.length === 1 &&
+      !callHasIterationAncestor(commandClientSubmitCalls[0], configurationCommandExecute) &&
       countOccurrences(
         executeConfigurationCommand.getText(configurationCommandClientSource),
         "runWorkspaceAction('configuration', execute)",

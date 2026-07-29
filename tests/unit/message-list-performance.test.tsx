@@ -5,6 +5,7 @@ import type {
   GenerationSubmission,
 } from '../../src/app/presentation-interactions'
 import {
+  type ActiveBranchForkSlot,
   createActiveBranchSpine,
   emptyActiveBranchChildSlot,
   type VersionedActiveBranchSpine,
@@ -19,13 +20,14 @@ import {
   prependTranscriptBodyPage,
   type TranscriptBodyPage,
   type TranscriptBodyWindow,
+  transcriptBodyPointWindow,
   transcriptBodyWindowFromPage,
   withTranscriptBodyRevisions,
 } from '../../src/store/transcript-window'
 import { useToastStore } from '../../src/store/zustand/toastStore'
 import { useUiStore } from '../../src/store/zustand/uiStore'
 import { __setMessageRenderProbeForTests } from '../../src/ui/chat/Message'
-import { MessageList } from '../../src/ui/chat/MessageList'
+import { MessageList, MessageListPoint } from '../../src/ui/chat/MessageList'
 import { resetAttemptControllerForTests } from '../helpers/attempt-controller'
 import { createInteractionSettlementHarness } from '../helpers/presentation-interactions'
 
@@ -79,6 +81,81 @@ describe('message-list current presentation contract', () => {
     expect(log).toHaveAttribute('aria-relevant', 'additions')
     expect(log).toHaveAttribute('data-rendered-count', '3')
     expect(log).toHaveAttribute('data-total-count', '5')
+  })
+
+  it('renders the terminal point immediately as one explicitly provisional read-only row', () => {
+    const fixture = branchFixture(96, { bodyPrefix: 'point-body' })
+    const message = fixture.messages.at(-1)
+    const header = fixture.headers.at(-1)
+    if (!message || !header) throw new Error('PointFixtureMissing')
+    const view = render(
+      <MessageListPoint
+        kind="point"
+        chatId={CHAT_ID}
+        workspaceFence={fixture.seal}
+        window={transcriptBodyPointWindow({
+          header,
+          message,
+          bodyVersion: header.bodyVersion,
+        })}
+      />,
+    )
+
+    const log = view.getByRole('log')
+    expect(log).toHaveAttribute('data-presentation-kind', 'point')
+    expect(log).toHaveAttribute('data-presentation-only', 'true')
+    expect(log).toHaveAttribute('data-rendered-count', '1')
+    expect(log).toHaveAttribute('data-branch-counts', 'pending')
+    expect(log).not.toHaveAttribute('data-total-count')
+    expect(view.getByText('point-body 95')).toBeVisible()
+    expect(view.getByRole('button', { name: 'Edit message' })).toBeDisabled()
+    expect(view.getByRole('button', { name: 'Delete message' })).toBeDisabled()
+
+    const retained = view.container.querySelector<HTMLElement>('[data-message-id="message-95"]')
+    if (!retained) throw new Error('PointTerminalMissing')
+    view.rerender(listElement(fixture, fixture.window(86, 10)))
+
+    expect(view.getByRole('log')).toHaveAttribute('data-presentation-kind', 'ready')
+    expect(view.getByRole('log')).toHaveAttribute('data-branch-counts', 'known')
+    expect(view.container.querySelector('[data-message-id="message-95"]')).toBe(retained)
+  })
+
+  it('keeps branch counts pending until every mounted row has an exact fork slot', () => {
+    const fixture = branchFixture(5)
+    const window = fixture.window(2, 3)
+    const partialSpine = createActiveBranchSpine({
+      chatId: CHAT_ID,
+      structuralVersion: 0,
+      resolvedLeafId: fixture.headers.at(-1)?.id ?? null,
+      headers: fixture.headers,
+      terminalChildSlot: emptyActiveBranchChildSlot(fixture.headers.at(-1)?.id ?? null),
+    })
+    const partialBinding = Object.freeze({
+      ...transcriptBinding(fixture, window),
+      spine: partialSpine,
+    })
+    const view = render(
+      <MessageList
+        binding={partialBinding}
+        chatSettings={BASE_SETTINGS}
+        prefillPlan={PREFILL_UNAVAILABLE_PLAN}
+        messageInitialRenderWork={10}
+        messageRenderWindowLoadMode="manual"
+        onLoadOlderMessages={NOOP_LOAD}
+        runConversationMutation={RUN_MUTATION}
+        onEditAndSendMessage={STARTED_GENERATION}
+        onRegenerateMessage={STARTED_GENERATION}
+        onContinueMessage={STARTED_GENERATION}
+      />,
+    )
+    const retained = view.container.querySelector<HTMLElement>('[data-message-id="message-4"]')
+    if (!retained) throw new Error('PartialForkTerminalMissing')
+
+    expect(view.getByRole('log')).toHaveAttribute('data-branch-counts', 'pending')
+    view.rerender(listElement(fixture, window))
+
+    expect(view.getByRole('log')).toHaveAttribute('data-branch-counts', 'known')
+    expect(view.container.querySelector('[data-message-id="message-4"]')).toBe(retained)
   })
 
   it('keeps work bounded to the supplied body window while the complete path stays header-only', () => {
@@ -274,7 +351,7 @@ function branchFixture(
     resolvedLeafId: headers.at(-1)?.id ?? null,
     headers,
     terminalChildSlot: emptyActiveBranchChildSlot(headers.at(-1)?.id ?? null),
-  })
+  }).replaceForks(headers.map(singletonFork))
   const seal: ConversationTranscriptSurface['seal'] = Object.freeze({
     workspaceId: 'message-list-performance-workspace',
     replacementEpoch: 0,
@@ -359,6 +436,21 @@ function transcriptBinding(
     selectionEpoch: 0,
     viewportRevision: 0,
     reveal: null,
+  })
+}
+
+function singletonFork(header: MessageHeaderRow): ActiveBranchForkSlot {
+  return Object.freeze({
+    parentId: header.parentId,
+    selectedMessageId: header.id,
+    slotVersion: 0,
+    position: 0,
+    liveCount: 1,
+    nextSiblingIndex: 1,
+    previousMessageId: null,
+    nextMessageId: null,
+    firstMessageId: header.id,
+    lastMessageId: header.id,
   })
 }
 

@@ -79,7 +79,7 @@ export const WORK_MEMORY_EVIDENCE_LINKS = freezeRows([
   },
   {
     id: 'message-list-identity-delta-rendering',
-    ownerId: 'src/ui/chat/MessageList.tsx#MessageList',
+    ownerId: 'src/ui/chat/MessageList.tsx#MessageListSurface',
     testPath: 'tests/unit/message-list-performance.test.tsx',
     testLocator: "it('rerenders only the body whose exact revision changed'",
     assertionLocators: ["expect(renderedIds).toEqual(['message-5'])"],

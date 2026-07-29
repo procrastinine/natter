@@ -21,7 +21,7 @@ const manifest: VerificationComparisonManifest = {
   id: 'wave-test',
   comparison: { kind: 'git-commit', oid: '1'.repeat(40) },
 }
-const CURRENT_COMPARISON_OID = '598f65a1406c53d6c03f0d44239c408b715dacf6'
+const CURRENT_COMPARISON_OID = 'eb6d6600a91c818e5b15750cd9b9786820272049'
 
 describe('committed verification comparison', () => {
   it('accepts only the fixed comparison mode or a persisted baseline id', () => {

@@ -122,7 +122,7 @@ describe.skipIf(!RUN_BENCHMARK)('active branch selection read benchmark', () => 
     expect(shallowResult?.measurement).toMatchObject({
       pathFrames: 1,
       slotFrames: 1,
-      forkSlotsRead: 8,
+      forkSlotsRead: 0,
     })
     expect(widthResult?.measurement.physicalHeaderReadRequests).toBe(
       depthControl?.measurement.physicalHeaderReadRequests,

@@ -114,11 +114,16 @@ export function proveConversationSelectionFromExactPath(
   if (!tipHeader || tipHeader.id !== tipId) {
     throw new TreeChangedError(chat.id, `committed tip ${tipId} unavailable`)
   }
+  const pathById = new Map(pathHeaders.map((header) => [header.id, header]))
+  const forkIds = new Set<MessageId>()
   if (
-    forks.length !== pathHeaders.length ||
-    forks.some((fork, index) => {
-      const header = pathHeaders[index]
-      return !header || fork.selectedMessageId !== header.id || fork.parentId !== header.parentId
+    forks.some((fork) => {
+      const header = pathById.get(fork.selectedMessageId)
+      if (!header || forkIds.has(fork.selectedMessageId) || fork.parentId !== header.parentId) {
+        return true
+      }
+      forkIds.add(fork.selectedMessageId)
+      return false
     })
   ) {
     throw new TreeChangedError(chat.id, `committed fork frame ${tipId} unavailable`)

@@ -96,7 +96,10 @@ import {
 import { EditTreeToolbar } from '../ui/chat/EditTreeToolbar'
 import { EmptyState } from '../ui/chat/EmptyState'
 import { FocusModeToggle } from '../ui/chat/FocusModeToggle'
-import type { MessageList as MessageListComponent } from '../ui/chat/MessageList'
+import type {
+  MessageList as MessageListComponent,
+  MessageListPoint as MessageListPointComponent,
+} from '../ui/chat/MessageList'
 import { PrefillSettingsPrompt } from '../ui/chat/PrefillSettingsPrompt'
 import { ScrollRegion, type ScrollRegionHandle, type ScrollState } from '../ui/chat/ScrollRegion'
 import { ToastTray } from '../ui/chat/ToastTray'
@@ -149,7 +152,10 @@ import {
   useRoute,
 } from './router'
 
-type MessageListModule = { default: typeof MessageListComponent }
+type MessageListModule = {
+  default: typeof MessageListComponent
+  point: typeof MessageListPointComponent
+}
 type BranchTreeViewModule = { default: typeof BranchTreeViewComponent }
 
 function createSurfaceModuleResource<Module>(loader: () => Promise<Module>) {
@@ -196,6 +202,7 @@ function createSurfaceModuleResource<Module>(loader: () => Promise<Module>) {
 const messageListModuleResource = createSurfaceModuleResource<MessageListModule>(() =>
   Promise.all([import('../ui/chat/MessageList'), loadConversationActions()]).then(([module]) => ({
     default: module.MessageList,
+    point: module.MessageListPoint,
   })),
 )
 const branchTreeViewModuleResource = createSurfaceModuleResource<BranchTreeViewModule>(() =>
@@ -354,6 +361,7 @@ export function Shell() {
     branchTreeViewModuleResource.getSnapshot,
   )
   const MessageList = messageListModule?.default
+  const MessageListPoint = messageListModule?.point
   const BranchTreeView = branchTreeViewModule?.default
   const activeChatId = route.kind === 'chat' ? route.chatId : null
   const onNewChatSurface = route.kind === 'new'
@@ -524,6 +532,7 @@ export function Shell() {
     visibleBinding,
     paintedChat,
     transcriptBinding,
+    transcriptPoint,
     treeBinding,
     activePath,
     activeBranchTailId,
@@ -1748,7 +1757,9 @@ export function Shell() {
                         conversationSnapshot.workspaceEpoch
                       }
                       resetKey={transcriptBinding?.seal.chatId ?? activeChatId}
-                      selectionKey={transcriptBinding?.seal.leafId ?? null}
+                      selectionKey={
+                        transcriptBinding?.seal.leafId ?? transcriptPoint?.window.leafId ?? null
+                      }
                       viewportRevision={transcriptBinding?.viewportRevision ?? 0}
                       streamFollowKey={selectedPathFollowKey}
                       streamFollowTargetMessageId={selectedPathFollowTargetMessageId}
@@ -1788,6 +1799,15 @@ export function Shell() {
                           ) : (
                             <SurfaceLoading label="Loading conversation…" />
                           )
+                        ) : transcriptPoint && MessageListPoint ? (
+                          <MessageListPoint
+                            key={activeChatId}
+                            kind="point"
+                            chatId={activeChatId}
+                            workspaceFence={conversationWorkspaceFence}
+                            window={transcriptPoint.window}
+                            longMessageDisplayMode={prefs.longMessageDisplayMode}
+                          />
                         ) : transcriptLoadFailed ? (
                           <TranscriptLoadFailure onRetry={loadOlderMessageWindow} />
                         ) : (

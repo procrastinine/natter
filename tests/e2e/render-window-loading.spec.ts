@@ -1,6 +1,7 @@
 import {
   armDestinationFrameBudgetRecorder,
   assertDestinationFrameBudget,
+  assertDestinationPublicationContract,
   finishDestinationFrameBudgetRecorder,
   installDestinationFrameBudgetRecorder,
 } from './destination-frame-budget-recorder'
@@ -87,11 +88,8 @@ test('one sidebar destination gesture bounds the complete configured transcript 
   await target.click()
   const snapshot = await finishDestinationFrameBudgetRecorder(page)
   assertDestinationFrameBudget(snapshot, { firstPaintMs: 1_500, completeMs: 5_000 })
+  assertDestinationPublicationContract(snapshot, { point: 'required' })
   await expect(page).toHaveURL(new RegExp(`#/chat/${chatId}/message/${terminalMessageId}$`, 'u'))
-  expect(snapshot.publications.map((publication) => publication.renderedCount)).toEqual([
-    1,
-    initialRenderWork,
-  ])
   expect(snapshot.publications[0]?.messageIds).toEqual([terminalMessageId])
   const finalIds = snapshot.publications.at(-1)?.messageIds ?? []
   expect(finalIds).toHaveLength(initialRenderWork)

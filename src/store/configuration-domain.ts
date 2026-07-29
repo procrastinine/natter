@@ -7,11 +7,7 @@ import {
   serializeChatSettingsPatch,
 } from '../core/chat-metadata'
 import { cloneDefaultChatSettings } from '../core/defaults'
-import {
-  CORS_PROXY_SECRET_KEY,
-  CORS_PROXY_URL_KEY,
-  TOKEN_CALIBRATION_MODE_KEY,
-} from '../core/global-settings'
+import { GLOBAL_PREFERENCE_KEYS } from '../core/global-settings'
 import {
   forceEquivalentModelIdForConnection,
   resolveModelIdFromCatalog,
@@ -286,7 +282,26 @@ export function createConfigurationApplication(
   ): Promise<ConfigurationDomainResult<Command['kind']>> => {
     const pending = stagePendingConfigurationCommand(command, dependencies.pendingConfiguration)
     try {
-      const result = await dependencies.port.execute(command)
+      const localApplication = pendingConfigurationOwnsCompleteLocalWorkspaceSetting(pending)
+        ? {
+            localApplication: (committed: ConfigurationDomainResult) => {
+              if (
+                committed.kind === 'missing' ||
+                committed.kind === 'conflict' ||
+                committed.kind === 'invalid'
+              ) {
+                return 'inactive' as const
+              }
+              acknowledgePendingConfigurationCommand(
+                pending,
+                committed,
+                dependencies.pendingConfiguration,
+              )
+              return 'applied' as const
+            },
+          }
+        : null
+      const result = await dependencies.port.execute(command, localApplication ?? undefined)
       if (result.kind === 'missing' || result.kind === 'conflict' || result.kind === 'invalid') {
         throw new ConfigurationDomainError(result)
       }
@@ -684,11 +699,6 @@ interface StagedPendingConfigurationCommand {
   readonly acknowledgement: PendingConfigurationAcknowledgement
 }
 
-const REQUEST_PREPARATION_SETTING_KEYS = new Set<string>([
-  TOKEN_CALIBRATION_MODE_KEY,
-  CORS_PROXY_URL_KEY,
-  CORS_PROXY_SECRET_KEY,
-])
 const PROFILE_SWITCH_PLAN_ATTEMPTS = [true, false] as const
 
 type PendingConfigurationCommand = Extract<
@@ -831,7 +841,11 @@ function stagePendingConfigurationCommand(
       }
     }
     case 'global-preference.set': {
-      if (!REQUEST_PREPARATION_SETTING_KEYS.has(command.key)) return null
+      if (
+        !GLOBAL_PREFERENCE_KEYS.includes(command.key as (typeof GLOBAL_PREFERENCE_KEYS)[number])
+      ) {
+        return null
+      }
       const staged = pending.stageWorkspaceSetting(command.key, command.value)
       return {
         chatId: null,
@@ -842,6 +856,20 @@ function stagePendingConfigurationCommand(
       }
     }
   }
+}
+
+function pendingConfigurationOwnsCompleteLocalWorkspaceSetting(
+  staged: StagedPendingConfigurationCommand | null,
+): boolean {
+  if (!staged || staged.chatId !== null) return false
+  const acknowledgement = staged.acknowledgement
+  return (
+    acknowledgement.workspaceSettings?.length === 1 &&
+    acknowledgement.promptFields.length === 0 &&
+    acknowledgement.chatSettingsReplacement === undefined &&
+    acknowledgement.chatSettingsFields === undefined &&
+    acknowledgement.textTemplateConfigs === undefined
+  )
 }
 
 function isPendingConfigurationCommand(

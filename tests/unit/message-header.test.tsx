@@ -493,7 +493,7 @@ describe('Message edit session ownership', () => {
   it('keeps the draft mounted while rebinding presentation retention to a new workspace epoch', async () => {
     const releases = [vi.fn(), vi.fn()]
     const onBeginEdit = vi
-      .fn<ComponentProps<typeof ChatMessageComponent>['onBeginEdit']>()
+      .fn<NonNullable<ComponentProps<typeof ChatMessageComponent>['onBeginEdit']>>()
       .mockImplementationOnce(() => ({
         admitted: Promise.resolve(),
         release: releases[0] as () => void,

@@ -1226,6 +1226,35 @@
         "fixtureOwners": [],
         "processOwned": false
       }
+    },
+    {
+      "purpose": "fault-injection",
+      "mutationScope": {
+        "kind": "stores",
+        "targets": ["profiles"]
+      },
+      "cleanupRestoreObligation": "Commit the one generated-clone profile retarget atomically, close its database handle, and delete the isolated persistent-profile clone after the held-stream journey.",
+      "publicUiCannotExpress": "The generated active-stream reload proof must retarget its prebuilt selected profile to the per-test held fake provider without adding configuration UI work to the startup measurement.",
+      "siteIds": [
+        "tests/e2e/large-workspace-startup.spec.ts::owner=function%3AretargetGeneratedActiveProfile::operation=indexeddb.database.close::mode=-::store=-::occurrence=1",
+        "tests/e2e/large-workspace-startup.spec.ts::owner=function%3AretargetGeneratedActiveProfile::operation=indexeddb.database.transaction::mode=readwrite::store=chats%2Bprofiles::occurrence=1",
+        "tests/e2e/large-workspace-startup.spec.ts::owner=function%3AretargetGeneratedActiveProfile::operation=indexeddb.factory.open::mode=-::store=-::occurrence=1",
+        "tests/e2e/large-workspace-startup.spec.ts::owner=function%3AretargetGeneratedActiveProfile::operation=indexeddb.get::mode=readwrite::store=chats::occurrence=1",
+        "tests/e2e/large-workspace-startup.spec.ts::owner=function%3AretargetGeneratedActiveProfile::operation=indexeddb.get::mode=readwrite::store=profiles::occurrence=1",
+        "tests/e2e/large-workspace-startup.spec.ts::owner=function%3AretargetGeneratedActiveProfile::operation=indexeddb.put::mode=readwrite::store=profiles::occurrence=1",
+        "tests/e2e/large-workspace-startup.spec.ts::owner=function%3AretargetGeneratedActiveProfile::operation=indexeddb.transaction.object-store::mode=readwrite::store=chats::occurrence=1",
+        "tests/e2e/large-workspace-startup.spec.ts::owner=function%3AretargetGeneratedActiveProfile::operation=indexeddb.transaction.object-store::mode=readwrite::store=profiles::occurrence=1"
+      ],
+      "cleanupEvidence": {
+        "siteIds": [
+          "tests/e2e/large-workspace-startup.spec.ts::owner=function%3AretargetGeneratedActiveProfile::operation=indexeddb.database.close::mode=-::store=-::occurrence=1",
+          "tests/e2e/large-workspace-startup.spec.ts::owner=function%3AprofileActiveStreamReload::operation=fixture.generated-profile-release::mode=-::store=-::occurrence=1"
+        ],
+        "fixtureOwners": [
+          "tests/e2e/large-workspace-startup.spec.ts::owner=function%3AprofileActiveStreamReload"
+        ],
+        "processOwned": false
+      }
     }
   ]
 }

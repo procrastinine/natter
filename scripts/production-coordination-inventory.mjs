@@ -587,11 +587,6 @@ export const MODULE_COLLECTION_CONTRACTS = Object.freeze({
       'the open owner deletes the exact entry in finally; database collection is the weak-key backstop',
     scope: 'module-open-attempt-registry',
   },
-  'src/store/configuration-domain.ts#REQUEST_PREPARATION_SETTING_KEYS': {
-    bound: 'static preference lookup',
-    cleanup: 'process-lifetime immutable value; no runtime entries',
-    scope: 'module-static',
-  },
   'src/store/configuration-model-resolution-capability.ts#transientCatalogs': {
     bound: 'at most 16 uncached model catalogs for the active workspace',
     cleanup: 'workspace capability closure clears the map; insertion evicts the oldest entry',
@@ -1336,6 +1331,7 @@ export const CONTROLLER_COLLECTION_CONTRACTS = Object.freeze({
   },
   'src/store/configuration-controller.ts#TabConfigurationController': {
     fields: [
+      'acceptedWorkspaceSettings',
       'catalogListeners',
       'editSessions',
       'listeners',
@@ -1347,12 +1343,13 @@ export const CONTROLLER_COLLECTION_CONTRACTS = Object.freeze({
       'pendingWorkspaceSettings',
       'selectedGenerationConfigurationClaims',
       'selectedGenerationConfigurationClaimStates',
+      'uiFieldsOwnedBeforeSeed',
       'workspaceEditSessions',
     ],
     bound:
-      'mounted tab subscribers, unsettled configuration intents, one strong active-claim state plus one weak claim-to-state lookup per live generation configuration observation, keyed by exact chat, workspace, and field',
+      'mounted tab subscribers, unsettled configuration intents, accepted authoritative values from the finite global-preference keyspace, one strong active-claim state plus one weak claim-to-state lookup per live generation configuration observation, and at most the four exact UI-session field names changed before the first shell seed, keyed by exact chat, workspace, and field',
     cleanup:
-      'settlement removes exact intents; selected admission transfer or cancellation aborts and clears its read and deletes the strong Set entry, after which the WeakMap ephemeron is collectible when the caller releases the claim; workspace reconciliation closes edit sessions, aborts all claim reads, and clears the strong Set and pending collections; paired unsubscribe removes listeners',
+      'settlement removes exact intents; later unsuppressed setting effects invalidate accepted values by exact key and broad recovery clears them; selected admission transfer or cancellation aborts and clears its read and deletes the strong Set entry, after which the WeakMap ephemeron is collectible when the caller releases the claim; workspace reconciliation closes edit sessions, aborts all claim reads, and clears the strong Set, accepted values, and pending collections while carrying only pre-seed UI field ownership to the replacement fence; the first accepted shell seed clears those field names; paired unsubscribe removes listeners',
     scope: 'owner-instance',
   },
   'src/store/configuration-controller.ts#TabConfigurationEditSession': {

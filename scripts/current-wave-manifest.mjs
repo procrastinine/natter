@@ -1,11 +1,11 @@
 import { TEST_COMPILER_COHORT_DESCRIPTOR } from './test-compiler-cohort.mjs'
 
 export const currentWaveManifest = Object.freeze({
-  id: 'wave-b-cut-1-semantic-operation-capabilities',
+  id: 'wave-c-performance-release-closure',
   mode: 'coherence/gate',
   comparison: Object.freeze({
     kind: 'git-commit',
-    oid: '598f65a1406c53d6c03f0d44239c408b715dacf6',
+    oid: 'eb6d6600a91c818e5b15750cd9b9786820272049',
   }),
   roots: Object.freeze(['src']),
   requiredFiles: Object.freeze([

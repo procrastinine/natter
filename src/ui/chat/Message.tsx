@@ -739,7 +739,7 @@ function MessageInner({
             onDelete={handleDeleteMessage}
           />
         </div>
-        {editTreeMode ? (
+        {editTreeMode && !presentationOnly ? (
           <MessageEditTreeActions
             streamTargetBusy={streamTargetBusy || presentationOnly}
             structuralMutationPending={structuralMutationPending}

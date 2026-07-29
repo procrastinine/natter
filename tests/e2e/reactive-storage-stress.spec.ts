@@ -6,6 +6,9 @@ import {
 import { createChatUiJourneyProfile, expect, type Page, test } from './fixtures'
 import {
   clickSidebarToggleWithoutActionabilityWait,
+  installReloadStorageAdministrationBlocker,
+  releaseReloadStorageAdministrationBlocker,
+  reloadStorageAdministrationBlockerState,
   startForegroundGestureRecorder,
 } from './foreground-gesture'
 import {
@@ -747,11 +750,6 @@ async function shellIdentityIsStable(page: Page): Promise<boolean> {
   })
 }
 
-interface ReloadStorageAdministrationBlockerState {
-  acquired: boolean
-  released: boolean
-}
-
 interface SeededReloadConfigurationSample {
   source: 'frame' | 'mutation'
   runtimeState: string | null
@@ -814,58 +812,6 @@ async function seededReloadFalseConnectionSamples(
         sample.emptyConnectionActionCount > 0 ||
         sample.noConnectionReason?.includes('Add a connection') === true,
     )
-  })
-}
-
-async function installReloadStorageAdministrationBlocker(page: Page): Promise<void> {
-  await page.addInitScript(() => {
-    const locks = (globalThis as { navigator?: Partial<Navigator> }).navigator?.locks
-    if (!locks) return
-    const state: ReloadStorageAdministrationBlockerState = {
-      acquired: false,
-      released: false,
-    }
-    let release!: () => void
-    const released = new Promise<void>((resolve) => {
-      release = resolve
-    })
-    const win = window as Window & {
-      __reloadStorageAdministrationBlocker?: ReloadStorageAdministrationBlockerState
-      __releaseReloadStorageAdministrationBlocker?: () => void
-    }
-    win.__reloadStorageAdministrationBlocker = state
-    win.__releaseReloadStorageAdministrationBlocker = release
-    void locks
-      .request('natter:storage-administration', { mode: 'exclusive' }, async () => {
-        state.acquired = true
-        await released
-        state.released = true
-      })
-      .catch(() => {})
-  })
-}
-
-async function reloadStorageAdministrationBlockerState(
-  page: Page,
-): Promise<ReloadStorageAdministrationBlockerState> {
-  return page.evaluate(() => {
-    const state = (
-      window as Window & {
-        __reloadStorageAdministrationBlocker?: ReloadStorageAdministrationBlockerState
-      }
-    ).__reloadStorageAdministrationBlocker
-    if (!state) throw new Error('ReloadStorageAdministrationBlockerMissing')
-    return { ...state }
-  })
-}
-
-async function releaseReloadStorageAdministrationBlocker(page: Page): Promise<void> {
-  await page.evaluate(() => {
-    ;(
-      window as Window & {
-        __releaseReloadStorageAdministrationBlocker?: () => void
-      }
-    ).__releaseReloadStorageAdministrationBlocker?.()
   })
 }
 

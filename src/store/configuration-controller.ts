@@ -17,6 +17,8 @@ import { cloneDefaultChatSettings } from '../core/defaults'
 import {
   corsProxyConfigFromPrefs,
   GENERATION_GLOBAL_PREFERENCE_KEYS,
+  GLOBAL_PREFERENCE_KEYS,
+  globalPreferencesWithStoredValue,
 } from '../core/global-settings'
 import type { KeyDispatchRevision } from '../core/key-dispatch-proof'
 import {
@@ -686,6 +688,8 @@ class TabConfigurationController implements ConfigurationController {
     PendingChatSettingsReplacementIntent
   >()
   private readonly pendingWorkspaceSettings = new Map<string, PendingWorkspaceSettingIntent>()
+  private readonly acceptedWorkspaceSettings = new Map<string, unknown>()
+  private readonly uiFieldsOwnedBeforeSeed = new Set<keyof ConfigurationUiSession>()
   private readonly pendingTextTemplateConfigs = new Map<
     TextTemplateId,
     PendingTextTemplateConfigIntent
@@ -772,6 +776,7 @@ class TabConfigurationController implements ConfigurationController {
     ) {
       return
     }
+    const uiBeforeReconciliation = this.ui
     this.shellRead?.abort()
     this.shellRead = null
     this.globalTokenCalibrationRead?.abort()
@@ -794,6 +799,7 @@ class TabConfigurationController implements ConfigurationController {
     this.pendingChatSettingsFields.clear()
     this.pendingChatSettingsReplacements.clear()
     this.pendingWorkspaceSettings.clear()
+    this.acceptedWorkspaceSettings.clear()
     this.pendingTextTemplateConfigs.clear()
     this.pendingGenerationTextTemplates = PersistentStringMap.empty()
     this.pendingPromptGenerationRevisions.clear()
@@ -812,7 +818,20 @@ class TabConfigurationController implements ConfigurationController {
       : workspaceDefaultConfigurationSeedState()
     this.seedRevision += 1
     this.loads = IDLE_PROJECTION_LOADS
-    this.ui = DEFAULT_UI_SESSION
+    this.ui = Object.freeze({
+      sidebarCollapsed: this.uiFieldsOwnedBeforeSeed.has('sidebarCollapsed')
+        ? uiBeforeReconciliation.sidebarCollapsed
+        : DEFAULT_UI_SESSION.sidebarCollapsed,
+      composerHeight: this.uiFieldsOwnedBeforeSeed.has('composerHeight')
+        ? uiBeforeReconciliation.composerHeight
+        : DEFAULT_UI_SESSION.composerHeight,
+      composerNormalManualHeight: this.uiFieldsOwnedBeforeSeed.has('composerNormalManualHeight')
+        ? uiBeforeReconciliation.composerNormalManualHeight
+        : DEFAULT_UI_SESSION.composerNormalManualHeight,
+      composerFocusManualHeight: this.uiFieldsOwnedBeforeSeed.has('composerFocusManualHeight')
+        ? uiBeforeReconciliation.composerFocusManualHeight
+        : DEFAULT_UI_SESSION.composerFocusManualHeight,
+    })
     this.uiSeeded = false
     this.frameRevision = 0
     this.frameShell = null
@@ -860,13 +879,19 @@ class TabConfigurationController implements ConfigurationController {
 
   observeWorkspaceEffect(effect: WorkspaceEffect): void {
     if (!this.matchesWorkspace(effect) || effect.kind === 'replace') return
-    this.withPublicationBatch(() => this.reloadActiveFrameForDependencies(effect.impact))
+    this.withPublicationBatch(() => {
+      this.invalidateAcceptedWorkspaceSettings(effect.impact)
+      this.reloadActiveFrameForDependencies(effect.impact)
+    })
     this.publishCatalogChange(effect.impact)
   }
 
   recoverWorkspaceEffect(effect: WorkspaceEffect): void {
     if (!this.matchesWorkspace(effect)) return
-    this.withPublicationBatch(() => this.reloadActiveFrameForDependencies('all'))
+    this.withPublicationBatch(() => {
+      this.acceptedWorkspaceSettings.clear()
+      this.reloadActiveFrameForDependencies('all')
+    })
     this.publishCatalogChange('all')
   }
 
@@ -1075,6 +1100,7 @@ class TabConfigurationController implements ConfigurationController {
   }
 
   setSidebarCollapsed(collapsed: boolean): void {
+    if (!this.uiSeeded) this.uiFieldsOwnedBeforeSeed.add('sidebarCollapsed')
     if (this.ui.sidebarCollapsed === collapsed) return
     this.ui = Object.freeze({ ...this.ui, sidebarCollapsed: collapsed })
     this.publish()
@@ -1093,6 +1119,7 @@ class TabConfigurationController implements ConfigurationController {
         : height === null
           ? null
           : Math.min(600, Math.max(1, Math.round(height)))
+    if (!this.uiSeeded) this.uiFieldsOwnedBeforeSeed.add(key)
     if (this.ui[key] === normalized) return
     this.ui = Object.freeze({ ...this.ui, [key]: normalized })
     this.publish()
@@ -1216,7 +1243,10 @@ class TabConfigurationController implements ConfigurationController {
 
   stageRenderingPreferences(patch: Partial<RenderingPreferences>): PendingWorkspaceSettingIntent {
     const pending = this.pendingWorkspaceSettings.get(RENDERING_PREFERENCES_KEY)
-    const current = pending?.value ?? this.frameShell?.preferences.rendering
+    const current =
+      pending?.value ??
+      this.acceptedWorkspaceSettings.get(RENDERING_PREFERENCES_KEY) ??
+      this.frameShell?.preferences.rendering
     return this.stageWorkspaceSetting(
       RENDERING_PREFERENCES_KEY,
       normalizeRenderingPreferences({
@@ -1232,7 +1262,9 @@ class TabConfigurationController implements ConfigurationController {
   ): PendingWorkspaceSettingIntent {
     const pending = this.pendingWorkspaceSettings.get(SIDEBAR_COLLAPSED_FOLDERS_SETTING_KEY)
     const current = normalizeCollapsedSidebarFolderIds(
-      pending?.value ?? this.frameShell?.preferences.collapsedFolderIds,
+      pending?.value ??
+        this.acceptedWorkspaceSettings.get(SIDEBAR_COLLAPSED_FOLDERS_SETTING_KEY) ??
+        this.frameShell?.preferences.collapsedFolderIds,
     )
     const next = collapsed
       ? [...current.filter((id) => id !== folderId), folderId]
@@ -1563,16 +1595,17 @@ class TabConfigurationController implements ConfigurationController {
     if (chatId && chatFields?.size === 0) this.pendingChatSettingsFields.delete(chatId)
     for (const receipt of acknowledgement.workspaceSettings ?? []) {
       const pending = this.pendingWorkspaceSettings.get(receipt.key)
-      if (accept && pending?.revision === receipt.revision && receipt.accepted && this.frameShell) {
-        this.frameShell = Object.freeze({
-          ...this.frameShell,
-          preferences: preferencesWithWorkspaceSetting(
-            this.frameShell.preferences,
+      if (accept && pending?.revision === receipt.revision && receipt.accepted) {
+        const value = deepFreezeActiveGenerationValue(structuredClone(receipt.accepted.value))
+        this.acceptedWorkspaceSettings.set(receipt.key, value)
+        if (this.frameShell) {
+          this.frameShell = configurationShellWithWorkspaceSetting(
+            this.frameShell,
             receipt.key,
-            receipt.accepted.value,
-          ),
-        })
-        this.frameRevision += 1
+            value,
+          )
+          this.frameRevision += 1
+        }
       }
       this.removePendingWorkspaceSetting(receipt.key, receipt.revision)
     }
@@ -2153,16 +2186,31 @@ class TabConfigurationController implements ConfigurationController {
       },
       load: (source, signal) => source.loadShell(signal),
       accept: (projection) => {
-        this.frameShell = freezeConfigurationShell(projection)
+        let shell = freezeConfigurationShell(projection)
+        for (const [key, value] of this.acceptedWorkspaceSettings) {
+          shell = configurationShellWithWorkspaceSetting(shell, key, value)
+        }
+        this.frameShell = shell
         if (!this.uiSeeded) {
           this.uiSeeded = true
           const global = this.frameShell.preferences.global
           this.ui = Object.freeze({
-            sidebarCollapsed: global.sidebarCollapsed,
-            composerHeight: global.composerHeight,
-            composerNormalManualHeight: global.composerNormalManualHeight,
-            composerFocusManualHeight: global.composerFocusManualHeight,
+            sidebarCollapsed: this.uiFieldsOwnedBeforeSeed.has('sidebarCollapsed')
+              ? this.ui.sidebarCollapsed
+              : global.sidebarCollapsed,
+            composerHeight: this.uiFieldsOwnedBeforeSeed.has('composerHeight')
+              ? this.ui.composerHeight
+              : global.composerHeight,
+            composerNormalManualHeight: this.uiFieldsOwnedBeforeSeed.has(
+              'composerNormalManualHeight',
+            )
+              ? this.ui.composerNormalManualHeight
+              : global.composerNormalManualHeight,
+            composerFocusManualHeight: this.uiFieldsOwnedBeforeSeed.has('composerFocusManualHeight')
+              ? this.ui.composerFocusManualHeight
+              : global.composerFocusManualHeight,
           })
+          this.uiFieldsOwnedBeforeSeed.clear()
         }
         this.reconcileActiveModelTarget()
       },
@@ -2319,6 +2367,26 @@ class TabConfigurationController implements ConfigurationController {
       )
     ) {
       this.reconcileActiveModelTarget(true)
+    }
+  }
+
+  private invalidateAcceptedWorkspaceSettings(
+    dependencies: readonly WorkspaceDependency[] | 'all',
+  ): void {
+    if (
+      dependencies === 'all' ||
+      dependencies.some(
+        (dependency) =>
+          dependency.kind === 'workspace' ||
+          (dependency.kind === 'setting' && dependency.keys === undefined),
+      )
+    ) {
+      this.acceptedWorkspaceSettings.clear()
+      return
+    }
+    for (const dependency of dependencies) {
+      if (dependency.kind !== 'setting') continue
+      for (const key of dependency.keys ?? []) this.acceptedWorkspaceSettings.delete(key)
     }
   }
 
@@ -3485,6 +3553,7 @@ function configurationShellWithPendingWorkspaceSettings(
   if (!shell) return null
   let preferences = shell.preferences
   for (const key of [
+    ...GLOBAL_PREFERENCE_KEYS,
     RENDERING_PREFERENCES_KEY,
     SIDEBAR_SORT_SETTING_KEY,
     SIDEBAR_COLLAPSED_FOLDERS_SETTING_KEY,
@@ -3499,11 +3568,30 @@ function configurationShellWithPendingWorkspaceSettings(
   })
 }
 
+function configurationShellWithWorkspaceSetting(
+  shell: ConfigurationShellProjection,
+  key: string,
+  value: unknown,
+): ConfigurationShellProjection {
+  const preferences = preferencesWithWorkspaceSetting(shell.preferences, key, value)
+  if (preferences === shell.preferences) return shell
+  return Object.freeze({
+    ...shell,
+    preferences,
+  })
+}
+
 function preferencesWithWorkspaceSetting(
   preferences: ConfigurationPreferencesProjection,
   key: string,
   value: unknown,
 ): ConfigurationPreferencesProjection {
+  if (GLOBAL_PREFERENCE_KEYS.includes(key as (typeof GLOBAL_PREFERENCE_KEYS)[number])) {
+    return freezePreferencesProjection({
+      ...preferences,
+      global: globalPreferencesWithStoredValue(preferences.global, key, value),
+    })
+  }
   if (key === RENDERING_PREFERENCES_KEY) {
     return freezePreferencesProjection({
       ...preferences,

@@ -146,6 +146,19 @@ function deliverLocalCommit<C extends WorkspaceCommand>(
       recoverWorkspaceEffectGroup('conversation', error, effect)
     }
   }
+  const suppliedConfiguration = options.localApplications?.configuration
+  if (suppliedConfiguration) {
+    try {
+      const disposition = suppliedConfiguration(commit)
+      if (disposition === 'applied') {
+        suppressedGroups.add('configuration')
+      }
+    } catch (error) {
+      suppressedGroups.add('configuration')
+      reportLocalCommitProjectionFailure('configuration', command.kind, error)
+      recoverWorkspaceEffectGroup('configuration', error, effect)
+    }
+  }
   publishPreparedWorkspaceEffect(effect, suppressedGroups)
   postWorkspaceChange(change)
 }
@@ -159,7 +172,7 @@ export function publishCommittedWorkspaceCommand<C extends WorkspaceCommand>(
 }
 
 function reportLocalCommitProjectionFailure(
-  owner: 'conversation' | 'evidence',
+  owner: 'configuration' | 'conversation' | 'evidence',
   commandKind: WorkspaceCommand['kind'],
   error: unknown,
 ): void {

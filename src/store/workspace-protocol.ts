@@ -3100,6 +3100,7 @@ export type WorkspaceLocalCommitApplication<T = unknown> = (
 export interface WorkspaceCommandExecutionOptions<T = unknown> {
   readonly localApplications?: {
     readonly conversation?: WorkspaceLocalCommitApplication<T>
+    readonly configuration?: WorkspaceLocalCommitApplication<T>
   }
 }
 

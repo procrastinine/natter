@@ -123,6 +123,9 @@ describe('branch selection architecture boundary', () => {
     expect(resolver).toContain('const DESCENDANT_CHILD_PAGE_ROWS = 64')
     expect(resolver).toContain('private async readParentWalkFrame(')
     expect(resolver).toContain('private async readChildPage(')
+    expect(resolver).toContain('readActiveBranchTerminalChildSlotInTransaction(')
+    expect(resolver).toContain('readActiveBranchForkSlotsForHeadersInTransaction(')
+    expect(resolver).not.toContain('readActiveBranchPathSlotFrameInTransaction(')
     expect(resolver).toContain(".where('[chatId+treeParentKey+siblingIndex+id]')")
     expect(resolver).not.toMatch(/where\('chatId'\)\.equals\([^)]*\)\.toArray\(\)/)
   })
@@ -159,10 +162,14 @@ describe('branch selection architecture boundary', () => {
     )
     expect(shell).not.toContain('binding.seal.replacementEpoch !== workspace.replacementEpoch')
     expect(shell).not.toContain('foreignPaintedFrame ? null')
+    expect(shell).toContain('transcriptPoint && MessageList')
+    expect(shell).toContain('kind="point"')
     expect(shell).toContain('{transcriptFocusMode ? displayedTranscriptComposer : null}')
     expect(shell).toContain('{transcriptFocusMode ? null : displayedTranscriptComposer}')
-    expect(messages).toContain('data-branch-counts="known"')
-    expect(messages).toContain("const presentationOnly = binding.currency !== 'current'")
+    expect(messages).toContain("data-branch-counts={branchCountsKnown ? 'known' : 'pending'}")
+    expect(messages).toContain(
+      "const presentationOnly = point ? true : props.binding.currency !== 'current'",
+    )
     expect(messages).not.toContain('inert={presentationOnly || undefined}')
     expect(messages).toContain("if (e.key === '[' || e.key === ']')")
     expect(messages.indexOf("if (e.key === '[' || e.key === ']'")).toBeLessThan(

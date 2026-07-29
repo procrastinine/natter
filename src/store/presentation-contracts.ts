@@ -113,7 +113,7 @@ export type { SearchSession } from './search-session'
 export type { PromptEstimateContextSnapshot } from './send-context'
 export type { StorageChatCatalogSessionSnapshot } from './storage-chat-catalog-session'
 export type { StorageGlobalCalibrationModel } from './storage-overview-controller'
-export type { TranscriptBodyWindowRow } from './transcript-window'
+export type { TranscriptBodyWindow, TranscriptBodyWindowRow } from './transcript-window'
 export type {
   AttachmentManagerDetail,
   AttachmentMediaProjection,

@@ -99,6 +99,40 @@ describe('workspace local commit delivery', () => {
     unsubscribeEffect()
   })
 
+  it('lets the configuration owner fold its local commit without hiding the shared effect', async () => {
+    const commit = envelope({ value: { kind: 'workspace-setting-saved' } })
+    __setWorkspaceRepositoryForTests(fakeRepository(commit))
+    const configurationEffect = vi.fn()
+    const independentEffect = vi.fn()
+    const unsubscribeConfiguration = subscribeWorkspaceEffects({
+      owner: 'configuration-delivery-test',
+      group: 'configuration',
+      replacements: false,
+      impactKinds: ['chat'],
+      apply: configurationEffect,
+      recover: () => WORKSPACE_EFFECT_RECOVERY_OWNED,
+    })
+    const unsubscribeIndependent = subscribeWorkspaceEffects({
+      owner: 'independent-delivery-test',
+      replacements: false,
+      impactKinds: ['chat'],
+      apply: independentEffect,
+      recover: () => WORKSPACE_EFFECT_RECOVERY_OWNED,
+    })
+    const application = vi.fn(() => 'applied' as const)
+
+    await getWorkspaceRepository().execute(AUTHORITY, command(), {
+      localApplications: { configuration: application },
+    })
+
+    expect(application).toHaveBeenCalledWith(commit)
+    expect(configurationEffect).not.toHaveBeenCalled()
+    expect(independentEffect).toHaveBeenCalledTimes(1)
+    expect(posted).toHaveLength(1)
+    unsubscribeIndependent()
+    unsubscribeConfiguration()
+  })
+
   it('routes committed effects by facts rather than command identity', async () => {
     const commit = envelope()
     __setWorkspaceRepositoryForTests(fakeRepository(commit))

@@ -172,8 +172,20 @@ describe('proof-bearing active branch selection', () => {
       const work = createBranchSelectionReadMeasurement()
       const result = await openSelection(rows, canonical.id, selection, work)
       expect(result.kind).toBe('ready')
+      if (result.kind !== 'ready') throw new Error('ExpectedReadySelection')
+      expect(result.forks).toEqual(
+        selection.kind === 'default'
+          ? []
+          : [
+              expect.objectContaining({
+                parentId: observed.parentId,
+                selectedMessageId: observed.id,
+              }),
+            ],
+      )
       expect(work.descendantPageReads).toBe(0)
       expect(work.physicalHeaderRowsRead).toBeLessThanOrEqual(4)
+      expect(work.forkSlotsRead).toBe(selection.kind === 'default' ? 0 : 1)
     }
   })
 

@@ -23,6 +23,7 @@ import type { PrefillPlan } from '../../core/effective-endpoint-routing'
 import type { LongMessageDisplayMode, RenderWindowLoadMode } from '../../core/global-settings'
 import { UNLIMITED_CONTEXT } from '../../core/prompt-size'
 import type {
+  ChatId,
   ChatSettings,
   MessageAttachmentRef,
   MessageId,
@@ -37,6 +38,7 @@ import type {
   ConversationTranscriptSurface,
   MessageAttachmentRefMutation,
   MessageHeaderRow,
+  TranscriptBodyWindow,
   TranscriptBodyWindowRow,
   WorkspaceFence,
 } from '../../store/presentation-contracts'
@@ -58,6 +60,7 @@ const ImportModal = lazy(() =>
 )
 
 interface MessageListProps {
+  readonly kind?: 'ready'
   binding: ConversationTranscriptSurface
   mutationsUnavailable?: boolean
   structuralMutationPending?: boolean
@@ -85,6 +88,16 @@ interface MessageListProps {
   onCancelStructuralMutation?: () => void
 }
 
+interface PointMessageListProps {
+  readonly kind: 'point'
+  readonly chatId: ChatId
+  readonly workspaceFence: WorkspaceFence
+  readonly window: TranscriptBodyWindow
+  readonly longMessageDisplayMode?: LongMessageDisplayMode
+}
+
+type MessageListSurfaceProps = MessageListProps | PointMessageListProps
+
 interface InsertTarget {
   messageId: MessageId
   slot: InsertSlot
@@ -111,35 +124,35 @@ function oppositeRole(role: MessageRole): MessageRole {
 // Memoized at the list level so prefs changes (theme, send shortcut,
 // chat width) on the Shell don't cascade into a re-render of the
 // markdown-heavy children.
-export const MessageList = memo(function MessageList({
-  binding,
-  mutationsUnavailable = false,
-  structuralMutationPending = false,
-  runConversationMutation,
-  chatSettings,
-  capability,
-  prefillPlan,
-  longMessageDisplayMode = 'full',
-  messageInitialRenderWork,
-  messageRenderWindowLoadMode,
-  contextPreviewFrozen = false,
-  transcriptLoadFailed = false,
-  onLoadOlderMessages,
-  onEditAndSendMessage,
-  onRegenerateMessage,
-  onContinueMessage,
-  generationSubmissionPending = false,
-  onCancelStructuralMutation,
-}: MessageListProps) {
-  const chatId = binding.seal.chatId
-  const branchSnapshot = binding.window
-  const branchSpine = binding.spine
-  const activePath = binding.spine.path
-  const presentationOnly = binding.currency !== 'current'
+const MessageListSurface = memo(function MessageListSurface(props: MessageListSurfaceProps) {
+  const point = props.kind === 'point'
+  const chatId = point ? props.chatId : props.binding.seal.chatId
+  const branchSnapshot = point ? props.window : props.binding.window
+  const presentationFence = point ? props.workspaceFence : props.binding.seal
+  const branchSpine = point ? null : props.binding.spine
+  const activePath = branchSpine?.path ?? null
+  const presentationOnly = point ? true : props.binding.currency !== 'current'
+  const mutationsUnavailable = point ? true : props.mutationsUnavailable === true
+  const structuralMutationPending = point ? false : props.structuralMutationPending === true
+  const runConversationMutation = point ? null : props.runConversationMutation
+  const chatSettings = point ? null : props.chatSettings
+  const capability = point ? undefined : props.capability
+  const prefillPlan = point ? null : props.prefillPlan
+  const longMessageDisplayMode = props.longMessageDisplayMode ?? 'full'
+  const messageInitialRenderWork = point ? 1 : props.messageInitialRenderWork
+  const messageRenderWindowLoadMode = point ? 'manual' : props.messageRenderWindowLoadMode
+  const contextPreviewFrozen = point ? false : props.contextPreviewFrozen === true
+  const transcriptLoadFailed = point ? false : props.transcriptLoadFailed === true
+  const onLoadOlderMessages = point ? null : props.onLoadOlderMessages
+  const onEditAndSendMessage = point ? null : props.onEditAndSendMessage
+  const onRegenerateMessage = point ? null : props.onRegenerateMessage
+  const onContinueMessage = point ? null : props.onContinueMessage
+  const generationSubmissionPending = point ? false : props.generationSubmissionPending === true
+  const onCancelStructuralMutation = point ? undefined : props.onCancelStructuralMutation
   const hiddenOlderCount = branchSnapshot.offset
   const staleBodyCount = branchSnapshot.staleBodyCount
   const canRetryLoadedBodies = transcriptLoadFailed && staleBodyCount > 0
-  const branchLength = activePath.length
+  const branchLength = activePath?.length ?? 0
   const [insertTarget, setInsertTarget] = useState<InsertTarget | null>(null)
   // Track the set of user-message ids whose content was edited in THIS
   // tab session; used to surface the "stale reply?" hint under their
@@ -150,7 +163,7 @@ export const MessageList = memo(function MessageList({
   // Prefill UI gating for the inline editor's "Save & Send" path. The
   // button hides on `unsupported` models (Claude ≥ 4.6 / OpenAI / gpt-oss);
   // on every other class it shows up next to Save & Send.
-  const prefillSupported = prefillPlan.availability !== 'unsupported'
+  const prefillSupported = prefillPlan !== null && prefillPlan.availability !== 'unsupported'
   const prefillSettingsPrompt = useMemo(
     () =>
       prefillSupported ? <PrefillSettingsPrompt chatId={chatId} plan={prefillPlan} /> : undefined,
@@ -179,8 +192,9 @@ export const MessageList = memo(function MessageList({
   )
 
   const handleEditInPlace = useCallback(
-    (m: MessageRow, text: string) =>
-      runConversationMutation(
+    (m: MessageRow, text: string) => {
+      if (!runConversationMutation) throw new Error('ConversationPointMutationUnavailable')
+      return runConversationMutation(
         { kind: 'edit', chatId, messageId: m.id },
         (signal) => conversationActions.editMessage(chatId, m, text, signal),
         m.role === 'user'
@@ -193,36 +207,47 @@ export const MessageList = memo(function MessageList({
               })
             }
           : undefined,
-      ),
+      )
+    },
     [chatId, runConversationMutation],
   )
   const handleToggleReasoningHidden = useCallback(
-    (m: MessageRow, member: ReasoningMemberRef) =>
-      runConversationMutation({ kind: 'reasoning', chatId, messageId: m.id, member }, (signal) =>
-        conversationActions.toggleReasoning(chatId, m, member, signal),
-      ),
+    (m: MessageRow, member: ReasoningMemberRef) => {
+      if (!runConversationMutation) throw new Error('ConversationPointMutationUnavailable')
+      return runConversationMutation(
+        { kind: 'reasoning', chatId, messageId: m.id, member },
+        (signal) => conversationActions.toggleReasoning(chatId, m, member, signal),
+      )
+    },
     [chatId, runConversationMutation],
   )
   const handleToggleToolHidden = useCallback(
-    (m: MessageRow, member: ProviderOutputMemberRef) =>
-      runConversationMutation(
+    (m: MessageRow, member: ProviderOutputMemberRef) => {
+      if (!runConversationMutation) throw new Error('ConversationPointMutationUnavailable')
+      return runConversationMutation(
         { kind: 'provider-output', chatId, messageId: m.id, member },
         (signal) => conversationActions.toggleProviderOutput(chatId, m, member, signal),
-      ),
+      )
+    },
     [chatId, runConversationMutation],
   )
   const handleToggleContextVisibility = useCallback(
-    (m: MessageRow) =>
-      runConversationMutation({ kind: 'context', chatId, messageId: m.id }, (signal) =>
+    (m: MessageRow) => {
+      if (!runConversationMutation) throw new Error('ConversationPointMutationUnavailable')
+      return runConversationMutation({ kind: 'context', chatId, messageId: m.id }, (signal) =>
         conversationActions.toggleContext(chatId, m, signal),
-      ),
+      )
+    },
     [chatId, runConversationMutation],
   )
   const handleDismissGenerationNotice = useCallback(
-    (m: MessageRow) =>
-      runConversationMutation({ kind: 'generation-notice', chatId, messageId: m.id }, (signal) =>
-        conversationActions.dismissGenerationNotice(chatId, m, signal),
-      ),
+    (m: MessageRow) => {
+      if (!runConversationMutation) throw new Error('ConversationPointMutationUnavailable')
+      return runConversationMutation(
+        { kind: 'generation-notice', chatId, messageId: m.id },
+        (signal) => conversationActions.dismissGenerationNotice(chatId, m, signal),
+      )
+    },
     [chatId, runConversationMutation],
   )
   const handleMutateAttachmentRef = useCallback(
@@ -236,31 +261,46 @@ export const MessageList = memo(function MessageList({
       m: MessageRow,
       text: string,
       opts?: { prefillText?: string; attachmentRefs?: MessageAttachmentRef[] },
-    ) => onEditAndSendMessage(m, text, opts),
+    ) => {
+      if (!onEditAndSendMessage) throw new Error('ConversationPointGenerationUnavailable')
+      return onEditAndSendMessage(m, text, opts)
+    },
     [onEditAndSendMessage],
   )
 
   const handleRegenerate = useCallback(
-    (m: MessageRow, options?: { settingsPatch?: ChatSettingsPatch }) =>
-      onRegenerateMessage(m, options),
+    (m: MessageRow, options?: { settingsPatch?: ChatSettingsPatch }) => {
+      if (!onRegenerateMessage) throw new Error('ConversationPointGenerationUnavailable')
+      return onRegenerateMessage(m, options)
+    },
     [onRegenerateMessage],
   )
 
-  const handleContinue = useCallback((m: MessageRow) => onContinueMessage(m), [onContinueMessage])
+  const handleContinue = useCallback(
+    (m: MessageRow) => {
+      if (!onContinueMessage) throw new Error('ConversationPointGenerationUnavailable')
+      return onContinueMessage(m)
+    },
+    [onContinueMessage],
+  )
 
   const handleForkChat = useCallback(
-    (m: MessageRow) =>
-      runConversationMutation({ kind: 'fork', chatId, messageId: m.id }, (signal) =>
+    (m: MessageRow) => {
+      if (!runConversationMutation) throw new Error('ConversationPointMutationUnavailable')
+      return runConversationMutation({ kind: 'fork', chatId, messageId: m.id }, (signal) =>
         conversationActions.forkMessage(chatId, m, signal),
-      ),
+      )
+    },
     [chatId, runConversationMutation],
   )
 
   const handleDeleteMessage = useCallback(
-    (m: MessageRow, mode: ConversationDeleteMode, roleMismatch = false) =>
-      runConversationMutation({ kind: 'delete', chatId }, (signal, reportPhase) =>
+    (m: MessageRow, mode: ConversationDeleteMode, roleMismatch = false) => {
+      if (!runConversationMutation) throw new Error('ConversationPointMutationUnavailable')
+      return runConversationMutation({ kind: 'delete', chatId }, (signal, reportPhase) =>
         conversationActions.deleteMessage(chatId, m.id, mode, roleMismatch, signal, reportPhase),
-      ),
+      )
+    },
     [chatId, runConversationMutation],
   )
 
@@ -293,6 +333,7 @@ export const MessageList = memo(function MessageList({
       const focused = focusedRow.message
       if (e.key === '[' || e.key === ']') {
         e.preventDefault()
+        if (!branchSpine) return
         const slot = branchSpine.forkFor(focusedId)
         if (!slot || slot.liveCount < 2) return
         const movingBackward = e.key === '['
@@ -325,6 +366,7 @@ export const MessageList = memo(function MessageList({
 
   const roleMismatchIdsOnPath = useMemo(() => {
     const set = new Set<MessageId>()
+    if (!activePath) return set
     for (const { header } of transcriptBodyWindowRows(branchSnapshot)) {
       const prev = header.parentId ? activePath.get(header.parentId) : undefined
       if (prev?.role === header.role) set.add(header.id)
@@ -333,6 +375,7 @@ export const MessageList = memo(function MessageList({
   }, [activePath, branchSnapshot])
 
   const excludedIds = useMemo(() => {
+    if (!chatSettings) return new Set<MessageId>()
     return computeExcludedIds(
       contextPreviewPath?.materializeNodes() ?? [],
       chatSettings,
@@ -344,9 +387,13 @@ export const MessageList = memo(function MessageList({
       ...transcriptBodyPageRows(page),
     ])
   }, [branchSnapshot])
+  const branchCountsKnown =
+    !point &&
+    renderableMessageRows.every(({ message }) => Boolean(branchSpine?.forkFor(message.id)))
   const effectiveRenderedMessageCount = renderableMessageRows.length
   const loadOlderMessages = useCallback(() => {
     if (presentationOnly) return
+    if (!onLoadOlderMessages) return
     if (hiddenOlderCount <= 0 && !canRetryLoadedBodies) return
     onLoadOlderMessages()
   }, [canRetryLoadedBodies, hiddenOlderCount, onLoadOlderMessages, presentationOnly])
@@ -387,7 +434,7 @@ export const MessageList = memo(function MessageList({
       const rowMutationsUnavailable = mutationsUnavailable || intentOnly
       const showStaleHint =
         m.role === 'assistant' && m.parentId !== null && staleHintFor.has(m.parentId)
-      const branchContext = fork ?? branchSpine.forkFor(m.id)
+      const branchContext = fork ?? branchSpine?.forkFor(m.id)
       const hasSiblingVariants = (branchContext?.liveCount ?? 0) > 1
       return (
         <Message
@@ -401,7 +448,7 @@ export const MessageList = memo(function MessageList({
           structuralMutationPending={structuralMutationPending}
           {...(onCancelStructuralMutation ? { onCancelStructuralMutation } : {})}
           presentationOnly={rowMutationsUnavailable}
-          presentationFence={binding.seal}
+          presentationFence={presentationFence}
           onBeginEdit={handleBeginEdit}
           onEditInPlace={handleEditInPlace}
           onToggleContextVisibility={handleToggleContextVisibility}
@@ -409,19 +456,19 @@ export const MessageList = memo(function MessageList({
           onMutateAttachmentRef={handleMutateAttachmentRef}
           onToggleReasoningDetailHidden={handleToggleReasoningHidden}
           onToggleProviderOutputItemHidden={handleToggleToolHidden}
-          {...(m.role === 'user'
+          {...(!point && m.role === 'user'
             ? {
                 onEditAndSend: handleEditAndSend,
                 ...(prefillSupported
                   ? {
                       showPrefillButton: true,
-                      defaultPrefill: chatSettings.defaultPrefill ?? '',
+                      defaultPrefill: chatSettings?.defaultPrefill ?? '',
                       prefillSettingsPrompt,
                     }
                   : {}),
               }
             : {})}
-          {...(m.role === 'assistant'
+          {...(!point && m.role === 'assistant'
             ? {
                 onRegenerate: handleRegenerate,
                 onContinue: handleContinue,
@@ -438,10 +485,9 @@ export const MessageList = memo(function MessageList({
       )
     },
     [
-      binding.seal,
       branchSpine,
       chatId,
-      chatSettings.defaultPrefill,
+      chatSettings?.defaultPrefill,
       excludedIds,
       generationSubmissionPending,
       handleContinue,
@@ -465,6 +511,8 @@ export const MessageList = memo(function MessageList({
       staleHintFor,
       structuralMutationPending,
       onCancelStructuralMutation,
+      point,
+      presentationFence,
     ],
   )
 
@@ -472,14 +520,15 @@ export const MessageList = memo(function MessageList({
     <div
       data-ui="message-list"
       data-chat-id={chatId}
+      data-presentation-kind={point ? 'point' : 'ready'}
       role="log"
       aria-live={presentationOnly ? 'off' : 'polite'}
       aria-relevant="additions"
       ref={listRef}
       data-initial-render-work={messageInitialRenderWork}
       data-rendered-count={effectiveRenderedMessageCount}
-      data-total-count={branchLength}
-      data-branch-counts="known"
+      data-total-count={point ? undefined : branchLength}
+      data-branch-counts={branchCountsKnown ? 'known' : 'pending'}
       aria-busy={presentationOnly || undefined}
       data-presentation-only={presentationOnly || undefined}
     >
@@ -520,6 +569,9 @@ export const MessageList = memo(function MessageList({
     </div>
   )
 })
+
+export const MessageList = MessageListSurface
+export const MessageListPoint = MessageListSurface
 
 // Compute which messages would be trimmed out of the next request given
 // the chat's context settings. Uses a chars/4 approximation — the real

@@ -1,6 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
-import { DEFAULT_GLOBAL_PREFERENCES, PINNED_MODELS_KEY } from '../../src/core/global-settings'
+import {
+  DEFAULT_GLOBAL_PREFERENCES,
+  PINNED_MODELS_KEY,
+  SIDEBAR_COLLAPSED_KEY,
+} from '../../src/core/global-settings'
 import { DEFAULT_RENDERING_PREFS } from '../../src/core/rendering-preferences'
 import {
   DEFAULT_SIDEBAR_SORT_MODE,
@@ -24,7 +28,12 @@ import {
   type ConfigurationApplicationDependencies,
   createConfigurationApplication,
 } from '../../src/store/configuration-domain'
-import type { ConfigurationDomainPort } from '../../src/store/configuration-domain-contract'
+import type {
+  ConfigurationDomainCommand,
+  ConfigurationDomainExecutionOptions,
+  ConfigurationDomainPort,
+  ConfigurationDomainResult,
+} from '../../src/store/configuration-domain-contract'
 import { buildConnectionProfile } from '../../src/store/configuration-domain-contract'
 import type { ConversationSnapshot } from '../../src/store/conversation-controller'
 import { prepareLocalWorkspaceChange } from '../../src/store/workspace-effect-hub'
@@ -176,6 +185,109 @@ describe('configuration controller publication', () => {
     ).toEqual([])
   })
 
+  it('folds a local setting commit into an older resident read and reloads only for a later effect', async () => {
+    const staleShell = deferred<ConfigurationShellProjection>()
+    const loadShell = vi
+      .fn<ConfigurationProjectionSource['loadShell']>()
+      .mockImplementationOnce(() => staleShell.promise)
+      .mockImplementationOnce(async () => shell(1))
+    const bound = configurationController.setProjectionSource(projectionSource({ loadShell }))
+    await settle()
+    const result = {
+      kind: 'workspace-setting-saved',
+      key: SIDEBAR_COLLAPSED_KEY,
+      value: true,
+      changed: true,
+    } as const
+    let disposition: 'applied' | 'inactive' | undefined
+    const port: ConfigurationDomainPort = {
+      async execute<Command extends ConfigurationDomainCommand>(
+        _command: Command,
+        options?: ConfigurationDomainExecutionOptions<ConfigurationDomainResult<Command['kind']>>,
+      ): Promise<ConfigurationDomainResult<Command['kind']>> {
+        const committed = result as ConfigurationDomainResult<Command['kind']>
+        disposition = options?.localApplication(committed)
+        return committed
+      },
+    }
+    const application = createConfigurationApplication({
+      port,
+      async prepareKey() {
+        throw new Error('UnexpectedKeyPreparation')
+      },
+      async loadProfileSwitchPlan() {
+        return undefined
+      },
+      pendingConfiguration: configurationController,
+    })
+
+    await application.execute({
+      kind: 'global-preference.set',
+      key: SIDEBAR_COLLAPSED_KEY,
+      value: true,
+      now: 1,
+    })
+    expect(disposition).toBe('applied')
+    expect(loadShell).toHaveBeenCalledTimes(1)
+
+    staleShell.resolve(shell(1))
+    await bound
+    expect(
+      configurationController.getSnapshot().frame.shell?.preferences.global.sidebarCollapsed,
+    ).toBe(true)
+    expect(loadShell).toHaveBeenCalledTimes(1)
+
+    configurationController.observeWorkspaceEffect(
+      prepareLocalWorkspaceChange({
+        kind: 'invalidate',
+        workspaceId: 'configuration-controller-publication',
+        replacementEpoch: epoch,
+        dependencies: [{ kind: 'setting', keys: [SIDEBAR_COLLAPSED_KEY] }],
+      }).effect,
+    )
+    await waitForController(
+      () =>
+        configurationController.getSnapshot().frame.shell?.preferences.global.sidebarCollapsed ===
+        false,
+    )
+
+    expect(loadShell).toHaveBeenCalledTimes(2)
+    expect(
+      configurationController.getSnapshot().frame.shell?.preferences.global.sidebarCollapsed,
+    ).toBe(false)
+  })
+
+  it('seeds only untouched UI fields after an earlier tab intent', async () => {
+    const staleShell = deferred<ConfigurationShellProjection>()
+    const stored = shell(1)
+    Object.assign(stored.preferences.global, {
+      sidebarCollapsed: false,
+      composerHeight: 500,
+      composerNormalManualHeight: 230,
+      composerFocusManualHeight: 330,
+    })
+    configurationController.setSidebarCollapsed(true)
+    configurationController.setComposerHeight('fixed', 222)
+    configurationController.reconcileWorkspace({
+      workspaceId: 'configuration-controller-pre-seed-intent',
+      replacementEpoch: ++epoch,
+    })
+    const bound = configurationController.setProjectionSource(
+      projectionSource({ loadShell: vi.fn(() => staleShell.promise) }),
+    )
+    await settle()
+
+    staleShell.resolve(stored)
+    await bound
+
+    expect(configurationController.getSnapshot().ui).toEqual({
+      sidebarCollapsed: true,
+      composerHeight: 222,
+      composerNormalManualHeight: 230,
+      composerFocusManualHeight: 330,
+    })
+  })
+
   it.each([
     {
       command: {
@@ -258,7 +370,7 @@ describe('configuration controller publication', () => {
 
     const operation = application.execute(command)
     expect(execute).toHaveBeenCalledTimes(1)
-    expect(execute).toHaveBeenCalledWith(command)
+    expect(execute).toHaveBeenCalledWith(command, undefined)
     completion.resolve({
       kind: 'workspace-setting-saved',
       key: PINNED_MODELS_KEY,

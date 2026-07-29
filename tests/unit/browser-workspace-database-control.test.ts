@@ -257,6 +257,37 @@ describe('browser workspace database control', () => {
     await expect(databaseNames()).resolves.not.toContain(prepared.destinationDatabaseName)
   })
 
+  it('selects from the current proof and confirms the manifest once after acquiring its lease', async () => {
+    await recreateAndVerifyBrowserWorkspaceDatabase('natter')
+    await readBrowserWorkspaceDatabaseManifest()
+    const transaction = IDBDatabase.prototype.transaction
+    let manifestReadTransactions = 0
+    const transactionSpy = vi
+      .spyOn(IDBDatabase.prototype, 'transaction')
+      .mockImplementation(function (this: IDBDatabase, storeNames, mode, options) {
+        const names = typeof storeNames === 'string' ? [storeNames] : Array.from(storeNames).sort()
+        if (
+          this.name === 'natter-control' &&
+          names.length === 1 &&
+          names[0] === 'manifests' &&
+          (mode ?? 'readonly') === 'readonly'
+        ) {
+          manifestReadTransactions += 1
+        }
+        return options === undefined
+          ? transaction.call(this, storeNames, mode)
+          : transaction.call(this, storeNames, mode, options)
+      })
+
+    try {
+      await prepareSelection()
+    } finally {
+      transactionSpy.mockRestore()
+    }
+
+    expect(manifestReadTransactions).toBe(2)
+  })
+
   it('reopens the activated destination before asynchronously cleaning the old source', async () => {
     await recreateAndVerifyBrowserWorkspaceDatabase('natter')
     const prepared = await beginBrowserWorkspaceDatabaseReplacement()

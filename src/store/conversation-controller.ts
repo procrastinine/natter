@@ -3063,6 +3063,7 @@ class TabConversationController implements ConversationController {
       throw new Error(`ConversationDestinationChatVersionDiverged:${admitted.chat.id}`)
     }
     this.installCommittedSelection(session, admitted.proof, admitted.presentations, spine)
+    this.requestForkUpdates(true, 'visibility')
     if (admitted.presentations.length > 0) {
       this.applyAdmittedMessageRevisions(
         admitted.presentations.map((presentation) => ({
@@ -3105,8 +3106,12 @@ class TabConversationController implements ConversationController {
       active.headers = headers
       this.recordHeaderChanges(releaseOverlayIds)
     }
-    if (replacements.length === 0) return destination
-    const acceptedSpine = destination.spine.replaceHeaders(replacements)
+    let acceptedSpine = destination.spine
+    if (priorSpine?.structuralVersion === destination.spine.structuralVersion) {
+      acceptedSpine = acceptedSpine.replaceForks(priorSpine.forkSlots())
+    }
+    acceptedSpine = acceptedSpine.replaceHeaders(replacements)
+    if (acceptedSpine === destination.spine) return destination
     const presentations = destination.presentations.filter((presentation) => {
       const header = acceptedSpine.path.get(presentation.header.id)
       return Boolean(
@@ -3118,6 +3123,7 @@ class TabConversationController implements ConversationController {
     return sealConversationSelection(
       Object.freeze({ ...destination, presentations: Object.freeze(presentations) }),
       acceptedSpine.path,
+      acceptedSpine.forkSlots(),
     )
   }
 

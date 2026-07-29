@@ -117,6 +117,20 @@ export async function readActiveBranchPathSlotFrameInTransaction(
   })
 }
 
+export async function readActiveBranchTerminalChildSlotInTransaction(
+  tx: Transaction,
+  chatId: ChatId,
+  terminalId: MessageId | null,
+  signal?: AbortSignal,
+): Promise<ActiveBranchChildSlot> {
+  throwIfAborted(signal)
+  const state = await tx
+    .table<ChildListState, string>('childLists')
+    .get(childListKey(chatId, terminalId))
+  throwIfAborted(signal)
+  return activeBranchChildSlotFromState(chatId, terminalId, state)
+}
+
 function throwIfAborted(signal: AbortSignal | undefined): void {
   if (signal?.aborted) throw new DOMException('Active branch fork read aborted', 'AbortError')
 }

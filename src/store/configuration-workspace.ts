@@ -107,6 +107,7 @@ class ConfigurationRepositoryAdapter {
     })
     this.unsubscribeEffects = subscribeWorkspaceEffects({
       owner: 'configuration-repository-adapter',
+      group: 'configuration',
       impactKinds: [
         'workspace',
         'profile',

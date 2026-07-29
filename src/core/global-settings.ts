@@ -604,6 +604,45 @@ export function globalPreferencesFromStored(
   }
 }
 
+export function globalPreferencesWithStoredValue(
+  preferences: GlobalPreferences,
+  key: string,
+  value: unknown,
+): GlobalPreferences {
+  if (!GLOBAL_PREFERENCE_KEYS.includes(key as (typeof GLOBAL_PREFERENCE_KEYS)[number])) {
+    return preferences
+  }
+  const stored = new Map<string, unknown>([
+    [THEME_KEY, preferences.theme],
+    [SEND_SHORTCUT_KEY, preferences.sendShortcut],
+    [USER_PIC_KEY, preferences.userProfilePicture],
+    [ASSISTANT_PIC_KEY, preferences.assistantProfilePicture],
+    [CHAT_MAX_WIDTH_KEY, preferences.chatMaxWidth],
+    [FONT_FAMILY_KEY, preferences.fontFamily],
+    [BASE_FONT_SIZE_KEY, preferences.baseFontSize],
+    [AUTO_SCROLL_STREAM_KEY, preferences.autoScrollOnStream],
+    [PINNED_MODELS_KEY, preferences.pinnedModels],
+    [RECENT_MODELS_KEY, preferences.recentModels],
+    [TOKEN_CALIBRATION_MODE_KEY, preferences.tokenCalibrationMode],
+    [LONG_MESSAGE_DISPLAY_MODE_KEY, preferences.longMessageDisplayMode],
+    [MESSAGE_INITIAL_RENDER_WORK_KEY, preferences.messageInitialRenderWork],
+    [SIDEBAR_RENDER_WINDOW_SIZE_KEY, preferences.sidebarRenderWindowSize],
+    [MESSAGE_RENDER_WINDOW_LOAD_MODE_KEY, preferences.messageRenderWindowLoadMode],
+    [SIDEBAR_RENDER_WINDOW_LOAD_MODE_KEY, preferences.sidebarRenderWindowLoadMode],
+    [CORS_PROXY_URL_KEY, preferences.corsProxyUrl],
+    [CORS_PROXY_SECRET_KEY, preferences.corsProxySecret],
+    [SIDEBAR_COLLAPSED_KEY, preferences.sidebarCollapsed],
+    [COMPOSER_HEIGHT_KEY, preferences.composerHeight],
+    [COMPOSER_NORMAL_MANUAL_HEIGHT_KEY, preferences.composerNormalManualHeight],
+    [COMPOSER_FOCUS_MANUAL_HEIGHT_KEY, preferences.composerFocusManualHeight],
+  ])
+  if (key === LEGACY_MESSAGE_RENDER_WINDOW_SIZE_KEY) {
+    stored.delete(MESSAGE_INITIAL_RENDER_WORK_KEY)
+  }
+  stored.set(key, value)
+  return globalPreferencesFromStored(stored)
+}
+
 function nullableIntInRangeOrDefault(
   value: unknown,
   fallback: number | null,

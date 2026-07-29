@@ -13,6 +13,8 @@ interface DestinationFramePublication {
   readonly renderedCount: number
   readonly totalCount: number
   readonly messageIds: readonly string[]
+  readonly presentationKind: string
+  readonly branchCounts: string
 }
 
 interface DestinationFrameTransaction {
@@ -58,6 +60,7 @@ export interface DestinationFrameBudgetSnapshot {
   readonly milestones: {
     readonly firstDestinationPaintAt: number | null
     readonly configuredWindowCompleteAt: number | null
+    readonly terminalIdentityRetained: boolean | null
   }
   readonly publications: readonly DestinationFramePublication[]
   readonly transactions: readonly DestinationFrameTransaction[]
@@ -76,7 +79,9 @@ export async function installDestinationFrameBudgetRecorder(
     const transactionIds = new WeakMap<IDBTransaction, number>()
     const encoder = new TextEncoder()
     let nextTransactionId = 1
+    let closing = false
     let frozen = false
+    let firstDestinationElement: Element | null = null
     const state: {
       target: DestinationFrameBudgetTarget | null
       overflowed: boolean
@@ -89,6 +94,7 @@ export async function installDestinationFrameBudgetRecorder(
       milestones: {
         firstDestinationPaintAt: number | null
         configuredWindowCompleteAt: number | null
+        terminalIdentityRetained: boolean | null
       }
       publications: DestinationFramePublication[]
       transactions: DestinationFrameTransaction[]
@@ -98,7 +104,11 @@ export async function installDestinationFrameBudgetRecorder(
       target: null,
       overflowed: false,
       gesture: { armedAt: 0, pointerAt: null, clickAt: null, clickCount: 0 },
-      milestones: { firstDestinationPaintAt: null, configuredWindowCompleteAt: null },
+      milestones: {
+        firstDestinationPaintAt: null,
+        configuredWindowCompleteAt: null,
+        terminalIdentityRetained: null,
+      },
       publications: [],
       transactions: [],
       requests: [],
@@ -188,7 +198,7 @@ export async function installDestinationFrameBudgetRecorder(
       method: string,
       key: unknown,
     ) => {
-      if (!state.target || frozen) return
+      if (!state.target || closing || frozen) return
       const record: DestinationFrameRequest = {
         transactionId: transactionIds.get(transaction) ?? null,
         source,
@@ -232,7 +242,7 @@ export async function installDestinationFrameBudgetRecorder(
           if (!(transaction instanceof IDBTransaction)) {
             throw new Error('DestinationFrameTransactionInstrumentationInvalid')
           }
-          if (!state.target || frozen) return transaction
+          if (!state.target || closing || frozen) return transaction
           const stores = (
             typeof args[0] === 'string'
               ? [args[0]]
@@ -291,7 +301,7 @@ export async function installDestinationFrameBudgetRecorder(
             if (!(request instanceof IDBRequest)) {
               throw new Error('DestinationFrameRequestInstrumentationInvalid')
             }
-            if (state.target && !frozen) {
+            if (state.target && !closing && !frozen) {
               const identity = identify(this)
               recordRequest(
                 request,
@@ -332,17 +342,28 @@ export async function installDestinationFrameBudgetRecorder(
         .filter((id): id is string => id !== null)
       const renderedCount = Number(list.getAttribute('data-rendered-count') ?? messageIds.length)
       const totalCount = Number(list.getAttribute('data-total-count') ?? messageIds.length)
+      const presentationKind = list.getAttribute('data-presentation-kind') ?? 'unknown'
+      const branchCounts = list.getAttribute('data-branch-counts') ?? 'unknown'
       if (messageIds.length === 0) return
       const prior = state.publications.at(-1)
       if (
         !prior ||
         prior.renderedCount !== renderedCount ||
         prior.totalCount !== totalCount ||
+        prior.presentationKind !== presentationKind ||
+        prior.branchCounts !== branchCounts ||
         prior.messageIds.some((id, index) => messageIds[index] !== id)
       ) {
         append(
           state.publications,
-          { at: performance.now(), renderedCount, totalCount, messageIds },
+          {
+            at: performance.now(),
+            renderedCount,
+            totalCount,
+            messageIds,
+            presentationKind,
+            branchCounts,
+          },
           MAX_PUBLICATIONS,
         )
       }
@@ -352,6 +373,9 @@ export async function installDestinationFrameBudgetRecorder(
         messageIds[0] === state.target.targetMessageId
       ) {
         state.milestones.firstDestinationPaintAt = performance.now()
+        firstDestinationElement = list.querySelector(
+          `[data-ui="message"][data-message-id="${CSS.escape(state.target.targetMessageId)}"]`,
+        )
       }
       if (
         state.milestones.configuredWindowCompleteAt === null &&
@@ -359,7 +383,23 @@ export async function installDestinationFrameBudgetRecorder(
         list.getAttribute('data-branch-counts') === 'known'
       ) {
         state.milestones.configuredWindowCompleteAt = performance.now()
-        requestAnimationFrame(() => requestAnimationFrame(() => (frozen = true)))
+        const terminal = list.querySelector(
+          `[data-ui="message"][data-message-id="${CSS.escape(state.target.targetMessageId)}"]`,
+        )
+        state.milestones.terminalIdentityRetained =
+          firstDestinationElement !== null && terminal === firstDestinationElement
+        closing = true
+        const finishWhenSettled = () => {
+          if (
+            state.transactions.some((transaction) => transaction.outcome === 'pending') ||
+            state.requests.some((request) => request.outcome === 'pending')
+          ) {
+            requestAnimationFrame(finishWhenSettled)
+            return
+          }
+          requestAnimationFrame(() => requestAnimationFrame(() => (frozen = true)))
+        }
+        finishWhenSettled()
       }
     }
     new MutationObserver(inspect).observe(document, {
@@ -371,6 +411,7 @@ export async function installDestinationFrameBudgetRecorder(
         'data-rendered-count',
         'data-total-count',
         'data-branch-counts',
+        'data-presentation-kind',
       ],
     })
     try {
@@ -409,12 +450,15 @@ export async function installDestinationFrameBudgetRecorder(
         state.milestones = {
           firstDestinationPaintAt: null,
           configuredWindowCompleteAt: null,
+          terminalIdentityRetained: null,
         }
         state.publications = []
         state.transactions = []
         state.requests = []
         state.longTasks = []
+        closing = false
         frozen = false
+        firstDestinationElement = null
         queueMicrotask(inspect)
       },
       frozen: () => frozen,
@@ -483,9 +527,62 @@ export function assertDestinationFrameBudget(
   expect(snapshot.gesture.clickCount).toBe(1)
   expect(firstPaint).not.toBeNull()
   expect(complete).not.toBeNull()
+  expect(snapshot.milestones.terminalIdentityRetained).toBe(true)
   expect(firstPaint as number).toBeLessThan(complete as number)
   expect((firstPaint as number) - snapshot.gesture.armedAt).toBeLessThanOrEqual(bounds.firstPaintMs)
   expect((complete as number) - snapshot.gesture.armedAt).toBeLessThanOrEqual(bounds.completeMs)
+}
+
+export function assertDestinationPublicationContract(
+  snapshot: DestinationFrameBudgetSnapshot,
+  options: { readonly point: 'required' | 'optional' },
+): void {
+  const { publications, target } = snapshot
+  expect(publications.length).toBeGreaterThan(0)
+  const pointPublications = publications.filter(
+    (publication) => publication.presentationKind === 'point',
+  )
+  if (options.point === 'required') expect(pointPublications).toHaveLength(1)
+  expect(pointPublications.length).toBeLessThanOrEqual(1)
+  if (pointPublications.length > 0) {
+    expect(publications[0]).toMatchObject({
+      presentationKind: 'point',
+      branchCounts: 'pending',
+      renderedCount: 1,
+      messageIds: [target.targetMessageId],
+    })
+  }
+
+  const readyPublications = publications.slice(pointPublications.length)
+  expect(readyPublications.length).toBeGreaterThan(0)
+  expect(readyPublications.every((publication) => publication.presentationKind === 'ready')).toBe(
+    true,
+  )
+  expect(readyPublications[0]).toMatchObject({
+    renderedCount: 1,
+    messageIds: [target.targetMessageId],
+  })
+  expect(readyPublications.at(-1)).toMatchObject({
+    presentationKind: 'ready',
+    branchCounts: 'known',
+    renderedCount: target.minimumRows,
+  })
+
+  let previousRenderedCount = 0
+  let previousBranchCounts = 'pending'
+  for (const publication of publications) {
+    expect([1, target.minimumRows]).toContain(publication.renderedCount)
+    expect(['pending', 'known']).toContain(publication.branchCounts)
+    expect(publication.messageIds).toHaveLength(publication.renderedCount)
+    expect(new Set(publication.messageIds).size).toBe(publication.messageIds.length)
+    expect(publication.messageIds.at(-1)).toBe(target.targetMessageId)
+    expect(publication.renderedCount).toBeGreaterThanOrEqual(previousRenderedCount)
+    if (previousBranchCounts === 'known' && publication.branchCounts === 'pending') {
+      expect(publication.renderedCount).toBeGreaterThan(previousRenderedCount)
+    }
+    previousRenderedCount = publication.renderedCount
+    previousBranchCounts = publication.branchCounts
+  }
 }
 
 export function comparableDestinationWork(snapshot: DestinationFrameBudgetSnapshot): unknown {
@@ -520,6 +617,8 @@ export function comparableDestinationWork(snapshot: DestinationFrameBudgetSnapsh
       renderedCount: publication.renderedCount,
       totalCount: publication.totalCount,
       messageIds: publication.messageIds,
+      presentationKind: publication.presentationKind,
+      branchCounts: publication.branchCounts,
     })),
     transactions: Object.fromEntries(
       [...transactionHistogram].sort(([left], [right]) => left.localeCompare(right)),
