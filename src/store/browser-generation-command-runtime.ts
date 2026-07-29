@@ -1,4 +1,5 @@
-import { sameChatSettings } from '../core/chat-metadata'
+import type { ActiveBranchIntentTarget } from '../core/active-branch-spine'
+import { applyChatSettingsPatch, sameChatSettings } from '../core/chat-metadata'
 import {
   appendContinuationText,
   appendedContinuationSemanticEffect,
@@ -14,6 +15,7 @@ import {
 } from '../core/global-settings'
 import { fixedConversationSelectionTarget } from '../core/messages'
 import { tokenCalibrationKey } from '../core/model-ids'
+import { UNKNOWN_INBOUND_REASONING_VISIBILITY } from '../core/reasoning'
 import {
   addSampleToChat,
   applyAcceptedSamplesToGlobalRecord,
@@ -38,6 +40,7 @@ import type {
   PresetId,
   ProfileId,
 } from '../core/types'
+import { newId } from '../lib/ulid'
 import {
   type BrowserCommandMessageRevisionFact,
   recordBrowserCommandMessageRevisions,
@@ -47,7 +50,6 @@ import type {
   BrowserGenerationCommandSupport,
   BrowserMutationCommandPort,
 } from './browser-domain-mutations'
-import { GenerationPlanningSeedChangedError } from './browser-mutation-plan'
 import {
   putPhysicalStorageRow,
   putTokenCalibrationSettingByteOwner,
@@ -77,7 +79,6 @@ import {
   commitStreamLeaseMetadata,
   type MessageCalibrationPatch,
   type StreamLeaseRow,
-  type StreamPostCommitEvidence,
   type StreamTargetCommit,
   streamLeaseReasoningCarryForward,
   streamLeaseReasoningVisibility,
@@ -266,13 +267,14 @@ export async function prepareBrowserAttempt(
     throw new Error(`AttemptPromptPathRequirementMismatch:${input.lease.streamId}`)
   }
   const placement = input.strategy === 'continue' ? undefined : input.placement
-  const assistant = placement?.messages.find(
-    (message) => message.id === input.lease.messageId && message.role === 'assistant',
-  )
-  const user = placement?.messages.find((message) => message.role === 'user')
+  const userIntent = placement?.user
   const targetMessageId =
-    requirement.target.kind === 'root' ? undefined : requirement.target.messageId
-  const assistantId = assistant?.id ?? targetMessageId
+    requirement.kind === 'send'
+      ? generationIntentTargetMessageId(requirement.target)
+      : requirement.target.kind === 'root'
+        ? undefined
+        : requirement.target.messageId
+  const assistantId = placement?.assistantMessageId ?? targetMessageId
   if (!assistantId) throw new Error(`AttemptAssistantTargetMissing:${input.lease.streamId}`)
   if (input.lease.messageId !== assistantId) {
     throw new Error(`AttemptLeaseTargetMismatch:${input.lease.streamId}:${assistantId}`)
@@ -282,27 +284,8 @@ export async function prepareBrowserAttempt(
   }
   const chatId = input.lease.chatId
   if (input.strategy === 'new-chat-send') assertNewChatAttemptRow(input.chat, chatId)
-  const persistsCapturedConfiguration =
-    input.strategy === 'regenerate' && input.persistCapturedConfiguration === true
-  const attemptSettings = input.configurationClaim.settings
-  const postCommit: StreamPostCommitEvidence = {
-    usedAt: input.lease.startedAt,
-    profileId: attemptSettings.profileId,
-    ...(input.configurationClaim.presetId ? { presetId: input.configurationClaim.presetId } : {}),
-    ...(input.strategy === 'new-chat-send' || input.strategy === 'send'
-      ? { recentModelId: attemptSettings.model }
-      : {}),
-  }
-  const planningExpectation = input.configurationClaim
-  if (user) support.assertPreparedAttemptMessage(user, input.lease, 'user', 'user')
-  if (assistant) {
-    support.assertPreparedAttemptMessage(assistant, input.lease, 'assistant', 'generated')
-  }
   const attachmentIds = new Set<AttachmentId>()
-  for (const message of [...(user ? [user] : []), ...(assistant ? [assistant] : [])]) {
-    if (message.chatId !== chatId) throw new Error(`AttemptMessageChatMismatch:${message.id}`)
-    for (const ref of message.attachmentRefs ?? []) attachmentIds.add(ref.attachmentId)
-  }
+  for (const ref of userIntent?.attachmentRefs ?? []) attachmentIds.add(ref.attachmentId)
   const scopes: MutationScope[] = [
     { kind: 'chat-meta', chatId },
     { kind: 'message', messageId: assistantId },
@@ -311,32 +294,17 @@ export async function prepareBrowserAttempt(
       attachmentId,
     })),
   ]
-  if (user) scopes.push({ kind: 'message', messageId: user.id })
+  if (userIntent) scopes.push({ kind: 'message', messageId: userIntent.messageId })
   if (input.strategy !== 'continue') scopes.push({ kind: 'chat-topology', chatId })
   if (targetMessageId) scopes.push({ kind: 'message', messageId: targetMessageId })
-  const configurationLinkTransition = persistsCapturedConfiguration
-    ? {
-        chatId,
-        expectedResourceNames: input.configurationLinkTransition.expectedResourceNames,
-        nextResourceNames: input.configurationLinkTransition.nextResourceNames,
-      }
-    : undefined
-
   const mutation = await repository.runMutation(
     scopes,
     async (ctx, mutation) => {
       const currentChat = await ctx.getChat(chatId)
       if (!currentChat) throw new ChatMissingError(chatId)
-      if (
-        persistsCapturedConfiguration &&
-        'configurationVersion' in input.configurationClaim &&
-        (currentChat.configurationVersion ?? 0) !== input.configurationClaim.configurationVersion
-      ) {
-        throw new GenerationPlanningSeedChangedError(chatId)
-      }
-      const validatedPromptPath = await mutation.validateGenerationPromptPathClaim(
+      const validatedPromptPath = await mutation.resolveGenerationPromptPath(
         chatId,
-        input.promptPath.claim,
+        input.promptPath,
       )
       const promptPath = await resolveGenerationPromptPathProof(
         ctx,
@@ -344,20 +312,22 @@ export async function prepareBrowserAttempt(
         input.promptPath,
         validatedPromptPath,
       )
+      const settingsPatch =
+        input.strategy === 'regenerate' ? input.configurationIntent.settingsPatch : undefined
+      const attemptSettings = settingsPatch
+        ? applyChatSettingsPatch(currentChat.settings, settingsPatch)
+        : currentChat.settings
       const planningChat: Chat = {
         ...currentChat,
         settings: structuredClone(attemptSettings),
       }
       const selectionBase = Object.freeze({
         chatId,
-        structuralVersion: input.promptPath.claim.structuralVersion,
+        structuralVersion: currentChat.structuralVersion,
         tipId: promptPath.leafId,
       })
-      if (input.configurationClaim.presetId === null) delete planningChat.presetId
-      else planningChat.presetId = input.configurationClaim.presetId
-      if (persistsCapturedConfiguration) delete planningChat.modelResolution
-
-      if (persistsCapturedConfiguration) {
+      if (settingsPatch) {
+        delete planningChat.modelResolution
         const nextSettings = attemptSettings
         if (
           !sameChatSettings(currentChat.settings, nextSettings) ||
@@ -380,70 +350,55 @@ export async function prepareBrowserAttempt(
           )
         }
       }
+      mutation.setStreamAdmissionPostCommit({
+        usedAt: input.lease.startedAt,
+        profileId: attemptSettings.profileId,
+        ...(planningChat.presetId ? { presetId: planningChat.presetId } : {}),
+        ...(input.strategy === 'new-chat-send' || input.strategy === 'send'
+          ? { recentModelId: attemptSettings.model }
+          : {}),
+      })
       if (input.strategy === 'continue') {
         const header = requiredPromptPathTarget(promptPath, chatId)
-        const target = await ctx.getMessage(header.id)
-        if (!target || target.chatId !== chatId || target.deleted || target.role !== 'assistant') {
-          throw new GenerationPlanningSeedChangedError(chatId)
+        if (header.deleted || header.role !== 'assistant') {
+          throw new Error(`GenerationContinuationTargetUnavailable:${header.id}`)
         }
         const planning = await mutation.captureGenerationPlanningSnapshot(
           chatId,
-          planningExpectation,
+          input.configurationIntent,
           planningChat,
         )
         const prompt = preparedGenerationPrompt(
-          target.id,
+          header.id,
           promptPath.headers,
           promptPath.messageProofs,
-          [
-            {
-              header,
-              message: target,
-              bodyVersion: header.bodyVersion,
-            },
-          ],
+          [],
         )
         return {
           strategy: 'continue' as const,
-          assistant: target,
           assistantHeader: header,
           prompt,
           planning,
           continuationBase: {
             streamId: input.lease.streamId,
-            messageId: target.id,
+            messageId: header.id,
             baseNodeVersion: header.nodeVersion,
             baseBodyVersion: header.bodyVersion,
           },
         }
       }
 
-      const preparedAssistantInput = assistant
-      if (!placement || !preparedAssistantInput) {
+      if (!placement) {
         throw new Error(`AttemptPlacementMissing:${input.lease.streamId}`)
       }
-      if (
-        placement.chatId !== chatId ||
-        placement.structuralVersion !== input.promptPath.claim.structuralVersion ||
-        placement.createdAt !== input.lease.startedAt ||
-        placement.slot?.parentId !== input.promptPath.claim.placementSlot?.parentId ||
-        placement.slot?.slotVersion !== input.promptPath.claim.placementSlot?.slotVersion ||
-        placement.slot?.liveCount !== input.promptPath.claim.placementSlot?.liveCount ||
-        placement.slot?.nextSiblingIndex !== input.promptPath.claim.placementSlot?.nextSiblingIndex
-      ) {
-        throw new GenerationPlanningSeedChangedError(chatId)
+      if (placement.chatId !== chatId || placement.createdAt !== input.lease.startedAt) {
+        throw new Error(`AttemptPlacementIdentityMismatch:${input.lease.streamId}`)
       }
-      support.assertPreparedAttemptMessage(
-        preparedAssistantInput,
-        input.lease,
-        'assistant',
-        'generated',
-      )
-      if (await ctx.getMessageHeader(preparedAssistantInput.id)) {
-        throw new Error(`AttemptAssistantAlreadyExists:${preparedAssistantInput.id}`)
+      if (await ctx.getMessageHeader(placement.assistantMessageId)) {
+        throw new Error(`AttemptAssistantAlreadyExists:${placement.assistantMessageId}`)
       }
-      if (user && (await ctx.getMessageHeader(user.id))) {
-        throw new Error(`AttemptUserAlreadyExists:${user.id}`)
+      if (userIntent && (await ctx.getMessageHeader(userIntent.messageId))) {
+        throw new Error(`AttemptUserAlreadyExists:${userIntent.messageId}`)
       }
       if (
         input.strategy === 'edit-resend' ||
@@ -452,14 +407,65 @@ export async function prepareBrowserAttempt(
       ) {
         requiredPromptPathTarget(promptPath, chatId)
       }
-      const committedUser = user
-        ? await ctx.putMessage(user, { creationTimestamp: 'preserve' })
+      const slot = promptPath.slot
+      if (!slot) throw new Error(`AttemptPlacementSlotMissing:${input.lease.streamId}`)
+      const replyTarget =
+        input.strategy === 'reply' ? requiredPromptPathTarget(promptPath, chatId) : undefined
+      const turnId = replyTarget?.turnId ?? newId()
+      const rebasedUser: Message | undefined = userIntent
+        ? {
+            id: userIntent.messageId,
+            chatId,
+            parentId: promptPath.leafId,
+            siblingIndex: slot.nextSiblingIndex,
+            turnId,
+            turnIndex: 0,
+            createdAt: placement.createdAt,
+            role: 'user',
+            origin: 'user',
+            content: structuredClone([...userIntent.content]),
+            attachmentRefs: structuredClone([...userIntent.attachmentRefs]),
+            nodeVersion: 0,
+            deleted: false,
+          }
         : undefined
-      const committedAssistant = await ctx.putMessage(preparedAssistantInput, {
+      const rebasedAssistant: Message = {
+        id: placement.assistantMessageId,
+        chatId,
+        parentId: rebasedUser?.id ?? promptPath.leafId,
+        siblingIndex: rebasedUser ? 0 : slot.nextSiblingIndex,
+        turnId,
+        turnIndex: rebasedUser ? 1 : replyTarget ? replyTarget.turnIndex + 1 : 0,
+        createdAt: placement.createdAt,
+        role: 'assistant',
+        origin: 'generated',
+        content: structuredClone([...placement.prefillContent]),
+        attachmentRefs: [],
+        generation: {
+          model: attemptSettings.model,
+          requestedModel: attemptSettings.model,
+          status: 'preparing',
+          integrity: 'clean',
+          costSource: 'stream',
+          startedAt: placement.createdAt,
+          reasoningCarryForward: 'none',
+          reasoningVisibility: UNKNOWN_INBOUND_REASONING_VISIBILITY,
+        },
+        nodeVersion: 0,
+        deleted: false,
+      }
+      if (rebasedUser) {
+        support.assertPreparedAttemptMessage(rebasedUser, input.lease, 'user', 'user')
+      }
+      support.assertPreparedAttemptMessage(rebasedAssistant, input.lease, 'assistant', 'generated')
+      const committedUser = rebasedUser
+        ? await ctx.putMessage(rebasedUser, { creationTimestamp: 'preserve' })
+        : undefined
+      const committedAssistant = await ctx.putMessage(rebasedAssistant, {
         creationTimestamp: 'preserve',
       })
       const headers = await ctx.getMessageHeaders(
-        committedUser ? [committedUser.id, preparedAssistantInput.id] : [preparedAssistantInput.id],
+        committedUser ? [committedUser.id, rebasedAssistant.id] : [rebasedAssistant.id],
       )
       if (headers.some((header) => !header)) {
         throw new Error(`AttemptPreparedHeaderMissing:${input.lease.streamId}`)
@@ -473,7 +479,7 @@ export async function prepareBrowserAttempt(
       const planningPath = committedUserHeader
         ? appendValidatedGenerationPromptPath(promptPath, committedUserHeader)
         : promptPath
-      const planningLeafId = committedUserHeader?.id ?? preparedAssistantInput.parentId
+      const planningLeafId = committedUserHeader?.id ?? rebasedAssistant.parentId
       const committedAssistantHeader = headers.find(
         (header) => header?.id === committedAssistant.id,
       )
@@ -496,7 +502,7 @@ export async function prepareBrowserAttempt(
       )
       const planning = await mutation.captureGenerationPlanningSnapshot(
         chatId,
-        planningExpectation,
+        input.configurationIntent,
         planningChat,
       )
       return {
@@ -514,12 +520,12 @@ export async function prepareBrowserAttempt(
     {
       ...(input.strategy === 'new-chat-send' ? { initialChat: input.chat } : {}),
       captureGenerationPlanningSnapshot: true,
-      planningProfileId: input.configurationClaim.profile.profileId,
-      ...(configurationLinkTransition ? { configurationLinkTransition } : {}),
+      ...(input.strategy === 'regenerate' && input.configurationIntent.settingsPatch
+        ? { maintainConfigurationLinksForChatId: chatId }
+        : {}),
       promoteChatId: chatId,
       workspaceFence: { replacementEpoch },
       streamAdmission: input.lease,
-      streamAdmissionPostCommit: postCommit,
     },
     commit,
     async (ctx, value) => {
@@ -585,7 +591,6 @@ export async function prepareBrowserAttempt(
     return {
       strategy: 'continue',
       lease,
-      assistant: mutation.value.assistant,
       assistantHeader: mutation.value.assistantHeader,
       prompt: mutation.value.prompt,
       planning: mutation.value.planning,
@@ -606,6 +611,21 @@ export async function prepareBrowserAttempt(
     prompt: mutation.value.prompt,
     planning: mutation.value.planning,
     selectionTransition: mutation.value.selectionTransition,
+  }
+}
+
+function generationIntentTargetMessageId(target: ActiveBranchIntentTarget): MessageId | undefined {
+  if (target.kind === 'fixed') return target.messageId ?? undefined
+  const selection = target.selection
+  switch (selection.kind) {
+    case 'default':
+      return undefined
+    case 'tip':
+      return selection.messageId
+    case 'message':
+      return selection.observedTipId ?? selection.messageId
+    case 'sibling-position':
+      return selection.observedTipId
   }
 }
 

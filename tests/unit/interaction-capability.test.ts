@@ -3,7 +3,6 @@ import {
   AVAILABLE_GENERATION_CAPABILITY,
   connectionAvailabilityFromProfileCount,
   failedGenerationCapability,
-  generationCapabilityAvailable,
   generationUnavailableReason,
   pendingGenerationCapability,
   unavailableGenerationCapability,
@@ -32,7 +31,6 @@ describe('interaction capability', () => {
       state: 'unavailable',
       reason: 'target-unavailable',
     })
-    expect(generationCapabilityAvailable(AVAILABLE_GENERATION_CAPABILITY)).toBe(true)
   })
 
   it('publishes user-facing copy only for exact absence', () => {

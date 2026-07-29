@@ -765,6 +765,7 @@ export const ATTEMPT_CONTROLLER_OPERATION_LOCALITY = mergeRecords(
   ),
   records(
     [
+      'claimChatDemand',
       'observeLease',
       'reconcileLeasePoints',
       'reconcileChatLeases',
@@ -905,8 +906,6 @@ export const OWNER_PATH_CLASSIFICATIONS = Object.freeze({
     'src/store/sidebar-session.ts',
     'src/store/structural-undo-repository.ts',
     'src/store/tags.ts',
-    'src/ui/chat/BranchTreeView.tsx',
-    'src/ui/chat/MessageList.tsx',
     'src/ui/header/ConnectionHeader.tsx',
     'src/ui/sidebar/ChatList.tsx',
     'src/ui/storage/StorageView.tsx',

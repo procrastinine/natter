@@ -5,18 +5,14 @@ import ts from 'typescript'
 const REQUIRED_CAPABILITY_PROP = Object.freeze({
   'src/app/Shell.tsx': Object.freeze({
     Composer: 'generationCapability',
-    MessageList: 'generationCapabilityFrame',
-    BranchTreeView: 'generationCapabilityFrame',
   }),
-  'src/ui/chat/BranchTreeView.tsx': Object.freeze({
-    BranchTreeInspector: 'editResendCapability',
-  }),
-  'src/ui/chat/Message.tsx': Object.freeze({ MessageActions: 'regenerateCapability' }),
-  'src/ui/chat/MessageList.tsx': Object.freeze({ Message: 'editResendCapability' }),
 })
 const FORBIDDEN_JSX_PROPS = new Set([
   'connectionAvailability',
+  'editResendCapability',
+  'generationCapabilityFrame',
   'hasConnection',
+  'regenerateCapability',
   'sendBlockedReason',
   'sendUnavailable',
 ])

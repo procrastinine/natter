@@ -17,19 +17,39 @@ export const productionAsyncOwnershipReviews = Object.freeze([
     [
       at(
         'src/store/presentation-interaction-controller.ts',
-        287,
+        301,
         'const settled = new Promise<PresentationInteractionOutcome<Value>>((resolve) => {',
         'non-rejecting-construction',
       ),
       at(
         'src/store/presentation-interaction-controller.ts',
-        370,
+        384,
         'const settled = Promise.resolve(',
         'non-rejecting-construction',
       ),
     ],
     'InlineEditor owns one active visual session and receives only TotalPresentationInteractionPromise; the controller constructs both active and immediate settlements through resolve-only promises',
     'Interaction failures are fulfilled discriminated outcomes, so the detached UI observer has no rejection channel.',
+  ),
+  proof(
+    'src/app/Shell.tsx#<callback:useCallback>|detached-promise|fnv1a32:87b2fb54|1',
+    'void claim.settled.then((outcome) => {',
+    [
+      at(
+        'src/store/presentation-interaction-controller.ts',
+        301,
+        'const settled = new Promise<PresentationInteractionOutcome<Value>>((resolve) => {',
+        'non-rejecting-construction',
+      ),
+      at(
+        'src/store/presentation-interaction-controller.ts',
+        384,
+        'const settled = Promise.resolve(',
+        'non-rejecting-construction',
+      ),
+    ],
+    'Shell owns the exact mutation claim and observes only TotalPresentationInteractionPromise; active and immediate settlements are resolve-only',
+    'The detached observer removes only the matching claim and publishes passive diagnostics, so it has no rejection channel.',
   ),
   proof(
     'src/app/WorkspaceBootstrap.tsx#<anonymous>|detached-promise|fnv1a32:c4c2e7c3|1',
@@ -41,9 +61,16 @@ export const productionAsyncOwnershipReviews = Object.freeze([
   proof(
     'src/store/browser-active-branch-spine.ts#resolveConversationOpenReceipt|detached-promise|fnv1a32:f26a5897|1',
     'void Promise.allSettled(ownedLegs)',
-    [at('src/store/browser-active-branch-spine.ts', 620, '.catch(() => null)', 'error-owner')],
-    'ownedLegs contains only terminalPointPromise, whose rejection is normalized before insertion; allSettled then observes cancellation cleanup without creating a rejection channel',
-    'Closing a conversation-read scope never leaves a rejected leg unobserved.',
+    [
+      at(
+        'src/store/browser-active-branch-spine.ts',
+        635,
+        'const slotFrame = await slotFramePromise',
+        'error-owner',
+      ),
+    ],
+    'ownedLegs contains only slotFramePromise, which the same owner awaits before cleanup; allSettled observes cancellation cleanup after the ordinary propagation channel has settled',
+    'Closing a conversation-read scope never creates a second rejected leg or leaves the awaited frame unobserved.',
   ),
   proof(
     'src/store/locks.ts#<anonymous>|detached-promise|fnv1a32:9c359d1b|1',

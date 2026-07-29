@@ -61,9 +61,9 @@ import {
   type GenerationAdmissionPayload,
   type GenerationAdmissionRequest,
   type GenerationIntent,
+  type GenerationPreparationObserver,
   generationAdmissionController,
   type NewChatGenerationIntent,
-  type SelectedSendGenerationIntent,
 } from './generation-admission-controller'
 import {
   CONTINUE_GENERATION_ATTEMPT_ERROR_POLICY,
@@ -71,7 +71,6 @@ import {
   runGenerationAttempt,
   SEND_GENERATION_ATTEMPT_ERROR_POLICY,
 } from './generation-attempt-runner'
-import type { SelectedSendAdmissionClaim } from './generation-capability-controller'
 import { GenerationPlanningReader } from './generation-planning-reader'
 import {
   projectContinuationLiveAttempt,
@@ -127,7 +126,6 @@ import { announceGenerationOutcome, useAnnouncementStore } from './zustand/annou
 import { useUiStore } from './zustand/uiStore'
 
 export type { GenerationIntent } from './generation-admission-controller'
-export type SelectedSendGenerationAdmission = SelectedSendAdmissionClaim
 
 const PREPARED_NEW_CHAT_GENERATION = Symbol('prepared-new-chat-generation')
 
@@ -181,20 +179,10 @@ export type GenerationStartRequest =
       readonly intent: ExistingChatGenerationIntent
     }
 
-export type SettlingGenerationStartRequest =
-  | GenerationStartRequest
-  | {
-      readonly intent: SelectedSendGenerationIntent
-      readonly admission?: SelectedSendAdmissionClaim
-    }
+export type SettlingGenerationStartRequest = GenerationStartRequest
 
-export type PreparedGenerationForSettlingIntent<
-  Intent extends GenerationIntent | SelectedSendGenerationIntent,
-> = Intent extends SelectedSendGenerationIntent
-  ? PreparedGeneration
-  : Intent extends NewChatGenerationIntent
-    ? PreparedNewChatGeneration
-    : PreparedGeneration
+export type PreparedGenerationForSettlingIntent<Intent extends GenerationIntent> =
+  Intent extends NewChatGenerationIntent ? PreparedNewChatGeneration : PreparedGeneration
 
 export interface GenerationTransportInput {
   readonly connection: GenerationPlanningSnapshot['profile']
@@ -212,7 +200,10 @@ export interface GenerationEngine {
   ): GenerationStartResult<Request['intent']>
   startWhenCapabilitySettles<Request extends SettlingGenerationStartRequest>(
     request: Request,
-    options: { readonly signal: AbortSignal },
+    options: {
+      readonly signal: AbortSignal
+      readonly observer?: GenerationPreparationObserver
+    },
   ): Promise<GenerationHandle<PreparedGenerationForSettlingIntent<Request['intent']>>>
 }
 
@@ -230,6 +221,7 @@ interface Deferred<T> {
 interface PreparedAttemptState {
   readonly prepared: PreparedGeneration
   readonly result: AttemptPrepareResult
+  readonly assistant: Message
   readonly routeDelivery?: ConversationRouteDelivery
 }
 
@@ -309,17 +301,22 @@ export function createGenerationEngine(options: GenerationEngineOptions = {}): G
     },
     async startWhenCapabilitySettles<Request extends SettlingGenerationStartRequest>(
       request: Request,
-      startOptions: { readonly signal: AbortSignal },
+      startOptions: {
+        readonly signal: AbortSignal
+        readonly observer?: GenerationPreparationObserver
+      },
     ): Promise<GenerationHandle<PreparedGenerationForSettlingIntent<Request['intent']>>> {
       const claim = await generationAdmissionController.claimWhenCapabilitySettles(
         request,
         startOptions.signal,
+        startOptions.observer,
       )
       return startClaimedGeneration({
         claim,
         openStream,
         now,
         signal: startOptions.signal,
+        ...(startOptions.observer ? { observer: startOptions.observer } : {}),
       }) as GenerationHandle<PreparedGenerationForSettlingIntent<Request['intent']>>
     },
   })
@@ -332,6 +329,7 @@ function startClaimedGeneration(input: {
   readonly openStream: (input: GenerationTransportInput) => AsyncIterable<AssistantStreamChunk>
   readonly now: () => number
   readonly signal?: AbortSignal
+  readonly observer?: GenerationPreparationObserver
 }): GenerationHandle {
   const { claim } = input
   const { streamId, chatId, assistantMessageId, userMessageId } = claim
@@ -352,6 +350,7 @@ function startClaimedGeneration(input: {
   const prepared = deferred<PreparedGeneration>()
   void prepared.promise.catch(() => undefined)
   let preparedSettled = false
+  observeGenerationPreparationPhase(input.observer, 'workspace-requested')
   const execution = generationAdmissionController.execute(
     claim,
     (permit) =>
@@ -366,6 +365,7 @@ function startClaimedGeneration(input: {
         evidence,
         prepared,
         openStream: input.openStream,
+        ...(input.observer ? { observer: input.observer } : {}),
         markPreparedSettled: () => {
           preparedSettled = true
           releaseSubmitAbort()
@@ -418,9 +418,11 @@ async function runGeneration(input: {
   evidence: GenerationExecutionEvidence
   prepared: Deferred<PreparedGeneration>
   openStream: (input: GenerationTransportInput) => AsyncIterable<AssistantStreamChunk>
+  observer?: GenerationPreparationObserver
   markPreparedSettled: () => void
   now: () => number
 }): Promise<CompletedGeneration> {
+  observeGenerationPreparationPhase(input.observer, 'workspace-admitted')
   let admission: GenerationAdmissionPayload | undefined = generationAdmissionController.takePayload(
     input.claim,
   )
@@ -462,6 +464,7 @@ async function runGeneration(input: {
       admission.placement.createdAt,
     )
     leasePermitOwned = false
+    observeGenerationPreparationPhase(input.observer, 'ownership-requested')
     ownershipReservation = await reserveStreamOwnership(activeLeasePermit, leaseAdmission, () =>
       input.controller.abort(),
     )
@@ -526,7 +529,7 @@ async function runGeneration(input: {
     const initialContent =
       strategy === 'continue'
         ? []
-        : preparedState.result.assistant.content.map((item) => structuredClone(item))
+        : preparedState.assistant.content.map((item) => structuredClone(item))
     const runtime = compactPreparedAttempt(preparedState, input.assistantMessageId)
     preparedState = undefined
     const accumulator = createStreamAccumulator({
@@ -761,24 +764,24 @@ async function prepareAttempt(input: {
   controller: AbortController
   lease: StreamLeaseAdmission
   now: () => number
+  observer?: GenerationPreparationObserver
 }): Promise<PreparedAttemptState> {
   const intent = input.admission.intent
   const configuration = input.admission.configuration
   const createdAt = input.admission.placement.createdAt
-  const chat =
-    intent.kind === 'new-chat-send'
-      ? createChatRow({
-          id: input.chatId,
-          settings: configuration.settings,
-          ...(configuration.presetId ? { presetId: configuration.presetId } : {}),
-          ...(intent.title !== undefined ? { title: intent.title } : {}),
-          now: createdAt,
-        })
-      : undefined
-  const settings = configuration.settings
-  if (!settings.profileId) throw new Error(`GenerationProfileNotSelected:${input.chatId}`)
-  if (!settings.model) throw new Error(`GenerationModelNotSelected:${input.chatId}`)
-
+  let chat: Chat | undefined
+  if (intent.kind === 'new-chat-send') {
+    if (configuration.kind !== 'new-chat') {
+      throw new Error(`GenerationNewChatConfigurationMissing:${input.chatId}`)
+    }
+    chat = createChatRow({
+      id: input.chatId,
+      settings: configuration.settings,
+      ...(configuration.presetId ? { presetId: configuration.presetId } : {}),
+      ...(intent.title !== undefined ? { title: intent.title } : {}),
+      now: createdAt,
+    })
+  }
   const prepareInput = prepareCommandInput(
     intent,
     chat,
@@ -788,6 +791,7 @@ async function prepareAttempt(input: {
     input.admission.promptPath,
   )
   let routeDelivery: ConversationRouteDelivery | undefined
+  observeGenerationPreparationPhase(input.observer, 'repository-requested')
   const commit = await getWorkspaceRepository().execute(
     input.permit,
     {
@@ -820,21 +824,81 @@ async function prepareAttempt(input: {
                 committedEffect,
               }),
           )
+          observeGenerationPreparationPhase(input.observer, 'local-applied')
           return 'applied'
         },
       },
     },
   )
+  const assistant =
+    commit.value.strategy === 'continue'
+      ? await hydratePreparedContinuationTarget(
+          input.permit,
+          input.admission.promptMaterial,
+          commit.value.assistantHeader,
+        )
+      : required(commit.value.assistant)
   return {
     result: commit.value,
+    assistant,
     ...(routeDelivery ? { routeDelivery } : {}),
     prepared: {
       streamId: input.streamId,
       chatId: input.chatId,
-      assistantMessageId: commit.value.assistant.id,
+      assistantMessageId: assistant.id,
       ...(commit.value.user ? { userMessageId: commit.value.user.id } : {}),
     },
   }
+}
+
+function observeGenerationPreparationPhase(
+  observer: GenerationPreparationObserver | undefined,
+  phase: Parameters<GenerationPreparationObserver['phase']>[0],
+): void {
+  try {
+    observer?.phase(phase)
+  } catch {
+    // Diagnostics cannot participate in preparation.
+  }
+}
+
+async function hydratePreparedContinuationTarget(
+  permit: WorkspaceWritePermit,
+  promptMaterial: GenerationAdmissionPayload['promptMaterial'],
+  header: MessageHeaderRow,
+): Promise<Message> {
+  const presentation = required(
+    (
+      await promptMaterial.read(
+        permit,
+        [header],
+        async (headers, signal) => {
+          const read = await getWorkspaceRepository().query(
+            permit,
+            {
+              kind: 'message.presentations',
+              messageIds: headers.map((candidate) => candidate.id),
+            },
+            { signal },
+          )
+          return {
+            workspaceId: read.workspaceId,
+            replacementEpoch: read.replacementEpoch,
+            material: read.value,
+          }
+        },
+        permit.signal,
+      )
+    )[0],
+  )
+  if (
+    presentation.header.id !== header.id ||
+    presentation.message.id !== header.id ||
+    presentation.message.chatId !== header.chatId
+  ) {
+    throw new Error(`GenerationContinuationTargetUnavailable:${header.id}`)
+  }
+  return presentation.message
 }
 
 function compactGenerationRuntimeIntent(intent: GenerationIntent): GenerationRuntimeIntent {
@@ -857,39 +921,25 @@ function prepareCommandInput(
   const existingChatConfiguration =
     configuration.kind === 'chat'
       ? {
-          configurationClaim: {
-            configurationVersion: configuration.configurationVersion,
-            settings: configuration.settings,
-            presetId: configuration.presetId,
-            profile: configuration.profile,
-            requestRevision: configuration.requestRevision,
-            dispatchKeyRevisions: configuration.dispatchKeyRevisions,
+          configurationIntent: {
             preferredDispatchKeyId: configuration.preferredDispatchKeyId,
-            workspaceSettingOverrides: configuration.workspaceSettingOverrides,
-            ...(configuration.savedTextTemplate
-              ? { savedTextTemplate: configuration.savedTextTemplate }
-              : {}),
+            ...(configuration.settingsPatch ? { settingsPatch: configuration.settingsPatch } : {}),
           },
-          configurationLinkTransition: configuration.configurationLinkTransition,
         }
       : undefined
   switch (intent.kind) {
     case 'new-chat-send':
+      if (configuration.kind !== 'new-chat') {
+        throw new Error('GenerationNewChatConfigurationMissing')
+      }
       return {
         strategy: 'new-chat-send',
         promptPath,
         chat: required(chat),
-        configurationClaim: {
+        configurationIntent: {
           settings: configuration.settings,
           presetId: configuration.presetId,
-          profile: configuration.profile,
-          requestRevision: configuration.requestRevision,
-          dispatchKeyRevisions: configuration.dispatchKeyRevisions,
           preferredDispatchKeyId: configuration.preferredDispatchKeyId,
-          workspaceSettingOverrides: configuration.workspaceSettingOverrides,
-          ...(configuration.savedTextTemplate
-            ? { savedTextTemplate: configuration.savedTextTemplate }
-            : {}),
         },
         lease,
         placement,
@@ -917,7 +967,6 @@ function prepareCommandInput(
         ...required(existingChatConfiguration),
         lease,
         placement,
-        ...(intent.settingsPatch ? { persistCapturedConfiguration: true } : {}),
       }
     case 'edit-resend':
       return {
@@ -980,9 +1029,15 @@ async function planAndDispatch(
   const proofMessages = prompt.messageProofs
   if (input.intent.kind === 'continue') {
     const prepareProof = required(prepared.result.continuationBase)
-    const presentation = prompt.knownPresentations.find(
-      (candidate) => candidate.header.id === prepareProof.messageId,
-    )
+    const header = prompt.headers.find((candidate) => candidate.id === prepareProof.messageId)
+    const presentation =
+      header && prepared.assistant.id === header.id
+        ? Object.freeze({
+            header,
+            message: prepared.assistant,
+            bodyVersion: header.bodyVersion,
+          })
+        : undefined
     if (
       !presentation ||
       prepareProof.streamId !== input.streamId ||
@@ -1189,13 +1244,13 @@ function compactPreparedAttempt(
   return {
     prepared: prepared.prepared,
     lease: prepared.result.lease,
-    assistantAttachmentRefs: (prepared.result.assistant.attachmentRefs ?? []).map((ref) =>
+    assistantAttachmentRefs: (prepared.assistant.attachmentRefs ?? []).map((ref) =>
       structuredClone(ref),
     ),
-    assistantGeneration: prepared.result.assistant.generation
-      ? structuredClone(prepared.result.assistant.generation)
+    assistantGeneration: prepared.assistant.generation
+      ? structuredClone(prepared.assistant.generation)
       : undefined,
-    assistantBody: messageBodyFields(prepared.result.assistant),
+    assistantBody: messageBodyFields(prepared.assistant),
     assistantBodyVersion: prepared.result.assistantHeader.bodyVersion,
     planningModel: prepared.result.planning.chat.settings.model,
   }
@@ -1277,14 +1332,14 @@ function pendingPlanningMessages(
       },
     ]
   }
-  if (input.intent.kind === 'continue' || prepared.result.assistant.content.length === 0) {
+  if (input.intent.kind === 'continue' || prepared.assistant.content.length === 0) {
     return []
   }
   return [
     {
-      ...structuredClone(prepared.result.assistant),
+      ...structuredClone(prepared.assistant),
       origin: 'prefill',
-      content: structuredClone(prepared.result.assistant.content),
+      content: structuredClone(prepared.assistant.content),
     },
   ]
 }

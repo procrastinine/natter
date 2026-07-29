@@ -384,7 +384,7 @@ export const TEST_GUARANTEE_CLAIMS = Object.freeze([
     evidence: [
       {
         path: 'tests/integration/generation-intent-io-contract.test.ts',
-        locator: "it('retains one frozen first submit while destination selection settles'",
+        locator: "it('retains one frozen first submit while new-chat configuration settles'",
       },
       {
         path: 'tests/unit/composer.test.tsx',

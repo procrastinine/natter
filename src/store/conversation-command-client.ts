@@ -12,6 +12,7 @@
 //      sibling under the existing user parent; old assistant stays as a
 //      swipe variant. One API call.
 
+import type { ActiveBranchIntentTarget } from '../core/active-branch-spine'
 import type { ChatSettingsPatch } from '../core/chat-metadata'
 import { writeTextInto } from '../core/message-content'
 import type {
@@ -38,6 +39,7 @@ import {
   conversationCommittedResult,
 } from './conversation-repository-adapter'
 import type { ConversationRouteOwner } from './conversation-route-owner'
+import type { GenerationPreparationObserver } from './generation-admission-controller'
 import {
   type GenerationHandle,
   type GenerationIntent,
@@ -45,7 +47,6 @@ import {
   generationEngine,
   type PreparedGeneration,
   type PreparedNewChatGeneration,
-  type SelectedSendGenerationAdmission,
 } from './generation-engine'
 import { StreamTargetBusyError } from './repository'
 import type { StructuralSnapshotPresentation } from './structural-undo-contract'
@@ -66,10 +67,6 @@ export interface SendContentOptions {
   readonly attachmentRefs?: AttachmentRef[]
 }
 
-export interface SelectedSendContentOptions extends SendContentOptions {
-  readonly admission?: SelectedSendGenerationAdmission
-}
-
 export function isConversationTargetBusyError(error: unknown): boolean {
   return error instanceof StreamTargetBusyError
 }
@@ -85,9 +82,12 @@ type PreservingMessageMutationCommand = Exclude<
 
 async function executeConversationCommand<C extends PreservingMessageMutationCommand>(
   command: C,
+  signal?: AbortSignal,
 ): Promise<WorkspaceCommandResult<C>> {
-  const commit = await runWorkspaceAction('message-edit', (permit) =>
-    getWorkspaceRepository().execute(permit, command),
+  const commit = await runWorkspaceAction(
+    'message-edit',
+    (permit) => getWorkspaceRepository().execute(permit, command),
+    signal ? { signal } : {},
   )
   return commit.value
 }
@@ -95,22 +95,26 @@ async function executeConversationCommand<C extends PreservingMessageMutationCom
 async function executeSelectingConversationCommand<C extends SelectingMessageMutationCommand>(
   command: C,
   apply?: (result: ConversationCommittedResult<WorkspaceCommandResult<C>>) => void,
+  signal?: AbortSignal,
 ): Promise<ConversationCommittedResult<WorkspaceCommandResult<C>>> {
-  const commit = await runWorkspaceAction('message-structure', (permit) =>
-    getWorkspaceRepository().execute(
-      permit,
-      command,
-      apply
-        ? {
-            localApplications: {
-              conversation: (committed) => {
-                apply(conversationCommittedResult(committed, committed.value.destination.chat.id))
-                return 'applied'
+  const commit = await runWorkspaceAction(
+    'message-structure',
+    (permit) =>
+      getWorkspaceRepository().execute(
+        permit,
+        command,
+        apply
+          ? {
+              localApplications: {
+                conversation: (committed) => {
+                  apply(conversationCommittedResult(committed, committed.value.destination.chat.id))
+                  return 'applied'
+                },
               },
-            },
-          }
-        : undefined,
-    ),
+            }
+          : undefined,
+      ),
+    signal ? { signal } : {},
   )
   return conversationCommittedResult(commit, commit.value.destination.chat.id)
 }
@@ -119,60 +123,80 @@ export async function editInPlace(
   chatId: ChatId,
   message: Message,
   newText: string,
+  signal?: AbortSignal,
 ): Promise<void> {
   const nextContent = writeTextInto(message.content, newText)
-  await executeConversationCommand({
-    kind: 'message.edit-content',
-    input: { chatId, messageId: message.id, content: nextContent },
-  })
+  await executeConversationCommand(
+    {
+      kind: 'message.edit-content',
+      input: { chatId, messageId: message.id, content: nextContent },
+    },
+    signal,
+  )
 }
 
 export async function toggleReasoningDetailHidden(
   chatId: ChatId,
   messageId: MessageId,
   member: ReasoningMemberRef,
+  signal?: AbortSignal,
 ): Promise<void> {
-  await executeConversationCommand({
-    kind: 'message.toggle-reasoning-detail',
-    chatId,
-    messageId,
-    member,
-  })
+  await executeConversationCommand(
+    {
+      kind: 'message.toggle-reasoning-detail',
+      chatId,
+      messageId,
+      member,
+    },
+    signal,
+  )
 }
 
 export async function toggleProviderOutputItemHidden(
   chatId: ChatId,
   messageId: MessageId,
   member: ProviderOutputMemberRef,
+  signal?: AbortSignal,
 ): Promise<void> {
-  await executeConversationCommand({
-    kind: 'message.toggle-provider-output-item',
-    chatId,
-    messageId,
-    member,
-  })
+  await executeConversationCommand(
+    {
+      kind: 'message.toggle-provider-output-item',
+      chatId,
+      messageId,
+      member,
+    },
+    signal,
+  )
 }
 
 export async function toggleMessageContextHidden(
   chatId: ChatId,
   messageId: MessageId,
+  signal?: AbortSignal,
 ): Promise<void> {
-  await executeConversationCommand({
-    kind: 'message.toggle-context',
-    chatId,
-    messageId,
-  })
+  await executeConversationCommand(
+    {
+      kind: 'message.toggle-context',
+      chatId,
+      messageId,
+    },
+    signal,
+  )
 }
 
 export async function dismissMessageGenerationNotice(
   chatId: ChatId,
   messageId: MessageId,
+  signal?: AbortSignal,
 ): Promise<void> {
-  await executeConversationCommand({
-    kind: 'message.dismiss-generation-notice',
-    chatId,
-    messageId,
-  })
+  await executeConversationCommand(
+    {
+      kind: 'message.dismiss-generation-notice',
+      chatId,
+      messageId,
+    },
+    signal,
+  )
 }
 
 export async function mutateMessageAttachmentReference(
@@ -189,7 +213,7 @@ export async function mutateMessageAttachmentReference(
 
 export function sendMessage(
   chatId: ChatId,
-  expectedLeafId: MessageId | null,
+  target: ActiveBranchIntentTarget,
   content: ContentItem[],
   options: SendContentOptions = {},
 ): GenerationStartResult<Extract<GenerationIntent, { readonly kind: 'send' }>> {
@@ -197,7 +221,7 @@ export function sendMessage(
     intent: {
       kind: 'send',
       chatId,
-      expectedLeafId,
+      target,
       content,
       ...(options.attachmentRefs ? { attachmentRefs: options.attachmentRefs } : {}),
       ...(options.prefillContent?.length ? { prefillContent: options.prefillContent } : {}),
@@ -205,24 +229,26 @@ export function sendMessage(
   })
 }
 
-export function sendSelectedMessageWhenCapabilitySettles(
+export function sendMessageWhenCapabilitySettles(
   chatId: ChatId,
+  target: ActiveBranchIntentTarget,
   content: ContentItem[],
   signal: AbortSignal,
-  options: SelectedSendContentOptions = {},
+  options: SendContentOptions = {},
+  observer?: GenerationPreparationObserver,
 ): Promise<GenerationHandle<PreparedGeneration>> {
   return generationEngine.startWhenCapabilitySettles(
     {
       intent: {
-        kind: 'selected-send',
+        kind: 'send',
         chatId,
+        target,
         content,
         ...(options.attachmentRefs ? { attachmentRefs: options.attachmentRefs } : {}),
         ...(options.prefillContent?.length ? { prefillContent: options.prefillContent } : {}),
       },
-      ...(options.admission ? { admission: options.admission } : {}),
     },
-    { signal },
+    { signal, ...(observer ? { observer } : {}) },
   )
 }
 
@@ -247,6 +273,7 @@ export function sendNewChatWhenCapabilitySettles(
   routeOwner: ConversationRouteOwner,
   signal: AbortSignal,
   options: SendContentOptions = {},
+  observer?: GenerationPreparationObserver,
 ): Promise<GenerationHandle<PreparedNewChatGeneration>> {
   return generationEngine.startWhenCapabilitySettles(
     {
@@ -258,7 +285,7 @@ export function sendNewChatWhenCapabilitySettles(
       },
       routeOwner,
     },
-    { signal },
+    { signal, ...(observer ? { observer } : {}) },
   )
 }
 
@@ -273,10 +300,11 @@ export function replyToMessageWhenCapabilitySettles(
   chatId: ChatId,
   parentUserId: MessageId,
   signal: AbortSignal,
+  observer?: GenerationPreparationObserver,
 ): Promise<GenerationHandle<PreparedGeneration>> {
   return generationEngine.startWhenCapabilitySettles(
     { intent: { kind: 'reply', chatId, parentUserId } },
-    { signal },
+    { signal, ...(observer ? { observer } : {}) },
   )
 }
 
@@ -298,6 +326,29 @@ export function editAndResend(
   })
 }
 
+export function editAndResendWhenCapabilitySettles(
+  ctx: MessageOpsContext,
+  originalUser: Message,
+  newText: string,
+  signal: AbortSignal,
+  options: { prefillContent?: ContentItem[]; attachmentRefs?: AttachmentRef[] } = {},
+  observer?: GenerationPreparationObserver,
+): Promise<GenerationHandle<PreparedGeneration>> {
+  return generationEngine.startWhenCapabilitySettles(
+    {
+      intent: {
+        kind: 'edit-resend',
+        chatId: ctx.chatId,
+        targetUserId: originalUser.id,
+        content: [{ type: 'text', text: newText }],
+        ...(options.attachmentRefs ? { attachmentRefs: options.attachmentRefs } : {}),
+        ...(options.prefillContent?.length ? { prefillContent: options.prefillContent } : {}),
+      },
+    },
+    { signal, ...(observer ? { observer } : {}) },
+  )
+}
+
 export function regenerateFromMessage(
   ctx: MessageOpsContext,
   assistantMessage: Message,
@@ -311,6 +362,26 @@ export function regenerateFromMessage(
       ...(options.settingsPatch ? { settingsPatch: options.settingsPatch } : {}),
     },
   })
+}
+
+export function regenerateFromMessageWhenCapabilitySettles(
+  ctx: MessageOpsContext,
+  assistantMessage: Message,
+  signal: AbortSignal,
+  options: RegenerateMessageOptions = {},
+  observer?: GenerationPreparationObserver,
+): Promise<GenerationHandle<PreparedGeneration>> {
+  return generationEngine.startWhenCapabilitySettles(
+    {
+      intent: {
+        kind: 'regenerate',
+        chatId: ctx.chatId,
+        targetAssistantId: assistantMessage.id,
+        ...(options.settingsPatch ? { settingsPatch: options.settingsPatch } : {}),
+      },
+    },
+    { signal, ...(observer ? { observer } : {}) },
+  )
 }
 
 // Continue in place. Instead of creating a new assistant sibling (which
@@ -348,6 +419,24 @@ export function continueFromMessage(
   })
 }
 
+export function continueFromMessageWhenCapabilitySettles(
+  ctx: MessageOpsContext,
+  assistantMessage: Message,
+  signal: AbortSignal,
+  observer?: GenerationPreparationObserver,
+): Promise<GenerationHandle<PreparedGeneration>> {
+  return generationEngine.startWhenCapabilitySettles(
+    {
+      intent: {
+        kind: 'continue',
+        chatId: ctx.chatId,
+        targetAssistantId: assistantMessage.id,
+      },
+    },
+    { signal, ...(observer ? { observer } : {}) },
+  )
+}
+
 export async function importMessagesOp(
   input: PasteImportInput,
   apply?: (result: ConversationCommittedResult<PasteImportResult>) => void,
@@ -366,6 +455,7 @@ interface DeleteOpArgs {
   messageId: MessageId
   activeLeafId: MessageId | null
   cascade?: boolean
+  signal?: AbortSignal
 }
 
 export async function deletePairOp(
@@ -384,6 +474,7 @@ export async function deletePairOp(
       },
     },
     apply,
+    args.signal,
   )
 }
 export async function deleteTurnOp(
@@ -402,6 +493,7 @@ export async function deleteTurnOp(
       },
     },
     apply,
+    args.signal,
   )
 }
 export async function deleteVariantOp(
@@ -420,6 +512,7 @@ export async function deleteVariantOp(
       },
     },
     apply,
+    args.signal,
   )
 }
 
@@ -439,6 +532,7 @@ export async function deleteSingleOp(
       },
     },
     apply,
+    args.signal,
   )
 }
 

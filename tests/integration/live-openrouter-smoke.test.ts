@@ -113,7 +113,7 @@ async function startSend(chatId: string, content: ContentItem[]): Promise<Genera
   const intent = {
     kind: 'send' as const,
     chatId,
-    expectedLeafId: chat.lastUpdatedLeafId,
+    target: { kind: 'fixed' as const, messageId: chat.lastUpdatedLeafId },
     content,
   }
   const releaseSurface = await prepareControlledGenerationSurface(intent, {

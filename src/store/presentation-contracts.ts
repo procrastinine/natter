@@ -70,6 +70,10 @@ export type {
   ConversationRouteOwnerController,
 } from './conversation-route-owner'
 export type { CachedEndpointsRow, CachedModelsRow, CachedPrivacyPolicyRow } from './db-rows'
+export type {
+  GenerationPreparationObserver,
+  GenerationPreparationPhase,
+} from './generation-admission-controller'
 export type { GenerationCapabilityFrame } from './generation-capability-controller'
 export type { GenerationStartResult } from './generation-engine'
 export type { ImportChatOptions, ImportChatResult } from './import-export-contract'

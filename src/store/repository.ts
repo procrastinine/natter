@@ -272,14 +272,8 @@ export interface WorkspaceMutationOptions {
   promoteChatId?: ChatId
   generationReadSet?: GenerationPromptReadSet
   captureGenerationPlanningSnapshot?: boolean
-  planningProfileId?: ProfileId
-  configurationLinkTransition?: {
-    readonly chatId: ChatId
-    readonly expectedResourceNames: readonly string[]
-    readonly nextResourceNames: readonly string[]
-  }
+  maintainConfigurationLinksForChatId?: ChatId
   streamAdmission?: StreamLeaseAdmission
-  streamAdmissionPostCommit?: StreamPostCommitEvidence
   streamFence?: {
     streamId: string
     fence: StreamWriteFence

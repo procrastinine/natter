@@ -313,7 +313,7 @@ export const productionRuntimeEffectReviews = Object.freeze([
       ),
     ],
     'controller -> selected configuration claim state; either promise branch clears the matching identity and cancellation or workspace replacement aborts then removes the claim',
-    'Each synchronous selected-send claim owns at most one selection read and admission transfer, cancellation, or workspace reconciliation releases it.',
+    'Each generation configuration observation owns at most one selection read; admission transfer, cancellation, or workspace reconciliation releases it.',
   ),
   proof(
     'src/store/configuration-controller.ts#loadActiveSelection|abort-controller|acquire|new AbortController|fnv1a32:dcbfa1e8|1',
@@ -747,13 +747,6 @@ export const productionRuntimeEffectReviews = Object.freeze([
   ),
   lifetime(
     'src/ui/chat/Composer.tsx#Composer|animation-frame|acquire|requestAnimationFrame|fnv1a32:5a8d6022|1',
-    'requestAnimationFrame(() => prefillTextareaRef.current?.focus())',
-    'browser-one-shot',
-    'one callback self-released by the browser at the next animation frame',
-    'The callback only reads an optional live ref and does not recur.',
-  ),
-  lifetime(
-    'src/ui/chat/InlineEditor.tsx#InlineEditor|animation-frame|acquire|requestAnimationFrame|fnv1a32:5a8d6022|1',
     'requestAnimationFrame(() => prefillTextareaRef.current?.focus())',
     'browser-one-shot',
     'one callback self-released by the browser at the next animation frame',

@@ -21,6 +21,10 @@ export type ActiveBranchSelection =
       readonly observedTipId?: MessageId
     }
 
+export type ActiveBranchIntentTarget =
+  | { readonly kind: 'fixed'; readonly messageId: MessageId | null }
+  | { readonly kind: 'selection'; readonly selection: ActiveBranchSelection }
+
 export interface ActiveBranchChildSlot {
   readonly parentId: MessageId | null
   readonly slotVersion: number

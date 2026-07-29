@@ -1,25 +1,24 @@
 import type { Transaction } from 'dexie'
 import { normalizeModelsResponse } from '../api/providers'
 import { modelCatalogQueryForConnectionKind, modelsCacheKey } from '../core/cache-keys'
-import { sameChatSettings } from '../core/chat-metadata'
-import {
-  connectionDispatchKeyRefs,
-  profileMatchesDispatchProof,
-} from '../core/connection-dispatch-proof'
+import { connectionDispatchKeyRefs } from '../core/connection-dispatch-proof'
 import { assertCanonicalGeneratedOutputMessage } from '../core/generated-output-localization'
 import {
   CORS_PROXY_SECRET_KEY,
   CORS_PROXY_URL_KEY,
-  GENERATION_GLOBAL_PREFERENCE_KEYS,
   generationCorsProxyConfigFromStored,
   TOKEN_CALIBRATION_MODE_KEY,
   tokenCalibrationModeFromStored,
 } from '../core/global-settings'
-import { keyDispatchRevisions, keyDispatchRevisionsEqual } from '../core/key-dispatch-proof'
 import { messageTreeIndexFields } from '../core/message-tree-index'
 import { fixedConversationSelectionTarget } from '../core/messages'
 import { tokenCalibrationKey } from '../core/model-ids'
 import { pickEquivalentModelId } from '../core/model-selection'
+import {
+  isStaticTextTemplateId,
+  normalizeTextTemplateConfig,
+  type SavedTextTemplate,
+} from '../core/text-templates'
 import {
   deriveCompletionSample,
   GLOBAL_TOKEN_CALIBRATION_KEY,
@@ -85,7 +84,6 @@ import type {
 } from './browser-domain-mutations'
 import {
   type BrowserMutationTableName,
-  GenerationPlanningSeedChangedError,
   planMutationSemanticOperation,
   validateGenerationReadSetTransaction,
 } from './browser-mutation-plan'
@@ -112,10 +110,7 @@ import {
 } from './byte-owner-mutation'
 import { openLinkedChatMutation } from './chat-row-transition'
 import { maintainChildSlotProjections } from './child-list-projection'
-import {
-  configurationRequestRevisionFor,
-  configurationRequestRevisionKey,
-} from './configuration-domain-contract'
+import { configurationRequestRevisionFor } from './configuration-domain-contract'
 import { proveConversationSelectionInTransaction } from './conversation-destination-seal'
 import { childListKey } from './db'
 import type { SettingsRow } from './db-rows'
@@ -142,6 +137,7 @@ import type {
   PatchMessageBodyOptions,
   PutMessageOptions,
   StreamLeaseRow,
+  StreamPostCommitEvidence,
   WorkspaceMutationOptions,
   WorkspaceMutationResult,
 } from './repository'
@@ -168,7 +164,7 @@ import {
 } from './transaction-order'
 import type {
   GenerationPlanningSnapshot,
-  PrepareAttemptConfigurationClaim,
+  PrepareAttemptConfigurationIntent,
 } from './workspace-protocol'
 import { connectionDiscoveryRevisionKey } from './workspace-protocol'
 
@@ -182,52 +178,27 @@ function chatTokenCalibrationGeneration(chat: Pick<Chat, 'tokenCalibrationGenera
 async function captureGenerationPlanningSnapshot(
   tx: Transaction,
   chatId: ChatId,
-  expected: PrepareAttemptConfigurationClaim,
+  intent: PrepareAttemptConfigurationIntent,
   planningChat: Chat,
 ): Promise<GenerationPlanningSnapshot> {
-  if (
-    !sameChatSettings(planningChat.settings, expected.settings) ||
-    (planningChat.presetId ?? null) !== expected.presetId
-  ) {
-    throw new GenerationPlanningSeedChangedError(chatId)
-  }
   const profile = await tx
     .table<ConnectionProfile, ProfileId>('profiles')
     .get(planningChat.settings.profileId)
   if (!profile) {
     throw new Error(`GenerationPlanningProfileMissing:${planningChat.settings.profileId}`)
   }
-  if (!profileMatchesDispatchProof(profile, expected.profile)) {
-    throw new GenerationPlanningSeedChangedError(chatId)
-  }
   const keyRefs = connectionDispatchKeyRefs(profile)
   const keyRecords = await tx.table<KeyRecord, KeyId>('keys').bulkGet(keyRefs)
-  if (
-    !keyDispatchRevisionsEqual(
-      keyDispatchRevisions(keyRefs, keyRecords),
-      expected.dispatchKeyRevisions,
-    )
-  ) {
-    throw new GenerationPlanningSeedChangedError(chatId)
-  }
-  if (
-    expected.preferredDispatchKeyId !== null &&
-    !keyRefs.includes(expected.preferredDispatchKeyId)
-  ) {
-    throw new GenerationPlanningSeedChangedError(chatId)
-  }
+  const preferredDispatchKeyId =
+    intent.preferredDispatchKeyId !== null && keyRefs.includes(intent.preferredDispatchKeyId)
+      ? intent.preferredDispatchKeyId
+      : null
   const modelId = planningChat.settings.model
   if (!modelId) throw new Error(`GenerationPlanningModelMissing:${chatId}`)
   const discoveryRevision = configurationRequestRevisionFor(
     profile,
     profile.apiKeyRef ? keyRecords.find((record) => record?.id === profile.apiKeyRef) : undefined,
   )
-  if (
-    configurationRequestRevisionKey(discoveryRevision) !==
-    configurationRequestRevisionKey(expected.requestRevision)
-  ) {
-    throw new GenerationPlanningSeedChangedError(chatId)
-  }
   const discoveryRevisionKey = connectionDiscoveryRevisionKey(discoveryRevision)
   const [modelsRow, endpointsRow, privacyRow] = await Promise.all([
     profile.kind === 'openrouter'
@@ -276,12 +247,6 @@ async function captureGenerationPlanningSnapshot(
   const settingsByKey = new Map(
     settingKeys.map((key, index) => [key, settingRows[index]?.value] as const),
   )
-  for (const override of expected.workspaceSettingOverrides) {
-    if (!GENERATION_GLOBAL_PREFERENCE_KEYS.includes(override.key as never)) {
-      throw new Error(`GenerationPlanningSettingOverrideInvalid:${override.key}`)
-    }
-    settingsByKey.set(override.key, override.value)
-  }
   const globalCalibration = relevantGlobalTokenCalibration(
     settingsByKey.get(GLOBAL_TOKEN_CALIBRATION_KEY),
     modelId,
@@ -300,11 +265,19 @@ async function captureGenerationPlanningSnapshot(
   if (admissionDecision === 'zero-eligible') {
     throw new NoEligibleProvidersError()
   }
+  const textTemplateId = planningChat.settings.textTemplate
+  const savedTextTemplate =
+    textTemplateId && !isStaticTextTemplateId(textTemplateId)
+      ? await tx.table<SavedTextTemplate, string>('textTemplates').get(textTemplateId)
+      : undefined
+  if (textTemplateId && !isStaticTextTemplateId(textTemplateId) && !savedTextTemplate) {
+    throw new Error(`GenerationPlanningTemplateMissing:${textTemplateId}`)
+  }
   return {
     chat: structuredClone(planningChat),
     profile: structuredClone(profile),
     keyRecords: keyRecords.map((record) => (record ? structuredClone(record) : undefined)),
-    preferredDispatchKeyId: expected.preferredDispatchKeyId,
+    preferredDispatchKeyId,
     discovery,
     calibration: {
       modelId,
@@ -314,8 +287,13 @@ async function captureGenerationPlanningSnapshot(
       global: structuredClone(globalCalibration),
     },
     proxy: structuredClone(proxy),
-    ...(expected.savedTextTemplate
-      ? { savedTextTemplate: structuredClone(expected.savedTextTemplate) }
+    ...(savedTextTemplate
+      ? {
+          savedTextTemplate: {
+            templateId: savedTextTemplate.id,
+            config: normalizeTextTemplateConfig(savedTextTemplate.config),
+          },
+        }
       : {}),
   }
 }
@@ -369,7 +347,6 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
     calibrationUsageFromPostCommit,
     canApplyIncrementalBranchAppend,
     changedPatch,
-    chatConfigurationTargetResourceNames,
     chatPreviewInTransaction,
     cloneDraft,
     cloneMessage,
@@ -396,11 +373,15 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
     stableStringify,
     streamOwnedMessageFieldsChanged,
     transitionMessageGenerationForDispatch,
-    validateGenerationPromptPathClaim,
+    resolveGenerationPromptPath,
   } = shared
+  const streamAdmission = options?.streamAdmission
 
   let committedTargetLease: StreamLeaseRow | undefined
   let admittedTargetLease: StreamLeaseRow | undefined
+  let admissionExistingLease: StreamLeaseRow | undefined
+  let admissionSequence: number | undefined
+  let admissionPostCommit: StreamPostCommitEvidence | undefined
   const operationPlan = planMutationSemanticOperation(
     commandCommit.command,
     scopes,
@@ -410,9 +391,6 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
   )
   if (options?.streamTargetCommit && !options.streamFence) {
     throw new Error(`StreamTargetCommitFenceMissing:${options.streamTargetCommit.streamId}`)
-  }
-  if (options?.streamAdmissionPostCommit && !options.streamAdmission) {
-    throw new Error('StreamAdmissionPostCommitWithoutAdmission')
   }
   if (
     options?.streamTargetCommit &&
@@ -445,17 +423,6 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
       }
       const now = Date.now()
       const tx = transaction
-      if (options?.configurationLinkTransition) {
-        const transition = options.configurationLinkTransition
-        const current = await tx.table<Chat, ChatId>('chats').get(transition.chatId)
-        if (
-          !current ||
-          stableStringify(chatConfigurationTargetResourceNames(current)) !==
-            stableStringify(transition.expectedResourceNames)
-        ) {
-          throw new GenerationPlanningSeedChangedError(transition.chatId)
-        }
-      }
       if (options?.expectedAttachmentCatalogRevision !== undefined) {
         const expected = options.expectedAttachmentCatalogRevision
         if (!Number.isSafeInteger(expected) || expected < 0) {
@@ -539,35 +506,10 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
         ) {
           throw new Error(`StreamLeaseAlreadyOwned:${incoming.streamId}`)
         }
-        const admissionSequence = existing
+        admissionSequence = existing
           ? existing.admissionSequence
           : await reserveStreamLeaseTarget(tx, incoming)
-        const postCommit = options.streamAdmissionPostCommit
-        if (!postCommit || postCommit.final !== undefined) {
-          throw new Error(`StreamPostCommitAdmissionMissing:${incoming.streamId}`)
-        }
-        if (existing && stableStringify(existing.postCommit) !== stableStringify(postCommit)) {
-          throw new Error(`StreamPostCommitAdmissionMismatch:${incoming.streamId}`)
-        }
-        admittedTargetLease = requireStreamLeaseRow(
-          existing
-            ? {
-                ...existing,
-                heartbeatAt: now,
-                replacementEpoch: incoming.replacementEpoch,
-                revision: nextStreamLeaseRevision(existing),
-              }
-            : {
-                ...incoming,
-                phase: 'reserved',
-                targetOwnerKey: incoming.messageId,
-                postCommit: structuredClone(postCommit),
-                admissionSequence,
-                revision: 0,
-                controlRevision: 0,
-              },
-        )
-        await putStreamLeaseByteOwner(tx, admittedTargetLease, existing)
+        admissionExistingLease = existing
       }
       if (options?.streamFence) {
         const { streamId, fence } = options.streamFence
@@ -1359,7 +1301,7 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
             }
             assertScope({ kind: 'children', chatId, parentId: clone.parentId })
             const reservedTarget =
-              admittedTargetLease?.messageId === clone.id ? admittedTargetLease : undefined
+              streamAdmission?.messageId === clone.id ? streamAdmission : undefined
             const transition = compileCurrentMessageTransition(clone, {
               updatedAt: now,
               timestamp: creationTimestamp === 'preserve' ? 'exact' : 'transaction-allocated',
@@ -2135,10 +2077,50 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
           }
           return structuredClone(ownedStreamLease)
         },
-        validateGenerationPromptPathClaim: (chatId, claim) =>
-          validateGenerationPromptPathClaim(tx, chatId, claim),
-        captureGenerationPlanningSnapshot: (chatId, expected, planningChat) =>
-          captureGenerationPlanningSnapshot(tx, chatId, expected, planningChat),
+        resolveGenerationPromptPath: (chatId, proof) =>
+          resolveGenerationPromptPath(tx, chatId, proof),
+        captureGenerationPlanningSnapshot: (chatId, intent, planningChat) =>
+          captureGenerationPlanningSnapshot(tx, chatId, intent, planningChat),
+        setStreamAdmissionPostCommit: (postCommit) => {
+          const incoming = options?.streamAdmission
+          if (!incoming || admissionSequence === undefined) {
+            throw new Error('StreamAdmissionPostCommitWithoutAdmission')
+          }
+          if (postCommit.final !== undefined) {
+            throw new Error(`StreamPostCommitAdmissionInvalid:${incoming.streamId}`)
+          }
+          if (
+            admissionPostCommit &&
+            stableStringify(admissionPostCommit) !== stableStringify(postCommit)
+          ) {
+            throw new Error(`StreamPostCommitAdmissionChanged:${incoming.streamId}`)
+          }
+          if (
+            admissionExistingLease &&
+            stableStringify(admissionExistingLease.postCommit) !== stableStringify(postCommit)
+          ) {
+            throw new Error(`StreamPostCommitAdmissionMismatch:${incoming.streamId}`)
+          }
+          admissionPostCommit = structuredClone(postCommit)
+          admittedTargetLease = requireStreamLeaseRow(
+            admissionExistingLease
+              ? {
+                  ...admissionExistingLease,
+                  heartbeatAt: now,
+                  replacementEpoch: incoming.replacementEpoch,
+                  revision: nextStreamLeaseRevision(admissionExistingLease),
+                }
+              : {
+                  ...incoming,
+                  phase: 'reserved',
+                  targetOwnerKey: incoming.messageId,
+                  postCommit: admissionPostCommit,
+                  admissionSequence,
+                  revision: 0,
+                  controlRevision: 0,
+                },
+          )
+        },
         requestStorageMaintenance: (task) => {
           if (!options?.storageMaintenanceTasks?.includes(task)) {
             throw new Error(`StorageMaintenanceTaskUndeclared:${task}`)
@@ -2151,6 +2133,12 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
         },
       }
       const mutationValue = await fn(ctx, mutationOperations)
+      if (options?.streamAdmission) {
+        if (!admittedTargetLease || !admissionPostCommit) {
+          throw new Error(`StreamPostCommitAdmissionMissing:${options.streamAdmission.streamId}`)
+        }
+        await putStreamLeaseByteOwner(tx, admittedTargetLease, admissionExistingLease)
+      }
       const transactionExtensionResult = transactionExtension
         ? await transactionExtension.commit(tx, mutationValue)
         : (undefined as ExtensionResult)
@@ -2539,18 +2527,7 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
 
         const changed = stableStringify(current) !== stableStringify(patched)
         if (changed) {
-          const configurationLinkTransition =
-            options?.configurationLinkTransition?.chatId === chatId
-              ? options.configurationLinkTransition
-              : undefined
-          if (
-            configurationLinkTransition &&
-            stableStringify(chatConfigurationTargetResourceNames(patched)) !==
-              stableStringify(configurationLinkTransition.nextResourceNames)
-          ) {
-            throw new GenerationPlanningSeedChangedError(chatId)
-          }
-          if (configurationLinkTransition) {
+          if (options?.maintainConfigurationLinksForChatId === chatId) {
             chatMutation.replaceLinked(chatId, () => patched)
           } else {
             chatMutation.replacePreserving(chatId, () => patched)

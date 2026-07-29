@@ -1,14 +1,19 @@
+import type { ActiveBranchIntentTarget } from '../core/active-branch-spine'
 import type { ChatSettingsPatch } from '../core/chat-metadata'
 import {
   failedGenerationCapability,
   type GenerationCapability,
   type GenerationCapabilityOwner,
   pendingGenerationCapability,
-  unavailableGenerationCapability,
 } from '../core/interaction-capability'
-import type { PreparedMessagePlacementFrame } from '../core/messages'
-import { UNKNOWN_INBOUND_REASONING_VISIBILITY } from '../core/reasoning'
-import type { AttachmentRef, ChatId, ContentItem, Message, MessageId } from '../core/types'
+import type {
+  AttachmentRef,
+  ChatId,
+  ChatSettings,
+  ContentItem,
+  MessageId,
+  PresetId,
+} from '../core/types'
 import { newId } from '../lib/ulid'
 import {
   type AttemptTargetAdmissionClaim,
@@ -21,7 +26,6 @@ import {
 } from './configuration-controller'
 import { captureConnectionRuntimeKeyPreferenceFromProof } from './connection-runtime'
 import {
-  type ClaimedConversationDestination,
   type ConversationCommittedEffect,
   type ConversationPromptPathFrame,
   type ConversationRouteDelivery,
@@ -32,25 +36,18 @@ import {
 } from './conversation-controller'
 import type { ConversationRouteOwner } from './conversation-route-owner'
 import {
-  attemptAdmissionFrameForProbe,
   type GenerationAdmissionCapabilityProbe,
   type GenerationCapabilityFrame,
-  generationAttemptTargetCapability,
   generationCapabilityController,
-  generationConfigurationCapability,
   generationConfigurationRequirement,
-  type SelectedSendAdmissionClaim,
 } from './generation-capability-controller'
-import {
-  createGenerationPromptMaterialLease,
-  type GenerationPromptMaterialLease,
-} from './generation-prompt-material'
+import type { GenerationPromptMaterialLease } from './generation-prompt-material'
 import { withSharedGenerationLifetime } from './locks'
 import type { CommittedConversationTransition, WorkspaceFence } from './repository'
 import type {
   GenerationPromptPathProof,
   GenerationPromptPathRequirement,
-  PrepareAttemptConfigurationClaim,
+  PrepareAttemptPlacementIntent,
 } from './workspace-protocol'
 import {
   getWorkspaceRuntimeFence,
@@ -74,7 +71,7 @@ export type GenerationIntent =
   | (GenerationIntentBase & {
       readonly kind: 'send'
       readonly chatId: ChatId
-      readonly expectedLeafId: MessageId | null
+      readonly target: ActiveBranchIntentTarget
       readonly content: readonly ContentItem[]
       readonly attachmentRefs?: readonly AttachmentRef[]
     })
@@ -105,13 +102,6 @@ export type GenerationIntent =
 export type NewChatGenerationIntent = Extract<GenerationIntent, { readonly kind: 'new-chat-send' }>
 export type ExistingChatGenerationIntent = Exclude<GenerationIntent, NewChatGenerationIntent>
 
-export interface SelectedSendGenerationIntent extends GenerationIntentBase {
-  readonly kind: 'selected-send'
-  readonly chatId: ChatId
-  readonly content: readonly ContentItem[]
-  readonly attachmentRefs?: readonly AttachmentRef[]
-}
-
 export type GenerationAdmissionRequest =
   | {
       readonly intent: NewChatGenerationIntent
@@ -119,17 +109,9 @@ export type GenerationAdmissionRequest =
     }
   | {
       readonly intent: ExistingChatGenerationIntent
-      readonly steering?: SessionSelectingConversationOperationClaim
-      readonly selectedAdmission?: SelectedSendAdmissionClaim
-      readonly selectedPromptPath?: ConversationPromptPathFrame
     }
 
-export type SettlingGenerationAdmissionRequest =
-  | GenerationAdmissionRequest
-  | {
-      readonly intent: SelectedSendGenerationIntent
-      readonly admission?: SelectedSendAdmissionClaim
-    }
+export type SettlingGenerationAdmissionRequest = GenerationAdmissionRequest
 
 interface GenerationAdmissionClaimBase {
   readonly id: string
@@ -156,22 +138,22 @@ export type GenerationAdmissionClaim =
 
 export interface GenerationAdmissionPayload {
   readonly configuration:
-    | (PrepareAttemptConfigurationClaim & {
+    | {
         readonly kind: 'new-chat'
-      })
-    | (PrepareAttemptConfigurationClaim & {
+        readonly settings: ChatSettings
+        readonly presetId: PresetId | null
+        readonly preferredDispatchKeyId: string | null
+      }
+    | {
         readonly kind: 'chat'
         readonly chatId: ChatId
-        readonly configurationVersion: number
-        readonly configurationLinkTransition: {
-          readonly expectedResourceNames: readonly string[]
-          readonly nextResourceNames: readonly string[]
-        }
-      })
+        readonly preferredDispatchKeyId: string | null
+        readonly settingsPatch?: ChatSettingsPatch
+      }
   readonly promptPath: GenerationPromptPathProof
   readonly promptMaterial: GenerationPromptMaterialLease
   readonly intent: GenerationIntent
-  readonly placement: PreparedMessagePlacementFrame
+  readonly placement: PrepareAttemptPlacementIntent
 }
 
 export type {
@@ -201,7 +183,7 @@ export class GenerationAdmissionError extends Error {
 interface GenerationAdmissionState {
   status: 'claimed' | 'accepted' | 'cancelled' | 'failed'
   payload: GenerationAdmissionPayload | null
-  targetClaim: AttemptTargetAdmissionClaim | null
+  attemptTargetClaim: AttemptTargetAdmissionClaim | null
 }
 
 export interface GenerationAdmissionController {
@@ -209,6 +191,7 @@ export interface GenerationAdmissionController {
   claimWhenCapabilitySettles(
     request: SettlingGenerationAdmissionRequest,
     signal: AbortSignal,
+    observer?: GenerationPreparationObserver,
   ): Promise<GenerationAdmissionClaim>
   captureCapabilityFrame(
     attemptAdmission?: AttemptTargetAdmissionFrame | null,
@@ -231,9 +214,20 @@ export interface GenerationAdmissionController {
   cancel(claim: GenerationAdmissionClaim): void
 }
 
+export type GenerationPreparationPhase =
+  | 'workspace-requested'
+  | 'workspace-admitted'
+  | 'ownership-requested'
+  | 'repository-requested'
+  | 'local-applied'
+
+export interface GenerationPreparationObserver {
+  pending(owner: GenerationCapabilityOwner): void
+  phase(phase: GenerationPreparationPhase): void
+}
+
 class TabGenerationAdmissionController implements GenerationAdmissionController {
   private readonly states = new WeakMap<GenerationAdmissionClaim, GenerationAdmissionState>()
-  private readonly adoptedSteeringClaims = new WeakSet<SessionSelectingConversationOperationClaim>()
 
   claim(request: GenerationAdmissionRequest): GenerationAdmissionClaim {
     return this.claimCaptured(request, snapshotGenerationIntent(request.intent))
@@ -242,9 +236,10 @@ class TabGenerationAdmissionController implements GenerationAdmissionController 
   claimWhenCapabilitySettles(
     request: SettlingGenerationAdmissionRequest,
     signal: AbortSignal,
+    observer?: GenerationPreparationObserver,
   ): Promise<GenerationAdmissionClaim> {
     const captured = captureSettlingAdmissionRequest(request)
-    return this.settleCapturedAdmission(captured, signal)
+    return this.settleCapturedAdmission(captured, signal, observer)
   }
 
   private claimCaptured(
@@ -253,58 +248,26 @@ class TabGenerationAdmissionController implements GenerationAdmissionController 
   ): GenerationAdmissionClaim {
     const intent = capturedIntent
     const routeOwner = 'routeOwner' in request ? request.routeOwner : null
-    const suppliedSteering = 'steering' in request ? (request.steering ?? null) : null
-    const selectedAdmission =
-      'selectedAdmission' in request ? (request.selectedAdmission ?? null) : null
-    const selectedPromptPath =
-      'selectedPromptPath' in request ? request.selectedPromptPath : undefined
-    const selectedConfigurationResolution = selectedAdmission
-      ? configurationController.resolveSelectedGenerationConfiguration(
-          selectedAdmission.configuration,
-        )
-      : undefined
     const context = generationCapabilityController.captureContext(
-      attemptAdmissionFrameForProbe(intent),
-      selectedPromptPath,
-      selectedConfigurationResolution,
+      attemptAdmissionForIntent(capturedIntent),
     )
-    if (!context.workspace || !context.configuration || !context.promptPath) {
+    if (!context.workspace) {
       throw generationAdmissionErrorFor(context.frame.capability(intent))
     }
     const workspace = context.workspace
-    const configurationResolution =
-      selectedConfigurationResolution ??
-      context.configuration.resolve(generationConfigurationRequirement(capturedIntent))
-    if (configurationResolution.capability !== 'ready') {
-      throw generationAdmissionErrorFor(generationConfigurationCapability(configurationResolution))
-    }
     const chatId = capturedIntent.kind === 'new-chat-send' ? newId() : capturedIntent.chatId
     const configuration = captureGenerationConfiguration(
-      configurationResolution,
+      context.configuration?.resolve(generationConfigurationRequirement(capturedIntent)),
       capturedIntent,
       chatId,
     )
-    const attemptCapability = generationAttemptTargetCapability(
-      capturedIntent,
-      workspace,
-      context.attemptAdmission,
-    )
-    if (attemptCapability.state !== 'ready') {
-      throw generationAdmissionErrorFor(attemptCapability)
-    }
-    if (suppliedSteering) {
-      assertSelectedSendSteering(suppliedSteering, capturedIntent, workspace, selectedAdmission)
-      if (this.adoptedSteeringClaims.has(suppliedSteering)) {
-        throw new Error('GenerationAdmissionSteeringAlreadyAdopted')
-      }
-    }
     const capturedPrompt = captureGenerationPromptPath(
       capturedIntent,
       chatId,
       workspace,
       context.promptPath,
     )
-    let targetClaim: AttemptTargetAdmissionClaim | null = null
+    let attemptTargetClaim: AttemptTargetAdmissionClaim | undefined
     try {
       const claimId = newId()
       const streamId = newId()
@@ -316,26 +279,29 @@ class TabGenerationAdmissionController implements GenerationAdmissionController 
         capturedIntent.kind === 'edit-resend'
           ? newId()
           : undefined
-      const placement = prepareGenerationMessagePlacementFrame({
+      const placement = prepareGenerationMessagePlacementIntent({
         intent: capturedIntent,
         chatId,
         assistantMessageId,
         userMessageId,
-        model: configuration.settings.model,
-        promptPath: capturedPrompt.proof,
         createdAt: Date.now(),
       })
-      if (capturedIntent.kind === 'continue') {
-        const claimedTarget = attemptController.claimTarget(
+      const trackedAttemptFrame = context.attemptAdmission
+      if (
+        capturedIntent.kind === 'continue' &&
+        trackedAttemptFrame?.workspaceId === workspace.workspaceId &&
+        trackedAttemptFrame.replacementEpoch === workspace.replacementEpoch &&
+        trackedAttemptFrame.chatId === chatId
+      ) {
+        attemptTargetClaim = attemptController.claimTarget(
           workspace,
           chatId,
           assistantMessageId,
-          claimId,
+          `generation:${claimId}`,
         )
-        if (!claimedTarget) {
+        if (!attemptTargetClaim) {
           throw generationAdmissionErrorFor(pendingGenerationCapability('attempt-target'))
         }
-        targetClaim = claimedTarget
       }
       const base = {
         id: claimId,
@@ -371,18 +337,16 @@ class TabGenerationAdmissionController implements GenerationAdmissionController 
             : Object.freeze({
                 ...base,
                 strategy: capturedIntent.kind,
-                steering:
-                  suppliedSteering ??
-                  conversationController.claimOperation({
-                    chatId,
-                    workspaceFence: workspace,
-                    steering: 'select-result',
-                    selectionDelivery: 'session',
-                  }),
+                steering: conversationController.claimOperation({
+                  chatId,
+                  workspaceFence: workspace,
+                  steering: 'select-result',
+                  selectionDelivery: 'session',
+                }),
               })
-      if (suppliedSteering) this.adoptedSteeringClaims.add(suppliedSteering)
       this.states.set(claim, {
         status: 'claimed',
+        attemptTargetClaim: attemptTargetClaim ?? null,
         payload: Object.freeze({
           configuration,
           promptPath: capturedPrompt.proof,
@@ -390,97 +354,45 @@ class TabGenerationAdmissionController implements GenerationAdmissionController 
           intent: capturedIntent,
           placement,
         }),
-        targetClaim,
       })
-      if (
-        claim.strategy !== 'continue' &&
-        claim.strategy !== 'new-chat-send' &&
-        capturedIntent.kind !== 'continue' &&
-        capturedIntent.kind !== 'new-chat-send'
-      ) {
-        const messages = placement.messages
-        const destination = conversationController.resolveOperationDestination(claim.steering)
-        if (messages.length > 0 && destination.kind === 'ready') {
-          conversationController.presentGenerationIntent(claim.steering, {
-            baseLeafId: destination.expectedLeafId,
-            messages,
-            ...(capturedIntent.kind === 'regenerate'
-              ? { replacesFromMessageId: capturedIntent.targetAssistantId }
-              : capturedIntent.kind === 'edit-resend'
-                ? { replacesFromMessageId: capturedIntent.targetUserId }
-                : {}),
-          })
-        }
-      }
-      if (selectedAdmission) {
-        configurationController.cancelSelectedGenerationConfiguration(
-          selectedAdmission.configuration,
-        )
-      }
       return claim
     } catch (error) {
-      if (targetClaim) attemptController.releaseTargetClaim(targetClaim)
+      if (attemptTargetClaim) attemptController.releaseTargetClaim(attemptTargetClaim)
       capturedPrompt.material.release()
       throw error
     }
   }
 
   private async settleCapturedAdmission(
-    captured: CapturedSettlingAdmissionRequest,
+    captured: GenerationAdmissionRequest,
     signal: AbortSignal,
+    observer?: GenerationPreparationObserver,
   ): Promise<GenerationAdmissionClaim> {
-    let steeringTransferred = false
     let releasePublication: () => void = () => undefined
     const releaseCurrentPublication = () => {
       const release = releasePublication
       releasePublication = () => undefined
       release()
     }
-    const selectedSteering =
-      captured.kind === 'selected-send' ? captured.admission.destination.steering : undefined
     try {
       for (;;) {
         throwIfGenerationAdmissionAborted(signal)
-        const ready = resolveCapturedSettlingAdmission(captured)
-        if (ready.kind === 'pending-selection') {
-          releaseCurrentPublication()
-          releasePublication = await waitForGenerationAdmissionPublication(
-            'prompt-path',
-            ready.chatId,
-            signal,
-            selectedSteering,
-            () => resolveCapturedSettlingAdmission(captured).kind === 'pending-selection',
-          )
-          continue
-        }
-        if (ready.kind === 'terminal-selection') {
-          throw generationAdmissionErrorFor(ready.capability)
-        }
-        const capability = generationCapabilityForSettlingRequest(ready.request)
+        const capability = generationCapabilityForSettlingRequest(captured)
         if (capability.state === 'ready') {
           try {
-            const claim = this.claimCaptured(ready.request, ready.request.intent)
-            steeringTransferred = true
+            const claim = this.claimCaptured(captured, captured.intent)
             releaseCurrentPublication()
             return claim
           } catch (error) {
             if (error instanceof GenerationAdmissionError && error.capability.state === 'pending') {
               const pendingOwner = error.capability.owner
+              observeGenerationAdmissionPending(observer, pendingOwner)
               releaseCurrentPublication()
               releasePublication = await waitForGenerationAdmissionPublication(
                 pendingOwner,
-                ready.request.intent,
+                captured.intent,
                 signal,
-                selectedSteering,
-                () => {
-                  const current = resolveCapturedSettlingAdmission(captured)
-                  if (current.kind !== 'ready') return false
-                  const currentCapability = generationCapabilityForSettlingRequest(current.request)
-                  return (
-                    currentCapability.state === 'pending' &&
-                    currentCapability.owner === pendingOwner
-                  )
-                },
+                () => generationCapabilityForSettlingRequest(captured).state === 'pending',
               )
               continue
             }
@@ -488,16 +400,14 @@ class TabGenerationAdmissionController implements GenerationAdmissionController 
           }
         }
         if (capability.state !== 'pending') throw generationAdmissionErrorFor(capability)
+        observeGenerationAdmissionPending(observer, capability.owner)
         releaseCurrentPublication()
         releasePublication = await waitForGenerationAdmissionPublication(
           capability.owner,
-          ready.request.intent,
+          captured.intent,
           signal,
-          selectedSteering,
           () => {
-            const current = resolveCapturedSettlingAdmission(captured)
-            if (current.kind !== 'ready') return false
-            const currentCapability = generationCapabilityForSettlingRequest(current.request)
+            const currentCapability = generationCapabilityForSettlingRequest(captured)
             return (
               currentCapability.state === 'pending' && currentCapability.owner === capability.owner
             )
@@ -506,9 +416,6 @@ class TabGenerationAdmissionController implements GenerationAdmissionController 
       }
     } finally {
       releaseCurrentPublication()
-      if (!steeringTransferred && captured.kind === 'selected-send') {
-        generationCapabilityController.cancelSelectedSend(captured.admission)
-      }
     }
   }
 
@@ -519,7 +426,9 @@ class TabGenerationAdmissionController implements GenerationAdmissionController 
   }
 
   capability(probe: GenerationAdmissionCapabilityProbe | null): GenerationCapability {
-    return generationCapabilityController.capability(probe)
+    return generationCapabilityController
+      .captureFrame(probe ? attemptAdmissionForIntent(probe) : null)
+      .capability(probe)
   }
 
   takePayload(claim: GenerationAdmissionClaim): GenerationAdmissionPayload {
@@ -569,9 +478,9 @@ class TabGenerationAdmissionController implements GenerationAdmissionController 
         revealTargetMessageId: claim.assistantMessageId,
         committedEffect: input.committedEffect,
       })
-      releaseAdmissionTargetClaim(state)
       state.status = 'accepted'
       state.payload = null
+      this.releaseAttemptTarget(state)
       return undefined
     }
     if (!input.selection) throw new Error('GenerationAdmissionSelectionMissing')
@@ -592,17 +501,17 @@ class TabGenerationAdmissionController implements GenerationAdmissionController 
             conversationController.acceptLocalResult(claim.steering, result)
             return undefined
           })()
-    releaseAdmissionTargetClaim(state)
     state.status = 'accepted'
     state.payload = null
+    this.releaseAttemptTarget(state)
     return routeDelivery
   }
 
   fail(claim: GenerationAdmissionClaim): void {
     const state = this.states.get(claim)
     if (state?.status !== 'claimed') return
-    releaseAdmissionTargetClaim(state)
     state.payload?.promptMaterial.release()
+    this.releaseAttemptTarget(state)
     state.status = 'failed'
     state.payload = null
     conversationController.cancelOperation(claim.steering)
@@ -611,8 +520,8 @@ class TabGenerationAdmissionController implements GenerationAdmissionController 
   cancel(claim: GenerationAdmissionClaim): void {
     const state = this.states.get(claim)
     if (state?.status !== 'claimed') return
-    releaseAdmissionTargetClaim(state)
     state.payload?.promptMaterial.release()
+    this.releaseAttemptTarget(state)
     state.status = 'cancelled'
     state.payload = null
     conversationController.cancelOperation(claim.steering)
@@ -628,41 +537,45 @@ class TabGenerationAdmissionController implements GenerationAdmissionController 
     }
     return state
   }
+
+  private releaseAttemptTarget(state: GenerationAdmissionState): void {
+    const claim = state.attemptTargetClaim
+    state.attemptTargetClaim = null
+    if (claim) attemptController.releaseTargetClaim(claim)
+  }
 }
 
-type ReadyActiveGenerationConfigurationResolution = Extract<
-  ActiveGenerationConfigurationResolution,
-  { readonly capability: 'ready' }
->
-
 function captureGenerationConfiguration(
-  resolution: ReadyActiveGenerationConfigurationResolution,
+  resolution: ActiveGenerationConfigurationResolution | undefined,
   intent: GenerationIntent,
   chatId: ChatId,
 ): GenerationAdmissionPayload['configuration'] {
-  const preferredDispatchKeyId = captureConnectionRuntimeKeyPreferenceFromProof(
-    resolution.claim.profile,
-    chatId,
-  ).ref
-  const claim = Object.freeze({
-    ...resolution.claim,
-    preferredDispatchKeyId,
-  }) satisfies PrepareAttemptConfigurationClaim
   if (intent.kind === 'new-chat-send') {
-    if (resolution.kind !== 'new-chat') {
+    if (resolution?.capability !== 'ready' || resolution.kind !== 'new-chat') {
       throw generationAdmissionErrorFor(pendingGenerationCapability('configuration'))
     }
-    return Object.freeze({ kind: 'new-chat' as const, ...claim })
+    const preferredDispatchKeyId = captureConnectionRuntimeKeyPreferenceFromProof(
+      resolution.claim.profile,
+      chatId,
+    ).ref
+    return Object.freeze({
+      kind: 'new-chat' as const,
+      settings: resolution.claim.settings,
+      presetId: resolution.claim.presetId,
+      preferredDispatchKeyId,
+    })
   }
-  if (resolution.kind !== 'chat' || resolution.chatId !== chatId) {
-    throw generationAdmissionErrorFor(pendingGenerationCapability('configuration'))
-  }
+  const preferredDispatchKeyId =
+    resolution?.capability === 'ready' && resolution.kind === 'chat' && resolution.chatId === chatId
+      ? captureConnectionRuntimeKeyPreferenceFromProof(resolution.claim.profile, chatId).ref
+      : null
   return Object.freeze({
     kind: 'chat' as const,
     chatId,
-    configurationVersion: resolution.configurationVersion,
-    configurationLinkTransition: resolution.configurationLinkTransition,
-    ...claim,
+    preferredDispatchKeyId,
+    ...(intent.kind === 'regenerate' && intent.settingsPatch
+      ? { settingsPatch: intent.settingsPatch }
+      : {}),
   })
 }
 
@@ -670,146 +583,71 @@ function captureGenerationPromptPath(
   intent: GenerationIntent,
   chatId: ChatId,
   workspace: WorkspaceFence,
-  frame: ConversationPromptPathFrame,
+  frame: ConversationPromptPathFrame | null,
 ): {
   readonly proof: GenerationPromptPathProof
   readonly material: GenerationPromptMaterialLease
 } {
   const requirement = generationPromptPathRequirement(intent)
-  if (requirement.surface === 'new-chat') {
-    return Object.freeze({
-      proof: Object.freeze({
-        requirement,
-        claim: Object.freeze({
-          chatId,
-          structuralVersion: 0,
-          leafId: null,
-          headers: Object.freeze([]),
-          placementSlot: Object.freeze({
-            parentId: null,
-            slotVersion: 0,
-            liveCount: 0,
-            nextSiblingIndex: 0,
-          }),
-          targetTurn: null,
-        }),
-      }),
-      material: createGenerationPromptMaterialLease(workspace, chatId, []),
-    })
-  }
-  const capture = frame.capture(requirement)
-  if (!capture) {
-    const capability = frame.capability(intent)
-    throw generationAdmissionErrorFor(
-      capability === 'error'
-        ? failedGenerationCapability('prompt-path')
-        : capability === 'unavailable'
-          ? unavailableGenerationCapability('target-unavailable')
-          : pendingGenerationCapability('prompt-path'),
-    )
+  if (requirement.surface === 'chat' && frame) {
+    const capture = frame.capture(requirement)
+    if (capture) {
+      return Object.freeze({
+        proof: Object.freeze({ requirement, pathHint: capture.pathHint }),
+        material: capture.material,
+      })
+    }
   }
   return Object.freeze({
-    proof: Object.freeze({ requirement, claim: capture.claim }),
-    material: capture.material,
+    proof: Object.freeze({
+      requirement,
+      pathHint: Object.freeze({
+        chatId,
+        structuralVersion: 0,
+        leafId:
+          requirement.target.kind === 'include'
+            ? requirement.target.messageId
+            : requirement.target.kind === 'fixed'
+              ? requirement.target.messageId
+              : null,
+        headers: Object.freeze([]),
+        placementSlot: null,
+        targetTurn: null,
+      }),
+    }),
+    material: conversationController.acquirePromptMaterial(workspace, chatId, []),
   })
 }
 
-function releaseAdmissionTargetClaim(state: GenerationAdmissionState): void {
-  if (!state.targetClaim) return
-  attemptController.releaseTargetClaim(state.targetClaim)
-  state.targetClaim = null
-}
-
-function prepareGenerationMessagePlacementFrame(input: {
+function prepareGenerationMessagePlacementIntent(input: {
   readonly intent: GenerationIntent
   readonly chatId: ChatId
   readonly assistantMessageId: MessageId
   readonly userMessageId: MessageId | undefined
-  readonly model: string
   readonly createdAt: number
-  readonly promptPath: GenerationPromptPathProof
-}): PreparedMessagePlacementFrame {
-  const { claim } = input.promptPath
-  if (input.intent.kind === 'continue') {
-    return Object.freeze({
-      chatId: input.chatId,
-      structuralVersion: claim.structuralVersion,
-      createdAt: input.createdAt,
-      slot: null,
-      messages: Object.freeze([]),
-    })
-  }
-  if (!input.model) throw new Error(`GenerationModelNotSelected:${input.chatId}`)
-  const slot = claim.placementSlot
-  if (!slot) throw new Error(`GenerationPlacementSlotMissing:${input.chatId}`)
-  const turnId = input.intent.kind === 'reply' ? claim.targetTurn?.turnId : newId()
-  if (!turnId) throw new Error(`GenerationPlacementTargetTurnMissing:${input.chatId}`)
-  const user =
-    input.userMessageId === undefined
-      ? undefined
-      : Object.freeze({
-          id: input.userMessageId,
-          chatId: input.chatId,
-          parentId: claim.leafId,
-          siblingIndex: slot.nextSiblingIndex,
-          turnId,
-          turnIndex: 0,
-          createdAt: input.createdAt,
-          role: 'user' as const,
-          origin: 'user' as const,
-          content: structuredClone(
-            input.intent.kind === 'new-chat-send' ||
-              input.intent.kind === 'send' ||
-              input.intent.kind === 'edit-resend'
-              ? [...input.intent.content]
-              : [],
-          ),
-          ...(input.intent.kind === 'new-chat-send' ||
-          input.intent.kind === 'send' ||
-          input.intent.kind === 'edit-resend'
-            ? input.intent.attachmentRefs
-              ? { attachmentRefs: structuredClone([...input.intent.attachmentRefs]) }
-              : { attachmentRefs: [] }
-            : {}),
-          nodeVersion: 0,
-          deleted: false,
-        } satisfies Message)
-  const assistant = Object.freeze({
-    id: input.assistantMessageId,
-    chatId: input.chatId,
-    parentId: user?.id ?? claim.leafId,
-    siblingIndex: user ? 0 : slot.nextSiblingIndex,
-    turnId,
-    turnIndex:
-      user !== undefined
-        ? 1
-        : input.intent.kind === 'reply'
-          ? (claim.targetTurn?.turnIndex ?? -1) + 1
-          : 0,
-    createdAt: input.createdAt,
-    role: 'assistant' as const,
-    origin: 'generated' as const,
-    content: structuredClone([...(input.intent.prefillContent ?? [])]),
-    attachmentRefs: [],
-    generation: {
-      model: input.model,
-      requestedModel: input.model,
-      status: 'preparing' as const,
-      integrity: 'clean' as const,
-      costSource: 'stream' as const,
-      startedAt: input.createdAt,
-      reasoningCarryForward: 'none' as const,
-      reasoningVisibility: UNKNOWN_INBOUND_REASONING_VISIBILITY,
-    },
-    nodeVersion: 0,
-    deleted: false,
-  } satisfies Message)
+}): PrepareAttemptPlacementIntent {
+  const contentIntent =
+    input.intent.kind === 'new-chat-send' ||
+    input.intent.kind === 'send' ||
+    input.intent.kind === 'edit-resend'
+      ? input.intent
+      : null
   return Object.freeze({
     chatId: input.chatId,
-    structuralVersion: claim.structuralVersion,
     createdAt: input.createdAt,
-    slot: Object.freeze({ ...slot }),
-    messages: Object.freeze([...(user ? [user] : []), assistant]),
+    assistantMessageId: input.assistantMessageId,
+    ...(input.userMessageId && contentIntent
+      ? {
+          user: Object.freeze({
+            messageId: input.userMessageId,
+            content: cloneFrozenGenerationPayload([...contentIntent.content]),
+            attachmentRefs: cloneFrozenGenerationPayload([...(contentIntent.attachmentRefs ?? [])]),
+          }),
+        }
+      : {}),
+    prefillContent: cloneFrozenGenerationPayload([
+      ...('prefillContent' in input.intent ? (input.intent.prefillContent ?? []) : []),
+    ]),
   })
 }
 
@@ -865,15 +703,8 @@ export function generationPromptPathRequirement(
         kind: 'send',
         surface: 'chat',
         chatId: probe.chatId,
-        target:
-          probe.expectedLeafId === null
-            ? Object.freeze({ kind: 'root' as const })
-            : Object.freeze({
-                kind: 'include' as const,
-                messageId: probe.expectedLeafId,
-                role: 'any' as const,
-              }),
-        childSlot: 'empty',
+        target: Object.freeze(probe.target),
+        childSlot: 'append',
       })
     case 'reply':
       return Object.freeze({
@@ -885,7 +716,7 @@ export function generationPromptPathRequirement(
           messageId: probe.parentUserId,
           role: 'user',
         }),
-        childSlot: 'empty',
+        childSlot: 'append',
       })
     case 'regenerate':
       return Object.freeze({
@@ -966,156 +797,35 @@ function snapshotGenerationIntent(intent: GenerationIntent): GenerationIntent {
   }
 }
 
-type CapturedSettlingAdmissionRequest =
-  | {
-      readonly kind: 'admission'
-      readonly request: GenerationAdmissionRequest
-    }
-  | {
-      readonly kind: 'selected-send'
-      readonly intent: SelectedSendGenerationIntent
-      readonly admission: SelectedSendAdmissionClaim
-    }
-
-type ResolvedSettlingAdmission =
-  | { readonly kind: 'pending-selection'; readonly chatId: ChatId }
-  | { readonly kind: 'terminal-selection'; readonly capability: GenerationCapability }
-  | { readonly kind: 'ready'; readonly request: GenerationAdmissionRequest }
-
 function captureSettlingAdmissionRequest(
   request: SettlingGenerationAdmissionRequest,
-): CapturedSettlingAdmissionRequest {
-  if (request.intent.kind !== 'selected-send') {
-    return Object.freeze({
-      kind: 'admission',
-      request: Object.freeze({
-        ...request,
-        intent: snapshotGenerationIntent(request.intent),
-      }) as GenerationAdmissionRequest,
-    })
-  }
-  const intent = snapshotSelectedSendGenerationIntent(request.intent)
-  const admission =
-    ('admission' in request ? request.admission : undefined) ??
-    generationCapabilityController.claimSelectedSend(intent.chatId)
-  if (admission.destination.steering.chatId !== intent.chatId) {
-    throw new Error('GenerationAdmissionSelectedDestinationMismatch')
-  }
-  return Object.freeze({ kind: 'selected-send', intent, admission })
-}
-
-function resolveCapturedSettlingAdmission(
-  captured: CapturedSettlingAdmissionRequest,
-): ResolvedSettlingAdmission {
-  if (captured.kind === 'admission') {
-    return Object.freeze({ kind: 'ready', request: captured.request })
-  }
-  const destination = conversationController.resolveSelectedPromptPath(
-    captured.admission.destination,
-  )
-  switch (destination.kind) {
-    case 'pending':
-      return Object.freeze({ kind: 'pending-selection', chatId: captured.intent.chatId })
-    case 'ready':
-      return Object.freeze({
-        kind: 'ready',
-        request: Object.freeze({
-          intent: Object.freeze({
-            ...captured.intent,
-            kind: 'send' as const,
-            expectedLeafId: destination.expectedLeafId,
-          }),
-          steering: captured.admission.destination.steering,
-          selectedAdmission: captured.admission,
-          selectedPromptPath: destination.promptPath,
-        }),
-      })
-    case 'unavailable':
-    case 'superseded':
-      return Object.freeze({
-        kind: 'terminal-selection',
-        capability: unavailableGenerationCapability('target-unavailable'),
-      })
-    case 'failed':
-      return Object.freeze({
-        kind: 'terminal-selection',
-        capability: failedGenerationCapability('prompt-path'),
-      })
-  }
-}
-
-function snapshotSelectedSendGenerationIntent(
-  intent: SelectedSendGenerationIntent,
-): SelectedSendGenerationIntent {
+): GenerationAdmissionRequest {
   return Object.freeze({
-    ...intent,
-    content: cloneFrozenGenerationPayload([...intent.content]),
-    ...(intent.prefillContent !== undefined
-      ? { prefillContent: cloneFrozenGenerationPayload([...intent.prefillContent]) }
-      : {}),
-    ...(intent.attachmentRefs !== undefined
-      ? { attachmentRefs: cloneFrozenGenerationPayload([...intent.attachmentRefs]) }
-      : {}),
-  })
-}
-
-function assertSelectedSendSteering(
-  steering: SessionSelectingConversationOperationClaim,
-  intent: GenerationIntent,
-  workspace: WorkspaceFence,
-  selectedAdmission: SelectedSendAdmissionClaim | null,
-): void {
-  if (
-    intent.kind !== 'send' ||
-    steering.chatId !== intent.chatId ||
-    steering.workspaceId !== workspace.workspaceId ||
-    steering.workspaceEpoch !== workspace.replacementEpoch
-  ) {
-    throw new Error('GenerationAdmissionSteeringMismatch')
-  }
-  if (selectedAdmission && selectedAdmission.destination.steering !== steering) {
-    throw new Error('GenerationAdmissionSelectedDestinationSteeringMismatch')
-  }
-  const destination = selectedAdmission
-    ? conversationController.resolveSelectedDestination(selectedAdmission.destination)
-    : conversationController.resolveOperationDestination(steering)
-  if (destination.kind !== 'ready' || destination.expectedLeafId !== intent.expectedLeafId) {
-    throw generationAdmissionErrorFor(
-      destination.kind === 'failed'
-        ? failedGenerationCapability('prompt-path')
-        : destination.kind === 'unavailable' || destination.kind === 'superseded'
-          ? unavailableGenerationCapability('target-unavailable')
-          : pendingGenerationCapability('prompt-path'),
-    )
-  }
+    ...request,
+    intent: snapshotGenerationIntent(request.intent),
+  }) as GenerationAdmissionRequest
 }
 
 function generationCapabilityForSettlingRequest(
   request: GenerationAdmissionRequest,
 ): GenerationCapability {
-  const selectedPromptPath =
-    'selectedPromptPath' in request ? request.selectedPromptPath : undefined
-  const selectedAdmission =
-    'selectedAdmission' in request ? (request.selectedAdmission ?? null) : null
-  const selectedConfigurationResolution = selectedAdmission
-    ? configurationController.resolveSelectedGenerationConfiguration(
-        selectedAdmission.configuration,
-      )
-    : undefined
   return generationCapabilityController
-    .captureContext(
-      attemptAdmissionFrameForProbe(request.intent),
-      selectedPromptPath,
-      selectedConfigurationResolution,
-    )
+    .captureContext(attemptAdmissionForIntent(request.intent))
     .frame.capability(request.intent)
+}
+
+function attemptAdmissionForIntent(
+  intent: GenerationAdmissionCapabilityProbe,
+): AttemptTargetAdmissionFrame | null {
+  return intent.kind === 'continue'
+    ? attemptController.getTargetAdmissionFrame(intent.chatId)
+    : null
 }
 
 async function waitForGenerationAdmissionPublication(
   owner: GenerationCapabilityOwner,
   probe: GenerationAdmissionCapabilityProbe | ChatId,
   signal: AbortSignal,
-  steering?: SessionSelectingConversationOperationClaim,
   blocked: () => boolean = () => true,
 ): Promise<() => void> {
   throwIfGenerationAdmissionAborted(signal)
@@ -1125,7 +835,6 @@ async function waitForGenerationAdmissionPublication(
     let settled = false
     let armed = false
     let observed: unknown
-    let observedDestination: ClaimedConversationDestination | null = null
     const finish = (error?: unknown) => {
       if (settled) return
       settled = true
@@ -1148,51 +857,37 @@ async function waitForGenerationAdmissionPublication(
         return
       }
       const currentIdentity = generationAdmissionPublicationIdentity(owner, probe)
-      const currentDestination = steering
-        ? conversationController.resolveOperationDestination(steering)
-        : null
       if (!armed) {
         armed = true
         observed = currentIdentity
-        observedDestination = currentDestination
         return
       }
-      if (
-        currentIdentity !== observed ||
-        (steering &&
-          !sameClaimedConversationDestination(
-            currentDestination as ClaimedConversationDestination,
-            observedDestination as ClaimedConversationDestination,
-          ))
-      ) {
-        finish()
-      }
+      if (currentIdentity !== observed) finish()
     }
     const unsubscribeCapability = subscribeGenerationAdmissionPublication(owner, probe, inspect)
-    const unsubscribeSteering =
-      steering && owner !== 'prompt-path'
-        ? conversationController.subscribe(inspect)
-        : () => undefined
     unsubscribe = () => {
       if (unsubscribed) return
       unsubscribed = true
       unsubscribeCapability()
-      unsubscribeSteering()
     }
     signal.addEventListener('abort', onAbort, { once: true })
-    inspect()
+    try {
+      inspect()
+    } catch (error) {
+      finish(error)
+    }
   })
 }
 
-function sameClaimedConversationDestination(
-  left: ClaimedConversationDestination,
-  right: ClaimedConversationDestination,
-): boolean {
-  return (
-    left.kind === right.kind &&
-    (left.kind !== 'ready' ||
-      (right.kind === 'ready' && left.expectedLeafId === right.expectedLeafId))
-  )
+function observeGenerationAdmissionPending(
+  observer: GenerationPreparationObserver | undefined,
+  owner: GenerationCapabilityOwner,
+): void {
+  try {
+    observer?.pending(owner)
+  } catch {
+    // Diagnostics cannot participate in admission.
+  }
 }
 
 function subscribeGenerationAdmissionPublication(

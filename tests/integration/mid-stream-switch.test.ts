@@ -149,7 +149,7 @@ async function send(
     {
       kind: 'send',
       chatId,
-      expectedLeafId: chat.lastUpdatedLeafId,
+      target: { kind: 'fixed', messageId: chat.lastUpdatedLeafId },
       content: [{ type: 'text', text: content }],
     },
     { profile: connection, keyMaterial, openStream },

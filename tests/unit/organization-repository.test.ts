@@ -1,6 +1,5 @@
 import Dexie from 'dexie'
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
-import { connectionDispatchProfileProof } from '../../src/core/connection-dispatch-proof'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import { createStreamAccumulator } from '../../src/core/stream-accumulator'
 import type {
@@ -39,7 +38,6 @@ import { buildChat, deleteArchivedChatsPermanently } from '../../src/store/chats
 import {
   buildConnectionProfile,
   configurationOwnerKey,
-  configurationRequestRevisionFor,
   configurationTargetKey,
 } from '../../src/store/configuration-domain-contract'
 import {
@@ -88,7 +86,6 @@ import {
 } from '../../src/store/workspace-runtime'
 import { expectAttachmentReferenceInvariants } from '../helpers/attachment-reference-invariants'
 import { putTestChat, putTestChats, updateChatForTest } from '../helpers/chats'
-import { testChatConfigurationLinkTransition } from '../helpers/configuration'
 import { putTestMessages, readTestMessageHeader } from '../helpers/message-storage'
 import { encodeTestStreamJournalEntries } from '../helpers/stream-journal'
 import { testStreamLeaseAdmission } from '../helpers/stream-leases'
@@ -388,16 +385,15 @@ async function prepareGeneration(
         input: {
           strategy: 'send',
           lease: admission,
-          configurationLinkTransition: testChatConfigurationLinkTransition(claimedChat),
           promptPath: {
             requirement: {
               kind: 'send',
               surface: 'chat',
               chatId,
-              target: { kind: 'root' },
-              childSlot: 'empty',
+              target: { kind: 'selection', selection: { kind: 'default' } },
+              childSlot: 'append',
             },
-            claim: {
+            pathHint: {
               chatId,
               structuralVersion: claimedChat.structuralVersion,
               leafId: null,
@@ -411,27 +407,19 @@ async function prepareGeneration(
               targetTurn: null,
             },
           },
-          configurationClaim: {
-            configurationVersion: claimedChat.configurationVersion ?? 0,
-            settings: claimedChat.settings,
-            presetId: claimedChat.presetId ?? null,
-            profile: connectionDispatchProfileProof(profile, MODEL_ID),
-            requestRevision: configurationRequestRevisionFor(profile, undefined),
-            dispatchKeyRevisions: [],
+          configurationIntent: {
             preferredDispatchKeyId: null,
-            workspaceSettingOverrides: [],
           },
           placement: {
             chatId,
-            structuralVersion: claimedChat.structuralVersion,
             createdAt: startedAt,
-            slot: {
-              parentId: null,
-              slotVersion: 0,
-              liveCount: 0,
-              nextSiblingIndex: 0,
+            assistantMessageId: assistant.id,
+            user: {
+              messageId: user.id,
+              content: user.content,
+              attachmentRefs: user.attachmentRefs ?? [],
             },
-            messages: [user, assistant],
+            prefillContent: assistant.content,
           },
         },
       })
@@ -459,7 +447,7 @@ async function finishPreparedGeneration(active: {
 }): Promise<void> {
   const finishedAt = active.lease.startedAt + 20
   const header = active.prepared.assistantHeader
-  const generation = active.prepared.assistant.generation
+  const generation = active.prepared.assistant?.generation
   if (!generation) throw new Error(`PreparedGenerationMissing:${active.lease.messageId}`)
   const outcome = await runWorkspaceAction('conversation-generation', async (permit) => {
     const owner = createWriterAttemptTerminalOwner({

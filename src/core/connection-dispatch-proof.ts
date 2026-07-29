@@ -130,41 +130,6 @@ function normalizedHeaders(headers: Readonly<Record<string, string>>): Record<st
   return Object.fromEntries([...normalized].sort(([left], [right]) => left.localeCompare(right)))
 }
 
-export function profileMatchesDispatchProof(
-  profile: ConnectionProfile | undefined,
-  proof: ConnectionDispatchProfileProof,
-): boolean {
-  const modelId = proof.capabilityOverride?.modelId ?? ''
-  return (
-    profile !== undefined &&
-    dispatchProofValuesEqual(connectionDispatchProfileProof(profile, modelId), proof)
-  )
-}
-
-function dispatchProofValuesEqual(left: unknown, right: unknown): boolean {
-  if (Object.is(left, right)) return true
-  if (typeof left !== 'object' || left === null || typeof right !== 'object' || right === null) {
-    return false
-  }
-  if (Array.isArray(left) || Array.isArray(right)) {
-    if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) return false
-    for (let index = 0; index < left.length; index += 1) {
-      if (!dispatchProofValuesEqual(left[index], right[index])) return false
-    }
-    return true
-  }
-  const leftKeys = Object.keys(left)
-  const rightKeys = Object.keys(right)
-  if (leftKeys.length !== rightKeys.length) return false
-  for (const [index, key] of leftKeys.entries()) {
-    if (key !== rightKeys[index]) return false
-    const leftValue = (left as Record<string, unknown>)[key]
-    const rightValue = (right as Record<string, unknown>)[key]
-    if (!dispatchProofValuesEqual(leftValue, rightValue)) return false
-  }
-  return true
-}
-
 function deepFreeze<T>(value: T): T {
   if (typeof value !== 'object' || value === null || Object.isFrozen(value)) return value
   for (const child of Object.values(value)) deepFreeze(child)

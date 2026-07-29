@@ -134,7 +134,7 @@ async function executeSend(input: ConfiguredSendInput) {
     {
       kind: 'send',
       chatId: input.chatId,
-      expectedLeafId: chat.lastUpdatedLeafId,
+      target: { kind: 'fixed', messageId: chat.lastUpdatedLeafId },
       content: input.content,
       ...(input.prefillContent ? { prefillContent: input.prefillContent } : {}),
     },
@@ -1003,7 +1003,7 @@ describe('send action routing', () => {
       {
         kind: 'send',
         chatId: chat.id,
-        expectedLeafId: null,
+        target: { kind: 'fixed', messageId: null },
         content: [{ type: 'text', text: 'hello' }],
       },
       {

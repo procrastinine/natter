@@ -84,6 +84,12 @@ test('a second send from a non-root leaf persists through Chromium compound-inde
   await expect(
     page.locator('[data-ui="message"][data-role="assistant"] [data-ui="message-body"]').nth(1),
   ).toHaveText('reply 2')
+  const latestAssistant = page.locator('[data-ui="message"][data-role="assistant"]').nth(1)
+  await expect(latestAssistant.getByRole('button', { name: 'Regenerate response' })).toBeEnabled()
+  const latestUser = page.locator('[data-ui="message"][data-role="user"]').nth(1)
+  await latestUser.getByRole('button', { name: 'Edit message' }).click()
+  await expect(latestUser.getByRole('button', { name: 'Save & Send' })).toBeEnabled()
+  await latestUser.getByRole('button', { name: 'Cancel', exact: true }).click()
 
   const chatId = await firstChatId(page)
   const rows = await readMessages(page, chatId)
@@ -116,6 +122,9 @@ test('delayed stream start keeps the sent turn visible before first bytes arrive
   const user = page.locator('[data-ui="message"][data-role="user"]').first()
   await expect(user.locator('[data-ui="message-body"]')).toHaveText('slow network')
   await expect(page.locator('[data-ui="message"][data-role="assistant"]').first()).toBeVisible()
+  await user.getByRole('button', { name: 'Edit message' }).click()
+  await expect(user.getByRole('button', { name: 'Save & Send' })).toBeEnabled()
+  await user.getByRole('button', { name: 'Cancel', exact: true }).click()
 
   const chatId = await firstChatId(page)
   const midRows = await readMessages(page, chatId)

@@ -1,5 +1,11 @@
-import type { ChatId, MessageId, ProviderOutputMemberRef, ReasoningMemberRef } from '../core/types'
 import type {
+  GenerationCapabilityOwner,
+  NonReadyGenerationCapability,
+} from '../core/interaction-capability'
+import type { ChatId, MessageId, ProviderOutputMemberRef, ReasoningMemberRef } from '../core/types'
+import { redactDiagnosticValue } from '../lib/diagnostic-redaction'
+import type {
+  GenerationPreparationPhase,
   PresentationInteractionCapability,
   PresentationInteractionFailure,
   PresentationInteractionPresenter,
@@ -58,13 +64,132 @@ export const attachmentMutationInteraction = definePresentationInteraction<strin
   },
 })
 
-export const generationSubmitInteraction = definePresentationInteraction<'composer'>({
+export type GenerationSubmissionOutcome =
+  | { readonly kind: 'prepared' }
+  | {
+      readonly kind: 'not-prepared'
+      readonly reason: 'cancelled' | 'failed' | 'rejected-pending' | 'superseded'
+      readonly failure?: {
+        readonly message: string
+        readonly diagnosticId: string
+      }
+    }
+
+export type GenerationSubmissionAdmission =
+  | { readonly kind: 'admitted' }
+  | {
+      readonly kind: 'not-admitted'
+      readonly reason: 'cancelled' | 'failed' | 'rejected-pending' | 'superseded'
+    }
+
+export type GenerationSubmission =
+  | {
+      readonly kind: 'started'
+      readonly admission: Promise<GenerationSubmissionAdmission>
+      readonly completion: Promise<GenerationSubmissionOutcome>
+      cancel(): void
+    }
+  | { readonly kind: 'not-started'; readonly capability: NonReadyGenerationCapability }
+
+export const generationSubmitInteraction = definePresentationInteraction<string>({
   id: 'generation.submit',
   label: 'Send',
   concurrency: 'replace',
   lifetime: 'workspace-tab',
   workspaceStart: 'settle-current',
 })
+
+export interface GenerationSubmitIntent {
+  readonly chatId: ChatId | null
+  readonly action: 'composer' | 'reply' | 'edit-resend' | 'regenerate' | 'continue'
+  readonly messageId?: MessageId
+}
+
+export function generationSubmitTarget(input: GenerationSubmitIntent): string {
+  return input.chatId ? `chat:${input.chatId}:generation` : 'new-chat:generation'
+}
+
+export function generationSubmitDiagnosticTarget(input: GenerationSubmitIntent): string {
+  const chat = input.chatId ? `chat:${input.chatId}` : 'new-chat'
+  return input.messageId
+    ? `${chat}:message:${input.messageId}:${input.action}`
+    : `${chat}:${input.action}`
+}
+
+export function reportGenerationSubmissionFailure(input: {
+  readonly claimId: number
+  readonly target: string
+  readonly failure: PresentationInteractionFailure
+}): { readonly message: string; readonly diagnosticId: string } {
+  const diagnosticId = `generation-submit-${input.claimId}`
+  console.error(
+    `[generation-submit][${diagnosticId}]`,
+    redactDiagnosticValue({
+      target: input.target,
+      message: input.failure.message,
+      tone: input.failure.tone,
+    }),
+  )
+  return Object.freeze({ message: input.failure.message, diagnosticId })
+}
+
+export function reportGenerationSubmissionPhase(input: {
+  readonly claimId: number
+  readonly target: string
+  readonly phase:
+    | 'claimed'
+    | 'waiting'
+    | 'admitted'
+    | GenerationPreparationPhase
+    | 'cancelling'
+    | 'settled'
+  readonly owner?: GenerationCapabilityOwner
+  readonly outcome?: string
+}): void {
+  const diagnosticId = `generation-submit-${input.claimId}`
+  console.info(
+    `[generation-submit][${diagnosticId}]`,
+    redactDiagnosticValue({
+      target: input.target,
+      phase: input.phase,
+      ...(input.owner ? { owner: input.owner } : {}),
+      ...(input.outcome ? { outcome: input.outcome } : {}),
+    }),
+  )
+}
+
+export function reportConversationMutationPhase(input: {
+  readonly claimId: number
+  readonly target: string
+  readonly phase: 'claimed' | 'admitted' | 'repository-requested' | 'local-applied' | 'settled'
+  readonly outcome?: string
+}): void {
+  const diagnosticId = `conversation-mutation-${input.claimId}`
+  console.info(
+    `[conversation-mutation][${diagnosticId}]`,
+    redactDiagnosticValue({
+      target: input.target,
+      phase: input.phase,
+      ...(input.outcome ? { outcome: input.outcome } : {}),
+    }),
+  )
+}
+
+export function reportConversationMutationFailure(input: {
+  readonly claimId: number
+  readonly target: string
+  readonly failure: PresentationInteractionFailure
+}): void {
+  const diagnosticId = `conversation-mutation-${input.claimId}`
+  console.error(
+    `[conversation-mutation][${diagnosticId}]`,
+    redactDiagnosticValue({
+      target: input.target,
+      message: input.failure.message,
+      tone: input.failure.tone,
+    }),
+  )
+}
 
 export const configurationWriteInteraction = definePresentationInteraction<string>({
   id: 'configuration.write',
@@ -100,11 +225,19 @@ export type ConversationMutationIntent =
   | Readonly<{ kind: 'fork'; chatId: ChatId; messageId: MessageId }>
 
 export type ConversationMutationSettlement = TotalPresentationInteractionPromise<void>
+export type ConversationMutationRunner = (
+  intent: ConversationMutationIntent,
+  action: (
+    signal: AbortSignal,
+    reportPhase: (phase: 'repository-requested' | 'local-applied') => void,
+  ) => Promise<void>,
+  commit?: () => void,
+) => ConversationMutationSettlement
 
 export const conversationMutationInteraction = definePresentationInteraction<string>({
   id: 'conversation.mutate',
   label: 'Conversation update',
-  concurrency: 'reject',
+  concurrency: 'replace',
   lifetime: 'workspace-tab',
   describeFailure: (error) => {
     const cause = error instanceof Error ? error : new Error('Unknown error')
@@ -136,9 +269,8 @@ export function conversationMutationTarget(intent: ConversationMutationIntent): 
     case 'generation-notice':
       return `${message}:generation-notice`
     case 'delete':
-      return `chat:${intent.chatId}:structure`
     case 'fork':
-      return `${message}:fork`
+      return `chat:${intent.chatId}:structure`
   }
 }
 

@@ -2,24 +2,18 @@ import { memo, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import {
   type ConversationMutationSettlement,
   definePresentationInteraction,
+  type GenerationSubmission,
 } from '../../app/presentation-interactions'
 import {
   createAppliedMessageView,
   projectAppliedMessageReasoningPresentation,
 } from '../../core/continuation-content'
-import {
-  type GenerationCapability,
-  generationCapabilityAvailable,
-  generationCapabilityBlockedReason,
-  pendingGenerationCapability,
-} from '../../core/interaction-capability'
 import { plaintextOf } from '../../core/message-content'
 import { literalSearchHasMatchEndingAfter } from '../../core/search-query'
 import type { Message, ProviderOutputMemberRef, ReasoningMemberRef } from '../../core/types'
 import { useMessageStreamProjection } from '../../hooks/useMessageStreamProjection'
 import { usePresentationInteraction } from '../../hooks/usePresentationInteraction'
 import type {
-  GenerationStartResult,
   MessageAttachmentRefMutation,
   WorkspaceFence,
 } from '../../store/presentation-contracts'
@@ -35,6 +29,7 @@ import {
   PencilIcon,
   ReloadIcon,
   SendIcon,
+  StopIcon,
   TrashIcon,
 } from '../icons/Icon'
 import { Button } from '../primitives/Button'
@@ -62,10 +57,10 @@ export interface BranchTreeInspectorProps {
   onClose: () => void
   onActivate?: () => void
   onEdit?: (message: Message, text: string) => ConversationMutationSettlement
-  onEditAndSend?: (message: Message, text: string) => GenerationStartResult
+  onEditAndSend?: (message: Message, text: string) => GenerationSubmission
   onDelete?: () => ConversationMutationSettlement
-  onRegenerate?: () => GenerationStartResult
-  onContinue?: () => GenerationStartResult
+  onRegenerate?: () => GenerationSubmission
+  onContinue?: () => GenerationSubmission
   onForkChat?: () => ConversationMutationSettlement
   onToggleContextVisibility?: () => ConversationMutationSettlement
   onMutateAttachmentRef?: (mutation: MessageAttachmentRefMutation) => void | Promise<void>
@@ -73,9 +68,10 @@ export interface BranchTreeInspectorProps {
   onToggleProviderOutputItemHidden?: (
     member: ProviderOutputMemberRef,
   ) => ConversationMutationSettlement
-  editResendCapability?: GenerationCapability
-  regenerateCapability?: GenerationCapability
-  continueCapability?: GenerationCapability
+  generationSubmissionPending?: boolean
+  onCancelGenerationSubmission?: () => void
+  structuralMutationPending?: boolean
+  onCancelStructuralMutation?: () => void
   streamOnActivePath?: boolean
   searchQuery?: string
   searchMatched?: boolean
@@ -137,26 +133,15 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
   onMutateAttachmentRef,
   onToggleReasoningDetailHidden,
   onToggleProviderOutputItemHidden,
-  editResendCapability = pendingGenerationCapability('prompt-path'),
-  regenerateCapability = pendingGenerationCapability('prompt-path'),
-  continueCapability = pendingGenerationCapability('prompt-path'),
+  generationSubmissionPending = false,
+  onCancelGenerationSubmission,
+  structuralMutationPending = false,
+  onCancelStructuralMutation,
   streamOnActivePath = true,
   searchQuery,
   searchMatched = false,
 }: BranchTreeInspectorProps) {
   branchTreeInspectorComputationProbe?.('render')
-  const editResendAvailable = generationCapabilityAvailable(editResendCapability)
-  const regenerateAvailable = generationCapabilityAvailable(regenerateCapability)
-  const continueAvailable = generationCapabilityAvailable(continueCapability)
-  const editResendBlockedReason = generationCapabilityBlockedReason(
-    editResendCapability,
-    'edit-resend',
-  )
-  const regenerateBlockedReason = generationCapabilityBlockedReason(
-    regenerateCapability,
-    'regenerate',
-  )
-  const continueBlockedReason = generationCapabilityBlockedReason(continueCapability, 'continue')
   const [fullMessageId, setFullMessageId] = useState<string | null>(null)
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null)
   const [showInfo, setShowInfo] = useState(false)
@@ -177,12 +162,11 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
   const presentationPending =
     streamProjection.presentation !== undefined ||
     (activeAttempt === undefined && liveSnapshot !== undefined)
-  const streamTargetBusy = availability?.blocksReplacement === true
+  const streamTargetBusy = availability !== undefined && availability.presentation !== 'none'
   const activeStreamingPresentation =
     availability !== undefined && availability.presentation !== 'none'
   const liveRendering =
     activeStreamingPresentation || liveSnapshot !== undefined || presentationPending
-  const requestBusy = !bodyReady || streamTargetBusy
   const liveReasoning = liveSnapshot?.reasoning
   const finalError = appliedView.latestAttempt.metadata?.error
   const finalAbort = appliedView.latestAttempt.metadata?.abortReason
@@ -394,7 +378,7 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
     navigator.clipboard.writeText(plaintextOf(renderedContent)).catch(() => undefined)
 
   const saveEditAndSend = onEditAndSend
-    ? (text: string): GenerationStartResult => onEditAndSend(message, text)
+    ? (text: string): GenerationSubmission => onEditAndSend(message, text)
     : undefined
 
   return (
@@ -438,6 +422,19 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
               Open branch
             </Button>
           ) : null}
+          {generationSubmissionPending && onCancelGenerationSubmission ? (
+            <Button
+              type="button"
+              data-ui="branch-tree-inspector-action"
+              data-action="cancel-generation"
+              data-variant="danger"
+              aria-label="Cancel request preparation"
+              title="Cancel request preparation"
+              onClick={onCancelGenerationSubmission}
+            >
+              <StopIcon size={15} />
+            </Button>
+          ) : null}
           <Button
             type="button"
             data-ui="branch-tree-inspector-action"
@@ -473,15 +470,12 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
               title={
                 !bodyReady
                   ? 'Refreshing message details…'
-                  : regenerateBlockedReason
-                    ? regenerateBlockedReason
-                    : streamTargetBusy
-                      ? "Can't regenerate while this message is streaming."
-                      : regenerateCapability.state === 'pending'
-                        ? undefined
-                        : 'Regenerate response'
+                  : streamTargetBusy
+                    ? 'Replace the active stream with a regenerated response.'
+                    : generationSubmissionPending
+                      ? 'Preparing the current request.'
+                      : 'Regenerate response'
               }
-              disabled={!regenerateAvailable || requestBusy}
               onClick={() => {
                 onRegenerate()
               }}
@@ -499,13 +493,11 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
                 !bodyReady
                   ? 'Refreshing message details…'
                   : streamTargetBusy
-                    ? "Can't continue while streaming."
-                    : (continueBlockedReason ??
-                      (continueCapability.state === 'pending'
-                        ? undefined
-                        : 'Continue this assistant message'))
+                    ? 'Replace the active stream with a continuation.'
+                    : generationSubmissionPending
+                      ? 'Preparing the current request.'
+                      : 'Continue this assistant message'
               }
-              disabled={!continueAvailable || requestBusy}
               onClick={() => {
                 onContinue()
               }}
@@ -519,7 +511,12 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
               data-ui="branch-tree-inspector-action"
               data-action="fork-chat"
               aria-label="Branch this chat from here"
-              title="Branch this chat from here — opens in a new chat"
+              title={
+                structuralMutationPending
+                  ? 'Wait for the current structural update.'
+                  : 'Branch this chat from here — opens in a new chat'
+              }
+              disabled={structuralMutationPending}
               onClick={() => void onForkChat()}
             >
               <BranchIcon size={15} />
@@ -552,12 +549,22 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
               data-ui="branch-tree-inspector-action"
               data-action="delete"
               data-variant="danger"
-              aria-label="Delete message"
-              title="Delete message"
-              disabled={streamTargetBusy}
-              onClick={() => void onDelete()}
+              aria-label={
+                structuralMutationPending ? 'Cancel conversation update' : 'Delete message'
+              }
+              title={
+                structuralMutationPending
+                  ? 'Cancel the pending structural update'
+                  : 'Delete message'
+              }
+              disabled={
+                streamTargetBusy || (structuralMutationPending && !onCancelStructuralMutation)
+              }
+              onClick={() =>
+                structuralMutationPending ? onCancelStructuralMutation?.() : void onDelete()
+              }
             >
-              <TrashIcon size={15} />
+              {structuralMutationPending ? <CloseIcon size={15} /> : <TrashIcon size={15} />}
             </Button>
           ) : null}
           <Button
@@ -677,17 +684,6 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
               {...(message.role === 'user' && saveEditAndSend
                 ? {
                     onSaveAndSend: saveEditAndSend,
-                    saveAndSendDisabled: !editResendAvailable || requestBusy,
-                    ...(editResendBlockedReason
-                      ? {
-                          saveAndSendDisabledReason: editResendBlockedReason,
-                        }
-                      : requestBusy
-                        ? {
-                            saveAndSendDisabledReason:
-                              'Wait for this generation to finish before sending again.',
-                          }
-                        : {}),
                   }
                 : {})}
               ariaLabel={`Edit ${message.role} message`}

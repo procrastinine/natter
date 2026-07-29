@@ -1,10 +1,11 @@
+import type { ActiveBranchIntentTarget } from './active-branch-spine'
 import type { ChatId, MessageId } from './types'
 
 export type ConnectionAvailability = 'unknown' | 'missing' | 'available'
 
 export type GenerationCapabilityTarget =
   | { readonly kind: 'new-chat-send' }
-  | { readonly kind: 'send'; readonly chatId: ChatId; readonly expectedLeafId: MessageId | null }
+  | { readonly kind: 'send'; readonly chatId: ChatId; readonly target: ActiveBranchIntentTarget }
   | { readonly kind: 'reply'; readonly chatId: ChatId; readonly parentUserId: MessageId }
   | {
       readonly kind: 'regenerate'
@@ -98,12 +99,6 @@ export function unavailableGenerationCapability(
 
 export function generationNotStarted(capability: NonReadyGenerationCapability) {
   return Object.freeze({ kind: 'not-started' as const, capability })
-}
-
-export function generationCapabilityAvailable(
-  capability: GenerationCapability,
-): capability is ReadyGenerationCapability {
-  return capability.state === 'ready'
 }
 
 export function connectionAvailabilityFromProfileCount(

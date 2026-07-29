@@ -140,7 +140,10 @@ describe('generation mode contract', () => {
       {
         kind: 'send',
         chatId: chat.id,
-        expectedLeafId: required(priorAssistant, 'prior assistant').id,
+        target: {
+          kind: 'fixed',
+          messageId: required(priorAssistant, 'prior assistant').id,
+        },
         content: [{ type: 'text', text: 'new question' }],
       },
       captureOpen(sendCaptures, 'answer'),
@@ -217,7 +220,10 @@ describe('generation mode contract', () => {
       {
         kind: 'send',
         chatId: chat.id,
-        expectedLeafId: required(history.at(-1), 'history leaf').id,
+        target: {
+          kind: 'fixed',
+          messageId: required(history.at(-1), 'history leaf').id,
+        },
         content: [{ type: 'text', text: 'fresh submitted question' }],
       },
       (open) => {
@@ -243,7 +249,7 @@ describe('generation mode contract', () => {
       {
         kind: 'send',
         chatId: chat.id,
-        expectedLeafId: null,
+        target: { kind: 'fixed', messageId: null },
         content: [{ type: 'text', text: 'new question' }],
       },
       captureOpen(calls, 'new answer'),
@@ -292,7 +298,7 @@ describe('generation mode contract', () => {
       {
         kind: 'send',
         chatId: chat.id,
-        expectedLeafId: null,
+        target: { kind: 'fixed', messageId: null },
         content: [{ type: 'text', text: 'question before navigation' }],
       },
       gate.openStream,
@@ -323,7 +329,7 @@ describe('generation mode contract', () => {
       {
         kind: 'send',
         chatId: chat.id,
-        expectedLeafId: null,
+        target: { kind: 'fixed', messageId: null },
         content: [{ type: 'text', text: 'first question' }],
       },
       captureOpen([], 'first answer'),
@@ -332,7 +338,7 @@ describe('generation mode contract', () => {
       {
         kind: 'send',
         chatId: chat.id,
-        expectedLeafId: first.assistantMessageId,
+        target: { kind: 'fixed', messageId: first.assistantMessageId },
         content: [{ type: 'text', text: 'second question' }],
       },
       captureOpen([], 'second answer'),
@@ -357,7 +363,7 @@ describe('generation mode contract', () => {
         {
           kind: 'send',
           chatId,
-          expectedLeafId: left.id,
+          target: { kind: 'fixed', messageId: left.id },
           content: [{ type: 'text', text: 'left followup' }],
         },
         gate.openStream,
@@ -366,7 +372,7 @@ describe('generation mode contract', () => {
         {
           kind: 'send',
           chatId,
-          expectedLeafId: right.id,
+          target: { kind: 'fixed', messageId: right.id },
           content: [{ type: 'text', text: 'right followup' }],
         },
         gate.openStream,
@@ -413,14 +419,14 @@ describe('generation mode contract', () => {
     }
   })
 
-  it('allows exactly one simultaneous same-leaf composer append', async () => {
+  it('serializes simultaneous same-parent composer appends into distinct branches', async () => {
     const chat = await createChat({ settings: settings() })
-    const gate = sharedProviderGate(1)
+    const gate = sharedProviderGate(2)
     const first = await start(
       {
         kind: 'send',
         chatId: chat.id,
-        expectedLeafId: null,
+        target: { kind: 'fixed', messageId: null },
         content: [{ type: 'text', text: 'concurrent A' }],
       },
       gate.openStream,
@@ -429,27 +435,29 @@ describe('generation mode contract', () => {
       {
         kind: 'send',
         chatId: chat.id,
-        expectedLeafId: null,
+        target: { kind: 'fixed', messageId: null },
         content: [{ type: 'text', text: 'concurrent B' }],
       },
       gate.openStream,
     )
-    const prepared = await Promise.allSettled([first.prepared, second.prepared])
+    const prepared = await Promise.all([first.prepared, second.prepared])
     await gate.allOpened
 
-    expect(prepared.filter((result) => result.status === 'fulfilled')).toHaveLength(1)
-    const rejected = prepared.find((result) => result.status === 'rejected')
-    expect(rejected).toMatchObject({
-      status: 'rejected',
-      reason: { name: 'ExpectedLeafChangedError', reason: 'root-not-empty' },
-    })
-    expect(await streamLeases(chat.id)).toHaveLength(1)
+    expect(prepared.map((result) => result.userMessageId)).toHaveLength(2)
+    expect(await streamLeases(chat.id)).toHaveLength(2)
     gate.release()
     const completed = await Promise.all([first.completed, second.completed])
-    expect(completed.filter((result) => result.outcome === 'done')).toHaveLength(1)
-    expect(completed.filter((result) => result.outcome === 'error')).toHaveLength(1)
-    expect(gate.wires).toHaveLength(1)
-    expect(await messages(chat.id)).toHaveLength(2)
+    expect(completed.every((result) => result.outcome === 'done')).toBe(true)
+    expect(gate.wires).toHaveLength(2)
+    const rows = await messages(chat.id)
+    const users = rows
+      .filter((message) => message.role === 'user')
+      .sort((left, right) => left.siblingIndex - right.siblingIndex)
+    expect(users.map((message) => [message.parentId, message.siblingIndex])).toEqual([
+      [null, 0],
+      [null, 1],
+    ])
+    expect(rows).toHaveLength(4)
     expect(await streamLeases(chat.id)).toEqual([])
   })
 
@@ -787,6 +795,34 @@ describe('generation mode contract', () => {
     await expect(first.completed).resolves.toMatchObject({ outcome: 'done' })
     expect(await message(targetId)).toMatchObject({
       content: [{ type: 'output_text', text: 'base-one' }],
+      continuationAttempts: [expect.objectContaining({ status: 'done' })],
+    })
+  })
+
+  it('lets current durable Continue proceed when the optional attempt frame is stale', async () => {
+    const chat = await createChat({
+      settings: settings({ continueSystemPrompt: '', continueUserPrompt: '' }),
+    })
+    const [, target] = await seedLinear(chat.id, [
+      { role: 'user', text: 'question' },
+      { role: 'assistant', text: 'base' },
+    ])
+    const targetId = required(target, 'target').id
+    attemptController.replaceWorkspace({
+      workspaceId: 'stale-attempt-controller-workspace',
+      replacementEpoch: Number.MAX_SAFE_INTEGER,
+    })
+    const openStream = vi.fn(() => completedStream('-continued'))
+
+    const result = await run(
+      { kind: 'continue', chatId: chat.id, targetAssistantId: targetId },
+      openStream,
+    )
+
+    expect(result).toMatchObject({ outcome: 'done' })
+    expect(openStream).toHaveBeenCalledTimes(1)
+    expect(await message(targetId)).toMatchObject({
+      content: [{ type: 'output_text', text: 'base-continued' }],
       continuationAttempts: [expect.objectContaining({ status: 'done' })],
     })
   })

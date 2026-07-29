@@ -17,7 +17,6 @@ import {
   shutdownBrowserWorkspace,
 } from '../../src/store/browser-workspace-lifecycle'
 import { __resetDbForTests } from '../../src/store/db'
-import type { GenerationStartResult } from '../../src/store/generation-engine'
 import { COMPOSER_DRAFT_PREFIX } from '../../src/store/workspace-tab-session'
 import {
   Composer,
@@ -40,25 +39,11 @@ function started(completion: Promise<void> = Promise.resolve()): ComposerSubmiss
     completion: completion.then(
       (): ComposerSubmissionOutcome => Object.freeze({ kind: 'prepared' }),
     ),
+    cancel: () => undefined,
   })
 }
 
-function startedInlineGeneration(): GenerationStartResult {
-  const prepared = Object.freeze({
-    streamId: 'inline-stream',
-    chatId: 'chat-1',
-    assistantMessageId: 'assistant-1',
-  })
-  return Object.freeze({
-    kind: 'started',
-    handle: Object.freeze({
-      streamId: prepared.streamId,
-      chatId: prepared.chatId,
-      prepared: Promise.resolve(prepared),
-      completed: Promise.resolve(Object.freeze({ ...prepared, outcome: 'done' as const })),
-    }),
-  })
-}
+const startedInlineGeneration = started
 
 const BLOCKED_GENERATION_CASES = [
   ['unavailable', unavailableGenerationCapability('connection-missing')],
@@ -95,6 +80,40 @@ afterEach(async () => {
 })
 
 describe('Composer', () => {
+  it('blocks only submission while another chat request is preparing', () => {
+    const onSubmit = vi.fn(() => started())
+    render(<Composer submissionPending onSubmit={onSubmit} />)
+
+    const input = screen.getByPlaceholderText('Ask anything…')
+    fireEvent.change(input, { target: { value: 'draft stays editable' } })
+
+    expect(input).toBeEnabled()
+    expect(input).toHaveValue('draft stays editable')
+    expect(screen.getByRole('button', { name: /Preparing/u })).toBeDisabled()
+    const form = input.closest('form')
+    if (!form) throw new Error('Composer form missing')
+    fireEvent.submit(form)
+    expect(onSubmit).not.toHaveBeenCalled()
+  })
+
+  it('cancels request preparation without discarding the composer draft', () => {
+    const onCancelSubmission = vi.fn()
+    render(
+      <Composer
+        submissionPending
+        onCancelSubmission={onCancelSubmission}
+        onSubmit={() => started()}
+      />,
+    )
+    const input = screen.getByPlaceholderText('Ask anything…')
+    fireEvent.change(input, { target: { value: 'keep this draft' } })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel preparing' }))
+
+    expect(onCancelSubmission).toHaveBeenCalledOnce()
+    expect(input).toHaveValue('keep this draft')
+  })
+
   it('keeps the committed composer mounted but inert while its target is retained', () => {
     const onSubmit = vi.fn(() => started())
     const view = render(<Composer draftKey="retained-composer" onSubmit={onSubmit} />)
@@ -202,6 +221,7 @@ describe('Composer', () => {
                 : Object.freeze({ kind: 'not-admitted' as const, reason: outcome.reason }),
             ),
             completion,
+            cancel: () => undefined,
           })
         }
       />,
@@ -233,6 +253,7 @@ describe('Composer', () => {
           kind: 'started',
           admission: admission.then(() => Object.freeze({ kind: 'admitted' })),
           completion: completion.then(() => Object.freeze({ kind: 'prepared' })),
+          cancel: () => undefined,
         }),
     )
     const { container } = render(
@@ -602,6 +623,113 @@ describe('Composer', () => {
     expect(options?.attachmentRefs?.[0]).toMatchObject({ includeInContext: true })
   })
 
+  it('owns a queued Save & Send until its exact preparation settles', async () => {
+    let resolvePreparation!: () => void
+    const preparation = new Promise<void>((resolve) => {
+      resolvePreparation = resolve
+    })
+    const onCancel = vi.fn()
+    render(
+      <InlineEditor
+        initial="queued edit"
+        onSave={succeededInteractionSettlement}
+        onCancel={onCancel}
+        onSaveAndSend={() => started(preparation)}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save & Send' }))
+    expect(screen.getByRole('button', { name: 'Save & Send' })).toBeEnabled()
+    expect(onCancel).not.toHaveBeenCalled()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+
+    resolvePreparation()
+    await waitFor(() => expect(onCancel).toHaveBeenCalledOnce())
+  })
+
+  it('lets Save & Send replace a preparation without surfacing the superseded outcome', async () => {
+    let settleFirst!: (outcome: ComposerSubmissionOutcome) => void
+    let settleSecond!: (outcome: ComposerSubmissionOutcome) => void
+    const firstCompletion = new Promise<ComposerSubmissionOutcome>((resolve) => {
+      settleFirst = resolve
+    })
+    const secondCompletion = new Promise<ComposerSubmissionOutcome>((resolve) => {
+      settleSecond = resolve
+    })
+    const cancelFirst = vi.fn(() => {
+      settleFirst({ kind: 'not-prepared', reason: 'superseded' })
+    })
+    const onSaveAndSend = vi
+      .fn()
+      .mockReturnValueOnce({
+        kind: 'started',
+        admission: Promise.resolve({ kind: 'admitted' }),
+        completion: firstCompletion,
+        cancel: cancelFirst,
+      })
+      .mockReturnValueOnce({
+        kind: 'started',
+        admission: Promise.resolve({ kind: 'admitted' }),
+        completion: secondCompletion,
+        cancel: () => undefined,
+      })
+    const onCancel = vi.fn()
+    render(
+      <InlineEditor
+        initial="replace queued edit"
+        onSave={succeededInteractionSettlement}
+        onCancel={onCancel}
+        onSaveAndSend={onSaveAndSend}
+      />,
+    )
+
+    const saveAndSend = screen.getByRole('button', { name: 'Save & Send' })
+    fireEvent.click(saveAndSend)
+    expect(saveAndSend).toBeEnabled()
+    fireEvent.click(saveAndSend)
+
+    expect(onSaveAndSend).toHaveBeenCalledTimes(2)
+    expect(cancelFirst).toHaveBeenCalledOnce()
+    await firstCompletion
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(onCancel).not.toHaveBeenCalled()
+
+    settleSecond({ kind: 'prepared' })
+    await waitFor(() => expect(onCancel).toHaveBeenCalledOnce())
+  })
+
+  it('cancels a queued Save & Send without dismissing or discarding the edit', async () => {
+    let settle!: (outcome: ComposerSubmissionOutcome) => void
+    const completion = new Promise<ComposerSubmissionOutcome>((resolve) => {
+      settle = resolve
+    })
+    const cancelPreparation = vi.fn(() => {
+      settle({ kind: 'not-prepared', reason: 'cancelled' })
+    })
+    const onCancel = vi.fn()
+    render(
+      <InlineEditor
+        initial="queued edit"
+        onSave={succeededInteractionSettlement}
+        onCancel={onCancel}
+        onSaveAndSend={() => ({
+          kind: 'started',
+          admission: Promise.resolve({ kind: 'not-admitted', reason: 'cancelled' }),
+          completion,
+          cancel: cancelPreparation,
+        })}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save & Send' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel preparing' }))
+
+    expect(cancelPreparation).toHaveBeenCalledOnce()
+    await screen.findByRole('alert')
+    expect(screen.getByRole('textbox', { name: 'Edit message' })).toHaveValue('queued edit')
+    expect(onCancel).not.toHaveBeenCalled()
+  })
+
   it('keeps reasoning and provider output outside the content-only editor', async () => {
     const onSave = vi.fn(() => succeededInteractionSettlement())
     const { container } = render(
@@ -665,16 +793,8 @@ describe('Composer', () => {
   })
 
   it('lets only the mounted edit session dismiss after Save & Send prepares', async () => {
-    let resolveOld!: (value: {
-      streamId: string
-      chatId: string
-      assistantMessageId: string
-    }) => void
-    const oldPrepared = new Promise<{
-      streamId: string
-      chatId: string
-      assistantMessageId: string
-    }>((resolve) => {
+    let resolveOld!: () => void
+    const oldPrepared = new Promise<void>((resolve) => {
       resolveOld = resolve
     })
     const oldCancel = vi.fn()
@@ -686,17 +806,9 @@ describe('Composer', () => {
           onCancel={oldCancel}
           onSaveAndSend={() => ({
             kind: 'started',
-            handle: {
-              streamId: 'old-stream',
-              chatId: 'chat-1',
-              prepared: oldPrepared,
-              completed: Promise.resolve({
-                streamId: 'old-stream',
-                chatId: 'chat-1',
-                assistantMessageId: 'assistant-old',
-                outcome: 'done',
-              }),
-            },
+            admission: Promise.resolve({ kind: 'admitted' }),
+            completion: oldPrepared.then(() => ({ kind: 'prepared' })),
+            cancel: () => undefined,
           })}
         />
       </StrictMode>,
@@ -711,15 +823,11 @@ describe('Composer', () => {
           initial="same message"
           onSave={succeededInteractionSettlement}
           onCancel={currentCancel}
-          onSaveAndSend={startedInlineGeneration}
+          onSaveAndSend={() => startedInlineGeneration()}
         />
       </StrictMode>,
     )
-    resolveOld({
-      streamId: 'old-stream',
-      chatId: 'chat-1',
-      assistantMessageId: 'assistant-old',
-    })
+    resolveOld()
     await oldPrepared
     await Promise.resolve()
     expect(oldCancel).not.toHaveBeenCalled()

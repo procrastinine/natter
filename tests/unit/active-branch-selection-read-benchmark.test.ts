@@ -181,7 +181,6 @@ async function readSelection(chat: Chat): Promise<SelectionSample> {
   const result = await resolveConversationOpenReceipt(
     {
       runFrame: (stores, read) => runReadFrame(stores, read),
-      readTerminalPresentation: async () => ({ kind: 'ready', value: undefined }),
     },
     receipt,
     'none',
@@ -241,7 +240,6 @@ async function measureQueuedWriter(scenario: {
           return read(tx)
         })
       },
-      readTerminalPresentation: async () => ({ kind: 'ready', value: undefined }),
     },
     receipt,
     'none',

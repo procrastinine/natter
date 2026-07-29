@@ -1,9 +1,9 @@
 import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import type { ChatId, MessageId } from '../../src/core/types'
+import { isBrowserCommandFanoutBudgetExceededError } from '../../src/store/browser-command-fanout-budget'
 import {
   installBrowserCommandMutationJournal,
-  isBrowserCommandFanoutBudgetExceededError,
   recordBrowserCommandInvalidation,
   recordBrowserCommandOwnerInvalidation,
   runBrowserCommandTransaction,
@@ -217,7 +217,12 @@ describe('browser command mutation journal', () => {
             })
         },
         {
-          fanoutBudget: { maxReadRows: 8, maxWriteRows: 8, maxBytes: 1024 * 1024 },
+          fanoutBudget: {
+            maxReadRequestRows: 8,
+            maxReadRequestBytes: 1024 * 1024,
+            maxWriteRows: 8,
+            maxWriteBytes: 1024 * 1024,
+          },
         },
       ),
     )
@@ -226,6 +231,60 @@ describe('browser command mutation journal', () => {
     expect(visited).toBe(8)
     expect(await db.table('rows').get('must-rollback')).toBeUndefined()
     expect(await db.table('rows').count()).toBe(100)
+  })
+
+  it('does not mistake a dependency chain of point reads for row fanout', async () => {
+    const db = await openDatabase()
+    await db
+      .table('rows')
+      .bulkPut(Array.from({ length: 100 }, (_, index) => ({ id: `row-${index}`, value: index })))
+
+    await expect(
+      db.transaction('rw', db.table('rows'), (tx) =>
+        runBrowserCommandTransaction(
+          tx,
+          async (tracked) => {
+            for (let index = 0; index < 100; index += 1) {
+              await tracked.table('rows').get(`row-${index}`)
+            }
+            await tracked.table('rows').put({ id: 'point-read-commit', value: -1 })
+          },
+          {
+            fanoutBudget: {
+              maxReadRequestRows: 8,
+              maxReadRequestBytes: 1024 * 1024,
+              maxWriteRows: 8,
+              maxWriteBytes: 1024 * 1024,
+            },
+          },
+        ),
+      ),
+    ).resolves.toMatchObject({ value: undefined })
+    expect(await db.table('rows').get('point-read-commit')).toEqual({
+      id: 'point-read-commit',
+      value: -1,
+    })
+
+    const writeOperation = db.transaction('rw', db.table('rows'), (tx) =>
+      runBrowserCommandTransaction(
+        tx,
+        async (tracked) => {
+          for (let index = 0; index < 9; index += 1) {
+            await tracked.table('rows').put({ id: `must-rollback-${index}`, value: index })
+          }
+        },
+        {
+          fanoutBudget: {
+            maxReadRequestRows: 8,
+            maxReadRequestBytes: 1024 * 1024,
+            maxWriteRows: 8,
+            maxWriteBytes: 1024 * 1024,
+          },
+        },
+      ),
+    )
+    await expect(writeOperation).rejects.toSatisfy(isBrowserCommandFanoutBudgetExceededError)
+    expect(await db.table('rows').where('id').startsWith('must-rollback-').count()).toBe(0)
   })
 
   it('bounds direct work by the page plus its largest physical value', async () => {
@@ -242,7 +301,12 @@ describe('browser command mutation journal', () => {
             await tracked.table('rows').put(companion)
           },
           {
-            fanoutBudget: { maxReadRows: 8, maxWriteRows: 8, maxBytes: 128 },
+            fanoutBudget: {
+              maxReadRequestRows: 8,
+              maxReadRequestBytes: 128,
+              maxWriteRows: 8,
+              maxWriteBytes: 128,
+            },
           },
         ),
       ),
@@ -256,7 +320,12 @@ describe('browser command mutation journal', () => {
           await tracked.table('rows').put({ id: 'must-rollback', value: 'z'.repeat(4_096) })
         },
         {
-          fanoutBudget: { maxReadRows: 8, maxWriteRows: 8, maxBytes: 128 },
+          fanoutBudget: {
+            maxReadRequestRows: 8,
+            maxReadRequestBytes: 128,
+            maxWriteRows: 8,
+            maxWriteBytes: 128,
+          },
         },
       ),
     )

@@ -6,9 +6,9 @@
 //   - Edit in place — never creates a sibling, never fires an API call.
 //   - Edit & Send — creates a user sibling of the original AND fires one
 //     assistant completion. Shown as an extra button inside the inline
-//     editor; disabled when no connection is configured.
+//     editor.
 //   - Regenerate (assistant only) — creates an assistant sibling under
-//     the same user parent; disabled when no connection is configured.
+//     the same user parent.
 //
 // This component owns only the action row + Info/Edit disclosures; the
 // inline editor body lives inside <Message> so the row can swap the
@@ -16,15 +16,12 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ConversationDeleteMode } from '../../app/conversation-actions'
-import type { ConversationMutationSettlement } from '../../app/presentation-interactions'
+import type {
+  ConversationMutationSettlement,
+  GenerationSubmission,
+} from '../../app/presentation-interactions'
 import type { AppliedMessageView } from '../../core/continuation-content'
-import {
-  type GenerationCapability,
-  generationCapabilityAvailable,
-  generationCapabilityBlockedReason,
-} from '../../core/interaction-capability'
 import type { Message } from '../../core/types'
-import type { GenerationStartResult } from '../../store/presentation-contracts'
 import {
   BranchIcon,
   CheckIcon,
@@ -57,16 +54,15 @@ interface MessageActionsProps {
   // Permission flags. The buttons stay VISIBLE (discoverable) but
   // disabled with a tooltip so the user understands why the action
   // can't run right now.
-  regenerateCapability: GenerationCapability
-  continueCapability: GenerationCapability
   generationBusy?: boolean
   streamTargetBusy?: boolean
   mutationDisabled?: boolean
   structuralDisabled?: boolean
-  disabledReason?: string
+  structuralMutationPending?: boolean
+  onCancelStructuralMutation?: () => void
   // Structural ops.
-  onRegenerate?: () => GenerationStartResult
-  onContinue?: () => GenerationStartResult
+  onRegenerate?: () => GenerationSubmission
+  onContinue?: () => GenerationSubmission
   // The per-message branch action forks the chat from this node into a
   // brand-new chat row (store/chat-fork.ts). There is NO separate in-tree
   // branch-sibling button — alternate siblings come from regenerate /
@@ -88,13 +84,12 @@ export function MessageActions(props: MessageActionsProps) {
     onToggleInfo,
     isEditing,
     onBeginEdit,
-    regenerateCapability,
-    continueCapability,
     generationBusy = false,
     streamTargetBusy = false,
     mutationDisabled = false,
     structuralDisabled = false,
-    disabledReason,
+    structuralMutationPending = false,
+    onCancelStructuralMutation,
     onRegenerate,
     onContinue,
     onForkChat,
@@ -159,29 +154,20 @@ export function MessageActions(props: MessageActionsProps) {
     }
   }, [markCopied, message.content, onCopy])
 
-  const regenerationDisabled =
-    mutationDisabled ||
-    !generationCapabilityAvailable(regenerateCapability) ||
-    generationBusy ||
-    streamTargetBusy
-  const continuationDisabled =
-    mutationDisabled ||
-    !generationCapabilityAvailable(continueCapability) ||
-    generationBusy ||
-    streamTargetBusy
-  const regenerationDisabledTitle = mutationDisabled
-    ? 'Refreshing this message before editing or generation.'
-    : streamTargetBusy
-      ? "Can't regenerate while this message is streaming."
-      : (disabledReason ??
-        generationCapabilityBlockedReason(regenerateCapability, 'regenerate') ??
-        (generationBusy ? 'A request is already running for this chat.' : undefined))
-  const continuationDisabledTitle = streamTargetBusy
-    ? "Can't continue while streaming."
-    : (generationCapabilityBlockedReason(continueCapability, 'continue') ??
-      (generationBusy ? 'A request is already running for this chat.' : undefined))
-  const deleteLabel = 'Delete message'
-  const deleteTooltip = 'Delete this message…'
+  const regenerationTitle = streamTargetBusy
+    ? 'Replace the active stream with a regenerated response.'
+    : generationBusy
+      ? 'Starts a new request and replaces the current preparation.'
+      : undefined
+  const continuationTitle = streamTargetBusy
+    ? 'Replace the active stream with a continuation.'
+    : generationBusy
+      ? 'Starts a new request and replaces the current preparation.'
+      : undefined
+  const deleteLabel = structuralMutationPending ? 'Cancel conversation update' : 'Delete message'
+  const deleteTooltip = structuralMutationPending
+    ? 'Cancel the pending structural update'
+    : 'Delete this message…'
 
   return (
     <div data-ui="message-actions" data-mode="default">
@@ -236,9 +222,8 @@ export function MessageActions(props: MessageActionsProps) {
           onClick={() => {
             onRegenerate()
           }}
-          disabled={regenerationDisabled}
           aria-label="Regenerate response"
-          title={!regenerationDisabled ? 'Regenerate (⇧⌘R)' : regenerationDisabledTitle}
+          title={regenerationTitle ?? 'Regenerate (⇧⌘R)'}
         >
           <ReloadIcon size={14} />
         </IconButton>
@@ -253,14 +238,10 @@ export function MessageActions(props: MessageActionsProps) {
           onClick={() => {
             onContinue()
           }}
-          disabled={continuationDisabled}
           aria-label={abortReason ? 'Continue partial response' : 'Continue from here'}
           title={
-            !continuationDisabled
-              ? abortReason
-                ? 'Continue this partial response'
-                : 'Continue this assistant message'
-              : continuationDisabledTitle
+            continuationTitle ??
+            (abortReason ? 'Continue this partial response' : 'Continue this assistant message')
           }
         >
           <SendIcon size={14} />
@@ -315,15 +296,23 @@ export function MessageActions(props: MessageActionsProps) {
         data-size="sm"
         data-role="message-action"
         data-action="delete-pair"
-        onClick={() => setConfirmOpen(true)}
-        disabled={streamTargetBusy || structuralDisabled}
+        onClick={() =>
+          structuralMutationPending ? onCancelStructuralMutation?.() : setConfirmOpen(true)
+        }
+        disabled={
+          streamTargetBusy ||
+          (structuralDisabled && !structuralMutationPending) ||
+          (structuralMutationPending && !onCancelStructuralMutation)
+        }
         aria-label={deleteLabel}
         title={
-          structuralDisabled
-            ? 'Resolving this branch before structural changes.'
-            : streamTargetBusy
-              ? "Can't delete while streaming."
-              : deleteTooltip
+          structuralMutationPending
+            ? deleteTooltip
+            : structuralDisabled
+              ? 'Resolving this branch before structural changes.'
+              : streamTargetBusy
+                ? "Can't delete while streaming."
+                : deleteTooltip
         }
       >
         <TrashIcon size={14} />
@@ -362,6 +351,8 @@ interface MessageEditTreeActionsProps {
   onInsert?: (slot: InsertSlot) => void | Promise<void>
   onDelete: (mode: ConversationDeleteMode) => ConversationMutationSettlement
   streamTargetBusy?: boolean
+  structuralMutationPending?: boolean
+  onCancelStructuralMutation?: () => void
 }
 
 // Structural-ops row for edit-tree mode. Rendered BELOW the default
@@ -373,6 +364,8 @@ export function MessageEditTreeActions({
   onInsert,
   onDelete,
   streamTargetBusy = false,
+  structuralMutationPending = false,
+  onCancelStructuralMutation,
 }: MessageEditTreeActionsProps) {
   return (
     <div data-ui="message-edit-tree-row">
@@ -416,28 +409,44 @@ export function MessageEditTreeActions({
         ) : null}
       </div>
       <div data-ui="edit-tree-group" data-side="deletes">
-        <Button
-          data-ui="edit-tree-action"
-          tone="danger"
-          appearance="soft"
-          size="xs"
-          data-action="delete-variant"
-          onClick={() => void onDelete('variant')}
-          disabled={streamTargetBusy}
-        >
-          Delete variant
-        </Button>
-        <Button
-          data-ui="edit-tree-action"
-          tone="danger"
-          appearance="soft"
-          size="xs"
-          data-action="delete-turn"
-          onClick={() => void onDelete('turn')}
-          disabled={streamTargetBusy}
-        >
-          Delete turn
-        </Button>
+        {structuralMutationPending ? (
+          <Button
+            data-ui="edit-tree-action"
+            tone="danger"
+            appearance="soft"
+            size="xs"
+            data-action="cancel-structure"
+            onClick={onCancelStructuralMutation}
+            disabled={!onCancelStructuralMutation}
+          >
+            Cancel update
+          </Button>
+        ) : (
+          <>
+            <Button
+              data-ui="edit-tree-action"
+              tone="danger"
+              appearance="soft"
+              size="xs"
+              data-action="delete-variant"
+              onClick={() => void onDelete('variant')}
+              disabled={streamTargetBusy}
+            >
+              Delete variant
+            </Button>
+            <Button
+              data-ui="edit-tree-action"
+              tone="danger"
+              appearance="soft"
+              size="xs"
+              data-action="delete-turn"
+              onClick={() => void onDelete('turn')}
+              disabled={streamTargetBusy}
+            >
+              Delete turn
+            </Button>
+          </>
+        )}
       </div>
     </div>
   )

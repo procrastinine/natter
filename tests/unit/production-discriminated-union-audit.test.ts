@@ -220,14 +220,6 @@ describe('production discriminated-union meta-audit', () => {
   })
 
   it('derives composite aliases by matching discriminant property, never by an ambiguous type edge', () => {
-    const selectedPromptPath = entry(
-      'src/store/conversation-controller.ts#ClaimedSelectedConversationPromptPath|kind',
-    )
-    expect(selectedPromptPath.role).toBe('state')
-    expect(selectedPromptPath.canonicalRoots).toEqual([
-      'src/store/conversation-controller.ts#ClaimedConversationDestination|kind',
-    ])
-    expect(selectedPromptPath.coverage?.status).toBe('derived')
     expect(entry('src/store/repository.ts#StreamLeaseByAttempt|custody').canonicalRoots).toEqual([
       'src/store/repository.ts#StreamLeaseCustody|custody',
     ])

@@ -159,6 +159,12 @@ export interface AttemptTargetAdmissionClaim extends WorkspaceFence {
   readonly messageId: MessageId
 }
 
+export interface AttemptChatDemandClaim {
+  readonly kind: 'attempt-chat-demand'
+  readonly chatId: ChatId
+  release(): void
+}
+
 type AttemptListener = () => void
 
 interface ChatLeaseCoverage extends WorkspaceFence {
@@ -168,6 +174,7 @@ interface ChatLeaseCoverage extends WorkspaceFence {
 
 export interface AttemptController {
   subscribeDemand(listener: AttemptListener): () => void
+  claimChatDemand(chatId: ChatId): AttemptChatDemandClaim
   subscribeChat(chatId: ChatId, listener: AttemptListener): () => void
   subscribeTarget(chatId: ChatId, messageId: MessageId, listener: AttemptListener): () => void
   observeLease(
@@ -257,12 +264,26 @@ class TabAttemptController implements AttemptController {
     return () => this.demandListeners.delete(listener)
   }
 
-  subscribeChat(chatId: ChatId, listener: AttemptListener): () => void {
+  claimChatDemand(chatId: ChatId): AttemptChatDemandClaim {
     this.retainChatDemand(chatId)
+    let released = false
+    return Object.freeze({
+      kind: 'attempt-chat-demand' as const,
+      chatId,
+      release: () => {
+        if (released) return
+        released = true
+        this.releaseChatDemand(chatId)
+      },
+    })
+  }
+
+  subscribeChat(chatId: ChatId, listener: AttemptListener): () => void {
+    const demand = this.claimChatDemand(chatId)
     const unsubscribe = subscribeKeyed(this.chatListeners, chatId, listener)
     return () => {
       unsubscribe()
-      this.releaseChatDemand(chatId)
+      demand.release()
     }
   }
 
@@ -477,7 +498,7 @@ class TabAttemptController implements AttemptController {
     claimId: string,
   ): AttemptTargetAdmissionClaim | undefined {
     if (!this.workspaceFence || !sameWorkspaceFence(this.workspaceFence, fence)) return undefined
-    if (this.getTargetAdmissionFrame(chatId).admission(messageId) !== 'available') return undefined
+    if (this.getTargetAdmissionFrame(chatId).admission(messageId) === 'occupied') return undefined
     const key = targetKey(chatId, messageId)
     if (this.targetAdmissionClaims.has(key)) return undefined
     const claim = Object.freeze({ ...fence, claimId, chatId, messageId })

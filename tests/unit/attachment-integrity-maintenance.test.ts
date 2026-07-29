@@ -248,7 +248,12 @@ async function reconcilePageWithinDirectBudget(
         limit,
         now: Date.now(),
       },
-      { maxReadRows: 64, maxWriteRows: 64, maxBytes: 1024 * 1024 },
+      {
+        maxReadRequestRows: 64,
+        maxReadRequestBytes: 1024 * 1024,
+        maxWriteRows: 64,
+        maxWriteBytes: 1024 * 1024,
+      },
     )
     expect(admission.kind).toBe('committed')
     if (admission.kind !== 'committed') throw new Error('AttachmentIntegrityUnexpectedStaging')

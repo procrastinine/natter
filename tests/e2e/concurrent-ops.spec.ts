@@ -337,7 +337,7 @@ test('a send that leaves before its first receipt finishes exactly when returnin
 })
 
 test.describe('same-leaf composer admission', () => {
-  test('two tabs cannot turn simultaneous composer sends into an implicit branch', async ({
+  test('two tabs serialize simultaneous same-parent sends into explicit durable branches', async ({
     page,
   }) => {
     const completionRoute = '**/api/v1/chat/completions'
@@ -362,25 +362,27 @@ test.describe('same-leaf composer admission', () => {
       releaseResponse = resolve
     })
     let requestCount = 0
-    const routeCompletion = async (route: Route) => {
-      requestCount += 1
-      await responseGate
-      await route.fulfill({
-        status: 200,
-        contentType: 'text/event-stream',
-        body: buildSseBody([
-          { id: 'simultaneous-winner', content: 'accepted answer' },
-          { finish: 'stop' },
-        ]),
-      })
-    }
+    const routeCompletion =
+      (id: string, content: string) =>
+      async (route: Route): Promise<void> => {
+        requestCount += 1
+        await responseGate
+        await route.fulfill({
+          status: 200,
+          contentType: 'text/event-stream',
+          body: buildSseBody([{ id, content }, { finish: 'stop' }]),
+        })
+      }
     try {
       await second.goto(`/#/chat/${chatId}/message/${baselineId}`)
       await expect(
         second.locator(`[data-ui="message"][data-message-id="${baselineId}"]`),
       ).toBeVisible()
-      await page.route(completionRoute, routeCompletion)
-      await second.route(completionRoute, routeCompletion)
+      await page.route(completionRoute, routeCompletion('simultaneous-a', 'accepted answer from A'))
+      await second.route(
+        completionRoute,
+        routeCompletion('simultaneous-b', 'accepted answer from B'),
+      )
       await page.locator('[data-ui="composer-input"]').fill('same-chat A')
       await second.locator('[data-ui="composer-input"]').fill('same-chat B')
       const admissionLockName = `chat-meta:${chatId}`
@@ -424,7 +426,7 @@ test.describe('same-leaf composer admission', () => {
           }
         ).__releaseE2EAdmissionGate?.()
       })
-      await expect.poll(() => requestCount).toBe(1)
+      await expect.poll(() => requestCount).toBe(2)
       await expect
         .poll(async () =>
           Promise.all([
@@ -432,49 +434,52 @@ test.describe('same-leaf composer admission', () => {
             second.locator('[data-ui="composer-input"]').inputValue(),
           ]).then((values) => values.filter((value) => value === '').length),
         )
-        .toBe(1)
-      const composerValues = await Promise.all([
-        page.locator('[data-ui="composer-input"]').inputValue(),
-        second.locator('[data-ui="composer-input"]').inputValue(),
-      ])
-      expect(composerValues.filter((value) => value === '')).toHaveLength(1)
-      expect(
-        composerValues.filter((value) => value === 'same-chat A' || value === 'same-chat B'),
-      ).toHaveLength(1)
+        .toBe(2)
 
       releaseResponse()
-      const winningPage = composerValues[0] === '' ? page : second
-      const losingPage = composerValues[0] === '' ? second : page
-      const losingDraft = composerValues[0] === '' ? 'same-chat B' : 'same-chat A'
       await expect(
-        winningPage
+        page.locator('[data-ui="message"][data-role="assistant"] [data-ui="message-body"]').last(),
+      ).toContainText('accepted answer from A')
+      await expect(
+        second
           .locator('[data-ui="message"][data-role="assistant"] [data-ui="message-body"]')
           .last(),
-      ).toContainText('accepted answer')
-      await expect(losingPage.locator('[data-ui="composer-input"]')).toHaveValue(losingDraft)
+      ).toContainText('accepted answer from B')
 
       await expect
         .poll(async () => (await readMessages(page, chatId)).filter((row) => row.deleted !== true))
-        .toHaveLength(4)
+        .toHaveLength(6)
       const rows = (await readMessages(page, chatId)).filter((row) => row.deleted !== true)
-      const roots = rows.filter((row) => row.parentId === null)
-      expect(roots).toHaveLength(1)
-      const childrenByParent = new Map<string, Array<Record<string, unknown>>>()
-      for (const row of rows) {
-        if (typeof row.parentId !== 'string') continue
-        const bucket = childrenByParent.get(row.parentId) ?? []
-        bucket.push(row)
-        childrenByParent.set(row.parentId, bucket)
+      const submittedUsers = rows
+        .filter(
+          (row) =>
+            row.role === 'user' &&
+            row.parentId === baselineId &&
+            Array.isArray(row.content) &&
+            row.content.some(
+              (item) =>
+                typeof item === 'object' &&
+                item !== null &&
+                ((item as { text?: unknown }).text === 'same-chat A' ||
+                  (item as { text?: unknown }).text === 'same-chat B'),
+            ),
+        )
+        .sort((left, right) => Number(left.siblingIndex) - Number(right.siblingIndex))
+      expect(submittedUsers.map((row) => row.siblingIndex)).toEqual([0, 1])
+      expect(
+        submittedUsers.map(
+          (row) =>
+            (row.content as Array<{ text?: unknown }>).find((item) => typeof item.text === 'string')
+              ?.text,
+        ),
+      ).toEqual(expect.arrayContaining(['same-chat A', 'same-chat B']))
+      for (const submittedUser of submittedUsers) {
+        expect(
+          rows.filter(
+            (row) => row.role === 'assistant' && row.parentId === String(submittedUser.id),
+          ),
+        ).toHaveLength(1)
       }
-      expect([...childrenByParent.values()].every((children) => children.length === 1)).toBe(true)
-
-      const roles: unknown[] = []
-      let current = roots[0]
-      while (current) {
-        roles.push(current.role)
-        current = childrenByParent.get(String(current.id))?.[0]
-      }
-      expect(roles).toEqual(['user', 'assistant', 'user', 'assistant'])
     } finally {
       await page.evaluate(() => {
         ;(
@@ -557,6 +562,11 @@ test('one Enter keeps its claimed branch while destination and a remote publicat
     const input = page.locator('[data-ui="composer-input"]')
     await input.fill(draft)
     await uiJourney.intent(page, {
+      kind: 'transcript-replace-after',
+      id: 'claimed-destination-branch-suffix',
+      messageId: secondAssistantId,
+    })
+    await uiJourney.intent(page, {
       kind: 'gesture',
       id: 'claimed-destination-enter',
       targetSelector: '[data-ui="composer-input"]',
@@ -580,12 +590,8 @@ test('one Enter keeps its claimed branch while destination and a remote publicat
     await expect(input).toHaveValue(draft)
     peer.once('dialog', (dialog) => dialog.accept('Remote during destination settle'))
     await peer.getByLabel('New folder').click()
-    await expect(
-      page.locator('[data-ui="folder-section"]').filter({
-        hasText: 'Remote during destination settle',
-      }),
-    ).toBeVisible()
     await expect(input).toHaveValue(draft)
+    await expect(page.getByLabel('View conversation tree')).toBeEnabled()
 
     await uiJourney.intent(page, {
       kind: 'route',
@@ -595,6 +601,11 @@ test('one Enter keeps its claimed branch while destination and a remote publicat
     await releaseMessages()
     await expect.poll(() => requestCount).toBe(1)
     await expect(input).toHaveValue('')
+    await expect(
+      page.locator('[data-ui="folder-section"]').filter({
+        hasText: 'Remote during destination settle',
+      }),
+    ).toBeVisible()
     await expect(
       page
         .locator('[data-ui="message"][data-role="assistant"]')

@@ -8,6 +8,8 @@ import {
 } from '../core/active-branch-spine'
 import { childListKey } from '../core/child-list-state'
 import type { ChatId, ChildListState, ChildSlotMember, MessageId } from '../core/types'
+import { BROWSER_COMMAND_DIRECT_FANOUT_BUDGET } from './browser-command-fanout-budget'
+import { readBulkGetPages } from './browser-indexeddb-reads'
 import type { MessageHeaderRow } from './message-storage'
 
 export interface ActiveBranchPathSlotFrame {
@@ -49,13 +51,21 @@ export async function readActiveBranchForkSlotsForHeadersInTransaction(
   signal?: AbortSignal,
 ): Promise<readonly ActiveBranchForkSlot[]> {
   if (headers.length === 0) return Object.freeze([])
+  const pageOptions = {
+    ...(signal ? { signal } : {}),
+    maxRows: BROWSER_COMMAND_DIRECT_FANOUT_BUDGET.maxReadRequestRows,
+  }
   const [members, states] = await Promise.all([
-    tx
-      .table<ChildSlotMember, MessageId>('childSlotMembers')
-      .bulkGet(headers.map((header) => header.id)),
-    tx
-      .table<ChildListState, string>('childLists')
-      .bulkGet(headers.map((header) => childListKey(header.chatId, header.parentId))),
+    readBulkGetPages(
+      tx.table<ChildSlotMember, MessageId>('childSlotMembers'),
+      headers.map((header) => header.id),
+      pageOptions,
+    ),
+    readBulkGetPages(
+      tx.table<ChildListState, string>('childLists'),
+      headers.map((header) => childListKey(header.chatId, header.parentId)),
+      pageOptions,
+    ),
   ])
   throwIfAborted(signal)
   return materializeActiveBranchForkSlots(
@@ -73,19 +83,27 @@ export async function readActiveBranchPathSlotFrameInTransaction(
   signal?: AbortSignal,
 ): Promise<ActiveBranchPathSlotFrame> {
   const terminalId = headers.at(-1)?.id ?? null
+  const pageOptions = {
+    ...(signal ? { signal } : {}),
+    maxRows: BROWSER_COMMAND_DIRECT_FANOUT_BUDGET.maxReadRequestRows,
+  }
   throwIfAborted(signal)
   const [members, states] = await Promise.all([
     headers.length === 0
       ? Promise.resolve([])
-      : tx
-          .table<ChildSlotMember, MessageId>('childSlotMembers')
-          .bulkGet(headers.map((header) => header.id)),
-    tx
-      .table<ChildListState, string>('childLists')
-      .bulkGet([
+      : readBulkGetPages(
+          tx.table<ChildSlotMember, MessageId>('childSlotMembers'),
+          headers.map((header) => header.id),
+          pageOptions,
+        ),
+    readBulkGetPages(
+      tx.table<ChildListState, string>('childLists'),
+      [
         ...headers.map((header) => childListKey(chatId, header.parentId)),
         childListKey(chatId, terminalId),
-      ]),
+      ],
+      pageOptions,
+    ),
   ])
   throwIfAborted(signal)
   const forkStates = states.slice(0, headers.length)

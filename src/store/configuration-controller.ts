@@ -9,6 +9,7 @@ import {
   sameChatSettings,
 } from '../core/chat-metadata'
 import {
+  type ConnectionDispatchProfileProof,
   connectionDispatchKeyRefs,
   connectionDispatchProfileProof,
 } from '../core/connection-dispatch-proof'
@@ -59,7 +60,7 @@ import {
   configurationRequestRevisionKey,
 } from './configuration-domain-contract'
 import type { ConversationSnapshot } from './conversation-controller'
-import type { WorkspaceFence } from './repository'
+import type { GenerationSavedTextTemplateReadProof, WorkspaceFence } from './repository'
 import type { WorkspaceEffect } from './workspace-effect-hub'
 import type {
   ConfigurationActiveModelKnownPayloads,
@@ -85,7 +86,6 @@ import type {
   PendingPromptFieldIntent,
   PendingTextTemplateConfigIntent,
   PendingWorkspaceSettingIntent,
-  PrepareAttemptConfigurationClaim,
   WorkspaceDependency,
 } from './workspace-protocol'
 import { workspaceDependenciesOverlap, workspaceQueryDependencies } from './workspace-protocol'
@@ -223,10 +223,18 @@ export type ActiveGenerationConfigurationRequirement =
       readonly settingsPatch?: ChatSettingsPatch
     }
 
-export type ActiveGenerationConfigurationClaim = Omit<
-  PrepareAttemptConfigurationClaim,
-  'preferredDispatchKeyId'
->
+export interface ActiveGenerationConfigurationClaim {
+  readonly settings: ChatSettings
+  readonly presetId: PresetId | null
+  readonly profile: ConnectionDispatchProfileProof
+  readonly requestRevision: ConfigurationRequestRevision
+  readonly dispatchKeyRevisions: readonly KeyDispatchRevision[]
+  readonly workspaceSettingOverrides: readonly Pick<
+    PendingWorkspaceSettingIntent,
+    'key' | 'value'
+  >[]
+  readonly savedTextTemplate?: GenerationSavedTextTemplateReadProof
+}
 
 export type ActiveGenerationConfigurationResolution =
   | { readonly capability: Exclude<ActiveGenerationConfigurationCapability, 'ready'> }

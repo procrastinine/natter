@@ -685,7 +685,8 @@ describe('public chat fork command', () => {
     const sidebarRow = (await query({ kind: 'sidebar.rows-by-id', chatIds: [commit.value.chatId] }))
       .value[0]
     expect(opened.proof.pathHeaders.map((header) => header.id)).toEqual([copied.id])
-    expect(opened.presentations.map((row) => row.message.id)).toEqual([copied.id])
+    expect(opened.presentations).toEqual([])
+    expect(await getMessage(copied.id)).toEqual(copied)
     expect(sidebarRow).toMatchObject({
       id: commit.value.chatId,
       lastUpdatedLeafId: copied.id,
@@ -924,7 +925,8 @@ describe('public structural undo', () => {
     ).value
     expect(opened.kind).toBe('ready')
     if (opened.kind !== 'ready') throw new Error('RestoredPairDestinationUnavailable')
-    expect(opened.presentations.map((row) => row.message.id)).toEqual([assistant.id])
+    expect(opened.presentations).toEqual([])
+    expect(await getMessage(assistant.id)).toMatchObject({ id: assistant.id, deleted: false })
     expect((await getHeader(user.id))?.deleted).toBe(false)
     expect((await getHeader(assistant.id))?.deleted).toBe(false)
   })
@@ -991,7 +993,8 @@ describe('public structural undo', () => {
     ).value
     expect(opened.kind).toBe('ready')
     if (opened.kind !== 'ready') throw new Error('RestoredInsertionDestinationUnavailable')
-    expect(opened.presentations.map((row) => row.message.id)).toEqual([previous.id])
+    expect(opened.presentations).toEqual([])
+    expect(await getMessage(previous.id)).toMatchObject({ id: previous.id, deleted: false })
 
     expect(await getMessage(introduced.messageId)).toMatchObject({
       id: introduced.messageId,

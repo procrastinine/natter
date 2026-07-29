@@ -169,7 +169,7 @@ export const ARCHITECTURE_PROOFS = Object.freeze([
     'render-window-browser-tests',
     'browser-test',
     'tests/e2e/render-window.spec.ts',
-    "test('send and regenerate keep the transcript mounted while the branch window reloads'",
+    "test('send, regenerate, and continue keep the transcript mounted while readiness settles'",
     ['conversation', 'presentation-system'],
     ['browser-performance-tests'],
   ),

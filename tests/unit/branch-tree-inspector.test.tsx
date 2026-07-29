@@ -1,17 +1,10 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { StrictMode } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import {
-  AVAILABLE_GENERATION_CAPABILITY,
-  pendingGenerationCapability,
-} from '../../src/core/interaction-capability'
+import type { GenerationSubmission } from '../../src/app/presentation-interactions'
+import { pendingGenerationCapability } from '../../src/core/interaction-capability'
 import type { Message } from '../../src/core/types'
 import { attemptController } from '../../src/store/attempt-controller'
-import type {
-  CompletedGeneration,
-  GenerationStartResult,
-  PreparedGeneration,
-} from '../../src/store/generation-engine'
 import type { WorkspaceFence } from '../../src/store/presentation-contracts'
 import { reconcileWorkspaceTabSessionStorage } from '../../src/store/workspace-tab-session'
 import {
@@ -191,24 +184,23 @@ function message(overrides: Partial<Message> = {}): Message {
   }
 }
 
-function startedGeneration(preparationError?: Error): GenerationStartResult {
-  const prepared: PreparedGeneration = {
-    streamId: 'test-stream',
-    chatId: 'chat-1',
-    assistantMessageId: 'assistant-message',
-  }
-  const completed: CompletedGeneration = {
-    ...prepared,
-    outcome: preparationError ? 'error' : 'done',
-  }
+function startedGeneration(preparationError?: Error): GenerationSubmission {
   return {
     kind: 'started',
-    handle: {
-      streamId: prepared.streamId,
-      chatId: prepared.chatId,
-      prepared: preparationError ? Promise.reject(preparationError) : Promise.resolve(prepared),
-      completed: Promise.resolve(completed),
-    },
+    admission: Promise.resolve({ kind: 'admitted' }),
+    completion: Promise.resolve(
+      preparationError
+        ? {
+            kind: 'not-prepared',
+            reason: 'failed',
+            failure: {
+              message: preparationError.message,
+              diagnosticId: 'generation-submit-test',
+            },
+          }
+        : { kind: 'prepared' },
+    ),
+    cancel: () => undefined,
   }
 }
 
@@ -275,6 +267,27 @@ describe('BranchTreeInspector', () => {
     expect(remove).toHaveAttribute('data-variant', 'danger')
     fireEvent.click(remove)
     await waitFor(() => expect(onDelete).toHaveBeenCalledTimes(1))
+  })
+
+  it('keeps a pending structural mutation explicitly cancellable', () => {
+    const onDelete = vi.fn(() => succeededInteractionSettlement())
+    const onCancelStructuralMutation = vi.fn()
+    render(
+      <BranchTreeInspector
+        message={message()}
+        onClose={() => undefined}
+        onDelete={onDelete}
+        structuralMutationPending
+        onCancelStructuralMutation={onCancelStructuralMutation}
+      />,
+    )
+
+    const cancel = screen.getByRole('button', { name: 'Cancel conversation update' })
+    expect(cancel).toBeEnabled()
+    fireEvent.click(cancel)
+
+    expect(onCancelStructuralMutation).toHaveBeenCalledOnce()
+    expect(onDelete).not.toHaveBeenCalled()
   })
 
   it('renders structured reasoning while keeping in-place edits strictly text-only', async () => {
@@ -381,8 +394,6 @@ describe('BranchTreeInspector', () => {
         onToggleContextVisibility={onToggleContextVisibility}
         onToggleReasoningDetailHidden={onToggleReasoningDetailHidden}
         onToggleProviderOutputItemHidden={onToggleProviderOutputItemHidden}
-        regenerateCapability={AVAILABLE_GENERATION_CAPABILITY}
-        continueCapability={AVAILABLE_GENERATION_CAPABILITY}
       />,
     )
 
@@ -483,7 +494,7 @@ describe('BranchTreeInspector', () => {
       content: [{ type: 'text', text: 'Original prompt' }],
     })
     const onEditAndSend = vi
-      .fn<() => GenerationStartResult>()
+      .fn<() => GenerationSubmission>()
       .mockImplementationOnce(() => startedGeneration(new Error('Temporary send failure')))
       .mockImplementationOnce(() => startedGeneration())
     render(
@@ -492,7 +503,6 @@ describe('BranchTreeInspector', () => {
         onClose={() => undefined}
         onEdit={succeededInteractionSettlement}
         onEditAndSend={onEditAndSend}
-        editResendCapability={AVAILABLE_GENERATION_CAPABILITY}
       />,
     )
 
@@ -511,14 +521,38 @@ describe('BranchTreeInspector', () => {
     )
   })
 
-  it('preserves an edit draft when a ready action synchronously does not start', () => {
+  it('keeps Save & Send actionable while the new-node prompt path is pending', async () => {
+    const userMessage = message({
+      role: 'user',
+      origin: 'imported',
+      content: [{ type: 'text', text: 'Newly committed prompt' }],
+    })
+    const onEditAndSend = vi.fn(() => startedGeneration())
+    render(
+      <BranchTreeInspector
+        message={userMessage}
+        onClose={() => undefined}
+        onEdit={succeededInteractionSettlement}
+        onEditAndSend={onEditAndSend}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Edit message' }))
+    const saveAndSend = screen.getByRole('button', { name: 'Save & Send' })
+    expect(saveAndSend).toBeEnabled()
+    fireEvent.click(saveAndSend)
+
+    expect(onEditAndSend).toHaveBeenCalledOnce()
+  })
+
+  it('preserves an edit draft and reports when a ready action synchronously does not start', () => {
     const userMessage = message({
       role: 'user',
       origin: 'user',
       content: [{ type: 'text', text: 'Original prompt' }],
     })
     const onEditAndSend = vi.fn(
-      (): GenerationStartResult => ({
+      (): GenerationSubmission => ({
         kind: 'not-started',
         capability: pendingGenerationCapability('prompt-path'),
       }),
@@ -529,7 +563,6 @@ describe('BranchTreeInspector', () => {
         onClose={() => undefined}
         onEdit={succeededInteractionSettlement}
         onEditAndSend={onEditAndSend}
-        editResendCapability={AVAILABLE_GENERATION_CAPABILITY}
       />,
     )
 
@@ -540,6 +573,9 @@ describe('BranchTreeInspector', () => {
 
     expect(onEditAndSend).toHaveBeenCalledWith(userMessage, 'Still local')
     expect(screen.getByRole('textbox', { name: 'Edit user message' })).toHaveValue('Still local')
+    expect(screen.getByRole('alert')).toHaveTextContent(
+      'This branch is still preparing. Save & Send did not start.',
+    )
   })
 
   it('preserves an active edit draft when a newer body snapshot arrives', () => {
@@ -640,7 +676,7 @@ describe('BranchTreeInspector', () => {
     expect(updatedBody).toHaveTextContent('Updated exact inspector body.')
   })
 
-  it('keeps header-only controls available but disables body-row actions while streaming', async () => {
+  it('keeps replacement generation actions live while protecting body mutations during streaming', async () => {
     const row = message({
       reasoningEnvelope: reasoningEnvelopeFromDetailsForTest(
         [{ type: 'reasoning.text', text: 'Persisted reasoning.', format: 'unknown' }],
@@ -678,8 +714,6 @@ describe('BranchTreeInspector', () => {
         onToggleContextVisibility={succeededInteractionSettlement}
         onToggleReasoningDetailHidden={succeededInteractionSettlement}
         onToggleProviderOutputItemHidden={succeededInteractionSettlement}
-        regenerateCapability={AVAILABLE_GENERATION_CAPABILITY}
-        continueCapability={AVAILABLE_GENERATION_CAPABILITY}
       />,
     )
     const { container } = view
@@ -705,7 +739,7 @@ describe('BranchTreeInspector', () => {
     expect(container.querySelector('[data-ui="markdown"]')).not.toHaveTextContent('Inspector body.')
     expect(screen.getByRole('button', { name: 'Edit message' })).toBeDisabled()
     expect(screen.getByRole('button', { name: 'Delete message' })).toBeDisabled()
-    expect(screen.getByRole('button', { name: 'Continue from here' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Continue from here' })).toBeEnabled()
     expect(
       screen.getByRole('button', { name: 'Hide from context (never send to model)' }),
     ).toBeEnabled()
@@ -721,7 +755,7 @@ describe('BranchTreeInspector', () => {
     toolEvidence.open = true
     fireEvent(toolEvidence, new Event('toggle'))
     expect(screen.getByRole('button', { name: 'Hide tool call' })).toBeDisabled()
-    expect(screen.getByRole('button', { name: 'Regenerate response' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Regenerate response' })).toBeEnabled()
     expect(screen.getByRole('button', { name: 'Branch this chat from here' })).toBeEnabled()
 
     clearTestLiveProjection('stream-1')
@@ -751,8 +785,6 @@ describe('BranchTreeInspector', () => {
         onToggleContextVisibility={succeededInteractionSettlement}
         onToggleReasoningDetailHidden={succeededInteractionSettlement}
         onToggleProviderOutputItemHidden={succeededInteractionSettlement}
-        regenerateCapability={AVAILABLE_GENERATION_CAPABILITY}
-        continueCapability={AVAILABLE_GENERATION_CAPABILITY}
       />,
     )
     await waitFor(() =>
@@ -1004,7 +1036,6 @@ describe('BranchTreeInspector', () => {
         onEdit={succeededInteractionSettlement}
         onDelete={succeededInteractionSettlement}
         onContinue={() => startedGeneration()}
-        continueCapability={AVAILABLE_GENERATION_CAPABILITY}
       />,
     )
 
@@ -1072,8 +1103,6 @@ describe('BranchTreeInspector', () => {
         onClose={() => undefined}
         onRegenerate={onRegenerate}
         onContinue={onContinue}
-        regenerateCapability={AVAILABLE_GENERATION_CAPABILITY}
-        continueCapability={AVAILABLE_GENERATION_CAPABILITY}
       />,
     )
 
@@ -1091,7 +1120,6 @@ describe('BranchTreeInspector', () => {
         onClose={() => undefined}
         onEdit={succeededInteractionSettlement}
         onEditAndSend={() => startedGeneration()}
-        editResendCapability={AVAILABLE_GENERATION_CAPABILITY}
       />,
     )
     fireEvent.click(screen.getByRole('button', { name: 'Edit message' }))

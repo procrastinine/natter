@@ -62,14 +62,6 @@ export interface MessagePresentation {
   readonly bodyVersion: number
 }
 
-export interface PreparedMessagePlacementFrame {
-  readonly chatId: ChatId
-  readonly structuralVersion: number
-  readonly createdAt: number
-  readonly slot: ActiveBranchChildSlot | null
-  readonly messages: readonly Message[]
-}
-
 export interface MessageMutationContext {
   getMessage(messageId: MessageId): Promise<Message | undefined>
   getMessageHeader(messageId: MessageId): Promise<MessageHeaderRow | undefined>
@@ -199,6 +191,16 @@ export type ConversationDestinationPoint =
       readonly target: ConversationSelectionProofTarget
       readonly structuralVersion: number
       readonly presentation: MessagePresentation
+    }
+
+export type ConversationDestinationHeaderPoint =
+  | Extract<ConversationDestinationPoint, { readonly kind: 'empty-point' }>
+  | {
+      readonly kind: 'tip-header-point'
+      readonly chat: Chat
+      readonly target: ConversationSelectionProofTarget
+      readonly structuralVersion: number
+      readonly header: MessageHeaderRow
     }
 
 const SEALED_CONVERSATION_SELECTION = Symbol('sealed-conversation-selection')

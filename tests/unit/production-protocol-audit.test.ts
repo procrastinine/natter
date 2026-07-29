@@ -113,19 +113,19 @@ describe('production workspace protocol audit', () => {
 
     expect(report).toMatchObject({
       ok: true,
-      sourceFiles: 481,
+      sourceFiles: 483,
       roots: {
         variants: 16,
         exclusiveVariants: 2,
         admissionFunctions: 7,
-        finiteAdmissions: 111,
+        finiteAdmissions: 110,
         unboundedAdmissions: 0,
         capabilityEscapes: 0,
       },
       problems: [],
     })
     expect(report.protocols.WorkspaceQuery).toMatchObject({
-      ingressSites: 97,
+      ingressSites: 99,
       dependencyProbeSites: 5,
       unclassifiedSites: 0,
       missingIngress: [],

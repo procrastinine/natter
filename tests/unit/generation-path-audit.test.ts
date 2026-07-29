@@ -1,6 +1,13 @@
 import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { relative, resolve } from 'node:path'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
+import {
+  conversationMutationTarget,
+  generationSubmitTarget,
+  reportConversationMutationFailure,
+  reportGenerationSubmissionFailure,
+  reportGenerationSubmissionPhase,
+} from '../../src/app/presentation-interactions'
 
 const SRC_ROOT = resolve(__dirname, '../../src')
 
@@ -358,6 +365,7 @@ describe('generation request path audit', () => {
 
     expect(directStarters).toEqual(['store/conversation-command-client.ts'])
     expect(client.match(/\bgenerationEngine\.start\s*\(/gu)).toHaveLength(6)
+    expect(client.match(/\bgenerationEngine\.startWhenCapabilitySettles\s*\(/gu)).toHaveLength(6)
     for (const kind of [
       'new-chat-send',
       'send',
@@ -388,6 +396,296 @@ describe('generation request path audit', () => {
     expect(engine.indexOf('const preparedIntent = admission.intent')).toBeLessThan(
       engine.indexOf('compactGenerationRuntimeIntent(preparedIntent)'),
     )
+  })
+
+  it('keeps existing-chat admission transactional while treating projections only as hints', () => {
+    const protocol = withoutComments(
+      readFileSync(resolve(SRC_ROOT, 'store/workspace-protocol.ts'), 'utf8'),
+    )
+    const admission = withoutComments(
+      readFileSync(resolve(SRC_ROOT, 'store/generation-admission-controller.ts'), 'utf8'),
+    )
+    const capability = withoutComments(
+      readFileSync(resolve(SRC_ROOT, 'store/generation-capability-controller.ts'), 'utf8'),
+    )
+    const attemptController = withoutComments(
+      readFileSync(resolve(SRC_ROOT, 'store/attempt-controller.ts'), 'utf8'),
+    )
+    const browser = withoutComments(
+      readFileSync(resolve(SRC_ROOT, 'store/browser-repo.ts'), 'utf8'),
+    )
+    const command = withoutComments(
+      readFileSync(resolve(SRC_ROOT, 'store/browser-generation-command-runtime.ts'), 'utf8'),
+    )
+    const production = sourceFiles()
+      .map((file) => withoutComments(readFileSync(file, 'utf8')))
+      .join('\n')
+    const placementStart = protocol.indexOf('export interface PrepareAttemptPlacementIntent')
+    const placementEnd = protocol.indexOf('export type PrepareAttemptInput', placementStart)
+    const placement = protocol.slice(placementStart, placementEnd)
+
+    expect(production).not.toContain('GenerationPlanningSeedChanged')
+    expect(production).not.toContain('selected-send')
+    expect(production).not.toContain('sendSelectedMessage')
+    expect(production).not.toContain('presentGenerationIntent')
+    expect(protocol).toContain('readonly pathHint: GenerationPromptPathReadHint')
+    expect(admission).toContain(
+      'material: conversationController.acquirePromptMaterial(workspace, chatId, [])',
+    )
+    expect(capability).toContain('return existingGenerationCapability(')
+    expect(capability).toContain(
+      "attemptAdmission.admission(probe.targetAssistantId) === 'occupied'",
+    )
+    expect(capability).not.toContain(
+      "attemptAdmission.admission(probe.targetAssistantId) === 'unknown'",
+    )
+    expect(admission).toContain('const trackedAttemptFrame = context.attemptAdmission')
+    expect(admission).toContain('trackedAttemptFrame?.workspaceId === workspace.workspaceId')
+    expect(attemptController).toContain(
+      "this.getTargetAdmissionFrame(chatId).admission(messageId) === 'occupied'",
+    )
+    expect(attemptController).not.toContain(
+      "this.getTargetAdmissionFrame(chatId).admission(messageId) !== 'available'",
+    )
+    expect(browser).toContain('readCurrentGenerationPromptPathFromHint(')
+    expect(browser).toContain('(await readBranchPathInTransaction(tx, chatId, leafId))')
+    expect(protocol).toContain('readonly target: ActiveBranchIntentTarget')
+    expect(browser).toContain('resolveGenerationSendPathInTransaction(')
+    expect(browser).toContain('resolvingConversationSelectionTarget(selection)')
+    expect(admission).toMatch(/case 'send':[\s\S]*?childSlot: 'append'/u)
+    expect(admission).toMatch(/case 'reply':[\s\S]*?childSlot: 'append'/u)
+    expect(command).toContain('const currentChat = await ctx.getChat(chatId)')
+    expect(command).toContain('const slot = promptPath.slot')
+    expect(placementStart).toBeGreaterThanOrEqual(0)
+    expect(placementEnd).toBeGreaterThan(placementStart)
+    expect(placement).not.toMatch(/\b(?:model|parentId|siblingIndex)\b/u)
+  })
+
+  it('routes every UI generation gesture through one owned settling submission', () => {
+    const uiGenerationBypasses = sourceFiles()
+      .map((file) => ({ file, path: rel(file) }))
+      .filter(({ path }) => /^(?:app|hooks|ui)\//u.test(path))
+      .filter(({ path }) => path !== 'app/conversation-actions.ts')
+      .filter(({ file }) =>
+        /(?:conversationActions|requireConversationActions\(\))\.(?:editAndResend|regenerate|continueMessage)\s*\(/u.test(
+          withoutComments(readFileSync(file, 'utf8')),
+        ),
+      )
+      .map(({ path }) => path)
+      .sort()
+    const shell = withoutComments(readFileSync(resolve(SRC_ROOT, 'app/Shell.tsx'), 'utf8'))
+    const submitStart = shell.indexOf('const handleSubmit = useCallback(')
+    const submitEnd = shell.indexOf('const handleNewChatSubmit = useCallback(', submitStart)
+    const submit = shell.slice(submitStart, submitEnd)
+    const silentUiNonStarts = sourceFiles()
+      .map((file) => ({ path: rel(file), source: withoutComments(readFileSync(file, 'utf8')) }))
+      .filter(({ path }) => /^(?:app|ui)\//u.test(path))
+      .filter(({ source }) => /\bgenerationNotStarted\s*\(/u.test(source))
+      .map(({ path }) => path)
+      .sort()
+    const readinessPermissionBypasses = sourceFiles()
+      .map((file) => ({ path: rel(file), source: withoutComments(readFileSync(file, 'utf8')) }))
+      .filter(({ path }) => /^(?:app|ui)\//u.test(path))
+      .filter(({ source }) =>
+        /\bgenerationCapability(?:Available|CanOwnIntent)\b|(?:generation|editResend|regenerate|continue)Capability\.state\s*===\s*['"]ready['"]/u.test(
+          source,
+        ),
+      )
+      .map(({ path }) => path)
+      .sort()
+    const message = withoutComments(readFileSync(resolve(SRC_ROOT, 'ui/chat/Message.tsx'), 'utf8'))
+    const messageActions = withoutComments(
+      readFileSync(resolve(SRC_ROOT, 'ui/chat/MessageActions.tsx'), 'utf8'),
+    )
+    const branchInspector = withoutComments(
+      readFileSync(resolve(SRC_ROOT, 'ui/chat/BranchTreeInspector.tsx'), 'utf8'),
+    )
+    const inlineEditor = withoutComments(
+      readFileSync(resolve(SRC_ROOT, 'ui/chat/InlineEditor.tsx'), 'utf8'),
+    )
+    const messageList = withoutComments(
+      readFileSync(resolve(SRC_ROOT, 'ui/chat/MessageList.tsx'), 'utf8'),
+    )
+    const branchTree = withoutComments(
+      readFileSync(resolve(SRC_ROOT, 'ui/chat/BranchTreeView.tsx'), 'utf8'),
+    )
+
+    expect(uiGenerationBypasses).toEqual([])
+    expect(silentUiNonStarts).toEqual([])
+    expect(readinessPermissionBypasses).toEqual([])
+    expect(message).not.toContain('availability?.blocksReplacement')
+    expect(branchInspector).not.toContain('availability?.blocksReplacement')
+    expect(message).not.toContain('saveAndSendDisabled')
+    expect(branchInspector).not.toContain('saveAndSendDisabled')
+    expect(messageActions).not.toMatch(/\b(?:regeneration|continuation)Disabled\b/u)
+    expect(inlineEditor).not.toContain('saveAndSendDisabled')
+    expect(inlineEditor).toContain('disabled={uploadingAttachments}')
+    expect(messageList).not.toMatch(/\bgenerationCapabilityFrame\b|\.capability\s*\(/u)
+    expect(branchTree).not.toMatch(/\bgenerationCapabilityFrame\b|\.capability\s*\(/u)
+    expect(shell.match(/\bownGenerationSubmission\s*\(/gu)).toHaveLength(6)
+    expect(shell.match(/\bgenerationSubmitTarget\s*\(/gu)).toHaveLength(4)
+    expect(shell).not.toMatch(/\bownGenerationSubmission\s*\(\s*generationSubmitTarget\s*\(/u)
+    expect(shell).not.toMatch(/\b(?:readonly\s+)?admit\b|\badmit\s*\(\s*\)/u)
+    expect(submit).toContain(
+      'const target = conversationController.captureGenerationTarget(activeChatId)',
+    )
+    expect(submit).toContain(
+      'sendMessageWhenCapabilitySettles(\n            activeChatId,\n            target,',
+    )
+    expect(submit).not.toContain('activeBranchTailId')
+    const submissionOwner = shell.slice(
+      shell.indexOf('const ownGenerationSubmission'),
+      shell.indexOf('const cancelGenerationSubmission'),
+    )
+    expect(submissionOwner.indexOf('await action({')).toBeGreaterThanOrEqual(0)
+    expect(submissionOwner.indexOf('await action({')).toBeLessThan(
+      submissionOwner.indexOf("phase: 'admitted'"),
+    )
+    expect(shell).toContain('editAndResendWhenCapabilitySettles(')
+    expect(shell).toContain('regenerateWhenCapabilitySettles(')
+    expect(shell).toContain('continueMessageWhenCapabilitySettles(')
+  })
+
+  it('owns conversation mutations in Shell instead of split surface presenters', () => {
+    const owners = sourceFiles()
+      .map((file) => ({ path: rel(file), source: withoutComments(readFileSync(file, 'utf8')) }))
+      .filter(({ source }) =>
+        /\busePresentationInteraction\s*\(\s*conversationMutationInteraction/u.test(source),
+      )
+      .map(({ path }) => path)
+      .sort()
+    const messageList = withoutComments(
+      readFileSync(resolve(SRC_ROOT, 'ui/chat/MessageList.tsx'), 'utf8'),
+    )
+
+    expect(owners).toEqual(['app/Shell.tsx'])
+    expect(messageList).toContain('runConversationMutation: ConversationMutationRunner')
+    expect(messageList).not.toContain('conversationMutationInteraction')
+    expect(conversationMutationTarget({ kind: 'delete', chatId: 'chat-1' })).toBe(
+      conversationMutationTarget({
+        kind: 'fork',
+        chatId: 'chat-1',
+        messageId: 'message-1',
+      }),
+    )
+  })
+
+  it('keeps edit presentation retention out of the authoritative workspace lifetime', () => {
+    const actions = withoutComments(
+      readFileSync(resolve(SRC_ROOT, 'app/conversation-actions.ts'), 'utf8'),
+    )
+    const start = actions.indexOf('function beginMessageEditSession(')
+    const end = actions.indexOf('export interface ConversationImportInput', start)
+    const editSession = actions.slice(start, end)
+    const client = withoutComments(
+      readFileSync(resolve(SRC_ROOT, 'store/conversation-command-client.ts'), 'utf8'),
+    )
+
+    expect(editSession).toContain('conversationController.claimTranscriptRetention({')
+    expect(editSession).toContain('workspaceFence,')
+    expect(editSession).not.toMatch(/\brunWorkspace(?:Action|ActionAtFence|Read)\s*\(/u)
+    expect(client).toContain("runWorkspaceAction(\n    'message-edit',")
+  })
+
+  it('owns every generation gesture at one chat-level target', () => {
+    const editTarget = generationSubmitTarget({
+      chatId: 'chat-1',
+      action: 'edit-resend',
+      messageId: 'user-1',
+    })
+    const regenerateTarget = generationSubmitTarget({
+      chatId: 'chat-1',
+      action: 'regenerate',
+      messageId: 'assistant-1',
+    })
+    const continueTarget = generationSubmitTarget({
+      chatId: 'chat-1',
+      action: 'continue',
+      messageId: 'assistant-2',
+    })
+
+    expect(editTarget).toBe(regenerateTarget)
+    expect(regenerateTarget).toBe(continueTarget)
+    expect(
+      generationSubmitTarget({
+        chatId: 'chat-2',
+        action: 'composer',
+      }),
+    ).not.toBe(editTarget)
+  })
+
+  it('emits a correlated console diagnostic for every preparation failure', () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    try {
+      expect(
+        reportGenerationSubmissionFailure({
+          claimId: 41,
+          target: 'chat:chat-1:message:user-1:edit-resend',
+          failure: { message: 'Workspace preparation failed.', tone: 'danger' },
+        }),
+      ).toEqual({
+        message: 'Workspace preparation failed.',
+        diagnosticId: 'generation-submit-41',
+      })
+      expect(error).toHaveBeenCalledWith(
+        '[generation-submit][generation-submit-41]',
+        expect.objectContaining({
+          target: 'chat:chat-1:message:user-1:edit-resend',
+          message: 'Workspace preparation failed.',
+          tone: 'danger',
+        }),
+      )
+      reportConversationMutationFailure({
+        claimId: 43,
+        target: 'chat:chat-1:structure',
+        failure: { message: 'Delete transaction failed.', tone: 'danger' },
+      })
+      expect(error).toHaveBeenCalledWith(
+        '[conversation-mutation][conversation-mutation-43]',
+        expect.objectContaining({
+          target: 'chat:chat-1:structure',
+          message: 'Delete transaction failed.',
+          tone: 'danger',
+        }),
+      )
+    } finally {
+      error.mockRestore()
+    }
+  })
+
+  it('reports the exact preparation boundary without adding an admission gate', () => {
+    const info = vi.spyOn(console, 'info').mockImplementation(() => undefined)
+    try {
+      reportGenerationSubmissionPhase({
+        claimId: 42,
+        target: 'chat:chat-1:message:user-1:edit-resend',
+        phase: 'waiting',
+        owner: 'prompt-path',
+      })
+      reportGenerationSubmissionPhase({
+        claimId: 42,
+        target: 'chat:chat-1:message:user-1:edit-resend',
+        phase: 'repository-requested',
+      })
+
+      expect(info).toHaveBeenNthCalledWith(
+        1,
+        '[generation-submit][generation-submit-42]',
+        expect.objectContaining({
+          phase: 'waiting',
+          owner: 'prompt-path',
+        }),
+      )
+      expect(info).toHaveBeenNthCalledWith(
+        2,
+        '[generation-submit][generation-submit-42]',
+        expect.objectContaining({
+          phase: 'repository-requested',
+        }),
+      )
+    } finally {
+      info.mockRestore()
+    }
   })
 
   it('keeps saved template sources in point-addressed rows outside compatibility envelopes', () => {

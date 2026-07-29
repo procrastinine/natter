@@ -1,6 +1,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { StrictMode, useLayoutEffect, useMemo, useRef, useSyncExternalStore } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { GenerationSubmission } from '../../src/app/presentation-interactions'
 import {
   type ActiveBranchForkSlot,
   createActiveBranchSpineFromPath,
@@ -9,7 +10,6 @@ import {
 import type { MessageTreeProjection } from '../../src/core/active-path'
 import { createBranchPath } from '../../src/core/branch-session'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
-import { AVAILABLE_GENERATION_CAPABILITY } from '../../src/core/interaction-capability'
 import { createMessageTopologyIndex } from '../../src/core/message-topology'
 import { messageTreeIndexFields } from '../../src/core/message-tree-index'
 import {
@@ -32,8 +32,6 @@ import {
   createConversationController,
   TREE_PREVIEW_MAX_CHARS,
 } from '../../src/store/conversation-controller'
-import type { GenerationCapabilityFrame } from '../../src/store/generation-admission-controller'
-import type { GenerationStartResult } from '../../src/store/generation-engine'
 import { type MessageHeaderRow, sameMessageHeaderValue } from '../../src/store/message-storage'
 import {
   attachMountedRepositoryProjections,
@@ -89,10 +87,6 @@ vi.mock('../../src/ui/attachments/useAttachmentObjectUrl', () => ({
 }))
 
 type CursorMap = Readonly<Record<string, MessageId>>
-
-const READY_GENERATION_CAPABILITY_FRAME: GenerationCapabilityFrame = Object.freeze({
-  capability: () => AVAILABLE_GENERATION_CAPABILITY,
-})
 
 const TEST_STRUCTURAL_VERSION = 1
 const EMPTY_TREE_PREVIEWS: ConversationTreeSurface['previews'] = new Map()
@@ -291,21 +285,12 @@ function testChat(chatId: string, structuralVersion: number, leafId: MessageId |
   }
 }
 
-function startedGenerationResult(messageId = 'generated'): GenerationStartResult {
-  const prepared = Object.freeze({
-    streamId: `stream-${messageId}`,
-    chatId: 'chat-1',
-    assistantMessageId: messageId,
-  })
+function startedGenerationResult(_messageId = 'generated'): GenerationSubmission {
   return Object.freeze({
     kind: 'started' as const,
-    handle: Object.freeze({
-      streamId: prepared.streamId,
-      chatId: prepared.chatId,
-      prepared: Promise.resolve(prepared),
-      completed: Promise.resolve({ ...prepared, outcome: 'done' as const }),
-      abort: () => undefined,
-    }),
+    admission: Promise.resolve(Object.freeze({ kind: 'admitted' as const })),
+    completion: Promise.resolve(Object.freeze({ kind: 'prepared' as const })),
+    cancel: () => undefined,
   })
 }
 
@@ -313,15 +298,10 @@ const BranchTreeView = Object.assign(
   function TestBranchTreeView(
     props: Omit<
       BranchTreeViewProps,
-      | 'attempts'
-      | 'binding'
-      | 'conversationController'
-      | 'generationCapabilityFrame'
-      | 'viewportActive'
+      'attempts' | 'binding' | 'conversationController' | 'viewportActive'
     > & {
       chatId: string
       cursor: CursorMap
-      generationCapabilityFrame?: GenerationCapabilityFrame
       headers: readonly MessageHeaderRow[]
       latestHeaders?: readonly MessageHeaderRow[]
       localPresentations?: ReadonlyMap<
@@ -341,7 +321,6 @@ const BranchTreeView = Object.assign(
       testController,
       viewportActive = true,
       bindingCurrency = 'current',
-      generationCapabilityFrame = READY_GENERATION_CAPABILITY_FRAME,
       ...viewProps
     } = props
     const structuralHeaders = headers
@@ -779,7 +758,6 @@ const BranchTreeView = Object.assign(
         attempts={attempts}
         viewportActive={viewportActive}
         conversationController={controller}
-        generationCapabilityFrame={generationCapabilityFrame}
       />
     )
   },
@@ -3441,6 +3419,7 @@ describe('BranchTreeView', () => {
         cursor={{ root: 'left' }}
         expanded={false}
         bindingCurrency="retained"
+        mutationsUnavailable
         repository={treeRepository}
         onActivateNode={() => undefined}
       />,
@@ -3457,11 +3436,13 @@ describe('BranchTreeView', () => {
         headers={changedTree}
         cursor={{ root: 'left' }}
         expanded={false}
+        bindingCurrency="retained"
         repository={treeRepository}
         onActivateNode={() => undefined}
       />,
     )
     expect(document.querySelector('[data-ui="branch-tree-view"]')).toBe(workspace)
+    expect(workspace).not.toHaveAttribute('inert')
     expect(document.querySelectorAll('[data-ui="branch-tree-node"]')).toHaveLength(4)
     expect(computations.filter((entry) => entry === 'layout')).toHaveLength(activeLayouts + 1)
     expect(computations.filter((entry) => entry === 'connector-index')).toHaveLength(

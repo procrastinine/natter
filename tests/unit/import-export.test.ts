@@ -10,7 +10,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { recentModelRecencyBackfillMarker } from '../../src/backcompat/global-settings'
 import { migrateNatterExportEnvelope } from '../../src/backcompat/import-export'
 import { LEGACY_STORAGE_COMPACTION_STATE_KEY } from '../../src/backcompat/storage-compaction-control'
-import { connectionDispatchProfileProof } from '../../src/core/connection-dispatch-proof'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import { RECENT_MODEL_RECENCY_KEY, RECENT_MODELS_KEY } from '../../src/core/global-settings'
 import { retainReachableIncomingAttachments } from '../../src/core/import-export/attachment-reachability'
@@ -23,7 +22,6 @@ import {
 } from '../../src/core/import-export/schema'
 import { normalizeWorkspaceCredentialReferences } from '../../src/core/import-export/workspace-credentials'
 import { validateWorkspaceBackupGraph } from '../../src/core/import-export/workspace-validation'
-import { keyDispatchRevisions } from '../../src/core/key-dispatch-proof'
 import {
   EMPTY_TEXT_TEMPLATE,
   LEGACY_SAVED_TEXT_TEMPLATES_KEY,
@@ -76,7 +74,6 @@ import {
 } from '../../src/store/chat-sidebar-projection'
 
 import { configurationApplication } from '../../src/store/configuration-application'
-import { configurationRequestRevisionFor } from '../../src/store/configuration-domain-contract'
 import { CONFIGURATION_PROFILE_MANAGER_STATE_ID } from '../../src/store/configuration-profile-usage-projection'
 import { __resetDbForTests, getDb, NatterDb, openDb } from '../../src/store/db'
 import { configurationDiscoveryApplication } from '../../src/store/discovery-service'
@@ -91,7 +88,7 @@ import {
   restoreWorkspaceBackup,
   WorkspaceReplacementInProgressError,
 } from '../../src/store/import-export'
-import { __resetKeyCacheForTests, createKey, getKey } from '../../src/store/keys'
+import { __resetKeyCacheForTests, createKey } from '../../src/store/keys'
 import {
   __resetLockTrackerForTests,
   createIndexedDbLockBackend,
@@ -133,7 +130,6 @@ import {
   createConfigurationProfile,
   createConfigurationPromptPreset,
   listConfigurationChatPresets,
-  testChatConfigurationLinkTransition,
 } from '../helpers/configuration'
 import { deleteNatterIndexedDatabasesForTests } from '../helpers/fake-indexeddb'
 import {
@@ -533,24 +529,10 @@ async function prepareBlockingAttempt(
       heartbeatAt: startedAt,
       attemptKind: kind === 'Continue' ? ('continuation' as const) : ('generation' as const),
     })
-    const profile = must(await getDb().profiles.get(seeded.profile.id), 'generation profile')
-    const keyRefs = [profile.apiKeyRef, ...(profile.apiKeyFallbackRefs ?? [])].filter(
-      (keyId): keyId is string => keyId !== undefined,
-    )
-    const keys = await getDb().keys.bulkGet(keyRefs)
-    const primaryKey = profile.apiKeyRef ? await getKey(profile.apiKeyRef) : undefined
     const promptHeaders = await generationPromptPathClaims(seeded.assistantMessage.id)
-    const configurationClaim = {
-      configurationVersion: seeded.chat.configurationVersion ?? 0,
-      settings: seeded.chat.settings,
-      presetId: seeded.chat.presetId ?? null,
-      profile: connectionDispatchProfileProof(profile, seeded.chat.settings.model),
-      requestRevision: configurationRequestRevisionFor(profile, primaryKey),
-      dispatchKeyRevisions: keyDispatchRevisions(keyRefs, keys),
+    const configurationIntent = {
       preferredDispatchKeyId: null,
-      workspaceSettingOverrides: [],
     }
-    const configurationLinkTransition = testChatConfigurationLinkTransition(seeded.chat)
     const sendTurnId = newId()
     const reservedUser = message({
       id: 'reserved-send-user',
@@ -587,8 +569,7 @@ async function prepareBlockingAttempt(
         ? ({
             strategy: 'continue',
             lease,
-            configurationClaim,
-            configurationLinkTransition,
+            configurationIntent,
             promptPath: {
               requirement: {
                 kind: 'continue',
@@ -601,7 +582,7 @@ async function prepareBlockingAttempt(
                 },
                 childSlot: 'none',
               },
-              claim: {
+              pathHint: {
                 chatId: seeded.chat.id,
                 structuralVersion: seeded.chat.structuralVersion,
                 leafId: seeded.assistantMessage.id,
@@ -614,21 +595,19 @@ async function prepareBlockingAttempt(
         : ({
             strategy: 'send',
             lease,
-            configurationClaim,
-            configurationLinkTransition,
+            configurationIntent,
             promptPath: {
               requirement: {
                 kind: 'send',
                 surface: 'chat',
                 chatId: seeded.chat.id,
                 target: {
-                  kind: 'include',
-                  messageId: seeded.assistantMessage.id,
-                  role: 'any',
+                  kind: 'selection',
+                  selection: { kind: 'tip', messageId: seeded.assistantMessage.id },
                 },
-                childSlot: 'empty',
+                childSlot: 'append',
               },
-              claim: {
+              pathHint: {
                 chatId: seeded.chat.id,
                 structuralVersion: seeded.chat.structuralVersion,
                 leafId: seeded.assistantMessage.id,
@@ -647,15 +626,14 @@ async function prepareBlockingAttempt(
             },
             placement: {
               chatId: seeded.chat.id,
-              structuralVersion: seeded.chat.structuralVersion,
               createdAt: startedAt,
-              slot: {
-                parentId: seeded.assistantMessage.id,
-                slotVersion: 0,
-                liveCount: 0,
-                nextSiblingIndex: 0,
+              assistantMessageId: reservedAssistant.id,
+              user: {
+                messageId: reservedUser.id,
+                content: reservedUser.content,
+                attachmentRefs: reservedUser.attachmentRefs ?? [],
               },
-              messages: [reservedUser, reservedAssistant],
+              prefillContent: reservedAssistant.content,
             },
           } as const)
     await getWorkspaceRepository().execute(permit, { kind: 'attempt.prepare', input })

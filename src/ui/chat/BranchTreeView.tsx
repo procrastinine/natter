@@ -14,14 +14,16 @@ import {
   useState,
   useSyncExternalStore,
 } from 'react'
-import type { ConversationMutationSettlement } from '../../app/presentation-interactions'
+import type {
+  ConversationMutationSettlement,
+  GenerationSubmission,
+} from '../../app/presentation-interactions'
 import { chatHref } from '../../app/router'
 import {
   type BranchTreeLayout,
   type BranchTreeLayoutNode,
   layoutBranchTree,
 } from '../../core/branch-tree-layout'
-import { pendingGenerationCapability } from '../../core/interaction-capability'
 import type {
   ChatId,
   Message,
@@ -44,8 +46,6 @@ import type {
   BranchTreeSearchSource,
   ConversationController,
   ConversationTreeSurface,
-  GenerationCapabilityFrame,
-  GenerationStartResult,
   MessageAttachmentRefMutation,
   MessageHeaderRow,
   RequestableAttemptStopCapability,
@@ -134,9 +134,9 @@ interface BranchTreeHeaderLookup {
 
 type BranchTreeAction = (messageId: MessageId, observedTipId?: MessageId) => void | Promise<void>
 type BranchTreeEditAction = (message: Message, text: string) => ConversationMutationSettlement
-type BranchTreeGenerationEditAction = (message: Message, text: string) => GenerationStartResult
+type BranchTreeGenerationEditAction = (message: Message, text: string) => GenerationSubmission
 type BranchTreeMessageMutationAction = (message: Message) => ConversationMutationSettlement
-type BranchTreeGenerationMessageAction = (message: Message) => GenerationStartResult
+type BranchTreeGenerationMessageAction = (message: Message) => GenerationSubmission
 type BranchTreeProviderOutputAction = (
   message: Message,
   member: ProviderOutputMemberRef,
@@ -154,6 +154,8 @@ export interface BranchTreeViewProps {
   binding: ConversationTreeSurface
   attempts: readonly AttemptExecutionRecord[]
   viewportActive: boolean
+  mutationsUnavailable?: boolean
+  structuralMutationPending?: boolean
   expanded: boolean
   previewFontFamily?: string
   selectedNodeId?: MessageId | null
@@ -175,7 +177,9 @@ export interface BranchTreeViewProps {
   onToggleReasoningDetailHidden?: BranchTreeReasoningAction
   onToggleProviderOutputItemHidden?: BranchTreeProviderOutputAction
   onRequestStop?: (capability: RequestableAttemptStopCapability) => void
-  generationCapabilityFrame: GenerationCapabilityFrame
+  generationSubmissionPending?: boolean
+  onCancelGenerationSubmission?: () => void
+  onCancelStructuralMutation?: () => void
   className?: string
 }
 
@@ -427,6 +431,8 @@ function connectorIndexFor(layout: BranchTreeLayout): ConnectorIndex {
 
 const ActiveBranchTreeView = memo(function ActiveBranchTreeView({
   viewportActive,
+  mutationsUnavailable = false,
+  structuralMutationPending = false,
   binding,
   attempts,
   expanded,
@@ -450,11 +456,13 @@ const ActiveBranchTreeView = memo(function ActiveBranchTreeView({
   onToggleReasoningDetailHidden,
   onToggleProviderOutputItemHidden,
   onRequestStop,
-  generationCapabilityFrame,
+  generationSubmissionPending = false,
+  onCancelGenerationSubmission,
+  onCancelStructuralMutation,
   className,
 }: ActiveBranchTreeViewProps) {
   branchTreeComputationProbe?.('render')
-  const bodyActive = viewportActive && binding.currency === 'current'
+  const bodyActive = viewportActive && !mutationsUnavailable
   const controller = injectedController ?? defaultConversationController
   const chatId = binding.seal.chatId
   const exactHeaderById = binding.headers
@@ -1270,30 +1278,6 @@ const ActiveBranchTreeView = memo(function ActiveBranchTreeView({
     if (!inspectorBody || liveSelectedHeader?.id !== inspectorBody.id) return undefined
     return rebaseHydratedMessageHeader(inspectorBody, liveSelectedHeader)
   }, [inspectorBody, liveSelectedHeader])
-  const inspectorEditResendCapability =
-    inspectorMessage?.role === 'user'
-      ? generationCapabilityFrame.capability({
-          kind: 'edit-resend',
-          chatId,
-          targetUserId: inspectorMessage.id,
-        })
-      : pendingGenerationCapability('prompt-path')
-  const inspectorRegenerateCapability =
-    inspectorMessage?.role === 'assistant'
-      ? generationCapabilityFrame.capability({
-          kind: 'regenerate',
-          chatId,
-          targetAssistantId: inspectorMessage.id,
-        })
-      : pendingGenerationCapability('prompt-path')
-  const inspectorContinueCapability =
-    inspectorMessage?.role === 'assistant'
-      ? generationCapabilityFrame.capability({
-          kind: 'continue',
-          chatId,
-          targetAssistantId: inspectorMessage.id,
-        })
-      : pendingGenerationCapability('prompt-path')
   const handleInspectorActivate = useCallback(() => {
     if (inspectedMessageId) void activateNode(inspectedMessageId)
   }, [activateNode, inspectedMessageId])
@@ -1534,20 +1518,21 @@ const ActiveBranchTreeView = memo(function ActiveBranchTreeView({
                   {onInsertAtSharedTrunk
                     ? visibleConnectors.shared.map((connector) => {
                         const streamBusy = streamBusyParentIds.has(connector.parentId)
+                        const structuralBusy = streamBusy || structuralMutationPending
                         return (
                           <SvgAction
                             key={`${connector.key}:hit-group`}
                             label="Insert after this parent before all of its children"
-                            disabled={streamBusy}
+                            disabled={structuralBusy}
                             data-connector-hit="shared-trunk"
                             data-parent-id={connector.parentId}
                             data-stream-busy={streamBusy || undefined}
                             onPointerEnter={() => {
-                              if (!streamBusy) setHoveredConnectorKey(connector.key)
+                              if (!structuralBusy) setHoveredConnectorKey(connector.key)
                             }}
                             onPointerLeave={() => setHoveredConnectorKey(null)}
                             onFocus={() => {
-                              if (!streamBusy) setHoveredConnectorKey(connector.key)
+                              if (!structuralBusy) setHoveredConnectorKey(connector.key)
                             }}
                             onBlur={() => setHoveredConnectorKey(null)}
                             onActivate={() => {
@@ -1556,9 +1541,11 @@ const ActiveBranchTreeView = memo(function ActiveBranchTreeView({
                               )
                             }}
                           >
-                            {streamBusy ? (
+                            {structuralBusy ? (
                               <title>
-                                Wait for the connected generation to finish before inserting
+                                {structuralMutationPending
+                                  ? 'Wait for the current structural update before inserting'
+                                  : 'Wait for the connected generation to finish before inserting'}
                               </title>
                             ) : null}
                             <path d={connector.path} data-ui="branch-tree-connector-hit-path" />
@@ -1575,21 +1562,22 @@ const ActiveBranchTreeView = memo(function ActiveBranchTreeView({
                   {onInsertAtChildLeg
                     ? visibleConnectors.children.map((connector) => {
                         const streamBusy = busyMessageIds.has(connector.childId)
+                        const structuralBusy = streamBusy || structuralMutationPending
                         return (
                           <SvgAction
                             key={`${connector.key}:hit-group`}
                             label="Insert before this child only"
-                            disabled={streamBusy}
+                            disabled={structuralBusy}
                             data-connector-hit="child-leg"
                             data-parent-id={connector.parentId}
                             data-child-id={connector.childId}
                             data-stream-busy={streamBusy || undefined}
                             onPointerEnter={() => {
-                              if (!streamBusy) setHoveredConnectorKey(connector.key)
+                              if (!structuralBusy) setHoveredConnectorKey(connector.key)
                             }}
                             onPointerLeave={() => setHoveredConnectorKey(null)}
                             onFocus={() => {
-                              if (!streamBusy) setHoveredConnectorKey(connector.key)
+                              if (!structuralBusy) setHoveredConnectorKey(connector.key)
                             }}
                             onBlur={() => setHoveredConnectorKey(null)}
                             onActivate={() => {
@@ -1598,8 +1586,12 @@ const ActiveBranchTreeView = memo(function ActiveBranchTreeView({
                               )
                             }}
                           >
-                            {streamBusy ? (
-                              <title>Wait for this generation to finish before inserting</title>
+                            {structuralBusy ? (
+                              <title>
+                                {structuralMutationPending
+                                  ? 'Wait for the current structural update before inserting'
+                                  : 'Wait for this generation to finish before inserting'}
+                              </title>
                             ) : null}
                             <path d={connector.path} data-ui="branch-tree-connector-hit-path" />
                             <BranchTreeAddMarker
@@ -1616,6 +1608,7 @@ const ActiveBranchTreeView = memo(function ActiveBranchTreeView({
                     ? visibleNodes.map((node) => {
                         if ((layout.childrenByParent.get(node.id)?.length ?? 0) > 0) return null
                         const streamBusy = busyMessageIds.has(node.id)
+                        const structuralBusy = streamBusy || structuralMutationPending
                         const markerKey = `leaf:${node.id}`
                         const x = node.x + node.width / 2
                         const startY = node.y + node.height
@@ -1625,16 +1618,16 @@ const ActiveBranchTreeView = memo(function ActiveBranchTreeView({
                           <SvgAction
                             key={markerKey}
                             label="Add message after this leaf"
-                            disabled={streamBusy}
+                            disabled={structuralBusy}
                             data-connector-hit="leaf-append"
                             data-parent-id={node.id}
                             data-stream-busy={streamBusy || undefined}
                             onPointerEnter={() => {
-                              if (!streamBusy) setHoveredConnectorKey(markerKey)
+                              if (!structuralBusy) setHoveredConnectorKey(markerKey)
                             }}
                             onPointerLeave={() => setHoveredConnectorKey(null)}
                             onFocus={() => {
-                              if (!streamBusy) setHoveredConnectorKey(markerKey)
+                              if (!structuralBusy) setHoveredConnectorKey(markerKey)
                             }}
                             onBlur={() => setHoveredConnectorKey(null)}
                             onActivate={() => {
@@ -1643,9 +1636,11 @@ const ActiveBranchTreeView = memo(function ActiveBranchTreeView({
                               )
                             }}
                           >
-                            {streamBusy ? (
+                            {structuralBusy ? (
                               <title>
-                                Wait for this generation to finish before adding a child
+                                {structuralMutationPending
+                                  ? 'Wait for the current structural update before adding a child'
+                                  : 'Wait for this generation to finish before adding a child'}
                               </title>
                             ) : null}
                             <path
@@ -1816,9 +1811,10 @@ const ActiveBranchTreeView = memo(function ActiveBranchTreeView({
                     bodyReady={exactInspectorBodyReady}
                     searchQuery={normalizedQuery}
                     searchMatched={matchSet.has(inspectedMessageId)}
-                    editResendCapability={inspectorEditResendCapability}
-                    regenerateCapability={inspectorRegenerateCapability}
-                    continueCapability={inspectorContinueCapability}
+                    generationSubmissionPending={generationSubmissionPending}
+                    structuralMutationPending={structuralMutationPending}
+                    {...(onCancelGenerationSubmission ? { onCancelGenerationSubmission } : {})}
+                    {...(onCancelStructuralMutation ? { onCancelStructuralMutation } : {})}
                     streamOnActivePath={activePathIds.has(inspectedMessageId)}
                     onClose={clearSelection}
                     onActivate={handleInspectorActivate}

@@ -1,7 +1,7 @@
 import Dexie, { type Transaction } from 'dexie'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { AssistantStreamChunk } from '../../src/api/assistant-stream'
-import { navigate, newChatHref } from '../../src/app/router'
+import { chatHref, navigate, newChatHref } from '../../src/app/router'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import type {
   ChatSettings,
@@ -242,16 +242,18 @@ describe('generation intent outbound-path and body-I/O contract', () => {
         (rows) => rows <= TRANSCRIPT_BODY_PAGE_ROWS,
       ),
     ).toBe(true)
-    if (kind !== 'new-chat-send') {
-      expect(capture.queryEvidenceAtOpen.queryKinds).toContain('branch.page-structure')
-      expect(capture.queryEvidenceAtOpen.branchPageStructureRows.length).toBeGreaterThan(0)
-    }
-
     for (const id of [...scenario.coldBodyIds, ...scenario.siblingBodyIds]) {
       expect(capture.readsAtOpen, `body ${id} must stay cold`).not.toContain(id)
     }
     const counts = countBodyReads(capture.readsAtOpen)
-    expect([...counts.values()].every((count) => count === 1)).toBe(true)
+    expect(
+      [...counts.values()].every((count) => count === 1),
+      JSON.stringify({
+        counts: [...counts],
+        batches: capture.bodyBatchesAtOpen,
+        queries: capture.queryEvidenceAtOpen,
+      }),
+    ).toBe(true)
     const readableBodyIds = new Set(scenario.readableBodyIds)
     expect([...counts.keys()].every((id) => readableBodyIds.has(id))).toBe(true)
     expect(counts.size).toBeLessThanOrEqual(
@@ -266,11 +268,11 @@ describe('generation intent outbound-path and body-I/O contract', () => {
         preparedAttempt.userMessageId,
       )
     }
-    expect(
-      promptReadIds,
-      'prepared assistant body must not be read for prompt planning',
-    ).not.toContain(preparedAttempt.assistantMessageId)
     if (kind !== 'continue') {
+      expect(
+        promptReadIds,
+        'prepared assistant body must not be read for prompt planning',
+      ).not.toContain(preparedAttempt.assistantMessageId)
       expect(capture.readsAtOpen, 'prepared assistant body must not be reread').not.toContain(
         preparedAttempt.assistantMessageId,
       )
@@ -287,7 +289,10 @@ describe('generation intent outbound-path and body-I/O contract', () => {
     const intent = {
       kind: 'send' as const,
       chatId: fixture.chatId,
-      expectedLeafId: required(fixture.path.at(-1), 'reconciled leaf').id,
+      target: {
+        kind: 'fixed',
+        messageId: required(fixture.path.at(-1), 'reconciled leaf').id,
+      } as const,
       content: [{ type: 'text' as const, text: submitted }],
     }
     const releaseSurface = await prepareControlledGenerationSurface(intent, {
@@ -314,7 +319,10 @@ describe('generation intent outbound-path and body-I/O contract', () => {
     expect(providerWire.ignore).toContain('tiny-cap')
     expect(providerWire.ignore).not.toContain('large-cap')
     const counts = countBodyReads(bodyReads.ids)
-    expect([...counts.values()].every((count) => count === 1)).toBe(true)
+    expect(
+      [...counts.values()].every((count) => count === 1),
+      JSON.stringify([...counts]),
+    ).toBe(true)
     for (const id of fixture.siblingBodyIds) expect(bodyReads.ids).not.toContain(id)
   })
 
@@ -395,7 +403,7 @@ describe('generation intent outbound-path and body-I/O contract', () => {
     const sendIntent = {
       kind: 'send' as const,
       chatId: chat.id,
-      expectedLeafId: null,
+      target: { kind: 'fixed', messageId: null } as const,
       content,
       prefillContent,
       attachmentRefs,
@@ -477,7 +485,7 @@ describe('generation intent outbound-path and body-I/O contract', () => {
     expect(regenerateWireText).not.toContain('mutated system')
   })
 
-  it('commits the exact nonzero-sibling regenerate placement shown at admission', async () => {
+  it('derives nonzero-sibling regenerate placement only from the authoritative transaction', async () => {
     const chat = await createChat({ settings: boundedSettings() })
     const path = await seedLinear(chat.id, [
       { role: 'user', text: 'regenerate exact placement parent' },
@@ -502,8 +510,6 @@ describe('generation intent outbound-path and body-I/O contract', () => {
     const providerGate = new Promise<void>((resolve) => {
       releaseProvider = resolve
     })
-    const presented = vi.spyOn(conversationController, 'presentGenerationIntent')
-    let immediate: Message | undefined
     let committed: Message | undefined
     let preparedAssistantId: MessageId | undefined
     try {
@@ -511,7 +517,6 @@ describe('generation intent outbound-path and body-I/O contract', () => {
         profile: profile(),
         openStream: () => gatedCompletedStream(providerGate, 'replacement answer'),
       })
-      immediate = required(presented.mock.calls.at(-1)?.[1].messages.at(-1), 'immediate placement')
       const prepared = await handle.prepared
       preparedAssistantId = prepared.assistantMessageId
       committed = required(
@@ -523,33 +528,19 @@ describe('generation intent outbound-path and body-I/O contract', () => {
       releaseProvider()
       await expect(handle.completed).resolves.toMatchObject({ outcome: 'done' })
     } finally {
-      presented.mockRestore()
       releaseProvider()
     }
-    const exactImmediate = required(immediate, 'captured immediate placement')
     const exactCommitted = required(committed, 'captured committed placement')
-    expect(exactImmediate.siblingIndex).toBe(2)
     expect(exactCommitted.id).toBe(preparedAssistantId)
-    const {
-      generation: immediateGeneration,
-      nodeVersion: immediateNodeVersion,
-      ...immediateMessage
-    } = exactImmediate
-    const {
-      generation: committedGeneration,
-      nodeVersion: committedNodeVersion,
-      ...committedMessage
-    } = exactCommitted
-    expect(committedMessage).toEqual(immediateMessage)
-    expect(immediateNodeVersion).toBe(0)
-    expect(committedNodeVersion).toBeGreaterThanOrEqual(immediateNodeVersion)
-    const { reasoningVisibility: _immediateVisibility, ...immediateProvenance } = required(
-      immediateGeneration,
-      'immediate generation',
-    )
-    expect(committedGeneration).toMatchObject({
-      ...immediateProvenance,
-      status: 'streaming',
+    expect(exactCommitted).toMatchObject({
+      parentId: target.parentId,
+      siblingIndex: 2,
+      role: 'assistant',
+      origin: 'generated',
+      generation: {
+        model: chat.settings.model,
+        status: 'streaming',
+      },
     })
   })
 
@@ -583,7 +574,7 @@ describe('generation intent outbound-path and body-I/O contract', () => {
         ? {
             kind,
             chatId: chat.id,
-            expectedLeafId: assistant.id,
+            target: { kind: 'fixed', messageId: assistant.id },
             content: [{ type: 'text', text: 'send after imported chain' }],
           }
         : { kind, chatId: chat.id, targetAssistantId: assistant.id }
@@ -595,7 +586,97 @@ describe('generation intent outbound-path and body-I/O contract', () => {
     expect(result.completed.error).toBeUndefined()
   })
 
-  it('retains one frozen first submit while destination selection settles', async () => {
+  it('save-and-send appends from an imported intermediate node with existing descendants', async () => {
+    const chat = await createChat({ settings: boundedSettings() })
+    const path = await seedLinear(chat.id, [
+      { role: 'user', text: 'intermediate root' },
+      { role: 'assistant', text: 'intermediate target' },
+      { role: 'user', text: 'existing descendant user' },
+      { role: 'assistant', text: 'existing descendant assistant' },
+    ])
+    const target = required(path[1], 'intermediate send target')
+    const submitted = 'new branch from intermediate target'
+    const result = await runSettlingToCompletion(
+      {
+        kind: 'send',
+        chatId: chat.id,
+        target: { kind: 'fixed', messageId: target.id },
+        content: [{ type: 'text', text: submitted }],
+      },
+      () => completedStream('intermediate branch answer'),
+    )
+
+    expect(result.completed).toMatchObject({ outcome: 'done' })
+    const durable = await readTestMessages(chat.id)
+    const user = required(
+      durable.find((message) => message.id === result.prepared.userMessageId),
+      'intermediate branch user',
+    )
+    const assistant = required(
+      durable.find((message) => message.id === result.prepared.assistantMessageId),
+      'intermediate branch assistant',
+    )
+    expect(user).toMatchObject({
+      parentId: target.id,
+      siblingIndex: 1,
+      content: [{ type: 'text', text: submitted }],
+    })
+    expect(assistant).toMatchObject({
+      parentId: user.id,
+      siblingIndex: 0,
+      role: 'assistant',
+    })
+  })
+
+  it('repeatedly regenerates one imported non-leaf across on-spine and off-spine transitions', async () => {
+    const chat = await createChat({ settings: boundedSettings() })
+    const path = await seedLinear(chat.id, [
+      { role: 'user', text: 'non-leaf regenerate parent' },
+      { role: 'assistant', text: 'non-leaf regenerate target' },
+      { role: 'user', text: 'non-leaf regenerate descendant user' },
+      { role: 'assistant', text: 'non-leaf regenerate descendant assistant' },
+    ])
+    const target = required(path.at(-3), 'non-leaf regenerate target')
+    const descendantLeaf = required(path.at(-1), 'non-leaf regenerate descendant leaf')
+    const generatedIds = new Set<MessageId>()
+    const releaseSurface = await prepareControlledGenerationSurface(
+      {
+        kind: 'regenerate',
+        chatId: chat.id,
+        targetAssistantId: target.id,
+      },
+      { profile: profile() },
+    )
+    releaseSurface()
+
+    for (let iteration = 1; iteration <= 8; iteration += 1) {
+      if (iteration % 2 === 0) navigate(chatHref(chat.id, descendantLeaf.id))
+      const regenerated = await runSettlingToCompletion(
+        {
+          kind: 'regenerate',
+          chatId: chat.id,
+          targetAssistantId: target.id,
+        },
+        () => completedStream(`non-leaf regenerated answer ${iteration}`),
+      )
+      expect(regenerated.completed).toMatchObject({ outcome: 'done' })
+      expect(generatedIds.has(regenerated.prepared.assistantMessageId)).toBe(false)
+      generatedIds.add(regenerated.prepared.assistantMessageId)
+    }
+
+    expect(generatedIds.size).toBe(8)
+    const durable = await readTestMessages(chat.id)
+    for (const [index, generatedId] of [...generatedIds].entries()) {
+      expect(durable.find((message) => message.id === generatedId)).toMatchObject({
+        parentId: target.parentId,
+        siblingIndex: index + 1,
+        role: 'assistant',
+        deleted: false,
+      })
+    }
+  }, 30_000)
+
+  it('captures one synchronous branch intent and resolves it transactionally without waiting on paint', async () => {
     const chat = await createChat({ settings: boundedSettings() })
     const path = await seedLinear(chat.id, [
       { role: 'user', text: 'choose a branch' },
@@ -616,7 +697,7 @@ describe('generation intent outbound-path and body-I/O contract', () => {
       {
         kind: 'send',
         chatId: chat.id,
-        expectedLeafId: left.id,
+        target: { kind: 'fixed', messageId: left.id },
         content: [{ type: 'text', text: 'surface only' }],
       },
       { profile: profile() },
@@ -629,6 +710,15 @@ describe('generation intent outbound-path and body-I/O contract', () => {
       parentId: parent.id,
       position: 1,
     })
+    const target = conversationController.captureGenerationTarget(chat.id)
+    expect(target).toEqual({
+      kind: 'selection',
+      selection: {
+        kind: 'sibling-position',
+        parentId: parent.id,
+        position: 1,
+      },
+    })
     const content: ContentItem[] = [{ type: 'text', text: 'captured first submit' }]
     let wire: Record<string, unknown> | undefined
     const openStream = vi.fn((input: GenerationTransportInput) => {
@@ -637,7 +727,14 @@ describe('generation intent outbound-path and body-I/O contract', () => {
     })
     const controller = new AbortController()
     const handlePromise = createGenerationEngine({ openStream }).startWhenCapabilitySettles(
-      { intent: { kind: 'selected-send', chatId: chat.id, content } },
+      {
+        intent: {
+          kind: 'send',
+          chatId: chat.id,
+          target,
+          content,
+        },
+      },
       { signal: controller.signal },
     )
     expect(openStream).not.toHaveBeenCalled()
@@ -655,7 +752,7 @@ describe('generation intent outbound-path and body-I/O contract', () => {
     expect(JSON.stringify(wire)).not.toContain('mutated after gesture')
   })
 
-  it('retains selected configuration through its exact acknowledgement and a route change', async () => {
+  it('uses durable chat configuration without waiting on its presentation acknowledgement', async () => {
     const first = await createChat({ settings: boundedSettings() })
     const path = await seedLinear(first.id, [
       { role: 'user', text: 'first route' },
@@ -666,23 +763,23 @@ describe('generation intent outbound-path and body-I/O contract', () => {
       {
         kind: 'send',
         chatId: first.id,
-        expectedLeafId: leaf.id,
+        target: { kind: 'fixed', messageId: leaf.id },
         content: [{ type: 'text', text: 'surface only' }],
       },
       { profile: profile() },
     )
     releaseFirst()
-    const [configurationIntent] = configurationController.stageChatSettingsFields(first.id, [
+    configurationController.stageChatSettingsFields(first.id, [
       { path: ['textTemplate'], value: 'raw' },
     ])
-    if (!configurationIntent) throw new Error('GenerationConfigurationIntentMissing')
     const openStream = vi.fn(() => completedStream('route-independent answer'))
     const controller = new AbortController()
     const handlePromise = createGenerationEngine({ openStream }).startWhenCapabilitySettles(
       {
         intent: {
-          kind: 'selected-send',
+          kind: 'send',
           chatId: first.id,
+          target: { kind: 'fixed', messageId: leaf.id },
           content: [{ type: 'text', text: 'finish the first route' }],
         },
       },
@@ -695,23 +792,12 @@ describe('generation intent outbound-path and body-I/O contract', () => {
       {
         kind: 'send',
         chatId: second.id,
-        expectedLeafId: null,
+        target: { kind: 'fixed', messageId: null },
         content: [{ type: 'text', text: 'second surface only' }],
       },
       { profile: profile() },
     )
     releaseSecond()
-    configurationController.acknowledgePendingConfiguration(first.id, {
-      promptFields: [],
-      chatSettingsFields: [
-        {
-          fieldKey: configurationIntent.fieldKey,
-          revision: configurationIntent.revision,
-        },
-      ],
-      acceptedChatConfigurationVersion: 1,
-    })
-
     const handle = await handlePromise
     const prepared = await handle.prepared
     await expect(handle.completed).resolves.toMatchObject({ outcome: 'done' })
@@ -724,7 +810,7 @@ describe('generation intent outbound-path and body-I/O contract', () => {
     })
   })
 
-  it('releases a cancelled pending first submit before the next gesture', async () => {
+  it('does not retain admission ownership for a gesture cancelled before admission', async () => {
     const chat = await createChat({ settings: boundedSettings() })
     const path = await seedLinear(chat.id, [
       { role: 'user', text: 'choose a cancellable branch' },
@@ -745,7 +831,7 @@ describe('generation intent outbound-path and body-I/O contract', () => {
       {
         kind: 'send',
         chatId: chat.id,
-        expectedLeafId: first.id,
+        target: { kind: 'fixed', messageId: first.id },
         content: [{ type: 'text', text: 'surface only' }],
       },
       { profile: profile() },
@@ -761,17 +847,18 @@ describe('generation intent outbound-path and body-I/O contract', () => {
     const openStream = vi.fn(() => completedStream('only the second gesture runs'))
     const engine = createGenerationEngine({ openStream })
     const cancelled = new AbortController()
+    cancelled.abort(new DOMException('Gesture cancelled.', 'AbortError'))
     const firstGesture = engine.startWhenCapabilitySettles(
       {
         intent: {
-          kind: 'selected-send',
+          kind: 'send',
           chatId: chat.id,
+          target: { kind: 'fixed', messageId: first.id },
           content: [{ type: 'text', text: 'cancel this gesture' }],
         },
       },
       { signal: cancelled.signal },
     )
-    cancelled.abort(new DOMException('Gesture cancelled.', 'AbortError'))
 
     await expect(firstGesture).rejects.toMatchObject({ name: 'AbortError' })
     expect(openStream).not.toHaveBeenCalled()
@@ -780,8 +867,9 @@ describe('generation intent outbound-path and body-I/O contract', () => {
     const handle = await engine.startWhenCapabilitySettles(
       {
         intent: {
-          kind: 'selected-send',
+          kind: 'send',
           chatId: chat.id,
+          target: { kind: 'fixed', messageId: first.id },
           content: [{ type: 'text', text: 'run the next gesture' }],
         },
       },
@@ -803,7 +891,7 @@ describe('generation intent outbound-path and body-I/O contract', () => {
       {
         kind: 'send',
         chatId: chat.id,
-        expectedLeafId: leaf.id,
+        target: { kind: 'fixed', messageId: leaf.id },
         content: [{ type: 'text', text: 'surface only' }],
       },
       { profile: profile() },
@@ -820,8 +908,9 @@ describe('generation intent outbound-path and body-I/O contract', () => {
     }).startWhenCapabilitySettles(
       {
         intent: {
-          kind: 'selected-send',
+          kind: 'send',
           chatId: chat.id,
+          target: { kind: 'fixed', messageId: leaf.id },
           content: [{ type: 'text', text: 'durably prepare this send' }],
         },
       },
@@ -873,7 +962,10 @@ describe('generation intent outbound-path and body-I/O contract', () => {
     const intent = {
       kind: 'send' as const,
       chatId: fixture.chatId,
-      expectedLeafId: required(fixture.path.at(-1), 'unlimited leaf').id,
+      target: {
+        kind: 'fixed',
+        messageId: required(fixture.path.at(-1), 'unlimited leaf').id,
+      } as const,
       content: [{ type: 'text' as const, text: submitted }],
     }
     const queryMark = markQueryEvidence(queryEvidence)
@@ -911,7 +1003,10 @@ describe('generation intent outbound-path and body-I/O contract', () => {
     ).toBe(true)
     const pathIds = new Set(fixture.path.map((message) => message.id))
     const counts = countBodyReads(readsAtCompletion)
-    expect([...counts.values()].every((count) => count === 1)).toBe(true)
+    expect(
+      [...counts.values()].every((count) => count === 1),
+      JSON.stringify([...counts]),
+    ).toBe(true)
     expect(readsAtCompletion).not.toContain(preparedAttempt.userMessageId)
     expect(readsAtCompletion).not.toContain(preparedAttempt.assistantMessageId)
     expect([...counts.keys()].every((id) => pathIds.has(id))).toBe(true)
@@ -957,7 +1052,10 @@ async function buildScenario(kind: GenerationIntent['kind']): Promise<Generation
         intent: {
           kind,
           chatId: fixture.chatId,
-          expectedLeafId: required(fixture.path.at(-1), 'send leaf').id,
+          target: {
+            kind: 'fixed',
+            messageId: required(fixture.path.at(-1), 'send leaf').id,
+          },
           content: [{ type: 'text', text }],
         },
         coldBodyIds: fixture.coldBodyIds,
@@ -1211,6 +1309,20 @@ async function runToCompletion(
     keyMaterial: { 'intent-io-key': 'sk-test' },
     openStream,
   })
+  const prepared = await handle.prepared
+  const completed = await handle.completed
+  return { prepared, completed }
+}
+
+async function runSettlingToCompletion(
+  intent: Exclude<GenerationIntent, { readonly kind: 'new-chat-send' }>,
+  openStream: (input: GenerationTransportInput) => AsyncIterable<AssistantStreamChunk>,
+) {
+  const controller = new AbortController()
+  const handle = await createGenerationEngine({ openStream }).startWhenCapabilitySettles(
+    { intent },
+    { signal: controller.signal },
+  )
   const prepared = await handle.prepared
   const completed = await handle.completed
   return { prepared, completed }

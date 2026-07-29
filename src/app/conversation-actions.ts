@@ -14,6 +14,7 @@ import { forkChatFromMessage } from '../store/chat-fork'
 import { getChat, nextForkTitle } from '../store/chat-metadata-application'
 import {
   continueFromMessage,
+  continueFromMessageWhenCapabilitySettles,
   deletePairOp,
   deleteSingleOp,
   deleteTurnOp,
@@ -27,11 +28,13 @@ import {
   replyToMessageWhenCapabilitySettles,
   restoreStructuralSnapshotOp,
   sendMessage,
+  sendMessageWhenCapabilitySettles,
   sendNewChat,
   sendNewChatWhenCapabilitySettles,
-  sendSelectedMessageWhenCapabilitySettles,
   editAndResend as startEditAndResend,
+  editAndResendWhenCapabilitySettles as startEditAndResendWhenCapabilitySettles,
   regenerateFromMessage as startRegenerateFromMessage,
+  regenerateFromMessageWhenCapabilitySettles as startRegenerateFromMessageWhenCapabilitySettles,
   toggleMessageContextHidden,
   toggleProviderOutputItemHidden,
   toggleReasoningDetailHidden,
@@ -45,6 +48,7 @@ import type {
   ConversationCommittedResult,
   ConversationRouteDelivery,
   ConversationRouteOwner,
+  GenerationPreparationObserver,
   ImportChatOptions,
   ImportChatResult,
   MessageAttachmentRefMutation,
@@ -53,7 +57,6 @@ import type {
 } from '../store/presentation-contracts'
 import {
   getWorkspaceRuntimeState,
-  runWorkspaceActionAtFence,
   subscribeWorkspaceRuntimeState,
 } from '../store/workspace-runtime'
 import { useToastStore } from '../store/zustand/toastStore'
@@ -84,54 +87,29 @@ function beginMessageEditSession(
   chatId: ChatId,
   messageId: MessageId,
 ): ConversationEditSession {
-  const controller = new AbortController()
   let transcriptRetention: ReturnType<
     typeof conversationController.claimTranscriptRetention
   > | null = null
   let released = false
-  let resolveHold!: () => void
-  let resolveAdmitted!: () => void
-  let rejectAdmitted!: (error: unknown) => void
-  const hold = new Promise<void>((resolve) => {
-    resolveHold = resolve
-  })
-  const admitted = new Promise<void>((resolve, reject) => {
-    resolveAdmitted = resolve
-    rejectAdmitted = reject
-  })
-  let admissionSettled = false
-  let completion: Promise<void>
+  let admitted: Promise<void>
   try {
-    completion = runWorkspaceActionAtFence(
-      'message-edit',
+    transcriptRetention = conversationController.claimTranscriptRetention({
       workspaceFence,
-      async () => {
-        transcriptRetention = conversationController.claimTranscriptRetention({
-          chatId,
-          messageId,
-        })
-        admissionSettled = true
-        resolveAdmitted()
-        await hold
-      },
-      { signal: controller.signal },
-    )
+      chatId,
+      messageId,
+    })
+    admitted = Promise.resolve()
   } catch (error) {
     const normalized = actionError('Message edit', error)
-    rejectAdmitted(normalized)
-    completion = Promise.reject(normalized)
+    admitted = Promise.reject(normalized)
   }
-  void completion.catch((error: unknown) => {
-    if (!admissionSettled) rejectAdmitted(error)
-  })
+  void admitted.catch(() => undefined)
   return Object.freeze({
     admitted,
     release: () => {
       if (released) return
       released = true
       transcriptRetention?.release()
-      resolveHold()
-      controller.abort(new DOMException('Message edit session released', 'AbortError'))
     },
   })
 }
@@ -280,7 +258,7 @@ function acceptCommittedConversationImports(
 export const conversationActions = {
   beginMessageEditSession,
   sendMessage,
-  sendSelectedMessageWhenCapabilitySettles,
+  sendMessageWhenCapabilitySettles,
   sendNewChat,
   sendNewChatWhenCapabilitySettles,
   replyToMessage,
@@ -288,9 +266,14 @@ export const conversationActions = {
   commitConversationImports,
   acceptCommittedConversationImports,
 
-  async editMessage(chatId: ChatId, message: Message, text: string): Promise<void> {
+  async editMessage(
+    chatId: ChatId,
+    message: Message,
+    text: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
     try {
-      await editInPlace(chatId, message, text)
+      await editInPlace(chatId, message, text, signal)
     } catch (error) {
       throw actionError('Edit', error)
     }
@@ -311,12 +294,61 @@ export const conversationActions = {
     })
   },
 
+  editAndResendWhenCapabilitySettles(
+    chatId: ChatId,
+    message: Message,
+    text: string,
+    signal: AbortSignal,
+    options: EditAndResendOptions = {},
+    observer?: GenerationPreparationObserver,
+  ) {
+    const prefillText = options.prefillText ?? ''
+    return startEditAndResendWhenCapabilitySettles(
+      { chatId },
+      message,
+      text,
+      signal,
+      {
+        ...(prefillText.length > 0
+          ? { prefillContent: [{ type: 'text', text: prefillText }] satisfies ContentItem[] }
+          : {}),
+        ...(options.attachmentRefs ? { attachmentRefs: options.attachmentRefs } : {}),
+      },
+      observer,
+    )
+  },
+
   regenerate(chatId: ChatId, message: Message, options: RegenerateMessageOptions = {}) {
     return startRegenerateFromMessage({ chatId }, message, options)
   },
 
+  regenerateWhenCapabilitySettles(
+    chatId: ChatId,
+    message: Message,
+    signal: AbortSignal,
+    options: RegenerateMessageOptions = {},
+    observer?: GenerationPreparationObserver,
+  ) {
+    return startRegenerateFromMessageWhenCapabilitySettles(
+      { chatId },
+      message,
+      signal,
+      options,
+      observer,
+    )
+  },
+
   continueMessage(chatId: ChatId, message: Message) {
     return continueFromMessage({ chatId }, message)
+  },
+
+  continueMessageWhenCapabilitySettles(
+    chatId: ChatId,
+    message: Message,
+    signal: AbortSignal,
+    observer?: GenerationPreparationObserver,
+  ) {
+    return continueFromMessageWhenCapabilitySettles({ chatId }, message, signal, observer)
   },
 
   async importMessages(input: ConversationImportInput): Promise<void> {
@@ -356,15 +388,20 @@ export const conversationActions = {
     }
   },
 
-  toggleContext(chatId: ChatId, message: Message): Promise<void> {
+  toggleContext(chatId: ChatId, message: Message, signal?: AbortSignal): Promise<void> {
     return runConversationAction('Context visibility update', async () => {
-      await toggleMessageContextHidden(chatId, message.id)
+      await toggleMessageContextHidden(chatId, message.id, signal)
     })
   },
 
-  toggleReasoning(chatId: ChatId, message: Message, member: ReasoningMemberRef): Promise<void> {
+  toggleReasoning(
+    chatId: ChatId,
+    message: Message,
+    member: ReasoningMemberRef,
+    signal?: AbortSignal,
+  ): Promise<void> {
     return runConversationAction('Reasoning visibility update', async () => {
-      await toggleReasoningDetailHidden(chatId, message.id, member)
+      await toggleReasoningDetailHidden(chatId, message.id, member, signal)
     })
   },
 
@@ -372,15 +409,16 @@ export const conversationActions = {
     chatId: ChatId,
     message: Message,
     member: ProviderOutputMemberRef,
+    signal?: AbortSignal,
   ): Promise<void> {
     return runConversationAction('Tool visibility update', async () => {
-      await toggleProviderOutputItemHidden(chatId, message.id, member)
+      await toggleProviderOutputItemHidden(chatId, message.id, member, signal)
     })
   },
 
-  dismissGenerationNotice(chatId: ChatId, message: Message): Promise<void> {
+  dismissGenerationNotice(chatId: ChatId, message: Message, signal?: AbortSignal): Promise<void> {
     return runConversationAction('Dismiss', () =>
-      dismissMessageGenerationNotice(chatId, message.id),
+      dismissMessageGenerationNotice(chatId, message.id, signal),
     )
   },
 
@@ -393,6 +431,8 @@ export const conversationActions = {
     messageId: MessageId,
     mode: ConversationDeleteMode,
     roleMismatch = false,
+    signal?: AbortSignal,
+    reportPhase?: (phase: 'repository-requested' | 'local-applied') => void,
   ): Promise<void> {
     return runConversationAction('Delete', async () => {
       const snapshot = conversationController.getSnapshot()
@@ -417,12 +457,14 @@ export const conversationActions = {
               ? deleteVariantOp
               : deleteSingleOp
       try {
+        reportPhase?.('repository-requested')
         const result = await execute(
           {
             chatId,
             messageId,
             activeLeafId: previousLeafId,
             ...(useUiStore.getState().cascadeDelete ? { cascade: true } : {}),
+            ...(signal ? { signal } : {}),
           },
           (committed) => {
             conversationController.acceptLocalResult(operation, {
@@ -430,6 +472,7 @@ export const conversationActions = {
               receipt: committed,
               committedEffect: committed.committedEffect,
             })
+            reportPhase?.('local-applied')
           },
         )
         useToastStore.getState().push({
@@ -467,7 +510,7 @@ export const conversationActions = {
     })
   },
 
-  async forkMessage(chatId: ChatId, message: Message): Promise<void> {
+  async forkMessage(chatId: ChatId, message: Message, signal?: AbortSignal): Promise<void> {
     const routeIntent = beginRouteIntent()
     try {
       const sourceChat = await getChat(chatId)
@@ -505,6 +548,7 @@ export const conversationActions = {
             })
             if (receipt.accepted) routeDelivery = receipt.routeDelivery
           },
+          signal,
         )
         if (!isRouteIntentCurrent(routeIntent)) {
           if (routeDelivery?.kind === 'handoff') routeDelivery.handoff.cancel()

@@ -114,7 +114,18 @@ function initialSurfaceTargetId(
 ): MessageId | undefined {
   switch (intent.kind) {
     case 'send':
-      return intent.expectedLeafId ?? undefined
+      if (intent.target.kind === 'fixed') return intent.target.messageId ?? undefined
+      switch (intent.target.selection.kind) {
+        case 'default':
+          return undefined
+        case 'tip':
+          return intent.target.selection.messageId
+        case 'message':
+          return intent.target.selection.observedTipId ?? intent.target.selection.messageId
+        case 'sibling-position':
+          return intent.target.selection.observedTipId
+      }
+      return undefined
     case 'reply':
       return intent.parentUserId
     case 'regenerate':

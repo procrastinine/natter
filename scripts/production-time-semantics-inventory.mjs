@@ -8,28 +8,17 @@ const covered = (id, semantics, sites) =>
     sites: freezeSites(sites),
   })
 
-const gap = (id, semantics, criticalOutcomes, gapRationale, sites) =>
-  Object.freeze({
-    id,
-    ...semantics,
-    correctnessFromElapsedTime: false,
-    criticalOutcomes: Object.freeze(criticalOutcomes),
-    status: 'gap',
-    gapRationale,
-    sites: freezeSites(sites),
-  })
-
 export const TEMPORAL_SEMANTIC_GROUPS = Object.freeze([
   covered(
     'generation-admission-publication-settlement',
     semantics(
-      'Capability and destination publications, never elapsed time, wake a captured generation intent for atomic re-evaluation.',
+      'Workspace or new-chat configuration publications, never elapsed time, wake a captured intent; an existing-chat intent enters its authoritative transaction on the first running-workspace evaluation.',
       'one captured generation admission',
-      'tab-local intent with workspace-scoped capability publications',
+      'tab-local intent with workspace and new-chat configuration publications',
       'generation admission controller',
-      'Abort rejects the active wait; every wake returns an exact disposer, and the finally path releases both that subscription and any untransferred steering claim.',
+      'Abort rejects an active workspace or new-chat configuration wait; every wake returns an exact disposer and the terminal path releases prompt material and exact target reservations.',
       'At most one active publication wait per captured admission.',
-      'Each continuation follows a capability or destination identity change, or observes an already-resolved blocker.',
+      'Each continuation follows a workspace or new-chat configuration identity change, while existing-chat durable state is resolved by one repository transaction.',
       'none',
     ),
     {
@@ -784,9 +773,6 @@ export const TEMPORAL_SEMANTIC_GROUPS = Object.freeze([
         'src/store/attempt-workspace.ts|applyPoints|ForStatement|bounded|1',
         'src/store/attempt-controller.ts|reconcileLeasePoints|ForStatement|bounded|1',
         'src/store/browser-command-mutation-journal.ts|recordSuccessfulStreamJournalRetirements|ForStatement|bounded|1',
-        'src/store/browser-repo.ts|validateGenerationPromptPathClaim|ForStatement|bounded|1',
-        'src/store/browser-repo.ts|validateGenerationPromptPathClaim|ForStatement|bounded|2',
-        'src/store/browser-repo.ts|validateGenerationPromptPathClaim|ForStatement|bounded|3',
         'src/store/browser-repo.ts|newestLiveLeafIdInTransaction|ForStatement|unbounded|1',
         'src/store/browser-repo.ts|readConversationPageStructureEnvelope|ForStatement|bounded|1',
         'src/store/conversation-controller.ts|rememberTerminal|ForStatement|unbounded|1',

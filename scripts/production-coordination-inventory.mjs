@@ -259,7 +259,6 @@ export const MODULE_COLLECTION_CONTRACTS = Object.freeze({
         'src/store/browser-repo.ts#STREAM_FINISH_CLEANUP_OPERATION',
         'src/store/browser-repo.ts#STREAM_JOURNAL_INTEGRITY_OPERATION',
         'src/store/browser-repo.ts#TERMINAL_STREAM_RETENTION_OPERATION',
-        'src/store/conversation-controller.ts#EMPTY_CONVERSATION_MESSAGE_PRESENTATIONS',
         'src/store/conversation-controller.ts#EMPTY_EXACT_TARGET_PRESENTATION_RECEIPTS',
         'src/store/stream-journal-codec.ts#STREAM_JOURNAL_COMMIT_FRAME_KEYS',
         'src/store/stream-journal-codec.ts#STREAM_JOURNAL_INLINE_FRAME_KEYS',
@@ -1147,6 +1146,7 @@ export const CONTROLLER_COLLECTION_CONTRACTS = Object.freeze({
       'idleListeners',
       'listeners',
       'permitRecords',
+      'rootReleaseListeners',
       'stateListeners',
     ],
     bound: 'active permits and live subscribers for one exact runtime kernel',
@@ -1350,7 +1350,7 @@ export const CONTROLLER_COLLECTION_CONTRACTS = Object.freeze({
       'workspaceEditSessions',
     ],
     bound:
-      'mounted tab subscribers, unsettled configuration intents, one strong active-claim state plus one weak claim-to-state lookup per live selected-send, keyed by their exact chat, workspace, and field',
+      'mounted tab subscribers, unsettled configuration intents, one strong active-claim state plus one weak claim-to-state lookup per live generation configuration observation, keyed by exact chat, workspace, and field',
     cleanup:
       'settlement removes exact intents; selected admission transfer or cancellation aborts and clears its read and deletes the strong Set entry, after which the WeakMap ephemeron is collectible when the caller releases the claim; workspace reconciliation closes edit sessions, aborts all claim reads, and clears the strong Set and pending collections; paired unsubscribe removes listeners',
     scope: 'owner-instance',
@@ -1393,13 +1393,13 @@ export const CONTROLLER_COLLECTION_CONTRACTS = Object.freeze({
   'src/store/conversation-controller.ts#TabConversationController': {
     fields: [
       'blockedReads',
-      'generationIntentPresentations',
       'inspectorDemands',
       'listeners',
       'operationClaimCountsByChat',
       'operationClaims',
       'pendingForkParentIds',
       'pendingRouteHandoffsByOwnerId',
+      'promptPathDemands',
       'previewDemands',
       'reads',
       'sessions',
@@ -1407,9 +1407,9 @@ export const CONTROLLER_COLLECTION_CONTRACTS = Object.freeze({
       'transcriptRetentions',
     ],
     bound:
-      'active chat, mounted projection demands and exact retained-message claims, active or blocked reads, unfinished operation claims and exact generation-intent presentations, and unconsumed route handoffs keyed by exact synchronous route-owner ID; inactive sessions are persisted then evicted once they have no operation claim',
+      'active chat, mounted projection demands, exact retained-message claims and pending prompt-path demand claims, active or blocked reads, unfinished operation claims, and unconsumed route handoffs keyed by exact synchronous route-owner ID; inactive sessions are persisted then evicted once they have no operation claim',
     cleanup:
-      'read completion or abort, mounted-owner cleanup, and retention-claim release remove transient entries; generation settlement, claim terminal or cancel, and handoff consume or cancel remove exact owners; chat deletion or workspace reconciliation clears all chat-scoped maps',
+      'read completion or abort, mounted-owner cleanup, and retention or prompt-path claim release remove transient entries; operation claim terminal or cancel and handoff consume or cancel remove exact owners; chat deletion or workspace reconciliation clears all chat-scoped maps',
     scope: 'owner-instance',
   },
   'src/store/conversation-repository-adapter.ts#ConversationEffectAccumulator': {
@@ -1427,19 +1427,19 @@ export const CONTROLLER_COLLECTION_CONTRACTS = Object.freeze({
     scope: 'owner-instance',
   },
   'src/store/generation-admission-controller.ts#TabGenerationAdmissionController': {
-    fields: ['adoptedSteeringClaims', 'states'],
+    fields: ['states'],
     bound:
-      'one weak state per reachable generation admission claim and one weak adoption marker per reachable supplied steering claim',
+      'one weak state per reachable generation admission claim; the map records lifecycle cleanup but never durable eligibility',
     cleanup:
-      'take, accept, fail, or cancel clears retained prompt material; claim collection releases the weak state and steering collection releases its adoption marker',
+      'accept, failure, cancellation or rejected capture releases exact target reservations and retained prompt material; claim collection releases terminal weak state',
     scope: 'owner-instance',
   },
   'src/store/generation-prompt-material.ts#PerAttemptGenerationPromptMaterialLease': {
-    fields: ['claimedHeaders', 'sealedHeaders'],
+    fields: ['claimedHeaders', 'retainedPresentations', 'sealedHeaders'],
     bound:
-      'one current claimed header and one immutable sealed-header view per message on one admitted attempt prompt path',
+      'one current claimed header, matching retained presentation and immutable sealed-header view per message on one admitted attempt prompt path',
     cleanup:
-      'seal replaces claims with the prepared path; release removes coordinator claims, clears claimed headers, and drops the sealed view',
+      'seal replaces claims and retains only matching prepared-path presentations; release removes coordinator claims, clears headers and presentations, and drops the sealed view',
     scope: 'owner-instance',
   },
   'src/store/generation-prompt-material.ts#TabWorkspaceMessageMaterialCoordinator': {
@@ -2289,6 +2289,18 @@ const LIFECYCLE_DIRECT_CALL_CONTRACTS = exactSiteContracts([
   },
   {
     ids: [
+      'src/store/browser-workspace-replacement-runner.ts|promoteWhenUnblocked|launchCommandFanoutWorkspaceRuntimeReplacementWhenUnblocked|1',
+    ],
+    scope: 'workspace-replacement-call-edge',
+    stage: 'prepared-replacement-blocker-release-promotion',
+    ownership: 'total-promise-awaited',
+    bound:
+      'one event-driven promotion promise per prepared command-fanout destination with no copy or mutation replay',
+    cleanup:
+      'promotion, competing runtime transition or caller cancellation settles the promise and removes every admission listener',
+  },
+  {
+    ids: [
       'src/store/browser-workspace-replacement-runner.ts|performBrowserWorkspaceReplacementLaunch|getWorkspaceRuntimeControlSnapshot|1',
       'src/store/browser-workspace-replacement-runner.ts|attempt|getWorkspaceRuntimeControlSnapshot|1',
       'src/store/browser-workspace-replacement-runner.ts|runGatedBrowserWorkspaceReplacementAttempt|getWorkspaceRuntimeControlSnapshot|1',
@@ -2398,6 +2410,18 @@ const LIFECYCLE_DIRECT_CALL_CONTRACTS = exactSiteContracts([
     ownership: 'synchronous-result-captured-and-returned',
     bound: 'one promoted authority for each idle-aware replacement launch attempt',
     cleanup: 'the wrapper returns the authority directly to the replacement orchestrator',
+  },
+  {
+    ids: [
+      'src/store/workspace-runtime-control.ts|launchWorkspaceRuntimeReplacementWhenUnblockedImpl|workspaceRuntimeKernel.launchReplacementWhenUnblocked|1',
+    ],
+    scope: 'runtime-control-internal-call-edge',
+    stage: 'replacement-root-blocker-release-promotion',
+    ownership: 'total-promise-returned',
+    bound:
+      'one retained admission observer and one atomic promotion for the prepared replacement; blocker releases trigger no copy or mutation replay',
+    cleanup:
+      'promotion, runtime transition or caller cancellation removes every root, idle, state and abort listener',
   },
   {
     ids: [
@@ -2872,6 +2896,7 @@ export const LIFECYCLE_PRIMITIVE_MODULES = Object.freeze({
     'getWorkspaceRuntimeControlSnapshot',
     'installWorkspaceRuntimeResources',
     'launchCommandFanoutWorkspaceRuntimeReplacementNow',
+    'launchCommandFanoutWorkspaceRuntimeReplacementWhenUnblocked',
     'launchImportExportWorkspaceRuntimeReplacementNow',
     'noteWorkspaceRuntimeGatedChange',
     'resumeWorkspaceRuntimeResources',

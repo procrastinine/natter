@@ -2,8 +2,6 @@ import { act, fireEvent, render, waitFor } from '@testing-library/react'
 import type { ComponentProps } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
-  AVAILABLE_GENERATION_CAPABILITY,
-  type GenerationCapability,
   generationNotStarted,
   unavailableGenerationCapability,
 } from '../../src/core/interaction-capability'
@@ -32,17 +30,9 @@ import {
 
 type ChatMessageTestProps = Omit<
   ComponentProps<typeof ChatMessageComponent>,
-  | 'bodyVersion'
-  | 'editResendCapability'
-  | 'regenerateCapability'
-  | 'continueCapability'
-  | 'presentationFence'
-  | 'onBeginEdit'
-  | 'onDeleteMessage'
-  | 'onEditInPlace'
+  'bodyVersion' | 'presentationFence' | 'onBeginEdit' | 'onDeleteMessage' | 'onEditInPlace'
 > & {
   bodyVersion?: number
-  generationCapability?: GenerationCapability
   onBeginEdit?: ComponentProps<typeof ChatMessageComponent>['onBeginEdit']
   onDeleteMessage?: ComponentProps<typeof ChatMessageComponent>['onDeleteMessage']
   onEditInPlace?: ComponentProps<typeof ChatMessageComponent>['onEditInPlace']
@@ -54,7 +44,6 @@ let presentationFence: WorkspaceFence = { workspaceId: 'message-header-tests', r
 
 function ChatMessage({
   bodyVersion,
-  generationCapability = CONNECTION_MISSING_CAPABILITY,
   presentationFence: explicitPresentationFence,
   ...props
 }: ChatMessageTestProps) {
@@ -62,9 +51,6 @@ function ChatMessage({
     <ChatMessageComponent
       {...props}
       bodyVersion={bodyVersion ?? props.message.nodeVersion}
-      editResendCapability={generationCapability}
-      regenerateCapability={generationCapability}
-      continueCapability={generationCapability}
       presentationFence={explicitPresentationFence ?? presentationFence}
       onDeleteMessage={props.onDeleteMessage ?? succeededInteractionSettlement}
       onEditInPlace={props.onEditInPlace ?? succeededInteractionSettlement}
@@ -438,6 +424,116 @@ describe('Message content refresh', () => {
   })
 })
 
+describe('Message edit session ownership', () => {
+  it('keeps Save & Send actionable without precomputing readiness as permission', async () => {
+    const message = makeUser({ origin: 'imported' })
+    const onEditAndSend = vi.fn(() =>
+      Object.freeze({
+        kind: 'started' as const,
+        admission: Promise.resolve(Object.freeze({ kind: 'admitted' as const })),
+        completion: Promise.resolve(Object.freeze({ kind: 'prepared' as const })),
+        cancel: () => undefined,
+      }),
+    )
+    const view = render(
+      <ChatMessage chatId={message.chatId} message={message} onEditAndSend={onEditAndSend} />,
+    )
+
+    fireEvent.click(view.getByRole('button', { name: 'Edit message' }))
+    const editor = await view.findByLabelText('Edit user message')
+    fireEvent.change(editor, { target: { value: 'continue from this new node' } })
+    const saveAndSend = view.getByRole('button', { name: 'Save & Send' })
+    expect(saveAndSend).toBeEnabled()
+
+    fireEvent.click(saveAndSend)
+
+    expect(onEditAndSend).toHaveBeenCalledWith(
+      message,
+      'continue from this new node',
+      expect.objectContaining({}),
+    )
+  })
+
+  it('keeps Regenerate enabled while an exact target is only preparing, not streaming', () => {
+    const message = makeAssistant()
+    observeTestAttempt({
+      streamId: 'message-preparing-stream',
+      chatId: message.chatId,
+      messageId: message.id,
+      kind: 'generation',
+      phase: 'preparing',
+    })
+    const onRegenerate = vi.fn(() =>
+      Object.freeze({
+        kind: 'started' as const,
+        admission: Promise.resolve(Object.freeze({ kind: 'admitted' as const })),
+        completion: Promise.resolve(Object.freeze({ kind: 'prepared' as const })),
+        cancel: () => undefined,
+      }),
+    )
+    const view = render(
+      <ChatMessage
+        chatId={message.chatId}
+        message={message}
+        onRegenerate={onRegenerate}
+        presentationOnly
+      />,
+    )
+
+    const regenerate = view.getByRole('button', { name: 'Regenerate response' })
+    expect(regenerate).toBeEnabled()
+    expect(view.container.querySelector('[data-ui="message"]')).not.toHaveAttribute(
+      'aria-busy',
+      'true',
+    )
+    fireEvent.click(regenerate)
+    expect(onRegenerate).toHaveBeenCalledOnce()
+  })
+
+  it('keeps the draft mounted while rebinding presentation retention to a new workspace epoch', async () => {
+    const releases = [vi.fn(), vi.fn()]
+    const onBeginEdit = vi
+      .fn<ComponentProps<typeof ChatMessageComponent>['onBeginEdit']>()
+      .mockImplementationOnce(() => ({
+        admitted: Promise.resolve(),
+        release: releases[0] as () => void,
+      }))
+      .mockImplementationOnce(() => ({
+        admitted: Promise.resolve(),
+        release: releases[1] as () => void,
+      }))
+    const message = makeUser({ origin: 'imported' })
+    const view = render(
+      <ChatMessage
+        chatId={message.chatId}
+        message={message}
+        onBeginEdit={onBeginEdit}
+        presentationFence={{ workspaceId: 'edit-rebind-workspace', replacementEpoch: 0 }}
+      />,
+    )
+
+    fireEvent.click(view.getByRole('button', { name: 'Edit message' }))
+    const editor = await view.findByLabelText('Edit user message')
+    fireEvent.change(editor, { target: { value: 'draft retained across replacement' } })
+
+    view.rerender(
+      <ChatMessage
+        chatId={message.chatId}
+        message={message}
+        onBeginEdit={onBeginEdit}
+        presentationFence={{ workspaceId: 'edit-rebind-workspace', replacementEpoch: 1 }}
+      />,
+    )
+
+    await waitFor(() => expect(onBeginEdit).toHaveBeenCalledTimes(2))
+    expect(releases[0]).toHaveBeenCalledOnce()
+    expect(view.getByLabelText('Edit user message')).toHaveValue(
+      'draft retained across replacement',
+    )
+    expect(view.getByRole('button', { name: 'Save' })).toBeEnabled()
+  })
+})
+
 describe('Message presentation-only snapshots', () => {
   it('uses the canonical terminal body before the current generation snapshot clears', async () => {
     const message = makeAssistant({
@@ -532,7 +628,6 @@ describe('Message presentation-only snapshots', () => {
       <ChatMessage
         chatId={message.chatId}
         message={message}
-        generationCapability={AVAILABLE_GENERATION_CAPABILITY}
         presentationOnly
         onEditInPlace={succeededInteractionSettlement}
       />,
@@ -563,7 +658,6 @@ describe('Message presentation-only snapshots', () => {
       <ChatMessage
         chatId={message.chatId}
         message={message}
-        generationCapability={AVAILABLE_GENERATION_CAPABILITY}
         presentationOnly
         onEditInPlace={succeededInteractionSettlement}
         onRegenerate={() => generationNotStarted(CONNECTION_MISSING_CAPABILITY)}
@@ -715,7 +809,6 @@ describe('Message streaming info surface', () => {
       <ChatMessage
         chatId={msg.chatId}
         message={msg}
-        generationCapability={AVAILABLE_GENERATION_CAPABILITY}
         onEditInPlace={succeededInteractionSettlement}
         onContinue={() => generationNotStarted(CONNECTION_MISSING_CAPABILITY)}
       />,

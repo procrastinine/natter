@@ -7,20 +7,14 @@ import {
   pendingGenerationCapability,
   unavailableGenerationCapability,
 } from '../core/interaction-capability'
-import type { ChatId, MessageId } from '../core/types'
-import { type AttemptTargetAdmissionFrame, attemptController } from './attempt-controller'
+import type { AttemptTargetAdmissionFrame } from './attempt-controller'
 import {
   type ActiveGenerationConfigurationFrame,
   type ActiveGenerationConfigurationRequirement,
   type ActiveGenerationConfigurationResolution,
   configurationController,
-  type SelectedGenerationConfigurationClaim,
 } from './configuration-controller'
-import {
-  type ConversationPromptPathFrame,
-  conversationController,
-  type SelectedConversationDestinationClaim,
-} from './conversation-controller'
+import { type ConversationPromptPathFrame, conversationController } from './conversation-controller'
 import type { WorkspaceFence } from './repository'
 import { getWorkspaceRuntimeFence, getWorkspaceRuntimeState } from './workspace-runtime'
 
@@ -50,16 +44,6 @@ export interface GenerationCapabilityController {
   ): GenerationCapabilityContext
   captureFrame(attemptAdmission?: AttemptTargetAdmissionFrame | null): GenerationCapabilityFrame
   capability(probe: GenerationAdmissionCapabilityProbe | null): GenerationCapability
-  claimSelectedSend(chatId: ChatId): SelectedSendAdmissionClaim
-  cancelSelectedSend(claim: SelectedSendAdmissionClaim): void
-}
-
-const SELECTED_SEND_ADMISSION_CLAIM = Symbol('selected-send-admission-claim')
-
-export interface SelectedSendAdmissionClaim {
-  readonly [SELECTED_SEND_ADMISSION_CLAIM]: true
-  readonly destination: SelectedConversationDestinationClaim
-  readonly configuration: SelectedGenerationConfigurationClaim
 }
 
 const NEW_CHAT_GENERATION_CONFIGURATION_REQUIREMENT: ActiveGenerationConfigurationRequirement =
@@ -89,6 +73,12 @@ class TabGenerationCapabilityController implements GenerationCapabilityControlle
     const workspace = getWorkspaceRuntimeFence()
     if (!workspace) return PENDING_WORKSPACE_CAPABILITY_CONTEXT
     const configuration = configurationController.getSnapshot().frame.generation
+    const promptPath =
+      promptPathOverride &&
+      promptPathOverride.workspaceId === workspace.workspaceId &&
+      promptPathOverride.replacementEpoch === workspace.replacementEpoch
+        ? promptPathOverride
+        : conversationController.capturePromptPathFrame(workspace)
     if (
       configuration.workspaceId !== workspace.workspaceId ||
       configuration.replacementEpoch !== workspace.replacementEpoch
@@ -96,17 +86,18 @@ class TabGenerationCapabilityController implements GenerationCapabilityControlle
       return Object.freeze({
         workspace,
         configuration: null,
-        promptPath: null,
+        promptPath,
         attemptAdmission,
-        frame: PENDING_CONFIGURATION_CAPABILITY_FRAME,
+        frame: Object.freeze({
+          capability: (probe: GenerationAdmissionCapabilityProbe | null) =>
+            probe?.kind === 'new-chat-send'
+              ? pendingGenerationCapability('configuration')
+              : probe
+                ? existingGenerationCapability(workspace, attemptAdmission, probe)
+                : pendingGenerationCapability('prompt-path'),
+        }),
       })
     }
-    const promptPath =
-      promptPathOverride &&
-      promptPathOverride.workspaceId === workspace.workspaceId &&
-      promptPathOverride.replacementEpoch === workspace.replacementEpoch
-        ? promptPathOverride
-        : conversationController.capturePromptPathFrame(workspace)
     const cached = this.cache
     if (
       cached?.workspaceId === workspace.workspaceId &&
@@ -121,22 +112,14 @@ class TabGenerationCapabilityController implements GenerationCapabilityControlle
     const frame = Object.freeze({
       capability: (probe: GenerationAdmissionCapabilityProbe | null): GenerationCapability => {
         if (!probe) return pendingGenerationCapability('prompt-path')
+        if (probe.kind !== 'new-chat-send') {
+          return existingGenerationCapability(workspace, attemptAdmission, probe)
+        }
         const configurationCapability = generationConfigurationCapability(
           configurationOverride ?? configuration.resolve(generationConfigurationRequirement(probe)),
         )
         if (configurationCapability.state !== 'ready') return configurationCapability
-        if (probe.kind === 'new-chat-send') return AVAILABLE_GENERATION_CAPABILITY
-        const promptPathCapability = promptPath.capability(probe)
-        switch (promptPathCapability) {
-          case 'available':
-            return generationAttemptTargetCapability(probe, workspace, attemptAdmission)
-          case 'unavailable':
-            return unavailableGenerationCapability('target-unavailable')
-          case 'error':
-            return failedGenerationCapability('prompt-path')
-          case 'pending':
-            return pendingGenerationCapability('prompt-path')
-        }
+        return AVAILABLE_GENERATION_CAPABILITY
       },
     }) satisfies GenerationCapabilityFrame
     const context = Object.freeze({
@@ -165,28 +148,25 @@ class TabGenerationCapabilityController implements GenerationCapabilityControlle
   }
 
   capability(probe: GenerationAdmissionCapabilityProbe | null): GenerationCapability {
-    return this.captureFrame(attemptAdmissionFrameForProbe(probe)).capability(probe)
+    return this.captureFrame().capability(probe)
   }
+}
 
-  claimSelectedSend(chatId: ChatId): SelectedSendAdmissionClaim {
-    const destination = conversationController.claimSelectedDestination({ chatId })
-    try {
-      const configuration = configurationController.claimSelectedGenerationConfiguration(chatId)
-      return Object.freeze({
-        [SELECTED_SEND_ADMISSION_CLAIM]: true as const,
-        destination,
-        configuration,
-      })
-    } catch (error) {
-      conversationController.cancelSelectedDestination(destination)
-      throw error
-    }
+function existingGenerationCapability(
+  workspace: WorkspaceFence,
+  attemptAdmission: AttemptTargetAdmissionFrame | null,
+  probe: Exclude<GenerationAdmissionCapabilityProbe, { readonly kind: 'new-chat-send' }>,
+): GenerationCapability {
+  if (
+    probe.kind === 'continue' &&
+    attemptAdmission?.workspaceId === workspace.workspaceId &&
+    attemptAdmission.replacementEpoch === workspace.replacementEpoch &&
+    attemptAdmission.chatId === probe.chatId &&
+    attemptAdmission.admission(probe.targetAssistantId) === 'occupied'
+  ) {
+    return pendingGenerationCapability('attempt-target')
   }
-
-  cancelSelectedSend(claim: SelectedSendAdmissionClaim): void {
-    conversationController.cancelSelectedDestination(claim.destination)
-    configurationController.cancelSelectedGenerationConfiguration(claim.configuration)
-  }
+  return AVAILABLE_GENERATION_CAPABILITY
 }
 
 export function generationConfigurationRequirement(
@@ -219,59 +199,11 @@ export function generationConfigurationCapability(
   }
 }
 
-export function generationAttemptTargetCapability(
-  probe: GenerationAdmissionCapabilityProbe,
-  workspace: WorkspaceFence,
-  frame: AttemptTargetAdmissionFrame | null,
-): GenerationCapability {
-  const target = generationAttemptTarget(probe)
-  if (!target) return AVAILABLE_GENERATION_CAPABILITY
-  if (
-    !frame ||
-    frame.workspaceId !== workspace.workspaceId ||
-    frame.replacementEpoch !== workspace.replacementEpoch ||
-    frame.chatId !== target.chatId ||
-    frame.admission(target.messageId) !== 'available'
-  ) {
-    return pendingGenerationCapability('attempt-target')
-  }
-  return AVAILABLE_GENERATION_CAPABILITY
-}
-
-export function attemptAdmissionFrameForProbe(
-  probe: GenerationAdmissionCapabilityProbe | null,
-): AttemptTargetAdmissionFrame | null {
-  if (!probe || probe.kind === 'new-chat-send') return null
-  return attemptController.getTargetAdmissionFrame(probe.chatId)
-}
-
-function generationAttemptTarget(
-  probe: GenerationAdmissionCapabilityProbe,
-): { readonly chatId: ChatId; readonly messageId: MessageId } | null {
-  switch (probe.kind) {
-    case 'continue':
-    case 'regenerate':
-      return { chatId: probe.chatId, messageId: probe.targetAssistantId }
-    case 'send':
-      return probe.expectedLeafId === null
-        ? null
-        : { chatId: probe.chatId, messageId: probe.expectedLeafId }
-    case 'new-chat-send':
-    case 'reply':
-    case 'edit-resend':
-      return null
-  }
-}
-
 export const generationCapabilityController: GenerationCapabilityController =
   new TabGenerationCapabilityController()
 
 const PENDING_WORKSPACE_CAPABILITY_FRAME: GenerationCapabilityFrame = Object.freeze({
   capability: () => pendingGenerationCapability('workspace'),
-})
-
-const PENDING_CONFIGURATION_CAPABILITY_FRAME: GenerationCapabilityFrame = Object.freeze({
-  capability: () => pendingGenerationCapability('configuration'),
 })
 
 const FAILED_WORKSPACE_CAPABILITY_FRAME: GenerationCapabilityFrame = Object.freeze({

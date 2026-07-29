@@ -70,7 +70,7 @@ export function observeTestAttempt(input: {
     ownershipLock: local
       ? { kind: 'unobserved' }
       : { kind: 'held-by-other', streamId: lease.streamId, observedAt: admissionSequence },
-    ...(input.phase ? { phase: input.phase } : {}),
+    phase: input.phase ?? 'streaming',
   })
   if (input.requestLiveProjection) {
     attemptController.setLiveProjectionRequester(input.streamId, input.requestLiveProjection)

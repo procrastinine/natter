@@ -560,9 +560,11 @@
       "responsibility": "Implement browser repository queries/mutations, physical schema, reactive reads, key ranges, and transaction-safe database access.",
       "paths": [
         "src/store/browser-catalog-command-runtime.ts",
+        "src/store/browser-command-fanout-budget.ts",
         "src/store/browser-command-mutation-journal.ts",
         "src/store/browser-domain-mutations.ts",
         "src/store/browser-generation-command-runtime.ts",
+        "src/store/browser-indexeddb-reads.ts",
         "src/store/browser-lock-record.ts",
         "src/store/browser-mutation-plan.ts",
         "src/store/browser-mutation-runtime.ts",

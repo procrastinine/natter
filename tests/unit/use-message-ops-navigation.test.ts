@@ -2,9 +2,12 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Message } from '../../src/core/types'
 import {
   continueFromMessage,
+  continueFromMessageWhenCapabilitySettles,
   editAndResend,
+  editAndResendWhenCapabilitySettles,
   mutateMessageAttachmentReference,
   regenerateFromMessage,
+  regenerateFromMessageWhenCapabilitySettles,
   replyToMessage,
   sendMessage,
   sendNewChat,
@@ -18,6 +21,7 @@ import type {
 
 const mocks = vi.hoisted(() => ({
   start: vi.fn(),
+  startWhenCapabilitySettles: vi.fn(),
   mutateAttachment: vi.fn(),
 }))
 
@@ -29,7 +33,10 @@ function requireStarted(result: GenerationStartResult): GenerationHandle<Prepare
 }
 
 vi.mock('../../src/store/generation-engine', () => ({
-  generationEngine: { start: mocks.start },
+  generationEngine: {
+    start: mocks.start,
+    startWhenCapabilitySettles: mocks.startWhenCapabilitySettles,
+  },
 }))
 
 vi.mock('../../src/store/attachments', () => ({
@@ -56,7 +63,7 @@ function message(overrides: Partial<Message> = {}): Message {
 
 beforeEach(() => {
   vi.resetAllMocks()
-  mocks.start.mockReturnValue({
+  const started = {
     kind: 'started',
     handle: {
       streamId: 'stream-1',
@@ -74,7 +81,9 @@ beforeEach(() => {
       }),
       abort: vi.fn(),
     },
-  })
+  } as const
+  mocks.start.mockReturnValue(started)
+  mocks.startWhenCapabilitySettles.mockResolvedValue(started.handle)
 })
 
 describe('conversation command generation intents', () => {
@@ -152,9 +161,69 @@ describe('conversation command generation intents', () => {
     })
   })
 
+  it('settles every message generation gesture through one abortable engine contract', async () => {
+    const signal = new AbortController().signal
+    const user = message({
+      id: 'user-1',
+      parentId: null,
+      role: 'user',
+      origin: 'user',
+      content: [{ type: 'text', text: 'before' }],
+    })
+    const assistant = message()
+
+    await editAndResendWhenCapabilitySettles({ chatId: 'chat-1' }, user, 'after', signal, {
+      prefillContent: [{ type: 'text', text: 'prefill' }],
+    })
+    await regenerateFromMessageWhenCapabilitySettles({ chatId: 'chat-1' }, assistant, signal, {
+      settingsPatch: { model: 'model-2' },
+    })
+    await continueFromMessageWhenCapabilitySettles({ chatId: 'chat-1' }, assistant, signal)
+
+    expect(mocks.startWhenCapabilitySettles.mock.calls).toEqual([
+      [
+        {
+          intent: {
+            kind: 'edit-resend',
+            chatId: 'chat-1',
+            targetUserId: 'user-1',
+            content: [{ type: 'text', text: 'after' }],
+            prefillContent: [{ type: 'text', text: 'prefill' }],
+          },
+        },
+        { signal },
+      ],
+      [
+        {
+          intent: {
+            kind: 'regenerate',
+            chatId: 'chat-1',
+            targetAssistantId: 'assistant-1',
+            settingsPatch: { model: 'model-2' },
+          },
+        },
+        { signal },
+      ],
+      [
+        {
+          intent: {
+            kind: 'continue',
+            chatId: 'chat-1',
+            targetAssistantId: 'assistant-1',
+          },
+        },
+        { signal },
+      ],
+    ])
+  })
+
   it('routes ordinary send, reply, and new-chat send through the same engine', async () => {
     const routeOwner = createConversationRouteOwnerController().owner
-    requireStarted(sendMessage('chat-1', 'expected-leaf', [{ type: 'text', text: 'send' }]))
+    requireStarted(
+      sendMessage('chat-1', { kind: 'fixed', messageId: 'expected-leaf' }, [
+        { type: 'text', text: 'send' },
+      ]),
+    )
     requireStarted(replyToMessage('chat-1', 'user-1'))
     requireStarted(sendNewChat([{ type: 'text', text: 'new chat' }], routeOwner))
 
@@ -164,7 +233,7 @@ describe('conversation command generation intents', () => {
           intent: {
             kind: 'send',
             chatId: 'chat-1',
-            expectedLeafId: 'expected-leaf',
+            target: { kind: 'fixed', messageId: 'expected-leaf' },
             content: [{ type: 'text', text: 'send' }],
           },
         },
@@ -189,7 +258,11 @@ describe('conversation command generation intents', () => {
     })
 
     expect(() =>
-      requireStarted(sendMessage('chat-1', 'expected-leaf', [{ type: 'text', text: 'send' }])),
+      requireStarted(
+        sendMessage('chat-1', { kind: 'fixed', messageId: 'expected-leaf' }, [
+          { type: 'text', text: 'send' },
+        ]),
+      ),
     ).toThrow('GenerationTestNotStarted:pending:configuration')
   })
 })

@@ -1,6 +1,10 @@
 import { act, fireEvent, render } from '@testing-library/react'
 import { createRef } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type {
+  ConversationMutationRunner,
+  GenerationSubmission,
+} from '../../src/app/presentation-interactions'
 import {
   createActiveBranchSpine,
   emptyActiveBranchChildSlot,
@@ -9,9 +13,7 @@ import {
 import { type BranchPathDescriptor, createBranchPath } from '../../src/core/branch-session'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import { PREFILL_UNAVAILABLE_PLAN } from '../../src/core/effective-endpoint-routing'
-import { AVAILABLE_GENERATION_CAPABILITY } from '../../src/core/interaction-capability'
 import type { Message, MessageId } from '../../src/core/types'
-import type { GenerationCapabilityFrame } from '../../src/store/generation-admission-controller'
 import { type MessageHeaderRow, splitMessageForStorage } from '../../src/store/message-storage'
 import type { ConversationTranscriptSurface } from '../../src/store/presentation-contracts'
 import {
@@ -25,6 +27,7 @@ import { useUiStore } from '../../src/store/zustand/uiStore'
 import { MessageList } from '../../src/ui/chat/MessageList'
 import { ScrollRegion, type ScrollRegionHandle } from '../../src/ui/chat/ScrollRegion'
 import { resetAttemptControllerForTests } from '../helpers/attempt-controller'
+import { createInteractionSettlementHarness } from '../helpers/presentation-interactions'
 
 vi.mock('../../src/ui/chat/MarkdownView', () => ({
   PROGRESSIVE_STATIC_MARKDOWN_CHARS: 120_000,
@@ -35,9 +38,19 @@ vi.mock('../../src/ui/attachments/AttachmentRefChips', () => ({ AttachmentRefChi
 vi.mock('../../src/ui/chat/ToolEvidenceBlock', () => ({ ToolEvidenceBlock: () => null }))
 
 const CHAT_ID = 'chat-prepend-anchor'
-const AVAILABLE_CAPABILITY_FRAME: GenerationCapabilityFrame = Object.freeze({
-  capability: () => AVAILABLE_GENERATION_CAPABILITY,
-})
+const STARTED_GENERATION = (): GenerationSubmission =>
+  Object.freeze({
+    kind: 'started',
+    admission: Promise.resolve(Object.freeze({ kind: 'admitted' })),
+    completion: Promise.resolve(Object.freeze({ kind: 'prepared' })),
+    cancel: () => undefined,
+  })
+const mutationSettlements = createInteractionSettlementHarness()
+const RUN_MUTATION: ConversationMutationRunner = (_intent, action, commit) =>
+  mutationSettlements.run(async () => {
+    await action(new AbortController().signal, () => undefined)
+    commit?.()
+  })
 
 beforeEach(() => {
   resetAttemptControllerForTests()
@@ -321,10 +334,13 @@ function viewportElement(
         binding={transcriptBinding(fixture, snapshot, viewportRevision)}
         chatSettings={cloneDefaultChatSettings()}
         prefillPlan={PREFILL_UNAVAILABLE_PLAN}
-        generationCapabilityFrame={AVAILABLE_CAPABILITY_FRAME}
         messageInitialRenderWork={10}
         messageRenderWindowLoadMode="manual"
         onLoadOlderMessages={() => {}}
+        runConversationMutation={RUN_MUTATION}
+        onEditAndSendMessage={STARTED_GENERATION}
+        onRegenerateMessage={STARTED_GENERATION}
+        onContinueMessage={STARTED_GENERATION}
       />
     </ScrollRegion>
   )
@@ -343,7 +359,6 @@ function transcriptBinding(
     window,
     selectionEpoch: 0,
     viewportRevision,
-    intentPresentations: Object.freeze([]),
     reveal: null,
   })
 }

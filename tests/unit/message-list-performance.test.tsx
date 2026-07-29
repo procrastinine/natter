@@ -1,5 +1,9 @@
-import { render } from '@testing-library/react'
+import { fireEvent, render } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type {
+  ConversationMutationRunner,
+  GenerationSubmission,
+} from '../../src/app/presentation-interactions'
 import {
   createActiveBranchSpine,
   emptyActiveBranchChildSlot,
@@ -8,9 +12,7 @@ import {
 import { type BranchPathDescriptor, createBranchPath } from '../../src/core/branch-session'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import { PREFILL_UNAVAILABLE_PLAN } from '../../src/core/effective-endpoint-routing'
-import { AVAILABLE_GENERATION_CAPABILITY } from '../../src/core/interaction-capability'
 import type { ChatSettings, Message, MessageId } from '../../src/core/types'
-import type { GenerationCapabilityFrame } from '../../src/store/generation-admission-controller'
 import { type MessageHeaderRow, splitMessageForStorage } from '../../src/store/message-storage'
 import type { ConversationTranscriptSurface } from '../../src/store/presentation-contracts'
 import {
@@ -25,6 +27,7 @@ import { useUiStore } from '../../src/store/zustand/uiStore'
 import { __setMessageRenderProbeForTests } from '../../src/ui/chat/Message'
 import { MessageList } from '../../src/ui/chat/MessageList'
 import { resetAttemptControllerForTests } from '../helpers/attempt-controller'
+import { createInteractionSettlementHarness } from '../helpers/presentation-interactions'
 
 vi.mock('../../src/ui/chat/MarkdownView', () => ({
   PROGRESSIVE_STATIC_MARKDOWN_CHARS: 120_000,
@@ -35,11 +38,21 @@ vi.mock('../../src/ui/attachments/AttachmentRefChips', () => ({ AttachmentRefChi
 vi.mock('../../src/ui/chat/ToolEvidenceBlock', () => ({ ToolEvidenceBlock: () => null }))
 
 const CHAT_ID = 'chat-message-list'
-const AVAILABLE_CAPABILITY_FRAME: GenerationCapabilityFrame = Object.freeze({
-  capability: () => AVAILABLE_GENERATION_CAPABILITY,
-})
+const STARTED_GENERATION = (): GenerationSubmission =>
+  Object.freeze({
+    kind: 'started',
+    admission: Promise.resolve(Object.freeze({ kind: 'admitted' })),
+    completion: Promise.resolve(Object.freeze({ kind: 'prepared' })),
+    cancel: () => undefined,
+  })
 const BASE_SETTINGS = cloneDefaultChatSettings()
 const NOOP_LOAD = () => {}
+const mutationSettlements = createInteractionSettlementHarness()
+const RUN_MUTATION: ConversationMutationRunner = (_intent, action, commit) =>
+  mutationSettlements.run(async () => {
+    await action(new AbortController().signal, () => undefined)
+    commit?.()
+  })
 
 let renderedIds: MessageId[] = []
 
@@ -179,6 +192,53 @@ describe('message-list current presentation contract', () => {
       view.container.querySelectorAll('[data-ui="profile-glyph"][data-excluded="true"]'),
     ).toHaveLength(0)
   })
+
+  it('keeps exact retained row commands live under current workspace authority', () => {
+    const fixture = branchFixture(3)
+    const snapshot = fixture.window(0, 3)
+    const view = renderList(fixture, snapshot, { currency: 'retained' })
+
+    for (const button of view.getAllByRole('button', { name: 'Edit message' })) {
+      expect(button).toBeEnabled()
+    }
+    for (const button of view.getAllByRole('button', { name: 'Delete message' })) {
+      expect(button).toBeEnabled()
+    }
+    expect(view.getByRole('log')).toHaveAttribute('data-presentation-only', 'true')
+
+    view.rerender(
+      listElement(fixture, snapshot, {
+        currency: 'retained',
+        mutationsUnavailable: true,
+      }),
+    )
+    for (const button of view.getAllByRole('button', { name: 'Edit message' })) {
+      expect(button).toBeDisabled()
+    }
+    for (const button of view.getAllByRole('button', { name: 'Delete message' })) {
+      expect(button).toBeDisabled()
+    }
+  })
+
+  it('lets regenerate own a pending capability and replace an earlier preparation', () => {
+    const fixture = branchFixture(2)
+    const onRegenerateMessage = vi.fn((_message: Message) => STARTED_GENERATION())
+    const view = renderList(fixture, fixture.window(0, 2), {
+      generationSubmissionPending: true,
+      onRegenerateMessage,
+    })
+    const focusTarget = view.getAllByRole('button', { name: 'Copy message' }).at(-1)
+    if (!focusTarget) throw new Error('Message focus target missing')
+    focusTarget.focus()
+
+    fireEvent.keyDown(window, { key: 'R', shiftKey: true, ctrlKey: true })
+
+    expect(onRegenerateMessage).toHaveBeenCalledOnce()
+    const regenerate = view.getByRole('button', { name: 'Regenerate response' })
+    expect(regenerate).toBeEnabled()
+    fireEvent.click(regenerate)
+    expect(onRegenerateMessage).toHaveBeenCalledTimes(2)
+  })
 })
 
 interface BranchFixture {
@@ -245,25 +305,42 @@ function branchFixture(
 function renderList(
   fixture: BranchFixture,
   branchSnapshot: TranscriptBodyWindow,
-  overrides: { readonly chatSettings?: ChatSettings } = {},
+  overrides: ListOverrides = {},
 ) {
   return render(listElement(fixture, branchSnapshot, overrides))
+}
+
+interface ListOverrides {
+  readonly chatSettings?: ChatSettings
+  readonly currency?: ConversationTranscriptSurface['currency']
+  readonly mutationsUnavailable?: boolean
+  readonly generationSubmissionPending?: boolean
+  readonly onRegenerateMessage?: (message: Message) => GenerationSubmission
 }
 
 function listElement(
   fixture: BranchFixture,
   branchSnapshot: TranscriptBodyWindow,
-  overrides: { readonly chatSettings?: ChatSettings } = {},
+  overrides: ListOverrides = {},
 ) {
   return (
     <MessageList
-      binding={transcriptBinding(fixture, branchSnapshot)}
+      binding={transcriptBinding(fixture, branchSnapshot, overrides.currency)}
+      {...(overrides.mutationsUnavailable !== undefined
+        ? { mutationsUnavailable: overrides.mutationsUnavailable }
+        : {})}
       chatSettings={overrides.chatSettings ?? BASE_SETTINGS}
       prefillPlan={PREFILL_UNAVAILABLE_PLAN}
-      generationCapabilityFrame={AVAILABLE_CAPABILITY_FRAME}
       messageInitialRenderWork={10}
       messageRenderWindowLoadMode="manual"
       onLoadOlderMessages={NOOP_LOAD}
+      runConversationMutation={RUN_MUTATION}
+      onEditAndSendMessage={STARTED_GENERATION}
+      onRegenerateMessage={overrides.onRegenerateMessage ?? STARTED_GENERATION}
+      onContinueMessage={STARTED_GENERATION}
+      {...(overrides.generationSubmissionPending !== undefined
+        ? { generationSubmissionPending: overrides.generationSubmissionPending }
+        : {})}
     />
   )
 }
@@ -271,16 +348,16 @@ function listElement(
 function transcriptBinding(
   fixture: BranchFixture,
   window: TranscriptBodyWindow,
+  currency: ConversationTranscriptSurface['currency'] = 'current',
 ): ConversationTranscriptSurface {
   return Object.freeze({
     surface: 'transcript',
-    currency: 'current',
+    currency,
     seal: fixture.seal,
     spine: fixture.spine,
     window,
     selectionEpoch: 0,
     viewportRevision: 0,
-    intentPresentations: Object.freeze([]),
     reveal: null,
   })
 }

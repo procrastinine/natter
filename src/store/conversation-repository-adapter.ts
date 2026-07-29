@@ -1,4 +1,9 @@
-import { type ConversationProvedSelection, sealConversationSelection } from '../core/messages'
+import {
+  type ConversationDestinationHeaderPoint,
+  type ConversationDestinationPoint,
+  type ConversationProvedSelection,
+  sealConversationSelection,
+} from '../core/messages'
 import type { Chat, ChatId, MessageId } from '../core/types'
 import { assertNever } from '../lib/assert'
 import {
@@ -100,6 +105,60 @@ class RepositoryConversationAdapter implements ConversationRepositoryAdapter {
         return conversationEnvelope(envelope, envelope.value)
       },
       openSelection: async (chatId, target, onPoint, signal) => {
+        const publishPoint = (
+          stage: ConversationReadEnvelope<ConversationDestinationHeaderPoint>,
+        ) => {
+          if (!onPoint) return
+          if (stage.value.kind === 'empty-point') {
+            onPoint(
+              Object.freeze({
+                workspaceId: stage.workspaceId,
+                replacementEpoch: stage.replacementEpoch,
+                value: stage.value,
+              }),
+            )
+            return
+          }
+          const header = stage.value.header
+          void this.controller
+            .readSharedMessageMaterial(
+              stage,
+              [header],
+              async (headers, sharedSignal) => {
+                const read = await this.read(
+                  {
+                    kind: 'message.presentations',
+                    messageIds: headers.map((candidate) => candidate.id),
+                  },
+                  sharedSignal,
+                )
+                return {
+                  workspaceId: read.workspaceId,
+                  replacementEpoch: read.replacementEpoch,
+                  material: read.value,
+                }
+              },
+              signal,
+            )
+            .then(([presentation]) => {
+              if (!presentation || signal.aborted) return
+              const point: ConversationDestinationPoint = Object.freeze({
+                kind: 'tip-point',
+                chat: stage.value.chat,
+                target: stage.value.target,
+                structuralVersion: stage.value.structuralVersion,
+                presentation,
+              })
+              onPoint(
+                Object.freeze({
+                  workspaceId: stage.workspaceId,
+                  replacementEpoch: stage.replacementEpoch,
+                  value: point,
+                }),
+              )
+            })
+            .catch(() => undefined)
+        }
         const envelope = await runWorkspaceRead(
           'repository-query',
           (permit) =>
@@ -109,7 +168,7 @@ class RepositoryConversationAdapter implements ConversationRepositoryAdapter {
               onPoint
                 ? {
                     signal: permit.signal,
-                    onStage: (stage) => onPoint(conversationEnvelope(stage, stage.value)),
+                    onStage: (stage) => publishPoint(conversationEnvelope(stage, stage.value)),
                   }
                 : { signal: permit.signal },
             ),

@@ -286,7 +286,7 @@ describe('calibration metadata commits', () => {
       {
         kind: 'send',
         chatId: chat.id,
-        expectedLeafId: null,
+        target: { kind: 'fixed', messageId: null },
         content: [{ type: 'text', text: 'a'.repeat(400) }],
       },
       {
@@ -392,7 +392,7 @@ describe('calibration metadata commits', () => {
       {
         kind: 'send',
         chatId: chat.id,
-        expectedLeafId: null,
+        target: { kind: 'fixed', messageId: null },
         content: [{ type: 'text', text: 'prepared but not dispatched' }],
       },
       {

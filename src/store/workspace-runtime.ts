@@ -132,6 +132,7 @@ export interface WorkspaceRuntimeOpenedEvent {
 type WorkspaceRuntimeListener = (event: WorkspaceRuntimeOpenedEvent) => void
 type WorkspaceRuntimeIdleListener = () => void
 type WorkspaceRuntimeStateListener = () => void
+type WorkspaceRuntimeRootReleaseListener = () => void
 type WorkspaceRuntimeQuiesceMode = 'graceful' | 'abortive'
 type WorkspaceRuntimeDemandBoundary = () => Promise<void>
 
@@ -258,6 +259,7 @@ export function createWorkspaceRuntimeKernel() {
   const listeners = new Set<WorkspaceRuntimeListener>()
   const idleListeners = new Set<WorkspaceRuntimeIdleListener>()
   const stateListeners = new Set<WorkspaceRuntimeStateListener>()
+  const rootReleaseListeners = new Set<WorkspaceRuntimeRootReleaseListener>()
 
   let state: WorkspaceRuntimeState = 'STARTING'
   let runtimeGeneration = 0
@@ -472,6 +474,93 @@ export function createWorkspaceRuntimeKernel() {
     return () => stateListeners.delete(listener)
   }
 
+  function waitForWorkspaceRuntimeReplacementBlockers(
+    options: WorkspaceRuntimeActionOptions = {},
+  ): Promise<void> {
+    if (options.signal?.aborted) return Promise.reject(workspaceRuntimeError(options.signal.reason))
+    if (replacementBlockerIds(options.lineageId).length === 0) return Promise.resolve()
+    return new Promise<void>((resolve, reject) => {
+      let settled = false
+      const dispose = () => {
+        rootReleaseListeners.delete(attempt)
+        stateListeners.delete(attempt)
+        options.signal?.removeEventListener('abort', onAbort)
+      }
+      const settle = (operation: () => void) => {
+        if (settled) return
+        settled = true
+        dispose()
+        operation()
+      }
+      const attempt = () => {
+        if (options.signal?.aborted) {
+          settle(() => reject(workspaceRuntimeError(options.signal?.reason)))
+          return
+        }
+        if (state !== 'RUNNING' || replacementBlockerIds(options.lineageId).length === 0) {
+          settle(resolve)
+        }
+      }
+      const onAbort = () => settle(() => reject(workspaceRuntimeError(options.signal?.reason)))
+      rootReleaseListeners.add(attempt)
+      stateListeners.add(attempt)
+      options.signal?.addEventListener('abort', onAbort, { once: true })
+      attempt()
+    })
+  }
+
+  function launchReplacementWhenUnblocked(
+    kind: WorkspaceReplacementRootKind,
+    options: WorkspaceRuntimeActionOptions & { readonly requireIdle: boolean },
+    enterQuiescing: () => void,
+  ): Promise<WorkspaceReconcileAuthority | null> {
+    if (options.signal?.aborted) return Promise.reject(workspaceRuntimeError(options.signal.reason))
+    return new Promise<WorkspaceReconcileAuthority | null>((resolve, reject) => {
+      let settled = false
+      let promoting = false
+      const dispose = () => {
+        rootReleaseListeners.delete(attempt)
+        idleListeners.delete(attempt)
+        stateListeners.delete(attempt)
+        options.signal?.removeEventListener('abort', onAbort)
+      }
+      const settle = (operation: () => void) => {
+        if (settled) return
+        settled = true
+        dispose()
+        operation()
+      }
+      const attempt = () => {
+        if (settled || promoting) return
+        if (options.signal?.aborted) {
+          settle(() => reject(workspaceRuntimeError(options.signal?.reason)))
+          return
+        }
+        if (state !== 'RUNNING') {
+          settle(() => resolve(null))
+          return
+        }
+        promoting = true
+        try {
+          const authority = launchReplacementNow(kind, options, enterQuiescing)
+          if (authority) settle(() => resolve(authority))
+        } catch (error) {
+          if (!(error instanceof WorkspaceRuntimeReplacementBlockedError)) {
+            settle(() => reject(workspaceRuntimeError(error)))
+          }
+        } finally {
+          promoting = false
+        }
+      }
+      const onAbort = () => settle(() => reject(workspaceRuntimeError(options.signal?.reason)))
+      rootReleaseListeners.add(attempt)
+      idleListeners.add(attempt)
+      stateListeners.add(attempt)
+      options.signal?.addEventListener('abort', onAbort, { once: true })
+      attempt()
+    })
+  }
+
   function getWorkspaceRuntimeState(): WorkspaceRuntimeState {
     return state
   }
@@ -630,6 +719,7 @@ export function createWorkspaceRuntimeKernel() {
     record.active = false
     record.unlink()
     activeRoots.delete(record)
+    for (const listener of [...rootReleaseListeners]) listener()
     endTrackedWork()
   }
 
@@ -838,30 +928,13 @@ export function createWorkspaceRuntimeKernel() {
     enterQuiescing: () => void,
   ): WorkspaceReconcileAuthority | null {
     if (options.signal?.aborted) throw options.signal.reason
-    const matchingRoots = options.lineageId
-      ? [...activeRoots].filter((candidate) => candidate.permit.lineageId === options.lineageId)
-      : []
-    if (matchingRoots.length > 1) {
-      throw new Error(`WorkspaceRuntimeReplacementLineageAmbiguous:${options.lineageId}`)
-    }
-    const promotedRoot = matchingRoots[0]
+    const promotedRoot = replacementPromotedRoot(options.lineageId)
     const otherwiseIdle =
       activeChildren.size === 0 &&
       activeRoots.size === (promotedRoot === undefined ? 0 : 1) &&
       activeCount === (promotedRoot === undefined ? 0 : 1)
     if (state !== 'RUNNING' || (options.requireIdle && !otherwiseIdle)) return null
-    const blockerIds = [...activeRoots]
-      .filter(
-        (candidate) =>
-          candidate !== promotedRoot &&
-          WORKSPACE_ROOT_REPLACEMENT_DISPOSITIONS[candidate.kind] === 'block',
-      )
-      .map((candidate) =>
-        candidate.permit.lineageId.startsWith('generation:')
-          ? candidate.permit.lineageId.slice('generation:'.length)
-          : candidate.permit.permitId,
-      )
-      .sort()
+    const blockerIds = replacementBlockerIds(options.lineageId)
     if (blockerIds.length > 0) throw new WorkspaceRuntimeReplacementBlockedError(blockerIds)
     const root = promotedRoot ?? admitRoot(kind, 'write-root', options)
     if (authority) deactivateAuthorityRecord(authority)
@@ -894,6 +967,32 @@ export function createWorkspaceRuntimeKernel() {
     publishRuntimeState()
     endTrackedWork()
     return next
+  }
+
+  function replacementPromotedRoot(lineageId: string | undefined): RootPermitRecord | undefined {
+    const matchingRoots = lineageId
+      ? [...activeRoots].filter((candidate) => candidate.permit.lineageId === lineageId)
+      : []
+    if (matchingRoots.length > 1) {
+      throw new Error(`WorkspaceRuntimeReplacementLineageAmbiguous:${lineageId}`)
+    }
+    return matchingRoots[0]
+  }
+
+  function replacementBlockerIds(lineageId: string | undefined): string[] {
+    const promotedRoot = replacementPromotedRoot(lineageId)
+    return [...activeRoots]
+      .filter(
+        (candidate) =>
+          candidate !== promotedRoot &&
+          WORKSPACE_ROOT_REPLACEMENT_DISPOSITIONS[candidate.kind] === 'block',
+      )
+      .map((candidate) =>
+        candidate.permit.lineageId.startsWith('generation:')
+          ? candidate.permit.lineageId.slice('generation:'.length)
+          : candidate.permit.permitId,
+      )
+      .sort()
   }
 
   function beginReconciliation(
@@ -1053,6 +1152,7 @@ export function createWorkspaceRuntimeKernel() {
     markFailedClosed,
     sealAfterClosedInvariantFailure,
     launchReplacementNow,
+    launchReplacementWhenUnblocked,
     beginReconciliation,
     noteGatedChange,
     finishReconciliation,
@@ -1075,6 +1175,7 @@ export function createWorkspaceRuntimeKernel() {
     subscribeWorkspaceRuntime,
     subscribeWorkspaceRuntimeIdle,
     subscribeWorkspaceRuntimeState,
+    waitForWorkspaceRuntimeReplacementBlockers,
     getWorkspaceRuntimeState,
     getWorkspaceRuntimeFence,
     isWorkspaceRuntimeReplacementTransitionOwned,
@@ -1098,6 +1199,8 @@ const subscribeProductionWorkspaceRuntimeIdle =
   productionWorkspaceRuntime.subscribeWorkspaceRuntimeIdle
 const subscribeProductionWorkspaceRuntimeState =
   productionWorkspaceRuntime.subscribeWorkspaceRuntimeState
+const waitForProductionWorkspaceRuntimeReplacementBlockers =
+  productionWorkspaceRuntime.waitForWorkspaceRuntimeReplacementBlockers
 const assertProductionWorkspaceReadPermit: (
   value: unknown,
 ) => asserts value is WorkspaceReadPermit | WorkspaceReconcileAuthority =
@@ -1177,6 +1280,12 @@ export function subscribeWorkspaceRuntimeState(
   listener: WorkspaceRuntimeStateListener,
 ): () => void {
   return subscribeProductionWorkspaceRuntimeState(listener)
+}
+
+export function waitForWorkspaceRuntimeReplacementBlockers(
+  options: WorkspaceRuntimeActionOptions = {},
+): Promise<void> {
+  return waitForProductionWorkspaceRuntimeReplacementBlockers(options)
 }
 
 export function getWorkspaceRuntimeState(): WorkspaceRuntimeState {

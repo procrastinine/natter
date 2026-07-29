@@ -2,12 +2,12 @@ import type {
   ActiveBranchChildSlot,
   ActiveBranchForkSlot,
   ActiveBranchForkTarget,
+  ActiveBranchIntentTarget,
   ActiveBranchTargetUnavailableReason,
 } from '../core/active-branch-spine'
 import type { AttemptTerminalDecision, AttemptTerminalReceipt } from '../core/attempt-outcome'
 import type { BranchPathWindow } from '../core/branch-session'
-import type { ChatSettingsFieldPatch } from '../core/chat-metadata'
-import type { ConnectionDispatchProfileProof } from '../core/connection-dispatch-proof'
+import type { ChatSettingsFieldPatch, ChatSettingsPatch } from '../core/chat-metadata'
 import type { AppliedMessageSemanticEffect } from '../core/continuation-content'
 import type { CorsProxyConfig } from '../core/cors-proxy'
 import {
@@ -27,7 +27,7 @@ import type {
 import type { KeyDispatchProof, KeyDispatchRevision } from '../core/key-dispatch-proof'
 import type {
   ConversationAppendSelectionTransition,
-  ConversationDestinationPoint,
+  ConversationDestinationHeaderPoint,
   ConversationProvedSelection,
   ConversationSelectionProofTarget,
   DeleteInput,
@@ -37,7 +37,6 @@ import type {
   MessageBodyMutationInput,
   PasteImportInput,
   PasteImportResult,
-  PreparedMessagePlacementFrame,
 } from '../core/messages'
 
 import { RENDERING_PREFERENCES_KEY, type RenderingPreferences } from '../core/rendering-preferences'
@@ -55,6 +54,7 @@ import type {
   AttachmentId,
   AttachmentJob,
   AttachmentMissingReason,
+  AttachmentRef,
   AttachmentReferenceEdge,
   Chat,
   ChatFolder,
@@ -71,6 +71,7 @@ import type {
   ConnectionHttpProfile,
   ConnectionProfile,
   ContentAnnotation,
+  ContentItem,
   ContinuationAttemptDraft,
   DispatchedGenerationMeta,
   DraftRow,
@@ -202,7 +203,7 @@ export type WorkspaceQueryStage<Q extends WorkspaceQuery> = Q extends {
   kind: 'branch.open'
   bodyDemand: 'terminal'
 }
-  ? ConversationDestinationPoint
+  ? ConversationDestinationHeaderPoint
   : never
 
 export type WorkspaceQueryOptions<Q extends WorkspaceQuery = WorkspaceQuery> = {
@@ -1018,27 +1019,29 @@ export interface PendingConfigurationAcknowledgement
   >[]
 }
 
-export interface PrepareAttemptConfigurationClaim {
-  readonly settings: ChatSettings
-  readonly presetId: PresetId | null
-  readonly profile: ConnectionDispatchProfileProof
-  readonly requestRevision: ConfigurationRequestRevision
-  readonly dispatchKeyRevisions: readonly KeyDispatchRevision[]
+export interface PrepareAttemptConfigurationIntent {
   readonly preferredDispatchKeyId: KeyId | null
-  readonly workspaceSettingOverrides: readonly Pick<
-    PendingWorkspaceSettingIntent,
-    'key' | 'value'
-  >[]
-  readonly savedTextTemplate?: GenerationSavedTextTemplateReadProof
 }
 
-export type GenerationPromptPathHeaderClaim = GenerationMessageReadProof
+export interface PrepareAttemptPlacementIntent {
+  readonly chatId: ChatId
+  readonly createdAt: number
+  readonly assistantMessageId: MessageId
+  readonly user?: {
+    readonly messageId: MessageId
+    readonly content: readonly ContentItem[]
+    readonly attachmentRefs: readonly AttachmentRef[]
+  }
+  readonly prefillContent: readonly ContentItem[]
+}
 
-export interface GenerationPromptPathClaim {
+export type GenerationPromptPathReadHintHeader = GenerationMessageReadProof
+
+export interface GenerationPromptPathReadHint {
   readonly chatId: ChatId
   readonly structuralVersion: number
   readonly leafId: MessageId | null
-  readonly headers: readonly GenerationPromptPathHeaderClaim[]
+  readonly headers: readonly GenerationPromptPathReadHintHeader[]
   readonly placementSlot: ActiveBranchChildSlot | null
   readonly targetTurn: {
     readonly turnId: string
@@ -1057,14 +1060,8 @@ export type GenerationPromptPathRequirement =
       readonly kind: 'send'
       readonly surface: 'chat'
       readonly chatId: ChatId
-      readonly target:
-        | { readonly kind: 'root' }
-        | {
-            readonly kind: 'include'
-            readonly messageId: MessageId
-            readonly role: 'any'
-          }
-      readonly childSlot: 'empty'
+      readonly target: ActiveBranchIntentTarget
+      readonly childSlot: 'append'
     }
   | {
       readonly kind: 'reply'
@@ -1075,7 +1072,7 @@ export type GenerationPromptPathRequirement =
         readonly messageId: MessageId
         readonly role: 'user'
       }
-      readonly childSlot: 'empty'
+      readonly childSlot: 'append'
     }
   | {
       readonly kind: 'regenerate'
@@ -1113,16 +1110,12 @@ export type GenerationPromptPathRequirement =
 
 export interface GenerationPromptPathProof {
   readonly requirement: GenerationPromptPathRequirement
-  readonly claim: GenerationPromptPathClaim
+  readonly pathHint: GenerationPromptPathReadHint
 }
 
 type ExistingChatPrepareConfiguration = {
-  readonly configurationClaim: {
-    readonly configurationVersion: number
-  } & PrepareAttemptConfigurationClaim
-  readonly configurationLinkTransition: {
-    readonly expectedResourceNames: readonly string[]
-    readonly nextResourceNames: readonly string[]
+  readonly configurationIntent: PrepareAttemptConfigurationIntent & {
+    readonly settingsPatch?: ChatSettingsPatch
   }
 }
 
@@ -1131,29 +1124,31 @@ export type PrepareAttemptInput = (
       strategy: 'new-chat-send'
       chat: Chat
       lease: StreamLeaseAdmission
-      placement: PreparedMessagePlacementFrame
-      configurationClaim: PrepareAttemptConfigurationClaim
+      placement: PrepareAttemptPlacementIntent
+      configurationIntent: PrepareAttemptConfigurationIntent & {
+        readonly settings: ChatSettings
+        readonly presetId: PresetId | null
+      }
     }
   | ({
       strategy: 'send'
       lease: StreamLeaseAdmission
-      placement: PreparedMessagePlacementFrame
+      placement: PrepareAttemptPlacementIntent
     } & ExistingChatPrepareConfiguration)
   | ({
       strategy: 'reply'
       lease: StreamLeaseAdmission
-      placement: PreparedMessagePlacementFrame
+      placement: PrepareAttemptPlacementIntent
     } & ExistingChatPrepareConfiguration)
   | ({
       strategy: 'regenerate'
       lease: StreamLeaseAdmission
-      placement: PreparedMessagePlacementFrame
-      persistCapturedConfiguration?: true
+      placement: PrepareAttemptPlacementIntent
     } & ExistingChatPrepareConfiguration)
   | ({
       strategy: 'edit-resend'
       lease: StreamLeaseAdmission
-      placement: PreparedMessagePlacementFrame
+      placement: PrepareAttemptPlacementIntent
     } & ExistingChatPrepareConfiguration)
   | ({
       strategy: 'continue'
@@ -1166,7 +1161,6 @@ export type PrepareAttemptInput = (
 interface AttemptPrepareResultBase<Lease extends WriterReservedStreamLeaseRow> {
   lease: Lease
   user?: Message
-  assistant: Message
   userHeader?: MessageHeaderRow
   assistantHeader: MessageHeaderRow
   prompt: PreparedGenerationPrompt
@@ -1179,12 +1173,14 @@ export type AttemptPrepareResult =
     > & {
       strategy: 'continue'
       user?: never
+      assistant?: never
       continuationBase: ContinuationPrepareProof
     })
   | (AttemptPrepareResultBase<
       Extract<WriterReservedStreamLeaseRow, { attemptKind: 'generation' }>
     > & {
       strategy: Exclude<PrepareAttemptInput['strategy'], 'continue'>
+      assistant: Message
       continuationBase?: never
       selectionTransition: ConversationAppendSelectionTransition
     })

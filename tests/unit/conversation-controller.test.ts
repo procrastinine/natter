@@ -807,109 +807,6 @@ describe('conversation controller', () => {
     expect(presentedSpine(controller).resolvedLeafId).toBe(assistant.header.id)
   })
 
-  it('seals a selected destination before navigation without retaining the active route', async () => {
-    const root = message('root', null, 0, 'root', 1)
-    const { controller, navigation } = harness([root])
-    navigation.arrive('arrival-1', { chatId: CHAT_ID, targetMessageId: root.id })
-    await settle()
-
-    const destination = controller.claimSelectedDestination({ chatId: CHAT_ID })
-    expect(controller.resolveSelectedDestination(destination)).toEqual({
-      kind: 'ready',
-      expectedLeafId: root.id,
-    })
-    const promptDestination = controller.resolveSelectedPromptPath(destination)
-    expect(promptDestination.kind).toBe('ready')
-    if (promptDestination.kind !== 'ready') throw new Error('selected prompt path unavailable')
-    expect(
-      promptDestination.promptPath.capability({
-        kind: 'send',
-        chatId: CHAT_ID,
-        expectedLeafId: root.id,
-      }),
-    ).toBe('available')
-
-    navigation.arrive('arrival-2', null)
-    await settle()
-    expect(controller.resolveOperationDestination(destination.steering)).toEqual({
-      kind: 'superseded',
-    })
-    expect(controller.resolveSelectedDestination(destination)).toEqual({
-      kind: 'ready',
-      expectedLeafId: root.id,
-    })
-    const retainedPromptDestination = controller.resolveSelectedPromptPath(destination)
-    expect(retainedPromptDestination.kind).toBe('ready')
-    if (retainedPromptDestination.kind !== 'ready') {
-      throw new Error('retained selected prompt path unavailable')
-    }
-    expect(retainedPromptDestination.promptPath).toBe(promptDestination.promptPath)
-
-    controller.cancelSelectedDestination(destination)
-    expect(retainedSessionIds(controller)).toEqual([])
-  })
-
-  it('keeps an exact selected prompt path after a newer branch selection supersedes steering', async () => {
-    const root = message('root', null, 0, 'root', 1)
-    const first = message('first', root.id, 0, 'first', 2)
-    const second = message('second', root.id, 1, 'second', 3)
-    const { controller, navigation } = harness([root, first, second])
-    navigation.arrive('arrival-1', { chatId: CHAT_ID, targetMessageId: first.id })
-    await settle()
-
-    const destination = controller.claimSelectedDestination({ chatId: CHAT_ID })
-    const promptDestination = controller.resolveSelectedPromptPath(destination)
-    expect(promptDestination.kind).toBe('ready')
-    if (promptDestination.kind !== 'ready') throw new Error('selected prompt path unavailable')
-
-    controller.navigate({
-      chatId: CHAT_ID,
-      kind: 'message',
-      messageId: second.id,
-    })
-    await settle()
-
-    expect(controller.resolveOperationDestination(destination.steering)).toEqual({
-      kind: 'superseded',
-    })
-    expect(controller.resolveSelectedPromptPath(destination)).toEqual(promptDestination)
-
-    controller.cancelSelectedDestination(destination)
-    expect(controller.resolveSelectedPromptPath(destination)).toEqual({ kind: 'superseded' })
-  })
-
-  it('seals the exact presented destination while the same selection refreshes', async () => {
-    const root = message('root', null, 0, 'root', 1)
-    const leaf = message('leaf', root.id, 0, 'leaf', 2)
-    const { controller, navigation, source } = harness([root, leaf])
-    navigation.arrive('arrival-1', { chatId: CHAT_ID, targetMessageId: leaf.id })
-    await settle()
-
-    source.selectionCompletionGate = new Promise(() => {})
-    controller.applyCommittedEffect({
-      ...FENCE,
-      chatId: CHAT_ID,
-      source: 'invalidation',
-      kind: 'changed',
-      structural: { kind: 'none' },
-      refresh: { headers: true },
-    })
-    expect(controller.getSnapshot().active?.destination.kind).toBe('resolving')
-
-    const destination = controller.claimSelectedDestination({ chatId: CHAT_ID })
-    const promptDestination = controller.resolveSelectedPromptPath(destination)
-    expect(promptDestination.kind).toBe('ready')
-    if (promptDestination.kind !== 'ready') throw new Error('selected prompt path unavailable')
-    expect(promptDestination.expectedLeafId).toBe(leaf.id)
-    expect(
-      promptDestination.promptPath.capability({
-        kind: 'send',
-        chatId: CHAT_ID,
-        expectedLeafId: leaf.id,
-      }),
-    ).toBe('available')
-  })
-
   it('keeps a durable result successful while suppressing a superseded route delivery', () => {
     const root = message('root', null, 0, 'root', 1)
     const { controller, source } = harness([root])
@@ -1112,6 +1009,17 @@ describe('conversation controller', () => {
       visible,
     )
     expect(retained.surface).toBe('transcript')
+    const retainedEdit = controller.claimTranscriptRetention({
+      workspaceFence: FENCE,
+      chatId: CHAT_ID,
+      messageId: root.id,
+    })
+    expect(retainedEdit).toMatchObject({
+      kind: 'conversation-transcript-retention',
+      chatId: CHAT_ID,
+      messageId: root.id,
+    })
+    retainedEdit.release()
 
     acceptFreshSelection()
     await settle()
@@ -1162,6 +1070,13 @@ describe('conversation controller', () => {
     expect(pending.active?.presentation.painted?.chat.id).toBe(CHAT_ID)
     if (retained.surface !== 'transcript') throw new Error('expected retained transcript')
     expect(retained.window).toBe(firstWindow)
+    expect(() =>
+      controller.claimTranscriptRetention({
+        workspaceFence: FENCE,
+        chatId: CHAT_ID,
+        messageId: firstRoot.id,
+      }),
+    ).toThrowError('ConversationTranscriptRetentionTargetUnavailable')
 
     releaseSecond()
     source.selectionCompletionGate = null
@@ -1394,6 +1309,163 @@ describe('conversation controller', () => {
 
     unsubscribe()
     controller.setTranscriptDemand(demandOwner, null)
+  })
+
+  it('holds an exact retained edit across newer branch settlement until the edit releases', async () => {
+    const root = message('root', null, 0, 'root', 1)
+    const oldBranch = message('old-branch', root.id, 0, 'old branch', 2)
+    const oldLeaf = message('old-leaf', oldBranch.id, 0, 'old leaf', 3)
+    const newBranch = message('new-branch', root.id, 1, 'new branch', 4)
+    const newLeaf = message('new-leaf', newBranch.id, 0, 'new leaf', 5)
+    const { controller, navigation, source } = harness([
+      root,
+      oldBranch,
+      oldLeaf,
+      newBranch,
+      newLeaf,
+    ])
+    navigation.arrive('arrival-old', { chatId: CHAT_ID, targetMessageId: oldLeaf.id })
+    await settle()
+
+    let releaseSelection = () => {}
+    source.selectionCompletionGate = new Promise<void>((resolve) => {
+      releaseSelection = resolve
+    })
+    controller.navigate({
+      chatId: CHAT_ID,
+      kind: 'message',
+      messageId: newLeaf.id,
+    })
+    const edit = controller.claimTranscriptRetention({
+      workspaceFence: FENCE,
+      chatId: CHAT_ID,
+      messageId: oldLeaf.id,
+    })
+    expect(
+      controller.capturePromptPathFrame(FENCE).capability({
+        kind: 'edit-resend',
+        chatId: CHAT_ID,
+        targetUserId: oldLeaf.id,
+      }),
+    ).toBe('available')
+    expect(
+      controller.capturePromptPathFrame(FENCE).capability({
+        kind: 'regenerate',
+        chatId: CHAT_ID,
+        targetAssistantId: oldBranch.id,
+      }),
+    ).toBe('available')
+    expect(
+      controller.capturePromptPathFrame(FENCE).capability({
+        kind: 'continue',
+        chatId: CHAT_ID,
+        targetAssistantId: oldBranch.id,
+      }),
+    ).toBe('available')
+
+    releaseSelection()
+    await settle()
+    expect(controller.getSnapshot().active?.destination).toMatchObject({
+      kind: 'ready',
+      spine: { resolvedLeafId: newLeaf.id },
+    })
+    const held = controller.getSnapshot().active?.presentation
+    expect(held?.target).toMatchObject({ kind: 'pending', surface: 'transcript' })
+    expect(held?.painted?.binding).toMatchObject({
+      surface: 'transcript',
+      currency: 'retained',
+      seal: { leafId: oldLeaf.id },
+    })
+    const promptPath = controller.capturePromptPathFrame(FENCE)
+    expect(
+      promptPath.capability({
+        kind: 'edit-resend',
+        chatId: CHAT_ID,
+        targetUserId: oldLeaf.id,
+      }),
+    ).toBe('available')
+    const captured = promptPath.capture({
+      kind: 'edit-resend',
+      surface: 'chat',
+      chatId: CHAT_ID,
+      target: { kind: 'exclude', messageId: oldLeaf.id, role: 'user' },
+      childSlot: 'append',
+    })
+    expect(captured?.pathHint).toMatchObject({
+      chatId: CHAT_ID,
+      leafId: oldBranch.id,
+      placementSlot: {
+        parentId: oldBranch.id,
+        liveCount: 1,
+        nextSiblingIndex: 1,
+      },
+      targetTurn: {
+        turnId: oldLeaf.turnId,
+        turnIndex: oldLeaf.turnIndex,
+      },
+      headers: [
+        { messageId: root.id, parentId: null },
+        { messageId: oldBranch.id, parentId: root.id },
+      ],
+    })
+    captured?.material.release()
+
+    edit.release()
+    await settle()
+    expect(
+      expectCoherentReadyPresentation(controller.getSnapshot().active?.presentation, 'transcript')
+        .seal.leafId,
+    ).toBe(newLeaf.id)
+  })
+
+  it('captures an off-spine generation claim from exact topology', async () => {
+    const root = message('root', null, 0, 'root', 1)
+    const selectedAssistant = message('selected-assistant', root.id, 0, 'selected', 2)
+    const offSpineAssistant = message('off-spine-assistant', root.id, 1, 'off spine', 4)
+    const { controller, navigation, source } = harness([root, selectedAssistant, offSpineAssistant])
+
+    navigation.arrive('arrival-selected', {
+      chatId: CHAT_ID,
+      targetMessageId: selectedAssistant.id,
+    })
+    await settle()
+    controller.requestPresentation({ chatId: CHAT_ID, surface: 'tree' })
+    await settle()
+
+    expect(controller.getSnapshot().active?.topologyLoaded).toBe(true)
+    expect(presentedSpine(controller).path.has(offSpineAssistant.id)).toBe(false)
+    const promptPath = controller.capturePromptPathFrame(FENCE)
+    expect(
+      promptPath.capability({
+        kind: 'regenerate',
+        chatId: CHAT_ID,
+        targetAssistantId: offSpineAssistant.id,
+      }),
+    ).toBe('available')
+
+    const captured = promptPath.capture({
+      kind: 'regenerate',
+      surface: 'chat',
+      chatId: CHAT_ID,
+      target: { kind: 'exclude', messageId: offSpineAssistant.id, role: 'assistant' },
+      childSlot: 'append',
+    })
+    expect(captured?.pathHint).toMatchObject({
+      chatId: CHAT_ID,
+      structuralVersion: source.currentChat.structuralVersion,
+      leafId: root.id,
+      placementSlot: {
+        parentId: root.id,
+        liveCount: 2,
+        nextSiblingIndex: 2,
+      },
+      targetTurn: {
+        turnId: offSpineAssistant.turnId,
+        turnIndex: offSpineAssistant.turnIndex,
+      },
+      headers: [{ messageId: root.id, parentId: null }],
+    })
+    captured?.material.release()
   })
 
   it('remembers a deeper fork when swiping away from and back to its ancestor', async () => {
@@ -1729,7 +1801,7 @@ describe('conversation controller', () => {
     expect(controller.resolveOperationDestination(older)).toEqual({ kind: 'superseded' })
     expect(controller.resolveOperationDestination(newer)).toEqual({
       kind: 'ready',
-      expectedLeafId: left.id,
+      selection: { kind: 'tip', messageId: left.id },
     })
     expect(
       controller.acceptLocalResult(older, {
@@ -1818,7 +1890,7 @@ describe('conversation controller', () => {
     const operation = controller.claimOperation({ chatId: CHAT_ID, steering: 'select-result' })
     expect(controller.resolveOperationDestination(operation)).toEqual({
       kind: 'ready',
-      expectedLeafId: left.id,
+      selection: { kind: 'tip', messageId: left.id },
     })
     const remoteExtension = source.put(message('remote-extension', left.id, 0, 'remote', 3))
     controller.applyCommittedEffect({
@@ -1842,7 +1914,7 @@ describe('conversation controller', () => {
     })
     expect(controller.resolveOperationDestination(operation)).toEqual({
       kind: 'ready',
-      expectedLeafId: left.id,
+      selection: { kind: 'tip', messageId: left.id },
     })
     let releaseTopology = () => {}
     source.topologyCompletionGate = new Promise<void>((resolve) => {
@@ -2055,6 +2127,7 @@ describe('conversation controller', () => {
     if (!retainedMessageId) throw new Error('missing retained edit target')
 
     const retention = controller.claimTranscriptRetention({
+      workspaceFence: FENCE,
       chatId: CHAT_ID,
       messageId: retainedMessageId,
     })
@@ -2735,6 +2808,17 @@ describe('conversation controller', () => {
       current,
     )
     expect(retained.seal.replacementEpoch).toBe(FENCE.replacementEpoch)
+    const retainedEdit = controller.claimTranscriptRetention({
+      workspaceFence: FENCE,
+      chatId: CHAT_ID,
+      messageId: root.id,
+    })
+    expect(retainedEdit).toMatchObject({
+      kind: 'conversation-transcript-retention',
+      chatId: CHAT_ID,
+      messageId: root.id,
+    })
+    retainedEdit.release()
     expect(controller.getSnapshot()).toMatchObject({
       workspaceId: FENCE.workspaceId,
       workspaceEpoch: 1,

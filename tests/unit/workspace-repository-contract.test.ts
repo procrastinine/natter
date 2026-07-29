@@ -14,6 +14,7 @@ import {
   executeBrowserCommandInStagedDatabase,
   getBrowserRepository,
 } from '../../src/store/browser-repo'
+import { isBrowserWorkspaceStagedFanoutCommand } from '../../src/store/browser-staged-fanout-command'
 import { cleanPendingBrowserWorkspaceDatabase } from '../../src/store/browser-workspace-database-cleanup'
 import {
   beginBrowserWorkspaceDatabaseReplacement,
@@ -114,6 +115,34 @@ afterAll(async () => {
 })
 
 describe('browser WorkspaceRepository protocol contract', () => {
+  it('keeps every delete shape behind adaptive direct-or-staged fanout admission', () => {
+    for (const mode of ['pair', 'single', 'turn', 'variant'] as const) {
+      expect(
+        isBrowserWorkspaceStagedFanoutCommand({
+          kind: 'message.delete',
+          mode,
+          input: {
+            chatId: 'large-imported-chat',
+            messageId: 'intermediate-node',
+            activeLeafId: 'deep-leaf',
+          },
+        }),
+      ).toBe(true)
+    }
+    expect(
+      isBrowserWorkspaceStagedFanoutCommand({
+        kind: 'message.delete',
+        mode: 'single',
+        input: {
+          chatId: 'large-imported-chat',
+          messageId: 'intermediate-node',
+          activeLeafId: 'deep-leaf',
+          cascade: true,
+        },
+      }),
+    ).toBe(true)
+  })
+
   it('satisfies the reusable stamped query/command/branch contract', async () => {
     await expectWorkspaceRepositoryCoreContract(getBrowserRepository())
   })
@@ -297,6 +326,64 @@ describe('browser WorkspaceRepository protocol contract', () => {
       tokenCalibration: {},
       tokenCalibrationGeneration: 1,
     })
+  })
+
+  it('queues a staged foreground command behind a generation without surfacing replacement blocked', async () => {
+    const calibrationKey = tokenCalibrationKey('staged/blocked-generation-model')
+    const sample = {
+      totalTextChars: 400,
+      totalTextTokens: 100,
+      sampleCount: 2,
+      updatedAt: 1,
+    }
+    const chatIds = Array.from({ length: 130 }, (_, index) => `blocked-generation-${index}`)
+    await getDb().chats.bulkPut(
+      chatIds.map((id) => ({
+        ...sessionChat(id),
+        tokenCalibration: { [calibrationKey]: sample },
+        tokenCalibrationGeneration: 0,
+      })),
+    )
+    let releaseGeneration!: () => void
+    const generationGate = new Promise<void>((resolve) => {
+      releaseGeneration = resolve
+    })
+    let generationAborted = false
+    const generation = runWorkspaceAction(
+      'conversation-generation',
+      async (permit) => {
+        permit.signal.addEventListener('abort', () => {
+          generationAborted = true
+        })
+        await generationGate
+      },
+      { lineageId: 'generation:staged-command-blocker' },
+    )
+    let commandSettled = false
+    const command = runWorkspaceAction('message-structure', (permit) =>
+      getBrowserRepository()
+        .execute(permit, {
+          kind: 'chat.calibration.clear-family',
+          calibrationKey,
+          now: 10,
+        })
+        .finally(() => {
+          commandSettled = true
+        }),
+    )
+
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(commandSettled).toBe(false)
+    expect(generationAborted).toBe(false)
+    expect(getWorkspaceRuntimeControlSnapshot().state).toBe('RUNNING')
+
+    releaseGeneration()
+    await generation
+    await expect(command).resolves.toMatchObject({
+      value: { value: { globalChanged: false, chatCount: 130 } },
+    })
+    expect(generationAborted).toBe(false)
   })
 
   it('pages staged prompt target fanout and publishes identity-only chat evidence', async () => {

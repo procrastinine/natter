@@ -8,12 +8,15 @@ import {
   useState,
   useSyncExternalStore,
 } from 'react'
+import type {
+  GenerationSubmission,
+  GenerationSubmissionOutcome,
+} from '../../app/presentation-interactions'
 import type { SendShortcut } from '../../core/global-settings'
 import {
   AVAILABLE_GENERATION_CAPABILITY,
   type GenerationCapability,
   generationUnavailableReason,
-  type NonReadyGenerationCapability,
 } from '../../core/interaction-capability'
 import { estimateTokens } from '../../core/tokens'
 import type { MessageAttachmentRef } from '../../core/types'
@@ -40,6 +43,8 @@ export { moveComposerDraft } from './composer-draft-state'
 export interface ComposerProps {
   // Disables the textarea entirely.
   disabled?: boolean
+  submissionPending?: boolean
+  onCancelSubmission?: () => void
   generationCapability?: GenerationCapability
   replyGenerationCapability?: GenerationCapability
   onSubmit: (
@@ -103,27 +108,8 @@ export interface ComposerProps {
   presentationOnly?: boolean
 }
 
-export type ComposerSubmissionOutcome =
-  | { readonly kind: 'prepared' }
-  | {
-      readonly kind: 'not-prepared'
-      readonly reason: 'cancelled' | 'failed' | 'rejected-pending' | 'superseded'
-    }
-
-export type ComposerSubmissionAdmission =
-  | { readonly kind: 'admitted' }
-  | {
-      readonly kind: 'not-admitted'
-      readonly reason: 'cancelled' | 'failed' | 'rejected-pending' | 'superseded'
-    }
-
-export type ComposerSubmission =
-  | {
-      readonly kind: 'started'
-      readonly admission: Promise<ComposerSubmissionAdmission>
-      readonly completion: Promise<ComposerSubmissionOutcome>
-    }
-  | { readonly kind: 'not-started'; readonly capability: NonReadyGenerationCapability }
+export type ComposerSubmissionOutcome = GenerationSubmissionOutcome
+export type ComposerSubmission = GenerationSubmission
 
 type AutoSizeVariant = 'normal' | 'focus'
 
@@ -199,6 +185,8 @@ function setComposerTextareaHeight(
 
 export function Composer({
   disabled,
+  submissionPending = false,
+  onCancelSubmission,
   generationCapability = AVAILABLE_GENERATION_CAPABILITY,
   replyGenerationCapability = generationCapability,
   onSubmit,
@@ -504,6 +492,7 @@ export function Composer({
     Boolean(disabled) ||
     presentationOnly ||
     stopCapability !== undefined ||
+    submissionPending ||
     submitting ||
     uploadingAttachments
   const attachmentControlsDisabled = Boolean(disabled) || attachmentsDisabled
@@ -585,11 +574,13 @@ export function Composer({
     consumeAttachments,
     setComposerText,
   ])
-  const sendButtonLabel = emptyWithTrailingUser
-    ? 'Reply ⏎'
-    : sendShortcut === 'cmd-enter'
-      ? 'Send ⌘⏎'
-      : 'Send ⏎'
+  const sendButtonLabel = submissionPending
+    ? 'Preparing…'
+    : emptyWithTrailingUser
+      ? 'Reply ⏎'
+      : sendShortcut === 'cmd-enter'
+        ? 'Send ⌘⏎'
+        : 'Send ⏎'
 
   // Drag the TOP edge of the composer to resize. Capture pointer to keep
   // the drag stable even if the cursor leaves the handle, and clamp against
@@ -854,24 +845,35 @@ export function Composer({
             </Button>
           ) : (
             <Button
-              type="submit"
+              type={submissionPending ? 'button' : 'submit'}
               data-ui="send"
               tone="accent"
               appearance="solid"
               geometry="flush"
               data-mode={emptyWithTrailingUser ? 'reply' : 'send'}
+              onClick={submissionPending ? onCancelSubmission : undefined}
               disabled={
-                sendBlocked || (text.trim() === '' && !hasAttachments && !emptyWithTrailingUser)
+                submissionPending
+                  ? !onCancelSubmission
+                  : sendBlocked || (text.trim() === '' && !hasAttachments && !emptyWithTrailingUser)
               }
               title={
-                sendBlockedReason ??
+                (submissionPending
+                  ? onCancelSubmission
+                    ? 'Cancel request preparation and keep this draft'
+                    : 'Preparing the current request'
+                  : sendBlockedReason) ??
                 (uploadingAttachments ? 'Uploading attachments' : undefined) ??
                 (emptyWithTrailingUser
                   ? 'Generate an assistant reply for the trailing user message'
                   : undefined)
               }
             >
-              {sendButtonLabel}
+              {submissionPending
+                ? onCancelSubmission
+                  ? 'Cancel preparing'
+                  : 'Preparing…'
+                : sendButtonLabel}
             </Button>
           )}
         </div>

@@ -10,13 +10,11 @@ import {
   useRef,
   useState,
 } from 'react'
+import type { GenerationSubmission } from '../../app/presentation-interactions'
 import { generationCapabilityBlockedReason } from '../../core/interaction-capability'
 import type { AttachmentRef, MessageAttachmentRef } from '../../core/types'
 import { isPageHidingAbortError } from '../../lib/page-lifecycle'
-import type {
-  GenerationStartResult,
-  TotalPresentationInteractionPromise,
-} from '../../store/presentation-contracts'
+import type { TotalPresentationInteractionPromise } from '../../store/presentation-contracts'
 import { useAnnouncementStore } from '../../store/zustand/announcementStore'
 import { AttachmentDraftTray } from '../attachments/AttachmentDraftTray'
 import { AttachmentPicker } from '../attachments/AttachmentPicker'
@@ -32,10 +30,8 @@ interface InlineEditorProps {
   onSaveAndSend?: (
     text: string,
     opts?: { prefillText?: string; attachmentRefs?: MessageAttachmentRef[] },
-  ) => GenerationStartResult
+  ) => GenerationSubmission
   saveDisabled?: boolean
-  saveAndSendDisabled?: boolean
-  saveAndSendDisabledReason?: string
   ariaLabel?: string
   initialAttachmentRefs?: readonly AttachmentRef[] | undefined
   attachmentsEnabled?: boolean
@@ -68,8 +64,6 @@ export function InlineEditor({
   onCancel,
   onSaveAndSend,
   saveDisabled,
-  saveAndSendDisabled,
-  saveAndSendDisabledReason,
   ariaLabel,
   initialAttachmentRefs,
   attachmentsEnabled = true,
@@ -100,6 +94,9 @@ export function InlineEditor({
   const scrollRegionCommands = useScrollRegionCommands()
   const prefillTextareaRef = useRef<HTMLTextAreaElement | null>(null)
   const sessionRef = useRef<InlineEditorSession>({ active: false })
+  const pendingGenerationRef = useRef<Extract<GenerationSubmission, { kind: 'started' }> | null>(
+    null,
+  )
   const onCancelRef = useRef(onCancel)
   const uploadingAttachments = uploads.some((upload) => upload.state === 'uploading')
 
@@ -188,7 +185,7 @@ export function InlineEditor({
     uploadingAttachments,
   ])
   const commitSaveAndSend = useCallback(() => {
-    if (!onSaveAndSend || saveAndSendDisabled || busy || uploadingAttachments) return
+    if (!onSaveAndSend || uploadingAttachments) return
     const prefillOut = prefillOpen && prefillText.trim().length > 0 ? prefillText : ''
     setSaveAndSendError(null)
     const start = onSaveAndSend(text, {
@@ -197,37 +194,51 @@ export function InlineEditor({
     })
     if (start.kind === 'not-started') {
       setSaveAndSendError(
-        generationCapabilityBlockedReason(start.capability, 'edit-resend') ?? null,
+        generationCapabilityBlockedReason(start.capability, 'edit-resend') ??
+          'This branch is still preparing. Save & Send did not start.',
       )
       return
     }
+    pendingGenerationRef.current?.cancel()
     setBusy(true)
+    pendingGenerationRef.current = start
     const session = sessionRef.current
     void (async () => {
       try {
-        await start.handle.prepared
-        dismissIfCurrent(session)
+        const outcome = await start.completion
+        if (!sessionIsCurrent(session) || pendingGenerationRef.current !== start) return
+        if (outcome.kind === 'prepared') {
+          dismissIfCurrent(session)
+          return
+        }
+        setSaveAndSendError(
+          outcome.failure
+            ? `${outcome.failure.message} (${outcome.failure.diagnosticId})`
+            : `Save & Send did not prepare (${outcome.reason}).`,
+        )
       } catch (error) {
-        if (isPageHidingAbortError(error)) return
-        const completed = await start.handle.completed
-        if (sessionIsCurrent(session) && completed.outcome === 'error') {
+        if (
+          !isPageHidingAbortError(error) &&
+          sessionIsCurrent(session) &&
+          pendingGenerationRef.current === start
+        ) {
           setSaveAndSendError(
-            completed.error?.message ??
-              (error instanceof Error ? error.message : 'Generation preparation failed.'),
+            error instanceof Error ? error.message : 'Generation preparation failed.',
           )
         }
       } finally {
-        if (sessionIsCurrent(session)) setBusy(false)
+        if (pendingGenerationRef.current === start) {
+          pendingGenerationRef.current = null
+          if (sessionIsCurrent(session)) setBusy(false)
+        }
       }
     })()
   }, [
     attachmentRefs,
-    busy,
     dismissIfCurrent,
     onSaveAndSend,
     prefillOpen,
     prefillText,
-    saveAndSendDisabled,
     sessionIsCurrent,
     text,
     uploadingAttachments,
@@ -242,14 +253,14 @@ export function InlineEditor({
       }
       if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
         e.preventDefault()
-        if (e.shiftKey && onSaveAndSend && !saveAndSendDisabled) {
+        if (e.shiftKey && onSaveAndSend) {
           void commitSaveAndSend()
         } else {
           void commitSave()
         }
       }
     },
-    [commitSave, commitSaveAndSend, onCancel, onSaveAndSend, saveAndSendDisabled],
+    [commitSave, commitSaveAndSend, onCancel, onSaveAndSend],
   )
 
   return (
@@ -345,11 +356,21 @@ export function InlineEditor({
           data-ui="inline-editor-button"
           data-role="cancel"
           geometry="flush"
-          onClick={onCancel}
-          disabled={busy}
-          title="Cancel (Esc)"
+          onClick={() => {
+            if (busy && pendingGenerationRef.current) {
+              pendingGenerationRef.current.cancel()
+              return
+            }
+            onCancel()
+          }}
+          disabled={busy && pendingGenerationRef.current === null}
+          title={
+            busy && pendingGenerationRef.current
+              ? 'Cancel request preparation and keep this edit'
+              : 'Cancel (Esc)'
+          }
         >
-          Cancel
+          {busy && pendingGenerationRef.current ? 'Cancel preparing' : 'Cancel'}
         </Button>
         {onSaveAndSend && showPrefillButton ? (
           <Button
@@ -395,13 +416,11 @@ export function InlineEditor({
             appearance="solid"
             geometry="flush"
             onClick={() => void commitSaveAndSend()}
-            disabled={busy || uploadingAttachments || saveAndSendDisabled}
+            disabled={uploadingAttachments}
             title={
               uploadingAttachments
                 ? 'Uploading attachments'
-                : saveAndSendDisabled
-                  ? (saveAndSendDisabledReason ?? 'Send disabled')
-                  : 'Save as a new variant and send (⇧⌘⏎)'
+                : 'Save as a new variant and send (⇧⌘⏎)'
             }
           >
             Save &amp; Send

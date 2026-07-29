@@ -13,6 +13,7 @@ import {
   useSyncExternalStore,
 } from 'react'
 import { attachmentsDisabledByTextProtocol } from '../core/attachments/context'
+import type { ChatSettingsPatch } from '../core/chat-metadata'
 import {
   PREFILL_UNAVAILABLE_PLAN,
   rebaseEffectiveEndpointRouting,
@@ -25,11 +26,7 @@ import {
   DEFAULT_GLOBAL_PREFERENCES,
   fontFamilyStack,
 } from '../core/global-settings'
-import {
-  connectionAvailabilityFromProfileCount,
-  generationNotStarted,
-  pendingGenerationCapability,
-} from '../core/interaction-capability'
+import { connectionAvailabilityFromProfileCount } from '../core/interaction-capability'
 import type { PasteImportSlot } from '../core/messages'
 import { EMPTY_MESSAGE_CONTEXT_ROUTE_FACTS, mergeMessageContextRouteFacts } from '../core/reasoning'
 import { DEFAULT_SIDEBAR_SORT_MODE } from '../core/sidebar-sort'
@@ -70,8 +67,11 @@ import type {
   ConversationPresentationResourcePort,
   ConversationPresentationResourceState,
   ConversationSurface,
+  ConversationVisibleSurfaceBinding,
+  GenerationPreparationObserver,
   MessageAttachmentRefMutation,
   RequestableAttemptStopCapability,
+  WorkspaceFence,
 } from '../store/presentation-contracts'
 import { installPersistenceRequestOnFirstInteraction } from '../store/quota'
 import {
@@ -121,10 +121,18 @@ import {
 } from './conversation-actions-capability'
 import {
   type ConversationMutationIntent,
+  type ConversationMutationRunner,
   type ConversationMutationSettlement,
   conversationMutationInteraction,
   conversationMutationTarget,
+  type GenerationSubmitIntent,
+  generationSubmitDiagnosticTarget,
   generationSubmitInteraction,
+  generationSubmitTarget,
+  reportConversationMutationFailure,
+  reportConversationMutationPhase,
+  reportGenerationSubmissionFailure,
+  reportGenerationSubmissionPhase,
 } from './presentation-interactions'
 import {
   beginRouteIntent,
@@ -232,10 +240,6 @@ const loadStorageView = () =>
 
 const ImportModal = lazy(loadImportModal)
 const StorageView = lazy(loadStorageView)
-const PENDING_TREE_GENERATION_START = generationNotStarted(
-  pendingGenerationCapability('prompt-path'),
-)
-
 function preload(loader: () => Promise<unknown>): void {
   void loader().catch(() => undefined)
 }
@@ -383,22 +387,79 @@ export function Shell() {
   const [scrollState, setScrollState] = useState<ScrollState>('follow')
   const [importAtEndOpen, setImportAtEndOpen] = useState(false)
   const [treeInsertTarget, setTreeInsertTarget] = useState<TreeInsertTarget | null>(null)
-  const { run: runGenerationSubmit } = usePresentationInteraction(generationSubmitInteraction)
-  const { run: runConversationMutationInteraction } = usePresentationInteraction(
-    conversationMutationInteraction,
-    { observePending: false },
+  const { run: runGenerationSubmit, isPending: isGenerationSubmitPending } =
+    usePresentationInteraction(generationSubmitInteraction)
+  const generationSubmissionClaimsRef = useRef(
+    new Map<string, { readonly id: number; cancel(): void }>(),
   )
-  const runConversationMutation = useCallback(
+  const { run: runConversationMutationInteraction, isPending: isConversationMutationPending } =
+    usePresentationInteraction(conversationMutationInteraction)
+  const conversationMutationClaimsRef = useRef(
+    new Map<string, { readonly id: number; cancel(): void }>(),
+  )
+  const runConversationMutation = useCallback<ConversationMutationRunner>(
     (
       intent: ConversationMutationIntent,
-      action: () => Promise<void>,
-    ): ConversationMutationSettlement =>
-      runConversationMutationInteraction({
-        target: conversationMutationTarget(intent),
-        action,
-      }).settled,
+      action,
+      commit?: () => void,
+    ): ConversationMutationSettlement => {
+      const target = conversationMutationTarget(intent)
+      let claimReported = false
+      const reportClaimed = (claimId: number) => {
+        if (claimReported) return
+        claimReported = true
+        reportConversationMutationPhase({ claimId, target, phase: 'claimed' })
+      }
+      const runAction = ({ id, signal }: { readonly id: number; readonly signal: AbortSignal }) => {
+        reportClaimed(id)
+        reportConversationMutationPhase({ claimId: id, target, phase: 'admitted' })
+        return action(signal, (phase) =>
+          reportConversationMutationPhase({ claimId: id, target, phase }),
+        )
+      }
+      const claim = commit
+        ? runConversationMutationInteraction({
+            target,
+            action: runAction,
+            commit: () => {
+              commit()
+              return undefined
+            },
+          })
+        : runConversationMutationInteraction({ target, action: runAction })
+      reportClaimed(claim.id)
+      if (!claim.signal.aborted) {
+        conversationMutationClaimsRef.current.set(
+          target,
+          Object.freeze({ id: claim.id, cancel: () => claim.cancel() }),
+        )
+      }
+      void claim.settled.then((outcome) => {
+        if (conversationMutationClaimsRef.current.get(target)?.id === claim.id) {
+          conversationMutationClaimsRef.current.delete(target)
+        }
+        reportConversationMutationPhase({
+          claimId: claim.id,
+          target,
+          phase: 'settled',
+          outcome: outcome.kind,
+        })
+        if (outcome.kind === 'failed') {
+          reportConversationMutationFailure({
+            claimId: claim.id,
+            target,
+            failure: outcome.failure,
+          })
+        }
+      })
+      return claim.settled
+    },
     [runConversationMutationInteraction],
   )
+  const cancelStructuralMutation = useCallback((chatId: ChatId) => {
+    const target = conversationMutationTarget({ kind: 'delete', chatId })
+    conversationMutationClaimsRef.current.get(target)?.cancel()
+  }, [])
   const editTreeMode = useUiStore((s) => s.editTreeMode)
   const setEditTreeMode = useUiStore((s) => s.setEditTreeMode)
   const treeExpanded = useUiStore((s) => s.treeExpanded)
@@ -498,10 +559,21 @@ export function Shell() {
   useEffect(() => {
     if (paintedChat) catalogApplication.tab.observeChatRows([paintedChat])
   }, [paintedChat])
-  const visiblePresentationOnly =
-    visibleBinding === null ||
-    visibleBinding.currency !== 'current' ||
-    visibleBinding.seal.chatId !== activeChatId
+  const visibleBindingAddressesActiveConversation =
+    visibleBinding !== null &&
+    visibleBinding.seal.workspaceId === conversationWorkspaceFence.workspaceId &&
+    visibleBinding.seal.chatId === activeChatId
+  const visiblePresentationOnly = !visibleBindingAddressesActiveConversation
+  const transcriptMutationsUnavailable = conversationBindingMutationsUnavailable(
+    transcriptBinding,
+    conversationWorkspaceFence,
+    activeConversation?.chatId ?? null,
+  )
+  const treeMutationsUnavailable = conversationBindingMutationsUnavailable(
+    treeBinding,
+    conversationWorkspaceFence,
+    activeConversation?.chatId ?? null,
+  )
   useEffect(() => {
     if (!treeViewActive) return
     setTreeInsertTarget(null)
@@ -529,7 +601,11 @@ export function Shell() {
   )
   const activeSendCapability = generationCapabilityFrame.capability(
     activeChatId
-      ? { kind: 'send', chatId: activeChatId, expectedLeafId: activeBranchTailId }
+      ? {
+          kind: 'send',
+          chatId: activeChatId,
+          target: { kind: 'fixed', messageId: activeBranchTailId },
+        }
       : null,
   )
   const targetProfileId = configurationTarget?.profileId ?? null
@@ -783,25 +859,101 @@ export function Shell() {
 
   const ownGenerationSubmission = useCallback(
     (
+      intent: GenerationSubmitIntent,
       action: (control: {
         readonly signal: AbortSignal
-        readonly admit: () => void
+        readonly observer: GenerationPreparationObserver
       }) => Promise<void>,
     ): ComposerSubmission => {
+      const target = generationSubmitTarget(intent)
+      const diagnosticTarget = generationSubmitDiagnosticTarget(intent)
       let resolveAdmission!: () => void
       const admitted = new Promise<void>((resolve) => {
         resolveAdmission = resolve
       })
+      let admissionReported = false
+      let claimReported = false
+      const reportClaimed = (claimId: number) => {
+        if (claimReported) return
+        claimReported = true
+        reportGenerationSubmissionPhase({
+          claimId,
+          target: diagnosticTarget,
+          phase: 'claimed',
+        })
+      }
       const claim = runGenerationSubmit({
-        target: 'composer',
-        action: ({ signal }) => action({ signal, admit: resolveAdmission }),
+        target,
+        action: async ({ id, signal }) => {
+          reportClaimed(id)
+          await action({
+            signal,
+            observer: Object.freeze({
+              pending: (owner) =>
+                reportGenerationSubmissionPhase({
+                  claimId: id,
+                  target: diagnosticTarget,
+                  phase: 'waiting',
+                  owner,
+                }),
+              phase: (phase) =>
+                reportGenerationSubmissionPhase({
+                  claimId: id,
+                  target: diagnosticTarget,
+                  phase,
+                }),
+            } satisfies GenerationPreparationObserver),
+          })
+          if (!admissionReported) {
+            admissionReported = true
+            reportGenerationSubmissionPhase({
+              claimId: id,
+              target: diagnosticTarget,
+              phase: 'admitted',
+            })
+          }
+          resolveAdmission()
+        },
       })
+      reportClaimed(claim.id)
+      const cancelClaim = () => {
+        if (generationSubmissionClaimsRef.current.get(target)?.id !== claim.id) return
+        reportGenerationSubmissionPhase({
+          claimId: claim.id,
+          target: diagnosticTarget,
+          phase: 'cancelling',
+        })
+        claim.cancel()
+      }
+      generationSubmissionClaimsRef.current.set(
+        target,
+        Object.freeze({ id: claim.id, cancel: cancelClaim }),
+      )
       const completion = (async (): Promise<ComposerSubmissionOutcome> => {
         const outcome = await claim.settled
+        if (generationSubmissionClaimsRef.current.get(target)?.id === claim.id) {
+          generationSubmissionClaimsRef.current.delete(target)
+        }
+        reportGenerationSubmissionPhase({
+          claimId: claim.id,
+          target: diagnosticTarget,
+          phase: 'settled',
+          outcome: outcome.kind,
+        })
         switch (outcome.kind) {
           case 'succeeded':
             return Object.freeze({ kind: 'prepared' })
-          case 'failed':
+          case 'failed': {
+            return Object.freeze({
+              kind: 'not-prepared',
+              reason: outcome.kind,
+              failure: reportGenerationSubmissionFailure({
+                claimId: claim.id,
+                target: diagnosticTarget,
+                failure: outcome.failure,
+              }),
+            })
+          }
           case 'superseded':
           case 'rejected-pending':
           case 'cancelled':
@@ -816,10 +968,31 @@ export function Shell() {
             : Object.freeze({ kind: 'not-admitted' as const, reason: outcome.kind }),
         ),
       ])
-      return Object.freeze({ kind: 'started', admission, completion })
+      return Object.freeze({
+        kind: 'started',
+        admission,
+        completion,
+        cancel: cancelClaim,
+      })
     },
     [runGenerationSubmit],
   )
+  const cancelGenerationSubmission = useCallback((chatId: ChatId | null) => {
+    generationSubmissionClaimsRef.current
+      .get(generationSubmitTarget({ chatId, action: 'composer' }))
+      ?.cancel()
+  }, [])
+  const activeGenerationSubmissionPending =
+    activeChatId !== null &&
+    isGenerationSubmitPending(generationSubmitTarget({ chatId: activeChatId, action: 'composer' }))
+  const newChatGenerationSubmissionPending = isGenerationSubmitPending(
+    generationSubmitTarget({ chatId: null, action: 'composer' }),
+  )
+  const activeStructuralMutationPending =
+    activeChatId !== null &&
+    isConversationMutationPending(
+      conversationMutationTarget({ kind: 'delete', chatId: activeChatId }),
+    )
 
   const handleSubmit = useCallback(
     (
@@ -827,35 +1000,29 @@ export function Shell() {
       opts?: { prefillText?: string; attachmentRefs?: MessageAttachmentRef[] },
     ): ComposerSubmission => {
       if (!activeChatId) throw new Error('SendActiveChatMissing')
+      const target = conversationController.captureGenerationTarget(activeChatId)
       const prefillText = opts?.prefillText ?? ''
-      return ownGenerationSubmission(async ({ signal, admit }) => {
-        const admission = generationCapabilityController.claimSelectedSend(activeChatId)
-        let admissionTransferred = false
-        try {
+      return ownGenerationSubmission(
+        { chatId: activeChatId, action: 'composer' },
+        async ({ signal, observer }) => {
           const conversationActions = await loadConversationActions()
-          const handlePromise = conversationActions.sendSelectedMessageWhenCapabilitySettles(
+          const handle = await conversationActions.sendMessageWhenCapabilitySettles(
             activeChatId,
+            target,
             [{ type: 'text', text }],
             signal,
             {
-              admission,
               ...(opts?.attachmentRefs ? { attachmentRefs: opts.attachmentRefs } : {}),
               ...(prefillText.length > 0
                 ? { prefillContent: [{ type: 'text', text: prefillText }] }
                 : {}),
             },
+            observer,
           )
-          admissionTransferred = true
-          const handle = await handlePromise
-          admit()
           preloadMessageList()
           await handle.prepared
-        } finally {
-          if (!admissionTransferred) {
-            generationCapabilityController.cancelSelectedSend(admission)
-          }
-        }
-      })
+        },
+      )
     },
     [activeChatId, ownGenerationSubmission],
   )
@@ -866,52 +1033,58 @@ export function Shell() {
       opts?: { prefillText?: string; attachmentRefs?: MessageAttachmentRef[] },
     ): ComposerSubmission => {
       const prefillText = opts?.prefillText ?? ''
-      return ownGenerationSubmission(async ({ signal, admit }) => {
-        const routeIntent = beginRouteIntent()
-        try {
-          const conversationActions = await loadConversationActions()
-          const handle = await conversationActions.sendNewChatWhenCapabilitySettles(
-            [{ type: 'text', text }],
-            routeIntentOwner(routeIntent),
-            signal,
-            {
-              ...(opts?.attachmentRefs ? { attachmentRefs: opts.attachmentRefs } : {}),
-              ...(prefillText.length > 0
-                ? { prefillContent: [{ type: 'text', text: prefillText }] }
-                : {}),
-            },
-          )
-          admit()
-          const prepared = await handle.prepared
-          if (prepared.kind === 'handoff') {
-            navigateToChatForIntent(routeIntent, prepared.chatId, prepared.handoff)
+      return ownGenerationSubmission(
+        { chatId: null, action: 'composer' },
+        async ({ signal, observer }) => {
+          const routeIntent = beginRouteIntent()
+          try {
+            const conversationActions = await loadConversationActions()
+            const handle = await conversationActions.sendNewChatWhenCapabilitySettles(
+              [{ type: 'text', text }],
+              routeIntentOwner(routeIntent),
+              signal,
+              {
+                ...(opts?.attachmentRefs ? { attachmentRefs: opts.attachmentRefs } : {}),
+                ...(prefillText.length > 0
+                  ? { prefillContent: [{ type: 'text', text: prefillText }] }
+                  : {}),
+              },
+              observer,
+            )
+            const prepared = await handle.prepared
+            if (prepared.kind === 'handoff') {
+              navigateToChatForIntent(routeIntent, prepared.chatId, prepared.handoff)
+            }
+          } finally {
+            cancelRouteIntent(routeIntent)
           }
-        } finally {
-          cancelRouteIntent(routeIntent)
-        }
-      })
+        },
+      )
     },
     [ownGenerationSubmission],
   )
 
   const handleReplyToTrailingUser = useCallback((): ComposerSubmission => {
-    if (!activeChatId || !trailingUserMessage) {
-      return Object.freeze({
-        kind: 'not-started',
-        capability: pendingGenerationCapability('prompt-path'),
-      })
-    }
-    return ownGenerationSubmission(async ({ signal, admit }) => {
-      const conversationActions = await loadConversationActions()
-      const handle = await conversationActions.replyToMessageWhenCapabilitySettles(
-        activeChatId,
-        trailingUserMessage.id,
-        signal,
-      )
-      admit()
-      await handle.prepared
-    })
-  }, [activeChatId, ownGenerationSubmission, trailingUserMessage])
+    if (!trailingUserMessage) throw new Error('ReplyTargetMissing')
+    const chatId = trailingUserMessage.chatId
+    return ownGenerationSubmission(
+      {
+        chatId,
+        action: 'reply',
+        messageId: trailingUserMessage.id,
+      },
+      async ({ signal, observer }) => {
+        const conversationActions = await loadConversationActions()
+        const handle = await conversationActions.replyToMessageWhenCapabilitySettles(
+          chatId,
+          trailingUserMessage.id,
+          signal,
+          observer,
+        )
+        await handle.prepared
+      },
+    )
+  }, [ownGenerationSubmission, trailingUserMessage])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -1064,54 +1237,111 @@ export function Shell() {
   )
   const editTreeMessage = useCallback(
     (message: Message, text: string) =>
-      runConversationMutation({ kind: 'edit', chatId: message.chatId, messageId: message.id }, () =>
-        requireConversationActions().editMessage(message.chatId, message, text),
+      runConversationMutation(
+        { kind: 'edit', chatId: message.chatId, messageId: message.id },
+        (signal) => requireConversationActions().editMessage(message.chatId, message, text, signal),
       ),
     [runConversationMutation],
   )
-  const editAndSendTreeMessage = useCallback(
-    (message: Message, text: string) => {
-      if (!activeChatId || message.chatId !== activeChatId || message.role !== 'user') {
-        return PENDING_TREE_GENERATION_START
-      }
-      return requireConversationActions().editAndResend(
-        activeChatId,
-        message,
-        text,
-        message.attachmentRefs ? { attachmentRefs: message.attachmentRefs } : {},
+  const editAndSendMessage = useCallback(
+    (
+      message: Message,
+      text: string,
+      options?: { prefillText?: string; attachmentRefs?: MessageAttachmentRef[] },
+    ): ComposerSubmission => {
+      const attachmentRefs = options?.attachmentRefs ?? message.attachmentRefs
+      return ownGenerationSubmission(
+        {
+          chatId: message.chatId,
+          action: 'edit-resend',
+          messageId: message.id,
+        },
+        async ({ signal, observer }) => {
+          const conversationActions = await loadConversationActions()
+          const handle = await conversationActions.editAndResendWhenCapabilitySettles(
+            message.chatId,
+            message,
+            text,
+            signal,
+            {
+              ...(options?.prefillText ? { prefillText: options.prefillText } : {}),
+              ...(attachmentRefs ? { attachmentRefs } : {}),
+            },
+            observer,
+          )
+          preloadMessageList()
+          await handle.prepared
+        },
       )
     },
-    [activeChatId],
+    [ownGenerationSubmission],
   )
   const deleteTreeNode = useCallback(
     (message: Message) =>
-      runConversationMutation({ kind: 'delete', chatId: message.chatId }, () =>
-        requireConversationActions().deleteMessage(message.chatId, message.id, 'single'),
+      runConversationMutation({ kind: 'delete', chatId: message.chatId }, (signal, reportPhase) =>
+        requireConversationActions().deleteMessage(
+          message.chatId,
+          message.id,
+          'single',
+          false,
+          signal,
+          reportPhase,
+        ),
       ),
     [runConversationMutation],
   )
-  const regenerateTreeMessage = useCallback(
-    (message: Message) => {
-      if (!activeChatId || message.chatId !== activeChatId || message.role !== 'assistant') {
-        return PENDING_TREE_GENERATION_START
-      }
-      return requireConversationActions().regenerate(activeChatId, message)
+  const regenerateMessage = useCallback(
+    (message: Message, options?: { settingsPatch?: ChatSettingsPatch }): ComposerSubmission => {
+      return ownGenerationSubmission(
+        {
+          chatId: message.chatId,
+          action: 'regenerate',
+          messageId: message.id,
+        },
+        async ({ signal, observer }) => {
+          const conversationActions = await loadConversationActions()
+          const handle = await conversationActions.regenerateWhenCapabilitySettles(
+            message.chatId,
+            message,
+            signal,
+            options,
+            observer,
+          )
+          preloadMessageList()
+          await handle.prepared
+        },
+      )
     },
-    [activeChatId],
+    [ownGenerationSubmission],
   )
-  const continueTreeMessage = useCallback(
-    (message: Message) => {
-      if (!activeChatId || message.chatId !== activeChatId || message.role !== 'assistant') {
-        return PENDING_TREE_GENERATION_START
-      }
-      return requireConversationActions().continueMessage(activeChatId, message)
+  const continueMessage = useCallback(
+    (message: Message): ComposerSubmission => {
+      return ownGenerationSubmission(
+        {
+          chatId: message.chatId,
+          action: 'continue',
+          messageId: message.id,
+        },
+        async ({ signal, observer }) => {
+          const conversationActions = await loadConversationActions()
+          const handle = await conversationActions.continueMessageWhenCapabilitySettles(
+            message.chatId,
+            message,
+            signal,
+            observer,
+          )
+          preloadMessageList()
+          await handle.prepared
+        },
+      )
     },
-    [activeChatId],
+    [ownGenerationSubmission],
   )
   const forkTreeMessage = useCallback(
     (message: Message) =>
-      runConversationMutation({ kind: 'fork', chatId: message.chatId, messageId: message.id }, () =>
-        requireConversationActions().forkMessage(message.chatId, message),
+      runConversationMutation(
+        { kind: 'fork', chatId: message.chatId, messageId: message.id },
+        (signal) => requireConversationActions().forkMessage(message.chatId, message, signal),
       ),
     [runConversationMutation],
   )
@@ -1119,7 +1349,7 @@ export function Shell() {
     (message: Message) =>
       runConversationMutation(
         { kind: 'context', chatId: message.chatId, messageId: message.id },
-        () => requireConversationActions().toggleContext(message.chatId, message),
+        (signal) => requireConversationActions().toggleContext(message.chatId, message, signal),
       ),
     [runConversationMutation],
   )
@@ -1137,7 +1367,8 @@ export function Shell() {
           messageId: message.id,
           member,
         },
-        () => requireConversationActions().toggleReasoning(message.chatId, message, member),
+        (signal) =>
+          requireConversationActions().toggleReasoning(message.chatId, message, member, signal),
       ),
     [runConversationMutation],
   )
@@ -1150,7 +1381,13 @@ export function Shell() {
           messageId: message.id,
           member,
         },
-        () => requireConversationActions().toggleProviderOutput(message.chatId, message, member),
+        (signal) =>
+          requireConversationActions().toggleProviderOutput(
+            message.chatId,
+            message,
+            member,
+            signal,
+          ),
       ),
     [runConversationMutation],
   )
@@ -1210,6 +1447,8 @@ export function Shell() {
         autoSizeMeasurementKey: `${prefs.fontFamily}:${prefs.baseFontSize}`,
         generationCapability: activeSendCapability,
         replyGenerationCapability: trailingReplyCapability,
+        submissionPending: activeGenerationSubmissionPending,
+        onCancelSubmission: () => cancelGenerationSubmission(activeChatId),
         seed: composerSeed,
         onSeedConsumed: () => setComposerSeed(null),
         draftKey: activeComposerDraftKey,
@@ -1263,7 +1502,7 @@ export function Shell() {
       key={composerPresentation.value.draftKey}
       {...composerPresentation.value}
       generationCapability={composerPresentation.value.generationCapability}
-      presentationOnly={composerPresentation.retained}
+      presentationOnly={composerPresentation.retained && !visibleBindingAddressesActiveConversation}
     />
   ) : null
   const activeSurfaceReady = activeChatId ? activePresentation?.visibleReady === true : true
@@ -1463,6 +1702,8 @@ export function Shell() {
                         binding={treeBinding}
                         attempts={treeStreams}
                         viewportActive={treeViewActive}
+                        mutationsUnavailable={treeMutationsUnavailable}
+                        structuralMutationPending={activeStructuralMutationPending}
                         expanded={treeExpanded}
                         previewFontFamily={fontFamilyStack(prefs.fontFamily)}
                         onActivateNode={activateTreeNode}
@@ -1470,17 +1711,21 @@ export function Shell() {
                         onInsertAtChildLeg={insertAtTreeChildLeg}
                         onInsertAfterLeaf={insertAfterTreeLeaf}
                         onEditMessage={editTreeMessage}
-                        onEditAndSendMessage={editAndSendTreeMessage}
+                        onEditAndSendMessage={editAndSendMessage}
                         onDeleteNode={deleteTreeNode}
-                        onRegenerateMessage={regenerateTreeMessage}
-                        onContinueMessage={continueTreeMessage}
+                        onRegenerateMessage={regenerateMessage}
+                        onContinueMessage={continueMessage}
                         onForkMessage={forkTreeMessage}
                         onToggleMessageContextVisibility={toggleTreeMessageContextVisibility}
                         onMutateMessageAttachmentRef={mutateTreeMessageAttachmentRef}
                         onToggleReasoningDetailHidden={toggleTreeReasoningDetailHidden}
                         onToggleProviderOutputItemHidden={toggleTreeProviderOutputItemHidden}
                         onRequestStop={requestStop}
-                        generationCapabilityFrame={generationCapabilityFrame}
+                        generationSubmissionPending={activeGenerationSubmissionPending}
+                        onCancelGenerationSubmission={() =>
+                          cancelGenerationSubmission(activeChatId)
+                        }
+                        onCancelStructuralMutation={() => cancelStructuralMutation(activeChatId)}
                       />
                     ) : (
                       <SurfaceLoading label="Loading conversation tree…" />
@@ -1518,8 +1763,17 @@ export function Shell() {
                             <MessageList
                               key={transcriptBinding.seal.chatId}
                               binding={transcriptBinding}
+                              mutationsUnavailable={transcriptMutationsUnavailable}
+                              structuralMutationPending={activeStructuralMutationPending}
+                              runConversationMutation={runConversationMutation}
                               chatSettings={resolvedPaintedChatRow.settings}
-                              generationCapabilityFrame={generationCapabilityFrame}
+                              onEditAndSendMessage={editAndSendMessage}
+                              onRegenerateMessage={regenerateMessage}
+                              onContinueMessage={continueMessage}
+                              generationSubmissionPending={activeGenerationSubmissionPending}
+                              onCancelStructuralMutation={() =>
+                                cancelStructuralMutation(activeChatId)
+                              }
                               contextPreviewFrozen={selectedPathStreamActive}
                               {...(activeCapability ? { capability: activeCapability } : {})}
                               prefillPlan={activePrefillPlan}
@@ -1557,6 +1811,8 @@ export function Shell() {
                   autoSize
                   autoSizeMeasurementKey={`${prefs.fontFamily}:${prefs.baseFontSize}`}
                   generationCapability={connectionGenerationCapability}
+                  submissionPending={newChatGenerationSubmissionPending}
+                  onCancelSubmission={() => cancelGenerationSubmission(null)}
                   seed={composerSeed}
                   onSeedConsumed={() => setComposerSeed(null)}
                   draftKey={activeComposerDraftKey}
@@ -1731,4 +1987,17 @@ function useSampleAndHoldPresentation<T>(
     value: presented,
     retained: !ready && presented !== null,
   }
+}
+
+function conversationBindingMutationsUnavailable(
+  binding: ConversationVisibleSurfaceBinding | null,
+  workspace: WorkspaceFence,
+  activeChatId: ChatId | null,
+): boolean {
+  return (
+    binding === null ||
+    activeChatId === null ||
+    binding.seal.workspaceId !== workspace.workspaceId ||
+    binding.seal.chatId !== activeChatId
+  )
 }

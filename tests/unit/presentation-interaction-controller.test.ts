@@ -1136,7 +1136,11 @@ describe('PresentationInteractionController', () => {
       messageId: 'conversation-message',
     })
     const firstWork = deferred<void>()
-    const firstAction = vi.fn(() => firstWork.promise)
+    let firstSignal: AbortSignal | undefined
+    const firstAction = vi.fn(({ signal }: { readonly signal: AbortSignal }) => {
+      firstSignal = signal
+      return firstWork.promise
+    })
     const firstCommit = vi.fn()
     const first = renderHook(
       () => usePresentationInteraction(conversationMutationInteraction, { observePending: false }),
@@ -1162,12 +1166,14 @@ describe('PresentationInteractionController', () => {
     act(() => {
       duplicate = second.result.current.run({ target, action: duplicateAction })
     })
-    await expect(duplicate?.settled).resolves.toEqual({ kind: 'rejected-pending' })
-    expect(duplicateAction).not.toHaveBeenCalled()
+    await expect(duplicate?.settled).resolves.toEqual({ kind: 'succeeded', value: undefined })
+    expect(duplicateAction).toHaveBeenCalledOnce()
+    await expect(firstClaim?.settled).resolves.toEqual({ kind: 'superseded' })
+    expect(firstSignal?.aborted).toBe(true)
 
     await act(async () => {
       firstWork.resolve(undefined)
-      await firstClaim?.settled
+      await firstWork.promise
     })
     expect(firstAction).toHaveBeenCalledOnce()
     expect(firstCommit).not.toHaveBeenCalled()

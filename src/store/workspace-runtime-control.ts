@@ -469,20 +469,30 @@ export function createWorkspaceRuntimeControlKernel(runtime: WorkspaceRuntimeKer
     options: WorkspaceRuntimeActionOptions & { readonly requireIdle: boolean },
   ): WorkspaceReconcileAuthority | null {
     assertResourceManifestInstalled()
-    return runtime.launchReplacementNow(kind, options, () => {
-      capabilityCycle += 1
-      quiesceMode = 'graceful'
-      try {
-        abortCapabilityActivations()
-      } catch (error) {
-        quiesceFailures.push(error)
+    return runtime.launchReplacementNow(kind, options, prepareReplacementQuiesce)
+  }
+
+  function launchWorkspaceRuntimeReplacementWhenUnblockedImpl(
+    kind: WorkspaceReplacementRootKind,
+    options: WorkspaceRuntimeActionOptions & { readonly requireIdle: boolean },
+  ): Promise<WorkspaceReconcileAuthority | null> {
+    assertResourceManifestInstalled()
+    return runtime.launchReplacementWhenUnblocked(kind, options, prepareReplacementQuiesce)
+  }
+
+  function prepareReplacementQuiesce(): void {
+    capabilityCycle += 1
+    quiesceMode = 'graceful'
+    try {
+      abortCapabilityActivations()
+    } catch (error) {
+      quiesceFailures.push(error)
+    }
+    for (const phase of ['inbound', 'producer'] as const) {
+      for (const resource of resourcesInPhase(phase)) {
+        closeResourceAdmissions(resource, quiesceFailures)
       }
-      for (const phase of ['inbound', 'producer'] as const) {
-        for (const resource of resourcesInPhase(phase)) {
-          closeResourceAdmissions(resource, quiesceFailures)
-        }
-      }
-    })
+    }
   }
 
   function beginWorkspaceRuntimeReconciliationImpl(
@@ -938,6 +948,8 @@ export function createWorkspaceRuntimeControlKernel(runtime: WorkspaceRuntimeKer
     tryBeginWorkspaceRuntimeQuiesceIfIdle: tryBeginWorkspaceRuntimeQuiesceIfIdleImpl,
     awaitWorkspaceRuntimeQuiesced: awaitWorkspaceRuntimeQuiescedImpl,
     launchWorkspaceRuntimeReplacementNow: launchWorkspaceRuntimeReplacementNowImpl,
+    launchWorkspaceRuntimeReplacementWhenUnblocked:
+      launchWorkspaceRuntimeReplacementWhenUnblockedImpl,
     beginWorkspaceRuntimeReconciliation: beginWorkspaceRuntimeReconciliationImpl,
     resumeWorkspaceRuntimeResources: resumeWorkspaceRuntimeResourcesImpl,
     noteWorkspaceRuntimeGatedChange: noteWorkspaceRuntimeGatedChangeImpl,
@@ -1034,6 +1046,15 @@ export const launchCommandFanoutWorkspaceRuntimeReplacementNow =
     false,
     productionWorkspaceRuntimeControl.launchWorkspaceRuntimeReplacementNow,
   )
+
+export function launchCommandFanoutWorkspaceRuntimeReplacementWhenUnblocked(
+  options: WorkspaceRuntimeActionOptions = {},
+): Promise<WorkspaceReconcileAuthority | null> {
+  return productionWorkspaceRuntimeControl.launchWorkspaceRuntimeReplacementWhenUnblocked(
+    'command-fanout',
+    { ...options, requireIdle: false },
+  )
+}
 
 export const tryLaunchMaintenanceWorkspaceRuntimeReplacementIfIdle =
   createWorkspaceReplacementAdmission(

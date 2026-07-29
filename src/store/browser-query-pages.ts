@@ -1,6 +1,7 @@
-import Dexie, { type Table, type Transaction } from 'dexie'
+import Dexie, { type Table } from 'dexie'
 import { treeParentKey } from '../core/message-tree-index'
 import type { ChatId, MessageId } from '../core/types'
+import { bindReadonlyTransactionAbort } from './browser-indexeddb-reads'
 import type { NatterDb } from './db'
 import { exactCompoundPrefixBetween } from './indexeddb-key-ranges'
 import type { MessageBodyRow, MessageHeaderRow } from './message-storage'
@@ -25,20 +26,7 @@ const STREAM_READ_PAGE_SIZE = 128
 interface BrowserPageReadOptions {
   readonly signal?: AbortSignal
   readonly onPageRead?: (rowCount: number) => void
-}
-
-export async function readBulkGetPages<Row, Key>(
-  table: Table<Row, Key>,
-  keys: readonly Key[],
-  options: BrowserPageReadOptions = {},
-): Promise<Array<Row | undefined>> {
-  const rows: Array<Row | undefined> = []
-  for (let offset = 0; offset < keys.length; offset += CATALOG_READ_PAGE_SIZE) {
-    throwIfPageReadAborted(options.signal)
-    rows.push(...(await table.bulkGet(keys.slice(offset, offset + CATALOG_READ_PAGE_SIZE))))
-    throwIfPageReadAborted(options.signal)
-  }
-  return rows
+  readonly maxRows?: number
 }
 
 export async function readChatMessageHeaderPages(
@@ -85,7 +73,7 @@ export async function readExactMessageRowsByIdPages(
     throwIfPageReadAborted(options.signal)
     const pageIds = messageIds.slice(offset, offset + BODY_READ_PAGE_SIZE)
     const page = await db.transaction('r', db.messages, db.messageBodies, async (tx) => {
-      const unbind = bindPageTransactionAbort(tx, options.signal)
+      const unbind = bindReadonlyTransactionAbort(tx, options.signal, 'Workspace query aborted')
       try {
         const [headers, bodies] = await Promise.all([
           db.messages.bulkGet(pageIds),
@@ -241,15 +229,4 @@ export async function readStreamJournalFramePage(
 
 function throwIfPageReadAborted(signal: AbortSignal | undefined): void {
   if (signal?.aborted) throw new DOMException('Workspace query aborted', 'AbortError')
-}
-
-function bindPageTransactionAbort(tx: Transaction, signal: AbortSignal | undefined): () => void {
-  if (!signal) return () => undefined
-  const abort = () => tx.abort()
-  if (signal.aborted) {
-    abort()
-    throw new DOMException('Workspace query aborted', 'AbortError')
-  }
-  signal.addEventListener('abort', abort, { once: true })
-  return () => signal.removeEventListener('abort', abort)
 }

@@ -718,12 +718,14 @@ function stagedFanoutCapabilityFacts(
         'executeBrowserWorkspaceStagedFanoutCommand',
       ]) &&
       budgetText.includes('isBrowserCommandFanoutBudgetExceededError(error)') &&
-      budgetText.includes("return { kind: 'staging-required' }") &&
+      budgetText.includes('dimension: error.dimension') &&
+      budgetText.includes('observed: error.observed') &&
+      budgetText.includes('limit: error.limit') &&
       databaseExecuteText.includes('fanoutBudget') &&
       mutationJournalSource.getText().includes('BrowserCommandFanoutBudgetExceededError') &&
-      mutationJournalSource.getText().includes('fanoutReadRows') &&
+      mutationJournalSource.getText().includes('fanoutLargestReadRequestRows') &&
       mutationJournalSource.getText().includes('fanoutWriteRows') &&
-      mutationJournalSource.getText().includes('fanoutBytes'),
+      mutationJournalSource.getText().includes('fanoutWriteBytes'),
     boundedSourceDestinationCopy:
       copyText.includes('readStagedCopyPage(') &&
       copyText.includes('bulkPut(page.rows)') &&
@@ -2205,7 +2207,8 @@ function chatSetArchivedCapabilityFacts(program, catalogSource, browserRepoSourc
       domainMutationSource
         .getText()
         .includes('readSemanticOperationPreflight<Tables extends PhysicalStorageTableName, T>(') &&
-      executablePreflightText.includes("this.db.transaction(\n      'r',") &&
+      executablePreflightText.includes('this.runCommandTransaction(') &&
+      executablePreflightText.includes("this.db.transaction(\n          'r',") &&
       executablePreflightText.includes('runBrowserCommandTransaction(') &&
       executablePreflightText.includes('observePhysicalReads: true') &&
       executablePreflightText.includes('assertPhysicalTransactionTablesDeclared(') &&
@@ -7307,7 +7310,7 @@ function commandLifetimeReceiptFacts(program, browserRepoSource, outputProblems)
       tokensInOrder(executeText, [
         'const db = this.session.runOperation((database) => database)',
         'const admission = await awaitStorageCompactionWriteAdmission()',
-        'withSharedAuthoritativeCommandSession(db, async (lockSession) => {',
+        'withSharedAuthoritativeCommandSession(',
         'const workspace = this.session.getWorkspaceFence()',
         'assertPermitFence(permit, workspace)',
         'this.executeCommandInDatabase(',
@@ -7982,15 +7985,24 @@ function scopeDerivedMutationCapabilityFacts(
       call.expression.getText(browserRepoSource) ===
       'semanticOperationCommandLifetimeReceiptWithPreflight',
   )
-  const transactionGrantCalls = executableCalls(runTransactionOwner).filter(
-    (call) => call.expression.getText(browserRepoSource) === 'grant.runTransaction',
+  const transactionWrapperCalls = executableCalls(runTransactionOwner).filter(
+    (call) => call.expression.getText(browserRepoSource) === 'this.runCommandTransaction',
   )
-  const transactionGrantCallback = transactionGrantCalls[0]?.arguments[2]
-    ? unwrap(transactionGrantCalls[0].arguments[2])
+  const transactionOperationCallback = transactionWrapperCalls[0]?.arguments[0]
+    ? unwrap(transactionWrapperCalls[0].arguments[0])
     : undefined
+  const transactionStartCallback = transactionWrapperCalls[0]?.arguments[1]
+    ? unwrap(transactionWrapperCalls[0].arguments[1])
+    : undefined
+  const transactionGrantCalls =
+    transactionStartCallback && ts.isFunctionLike(transactionStartCallback)
+      ? executableCalls(transactionStartCallback).filter(
+          (call) => call.expression.getText(browserRepoSource) === 'grant.runTransaction',
+        )
+      : []
   const transactionAttachReadCalls =
-    transactionGrantCallback && ts.isFunctionLike(transactionGrantCallback)
-      ? executableCalls(transactionGrantCallback).filter(
+    transactionOperationCallback && ts.isFunctionLike(transactionOperationCallback)
+      ? executableCalls(transactionOperationCallback).filter(
           (call) =>
             call.expression.getText(browserRepoSource) ===
             'attachSemanticOperationExactPhysicalReads',
@@ -8037,9 +8049,11 @@ function scopeDerivedMutationCapabilityFacts(
       commitPreflightReceiptCalls.length === 1 &&
       !callHasIterationAncestor(commitPreflightReceiptCalls[0], readPreflightOwner),
     transactionAttachment:
+      transactionWrapperCalls.length === 1 &&
       transactionGrantCalls.length === 1 &&
+      transactionGrantCalls[0]?.arguments[2]?.getText(browserRepoSource) === 'transaction' &&
       transactionAttachReadCalls.length === 1 &&
-      !callHasIterationAncestor(transactionAttachReadCalls[0], transactionGrantCallback),
+      !callHasIterationAncestor(transactionAttachReadCalls[0], transactionOperationCallback),
     exactReceiptComposition:
       preflightReceiptText.includes('...receipt.exactPhysicalReads') &&
       preflightReceiptText.includes('...exactPhysicalReads') &&
@@ -9927,64 +9941,61 @@ function scopeDerivedMutationCapabilityFacts(
     generationAdmissionSource,
     'captureGenerationConfiguration',
   ).getText(generationAdmissionSource)
-  const configurationControllerSource = exactSource(
-    program,
-    'src/store/configuration-controller.ts',
-  )
-  const createActiveGenerationConfigurationFrameText = findFunction(
-    configurationControllerSource,
-    'createActiveGenerationConfigurationFrame',
-  ).getText(configurationControllerSource)
+  const captureGenerationPromptPathText = findFunction(
+    generationAdmissionSource,
+    'captureGenerationPromptPath',
+  ).getText(generationAdmissionSource)
+  const prepareGenerationMessagePlacementIntentText = findFunction(
+    generationAdmissionSource,
+    'prepareGenerationMessagePlacementIntent',
+  ).getText(generationAdmissionSource)
   const attemptMutationInfrastructureText = findFunction(
     mutationPlanSource,
     'mutationInfrastructurePlan',
   ).getText(mutationPlanSource)
   const attemptPrepareCommon = Object.freeze({
-    typedConfigurationLinkProof:
+    typedTransactionAuthority:
       workspaceProtocolSource.getText().includes('type ExistingChatPrepareConfiguration') &&
-      workspaceProtocolSource.getText().includes('readonly configurationLinkTransition:') &&
       workspaceProtocolSource
         .getText()
-        .includes('readonly expectedResourceNames: readonly string[]') &&
-      workspaceProtocolSource.getText().includes('readonly nextResourceNames: readonly string[]'),
-    proofCapturedAtAdmission:
-      createActiveGenerationConfigurationFrameText.includes(
-        'expectedResourceNames: target.configurationLinkProof.expectedResourceNames',
+        .includes('readonly configurationIntent: PrepareAttemptConfigurationIntent') &&
+      workspaceProtocolSource
+        .getText()
+        .includes('readonly pathHint: GenerationPromptPathReadHint') &&
+      !workspaceProtocolSource.getText().includes('PrepareAttemptConfigurationClaim'),
+    admissionCapturesHintsOnly:
+      captureGenerationConfigurationText.includes('preferredDispatchKeyId') &&
+      captureGenerationConfigurationText.includes('settingsPatch: intent.settingsPatch') &&
+      captureGenerationPromptPathText.includes(
+        'proof: Object.freeze({ requirement, pathHint: capture.pathHint })',
       ) &&
-      createActiveGenerationConfigurationFrameText.includes('nextResourceNames: Object.freeze(') &&
-      captureGenerationConfigurationText.includes(
-        'configurationLinkTransition: resolution.configurationLinkTransition',
+      captureGenerationPromptPathText.includes(
+        'material: conversationController.acquirePromptMaterial(workspace, chatId, [])',
       ) &&
-      prepareCommandInputText.includes(
-        'configurationLinkTransition: configuration.configurationLinkTransition',
+      !prepareGenerationMessagePlacementIntentText.match(
+        /\b(?:model|parentId|siblingIndex|turnId|turnIndex)\b/u,
       ),
     noExternalChatPreflight:
       countOccurrences(prepareBrowserAttemptText, 'repository.runMutation(') === 1 &&
       !prepareBrowserAttemptText.includes('repository.getChat('),
-    transactionValidatesProof:
-      prepareBrowserAttemptText.includes(
-        'expectedResourceNames: input.configurationLinkTransition.expectedResourceNames',
-      ) &&
-      prepareBrowserAttemptText.includes(
-        'nextResourceNames: input.configurationLinkTransition.nextResourceNames',
-      ) &&
-      runBrowserMutationText.includes('if (options?.configurationLinkTransition)') &&
-      runBrowserMutationText.includes(
-        'stableStringify(chatConfigurationTargetResourceNames(current))',
-      ) &&
-      runBrowserMutationText.includes(
-        'stableStringify(configurationLinkTransition.nextResourceNames)',
+    transactionResolvesCurrentState:
+      prepareBrowserAttemptText.includes('const currentChat = await ctx.getChat(chatId)') &&
+      prepareBrowserAttemptText.includes('await mutation.resolveGenerationPromptPath(') &&
+      prepareBrowserAttemptText.includes('input.configurationIntent.settingsPatch') &&
+      prepareBrowserAttemptText.includes('const attemptSettings = settingsPatch') &&
+      prepareBrowserAttemptText.includes('const slot = promptPath.slot') &&
+      prepareBrowserAttemptText.includes('mutation.captureGenerationPlanningSnapshot(') &&
+      prepareCommandInputText.includes(
+        'preferredDispatchKeyId: configuration.preferredDispatchKeyId',
       ),
     exactTableCompilation:
       prepareBrowserAttemptText.includes('captureGenerationPlanningSnapshot: true') &&
       prepareBrowserAttemptText.includes('promoteChatId: chatId') &&
       prepareBrowserAttemptText.includes('streamAdmission: input.lease') &&
       attemptMutationInfrastructureText.includes(
-        'if (options?.configurationLinkTransition) addConfigurationLinkMutationTables(builder)',
-      ) &&
-      attemptMutationInfrastructureText.includes(
         'if (options?.captureGenerationPlanningSnapshot) {',
       ) &&
+      attemptMutationInfrastructureText.includes("builder.addReadTables('chats', 'messages')") &&
       attemptMutationInfrastructureText.includes(
         "addChatCapabilityTables(builder, CHAT_ROW_PRESERVING_LINKS_TRANSACTION_CAPABILITY, 'write')",
       ),
@@ -11602,7 +11613,7 @@ function validateTransactionDerivedWriteSource(
       output.push(`transaction-derived write proof missing ${fragment}`)
     }
   }
-  const awaitCommit = repoText.indexOf('const committed = await grant.runTransaction')
+  const awaitCommit = repoText.indexOf('const committed = await this.runCommandTransaction')
   const mergeFacts = repoText.indexOf('this.recordCommittedMutationFacts(committed.facts)')
   if (awaitCommit < 0 || mergeFacts < 0 || awaitCommit > mergeFacts) {
     output.push('mutation facts must merge only after the fenced transaction commits')
@@ -11638,16 +11649,35 @@ function hasAwaitedTransactionJournalCallback(source) {
       matched ||
       !ts.isAwaitExpression(node) ||
       !ts.isCallExpression(unwrap(node.expression)) ||
-      unwrap(node.expression).expression.getText(source) !== 'grant.runTransaction'
+      unwrap(node.expression).expression.getText(source) !== 'this.runCommandTransaction'
     ) {
       return
     }
     const transactionCall = unwrap(node.expression)
-    const callback = transactionCall.arguments[2] ? unwrap(transactionCall.arguments[2]) : undefined
-    if (!callback || (!ts.isArrowFunction(callback) && !ts.isFunctionExpression(callback))) return
-    if (!callback.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.AsyncKeyword))
+    const operationCallback = transactionCall.arguments[0]
+      ? unwrap(transactionCall.arguments[0])
+      : undefined
+    const startCallback = transactionCall.arguments[1]
+      ? unwrap(transactionCall.arguments[1])
+      : undefined
+    if (
+      !operationCallback ||
+      (!ts.isArrowFunction(operationCallback) && !ts.isFunctionExpression(operationCallback)) ||
+      !operationCallback.modifiers?.some(
+        (modifier) => modifier.kind === ts.SyntaxKind.AsyncKeyword,
+      ) ||
+      !startCallback ||
+      (!ts.isArrowFunction(startCallback) && !ts.isFunctionExpression(startCallback))
+    ) {
       return
-    visit(callback.body, (candidate) => {
+    }
+    const startsGrantedTransaction = executableCalls(startCallback).some(
+      (call) =>
+        call.expression.getText(source) === 'grant.runTransaction' &&
+        call.arguments[2]?.getText(source) === 'transaction',
+    )
+    if (!startsGrantedTransaction) return
+    visit(operationCallback.body, (candidate) => {
       if (
         matched ||
         !ts.isAwaitExpression(candidate) ||
@@ -11662,19 +11692,20 @@ function hasAwaitedTransactionJournalCallback(source) {
       ) {
         return
       }
-      const operationCallback = journalCall.arguments[1]
+      const journalOperationCallback = journalCall.arguments[1]
         ? unwrap(journalCall.arguments[1])
         : undefined
       if (
-        !operationCallback ||
-        (!ts.isArrowFunction(operationCallback) && !ts.isFunctionExpression(operationCallback))
+        !journalOperationCallback ||
+        (!ts.isArrowFunction(journalOperationCallback) &&
+          !ts.isFunctionExpression(journalOperationCallback))
       ) {
         return
       }
       let fencedTransactionBound = false
       let physicalWritesCollected = false
       let operationInvoked = false
-      visit(operationCallback.body, (operationCandidate) => {
+      visit(journalOperationCallback.body, (operationCandidate) => {
         if (
           ts.isVariableDeclaration(operationCandidate) &&
           ts.isIdentifier(operationCandidate.name) &&

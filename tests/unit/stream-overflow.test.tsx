@@ -1,6 +1,5 @@
 import { act, render } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { unavailableGenerationCapability } from '../../src/core/interaction-capability'
 import type { Message as MessageRow } from '../../src/core/types'
 import { attemptController } from '../../src/store/attempt-controller'
 import type { WorkspaceFence } from '../../src/store/presentation-contracts'
@@ -27,7 +26,6 @@ const ChatMessage = (
   />
 )
 
-const CONNECTION_MISSING = unavailableGenerationCapability('connection-missing')
 let presentationFence: WorkspaceFence
 
 beforeEach(() => {
@@ -110,9 +108,6 @@ describe('Message active-stream overflow behavior', () => {
       <ChatMessage
         chatId={message.chatId}
         message={message}
-        editResendCapability={CONNECTION_MISSING}
-        regenerateCapability={CONNECTION_MISSING}
-        continueCapability={CONNECTION_MISSING}
         presentationFence={presentationFence}
         longMessageDisplayMode="compact"
         onEditInPlace={succeededInteractionSettlement}
@@ -140,9 +135,6 @@ describe('Message active-stream overflow behavior', () => {
     const props = {
       chatId: message.chatId,
       message,
-      editResendCapability: CONNECTION_MISSING,
-      regenerateCapability: CONNECTION_MISSING,
-      continueCapability: CONNECTION_MISSING,
       presentationFence,
       longMessageDisplayMode: 'compact' as const,
       onEditInPlace: succeededInteractionSettlement,

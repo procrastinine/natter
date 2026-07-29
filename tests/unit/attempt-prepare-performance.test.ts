@@ -2,7 +2,6 @@
 
 import Dexie, { type Transaction } from 'dexie'
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
-import { connectionDispatchProfileProof } from '../../src/core/connection-dispatch-proof'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import type {
   Chat,
@@ -42,7 +41,6 @@ import {
   runWorkspaceRead,
 } from '../../src/store/workspace-runtime'
 import { createChat } from '../helpers/chats'
-import { testChatConfigurationLinkTransition } from '../helpers/configuration'
 import { installGenerationProfile } from '../helpers/generation-engine'
 import { testStreamLeaseAdmission } from '../helpers/stream-leases'
 
@@ -112,8 +110,8 @@ describe.skipIf(!RUN_BENCHMARK)('attempt.prepare performance gate', () => {
     expect(await db.messages.count()).toBe(DEPTH)
     expect(await db.messageBodies.count()).toBe(1)
     expect(await db.messagePreviews.count()).toBe(1)
-    const claimedIds = new Set(input.promptPath.claim.headers.map((header) => header.messageId))
-    const structure = await measurePrepareStructure(db, claimedIds)
+    const hintedIds = new Set(input.promptPath.pathHint.headers.map((header) => header.messageId))
+    const structure = await measurePrepareStructure(db, hintedIds)
     expect(HEADER_READ_PAGE_SIZE).toBe(256)
     expect(structure.prepareTransactionCount).toBe(1)
     expect(structure.transactionIdentities).toBe(1)
@@ -126,10 +124,10 @@ describe.skipIf(!RUN_BENCHMARK)('attempt.prepare performance gate', () => {
 
     const requestedHeapMb = requestedHeapLimitMb()
     const sampleCount = requestedHeapMb === undefined ? SAMPLE_COUNT : CONSTRAINED_SAMPLE_COUNT
-    const claimIds = input.promptPath.claim.headers.map((header) => header.messageId)
+    const hintIds = input.promptPath.pathHint.headers.map((header) => header.messageId)
     await execute({ kind: 'attempt.prepare', input })
     if (requestedHeapMb !== undefined) {
-      await measureRawHeaderMaterialization(db, claimIds)
+      await measureRawHeaderMaterialization(db, hintIds)
     }
     const samples: PrepareSample[] = []
     const rawWallMs: number[] = []
@@ -138,10 +136,10 @@ describe.skipIf(!RUN_BENCHMARK)('attempt.prepare performance gate', () => {
     for (let sampleIndex = 0; sampleIndex < sampleCount; sampleIndex += 1) {
       releaseUnmeasuredGarbage()
       if (requestedHeapMb !== undefined) {
-        rawWallMs.push(await measureRawHeaderMaterialization(db, claimIds))
+        rawWallMs.push(await measureRawHeaderMaterialization(db, hintIds))
         releaseUnmeasuredGarbage()
       }
-      samples.push(await measurePrepareSample(claimIds))
+      samples.push(await measurePrepareSample(hintIds))
       if (requestedHeapMb !== undefined) {
         releaseUnmeasuredGarbage()
         retainedHeapBytes.push(process.memoryUsage().heapUsed)
@@ -377,11 +375,9 @@ async function continuationPrepareInput(
     heartbeatAt: startedAt,
     attemptKind: 'continuation',
   })
-  const selectedProfile = profile()
   return {
     strategy: 'continue',
     lease,
-    configurationLinkTransition: testChatConfigurationLinkTransition(deepPath.chat),
     promptPath: {
       requirement: {
         kind: 'continue',
@@ -394,7 +390,7 @@ async function continuationPrepareInput(
         },
         childSlot: 'none',
       },
-      claim: {
+      pathHint: {
         chatId: deepPath.chat.id,
         structuralVersion: deepPath.chat.structuralVersion,
         leafId: deepPath.targetId,
@@ -403,19 +399,8 @@ async function continuationPrepareInput(
         targetTurn: null,
       },
     },
-    configurationClaim: {
-      configurationVersion: deepPath.chat.configurationVersion ?? 0,
-      settings: deepPath.chat.settings,
-      presetId: deepPath.chat.presetId ?? null,
-      profile: connectionDispatchProfileProof(selectedProfile, MODEL),
-      requestRevision: {
-        profileId: selectedProfile.id,
-        requestRevision: selectedProfile.requestRevision ?? 0,
-        key: { kind: 'missing' },
-      },
-      dispatchKeyRevisions: [],
+    configurationIntent: {
       preferredDispatchKeyId: null,
-      workspaceSettingOverrides: [],
     },
   }
 }

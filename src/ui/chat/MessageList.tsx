@@ -10,10 +10,9 @@ import {
   useState,
 } from 'react'
 import { type ConversationDeleteMode, conversationActions } from '../../app/conversation-actions'
-import {
-  type ConversationMutationIntent,
-  conversationMutationInteraction,
-  conversationMutationTarget,
+import type {
+  ConversationMutationRunner,
+  GenerationSubmission,
 } from '../../app/presentation-interactions'
 import type { ActiveBranchForkSlot } from '../../core/active-branch-spine'
 import type { EffectiveCapability } from '../../core/capabilities'
@@ -22,10 +21,6 @@ import { resolveCutoff } from '../../core/context-cutoff'
 import { groupUserAnchoredContextItems, selectContextPairs } from '../../core/context-selection'
 import type { PrefillPlan } from '../../core/effective-endpoint-routing'
 import type { LongMessageDisplayMode, RenderWindowLoadMode } from '../../core/global-settings'
-import {
-  generationCapabilityAvailable,
-  pendingGenerationCapability,
-} from '../../core/interaction-capability'
 import { UNLIMITED_CONTEXT } from '../../core/prompt-size'
 import type {
   ChatSettings,
@@ -37,14 +32,11 @@ import type {
   ReasoningMemberRef,
 } from '../../core/types'
 import { navigateConversationMessage } from '../../hooks/useConversationCursor'
-import { usePresentationInteraction } from '../../hooks/usePresentationInteraction'
 import { useStreamStableBranchPath } from '../../hooks/useStreamStablePromptEstimate'
 import type {
   ConversationTranscriptSurface,
-  GenerationCapabilityFrame,
   MessageAttachmentRefMutation,
   MessageHeaderRow,
-  TotalPresentationInteractionPromise,
   TranscriptBodyWindowRow,
   WorkspaceFence,
 } from '../../store/presentation-contracts'
@@ -67,8 +59,10 @@ const ImportModal = lazy(() =>
 
 interface MessageListProps {
   binding: ConversationTranscriptSurface
+  mutationsUnavailable?: boolean
+  structuralMutationPending?: boolean
+  runConversationMutation: ConversationMutationRunner
   chatSettings: ChatSettings
-  generationCapabilityFrame: GenerationCapabilityFrame
   capability?: EffectiveCapability
   prefillPlan: PrefillPlan
   longMessageDisplayMode?: LongMessageDisplayMode
@@ -77,6 +71,18 @@ interface MessageListProps {
   contextPreviewFrozen?: boolean
   transcriptLoadFailed?: boolean
   onLoadOlderMessages: () => void
+  onEditAndSendMessage: (
+    message: MessageRow,
+    text: string,
+    options?: { prefillText?: string; attachmentRefs?: MessageAttachmentRef[] },
+  ) => GenerationSubmission
+  onRegenerateMessage: (
+    message: MessageRow,
+    options?: { settingsPatch?: ChatSettingsPatch },
+  ) => GenerationSubmission
+  onContinueMessage: (message: MessageRow) => GenerationSubmission
+  generationSubmissionPending?: boolean
+  onCancelStructuralMutation?: () => void
 }
 
 interface InsertTarget {
@@ -107,8 +113,10 @@ function oppositeRole(role: MessageRole): MessageRole {
 // markdown-heavy children.
 export const MessageList = memo(function MessageList({
   binding,
+  mutationsUnavailable = false,
+  structuralMutationPending = false,
+  runConversationMutation,
   chatSettings,
-  generationCapabilityFrame,
   capability,
   prefillPlan,
   longMessageDisplayMode = 'full',
@@ -117,6 +125,11 @@ export const MessageList = memo(function MessageList({
   contextPreviewFrozen = false,
   transcriptLoadFailed = false,
   onLoadOlderMessages,
+  onEditAndSendMessage,
+  onRegenerateMessage,
+  onContinueMessage,
+  generationSubmissionPending = false,
+  onCancelStructuralMutation,
 }: MessageListProps) {
   const chatId = binding.seal.chatId
   const branchSnapshot = binding.window
@@ -134,30 +147,6 @@ export const MessageList = memo(function MessageList({
   // memory — reloads wipe it per §10.6 "Edit action" session-local hint.
   const [staleHintFor, setStaleHintFor] = useState<Set<MessageId>>(() => new Set())
   const contextPreviewPath = useStreamStableBranchPath(activePath, contextPreviewFrozen)
-  const { run: runConversationMutationInteraction } = usePresentationInteraction(
-    conversationMutationInteraction,
-    { observePending: false },
-  )
-  const runConversationMutation = useCallback(
-    (
-      intent: ConversationMutationIntent,
-      action: () => Promise<void>,
-      commit?: () => void,
-    ): TotalPresentationInteractionPromise<void> => {
-      const target = conversationMutationTarget(intent)
-      if (!commit) return runConversationMutationInteraction({ target, action }).settled
-      return runConversationMutationInteraction({
-        target,
-        action,
-        commit: () => {
-          commit()
-          return undefined
-        },
-      }).settled
-    },
-    [runConversationMutationInteraction],
-  )
-
   // Prefill UI gating for the inline editor's "Save & Send" path. The
   // button hides on `unsupported` models (Claude ≥ 4.6 / OpenAI / gpt-oss);
   // on every other class it shows up next to Save & Send.
@@ -180,8 +169,8 @@ export const MessageList = memo(function MessageList({
   }, [])
 
   useEffect(() => {
-    if (presentationOnly) setInsertTarget(null)
-  }, [presentationOnly])
+    if (mutationsUnavailable) setInsertTarget(null)
+  }, [mutationsUnavailable])
 
   const handleBeginEdit = useCallback(
     (presentationFence: WorkspaceFence, message: MessageRow) =>
@@ -193,7 +182,7 @@ export const MessageList = memo(function MessageList({
     (m: MessageRow, text: string) =>
       runConversationMutation(
         { kind: 'edit', chatId, messageId: m.id },
-        () => conversationActions.editMessage(chatId, m, text),
+        (signal) => conversationActions.editMessage(chatId, m, text, signal),
         m.role === 'user'
           ? () => {
               setStaleHintFor((prev) => {
@@ -209,29 +198,30 @@ export const MessageList = memo(function MessageList({
   )
   const handleToggleReasoningHidden = useCallback(
     (m: MessageRow, member: ReasoningMemberRef) =>
-      runConversationMutation({ kind: 'reasoning', chatId, messageId: m.id, member }, () =>
-        conversationActions.toggleReasoning(chatId, m, member),
+      runConversationMutation({ kind: 'reasoning', chatId, messageId: m.id, member }, (signal) =>
+        conversationActions.toggleReasoning(chatId, m, member, signal),
       ),
     [chatId, runConversationMutation],
   )
   const handleToggleToolHidden = useCallback(
     (m: MessageRow, member: ProviderOutputMemberRef) =>
-      runConversationMutation({ kind: 'provider-output', chatId, messageId: m.id, member }, () =>
-        conversationActions.toggleProviderOutput(chatId, m, member),
+      runConversationMutation(
+        { kind: 'provider-output', chatId, messageId: m.id, member },
+        (signal) => conversationActions.toggleProviderOutput(chatId, m, member, signal),
       ),
     [chatId, runConversationMutation],
   )
   const handleToggleContextVisibility = useCallback(
     (m: MessageRow) =>
-      runConversationMutation({ kind: 'context', chatId, messageId: m.id }, () =>
-        conversationActions.toggleContext(chatId, m),
+      runConversationMutation({ kind: 'context', chatId, messageId: m.id }, (signal) =>
+        conversationActions.toggleContext(chatId, m, signal),
       ),
     [chatId, runConversationMutation],
   )
   const handleDismissGenerationNotice = useCallback(
     (m: MessageRow) =>
-      runConversationMutation({ kind: 'generation-notice', chatId, messageId: m.id }, () =>
-        conversationActions.dismissGenerationNotice(chatId, m),
+      runConversationMutation({ kind: 'generation-notice', chatId, messageId: m.id }, (signal) =>
+        conversationActions.dismissGenerationNotice(chatId, m, signal),
       ),
     [chatId, runConversationMutation],
   )
@@ -246,33 +236,30 @@ export const MessageList = memo(function MessageList({
       m: MessageRow,
       text: string,
       opts?: { prefillText?: string; attachmentRefs?: MessageAttachmentRef[] },
-    ) => conversationActions.editAndResend(chatId, m, text, opts),
-    [chatId],
+    ) => onEditAndSendMessage(m, text, opts),
+    [onEditAndSendMessage],
   )
 
   const handleRegenerate = useCallback(
     (m: MessageRow, options?: { settingsPatch?: ChatSettingsPatch }) =>
-      conversationActions.regenerate(chatId, m, options),
-    [chatId],
+      onRegenerateMessage(m, options),
+    [onRegenerateMessage],
   )
 
-  const handleContinue = useCallback(
-    (m: MessageRow) => conversationActions.continueMessage(chatId, m),
-    [chatId],
-  )
+  const handleContinue = useCallback((m: MessageRow) => onContinueMessage(m), [onContinueMessage])
 
   const handleForkChat = useCallback(
     (m: MessageRow) =>
-      runConversationMutation({ kind: 'fork', chatId, messageId: m.id }, () =>
-        conversationActions.forkMessage(chatId, m),
+      runConversationMutation({ kind: 'fork', chatId, messageId: m.id }, (signal) =>
+        conversationActions.forkMessage(chatId, m, signal),
       ),
     [chatId, runConversationMutation],
   )
 
   const handleDeleteMessage = useCallback(
     (m: MessageRow, mode: ConversationDeleteMode, roleMismatch = false) =>
-      runConversationMutation({ kind: 'delete', chatId }, () =>
-        conversationActions.deleteMessage(chatId, m.id, mode, roleMismatch),
+      runConversationMutation({ kind: 'delete', chatId }, (signal, reportPhase) =>
+        conversationActions.deleteMessage(chatId, m.id, mode, roleMismatch, signal, reportPhase),
       ),
     [chatId, runConversationMutation],
   )
@@ -319,21 +306,8 @@ export const MessageList = memo(function MessageList({
         announceVariantPosition(targetIndex, slot.liveCount)
         return
       }
-      if (presentationOnly) return
-      if (
-        e.key === 'R' &&
-        e.shiftKey &&
-        (e.metaKey || e.ctrlKey) &&
-        focused.role === 'assistant' &&
-        focusedRow.bodyExact &&
-        generationCapabilityAvailable(
-          generationCapabilityFrame.capability({
-            kind: 'regenerate',
-            chatId,
-            targetAssistantId: focused.id,
-          }),
-        )
-      ) {
+      if (mutationsUnavailable) return
+      if (e.key === 'R' && e.shiftKey && (e.metaKey || e.ctrlKey) && focused.role === 'assistant') {
         e.preventDefault()
         void handleRegenerate(focused)
       }
@@ -345,9 +319,8 @@ export const MessageList = memo(function MessageList({
     branchSpine,
     chatId,
     focusedMessageId,
-    generationCapabilityFrame,
     handleRegenerate,
-    presentationOnly,
+    mutationsUnavailable,
   ])
 
   const roleMismatchIdsOnPath = useMemo(() => {
@@ -367,24 +340,10 @@ export const MessageList = memo(function MessageList({
     )
   }, [capability, chatSettings, contextPreviewPath])
   const renderableMessageRows = useMemo(() => {
-    const durableRows = [...transcriptBodyWindowPages(branchSnapshot)].flatMap((page) => [
+    return [...transcriptBodyWindowPages(branchSnapshot)].flatMap((page) => [
       ...transcriptBodyPageRows(page),
     ])
-    const replacementIds = new Set(
-      binding.intentPresentations.flatMap((presentation) =>
-        presentation.replacesFromMessageId ? [presentation.replacesFromMessageId] : [],
-      ),
-    )
-    const replacementOffset = durableRows.findIndex(({ message }) => replacementIds.has(message.id))
-    return [
-      ...(replacementOffset < 0 ? durableRows : durableRows.slice(0, replacementOffset)),
-      ...binding.intentPresentations.map((presentation) => ({
-        ...presentation,
-        bodyExact: true,
-        intentOnly: true,
-      })),
-    ]
-  }, [binding.intentPresentations, branchSnapshot])
+  }, [branchSnapshot])
   const effectiveRenderedMessageCount = renderableMessageRows.length
   const loadOlderMessages = useCallback(() => {
     if (presentationOnly) return
@@ -425,35 +384,11 @@ export const MessageList = memo(function MessageList({
       intentOnly = false,
       fork,
     }: RenderableMessageRow): ReactNode => {
-      const rowPresentationOnly = presentationOnly || intentOnly
+      const rowMutationsUnavailable = mutationsUnavailable || intentOnly
       const showStaleHint =
         m.role === 'assistant' && m.parentId !== null && staleHintFor.has(m.parentId)
       const branchContext = fork ?? branchSpine.forkFor(m.id)
       const hasSiblingVariants = (branchContext?.liveCount ?? 0) > 1
-      const editResendCapability =
-        m.role === 'user'
-          ? generationCapabilityFrame.capability({
-              kind: 'edit-resend',
-              chatId,
-              targetUserId: m.id,
-            })
-          : pendingGenerationCapability('prompt-path')
-      const regenerateCapability =
-        m.role === 'assistant'
-          ? generationCapabilityFrame.capability({
-              kind: 'regenerate',
-              chatId,
-              targetAssistantId: m.id,
-            })
-          : pendingGenerationCapability('prompt-path')
-      const continueCapability =
-        m.role === 'assistant'
-          ? generationCapabilityFrame.capability({
-              kind: 'continue',
-              chatId,
-              targetAssistantId: m.id,
-            })
-          : pendingGenerationCapability('prompt-path')
       return (
         <Message
           key={m.id}
@@ -462,10 +397,10 @@ export const MessageList = memo(function MessageList({
           bodyVersion={bodyVersion}
           bodyExact={bodyExact}
           {...(hasSiblingVariants && branchContext ? { branchContext } : {})}
-          editResendCapability={editResendCapability}
-          regenerateCapability={regenerateCapability}
-          continueCapability={continueCapability}
-          presentationOnly={rowPresentationOnly}
+          generationSubmissionPending={generationSubmissionPending}
+          structuralMutationPending={structuralMutationPending}
+          {...(onCancelStructuralMutation ? { onCancelStructuralMutation } : {})}
+          presentationOnly={rowMutationsUnavailable}
           presentationFence={binding.seal}
           onBeginEdit={handleBeginEdit}
           onEditInPlace={handleEditInPlace}
@@ -508,7 +443,7 @@ export const MessageList = memo(function MessageList({
       chatId,
       chatSettings.defaultPrefill,
       excludedIds,
-      generationCapabilityFrame,
+      generationSubmissionPending,
       handleContinue,
       handleBeginEdit,
       handleDismissGenerationNotice,
@@ -525,9 +460,11 @@ export const MessageList = memo(function MessageList({
       openInsert,
       prefillSettingsPrompt,
       prefillSupported,
-      presentationOnly,
+      mutationsUnavailable,
       roleMismatchIdsOnPath,
       staleHintFor,
+      structuralMutationPending,
+      onCancelStructuralMutation,
     ],
   )
 

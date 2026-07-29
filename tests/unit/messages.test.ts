@@ -1,4 +1,4 @@
-import Dexie from 'dexie'
+import Dexie, { type Transaction } from 'dexie'
 import 'fake-indexeddb/auto'
 import { IDBFactory } from 'fake-indexeddb'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
@@ -27,7 +27,7 @@ import {
 } from '../../src/store/browser-workspace-lifecycle'
 import { __resetDbForTests, CURRENT_DB_VERSION, getDb } from '../../src/store/db'
 import { exportWorkspaceBackup, restoreWorkspaceBackup } from '../../src/store/import-export'
-import { __setLockBackendForTests } from '../../src/store/locks'
+import { __setLockBackendForTests, type LockBackend, type LockGrant } from '../../src/store/locks'
 import type { MessageHeaderRow } from '../../src/store/message-storage'
 import type {
   CommitEnvelope,
@@ -296,6 +296,82 @@ function sourceMessage(chatId: ChatId, id: MessageId, overrides: Partial<Message
 }
 
 describe('body edits', () => {
+  it('rolls back an authoritative command cancelled while its transaction is queued', async () => {
+    const chat = await seedChat()
+    const row = await append(
+      message(chat.id, {
+        id: 'cancelled-queued-edit',
+        content: [{ type: 'text', text: 'before' }],
+      }),
+      null,
+    )
+
+    let markTransactionEntered!: () => void
+    const transactionEntered = new Promise<void>((resolve) => {
+      markTransactionEntered = resolve
+    })
+    let releaseTransaction!: () => void
+    const transactionGate = new Promise<void>((resolve) => {
+      releaseTransaction = resolve
+    })
+    const runTransaction: LockGrant['runTransaction'] = async (database, tables, operation) => {
+      markTransactionEntered()
+      await transactionGate
+      return database.transaction(
+        'rw',
+        tables.map((table) => database.table(typeof table === 'string' ? table : table.name)),
+        (transaction: Transaction) => operation(transaction),
+      )
+    }
+    const backend: LockBackend = {
+      kind: 'web-locks',
+      run: (logicalNames, operation) =>
+        Promise.resolve(
+          operation({
+            kind: 'web-locks',
+            logicalNames,
+            runTransaction,
+          }),
+        ),
+      runAuthoritativeCommandSession: (_database, operation) =>
+        Promise.resolve(
+          operation({
+            kind: 'web-locks',
+            withResourceLocks: (logicalNames, child) =>
+              Promise.resolve(
+                child({
+                  kind: 'web-locks',
+                  logicalNames,
+                  runTransaction,
+                }),
+              ),
+          }),
+        ),
+    }
+    __setLockBackendForTests(backend)
+    const controller = new AbortController()
+    const execution = runWorkspaceAction(
+      'conversation-generation',
+      (permit) =>
+        getWorkspaceRepository().execute(permit, {
+          kind: 'message.edit-content',
+          input: {
+            chatId: chat.id,
+            messageId: row.id,
+            content: [{ type: 'text', text: 'must not commit' }],
+            now: 2,
+          },
+        }),
+      { signal: controller.signal },
+    )
+    await transactionEntered
+    controller.abort(new DOMException('cancel queued command', 'AbortError'))
+    releaseTransaction()
+
+    await expect(execution).rejects.toMatchObject({ name: 'AbortError' })
+    expect((await getMessage(row.id))?.content).toEqual([{ type: 'text', text: 'before' }])
+  })
+
   it('changes only editable body fields and returns an exact versioned presentation', async () => {
     const chat = await seedChat()
     const rich = message(chat.id, {

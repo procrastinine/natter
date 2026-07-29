@@ -2,6 +2,7 @@ import type {
   ActiveBranchChildSlot,
   ActiveBranchForkSlot,
   ActiveBranchForkTarget,
+  ActiveBranchIntentTarget,
   ActiveBranchSelection,
   ActiveBranchTargetUnavailableReason,
   VersionedActiveBranchSpine,
@@ -54,6 +55,7 @@ import type { ConversationRouteOwner } from './conversation-route-owner'
 import {
   createWorkspaceMessageMaterialCoordinator,
   type GenerationPromptMaterialLease,
+  type GenerationPromptMaterialLoader,
   type WorkspaceMessageMaterialCoordinator,
 } from './generation-prompt-material'
 import {
@@ -99,7 +101,7 @@ import type {
   ConversationForksResult,
   ConversationOpenResult,
   ConversationTopologyResult,
-  GenerationPromptPathClaim,
+  GenerationPromptPathReadHint,
   GenerationPromptPathRequirement,
   WorkspaceLocalChildSlotEvidence,
 } from './workspace-protocol'
@@ -163,29 +165,10 @@ export type ConversationOperationClaim =
 
 export type ClaimedConversationDestination =
   | { readonly kind: 'pending' }
-  | { readonly kind: 'ready'; readonly expectedLeafId: MessageId | null }
+  | { readonly kind: 'ready'; readonly selection: ActiveBranchSelection }
   | { readonly kind: 'unavailable' }
   | { readonly kind: 'failed' }
   | { readonly kind: 'superseded' }
-
-export type ClaimedSelectedConversationPromptPath =
-  | Exclude<ClaimedConversationDestination, { readonly kind: 'ready' }>
-  | {
-      readonly kind: 'ready'
-      readonly expectedLeafId: MessageId | null
-      readonly promptPath: ConversationPromptPathFrame
-    }
-
-const SELECTED_CONVERSATION_DESTINATION_CLAIM = Symbol('selected-conversation-destination-claim')
-
-export interface SelectedConversationDestinationClaim {
-  readonly [SELECTED_CONVERSATION_DESTINATION_CLAIM]: true
-  readonly steering: SessionSelectingConversationOperationClaim
-  readonly captured: Extract<
-    ClaimedSelectedConversationPromptPath,
-    { readonly kind: 'ready' }
-  > | null
-}
 
 export type ConversationLocalResultEffect =
   | {
@@ -238,7 +221,6 @@ interface ConversationTranscriptBindingPayload {
   readonly window: ConversationTranscriptFrame
   readonly selectionEpoch: number
   readonly viewportRevision: number
-  readonly intentPresentations: readonly GenerationIntentMessagePresentation[]
 }
 
 interface ConversationTreeBindingPayload {
@@ -331,13 +313,6 @@ export interface ConversationPresentationResourcePort {
 }
 
 export type ConversationMessagePresentation = TranscriptBodyPresentation
-
-export interface GenerationIntentMessagePresentation {
-  readonly message: Message
-  readonly bodyVersion: 0
-  readonly replacesFromMessageId?: MessageId
-  readonly fork?: ActiveBranchForkSlot
-}
 
 export type ConversationTranscriptPage = TranscriptBodyPage
 export type ConversationTranscriptFrame = TranscriptBodyWindow
@@ -446,6 +421,17 @@ export interface ConversationTranscriptRetentionClaim {
   readonly kind: 'conversation-transcript-retention'
   readonly chatId: ChatId
   readonly messageId: MessageId
+  release(): void
+}
+
+interface PromptPathDemand {
+  readonly workspaceId: string
+  readonly replacementEpoch: number
+  readonly chatId: ChatId
+}
+
+export interface ConversationPromptPathDemandClaim extends PromptPathDemand {
+  readonly kind: 'conversation-prompt-path-demand'
   release(): void
 }
 
@@ -961,9 +947,6 @@ const TOPOLOGY_OPTIONS: MessageTopologyOptions<StructuralMessageHeader> = {
 
 const EMPTY_TOPOLOGY = createMessageTopologyIndex<StructuralMessageHeader>([], TOPOLOGY_OPTIONS)
 const EMPTY_STRUCTURAL_TOPOLOGY = structuralTopologyView(EMPTY_TOPOLOGY)
-const EMPTY_CONVERSATION_MESSAGE_PRESENTATIONS = Object.freeze(
-  [],
-) as readonly GenerationIntentMessagePresentation[]
 const ABSENT_TOPOLOGY: ActiveTopologyState = Object.freeze({ kind: 'absent' })
 const FULL_PROJECTION_REFRESH: ConversationProjectionRefresh = Object.freeze({
   chat: true,
@@ -1003,7 +986,19 @@ export interface ConversationController {
     parentId: MessageId | null,
     position: number,
   ): Promise<MessageId | null>
+  captureGenerationTarget(chatId: ChatId): ActiveBranchIntentTarget
   capturePromptPathFrame(workspaceFence: WorkspaceFence): ConversationPromptPathFrame
+  acquirePromptMaterial(
+    workspaceFence: WorkspaceFence,
+    chatId: ChatId,
+    headers: readonly MessageHeaderRow[],
+  ): GenerationPromptMaterialLease
+  readSharedMessageMaterial(
+    workspaceFence: WorkspaceFence,
+    headers: readonly MessageHeaderRow[],
+    loader: GenerationPromptMaterialLoader,
+    signal?: AbortSignal,
+  ): Promise<readonly (MessagePresentation | undefined)[]>
   claimOperation(input: {
     chatId: ChatId
     workspaceFence?: WorkspaceFence
@@ -1030,25 +1025,6 @@ export interface ConversationController {
   resolveOperationDestination(
     claim: SessionSelectingConversationOperationClaim,
   ): ClaimedConversationDestination
-  presentGenerationIntent(
-    claim: SessionSelectingConversationOperationClaim,
-    input: {
-      readonly baseLeafId: MessageId | null
-      readonly messages: readonly Message[]
-      readonly replacesFromMessageId?: MessageId
-    },
-  ): void
-  claimSelectedDestination(input: {
-    chatId: ChatId
-    workspaceFence?: WorkspaceFence
-  }): SelectedConversationDestinationClaim
-  resolveSelectedDestination(
-    claim: SelectedConversationDestinationClaim,
-  ): ClaimedConversationDestination
-  resolveSelectedPromptPath(
-    claim: SelectedConversationDestinationClaim,
-  ): ClaimedSelectedConversationPromptPath
-  cancelSelectedDestination(claim: SelectedConversationDestinationClaim): void
   acceptLocalResult(
     claim: SessionSelectingConversationOperationClaim,
     effect: SelectingLocalResultEffect,
@@ -1075,9 +1051,14 @@ export interface ConversationController {
   observedCommitChatIds(): readonly ChatId[]
   reconcileWorkspace(fence: WorkspaceFence): void
   claimTranscriptRetention(input: {
+    workspaceFence: WorkspaceFence
     chatId: ChatId
     messageId: MessageId
   }): ConversationTranscriptRetentionClaim
+  claimPromptPathDemand(input: {
+    workspaceFence: WorkspaceFence
+    chatId: ChatId
+  }): ConversationPromptPathDemandClaim
   setTranscriptDemand(owner: object, demand: TranscriptDemand | null): void
   setSettledTranscriptWorkScale(minimumRowCount: number): void
   expandTranscriptDemand(input: {
@@ -1119,7 +1100,7 @@ export interface ConversationPromptPathFrame {
 }
 
 export interface ConversationPromptPathCapture {
-  readonly claim: GenerationPromptPathClaim
+  readonly pathHint: GenerationPromptPathReadHint
   readonly material: GenerationPromptMaterialLease
 }
 
@@ -1129,20 +1110,13 @@ class TabConversationController implements ConversationController {
   private readonly sessions = new Map<ChatId, ChatSession>()
   private readonly operationClaims = new Map<string, ConversationOperationClaim>()
   private readonly operationClaimCountsByChat = new Map<ChatId, number>()
-  private readonly generationIntentPresentations = new Map<
-    string,
-    {
-      readonly claim: SessionSelectingConversationOperationClaim
-      readonly baseLeafId: MessageId | null
-      readonly presentations: readonly GenerationIntentMessagePresentation[]
-    }
-  >()
   private readonly pendingRouteHandoffsByOwnerId = new Map<
     string,
     PendingConversationRouteHandoff
   >()
   private readonly transcriptDemands = new Map<object, TranscriptDemand>()
   private readonly transcriptRetentions = new Map<object, TranscriptRetention>()
+  private readonly promptPathDemands = new Map<object, PromptPathDemand>()
   private readonly inspectorDemands = new Map<object, InspectorDemand>()
   private readonly previewDemands = new Map<object, TreePreviewDemand>()
   private readonly reads = new Map<ReadKind, PendingRead>()
@@ -1174,6 +1148,7 @@ class TabConversationController implements ConversationController {
     readonly replacementEpoch: number
     readonly chatId: ChatId
     readonly destination: ConversationDestinationProjection
+    readonly retainedSpine: VersionedActiveBranchSpine<MessageHeaderRow> | null
     readonly topology: ActiveTopologyState
     readonly topologyFailed: boolean
     readonly promptPathRevision: number
@@ -1545,18 +1520,34 @@ class TabConversationController implements ConversationController {
     }
   }
 
+  captureGenerationTarget(chatId: ChatId): ActiveBranchIntentTarget {
+    const session = this.sessions.get(chatId)
+    const active = this.active
+    if (this.activeChatId !== chatId || active?.chatId !== chatId || !session) {
+      throw new Error(`ConversationGenerationSelectionUnavailable:${chatId}`)
+    }
+    return active.destination.kind === 'ready'
+      ? Object.freeze({
+          kind: 'fixed',
+          messageId: active.destination.spine.resolvedLeafId,
+        })
+      : Object.freeze({ kind: 'selection', selection: session.intent.selection })
+  }
+
   capturePromptPathFrame(workspaceFence: WorkspaceFence): ConversationPromptPathFrame {
     const active = this.active
     if (!this.matchesWorkspace(workspaceFence) || !active || this.activeChatId !== active.chatId) {
       return PENDING_CONVERSATION_PROMPT_PATH_FRAME
     }
     const topologyFailed = active.failure?.kind === 'topology'
+    const retainedSpine = this.retainedPromptPathSpine(active)
     const cached = this.promptPathFrameCache
     if (
       cached?.workspaceId === workspaceFence.workspaceId &&
       cached.replacementEpoch === workspaceFence.replacementEpoch &&
       cached.chatId === active.chatId &&
       cached.destination === active.destination &&
+      cached.retainedSpine === retainedSpine &&
       cached.topology === active.topology &&
       cached.topologyFailed === topologyFailed &&
       cached.promptPathRevision === this.promptPathRevision
@@ -1569,6 +1560,7 @@ class TabConversationController implements ConversationController {
       replacementEpoch: workspaceFence.replacementEpoch,
       chatId: active.chatId,
       destination: active.destination,
+      retainedSpine,
       topology: active.topology,
       topologyFailed,
       promptPathRevision: this.promptPathRevision,
@@ -1577,7 +1569,7 @@ class TabConversationController implements ConversationController {
     return frame
   }
 
-  private capturePromptMaterial(
+  acquirePromptMaterial(
     workspaceFence: WorkspaceFence,
     chatId: ChatId,
     headers: readonly MessageHeaderRow[],
@@ -1588,25 +1580,48 @@ class TabConversationController implements ConversationController {
     }
     const lease = coordinator.acquirePrompt(chatId, headers)
     const requestedIds = new Set(headers.map((header) => header.id))
-    const transcript =
-      this.active?.chatId === chatId ? presentedTranscriptWindow(this.active.transcript) : null
-    if (transcript) {
-      lease.seed(
-        workspaceFence,
-        [...transcriptBodyWindowRows(transcript)].flatMap((row) =>
-          row.bodyExact && requestedIds.has(row.header.id)
-            ? [
-                Object.freeze({
-                  header: row.header,
-                  message: row.message,
-                  bodyVersion: row.bodyVersion,
-                }),
-              ]
-            : [],
-        ),
-      )
+    const active = this.active?.chatId === chatId ? this.active : null
+    const transcriptWindow = active ? presentedTranscriptWindow(active.transcript) : null
+    const residentWindow = active?.presentationResidents.transcript?.window ?? null
+    const windows =
+      residentWindow && residentWindow !== transcriptWindow
+        ? [transcriptWindow, residentWindow]
+        : [transcriptWindow]
+    const known = new Map<MessageId, MessagePresentation>()
+    for (const window of windows) {
+      if (!window) continue
+      for (const row of transcriptBodyWindowRows(window)) {
+        if (!row.bodyExact || !requestedIds.has(row.header.id) || known.has(row.header.id)) continue
+        known.set(
+          row.header.id,
+          Object.freeze({
+            header: row.header,
+            message: row.message,
+            bodyVersion: row.bodyVersion,
+          }),
+        )
+      }
     }
+    lease.seed(workspaceFence, [...known.values()])
     return lease
+  }
+
+  async readSharedMessageMaterial(
+    workspaceFence: WorkspaceFence,
+    headers: readonly MessageHeaderRow[],
+    loader: GenerationPromptMaterialLoader,
+    signal?: AbortSignal,
+  ): Promise<readonly (MessagePresentation | undefined)[]> {
+    const coordinator = this.materialCoordinator
+    if (!coordinator || !this.matchesWorkspace(workspaceFence)) {
+      throw new Error('ConversationPromptMaterialCoordinatorMissing')
+    }
+    const reservation = coordinator.reserve(workspaceFence, headers)
+    try {
+      return await coordinator.read(workspaceFence, headers, loader, signal)
+    } finally {
+      reservation.release()
+    }
   }
 
   claimOperation(input: {
@@ -1663,7 +1678,13 @@ class TabConversationController implements ConversationController {
       case 'ready':
         return Object.freeze({
           kind: 'ready',
-          expectedLeafId: active.destination.spine.resolvedLeafId,
+          selection:
+            active.destination.spine.resolvedLeafId === null
+              ? Object.freeze({ kind: 'default' as const })
+              : Object.freeze({
+                  kind: 'tip' as const,
+                  messageId: active.destination.spine.resolvedLeafId,
+                }),
         })
       case 'missing':
       case 'unavailable':
@@ -1671,110 +1692,6 @@ class TabConversationController implements ConversationController {
       case 'failed':
         return Object.freeze({ kind: 'failed' })
     }
-  }
-
-  presentGenerationIntent(
-    claim: SessionSelectingConversationOperationClaim,
-    input: {
-      readonly baseLeafId: MessageId | null
-      readonly messages: readonly Message[]
-      readonly replacesFromMessageId?: MessageId
-    },
-  ): void {
-    const active = this.active
-    if (
-      !this.operationClaimIsCurrent(claim) ||
-      this.activeChatId !== claim.chatId ||
-      active?.chatId !== claim.chatId ||
-      active.destination.kind !== 'ready' ||
-      active.destination.spine.resolvedLeafId !== input.baseLeafId
-    ) {
-      return
-    }
-    const replacedFork = input.replacesFromMessageId
-      ? active.destination.spine.forkFor(input.replacesFromMessageId)
-      : undefined
-    const presentations: readonly GenerationIntentMessagePresentation[] = Object.freeze(
-      input.messages.map((message, index) => {
-        if (message.chatId !== claim.chatId) {
-          throw new Error(`GenerationIntentPresentationChatMismatch:${message.id}`)
-        }
-        const fork =
-          index === 0 &&
-          replacedFork &&
-          message.parentId === replacedFork.parentId &&
-          message.siblingIndex >= replacedFork.nextSiblingIndex
-            ? Object.freeze({
-                parentId: replacedFork.parentId,
-                selectedMessageId: message.id,
-                slotVersion: replacedFork.slotVersion,
-                position: replacedFork.liveCount,
-                liveCount: replacedFork.liveCount + 1,
-                nextSiblingIndex: message.siblingIndex + 1,
-                previousMessageId: replacedFork.lastMessageId,
-                nextMessageId: null,
-                firstMessageId: replacedFork.firstMessageId,
-                lastMessageId: message.id,
-              })
-            : undefined
-        return Object.freeze({
-          message,
-          bodyVersion: 0 as const,
-          ...(index === 0 && input.replacesFromMessageId
-            ? { replacesFromMessageId: input.replacesFromMessageId }
-            : {}),
-          ...(fork ? { fork } : {}),
-        })
-      }),
-    )
-    if (presentations.length === 0) return
-    this.generationIntentPresentations.set(
-      claim.id,
-      Object.freeze({ claim, baseLeafId: input.baseLeafId, presentations }),
-    )
-    this.publish()
-  }
-
-  claimSelectedDestination(input: {
-    chatId: ChatId
-    workspaceFence?: WorkspaceFence
-  }): SelectedConversationDestinationClaim {
-    const steering = this.createOperationClaim({
-      ...input,
-      steering: 'select-result',
-      selectionDelivery: 'session',
-    }) as SessionSelectingConversationOperationClaim
-    const destination = this.captureSelectedPromptPath(steering)
-    return Object.freeze({
-      [SELECTED_CONVERSATION_DESTINATION_CLAIM]: true as const,
-      steering,
-      captured: destination.kind === 'ready' ? destination : null,
-    })
-  }
-
-  resolveSelectedDestination(
-    claim: SelectedConversationDestinationClaim,
-  ): ClaimedConversationDestination {
-    const destination = this.resolveSelectedPromptPath(claim)
-    return destination.kind === 'ready'
-      ? Object.freeze({
-          kind: 'ready' as const,
-          expectedLeafId: destination.expectedLeafId,
-        })
-      : destination
-  }
-
-  resolveSelectedPromptPath(
-    claim: SelectedConversationDestinationClaim,
-  ): ClaimedSelectedConversationPromptPath {
-    if (!this.operationClaimIsRetained(claim.steering)) {
-      return Object.freeze({ kind: 'superseded' })
-    }
-    return claim.captured ?? this.captureSelectedPromptPath(claim.steering)
-  }
-
-  cancelSelectedDestination(claim: SelectedConversationDestinationClaim): void {
-    this.cancelOperation(claim.steering)
   }
 
   acceptLocalResult(
@@ -2126,9 +2043,6 @@ class TabConversationController implements ConversationController {
       if (claim.chatId === chatId) this.operationClaims.delete(claimId)
     }
     this.operationClaimCountsByChat.delete(chatId)
-    for (const [claimId, presentation] of this.generationIntentPresentations) {
-      if (presentation.claim.chatId === chatId) this.generationIntentPresentations.delete(claimId)
-    }
     for (const [ownerId, pending] of this.pendingRouteHandoffsByOwnerId) {
       if (pending.seed.chat.id === chatId) this.deletePendingRouteHandoff(ownerId)
     }
@@ -2160,8 +2074,8 @@ class TabConversationController implements ConversationController {
     if (!sameLogicalWorkspace) this.sessions.clear()
     this.operationClaims.clear()
     this.operationClaimCountsByChat.clear()
-    this.generationIntentPresentations.clear()
     this.transcriptRetentions.clear()
+    this.promptPathDemands.clear()
     this.clearPendingRouteHandoffs()
     this.activeChatId = null
     this.active = null
@@ -2173,20 +2087,71 @@ class TabConversationController implements ConversationController {
   }
 
   claimTranscriptRetention(input: {
+    workspaceFence: WorkspaceFence
     chatId: ChatId
     messageId: MessageId
   }): ConversationTranscriptRetentionClaim {
     const workspaceId = this.workspaceId
     const active = this.active
     const session = this.activeSession()
-    const path = this.activeSpine()?.path
-    const window = active ? readyTranscriptWindow(active.transcript) : null
+    const currentPath = this.activeSpine()?.path
+    const currentWindow = active ? readyTranscriptWindow(active.transcript) : null
+    const currentContainsTarget =
+      currentPath !== undefined &&
+      currentWindow !== null &&
+      transcriptBodyWindowFindRow(currentWindow, input.messageId) !== undefined
+    const resident = active?.presentationResidents.transcript
+    const residentContainsTarget =
+      resident !== null &&
+      resident !== undefined &&
+      resident.seal.workspaceId === workspaceId &&
+      resident.seal.replacementEpoch === this.workspaceEpoch &&
+      resident.seal.chatId === input.chatId &&
+      transcriptBodyWindowFindRow(resident.window, input.messageId) !== undefined
+    const painted =
+      this.paintedFrame?.binding.surface === 'transcript' ? this.paintedFrame.binding : null
+    const paintedContainsTarget =
+      painted !== null &&
+      painted.seal.workspaceId === workspaceId &&
+      painted.seal.chatId === input.chatId &&
+      transcriptBodyWindowFindRow(painted.window, input.messageId) !== undefined
+    const path = currentContainsTarget
+      ? currentPath
+      : residentContainsTarget
+        ? resident.spine.path
+        : paintedContainsTarget
+          ? painted.spine.path
+          : null
+    const window = currentContainsTarget
+      ? currentWindow
+      : residentContainsTarget
+        ? resident.window
+        : paintedContainsTarget
+          ? painted.window
+          : null
+    const selectionRevision = currentContainsTarget
+      ? session?.selectionRevision
+      : residentContainsTarget
+        ? resident.seal.selectionRevision
+        : paintedContainsTarget
+          ? painted.seal.selectionRevision
+          : undefined
+    const selectionEpoch = currentContainsTarget
+      ? active?.transcript.selectionEpoch
+      : residentContainsTarget
+        ? resident.selectionEpoch
+        : paintedContainsTarget
+          ? painted.selectionEpoch
+          : undefined
     if (
       workspaceId === null ||
+      workspaceId !== input.workspaceFence.workspaceId ||
       !active ||
       !session ||
       !path ||
       !window ||
+      selectionRevision === undefined ||
+      selectionEpoch === undefined ||
       active.chatId !== input.chatId ||
       transcriptBodyWindowFindRow(window, input.messageId) === undefined
     ) {
@@ -2199,11 +2164,11 @@ class TabConversationController implements ConversationController {
       replacementEpoch: this.workspaceEpoch,
       chatId: input.chatId,
       messageId: input.messageId,
-      selectionRevision: session.selectionRevision,
-      selectionEpoch: active.transcript.selectionEpoch,
+      selectionRevision,
+      selectionEpoch,
       precedingRowCount: messageIndex - window.offset,
     })
-    this.requestTranscript()
+    if (!this.requestTranscript()) this.publish()
     let released = false
     return Object.freeze({
       kind: 'conversation-transcript-retention' as const,
@@ -2213,7 +2178,36 @@ class TabConversationController implements ConversationController {
         if (released) return
         released = true
         this.transcriptRetentions.delete(owner)
-        this.requestTranscript()
+        if (!this.requestTranscript()) this.publish()
+      },
+    })
+  }
+
+  claimPromptPathDemand(input: {
+    workspaceFence: WorkspaceFence
+    chatId: ChatId
+  }): ConversationPromptPathDemandClaim {
+    if (!this.matchesWorkspace(input.workspaceFence)) {
+      throw new Error('ConversationPromptPathDemandWorkspaceUnavailable')
+    }
+    const owner = {}
+    const demand = Object.freeze({
+      workspaceId: input.workspaceFence.workspaceId,
+      replacementEpoch: input.workspaceFence.replacementEpoch,
+      chatId: input.chatId,
+    })
+    this.promptPathDemands.set(owner, demand)
+    this.requestTopology()
+    let released = false
+    return Object.freeze({
+      kind: 'conversation-prompt-path-demand' as const,
+      ...demand,
+      release: () => {
+        if (released) return
+        released = true
+        this.promptPathDemands.delete(owner)
+        const active = this.active
+        if (active && !this.activeNeedsTopology(active)) this.releaseTopology()
       },
     })
   }
@@ -2486,80 +2480,6 @@ class TabConversationController implements ConversationController {
     )
   }
 
-  private captureSelectedPromptPath(
-    claim: SessionSelectingConversationOperationClaim,
-  ): ClaimedSelectedConversationPromptPath {
-    const resolved = this.resolveOperationDestination(claim)
-    if (resolved.kind !== 'ready' && resolved.kind !== 'pending') return resolved
-    const active = this.active
-    const session = this.sessions.get(claim.chatId)
-    if (
-      !active ||
-      active.chatId !== claim.chatId ||
-      this.activeChatId !== claim.chatId ||
-      session?.selectionRevision !== claim.selectionRevision
-    ) {
-      return Object.freeze({ kind: 'superseded' })
-    }
-    const destination =
-      resolved.kind === 'ready'
-        ? active.destination.kind === 'ready'
-          ? active.destination
-          : null
-        : this.retainedSelectedDestination(active, claim)
-    if (!destination) return Object.freeze({ kind: 'pending' })
-    const expectedLeafId = destination.spine.resolvedLeafId
-    const workspaceFence = {
-      workspaceId: claim.workspaceId,
-      replacementEpoch: claim.workspaceEpoch,
-    }
-    const promptPath =
-      destination === active.destination
-        ? this.capturePromptPathFrame(workspaceFence)
-        : this.createPromptPathFrame(workspaceFence, active, destination)
-    const capability = promptPath.capability({
-      kind: 'send',
-      chatId: claim.chatId,
-      expectedLeafId,
-    })
-    switch (capability) {
-      case 'available':
-        return Object.freeze({
-          kind: 'ready',
-          expectedLeafId,
-          promptPath,
-        })
-      case 'pending':
-        return Object.freeze({ kind: 'pending' })
-      case 'unavailable':
-        return Object.freeze({ kind: 'unavailable' })
-      case 'error':
-        return Object.freeze({ kind: 'failed' })
-    }
-  }
-
-  private retainedSelectedDestination(
-    active: ActiveProjection,
-    claim: SessionSelectingConversationOperationClaim,
-  ): ConversationDestinationReadyProjection | null {
-    if (!destinationRetainsObservedFacts(active.destination)) return null
-    const retained = retainedReadyDestination(active.destination)
-    const seal = active.presentationSeal
-    if (
-      !retained ||
-      !seal ||
-      seal.workspaceId !== claim.workspaceId ||
-      seal.replacementEpoch !== claim.workspaceEpoch ||
-      seal.chatId !== claim.chatId ||
-      seal.selectionRevision !== claim.selectionRevision ||
-      seal.structuralVersion !== retained.spine.structuralVersion ||
-      seal.leafId !== retained.spine.resolvedLeafId
-    ) {
-      return null
-    }
-    return retained
-  }
-
   private createPromptPathFrame(
     workspaceFence: WorkspaceFence,
     active: ActiveProjection,
@@ -2569,20 +2489,31 @@ class TabConversationController implements ConversationController {
       workspaceFence,
       chatId: active.chatId,
       destination,
+      retainedSpine: this.retainedPromptPathSpine(active),
       topology: active.topology.kind === 'exact' ? active.topology.index : null,
+      topologyStructuralVersion:
+        active.topology.kind === 'exact' ? active.topology.structuralVersion : null,
       topologyChildSlots: active.topology.kind === 'exact' ? active.topology.childSlots : new Map(),
       topologyLoaded: active.topology.kind === 'exact',
       topologyFailed: active.failure?.kind === 'topology',
-      headers: active.headers,
+      headers: active.topology.kind === 'exact' ? active.topology.headers : active.headers,
       captureMaterial: (headers) =>
-        this.capturePromptMaterial(workspaceFence, active.chatId, headers),
+        this.acquirePromptMaterial(workspaceFence, active.chatId, headers),
     })
+  }
+
+  private retainedPromptPathSpine(
+    active: ActiveProjection,
+  ): VersionedActiveBranchSpine<MessageHeaderRow> | null {
+    return this.paintedFrame?.chat.id === active.chatId &&
+      this.paintedFrame.binding.currency === 'retained'
+      ? this.paintedFrame.binding.spine
+      : null
   }
 
   private releaseOperationClaim(claim: ConversationOperationClaim, recover = true): boolean {
     if (this.operationClaims.get(claim.id) !== claim) return false
     this.operationClaims.delete(claim.id)
-    this.generationIntentPresentations.delete(claim.id)
     const remaining = (this.operationClaimCountsByChat.get(claim.chatId) ?? 1) - 1
     if (remaining === 0) this.operationClaimCountsByChat.delete(claim.chatId)
     else this.operationClaimCountsByChat.set(claim.chatId, remaining)
@@ -4422,8 +4353,10 @@ class TabConversationController implements ConversationController {
     return true
   }
 
-  private requestTranscript(): void {
-    if (this.stageTranscriptDrain()) this.publish()
+  private requestTranscript(): boolean {
+    const changed = this.stageTranscriptDrain()
+    if (changed) this.publish()
+    return changed
   }
 
   private stageTranscriptDrain(): boolean {
@@ -5164,7 +5097,17 @@ class TabConversationController implements ConversationController {
 
   private activeNeedsTopology(active: ActiveProjection): boolean {
     const session = this.activeSession()
-    return Boolean(session && this.presentationOwnsSurfaceWork(active, session, 'tree'))
+    if (session && this.presentationOwnsSurfaceWork(active, session, 'tree')) return true
+    for (const demand of this.promptPathDemands.values()) {
+      if (
+        demand.workspaceId === this.workspaceId &&
+        demand.replacementEpoch === this.workspaceEpoch &&
+        demand.chatId === active.chatId
+      ) {
+        return true
+      }
+    }
+    return false
   }
 
   private refreshPresentationDemands(): void {
@@ -5506,7 +5449,6 @@ class TabConversationController implements ConversationController {
         window: transcript.window,
         selectionEpoch: transcript.selectionEpoch,
         viewportRevision: presentation.viewportRevision,
-        intentPresentations: this.presentedGenerationIntents(active.chatId, spine.resolvedLeafId),
         currency: 'current',
         reveal: presentation.reveal,
       })
@@ -5553,26 +5495,6 @@ class TabConversationController implements ConversationController {
       ),
     })
     return Object.freeze({ kind: 'ready', binding })
-  }
-
-  private presentedGenerationIntents(
-    chatId: ChatId,
-    leafId: MessageId | null,
-  ): readonly GenerationIntentMessagePresentation[] {
-    let matched: readonly GenerationIntentMessagePresentation[] | null = null
-    for (const pending of this.generationIntentPresentations.values()) {
-      if (
-        pending.claim.chatId === chatId &&
-        pending.baseLeafId === leafId &&
-        this.operationClaimIsCurrent(pending.claim)
-      ) {
-        matched =
-          matched === null
-            ? pending.presentations
-            : Object.freeze([...matched, ...pending.presentations])
-      }
-    }
-    return matched ?? EMPTY_CONVERSATION_MESSAGE_PRESENTATIONS
   }
 
   private retainedTreeInspector(
@@ -5727,6 +5649,29 @@ class TabConversationController implements ConversationController {
     let target = this.presentationTarget(active, session, transcript)
     if (target.kind === 'ready') {
       const previousFrame = this.paintedFrame
+      const previousBinding =
+        previousFrame?.chat.id === active.chatId ? previousFrame.binding : null
+      if (
+        previousFrame !== null &&
+        previousBinding?.surface === 'transcript' &&
+        target.binding.surface === 'transcript' &&
+        this.transcriptTransitionDisplacesRetention(previousBinding, target.binding)
+      ) {
+        const retained = retainConversationBinding(previousBinding)
+        this.paintedFrame = Object.freeze({
+          chat: previousFrame.chat,
+          binding: retained,
+        })
+        active.presentationResidents.transcript = retained
+        target = Object.freeze({
+          kind: 'pending',
+          surface: 'transcript',
+          blocker: 'transcript',
+        })
+      }
+    }
+    if (target.kind === 'ready') {
+      const previousFrame = this.paintedFrame
       if (
         previousFrame?.chat.id === active.chatId &&
         previousFrame.binding.surface === 'transcript' &&
@@ -5838,6 +5783,29 @@ class TabConversationController implements ConversationController {
       target,
       mounted,
     })
+  }
+
+  private transcriptTransitionDisplacesRetention(
+    previous: ConversationTranscriptSurface,
+    next: ConversationTranscriptSurface,
+  ): boolean {
+    for (const retention of this.transcriptRetentions.values()) {
+      if (
+        retention.workspaceId !== previous.seal.workspaceId ||
+        retention.replacementEpoch !== previous.seal.replacementEpoch ||
+        retention.chatId !== previous.seal.chatId ||
+        transcriptBodyWindowFindRow(previous.window, retention.messageId) === undefined
+      ) {
+        continue
+      }
+      if (
+        previous.seal.selectionRevision !== next.seal.selectionRevision ||
+        transcriptBodyWindowFindRow(next.window, retention.messageId) === undefined
+      ) {
+        return true
+      }
+    }
+    return false
   }
 
   private promisedTranscriptSpan(
@@ -6018,10 +5986,7 @@ class TabConversationController implements ConversationController {
     if (!port || !active || !session || !path) return
     const arrival = port.getArrival()
     if (arrival.route?.chatId !== active.chatId) return
-    const durableLeafId = path.leaf?.id ?? null
-    const intentLeafId = this.presentedGenerationIntents(active.chatId, durableLeafId).at(-1)
-      ?.message.id
-    const leafId = intentLeafId ?? durableLeafId
+    const leafId = path.leaf?.id ?? null
     const key = `${active.chatId}:${leafId ?? ''}`
     if (this.lastProjectedRouteKey === key) return
     this.lastProjectedRouteKey = key
@@ -6258,8 +6223,7 @@ function sameConversationBindingPayload(
     ? incoming.surface === 'transcript' &&
         current.window === incoming.window &&
         current.selectionEpoch === incoming.selectionEpoch &&
-        current.viewportRevision === incoming.viewportRevision &&
-        current.intentPresentations === incoming.intentPresentations
+        current.viewportRevision === incoming.viewportRevision
     : incoming.surface === 'tree' &&
         current.headers === incoming.headers &&
         current.topology === incoming.topology &&
@@ -6370,11 +6334,13 @@ interface ConversationPromptPathFrameInput {
   readonly workspaceFence: WorkspaceFence
   readonly chatId: ChatId
   readonly destination: ConversationDestinationProjection
+  readonly retainedSpine: VersionedActiveBranchSpine<MessageHeaderRow> | null
   readonly topology: MessageTopologyIndex<StructuralMessageHeader> | null
+  readonly topologyStructuralVersion: number | null
   readonly topologyChildSlots: ReadonlyMap<string, ActiveBranchChildSlot>
   readonly topologyLoaded: boolean
   readonly topologyFailed: boolean
-  readonly headers: PersistentStringMap<MessageHeaderRow>
+  readonly headers: ConversationMessageHeaderLookup
   readonly captureMaterial: (headers: readonly MessageHeaderRow[]) => GenerationPromptMaterialLease
 }
 
@@ -6382,7 +6348,9 @@ function createConversationPromptPathFrame({
   workspaceFence,
   chatId,
   destination,
+  retainedSpine,
   topology,
+  topologyStructuralVersion,
   topologyChildSlots,
   topologyLoaded,
   topologyFailed,
@@ -6390,9 +6358,13 @@ function createConversationPromptPathFrame({
   captureMaterial,
 }: ConversationPromptPathFrameInput): ConversationPromptPathFrame {
   const spine = destination.kind === 'ready' ? destination.spine : null
-  const path = spine?.path ?? null
+  const spineForMessage = (messageId: MessageId) => {
+    if (spine?.path.has(messageId)) return spine
+    if (retainedSpine?.path.has(messageId)) return retainedSpine
+    return null
+  }
   const header = (messageId: MessageId): MessageHeaderRow | null => {
-    const pathHeader = path?.get(messageId)
+    const pathHeader = spine?.path.get(messageId) ?? retainedSpine?.path.get(messageId)
     if (pathHeader) return pathHeader
     if (!topologyLoaded || !topology) return null
     const structuralHeader = topology.byId.get(messageId)
@@ -6404,74 +6376,154 @@ function createConversationPromptPathFrame({
       ? exactHeader
       : null
   }
-  const classify = (
+  type PromptPathResolution =
+    | {
+        readonly capability: Exclude<ConversationPromptPathCapability, 'available'>
+      }
+    | {
+        readonly capability: 'available'
+        readonly pathHint: GenerationPromptPathReadHint
+        readonly headers: readonly MessageHeaderRow[]
+      }
+  const proofUnavailable = (): PromptPathResolution => ({
+    capability: topologyFailed ? 'error' : topologyLoaded ? 'unavailable' : 'pending',
+  })
+  const resolve = (
     targetChatId: ChatId,
     targetKind: 'root' | 'include' | 'exclude',
     targetMessageId: MessageId | null,
     targetRole: 'any' | 'user' | 'assistant',
     childSlot: 'empty' | 'append' | 'none',
-  ): ConversationPromptPathCapability => {
-    if (targetChatId !== chatId) return 'pending'
-    if (destination.kind === 'missing' || destination.kind === 'unavailable') return 'unavailable'
-    if (destination.kind === 'failed') return 'error'
-    if (!spine) return 'pending'
+  ): PromptPathResolution => {
+    if (targetChatId !== chatId) return { capability: 'pending' }
+    if (destination.kind === 'missing' || destination.kind === 'unavailable') {
+      return { capability: 'unavailable' }
+    }
+    if (destination.kind === 'failed') return { capability: 'error' }
+    let target: MessageHeaderRow | null = null
     if (targetKind === 'root') {
-      return spine.resolvedLeafId === null ? 'available' : 'unavailable'
+      if (!spine) return { capability: 'pending' }
+      if (spine.resolvedLeafId !== null) return { capability: 'unavailable' }
+    } else {
+      if (targetMessageId === null) return { capability: 'unavailable' }
+      target = header(targetMessageId)
+      if (!target) return proofUnavailable()
+      if (targetRole !== 'any' && target.role !== targetRole) {
+        return { capability: 'unavailable' }
+      }
+      const targetSpine = spineForMessage(target.id)
+      if (
+        childSlot === 'empty' &&
+        targetSpine?.resolvedLeafId !== target.id &&
+        (!topologyLoaded || !topology || (topology.liveByParent.get(target.id)?.length ?? 0) !== 0)
+      ) {
+        return !topologyLoaded || !topology ? proofUnavailable() : { capability: 'unavailable' }
+      }
     }
-    if (targetMessageId === null) return 'unavailable'
-    const target = header(targetMessageId)
-    if (!target) {
-      if (topologyFailed) return 'error'
-      return topologyLoaded ? 'unavailable' : 'pending'
+    const selectedSpine =
+      targetMessageId === null
+        ? spine
+        : (spineForMessage(targetMessageId) ?? spine ?? retainedSpine)
+    const structuralVersion = selectedSpine?.structuralVersion ?? topologyStructuralVersion
+    if (structuralVersion === null) return proofUnavailable()
+    const leafId = targetKind === 'exclude' ? (target?.parentId ?? null) : targetMessageId
+    const capturedHeaders = pathHeaders(leafId, selectedSpine)
+    if (!capturedHeaders) return proofUnavailable()
+    const placementSlot =
+      childSlot === 'none'
+        ? null
+        : selectedSpine && leafId === selectedSpine.resolvedLeafId
+          ? selectedSpine.terminalChildSlot
+          : (topologyChildSlots.get(childListKey(chatId, leafId)) ??
+            (targetKind === 'exclude' && targetMessageId
+              ? (selectedSpine?.forkFor(targetMessageId) ?? null)
+              : null))
+    if (childSlot !== 'none' && !placementSlot) return proofUnavailable()
+    return {
+      capability: 'available',
+      headers: capturedHeaders,
+      pathHint: Object.freeze({
+        chatId,
+        structuralVersion,
+        leafId,
+        placementSlot: placementSlot
+          ? Object.freeze({
+              parentId: placementSlot.parentId,
+              slotVersion: placementSlot.slotVersion,
+              liveCount: placementSlot.liveCount,
+              nextSiblingIndex: placementSlot.nextSiblingIndex,
+            })
+          : null,
+        targetTurn: target
+          ? Object.freeze({
+              turnId: target.turnId,
+              turnIndex: target.turnIndex,
+            })
+          : null,
+        headers: Object.freeze(
+          capturedHeaders.map((capturedHeader) =>
+            Object.freeze({
+              messageId: capturedHeader.id,
+              parentId: capturedHeader.parentId,
+              requestContextVersion: capturedHeader.requestContextVersion,
+            }),
+          ),
+        ),
+      }),
     }
-    if (targetRole !== 'any' && target.role !== targetRole) {
-      return 'unavailable'
-    }
-    if (childSlot !== 'empty' || spine.resolvedLeafId === target.id) {
-      return 'available'
-    }
-    if (!topologyLoaded || !topology) return topologyFailed ? 'error' : 'pending'
-    return (topology.liveByParent.get(target.id)?.length ?? 0) === 0 ? 'available' : 'unavailable'
   }
-  const requirementCapability = (
-    requirement: Extract<GenerationPromptPathRequirement, { readonly surface: 'chat' }>,
-  ): ConversationPromptPathCapability =>
-    classify(
-      requirement.chatId,
-      requirement.target.kind,
-      requirement.target.kind === 'root' ? null : requirement.target.messageId,
-      requirement.target.kind === 'root' ? 'any' : requirement.target.role,
-      requirement.childSlot,
-    )
   const capability = (target: GenerationCapabilityTarget): ConversationPromptPathCapability => {
     switch (target.kind) {
       case 'new-chat-send':
         return 'pending'
       case 'send':
-        return classify(
-          target.chatId,
-          target.expectedLeafId === null ? 'root' : 'include',
-          target.expectedLeafId,
-          'any',
-          'empty',
-        )
+        return resolveGenerationTarget(target.chatId, target.target)?.capability ?? 'pending'
       case 'reply':
-        return classify(target.chatId, 'include', target.parentUserId, 'user', 'empty')
+        return resolve(target.chatId, 'include', target.parentUserId, 'user', 'empty').capability
       case 'regenerate':
-        return classify(target.chatId, 'exclude', target.targetAssistantId, 'assistant', 'append')
+        return resolve(target.chatId, 'exclude', target.targetAssistantId, 'assistant', 'append')
+          .capability
       case 'edit-resend':
-        return classify(target.chatId, 'exclude', target.targetUserId, 'user', 'append')
+        return resolve(target.chatId, 'exclude', target.targetUserId, 'user', 'append').capability
       case 'continue':
-        return classify(target.chatId, 'include', target.targetAssistantId, 'assistant', 'none')
+        return resolve(target.chatId, 'include', target.targetAssistantId, 'assistant', 'none')
+          .capability
     }
   }
-  const pathHeaders = (leafId: MessageId | null): readonly MessageHeaderRow[] | null => {
+  const resolveGenerationTarget = (
+    targetChatId: ChatId,
+    target: ActiveBranchIntentTarget,
+  ): PromptPathResolution | null => {
+    if (target.kind === 'fixed') {
+      return target.messageId === null
+        ? resolve(targetChatId, 'root', null, 'any', 'append')
+        : resolve(targetChatId, 'include', target.messageId, 'any', 'append')
+    }
+    const selection = target.selection
+    if (selection.kind === 'default') {
+      return spine ? resolve(targetChatId, 'include', spine.resolvedLeafId, 'any', 'append') : null
+    }
+    if (selection.kind === 'tip') {
+      return resolve(targetChatId, 'include', selection.messageId, 'any', 'append')
+    }
+    if (selection.kind === 'sibling-position') return null
+    const selectedSpine = spineForMessage(selection.messageId)
+    if (!selectedSpine) return null
+    if (selection.observedTipId && selectedSpine.resolvedLeafId !== selection.observedTipId) {
+      return null
+    }
+    return resolve(targetChatId, 'include', selectedSpine.resolvedLeafId, 'any', 'append')
+  }
+  const pathHeaders = (
+    leafId: MessageId | null,
+    preferredSpine: VersionedActiveBranchSpine<MessageHeaderRow> | null,
+  ): readonly MessageHeaderRow[] | null => {
     if (leafId === null) return Object.freeze([])
-    if (path?.has(leafId)) {
-      const index = path.indexOf(leafId)
+    if (preferredSpine?.path.has(leafId)) {
+      const index = preferredSpine.path.indexOf(leafId)
       return index < 0
         ? null
-        : Object.freeze([...path.window({ offset: 0, limit: index + 1 }).nodes])
+        : Object.freeze([...preferredSpine.path.window({ offset: 0, limit: index + 1 }).nodes])
     }
     if (!topologyLoaded || !topology) return null
     const reversed: MessageHeaderRow[] = []
@@ -6496,58 +6548,21 @@ function createConversationPromptPathFrame({
     capture: (
       requirement: Extract<GenerationPromptPathRequirement, { readonly surface: 'chat' }>,
     ) => {
-      if (requirementCapability(requirement) !== 'available' || !spine) return null
-      let leafId = requirement.target.kind === 'root' ? null : requirement.target.messageId
-      if (requirement.target.kind === 'exclude') {
-        const target = header(requirement.target.messageId)
-        if (!target) return null
-        leafId = target.parentId
-      }
-      const capturedHeaders = pathHeaders(leafId)
-      if (!capturedHeaders) return null
-      const placementSlot =
-        requirement.childSlot === 'none'
-          ? null
-          : leafId === spine.resolvedLeafId
-            ? spine.terminalChildSlot
-            : (topologyChildSlots.get(childListKey(chatId, leafId)) ??
-              (requirement.target.kind === 'exclude'
-                ? (spine.forkFor(requirement.target.messageId) ?? null)
-                : null))
-      if (requirement.childSlot !== 'none' && !placementSlot) return null
-      const target =
-        requirement.target.kind === 'root' ? null : header(requirement.target.messageId)
-      if (requirement.target.kind !== 'root' && !target) return null
+      const resolution =
+        requirement.kind === 'send'
+          ? resolveGenerationTarget(requirement.chatId, requirement.target)
+          : resolve(
+              requirement.chatId,
+              requirement.target.kind,
+              requirement.target.messageId,
+              requirement.target.role,
+              requirement.childSlot,
+            )
+      if (!resolution) return null
+      if (resolution.capability !== 'available') return null
       return Object.freeze({
-        claim: Object.freeze({
-          chatId,
-          structuralVersion: spine.structuralVersion,
-          leafId,
-          placementSlot: placementSlot
-            ? Object.freeze({
-                parentId: placementSlot.parentId,
-                slotVersion: placementSlot.slotVersion,
-                liveCount: placementSlot.liveCount,
-                nextSiblingIndex: placementSlot.nextSiblingIndex,
-              })
-            : null,
-          targetTurn: target
-            ? Object.freeze({
-                turnId: target.turnId,
-                turnIndex: target.turnIndex,
-              })
-            : null,
-          headers: Object.freeze(
-            capturedHeaders.map((capturedHeader) =>
-              Object.freeze({
-                messageId: capturedHeader.id,
-                parentId: capturedHeader.parentId,
-                requestContextVersion: capturedHeader.requestContextVersion,
-              }),
-            ),
-          ),
-        }),
-        material: captureMaterial(capturedHeaders),
+        pathHint: resolution.pathHint,
+        material: captureMaterial(resolution.headers),
       })
     },
   })

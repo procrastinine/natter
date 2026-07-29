@@ -6,6 +6,7 @@ import type { ChatSettings, ConnectionProfile, Message, MessageId } from '../../
 import {
   __resetBrowserRepositoryForTests,
   getBrowserRepository,
+  tryExecuteBrowserWorkspaceCommandWithinFanoutBudget,
 } from '../../src/store/browser-repo'
 import {
   openBrowserWorkspace,
@@ -254,7 +255,7 @@ describe('send-context freshness', () => {
     const { handle, discovery, openStream } = await delayedGeneration({
       kind: 'send',
       chatId: chat.id,
-      expectedLeafId: null,
+      target: { kind: 'fixed', messageId: null },
       content: [{ type: 'text', text: 'original question' }],
     })
     const prepared = await within(handle.prepared, 'prepared admission')
@@ -286,7 +287,7 @@ describe('send-context freshness', () => {
     const { handle, discovery, openStream } = await delayedGeneration({
       kind: 'send',
       chatId: chat.id,
-      expectedLeafId: null,
+      target: { kind: 'fixed', messageId: null },
       content: [{ type: 'text', text: 'before edit' }],
     })
     const prepared = await handle.prepared
@@ -411,12 +412,50 @@ describe('send-context freshness', () => {
     expect(await messageHeader(assistant.id)).toMatchObject({ parentId: user.id })
   })
 
+  it('deletes an imported intermediate node on a branch deeper than the direct fanout budget', async () => {
+    const chat = await createChat({ settings: settings() })
+    const imported = await importMessagesOp({
+      chatId: chat.id,
+      slot: { kind: 'at-end' },
+      activeLeafId: null,
+      messages: Array.from({ length: 70 }, (_unused, index) => ({
+        role: index % 2 === 0 ? ('user' as const) : ('assistant' as const),
+        content:
+          index % 2 === 0
+            ? [{ type: 'text' as const, text: `imported user ${index}` }]
+            : [{ type: 'output_text' as const, text: `imported assistant ${index}` }],
+      })),
+    })
+    const parent = required(imported.presentations[0]?.message, 'deep imported parent')
+    const target = required(imported.presentations[1]?.message, 'deep imported target')
+    const child = required(imported.presentations[2]?.message, 'deep imported child')
+    const leaf = required(imported.presentations.at(-1)?.message, 'deep imported leaf')
+
+    const admission = await runWorkspaceAction('message-structure', (permit) =>
+      tryExecuteBrowserWorkspaceCommandWithinFanoutBudget(permit, {
+        kind: 'message.delete',
+        mode: 'single',
+        input: {
+          chatId: chat.id,
+          messageId: target.id,
+          activeLeafId: leaf.id,
+        },
+      }),
+    )
+
+    if (admission.kind === 'staging-required') {
+      throw new Error(`DeepDeleteUnexpectedStaging:${JSON.stringify(admission.reason)}`)
+    }
+    expect(await messageHeader(target.id)).toMatchObject({ deleted: true })
+    expect(await messageHeader(child.id)).toMatchObject({ parentId: parent.id })
+  })
+
   it('keeps click-time prompt settings frozen when the chat changes after admission', async () => {
     const chat = await createChat({ settings: settings({ sampling: { temperature: 0.8 } }) })
     const { handle, discovery, openStream, wires } = await delayedGeneration({
       kind: 'send',
       chatId: chat.id,
-      expectedLeafId: null,
+      target: { kind: 'fixed', messageId: null },
       content: [{ type: 'text', text: 'question' }],
     })
     const prepared = await handle.prepared
@@ -441,7 +480,7 @@ describe('send-context freshness', () => {
     const { handle, discovery, openStream } = await delayedGeneration({
       kind: 'send',
       chatId: chat.id,
-      expectedLeafId: null,
+      target: { kind: 'fixed', messageId: null },
       content: [{ type: 'text', text: 'question' }],
     })
     await handle.prepared
@@ -463,7 +502,7 @@ describe('send-context freshness', () => {
     const { handle, discovery, openStream } = await delayedGeneration({
       kind: 'send',
       chatId: chat.id,
-      expectedLeafId: null,
+      target: { kind: 'fixed', messageId: null },
       content: [{ type: 'text', text: 'question' }],
     })
     await handle.prepared
@@ -493,7 +532,7 @@ describe('send-context freshness', () => {
     const handle = await start({
       kind: 'send',
       chatId: chat.id,
-      expectedLeafId: null,
+      target: { kind: 'fixed', messageId: null },
       content: [{ type: 'text', text: 'proof shape' }],
     })
     await expect(handle.completed).resolves.toMatchObject({ outcome: 'done' })
@@ -531,7 +570,7 @@ describe('send-context freshness', () => {
     const handle = await start({
       kind: 'send',
       chatId: chat.id,
-      expectedLeafId: null,
+      target: { kind: 'fixed', messageId: null },
       content: [{ type: 'text', text: 'bodyless validation' }],
     })
     await expect(handle.completed).resolves.toMatchObject({ outcome: 'done' })

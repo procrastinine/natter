@@ -30,7 +30,7 @@ describe('production runtime effects audit', () => {
     expect(inventory.counts.reviewedArchitectureGaps).toBe(inventory.gaps.length)
     expect(inventory.dispositionCounts).toEqual({
       proved: 31,
-      'intentional-bounded-lifetime': 11,
+      'intentional-bounded-lifetime': 10,
       'architecture-gap': 0,
     })
     expect(inventory.reviews).toHaveLength(inventory.syntacticGaps.length)

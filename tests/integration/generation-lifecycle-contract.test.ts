@@ -196,7 +196,7 @@ afterEach(async () => {
 })
 
 describe('generation lifecycle contract', () => {
-  it('publishes send and regenerate intent rows before durable prepare and adopts their ids', async () => {
+  it('publishes send and regenerate rows only after durable preparation owns their ids', async () => {
     const chat = await createChat({ settings: settings() })
     let releasePrepare: () => void = () => undefined
     let prepareStarted: () => void = () => undefined
@@ -218,36 +218,22 @@ describe('generation lifecycle contract', () => {
       {
         kind: 'send',
         chatId: chat.id,
-        expectedLeafId: null,
+        target: { kind: 'fixed', messageId: null },
         content: [{ type: 'text', text: 'intent-owned prompt' }],
       },
       () => finiteStream(completionChunk('intent-owned answer')),
     )
     await prepareObserved
-    const sendBinding = currentTranscriptBinding()
-    const intentIds = sendBinding.intentPresentations.map(({ message }) => message.id)
     try {
-      expect(sendBinding.intentPresentations.map(({ message }) => message)).toMatchObject([
-        {
-          chatId: chat.id,
-          role: 'user',
-          content: [{ type: 'text', text: 'intent-owned prompt' }],
-        },
-        {
-          chatId: chat.id,
-          role: 'assistant',
-          content: [],
-          generation: { status: 'preparing' },
-        },
-      ])
       expect(await messages(chat.id)).toEqual([])
     } finally {
       releasePrepare()
     }
     const sendPrepared = await send.prepared
-    expect([sendPrepared.userMessageId, sendPrepared.assistantMessageId]).toEqual(intentIds)
+    expect(new Set((await messages(chat.id)).map((message) => message.id))).toEqual(
+      new Set([sendPrepared.userMessageId, sendPrepared.assistantMessageId]),
+    )
     await send.completed
-    expect(currentTranscriptBinding().intentPresentations).toEqual([])
 
     prepareGate = new Promise<void>((resolve) => {
       releasePrepare = resolve
@@ -264,38 +250,21 @@ describe('generation lifecycle contract', () => {
       () => finiteStream(completionChunk('regenerated answer')),
     )
     await prepareObserved
-    let regeneratedIntentId: string | undefined
     try {
-      const regenerateBinding = currentTranscriptBinding()
-      expect(regenerateBinding.intentPresentations).toHaveLength(1)
-      expect(regenerateBinding.intentPresentations[0]?.message).toMatchObject({
-        chatId: chat.id,
-        role: 'assistant',
-        content: [],
-        generation: { status: 'preparing' },
-      })
-      expect(regenerateBinding.intentPresentations[0]?.replacesFromMessageId).toBe(
-        sendPrepared.assistantMessageId,
-      )
-      regeneratedIntentId = regenerateBinding.intentPresentations[0]?.message.id
-      expect(regenerateBinding.intentPresentations[0]?.fork).toMatchObject({
-        selectedMessageId: regeneratedIntentId,
-        position: 1,
-        liveCount: 2,
-        previousMessageId: sendPrepared.assistantMessageId,
-        nextMessageId: null,
-      })
+      const durable = await messages(chat.id)
+      expect(durable).toHaveLength(2)
       expect(
-        (await messages(chat.id)).find((message) => message.id === sendPrepared.assistantMessageId)
-          ?.content,
+        durable.find((message) => message.id === sendPrepared.assistantMessageId)?.content,
       ).toEqual([{ type: 'output_text', text: 'intent-owned answer' }])
     } finally {
       releasePrepare()
     }
     const regeneratePrepared = await regenerate.prepared
-    expect(regeneratePrepared.assistantMessageId).toBe(regeneratedIntentId)
+    expect(regeneratePrepared.assistantMessageId).not.toBe(sendPrepared.assistantMessageId)
+    expect((await messages(chat.id)).map((message) => message.id)).toContain(
+      regeneratePrepared.assistantMessageId,
+    )
     await regenerate.completed
-    expect(currentTranscriptBinding().intentPresentations).toEqual([])
   })
 
   it('rolls back the whole admission when attempt.prepare fails before publication', async () => {
@@ -309,7 +278,7 @@ describe('generation lifecycle contract', () => {
       {
         kind: 'send',
         chatId: chat.id,
-        expectedLeafId: null,
+        target: { kind: 'fixed', messageId: null },
         content: [{ type: 'text', text: 'prepare failure' }],
       },
       openStream,
@@ -362,7 +331,7 @@ describe('generation lifecycle contract', () => {
       {
         kind: 'send',
         chatId: chat.id,
-        expectedLeafId: null,
+        target: { kind: 'fixed', messageId: null },
         content: [{ type: 'text', text: 'hello' }],
       },
       openStream,
@@ -437,7 +406,7 @@ describe('generation lifecycle contract', () => {
         {
           kind: 'send',
           chatId: chat.id,
-          expectedLeafId: null,
+          target: { kind: 'fixed', messageId: null },
           content: [{ type: 'text', text: 'a'.repeat(400) }],
         },
         () =>
@@ -528,7 +497,7 @@ describe('generation lifecycle contract', () => {
         {
           kind: 'send',
           chatId: chat.id,
-          expectedLeafId: null,
+          target: { kind: 'fixed', messageId: null },
           content: [{ type: 'text', text: 'a'.repeat(400) }],
         },
         () => finiteStream(completionChunk('b'.repeat(200))),
@@ -607,7 +576,7 @@ describe('generation lifecycle contract', () => {
         {
           kind: 'send',
           chatId: chat.id,
-          expectedLeafId: null,
+          target: { kind: 'fixed', messageId: null },
           content: [{ type: 'text', text: 'p'.repeat(400) }],
         },
         () =>
@@ -675,7 +644,7 @@ describe('generation lifecycle contract', () => {
       {
         kind: 'send',
         chatId: chat.id,
-        expectedLeafId: null,
+        target: { kind: 'fixed', messageId: null },
         content: [{ type: 'text', text: 'terminal evidence' }],
       },
       () => finiteStream(...chunks),
@@ -713,7 +682,7 @@ describe('generation lifecycle contract', () => {
       {
         kind: 'send',
         chatId: chat.id,
-        expectedLeafId: null,
+        target: { kind: 'fixed', messageId: null },
         content: [{ type: 'text', text: 'silent stream' }],
       },
       () => throwingStream(timeout),
@@ -751,7 +720,7 @@ describe('generation lifecycle contract', () => {
     const result = await runDefault({
       kind: 'send',
       chatId: chat.id,
-      expectedLeafId: null,
+      target: { kind: 'fixed', messageId: null },
       content: [{ type: 'text', text: 'sentinel' }],
     })
 
@@ -773,7 +742,7 @@ describe('generation lifecycle contract', () => {
     const result = await runDefault({
       kind: 'send',
       chatId: chat.id,
-      expectedLeafId: null,
+      target: { kind: 'fixed', messageId: null },
       content: [{ type: 'text', text: 'malformed frame lifecycle' }],
     })
 
@@ -1025,7 +994,7 @@ describe('generation lifecycle contract', () => {
       {
         kind: 'send',
         chatId: sendChat.id,
-        expectedLeafId: null,
+        target: { kind: 'fixed', messageId: null },
         content: [{ type: 'text', text: 'abort send' }],
       },
       (input) => abortableStream(input.signal),
@@ -1081,7 +1050,7 @@ describe('generation lifecycle contract', () => {
         {
           kind: 'send',
           chatId: chat.id,
-          expectedLeafId: null,
+          target: { kind: 'fixed', messageId: null },
           content: [{ type: 'text', text: 'send failure' }],
         },
         () => throwingStream(error),
@@ -1123,7 +1092,7 @@ describe('generation lifecycle contract', () => {
       {
         kind: 'send',
         chatId: chat.id,
-        expectedLeafId: null,
+        target: { kind: 'fixed', messageId: null },
         content: [{ type: 'text', text: 'fail final write' }],
       },
       () => finiteStream(completionChunk(largeText)),
@@ -1173,7 +1142,7 @@ describe('generation lifecycle contract', () => {
       {
         kind: 'send',
         chatId: chat.id,
-        expectedLeafId: null,
+        target: { kind: 'fixed', messageId: null },
         content: [{ type: 'text', text: 'recover truncation' }],
       },
       () => finiteStream(...chunks),
@@ -1202,7 +1171,7 @@ describe('generation lifecycle contract', () => {
       {
         kind: 'send',
         chatId: chat.id,
-        expectedLeafId: null,
+        target: { kind: 'fixed', messageId: null },
         content: [{ type: 'text', text: 'recover network failure' }],
       },
       () =>
@@ -1239,7 +1208,7 @@ describe('generation lifecycle contract', () => {
       {
         kind: 'send',
         chatId: chat.id,
-        expectedLeafId: null,
+        target: { kind: 'fixed', messageId: null },
         content: [{ type: 'text', text: 'stale send race' }],
       },
       () => finiteStream(completionChunk(durable)),
@@ -1512,14 +1481,6 @@ describe('generation lifecycle contract', () => {
     expect((await message(target.id))?.continuationAttempts).toHaveLength(1)
   })
 })
-
-function currentTranscriptBinding() {
-  const target = conversationController.getSnapshot().active?.presentation.target
-  if (target?.kind !== 'ready' || target.binding.surface !== 'transcript') {
-    throw new Error('Current transcript binding unavailable')
-  }
-  return target.binding
-}
 
 async function start(
   intent: GenerationIntent,

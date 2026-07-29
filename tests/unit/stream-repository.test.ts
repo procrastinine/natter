@@ -2,7 +2,6 @@ import Dexie, { type Transaction } from 'dexie'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { AttemptTerminalReceipt } from '../../src/core/attempt-outcome'
 import { createChatRow } from '../../src/core/chat-metadata'
-import { connectionDispatchProfileProof } from '../../src/core/connection-dispatch-proof'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import type {
   ChatSettings,
@@ -50,7 +49,6 @@ import {
 } from '../../src/store/workspace-repository'
 import { runWorkspaceAction, runWorkspaceRead } from '../../src/store/workspace-runtime'
 import { createChat, updateChatForTest } from '../helpers/chats'
-import { testChatConfigurationLinkTransition } from '../helpers/configuration'
 import { installGenerationProfile } from '../helpers/generation-engine'
 import {
   decodeTestStreamJournalFrames,
@@ -176,7 +174,7 @@ describe('browser stream repository protocol', () => {
       targetAssistantId: firstTarget.id,
     })
 
-    expect(prepared.assistant.id).toBe(firstTarget.id)
+    expect(prepared.assistantHeader.id).toBe(firstTarget.id)
     expect(prepared.lease).toMatchObject({
       streamId: 'valid-target',
       chatId: first.chatId,
@@ -471,8 +469,8 @@ describe('browser stream repository protocol', () => {
       chatId: seeded.chatId,
       targetAssistantId: target.id,
     })
-    const claimedIds = new Set(input.promptPath.claim.headers.map((header) => header.messageId))
-    expect(claimedIds.size).toBe(4_096)
+    const hintedIds = new Set(input.promptPath.pathHint.headers.map((header) => header.messageId))
+    expect(hintedIds.size).toBe(4_096)
 
     const db = getDb()
     const messageTablePrototype = Object.getPrototypeOf(db.messages) as typeof db.messages
@@ -480,7 +478,7 @@ describe('browser stream repository protocol', () => {
     const readTransactions = new Set<Transaction>()
     const claimedHeaderReads: MessageId[] = []
     const reading = (header: MessageHeaderRow | undefined): MessageHeaderRow | undefined => {
-      if (!header || !claimedIds.has(header.id)) return header
+      if (!header || !hintedIds.has(header.id)) return header
       const transaction = Dexie.currentTransaction
       readTransactions.add(transaction)
       claimedHeaderReads.push(header.id)
@@ -494,19 +492,19 @@ describe('browser stream repository protocol', () => {
       db.messages.hook('reading').unsubscribe(reading)
     }
 
-    const claimPages = bulkGet.mock.calls
+    const hintPages = bulkGet.mock.calls
       .map(([ids]) => [...ids])
-      .filter((ids) => ids.length > 0 && ids.every((id) => claimedIds.has(id)))
-    const pagedIds = claimPages.flat()
+      .filter((ids) => ids.length > 0 && ids.every((id) => hintedIds.has(id)))
+    const pagedIds = hintPages.flat()
     expect(HEADER_READ_PAGE_SIZE).toBe(256)
-    expect(claimPages).toHaveLength(4_096 / HEADER_READ_PAGE_SIZE)
-    expect(claimPages.every((page) => page.length <= HEADER_READ_PAGE_SIZE)).toBe(true)
+    expect(hintPages).toHaveLength(4_096 / HEADER_READ_PAGE_SIZE)
+    expect(hintPages.every((page) => page.length <= HEADER_READ_PAGE_SIZE)).toBe(true)
     expect(pagedIds).toHaveLength(4_096)
-    expect(new Set(pagedIds)).toEqual(claimedIds)
+    expect(new Set(pagedIds)).toEqual(hintedIds)
     expect(readTransactions.size).toBe(1)
     expect(claimedHeaderReads.length).toBeGreaterThanOrEqual(4_096)
     expect(claimedHeaderReads.length).toBeLessThanOrEqual(4_098)
-    expect(new Set(claimedHeaderReads)).toEqual(claimedIds)
+    expect(new Set(claimedHeaderReads)).toEqual(hintedIds)
     const readCounts = new Map<MessageId, number>()
     for (const messageId of claimedHeaderReads) {
       readCounts.set(messageId, (readCounts.get(messageId) ?? 0) + 1)
@@ -519,10 +517,10 @@ describe('browser stream repository protocol', () => {
         }),
     ).toBe(true)
     expect(prepared.prompt.headers).toHaveLength(4_096)
-    expect(new Set(prepared.prompt.headers.map((header) => header.id))).toEqual(claimedIds)
+    expect(new Set(prepared.prompt.headers.map((header) => header.id))).toEqual(hintedIds)
   }, 30_000)
 
-  it('rejects a cyclic prompt claim through persisted parent validation', async () => {
+  it('falls back to the current persisted path when the read hint is cyclic', async () => {
     const seeded = await seedTargets(1)
     const target = requiredTarget(seeded, 0)
     const input = await continuationPrepareInput({
@@ -530,10 +528,10 @@ describe('browser stream repository protocol', () => {
       chatId: seeded.chatId,
       targetAssistantId: target.id,
     })
-    const [root, leaf] = input.promptPath.claim.headers
+    const [root, leaf] = input.promptPath.pathHint.headers
     if (!root || !leaf) throw new Error('CyclicPromptClaimFixtureMissing')
-    const claim = {
-      ...input.promptPath.claim,
+    const pathHint = {
+      ...input.promptPath.pathHint,
       headers: [
         root,
         leaf,
@@ -542,15 +540,17 @@ describe('browser stream repository protocol', () => {
       ],
     }
 
-    await expect(
-      execute({
-        kind: 'attempt.prepare',
-        input: {
-          ...input,
-          promptPath: { ...input.promptPath, claim },
-        },
-      }),
-    ).rejects.toThrow(`GenerationPlanningSeedChanged:${seeded.chatId}`)
+    const prepared = await execute({
+      kind: 'attempt.prepare',
+      input: {
+        ...input,
+        promptPath: { ...input.promptPath, pathHint },
+      },
+    })
+    expect(prepared.prompt.headers.map((header) => header.id)).toEqual([
+      root.messageId,
+      leaf.messageId,
+    ])
   })
 
   it('seals one exact settled journal boundary and rejects every later contradiction', async () => {
@@ -738,10 +738,11 @@ describe('browser stream repository protocol', () => {
 
   it('requires the sealed receipt before canonicalization and rejects a mismatched receipt', async () => {
     const seeded = await seedTargets(1)
+    const target = requiredTarget(seeded, 0)
     const prepared = await prepareContinuation({
       streamId: 'terminal-before-canonical',
       chatId: seeded.chatId,
-      targetAssistantId: requiredTarget(seeded, 0).id,
+      targetAssistantId: target.id,
     })
     const current = (await dispatchContinuation(prepared, prepared.lease.startedAt + 1)).lease
     const finishedAt = current.startedAt + 2
@@ -766,7 +767,7 @@ describe('browser stream repository protocol', () => {
         }),
       }),
     ).rejects.toThrow(`AttemptTerminalDecisionConflict:${current.streamId}`)
-    expect(await message(current.messageId)).toEqual(prepared.assistant)
+    expect(await message(current.messageId)).toEqual(target)
     expect(await streamLease(current.streamId)).toEqual(decided)
   })
 
@@ -1309,11 +1310,9 @@ async function continuationPrepareInput(input: {
       now: startedAt,
     })
   const promptHeaders = await promptPathHeaderClaims(input.targetAssistantId)
-  const selectedProfile = profile()
   return {
     strategy: 'continue',
     lease,
-    configurationLinkTransition: testChatConfigurationLinkTransition(chat),
     promptPath: {
       requirement: {
         kind: 'continue',
@@ -1326,7 +1325,7 @@ async function continuationPrepareInput(input: {
         },
         childSlot: 'none',
       },
-      claim: {
+      pathHint: {
         chatId: input.chatId,
         structuralVersion: chat.structuralVersion,
         leafId: input.targetAssistantId,
@@ -1335,19 +1334,8 @@ async function continuationPrepareInput(input: {
         targetTurn: null,
       },
     },
-    configurationClaim: {
-      configurationVersion: chat.configurationVersion ?? 0,
-      settings: chat.settings,
-      presetId: chat.presetId ?? null,
-      profile: connectionDispatchProfileProof(selectedProfile, MODEL),
-      requestRevision: {
-        profileId: selectedProfile.id,
-        requestRevision: selectedProfile.requestRevision ?? 0,
-        key: { kind: 'missing' },
-      },
-      dispatchKeyRevisions: [],
+    configurationIntent: {
       preferredDispatchKeyId: null,
-      workspaceSettingOverrides: [],
     },
   }
 }

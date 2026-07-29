@@ -13,6 +13,10 @@ import type {
 import type { AttachmentId, Chat, ChatId, MessageId } from '../core/types'
 import { sameValue } from '../lib/same-value'
 import {
+  type BrowserCommandFanoutBudget,
+  BrowserCommandFanoutBudgetExceededError,
+} from './browser-command-fanout-budget'
+import {
   browserWorkspaceCatchupTransactionTableNames,
   recordBrowserWorkspaceCatchupMutations,
 } from './browser-workspace-catchup-journal'
@@ -37,40 +41,6 @@ import type { WorkspaceDependency, WorkspaceLocalChildSlotEvidence } from './wor
 const DBCORE_RANGE_NEVER = 4 as DBCoreKeyRange['type']
 const journals = new WeakMap<DBCoreTransaction, MutableMutationJournal>()
 const installedDatabases = new WeakSet<Dexie>()
-
-export interface BrowserCommandFanoutBudget {
-  readonly maxReadRows: number
-  readonly maxWriteRows: number
-  readonly maxBytes: number
-}
-
-export class BrowserCommandFanoutBudgetExceededError extends Error {
-  readonly dimension: 'read-rows' | 'write-rows' | 'bytes'
-  readonly observed: number
-  readonly limit: number
-
-  constructor(dimension: 'read-rows' | 'write-rows' | 'bytes', observed: number, limit: number) {
-    super(`BrowserCommandFanoutBudgetExceeded:${dimension}:${observed}:${limit}`)
-    this.name = 'BrowserCommandFanoutBudgetExceededError'
-    this.dimension = dimension
-    this.observed = observed
-    this.limit = limit
-  }
-}
-
-export function isBrowserCommandFanoutBudgetExceededError(
-  error: unknown,
-): error is BrowserCommandFanoutBudgetExceededError {
-  if (error instanceof BrowserCommandFanoutBudgetExceededError) return true
-  if (error instanceof AggregateError) {
-    return error.errors.some(isBrowserCommandFanoutBudgetExceededError)
-  }
-  return (
-    error instanceof Error &&
-    error.cause !== undefined &&
-    isBrowserCommandFanoutBudgetExceededError(error.cause)
-  )
-}
 
 interface MutableMutationJournal {
   readonly tableNames: Set<string>
@@ -98,10 +68,11 @@ interface MutableMutationJournal {
   physicalReadPhase: 'command' | 'finalization'
   readonly fanoutBudget?: BrowserCommandFanoutBudget
   readonly retainFullChatStates: boolean
-  fanoutReadRows: number
+  fanoutLargestReadRequestRows: number
+  fanoutLargestReadRequestBytes: number
   fanoutWriteRows: number
-  fanoutBytes: number
-  fanoutLargestValueBytes: number
+  fanoutWriteBytes: number
+  fanoutLargestWriteValueBytes: number
 }
 
 interface BrowserCommandPhysicalMutationHint {
@@ -303,10 +274,11 @@ export async function runBrowserCommandTransaction<T>(
     physicalReadPhase: 'command',
     ...(options.fanoutBudget ? { fanoutBudget: options.fanoutBudget } : {}),
     retainFullChatStates: options.retainFullChatStates !== false,
-    fanoutReadRows: 0,
+    fanoutLargestReadRequestRows: 0,
+    fanoutLargestReadRequestBytes: 0,
     fanoutWriteRows: 0,
-    fanoutBytes: 0,
-    fanoutLargestValueBytes: 0,
+    fanoutWriteBytes: 0,
+    fanoutLargestWriteValueBytes: 0,
   }
   journals.set(transaction, journal)
   try {
@@ -753,7 +725,12 @@ const browserCommandMutationMiddleware: Middleware<DBCore> = {
           return result
         },
         getMany: async (request) => {
-          assertFanoutReadRequestWithinBudget(request.trans, request.keys.length)
+          assertFanoutReadRequestWithinBudget(
+            request.trans,
+            request.keys.length,
+            tableName,
+            'get-many',
+          )
           const result = dbCoreResultArray((await table.getMany(request)) as unknown)
           recordPhysicalRead(
             request.trans,
@@ -979,7 +956,9 @@ function recordPhysicalRead(
   countRequest = true,
 ): void {
   const journal = journals.get(transaction)
-  if (journal) consumeFanoutRead(journal, rowCount, payloadKind, payload)
+  if (journal) {
+    consumeFanoutRead(journal, requestRows, payloadKind, payload, tableName, operation)
+  }
   if (!journal?.observePhysicalReads) return
   const physicalReads =
     journal.physicalReadPhase === 'command'
@@ -1024,35 +1003,46 @@ function boundedFanoutQueryRequest(request: DBCoreQueryRequest): DBCoreQueryRequ
   const journal = journals.get(request.trans)
   const budget = journal?.fanoutBudget
   if (!journal || !budget) return request
-  const remaining = Math.max(0, budget.maxReadRows - journal.fanoutReadRows)
-  const limit = Math.min(request.limit ?? Number.MAX_SAFE_INTEGER, remaining + 1)
+  const limit = Math.min(request.limit ?? Number.MAX_SAFE_INTEGER, budget.maxReadRequestRows + 1)
   return { ...request, limit }
 }
 
 function assertFanoutReadRequestWithinBudget(
   transaction: DBCoreTransaction,
   requestedRows: number,
+  tableName: string,
+  operation: string,
 ): void {
   const journal = journals.get(transaction)
   const budget = journal?.fanoutBudget
   if (!journal || !budget) return
-  const observed = saturatingCount(journal.fanoutReadRows, requestedRows)
-  if (observed > budget.maxReadRows) {
-    throw new BrowserCommandFanoutBudgetExceededError('read-rows', observed, budget.maxReadRows)
+  if (requestedRows > budget.maxReadRequestRows) {
+    throw new BrowserCommandFanoutBudgetExceededError(
+      'read-request-rows',
+      requestedRows,
+      budget.maxReadRequestRows,
+      { tableName, operation },
+    )
   }
 }
 
 function consumeFanoutRead(
   journal: MutableMutationJournal,
-  rowCount: number,
+  requestRows: number,
   payloadKind: 'none' | 'single' | 'many',
   payload: unknown,
+  tableName: string,
+  operation: string,
 ): void {
   const budget = journal.fanoutBudget
   if (!budget) return
-  const rows = saturatingCount(journal.fanoutReadRows, rowCount)
-  if (rows > budget.maxReadRows) {
-    throw new BrowserCommandFanoutBudgetExceededError('read-rows', rows, budget.maxReadRows)
+  if (requestRows > budget.maxReadRequestRows) {
+    throw new BrowserCommandFanoutBudgetExceededError(
+      'read-request-rows',
+      requestRows,
+      budget.maxReadRequestRows,
+      { tableName, operation },
+    )
   }
   const values =
     payloadKind === 'none'
@@ -1060,8 +1050,20 @@ function consumeFanoutRead(
       : payloadKind === 'single'
         ? [payload]
         : ((payload as readonly unknown[] | undefined) ?? [])
-  consumeFanoutValues(journal, values)
-  journal.fanoutReadRows = rows
+  const requestBytes = boundedFanoutValueBytes(values)
+  if (requestBytes > budget.maxReadRequestBytes) {
+    throw new BrowserCommandFanoutBudgetExceededError(
+      'read-request-bytes',
+      requestBytes,
+      budget.maxReadRequestBytes,
+      { tableName, operation },
+    )
+  }
+  journal.fanoutLargestReadRequestRows = Math.max(journal.fanoutLargestReadRequestRows, requestRows)
+  journal.fanoutLargestReadRequestBytes = Math.max(
+    journal.fanoutLargestReadRequestBytes,
+    requestBytes,
+  )
 }
 
 function consumeFanoutWrite(journal: MutableMutationJournal, request: DBCoreMutateRequest): void {
@@ -1076,15 +1078,8 @@ function consumeFanoutWrite(journal: MutableMutationJournal, request: DBCoreMuta
     request.type === 'delete' || request.type === 'deleteRange'
       ? []
       : (request.values as readonly unknown[])
-  consumeFanoutValues(journal, values)
-  journal.fanoutWriteRows = rows
-}
-
-function consumeFanoutValues(journal: MutableMutationJournal, values: readonly unknown[]): void {
-  const budget = journal.fanoutBudget
-  if (!budget) return
-  let totalBytes = journal.fanoutBytes
-  let largestValueBytes = journal.fanoutLargestValueBytes
+  let totalBytes = journal.fanoutWriteBytes
+  let largestValueBytes = journal.fanoutLargestWriteValueBytes
   for (const value of values) {
     if (value === undefined) continue
     const valueBytes = estimateStoredValueBytes(value)
@@ -1092,11 +1087,28 @@ function consumeFanoutValues(journal: MutableMutationJournal, values: readonly u
     largestValueBytes = Math.max(largestValueBytes, valueBytes)
   }
   const boundedBytes = Math.max(0, totalBytes - largestValueBytes)
-  if (boundedBytes > budget.maxBytes) {
-    throw new BrowserCommandFanoutBudgetExceededError('bytes', boundedBytes, budget.maxBytes)
+  if (boundedBytes > budget.maxWriteBytes) {
+    throw new BrowserCommandFanoutBudgetExceededError(
+      'write-bytes',
+      boundedBytes,
+      budget.maxWriteBytes,
+    )
   }
-  journal.fanoutBytes = totalBytes
-  journal.fanoutLargestValueBytes = largestValueBytes
+  journal.fanoutWriteRows = rows
+  journal.fanoutWriteBytes = totalBytes
+  journal.fanoutLargestWriteValueBytes = largestValueBytes
+}
+
+function boundedFanoutValueBytes(values: readonly unknown[]): number {
+  let totalBytes = 0
+  let largestValueBytes = 0
+  for (const value of values) {
+    if (value === undefined) continue
+    const valueBytes = estimateStoredValueBytes(value)
+    totalBytes = saturatingCount(totalBytes, valueBytes)
+    largestValueBytes = Math.max(largestValueBytes, valueBytes)
+  }
+  return Math.max(0, totalBytes - largestValueBytes)
 }
 
 function recordReadConflictKeys(

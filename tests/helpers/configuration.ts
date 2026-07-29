@@ -1,6 +1,5 @@
 import type { Transaction } from 'dexie'
 import type {
-  Chat,
   ChatPreset,
   ChatSettings,
   ConnectionProfile,
@@ -21,7 +20,6 @@ import { executeConfigurationCommand } from '../../src/store/configuration-comma
 import {
   buildConnectionProfile,
   type ConfigurationProfileDraftInput,
-  chatConfigurationTargetResourceNames,
 } from '../../src/store/configuration-domain-contract'
 import { getDb } from '../../src/store/db'
 import {
@@ -38,23 +36,6 @@ const TEST_PROMPT_PRESET_WRITE_PLAN = physicalTransactionPlan(
   physicalStorageTables('promptPresets'),
   CONFIGURATION_PROMPT_PRESET_CATALOG_TRANSACTION_CAPABILITY,
 )
-
-export function testChatConfigurationLinkTransition(
-  chat: Chat,
-  settings: ChatSettings = chat.settings,
-): {
-  readonly expectedResourceNames: readonly string[]
-  readonly nextResourceNames: readonly string[]
-} {
-  return {
-    expectedResourceNames: chatConfigurationTargetResourceNames(chat),
-    nextResourceNames: chatConfigurationTargetResourceNames({
-      id: chat.id,
-      settings,
-      ...(chat.presetId ? { presetId: chat.presetId } : {}),
-    }),
-  }
-}
 
 export async function createConfigurationProfile(
   input: ConfigurationProfileDraftInput,

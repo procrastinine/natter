@@ -5,9 +5,11 @@ import {
 } from '../../scripts/workspace-provider-fixture.mjs'
 import { expect, type Locator, type Page, test } from './fixtures'
 import {
+  activeWorkspaceDatabaseName,
   buildSseBody,
   clearIndexedDb,
   holdIndexedDbStoreGate,
+  readMessages,
   seedFirstRun,
   seedLinearChat,
   sendMessage,
@@ -76,7 +78,7 @@ test('opening Appearance settings does not reapply the default chat width', asyn
     .toBe('1280px')
 })
 
-test('send and regenerate keep the transcript mounted while the branch window reloads', async ({
+test('send, regenerate, and continue keep the transcript mounted while readiness settles', async ({
   page,
 }) => {
   let requestCount = 0
@@ -105,7 +107,12 @@ test('send and regenerate keep the transcript mounted while the branch window re
       markRegenerateRequested()
       await regenerateGate
     }
-    const text = requestCount === 1 ? 'sent answer' : 'regenerated answer'
+    const text =
+      requestCount === 1
+        ? 'sent answer'
+        : requestCount === 2
+          ? 'regenerated answer'
+          : 'continued answer'
     await route.fulfill({
       contentType: 'text/event-stream',
       body: buildSseBody([
@@ -130,45 +137,41 @@ test('send and regenerate keep the transcript mounted while the branch window re
   await expect.poll(() => page.locator('[data-ui="message"]').count()).toBeGreaterThanOrEqual(10)
 
   await startMessageCountRecorder(page)
-  let appendedUserId: string
-  let appendedAssistantId: string
   const releaseSendStorage = await holdIndexedDbStoreGate(page, ['messages'])
   try {
     await sendMessage(page, 'new prompt')
-    const appendedUser = page.locator('[data-ui="message"][data-role="user"]').last()
-    const appendedAssistant = page.locator('[data-ui="message"][data-role="assistant"]').last()
-    await expect(appendedUser).toContainText('new prompt')
-    await expect(appendedAssistant).toBeVisible()
-    const userId = await appendedUser.getAttribute('data-message-id')
-    const assistantId = await appendedAssistant.getAttribute('data-message-id')
-    if (!userId || !assistantId) throw new Error('Send target has no message id')
-    appendedUserId = userId
-    appendedAssistantId = assistantId
-    await page.evaluate(
-      ({ userId: currentUserId, assistantId: currentAssistantId }) => {
-        const win = window as typeof window & {
-          __appendedMessageNodes?: Record<string, Element>
-        }
-        const user = document.querySelector(
-          `[data-ui="message"][data-message-id="${currentUserId}"]`,
-        )
-        const assistant = document.querySelector(
-          `[data-ui="message"][data-message-id="${currentAssistantId}"]`,
-        )
-        if (!user || !assistant) throw new Error('Appended send rows are not mounted')
-        win.__appendedMessageNodes = { user, assistant }
-      },
-      { userId, assistantId },
+    await expect(page.getByRole('button', { name: 'Cancel preparing' })).toBeEnabled()
+    await expect(page.locator('[data-ui="message"][data-role="user"]').last()).toContainText(
+      'window message 22',
     )
+    await expect(page.locator('[data-ui="message-list"]')).not.toHaveAttribute('inert')
     expect(requestCount).toBe(0)
   } finally {
     await releaseSendStorage()
   }
-  try {
-    await sendRequested
-  } finally {
-    releaseSend()
-  }
+  await sendRequested
+  const appendedUser = page.locator('[data-ui="message"][data-role="user"]').last()
+  const appendedAssistant = page.locator('[data-ui="message"][data-role="assistant"]').last()
+  await expect(appendedUser).toContainText('new prompt')
+  await expect(appendedAssistant).toBeVisible()
+  const userId = await appendedUser.getAttribute('data-message-id')
+  const assistantId = await appendedAssistant.getAttribute('data-message-id')
+  if (!userId || !assistantId) throw new Error('Send target has no message id')
+  await page.evaluate(
+    ({ userId: currentUserId, assistantId: currentAssistantId }) => {
+      const win = window as typeof window & {
+        __appendedMessageNodes?: Record<string, Element>
+      }
+      const user = document.querySelector(`[data-ui="message"][data-message-id="${currentUserId}"]`)
+      const assistant = document.querySelector(
+        `[data-ui="message"][data-message-id="${currentAssistantId}"]`,
+      )
+      if (!user || !assistant) throw new Error('Appended send rows are not mounted')
+      win.__appendedMessageNodes = { user, assistant }
+    },
+    { userId, assistantId },
+  )
+  releaseSend()
   await expect(
     page.locator('[data-ui="message"]').last().locator('[data-ui="message-body"]'),
   ).toContainText('sent answer')
@@ -187,7 +190,7 @@ test('send and regenerate keep the transcript mounted while the branch window re
             win.__appendedMessageNodes?.assistant,
         }
       },
-      { userId: appendedUserId, assistantId: appendedAssistantId },
+      { userId, assistantId },
     ),
   ).toEqual({ user: true, assistant: true })
   expect(await stopMessageCountRecorder(page)).toEqual({
@@ -225,7 +228,6 @@ test('send and regenerate keep the transcript mounted while the branch window re
     win.__tailAssistantObserver.observe(document.body, { childList: true, subtree: true })
     sample()
   })
-  let regeneratedId: string
   const releaseRegenerateStorage = await holdIndexedDbStoreGate(page, ['messages'])
   try {
     await page
@@ -233,57 +235,61 @@ test('send and regenerate keep the transcript mounted while the branch window re
       .last()
       .locator('[data-action="regenerate"]')
       .click()
-    const regeneratedMessage = page.locator('[data-ui="message"][data-role="assistant"]').last()
-    await expect
-      .poll(() => regeneratedMessage.getAttribute('data-message-id'))
-      .not.toBe(previousAssistantId)
-    const activeRegeneratedId = await regeneratedMessage.getAttribute('data-message-id')
-    if (!activeRegeneratedId) throw new Error('Regenerate stream has no target message')
-    regeneratedId = activeRegeneratedId
-    await page.evaluate((messageId) => {
-      const win = window as typeof window & { __regeneratedMessageNode?: Element }
-      const message = document.querySelector(`[data-ui="message"][data-message-id="${messageId}"]`)
-      if (!message) throw new Error('Regenerated row is not mounted')
-      win.__regeneratedMessageNode = message
-    }, regeneratedId)
-    await expect(
-      page.locator(`[data-ui="message"][data-message-id="${regeneratedId}"]`),
-    ).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Cancel preparing' })).toBeEnabled()
     await expect(
       page.locator(`[data-ui="message"][data-message-id="${previousAssistantId}"]`),
-    ).toHaveCount(0)
-    await expect(
-      page.locator(
-        `[data-ui="message"][data-message-id="${regeneratedId}"] [data-ui="branch-count"]`,
-      ),
-    ).toHaveText('2 / 2')
+    ).toBeVisible()
     await expect
       .poll(() => page.evaluate(() => window.location.hash))
-      .toBe(`#/chat/${chatId}/message/${regeneratedId}`)
+      .toBe(`#/chat/${chatId}/message/${previousAssistantId}`)
     await expect(page.locator('[data-ui="surface-loading"]')).toHaveCount(0)
     await expect(page.locator('[data-ui="message-list"]')).not.toHaveAttribute('inert')
-    await page.evaluate(
-      () =>
-        new Promise<void>((resolve) =>
-          requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
-        ),
-    )
-    const tailSamples = await page.evaluate(() => {
-      const win = window as typeof window & { __tailAssistantSamples?: string[] }
-      return win.__tailAssistantSamples ?? []
-    })
-    const firstRegenerated = tailSamples.indexOf(regeneratedId)
-    expect(firstRegenerated).toBeGreaterThanOrEqual(0)
-    expect(tailSamples.slice(firstRegenerated)).not.toContain(previousAssistantId)
     expect(requestCount).toBe(1)
   } finally {
     await releaseRegenerateStorage()
   }
-  try {
-    await regenerateRequested
-  } finally {
-    releaseRegenerate()
-  }
+  await regenerateRequested
+  const regeneratedMessage = page.locator('[data-ui="message"][data-role="assistant"]').last()
+  await expect
+    .poll(() => regeneratedMessage.getAttribute('data-message-id'))
+    .not.toBe(previousAssistantId)
+  const activeRegeneratedId = await regeneratedMessage.getAttribute('data-message-id')
+  if (!activeRegeneratedId) throw new Error('Regenerate stream has no target message')
+  const regeneratedId = activeRegeneratedId
+  await page.evaluate((messageId) => {
+    const win = window as typeof window & { __regeneratedMessageNode?: Element }
+    const message = document.querySelector(`[data-ui="message"][data-message-id="${messageId}"]`)
+    if (!message) throw new Error('Regenerated row is not mounted')
+    win.__regeneratedMessageNode = message
+  }, regeneratedId)
+  await expect(
+    page.locator(`[data-ui="message"][data-message-id="${regeneratedId}"]`),
+  ).toBeVisible()
+  await expect(
+    page.locator(`[data-ui="message"][data-message-id="${previousAssistantId}"]`),
+  ).toHaveCount(0)
+  await expect(
+    page.locator(
+      `[data-ui="message"][data-message-id="${regeneratedId}"] [data-ui="branch-count"]`,
+    ),
+  ).toHaveText('2 / 2')
+  await expect
+    .poll(() => page.evaluate(() => window.location.hash))
+    .toBe(`#/chat/${chatId}/message/${regeneratedId}`)
+  await page.evaluate(
+    () =>
+      new Promise<void>((resolve) =>
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+      ),
+  )
+  const pendingTailSamples = await page.evaluate(() => {
+    const win = window as typeof window & { __tailAssistantSamples?: string[] }
+    return win.__tailAssistantSamples ?? []
+  })
+  const firstPendingRegenerated = pendingTailSamples.indexOf(regeneratedId)
+  expect(firstPendingRegenerated).toBeGreaterThanOrEqual(0)
+  expect(pendingTailSamples.slice(firstPendingRegenerated)).not.toContain(previousAssistantId)
+  releaseRegenerate()
   await expect(
     page.locator(
       `[data-ui="message"][data-message-id="${regeneratedId}"] [data-ui="message-body"]`,
@@ -328,6 +334,31 @@ test('send and regenerate keep the transcript mounted while the branch window re
     minimumMessageCount: expect.any(Number),
   })
   expect(requestCount).toBe(2)
+
+  const continuedMessage = page.locator(`[data-ui="message"][data-message-id="${regeneratedId}"]`)
+  const continueButton = continuedMessage.locator('[data-action="continue"]')
+  const releaseContinueStorage = await holdIndexedDbStoreGate(page, ['messages'])
+  try {
+    await continueButton.click()
+    await expect(continueButton).toBeEnabled()
+    await expect(page.getByRole('button', { name: 'Cancel preparing' })).toBeEnabled()
+    await expect(continuedMessage).toBeVisible()
+    await expect(continuedMessage.locator('[data-ui="branch-count"]')).toHaveText('2 / 2')
+    await expect
+      .poll(() => page.evaluate(() => window.location.hash))
+      .toBe(`#/chat/${chatId}/message/${regeneratedId}`)
+    expect(requestCount).toBe(2)
+  } finally {
+    await releaseContinueStorage()
+  }
+  await expect.poll(() => requestCount).toBe(3)
+  await expect(continuedMessage.locator('[data-ui="message-body"]')).toContainText(
+    'continued answer',
+  )
+  await expect(continuedMessage.locator('[data-ui="branch-count"]')).toHaveText('2 / 2')
+  await expect
+    .poll(() => page.evaluate(() => window.location.hash))
+    .toBe(`#/chat/${chatId}/message/${regeneratedId}`)
 })
 
 test('trailing-user Reply appends without replacing the mounted transcript prefix', async ({
@@ -460,6 +491,210 @@ test('branch swipe preserves common-prefix DOM identity without loading or blank
   expect(continuity.messageCountsIncludeZero).toBe(false)
   expect(continuity.minimumBranchControlCount).toBeGreaterThan(0)
   await expect(messages).toHaveCount(3)
+})
+
+test('retained imported rows repeatedly own Save & Send and delete across branch resolution', async ({
+  page,
+}) => {
+  let requestCount = 0
+  await page.route('**/api/v1/chat/completions', async (route) => {
+    requestCount += 1
+    const responseNumber = requestCount
+    await route.fulfill({
+      contentType: 'text/event-stream',
+      body: buildSseBody([
+        {
+          id: `retained-imported-row-${responseNumber}`,
+          content: `retained row answer ${responseNumber}`,
+        },
+        { finish: 'stop' },
+      ]),
+    })
+  })
+  const fixture = await seedBranchedChat(page)
+  await page.goto(`/#/chat/${fixture.chatId}/message/${fixture.messageIdMap.A2}`)
+  await page.reload()
+
+  const messages = page.locator('[data-ui="message"][data-message-id]')
+  await expect(messages).toHaveCount(3)
+  const retainedUser = page.locator(
+    `[data-ui="message"][data-message-id="${fixture.messageIdMap.A1}"]`,
+  )
+  let replacement = page.locator('[data-ui="message"][data-role="user"]').filter({
+    hasText: 'replacement not created',
+  })
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    if (attempt > 1) {
+      await replacement.getByLabel('First variant').click()
+      await expect(retainedUser).toContainText('branch A user')
+    }
+    await expect(retainedUser.locator('[data-ui="branch-controls"]')).toContainText(
+      `1 / ${attempt + 1}`,
+    )
+    await expect(retainedUser.getByRole('button', { name: 'Edit message' })).toBeEnabled()
+    await expect(retainedUser.getByRole('button', { name: 'Delete message' })).toBeEnabled()
+    await retainedUser.getByRole('button', { name: 'Edit message' }).click()
+    await expect(retainedUser.locator('[data-ui="inline-editor-input"]')).toBeVisible()
+    await retainedUser
+      .locator('[data-ui="inline-editor-input"]')
+      .fill(`retained imported replacement ${attempt}`)
+    const releaseMessages = await holdIndexedDbStoreGate(page, ['messages'])
+    try {
+      await retainedUser.getByLabel('Next variant').click()
+      await expect(page.locator('[data-ui="message-list"]')).toHaveAttribute(
+        'data-presentation-only',
+        'true',
+      )
+      await expect(retainedUser.locator('[data-ui="branch-controls"]')).toBeVisible()
+      const saveAndSend = retainedUser.getByRole('button', { name: 'Save & Send' })
+      await expect(saveAndSend).toBeEnabled()
+      await saveAndSend.click()
+      await expect(saveAndSend).toBeEnabled()
+      await expect(retainedUser.locator('[data-ui="inline-editor"]')).toHaveAttribute(
+        'aria-busy',
+        'true',
+      )
+      await expect(retainedUser.locator('[data-ui="inline-editor-generation-error"]')).toHaveCount(
+        0,
+      )
+      expect(requestCount).toBe(attempt - 1)
+    } finally {
+      await releaseMessages()
+    }
+
+    await expect(
+      page
+        .locator('[data-ui="message"][data-role="assistant"]')
+        .filter({ hasText: `retained row answer ${attempt}` }),
+    ).toBeVisible()
+    expect(requestCount).toBe(attempt)
+    replacement = page
+      .locator('[data-ui="message"][data-role="user"]')
+      .filter({ hasText: `retained imported replacement ${attempt}` })
+    await expect(replacement).toBeVisible()
+    await expect(replacement.locator('[data-ui="branch-controls"]')).toContainText(
+      `${attempt + 2} / ${attempt + 2}`,
+    )
+  }
+
+  const replacementId = await replacement.getAttribute('data-message-id')
+  if (!replacementId) throw new Error('Retained Save & Send replacement has no message id')
+  const releaseDeleteStorage = await holdIndexedDbStoreGate(page, ['messages'])
+  try {
+    await replacement.getByLabel('First variant').click()
+    await expect(page.locator('[data-ui="message-list"]')).toHaveAttribute(
+      'data-presentation-only',
+      'true',
+    )
+    await expect(replacement.getByRole('button', { name: 'Delete message' })).toBeEnabled()
+    await replacement.getByRole('button', { name: 'Delete message' }).click()
+    await page.getByRole('button', { name: 'Delete', exact: true }).click()
+    const cancelDelete = replacement.getByRole('button', {
+      name: 'Cancel conversation update',
+    })
+    await expect(cancelDelete).toBeEnabled()
+    await cancelDelete.click()
+  } finally {
+    await releaseDeleteStorage()
+  }
+  await expect(retainedUser).toContainText('branch A user')
+  await expect
+    .poll(async () => {
+      const row = (await readMessages(page, fixture.chatId)).find(
+        (message) => message.id === replacementId,
+      )
+      return row?.deleted === true
+    })
+    .toBe(false)
+  await retainedUser.getByLabel('Last variant').click()
+  await expect(replacement).toBeVisible()
+  await expect(replacement.locator('[data-ui="branch-controls"]')).toContainText('5 / 5')
+  await replacement.getByRole('button', { name: 'Delete message' }).click()
+  await page.getByRole('button', { name: 'Delete', exact: true }).click()
+  await expect(replacement).toHaveCount(0)
+
+  const databaseName = await activeWorkspaceDatabaseName(page)
+  await expect
+    .poll(() =>
+      page.evaluate(
+        async ({ databaseName, replacementId }) => {
+          const database = await new Promise<IDBDatabase>((resolve, reject) => {
+            const request = indexedDB.open(databaseName)
+            request.onsuccess = () => resolve(request.result)
+            request.onerror = () => reject(request.error)
+          })
+          try {
+            return await new Promise<boolean>((resolve, reject) => {
+              const request = database
+                .transaction('messages', 'readonly')
+                .objectStore('messages')
+                .get(replacementId)
+              request.onsuccess = () =>
+                resolve((request.result as { deleted?: unknown } | undefined)?.deleted === true)
+              request.onerror = () => reject(request.error)
+            })
+          } finally {
+            database.close()
+          }
+        },
+        { databaseName, replacementId },
+      ),
+    )
+    .toBe(true)
+})
+
+test('cancelling queued Save & Send preserves the imported edit and releases its owner', async ({
+  page,
+}) => {
+  let requestCount = 0
+  await page.route('**/api/v1/chat/completions', async (route) => {
+    requestCount += 1
+    await route.fulfill({
+      contentType: 'text/event-stream',
+      body: buildSseBody([
+        { id: 'cancelled-save-send-retry', content: 'retry completed once' },
+        { finish: 'stop' },
+      ]),
+    })
+  })
+  const fixture = await seedBranchedChat(page)
+  await page.goto(`/#/chat/${fixture.chatId}/message/${fixture.messageIdMap.A2}`)
+  const importedUser = page.locator(
+    `[data-ui="message"][data-message-id="${fixture.messageIdMap.A1}"]`,
+  )
+  const beforeCount = (await readMessages(page, fixture.chatId)).length
+
+  await importedUser.getByRole('button', { name: 'Edit message' }).click()
+  const edit = importedUser.locator('[data-ui="inline-editor-input"]')
+  await edit.fill('cancel this queued imported replacement')
+  const releaseMessages = await holdIndexedDbStoreGate(page, ['messages'])
+  try {
+    await importedUser.getByRole('button', { name: 'Save & Send' }).click()
+    const cancelPreparing = importedUser.getByRole('button', { name: 'Cancel preparing' })
+    await expect(cancelPreparing).toBeEnabled()
+    await cancelPreparing.click()
+    await expect(edit).toHaveValue('cancel this queued imported replacement')
+    await expect(importedUser.locator('[data-ui="inline-editor-generation-error"]')).toContainText(
+      'cancelled',
+    )
+    expect(requestCount).toBe(0)
+  } finally {
+    await releaseMessages()
+  }
+
+  await expect(importedUser.getByRole('button', { name: 'Save & Send' })).toBeEnabled()
+  await expect
+    .poll(async () => {
+      return (await readMessages(page, fixture.chatId)).length
+    })
+    .toBe(beforeCount)
+  await importedUser.getByRole('button', { name: 'Save & Send' }).click()
+  await expect(
+    page.locator('[data-ui="message"][data-role="assistant"]').filter({
+      hasText: 'retry completed once',
+    }),
+  ).toBeVisible()
+  expect(requestCount).toBe(1)
 })
 
 test('switching message variants re-renders the selected branch window', async ({ page }) => {

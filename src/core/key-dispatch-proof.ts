@@ -30,20 +30,6 @@ export function keyDispatchRevisions(
   )
 }
 
-export function keyDispatchRevisionsEqual(
-  left: readonly KeyDispatchRevision[],
-  right: readonly KeyDispatchRevision[],
-): boolean {
-  return (
-    left.length === right.length &&
-    left.every(
-      (revision, index) =>
-        revision.keyId === right[index]?.keyId &&
-        revision.materialRevision === right[index].materialRevision,
-    )
-  )
-}
-
 export function keyDispatchProof(record: KeyRecord): Readonly<KeyDispatchProof> {
   return Object.freeze({
     keyId: record.id,

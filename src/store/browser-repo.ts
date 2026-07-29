@@ -1,5 +1,5 @@
 import Dexie, { type IndexableTypePart, type Table, type Transaction } from 'dexie'
-import type { ActiveBranchForkTarget } from '../core/active-branch-spine'
+import type { ActiveBranchForkTarget, ActiveBranchIntentTarget } from '../core/active-branch-spine'
 import { compareLiveLeafRecency, findLastUpdatedLeafId } from '../core/active-path'
 import { messageRenderableTextSemanticsEqual } from '../core/branch-flatten'
 import { type BranchPathWindow, readLiveBranchPath } from '../core/branch-session'
@@ -28,12 +28,13 @@ import { customImageOriginsFromStored, IMAGE_ALLOWLIST_KEY } from '../core/image
 import { keyDispatchProof, keyDispatchRevisions } from '../core/key-dispatch-proof'
 import { treeParentKey } from '../core/message-tree-index'
 import {
-  type ConversationDestinationPoint,
+  type ConversationDestinationHeaderPoint,
   type ConversationSelectionProofTarget,
   fixedConversationSelectionTarget,
   type MessageEditPreflightReader,
   type MessageMutationRepository,
   type MessageStructurePreflightReader,
+  resolvingConversationSelectionTarget,
 } from '../core/messages'
 import {
   normalizeRenderingPreferences,
@@ -121,8 +122,13 @@ import {
   readSidebarRowsById,
 } from './browser-catalog-queries'
 import {
-  type AttachmentReferenceStateFact,
+  BROWSER_COMMAND_DIRECT_FANOUT_BUDGET,
   type BrowserCommandFanoutBudget,
+  type BrowserCommandFanoutBudgetExceededError,
+  isBrowserCommandFanoutBudgetExceededError,
+} from './browser-command-fanout-budget'
+import {
+  type AttachmentReferenceStateFact,
   type BrowserCommandMessageRevisionFact,
   type BrowserCommandMutationFacts,
   type BrowserCommandPhysicalMutation,
@@ -130,7 +136,6 @@ import {
   type BrowserCommandReadConflictScope,
   INTERNAL_ATTACHMENT_INTEGRITY_MAINTENANCE,
   INTERNAL_DISCOVERY_CACHE_MAINTENANCE,
-  isBrowserCommandFanoutBudgetExceededError,
   recordBrowserCommandInvalidation,
   recordBrowserCommandStorageRetentionMutation,
   runBrowserCommandTransaction,
@@ -150,14 +155,11 @@ import {
   type ValidatedGenerationPromptPathHeaders,
 } from './browser-domain-mutations'
 import type { BrowserImportExportRead } from './browser-import-export'
-import {
-  type BrowserMutationTableName,
-  GenerationPlanningSeedChangedError,
-} from './browser-mutation-plan'
+import { bindReadonlyTransactionAbort, readBulkGetPages } from './browser-indexeddb-reads'
+import type { BrowserMutationTableName } from './browser-mutation-plan'
 import {
   BODY_READ_PAGE_SIZE,
   HEADER_READ_PAGE_SIZE,
-  readBulkGetPages,
   readChatMessageHeaderPages,
   readChildHeaderPages,
   readExactMessageRowsByIdPages,
@@ -492,7 +494,6 @@ import type {
   GeneratedOutputVideoExpandResult,
   GenerationPostCommitMetadataInput,
   GenerationPostCommitMetadataResult,
-  GenerationPromptPathClaim,
   GenerationPromptPathProof,
   MessagePresentation,
   PrepareAttemptInput,
@@ -1817,21 +1818,6 @@ function throwIfReadonlyAborted(signal: AbortSignal | undefined, message: string
   if (signal?.aborted) throw new DOMException(message, 'AbortError')
 }
 
-function bindReadonlyTransactionAbort(
-  tx: Transaction,
-  signal: AbortSignal | undefined,
-  message: string,
-): () => void {
-  if (!signal) return () => undefined
-  const abort = () => tx.abort()
-  if (signal.aborted) {
-    abort()
-    throw new DOMException(message, 'AbortError')
-  }
-  signal.addEventListener('abort', abort, { once: true })
-  return () => signal.removeEventListener('abort', abort)
-}
-
 function applyMessageHeaderPatch(
   header: MessageHeaderRow,
   patch: MessageHeaderPatch | undefined,
@@ -2017,31 +2003,36 @@ async function resolveGenerationPromptPathProof(
   proof: GenerationPromptPathProof,
   path: ValidatedGenerationPromptPath,
 ): Promise<ResolvedGenerationPromptPath> {
-  const { headers } = path
   const requirement = proof.requirement
   if (requirement.surface === 'chat' && requirement.chatId !== chatId) {
-    throw new GenerationPlanningSeedChangedError(chatId)
+    throw new Error(`GenerationPromptPathChatMismatch:${chatId}`)
   }
   let targetHeader: MessageHeaderRow | undefined
   let leafId: MessageId | null = null
-  if (requirement.target.kind !== 'root') {
+  if (requirement.kind === 'send') {
+    targetHeader = path.headers.at(-1)
+    leafId = targetHeader?.id ?? null
+  } else if (requirement.target.kind !== 'root') {
     targetHeader = await ctx.getMessageHeader(requirement.target.messageId)
     if (
       !targetHeader ||
       targetHeader.chatId !== chatId ||
       targetHeader.deleted ||
-      (requirement.target.role !== 'any' && targetHeader.role !== requirement.target.role)
+      targetHeader.role !== requirement.target.role
     ) {
-      throw new GenerationPlanningSeedChangedError(chatId)
+      throw new BranchTargetUnavailableError(
+        chatId,
+        requirement.target.messageId,
+        !targetHeader
+          ? 'message-missing'
+          : targetHeader.chatId !== chatId
+            ? 'message-chat-mismatch'
+            : targetHeader.deleted
+              ? 'message-deleted'
+              : 'invalid-ancestry',
+      )
     }
     leafId = requirement.target.kind === 'exclude' ? targetHeader.parentId : targetHeader.id
-  }
-  if (
-    proof.claim.chatId !== chatId ||
-    proof.claim.leafId !== leafId ||
-    (leafId === null ? headers.length !== 0 : headers.at(-1)?.id !== leafId)
-  ) {
-    throw new GenerationPlanningSeedChangedError(chatId)
   }
   let slot: ChildListState | undefined
   if (requirement.childSlot !== 'none') {
@@ -2054,18 +2045,6 @@ async function resolveGenerationPromptPathProof(
         slot.firstLiveChildId ?? undefined,
       )
     }
-    const claimedSlot = proof.claim.placementSlot
-    if (
-      !claimedSlot ||
-      claimedSlot.parentId !== leafId ||
-      claimedSlot.slotVersion !== slot.version ||
-      claimedSlot.liveCount !== slot.liveCount ||
-      claimedSlot.nextSiblingIndex !== slot.nextSiblingIndex
-    ) {
-      throw new GenerationPlanningSeedChangedError(chatId)
-    }
-  } else if (proof.claim.placementSlot !== null) {
-    throw new GenerationPlanningSeedChangedError(chatId)
   }
   return {
     ...path,
@@ -2079,7 +2058,7 @@ function requiredPromptPathTarget(
   path: ResolvedGenerationPromptPath,
   chatId: ChatId,
 ): MessageHeaderRow {
-  if (!path.targetHeader) throw new GenerationPlanningSeedChangedError(chatId)
+  if (!path.targetHeader) throw new Error(`GenerationPromptPathTargetMissing:${chatId}`)
   return path.targetHeader
 }
 
@@ -2173,18 +2152,21 @@ function sidebarChatIdsForMutationFacts(facts: BrowserCommandMutationFacts): rea
   ].sort()
 }
 
-export const BROWSER_COMMAND_DIRECT_FANOUT_BUDGET: BrowserCommandFanoutBudget = Object.freeze({
-  maxReadRows: 64,
-  maxWriteRows: 64,
-  maxBytes: 1024 * 1024,
-})
-
 export type BrowserCommandFanoutAdmission<C extends WorkspaceCommand> =
   | {
       readonly kind: 'committed'
       readonly execution: BrowserStagedCommandExecution<C>
     }
-  | { readonly kind: 'staging-required' }
+  | {
+      readonly kind: 'staging-required'
+      readonly reason: {
+        readonly dimension: BrowserCommandFanoutBudgetExceededError['dimension']
+        readonly observed: number
+        readonly limit: number
+        readonly tableName?: string
+        readonly operation?: string
+      }
+    }
 
 class BrowserCommandCommit implements BrowserCommandSessionPort {
   private readonly committedMutationTables = new Set<string>()
@@ -2216,6 +2198,7 @@ class BrowserCommandCommit implements BrowserCommandSessionPort {
   private readonly replacementEpoch: number
   private readonly fanoutBudget: BrowserCommandFanoutBudget | undefined
   private readonly retainFullChatStates: boolean
+  private readonly signal: AbortSignal | undefined
   readonly command: WorkspaceCommand
   readonly operationKind: WorkspaceCommand['kind']
   private readonly semanticOperationKind: SemanticOperationKind
@@ -2235,6 +2218,7 @@ class BrowserCommandCommit implements BrowserCommandSessionPort {
     commandLifetimeReceipt: SemanticOperationCommandLifetimeReceipt,
     fanoutBudget?: BrowserCommandFanoutBudget,
     retainFullChatStates = true,
+    signal?: AbortSignal,
   ) {
     this.db = db
     this.lockSession = lockSession
@@ -2247,6 +2231,7 @@ class BrowserCommandCommit implements BrowserCommandSessionPort {
     this.commandLifetimeReceipt = commandLifetimeReceipt
     this.fanoutBudget = fanoutBudget
     this.retainFullChatStates = retainFullChatStates
+    this.signal = signal
   }
 
   executeSemanticOperation<Tables extends PhysicalStorageTableName, ResourceInput, Receipt, T>(
@@ -2333,10 +2318,8 @@ class BrowserCommandCommit implements BrowserCommandSessionPort {
     if (this.executionMode !== undefined || this.semanticOperationCommitted) {
       throw new Error('SemanticOperationPreflightAfterExecution')
     }
-    const result = await this.db.transaction(
-      'r',
-      plan.tableNames.map((tableName) => this.db.table(tableName)),
-      async (tx) =>
+    const result = await this.runCommandTransaction(
+      (tx) =>
         runBrowserCommandTransaction(
           tx,
           (transaction) => operation(bindFencedTransaction(transaction, plan)),
@@ -2346,6 +2329,12 @@ class BrowserCommandCommit implements BrowserCommandSessionPort {
             ...(this.fanoutBudget ? { fanoutBudget: this.fanoutBudget } : {}),
             retainFullChatStates: this.retainFullChatStates,
           },
+        ),
+      (transaction) =>
+        this.db.transaction(
+          'r',
+          plan.tableNames.map((tableName) => this.db.table(tableName)),
+          transaction,
         ),
     )
     assertPhysicalTransactionTablesDeclared(plan, result.facts.tableNames)
@@ -2369,6 +2358,37 @@ class BrowserCommandCommit implements BrowserCommandSessionPort {
           result.facts.physicalReads as readonly SemanticOperationPhysicalRead[],
         )
     return result.value
+  }
+
+  private async runCommandTransaction<T>(
+    operation: (tx: Transaction) => Promise<T> | T,
+    start: (operation: (tx: Transaction) => Promise<T>) => Promise<T>,
+  ): Promise<T> {
+    const signal = this.signal
+    signal?.throwIfAborted()
+    let activeTransaction: Transaction | null = null
+    const abortTransaction = () => {
+      if (activeTransaction?.active) activeTransaction.abort()
+    }
+    signal?.addEventListener('abort', abortTransaction, { once: true })
+    try {
+      return await start(async (tx) => {
+        activeTransaction = tx
+        if (signal?.aborted) {
+          if (tx.active) tx.abort()
+          signal.throwIfAborted()
+        }
+        const result = await operation(tx)
+        signal?.throwIfAborted()
+        return result
+      })
+    } catch (error) {
+      signal?.throwIfAborted()
+      throw error
+    } finally {
+      activeTransaction = null
+      signal?.removeEventListener('abort', abortTransaction)
+    }
   }
 
   private semanticOperationMismatch<
@@ -2443,91 +2463,94 @@ class BrowserCommandCommit implements BrowserCommandSessionPort {
       unwrap(value: RawResult): { readonly value: PublicResult; readonly receipt: Receipt }
     },
   ): Promise<PublicResult> {
-    const committed = await grant.runTransaction(this.db, plan.tableNames, async (tx) => {
-      registerPhysicalMutationTransaction(tx)
-      const result = await runBrowserCommandTransaction(
-        tx,
-        (transaction) => {
-          const fencedTransaction = bindFencedTransaction(transaction, plan)
-          return collectSemanticOperationPhysicalWrites(
-            fencedTransaction,
-            semanticOperation?.descriptor.exactPhysicalWrites?.receiptSource,
-            () => operation(fencedTransaction),
+    const committed = await this.runCommandTransaction(
+      async (tx) => {
+        registerPhysicalMutationTransaction(tx)
+        const result = await runBrowserCommandTransaction(
+          tx,
+          (transaction) => {
+            const fencedTransaction = bindFencedTransaction(transaction, plan)
+            return collectSemanticOperationPhysicalWrites(
+              fencedTransaction,
+              semanticOperation?.descriptor.exactPhysicalWrites?.receiptSource,
+              () => operation(fencedTransaction),
+            )
+          },
+          {
+            observePhysicalReads: semanticOperation?.descriptor.exactPhysicalReads !== undefined,
+            observePhysicalWrites: semanticOperation?.descriptor.exactPhysicalWrites !== undefined,
+            ...(this.fanoutBudget ? { fanoutBudget: this.fanoutBudget } : {}),
+            retainFullChatStates: this.retainFullChatStates,
+          },
+        )
+        assertPhysicalTransactionTablesDeclared(plan, result.facts.tableNames)
+        if (semanticOperation) {
+          const { descriptor, resourceInput } = semanticOperation
+          const execution = semanticOperation.unwrap(result.value.value)
+          const physicalReads = [
+            ...this.commandLifetimeReceipt.physicalReads,
+            ...result.facts.physicalReads,
+          ]
+          const observedDependencies = semanticDependenciesForMutationFacts(result.facts)
+          const hasExactReceiptSource =
+            descriptor.exactPhysicalWrites?.receiptSource === 'exact-receipt'
+          const receipt = attachSemanticOperationPhysicalIo(
+            attachSemanticOperationExactPhysicalReads(
+              execution.receipt,
+              this.commandLifetimeReceipt.exactPhysicalReads,
+            ),
+            result.value.fragment,
+            physicalReads,
+            hasExactReceiptSource ? observedDependencies : [],
+            hasExactReceiptSource ? result.facts.physicalMutations : [],
           )
-        },
-        {
-          observePhysicalReads: semanticOperation?.descriptor.exactPhysicalReads !== undefined,
-          observePhysicalWrites: semanticOperation?.descriptor.exactPhysicalWrites !== undefined,
-          ...(this.fanoutBudget ? { fanoutBudget: this.fanoutBudget } : {}),
-          retainFullChatStates: this.retainFullChatStates,
-        },
-      )
-      assertPhysicalTransactionTablesDeclared(plan, result.facts.tableNames)
-      if (semanticOperation) {
-        const { descriptor, resourceInput } = semanticOperation
-        const execution = semanticOperation.unwrap(result.value.value)
-        const physicalReads = [
-          ...this.commandLifetimeReceipt.physicalReads,
-          ...result.facts.physicalReads,
-        ]
-        const observedDependencies = semanticDependenciesForMutationFacts(result.facts)
-        const hasExactReceiptSource =
-          descriptor.exactPhysicalWrites?.receiptSource === 'exact-receipt'
-        const receipt = attachSemanticOperationPhysicalIo(
-          attachSemanticOperationExactPhysicalReads(
-            execution.receipt,
-            this.commandLifetimeReceipt.exactPhysicalReads,
-          ),
-          result.value.fragment,
-          physicalReads,
-          hasExactReceiptSource ? observedDependencies : [],
-          hasExactReceiptSource ? result.facts.physicalMutations : [],
-        )
-        const tableNames = new Set(result.facts.tableNames)
-        const didMutateStorage = result.facts.successfulMutations > 0
-        assertSemanticOperationReplay(descriptor, resourceInput, receipt)
-        assertSemanticOperationWrites(descriptor, tableNames, didMutateStorage)
-        assertSemanticOperationEffectKinds(
-          descriptor,
-          semanticEffectKindsForMutationFacts(result.facts),
-          tableNames,
-          didMutateStorage,
-        )
-        assertSemanticOperationExactInvalidations(
-          descriptor,
-          resourceInput,
-          observedDependencies,
-          didMutateStorage,
-          receipt,
-        )
-        assertSemanticOperationExactPhysicalMutations(
-          descriptor,
-          resourceInput,
-          result.facts.physicalMutations,
-          result.facts.successfulMutations,
-          receipt,
-        )
-        assertSemanticOperationExactPhysicalReads(
-          descriptor,
-          resourceInput,
-          physicalReads,
-          true,
-          receipt,
-        )
-        assertSemanticOperationExactPhysicalWrites(
-          descriptor,
-          resourceInput,
-          result.facts.physicalWrites,
-          true,
-          receipt,
-        )
-        return { value: execution.value, facts: result.facts }
-      }
-      return {
-        value: result.value.value as unknown as PublicResult,
-        facts: result.facts,
-      }
-    })
+          const tableNames = new Set(result.facts.tableNames)
+          const didMutateStorage = result.facts.successfulMutations > 0
+          assertSemanticOperationReplay(descriptor, resourceInput, receipt)
+          assertSemanticOperationWrites(descriptor, tableNames, didMutateStorage)
+          assertSemanticOperationEffectKinds(
+            descriptor,
+            semanticEffectKindsForMutationFacts(result.facts),
+            tableNames,
+            didMutateStorage,
+          )
+          assertSemanticOperationExactInvalidations(
+            descriptor,
+            resourceInput,
+            observedDependencies,
+            didMutateStorage,
+            receipt,
+          )
+          assertSemanticOperationExactPhysicalMutations(
+            descriptor,
+            resourceInput,
+            result.facts.physicalMutations,
+            result.facts.successfulMutations,
+            receipt,
+          )
+          assertSemanticOperationExactPhysicalReads(
+            descriptor,
+            resourceInput,
+            physicalReads,
+            true,
+            receipt,
+          )
+          assertSemanticOperationExactPhysicalWrites(
+            descriptor,
+            resourceInput,
+            result.facts.physicalWrites,
+            true,
+            receipt,
+          )
+          return { value: execution.value, facts: result.facts }
+        }
+        return {
+          value: result.value.value as unknown as PublicResult,
+          facts: result.facts,
+        }
+      },
+      (transaction) => grant.runTransaction(this.db, plan.tableNames, transaction),
+    )
     this.recordCommittedMutationFacts(committed.facts)
     return committed.value
   }
@@ -4495,6 +4518,7 @@ async function newestLiveLeafIdInTransaction(
   const messages = tx.table<MessageHeaderRow, MessageId>('messages')
   const childLists = tx.table<ChildListState, string>('childLists')
   const prefixRange = exactCompoundPrefixBetween([chatId])
+  const pageSize = BROWSER_COMMAND_DIRECT_FANOUT_BUDGET.maxReadRequestRows
   let before: readonly [number, MessageId] | undefined
   for (;;) {
     const page = await messages
@@ -4506,7 +4530,7 @@ async function newestLiveLeafIdInTransaction(
         false,
       )
       .reverse()
-      .limit(HEADER_READ_PAGE_SIZE)
+      .limit(pageSize)
       .toArray()
     if (page.length === 0) return null
     const live = page.filter((header) => !header.deleted)
@@ -4518,7 +4542,7 @@ async function newestLiveLeafIdInTransaction(
     }
     const last = page.at(-1) as MessageHeaderRow
     before = [last.createdAt, last.id]
-    if (page.length < HEADER_READ_PAGE_SIZE) return null
+    if (page.length < pageSize) return null
   }
 }
 
@@ -4563,68 +4587,228 @@ async function readBranchPathInTransaction(
   return result.rows.map(cloneMessageHeader)
 }
 
-function assertGenerationPromptPathClaimStructure(
-  chatId: ChatId,
-  claim: GenerationPromptPathClaim,
-): void {
-  let parentId: MessageId | null = null
-  for (const header of claim.headers) {
-    if (header.parentId !== parentId) {
-      throw new GenerationPlanningSeedChangedError(chatId)
-    }
-    parentId = header.messageId
-  }
-}
-
-async function validateGenerationPromptPathClaim(
+async function readCurrentGenerationPromptPathFromHint(
   tx: Transaction,
   chatId: ChatId,
-  claim: GenerationPromptPathClaim,
+  leafId: MessageId | null,
+  proof: GenerationPromptPathProof,
+): Promise<MessageHeaderRow[] | null> {
+  const hint = proof.pathHint.headers
+  if (leafId === null) return hint.length === 0 ? [] : null
+  if (hint.length === 0 || hint.at(-1)?.messageId !== leafId) return null
+  const ids = hint.map((header) => header.messageId)
+  if (new Set(ids).size !== ids.length) return null
+  const rows = await readBulkGetPages(tx.table<MessageHeaderRow, MessageId>('messages'), ids, {
+    maxRows: HEADER_READ_PAGE_SIZE,
+  })
+  let parentId: MessageId | null = null
+  const current: MessageHeaderRow[] = []
+  for (let index = 0; index < rows.length; index += 1) {
+    const row = rows[index]
+    if (
+      !row ||
+      row.id !== ids[index] ||
+      row.chatId !== chatId ||
+      row.deleted ||
+      row.parentId !== parentId
+    ) {
+      return null
+    }
+    current.push(cloneMessageHeader(row))
+    parentId = row.id
+  }
+  return current
+}
+
+async function resolveGenerationPromptPath(
+  tx: Transaction,
+  chatId: ChatId,
+  proof: GenerationPromptPathProof,
 ): Promise<ValidatedGenerationPromptPath> {
-  if (claim.chatId !== chatId) throw new GenerationPlanningSeedChangedError(chatId)
-  if (claim.leafId === null) {
-    if (claim.headers.length !== 0) throw new GenerationPlanningSeedChangedError(chatId)
+  const table = tx.table<MessageHeaderRow, MessageId>('messages')
+  const requirement = proof.requirement
+  if (requirement.surface === 'chat' && requirement.chatId !== chatId) {
+    throw new Error(`GenerationPromptPathChatMismatch:${chatId}`)
+  }
+  if (requirement.kind === 'send') {
+    const headers = await resolveGenerationSendPathInTransaction(
+      tx,
+      chatId,
+      requirement.target,
+      proof,
+    )
     return Object.freeze({
-      headers: sealValidatedGenerationPromptPathHeaders([]),
-      messageProofs: claim.headers,
+      headers: sealValidatedGenerationPromptPathHeaders(headers),
+      messageProofs: Object.freeze(headers.map(generationMessageReadProofFromHeader)),
     })
   }
-  if (claim.headers.at(-1)?.messageId !== claim.leafId) {
-    throw new GenerationPlanningSeedChangedError(chatId)
-  }
-  assertGenerationPromptPathClaimStructure(chatId, claim)
-  const table = tx.table<MessageHeaderRow, MessageId>('messages')
-  const validated: MessageHeaderRow[] = []
-  for (let offset = 0; offset < claim.headers.length; offset += HEADER_READ_PAGE_SIZE) {
-    const pageLength = Math.min(HEADER_READ_PAGE_SIZE, claim.headers.length - offset)
-    const ids = new Array<MessageId>(pageLength)
-    for (let index = 0; index < pageLength; index += 1) {
-      const expected = claim.headers[offset + index]
-      if (!expected) throw new GenerationPlanningSeedChangedError(chatId)
-      ids[index] = expected.messageId
+  let leafId: MessageId | null = null
+  if (requirement.target.kind === 'include') {
+    leafId = requirement.target.messageId
+  } else if (requirement.target.kind === 'exclude') {
+    const target = await table.get(requirement.target.messageId)
+    if (
+      !target ||
+      target.chatId !== chatId ||
+      target.deleted ||
+      target.role !== requirement.target.role
+    ) {
+      throw new BranchTargetUnavailableError(
+        chatId,
+        requirement.target.messageId,
+        !target
+          ? 'message-missing'
+          : target.chatId !== chatId
+            ? 'message-chat-mismatch'
+            : target.deleted
+              ? 'message-deleted'
+              : 'invalid-ancestry',
+      )
     }
-    const rows = await table.bulkGet(ids)
-    for (let index = 0; index < pageLength; index += 1) {
-      const expected = claim.headers[offset + index]
-      const row = rows[index]
-      if (
-        !row ||
-        !expected ||
-        row.id !== expected.messageId ||
-        row.chatId !== chatId ||
-        row.deleted ||
-        row.parentId !== expected.parentId ||
-        row.requestContextVersion !== expected.requestContextVersion
-      ) {
-        throw new GenerationPlanningSeedChangedError(chatId)
-      }
-      validated.push(row)
+    leafId = target.parentId
+  }
+  const headers =
+    (await readCurrentGenerationPromptPathFromHint(tx, chatId, leafId, proof)) ??
+    (await readBranchPathInTransaction(tx, chatId, leafId))
+  if (requirement.target.kind === 'include') {
+    const target = headers.at(-1)
+    if (
+      !target ||
+      target.id !== requirement.target.messageId ||
+      target.role !== requirement.target.role
+    ) {
+      throw new BranchTargetUnavailableError(
+        chatId,
+        requirement.target.messageId,
+        'invalid-ancestry',
+      )
     }
   }
   return Object.freeze({
-    headers: sealValidatedGenerationPromptPathHeaders(validated),
-    messageProofs: claim.headers,
+    headers: sealValidatedGenerationPromptPathHeaders(headers),
+    messageProofs: Object.freeze(headers.map(generationMessageReadProofFromHeader)),
   })
+}
+
+async function resolveGenerationSendPathInTransaction(
+  tx: Transaction,
+  chatId: ChatId,
+  target: ActiveBranchIntentTarget,
+  proof: GenerationPromptPathProof,
+): Promise<MessageHeaderRow[]> {
+  if (target.kind === 'fixed') {
+    const headers =
+      (await readCurrentGenerationPromptPathFromHint(tx, chatId, target.messageId, proof)) ??
+      (await readBranchPathInTransaction(tx, chatId, target.messageId))
+    if (target.messageId !== null && headers.at(-1)?.id !== target.messageId) {
+      throw new BranchTargetUnavailableError(chatId, target.messageId, 'invalid-ancestry')
+    }
+    return headers
+  }
+  const selection = target.selection
+  const chat = await tx.table<Chat, ChatId>('chats').get(chatId)
+  if (!chat) throw new ChatMissingError(chatId)
+  if (selection.kind === 'default') {
+    return readBranchPathInTransaction(tx, chatId, chat.lastUpdatedLeafId)
+  }
+  if (selection.kind === 'tip') {
+    return readBranchPathInTransaction(tx, chatId, selection.messageId)
+  }
+  const selectedId =
+    selection.kind === 'message'
+      ? selection.messageId
+      : await readActiveBranchChildAtPositionInTransaction(
+          tx,
+          chatId,
+          selection.parentId,
+          selection.position,
+        )
+  if (!selectedId) {
+    throw new BranchTargetUnavailableError(chatId, chatId, 'invalid-ancestry')
+  }
+  const selected = await tx.table<MessageHeaderRow, MessageId>('messages').get(selectedId)
+  if (!selected || selected.chatId !== chatId || selected.deleted) {
+    throw new BranchTargetUnavailableError(
+      chatId,
+      selectedId,
+      !selected
+        ? 'message-missing'
+        : selected.chatId !== chatId
+          ? 'message-chat-mismatch'
+          : 'message-deleted',
+    )
+  }
+  const observedTipId = selection.observedTipId
+  if (observedTipId) {
+    const observedPath = await readGenerationSelectionCandidatePath(
+      tx,
+      chatId,
+      selectedId,
+      observedTipId,
+    )
+    if (observedPath) return observedPath
+  }
+  const selectedChildren = await tx
+    .table<ChildListState, string>('childLists')
+    .get(childListKey(chatId, selectedId))
+  if ((selectedChildren?.liveCount ?? 0) === 0) {
+    return readBranchPathInTransaction(tx, chatId, selectedId)
+  }
+  if (chat.lastUpdatedLeafId) {
+    const lastUpdatedPath = await readGenerationSelectionCandidatePath(
+      tx,
+      chatId,
+      selectedId,
+      chat.lastUpdatedLeafId,
+    )
+    if (lastUpdatedPath) return lastUpdatedPath
+  }
+  const proofTarget = resolvingConversationSelectionTarget(selection)
+  const receipt = await readConversationOpenInitialReceiptInTransaction(
+    tx,
+    chatId,
+    chat,
+    proofTarget,
+  )
+  const result = await resolveConversationOpenReceipt(
+    {
+      runFrame: async (_stores, read) =>
+        Object.freeze({ kind: 'ready' as const, value: await read(tx) }),
+    },
+    receipt,
+    'none',
+  )
+  if (result.kind === 'ready') {
+    return result.proof.pathHeaders.map(cloneMessageHeader)
+  }
+  if (result.kind === 'missing') throw new ChatMissingError(chatId)
+  if (result.kind === 'stale') {
+    throw new Error(`GenerationSelectionFrameStale:${chatId}`)
+  }
+  const messageId = selection.kind === 'message' ? selection.messageId : selection.observedTipId
+  throw new BranchTargetUnavailableError(
+    chatId,
+    messageId ?? chatId,
+    result.reason === 'sibling-position-unavailable' ? 'invalid-ancestry' : result.reason,
+  )
+}
+
+async function readGenerationSelectionCandidatePath(
+  tx: Transaction,
+  chatId: ChatId,
+  selectedId: MessageId,
+  candidateId: MessageId,
+): Promise<MessageHeaderRow[] | null> {
+  const table = tx.table<MessageHeaderRow, MessageId>('messages')
+  const path = await readLiveBranchPath({
+    chatId,
+    leafId: candidateId,
+    getHeader: (messageId) => table.get(messageId),
+  })
+  if (path.kind === 'unavailable' || !path.rows.some((header) => header.id === selectedId)) {
+    return null
+  }
+  return path.rows.map(cloneMessageHeader)
 }
 
 function assertPhysicalMutationEvidenceCoverage(
@@ -5106,7 +5290,7 @@ const browserMutationSharedInternals: BrowserMutationSharedInternals = Object.fr
   stableStringify,
   streamOwnedMessageFieldsChanged,
   transitionMessageGenerationForDispatch,
-  validateGenerationPromptPathClaim,
+  resolveGenerationPromptPath,
 })
 
 class BrowserWorkspaceRepository implements WorkspaceRepository {
@@ -5199,7 +5383,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
           query.target,
           query.bodyDemand,
           options.onStage as
-            | ((stage: ReadEnvelope<ConversationDestinationPoint>) => void)
+            | ((stage: ReadEnvelope<ConversationDestinationHeaderPoint>) => void)
             | undefined,
           linkedSignal.signal,
         )) as ReadEnvelope<WorkspaceQueryResult<Q>>
@@ -5297,7 +5481,16 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
       }
     } catch (error) {
       if (isBrowserCommandFanoutBudgetExceededError(error)) {
-        return { kind: 'staging-required' }
+        return {
+          kind: 'staging-required',
+          reason: {
+            dimension: error.dimension,
+            observed: error.observed,
+            limit: error.limit,
+            ...(error.tableName ? { tableName: error.tableName } : {}),
+            ...(error.operation ? { operation: error.operation } : {}),
+          },
+        }
       }
       throw error
     }
@@ -5311,18 +5504,24 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     assertWorkspaceExecutionPermit(permit)
     const db = this.session.runOperation((database) => database)
     const admission = await awaitStorageCompactionWriteAdmission()
-    return withSharedAuthoritativeCommandSession(db, async (lockSession) => {
-      const workspace = this.session.getWorkspaceFence()
-      assertPermitFence(permit, workspace)
-      return this.executeCommandInDatabase(
-        db,
-        workspace,
-        command,
-        lockSession,
-        admission,
-        fanoutBudget,
-      )
-    })
+    return withSharedAuthoritativeCommandSession(
+      db,
+      async (lockSession) => {
+        const workspace = this.session.getWorkspaceFence()
+        assertPermitFence(permit, workspace)
+        return this.executeCommandInDatabase(
+          db,
+          workspace,
+          command,
+          lockSession,
+          admission,
+          fanoutBudget,
+          true,
+          permit.signal,
+        )
+      },
+      { signal: permit.signal },
+    )
   }
 
   async executeStagedCommand<C extends WorkspaceCommand>(
@@ -5349,6 +5548,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     admission: StorageCompactionWriteAdmission,
     fanoutBudget?: BrowserCommandFanoutBudget,
     retainFullChatStates = true,
+    signal?: AbortSignal,
   ): Promise<BrowserStagedCommandExecution<C>> {
     const commandLifetimeReceipt = semanticOperationCommandLifetimeReceipt(
       workspace,
@@ -5366,6 +5566,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
       commandLifetimeReceipt,
       fanoutBudget,
       retainFullChatStates,
+      signal,
     )
     const value = (await this.dispatchCommand(
       command,
@@ -8371,7 +8572,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     chatId: ChatId,
     target: ConversationSelectionProofTarget,
     bodyDemand: 'terminal' | 'none',
-    onStage?: (stage: ReadEnvelope<ConversationDestinationPoint>) => void,
+    onStage?: (stage: ReadEnvelope<ConversationDestinationHeaderPoint>) => void,
     signal?: AbortSignal,
   ) {
     throwIfReadonlyAborted(signal, 'Conversation open read aborted')
@@ -8413,28 +8614,6 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
             stores,
             signal,
             read,
-          ),
-        readTerminalPresentation: (messageId, bodySignal) =>
-          this.readConversationOpenFrame(
-            db,
-            permit,
-            chatId,
-            expectedStructuralVersion,
-            ['messages', 'messageBodies'],
-            bodySignal,
-            async (tx) => {
-              const [header, body] = await Promise.all([
-                tx.table<MessageHeaderRow, MessageId>('messages').get(messageId),
-                tx.table<MessageBodyRow, MessageId>('messageBodies').get(messageId),
-              ])
-              if (!header || !body) return undefined
-              const clonedHeader = cloneMessageHeader(header)
-              return Object.freeze({
-                header: clonedHeader,
-                message: hydrateMessageWithOwnedBody(clonedHeader, body),
-                bodyVersion: clonedHeader.bodyVersion,
-              })
-            },
           ),
       },
       initial.receipt,

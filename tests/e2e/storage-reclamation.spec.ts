@@ -441,6 +441,13 @@ test('normal use catches up foreground work without repeating the physical copy 
       .poll(() => readChatTitleFromDatabase(page, before.activeDatabaseName, chatId))
       .toBe('Compaction catch-up stayed interactive')
 
+    const editDraft = 'this inline edit must survive workspace replacement'
+    const editedUser = page.locator('[data-ui="message"][data-role="user"]').last()
+    await editedUser.getByRole('button', { name: 'Edit message' }).click()
+    const inlineEditor = editedUser.locator('[data-ui="inline-editor-input"]')
+    await inlineEditor.fill(editDraft)
+    await expect(editedUser.getByRole('button', { name: 'Save & Send' })).toBeEnabled()
+
     await scenario.release()
     await expect
       .poll(() => scenario.snapshot().then((snapshot) => snapshot.activeStreams), {
@@ -493,6 +500,9 @@ test('normal use catches up foreground work without repeating the physical copy 
 
     await expect.poll(() => page.evaluate(() => window.location.hash)).toBe(pinnedRoute)
     await expect(composer).toHaveValue(draft)
+    await expect(inlineEditor).toBeVisible()
+    await expect(inlineEditor).toHaveValue(editDraft)
+    await expect(editedUser.getByRole('button', { name: 'Save & Send' })).toBeEnabled()
     await expect(secondBranch.locator('[data-ui="message-body"]')).toHaveText(/Lorem ipsum/u)
     await expect(secondBranch.locator('[data-ui="branch-count"]')).toHaveText('2 / 2')
     await expect
@@ -503,6 +513,35 @@ test('normal use catches up foreground work without repeating the physical copy 
           .evaluate((node) => node.textContent.length),
       )
       .toBe(4_096)
+
+    await uiJourney.intent(page, {
+      kind: 'gesture',
+      id: 'storage-compaction-save-send',
+      targetSelector: '[data-role="save-send"]',
+      allowsRouteChange: true,
+      expectedRoute: { kind: 'prefix', value: `/#/chat/${chatId}/message/` },
+      outcome: {
+        selector: '[data-ui="message"][data-role="assistant"] [data-ui="message-body"]',
+        requireInteractive: false,
+      },
+    })
+    await editedUser.getByRole('button', { name: 'Save & Send' }).click()
+    await expect.poll(() => scenario.snapshot().then((snapshot) => snapshot.requestCount)).toBe(2)
+    await expect(
+      page
+        .locator('[data-ui="message"][data-role="user"] [data-ui="message-body"]')
+        .filter({ hasText: editDraft }),
+    ).toHaveCount(1)
+    await expect
+      .poll(() =>
+        page
+          .locator('[data-ui="message"][data-role="assistant"] [data-ui="message-body"]')
+          .last()
+          .evaluate((node) => node.textContent.length),
+      )
+      .toBe(4_096)
+    const saveAndSendRoute = await page.evaluate(() => window.location.hash)
+    expect(saveAndSendRoute).toMatch(new RegExp(`^#/chat/${chatId}/message/`, 'u'))
     const journey = await uiJourney.finish(page, 'storage-compaction-committed')
     expect(journey.violations).toEqual([])
 
@@ -511,7 +550,7 @@ test('normal use catches up foreground work without repeating the physical copy 
       'Compaction catch-up stayed interactive',
     )
     await expect(page.locator('[data-ui="composer-input"]')).toHaveValue(draft)
-    await expect.poll(() => page.evaluate(() => window.location.hash)).toBe(pinnedRoute)
+    await expect.poll(() => page.evaluate(() => window.location.hash)).toBe(saveAndSendRoute)
     await expect
       .poll(() =>
         streamPage
@@ -714,6 +753,23 @@ test('durable replacement state recovers crashed owners and serializes competing
       })
     await expectBranchControlsReady(page, branchId)
 
+    await expect
+      .poll(async () => {
+        const snapshot = await readWorkspaceControlSnapshot(page)
+        return {
+          pending: snapshot.pending,
+          compactionSettled:
+            snapshot.activeCompaction !== null &&
+            snapshot.activeCompaction.attemptedRevision ===
+              snapshot.activeCompaction.requestRevision &&
+            snapshot.activeCompaction.completedRevision ===
+              snapshot.activeCompaction.requestRevision,
+        }
+      })
+      .toEqual({
+        pending: null,
+        compactionSettled: true,
+      })
     const beforeCompetition = await readWorkspaceControlSnapshot(page)
     firstCompetitor = await context.newPage()
     secondCompetitor = await context.newPage()

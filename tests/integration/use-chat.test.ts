@@ -589,17 +589,12 @@ interface LegacySendInput {
 }
 
 async function startSendText(input: LegacySendInput): Promise<GenerationHandle> {
-  const chat = requireDefined(await getChat(input.chatId), 'send chat')
   const selection = storedSelection(input.chatId)
-  const expectedLeafId =
-    selection.kind === 'tip' || selection.kind === 'message'
-      ? selection.messageId
-      : chat.lastUpdatedLeafId
   return startControlledGeneration(
     {
       kind: 'send',
       chatId: input.chatId,
-      expectedLeafId,
+      target: { kind: 'selection', selection },
       content: input.content,
       ...(input.prefillContent ? { prefillContent: input.prefillContent } : {}),
     },

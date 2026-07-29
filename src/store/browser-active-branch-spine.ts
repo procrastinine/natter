@@ -7,20 +7,15 @@ import { compareLiveLeafRecency } from '../core/active-path'
 import { childListKey, validateChildSlotProjection } from '../core/child-list-state'
 import { treeParentKey } from '../core/message-tree-index'
 import {
-  type ConversationDestinationPoint,
+  type ConversationDestinationHeaderPoint,
   type ConversationSelectionProofTarget,
   fixedConversationSelectionTarget,
-  type MessagePresentation,
 } from '../core/messages'
 import type { Chat, ChatId, ChildListState, ChildSlotMember, MessageId } from '../core/types'
 import { readActiveBranchPathSlotFrameInTransaction } from './active-branch-fork-storage'
 import { proveConversationSelectionFromExactPath } from './conversation-destination-seal'
 import { exactCompoundPrefixBetween } from './indexeddb-key-ranges'
-import {
-  canonicalMessageHeaderRow,
-  type MessageHeaderRow,
-  sameMessageHeaderValue,
-} from './message-storage'
+import { canonicalMessageHeaderRow, type MessageHeaderRow } from './message-storage'
 import type { ConversationOpenResult } from './workspace-protocol'
 
 const CHILD_MEMBER_POSITION_INDEX = '[chatId+parentKey+position]'
@@ -306,10 +301,6 @@ class BrowserSelectionHeaderReader {
 
 export interface ConversationSelectionReadAccess {
   readonly runFrame: RunConversationOpenFrame
-  readTerminalPresentation(
-    messageId: MessageId,
-    signal?: AbortSignal,
-  ): Promise<ConversationOpenFrameResult<MessagePresentation | undefined>>
 }
 
 type ConversationOpenTerminalHint =
@@ -517,7 +508,7 @@ export async function resolveConversationOpenReceipt(
   access: ConversationSelectionReadAccess,
   receipt: ConversationOpenInitialReceipt,
   bodyDemand: 'terminal' | 'none',
-  onTerminalPoint?: (point: ConversationDestinationPoint) => void,
+  onTerminalPoint?: (point: ConversationDestinationHeaderPoint) => void,
   signal?: AbortSignal,
   measurement?: BranchSelectionReadMeasurement,
 ): Promise<ConversationOpenResult> {
@@ -614,25 +605,17 @@ export async function resolveConversationOpenReceipt(
       }
     }
     retryTarget = fixedConversationSelectionTarget(receipt.stableSelection, leafHeader.id)
-    const terminalPointPromise = (
-      bodyDemand === 'terminal'
-        ? readConversationTerminalPoint(
-            access,
-            receipt.chat,
-            receipt.target,
-            leafHeader,
-            owned.signal,
-          )
-        : Promise.resolve(null)
-    )
-      .then((point) => {
-        if (point) {
-          if (onTerminalPoint) onTerminalPoint(point)
-        }
-        return point
-      })
-      .catch(() => null)
-    ownedLegs.push(terminalPointPromise)
+    if (bodyDemand === 'terminal' && onTerminalPoint) {
+      onTerminalPoint(
+        Object.freeze({
+          kind: 'tip-header-point',
+          chat: receipt.chat,
+          target: receipt.target,
+          structuralVersion: receipt.chat.structuralVersion,
+          header: leafHeader,
+        }),
+      )
+    }
     const path = exactPathHeaders
       ? { kind: 'ready' as const, rows: exactPathHeaders }
       : await reader.readLivePath(leafHeader.id, receipt.stableSelection)
@@ -649,7 +632,7 @@ export async function resolveConversationOpenReceipt(
       readActiveBranchPathSlotFrameInTransaction(tx, receipt.chat.id, path.rows, owned.signal),
     )
     ownedLegs.push(slotFramePromise)
-    const [terminalPoint, slotFrame] = await Promise.all([terminalPointPromise, slotFramePromise])
+    const slotFrame = await slotFramePromise
     throwIfAborted(signal)
     if (slotFrame.kind === 'stale') throw new ConversationOpenFrameStaleError()
     if (measurement) {
@@ -661,10 +644,7 @@ export async function resolveConversationOpenReceipt(
       target: receipt.target,
       tipId: leafHeader.id,
       exactPathHeaders: path.rows,
-      presentations:
-        terminalPoint?.kind === 'tip-point'
-          ? Object.freeze([terminalPoint.presentation])
-          : Object.freeze([]),
+      presentations: Object.freeze([]),
       forks: slotFrame.value.forks,
       terminalChildSlot: slotFrame.value.terminalChildSlot,
       snapshotOwnership: 'adopt',
@@ -684,38 +664,6 @@ export async function resolveConversationOpenReceipt(
     owned.dispose()
     void Promise.allSettled(ownedLegs)
   }
-}
-
-async function readConversationTerminalPoint(
-  access: ConversationSelectionReadAccess,
-  chat: Chat,
-  target: ConversationSelectionProofTarget,
-  leafHeader: MessageHeaderRow,
-  signal?: AbortSignal,
-): Promise<ConversationDestinationPoint | null> {
-  const frame = await access.readTerminalPresentation(leafHeader.id, signal)
-  if (frame.kind === 'stale' || !frame.value) return null
-  const presentation = frame.value
-  const tipHeader = presentation.header
-  if (
-    tipHeader.id !== leafHeader.id ||
-    tipHeader.chatId !== chat.id ||
-    tipHeader.deleted ||
-    presentation.message.id !== tipHeader.id ||
-    presentation.message.chatId !== chat.id ||
-    presentation.bodyVersion !== tipHeader.bodyVersion
-  ) {
-    throw new Error(`ConversationDestinationFrameHeaderInvalid:${leafHeader.id}`)
-  }
-  if (!sameMessageHeaderValue(tipHeader, leafHeader)) return null
-  throwIfAborted(signal)
-  return Object.freeze({
-    kind: 'tip-point',
-    chat,
-    target,
-    structuralVersion: chat.structuralVersion,
-    presentation: Object.freeze(presentation),
-  })
 }
 
 async function classifyLiveLeafInTransaction(

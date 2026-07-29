@@ -52,10 +52,9 @@ import type {
 } from './semantic-operation-capability'
 import type {
   GenerationPlanningSnapshot,
-  GenerationPromptPathClaim,
   GenerationPromptPathProof,
   MessagePresentation,
-  PrepareAttemptConfigurationClaim,
+  PrepareAttemptConfigurationIntent,
   PreparedAttachmentBundle,
   PreparedGenerationPrompt,
   StorageMaintenanceRequestTaskKind,
@@ -103,15 +102,16 @@ export interface ChatMutationState {
 
 export interface BrowserMutationOperations {
   getOwnedStreamLease(streamId: string): StreamLeaseRow
-  validateGenerationPromptPathClaim(
+  resolveGenerationPromptPath(
     chatId: ChatId,
-    claim: GenerationPromptPathClaim,
+    proof: GenerationPromptPathProof,
   ): Promise<ValidatedGenerationPromptPath>
   captureGenerationPlanningSnapshot(
     chatId: ChatId,
-    expected: PrepareAttemptConfigurationClaim,
+    intent: PrepareAttemptConfigurationIntent,
     planningChat: Chat,
   ): Promise<GenerationPlanningSnapshot>
+  setStreamAdmissionPostCommit(postCommit: StreamPostCommitEvidence): void
   requestStorageMaintenance(task: StorageMaintenanceRequestTaskKind): void
 }
 
@@ -255,11 +255,11 @@ export interface BrowserMutationSharedInternals {
     header: MessageHeaderRow,
     generation: DispatchedGenerationMeta,
   ): MessageHeaderRow
-  validateGenerationPromptPathClaim(
+  resolveGenerationPromptPath(
     this: void,
     tx: Transaction,
     chatId: ChatId,
-    claim: GenerationPromptPathClaim,
+    proof: GenerationPromptPathProof,
   ): Promise<ValidatedGenerationPromptPath>
 }
 

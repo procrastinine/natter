@@ -102,6 +102,29 @@
       }
     },
     {
+      "purpose": "read-only-assertion",
+      "mutationScope": {
+        "kind": "none",
+        "targets": []
+      },
+      "cleanupRestoreObligation": "Use one readonly message transaction, close the opened IndexedDB handle, and leave all durable browser state unchanged.",
+      "publicUiCannotExpress": "The retained-delete regression must verify the authoritative message tombstone rather than infer durable deletion from the projected transcript.",
+      "siteIds": [
+        "tests/e2e/render-window.spec.ts::owner=test%3Aretained%20imported%20rows%20repeatedly%20own%20Save%20%26%20Send%20and%20delete%20across%20branch%20resolution::operation=indexeddb.database.close::mode=-::store=-::occurrence=1",
+        "tests/e2e/render-window.spec.ts::owner=test%3Aretained%20imported%20rows%20repeatedly%20own%20Save%20%26%20Send%20and%20delete%20across%20branch%20resolution::operation=indexeddb.database.transaction::mode=readonly::store=messages::occurrence=1",
+        "tests/e2e/render-window.spec.ts::owner=test%3Aretained%20imported%20rows%20repeatedly%20own%20Save%20%26%20Send%20and%20delete%20across%20branch%20resolution::operation=indexeddb.factory.open::mode=-::store=-::occurrence=1",
+        "tests/e2e/render-window.spec.ts::owner=test%3Aretained%20imported%20rows%20repeatedly%20own%20Save%20%26%20Send%20and%20delete%20across%20branch%20resolution::operation=indexeddb.get::mode=readonly::store=messages::occurrence=1",
+        "tests/e2e/render-window.spec.ts::owner=test%3Aretained%20imported%20rows%20repeatedly%20own%20Save%20%26%20Send%20and%20delete%20across%20branch%20resolution::operation=indexeddb.transaction.object-store::mode=readonly::store=messages::occurrence=1"
+      ],
+      "cleanupEvidence": {
+        "siteIds": [
+          "tests/e2e/render-window.spec.ts::owner=test%3Aretained%20imported%20rows%20repeatedly%20own%20Save%20%26%20Send%20and%20delete%20across%20branch%20resolution::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+        ],
+        "fixtureOwners": [],
+        "processOwned": false
+      }
+    },
+    {
       "purpose": "fault-injection",
       "mutationScope": {
         "kind": "none",

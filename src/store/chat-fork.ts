@@ -16,23 +16,27 @@ export function forkChatFromMessage(
     now?: number
   },
   apply?: (result: ConversationCommittedResult<ForkChatFromMessageResult>) => void,
+  signal?: AbortSignal,
 ): Promise<ConversationCommittedResult<ForkChatFromMessageResult>> {
-  return runWorkspaceAction('chat-fork', (permit) =>
-    getWorkspaceRepository()
-      .execute(
-        permit,
-        { kind: 'chat.fork', input },
-        apply
-          ? {
-              localApplications: {
-                conversation: (commit) => {
-                  apply(conversationCommittedResult(commit, commit.value.chatId))
-                  return 'applied'
+  return runWorkspaceAction(
+    'chat-fork',
+    (permit) =>
+      getWorkspaceRepository()
+        .execute(
+          permit,
+          { kind: 'chat.fork', input },
+          apply
+            ? {
+                localApplications: {
+                  conversation: (commit) => {
+                    apply(conversationCommittedResult(commit, commit.value.chatId))
+                    return 'applied'
+                  },
                 },
-              },
-            }
-          : undefined,
-      )
-      .then((commit) => conversationCommittedResult(commit, commit.value.chatId)),
+              }
+            : undefined,
+        )
+        .then((commit) => conversationCommittedResult(commit, commit.value.chatId)),
+    signal ? { signal } : {},
   )
 }

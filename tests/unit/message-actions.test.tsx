@@ -1,15 +1,8 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import type { GenerationSubmission } from '../../src/app/presentation-interactions'
 import { createAppliedMessageView } from '../../src/core/continuation-content'
-import {
-  AVAILABLE_GENERATION_CAPABILITY,
-  failedGenerationCapability,
-  type NonReadyGenerationCapability,
-  pendingGenerationCapability,
-  unavailableGenerationCapability,
-} from '../../src/core/interaction-capability'
 import type { Message } from '../../src/core/types'
-import type { GenerationStartResult } from '../../src/store/generation-engine'
 import { MessageActions, MessageEditTreeActions } from '../../src/ui/chat/MessageActions'
 import {
   createInteractionSettlementHarness,
@@ -33,39 +26,18 @@ function assistantMessage(): Message {
   }
 }
 
-function startedGeneration(): GenerationStartResult {
-  const prepared = Object.freeze({
-    streamId: 'stream-1',
-    chatId: 'chat-1',
-    assistantMessageId: 'assistant-1',
-  })
+function startedGeneration(): GenerationSubmission {
   return Object.freeze({
     kind: 'started',
-    handle: Object.freeze({
-      streamId: prepared.streamId,
-      chatId: prepared.chatId,
-      prepared: Promise.resolve(prepared),
-      completed: Promise.resolve(Object.freeze({ ...prepared, outcome: 'done' as const })),
-    }),
+    admission: Promise.resolve(Object.freeze({ kind: 'admitted' as const })),
+    completion: Promise.resolve(Object.freeze({ kind: 'prepared' as const })),
+    cancel: () => undefined,
   })
 }
 
 function generationAction() {
   return vi.fn(() => startedGeneration())
 }
-
-const NON_READY_ACTION_CASES = [
-  ['pending', 'regenerate', pendingGenerationCapability('prompt-path')],
-  ['pending', 'continue', pendingGenerationCapability('prompt-path')],
-  ['unavailable', 'regenerate', unavailableGenerationCapability('target-unavailable')],
-  ['unavailable', 'continue', unavailableGenerationCapability('target-unavailable')],
-  ['failed', 'regenerate', failedGenerationCapability('configuration')],
-  ['failed', 'continue', failedGenerationCapability('configuration')],
-] as const satisfies readonly (readonly [
-  'pending' | 'unavailable' | 'failed',
-  'regenerate' | 'continue',
-  NonReadyGenerationCapability,
-])[]
 
 function renderActions(props: Partial<Parameters<typeof MessageActions>[0]> = {}) {
   const message = props.message ?? assistantMessage()
@@ -78,8 +50,6 @@ function renderActions(props: Partial<Parameters<typeof MessageActions>[0]> = {}
       onToggleInfo={props.onToggleInfo ?? (() => {})}
       isEditing={props.isEditing ?? false}
       onBeginEdit={props.onBeginEdit ?? (() => {})}
-      regenerateCapability={props.regenerateCapability ?? AVAILABLE_GENERATION_CAPABILITY}
-      continueCapability={props.continueCapability ?? AVAILABLE_GENERATION_CAPABILITY}
       onDelete={props.onDelete ?? (() => succeededInteractionSettlement())}
     />,
   )
@@ -92,28 +62,85 @@ afterEach(() => {
 })
 
 describe('MessageActions', () => {
-  it('disables generation actions while another request is active for the chat', () => {
+  it('lets a new generation intent replace another request still preparing for the chat', () => {
+    const onRegenerate = generationAction()
+    const onContinue = generationAction()
     renderActions({
       generationBusy: true,
-      onRegenerate: generationAction(),
-      onContinue: generationAction(),
+      onRegenerate,
+      onContinue,
     })
 
-    expect(screen.getByRole('button', { name: 'Regenerate response' })).toBeDisabled()
-    expect(screen.getByRole('button', { name: 'Continue from here' })).toBeDisabled()
+    const regenerate = screen.getByRole('button', { name: 'Regenerate response' })
+    const continuation = screen.getByRole('button', { name: 'Continue from here' })
+    expect(regenerate).toBeEnabled()
+    expect(continuation).toBeEnabled()
+
+    fireEvent.click(regenerate)
+    fireEvent.click(continuation)
+
+    expect(onRegenerate).toHaveBeenCalledOnce()
+    expect(onContinue).toHaveBeenCalledOnce()
   })
 
-  it('blocks every target-mutating action on the active stream target', () => {
+  it('keeps generation gestures live while the displayed body is only a retained snapshot', () => {
+    const onRegenerate = generationAction()
+    const onContinue = generationAction()
+    renderActions({
+      mutationDisabled: true,
+      onRegenerate,
+      onContinue,
+    })
+
+    const regenerate = screen.getByRole('button', { name: 'Regenerate response' })
+    const continuation = screen.getByRole('button', { name: 'Continue from here' })
+    expect(regenerate).toBeEnabled()
+    expect(continuation).toBeEnabled()
+
+    fireEvent.click(regenerate)
+    fireEvent.click(continuation)
+
+    expect(onRegenerate).toHaveBeenCalledOnce()
+    expect(onContinue).toHaveBeenCalledOnce()
+  })
+
+  it('keeps replacement generation actions live on the active stream target', () => {
+    const onRegenerate = generationAction()
+    const onContinue = generationAction()
     renderActions({
       streamTargetBusy: true,
-      onRegenerate: generationAction(),
-      onContinue: generationAction(),
+      onRegenerate,
+      onContinue,
     })
 
     expect(screen.getByRole('button', { name: 'Edit message' })).toBeDisabled()
-    expect(screen.getByRole('button', { name: 'Continue from here' })).toBeDisabled()
     expect(screen.getByRole('button', { name: 'Delete message' })).toBeDisabled()
-    expect(screen.getByRole('button', { name: 'Regenerate response' })).toBeDisabled()
+    const continuation = screen.getByRole('button', { name: 'Continue from here' })
+    const regenerate = screen.getByRole('button', { name: 'Regenerate response' })
+    expect(continuation).toBeEnabled()
+    expect(regenerate).toBeEnabled()
+
+    fireEvent.click(continuation)
+    fireEvent.click(regenerate)
+
+    expect(onContinue).toHaveBeenCalledOnce()
+    expect(onRegenerate).toHaveBeenCalledOnce()
+  })
+
+  it('turns a pending structural delete into an explicit cancellation action', () => {
+    const onCancelStructuralMutation = vi.fn()
+    renderActions({
+      structuralDisabled: true,
+      structuralMutationPending: true,
+      onCancelStructuralMutation,
+    })
+
+    const cancel = screen.getByRole('button', { name: 'Cancel conversation update' })
+    expect(cancel).toBeEnabled()
+    fireEvent.click(cancel)
+
+    expect(onCancelStructuralMutation).toHaveBeenCalledOnce()
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
   })
 
   it('treats an applied successful continuation as resolving the original partial state', () => {
@@ -150,37 +177,6 @@ describe('MessageActions', () => {
       'title',
       'Continue this assistant message',
     )
-  })
-
-  it.each(
-    NON_READY_ACTION_CASES,
-  )('keeps unrelated actions live when %s blocks only %s', (_state, blockedAction, capability) => {
-    const onRegenerate = generationAction()
-    const onContinue = generationAction()
-    renderActions({
-      regenerateCapability:
-        blockedAction === 'regenerate' ? capability : AVAILABLE_GENERATION_CAPABILITY,
-      continueCapability:
-        blockedAction === 'continue' ? capability : AVAILABLE_GENERATION_CAPABILITY,
-      onRegenerate,
-      onContinue,
-    })
-
-    const regenerate = screen.getByRole('button', { name: 'Regenerate response' })
-    const continuation = screen.getByRole('button', { name: 'Continue from here' })
-    const blocked = blockedAction === 'regenerate' ? regenerate : continuation
-    const independent = blockedAction === 'regenerate' ? continuation : regenerate
-
-    expect(blocked).toBeDisabled()
-    expect(independent).toBeEnabled()
-    expect(screen.getByRole('button', { name: 'Edit message' })).toBeEnabled()
-    expect(screen.getByRole('button', { name: 'Delete message' })).toBeEnabled()
-
-    fireEvent.click(blocked)
-    fireEvent.click(independent)
-
-    expect(blockedAction === 'regenerate' ? onRegenerate : onContinue).not.toHaveBeenCalled()
-    expect(blockedAction === 'regenerate' ? onContinue : onRegenerate).toHaveBeenCalledOnce()
   })
 
   it('shows a temporary copied state after writing message text to the clipboard', async () => {
@@ -272,5 +268,21 @@ describe('MessageEditTreeActions', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Delete turn' }))
 
     expect(onDelete.mock.calls).toEqual([['variant'], ['turn']])
+  })
+
+  it('replaces pending edit-tree deletes with the same cancellation owner', () => {
+    const onCancelStructuralMutation = vi.fn()
+    render(
+      <MessageEditTreeActions
+        onDelete={() => succeededInteractionSettlement()}
+        structuralMutationPending
+        onCancelStructuralMutation={onCancelStructuralMutation}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel update' }))
+
+    expect(onCancelStructuralMutation).toHaveBeenCalledOnce()
+    expect(screen.queryByRole('button', { name: 'Delete variant' })).not.toBeInTheDocument()
   })
 })

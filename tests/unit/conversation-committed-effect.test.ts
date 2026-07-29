@@ -537,6 +537,21 @@ it('extends an accepted long path from only the committed suffix', async () => {
   expect(
     transcriptBodyWindowFindRow(activeAfter.transcript.window, assistant.header.id)?.message,
   ).toMatchObject({ id: assistant.header.id, content: assistant.message.content })
+  const promptPath = controller.capturePromptPathFrame(FENCE)
+  expect(
+    promptPath.capability({
+      kind: 'edit-resend',
+      chatId: CHAT_ID,
+      targetUserId: user.header.id,
+    }),
+  ).toBe('available')
+  expect(
+    promptPath.capability({
+      kind: 'regenerate',
+      chatId: CHAT_ID,
+      targetAssistantId: assistant.header.id,
+    }),
+  ).toBe('available')
 })
 
 it('publishes a regenerate transition with the exact new sibling slot and no fork reread', async () => {
@@ -705,6 +720,13 @@ it('publishes a regenerate transition with the exact new sibling slot and no for
   if (active.destination.kind !== 'ready') throw new Error('expected ready destination')
   expect(active.destination.spine.resolvedLeafId).toBe(newAssistant.header.id)
   expect(active.destination.spine.forkFor(newAssistant.header.id)).toEqual(expectedFork)
+  expect(
+    controller.capturePromptPathFrame(FENCE).capability({
+      kind: 'regenerate',
+      chatId: CHAT_ID,
+      targetAssistantId: newAssistant.header.id,
+    }),
+  ).toBe('available')
   expect(publishedForks).toEqual([expectedFork])
   expect(source.loadForks).toHaveBeenCalledTimes(forkReadsBefore)
 })

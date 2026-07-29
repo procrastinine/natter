@@ -1699,6 +1699,7 @@ describe('storage retention', () => {
       'profiles',
       'privacyPolicies',
       'settings',
+      'textTemplates',
     ])
   })
 })

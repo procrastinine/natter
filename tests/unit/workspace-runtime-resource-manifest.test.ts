@@ -525,6 +525,129 @@ describe('workspace runtime resource manifest', () => {
     expect(runtime.WORKSPACE_ROOT_REPLACEMENT_DISPOSITIONS['cache-refresh']).toBe('cancel')
   })
 
+  it('publishes exact generation-blocker release to a cancellable foreground replacement wait', async () => {
+    const { runtime } = createRuntimeHarness()
+    const fence = { workspaceId: 'workspace-replacement-blocker-wait', replacementEpoch: 0 }
+    runtime.workspaceRuntimeInternal.beginReconciliation(fence)
+    runtime.workspaceRuntimeInternal.finishReconciliation(fence)
+    let releaseGeneration!: () => void
+    const generationGate = new Promise<void>((resolve) => {
+      releaseGeneration = resolve
+    })
+    let generationAborted = false
+    const generation = runtime.runWorkspaceAction(
+      'conversation-generation',
+      async (permit) => {
+        permit.signal.addEventListener('abort', () => {
+          generationAborted = true
+        })
+        await generationGate
+      },
+      { lineageId: 'generation:blocking-stream' },
+    )
+    const foreground = new AbortController()
+    let replacementUnblocked = false
+    const waiting = runtime
+      .waitForWorkspaceRuntimeReplacementBlockers({
+        signal: foreground.signal,
+        lineageId: 'foreground-delete',
+      })
+      .then(() => {
+        replacementUnblocked = true
+      })
+
+    await Promise.resolve()
+    expect(replacementUnblocked).toBe(false)
+    expect(generationAborted).toBe(false)
+
+    releaseGeneration()
+    await generation
+    await waiting
+
+    expect(replacementUnblocked).toBe(true)
+    expect(generationAborted).toBe(false)
+    expect(runtime.getWorkspaceRuntimeState()).toBe('RUNNING')
+  })
+
+  it('atomically promotes a prepared replacement when its last generation blocker releases', async () => {
+    const { control, runtime } = createRuntimeHarness()
+    installNoopResourceManifest(control)
+    const fence = { workspaceId: 'workspace-prepared-promotion', replacementEpoch: 0 }
+    runtime.workspaceRuntimeInternal.beginReconciliation(fence)
+    runtime.workspaceRuntimeInternal.finishReconciliation(fence)
+    let releaseGeneration!: () => void
+    const generationGate = new Promise<void>((resolve) => {
+      releaseGeneration = resolve
+    })
+    let generationAborted = false
+    const generation = runtime.runWorkspaceAction(
+      'conversation-generation',
+      async (permit) => {
+        permit.signal.addEventListener('abort', () => {
+          generationAborted = true
+        })
+        await generationGate
+      },
+      { lineageId: 'generation:late-copy-blocker' },
+    )
+    let promoted = false
+    const promotion = control
+      .launchWorkspaceRuntimeReplacementWhenUnblocked('command-fanout', {
+        lineageId: 'foreground-staged-delete',
+        requireIdle: false,
+      })
+      .then((authority) => {
+        promoted = true
+        return authority
+      })
+
+    await Promise.resolve()
+    expect(promoted).toBe(false)
+    expect(generationAborted).toBe(false)
+    expect(runtime.getWorkspaceRuntimeState()).toBe('RUNNING')
+
+    releaseGeneration()
+    await generation
+    const authority = await promotion
+    expect(authority).not.toBeNull()
+    expect(generationAborted).toBe(false)
+    expect(runtime.getWorkspaceRuntimeState()).toBe('QUIESCING')
+    expect(() => runtime.runWorkspaceAction('conversation-generation', () => undefined)).toThrow(
+      'WorkspaceRuntimeClosed:conversation-generation:QUIESCING',
+    )
+    await control.awaitWorkspaceRuntimeQuiesced()
+  })
+
+  it('cancels a foreground replacement wait without touching its blocking generation', async () => {
+    const { runtime } = createRuntimeHarness()
+    const fence = { workspaceId: 'workspace-replacement-blocker-cancel', replacementEpoch: 0 }
+    runtime.workspaceRuntimeInternal.beginReconciliation(fence)
+    runtime.workspaceRuntimeInternal.finishReconciliation(fence)
+    let releaseGeneration!: () => void
+    const generationGate = new Promise<void>((resolve) => {
+      releaseGeneration = resolve
+    })
+    let generationAborted = false
+    const generation = runtime.runWorkspaceAction('conversation-generation', async (permit) => {
+      permit.signal.addEventListener('abort', () => {
+        generationAborted = true
+      })
+      await generationGate
+    })
+    const foreground = new AbortController()
+    const reason = new Error('delete-cancelled')
+    const waiting = runtime.waitForWorkspaceRuntimeReplacementBlockers({
+      signal: foreground.signal,
+    })
+
+    foreground.abort(reason)
+    await expect(waiting).rejects.toBe(reason)
+    expect(generationAborted).toBe(false)
+
+    releaseGeneration()
+    await generation
+  })
+
   it('keeps caller cancellation linked after promotion to replacement authority', () => {
     const { control, runtime } = createRuntimeHarness()
     installNoopResourceManifest(control)

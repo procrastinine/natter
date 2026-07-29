@@ -261,7 +261,6 @@ describe('semantic operation capabilities', () => {
       [],
       {
         captureGenerationPlanningSnapshot: true,
-        planningProfileId: 'profile',
       },
       {
         readTableNames: ['attachmentRefEdges'],

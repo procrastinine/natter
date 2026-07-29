@@ -392,6 +392,7 @@ class PerAttemptGenerationPromptMaterialLease implements GenerationPromptMateria
   private readonly coordinator: TabWorkspaceMessageMaterialCoordinator
   private readonly onRelease: (lease: GenerationPromptMaterialLease) => void
   private readonly claimedHeaders = new Map<MessageId, MessageHeaderRow>()
+  private readonly retainedPresentations = new Map<MessageId, MessagePresentation>()
   private sealedHeaders: ReadonlyMap<MessageId, MessageHeaderRow> | null = null
   private released = false
 
@@ -417,6 +418,11 @@ class PerAttemptGenerationPromptMaterialLease implements GenerationPromptMateria
   seed(fence: WorkspaceFence, presentations: readonly MessagePresentation[]): void {
     if (this.released) return
     this.coordinator.seedClaimed(this, fence, presentations)
+    for (const presentation of presentations) {
+      const header = this.claimedHeaders.get(presentation.header.id)
+      const normalized = header ? normalizeMaterialPresentation(presentation, header) : undefined
+      if (header && normalized) this.retainedPresentations.set(header.id, normalized)
+    }
   }
 
   seal(fence: WorkspaceFence, prompt: PreparedGenerationPrompt): void {
@@ -443,8 +449,20 @@ class PerAttemptGenerationPromptMaterialLease implements GenerationPromptMateria
     ) {
       throw new Error('GenerationPromptMaterialSealMismatch')
     }
+    const retained = new Map<MessageId, MessagePresentation>()
+    for (const header of prompt.headers) {
+      const presentation = this.retainedPresentations.get(header.id)
+      const normalized = presentation
+        ? normalizeMaterialPresentation(presentation, header)
+        : undefined
+      if (normalized) retained.set(header.id, normalized)
+    }
     this.claimedHeaders.clear()
     for (const header of prompt.headers) this.claimedHeaders.set(header.id, header)
+    this.retainedPresentations.clear()
+    for (const [messageId, presentation] of retained) {
+      this.retainedPresentations.set(messageId, presentation)
+    }
     this.sealedHeaders = headers
     this.coordinator.claimsChanged(this)
     this.seed(fence, prompt.knownPresentations)
@@ -465,10 +483,24 @@ class PerAttemptGenerationPromptMaterialLease implements GenerationPromptMateria
     signal?: AbortSignal,
   ): Promise<readonly MessagePresentation[]> {
     if (!this.covers(fence, headers)) throw new Error('GenerationPromptMaterialLeaseMismatch')
-    const rows = await this.coordinator.read(fence, headers, loader, signal)
+    const missing = headers.filter((header) => {
+      const retained = this.retainedPresentations.get(header.id)
+      return !retained || !normalizeMaterialPresentation(retained, header)
+    })
+    if (missing.length > 0) {
+      const loaded = await this.coordinator.read(fence, missing, loader, signal)
+      for (let index = 0; index < missing.length; index += 1) {
+        const header = missing[index] as MessageHeaderRow
+        const presentation = loaded[index]
+        const normalized = presentation
+          ? normalizeMaterialPresentation(presentation, header)
+          : undefined
+        if (normalized) this.retainedPresentations.set(header.id, normalized)
+      }
+    }
     return Object.freeze(
-      rows.map((presentation, index) => {
-        const header = headers[index] as MessageHeaderRow
+      headers.map((header) => {
+        const presentation = this.retainedPresentations.get(header.id)
         const normalized = presentation
           ? normalizeMaterialPresentation(presentation, header)
           : undefined
@@ -483,6 +515,7 @@ class PerAttemptGenerationPromptMaterialLease implements GenerationPromptMateria
     this.released = true
     this.coordinator.removeLease(this)
     this.claimedHeaders.clear()
+    this.retainedPresentations.clear()
     this.sealedHeaders = null
     this.onRelease(this)
   }

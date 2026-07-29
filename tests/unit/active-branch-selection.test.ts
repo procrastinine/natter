@@ -14,11 +14,7 @@ import {
   readConversationOpenInitialReceiptInTransaction,
   resolveConversationOpenReceipt,
 } from '../../src/store/browser-active-branch-spine'
-import {
-  hydrateMessage,
-  type MessageBodyRow,
-  type MessageHeaderRow,
-} from '../../src/store/message-storage'
+import type { MessageHeaderRow } from '../../src/store/message-storage'
 
 const CHAT_ID = 'selection-chat'
 
@@ -50,16 +46,6 @@ function header(
     contextRouteFacts: EMPTY_MESSAGE_CONTEXT_ROUTE_FACTS,
     treeParentKey: treeParentKey(parentId),
     treeLive: 1,
-  }
-}
-
-function body(row: MessageHeaderRow): MessageBodyRow {
-  return {
-    id: row.id,
-    chatId: row.chatId,
-    bodyVersion: row.bodyVersion,
-    updatedAt: row.createdAt,
-    content: [{ type: row.role === 'assistant' ? 'output_text' : 'text', text: row.id }],
   }
 }
 
@@ -104,19 +90,9 @@ async function openSelection(
     undefined,
     measurement,
   )
-  const rowsById = new Map(rows.map((row) => [row.id, row] as const))
   return resolveConversationOpenReceipt(
     {
       runFrame: async (_stores, read) => ({ kind: 'ready', value: await read(tx) }),
-      readTerminalPresentation: async (messageId) => {
-        const row = rowsById.get(messageId)
-        return {
-          kind: 'ready',
-          value: row
-            ? { header: row, message: hydrateMessage(row, body(row)), bodyVersion: row.bodyVersion }
-            : undefined,
-        }
-      },
     },
     receipt,
     'none',
@@ -299,7 +275,6 @@ describe('proof-bearing active branch selection', () => {
       chat(canonical.id),
       selectionTarget,
     )
-    const rowsById = new Map(rows.map((row) => [row.id, row] as const))
     const points: MessageId[] = []
     let publishPoint!: () => void
     const pointPublished = new Promise<void>((resolve) => {
@@ -312,25 +287,12 @@ describe('proof-bearing active branch selection', () => {
           kind: 'ready',
           value: await read(blocked.transaction),
         }),
-        readTerminalPresentation: async (messageId) => {
-          const row = rowsById.get(messageId)
-          return {
-            kind: 'ready',
-            value: row
-              ? {
-                  header: row,
-                  message: hydrateMessage(row, body(row)),
-                  bodyVersion: row.bodyVersion,
-                }
-              : undefined,
-          }
-        },
       },
       receipt,
       'terminal',
       (point) => {
-        if (point.kind === 'tip-point') {
-          points.push(point.presentation.message.id)
+        if (point.kind === 'tip-header-point') {
+          points.push(point.header.id)
           publishPoint()
         }
       },

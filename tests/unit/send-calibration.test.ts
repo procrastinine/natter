@@ -302,7 +302,7 @@ async function startSend(
   openStream: (input: GenerationTransportInput) => AsyncIterable<AssistantStreamChunk>,
 ): Promise<GenerationHandle> {
   return startControlledGeneration(
-    { kind: 'send', chatId, expectedLeafId: null, content },
+    { kind: 'send', chatId, target: { kind: 'fixed', messageId: null }, content },
     {
       profile: profile(),
       keyMaterial: { 'calibration-key': 'sk-test' },

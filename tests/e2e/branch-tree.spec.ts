@@ -5,6 +5,7 @@ import {
   buildSseBody,
   clearIndexedDb,
   createChatAndOpen,
+  holdIndexedDbStoreGate,
   mockChatCompletions,
   readMessages,
   seedFirstRun,
@@ -577,12 +578,47 @@ test('shared and child connector targets remain distinct and shared insertion mo
   await expect(page.locator('[data-ui="branch-tree-inspector-content"]')).toContainText(
     'edited tree node',
   )
-  await page.getByRole('button', { name: 'Delete message' }).click()
+  const releaseDelete = await holdIndexedDbStoreGate(page, ['messages'])
+  const deleteMessage = page.getByRole('button', { name: 'Delete message' })
+  try {
+    await deleteMessage.click()
+    const cancelDelete = page.getByRole('button', { name: 'Cancel conversation update' })
+    await expect(cancelDelete).toBeEnabled()
+    await expect(page.locator('[data-ui="branch-tree-view"]')).not.toHaveAttribute(
+      'aria-busy',
+      'true',
+    )
+    await expect(page.locator('[data-ui="branch-tree-search-input"]')).toBeEnabled()
+    await expect(
+      page.locator('[data-ui="toast"]').filter({
+        hasText: 'Conversation update is already in progress.',
+      }),
+    ).toHaveCount(0)
+    await cancelDelete.click()
+  } finally {
+    await releaseDelete()
+  }
+  await expect(page.locator('[data-ui="branch-tree-node"]')).toHaveCount(6)
+  await expect(
+    page.locator('[data-ui="toast"]').filter({ hasText: 'Deleted message.' }),
+  ).toHaveCount(0)
+  await expect(deleteMessage).toBeEnabled()
+  await deleteMessage.click()
   await expect(page.locator('[data-ui="branch-tree-node"]')).toHaveCount(5)
   const deletedToast = page.locator('[data-ui="toast"]').filter({ hasText: 'Deleted message.' })
   await expect(deletedToast.locator('[data-ui="toast-text"]')).toHaveText('Deleted message.')
   await deletedToast.locator('[data-ui="toast-undo"]').click()
   await expect(page.locator('[data-ui="branch-tree-node"]')).toHaveCount(6)
+
+  await page.locator(`[data-ui="branch-tree-node"][data-message-id="${inserted.id}"]`).click()
+  await expect(deleteMessage).toBeEnabled()
+  await deleteMessage.click()
+  await expect(page.locator('[data-ui="branch-tree-node"]')).toHaveCount(5)
+  await expect(
+    page.locator('[data-ui="toast"]').filter({
+      hasText: 'Conversation update is already in progress.',
+    }),
+  ).toHaveCount(0)
 })
 
 test('every leaf exposes an append target that inserts a child after it', async ({ page }) => {
@@ -644,6 +680,104 @@ test('every leaf exposes an append target that inserts a child after it', async 
   ).toHaveAttribute('data-current-leaf', 'true')
   await page.locator('[data-role="chat-branch-tree"]').click()
   await expect(page.locator('[data-ui="message-list"]')).toContainText('child appended after A2')
+})
+
+test('trash deletes an existing imported intermediate node and durably splices its child', async ({
+  page,
+}) => {
+  const fixture = await seedBranchTreeChat(page)
+  await page.goto(`/#/chat/${fixture.chatId}/message/${fixture.B2}`)
+  await page.locator('[data-role="chat-branch-tree"]').click()
+
+  await page.locator(`[data-ui="branch-tree-node"][data-message-id="${fixture.A1}"]`).click()
+  await expect(page.locator('[data-ui="branch-tree-inspector"]')).toHaveAttribute(
+    'data-message-id',
+    fixture.A1,
+  )
+  await page.getByRole('button', { name: 'Delete message' }).click()
+
+  await expect(page.locator('[data-ui="branch-tree-node"]')).toHaveCount(4)
+  await expect
+    .poll(async () => {
+      const [deleted, child] = await Promise.all([
+        readStoredMessage(page, fixture.A1),
+        readStoredMessage(page, fixture.A2),
+      ])
+      return {
+        deleted: deleted?.deleted,
+        childParentId: child?.parentId,
+      }
+    })
+    .toEqual({
+      deleted: true,
+      childParentId: fixture.root,
+    })
+  await expect(
+    page.locator('[data-ui="toast"]').filter({ hasText: 'Deleted message.' }),
+  ).toBeVisible()
+})
+
+test('large imported trash commits directly while an unrelated generation continues', async ({
+  page,
+}) => {
+  let releaseResponse!: () => void
+  const responseGate = new Promise<void>((resolve) => {
+    releaseResponse = resolve
+  })
+  let markRequestSeen!: () => void
+  const requestSeen = new Promise<void>((resolve) => {
+    markRequestSeen = resolve
+  })
+  await page.route('**/api/v1/chat/completions', async (route) => {
+    markRequestSeen()
+    await responseGate
+    await route.fulfill({
+      contentType: 'text/event-stream',
+      body: buildSseBody([
+        { id: 'staged-delete-blocker', content: 'unrelated generation completed' },
+        { finish: 'stop' },
+      ]),
+    })
+  })
+  const fixture = await seedBranchTreeChat(page, { extraBranchRows: 66 })
+  await page.goto(`/#/chat/${fixture.chatId}/message/${fixture.B2}`)
+  await sendMessage(page, 'hold generation while staged delete waits')
+  await requestSeen
+  await expect(page.getByRole('button', { name: 'Stop generating' })).toBeVisible()
+
+  try {
+    await page.locator('[data-role="chat-branch-tree"]').click()
+    await page.locator(`[data-ui="branch-tree-node"][data-message-id="${fixture.A1}"]`).click()
+    const deleteMessage = page.getByRole('button', { name: 'Delete message' })
+    await expect(deleteMessage).toBeEnabled()
+    await deleteMessage.click()
+
+    await expect(page.getByRole('button', { name: 'Cancel conversation update' })).toHaveCount(0)
+    await expect(
+      page.locator('[data-ui="toast"]').filter({ hasText: 'WorkspaceRuntimeReplacementBlocked' }),
+    ).toHaveCount(0)
+    await expect
+      .poll(async () => {
+        const [deleted, child] = await Promise.all([
+          readStoredMessage(page, fixture.A1),
+          readStoredMessage(page, fixture.A2),
+        ])
+        return {
+          deleted: deleted?.deleted,
+          childParentId: child?.parentId,
+        }
+      })
+      .toEqual({
+        deleted: true,
+        childParentId: fixture.root,
+      })
+    await expect(page.getByRole('button', { name: 'Stop generating' })).toBeVisible()
+    await expect(
+      page.locator('[data-ui="toast"]').filter({ hasText: 'Deleted message.' }),
+    ).toBeVisible()
+  } finally {
+    releaseResponse()
+  }
 })
 
 test('tree inspector exposes generation, fork, context, reasoning, and tool actions', async ({
@@ -972,7 +1106,10 @@ test('tree shows and follows a pending response before the first byte arrives', 
   }
 })
 
-async function seedBranchTreeChat(page: Page): Promise<BranchTreeFixture> {
+async function seedBranchTreeChat(
+  page: Page,
+  options: { readonly extraBranchRows?: number } = {},
+): Promise<BranchTreeFixture> {
   const now = Date.now()
   const chatId = 'branch-tree-chat'
   const modelId = 'google/gemini-3.1-flash-lite-preview:free'
@@ -1109,6 +1246,30 @@ async function seedBranchTreeChat(page: Page): Promise<BranchTreeFixture> {
       deleted: false,
     },
   ]
+  let parentId = 'A2'
+  for (let index = 0; index < (options.extraBranchRows ?? 0); index += 1) {
+    const id = `A-extra-${index}`
+    const role = index % 2 === 0 ? 'user' : 'assistant'
+    sourceMessages.push({
+      id,
+      chatId,
+      parentId,
+      siblingIndex: 0,
+      turnId: `turn-${id}`,
+      turnIndex: index + 3,
+      createdAt: now + index + 5,
+      role,
+      origin: role === 'user' ? 'user' : 'imported',
+      content: [
+        role === 'user'
+          ? { type: 'text', text: `large imported branch user ${index}` }
+          : { type: 'output_text', text: `large imported branch assistant ${index}` },
+      ],
+      nodeVersion: 0,
+      deleted: false,
+    })
+    parentId = id
+  }
   const imported = await importPortableChatThroughUi(page, {
     sourceChatId: chatId,
     title: 'Branch tree chat',

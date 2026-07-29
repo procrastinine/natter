@@ -219,7 +219,7 @@ async function startSend(chatId: string, text: string, now: number): Promise<Gen
     {
       kind: 'send',
       chatId,
-      expectedLeafId: chat.lastUpdatedLeafId,
+      target: { kind: 'fixed', messageId: chat.lastUpdatedLeafId },
       content: [{ type: 'text', text }],
     },
     now,

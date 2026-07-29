@@ -3,7 +3,6 @@ import { createChat } from '../helpers/chats'
 import 'fake-indexeddb/auto'
 import { IDBFactory } from 'fake-indexeddb'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
-import { connectionDispatchProfileProof } from '../../src/core/connection-dispatch-proof'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import {
   EMPTY_TEXT_TEMPLATE,
@@ -28,7 +27,6 @@ import {
 import { getChat } from '../../src/store/chats'
 import { configurationApplication } from '../../src/store/configuration-application'
 import { configurationController } from '../../src/store/configuration-controller'
-import { configurationRequestRevisionFor } from '../../src/store/configuration-domain-contract'
 import { __resetDbForTests, getDb } from '../../src/store/db'
 import { exportWorkspaceBackup, restoreWorkspaceBackup } from '../../src/store/import-export'
 import type {
@@ -43,7 +41,6 @@ import {
   getWorkspaceRepository,
 } from '../../src/store/workspace-repository'
 import { runWorkspaceAction, runWorkspaceRead } from '../../src/store/workspace-runtime'
-import { testChatConfigurationLinkTransition } from '../helpers/configuration'
 import { testStreamLeaseAdmission } from '../helpers/stream-leases'
 
 const DB_NAME = 'natter'
@@ -428,7 +425,6 @@ async function captureGenerationPlanningSnapshot(
   if (!chat) throw new Error(`TextTemplatePlanningChatMissing:${chatId}`)
   const templateId = chat.settings.textTemplate
   if (!templateId) throw new Error(`TextTemplatePlanningSelectionMissing:${chatId}`)
-  const savedTextTemplate = await loadSelectedTextTemplate(templateId)
   const profileId = chat.settings.profileId
   if (!profileId) throw new Error(`TextTemplatePlanningProfileSelectionMissing:${chatId}`)
   const profile = await getDb().profiles.get(profileId)
@@ -438,7 +434,6 @@ async function captureGenerationPlanningSnapshot(
       kind: 'attempt.prepare',
       input: {
         strategy: 'send',
-        configurationLinkTransition: testChatConfigurationLinkTransition(chat),
         lease: testStreamLeaseAdmission({
           streamId,
           chatId,
@@ -455,10 +450,10 @@ async function captureGenerationPlanningSnapshot(
             kind: 'send',
             surface: 'chat',
             chatId,
-            target: { kind: 'root' },
-            childSlot: 'empty',
+            target: { kind: 'selection', selection: { kind: 'default' } },
+            childSlot: 'append',
           },
-          claim: {
+          pathHint: {
             chatId,
             structuralVersion: chat.structuralVersion,
             leafId: null,
@@ -472,28 +467,19 @@ async function captureGenerationPlanningSnapshot(
             targetTurn: null,
           },
         },
-        configurationClaim: {
-          configurationVersion: chat.configurationVersion ?? 0,
-          settings: chat.settings,
-          presetId: chat.presetId ?? null,
-          profile: connectionDispatchProfileProof(profile, MODEL_ID),
-          requestRevision: configurationRequestRevisionFor(profile, undefined),
-          dispatchKeyRevisions: [],
+        configurationIntent: {
           preferredDispatchKeyId: null,
-          workspaceSettingOverrides: [],
-          ...(savedTextTemplate ? { savedTextTemplate } : {}),
         },
         placement: {
           chatId,
-          structuralVersion: chat.structuralVersion,
           createdAt: startedAt,
-          slot: {
-            parentId: null,
-            slotVersion: 0,
-            liveCount: 0,
-            nextSiblingIndex: 0,
+          assistantMessageId: assistant.id,
+          user: {
+            messageId: user.id,
+            content: user.content,
+            attachmentRefs: user.attachmentRefs ?? [],
           },
-          messages: [user, assistant],
+          prefillContent: assistant.content,
         },
       },
     }),

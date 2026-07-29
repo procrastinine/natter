@@ -14,7 +14,7 @@ describe('branch selection architecture boundary', () => {
 
     expect(protocol).toContain("kind: 'branch.open'")
     expect(protocol).toContain('export type WorkspaceQueryStage<Q extends WorkspaceQuery>')
-    expect(protocol).toContain('? ConversationDestinationPoint')
+    expect(protocol).toContain('? ConversationDestinationHeaderPoint')
     expect(protocol).toContain('onStage?: (stage: ReadEnvelope<WorkspaceQueryStage<Q>>) => void')
     expect(protocol).not.toContain("kind: 'branch.open-selection'")
     expect(protocol).not.toContain("kind: 'branch.destination-point'")
@@ -22,7 +22,8 @@ describe('branch selection architecture boundary', () => {
     expect(protocol).not.toContain("kind: 'branch.destination-tail'")
     expect(adapter).toContain('openSelection: async')
     expect(adapter).toContain("{ kind: 'branch.open', chatId, target, bodyDemand: 'terminal' }")
-    expect(adapter).toContain('onStage: (stage) => onPoint(')
+    expect(adapter).toContain('onStage: (stage) =>')
+    expect(adapter).toContain('.readSharedMessageMaterial(')
     expect(adapter).not.toContain('loadDestinationTail')
     expect(controller).not.toContain('requestDestinationTail')
     expect(controller).toContain('acceptDestinationPoint(')
@@ -130,6 +131,7 @@ describe('branch selection architecture boundary', () => {
     const controller = source('src/store/conversation-controller.ts')
     const shell = source('src/app/Shell.tsx')
     const messages = source('src/ui/chat/MessageList.tsx')
+    const tree = source('src/ui/chat/BranchTreeView.tsx')
 
     expect(controller).toContain("kind: 'point'")
     expect(controller).toContain('if (retained) return')
@@ -141,13 +143,21 @@ describe('branch selection architecture boundary', () => {
     expect(shell).toContain('| null = activeChatId')
     expect(shell).toContain('const visiblePresentationOnly =')
     expect(shell).toContain('presentationOnly={visiblePresentationOnly}')
+    expect(shell).toContain(
+      'const transcriptMutationsUnavailable = conversationBindingMutationsUnavailable(',
+    )
+    expect(shell).toContain('mutationsUnavailable={transcriptMutationsUnavailable}')
+    expect(shell).toContain('mutationsUnavailable={treeMutationsUnavailable}')
     expect(shell).toContain('generationCapability: activeSendCapability')
     expect(shell).toContain('generationCapabilityController.captureFrame(')
     expect(shell).toContain('generationCapabilityFrame.capability(')
     expect(shell).not.toContain('connectionAvailability,\n    !transcriptPresentationOnly,')
     expect(shell).not.toContain('Resolving the active branch before sending.')
     expect(shell).toContain('const composerPresentation = useSampleAndHoldPresentation(')
-    expect(shell).toContain('presentationOnly={composerPresentation.retained}')
+    expect(shell).toContain(
+      'composerPresentation.retained && !visibleBindingAddressesActiveConversation',
+    )
+    expect(shell).not.toContain('binding.seal.replacementEpoch !== workspace.replacementEpoch')
     expect(shell).not.toContain('foreignPaintedFrame ? null')
     expect(shell).toContain('{transcriptFocusMode ? displayedTranscriptComposer : null}')
     expect(shell).toContain('{transcriptFocusMode ? null : displayedTranscriptComposer}')
@@ -156,10 +166,12 @@ describe('branch selection architecture boundary', () => {
     expect(messages).not.toContain('inert={presentationOnly || undefined}')
     expect(messages).toContain("if (e.key === '[' || e.key === ']')")
     expect(messages.indexOf("if (e.key === '[' || e.key === ']'")).toBeLessThan(
-      messages.indexOf('if (presentationOnly) return', messages.indexOf('const onKey')),
+      messages.indexOf('if (mutationsUnavailable) return', messages.indexOf('const onKey')),
     )
-    expect(messages).toContain('const rowPresentationOnly = presentationOnly || intentOnly')
-    expect(messages).toContain('presentationOnly={rowPresentationOnly}')
+    expect(messages).toContain('const rowMutationsUnavailable = mutationsUnavailable || intentOnly')
+    expect(messages).toContain('presentationOnly={rowMutationsUnavailable}')
+    expect(messages).not.toContain('const rowMutationsUnavailable = presentationOnly || intentOnly')
+    expect(tree).toContain('const bodyActive = viewportActive && !mutationsUnavailable')
   })
 })
 

@@ -171,6 +171,26 @@ describe('generation prompt material lease', () => {
     expectAtMostOnePhysicalReadPerIdentity(requests)
   })
 
+  it('retains a completed tail when a later generation read expands to the full path', async () => {
+    const headers = Array.from(
+      { length: 14 },
+      (_, index) => presentation(`message-${index}`).header,
+    )
+    const lease = createGenerationPromptMaterialLease(WORKSPACE_FENCE, CHAT_ID, [])
+    lease.seal(WORKSPACE_FENCE, prompt(headers))
+    const requests: MessageHeaderRow[][] = []
+    const loader = recordingLoader(requests)
+
+    await lease.read(WORKSPACE_FENCE, headers.slice(-8), loader)
+    await lease.read(WORKSPACE_FENCE, headers, loader)
+
+    expect(requests.map(messageIds)).toEqual([
+      headers.slice(-8).map((header) => header.id),
+      headers.slice(0, 6).map((header) => header.id),
+    ])
+    expectAtMostOnePhysicalReadPerIdentity(requests)
+  })
+
   it('shares an overlapping prefix while loading a disjoint transcript suffix once', async () => {
     const headers = ['message-a', 'message-b', 'message-c'].map((id) => presentation(id).header)
     const { coordinator, lease } = sealedCoordinatorLease(headers)

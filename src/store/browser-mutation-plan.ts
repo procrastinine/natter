@@ -120,13 +120,6 @@ export interface BrowserMutationSemanticOperationPlan {
   readonly assertScope: (scope: MutationScope) => void
 }
 
-export class GenerationPlanningSeedChangedError extends Error {
-  constructor(chatId: ChatId) {
-    super(`GenerationPlanningSeedChanged:${chatId}`)
-    this.name = 'GenerationPlanningSeedChangedError'
-  }
-}
-
 function planGenerationReadSetTransaction(
   readSet: NonNullable<WorkspaceMutationOptions['generationReadSet']>,
 ): GenerationReadSetTransactionPlan {
@@ -568,9 +561,10 @@ function mutationInfrastructurePlan(
       'profiles',
       'privacyPolicies',
       'settings',
+      'textTemplates',
     )
   }
-  if (options?.configurationLinkTransition) addConfigurationLinkMutationTables(builder)
+  if (options?.maintainConfigurationLinksForChatId) addConfigurationLinkMutationTables(builder)
   if (generationReadSet) {
     builder.addReadTable('messages')
     if (generationReadSet.kind === 'messages-and-attachments') {
@@ -620,9 +614,9 @@ function mutationInfrastructurePlan(
         : []),
       ...(initialChat?.folderId ? [`folder:${initialChat.folderId}`] : []),
       ...(initialChat && initialChat.tags.length > 0 ? ['tag-catalog'] : []),
-      ...(options?.planningProfileId ? [`profile:${options.planningProfileId}`] : []),
-      ...(options?.configurationLinkTransition?.expectedResourceNames ?? []),
-      ...(options?.configurationLinkTransition?.nextResourceNames ?? []),
+      ...(options?.maintainConfigurationLinksForChatId
+        ? [`configuration-owner:chat:${options.maintainConfigurationLinksForChatId}`]
+        : []),
       ...[...captureSettingKeys, ...(options?.settingReadKeys ?? [])].map(
         (key) => `setting:${key}`,
       ),
