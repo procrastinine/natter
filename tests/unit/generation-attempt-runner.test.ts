@@ -1151,6 +1151,116 @@ describe('generation attempt runner', () => {
 
   it.each([
     {
+      name: 'Chat Completions',
+      streamContract: chatRouteContract({
+        carrier: 'openrouter-reasoning-details',
+        include: { text: true },
+      }),
+      source: [
+        {
+          type: 'delta',
+          chunk: { choices: [{ delta: { reasoning: 'chat partial reasoning' } }] },
+        },
+      ] as AssistantStreamChunk[],
+      expectedReasoning: 'chat partial reasoning',
+    },
+    {
+      name: 'Responses',
+      streamContract: responsesRouteContract({ include: { summary: true } }),
+      source: [
+        {
+          type: 'event',
+          event: {
+            type: 'response.reasoning_summary_text.delta',
+            output_index: 0,
+            item_id: 'reasoning-abort',
+            summary_index: 0,
+            delta: 'responses partial reasoning',
+          },
+        },
+      ] as AssistantStreamChunk[],
+      expectedReasoning: 'responses partial reasoning',
+    },
+    {
+      name: 'Gemini native',
+      streamContract: geminiRouteContract({ include: { summary: true } }),
+      source: [
+        {
+          type: 'chunk',
+          chunk: {
+            candidates: [
+              {
+                content: {
+                  role: 'model',
+                  parts: [{ text: 'gemini partial reasoning', thought: true }],
+                },
+              },
+            ],
+          },
+        },
+      ] as AssistantStreamChunk[],
+      expectedReasoning: 'gemini partial reasoning',
+    },
+    {
+      name: 'Anthropic',
+      streamContract: anthropicRouteContract({ include: { text: true } }),
+      source: [
+        {
+          type: 'anthropic_event',
+          event: {
+            type: 'content_block_start',
+            index: 0,
+            content_block: { type: 'thinking', thinking: '' },
+          },
+        },
+        {
+          type: 'anthropic_event',
+          event: {
+            type: 'content_block_delta',
+            index: 0,
+            delta: { type: 'thinking_delta', thinking: 'anthropic partial reasoning' },
+          },
+        },
+      ] as AssistantStreamChunk[],
+      expectedReasoning: 'anthropic partial reasoning',
+    },
+  ])('preserves reasoning-only state when $name is aborted before response text', async ({
+    expectedReasoning,
+    source,
+    streamContract,
+  }) => {
+    const controller = new AbortController()
+    const accumulator = createStreamAccumulator({ initialContent: [], now: 0 })
+    const decisions: AttemptTerminalDecision[] = []
+    const result = await runTestGenerationAttempt({
+      open: async function* () {
+        for (const chunk of source) yield chunk
+        controller.abort()
+      },
+      signal: controller.signal,
+      isAborted: () => controller.signal.aborted,
+      streamContract,
+      accumulator,
+      journal: journalDouble(),
+      errorPolicy: SEND_GENERATION_ATTEMPT_ERROR_POLICY,
+      terminal: terminalDouble({
+        complete: async ({ decision }) => {
+          decisions.push(decision)
+          const final = projectStreamAccumulatorFinal(accumulator)
+          expect(final.content).toEqual([{ type: 'output_text', text: '' }])
+          expect(final.reasoningEnvelope?.visible.map((part) => part.text).join('')).toBe(
+            expectedReasoning,
+          )
+        },
+      }),
+    })
+
+    expect(result).toEqual({ outcome: 'abort', abortReason: 'user' })
+    expect(decisions).toEqual([{ outcome: 'abort', abortReason: 'user' }])
+  })
+
+  it.each([
+    {
       name: 'send network failure',
       policy: SEND_GENERATION_ATTEMPT_ERROR_POLICY,
       error: apiError('network'),

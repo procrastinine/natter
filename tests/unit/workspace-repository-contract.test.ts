@@ -11,10 +11,9 @@ import { __resetBroadcastForTests } from '../../src/store/broadcast'
 import {
   __getBrowserWorkspaceSessionRepositoryForTests,
   __resetBrowserRepositoryForTests,
-  executeBrowserCommandInStagedDatabase,
+  executeBrowserCommandInDatabase,
   getBrowserRepository,
 } from '../../src/store/browser-repo'
-import { isBrowserWorkspaceStagedFanoutCommand } from '../../src/store/browser-staged-fanout-command'
 import { cleanPendingBrowserWorkspaceDatabase } from '../../src/store/browser-workspace-database-cleanup'
 import {
   beginBrowserWorkspaceDatabaseReplacement,
@@ -115,34 +114,6 @@ afterAll(async () => {
 })
 
 describe('browser WorkspaceRepository protocol contract', () => {
-  it('keeps every delete shape behind adaptive direct-or-staged fanout admission', () => {
-    for (const mode of ['pair', 'single', 'turn', 'variant'] as const) {
-      expect(
-        isBrowserWorkspaceStagedFanoutCommand({
-          kind: 'message.delete',
-          mode,
-          input: {
-            chatId: 'large-imported-chat',
-            messageId: 'intermediate-node',
-            activeLeafId: 'deep-leaf',
-          },
-        }),
-      ).toBe(true)
-    }
-    expect(
-      isBrowserWorkspaceStagedFanoutCommand({
-        kind: 'message.delete',
-        mode: 'single',
-        input: {
-          chatId: 'large-imported-chat',
-          messageId: 'intermediate-node',
-          activeLeafId: 'deep-leaf',
-          cascade: true,
-        },
-      }),
-    ).toBe(true)
-  })
-
   it('satisfies the reusable stamped query/command/branch contract', async () => {
     await expectWorkspaceRepositoryCoreContract(getBrowserRepository())
   })
@@ -288,15 +259,15 @@ describe('browser WorkspaceRepository protocol contract', () => {
     })
   })
 
-  it('pages staged workspace calibration and publishes identity-only chat evidence', async () => {
-    const calibrationKey = tokenCalibrationKey('staged/calibration-model')
+  it('pages workspace calibration atomically and publishes identity-only chat evidence', async () => {
+    const calibrationKey = tokenCalibrationKey('paged/calibration-model')
     const sample = {
       totalTextChars: 400,
       totalTextTokens: 100,
       sampleCount: 2,
       updatedAt: 1,
     }
-    const chatIds = Array.from({ length: 130 }, (_, index) => `staged-calibration-${index}`)
+    const chatIds = Array.from({ length: 130 }, (_, index) => `paged-calibration-${index}`)
     await getDb().chats.bulkPut(
       chatIds.map((id) => ({
         ...sessionChat(id),
@@ -306,7 +277,7 @@ describe('browser WorkspaceRepository protocol contract', () => {
     )
     const workspace = await readBrowserWorkspaceMeta(getDb())
 
-    const execution = await executeBrowserCommandInStagedDatabase(getDb(), workspace, {
+    const execution = await executeBrowserCommandInDatabase(getDb(), workspace, {
       kind: 'chat.calibration.clear-family',
       calibrationKey,
       now: 10,
@@ -328,8 +299,8 @@ describe('browser WorkspaceRepository protocol contract', () => {
     })
   })
 
-  it('queues a staged foreground command behind a generation without surfacing replacement blocked', async () => {
-    const calibrationKey = tokenCalibrationKey('staged/blocked-generation-model')
+  it('queues a foreground command behind a generation without replacing the workspace', async () => {
+    const calibrationKey = tokenCalibrationKey('paged/blocked-generation-model')
     const sample = {
       totalTextChars: 400,
       totalTextTokens: 100,
@@ -357,7 +328,7 @@ describe('browser WorkspaceRepository protocol contract', () => {
         })
         await generationGate
       },
-      { lineageId: 'generation:staged-command-blocker' },
+      { lineageId: 'generation:paged-command-blocker' },
     )
     let commandSettled = false
     const command = runWorkspaceAction('message-structure', (permit) =>
@@ -380,13 +351,19 @@ describe('browser WorkspaceRepository protocol contract', () => {
 
     releaseGeneration()
     await generation
-    await expect(command).resolves.toMatchObject({
+    const committed = await command
+    expect(committed).toMatchObject({
       value: { value: { globalChanged: false, chatCount: 130 } },
+    })
+    expect(committed.receipt.chats).toEqual([])
+    expect(committed.delta.invalidations).toContainEqual({
+      kind: 'chat',
+      chatIds: [...chatIds].sort(),
     })
     expect(generationAborted).toBe(false)
   })
 
-  it('pages staged prompt target fanout and publishes identity-only chat evidence', async () => {
+  it('pages prompt target fanout atomically and publishes identity-only chat evidence', async () => {
     const preset: PromptPreset = {
       id: 'staged-prompt-fanout',
       kind: 'system',
@@ -414,7 +391,7 @@ describe('browser WorkspaceRepository protocol contract', () => {
     ])
     const workspace = await readBrowserWorkspaceMeta(getDb())
 
-    const execution = await executeBrowserCommandInStagedDatabase(getDb(), workspace, {
+    const execution = await executeBrowserCommandInDatabase(getDb(), workspace, {
       kind: 'configuration.execute',
       input: {
         kind: 'prompt-preset.overwrite-and-pin',
@@ -450,7 +427,7 @@ describe('browser WorkspaceRepository protocol contract', () => {
     })
   })
 
-  it('rolls back every earlier page when a staged destination command fails late', async () => {
+  it('rolls back every earlier page when an atomic command fails late', async () => {
     const preset: PromptPreset = {
       id: 'failed-staged-prompt',
       kind: 'system',
@@ -491,7 +468,7 @@ describe('browser WorkspaceRepository protocol contract', () => {
     const beforeLastChat = await getDb().chats.get(chatIds.at(-1) ?? '')
 
     await expect(
-      executeBrowserCommandInStagedDatabase(getDb(), beforeWorkspace, {
+      executeBrowserCommandInDatabase(getDb(), beforeWorkspace, {
         kind: 'configuration.execute',
         input: {
           kind: 'prompt-preset.overwrite-and-pin',
@@ -509,7 +486,7 @@ describe('browser WorkspaceRepository protocol contract', () => {
     expect(await getDb().chats.get(chatIds.at(-1) ?? '')).toEqual(beforeLastChat)
   })
 
-  it('pages staged connection reassignment and publishes one identity-only result', async () => {
+  it('pages connection reassignment atomically and publishes one identity-only result', async () => {
     const source: ConnectionProfile = {
       id: 'staged-source-profile',
       name: 'Staged source profile',
@@ -548,7 +525,7 @@ describe('browser WorkspaceRepository protocol contract', () => {
     )
     const workspace = await readBrowserWorkspaceMeta(getDb())
 
-    const execution = await executeBrowserCommandInStagedDatabase(getDb(), workspace, {
+    const execution = await executeBrowserCommandInDatabase(getDb(), workspace, {
       kind: 'configuration.execute',
       input: {
         kind: 'connection.delete',

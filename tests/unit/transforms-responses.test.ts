@@ -166,7 +166,7 @@ describe('toResponses — envelope', () => {
   it('serializes enabled OpenRouter hosted tools only when explicitly allowed', () => {
     const s = settings({
       ...openRouterTools({
-        enabledServerToolIds: ['web-search', 'datetime', 'web-fetch'],
+        enabledServerToolIds: ['web-search', 'datetime', 'web-fetch', 'shell'],
         toolChoice: 'auto',
         parallelToolCalls: true,
       }),
@@ -179,6 +179,7 @@ describe('toResponses — envelope', () => {
       { type: 'openrouter:web_search' },
       { type: 'openrouter:datetime' },
       { type: 'openrouter:web_fetch' },
+      { type: 'openrouter:shell' },
     ])
     expect(wire.tool_choice).toBe('auto')
     expect(wire.parallel_tool_calls).toBe(true)

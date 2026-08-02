@@ -828,8 +828,6 @@ export const TEMPORAL_SEMANTIC_GROUPS = Object.freeze([
         'src/store/browser-query-pages.ts|readStreamLeasePages|ForStatement|unbounded|1',
         'src/store/browser-workspace-derived-repair.ts|rebuildChildSlotDerivedState|ForStatement|unbounded|1',
         'src/store/browser-workspace-derived-repair.ts|forEachPrimaryPage|ForStatement|unbounded|1',
-        'src/store/browser-workspace-staged-fanout.ts|copyStagedWorkspace|ForStatement|unbounded|1',
-        'src/store/browser-workspace-staged-fanout.ts|drainStagedWorkspaceCatchup|ForStatement|unbounded|1',
         'src/store/browser-workspace-startup-repair.ts|copyCanonicalBrowserWorkspaceRows|ForStatement|unbounded|1',
         'src/store/chat-search.ts|iterateSearchSidebarPages|ForStatement|unbounded|1',
         'src/store/chat-sidebar-projection.ts|rebuildChatSidebarProjectionRowsInTransaction|ForStatement|unbounded|1',

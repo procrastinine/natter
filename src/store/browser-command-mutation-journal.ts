@@ -13,6 +13,7 @@ import type {
 import type { AttachmentId, Chat, ChatId, MessageId } from '../core/types'
 import { sameValue } from '../lib/same-value'
 import {
+  BROWSER_COMMAND_DIRECT_FANOUT_BUDGET,
   type BrowserCommandFanoutBudget,
   BrowserCommandFanoutBudgetExceededError,
 } from './browser-command-fanout-budget'
@@ -60,7 +61,7 @@ interface MutableMutationJournal {
   readonly childSlots: Map<string, WorkspaceLocalChildSlotAccumulator>
   readonly chatIds: Set<ChatId>
   readonly initialChatExistsById: Map<ChatId, boolean>
-  readonly finalChatById: Map<ChatId, Chat | null>
+  readonly finalChatById: Map<ChatId, Chat | null | undefined>
   readonly handledKeyRequestMaterialIds: Set<string>
   readonly catchupActiveByTable: Map<string, boolean>
   successfulMutations: number
@@ -68,6 +69,7 @@ interface MutableMutationJournal {
   physicalReadPhase: 'command' | 'finalization'
   readonly fanoutBudget?: BrowserCommandFanoutBudget
   readonly retainFullChatStates: boolean
+  chatStateRetentionExceeded: boolean
   fanoutLargestReadRequestRows: number
   fanoutLargestReadRequestBytes: number
   fanoutWriteRows: number
@@ -274,6 +276,7 @@ export async function runBrowserCommandTransaction<T>(
     physicalReadPhase: 'command',
     ...(options.fanoutBudget ? { fanoutBudget: options.fanoutBudget } : {}),
     retainFullChatStates: options.retainFullChatStates !== false,
+    chatStateRetentionExceeded: false,
     fanoutLargestReadRequestRows: 0,
     fanoutLargestReadRequestBytes: 0,
     fanoutWriteRows: 0,
@@ -1490,14 +1493,18 @@ function recordSuccessfulChatMutations(
         const chatId = (value as { id?: unknown }).id
         if (typeof chatId !== 'string') throw new Error('BrowserCommandChatMutationIdMissing')
         journal.chatIds.add(chatId)
-        if (journal.retainFullChatStates || request.type === 'add') {
+        if (
+          request.type === 'add' ||
+          (journal.retainFullChatStates && !journal.chatStateRetentionExceeded)
+        ) {
           journal.finalChatById.set(chatId, value as Chat)
         } else {
-          journal.finalChatById.delete(chatId)
+          journal.finalChatById.set(chatId, undefined)
         }
         if (!journal.initialChatExistsById.has(chatId)) {
           journal.initialChatExistsById.set(chatId, request.type !== 'add')
         }
+        thinRetainedChatStatesIfNeeded(journal)
       })
       return
     case 'delete':
@@ -1513,6 +1520,32 @@ function recordSuccessfulChatMutations(
       return
     case 'deleteRange':
       throw new Error('BrowserCommandChatDeleteRangeForbidden')
+  }
+}
+
+function thinRetainedChatStatesIfNeeded(journal: MutableMutationJournal): void {
+  if (!journal.retainFullChatStates || journal.chatStateRetentionExceeded) return
+  const retained = [...journal.finalChatById].flatMap(([chatId, value]) =>
+    journal.initialChatExistsById.get(chatId) === true && value ? [value] : [],
+  )
+  let totalBytes = 0
+  let largestBytes = 0
+  for (const chat of retained) {
+    const bytes = estimateStoredValueBytes(chat)
+    totalBytes = saturatingCount(totalBytes, bytes)
+    largestBytes = Math.max(largestBytes, bytes)
+  }
+  if (
+    retained.length <= BROWSER_COMMAND_DIRECT_FANOUT_BUDGET.maxWriteRows &&
+    Math.max(0, totalBytes - largestBytes) <= BROWSER_COMMAND_DIRECT_FANOUT_BUDGET.maxWriteBytes
+  ) {
+    return
+  }
+  journal.chatStateRetentionExceeded = true
+  for (const [chatId, value] of journal.finalChatById) {
+    if (journal.initialChatExistsById.get(chatId) === true && value !== null) {
+      journal.finalChatById.set(chatId, undefined)
+    }
   }
 }
 

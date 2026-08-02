@@ -1088,6 +1088,13 @@ function sameVisibleMetadata(
   )
 }
 
+export function reasoningVisiblePartEquals(
+  left: ReasoningVisiblePartV2,
+  right: ReasoningVisiblePartV2,
+): boolean {
+  return left.text === right.text && sameVisibleMetadata(left, right)
+}
+
 function sameCarrierDescriptor(
   left: OpaqueReasoningCarrierV2Descriptor,
   right: OpaqueReasoningCarrierV2Descriptor,
@@ -1101,6 +1108,13 @@ function sameCarrierDescriptor(
     boundVisiblePartId(left) === boundVisiblePartId(right) &&
     sameReasoningSource(left.source, right.source)
   )
+}
+
+export function reasoningCarrierDescriptorEquals(
+  left: OpaqueReasoningCarrierV2Descriptor,
+  right: OpaqueReasoningCarrierV2Descriptor,
+): boolean {
+  return sameCarrierDescriptor(left, right)
 }
 
 function sameReasoningSource(left: ReasoningSourceRefV2, right: ReasoningSourceRefV2): boolean {
@@ -1123,6 +1137,12 @@ function withoutCarrierValue(
   }
   const { data: _data, ...descriptor } = carrier
   return descriptor
+}
+
+export function reasoningCarrierDescriptorFromCarrier(
+  carrier: OpaqueReasoningCarrierV2,
+): OpaqueReasoningCarrierV2Descriptor {
+  return cloneCarrierDescriptor(withoutCarrierValue(carrier))
 }
 
 function isReasoningProducerBridge(value: unknown): value is ReasoningProducerBridge {

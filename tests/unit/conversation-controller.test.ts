@@ -1377,8 +1377,20 @@ describe('conversation controller', () => {
       }),
     ).toBe('available')
 
+    const retainedPublicationIds: MessageId[][] = []
+    const unsubscribe = controller.subscribe(() => {
+      const binding = controller.getSnapshot().active?.presentation.painted?.binding
+      if (binding?.surface !== 'transcript') return
+      retainedPublicationIds.push(
+        [...transcriptBodyWindowRows(binding.window)].map((row) => row.header.id),
+      )
+    })
+
     releaseSelection()
     await settle()
+    unsubscribe()
+    expect(retainedPublicationIds.length).toBeGreaterThan(0)
+    expect(retainedPublicationIds.every((messageIds) => messageIds.includes(oldLeaf.id))).toBe(true)
     expect(controller.getSnapshot().active?.destination).toMatchObject({
       kind: 'ready',
       spine: { resolvedLeafId: newLeaf.id },
@@ -2193,6 +2205,86 @@ describe('conversation controller', () => {
     retention.release()
     await settle()
     expect(transcriptMessages(exactTranscript(controller)).map((row) => row.id)).toEqual([leafId])
+  })
+
+  it('carries an exact edit claim across a same-workspace physical replacement', async () => {
+    const root = message('replacement-retained-root', null, 0, 'root', 1)
+    const branchA = message('replacement-retained-a', root.id, 0, 'branch A', 2)
+    const branchB = message('replacement-retained-b', root.id, 1, 'branch B', 2)
+    const { controller, navigation, source } = harness([root, branchA, branchB])
+    navigation.arrive('arrival-replacement-retained-a', {
+      chatId: CHAT_ID,
+      targetMessageId: branchA.id,
+    })
+    await settle()
+
+    const before = expectCoherentReadyPresentation(
+      controller.getSnapshot().active?.presentation,
+      'transcript',
+    )
+    const retention = controller.claimTranscriptRetention({
+      workspaceFence: FENCE,
+      chatId: CHAT_ID,
+      messageId: branchA.id,
+    })
+    const replacementFence = Object.freeze({ ...FENCE, replacementEpoch: 1 })
+    source.workspaceFence = replacementFence
+    controller.reconcileWorkspace(replacementFence)
+    await settle()
+
+    navigation.arrive('arrival-replacement-retained-b', {
+      chatId: CHAT_ID,
+      targetMessageId: branchB.id,
+    })
+    await settle()
+    const during = controller.getSnapshot().active?.presentation
+    const painted = during?.painted?.binding
+    expect(painted?.surface).toBe('transcript')
+    if (painted?.surface !== 'transcript') throw new Error('missing retained transcript')
+    expect(transcriptMessages(painted.window).map((row) => row.id)).toEqual(
+      transcriptMessages(before.window).map((row) => row.id),
+    )
+
+    retention.release()
+    await settle()
+    const after = expectCoherentReadyPresentation(
+      controller.getSnapshot().active?.presentation,
+      'transcript',
+    )
+    expect(transcriptMessages(after.window).map((row) => row.id)).toEqual([root.id, branchB.id])
+  })
+
+  it('does not carry an edit claim into a different logical workspace', async () => {
+    const root = message('replacement-foreign-root', null, 0, 'root', 1)
+    const branchA = message('replacement-foreign-a', root.id, 0, 'branch A', 2)
+    const branchB = message('replacement-foreign-b', root.id, 1, 'branch B', 2)
+    const { controller, navigation, source } = harness([root, branchA, branchB])
+    navigation.arrive('arrival-replacement-foreign-a', {
+      chatId: CHAT_ID,
+      targetMessageId: branchA.id,
+    })
+    await settle()
+    const retention = controller.claimTranscriptRetention({
+      workspaceFence: FENCE,
+      chatId: CHAT_ID,
+      messageId: branchA.id,
+    })
+
+    const replacementFence = Object.freeze({ workspaceId: 'workspace-b', replacementEpoch: 1 })
+    source.workspaceFence = replacementFence
+    navigation.arrive('arrival-replacement-foreign-b', {
+      chatId: CHAT_ID,
+      targetMessageId: branchB.id,
+    })
+    controller.reconcileWorkspace(replacementFence)
+    await settle()
+
+    const after = expectCoherentReadyPresentation(
+      controller.getSnapshot().active?.presentation,
+      'transcript',
+    )
+    expect(transcriptMessages(after.window).map((row) => row.id)).toEqual([root.id, branchB.id])
+    retention.release()
   })
 
   it('hands a finalized local body directly into the painted transcript frame', async () => {

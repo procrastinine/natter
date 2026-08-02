@@ -9,6 +9,7 @@ import {
   pendingGenerationCapability,
   unavailableGenerationCapability,
 } from '../../src/core/interaction-capability'
+import type { MessageBodyAuthoringOperations } from '../../src/core/message-body-authoring'
 import type { MessageAttachmentRef } from '../../src/core/types'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
 import { __resetBrowserRepositoryForTests } from '../../src/store/browser-repo'
@@ -583,8 +584,46 @@ describe('Composer', () => {
     expect(submitted?.[0]).toMatchObject({ includeInContext: true })
   })
 
-  it('passes inline attachments only through Save & Send', async () => {
-    const onSave = vi.fn(() => succeededInteractionSettlement())
+  it('commits inline attachment edits through Save', async () => {
+    const onSave = vi.fn(
+      (
+        _text: string,
+        _authoring?: MessageBodyAuthoringOperations,
+        _attachmentRefs?: MessageAttachmentRef[],
+      ) => succeededInteractionSettlement(),
+    )
+    const { container } = render(
+      <InlineEditor initial="assistant answer" onSave={onSave} onCancel={() => {}} />,
+    )
+    const fileInput = container.querySelector(
+      '[data-ui="attachment-hidden-input"]',
+    ) as HTMLInputElement
+
+    fireEvent.change(fileInput, {
+      target: {
+        files: [new File(['assistant evidence'], 'assistant-evidence.txt', { type: 'text/plain' })],
+      },
+    })
+
+    expect(await screen.findByText('assistant-evidence.txt')).toBeInTheDocument()
+    await waitFor(() =>
+      expect(
+        container.querySelector('[data-ui="attachment-file-card"][data-storage="local"]'),
+      ).toBeInTheDocument(),
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    await waitFor(() => expect(onSave).toHaveBeenCalledOnce())
+    expect(onSave.mock.calls[0]?.[0]).toBe('assistant answer')
+    expect(onSave.mock.calls[0]?.[1]).toBeUndefined()
+    expect(onSave.mock.calls[0]?.[2]).toHaveLength(1)
+    expect(onSave.mock.calls[0]?.[2]?.[0]).toMatchObject({ includeInContext: true })
+  })
+
+  it('passes inline attachments through Save & Send', async () => {
+    const onSave = vi.fn((_text: string, _authoring?: MessageBodyAuthoringOperations) =>
+      succeededInteractionSettlement(),
+    )
     const onSaveAndSend = vi.fn(
       (
         _text: string,
@@ -730,7 +769,7 @@ describe('Composer', () => {
     expect(onCancel).not.toHaveBeenCalled()
   })
 
-  it('keeps reasoning and provider output outside the content-only editor', async () => {
+  it('keeps reasoning controls off message roles that do not own reasoning', async () => {
     const onSave = vi.fn(() => succeededInteractionSettlement())
     const { container } = render(
       <InlineEditor initial="existing message" onSave={onSave} onCancel={() => {}} />,
@@ -745,6 +784,234 @@ describe('Composer', () => {
 
     await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1))
     expect(onSave).toHaveBeenCalledWith('existing message updated')
+  })
+
+  it('authors reasoning and provider-output fields, creation and deletion in one save', async () => {
+    const onSave = vi.fn((_text: string, _authoring?: MessageBodyAuthoringOperations) =>
+      succeededInteractionSettlement(),
+    )
+    const initialReasoning = {
+      owners: [{ kind: 'generation' }, { kind: 'continuation', streamId: 'continuation-1' }],
+      entries: [
+        {
+          kind: 'visible',
+          owner: { kind: 'generation' },
+          part: {
+            id: 'visible-1',
+            groupId: 'group-1',
+            kind: 'text',
+            text: 'original reasoning',
+            format: 'unknown',
+            source: { dialect: 'unknown', bridge: 'unknown' },
+          },
+        },
+        {
+          kind: 'carrier',
+          owner: { kind: 'generation' },
+          carrier: {
+            id: 'carrier-1',
+            groupId: 'carrier-group',
+            kind: 'unknown',
+            format: 'unknown',
+            source: { dialect: 'unknown', bridge: 'unknown' },
+          },
+          payloadLength: 42,
+        },
+      ],
+    } as const
+    const initialProviderOutput = {
+      owners: [{ kind: 'generation' }],
+      entries: [
+        {
+          editorId: 'stored:generation:0',
+          owner: { kind: 'generation' },
+          member: { owner: { kind: 'generation' }, itemIndex: 0 },
+          original: {
+            dialect: 'openai-responses',
+            type: 'web_search_call',
+            outputIndex: 0,
+            item: { query: 'before', encrypted_content: 'sealed' },
+          },
+          item: {
+            dialect: 'openai-responses',
+            type: 'web_search_call',
+            outputIndex: 0,
+            item: { query: 'before', encrypted_content: 'sealed' },
+          },
+        },
+        {
+          editorId: 'stored:generation:1',
+          owner: { kind: 'generation' },
+          member: { owner: { kind: 'generation' }, itemIndex: 1 },
+          original: {
+            dialect: 'unknown',
+            type: 'delete_me',
+            outputIndex: 1,
+            item: { obsolete: true },
+          },
+          item: {
+            dialect: 'unknown',
+            type: 'delete_me',
+            outputIndex: 1,
+            item: { obsolete: true },
+          },
+        },
+      ],
+    } as const
+    render(
+      <InlineEditor
+        initial="answer"
+        initialReasoning={initialReasoning}
+        initialProviderOutput={initialProviderOutput}
+        onSave={onSave}
+        onCancel={() => {}}
+      />,
+    )
+
+    fireEvent.click(screen.getByText('Reasoning (2)'))
+    fireEvent.change(screen.getByRole('combobox', { name: 'Reasoning block type' }), {
+      target: { value: 'summary' },
+    })
+    fireEvent.change(screen.getByRole('textbox', { name: 'Edit summary reasoning' }), {
+      target: { value: 'authored summary' },
+    })
+    const [visibleHide] = screen.getAllByRole('button', { name: 'Hide reasoning block' })
+    if (!visibleHide) throw new Error('VisibleReasoningHideMissing')
+    fireEvent.click(visibleHide)
+    fireEvent.click(screen.getByRole('button', { name: 'Delete opaque reasoning block' }))
+    fireEvent.change(screen.getByRole('combobox', { name: 'New reasoning block owner' }), {
+      target: { value: '1' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Add reasoning block' }))
+    fireEvent.change(screen.getByRole('textbox', { name: 'Edit plaintext reasoning' }), {
+      target: { value: 'continued detail' },
+    })
+    fireEvent.click(screen.getByText('Tool calls (2)'))
+    const providerInputs = await screen.findAllByRole('textbox', {
+      name: 'Edit tool call JSON or text',
+    })
+    const firstProviderInput = providerInputs[0]
+    if (!firstProviderInput) throw new Error('ProviderOutputEditorMissing')
+    fireEvent.change(firstProviderInput, { target: { value: '{"query":"after"}' } })
+    const deleteToolCalls = screen.getAllByRole('button', { name: 'Delete tool call' })
+    const deleteSecond = deleteToolCalls[1]
+    if (!deleteSecond) throw new Error('SecondProviderOutputDeleteMissing')
+    fireEvent.click(deleteSecond)
+    fireEvent.click(screen.getByRole('button', { name: 'Add tool call' }))
+    const addedProviderInput = screen.getAllByRole('textbox', {
+      name: 'Edit tool call JSON or text',
+    })[1]
+    if (!addedProviderInput) throw new Error('AddedProviderOutputEditorMissing')
+    fireEvent.change(addedProviderInput, { target: { value: '{"authored":true}' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    await waitFor(() => expect(onSave).toHaveBeenCalledOnce())
+    const authoring = onSave.mock.calls[0]?.[1]
+    const operations = authoring?.reasoning
+    expect(operations).toHaveLength(3)
+    expect(operations?.[0]).toMatchObject({
+      kind: 'visible-replace',
+      member: { owner: { kind: 'generation' }, kind: 'visible', id: 'visible-1' },
+      expected: { id: 'visible-1', kind: 'text', text: 'original reasoning' },
+      next: { id: 'visible-1', kind: 'summary', text: 'authored summary', hidden: true },
+    })
+    expect(operations?.[1]).toMatchObject({
+      kind: 'carrier-delete',
+      member: { owner: { kind: 'generation' }, kind: 'carrier', id: 'carrier-1' },
+      expected: { id: 'carrier-1' },
+    })
+    expect(operations?.[2]).toMatchObject({
+      kind: 'visible-create',
+      owner: { kind: 'continuation', streamId: 'continuation-1' },
+      part: { kind: 'text', text: 'continued detail', format: 'unknown' },
+    })
+    expect(authoring?.providerOutput).toHaveLength(3)
+    expect(authoring?.providerOutput?.[0]).toMatchObject({
+      kind: 'provider-output-replace',
+      next: {
+        edited: true,
+        item: { query: 'after', encrypted_content: 'sealed' },
+      },
+    })
+    expect(authoring?.providerOutput?.[1]).toMatchObject({
+      kind: 'provider-output-delete',
+      member: { itemIndex: 1 },
+    })
+    expect(authoring?.providerOutput?.[2]).toMatchObject({
+      kind: 'provider-output-create',
+      item: { type: 'manual_tool_call', outputIndex: 1, edited: true, item: { authored: true } },
+    })
+  })
+
+  it('plans reasoning edits from the mounted snapshot without deleting remote additions', async () => {
+    const onSave = vi.fn((_text: string, _authoring?: MessageBodyAuthoringOperations) =>
+      succeededInteractionSettlement(),
+    )
+    const original = {
+      owners: [{ kind: 'generation' }],
+      entries: [
+        {
+          kind: 'visible',
+          owner: { kind: 'generation' },
+          part: {
+            id: 'visible-original',
+            groupId: 'group-original',
+            kind: 'text',
+            text: 'opening snapshot',
+            format: 'unknown',
+            source: { dialect: 'unknown', bridge: 'unknown' },
+          },
+        },
+      ],
+    } as const
+    const remoteAddition = {
+      kind: 'visible',
+      owner: { kind: 'generation' },
+      part: {
+        id: 'visible-remote',
+        groupId: 'group-remote',
+        kind: 'summary',
+        text: 'remote addition',
+        format: 'unknown',
+        source: { dialect: 'unknown', bridge: 'unknown' },
+      },
+    } as const
+    const view = render(
+      <InlineEditor
+        initial="answer"
+        initialReasoning={original}
+        onSave={onSave}
+        onCancel={() => {}}
+      />,
+    )
+
+    view.rerender(
+      <InlineEditor
+        initial="answer"
+        initialReasoning={{ ...original, entries: [...original.entries, remoteAddition] }}
+        onSave={onSave}
+        onCancel={() => {}}
+      />,
+    )
+    fireEvent.click(screen.getByText('Reasoning (1)'))
+    fireEvent.change(screen.getByRole('textbox', { name: 'Edit plaintext reasoning' }), {
+      target: { value: 'local replacement' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    await waitFor(() => expect(onSave).toHaveBeenCalledOnce())
+    const operations = onSave.mock.calls[0]?.[1]?.reasoning
+    expect(operations).toHaveLength(1)
+    expect(operations?.[0]).toMatchObject({
+      kind: 'visible-replace',
+      expected: { id: 'visible-original', text: 'opening snapshot' },
+      next: { id: 'visible-original', text: 'local replacement' },
+    })
+    expect(
+      operations?.some(
+        (operation) => 'expected' in operation && operation.expected.id === 'visible-remote',
+      ),
+    ).toBe(false)
   })
 
   it('lets only the mounted edit session dismiss after Save settles', async () => {

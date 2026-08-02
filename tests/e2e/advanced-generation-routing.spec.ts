@@ -12,6 +12,7 @@ import {
 } from './helpers'
 
 const OR_CHAT_MODEL = 'qwen/qwen3-4b'
+const OR_BOTH_CHAT_ROUTES_MODEL = 'openai/gpt-4.1-mini'
 const OR_RESPONSES_MODEL = 'openai/gpt-5.4'
 const OPENAI_MODEL = 'gpt-5.4-nano'
 const GOOGLE_MODEL = 'gemini-3.1-flash-lite-preview'
@@ -229,6 +230,81 @@ test('GUI OpenRouter hosted tools serialize for chat routes but not text complet
   expect(textRequests[0]?.url).toBe('https://openrouter.ai/api/v1/completions')
   expect(textRequests[0]?.body.tools).toBeUndefined()
 
+  expectNoConsoleProblems(consoleLines)
+})
+
+test('GUI OpenRouter Shell is retained but exposed and serialized only on Responses', async ({
+  page,
+}) => {
+  const consoleLines = captureConsole(page)
+  const responsesRequests: CapturedRequest[] = []
+  const chatRequests: CapturedRequest[] = []
+  await mockOpenRouterDiscovery(page, OR_BOTH_CHAT_ROUTES_MODEL, {
+    supportedParameters: ['provider', 'tools', 'tool_choice', 'parallel_tool_calls'],
+  })
+  await mockOpenRouterResponses(page, responsesRequests)
+  await mockChatCompletionsCapture(page, chatRequests, ['hosted chat ok'])
+
+  await seedFirstRun(page, {
+    model: OR_BOTH_CHAT_ROUTES_MODEL,
+    disablePrivacyFilter: false,
+    corsProxyUrl: '/_or_scrape',
+  })
+  await createChatAndOpen(page)
+  await openSettingsPanel(page)
+  await page.getByRole('tab', { name: 'Generation' }).click()
+
+  const tools = page.locator('[data-ui-section="hosted-tools"]')
+  await expect(tools.getByRole('checkbox', { name: 'Web search' })).toBeVisible()
+  await expect(tools.getByRole('checkbox', { name: 'Datetime' })).toBeVisible()
+  await expect(tools.getByRole('checkbox', { name: 'Web fetch' })).toBeVisible()
+  await expect(tools.getByRole('checkbox', { name: 'Shell' })).toHaveCount(0)
+  await expect(tools.getByRole('checkbox', { name: 'Image generation' })).toHaveCount(0)
+
+  await page.getByRole('tab', { name: 'Model' }).click()
+  const apiMode = page.locator('[data-ui-section="api-mode"]')
+  await apiMode.getByRole('button', { name: 'Responses', exact: true }).click()
+  await page.getByRole('tab', { name: 'Generation' }).click()
+  for (const label of ['Web search', 'Datetime', 'Web fetch', 'Shell']) {
+    const checkbox = tools.getByRole('checkbox', { name: label })
+    await expect(checkbox).toBeVisible()
+    await checkbox.check()
+    await expect(checkbox).toBeChecked()
+  }
+
+  await page.reload()
+  await openSettingsPanel(page)
+  await page.getByRole('tab', { name: 'Generation' }).click()
+  await expect(tools.getByRole('checkbox', { name: 'Shell' })).toBeChecked()
+  await page.locator('[data-role="settings-cog"]').click()
+  await sendAndExpectAssistant(
+    page,
+    'Inspect the hosted environment.',
+    'CJK answer from responses.',
+  )
+
+  expect(responsesRequests).toHaveLength(1)
+  expect(responsesRequests[0]?.body.tools).toEqual([
+    { type: 'openrouter:web_search' },
+    { type: 'openrouter:datetime' },
+    { type: 'openrouter:web_fetch' },
+    { type: 'openrouter:shell' },
+  ])
+
+  await openSettingsPanel(page)
+  await page.getByRole('tab', { name: 'Model' }).click()
+  await apiMode.getByRole('button', { name: 'Chat completions', exact: true }).click()
+  await page.getByRole('tab', { name: 'Generation' }).click()
+  await expect(tools.getByRole('checkbox', { name: 'Shell' })).toHaveCount(0)
+  await page.locator('[data-role="settings-cog"]').click()
+  await sendAndExpectAssistant(page, 'Use the ordinary hosted tools.', 'hosted chat ok')
+
+  expect(chatRequests).toHaveLength(1)
+  expect(chatRequests[0]?.body.tools).toEqual([
+    { type: 'openrouter:web_search' },
+    { type: 'openrouter:datetime' },
+    { type: 'openrouter:web_fetch' },
+  ])
   expectNoConsoleProblems(consoleLines)
 })
 

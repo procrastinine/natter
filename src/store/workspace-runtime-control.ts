@@ -1040,22 +1040,6 @@ export const launchImportExportWorkspaceRuntimeReplacementNow = createWorkspaceR
   productionWorkspaceRuntimeControl.launchWorkspaceRuntimeReplacementNow,
 )
 
-export const launchCommandFanoutWorkspaceRuntimeReplacementNow =
-  createWorkspaceReplacementAdmission(
-    'command-fanout',
-    false,
-    productionWorkspaceRuntimeControl.launchWorkspaceRuntimeReplacementNow,
-  )
-
-export function launchCommandFanoutWorkspaceRuntimeReplacementWhenUnblocked(
-  options: WorkspaceRuntimeActionOptions = {},
-): Promise<WorkspaceReconcileAuthority | null> {
-  return productionWorkspaceRuntimeControl.launchWorkspaceRuntimeReplacementWhenUnblocked(
-    'command-fanout',
-    { ...options, requireIdle: false },
-  )
-}
-
 export const tryLaunchMaintenanceWorkspaceRuntimeReplacementIfIdle =
   createWorkspaceReplacementAdmission(
     'maintenance',

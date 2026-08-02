@@ -899,7 +899,7 @@ describe('generation lifecycle contract', () => {
       error: { category: 'network' as const, code: 'NETWORK', message: 'original ended' },
     }
     await executeMessageCommand({
-      kind: 'message.edit-content',
+      kind: 'message.edit-body',
       input: { chatId, messageId: target.id, content: originalContent },
     })
     await patchMessageFixture(target.id, { generation: originalGeneration })
@@ -1416,7 +1416,7 @@ describe('generation lifecycle contract', () => {
     const { chatId, target } = await seedAssistant('edit-race')
     const baseline = required(await presentationFor(target.id), 'baseline')
     await executeMessageCommand({
-      kind: 'message.edit-content',
+      kind: 'message.edit-body',
       input: {
         chatId,
         messageId: target.id,

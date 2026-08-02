@@ -17,12 +17,12 @@ export const INTERACTION_EFFECT_KINDS = Object.freeze([
 
 export const INTERACTION_REVIEW_BASELINE = Object.freeze({
   schemaVersion: 5,
-  exactSiteCount: 800,
+  exactSiteCount: 838,
   sourceCount: 59,
-  exactSiteIdSha256: '055c9861e9d11ef1151727b81bffe6869a1660a905c71d7275ad2b205ec87db4',
-  sourceFactSha256: 'e65a4a0106edadfe98ff33281a89de0dfe531390da49cfeec064faa537098823',
+  exactSiteIdSha256: '4251162a8d645ba783caa4ddc9ec74a6cab3dd8461734a76698c4905f98ee916',
+  sourceFactSha256: '537bac617e24d19043e88782c09b6051513cdfc584a2ec3bf0a5ac4d29fe00b9',
   presentationDefinitionSha256: '149f270b61a932f0ff2c6459725df46c9abc50fc7b9e793436e6b388d0a3b767',
-  interactionOutcomeSha256: '072792aba0e64d63382cf2e1ca86042a1a9dcc2637ea1b47816c8334ee9bef16',
+  interactionOutcomeSha256: '679fdcd1a2719934caeea312422559372db00a29d839771aedf5b6e28d328205',
   disposition:
     'Any source interaction or analyzed handler-fact drift reopens classification review before the baseline may be updated.',
 })
@@ -393,7 +393,8 @@ export const INTERACTION_OUTCOME_CONTRACTS = Object.freeze([
       Object.freeze({
         path: 'tests/e2e/sidebar.spec.ts',
         testLocator: "test('clicking a chat row navigates to it and swaps the main pane'",
-        assertionLocator: 'await expect(rows).toHaveCount(2)',
+        assertionLocator:
+          'await expect(page.locator(\'[data-ui="message"][data-role="user"]\')).toContainText(\'first\')',
       }),
     ]),
   }),

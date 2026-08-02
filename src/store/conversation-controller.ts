@@ -415,6 +415,10 @@ interface TranscriptRetention {
   readonly selectionRevision: number
   readonly selectionEpoch: number
   readonly precedingRowCount: number
+  readonly frame: {
+    readonly chat: Chat
+    readonly binding: ConversationTranscriptSurface
+  }
 }
 
 export interface ConversationTranscriptRetentionClaim {
@@ -2074,7 +2078,16 @@ class TabConversationController implements ConversationController {
     if (!sameLogicalWorkspace) this.sessions.clear()
     this.operationClaims.clear()
     this.operationClaimCountsByChat.clear()
-    this.transcriptRetentions.clear()
+    if (sameLogicalWorkspace) {
+      for (const [owner, retention] of this.transcriptRetentions) {
+        this.transcriptRetentions.set(owner, {
+          ...retention,
+          replacementEpoch: fence.replacementEpoch,
+        })
+      }
+    } else {
+      this.transcriptRetentions.clear()
+    }
     this.promptPathDemands.clear()
     this.clearPendingRouteHandoffs()
     this.activeChatId = null
@@ -2143,6 +2156,9 @@ class TabConversationController implements ConversationController {
         : paintedContainsTarget
           ? painted.selectionEpoch
           : undefined
+    const sourceBinding = residentContainsTarget ? resident : paintedContainsTarget ? painted : null
+    const sourceChat =
+      this.paintedFrame?.chat.id === input.chatId ? this.paintedFrame.chat : active?.chat
     if (
       workspaceId === null ||
       workspaceId !== input.workspaceFence.workspaceId ||
@@ -2152,6 +2168,8 @@ class TabConversationController implements ConversationController {
       !window ||
       selectionRevision === undefined ||
       selectionEpoch === undefined ||
+      !sourceBinding ||
+      !sourceChat ||
       active.chatId !== input.chatId ||
       transcriptBodyWindowFindRow(window, input.messageId) === undefined
     ) {
@@ -2167,6 +2185,10 @@ class TabConversationController implements ConversationController {
       selectionRevision,
       selectionEpoch,
       precedingRowCount: messageIndex - window.offset,
+      frame: Object.freeze({
+        chat: sourceChat,
+        binding: retainConversationBinding(sourceBinding),
+      }),
     })
     if (!this.requestTranscript()) this.publish()
     let released = false
@@ -3032,12 +3054,23 @@ class TabConversationController implements ConversationController {
       return
     }
     if (retained) return
+    const window = transcriptBodyPointWindow(presentation)
+    if (
+      this.transcriptWindowOmitsRetention(
+        active.chatId,
+        this.workspaceId,
+        this.workspaceEpoch,
+        window,
+      )
+    ) {
+      return
+    }
     active.transcript = Object.freeze({
       kind: 'point',
       selectionEpoch: active.transcript.selectionEpoch,
       attemptId: attempt.id,
       tipId,
-      window: transcriptBodyPointWindow(presentation),
+      window,
     })
   }
 
@@ -5643,6 +5676,28 @@ class TabConversationController implements ConversationController {
     session: ChatSession,
     transcript: ConversationTranscriptProjection,
   ): ConversationPresentationFrame {
+    const claimedFrame = this.claimedTranscriptFrame(active.chatId)
+    const paintedTranscript =
+      this.paintedFrame?.chat.id === active.chatId &&
+      this.paintedFrame.binding.surface === 'transcript'
+        ? this.paintedFrame.binding
+        : null
+    if (
+      claimedFrame &&
+      (!paintedTranscript ||
+        this.transcriptWindowOmitsRetention(
+          active.chatId,
+          this.workspaceId,
+          this.workspaceEpoch,
+          paintedTranscript.window,
+        ))
+    ) {
+      this.paintedFrame = Object.freeze({
+        chat: active.chat ?? claimedFrame.chat,
+        binding: claimedFrame.binding,
+      })
+      active.presentationResidents.transcript = claimedFrame.binding
+    }
     const retainedPaintedBinding =
       this.paintedFrame?.chat.id === active.chatId ? this.paintedFrame.binding : null
     if (retainedPaintedBinding?.currency === 'retained') {
@@ -5661,7 +5716,12 @@ class TabConversationController implements ConversationController {
         previousFrame !== null &&
         previousBinding?.surface === 'transcript' &&
         target.binding.surface === 'transcript' &&
-        this.transcriptTransitionDisplacesRetention(previousBinding, target.binding)
+        this.transcriptWindowOmitsRetention(
+          target.binding.seal.chatId,
+          this.workspaceId,
+          this.workspaceEpoch,
+          target.binding.window,
+        )
       ) {
         const retained = retainConversationBinding(previousBinding)
         this.paintedFrame = Object.freeze({
@@ -5791,27 +5851,48 @@ class TabConversationController implements ConversationController {
     })
   }
 
-  private transcriptTransitionDisplacesRetention(
-    previous: ConversationTranscriptSurface,
-    next: ConversationTranscriptSurface,
+  private transcriptWindowOmitsRetention(
+    chatId: ChatId,
+    workspaceId: string | null,
+    replacementEpoch: number,
+    next: ConversationTranscriptFrame,
   ): boolean {
+    if (workspaceId === null) return false
     for (const retention of this.transcriptRetentions.values()) {
       if (
-        retention.workspaceId !== previous.seal.workspaceId ||
-        retention.replacementEpoch !== previous.seal.replacementEpoch ||
-        retention.chatId !== previous.seal.chatId ||
-        transcriptBodyWindowFindRow(previous.window, retention.messageId) === undefined
+        retention.workspaceId !== workspaceId ||
+        retention.replacementEpoch !== replacementEpoch ||
+        retention.chatId !== chatId
       ) {
         continue
       }
-      if (
-        previous.seal.selectionRevision !== next.seal.selectionRevision ||
-        transcriptBodyWindowFindRow(next.window, retention.messageId) === undefined
-      ) {
-        return true
-      }
+      if (transcriptBodyWindowFindRow(next, retention.messageId) === undefined) return true
     }
     return false
+  }
+
+  private claimedTranscriptFrame(chatId: ChatId): TranscriptRetention['frame'] | null {
+    const claims = [...this.transcriptRetentions.values()].filter(
+      (retention) =>
+        retention.workspaceId === this.workspaceId &&
+        retention.replacementEpoch === this.workspaceEpoch &&
+        retention.chatId === chatId,
+    )
+    for (let index = claims.length - 1; index >= 0; index -= 1) {
+      const claim = claims[index]
+      if (!claim) continue
+      const candidate = claim.frame
+      if (
+        claims.every(
+          (retention) =>
+            transcriptBodyWindowFindRow(candidate.binding.window, retention.messageId) !==
+            undefined,
+        )
+      ) {
+        return candidate
+      }
+    }
+    return claims.at(-1)?.frame ?? null
   }
 
   private promisedTranscriptSpan(

@@ -178,7 +178,7 @@ function messageCommandRootKind(
   command: MessageMutationCommand,
 ): 'message-edit' | 'message-structure' {
   switch (command.kind) {
-    case 'message.edit-content':
+    case 'message.edit-body':
     case 'message.toggle-reasoning-detail':
     case 'message.toggle-provider-output-item':
     case 'message.toggle-context':

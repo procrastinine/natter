@@ -790,7 +790,7 @@ describe('resolveRequestPrivacyPlan', () => {
       api: 'responses',
       allowFallbacks: false,
       ...openRouterTools({
-        enabledServerToolIds: ['datetime', 'web-fetch'],
+        enabledServerToolIds: ['datetime', 'web-fetch', 'shell'],
         toolChoice: 'auto',
       }),
       providerPrefs: {
@@ -979,7 +979,7 @@ describe('resolveRequestPrivacyPlan', () => {
     const profile = makeProfile()
     const chat = makeChat({
       ...openRouterTools({
-        enabledServerToolIds: ['datetime', 'web-fetch'],
+        enabledServerToolIds: ['datetime', 'web-fetch', 'shell'],
         toolChoice: 'auto',
       }),
     })
@@ -1021,6 +1021,23 @@ describe('resolveRequestPrivacyPlan', () => {
       { type: 'openrouter:web_fetch' },
     ])
     expect(requestPlan.wire.tool_choice).toBe('auto')
+
+    const responsesChat = {
+      ...chat,
+      settings: { ...chat.settings, api: 'responses' as const },
+    }
+    const { requestPlan: responsesPlan } = await prepareAssistantRequestPlan({
+      chat: responsesChat,
+      connection: profile,
+      pathMessages: [makeMessage('inspect the environment')],
+      draftText: '',
+    })
+    expect(responsesPlan.kind).toBe('responses')
+    expect(responsesPlan.wire.tools).toEqual([
+      { type: 'openrouter:datetime' },
+      { type: 'openrouter:web_fetch' },
+      { type: 'openrouter:shell' },
+    ])
   })
 
   it('uses one tool-call visibility source for OpenRouter, OpenAI, Gemini, and Anthropic planning', async () => {

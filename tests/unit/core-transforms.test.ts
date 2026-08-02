@@ -353,7 +353,7 @@ describe('toChatCompletions', () => {
     const path = [textMessage({ id: 'u1', role: 'user', text: 'hi' })]
     const s = settings({
       ...openRouterTools({
-        enabledServerToolIds: ['web-search', 'datetime', 'web-fetch'],
+        enabledServerToolIds: ['web-search', 'datetime', 'web-fetch', 'shell'],
         toolChoice: 'auto',
         parallelToolCalls: false,
       }),

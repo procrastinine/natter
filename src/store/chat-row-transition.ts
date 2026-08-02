@@ -228,7 +228,6 @@ export interface TransactionChatMutationReader {
     readonly rowCount: 0 | 1
   }>
   readMany(chatIds: readonly ChatId[]): Promise<readonly (Chat | undefined)[]>
-  readAll(): Promise<readonly Chat[]>
   readFolder(folderId: NonNullable<Chat['folderId']>): Promise<readonly Chat[]>
 }
 
@@ -294,13 +293,6 @@ class TransactionChatMutationOwner implements LinkedChatMutationOwner {
       for (const [index, chatId] of missing.entries()) this.#register(chatId, rows[index])
     }
     return chatIds.map((chatId) => this.#current.get(chatId))
-  }
-
-  async readAll(): Promise<readonly Chat[]> {
-    this.#assertOpen()
-    const rows = await this.tx.table<Chat, ChatId>('chats').toArray()
-    for (const row of rows) this.#register(row.id, row)
-    return rows.map((row) => this.#current.get(row.id) as Chat)
   }
 
   async readFolder(folderId: NonNullable<Chat['folderId']>): Promise<readonly Chat[]> {
@@ -397,7 +389,6 @@ export function openPreservingChatMutation(tx: Transaction): PreservingChatMutat
     read: (chatId) => owner.read(chatId),
     readWithEvidence: (chatId) => owner.readWithEvidence(chatId),
     readMany: (chatIds) => owner.readMany(chatIds),
-    readAll: () => owner.readAll(),
     readFolder: (folderId) => owner.readFolder(folderId),
     replace: (chatId, update) => owner.replacePreserving(chatId, update),
     commit: () =>

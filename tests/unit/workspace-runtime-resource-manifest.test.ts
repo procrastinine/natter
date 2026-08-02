@@ -592,8 +592,8 @@ describe('workspace runtime resource manifest', () => {
     )
     let promoted = false
     const promotion = control
-      .launchWorkspaceRuntimeReplacementWhenUnblocked('command-fanout', {
-        lineageId: 'foreground-staged-delete',
+      .launchWorkspaceRuntimeReplacementWhenUnblocked('import-export', {
+        lineageId: 'foreground-import',
         requireIdle: false,
       })
       .then((authority) => {
@@ -682,7 +682,7 @@ describe('workspace runtime resource manifest', () => {
     const maintenance = runtime.tryRunWorkspaceActionIfIdle(
       'maintenance',
       (permit) => {
-        const authority = control.launchWorkspaceRuntimeReplacementNow('command-fanout', {
+        const authority = control.launchWorkspaceRuntimeReplacementNow('maintenance', {
           lineageId: permit.lineageId,
           requireIdle: false,
         })
@@ -700,22 +700,22 @@ describe('workspace runtime resource manifest', () => {
     await control.awaitWorkspaceRuntimeQuiesced()
   })
 
-  it('promotes the admitted command lineage without a second active root', async () => {
+  it('promotes an admitted import lineage without a second active root', async () => {
     const { control, runtime } = createRuntimeHarness()
     installNoopResourceManifest(control)
-    const fence = { workspaceId: 'workspace-command-fanout', replacementEpoch: 0 }
+    const fence = { workspaceId: 'workspace-import-replacement', replacementEpoch: 0 }
     runtime.workspaceRuntimeInternal.beginReconciliation(fence)
     runtime.workspaceRuntimeInternal.finishReconciliation(fence)
     let authoritySignal: AbortSignal | undefined
     let permitSignal: AbortSignal | undefined
 
-    await runtime.runWorkspaceAction('chat-metadata', (permit) => {
+    await runtime.runWorkspaceAction('import-export', (permit) => {
       permitSignal = permit.signal
-      const authority = control.launchWorkspaceRuntimeReplacementNow('command-fanout', {
+      const authority = control.launchWorkspaceRuntimeReplacementNow('import-export', {
         lineageId: permit.lineageId,
         requireIdle: false,
       })
-      if (!authority) throw new Error('Expected command fanout replacement authority')
+      if (!authority) throw new Error('Expected import replacement authority')
       authoritySignal = authority.signal
       expect(control.getWorkspaceRuntimeControlSnapshot().state).toBe('QUIESCING')
     })

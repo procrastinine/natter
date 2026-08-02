@@ -88,11 +88,6 @@ export function useScrollRegionState(): ScrollState | undefined {
 
 const DEFAULT_THRESHOLD_PX = 48
 const PROGRAMMATIC_SCROLL_TOLERANCE_PX = 4
-const MAX_INSTANT_SCROLL_INTENTS = 32
-
-interface InstantScrollIntent {
-  top: number
-}
 
 interface SmoothScrollIntent {
   target: number
@@ -166,15 +161,8 @@ function semanticFollowClaimForTarget(
 
 const LAYOUT_ANCHOR_TOLERANCE_PX = 0.5
 
-function consumeInstantScrollIntent(intents: InstantScrollIntent[], top: number): boolean {
-  for (let index = intents.length - 1; index >= 0; index -= 1) {
-    const intent = intents[index]
-    if (intent && Math.abs(intent.top - top) <= PROGRAMMATIC_SCROLL_TOLERANCE_PX) {
-      intents.splice(0, index + 1)
-      return true
-    }
-  }
-  return false
+function matchesInstantScrollIntent(intentTop: number | null, top: number): boolean {
+  return intentTop !== null && Math.abs(intentTop - top) <= PROGRAMMATIC_SCROLL_TOLERANCE_PX
 }
 
 function advanceSmoothScrollIntent(
@@ -323,7 +311,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
     typeof document === 'undefined' || document.visibilityState !== 'hidden',
   )
   const lastNativeScrollTopRef = useRef<number | null>(null)
-  const instantScrollIntentsRef = useRef<InstantScrollIntent[]>([])
+  const instantScrollIntentTopRef = useRef<number | null>(null)
   const layoutCorrectionPendingRef = useRef(false)
   const smoothScrollIntentRef = useRef<SmoothScrollIntent | null>(null)
   const thresholdRef = useRef(pinThresholdPx ?? DEFAULT_THRESHOLD_PX)
@@ -351,7 +339,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
         didOpen: didOpenRef.current,
         streamActive: streamActiveRef.current,
         autoScrollOnStream: autoScrollOnStreamRef.current,
-        instantScrollIntents: instantScrollIntentsRef.current.length,
+        instantScrollIntentTop: instantScrollIntentTopRef.current,
         layoutCorrectionPending: layoutCorrectionPendingRef.current,
         followTargetMessageId: claim?.kind === 'message' ? claim.target.messageId : null,
         smoothScrollIntent: smoothScrollIntentRef.current,
@@ -405,7 +393,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
   )
 
   const clearInstantScrollIntents = useCallback(() => {
-    instantScrollIntentsRef.current = []
+    instantScrollIntentTopRef.current = null
   }, [])
 
   const clearProgrammaticScrollIntents = useCallback(() => {
@@ -414,11 +402,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
   }, [clearInstantScrollIntents])
 
   const recordInstantScrollIntent = useCallback((top: number) => {
-    const intents = instantScrollIntentsRef.current
-    intents.push({ top })
-    if (intents.length > MAX_INSTANT_SCROLL_INTENTS) {
-      intents.splice(0, intents.length - MAX_INSTANT_SCROLL_INTENTS)
-    }
+    instantScrollIntentTopRef.current = top
   }, [])
 
   const releaseSemanticClaim = useCallback(() => {
@@ -919,10 +903,9 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
       }
       let programmaticScroll = false
       if (source === 'scroll') {
-        const instantMatched = consumeInstantScrollIntent(
-          instantScrollIntentsRef.current,
-          container.scrollTop,
-        )
+        const instantIntentTop = instantScrollIntentTopRef.current
+        instantScrollIntentTopRef.current = null
+        const instantMatched = matchesInstantScrollIntent(instantIntentTop, container.scrollTop)
         if (instantMatched) {
           programmaticScroll = true
         } else if (smoothScrollIntentRef.current) {

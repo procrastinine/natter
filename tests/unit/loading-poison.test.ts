@@ -529,7 +529,7 @@ describe('cold message-body repository boundary', () => {
     const bodies = captureReads<MessageBodyRow>('messageBodies')
 
     const result = await executeMessageCommand({
-      kind: 'message.edit-content',
+      kind: 'message.edit-body',
       input: {
         chatId: seeded.chat.id,
         messageId: target.id,

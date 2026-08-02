@@ -52,6 +52,7 @@ import { TextTemplateSection } from './TextTemplateSection'
 interface ParamFormProps {
   chat: Chat
   capability: EffectiveCapability | null
+  assistantRouteKind?: AssistantRouteContract['kind'] | null | undefined
   textTemplateMode?: 'openrouter' | 'llama-server' | null | undefined
   llamaProps?: LlamaServerProps | null | undefined
   connectionKind?: ConnectionKind | undefined
@@ -287,6 +288,11 @@ const OPENROUTER_HOSTED_TOOL_OPTIONS: ReadonlyArray<{
   { id: 'web-search', label: 'Web search', help: 'OpenRouter runs the search server-side.' },
   { id: 'datetime', label: 'Datetime', help: 'OpenRouter supplies current date/time context.' },
   { id: 'web-fetch', label: 'Web fetch', help: 'OpenRouter fetches URLs server-side.' },
+  {
+    id: 'shell',
+    label: 'Shell',
+    help: 'OpenRouter runs commands in a hosted sandbox through the Responses API.',
+  },
 ]
 
 const OPENAI_HOSTED_TOOL_OPTIONS: ReadonlyArray<{
@@ -324,6 +330,7 @@ const ANTHROPIC_HOSTED_TOOL_OPTIONS: ReadonlyArray<{
 export function ParamForm({
   chat,
   capability,
+  assistantRouteKind = null,
   textTemplateMode = null,
   llamaProps = null,
   connectionKind = 'custom',
@@ -362,6 +369,7 @@ export function ParamForm({
       <HostedToolsSection
         chat={chat}
         capability={capability}
+        assistantRouteKind={assistantRouteKind}
         connectionKind={connectionKind}
         connectionProfile={connectionProfile}
         textCompletionsActive={textCompletionsActive}
@@ -427,12 +435,14 @@ export function PrefillSettingsSection({
 function HostedToolsSection({
   chat,
   capability,
+  assistantRouteKind,
   connectionKind,
   connectionProfile,
   textCompletionsActive,
 }: {
   chat: Chat
   capability: EffectiveCapability
+  assistantRouteKind: AssistantRouteContract['kind'] | null
   connectionKind: ConnectionKind
   connectionProfile?: ConnectionProfile | null | undefined
   textCompletionsActive: boolean
@@ -440,7 +450,13 @@ function HostedToolsSection({
   const { run: runConfigurationWrite } = usePresentationInteraction(configurationWriteInteraction, {
     observePending: false,
   })
-  const config = hostedToolUiConfig({ connectionKind, connectionProfile, chat, capability })
+  const config = hostedToolUiConfig({
+    connectionKind,
+    connectionProfile,
+    chat,
+    capability,
+    assistantRouteKind,
+  })
   if (!config || textCompletionsActive) {
     return null
   }
@@ -522,6 +538,7 @@ function hostedToolUiConfig(input: {
   connectionProfile?: ConnectionProfile | null | undefined
   chat: Chat
   capability: EffectiveCapability
+  assistantRouteKind: AssistantRouteContract['kind'] | null
 }): {
   provider: HostedToolProvider
   title: string
@@ -532,7 +549,9 @@ function hostedToolUiConfig(input: {
     return {
       provider: 'openrouter',
       title: 'OpenRouter tools',
-      options: OPENROUTER_HOSTED_TOOL_OPTIONS,
+      options: OPENROUTER_HOSTED_TOOL_OPTIONS.filter(
+        (option) => option.id !== 'shell' || input.assistantRouteKind === 'responses',
+      ),
     }
   }
   const profile = input.connectionProfile

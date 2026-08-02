@@ -19,6 +19,11 @@ import {
   projectAppliedMessageReasoningPresentation,
 } from '../../core/continuation-content'
 import type { LongMessageDisplayMode } from '../../core/global-settings'
+import {
+  type MessageBodyAuthoringOperations,
+  projectProviderOutputAuthoring,
+  projectReasoningAuthoring,
+} from '../../core/message-body-authoring'
 import { plaintextOf } from '../../core/message-content'
 import { messageReasoningVisibility } from '../../core/reasoning'
 import { detectStaleReasoning, staleReasoningBannerText } from '../../core/stale-reasoning'
@@ -85,7 +90,12 @@ interface MessageProps {
     readonly admitted: Promise<void>
     release(): void
   }
-  onEditInPlace: (message: MessageRow, text: string) => ConversationMutationSettlement
+  onEditInPlace: (
+    message: MessageRow,
+    text: string,
+    authoring?: MessageBodyAuthoringOperations,
+    attachmentRefs?: MessageAttachmentRef[],
+  ) => ConversationMutationSettlement
   onToggleContextVisibility?: (message: MessageRow) => ConversationMutationSettlement
   onDismissGenerationNotice?: (message: MessageRow) => ConversationMutationSettlement
   onMutateAttachmentRef?: (
@@ -95,6 +105,11 @@ interface MessageProps {
   onToggleReasoningDetailHidden?: (
     message: MessageRow,
     member: ReasoningMemberRef,
+  ) => ConversationMutationSettlement
+  onEditReasoningDetail?: (
+    message: MessageRow,
+    member: Extract<ReasoningMemberRef, { kind: 'visible' }>,
+    text: string,
   ) => ConversationMutationSettlement
   onToggleProviderOutputItemHidden?: (
     message: MessageRow,
@@ -166,6 +181,7 @@ export const Message = memo(
     prev.onDismissGenerationNotice === next.onDismissGenerationNotice &&
     prev.onMutateAttachmentRef === next.onMutateAttachmentRef &&
     prev.onToggleReasoningDetailHidden === next.onToggleReasoningDetailHidden &&
+    prev.onEditReasoningDetail === next.onEditReasoningDetail &&
     prev.onToggleProviderOutputItemHidden === next.onToggleProviderOutputItemHidden &&
     prev.onEditAndSend === next.onEditAndSend &&
     prev.onRegenerate === next.onRegenerate &&
@@ -199,6 +215,7 @@ function MessageInner({
   onDismissGenerationNotice,
   onMutateAttachmentRef,
   onToggleReasoningDetailHidden,
+  onEditReasoningDetail,
   onToggleProviderOutputItemHidden,
   onEditAndSend,
   onRegenerate,
@@ -225,6 +242,14 @@ function MessageInner({
   const editIdentity = `${presentationFence.workspaceId}:${chatId}:${message.id}`
   const editFenceIdentity = `${presentationFence.workspaceId}:${presentationFence.replacementEpoch}`
   const appliedView = useMemo(() => createAppliedMessageView(message), [message])
+  const reasoningAuthoring = useMemo(
+    () => (message.role === 'assistant' ? projectReasoningAuthoring(message) : undefined),
+    [message],
+  )
+  const providerOutputAuthoring = useMemo(
+    () => (message.role === 'assistant' ? projectProviderOutputAuthoring(message) : undefined),
+    [message],
+  )
   const projectionEnabled = message.role === 'assistant'
   const streamProjection = useMessageStreamProjection(message, presentationFence, projectionEnabled)
   const activeAttempt = streamProjection.execution
@@ -472,17 +497,37 @@ function MessageInner({
   }, [collapseProfile.defaultMode, collapseProfile.modes, liveRendering])
 
   const handleSave = useCallback(
-    (text: string) => onEditInPlace(message, text),
+    (
+      text: string,
+      authoring?: MessageBodyAuthoringOperations,
+      attachmentRefs?: MessageAttachmentRef[],
+    ) =>
+      authoring || attachmentRefs
+        ? onEditInPlace(message, text, authoring, attachmentRefs)
+        : onEditInPlace(message, text),
     [message, onEditInPlace],
   )
   // The display normalizer is deliberately one-row-in/one-row-out. Apply the
   // eye toggle to that same raw row and leave every other carrier untouched.
   const handleToggleReasoningHidden = useCallback(
-    (member: ReasoningMemberRef) => onToggleReasoningDetailHidden!(message, member),
+    (member: ReasoningMemberRef) => {
+      if (!onToggleReasoningDetailHidden) throw new Error('MessageReasoningToggleHandlerMissing')
+      return onToggleReasoningDetailHidden(message, member)
+    },
     [message, onToggleReasoningDetailHidden],
   )
+  const handleEditReasoning = useCallback(
+    (member: Extract<ReasoningMemberRef, { kind: 'visible' }>, text: string) => {
+      if (!onEditReasoningDetail) throw new Error('MessageReasoningEditHandlerMissing')
+      return onEditReasoningDetail(message, member, text)
+    },
+    [message, onEditReasoningDetail],
+  )
   const handleToggleToolHidden = useCallback(
-    (member: ProviderOutputMemberRef) => onToggleProviderOutputItemHidden!(message, member),
+    (member: ProviderOutputMemberRef) => {
+      if (!onToggleProviderOutputItemHidden) throw new Error('MessageProviderToggleHandlerMissing')
+      return onToggleProviderOutputItemHidden(message, member)
+    },
     [message, onToggleProviderOutputItemHidden],
   )
   const handleSaveAndSend = useCallback(
@@ -508,7 +553,8 @@ function MessageInner({
     return onContinue(message)
   }, [message, onContinue])
   const handleForkChat = useCallback(() => {
-    return onForkChat!(message)
+    if (!onForkChat) throw new Error('MessageForkHandlerMissing')
+    return onForkChat(message)
   }, [message, onForkChat])
   const handleDeleteMessage = useCallback(
     (mode: ConversationDeleteMode) => onDeleteMessage(message, mode, roleMismatch),
@@ -565,8 +611,12 @@ function MessageInner({
             hasContent={hasContent}
             deferContentUntilOpen={!liveRendering}
             toggleHiddenDisabled={bodyMutationUnavailable}
+            editDisabled={bodyMutationUnavailable || liveRendering}
             {...(message.role === 'assistant' && onToggleReasoningDetailHidden
               ? { onToggleHidden: handleToggleReasoningHidden }
+              : {})}
+            {...(message.role === 'assistant' && onEditReasoningDetail
+              ? { onEditVisible: handleEditReasoning }
               : {})}
           />
         ) : null}
@@ -606,10 +656,12 @@ function MessageInner({
             onSave={handleSave}
             onCancel={endEditing}
             saveDisabled={editMutationUnavailable}
-            attachmentsEnabled={message.role === 'user' && onEditAndSend !== undefined}
+            initialAttachmentRefs={message.attachmentRefs}
+            attachmentsEnabled
+            {...(reasoningAuthoring ? { initialReasoning: reasoningAuthoring } : {})}
+            {...(providerOutputAuthoring ? { initialProviderOutput: providerOutputAuthoring } : {})}
             {...(message.role === 'user' && onEditAndSend
               ? {
-                  initialAttachmentRefs: message.attachmentRefs,
                   onSaveAndSend: handleSaveAndSend,
                   ...(showPrefillButton
                     ? {

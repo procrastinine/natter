@@ -433,7 +433,7 @@ describe('ScrollRegion continuity lease', () => {
     expect(fixture.ref.current?.getState()).toBe('follow')
   })
 
-  it('accepts delayed instant scroll events in recorded target order', () => {
+  it('pins a native jump that collides with an obsolete instant-scroll target', async () => {
     const fixture = setup()
     acquireOpen(fixture)
 
@@ -445,13 +445,9 @@ describe('ScrollRegion continuity lease', () => {
       fixture.region.scrollTop = 600
       fireEvent.scroll(fixture.region)
     })
-    expect(fixture.ref.current?.getState()).toBe('follow')
-
-    act(() => {
-      fixture.region.scrollTop = 1_000
-      fireEvent.scroll(fixture.region)
-    })
-    expect(fixture.ref.current?.getState()).toBe('follow')
+    expect(fixture.ref.current?.getState()).toBe('pinned')
+    await act(nextTask)
+    expect(fixture.region.dataset.scrollState).toBe('pinned')
   })
 
   it('accepts a coalesced instant event at the newest recorded target', () => {

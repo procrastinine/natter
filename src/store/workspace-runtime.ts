@@ -40,7 +40,6 @@ export const WORKSPACE_ROOT_REPLACEMENT_DISPOSITIONS = Object.freeze({
   'workspace-organization': 'drain',
   configuration: 'drain',
   attachment: 'drain',
-  'command-fanout': 'drain',
   'import-export': 'drain',
   'repository-query': 'cancel',
   'search-session': 'cancel',
@@ -53,7 +52,7 @@ export type WorkspaceRootKind = keyof typeof WORKSPACE_ROOT_REPLACEMENT_DISPOSIT
 
 export type WorkspaceReplacementRootKind = Extract<
   WorkspaceRootKind,
-  'command-fanout' | 'import-export' | 'maintenance'
+  'import-export' | 'maintenance'
 >
 
 type WorkspaceRootSubset<Kind extends WorkspaceRootKind> = Kind

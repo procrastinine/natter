@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { BrowserContext, CDPSession, Page } from '@playwright/test'
 import { chromium, expect, test } from '@playwright/test'
+import { discoverCanonicalPhysicalStorageTableNames } from '../../scripts/audit-storage-ownership-reclamation.mjs'
 import {
   GENERATED_WORKSPACE_ACTIVE_CHAT_ID,
   GENERATED_WORKSPACE_ACTIVE_TERMINAL_ID,
@@ -31,13 +32,16 @@ import {
   type GeneratedWorkspaceStateName,
   readReusableGeneratedWorkspaceStateManifest,
 } from './generated-workspace-state'
-import { activeWorkspaceDatabaseName } from './helpers'
+import { activeWorkspaceDatabaseName, readMessages } from './helpers'
 
 const ACTIVE_ROUTE = `/#/chat/${GENERATED_WORKSPACE_ACTIVE_CHAT_ID}/message/${GENERATED_WORKSPACE_ACTIVE_TERMINAL_ID}`
 const INITIAL_TRANSCRIPT_FLOOR = 10
 const HANG_BOUND_MS = 45_000
 const ROUTE_SWITCH_OBSERVATION_MS = 1_500
 const INSTRUMENTED_FOREGROUND_GESTURE_BOUND_MS = 75
+const GENERATED_WORKSPACE_FORK_TARGET_ID = 'generated-active-message-086'
+const GENERATED_WORKSPACE_MODEL_ID = 'google/gemini-3.5-flash'
+const CANONICAL_PHYSICAL_STORAGE_TABLE_NAMES = discoverCanonicalPhysicalStorageTableNames()
 
 test.describe.configure({ mode: 'serial', timeout: 5 * 60_000 })
 
@@ -130,6 +134,14 @@ test('startup work and first interaction stay cardinality-bounded in a 4k-chat w
   expect(large.probe.resourceCount).toBeLessThanOrEqual(control.probe.resourceCount + 10)
   assertNoCanonicalWholeTableRouteRead('control route switch', control.routeSwitch)
   assertNoCanonicalWholeTableRouteRead('large route switch', large.routeSwitch)
+  assertForegroundFork('control', control.foregroundFork)
+  assertForegroundFork('large', large.foregroundFork)
+  expect(large.foregroundFork.idbRequests).toBeLessThanOrEqual(
+    control.foregroundFork.idbRequests + 20,
+  )
+  expect(large.foregroundFork.durationMs).toBeLessThanOrEqual(
+    Math.max(control.foregroundFork.durationMs * 3, control.foregroundFork.durationMs + 1_000),
+  )
   expect(comparableDestinationWork(large.destinationFrame)).toEqual(
     comparableDestinationWork(control.destinationFrame),
   )
@@ -199,6 +211,8 @@ test('active-stream reload keeps input and unrelated controls cardinality-indepe
     expect(profile.gestureLatencyMs).toBeLessThanOrEqual(INSTRUMENTED_FOREGROUND_GESTURE_BOUND_MS)
     expect(profile.composerReadyMs).toBeLessThanOrEqual(HANG_BOUND_MS)
     expect(profile.probe.milestones.coreRunning).toBeDefined()
+    expect(profile.providerRequestCounts.endpointCatalog).toBeLessThanOrEqual(1)
+    expect(profile.providerRequestCounts.generation).toBe(1)
     assertNoCanonicalWholeTableReadBeforeRunning(`${name} active-stream reload`, profile.probe)
   }
   expect(large.composerReadyMs).toBeLessThanOrEqual(control.composerReadyMs + 100)
@@ -320,6 +334,21 @@ interface StartupProfile {
   readonly reload: ReloadProfile
   readonly routeSwitch: RouteSwitchProfile
   readonly destinationFrame: DestinationFrameBudgetSnapshot
+  readonly foregroundFork: ForegroundForkProfile
+}
+
+interface ForegroundForkProfile {
+  readonly sourceDatabaseName: string
+  readonly destinationDatabaseName: string
+  readonly destinationChatId: string
+  readonly durationMs: number
+  readonly heartbeatTicks: number
+  readonly heartbeatMaxGapMs: number
+  readonly sourceMessageCount: number
+  readonly destinationMessageCount: number
+  readonly idbRequests: number
+  readonly idbCalls: Readonly<Record<string, number>>
+  readonly settingMutations: readonly StartupProbeSnapshot['settingMutations'][number][]
 }
 
 interface FreshStartupProfile {
@@ -416,6 +445,32 @@ async function profileActiveStreamReload(baseURL: string, name: GeneratedWorkspa
     chunkChars: 512,
     initialDelayMs: 15_000,
     delayMs: 80,
+    responses: [
+      {
+        method: 'GET',
+        path: `/models/${GENERATED_WORKSPACE_MODEL_ID}/endpoints`,
+        json: {
+          data: {
+            id: GENERATED_WORKSPACE_MODEL_ID,
+            name: 'Generated Workspace Model',
+            context_length: 1_000_000,
+            architecture: {
+              tokenizer: 'Other',
+              input_modalities: ['text'],
+              output_modalities: ['text'],
+            },
+            endpoints: [
+              {
+                provider_name: 'Natter Fake Provider',
+                context_length: 1_000_000,
+                supported_parameters: ['max_tokens', 'reasoning'],
+                pricing: {},
+              },
+            ],
+          },
+        },
+      },
+    ],
   })
   let context: BrowserContext | undefined
   try {
@@ -493,6 +548,7 @@ async function profileActiveStreamReload(baseURL: string, name: GeneratedWorkspa
     const composerReadyMs = performance.now() - inputStartedAt
     await scenario.release()
     await expect.poll(() => scenario.snapshot().then((state) => state.activeStreams)).toBe(0)
+    const provider = await scenario.snapshot()
     return {
       diagnostics: diagnostics(),
       expectedSidebarState,
@@ -500,6 +556,16 @@ async function profileActiveStreamReload(baseURL: string, name: GeneratedWorkspa
       gestureLatencyMs: gesture.outcomeAt - gesture.clickAt,
       composerReadyMs,
       probe: await startupProbeSnapshot(page),
+      providerRequestCounts: {
+        endpointCatalog: provider.requests.filter(
+          (request) =>
+            request.method === 'GET' &&
+            request.path === `/models/${GENERATED_WORKSPACE_MODEL_ID}/endpoints`,
+        ).length,
+        generation: provider.requests.filter(
+          (request) => request.method === 'POST' && request.path === '/chat/completions',
+        ).length,
+      },
     }
   } finally {
     if (context) {
@@ -532,7 +598,8 @@ async function retargetGeneratedActiveProfile(page: Page, providerBaseUrl: strin
         const chat = (await requestResult(transaction.objectStore('chats').get(chatId))) as
           | { settings?: { profileId?: unknown } }
           | undefined
-        const profileId = chat?.settings?.profileId
+        if (!chat) throw new Error('GeneratedActiveChatMissing')
+        const profileId = chat.settings?.profileId
         if (typeof profileId !== 'string') throw new Error('GeneratedActiveProfileIdMissing')
         const profiles = transaction.objectStore('profiles')
         const profile = (await requestResult(profiles.get(profileId))) as
@@ -549,7 +616,11 @@ async function retargetGeneratedActiveProfile(page: Page, providerBaseUrl: strin
         database.close()
       }
     },
-    { chatId: GENERATED_WORKSPACE_ACTIVE_CHAT_ID, databaseName, providerBaseUrl },
+    {
+      chatId: GENERATED_WORKSPACE_ACTIVE_CHAT_ID,
+      databaseName,
+      providerBaseUrl,
+    },
   )
 }
 
@@ -599,6 +670,7 @@ async function profileStartup(
   const reload = await profileReload(page, cdp)
   const routeSwitch = await measureRouteSwitch(page)
   const destinationFrame = await measureActiveDestinationFrame(page)
+  const foregroundFork = await measureForegroundFork(page, name)
   return {
     name,
     environment: {
@@ -619,6 +691,7 @@ async function profileStartup(
     reload,
     routeSwitch,
     destinationFrame,
+    foregroundFork,
   }
 }
 
@@ -728,8 +801,19 @@ async function installStartupProbe(
         if (state.milestones[name]) return
         state.milestones[name] = { at: performance.now(), idb: idbSnapshot() }
       }
-      const fullSuffix = (args: unknown[]) =>
-        args.length === 0 || args[0] === undefined || args[0] === null ? '.full' : '.bounded'
+      const fullSuffix = (args: unknown[]) => {
+        if (args.length === 0 || args[0] === undefined || args[0] === null) return '.full'
+        const first = args[0]
+        if (
+          typeof first === 'object' &&
+          'query' in first &&
+          (first as { query?: unknown }).query == null &&
+          (first as { count?: unknown }).count === undefined
+        ) {
+          return '.full'
+        }
+        return '.bounded'
+      }
       const wrap = (
         prototype: object | undefined,
         method: string,
@@ -1171,6 +1255,94 @@ async function measureActiveDestinationFrame(page: Page): Promise<DestinationFra
   return snapshot
 }
 
+async function measureForegroundFork(
+  page: Page,
+  name: GeneratedWorkspaceStateName,
+): Promise<ForegroundForkProfile> {
+  const target = page.locator(
+    `[data-ui="message"][data-message-id="${GENERATED_WORKSPACE_FORK_TARGET_ID}"]`,
+  )
+  await expect(target).toBeVisible({ timeout: HANG_BOUND_MS })
+  const fork = target.getByRole('button', { name: 'Branch this chat from here' })
+  await expect(fork).toBeEnabled({ timeout: HANG_BOUND_MS })
+  const sourceDatabaseName = await activeWorkspaceDatabaseName(page)
+  const before = await startupProbeSnapshot(page)
+  await page.evaluate(() => {
+    const state = {
+      startedAt: performance.now(),
+      lastAt: performance.now(),
+      ticks: 0,
+      maxGapMs: 0,
+      timer: 0,
+    }
+    state.timer = window.setInterval(() => {
+      const now = performance.now()
+      state.maxGapMs = Math.max(state.maxGapMs, now - state.lastAt)
+      state.lastAt = now
+      state.ticks += 1
+    }, 16)
+    ;(
+      window as typeof window & {
+        __natterForegroundForkHeartbeat?: typeof state
+      }
+    ).__natterForegroundForkHeartbeat = state
+  })
+  page.once('dialog', (dialog) => void dialog.accept(`Generated ${name} fork`))
+  await fork.click()
+  await expect(page.locator('[data-ui="chat-title"]')).toContainText(`Generated ${name} fork`, {
+    timeout: HANG_BOUND_MS,
+  })
+  const destinationChatId = await page.evaluate(() => {
+    const match = window.location.hash.match(/^#\/chat\/([^/]+)/u)
+    return match?.[1] ?? ''
+  })
+  if (!destinationChatId || destinationChatId === GENERATED_WORKSPACE_ACTIVE_CHAT_ID) {
+    throw new Error(`GeneratedWorkspaceForkRouteInvalid:${name}`)
+  }
+  const heartbeat = await page.evaluate(() => {
+    const state = (
+      window as typeof window & {
+        __natterForegroundForkHeartbeat?: {
+          startedAt: number
+          lastAt: number
+          ticks: number
+          maxGapMs: number
+          timer: number
+        }
+      }
+    ).__natterForegroundForkHeartbeat
+    if (!state) throw new Error('GeneratedWorkspaceForkHeartbeatMissing')
+    window.clearInterval(state.timer)
+    delete (
+      window as typeof window & {
+        __natterForegroundForkHeartbeat?: typeof state
+      }
+    ).__natterForegroundForkHeartbeat
+    return {
+      durationMs: performance.now() - state.startedAt,
+      heartbeatTicks: state.ticks,
+      heartbeatMaxGapMs: state.maxGapMs,
+    }
+  })
+  const after = await startupProbeSnapshot(page)
+  const destinationDatabaseName = await activeWorkspaceDatabaseName(page)
+  const [sourceMessages, destinationMessages] = await Promise.all([
+    readMessages(page, GENERATED_WORKSPACE_ACTIVE_CHAT_ID),
+    readMessages(page, destinationChatId),
+  ])
+  return {
+    sourceDatabaseName,
+    destinationDatabaseName,
+    destinationChatId,
+    ...heartbeat,
+    sourceMessageCount: sourceMessages.length,
+    destinationMessageCount: destinationMessages.length,
+    idbRequests: after.idb.total - before.idb.total,
+    idbCalls: idbCallDelta(before.idb.calls, after.idb.calls),
+    settingMutations: after.settingMutations.slice(before.settingMutations.length),
+  }
+}
+
 function destinationMilestoneDuration(
   snapshot: DestinationFrameBudgetSnapshot,
   milestone: 'firstDestinationPaintAt' | 'configuredWindowCompleteAt',
@@ -1379,25 +1551,70 @@ function assertNoCanonicalWholeTableReadBeforeRunning(
   probe: StartupProbeSnapshot,
 ): void {
   const calls = probe.milestones.coreRunning.idb.calls
-  const forbidden = Object.entries(calls).filter(
-    ([key, count]) =>
-      count > 0 &&
-      /^objectStore\.(?:chats|messages|messageBodies|profiles|presets)\.(?:getAll|getAllKeys|openCursor|openKeyCursor)\.full$/u.test(
-        key,
-      ),
-  )
+  const forbidden = canonicalWholeTableReads(calls)
   expect(forbidden, `${name} canonical whole-table startup reads`).toEqual([])
 }
 
 function assertNoCanonicalWholeTableRouteRead(name: string, routeSwitch: RouteSwitchProfile): void {
-  const forbidden = Object.entries(routeSwitch.idbCalls).filter(
-    ([key, count]) =>
-      count > 0 &&
-      /^objectStore\.(?:chats|messages|messageBodies|profiles|presets)\.(?:getAll|getAllKeys|openCursor|openKeyCursor)\.full$/u.test(
-        key,
-      ),
-  )
+  const forbidden = unrelatedCanonicalWholeTableReads(routeSwitch.idbCalls, ['folders', 'tags'])
   expect(forbidden, `${name} canonical whole-table reads`).toEqual([])
+}
+
+function assertForegroundFork(name: string, profile: ForegroundForkProfile): void {
+  expect(profile.destinationDatabaseName, `${name} active database identity`).toBe(
+    profile.sourceDatabaseName,
+  )
+  expect(profile.sourceMessageCount, `${name} source message count`).toBe(96)
+  expect(profile.destinationMessageCount, `${name} destination message count`).toBe(87)
+  expect(profile.durationMs, `${name} fork hang bound`).toBeLessThan(HANG_BOUND_MS)
+  expect(profile.heartbeatTicks, `${name} responsive event-loop heartbeat`).toBeGreaterThan(0)
+  expect(profile.heartbeatMaxGapMs, `${name} maximum event-loop gap`).toBeLessThan(500)
+  expect(
+    unrelatedCanonicalWholeTableReads(profile.idbCalls, ['folders', 'tags']),
+    `${name} fork canonical whole-table reads`,
+  ).toEqual([])
+  expect(
+    Object.entries(profile.idbCalls).filter(
+      ([key, count]) => count > 0 && key.startsWith('factory.open:'),
+    ),
+    `${name} fork database opens`,
+  ).toEqual([])
+  expect(profile.settingMutations, `${name} fork workspace-slot writes`).toEqual([])
+}
+
+function idbCallDelta(
+  before: Readonly<Record<string, number>>,
+  after: Readonly<Record<string, number>>,
+): Readonly<Record<string, number>> {
+  return Object.fromEntries(
+    Object.entries(after)
+      .map(([key, count]) => [key, count - (before[key] ?? 0)] as const)
+      .filter(([, count]) => count > 0),
+  )
+}
+
+function canonicalWholeTableReads(
+  calls: Readonly<Record<string, number>>,
+): readonly [string, number][] {
+  const canonical = new Set<string>(CANONICAL_PHYSICAL_STORAGE_TABLE_NAMES)
+  return Object.entries(calls).filter(([key, count]) => {
+    if (count <= 0) return false
+    const match = key.match(
+      /^objectStore\.([^.]+)\.(?:getAll|getAllKeys|openCursor|openKeyCursor)\.full$/u,
+    )
+    return match?.[1] !== undefined && canonical.has(match[1])
+  })
+}
+
+function unrelatedCanonicalWholeTableReads(
+  calls: Readonly<Record<string, number>>,
+  requiredCatalogs: readonly string[],
+): readonly [string, number][] {
+  const allowed = new Set(requiredCatalogs)
+  return canonicalWholeTableReads(calls).filter(([key]) => {
+    const tableName = key.match(/^objectStore\.([^.]+)\./u)?.[1]
+    return tableName === undefined || !allowed.has(tableName)
+  })
 }
 
 function startupComparisons(control: StartupProfile, large: StartupProfile) {

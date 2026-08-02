@@ -38,7 +38,7 @@ describe('production async ownership audit', () => {
     expect(inventory.counts.unprovedDetachedFailures).toBe(inventory.syntacticGaps.length)
     expect(inventory.counts.reviewedArchitectureGaps).toBe(inventory.gaps.length)
     expect(inventory.dispositionCounts).toEqual({
-      proved: 25,
+      proved: 26,
       'intentional-bounded-lifetime': 0,
       'architecture-gap': 0,
     })

@@ -186,7 +186,7 @@ const COMMAND_VARIANTS = Object.freeze([
   'maintenance.reconcile-stream-journal-integrity',
   'message.delete',
   'message.dismiss-generation-notice',
-  'message.edit-content',
+  'message.edit-body',
   'message.import',
   'message.restore-structure',
   'message.toggle-context',
@@ -358,18 +358,6 @@ export const WORKSPACE_ROOT_LOCALITY = mergeRecords(
     expectedOtherTabBehavior: 'unrelated-streams-remain-live-and-unaffected',
     status: 'observed',
     evidence: 'src/store/attempt-control-application.ts#requestAttemptStop',
-  }),
-  records(['command-fanout'], {
-    initiatingOwner: 'background-command-coordinator',
-    durableScope: 'one-admitted-semantic-operation-and-its-bounded-command-pages',
-    lockTransactionScope: 'workspace-replacement-root-plus-command-specific-locks',
-    localPresentationEffect: 'none-directly',
-    crossTabPublication: 'each-committed-command-publishes-its-exact-delta',
-    forbiddenRemoteSteering: FORBID_REMOTE_STEERING,
-    activeStreamOwnership: 'none',
-    expectedOtherTabBehavior: 'refresh-only-the-published-authoritative-dependencies',
-    status: 'observed',
-    evidence: 'src/store/browser-staged-fanout-command.ts',
   }),
   records(
     [

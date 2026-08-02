@@ -21,6 +21,7 @@ import { resolveCutoff } from '../../core/context-cutoff'
 import { groupUserAnchoredContextItems, selectContextPairs } from '../../core/context-selection'
 import type { PrefillPlan } from '../../core/effective-endpoint-routing'
 import type { LongMessageDisplayMode, RenderWindowLoadMode } from '../../core/global-settings'
+import type { MessageBodyAuthoringOperations } from '../../core/message-body-authoring'
 import { UNLIMITED_CONTEXT } from '../../core/prompt-size'
 import type {
   ChatId,
@@ -88,7 +89,20 @@ interface MessageListProps {
   onCancelStructuralMutation?: () => void
 }
 
-interface PointMessageListProps {
+interface PointMessageListProps
+  extends Pick<
+    MessageListProps,
+    | 'runConversationMutation'
+    | 'chatSettings'
+    | 'capability'
+    | 'prefillPlan'
+    | 'onEditAndSendMessage'
+    | 'onRegenerateMessage'
+    | 'onContinueMessage'
+    | 'generationSubmissionPending'
+    | 'structuralMutationPending'
+    | 'onCancelStructuralMutation'
+  > {
   readonly kind: 'point'
   readonly chatId: ChatId
   readonly workspaceFence: WorkspaceFence
@@ -131,24 +145,24 @@ const MessageListSurface = memo(function MessageListSurface(props: MessageListSu
   const presentationFence = point ? props.workspaceFence : props.binding.seal
   const branchSpine = point ? null : props.binding.spine
   const activePath = branchSpine?.path ?? null
-  const presentationOnly = point ? true : props.binding.currency !== 'current'
-  const mutationsUnavailable = point ? true : props.mutationsUnavailable === true
-  const structuralMutationPending = point ? false : props.structuralMutationPending === true
-  const runConversationMutation = point ? null : props.runConversationMutation
-  const chatSettings = point ? null : props.chatSettings
-  const capability = point ? undefined : props.capability
-  const prefillPlan = point ? null : props.prefillPlan
+  const presentationOnly = point ? false : props.binding.currency !== 'current'
+  const mutationsUnavailable = point ? false : props.mutationsUnavailable === true
+  const structuralMutationPending = props.structuralMutationPending === true
+  const runConversationMutation = props.runConversationMutation
+  const chatSettings = props.chatSettings
+  const capability = props.capability
+  const prefillPlan = props.prefillPlan
   const longMessageDisplayMode = props.longMessageDisplayMode ?? 'full'
   const messageInitialRenderWork = point ? 1 : props.messageInitialRenderWork
   const messageRenderWindowLoadMode = point ? 'manual' : props.messageRenderWindowLoadMode
   const contextPreviewFrozen = point ? false : props.contextPreviewFrozen === true
   const transcriptLoadFailed = point ? false : props.transcriptLoadFailed === true
   const onLoadOlderMessages = point ? null : props.onLoadOlderMessages
-  const onEditAndSendMessage = point ? null : props.onEditAndSendMessage
-  const onRegenerateMessage = point ? null : props.onRegenerateMessage
-  const onContinueMessage = point ? null : props.onContinueMessage
-  const generationSubmissionPending = point ? false : props.generationSubmissionPending === true
-  const onCancelStructuralMutation = point ? undefined : props.onCancelStructuralMutation
+  const onEditAndSendMessage = props.onEditAndSendMessage
+  const onRegenerateMessage = props.onRegenerateMessage
+  const onContinueMessage = props.onContinueMessage
+  const generationSubmissionPending = props.generationSubmissionPending === true
+  const onCancelStructuralMutation = props.onCancelStructuralMutation
   const hiddenOlderCount = branchSnapshot.offset
   const staleBodyCount = branchSnapshot.staleBodyCount
   const canRetryLoadedBodies = transcriptLoadFailed && staleBodyCount > 0
@@ -163,7 +177,7 @@ const MessageListSurface = memo(function MessageListSurface(props: MessageListSu
   // Prefill UI gating for the inline editor's "Save & Send" path. The
   // button hides on `unsupported` models (Claude ≥ 4.6 / OpenAI / gpt-oss);
   // on every other class it shows up next to Save & Send.
-  const prefillSupported = prefillPlan !== null && prefillPlan.availability !== 'unsupported'
+  const prefillSupported = prefillPlan.availability !== 'unsupported'
   const prefillSettingsPrompt = useMemo(
     () =>
       prefillSupported ? <PrefillSettingsPrompt chatId={chatId} plan={prefillPlan} /> : undefined,
@@ -192,11 +206,16 @@ const MessageListSurface = memo(function MessageListSurface(props: MessageListSu
   )
 
   const handleEditInPlace = useCallback(
-    (m: MessageRow, text: string) => {
-      if (!runConversationMutation) throw new Error('ConversationPointMutationUnavailable')
+    (
+      m: MessageRow,
+      text: string,
+      authoring?: MessageBodyAuthoringOperations,
+      attachmentRefs?: MessageAttachmentRef[],
+    ) => {
       return runConversationMutation(
         { kind: 'edit', chatId, messageId: m.id },
-        (signal) => conversationActions.editMessage(chatId, m, text, signal),
+        (signal) =>
+          conversationActions.editMessage(chatId, m, text, signal, authoring, attachmentRefs),
         m.role === 'user'
           ? () => {
               setStaleHintFor((prev) => {
@@ -213,7 +232,6 @@ const MessageListSurface = memo(function MessageListSurface(props: MessageListSu
   )
   const handleToggleReasoningHidden = useCallback(
     (m: MessageRow, member: ReasoningMemberRef) => {
-      if (!runConversationMutation) throw new Error('ConversationPointMutationUnavailable')
       return runConversationMutation(
         { kind: 'reasoning', chatId, messageId: m.id, member },
         (signal) => conversationActions.toggleReasoning(chatId, m, member, signal),
@@ -221,9 +239,17 @@ const MessageListSurface = memo(function MessageListSurface(props: MessageListSu
     },
     [chatId, runConversationMutation],
   )
+  const handleEditReasoning = useCallback(
+    (m: MessageRow, member: Extract<ReasoningMemberRef, { kind: 'visible' }>, text: string) => {
+      return runConversationMutation(
+        { kind: 'reasoning', chatId, messageId: m.id, member },
+        (signal) => conversationActions.editReasoning(chatId, m, member, text, signal),
+      )
+    },
+    [chatId, runConversationMutation],
+  )
   const handleToggleToolHidden = useCallback(
     (m: MessageRow, member: ProviderOutputMemberRef) => {
-      if (!runConversationMutation) throw new Error('ConversationPointMutationUnavailable')
       return runConversationMutation(
         { kind: 'provider-output', chatId, messageId: m.id, member },
         (signal) => conversationActions.toggleProviderOutput(chatId, m, member, signal),
@@ -233,7 +259,6 @@ const MessageListSurface = memo(function MessageListSurface(props: MessageListSu
   )
   const handleToggleContextVisibility = useCallback(
     (m: MessageRow) => {
-      if (!runConversationMutation) throw new Error('ConversationPointMutationUnavailable')
       return runConversationMutation({ kind: 'context', chatId, messageId: m.id }, (signal) =>
         conversationActions.toggleContext(chatId, m, signal),
       )
@@ -242,7 +267,6 @@ const MessageListSurface = memo(function MessageListSurface(props: MessageListSu
   )
   const handleDismissGenerationNotice = useCallback(
     (m: MessageRow) => {
-      if (!runConversationMutation) throw new Error('ConversationPointMutationUnavailable')
       return runConversationMutation(
         { kind: 'generation-notice', chatId, messageId: m.id },
         (signal) => conversationActions.dismissGenerationNotice(chatId, m, signal),
@@ -262,7 +286,6 @@ const MessageListSurface = memo(function MessageListSurface(props: MessageListSu
       text: string,
       opts?: { prefillText?: string; attachmentRefs?: MessageAttachmentRef[] },
     ) => {
-      if (!onEditAndSendMessage) throw new Error('ConversationPointGenerationUnavailable')
       return onEditAndSendMessage(m, text, opts)
     },
     [onEditAndSendMessage],
@@ -270,7 +293,6 @@ const MessageListSurface = memo(function MessageListSurface(props: MessageListSu
 
   const handleRegenerate = useCallback(
     (m: MessageRow, options?: { settingsPatch?: ChatSettingsPatch }) => {
-      if (!onRegenerateMessage) throw new Error('ConversationPointGenerationUnavailable')
       return onRegenerateMessage(m, options)
     },
     [onRegenerateMessage],
@@ -278,7 +300,6 @@ const MessageListSurface = memo(function MessageListSurface(props: MessageListSu
 
   const handleContinue = useCallback(
     (m: MessageRow) => {
-      if (!onContinueMessage) throw new Error('ConversationPointGenerationUnavailable')
       return onContinueMessage(m)
     },
     [onContinueMessage],
@@ -286,9 +307,9 @@ const MessageListSurface = memo(function MessageListSurface(props: MessageListSu
 
   const handleForkChat = useCallback(
     (m: MessageRow) => {
-      if (!runConversationMutation) throw new Error('ConversationPointMutationUnavailable')
-      return runConversationMutation({ kind: 'fork', chatId, messageId: m.id }, (signal) =>
-        conversationActions.forkMessage(chatId, m, signal),
+      return runConversationMutation(
+        { kind: 'fork', chatId, messageId: m.id },
+        (signal, reportPhase) => conversationActions.forkMessage(chatId, m, signal, reportPhase),
       )
     },
     [chatId, runConversationMutation],
@@ -296,7 +317,6 @@ const MessageListSurface = memo(function MessageListSurface(props: MessageListSu
 
   const handleDeleteMessage = useCallback(
     (m: MessageRow, mode: ConversationDeleteMode, roleMismatch = false) => {
-      if (!runConversationMutation) throw new Error('ConversationPointMutationUnavailable')
       return runConversationMutation({ kind: 'delete', chatId }, (signal, reportPhase) =>
         conversationActions.deleteMessage(chatId, m.id, mode, roleMismatch, signal, reportPhase),
       )
@@ -375,7 +395,6 @@ const MessageListSurface = memo(function MessageListSurface(props: MessageListSu
   }, [activePath, branchSnapshot])
 
   const excludedIds = useMemo(() => {
-    if (!chatSettings) return new Set<MessageId>()
     return computeExcludedIds(
       contextPreviewPath?.materializeNodes() ?? [],
       chatSettings,
@@ -455,20 +474,21 @@ const MessageListSurface = memo(function MessageListSurface(props: MessageListSu
           onDismissGenerationNotice={handleDismissGenerationNotice}
           onMutateAttachmentRef={handleMutateAttachmentRef}
           onToggleReasoningDetailHidden={handleToggleReasoningHidden}
+          onEditReasoningDetail={handleEditReasoning}
           onToggleProviderOutputItemHidden={handleToggleToolHidden}
-          {...(!point && m.role === 'user'
+          {...(m.role === 'user'
             ? {
                 onEditAndSend: handleEditAndSend,
                 ...(prefillSupported
                   ? {
                       showPrefillButton: true,
-                      defaultPrefill: chatSettings?.defaultPrefill ?? '',
+                      defaultPrefill: chatSettings.defaultPrefill ?? '',
                       prefillSettingsPrompt,
                     }
                   : {}),
               }
             : {})}
-          {...(!point && m.role === 'assistant'
+          {...(m.role === 'assistant'
             ? {
                 onRegenerate: handleRegenerate,
                 onContinue: handleContinue,
@@ -487,7 +507,7 @@ const MessageListSurface = memo(function MessageListSurface(props: MessageListSu
     [
       branchSpine,
       chatId,
-      chatSettings?.defaultPrefill,
+      chatSettings.defaultPrefill,
       excludedIds,
       generationSubmissionPending,
       handleContinue,
@@ -495,6 +515,7 @@ const MessageListSurface = memo(function MessageListSurface(props: MessageListSu
       handleDismissGenerationNotice,
       handleEditAndSend,
       handleEditInPlace,
+      handleEditReasoning,
       handleDeleteMessage,
       handleForkChat,
       handleMutateAttachmentRef,
@@ -511,7 +532,6 @@ const MessageListSurface = memo(function MessageListSurface(props: MessageListSu
       staleHintFor,
       structuralMutationPending,
       onCancelStructuralMutation,
-      point,
       presentationFence,
     ],
   )

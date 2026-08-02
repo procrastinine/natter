@@ -3,7 +3,7 @@
 // the ops can be unit-tested by calling these helpers directly.
 //
 // Three distinct "modify user prompt" semantics, per the user's rule:
-//   1. Edit in place — `editInPlace(messageId, text)` mutates `content`
+//   1. Edit in place — `editMessageBody(messageId, text)` mutates the authored body
 //      on the existing row; NO sibling is created; NO API call.
 //   2. Edit & resend — `editAndResend(messageId, text)` atomically prepares
 //      the user sibling and its assistant placeholder, then dispatches one
@@ -14,7 +14,12 @@
 
 import type { ActiveBranchIntentTarget } from '../core/active-branch-spine'
 import type { ChatSettingsPatch } from '../core/chat-metadata'
-import { writeTextInto } from '../core/message-content'
+import {
+  type MessageBodyAuthoringOperations,
+  planReasoningAuthoringOperations,
+  projectReasoningAuthoring,
+} from '../core/message-body-authoring'
+import { plaintextOf, writeTextInto } from '../core/message-content'
 import type {
   DeleteResult,
   PasteImportInput,
@@ -119,17 +124,25 @@ async function executeSelectingConversationCommand<C extends SelectingMessageMut
   return conversationCommittedResult(commit, commit.value.destination.chat.id)
 }
 
-export async function editInPlace(
+export async function editMessageBody(
   chatId: ChatId,
   message: Message,
   newText: string,
   signal?: AbortSignal,
+  authoring?: MessageBodyAuthoringOperations,
+  attachmentRefs?: AttachmentRef[],
 ): Promise<void> {
-  const nextContent = writeTextInto(message.content, newText)
+  const contentChanged = newText !== plaintextOf(message.content)
   await executeConversationCommand(
     {
-      kind: 'message.edit-content',
-      input: { chatId, messageId: message.id, content: nextContent },
+      kind: 'message.edit-body',
+      input: {
+        chatId,
+        messageId: message.id,
+        ...(contentChanged ? { content: writeTextInto(message.content, newText) } : {}),
+        ...(authoring ? { authoring } : {}),
+        ...(attachmentRefs ? { attachmentRefs } : {}),
+      },
     },
     signal,
   )
@@ -149,6 +162,49 @@ export async function toggleReasoningDetailHidden(
       member,
     },
     signal,
+  )
+}
+
+export async function editReasoningDetail(
+  chatId: ChatId,
+  message: Message,
+  member: Extract<ReasoningMemberRef, { kind: 'visible' }>,
+  text: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  const projection = projectReasoningAuthoring(message)
+  const nextEntries = projection.entries.map((entry) =>
+    entry.kind === 'visible' &&
+    entry.part.id === member.id &&
+    sameAttemptOwner(entry.owner, member.owner)
+      ? { ...entry, part: { ...entry.part, text } }
+      : entry,
+  )
+  const operations = planReasoningAuthoringOperations(projection.entries, nextEntries)
+  if (
+    operations.length === 0 &&
+    !projection.entries.some(
+      (entry) =>
+        entry.kind === 'visible' &&
+        entry.part.id === member.id &&
+        sameAttemptOwner(entry.owner, member.owner),
+    )
+  ) {
+    throw new Error(`ReasoningMemberUnavailable:${message.id}:${member.id}`)
+  }
+  await editMessageBody(chatId, message, plaintextOf(message.content), signal, {
+    reasoning: operations,
+  })
+}
+
+function sameAttemptOwner(
+  left: ReasoningMemberRef['owner'],
+  right: ReasoningMemberRef['owner'],
+): boolean {
+  return (
+    left.kind === right.kind &&
+    (left.kind === 'generation' ||
+      (right.kind === 'continuation' && left.streamId === right.streamId))
   )
 }
 

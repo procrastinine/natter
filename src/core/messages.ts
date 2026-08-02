@@ -10,8 +10,20 @@ import {
 import { attachmentRefsFromIds, liveAttachmentRefs } from './attachment-refs'
 import { type BranchPathDescriptor, readLiveBranchPath } from './branch-session'
 import type { TokenCalibrationMode } from './global-settings'
+import {
+  type MessageBodyAuthoringOperations,
+  type ProviderOutputAuthoringOperation,
+  preserveProviderSealedFields,
+  providerOutputItemEquals,
+  type ReasoningAuthoringOperation,
+} from './message-body-authoring'
 import type { MessageTreeIndexFields } from './message-tree-index'
 import type { MessageContextRouteFacts } from './reasoning'
+import {
+  reasoningCarrierDescriptorEquals,
+  reasoningCarrierDescriptorFromCarrier,
+  reasoningVisiblePartEquals,
+} from './reasoning-envelope'
 import { calibrationFieldsForEdit } from './token-calibration'
 import {
   cascadeSoftDelete,
@@ -33,8 +45,10 @@ import type {
   MessageId,
   MessageRole,
   MutationScope,
+  ProviderOutputItem,
   ProviderOutputMemberRef,
   ReasoningMemberRef,
+  ReasoningVisiblePartV2,
 } from './types'
 
 type MessageBodyKey =
@@ -860,15 +874,16 @@ async function executeDeleteMutation(
   }
 }
 
-export interface EditMessageInput {
+export interface EditMessageBodyInput {
   chatId: ChatId
   messageId: MessageId
-  content: ContentItem[]
+  content?: ContentItem[]
   attachmentRefs?: AttachmentRef[]
+  authoring?: MessageBodyAuthoringOperations
   now?: number
 }
 
-export interface EditMessageResult {
+export interface EditMessageBodyResult {
   versions: ChatVersions
   message: Message
   header: MessageHeaderRow
@@ -879,11 +894,11 @@ export interface EditMessageCalibrationSnapshot {
   mode: TokenCalibrationMode
 }
 
-export async function editMessageContentInRepository(
+export async function editMessageBodyInRepository(
   repo: MessageMutationRepository,
-  input: EditMessageInput,
+  input: EditMessageBodyInput,
   readCalibration: (reader: MessageEditPreflightReader) => Promise<EditMessageCalibrationSnapshot>,
-): Promise<EditMessageResult> {
+): Promise<EditMessageBodyResult> {
   const now = input.now ?? Date.now()
   const { target, chatForRatio, calibration } = await repo.readEditPreflight(async (reader) => {
     const [target, chatForRatio, calibration] = await Promise.all([
@@ -897,18 +912,19 @@ export async function editMessageContentInRepository(
     return { target, chatForRatio, calibration }
   })
   const currentModelId = chatForRatio?.settings.model ?? ''
-  const calibrationPatch = currentModelId
-    ? calibrationFieldsForEdit(
-        input.content,
-        target.originalCharCount,
-        target.originalModelId,
-        target.originalCalibrationKey,
-        currentModelId,
-        chatForRatio,
-        calibration.global,
-        calibration.mode,
-      )
-    : null
+  const calibrationPatch =
+    currentModelId && input.content
+      ? calibrationFieldsForEdit(
+          input.content,
+          target.originalCharCount,
+          target.originalModelId,
+          target.originalCalibrationKey,
+          currentModelId,
+          chatForRatio,
+          calibration.global,
+          calibration.mode,
+        )
+      : null
   const result = await repo.runMutation(
     dedupeScopes([
       messageScope(input.messageId),
@@ -930,27 +946,264 @@ export async function editMessageContentInRepository(
       ) {
         throw new TreeChangedError(input.chatId, `edit target ${input.messageId} changed`)
       }
-      const next: Message = {
+      let next: Message = {
         ...current,
-        content: structuredClone(input.content),
+        content: input.content ? structuredClone(input.content) : current.content,
         editedAt: now,
         ...(calibrationPatch ?? {}),
+      }
+      if (input.authoring?.reasoning && input.authoring.reasoning.length > 0) {
+        next = applyReasoningAuthoringOperations(next, input.authoring.reasoning)
+      }
+      if (input.authoring?.providerOutput && input.authoring.providerOutput.length > 0) {
+        next = applyProviderOutputAuthoringOperations(next, input.authoring.providerOutput)
       }
       if (input.attachmentRefs !== undefined) {
         if (input.attachmentRefs.length > 0) {
           const withRefs = withAttachmentRefs({}, input.attachmentRefs, now, current.attachmentRefs)
           if (withRefs.attachmentRefs) next.attachmentRefs = withRefs.attachmentRefs
-        } else if (contentHasAttachmentIds(input.content)) {
+        } else if (contentHasAttachmentIds(next.content)) {
           next.attachmentRefs = []
         } else delete next.attachmentRefs
       }
-      const message = await ctx.putMessage(next)
+      const message = await ctx.putMessage(next, {
+        touchChatSummary: input.content !== undefined,
+      })
       const header = await ctx.getMessageHeader(input.messageId)
       if (!header) throw new Error(`EditMessagePresentationMissing:${input.messageId}`)
       return { message, header }
     },
   )
   return { ...result.value, versions: versionsFor(result, input.chatId) }
+}
+
+function applyReasoningAuthoringOperations(
+  message: Message,
+  operations: readonly ReasoningAuthoringOperation[],
+): Message {
+  let next = message
+  for (const operation of operations) {
+    const owner = 'owner' in operation ? operation.owner : operation.member.owner
+    const updated = mutateOwnedReasoningEnvelopeForAuthoring(next, owner, (envelope) => {
+      switch (operation.kind) {
+        case 'visible-create': {
+          if (
+            envelope.visible.some((part) => part.id === operation.part.id) ||
+            envelope.carriers.some((carrier) => carrier.id === operation.part.id)
+          ) {
+            throw new TreeChangedError(
+              message.chatId,
+              `reasoning member ${operation.part.id} exists`,
+            )
+          }
+          return {
+            ...envelope,
+            visible: [...envelope.visible, structuredClone(operation.part)],
+          }
+        }
+        case 'visible-replace': {
+          const index = envelope.visible.findIndex((part) => part.id === operation.member.id)
+          const current = envelope.visible[index]
+          if (!current || !reasoningVisiblePartEquals(current, operation.expected)) {
+            throw new TreeChangedError(
+              message.chatId,
+              `reasoning member ${operation.member.id} changed`,
+            )
+          }
+          const { hidden: _expectedHidden, ...expectedWithoutHidden } = operation.expected
+          const allowedNext: ReasoningVisiblePartV2 = {
+            ...expectedWithoutHidden,
+            kind: operation.next.kind,
+            text: operation.next.text,
+            ...(operation.next.hidden !== undefined ? { hidden: operation.next.hidden } : {}),
+          }
+          if (!reasoningVisiblePartEquals(allowedNext, operation.next)) {
+            throw new Error(`ReasoningVisibleAuthoringMetadataChanged:${operation.member.id}`)
+          }
+          const visible = [...envelope.visible]
+          visible[index] = structuredClone(operation.next)
+          const invalidatesBinding =
+            operation.expected.text !== operation.next.text ||
+            operation.expected.kind !== operation.next.kind
+          const carriers = invalidatesBinding
+            ? envelope.carriers.filter(
+                (carrier) =>
+                  !(
+                    (carrier.kind === 'anthropic-signature' ||
+                      carrier.kind === 'gemini-thought-signature') &&
+                    carrier.bindsVisiblePartId === operation.member.id
+                  ),
+              )
+            : envelope.carriers
+          return { ...envelope, visible, carriers }
+        }
+        case 'visible-delete': {
+          const index = envelope.visible.findIndex((part) => part.id === operation.member.id)
+          const current = envelope.visible[index]
+          if (!current || !reasoningVisiblePartEquals(current, operation.expected)) {
+            throw new TreeChangedError(
+              message.chatId,
+              `reasoning member ${operation.member.id} changed`,
+            )
+          }
+          return {
+            ...envelope,
+            visible: envelope.visible.filter((_, candidateIndex) => candidateIndex !== index),
+            carriers: envelope.carriers.filter(
+              (carrier) =>
+                !(
+                  (carrier.kind === 'anthropic-signature' ||
+                    carrier.kind === 'gemini-thought-signature') &&
+                  carrier.bindsVisiblePartId === operation.member.id
+                ),
+            ),
+          }
+        }
+        case 'carrier-set-hidden':
+        case 'carrier-delete': {
+          const index = envelope.carriers.findIndex((carrier) => carrier.id === operation.member.id)
+          const current = envelope.carriers[index]
+          if (
+            !current ||
+            !reasoningCarrierDescriptorEquals(
+              reasoningCarrierDescriptorFromCarrier(current),
+              operation.expected,
+            )
+          ) {
+            throw new TreeChangedError(
+              message.chatId,
+              `reasoning carrier ${operation.member.id} changed`,
+            )
+          }
+          if (operation.kind === 'carrier-delete') {
+            return {
+              ...envelope,
+              carriers: envelope.carriers.filter((_, candidateIndex) => candidateIndex !== index),
+            }
+          }
+          const carriers = [...envelope.carriers]
+          if (operation.hidden) carriers[index] = { ...current, hidden: true }
+          else {
+            const { hidden: _hidden, ...shown } = current
+            carriers[index] = shown
+          }
+          return { ...envelope, carriers }
+        }
+      }
+    })
+    if (!updated) {
+      throw new TreeChangedError(message.chatId, 'reasoning attempt owner unavailable')
+    }
+    next = updated
+  }
+  return next
+}
+
+function mutateOwnedReasoningEnvelopeForAuthoring(
+  message: Message,
+  owner: ReasoningMemberRef['owner'],
+  mutate: (
+    envelope: NonNullable<Message['reasoningEnvelope']>,
+  ) => NonNullable<Message['reasoningEnvelope']>,
+): Message | undefined {
+  if (owner.kind === 'generation') {
+    const reasoningEnvelope = mutate(
+      message.reasoningEnvelope ?? { schemaVersion: 2, visible: [], carriers: [] },
+    )
+    return { ...message, reasoningEnvelope }
+  }
+  const attempts = message.continuationAttempts
+  const attemptIndex = attempts?.findIndex(
+    (attempt) => attempt.application.kind === 'applied' && attempt.streamId === owner.streamId,
+  )
+  if (!attempts || attemptIndex === undefined || attemptIndex < 0) return undefined
+  const attempt = attempts[attemptIndex]
+  if (!attempt) return undefined
+  const reasoningEnvelope = mutate(
+    attempt.reasoningEnvelope ?? { schemaVersion: 2, visible: [], carriers: [] },
+  )
+  const nextAttempts = [...attempts]
+  nextAttempts[attemptIndex] = { ...attempt, reasoningEnvelope }
+  return { ...message, continuationAttempts: nextAttempts }
+}
+
+function applyProviderOutputAuthoringOperations(
+  message: Message,
+  operations: readonly ProviderOutputAuthoringOperation[],
+): Message {
+  let next = message
+  for (const operation of operations) {
+    const owner = 'owner' in operation ? operation.owner : operation.member.owner
+    const updated = mutateOwnedProviderOutputForAuthoring(next, owner, (items) => {
+      if (operation.kind === 'provider-output-create') {
+        return [...items, structuredClone({ ...operation.item, edited: true })]
+      }
+      const index = locateProviderOutputMember(
+        message.chatId,
+        items,
+        operation.member,
+        operation.expected,
+      )
+      if (operation.kind === 'provider-output-delete') {
+        return items.filter((_, candidateIndex) => candidateIndex !== index)
+      }
+      const sealedItem = preserveProviderSealedFields(operation.expected.item, operation.next.item)
+      if (!providerOutputItemEquals({ ...operation.next, item: sealedItem }, operation.next)) {
+        throw new Error(`ProviderOutputSealedFieldChanged:${operation.member.itemIndex}`)
+      }
+      const replaced = [...items]
+      replaced[index] = structuredClone(operation.next)
+      return replaced
+    })
+    if (!updated) {
+      throw new TreeChangedError(message.chatId, 'provider output attempt owner unavailable')
+    }
+    next = updated
+  }
+  return next
+}
+
+function locateProviderOutputMember(
+  chatId: ChatId,
+  items: readonly ProviderOutputItem[],
+  member: ProviderOutputMemberRef,
+  expected: ProviderOutputItem,
+): number {
+  const direct = items[member.itemIndex]
+  if (direct && providerOutputItemEquals(direct, expected)) return member.itemIndex
+  const matches: number[] = []
+  for (const [index, item] of items.entries()) {
+    if (providerOutputItemEquals(item, expected)) matches.push(index)
+  }
+  if (matches.length === 1) return matches[0] as number
+  throw new TreeChangedError(chatId, `provider output member ${member.itemIndex} changed`)
+}
+
+function mutateOwnedProviderOutputForAuthoring(
+  message: Message,
+  owner: ProviderOutputMemberRef['owner'],
+  mutate: (items: readonly ProviderOutputItem[]) => ProviderOutputItem[],
+): Message | undefined {
+  if (owner.kind === 'generation') {
+    const providerOutputItems = mutate(message.providerOutputItems ?? [])
+    if (providerOutputItems.length > 0) return { ...message, providerOutputItems }
+    const { providerOutputItems: _providerOutputItems, ...withoutItems } = message
+    return withoutItems
+  }
+  const attempts = message.continuationAttempts
+  const attemptIndex = attempts?.findIndex(
+    (attempt) => attempt.application.kind === 'applied' && attempt.streamId === owner.streamId,
+  )
+  if (!attempts || attemptIndex === undefined || attemptIndex < 0) return undefined
+  const attempt = attempts[attemptIndex]
+  if (!attempt) return undefined
+  const providerOutputItems = mutate(attempt.providerOutputItems ?? [])
+  const nextAttempt: typeof attempt = { ...attempt }
+  if (providerOutputItems.length > 0) nextAttempt.providerOutputItems = providerOutputItems
+  else delete nextAttempt.providerOutputItems
+  const nextAttempts = [...attempts]
+  nextAttempts[attemptIndex] = nextAttempt
+  return { ...message, continuationAttempts: nextAttempts }
 }
 
 export async function mutateMessageBodyInRepository(
@@ -967,27 +1220,10 @@ export async function mutateMessageBodyInRepository(
       let next: Message | undefined
       switch (input.kind) {
         case 'message.toggle-reasoning-detail': {
-          if (input.member.owner.kind === 'generation') {
-            const envelope = current.reasoningEnvelope
-            if (!envelope) return undefined
-            const reasoningEnvelope = toggleReasoningMember(envelope, input.member)
-            if (!reasoningEnvelope) return undefined
-            next = { ...current, reasoningEnvelope }
-            break
-          }
-          const streamId = input.member.owner.streamId
-          const attempts = current.continuationAttempts
-          const attemptIndex = attempts?.findIndex(
-            (attempt) => attempt.application.kind === 'applied' && attempt.streamId === streamId,
+          next = mutateOwnedReasoningEnvelope(current, input.member.owner, (envelope) =>
+            toggleReasoningMember(envelope, input.member),
           )
-          if (!attempts || attemptIndex === undefined || attemptIndex < 0) return undefined
-          const attempt = attempts[attemptIndex]
-          if (!attempt?.reasoningEnvelope) return undefined
-          const reasoningEnvelope = toggleReasoningMember(attempt.reasoningEnvelope, input.member)
-          if (!reasoningEnvelope) return undefined
-          const nextAttempts = [...attempts]
-          nextAttempts[attemptIndex] = { ...attempt, reasoningEnvelope }
-          next = { ...current, continuationAttempts: nextAttempts }
+          if (!next) return undefined
           break
         }
         case 'message.toggle-provider-output-item': {
@@ -1051,6 +1287,33 @@ export async function mutateMessageBodyInRepository(
     },
   )
   return result.value
+}
+
+function mutateOwnedReasoningEnvelope(
+  message: Message,
+  owner: ReasoningMemberRef['owner'],
+  mutate: (
+    envelope: NonNullable<Message['reasoningEnvelope']>,
+  ) => NonNullable<Message['reasoningEnvelope']> | undefined,
+): Message | undefined {
+  if (owner.kind === 'generation') {
+    const envelope = message.reasoningEnvelope
+    if (!envelope) return undefined
+    const reasoningEnvelope = mutate(envelope)
+    return reasoningEnvelope ? { ...message, reasoningEnvelope } : undefined
+  }
+  const attempts = message.continuationAttempts
+  const attemptIndex = attempts?.findIndex(
+    (attempt) => attempt.application.kind === 'applied' && attempt.streamId === owner.streamId,
+  )
+  if (!attempts || attemptIndex === undefined || attemptIndex < 0) return undefined
+  const attempt = attempts[attemptIndex]
+  if (!attempt?.reasoningEnvelope) return undefined
+  const reasoningEnvelope = mutate(attempt.reasoningEnvelope)
+  if (!reasoningEnvelope) return undefined
+  const nextAttempts = [...attempts]
+  nextAttempts[attemptIndex] = { ...attempt, reasoningEnvelope }
+  return { ...message, continuationAttempts: nextAttempts }
 }
 
 function toggleReasoningMember(

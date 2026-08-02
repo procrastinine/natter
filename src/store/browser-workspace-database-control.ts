@@ -524,8 +524,10 @@ async function applyReplacementStorageBaseline(
     knownReclaimableBytes: 0,
     lastCompactedLiveBytes: baseline.liveBytes,
     requestRevision: previous.requestRevision,
-    attemptedRevision: previous.attemptedRevision,
-    completedRevision: previous.attemptedRevision,
+    attemptedRevision:
+      baseline.kind === 'reset' ? previous.requestRevision : previous.attemptedRevision,
+    completedRevision:
+      baseline.kind === 'reset' ? previous.requestRevision : previous.attemptedRevision,
   }
   await db.compactionStates.put(state)
   return state

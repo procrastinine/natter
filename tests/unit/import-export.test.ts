@@ -264,7 +264,7 @@ async function flattenedSettings(profileId: ProfileId): Promise<ChatSettings> {
   settings.textTemplate = template.id
   settings.enabledToolIds = ['local-tool']
   settings.trustedToolIds = ['local-tool']
-  settings.tools.openrouter.enabledServerToolIds = ['web-search']
+  settings.tools.openrouter.enabledServerToolIds = ['web-search', 'shell']
   return settings
 }
 
@@ -962,7 +962,7 @@ describe('chat preset export/import', () => {
     expect(portable.customTextTemplate?.userPrefix).toBe('Saved user: ')
     expect(portable.enabledToolIds).toEqual([])
     expect(portable.trustedToolIds).toEqual([])
-    expect(portable.tools.openrouter.enabledServerToolIds).toEqual(['web-search'])
+    expect(portable.tools.openrouter.enabledServerToolIds).toEqual(['web-search', 'shell'])
   })
 
   it('imports a flattened preset even when the source connection is missing', async () => {

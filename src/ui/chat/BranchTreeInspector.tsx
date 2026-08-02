@@ -8,9 +8,19 @@ import {
   createAppliedMessageView,
   projectAppliedMessageReasoningPresentation,
 } from '../../core/continuation-content'
+import {
+  type MessageBodyAuthoringOperations,
+  projectProviderOutputAuthoring,
+  projectReasoningAuthoring,
+} from '../../core/message-body-authoring'
 import { plaintextOf } from '../../core/message-content'
 import { literalSearchHasMatchEndingAfter } from '../../core/search-query'
-import type { Message, ProviderOutputMemberRef, ReasoningMemberRef } from '../../core/types'
+import type {
+  Message,
+  MessageAttachmentRef,
+  ProviderOutputMemberRef,
+  ReasoningMemberRef,
+} from '../../core/types'
 import { useMessageStreamProjection } from '../../hooks/useMessageStreamProjection'
 import { usePresentationInteraction } from '../../hooks/usePresentationInteraction'
 import type {
@@ -56,8 +66,17 @@ export interface BranchTreeInspectorProps {
   bodyReady?: boolean
   onClose: () => void
   onActivate?: () => void
-  onEdit?: (message: Message, text: string) => ConversationMutationSettlement
-  onEditAndSend?: (message: Message, text: string) => GenerationSubmission
+  onEdit?: (
+    message: Message,
+    text: string,
+    authoring?: MessageBodyAuthoringOperations,
+    attachmentRefs?: MessageAttachmentRef[],
+  ) => ConversationMutationSettlement
+  onEditAndSend?: (
+    message: Message,
+    text: string,
+    options?: { prefillText?: string; attachmentRefs?: MessageAttachmentRef[] },
+  ) => GenerationSubmission
   onDelete?: () => ConversationMutationSettlement
   onRegenerate?: () => GenerationSubmission
   onContinue?: () => GenerationSubmission
@@ -65,6 +84,10 @@ export interface BranchTreeInspectorProps {
   onToggleContextVisibility?: () => ConversationMutationSettlement
   onMutateAttachmentRef?: (mutation: MessageAttachmentRefMutation) => void | Promise<void>
   onToggleReasoningDetailHidden?: (member: ReasoningMemberRef) => ConversationMutationSettlement
+  onEditReasoningDetail?: (
+    member: Extract<ReasoningMemberRef, { kind: 'visible' }>,
+    text: string,
+  ) => ConversationMutationSettlement
   onToggleProviderOutputItemHidden?: (
     member: ProviderOutputMemberRef,
   ) => ConversationMutationSettlement
@@ -132,6 +155,7 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
   onToggleContextVisibility,
   onMutateAttachmentRef,
   onToggleReasoningDetailHidden,
+  onEditReasoningDetail,
   onToggleProviderOutputItemHidden,
   generationSubmissionPending = false,
   onCancelGenerationSubmission,
@@ -149,6 +173,14 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
   const [totalOccurrenceCount, setTotalOccurrenceCount] = useState(0)
   const [currentOccurrence, setCurrentOccurrence] = useState(-1)
   const appliedView = useMemo(() => createAppliedMessageView(message), [message])
+  const reasoningAuthoring = useMemo(
+    () => (message.role === 'assistant' ? projectReasoningAuthoring(message) : undefined),
+    [message],
+  )
+  const providerOutputAuthoring = useMemo(
+    () => (message.role === 'assistant' ? projectProviderOutputAuthoring(message) : undefined),
+    [message],
+  )
   const searchToolsInteraction = usePresentationInteraction(branchInspectorSearchInteraction)
   const runSearchToolsInteraction = searchToolsInteraction.run
   const streamProjection = useMessageStreamProjection(
@@ -378,7 +410,10 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
     navigator.clipboard.writeText(plaintextOf(renderedContent)).catch(() => undefined)
 
   const saveEditAndSend = onEditAndSend
-    ? (text: string): GenerationSubmission => onEditAndSend(message, text)
+    ? (
+        text: string,
+        options?: { prefillText?: string; attachmentRefs?: MessageAttachmentRef[] },
+      ): GenerationSubmission => onEditAndSend(message, text, options)
     : undefined
 
   return (
@@ -677,10 +712,23 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
             <InlineEditor
               key={message.id}
               initial={plaintextOf(message.content)}
-              onSave={(text) => onEdit(message, text)}
+              onSave={(
+                text,
+                authoring?: MessageBodyAuthoringOperations,
+                attachmentRefs?: MessageAttachmentRef[],
+              ) =>
+                authoring || attachmentRefs
+                  ? onEdit(message, text, authoring, attachmentRefs)
+                  : onEdit(message, text)
+              }
               onCancel={() => setEditingMessageId(null)}
               saveDisabled={!bodyReady || streamTargetBusy}
-              attachmentsEnabled={false}
+              initialAttachmentRefs={message.attachmentRefs}
+              attachmentsEnabled
+              {...(reasoningAuthoring ? { initialReasoning: reasoningAuthoring } : {})}
+              {...(providerOutputAuthoring
+                ? { initialProviderOutput: providerOutputAuthoring }
+                : {})}
               {...(message.role === 'user' && saveEditAndSend
                 ? {
                     onSaveAndSend: saveEditAndSend,
@@ -697,9 +745,15 @@ const BranchTreeInspectorComponent = memo(function BranchTreeInspector({
                   hasContent={totalChars > 0}
                   deferContentUntilOpen
                   toggleHiddenDisabled={!bodyReady || streamTargetBusy || Boolean(liveReasoning)}
+                  editDisabled={!bodyReady || streamTargetBusy || Boolean(liveReasoning)}
                   {...(onToggleReasoningDetailHidden
                     ? {
                         onToggleHidden: onToggleReasoningDetailHidden,
+                      }
+                    : {})}
+                  {...(onEditReasoningDetail
+                    ? {
+                        onEditVisible: onEditReasoningDetail,
                       }
                     : {})}
                 />

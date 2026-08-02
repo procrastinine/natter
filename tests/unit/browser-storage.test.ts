@@ -1,7 +1,10 @@
 import type { Transaction } from 'dexie'
 import { describe, expect, it, vi } from 'vitest'
 import { browserLocalStorage, browserSessionStorage } from '../../src/lib/browser-storage'
-import { bindReadonlyTransactionAbort } from '../../src/store/browser-indexeddb-reads'
+import {
+  abortIndexedDbTransactionAtCancellationBoundary,
+  bindReadonlyTransactionAbort,
+} from '../../src/store/browser-indexeddb-reads'
 
 describe('browser storage boundary', () => {
   it('selects the current browser origin storage', () => {
@@ -43,7 +46,7 @@ describe('IndexedDB read cancellation', () => {
       active: true,
       abort: vi.fn(() => {
         transaction.active = false
-        throw new Error('native transaction completed before Dexie observed it')
+        throw new DOMException('The transaction has finished', 'InvalidStateError')
       }),
     } as unknown as Transaction
     const controller = new AbortController()
@@ -58,7 +61,7 @@ describe('IndexedDB read cancellation', () => {
     unbind()
   })
 
-  it('keeps the cancellation listener total when a live transaction cannot abort', () => {
+  it('does not hide an unexpected transaction abort failure', () => {
     const failure = new Error('abort failed before terminal ownership transferred')
     const transaction = {
       active: true,
@@ -66,16 +69,8 @@ describe('IndexedDB read cancellation', () => {
         throw failure
       }),
     } as unknown as Transaction
-    const controller = new AbortController()
-    const unbind = bindReadonlyTransactionAbort(
-      transaction,
-      controller.signal,
-      'Workspace query aborted',
-    )
 
-    expect(() => controller.abort()).not.toThrow()
-    expect(controller.signal.aborted).toBe(true)
+    expect(() => abortIndexedDbTransactionAtCancellationBoundary(transaction)).toThrow(failure)
     expect(transaction.abort).toHaveBeenCalledTimes(1)
-    unbind()
   })
 })

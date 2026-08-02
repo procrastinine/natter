@@ -2937,7 +2937,7 @@ describe('sendText — token calibration sample ingest', () => {
     if (!output) throw new Error('ExpectedOutputImage')
     expect(typeof output.attachmentId).toBe('string')
     await executeMessageCommand({
-      kind: 'message.edit-content',
+      kind: 'message.edit-body',
       input: {
         chatId: chat.id,
         messageId: result.assistantMessageId,
@@ -3689,7 +3689,7 @@ describe('recoverOrphans', () => {
 
     await expect(
       executeMessageCommand({
-        kind: 'message.edit-content',
+        kind: 'message.edit-body',
         input: {
           chatId: chat.id,
           messageId,
@@ -3703,7 +3703,7 @@ describe('recoverOrphans', () => {
 
     await expect(
       executeMessageCommand({
-        kind: 'message.edit-content',
+        kind: 'message.edit-body',
         input: {
           chatId: chat.id,
           messageId,
@@ -3908,7 +3908,7 @@ describe('recoverOrphans', () => {
     const chat = await createChat({ settings: chatSettings() })
     const orphanId = await seedUnfinishedAssistant(chat.id)
     await executeMessageCommand({
-      kind: 'message.edit-content',
+      kind: 'message.edit-body',
       input: { chatId: chat.id, messageId: orphanId, content: [] },
     })
     const staleLease = await insertRecoveryLease({

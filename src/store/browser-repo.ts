@@ -1,6 +1,6 @@
 import Dexie, { type IndexableTypePart, type Table, type Transaction } from 'dexie'
 import type { ActiveBranchForkTarget, ActiveBranchIntentTarget } from '../core/active-branch-spine'
-import { compareLiveLeafRecency, findLastUpdatedLeafId } from '../core/active-path'
+import { compareLiveLeafRecency } from '../core/active-path'
 import { messageRenderableTextSemanticsEqual } from '../core/branch-flatten'
 import { type BranchPathWindow, readLiveBranchPath } from '../core/branch-session'
 import { modelCatalogQueryForConnectionKind, modelsCacheKey } from '../core/cache-keys'
@@ -155,7 +155,11 @@ import {
   type ValidatedGenerationPromptPathHeaders,
 } from './browser-domain-mutations'
 import type { BrowserImportExportRead } from './browser-import-export'
-import { bindReadonlyTransactionAbort, readBulkGetPages } from './browser-indexeddb-reads'
+import {
+  abortIndexedDbTransactionAtCancellationBoundary,
+  bindReadonlyTransactionAbort,
+  readBulkGetPages,
+} from './browser-indexeddb-reads'
 import type { BrowserMutationTableName } from './browser-mutation-plan'
 import {
   BODY_READ_PAGE_SIZE,
@@ -167,11 +171,6 @@ import {
   readStreamLeasePages,
   readStringPrimaryKeyPages,
 } from './browser-query-pages'
-import {
-  type BrowserStagedCommandConflictEvidence,
-  type BrowserStagedCommandExecution,
-  isBrowserWorkspaceStagedFanoutCommand,
-} from './browser-staged-fanout-command'
 import {
   boundedMaintenanceLimit,
   MAX_STORAGE_MAINTENANCE_BATCH,
@@ -248,7 +247,7 @@ import {
   deleteSingleMessageInRepository,
   deleteTurnInRepository,
   deleteVariantInRepository,
-  editMessageContentInRepository,
+  editMessageBodyInRepository,
   mutateMessageBodyInRepository,
   pasteImportInRepository,
 } from './message-command-repository'
@@ -2155,10 +2154,10 @@ function sidebarChatIdsForMutationFacts(facts: BrowserCommandMutationFacts): rea
 export type BrowserCommandFanoutAdmission<C extends WorkspaceCommand> =
   | {
       readonly kind: 'committed'
-      readonly execution: BrowserStagedCommandExecution<C>
+      readonly execution: BrowserCommandExecution<C>
     }
   | {
-      readonly kind: 'staging-required'
+      readonly kind: 'budget-exceeded'
       readonly reason: {
         readonly dimension: BrowserCommandFanoutBudgetExceededError['dimension']
         readonly observed: number
@@ -2167,6 +2166,17 @@ export type BrowserCommandFanoutAdmission<C extends WorkspaceCommand> =
         readonly operation?: string
       }
     }
+
+export interface BrowserCommandConflictEvidence {
+  readonly readAddresses: readonly string[]
+  readonly readScopes: readonly BrowserCommandReadConflictScope[]
+  readonly mutationAddresses: readonly string[]
+}
+
+export interface BrowserCommandExecution<C extends WorkspaceCommand> {
+  readonly commit: CommitEnvelope<WorkspaceCommandResult<C>>
+  readonly conflictEvidence: BrowserCommandConflictEvidence
+}
 
 class BrowserCommandCommit implements BrowserCommandSessionPort {
   private readonly committedMutationTables = new Set<string>()
@@ -2368,14 +2378,16 @@ class BrowserCommandCommit implements BrowserCommandSessionPort {
     signal?.throwIfAborted()
     let activeTransaction: Transaction | null = null
     const abortTransaction = () => {
-      if (activeTransaction?.active) activeTransaction.abort()
+      if (activeTransaction) {
+        abortIndexedDbTransactionAtCancellationBoundary(activeTransaction)
+      }
     }
     signal?.addEventListener('abort', abortTransaction, { once: true })
     try {
       return await start(async (tx) => {
         activeTransaction = tx
         if (signal?.aborted) {
-          if (tx.active) tx.abort()
+          abortIndexedDbTransactionAtCancellationBoundary(tx)
           signal.throwIfAborted()
         }
         const result = await operation(tx)
@@ -2877,7 +2889,7 @@ class BrowserCommandCommit implements BrowserCommandSessionPort {
     }
   }
 
-  stagedConflictEvidence(): BrowserStagedCommandConflictEvidence {
+  conflictEvidence(): BrowserCommandConflictEvidence {
     return Object.freeze({
       readAddresses: Object.freeze([...this.readConflictAddresses].sort()),
       readScopes: Object.freeze(
@@ -3974,33 +3986,25 @@ function replaceGeneratedPollingVideoRefs(
   }
 }
 
-function cloneForkMessages(
-  ancestors: readonly Message[],
+function cloneForkMessage(
+  source: Message,
   destinationChatId: ChatId,
-  destinationMessageIds: readonly MessageId[],
+  destinationMessageId: MessageId,
+  destinationParentId: MessageId | null,
+  destinationTurnId: string,
+  createdAt: number,
   now: number,
-): Message[] {
-  const destinationIdBySourceId = new Map(
-    ancestors.map((row, index) => [row.id, destinationMessageIds[index] as MessageId]),
-  )
-  const destinationTurnIdBySourceTurnId = new Map<string, string>()
-  return ancestors.map((source, index) => {
-    const clone = structuredClone(source)
-    clone.id = destinationMessageIds[index] as MessageId
-    clone.chatId = destinationChatId
-    clone.parentId = source.parentId ? (destinationIdBySourceId.get(source.parentId) ?? null) : null
-    clone.siblingIndex = 0
-    let destinationTurnId = destinationTurnIdBySourceTurnId.get(source.turnId)
-    if (!destinationTurnId) {
-      destinationTurnId = newId()
-      destinationTurnIdBySourceTurnId.set(source.turnId, destinationTurnId)
-    }
-    clone.turnId = destinationTurnId
-    clone.createdAt = now - (ancestors.length - index)
-    if (clone.editedAt !== undefined) clone.editedAt = now
-    clone.nodeVersion = 0
-    return clone
-  })
+): Message {
+  const clone = structuredClone(source)
+  clone.id = destinationMessageId
+  clone.chatId = destinationChatId
+  clone.parentId = destinationParentId
+  clone.siblingIndex = 0
+  clone.turnId = destinationTurnId
+  clone.createdAt = createdAt
+  if (clone.editedAt !== undefined) clone.editedAt = now
+  clone.nodeVersion = 0
+  return clone
 }
 
 const FORBIDDEN_MESSAGE_HEADER_PATCH_KEYS = new Set<keyof MessageHeaderRow>([
@@ -5445,27 +5449,6 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     command: C,
   ): Promise<CommitEnvelope<WorkspaceCommandResult<C>>> {
     assertWorkspaceExecutionPermit(permit)
-    if (isBrowserWorkspaceStagedFanoutCommand(command)) {
-      const { browserWorkspaceSlotSwitchingSupported } = await import(
-        './browser-workspace-slot-coordination'
-      )
-      if (browserWorkspaceSlotSwitchingSupported()) {
-        const admission = await this.tryExecuteCommandWithinFanoutBudget(
-          permit,
-          command,
-          BROWSER_COMMAND_DIRECT_FANOUT_BUDGET,
-        )
-        if (admission.kind === 'committed') return admission.execution.commit
-        const { executeBrowserWorkspaceStagedFanoutCommand } = await import(
-          './browser-workspace-staged-fanout'
-        )
-        return executeBrowserWorkspaceStagedFanoutCommand(
-          permit,
-          command,
-          executeBrowserCommandInStagedDatabase,
-        )
-      }
-    }
     return (await this.executeDirectCommand(permit, command)).commit
   }
 
@@ -5482,7 +5465,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     } catch (error) {
       if (isBrowserCommandFanoutBudgetExceededError(error)) {
         return {
-          kind: 'staging-required',
+          kind: 'budget-exceeded',
           reason: {
             dimension: error.dimension,
             observed: error.observed,
@@ -5500,7 +5483,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     permit: WorkspaceWriteAuthority,
     command: C,
     fanoutBudget?: BrowserCommandFanoutBudget,
-  ): Promise<BrowserStagedCommandExecution<C>> {
+  ): Promise<BrowserCommandExecution<C>> {
     assertWorkspaceExecutionPermit(permit)
     const db = this.session.runOperation((database) => database)
     const admission = await awaitStorageCompactionWriteAdmission()
@@ -5524,16 +5507,16 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     )
   }
 
-  async executeStagedCommand<C extends WorkspaceCommand>(
+  async executeInProvidedDatabase<C extends WorkspaceCommand>(
     db: NatterDb,
     workspace: WorkspaceFence,
     command: C,
-  ): Promise<BrowserStagedCommandExecution<C>> {
+  ): Promise<BrowserCommandExecution<C>> {
     return this.executeCommandInDatabase(
       db,
       workspace,
       command,
-      stagedCommandLockSession(db),
+      providedDatabaseCommandLockSession(db),
       stagedStorageCompactionWriteAdmission(db.name),
       undefined,
       false,
@@ -5549,7 +5532,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     fanoutBudget?: BrowserCommandFanoutBudget,
     retainFullChatStates = true,
     signal?: AbortSignal,
-  ): Promise<BrowserStagedCommandExecution<C>> {
+  ): Promise<BrowserCommandExecution<C>> {
     const commandLifetimeReceipt = semanticOperationCommandLifetimeReceipt(
       workspace,
       db.name,
@@ -5634,7 +5617,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
         receipt,
         delta,
       },
-      conflictEvidence: commit.stagedConflictEvidence(),
+      conflictEvidence: commit.conflictEvidence(),
     })
   }
 
@@ -6003,8 +5986,8 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
         return this.clearCalibrationEverywhere(command, commit)
       case 'chat.fork':
         return this.forkChatFromMessage(command.input, commit)
-      case 'message.edit-content':
-        return editMessageContentInRepository(this.messageMutationRepository(commit), command.input)
+      case 'message.edit-body':
+        return editMessageBodyInRepository(this.messageMutationRepository(commit), command.input)
       case 'message.toggle-reasoning-detail':
       case 'message.toggle-provider-output-item':
       case 'message.toggle-context':
@@ -6444,17 +6427,89 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
           input.messageId,
         )
         if (headers.length === 0) throw new Error('fork: no ancestors to copy')
-        const bodies = await tx
-          .table<MessageBodyRow, MessageId>('messageBodies')
-          .bulkGet(headers.map((header) => header.id))
-        const ancestors = hydrateMessages(
-          headers,
-          bodies.filter((body): body is MessageBodyRow => body !== undefined),
-        )
-        const destinationMessageIds = ancestors.map(() => newId())
-        const messages = cloneForkMessages(ancestors, destinationChatId, destinationMessageIds, now)
-        const lastUpdatedLeafId = findLastUpdatedLeafId(messages)
-        const selectedTipId = messages.at(-1)?.id ?? null
+        const destinationMessageIds = headers.map(() => newId())
+        const destinationTurnIdBySourceTurnId = new Map<string, string>()
+        const destinationHeaders: MessageHeaderRow[] = []
+        let selectedMessage: Message | null = null
+        let wordCount = 0
+        let totalCostUsd = 0
+        let previewText = ''
+        let previewResolved = false
+        const sourceBodyTable = tx.table<MessageBodyRow, MessageId>('messageBodies')
+        for (let offset = 0; offset < headers.length; offset += BODY_READ_PAGE_SIZE) {
+          const sourceHeaders = headers.slice(offset, offset + BODY_READ_PAGE_SIZE)
+          const sourceBodies = await sourceBodyTable.bulkGet(
+            sourceHeaders.map((header) => header.id),
+          )
+          const sourceMessages = hydrateMessages(
+            sourceHeaders,
+            sourceBodies.filter((body): body is MessageBodyRow => body !== undefined),
+          )
+          const destinationMessages = sourceMessages.map((sourceMessage, pageIndex) => {
+            const index = offset + pageIndex
+            let destinationTurnId = destinationTurnIdBySourceTurnId.get(sourceMessage.turnId)
+            if (!destinationTurnId) {
+              destinationTurnId = newId()
+              destinationTurnIdBySourceTurnId.set(sourceMessage.turnId, destinationTurnId)
+            }
+            return cloneForkMessage(
+              sourceMessage,
+              destinationChatId,
+              destinationMessageIds[index] as MessageId,
+              index === 0 ? null : (destinationMessageIds[index - 1] as MessageId),
+              destinationTurnId,
+              now - (headers.length - index),
+              now,
+            )
+          })
+          const storageRows = destinationMessages.map((message) =>
+            splitMessageForStorage(message, { updatedAt: now }),
+          )
+          await Promise.all([
+            addPhysicalStorageRows(
+              tx,
+              'messages',
+              storageRows.map(({ header }) => header),
+            ),
+            addPhysicalStorageRows(
+              tx,
+              'messageBodies',
+              storageRows.map(({ body }) => body),
+            ),
+            addPhysicalStorageRows(
+              tx,
+              'messagePreviews',
+              storageRows.map(({ preview }) => preview),
+            ),
+          ])
+          await applyAttachmentReferenceOwnerTransitions(
+            tx,
+            destinationMessages.map((message) => ({
+              ownerKind: 'message' as const,
+              ownerId: message.id,
+              chatId: message.chatId,
+              previousRefs: undefined,
+              nextRefs: message.attachmentRefs,
+            })),
+            now,
+          )
+          destinationHeaders.push(...storageRows.map(({ header }) => header))
+          wordCount += countMessagesWords(destinationMessages)
+          totalCostUsd += computeTotalCostUsd(destinationMessages)
+          if (!previewResolved) {
+            const firstUser = destinationMessages.find(
+              (message) => !message.deleted && message.role === 'user',
+            )
+            if (firstUser) {
+              previewText = previewTextFromMessages([firstUser])
+              previewResolved = true
+            }
+          }
+          if (offset + sourceMessages.length === headers.length) {
+            selectedMessage = destinationMessages.at(-1) ?? null
+          }
+        }
+        const selectedTipId = destinationHeaders.at(-1)?.id ?? null
         const updatedAt = await nextChatUpdatedAtInTransaction(tx, now)
         const chat: Chat = {
           id: destinationChatId,
@@ -6463,56 +6518,58 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
           createdAt: now,
           updatedAt,
           lastViewedAt: now,
-          wordCount: countMessagesWords(messages),
-          totalCostUsd: computeTotalCostUsd(messages),
+          wordCount,
+          totalCostUsd,
           metaVersion: 0,
           summaryVersion: 1,
           structuralVersion: 1,
           settings: structuredClone(source.settings),
-          lastUpdatedLeafId,
+          lastUpdatedLeafId: selectedTipId,
           lastBranchUpdatedAt: updatedAt,
           archived: false,
           pinned: false,
           folderId: null,
           tags: [],
-          previewText: previewTextFromMessages(messages),
+          previewText,
           ...(source.presetId ? { presetId: source.presetId } : {}),
         }
 
         const chatMutation = openLinkedChatMutation(tx)
         await chatMutation.add(chat)
         await chatMutation.commit()
-        const storageRows = messages.map((message) =>
-          splitMessageForStorage(message, {
-            updatedAt: now,
-          }),
-        )
-        await Promise.all([
-          addPhysicalStorageRows(
-            tx,
-            'messages',
-            storageRows.map(({ header }) => header),
-          ),
-          addPhysicalStorageRows(
-            tx,
-            'messageBodies',
-            storageRows.map(({ body }) => body),
-          ),
-          addPhysicalStorageRows(
-            tx,
-            'messagePreviews',
-            storageRows.map(({ preview }) => preview),
-          ),
-        ])
-        const childProjection = buildChildSlotProjection(destinationChatId, messages, {
+        const childProjection = buildChildSlotProjection(destinationChatId, destinationHeaders, {
           updatedAt: now,
           defaultVersion: 1,
         })
-        await Promise.all([
-          addPhysicalStorageRows(tx, 'childLists', childProjection.states),
-          addPhysicalStorageRows(tx, 'childSlotMembers', childProjection.members),
-        ])
-        const selectedStorage = storageRows.at(-1)
+        for (
+          let offset = 0;
+          offset < childProjection.states.length;
+          offset += BROWSER_COMMAND_DIRECT_FANOUT_BUDGET.maxWriteRows
+        ) {
+          await addPhysicalStorageRows(
+            tx,
+            'childLists',
+            childProjection.states.slice(
+              offset,
+              offset + BROWSER_COMMAND_DIRECT_FANOUT_BUDGET.maxWriteRows,
+            ),
+          )
+        }
+        for (
+          let offset = 0;
+          offset < childProjection.members.length;
+          offset += BROWSER_COMMAND_DIRECT_FANOUT_BUDGET.maxWriteRows
+        ) {
+          await addPhysicalStorageRows(
+            tx,
+            'childSlotMembers',
+            childProjection.members.slice(
+              offset,
+              offset + BROWSER_COMMAND_DIRECT_FANOUT_BUDGET.maxWriteRows,
+            ),
+          )
+        }
+        const selectedHeader = destinationHeaders.at(-1)
         const destination = await proveConversationSelectionInTransaction(tx, {
           chat,
           target: fixedConversationSelectionTarget(
@@ -6522,33 +6579,22 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
             selectedTipId,
           ),
           tipId: selectedTipId,
-          exactPathHeaders: storageRows.map(({ header }) => header),
+          exactPathHeaders: destinationHeaders,
           presentations:
-            selectedStorage && selectedTipId
+            selectedHeader && selectedMessage && selectedTipId
               ? [
                   {
-                    header: selectedStorage.header,
-                    message: messages[messages.length - 1] as Message,
-                    bodyVersion: selectedStorage.header.bodyVersion,
+                    header: selectedHeader,
+                    message: selectedMessage,
+                    bodyVersion: selectedHeader.bodyVersion,
                   },
                 ]
               : [],
         })
-        await applyAttachmentReferenceOwnerTransitions(
-          tx,
-          messages.map((message) => ({
-            ownerKind: 'message' as const,
-            ownerId: message.id,
-            chatId: message.chatId,
-            previousRefs: undefined,
-            nextRefs: message.attachmentRefs,
-          })),
-          now,
-        )
         return semanticOperationExecution(
           {
             chatId: destinationChatId,
-            messageCount: messages.length,
+            messageCount: destinationHeaders.length,
             destination,
           },
           semanticOperationExactOccurrenceReceipt<PhysicalStorageTableName>(tx),
@@ -10202,7 +10248,7 @@ function collapseConversationConstructionPublication(delta: WorkspaceDelta): Wor
   }
 }
 
-function stagedCommandLockSession(database: NatterDb): AuthoritativeCommandLockSession {
+function providedDatabaseCommandLockSession(database: NatterDb): AuthoritativeCommandLockSession {
   return Object.freeze({
     kind: 'indexeddb-fence' as const,
     withResourceLocks: async <T>(
@@ -10213,7 +10259,7 @@ function stagedCommandLockSession(database: NatterDb): AuthoritativeCommandLockS
         kind: 'indexeddb-fence',
         logicalNames: Object.freeze([...new Set(resourceNames)].sort()),
         runTransaction: (target, tables, transactionOperation) => {
-          if (target !== database) throw new Error('StagedCommandDatabaseChanged')
+          if (target !== database) throw new Error('ProvidedCommandDatabaseChanged')
           return database.transaction(
             'rw',
             tables.map((table) => database.table(typeof table === 'string' ? table : table.name)),
@@ -10224,11 +10270,11 @@ function stagedCommandLockSession(database: NatterDb): AuthoritativeCommandLockS
   })
 }
 
-export function executeBrowserCommandInStagedDatabase<C extends WorkspaceCommand>(
+export function executeBrowserCommandInDatabase<C extends WorkspaceCommand>(
   database: NatterDb,
   workspace: WorkspaceFence,
   command: C,
-): Promise<BrowserStagedCommandExecution<C>> {
+): Promise<BrowserCommandExecution<C>> {
   const session: BrowserWorkspaceSession = {
     generation: 0,
     databaseName: database.name,
@@ -10236,13 +10282,17 @@ export function executeBrowserCommandInStagedDatabase<C extends WorkspaceCommand
     isOpen: () => database.isOpen(),
     assertCurrent: () => {},
     bindWorkspaceFence: () => {
-      throw new Error('StagedCommandWorkspaceFenceImmutable')
+      throw new Error('ProvidedCommandWorkspaceFenceImmutable')
     },
     getWorkspaceFence: () => workspace,
     open: () => Promise.resolve(database),
     runOperation: (operation) => operation(database),
   }
-  return new BrowserWorkspaceRepository(session).executeStagedCommand(database, workspace, command)
+  return new BrowserWorkspaceRepository(session).executeInProvidedDatabase(
+    database,
+    workspace,
+    command,
+  )
 }
 
 let singleton: {

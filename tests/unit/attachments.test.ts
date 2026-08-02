@@ -2028,7 +2028,7 @@ describe('attachment refcounts under repository mutations', () => {
     expect((await getDb().attachments.get(attachment.id))?.refCount).toBe(1)
 
     await execute({
-      kind: 'message.edit-content',
+      kind: 'message.edit-body',
       input: {
         chatId: chat.id,
         messageId: message.id,
@@ -2131,7 +2131,7 @@ describe('attachment edge projection invariants', () => {
     const edgeReads = vi.spyOn(getDb().attachmentRefEdges, 'where')
 
     await execute({
-      kind: 'message.edit-content',
+      kind: 'message.edit-body',
       input: {
         chatId: chat.id,
         messageId: message.id,
@@ -2174,7 +2174,7 @@ describe('attachment edge projection invariants', () => {
       ref.refId === refs[1]?.refId ? { ...ref, deletedAt: 0 } : ref,
     )
     await execute({
-      kind: 'message.edit-content',
+      kind: 'message.edit-body',
       input: {
         chatId: chat.id,
         messageId: message.id,
@@ -2218,7 +2218,7 @@ describe('attachment edge projection invariants', () => {
 
     await expect(
       execute({
-        kind: 'message.edit-content',
+        kind: 'message.edit-body',
         input: {
           chatId: chat.id,
           messageId: original.id,

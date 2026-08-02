@@ -493,8 +493,9 @@ interface OpenRouterHostedToolWireBlock {
 function openRouterHostedToolWireBlock(
   settings: ChatSettings,
   gate: (parameter: string) => boolean,
+  route: 'chat-completions' | 'responses',
 ): OpenRouterHostedToolWireBlock | null {
-  const tools = buildOpenRouterServerTools(settings)
+  const tools = buildOpenRouterServerTools(settings, route)
   if (tools.length === 0 || !gate('tools')) return null
   const toolSettings = settings.tools.openrouter
   const block: OpenRouterHostedToolWireBlock = { tools }
@@ -584,7 +585,7 @@ export function toChatCompletions(
     wire.response_format = toWireResponseFormat(settings.responseFormat)
   }
   if (opts.hostedToolsProvider === 'openrouter') {
-    const toolBlock = openRouterHostedToolWireBlock(settings, gate)
+    const toolBlock = openRouterHostedToolWireBlock(settings, gate, 'chat-completions')
     if (toolBlock) Object.assign(wire, toolBlock)
   }
   if (settings.serviceTier && settings.serviceTier !== 'auto' && gate('service_tier')) {
@@ -1091,7 +1092,7 @@ export function toResponses(
   }
 
   if (opts.hostedToolsProvider === 'openrouter') {
-    const toolBlock = openRouterHostedToolWireBlock(settings, gate)
+    const toolBlock = openRouterHostedToolWireBlock(settings, gate, 'responses')
     if (toolBlock) Object.assign(wire, toolBlock)
   } else if (opts.hostedToolsProvider === 'openai') {
     const { tools, include } = buildOpenAiServerTools(settings)

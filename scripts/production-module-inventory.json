@@ -165,6 +165,7 @@
         "src/core/message-topology.ts",
         "src/core/message-tree-index.ts",
         "src/core/messages.ts",
+        "src/core/message-body-authoring.ts",
         "src/core/tree-ops.ts"
       ]
     },
@@ -570,7 +571,6 @@
         "src/store/browser-mutation-runtime.ts",
         "src/store/browser-query-pages.ts",
         "src/store/browser-repo.ts",
-        "src/store/browser-staged-fanout-command.ts",
         "src/store/browser-workspace-catchup-journal.ts",
         "src/store/browser-workspace-schema-v94.ts",
         "src/store/browser-workspace-schema-v97.ts",
@@ -612,7 +612,6 @@
         "src/store/browser-workspace-replacement-transition.ts",
         "src/store/browser-workspace-replacement.ts",
         "src/store/browser-workspace-slot-coordination.ts",
-        "src/store/browser-workspace-staged-fanout.ts",
         "src/store/mounted-projection-lifecycle.ts",
         "src/store/workspace-change-boundary.ts",
         "src/store/workspace-effect-hub.ts",

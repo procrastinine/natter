@@ -325,7 +325,7 @@ function scopeDerivedMutationReceiptPolicy(
         exactOccurrence: true,
         replayReason: 'non-replayable',
       }
-    case 'message.edit-content':
+    case 'message.edit-body':
       return {
         exactOccurrence: true,
         replayReason: 'unfenced-relative-update',

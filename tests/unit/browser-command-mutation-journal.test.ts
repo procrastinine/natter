@@ -1,6 +1,6 @@
 import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import type { ChatId, MessageId } from '../../src/core/types'
+import type { Chat, ChatId, MessageId } from '../../src/core/types'
 import { isBrowserCommandFanoutBudgetExceededError } from '../../src/store/browser-command-fanout-budget'
 import {
   installBrowserCommandMutationJournal,
@@ -558,7 +558,7 @@ describe('browser command mutation journal', () => {
     )
   })
 
-  it('retains only existing chat identities for staged publication evidence', async () => {
+  it('retains only existing chat identities when rich publication evidence exceeds its cache', async () => {
     const db = new NatterDb(`browser-command-journal-thin-chat-${crypto.randomUUID()}`)
     databases.push(db)
     await db.open()
@@ -587,6 +587,38 @@ describe('browser command mutation journal', () => {
         initialExists: false,
       },
     ])
+  })
+
+  it('degrades rich chat cache evidence without limiting a multi-page transaction', async () => {
+    const db = new NatterDb(`browser-command-journal-adaptive-chat-${crypto.randomUUID()}`)
+    databases.push(db)
+    await db.open()
+    const chats = Array.from({ length: 130 }, (_, index) => ({
+      id: `adaptive-chat-${String(index).padStart(3, '0')}`,
+      title: 'before',
+    }))
+    await db.table('chats').bulkPut(chats)
+
+    const result = await db.transaction('rw', ['chats'], (tx) =>
+      runBrowserCommandTransaction(tx, async () => {
+        for (let offset = 0; offset < chats.length; offset += 32) {
+          await db
+            .table('chats')
+            .bulkPut(chats.slice(offset, offset + 32).map((chat) => ({ ...chat, title: 'after' })))
+        }
+      }),
+    )
+
+    expect(result.facts.successfulMutations).toBe(130)
+    expect(result.facts.chatStates).toHaveLength(130)
+    expect(result.facts.chatStates).toEqual(
+      chats.map((chat) => ({ chatId: chat.id, initialExists: true })),
+    )
+    expect(
+      (await db.table<Chat, string>('chats').bulkGet(chats.map((chat) => chat.id))).every(
+        (chat) => chat?.title === 'after',
+      ),
+    ).toBe(true)
   })
 
   it('rolls a catch-up key back with its source mutation and preserves disjoint table scopes', async () => {

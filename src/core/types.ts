@@ -367,7 +367,12 @@ export interface ToolDefinition {
   updatedAt: number
 }
 
-export type OpenRouterServerToolId = 'web-search' | 'datetime' | 'web-fetch' | 'image-generation'
+export type OpenRouterServerToolId =
+  | 'web-search'
+  | 'datetime'
+  | 'web-fetch'
+  | 'image-generation'
+  | 'shell'
 export type OpenAiServerToolId = 'web-search' | 'image-generation' | 'code-interpreter' | 'shell'
 export type AnthropicServerToolId = 'web-search' | 'web-fetch' | 'code-execution' | 'advisor'
 export type GoogleServerToolId = 'google-search' | 'url-context' | 'code-execution' | 'google-maps'

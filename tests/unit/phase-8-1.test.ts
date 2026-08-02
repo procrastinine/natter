@@ -953,7 +953,7 @@ describe('public structural undo', () => {
       },
     })
     await execute({
-      kind: 'message.edit-content',
+      kind: 'message.edit-body',
       input: {
         chatId: chat.id,
         messageId: previous.id,

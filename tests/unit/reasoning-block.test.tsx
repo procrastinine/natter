@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import type { ComponentProps } from 'react'
 import { describe, expect, it, vi } from 'vitest'
 import {
@@ -396,6 +396,41 @@ describe('ReasoningBlock', () => {
       kind: 'visible',
       id: presentation.text[0]?.part.id,
     })
+  })
+
+  it('edits visible reasoning by stable member identity and keeps opaque rows read-only', async () => {
+    const presentation = presentationFromDetails([
+      { type: 'reasoning.text', text: 'original thought', id: 't-1', format: 'unknown' },
+      { type: 'reasoning.encrypted', data: 'opaque', id: 'e-1', format: 'unknown' },
+    ])
+    const onEdit = vi.fn(() => succeededInteractionSettlement())
+    const { container } = render(
+      <ReasoningBlock presentation={presentation} onEditVisible={onEdit} />,
+    )
+    openSummary(container)
+
+    expect(screen.getAllByRole('button', { name: 'Edit reasoning details' })).toHaveLength(1)
+    fireEvent.click(screen.getByRole('button', { name: 'Edit reasoning details' }))
+    const editor = screen.getByRole('textbox', { name: 'Edit reasoning details' })
+    expect(editor).toHaveValue('original thought')
+    fireEvent.change(editor, { target: { value: 'corrected thought' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+
+    await waitFor(() => {
+      expect(onEdit).toHaveBeenCalledWith(
+        {
+          owner: GENERATION_OWNER,
+          kind: 'visible',
+          id: presentation.text[0]?.part.id,
+        },
+        'corrected thought',
+      )
+    })
+    await waitFor(() =>
+      expect(
+        screen.queryByRole('textbox', { name: 'Edit reasoning details' }),
+      ).not.toBeInTheDocument(),
+    )
   })
 
   it('keeps an existing reasoning row mounted when an earlier row arrives', () => {

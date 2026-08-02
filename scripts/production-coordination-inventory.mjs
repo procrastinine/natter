@@ -243,6 +243,7 @@ export const MODULE_COLLECTION_CONTRACTS = Object.freeze({
         'src/core/import-export/row-validation.ts#STREAMING_CAPABILITIES',
         'src/core/provider-tool-context.ts#PROVIDER_OUTPUT_DIALECTS',
         'src/core/provider-tool-context.ts#TOOL_EVIDENCE_KEYS',
+        'src/core/message-body-authoring.ts#PROVIDER_SEALED_FIELD_NAMES',
         'src/core/quirks.ts#GEMINI_DROPS_SAMPLING_PARAMS',
         'src/core/quirks.ts#PREFILL_UNSUPPORTED_GEMINI_MODELS',
         'src/core/reasoning-envelope.ts#REASONING_FORMATS',
@@ -2271,7 +2272,6 @@ const LIFECYCLE_DIRECT_CALL_CONTRACTS = exactSiteContracts([
   },
   {
     ids: [
-      'src/store/browser-workspace-replacement-runner.ts|promote|launchCommandFanoutWorkspaceRuntimeReplacementNow|1',
       'src/store/browser-workspace-replacement-runner.ts|promote|launchImportExportWorkspaceRuntimeReplacementNow|1',
       'src/store/browser-workspace-replacement-runner.ts|promote|tryLaunchMaintenanceWorkspaceRuntimeReplacementIfIdle|1',
       'src/store/browser-workspace-replacement-runner.ts|promote|tryLaunchMaintenanceWorkspaceRuntimeReplacementIfIdle|2',
@@ -2280,21 +2280,9 @@ const LIFECYCLE_DIRECT_CALL_CONTRACTS = exactSiteContracts([
     stage: 'replacement-root-atomic-promotion-and-quiesce',
     ownership: 'synchronous-result-captured',
     bound:
-      'one typed command, import-export, or maintenance replacement-root promotion per admitted replacement selection',
+      'one typed import-export or maintenance replacement-root promotion per admitted replacement selection',
     cleanup:
       'the exact promoted authority supplies cancellation to every replacement admission boundary',
-  },
-  {
-    ids: [
-      'src/store/browser-workspace-replacement-runner.ts|promoteWhenUnblocked|launchCommandFanoutWorkspaceRuntimeReplacementWhenUnblocked|1',
-    ],
-    scope: 'workspace-replacement-call-edge',
-    stage: 'prepared-replacement-blocker-release-promotion',
-    ownership: 'total-promise-awaited',
-    bound:
-      'one event-driven promotion promise per prepared command-fanout destination with no copy or mutation replay',
-    cleanup:
-      'promotion, competing runtime transition or caller cancellation settles the promise and removes every admission listener',
   },
   {
     ids: [
@@ -2892,8 +2880,6 @@ export const LIFECYCLE_PRIMITIVE_MODULES = Object.freeze({
     'finishWorkspaceRuntimeReconciliation',
     'getWorkspaceRuntimeControlSnapshot',
     'installWorkspaceRuntimeResources',
-    'launchCommandFanoutWorkspaceRuntimeReplacementNow',
-    'launchCommandFanoutWorkspaceRuntimeReplacementWhenUnblocked',
     'launchImportExportWorkspaceRuntimeReplacementNow',
     'noteWorkspaceRuntimeGatedChange',
     'resumeWorkspaceRuntimeResources',

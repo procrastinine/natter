@@ -373,6 +373,7 @@ describe('ParamForm hosted tools', () => {
     const section = container.querySelector('[data-ui-section="hosted-tools"]')
     expect(section).toBeTruthy()
     expect(section?.querySelector('h3')?.textContent).toContain('OpenRouter tools')
+    expect(screen.queryByLabelText('Shell')).not.toBeInTheDocument()
 
     fireEvent.click(screen.getByLabelText('Web search'))
 
@@ -381,6 +382,53 @@ describe('ParamForm hosted tools', () => {
         'web-search',
       )
     })
+  })
+
+  it('shows and persists OpenRouter Shell only on a resolved Responses route', async () => {
+    const settings = cloneDefaultChatSettings()
+    settings.model = 'openai/gpt-5.4-nano'
+    settings.api = 'responses'
+    const chat = await createChat({ settings })
+    const capability = effectiveCapabilityFromEndpoints(settings.model, [
+      makeEndpoint({ supported_parameters: ['tools', 'tool_choice'] }),
+    ])
+    const view = render(
+      <ParamForm
+        chat={chat}
+        capability={capability}
+        assistantRouteKind="responses"
+        connectionKind="openrouter"
+      />,
+    )
+
+    fireEvent.click(screen.getByLabelText('Shell'))
+    await waitFor(async () => {
+      expect((await getChat(chat.id))?.settings.tools.openrouter.enabledServerToolIds).toContain(
+        'shell',
+      )
+    })
+
+    view.rerender(
+      <ParamForm
+        chat={{
+          ...chat,
+          settings: {
+            ...chat.settings,
+            tools: {
+              ...chat.settings.tools,
+              openrouter: {
+                ...chat.settings.tools.openrouter,
+                enabledServerToolIds: ['shell'],
+              },
+            },
+          },
+        }}
+        capability={capability}
+        assistantRouteKind="chat-completions"
+        connectionKind="openrouter"
+      />,
+    )
+    expect(screen.queryByLabelText('Shell')).not.toBeInTheDocument()
   })
 
   it('renders direct OpenAI tools and persists them in the OpenAI bucket', async () => {

@@ -237,6 +237,30 @@ describe('storage compaction state', () => {
     })
   })
 
+  it('retires compaction requests that belong to contents erased by a reset replacement', async () => {
+    db = createDbForTests(`natter-compaction-replacement-reset-${crypto.randomUUID()}`)
+    await db.open()
+    await recordBrowserWorkspaceCompactionDebt(db.name, STORAGE_COMPACTION_MIN_RECLAIMABLE_BYTES)
+
+    await applyUnslottedBrowserWorkspaceReplacementStorageBaseline(db.name, {
+      kind: 'reset',
+      liveBytes: 123,
+    })
+
+    await expect(readStorageCompactionState(db)).resolves.toEqual({
+      databaseName: db.name,
+      formatVersion: 2,
+      knownReclaimableBytes: 0,
+      lastCompactedLiveBytes: 123,
+      requestRevision: 1,
+      attemptedRevision: 1,
+      completedRevision: 1,
+    })
+    await expect(claimBrowserWorkspaceCompactionAttempt(db.name)).resolves.toMatchObject({
+      kind: 'idle',
+    })
+  })
+
   it('publishes one synchronous compaction wake to each current subscriber', () => {
     const first = vi.fn()
     const second = vi.fn()

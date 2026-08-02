@@ -162,14 +162,16 @@ describe('branch selection architecture boundary', () => {
     )
     expect(shell).not.toContain('binding.seal.replacementEpoch !== workspace.replacementEpoch')
     expect(shell).not.toContain('foreignPaintedFrame ? null')
-    expect(shell).toContain('transcriptPoint && MessageList')
+    expect(shell).toContain('transcriptPoint && resolvedActiveChatRow && MessageListPoint')
     expect(shell).toContain('kind="point"')
     expect(shell).toContain('{transcriptFocusMode ? displayedTranscriptComposer : null}')
     expect(shell).toContain('{transcriptFocusMode ? null : displayedTranscriptComposer}')
     expect(messages).toContain("data-branch-counts={branchCountsKnown ? 'known' : 'pending'}")
     expect(messages).toContain(
-      "const presentationOnly = point ? true : props.binding.currency !== 'current'",
+      "const presentationOnly = point ? false : props.binding.currency !== 'current'",
     )
+    expect(shell).toContain('runConversationMutation={runConversationMutation}')
+    expect(shell).toContain('chatSettings={resolvedActiveChatRow.settings}')
     expect(messages).not.toContain('inert={presentationOnly || undefined}')
     expect(messages).toContain("if (e.key === '[' || e.key === ']')")
     expect(messages.indexOf("if (e.key === '[' || e.key === ']'")).toBeLessThan(

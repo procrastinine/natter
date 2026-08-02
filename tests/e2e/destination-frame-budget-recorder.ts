@@ -15,6 +15,7 @@ interface DestinationFramePublication {
   readonly messageIds: readonly string[]
   readonly presentationKind: string
   readonly branchCounts: string
+  readonly commandActionsReady: boolean
 }
 
 interface DestinationFrameTransaction {
@@ -344,6 +345,14 @@ export async function installDestinationFrameBudgetRecorder(
       const totalCount = Number(list.getAttribute('data-total-count') ?? messageIds.length)
       const presentationKind = list.getAttribute('data-presentation-kind') ?? 'unknown'
       const branchCounts = list.getAttribute('data-branch-counts') ?? 'unknown'
+      const commandActionsReady = ['edit', 'fork-chat', 'toggle-visible', 'delete-pair'].every(
+        (action) => {
+          const button = list.querySelector<HTMLButtonElement>(`[data-action="${action}"]`)
+          return (
+            button !== null && !button.disabled && Number(getComputedStyle(button).opacity) >= 1
+          )
+        },
+      )
       if (messageIds.length === 0) return
       const prior = state.publications.at(-1)
       if (
@@ -363,6 +372,7 @@ export async function installDestinationFrameBudgetRecorder(
             messageIds,
             presentationKind,
             branchCounts,
+            commandActionsReady,
           },
           MAX_PUBLICATIONS,
         )
@@ -550,6 +560,7 @@ export function assertDestinationPublicationContract(
       branchCounts: 'pending',
       renderedCount: 1,
       messageIds: [target.targetMessageId],
+      commandActionsReady: true,
     })
   }
 

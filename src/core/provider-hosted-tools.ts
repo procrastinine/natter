@@ -34,14 +34,19 @@ const OPENROUTER_SERVER_TOOL_TYPES: Readonly<Partial<Record<OpenRouterServerTool
     'web-search': 'openrouter:web_search',
     datetime: 'openrouter:datetime',
     'web-fetch': 'openrouter:web_fetch',
+    shell: 'openrouter:shell',
   })
 
-export function buildOpenRouterServerTools(settings: ChatSettings): Array<{ type: string }> {
+export function buildOpenRouterServerTools(
+  settings: ChatSettings,
+  route: 'chat-completions' | 'responses',
+): Array<{ type: string }> {
   const tools: Array<{ type: string }> = []
   const seen = new Set<OpenRouterServerToolId>()
   for (const id of settings.tools.openrouter.enabledServerToolIds) {
     if (seen.has(id)) continue
     seen.add(id)
+    if (id === 'shell' && route !== 'responses') continue
     const type = OPENROUTER_SERVER_TOOL_TYPES[id]
     if (!type) continue
     tools.push({ type })

@@ -65,7 +65,7 @@ describe('generation request path audit', () => {
     expect(mutationRuntime).toContain(
       'clone.createdAt = await messageCreationClock.next(tx, clone.chatId, now)',
     )
-    expect(browser).toContain('clone.createdAt = now - (ancestors.length - index)')
+    expect(browser).toContain('now - (headers.length - index)')
     expect(mutationRuntime).toContain(
       'next.updatedAt = await nextChatUpdatedAtInTransaction(tx, now)',
     )

@@ -27,6 +27,7 @@ import {
   fontFamilyStack,
 } from '../core/global-settings'
 import { connectionAvailabilityFromProfileCount } from '../core/interaction-capability'
+import type { MessageBodyAuthoringOperations } from '../core/message-body-authoring'
 import type { PasteImportSlot } from '../core/messages'
 import { EMPTY_MESSAGE_CONTEXT_ROUTE_FACTS, mergeMessageContextRouteFacts } from '../core/reasoning'
 import { DEFAULT_SIDEBAR_SORT_MODE } from '../core/sidebar-sort'
@@ -576,12 +577,10 @@ export function Shell() {
   const transcriptMutationsUnavailable = conversationBindingMutationsUnavailable(
     transcriptBinding,
     conversationWorkspaceFence,
-    activeConversation?.chatId ?? null,
   )
   const treeMutationsUnavailable = conversationBindingMutationsUnavailable(
     treeBinding,
     conversationWorkspaceFence,
-    activeConversation?.chatId ?? null,
   )
   useEffect(() => {
     if (!treeViewActive) return
@@ -1245,10 +1244,23 @@ export function Shell() {
     [activeChatId, pushToast, treeHeaderById, treeProjection, treeStreamTargetIds],
   )
   const editTreeMessage = useCallback(
-    (message: Message, text: string) =>
+    (
+      message: Message,
+      text: string,
+      authoring?: MessageBodyAuthoringOperations,
+      attachmentRefs?: MessageAttachmentRef[],
+    ) =>
       runConversationMutation(
         { kind: 'edit', chatId: message.chatId, messageId: message.id },
-        (signal) => requireConversationActions().editMessage(message.chatId, message, text, signal),
+        (signal) =>
+          requireConversationActions().editMessage(
+            message.chatId,
+            message,
+            text,
+            signal,
+            authoring,
+            attachmentRefs,
+          ),
       ),
     [runConversationMutation],
   )
@@ -1350,7 +1362,8 @@ export function Shell() {
     (message: Message) =>
       runConversationMutation(
         { kind: 'fork', chatId: message.chatId, messageId: message.id },
-        (signal) => requireConversationActions().forkMessage(message.chatId, message, signal),
+        (signal, reportPhase) =>
+          requireConversationActions().forkMessage(message.chatId, message, signal, reportPhase),
       ),
     [runConversationMutation],
   )
@@ -1378,6 +1391,20 @@ export function Shell() {
         },
         (signal) =>
           requireConversationActions().toggleReasoning(message.chatId, message, member, signal),
+      ),
+    [runConversationMutation],
+  )
+  const editTreeReasoningDetail = useCallback(
+    (message: Message, member: Extract<ReasoningMemberRef, { kind: 'visible' }>, text: string) =>
+      runConversationMutation(
+        {
+          kind: 'reasoning',
+          chatId: message.chatId,
+          messageId: message.id,
+          member,
+        },
+        (signal) =>
+          requireConversationActions().editReasoning(message.chatId, message, member, text, signal),
       ),
     [runConversationMutation],
   )
@@ -1728,6 +1755,7 @@ export function Shell() {
                         onToggleMessageContextVisibility={toggleTreeMessageContextVisibility}
                         onMutateMessageAttachmentRef={mutateTreeMessageAttachmentRef}
                         onToggleReasoningDetailHidden={toggleTreeReasoningDetailHidden}
+                        onEditReasoningDetail={editTreeReasoningDetail}
                         onToggleProviderOutputItemHidden={toggleTreeProviderOutputItemHidden}
                         onRequestStop={requestStop}
                         generationSubmissionPending={activeGenerationSubmissionPending}
@@ -1799,13 +1827,25 @@ export function Shell() {
                           ) : (
                             <SurfaceLoading label="Loading conversation…" />
                           )
-                        ) : transcriptPoint && MessageListPoint ? (
+                        ) : transcriptPoint && resolvedActiveChatRow && MessageListPoint ? (
                           <MessageListPoint
                             key={activeChatId}
                             kind="point"
                             chatId={activeChatId}
                             workspaceFence={conversationWorkspaceFence}
                             window={transcriptPoint.window}
+                            runConversationMutation={runConversationMutation}
+                            chatSettings={resolvedActiveChatRow.settings}
+                            onEditAndSendMessage={editAndSendMessage}
+                            onRegenerateMessage={regenerateMessage}
+                            onContinueMessage={continueMessage}
+                            generationSubmissionPending={activeGenerationSubmissionPending}
+                            structuralMutationPending={activeStructuralMutationPending}
+                            onCancelStructuralMutation={() =>
+                              cancelStructuralMutation(activeChatId)
+                            }
+                            {...(activeCapability ? { capability: activeCapability } : {})}
+                            prefillPlan={activePrefillPlan}
                             longMessageDisplayMode={prefs.longMessageDisplayMode}
                           />
                         ) : transcriptLoadFailed ? (
@@ -2012,12 +2052,6 @@ function useSampleAndHoldPresentation<T>(
 function conversationBindingMutationsUnavailable(
   binding: ConversationVisibleSurfaceBinding | null,
   workspace: WorkspaceFence,
-  activeChatId: ChatId | null,
 ): boolean {
-  return (
-    binding === null ||
-    activeChatId === null ||
-    binding.seal.workspaceId !== workspace.workspaceId ||
-    binding.seal.chatId !== activeChatId
-  )
+  return binding === null || binding.seal.workspaceId !== workspace.workspaceId
 }

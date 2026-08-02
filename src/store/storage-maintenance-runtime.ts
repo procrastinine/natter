@@ -27,11 +27,7 @@ import type {
   WorkspaceCommand,
   WorkspaceCommandResult,
 } from './workspace-protocol'
-import {
-  getWorkspaceRepository,
-  publishCommittedWorkspaceCommand,
-  publishLocalWorkspaceInvalidation,
-} from './workspace-repository'
+import { getWorkspaceRepository, publishLocalWorkspaceInvalidation } from './workspace-repository'
 import {
   isWorkspaceRuntimeClosedError,
   subscribeWorkspaceRuntimeIdle,
@@ -282,7 +278,7 @@ class StorageMaintenanceController {
     ] as const) {
       this.#requestTask(this.#task(kind))
     }
-    if (!integrity || integrity.phase !== 'complete') {
+    if (integrity?.phase !== 'complete') {
       this.#requestTask(this.#task('reconcile-attachment-integrity'))
     }
     const now = Date.now()
@@ -574,67 +570,14 @@ class StorageMaintenanceController {
   > {
     const started = tryRunWorkspaceActionIfIdle(
       'maintenance',
-      async (permit) => {
-        const { isBrowserWorkspaceStagedFanoutCommand } = await import(
-          './browser-staged-fanout-command'
-        )
-        const { browserWorkspaceSlotSwitchingSupported } = await import(
-          './browser-workspace-slot-coordination'
-        )
-        if (
-          !isBrowserWorkspaceStagedFanoutCommand(command) ||
-          !browserWorkspaceSlotSwitchingSupported()
-        ) {
-          return {
-            kind: 'result' as const,
-            value: (await getWorkspaceRepository().execute(permit, command)).value,
-          }
-        }
-        const {
-          executeBrowserCommandInStagedDatabase,
-          tryExecuteBrowserWorkspaceCommandWithinFanoutBudget,
-        } = await import('./browser-repo')
-        const admission = await tryExecuteBrowserWorkspaceCommandWithinFanoutBudget(permit, command)
-        if (admission.kind === 'committed') {
-          return {
-            kind: 'direct-commit' as const,
-            commit: admission.execution.commit,
-          }
-        }
-        const { startBrowserWorkspaceStagedFanoutCommand } = await import(
-          './browser-workspace-staged-fanout'
-        )
-        return {
-          kind: 'replacement' as const,
-          started: await startBrowserWorkspaceStagedFanoutCommand(
-            permit,
-            command,
-            executeBrowserCommandInStagedDatabase,
-          ),
-        }
-      },
+      async (permit) => ({
+        kind: 'result' as const,
+        value: (await getWorkspaceRepository().execute(permit, command)).value,
+      }),
       { signal: this.#ownerSignal() },
     )
     if (!started) return { kind: 'blocked', on: 'runtime-idle' }
-    const outcome = await started
-    if (outcome.kind === 'result') return outcome
-    if (outcome.kind === 'direct-commit') {
-      publishCommittedWorkspaceCommand(command, outcome.commit)
-      return { kind: 'result', value: outcome.commit.value }
-    }
-    if (outcome.started.kind === 'blocked') return { kind: 'blocked', on: 'runtime-idle' }
-    if (outcome.started.kind === 'cleanup-required') {
-      this.#requestTask(this.#task('clean-replacement-database'))
-      throw new Error('BrowserWorkspaceReplacementCleanupRequired')
-    }
-    if (outcome.started.kind === 'skipped') {
-      throw new Error('BrowserWorkspaceReplacementPreflightSkipped')
-    }
-    void outcome.started.handoff.completion
-      .then((replacement) => publishCommittedWorkspaceCommand(command, replacement.value))
-      .catch(() => undefined)
-    this.#replacementHandoffs.transfer(outcome.started.handoff)
-    return { kind: 'handoff' }
+    return started
   }
 
   #applyOutcome(

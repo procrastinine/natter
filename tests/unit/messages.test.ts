@@ -7,7 +7,12 @@ import {
   type ChatExportEnvelope,
   NATTER_EXPORT_SCHEMA_VERSION,
 } from '../../src/core/import-export/schema'
+import {
+  planProviderOutputAuthoringOperations,
+  projectProviderOutputAuthoring,
+} from '../../src/core/message-body-authoring'
 import type { StructuralSnapshot, StructuralSnapshotRow } from '../../src/core/messages'
+import { reasoningCarrierDescriptorFromCarrier } from '../../src/core/reasoning-envelope'
 import { createAncestorOutsideSetResolver, TreeChangedError } from '../../src/core/tree-ops'
 import type {
   Chat,
@@ -354,7 +359,7 @@ describe('body edits', () => {
       'conversation-generation',
       (permit) =>
         getWorkspaceRepository().execute(permit, {
-          kind: 'message.edit-content',
+          kind: 'message.edit-body',
           input: {
             chatId: chat.id,
             messageId: row.id,
@@ -403,7 +408,7 @@ describe('body edits', () => {
     await append(rich, null)
     const before = await getHeader(rich.id)
     const commit = await execute({
-      kind: 'message.edit-content',
+      kind: 'message.edit-body',
       input: {
         chatId: chat.id,
         messageId: rich.id,
@@ -480,6 +485,409 @@ describe('body edits', () => {
     if (!visibleAgain.value) throw new Error('VisibleReasoningToggleMissing')
     expect(visibleAgain.value.message.reasoningEnvelope?.visible[0]?.hidden).toBe(false)
     expect(visibleAgain.value.message.reasoningEnvelope?.carriers[0]?.hidden).toBeUndefined()
+  })
+
+  it('edits one visible reasoning member in place and drops only its invalidated signature', async () => {
+    const chat = await seedChat()
+    const signedEnvelope = reasoningEnvelopeFromDetailsForTest(
+      [
+        {
+          type: 'reasoning.text',
+          text: 'signed thought',
+          signature: 'opaque-signature',
+          format: 'anthropic-claude-v1',
+        },
+      ],
+      'anthropic-messages',
+    )
+    const visible = signedEnvelope.visible[0]
+    if (!visible) throw new Error('SignedReasoningFixtureMissing')
+    const importedVisible = { ...visible, hidden: false }
+    const unrelatedCarrier = {
+      id: 'unrelated-encrypted-carrier',
+      groupId: 'unrelated-group',
+      kind: 'responses-encrypted' as const,
+      data: 'preserve-me',
+      format: 'openai-responses-v1' as const,
+      source: {
+        dialect: 'openai-responses' as const,
+        bridge: 'openai-direct' as const,
+        itemId: 'unrelated-provider-item',
+      },
+    }
+    const reasoningEnvelope = {
+      ...signedEnvelope,
+      carriers: [...signedEnvelope.carriers, unrelatedCarrier],
+    }
+    const originalContent = [
+      {
+        type: 'output_text' as const,
+        text: 'unchanged answer',
+        annotations: [
+          {
+            type: 'url_citation' as const,
+            startIndex: 0,
+            endIndex: 9,
+            source: 'openai-responses' as const,
+            providerPayload: { cited: true },
+            url: 'https://example.com/source',
+          },
+        ],
+      },
+      { type: 'image_url' as const, url: 'https://example.com/image.png', detail: 'high' as const },
+      { type: 'output_text' as const, text: ' second segment' },
+    ]
+    const row = message(chat.id, {
+      id: 'editable-reasoning',
+      createdAt: 123,
+      role: 'assistant',
+      origin: 'generated',
+      content: originalContent,
+      reasoningEnvelope: { ...reasoningEnvelope, visible: [importedVisible] },
+    })
+    await append(row, null)
+
+    const edited = await execute({
+      kind: 'message.edit-body',
+      input: {
+        chatId: chat.id,
+        messageId: row.id,
+        now: 500,
+        authoring: {
+          reasoning: [
+            {
+              kind: 'visible-replace',
+              member: { owner: { kind: 'generation' }, kind: 'visible', id: importedVisible.id },
+              expected: importedVisible,
+              next: { ...importedVisible, text: 'corrected thought' },
+            },
+          ],
+        },
+      },
+    })
+
+    expect(edited.value.message).toMatchObject({
+      id: row.id,
+      createdAt: 123,
+      editedAt: 500,
+    })
+    expect(edited.value.message.content).toEqual(originalContent)
+    expect(edited.value.message.reasoningEnvelope?.visible).toEqual([
+      { ...importedVisible, text: 'corrected thought' },
+    ])
+    expect(edited.value.message.reasoningEnvelope?.carriers).toEqual([unrelatedCarrier])
+  })
+
+  it('addresses an applied continuation reasoning member without touching generation reasoning', async () => {
+    const chat = await seedChat()
+    const generationEnvelope = reasoningEnvelopeFromDetailsForTest(
+      [{ type: 'reasoning.text', text: 'generation thought', format: 'unknown' }],
+      'unknown',
+    )
+    const continuationEnvelope = reasoningEnvelopeFromDetailsForTest(
+      [{ type: 'reasoning.summary', summary: 'continuation thought', format: 'unknown' }],
+      'unknown',
+    )
+    const continuationVisible = continuationEnvelope.visible[0]
+    if (!continuationVisible) throw new Error('ContinuationReasoningFixtureMissing')
+    const row = message(chat.id, {
+      id: 'continued-reasoning',
+      role: 'assistant',
+      origin: 'generated',
+      reasoningEnvelope: generationEnvelope,
+      continuationAttempts: [
+        {
+          streamId: 'continuation-stream',
+          strategy: 'prompt',
+          status: 'done',
+          startedAt: 2,
+          finishedAt: 3,
+          application: { kind: 'applied' },
+          reasoningEnvelope: continuationEnvelope,
+          reasoningCarryForward: 'none',
+          reasoningVisibility: { disclosure: 'visible', visibleKind: 'summary' },
+        },
+      ],
+    })
+    await append(row, null)
+
+    const edited = await execute({
+      kind: 'message.edit-body',
+      input: {
+        chatId: chat.id,
+        messageId: row.id,
+        authoring: {
+          reasoning: [
+            {
+              kind: 'visible-replace',
+              member: {
+                owner: { kind: 'continuation', streamId: 'continuation-stream' },
+                kind: 'visible',
+                id: continuationVisible.id,
+              },
+              expected: continuationVisible,
+              next: { ...continuationVisible, text: 'corrected continuation thought' },
+            },
+          ],
+        },
+      },
+    })
+
+    expect(edited.value.message.reasoningEnvelope).toEqual(generationEnvelope)
+    expect(
+      edited.value.message.continuationAttempts?.[0]?.reasoningEnvelope?.visible[0]?.text,
+    ).toBe('corrected continuation thought')
+  })
+
+  it('creates, relabels and deletes exact reasoning members in one atomic body edit', async () => {
+    const chat = await seedChat()
+    const initialEnvelope = reasoningEnvelopeFromDetailsForTest(
+      [
+        { type: 'reasoning.text', text: 'delete me', format: 'unknown' },
+        { type: 'reasoning.summary', summary: 'relabel me', format: 'unknown' },
+        { type: 'reasoning.encrypted', data: 'remove opaque', format: 'unknown' },
+      ],
+      'unknown',
+    )
+    const deletedVisible = initialEnvelope.visible[0]
+    const relabeledVisible = initialEnvelope.visible[1]
+    const deletedCarrier = initialEnvelope.carriers[0]
+    if (!deletedVisible || !relabeledVisible || !deletedCarrier) {
+      throw new Error('ReasoningAuthoringFixtureMissing')
+    }
+    const row = message(chat.id, {
+      id: 'message-body-authoring',
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_text', text: 'answer' }],
+      reasoningEnvelope: initialEnvelope,
+    })
+    await append(row, null)
+
+    const carrierDescriptor = reasoningCarrierDescriptorFromCarrier(deletedCarrier)
+    const created = {
+      id: 'authored-visible',
+      groupId: 'authored-visible',
+      kind: 'summary' as const,
+      text: 'new summary',
+      format: 'unknown' as const,
+      source: { dialect: 'unknown' as const, bridge: 'unknown' as const },
+    }
+    const edited = await execute({
+      kind: 'message.edit-body',
+      input: {
+        chatId: chat.id,
+        messageId: row.id,
+        authoring: {
+          reasoning: [
+            {
+              kind: 'visible-delete',
+              member: {
+                owner: { kind: 'generation' },
+                kind: 'visible',
+                id: deletedVisible.id,
+              },
+              expected: deletedVisible,
+            },
+            {
+              kind: 'visible-replace',
+              member: {
+                owner: { kind: 'generation' },
+                kind: 'visible',
+                id: relabeledVisible.id,
+              },
+              expected: relabeledVisible,
+              next: { ...relabeledVisible, kind: 'text', text: 'now plaintext', hidden: true },
+            },
+            {
+              kind: 'carrier-delete',
+              member: {
+                owner: { kind: 'generation' },
+                kind: 'carrier',
+                id: deletedCarrier.id,
+              },
+              expected: carrierDescriptor,
+            },
+            { kind: 'visible-create', owner: { kind: 'generation' }, part: created },
+          ],
+        },
+      },
+    })
+
+    expect(edited.value.message.reasoningEnvelope).toEqual({
+      schemaVersion: 2,
+      visible: [
+        { ...relabeledVisible, kind: 'text', text: 'now plaintext', hidden: true },
+        created,
+      ],
+      carriers: [],
+    })
+  })
+
+  it('merges disjoint reasoning edits and rejects a stale edit of the same member', async () => {
+    const chat = await seedChat()
+    const reasoningEnvelope = reasoningEnvelopeFromDetailsForTest(
+      [
+        { type: 'reasoning.text', text: 'first', format: 'unknown' },
+        { type: 'reasoning.summary', summary: 'second', format: 'unknown' },
+      ],
+      'unknown',
+    )
+    const first = reasoningEnvelope.visible[0]
+    const second = reasoningEnvelope.visible[1]
+    if (!first || !second) throw new Error('ReasoningConflictFixtureMissing')
+    const row = message(chat.id, {
+      id: 'reasoning-conflict',
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_text', text: 'answer' }],
+      reasoningEnvelope,
+    })
+    await append(row, null)
+    const replace = (expected: typeof first, text: string) =>
+      execute({
+        kind: 'message.edit-body',
+        input: {
+          chatId: chat.id,
+          messageId: row.id,
+          authoring: {
+            reasoning: [
+              {
+                kind: 'visible-replace',
+                member: {
+                  owner: { kind: 'generation' },
+                  kind: 'visible',
+                  id: expected.id,
+                },
+                expected,
+                next: { ...expected, text },
+              },
+            ],
+          },
+        },
+      })
+
+    await replace(first, 'first changed')
+    await replace(second, 'second changed')
+    await expect(replace(first, 'stale overwrite')).rejects.toBeInstanceOf(TreeChangedError)
+
+    const persisted = await getMessage(row.id)
+    expect(persisted?.reasoningEnvelope?.visible.map((part) => part.text)).toEqual([
+      'first changed',
+      'second changed',
+    ])
+  })
+
+  it('authors exact provider outputs, preserves sealed fields and rolls back a mixed conflict', async () => {
+    const chat = await seedChat()
+    const sealed = {
+      dialect: 'openai-responses' as const,
+      type: 'web_search_call',
+      captureId: 'provider-capture-sealed',
+      outputIndex: 0,
+      item: {
+        id: 'provider-item-sealed',
+        query: 'before',
+        encrypted_content: 'must-survive-raw-edit',
+      },
+    }
+    const deleted = {
+      dialect: 'google-gemini' as const,
+      type: 'grounding_result',
+      captureId: 'provider-capture-delete',
+      outputIndex: 1,
+      item: { result: 'delete me' },
+    }
+    const row = message(chat.id, {
+      id: 'provider-output-authoring',
+      role: 'assistant',
+      origin: 'generated',
+      providerOutputItems: [sealed, deleted],
+    })
+    await append(row, null)
+    const projection = projectProviderOutputAuthoring(row)
+    const first = projection.entries[0]
+    if (!first) throw new Error('ProviderOutputAuthoringFixtureMissing')
+    const next = [
+      {
+        ...first,
+        item: {
+          ...first.item,
+          type: 'web_search_call_edited',
+          item: { id: 'provider-item-sealed', query: 'after' },
+        },
+      },
+      {
+        editorId: 'new-provider-output',
+        owner: { kind: 'generation' as const },
+        item: {
+          dialect: 'unknown' as const,
+          type: 'manual_tool_call',
+          outputIndex: 2,
+          item: { authored: true },
+        },
+      },
+    ]
+    const operations = planProviderOutputAuthoringOperations(projection.entries, next)
+    expect(operations).toHaveLength(3)
+    expect(operations[0]).toMatchObject({
+      kind: 'provider-output-replace',
+      next: {
+        edited: true,
+        item: { query: 'after', encrypted_content: 'must-survive-raw-edit' },
+      },
+    })
+
+    const edited = await execute({
+      kind: 'message.edit-body',
+      input: {
+        chatId: chat.id,
+        messageId: row.id,
+        authoring: { providerOutput: operations },
+      },
+    })
+    expect(edited.value.message.providerOutputItems).toEqual([
+      {
+        ...sealed,
+        type: 'web_search_call_edited',
+        edited: true,
+        item: {
+          id: 'provider-item-sealed',
+          query: 'after',
+          encrypted_content: 'must-survive-raw-edit',
+        },
+      },
+      { ...next[1]?.item, edited: true },
+    ])
+
+    const beforeConflict = structuredClone(edited.value.message.providerOutputItems)
+    const currentFirst = beforeConflict?.[0]
+    if (!currentFirst) throw new Error('EditedProviderOutputMissing')
+    await expect(
+      execute({
+        kind: 'message.edit-body',
+        input: {
+          chatId: chat.id,
+          messageId: row.id,
+          authoring: {
+            providerOutput: [
+              {
+                kind: 'provider-output-replace',
+                member: { owner: { kind: 'generation' }, itemIndex: 0 },
+                expected: currentFirst,
+                next: { ...currentFirst, type: 'must-roll-back' },
+              },
+              {
+                kind: 'provider-output-delete',
+                member: { owner: { kind: 'generation' }, itemIndex: 1 },
+                expected: { ...currentFirst, type: 'stale-member' },
+              },
+            ],
+          },
+        },
+      }),
+    ).rejects.toBeInstanceOf(TreeChangedError)
+    expect((await getMessage(row.id))?.providerOutputItems).toEqual(beforeConflict)
   })
 
   it('keeps presentation-only message actions out of chat and sidebar finalization', async () => {
@@ -576,7 +984,7 @@ describe('body edits', () => {
     await append(row, null)
 
     await execute({
-      kind: 'message.edit-content',
+      kind: 'message.edit-body',
       input: {
         chatId: chat.id,
         messageId: row.id,
@@ -610,7 +1018,7 @@ describe('body edits', () => {
     const freshness = (await getChat(chat.id))?.lastBranchUpdatedAt
 
     await execute({
-      kind: 'message.edit-content',
+      kind: 'message.edit-body',
       input: {
         chatId: chat.id,
         messageId: descendant?.id as MessageId,
@@ -622,7 +1030,7 @@ describe('body edits', () => {
     expect(await getPresentation(assistant?.id as MessageId)).toEqual(assistantBefore)
 
     await execute({
-      kind: 'message.edit-content',
+      kind: 'message.edit-body',
       input: {
         chatId: chat.id,
         messageId: branch.messageId,
@@ -1112,7 +1520,7 @@ describe('structural undo', () => {
     })
     await putAttachment(attachment)
     await execute({
-      kind: 'message.edit-content',
+      kind: 'message.edit-body',
       input: {
         chatId: graph.chat.id,
         messageId: graph.id('C'),
@@ -1153,7 +1561,7 @@ describe('structural undo', () => {
     ).toBe(1)
 
     await execute({
-      kind: 'message.edit-content',
+      kind: 'message.edit-body',
       input: {
         chatId: graph.chat.id,
         messageId: graph.id('G'),
@@ -1162,7 +1570,7 @@ describe('structural undo', () => {
       },
     })
     await execute({
-      kind: 'message.edit-content',
+      kind: 'message.edit-body',
       input: {
         chatId: graph.chat.id,
         messageId: graph.id('U'),
@@ -1215,7 +1623,7 @@ describe('structural undo', () => {
       })
     ).value
     await execute({
-      kind: 'message.edit-content',
+      kind: 'message.edit-body',
       input: {
         chatId: chat.id,
         messageId: child?.id as MessageId,
@@ -1265,7 +1673,7 @@ describe('structural undo', () => {
       })
     ).value
     await execute({
-      kind: 'message.edit-content',
+      kind: 'message.edit-body',
       input: {
         chatId: graph.chat.id,
         messageId: inserted.messageId,

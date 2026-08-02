@@ -2,6 +2,7 @@ import {
   useCallback,
   useEffect,
   useId,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -152,7 +153,30 @@ export function ConnectionHeader({
   const currentSurfaceSelection =
     currentSelection && selectionMatchesSurface(currentSelection) ? currentSelection : null
   const previousSurfaceSelection = previousSelection
-  const presentedSelection = currentSurfaceSelection ?? previousSurfaceSelection
+  const selectedPresentation = currentSurfaceSelection ?? previousSurfaceSelection
+  const workspacePresentationKey = activeSeed.workspaceFence
+    ? `${activeSeed.workspaceFence.workspaceId}:${activeSeed.workspaceFence.replacementEpoch}`
+    : null
+  const retainedSelectionRef = useRef({
+    workspaceKey: workspacePresentationKey,
+    selection: selectedPresentation,
+  })
+  const retainedSelection =
+    retainedSelectionRef.current.workspaceKey === workspacePresentationKey
+      ? retainedSelectionRef.current.selection
+      : null
+  useLayoutEffect(() => {
+    if (
+      selectedPresentation ||
+      retainedSelectionRef.current.workspaceKey !== workspacePresentationKey
+    ) {
+      retainedSelectionRef.current = {
+        workspaceKey: workspacePresentationKey,
+        selection: selectedPresentation,
+      }
+    }
+  }, [selectedPresentation, workspacePresentationKey])
+  const presentedSelection = selectedPresentation ?? retainedSelection
   const selectionPresentationOnly = currentSurfaceSelection === null && presentedSelection !== null
   const activeId =
     currentSurfaceSelection?.target.profileId ??

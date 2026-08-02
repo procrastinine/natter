@@ -10,6 +10,7 @@ import {
   createChatAndOpen,
   createChatAndSend,
   firstChatId,
+  holdIndexedDbStoreGate,
   mockChatCompletions,
   readMessages,
   seedFirstRun,
@@ -58,7 +59,107 @@ test('clicking a chat row navigates to it and swaps the main pane', async ({ pag
   await expect(rows).toHaveCount(2)
   await rows.nth(1).click()
   await expect(page.locator('[data-ui="composer"]')).toBeVisible()
+  await expect(page.locator('[data-ui="message"][data-role="user"]')).toContainText('first')
   await expect(page.locator('[data-ui="chat-row"][data-active="true"]')).toHaveCount(1)
+})
+
+test('sidebar chat switching never exposes null connection, message actions, or privacy frames', async ({
+  page,
+}) => {
+  await createChatAndSend(page, 'first continuity chat')
+  await createChatAndSend(page, 'second continuity chat')
+  const rows = page.locator('[data-ui="chat-row-link"]')
+  await expect(rows).toHaveCount(2)
+  await expect(page.locator('[data-ui="connection-provider-button"] svg')).toHaveCount(1)
+  await expect(page.locator('[data-ui="header-privacy-badge"]')).toHaveCount(1)
+  await expect(page.locator('[data-action="edit"]')).not.toHaveCount(0)
+
+  await page.evaluate(() => {
+    const selectors = {
+      message: '[data-ui="message"]',
+      connection: '[data-ui="connection-provider-button"] svg',
+      edit: '[data-action="edit"]',
+      fork: '[data-action="fork-chat"]',
+      visibility: '[data-action="toggle-visible"]',
+      trash: '[data-action="delete-pair"]',
+      privacy: '[data-ui="header-privacy-badge"]',
+    } as const
+    const minimums = Object.fromEntries(
+      Object.entries(selectors).map(([key, selector]) => [
+        key,
+        document.querySelectorAll(selector).length,
+      ]),
+    ) as Record<keyof typeof selectors, number>
+    const sample = () => {
+      for (const [key, selector] of Object.entries(selectors) as Array<
+        [keyof typeof selectors, string]
+      >) {
+        minimums[key] = Math.min(minimums[key], document.querySelectorAll(selector).length)
+      }
+      const messageCount = document.querySelectorAll(selectors.message).length
+      for (const key of ['edit', 'fork', 'visibility', 'trash'] as const) {
+        const buttons = [...document.querySelectorAll<HTMLButtonElement>(selectors[key])]
+        if (
+          buttons.length < messageCount ||
+          buttons.some((button) => button.disabled || Number(getComputedStyle(button).opacity) < 1)
+        ) {
+          minimums[key] = 0
+        }
+      }
+    }
+    const observer = new MutationObserver(sample)
+    observer.observe(document.querySelector('main') ?? document.body, {
+      childList: true,
+      subtree: true,
+    })
+    ;(
+      window as typeof window & {
+        __chatSwitchContinuity?: {
+          minimums: typeof minimums
+          stop(): typeof minimums
+        }
+      }
+    ).__chatSwitchContinuity = {
+      minimums,
+      stop: () => {
+        sample()
+        observer.disconnect()
+        return { ...minimums }
+      },
+    }
+  })
+
+  const releaseMessages = await holdIndexedDbStoreGate(page, ['messages'])
+  try {
+    await rows.nth(1).click()
+    await expect(page).toHaveURL(/#\/chat\//)
+    await expect(page.locator('[data-ui="chat-row"][data-active="true"]')).toContainText(
+      'first continuity chat',
+    )
+  } finally {
+    await releaseMessages()
+  }
+  await expect(page.locator('[data-ui="message"][data-role="user"]')).toContainText(
+    'first continuity chat',
+  )
+  const minimums = await page.evaluate(() => {
+    const recorder = (
+      window as typeof window & {
+        __chatSwitchContinuity?: { stop(): Record<string, number> }
+      }
+    ).__chatSwitchContinuity
+    if (!recorder) throw new Error('ChatSwitchContinuityRecorderMissing')
+    return recorder.stop()
+  })
+  expect(minimums).toEqual({
+    message: 1,
+    connection: 1,
+    edit: 1,
+    fork: 1,
+    visibility: 1,
+    trash: 1,
+    privacy: 1,
+  })
 })
 
 test('clicking the brand returns to home (no chat selected)', async ({ page }) => {

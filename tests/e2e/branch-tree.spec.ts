@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs'
 import { importPortableChatThroughUi } from '../../scripts/workspace-provider-fixture.mjs'
 import { expect, type Page, test } from './fixtures'
 import {
@@ -19,11 +20,111 @@ interface BranchTreeFixture {
   readonly A2: string
   readonly B1: string
   readonly B2: string
+  readonly extraA: readonly string[]
 }
 
 test.beforeEach(async ({ page }) => {
   await clearIndexedDb(page)
   await seedFirstRun(page)
+})
+
+test('branching from an intermediate transcript node settles one durable fork', async ({
+  page,
+}) => {
+  const fixture = await seedBranchTreeChat(page, { extraBranchRows: 66 })
+  const targetId = fixture.extraA[63]
+  const tipId = fixture.extraA[65]
+  if (!targetId || !tipId) throw new Error('IntermediateForkFixtureMissing')
+  await page.goto(`/#/chat/${fixture.chatId}/message/${tipId}`)
+  const activeDatabaseBefore = await activeWorkspaceDatabaseName(page)
+  const intermediate = page.locator(`[data-ui="message"][data-message-id="${targetId}"]`)
+  await expect(intermediate).toContainText('large imported branch assistant 63')
+  await expect(
+    intermediate.getByRole('button', { name: 'Branch this chat from here' }),
+  ).toBeEnabled()
+
+  page.once('dialog', (dialog) => void dialog.accept('Intermediate durable fork'))
+  await intermediate.getByRole('button', { name: 'Branch this chat from here' }).click()
+
+  await expect(page.locator('[data-ui="chat-title"]')).toContainText('Intermediate durable fork', {
+    timeout: 15_000,
+  })
+  await expect(page.locator('[data-ui="toast"]').filter({ hasText: 'Forked to' })).toHaveCount(1)
+  const forkChatId = await page.evaluate(() => {
+    const match = window.location.hash.match(/^#\/chat\/([^/]+)/u)
+    return match?.[1] ?? null
+  })
+  expect(forkChatId).not.toBeNull()
+  expect(forkChatId).not.toBe(fixture.chatId)
+  if (!forkChatId) throw new Error('IntermediateForkRouteMissing')
+
+  const sourceRows = await readMessages(page, fixture.chatId)
+  const forkRows = await readMessages(page, forkChatId)
+  expect(sourceRows).toHaveLength(71)
+  expect(forkRows).toHaveLength(67)
+  const forkText = forkRows.map((message) =>
+    ((message.content ?? []) as Array<{ text?: string }>).map((item) => item.text ?? '').join(''),
+  )
+  expect(forkText.slice(0, 3)).toEqual([
+    'root instruction',
+    'branch A user',
+    expect.stringContaining('branch A assistant'),
+  ])
+  expect(forkText.at(-1)).toBe('large imported branch assistant 63')
+  expect(forkRows[0]?.parentId).toBeNull()
+  expect(forkRows[1]?.parentId).toBe(forkRows[0]?.id)
+  expect(forkRows.some((message) => sourceRows.some((source) => source.id === message.id))).toBe(
+    false,
+  )
+  expect(await activeWorkspaceDatabaseName(page)).toBe(activeDatabaseBefore)
+  const mountedMessages = page.locator('[data-ui="message"]')
+  await expect(mountedMessages.last()).toContainText('large imported branch assistant 63')
+  expect(await mountedMessages.count()).toBeLessThanOrEqual(50)
+  await expect(
+    page.locator('[data-ui="message"]').last().getByRole('button', { name: 'Edit message' }),
+  ).toBeEnabled()
+})
+
+test('content-free structure exporter reports the active chat without message payloads', async ({
+  page,
+}) => {
+  const fixture = await seedBranchTreeChat(page, { extraBranchRows: 66 })
+  const tipId = fixture.extraA.at(-1)
+  if (!tipId) throw new Error('StructureExporterFixtureMissing')
+  await page.goto(`/#/chat/${fixture.chatId}/message/${tipId}`)
+  const source = readFileSync(
+    new URL('../../scripts/export-chat-structure.js', import.meta.url),
+    'utf8',
+  )
+  const downloadPromise = page.waitForEvent('download')
+
+  await page.addScriptTag({ content: source })
+
+  const download = await downloadPromise
+  const stream = await download.createReadStream()
+  const chunks: Buffer[] = []
+  for await (const chunk of stream) chunks.push(Buffer.from(chunk as Uint8Array))
+  const exported = Buffer.concat(chunks).toString('utf8')
+  const report = JSON.parse(exported) as {
+    chat: Record<string, unknown>
+    messages: Array<Record<string, unknown>>
+    summary: { messageCount: number; maximumDepth: number }
+    diagnostics: { missingParents: unknown[]; cyclicMessageIds: unknown[] }
+  }
+
+  expect(download.suggestedFilename()).toContain(fixture.chatId)
+  expect(report.summary).toMatchObject({ messageCount: 71, maximumDepth: 68 })
+  expect(report.diagnostics).toMatchObject({ missingParents: [], cyclicMessageIds: [] })
+  expect(report.chat).not.toHaveProperty('title')
+  expect(report.messages).toHaveLength(71)
+  for (const message of report.messages) {
+    expect(message).not.toHaveProperty('content')
+    expect(message).not.toHaveProperty('reasoningDetails')
+    expect(message).not.toHaveProperty('providerOutputItems')
+  }
+  expect(exported).not.toContain('root instruction')
+  expect(exported).not.toContain('Tree inspector reasoning detail.')
+  expect(exported).not.toContain('large imported branch assistant 65')
 })
 
 test('middle-click opens the newest descendant branch in a background tab', async ({
@@ -819,13 +920,92 @@ test('tree inspector exposes generation, fork, context, reasoning, and tool acti
   await expect(page.getByRole('button', { name: 'Unhide this reasoning block' })).toBeVisible()
 
   await page.locator('[data-ui="branch-tree-inspector"] [data-ui="tool-evidence-summary"]').click()
-  await page.getByRole('button', { name: 'Hide tool call' }).click()
+  await page.getByRole('button', { name: 'Hide tool call' }).first().click()
   await expect(page.getByRole('button', { name: 'Unhide tool call' })).toBeVisible()
 
   await page.getByRole('button', { name: 'Show in context (send to model)' }).click()
   await expect(branchANode).not.toHaveAttribute('data-hidden-from-context')
   await page.getByRole('button', { name: 'Unhide this reasoning block' }).click()
   await page.getByRole('button', { name: 'Unhide tool call' }).click()
+
+  const inspector = page.locator('[data-ui="branch-tree-inspector"]')
+  await inspector.getByRole('button', { name: 'Edit reasoning details' }).click()
+  await inspector
+    .getByRole('textbox', { name: 'Edit reasoning details' })
+    .fill('Corrected tree inspector reasoning.')
+  await inspector.getByRole('button', { name: 'Save', exact: true }).click()
+  await expect(
+    inspector.locator(
+      '[data-ui="reasoning-section"][data-reasoning-kind="text"] [data-ui="reasoning-row-body"]',
+    ),
+  ).toHaveText('Corrected tree inspector reasoning.')
+  await expect
+    .poll(() => readStoredReasoningText(page, fixture.A2))
+    .toBe('Corrected tree inspector reasoning.')
+
+  await inspector.getByRole('button', { name: 'Edit message' }).click()
+  const reasoningAuthoring = inspector.locator('[data-ui="inline-editor-reasoning"]')
+  await reasoningAuthoring.locator('summary').click()
+  await reasoningAuthoring
+    .getByRole('combobox', { name: 'Reasoning block type', exact: true })
+    .selectOption('summary')
+  await reasoningAuthoring.getByRole('button', { name: 'Add reasoning block' }).click()
+  await reasoningAuthoring
+    .getByRole('textbox', { name: 'Edit plaintext reasoning' })
+    .fill('Additional tree detail.')
+  const toolAuthoring = inspector.locator('[data-ui="inline-editor-tool-calls"]')
+  await toolAuthoring.locator('summary').click()
+  await toolAuthoring
+    .getByRole('textbox', { name: 'Edit tool call JSON or text' })
+    .first()
+    .fill(
+      '{"type":"web_search_call","id":"tree-search-1","status":"completed","action":{"type":"search","query":"edited tree query"}}',
+    )
+  await toolAuthoring.getByRole('button', { name: 'Delete tool call' }).nth(1).click()
+  await toolAuthoring.getByRole('button', { name: 'Add tool call' }).click()
+  await toolAuthoring
+    .getByRole('textbox', { name: 'Edit tool call JSON or text' })
+    .nth(1)
+    .fill('{"treeAuthored":true}')
+  await inspector.locator('[data-ui="attachment-hidden-input"]').setInputFiles({
+    name: 'tree-evidence.txt',
+    mimeType: 'text/plain',
+    buffer: Buffer.from('tree-authored attachment'),
+  })
+  await expect(inspector.getByText('tree-evidence.txt')).toBeVisible()
+  await inspector.getByRole('button', { name: 'Save', exact: true }).click()
+  await expect
+    .poll(async () => {
+      const stored = await readStoredMessage(page, fixture.A2)
+      const envelope = stored?.reasoningEnvelope as
+        | { visible?: Array<{ kind?: string; text?: string }> }
+        | undefined
+      return envelope?.visible?.map((part) => `${part.kind}:${part.text}`)
+    })
+    .toEqual(['summary:Corrected tree inspector reasoning.', 'text:Additional tree detail.'])
+  await expect
+    .poll(async () => {
+      const stored = await readStoredMessage(page, fixture.A2)
+      return stored?.providerOutputItems as Array<{ type?: string; item?: unknown }> | undefined
+    })
+    .toEqual([
+      expect.objectContaining({
+        type: 'web_search_call',
+        edited: true,
+        item: expect.objectContaining({ action: { type: 'search', query: 'edited tree query' } }),
+      }),
+      expect.objectContaining({
+        type: 'manual_tool_call',
+        edited: true,
+        item: { treeAuthored: true },
+      }),
+    ])
+  await expect
+    .poll(async () => {
+      const stored = await readStoredMessage(page, fixture.A2)
+      return Array.isArray(stored?.attachmentRefs) ? stored.attachmentRefs.length : 0
+    })
+    .toBe(1)
 
   await page.getByRole('button', { name: 'Continue from here' }).click()
   await expect.poll(() => readStoredMessageText(page, fixture.A2)).toContain('continued from tree')
@@ -894,11 +1074,35 @@ test('Save & Send from an off-branch tree node hands its live stream to the tran
   await page
     .locator('[data-ui="branch-tree-inspector"] [data-ui="inline-editor-input"]')
     .fill('edited prompt sent from the tree')
+  const inspector = page.locator('[data-ui="branch-tree-inspector"]')
+  await inspector.locator('[data-ui="attachment-hidden-input"]').setInputFiles({
+    name: 'tree-save-send-evidence.txt',
+    mimeType: 'text/plain',
+    buffer: Buffer.from('tree Save & Send attachment'),
+  })
+  await expect(inspector.getByText('tree-save-send-evidence.txt')).toBeVisible()
+  const saveAndSend = page.getByRole('button', { name: 'Save & Send' })
+  await expect(saveAndSend).toBeEnabled()
 
   let streamTargetId: string | null
   try {
-    await page.getByRole('button', { name: 'Save & Send' }).click()
+    await saveAndSend.click()
     await requestSeen
+    await expect
+      .poll(async () => {
+        const messages = await readMessages(page, fixture.chatId)
+        const editedVariant = messages.find(
+          (message) =>
+            message.role === 'user' &&
+            ((message.content ?? []) as Array<{ text?: string }>)
+              .map((item) => item.text ?? '')
+              .join('') === 'edited prompt sent from the tree',
+        )
+        return Array.isArray(editedVariant?.attachmentRefs)
+          ? editedVariant.attachmentRefs.length
+          : 0
+      })
+      .toBe(1)
     const streamingLeaf = page.locator(
       '[data-ui="branch-tree-node"][data-current-leaf="true"][data-selected="true"]',
     )
@@ -984,7 +1188,7 @@ test('tree inspector keeps header controls live and guards body actions during a
       .locator('[data-ui="branch-tree-inspector"] [data-ui="tool-evidence-summary"]')
       .click()
     await expect(page.getByRole('button', { name: 'Hide this reasoning block' })).toBeDisabled()
-    await expect(page.getByRole('button', { name: 'Hide tool call' })).toBeDisabled()
+    await expect(page.getByRole('button', { name: 'Hide tool call' }).first()).toBeDisabled()
 
     await page.getByRole('button', { name: 'Hide from context (never send to model)' }).click()
     await expect(
@@ -1002,7 +1206,7 @@ test('tree inspector keeps header controls live and guards body actions during a
     await expect(branchANode).toHaveAttribute('data-selected', 'true')
     await expect(page.locator('[data-ui="branch-tree-stop"]')).toBeVisible()
     await expect(page.getByRole('button', { name: 'Hide this reasoning block' })).toBeDisabled()
-    await expect(page.getByRole('button', { name: 'Hide tool call' })).toBeDisabled()
+    await expect(page.getByRole('button', { name: 'Hide tool call' }).first()).toBeDisabled()
   } finally {
     releaseResponse()
   }
@@ -1011,7 +1215,7 @@ test('tree inspector keeps header controls live and guards body actions during a
   await expect.poll(() => readStoredMessageText(page, fixture.A2)).toContain('guarded continuation')
   await waitForMessageGenerationFinished(page, fixture.A2)
   await expect(page.getByRole('button', { name: 'Hide this reasoning block' })).toBeEnabled()
-  await expect(page.getByRole('button', { name: 'Hide tool call' })).toBeEnabled()
+  await expect(page.getByRole('button', { name: 'Hide tool call' }).first()).toBeEnabled()
 })
 
 test('tree shows and follows a pending response before the first byte arrives', async ({
@@ -1213,6 +1417,12 @@ async function seedBranchTreeChat(
             action: { type: 'search', query: 'tree inspector action parity' },
           },
         },
+        {
+          dialect: 'unknown',
+          type: 'obsolete_tree_tool',
+          outputIndex: 1,
+          item: { obsolete: true },
+        },
       ],
       nodeVersion: 0,
       deleted: false,
@@ -1294,6 +1504,9 @@ async function seedBranchTreeChat(
     A2: id('A2'),
     B1: id('B1'),
     B2: id('B2'),
+    extraA: Array.from({ length: options.extraBranchRows ?? 0 }, (_, index) =>
+      id(`A-extra-${index}`),
+    ),
   }
 }
 
@@ -1306,6 +1519,12 @@ async function readStoredMessageText(page: Page, messageId: string): Promise<str
 
 async function readStoredMessageHidden(page: Page, messageId: string): Promise<boolean> {
   return (await readStoredMessage(page, messageId))?.hiddenFromContext === true
+}
+
+async function readStoredReasoningText(page: Page, messageId: string): Promise<string | undefined> {
+  const message = await readStoredMessage(page, messageId)
+  const envelope = message?.reasoningEnvelope as { visible?: Array<{ text?: string }> } | undefined
+  return envelope?.visible?.[0]?.text
 }
 
 async function readRegeneratedSiblingText(

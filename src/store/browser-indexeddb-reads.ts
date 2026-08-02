@@ -24,7 +24,7 @@ export function bindReadonlyTransactionAbort(
   message: string,
 ): () => void {
   if (!signal) return () => undefined
-  const abort = () => abortReadonlyTransaction(transaction)
+  const abort = () => abortIndexedDbTransactionAtCancellationBoundary(transaction)
   if (signal.aborted) {
     abort()
     throw new DOMException(message, 'AbortError')
@@ -33,11 +33,11 @@ export function bindReadonlyTransactionAbort(
   return () => signal.removeEventListener('abort', abort)
 }
 
-function abortReadonlyTransaction(transaction: Transaction): void {
+export function abortIndexedDbTransactionAtCancellationBoundary(transaction: Transaction): void {
   if (!transaction.active) return
   try {
     transaction.abort()
-  } catch {
-    // Readonly cancellation remains authoritative through the surrounding signal checks.
+  } catch (error) {
+    if (!(error instanceof DOMException) || error.name !== 'InvalidStateError') throw error
   }
 }

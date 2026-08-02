@@ -246,6 +246,20 @@ export function auditStorageOwnershipReclamation(root, inventoryModule, initialP
   }
 }
 
+export function discoverCanonicalPhysicalStorageTableNames(root = ROOT) {
+  const problems = []
+  const policies = discoverPhysicalStoragePolicy(
+    resolve(root, 'src/store/physical-storage-tables.ts'),
+    problems,
+  )
+  if (problems.length > 0) {
+    throw new Error(`PhysicalStoragePolicyDiscoveryFailed:${problems.join('|')}`)
+  }
+  return Object.freeze(
+    [...policies].filter(([, policy]) => policy.schema === 'canonical').map(([name]) => name),
+  )
+}
+
 function validateCompactionAttemptRelease(root, problems) {
   const expectations = [
     [

@@ -198,6 +198,11 @@ export async function* parseSSE(
     opts.maxPendingEventChars ?? DEFAULT_MAX_PENDING_EVENT_CHARS,
   )
   if (signal?.aborted) {
+    try {
+      void response.body?.cancel().catch(() => {})
+    } catch {
+      // The typed abort remains authoritative when the body cannot be canceled.
+    }
     throw normalizeError(undefined, { midStream: true, cause: 'abort' })
   }
   let body: ReadableStream<Uint8Array> | null

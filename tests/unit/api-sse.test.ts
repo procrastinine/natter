@@ -472,7 +472,18 @@ describe('parseSSE', () => {
   it('normalizes arbitrary abort reasons without retaining them', async () => {
     const controller = new AbortController()
     controller.abort(new Error('abort-reason-secret'))
-    const response = responseFromChunks([enc('data: never\n\n')])
+    let canceled = false
+    const response = new Response(
+      new ReadableStream<Uint8Array>({
+        start(stream) {
+          stream.enqueue(enc('data: never\n\n'))
+        },
+        cancel() {
+          canceled = true
+        },
+      }),
+      { headers: { 'content-type': 'text/event-stream' } },
+    )
 
     let thrown: unknown
     try {
@@ -492,5 +503,6 @@ describe('parseSSE', () => {
       retryable: false,
     })
     expect(JSON.stringify(thrown)).not.toContain('abort-reason-secret')
+    expect(canceled).toBe(true)
   })
 })

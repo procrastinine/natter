@@ -303,7 +303,7 @@ test('Anthropic Messages hosted-tool fixtures cross the provider boundary into t
   ])
 })
 
-test('tool evidence supports per-item visibility while Edit remains content-only', async ({
+test('tool evidence supports per-item visibility and assistant Edit authors provider output', async ({
   page,
 }) => {
   const result = await startProviderFixture(page, 'openai-shell')
@@ -333,14 +333,25 @@ test('tool evidence supports per-item visibility while Edit remains content-only
   expect(storedAssistant?.providerOutputItems?.[0]?.hidden).toBeUndefined()
   const providerOutputBeforeEdit = structuredClone(storedAssistant?.providerOutputItems)
   await assistant.locator('[data-action="edit"]').click()
-  await expect(assistant.locator('[data-ui="inline-editor-tool-calls"]')).toHaveCount(0)
-  await assistant.locator('[data-ui="inline-editor-input"]').fill('content-only edit')
+  const toolAuthoring = assistant.locator('[data-ui="inline-editor-tool-calls"]')
+  await expect(toolAuthoring).toHaveCount(1)
+  await toolAuthoring.locator('summary').click()
+  await toolAuthoring
+    .getByRole('textbox', { name: 'Edit tool call JSON or text' })
+    .first()
+    .fill('{"editedFromProviderFixture":true}')
+  await assistant.locator('[data-ui="inline-editor-input"]').fill('provider-output edit')
   await assistant.locator('[data-role="save"]').click()
 
-  await expect(assistant.locator('[data-ui="message-body"]')).toContainText('content-only edit')
+  await expect(assistant.locator('[data-ui="message-body"]')).toContainText('provider-output edit')
   rows = await readMessages(page, result.chatId)
   storedAssistant = rows.filter((row) => row.role === 'assistant').at(-1)
-  expect(storedAssistant?.providerOutputItems).toEqual(providerOutputBeforeEdit)
+  expect(storedAssistant?.providerOutputItems?.[0]).toEqual({
+    ...providerOutputBeforeEdit?.[0],
+    edited: true,
+    item: { editedFromProviderFixture: true },
+  })
+  expect(storedAssistant?.providerOutputItems?.slice(1)).toEqual(providerOutputBeforeEdit?.slice(1))
 })
 
 test('tool evidence keeps long stdout horizontally scrollable in narrow layouts', async ({

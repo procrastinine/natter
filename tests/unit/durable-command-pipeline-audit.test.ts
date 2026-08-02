@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { beforeAll, describe, expect, it } from 'vitest'
@@ -74,6 +74,38 @@ let evaluateDurableCommandPipeline: (
 ) => DurableCommandPipelineReport
 let buildDurableCommandPipelineSourceFacts: (options?: Readonly<Record<string, unknown>>) => unknown
 
+function withForegroundCommandFootprintBounds(gaps: readonly string[]): readonly string[] {
+  const facts = sourceFacts as {
+    readonly b16BoundsClassification: {
+      readonly classifications: Readonly<
+        Record<string, { readonly kind: string; readonly proof: string }>
+      >
+    }
+  }
+  const commandFootprintVariants = new Set(
+    Object.entries(facts.b16BoundsClassification.classifications)
+      .filter(
+        ([, classification]) =>
+          classification.kind === 'finite' &&
+          classification.proof === 'foreground-storage:command-footprint-atomic-pages',
+      )
+      .map(([variant]) => variant),
+  )
+  const expected = new Set(gaps)
+  for (const gap of gaps) {
+    const separator = gap.lastIndexOf(':')
+    const variant = gap.slice(0, separator)
+    const stage = gap.slice(separator + 1)
+    if (
+      commandFootprintVariants.has(variant) &&
+      (stage === 'physicalWrites' || stage === 'receiptDelta' || stage === 'tables')
+    ) {
+      expected.add(`${variant}:bounds`)
+    }
+  }
+  return [...expected].sort()
+}
+
 beforeAll(async () => {
   const audit = (await import(AUDIT_URL)) as {
     evaluateDurableCommandPipeline: typeof evaluateDurableCommandPipeline
@@ -108,8 +140,8 @@ describe('durable command commit pipeline audit', () => {
       directTransactionOwners: 2,
       directTransactionCalls: 3,
       semanticCapabilityCommands: 109,
-      finiteClassifiedBoundCells: 11,
-      stagedClassifiedBoundCells: 28,
+      finiteClassifiedBoundCells: 39,
+      stagedClassifiedBoundCells: 0,
       carriedBoundCells: 0,
       problems: [],
     })
@@ -124,13 +156,13 @@ describe('durable command commit pipeline audit', () => {
     expect(result.report.limitations).toEqual(
       expect.arrayContaining([
         expect.stringContaining('finite bounds prove command-lifetime request and row cardinality'),
-        expect.stringContaining('exact 28 former carries use the B2.2 staged'),
+        expect.stringContaining('All 39 formerly open bounds use command-footprint pages'),
         expect.stringContaining('Zero pipeline gaps is B2.2 source closure'),
       ]),
     )
   })
 
-  it('passes enforcement only after every command is finite or staged through B2.2', () => {
+  it('passes enforcement only after every command has a finite active-database bound', () => {
     const result = runAudit('enforce')
 
     expect(result.status).toBe(0)
@@ -139,7 +171,7 @@ describe('durable command commit pipeline audit', () => {
     expect(result.report.gapCells).toBe(0)
   })
 
-  it('classifies all remaining bounds through the one B2.2 staged owner', () => {
+  it('classifies all remaining bounds without a foreground workspace-copy owner', () => {
     const facts = sourceFacts as {
       readonly b16BoundsClassification: {
         readonly finiteVariants: readonly string[]
@@ -176,26 +208,54 @@ describe('durable command commit pipeline audit', () => {
     const classification = facts.b16BoundsClassification
 
     expect(classification.finiteVariants).toEqual([
+      'attachment.bundle.write',
+      'attachment.bytes.delete',
+      'attachment.delete-if-unreferenced',
+      'attachment.delete-many',
+      'attachment.reap',
+      'attachment.ref.add',
+      'attachment.ref.detach',
+      'attachment.ref.relink',
+      'attachment.ref.set-visibility',
       'attempt.finalize',
       'attempt.prepare',
+      'chat.calibration.clear-all',
+      'chat.calibration.clear-family',
       'chat.delete-archived',
       'chat.discard-empty-drafts',
       'chat.empty-archive',
+      'chat.fork',
       'chat.set-tags-from-names',
+      'connection.delete',
       'draft.put',
+      'folder.delete',
+      'folder.ensure-and-move-chats',
+      'generated-output.localization-claim',
+      'generated-output.localization-complete',
+      'generated-output.localization-fail',
+      'generated-output.localization-retry',
+      'generated-output.video-expand',
       'interchange.import-chat',
       'interchange.import-chat-preset',
       'interchange.import-connection-profile',
-      'message.edit-content',
+      'maintenance.prune-empty-draft-chats',
+      'maintenance.reconcile-attachment-integrity',
+      'message.delete',
+      'message.edit-body',
+      'message.import',
+      'message.restore-structure',
+      'prompt-preset.delete',
+      'prompt-preset.overwrite-and-pin',
+      'text-template.delete',
     ])
-    expect(classification.stagedVariants).toHaveLength(28)
+    expect(classification.stagedVariants).toEqual([])
     expect(classification.carriedVariants).toEqual([])
     expect(
       Object.values(classification.classifications).filter(({ kind }) => kind === 'finite'),
-    ).toHaveLength(11)
+    ).toHaveLength(39)
     expect(
       Object.values(classification.classifications).filter(({ kind }) => kind === 'staged'),
-    ).toHaveLength(28)
+    ).toHaveLength(0)
     for (const variant of classification.finiteVariants) {
       expect(facts.semanticCapabilities[variant]).toMatchObject({
         boundsProved: true,
@@ -212,11 +272,11 @@ describe('durable command commit pipeline audit', () => {
     }
 
     const report = runAudit('enforce').report
-    expect(report.stagedClassifiedBoundCells).toBe(28)
+    expect(report.stagedClassifiedBoundCells).toBe(0)
     expect(report.carriedBounds).toEqual([])
   })
 
-  it('reopens a bound when its finite or staged proof is removed', () => {
+  it('reopens a bound when either finite proof family is removed', () => {
     const facts = sourceFacts as {
       readonly semanticCapabilities: Readonly<Record<string, Readonly<Record<string, unknown>>>>
     }
@@ -228,8 +288,8 @@ describe('durable command commit pipeline audit', () => {
         ...(sourceFacts as object),
         semanticCapabilities: {
           ...facts.semanticCapabilities,
-          'message.edit-content': {
-            ...facts.semanticCapabilities['message.edit-content'],
+          'message.edit-body': {
+            ...facts.semanticCapabilities['message.edit-body'],
             boundsProved: false,
           },
         },
@@ -237,7 +297,7 @@ describe('durable command commit pipeline audit', () => {
     ) as DurableCommandPipelineReport & {
       readonly gaps: readonly { readonly variant: string; readonly stage: string }[]
     }
-    const withoutStagedProof = evaluateDurableCommandPipeline(
+    const withoutCommandFootprintProof = evaluateDurableCommandPipeline(
       canonicalInventory,
       'inventory',
       { detail: true },
@@ -258,48 +318,95 @@ describe('durable command commit pipeline audit', () => {
 
     expect(withoutFiniteProof.gaps).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ variant: 'message.edit-content', stage: 'bounds' }),
+        expect.objectContaining({ variant: 'message.edit-body', stage: 'bounds' }),
       ]),
     )
-    expect(withoutStagedProof.gaps).toEqual(
+    expect(withoutCommandFootprintProof.gaps).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ variant: 'connection.delete', stage: 'bounds' }),
       ]),
     )
   })
 
-  it('derives the exact 28 variants from one bounded staged-fanout owner', () => {
+  it('derives one foreground storage-locality owner with no workspace-copy fallback', () => {
     const facts = sourceFacts as {
-      readonly stagedFanoutFamily: {
-        readonly variants: readonly string[]
-        readonly workspaceVariants: readonly string[]
-        readonly configurationVariants: readonly string[]
+      readonly foregroundStorageLocalityFamily: {
+        readonly wholeCollectionReadSites: readonly string[]
+        readonly reviewedWholeCollectionReadSites: readonly string[]
         readonly commonKernel: Readonly<Record<string, boolean>>
         readonly consumed: boolean
       }
     }
 
-    expect(facts.stagedFanoutFamily.variants).toHaveLength(28)
-    expect(facts.stagedFanoutFamily.workspaceVariants).toHaveLength(24)
-    expect(facts.stagedFanoutFamily.configurationVariants).toEqual([
-      'connection.delete',
-      'prompt-preset.delete',
-      'prompt-preset.overwrite-and-pin',
-      'text-template.delete',
-    ])
-    expect(Object.values(facts.stagedFanoutFamily.commonKernel).every(Boolean)).toBe(true)
-    expect(facts.stagedFanoutFamily.consumed).toBe(true)
+    expect(Object.values(facts.foregroundStorageLocalityFamily.commonKernel).every(Boolean)).toBe(
+      true,
+    )
+    expect(facts.foregroundStorageLocalityFamily.consumed).toBe(true)
+    expect(facts.foregroundStorageLocalityFamily.wholeCollectionReadSites).toEqual(
+      facts.foregroundStorageLocalityFamily.reviewedWholeCollectionReadSites,
+    )
+    expect(existsSync(resolve(ROOT, 'src/store/browser-staged-fanout-command.ts'))).toBe(false)
+    expect(existsSync(resolve(ROOT, 'src/store/browser-workspace-staged-fanout.ts'))).toBe(false)
   })
 
-  it('rejects a staged inventory, page guard, and budget guard removed together', async () => {
-    const commandSource = readFileSync(
-      resolve(ROOT, 'src/store/browser-staged-fanout-command.ts'),
+  it('rejects an ordinary command or maintenance path that regains overflow admission', async () => {
+    const repoSource = readFileSync(resolve(ROOT, 'src/store/browser-repo.ts'), 'utf8')
+    const maintenanceSource = readFileSync(
+      resolve(ROOT, 'src/store/storage-maintenance-runtime.ts'),
       'utf8',
     )
-    const stagedSource = readFileSync(
-      resolve(ROOT, 'src/store/browser-workspace-staged-fanout.ts'),
-      'utf8',
+    const { createProductionTypeScriptProgram } = (await import(TYPESCRIPT_SOURCE_URL)) as {
+      createProductionTypeScriptProgram(
+        root: string,
+        options: { sourceTextOverrides: Readonly<Record<string, string>> },
+      ): unknown
+    }
+    expect(repoSource).toContain('this.executeDirectCommand(permit, command)')
+    expect(maintenanceSource).toContain(
+      'value: (await getWorkspaceRepository().execute(permit, command)).value',
     )
+
+    const mutated = buildDurableCommandPipelineSourceFacts({
+      program: createProductionTypeScriptProgram(ROOT, {
+        sourceTextOverrides: {
+          'src/store/browser-repo.ts': repoSource.replace(
+            'this.executeDirectCommand(permit, command)',
+            'this.tryExecuteCommandWithinFanoutBudget(permit, command, BROWSER_COMMAND_DIRECT_FANOUT_BUDGET)',
+          ),
+          'src/store/storage-maintenance-runtime.ts': maintenanceSource.replace(
+            'value: (await getWorkspaceRepository().execute(permit, command)).value',
+            'value: (await tryExecuteBrowserWorkspaceCommandWithinFanoutBudget(permit, command)).value',
+          ),
+        },
+      }),
+    }) as {
+      readonly foregroundStorageLocalityFamily: {
+        readonly commonKernel: Readonly<Record<string, boolean>>
+        readonly consumed: boolean
+      }
+      readonly sourceArchitectureProblems: readonly string[]
+    }
+
+    expect(mutated.foregroundStorageLocalityFamily.commonKernel.oneDirectRepositoryIngress).toBe(
+      false,
+    )
+    expect(
+      mutated.foregroundStorageLocalityFamily.commonKernel.maintenanceUsesSameRepositoryIngress,
+    ).toBe(false)
+    expect(
+      mutated.foregroundStorageLocalityFamily.commonKernel.budgetCannotRejectProductionIntent,
+    ).toBe(false)
+    expect(mutated.foregroundStorageLocalityFamily.consumed).toBe(false)
+    expect(mutated.sourceArchitectureProblems).toEqual(
+      expect.arrayContaining([
+        'foreground storage locality missing oneDirectRepositoryIngress',
+        'foreground storage locality missing maintenanceUsesSameRepositoryIngress',
+        'foreground storage locality missing budgetCannotRejectProductionIntent',
+      ]),
+    )
+  }, 30_000)
+
+  it('rejects a new unreviewed whole-collection read in an ordinary repository route', async () => {
     const repoSource = readFileSync(resolve(ROOT, 'src/store/browser-repo.ts'), 'utf8')
     const { createProductionTypeScriptProgram } = (await import(TYPESCRIPT_SOURCE_URL)) as {
       createProductionTypeScriptProgram(
@@ -307,45 +414,45 @@ describe('durable command commit pipeline audit', () => {
         options: { sourceTextOverrides: Readonly<Record<string, string>> },
       ): unknown
     }
-    expect(commandSource).toContain("  'connection.delete',")
-    expect(stagedSource).toContain('rows.length >= STAGED_COPY_MAX_PAGE_ROWS')
-    expect(repoSource).toContain('isBrowserCommandFanoutBudgetExceededError(error)')
+    const mutatedSource = repoSource.replace(
+      '    assertWorkspaceExecutionPermit(permit)\n    return (await this.executeDirectCommand(permit, command)).commit',
+      `    assertWorkspaceExecutionPermit(permit)
+    void this.session.runOperation((database) => database.chats.toArray())
+    const rawStore = indexedDB.open('unreviewed').result.transaction('chats').objectStore('chats')
+    void rawStore.getAll()
+    void rawStore.openCursor()
+    return (await this.executeDirectCommand(permit, command)).commit`,
+    )
+    expect(mutatedSource).not.toBe(repoSource)
 
     const mutated = buildDurableCommandPipelineSourceFacts({
       program: createProductionTypeScriptProgram(ROOT, {
-        sourceTextOverrides: {
-          'src/store/browser-staged-fanout-command.ts': commandSource.replace(
-            "  'connection.delete',",
-            '',
-          ),
-          'src/store/browser-workspace-staged-fanout.ts': stagedSource.replaceAll(
-            'rows.length >= STAGED_COPY_MAX_PAGE_ROWS',
-            'rows.length >= Number.MAX_SAFE_INTEGER',
-          ),
-          'src/store/browser-repo.ts': repoSource.replace(
-            'isBrowserCommandFanoutBudgetExceededError(error)',
-            'false',
-          ),
-        },
+        sourceTextOverrides: { 'src/store/browser-repo.ts': mutatedSource },
       }),
     }) as {
-      readonly stagedFanoutFamily: {
+      readonly foregroundStorageLocalityFamily: {
+        readonly wholeCollectionReadSites: readonly string[]
         readonly commonKernel: Readonly<Record<string, boolean>>
         readonly consumed: boolean
       }
       readonly sourceArchitectureProblems: readonly string[]
     }
 
-    expect(mutated.stagedFanoutFamily.commonKernel.exactVariantInventory).toBe(false)
-    expect(mutated.stagedFanoutFamily.commonKernel.boundedSourceDestinationCopy).toBe(false)
-    expect(mutated.stagedFanoutFamily.commonKernel.adaptiveAtomicAdmission).toBe(false)
-    expect(mutated.stagedFanoutFamily.consumed).toBe(false)
-    expect(mutated.sourceArchitectureProblems).toEqual(
-      expect.arrayContaining([
-        'staged fanout family missing exactVariantInventory',
-        'staged fanout family missing boundedSourceDestinationCopy',
-        'staged fanout family missing adaptiveAtomicAdmission',
-      ]),
+    expect(mutated.foregroundStorageLocalityFamily.wholeCollectionReadSites).toContain(
+      'src/store/browser-repo.ts#execute:toArray',
+    )
+    expect(mutated.foregroundStorageLocalityFamily.wholeCollectionReadSites).toContain(
+      'src/store/browser-repo.ts#execute:getAll',
+    )
+    expect(mutated.foregroundStorageLocalityFamily.wholeCollectionReadSites).toContain(
+      'src/store/browser-repo.ts#execute:openCursor',
+    )
+    expect(
+      mutated.foregroundStorageLocalityFamily.commonKernel.exactReviewedWholeCollectionReads,
+    ).toBe(false)
+    expect(mutated.foregroundStorageLocalityFamily.consumed).toBe(false)
+    expect(mutated.sourceArchitectureProblems).toContain(
+      'foreground storage locality missing exactReviewedWholeCollectionReads',
     )
   }, 30_000)
 
@@ -556,7 +663,7 @@ describe('durable command commit pipeline audit', () => {
     }
     expect(family.fixedReceiptFamily.messageCommandExact.variants).toEqual([
       'message.delete',
-      'message.edit-content',
+      'message.edit-body',
       'message.import',
       'message.restore-structure',
     ])
@@ -681,9 +788,12 @@ describe('durable command commit pipeline audit', () => {
       {},
       { ...(sourceFacts as object), semanticCapabilities },
     )
-    expect(reopened.gapCells).toBe(runAudit('inventory').report.gapCells + 27)
+    expect(reopened.gapCells).toBe(
+      runAudit('inventory').report.gapCells + family.declaredVariants.length,
+    )
     expect(reopened.gapStageCounts.physicalWrites).toBe(
-      (runAudit('inventory').report.gapStageCounts.physicalWrites ?? 0) + 27,
+      (runAudit('inventory').report.gapStageCounts.physicalWrites ?? 0) +
+        family.declaredVariants.length,
     )
 
     const withoutFixedReceipt = { ...facts.semanticCapabilities }
@@ -700,12 +810,16 @@ describe('durable command commit pipeline audit', () => {
       {},
       { ...(sourceFacts as object), semanticCapabilities: withoutFixedReceipt },
     )
-    expect(receiptReopened.gapCells).toBe(runAudit('inventory').report.gapCells + 16)
+    expect(receiptReopened.gapCells).toBe(
+      runAudit('inventory').report.gapCells + family.fixedReceiptFamily.variants.length * 2,
+    )
     expect(receiptReopened.gapStageCounts.receiptDelta).toBe(
-      (runAudit('inventory').report.gapStageCounts.receiptDelta ?? 0) + 8,
+      (runAudit('inventory').report.gapStageCounts.receiptDelta ?? 0) +
+        family.fixedReceiptFamily.variants.length,
     )
     expect(receiptReopened.gapStageCounts.idempotence).toBe(
-      (runAudit('inventory').report.gapStageCounts.idempotence ?? 0) + 8,
+      (runAudit('inventory').report.gapStageCounts.idempotence ?? 0) +
+        family.fixedReceiptFamily.variants.length,
     )
   })
 
@@ -874,9 +988,10 @@ describe('durable command commit pipeline audit', () => {
 
     for (const scenario of cases) {
       const result = reopenedFrom(scenario.overrides)
+      const expected = withForegroundCommandFootprintBounds(scenario.reopened)
       expect(result.common[scenario.common], scenario.name).toBe(false)
-      expect(result.reopened, scenario.name).toEqual(scenario.reopened)
-      expect(result.gapCells, scenario.name).toBe(baseline.gapCells + scenario.reopened.length)
+      expect(result.reopened, scenario.name).toEqual(expected)
+      expect(result.gapCells, scenario.name).toBe(baseline.gapCells + expected.length)
     }
   }, 180_000)
 
@@ -1082,9 +1197,10 @@ describe('durable command commit pipeline audit', () => {
 
     for (const scenario of cases) {
       const result = reopenedFrom(scenario.overrides)
+      const expected = withForegroundCommandFootprintBounds(scenario.reopened)
       expect(result.common[scenario.common], scenario.name).toBe(false)
-      expect(result.reopened, scenario.name).toEqual(scenario.reopened)
-      expect(result.gapCells, scenario.name).toBe(baseline.gapCells + scenario.reopened.length)
+      expect(result.reopened, scenario.name).toEqual(expected)
+      expect(result.gapCells, scenario.name).toBe(baseline.gapCells + expected.length)
     }
   }, 180_000)
 
@@ -1268,9 +1384,10 @@ describe('durable command commit pipeline audit', () => {
 
     for (const scenario of cases) {
       const result = reopenedFrom(scenario.overrides)
+      const expected = withForegroundCommandFootprintBounds(scenario.reopened)
       expect(result.common[scenario.common], scenario.name).toBe(false)
-      expect(result.reopened, scenario.name).toEqual(scenario.reopened)
-      expect(result.gapCells, scenario.name).toBe(baseline.gapCells + scenario.reopened.length)
+      expect(result.reopened, scenario.name).toEqual(expected)
+      expect(result.gapCells, scenario.name).toBe(baseline.gapCells + expected.length)
     }
   }, 240_000)
 
@@ -1466,9 +1583,10 @@ describe('durable command commit pipeline audit', () => {
 
     for (const scenario of cases) {
       const result = reopenedFrom(scenario.overrides)
+      const expected = withForegroundCommandFootprintBounds(scenario.reopened)
       expect(result.common[scenario.common], scenario.name).toBe(false)
-      expect(result.reopened, scenario.name).toEqual(scenario.reopened)
-      expect(result.gapCells, scenario.name).toBe(baseline.gapCells + scenario.reopened.length)
+      expect(result.reopened, scenario.name).toEqual(expected)
+      expect(result.gapCells, scenario.name).toBe(baseline.gapCells + expected.length)
     }
   }, 240_000)
 
@@ -1699,9 +1817,10 @@ describe('durable command commit pipeline audit', () => {
 
     for (const scenario of cases) {
       const result = reopenedFrom(scenario.overrides)
+      const expected = withForegroundCommandFootprintBounds(scenario.reopened)
       expect(result.common[scenario.common], scenario.name).toBe(false)
-      expect(result.reopened, scenario.name).toEqual(scenario.reopened)
-      expect(result.gapCells, scenario.name).toBe(baseline.gapCells + scenario.reopened.length)
+      expect(result.reopened, scenario.name).toEqual(expected)
+      expect(result.gapCells, scenario.name).toBe(baseline.gapCells + expected.length)
     }
   }, 300_000)
 
@@ -1877,9 +1996,10 @@ describe('durable command commit pipeline audit', () => {
 
     for (const scenario of cases) {
       const result = reopenedFrom(scenario.overrides)
+      const expected = withForegroundCommandFootprintBounds(scenario.reopened)
       expect(result.common[scenario.common], scenario.name).toBe(false)
-      expect(result.reopened, scenario.name).toEqual(scenario.reopened)
-      expect(result.gapCells, scenario.name).toBe(baseline.gapCells + scenario.reopened.length)
+      expect(result.reopened, scenario.name).toEqual(expected)
+      expect(result.gapCells, scenario.name).toBe(baseline.gapCells + expected.length)
     }
   }, 300_000)
 
@@ -2034,9 +2154,10 @@ describe('durable command commit pipeline audit', () => {
 
     for (const scenario of cases) {
       const result = reopenedFrom(scenario.overrides)
+      const expected = withForegroundCommandFootprintBounds(scenario.reopened)
       expect(result.common[scenario.common], scenario.name).toBe(false)
-      expect(result.reopened, scenario.name).toEqual(scenario.reopened)
-      expect(result.gapCells, scenario.name).toBe(baseline.gapCells + scenario.reopened.length)
+      expect(result.reopened, scenario.name).toEqual(expected)
+      expect(result.gapCells, scenario.name).toBe(baseline.gapCells + expected.length)
     }
   }, 300_000)
 
@@ -2071,7 +2192,7 @@ describe('durable command commit pipeline audit', () => {
       }[]
     }
 
-    expect(result.gapCells).toBe(runAudit('inventory').report.gapCells + 8)
+    expect(result.gapCells).toBe(runAudit('inventory').report.gapCells + variants.length * 2)
     expect(
       result.gaps
         .filter(({ scope, variant }) => scope === 'workspace' && variants.includes(variant))
@@ -2573,7 +2694,7 @@ describe('durable command commit pipeline audit', () => {
     expect(result.gapCells).toBe(baseline.gapCells + reopenedGaps.length)
   }, 30_000)
 
-  it('derives page-shaped calibration receipts before staged classification', () => {
+  it('derives page-shaped calibration receipts without a total-operation bound', () => {
     const facts = sourceFacts as {
       readonly chatCalibrationFamily: {
         readonly variants: readonly string[]
@@ -4049,7 +4170,7 @@ describe('durable command commit pipeline audit', () => {
     expect(importSource.match(/semanticOperationExactReceiptContracts</gu)).toHaveLength(3)
     const mutationPlanPath = resolve(ROOT, 'src/store/browser-mutation-plan.ts')
     const mutationPlanSource = readFileSync(mutationPlanPath, 'utf8')
-    const editPolicy = `case 'message.edit-content':
+    const editPolicy = `case 'message.edit-body':
       return {
         exactOccurrence: true,`
     expect(mutationPlanSource).toContain(editPolicy)
@@ -4100,7 +4221,7 @@ describe('durable command commit pipeline audit', () => {
       'interchange.import-chat-preset',
       'interchange.import-connection-profile',
       'message.delete',
-      'message.edit-content',
+      'message.edit-body',
       'message.import',
       'message.restore-structure',
     ]
@@ -4114,14 +4235,16 @@ describe('durable command commit pipeline audit', () => {
       .map(({ variant, stage }) => `${variant}:${stage}`)
       .sort()
     expect(reopened).toEqual(
-      [
-        ...variants.flatMap((variant) => [
-          `${variant}:idempotence`,
-          `${variant}:receiptDelta`,
-          `${variant}:tables`,
-        ]),
-        'message.edit-content:bounds',
-      ].sort(),
+      withForegroundCommandFootprintBounds(
+        [
+          ...variants.flatMap((variant) => [
+            `${variant}:idempotence`,
+            `${variant}:receiptDelta`,
+            `${variant}:tables`,
+          ]),
+          'message.edit-body:bounds',
+        ].sort(),
+      ),
     )
   }, 60_000)
 

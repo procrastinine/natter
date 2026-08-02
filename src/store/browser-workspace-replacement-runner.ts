@@ -63,14 +63,10 @@ import {
   subscribeWorkspaceRuntimeState,
   type WorkspaceReconcileAuthority,
   type WorkspaceRuntimeActionOptions,
-  WorkspaceRuntimeReplacementBlockedError,
-  waitForWorkspaceRuntimeReplacementBlockers,
 } from './workspace-runtime'
 import {
   awaitWorkspaceRuntimeQuiesced,
   getWorkspaceRuntimeControlSnapshot,
-  launchCommandFanoutWorkspaceRuntimeReplacementNow,
-  launchCommandFanoutWorkspaceRuntimeReplacementWhenUnblocked,
   launchImportExportWorkspaceRuntimeReplacementNow,
   tryLaunchMaintenanceWorkspaceRuntimeReplacementIfIdle,
 } from './workspace-runtime-control'
@@ -87,10 +83,8 @@ type BrowserWorkspaceReplacementPreflight = (
 
 interface BrowserWorkspaceReplacementLaunchPolicy {
   readonly admission: 'required' | 'if-idle'
-  readonly blockedAdmission: 'reject' | 'wait'
   readonly admissionOptions: WorkspaceRuntimeActionOptions
   readonly promote: () => WorkspaceReconcileAuthority | null
-  readonly promoteWhenUnblocked?: () => Promise<WorkspaceReconcileAuthority | null>
 }
 
 interface BrowserWorkspaceReplacementPromoted<T> {
@@ -137,7 +131,6 @@ export async function runBrowserWorkspaceReplacement<T>(
   const started = await launchBrowserWorkspaceReplacement(
     {
       admission: 'required',
-      blockedAdmission: 'reject',
       admissionOptions: options,
       promote: () => launchImportExportWorkspaceRuntimeReplacementNow(options),
     },
@@ -161,7 +154,6 @@ export function tryStartBrowserWorkspaceReplacementIfIdle<T>(
   return launchBrowserWorkspaceReplacement(
     {
       admission: 'if-idle',
-      blockedAdmission: 'reject',
       admissionOptions: options,
       // Promotion closes the maintenance producer; the handoff authority owns execution.
       promote: () => tryLaunchMaintenanceWorkspaceRuntimeReplacementIfIdle(authorityOptions),
@@ -180,42 +172,8 @@ export function tryStartBrowserWorkspaceOnlineReplacementIfIdle<Prepared, T>(
   return launchBrowserWorkspaceReplacement(
     {
       admission: 'if-idle',
-      blockedAdmission: 'reject',
       admissionOptions: options,
       promote: () => tryLaunchMaintenanceWorkspaceRuntimeReplacementIfIdle(authorityOptions),
-    },
-    preflight,
-    onlineBrowserWorkspaceReplacementWork(operation),
-  )
-}
-
-export async function runBrowserWorkspaceOnlineReplacement<Prepared, T>(
-  preflight: BrowserWorkspaceReplacementPreflight,
-  operation: BrowserWorkspaceOnlineReplacementOperation<Prepared, T>,
-  options: WorkspaceRuntimeActionOptions = {},
-): Promise<BrowserWorkspaceReplacementCommit<T>> {
-  const started = await startBrowserWorkspaceOnlineReplacement(preflight, operation, options)
-  if (started.kind === 'skipped') throw new Error('BrowserWorkspaceReplacementPreflightSkipped')
-  if (started.kind === 'blocked') throw new Error('BrowserWorkspaceReplacementAdmissionBlocked')
-  if (started.kind === 'cleanup-required') {
-    throw new Error('BrowserWorkspaceReplacementCleanupRequired')
-  }
-  return started.handoff.completion
-}
-
-export function startBrowserWorkspaceOnlineReplacement<Prepared, T>(
-  preflight: BrowserWorkspaceReplacementPreflight,
-  operation: BrowserWorkspaceOnlineReplacementOperation<Prepared, T>,
-  options: WorkspaceRuntimeActionOptions = {},
-): Promise<BrowserWorkspaceReplacementStart<T>> {
-  return launchBrowserWorkspaceReplacement(
-    {
-      admission: 'required',
-      blockedAdmission: 'wait',
-      admissionOptions: options,
-      promote: () => launchCommandFanoutWorkspaceRuntimeReplacementNow(options),
-      promoteWhenUnblocked: () =>
-        launchCommandFanoutWorkspaceRuntimeReplacementWhenUnblocked(options),
     },
     preflight,
     onlineBrowserWorkspaceReplacementWork(operation),
@@ -282,29 +240,12 @@ async function performBrowserWorkspaceReplacementLaunch<T>(
       await runWorkspaceRead('import-export', () => undefined, policy.admissionOptions)
       continue
     }
-    if (policy.blockedAdmission === 'wait') {
-      await waitForWorkspaceRuntimeReplacementBlockers(policy.admissionOptions)
-    }
-    let attempt:
-      | Awaited<ReturnType<typeof runBrowserWorkspaceReplacementSelectionAttempt<T>>>
-      | undefined
-    try {
-      attempt = await runBrowserWorkspaceReplacementSelectionAttempt(
-        policy,
-        preflight,
-        work,
-        onPromoted,
-      )
-    } catch (error) {
-      if (
-        policy.blockedAdmission === 'wait' &&
-        error instanceof WorkspaceRuntimeReplacementBlockedError
-      ) {
-        await waitForWorkspaceRuntimeReplacementBlockers(policy.admissionOptions)
-        continue
-      }
-      throw error
-    }
+    const attempt = await runBrowserWorkspaceReplacementSelectionAttempt(
+      policy,
+      preflight,
+      work,
+      onPromoted,
+    )
     if (attempt.kind === 'cleanup-required' && policy.admission === 'required') {
       const cleanup = await cleanPendingBrowserWorkspaceDatabase(policy.admissionOptions.signal)
       if (cleanup.status === 'preparing') continue
@@ -402,7 +343,7 @@ async function runGatedBrowserWorkspaceReplacementAttempt<T>(
             policy.admissionOptions.signal,
           )
         : undefined
-    const authority = await launchPreparedReplacementAuthority(policy)
+    const authority = launchReplacementAuthority(policy)
     if (!authority) {
       cleanupAttempted = true
       await abandonUnpromotedSlottedReplacement(journal, work)
@@ -444,16 +385,6 @@ function launchReplacementAuthority(
 ): WorkspaceReconcileAuthority | null {
   if (policy.admissionOptions.signal?.aborted) throw policy.admissionOptions.signal.reason
   return policy.promote()
-}
-
-async function launchPreparedReplacementAuthority(
-  policy: BrowserWorkspaceReplacementLaunchPolicy,
-): Promise<WorkspaceReconcileAuthority | null> {
-  if (policy.blockedAdmission === 'reject') return launchReplacementAuthority(policy)
-  if (!policy.promoteWhenUnblocked) {
-    throw new Error('BrowserWorkspaceReplacementBlockedPromotionMissing')
-  }
-  return policy.promoteWhenUnblocked()
 }
 
 function awaitOnlineReplacementAuthority(

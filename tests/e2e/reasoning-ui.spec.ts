@@ -1,6 +1,6 @@
 import { importPortableChatThroughUi } from '../../scripts/workspace-provider-fixture.mjs'
 import { expect, test } from './fixtures'
-import { clearIndexedDb, seedFirstRun } from './helpers'
+import { clearIndexedDb, readMessages, seedFirstRun } from './helpers'
 
 test.beforeEach(async ({ page }) => {
   await clearIndexedDb(page)
@@ -40,7 +40,28 @@ test('canonicalized Claude reasoning renders once in the UI and shows reasoning 
       role: 'assistant',
       origin: 'generated',
       content: [{ type: 'output_text', text: 'The ratio is Cauchy.' }],
-      reasoningDetails: [{ type: 'reasoning.text', index: 0, text: 'Let me' }],
+      reasoningDetails: [
+        { type: 'reasoning.text', index: 0, text: 'Let me' },
+        { type: 'reasoning.encrypted', index: 1, data: 'opaque-reasoning' },
+      ],
+      providerOutputItems: [
+        {
+          dialect: 'openai-responses',
+          type: 'web_search_call',
+          outputIndex: 0,
+          item: {
+            id: 'reasoning-provider-output',
+            query: 'before',
+            encrypted_content: 'sealed-provider-field',
+          },
+        },
+        {
+          dialect: 'unknown',
+          type: 'obsolete_tool_result',
+          outputIndex: 1,
+          item: { obsolete: true },
+        },
+      ],
       nodeVersion: 0,
       deleted: false,
       generation: {
@@ -72,6 +93,99 @@ test('canonicalized Claude reasoning renders once in the UI and shows reasoning 
       '[data-ui="reasoning-section"][data-reasoning-kind="text"] [data-ui="reasoning-row-body"]',
     ),
   ).toHaveText('Let me')
+  await assistant.getByRole('button', { name: 'Edit reasoning details' }).click()
+  const reasoningEditor = assistant.getByRole('textbox', { name: 'Edit reasoning details' })
+  await reasoningEditor.fill('Let me verify the ratio')
+  await assistant.getByRole('button', { name: 'Save', exact: true }).click()
+  await expect(reasoningEditor).toBeHidden()
+  await expect(
+    assistant.locator(
+      '[data-ui="reasoning-section"][data-reasoning-kind="text"] [data-ui="reasoning-row-body"]',
+    ),
+  ).toHaveText('Let me verify the ratio')
+
+  await page.reload()
+  await assistant.locator('[data-ui="reasoning-summary"]').click()
+  await expect(
+    assistant.locator(
+      '[data-ui="reasoning-section"][data-reasoning-kind="text"] [data-ui="reasoning-row-body"]',
+    ),
+  ).toHaveText('Let me verify the ratio')
+
+  await assistant.locator('[data-role="message-action"][data-action="edit"]').click()
+  const authoring = assistant.locator('[data-ui="inline-editor-reasoning"]')
+  await authoring.locator('summary').click()
+  await authoring
+    .getByRole('combobox', { name: 'Reasoning block type', exact: true })
+    .selectOption('summary')
+  await authoring.getByRole('textbox', { name: 'Edit summary reasoning' }).fill('Ratio summary')
+  await authoring
+    .getByRole('button', { name: /Delete (?:opaque|encrypted|redacted) reasoning block/ })
+    .click()
+  await authoring.getByRole('button', { name: 'Add reasoning block' }).click()
+  await authoring
+    .getByRole('textbox', { name: 'Edit plaintext reasoning' })
+    .fill('User-authored detail')
+  const toolAuthoring = assistant.locator('[data-ui="inline-editor-tool-calls"]')
+  await toolAuthoring.locator('summary').click()
+  await toolAuthoring
+    .getByRole('textbox', { name: 'Edit tool call JSON or text' })
+    .first()
+    .fill('{"id":"reasoning-provider-output","query":"after"}')
+  await toolAuthoring.getByRole('button', { name: 'Delete tool call' }).nth(1).click()
+  await toolAuthoring.getByRole('button', { name: 'Add tool call' }).click()
+  await toolAuthoring
+    .getByRole('textbox', { name: 'Edit tool call JSON or text' })
+    .nth(1)
+    .fill('{"authored":true}')
+  await assistant.locator('[data-ui="attachment-hidden-input"]').setInputFiles({
+    name: 'assistant-evidence.txt',
+    mimeType: 'text/plain',
+    buffer: Buffer.from('assistant-authored attachment'),
+  })
+  await expect(assistant.getByText('assistant-evidence.txt')).toBeVisible()
+  await assistant.getByRole('button', { name: 'Save', exact: true }).click()
+  await expect(authoring).toBeHidden()
+
+  await page.reload()
+  await assistant.locator('[data-ui="reasoning-summary"]').click()
+  await expect(
+    assistant.locator(
+      '[data-ui="reasoning-section"][data-reasoning-kind="summary"] [data-ui="reasoning-row-body"]',
+    ),
+  ).toHaveText('Ratio summary')
+  await expect(
+    assistant.locator(
+      '[data-ui="reasoning-section"][data-reasoning-kind="text"] [data-ui="reasoning-row-body"]',
+    ),
+  ).toHaveText('User-authored detail')
+  await expect(
+    assistant.locator('[data-ui="reasoning-section"][data-reasoning-kind="encrypted"]'),
+  ).toHaveCount(0)
+  const stored = (await readMessages(page, imported.chatId)).find(
+    (message) => message.role === 'assistant',
+  )
+  expect(stored?.providerOutputItems).toEqual([
+    {
+      dialect: 'openai-responses',
+      type: 'web_search_call',
+      outputIndex: 0,
+      edited: true,
+      item: {
+        id: 'reasoning-provider-output',
+        query: 'after',
+        encrypted_content: 'sealed-provider-field',
+      },
+    },
+    {
+      dialect: 'unknown',
+      type: 'manual_tool_call',
+      outputIndex: 1,
+      edited: true,
+      item: { authored: true },
+    },
+  ])
+  expect(stored?.attachmentRefs).toHaveLength(1)
   await assistant.locator('[data-role="message-action"][data-action="info"]').click()
   await expect(assistant.locator('[data-ui="message-info"]')).toContainText('Reasoning time')
   await expect(assistant.locator('[data-ui="message-info"]')).toContainText('1.10 s before answer')

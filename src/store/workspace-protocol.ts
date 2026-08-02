@@ -32,8 +32,8 @@ import type {
   ConversationSelectionProofTarget,
   DeleteInput,
   DeleteResult,
-  EditMessageInput,
-  EditMessageResult,
+  EditMessageBodyInput,
+  EditMessageBodyResult,
   MessageBodyMutationInput,
   PasteImportInput,
   PasteImportResult,
@@ -2695,7 +2695,7 @@ type OrganizationCommand =
   | { kind: 'folder.ensure-and-move-chats'; input: EnsureFolderAndMoveChatsInput }
 
 export type MessageMutationCommand =
-  | { kind: 'message.edit-content'; input: EditMessageInput }
+  | { kind: 'message.edit-body'; input: EditMessageBodyInput }
   | MessageBodyMutationInput
   | { kind: 'message.import'; input: PasteImportInput }
   | {
@@ -2900,8 +2900,8 @@ export type WorkspaceCommandResult<C extends WorkspaceCommand> = C extends {
                           ? ChatCalibrationEverywhereResult
                           : C extends { kind: 'chat.fork' }
                             ? ForkChatFromMessageResult
-                            : C extends { kind: 'message.edit-content' }
-                              ? EditMessageResult
+                            : C extends { kind: 'message.edit-body' }
+                              ? EditMessageBodyResult
                               : C extends {
                                     kind:
                                       | 'message.toggle-reasoning-detail'

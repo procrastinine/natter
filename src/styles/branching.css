@@ -1003,6 +1003,152 @@
   outline: none;
 }
 
+[data-ui="inline-editor-reasoning"],
+[data-ui="inline-editor-tool-calls"] {
+  border-top: 1px solid var(--color-border-subtle);
+  background: var(--color-bg-surface-2);
+}
+
+[data-ui="inline-editor-reasoning"] > summary,
+[data-ui="inline-editor-tool-calls"] > summary {
+  padding: var(--space-2) var(--space-3);
+  color: var(--color-fg-secondary);
+  cursor: pointer;
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
+}
+
+[data-ui="inline-editor-reasoning-list"],
+[data-ui="inline-editor-tool-call-list"] {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: 0 var(--space-3) var(--space-3);
+}
+
+[data-ui="inline-editor-reasoning-row"],
+[data-ui="inline-editor-tool-call-row"] {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-2);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-surface-1);
+}
+
+[data-ui="inline-editor-reasoning-row"][data-hidden="true"],
+[data-ui="inline-editor-tool-call-row"][data-hidden="true"] {
+  opacity: 0.72;
+}
+
+[data-ui="inline-editor-reasoning-row-header"],
+[data-ui="inline-editor-reasoning-row-identity"],
+[data-ui="inline-editor-reasoning-row-actions"],
+[data-ui="inline-editor-reasoning-add"],
+[data-ui="inline-editor-tool-call-add"] {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+[data-ui="inline-editor-reasoning-row-header"] {
+  justify-content: space-between;
+}
+
+[data-ui="inline-editor-reasoning-row-kind"],
+[data-ui="inline-editor-reasoning-kind"],
+[data-ui="inline-editor-reasoning-owner"] {
+  min-height: 28px;
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-surface-1);
+  color: var(--color-fg-primary);
+  font: inherit;
+  font-size: var(--font-size-xs);
+}
+
+[data-ui="inline-editor-reasoning-owner"],
+[data-ui="inline-editor-reasoning-readonly"] {
+  color: var(--color-fg-muted);
+  font-size: var(--font-size-xs);
+}
+
+[data-ui="inline-editor-reasoning-input"] {
+  width: 100%;
+  min-height: 5rem;
+  padding: var(--space-2);
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-surface-1);
+  color: var(--color-fg-primary);
+  font: inherit;
+  font-size: var(--font-size-sm);
+  resize: vertical;
+}
+
+[data-ui="inline-editor-tool-call-meta"] {
+  display: grid;
+  grid-template-columns: minmax(9rem, 1fr) minmax(8rem, 1fr) minmax(5rem, 0.45fr);
+  gap: var(--space-2);
+}
+
+[data-ui="inline-editor-tool-call-meta"] label {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: var(--space-1);
+  color: var(--color-fg-muted);
+  font-size: var(--font-size-xs);
+}
+
+[data-ui="inline-editor-tool-call-meta"] input,
+[data-ui="inline-editor-tool-call-meta"] select,
+[data-ui="inline-editor-tool-call-add"] select,
+[data-ui="inline-editor-tool-call-input"] {
+  min-width: 0;
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-sm);
+  background: var(--color-bg-surface-1);
+  color: var(--color-fg-primary);
+  font: inherit;
+}
+
+[data-ui="inline-editor-tool-call-meta"] input,
+[data-ui="inline-editor-tool-call-meta"] select,
+[data-ui="inline-editor-tool-call-add"] select {
+  min-height: 28px;
+  padding-inline: var(--space-2);
+}
+
+[data-ui="inline-editor-tool-call-input"] {
+  width: 100%;
+  min-height: 7rem;
+  padding: var(--space-2);
+  resize: vertical;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+}
+
+[data-ui="inline-editor-reasoning-add"],
+[data-ui="inline-editor-tool-call-add"] {
+  flex-wrap: wrap;
+  padding: 0 var(--space-3) var(--space-3);
+}
+
+[data-ui="inline-editor-tool-call-note"] {
+  margin: 0;
+  padding: 0 var(--space-3) var(--space-3);
+  color: var(--color-fg-muted);
+  font-size: var(--font-size-xs);
+}
+
+@media (max-width: 680px) {
+  [data-ui="inline-editor-tool-call-meta"] {
+    grid-template-columns: 1fr;
+  }
+}
+
 [data-ui="inline-editor-actions"] {
   display: flex;
   border-top: 1px solid var(--color-border-subtle);

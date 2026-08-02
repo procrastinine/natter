@@ -295,7 +295,7 @@ describe('send-context freshness', () => {
     const userId = required(prepared.userMessageId, 'prepared user')
 
     await executeMessageCommand({
-      kind: 'message.edit-content',
+      kind: 'message.edit-body',
       input: {
         chatId: chat.id,
         messageId: userId,
@@ -325,7 +325,7 @@ describe('send-context freshness', () => {
     await discovery.started
 
     await executeMessageCommand({
-      kind: 'message.edit-content',
+      kind: 'message.edit-body',
       input: {
         chatId: chat.id,
         messageId: user.id,
@@ -443,8 +443,8 @@ describe('send-context freshness', () => {
       }),
     )
 
-    if (admission.kind === 'staging-required') {
-      throw new Error(`DeepDeleteUnexpectedStaging:${JSON.stringify(admission.reason)}`)
+    if (admission.kind === 'budget-exceeded') {
+      throw new Error(`DeepDeleteUnexpectedRequestBudget:${JSON.stringify(admission.reason)}`)
     }
     expect(await messageHeader(target.id)).toMatchObject({ deleted: true })
     expect(await messageHeader(child.id)).toMatchObject({ parentId: parent.id })
@@ -592,7 +592,7 @@ describe('send-context freshness', () => {
     const messageId = changedMessage === 'target' ? assistant.id : user.id
 
     const edit = executeMessageCommand({
-      kind: 'message.edit-content',
+      kind: 'message.edit-body',
       input: {
         chatId,
         messageId,

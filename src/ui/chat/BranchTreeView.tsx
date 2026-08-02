@@ -24,9 +24,11 @@ import {
   type BranchTreeLayoutNode,
   layoutBranchTree,
 } from '../../core/branch-tree-layout'
+import type { MessageBodyAuthoringOperations } from '../../core/message-body-authoring'
 import type {
   ChatId,
   Message,
+  MessageAttachmentRef,
   MessageId,
   MessageRole,
   ProviderOutputMemberRef,
@@ -133,8 +135,17 @@ interface BranchTreeHeaderLookup {
 }
 
 type BranchTreeAction = (messageId: MessageId, observedTipId?: MessageId) => void | Promise<void>
-type BranchTreeEditAction = (message: Message, text: string) => ConversationMutationSettlement
-type BranchTreeGenerationEditAction = (message: Message, text: string) => GenerationSubmission
+type BranchTreeEditAction = (
+  message: Message,
+  text: string,
+  authoring?: MessageBodyAuthoringOperations,
+  attachmentRefs?: MessageAttachmentRef[],
+) => ConversationMutationSettlement
+type BranchTreeGenerationEditAction = (
+  message: Message,
+  text: string,
+  options?: { prefillText?: string; attachmentRefs?: MessageAttachmentRef[] },
+) => GenerationSubmission
 type BranchTreeMessageMutationAction = (message: Message) => ConversationMutationSettlement
 type BranchTreeGenerationMessageAction = (message: Message) => GenerationSubmission
 type BranchTreeProviderOutputAction = (
@@ -144,6 +155,11 @@ type BranchTreeProviderOutputAction = (
 type BranchTreeReasoningAction = (
   message: Message,
   member: ReasoningMemberRef,
+) => ConversationMutationSettlement
+type BranchTreeReasoningEditAction = (
+  message: Message,
+  member: Extract<ReasoningMemberRef, { kind: 'visible' }>,
+  text: string,
 ) => ConversationMutationSettlement
 type BranchTreeMessageAttachmentAction = (
   message: Message,
@@ -175,6 +191,7 @@ export interface BranchTreeViewProps {
   onToggleMessageContextVisibility?: BranchTreeMessageMutationAction
   onMutateMessageAttachmentRef?: BranchTreeMessageAttachmentAction
   onToggleReasoningDetailHidden?: BranchTreeReasoningAction
+  onEditReasoningDetail?: BranchTreeReasoningEditAction
   onToggleProviderOutputItemHidden?: BranchTreeProviderOutputAction
   onRequestStop?: (capability: RequestableAttemptStopCapability) => void
   generationSubmissionPending?: boolean
@@ -454,6 +471,7 @@ const ActiveBranchTreeView = memo(function ActiveBranchTreeView({
   onToggleMessageContextVisibility,
   onMutateMessageAttachmentRef,
   onToggleReasoningDetailHidden,
+  onEditReasoningDetail,
   onToggleProviderOutputItemHidden,
   onRequestStop,
   generationSubmissionPending = false,
@@ -1303,6 +1321,14 @@ const ActiveBranchTreeView = memo(function ActiveBranchTreeView({
               onToggleReasoningDetailHidden(inspectorMessage, member),
           }
         : {}),
+      ...(onEditReasoningDetail
+        ? {
+            onEditReasoningDetail: (
+              member: Extract<ReasoningMemberRef, { kind: 'visible' }>,
+              text: string,
+            ) => onEditReasoningDetail(inspectorMessage, member, text),
+          }
+        : {}),
       ...(onToggleProviderOutputItemHidden
         ? {
             onToggleProviderOutputItemHidden: (member: ProviderOutputMemberRef) =>
@@ -1316,6 +1342,7 @@ const ActiveBranchTreeView = memo(function ActiveBranchTreeView({
     onForkMessage,
     onMutateMessageAttachmentRef,
     onToggleMessageContextVisibility,
+    onEditReasoningDetail,
     onToggleProviderOutputItemHidden,
     onToggleReasoningDetailHidden,
   ])

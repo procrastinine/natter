@@ -1,5 +1,6 @@
 import { fireEvent, render } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { conversationActions } from '../../src/app/conversation-actions'
 import type {
   ConversationMutationRunner,
   GenerationSubmission,
@@ -83,11 +84,13 @@ describe('message-list current presentation contract', () => {
     expect(log).toHaveAttribute('data-total-count', '5')
   })
 
-  it('renders the terminal point immediately as one explicitly provisional read-only row', () => {
+  it('renders an exact terminal point immediately with the same command authority as a full binding', () => {
     const fixture = branchFixture(96, { bodyPrefix: 'point-body' })
     const message = fixture.messages.at(-1)
     const header = fixture.headers.at(-1)
     if (!message || !header) throw new Error('PointFixtureMissing')
+    const runMutation = vi.fn(RUN_MUTATION)
+    const forkMessage = vi.spyOn(conversationActions, 'forkMessage').mockResolvedValue()
     const view = render(
       <MessageListPoint
         kind="point"
@@ -98,18 +101,38 @@ describe('message-list current presentation contract', () => {
           message,
           bodyVersion: header.bodyVersion,
         })}
+        runConversationMutation={runMutation}
+        chatSettings={BASE_SETTINGS}
+        prefillPlan={PREFILL_UNAVAILABLE_PLAN}
+        onEditAndSendMessage={STARTED_GENERATION}
+        onRegenerateMessage={STARTED_GENERATION}
+        onContinueMessage={STARTED_GENERATION}
       />,
     )
 
     const log = view.getByRole('log')
     expect(log).toHaveAttribute('data-presentation-kind', 'point')
-    expect(log).toHaveAttribute('data-presentation-only', 'true')
+    expect(log).not.toHaveAttribute('data-presentation-only')
     expect(log).toHaveAttribute('data-rendered-count', '1')
     expect(log).toHaveAttribute('data-branch-counts', 'pending')
     expect(log).not.toHaveAttribute('data-total-count')
     expect(view.getByText('point-body 95')).toBeVisible()
-    expect(view.getByRole('button', { name: 'Edit message' })).toBeDisabled()
-    expect(view.getByRole('button', { name: 'Delete message' })).toBeDisabled()
+    expect(view.getByRole('button', { name: 'Edit message' })).toBeEnabled()
+    expect(view.getByRole('button', { name: 'Branch this chat from here' })).toBeEnabled()
+    expect(
+      view.getByRole('button', { name: 'Hide from context (never send to model)' }),
+    ).toBeEnabled()
+    expect(view.getByRole('button', { name: 'Delete message' })).toBeEnabled()
+    fireEvent.click(view.getByRole('button', { name: 'Branch this chat from here' }))
+    expect(runMutation).toHaveBeenCalledWith(
+      { kind: 'fork', chatId: CHAT_ID, messageId: 'message-95' },
+      expect.any(Function),
+    )
+    const [forkChatId, forkedMessage, forkSignal] = forkMessage.mock.calls[0] ?? []
+    expect(forkChatId).toBe(CHAT_ID)
+    expect(forkedMessage?.id).toBe(message.id)
+    expect(forkSignal?.aborted).toBe(false)
+    forkMessage.mockRestore()
 
     const retained = view.container.querySelector<HTMLElement>('[data-message-id="message-95"]')
     if (!retained) throw new Error('PointTerminalMissing')

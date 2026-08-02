@@ -831,7 +831,7 @@ describe('generation mode contract', () => {
     const { chatId, target, handle, gate } = await activeContinue('edited')
     await expect(
       executeMessageCommand({
-        kind: 'message.edit-content',
+        kind: 'message.edit-body',
         input: {
           chatId,
           messageId: target.id,

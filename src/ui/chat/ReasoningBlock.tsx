@@ -16,11 +16,14 @@
 // Per-row hide toggles address stable envelope member identities. Hidden
 // members remain on disk but are omitted from the next-turn wire projection.
 
-import { memo, useEffect, useRef, useState } from 'react'
+import { type KeyboardEvent, memo, useEffect, useRef, useState } from 'react'
 import type { ConversationMutationSettlement } from '../../app/presentation-interactions'
 import type { ReasoningPresentation } from '../../core/reasoning-envelope'
 import type { ReasoningMemberRef } from '../../core/types'
+import { PencilIcon } from '../icons/Icon'
 import { Button } from '../primitives/Button'
+
+type VisibleReasoningMemberRef = Extract<ReasoningMemberRef, { kind: 'visible' }>
 
 interface ReasoningBlockProps {
   presentation: ReasoningPresentation
@@ -35,6 +38,11 @@ interface ReasoningBlockProps {
   // don't render (read-only view).
   onToggleHidden?: (member: ReasoningMemberRef) => ConversationMutationSettlement
   toggleHiddenDisabled?: boolean
+  onEditVisible?: (
+    member: VisibleReasoningMemberRef,
+    text: string,
+  ) => ConversationMutationSettlement
+  editDisabled?: boolean
 }
 
 export const ReasoningBlock = memo(function ReasoningBlock({
@@ -44,6 +52,8 @@ export const ReasoningBlock = memo(function ReasoningBlock({
   hasContent = false,
   onToggleHidden,
   toggleHiddenDisabled = false,
+  onEditVisible,
+  editDisabled = false,
 }: ReasoningBlockProps) {
   const parts = presentation
   const total = presentation.rowCount
@@ -113,6 +123,21 @@ export const ReasoningBlock = memo(function ReasoningBlock({
                   kind="summary"
                   hidden={entry.part.hidden === true}
                   toggleHiddenDisabled={toggleHiddenDisabled}
+                  editDisabled={editDisabled}
+                  {...(entry.text !== undefined ? { initialText: entry.text } : {})}
+                  {...(onEditVisible && !entry.valueSections
+                    ? {
+                        onEdit: (text: string) =>
+                          onEditVisible(
+                            {
+                              owner: entry.owner,
+                              kind: 'visible',
+                              id: entry.part.id,
+                            },
+                            text,
+                          ),
+                      }
+                    : {})}
                   {...(onToggleHidden
                     ? {
                         onToggleHidden: () =>
@@ -137,6 +162,21 @@ export const ReasoningBlock = memo(function ReasoningBlock({
                   kind="text"
                   hidden={entry.part.hidden === true}
                   toggleHiddenDisabled={toggleHiddenDisabled}
+                  editDisabled={editDisabled}
+                  {...(entry.text !== undefined ? { initialText: entry.text } : {})}
+                  {...(onEditVisible && !entry.valueSections
+                    ? {
+                        onEdit: (text: string) =>
+                          onEditVisible(
+                            {
+                              owner: entry.owner,
+                              kind: 'visible',
+                              id: entry.part.id,
+                            },
+                            text,
+                          ),
+                      }
+                    : {})}
                   {...(onToggleHidden
                     ? {
                         onToggleHidden: () =>
@@ -190,49 +230,147 @@ export const ReasoningBlock = memo(function ReasoningBlock({
 function ReasoningRow({
   kind,
   hidden,
+  initialText,
+  onEdit,
+  editDisabled = false,
   onToggleHidden,
   toggleHiddenDisabled = false,
   children,
 }: {
   kind: 'summary' | 'text' | 'encrypted'
   hidden: boolean
+  initialText?: string
+  onEdit?: (text: string) => ConversationMutationSettlement
+  editDisabled?: boolean
   onToggleHidden?: () => ConversationMutationSettlement
   toggleHiddenDisabled?: boolean
   children: React.ReactNode
 }) {
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState('')
+  const [busy, setBusy] = useState(false)
+  const editorRef = useRef<HTMLTextAreaElement | null>(null)
+  const editLabel = kind === 'summary' ? 'Edit reasoning summary' : 'Edit reasoning details'
+  useEffect(() => {
+    if (editing) editorRef.current?.focus()
+  }, [editing])
+  const beginEdit = () => {
+    if (initialText === undefined || editDisabled) return
+    setDraft(initialText)
+    setEditing(true)
+  }
+  const cancelEdit = () => {
+    if (busy) return
+    setEditing(false)
+  }
+  const saveEdit = () => {
+    if (!onEdit || initialText === undefined || editDisabled || busy) return
+    if (draft === initialText) {
+      setEditing(false)
+      return
+    }
+    setBusy(true)
+    void onEdit(draft).then((outcome) => {
+      setBusy(false)
+      if (outcome.kind === 'succeeded') setEditing(false)
+    })
+  }
+  const handleEditorKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (event.key === 'Escape') {
+      event.preventDefault()
+      cancelEdit()
+      return
+    }
+    if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+      event.preventDefault()
+      saveEdit()
+    }
+  }
+
   return (
     <div
       data-ui="reasoning-row"
       data-reasoning-kind={kind}
       data-hidden={hidden ? 'true' : undefined}
     >
-      <p
-        data-ui="reasoning-row-body"
-        {...(kind === 'encrypted' ? { 'data-state': 'encrypted' } : {})}
-      >
-        {children}
-      </p>
-      {onToggleHidden ? (
-        <Button
-          type="button"
-          data-ui="reasoning-row-hide"
-          data-pressed={hidden ? 'true' : undefined}
-          onClick={() => {
-            void onToggleHidden()
-          }}
-          disabled={toggleHiddenDisabled}
-          aria-label={hidden ? 'Unhide this reasoning block' : 'Hide this reasoning block'}
-          title={
-            toggleHiddenDisabled
-              ? 'Wait for this generation to finish before changing reasoning visibility.'
-              : hidden
-                ? 'Hidden — preserved on disk, skipped on next-turn echo. Click to unhide.'
-                : 'Hide this reasoning block (kept on disk, skipped on echo).'
-          }
-        >
-          {hidden ? <EyeOffIcon /> : <EyeIcon />}
-        </Button>
-      ) : null}
+      {editing ? (
+        <div data-ui="reasoning-row-editor">
+          <textarea
+            ref={editorRef}
+            data-ui="reasoning-row-editor-input"
+            value={draft}
+            onChange={(event) => setDraft(event.currentTarget.value)}
+            onKeyDown={handleEditorKeyDown}
+            disabled={busy || editDisabled}
+            aria-label={editLabel}
+          />
+          <div data-ui="reasoning-row-editor-actions">
+            <Button type="button" appearance="ghost" size="xs" onClick={cancelEdit} disabled={busy}>
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              tone="accent"
+              appearance="solid"
+              size="xs"
+              onClick={saveEdit}
+              disabled={busy || editDisabled}
+            >
+              {busy ? 'Saving…' : 'Save'}
+            </Button>
+          </div>
+        </div>
+      ) : (
+        <>
+          <p
+            data-ui="reasoning-row-body"
+            {...(kind === 'encrypted' ? { 'data-state': 'encrypted' } : {})}
+          >
+            {children}
+          </p>
+          {onEdit || onToggleHidden ? (
+            <div data-ui="reasoning-row-actions">
+              {onEdit && initialText !== undefined ? (
+                <Button
+                  type="button"
+                  data-ui="reasoning-row-edit"
+                  onClick={beginEdit}
+                  disabled={editDisabled}
+                  aria-label={editLabel}
+                  title={
+                    editDisabled
+                      ? 'Wait for this generation to finish before editing reasoning.'
+                      : editLabel
+                  }
+                >
+                  <PencilIcon size={12} />
+                </Button>
+              ) : null}
+              {onToggleHidden ? (
+                <Button
+                  type="button"
+                  data-ui="reasoning-row-hide"
+                  data-pressed={hidden ? 'true' : undefined}
+                  onClick={() => {
+                    void onToggleHidden()
+                  }}
+                  disabled={toggleHiddenDisabled}
+                  aria-label={hidden ? 'Unhide this reasoning block' : 'Hide this reasoning block'}
+                  title={
+                    toggleHiddenDisabled
+                      ? 'Wait for this generation to finish before changing reasoning visibility.'
+                      : hidden
+                        ? 'Hidden — preserved on disk, skipped on next-turn echo. Click to unhide.'
+                        : 'Hide this reasoning block (kept on disk, skipped on echo).'
+                  }
+                >
+                  {hidden ? <EyeOffIcon /> : <EyeIcon />}
+                </Button>
+              ) : null}
+            </div>
+          ) : null}
+        </>
+      )}
     </div>
   )
 }

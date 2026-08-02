@@ -1,3 +1,4 @@
+import type { MessageBodyAuthoringOperations } from '../core/message-body-authoring'
 import type { PasteImportSlot } from '../core/messages'
 import type {
   ChatId,
@@ -20,7 +21,8 @@ import {
   deleteTurnOp,
   deleteVariantOp,
   dismissMessageGenerationNotice,
-  editInPlace,
+  editMessageBody,
+  editReasoningDetail,
   importMessagesOp,
   isConversationTargetBusyError,
   mutateMessageAttachmentReference,
@@ -271,9 +273,11 @@ export const conversationActions = {
     message: Message,
     text: string,
     signal?: AbortSignal,
+    authoring?: MessageBodyAuthoringOperations,
+    attachmentRefs?: MessageAttachmentRef[],
   ): Promise<void> {
     try {
-      await editInPlace(chatId, message, text, signal)
+      await editMessageBody(chatId, message, text, signal, authoring, attachmentRefs)
     } catch (error) {
       throw actionError('Edit', error)
     }
@@ -405,6 +409,18 @@ export const conversationActions = {
     })
   },
 
+  editReasoning(
+    chatId: ChatId,
+    message: Message,
+    member: Extract<ReasoningMemberRef, { kind: 'visible' }>,
+    text: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    return runConversationAction('Reasoning edit', async () => {
+      await editReasoningDetail(chatId, message, member, text, signal)
+    })
+  },
+
   toggleProviderOutput(
     chatId: ChatId,
     message: Message,
@@ -510,7 +526,12 @@ export const conversationActions = {
     })
   },
 
-  async forkMessage(chatId: ChatId, message: Message, signal?: AbortSignal): Promise<void> {
+  async forkMessage(
+    chatId: ChatId,
+    message: Message,
+    signal?: AbortSignal,
+    reportPhase?: (phase: 'repository-requested' | 'local-applied') => void,
+  ): Promise<void> {
     const routeIntent = beginRouteIntent()
     try {
       const sourceChat = await getChat(chatId)
@@ -524,6 +545,18 @@ export const conversationActions = {
       if (chosen === null) return
       const title = chosen.trim() || defaultTitle
       const forkChatId = newId()
+      reportPhase?.('repository-requested')
+      const result = await forkChatFromMessage(
+        {
+          chatId,
+          messageId: message.id,
+          title,
+          destinationChatId: forkChatId,
+        },
+        undefined,
+        signal,
+      )
+      if (!isRouteIntentCurrent(routeIntent)) return
       const operation = conversationController.claimOperation({
         chatId: forkChatId,
         steering: 'select-result',
@@ -533,28 +566,14 @@ export const conversationActions = {
       let routeDelivery: ConversationRouteDelivery | undefined
       let routeHandoffTransferred = false
       try {
-        const result = await forkChatFromMessage(
-          {
-            chatId,
-            messageId: message.id,
-            title,
-            destinationChatId: forkChatId,
-          },
-          (committed) => {
-            const receipt = conversationController.acceptLocalResult(operation, {
-              kind: 'select-committed',
-              receipt: committed,
-              committedEffect: committed.committedEffect,
-            })
-            if (receipt.accepted) routeDelivery = receipt.routeDelivery
-          },
-          signal,
-        )
-        if (!isRouteIntentCurrent(routeIntent)) {
-          if (routeDelivery?.kind === 'handoff') routeDelivery.handoff.cancel()
-          return
-        }
+        const receipt = conversationController.acceptLocalResult(operation, {
+          kind: 'select-committed',
+          receipt: result,
+          committedEffect: result.committedEffect,
+        })
+        if (receipt.accepted) routeDelivery = receipt.routeDelivery
         if (!routeDelivery) throw new Error('ForkRouteDeliveryMissing')
+        reportPhase?.('local-applied')
         useToastStore.getState().push({
           level: 'success',
           text: `Forked to "${title}" (${result.messageCount} messages).`,

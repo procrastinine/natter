@@ -164,7 +164,9 @@ describe('stream profile evaluator', () => {
   it('rejects concurrent under-admission, retained state, reload corruption, and diagnostics', () => {
     const report = passingConcurrentReport()
     report.applicationAdmissionPhases.currentTurn.observed = 99
-    report.pageStates.at(0)!.activeCount = 1
+    const firstPage = report.pageStates.at(0)
+    if (!firstPage) throw new Error('expected at least one concurrent profile page')
+    firstPage.activeCount = 1
     report.afterReload.failures.push('corrupt')
     report.consoleProblems.push({ type: 'warning', text: 'unexpected' })
 

@@ -7,6 +7,7 @@ import {
   holdIndexedDbStoreGate,
   mockChatCompletions,
   seedFirstRun,
+  sendMessage,
 } from './helpers'
 
 test.beforeEach(async ({ page }) => {
@@ -142,6 +143,74 @@ test('composer can be resized below its content and scrolls internally', async (
 
   await input.fill(`${draft}\nnew automatic line`)
   expect(await input.evaluate((node) => node.clientHeight)).toBeGreaterThan(resetHeight)
+})
+
+test('inline editor autosize tracks wrapped content width without spare lines', async ({
+  page,
+}) => {
+  await mockChatCompletions(page, {
+    body: buildSseBody([{ id: 'inline-editor-sizing', content: 'ok', finish: 'stop' }]),
+  })
+  await sendMessage(page, 'edit sizing')
+  await expect(
+    page.locator('[data-ui="message"][data-role="assistant"] [data-ui="message-body"]'),
+  ).toHaveText('ok')
+
+  const userMessage = page.locator('[data-ui="message"][data-role="user"]')
+  await userMessage.getByRole('button', { name: 'Edit message' }).click()
+  const input = userMessage.locator('[data-ui="inline-editor-input"]')
+  const metrics = () =>
+    input.evaluate((node) => {
+      const style = getComputedStyle(node)
+      return {
+        boxSizing: style.boxSizing,
+        clientHeight: node.clientHeight,
+        cssHeight: Number.parseFloat(style.height),
+        maxHeight: Number.parseFloat(style.maxHeight),
+        overflowY: style.overflowY,
+        renderedHeight: node.getBoundingClientRect().height,
+        scrollHeight: node.scrollHeight,
+      }
+    })
+
+  await input.fill('short edit')
+  const short = await metrics()
+  await input.fill('short edit with more unwrapped text')
+  const extended = await metrics()
+  expect(extended.renderedHeight).toBeCloseTo(short.renderedHeight, 1)
+  expect(short.overflowY).toBe('hidden')
+  expect(extended.overflowY).toBe('hidden')
+  expect(extended.boxSizing).toBe('border-box')
+  expect(extended.renderedHeight).toBeCloseTo(extended.cssHeight, 1)
+
+  await input.fill('responsive wrapping '.repeat(50))
+  const wide = await metrics()
+  await page.evaluate(() => {
+    document.documentElement.style.setProperty('--message-max-width', '420px')
+  })
+  await expect
+    .poll(() => metrics().then((value) => value.renderedHeight))
+    .toBeGreaterThan(wide.renderedHeight)
+  const narrow = await metrics()
+  expect(narrow.overflowY).toBe('hidden')
+  expect(narrow.renderedHeight).toBeGreaterThan(wide.renderedHeight)
+
+  await page.evaluate(() => {
+    document.documentElement.style.setProperty('--message-max-width', '920px')
+  })
+  await expect
+    .poll(() => metrics().then((value) => value.renderedHeight))
+    .toBeCloseTo(wide.renderedHeight, 1)
+
+  await input.fill(Array.from({ length: 80 }, (_, index) => `line ${index}`).join('\n'))
+  await expect.poll(metrics).toMatchObject({
+    boxSizing: 'border-box',
+    overflowY: 'auto',
+  })
+  const capped = await metrics()
+  expect(capped.renderedHeight).toBeLessThanOrEqual(capped.maxHeight + 0.5)
+  expect(capped.renderedHeight).toBeCloseTo(capped.cssHeight, 1)
+  expect(capped.scrollHeight).toBeGreaterThan(capped.clientHeight)
 })
 
 test('composer input overscroll backing matches the input surface', async ({ page }) => {

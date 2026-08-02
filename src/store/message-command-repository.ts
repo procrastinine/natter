@@ -1,9 +1,9 @@
 import { TOKEN_CALIBRATION_MODE_KEY, tokenCalibrationModeFromStored } from '../core/global-settings'
 import {
+  type EditMessageBodyInput,
+  type EditMessageBodyResult,
   type EditMessageCalibrationSnapshot,
-  type EditMessageInput,
-  type EditMessageResult,
-  editMessageContentInRepository as editMessageContentInCoreRepository,
+  editMessageBodyInRepository as editMessageBodyInCoreRepository,
   type MessageEditPreflightReader,
   type MessageMutationRepository,
 } from '../core/messages'
@@ -31,9 +31,9 @@ export async function captureEditMessageCalibration(
   }
 }
 
-export function editMessageContentInRepository(
+export function editMessageBodyInRepository(
   repo: MessageMutationRepository,
-  input: EditMessageInput,
-): Promise<EditMessageResult> {
-  return editMessageContentInCoreRepository(repo, input, captureEditMessageCalibration)
+  input: EditMessageBodyInput,
+): Promise<EditMessageBodyResult> {
+  return editMessageBodyInCoreRepository(repo, input, captureEditMessageCalibration)
 }

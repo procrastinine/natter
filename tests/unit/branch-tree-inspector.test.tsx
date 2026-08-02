@@ -290,7 +290,7 @@ describe('BranchTreeInspector', () => {
     expect(onDelete).not.toHaveBeenCalled()
   })
 
-  it('renders structured reasoning while keeping in-place edits strictly text-only', async () => {
+  it('renders the complete assistant body authoring surface', async () => {
     const reasoningEnvelope = reasoningEnvelopeFromDetailsForTest(
       [
         {
@@ -335,8 +335,12 @@ describe('BranchTreeInspector', () => {
     )
     fireEvent.click(screen.getByRole('button', { name: 'Edit message' }))
     const editor = screen.getByRole('textbox', { name: 'Edit assistant message' })
-    expect(screen.queryByRole('button', { name: 'Upload attachment' })).not.toBeInTheDocument()
-    expect(screen.queryByLabelText('Edit reasoning summary 1')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Upload attachment' })).toBeInTheDocument()
+    expect(screen.getByRole('combobox', { name: 'Reasoning block type' })).toBeInTheDocument()
+    fireEvent.click(screen.getByText('Tool calls (1)'))
+    expect(
+      await screen.findByRole('textbox', { name: 'Edit tool call JSON or text' }),
+    ).toBeInTheDocument()
     fireEvent.change(editor, { target: { value: '  Updated inspector body.  ' } })
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
 
@@ -510,7 +514,9 @@ describe('BranchTreeInspector', () => {
     const editor = screen.getByRole('textbox', { name: 'Edit user message' })
     fireEvent.change(editor, { target: { value: 'Edited prompt' } })
     fireEvent.click(screen.getByRole('button', { name: 'Save & Send' }))
-    await waitFor(() => expect(onEditAndSend).toHaveBeenCalledWith(userMessage, 'Edited prompt'))
+    await waitFor(() =>
+      expect(onEditAndSend).toHaveBeenCalledWith(userMessage, 'Edited prompt', {}),
+    )
     expect(await screen.findByRole('alert')).toHaveTextContent('Temporary send failure')
     expect(screen.getByRole('textbox', { name: 'Edit user message' })).toHaveValue('Edited prompt')
 
@@ -571,7 +577,7 @@ describe('BranchTreeInspector', () => {
     fireEvent.change(editor, { target: { value: 'Still local' } })
     fireEvent.click(screen.getByRole('button', { name: 'Save & Send' }))
 
-    expect(onEditAndSend).toHaveBeenCalledWith(userMessage, 'Still local')
+    expect(onEditAndSend).toHaveBeenCalledWith(userMessage, 'Still local', {})
     expect(screen.getByRole('textbox', { name: 'Edit user message' })).toHaveValue('Still local')
     expect(screen.getByRole('alert')).toHaveTextContent(
       'This branch is still preparing. Save & Send did not start.',

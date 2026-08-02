@@ -569,6 +569,7 @@ export function ChatModelPanel({
             <ParamForm
               chat={presentationChat}
               capability={capability}
+              assistantRouteKind={assistantRouting?.kind}
               textTemplateMode={textTemplateMode}
               llamaProps={llamaProps}
               connectionKind={presentationProfile?.kind ?? 'custom'}

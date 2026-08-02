@@ -194,9 +194,14 @@ const SOURCE_BEHAVIOR_TESTS = {
   'ui/chat/FocusModeToggle.tsx': ['unit/shell.test.tsx', 'e2e/focus-mode-layout.spec.ts'],
   'ui/chat/HeaderPrivacyBadge.tsx': ['e2e/advanced-generation-routing.spec.ts'],
   'ui/chat/ImportModal.tsx': ['unit/import-modal.test.tsx'],
-  'ui/chat/InlineEditor.tsx': ['unit/message-actions.test.tsx', 'e2e/branch-tree.spec.ts'],
+  'ui/chat/InlineEditor.tsx': [
+    'unit/composer.test.tsx',
+    'unit/message-actions.test.tsx',
+    'e2e/branch-tree.spec.ts',
+    'e2e/reasoning-ui.spec.ts',
+  ],
   'ui/chat/MarkdownView.tsx': ['unit/markdown-view.test.tsx', 'e2e/markdown.spec.ts'],
-  'ui/chat/Message.tsx': ['unit/message-header.test.tsx'],
+  'ui/chat/Message.tsx': ['unit/message-header.test.tsx', 'e2e/reasoning-ui.spec.ts'],
   'ui/chat/MessageActions.tsx': ['unit/message-actions.test.tsx'],
   'ui/chat/MessageContent.tsx': ['unit/message-content.test.tsx'],
   'ui/chat/MessageList.tsx': [

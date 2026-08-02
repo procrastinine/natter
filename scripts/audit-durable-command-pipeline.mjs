@@ -37,10 +37,7 @@ const PRESET_ORDER_PATH = 'src/store/preset-order.ts'
 const MUTATION_JOURNAL_PATH = 'src/store/browser-command-mutation-journal.ts'
 const DATABASE_PATH = 'src/store/db.ts'
 const BROWSER_WORKSPACE_LIFECYCLE_PATH = 'src/store/browser-workspace-lifecycle.ts'
-const BROWSER_WORKSPACE_REPLACEMENT_RUNNER_PATH =
-  'src/store/browser-workspace-replacement-runner.ts'
-const BROWSER_STAGED_FANOUT_COMMAND_PATH = 'src/store/browser-staged-fanout-command.ts'
-const BROWSER_WORKSPACE_STAGED_FANOUT_PATH = 'src/store/browser-workspace-staged-fanout.ts'
+const STORAGE_MAINTENANCE_RUNTIME_PATH = 'src/store/storage-maintenance-runtime.ts'
 const STORAGE_COMPACTION_STATE_PATH = 'src/store/storage-compaction-state.ts'
 const WORKSPACE_REPOSITORY_PATH = 'src/store/workspace-repository.ts'
 const WORKSPACE_EFFECT_HUB_PATH = 'src/store/workspace-effect-hub.ts'
@@ -66,12 +63,6 @@ const COMMAND_TRANSACTION_BOUNDARY_PATHS = [
   'src/store/browser-domain-mutations.ts',
 ]
 const VALID_STAGE_STATUSES = new Set(['observed', 'gap'])
-const B16_BOUNDS_CARRY_OWNERS = Object.freeze({
-  'F-B1-08': 'B2',
-  'F-B1-09': 'B2',
-  'F-B1-10': 'B2',
-  'F-B1-14': 'B2',
-})
 const GENERATED_OUTPUT_LOCALIZATION_VARIANTS = Object.freeze([
   'generated-output.localization-claim',
   'generated-output.localization-complete',
@@ -539,11 +530,9 @@ export function buildDurableCommandPipelineSourceFacts(options = {}) {
     }
     semanticCapabilities.set(kind, capability)
   }
-  const stagedFanoutFamily = stagedFanoutCapabilityFacts(
+  const foregroundStorageLocalityFamily = foregroundStorageLocalityFacts(
     program,
     browserRepoSource,
-    fanoutAdmissionUnion,
-    replacementWorkUnion,
     sourceArchitectureProblems,
   )
   const b16BoundsClassification = classifyB16RemainingBounds(
@@ -560,7 +549,7 @@ export function buildDurableCommandPipelineSourceFacts(options = {}) {
       chatClosureFamily,
       chatForkFamily,
       interchangeImportFamily,
-      stagedFanoutFamily,
+      foregroundStorageLocalityFamily,
     },
     sourceArchitectureProblems,
   )
@@ -625,7 +614,7 @@ export function buildDurableCommandPipelineSourceFacts(options = {}) {
     chatClosureFamily,
     chatForkFamily,
     interchangeImportFamily,
-    stagedFanoutFamily,
+    foregroundStorageLocalityFamily,
     b16BoundsClassification,
     sourceArchitectureProblems: Object.freeze(sourceArchitectureProblems.sort()),
     physicalTables: Object.freeze(
@@ -637,148 +626,229 @@ export function buildDurableCommandPipelineSourceFacts(options = {}) {
   })
 }
 
-function stagedFanoutCapabilityFacts(
-  program,
-  browserRepoSource,
-  fanoutAdmissionUnion,
-  replacementWorkUnion,
-  outputProblems,
-) {
-  const commandSource = exactSource(program, BROWSER_STAGED_FANOUT_COMMAND_PATH)
-  const stagedSource = exactSource(program, BROWSER_WORKSPACE_STAGED_FANOUT_PATH)
-  const replacementSource = exactSource(program, BROWSER_WORKSPACE_REPLACEMENT_RUNNER_PATH)
+function foregroundStorageLocalityFacts(program, browserRepoSource, outputProblems) {
+  const maintenanceSource = exactSource(program, STORAGE_MAINTENANCE_RUNTIME_PATH)
   const mutationJournalSource = exactSource(program, MUTATION_JOURNAL_PATH)
   const executeText = findMethod(
     browserRepoSource,
     'BrowserWorkspaceRepository',
     'execute',
   ).getText(browserRepoSource)
-  const budgetText = findMethod(
+  const directText = findMethod(
     browserRepoSource,
     'BrowserWorkspaceRepository',
-    'tryExecuteCommandWithinFanoutBudget',
+    'executeDirectCommand',
   ).getText(browserRepoSource)
-  const stagedExecuteText = findMethod(
-    browserRepoSource,
-    'BrowserWorkspaceRepository',
-    'executeStagedCommand',
-  ).getText(browserRepoSource)
-  const databaseExecuteText = findMethod(
+  const databaseText = findMethod(
     browserRepoSource,
     'BrowserWorkspaceRepository',
     'executeCommandInDatabase',
   ).getText(browserRepoSource)
-  const operationText = findFunction(stagedSource, 'stagedFanoutOperation').getText(stagedSource)
-  const copyText = findFunction(stagedSource, 'copyStagedWorkspace').getText(stagedSource)
-  const copyPageText = findFunction(stagedSource, 'readStagedCopyPage').getText(stagedSource)
-  const catchupText = findFunction(stagedSource, 'drainStagedWorkspaceCatchup').getText(
-    stagedSource,
+  const sessionBindingText = findFunction(browserRepoSource, 'bindRepositoryToSession').getText(
+    browserRepoSource,
   )
-  const catchupPageText = findFunction(stagedSource, 'readStagedCatchupPage').getText(stagedSource)
-  const conflictText = findFunction(stagedSource, 'assertNoStagedCommandConflict').getText(
-    stagedSource,
-  )
-  const replacementLaunchText = findFunction(
-    replacementSource,
-    'runGatedBrowserWorkspaceReplacementAttempt',
-  ).getText(replacementSource)
-  const workspaceVariants = literalArrayValues(commandSource, 'STAGED_WORKSPACE_COMMAND_KINDS')
-  const configurationVariants = literalArrayValues(
-    commandSource,
-    'STAGED_CONFIGURATION_COMMAND_KINDS',
-  )
-  const semanticVariants = literalArrayValues(
-    commandSource,
-    'BROWSER_WORKSPACE_STAGED_FANOUT_SEMANTIC_VARIANTS',
-  )
+  const productionText = program
+    .getSourceFiles()
+    .filter((source) =>
+      source.fileName.replaceAll('\\', '/').startsWith(`${SRC_ROOT.replaceAll('\\', '/')}/`),
+    )
+    .map((source) => source.getText())
+    .join('\n')
+  const wholeCollectionReadSites = productionWholeCollectionReadSites(program)
+  const reviewedWholeCollectionReadSites = Object.freeze([
+    'src/backcompat/attachment-reference-edges.ts#rebuildAttachmentReferenceEdges:toCollection',
+    'src/backcompat/attachment-refs.ts#normalizeAttachmentRefOwners:toCollection',
+    'src/backcompat/attachment-refs.ts#normalizeAttachmentRefOwners:toCollection',
+    'src/backcompat/chat-preview-projection.ts#earliestLiveUserHeaders:each',
+    'src/backcompat/generation-attempt-outcomes.ts#migrateGenerationAttemptOutcomes:toCollection',
+    'src/backcompat/generation-attempt-outcomes.ts#migrateGenerationAttemptOutcomes:toCollection',
+    'src/backcompat/provider-tools.ts#migrateProviderToolSettingsRows:toCollection',
+    'src/backcompat/provider-tools.ts#migrateProviderToolSettingsRows:toCollection',
+    'src/backcompat/stream-lease-attempts.ts#migrateStreamLeaseAttempts:toCollection',
+    'src/backcompat/token-calibration-global.ts#canonicalizeTokenCalibrationRows:toCollection',
+    'src/backcompat/wave-a-derived-storage-v94.ts#rebuildChildSlotsV94:openCursor',
+    'src/backcompat/wave-a-derived-storage-v94.ts#rebuildOrganizationAndChatSidebarV94:openCursor',
+    'src/backcompat/wave-a-derived-storage-v94.ts#rebuildOrganizationAndChatSidebarV94:openCursor',
+    'src/backcompat/wave-a-derived-storage-v94.ts#rebuildOrganizationAndChatSidebarV94:primaryKeys',
+    'src/backcompat/wave-a-derived-storage-v94.ts#rebuildOrganizationAndChatSidebarV94:toCollection',
+    'src/backcompat/wave-a-message-storage-v94.ts#migrateWaveAAttachmentRowsV94:openCursor',
+    'src/backcompat/wave-a-message-storage-v94.ts#migrateWaveAAttachmentRowsV94:openCursor',
+    'src/backcompat/wave-a-preset-order-v94.ts#hasPresetOrderStageAfterV94:openKeyCursor',
+    'src/backcompat/wave-a-preset-order-v94.ts#rebuildPresetOrderFromStagingV94:getAll',
+    'src/backcompat/wave-a-stream-storage-v94.ts#rewriteStreamJournalV94:openCursor',
+    'src/backcompat/wave-a-stream-storage-v94.ts#terminalizeStrandedGenerationHeadersV94:openCursor',
+    'src/backcompat/wave-a-stream-storage-v94.ts#terminalizeStrandedGenerationHeadersV94:openCursor',
+    'src/store/bounded-idb-cursor.ts#forEachBoundedIdbCursorPage:openCursor',
+    'src/store/bounded-idb-cursor.ts#forEachBoundedIdbKeyedPairPage:openCursor',
+    'src/store/bounded-idb-cursor.ts#forEachBoundedIdbKeyedPairPage:openCursor',
+    'src/store/browser-catalog-command-runtime.ts#ensureFolderAndMoveChats:each',
+    'src/store/browser-catalog-queries.ts#readSidebarPresentationPage:toArray',
+    'src/store/browser-catalog-queries.ts#readSidebarPresentationPage:toArray',
+    'src/store/browser-command-mutation-journal.ts#<module>:openCursor',
+    'src/store/browser-import-export.ts#estimateBrowserWorkspaceLiveBytes:each',
+    'src/store/browser-import-export.ts#readCollectionInPages:each',
+    'src/store/browser-import-export.ts#uniquePresetName:each',
+    'src/store/browser-import-export.ts#workspaceReplacementBlockersInTransaction:each',
+    'src/store/browser-workspace-compaction.ts#readCopyPage:openCursor',
+    'src/store/browser-workspace-database-control.ts#constructor:toCollection',
+    'src/store/browser-workspace-startup-repair.ts#readRawPage:openCursor',
+    'src/store/byte-owner-mutation.ts#deleteChatOwnedPhysicalStorageCollectionWithKnownBytes:primaryKeys',
+    'src/store/byte-owner-mutation.ts#deletePhysicalStorageCollection:each',
+    'src/store/chat-storage-ownership.ts#deleteKnownChatClosure:each',
+    ...Array.from({ length: 12 }, () => 'src/store/db.ts#registerSchema:toCollection'),
+    'src/store/preset-order.ts#readPresetOrderIds:toArray',
+    'src/store/text-template-storage.ts#readTextTemplateCatalog:keys',
+  ])
   const commonKernel = Object.freeze({
-    exactVariantInventory:
-      workspaceVariants.length === 24 &&
-      configurationVariants.length === 4 &&
-      semanticVariants.length === 28 &&
-      new Set(semanticVariants).size === semanticVariants.length,
-    exactFanoutAdmissionProtocol:
-      sameSortedValues(fanoutAdmissionUnion.variants, ['committed', 'staging-required']) &&
-      budgetText.includes("kind: 'committed'") &&
-      budgetText.includes("kind: 'staging-required'") &&
-      executeText.includes("admission.kind === 'committed'") &&
-      executeText.includes('executeBrowserWorkspaceStagedFanoutCommand'),
-    exactReplacementWorkProtocol:
-      sameSortedValues(replacementWorkUnion.variants, ['online', 'quiesced']) &&
-      replacementSource.getText().includes('quiescedBrowserWorkspaceReplacementWork(operation)') &&
-      replacementSource.getText().includes('onlineBrowserWorkspaceReplacementWork(operation)') &&
-      replacementLaunchText.includes("work.kind === 'online'") &&
-      replacementLaunchText.includes("work.kind === 'quiesced'"),
-    adaptiveAtomicAdmission:
+    oneDirectRepositoryIngress:
       tokensInOrder(executeText, [
-        'isBrowserWorkspaceStagedFanoutCommand(command)',
-        'browserWorkspaceSlotSwitchingSupported()',
-        'this.tryExecuteCommandWithinFanoutBudget(',
-        "admission.kind === 'committed'",
-        'executeBrowserWorkspaceStagedFanoutCommand',
+        'assertWorkspaceExecutionPermit(permit)',
+        'this.executeDirectCommand(permit, command)',
       ]) &&
-      budgetText.includes('isBrowserCommandFanoutBudgetExceededError(error)') &&
-      budgetText.includes('dimension: error.dimension') &&
-      budgetText.includes('observed: error.observed') &&
-      budgetText.includes('limit: error.limit') &&
-      databaseExecuteText.includes('fanoutBudget') &&
-      mutationJournalSource.getText().includes('BrowserCommandFanoutBudgetExceededError') &&
-      mutationJournalSource.getText().includes('fanoutLargestReadRequestRows') &&
-      mutationJournalSource.getText().includes('fanoutWriteRows') &&
-      mutationJournalSource.getText().includes('fanoutWriteBytes'),
-    boundedSourceDestinationCopy:
-      copyText.includes('readStagedCopyPage(') &&
-      copyText.includes('bulkPut(page.rows)') &&
-      copyText.includes('page.lastPrimaryKey') &&
-      copyPageText.includes('rows.length >= STAGED_COPY_MAX_PAGE_ROWS') &&
-      copyPageText.includes('STAGED_COPY_MAX_PAGE_BYTES') &&
-      copyPageText.includes('IDBKeyRange.lowerBound(after, true)') &&
-      copyPageText.includes('estimateStoredValueBytes(cursor.value)'),
-    replacementScopedCatchup:
-      operationText.includes('activateBrowserWorkspaceCatchupJournals(source)') &&
-      operationText.match(/drainStagedWorkspaceCatchup\(/gu)?.length === 3 &&
-      operationText.includes("mode: 'online'") &&
-      operationText.includes("mode: 'final'") &&
-      operationText.includes('deactivateSourceCatchupJournals') &&
-      catchupText.includes('STAGED_FINAL_CATCHUP_MAX_ROWS') &&
-      catchupText.includes('STAGED_FINAL_CATCHUP_MAX_BYTES') &&
-      catchupPageText.includes('STAGED_COPY_MAX_PAGE_ROWS') &&
-      catchupPageText.includes('STAGED_COPY_MAX_PAGE_BYTES'),
-    exactConflictClosure:
-      operationText.includes('conflictEvidence: execution.conflictEvidence') &&
-      operationText.includes('conflictEvidence: prepared.execution.conflictEvidence') &&
-      conflictText.includes('evidence.readAddresses') &&
-      conflictText.includes('evidence.mutationAddresses') &&
-      conflictText.includes('evidence.readScopes') &&
-      conflictText.includes('BrowserWorkspaceStagedCommandConflict'),
-    oneDestinationCommand:
-      countOccurrences(operationText, 'executeBrowserCommandInStagedDatabase(') === 1 &&
-      stagedExecuteText.includes('stagedCommandLockSession(db)') &&
-      stagedExecuteText.includes('stagedStorageCompactionWriteAdmission(db.name)') &&
-      stagedExecuteText.includes('false') &&
-      databaseExecuteText.includes('retainFullChatStates') &&
-      operationText.includes('prepared.execution.commit') &&
-      operationText.includes("publication: 'deferred' as const"),
-    sourceCanonicalUnchangedOnFailure:
-      operationText.includes('context.withSourceDatabase(async (source) => {') &&
-      operationText.includes('executeBrowserCommandInStagedDatabase(\n          destination,') &&
-      !operationText.includes('executeBrowserCommandInStagedDatabase(\n          source,') &&
-      operationText.includes('abandon: (sourceDatabaseName) =>') &&
-      operationText.includes('deactivateSourceCatchupJournals(sourceDatabaseName)'),
-    noTimerOrProvenanceGate: ![executeText, budgetText, operationText, copyText, catchupText].some(
-      (text) => text.includes('setTimeout(') || text.includes('WeakMap'),
+      !executeText.includes('fanoutBudget') &&
+      !executeText.includes('replacement'),
+    oneSessionLifetime:
+      sessionBindingText.includes('run(() => target.execute(permit, command))') &&
+      !sessionBindingText.includes('handoff.completion'),
+    maintenanceUsesSameRepositoryIngress:
+      maintenanceSource
+        .getText()
+        .includes('value: (await getWorkspaceRepository().execute(permit, command)).value') &&
+      !maintenanceSource.getText().includes('tryExecuteBrowserWorkspaceCommandWithinFanoutBudget'),
+    oneAtomicActiveDatabaseTransaction:
+      directText.includes('withSharedAuthoritativeCommandSession(') &&
+      directText.includes('this.executeCommandInDatabase(') &&
+      databaseText.includes('new BrowserCommandCommit(') &&
+      databaseText.includes('lockSession') &&
+      databaseText.includes('admission'),
+    noForegroundWorkspaceCopyFallback:
+      !productionText.includes('browser-staged-fanout-command') &&
+      !productionText.includes('browser-workspace-staged-fanout') &&
+      !productionText.includes('startBrowserWorkspaceStagedFanoutCommand') &&
+      !productionText.includes('copyStagedWorkspace'),
+    exactReviewedWholeCollectionReads: sameSortedValues(
+      wholeCollectionReadSites,
+      reviewedWholeCollectionReadSites,
     ),
+    boundedEvidenceDegradation:
+      mutationJournalSource.getText().includes('thinRetainedChatStatesIfNeeded(journal)') &&
+      mutationJournalSource.getText().includes('chatStateRetentionExceeded') &&
+      mutationJournalSource.getText().includes('maxWriteRows') &&
+      mutationJournalSource.getText().includes('maxWriteBytes'),
+    budgetCannotRejectProductionIntent:
+      !executeText.includes('tryExecuteCommandWithinFanoutBudget') &&
+      !directText.includes('BROWSER_COMMAND_DIRECT_FANOUT_BUDGET'),
+    noTimerOrProvenanceGate:
+      !executeText.includes('setTimeout(') &&
+      !executeText.includes('WeakMap') &&
+      !directText.includes('setTimeout(') &&
+      !directText.includes('WeakMap'),
   })
   for (const [name, consumed] of Object.entries(commonKernel)) {
-    if (!consumed) outputProblems.push(`staged fanout family missing ${name}`)
+    if (!consumed) outputProblems.push(`foreground storage locality missing ${name}`)
   }
   return Object.freeze({
-    variants: Object.freeze(semanticVariants),
-    workspaceVariants: Object.freeze(workspaceVariants),
-    configurationVariants: Object.freeze(configurationVariants),
+    wholeCollectionReadSites,
+    reviewedWholeCollectionReadSites,
     commonKernel,
     consumed: Object.values(commonKernel).every(Boolean),
   })
+}
+
+function productionWholeCollectionReadSites(program) {
+  const readMethods = new Set([
+    'each',
+    'eachKey',
+    'eachPrimaryKey',
+    'getAll',
+    'getAllKeys',
+    'keys',
+    'openCursor',
+    'openKeyCursor',
+    'primaryKeys',
+    'sortBy',
+    'toArray',
+    'toCollection',
+    'uniqueKeys',
+  ])
+  const narrowingMethods = new Set([
+    'above',
+    'aboveOrEqual',
+    'anyOf',
+    'below',
+    'belowOrEqual',
+    'between',
+    'equals',
+    'filter',
+    'limit',
+    'offset',
+    'startsWith',
+    'startsWithIgnoreCase',
+    'until',
+    'where',
+  ])
+  const sites = []
+  for (const source of program.getSourceFiles()) {
+    const path = relative(ROOT, source.fileName).split(sep).join('/')
+    if (!path.startsWith('src/store/') && !path.startsWith('src/backcompat/')) continue
+    const visit = (node, owner = '<module>') => {
+      const nextOwner = sourceOwnerName(node, source, owner)
+      if (
+        ts.isCallExpression(node) &&
+        ts.isPropertyAccessExpression(node.expression) &&
+        readMethods.has(node.expression.name.text)
+      ) {
+        const chain = calledMethodChain(node.expression.expression)
+        if (
+          node.expression.name.text === 'keys' &&
+          !chain.some((method) => method === 'orderBy' || method === 'toCollection')
+        ) {
+          ts.forEachChild(node, (child) => visit(child, nextOwner))
+          return
+        }
+        if (
+          node.expression.name.text === 'toCollection' ||
+          !chain.some((method) => narrowingMethods.has(method))
+        ) {
+          sites.push(`${path}#${nextOwner}:${node.expression.name.text}`)
+        }
+      }
+      ts.forEachChild(node, (child) => visit(child, nextOwner))
+    }
+    visit(source)
+  }
+  return Object.freeze(sites.sort())
+}
+
+function sourceOwnerName(node, source, current) {
+  if (
+    (ts.isFunctionDeclaration(node) ||
+      ts.isMethodDeclaration(node) ||
+      ts.isFunctionExpression(node)) &&
+    node.name
+  ) {
+    return node.name.getText(source)
+  }
+  if (ts.isConstructorDeclaration(node)) return 'constructor'
+  if (
+    ts.isVariableDeclaration(node) &&
+    ts.isIdentifier(node.name) &&
+    node.initializer &&
+    (ts.isArrowFunction(node.initializer) || ts.isFunctionExpression(node.initializer))
+  ) {
+    return node.name.text
+  }
+  return current
+}
+
+function calledMethodChain(node) {
+  const methods = []
+  let current = node
+  while (ts.isCallExpression(current) && ts.isPropertyAccessExpression(current.expression)) {
+    methods.push(current.expression.name.text)
+    current = current.expression.expression
+  }
+  return methods
 }
 
 function classifyB16RemainingBounds(semanticCapabilities, families, outputProblems) {
@@ -794,10 +864,10 @@ function classifyB16RemainingBounds(semanticCapabilities, families, outputProble
     chatClosureFamily,
     chatForkFamily,
     interchangeImportFamily,
-    stagedFanoutFamily,
+    foregroundStorageLocalityFamily,
   } = families
   const fixed = scopeDerivedMutationFamily.fixedReceiptFamily
-  const finiteCohorts = Object.freeze([
+  const finiteCohorts = [
     Object.freeze({
       proof: 'scope-derived:attempt-prepare',
       variants: Object.freeze([fixed.attemptPrepare.variant]),
@@ -837,7 +907,7 @@ function classifyB16RemainingBounds(semanticCapabilities, families, outputProble
     }),
     Object.freeze({
       proof: 'scope-derived:message-edit',
-      variants: Object.freeze(['message.edit-content']),
+      variants: Object.freeze(['message.edit-body']),
       proved: proofKeysComplete(fixed.messageCommandExact.commonKernel, [
         'onePreflightPerCommandPath',
         'targetShapedCachedReads',
@@ -876,6 +946,19 @@ function classifyB16RemainingBounds(semanticCapabilities, families, outputProble
         ]),
     }),
     Object.freeze({
+      proof: 'chat-fork:path-proportional-atomic-pages',
+      variants: chatForkFamily.variants,
+      proved: proofKeysComplete(chatForkFamily.commonKernel, [
+        'transactionLocalSnapshot',
+        'boundedBodyWorkingSet',
+        'pagedDestinationWrites',
+        'boundedTopologyRequests',
+        'exactDestinationSelection',
+        'oneLinkedAttachmentAwareCommit',
+        'noLegacyPlanning',
+      ]),
+    }),
+    Object.freeze({
       proof: 'interchange:admitted-envelope',
       variants: interchangeImportFamily.variants,
       proved:
@@ -891,49 +974,39 @@ function classifyB16RemainingBounds(semanticCapabilities, families, outputProble
           'noRetryOrLegacyBoundary',
         ]),
     }),
+  ]
+  const commandFootprintVariants = Object.freeze([
+    ...configurationConnectionDeleteFamily.variants,
+    ...configurationTargetFanoutFamily.variants,
+    ...chatCalibrationFamily.variants.filter((variant) => variant !== 'chat.calibration.clear'),
+    fixed.attachmentBytesDelete.variant,
+    fixed.attachmentBundleWrite.variant,
+    fixed.attachmentDeleteIfUnreferenced.variant,
+    fixed.attachmentDeleteMany.variant,
+    fixed.attachmentReap.variant,
+    ...fixed.attachmentReference.variants,
+    ...generatedOutputLocalizationFamily.variants,
+    ...fixed.messageCommandExact.variants.filter((variant) => variant !== 'message.edit-body'),
+    ...folderFamily.variants.filter(
+      (variant) => variant !== 'folder.create' && variant !== 'folder.update',
+    ),
+    ...maintenanceOccurrenceFamily.variants,
   ])
-  const stagedCohorts = Object.freeze([
-    Object.freeze({
-      findingId: 'F-B1-08',
-      variants: configurationConnectionDeleteFamily.variants,
-    }),
-    Object.freeze({
-      findingId: 'F-B1-09',
-      variants: configurationTargetFanoutFamily.variants,
-    }),
-    Object.freeze({
-      findingId: 'F-B1-10',
-      variants: Object.freeze(
-        chatCalibrationFamily.variants.filter((variant) => variant !== 'chat.calibration.clear'),
-      ),
-    }),
-    Object.freeze({
-      findingId: 'F-B1-14',
-      variants: Object.freeze([
-        fixed.attachmentBytesDelete.variant,
-        fixed.attachmentBundleWrite.variant,
-        fixed.attachmentDeleteIfUnreferenced.variant,
-        fixed.attachmentDeleteMany.variant,
-        fixed.attachmentReap.variant,
-        ...fixed.attachmentReference.variants,
-        ...generatedOutputLocalizationFamily.variants,
-        ...fixed.messageCommandExact.variants.filter(
-          (variant) => variant !== 'message.edit-content',
-        ),
-        ...folderFamily.variants.filter(
-          (variant) => variant !== 'folder.create' && variant !== 'folder.update',
-        ),
-        ...maintenanceOccurrenceFamily.variants,
-        ...chatForkFamily.variants,
-      ]),
-    }),
-  ])
-  compareExact(
-    'B2.2 staged fanout variants',
-    [...stagedFanoutFamily.variants].sort(),
-    stagedCohorts.flatMap(({ variants }) => [...variants]).sort(),
-    outputProblems,
-  )
+  for (const variant of commandFootprintVariants) {
+    const capability = semanticCapabilities.get(variant)
+    finiteCohorts.push(
+      Object.freeze({
+        proof: 'foreground-storage:command-footprint-atomic-pages',
+        variants: Object.freeze([variant]),
+        proved:
+          foregroundStorageLocalityFamily.consumed &&
+          capability?.consumed === true &&
+          capability.physicalWritesProved === true &&
+          capability.exactEffectsProved === true &&
+          capability.tablesProved === true,
+      }),
+    )
+  }
   const openVariants = [...semanticCapabilities]
     .filter(([, capability]) => capability.boundsProved !== true)
     .map(([variant]) => variant)
@@ -947,18 +1020,6 @@ function classifyB16RemainingBounds(semanticCapabilities, families, outputProble
         variant,
         cohort.proof,
         cohort.proved,
-        outputProblems,
-      )
-    }
-  }
-  for (const cohort of stagedCohorts) {
-    for (const variant of cohort.variants) {
-      classifyStagedBound(
-        semanticCapabilities,
-        classifications,
-        variant,
-        cohort.findingId,
-        stagedFanoutFamily.consumed,
         outputProblems,
       )
     }
@@ -977,9 +1038,9 @@ function classifyB16RemainingBounds(semanticCapabilities, families, outputProble
     .filter(([, classification]) => classification.kind === 'staged')
     .map(([variant]) => variant)
     .sort()
-  if (finiteVariants.length !== 11 || stagedVariants.length !== 28) {
+  if (finiteVariants.length !== 39 || stagedVariants.length !== 0) {
     outputProblems.push(
-      `B2.2 bounds classification count expected finite=11/staged=28, found finite=${finiteVariants.length}/staged=${stagedVariants.length}`,
+      `B2.2 bounds classification count expected finite=39/staged=0, found finite=${finiteVariants.length}/staged=${stagedVariants.length}`,
     )
   }
   return Object.freeze({
@@ -1013,43 +1074,6 @@ function classifyFiniteBound(
     variant,
     Object.freeze({
       ...capability,
-      boundsProved: true,
-      boundsClassification: classification,
-    }),
-  )
-}
-
-function classifyStagedBound(
-  semanticCapabilities,
-  classifications,
-  variant,
-  findingId,
-  stagedOwnerProved,
-  outputProblems,
-) {
-  const capability = semanticCapabilities.get(variant)
-  const owner = B16_BOUNDS_CARRY_OWNERS[findingId]
-  if (!capability || !owner) {
-    outputProblems.push(`B2.2 staged bounds capability invalid ${variant}:${findingId}`)
-    return
-  }
-  if (!stagedOwnerProved || capability.boundsProved === true) {
-    outputProblems.push(`B2.2 staged bounds proof incomplete ${variant}:${findingId}`)
-    return
-  }
-  const classification = Object.freeze({
-    kind: 'staged',
-    findingId,
-    carriedFrom: owner,
-    owner: 'B2.2',
-    proof: 'generic-bounded-staged-fanout',
-  })
-  classifications.set(variant, classification)
-  const { boundsDisposition: _legacyBoundsDisposition, ...baseCapability } = capability
-  semanticCapabilities.set(
-    variant,
-    Object.freeze({
-      ...baseCapability,
       boundsProved: true,
       boundsClassification: classification,
     }),
@@ -1293,7 +1317,7 @@ export function evaluateDurableCommandPipeline(
     ...(options.detail ? { records: allRecords, gaps } : {}),
     limitations: Object.freeze([
       'B1 finite bounds prove command-lifetime request and row cardinality; exact retained-byte ceilings remain a later storage measurement obligation.',
-      'The exact 28 former carries use the B2.2 staged copy/catch-up/activation owner; B2.3 crash/reopen and competing-tab replacement outcomes remain separate closure obligations.',
+      'All 39 formerly open bounds use command-footprint pages inside the one active-database transaction; no ordinary command can overflow into a whole-workspace copy or permanent row-budget blocker.',
       'Zero pipeline gaps is B2.2 source closure, not B5 unchanged-candidate/browser/large-store durability closure.',
     ]),
     problems: Object.freeze(problems.sort()),
@@ -2414,7 +2438,9 @@ function chatCalibrationCapabilityFacts(program, catalogSource, outputProblems) 
       fanoutTransactionText.includes("operation: 'query'"),
     callerSingleAttemptOwned: Object.values(callerSingleAttempt).every(Boolean),
     finalizationReadSubtracted:
-      mutationJournalSource.getText().includes('finalChatById: Map<ChatId, Chat | null>') &&
+      mutationJournalSource
+        .getText()
+        .includes('finalChatById: Map<ChatId, Chat | null | undefined>') &&
       mutationJournalSource.getText().includes('finalChatState(journal, chatId)') &&
       !mutationJournalSource.getText().includes("tx.table<Chat, ChatId>('chats').bulkGet(chatIds)"),
     atomicFanoutAdmitted:
@@ -3794,7 +3820,7 @@ function chatForkCapabilityFacts(browserRepoSource, outputProblems) {
   const pathReader = findFunction(browserRepoSource, 'readForkLivePathHeaders').getText(
     browserRepoSource,
   )
-  const clone = findFunction(browserRepoSource, 'cloneForkMessages').getText(browserRepoSource)
+  const clone = findFunction(browserRepoSource, 'cloneForkMessage').getText(browserRepoSource)
   const command = findMethod(
     browserRepoSource,
     'BrowserWorkspaceRepository',
@@ -3822,23 +3848,34 @@ function chatForkCapabilityFacts(browserRepoSource, outputProblems) {
     transactionLocalSnapshot:
       command.includes("tx.table<Chat, ChatId>('chats')") &&
       command.includes('readForkLivePathHeaders(') &&
-      command.includes("table<MessageBodyRow, MessageId>('messageBodies')") &&
-      command.includes('.bulkGet(headers.map((header) => header.id))') &&
+      command.includes("tx.table<MessageBodyRow, MessageId>('messageBodies')") &&
       pathReader.includes('readLiveBranchPath('),
     freshIdentityAndPayload:
-      command.includes('const destinationMessageIds = ancestors.map(() => newId())') &&
-      clone.includes('destinationTurnIdBySourceTurnId') &&
+      command.includes('const destinationMessageIds = headers.map(() => newId())') &&
+      command.includes('destinationTurnIdBySourceTurnId') &&
       clone.includes('clone.turnId = destinationTurnId') &&
       clone.includes('clone.nodeVersion = 0'),
-    batchedDestinationWrites:
-      command.includes("addPhysicalStorageRows(\n            tx,\n            'messages'") &&
+    boundedBodyWorkingSet:
+      command.includes('offset += BODY_READ_PAGE_SIZE') &&
+      command.includes('headers.slice(offset, offset + BODY_READ_PAGE_SIZE)') &&
+      command.includes('sourceHeaders.map((header) => header.id)') &&
+      !command.includes('.bulkGet(headers.map((header) => header.id))'),
+    pagedDestinationWrites:
+      command.includes('const destinationMessages = sourceMessages.map(') &&
+      command.includes('const storageRows = destinationMessages.map(') &&
+      countOccurrences(command, 'addPhysicalStorageRows(') >= 5 &&
+      command.includes("'messages'") &&
       command.includes("'messageBodies'") &&
       command.includes("'messagePreviews'") &&
-      command.includes("'childLists'") &&
-      command.includes("'childSlotMembers'"),
-    noDuplicateDestinationPathRead: command.includes(
-      'exactPathHeaders: storageRows.map(({ header }) => header)',
-    ),
+      command.includes('destinationHeaders.push(...storageRows.map(({ header }) => header))'),
+    boundedTopologyRequests:
+      countOccurrences(command, 'offset += BROWSER_COMMAND_DIRECT_FANOUT_BUDGET.maxWriteRows') ===
+        2 &&
+      command.includes('childProjection.states.slice(') &&
+      command.includes('childProjection.members.slice('),
+    exactDestinationSelection:
+      command.includes('exactPathHeaders: destinationHeaders') &&
+      command.includes('messageCount: destinationHeaders.length'),
     oneLinkedAttachmentAwareCommit:
       command.includes('const chatMutation = openLinkedChatMutation(tx)') &&
       command.includes('await chatMutation.add(chat)') &&
@@ -6350,7 +6387,9 @@ function configurationTargetFanoutCapabilityFacts(
       !mutationJournalSource
         .getText()
         .includes("tx.table<Chat, ChatId>('chats').bulkGet(chatIds)") &&
-      mutationJournalSource.getText().includes('finalChatById: Map<ChatId, Chat | null>') &&
+      mutationJournalSource
+        .getText()
+        .includes('finalChatById: Map<ChatId, Chat | null | undefined>') &&
       mutationJournalSource.getText().includes('finalChatState(journal, chatId)') &&
       mutationJournalSource.getText().includes('retainFullChatStates') &&
       mutationJournalSource.getText().includes('finalizationPhysicalReads'),
@@ -7504,7 +7543,7 @@ function scopeDerivedMutationCapabilityFacts(
   ])
   const messageCommandExactVariants = Object.freeze([
     'message.delete',
-    'message.edit-content',
+    'message.edit-body',
     'message.import',
     'message.restore-structure',
   ])
@@ -7627,7 +7666,7 @@ function scopeDerivedMutationCapabilityFacts(
     'MessageMutationRepository',
     'runMutation',
   ).parent.getText(messagesSource)
-  const editMessageText = findFunction(messagesSource, 'editMessageContentInRepository').getText(
+  const editMessageText = findFunction(messagesSource, 'editMessageBodyInRepository').getText(
     messagesSource,
   )
   const pasteImportText = findFunction(messagesSource, 'pasteImportInRepository').getText(
@@ -7789,7 +7828,7 @@ function scopeDerivedMutationCapabilityFacts(
     exactOccurrencePolicies:
       [...exactMessagePolicies.values()].every((body) => body.includes('exactOccurrence: true')) &&
       exactMessagePolicies
-        .get('message.edit-content')
+        .get('message.edit-body')
         ?.includes("replayReason: 'unfenced-relative-update'") === true &&
       exactMessagePolicies.get('message.import')?.includes("replayReason: 'random-identity'") ===
         true &&

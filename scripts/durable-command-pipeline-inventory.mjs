@@ -126,7 +126,7 @@ export const WORKSPACE_COMMAND_PIPELINES = Object.freeze({
     'deleteVariantInRepository',
   ]),
   'message.dismiss-generation-notice': pipeline('mutateMessageBodyInRepository'),
-  'message.edit-content': pipeline('editMessageContentInRepository'),
+  'message.edit-body': pipeline('editMessageBodyInRepository'),
   'message.import': pipeline('pasteImportInRepository'),
   'message.restore-structure': pipeline('applyStructuralSnapshotInRepository'),
   'message.toggle-context': pipeline('mutateMessageBodyInRepository'),

@@ -59,6 +59,89 @@ test('clicking abort mid-stream persists abortReason="user" and shows the interr
   expect(typeof assistant.generation.finishedAt).toBe('number')
 })
 
+test('clicking abort before response text preserves partial reasoning through terminalization and reload', async ({
+  page,
+}) => {
+  const partialReasoning = 'partial reasoning before the answer'
+  const firstFrame = buildSseBody([{ id: 'abort-reasoning-only', reasoning: partialReasoning }], {
+    noDone: true,
+  })
+  await page.evaluate((frame) => {
+    const originalFetch = window.fetch.bind(window)
+    window.fetch = async (input, init) => {
+      const url =
+        typeof input === 'string' ? input : input instanceof Request ? input.url : String(input)
+      if (!url.includes('/api/v1/chat/completions')) return originalFetch(input, init)
+      const encoder = new TextEncoder()
+      return new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(encoder.encode(frame))
+          },
+        }),
+        { status: 200, headers: { 'content-type': 'text/event-stream' } },
+      )
+    }
+  }, firstFrame)
+
+  await createChatAndOpen(page)
+  await sendMessage(page, 'reason, then wait')
+  const assistantMessage = page.locator('[data-ui="message"][data-role="assistant"]').first()
+  await expect(assistantMessage.locator('[data-ui="reasoning-summary"]')).toBeVisible()
+  await expect(assistantMessage.locator('[data-ui="reasoning-row-body"]')).toContainText(
+    partialReasoning,
+  )
+  await assistantMessage.evaluate((article) => {
+    ;(article as HTMLElement & { reasoningAbortIdentity?: true }).reasoningAbortIdentity = true
+    const reasoning = article.querySelector('[data-ui="reasoning"]')
+    if (!(reasoning instanceof HTMLDetailsElement)) throw new Error('ReasoningDetailsMissing')
+    ;(reasoning as HTMLDetailsElement & { reasoningAbortIdentity?: true }).reasoningAbortIdentity =
+      true
+  })
+
+  await page.locator('[data-ui="abort"]').click()
+  await expect(
+    assistantMessage.locator('[data-ui="message-error"][data-role="abort"]'),
+  ).toBeVisible()
+
+  const chatId = await firstChatId(page)
+  const rows = await readMessages(page, chatId)
+  const assistant = rows.find((row) => row.role === 'assistant') as {
+    content?: unknown[]
+    reasoningEnvelope?: { visible?: Array<{ text?: string }> }
+  }
+  expect(assistant.content).toEqual([{ type: 'output_text', text: '' }])
+  expect(assistant.reasoningEnvelope?.visible?.map((part) => part.text).join('')).toBe(
+    partialReasoning,
+  )
+  expect(
+    await assistantMessage.evaluate((article) => {
+      const reasoning = article.querySelector('[data-ui="reasoning"]')
+      return {
+        articleRetained:
+          (article as HTMLElement & { reasoningAbortIdentity?: true }).reasoningAbortIdentity ===
+          true,
+        reasoningRetained:
+          reasoning instanceof HTMLDetailsElement &&
+          (reasoning as HTMLDetailsElement & { reasoningAbortIdentity?: true })
+            .reasoningAbortIdentity === true,
+        open: reasoning instanceof HTMLDetailsElement && reasoning.open,
+      }
+    }),
+  ).toEqual({ articleRetained: true, reasoningRetained: true, open: true })
+  await expect(assistantMessage.locator('[data-ui="reasoning-row-body"]')).toContainText(
+    partialReasoning,
+  )
+
+  await page.reload()
+  const reloadedAssistant = page.locator('[data-ui="message"][data-role="assistant"]').first()
+  await expect(reloadedAssistant.locator('[data-ui="reasoning-summary"]')).toBeVisible()
+  await reloadedAssistant.locator('[data-ui="reasoning-summary"]').click()
+  await expect(reloadedAssistant.locator('[data-ui="reasoning-row-body"]')).toContainText(
+    partialReasoning,
+  )
+})
+
 test('reloading mid-stream preserves the partial row and recovers it as tab-close', async ({
   page,
 }) => {

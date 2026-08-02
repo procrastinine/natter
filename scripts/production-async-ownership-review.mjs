@@ -12,6 +12,26 @@ const proof = (siteId, siteText, evidence, identityFlow, rationale) =>
 
 export const productionAsyncOwnershipReviews = Object.freeze([
   proof(
+    'src/ui/chat/ReasoningBlock.tsx#saveEdit|detached-promise|fnv1a32:4bba017d|1',
+    'void onEdit(draft).then((outcome) => {',
+    [
+      at(
+        'src/store/presentation-interaction-controller.ts',
+        301,
+        'const settled = new Promise<PresentationInteractionOutcome<Value>>((resolve) => {',
+        'non-rejecting-construction',
+      ),
+      at(
+        'src/store/presentation-interaction-controller.ts',
+        384,
+        'const settled = Promise.resolve(',
+        'non-rejecting-construction',
+      ),
+    ],
+    'ReasoningBlock owns the exact busy editor session and onEdit returns only TotalPresentationInteractionPromise; active and immediate settlements are resolve-only',
+    'The detached observer updates only the matching local editor state and has no rejection channel.',
+  ),
+  proof(
     'src/ui/chat/InlineEditor.tsx#<callback:useCallback>|detached-promise|fnv1a32:042752bd|1',
     'void settlement.then((outcome) => {',
     [

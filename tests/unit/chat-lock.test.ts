@@ -155,7 +155,7 @@ describe('workspace command locking and projection contract', () => {
     await appendMessage(second, first.id)
 
     await executeMessageCommand({
-      kind: 'message.edit-content',
+      kind: 'message.edit-body',
       input: {
         chatId: chat.id,
         messageId: first.id,
@@ -185,7 +185,7 @@ describe('workspace command locking and projection contract', () => {
 
     await Promise.all([
       executeMessageCommand({
-        kind: 'message.edit-content',
+        kind: 'message.edit-body',
         input: {
           chatId: chat.id,
           messageId: first.id,
@@ -194,7 +194,7 @@ describe('workspace command locking and projection contract', () => {
         },
       }),
       executeMessageCommand({
-        kind: 'message.edit-content',
+        kind: 'message.edit-body',
         input: {
           chatId: chat.id,
           messageId: first.id,
@@ -248,7 +248,7 @@ describe('workspace command locking and projection contract', () => {
 
     await Promise.all([
       executeMessageCommand({
-        kind: 'message.edit-content',
+        kind: 'message.edit-body',
         input: {
           chatId: chat.id,
           messageId: first.id,
@@ -257,7 +257,7 @@ describe('workspace command locking and projection contract', () => {
         },
       }),
       executeMessageCommand({
-        kind: 'message.edit-content',
+        kind: 'message.edit-body',
         input: {
           chatId: chat.id,
           messageId: second.id,
@@ -278,7 +278,7 @@ describe('workspace command locking and projection contract', () => {
 
     await Promise.all([
       executeMessageCommand({
-        kind: 'message.edit-content',
+        kind: 'message.edit-body',
         input: {
           chatId: chat.id,
           messageId: message.id,
@@ -287,7 +287,7 @@ describe('workspace command locking and projection contract', () => {
         },
       }),
       executeMessageCommand({
-        kind: 'message.edit-content',
+        kind: 'message.edit-body',
         input: {
           chatId: chat.id,
           messageId: message.id,
@@ -462,7 +462,7 @@ describe('workspace command locking and projection contract', () => {
     if (!before) throw new Error('ExpectedMessageHeader')
 
     await executeMessageCommand({
-      kind: 'message.edit-content',
+      kind: 'message.edit-body',
       input: {
         chatId: chat.id,
         messageId: message.id,
