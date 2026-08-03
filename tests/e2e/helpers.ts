@@ -461,7 +461,7 @@ interface TranscriptContinuityState {
   listReplaced: boolean
   loadingSeen: boolean
   branchControlCounts: number[]
-  messageCounts: number[]
+  renderedMessageCounts: number[]
 }
 
 interface TranscriptContinuityWindow extends Window {
@@ -514,7 +514,7 @@ export async function startMessageCountRecorder(
       listReplaced: false,
       loadingSeen: false,
       branchControlCounts: [],
-      messageCounts: [],
+      renderedMessageCounts: [],
     }
     const sample = () => {
       const currentList = state.content.querySelector('[data-ui="message-list"]')
@@ -524,7 +524,12 @@ export async function startMessageCountRecorder(
       const currentMessagesById = new Map(
         currentMessages.map((message) => [message.getAttribute('data-message-id'), message]),
       )
-      state.messageCounts.push(currentMessages.length)
+      const renderedCount = Number(currentList?.getAttribute('data-rendered-count'))
+      state.renderedMessageCounts.push(
+        Number.isInteger(renderedCount) && renderedCount >= 0
+          ? renderedCount
+          : currentMessages.length,
+      )
       state.branchControlCounts.push(
         currentList?.querySelectorAll('[data-ui="branch-controls"]').length ?? 0,
       )
@@ -568,7 +573,12 @@ export async function stopMessageCountRecorder(page: Page): Promise<TranscriptCo
     const state = win.__messageCountSamples
     if (!state) throw new Error('Transcript continuity recorder not started')
     const currentList = state.content.querySelector('[data-ui="message-list"]')
-    state.messageCounts.push(currentList?.querySelectorAll('[data-ui="message"]').length ?? 0)
+    const finalRenderedCount = Number(currentList?.getAttribute('data-rendered-count'))
+    state.renderedMessageCounts.push(
+      Number.isInteger(finalRenderedCount) && finalRenderedCount >= 0
+        ? finalRenderedCount
+        : (currentList?.querySelectorAll('[data-ui="message"]').length ?? 0),
+    )
     state.branchControlCounts.push(
       currentList?.querySelectorAll('[data-ui="branch-controls"]').length ?? 0,
     )
@@ -579,23 +589,25 @@ export async function stopMessageCountRecorder(page: Page): Promise<TranscriptCo
     win.__stopMessageCountSamples?.()
     delete win.__messageCountSamples
     delete win.__stopMessageCountSamples
-    const initialMessageCount = state.messageCounts[0] ?? 0
+    const initialMessageCount = state.renderedMessageCounts[0] ?? 0
     const expectedCommonPrefixCount = state.expectedCommonPrefixCount
     return {
       anchorRemoved: state.anchorRemoved,
       listRemoved: state.listRemoved,
       listReplaced: state.listReplaced,
       loadingSeen: state.loadingSeen,
-      messageCountDecreased: state.messageCounts.some((count) => count < initialMessageCount),
-      messageCountsIncludeZero: state.messageCounts.includes(0),
-      minimumMessageCount: Math.min(...state.messageCounts),
+      messageCountDecreased: state.renderedMessageCounts.some(
+        (count) => count < initialMessageCount,
+      ),
+      messageCountsIncludeZero: state.renderedMessageCounts.includes(0),
+      minimumMessageCount: Math.min(...state.renderedMessageCounts),
       minimumBranchControlCount: Math.min(...state.branchControlCounts),
       ...(expectedCommonPrefixCount === null
         ? {}
         : {
             commonPrefixDisconnectedIds: [...state.commonPrefixDisconnectedIds],
             commonPrefixReplacedIds: [...state.commonPrefixReplacedIds],
-            messageCountBelowExpectedCommonPrefix: state.messageCounts.some(
+            messageCountBelowExpectedCommonPrefix: state.renderedMessageCounts.some(
               (count) => count < expectedCommonPrefixCount,
             ),
           }),

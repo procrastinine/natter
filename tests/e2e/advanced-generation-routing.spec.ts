@@ -88,6 +88,7 @@ test('GUI OpenRouter Responses GPT-5.4 xhigh reasoning and Continue stay on the 
   const rows = await readMessages(page, chatId)
   const storedAssistant = rows.find((row) => row.role === 'assistant') as
     | {
+        generation?: { cost?: number; usage?: { cost?: number } }
         reasoningEnvelope?: {
           visible?: Array<{ kind?: unknown; text?: unknown }>
         }
@@ -98,7 +99,48 @@ test('GUI OpenRouter Responses GPT-5.4 xhigh reasoning and Continue stay on the 
   expect(summaries).toHaveLength(1)
   expect(summaries[0]?.text).toContain('fragment-000 fragment-001 fragment-002')
   expect(summaries[0]?.text).toContain('fragment-119')
+  expect(storedAssistant?.generation?.cost).toBe(0.00000825)
+  expect(storedAssistant?.generation?.usage?.cost).toBe(0.00000825)
 
+  expectNoConsoleProblems(consoleLines)
+})
+
+test('GUI OpenRouter Responses reasoning inclusion toggles never mix prompt-estimate routes', async ({
+  page,
+}) => {
+  const consoleLines = captureConsole(page)
+  const pageErrors: string[] = []
+  page.on('pageerror', (error) => pageErrors.push(error.message))
+  await mockOpenRouterDiscovery(page, OR_RESPONSES_MODEL, {
+    supportedParameters: ['provider', 'reasoning', 'verbosity', 'max_completion_tokens'],
+  })
+
+  await seedFirstRun(page, {
+    model: OR_RESPONSES_MODEL,
+    disablePrivacyFilter: false,
+    corsProxyUrl: '/_or_scrape',
+  })
+  await createChatAndOpen(page)
+  await openSettingsPanel(page)
+
+  const apiMode = page.locator('[data-ui-section="api-mode"]')
+  if ((await apiMode.count()) > 0) {
+    await apiMode.getByRole('button', { name: 'Responses', exact: true }).click()
+  }
+  await page.getByRole('tab', { name: 'Context' }).click()
+  const panel = page.locator('[data-ui="chat-model-panel"]')
+  const contextGauge = page.locator('[data-ui="context-gauge"]')
+  const encrypted = page.getByRole('checkbox', { name: 'Encrypted reasoning' })
+  await expect(contextGauge).toBeVisible()
+  await expect(encrypted).toBeVisible()
+
+  for (let index = 0; index < 4; index += 1) {
+    await encrypted.click()
+    await expect(panel).toBeVisible()
+    await expect(contextGauge).toBeVisible()
+  }
+
+  expect(pageErrors).toEqual([])
   expectNoConsoleProblems(consoleLines)
 })
 
@@ -1469,7 +1511,17 @@ function buildResponsesSse(input: {
         id: input.id,
         model: input.model,
         status: 'completed',
-        usage: { input_tokens: 10, output_tokens: 4, total_tokens: 14 },
+        usage: {
+          input_tokens: 10,
+          output_tokens: 4,
+          total_tokens: 14,
+          cost: 0.00000825,
+          cost_details: {
+            upstream_inference_cost: 0.00000825,
+            upstream_inference_input_cost: 0.000002,
+            upstream_inference_output_cost: 0.00000625,
+          },
+        },
       },
     },
   )

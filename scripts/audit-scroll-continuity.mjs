@@ -40,7 +40,6 @@ const REQUIRED_HEIGHT_PRODUCER_IDS = Object.freeze([
   'inline-editor-autosize',
   'message-collapse-mode',
   'generation-terminal-notices',
-  'content-visibility-realization',
 ])
 const REQUIRED_TRANSITION_IDS = Object.freeze([
   'destination-first-demand',
@@ -62,6 +61,7 @@ const REQUIRED_TRANSITION_IDS = Object.freeze([
 const REQUIRED_PROOF_IDS = Object.freeze([
   'destination-first-passive-floor',
   'repeated-mixed-height-prepend',
+  'exact-100k-native-scroll-and-glyph-browser',
   'automatic-adjacent-prepend',
   'delayed-layout-prepend',
   'edit-scroll-not-trapped',

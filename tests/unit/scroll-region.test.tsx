@@ -172,6 +172,39 @@ describe('ScrollRegion continuity lease', () => {
     expect(fixture.region.dataset.scrollState).toBe('follow')
   })
 
+  it('does not mistake a geometry-coupled native clamp for user navigation', () => {
+    const fixture = setup()
+    acquireOpen(fixture)
+    act(() => fireEvent.scroll(fixture.region))
+
+    act(() => {
+      fixture.setHeight(900)
+      fixture.region.scrollTop = 620
+      fireEvent.scroll(fixture.region)
+    })
+
+    expect(fixture.ref.current?.getState()).toBe('follow')
+    act(() => deliverResize())
+    expect(fixture.region.scrollTop).toBe(800)
+    expect(fixture.ref.current?.getState()).toBe('follow')
+  })
+
+  it('does not let an intermediate layout snapshot revoke follow ownership', () => {
+    const fixture = setup()
+    acquireOpen(fixture)
+
+    act(() => {
+      fixture.setHeight(1_400)
+      fixture.rerender()
+    })
+
+    expect(fixture.region.scrollTop).toBe(1_000)
+    expect(fixture.ref.current?.getState()).toBe('follow')
+    act(() => deliverResize())
+    expect(fixture.region.scrollTop).toBe(1_300)
+    expect(fixture.ref.current?.getState()).toBe('follow')
+  })
+
   it('rebinds a same-chat workspace epoch without reopening or moving a pinned viewport', async () => {
     const fixture = setup({ workspaceEpoch: 0 })
     acquireOpen(fixture)
@@ -307,6 +340,54 @@ describe('ScrollRegion continuity lease', () => {
     expect(fixture.ref.current?.getState()).toBe('follow')
   })
 
+  it('hands simultaneous stream completion and leaf publication to one preserve lease', () => {
+    const fixture = setup()
+    acquireOpen(fixture, 2_000)
+    const target = fixture.region.querySelector<HTMLElement>('[data-message-id="command-target"]')
+    if (!target) throw new Error('Stream terminal target did not mount')
+    let documentBottom = 1_300
+    target.getBoundingClientRect = () =>
+      rect({
+        top: documentBottom - 120 - fixture.region.scrollTop,
+        bottom: documentBottom - fixture.region.scrollTop,
+      })
+
+    act(() => {
+      fixture.rerender({
+        streamActive: true,
+        autoScrollOnStream: true,
+        streamFollowKey: 'stream-a',
+        streamFollowTargetMessageId: 'command-target',
+      })
+      deliverResize()
+    })
+    expect(fixture.region.scrollTop).toBe(1_200)
+
+    act(() => {
+      fixture.rerender({
+        selectionKey: 'command-target',
+        streamActive: false,
+        streamFollowKey: null,
+      })
+      documentBottom += 240
+      fixture.setHeight(2_240)
+      deliverResize()
+    })
+
+    expect(fixture.region.scrollTop).toBe(1_440)
+    expect(target.getBoundingClientRect().bottom).toBe(100)
+
+    act(() => {
+      documentBottom += 160
+      fixture.setHeight(2_400)
+      deliverResize()
+    })
+
+    expect(fixture.region.scrollTop).toBe(1_600)
+    expect(target.getBoundingClientRect().bottom).toBe(100)
+    expect(fixture.ref.current?.getState()).toBe('follow')
+  })
+
   it('keeps bottom continuity when the viewport height changes', () => {
     const fixture = setup()
     acquireOpen(fixture)
@@ -374,6 +455,21 @@ describe('ScrollRegion continuity lease', () => {
       deliverResize()
     })
     expect(fixture.region.scrollTop).toBe(300)
+    expect(fixture.region.dataset.scrollState).toBe('pinned')
+  })
+
+  it('publishes upward wheel ownership before the native scroll event arrives', async () => {
+    const fixture = setup({
+      streamActive: true,
+      autoScrollOnStream: true,
+      streamFollowKey: 'stream-a',
+    })
+    acquireOpen(fixture)
+
+    act(() => fireEvent.wheel(fixture.region, { deltaY: -320 }))
+
+    expect(fixture.ref.current?.getState()).toBe('pinned')
+    await act(nextTask)
     expect(fixture.region.dataset.scrollState).toBe('pinned')
   })
 
@@ -513,6 +609,81 @@ describe('ScrollRegion continuity lease', () => {
     expect(fixture.ref.current?.getState()).toBe('pinned')
   })
 
+  it('defers a prepared lease until its parent viewport revision publishes', async () => {
+    const fixture = setup()
+    acquireOpen(fixture)
+    const target = fixture.region.querySelector<HTMLElement>('[data-message-id="command-target"]')
+    if (!target) throw new Error('Deferred prepared target did not mount')
+    let documentBottom = 280
+    target.getBoundingClientRect = () =>
+      rect({
+        top: documentBottom - 120 - fixture.region.scrollTop,
+        bottom: documentBottom - fixture.region.scrollTop,
+      })
+    await pinByWheel(fixture)
+
+    const transition: ViewportTransition = {
+      workspaceEpoch: 0,
+      chatId: 'chat-a',
+      revision: 1,
+      fromSelectionKey: 'tail-a',
+      toSelectionKey: 'tail-a',
+      kind: 'prepend',
+    }
+    act(() => {
+      expect(fixture.ref.current?.prepareLayoutChange(transition)).toEqual({ kind: 'prepared' })
+      documentBottom += 300
+      fixture.setHeight(1_400)
+      expect(fixture.commands().reconcileLayoutAnchor()).toBe(false)
+    })
+
+    act(() => fixture.rerender({ viewportRevision: 1 }))
+
+    expect(fixture.region.scrollTop).toBe(500)
+    expect(target.getBoundingClientRect().bottom).toBe(80)
+    expect(fixture.ref.current?.getState()).toBe('pinned')
+  })
+
+  it('rebases a prepared prepend to native wheel position before publication', async () => {
+    const fixture = setup()
+    acquireOpen(fixture)
+    const target = fixture.region.querySelector<HTMLElement>('[data-message-id="command-target"]')
+    if (!target) throw new Error('Prepared wheel target did not mount')
+    let documentBottom = 1_050
+    target.getBoundingClientRect = () =>
+      rect({
+        top: documentBottom - 120 - fixture.region.scrollTop,
+        bottom: documentBottom - fixture.region.scrollTop,
+      })
+    const transition: ViewportTransition = {
+      workspaceEpoch: 0,
+      chatId: 'chat-a',
+      revision: 1,
+      fromSelectionKey: 'tail-a',
+      toSelectionKey: 'tail-a',
+      kind: 'prepend',
+    }
+
+    act(() => {
+      expect(fixture.ref.current?.prepareLayoutChange(transition)).toEqual({ kind: 'prepared' })
+      fireEvent.wheel(fixture.region, { deltaY: -180 })
+      fixture.region.scrollTop = 820
+      fireEvent.scroll(fixture.region)
+    })
+    await act(nextTask)
+    expect(fixture.ref.current?.getState()).toBe('pinned')
+
+    act(() => {
+      documentBottom += 300
+      fixture.setHeight(1_400)
+      fixture.rerender({ viewportRevision: 1 })
+    })
+
+    expect(fixture.region.scrollTop).toBe(1_120)
+    expect(target.getBoundingClientRect().bottom).toBe(230)
+    expect(fixture.ref.current?.getState()).toBe('pinned')
+  })
+
   it('ignores a prepared transition for a different selection authority', async () => {
     const fixture = setup()
     acquireOpen(fixture)
@@ -557,6 +728,124 @@ describe('ScrollRegion continuity lease', () => {
 
     expect(fixture.region.scrollTop).toBe(500)
     expect(target.getBoundingClientRect().bottom).toBe(520)
+    expect(fixture.ref.current?.getState()).toBe('pinned')
+  })
+
+  it('reconciles an estimate-based virtualizer offset against the exact text lease synchronously', async () => {
+    const fixture = setup()
+    acquireOpen(fixture)
+    const target = fixture.region.querySelector<HTMLElement>('[data-message-id="command-target"]')
+    if (!target) throw new Error('Virtualizer anchor target did not mount')
+    let documentBottom = 720
+    target.getBoundingClientRect = () =>
+      rect({
+        top: documentBottom - 120 - fixture.region.scrollTop,
+        bottom: documentBottom - fixture.region.scrollTop,
+      })
+    await pinByWheel(fixture)
+    expect(fixture.commands().captureLayoutAnchor({ element: target, edge: 'bottom' })).toBe(true)
+
+    act(() => {
+      documentBottom += 205_000
+      fixture.setHeight(220_000)
+      fixture.commands().applyVirtualizerOffset(2_400)
+    })
+
+    expect(fixture.region.scrollTop).toBe(205_200)
+    expect(target.getBoundingClientRect().bottom).toBe(520)
+    expect(fixture.ref.current?.getState()).toBe('pinned')
+  })
+
+  it('keeps layout ownership when measured geometry coalesces an unmatched native scroll', async () => {
+    const fixture = setup()
+    acquireOpen(fixture)
+    const target = fixture.region.querySelector<HTMLElement>('[data-message-id="command-target"]')
+    if (!target) throw new Error('Layout anchor target did not mount')
+    let documentBottom = 720
+    target.getBoundingClientRect = () =>
+      rect({
+        top: documentBottom - 120 - fixture.region.scrollTop,
+        bottom: documentBottom - fixture.region.scrollTop,
+      })
+    await pinByWheel(fixture)
+    expect(fixture.commands().captureLayoutAnchor({ element: target, edge: 'bottom' })).toBe(true)
+
+    act(() => {
+      documentBottom += 300
+      fixture.setHeight(1_400)
+      deliverResize()
+      fixture.setHeight(1_450)
+      fixture.region.scrollTop = 450
+      fireEvent.scroll(fixture.region)
+      documentBottom += 100
+      fixture.setHeight(1_500)
+      deliverResize()
+    })
+
+    expect(fixture.region.scrollTop).toBe(600)
+    expect(target.getBoundingClientRect().bottom).toBe(520)
+    expect(fixture.ref.current?.getState()).toBe('pinned')
+  })
+
+  it('does not let unrelated progressive content replace an owned text anchor', async () => {
+    const fixture = setup(
+      {},
+      <article data-ui="message" data-message-id="unrelated-progressive-message">
+        unrelated
+      </article>,
+    )
+    acquireOpen(fixture)
+    await pinByWheel(fixture)
+    const target = fixture.region.querySelector<HTMLElement>('[data-message-id="command-target"]')
+    const unrelated = fixture.region.querySelector<HTMLElement>(
+      '[data-message-id="unrelated-progressive-message"]',
+    )
+    if (!target || !unrelated) throw new Error('Progressive anchor fixtures did not mount')
+    expect(fixture.commands().captureLayoutAnchor({ element: target })).toBe(true)
+
+    expect(
+      fixture.commands().captureLayoutAnchor({
+        element: unrelated,
+        edge: 'bottom',
+        replaceExisting: false,
+      }),
+    ).toBe(false)
+    expect(fixture.commands().getLayoutAnchorMessageId()).toBe('command-target')
+  })
+
+  it('re-resolves a replaced streaming text block without falling back to its message shell', async () => {
+    const fixture = setup()
+    acquireOpen(fixture)
+    const message = fixture.region.querySelector<HTMLElement>('[data-message-id="command-target"]')
+    if (!message) throw new Error('Streaming block message did not mount')
+    let documentTop = 240
+    const initialBlock = document.createElement('p')
+    initialBlock.textContent = 'stable streamed prefix'
+    initialBlock.getBoundingClientRect = () =>
+      rect({
+        top: documentTop - fixture.region.scrollTop,
+        bottom: documentTop + 20 - fixture.region.scrollTop,
+      })
+    message.append(initialBlock)
+    await pinByWheel(fixture)
+    expect(fixture.commands().captureLayoutAnchor({ element: initialBlock })).toBe(true)
+
+    const replacementBlock = document.createElement('p')
+    replacementBlock.textContent = 'stable streamed prefix plus a new suffix'
+    replacementBlock.getBoundingClientRect = () =>
+      rect({
+        top: documentTop - fixture.region.scrollTop,
+        bottom: documentTop + 20 - fixture.region.scrollTop,
+      })
+    act(() => {
+      initialBlock.replaceWith(replacementBlock)
+      documentTop += 300
+      fixture.setHeight(1_400)
+      deliverResize()
+    })
+
+    expect(fixture.region.scrollTop).toBe(500)
+    expect(replacementBlock.getBoundingClientRect().top).toBe(40)
     expect(fixture.ref.current?.getState()).toBe('pinned')
   })
 

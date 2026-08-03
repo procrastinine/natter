@@ -154,7 +154,45 @@ function liveReasoningSettings(model: string): ChatSettings {
   }
 }
 
+function liveResponsesSettings(): ChatSettings {
+  return {
+    ...liveSettings(),
+    model: 'openai/gpt-5.4-nano',
+    api: 'responses',
+    sampling: {},
+    maxCompletionTokens: 16,
+  }
+}
+
 describe.skipIf(!RUN)('Phase 7 live OpenRouter chat-completions smoke', () => {
+  it('persists OpenRouter Responses cost once on the assistant and chat aggregate', async () => {
+    const originalFetch = globalThis.fetch
+    let responsePostCount = 0
+    globalThis.fetch = async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : String(input))
+      if (url.pathname.endsWith('/responses') && (init?.method ?? 'GET') === 'POST') {
+        responsePostCount += 1
+      }
+      return originalFetch(input, init)
+    }
+    try {
+      const chat = await createChat({ settings: liveResponsesSettings() })
+      const result = await send(chat.id, [{ type: 'text', text: 'Reply with only the digit 4.' }])
+      expect(result.outcome).toBe('done')
+
+      const assistant = await getMessage(result.assistantMessageId)
+      const persistedChat = await getChat(chat.id)
+      const generation = assistant?.generation
+      expect(generation?.apiUsed).toBe('responses')
+      expect(generation?.cost).toBeGreaterThan(0)
+      expect(generation?.usage?.cost).toBe(generation?.cost)
+      expect(persistedChat?.totalCostUsd).toBeCloseTo(generation?.cost ?? 0, 12)
+      expect(responsePostCount).toBe(1)
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  }, 60_000)
+
   it('streams a short answer end-to-end and persists generation metadata', async () => {
     const chat = await createChat({ settings: liveSettings() })
     const result = await send(chat.id, [

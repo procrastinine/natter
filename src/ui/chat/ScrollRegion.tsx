@@ -71,8 +71,21 @@ export interface ScrollRegionHandle {
 }
 
 export interface ScrollRegionCommands {
-  captureLayoutAnchor(input?: { element?: HTMLElement; edge?: 'top' | 'bottom' }): boolean
+  captureLayoutAnchor(input?: {
+    element?: HTMLElement
+    edge?: 'top' | 'bottom'
+    replaceExisting?: boolean
+  }): boolean
   revealNearest(element: HTMLElement): boolean
+  getLayoutAnchorMessageId(): string | null
+  getLayoutAnchorSnapshot(): {
+    readonly element: HTMLElement
+    readonly messageId: string | null
+    readonly edge: 'top' | 'bottom'
+    readonly coordinate: number
+  } | null
+  reconcileLayoutAnchor(): boolean
+  applyVirtualizerOffset(offset: number, adjustment?: number): void
 }
 
 const ScrollRegionCommandsContext = createContext<ScrollRegionCommands | null>(null)
@@ -95,9 +108,26 @@ interface SmoothScrollIntent {
   direction: -1 | 1
 }
 
+interface InstantScrollIntent {
+  readonly top: number
+  readonly scrollHeight: number
+  readonly preserveThroughScrollEnd: boolean
+}
+
+interface ObservedScrollGeometry {
+  readonly scrollHeight: number
+  readonly clientHeight: number
+}
+
 interface MessageFollowTarget {
   messageId: string
   element: HTMLElement | null
+}
+
+interface TextContinuityIdentity {
+  readonly markdownOrdinal: number
+  readonly edge: 'start' | 'end'
+  readonly characterOffset: number
 }
 
 type ViewportDisplacement =
@@ -105,8 +135,11 @@ type ViewportDisplacement =
       readonly kind: 'element'
       readonly element: HTMLElement
       readonly messageId: string | null
+      readonly elementOrdinal: number | null
+      readonly textIdentity: TextContinuityIdentity | null
       readonly edge: 'top' | 'bottom'
       readonly coordinate: number
+      readonly documentCoordinate: number
     }
   | {
       readonly kind: 'bottom'
@@ -149,6 +182,114 @@ interface RevealClaimLifecycle {
   status: 'active' | 'cancelled' | 'consumed'
 }
 
+const CONTINUITY_BLOCK_SELECTOR =
+  'p, li, pre, blockquote, table, figcaption, [data-ui="reasoning-summary"], [data-ui="message-body"]'
+
+function continuityElementOrdinal(message: HTMLElement, element: HTMLElement): number | null {
+  if (message === element || !element.matches(CONTINUITY_BLOCK_SELECTOR)) return null
+  return Array.from(message.querySelectorAll<HTMLElement>(CONTINUITY_BLOCK_SELECTOR)).indexOf(
+    element,
+  )
+}
+
+function rangeLineTop(range: Range): number | null {
+  const node = range.startContainer
+  if (!(node instanceof Text)) return range.getClientRects().item(0)?.top ?? null
+  const probe = range.cloneRange()
+  if (range.startOffset < node.length) {
+    probe.setEnd(node, range.startOffset + 1)
+  } else if (range.startOffset > 0) {
+    probe.setStart(node, range.startOffset - 1)
+  }
+  return probe.getClientRects().item(0)?.top ?? null
+}
+
+function captureTextContinuity(
+  container: HTMLDivElement,
+  message: HTMLElement,
+  element: HTMLElement,
+): {
+  readonly element: HTMLElement
+  readonly identity: TextContinuityIdentity
+  readonly coordinate: number
+} | null {
+  const markdown = element.closest<HTMLElement>('[data-ui="markdown"]')
+  if (!markdown || !message.contains(markdown)) return null
+  const markdowns = Array.from(message.querySelectorAll<HTMLElement>('[data-ui="markdown"]'))
+  const markdownOrdinal = markdowns.indexOf(markdown)
+  if (markdownOrdinal < 0) return null
+  const containerRect = container.getBoundingClientRect()
+  const elementRect = element.getBoundingClientRect()
+  const markdownRect = markdown.getBoundingClientRect()
+  const targetY = Math.min(
+    Math.max(containerRect.top + containerRect.height * 0.46, elementRect.top + 1),
+    elementRect.bottom - 1,
+  )
+  const left = Math.max(containerRect.left, markdownRect.left, elementRect.left) + 4
+  const right = Math.min(containerRect.right, markdownRect.right, elementRect.right) - 4
+  const xs = [containerRect.left + containerRect.width / 2, left + 12, right - 12].filter(
+    (x) => Number.isFinite(x) && x >= left && x <= right,
+  )
+  for (const x of xs) {
+    const caret = container.ownerDocument.caretRangeFromPoint?.(x, targetY) ?? null
+    if (!caret || !markdown.contains(caret.startContainer)) continue
+    const coordinate = rangeLineTop(caret)
+    if (coordinate === null) continue
+    const prefix = container.ownerDocument.createRange()
+    prefix.selectNodeContents(markdown)
+    prefix.setEnd(caret.startContainer, caret.startOffset)
+    const prefixLength = prefix.toString().length
+    const progressiveStatic = markdown.dataset.overflow === 'progressive-static'
+    const caretElement =
+      (caret.startContainer instanceof Element
+        ? caret.startContainer
+        : caret.startContainer.parentElement
+      )?.closest<HTMLElement>(CONTINUITY_BLOCK_SELECTOR) ?? element
+    return {
+      element: message.contains(caretElement) ? caretElement : element,
+      identity: {
+        markdownOrdinal,
+        edge: progressiveStatic ? 'end' : 'start',
+        characterOffset: progressiveStatic
+          ? Math.max(0, (markdown.textContent?.length ?? 0) - prefixLength)
+          : prefixLength,
+      },
+      coordinate,
+    }
+  }
+  return null
+}
+
+function resolveTextContinuity(
+  message: HTMLElement,
+  identity: TextContinuityIdentity,
+): { readonly element: HTMLElement; readonly coordinate: number } | null {
+  const markdown = message
+    .querySelectorAll<HTMLElement>('[data-ui="markdown"]')
+    .item(identity.markdownOrdinal)
+  if (!markdown) return null
+  const walker = message.ownerDocument.createTreeWalker(markdown, NodeFilter.SHOW_TEXT)
+  let remaining =
+    identity.edge === 'end'
+      ? Math.max(0, (markdown.textContent?.length ?? 0) - identity.characterOffset)
+      : identity.characterOffset
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    const text = node as Text
+    if (remaining > text.length) {
+      remaining -= text.length
+      continue
+    }
+    const range = message.ownerDocument.createRange()
+    range.setStart(text, remaining)
+    range.collapse(true)
+    const coordinate = rangeLineTop(range)
+    if (coordinate === null) return null
+    const element = text.parentElement?.closest<HTMLElement>(CONTINUITY_BLOCK_SELECTOR) ?? markdown
+    return { element, coordinate }
+  }
+  return null
+}
+
 function semanticFollowClaimForTarget(
   source: Exclude<SemanticFollowClaim['source'], 'manual'>,
   messageId: string | null | undefined,
@@ -161,8 +302,8 @@ function semanticFollowClaimForTarget(
 
 const LAYOUT_ANCHOR_TOLERANCE_PX = 0.5
 
-function matchesInstantScrollIntent(intentTop: number | null, top: number): boolean {
-  return intentTop !== null && Math.abs(intentTop - top) <= PROGRAMMATIC_SCROLL_TOLERANCE_PX
+function matchesInstantScrollIntent(intent: InstantScrollIntent | null, top: number): boolean {
+  return intent !== null && Math.abs(intent.top - top) <= PROGRAMMATIC_SCROLL_TOLERANCE_PX
 }
 
 function advanceSmoothScrollIntent(
@@ -225,7 +366,7 @@ function messageFollowScrollTop(
   )
 }
 
-function visibleMessageAnchor(
+function visibleContentAnchor(
   container: HTMLDivElement,
   content: HTMLDivElement,
 ): HTMLElement | undefined {
@@ -242,7 +383,12 @@ function visibleMessageAnchor(
   for (const y of yCandidates) {
     const hit = hitTestDocument.elementFromPoint?.call(container.ownerDocument, x, y)
     const message = hit?.closest<HTMLElement>('[data-ui="message"][data-message-id]')
-    if (message && content.contains(message)) return message
+    if (!message || !content.contains(message)) continue
+    const element = hit instanceof HTMLElement ? hit : hit?.parentElement
+    const textBlock = element?.closest<HTMLElement>(
+      'p, li, pre, blockquote, table, figcaption, [data-ui="reasoning-summary"], [data-ui="message-body"]',
+    )
+    return textBlock && message.contains(textBlock) ? textBlock : message
   }
   for (const message of content.querySelectorAll<HTMLElement>(
     '[data-ui="message"][data-message-id]',
@@ -311,7 +457,9 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
     typeof document === 'undefined' || document.visibilityState !== 'hidden',
   )
   const lastNativeScrollTopRef = useRef<number | null>(null)
-  const instantScrollIntentTopRef = useRef<number | null>(null)
+  const lastObservedScrollGeometryRef = useRef<ObservedScrollGeometry | null>(null)
+  const userScrollIntentRef = useRef(false)
+  const instantScrollIntentRef = useRef<InstantScrollIntent | null>(null)
   const layoutCorrectionPendingRef = useRef(false)
   const smoothScrollIntentRef = useRef<SmoothScrollIntent | null>(null)
   const thresholdRef = useRef(pinThresholdPx ?? DEFAULT_THRESHOLD_PX)
@@ -339,7 +487,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
         didOpen: didOpenRef.current,
         streamActive: streamActiveRef.current,
         autoScrollOnStream: autoScrollOnStreamRef.current,
-        instantScrollIntentTop: instantScrollIntentTopRef.current,
+        instantScrollIntent: instantScrollIntentRef.current,
         layoutCorrectionPending: layoutCorrectionPendingRef.current,
         followTargetMessageId: claim?.kind === 'message' ? claim.target.messageId : null,
         smoothScrollIntent: smoothScrollIntentRef.current,
@@ -393,7 +541,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
   )
 
   const clearInstantScrollIntents = useCallback(() => {
-    instantScrollIntentTopRef.current = null
+    instantScrollIntentRef.current = null
   }, [])
 
   const clearProgrammaticScrollIntents = useCallback(() => {
@@ -401,8 +549,13 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
     smoothScrollIntentRef.current = null
   }, [clearInstantScrollIntents])
 
-  const recordInstantScrollIntent = useCallback((top: number) => {
-    instantScrollIntentTopRef.current = top
+  const recordInstantScrollIntent = useCallback((top: number, reason: string) => {
+    const container = containerRef.current
+    instantScrollIntentRef.current = {
+      top,
+      scrollHeight: container?.scrollHeight ?? 0,
+      preserveThroughScrollEnd: reason === 'layout-anchor' || reason === 'virtualizer-layout',
+    }
   }, [])
 
   const releaseSemanticClaim = useCallback(() => {
@@ -470,7 +623,11 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
       container.scrollTop = boundedTop
       const actual = container.scrollTop
       lastNativeScrollTopRef.current = actual
-      if (Math.abs(actual - before) > 0.5) recordInstantScrollIntent(actual)
+      lastObservedScrollGeometryRef.current = {
+        scrollHeight: container.scrollHeight,
+        clientHeight: container.clientHeight,
+      }
+      if (Math.abs(actual - before) > 0.5) recordInstantScrollIntent(actual, reason)
       if (hasScrollDebugSink()) {
         debugScroll('position', { source: reason, targetTop: boundedTop })
       }
@@ -481,7 +638,11 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
 
   const capturePinnedLayoutAnchor = useCallback(
     (
-      input?: { element?: HTMLElement; edge?: 'top' | 'bottom' },
+      input?: {
+        element?: HTMLElement
+        edge?: 'top' | 'bottom'
+        replaceExisting?: boolean
+      },
       prepared?: ConversationViewportTransition,
     ): boolean => {
       const container = containerRef.current
@@ -492,21 +653,36 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
       let element = input?.element
       let edge = input?.edge ?? 'top'
       if (!element || !content.contains(element)) {
-        element = visibleMessageAnchor(container, content)
+        element = visibleContentAnchor(container, content)
         edge = 'top'
       }
       if (!element || !content.contains(element)) return false
+      const existing = continuityLeaseRef.current?.displacement
+      if (
+        input?.replaceExisting === false &&
+        existing?.kind === 'element' &&
+        !element.contains(existing.element) &&
+        !existing.element.contains(element)
+      ) {
+        return false
+      }
+      if (input?.replaceExisting === false && existing?.kind === 'bottom') return false
       const message = element.closest<HTMLElement>('[data-ui="message"][data-message-id]')
-      const anchorElement = message ?? element
+      const textContinuity = message ? captureTextContinuity(container, message, element) : null
+      const anchorElement = textContinuity?.element ?? element
       const rect = anchorElement.getBoundingClientRect()
+      const coordinate = textContinuity?.coordinate ?? (edge === 'bottom' ? rect.bottom : rect.top)
       installContinuityLease(
         prepared?.kind ?? 'manual',
         {
           kind: 'element',
           element: anchorElement,
           messageId: message?.getAttribute('data-message-id') ?? null,
+          elementOrdinal: message ? continuityElementOrdinal(message, anchorElement) : null,
+          textIdentity: textContinuity?.identity ?? null,
           edge,
-          coordinate: edge === 'bottom' ? rect.bottom : rect.top,
+          coordinate,
+          documentCoordinate: coordinate + container.scrollTop,
         },
         prepared,
       )
@@ -541,12 +717,12 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
     if (
       !Object.is(lease.selectionKey, selectionKeyRef.current) ||
       lease.workspaceEpoch !== workspaceEpochRef.current ||
-      !Object.is(lease.chatKey, resetKeyRef.current) ||
-      lease.viewportRevision > committedViewportRevisionRef.current
+      !Object.is(lease.chatKey, resetKeyRef.current)
     ) {
       continuityLeaseRef.current = null
       return false
     }
+    if (lease.viewportRevision > committedViewportRevisionRef.current) return false
     const anchor = lease.displacement
     if (!anchor) return false
     if (anchor.kind === 'bottom') {
@@ -557,22 +733,60 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
       return true
     }
     let element = anchor.element
-    if (!element.isConnected || !contentRef.current?.contains(element)) {
+    let current: number
+    if (anchor.textIdentity) {
       if (!anchor.messageId) {
         continuityLeaseRef.current = null
         return false
       }
+      const message = contentRef.current?.querySelector<HTMLElement>(
+        `[data-ui="message"][data-message-id="${CSS.escape(anchor.messageId)}"]`,
+      )
+      if (!message) return false
+      const resolved = resolveTextContinuity(message, anchor.textIdentity)
+      if (!resolved) return false
+      element = resolved.element
+      current = resolved.coordinate
+    } else if (!element.isConnected || !contentRef.current?.contains(element)) {
+      if (!anchor.messageId) {
+        continuityLeaseRef.current = null
+        return false
+      }
+      const message = contentRef.current?.querySelector<HTMLElement>(
+        `[data-ui="message"][data-message-id="${CSS.escape(anchor.messageId)}"]`,
+      )
+      if (!message) return false
       element =
-        contentRef.current?.querySelector<HTMLElement>(
-          `[data-ui="message"][data-message-id="${CSS.escape(anchor.messageId)}"]`,
-        ) ?? element
+        anchor.elementOrdinal === null
+          ? message
+          : (message
+              .querySelectorAll<HTMLElement>(CONTINUITY_BLOCK_SELECTOR)
+              .item(anchor.elementOrdinal) ?? element)
       if (!element.isConnected || !contentRef.current?.contains(element)) return false
+      const rect = element.getBoundingClientRect()
+      current = anchor.edge === 'bottom' ? rect.bottom : rect.top
+    } else {
+      const rect = element.getBoundingClientRect()
+      current = anchor.edge === 'bottom' ? rect.bottom : rect.top
     }
-    const rect = element.getBoundingClientRect()
-    const current = anchor.edge === 'bottom' ? rect.bottom : rect.top
+    const documentCoordinate = current + container.scrollTop
     const delta = current - anchor.coordinate
-    if (Math.abs(delta) <= LAYOUT_ANCHOR_TOLERANCE_PX) return false
+    if (Math.abs(delta) <= LAYOUT_ANCHOR_TOLERANCE_PX) {
+      if (Math.abs(documentCoordinate - anchor.documentCoordinate) > LAYOUT_ANCHOR_TOLERANCE_PX) {
+        continuityLeaseRef.current = {
+          ...lease,
+          displacement: { ...anchor, element, documentCoordinate },
+        }
+      }
+      return false
+    }
     writeScrollTopNow(container.scrollTop + delta, 'layout-anchor')
+    if (continuityLeaseRef.current === lease) {
+      continuityLeaseRef.current = {
+        ...lease,
+        displacement: { ...anchor, element, documentCoordinate },
+      }
+    }
     return true
   }, [writeScrollTopNow])
 
@@ -659,8 +873,11 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
           kind: 'element',
           element,
           messageId: claim.target.messageId,
+          elementOrdinal: null,
+          textIdentity: null,
           edge: 'bottom',
           coordinate: element.getBoundingClientRect().bottom,
+          documentCoordinate: element.getBoundingClientRect().bottom + container.scrollTop,
         },
       }
     },
@@ -823,8 +1040,11 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
         kind: 'element',
         element,
         messageId: claim.target.messageId,
+        elementOrdinal: null,
+        textIdentity: null,
         edge: 'bottom',
         coordinate: element.getBoundingClientRect().bottom,
+        documentCoordinate: element.getBoundingClientRect().bottom + container.scrollTop,
       })
       return true
     },
@@ -892,43 +1112,93 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
       const container = containerRef.current
       if (!container) return
       const previousNativeScrollTop = lastNativeScrollTopRef.current
+      const previousGeometry = lastObservedScrollGeometryRef.current
       const next = scrollStateFromPosition(container, thresholdRef.current)
       const stationaryNativeScroll =
         source === 'scroll' &&
         previousNativeScrollTop !== null &&
         Math.abs(previousNativeScrollTop - container.scrollTop) <= 0.5
+      const displacement = continuityLeaseRef.current?.displacement
+      const continuityGeometryChanged =
+        source === 'scroll' &&
+        displacement?.kind === 'element' &&
+        displacement.element.isConnected &&
+        Math.abs(
+          (displacement.edge === 'bottom'
+            ? displacement.element.getBoundingClientRect().bottom
+            : displacement.element.getBoundingClientRect().top) +
+            container.scrollTop -
+            displacement.documentCoordinate,
+        ) > LAYOUT_ANCHOR_TOLERANCE_PX
+      const scrollGeometryChanged =
+        source === 'scroll' &&
+        previousGeometry !== null &&
+        (Math.abs(previousGeometry.scrollHeight - container.scrollHeight) > 0.5 ||
+          Math.abs(previousGeometry.clientHeight - container.clientHeight) > 0.5)
       if (source === 'scroll') lastNativeScrollTopRef.current = container.scrollTop
+      lastObservedScrollGeometryRef.current = {
+        scrollHeight: container.scrollHeight,
+        clientHeight: container.clientHeight,
+      }
       if (hasScrollDebugSink()) {
-        debugScroll('position', { source, next, stationaryNativeScroll })
+        debugScroll('position', {
+          source,
+          next,
+          stationaryNativeScroll,
+          continuityGeometryChanged,
+          scrollGeometryChanged,
+          userScrollIntent: userScrollIntentRef.current,
+        })
       }
       let programmaticScroll = false
       if (source === 'scroll') {
-        const instantIntentTop = instantScrollIntentTopRef.current
-        instantScrollIntentTopRef.current = null
-        const instantMatched = matchesInstantScrollIntent(instantIntentTop, container.scrollTop)
-        if (instantMatched) {
+        const instantIntent = instantScrollIntentRef.current
+        const instantMatched = matchesInstantScrollIntent(instantIntent, container.scrollTop)
+        const instantGeometryChanged =
+          instantIntent?.preserveThroughScrollEnd &&
+          instantIntent.scrollHeight !== container.scrollHeight
+        if (
+          instantMatched ||
+          instantGeometryChanged ||
+          continuityGeometryChanged ||
+          (scrollGeometryChanged &&
+            !userScrollIntentRef.current &&
+            continuityLeaseRef.current !== null)
+        ) {
           programmaticScroll = true
+          instantScrollIntentRef.current = instantIntent?.preserveThroughScrollEnd
+            ? {
+                ...instantIntent,
+                top: container.scrollTop,
+                scrollHeight: container.scrollHeight,
+              }
+            : null
         } else if (smoothScrollIntentRef.current) {
+          instantScrollIntentRef.current = null
           const smooth = advanceSmoothScrollIntent(
             smoothScrollIntentRef.current,
             container.scrollTop,
           )
           smoothScrollIntentRef.current = smooth.next
           programmaticScroll = smooth.programmatic
+        } else {
+          instantScrollIntentRef.current = null
         }
       }
       const preparedTransition =
         source === 'scroll' && !programmaticScroll ? pendingPreparedTransitionRef.current : null
       if (preparedTransition) rebasePreparedTransitionToUser(preparedTransition)
-      if (next === 'follow') {
-        setScrollStateNow('follow', source)
-        return
-      }
       if (
         programmaticScroll ||
         (layoutCorrectionPendingRef.current && continuityLeaseRef.current?.mode === 'follow') ||
         (stationaryNativeScroll && continuityLeaseRef.current?.mode === 'follow')
       ) {
+        return
+      }
+      if (next === 'follow') {
+        if (source === 'scroll' || continuityLeaseRef.current?.mode === 'follow') {
+          setScrollStateNow('follow', source)
+        }
         return
       }
       if (source === 'scroll') {
@@ -938,7 +1208,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
         if (!preparedTransition) capturePinnedLayoutAnchor()
         return
       }
-      if (continuityLeaseRef.current?.mode === 'follow') {
+      if (stateRef.current === 'follow' || continuityLeaseRef.current?.mode === 'follow') {
         setScrollStateNow('follow', source)
         return
       }
@@ -1070,11 +1340,34 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
         }
         return true
       },
+      getLayoutAnchorMessageId() {
+        const displacement = continuityLeaseRef.current?.displacement
+        return displacement?.kind === 'element' ? displacement.messageId : null
+      },
+      getLayoutAnchorSnapshot() {
+        const displacement = continuityLeaseRef.current?.displacement
+        return displacement?.kind === 'element'
+          ? {
+              element: displacement.element,
+              messageId: displacement.messageId,
+              edge: displacement.edge,
+              coordinate: displacement.coordinate,
+            }
+          : null
+      },
+      reconcileLayoutAnchor() {
+        return correctContinuityLease()
+      },
+      applyVirtualizerOffset(offset, adjustment = 0) {
+        writeScrollTopNow(offset + adjustment, 'virtualizer-layout')
+        correctContinuityLease()
+      },
     }),
     [
       cancelViewportOwnership,
       capturePinnedLayoutAnchor,
       clearProgrammaticScrollIntents,
+      correctContinuityLease,
       installContinuityLease,
       setScrollStateNow,
       writeScrollTopNow,
@@ -1213,7 +1506,11 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
   useEffect(() => {
     const container = containerRef.current
     if (!container) return
-    const markUserScrollIntent = (event: 'wheel' | 'touchmove' | 'scrollbar' | 'keyboard') => {
+    const markUserScrollIntent = (
+      event: 'wheel' | 'touchmove' | 'scrollbar' | 'keyboard',
+      pinSynchronously = false,
+    ) => {
+      userScrollIntentRef.current = true
       clearProgrammaticScrollIntents()
       const lease = continuityLeaseRef.current
       if (lease?.mode === 'follow') {
@@ -1231,11 +1528,16 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
       if (preparedTransition) {
         rebasePreparedTransitionToUser(preparedTransition)
       } else {
-        cancelViewportOwnership()
+        if (continuityLeaseRef.current?.mode === 'follow') {
+          captureFollowDisplacement()
+          releaseSemanticClaim()
+        }
+        capturePinnedLayoutAnchor()
       }
       if (owned && hasScrollDebugSink()) {
         debugScroll('user-follow-cancel', { event })
       }
+      if (pinSynchronously) setScrollStateNow('pinned', `${event}-intent`)
       if (hasScrollDebugSink() && (event === 'wheel' || event === 'touchmove')) {
         debugScroll(event)
       }
@@ -1255,10 +1557,14 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
       settleAcquiredFiniteFollowClaim()
     }
     const onScrollEnd = () => {
+      userScrollIntentRef.current = false
+      if (!instantScrollIntentRef.current?.preserveThroughScrollEnd) {
+        instantScrollIntentRef.current = null
+      }
       smoothScrollIntentRef.current = null
       settleAcquiredFiniteFollowClaim()
     }
-    const onWheel = () => markUserScrollIntent('wheel')
+    const onWheel = (event: WheelEvent) => markUserScrollIntent('wheel', event.deltaY < 0)
     const onTouchMove = () => markUserScrollIntent('touchmove')
     const onPointerDown = (event: PointerEvent) => {
       if (event.target === container) markUserScrollIntent('scrollbar')
@@ -1273,28 +1579,31 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
       ) {
         return
       }
-      markUserScrollIntent('keyboard')
+      markUserScrollIntent('keyboard', ['ArrowUp', 'PageUp', 'Home'].includes(event.key))
     }
     container.addEventListener('wheel', onWheel, { passive: true })
     container.addEventListener('touchmove', onTouchMove, { passive: true })
     container.addEventListener('pointerdown', onPointerDown, { passive: true })
     container.addEventListener('keydown', onKeyDown)
-    container.addEventListener('scroll', onScroll, { passive: true })
+    container.addEventListener('scroll', onScroll, { capture: true, passive: true })
     container.addEventListener('scrollend', onScrollEnd, { passive: true })
     return () => {
       container.removeEventListener('wheel', onWheel)
       container.removeEventListener('touchmove', onTouchMove)
       container.removeEventListener('pointerdown', onPointerDown)
       container.removeEventListener('keydown', onKeyDown)
-      container.removeEventListener('scroll', onScroll)
+      container.removeEventListener('scroll', onScroll, { capture: true })
       container.removeEventListener('scrollend', onScrollEnd)
     }
   }, [
-    cancelViewportOwnership,
+    captureFollowDisplacement,
+    capturePinnedLayoutAnchor,
     clearProgrammaticScrollIntents,
     debugScroll,
     rebasePreparedTransitionToUser,
+    releaseSemanticClaim,
     scheduleFollowReconciliation,
+    setScrollStateNow,
     settleAcquiredFiniteFollowClaim,
     updateFromScrollPosition,
   ])
@@ -1348,19 +1657,38 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
       previousLease.claim.source === 'stream'
     ) {
       correctContinuityLease()
+      captureFollowDisplacement()
       releaseSemanticClaim()
       layoutCorrectionPendingRef.current = false
       if (container) setScrollStateNow('follow', 'stream-terminal')
     }
+    const terminalStreamLease =
+      streamEnded && continuityLeaseRef.current?.mode === 'preserve'
+        ? continuityLeaseRef.current
+        : null
     const carriedClaim =
       continuityLeaseRef.current?.mode === 'follow'
         ? continuityLeaseRef.current.claim
-        : previousLease?.mode === 'follow'
+        : !streamEnded && previousLease?.mode === 'follow'
           ? previousLease.claim
           : null
     const carriedDisplacement =
-      previousLease?.mode === 'preserve' ? previousLease.displacement : null
-    if (selectionIdentityChanged) cancelContinuityLease()
+      continuityLeaseRef.current?.mode === 'preserve'
+        ? continuityLeaseRef.current.displacement
+        : previousLease?.mode === 'preserve'
+          ? previousLease.displacement
+          : null
+    if (selectionIdentityChanged) {
+      if (terminalStreamLease) {
+        continuityLeaseRef.current = {
+          ...terminalStreamLease,
+          revision: ++continuityRevisionRef.current,
+          selectionKey,
+        }
+      } else {
+        cancelContinuityLease()
+      }
+    }
     selectionKeyRef.current = selectionKey
 
     const lifecycle = revealClaimLifecycleRef.current
@@ -1384,7 +1712,9 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
       scheduleFollowReconciliation()
     }
 
-    if (selectionIdentityChanged) {
+    if (selectionIdentityChanged && terminalStreamLease) {
+      correctContinuityLease()
+    } else if (selectionIdentityChanged) {
       clearProgrammaticScrollIntents()
       const currentLease = continuityLeaseRef.current
       const claim = currentLease?.mode === 'follow' ? currentLease.claim : carriedClaim
@@ -1500,6 +1830,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
     autoScrollOnStream,
     cancelContinuityLease,
     cancelViewportOwnership,
+    captureFollowDisplacement,
     clearProgrammaticScrollIntents,
     correctContinuityLease,
     debugScroll,

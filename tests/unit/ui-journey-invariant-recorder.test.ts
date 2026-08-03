@@ -338,7 +338,7 @@ describe('UI journey invariant recorder', () => {
     )
   })
 
-  it('accepts only contiguous geometry-compensated bounded prefix eviction', async () => {
+  it('accepts only contiguous text-anchored bounded prefix eviction', async () => {
     document.body.innerHTML = `
       <div data-ui="shell"><main data-ui="content">
         <div data-ui="scroll"><div
@@ -404,7 +404,7 @@ describe('UI journey invariant recorder', () => {
     requiredElement('[data-message-id="m2"]').remove()
     messages.setAttribute('data-rendered-count', '2')
     scrollHeight = 800
-    scrollTop = 300
+    scrollTop = 350
     await flushMutationFrame()
     expect(recorder.report().violations).toEqual([])
 
@@ -422,6 +422,60 @@ describe('UI journey invariant recorder', () => {
     await flushMutationFrame()
     expect(recorder.report().violations.map((violation) => violation.code)).toEqual(
       expect.arrayContaining(['count-regression', 'transcript-prefix-loss']),
+    )
+  })
+
+  it('accepts bounded virtual residency changes but still rejects overlapping row remounts', async () => {
+    document.body.innerHTML = `
+      <div data-ui="shell"><main data-ui="content">
+        <div data-ui="scroll"><div
+          data-ui="messages"
+          data-rendered-count="20"
+          data-virtualized="true"
+        >
+          <article data-message-id="m1"></article>
+          <article data-message-id="m2"></article>
+          <article data-message-id="m3"></article>
+        </div></div>
+      </main></div>
+    `
+    const messages = requiredElement<HTMLElement>('[data-ui="messages"]')
+    topElement = messages
+    installUiJourneyInvariantRecorderInPage({
+      shell: { selector: '[data-ui="shell"]', contentSelector: '[data-ui="content"]' },
+      countSurfaces: [
+        {
+          id: 'mounted-messages',
+          rootSelector: '[data-ui="messages"]',
+          itemSelector: '[data-message-id]',
+          minimum: 1,
+        },
+      ],
+      transcript: {
+        rootSelector: '[data-ui="messages"]',
+        itemSelector: '[data-message-id]',
+        idAttribute: 'data-message-id',
+        boundedVirtualResidency: {
+          renderedCountAttribute: 'data-rendered-count',
+          virtualizedAttribute: 'data-virtualized',
+        },
+      },
+    })
+    const recorder = installedRecorder()
+    const armed = recorder.arm()
+    flushFrame()
+    await armed
+
+    requiredElement('[data-message-id="m1"]').remove()
+    messages.insertAdjacentHTML('beforeend', '<article data-message-id="m4"></article>')
+    await flushMutationFrame()
+    expect(recorder.report().violations).toEqual([])
+
+    const retained = requiredElement('[data-message-id="m2"]')
+    retained.replaceWith(retained.cloneNode(true))
+    await flushMutationFrame()
+    expect(recorder.report().violations.map((violation) => violation.code)).toContain(
+      'transcript-message-remount',
     )
   })
 

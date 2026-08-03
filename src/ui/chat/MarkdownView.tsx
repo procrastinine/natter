@@ -133,12 +133,10 @@ export function MarkdownView({
   const configurationPreferences = useConfigurationPreferences()
   const scrollRegionCommands = useScrollRegionCommands()
   const markdownRootRef = useRef<HTMLDivElement | null>(null)
-  const captureProgressiveStaticAnchor = useCallback(() => {
-    const element = markdownRootRef.current
-    return element
-      ? scrollRegionCommands?.captureLayoutAnchor({ element, edge: 'bottom' })
-      : scrollRegionCommands?.captureLayoutAnchor()
-  }, [scrollRegionCommands])
+  const captureProgressiveStaticAnchor = useCallback(
+    () => scrollRegionCommands?.captureLayoutAnchor({ replaceExisting: false }),
+    [scrollRegionCommands],
+  )
   const allowed = useMemo(
     () => [
       ...new Set([

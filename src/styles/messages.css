@@ -12,7 +12,7 @@
  *              'message-body'|'message-actions'|'message-action'|
  *              'message-info'|'message-info-row'|'profile-glyph'|
  *              'profile-glyph-button'|'message-body-peek'|
- *              'inline-editor'|'message-edited'|'message-imported'|
+ *              'message-edited'|'message-imported'|
  *              'message-error'|'message-crash'|'message-continue'|
  *              'fallback-chip'].
  */
@@ -32,6 +32,30 @@
   padding: var(--space-3) 0 var(--space-2);
   color: var(--color-fg-muted);
   font-size: var(--font-size-sm);
+}
+
+[data-ui="message-virtual-window"] {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+}
+
+[data-ui="message-virtual-row"] {
+  display: block;
+  width: 100%;
+}
+
+[data-ui="message-virtual-window"][data-virtualized="true"] {
+  display: block;
+  position: relative;
+}
+
+[data-ui="message-virtual-window"][data-virtualized="true"] > [data-ui="message-virtual-row"] {
+  display: block;
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
 }
 
 [data-ui="load-more-messages"] {
@@ -69,15 +93,6 @@
     minmax(var(--message-glyph-gutter), 1fr);
   column-gap: 0;
   padding: var(--message-row-padding) 0 0;
-  content-visibility: auto;
-  contain-intrinsic-size: 240px;
-}
-
-[data-ui="message"]:has([data-ui="tool-evidence"][open]),
-[data-ui="message"]:has([data-ui="reasoning"][open]),
-[data-ui="message"]:has([data-ui="message-info"]),
-[data-ui="message"]:has([data-ui="inline-editor"]) {
-  content-visibility: visible;
 }
 
 /* Vertically center the round glyph on the role label (User / Assistant)
@@ -200,7 +215,9 @@
   border-bottom: 1px solid var(--color-border-subtle);
 }
 
-[data-ui="message"]:last-child > [data-ui="message-body-column"] {
+[data-ui="message-virtual-row"][data-terminal="true"]
+  > [data-ui="message"]
+  > [data-ui="message-body-column"] {
   border-bottom: none;
 }
 

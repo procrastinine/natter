@@ -101,6 +101,10 @@ export interface UiJourneyTranscriptConfig {
     renderedCountAttribute: string
     totalCountAttribute: string
   }
+  boundedVirtualResidency?: {
+    renderedCountAttribute: string
+    virtualizedAttribute: string
+  }
 }
 
 export interface UiJourneyInvariantRecorderConfig {
@@ -189,9 +193,12 @@ export interface UiJourneySample {
     rootId: number
     count: number
     messageIds: readonly string[]
+    presentationKind: string | null
+    virtualWindowId: number | null
     truncated: boolean
     renderedCount: number | null
     totalCount: number | null
+    virtualized: boolean
   } | null
   scroll: {
     nodeId: number
@@ -347,6 +354,8 @@ export function installUiJourneyInvariantRecorderInPage(
   const claimBaselines = new Map<string, string>()
   const messageNodes = new Map<string, Element>()
   const messageTops = new Map<string, number>()
+  const messageWrappers = new Map<string, Element>()
+  const messageWrapperIndices = new Map<string, string | null>()
   const priorCounts = new Map<string, number>()
   const pendingGestures = new Map<
     string,
@@ -682,6 +691,8 @@ export function installUiJourneyInvariantRecorderInPage(
     }
     if (config.transcript?.resetOnRouteChange ?? true) {
       messageNodes.clear()
+      messageWrappers.clear()
+      messageWrapperIndices.clear()
     }
   }
   const inspectRouteChange = (seen: Set<string>, previous: string, current: string) => {
@@ -959,6 +970,18 @@ export function installUiJourneyInvariantRecorderInPage(
       root,
       config.transcript.boundedPrefixEviction?.totalCountAttribute,
     )
+    const virtualized =
+      config.transcript.boundedVirtualResidency !== undefined &&
+      root.getAttribute(config.transcript.boundedVirtualResidency.virtualizedAttribute) === 'true'
+    const residencyRenderedCount = readIntegerAttribute(
+      root,
+      config.transcript.boundedVirtualResidency?.renderedCountAttribute,
+    )
+    const boundedVirtualResidency =
+      virtualized && residencyRenderedCount !== null && residencyRenderedCount >= all.length
+    const presentationKind = root.getAttribute('data-presentation-kind')
+    const virtualWindow = root.querySelector('[data-ui="message-virtual-window"]')
+    const virtualWindowId = virtualWindow ? nodeId(virtualWindow) : null
     const previousTranscript = priorSample?.transcript
     const previousIds = previousTranscript?.messageIds ?? []
     const evictedRowCount = previousIds.length - messageIds.length
@@ -991,16 +1014,17 @@ export function installUiJourneyInvariantRecorderInPage(
       retainedAnchor === previousAnchor &&
       previousAnchorTop !== undefined &&
       retainedAnchorTop !== undefined &&
-      Math.abs(retainedAnchorTop - previousAnchorTop) <= tolerance &&
-      Math.abs(
-        scrollState.top - priorSample.scroll.top - (scrollState.height - priorSample.scroll.height),
-      ) <= tolerance &&
-      Math.abs(scrollState.fromBottom - priorSample.scroll.fromBottom) <= tolerance
-    if ((config.transcript.preservePrefix ?? true) && !resetComparison && !boundedPrefixEviction) {
+      Math.abs(retainedAnchorTop - previousAnchorTop) <= tolerance
+    const replacementIndex = transcriptReplacementIntent
+      ? previousIds.indexOf(transcriptReplacementIntent.messageId)
+      : -1
+    if (
+      (config.transcript.preservePrefix ?? true) &&
+      !resetComparison &&
+      !boundedPrefixEviction &&
+      !boundedVirtualResidency
+    ) {
       const allowance = Math.max(0, config.transcript.stablePrefixTailAllowance ?? 0)
-      const replacementIndex = transcriptReplacementIntent
-        ? previousIds.indexOf(transcriptReplacementIntent.messageId)
-        : -1
       const stable =
         replacementIndex >= 0
           ? previousIds.slice(0, replacementIndex)
@@ -1023,30 +1047,46 @@ export function installUiJourneyInvariantRecorderInPage(
     if (config.transcript.preserveMessageIdentity ?? true) {
       for (const [id, element] of currentNodes) {
         const previous = messageNodes.get(id)
-        if (previous && previous !== element) {
+        const previousWrapper = messageWrappers.get(id)
+        const currentWrapper = element.closest('[data-ui="message-virtual-row"]')
+        const previousWrapperIndex = messageWrapperIndices.get(id) ?? null
+        const currentWrapperIndex = currentWrapper?.getAttribute('data-index') ?? null
+        const replacementOwnsIdentity =
+          replacementIndex >= 0 && previousIds.slice(replacementIndex).includes(id)
+        if (previous && previous !== element && !replacementOwnsIdentity) {
           recordViolation(
             seen,
             'transcript-message-remount',
             id,
-            `${nodeId(previous)} -> ${nodeId(element)}`,
+            `${nodeId(previous)} -> ${nodeId(element)}; wrapper ${previousWrapper ? nodeId(previousWrapper) : 0}@${previousWrapperIndex ?? 'none'} -> ${currentWrapper ? nodeId(currentWrapper) : 0}@${currentWrapperIndex ?? 'none'}; window ${previousTranscript?.virtualWindowId ?? 0} -> ${virtualWindowId ?? 0}; root ${previousTranscript?.rootId ?? 0} -> ${nodeId(root)}; presentation ${previousTranscript?.presentationKind ?? 'none'} -> ${presentationKind ?? 'none'}; virtualized ${previousTranscript?.virtualized === true ? 'true' : 'false'} -> ${virtualized ? 'true' : 'false'}; rendered ${previousTranscript?.renderedCount ?? 'none'} -> ${renderedCount ?? 'none'}`,
           )
         }
       }
     }
     messageNodes.clear()
     messageTops.clear()
+    messageWrappers.clear()
+    messageWrapperIndices.clear()
     for (const [id, element] of currentNodes) {
       messageNodes.set(id, element)
       messageTops.set(id, element.getBoundingClientRect().top)
+      const wrapper = element.closest('[data-ui="message-virtual-row"]')
+      if (wrapper) {
+        messageWrappers.set(id, wrapper)
+        messageWrapperIndices.set(id, wrapper.getAttribute('data-index'))
+      }
     }
     return {
       transcript: {
         rootId: nodeId(root),
         count: all.length,
         messageIds,
+        presentationKind,
+        virtualWindowId,
         truncated: all.length > tracked.length,
         renderedCount,
         totalCount,
+        virtualized,
       },
       scroll: scrollState,
       boundedPrefixEviction,
@@ -1738,6 +1778,8 @@ export function installUiJourneyInvariantRecorderInPage(
     semanticConfigs.clear()
     claimBaselines.clear()
     messageNodes.clear()
+    messageWrappers.clear()
+    messageWrapperIndices.clear()
     pendingGestures.clear()
     followIntent = undefined
     prependIntent = undefined
@@ -1763,6 +1805,8 @@ export function installUiJourneyInvariantRecorderInPage(
       semanticConfigs.clear()
       claimBaselines.clear()
       messageNodes.clear()
+      messageWrappers.clear()
+      messageWrapperIndices.clear()
       priorCounts.clear()
       for (const pending of pendingGestures.values()) {
         document.removeEventListener(pending.eventType, pending.listener, true)

@@ -90,7 +90,14 @@ const IMPLEMENTED_INTERACTION_AREAS = [
       'ui/chat/ReasoningBlock.tsx',
       'ui/chat/ToolEvidenceBlock.tsx',
     ],
-    stylesheets: ['messages.css', 'reasoning.css', 'tools.css', 'forms.css', 'primitives.css'],
+    stylesheets: [
+      'messages.css',
+      'branching.css',
+      'reasoning.css',
+      'tools.css',
+      'forms.css',
+      'primitives.css',
+    ],
   },
   {
     name: 'rendered content actions',

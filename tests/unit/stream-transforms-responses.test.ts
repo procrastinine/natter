@@ -136,7 +136,18 @@ describe('splitResponsesStream — representative streaming fixture', () => {
 
 describe('splitResponsesStream — representative buffered result', () => {
   it('synthesizes one authoritative envelope/text/tool/phase terminal snapshot', async () => {
-    const buffered = responsesBufferedResult
+    const buffered: ResponsesResultWire = {
+      ...responsesBufferedResult,
+      usage: {
+        ...responsesBufferedResult.usage,
+        cost: 0.00000825,
+        cost_details: {
+          upstream_inference_cost: 0.00000825,
+          upstream_inference_input_cost: 0.000002,
+          upstream_inference_output_cost: 0.00000625,
+        },
+      },
+    }
     const chunks: ResponsesStreamChunk[] = [
       buffered.id
         ? { type: 'buffered_result', result: buffered, generationId: buffered.id }
@@ -152,10 +163,22 @@ describe('splitResponsesStream — representative buffered result', () => {
     }
     expect(snapshot.outcome).toEqual({ kind: 'finish', finishReason: 'stop' })
     expect(snapshot.generationId).toBe(buffered.id)
-    expect(snapshot.usage).toBeDefined()
+    expect(snapshot.usage).toMatchObject({
+      prompt_tokens: 5,
+      completion_tokens: 7,
+      total_tokens: 12,
+      cost: 0.00000825,
+      cost_details: {
+        upstream_inference_cost: 0.00000825,
+        upstream_inference_input_cost: 0.000002,
+        upstream_inference_output_cost: 0.00000625,
+      },
+    })
     expect(snapshot.payload.textParts.map((part) => part.text).join('')).toMatch(/44 and 46/)
     expect(snapshot.payload.phase).toBe('final_answer')
-    const envelope = foldStreamLaneEvents(lanes).final.reasoningEnvelope
+    const folded = foldStreamLaneEvents(lanes)
+    expect(folded.accumulator.usage?.cost).toBe(0.00000825)
+    const envelope = folded.final.reasoningEnvelope
     expect(envelope?.visible[0]).toMatchObject({
       kind: 'summary',
       source: {

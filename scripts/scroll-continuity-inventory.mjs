@@ -225,13 +225,6 @@ export const TRANSCRIPT_HEIGHT_PRODUCERS = Object.freeze([
     'stream',
     'follow-or-anchor',
   ),
-  heightProducer(
-    'content-visibility-realization',
-    'src/styles/messages.css',
-    'content-visibility: auto;',
-    'browser-layout',
-    'follow-or-anchor',
-  ),
 ])
 
 export const SCROLL_HEIGHT_PRODUCER_PROOF_MATRIX = Object.freeze([
@@ -252,7 +245,6 @@ export const SCROLL_HEIGHT_PRODUCER_PROOF_MATRIX = Object.freeze([
   heightProducerProof('inline-editor-autosize', 'user-control'),
   heightProducerProof('message-collapse-mode', 'user-control'),
   heightProducerProof('generation-terminal-notices', 'stream'),
-  heightProducerProof('content-visibility-realization', 'browser-layout'),
 ])
 
 export const SCROLL_SEMANTIC_TRANSITIONS = Object.freeze([
@@ -350,9 +342,9 @@ export const SCROLL_SEMANTIC_TRANSITIONS = Object.freeze([
   transition(
     'user-follow-cancel',
     'src/ui/chat/ScrollRegion.tsx',
-    "const markUserScrollIntent = (event: 'wheel' | 'touchmove' | 'scrollbar' | 'keyboard') => {",
+    'const markUserScrollIntent = (',
     'user-intent',
-    'Wheel, touch, scrollbar, and keyboard intent revoke automatic follow ownership.',
+    'Wheel, touch, scrollbar, and keyboard intent synchronously revoke automatic follow ownership.',
   ),
   transition(
     'editor-nearest-reveal',
@@ -377,6 +369,13 @@ export const SCROLL_EXISTING_PROOFS = Object.freeze([
     "test('very long destination paints first, passively fills, and loads older batches manually'",
     'browser',
     'Bounds repeated manual prepend displacement, but not the automatic top-demand sequence reported by the user.',
+  ),
+  proof(
+    'exact-100k-native-scroll-and-glyph-browser',
+    'tests/e2e/render-window-loading.spec.ts',
+    "test('physical scrolling across 100k-character turns preserves text and constrained sticky glyphs through every expansion'",
+    'browser',
+    'Materializes 48 exact 100k-character turns, monitors semantic text every frame through normal-speed 10 to 20 to 40 to 48 expansion, and traverses top to bottom to top while checking glyph containment and handoff.',
   ),
   proof(
     'automatic-adjacent-prepend',

@@ -625,11 +625,7 @@ export const ChatList = memo(function ChatList({
             routeIntentOwner(routeIntent),
           )
           const importedCount = committed.results.length
-          pushToast({
-            level: 'success',
-            text: importedCount === 1 ? 'Imported chat.' : `Imported ${importedCount} chats.`,
-            durationMs: 2500,
-          })
+          let navigationWarning: string | null = null
           if (isRouteIntentCurrent(routeIntent)) {
             try {
               const delivery = actions.acceptCommittedConversationImports(committed)
@@ -637,20 +633,33 @@ export const ChatList = memo(function ChatList({
                 const last = committed.results.at(-1)
                 if (!last) throw new Error('ConversationImportCommittedResultMissing')
                 navigateToChatForIntent(routeIntent, last.chatId, delivery.handoff)
+              } else {
+                const last = committed.results.at(-1)
+                console.warn('Chat import committed without a local navigation handoff', {
+                  importedCount,
+                  destinationChatId: last?.chatId ?? null,
+                  routeDelivery: delivery.kind,
+                })
+                navigationWarning =
+                  'The chats were imported, but the last chat could not be opened automatically.'
               }
             } catch (error) {
               if (committed.routeDelivery.kind === 'handoff') {
                 committed.routeDelivery.handoff.cancel()
               }
               console.error('Chat import committed but its local navigation handoff failed', error)
-              pushToast({
-                level: 'warning',
-                text: 'The chats were imported, but the last chat could not be opened automatically.',
-              })
+              navigationWarning =
+                'The chats were imported, but the last chat could not be opened automatically.'
             }
           } else if (committed.routeDelivery.kind === 'handoff') {
             committed.routeDelivery.handoff.cancel()
           }
+          pushToast({
+            level: 'success',
+            text: importedCount === 1 ? 'Imported chat.' : `Imported ${importedCount} chats.`,
+            durationMs: 2500,
+          })
+          if (navigationWarning) pushToast({ level: 'warning', text: navigationWarning })
         } catch (error) {
           console.error('Failed to import chat JSON/ZIP', error)
           pushToast({ level: 'danger', text: importExportErrorMessage(error) })

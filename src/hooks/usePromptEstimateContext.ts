@@ -6,6 +6,21 @@ import type {
 import { promptEstimateContextWorkspace } from '../store/prompt-estimate-context-workspace'
 import { useWorkspaceFence } from './useCatalogApplication'
 
+interface PromptEstimateContextPublication {
+  readonly targetKey: string
+  readonly chatId: string
+  readonly value: PromptEstimateContextSnapshot | null
+}
+
+export function selectPromptEstimateContextForTarget(
+  target: Pick<PromptEstimateContextTarget, 'key' | 'chat'> | null,
+  snapshot: PromptEstimateContextPublication | null,
+): PromptEstimateContextSnapshot | null {
+  return target && snapshot?.targetKey === target.key && snapshot.chatId === target.chat.id
+    ? snapshot.value
+    : null
+}
+
 export function usePromptEstimateContext(
   target: PromptEstimateContextTarget | null,
 ): PromptEstimateContextSnapshot | null {
@@ -20,5 +35,5 @@ export function usePromptEstimateContext(
     if (!fence || !target) return
     return controller.request(fence, target)
   }, [controller, fence, target])
-  return target && snapshot?.chatId === target.chat.id ? snapshot.value : null
+  return selectPromptEstimateContextForTarget(target, snapshot)
 }

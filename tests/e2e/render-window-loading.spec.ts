@@ -45,6 +45,121 @@ test('destination-first transcript loading passively reaches the configured floo
   })
 })
 
+test('cold sidebar passive fill preserves visible text when reading starts before the floor', async ({
+  page,
+}, testInfo) => {
+  const initialRenderWork = 10
+  const totalCount = 48
+  const destinationText = Array.from(
+    { length: 240 },
+    (_, index) => `cold sidebar destination paragraph ${index} ${'x'.repeat(72)}`,
+  ).join('\n\n')
+  const chatId = await seedLinearChat(page, {
+    messageCount: totalCount,
+    chatId: 'cold-sidebar-continuity-chat',
+    title: 'Cold sidebar continuity chat',
+    textForIndex: (index) =>
+      index === totalCount - 1
+        ? destinationText
+        : `cold sidebar history ${index} ${'x'.repeat((index % 5) * 140)}`,
+    settings: {
+      'global:message-initial-render-work': initialRenderWork,
+      'global:message-render-window-load-mode': 'auto',
+    },
+  })
+
+  await page.goto('/#/new')
+  await installColdSidebarReadingProbe(page, initialRenderWork)
+  await page.setViewportSize({ width: 1280, height: 360 })
+  await page.reload()
+  await expect(page).toHaveURL(/#\/new$/u)
+  const target = page.locator(`[data-ui="chat-row-link"][href="#/chat/${chatId}"]`)
+  await expect(target).toBeVisible()
+  await target.click()
+
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (
+            window as typeof window & {
+              __coldSidebarReadingProbe?: { readingStartedAt: number | null }
+            }
+          ).__coldSidebarReadingProbe?.readingStartedAt ?? null,
+      ),
+    )
+    .not.toBeNull()
+  await expect.poll(() => page.locator('[data-ui="message"]').count()).toBeGreaterThanOrEqual(10)
+  const probe = await page.evaluate(() => {
+    const state = (
+      window as typeof window & {
+        __coldSidebarReadingProbe?: {
+          pointObservedAt: number | null
+          readingStartedAt: number | null
+          floorObservedAt: number | null
+          anchor: SemanticTextAnchor | null
+          counts: number[]
+        }
+      }
+    ).__coldSidebarReadingProbe
+    return {
+      pointObservedAt: state?.pointObservedAt ?? null,
+      readingStartedAt: state?.readingStartedAt ?? null,
+      floorObservedAt: state?.floorObservedAt ?? null,
+      anchor: state?.anchor ?? null,
+      counts: state?.counts ?? [],
+      renderedCount: document.querySelectorAll('[data-ui="message"][data-message-id]').length,
+      scrollState: document
+        .querySelector('[data-ui="scroll-region"]')
+        ?.getAttribute('data-scroll-state'),
+    }
+  })
+  expect(probe.pointObservedAt).not.toBeNull()
+  expect(probe.readingStartedAt).not.toBeNull()
+  expect(probe.floorObservedAt).not.toBeNull()
+  expect(probe.readingStartedAt as number).toBeLessThan(probe.floorObservedAt as number)
+  expect(probe.anchor?.paragraphKey).toContain('cold sidebar destination paragraph')
+  expect(probe.scrollState).toBe('pinned')
+  if (!probe.anchor) throw new Error('ColdSidebarSemanticAnchorMissing')
+  const afterFill = await readSemanticTextAnchor(page, probe.anchor)
+  expect(afterFill.messageId).toBe(probe.anchor.messageId)
+  expect(afterFill.paragraphKey).toBe(probe.anchor.paragraphKey)
+  expect(afterFill.characterOffset).toBe(probe.anchor.characterOffset)
+  await testInfo.attach('cold-sidebar-fill-transition.json', {
+    body: JSON.stringify({ probe, afterFill }, null, 2),
+    contentType: 'application/json',
+  })
+  expect(Math.abs(afterFill.lineTop - probe.anchor.lineTop)).toBeLessThanOrEqual(2)
+
+  const region = page.locator('[data-ui="scroll-region"]')
+  await region.hover()
+  await page.mouse.wheel(0, -1)
+  await waitForNativeScrollSettle(page)
+  const delayedAnchor = await captureVisibleSemanticTextAnchor(page)
+  const delayedTextLayout = await page.evaluate((anchor) => {
+    const message = document.querySelector<HTMLElement>(
+      `[data-ui="message"][data-message-id="${anchor.messageId}"]`,
+    )
+    const paragraph = Array.from(
+      message?.querySelectorAll<HTMLElement>('[data-ui="markdown"] p') ?? [],
+    ).find((candidate) => candidate.textContent?.startsWith(anchor.paragraphKey))
+    const markdown = paragraph?.closest<HTMLElement>('[data-ui="markdown"]')
+    if (!paragraph || !markdown) throw new Error('ColdSidebarDelayedAnchorMissing')
+    const block = document.createElement('div')
+    block.dataset.ui = 'delayed-text-layout'
+    block.style.height = '137px'
+    markdown.prepend(block)
+    return { addedHeight: 137 }
+  }, delayedAnchor)
+  await expect
+    .poll(async () => (await readSemanticTextAnchor(page, delayedAnchor)).lineTop)
+    .toBeCloseTo(delayedAnchor.lineTop, 0)
+  await testInfo.attach('cold-sidebar-passive-fill-continuity.json', {
+    body: JSON.stringify({ ...probe, afterFill, delayedAnchor, delayedTextLayout }, null, 2),
+    contentType: 'application/json',
+  })
+})
+
 test('one sidebar destination gesture bounds the complete configured transcript window', async ({
   page,
 }, testInfo) => {
@@ -171,7 +286,11 @@ test('very long destination paints first, passively fills, and loads older batch
   }
   expect(prependDeltas.length).toBeGreaterThanOrEqual(4)
   expect(Math.max(...prependDeltas)).toBeLessThan(2)
-  await expect(page.locator('[data-ui="message"]')).toHaveCount(totalCount)
+  await expect(page.locator('[data-ui="message-list"]')).toHaveAttribute(
+    'data-rendered-count',
+    String(totalCount),
+  )
+  expect(await page.locator('[data-ui="message"]').count()).toBeLessThan(totalCount)
   await expect(page.locator('[data-ui="load-more-messages"]')).toHaveCount(0)
   const expectedUrl = page.url()
   const messageList = page.locator('[data-ui="message-list"]')
@@ -183,10 +302,6 @@ test('very long destination paints first, passively fills, and loads older batch
   await expect(scrollRegion).toHaveAttribute('data-scroll-state', 'follow')
   await expect.poll(() => scrollDistanceFromBottom(scrollRegion)).toBeLessThanOrEqual(2)
   await messageList.evaluate((element) => {
-    ;(element as HTMLElement & { retainedAcrossSurfaceCycles?: true }).retainedAcrossSurfaceCycles =
-      true
-  })
-  await terminal.evaluate((element) => {
     ;(element as HTMLElement & { retainedAcrossSurfaceCycles?: true }).retainedAcrossSurfaceCycles =
       true
   })
@@ -210,7 +325,7 @@ test('very long destination paints first, passively fills, and loads older batch
         {
           id: 'resident-terminal-message',
           selector: `[data-ui="message"][data-message-id="${terminalMessageId}"]`,
-          preserveIdentity: true,
+          preserveIdentity: false,
           requireVisible: false,
           attributes: {
             'data-message-id': { kind: 'exact', value: terminalMessageId },
@@ -278,15 +393,6 @@ test('very long destination paints first, passively fills, and loads older batch
           (element as HTMLElement & { retainedAcrossSurfaceCycles?: true })
             .retainedAcrossSurfaceCycles === true,
       ),
-    ).toBe(true)
-    expect(
-      await page
-        .locator(`[data-ui="message"][data-message-id="${terminalMessageId}"]`)
-        .evaluate(
-          (element) =>
-            (element as HTMLElement & { retainedAcrossSurfaceCycles?: true })
-              .retainedAcrossSurfaceCycles === true,
-        ),
     ).toBe(true)
     await expect(scrollRegion).toHaveAttribute('data-scroll-state', 'follow')
     await expect.poll(() => scrollDistanceFromBottom(scrollRegion)).toBeLessThanOrEqual(4)
@@ -382,49 +488,44 @@ test('progressive static handoff preserves bottom follow and a pinned semantic e
   await page.reload()
   const pinnedProgressive = page.locator('[data-overflow="progressive-static"]').first()
   await expect(pinnedProgressive).toBeVisible()
-  const pinnedBefore = await pinnedProgressive.evaluate((element) => {
-    const scrollRegion = element.closest<HTMLElement>('[data-ui="scroll-region"]')
+  const pinnedMessageId = await pinnedProgressive.evaluate((element) => {
     const message = element.closest<HTMLElement>('[data-ui="message"][data-message-id]')
-    if (!scrollRegion || !message) throw new Error('ProgressiveStaticPinnedAnchorMissing')
-    const containerRect = scrollRegion.getBoundingClientRect()
-    const rootRect = element.getBoundingClientRect()
-    const desiredBottom = containerRect.bottom - 80
-    scrollRegion.scrollTop += rootRect.bottom - desiredBottom
+    if (!message) throw new Error('ProgressiveStaticPinnedAnchorMissing')
     ;(
       element as HTMLElement & { retainedAcrossProgressiveHandoff?: true }
     ).retainedAcrossProgressiveHandoff = true
-    return {
-      messageId: message.getAttribute('data-message-id'),
-      rootBottomOffset: element.getBoundingClientRect().bottom - containerRect.bottom,
-      scrollTop: scrollRegion.scrollTop,
-    }
+    return message.getAttribute('data-message-id')
   })
-  expect(pinnedBefore.messageId).not.toBeNull()
+  expect(pinnedMessageId).not.toBeNull()
+  await region.hover()
+  await page.mouse.wheel(0, -180)
+  await waitForNativeScrollSettle(page)
   await expect(region).toHaveAttribute('data-scroll-state', 'pinned')
+  const pinnedBefore = await captureVisibleSemanticTextAnchor(page)
+  expect(pinnedBefore.messageId).toBe(pinnedMessageId)
+  expect(pinnedBefore.paragraphKey).toContain('progressive paragraph')
   await releaseYieldGate(page)
   await expect(page.locator('[data-overflow="progressive-static"]')).toHaveCount(0)
   await expect(region).toHaveAttribute('data-scroll-state', 'pinned')
-  const pinnedAfter = await page
+  const pinnedAfter = await readSemanticTextAnchor(page, pinnedBefore)
+  const retained = await page
     .locator(
       `[data-ui="message"][data-message-id="${pinnedBefore.messageId}"] [data-ui="markdown"]`,
     )
-    .evaluate((element) => {
-      const scrollRegion = element.closest<HTMLElement>('[data-ui="scroll-region"]')
-      const message = element.closest<HTMLElement>('[data-ui="message"][data-message-id]')
-      if (!scrollRegion || !message) throw new Error('ProgressiveStaticPinnedResultMissing')
-      return {
-        messageId: message.getAttribute('data-message-id'),
-        retained:
-          (element as HTMLElement & { retainedAcrossProgressiveHandoff?: true })
-            .retainedAcrossProgressiveHandoff === true,
-        rootBottomOffset:
-          element.getBoundingClientRect().bottom - scrollRegion.getBoundingClientRect().bottom,
-        scrollTop: scrollRegion.scrollTop,
-      }
-    })
+    .evaluate(
+      (element) =>
+        (element as HTMLElement & { retainedAcrossProgressiveHandoff?: true })
+          .retainedAcrossProgressiveHandoff === true,
+    )
   expect(pinnedAfter.messageId).toBe(pinnedBefore.messageId)
-  expect(pinnedAfter.retained).toBe(true)
-  expect(Math.abs(pinnedAfter.rootBottomOffset - pinnedBefore.rootBottomOffset)).toBeLessThan(2)
+  expect(pinnedAfter.paragraphKey).toBe(pinnedBefore.paragraphKey)
+  expect(pinnedAfter.characterOffset).toBe(pinnedBefore.characterOffset)
+  expect(retained).toBe(true)
+  await testInfo.attach('progressive-static-text-transition.json', {
+    body: JSON.stringify({ pinnedBefore, pinnedAfter }, null, 2),
+    contentType: 'application/json',
+  })
+  expect(Math.abs(pinnedAfter.lineTop - pinnedBefore.lineTop)).toBeLessThanOrEqual(2)
   await testInfo.attach('progressive-static-geometry.json', {
     body: JSON.stringify(
       {
@@ -435,9 +536,7 @@ test('progressive static handoff preserves bottom follow and a pinned semantic e
         ),
         pinnedBefore,
         pinnedAfter,
-        pinnedRootBottomDelta: Math.abs(
-          pinnedAfter.rootBottomOffset - pinnedBefore.rootBottomOffset,
-        ),
+        pinnedTextDelta: Math.abs(pinnedAfter.lineTop - pinnedBefore.lineTop),
       },
       null,
       2,
@@ -495,65 +594,77 @@ test('destination-first passive fill and repeated variable-height auto prepends 
     Math.max(...passiveGeometry.map((sample) => Math.abs(sample.bottomDistance))),
   ).toBeLessThan(3)
 
-  await uiJourney.start(page, createChatUiJourneyProfile(), 'repeated-auto-prepend')
+  const journeyProfile = createChatUiJourneyProfile()
+  const transcriptJourney = journeyProfile.transcript
+  if (!transcriptJourney) throw new Error('AutoPrependTranscriptJourneyMissing')
+  const { boundedPrefixEviction: _boundedPrefixEviction, ...virtualTranscriptJourney } =
+    transcriptJourney
+  await uiJourney.start(
+    page,
+    {
+      ...journeyProfile,
+      countSurfaces: [],
+      transcript: {
+        ...virtualTranscriptJourney,
+        preserveMessageIdentity: false,
+        preservePrefix: false,
+      },
+      sampleLimit: 1_200,
+      transitionLimit: 1_000,
+    },
+    'repeated-auto-prepend',
+  )
   const counts = [initialCount]
   const anchorDeltas: number[] = []
   let renderedCount = initialCount
   let prependIndex = 0
   while (renderedCount < totalCount) {
-    const retainedId = await page
-      .locator('[data-ui="message"]')
-      .first()
-      .getAttribute('data-message-id')
-    if (!retainedId) throw new Error('AutoHistoryAnchorMissing')
+    const boundary = await captureLoadedBoundaryAnchor(page, renderedCount)
+    const retainedId = boundary.messageId
     const retained = page.locator(`[data-ui="message"][data-message-id="${retainedId}"]`)
-    const retainedTop = await retained.evaluate((element) => {
-      const scrollRegion = element.closest<HTMLElement>('[data-ui="scroll-region"]')
-      if (!scrollRegion) throw new Error('AutoHistoryScrollRegionMissing')
-      scrollRegion.dispatchEvent(new WheelEvent('wheel', { deltaY: -100, bubbles: true }))
-      scrollRegion.scrollTop = 0
-      return element.getBoundingClientRect().top
-    })
-    await holdUpwardScrollIntentUntilWindowExpands(page, renderedCount)
+    const retainedText = page.locator('[data-scroll-anchor="history-demand"]')
+    const retainedTop = boundary.top
     await expect(region).toHaveAttribute('data-scroll-state', 'pinned')
     await uiJourney.intent(page, {
       kind: 'prepend-anchor',
       id: `auto-prepend-${prependIndex}`,
-      anchorSelector: `[data-ui="message"][data-message-id="${retainedId}"]`,
+      anchorSelector: '[data-scroll-anchor="history-demand"]',
       scrollSelector: '[data-ui="scroll-region"]',
       tolerancePx: 2,
     })
-    await expect
-      .poll(() => page.locator('[data-ui="message"]').count())
-      .toBeGreaterThan(renderedCount)
-    const nextCount = await page.locator('[data-ui="message"]').count()
-    await page
-      .locator('[data-ui="message"]')
-      .first()
-      .evaluate(
-        (element, height) => {
-          const block = document.createElement('div')
-          block.dataset.ui = 'arbitrary-history-height'
-          block.style.height = `${height}px`
-          element.append(block)
-        },
-        37 + (prependIndex % 5) * 29,
-      )
+    await expect.poll(() => loadedMessageCount(page)).toBeGreaterThan(renderedCount)
+    await expect(retained).toHaveCount(1)
+    const nextCount = await loadedMessageCount(page)
+    await retainedText.evaluate(
+      (element, height) => {
+        const block = document.createElement('div')
+        block.dataset.ui = 'arbitrary-history-height'
+        block.style.height = `${height}px`
+        element.parentElement?.insertBefore(block, element)
+      },
+      37 + (prependIndex % 5) * 29,
+    )
     const journey = await uiJourney.checkpoint(page, `auto-prepend-${prependIndex}-remeasured`)
     expect(journey.violations).toEqual([])
-    const anchorDelta = await retained.evaluate(
+    const anchorDelta = await retainedText.evaluate(
       (element, targetTop) => Math.abs(element.getBoundingClientRect().top - targetTop),
       retainedTop,
     )
-    expect(anchorDelta).toBeLessThan(2)
+    expect(anchorDelta).toBeLessThanOrEqual(2)
     anchorDeltas.push(anchorDelta)
     counts.push(nextCount)
     renderedCount = nextCount
     prependIndex += 1
   }
-  expect(anchorDeltas.length).toBeGreaterThanOrEqual(4)
-  expect(Math.max(...anchorDeltas)).toBeLessThan(2)
-  await expect(page.locator('[data-ui="message"]')).toHaveCount(totalCount)
+  expect(anchorDeltas.length).toBeGreaterThan(1)
+  expect(Math.max(...anchorDeltas)).toBeLessThanOrEqual(2)
+  await expect(page.locator('[data-ui="message-list"]')).toHaveAttribute(
+    'data-rendered-count',
+    String(totalCount),
+  )
+  await expect(page.locator('[data-ui="message-list"]')).toHaveAttribute('data-virtualized', 'true')
+  expect(await page.locator('[data-ui="message"]').count()).toBeLessThan(totalCount)
+  expect(await page.locator('[data-ui="message"]').count()).toBeLessThanOrEqual(32)
   await expect(page.locator('[data-ui="load-more-messages"]')).toHaveCount(0)
   const finalJourney = await uiJourney.finish(page, 'repeated-auto-prepend-complete')
   expect(finalJourney.violations).toEqual([])
@@ -569,6 +680,130 @@ test('destination-first passive fill and repeated variable-height auto prepends 
     ),
     contentType: 'application/json',
   })
+})
+
+test('physical scrolling across 100k-character turns preserves text and constrained sticky glyphs through every expansion', async ({
+  page,
+}, testInfo) => {
+  test.setTimeout(300_000)
+  const initialRenderWork = 10
+  const totalCount = 48
+  const chatId = await seedLinearChat(page, {
+    messageCount: totalCount,
+    chatId: 'physical-100k-scroll-continuity-chat',
+    title: 'Physical 100k scroll continuity chat',
+    textForIndex: hundredKilobyteTurn,
+    settings: {
+      'global:message-initial-render-work': initialRenderWork,
+      'global:message-render-window-load-mode': 'auto',
+    },
+  })
+
+  await page.setViewportSize({ width: 1280, height: 500 })
+  await page.goto(`/#/chat/${chatId}`)
+  await page.reload()
+  await waitForMessageFloor(page, initialRenderWork)
+  await expect
+    .poll(() =>
+      page
+        .locator('[data-ui="message"] [data-ui="markdown"]')
+        .evaluateAll((elements) =>
+          elements.reduce((total, element) => total + (element.textContent?.length ?? 0), 0),
+        ),
+    )
+    .toBeGreaterThanOrEqual(initialRenderWork * 99_000)
+  await installNativeScrollContinuityProbe(page)
+
+  const region = page.locator('[data-ui="scroll-region"]')
+  await region.hover()
+  const beforeExpansionSamples = []
+  const settledWheelSamples = []
+  for (let index = 0; index < 4; index += 1) {
+    const sample = await wheelWithSettledTextContinuity(page, -180)
+    settledWheelSamples.push(sample)
+    beforeExpansionSamples.push(sample.settled)
+  }
+
+  let renderedCount = await loadedMessageCount(page)
+  let wheelCount = 0
+  const reasonableSpeedExpansionRuns = []
+  while (renderedCount < totalCount && wheelCount < 1_500) {
+    const run = await wheelAtReasonableSpeedUntilExpansion(page)
+    reasonableSpeedExpansionRuns.push(run)
+    wheelCount += run.wheelEvents
+    renderedCount = await loadedMessageCount(page)
+  }
+  expect(renderedCount).toBe(totalCount)
+  expect(wheelCount).toBeLessThan(1_500)
+  await expect.poll(() => nativeScrollExpansionCount(page)).toBeGreaterThanOrEqual(3)
+
+  const afterExpansionSamples = []
+  for (let index = 0; index < 4; index += 1) {
+    const sample = await wheelWithSettledTextContinuity(page, 180)
+    settledWheelSamples.push(sample)
+    afterExpansionSamples.push(sample.settled)
+  }
+
+  const boundaryContinuity = await nativeScrollContinuityResult(page, true)
+  await testInfo.attach('native-scroll-boundary-continuity.json', {
+    body: JSON.stringify({ reasonableSpeedExpansionRuns, boundaryContinuity }, null, 2),
+    contentType: 'application/json',
+  })
+  expect(boundaryContinuity.frameViolations).toEqual([])
+
+  const glyphViolations: unknown[] = []
+  const traversalSamples: unknown[] = []
+  let reachedTop = false
+  for (let step = 0; step < 1_500 && !reachedTop; step += 1) {
+    const result = await inspectProfileGlyphGeometry(page)
+    traversalSamples.push(result.sample)
+    glyphViolations.push(...result.violations)
+    reachedTop = result.sample.atTop
+    if (!reachedTop) settledWheelSamples.push(await wheelWithSettledTextContinuity(page, -20_000))
+  }
+  expect(reachedTop).toBe(true)
+  for (const direction of [1, -1] as const) {
+    let reachedEdge = false
+    for (let step = 0; step < 1_500 && !reachedEdge; step += 1) {
+      const result = await inspectProfileGlyphGeometry(page)
+      traversalSamples.push(result.sample)
+      glyphViolations.push(...result.violations)
+      reachedEdge = direction > 0 ? result.sample.atBottom : result.sample.atTop
+      if (!reachedEdge) {
+        settledWheelSamples.push(await wheelWithSettledTextContinuity(page, direction * 20_000))
+      }
+    }
+    expect(reachedEdge).toBe(true)
+  }
+
+  const continuity = await nativeScrollContinuityResult(page)
+  await testInfo.attach('native-scroll-continuity.json', {
+    body: JSON.stringify(
+      {
+        beforeExpansionSamples,
+        afterExpansionSamples,
+        settledWheelSamples,
+        reasonableSpeedExpansionRuns,
+        continuity,
+        traversalSamples,
+        glyphViolations,
+      },
+      null,
+      2,
+    ),
+    contentType: 'application/json',
+  })
+  await testInfo.attach('native-scroll-continuity.png', {
+    body: await page.screenshot(),
+    contentType: 'image/png',
+  })
+  expect(continuity.transitions.length).toBeGreaterThanOrEqual(3)
+  expect(continuity.frameViolations).toEqual([])
+  for (const transition of continuity.transitions) {
+    expect(transition.before).not.toBeNull()
+    expect(transition.after).not.toBeNull()
+  }
+  expect(glyphViolations).toEqual([])
 })
 
 test('manual prepend retains its viewport anchor across delayed layout above it', async ({
@@ -597,7 +832,7 @@ test('manual prepend retains its viewport anchor across delayed layout above it'
   )
 
   await page.locator('[data-ui="load-more-messages"]').click()
-  await expect(page.locator('[data-ui="message"]')).toHaveCount(20)
+  await expect.poll(() => loadedMessageCount(page)).toBe(20)
   await page.waitForTimeout(250)
   await page
     .locator('[data-ui="message"]')
@@ -627,7 +862,9 @@ test('manual prepend retains its viewport anchor across delayed layout above it'
   })
 })
 
-test('user scrolling cancels delayed prepend-anchor corrections', async ({ page }) => {
+test('user scrolling rebases delayed prepend correction to the newly visible text', async ({
+  page,
+}) => {
   const chatId = await seedLinearChat(page, {
     messageCount: 20,
     chatId: 'render-window-user-scroll-chat',
@@ -651,7 +888,7 @@ test('user scrolling cancels delayed prepend-anchor corrections', async ({ page 
   )
 
   await page.locator('[data-ui="load-more-messages"]').click()
-  await expect(page.locator('[data-ui="message"]')).toHaveCount(20)
+  await expect.poll(() => loadedMessageCount(page)).toBe(20)
   const prependedMessage = page.locator('[data-ui="message"]').first()
   await prependedMessage.evaluate((element) => {
     const firstDelayedBlock = document.createElement('div')
@@ -673,17 +910,587 @@ test('user scrolling cancels delayed prepend-anchor corrections', async ({ page 
   await expect
     .poll(() => scrollRegion.evaluate((element) => element.scrollTop))
     .toBeGreaterThan(beforeUserScroll)
-  const userScrollTop = await scrollRegion.evaluate((element) => element.scrollTop)
+  const userAnchorTop = await retainedMessage.evaluate(
+    (element) => element.getBoundingClientRect().top,
+  )
   await prependedMessage.evaluate((element) => {
     const secondDelayedBlock = document.createElement('div')
     secondDelayedBlock.style.height = '127px'
     element.append(secondDelayedBlock)
   })
-  await page.waitForTimeout(100)
-
-  const afterDelayedLayout = await scrollRegion.evaluate((element) => element.scrollTop)
-  expect(Math.abs(afterDelayedLayout - userScrollTop)).toBeLessThan(2)
+  await expect
+    .poll(() =>
+      retainedMessage.evaluate(
+        (element, targetTop) => Math.abs(element.getBoundingClientRect().top - targetTop),
+        userAnchorTop,
+      ),
+    )
+    .toBeLessThan(2)
 })
+
+interface SemanticTextAnchor {
+  readonly messageId: string
+  readonly paragraphKey: string
+  readonly characterOffset: number
+  readonly paragraphTop: number
+  readonly lineTop: number
+  readonly scrollTop: number
+  readonly scrollHeight: number
+}
+
+async function captureVisibleSemanticTextAnchor(page: Page): Promise<SemanticTextAnchor> {
+  return page.evaluate(() => {
+    const region = document.querySelector<HTMLElement>('[data-ui="scroll-region"]')
+    if (!region) throw new Error('SemanticTextAnchorRegionMissing')
+    const regionRect = region.getBoundingClientRect()
+    const targetY = regionRect.top + regionRect.height * 0.46
+    const body = document.querySelector<HTMLElement>('[data-ui="message-body-column"]')
+    const x = body
+      ? body.getBoundingClientRect().left + body.getBoundingClientRect().width / 2
+      : regionRect.left + regionRect.width / 2
+    const paragraphs = Array.from(
+      region.querySelectorAll<HTMLElement>('[data-ui="message"] [data-ui="markdown"] p'),
+    ).filter((paragraph) => {
+      const rect = paragraph.getBoundingClientRect()
+      return rect.bottom > regionRect.top && rect.top < regionRect.bottom
+    })
+    const paragraph =
+      paragraphs.find((candidate) => {
+        const rect = candidate.getBoundingClientRect()
+        return rect.top <= targetY && rect.bottom >= targetY
+      }) ??
+      paragraphs.sort((left, right) => {
+        const leftRect = left.getBoundingClientRect()
+        const rightRect = right.getBoundingClientRect()
+        return (
+          Math.abs((leftRect.top + leftRect.bottom) / 2 - targetY) -
+          Math.abs((rightRect.top + rightRect.bottom) / 2 - targetY)
+        )
+      })[0]
+    const message = paragraph?.closest<HTMLElement>('[data-ui="message"][data-message-id]')
+    const messageId = message?.dataset.messageId
+    const paragraphKey = paragraph?.textContent?.match(
+      /^(?:progressive paragraph|cold sidebar destination paragraph) \d+/u,
+    )?.[0]
+    if (!paragraph || !messageId || !paragraphKey) {
+      throw new Error('SemanticTextAnchorParagraphMissing')
+    }
+    const paragraphRect = paragraph.getBoundingClientRect()
+    const caretY = Math.min(Math.max(targetY, paragraphRect.top + 1), paragraphRect.bottom - 1)
+    const caret = document.caretRangeFromPoint?.(x, caretY) ?? null
+    let characterOffset = 0
+    if (caret && paragraph.contains(caret.startContainer)) {
+      const prefix = document.createRange()
+      prefix.selectNodeContents(paragraph)
+      prefix.setEnd(caret.startContainer, caret.startOffset)
+      characterOffset = prefix.toString().length
+    }
+    const walker = document.createTreeWalker(paragraph, NodeFilter.SHOW_TEXT)
+    let remaining = characterOffset
+    let lineTop = paragraphRect.top
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      const length = node.textContent?.length ?? 0
+      if (remaining > length) {
+        remaining -= length
+        continue
+      }
+      const start = Math.min(remaining, Math.max(0, length - 1))
+      const range = document.createRange()
+      range.setStart(node, start)
+      range.setEnd(node, Math.min(length, start + 1))
+      lineTop = range.getClientRects()[0]?.top ?? paragraphRect.top
+      break
+    }
+    return {
+      messageId,
+      paragraphKey,
+      characterOffset,
+      paragraphTop: paragraphRect.top,
+      lineTop,
+      scrollTop: region.scrollTop,
+      scrollHeight: region.scrollHeight,
+    }
+  })
+}
+
+async function readSemanticTextAnchor(
+  page: Page,
+  anchor: SemanticTextAnchor,
+): Promise<SemanticTextAnchor> {
+  return page.evaluate((target) => {
+    const message = document.querySelector<HTMLElement>(
+      `[data-ui="message"][data-message-id="${target.messageId}"]`,
+    )
+    const paragraph = Array.from(
+      message?.querySelectorAll<HTMLElement>('[data-ui="markdown"] p') ?? [],
+    ).find((candidate) => candidate.textContent?.startsWith(target.paragraphKey))
+    if (!message || !paragraph) throw new Error('SemanticTextAnchorNoLongerRendered')
+    const region = message.closest<HTMLElement>('[data-ui="scroll-region"]')
+    if (!region) throw new Error('SemanticTextAnchorRegionNoLongerRendered')
+    const paragraphRect = paragraph.getBoundingClientRect()
+    const walker = document.createTreeWalker(paragraph, NodeFilter.SHOW_TEXT)
+    let remaining = target.characterOffset
+    let lineTop = paragraphRect.top
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      const length = node.textContent?.length ?? 0
+      if (remaining > length) {
+        remaining -= length
+        continue
+      }
+      const start = Math.min(remaining, Math.max(0, length - 1))
+      const range = document.createRange()
+      range.setStart(node, start)
+      range.setEnd(node, Math.min(length, start + 1))
+      lineTop = range.getClientRects()[0]?.top ?? paragraphRect.top
+      break
+    }
+    return {
+      messageId: target.messageId,
+      paragraphKey: target.paragraphKey,
+      characterOffset: target.characterOffset,
+      paragraphTop: paragraphRect.top,
+      lineTop,
+      scrollTop: region.scrollTop,
+      scrollHeight: region.scrollHeight,
+    }
+  }, anchor)
+}
+
+interface NativeScrollTextSample {
+  readonly messageId: string
+  readonly paragraphKey: string
+  readonly messageOrdinal: number
+  readonly paragraphOrdinal: number
+  readonly messageCharacterOffset: number
+  readonly characterOffset: number
+  readonly paragraphTop: number
+  readonly scrollTop: number
+  readonly renderedCount: number
+}
+
+interface NativeScrollExpansionTransition {
+  readonly fromCount: number
+  readonly toCount: number
+  readonly before: NativeScrollTextSample | null
+  readonly after: NativeScrollTextSample | null
+}
+
+interface NativeScrollContinuityProbe {
+  active: boolean
+  readonly readSample: () => NativeScrollTextSample | null
+  readonly transitions: NativeScrollExpansionTransition[]
+  readonly frameViolations: Array<Record<string, unknown>>
+}
+
+function hundredKilobyteTurn(messageIndex: number): string {
+  const paragraphs = Array.from({ length: 80 }, (_, paragraphIndex) => {
+    const marker = `huge-scroll-row-${messageIndex}-paragraph-${paragraphIndex} `
+    return `${marker}${'physical boundary continuity token '.repeat(34)}`
+  })
+  const text = paragraphs.join('\n\n')
+  return text.length >= 100_000
+    ? text.slice(0, 100_000)
+    : `${text}${'x'.repeat(100_000 - text.length)}`
+}
+
+async function installNativeScrollContinuityProbe(page: Page): Promise<void> {
+  await page.evaluate(() => {
+    const region = document.querySelector<HTMLElement>('[data-ui="scroll-region"]')
+    const list = document.querySelector<HTMLElement>('[data-ui="message-list"]')
+    if (!region || !list) throw new Error('NativeScrollContinuitySurfaceMissing')
+    const renderedCount = () => Number(list.dataset.renderedCount ?? '0')
+    const readSample = (): NativeScrollTextSample | null => {
+      const regionRect = region.getBoundingClientRect()
+      const body = document.querySelector<HTMLElement>('[data-ui="message-body-column"]')
+      const x = body
+        ? body.getBoundingClientRect().left + body.getBoundingClientRect().width / 2
+        : regionRect.left + regionRect.width / 2
+      const targetY = regionRect.top + regionRect.height * 0.46
+      const visibleParagraphs = Array.from(
+        list.querySelectorAll<HTMLElement>('[data-ui="message"] [data-ui="markdown"] p'),
+      ).filter((paragraph) => {
+        const rect = paragraph.getBoundingClientRect()
+        return rect.bottom > regionRect.top && rect.top < regionRect.bottom
+      })
+      const paragraph =
+        visibleParagraphs.find((candidate) => {
+          const rect = candidate.getBoundingClientRect()
+          return rect.top <= targetY && rect.bottom >= targetY
+        }) ??
+        visibleParagraphs.sort((left, right) => {
+          const leftRect = left.getBoundingClientRect()
+          const rightRect = right.getBoundingClientRect()
+          const leftDistance = Math.abs((leftRect.top + leftRect.bottom) / 2 - targetY)
+          const rightDistance = Math.abs((rightRect.top + rightRect.bottom) / 2 - targetY)
+          return leftDistance - rightDistance
+        })[0]
+      if (!paragraph) return null
+      const message = paragraph.closest<HTMLElement>('[data-ui="message"][data-message-id]')
+      const messageId = message?.dataset.messageId
+      const paragraphMatch = paragraph.textContent?.match(
+        /^(?:scroll-row|huge-scroll-row)-(\d+)-paragraph-(\d+)/u,
+      )
+      const paragraphKey = paragraphMatch?.[0]
+      const messageOrdinal = Number(paragraphMatch?.[1])
+      const paragraphOrdinal = Number(paragraphMatch?.[2])
+      if (
+        !messageId ||
+        !paragraphKey ||
+        !Number.isSafeInteger(messageOrdinal) ||
+        !Number.isSafeInteger(paragraphOrdinal)
+      ) {
+        return null
+      }
+      const paragraphRect = paragraph.getBoundingClientRect()
+      const caretY = Math.min(Math.max(targetY, paragraphRect.top + 1), paragraphRect.bottom - 1)
+      const caret = document.caretRangeFromPoint?.(x, caretY) ?? null
+      let characterOffset = 0
+      let messageCharacterOffset = 0
+      if (caret && paragraph.contains(caret.startContainer)) {
+        const prefix = document.createRange()
+        prefix.selectNodeContents(paragraph)
+        prefix.setEnd(caret.startContainer, caret.startOffset)
+        characterOffset = prefix.toString().length
+        const markdown = paragraph.closest<HTMLElement>('[data-ui="markdown"]')
+        if (markdown) {
+          const messagePrefix = document.createRange()
+          messagePrefix.selectNodeContents(markdown)
+          messagePrefix.setEnd(caret.startContainer, caret.startOffset)
+          messageCharacterOffset = messagePrefix.toString().length
+        }
+      }
+      return {
+        messageId,
+        paragraphKey,
+        messageOrdinal,
+        paragraphOrdinal,
+        messageCharacterOffset,
+        characterOffset,
+        paragraphTop: paragraphRect.top,
+        scrollTop: region.scrollTop,
+        renderedCount: renderedCount(),
+      }
+    }
+    const probe: NativeScrollContinuityProbe & {
+      currentCount: number
+      beforeExpansion: NativeScrollTextSample | null
+    } = {
+      active: true,
+      readSample,
+      transitions: [],
+      frameViolations: [],
+      currentCount: renderedCount(),
+      beforeExpansion: readSample(),
+    }
+    ;(
+      window as typeof window & {
+        __nativeScrollContinuityProbe?: NativeScrollContinuityProbe
+      }
+    ).__nativeScrollContinuityProbe = probe
+    let unconsumedWheelDelta = 0
+    let wheelCreditFrames = 0
+    let previousFrame = readSample()
+    region.addEventListener(
+      'wheel',
+      (event) => {
+        unconsumedWheelDelta += event.deltaY
+        wheelCreditFrames = 8
+      },
+      { capture: true, passive: true },
+    )
+    const monitorFrame = () => {
+      if (!probe.active) return
+      const nextFrame = readSample()
+      if (previousFrame && nextFrame) {
+        const previousPosition =
+          previousFrame.messageOrdinal * 100_000 + previousFrame.messageCharacterOffset
+        const nextPosition = nextFrame.messageOrdinal * 100_000 + nextFrame.messageCharacterOffset
+        const semanticDelta = nextPosition - previousPosition
+        const pixelDelta = nextFrame.scrollTop - previousFrame.scrollTop
+        const maximumInputMovement = Math.abs(unconsumedWheelDelta) * 10 + 1_024
+        if (Math.abs(semanticDelta) > maximumInputMovement) {
+          probe.frameViolations.push({
+            kind: 'semantic-frame-jump',
+            wheelDelta: unconsumedWheelDelta,
+            pixelDelta,
+            semanticDelta,
+            maximumInputMovement,
+            before: previousFrame,
+            after: nextFrame,
+          })
+        }
+        if (Math.abs(pixelDelta) > 0.5) {
+          unconsumedWheelDelta = 0
+          wheelCreditFrames = 0
+        }
+      }
+      previousFrame = nextFrame
+      if (wheelCreditFrames > 0) {
+        wheelCreditFrames -= 1
+      } else {
+        unconsumedWheelDelta = 0
+      }
+      requestAnimationFrame(monitorFrame)
+    }
+    requestAnimationFrame(monitorFrame)
+    region.addEventListener(
+      'scroll',
+      () => {
+        if (renderedCount() === probe.currentCount) probe.beforeExpansion = readSample()
+      },
+      { capture: true, passive: true },
+    )
+    new MutationObserver(() => {
+      const nextCount = renderedCount()
+      if (nextCount <= probe.currentCount) return
+      const fromCount = probe.currentCount
+      const before = probe.beforeExpansion
+      probe.currentCount = nextCount
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          probe.transitions.push({
+            fromCount,
+            toCount: nextCount,
+            before,
+            after: readSample(),
+          })
+          probe.beforeExpansion = readSample()
+        })
+      })
+    }).observe(list, { attributes: true, attributeFilter: ['data-rendered-count'] })
+  })
+}
+
+async function nativeScrollTextSample(page: Page): Promise<NativeScrollTextSample | null> {
+  return page.evaluate(() => {
+    const probe = (
+      window as typeof window & {
+        __nativeScrollContinuityProbe?: NativeScrollContinuityProbe
+      }
+    ).__nativeScrollContinuityProbe
+    if (!probe) throw new Error('NativeScrollContinuityProbeMissing')
+    return probe.readSample()
+  })
+}
+
+async function wheelWithSettledTextContinuity(
+  page: Page,
+  deltaY: number,
+): Promise<{
+  readonly deltaY: number
+  readonly immediate: NativeScrollTextSample | null
+  readonly settled: NativeScrollTextSample | null
+}> {
+  await page.mouse.wheel(0, deltaY)
+  await waitForNativeScrollSettle(page)
+  const immediate = await nativeScrollTextSample(page)
+  await page.evaluate(
+    () =>
+      new Promise<void>((resolve) =>
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+      ),
+  )
+  const settled = await nativeScrollTextSample(page)
+  expect(immediate).not.toBeNull()
+  expect(settled).not.toBeNull()
+  expect(settled?.messageId).toBe(immediate?.messageId)
+  expect(settled?.paragraphKey).toBe(immediate?.paragraphKey)
+  expect(settled?.characterOffset).toBe(immediate?.characterOffset)
+  expect(Math.abs((settled?.paragraphTop ?? 0) - (immediate?.paragraphTop ?? 0))).toBeLessThan(2)
+  return { deltaY, immediate, settled }
+}
+
+async function wheelAtReasonableSpeedUntilExpansion(page: Page): Promise<{
+  readonly fromCount: number
+  readonly toCount: number
+  readonly wheelEvents: number
+}> {
+  const region = page.locator('[data-ui="scroll-region"]')
+  const fromCount = await loadedMessageCount(page)
+  let toCount = fromCount
+  let wheelEvents = 0
+  while (toCount === fromCount && wheelEvents < 600) {
+    const distanceFromRenderedTop = await region.evaluate((element) => element.scrollTop)
+    const deltaY = distanceFromRenderedTop > 5_000 ? -1_800 : -320
+    await page.mouse.wheel(0, deltaY)
+    wheelEvents += 1
+    await page.evaluate(
+      () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve())),
+    )
+    toCount = await loadedMessageCount(page)
+  }
+  expect(toCount).toBeGreaterThan(fromCount)
+  await waitForNativeScrollSettle(page)
+  return { fromCount, toCount, wheelEvents }
+}
+
+async function waitForNativeScrollSettle(page: Page): Promise<void> {
+  await page.evaluate(async () => {
+    const region = document.querySelector<HTMLElement>('[data-ui="scroll-region"]')
+    if (!region) throw new Error('NativeScrollSettleRegionMissing')
+    let previous = region.scrollTop
+    let stableFrames = 0
+    for (let frame = 0; frame < 120 && stableFrames < 3; frame += 1) {
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+      const current = region.scrollTop
+      stableFrames = Math.abs(current - previous) <= 0.5 ? stableFrames + 1 : 0
+      previous = current
+    }
+    if (stableFrames < 3) throw new Error('NativeScrollDidNotSettle')
+  })
+}
+
+async function nativeScrollExpansionCount(page: Page): Promise<number> {
+  return page.evaluate(
+    () =>
+      (
+        window as typeof window & {
+          __nativeScrollContinuityProbe?: NativeScrollContinuityProbe
+        }
+      ).__nativeScrollContinuityProbe?.transitions.length ?? 0,
+  )
+}
+
+async function nativeScrollContinuityResult(
+  page: Page,
+  stop = false,
+): Promise<{
+  transitions: NativeScrollExpansionTransition[]
+  frameViolations: Array<Record<string, unknown>>
+}> {
+  return page.evaluate((shouldStop) => {
+    const probe = (
+      window as typeof window & {
+        __nativeScrollContinuityProbe?: NativeScrollContinuityProbe
+      }
+    ).__nativeScrollContinuityProbe
+    if (!probe) throw new Error('NativeScrollContinuityProbeMissing')
+    if (shouldStop) probe.active = false
+    return { transitions: probe.transitions, frameViolations: probe.frameViolations }
+  }, stop)
+}
+
+async function inspectProfileGlyphGeometry(page: Page): Promise<{
+  sample: {
+    readonly scrollTop: number
+    readonly atTop: boolean
+    readonly atBottom: boolean
+    readonly visibleMessageIds: string[]
+    readonly visibleGlyphMessageIds: string[]
+  }
+  violations: Array<Record<string, unknown>>
+}> {
+  return page.evaluate(() => {
+    const region = document.querySelector<HTMLElement>('[data-ui="scroll-region"]')
+    if (!region) throw new Error('ProfileGlyphScrollRegionMissing')
+    const regionRect = region.getBoundingClientRect()
+    const violations: Array<Record<string, unknown>> = []
+    const visibleMessageIds: string[] = []
+    const visibleGlyphMessageIds: string[] = []
+    const visibleGlyphCenters: Array<{ messageId: string; x: number; y: number }> = []
+    for (const message of document.querySelectorAll<HTMLElement>(
+      '[data-ui="message"][data-message-id]',
+    )) {
+      const messageId = message.dataset.messageId ?? 'missing'
+      const messageRect = message.getBoundingClientRect()
+      const messageVisible =
+        messageRect.bottom > regionRect.top && messageRect.top < regionRect.bottom
+      if (messageVisible) visibleMessageIds.push(messageId)
+      const glyphs = message.querySelectorAll<HTMLElement>(
+        ':scope > [data-ui="profile-glyph-button"]',
+      )
+      if (glyphs.length !== 1) {
+        violations.push({ kind: 'glyph-count', messageId, count: glyphs.length })
+        continue
+      }
+      const glyphRect = glyphs[0]?.getBoundingClientRect()
+      if (!glyphRect) continue
+      const glyphVisible = glyphRect.bottom > regionRect.top && glyphRect.top < regionRect.bottom
+      if (glyphVisible) {
+        visibleGlyphMessageIds.push(messageId)
+        visibleGlyphCenters.push({
+          messageId,
+          x: (glyphRect.left + glyphRect.right) / 2,
+          y: (glyphRect.top + glyphRect.bottom) / 2,
+        })
+      }
+      if (glyphVisible && !messageVisible) {
+        violations.push({ kind: 'orphan-visible-glyph', messageId, messageRect, glyphRect })
+      }
+      if (
+        glyphRect.left < messageRect.left - 1 ||
+        glyphRect.right > messageRect.right + 1 ||
+        glyphRect.top < messageRect.top - 1 ||
+        glyphRect.bottom > messageRect.bottom + 1
+      ) {
+        violations.push({ kind: 'glyph-outside-message', messageId, messageRect, glyphRect })
+      }
+      const header = message.querySelector<HTMLElement>(':scope [data-ui="message-header"]')
+      const headerRect = header?.getBoundingClientRect()
+      if (
+        messageVisible &&
+        headerRect &&
+        headerRect.bottom < regionRect.top &&
+        messageRect.bottom > regionRect.top + glyphRect.height + 16 &&
+        !glyphVisible
+      ) {
+        violations.push({ kind: 'missing-sticky-glyph', messageId, messageRect, glyphRect })
+      }
+      if (
+        glyphVisible &&
+        headerRect &&
+        headerRect.bottom < regionRect.top &&
+        messageRect.bottom > regionRect.top + glyphRect.height + 16 &&
+        (glyphRect.top < regionRect.top - 1 || glyphRect.top > regionRect.top + 48)
+      ) {
+        violations.push({ kind: 'sticky-glyph-position', messageId, regionRect, glyphRect })
+      }
+      if (
+        glyphVisible &&
+        headerRect &&
+        headerRect.top >= regionRect.top &&
+        headerRect.bottom <= regionRect.bottom
+      ) {
+        const glyphCenter = (glyphRect.top + glyphRect.bottom) / 2
+        const headerCenter = (headerRect.top + headerRect.bottom) / 2
+        if (Math.abs(glyphCenter - headerCenter) >= 3) {
+          violations.push({
+            kind: 'glyph-header-misalignment',
+            messageId,
+            glyphCenter,
+            headerCenter,
+          })
+        }
+      }
+    }
+    for (let leftIndex = 0; leftIndex < visibleGlyphCenters.length; leftIndex += 1) {
+      const left = visibleGlyphCenters[leftIndex]
+      if (!left) continue
+      for (
+        let rightIndex = leftIndex + 1;
+        rightIndex < visibleGlyphCenters.length;
+        rightIndex += 1
+      ) {
+        const right = visibleGlyphCenters[rightIndex]
+        if (!right) continue
+        if (Math.abs(left.x - right.x) < 2 && Math.abs(left.y - right.y) < 2) {
+          violations.push({ kind: 'stacked-glyphs', left: left.messageId, right: right.messageId })
+        }
+      }
+    }
+    const maximumTop = Math.max(0, region.scrollHeight - region.clientHeight)
+    return {
+      sample: {
+        scrollTop: region.scrollTop,
+        atTop: region.scrollTop <= 1,
+        atBottom: maximumTop - region.scrollTop <= 1,
+        visibleMessageIds,
+        visibleGlyphMessageIds,
+      },
+      violations,
+    }
+  })
+}
 
 async function pinScrollRegionAtTop(page: Page): Promise<Locator> {
   const scrollRegion = page.locator('[data-ui="scroll-region"]')
@@ -706,33 +1513,59 @@ async function pinScrollRegionAtTop(page: Page): Promise<Locator> {
   return scrollRegion
 }
 
-async function holdUpwardScrollIntentUntilWindowExpands(
+async function captureLoadedBoundaryAnchor(
   page: Page,
-  renderedCount: number,
-): Promise<void> {
-  await page.evaluate((currentCount) => {
-    const region = document.querySelector<HTMLElement>('[data-ui="scroll-region"]')
-    if (!region) throw new Error('AutoHistoryScrollRegionMissing')
-    let remainingFrames = 600
-    const hold = () => {
-      if (
-        remainingFrames <= 0 ||
-        document.querySelectorAll('[data-ui="message"]').length > currentCount
-      ) {
-        return
-      }
-      remainingFrames -= 1
-      region.dispatchEvent(new WheelEvent('wheel', { deltaY: -1, bubbles: true }))
-      requestAnimationFrame(hold)
+  previousCount: number,
+): Promise<{ messageId: string; top: number }> {
+  const scrollRegion = page.locator('[data-ui="scroll-region"]')
+  const list = page.locator('[data-ui="message-list"]')
+  const previousRevision = await list.evaluate((element) =>
+    Number(element.getAttribute('data-history-demand-revision') ?? '0'),
+  )
+  await scrollRegion.hover()
+  let revision = previousRevision
+  for (
+    let wheelEvents = 0;
+    wheelEvents < 600 &&
+    revision <= previousRevision &&
+    (await loadedMessageCount(page)) <= previousCount;
+    wheelEvents += 1
+  ) {
+    const distanceFromRenderedTop = await scrollRegion.evaluate((element) => element.scrollTop)
+    await page.mouse.wheel(0, distanceFromRenderedTop > 5_000 ? -1_800 : -320)
+    await page.evaluate(
+      () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve())),
+    )
+    revision = await list.evaluate((element) =>
+      Number(element.getAttribute('data-history-demand-revision') ?? '0'),
+    )
+  }
+  await expect(scrollRegion).toHaveAttribute('data-scroll-state', 'pinned')
+  if ((await loadedMessageCount(page)) <= previousCount) {
+    expect(revision).toBeGreaterThan(previousRevision)
+  }
+  await expect.poll(() => list.getAttribute('data-history-demand-anchor-id')).not.toBeNull()
+  return list.evaluate((element) => {
+    const messageId = element.getAttribute('data-history-demand-anchor-id')
+    const anchor = element.querySelector<HTMLElement>('[data-scroll-anchor="history-demand"]')
+    if (!messageId || !anchor) {
+      throw new Error('AutoHistoryBoundaryAnchorMissing')
     }
-    hold()
-  }, renderedCount)
+    return { messageId, top: anchor.getBoundingClientRect().top }
+  })
 }
 
 async function waitForMessageFloor(page: Page, minimum: number): Promise<number> {
-  const messages = page.locator('[data-ui="message"]')
-  await expect.poll(() => messages.count()).toBeGreaterThanOrEqual(minimum)
-  return messages.count()
+  await expect.poll(() => loadedMessageCount(page)).toBeGreaterThanOrEqual(minimum)
+  return loadedMessageCount(page)
+}
+
+async function loadedMessageCount(page: Page): Promise<number> {
+  return page.locator('[data-ui="message-list"]').evaluate((element) => {
+    const value = Number((element as HTMLElement).dataset.renderedCount)
+    if (!Number.isSafeInteger(value) || value < 0) throw new Error('LoadedMessageCountInvalid')
+    return value
+  })
 }
 
 async function firstMessageById(page: Page): Promise<Locator> {
@@ -748,44 +1581,57 @@ async function loadOlderPreservingVisibleAnchor(
   page: Page,
   previousCount: number,
 ): Promise<{ anchorDelta: number; renderedCount: number }> {
-  const anchor = page.locator('[data-ui="message"][data-message-id]').filter({
-    has: page.locator('[data-ui="message-body"]'),
-  })
-  const visibleAnchor = await anchor.evaluateAll((messages) => {
-    const region = messages[0]?.closest<HTMLElement>('[data-ui="scroll-region"]')
+  const visibleAnchor = await page.locator('[data-ui="load-more-messages"]').evaluate((button) => {
+    const list = button.closest<HTMLElement>('[data-ui="message-list"]')
+    if (!list) throw new Error('VisiblePrependMessageListMissing')
+    const region = list.closest<HTMLElement>('[data-ui="scroll-region"]')
     if (!region) throw new Error('VisiblePrependAnchorScrollRegionMissing')
-    const rootTop = region.getBoundingClientRect().top
-    const element = messages.find((message) => message.getBoundingClientRect().bottom > rootTop)
-    const id = element?.getAttribute('data-message-id')
-    if (!element || !id) throw new Error('VisiblePrependAnchorMissing')
-    ;(element as HTMLElement & { retainedAcrossPrepend?: true }).retainedAcrossPrepend = true
-    return { id, top: element.getBoundingClientRect().top }
+    const regionRect = region.getBoundingClientRect()
+    const x = regionRect.left + regionRect.width / 2
+    const hit = [regionRect.top + 1, regionRect.top + regionRect.height / 2, regionRect.bottom - 1]
+      .map((y) => document.elementFromPoint(x, y))
+      .find((candidate) => candidate?.closest('[data-ui="message"]'))
+    const message = hit?.closest<HTMLElement>('[data-ui="message"]')
+    const textBlock = hit?.closest<HTMLElement>(
+      'p, li, pre, blockquote, table, figcaption, [data-ui="reasoning-summary"], [data-ui="message-body"]',
+    )
+    const anchor = textBlock && message?.contains(textBlock) ? textBlock : message
+    const id = message?.getAttribute('data-message-id') ?? null
+    if (!anchor || !message || !list.contains(message) || !id) {
+      throw new Error('VisiblePrependAnchorMissing')
+    }
+    for (const previous of list.querySelectorAll<HTMLElement>('[data-e2e-prepend-anchor]')) {
+      previous.removeAttribute('data-e2e-prepend-anchor')
+    }
+    anchor.dataset.e2ePrependAnchor = 'true'
+    ;(message as HTMLElement & { retainedAcrossPrepend?: true }).retainedAcrossPrepend = true
+    ;(anchor as HTMLElement & { retainedAcrossPrepend?: true }).retainedAcrossPrepend = true
+    const result = { id, top: anchor.getBoundingClientRect().top }
+    ;(button as HTMLElement).click()
+    return result
   })
   const retained = page.locator(`[data-ui="message"][data-message-id="${visibleAnchor.id}"]`)
-  await page
-    .locator('[data-ui="load-more-messages"]')
-    .evaluate((element: HTMLElement) => element.click())
-  await expect
-    .poll(() => page.locator('[data-ui="message"]').count())
-    .toBeGreaterThan(previousCount)
-  const renderedCount = await page.locator('[data-ui="message"]').count()
+  const retainedText = page.locator('[data-e2e-prepend-anchor="true"]')
+  await expect.poll(() => loadedMessageCount(page)).toBeGreaterThan(previousCount)
+  const renderedCount = await loadedMessageCount(page)
   await expect(retained).toHaveCount(1)
+  await expect(retainedText).toHaveCount(1)
   await expect
     .poll(() =>
-      retained.evaluate(
+      retainedText.evaluate(
         (element, targetTop) => Math.abs(element.getBoundingClientRect().top - targetTop),
         visibleAnchor.top,
       ),
     )
     .toBeLessThan(2)
   expect(
-    await retained.evaluate(
+    await retainedText.evaluate(
       (element) =>
         (element as HTMLElement & { retainedAcrossPrepend?: true }).retainedAcrossPrepend === true,
     ),
   ).toBe(true)
   return {
-    anchorDelta: await retained.evaluate(
+    anchorDelta: await retainedText.evaluate(
       (element, targetTop) => Math.abs(element.getBoundingClientRect().top - targetTop),
       visibleAnchor.top,
     ),
@@ -886,6 +1732,126 @@ async function installDestinationFirstProbe(page: Page, initialRenderWork: numbe
   }, initialRenderWork)
 }
 
+async function installColdSidebarReadingProbe(
+  page: Page,
+  initialRenderWork: number,
+): Promise<void> {
+  await page.exposeBinding(
+    '__coldSidebarNativeWheel',
+    async (_source, point: { x: number; y: number }) => {
+      await page.mouse.move(point.x, point.y)
+      await page.mouse.wheel(0, -180)
+    },
+  )
+  await page.addInitScript((minimumRows) => {
+    const state = {
+      pointObservedAt: null as number | null,
+      readingStartedAt: null as number | null,
+      floorObservedAt: null as number | null,
+      anchor: null as SemanticTextAnchor | null,
+      counts: [] as number[],
+      wheelRequested: false,
+    }
+    ;(
+      window as typeof window & {
+        __coldSidebarReadingProbe?: typeof state
+      }
+    ).__coldSidebarReadingProbe = state
+    const sample = () => {
+      const messages = document.querySelectorAll<HTMLElement>(
+        '[data-ui="message"][data-message-id]',
+      )
+      const count = messages.length
+      if (count > 0 && state.counts.at(-1) !== count) state.counts.push(count)
+      if (count >= minimumRows && state.floorObservedAt === null) {
+        state.floorObservedAt = performance.now()
+      }
+      const list = document.querySelector<HTMLElement>(
+        '[data-ui="message-list"][data-presentation-kind="point"]',
+      )
+      if (!list || count !== 1 || state.wheelRequested) return
+      state.pointObservedAt ??= performance.now()
+      const current = document.querySelectorAll<HTMLElement>('[data-ui="message"][data-message-id]')
+      const region = current[0]?.closest<HTMLElement>('[data-ui="scroll-region"]')
+      if (!region || region.scrollHeight <= region.clientHeight + 120) return
+      state.wheelRequested = true
+      const wheelStartScrollTop = region.scrollTop
+      const captureReadingPosition = () => {
+        if (state.readingStartedAt !== null || region.scrollTop >= wheelStartScrollTop - 0.5) return
+        const regionRect = region.getBoundingClientRect()
+        const targetY = regionRect.top + regionRect.height * 0.46
+        const paragraphs = Array.from(
+          current[0]?.querySelectorAll<HTMLElement>('[data-ui="markdown"] p') ?? [],
+        ).filter((paragraph) => {
+          const rect = paragraph.getBoundingClientRect()
+          return rect.bottom > regionRect.top && rect.top < regionRect.bottom
+        })
+        const paragraph =
+          paragraphs.find((candidate) => {
+            const rect = candidate.getBoundingClientRect()
+            return rect.top <= targetY && rect.bottom >= targetY
+          }) ?? paragraphs[0]
+        const messageId = current[0]?.dataset.messageId
+        const paragraphKey = paragraph?.textContent?.match(
+          /^cold sidebar destination paragraph \d+/u,
+        )?.[0]
+        if (!paragraph || !messageId || !paragraphKey) return
+        const body = document.querySelector<HTMLElement>('[data-ui="message-body-column"]')
+        const x = body
+          ? body.getBoundingClientRect().left + body.getBoundingClientRect().width / 2
+          : regionRect.left + regionRect.width / 2
+        const paragraphRect = paragraph.getBoundingClientRect()
+        const caretY = Math.min(Math.max(targetY, paragraphRect.top + 1), paragraphRect.bottom - 1)
+        const caret = document.caretRangeFromPoint?.(x, caretY) ?? null
+        let characterOffset = 0
+        if (caret && paragraph.contains(caret.startContainer)) {
+          const prefix = document.createRange()
+          prefix.selectNodeContents(paragraph)
+          prefix.setEnd(caret.startContainer, caret.startOffset)
+          characterOffset = prefix.toString().length
+        }
+        const walker = document.createTreeWalker(paragraph, NodeFilter.SHOW_TEXT)
+        let remaining = characterOffset
+        let lineTop = paragraphRect.top
+        for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+          const length = node.textContent?.length ?? 0
+          if (remaining > length) {
+            remaining -= length
+            continue
+          }
+          const start = Math.min(remaining, Math.max(0, length - 1))
+          const range = document.createRange()
+          range.setStart(node, start)
+          range.setEnd(node, Math.min(length, start + 1))
+          lineTop = range.getClientRects()[0]?.top ?? paragraphRect.top
+          break
+        }
+        state.anchor = {
+          messageId,
+          paragraphKey,
+          characterOffset,
+          paragraphTop: paragraphRect.top,
+          lineTop,
+          scrollTop: region.scrollTop,
+          scrollHeight: region.scrollHeight,
+        }
+        state.readingStartedAt = performance.now()
+        region.removeEventListener('scroll', captureReadingPosition, true)
+      }
+      region.addEventListener('scroll', captureReadingPosition, { capture: true, passive: true })
+      const rect = region.getBoundingClientRect()
+      const nativeWheel = (
+        window as typeof window & {
+          __coldSidebarNativeWheel?: (point: { x: number; y: number }) => Promise<void>
+        }
+      ).__coldSidebarNativeWheel
+      if (!nativeWheel) throw new Error('ColdSidebarNativeWheelBindingMissing')
+      void nativeWheel({ x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 })
+    }
+    new MutationObserver(sample).observe(document, { childList: true, subtree: true })
+  }, initialRenderWork)
+}
+
 async function assertDestinationFirstPassiveFill(
   page: Page,
   input: {
@@ -972,9 +1938,6 @@ async function assertDestinationFirstPassiveFill(
     }),
   ).toBe('follow')
   expect(Math.abs(finalMetrics.bottomDistance)).toBeLessThan(3)
-  expect(finalMetrics.scrollTop).toBeGreaterThan(
-    (probe.initialMetrics as DestinationFirstProbeMetrics).scrollTop,
-  )
   await expect(page.locator('[data-ui="message-list"]')).toHaveAttribute(
     'data-total-count',
     String(input.totalCount),

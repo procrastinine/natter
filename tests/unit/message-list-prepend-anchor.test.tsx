@@ -46,6 +46,8 @@ const STARTED_GENERATION = (): GenerationSubmission =>
     cancel: () => undefined,
   })
 const mutationSettlements = createInteractionSettlementHarness()
+let deliverResize: () => void
+let resizeCallbacks = new Set<ResizeObserverCallback>()
 const RUN_MUTATION: ConversationMutationRunner = (_intent, action, commit) =>
   mutationSettlements.run(async () => {
     await action(new AbortController().signal, () => undefined)
@@ -56,11 +58,25 @@ beforeEach(() => {
   resetAttemptControllerForTests()
   useToastStore.getState().reset()
   useUiStore.getState().reset()
+  resizeCallbacks = new Set()
+  deliverResize = () => {
+    for (const callback of resizeCallbacks) callback([], {} as ResizeObserver)
+  }
   vi.stubGlobal(
     'ResizeObserver',
     class {
+      readonly callback: ResizeObserverCallback
+
+      constructor(callback: ResizeObserverCallback) {
+        this.callback = callback
+        resizeCallbacks.add(callback)
+      }
+
       observe() {}
-      disconnect() {}
+      unobserve() {}
+      disconnect() {
+        resizeCallbacks.delete(this.callback)
+      }
     },
   )
 })
@@ -224,7 +240,100 @@ describe('message-list viewport transition contract', () => {
     expect(ref.current?.getState()).toBe('pinned')
   })
 
-  it('ignores a preannouncement whose selection authority does not match the tab', async () => {
+  it('retains the visible row while an upward boundary gesture waits for more content', async () => {
+    const fixture = branchFixture(8)
+    const initial = fixture.window(6, 2)
+    const ref = createRef<ScrollRegionHandle>()
+    const view = render(viewportElement(fixture, initial, 0, ref))
+    const region = requireRegion(view.container)
+    let scrollHeight = 1_000
+    installRegionGeometry(region, () => scrollHeight)
+    const retained = requireMessage(view.container, 'message-6')
+    let retainedDocumentTop = 20
+    retained.getBoundingClientRect = () =>
+      rect({
+        top: retainedDocumentTop - region.scrollTop,
+        bottom: retainedDocumentTop + 20 - region.scrollTop,
+      })
+
+    act(() => view.rerender(viewportElement(fixture, initial, 0, ref)))
+    act(() => {
+      fireEvent.wheel(region)
+      region.scrollTop = 0
+      fireEvent.scroll(region)
+    })
+    await act(nextTask)
+    expect(ref.current?.getState()).toBe('pinned')
+    expect(retained.getBoundingClientRect().top).toBe(20)
+
+    act(() => {
+      fireEvent.wheel(region, { deltaY: -100 })
+      retainedDocumentTop += 300
+      scrollHeight += 300
+      deliverResize()
+    })
+
+    expect(region.scrollTop).toBe(300)
+    expect(retained.getBoundingClientRect().top).toBe(20)
+  })
+
+  it('admits history demand when no semantic anchor can be captured', async () => {
+    const fixture = branchFixture(8)
+    const initial = fixture.window(6, 2)
+    const ref = createRef<ScrollRegionHandle>()
+    const loadOlder = vi.fn()
+    const view = render(viewportElement(fixture, initial, 0, ref, loadOlder))
+    const region = requireRegion(view.container)
+    installRegionGeometry(region, () => 1_000)
+
+    act(() => view.rerender(viewportElement(fixture, initial, 0, ref, loadOlder)))
+    act(() => {
+      fireEvent.wheel(region)
+      region.scrollTop = 0
+      fireEvent.scroll(region)
+    })
+    await act(nextTask)
+    expect(ref.current?.getState()).toBe('pinned')
+    for (const message of view.container.querySelectorAll<HTMLElement>('[data-ui="message"]')) {
+      message.getBoundingClientRect = () => rect({ top: -100, bottom: -80 })
+    }
+
+    fireEvent.click(view.getByRole('button', { name: 'Load more' }))
+
+    expect(loadOlder).toHaveBeenCalledTimes(1)
+  })
+
+  it('captures the wheel-owned text anchor before pinned state publishes', () => {
+    const fixture = branchFixture(8)
+    const initial = fixture.window(6, 2)
+    const ref = createRef<ScrollRegionHandle>()
+    const loadOlder = vi.fn()
+    const view = render(viewportElement(fixture, initial, 0, ref, loadOlder))
+    const region = requireRegion(view.container)
+    installRegionGeometry(region, () => 1_000)
+    const retained = requireMessage(view.container, 'message-6')
+    retained.getBoundingClientRect = () =>
+      rect({
+        top: 920 - region.scrollTop,
+        bottom: 940 - region.scrollTop,
+      })
+
+    act(() => view.rerender(viewportElement(fixture, initial, 0, ref, loadOlder)))
+    expect(region.scrollTop).toBe(900)
+
+    act(() => {
+      fireEvent.wheel(region, { deltaY: -320 })
+      fireEvent.click(view.getByRole('button', { name: 'Load more' }))
+    })
+
+    expect(loadOlder).toHaveBeenCalledTimes(1)
+    expect(view.container.querySelector('[data-ui="message-list"]')).toHaveAttribute(
+      'data-history-demand-anchor-id',
+      'message-6',
+    )
+  })
+
+  it('preserves a physical prepend when controller preannouncement authority does not match', async () => {
     const fixture = branchFixture(8)
     const initial = fixture.window(6, 2)
     const prepended = prependTranscriptBodyPage(initial, fixture.page(2, 4))
@@ -236,6 +345,13 @@ describe('message-list viewport transition contract', () => {
     const region = requireRegion(view.container)
     let scrollHeight = 1_000
     installRegionGeometry(region, () => scrollHeight)
+    const retained = requireMessage(view.container, 'message-6')
+    let retainedDocumentTop = 240
+    retained.getBoundingClientRect = () =>
+      rect({
+        top: retainedDocumentTop - region.scrollTop,
+        bottom: retainedDocumentTop + 20 - region.scrollTop,
+      })
 
     act(() => {
       view.rerender(element())
@@ -248,9 +364,11 @@ describe('message-list viewport transition contract', () => {
       fireEvent.scroll(region)
     })
     await act(nextTask)
+    expect(retained.getBoundingClientRect().top).toBe(40)
 
+    let preparation: ReturnType<ScrollRegionHandle['prepareLayoutChange']> | undefined
     act(() => {
-      ref.current?.prepareLayoutChange({
+      preparation = ref.current?.prepareLayoutChange({
         workspaceEpoch: 0,
         chatId: CHAT_ID,
         revision: 1,
@@ -258,13 +376,18 @@ describe('message-list viewport transition contract', () => {
         toSelectionKey: 'other-tab-selection',
         kind: 'prepend',
       })
-      scrollHeight = 1_300
+      retainedDocumentTop += 300
+      scrollHeight += 300
       snapshot = prepended
       viewportRevision = 1
       view.rerender(element())
+      deliverResize()
     })
 
-    expect(region.scrollTop).toBe(200)
+    expect(preparation).toEqual({ kind: 'unavailable' })
+    expect(view.container.querySelector('[data-message-id="message-6"]')).toBe(retained)
+    expect(region.scrollTop).toBe(500)
+    expect(retained.getBoundingClientRect().top).toBe(40)
     expect(ref.current?.getState()).toBe('pinned')
   })
 })
@@ -321,6 +444,7 @@ function viewportElement(
   snapshot: TranscriptBodyWindow,
   viewportRevision: number,
   ref: React.RefObject<ScrollRegionHandle | null>,
+  onLoadOlderMessages: () => void = () => {},
 ) {
   return (
     <ScrollRegion
@@ -336,7 +460,7 @@ function viewportElement(
         prefillPlan={PREFILL_UNAVAILABLE_PLAN}
         messageInitialRenderWork={10}
         messageRenderWindowLoadMode="manual"
-        onLoadOlderMessages={() => {}}
+        onLoadOlderMessages={onLoadOlderMessages}
         runConversationMutation={RUN_MUTATION}
         onEditAndSendMessage={STARTED_GENERATION}
         onRegenerateMessage={STARTED_GENERATION}

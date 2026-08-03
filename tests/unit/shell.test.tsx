@@ -134,19 +134,30 @@ describe('controller-backed shell contract', () => {
     })
     const input = container.querySelector<HTMLInputElement>('[data-ui="sidebar-chat-import-input"]')
     if (!input) throw new Error('SidebarImportInputMissing')
-
-    fireEvent.change(input, {
-      target: {
-        files: [new File([JSON.stringify(envelope)], 'chat.json', { type: 'application/json' })],
-      },
+    const successHashes: string[] = []
+    const unsubscribe = useToastStore.subscribe((state) => {
+      if (state.toasts.some((toast) => toast.text === 'Imported chat.')) {
+        successHashes.push(window.location.hash)
+      }
     })
 
-    await waitFor(async () => {
-      const chats = await getDb().chats.orderBy('createdAt').toArray()
-      expect(chats).toHaveLength(2)
-      expect(chats[1]?.id).not.toBe(source.id)
-      expect(window.location.hash).toMatch(/^#\/chat\//)
-    })
+    try {
+      fireEvent.change(input, {
+        target: {
+          files: [new File([JSON.stringify(envelope)], 'chat.json', { type: 'application/json' })],
+        },
+      })
+
+      await waitFor(async () => {
+        const chats = await getDb().chats.orderBy('createdAt').toArray()
+        expect(chats).toHaveLength(2)
+        expect(chats[1]?.id).not.toBe(source.id)
+        expect(window.location.hash).toMatch(/^#\/chat\//)
+        expect(successHashes.at(-1)).toMatch(/^#\/chat\//)
+      })
+    } finally {
+      unsubscribe()
+    }
   })
 
   it('keeps a durable sidebar import successful when local route projection fails', async () => {
@@ -173,12 +184,21 @@ describe('controller-backed shell contract', () => {
 
       await waitFor(async () => {
         expect(await getDb().chats.count()).toBe(2)
-        expect(useToastStore.getState().toasts.at(-1)).toMatchObject({
-          level: 'success',
-          text: 'Imported chat.',
-        })
+        expect(useToastStore.getState().toasts).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ level: 'success', text: 'Imported chat.' }),
+            expect.objectContaining({
+              level: 'warning',
+              text: 'The chats were imported, but the last chat could not be opened automatically.',
+            }),
+          ]),
+        )
       })
       expect(window.location.hash).toBe('#/')
+      expect(warnSpy).toHaveBeenCalledWith(
+        'Chat import committed without a local navigation handoff',
+        expect.objectContaining({ importedCount: 1, routeDelivery: 'superseded' }),
+      )
       expect(errorSpy).toHaveBeenCalledWith(
         'Workspace local commit projection failed',
         expect.objectContaining({ commandKind: 'interchange.import-chat' }),

@@ -1,10 +1,18 @@
 import {
+  defaultRangeExtractor,
+  type Range,
+  useVirtualizer,
+  type VirtualItem,
+  type Virtualizer,
+} from '@tanstack/react-virtual'
+import {
   lazy,
   memo,
   type ReactNode,
   Suspense,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -54,11 +62,13 @@ import { Button } from '../primitives/Button'
 import { Message } from './Message'
 import type { InsertSlot } from './MessageActions'
 import { PrefillSettingsPrompt } from './PrefillSettingsPrompt'
-import { useScrollRegionState } from './ScrollRegion'
+import { useScrollRegionCommands, useScrollRegionState } from './ScrollRegion'
 
 const ImportModal = lazy(() =>
   import('./ImportModal').then((module) => ({ default: module.ImportModal })),
 )
+
+const TRANSCRIPT_VIRTUAL_OVERSCAN = 8
 
 interface MessageListProps {
   readonly kind?: 'ready'
@@ -166,6 +176,7 @@ const MessageListSurface = memo(function MessageListSurface(props: MessageListSu
   const hiddenOlderCount = branchSnapshot.offset
   const staleBodyCount = branchSnapshot.staleBodyCount
   const canRetryLoadedBodies = transcriptLoadFailed && staleBodyCount > 0
+  const windowLoadVisible = hiddenOlderCount > 0 || canRetryLoadedBodies
   const branchLength = activePath?.length ?? 0
   const [insertTarget, setInsertTarget] = useState<InsertTarget | null>(null)
   // Track the set of user-message ids whose content was edited in THIS
@@ -188,8 +199,23 @@ const MessageListSurface = memo(function MessageListSurface(props: MessageListSu
   // user is navigating. Keeps keyboard shortcuts tied to "the message just
   // clicked" without forcing a controlled-selection state.
   const listRef = useRef<HTMLDivElement | null>(null)
+  const virtualWindowRef = useRef<HTMLDivElement | null>(null)
+  const [listElement, setListElement] = useState<HTMLDivElement | null>(null)
+  const [virtualScrollMargin, setVirtualScrollMargin] = useState(0)
+  const [historyDemandAnchor, setHistoryDemandAnchor] = useState<{
+    readonly messageId: MessageId
+    readonly coordinate: number
+    readonly revision: number
+  } | null>(null)
+  const historyDemandRevisionRef = useRef(0)
+  const measuredVirtualMessageIdsRef = useRef(new Set<MessageId>())
   const loadOlderRef = useRef<HTMLDivElement | null>(null)
+  const scrollRegionCommands = useScrollRegionCommands()
   const scrollRegionState = useScrollRegionState()
+  const bindList = useCallback((node: HTMLDivElement | null) => {
+    listRef.current = node
+    setListElement((current) => (current === node ? current : node))
+  }, [])
   const focusedMessageId = useCallback((): MessageId | null => {
     const el = listRef.current?.querySelector<HTMLElement>('[data-ui="message"]:focus-within')
     return el?.getAttribute('data-message-id') ?? null
@@ -406,16 +432,196 @@ const MessageListSurface = memo(function MessageListSurface(props: MessageListSu
       ...transcriptBodyPageRows(page),
     ])
   }, [branchSnapshot])
+  const shouldVirtualize =
+    !point && renderableMessageRows.length > Math.max(1, messageInitialRenderWork)
+  const measureVirtualRows = !point && renderableMessageRows.length > 0
+  const layoutAnchorMessageId = scrollRegionCommands?.getLayoutAnchorMessageId() ?? null
+  const getVirtualMessageKey = useCallback(
+    (index: number) => renderableMessageRows[index]?.message.id ?? index,
+    [renderableMessageRows],
+  )
+  const renderableMessageIndexById = useMemo(
+    () => new Map(renderableMessageRows.map((row, index) => [row.message.id, index])),
+    [renderableMessageRows],
+  )
+  const extractVirtualMessageRange = useCallback(
+    (range: Range): number[] => {
+      const requiredIndices = new Set(defaultRangeExtractor(range))
+      if (scrollRegionState === 'follow' && renderableMessageRows.length > 0) {
+        requiredIndices.add(renderableMessageRows.length - 1)
+      }
+      const retainedMessageIds = new Set([
+        scrollRegionCommands?.getLayoutAnchorMessageId() ?? null,
+        historyDemandAnchor?.messageId ?? null,
+        focusedMessageId(),
+      ])
+      for (const messageId of retainedMessageIds) {
+        if (!messageId) continue
+        const retainedIndex = renderableMessageIndexById.get(messageId) ?? -1
+        if (retainedIndex >= 0) requiredIndices.add(retainedIndex)
+      }
+      if (historyDemandAnchor) {
+        const anchorIndex = renderableMessageIndexById.get(historyDemandAnchor.messageId) ?? -1
+        for (let index = 0; index < anchorIndex; index += 1) {
+          const messageId = renderableMessageRows[index]?.message.id
+          if (messageId && !measuredVirtualMessageIdsRef.current.has(messageId)) {
+            requiredIndices.add(index)
+          }
+        }
+      }
+      return [...requiredIndices].sort((left, right) => left - right)
+    },
+    [
+      focusedMessageId,
+      historyDemandAnchor,
+      renderableMessageIndexById,
+      renderableMessageRows,
+      scrollRegionCommands,
+      scrollRegionState,
+    ],
+  )
+  const applyVirtualizerScroll = useCallback(
+    (offset: number, options: { adjustments?: number }) => {
+      if (!shouldVirtualize) return
+      scrollRegionCommands?.applyVirtualizerOffset(offset, options.adjustments)
+    },
+    [scrollRegionCommands, shouldVirtualize],
+  )
+  const ignorePreVirtualMeasurementAdjustment = useCallback(() => false, [])
+  const adjustOnlyRowsBeforeLayoutAnchor = useCallback(
+    (item: VirtualItem, _delta: number, instance: Virtualizer<HTMLDivElement, HTMLDivElement>) => {
+      const anchorMessageId = scrollRegionCommands?.getLayoutAnchorMessageId() ?? null
+      const anchorIndex = anchorMessageId
+        ? renderableMessageIndexById.get(anchorMessageId as MessageId)
+        : undefined
+      if (anchorIndex !== undefined) return item.index < anchorIndex
+      return (
+        item.start < (instance.scrollOffset ?? 0) &&
+        (!instance.itemSizeCache.has(item.key) || instance.scrollDirection !== 'backward')
+      )
+    },
+    [renderableMessageIndexById, scrollRegionCommands],
+  )
+  const messageVirtualizer = useVirtualizer<HTMLDivElement, HTMLDivElement>({
+    count: renderableMessageRows.length,
+    getScrollElement: () =>
+      listElement?.closest<HTMLDivElement>('[data-ui="scroll-region"]') ?? null,
+    estimateSize: () => 240,
+    getItemKey: getVirtualMessageKey,
+    overscan: TRANSCRIPT_VIRTUAL_OVERSCAN,
+    initialRect: { width: 1280, height: 720 },
+    initialOffset: () =>
+      listElement?.closest<HTMLDivElement>('[data-ui="scroll-region"]')?.scrollTop ?? 0,
+    scrollMargin: virtualScrollMargin,
+    scrollToFn: applyVirtualizerScroll,
+    rangeExtractor: extractVirtualMessageRange,
+    anchorTo: shouldVirtualize ? 'end' : 'start',
+    directDomUpdates: true,
+    directDomUpdatesMode: 'position',
+    enabled: measureVirtualRows,
+  })
+  messageVirtualizer.shouldAdjustScrollPositionOnItemSizeChange = shouldVirtualize
+    ? adjustOnlyRowsBeforeLayoutAnchor
+    : ignorePreVirtualMeasurementAdjustment
+  const bindVirtualWindow = useCallback(
+    (node: HTMLDivElement | null) => {
+      virtualWindowRef.current = node
+      messageVirtualizer.containerRef(shouldVirtualize ? node : null)
+      if (node && !shouldVirtualize) node.style.height = ''
+    },
+    [messageVirtualizer, shouldVirtualize],
+  )
+  const measureVirtualMessage = useCallback(
+    (node: HTMLDivElement | null) => {
+      const messageId = node
+        ?.querySelector<HTMLElement>('[data-ui="message"][data-message-id]')
+        ?.getAttribute('data-message-id')
+      if (node && messageId) {
+        measuredVirtualMessageIdsRef.current.add(messageId as MessageId)
+        const index = Number(node.dataset.index)
+        if (Number.isSafeInteger(index)) {
+          messageVirtualizer.resizeItem(index, node.getBoundingClientRect().height)
+        }
+      }
+      messageVirtualizer.measureElement(node)
+    },
+    [messageVirtualizer],
+  )
+  useLayoutEffect(() => {
+    void windowLoadVisible
+    const windowElement = virtualWindowRef.current
+    const region = listElement?.closest<HTMLElement>('[data-ui="scroll-region"]') ?? null
+    if (!windowElement || !region) return
+    const margin =
+      windowElement.getBoundingClientRect().top -
+      region.getBoundingClientRect().top +
+      region.scrollTop
+    setVirtualScrollMargin((current) => (Math.abs(current - margin) < 0.5 ? current : margin))
+  }, [listElement, windowLoadVisible])
+  const virtualItems = shouldVirtualize ? messageVirtualizer.getVirtualItems() : []
+  const mountedVirtualItems =
+    shouldVirtualize && virtualItems.length > 0
+      ? virtualItems
+      : renderableMessageRows.map(
+          (_, index): VirtualItem => ({
+            index,
+            key: getVirtualMessageKey(index),
+            start: 0,
+            end: 0,
+            size: 0,
+            lane: 0,
+          }),
+        )
+  const renderedMessageCount = renderableMessageRows.length
+  useLayoutEffect(() => {
+    if (!historyDemandAnchor || renderedMessageCount === 0) return
+    scrollRegionCommands?.reconcileLayoutAnchor()
+  }, [historyDemandAnchor, renderedMessageCount, scrollRegionCommands])
   const branchCountsKnown =
     !point &&
     renderableMessageRows.every(({ message }) => Boolean(branchSpine?.forkFor(message.id)))
-  const effectiveRenderedMessageCount = renderableMessageRows.length
+  const effectiveRenderedMessageCount = renderedMessageCount
   const loadOlderMessages = useCallback(() => {
     if (presentationOnly) return
     if (!onLoadOlderMessages) return
     if (hiddenOlderCount <= 0 && !canRetryLoadedBodies) return
+    if (scrollRegionCommands) {
+      if (scrollRegionCommands.captureLayoutAnchor()) {
+        const anchor = scrollRegionCommands.getLayoutAnchorSnapshot()
+        if (anchor?.messageId) {
+          for (const previous of listRef.current?.querySelectorAll<HTMLElement>(
+            '[data-scroll-anchor="history-demand"]',
+          ) ?? []) {
+            previous.removeAttribute('data-scroll-anchor')
+          }
+          anchor.element.dataset.scrollAnchor = 'history-demand'
+          historyDemandRevisionRef.current += 1
+          setHistoryDemandAnchor({
+            messageId: anchor.messageId as MessageId,
+            coordinate: anchor.coordinate,
+            revision: historyDemandRevisionRef.current,
+          })
+        }
+      }
+    }
     onLoadOlderMessages()
-  }, [canRetryLoadedBodies, hiddenOlderCount, onLoadOlderMessages, presentationOnly])
+  }, [
+    canRetryLoadedBodies,
+    hiddenOlderCount,
+    onLoadOlderMessages,
+    presentationOnly,
+    scrollRegionCommands,
+  ])
+
+  useEffect(() => {
+    if (scrollRegionState !== 'follow') return
+    setHistoryDemandAnchor(null)
+    for (const previous of listRef.current?.querySelectorAll<HTMLElement>(
+      '[data-scroll-anchor="history-demand"]',
+    ) ?? []) {
+      previous.removeAttribute('data-scroll-anchor')
+    }
+  }, [scrollRegionState])
 
   useEffect(() => {
     if (presentationOnly) return
@@ -535,6 +741,31 @@ const MessageListSurface = memo(function MessageListSurface(props: MessageListSu
       presentationFence,
     ],
   )
+  const renderMountedMessage = useCallback(
+    (virtualItem: VirtualItem): ReactNode => {
+      const row = renderableMessageRows[virtualItem.index]
+      if (!row) return null
+      return (
+        <div
+          key={row.message.id}
+          data-ui="message-virtual-row"
+          data-index={virtualItem.index}
+          data-terminal={virtualItem.index === renderableMessageRows.length - 1 || undefined}
+          ref={measureVirtualRows ? measureVirtualMessage : undefined}
+          style={shouldVirtualize ? undefined : { transform: 'none' }}
+        >
+          {renderMessageRow(row)}
+        </div>
+      )
+    },
+    [
+      measureVirtualMessage,
+      measureVirtualRows,
+      renderMessageRow,
+      renderableMessageRows,
+      shouldVirtualize,
+    ],
+  )
 
   return (
     <div
@@ -544,16 +775,22 @@ const MessageListSurface = memo(function MessageListSurface(props: MessageListSu
       role="log"
       aria-live={presentationOnly ? 'off' : 'polite'}
       aria-relevant="additions"
-      ref={listRef}
+      ref={bindList}
       data-initial-render-work={messageInitialRenderWork}
       data-rendered-count={effectiveRenderedMessageCount}
+      data-mounted-count={mountedVirtualItems.length}
+      data-virtualized={shouldVirtualize ? 'true' : 'false'}
+      data-layout-anchor-id={layoutAnchorMessageId ?? undefined}
+      data-history-demand-anchor-id={historyDemandAnchor?.messageId}
+      data-history-demand-anchor-coordinate={historyDemandAnchor?.coordinate}
+      data-history-demand-revision={historyDemandAnchor?.revision}
       data-total-count={point ? undefined : branchLength}
       data-branch-counts={branchCountsKnown ? 'known' : 'pending'}
       aria-busy={presentationOnly || undefined}
       data-presentation-only={presentationOnly || undefined}
     >
-      {hiddenOlderCount > 0 || canRetryLoadedBodies ? (
-        <div ref={loadOlderRef} data-ui="message-window-load">
+      {windowLoadVisible ? (
+        <div key="message-window-load" ref={loadOlderRef} data-ui="message-window-load">
           <Button
             type="button"
             data-ui="load-more-messages"
@@ -565,7 +802,14 @@ const MessageListSurface = memo(function MessageListSurface(props: MessageListSu
           {hiddenOlderCount > 0 ? <span>{hiddenOlderCount} older</span> : null}
         </div>
       ) : null}
-      {renderableMessageRows.map(renderMessageRow)}
+      <div
+        key="message-virtual-window"
+        ref={bindVirtualWindow}
+        data-ui="message-virtual-window"
+        data-virtualized={shouldVirtualize ? 'true' : 'false'}
+      >
+        {mountedVirtualItems.map(renderMountedMessage)}
+      </div>
       {insertTarget ? (
         <Suspense
           fallback={

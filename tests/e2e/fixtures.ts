@@ -198,7 +198,7 @@ export function createChatUiJourneyProfile(
         rootSelector: '[data-ui="message-list"]',
         itemSelector: '[data-ui="message"][data-message-id]',
         activeWhenSelector: '[data-ui="message-list"]',
-        monotonic: 'nondecreasing',
+        minimum: 1,
       },
     ],
     transcript: {
@@ -211,6 +211,10 @@ export function createChatUiJourneyProfile(
         countSurfaceId: 'mounted-messages',
         renderedCountAttribute: 'data-rendered-count',
         totalCountAttribute: 'data-total-count',
+      },
+      boundedVirtualResidency: {
+        renderedCountAttribute: 'data-rendered-count',
+        virtualizedAttribute: 'data-virtualized',
       },
     },
   }

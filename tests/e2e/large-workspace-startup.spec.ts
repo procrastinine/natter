@@ -39,6 +39,8 @@ const INITIAL_TRANSCRIPT_FLOOR = 10
 const HANG_BOUND_MS = 45_000
 const ROUTE_SWITCH_OBSERVATION_MS = 1_500
 const INSTRUMENTED_FOREGROUND_GESTURE_BOUND_MS = 75
+const LONG_TASK_THRESHOLD_MS = 50
+const CARDINALITY_BLOCKING_TIME_HEADROOM_MS = 50
 const GENERATED_WORKSPACE_FORK_TARGET_ID = 'generated-active-message-086'
 const GENERATED_WORKSPACE_MODEL_ID = 'google/gemini-3.5-flash'
 const CANONICAL_PHYSICAL_STORAGE_TABLE_NAMES = discoverCanonicalPhysicalStorageTableNames()
@@ -165,15 +167,11 @@ test('startup work and first interaction stay cardinality-bounded in a 4k-chat w
     Math.max(controlFirstPaint * 2, controlFirstPaint + 100),
   )
   expect(largeComplete).toBeLessThanOrEqual(Math.max(controlComplete * 2, controlComplete + 200))
-  const controlLongTaskTotal = control.destinationFrame.longTasks.reduce(
-    (sum, task) => sum + task.duration,
-    0,
+  const controlBlockingTime = totalBlockingTime(control.destinationFrame.longTasks)
+  const largeBlockingTime = totalBlockingTime(large.destinationFrame.longTasks)
+  expect(largeBlockingTime).toBeLessThanOrEqual(
+    controlBlockingTime + CARDINALITY_BLOCKING_TIME_HEADROOM_MS,
   )
-  const largeLongTaskTotal = large.destinationFrame.longTasks.reduce(
-    (sum, task) => sum + task.duration,
-    0,
-  )
-  expect(largeLongTaskTotal).toBeLessThanOrEqual(controlLongTaskTotal + 100)
   expect(
     Math.max(0, ...large.destinationFrame.longTasks.map((task) => task.duration)),
   ).toBeLessThanOrEqual(
@@ -183,6 +181,13 @@ test('startup work and first interaction stay cardinality-bounded in a 4k-chat w
   expect(control.diagnostics, 'control browser diagnostics').toEqual([])
   expect(large.diagnostics, 'large browser diagnostics').toEqual([])
 })
+
+function totalBlockingTime(longTasks: readonly { readonly duration: number }[]): number {
+  return longTasks.reduce(
+    (sum, task) => sum + Math.max(0, task.duration - LONG_TASK_THRESHOLD_MS),
+    0,
+  )
+}
 
 test('active-stream reload keeps input and unrelated controls cardinality-independent', async ({
   baseURL,

@@ -7,8 +7,11 @@ import type { BranchPathDescriptor } from '../../src/core/branch-session'
 import { createBranchPath, emptyBranchPath } from '../../src/core/branch-session'
 import { messageTreeIndexFields } from '../../src/core/message-tree-index'
 import { EMPTY_MESSAGE_CONTEXT_ROUTE_FACTS } from '../../src/core/reasoning'
+import type { Chat } from '../../src/core/types'
+import { selectPromptEstimateContextForTarget } from '../../src/hooks/usePromptEstimateContext'
 import type { ConversationChatSnapshot } from '../../src/store/conversation-controller'
 import type { MessageHeaderRow } from '../../src/store/message-storage'
+import type { PromptEstimateContextSnapshot } from '../../src/store/presentation-contracts'
 import {
   acceptedSettingsContextPath,
   settingsContextPathQueryIdentity,
@@ -49,6 +52,29 @@ describe('ChatModelPanel context freshness', () => {
     expect(settingsContextPathQueryIdentity(true, ['message-a', 'message-b'], [])).not.toBe(
       identities[0],
     )
+  })
+
+  it('never exposes a same-chat context publication for a different settings route', () => {
+    const value = {} as PromptEstimateContextSnapshot
+    const target = {
+      key: 'responses-without-encrypted-reasoning',
+      chat: { id: 'chat-a' } as Chat,
+    }
+
+    expect(
+      selectPromptEstimateContextForTarget(target, {
+        targetKey: 'responses-with-encrypted-reasoning',
+        chatId: 'chat-a',
+        value,
+      }),
+    ).toBeNull()
+    expect(
+      selectPromptEstimateContextForTarget(target, {
+        targetKey: target.key,
+        chatId: 'chat-a',
+        value,
+      }),
+    ).toBe(value)
   })
 })
 
