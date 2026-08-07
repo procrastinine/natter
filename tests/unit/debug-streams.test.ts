@@ -57,6 +57,7 @@ describe('debug stream helpers', () => {
   })
 
   it('copy() falls back cleanly when the document is not focused', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
     installDebugStreams()
     window.__debugStreams?.enable()
     vi.spyOn(document, 'hasFocus').mockReturnValue(false)
@@ -68,6 +69,11 @@ describe('debug stream helpers', () => {
     await expect(window.__debugStreams?.copy()).resolves.toBe('')
     expect(writeText).not.toHaveBeenCalled()
     expect(window.__debugStreamsLastCopyText).toBe('')
+    expect(warn).toHaveBeenCalledOnce()
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining('clipboard copy unavailable'),
+      expect.objectContaining({ name: 'NotAllowedError' }),
+    )
   })
 
   it('plan logging can be enabled without enabling verbose stream logging', () => {
@@ -214,6 +220,7 @@ describe('debug stream helpers', () => {
   })
 
   it('disable and clear release buffers, latest requests, and clipboard fallbacks', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
     installDebugStreams()
     window.__debugStreams?.enable()
     window.__debugStreams?.enablePlans()
@@ -246,5 +253,9 @@ describe('debug stream helpers', () => {
       latestRequest: { state: 'none', maximumBytes: 1024 * 1024 },
     })
     expect(window.__debugStreams?.lastRequest()).toBeNull()
+    expect(warn).toHaveBeenCalledTimes(2)
+    expect(
+      warn.mock.calls.every(([message]) => String(message).includes('clipboard copy unavailable')),
+    ).toBe(true)
   })
 })

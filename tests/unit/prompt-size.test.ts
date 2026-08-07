@@ -1435,10 +1435,11 @@ describe('promptEstimateInputSignature', () => {
 
     expect(input.reasoningRoute?.kind).toBe('chat')
     expect(() => estimatePromptSize(input)).not.toThrow()
+    if (!input.reasoning) throw new Error('PromptSizeReasoningFixtureMissing')
     expect(promptEstimateInputSignature(input)).not.toBe(
       promptEstimateInputSignature({
         ...input,
-        reasoningRoute: outboundReasoningRouteForReplayContract(input.reasoning!),
+        reasoningRoute: outboundReasoningRouteForReplayContract(input.reasoning),
       }),
     )
   })

@@ -577,64 +577,64 @@ describe('send-context freshness', () => {
     expect(validationBodyReads).toEqual({ get: 0, bulkGet: 0 })
   })
 
-  it.each([
-    'target',
-    'ancestor',
-  ] as const)('keeps delayed Continue coherent when a %s edit races planning', async (changedMessage) => {
-    const { chatId, user, assistant } = await seedAssistantBranch()
-    const { handle, discovery, openStream } = await delayedGeneration({
-      kind: 'continue',
-      chatId,
-      targetAssistantId: assistant.id,
-    })
-    await handle.prepared
-    await discovery.started
-    const messageId = changedMessage === 'target' ? assistant.id : user.id
-
-    const edit = executeMessageCommand({
-      kind: 'message.edit-body',
-      input: {
+  it.each(['target', 'ancestor'] as const)(
+    'keeps delayed Continue coherent when a %s edit races planning',
+    async (changedMessage) => {
+      const { chatId, user, assistant } = await seedAssistantBranch()
+      const { handle, discovery, openStream } = await delayedGeneration({
+        kind: 'continue',
         chatId,
-        messageId,
-        content: [
-          {
-            type: changedMessage === 'target' ? 'output_text' : 'text',
-            text: `${changedMessage} changed`,
-          },
-        ],
-      },
-    })
+        targetAssistantId: assistant.id,
+      })
+      await handle.prepared
+      await discovery.started
+      const messageId = changedMessage === 'target' ? assistant.id : user.id
 
-    if (changedMessage === 'target') {
-      await expect(edit).rejects.toThrow(`StreamTargetBusy:${assistant.id}`)
+      const edit = executeMessageCommand({
+        kind: 'message.edit-body',
+        input: {
+          chatId,
+          messageId,
+          content: [
+            {
+              type: changedMessage === 'target' ? 'output_text' : 'text',
+              text: `${changedMessage} changed`,
+            },
+          ],
+        },
+      })
+
+      if (changedMessage === 'target') {
+        await expect(edit).rejects.toThrow(`StreamTargetBusy:${assistant.id}`)
+        discovery.release()
+
+        await expect(handle.completed).resolves.toMatchObject({ outcome: 'done' })
+        expect(openStream).toHaveBeenCalledOnce()
+        const target = required(await message(assistant.id), 'continuation target')
+        expect(target.continuationAttempts).toEqual([
+          expect.objectContaining({ streamId: handle.streamId, status: 'done' }),
+        ])
+        expect(target.content).toEqual([{ type: 'output_text', text: 'partialdone' }])
+        return
+      }
+
+      await edit
       discovery.release()
 
-      await expect(handle.completed).resolves.toMatchObject({ outcome: 'done' })
-      expect(openStream).toHaveBeenCalledOnce()
+      await expect(handle.completed).resolves.toMatchObject({ outcome: 'error' })
+      expect(openStream).not.toHaveBeenCalled()
       const target = required(await message(assistant.id), 'continuation target')
       expect(target.continuationAttempts).toEqual([
-        expect.objectContaining({ streamId: handle.streamId, status: 'done' }),
+        expect.objectContaining({ streamId: handle.streamId, status: 'error' }),
       ])
-      expect(target.content).toEqual([{ type: 'output_text', text: 'partialdone' }])
-      return
-    }
-
-    await edit
-    discovery.release()
-
-    await expect(handle.completed).resolves.toMatchObject({ outcome: 'error' })
-    expect(openStream).not.toHaveBeenCalled()
-    const target = required(await message(assistant.id), 'continuation target')
-    expect(target.continuationAttempts).toEqual([
-      expect.objectContaining({ streamId: handle.streamId, status: 'error' }),
-    ])
-    expect(target.content).toEqual([
-      {
-        type: 'output_text',
-        text: 'partial',
-      },
-    ])
-  })
+      expect(target.content).toEqual([
+        {
+          type: 'output_text',
+          text: 'partial',
+        },
+      ])
+    },
+  )
 
   it('records a pre-dispatch Continue abort and never opens the transport', async () => {
     const { chatId, assistant } = await seedAssistantBranch()

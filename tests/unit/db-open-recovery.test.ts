@@ -100,6 +100,7 @@ describe('openDb recovery events', () => {
   })
 
   it('forwards blocked version changes only for the active open attempt', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
     const db = getDb()
     let rejectOpen!: (reason?: unknown) => void
     const pendingOpen = new Promise<never>((_resolve, reject) => {
@@ -120,6 +121,15 @@ describe('openDb recovery events', () => {
     await expect(opening).rejects.toThrow('open failed')
     db.on.blocked.fire(event)
     expect(onBlocked).toHaveBeenCalledTimes(1)
+    expect(warn).toHaveBeenCalledTimes(2)
+    expect(warn).toHaveBeenNthCalledWith(
+      1,
+      "Upgrade 'natter' blocked by other connection holding version 22",
+    )
+    expect(warn).toHaveBeenNthCalledWith(
+      2,
+      "Upgrade 'natter' blocked by other connection holding version 22",
+    )
   })
 
   it('creates and physically verifies a fresh current workspace database', async () => {
@@ -452,6 +462,7 @@ describe('openDb recovery events', () => {
   })
 
   it('reports an external version change once for the exact current session', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
     const fatal = vi.fn()
     claimBrowserWorkspaceFatalInvalidationOwner(fatal)
     await openDb()
@@ -471,9 +482,14 @@ describe('openDb recovery events', () => {
     )
     ;(await upgraded).close()
     expect(fatal).toHaveBeenCalledTimes(1)
+    expect(warn).toHaveBeenCalledOnce()
+    expect(warn).toHaveBeenCalledWith(
+      "Another connection wants to upgrade database 'natter'. Closing db now to resume the upgrade.",
+    )
   })
 
   it('delivers fatal invalidation only to the exact owner captured by the session', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
     const fatalA = vi.fn()
     const ownerA = claimBrowserWorkspaceFatalInvalidationOwner(fatalA)
     expect(() => claimBrowserWorkspaceFatalInvalidationOwner(vi.fn())).toThrow(
@@ -493,6 +509,10 @@ describe('openDb recovery events', () => {
     ;(await upgraded).close()
 
     expect(fatalA).not.toHaveBeenCalled()
+    expect(warn).toHaveBeenCalledOnce()
+    expect(warn).toHaveBeenCalledWith(
+      "Another connection wants to upgrade database 'natter'. Closing db now to resume the upgrade.",
+    )
     releaseBrowserWorkspaceFatalInvalidationOwner(ownerB)
   })
 

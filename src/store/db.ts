@@ -588,7 +588,7 @@ function sameStringArray(left: readonly string[], right: readonly string[]): boo
 // then tack on synthetic v2/v3 upgrades.
 export function registerSchema(db: Dexie): void {
   db.on('populate', async (tx) => {
-    await Promise.all([
+    await Dexie.Promise.all([
       tx.table<SettingsRow>('settings').bulkPut(freshWorkspaceSettingsRows()),
       tx.table<BrowserWorkspaceFenceRow>('workspaceFence').put(browserWorkspaceFenceRow()),
       tx.table<BrowserLockRow>('browserLocks').put(emptyBrowserWriterLockRow()),

@@ -1,9 +1,20 @@
 import { spawn } from 'node:child_process'
 import { existsSync, readFileSync, rmSync } from 'node:fs'
 import { resolve } from 'node:path'
+import { currentRuntimeCapability } from './verification-dependency-image.mjs'
 
 const root = resolve(import.meta.dirname, '..')
 const checkOnly = process.argv.includes('--check')
+const REQUIRED_POLICY = Object.freeze({
+  minimumReleaseAge: '1440',
+  minimumReleaseAgeStrict: 'true',
+  minimumReleaseAgeIgnoreMissingTime: 'false',
+  trustPolicy: 'no-downgrade',
+  trustLockfile: 'false',
+  blockExoticSubdeps: 'true',
+  strictDepBuilds: 'true',
+})
+let verifiedRuntime = null
 
 function readJson(path) {
   return JSON.parse(readFileSync(resolve(root, path), 'utf8'))
@@ -11,23 +22,52 @@ function readJson(path) {
 
 function readPolicy() {
   const text = readFileSync(resolve(root, 'pnpm-workspace.yaml'), 'utf8')
-  const policyKeys = ['minimumReleaseAge', 'trustPolicy', 'blockExoticSubdeps', 'strictDepBuilds']
   const lines = []
-  for (const key of policyKeys) {
+  for (const [key, expected] of Object.entries(REQUIRED_POLICY)) {
     const match = text.match(new RegExp(`^${key}:\\s*(.+)$`, 'm'))
-    if (match) lines.push(`${key}: ${match[1]}`)
+    const actual = match?.[1]?.trim()
+    if (actual !== expected) {
+      throw new Error(
+        `DependencyPolicyMismatch:${key}:expected=${expected}:actual=${actual ?? 'missing'}`,
+      )
+    }
+    lines.push(`${key}: ${actual}`)
   }
-  const ignoredUpdateBlock = text.match(
-    /^updateConfig:\s*\n {2}ignoreDependencies:\s*\n((?: {4}- .+\n?)*)/m,
-  )
+  const ignoredUpdateBlock = text.match(/^update:\s*\n {2}ignoreDeps:\s*\n((?: {4}- .+\n?)*)/m)
   if (ignoredUpdateBlock?.[1]) {
     const dependencies = ignoredUpdateBlock[1]
       .split('\n')
       .map((line) => line.replace(/^\s*-\s*/, '').trim())
       .filter(Boolean)
-    lines.push(`updateConfig.ignoreDependencies: ${dependencies.join(', ')}`)
+    lines.push(`update.ignoreDeps: ${dependencies.join(', ')}`)
   }
+  if (!ignoredUpdateBlock?.[1]) throw new Error('DependencyPolicyUpdateIgnoreMissing')
   return lines
+}
+
+async function verifyRuntime(packageJson) {
+  const expectedNodeVersion = readFileSync(resolve(root, '.node-version'), 'utf8').trim()
+  if (packageJson.engines?.node !== expectedNodeVersion) {
+    throw new Error(
+      `DependencyNodeDeclarationMismatch:pin=${expectedNodeVersion}:engine=${String(packageJson.engines?.node)}`,
+    )
+  }
+  if (process.versions.node !== expectedNodeVersion) {
+    throw new Error(
+      `DependencyNodeRuntimeMismatch:expected=${expectedNodeVersion}:actual=${process.versions.node}`,
+    )
+  }
+  const expectedPnpmVersion = /^pnpm@(\d+\.\d+\.\d+)$/u.exec(packageJson.packageManager)?.[1]
+  if (!expectedPnpmVersion) throw new Error('DependencyPnpmDeclarationMissing')
+  const capability = currentRuntimeCapability(root)
+  const actualPnpmVersion = capability.identity.pnpmVersion
+  if (actualPnpmVersion !== expectedPnpmVersion) {
+    throw new Error(
+      `DependencyPnpmRuntimeMismatch:expected=${expectedPnpmVersion}:actual=${actualPnpmVersion}`,
+    )
+  }
+  verifiedRuntime = capability
+  return { node: expectedNodeVersion, pnpm: expectedPnpmVersion }
 }
 
 function readPatchedDependencies() {
@@ -83,6 +123,16 @@ function verifyPatchedUpdates(patched, outdated) {
 }
 
 function pnpmInvocation(args) {
+  if (verifiedRuntime) {
+    return {
+      command: verifiedRuntime.nodeExecutablePath,
+      args: [
+        verifiedRuntime.pnpmExecutablePath,
+        '--config.manage-package-manager-versions=false',
+        ...args,
+      ],
+    }
+  }
   const pnpmArgs = ['--config.manage-package-manager-versions=false', ...args]
   const npmExecPath = process.env.npm_execpath
   if (!npmExecPath) return { command: 'pnpm', args: pnpmArgs }
@@ -173,15 +223,20 @@ async function showOutdated(label) {
 
 async function main() {
   const pkg = readJson('package.json')
+  const runtime = await verifyRuntime(pkg)
+  const policy = readPolicy()
   const patched = readPatchedDependencies()
   verifyPatchedDependencies(patched)
   section('Dependency Refresh')
   console.log(`packageManager: ${pkg.packageManager}`)
+  console.log(`runtime: Node ${runtime.node}, pnpm ${runtime.pnpm}`)
   console.log(`mode: ${checkOnly ? 'check only' : 'refresh'}`)
-  console.log('install scripts: disabled during refresh (--ignore-scripts)')
+  console.log(
+    'install scripts: disabled while resolving; only reviewed builds run during reconciliation',
+  )
 
   section('pnpm Policy')
-  for (const line of readPolicy()) console.log(line)
+  for (const line of policy) console.log(line)
 
   const outdatedBefore = await showOutdated('Outdated Before')
   verifyPatchedUpdates(patched, outdatedBefore)
@@ -190,6 +245,8 @@ async function main() {
     section('Refresh')
     console.log('Running: pnpm update --latest --ignore-scripts')
     await run(['update', '--latest', '--ignore-scripts'])
+    console.log('Running: pnpm install --frozen-lockfile')
+    await run(['install', '--frozen-lockfile'])
     rmSync(resolve(root, 'node_modules', '.vite'), { recursive: true, force: true })
     console.log('Cleared the derived Vite dependency cache.')
   }
@@ -200,16 +257,17 @@ async function main() {
   section('Audit')
   await run(['audit', '--audit-level', 'moderate'])
 
-  section('Ignored Builds')
-  const ignoredBuilds = await run(['ignored-builds'], {
-    allowExitCodes: [0, 1],
-    capture: true,
-  })
-  const ignoredOutput = `${ignoredBuilds.stdout}${ignoredBuilds.stderr}`.trim()
-  console.log(ignoredOutput || 'No ignored dependency builds reported.')
+  section('Build Script Policy')
+  console.log('strictDepBuilds rejects every unreviewed dependency build during reconciliation.')
 
   const outdatedAfter = await showOutdated('Outdated After')
   verifyPatchedUpdates(patched, outdatedAfter)
+  const eligibleRemaining = outdatedAfter.filter((row) => row.current !== row.wanted)
+  if (!checkOnly && eligibleRemaining.length > 0) {
+    throw new Error(
+      `EligibleDependencyUpdatesRemain:${eligibleRemaining.map((row) => row.name).join(',')}`,
+    )
+  }
 
   section('Next Checks')
   console.log('Recommended after dependency diffs: pnpm typecheck && pnpm build')

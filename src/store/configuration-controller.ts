@@ -645,6 +645,7 @@ class TabConfigurationController implements ConfigurationController {
   private conversationChatId: ChatId | null = null
   private activeConversationChat: Chat | null = null
   private intentRevision = 0
+  private intentClaimRevision = 0
   private projectionLoadRevision = 0
   private activeChatSeed: ActiveConfigurationSeed | null = null
   private discoverySurface: ConfigurationDiscoverySurface | null = null
@@ -812,6 +813,7 @@ class TabConfigurationController implements ConfigurationController {
     this.discoverySurface = null
     this.modelCatalogDemanded = false
     this.intentRevision += 1
+    this.intentClaimRevision += 1
     const rememberedSeed = readRememberedConfigurationSeed(fence)
     this.seedState = rememberedSeed.settings
       ? resolvedConfigurationSeedState(rememberedSeed)
@@ -870,6 +872,7 @@ class TabConfigurationController implements ConfigurationController {
       this.persistSeed()
     }
     this.intentRevision += 1
+    if (routeChanged) this.intentClaimRevision += 1
     if (routeChanged && previousChatId) this.closeChatEditSessions(previousChatId, 'flush')
     this.withPublicationBatch(() => {
       this.reconcileActiveFrameTarget(snapshot)
@@ -1023,7 +1026,10 @@ class TabConfigurationController implements ConfigurationController {
   }
 
   observeDiscoverySurface(surface: ConfigurationDiscoverySurface | null): void {
-    const next = surface ? Object.freeze({ ...surface }) : null
+    const sameProfile = this.discoverySurface?.profileId === surface?.profileId
+    const demanded =
+      (surface?.modelsDemanded ?? false) || (sameProfile && this.modelCatalogDemanded)
+    const next = surface ? Object.freeze({ ...surface, modelsDemanded: demanded }) : null
     if (
       this.discoverySurface?.profileId === next?.profileId &&
       this.discoverySurface?.modelId === next?.modelId &&
@@ -1032,7 +1038,6 @@ class TabConfigurationController implements ConfigurationController {
       return
     }
     this.discoverySurface = next
-    const demanded = next?.modelsDemanded ?? false
     const demandStarted = demanded && !this.modelCatalogDemanded
     this.modelCatalogDemanded = demanded
     if (demandStarted) {
@@ -1063,6 +1068,7 @@ class TabConfigurationController implements ConfigurationController {
     this.seedState = resolvedConfigurationSeedState(next)
     this.seedRevision += 1
     this.intentRevision += 1
+    this.intentClaimRevision += 1
     this.persistSeed()
     this.withPublicationBatch(() => {
       this.reconcileActiveFrameFromCurrentState()
@@ -1095,6 +1101,7 @@ class TabConfigurationController implements ConfigurationController {
     }
     this.seedRevision += 1
     this.intentRevision += 1
+    this.intentClaimRevision += 1
     this.persistSeed()
     return true
   }
@@ -1790,15 +1797,16 @@ class TabConfigurationController implements ConfigurationController {
   }
 
   claimIntent(): ConfigurationIntent {
+    const revision = ++this.intentClaimRevision
     return Object.freeze({
       workspaceId: this.workspaceFence?.workspaceId ?? null,
       replacementEpoch: this.workspaceFence?.replacementEpoch ?? null,
-      revision: this.intentRevision,
+      revision,
     })
   }
 
   intentIsCurrent(intent: ConfigurationIntent): boolean {
-    if (intent.revision !== this.intentRevision) return false
+    if (intent.revision !== this.intentClaimRevision) return false
     if (intent.workspaceId === null || intent.replacementEpoch === null) return true
     return (
       this.workspaceFence !== null &&

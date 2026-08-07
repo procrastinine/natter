@@ -264,20 +264,18 @@ export const TEMPORAL_SEMANTIC_GROUPS = Object.freeze([
   covered(
     'configuration-discovery-freshness',
     semantics(
-      'Repository cache rows and request epochs own discovery correctness; TTL and retry deadlines only choose refresh timing.',
+      'Repository cache rows and request epochs own discovery correctness; TTL deadlines only choose refresh timing, while failures require target change or explicit retry.',
       'configuration discovery background refresh',
       'workspace plus profile/model key',
       'configuration discovery coordinator',
       'Reschedule clears the prior timer and runtime close aborts in-flight discovery.',
-      'One timer per coordinator plus finite TTL/retry policy constants consumed by keyed cache rows.',
+      'One timer per coordinator plus finite TTL policy constants consumed by keyed cache rows.',
       'Captured key, request epoch, and cache row revision reject stale completion.',
       'freshness-policy',
     ),
     {
       schedulers: ['src/store/configuration-discovery-coordinator.ts|schedule|setTimeout|delay|1'],
       durations: [
-        'src/store/configuration-discovery-coordinator.ts|DISCOVERY_RETRY_BASE_MS|1_000',
-        'src/store/configuration-discovery-coordinator.ts|DISCOVERY_RETRY_MAX_MS|60_000',
         'src/store/discovery-cache-policy.ts|MODELS_TTL_MS|60 * 60 * 1000',
         'src/store/discovery-cache-policy.ts|ENDPOINTS_TTL_MS|5 * 60 * 1000',
         'src/store/discovery-cache-policy.ts|PRIVACY_POLICY_TTL_MS|24 * 60 * 60 * 1000',

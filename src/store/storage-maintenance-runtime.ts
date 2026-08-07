@@ -1,3 +1,4 @@
+import Dexie from 'dexie'
 import { isWorkspaceReplacementRecoveryRequiredError } from '../core/import-export/errors'
 import { yieldToEventLoop } from '../lib/yield-to-event-loop'
 import { cleanPendingBrowserWorkspaceDatabase } from './browser-workspace-database-cleanup'
@@ -7,6 +8,7 @@ import type {
   BrowserWorkspaceReplacementStart,
 } from './browser-workspace-maintenance-contract'
 import { reclaimInactiveBrowserWorkspaceDatabases } from './browser-workspace-orphan-reclamation'
+import { withBrowserWorkspaceSelectionGate } from './browser-workspace-slot-coordination'
 import type { NatterDb } from './db'
 import { getBrowserWorkspaceSession } from './db'
 import { withCoordinationLock } from './locks'
@@ -254,7 +256,7 @@ class StorageMaintenanceController {
         database.streamLeases,
       ],
       () =>
-        Promise.all([
+        Dexie.Promise.all([
           database.attachmentIntegrityState.get('workspace'),
           readStorageRetentionState(database, 'attachment-reap'),
           readStorageRetentionState(database, 'terminal-stream-prune'),
@@ -382,7 +384,7 @@ class StorageMaintenanceController {
     }
     this.#clearWakeTimer()
     const generation = this.#ownerGeneration
-    const finalized = this.#runPump(generation).finally(() => {
+    const finalized = runStorageMaintenancePump(() => this.#runPump(generation)).finally(() => {
       if (this.#pumpTask === finalized) this.#pumpTask = null
       if (this.#ownerIsCurrent(generation)) this.#schedulePump()
     })
@@ -434,7 +436,8 @@ class StorageMaintenanceController {
         const result = await cleanPendingBrowserWorkspaceDatabase(this.#ownerSignal())
         if (result.status === 'changed' || result.status === 'cleaned') return { kind: 'continue' }
         if (result.status === 'preparing') {
-          return { kind: 'blocked', on: 'slot', retryAt: Date.now() + RETRY_BASE_DELAY_MS }
+          await withBrowserWorkspaceSelectionGate(() => Promise.resolve(), this.#ownerSignal())
+          return { kind: 'continue' }
         }
         return { kind: 'done' }
       }
@@ -884,6 +887,11 @@ function abortSignalIsAborted(signal: AbortSignal): boolean {
 }
 
 export const __linkedStorageMaintenanceAbortControllerForTests = linkedAbortController
+export const __runStorageMaintenancePumpForTests = runStorageMaintenancePump
+
+function runStorageMaintenancePump<T>(operation: () => Promise<T>): Promise<T> {
+  return Dexie.ignoreTransaction(operation)
+}
 
 function waitForAbort(signal: AbortSignal): Promise<void> {
   if (signal.aborted) return Promise.resolve()

@@ -7,6 +7,7 @@
   "minimumReleaseAgeBehaviour": "timestamp-required",
   "prCreation": "not-pending",
   "internalChecksFilter": "strict",
+  "automerge": false,
   "rangeStrategy": "bump",
   "prConcurrentLimit": 4,
   "labels": ["dependencies"],
@@ -24,6 +25,10 @@
     {
       "matchDepTypes": ["packageManager"],
       "groupName": "package manager"
+    },
+    {
+      "matchDatasources": ["node-version"],
+      "groupName": "Node.js runtime"
     },
     {
       "matchManagers": ["github-actions"],

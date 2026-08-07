@@ -385,7 +385,11 @@ function StorageOverview() {
       })
       navigateForIntent(routeIntent, storageHref())
     } catch (error) {
-      console.error('Failed to import workspace backup', error)
+      console.error(
+        'Failed to import workspace backup',
+        error,
+        ...aggregateDiagnosticConstituents(error),
+      )
       if (isWorkspaceReplacementRecoveryRequiredError(error)) {
         setWorkspaceRecoveryRequired(true)
       }
@@ -601,6 +605,16 @@ function StorageOverview() {
       ) : null}
     </section>
   )
+}
+
+function aggregateDiagnosticConstituents(error: unknown): readonly unknown[] {
+  if (!(error instanceof AggregateError)) return []
+  const errors: unknown = error.errors
+  if (!Array.isArray(errors)) return []
+  return errors.flatMap((constituent: unknown) => [
+    constituent,
+    ...aggregateDiagnosticConstituents(constituent),
+  ])
 }
 
 function StorageUsageDetails({ quota }: { quota: QuotaSnapshot | null }) {

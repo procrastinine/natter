@@ -603,14 +603,16 @@ export function createWorkspaceRuntimeControlKernel(runtime: WorkspaceRuntimeKer
 
   async function performWorkspaceRuntimeQuiesce(mode: 'graceful' | 'abortive'): Promise<void> {
     const failures = quiesceFailures.splice(0)
-    await settleResourcePhase('inbound', failures)
+    await settleResourcePhase('inbound', failures, mode === 'abortive')
     collectRejected(failures, await Promise.allSettled([runtime.awaitDrain()]))
-    await settleResourcePhase('producer', failures)
+    await settleResourcePhase('producer', failures, mode === 'abortive')
     collectRejected(failures, await Promise.allSettled([awaitCapabilityStartupIdle()]))
     if (mode === 'graceful') {
       for (const phase of ['inbound', 'producer'] as const) {
         for (const resource of resourcesInPhase(phase)) abortResource(resource, failures)
       }
+      await settleResourcePhase('inbound', failures, true)
+      await settleResourcePhase('producer', failures, true)
     }
     for (const phase of CLOSE_PHASES) {
       if (phase === 'inbound' || phase === 'producer') continue
@@ -637,13 +639,15 @@ export function createWorkspaceRuntimeControlKernel(runtime: WorkspaceRuntimeKer
   async function settleResourcePhase(
     phase: WorkspaceRuntimeResourcePhase,
     failures: unknown[],
+    finishDispose = true,
   ): Promise<void> {
-    await settleResources(resourcesInPhase(phase), failures)
+    await settleResources(resourcesInPhase(phase), failures, finishDispose)
   }
 
   async function settleResources(
     batch: readonly WorkspaceRuntimeResource[],
     failures: unknown[],
+    finishDispose = true,
   ): Promise<void> {
     collectRejected(
       failures,
@@ -656,12 +660,14 @@ export function createWorkspaceRuntimeControlKernel(runtime: WorkspaceRuntimeKer
         ),
       ),
     )
-    collectRejected(
-      failures,
-      await Promise.allSettled(
-        batch.map((resource) => Promise.resolve().then(() => resource.finishDispose?.())),
-      ),
-    )
+    if (finishDispose) {
+      collectRejected(
+        failures,
+        await Promise.allSettled(
+          batch.map((resource) => Promise.resolve().then(() => resource.finishDispose?.())),
+        ),
+      )
+    }
   }
 
   function closeAndAbort(resource: WorkspaceRuntimeResource, failures?: unknown[]): void {
@@ -893,7 +899,11 @@ export function createWorkspaceRuntimeControlKernel(runtime: WorkspaceRuntimeKer
       } catch (error) {
         resource.status = 'failed'
         resource.failure = error
-        failures.push(error)
+        failures.push(
+          new AggregateError([error], `WorkspaceRuntimeResourceClosureFailed:${resource.id}`, {
+            cause: error,
+          }),
+        )
       }
     }
     return failures

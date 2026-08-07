@@ -1283,7 +1283,7 @@ function runAcceptsCoordinatorEntry(run: RecoveryRun, entry: RecoveryQueueEntry)
 
 function watchOwnershipRelease(streamId: string): void {
   const deadline = leaseDeadlines.get(streamId)
-  if (!deadline || !deadline.ownershipWatchable || deadline.ownershipWatch) return
+  if (!deadline?.ownershipWatchable || deadline.ownershipWatch) return
   const watch = { controller: new AbortController() }
   deadline.ownershipWatch = watch
   void waitForStreamOwnershipRelease(streamId, watch.controller.signal).then((released) => {

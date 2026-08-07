@@ -30,6 +30,7 @@ vi.mock('../../src/store/discovery-service', () => ({
 }))
 
 afterEach(() => {
+  vi.useRealTimers()
   vi.clearAllMocks()
 })
 
@@ -113,6 +114,28 @@ describe('ConfigurationDiscoveryCoordinator', () => {
     coordinator.reconcile(input)
 
     expect(coordinator.getSnapshot().statuses.models.error).toBeNull()
+    coordinator.reset()
+  })
+
+  it('keeps failure settled without clock-based network readmission', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(10_000)
+    const input = modelCatalogInput()
+    const coordinator = new ConfigurationDiscoveryCoordinator({ onChange: () => undefined })
+    discovery.refreshModels.mockRejectedValueOnce(new Error('offline'))
+    coordinator.reconcile(input)
+
+    coordinator.requestModels(input.surface.profileId)
+    await vi.waitFor(() => expect(coordinator.getSnapshot().statuses.models.error).toBe('offline'))
+
+    await vi.advanceTimersByTimeAsync(600_000)
+    coordinator.reconcile(input)
+
+    expect(discovery.refreshModels).toHaveBeenCalledOnce()
+    expect(coordinator.getSnapshot().statuses.models).toMatchObject({
+      inFlight: false,
+      error: 'offline',
+    })
     coordinator.reset()
   })
 })

@@ -666,27 +666,33 @@ describe('built-app runtime boundary', () => {
     const packageJson = readJson<{ scripts: Record<string, string> }>('package.json')
 
     expect(config).toContain("const skipBuild = process.env.E2E_SKIP_BUILD === '1'")
-    expect(config).toContain('...(skipBuild ? [] : [`${packageManagerCommand} build`])')
+    expect(config).toContain('delete process.env.NO_COLOR')
+    expect(config).toContain('...(skipBuild ? [] : [`$' + '{packageManagerCommand} build`])')
     expect(config).toContain('command: applicationServerCommand')
-    expect(config).toContain('command: `${packageManagerCommand} fake-provider -- --host')
+    expect(config).toContain('command: `$' + '{packageManagerCommand} fake-provider -- --host')
     expect(config).not.toContain('E2E_BUILD_KIND')
     expect(config).not.toContain('build:pages')
-    expect(config).toContain('${packageManagerCommand} exec vite preview --host')
+    expect(config).toContain('$' + '{packageManagerCommand} exec vite preview --host')
     expect(packageJson.scripts.preview).toBe('pnpm build && vite preview')
-    expect(config).toContain('${packageManagerCommand} fake-provider -- --host')
+    expect(config).toContain('$' + '{packageManagerCommand} fake-provider -- --host')
     expect(config).toContain('E2E_FAKE_PROVIDER_ORIGIN')
     expect(config).not.toContain('E2E_FAKE_PROVIDER_URL')
     expect(config).toMatch(/url: `\$\{fakeProviderURL\}\/healthz`/u)
     expect(config).toContain("process.env.E2E_REUSE_EXISTING_SERVER === '1'")
     expect(readText('scripts/run-verification.mjs')).toContain("E2E_REUSE_EXISTING_SERVER: '0'")
     expect(readText('scripts/run-verification.mjs')).toContain(
-      "['chromium-e2e', 'headed-hidden-tab-visual-continuity', 'dev-preview-parity'].includes(item.id)",
+      "E2E_SERIALIZE_LARGE_WORKSPACE_CLOSURE: '1'",
     )
+    expect(config).toContain("process.env.E2E_SERIALIZE_LARGE_WORKSPACE_CLOSURE === '1'")
+    expect(config).toContain("{ dependencies: ['large-workspace-setup'] }")
+    expect(config).toContain("? ['chromium'] : ['large-workspace-setup']")
+    expect(readText('scripts/run-verification.mjs')).toContain("'firefox-e2e',")
     const runner = readText('scripts/run-verification.mjs')
     expect(runner.indexOf("stage('production-build'")).toBeLessThan(
       runner.indexOf("stage('chromium-e2e'"),
     )
-    expect(runner.indexOf("stage('chromium-e2e'")).toBeLessThan(
+    expect(runner.indexOf("stage('chromium-e2e'")).toBeLessThan(runner.indexOf("'firefox-e2e',"))
+    expect(runner.indexOf("'firefox-e2e',")).toBeLessThan(
       runner.indexOf("'headed-hidden-tab-visual-continuity',"),
     )
     expect(runner.indexOf("'headed-hidden-tab-visual-continuity',")).toBeLessThan(
@@ -701,7 +707,7 @@ describe('built-app runtime boundary', () => {
     expect(config).toContain('--strictPort')
     expect(config).toContain("process.env.E2E_DEV_PREVIEW_PARITY === '1'")
     expect(config).toContain('command: devServerCommand')
-    expect(config).toContain('url: `${devBaseURL}/src/main.tsx`')
+    expect(config).toContain('url: `$' + '{devBaseURL}/src/main.tsx`')
     expect(config).toContain("name: 'chromium-preview-parity'")
     expect(config).toContain("name: 'chromium-dev-parity'")
     expect(config).toContain("process.env.E2E_HEADED_VISIBILITY === '1'")
@@ -871,6 +877,7 @@ describe('built-app runtime boundary', () => {
   })
 
   it('pins local tools and every CI workflow to the same Node and pnpm runtime', () => {
+    const pnpmActionSetupRevision = '0977fd99725f1db4007ccb2928dbb4e90d06cc86'
     const packageJson = readJson<{
       packageManager: string
       engines: { node: string }
@@ -888,10 +895,16 @@ describe('built-app runtime boundary', () => {
       const source = readFileSync(workflow, 'utf8')
       expect(source, relativePath(ROOT, workflow)).toContain('node-version-file: .node-version')
       expect(source, relativePath(ROOT, workflow)).not.toMatch(/node-version:\s*['"]?\d/iu)
+      expect(source, relativePath(ROOT, workflow)).toContain(
+        `pnpm/action-setup@${pnpmActionSetupRevision}`,
+      )
     }
 
     const verify = readText('.github/workflows/verify.yml')
+    const verifyTimeout = Number(/timeout-minutes:\s*(\d+)/u.exec(verify)?.[1])
     expect(verify).toContain('run: pnpm verify:ci')
+    expect(verify).toContain('playwright install --with-deps chromium firefox')
+    expect(verifyTimeout).toBeGreaterThanOrEqual(90)
     expect(VERIFICATION_STAGES.find((stage) => stage.id === 'vitest')?.argv).toEqual([
       'pnpm',
       'exec',
@@ -905,6 +918,13 @@ describe('built-app runtime boundary', () => {
       'test',
       '--project=chromium',
       '--project=chromium-large-workspace',
+    ])
+    expect(VERIFICATION_STAGES.find((stage) => stage.id === 'firefox-e2e')?.argv).toEqual([
+      'pnpm',
+      'exec',
+      'playwright',
+      'test',
+      '--project=firefox',
     ])
     expect(
       VERIFICATION_STAGES.find((stage) => stage.id === 'headed-hidden-tab-visual-continuity')?.argv,

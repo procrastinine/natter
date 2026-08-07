@@ -632,42 +632,40 @@ describe('planned configuration commands', () => {
       currentVersion: 1,
       ciphertext: 'replacement',
     },
-  ])('treats exact $label replay as conflict without a second key mutation', async ({
-    seed,
-    command,
-    currentVersion,
-    ciphertext,
-  }) => {
-    if (seed) await getDb().keys.put(key(0))
-    let mutations = 0
-    const observeMutation = () => {
-      mutations += 1
-    }
-    getDb().keys.hook.creating.subscribe(observeMutation)
-    getDb().keys.hook.updating.subscribe(observeMutation)
-    try {
-      await expect(executePlannedCommand(command)).resolves.toMatchObject({
-        kind: 'key-saved',
-        keyId: 'key-a',
-        changed: true,
-        deleted: false,
-      })
-      await expect(executePlannedCommand(command)).resolves.toMatchObject({
-        kind: 'conflict',
-        reason: 'key-material-revision',
-        currentVersion,
-      })
-    } finally {
-      getDb().keys.hook.creating.unsubscribe(observeMutation)
-      getDb().keys.hook.updating.unsubscribe(observeMutation)
-    }
+  ])(
+    'treats exact $label replay as conflict without a second key mutation',
+    async ({ seed, command, currentVersion, ciphertext }) => {
+      if (seed) await getDb().keys.put(key(0))
+      let mutations = 0
+      const observeMutation = () => {
+        mutations += 1
+      }
+      getDb().keys.hook.creating.subscribe(observeMutation)
+      getDb().keys.hook.updating.subscribe(observeMutation)
+      try {
+        await expect(executePlannedCommand(command)).resolves.toMatchObject({
+          kind: 'key-saved',
+          keyId: 'key-a',
+          changed: true,
+          deleted: false,
+        })
+        await expect(executePlannedCommand(command)).resolves.toMatchObject({
+          kind: 'conflict',
+          reason: 'key-material-revision',
+          currentVersion,
+        })
+      } finally {
+        getDb().keys.hook.creating.unsubscribe(observeMutation)
+        getDb().keys.hook.updating.unsubscribe(observeMutation)
+      }
 
-    expect(mutations).toBe(1)
-    expect(await getDb().keys.get('key-a')).toMatchObject({
-      ciphertext,
-      materialRevision: currentVersion,
-    })
-  })
+      expect(mutations).toBe(1)
+      expect(await getDb().keys.get('key-a')).toMatchObject({
+        ciphertext,
+        materialRevision: currentVersion,
+      })
+    },
+  )
 
   it('keeps key-material work exact and independent of linked-profile cardinality', async () => {
     await getDb().keys.put(key(0))

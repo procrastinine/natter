@@ -1410,6 +1410,7 @@ describe('BranchTreeView', () => {
 
   it('keeps inspection distinct from branch activation while preserving real deep links', async () => {
     const activate = vi.fn()
+    const open = vi.spyOn(window, 'open').mockReturnValue(null)
     render(
       <BranchTreeView
         chatId="chat-1"
@@ -1430,7 +1431,8 @@ describe('BranchTreeView', () => {
     expect(fireEvent.click(root, { metaKey: true })).toBe(true)
     expect(
       fireEvent(root, new MouseEvent('auxclick', { bubbles: true, cancelable: true, button: 1 })),
-    ).toBe(true)
+    ).toBe(false)
+    expect(open).toHaveBeenCalledWith('#/chat/chat-1/message/right', '_blank', 'noopener')
     expect(activate).not.toHaveBeenCalled()
     expect(root).not.toHaveAttribute('data-selected')
     expect(document.querySelector('[data-ui="branch-tree-inspector"]')).not.toBeInTheDocument()
@@ -2146,7 +2148,10 @@ describe('BranchTreeView', () => {
     ).length
 
     committed = true
-    await act(() => removeTestAttempt('empty-preview-stream'))
+    await act(async () => {
+      removeTestAttempt('empty-preview-stream')
+      await Promise.resolve()
+    })
 
     await waitFor(() =>
       expect(
@@ -3005,138 +3010,138 @@ describe('BranchTreeView', () => {
     expect(deleteNode).toHaveBeenCalledWith(expect.objectContaining({ id: 'root' }))
   })
 
-  it.each(
-    rejectedTreeActionCases,
-  )('owns and surfaces rejected $kind actions without closing or applying them', async ({
-    kind,
-    label,
-  }) => {
-    const rejected = vi.fn(async () => {
-      throw new Error(`${kind} rejected`)
-    })
-    const settlements = createInteractionSettlementHarness()
-    const rejectedMutation = vi.fn(() => settlements.fail(new Error(`${kind} rejected`)))
-    const treeRepository = repository({
-      getMessage: async (messageId) =>
-        messageId === 'right' ? actionMessage() : fullMessageFor(messageId),
-    })
-    render(
-      <BranchTreeView
-        chatId="chat-1"
-        headers={smallTree}
-        cursor={{ root: 'left' }}
-        expanded={false}
-        repository={treeRepository}
-        onActivateNode={kind === 'activate' ? rejected : () => undefined}
-        {...(kind === 'delete' ? { onDeleteNode: rejectedMutation } : {})}
-        {...(kind === 'fork' ? { onForkMessage: rejectedMutation } : {})}
-        {...(kind === 'toggle' ? { onToggleMessageContextVisibility: rejectedMutation } : {})}
-        {...(kind === 'attachment' ? { onMutateMessageAttachmentRef: rejected } : {})}
-        {...(kind === 'reasoning-visibility'
-          ? { onToggleReasoningDetailHidden: rejectedMutation }
-          : {})}
-        {...(kind === 'tool-visibility'
-          ? { onToggleProviderOutputItemHidden: rejectedMutation }
-          : {})}
-        {...(kind === 'insert' ? { onInsertAfterLeaf: rejected } : {})}
-      />,
-    )
-
-    fireEvent.click(document.querySelector('[data-message-id="right"]') as Element)
-    const inspector = await waitFor(() => {
-      const current = document.querySelector('[data-ui="branch-tree-inspector"]')
-      expect(current).toHaveAttribute('data-message-id', 'right')
-      return current as HTMLElement
-    })
-
-    if (kind === 'activate') {
-      fireEvent.click(screen.getByRole('button', { name: 'Open this branch' }))
-    } else if (kind === 'delete') {
-      fireEvent.click(screen.getByRole('button', { name: 'Delete message' }))
-    } else if (kind === 'fork') {
-      fireEvent.click(screen.getByRole('button', { name: 'Branch this chat from here' }))
-    } else if (kind === 'toggle') {
-      fireEvent.click(
-        screen.getByRole('button', { name: 'Hide from context (never send to model)' }),
+  it.each(rejectedTreeActionCases)(
+    'owns and surfaces rejected $kind actions without closing or applying them',
+    async ({ kind, label }) => {
+      const rejected = vi.fn(async () => {
+        throw new Error(`${kind} rejected`)
+      })
+      const settlements = createInteractionSettlementHarness()
+      const rejectedMutation = vi.fn(() => settlements.fail(new Error(`${kind} rejected`)))
+      const treeRepository = repository({
+        getMessage: async (messageId) =>
+          messageId === 'right' ? actionMessage() : fullMessageFor(messageId),
+      })
+      render(
+        <BranchTreeView
+          chatId="chat-1"
+          headers={smallTree}
+          cursor={{ root: 'left' }}
+          expanded={false}
+          repository={treeRepository}
+          onActivateNode={kind === 'activate' ? rejected : () => undefined}
+          {...(kind === 'delete' ? { onDeleteNode: rejectedMutation } : {})}
+          {...(kind === 'fork' ? { onForkMessage: rejectedMutation } : {})}
+          {...(kind === 'toggle' ? { onToggleMessageContextVisibility: rejectedMutation } : {})}
+          {...(kind === 'attachment' ? { onMutateMessageAttachmentRef: rejected } : {})}
+          {...(kind === 'reasoning-visibility'
+            ? { onToggleReasoningDetailHidden: rejectedMutation }
+            : {})}
+          {...(kind === 'tool-visibility'
+            ? { onToggleProviderOutputItemHidden: rejectedMutation }
+            : {})}
+          {...(kind === 'insert' ? { onInsertAfterLeaf: rejected } : {})}
+        />,
       )
-    } else if (kind === 'attachment') {
-      fireEvent.click(screen.getByRole('button', { name: 'Hide attachment from context' }))
-    } else if (kind === 'reasoning-visibility') {
-      const reasoning = document.querySelector<HTMLDetailsElement>('[data-ui="reasoning"]')
-      if (!reasoning) throw new Error('Reasoning disclosure missing')
-      reasoning.open = true
-      fireEvent(reasoning, new Event('toggle'))
-      fireEvent.click(screen.getByRole('button', { name: 'Hide this reasoning block' }))
-    } else if (kind === 'tool-visibility') {
-      const toolEvidence = document.querySelector<HTMLDetailsElement>('[data-ui="tool-evidence"]')
-      if (!toolEvidence) throw new Error('Tool evidence disclosure missing')
-      toolEvidence.open = true
-      fireEvent(toolEvidence, new Event('toggle'))
-      fireEvent.click(screen.getByRole('button', { name: 'Hide tool call' }))
-    } else {
-      const append = document.querySelector<HTMLElement>(
-        '[data-connector-hit="leaf-append"][data-parent-id="right"]',
-      )
-      if (!append) throw new Error('Leaf insertion target missing')
-      fireEvent.click(append)
-    }
 
-    const mutationOwned = [
-      'delete',
-      'fork',
-      'toggle',
-      'reasoning-visibility',
-      'tool-visibility',
-    ].includes(kind)
-    if (mutationOwned) {
-      await waitFor(() => expect(settlements.presented).toHaveLength(1))
-      expect(settlements.presented[0]?.message).toContain(`${kind} rejected`)
-    } else if (kind === 'attachment') {
-      const expectedToast = {
-        level: 'danger',
-        text: `${label} failed: ${kind} rejected`,
+      fireEvent.click(document.querySelector('[data-message-id="right"]') as Element)
+      const inspector = await waitFor(() => {
+        const current = document.querySelector('[data-ui="branch-tree-inspector"]')
+        expect(current).toHaveAttribute('data-message-id', 'right')
+        return current as HTMLElement
+      })
+
+      if (kind === 'activate') {
+        fireEvent.click(screen.getByRole('button', { name: 'Open this branch' }))
+      } else if (kind === 'delete') {
+        fireEvent.click(screen.getByRole('button', { name: 'Delete message' }))
+      } else if (kind === 'fork') {
+        fireEvent.click(screen.getByRole('button', { name: 'Branch this chat from here' }))
+      } else if (kind === 'toggle') {
+        fireEvent.click(
+          screen.getByRole('button', { name: 'Hide from context (never send to model)' }),
+        )
+      } else if (kind === 'attachment') {
+        fireEvent.click(screen.getByRole('button', { name: 'Hide attachment from context' }))
+      } else if (kind === 'reasoning-visibility') {
+        const reasoning = document.querySelector<HTMLDetailsElement>('[data-ui="reasoning"]')
+        if (!reasoning) throw new Error('Reasoning disclosure missing')
+        reasoning.open = true
+        fireEvent(reasoning, new Event('toggle'))
+        fireEvent.click(screen.getByRole('button', { name: 'Hide this reasoning block' }))
+      } else if (kind === 'tool-visibility') {
+        const toolEvidence = document.querySelector<HTMLDetailsElement>('[data-ui="tool-evidence"]')
+        if (!toolEvidence) throw new Error('Tool evidence disclosure missing')
+        toolEvidence.open = true
+        fireEvent(toolEvidence, new Event('toggle'))
+        fireEvent.click(screen.getByRole('button', { name: 'Hide tool call' }))
+      } else {
+        const append = document.querySelector<HTMLElement>(
+          '[data-connector-hit="leaf-append"][data-parent-id="right"]',
+        )
+        if (!append) throw new Error('Leaf insertion target missing')
+        fireEvent.click(append)
       }
-      await waitFor(() =>
-        expect(
-          useToastStore
-            .getState()
-            .toasts.filter(
-              (toast) => toast.level === expectedToast.level && toast.text === expectedToast.text,
-            ),
-        ).toHaveLength(1),
-      )
-    } else {
-      expect(await screen.findByRole('alert')).toHaveTextContent(
-        `${label} failed: ${kind} rejected`,
-      )
-    }
-    if (mutationOwned) expect(rejectedMutation).toHaveBeenCalledOnce()
-    else expect(rejected).toHaveBeenCalledOnce()
-    expect(document.querySelector('[data-ui="branch-tree-inspector"]')).toBe(inspector)
-    expect(document.querySelector('[data-message-id="right"]')).toHaveAttribute(
-      'data-selected',
-      'true',
-    )
-    if (kind === 'activate') {
-      expect(document.querySelector('[data-message-id="left"]')).toHaveAttribute(
-        'data-current-leaf',
+
+      const mutationOwned = [
+        'delete',
+        'fork',
+        'toggle',
+        'reasoning-visibility',
+        'tool-visibility',
+      ].includes(kind)
+      if (mutationOwned) {
+        await waitFor(() => expect(settlements.presented).toHaveLength(1))
+        expect(settlements.presented[0]?.message).toContain(`${kind} rejected`)
+      } else if (kind === 'attachment') {
+        const expectedToast = {
+          level: 'danger',
+          text: `${label} failed: ${kind} rejected`,
+        }
+        await waitFor(() =>
+          expect(
+            useToastStore
+              .getState()
+              .toasts.filter(
+                (toast) => toast.level === expectedToast.level && toast.text === expectedToast.text,
+              ),
+          ).toHaveLength(1),
+        )
+      } else {
+        expect(await screen.findByRole('alert')).toHaveTextContent(
+          `${label} failed: ${kind} rejected`,
+        )
+      }
+      if (mutationOwned) expect(rejectedMutation).toHaveBeenCalledOnce()
+      else expect(rejected).toHaveBeenCalledOnce()
+      expect(document.querySelector('[data-ui="branch-tree-inspector"]')).toBe(inspector)
+      expect(document.querySelector('[data-message-id="right"]')).toHaveAttribute(
+        'data-selected',
         'true',
       )
-    } else if (kind === 'toggle') {
-      expect(
-        screen.getByRole('button', { name: 'Hide from context (never send to model)' }),
-      ).toHaveAttribute('aria-pressed', 'false')
-    } else if (kind === 'attachment') {
-      expect(document.querySelector('[data-ui="attachment-chip"]')).toHaveAttribute(
-        'data-context',
-        'included',
-      )
-    } else if (kind === 'reasoning-visibility') {
-      expect(screen.getByRole('button', { name: 'Hide this reasoning block' })).toBeInTheDocument()
-    } else if (kind === 'tool-visibility') {
-      expect(screen.getByRole('button', { name: 'Hide tool call' })).toBeInTheDocument()
-    }
-  })
+      if (kind === 'activate') {
+        expect(document.querySelector('[data-message-id="left"]')).toHaveAttribute(
+          'data-current-leaf',
+          'true',
+        )
+      } else if (kind === 'toggle') {
+        expect(
+          screen.getByRole('button', { name: 'Hide from context (never send to model)' }),
+        ).toHaveAttribute('aria-pressed', 'false')
+      } else if (kind === 'attachment') {
+        expect(document.querySelector('[data-ui="attachment-chip"]')).toHaveAttribute(
+          'data-context',
+          'included',
+        )
+      } else if (kind === 'reasoning-visibility') {
+        expect(
+          screen.getByRole('button', { name: 'Hide this reasoning block' }),
+        ).toBeInTheDocument()
+      } else if (kind === 'tool-visibility') {
+        expect(screen.getByRole('button', { name: 'Hide tool call' })).toBeInTheDocument()
+      }
+    },
+  )
 
   it('renders viewport-sized DOM for a very wide tree and only previews visible expanded cards', async () => {
     const headers: MessageHeaderRow[] = [header('root', null, 0, 'user', 1)]

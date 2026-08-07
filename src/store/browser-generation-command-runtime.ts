@@ -1,3 +1,4 @@
+import Dexie from 'dexie'
 import type { ActiveBranchIntentTarget } from '../core/active-branch-spine'
 import { applyChatSettingsPatch, sameChatSettings } from '../core/chat-metadata'
 import {
@@ -933,7 +934,7 @@ export async function finalizeBrowserAttempt(
             : current.content
         let calibrationPatch: MessageCalibrationPatch | undefined
         if (baseMatches && input.continuationText.length > 0) {
-          const [chat, globalCalibrationValue, calibrationModeValue] = await Promise.all([
+          const [chat, globalCalibrationValue, calibrationModeValue] = await Dexie.Promise.all([
             ctx.getChat(current.chatId),
             ctx.getSetting<unknown>(GLOBAL_TOKEN_CALIBRATION_KEY),
             ctx.getSetting<unknown>(TOKEN_CALIBRATION_MODE_KEY),
@@ -1120,7 +1121,7 @@ export async function commitBrowserGenerationMetadata(
       const settings = tx.table<SettingsRow, string>('settings')
       if (evidence.recentModelId !== undefined && generationCompleted) {
         recordGenerationMetadataPrimaryRead(physicalReads, 'settings', 2)
-        const [publicRow, recencyRow] = await Promise.all([
+        const [publicRow, recencyRow] = await Dexie.Promise.all([
           settings.get(RECENT_MODELS_KEY),
           settings.get(RECENT_MODEL_RECENCY_KEY),
         ])
@@ -1155,7 +1156,7 @@ export async function commitBrowserGenerationMetadata(
         recordGenerationMetadataPrimaryRead(physicalReads, 'chats')
         recordGenerationMetadataPrimaryRead(physicalReads, 'settings')
         const chatMutation = openPreservingChatMutation(tx)
-        const [chat, globalRow] = await Promise.all([
+        const [chat, globalRow] = await Dexie.Promise.all([
           chatMutation.read(lease.chatId),
           settings.get(GLOBAL_TOKEN_CALIBRATION_KEY),
         ])

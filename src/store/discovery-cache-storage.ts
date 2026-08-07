@@ -1,4 +1,4 @@
-import type { Transaction } from 'dexie'
+import Dexie, { type Transaction } from 'dexie'
 import {
   recordBrowserCommandDiscoveryCacheMaintenance,
   recordBrowserCommandOwnerInvalidation,
@@ -189,7 +189,7 @@ export async function readDiscoveryCacheRowWithEvidence<T extends DiscoveryCache
       payloadFound: false,
     }
   }
-  const [metadata, payload] = await Promise.all([
+  const [metadata, payload] = await Dexie.Promise.all([
     tx
       .table<DiscoveryPayloadMetadataStorageRow, string>('discoveryPayloadMetadata')
       .get(stored.payloadId),
@@ -541,7 +541,7 @@ export async function clearDiscoveryCacheProfileRows(
 ): Promise<DiscoveryCacheProfileClearReceipt> {
   recordDiscoveryCacheProfileInvalidations(tx, tableNames, profileId)
   const state = await readValidatedState(tx, receipt)
-  const boundedRows = await Promise.all(
+  const boundedRows = await Dexie.Promise.all(
     tableNames.map((tableName) =>
       tx
         .table<StorageRowByTable[typeof tableName], [string, string]>(tableName)
@@ -1119,14 +1119,14 @@ async function readHeaderAuditPage(
   recordDiscoveryCacheRead(receipt, tableName, 'primary', undefined, 'query', 1, rows.length)
   const page = rows.slice(0, limit)
   const payloadIds = [...new Set(page.map((row) => row.payloadId))]
-  const [metadata, bodyIds] = await Promise.all([
+  const [metadata, bodyIds] = await Dexie.Promise.all([
     payloadIds.length === 0
-      ? Promise.resolve([] as Array<DiscoveryPayloadMetadataStorageRow | undefined>)
+      ? Dexie.Promise.resolve([] as Array<DiscoveryPayloadMetadataStorageRow | undefined>)
       : tx
           .table<DiscoveryPayloadMetadataStorageRow, string>('discoveryPayloadMetadata')
           .bulkGet(payloadIds),
     payloadIds.length === 0
-      ? Promise.resolve([] as string[])
+      ? Dexie.Promise.resolve([] as string[])
       : (tx
           .table<DiscoveryPayloadStorageRow, string>('discoveryPayloads')
           .where(':id')
@@ -1255,7 +1255,7 @@ async function countPayloadReferences(
   payloadId: string,
   receipt?: DiscoveryCacheReceiptAccumulator,
 ): Promise<number> {
-  const counts = await Promise.all(
+  const counts = await Dexie.Promise.all(
     TABLE_ORDER.map((tableName) =>
       tx.table(tableName).where('payloadId').equals(payloadId).count(),
     ),
@@ -1294,7 +1294,7 @@ async function deletePayloadIfUnreferenced(
   payloadId: string,
   receipt?: DiscoveryCacheReceiptAccumulator,
 ): Promise<boolean> {
-  const references = await Promise.all(
+  const references = await Dexie.Promise.all(
     TABLE_ORDER.map((tableName) =>
       tx.table(tableName).where('payloadId').equals(payloadId).limit(1).primaryKeys(),
     ),
@@ -1321,20 +1321,20 @@ async function deleteDiscoveryPayload(
   knownBodyExists?: boolean,
   receipt?: DiscoveryCacheReceiptAccumulator,
 ): Promise<boolean> {
-  const [metadata, bodyExists] = await Promise.all([
+  const [metadata, bodyExists] = await Dexie.Promise.all([
     knownMetadata !== undefined
-      ? Promise.resolve(knownMetadata ?? undefined)
+      ? Dexie.Promise.resolve(knownMetadata ?? undefined)
       : tx
           .table<DiscoveryPayloadMetadataStorageRow, string>('discoveryPayloadMetadata')
           .get(payloadId),
     knownBodyExists === undefined
       ? payloadBodyExists(tx, payloadId, receipt)
-      : Promise.resolve(knownBodyExists),
+      : Dexie.Promise.resolve(knownBodyExists),
   ])
   if (knownMetadata === undefined) {
     recordDiscoveryCacheRead(receipt, 'discoveryPayloadMetadata', 'primary', undefined, 'get', 1, 1)
   }
-  await Promise.all([
+  await Dexie.Promise.all([
     deletePhysicalStorageKeys<DiscoveryPayloadMetadataStorageRow, string>(
       tx,
       'discoveryPayloadMetadata',
@@ -1347,7 +1347,7 @@ async function deleteDiscoveryPayload(
   const obsoleteBytes = metadata
     ? estimateStoredValueBytes(metadata) + (bodyExists ? metadata.byteLength : 0)
     : 0
-  await recordObsoleteByteOwnerBytes(tx, obsoleteBytes)
+  recordObsoleteByteOwnerBytes(tx, obsoleteBytes)
   return bodyExists
 }
 

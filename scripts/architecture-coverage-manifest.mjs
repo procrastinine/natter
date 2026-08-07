@@ -216,7 +216,7 @@ export const ARCHITECTURE_PROOFS = Object.freeze([
     'branch-tree-browser-tests',
     'browser-test',
     'tests/e2e/branch-tree.spec.ts',
-    "test('middle-click opens the newest descendant branch in a background tab'",
+    "test('middle-click targets the newest descendant and its activated tab presents that branch'",
     ['conversation', 'presentation-system'],
     ['behavioral-tests', 'browser-performance-tests'],
   ),
@@ -273,7 +273,7 @@ export const ARCHITECTURE_COVERAGE = Object.freeze([
       'Active-stream reload can leave shell controls inert for seconds, and no fault matrix proves recovery work remains independent from shell interaction.',
     ),
     'tab-cross-tab-locality': gap(
-      'Selected multi-tab scenarios pass, but application-shell lacks an entry-by-entry locality matrix; the still-failing background-tab New chat path is direct counterevidence.',
+      'Selected multi-tab scenarios, including background New chat startup, pass, but application-shell lacks an entry-by-entry locality matrix.',
     ),
     'temporal-semantics': gap(
       'Active-stream reload exposes a multi-second coupling between hydration or recovery and shell interactivity; no temporal contract forbids that coupling.',
@@ -1212,7 +1212,7 @@ export const ARCHITECTURE_COVERAGE = Object.freeze([
       'Distributed writes lack per-variant rollback proof, and active-stream reload currently leaves controls inert while workspace recovery settles.',
     ),
     'tab-cross-tab-locality': gap(
-      'Selected multi-tab scenarios pass, but workspace lacks an entry-by-entry locality matrix; the still-failing background-tab New chat path is direct counterevidence.',
+      'Selected multi-tab scenarios, including background New chat startup, pass, but workspace lacks an entry-by-entry locality matrix.',
     ),
     'temporal-semantics': gap(
       'Workspace recovery has no invariant separating UI readiness from hydration and lease arbitration; active-stream reload currently causes multi-second unclickability.',

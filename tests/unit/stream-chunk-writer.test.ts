@@ -286,6 +286,21 @@ describe('stream chunk writer', () => {
     expect(appendStreamChunks).toHaveBeenCalledTimes(2)
   })
 
+  it('keeps the flush schedule bounded when the wall clock moves backward', async () => {
+    vi.useFakeTimers()
+    const appendStreamChunks = vi.fn(async (_rows: readonly TestSemanticJournalRow[]) => {})
+    const writer = createWriter({ appendStreamChunks }, 1_000_000)
+
+    writer.append({ lane: 'text', text: 'after clock correction' }, 1_000)
+    writer.flush({ mode: 'scheduled', now: 1_000 })
+
+    await vi.advanceTimersByTimeAsync(149)
+    expect(appendStreamChunks).not.toHaveBeenCalled()
+    await vi.advanceTimersByTimeAsync(1)
+    await writer.settle()
+    expect(appendStreamChunks).toHaveBeenCalledTimes(1)
+  })
+
   it.each([
     ['text', { lane: 'text', text: 'x'.repeat(128 * 1024) } satisfies CanonicalStreamEventV2],
     [

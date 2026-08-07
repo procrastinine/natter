@@ -5,6 +5,7 @@ export interface VerificationPerformanceStageEvidence {
     | 'production-build'
     | 'vitest'
     | 'chromium-e2e'
+    | 'firefox-e2e'
     | 'stream-profile-single'
     | 'stream-profile-concurrent'
   readonly status: 'failed' | 'inventoried' | 'passed' | 'planned'

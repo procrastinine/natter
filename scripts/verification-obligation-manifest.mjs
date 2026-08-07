@@ -1,5 +1,6 @@
 import { PROTOCOL_CONTRACT_STAGE } from './protocol-contract-descriptor.mjs'
 import { PUBLICATION_CONSUMER_FILES } from './tab-cross-tab-locality-inventory.mjs'
+import { DECLARED_TEST_DOMAINS } from './test-evidence-manifest.mjs'
 import {
   VERIFICATION_DEPENDENCY_RECIPE_FILES,
   verificationDependencyRecipeInputPaths,
@@ -219,6 +220,10 @@ export const VERIFICATION_PROOFS = Object.freeze([
     runner: 'node',
     argv: ['scripts/audit-current-wave.mjs'],
   }),
+  proof('e2e-browser-storage-ownership', 'static', {
+    runner: 'node',
+    argv: ['scripts/audit-e2e-browser-storage.mjs'],
+  }),
 ])
 
 export const VERIFICATION_OBLIGATIONS = Object.freeze([
@@ -279,6 +284,7 @@ export const VERIFICATION_OBLIGATIONS = Object.freeze([
       'protocol-contracts',
       'protocol-contracts-contract',
       'test-runtime-isolation',
+      'e2e-browser-storage-ownership',
     ],
     'open',
   ),
@@ -521,6 +527,10 @@ export const VERIFICATION_EXPLICIT_MODULE_EDGES = Object.freeze([
     'scripts/audit-storage-ownership-reclamation.mjs',
     'scripts/storage-ownership-reclamation-inventory.mjs',
   ),
+  edge('scripts/audit-e2e-browser-storage.mjs', 'scripts/e2e-browser-storage-inventory.json'),
+  ...Object.keys(DECLARED_TEST_DOMAINS)
+    .filter((path) => path.startsWith('tests/e2e/'))
+    .map((path) => edge('scripts/audit-e2e-browser-storage.mjs', path)),
   edge('scripts/launch-slice-verification.mjs', 'scripts/run-checkpoint-verification.mjs'),
   edge('scripts/launch-slice-verification.mjs', 'scripts/run-slice-verification.mjs'),
 ])

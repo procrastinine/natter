@@ -956,6 +956,30 @@ describe('browser WorkspaceRepository protocol contract', () => {
     expect(getWorkspaceRuntimeControlSnapshot().state).toBe('RUNNING')
   })
 
+  it('starts replacement selection outside an ambient Dexie transaction', async () => {
+    const db = getDb()
+    let replacement: Promise<unknown> | undefined
+    let observed: unknown
+
+    await db.transaction('r', db.settings, () => {
+      expect(Dexie.currentTransaction).not.toBeNull()
+      replacement = runBrowserWorkspaceReplacement(
+        () => {
+          observed = Dexie.currentTransaction
+          return false
+        },
+        async () => {
+          throw new Error('Skipped replacement operation ran')
+        },
+      )
+      void replacement.catch(() => undefined)
+    })
+
+    await expect(replacement).rejects.toThrow('BrowserWorkspaceReplacementPreflightSkipped')
+    expect(observed).toBeNull()
+    expect(getWorkspaceRuntimeControlSnapshot().state).toBe('RUNNING')
+  })
+
   it('claims an abandoned preparing journal before admitting the next required replacement', async () => {
     const abandoned = await beginBrowserWorkspaceDatabaseReplacement()
     const abandonedManifest = await readBrowserWorkspaceDatabaseManifest()
@@ -1015,7 +1039,7 @@ describe('browser WorkspaceRepository protocol contract', () => {
       async (_database, context) => {
         markEntered()
         await gate
-        context.preactivationCheckpoint()
+        if (!context.signal.aborted) throw new Error('replacement-signal-not-aborted')
         throw continuedWithoutCancellation
       },
       { signal: controller.signal },

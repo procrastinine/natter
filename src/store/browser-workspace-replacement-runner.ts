@@ -58,6 +58,7 @@ import {
 import { readBrowserWorkspaceMeta, seedBrowserWorkspaceReplacementMeta } from './workspace-meta'
 import {
   isWorkspaceMaintenancePreemptedError,
+  isWorkspaceRuntimeClosedError,
   runWorkspaceRead,
   subscribeWorkspaceRuntimeIdle,
   subscribeWorkspaceRuntimeState,
@@ -185,45 +186,47 @@ function launchBrowserWorkspaceReplacement<T>(
   preflight: BrowserWorkspaceReplacementPreflight,
   work: BrowserWorkspaceReplacementWork<T>,
 ): Promise<BrowserWorkspaceReplacementStart<T>> {
-  let promoted = false
-  let resolveCompletion!: (commit: BrowserWorkspaceReplacementCommit<T>) => void
-  let rejectCompletion!: (error: unknown) => void
-  return new Promise<BrowserWorkspaceReplacementStart<T>>((resolve, reject) => {
-    const onPromoted = () => {
-      promoted = true
-      const completion = new Promise<BrowserWorkspaceReplacementCommit<T>>(
-        (resolveCommit, rejectCommit) => {
-          resolveCompletion = resolveCommit
-          rejectCompletion = rejectCommit
+  return Dexie.ignoreTransaction(() => {
+    let promoted = false
+    let resolveCompletion!: (commit: BrowserWorkspaceReplacementCommit<T>) => void
+    let rejectCompletion!: (error: unknown) => void
+    return new Promise<BrowserWorkspaceReplacementStart<T>>((resolve, reject) => {
+      const onPromoted = () => {
+        promoted = true
+        const completion = new Promise<BrowserWorkspaceReplacementCommit<T>>(
+          (resolveCommit, rejectCommit) => {
+            resolveCompletion = resolveCommit
+            rejectCompletion = rejectCommit
+          },
+        )
+        void completion.catch(() => undefined)
+        resolve({
+          kind: 'handoff',
+          handoff: { completion },
+        })
+      }
+      void performBrowserWorkspaceReplacementLaunch(policy, preflight, work, onPromoted).then(
+        (result) => {
+          if (
+            result.kind === 'blocked' ||
+            result.kind === 'cleanup-required' ||
+            result.kind === 'skipped'
+          ) {
+            resolve(result)
+            return
+          }
+          void result.transition
+            .finalize()
+            .then(unwrapBrowserWorkspaceReplacementOutcome)
+            .then(resolveCompletion, rejectCompletion)
+        },
+        (error: unknown) => {
+          const failure = browserWorkspaceReplacementError(error)
+          if (promoted) rejectCompletion(failure)
+          else reject(failure)
         },
       )
-      void completion.catch(() => undefined)
-      resolve({
-        kind: 'handoff',
-        handoff: { completion },
-      })
-    }
-    void performBrowserWorkspaceReplacementLaunch(policy, preflight, work, onPromoted).then(
-      (result) => {
-        if (
-          result.kind === 'blocked' ||
-          result.kind === 'cleanup-required' ||
-          result.kind === 'skipped'
-        ) {
-          resolve(result)
-          return
-        }
-        void result.transition
-          .finalize()
-          .then(unwrapBrowserWorkspaceReplacementOutcome)
-          .then(resolveCompletion, rejectCompletion)
-      },
-      (error: unknown) => {
-        const failure = browserWorkspaceReplacementError(error)
-        if (promoted) rejectCompletion(failure)
-        else reject(failure)
-      },
-    )
+    })
   })
 }
 
@@ -492,7 +495,7 @@ async function runUnslottedBrowserWorkspaceReplacement<T>(
   } catch (error) {
     if (!transition.hasDisposition()) {
       if (mutationState.authoritativeMutationCommitted) transition.markOutcomeUnknown(error)
-      else transition.markUncommitted(error)
+      else transition.markUncommitted(replacementExecutionFailure(error, authority.signal))
     }
   } finally {
     replacementDb.close()
@@ -520,7 +523,9 @@ async function runSlottedBrowserWorkspaceReplacement<T>(
       authority.signal,
     )
   } catch (error) {
-    if (!transition.hasDisposition()) transition.markUncommitted(error)
+    if (!transition.hasDisposition()) {
+      transition.markUncommitted(replacementExecutionFailure(error, authority.signal))
+    }
   }
   return transition
 }
@@ -588,6 +593,16 @@ function browserWorkspaceReplacementStageError(stage: string, reason: unknown): 
   })
 }
 
+function replacementExecutionFailure(error: unknown, signal: AbortSignal): unknown {
+  if (!signal.aborted || signal.reason === error) return error
+  if (!isWorkspaceRuntimeClosedError(signal.reason)) return signal.reason
+  return new AggregateError(
+    [error, signal.reason],
+    'BrowserWorkspaceReplacementExecutionFailedAndAuthorityAborted',
+    { cause: error },
+  )
+}
+
 async function prepareSlottedDestination(
   journal: BrowserWorkspaceReplacementPreparing,
   originalWorkspace: BrowserWorkspaceSnapshot,
@@ -629,7 +644,7 @@ async function prepareOnlineSlottedReplacement<T>(
             withBrowserWorkspaceSourceDatabase(journal.sourceDatabaseName, sourceOperation),
           runDestinationTransaction: (tableNames, transactionOperation) =>
             destination.transaction(
-              'rw',
+              'rw!',
               tableNames.map((tableName) => destination.table(tableName)),
               transactionOperation,
             ),
@@ -798,7 +813,7 @@ async function withBrowserWorkspaceSourceDatabase<T>(
   try {
     await prepareBrowserWorkspaceSchema(source)
     await source.open()
-    return await operation(source)
+    return await Dexie.ignoreTransaction(() => operation(source))
   } finally {
     source.close()
   }

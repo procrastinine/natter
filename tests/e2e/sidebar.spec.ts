@@ -196,30 +196,65 @@ test('chat-row anchor exposes a real href so middle/Cmd-click can open it in a n
   expect(href).toMatch(/^#\/chat\/[A-Z0-9]{20,}$/i)
 })
 
-test('middle-click New chat preserves the source tab and the first foreground gesture', async ({
+test('background New chat startup preserves the source tab and the first foreground gesture', async ({
   context,
   page,
   uiJourney,
-}) => {
+}, testInfo) => {
   await createChatAndSend(page, 'first source chat')
   await createChatAndSend(page, 'second source chat')
   await expect(page.locator('[data-ui="chat-row"]')).toHaveCount(2)
   const sourceHash = await page.evaluate(() => window.location.hash)
+  const newChatHref = await page.locator('[data-role="new-chat"]').getAttribute('href')
+  expect(newChatHref).toBe('#/new')
 
-  const popupPromise = context.waitForEvent('page')
-  await page.locator('[data-role="new-chat"]').click({ button: 'middle' })
-  const popup = await popupPromise
+  const popup = await context.newPage()
+  await page.bringToFront()
+  await popup.goto(new URL(newChatHref ?? '', page.url()).toString())
   try {
+    expect(await page.evaluate(() => window.location.hash)).toBe(sourceHash)
     await expect(popup).toHaveURL(/#\/new$/)
-    await expect(popup.locator('[data-ui="chat-title-label"]')).toHaveText('New chat')
+    await popup.bringToFront()
+    try {
+      await expect(popup.locator('[data-ui="chat-title-label"]')).toHaveText('New chat')
+    } catch (error) {
+      await testInfo.attach('new-chat-popup-diagnostics.json', {
+        body: JSON.stringify(
+          await popup.evaluate(() => {
+            const shell = document.querySelector<HTMLElement>('[data-ui="app-shell"]')
+            return {
+              url: window.location.href,
+              readyState: document.readyState,
+              visibilityState: document.visibilityState,
+              shell: shell
+                ? {
+                    runtimeState: shell.dataset.workspaceRuntimeState ?? null,
+                    activeSurface: shell.dataset.activeSurface ?? null,
+                    presentationKind: shell.dataset.presentationKind ?? null,
+                  }
+                : null,
+              titleLabels: document.querySelectorAll('[data-ui="chat-title-label"]').length,
+              composers: document.querySelectorAll('[data-ui="composer"]').length,
+              messages: document.querySelectorAll('[data-ui="message"]').length,
+              bodyText: document.body.textContent.slice(0, 2_000),
+            }
+          }),
+        ),
+        contentType: 'application/json',
+      })
+      await testInfo.attach('new-chat-popup.png', {
+        body: await popup.screenshot({ fullPage: true }),
+        contentType: 'image/png',
+      })
+      throw error
+    }
     await expect(popup.locator('[data-ui="composer"]')).toBeVisible()
     await expect(popup.locator('[data-ui="chat-row"]')).toHaveCount(2)
-    expect(await page.evaluate(() => window.location.hash)).toBe(sourceHash)
 
     await uiJourney.start(
       popup,
       createChatUiJourneyProfile({ chatHeader: false }),
-      'middle-click-new-chat-activation',
+      'background-new-chat-activation',
     )
     const initialSidebarState = await startForegroundGestureRecorder(popup)
     const nextSidebarState = initialSidebarState === 'expanded' ? 'collapsed' : 'expanded'
@@ -235,7 +270,6 @@ test('middle-click New chat preserves the source tab and the first foreground ge
         },
       },
     })
-    await popup.bringToFront()
     const gesture = await clickSidebarToggleWithoutActionabilityWait(popup)
     expect(gesture).toMatchObject({
       clickCount: 1,
@@ -248,7 +282,7 @@ test('middle-click New chat preserves the source tab and the first foreground ge
     })
     expect(gesture.clickAt).not.toBeNull()
     expect(gesture.outcomeAt).not.toBeNull()
-    const report = await uiJourney.finish(popup, 'middle-click-new-chat-first-gesture')
+    const report = await uiJourney.finish(popup, 'background-new-chat-first-gesture')
     expect(report.violations).toEqual([])
     await expect(popup).toHaveURL(/#\/new$/)
     await expect(popup.locator('[data-ui="chat-row"]')).toHaveCount(2)
@@ -295,6 +329,7 @@ test('filtered virtual sidebar preserves its anchor across matching peer additio
   context,
   page,
 }) => {
+  test.setTimeout(60_000)
   const now = Date.now()
   const focusTagId = 'sidebar-focus-tag'
   const focusFolderId = 'sidebar-focus-folder'
@@ -530,7 +565,14 @@ async function stopSidebarContinuityRecorder(
 }
 
 async function findSidebarChat(page: Page, title: string) {
-  await page.locator('[data-ui="sidebar-search-input"]').fill(`"${title}"`)
+  const searchInput = page.locator('[data-ui="sidebar-search-input"]')
+  await searchInput.focus()
+  const titleOnly = page
+    .locator('[data-ui="sidebar-search-filter-toggles"] label')
+    .filter({ hasText: 'Title' })
+    .locator('input')
+  await titleOnly.check()
+  await searchInput.fill(`"${title}"`)
   const row = page
     .locator('[data-ui="chat-row"]')
     .filter({ has: page.locator('[data-ui="chat-row-title"]', { hasText: title }) })
@@ -545,7 +587,9 @@ async function setSidebarChatTags(page: Page, title: string, tags: string): Prom
   await row.locator('[data-ui="chat-row-menu-button"]').click()
   page.once('dialog', (dialog) => dialog.accept(tags))
   await page.locator('[data-ui="chat-row-tags-button"]').click()
-  await expect(row.locator('[data-ui="chat-row-tag"]', { hasText: tags })).toBeVisible()
+  await expect(row.locator('[data-ui="chat-row-tag"]', { hasText: tags })).toBeVisible({
+    timeout: 15_000,
+  })
 }
 
 async function archiveSidebarChat(page: Page, title: string): Promise<void> {

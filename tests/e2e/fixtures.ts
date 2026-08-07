@@ -45,6 +45,19 @@ export interface RuntimeDiagnosticExpectation extends RuntimeDiagnosticAllowance
   count: number
 }
 
+const firefoxEngineDiagnosticAllowances: readonly RuntimeDiagnosticAllowance[] = [
+  {
+    category: 'console-other',
+    message:
+      '^\\[JavaScript Warning: "An IndexedDB transaction that was not yet complete has been aborted due to page navigation\\." \\{file: "http://127\\.0\\.0\\.1:\\d+/(?:assets/[^"]+|node_modules/\\.vite/deps/dexie\\.js[^"]*)" line: \\d+\\}\\]$',
+  },
+  {
+    category: 'console-other',
+    message:
+      '^\\[JavaScript Warning: "This site appears to use a scroll-linked positioning effect\\. This may not work well with asynchronous panning; see https://firefox-source-docs\\.mozilla\\.org/performance/scroll-linked_effects\\.html for further details and to join the discussion on related tools and features!" \\{file: "http://127\\.0\\.0\\.1:\\d+/#/[^"]+" line: 0\\}\\]$',
+  },
+]
+
 interface RuntimeDiagnostic {
   category: RuntimeDiagnosticCategory
   source: RuntimeDiagnosticSource
@@ -57,11 +70,16 @@ interface RuntimeDiagnostic {
 }
 
 interface RuntimeDiagnosticFixtures {
+  runtimeDiagnosticPolicy: RuntimeDiagnosticPolicy
   runtimeDiagnosticAllowances: RuntimeDiagnosticAllowance[]
   runtimeDiagnosticExpectations: RuntimeDiagnosticExpectation[]
   expectRuntimeDiagnostic: (expectation: RuntimeDiagnosticExpectation) => void
   runtimeDiagnosticGate: undefined
   uiJourney: UiJourneyFixture
+}
+
+interface RuntimeDiagnosticPolicy {
+  readonly allowances: readonly RuntimeDiagnosticAllowance[]
 }
 
 type NativeCdpConnect = (options: {
@@ -227,7 +245,10 @@ const activeSurfaceReadinessNode = Object.freeze({
 })
 
 export const test = fixtureBase.extend<RuntimeDiagnosticFixtures>({
-  runtimeDiagnosticAllowances: [[], { option: true }],
+  runtimeDiagnosticPolicy: [{ allowances: [] }, { option: true }],
+  runtimeDiagnosticAllowances: async ({ runtimeDiagnosticPolicy }, use) => {
+    await use([...runtimeDiagnosticPolicy.allowances])
+  },
   runtimeDiagnosticExpectations: async ({ context: _context }, use) => {
     await use([])
   },
@@ -236,13 +257,35 @@ export const test = fixtureBase.extend<RuntimeDiagnosticFixtures>({
   },
   runtimeDiagnosticGate: [
     async (
-      { context, runtimeDiagnosticAllowances, runtimeDiagnosticExpectations },
+      { baseURL, browserName, context, runtimeDiagnosticAllowances, runtimeDiagnosticExpectations },
       use,
       testInfo,
     ) => {
       const diagnostics: RuntimeDiagnostic[] = []
+      const classifyDiagnostic = (diagnostic: RuntimeDiagnostic): RuntimeDiagnostic => {
+        const application = classifyAllowance(
+          diagnostic,
+          runtimeDiagnosticAllowances,
+          runtimeDiagnosticExpectations,
+        )
+        return application.allowed || browserName !== 'firefox'
+          ? application
+          : classifyAllowance(
+              application,
+              firefoxEngineDiagnosticAllowances,
+              runtimeDiagnosticExpectations,
+            )
+      }
       const pendingConsoleDetails = new Set<Promise<void>>()
       let lifecycleDrainStarted = false
+      if (!baseURL) throw new Error('RuntimeDiagnosticBaseUrlMissing')
+      const lifecycleDrainUrl = new URL('/__e2e-lifecycle-drain__', baseURL).href
+      await context.route('**/__e2e-lifecycle-drain__', (route) =>
+        route.fulfill({
+          contentType: 'text/html',
+          body: '<!doctype html><html data-e2e-lifecycle-drain><title>Closed</title></html>',
+        }),
+      )
       await context.route('https://debug.invalid/**', (route) =>
         route.fulfill({
           contentType: 'application/json',
@@ -293,18 +336,14 @@ export const test = fixtureBase.extend<RuntimeDiagnosticFixtures>({
         if (message.type() !== 'warning' && message.type() !== 'error') return
         const category = classifyConsoleDiagnostic(message.text())
         const location = message.location()
-        const diagnostic: RuntimeDiagnostic = classifyAllowance(
-          {
-            category: category ?? 'console-other',
-            source: 'console',
-            level: message.type(),
-            message: message.text(),
-            ...(location.url ? { location } : {}),
-            allowed: false,
-          },
-          runtimeDiagnosticAllowances,
-          runtimeDiagnosticExpectations,
-        )
+        const diagnostic: RuntimeDiagnostic = classifyDiagnostic({
+          category: category ?? 'console-other',
+          source: 'console',
+          level: message.type(),
+          message: message.text(),
+          ...(location.url ? { location } : {}),
+          allowed: false,
+        })
         diagnostics.push(
           lifecycleDrainStarted && isFixtureLifecycleNavigationWarning(message)
             ? { ...diagnostic, allowed: true }
@@ -315,11 +354,7 @@ export const test = fixtureBase.extend<RuntimeDiagnosticFixtures>({
           diagnostic.detail = detail
           diagnostic.category =
             classifyConsoleDiagnostic(`${diagnostic.message}\n${detail}`) ?? diagnostic.category
-          diagnostic.allowed = classifyAllowance(
-            diagnostic,
-            runtimeDiagnosticAllowances,
-            runtimeDiagnosticExpectations,
-          ).allowed
+          diagnostic.allowed = classifyDiagnostic(diagnostic).allowed
         })
         pendingConsoleDetails.add(detailTask)
         void detailTask.finally(() => pendingConsoleDetails.delete(detailTask))
@@ -329,19 +364,15 @@ export const test = fixtureBase.extend<RuntimeDiagnosticFixtures>({
         if (pageErrorHandlers.has(page)) return
         const onPageError = (error: Error) => {
           diagnostics.push(
-            classifyAllowance(
-              {
-                category: 'page-error',
-                source: 'pageerror',
-                level: 'error',
-                message: error.message,
-                ...(error.stack ? { stack: error.stack } : {}),
-                location: { url: safePageUrl(page), lineNumber: 0, columnNumber: 0 },
-                allowed: false,
-              },
-              runtimeDiagnosticAllowances,
-              runtimeDiagnosticExpectations,
-            ),
+            classifyDiagnostic({
+              category: 'page-error',
+              source: 'pageerror',
+              level: 'error',
+              message: error.message,
+              ...(error.stack ? { stack: error.stack } : {}),
+              location: { url: safePageUrl(page), lineNumber: 0, columnNumber: 0 },
+              allowed: false,
+            }),
           )
         }
         pageErrorHandlers.set(page, onPageError)
@@ -363,9 +394,8 @@ export const test = fixtureBase.extend<RuntimeDiagnosticFixtures>({
         const keeperPage = nativeCdpEndpoint ? await context.newPage() : undefined
         const pages = context.pages().filter((page) => page !== keeperPage)
         await drainRuntimeTasks(pages)
-        await waitForRuntimeNetworkIdle(pages)
         lifecycleDrainStarted = true
-        await navigatePagesForLifecycleDrain(pages)
+        await navigatePagesForLifecycleDrain(pages, lifecycleDrainUrl)
         await nextHostTask()
         await Promise.allSettled(
           pages.filter((page) => !page.isClosed()).map((page) => page.close()),
@@ -630,19 +660,19 @@ async function drainRuntimeTasks(pages: readonly Page[]): Promise<void> {
   )
 }
 
-async function waitForRuntimeNetworkIdle(pages: readonly Page[]): Promise<void> {
+async function navigatePagesForLifecycleDrain(
+  pages: readonly Page[],
+  lifecycleDrainUrl: string,
+): Promise<void> {
   const results = await Promise.allSettled(
-    pages.filter((page) => !page.isClosed()).map((page) => page.waitForLoadState('networkidle')),
-  )
-  const rejected = results.find(
-    (result): result is PromiseRejectedResult => result.status === 'rejected',
-  )
-  if (rejected) throw rejected.reason
-}
-
-async function navigatePagesForLifecycleDrain(pages: readonly Page[]): Promise<void> {
-  const results = await Promise.allSettled(
-    pages.filter((page) => !page.isClosed()).map((page) => page.goto('about:blank')),
+    pages
+      .filter((page) => !page.isClosed())
+      .map(async (page) => {
+        const arrived = page.locator('[data-e2e-lifecycle-drain]').waitFor({ state: 'attached' })
+        await page.evaluate((url) => window.location.replace(url), lifecycleDrainUrl)
+        await arrived
+        if (page.url() !== lifecycleDrainUrl) throw new Error('RuntimeDiagnosticDrainUrlMismatch')
+      }),
   )
   const rejected = results.find(
     (result): result is PromiseRejectedResult => result.status === 'rejected',

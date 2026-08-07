@@ -67,6 +67,7 @@ describe('debug scroll helpers', () => {
   })
 
   it('clear and disable release entries and clipboard fallback text', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
     installDebugScroll()
     window.__debugScroll?.enable()
     logScrollDebug('position', { scrollTop: 12 })
@@ -84,5 +85,11 @@ describe('debug scroll helpers', () => {
     window.__debugScroll?.disable()
     expect(window.__debugScroll?.status()).toEqual({ enabled: false, entries: 0 })
     expect(window.__debugScrollLastCopyText).toBeUndefined()
+    expect(warn).toHaveBeenCalledTimes(2)
+    expect(
+      warn.mock.calls.every(([message]) =>
+        String(message).includes('scroll clipboard copy unavailable'),
+      ),
+    ).toBe(true)
   })
 })

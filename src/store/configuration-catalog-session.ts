@@ -245,6 +245,7 @@ class ConfigurationCatalogSession<Row> implements ConfigurationCatalogSessionCon
   private generation = 0
   private revision = 0
   private refreshQueued = false
+  private pageDemand: 'next' | 'previous' | null = null
   private resumeReadPending = false
   private released = true
   private disposed = false
@@ -280,6 +281,7 @@ class ConfigurationCatalogSession<Row> implements ConfigurationCatalogSessionCon
       }
       return
     }
+    this.pageDemand = null
     const preserve =
       this.active !== null &&
       sameFence(this.active, normalized) &&
@@ -298,11 +300,11 @@ class ConfigurationCatalogSession<Row> implements ConfigurationCatalogSessionCon
   }
 
   demandAfter(): void {
-    this.startRead('next')
+    this.demandPage('next')
   }
 
   demandBefore(): void {
-    this.startRead('previous')
+    this.demandPage('previous')
   }
 
   refresh(): void {
@@ -321,6 +323,7 @@ class ConfigurationCatalogSession<Row> implements ConfigurationCatalogSessionCon
     this.released = true
     this.abortRead()
     this.detachChangefeed()
+    this.pageDemand = null
     this.resumeReadPending = false
     lifecycle?.dispose()
   }
@@ -354,22 +357,33 @@ class ConfigurationCatalogSession<Row> implements ConfigurationCatalogSessionCon
     this.detachChangefeed()
     this.active = null
     this.pages = Object.freeze([])
+    this.pageDemand = null
     this.snapshot = null
     this.listeners.clear()
   }
 
-  private startRead(mode: ConfigurationCatalogRead<Row>['mode']): void {
+  private demandPage(mode: 'next' | 'previous'): void {
+    if (this.disposed || this.released || !this.active) return
+    if (this.read || !this.lifecycle?.isOpen()) {
+      this.pageDemand = mode
+      if (!this.lifecycle?.isOpen()) this.resumeReadPending = true
+      return
+    }
+    this.startRead(mode)
+  }
+
+  private startRead(mode: ConfigurationCatalogRead<Row>['mode']): boolean {
     const active = this.active
-    if (this.disposed || this.released || !active || this.read) return
+    if (this.disposed || this.released || !active || this.read) return false
     const lifecycle = this.lifecycle
     if (!lifecycle?.isOpen()) {
       this.resumeReadPending = true
-      return
+      return false
     }
     const first = this.pages[0]
     const last = this.pages.at(-1)
-    if (mode === 'next' && !last?.nextCursor) return
-    if (mode === 'previous' && !first?.previousCursor) return
+    if (mode === 'next' && !last?.nextCursor) return false
+    if (mode === 'previous' && !first?.previousCursor) return false
     const read: ConfigurationCatalogRead<Row> = {
       active,
       controller: new AbortController(),
@@ -389,12 +403,13 @@ class ConfigurationCatalogSession<Row> implements ConfigurationCatalogSessionCon
       promise = lifecycle.track(this.readPages(read))
     } catch (error) {
       this.settleRead(read, undefined, error)
-      return
+      return true
     }
     void promise.then(
       (result) => this.settleRead(read, result),
       (error: unknown) => this.settleRead(read, undefined, error),
     )
+    return true
   }
 
   private async readPages(
@@ -518,9 +533,16 @@ class ConfigurationCatalogSession<Row> implements ConfigurationCatalogSessionCon
   }
 
   private afterRead(): void {
-    if (!this.refreshQueued) return
-    this.refreshQueued = false
-    this.startRead('refresh')
+    if (this.refreshQueued) {
+      this.refreshQueued = false
+      this.startRead('refresh')
+      return
+    }
+    const mode = this.pageDemand
+    if (!mode) return
+    this.pageDemand = null
+    if (this.startRead(mode) || !this.resumeReadPending) return
+    this.pageDemand = mode
   }
 
   private receiveChange(change: ConfigurationCatalogChange): void {

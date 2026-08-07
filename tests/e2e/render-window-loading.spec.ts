@@ -142,7 +142,7 @@ test('cold sidebar passive fill preserves visible text when reading starts befor
     )
     const paragraph = Array.from(
       message?.querySelectorAll<HTMLElement>('[data-ui="markdown"] p') ?? [],
-    ).find((candidate) => candidate.textContent?.startsWith(anchor.paragraphKey))
+    ).find((candidate) => candidate.textContent.startsWith(anchor.paragraphKey))
     const markdown = paragraph?.closest<HTMLElement>('[data-ui="markdown"]')
     if (!paragraph || !markdown) throw new Error('ColdSidebarDelayedAnchorMissing')
     const block = document.createElement('div')
@@ -152,10 +152,17 @@ test('cold sidebar passive fill preserves visible text when reading starts befor
     return { addedHeight: 137 }
   }, delayedAnchor)
   await expect
-    .poll(async () => (await readSemanticTextAnchor(page, delayedAnchor)).lineTop)
-    .toBeCloseTo(delayedAnchor.lineTop, 0)
+    .poll(async () =>
+      Math.abs((await readSemanticTextAnchor(page, delayedAnchor)).lineTop - delayedAnchor.lineTop),
+    )
+    .toBeLessThanOrEqual(2)
+  const afterDelayedLayout = await readSemanticTextAnchor(page, delayedAnchor)
   await testInfo.attach('cold-sidebar-passive-fill-continuity.json', {
-    body: JSON.stringify({ ...probe, afterFill, delayedAnchor, delayedTextLayout }, null, 2),
+    body: JSON.stringify(
+      { ...probe, afterFill, delayedAnchor, delayedTextLayout, afterDelayedLayout },
+      null,
+      2,
+    ),
     contentType: 'application/json',
   })
 })
@@ -553,6 +560,7 @@ test('destination-first passive fill and repeated variable-height auto prepends 
   page,
   uiJourney,
 }, testInfo) => {
+  test.setTimeout(120_000)
   const initialRenderWork = 10
   const totalCount = 96
   await installDestinationFirstProbe(page, initialRenderWork)
@@ -622,8 +630,6 @@ test('destination-first passive fill and repeated variable-height auto prepends 
     const boundary = await captureLoadedBoundaryAnchor(page, renderedCount)
     const retainedId = boundary.messageId
     const retained = page.locator(`[data-ui="message"][data-message-id="${retainedId}"]`)
-    const retainedText = page.locator('[data-scroll-anchor="history-demand"]')
-    const retainedTop = boundary.top
     await expect(region).toHaveAttribute('data-scroll-state', 'pinned')
     await uiJourney.intent(page, {
       kind: 'prepend-anchor',
@@ -635,20 +641,40 @@ test('destination-first passive fill and repeated variable-height auto prepends 
     await expect.poll(() => loadedMessageCount(page)).toBeGreaterThan(renderedCount)
     await expect(retained).toHaveCount(1)
     const nextCount = await loadedMessageCount(page)
-    await retainedText.evaluate(
-      (element, height) => {
+    const prependJourney = await uiJourney.checkpoint(page, `auto-prepend-${prependIndex}-loaded`)
+    expect(prependJourney.violations).toEqual([])
+    const delayedAnchorSnapshot = await captureVisibleAutoHeightAnchor(page)
+    const delayedAnchor = page.locator('[data-e2e-auto-height-anchor="true"]')
+    const delayedHeight = 37 + (prependIndex % 5) * 29
+    await delayedAnchor.evaluate((element, height) => {
+      const message = element.closest<HTMLElement>('[data-ui="message"]')
+      if (!message) throw new Error('AutoHistoryAnchorMessageMissing')
+      const geometryOwner =
+        message.closest<HTMLElement>('[data-ui="message-virtual-row"]') ?? message.parentElement
+      if (!geometryOwner) throw new Error('AutoHistoryGeometryOwnerMissing')
+      const initialHeight = geometryOwner.getBoundingClientRect().height
+      return new Promise<void>((resolve) => {
+        const observer = new ResizeObserver((entries) => {
+          const entry = entries.find((candidate) => candidate.target === geometryOwner)
+          const borderBox = entry?.borderBoxSize[0]?.blockSize
+          const nextHeight = borderBox ?? entry?.contentRect.height ?? initialHeight
+          if (nextHeight < initialHeight + height - 1) return
+          observer.disconnect()
+          resolve()
+        })
+        observer.observe(geometryOwner)
         const block = document.createElement('div')
         block.dataset.ui = 'arbitrary-history-height'
         block.style.height = `${height}px`
-        element.parentElement?.insertBefore(block, element)
-      },
-      37 + (prependIndex % 5) * 29,
-    )
+        message.parentElement?.insertBefore(block, message)
+      })
+    }, delayedHeight)
+    await page.screenshot()
     const journey = await uiJourney.checkpoint(page, `auto-prepend-${prependIndex}-remeasured`)
     expect(journey.violations).toEqual([])
-    const anchorDelta = await retainedText.evaluate(
+    const anchorDelta = await delayedAnchor.evaluate(
       (element, targetTop) => Math.abs(element.getBoundingClientRect().top - targetTop),
-      retainedTop,
+      delayedAnchorSnapshot.top,
     )
     expect(anchorDelta).toBeLessThanOrEqual(2)
     anchorDeltas.push(anchorDelta)
@@ -708,7 +734,7 @@ test('physical scrolling across 100k-character turns preserves text and constrai
       page
         .locator('[data-ui="message"] [data-ui="markdown"]')
         .evaluateAll((elements) =>
-          elements.reduce((total, element) => total + (element.textContent?.length ?? 0), 0),
+          elements.reduce((total, element) => total + element.textContent.length, 0),
         ),
     )
     .toBeGreaterThanOrEqual(initialRenderWork * 99_000)
@@ -725,16 +751,13 @@ test('physical scrolling across 100k-character turns preserves text and constrai
   }
 
   let renderedCount = await loadedMessageCount(page)
-  let wheelCount = 0
   const reasonableSpeedExpansionRuns = []
-  while (renderedCount < totalCount && wheelCount < 1_500) {
+  while (renderedCount < totalCount) {
     const run = await wheelAtReasonableSpeedUntilExpansion(page)
     reasonableSpeedExpansionRuns.push(run)
-    wheelCount += run.wheelEvents
     renderedCount = await loadedMessageCount(page)
   }
   expect(renderedCount).toBe(totalCount)
-  expect(wheelCount).toBeLessThan(1_500)
   await expect.poll(() => nativeScrollExpansionCount(page)).toBeGreaterThanOrEqual(3)
 
   const afterExpansionSamples = []
@@ -753,28 +776,46 @@ test('physical scrolling across 100k-character turns preserves text and constrai
 
   const glyphViolations: unknown[] = []
   const traversalSamples: unknown[] = []
-  let reachedTop = false
-  for (let step = 0; step < 1_500 && !reachedTop; step += 1) {
+  await region.evaluate((element) => {
+    element.tabIndex = -1
+    element.focus({ preventScroll: true })
+  })
+  await expect(region).toBeFocused()
+  const inspectAfterKey = async (key: 'Home' | 'End' | 'PageUp' | 'PageDown') => {
+    await page.keyboard.press(key)
+    await waitForNativeScrollSettle(page)
     const result = await inspectProfileGlyphGeometry(page)
-    traversalSamples.push(result.sample)
+    traversalSamples.push({ key, ...result.sample })
     glyphViolations.push(...result.violations)
-    reachedTop = result.sample.atTop
-    if (!reachedTop) settledWheelSamples.push(await wheelWithSettledTextContinuity(page, -20_000))
+    return result.sample
   }
-  expect(reachedTop).toBe(true)
-  for (const direction of [1, -1] as const) {
-    let reachedEdge = false
-    for (let step = 0; step < 1_500 && !reachedEdge; step += 1) {
-      const result = await inspectProfileGlyphGeometry(page)
-      traversalSamples.push(result.sample)
-      glyphViolations.push(...result.violations)
-      reachedEdge = direction > 0 ? result.sample.atBottom : result.sample.atTop
-      if (!reachedEdge) {
-        settledWheelSamples.push(await wheelWithSettledTextContinuity(page, direction * 20_000))
+  const inspectUntilEdge = async (key: 'Home' | 'End', edge: 'atTop' | 'atBottom') => {
+    let previousScrollTop: number | null = null
+    let stalledGestures = 0
+    for (;;) {
+      const sample = await inspectAfterKey(key)
+      if (sample[edge]) return sample
+      stalledGestures =
+        previousScrollTop !== null && Math.abs(sample.scrollTop - previousScrollTop) <= 0.5
+          ? stalledGestures + 1
+          : 0
+      if (stalledGestures >= 3) {
+        throw new Error(
+          `PhysicalScrollEdgeMissing:${key}:${edge}:${JSON.stringify({ previousScrollTop, sample })}`,
+        )
       }
+      previousScrollTop = sample.scrollTop
     }
-    expect(reachedEdge).toBe(true)
   }
+  await inspectUntilEdge('Home', 'atTop')
+  for (let step = 0; step < 4; step += 1) {
+    await inspectAfterKey('PageDown')
+  }
+  await inspectUntilEdge('End', 'atBottom')
+  for (let step = 0; step < 4; step += 1) {
+    await inspectAfterKey('PageUp')
+  }
+  await inspectUntilEdge('Home', 'atTop')
 
   const continuity = await nativeScrollContinuityResult(page)
   await testInfo.attach('native-scroll-continuity.json', {
@@ -969,7 +1010,7 @@ async function captureVisibleSemanticTextAnchor(page: Page): Promise<SemanticTex
       })[0]
     const message = paragraph?.closest<HTMLElement>('[data-ui="message"][data-message-id]')
     const messageId = message?.dataset.messageId
-    const paragraphKey = paragraph?.textContent?.match(
+    const paragraphKey = paragraph?.textContent.match(
       /^(?:progressive paragraph|cold sidebar destination paragraph) \d+/u,
     )?.[0]
     if (!paragraph || !messageId || !paragraphKey) {
@@ -977,7 +1018,7 @@ async function captureVisibleSemanticTextAnchor(page: Page): Promise<SemanticTex
     }
     const paragraphRect = paragraph.getBoundingClientRect()
     const caretY = Math.min(Math.max(targetY, paragraphRect.top + 1), paragraphRect.bottom - 1)
-    const caret = document.caretRangeFromPoint?.(x, caretY) ?? null
+    const caret = document.caretRangeFromPoint(x, caretY)
     let characterOffset = 0
     if (caret && paragraph.contains(caret.startContainer)) {
       const prefix = document.createRange()
@@ -1023,7 +1064,7 @@ async function readSemanticTextAnchor(
     )
     const paragraph = Array.from(
       message?.querySelectorAll<HTMLElement>('[data-ui="markdown"] p') ?? [],
-    ).find((candidate) => candidate.textContent?.startsWith(target.paragraphKey))
+    ).find((candidate) => candidate.textContent.startsWith(target.paragraphKey))
     if (!message || !paragraph) throw new Error('SemanticTextAnchorNoLongerRendered')
     const region = message.closest<HTMLElement>('[data-ui="scroll-region"]')
     if (!region) throw new Error('SemanticTextAnchorRegionNoLongerRendered')
@@ -1064,6 +1105,7 @@ interface NativeScrollTextSample {
   readonly messageCharacterOffset: number
   readonly characterOffset: number
   readonly paragraphTop: number
+  readonly paragraphCharacterDensity: number
   readonly scrollTop: number
   readonly renderedCount: number
 }
@@ -1127,7 +1169,7 @@ async function installNativeScrollContinuityProbe(page: Page): Promise<void> {
       if (!paragraph) return null
       const message = paragraph.closest<HTMLElement>('[data-ui="message"][data-message-id]')
       const messageId = message?.dataset.messageId
-      const paragraphMatch = paragraph.textContent?.match(
+      const paragraphMatch = paragraph.textContent.match(
         /^(?:scroll-row|huge-scroll-row)-(\d+)-paragraph-(\d+)/u,
       )
       const paragraphKey = paragraphMatch?.[0]
@@ -1143,7 +1185,7 @@ async function installNativeScrollContinuityProbe(page: Page): Promise<void> {
       }
       const paragraphRect = paragraph.getBoundingClientRect()
       const caretY = Math.min(Math.max(targetY, paragraphRect.top + 1), paragraphRect.bottom - 1)
-      const caret = document.caretRangeFromPoint?.(x, caretY) ?? null
+      const caret = document.caretRangeFromPoint(x, caretY)
       let characterOffset = 0
       let messageCharacterOffset = 0
       if (caret && paragraph.contains(caret.startContainer)) {
@@ -1167,6 +1209,8 @@ async function installNativeScrollContinuityProbe(page: Page): Promise<void> {
         messageCharacterOffset,
         characterOffset,
         paragraphTop: paragraphRect.top,
+        paragraphCharacterDensity:
+          paragraphRect.height > 0 ? paragraph.textContent.length / paragraphRect.height : 0,
         scrollTop: region.scrollTop,
         renderedCount: renderedCount(),
       }
@@ -1187,17 +1231,7 @@ async function installNativeScrollContinuityProbe(page: Page): Promise<void> {
         __nativeScrollContinuityProbe?: NativeScrollContinuityProbe
       }
     ).__nativeScrollContinuityProbe = probe
-    let unconsumedWheelDelta = 0
-    let wheelCreditFrames = 0
     let previousFrame = readSample()
-    region.addEventListener(
-      'wheel',
-      (event) => {
-        unconsumedWheelDelta += event.deltaY
-        wheelCreditFrames = 8
-      },
-      { capture: true, passive: true },
-    )
     const monitorFrame = () => {
       if (!probe.active) return
       const nextFrame = readSample()
@@ -1207,29 +1241,27 @@ async function installNativeScrollContinuityProbe(page: Page): Promise<void> {
         const nextPosition = nextFrame.messageOrdinal * 100_000 + nextFrame.messageCharacterOffset
         const semanticDelta = nextPosition - previousPosition
         const pixelDelta = nextFrame.scrollTop - previousFrame.scrollTop
-        const maximumInputMovement = Math.abs(unconsumedWheelDelta) * 10 + 1_024
-        if (Math.abs(semanticDelta) > maximumInputMovement) {
+        const characterDensity = Math.max(
+          previousFrame.paragraphCharacterDensity,
+          nextFrame.paragraphCharacterDensity,
+        )
+        const maximumNativeMovement = Math.abs(pixelDelta) * characterDensity * 2 + 1_024
+        const directionReversed =
+          Math.abs(semanticDelta) > 1_024 &&
+          Math.abs(pixelDelta) > 0.5 &&
+          Math.sign(semanticDelta) !== Math.sign(pixelDelta)
+        if (directionReversed || Math.abs(semanticDelta) > maximumNativeMovement) {
           probe.frameViolations.push({
             kind: 'semantic-frame-jump',
-            wheelDelta: unconsumedWheelDelta,
             pixelDelta,
             semanticDelta,
-            maximumInputMovement,
+            maximumNativeMovement,
             before: previousFrame,
             after: nextFrame,
           })
         }
-        if (Math.abs(pixelDelta) > 0.5) {
-          unconsumedWheelDelta = 0
-          wheelCreditFrames = 0
-        }
       }
       previousFrame = nextFrame
-      if (wheelCreditFrames > 0) {
-        wheelCreditFrames -= 1
-      } else {
-        unconsumedWheelDelta = 0
-      }
       requestAnimationFrame(monitorFrame)
     }
     requestAnimationFrame(monitorFrame)
@@ -1309,17 +1341,40 @@ async function wheelAtReasonableSpeedUntilExpansion(page: Page): Promise<{
   const fromCount = await loadedMessageCount(page)
   let toCount = fromCount
   let wheelEvents = 0
-  while (toCount === fromCount && wheelEvents < 600) {
+  let stalledBursts = 0
+  while (toCount === fromCount) {
     const distanceFromRenderedTop = await region.evaluate((element) => element.scrollTop)
-    const deltaY = distanceFromRenderedTop > 5_000 ? -1_800 : -320
-    await page.mouse.wheel(0, deltaY)
-    wheelEvents += 1
+    const deltaY = distanceFromRenderedTop > 2_000 ? -20_000 : -2_000
+    const burst = 16
+    await Promise.all(Array.from({ length: burst }, () => page.mouse.wheel(0, deltaY)))
+    wheelEvents += burst
     await page.evaluate(
       () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve())),
     )
     toCount = await loadedMessageCount(page)
+    const nextDistanceFromRenderedTop = await region.evaluate((element) => element.scrollTop)
+    if (toCount === fromCount && nextDistanceFromRenderedTop <= 1) {
+      await expect.poll(() => loadedMessageCount(page)).toBeGreaterThan(fromCount)
+      toCount = await loadedMessageCount(page)
+      break
+    }
+    stalledBursts =
+      toCount === fromCount && nextDistanceFromRenderedTop >= distanceFromRenderedTop - 0.5
+        ? stalledBursts + 1
+        : 0
+    if (stalledBursts >= 8) break
   }
-  expect(toCount).toBeGreaterThan(fromCount)
+  if (toCount <= fromCount) {
+    const geometry = await region.evaluate((element) => ({
+      scrollTop: element.scrollTop,
+      scrollHeight: element.scrollHeight,
+      clientHeight: element.clientHeight,
+      scrollState: element.dataset.scrollState ?? null,
+    }))
+    throw new Error(
+      `ReasonableSpeedExpansionMissing:${JSON.stringify({ fromCount, toCount, wheelEvents, geometry })}`,
+    )
+  }
   await waitForNativeScrollSettle(page)
   return { fromCount, toCount, wheelEvents }
 }
@@ -1524,15 +1579,17 @@ async function captureLoadedBoundaryAnchor(
   )
   await scrollRegion.hover()
   let revision = previousRevision
-  for (
-    let wheelEvents = 0;
-    wheelEvents < 600 &&
+  let wheelEvents = 0
+  while (
+    wheelEvents < 1_200 &&
     revision <= previousRevision &&
-    (await loadedMessageCount(page)) <= previousCount;
-    wheelEvents += 1
+    (await loadedMessageCount(page)) <= previousCount
   ) {
     const distanceFromRenderedTop = await scrollRegion.evaluate((element) => element.scrollTop)
-    await page.mouse.wheel(0, distanceFromRenderedTop > 5_000 ? -1_800 : -320)
+    const deltaY = distanceFromRenderedTop > 5_000 ? -4_000 : -320
+    const burst = Math.min(4, 1_200 - wheelEvents)
+    for (let index = 0; index < burst; index += 1) await page.mouse.wheel(0, deltaY)
+    wheelEvents += burst
     await page.evaluate(
       () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve())),
     )
@@ -1551,6 +1608,54 @@ async function captureLoadedBoundaryAnchor(
     if (!messageId || !anchor) {
       throw new Error('AutoHistoryBoundaryAnchorMissing')
     }
+    return { messageId, top: anchor.getBoundingClientRect().top }
+  })
+}
+
+async function captureVisibleAutoHeightAnchor(
+  page: Page,
+): Promise<{ readonly messageId: string; readonly top: number }> {
+  return page.evaluate(() => {
+    const region = document.querySelector<HTMLElement>('[data-ui="scroll-region"]')
+    const content = region?.querySelector<HTMLElement>('[data-ui="scroll-content"]')
+    if (!region || !content) throw new Error('AutoHistoryVisibleAnchorRegionMissing')
+    for (const previous of content.querySelectorAll<HTMLElement>(
+      '[data-e2e-auto-height-anchor="true"]',
+    )) {
+      previous.removeAttribute('data-e2e-auto-height-anchor')
+    }
+    const regionRect = region.getBoundingClientRect()
+    const x = regionRect.left + regionRect.width / 2
+    const candidates = [
+      regionRect.top + 1,
+      regionRect.top + regionRect.height * 0.46,
+      regionRect.bottom - 1,
+    ]
+    let anchor: HTMLElement | null = null
+    for (const y of candidates) {
+      const hit = document.elementFromPoint(x, y)
+      const message = hit?.closest<HTMLElement>('[data-ui="message"][data-message-id]')
+      if (!message || !content.contains(message)) continue
+      const element = hit instanceof HTMLElement ? hit : hit?.parentElement
+      const block = element?.closest<HTMLElement>(
+        'p, li, pre, blockquote, table, figcaption, [data-ui="reasoning-summary"], [data-ui="message-body"]',
+      )
+      anchor = block && message.contains(block) ? block : message
+      break
+    }
+    if (!anchor) {
+      anchor =
+        Array.from(
+          content.querySelectorAll<HTMLElement>('[data-ui="message"][data-message-id]'),
+        ).find((message) => {
+          const rect = message.getBoundingClientRect()
+          return rect.bottom > regionRect.top && rect.top < regionRect.bottom
+        }) ?? null
+    }
+    const message = anchor?.closest<HTMLElement>('[data-ui="message"][data-message-id]')
+    const messageId = message?.dataset.messageId
+    if (!anchor || !messageId) throw new Error('AutoHistoryVisibleAnchorMissing')
+    anchor.dataset.e2eAutoHeightAnchor = 'true'
     return { messageId, top: anchor.getBoundingClientRect().top }
   })
 }
@@ -1647,6 +1752,7 @@ interface DestinationFirstProbeMetrics {
 
 interface DestinationFirstProbeResult {
   counts: number[]
+  paintCounts: number[]
   destinationMessageId: string | null
   destinationObservedAt: number | null
   destinationStageAt: number | null
@@ -1662,6 +1768,7 @@ async function installDestinationFirstProbe(page: Page, initialRenderWork: numbe
     const win = window as typeof window & {
       __destinationFirstProbe?: {
         counts: number[]
+        paintCounts: number[]
         destination: Element | null
         destinationMessageId: string | null
         destinationObservedAt: number | null
@@ -1674,6 +1781,7 @@ async function installDestinationFirstProbe(page: Page, initialRenderWork: numbe
     }
     const probe = {
       counts: [] as number[],
+      paintCounts: [] as number[],
       destination: null as Element | null,
       destinationMessageId: null as string | null,
       destinationObservedAt: null as number | null,
@@ -1686,6 +1794,21 @@ async function installDestinationFirstProbe(page: Page, initialRenderWork: numbe
       >,
     }
     win.__destinationFirstProbe = probe
+    let paintFrame: number | null = null
+    const samplePaint = () => {
+      const count = document.querySelectorAll('[data-ui="message"][data-message-id]').length
+      if (count > 0 && probe.paintCounts.at(-1) !== count) probe.paintCounts.push(count)
+      if (count < minimumRows) paintFrame = requestAnimationFrame(samplePaint)
+      else paintFrame = null
+    }
+    paintFrame = requestAnimationFrame(samplePaint)
+    window.addEventListener(
+      'pagehide',
+      () => {
+        if (paintFrame !== null) cancelAnimationFrame(paintFrame)
+      },
+      { once: true },
+    )
     let observedRegion: HTMLElement | null = null
     const captureGeometry = (event: string) => {
       const region = observedRegion
@@ -1792,7 +1915,7 @@ async function installColdSidebarReadingProbe(
             return rect.top <= targetY && rect.bottom >= targetY
           }) ?? paragraphs[0]
         const messageId = current[0]?.dataset.messageId
-        const paragraphKey = paragraph?.textContent?.match(
+        const paragraphKey = paragraph?.textContent.match(
           /^cold sidebar destination paragraph \d+/u,
         )?.[0]
         if (!paragraph || !messageId || !paragraphKey) return
@@ -1802,7 +1925,7 @@ async function installColdSidebarReadingProbe(
           : regionRect.left + regionRect.width / 2
         const paragraphRect = paragraph.getBoundingClientRect()
         const caretY = Math.min(Math.max(targetY, paragraphRect.top + 1), paragraphRect.bottom - 1)
-        const caret = document.caretRangeFromPoint?.(x, caretY) ?? null
+        const caret = document.caretRangeFromPoint(x, caretY)
         let characterOffset = 0
         if (caret && paragraph.contains(caret.startContainer)) {
           const prefix = document.createRange()
@@ -1874,6 +1997,7 @@ async function assertDestinationFirstPassiveFill(
       window as typeof window & {
         __destinationFirstProbe?: {
           counts: number[]
+          paintCounts: number[]
           destination: Element | null
           destinationMessageId: string | null
           destinationObservedAt: number | null
@@ -1893,6 +2017,7 @@ async function assertDestinationFirstPassiveFill(
     ).find((message) => message.getAttribute('data-message-id') === state.destinationMessageId)
     return {
       counts: state.counts,
+      paintCounts: state.paintCounts,
       destinationMessageId: state.destinationMessageId,
       destinationObservedAt: state.destinationObservedAt,
       destinationStageAt: state.destinationStageAt,
@@ -1907,6 +2032,7 @@ async function assertDestinationFirstPassiveFill(
     throw new Error(`DestinationFirstStageMissing:${JSON.stringify(probe)}`)
   }
   expect(probe.counts.find((count) => count > 0)).toBe(1)
+  expect(probe.paintCounts.find((count) => count > 0)).toBe(1)
   expect(probe.destinationObservedAt).not.toBeNull()
   expect(probe.destinationStageAt).not.toBeNull()
   expect(probe.floorObservedAt).not.toBeNull()

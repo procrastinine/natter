@@ -133,81 +133,83 @@ describe('Wave A final storage epoch migration', () => {
     }
   }, 60_000)
 
-  it.each([
-    94, 94.1,
-  ])('opens the observed intermediate v%s manifest through the final production cutover', async (intermediateVersion) => {
-    const name = databaseName()
-    const intermediate = new Dexie(name)
-    intermediate.version(intermediateVersion).stores(WAVE_A_V94_STORES)
-    await intermediate.open()
-    await intermediate.table('settings').put({
-      key: 'manifest-proof:intermediate-sentinel',
-      value: { intermediateVersion },
-    })
-    intermediate.close()
+  it.each([94, 94.1])(
+    'opens the observed intermediate v%s manifest through the final production cutover',
+    async (intermediateVersion) => {
+      const name = databaseName()
+      const intermediate = new Dexie(name)
+      intermediate.version(intermediateVersion).stores(WAVE_A_V94_STORES)
+      await intermediate.open()
+      await intermediate.table('settings').put({
+        key: 'manifest-proof:intermediate-sentinel',
+        value: { intermediateVersion },
+      })
+      intermediate.close()
 
-    const db = createDbForTests(name)
-    await prepareBrowserWorkspaceSchema(db)
-    await db.open()
+      const db = createDbForTests(name)
+      await prepareBrowserWorkspaceSchema(db)
+      await db.open()
 
-    expect(db.verno).toBe(CURRENT_DB_VERSION)
-    expect(await db.settings.get('manifest-proof:intermediate-sentinel')).toEqual({
-      key: 'manifest-proof:intermediate-sentinel',
-      value: { intermediateVersion },
-    })
-    expect(
-      await db.settings.bulkGet(waveACompletionSettingsV94().map((row) => row.key)),
-    ).not.toContain(undefined)
-    db.close()
-  })
+      expect(db.verno).toBe(CURRENT_DB_VERSION)
+      expect(await db.settings.get('manifest-proof:intermediate-sentinel')).toEqual({
+        key: 'manifest-proof:intermediate-sentinel',
+        value: { intermediateVersion },
+      })
+      expect(
+        await db.settings.bulkGet(waveACompletionSettingsV94().map((row) => row.key)),
+      ).not.toContain(undefined)
+      db.close()
+    },
+  )
 
-  it.each([
-    95, 95.1, 95.2, 95.3, 95.4, 95.5, 95.6, 95.7, 95.8, 96,
-  ])('opens observed current v%s data through the one fixed Wave-B epoch and reopens it in place', async (observedVersion) => {
-    const name = databaseName()
-    const observed = new Dexie(name)
-    observed
-      .version(observedVersion)
-      .stores(observedVersion === 96 ? OBSERVED_WAVE_B_V96_STORES : WAVE_A_V94_STORES)
-    await observed.open()
-    await observed.table('settings').put({
-      key: 'manifest-proof:wave-b-sentinel',
-      value: { observedVersion },
-    })
-    observed.close()
+  it.each([95, 95.1, 95.2, 95.3, 95.4, 95.5, 95.6, 95.7, 95.8, 96])(
+    'opens observed current v%s data through the one fixed Wave-B epoch and reopens it in place',
+    async (observedVersion) => {
+      const name = databaseName()
+      const observed = new Dexie(name)
+      observed
+        .version(observedVersion)
+        .stores(observedVersion === 96 ? OBSERVED_WAVE_B_V96_STORES : WAVE_A_V94_STORES)
+      await observed.open()
+      await observed.table('settings').put({
+        key: 'manifest-proof:wave-b-sentinel',
+        value: { observedVersion },
+      })
+      observed.close()
 
-    const migrated = createDbForTests(name)
-    await prepareBrowserWorkspaceSchema(migrated)
-    await migrated.open()
+      const migrated = createDbForTests(name)
+      await prepareBrowserWorkspaceSchema(migrated)
+      await migrated.open()
 
-    expect(migrated.verno).toBe(CURRENT_DB_VERSION)
-    expect(migrated.tables.map((table) => table.name).sort()).toEqual(
-      Object.keys(activeStoreSpec(WAVE_B_V97_STORES)).sort(),
-    )
-    expect(await migrated.settings.get('manifest-proof:wave-b-sentinel')).toEqual({
-      key: 'manifest-proof:wave-b-sentinel',
-      value: { observedVersion },
-    })
-    expect(
-      await Promise.all(
-        BROWSER_WORKSPACE_CATCHUP_JOURNAL_TABLE_NAMES.map((tableName) =>
-          migrated.table(tableName).count(),
+      expect(migrated.verno).toBe(CURRENT_DB_VERSION)
+      expect(migrated.tables.map((table) => table.name).sort()).toEqual(
+        Object.keys(activeStoreSpec(WAVE_B_V97_STORES)).sort(),
+      )
+      expect(await migrated.settings.get('manifest-proof:wave-b-sentinel')).toEqual({
+        key: 'manifest-proof:wave-b-sentinel',
+        value: { observedVersion },
+      })
+      expect(
+        await Promise.all(
+          BROWSER_WORKSPACE_CATCHUP_JOURNAL_TABLE_NAMES.map((tableName) =>
+            migrated.table(tableName).count(),
+          ),
         ),
-      ),
-    ).toEqual(BROWSER_WORKSPACE_CATCHUP_JOURNAL_TABLE_NAMES.map(() => 0))
-    expect(await migrated.settings.get(BROWSER_WORKSPACE_CURRENT_COMPLETION_KEY)).toBeDefined()
-    migrated.close()
+      ).toEqual(BROWSER_WORKSPACE_CATCHUP_JOURNAL_TABLE_NAMES.map(() => 0))
+      expect(await migrated.settings.get(BROWSER_WORKSPACE_CURRENT_COMPLETION_KEY)).toBeDefined()
+      migrated.close()
 
-    const reopened = createDbForTests(name)
-    await prepareBrowserWorkspaceSchema(reopened)
-    await reopened.open()
-    expect(reopened.verno).toBe(CURRENT_DB_VERSION)
-    expect(await reopened.settings.get('manifest-proof:wave-b-sentinel')).toEqual({
-      key: 'manifest-proof:wave-b-sentinel',
-      value: { observedVersion },
-    })
-    reopened.close()
-  })
+      const reopened = createDbForTests(name)
+      await prepareBrowserWorkspaceSchema(reopened)
+      await reopened.open()
+      expect(reopened.verno).toBe(CURRENT_DB_VERSION)
+      expect(await reopened.settings.get('manifest-proof:wave-b-sentinel')).toEqual({
+        key: 'manifest-proof:wave-b-sentinel',
+        value: { observedVersion },
+      })
+      reopened.close()
+    },
+  )
 
   it('atomically rolls back a late mixed 4,096-row cutover and retries the same production database', async () => {
     const name = databaseName()

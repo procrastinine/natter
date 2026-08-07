@@ -6,6 +6,7 @@ export const VERIFICATION_PERFORMANCE_REQUIRED_STAGE_IDS = Object.freeze([
   'production-build',
   'vitest',
   'chromium-e2e',
+  'firefox-e2e',
   'stream-profile-single',
   'stream-profile-concurrent',
 ])

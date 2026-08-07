@@ -29,7 +29,9 @@ export interface StreamProfileHeapSample {
 }
 
 export interface StreamProfileState {
-  readonly renderedMessages: number
+  readonly mountedMessages: number
+  readonly loadedMessages: number
+  readonly virtualized: boolean
   readonly initialRenderWork: number
   readonly totalMessages: number
   readonly assistantTextLengths: readonly number[]

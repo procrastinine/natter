@@ -2,6 +2,7 @@ import { createBundledHighlighter, type TokensResult } from 'shiki/core'
 import { createJavaScriptRegexEngine } from 'shiki/engine/javascript'
 import type { CodeHighlighterPlugin, ThemeInput } from 'streamdown'
 import type { ShikiThemeChoice } from '../../core/rendering-preferences'
+import { isPageHiding } from '../../lib/page-lifecycle'
 
 const DEFAULT_THEMES: ShikiThemePair = ['github-light', 'github-dark']
 
@@ -168,7 +169,7 @@ export function createShikiCodePlugin(options: ShikiCodePluginOptions = {}): Cod
         })
         .catch((error: unknown) => {
           deleteIndexed(pendingHighlights, key, code, pending)
-          console.error('[Natter Code] Failed to highlight code:', error)
+          if (!isPageHiding()) console.error('[Natter Code] Failed to highlight code:', error)
         })
       return null
     },

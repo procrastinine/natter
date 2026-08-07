@@ -1,5 +1,5 @@
 import { expect, type Page, test } from './fixtures'
-import { activeWorkspaceDatabaseName, clearIndexedDb } from './helpers'
+import { activeWorkspaceDatabaseName, clearIndexedDb, waitForWorkspaceRunning } from './helpers'
 
 test.beforeEach(async ({ page }) => {
   await clearIndexedDb(page)
@@ -126,36 +126,38 @@ test('startup opens the committed source while a live replacement owns selection
     })
 
     await expect
-      .poll(() =>
-        openingPage.evaluate(async ({ destinationDatabaseName }) => {
-          const manifest = await new Promise<{
-            pending?: unknown
-          }>((resolve, reject) => {
-            const request = indexedDB.open('natter-control')
-            request.onsuccess = () => {
-              const control = request.result
-              const transaction = control.transaction('manifests', 'readonly')
-              const read = transaction.objectStore('manifests').get('workspace')
-              read.onsuccess = () => {
-                const result: unknown = read.result
-                control.close()
-                resolve(result as { pending?: unknown })
+      .poll(
+        () =>
+          openingPage.evaluate(async ({ destinationDatabaseName }) => {
+            const manifest = await new Promise<{
+              pending?: unknown
+            }>((resolve, reject) => {
+              const request = indexedDB.open('natter-control')
+              request.onsuccess = () => {
+                const control = request.result
+                const transaction = control.transaction('manifests', 'readonly')
+                const read = transaction.objectStore('manifests').get('workspace')
+                read.onsuccess = () => {
+                  const result: unknown = read.result
+                  control.close()
+                  resolve(result as { pending?: unknown })
+                }
+                read.onerror = () => {
+                  control.close()
+                  reject(read.error)
+                }
               }
-              read.onerror = () => {
-                control.close()
-                reject(read.error)
-              }
+              request.onerror = () => reject(request.error)
+            })
+            return {
+              pending: manifest.pending !== undefined,
+              databases: (await indexedDB.databases()).flatMap((database) =>
+                database.name === undefined ? [] : [database.name],
+              ),
+              destinationDatabaseName,
             }
-            request.onerror = () => reject(request.error)
-          })
-          return {
-            pending: manifest.pending !== undefined,
-            databases: (await indexedDB.databases()).flatMap((database) =>
-              database.name === undefined ? [] : [database.name],
-            ),
-            destinationDatabaseName,
-          }
-        }, replacement),
+          }, replacement),
+        { timeout: 15_000 },
       )
       .toMatchObject({
         pending: false,
@@ -173,12 +175,14 @@ test('startup opens the committed source while a live replacement owns selection
   }
 })
 
-test('an observed intermediate v94 workspace repairs on an inactive slot and opens in Chromium', async ({
+test('an observed intermediate v94 workspace repairs on an inactive slot across browser engines', async ({
   context,
   page,
 }) => {
+  await waitForWorkspaceRunning(page)
   const databaseName = await activeWorkspaceDatabaseName(page)
   const schema = await readDatabaseSchema(page, databaseName)
+  expect(schema.length).toBeGreaterThan(0)
   const resetRoute = '**/__startup-v94-reset__'
   await page.route(resetRoute, (route) =>
     route.fulfill({ contentType: 'text/html', body: '<!doctype html><title>Reset</title>' }),
@@ -287,17 +291,30 @@ test('an observed intermediate v94 workspace repairs on an inactive slot and ope
 })
 
 test('a poisoned local database shows recovery instead of a blank root', async ({
+  browserName,
   expectRuntimeDiagnostic,
   page,
 }) => {
-  expectRuntimeDiagnostic({
-    category: 'console-other',
-    source: 'console',
-    level: 'error',
-    message:
-      '^Failed to inspect workspace backend for persistence request Error: WaveAMessageBodyMissing:message-poison',
-    count: 1,
-  })
+  await waitForWorkspaceRunning(page)
+  expectRuntimeDiagnostic(
+    browserName === 'firefox'
+      ? {
+          category: 'console-other',
+          source: 'console',
+          level: 'error',
+          message: '^Failed to inspect workspace backend for persistence request Error$',
+          detail: '^argument 2: Error: WaveAMessageBodyMissing:message-poison(?:\\n|$)',
+          count: 1,
+        }
+      : {
+          category: 'console-other',
+          source: 'console',
+          level: 'error',
+          message:
+            '^Failed to inspect workspace backend for persistence request Error: WaveAMessageBodyMissing:message-poison',
+          count: 1,
+        },
+  )
   const databaseName = await activeWorkspaceDatabaseName(page)
   const schema = await page.evaluate(async (databaseName) => {
     const db = await new Promise<IDBDatabase>((resolve, reject) => {

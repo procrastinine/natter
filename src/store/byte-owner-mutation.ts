@@ -1,4 +1,4 @@
-import type { Collection, Transaction } from 'dexie'
+import Dexie, { type Collection, type Transaction } from 'dexie'
 import type { SavedTextTemplate } from '../core/text-templates'
 import type {
   AttachmentArtifact,
@@ -160,7 +160,7 @@ export async function replacePhysicalStorageRow<Row, Key>(
   next: Row,
   previous: Row | undefined,
 ): Promise<void> {
-  if (previous !== undefined) await recordObsoleteByteOwnerValues(tx, [previous])
+  if (previous !== undefined) recordObsoleteByteOwnerValues(tx, [previous])
   const receipt = recordSemanticOperationExactPhysicalWrite(tx, tableName, 'put', [next])
   const key = await tx.table<Row, Key>(tableName).put(next)
   recordConstructivePhysicalKeys(receipt, tableName, 'write', [key])
@@ -173,7 +173,7 @@ export async function putPhysicalStorageRows<Row, Key>(
   replaced: readonly Row[],
 ): Promise<void> {
   if (next.length === 0) return
-  await recordObsoleteByteOwnerValues(tx, replaced)
+  recordObsoleteByteOwnerValues(tx, replaced)
   const receipt = recordSemanticOperationExactPhysicalWrite(tx, tableName, 'put', next)
   await tx.table<Row, Key>(tableName).bulkPut([...next])
   recordConstructivePhysicalRows(receipt, tx, tableName, 'write', next)
@@ -234,7 +234,7 @@ export async function deletePhysicalStorageRows<Row, Key>(
 ): Promise<void> {
   if (keys.length === 0) return
   recordBrowserCommandPhysicalDeletionRows(tx, tableName, keys, previous)
-  await recordObsoleteByteOwnerValues(tx, previous)
+  recordObsoleteByteOwnerValues(tx, previous)
   await deletePhysicalStorageKeys<Row, Key>(tx, tableName, keys)
 }
 
@@ -263,7 +263,7 @@ export async function deletePhysicalStorageCollection<Row, Key>(
     obsoleteBytes = saturatingAdd(obsoleteBytes, estimateStoredValueBytes(row))
   })
   recordBrowserCommandPhysicalDeletionRows(tx, tableName, keys, rows)
-  await recordObsoleteByteOwnerBytes(tx, obsoleteBytes)
+  recordObsoleteByteOwnerBytes(tx, obsoleteBytes)
   if (keys.length > 0) {
     await deletePhysicalStorageKeys<Row, Key>(tx, tableName, keys)
   }
@@ -331,7 +331,7 @@ export async function deleteChatOwnedPhysicalStorageCollectionWithKnownBytes<
     kind: 'chat',
     ownerIds,
   })
-  await recordObsoleteByteOwnerBytes(tx, obsoleteBytes)
+  recordObsoleteByteOwnerBytes(tx, obsoleteBytes)
   if (keys.length > 0) {
     await deletePhysicalStorageKeys<Row, Key>(tx, tableName, keys)
   }
@@ -1035,25 +1035,18 @@ export async function putTokenCalibrationSettingByteOwner(
   recordBrowserCommandOwnerInvalidation(tx, { kind: 'setting', keys: [next.key] })
 }
 
-export async function recordObsoleteByteOwnerValues(
-  tx: Transaction,
-  values: readonly unknown[],
-): Promise<void> {
+export function recordObsoleteByteOwnerValues(tx: Transaction, values: readonly unknown[]): void {
   let obsoleteBytes = 0
   for (const value of values) {
     if (value === undefined) continue
     obsoleteBytes = saturatingAdd(obsoleteBytes, estimateStoredValueBytes(value))
   }
-  await recordObsoleteByteOwnerBytes(tx, obsoleteBytes)
+  recordObsoleteByteOwnerBytes(tx, obsoleteBytes)
 }
 
-export function recordObsoleteByteOwnerBytes(
-  tx: Transaction,
-  obsoleteBytes: number,
-): Promise<void> {
-  if (obsoleteBytes === 0) return Promise.resolve()
+export function recordObsoleteByteOwnerBytes(tx: Transaction, obsoleteBytes: number): void {
+  if (obsoleteBytes === 0) return
   accumulateStorageCompactionDebt(tx, obsoleteBytes)
-  return Promise.resolve()
 }
 
 export async function insertMessageBody(tx: Transaction, body: MessageBodyRow): Promise<void> {
@@ -1074,10 +1067,7 @@ export async function replaceMessageBody(
   if (previous.kind === 'row') {
     await replacePhysicalStorageRow<MessageBodyRow, string>(tx, 'messageBodies', body, previous.row)
   } else {
-    await recordObsoleteByteOwnerBytes(
-      tx,
-      estimateMessageBodyProjectionStorageBytes(previous.header),
-    )
+    recordObsoleteByteOwnerBytes(tx, estimateMessageBodyProjectionStorageBytes(previous.header))
     await replacePhysicalStorageRow<MessageBodyRow, string>(tx, 'messageBodies', body, undefined)
   }
 }
@@ -1091,7 +1081,7 @@ export async function deleteChatAuxiliaryByteOwners(
 ): Promise<void> {
   const drafts = await tx.table<DraftRow, string>('drafts').bulkGet([...input.chatIds])
   const deletedDraftChatIds = drafts.flatMap((draft) => (draft ? [draft.chatId] : []))
-  const [deletedBodies] = await Promise.all([
+  const [deletedBodies] = await Dexie.Promise.all([
     deleteChatOwnedPhysicalStorageCollectionWithKnownBytes<MessageBodyRow, string>(
       tx,
       'messageBodies',
@@ -1100,7 +1090,7 @@ export async function deleteChatAuxiliaryByteOwners(
     ),
     deletedDraftChatIds.length > 0
       ? deletePhysicalStorageKeys<DraftRow, string>(tx, 'drafts', deletedDraftChatIds)
-      : Promise.resolve(),
+      : Dexie.Promise.resolve(),
   ])
   if (deletedDraftChatIds.length > 0) {
     recordBrowserCommandOwnerInvalidation(tx, {
@@ -1118,7 +1108,7 @@ export async function deleteChatAuxiliaryByteOwners(
       obsoleteBytes = saturatingAdd(obsoleteBytes, estimateStoredValueBytes(value))
     }
   }
-  await recordObsoleteByteOwnerBytes(tx, obsoleteBytes)
+  recordObsoleteByteOwnerBytes(tx, obsoleteBytes)
 }
 
 export async function putDraftByteOwner(
@@ -1324,7 +1314,7 @@ export async function replaceAttachmentByteOwnerBundle(
   ) {
     throw new Error(`AttachmentPayloadIdentityMismatch:${attachmentId}`)
   }
-  const [blobKeys, artifactKeys, jobKeys] = await Promise.all([
+  const [blobKeys, artifactKeys, jobKeys] = await Dexie.Promise.all([
     attachmentRowKeys(tx, 'attachmentBlobs', attachmentId),
     attachmentRowKeys(tx, 'attachmentArtifacts', attachmentId),
     attachmentRowKeys(tx, 'attachmentJobs', attachmentId),
@@ -1337,7 +1327,7 @@ export async function replaceAttachmentByteOwnerBundle(
     attachmentId,
   )
   recordBrowserCommandAttachmentPayloadDeletion(tx, 'attachmentJobs', jobKeys, attachmentId)
-  await Promise.all([
+  await Dexie.Promise.all([
     deletePhysicalStorageKeys(tx, 'attachmentBlobs', blobKeys),
     deletePhysicalStorageKeys(tx, 'attachmentArtifacts', artifactKeys),
     deletePhysicalStorageKeys(tx, 'attachmentJobs', jobKeys),
@@ -1349,8 +1339,8 @@ export async function replaceAttachmentByteOwnerBundle(
     header ? estimateAttachmentPayloadProjectionStorageBytes(header) : 0,
     estimateDeletedCompactRowsStorageBytes(blobs + artifacts + jobs),
   )
-  await recordObsoleteByteOwnerBytes(tx, obsoleteBytes)
-  await Promise.all([
+  recordObsoleteByteOwnerBytes(tx, obsoleteBytes)
+  await Dexie.Promise.all([
     addAttachmentBlobByteOwners(tx, next.blobs),
     addAttachmentArtifactByteOwners(tx, next.artifacts),
     addAttachmentByteOwners(tx, 'attachmentJobs', next.jobs),
@@ -1372,7 +1362,7 @@ export async function deleteAttachmentBlobRows(
 ): Promise<number> {
   const deleted = await deleteAttachmentRows(tx, 'attachmentBlobs', attachmentId)
   if (deleted > 0) {
-    await recordObsoleteByteOwnerBytes(
+    recordObsoleteByteOwnerBytes(
       tx,
       saturatingAdd(
         estimateAttachmentPayloadProjectionStorageBytes({ sizeBytes: header?.sizeBytes ?? 0 }),
@@ -1394,7 +1384,7 @@ export async function deleteAttachmentArtifactRows(
 ): Promise<number> {
   const deleted = await deleteAttachmentRows(tx, 'attachmentArtifacts', attachmentId)
   if (deleted > 0) {
-    await recordObsoleteByteOwnerBytes(
+    recordObsoleteByteOwnerBytes(
       tx,
       saturatingAdd(
         estimateAttachmentPayloadProjectionStorageBytes({
@@ -1413,7 +1403,7 @@ export async function deleteAttachmentJobRows(
 ): Promise<number> {
   const deleted = await deleteAttachmentRows(tx, 'attachmentJobs', attachmentId)
   if (deleted > 0) {
-    await recordObsoleteByteOwnerBytes(tx, estimateDeletedCompactRowsStorageBytes(deleted))
+    recordObsoleteByteOwnerBytes(tx, estimateDeletedCompactRowsStorageBytes(deleted))
     recordBrowserCommandOwnerInvalidation(tx, {
       kind: 'attachment-job',
       attachmentIds: [attachmentId],

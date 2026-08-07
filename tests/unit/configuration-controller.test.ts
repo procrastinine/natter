@@ -61,6 +61,36 @@ afterEach(async () => {
 })
 
 describe('configuration controller publication', () => {
+  it('keeps an owned configuration intent current across a late same-chat projection', () => {
+    const firstProfile = profileFixture('intent-profile-a')
+    const secondProfile = profileFixture('intent-profile-b')
+    const chat = chatFixture('intent-chat', settingsFixture(firstProfile))
+    observeChat(chat)
+    const intent = configurationController.claimIntent()
+
+    observeChat({
+      ...chat,
+      configurationVersion: 1,
+      settings: settingsFixture(secondProfile),
+    })
+
+    expect(configurationController.intentIsCurrent(intent)).toBe(true)
+  })
+
+  it('supersedes an older configuration intent only with a newer gesture or route', () => {
+    const profile = profileFixture('intent-profile')
+    const chat = chatFixture('intent-chat-a', settingsFixture(profile))
+    observeChat(chat)
+    const first = configurationController.claimIntent()
+    const second = configurationController.claimIntent()
+
+    expect(configurationController.intentIsCurrent(first)).toBe(false)
+    expect(configurationController.intentIsCurrent(second)).toBe(true)
+
+    observeChat({ ...chat, id: 'intent-chat-b' })
+    expect(configurationController.intentIsCurrent(second)).toBe(false)
+  })
+
   it('cannot lose a publication between observation and subscription', async () => {
     const observed = configurationController.getSnapshot()
     configurationController.setSidebarCollapsed(!observed.ui.sidebarCollapsed)
@@ -458,39 +488,39 @@ describe('profile switch admission', () => {
 })
 
 describe('sealed target-qualified generation configuration', () => {
-  it.each([
-    'selection-first',
-    'shell-first',
-  ] as const)('publishes connection absence only after the exact selection and shell settle: %s', async (order) => {
-    const settings = cloneDefaultChatSettings()
-    const shellRead = deferred<ConfigurationShellProjection>()
-    const selectionRead = deferred<ConfigurationActiveSelectionProjection>()
-    configurationController.rememberSeed({ profileId: null, presetId: null, settings })
-    const source = projectionSource({
-      loadShell: vi.fn(() => shellRead.promise),
-      loadActiveSelection: vi.fn(() => selectionRead.promise),
-    })
-    const bound = configurationController.setProjectionSource(source)
-    await settle()
+  it.each(['selection-first', 'shell-first'] as const)(
+    'publishes connection absence only after the exact selection and shell settle: %s',
+    async (order) => {
+      const settings = cloneDefaultChatSettings()
+      const shellRead = deferred<ConfigurationShellProjection>()
+      const selectionRead = deferred<ConfigurationActiveSelectionProjection>()
+      configurationController.rememberSeed({ profileId: null, presetId: null, settings })
+      const source = projectionSource({
+        loadShell: vi.fn(() => shellRead.promise),
+        loadActiveSelection: vi.fn(() => selectionRead.promise),
+      })
+      const bound = configurationController.setProjectionSource(source)
+      await settle()
 
-    expect(resolveNewChat()).toEqual({ capability: 'pending' })
-
-    if (order === 'selection-first') {
-      selectionRead.resolve(emptySelection())
-      await waitForSelectionStatus('ready')
       expect(resolveNewChat()).toEqual({ capability: 'pending' })
-      shellRead.resolve(shell(0))
-      await bound
-    } else {
-      shellRead.resolve(shell(0))
-      await bound
-      expect(resolveNewChat()).toEqual({ capability: 'pending' })
-      selectionRead.resolve(emptySelection())
-      await waitForSelectionStatus('ready')
-    }
 
-    expect(resolveNewChat()).toEqual({ capability: 'connection-missing' })
-  })
+      if (order === 'selection-first') {
+        selectionRead.resolve(emptySelection())
+        await waitForSelectionStatus('ready')
+        expect(resolveNewChat()).toEqual({ capability: 'pending' })
+        shellRead.resolve(shell(0))
+        await bound
+      } else {
+        shellRead.resolve(shell(0))
+        await bound
+        expect(resolveNewChat()).toEqual({ capability: 'pending' })
+        selectionRead.resolve(emptySelection())
+        await waitForSelectionStatus('ready')
+      }
+
+      expect(resolveNewChat()).toEqual({ capability: 'connection-missing' })
+    },
+  )
 
   it('does not publish absence from a superseded selection settlement', async () => {
     const selectionA = deferred<ConfigurationActiveSelectionProjection>()

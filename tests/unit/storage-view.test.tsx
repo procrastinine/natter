@@ -392,6 +392,7 @@ describe('StorageView', () => {
   })
 
   it('requests notification permission and shows Chromium/Safari persistence hints in browser mode', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
     const persist = vi.fn<StorageManager['persist']>().mockResolvedValue(false)
     const persisted = vi.fn<StorageManager['persisted']>().mockResolvedValue(false)
     setNavigatorStorage({
@@ -420,6 +421,8 @@ describe('StorageView', () => {
       expect(notification.requestPermission).toHaveBeenCalledTimes(1)
       expect(persist).toHaveBeenCalledTimes(1)
     })
+    expect(warn).toHaveBeenCalledOnce()
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('storage persistence denied'))
   })
 
   it('hides browser persistence actions outside IndexedDB mode', async () => {
@@ -898,6 +901,7 @@ describe('StorageView', () => {
   })
 
   it('selects and applies a bulk action to every matching chat beyond the retained page', async () => {
+    const diagnostic = vi.spyOn(console, 'error').mockImplementation(() => {})
     const initial = buildChat({ id: 'chat-000', title: 'Chat 000', now: 1 })
     const seed: Chat = {
       ...initial,
@@ -993,6 +997,7 @@ describe('StorageView', () => {
       CONFIGURATION_PROFILE_MANAGER_STATE_ID,
     )) as ConfigurationProfileManagerStateRow | undefined
     expect(managerAfterArchive?.revision).toBe((managerAfterSeed?.revision ?? 0) + 1)
+    expect(diagnostic).not.toHaveBeenCalled()
   })
 
   it('explains when an active stream blocks permanent deletion from the archive', async () => {

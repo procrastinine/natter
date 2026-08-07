@@ -187,97 +187,100 @@ afterEach(async () => {
 })
 
 describe('generation intent outbound-path and body-I/O contract', () => {
-  it.each(
-    INTENT_KINDS,
-  )('%s resolves one finite provider cutoff before bounded branch hydration', async (kind) => {
-    const scenario = await buildScenario(kind)
-    expect(scenario.settings.customMaxContext).toBeUndefined()
-    const queryMark = markQueryEvidence(queryEvidence)
-    const releaseSurface = await prepareControlledGenerationSurface(scenario.intent, {
-      profile: profile(),
-      ...(kind === 'new-chat-send' ? { newChatSettings: scenario.settings } : {}),
-    })
-    releaseSurface()
-    const bodyReads = captureBodyReads()
-    let providerCapture: ProviderCapture | undefined
-    let prepared: PreparedGeneration | undefined
-    let outcome: CompletedGeneration | undefined
-    try {
-      const result = await runToCompletion(scenario.intent, (input) => {
-        providerCapture = {
-          wireMessages: structuredClone(input.requestPlan.wire.messages),
-          readsAtOpen: [...bodyReads.ids],
-          bodyBatchesAtOpen: bodyReads.batches(),
-          queryEvidenceAtOpen: readQueryEvidenceSince(queryEvidence, queryMark),
-        }
-        return completedStream('intent contract answer')
+  it.each(INTENT_KINDS)(
+    '%s resolves one finite provider cutoff before bounded branch hydration',
+    async (kind) => {
+      const scenario = await buildScenario(kind)
+      expect(scenario.settings.customMaxContext).toBeUndefined()
+      const queryMark = markQueryEvidence(queryEvidence)
+      const releaseSurface = await prepareControlledGenerationSurface(scenario.intent, {
+        profile: profile(),
+        ...(kind === 'new-chat-send' ? { newChatSettings: scenario.settings } : {}),
       })
-      prepared = result.prepared
-      outcome = result.completed
-    } finally {
-      bodyReads.stop()
-    }
+      releaseSurface()
+      const bodyReads = captureBodyReads()
+      let providerCapture: ProviderCapture | undefined
+      let prepared: PreparedGeneration | undefined
+      let outcome: CompletedGeneration | undefined
+      try {
+        const result = await runToCompletion(scenario.intent, (input) => {
+          providerCapture = {
+            wireMessages: structuredClone(input.requestPlan.wire.messages),
+            readsAtOpen: [...bodyReads.ids],
+            bodyBatchesAtOpen: bodyReads.batches(),
+            queryEvidenceAtOpen: readQueryEvidenceSince(queryEvidence, queryMark),
+          }
+          return completedStream('intent contract answer')
+        })
+        prepared = result.prepared
+        outcome = result.completed
+      } finally {
+        bodyReads.stop()
+      }
 
-    expect(outcome.error).toBeUndefined()
-    expect(outcome).toMatchObject({ outcome: 'done' })
-    const capture = required(providerCapture, 'provider capture')
-    const preparedAttempt = required(prepared, 'prepared attempt')
-    if (kind === 'new-chat-send') {
-      const newChat = requirePreparedNewChat(preparedAttempt)
-      expect(newChat.kind).toBe('handoff')
-      if (newChat.kind !== 'handoff') throw new Error('prepared new chat route superseded')
-      expect(newChat.handoff.chatId).toBe(newChat.chatId)
-      expect(newChat.handoff.id.length).toBeGreaterThan(0)
-      expect(newChat.handoff.workspaceId).toBeTruthy()
-      expect(newChat.handoff.replacementEpoch).toBeGreaterThanOrEqual(0)
-    }
-    const expectedPath = scenario.expectedPath(preparedAttempt)
-    expect(capture.wireMessages).toEqual(
-      expectedPath.map(({ role, text }) => ({ role, content: text })),
-    )
-    expect(capture.queryEvidenceAtOpen.queryKinds).not.toContain('branch.body-page')
-    expect(capture.queryEvidenceAtOpen.branchPageStructureBodyIds).toEqual([])
-    expect(
-      capture.queryEvidenceAtOpen.branchPageStructureRows.every(
-        (rows) => rows <= TRANSCRIPT_BODY_PAGE_ROWS,
-      ),
-    ).toBe(true)
-    for (const id of [...scenario.coldBodyIds, ...scenario.siblingBodyIds]) {
-      expect(capture.readsAtOpen, `body ${id} must stay cold`).not.toContain(id)
-    }
-    const counts = countBodyReads(capture.readsAtOpen)
-    expect(
-      [...counts.values()].every((count) => count === 1),
-      JSON.stringify({
-        counts: [...counts],
-        batches: capture.bodyBatchesAtOpen,
-        queries: capture.queryEvidenceAtOpen,
-      }),
-    ).toBe(true)
-    const readableBodyIds = new Set(scenario.readableBodyIds)
-    expect([...counts.keys()].every((id) => readableBodyIds.has(id))).toBe(true)
-    expect(counts.size).toBeLessThanOrEqual(
-      kind === 'new-chat-send' ? 0 : TRANSCRIPT_BODY_PAGE_ROWS,
-    )
-    const batches = await classifyBodyReadBatches(capture.readsAtOpen, capture.bodyBatchesAtOpen)
-    const promptReadIds = batches
-      .filter((batch) => batch.source === 'message.presentations')
-      .flatMap((batch) => batch.ids)
-    if (preparedAttempt.userMessageId) {
-      expect(capture.readsAtOpen, 'prepared user body must not be reread').not.toContain(
-        preparedAttempt.userMessageId,
+      expect(outcome.error).toBeUndefined()
+      expect(outcome).toMatchObject({ outcome: 'done' })
+      const capture = required(providerCapture, 'provider capture')
+      const preparedAttempt = required(prepared, 'prepared attempt')
+      if (kind === 'new-chat-send') {
+        const newChat = requirePreparedNewChat(preparedAttempt)
+        expect(newChat.kind).toBe('handoff')
+        if (newChat.kind !== 'handoff') throw new Error('prepared new chat route superseded')
+        newChat.handoff.cancel()
+        expect(newChat.handoff.chatId).toBe(newChat.chatId)
+        expect(newChat.handoff.id.length).toBeGreaterThan(0)
+        expect(newChat.handoff.workspaceId).toBeTruthy()
+        expect(newChat.handoff.replacementEpoch).toBeGreaterThanOrEqual(0)
+      }
+      const expectedPath = scenario.expectedPath(preparedAttempt)
+      expect(capture.wireMessages).toEqual(
+        expectedPath.map(({ role, text }) => ({ role, content: text })),
       )
-    }
-    if (kind !== 'continue') {
+      expect(capture.queryEvidenceAtOpen.queryKinds).not.toContain('branch.body-page')
+      expect(capture.queryEvidenceAtOpen.branchPageStructureBodyIds).toEqual([])
       expect(
-        promptReadIds,
-        'prepared assistant body must not be read for prompt planning',
-      ).not.toContain(preparedAttempt.assistantMessageId)
-      expect(capture.readsAtOpen, 'prepared assistant body must not be reread').not.toContain(
-        preparedAttempt.assistantMessageId,
+        capture.queryEvidenceAtOpen.branchPageStructureRows.every(
+          (rows) => rows <= TRANSCRIPT_BODY_PAGE_ROWS,
+        ),
+      ).toBe(true)
+      for (const id of [...scenario.coldBodyIds, ...scenario.siblingBodyIds]) {
+        expect(capture.readsAtOpen, `body ${id} must stay cold`).not.toContain(id)
+      }
+      const counts = countBodyReads(capture.readsAtOpen)
+      expect(bodyReads.unscopedIds).toEqual([])
+      expect(
+        [...counts.values()].every((count) => count === 1),
+        JSON.stringify({
+          counts: [...counts],
+          batches: capture.bodyBatchesAtOpen,
+          queries: capture.queryEvidenceAtOpen,
+        }),
+      ).toBe(true)
+      const readableBodyIds = new Set(scenario.readableBodyIds)
+      expect([...counts.keys()].every((id) => readableBodyIds.has(id))).toBe(true)
+      expect(counts.size).toBeLessThanOrEqual(
+        kind === 'new-chat-send' ? 0 : TRANSCRIPT_BODY_PAGE_ROWS,
       )
-    }
-  })
+      const batches = await classifyBodyReadBatches(capture.readsAtOpen, capture.bodyBatchesAtOpen)
+      const promptReadIds = batches
+        .filter((batch) => batch.source === 'message.presentations')
+        .flatMap((batch) => batch.ids)
+      if (preparedAttempt.userMessageId) {
+        expect(capture.readsAtOpen, 'prepared user body must not be reread').not.toContain(
+          preparedAttempt.userMessageId,
+        )
+      }
+      if (kind !== 'continue') {
+        expect(
+          promptReadIds,
+          'prepared assistant body must not be read for prompt planning',
+        ).not.toContain(preparedAttempt.assistantMessageId)
+        expect(capture.readsAtOpen, 'prepared assistant body must not be reread').not.toContain(
+          preparedAttempt.assistantMessageId,
+        )
+      }
+    },
+  )
 
   it('reconciles a mandatory terminal send by shrinking endpoint eligibility without rereading bodies', async () => {
     await seedReconciledModel()
@@ -312,13 +315,14 @@ describe('generation intent outbound-path and body-I/O contract', () => {
       bodyReads.stop()
     }
 
-    expect(completed).toMatchObject({ outcome: 'done' })
+    expect(completed, completed.error?.message).toMatchObject({ outcome: 'done' })
     const sentWire = required(wire, 'reconciled wire')
     const providerWire = sentWire.provider as { ignore?: string[] }
     expect(JSON.stringify(sentWire.messages)).toContain(submitted)
     expect(providerWire.ignore).toContain('tiny-cap')
     expect(providerWire.ignore).not.toContain('large-cap')
     const counts = countBodyReads(bodyReads.ids)
+    expect(bodyReads.unscopedIds).toEqual([])
     expect(
       [...counts.values()].every((count) => count === 1),
       JSON.stringify([...counts]),
@@ -544,47 +548,46 @@ describe('generation intent outbound-path and body-I/O contract', () => {
     })
   })
 
-  it.each([
-    'send',
-    'regenerate',
-    'continue',
-  ] as const)('%s remains eligible after re-reading an imported chain from durable storage', async (kind) => {
-    const chat = await createChat({
-      settings: boundedSettings({ continueSystemPrompt: '', continueUserPrompt: '' }),
-    })
-    const path = await seedLinear(chat.id, [
-      { role: 'user', text: 'imported generation parent' },
-      { role: 'assistant', text: 'imported assistant without generation metadata' },
-    ])
-    const durablePath = await readTestMessages(chat.id)
-    const user = required(
-      durablePath.find((message) => message.id === path.at(-2)?.id),
-      'durable imported user',
-    )
-    const assistant = required(
-      durablePath.find((message) => message.id === path.at(-1)?.id),
-      'durable imported assistant',
-    )
-    expect(user.origin).toBe('imported')
-    expect(assistant.origin).toBe('imported')
-    expect(assistant.generation).toBeUndefined()
+  it.each(['send', 'regenerate', 'continue'] as const)(
+    '%s remains eligible after re-reading an imported chain from durable storage',
+    async (kind) => {
+      const chat = await createChat({
+        settings: boundedSettings({ continueSystemPrompt: '', continueUserPrompt: '' }),
+      })
+      const path = await seedLinear(chat.id, [
+        { role: 'user', text: 'imported generation parent' },
+        { role: 'assistant', text: 'imported assistant without generation metadata' },
+      ])
+      const durablePath = await readTestMessages(chat.id)
+      const user = required(
+        durablePath.find((message) => message.id === path.at(-2)?.id),
+        'durable imported user',
+      )
+      const assistant = required(
+        durablePath.find((message) => message.id === path.at(-1)?.id),
+        'durable imported assistant',
+      )
+      expect(user.origin).toBe('imported')
+      expect(assistant.origin).toBe('imported')
+      expect(assistant.generation).toBeUndefined()
 
-    const intent: GenerationIntent =
-      kind === 'send'
-        ? {
-            kind,
-            chatId: chat.id,
-            target: { kind: 'fixed', messageId: assistant.id },
-            content: [{ type: 'text', text: 'send after imported chain' }],
-          }
-        : { kind, chatId: chat.id, targetAssistantId: assistant.id }
-    const result = await runToCompletion(intent, () =>
-      completedStream(`${kind} after imported chain`),
-    )
+      const intent: GenerationIntent =
+        kind === 'send'
+          ? {
+              kind,
+              chatId: chat.id,
+              target: { kind: 'fixed', messageId: assistant.id },
+              content: [{ type: 'text', text: 'send after imported chain' }],
+            }
+          : { kind, chatId: chat.id, targetAssistantId: assistant.id }
+      const result = await runToCompletion(intent, () =>
+        completedStream(`${kind} after imported chain`),
+      )
 
-    expect(result.completed).toMatchObject({ outcome: 'done' })
-    expect(result.completed.error).toBeUndefined()
-  })
+      expect(result.completed).toMatchObject({ outcome: 'done' })
+      expect(result.completed.error).toBeUndefined()
+    },
+  )
 
   it('save-and-send appends from an imported intermediate node with existing descendants', async () => {
     const chat = await createChat({ settings: boundedSettings() })
@@ -994,15 +997,12 @@ describe('generation intent outbound-path and body-I/O contract', () => {
       error: { message: 'No eligible providers can serve this request.' },
     })
     const evidence = required(queryEvidenceAtCompletion, 'unlimited query evidence')
-    expect(evidence.queryKinds).toContain('branch.page-structure')
+    expect(evidence.queryKinds).not.toContain('message.headers-by-chat')
     expect(evidence.queryKinds).not.toContain('branch.body-page')
     expect(evidence.branchPageStructureBodyIds).toEqual([])
-    expect(evidence.branchPageStructureRows.length).toBeGreaterThan(0)
-    expect(
-      evidence.branchPageStructureRows.every((rows) => rows <= TRANSCRIPT_BODY_PAGE_ROWS),
-    ).toBe(true)
     const pathIds = new Set(fixture.path.map((message) => message.id))
     const counts = countBodyReads(readsAtCompletion)
+    expect(bodyReads.unscopedIds).toEqual([])
     expect(
       [...counts.values()].every((count) => count === 1),
       JSON.stringify([...counts]),
@@ -1355,17 +1355,23 @@ async function* gatedCompletedStream(
 
 function captureBodyReads(): {
   ids: MessageId[]
+  unscopedIds: MessageId[]
   batches(): readonly BodyReadBatch[]
   stop(): void
 } {
   const ids: MessageId[] = []
+  const unscopedIds: MessageId[] = []
   const transactionIds = new WeakMap<Transaction, number>()
   const batches = new Map<number, { storeNames: readonly string[]; ids: MessageId[] }>()
   let nextTransactionId = 1
   const reading = (row: MessageBodyRow | undefined): MessageBodyRow | undefined => {
     if (row) {
       ids.push(row.id)
-      const transaction = Dexie.currentTransaction
+      const transaction = currentDexieTransaction()
+      if (!transaction) {
+        unscopedIds.push(row.id)
+        return row
+      }
       const transactionId = transactionIds.get(transaction) ?? nextTransactionId++
       transactionIds.set(transaction, transactionId)
       const storeNames = [...transaction.storeNames]
@@ -1378,6 +1384,7 @@ function captureBodyReads(): {
   getDb().messageBodies.hook('reading', reading)
   return {
     ids,
+    unscopedIds,
     batches: () =>
       Object.freeze(
         [...batches].map(([transaction, batch]) =>
@@ -1449,7 +1456,7 @@ function repositoryWithQueryEvidence(
         evidence.branchPageStructureRows.push(query.window.nodes.length)
         const reading = (row: MessageBodyRow | undefined): MessageBodyRow | undefined => {
           if (!row) return row
-          const stores = new Set(Dexie.currentTransaction.storeNames)
+          const stores = new Set(currentDexieTransaction()?.storeNames ?? [])
           if (stores.has('workspaceFence') && stores.has('chats')) {
             evidence.branchPageStructureBodyIds.push(row.id)
           }
@@ -1464,6 +1471,11 @@ function repositoryWithQueryEvidence(
       }
     },
   })
+}
+
+function currentDexieTransaction(): Transaction | null {
+  return (Dexie as unknown as { readonly currentTransaction: Transaction | null })
+    .currentTransaction
 }
 
 async function classifyBodyReadBatches(

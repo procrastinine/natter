@@ -204,7 +204,9 @@ export async function sendMessage(page: Page, text: string): Promise<void> {
   const composer = interactiveComposer(page)
   await expect(composer).toBeVisible()
   await composer.locator('[data-ui="composer-input"]').fill(text)
+  const materializesChat = await page.evaluate(() => window.location.hash === '#/new')
   await composer.locator('[data-ui="send"]').click()
+  if (materializesChat) await expect(page).toHaveURL(/#\/chat\/[^/]+\/message\/[^/]+$/)
 }
 
 export function interactiveComposer(page: Page) {
@@ -626,6 +628,23 @@ export async function waitForAssistantGenerationFinished(
         (row) => row.role === 'assistant',
       )
       const generation = assistants[assistantIndex]?.generation
+      return generation && typeof generation === 'object'
+        ? typeof (generation as { finishedAt?: unknown }).finishedAt
+        : 'undefined'
+    })
+    .toBe('number')
+}
+
+export async function waitForMessageGenerationFinished(
+  page: Page,
+  chatId: string,
+  messageId: string,
+): Promise<void> {
+  await expect
+    .poll(async () => {
+      const generation = (await readMessages(page, chatId)).find(
+        (row) => row.id === messageId,
+      )?.generation
       return generation && typeof generation === 'object'
         ? typeof (generation as { finishedAt?: unknown }).finishedAt
         : 'undefined'

@@ -81,7 +81,7 @@ describe('hidden-tab visual continuity architecture audit', () => {
       ok: true,
       structurallyValid: true,
       surfaceCount: 8,
-      transitionCount: 4,
+      transitionCount: 3,
       proofCount: 10,
       gapCount: 0,
       acceptanceCount: 7,

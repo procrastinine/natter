@@ -423,6 +423,7 @@ export function Composer({
   const attachments = useAttachmentDrafts()
   const {
     attachmentRefs,
+    currentAttachmentRefs,
     attachmentRows,
     uploads,
     addAttachment,
@@ -473,7 +474,7 @@ export function Composer({
     prefillScopeStable,
   ])
   const uploadingAttachments = uploads.some((upload) => upload.state === 'uploading')
-  const hasAttachments = !attachmentsDisabled && attachmentRefs.length > 0
+  const hasAttachments = attachmentScopeStable && !attachmentsDisabled && attachmentRefs.length > 0
   const emptyWithTrailingUser =
     trimmed.length === 0 &&
     !hasAttachments &&
@@ -522,7 +523,7 @@ export function Composer({
     }
     const submittedDraft = text
     const out = submittedDraft.trim()
-    const refsOut = attachmentsDisabled ? [] : attachmentRefs
+    const refsOut = attachmentsDisabled || !attachmentScopeStable ? [] : currentAttachmentRefs()
     // Empty / whitespace-only prefill is treated as no prefill (the wire
     // transform would trim trailing whitespace anyway, so an empty prefill
     // turn would be a no-op-then-confuse-the-model).
@@ -568,9 +569,10 @@ export function Composer({
     prefillOpen,
     prefillText,
     defaultPrefill,
-    attachmentRefs,
+    currentAttachmentRefs,
     hasAttachments,
     attachmentsDisabled,
+    attachmentScopeStable,
     consumeAttachments,
     setComposerText,
   ])

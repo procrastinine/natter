@@ -331,7 +331,7 @@ class TabGenerationAdmissionController implements GenerationAdmissionController 
                   workspaceFence: workspace,
                   steering: 'select-result',
                   selectionDelivery: 'route-handoff',
-                  routeOwner: routeOwner!,
+                  routeOwner: requireNewChatRouteOwner(routeOwner),
                 }),
               })
             : Object.freeze({
@@ -543,6 +543,13 @@ class TabGenerationAdmissionController implements GenerationAdmissionController 
     state.attemptTargetClaim = null
     if (claim) attemptController.releaseTargetClaim(claim)
   }
+}
+
+function requireNewChatRouteOwner(
+  routeOwner: ConversationRouteOwner | null,
+): ConversationRouteOwner {
+  if (!routeOwner) throw new Error('GenerationAdmissionNewChatRouteOwnerMissing')
+  return routeOwner
 }
 
 function captureGenerationConfiguration(

@@ -1,11 +1,16 @@
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
+import Dexie from 'dexie'
 import { afterEach, expect, it, vi } from 'vitest'
 import { yieldToEventLoop } from '../../src/lib/yield-to-event-loop'
 import type { BrowserWorkspaceCompactionResult } from '../../src/store/browser-workspace-compaction'
 import type { BrowserWorkspaceReplacementCommit } from '../../src/store/browser-workspace-contract'
 import { createBrowserWorkspacePromotedReplacementDrain } from '../../src/store/browser-workspace-lifecycle'
-import { __linkedStorageMaintenanceAbortControllerForTests } from '../../src/store/storage-maintenance-runtime'
+import { createDbForTests } from '../../src/store/db'
+import {
+  __linkedStorageMaintenanceAbortControllerForTests,
+  __runStorageMaintenancePumpForTests,
+} from '../../src/store/storage-maintenance-runtime'
 
 afterEach(() => {
   vi.useRealTimers()
@@ -45,7 +50,7 @@ it('transfers promoted replacement custody before ending the finalized maintenan
   const runCompaction = source.slice(compactionStart, compactionEnd)
 
   expect(schedulePump).toMatch(
-    /const finalized = this\.#runPump\(generation\)\.finally[\s\S]*this\.#pumpTask = finalized/u,
+    /const finalized = runStorageMaintenancePump\(\(\) => this\.#runPump\(generation\)\)\.finally[\s\S]*this\.#pumpTask = finalized/u,
   )
   expect(runPump).toContain("if (outcome.kind === 'handoff') return")
   expect(runCompaction).not.toContain('#observeTransitionHandoff')
@@ -55,6 +60,26 @@ it('transfers promoted replacement custody before ending the finalized maintenan
   expect(runCompaction).toMatch(
     /this\.#replacementHandoffs\.transfer\(started\.handoff\)[\s\S]*return \{ kind: 'handoff' \}/u,
   )
+})
+
+it('starts the maintenance pump outside an ambient Dexie transaction', async () => {
+  const db = createDbForTests(`natter-maintenance-zone-${crypto.randomUUID()}`)
+  await db.open()
+  let pump: Promise<void> | undefined
+  let observed: unknown
+  try {
+    await db.transaction('r', db.settings, () => {
+      expect(Dexie.currentTransaction).not.toBeNull()
+      pump = __runStorageMaintenancePumpForTests(async () => {
+        observed = Dexie.currentTransaction
+      })
+    })
+    await pump
+    expect(observed).toBeNull()
+  } finally {
+    db.close()
+    await Dexie.delete(db.name)
+  }
 })
 
 it('keeps promoted replacement custody alive after the producer closes and drains it exactly once', async () => {

@@ -1007,7 +1007,8 @@ export function installUiJourneyInvariantRecorderInPage(
       messageIds.length > 0 &&
       previousIds.slice(evictedRowCount).every((id, index) => id === messageIds[index]) &&
       renderedCount === all.length &&
-      previousTranscript.renderedCount === previousTranscript.count &&
+      previousTranscript.renderedCount !== null &&
+      previousTranscript.renderedCount >= previousTranscript.count &&
       totalCount !== null &&
       totalCount === previousTranscript.totalCount &&
       retainedAnchor !== undefined &&

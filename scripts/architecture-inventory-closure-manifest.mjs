@@ -282,6 +282,14 @@ export const VERIFICATION_STAGE_CLASSIFICATIONS = Object.freeze([
     'Executes built-browser behavior but cannot infer unexercised architecture paths.',
   ),
   stage(
+    'firefox-e2e',
+    'Test the built app in Firefox against the loopback fake provider',
+    'blocking',
+    ['pnpm', 'exec', 'playwright', 'test', '--project=firefox'],
+    'behavior',
+    'Executes the same built-browser behavior in Firefox so engine-specific storage, layout, and lifecycle failures are part of the checkpoint gate.',
+  ),
+  stage(
     'headed-hidden-tab-visual-continuity',
     'Prove native hidden-tab first-frame continuity in headed Chromium',
     'blocking',
@@ -649,7 +657,7 @@ export const ARCHITECTURE_DIMENSION_CLOSURE = Object.freeze([
     ['architecture-coverage', 'test-evidence', 'chromium-e2e'],
     'Finite protocols and known publication consumers are classified, but arbitrary callbacks, browser history, popup/tab creation, retained UI state, and closure-captured tab authority are not exhaustively discovered.',
     'Every public operation and state cell has generated tab/shared scope, remote-observation behavior, route/cursor/draft constraints, and real multi-tab success/failure/reload evidence without cross-tab steering.',
-    'The locality matrix is not closed over every UI entry and known middle-click/reload gaps remain.',
+    'The locality matrix is not closed over every UI entry, popup/tab creation variant, and reload path.',
   ),
   dimension(
     'temporal-semantics',

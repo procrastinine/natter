@@ -258,7 +258,7 @@ export async function readSidebarPresentationPage(
       const [aggregate, folderCatalog, tagCatalog] = await Dexie.Promise.all([
         readSidebarAggregate(db),
         db.folders.toArray(),
-        request.countMode === 'omit' ? Promise.resolve([]) : db.tags.toArray(),
+        request.countMode === 'omit' ? Dexie.Promise.resolve([]) : db.tags.toArray(),
       ])
       throwIfAborted(signal)
       const folders = sortSidebarFolders(folderCatalog)
@@ -1338,7 +1338,7 @@ export async function readAttachmentManagerCore(db: NatterDb, attachmentId: Atta
     'r',
     [db.attachmentCatalogRows, db.attachmentArtifacts, db.attachmentJobs],
     async () => {
-      const [row, artifacts, jobs] = await Promise.all([
+      const [row, artifacts, jobs] = await Dexie.Promise.all([
         db.attachmentCatalogRows.get(attachmentId),
         db.attachmentArtifacts.where('attachmentId').equals(attachmentId).toArray(),
         db.attachmentJobs.where('attachmentId').equals(attachmentId).toArray(),

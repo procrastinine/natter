@@ -1,9 +1,9 @@
-import type {
-  DBCore,
-  DBCoreMutateRequest,
-  DBCoreMutateResponse,
-  DBCoreTransaction,
-  Dexie,
+import Dexie, {
+  type DBCore,
+  type DBCoreMutateRequest,
+  type DBCoreMutateResponse,
+  type DBCoreTransaction,
+  type Dexie as DexieDatabase,
 } from 'dexie'
 import { newId } from '../lib/ulid'
 import {
@@ -98,35 +98,35 @@ export async function recordBrowserWorkspaceCatchupMutations(
   }
 }
 
-export function activateBrowserWorkspaceCatchupJournals(db: Dexie): Promise<void> {
-  return db.transaction(
-    'rw',
-    BROWSER_WORKSPACE_CATCHUP_JOURNAL_TABLE_NAMES.map((tableName) => db.table(tableName)),
-    async () => {
-      await Promise.all(
-        BROWSER_WORKSPACE_MUTATION_JOURNAL_SOURCE_TABLE_NAMES.map(async (sourceTableName) => {
-          const table = db.table<BrowserWorkspaceCatchupJournalRow, string>(
-            browserWorkspaceCatchupJournalTableName(sourceTableName),
-          )
-          await table.clear()
-          await table.put({
-            id: BROWSER_WORKSPACE_CATCHUP_ACTIVE_ID,
-            sourceTableName,
-            sourceKey: BROWSER_WORKSPACE_CATCHUP_ACTIVE_ID,
-            revision: BROWSER_WORKSPACE_CATCHUP_ACTIVE_ID,
-          })
-        }),
-      )
-    },
-  )
-}
-
-export function deactivateBrowserWorkspaceCatchupJournals(db: Dexie): Promise<void> {
+export function activateBrowserWorkspaceCatchupJournals(db: DexieDatabase): Promise<void> {
   return db.transaction(
     'rw',
     BROWSER_WORKSPACE_CATCHUP_JOURNAL_TABLE_NAMES.map((tableName) => db.table(tableName)),
     () =>
-      Promise.all(
+      Dexie.Promise.all(
+        BROWSER_WORKSPACE_MUTATION_JOURNAL_SOURCE_TABLE_NAMES.map((sourceTableName) => {
+          const table = db.table<BrowserWorkspaceCatchupJournalRow, string>(
+            browserWorkspaceCatchupJournalTableName(sourceTableName),
+          )
+          return table.clear().then(() =>
+            table.put({
+              id: BROWSER_WORKSPACE_CATCHUP_ACTIVE_ID,
+              sourceTableName,
+              sourceKey: BROWSER_WORKSPACE_CATCHUP_ACTIVE_ID,
+              revision: BROWSER_WORKSPACE_CATCHUP_ACTIVE_ID,
+            }),
+          )
+        }),
+      ).then(() => undefined),
+  )
+}
+
+export function deactivateBrowserWorkspaceCatchupJournals(db: DexieDatabase): Promise<void> {
+  return db.transaction(
+    'rw',
+    BROWSER_WORKSPACE_CATCHUP_JOURNAL_TABLE_NAMES.map((tableName) => db.table(tableName)),
+    () =>
+      Dexie.Promise.all(
         BROWSER_WORKSPACE_CATCHUP_JOURNAL_TABLE_NAMES.map((tableName) =>
           db.table(tableName).clear(),
         ),

@@ -826,6 +826,7 @@ export const OWNER_PATH_CLASSIFICATIONS = Object.freeze({
     'src/store/browser-mutation-runtime.ts',
     'src/store/browser-repo.ts',
     'src/store/browser-workspace-replacement-runner.ts',
+    'src/store/browser-workspace-lifecycle.ts',
     'src/store/byte-owner-mutation.ts',
     'src/store/chat-row-transition.ts',
     'src/store/child-list-projection.ts',

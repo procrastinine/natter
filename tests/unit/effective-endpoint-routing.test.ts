@@ -99,7 +99,7 @@ describe('effective endpoint routing', () => {
       wire: { only: ['foo'], zeroEligible: false },
     })
     expect(routing.selectedEndpoints).toEqual([exact])
-    expect([...routing.capability!.supportedParameters]).toEqual(['temperature'])
+    expect([...(routing.capability?.supportedParameters ?? [])]).toEqual(['temperature'])
   })
 
   it('applies ignore before only and blocks an unknown-only selection', () => {
@@ -189,8 +189,11 @@ describe('effective endpoint routing', () => {
       endpoints,
       settings: settings({ strictProviderRouting: true }),
     })
-    expect([...normal.capability!.supportedParameters].sort()).toEqual(['temperature', 'top_p'])
-    expect([...strict.capability!.supportedParameters]).toEqual(['temperature'])
+    expect([...(normal.capability?.supportedParameters ?? [])].sort()).toEqual([
+      'temperature',
+      'top_p',
+    ])
+    expect([...(strict.capability?.supportedParameters ?? [])]).toEqual(['temperature'])
   })
 
   it('uses transport-only OpenRouter prefill and typed direct endpoint markers', () => {

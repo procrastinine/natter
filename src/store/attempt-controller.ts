@@ -384,10 +384,7 @@ class TabAttemptController implements AttemptController {
         : {}),
     })
     const phase = executionPhaseFromAvailability(availability, lease, requestedPhase)
-    const requestLiveProjection =
-      sameAttempt && attemptAvailabilityIsLocal(availability)
-        ? currentExecution?.requestLiveProjection
-        : undefined
+    const requestLiveProjection = sameAttempt ? currentExecution?.requestLiveProjection : undefined
     if (
       current &&
       current.streamId === lease.streamId &&

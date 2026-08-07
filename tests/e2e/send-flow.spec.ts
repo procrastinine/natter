@@ -169,13 +169,15 @@ test('mid-stream error frame surfaces ApiError and preserves partial text', asyn
 
 test.describe('HTTP error response diagnostics', () => {
   test.use({
-    runtimeDiagnosticAllowances: [
-      {
-        category: 'console-other',
-        message:
-          '^Failed to load resource: the server responded with a status of (?:401 \\(Unauthorized\\)|402 \\(Payment Required\\)|503 \\(Service Unavailable\\))$',
-      },
-    ],
+    runtimeDiagnosticPolicy: {
+      allowances: [
+        {
+          category: 'console-other',
+          message:
+            '^Failed to load resource: the server responded with a status of (?:401 \\(Unauthorized\\)|402 \\(Payment Required\\)|503 \\(Service Unavailable\\))$',
+        },
+      ],
+    },
   })
 
   test('HTTP 401 shows the unauthorized classifier string', async ({ page }) => {

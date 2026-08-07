@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import Dexie from 'dexie'
 import { StrictMode } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -297,21 +297,24 @@ describe('Composer', () => {
     expect(onSubmit).toHaveBeenCalledWith('exact draft', {})
   })
 
-  it.each(
-    BLOCKED_GENERATION_CASES,
-  )('preserves the draft and does not invoke submit while generation is %s', (_state, capability) => {
-    const onSubmit = vi.fn(() => started())
-    const { container } = render(<Composer generationCapability={capability} onSubmit={onSubmit} />)
-    const input = screen.getByRole('textbox')
-    fireEvent.change(input, { target: { value: 'retain this exact draft' } })
+  it.each(BLOCKED_GENERATION_CASES)(
+    'preserves the draft and does not invoke submit while generation is %s',
+    (_state, capability) => {
+      const onSubmit = vi.fn(() => started())
+      const { container } = render(
+        <Composer generationCapability={capability} onSubmit={onSubmit} />,
+      )
+      const input = screen.getByRole('textbox')
+      fireEvent.change(input, { target: { value: 'retain this exact draft' } })
 
-    const send = screen.getByRole('button', { name: 'Send ⏎' })
-    expect(send).toBeDisabled()
-    fireEvent.submit(container.querySelector('[data-ui="composer"]') as HTMLFormElement)
+      const send = screen.getByRole('button', { name: 'Send ⏎' })
+      expect(send).toBeDisabled()
+      fireEvent.submit(container.querySelector('[data-ui="composer"]') as HTMLFormElement)
 
-    expect(onSubmit).not.toHaveBeenCalled()
-    expect(input).toHaveValue('retain this exact draft')
-  })
+      expect(onSubmit).not.toHaveBeenCalled()
+      expect(input).toHaveValue('retain this exact draft')
+    },
+  )
 
   it('selects send and reply capability independently from the inactive action', async () => {
     const onSubmit = vi.fn((_text: string) => started())
@@ -443,7 +446,7 @@ describe('Composer', () => {
       render(<Composer autoSize onSubmit={() => started()} />)
       const input = screen.getByRole('textbox')
 
-      expect(input.style.height).toBe('48px')
+      expect(input.style.height).toBe(input.style.minHeight)
       expect(input.style.overflowY).toBe('hidden')
     } finally {
       if (descriptor) {
@@ -539,6 +542,36 @@ describe('Composer', () => {
       | undefined
     expect(options?.attachmentRefs).toHaveLength(1)
     expect(options?.attachmentRefs?.[0]).toMatchObject({ includeInContext: true })
+  })
+
+  it('submits the synchronous attachment draft after a remove and send in one event turn', async () => {
+    const onSubmit = vi.fn(
+      (_text: string, _opts?: { prefillText?: string; attachmentRefs?: MessageAttachmentRef[] }) =>
+        started(),
+    )
+    const { container } = render(<Composer onSubmit={onSubmit} />)
+    const fileInput = container.querySelector(
+      '[data-ui="attachment-hidden-input"]',
+    ) as HTMLInputElement
+    fireEvent.change(fileInput, {
+      target: { files: [new File(['remove me'], 'remove-me.txt', { type: 'text/plain' })] },
+    })
+    expect(await screen.findByText('remove-me.txt')).toBeInTheDocument()
+    await waitFor(() =>
+      expect(
+        container.querySelector('[data-ui="attachment-file-card"][data-storage="local"]'),
+      ).toBeInTheDocument(),
+    )
+
+    act(() => {
+      screen.getByRole('button', { name: 'Remove attachment' }).click()
+      container
+        .querySelector<HTMLFormElement>('[data-ui="composer"]')
+        ?.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
+    })
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledOnce())
+    expect(onSubmit.mock.calls[0]?.[1]).toEqual({})
   })
 
   it('preserves attachment edits and additions made while preparation is pending', async () => {
@@ -660,6 +693,41 @@ describe('Composer', () => {
     const options = onSaveAndSend.mock.calls[0]?.[1]
     expect(options?.attachmentRefs).toHaveLength(1)
     expect(options?.attachmentRefs?.[0]).toMatchObject({ includeInContext: true })
+  })
+
+  it('Save & Send reads the synchronous attachment draft after a same-turn remove', async () => {
+    const onSaveAndSend = vi.fn(
+      (_text: string, _opts?: { prefillText?: string; attachmentRefs?: MessageAttachmentRef[] }) =>
+        startedInlineGeneration(),
+    )
+    const { container } = render(
+      <InlineEditor
+        initial="existing message"
+        onSave={succeededInteractionSettlement}
+        onCancel={() => {}}
+        onSaveAndSend={onSaveAndSend}
+      />,
+    )
+    const fileInput = container.querySelector(
+      '[data-ui="attachment-hidden-input"]',
+    ) as HTMLInputElement
+    fireEvent.change(fileInput, {
+      target: { files: [new File(['remove me'], 'remove-inline.txt', { type: 'text/plain' })] },
+    })
+    expect(await screen.findByText('remove-inline.txt')).toBeInTheDocument()
+    await waitFor(() =>
+      expect(
+        container.querySelector('[data-ui="attachment-file-card"][data-storage="local"]'),
+      ).toBeInTheDocument(),
+    )
+
+    act(() => {
+      screen.getByRole('button', { name: 'Remove attachment' }).click()
+      screen.getByRole('button', { name: 'Save & Send' }).click()
+    })
+
+    await waitFor(() => expect(onSaveAndSend).toHaveBeenCalledOnce())
+    expect(onSaveAndSend.mock.calls[0]?.[1]).toEqual({})
   })
 
   it('owns a queued Save & Send until its exact preparation settles', async () => {

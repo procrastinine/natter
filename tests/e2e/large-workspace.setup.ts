@@ -1,6 +1,6 @@
 import { readFile, rm } from 'node:fs/promises'
 import { resolve } from 'node:path'
-import { type BrowserContext, chromium, expect, test } from '@playwright/test'
+import { type BrowserContext, chromium, expect, type Page, test } from '@playwright/test'
 import {
   GENERATED_WORKSPACE_ACTIVE_CHAT_ID,
   GENERATED_WORKSPACE_ACTIVE_TERMINAL_ID,
@@ -88,6 +88,7 @@ test('cache deterministic current-schema large-workspace browser states', async 
           `[data-ui="message"][data-message-id="${GENERATED_WORKSPACE_ACTIVE_TERMINAL_ID}"] [data-ui="message-body"]`,
         ),
       ).toBeVisible({ timeout: 30_000 })
+      await waitForGeneratedWorkspaceStorageQuiescence(page)
       const closeStartedAt = performance.now()
       await context.close()
       const browserCloseMs = performance.now() - closeStartedAt
@@ -151,5 +152,70 @@ async function installProviderCatalogFixture(context: BrowserContext) {
         ],
       }),
     }),
+  )
+}
+
+async function waitForGeneratedWorkspaceStorageQuiescence(page: Page) {
+  await page.waitForFunction(
+    async ({ controlDatabaseName, recoveryIntentPrefix }) => {
+      const recoveryPending = Array.from({ length: localStorage.length }, (_value, index) =>
+        localStorage.key(index),
+      ).some((key) => key?.startsWith(recoveryIntentPrefix))
+      if (recoveryPending) return false
+      const database = await new Promise<IDBDatabase>((resolve, reject) => {
+        const request = indexedDB.open(controlDatabaseName)
+        request.onsuccess = () => resolve(request.result)
+        request.onerror = () => reject(request.error)
+      })
+      try {
+        const state = await new Promise<
+          | {
+              readonly manifest: { activeDatabaseName?: unknown; pending?: unknown }
+              readonly compaction:
+                | { completedRevision?: unknown; requestRevision?: unknown }
+                | undefined
+            }
+          | undefined
+        >((resolve, reject) => {
+          const transaction = database.transaction(['compactionStates', 'manifests'], 'readonly')
+          const manifestRequest = transaction.objectStore('manifests').get('workspace')
+          manifestRequest.onerror = () => reject(manifestRequest.error)
+          manifestRequest.onsuccess = () => {
+            const manifest = manifestRequest.result as
+              | { activeDatabaseName?: unknown; pending?: unknown }
+              | undefined
+            if (!manifest || typeof manifest.activeDatabaseName !== 'string') {
+              resolve(undefined)
+              return
+            }
+            const compactionRequest = transaction
+              .objectStore('compactionStates')
+              .get(manifest.activeDatabaseName)
+            compactionRequest.onerror = () => reject(compactionRequest.error)
+            compactionRequest.onsuccess = () =>
+              resolve({
+                manifest,
+                compaction: compactionRequest.result as
+                  | { completedRevision?: unknown; requestRevision?: unknown }
+                  | undefined,
+              })
+          }
+        })
+        return (
+          state !== undefined &&
+          state.manifest.pending === undefined &&
+          typeof state.compaction?.requestRevision === 'number' &&
+          typeof state.compaction.completedRevision === 'number' &&
+          state.compaction.requestRevision <= state.compaction.completedRevision
+        )
+      } finally {
+        database.close()
+      }
+    },
+    {
+      controlDatabaseName: 'natter-control',
+      recoveryIntentPrefix: 'natter:storage-compaction-intent:v1:',
+    },
+    { timeout: 60_000 },
   )
 }

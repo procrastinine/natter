@@ -79,13 +79,6 @@ export const HIDDEN_TAB_PRESENTATION_TRANSITIONS = Object.freeze([
     'draft-persistence',
     'Hiding flushes the tab-local draft without detaching or replacing its owner.',
   ),
-  transition(
-    'message-content-visibility',
-    'src/styles/messages.css',
-    'content-visibility: auto;',
-    'compositor-retention',
-    'Chromium may discard offscreen message paint; this is measured only after DOM churn is removed.',
-  ),
 ])
 
 export const HIDDEN_TAB_EXISTING_PROOFS = Object.freeze([
@@ -167,8 +160,8 @@ export const HIDDEN_TAB_EXISTING_PROOFS = Object.freeze([
       'expect(diff.meanChannelDelta).toBeLessThanOrEqual(2)',
       'expect(diff.changedPixelRatio).toBeLessThanOrEqual(0.25)',
       'expect(gesture.clickAt - gesture.visibleAt).toBeLessThanOrEqual(250)',
-      'await testInfo.attach(`baseline-${theme}`',
-      'await testInfo.attach(`first-foreground-${theme}`',
+      'await testInfo.attach(`baseline-$' + '{theme}`',
+      'await testInfo.attach(`first-foreground-$' + '{theme}`',
     ],
   ),
 ])
@@ -230,10 +223,6 @@ function proof(id, path, locator, kind, limit, requiredLocators = []) {
     limit,
     requiredLocators: Object.freeze(requiredLocators),
   })
-}
-
-function gap(id, path, locator, rationale) {
-  return Object.freeze({ id, path, locator, rationale })
 }
 
 function acceptance(id, proofKinds, invariant) {

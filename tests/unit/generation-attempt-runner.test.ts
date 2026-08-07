@@ -303,7 +303,7 @@ describe('generation attempt runner', () => {
     expect(journal.checkpoint).not.toHaveBeenCalled()
   })
 
-  it('publishes one current durable snapshot when an offscreen paused stream becomes relevant', async () => {
+  it('republishes a current durable revision when a returning consumer requests it', async () => {
     const paused = deferred<void>()
     const release = deferred<void>()
     const journal = journalDouble()
@@ -346,6 +346,10 @@ describe('generation attempt runner', () => {
     await Promise.all([currentRequester(), currentRequester()])
     expect(published).toEqual(['waiting'])
     expect(journal.checkpoint).toHaveBeenCalledTimes(1)
+
+    await currentRequester()
+    expect(published).toEqual(['waiting', 'waiting'])
+    expect(journal.checkpoint).toHaveBeenCalledTimes(2)
 
     release.resolve()
     await expect(attempt).resolves.toMatchObject({ outcome: 'done' })
@@ -1224,40 +1228,39 @@ describe('generation attempt runner', () => {
       ] as AssistantStreamChunk[],
       expectedReasoning: 'anthropic partial reasoning',
     },
-  ])('preserves reasoning-only state when $name is aborted before response text', async ({
-    expectedReasoning,
-    source,
-    streamContract,
-  }) => {
-    const controller = new AbortController()
-    const accumulator = createStreamAccumulator({ initialContent: [], now: 0 })
-    const decisions: AttemptTerminalDecision[] = []
-    const result = await runTestGenerationAttempt({
-      open: async function* () {
-        for (const chunk of source) yield chunk
-        controller.abort()
-      },
-      signal: controller.signal,
-      isAborted: () => controller.signal.aborted,
-      streamContract,
-      accumulator,
-      journal: journalDouble(),
-      errorPolicy: SEND_GENERATION_ATTEMPT_ERROR_POLICY,
-      terminal: terminalDouble({
-        complete: async ({ decision }) => {
-          decisions.push(decision)
-          const final = projectStreamAccumulatorFinal(accumulator)
-          expect(final.content).toEqual([{ type: 'output_text', text: '' }])
-          expect(final.reasoningEnvelope?.visible.map((part) => part.text).join('')).toBe(
-            expectedReasoning,
-          )
+  ])(
+    'preserves reasoning-only state when $name is aborted before response text',
+    async ({ expectedReasoning, source, streamContract }) => {
+      const controller = new AbortController()
+      const accumulator = createStreamAccumulator({ initialContent: [], now: 0 })
+      const decisions: AttemptTerminalDecision[] = []
+      const result = await runTestGenerationAttempt({
+        open: async function* () {
+          for (const chunk of source) yield chunk
+          controller.abort()
         },
-      }),
-    })
+        signal: controller.signal,
+        isAborted: () => controller.signal.aborted,
+        streamContract,
+        accumulator,
+        journal: journalDouble(),
+        errorPolicy: SEND_GENERATION_ATTEMPT_ERROR_POLICY,
+        terminal: terminalDouble({
+          complete: async ({ decision }) => {
+            decisions.push(decision)
+            const final = projectStreamAccumulatorFinal(accumulator)
+            expect(final.content).toEqual([{ type: 'output_text', text: '' }])
+            expect(final.reasoningEnvelope?.visible.map((part) => part.text).join('')).toBe(
+              expectedReasoning,
+            )
+          },
+        }),
+      })
 
-    expect(result).toEqual({ outcome: 'abort', abortReason: 'user' })
-    expect(decisions).toEqual([{ outcome: 'abort', abortReason: 'user' }])
-  })
+      expect(result).toEqual({ outcome: 'abort', abortReason: 'user' })
+      expect(decisions).toEqual([{ outcome: 'abort', abortReason: 'user' }])
+    },
+  )
 
   it.each([
     {

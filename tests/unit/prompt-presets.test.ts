@@ -24,7 +24,6 @@ import { getChat } from '../../src/store/chats'
 import { configurationApplication } from '../../src/store/configuration-application'
 import { configurationController } from '../../src/store/configuration-controller'
 import { __resetDbForTests, getDb } from '../../src/store/db'
-import { exportWorkspaceBackup, restoreWorkspaceBackup } from '../../src/store/import-export'
 import { __resetKeyCacheForTests, createKey } from '../../src/store/keys'
 import type { WorkspaceChange, WorkspaceDependency } from '../../src/store/workspace-protocol'
 import { __resetWorkspaceRepositoryForTests } from '../../src/store/workspace-repository'
@@ -35,28 +34,30 @@ import {
 
 const DB_NAME = 'natter'
 
-let emptyWorkspaceBackup: Awaited<ReturnType<typeof exportWorkspaceBackup>>
-
-beforeAll(async () => {
-  ;(globalThis as unknown as { indexedDB: IDBFactory }).indexedDB = new IDBFactory()
+async function resetAll(): Promise<void> {
   __resetWorkspaceRepositoryForTests()
   __resetBrowserRepositoryForTests()
   __resetBroadcastForTests()
   __resetKeyCacheForTests()
   __resetDbForTests()
   await Dexie.delete(DB_NAME)
+}
+
+beforeAll(async () => {
+  ;(globalThis as unknown as { indexedDB: IDBFactory }).indexedDB = new IDBFactory()
+  await resetAll()
   await openBrowserWorkspace()
-  emptyWorkspaceBackup = await exportWorkspaceBackup()
 })
 
 beforeEach(async () => {
-  __resetKeyCacheForTests()
-  await restoreWorkspaceBackup(emptyWorkspaceBackup, { now: 1 })
+  await shutdownBrowserWorkspace()
+  await resetAll()
+  await openBrowserWorkspace()
 })
 
 afterAll(async () => {
   await shutdownBrowserWorkspace()
-  __resetKeyCacheForTests()
+  await resetAll()
 })
 
 async function fakeProfileId(name = 'P'): Promise<ProfileId> {

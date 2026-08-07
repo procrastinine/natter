@@ -291,7 +291,7 @@ export const TEST_GUARANTEE_CLAIMS = Object.freeze([
       },
       {
         path: 'playwright.config.ts',
-        locator: '${packageManagerCommand} fake-provider',
+        locator: '$' + '{packageManagerCommand} fake-provider',
       },
       {
         path: 'tests/e2e/production-startup.spec.ts',
@@ -348,16 +348,16 @@ export const TEST_GUARANTEE_CLAIMS = Object.freeze([
     ],
   },
   {
-    id: 'middle-click-new-chat-first-activation',
+    id: 'background-new-chat-first-activation',
     status: 'covered',
     requiredProofKinds: ['browser', 'multi-tab'],
     rationale:
-      'A browser journey middle-clicks the New chat anchor, preserves the source tab, activates the background tab, and proves its first foreground gesture.',
+      'A browser journey verifies the New chat anchor, preserves the source tab while the new surface starts in a background tab, activates it, and proves its first foreground gesture.',
     evidence: [
       {
         path: 'tests/e2e/sidebar.spec.ts',
         locator:
-          "test('middle-click New chat preserves the source tab and the first foreground gesture'",
+          "test('background New chat startup preserves the source tab and the first foreground gesture'",
       },
     ],
   },

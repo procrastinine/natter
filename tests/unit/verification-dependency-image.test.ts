@@ -24,6 +24,7 @@ import {
   installVerificationDependencyFacade,
   prepareVerificationDependencyImage,
   readVerificationDependencyImage,
+  resolvePnpmLauncherTarget,
   resolveVerificationDependencyRuntime,
   type VerificationDependencyImage,
   type VerificationDependencyProcessInvocation,
@@ -33,6 +34,8 @@ import {
 
 const roots: string[] = []
 const images: VerificationDependencyImage[] = []
+const PNPM_ACTION_SETUP_REVISION = '0977fd99725f1db4007ccb2928dbb4e90d06cc86'
+const PNPM_ACTION_BOOTSTRAP_VERSION = '11.19.0'
 const repositoryPackage = JSON.parse(readFileSync(resolve('package.json'), 'utf8')) as {
   packageManager: string
   engines: { node: string }
@@ -69,6 +72,65 @@ afterEach(() => {
 })
 
 describe('verification dependency image', () => {
+  it('follows the pinned action self-update shim to the invoked pnpm package', () => {
+    const root = mkdtempSync(resolve(tmpdir(), 'natter-pnpm-action-runtime-'))
+    roots.push(root)
+    const targetVersion = repositoryPackage.packageManager.replace(/^pnpm@/u, '')
+    const launcher = resolve(root, 'setup-pnpm/node_modules/.bin/pnpm')
+    const bootstrapPackageJson = resolve(root, 'setup-pnpm/node_modules/pnpm/package.json')
+    const targetPackageJson = resolve(
+      root,
+      `pnpm-home/.tools/pnpm/${targetVersion}/node_modules/pnpm/package.json`,
+    )
+    const target = resolve(
+      root,
+      `pnpm-home/.tools/pnpm/${targetVersion}/node_modules/pnpm/bin/pnpm.mjs`,
+    )
+    write(
+      root,
+      'setup-pnpm/node_modules/pnpm/package.json',
+      `${JSON.stringify({
+        name: 'pnpm',
+        version: PNPM_ACTION_BOOTSTRAP_VERSION,
+        main: 'package.json',
+        bin: { pnpm: 'bin/pnpm.cjs' },
+      })}\n`,
+    )
+    write(root, 'setup-pnpm/node_modules/pnpm/bin/pnpm.cjs', '#!/usr/bin/env node\n')
+    write(
+      root,
+      `pnpm-home/.tools/pnpm/${targetVersion}/node_modules/pnpm/package.json`,
+      `${JSON.stringify({ name: 'pnpm', version: targetVersion, bin: { pnpm: 'bin/pnpm.mjs' } })}\n`,
+    )
+    write(
+      root,
+      `pnpm-home/.tools/pnpm/${targetVersion}/node_modules/pnpm/bin/pnpm.mjs`,
+      '#!/usr/bin/env node\n',
+    )
+    write(root, 'setup-pnpm/node_modules/.bin/pnpm', `#!/bin/sh\n# cmd-shim-target=${target}\n`)
+
+    expect(readFileSync(resolve('.github/workflows/verify.yml'), 'utf8')).toContain(
+      `pnpm/action-setup@${PNPM_ACTION_SETUP_REVISION}`,
+    )
+    expect(findPnpmPackageJson(launcher)).toBe(bootstrapPackageJson)
+    const resolvedTarget = resolvePnpmLauncherTarget(launcher)
+    expect(resolvedTarget).toBe(target)
+    expect(findPnpmPackageJson(resolvedTarget)).toBe(targetPackageJson)
+  })
+
+  it('rejects cyclic command-shim targets instead of guessing a runtime', () => {
+    const root = mkdtempSync(resolve(tmpdir(), 'natter-pnpm-action-cycle-'))
+    roots.push(root)
+    const first = resolve(root, 'first')
+    const second = resolve(root, 'second')
+    write(root, 'first', `#!/bin/sh\n# cmd-shim-target=${second}\n`)
+    write(root, 'second', `#!/bin/sh\n# cmd-shim-target=${first}\n`)
+
+    expect(() => resolvePnpmLauncherTarget(first)).toThrow(
+      'VerificationDependencyPnpmLauncherCycle',
+    )
+  })
+
   it('resolves pnpm metadata beside a content-addressed store-link launcher', () => {
     const root = mkdtempSync(resolve(tmpdir(), 'natter-pnpm-runtime-'))
     roots.push(root)

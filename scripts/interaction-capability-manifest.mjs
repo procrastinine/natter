@@ -17,12 +17,12 @@ export const INTERACTION_EFFECT_KINDS = Object.freeze([
 
 export const INTERACTION_REVIEW_BASELINE = Object.freeze({
   schemaVersion: 5,
-  exactSiteCount: 838,
+  exactSiteCount: 840,
   sourceCount: 59,
-  exactSiteIdSha256: '4251162a8d645ba783caa4ddc9ec74a6cab3dd8461734a76698c4905f98ee916',
-  sourceFactSha256: '331629c73b4e3fa2fdc0bdd4bcc0406290fda8ee4dcf8cc49b03a582ee41e445',
+  exactSiteIdSha256: '785076bd23c5aa109b451b7e229cbba2114532e6df80ffb9e9bd57f40ab29b27',
+  sourceFactSha256: '0e78f4c6268d40a69114bc9c6b2a0b9e9920588b47159671ef37a78f401664d9',
   presentationDefinitionSha256: '149f270b61a932f0ff2c6459725df46c9abc50fc7b9e793436e6b388d0a3b767',
-  interactionOutcomeSha256: 'fc90e4de5f29b8001d08a6650c5cfc92b41da56dd2c03d7e5cfc30d14c47938f',
+  interactionOutcomeSha256: '78e88eeb1cab4c6bd88926c3757a848e476605fae5e76731413252ed59ce96b6',
   disposition:
     'Any source interaction or analyzed handler-fact drift reopens classification review before the baseline may be updated.',
 })
@@ -421,7 +421,7 @@ export const INTERACTION_OUTCOME_CONTRACTS = Object.freeze([
         path: 'tests/e2e/scroll.spec.ts',
         testLocator:
           "test('streaming text keeps the scroll region in follow state; scrolling up flips to pinned with a Jump chip'",
-        assertionLocator: 'await expect(jumpChip).toBeVisible()',
+        assertionLocator: 'await expect(jumpChip).toBeVisible()\n  await uiJourney.intent(page, {',
       }),
     ]),
   }),

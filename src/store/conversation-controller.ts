@@ -131,7 +131,6 @@ interface ConversationOperationClaimBase {
   readonly id: string
   readonly chatId: ChatId
   readonly workspaceId: string
-  readonly workspaceEpoch: number
   readonly selectionRevision: number
 }
 
@@ -332,6 +331,7 @@ interface TranscriptPresentationPlan {
   readonly selectionRevision: number
   readonly selectionEpoch: number
   readonly pathIdentity: object
+  readonly viewportDemanded: boolean
   readonly demandBudget: TranscriptWorkBudget
   readonly budget: TranscriptWorkBudget
   readonly span: BranchPathSpan
@@ -405,6 +405,7 @@ export interface TranscriptDemand {
 
 interface TranscriptDemandPlan extends TranscriptDemand {
   readonly residency: 'monotonic' | 'settled'
+  readonly viewportDemanded: boolean
 }
 
 interface TranscriptRetention {
@@ -1084,6 +1085,7 @@ export interface ConversationController {
     revealTargetMessageId?: MessageId
   }): void
   consumePresentationReveal(effectId: string, surface: ConversationSurface): void
+  supersedePresentationReveal(surface: ConversationSurface): void
 }
 
 export interface ConversationTargetPresentationPort {
@@ -1897,18 +1899,19 @@ class TabConversationController implements ConversationController {
       const suppliedMember = evidence.upserts.find((member) => member.id === selected.id)
       if (evidence.mode === 'replace' && !suppliedMember) continue
       const current = spine.forkFor(selected.id)
-      if (!suppliedMember && !current) continue
-      const member =
-        suppliedMember ??
-        Object.freeze({
+      let member = suppliedMember
+      if (!member) {
+        if (!current) continue
+        member = Object.freeze({
           id: selected.id,
           chatId: state.chatId,
           parentId: state.parentId,
           parentKey: state.id,
-          position: current!.position,
-          previousMessageId: current!.previousMessageId,
-          nextMessageId: current!.nextMessageId,
+          position: current.position,
+          previousMessageId: current.previousMessageId,
+          nextMessageId: current.nextMessageId,
         })
+      }
       if (
         state.liveCount < 1 ||
         state.firstLiveChildId === null ||
@@ -2076,8 +2079,10 @@ class TabConversationController implements ConversationController {
     this.observationRevision += 1
     this.cancelAllReads()
     if (!sameLogicalWorkspace) this.sessions.clear()
-    this.operationClaims.clear()
-    this.operationClaimCountsByChat.clear()
+    if (!sameLogicalWorkspace) {
+      this.operationClaims.clear()
+      this.operationClaimCountsByChat.clear()
+    }
     if (sameLogicalWorkspace) {
       for (const [owner, retention] of this.transcriptRetentions) {
         this.transcriptRetentions.set(owner, {
@@ -2362,6 +2367,14 @@ class TabConversationController implements ConversationController {
     this.publish()
   }
 
+  supersedePresentationReveal(surface: ConversationSurface): void {
+    const active = this.active
+    const session = this.activeSession()
+    if (!active?.reveal || !session || session.presentationRequest.surface !== surface) return
+    active.reveal = null
+    this.publish()
+  }
+
   private installReveal(chatId: ChatId, session: ChatSession, targetMessageId: MessageId): void {
     if (this.activeChatId === chatId && this.active?.chatId === chatId) {
       this.active.reveal = Object.freeze({
@@ -2464,7 +2477,6 @@ class TabConversationController implements ConversationController {
       id: newId(),
       chatId: input.chatId,
       workspaceId: this.workspaceId,
-      workspaceEpoch: this.workspaceEpoch,
       selectionRevision: session.selectionRevision,
       steering: input.steering,
       ...(input.steering === 'select-result'
@@ -2495,11 +2507,7 @@ class TabConversationController implements ConversationController {
   }
 
   private operationClaimIsRetained(claim: ConversationOperationClaim): boolean {
-    return (
-      this.operationClaims.get(claim.id) === claim &&
-      claim.workspaceId === this.workspaceId &&
-      claim.workspaceEpoch === this.workspaceEpoch
-    )
+    return this.operationClaims.get(claim.id) === claim && claim.workspaceId === this.workspaceId
   }
 
   private createPromptPathFrame(
@@ -3223,9 +3231,9 @@ class TabConversationController implements ConversationController {
       const relation = current
         ? classifyMessageHeaderRevision(revision.header, current)
         : 'structural-newer'
-      if (relation === 'invalid-regression' || relation === 'version-collision') {
+      if (current && (relation === 'invalid-regression' || relation === 'version-collision')) {
         throw new Error(
-          `ConversationMessageRevisionInvariant:${revision.header.id}:${relation}:${differingMessageHeaderFields(revision.header, current!).join(',')}`,
+          `ConversationMessageRevisionInvariant:${revision.header.id}:${relation}:${differingMessageHeaderFields(revision.header, current).join(',')}`,
         )
       }
       if (
@@ -4414,14 +4422,7 @@ class TabConversationController implements ConversationController {
     const baseDemand = active && session ? this.currentTranscriptDemand(active, session) : null
     const spine = this.activeSpine()
     const path = spine?.path
-    if (
-      !active ||
-      !active.chat ||
-      !baseDemand ||
-      !spine ||
-      !path ||
-      active.destination.kind !== 'ready'
-    ) {
+    if (!active?.chat || !baseDemand || !spine || !path || active.destination.kind !== 'ready') {
       this.cancelRead('transcript')
       if (active) active.transcriptFill = null
       if (active && !baseDemand) {
@@ -4432,8 +4433,11 @@ class TabConversationController implements ConversationController {
     }
     const plan = this.acceptTranscriptPlan(active, baseDemand, path)
     if (path.length === 0) {
-      const empty = emptyTranscriptBodyWindow(active.chatId, path)
-      active.transcript = readyTranscriptState(active.transcript.selectionEpoch, empty)
+      const current = readyTranscriptWindow(active.transcript)
+      if (!current || !transcriptBodyWindowMatchesPath(current, path)) {
+        const empty = emptyTranscriptBodyWindow(active.chatId, path)
+        active.transcript = readyTranscriptState(active.transcript.selectionEpoch, empty)
+      }
       active.transcriptFill = null
       this.cancelRead('transcript')
       return projectionChanged()
@@ -4754,7 +4758,7 @@ class TabConversationController implements ConversationController {
             !refreshed ||
             page.headers.some((header) => {
               const row = transcriptBodyWindowFindRow(refreshed, header.id)
-              return !row || !row.bodyExact || row.bodyVersion !== header.bodyVersion
+              return !row?.bodyExact || row.bodyVersion !== header.bodyVersion
             })
           ) {
             this.reconcileReadConflict(
@@ -4839,6 +4843,7 @@ class TabConversationController implements ConversationController {
       if (
         budget === current.budget &&
         sameTranscriptWorkBudget(base.budget, current.demandBudget) &&
+        base.viewportDemanded === current.viewportDemanded &&
         residentFloorOffset === current.residentFloorOffset &&
         sameBranchPathSpan(span, current.span)
       ) {
@@ -4846,6 +4851,7 @@ class TabConversationController implements ConversationController {
       }
       const accepted = Object.freeze({
         ...current,
+        viewportDemanded: base.viewportDemanded,
         demandBudget: base.budget,
         budget,
         span,
@@ -4869,6 +4875,7 @@ class TabConversationController implements ConversationController {
       selectionRevision: base.selectionRevision,
       selectionEpoch: base.selectionEpoch,
       pathIdentity: path.identity,
+      viewportDemanded: base.viewportDemanded,
       demandBudget: base.budget,
       budget: base.budget,
       span,
@@ -4923,17 +4930,32 @@ class TabConversationController implements ConversationController {
       session.selectionRevision,
       active.transcript.selectionEpoch,
     )
+    const paintedBinding = this.paintedFrame?.binding
+    const retainedTranscriptDemand =
+      paintedBinding?.surface === 'transcript' &&
+      paintedBinding.seal.workspaceId === this.workspaceId &&
+      paintedBinding.seal.chatId === active.chatId &&
+      (paintedBinding.seal.replacementEpoch !== this.workspaceEpoch ||
+        paintedBinding.selectionEpoch !== active.transcript.selectionEpoch)
+    const viewportDemanded =
+      explicit !== null ||
+      active.transcriptPlan?.viewportDemanded === true ||
+      retainedTranscriptDemand
     if (!this.presentationOwnsSurfaceWork(active, session, 'transcript')) {
-      return explicit ? Object.freeze({ ...explicit, residency: 'monotonic' }) : null
+      return explicit
+        ? Object.freeze({ ...explicit, residency: 'monotonic', viewportDemanded })
+        : null
     }
+    const settledBudget = viewportDemanded
+      ? this.settledTranscriptBudget
+      : transcriptRowFloorBudget(1)
     return {
       chatId: active.chatId,
       selectionRevision: session.selectionRevision,
       selectionEpoch: active.transcript.selectionEpoch,
       residency: explicit ? 'monotonic' : 'settled',
-      budget: explicit
-        ? maxTranscriptWorkBudget(this.settledTranscriptBudget, explicit.budget)
-        : this.settledTranscriptBudget,
+      viewportDemanded,
+      budget: explicit ? maxTranscriptWorkBudget(settledBudget, explicit.budget) : settledBudget,
     }
   }
 

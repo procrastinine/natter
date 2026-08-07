@@ -172,9 +172,15 @@ function reportLocalCommitProjectionFailure(
     console.error('Workspace local commit projection failed', {
       owner,
       commandKind,
+      code: internalDiagnosticCode(error),
       error: redactDiagnosticValue(error),
     })
   } catch {
     // Diagnostics cannot alter the result of an authoritative commit.
   }
+}
+
+function internalDiagnosticCode(error: unknown): string {
+  if (!(error instanceof Error)) return 'NonErrorFailure'
+  return error.message.split(':', 1)[0] || error.name
 }

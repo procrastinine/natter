@@ -225,9 +225,12 @@ export function ConnectionHeader({
   } | null>(null)
   const [deleteReassignTo, setDeleteReassignTo] = useState<ProfileId | null>(null)
   const [deleteError, setDeleteError] = useState<string | null>(null)
+  const [profileSwitchPendingId, setProfileSwitchPendingId] = useState<ProfileId | null>(null)
+  const [profileSwitchError, setProfileSwitchError] = useState<string | null>(null)
   const detailId = `connection-title-detail-${useId().replace(/:/g, '')}`
   const titleEntryRef = useRef<HTMLDivElement | null>(null)
   const probeRunRef = useRef(0)
+  const profileSwitchRunRef = useRef(0)
   const hasConnection = state.profile !== null
   const connectionsKnownMissing = activeSeed.frame.shell?.totalProfileCount === 0
   const selectedProfileId = currentSurfaceSelection?.value.profile?.id ?? null
@@ -327,17 +330,16 @@ export function ConnectionHeader({
     async (id: ProfileId, seed?: ActiveConfigurationSeed) => {
       const intent = configurationController.claimIntent()
       if (activeChatId) {
-        await configurationApplication.switchChatProfile({
+        return configurationApplication.switchChatProfile({
           chatId: activeChatId,
           profileId: id,
           isCurrent: () => configurationController.intentIsCurrent(intent),
         })
-        return
       }
-      if (!configurationController.intentIsCurrent(intent)) return
+      if (!configurationController.intentIsCurrent(intent)) return null
       if (seed) configurationController.rememberSeed(seed)
       else configurationController.rememberProfile(id)
-      await configurationApplication.execute({
+      return configurationApplication.execute({
         kind: 'connection.touch',
         profileId: id,
         now: Date.now(),
@@ -348,14 +350,29 @@ export function ConnectionHeader({
 
   const switchProfile = useCallback(
     async (id: ProfileId) => {
+      const run = ++profileSwitchRunRef.current
+      setProfileSwitchPendingId(id)
+      setProfileSwitchError(null)
       if (id !== selectedProfileId) {
         setEditing(false)
         resetProbeState()
         setDeleteConfirmOpen(false)
       }
-      await activateProfile(id)
+      try {
+        const result = await activateProfile(id)
+        if (profileSwitchRunRef.current !== run) return
+        if (activeChatId && result?.kind !== 'chat-updated') {
+          setProfileSwitchError('Connection switch was not applied. Nothing was changed.')
+        }
+      } catch {
+        if (profileSwitchRunRef.current === run) {
+          setProfileSwitchError('Connection switch failed. Nothing was changed.')
+        }
+      } finally {
+        if (profileSwitchRunRef.current === run) setProfileSwitchPendingId(null)
+      }
     },
-    [activateProfile, resetProbeState, selectedProfileId],
+    [activateProfile, activeChatId, resetProbeState, selectedProfileId],
   )
 
   const applySaveResult = useCallback(
@@ -514,13 +531,15 @@ export function ConnectionHeader({
     <div data-ui="connection-detail" id={detailId}>
       <ProfileSwitcher
         profiles={profiles}
-        activeId={profile.id}
+        activeId={profileSwitchPendingId ?? profile.id}
         hasPrevious={Boolean(profileCatalog?.page.previousCursor)}
         hasMore={Boolean(profileCatalog?.page.nextCursor)}
         onLoadPrevious={profileCatalogResult.demandBefore}
         onLoadMore={profileCatalogResult.demandAfter}
         onSwitch={switchProfile}
         onCreateNew={() => setSetupOpen(true)}
+        pending={profileSwitchPendingId !== null}
+        error={profileSwitchError}
       />
       {editing ? (
         <ConnectionEditor
@@ -770,6 +789,8 @@ interface ProfileSwitcherProps {
   onLoadMore: () => void
   onSwitch: (id: ProfileId) => void | Promise<void>
   onCreateNew: () => void
+  pending: boolean
+  error: string | null
 }
 
 const LOAD_MORE_PROFILES_VALUE = '__natter_load_more_profiles__'
@@ -784,6 +805,8 @@ function ProfileSwitcher({
   onLoadMore,
   onSwitch,
   onCreateNew,
+  pending,
+  error,
 }: ProfileSwitcherProps) {
   return (
     <div data-ui="connection-switcher">
@@ -792,6 +815,8 @@ function ProfileSwitcher({
         id="connection-profile-select"
         data-ui="connection-profile-select"
         value={activeId}
+        aria-busy={pending}
+        data-state={pending ? 'pending' : 'settled'}
         onChange={(event) => {
           if (event.target.value === LOAD_PREVIOUS_PROFILES_VALUE) {
             onLoadPrevious()
@@ -824,6 +849,11 @@ function ProfileSwitcher({
       >
         +
       </Button>
+      {error ? (
+        <span data-ui="connection-switch-error" role="alert">
+          {error}
+        </span>
+      ) : null}
     </div>
   )
 }

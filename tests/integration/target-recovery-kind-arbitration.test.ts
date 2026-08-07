@@ -242,82 +242,82 @@ describe('target recovery kind arbitration', () => {
     expect(await streamFrames(lease.streamId)).toEqual([])
   })
 
-  it.each([
-    'generation',
-    'continuation',
-  ] as const)('reuses a sealed %s decision and ignores journal rows beyond its receipt', async (attemptKind) => {
-    const { chatId, target } = await seedAssistant(`sealed-${attemptKind}`)
-    const header = required(await messageHeader(target.id), 'target header')
-    const finishedAt = STARTED_AT + 10
-    const terminal = {
-      version: 1 as const,
-      finishedAt,
-      journalMaxSeq: 0,
-      journalCompleteness: 'settled' as const,
-      decision: { outcome: 'done' as const, finishReason: 'stop' },
-    }
-    const lease = await insertLease(
-      attemptKind === 'generation'
-        ? {
-            streamId: 'sealed-generation-recovery',
-            chatId,
-            messageId: target.id,
-            attemptKind,
-            phase: 'terminal-decided',
-            journalMaxSeq: 0,
-            terminal,
-            stopControl: {
-              requestId: `stop-sealed-${attemptKind}`,
-              requestedBy: 'stranded-tab',
-              requestedAt: finishedAt + 1,
-              reason: 'user',
+  it.each(['generation', 'continuation'] as const)(
+    'reuses a sealed %s decision and ignores journal rows beyond its receipt',
+    async (attemptKind) => {
+      const { chatId, target } = await seedAssistant(`sealed-${attemptKind}`)
+      const header = required(await messageHeader(target.id), 'target header')
+      const finishedAt = STARTED_AT + 10
+      const terminal = {
+        version: 1 as const,
+        finishedAt,
+        journalMaxSeq: 0,
+        journalCompleteness: 'settled' as const,
+        decision: { outcome: 'done' as const, finishReason: 'stop' },
+      }
+      const lease = await insertLease(
+        attemptKind === 'generation'
+          ? {
+              streamId: 'sealed-generation-recovery',
+              chatId,
+              messageId: target.id,
+              attemptKind,
+              phase: 'terminal-decided',
+              journalMaxSeq: 0,
+              terminal,
+              stopControl: {
+                requestId: `stop-sealed-${attemptKind}`,
+                requestedBy: 'stranded-tab',
+                requestedAt: finishedAt + 1,
+                reason: 'user',
+              },
+              controlRevision: 1,
+              targetCommittedAt: STARTED_AT + 1,
+              requestedModel: settings().model,
+              apiUsed: 'chat',
+            }
+          : {
+              streamId: 'sealed-continuation-recovery',
+              chatId,
+              messageId: target.id,
+              attemptKind,
+              phase: 'terminal-decided',
+              journalMaxSeq: 0,
+              terminal,
+              stopControl: {
+                requestId: `stop-sealed-${attemptKind}`,
+                requestedBy: 'stranded-tab',
+                requestedAt: finishedAt + 1,
+                reason: 'user',
+              },
+              controlRevision: 1,
+              targetCommittedAt: STARTED_AT + 1,
+              continuationStrategy: 'prompt',
+              baseNodeVersion: header.nodeVersion,
+              baseBodyVersion: header.bodyVersion,
+              requestedModel: settings().model,
+              apiUsed: 'chat',
             },
-            controlRevision: 1,
-            targetCommittedAt: STARTED_AT + 1,
-            requestedModel: settings().model,
-            apiUsed: 'chat',
-          }
-        : {
-            streamId: 'sealed-continuation-recovery',
-            chatId,
-            messageId: target.id,
-            attemptKind,
-            phase: 'terminal-decided',
-            journalMaxSeq: 0,
-            terminal,
-            stopControl: {
-              requestId: `stop-sealed-${attemptKind}`,
-              requestedBy: 'stranded-tab',
-              requestedAt: finishedAt + 1,
-              reason: 'user',
-            },
-            controlRevision: 1,
-            targetCommittedAt: STARTED_AT + 1,
-            continuationStrategy: 'prompt',
-            baseNodeVersion: header.nodeVersion,
-            baseBodyVersion: header.bodyVersion,
-            requestedModel: settings().model,
-            apiUsed: 'chat',
-          },
-    )
-    await putStreamTextFrames(lease, ['-sealed', '-must-not-replay'])
+      )
+      await putStreamTextFrames(lease, ['-sealed', '-must-not-replay'])
 
-    await expect(recoverStreamOrphan({ streamId: lease.streamId }, RECOVERY_AT)).resolves.toBe(
-      'recovered',
-    )
+      await expect(recoverStreamOrphan({ streamId: lease.streamId }, RECOVERY_AT)).resolves.toBe(
+        'recovered',
+      )
 
-    const recovered = required(await message(target.id), 'recovered target')
-    expect(recovered.content).toEqual([{ type: 'output_text', text: 'original-sealed' }])
-    if (attemptKind === 'generation') {
-      expect(recovered.generation).toMatchObject({ status: 'done', finishedAt })
-    } else {
-      expect(recovered.continuationAttempts).toEqual([
-        expect.objectContaining({ status: 'done', finishedAt }),
-      ])
-    }
-    expect(await streamLease(lease.streamId)).toBeUndefined()
-    expect(await streamFrames(lease.streamId)).toEqual([])
-  })
+      const recovered = required(await message(target.id), 'recovered target')
+      expect(recovered.content).toEqual([{ type: 'output_text', text: 'original-sealed' }])
+      if (attemptKind === 'generation') {
+        expect(recovered.generation).toMatchObject({ status: 'done', finishedAt })
+      } else {
+        expect(recovered.continuationAttempts).toEqual([
+          expect.objectContaining({ status: 'done', finishedAt }),
+        ])
+      }
+      expect(await streamLease(lease.streamId)).toBeUndefined()
+      expect(await streamFrames(lease.streamId)).toEqual([])
+    },
+  )
 
   it('enforces one durable attempt per target before recovery has to arbitrate kinds', async () => {
     const { chatId, target } = await seedAssistant('unique-target')

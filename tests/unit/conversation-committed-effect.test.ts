@@ -753,147 +753,154 @@ it.each([
     expectedBodyVersion: 1,
     expectedExact: false,
   },
-])('reduces pending route knowledge causally: $name', ({
-  order,
-  expectedText,
-  expectedBodyVersion,
-  expectedExact,
-}) => {
-  const root = presentation(message('route-root', null, 0, 'user', 'root', 1))
-  const originalTipMessage = message('route-tip', root.header.id, 0, 'assistant', 'original tip', 2)
-  const originalTip = presentation(originalTipMessage)
-  const updatedTip = (() => {
-    const next = {
-      ...originalTipMessage,
-      content: [{ type: 'output_text' as const, text: 'updated tip' }],
-      nodeVersion: 1,
-    }
-    const { header } = splitMessageForStorage(next, { bodyVersion: 2 })
-    return Object.freeze({ header, message: next, bodyVersion: 2 })
-  })()
-  const selected = destination(
-    fixedConversationSelectionTarget(
-      { kind: 'tip', messageId: originalTip.header.id },
-      originalTip.header.id,
-    ),
-    1,
-    [root, originalTip],
-  )
-  const exactEffect: ConversationCommittedEffect = Object.freeze({
-    ...FENCE,
-    chatId: CHAT_ID,
-    source: 'local',
-    kind: 'changed',
-    structural: NO_STRUCTURAL_TRANSITION,
-    revisions: Object.freeze([
-      Object.freeze({
-        header: updatedTip.header,
-        structuralVersion: 1,
-        presentation: updatedTip,
-      }),
-    ]),
-  })
-  const invalidationEffect: ConversationCommittedEffect = Object.freeze({
-    ...FENCE,
-    chatId: CHAT_ID,
-    source: 'invalidation',
-    kind: 'changed',
-    structural: NO_STRUCTURAL_TRANSITION,
-    refresh: Object.freeze({ bodies: Object.freeze([originalTip.header.id]) }),
-  })
-  const headerOnlyEffect: ConversationCommittedEffect = Object.freeze({
-    ...FENCE,
-    chatId: CHAT_ID,
-    source: 'remote',
-    kind: 'changed',
-    structural: NO_STRUCTURAL_TRANSITION,
-    revisions: Object.freeze([Object.freeze({ header: updatedTip.header, structuralVersion: 1 })]),
-  })
-
-  let publicationCount = 0
-  const readStarts: Array<{ readonly kind: string; readonly publicationCount: number }> = []
-  const pendingRead = (kind: string): Promise<never> => {
-    readStarts.push({ kind, publicationCount })
-    return new Promise<never>(() => {})
-  }
-  const source = {
-    loadChat: vi.fn(async () => pendingRead('chat')),
-    openSelection: vi.fn(async () => pendingRead('selection')),
-    loadForks: vi.fn(async () => pendingRead('forks')),
-    loadChildAtPosition: vi.fn(async () => pendingRead('child-position')),
-    loadTopology: vi.fn(async () => pendingRead('topology')),
-    loadTranscriptPage: vi.fn(async () => pendingRead('transcript')),
-    loadInspector: vi.fn(async () => pendingRead('inspector')),
-    loadPreviews: vi.fn(async () => pendingRead('previews')),
-  } satisfies ConversationProjectionSource
-  const navigation = new NavigationPort()
-  const controller = createConversationController()
-  controller.reconcileWorkspace(FENCE)
-  controller.setProjectionSource(source)
-  controller.setNavigationPort(navigation)
-  const claim = controller.claimOperation({
-    chatId: CHAT_ID,
-    steering: 'select-result',
-    selectionDelivery: 'route-handoff',
-    routeOwner: createConversationRouteOwnerController().owner,
-  })
-  const receipt = controller.acceptLocalResult(claim, {
-    kind: 'select-committed',
-    receipt: Object.freeze({ ...FENCE, destination: selected }),
-    committedEffect: Object.freeze({
+])(
+  'reduces pending route knowledge causally: $name',
+  ({ order, expectedText, expectedBodyVersion, expectedExact }) => {
+    const root = presentation(message('route-root', null, 0, 'user', 'root', 1))
+    const originalTipMessage = message(
+      'route-tip',
+      root.header.id,
+      0,
+      'assistant',
+      'original tip',
+      2,
+    )
+    const originalTip = presentation(originalTipMessage)
+    const updatedTip = (() => {
+      const next = {
+        ...originalTipMessage,
+        content: [{ type: 'output_text' as const, text: 'updated tip' }],
+        nodeVersion: 1,
+      }
+      const { header } = splitMessageForStorage(next, { bodyVersion: 2 })
+      return Object.freeze({ header, message: next, bodyVersion: 2 })
+    })()
+    const selected = destination(
+      fixedConversationSelectionTarget(
+        { kind: 'tip', messageId: originalTip.header.id },
+        originalTip.header.id,
+      ),
+      1,
+      [root, originalTip],
+    )
+    const exactEffect: ConversationCommittedEffect = Object.freeze({
       ...FENCE,
       chatId: CHAT_ID,
       source: 'local',
       kind: 'changed',
       structural: NO_STRUCTURAL_TRANSITION,
-    }),
-  })
-  if (!receipt.accepted) {
-    throw new Error('expected a pending route handoff')
-  }
-  if (receipt.routeDelivery.kind !== 'handoff') {
-    throw new Error('expected a live route handoff')
-  }
-  if (order === 'exact-then-invalidation') {
-    controller.applyCommittedEffects([exactEffect, invalidationEffect])
-  } else if (order === 'invalidation-then-exact') {
-    controller.applyCommittedEffects([invalidationEffect, exactEffect])
-  } else {
-    controller.applyCommittedEffect(headerOnlyEffect)
-  }
+      revisions: Object.freeze([
+        Object.freeze({
+          header: updatedTip.header,
+          structuralVersion: 1,
+          presentation: updatedTip,
+        }),
+      ]),
+    })
+    const invalidationEffect: ConversationCommittedEffect = Object.freeze({
+      ...FENCE,
+      chatId: CHAT_ID,
+      source: 'invalidation',
+      kind: 'changed',
+      structural: NO_STRUCTURAL_TRANSITION,
+      refresh: Object.freeze({ bodies: Object.freeze([originalTip.header.id]) }),
+    })
+    const headerOnlyEffect: ConversationCommittedEffect = Object.freeze({
+      ...FENCE,
+      chatId: CHAT_ID,
+      source: 'remote',
+      kind: 'changed',
+      structural: NO_STRUCTURAL_TRANSITION,
+      revisions: Object.freeze([
+        Object.freeze({ header: updatedTip.header, structuralVersion: 1 }),
+      ]),
+    })
 
-  const snapshots: ReturnType<typeof controller.getSnapshot>[] = []
-  controller.subscribe(() => {
-    publicationCount += 1
-    snapshots.push(controller.getSnapshot())
-  })
-  navigation.open(CHAT_ID, receipt.routeDelivery.handoff)
+    let publicationCount = 0
+    const readStarts: Array<{ readonly kind: string; readonly publicationCount: number }> = []
+    const pendingRead = (kind: string): Promise<never> => {
+      readStarts.push({ kind, publicationCount })
+      return new Promise<never>(() => {})
+    }
+    const source = {
+      loadChat: vi.fn(async () => pendingRead('chat')),
+      openSelection: vi.fn(async () => pendingRead('selection')),
+      loadForks: vi.fn(async () => pendingRead('forks')),
+      loadChildAtPosition: vi.fn(async () => pendingRead('child-position')),
+      loadTopology: vi.fn(async () => pendingRead('topology')),
+      loadTranscriptPage: vi.fn(async () => pendingRead('transcript')),
+      loadInspector: vi.fn(async () => pendingRead('inspector')),
+      loadPreviews: vi.fn(async () => pendingRead('previews')),
+    } satisfies ConversationProjectionSource
+    const navigation = new NavigationPort()
+    const controller = createConversationController()
+    controller.reconcileWorkspace(FENCE)
+    controller.setProjectionSource(source)
+    controller.setNavigationPort(navigation)
+    const claim = controller.claimOperation({
+      chatId: CHAT_ID,
+      steering: 'select-result',
+      selectionDelivery: 'route-handoff',
+      routeOwner: createConversationRouteOwnerController().owner,
+    })
+    const receipt = controller.acceptLocalResult(claim, {
+      kind: 'select-committed',
+      receipt: Object.freeze({ ...FENCE, destination: selected }),
+      committedEffect: Object.freeze({
+        ...FENCE,
+        chatId: CHAT_ID,
+        source: 'local',
+        kind: 'changed',
+        structural: NO_STRUCTURAL_TRANSITION,
+      }),
+    })
+    if (!receipt.accepted) {
+      throw new Error('expected a pending route handoff')
+    }
+    if (receipt.routeDelivery.kind !== 'handoff') {
+      throw new Error('expected a live route handoff')
+    }
+    if (order === 'exact-then-invalidation') {
+      controller.applyCommittedEffects([exactEffect, invalidationEffect])
+    } else if (order === 'invalidation-then-exact') {
+      controller.applyCommittedEffects([invalidationEffect, exactEffect])
+    } else {
+      controller.applyCommittedEffect(headerOnlyEffect)
+    }
 
-  expect(publicationCount).toBeGreaterThanOrEqual(1)
-  expect(readStarts.length).toBeGreaterThan(0)
-  const privateFrameReads = readStarts.filter((read) => read.publicationCount === 0)
-  const residualReads = readStarts.filter((read) => read.publicationCount >= 1)
-  expect(privateFrameReads).toEqual([{ kind: 'transcript', publicationCount: 0 }])
-  expect(residualReads.length).toBeGreaterThan(0)
-  expect(residualReads.every((read) => read.publicationCount >= 1)).toBe(true)
-  expect(residualReads.some((read) => read.kind === 'forks')).toBe(true)
-  expect(source.openSelection).not.toHaveBeenCalled()
-  expect(source.loadChat).not.toHaveBeenCalled()
-  const active = snapshots[0]?.active
-  expect(active?.destination.kind).toBe('ready')
-  if (active?.destination.kind !== 'ready' || active.transcript.kind === 'absent') {
-    throw new Error('expected the first publication to contain a ready transcript')
-  }
-  expect(active.chat?.structuralVersion).toBe(active.destination.spine.structuralVersion)
-  expect(active.transcript.window.pathIdentity).toBe(active.destination.spine.path.identity)
-  const row = transcriptBodyWindowFindRow(active.transcript.window, originalTip.header.id)
-  expect(row).toBeDefined()
-  const content = row?.message.content[0]
-  expect(content && 'text' in content ? content.text : null).toBe(expectedText)
-  expect(row?.bodyVersion).toBe(expectedBodyVersion)
-  expect(row?.bodyExact).toBe(expectedExact)
-  expect(active.transcript.window.staleBodyCount).toBe(expectedExact ? 0 : 1)
-})
+    const snapshots: ReturnType<typeof controller.getSnapshot>[] = []
+    controller.subscribe(() => {
+      publicationCount += 1
+      snapshots.push(controller.getSnapshot())
+    })
+    navigation.open(CHAT_ID, receipt.routeDelivery.handoff)
+
+    expect(publicationCount).toBeGreaterThanOrEqual(1)
+    expect(readStarts.length).toBeGreaterThan(0)
+    const privateFrameReads = readStarts.filter((read) => read.publicationCount === 0)
+    const residualReads = readStarts.filter((read) => read.publicationCount >= 1)
+    expect(privateFrameReads).toEqual([])
+    expect(residualReads.length).toBeGreaterThan(0)
+    expect(residualReads.every((read) => read.publicationCount >= 1)).toBe(true)
+    expect(residualReads.some((read) => read.kind === 'forks')).toBe(true)
+    expect(source.openSelection).not.toHaveBeenCalled()
+    expect(source.loadChat).not.toHaveBeenCalled()
+    const active = snapshots[0]?.active
+    expect(active?.destination.kind).toBe('ready')
+    if (active?.destination.kind !== 'ready' || active.transcript.kind === 'absent') {
+      throw new Error('expected the first publication to contain a ready transcript')
+    }
+    expect(active.chat?.structuralVersion).toBe(active.destination.spine.structuralVersion)
+    expect(active.transcript.window.pathIdentity).toBe(active.destination.spine.path.identity)
+    const row = transcriptBodyWindowFindRow(active.transcript.window, originalTip.header.id)
+    expect(row).toBeDefined()
+    const content = row?.message.content[0]
+    expect(content && 'text' in content ? content.text : null).toBe(expectedText)
+    expect(row?.bodyVersion).toBe(expectedBodyVersion)
+    expect(row?.bodyExact).toBe(expectedExact)
+    expect(active.transcript.window.staleBodyCount).toBe(expectedExact ? 0 : 1)
+  },
+)
 
 it('makes the structural transition the only topology invalidation owner', () => {
   const inserted = presentation(message('inserted', null, 0, 'user', 'inserted', 1))

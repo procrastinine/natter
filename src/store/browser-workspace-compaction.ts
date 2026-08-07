@@ -1,4 +1,4 @@
-import type { IndexableType, Table, Transaction } from 'dexie'
+import Dexie, { type IndexableType, type Table, type Transaction } from 'dexie'
 import {
   type BrowserWorkspaceCompactionAttemptClaim,
   claimBrowserWorkspaceCompactionAttempt,
@@ -225,7 +225,7 @@ async function copyBrowserWorkspace(
   }
   preactivationCheckpoint()
   await runDestinationTransaction(clearTableNames, (tx) =>
-    Promise.all(clearTableNames.map((name) => tx.table(name).clear())).then(() => undefined),
+    Dexie.Promise.all(clearTableNames.map((name) => tx.table(name).clear())).then(() => undefined),
   )
   let copiedRows = 0
   let estimatedLiveBytes = 0
@@ -234,7 +234,6 @@ async function copyBrowserWorkspace(
     const result = await copyTable(
       source,
       name,
-      destination.table<unknown, IndexableType>(name),
       runDestinationTransaction,
       signal,
       preactivationCheckpoint,
@@ -248,7 +247,6 @@ async function copyBrowserWorkspace(
 async function copyTable(
   sourceDb: NatterDb,
   tableName: PhysicalStorageTableName,
-  destination: Table<unknown, IndexableType>,
   runDestinationTransaction: DestinationTransactionRunner,
   signal: AbortSignal,
   preactivationCheckpoint: () => void,
@@ -263,16 +261,18 @@ async function copyTable(
     if (page.rows.length === 0) break
     const rows = await filterCompactionRows(sourceDb, tableName, page.rows)
     const keyPath = (
-      destination.schema.primKey as unknown as {
+      sourceDb.table(tableName).schema.primKey as unknown as {
         readonly keyPath?: string | readonly string[] | null
       }
     ).keyPath
     if (keyPath == null) {
-      throw new Error(`BrowserWorkspaceCompactionOutboundPrimaryKey:${destination.name}`)
+      throw new Error(`BrowserWorkspaceCompactionOutboundPrimaryKey:${tableName}`)
     }
     if (rows.length > 0) {
       preactivationCheckpoint()
-      await runDestinationTransaction([destination.name], () => destination.bulkPut(rows))
+      await runDestinationTransaction([tableName], (tx) =>
+        tx.table<unknown, IndexableType>(tableName).bulkPut(rows),
+      )
       copiedRows = saturatingAdd(copiedRows, rows.length)
       for (const row of rows) {
         estimatedLiveBytes = saturatingAdd(estimatedLiveBytes, estimateStoredValueBytes(row))

@@ -134,13 +134,31 @@ describe('stream profile evaluator', () => {
     const report = mutableReport()
     const preRelease = state(report, { kind: 'pre-release' }).state
     preRelease.totalMessages = 10
-    preRelease.renderedMessages = 10
+    preRelease.loadedMessages = 10
+    preRelease.mountedMessages = 10
+    preRelease.virtualized = false
     preRelease.assistantTextLengths = Array.from({ length: 5 }, () => 100_000)
 
     expect(problemCodes(evaluateStreamProfile(report))).toEqual(
       expect.arrayContaining([
         'profile.demand.branch-depth',
-        'profile.demand.visible-assistant-count',
+        'profile.demand.expanded-transcript-not-virtualized',
+      ]),
+    )
+  })
+
+  it('separates loaded branch demand from the bounded virtualized DOM window', () => {
+    const report = mutableReport()
+    const preRelease = state(report, { kind: 'pre-release' }).state
+    preRelease.loadedMessages = 19
+    preRelease.mountedMessages = 11
+    preRelease.assistantTextLengths = []
+
+    expect(problemCodes(evaluateStreamProfile(report))).toEqual(
+      expect.arrayContaining([
+        'profile.demand.expanded-transcript',
+        'profile.demand.mounted-transcript-window',
+        'profile.demand.visible-assistant-floor',
       ]),
     )
   })
@@ -329,10 +347,12 @@ function passingReport(): StreamProfileReport {
       phase,
       label: streamProfilePhaseLabel(phase),
       state: {
-        renderedMessages: preRelease ? 20 : 10,
+        mountedMessages: preRelease ? 9 : 10,
+        loadedMessages: preRelease ? 20 : 10,
+        virtualized: preRelease,
         initialRenderWork: 10,
         totalMessages: 20,
-        assistantTextLengths: Array.from({ length: preRelease ? 10 : 5 }, () => 100_000),
+        assistantTextLengths: Array.from({ length: 5 }, () => 100_000),
         transcriptVisible: !tree,
         treeVisible: tree,
         treeNodeCount: tree ? 25 : 0,

@@ -95,7 +95,12 @@ export function useActiveBranchFrame({
   const transcriptSelectionRevision = frame?.selectionRevision ?? null
   const transcriptSelectionEpoch = frame?.transcriptSelectionEpoch ?? null
   const transcriptDemand = useMemo<ConversationTranscriptDemand | null>(() => {
-    if (!transcriptOwnsViewportWork) return null
+    if (
+      !transcriptOwnsViewportWork ||
+      (transcriptBinding === null && frame?.transcript.kind !== 'point')
+    ) {
+      return null
+    }
     if (
       !activeChatId ||
       transcriptSelectionRevision === null ||
@@ -114,7 +119,9 @@ export function useActiveBranchFrame({
     baseBudget,
     transcriptSelectionEpoch,
     transcriptSelectionRevision,
+    transcriptBinding,
     transcriptOwnsViewportWork,
+    frame?.transcript.kind,
   ])
   useConversationTranscriptDemand(transcriptDemand)
   const transcriptBoundaryOffset = resolvedActiveBranchSnapshot?.offset ?? null

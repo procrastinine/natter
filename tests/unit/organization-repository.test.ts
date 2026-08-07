@@ -45,7 +45,6 @@ import {
   type ConfigurationProfileManagerStateRow,
 } from '../../src/store/configuration-profile-usage-projection'
 import { __resetDbForTests, getDb } from '../../src/store/db'
-import { exportWorkspaceBackup, restoreWorkspaceBackup } from '../../src/store/import-export'
 import {
   __setLockBackendForTests,
   type AuthoritativeCommandLockSession,
@@ -93,8 +92,6 @@ import { testStreamLeaseAdmission } from '../helpers/stream-leases'
 const DB_NAME = 'natter'
 const PROFILE_ID = 'organization-test-profile'
 const MODEL_ID = 'organization/test-model'
-
-let emptyWorkspaceBackup: Awaited<ReturnType<typeof exportWorkspaceBackup>>
 
 class BeforeFirstResourceLockBackend implements LockBackend {
   readonly kind = 'web-locks' as const
@@ -152,12 +149,13 @@ async function resetAll(): Promise<void> {
 beforeAll(async () => {
   await resetAll()
   await openBrowserWorkspace()
-  emptyWorkspaceBackup = await exportWorkspaceBackup()
 })
 
 beforeEach(async () => {
   __setLockBackendForTests(null)
-  await restoreWorkspaceBackup(emptyWorkspaceBackup, { now: 1 })
+  await shutdownBrowserWorkspace()
+  await resetAll()
+  await openBrowserWorkspace()
 })
 
 afterAll(async () => {
@@ -806,6 +804,7 @@ describe('organization repository contract', () => {
   })
 
   it('moves more than 128 selected chats with input-shaped work and no unrelated writes', async () => {
+    const diagnostic = vi.spyOn(console, 'error').mockImplementation(() => {})
     const count = 129
     const folders = Array.from({ length: count }, (_, index) => ({
       id: `move-scale-source-${String(index).padStart(3, '0')}`,
@@ -908,6 +907,7 @@ describe('organization repository contract', () => {
       value: { value: false, affectedChatIds: [] },
       delta: { facts: [], invalidations: [] },
     })
+    expect(diagnostic).not.toHaveBeenCalled()
   }, 15_000)
 
   it('rejects one stale move preflight without retrying or writing the destination', async () => {
@@ -1167,6 +1167,7 @@ describe('organization repository contract', () => {
   })
 
   it('deletes canonical archived chats even when their sidebar projection is missing', async () => {
+    const diagnostic = vi.spyOn(console, 'error').mockImplementation(() => {})
     const archived = await seedChat({ id: 'archived-missing-sidebar', archived: true })
     await getDb().chatSidebarRows.delete(archived.id)
 
@@ -1182,6 +1183,7 @@ describe('organization repository contract', () => {
       totalCount: 0,
       activeCount: 0,
     })
+    expect(diagnostic).not.toHaveBeenCalled()
   })
 
   it('uses one closure manifest for every chat-owned row and reconciles orphan edges', async () => {
@@ -1476,6 +1478,7 @@ describe('organization repository contract', () => {
   })
 
   it('bounds archive work by admitted ids across link batches, not unrelated chats', async () => {
+    const diagnostic = vi.spyOn(console, 'error').mockImplementation(() => {})
     const targets = Array.from({ length: 129 }, (_, index) => ({
       ...buildChat({
         id: `archive-target-${String(index).padStart(3, '0')}`,
@@ -1533,6 +1536,7 @@ describe('organization repository contract', () => {
     expect(archived.value.value).toEqual(targets.map(({ id }) => id))
     expect(await getDb().chats.get(targets[0]?.id ?? '')).toMatchObject({ archived: true })
     expect(await getDb().chats.get(unrelated[0]?.id ?? '')).toMatchObject({ archived: false })
+    expect(diagnostic).not.toHaveBeenCalled()
   }, 15_000)
 
   it('rejects one stale archive preflight without retrying or writing archive state', async () => {

@@ -89,17 +89,20 @@ test('UI does not flash an unavailable warning while clearing a non-equivalent m
 })
 
 test('OpenRouter model switches retain routing and model-row geometry until the new target is ready', async ({
+  browserName,
   expectRuntimeDiagnostic,
   page,
 }) => {
-  expectRuntimeDiagnostic({
-    category: 'console-other',
-    source: 'console',
-    level: 'error',
-    message:
-      '^Failed to load resource: the server responded with a status of 503 \\(Service Unavailable\\)$',
-    count: 1,
-  })
+  if (browserName === 'chromium') {
+    expectRuntimeDiagnostic({
+      category: 'console-other',
+      source: 'console',
+      level: 'error',
+      message:
+        '^Failed to load resource: the server responded with a status of 503 \\(Service Unavailable\\)$',
+      count: 1,
+    })
+  }
   const oldModelId = 'openai/gpt-5.4'
   const newModelId = 'anthropic/claude-opus-4.6'
   const privacyGate = await mockOpenRouterRouting(page, newModelId)
@@ -164,17 +167,20 @@ test('OpenRouter model switches retain routing and model-row geometry until the 
 })
 
 test('a failed OpenRouter reload retains stale rows, stays settled across remount, and retries manually', async ({
+  browserName,
   expectRuntimeDiagnostic,
   page,
 }) => {
-  expectRuntimeDiagnostic({
-    category: 'console-other',
-    source: 'console',
-    level: 'error',
-    message:
-      '^Failed to load resource: the server responded with a status of 503 \\(Service Unavailable\\)$',
-    count: 1,
-  })
+  if (browserName === 'chromium') {
+    expectRuntimeDiagnostic({
+      category: 'console-other',
+      source: 'console',
+      level: 'error',
+      message:
+        '^Failed to load resource: the server responded with a status of 503 \\(Service Unavailable\\)$',
+      count: 1,
+    })
+  }
   const staleModelId = 'test/stale-catalog-model'
   const recoveredModelId = 'test/recovered-catalog-model'
   let response: 'initial' | 'failed' | 'recovered' = 'initial'
@@ -683,8 +689,17 @@ async function addConnectionThroughGui(
 
 async function switchConnectionThroughGui(page: Page, profileName: string): Promise<void> {
   await openConnectionDetail(page)
-  await page.locator('[data-ui="connection-profile-select"]').selectOption({ label: profileName })
+  const select = page.locator('[data-ui="connection-profile-select"]')
+  const profileId = await select
+    .locator('option')
+    .filter({ hasText: profileName })
+    .getAttribute('value')
+  if (!profileId) throw new Error(`ConnectionProfileOptionMissing:${profileName}`)
+  await select.selectOption({ label: profileName })
+  await expect(select).toHaveValue(profileId)
   await expect(page.locator('[data-ui="connection-name"]')).toContainText(profileName)
+  await expect(select).toHaveAttribute('data-state', 'settled')
+  await expect(page.locator('[data-ui="connection-switch-error"]')).toHaveCount(0)
 }
 
 async function openConnectionDetail(page: Page): Promise<void> {

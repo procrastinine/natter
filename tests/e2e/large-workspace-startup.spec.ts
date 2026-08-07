@@ -43,6 +43,7 @@ const LONG_TASK_THRESHOLD_MS = 50
 const CARDINALITY_BLOCKING_TIME_HEADROOM_MS = 50
 const GENERATED_WORKSPACE_FORK_TARGET_ID = 'generated-active-message-086'
 const GENERATED_WORKSPACE_MODEL_ID = 'google/gemini-3.5-flash'
+const BROWSER_WORKSPACE_CONTROL_DATABASE_NAME = 'natter-control'
 const CANONICAL_PHYSICAL_STORAGE_TABLE_NAMES = discoverCanonicalPhysicalStorageTableNames()
 
 test.describe.configure({ mode: 'serial', timeout: 5 * 60_000 })
@@ -470,6 +471,13 @@ async function profileActiveStreamReload(baseURL: string, name: GeneratedWorkspa
                 context_length: 1_000_000,
                 supported_parameters: ['max_tokens', 'reasoning'],
                 pricing: {},
+                data_policy: {
+                  training: false,
+                  trainingOpenRouter: false,
+                  retainsPrompts: false,
+                  canPublish: false,
+                  requiresUserIDs: false,
+                },
               },
             ],
           },
@@ -775,7 +783,7 @@ async function installStartupProbe(
   target: StartupProbeTarget = { kind: 'transcript' },
 ): Promise<void> {
   await context.addInitScript(
-    ({ activeChatId, terminalId, initialTranscriptFloor, targetKind }) => {
+    ({ activeChatId, controlDatabaseName, terminalId, initialTranscriptFloor, targetKind }) => {
       const calls: Record<string, number> = Object.create(null) as Record<string, number>
       let total = 0
       const increment = (key: string) => {
@@ -846,7 +854,7 @@ async function installStartupProbe(
         (_receiver, args) => `factory.open:${String(args[0])}`,
         (_receiver, args, result) => {
           const databaseName = String(args[0])
-          if (databaseName === 'natter-control') mark('databaseSelectionStarted')
+          if (databaseName === controlDatabaseName) mark('databaseSelectionStarted')
           if (!['natter', 'natter-workspace-a', 'natter-workspace-b'].includes(databaseName)) return
           const authoredOpen = args[1] !== undefined
           if (authoredOpen) mark('schemaPreflightCompleted')
@@ -891,7 +899,7 @@ async function installStartupProbe(
           transaction.addEventListener(
             'complete',
             () => {
-              if (database.name === 'natter-control' && names.join(',') === 'manifests') {
+              if (database.name === controlDatabaseName && names.join(',') === 'manifests') {
                 state.controlManifestReads += 1
                 mark(
                   state.controlManifestReads === 1
@@ -977,6 +985,9 @@ async function installStartupProbe(
       }
 
       try {
+        if (!PerformanceObserver.supportedEntryTypes.includes('longtask')) {
+          throw new Error('LongTaskTimingUnsupported')
+        }
         new PerformanceObserver((entries) => {
           for (const entry of entries.getEntries()) state.longTasks.push(entry.duration)
         }).observe({ type: 'longtask', buffered: true })
@@ -1127,6 +1138,7 @@ async function installStartupProbe(
     },
     {
       activeChatId: GENERATED_WORKSPACE_ACTIVE_CHAT_ID,
+      controlDatabaseName: BROWSER_WORKSPACE_CONTROL_DATABASE_NAME,
       terminalId: GENERATED_WORKSPACE_ACTIVE_TERMINAL_ID,
       initialTranscriptFloor: INITIAL_TRANSCRIPT_FLOOR,
       targetKind: target.kind,
@@ -1479,7 +1491,10 @@ function assertStartupStageOrder(name: string, probe: StartupProbeSnapshot): voi
 
 function assertCachedSelectionRequestBudget(name: string, probe: StartupProbeSnapshot): void {
   const calls = probe.milestones.coreRunning.idb.calls
-  expect(calls['factory.open:natter-control'], `${name} control database opens`).toBe(2)
+  expect(
+    calls[`factory.open:${BROWSER_WORKSPACE_CONTROL_DATABASE_NAME}`],
+    `${name} control database opens`,
+  ).toBe(2)
   expect(
     calls['database.transaction:manifests:readonly'],
     `${name} manifest read transactions`,
@@ -1578,12 +1593,37 @@ function assertForegroundFork(name: string, profile: ForegroundForkProfile): voi
     unrelatedCanonicalWholeTableReads(profile.idbCalls, ['folders', 'tags']),
     `${name} fork canonical whole-table reads`,
   ).toEqual([])
+  const databaseOpens = Object.entries(profile.idbCalls).filter(
+    ([key, count]) => count > 0 && key.startsWith('factory.open:'),
+  )
+  expect(
+    databaseOpens.filter(
+      ([key]) => key !== `factory.open:${BROWSER_WORKSPACE_CONTROL_DATABASE_NAME}`,
+    ),
+    `${name} fork workspace database opens`,
+  ).toEqual([])
+  expect(
+    profile.idbCalls[`factory.open:${BROWSER_WORKSPACE_CONTROL_DATABASE_NAME}`] ?? 0,
+    `${name} fork control database opens`,
+  ).toBeLessThanOrEqual(1)
+  const allowedControlAccountingCalls = new Set([
+    'database.transaction:compactionStates,manifests:readonly',
+    'database.transaction:compactionStates:readwrite',
+    'objectStore.compactionStates.get.bounded',
+    'objectStore.compactionStates.put.bounded',
+  ])
   expect(
     Object.entries(profile.idbCalls).filter(
-      ([key, count]) => count > 0 && key.startsWith('factory.open:'),
+      ([key, count]) =>
+        count > 0 &&
+        /(?:compactionStates|manifests)/u.test(key) &&
+        !allowedControlAccountingCalls.has(key),
     ),
-    `${name} fork database opens`,
+    `${name} fork control database work`,
   ).toEqual([])
+  for (const key of allowedControlAccountingCalls) {
+    expect(profile.idbCalls[key] ?? 0, `${name} fork bounded ${key}`).toBeLessThanOrEqual(1)
+  }
   expect(profile.settingMutations, `${name} fork workspace-slot writes`).toEqual([])
 }
 

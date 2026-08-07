@@ -13,6 +13,7 @@ import {
   seedFirstRun,
   sendMessage,
   waitForAssistantGenerationFinished,
+  waitForMessageGenerationFinished,
 } from './helpers'
 
 interface RetentionStorageState {
@@ -369,16 +370,18 @@ test('returning to an offscreen paused stream projects its current durable prefi
 
   await openStoredChat(page, firstChat)
   await expect(page.locator('[data-ui="abort"]')).toBeVisible()
-  await expect(
-    page
-      .locator('[data-ui="message"][data-role="assistant"]')
-      .last()
-      .locator('[data-ui="message-body"]'),
-  ).toHaveText(pausedPrefix, { timeout: 2_000 })
+  const streamedAssistant = page.locator('[data-ui="message"][data-role="assistant"]').last()
+  await expect(streamedAssistant.locator('[data-ui="message-body"]')).toHaveText(pausedPrefix, {
+    timeout: 2_000,
+  })
+  const streamedAssistantId = await streamedAssistant.getAttribute('data-message-id')
+  if (!streamedAssistantId) throw new Error('OffscreenPausedAssistantIdentityMissing')
   await expect.poll(() => scenario.snapshot().then((state) => state.activeStreams)).toBe(1)
 
-  await waitForAssistantGenerationFinished(page, firstChat)
-  await expect.poll(() => scenario.snapshot().then((state) => state.activeStreams)).toBe(0)
+  await expect
+    .poll(() => scenario.snapshot().then((state) => state.activeStreams), { timeout: 10_000 })
+    .toBe(0)
+  await waitForMessageGenerationFinished(page, firstChat, streamedAssistantId)
 })
 
 async function sendDetachedTurn(

@@ -35,6 +35,7 @@ test('pencil opens the inline editor; Enter commits and sets titleStatus=manual'
   await editor.press('Enter')
   await expect(page.locator('[data-ui="chat-title-label"]')).toHaveText('Branching deep-dive')
   const chatId = await firstChatId(page)
+  await expectManualTitleCommitted(page, chatId, 'Branching deep-dive')
   const row = await readChatRow(page, chatId)
   expect(row.title).toBe('Branching deep-dive')
   expect(row.titleStatus).toBe('manual')
@@ -111,12 +112,16 @@ test('title commit bumps updatedAt + metaVersion, leaves branch state untouched,
   const chatId = await firstChatId(page)
   await waitForAssistantGenerationFinished(page, chatId)
   const before = await readChat(page, chatId)
+  const peer = await page.context().newPage()
+  await peer.goto(page.url())
+  await expect(peer.locator('[data-ui="chat-title-label"]')).toHaveText('Untitled chat')
 
   await page.locator('[data-role="chat-title-edit"]').click()
   const editor = page.locator('[data-ui="chat-title-editor"]')
   await editor.fill('After send')
   await editor.press('Enter')
   await expect(page.locator('[data-ui="chat-title-label"]')).toHaveText('After send')
+  await expect(peer.locator('[data-ui="chat-title-label"]')).toHaveText('After send')
 
   const after = await readChat(page, chatId)
   expect(after.title).toBe('After send')
@@ -130,4 +135,13 @@ test('title commit bumps updatedAt + metaVersion, leaves branch state untouched,
 
 async function readChat(page: Page, chatId: string): Promise<Record<string, unknown>> {
   return readChatRow(page, chatId)
+}
+
+async function expectManualTitleCommitted(page: Page, chatId: string, title: string) {
+  await expect
+    .poll(async () => {
+      const row = await readChat(page, chatId)
+      return { title: row.title, titleStatus: row.titleStatus }
+    })
+    .toEqual({ title, titleStatus: 'manual' })
 }

@@ -62,7 +62,6 @@ interface ActiveRefresh {
   readonly observedRow: object | null
   readonly baselineFetchedAt: number | null
   readonly controller: AbortController
-  readonly failureCount: number
 }
 
 interface SettledRefresh {
@@ -73,8 +72,6 @@ interface SettledRefresh {
 
 interface FailedRefresh extends SettledRefresh {
   readonly error: string
-  readonly failureCount: number
-  readonly nextRetryAt: number
 }
 
 interface ManualRefresh {
@@ -113,9 +110,6 @@ const EMPTY_SNAPSHOT: ConfigurationDiscoverySnapshot = Object.freeze({
 })
 
 const CHANNELS = ['models', 'endpoints', 'privacy'] as const
-const DISCOVERY_RETRY_BASE_MS = 1_000
-const DISCOVERY_RETRY_MAX_MS = 60_000
-
 export class ConfigurationDiscoveryCoordinator {
   private readonly onChange: () => void
   private input: ConfigurationDiscoveryCoordinatorInput = Object.freeze({
@@ -232,9 +226,8 @@ export class ConfigurationDiscoveryCoordinator {
       }
       const force = this.manual[channel] !== null
       const failed = this.failed[channel]
-      if (!force && failed && failed.nextRetryAt > now) {
+      if (!force && failed) {
         changed = this.publishStatus(channel, plan, false, failed.error) || changed
-        nextDeadline = Math.min(nextDeadline ?? Number.POSITIVE_INFINITY, failed.nextRetryAt)
         continue
       }
       if (!force && this.completed[channel]) {
@@ -260,7 +253,6 @@ export class ConfigurationDiscoveryCoordinator {
         observedRow: plan.observedRow,
         baselineFetchedAt: plan.fetchedAt ?? null,
         controller,
-        failureCount: force ? 0 : (failed?.failureCount ?? 0),
       }
       this.active[channel] = refresh
       changed = this.publishStatus(channel, plan, true, null) || changed
@@ -467,8 +459,6 @@ export class ConfigurationDiscoveryCoordinator {
             plan?.targetKey === refresh.targetKey ? plan.observedRow : refresh.observedRow,
           baselineFetchedAt: refresh.baselineFetchedAt,
           error,
-          failureCount: refresh.failureCount + 1,
-          nextRetryAt: Date.now() + discoveryRetryDelay(refresh.failureCount + 1),
         }
       : null
     this.completed[channel] = error
@@ -536,9 +526,4 @@ function routingLogicalTargetKey(profileId: ProfileId, modelId: string): string 
 
 function refreshError(error: unknown): string {
   return error instanceof Error ? error.message : 'refresh failed'
-}
-
-function discoveryRetryDelay(failureCount: number): number {
-  const exponent = Math.min(16, Math.max(0, failureCount - 1))
-  return Math.min(DISCOVERY_RETRY_MAX_MS, DISCOVERY_RETRY_BASE_MS * 2 ** exponent)
 }

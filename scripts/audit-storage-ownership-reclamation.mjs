@@ -184,6 +184,9 @@ export function auditStorageOwnershipReclamation(root, inventoryModule, initialP
   validateSourceRecords(root, gaps, 'gaps', gapIds, problems, false)
   validateWorkspaceReplacementLifecycle(root, problems)
   validateCompactionAttemptRelease(root, problems)
+  validateSynchronousTransactionLocalDebtAccounting(root, problems)
+  validateTransactionPromiseOwnership(root, problems)
+  validateControlDatabaseTransactionIsolation(root, problems)
   validateOrphanWorkspaceReclamation(root, problems)
   validateAcceptance(acceptance, problems)
 
@@ -260,6 +263,15 @@ export function discoverCanonicalPhysicalStorageTableNames(root = ROOT) {
   )
 }
 
+export function discoverBrowserWorkspaceDatabaseNames(root = ROOT) {
+  const problems = []
+  const names = discoverOriginDatabaseNames(root, problems).slice(1)
+  if (problems.length > 0 || names.length === 0) {
+    throw new Error(`BrowserWorkspaceDatabaseNameDiscoveryFailed:${problems.join('|')}`)
+  }
+  return Object.freeze(names)
+}
+
 function validateCompactionAttemptRelease(root, problems) {
   const expectations = [
     [
@@ -301,6 +313,131 @@ function validateCompactionAttemptRelease(root, problems) {
       problems.push(`compaction-attempt-release: missing exact evidence: ${path}: ${locator}`)
     }
   }
+}
+
+function validateSynchronousTransactionLocalDebtAccounting(root, problems) {
+  const ownerNames = new Set(['recordObsoleteByteOwnerBytes', 'recordObsoleteByteOwnerValues'])
+  const declarationCounts = new Map([...ownerNames].map((name) => [name, 0]))
+  for (const path of sourceFiles(resolve(root, 'src'))) {
+    const sourceFile = sourceFileFor(path)
+    const relativePath = relative(root, path).split('\\').join('/')
+    const visit = (node) => {
+      if (ts.isFunctionDeclaration(node) && node.name && ownerNames.has(node.name.text)) {
+        declarationCounts.set(node.name.text, (declarationCounts.get(node.name.text) ?? 0) + 1)
+        if (node.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.AsyncKeyword)) {
+          problems.push(`transaction-local-debt: async owner: ${relativePath}:${node.name.text}`)
+        }
+        if (node.type?.kind !== ts.SyntaxKind.VoidKeyword) {
+          problems.push(`transaction-local-debt: non-void owner: ${relativePath}:${node.name.text}`)
+        }
+      }
+      if (ts.isAwaitExpression(node)) {
+        const expression = unwrapExpression(node.expression)
+        if (
+          expression &&
+          ts.isCallExpression(expression) &&
+          ts.isIdentifier(expression.expression) &&
+          ownerNames.has(expression.expression.text)
+        ) {
+          const line = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1
+          problems.push(
+            `transaction-local-debt: awaited synchronous accounting: ${relativePath}:${line}:${expression.expression.text}`,
+          )
+        }
+      }
+      node.forEachChild(visit)
+    }
+    visit(sourceFile)
+  }
+  for (const [name, count] of declarationCounts) {
+    if (count !== 1)
+      problems.push(`transaction-local-debt: ${name} declarations=${count}; expected=1`)
+  }
+}
+
+function validateTransactionPromiseOwnership(root, problems) {
+  const reported = new Set()
+  const report = (sourceFile, relativePath, node) => {
+    const line = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1
+    const problem = `transaction-owned-promise: native Promise.${node.expression.name.text}: ${relativePath}:${line}`
+    if (reported.has(problem)) return
+    reported.add(problem)
+    problems.push(problem)
+  }
+  const isNativePromiseCall = (node) =>
+    ts.isCallExpression(node) &&
+    ts.isPropertyAccessExpression(node.expression) &&
+    ts.isIdentifier(node.expression.expression) &&
+    node.expression.expression.text === 'Promise'
+  const ownsTransactionParameter = (node) =>
+    ts.isFunctionLike(node) &&
+    node.parameters.some(
+      (parameter) =>
+        ts.isIdentifier(parameter.name) &&
+        (parameter.name.text === 'tx' || parameter.name.text === 'transaction'),
+    )
+  for (const path of sourceFiles(resolve(root, 'src/store'))) {
+    const relativePath = relative(root, path)
+    const sourceFile = sourceFileFor(path)
+    const inspect = (node, transactionOwned = false) => {
+      const owned = transactionOwned || ownsTransactionParameter(node)
+      if (owned && isNativePromiseCall(node)) report(sourceFile, relativePath, node)
+      if (ts.isCallExpression(node) && transactionRunnerName(node.expression) !== undefined) {
+        const operation = node.arguments.at(-1)
+        if (operation && (ts.isArrowFunction(operation) || ts.isFunctionExpression(operation))) {
+          inspect(operation.body, true)
+        }
+      }
+      node.forEachChild((child) => inspect(child, owned))
+    }
+    inspect(sourceFile)
+  }
+}
+
+function validateControlDatabaseTransactionIsolation(root, problems) {
+  const path = resolve(root, 'src/store/browser-workspace-database-control.ts')
+  const sourceFile = sourceFileFor(path)
+  const declarations = sourceFile.statements.filter(
+    (statement) => ts.isFunctionDeclaration(statement) && statement.name?.text === 'withControlDb',
+  )
+  if (declarations.length !== 1) {
+    problems.push(
+      `control-database-transaction-isolation: withControlDb declarations=${declarations.length}; expected=1`,
+    )
+    return
+  }
+  let isolated = false
+  const visit = (node) => {
+    if (
+      ts.isCallExpression(node) &&
+      ts.isPropertyAccessExpression(node.expression) &&
+      ts.isIdentifier(node.expression.expression) &&
+      node.expression.expression.text === 'Dexie' &&
+      node.expression.name.text === 'ignoreTransaction'
+    ) {
+      isolated = true
+    }
+    node.forEachChild(visit)
+  }
+  visit(declarations[0])
+  if (!isolated) {
+    problems.push(
+      'control-database-transaction-isolation: withControlDb must start in Dexie.ignoreTransaction',
+    )
+  }
+}
+
+function transactionRunnerName(expression) {
+  if (ts.isIdentifier(expression) && expression.text === 'runDestinationTransaction') {
+    return expression.text
+  }
+  if (
+    ts.isPropertyAccessExpression(expression) &&
+    (expression.name.text === 'transaction' || expression.name.text === 'runTransaction')
+  ) {
+    return expression.name.text
+  }
+  return undefined
 }
 
 function parseArgs(argv) {

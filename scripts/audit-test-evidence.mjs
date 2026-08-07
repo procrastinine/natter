@@ -10,6 +10,8 @@ import {
 } from './test-evidence-manifest.mjs'
 
 const DEFAULT_ROOT = resolve(import.meta.dirname, '..')
+const PNPM_ACTION_SETUP_REVISION = '0977fd99725f1db4007ccb2928dbb4e90d06cc86'
+const MINIMUM_VERIFY_TIMEOUT_MINUTES = 90
 const VALID_STATUSES = new Set(['covered', 'partial', 'gap'])
 const VALID_PROOF_KINDS = new Set([
   'static',
@@ -22,7 +24,7 @@ const VALID_PROOF_KINDS = new Set([
 const REQUIRED_INTERROGATED_IDS = new Set([
   'startup-active-stream-shell-clickability',
   'hidden-tab-projection-visual-continuity',
-  'middle-click-new-chat-first-activation',
+  'background-new-chat-first-activation',
   'destination-first-transcript-prepend-scroll-continuity',
   'pending-generation-capability-preserves-first-submit-intent',
   'destination-frame-complete-window-budget',
@@ -133,6 +135,15 @@ function validateVerificationParity(root, problems) {
   const runner = readFileSync(resolve(root, 'scripts/run-verification.mjs'), 'utf8')
   const playwright = readFileSync(resolve(root, 'playwright.config.ts'), 'utf8')
   const nodeVersion = readFileSync(resolve(root, '.node-version'), 'utf8').trim()
+  const dependencyImage = readFileSync(
+    resolve(root, 'scripts/verification-dependency-image.mjs'),
+    'utf8',
+  )
+  const dependencyImageTest = readFileSync(
+    resolve(root, 'tests/unit/verification-dependency-image.test.ts'),
+    'utf8',
+  )
+  const verifyTimeoutMinutes = Number(/timeout-minutes:\s*(\d+)/u.exec(workflow)?.[1])
   const assertions = [
     parityAssertion(
       'shared-entrypoint',
@@ -151,6 +162,14 @@ function validateVerificationParity(root, problems) {
       'Local and CI share pnpm verify:ci, which explicitly dispatches migration work or the sealed candidate gate and preserves its evidence.',
     ),
     parityAssertion(
+      'cross-browser-gate',
+      workflow.includes('playwright install --with-deps chromium firefox') &&
+        runner.includes("stage('chromium-e2e'") &&
+        runner.includes("'firefox-e2e',") &&
+        runner.indexOf("'firefox-e2e',") > runner.indexOf("stage('chromium-e2e'"),
+      'The sealed local and GitHub checkpoint executes both required browser engines against the same production artifact.',
+    ),
+    parityAssertion(
       'pinned-node',
       packageJson.engines?.node === nodeVersion &&
         workflow.includes('node-version-file: .node-version'),
@@ -159,8 +178,15 @@ function validateVerificationParity(root, problems) {
     parityAssertion(
       'pinned-pnpm',
       /^pnpm@\d+\.\d+\.\d+$/u.test(packageJson.packageManager ?? '') &&
-        workflow.includes('pnpm/action-setup@'),
-      'pnpm/action-setup reads the exact packageManager pin.',
+        workflow.includes(`pnpm/action-setup@${PNPM_ACTION_SETUP_REVISION}`) &&
+        dependencyImage.includes('resolvePnpmLauncherTarget') &&
+        dependencyImageTest.includes(PNPM_ACTION_SETUP_REVISION),
+      'The immutable pnpm action, its self-update shim layout, and the exact packageManager execution target are locally coupled.',
+    ),
+    parityAssertion(
+      'ci-time-budget',
+      verifyTimeoutMinutes >= MINIMUM_VERIFY_TIMEOUT_MINUTES,
+      'The GitHub job budget exceeds the measured unchanged-candidate verification duration.',
     ),
     parityAssertion(
       'non-fail-fast-runner',
@@ -173,8 +199,9 @@ function validateVerificationParity(root, problems) {
       runner.includes("E2E_DEV_PORT: '4175'") &&
         runner.includes("E2E_FAKE_PROVIDER_PORT: '4174'") &&
         runner.includes("E2E_PORT: '4173'") &&
+        runner.includes("E2E_SERIALIZE_LARGE_WORKSPACE_CLOSURE: '1'") &&
         runner.includes("TZ: 'UTC'"),
-      'All child stages receive fixed ports and timezone.',
+      'All child stages receive fixed ports, timezone, and isolated large-workspace browser ordering.',
     ),
     parityAssertion(
       'built-preview-browser-path',
@@ -182,9 +209,10 @@ function validateVerificationParity(root, problems) {
         playwright.includes('command: applicationServerCommand') &&
         playwright.includes("process.env.E2E_REUSE_EXISTING_SERVER === '1'") &&
         runner.includes("stage('production-build'") &&
-        runner.includes(
-          "['chromium-e2e', 'headed-hidden-tab-visual-continuity', 'dev-preview-parity'].includes(item.id)",
-        ),
+        runner.includes("'firefox-e2e',") &&
+        runner.includes("'headed-hidden-tab-visual-continuity',") &&
+        runner.includes("'dev-preview-parity',") &&
+        runner.includes('].includes(item.id)'),
       'Direct Playwright builds then previews, while checkpoint execution builds once and every later browser workload consumes that exact artifact.',
     ),
     parityAssertion(
@@ -199,7 +227,7 @@ function validateVerificationParity(root, problems) {
     ),
     parityAssertion(
       'external-fake-provider',
-      playwright.includes('${packageManagerCommand} fake-provider') &&
+      playwright.includes('$' + '{packageManagerCommand} fake-provider') &&
         playwright.includes('/healthz'),
       'The provider harness is a separate loopback server.',
     ),

@@ -85,8 +85,9 @@ interface SharedMaterialLoad {
 interface SharedMaterialBatch {
   readonly controller: AbortController
   readonly value: Promise<GenerationPromptMaterialObservation>
+  readonly identities: Set<PromptMaterialIdentity>
   references: number
-  settled: boolean
+  state: 'shareable' | 'abandoned' | 'settled'
 }
 
 type PromptMaterialIdentity = string & { readonly __promptMaterialIdentity: unique symbol }
@@ -137,6 +138,26 @@ class TabWorkspaceMessageMaterialCoordinator implements WorkspaceMessageMaterial
   ): Promise<readonly (MessagePresentation | undefined)[]> {
     this.assertFence(fence)
     if (this.released) throw new Error('WorkspaceMessageMaterialCoordinatorReleased')
+    return this.readMaterial(headers, loader, signal)
+  }
+
+  readForLease(
+    lease: PerAttemptGenerationPromptMaterialLease,
+    headers: readonly MessageHeaderRow[],
+    loader: GenerationPromptMaterialLoader,
+    signal?: AbortSignal,
+  ): Promise<readonly (MessagePresentation | undefined)[]> {
+    if (!this.leases.has(lease)) {
+      return Promise.reject(new Error('GenerationPromptMaterialLeaseMismatch'))
+    }
+    return this.readMaterial(headers, loader, signal)
+  }
+
+  private async readMaterial(
+    headers: readonly MessageHeaderRow[],
+    loader: GenerationPromptMaterialLoader,
+    signal?: AbortSignal,
+  ): Promise<readonly (MessagePresentation | undefined)[]> {
     assertMaterialHeaders(headers)
     signal?.throwIfAborted()
     const rows: Array<MessagePresentation | undefined> = []
@@ -175,6 +196,7 @@ class TabWorkspaceMessageMaterialCoordinator implements WorkspaceMessageMaterial
           const loading: SharedMaterialLoad = { header, value, batch }
           const identity = promptMaterialIdentity(header)
           this.loadingByIdentity.set(identity, loading)
+          batch.identities.add(identity)
           values.set(header.id, value)
           void value.catch(() => undefined).finally(() => this.removeLoading(identity, loading))
         }
@@ -219,16 +241,9 @@ class TabWorkspaceMessageMaterialCoordinator implements WorkspaceMessageMaterial
   release(): void {
     if (this.released) return
     this.released = true
-    this.workspaceAbort.abort(new Error('WorkspaceMessageMaterialCoordinatorReleased'))
-    for (const lease of [...this.leases]) lease.release()
     for (const reservation of [...this.reservations]) reservation.release()
-    this.leases.clear()
     this.reservations.clear()
-    this.claimIdentitiesByLease.clear()
-    this.claimCounts.clear()
-    this.retainedByIdentity.clear()
-    this.loadingByIdentity.clear()
-    this.activeBatches.clear()
+    this.finalizeReleasedCoordinator()
   }
 
   seedClaimed(
@@ -237,7 +252,7 @@ class TabWorkspaceMessageMaterialCoordinator implements WorkspaceMessageMaterial
     presentations: readonly MessagePresentation[],
   ): void {
     this.assertFence(fence)
-    if (this.released || !this.leases.has(lease)) return
+    if (!this.leases.has(lease)) return
     for (const presentation of presentations) {
       const header = lease.claimedHeader(presentation.header.id)
       if (!header) continue
@@ -274,6 +289,7 @@ class TabWorkspaceMessageMaterialCoordinator implements WorkspaceMessageMaterial
     this.claimIdentitiesByLease.delete(lease)
     this.leases.delete(lease)
     this.pruneRetained()
+    this.finalizeReleasedCoordinator()
   }
 
   removeReservation(reservation: TabWorkspaceMessageMaterialReservation): void {
@@ -297,7 +313,13 @@ class TabWorkspaceMessageMaterialCoordinator implements WorkspaceMessageMaterial
   }
 
   private loading(header: MessageHeaderRow): SharedMaterialLoad | undefined {
-    return this.loadingByIdentity.get(promptMaterialIdentity(header))
+    const identity = promptMaterialIdentity(header)
+    const loading = this.loadingByIdentity.get(identity)
+    if (loading?.batch.state === 'abandoned') {
+      this.removeLoading(identity, loading)
+      return undefined
+    }
+    return loading
   }
 
   private retainIfClaimed(presentation: MessagePresentation): void {
@@ -326,8 +348,20 @@ class TabWorkspaceMessageMaterialCoordinator implements WorkspaceMessageMaterial
     }
   }
 
+  private finalizeReleasedCoordinator(): void {
+    if (!this.released || this.leases.size > 0) return
+    this.workspaceAbort.abort(new Error('WorkspaceMessageMaterialCoordinatorReleased'))
+    this.claimIdentitiesByLease.clear()
+    this.claimCounts.clear()
+    this.retainedByIdentity.clear()
+    this.loadingByIdentity.clear()
+    this.activeBatches.clear()
+  }
+
   private removeLoading(identity: PromptMaterialIdentity, loading: SharedMaterialLoad): void {
-    if (this.loadingByIdentity.get(identity) === loading) this.loadingByIdentity.delete(identity)
+    if (this.loadingByIdentity.get(identity) !== loading) return
+    this.loadingByIdentity.delete(identity)
+    loading.batch.identities.delete(identity)
   }
 
   private startBatch(
@@ -342,12 +376,13 @@ class TabWorkspaceMessageMaterialCoordinator implements WorkspaceMessageMaterial
       value: Promise.resolve()
         .then(() => loader(Object.freeze([...headers]), controller.signal))
         .finally(() => {
-          batch.settled = true
+          if (batch.state === 'shareable') batch.state = 'settled'
           this.activeBatches.delete(batch)
           this.workspaceAbort.signal.removeEventListener('abort', abort)
         }),
+      identities: new Set(),
       references: 0,
-      settled: false,
+      state: 'shareable',
     }
     this.activeBatches.add(batch)
     return batch
@@ -355,7 +390,12 @@ class TabWorkspaceMessageMaterialCoordinator implements WorkspaceMessageMaterial
 
   private releaseBatch(batch: SharedMaterialBatch): void {
     batch.references -= 1
-    if (batch.references === 0 && !batch.settled) {
+    if (batch.references === 0 && batch.state === 'shareable') {
+      batch.state = 'abandoned'
+      for (const identity of [...batch.identities]) {
+        const loading = this.loadingByIdentity.get(identity)
+        if (loading?.batch === batch) this.removeLoading(identity, loading)
+      }
       batch.controller.abort(new Error('WorkspaceMessageMaterialBatchUnobserved'))
     }
   }
@@ -488,7 +528,7 @@ class PerAttemptGenerationPromptMaterialLease implements GenerationPromptMateria
       return !retained || !normalizeMaterialPresentation(retained, header)
     })
     if (missing.length > 0) {
-      const loaded = await this.coordinator.read(fence, missing, loader, signal)
+      const loaded = await this.coordinator.readForLease(this, missing, loader, signal)
       for (let index = 0; index < missing.length; index += 1) {
         const header = missing[index] as MessageHeaderRow
         const presentation = loaded[index]

@@ -127,7 +127,7 @@ test('content-free structure exporter reports the active chat without message pa
   expect(exported).not.toContain('large imported branch assistant 65')
 })
 
-test('middle-click opens the newest descendant branch in a background tab', async ({
+test('middle-click targets the newest descendant and its activated tab presents that branch', async ({
   context,
   page,
 }) => {
@@ -146,8 +146,23 @@ test('middle-click opens the newest descendant branch in a background tab', asyn
     .poll(() => page.evaluate(() => window.location.hash))
     .toContain(`/message/${fixture.A2}`)
   await expect(popup).toHaveURL(new RegExp(`/message/${fixture.B2}$`, 'u'))
-  await expect(popup.locator('[data-ui="message-list"]')).toContainText('branch B assistant')
-  await expect(popup.locator('[data-ui="message-list"]')).not.toContainText('branch A assistant')
+  const branchUrl = popup.url()
+  await popup.close()
+
+  const activatedTab = await context.newPage()
+  await page.bringToFront()
+  await activatedTab.goto(branchUrl)
+  try {
+    await activatedTab.bringToFront()
+    await expect(activatedTab.locator('[data-ui="message-list"]')).toContainText(
+      'branch B assistant',
+    )
+    await expect(activatedTab.locator('[data-ui="message-list"]')).not.toContainText(
+      'branch A assistant',
+    )
+  } finally {
+    await activatedTab.close()
+  }
 })
 
 test('tree view replaces the transcript, searches all branches, and changes the active branch', async ({
@@ -359,7 +374,6 @@ test('switching views preserves the active branch and retained tree workspace st
   const treeNodes = page.locator('[data-ui="branch-tree-node"]')
   const nodePreviews = page.locator('[data-ui="branch-tree-node-preview"]')
   const treeRoot = await tree.elementHandle()
-  if (!treeRoot) throw new Error('Tree root is not mounted')
 
   await expect(tree).toBeVisible()
   await page.locator('[data-ui="tree-density-toggle"]').click()
@@ -374,7 +388,6 @@ test('switching views preserves the active branch and retained tree workspace st
   await expect(inspector).toHaveAttribute('data-message-id', fixture.A2)
   await expect(inspectorBody).toContainText('branch A assistant')
   const inspectorRoot = await inspector.elementHandle()
-  if (!inspectorRoot) throw new Error('Inspector root is not mounted')
   await expect
     .poll(() => page.evaluate(() => window.location.hash))
     .toContain(`/message/${fixture.B2}`)

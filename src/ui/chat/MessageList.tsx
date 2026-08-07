@@ -488,11 +488,14 @@ const MessageListSurface = memo(function MessageListSurface(props: MessageListSu
     [scrollRegionCommands, shouldVirtualize],
   )
   const ignorePreVirtualMeasurementAdjustment = useCallback(() => false, [])
+  const reconcileVirtualMessageGeometry = useCallback(() => {
+    scrollRegionCommands?.reconcileLayoutAnchor()
+  }, [scrollRegionCommands])
   const adjustOnlyRowsBeforeLayoutAnchor = useCallback(
     (item: VirtualItem, _delta: number, instance: Virtualizer<HTMLDivElement, HTMLDivElement>) => {
       const anchorMessageId = scrollRegionCommands?.getLayoutAnchorMessageId() ?? null
       const anchorIndex = anchorMessageId
-        ? renderableMessageIndexById.get(anchorMessageId as MessageId)
+        ? renderableMessageIndexById.get(anchorMessageId)
         : undefined
       if (anchorIndex !== undefined) return item.index < anchorIndex
       return (
@@ -516,8 +519,9 @@ const MessageListSurface = memo(function MessageListSurface(props: MessageListSu
     scrollToFn: applyVirtualizerScroll,
     rangeExtractor: extractVirtualMessageRange,
     anchorTo: shouldVirtualize ? 'end' : 'start',
-    directDomUpdates: true,
+    directDomUpdates: shouldVirtualize,
     directDomUpdatesMode: 'position',
+    onChange: reconcileVirtualMessageGeometry,
     enabled: measureVirtualRows,
   })
   messageVirtualizer.shouldAdjustScrollPositionOnItemSizeChange = shouldVirtualize
@@ -537,7 +541,7 @@ const MessageListSurface = memo(function MessageListSurface(props: MessageListSu
         ?.querySelector<HTMLElement>('[data-ui="message"][data-message-id]')
         ?.getAttribute('data-message-id')
       if (node && messageId) {
-        measuredVirtualMessageIdsRef.current.add(messageId as MessageId)
+        measuredVirtualMessageIdsRef.current.add(messageId)
         const index = Number(node.dataset.index)
         if (Number.isSafeInteger(index)) {
           messageVirtualizer.resizeItem(index, node.getBoundingClientRect().height)
@@ -546,6 +550,13 @@ const MessageListSurface = memo(function MessageListSurface(props: MessageListSu
       messageVirtualizer.measureElement(node)
     },
     [messageVirtualizer],
+  )
+  const bindVirtualMessage = useCallback(
+    (node: HTMLDivElement | null) => {
+      if (node && !shouldVirtualize) node.style.removeProperty('transform')
+      measureVirtualMessage(node)
+    },
+    [measureVirtualMessage, shouldVirtualize],
   )
   useLayoutEffect(() => {
     void windowLoadVisible
@@ -597,7 +608,7 @@ const MessageListSurface = memo(function MessageListSurface(props: MessageListSu
           anchor.element.dataset.scrollAnchor = 'history-demand'
           historyDemandRevisionRef.current += 1
           setHistoryDemandAnchor({
-            messageId: anchor.messageId as MessageId,
+            messageId: anchor.messageId,
             coordinate: anchor.coordinate,
             revision: historyDemandRevisionRef.current,
           })
@@ -751,20 +762,13 @@ const MessageListSurface = memo(function MessageListSurface(props: MessageListSu
           data-ui="message-virtual-row"
           data-index={virtualItem.index}
           data-terminal={virtualItem.index === renderableMessageRows.length - 1 || undefined}
-          ref={measureVirtualRows ? measureVirtualMessage : undefined}
-          style={shouldVirtualize ? undefined : { transform: 'none' }}
+          ref={measureVirtualRows ? bindVirtualMessage : undefined}
         >
           {renderMessageRow(row)}
         </div>
       )
     },
-    [
-      measureVirtualMessage,
-      measureVirtualRows,
-      renderMessageRow,
-      renderableMessageRows,
-      shouldVirtualize,
-    ],
+    [bindVirtualMessage, measureVirtualRows, renderMessageRow, renderableMessageRows],
   )
 
   return (

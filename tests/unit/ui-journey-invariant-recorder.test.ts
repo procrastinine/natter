@@ -343,8 +343,9 @@ describe('UI journey invariant recorder', () => {
       <div data-ui="shell"><main data-ui="content">
         <div data-ui="scroll"><div
           data-ui="messages"
-          data-rendered-count="4"
+          data-rendered-count="5"
           data-total-count="8"
+          data-virtualized="true"
         >
           <article data-message-id="m1"></article>
           <article data-message-id="m2"></article>
@@ -403,6 +404,7 @@ describe('UI journey invariant recorder', () => {
     requiredElement('[data-message-id="m1"]').remove()
     requiredElement('[data-message-id="m2"]').remove()
     messages.setAttribute('data-rendered-count', '2')
+    messages.setAttribute('data-virtualized', 'false')
     scrollHeight = 800
     scrollTop = 350
     await flushMutationFrame()

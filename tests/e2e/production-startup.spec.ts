@@ -22,3 +22,8 @@ test('production artifact excludes source modules and development tools', async 
     ),
   ).toEqual([])
 })
+
+test('runtime diagnostic teardown drains an opaque about:blank page', async ({ page }) => {
+  await page.goto('about:blank')
+  await expect(page).toHaveURL('about:blank')
+})

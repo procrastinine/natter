@@ -8,6 +8,7 @@ import {
   __setLockBackendForTests,
   assertAcquireOrder,
   awaitLockRuntimeIdle,
+  coordinationLockName,
   createIndexedDbLockBackend,
   disposeLockRuntime,
   type LockBackend,
@@ -16,6 +17,7 @@ import {
   resumeLockRuntime,
   ScopeOrderError,
   scopeResourceName,
+  withCoordinationLock,
   withMutationLocks,
   withNamedLock,
   withQuiescedWorkspaceReplacementLock,
@@ -193,6 +195,40 @@ async function lockDatabases() {
 }
 
 describe('IndexedDB fallback fencing', () => {
+  it('physically releases an admitted coordination lease after its owner aborts', async () => {
+    __resetLockTrackerForTests({ admissionsOpen: true })
+    const databases = await lockDatabases()
+    const controller = new AbortController()
+    const entered = deferred()
+    let ownerCleanupFinished = false
+    const resourceName = 'admitted-owner'
+
+    const operation = withCoordinationLock(
+      resourceName,
+      async () => {
+        entered.resolve()
+        await new Promise<void>((resolve) => {
+          controller.signal.addEventListener('abort', () => resolve(), { once: true })
+        })
+        ownerCleanupFinished = true
+      },
+      { database: databases.left, signal: controller.signal },
+    )
+    await entered.promise
+    const ownedRow = await databases.left.browserLocks.get(coordinationLockName(resourceName))
+    expect(typeof ownedRow?.ownerClientId).toBe('string')
+
+    controller.abort(new Error('owner-closed'))
+    await operation
+    await awaitLockRuntimeIdle()
+
+    expect(ownerCleanupFinished).toBe(true)
+    expect(
+      await databases.left.browserLocks.get(coordinationLockName(resourceName)),
+    ).toBeUndefined()
+    await databases.close()
+  })
+
   it('serializes different logical resources across independent page backends', async () => {
     const databases = await lockDatabases()
     const releaseLeft = deferred()
@@ -332,7 +368,7 @@ describe('IndexedDB fallback fencing', () => {
 
   it('takes over an abandoned fallback lease at its persisted expiry without release events', async () => {
     const databases = await lockDatabases()
-    const now = Date.now()
+    let now = 10_000
     await databases.left.browserLocks.put({
       name: BROWSER_WRITER_LOCK_NAME,
       ownerClientId: 'crashed-page',
@@ -342,24 +378,35 @@ describe('IndexedDB fallback fencing', () => {
       heartbeatAt: now,
       expiresAt: now + 80,
     })
+    let deadlineWaits = 0
     const backend = createIndexedDbLockBackend({
       openDatabase: async () => databases.right,
       clientId: 'successor-page',
+      now: () => now,
       leaseMs: 1_000,
       renewMs: 100,
       retryMs: 5,
+      waitForWakeOrDeadline: async (_wake, delay, signal) => {
+        expect(signal?.aborted).not.toBe(true)
+        expect(delay).toBe(80)
+        deadlineWaits += 1
+        now += delay
+      },
     })
     const transactions = vi.spyOn(databases.right, 'transaction')
+    try {
+      await backend.run(['maintenance'], async () => {})
 
-    await backend.run(['maintenance'], async () => {})
-
-    expect(transactions).toHaveBeenCalledTimes(3)
-    expect(await databases.left.browserLocks.get(BROWSER_WRITER_LOCK_NAME)).toMatchObject({
-      ownerClientId: null,
-      fencingToken: 8,
-    })
-    backend.dispose?.()
-    await databases.close()
+      expect(deadlineWaits).toBe(1)
+      expect(transactions).toHaveBeenCalledTimes(3)
+      expect(await databases.left.browserLocks.get(BROWSER_WRITER_LOCK_NAME)).toMatchObject({
+        ownerClientId: null,
+        fencingToken: 8,
+      })
+    } finally {
+      backend.dispose?.()
+      await databases.close()
+    }
   })
 
   it('rejects a stale owner inside the same transaction before domain writes', async () => {

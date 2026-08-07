@@ -75,7 +75,7 @@ export async function readExactMessageRowsByIdPages(
     const page = await db.transaction('r', db.messages, db.messageBodies, async (tx) => {
       const unbind = bindReadonlyTransactionAbort(tx, options.signal, 'Workspace query aborted')
       try {
-        const [headers, bodies] = await Promise.all([
+        const [headers, bodies] = await Dexie.Promise.all([
           db.messages.bulkGet(pageIds),
           db.messageBodies.bulkGet(pageIds),
         ])

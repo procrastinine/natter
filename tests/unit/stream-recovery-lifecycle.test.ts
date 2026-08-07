@@ -347,31 +347,31 @@ describe('stream recovery lifecycle ownership', () => {
     expect(await getDb().streamLeases.get(lease.streamId)).toEqual(lease)
   })
 
-  it.each([
-    'deletion',
-    'teardown',
-  ] as const)('%s aborts the pending ownership waiter', async (cause) => {
-    const manager = new ObservableExclusiveLockManager()
-    const probe = await openRecoveryRuntime(manager)
-    const lease = await freshLease(`cancel-on-${cause}`, 'remote-client')
-    const lockName = `stream-owner:${lease.streamId}`
-    const release = manager.hold(lockName)
+  it.each(['deletion', 'teardown'] as const)(
+    '%s aborts the pending ownership waiter',
+    async (cause) => {
+      const manager = new ObservableExclusiveLockManager()
+      const probe = await openRecoveryRuntime(manager)
+      const lease = await freshLease(`cancel-on-${cause}`, 'remote-client')
+      const lockName = `stream-owner:${lease.streamId}`
+      const release = manager.hold(lockName)
 
-    try {
-      await putAndPublishLease(lease, probe)
-      await waitForOwnershipWaiter(manager, lease.streamId)
+      try {
+        await putAndPublishLease(lease, probe)
+        await waitForOwnershipWaiter(manager, lease.streamId)
 
-      if (cause === 'deletion') {
-        await getDb().streamLeases.delete(lease.streamId)
-        await publishLeaseInvalidation(lease.streamId, probe)
-      } else {
-        await shutdownBrowserWorkspace()
+        if (cause === 'deletion') {
+          await getDb().streamLeases.delete(lease.streamId)
+          await publishLeaseInvalidation(lease.streamId, probe)
+        } else {
+          await shutdownBrowserWorkspace()
+        }
+
+        expect(manager.pendingCount(lockName)).toBe(0)
+        expect(manager.abortCount(lockName)).toBe(1)
+      } finally {
+        release()
       }
-
-      expect(manager.pendingCount(lockName)).toBe(0)
-      expect(manager.abortCount(lockName)).toBe(1)
-    } finally {
-      release()
-    }
-  })
+    },
+  )
 })

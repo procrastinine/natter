@@ -1,4 +1,4 @@
-import type { Transaction } from 'dexie'
+import Dexie, { type Transaction } from 'dexie'
 import type { AttachmentId, AttachmentReferenceEdge } from '../core/types'
 import { sameValue } from '../lib/same-value'
 import type { AttachmentHeaderRow } from './attachment-storage'
@@ -331,7 +331,7 @@ export async function refreshAttachmentCatalogProjectionsForRepair(
   const ids = [...new Set(attachmentIds)]
   if (ids.length === 0) return []
   const catalog = tx.table<AttachmentCatalogProjectionRow, AttachmentId>('attachmentCatalogRows')
-  const [snapshot, previousRows] = await Promise.all([
+  const [snapshot, previousRows] = await Dexie.Promise.all([
     suppliedSnapshot ?? readAttachmentCatalogRepairSnapshot(tx, ids),
     catalog.bulkGet(ids),
   ])

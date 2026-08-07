@@ -1,5 +1,5 @@
 import { createFakeStreamScenario, retargetOnlyProfileToFakeProvider } from './fake-stream-provider'
-import { expect, type Locator, test } from './fixtures'
+import { expect, type Locator, type Page, test } from './fixtures'
 import {
   clearIndexedDb,
   createChatAndOpen,
@@ -290,8 +290,19 @@ test('physical scrolling inside a growing streamed message preserves the visible
     await expect(region).toHaveAttribute('data-scroll-state', 'follow')
 
     await region.hover()
-    await page.mouse.wheel(0, -3_200)
+    await installStreamViewportProbe(page, assistantId, 'observe')
+    await expect.poll(() => streamViewportProbeSampleCount(page)).toBeGreaterThan(0)
+    const followedSample = await streamViewportProbeLatestSample(page)
+    for (let tick = 0; tick < 4; tick += 1) await page.mouse.wheel(0, -800)
     await expect(region).toHaveAttribute('data-scroll-state', 'pinned')
+    await expect
+      .poll(async () => {
+        const sample = await streamViewportProbeLatestSample(page)
+        return sample.textLength - sample.characterOffset
+      })
+      .toBeGreaterThan(followedSample.textLength - followedSample.characterOffset + 1_000)
+    const movement = await stopStreamViewportProbe(page)
+    expect(movement.samples).toBeGreaterThan(1)
     await waitForAnimationFrames(page, 3)
     await installStreamViewportProbe(page, assistantId, 'pinned')
     await expect.poll(() => streamViewportProbeSampleCount(page)).toBeGreaterThan(0)
@@ -372,7 +383,7 @@ interface StreamViewportProbeReport {
 async function installStreamViewportProbe(
   page: Parameters<typeof waitForAnimationFrames>[0],
   messageId: string,
-  mode: 'follow' | 'pinned',
+  mode: 'follow' | 'pinned' | 'observe',
 ): Promise<void> {
   await page.evaluate(
     ({ messageId: targetMessageId, mode: probeMode }) => {
@@ -412,7 +423,7 @@ async function installStreamViewportProbe(
             (x) => Number.isFinite(x) && x >= left && x <= right,
           )
           for (const x of xs) {
-            const candidate = document.caretRangeFromPoint?.(x, y) ?? null
+            const candidate = document.caretRangeFromPoint(x, y)
             if (candidate && markdown.contains(candidate.startContainer)) {
               caret = candidate
               break
@@ -509,6 +520,20 @@ async function streamViewportProbeSampleCount(
   )
 }
 
+async function streamViewportProbeLatestSample(
+  page: Parameters<typeof waitForAnimationFrames>[0],
+): Promise<StreamViewportSample> {
+  return page.evaluate(() => {
+    const sample = (
+      window as typeof window & {
+        __streamViewportProbe?: { previous: StreamViewportSample | null }
+      }
+    ).__streamViewportProbe?.previous
+    if (!sample) throw new Error('StreamViewportProbeSampleMissing')
+    return sample
+  })
+}
+
 async function stopStreamViewportProbe(
   page: Parameters<typeof waitForAnimationFrames>[0],
 ): Promise<StreamViewportProbeReport> {
@@ -533,10 +558,7 @@ async function stopStreamViewportProbe(
   })
 }
 
-async function waitForAnimationFrames(
-  page: import('@playwright/test').Page,
-  count: number,
-): Promise<void> {
+async function waitForAnimationFrames(page: Page, count: number): Promise<void> {
   await page.evaluate(async (frameCount) => {
     for (let frame = 0; frame < frameCount; frame += 1) {
       await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))

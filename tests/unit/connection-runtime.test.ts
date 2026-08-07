@@ -165,20 +165,20 @@ describe('connection runtime keys', () => {
     expect(access.resolve.mock.calls.map(([ref]) => ref)).toEqual(['primary', 'fallback'])
   })
 
-  it.each([
-    'custom',
-    'llama-server',
-  ] as const)('preserves empty authentication for key-optional %s profiles', async (kind) => {
-    const access = keyAccess([])
-    const connection = profile('missing-optional-key', [], kind)
+  it.each(['custom', 'llama-server'] as const)(
+    'preserves empty authentication for key-optional %s profiles',
+    async (kind) => {
+      const access = keyAccess([])
+      const connection = profile('missing-optional-key', [], kind)
 
-    expect(connectionRequiresKey(connection)).toBe(false)
-    const [candidate] = await resolveConnectionRuntimeKeys(connection, { access })
+      expect(connectionRequiresKey(connection)).toBe(false)
+      const [candidate] = await resolveConnectionRuntimeKeys(connection, { access })
 
-    expect(candidate?.ref).toBeNull()
-    expect(candidate?.index).toBe(0)
-    await expect(candidate?.resolve()).resolves.toBe('')
-  })
+      expect(candidate?.ref).toBeNull()
+      expect(candidate?.index).toBe(0)
+      await expect(candidate?.resolve()).resolves.toBe('')
+    },
+  )
 
   it('prefers an explicitly accepted key for only that chat and profile', async () => {
     const access = keyAccess(['primary', 'fallback'])

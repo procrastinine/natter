@@ -1,4 +1,4 @@
-import type { Transaction } from 'dexie'
+import Dexie, { type Transaction } from 'dexie'
 import { normalizeModelsResponse } from '../api/providers'
 import { modelCatalogQueryForConnectionKind, modelsCacheKey } from '../core/cache-keys'
 import {
@@ -3876,7 +3876,7 @@ async function commitConnectionDeleteOperation(
       connectionDeleteOperationReceipt(input, {}),
     )
   }
-  const [profile, storedUsage] = await Promise.all([
+  const [profile, storedUsage] = await Dexie.Promise.all([
     tx.table<ConnectionProfile, ProfileId>('profiles').get(input.profileId),
     tx
       .table<ConfigurationProfileUsageProjectionRow, ProfileId>('configurationProfileUsageRows')
@@ -5602,12 +5602,12 @@ async function switchChatProfile(
     input,
     async (tx) => {
       const chatMutation = openLinkedChatMutation(tx)
-      const [currentChat, currentProfile, currentKey] = await Promise.all([
+      const [currentChat, currentProfile, currentKey] = await Dexie.Promise.all([
         chatMutation.read(command.chatId),
         tx.table<ConnectionProfile, ProfileId>('profiles').get(command.profileId),
         command.requestKeyId
           ? tx.table<KeyRecord, KeyId>('keys').get(command.requestKeyId)
-          : Promise.resolve(undefined),
+          : Dexie.Promise.resolve(undefined),
       ])
       const modelsCache =
         input.readModelsCache && currentProfile
@@ -5779,12 +5779,12 @@ async function resolveChatModel(
     input,
     async (tx) => {
       const chatMutation = openLinkedChatMutation(tx)
-      const [currentChat, currentProfile, currentKey, modelsHeader] = await Promise.all([
+      const [currentChat, currentProfile, currentKey, modelsHeader] = await Dexie.Promise.all([
         chatMutation.read(command.chatId),
         tx.table<ConnectionProfile, ProfileId>('profiles').get(command.target.profileId),
         command.requestKeyId
           ? tx.table<KeyRecord, KeyId>('keys').get(command.requestKeyId)
-          : Promise.resolve(undefined),
+          : Dexie.Promise.resolve(undefined),
         tx
           .table<CachedModelsStorageRow, [ProfileId, string]>('models')
           .get([command.target.profileId, command.catalog.queryKey]),
@@ -6287,7 +6287,7 @@ async function createAndSelectTextTemplate(
     ConfigurationDomainResult<'text-template.create-and-select'>
   >(commandMeta, command.kind, input, async (tx) => {
     const chatMutation = openLinkedChatMutation(tx)
-    const [chat, currentTemplate] = await Promise.all([
+    const [chat, currentTemplate] = await Dexie.Promise.all([
       chatMutation.read(command.chatId),
       tx.table<SavedTextTemplate, TextTemplateId>('textTemplates').get(command.template.id),
     ])
@@ -6603,7 +6603,7 @@ async function moveChatPreset(
         )
       }
       const table = tx.table<ChatPreset, PresetId>('presets')
-      const [current, after] = await Promise.all([
+      const [current, after] = await Dexie.Promise.all([
         table.get(command.presetId),
         command.afterPresetId ? table.get(command.afterPresetId) : undefined,
       ])
@@ -6877,7 +6877,7 @@ async function createAndLinkChatPreset(
     input,
     async (tx) => {
       const chatMutation = openLinkedChatMutation(tx)
-      const [profile, chat, currentPreset] = await Promise.all([
+      const [profile, chat, currentPreset] = await Dexie.Promise.all([
         tx.table<ConnectionProfile, ProfileId>('profiles').get(profileId),
         chatMutation.read(command.chatId),
         tx.table<ChatPreset, PresetId>('presets').get(provisional.id),
@@ -6974,7 +6974,7 @@ async function applyChatPreset(
     input,
     async (tx) => {
       const chatMutation = openLinkedChatMutation(tx)
-      const [chat, preset] = await Promise.all([
+      const [chat, preset] = await Dexie.Promise.all([
         chatMutation.read(command.chatId),
         tx.table<ChatPreset, PresetId>('presets').get(command.presetId),
       ])
@@ -7054,10 +7054,10 @@ async function saveChatPreset(
     input,
     async (tx) => {
       const chatMutation = openLinkedChatMutation(tx)
-      const [preset, profile, chat] = await Promise.all([
+      const [preset, profile, chat] = await Dexie.Promise.all([
         tx.table<ChatPreset, PresetId>('presets').get(command.presetId),
         tx.table<ConnectionProfile, ProfileId>('profiles').get(profileId),
-        chatId ? chatMutation.read(chatId) : Promise.resolve(undefined),
+        chatId ? chatMutation.read(chatId) : Dexie.Promise.resolve(undefined),
       ])
       const unchangedChat = chat
         ? chatConfigurationOperationReceipt(chat, chat)
@@ -7203,7 +7203,7 @@ async function loadAndPinPrompt(
     input,
     async (tx) => {
       const chatMutation = openLinkedChatMutation(tx)
-      const [chat, currentPreset] = await Promise.all([
+      const [chat, currentPreset] = await Dexie.Promise.all([
         chatMutation.read(command.chatId),
         tx.table<PromptPreset, PromptPresetId>('promptPresets').get(command.presetId),
       ])
@@ -7296,7 +7296,7 @@ async function createAndPinPrompt(
     input,
     async (tx) => {
       const chatMutation = openLinkedChatMutation(tx)
-      const [chat, currentPreset] = await Promise.all([
+      const [chat, currentPreset] = await Dexie.Promise.all([
         chatMutation.read(command.chatId),
         tx.table<PromptPreset, PromptPresetId>('promptPresets').get(command.preset.id),
       ])

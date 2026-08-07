@@ -1,4 +1,4 @@
-import { useLayoutEffect, useMemo, useRef, useSyncExternalStore } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useSyncExternalStore } from 'react'
 import type { TranscriptWorkBudget } from '../core/transcript-work-budget'
 import type { ChatId, MessageId } from '../core/types'
 import { conversationController } from '../store/conversation-controller'
@@ -27,10 +27,10 @@ export function useConversationTranscriptDemand(
   controller: ConversationController = conversationController,
 ): void {
   const owner = useRef({})
-  useLayoutEffect(() => {
+  useEffect(() => {
     controller.setTranscriptDemand(owner.current, demand)
   }, [controller, demand])
-  useLayoutEffect(() => () => controller.setTranscriptDemand(owner.current, null), [controller])
+  useEffect(() => () => controller.setTranscriptDemand(owner.current, null), [controller])
 }
 
 export function useConversationInspectorDemand(

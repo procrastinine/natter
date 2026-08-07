@@ -216,7 +216,7 @@ describe('generation mode contract', () => {
     let readsAtProviderOpen: MessageId[] = []
     let wireAtProviderOpen: Record<string, unknown> = {}
 
-    await run(
+    const completed = await run(
       {
         kind: 'send',
         chatId: chat.id,
@@ -234,6 +234,7 @@ describe('generation mode contract', () => {
     )
     reads.stop()
 
+    expect(completed, JSON.stringify(completed)).toMatchObject({ outcome: 'done' })
     const wireText = JSON.stringify(wireAtProviderOpen)
     expect(wireText).toContain('fresh submitted question')
     expect(wireText).not.toContain('history-0:00')

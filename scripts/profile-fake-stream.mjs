@@ -513,7 +513,7 @@ async function collectStoreState(chatId) {
       const list = document.querySelector('[data-ui="message-list"]')
       const tree = document.querySelector('[data-ui="branch-tree-view"]')
       const isVisible = (node) => Boolean(node && node.getClientRects().length > 0)
-      const renderedMessages = document.querySelectorAll('[data-ui="message"]').length
+      const mountedMessages = document.querySelectorAll('[data-ui="message"]').length
       const assistantTextLengths = [
         ...document.querySelectorAll(
           '[data-ui="message"][data-role="assistant"] [data-ui="message-body"]',
@@ -562,10 +562,11 @@ async function collectStoreState(chatId) {
         return {
           chatId: id,
           url: location.href,
-          renderedMessages,
+          mountedMessages,
+          loadedMessages: Number(list?.getAttribute('data-rendered-count') ?? 0),
+          virtualized: list?.getAttribute('data-virtualized') === 'true',
           initialRenderWork: Number(list?.getAttribute('data-initial-render-work') ?? 0),
           totalMessages: Number(list?.getAttribute('data-total-count') ?? 0),
-          renderWindow: list?.getAttribute('data-rendered-count'),
           assistantTextLengths,
           transcriptVisible: isVisible(list),
           treeVisible: isVisible(tree),

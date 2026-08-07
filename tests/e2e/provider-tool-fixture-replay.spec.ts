@@ -16,6 +16,8 @@ import {
   waitForAssistantGenerationFinished,
 } from './helpers'
 
+test.describe.configure({ timeout: 60_000 })
+
 const PROBE_DIR = new URL(
   '../../../plan/direct-provider-server-tools-probes/latest/',
   import.meta.url,

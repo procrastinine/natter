@@ -346,7 +346,7 @@ describe('stream accumulator', () => {
       untypedVisibleKind: 'text',
       source: { choiceIndex: 0 },
     })
-    if (!structured || structured.kind !== 'visible') {
+    if (structured?.kind !== 'visible') {
       throw new Error('expected structured visible reasoning observation')
     }
     applyStreamAccumulatorEvent(

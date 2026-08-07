@@ -1,4 +1,4 @@
-import type { IndexableType, Table, Transaction } from 'dexie'
+import Dexie, { type IndexableType, type Table, type Transaction } from 'dexie'
 import { childListKey } from '../core/child-list-state'
 import type { Chat, ChatId, ChildListState, ChildSlotMember, MessageId } from '../core/types'
 import type { MessageHeaderRow } from './message-storage'
@@ -32,7 +32,7 @@ export async function rebuildChildSlotDerivedState(
   const messages = tx.table<MessageHeaderRow, MessageId>('messages')
   const states = tx.table<ChildListState, string>('childLists')
   const members = tx.table<ChildSlotMember, MessageId>('childSlotMembers')
-  await Promise.all([states.clear(), members.clear()])
+  await Dexie.Promise.all([states.clear(), members.clear()])
   await forEachPrimaryPage(chats, async (page) => {
     checkpoint()
     await states.bulkPut(

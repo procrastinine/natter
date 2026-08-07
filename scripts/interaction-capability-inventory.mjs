@@ -809,7 +809,7 @@ function buildInteractionOutcomeGraph(root, model, sites) {
         synthetic: false,
       })
     } else {
-      const destination = componentForJsxTag(root, astSite.opening.tagName, checker, registry)
+      const destination = componentForJsxTag(astSite.opening.tagName, checker, registry)
       if (!destination) {
         addGap(site.id, 'callback-destination-component-unresolved')
       } else if (!destination.callableProps.has(site.event)) {
@@ -882,7 +882,7 @@ function buildInteractionOutcomeGraph(root, model, sites) {
       const destinationIntrinsic = jsxElementIsIntrinsic(node.tagName.getText(node.getSourceFile()))
       const destination = destinationIntrinsic
         ? null
-        : componentForJsxTag(root, node.tagName, checker, registry)
+        : componentForJsxTag(node.tagName, checker, registry)
       for (const attribute of node.attributes.properties) {
         if (!ts.isJsxAttribute(attribute)) continue
         const destinationEvent = attribute.name.getText(node.getSourceFile())
@@ -893,7 +893,7 @@ function buildInteractionOutcomeGraph(root, model, sites) {
         if (sourceSlots.length === 0) continue
         for (const sourceSlot of sourceSlots) {
           const sourceId = addSlot(sourceSlot.component, sourceSlot.event)
-          if (!destination || !destination.callableProps.has(destinationEvent)) {
+          if (!destination?.callableProps.has(destinationEvent)) {
             addGap(sourceId, 'renamed-callback-destination-unresolved')
             continue
           }
@@ -2162,7 +2162,7 @@ function callbackSlotId(component, event) {
   return `slot:${component.id}.${event}`
 }
 
-function componentForJsxTag(root, tag, checker, registry) {
+function componentForJsxTag(tag, checker, registry) {
   const symbol = canonicalSymbol(checker, checker.getSymbolAtLocation(tag))
   for (const declaration of symbol?.declarations ?? []) {
     const callable = componentCallableFromDeclaration(declaration)

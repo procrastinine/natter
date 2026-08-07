@@ -510,6 +510,21 @@ async function settle(): Promise<void> {
   for (let index = 0; index < 12; index += 1) await Promise.resolve()
 }
 
+function setTranscriptRowDemand(
+  controller: ReturnType<typeof createConversationController>,
+  owner: object,
+  minimumRowCount: number,
+): void {
+  const active = controller.getSnapshot().active
+  if (!active) throw new Error('missing transcript demand target')
+  controller.setTranscriptDemand(owner, {
+    chatId: active.chatId,
+    selectionRevision: active.selectionRevision,
+    selectionEpoch: active.transcript.selectionEpoch,
+    budget: { minimumRowCount, textCharLimit: 0, renderCostLimit: 0 },
+  })
+}
+
 function expectNoControllerTimers(timeout: { mock: { calls: unknown[][] } }): void {
   const controllerTimers = timeout.mock.calls.filter((args) => {
     const [callback, delay, key] = args
@@ -856,6 +871,90 @@ describe('conversation controller', () => {
     ).toBe(0)
   })
 
+  it('carries a current route claim across a same-workspace physical replacement', () => {
+    const root = message('root', null, 0, 'root', 1)
+    const { controller, source } = harness([root])
+    const owner = createConversationRouteOwnerController()
+    const operation = controller.claimOperation({
+      chatId: CHAT_ID,
+      steering: 'select-result',
+      selectionDelivery: 'route-handoff',
+      routeOwner: owner.owner,
+    })
+    const assistant = source.put(message('assistant', root.id, 0, 'answer', 2))
+    const replacementFence = Object.freeze({ ...FENCE, replacementEpoch: 1 })
+    source.workspaceFence = replacementFence
+    controller.reconcileWorkspace(replacementFence)
+
+    const receipt = controller.acceptLocalResult(operation, {
+      kind: 'select-committed',
+      receipt: {
+        ...replacementFence,
+        destination: source.committedSelection(assistant.header.id, [assistant]),
+      },
+      committedEffect: {
+        ...localCommittedEffect(source, [assistant]),
+        ...replacementFence,
+      },
+    })
+
+    expect(receipt.accepted).toBe(true)
+    if (!receipt.accepted) throw new Error('missing replacement route handoff')
+    expect(receipt.routeDelivery.kind).toBe('handoff')
+    if (receipt.routeDelivery.kind === 'handoff') receipt.routeDelivery.handoff.cancel()
+  })
+
+  it('carries a preserving command claim across a same-workspace physical replacement', () => {
+    const root = presentation(message('root', null, 0, 'root', 1))
+    const { controller, source } = harness([root.message])
+    const operation = controller.claimOperation({
+      chatId: CHAT_ID,
+      steering: 'preserve',
+    })
+    const replacementFence = Object.freeze({ ...FENCE, replacementEpoch: 1 })
+    source.workspaceFence = replacementFence
+    controller.reconcileWorkspace(replacementFence)
+
+    const receipt = controller.acceptLocalResult(operation, {
+      kind: 'preserve',
+      committedEffect: {
+        ...localCommittedEffect(source, [root], [], { kind: 'none' }),
+        ...replacementFence,
+      },
+    })
+
+    expect(receipt).toEqual({ accepted: true })
+  })
+
+  it('invalidates a route claim when the logical workspace changes', () => {
+    const root = message('root', null, 0, 'root', 1)
+    const { controller, source } = harness([root])
+    const operation = controller.claimOperation({
+      chatId: CHAT_ID,
+      steering: 'select-result',
+      selectionDelivery: 'route-handoff',
+      routeOwner: createConversationRouteOwnerController().owner,
+    })
+    const assistant = source.put(message('assistant', root.id, 0, 'answer', 2))
+    const replacementFence = Object.freeze({ workspaceId: 'workspace-b', replacementEpoch: 1 })
+    source.workspaceFence = replacementFence
+    controller.reconcileWorkspace(replacementFence)
+
+    const receipt = controller.acceptLocalResult(operation, {
+      kind: 'select-committed',
+      receipt: {
+        ...replacementFence,
+        destination: source.committedSelection(assistant.header.id, [assistant]),
+      },
+      committedEffect: {
+        ...localCommittedEffect(source, [assistant]),
+        ...replacementFence,
+      },
+    })
+
+    expect(receipt).toEqual({ accepted: false })
+  })
+
   it('hands an inactive committed selection to its route without a repository selection read', () => {
     const root = message('root', null, 0, 'root', 1)
     const { controller, navigation, source } = harness([root])
@@ -1049,6 +1148,88 @@ describe('conversation controller', () => {
     controller.setTranscriptDemand(demandOwner, null)
   })
 
+  it('retains one terminal row until an exact viewport demand begins passive fill', async () => {
+    const rows: Message[] = []
+    for (let index = 0; index < 18; index += 1) {
+      rows.push(message(`point-${index}`, rows.at(-1)?.id ?? null, 0, `row ${index}`, index + 1))
+    }
+    const leafId = rows.at(-1)?.id
+    if (!leafId) throw new Error('missing destination point leaf')
+    const { controller, navigation, source } = harness(rows)
+    let finishSelection = () => {}
+    source.selectionCompletionGate = new Promise<void>((resolve) => {
+      finishSelection = resolve
+    })
+
+    navigation.arrive('arrival-point', { chatId: CHAT_ID, targetMessageId: leafId })
+    await settle()
+
+    expect(controller.getSnapshot().active?.transcript).toMatchObject({
+      kind: 'point',
+      window: { rowCount: 1, leafId },
+    })
+    expect(source.loadTranscriptPage).not.toHaveBeenCalled()
+
+    finishSelection()
+    await settle()
+
+    const opened = controller.getSnapshot().active
+    if (!opened) throw new Error('missing point-backed conversation')
+    expect(opened.destination.kind).toBe('ready')
+    expect(opened.transcript).toMatchObject({ kind: 'ready', window: { rowCount: 1, leafId } })
+    expect(source.loadTranscriptPage).not.toHaveBeenCalled()
+
+    const demandOwner = {}
+    controller.setTranscriptDemand(demandOwner, {
+      chatId: CHAT_ID,
+      selectionRevision: opened.selectionRevision,
+      selectionEpoch: opened.transcript.selectionEpoch,
+      budget: { minimumRowCount: 10, textCharLimit: 0, renderCostLimit: 0 },
+    })
+    await settle()
+
+    expect(source.loadTranscriptPage).toHaveBeenCalled()
+    const filled = exactTranscript(controller)
+    if (!filled) throw new Error('missing passively filled transcript')
+    expect(filled.rowCount).toBe(10)
+    controller.setTranscriptDemand(demandOwner, null)
+    await settle()
+    expect(exactTranscript(controller)?.rowCount).toBe(10)
+  })
+
+  it('does not republish an exact empty transcript for repeated equal viewport demand', async () => {
+    const { controller, navigation, source } = harness([])
+    navigation.arrive('arrival-empty', { chatId: CHAT_ID })
+    await settle()
+
+    const active = controller.getSnapshot().active
+    if (!active) throw new Error('missing empty conversation')
+    expect(active.transcript).toMatchObject({
+      kind: 'ready',
+      window: { rowCount: 0, leafId: null },
+    })
+    const demand = {
+      chatId: active.chatId,
+      selectionRevision: active.selectionRevision,
+      selectionEpoch: active.transcript.selectionEpoch,
+      budget: { minimumRowCount: 10, textCharLimit: 0, renderCostLimit: 0 },
+    }
+    let publications = 0
+    const unsubscribe = controller.subscribe(() => {
+      publications += 1
+    })
+    const owner = {}
+
+    controller.setTranscriptDemand(owner, demand)
+    await settle()
+    controller.setTranscriptDemand(owner, demand)
+    await settle()
+
+    expect(publications).toBe(0)
+    expect(source.loadTranscriptPage).not.toHaveBeenCalled()
+    unsubscribe()
+  })
+
   it('retains one inert painted frame until a different chat becomes exact', async () => {
     const firstRoot = message('first-root', null, 0, 'first root', 1)
     const firstLeaf = message('first-leaf', firstRoot.id, 0, 'first leaf', 2)
@@ -1232,6 +1413,21 @@ describe('conversation controller', () => {
     unsubscribe()
     uninstallViewport()
     uninstallSecond()
+  })
+
+  it('lets a manual surface intent supersede an automatic reveal before it paints', async () => {
+    const root = message('root', null, 0, 'root', 1)
+    const leaf = message('leaf', root.id, 0, 'leaf', 2)
+    const { controller, navigation } = harness([root, leaf])
+
+    navigation.arrive('arrival-manual-reveal', { chatId: CHAT_ID, targetMessageId: leaf.id })
+    controller.supersedePresentationReveal('transcript')
+    await settle()
+
+    expect(
+      expectCoherentReadyPresentation(controller.getSnapshot().active?.presentation, 'transcript')
+        .reveal,
+    ).toBeNull()
   })
 
   it('resolves repeated message arrivals in the same mounted tab without reusing stale selection', async () => {
@@ -2217,6 +2413,9 @@ describe('conversation controller', () => {
       targetMessageId: branchA.id,
     })
     await settle()
+    const viewportOwner = {}
+    setTranscriptRowDemand(controller, viewportOwner, 2)
+    await settle()
 
     const before = expectCoherentReadyPresentation(
       controller.getSnapshot().active?.presentation,
@@ -2236,6 +2435,8 @@ describe('conversation controller', () => {
       chatId: CHAT_ID,
       targetMessageId: branchB.id,
     })
+    await settle()
+    setTranscriptRowDemand(controller, viewportOwner, 2)
     await settle()
     const during = controller.getSnapshot().active?.presentation
     const painted = during?.painted?.binding
@@ -2264,6 +2465,9 @@ describe('conversation controller', () => {
       targetMessageId: branchA.id,
     })
     await settle()
+    const viewportOwner = {}
+    setTranscriptRowDemand(controller, viewportOwner, 2)
+    await settle()
     const retention = controller.claimTranscriptRetention({
       workspaceFence: FENCE,
       chatId: CHAT_ID,
@@ -2277,6 +2481,8 @@ describe('conversation controller', () => {
       targetMessageId: branchB.id,
     })
     controller.reconcileWorkspace(replacementFence)
+    await settle()
+    setTranscriptRowDemand(controller, viewportOwner, 2)
     await settle()
 
     const after = expectCoherentReadyPresentation(
@@ -2488,41 +2694,42 @@ describe('conversation controller', () => {
         }
       },
     },
-  ])('adopts $name proof with exact counts and no repository selection roundtrip', async ({
-    prepare,
-  }) => {
-    const root = message('root', null, 0, 'root', 1)
-    const child = message('child', root.id, 0, 'child', 2)
-    const tip = message('tip', child.id, 0, 'tip', 3)
-    const { controller, navigation, source } = harness([root, child, tip])
-    navigation.arrive('arrival-1', { chatId: CHAT_ID, targetMessageId: tip.id })
-    await settle()
-    const prepared = prepare(source, root, child, tip)
-    const selectionReadsBefore = source.openSelection.mock.calls.length
-    const operation = controller.claimOperation({ chatId: CHAT_ID, steering: 'select-result' })
+  ])(
+    'adopts $name proof with exact counts and no repository selection roundtrip',
+    async ({ prepare }) => {
+      const root = message('root', null, 0, 'root', 1)
+      const child = message('child', root.id, 0, 'child', 2)
+      const tip = message('tip', child.id, 0, 'tip', 3)
+      const { controller, navigation, source } = harness([root, child, tip])
+      navigation.arrive('arrival-1', { chatId: CHAT_ID, targetMessageId: tip.id })
+      await settle()
+      const prepared = prepare(source, root, child, tip)
+      const selectionReadsBefore = source.openSelection.mock.calls.length
+      const operation = controller.claimOperation({ chatId: CHAT_ID, steering: 'select-result' })
 
-    expect(
-      controller.acceptLocalResult(operation, {
-        kind: 'select-committed',
-        receipt: { ...FENCE, destination: prepared.selection },
-        committedEffect: localCommittedEffect(
-          source,
-          prepared.receiptPresentations,
-          prepared.receiptHeaders,
-        ),
-      }),
-    ).toEqual({ accepted: true })
-    await settle()
+      expect(
+        controller.acceptLocalResult(operation, {
+          kind: 'select-committed',
+          receipt: { ...FENCE, destination: prepared.selection },
+          committedEffect: localCommittedEffect(
+            source,
+            prepared.receiptPresentations,
+            prepared.receiptHeaders,
+          ),
+        }),
+      ).toEqual({ accepted: true })
+      await settle()
 
-    const active = controller.getSnapshot().active
-    expect(presentedSpine(controller).path.materializeIds()).toEqual(prepared.expectedPath)
-    expect(presentedSpine(controller).resolvedLeafId).toBe(prepared.expectedTipId)
-    expect(active?.destination.kind).toBe('ready')
-    expect(active?.presentation.target.kind).toBe('ready')
-    expect(presentedSpine(controller).forkFor(prepared.expectedTipId)?.liveCount).toBe(1)
-    expect(navigation.replacements.at(-1)?.targetMessageId).toBe(prepared.expectedTipId)
-    expect(source.openSelection).toHaveBeenCalledTimes(selectionReadsBefore)
-  })
+      const active = controller.getSnapshot().active
+      expect(presentedSpine(controller).path.materializeIds()).toEqual(prepared.expectedPath)
+      expect(presentedSpine(controller).resolvedLeafId).toBe(prepared.expectedTipId)
+      expect(active?.destination.kind).toBe('ready')
+      expect(active?.presentation.target.kind).toBe('ready')
+      expect(presentedSpine(controller).forkFor(prepared.expectedTipId)?.liveCount).toBe(1)
+      expect(navigation.replacements.at(-1)?.targetMessageId).toBe(prepared.expectedTipId)
+      expect(source.openSelection).toHaveBeenCalledTimes(selectionReadsBefore)
+    },
+  )
 
   it('adopts exact local send and regenerate selections without a spine reread', async () => {
     const root = message('root', null, 0, 'root', 1)
@@ -2974,6 +3181,8 @@ describe('conversation controller', () => {
     const reply = message('reply', root.id, 0, 'reply', 2)
     const { controller, navigation, source } = harness([root, reply])
     navigation.arrive('arrival-1', { chatId: CHAT_ID, targetMessageId: reply.id })
+    await settle()
+    setTranscriptRowDemand(controller, {}, 2)
     await settle()
     expect(
       transcriptMessages(

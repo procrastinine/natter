@@ -566,6 +566,14 @@ export function Shell() {
         configurationController.projectChatConfiguration(paintedChat),
       )
     : undefined
+  const chatModelPanelCanonicalRow = useFencedChatPresentation(
+    activeConversation?.chat ?? paintedChat,
+    activeChatId,
+    conversationWorkspaceFence,
+  )
+  const resolvedChatModelPanelRow = chatModelPanelCanonicalRow
+    ? configurationController.projectChatConfiguration(chatModelPanelCanonicalRow)
+    : undefined
   useEffect(() => {
     if (paintedChat) catalogApplication.tab.observeChatRows([paintedChat])
   }, [paintedChat])
@@ -1162,7 +1170,7 @@ export function Shell() {
   // including focus mode. Chat settings are per-chat, so routes without an
   // active chat hide the pane instead of showing the null-chat placeholder.
   const showChatModelPanel =
-    chatModelOpen && !!activeChatId && !!resolvedActiveChatRow && !activeStorageRoute
+    chatModelOpen && !!activeChatId && !!resolvedChatModelPanelRow && !activeStorageRoute
   const effectiveSidebarCollapsed = isNarrowScreen ? false : sidebarCollapsed
   const mobilePanelOpen = isNarrowScreen && (mobileSidebarOpen || showChatModelPanel)
   const closeMobilePanels = useCallback(() => {
@@ -1903,7 +1911,7 @@ export function Shell() {
       ) : null}
       {showChatModelPanel ? (
         <ChatModelPanel
-          chatSnapshot={resolvedActiveChatRow}
+          chatSnapshot={resolvedChatModelPanelRow}
           profileSnapshot={activeProfileForModelList ?? null}
           modelCatalog={activeModelCatalog}
           onClose={() => setChatModelOpen(false)}
@@ -2047,6 +2055,35 @@ function useSampleAndHoldPresentation<T>(
     value: presented,
     retained: !ready && presented !== null,
   }
+}
+
+function useFencedChatPresentation(
+  chat: Chat | null,
+  activeChatId: ChatId | null,
+  workspace: WorkspaceFence,
+): Chat | null {
+  const retained = useRef<{
+    readonly workspaceId: WorkspaceFence['workspaceId']
+    readonly replacementEpoch: WorkspaceFence['replacementEpoch']
+    readonly chat: Chat
+  } | null>(null)
+  const current = activeChatId !== null && chat?.id === activeChatId ? chat : null
+  useLayoutEffect(() => {
+    if (!current) return
+    retained.current = Object.freeze({
+      workspaceId: workspace.workspaceId,
+      replacementEpoch: workspace.replacementEpoch,
+      chat: current,
+    })
+  }, [current, workspace.replacementEpoch, workspace.workspaceId])
+  if (current) return current
+  const previous = retained.current
+  return activeChatId !== null &&
+    previous?.chat.id === activeChatId &&
+    previous.workspaceId === workspace.workspaceId &&
+    previous.replacementEpoch === workspace.replacementEpoch
+    ? previous.chat
+    : null
 }
 
 function conversationBindingMutationsUnavailable(

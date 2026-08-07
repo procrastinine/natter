@@ -1,3 +1,4 @@
+import Dexie from 'dexie'
 import { sameValue } from '../lib/same-value'
 import {
   recordBrowserCommandOwnerInvalidation,
@@ -339,7 +340,7 @@ async function retireOneStreamJournalPage(
   const maxFrameRows = boundedStreamJournalRetirementRows(request.maxFrameRows)
   const frames = tx.table<StreamJournalFrameRow, string>('streamChunks')
   const leases = tx.table<StreamLeaseRow, string>('streamLeases')
-  const [lease, rows] = await Promise.all([
+  const [lease, rows] = await Dexie.Promise.all([
     leases.get(streamId),
     frames
       .where('streamId')
@@ -412,7 +413,7 @@ async function retireOneStreamJournalPage(
     measuredJournalBytes,
     deleteLease ? estimateStoredValueBytes(lease) : 0,
   )
-  await recordObsoleteByteOwnerBytes(tx, obsoleteBytes)
+  recordObsoleteByteOwnerBytes(tx, obsoleteBytes)
   if (deleteLease) {
     recordBrowserCommandOwnerInvalidation(tx, {
       kind: 'stream-lease',
@@ -523,7 +524,7 @@ async function retireOrphanChatStreamJournalPage(
     }
     await deletePhysicalStorageKeys<StreamJournalFrameRow, string>(tx, 'streamChunks', frameIds)
   }
-  await recordObsoleteByteOwnerBytes(tx, obsoleteBytes)
+  recordObsoleteByteOwnerBytes(tx, obsoleteBytes)
   if (frameIds.length > 0) {
     for (const chatId of chatIds) {
       recordBrowserCommandOwnerInvalidation(tx, { kind: 'stream-chunks', chatId })

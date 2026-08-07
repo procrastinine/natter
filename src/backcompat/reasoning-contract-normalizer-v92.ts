@@ -691,7 +691,7 @@ function inferBridge(
 }
 
 function isOfficialOpenAiProfile(profile: ReasoningAttemptV92Context['profile']): boolean {
-  if (!profile || profile.kind !== 'openai-compatible' || typeof profile.baseUrl !== 'string') {
+  if (profile?.kind !== 'openai-compatible' || typeof profile.baseUrl !== 'string') {
     return false
   }
   try {

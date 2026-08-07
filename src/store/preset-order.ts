@@ -1,4 +1,4 @@
-import type { Table, Transaction } from 'dexie'
+import Dexie, { type Table, type Transaction } from 'dexie'
 import type { PresetId } from '../core/types'
 import { newId } from '../lib/ulid'
 import { recordBrowserCommandInvalidation } from './browser-command-mutation-journal'
@@ -201,7 +201,7 @@ export async function buildPresetOrderOnEmptyTables(
   checkpoint: () => void = () => undefined,
 ): Promise<void> {
   const counts = await runTransaction([tables.states, tables.blocks, tables.memberships], (tx) =>
-    Promise.all([
+    Dexie.Promise.all([
       tx.table<PresetOrderStateRow, typeof PRESET_ORDER_STATE_ID>(tables.states.name).count(),
       tx.table<PresetOrderBlockRow, string>(tables.blocks.name).count(),
       tx.table<PresetOrderMembershipRow, PresetId>(tables.memberships.name).count(),

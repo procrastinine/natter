@@ -56,7 +56,7 @@ export function buildCommittedVerificationComparison(options) {
     },
     isExecutable(path) {
       const entry = entryByPath.get(path)
-      if (!entry || entry.kind !== 'file') {
+      if (entry?.kind !== 'file') {
         throw new Error(`VerificationComparisonMetadataMissing:${path}`)
       }
       return entry.executable
@@ -151,7 +151,7 @@ function selectTreeEntries(entries) {
   const entryByPath = new Map(entries.map((entry) => [entry.path, entry]))
   const selectedEntries = selectedPaths.map((path) => {
     const entry = entryByPath.get(path)
-    if (!entry || entry.kind !== 'file') {
+    if (entry?.kind !== 'file') {
       throw new Error(`VerificationComparisonSelectedKindForbidden:${path}`)
     }
     return entry

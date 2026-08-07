@@ -295,6 +295,10 @@ test('GUI OpenRouter Shell is retained but exposed and serialized only on Respon
   await createChatAndOpen(page)
   await openSettingsPanel(page)
   await page.getByRole('tab', { name: 'Generation' }).click()
+  const settingsPanel = page.locator('[data-ui="chat-model-panel"]')
+  await settingsPanel.evaluate((element) => {
+    element.setAttribute('data-e2e-panel-instance', 'openrouter-shell')
+  })
 
   const tools = page.locator('[data-ui-section="hosted-tools"]')
   await expect(tools.getByRole('checkbox', { name: 'Web search' })).toBeVisible()
@@ -312,6 +316,11 @@ test('GUI OpenRouter Shell is retained but exposed and serialized only on Respon
     await expect(checkbox).toBeVisible()
     await checkbox.check()
     await expect(checkbox).toBeChecked()
+    await expect(settingsPanel).toHaveAttribute('data-e2e-panel-instance', 'openrouter-shell')
+    await expect(settingsPanel.locator('[data-ui="settings-panel"]')).toHaveAttribute(
+      'data-active-tab',
+      'generation',
+    )
   }
 
   await page.reload()
@@ -335,9 +344,17 @@ test('GUI OpenRouter Shell is retained but exposed and serialized only on Respon
 
   await openSettingsPanel(page)
   await page.getByRole('tab', { name: 'Model' }).click()
+  await settingsPanel.evaluate((element) => {
+    element.setAttribute('data-e2e-panel-instance', 'openrouter-chat')
+  })
   await apiMode.getByRole('button', { name: 'Chat completions', exact: true }).click()
   await page.getByRole('tab', { name: 'Generation' }).click()
   await expect(tools.getByRole('checkbox', { name: 'Shell' })).toHaveCount(0)
+  await expect(settingsPanel).toHaveAttribute('data-e2e-panel-instance', 'openrouter-chat')
+  await expect(settingsPanel.locator('[data-ui="settings-panel"]')).toHaveAttribute(
+    'data-active-tab',
+    'generation',
+  )
   await page.locator('[data-role="settings-cog"]').click()
   await sendAndExpectAssistant(page, 'Use the ordinary hosted tools.', 'hosted chat ok')
 

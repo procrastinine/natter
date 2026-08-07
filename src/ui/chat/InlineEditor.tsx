@@ -117,6 +117,7 @@ export function InlineEditor({
   const {
     initialAttachmentRefs: startingAttachmentRefs,
     attachmentRefs,
+    currentAttachmentRefs,
     attachmentRows,
     uploads,
     addAttachment,
@@ -219,26 +220,27 @@ export function InlineEditor({
   // flagging the "this reply may be stale" hint on downstream
   // assistant messages. Save & Send deliberately bypasses this check;
   // the user may want to re-send even when the text is unchanged.
-  const isUnchanged = useCallback(
-    () =>
+  const isUnchanged = useCallback(() => {
+    const currentRefs = currentAttachmentRefs()
+    return (
       text === initialTextRef.current &&
-      sameValue(startingAttachmentRefs, attachmentRefs) &&
+      sameValue(startingAttachmentRefs, currentRefs) &&
       (!reasoningBaseline ||
         planReasoningAuthoringOperations(reasoningBaseline.entries, reasoning).length === 0) &&
       (!providerOutputBaseline ||
         providerOutput === null ||
         planProviderOutputAuthoringOperations(providerOutputBaseline.entries, providerOutput)
-          .length === 0),
-    [
-      attachmentRefs,
-      providerOutput,
-      providerOutputBaseline,
-      reasoning,
-      reasoningBaseline,
-      startingAttachmentRefs,
-      text,
-    ],
-  )
+          .length === 0)
+    )
+  }, [
+    currentAttachmentRefs,
+    providerOutput,
+    providerOutputBaseline,
+    reasoning,
+    reasoningBaseline,
+    startingAttachmentRefs,
+    text,
+  ])
   const commitSave = useCallback(() => {
     if (saveDisabled || busy || uploadingAttachments) return
     if (isUnchanged()) {
@@ -258,7 +260,8 @@ export function InlineEditor({
       ...(reasoningOperations.length > 0 ? { reasoning: reasoningOperations } : {}),
       ...(providerOutputOperations.length > 0 ? { providerOutput: providerOutputOperations } : {}),
     }
-    const attachmentRefsChanged = !sameValue(startingAttachmentRefs, attachmentRefs)
+    const currentRefs = currentAttachmentRefs()
+    const attachmentRefsChanged = !sameValue(startingAttachmentRefs, currentRefs)
     const authoredBodyChanged =
       reasoningOperations.length > 0 || providerOutputOperations.length > 0
     const settlement =
@@ -266,7 +269,7 @@ export function InlineEditor({
         ? onSave(
             text,
             authoredBodyChanged ? authoring : undefined,
-            attachmentRefsChanged ? attachmentRefs : undefined,
+            attachmentRefsChanged ? currentRefs : undefined,
           )
         : onSave(text)
     void settlement.then((outcome) => {
@@ -279,7 +282,7 @@ export function InlineEditor({
     return settlement
   }, [
     busy,
-    attachmentRefs,
+    currentAttachmentRefs,
     dismissIfCurrent,
     isUnchanged,
     onCancel,
@@ -296,11 +299,12 @@ export function InlineEditor({
   ])
   const commitSaveAndSend = useCallback(() => {
     if (!onSaveAndSend || uploadingAttachments) return
+    const currentRefs = currentAttachmentRefs()
     const prefillOut = prefillOpen && prefillText.trim().length > 0 ? prefillText : ''
     setSaveAndSendError(null)
     const start = onSaveAndSend(text, {
       ...(prefillOut.length > 0 ? { prefillText: prefillOut } : {}),
-      ...(attachmentRefs.length > 0 ? { attachmentRefs } : {}),
+      ...(currentRefs.length > 0 ? { attachmentRefs: currentRefs } : {}),
     })
     if (start.kind === 'not-started') {
       setSaveAndSendError(
@@ -344,7 +348,7 @@ export function InlineEditor({
       }
     })()
   }, [
-    attachmentRefs,
+    currentAttachmentRefs,
     dismissIfCurrent,
     onSaveAndSend,
     prefillOpen,

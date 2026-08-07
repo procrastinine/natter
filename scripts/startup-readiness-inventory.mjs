@@ -429,7 +429,7 @@ export const STARTUP_READINESS_ACCEPTANCE = Object.freeze([
   'No wall-clock delay, lease TTL, retry backoff, debounce, or cleanup timer is a prerequisite for shell clickability.',
   'A hidden tab retains its workspace; visibility and pageshow only request durable fallback verification when BroadcastChannel is unavailable.',
   'Reloading during an active stream exposes the route and attempt projections before orphan recovery activation.',
-  'A middle-clicked background New chat tab preserves its route intent and acquires durable readiness through the shared demand boundary.',
+  'A background New chat tab preserves its route intent and acquires durable readiness through the shared demand boundary.',
 ])
 
 function stage(id, path, locator, readinessClass) {

@@ -1,4 +1,4 @@
-import type { Table, Transaction } from 'dexie'
+import Dexie, { type Table, type Transaction } from 'dexie'
 import type {
   SidebarSortExtrema,
   SidebarSortExtremum,
@@ -477,7 +477,7 @@ export async function rebuildChatSidebarProjectionRowsInTransaction(
   const chats = tx.table<Chat, ChatId>('chats')
   const rows = tx.table<ChatSidebarProjectionRow, ChatId>('chatSidebarRows')
   const aggregates = tx.table<ChatSidebarAggregateProjectionRow, string>('chatSidebarAggregates')
-  await Promise.all([rows.clear(), aggregates.clear()])
+  await Dexie.Promise.all([rows.clear(), aggregates.clear()])
   const accumulator = createChatSidebarAggregateAccumulator()
   let after: ChatId | undefined
   for (;;) {
@@ -838,44 +838,45 @@ async function readFolderSortExtrema(
   readonly reads: ChatSidebarProjectionMutationReceipt['extremaReads']
 }> {
   const table = tx.table<ChatSidebarProjectionRow, ChatId>('chatSidebarRows')
-  const [updatedAt, createdAt, lastViewedAt, totalCostUsd, wordCount, title] = await Promise.all([
-    readFolderFieldExtremum<number>(
-      table,
-      folderKey,
-      'updatedAt',
-      '[folderKey+visibleKey+pinnedKey+updatedAt+titleSortKey+id]',
-    ),
-    readFolderFieldExtremum<number>(
-      table,
-      folderKey,
-      'createdAt',
-      '[folderKey+visibleKey+pinnedKey+createdAt+titleSortKey+id]',
-    ),
-    readFolderFieldExtremum<number>(
-      table,
-      folderKey,
-      'lastViewedAt',
-      '[folderKey+visibleKey+pinnedKey+lastViewedAt+titleSortKey+id]',
-    ),
-    readFolderFieldExtremum<number>(
-      table,
-      folderKey,
-      'totalCostUsd',
-      '[folderKey+visibleKey+pinnedKey+totalCostUsd+titleSortKey+id]',
-    ),
-    readFolderFieldExtremum<number>(
-      table,
-      folderKey,
-      'wordCount',
-      '[folderKey+visibleKey+pinnedKey+wordCount+titleSortKey+id]',
-    ),
-    readFolderFieldExtremum<string>(
-      table,
-      folderKey,
-      'title',
-      '[folderKey+visibleKey+pinnedKey+titleSortKey+id]',
-    ),
-  ])
+  const [updatedAt, createdAt, lastViewedAt, totalCostUsd, wordCount, title] =
+    await Dexie.Promise.all([
+      readFolderFieldExtremum<number>(
+        table,
+        folderKey,
+        'updatedAt',
+        '[folderKey+visibleKey+pinnedKey+updatedAt+titleSortKey+id]',
+      ),
+      readFolderFieldExtremum<number>(
+        table,
+        folderKey,
+        'createdAt',
+        '[folderKey+visibleKey+pinnedKey+createdAt+titleSortKey+id]',
+      ),
+      readFolderFieldExtremum<number>(
+        table,
+        folderKey,
+        'lastViewedAt',
+        '[folderKey+visibleKey+pinnedKey+lastViewedAt+titleSortKey+id]',
+      ),
+      readFolderFieldExtremum<number>(
+        table,
+        folderKey,
+        'totalCostUsd',
+        '[folderKey+visibleKey+pinnedKey+totalCostUsd+titleSortKey+id]',
+      ),
+      readFolderFieldExtremum<number>(
+        table,
+        folderKey,
+        'wordCount',
+        '[folderKey+visibleKey+pinnedKey+wordCount+titleSortKey+id]',
+      ),
+      readFolderFieldExtremum<string>(
+        table,
+        folderKey,
+        'title',
+        '[folderKey+visibleKey+pinnedKey+titleSortKey+id]',
+      ),
+    ])
   return {
     extrema: {
       updatedAt: updatedAt.extremum,
@@ -902,7 +903,7 @@ async function readFolderFieldExtremum<T extends number | string>(
   readonly extremum: SidebarSortExtremum<T>
   readonly reads: ChatSidebarProjectionMutationReceipt['extremaReads']
 }> {
-  const results = await Promise.all(
+  const results = await Dexie.Promise.all(
     ([0, 1] as const).flatMap((pinnedKey) => {
       const collection = table
         .where(indexName)

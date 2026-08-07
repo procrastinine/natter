@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { BROWSER_WORKSPACE_CONTROL_DATABASE_NAME } from '../../src/lib/origin-storage-names'
@@ -352,7 +354,7 @@ describe('storage compaction state', () => {
       setItem.mock.calls.filter(([key]) =>
         String(key).startsWith('natter:storage-compaction-intent:v1:'),
       ),
-    ).toHaveLength(1)
+    ).toHaveLength(2)
     expect(
       removeItem.mock.calls.filter(([key]) =>
         String(key).startsWith('natter:storage-compaction-intent:v1:'),
@@ -360,7 +362,162 @@ describe('storage compaction state', () => {
     ).toHaveLength(1)
   })
 
-  it('closes failed debt ownership without retaining a stale database session', async () => {
+  it('starts threshold-triggered post-commit debt persistence outside the completed workspace transaction', async () => {
+    db = createDbForTests(`natter-compaction-isolation-${crypto.randomUUID()}`)
+    await db.open()
+    const previous = {
+      chatId: 'large-draft',
+      text: 'x'.repeat(1_100_000),
+      attachmentRefs: [],
+      updatedAt: 1,
+    }
+    await db.drafts.add(previous)
+    const transaction = IDBDatabase.prototype.transaction
+    const inheritedTransactionDatabases: Array<string | null> = []
+    const transactionSpy = vi
+      .spyOn(IDBDatabase.prototype, 'transaction')
+      .mockImplementation(function (this: IDBDatabase, storeNames, ...args) {
+        const names = typeof storeNames === 'string' ? [storeNames] : [...storeNames]
+        if (
+          this.name === BROWSER_WORKSPACE_CONTROL_DATABASE_NAME &&
+          names.includes('compactionStates') &&
+          args[0] === 'readwrite'
+        ) {
+          const ambientTransaction = Reflect.get(Dexie, 'currentTransaction') as
+            | { readonly db: { readonly name: string } }
+            | null
+            | undefined
+          inheritedTransactionDatabases.push(ambientTransaction?.db.name ?? null)
+        }
+        return transaction.call(this, storeNames, ...args)
+      })
+
+    await db.transaction('rw', db.drafts, (tx) =>
+      putPhysicalStorageRow(
+        tx,
+        'drafts',
+        { ...previous, text: 'replacement', updatedAt: 2 },
+        previous,
+      ),
+    )
+    await awaitStorageCompactionDebtIdle()
+
+    transactionSpy.mockRestore()
+    expect(inheritedTransactionDatabases).toEqual([null])
+    expect(await readStorageCompactionState(db)).toMatchObject({
+      knownReclaimableBytes: estimateStoredValueBytes(previous),
+    })
+  })
+
+  it('owns the shared debt-idle lifecycle outside the completed workspace transaction', () => {
+    const source = readFileSync(
+      resolve(__dirname, '../../src/store/storage-compaction-state.ts'),
+      'utf8',
+    )
+    const ownerStart = source.indexOf('function beginPhysicalMutationDebtWork(): void {')
+    const owner = source.slice(
+      ownerStart,
+      source.indexOf('function endPhysicalMutationDebtWork', ownerStart),
+    )
+
+    expect(owner).toMatch(
+      /physicalMutationDebtIdle = Dexie\.ignoreTransaction\([\s\S]*new Promise<void>/u,
+    )
+  })
+
+  it('keeps debt closure open from mutation admission through post-commit persistence', async () => {
+    db = createDbForTests(`natter-compaction-lifetime-${crypto.randomUUID()}`)
+    await db.open()
+    const previous = {
+      chatId: 'lifetime-draft',
+      text: 'old lifetime',
+      attachmentRefs: [],
+      updatedAt: 1,
+    }
+    await db.drafts.add(previous)
+    let releaseTransaction!: () => void
+    let mutationAdmitted!: () => void
+    const transactionHold = new Promise<void>((resolve) => {
+      releaseTransaction = resolve
+    })
+    const admitted = new Promise<void>((resolve) => {
+      mutationAdmitted = resolve
+    })
+    const transaction = db.transaction('rw', db.drafts, async (tx) => {
+      await putPhysicalStorageRow(
+        tx,
+        'drafts',
+        { ...previous, text: 'new lifetime', updatedAt: 2 },
+        previous,
+      )
+      mutationAdmitted()
+      await Dexie.waitFor(transactionHold)
+    })
+    await admitted
+
+    closeStorageCompactionDebtRuntime()
+    const idle = awaitStorageCompactionDebtIdle()
+    let settled = false
+    void idle.then(() => {
+      settled = true
+    })
+    await Promise.resolve()
+    expect(settled).toBe(false)
+
+    releaseTransaction()
+    await transaction
+    await idle
+    finishStorageCompactionDebtRuntimeClosure()
+    expect(() => assertStorageCompactionDebtRuntimeClosed()).not.toThrow()
+  })
+
+  it('retains a drain requested before an admitted transaction publishes its debt queue', async () => {
+    db = createDbForTests(`natter-compaction-late-queue-${crypto.randomUUID()}`)
+    await db.open()
+    const previous = {
+      chatId: 'late-queue-draft',
+      text: 'old late queue',
+      attachmentRefs: [],
+      updatedAt: 1,
+    }
+    await db.drafts.add(previous)
+    let releaseTransaction!: () => void
+    let mutationAdmitted!: () => void
+    const transactionHold = new Promise<void>((resolve) => {
+      releaseTransaction = resolve
+    })
+    const admitted = new Promise<void>((resolve) => {
+      mutationAdmitted = resolve
+    })
+    const transaction = db.transaction('rw', db.drafts, async (tx) => {
+      await putPhysicalStorageRow(
+        tx,
+        'drafts',
+        { ...previous, text: 'new late queue', updatedAt: 2 },
+        previous,
+      )
+      mutationAdmitted()
+      await Dexie.waitFor(transactionHold)
+    })
+    await admitted
+
+    const idle = awaitStorageCompactionDebtIdle()
+    let settled = false
+    void idle.then(() => {
+      settled = true
+    })
+    await Promise.resolve()
+    expect(settled).toBe(false)
+
+    releaseTransaction()
+    await transaction
+    await idle
+    expect(await readStorageCompactionState(db)).toMatchObject({
+      knownReclaimableBytes: estimateStoredValueBytes(previous),
+    })
+  })
+
+  it('hands off exact committed debt without retaining a stale database session', async () => {
     const name = `natter-compaction-reopen-${crypto.randomUUID()}`
     db = createDbForTests(name)
     await db.open()
@@ -408,9 +565,10 @@ describe('storage compaction state', () => {
     await expect(
       recoverStorageCompactionDebtIntents(db, { isOwnerLive: async () => false }),
     ).resolves.toBe(true)
+    const recoveredBytes = estimateStoredValueBytes(previous)
     expect(await readStorageCompactionState(db)).toMatchObject({
-      knownReclaimableBytes: STORAGE_COMPACTION_MIN_RECLAIMABLE_BYTES,
-      requestRevision: 1,
+      knownReclaimableBytes: recoveredBytes,
+      requestRevision: 0,
     })
 
     const committed = { ...previous, text: 'committed', updatedAt: 2 }
@@ -424,7 +582,7 @@ describe('storage compaction state', () => {
     )
     await awaitStorageCompactionDebtIdle()
     expect((await readStorageCompactionState(db)).knownReclaimableBytes).toBeGreaterThan(
-      STORAGE_COMPACTION_MIN_RECLAIMABLE_BYTES,
+      recoveredBytes,
     )
   })
 
@@ -576,6 +734,32 @@ describe('storage compaction state', () => {
     await expect(
       recoverStorageCompactionDebtIntents(db, { isOwnerLive: async () => false }),
     ).resolves.toBe(false)
+  })
+
+  it('recovers only the exact debt attributed to the active physical database', async () => {
+    db = createDbForTests(`natter-compaction-exact-recovery-${crypto.randomUUID()}`)
+    await db.open()
+    const key = storageCompactionRecoveryIntentKey('committed-tab')
+    localStorage.setItem(
+      key,
+      JSON.stringify({
+        formatVersion: 2,
+        nonce: 'committed-intent',
+        exactDebt: [
+          [db.name, 37],
+          ['retired-workspace-slot', STORAGE_COMPACTION_MIN_RECLAIMABLE_BYTES],
+        ],
+      }),
+    )
+
+    await expect(
+      recoverStorageCompactionDebtIntents(db, { isOwnerLive: async () => false }),
+    ).resolves.toBe(true)
+    expect(await readStorageCompactionState(db)).toMatchObject({
+      knownReclaimableBytes: 37,
+      requestRevision: 0,
+    })
+    expect(localStorage.getItem(key)).toBeNull()
   })
 
   it('leaves a live tab marker untouched and never guesses debt for it', async () => {

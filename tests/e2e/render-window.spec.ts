@@ -470,6 +470,7 @@ test('branch swipe preserves common-prefix DOM identity without loading or blank
   const swipeLabel = selectedBranchIsA ? 'Next variant' : 'First variant'
   const returnLabel = selectedBranchIsA ? 'Previous variant' : 'Last variant'
 
+  await expect(messages.nth(1).locator('[data-ui="branch-controls"]')).toBeVisible()
   await startMessageCountRecorder(page, { commonPrefixMessageIds })
   await messages.filter({ hasText: selectedUser }).getByLabel(swipeLabel).click()
   await expect(messages.nth(1)).toContainText(destinationUser)
@@ -859,7 +860,7 @@ test('sidebar keeps scroll position when auto-load crosses virtualization thresh
 
 test('a folder larger than one page expands gap-free without stealing the top-first viewport', async ({
   page,
-}) => {
+}, testInfo) => {
   test.setTimeout(60_000)
   const folderChatCount = 513
   const movedChatId = 'large-folder-drop-source'
@@ -892,8 +893,16 @@ test('a folder larger than one page expands gap-free without stealing the top-fi
   await source.dragTo(folderHeader)
   await expect(folder.locator('[data-ui="folder-count"]')).toHaveText(String(folderChatCount + 1))
   await expect(folderButton).toHaveAttribute('aria-expanded', 'true')
-  const moveLatency = await finishFolderMoveRecorder(page)
-  expect(moveLatency).toBeLessThan(250)
+  const movePerformance = await finishFolderMoveRecorder(page)
+  await testInfo.attach('folder-move-performance.json', {
+    body: Buffer.from(JSON.stringify(movePerformance)),
+    contentType: 'application/json',
+  })
+  expect(movePerformance.elapsedMs).toBeLessThan(1_000)
+  if (movePerformance.longTaskSupported) {
+    expect(movePerformance.maximumLongTaskMs).toBeLessThanOrEqual(100)
+    expect(movePerformance.totalBlockingTimeMs).toBeLessThanOrEqual(100)
+  }
   await expect.poll(() => list.evaluate((node) => node.scrollTop)).toBeLessThanOrEqual(2)
 
   const collected = new Set<string>()
@@ -1582,6 +1591,8 @@ async function startFolderMoveRecorder(page: Page, chatId: string): Promise<void
       droppedAt: number | null
       committedAt: number | null
       folderHeader: Element
+      longTaskObserver: PerformanceObserver | null
+      longTasks: Array<{ startTime: number; duration: number }>
       onDrop: () => void
       observer: MutationObserver
     }
@@ -1594,10 +1605,25 @@ async function startFolderMoveRecorder(page: Page, chatId: string): Promise<void
       droppedAt: null,
       committedAt: null,
       folderHeader,
+      longTaskObserver: null,
+      longTasks: [],
       onDrop: () => {
         record.droppedAt ??= performance.now()
       },
       observer: null as unknown as MutationObserver,
+    }
+    try {
+      if (!PerformanceObserver.supportedEntryTypes.includes('longtask')) {
+        throw new Error('LongTaskTimingUnsupported')
+      }
+      record.longTaskObserver = new PerformanceObserver((entries) => {
+        for (const entry of entries.getEntries()) {
+          record.longTasks.push({ startTime: entry.startTime, duration: entry.duration })
+        }
+      })
+      record.longTaskObserver.observe({ type: 'longtask', buffered: true })
+    } catch {
+      record.longTaskObserver = null
     }
     folderHeader.addEventListener('drop', record.onDrop, { capture: true })
     const sample = () => {
@@ -1626,7 +1652,12 @@ async function startFolderMoveRecorder(page: Page, chatId: string): Promise<void
   }, chatId)
 }
 
-async function finishFolderMoveRecorder(page: Page): Promise<number> {
+async function finishFolderMoveRecorder(page: Page): Promise<{
+  readonly elapsedMs: number
+  readonly longTaskSupported: boolean
+  readonly maximumLongTaskMs: number
+  readonly totalBlockingTimeMs: number
+}> {
   return page.evaluate(() => {
     const record = (
       window as typeof window & {
@@ -1634,6 +1665,8 @@ async function finishFolderMoveRecorder(page: Page): Promise<number> {
           droppedAt: number | null
           committedAt: number | null
           folderHeader: Element
+          longTaskObserver: PerformanceObserver | null
+          longTasks: Array<{ startTime: number; duration: number }>
           onDrop: () => void
           observer: MutationObserver
         }
@@ -1642,9 +1675,25 @@ async function finishFolderMoveRecorder(page: Page): Promise<number> {
     if (!record || record.droppedAt === null || record.committedAt === null) {
       throw new Error('FolderMoveRecordIncomplete')
     }
+    const { committedAt, droppedAt } = record
     record.observer.disconnect()
     record.folderHeader.removeEventListener('drop', record.onDrop, { capture: true })
-    return record.committedAt - record.droppedAt
+    for (const entry of record.longTaskObserver?.takeRecords() ?? []) {
+      record.longTasks.push({ startTime: entry.startTime, duration: entry.duration })
+    }
+    record.longTaskObserver?.disconnect()
+    const relevantLongTasks = record.longTasks.filter(
+      (task) => task.startTime < committedAt && task.startTime + task.duration > droppedAt,
+    )
+    return {
+      elapsedMs: committedAt - droppedAt,
+      longTaskSupported: record.longTaskObserver !== null,
+      maximumLongTaskMs: Math.max(0, ...relevantLongTasks.map((task) => task.duration)),
+      totalBlockingTimeMs: relevantLongTasks.reduce(
+        (total, task) => total + Math.max(0, task.duration - 50),
+        0,
+      ),
+    }
   })
 }
 

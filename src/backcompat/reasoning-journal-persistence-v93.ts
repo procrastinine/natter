@@ -141,7 +141,7 @@ function reasoningProducerBridge(
 }
 
 function isOfficialOpenAiProfile(profile: ReasoningBridgeContext['profile']): boolean {
-  if (!profile || profile.kind !== 'openai-compatible' || typeof profile.baseUrl !== 'string') {
+  if (profile?.kind !== 'openai-compatible' || typeof profile.baseUrl !== 'string') {
     return false
   }
   try {

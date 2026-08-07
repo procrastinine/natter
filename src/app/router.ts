@@ -336,12 +336,26 @@ let routeArrivalSnapshot = conversationRouteArrival(committedRouteSnapshot)
 let hashListenerInstalled = false
 
 function ensureHashListener(): void {
-  if (typeof window === 'undefined' || hashListenerInstalled) return
-  hashListenerInstalled = true
-  window.addEventListener('hashchange', () => {
+  if (typeof window === 'undefined') return
+  if (!hashListenerInstalled) {
+    hashListenerInstalled = true
+    window.addEventListener('hashchange', () => {
+      invalidateRouteIntent()
+      publishRouteChange()
+    })
+    window.addEventListener('pageshow', reconcileRouteSnapshotWithAddress)
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') reconcileRouteSnapshotWithAddress()
+    })
+  }
+  reconcileRouteSnapshotWithAddress()
+}
+
+function reconcileRouteSnapshotWithAddress(): void {
+  if (routeToHref(committedRouteSnapshot) !== routeToHref(currentAddressRoute())) {
     invalidateRouteIntent()
     publishRouteChange()
-  })
+  }
 }
 
 function publishRouteChange(handoff?: ConversationRouteHandoff): void {

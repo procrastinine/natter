@@ -419,6 +419,7 @@ function createAttemptLivePublisher(
   let requestedRevision: number | undefined
   let requestedPromise: Promise<void> | undefined
   let projectedRevision: number | undefined
+  let queuedProjectionTasks = 0
   let automaticProjectionSuppressed = false
 
   const clearTimer = () => {
@@ -432,6 +433,7 @@ function createAttemptLivePublisher(
   }
 
   const enqueue = (publishNow: number, force = false): Promise<void> => {
+    queuedProjectionTasks += 1
     const task = tail.then(async () => {
       if (force) automaticProjectionSuppressed = false
       if (
@@ -478,14 +480,19 @@ function createAttemptLivePublisher(
       else projectedRevision = revision
       markStreamAccumulatorPublished(input.accumulator, publishNow, revision)
     })
-    const observed = task.catch((error) => {
-      const normalized = errorFromUnknown(error)
-      if (failure === undefined) {
-        failure = normalized
-        input.onLiveProjectionFailure?.(normalized)
-      }
-      throw normalized
-    })
+    const observed = task
+      .finally(() => {
+        queuedProjectionTasks -= 1
+        if (queuedProjectionTasks === 0) projectedRevision = undefined
+      })
+      .catch((error) => {
+        const normalized = errorFromUnknown(error)
+        if (failure === undefined) {
+          failure = normalized
+          input.onLiveProjectionFailure?.(normalized)
+        }
+        throw normalized
+      })
     tail = observed.catch(() => {})
     return observed
   }
@@ -548,7 +555,6 @@ function createAttemptLivePublisher(
         return Promise.resolve()
       }
       const revision = input.accumulator.liveMutationRevision
-      if (projectedRevision === revision) return Promise.resolve()
       if (requestedRevision === revision && requestedPromise) return requestedPromise
       requestedRevision = revision
       const request = enqueue(now(), true).finally(() => {

@@ -1,5 +1,4 @@
-import type Dexie from 'dexie'
-import type { Transaction } from 'dexie'
+import Dexie, { type Transaction } from 'dexie'
 import { browserLocalStorage } from '../lib/browser-storage'
 import { newId } from '../lib/ulid'
 import type { BrowserLockRow } from './browser-lock-record'
@@ -15,6 +14,7 @@ export const STORAGE_COMPACTION_MIN_RECLAIMABLE_BYTES =
   BROWSER_WORKSPACE_COMPACTION_MIN_RECLAIMABLE_BYTES
 
 interface PhysicalMutationLedger {
+  readonly databaseName: string
   obsoleteBytes: number
 }
 
@@ -26,18 +26,22 @@ const STORAGE_COMPACTION_RECOVERY_INTENT_PREFIX = 'natter:storage-compaction-int
 const STORAGE_COMPACTION_RECOVERY_COORDINATION_RESOURCE = 'storage-compaction-recovery:v1'
 const STORAGE_COMPACTION_INTENT_OWNER_RESOURCE_PREFIX = 'storage-compaction-intent-owner:v1:'
 const STORAGE_COMPACTION_WRITE_ADMISSION = Symbol('StorageCompactionWriteAdmission')
+const STORAGE_COMPACTION_RECOVERY_INTENT_FORMAT_VERSION = 2
 const STORAGE_COMPACTION_DEBT_RETRY_BASE_MS = 1_000
 const STORAGE_COMPACTION_DEBT_RETRY_MAX_MS = 60_000
 const STORAGE_COMPACTION_DEBT_FLUSH_BYTES = 1024 * 1024
 const physicalMutationTabId = createPhysicalMutationTabId()
 const physicalMutationMarkerKey = storageCompactionRecoveryIntentKey(physicalMutationTabId)
-const physicalMutationMarkerValue = createPhysicalMutationTabId()
+const physicalMutationMarkerNonce = createPhysicalMutationTabId()
+const physicalMutationRecoveryDebtByDatabase = new Map<string, number>()
+let physicalMutationMarkerValue: string | null = null
 let physicalMutationIntentOutstanding = false
 let activePhysicalMutationLedgers = 0
 let pendingCompletedPhysicalMutationLedgers = 0
 let physicalMutationDebtWork = 0
 let physicalMutationDebtIdle: Promise<void> = Promise.resolve()
 let resolvePhysicalMutationDebtIdle: (() => void) | null = null
+let physicalMutationDebtDrainRequested = false
 let physicalMutationDebtClosing = false
 let physicalMutationDebtFailure: unknown = null
 let physicalMutationDebtRecoveryHandoff = false
@@ -61,6 +65,7 @@ interface PhysicalMutationDebtQueue {
   readonly databaseName: string
   obsoleteBytes: number
   completedLedgers: number
+  settledLedgers: number
   phase: 'scheduled' | 'writing' | 'retry-wait'
   failureCount: number
   task: Promise<void> | null
@@ -71,6 +76,7 @@ interface StorageCompactionRecoveryIntent {
   readonly key: string
   readonly value: string
   readonly tabId: string
+  readonly exactDebtByDatabase: ReadonlyMap<string, number> | null
 }
 
 interface StorageCompactionRecoveryOptions {
@@ -123,6 +129,8 @@ function completeStorageCompactionDebt(
   if (!ledger) return undefined
   physicalMutationLedgers.delete(tx)
   activePhysicalMutationLedgers -= 1
+  addPhysicalMutationRecoveryDebt(ledger.databaseName, ledger.obsoleteBytes)
+  syncCurrentStorageCompactionRecoveryIntent()
   return ledger
 }
 
@@ -131,7 +139,8 @@ export function discardStorageCompactionDebt(tx: Transaction): void {
   if (!ledger) return
   physicalMutationLedgers.delete(tx)
   activePhysicalMutationLedgers -= 1
-  maybeClearCurrentStorageCompactionRecoveryIntent()
+  endPhysicalMutationDebtWork()
+  syncCurrentStorageCompactionRecoveryIntent()
 }
 
 function commitCompletedStorageCompactionDebt(
@@ -143,6 +152,7 @@ function commitCompletedStorageCompactionDebt(
     databaseName,
     obsoleteBytes: 0,
     completedLedgers: 0,
+    settledLedgers: 0,
     phase: 'scheduled' as const,
     failureCount: 0,
     task: null,
@@ -153,10 +163,10 @@ function commitCompletedStorageCompactionDebt(
   pendingCompletedPhysicalMutationLedgers += 1
   if (!physicalMutationDebtQueues.has(databaseName)) {
     physicalMutationDebtQueues.set(databaseName, queue)
-    beginPhysicalMutationDebtWork()
   }
   if (
     physicalMutationDebtClosing ||
+    physicalMutationDebtDrainRequested ||
     !physicalMutationIntentOutstanding ||
     queue.obsoleteBytes >= STORAGE_COMPACTION_DEBT_FLUSH_BYTES
   ) {
@@ -186,11 +196,24 @@ export async function recoverStorageCompactionDebtIntents(
         if (!live) stale.push(intent)
       }
       if (stale.length === 0) return false
-      const state = await readBrowserWorkspaceCompactionState(db.name)
-      const { requested } = await recordBrowserWorkspaceCompactionDebt(
-        db.name,
-        storageCompactionDebtThreshold(state.lastCompactedLiveBytes),
+      let obsoleteBytes = stale.reduce(
+        (total, intent) =>
+          intent.exactDebtByDatabase
+            ? saturatingAdd(total, intent.exactDebtByDatabase.get(db.name) ?? 0)
+            : total,
+        0,
       )
+      if (stale.some((intent) => intent.exactDebtByDatabase === null)) {
+        const state = await readBrowserWorkspaceCompactionState(db.name)
+        obsoleteBytes = Math.max(
+          obsoleteBytes,
+          storageCompactionDebtThreshold(state.lastCompactedLiveBytes),
+        )
+      }
+      const requested =
+        obsoleteBytes === 0
+          ? false
+          : (await recordBrowserWorkspaceCompactionDebt(db.name, obsoleteBytes)).requested
       clearStorageCompactionRecoveryIntents(stale)
       if (requested) publishStorageCompactionRequest()
       return true
@@ -206,6 +229,7 @@ export async function awaitStorageCompactionDebtIdle(): Promise<void> {
 }
 
 export function flushStorageCompactionDebt(): void {
+  if (physicalMutationDebtWork !== 0) physicalMutationDebtDrainRequested = true
   for (const queue of physicalMutationDebtQueues.values()) {
     if (queue.timer !== null) {
       clearTimeout(queue.timer)
@@ -217,6 +241,7 @@ export function flushStorageCompactionDebt(): void {
 
 export function closeStorageCompactionDebtRuntime(): void {
   physicalMutationDebtClosing = true
+  if (physicalMutationDebtWork !== 0) physicalMutationDebtDrainRequested = true
   for (const queue of physicalMutationDebtQueues.values()) {
     if (queue.timer !== null) {
       clearTimeout(queue.timer)
@@ -258,7 +283,10 @@ export function finishStorageCompactionDebtRuntimeClosure(): void {
     throw new Error('StorageCompactionDebtRecoveryHandoffMissing')
   }
   physicalMutationIntentOutstanding = false
+  physicalMutationMarkerValue = null
+  physicalMutationRecoveryDebtByDatabase.clear()
   physicalMutationDebtClosing = false
+  physicalMutationDebtDrainRequested = false
   physicalMutationDebtFailure = null
   physicalMutationDebtRecoveryHandoff = false
   physicalMutationDebtIdle = Promise.resolve()
@@ -271,10 +299,13 @@ export function assertStorageCompactionDebtRuntimeClosed(): void {
     physicalMutationDebtWork !== 0 ||
     resolvePhysicalMutationDebtIdle !== null ||
     physicalMutationDebtQueues.size !== 0 ||
+    physicalMutationDebtDrainRequested ||
     physicalMutationDebtClosing ||
     physicalMutationDebtFailure !== null ||
     physicalMutationDebtRecoveryHandoff ||
     physicalMutationIntentOutstanding ||
+    physicalMutationMarkerValue !== null ||
+    physicalMutationRecoveryDebtByDatabase.size !== 0 ||
     storageCompactionRequestListeners.size !== 0
   ) {
     throw new Error('StorageCompactionDebtRuntimeNotClosed')
@@ -419,17 +450,22 @@ export async function __resetStorageCompactionStateForTests(): Promise<void> {
   closeStorageCompactionDebtRuntime()
   await awaitStorageCompactionDebtIdle()
   clearStorageCompactionRecoveryIntents([
-    { key: physicalMutationMarkerKey, value: physicalMutationMarkerValue },
+    ...(physicalMutationMarkerValue === null
+      ? []
+      : [{ key: physicalMutationMarkerKey, value: physicalMutationMarkerValue }]),
   ])
   physicalMutationLedgers = new WeakMap<Transaction, PhysicalMutationLedger>()
   physicalMutationTransactionDatabaseNames = new WeakMap<object, string>()
   physicalMutationDebtQueues.clear()
   physicalMutationIntentOutstanding = false
+  physicalMutationMarkerValue = null
+  physicalMutationRecoveryDebtByDatabase.clear()
   activePhysicalMutationLedgers = 0
   pendingCompletedPhysicalMutationLedgers = 0
   physicalMutationDebtWork = 0
   physicalMutationDebtIdle = Promise.resolve()
   resolvePhysicalMutationDebtIdle = null
+  physicalMutationDebtDrainRequested = false
   physicalMutationDebtClosing = false
   physicalMutationDebtFailure = null
   physicalMutationDebtRecoveryHandoff = false
@@ -442,11 +478,13 @@ export async function __resetStorageCompactionStateForTests(): Promise<void> {
 }
 
 function createPhysicalMutationLedger(tx: Transaction): PhysicalMutationLedger {
-  ensureCurrentStorageCompactionRecoveryIntent()
   activePhysicalMutationLedgers += 1
+  beginPhysicalMutationDebtWork()
   const databaseName = physicalMutationTransactionDatabaseNames.get(tx.idbtrans) ?? tx.db.name
+  ensureCurrentStorageCompactionRecoveryIntent()
   let settled = false
   const ledger = {
+    databaseName,
     obsoleteBytes: 0,
   }
   physicalMutationLedgers.set(tx, ledger)
@@ -462,7 +500,8 @@ function createPhysicalMutationLedger(tx: Transaction): PhysicalMutationLedger {
     if (!current) return
     physicalMutationLedgers.delete(tx)
     activePhysicalMutationLedgers -= 1
-    maybeClearCurrentStorageCompactionRecoveryIntent()
+    endPhysicalMutationDebtWork()
+    syncCurrentStorageCompactionRecoveryIntent()
   })
   return ledger
 }
@@ -482,8 +521,7 @@ function schedulePhysicalMutationDebtQueue(
   }
   queue.phase = 'scheduled'
   let disposition: 'finish' | 'handoff' | number = 'finish'
-  const task = Promise.resolve()
-    .then(() => drainPhysicalMutationDebtQueueBatch(queue))
+  const task = Dexie.ignoreTransaction(() => drainPhysicalMutationDebtQueueBatch(queue))
     .then((succeeded) => {
       if (succeeded) {
         queue.failureCount = 0
@@ -502,7 +540,10 @@ function schedulePhysicalMutationDebtQueue(
       queue.task = null
       if (disposition === 'finish') finishPhysicalMutationDebtQueue(queue, false)
       else if (disposition === 'handoff') finishPhysicalMutationDebtQueue(queue, true)
-      else schedulePhysicalMutationDebtQueue(queue, disposition)
+      else {
+        schedulePhysicalMutationDebtQueue(queue, disposition)
+        releaseSettledPhysicalMutationDebtWork(queue)
+      }
     })
   queue.task = task
 }
@@ -520,7 +561,9 @@ async function drainPhysicalMutationDebtQueueBatch(
     const debt = await recordBrowserWorkspaceCompactionDebt(queue.databaseName, obsoleteBytes)
     if (debt.requested) publishStorageCompactionRequest()
     pendingCompletedPhysicalMutationLedgers -= completedLedgers
-    maybeClearCurrentStorageCompactionRecoveryIntent()
+    subtractPhysicalMutationRecoveryDebt(queue.databaseName, obsoleteBytes)
+    queue.settledLedgers += completedLedgers
+    syncCurrentStorageCompactionRecoveryIntent()
     return true
   } catch (error) {
     queue.obsoleteBytes = saturatingAdd(queue.obsoleteBytes, obsoleteBytes)
@@ -540,13 +583,20 @@ function finishPhysicalMutationDebtQueue(
   }
   if (recoveryHandoff) {
     pendingCompletedPhysicalMutationLedgers -= queue.completedLedgers
+    queue.settledLedgers += queue.completedLedgers
     queue.completedLedgers = 0
     queue.obsoleteBytes = 0
     if (physicalMutationIntentOutstanding) physicalMutationDebtRecoveryHandoff = true
     else physicalMutationDebtFailure ??= new Error('StorageCompactionDebtUnprotectedFailure')
   }
   physicalMutationDebtQueues.delete(queue.databaseName)
-  endPhysicalMutationDebtWork()
+  releaseSettledPhysicalMutationDebtWork(queue)
+}
+
+function releaseSettledPhysicalMutationDebtWork(queue: PhysicalMutationDebtQueue): void {
+  const settledLedgers = queue.settledLedgers
+  queue.settledLedgers = 0
+  endPhysicalMutationDebtWork(settledLedgers)
 }
 
 function storageCompactionDebtRetryDelay(failureCount: number): number {
@@ -576,7 +626,14 @@ function readStorageCompactionRecoveryIntents(): StorageCompactionRecoveryIntent
     if (!key?.startsWith(STORAGE_COMPACTION_RECOVERY_INTENT_PREFIX)) continue
     const value = storage.getItem(key)
     const tabId = key.slice(STORAGE_COMPACTION_RECOVERY_INTENT_PREFIX.length)
-    if (value && tabId) intents.push({ key, value, tabId })
+    if (value && tabId) {
+      intents.push({
+        key,
+        value,
+        tabId,
+        exactDebtByDatabase: parseStorageCompactionRecoveryIntent(value),
+      })
+    }
   }
   return intents
 }
@@ -605,39 +662,110 @@ function writeStorageCompactionRecoveryIntent(key: string, value: string): boole
 }
 
 function ensureCurrentStorageCompactionRecoveryIntent(): void {
-  if (physicalMutationIntentOutstanding) return
-  physicalMutationIntentOutstanding = writeStorageCompactionRecoveryIntent(
-    physicalMutationMarkerKey,
-    physicalMutationMarkerValue,
+  writeCurrentStorageCompactionRecoveryIntent(serializeStorageCompactionRecoveryIntent(null))
+}
+
+function syncCurrentStorageCompactionRecoveryIntent(): void {
+  if (activePhysicalMutationLedgers !== 0) {
+    writeCurrentStorageCompactionRecoveryIntent(serializeStorageCompactionRecoveryIntent(null))
+  } else if (physicalMutationRecoveryDebtByDatabase.size !== 0) {
+    writeCurrentStorageCompactionRecoveryIntent(
+      serializeStorageCompactionRecoveryIntent(physicalMutationRecoveryDebtByDatabase),
+    )
+  } else if (physicalMutationIntentOutstanding && physicalMutationMarkerValue !== null) {
+    clearStorageCompactionRecoveryIntents([
+      { key: physicalMutationMarkerKey, value: physicalMutationMarkerValue },
+    ])
+    physicalMutationIntentOutstanding = false
+    physicalMutationMarkerValue = null
+  }
+}
+
+function writeCurrentStorageCompactionRecoveryIntent(value: string): void {
+  if (physicalMutationMarkerValue === value && physicalMutationIntentOutstanding) return
+  if (!writeStorageCompactionRecoveryIntent(physicalMutationMarkerKey, value)) return
+  physicalMutationIntentOutstanding = true
+  physicalMutationMarkerValue = value
+}
+
+function serializeStorageCompactionRecoveryIntent(
+  debtByDatabase: ReadonlyMap<string, number> | null,
+): string {
+  return JSON.stringify({
+    formatVersion: STORAGE_COMPACTION_RECOVERY_INTENT_FORMAT_VERSION,
+    nonce: physicalMutationMarkerNonce,
+    exactDebt:
+      debtByDatabase === null
+        ? null
+        : [...debtByDatabase.entries()].sort(([left], [right]) => left.localeCompare(right)),
+  })
+}
+
+function parseStorageCompactionRecoveryIntent(value: string): ReadonlyMap<string, number> | null {
+  try {
+    const parsed: unknown = JSON.parse(value)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null
+    const candidate = parsed as Record<string, unknown>
+    if (
+      candidate.formatVersion !== STORAGE_COMPACTION_RECOVERY_INTENT_FORMAT_VERSION ||
+      typeof candidate.nonce !== 'string' ||
+      !Array.isArray(candidate.exactDebt)
+    ) {
+      return null
+    }
+    const debts = new Map<string, number>()
+    for (const entry of candidate.exactDebt) {
+      if (
+        !Array.isArray(entry) ||
+        entry.length !== 2 ||
+        typeof entry[0] !== 'string' ||
+        entry[0].length === 0 ||
+        !Number.isSafeInteger(entry[1]) ||
+        Number(entry[1]) < 0
+      ) {
+        return null
+      }
+      debts.set(entry[0], saturatingAdd(debts.get(entry[0]) ?? 0, Number(entry[1])))
+    }
+    return debts
+  } catch {
+    return null
+  }
+}
+
+function addPhysicalMutationRecoveryDebt(databaseName: string, obsoleteBytes: number): void {
+  physicalMutationRecoveryDebtByDatabase.set(
+    databaseName,
+    saturatingAdd(physicalMutationRecoveryDebtByDatabase.get(databaseName) ?? 0, obsoleteBytes),
   )
 }
 
-function maybeClearCurrentStorageCompactionRecoveryIntent(): void {
-  if (
-    !physicalMutationIntentOutstanding ||
-    activePhysicalMutationLedgers !== 0 ||
-    pendingCompletedPhysicalMutationLedgers !== 0
-  ) {
-    return
-  }
-  clearStorageCompactionRecoveryIntents([
-    { key: physicalMutationMarkerKey, value: physicalMutationMarkerValue },
-  ])
-  physicalMutationIntentOutstanding = false
+function subtractPhysicalMutationRecoveryDebt(databaseName: string, obsoleteBytes: number): void {
+  const remaining = (physicalMutationRecoveryDebtByDatabase.get(databaseName) ?? 0) - obsoleteBytes
+  if (remaining < 0) throw new Error('StorageCompactionRecoveryDebtUnderflow')
+  if (remaining === 0) physicalMutationRecoveryDebtByDatabase.delete(databaseName)
+  else physicalMutationRecoveryDebtByDatabase.set(databaseName, remaining)
 }
 
 function beginPhysicalMutationDebtWork(): void {
   if (physicalMutationDebtWork === 0) {
-    physicalMutationDebtIdle = new Promise<void>((resolve) => {
-      resolvePhysicalMutationDebtIdle = resolve
-    })
+    physicalMutationDebtIdle = Dexie.ignoreTransaction(
+      () =>
+        new Promise<void>((resolve) => {
+          resolvePhysicalMutationDebtIdle = resolve
+        }),
+    )
   }
   physicalMutationDebtWork += 1
 }
 
-function endPhysicalMutationDebtWork(): void {
-  physicalMutationDebtWork -= 1
+function endPhysicalMutationDebtWork(completedLedgers = 1): void {
+  if (completedLedgers > physicalMutationDebtWork) {
+    throw new Error('StorageCompactionDebtWorkUnderflow')
+  }
+  physicalMutationDebtWork -= completedLedgers
   if (physicalMutationDebtWork !== 0) return
+  physicalMutationDebtDrainRequested = false
   const resolve = resolvePhysicalMutationDebtIdle
   resolvePhysicalMutationDebtIdle = null
   resolve?.()

@@ -1,10 +1,18 @@
 import type { Transaction } from 'dexie'
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { browserLocalStorage, browserSessionStorage } from '../../src/lib/browser-storage'
 import {
   abortIndexedDbTransactionAtCancellationBoundary,
   bindReadonlyTransactionAbort,
 } from '../../src/store/browser-indexeddb-reads'
+import {
+  CONVERSATION_SESSION_PREFIX,
+  initializeWorkspaceTabSessionContext,
+} from '../../src/store/workspace-tab-session'
+
+afterEach(() => {
+  sessionStorage.clear()
+})
 
 describe('browser storage boundary', () => {
   it('selects the current browser origin storage', () => {
@@ -20,6 +28,22 @@ describe('browser storage boundary', () => {
     browserSessionStorage()?.setItem('browser-storage-proof', 'session')
     expect(target?.localStorage.getItem('browser-storage-proof')).toBe('local')
     expect(target?.sessionStorage.getItem('browser-storage-proof')).toBe('session')
+  })
+
+  it('preserves reload state but clears cloned presentation state in a new navigation context', () => {
+    const conversationKey = `${CONVERSATION_SESSION_PREFIX}chat-a`
+    sessionStorage.clear()
+    sessionStorage.setItem(conversationKey, 'inherited-tree-presentation')
+
+    initializeWorkspaceTabSessionContext(window, 'navigate')
+    expect(sessionStorage.getItem(conversationKey)).toBeNull()
+
+    sessionStorage.setItem(conversationKey, 'reload-presentation')
+    initializeWorkspaceTabSessionContext(window, 'reload')
+    expect(sessionStorage.getItem(conversationKey)).toBe('reload-presentation')
+
+    initializeWorkspaceTabSessionContext(window, 'navigate')
+    expect(sessionStorage.getItem(conversationKey)).toBeNull()
   })
 })
 

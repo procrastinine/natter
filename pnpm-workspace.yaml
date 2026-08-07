@@ -2,13 +2,16 @@ packages:
   - .
 
 minimumReleaseAge: 1440
+minimumReleaseAgeStrict: true
+minimumReleaseAgeIgnoreMissingTime: false
 trustPolicy: no-downgrade
+trustLockfile: false
 blockExoticSubdeps: true
 strictDepBuilds: true
 overrides:
   mermaid>marked: 17.0.6
   cytoscape-cose-bilkent>cose-base: 2.2.0
-updateConfig:
-  ignoreDependencies:
+update:
+  ignoreDeps:
     - '@typescript/native'
     - typescript

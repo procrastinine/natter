@@ -521,7 +521,7 @@ function geminiVisibleBinding(
     | { readonly visibleIds: ReadonlySet<string>; readonly carrierIds: ReadonlySet<string> }
     | undefined,
 ): { readonly bindsVisiblePartId?: string } {
-  if (!members || members.visibleIds.size !== 1 || members.carrierIds.size !== 1) return {}
+  if (members?.visibleIds.size !== 1 || members.carrierIds.size !== 1) return {}
   const bindsVisiblePartId = members.visibleIds.values().next().value
   return bindsVisiblePartId === undefined ? {} : { bindsVisiblePartId }
 }

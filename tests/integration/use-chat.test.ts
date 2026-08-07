@@ -3455,53 +3455,53 @@ describe('recoverOrphans', () => {
     expect(await streamLeases(chat.id)).toEqual([first])
   })
 
-  it.each([
-    'generation',
-    'continuation',
-  ] as const)('recovers a fresh uncommitted-target %s admission immediately when its owner is gone', async (attemptKind) => {
-    __setStreamLockManagerForTests(new TestExclusiveLockManager())
-    const chat = await createChat({ settings: chatSettings() })
-    const lease = await insertRecoveryLease({
-      streamId: `uncommitted-target-${attemptKind}`,
-      chatId: chat.id,
-      messageId: `missing-${attemptKind}`,
-      startedAt: 100,
-      heartbeatAt: 19_000,
-      attemptKind,
-      ...(attemptKind === 'continuation' ? { continuationStrategy: 'prompt' as const } : {}),
-    })
+  it.each(['generation', 'continuation'] as const)(
+    'recovers a fresh uncommitted-target %s admission immediately when its owner is gone',
+    async (attemptKind) => {
+      __setStreamLockManagerForTests(new TestExclusiveLockManager())
+      const chat = await createChat({ settings: chatSettings() })
+      const lease = await insertRecoveryLease({
+        streamId: `uncommitted-target-${attemptKind}`,
+        chatId: chat.id,
+        messageId: `missing-${attemptKind}`,
+        startedAt: 100,
+        heartbeatAt: 19_000,
+        attemptKind,
+        ...(attemptKind === 'continuation' ? { continuationStrategy: 'prompt' as const } : {}),
+      })
 
-    await expect(recoverStreamOrphan({ streamId: lease.streamId }, 20_000)).resolves.toBe(
-      'recovered',
-    )
-    expect(await streamLeases(chat.id)).toEqual([])
-  })
+      await expect(recoverStreamOrphan({ streamId: lease.streamId }, 20_000)).resolves.toBe(
+        'recovered',
+      )
+      expect(await streamLeases(chat.id)).toEqual([])
+    },
+  )
 
-  it.each([
-    'generation',
-    'continuation',
-  ] as const)('waits for the no-Web-Locks TTL before recovering an uncommitted-target %s admission', async (attemptKind) => {
-    __setStreamLockManagerForTests(null)
-    const chat = await createChat({ settings: chatSettings() })
-    const lease = await insertRecoveryLease({
-      streamId: `fallback-uncommitted-${attemptKind}`,
-      chatId: chat.id,
-      messageId: `fallback-missing-${attemptKind}`,
-      startedAt: 100,
-      heartbeatAt: 19_000,
-      attemptKind,
-      ...(attemptKind === 'continuation' ? { continuationStrategy: 'prompt' as const } : {}),
-    })
+  it.each(['generation', 'continuation'] as const)(
+    'waits for the no-Web-Locks TTL before recovering an uncommitted-target %s admission',
+    async (attemptKind) => {
+      __setStreamLockManagerForTests(null)
+      const chat = await createChat({ settings: chatSettings() })
+      const lease = await insertRecoveryLease({
+        streamId: `fallback-uncommitted-${attemptKind}`,
+        chatId: chat.id,
+        messageId: `fallback-missing-${attemptKind}`,
+        startedAt: 100,
+        heartbeatAt: 19_000,
+        attemptKind,
+        ...(attemptKind === 'continuation' ? { continuationStrategy: 'prompt' as const } : {}),
+      })
 
-    await expect(recoverStreamOrphan({ streamId: lease.streamId }, 20_000)).resolves.toBe(
-      'deferred',
-    )
-    expect(await streamLeases(chat.id)).toHaveLength(1)
-    await expect(recoverStreamOrphan({ streamId: lease.streamId }, 34_001)).resolves.toBe(
-      'recovered',
-    )
-    expect(await streamLeases(chat.id)).toEqual([])
-  })
+      await expect(recoverStreamOrphan({ streamId: lease.streamId }, 20_000)).resolves.toBe(
+        'deferred',
+      )
+      expect(await streamLeases(chat.id)).toHaveLength(1)
+      await expect(recoverStreamOrphan({ streamId: lease.streamId }, 34_001)).resolves.toBe(
+        'recovered',
+      )
+      expect(await streamLeases(chat.id)).toEqual([])
+    },
+  )
 
   it('does not invent live recovery state for an unfinished header without a lease', async () => {
     const chat = await createChat({ settings: chatSettings() })

@@ -420,29 +420,29 @@ describe('toChatCompletions', () => {
     ])
   })
 
-  it.each([
-    'partial',
-    'prefix',
-  ] as const)('serializes only the sealed direct-provider %s marker', (marker) => {
-    const path = [
-      textMessage({ id: 'u1', role: 'user', text: 'hi' }),
-      textMessage({ id: 'a1', role: 'assistant', text: 'Sure,', origin: 'prefill' }),
-    ]
-    const { wire } = toChatCompletions(settings(), path, {
-      prefillPlan: {
-        availability: 'supported',
-        continueStrategy: 'prefill',
-        request: 'send-once',
-        semanticRetry: 'never',
-        serialization: { kind: 'assistant-tail', marker },
-        basis: 'endpoint-capability',
-      },
-    })
-    expect(wire.messages).toEqual([
-      { role: 'user', content: 'hi' },
-      { role: 'assistant', content: 'Sure,', [marker]: true },
-    ])
-  })
+  it.each(['partial', 'prefix'] as const)(
+    'serializes only the sealed direct-provider %s marker',
+    (marker) => {
+      const path = [
+        textMessage({ id: 'u1', role: 'user', text: 'hi' }),
+        textMessage({ id: 'a1', role: 'assistant', text: 'Sure,', origin: 'prefill' }),
+      ]
+      const { wire } = toChatCompletions(settings(), path, {
+        prefillPlan: {
+          availability: 'supported',
+          continueStrategy: 'prefill',
+          request: 'send-once',
+          semanticRetry: 'never',
+          serialization: { kind: 'assistant-tail', marker },
+          basis: 'endpoint-capability',
+        },
+      })
+      expect(wire.messages).toEqual([
+        { role: 'user', content: 'hi' },
+        { role: 'assistant', content: 'Sure,', [marker]: true },
+      ])
+    },
+  )
 
   it('carries a saved per-model connection capability through routing to the wire', () => {
     const chatSettings = settings({ model: 'z-ai/glm-5.1' })

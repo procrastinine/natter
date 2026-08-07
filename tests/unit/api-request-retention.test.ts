@@ -173,28 +173,27 @@ describe('adapter request retention', () => {
     },
   ]
 
-  it.each(cases)('$name stays lazy and sends the exact body on its first pull', async ({
-    expectedBody,
-    response,
-    open,
-  }) => {
-    let body: BodyInit | null | undefined
-    const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
-      body = init?.body
-      return response()
-    })
-    vi.stubGlobal('fetch', fetchMock)
+  it.each(cases)(
+    '$name stays lazy and sends the exact body on its first pull',
+    async ({ expectedBody, response, open }) => {
+      let body: BodyInit | null | undefined
+      const fetchMock = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+        body = init?.body
+        return response()
+      })
+      vi.stubGlobal('fetch', fetchMock)
 
-    const stream = open()
-    expect(fetchMock).not.toHaveBeenCalled()
+      const stream = open()
+      expect(fetchMock).not.toHaveBeenCalled()
 
-    const first = await stream.next()
+      const first = await stream.next()
 
-    expect(first.done).toBe(false)
-    expect(fetchMock).toHaveBeenCalledTimes(1)
-    expect(body).toBe(expectedBody)
-    await stream.return(undefined)
-  })
+      expect(first.done).toBe(false)
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+      expect(body).toBe(expectedBody)
+      await stream.return(undefined)
+    },
+  )
 
   it('releases an unstarted request without dispatching when the consumer closes it', async () => {
     const fetchMock = vi.fn()

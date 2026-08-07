@@ -1,7 +1,7 @@
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { resolve } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   CHECKPOINT_REQUIRED_STAGE_IDS,
   collectVerificationMetadata,
@@ -24,6 +24,7 @@ import { createVerificationRuntimeInvocation } from '../../scripts/verification-
 const temporaryRoots: string[] = []
 
 afterEach(async () => {
+  vi.restoreAllMocks()
   await Promise.all(
     temporaryRoots.splice(0).map((path) => rm(path, { force: true, recursive: true })),
   )
@@ -70,6 +71,7 @@ describe('verification runner', () => {
       'production-build',
       'vitest',
       'chromium-e2e',
+      'firefox-e2e',
       'headed-hidden-tab-visual-continuity',
       'dev-preview-parity',
       'stream-profile-single',
@@ -77,6 +79,7 @@ describe('verification runner', () => {
       'performance',
     ])
     expect(VERIFICATION_STAGES.every((stage) => Object.isFrozen(stage.argv))).toBe(true)
+    expect(VERIFICATION_STAGES.find((stage) => stage.id === 'vitest')?.stderr).toBe('empty')
   })
 
   it('runs every independent stage after advisory and blocking failures', async () => {
@@ -172,11 +175,12 @@ describe('verification runner', () => {
     const runDirectory = '/evidence/current-run'
     const vitest = VERIFICATION_STAGES.find((stage) => stage.id === 'vitest')
     const browser = VERIFICATION_STAGES.find((stage) => stage.id === 'chromium-e2e')
+    const firefox = VERIFICATION_STAGES.find((stage) => stage.id === 'firefox-e2e')
     const headed = VERIFICATION_STAGES.find(
       (stage) => stage.id === 'headed-hidden-tab-visual-continuity',
     )
     const parity = VERIFICATION_STAGES.find((stage) => stage.id === 'dev-preview-parity')
-    if (!vitest || !browser || !headed || !parity) {
+    if (!vitest || !browser || !firefox || !headed || !parity) {
       throw new Error('VerificationRuntimeStageMissing')
     }
     const vitestEnv = verificationStageEnvironment(vitest, {
@@ -189,6 +193,11 @@ describe('verification runner', () => {
       },
     })
     const browserEnv = verificationStageEnvironment(browser, {
+      root,
+      runDirectory,
+      baseEnv: { NODE_OPTIONS: '--trace-warnings' },
+    })
+    const firefoxEnv = verificationStageEnvironment(firefox, {
       root,
       runDirectory,
       baseEnv: { NODE_OPTIONS: '--trace-warnings' },
@@ -215,10 +224,15 @@ describe('verification runner', () => {
     expect(vitestEnv.E2E_PORT).toBe('29000')
     expect(vitestEnv.E2E_FAKE_PROVIDER_PORT).toBe('29001')
     expect(browserEnv.E2E_REUSE_EXISTING_SERVER).toBe('0')
+    expect(browserEnv.E2E_SERIALIZE_LARGE_WORKSPACE_CLOSURE).toBe('1')
     expect(browserEnv.E2E_SKIP_BUILD).toBe('1')
+    expect(firefoxEnv.E2E_SKIP_BUILD).toBe('1')
     expect(headedEnv.E2E_SKIP_BUILD).toBe('1')
     expect(browserEnv.E2E_PLAYWRIGHT_OUTPUT_DIR).toBe(
       '/evidence/current-run/chromium-e2e.playwright',
+    )
+    expect(firefoxEnv.E2E_PLAYWRIGHT_OUTPUT_DIR).toBe(
+      '/evidence/current-run/firefox-e2e.playwright',
     )
     expect(headedEnv.E2E_PLAYWRIGHT_OUTPUT_DIR).toBe(
       '/evidence/current-run/headed-hidden-tab-visual-continuity.playwright',
@@ -229,10 +243,11 @@ describe('verification runner', () => {
     expect(
       new Set([
         browserEnv.E2E_PLAYWRIGHT_OUTPUT_DIR,
+        firefoxEnv.E2E_PLAYWRIGHT_OUTPUT_DIR,
         headedEnv.E2E_PLAYWRIGHT_OUTPUT_DIR,
         parityEnv.E2E_PLAYWRIGHT_OUTPUT_DIR,
       ]).size,
-    ).toBe(3)
+    ).toBe(4)
     expect(browserEnv.E2E_DEV_PREVIEW_PARITY).toBeUndefined()
     expect(parityEnv.E2E_SKIP_BUILD).toBe('1')
     expect(parityEnv.E2E_DEV_PREVIEW_PARITY).toBe('1')
@@ -248,6 +263,7 @@ describe('verification runner', () => {
       '--project=chromium',
       '--project=chromium-large-workspace',
     ])
+    expect(firefox.argv).toEqual(['pnpm', 'exec', 'playwright', 'test', '--project=firefox'])
     expect(headed.argv).toEqual(['pnpm', 'run', 'e2e:headed-visibility'])
     expect(parity.argv).toEqual([
       'pnpm',
@@ -273,6 +289,7 @@ describe('verification runner', () => {
       verificationStage('production-build', 'blocking'),
       verificationStage('vitest', 'blocking'),
       verificationStage('chromium-e2e', 'blocking'),
+      verificationStage('firefox-e2e', 'blocking'),
       verificationStage('stream-profile-single', 'blocking'),
       verificationStage('stream-profile-concurrent', 'blocking'),
       verificationStage('performance', 'blocking'),
@@ -304,6 +321,7 @@ describe('verification runner', () => {
         { id: 'production-build', status: 'passed' },
         { id: 'vitest', status: 'passed' },
         { id: 'chromium-e2e', status: 'passed' },
+        { id: 'firefox-e2e', status: 'passed' },
         {
           id: 'stream-profile-single',
           status: 'passed',
@@ -431,6 +449,29 @@ describe('verification runner', () => {
     expect(await readFile(resolve(root, execution.stderrPath), 'utf8')).toBe('stage-error')
   })
 
+  it('makes unexpected stderr red for a stage that requires a clean diagnostic channel', async () => {
+    const root = await mkdtemp(resolve(tmpdir(), 'natter-verification-stderr-'))
+    temporaryRoots.push(root)
+    const stage = Object.freeze({
+      id: 'warning-clean',
+      label: 'warning-clean',
+      policy: 'blocking' as const,
+      stderr: 'empty' as const,
+      argv: Object.freeze(['node', '-e', "process.stderr.write('unexpected-warning')"]),
+    })
+    const execution = await executeVerificationStage(stage, verificationMetadata(), {
+      root,
+      artifactRoot: root,
+      runId: 'warning-clean',
+      forwardOutput: false,
+    })
+
+    expect(execution.exitCode).toBe(1)
+    expect(execution.diagnostics).toEqual([
+      `VerificationStageUnexpectedStderr:warning-clean:${'unexpected-warning'.length}`,
+    ])
+  })
+
   it('runs final validation after every stage and persists validation failure as canonical red', async () => {
     const phases: string[] = []
     const persisted: VerificationSummary[] = []
@@ -460,6 +501,7 @@ describe('verification runner', () => {
   })
 
   it('continues independent stages after summary persistence fails', async () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
     const calls: string[] = []
     const result = await runVerification({
       stages: [verificationStage('first', 'blocking'), verificationStage('second', 'blocking')],
@@ -482,6 +524,10 @@ describe('verification runner', () => {
       'VerificationSummaryPersistenceFailed:stage:second:QuotaExceededError',
       'VerificationSummaryPersistenceFailed:final:QuotaExceededError',
     ])
+    expect(error.mock.calls.map(([message]) => String(message))).toEqual(
+      result.summary.infrastructureDiagnostics.map((diagnostic) => `[verify] ${diagnostic}`),
+    )
+    error.mockRestore()
   })
 
   it('reports structural inventory completion without calling it a passed guarantee', async () => {

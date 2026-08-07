@@ -1059,7 +1059,7 @@ function workspaceEffectSubscriptionSites(context) {
       if (!input || !ts.isObjectLiteralExpression(input)) {
         throw new Error(`LocalityWorkspaceEffectSubscriptionNotLiteral:${path}`)
       }
-      const owner = requiredStringProperty(input, 'owner', source, path)
+      const owner = requiredStringProperty(input, 'owner', path)
       const line = source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1
       sites.push(
         Object.freeze({
@@ -1079,7 +1079,7 @@ function workspaceEffectSubscriptionSites(context) {
           impactKinds: Object.freeze(
             optionalStringArrayProperty(input, 'impactKinds', source, path) ?? [],
           ),
-          replacements: optionalBooleanProperty(input, 'replacements', source, path) ?? true,
+          replacements: optionalBooleanProperty(input, 'replacements', path) ?? true,
         }),
       )
     })
@@ -1183,7 +1183,7 @@ function publicationAddressingMatrix(
   })
 }
 
-function requiredStringProperty(object, name, source, path) {
+function requiredStringProperty(object, name, path) {
   const value = literalValue(objectPropertyInitializer(object, name))
   if (typeof value !== 'string') {
     throw new Error(`LocalityObjectStringPropertyInvalid:${path}#${name}`)
@@ -1233,7 +1233,7 @@ function staticArrayInitializer(node, source, path, propertyName, seen = new Set
   return staticArrayInitializer(declaration.initializer, source, path, propertyName, seen)
 }
 
-function optionalBooleanProperty(object, name, source, path) {
+function optionalBooleanProperty(object, name, path) {
   const initializer = objectPropertyInitializer(object, name)
   if (!initializer) return undefined
   const value = unwrap(initializer)

@@ -2678,48 +2678,49 @@ describe('Dexie migrations', () => {
     await reopened.delete()
   })
 
-  it.each([
-    20, 21,
-  ])('upgrades v%i workspace metadata through replacement epoch and incarnation migrations', async (legacyVersion) => {
-    const name = `natter-test-workspace-meta-v${legacyVersion}-v22-${Math.random()
-      .toString(36)
-      .slice(2)}`
-    await Dexie.delete(name)
+  it.each([20, 21])(
+    'upgrades v%i workspace metadata through replacement epoch and incarnation migrations',
+    async (legacyVersion) => {
+      const name = `natter-test-workspace-meta-v${legacyVersion}-v22-${Math.random()
+        .toString(36)
+        .slice(2)}`
+      await Dexie.delete(name)
 
-    const legacy = new Dexie(name)
-    if (legacyVersion === 20) registerLegacyStreamLeasesV20(legacy)
-    else registerLegacyAttemptOutcomesV21(legacy)
-    await legacy.open()
-    const legacyValue = {
-      workspaceId: 'browser-idb:natter',
-      backendKind: 'browser-idb',
-      lastMutationAt: 123,
-      mutationCounter: 17,
-    }
-    await legacy.table('settings').put({ key: 'workspace-meta', value: legacyValue })
-    legacy.close()
+      const legacy = new Dexie(name)
+      if (legacyVersion === 20) registerLegacyStreamLeasesV20(legacy)
+      else registerLegacyAttemptOutcomesV21(legacy)
+      await legacy.open()
+      const legacyValue = {
+        workspaceId: 'browser-idb:natter',
+        backendKind: 'browser-idb',
+        lastMutationAt: 123,
+        mutationCounter: 17,
+      }
+      await legacy.table('settings').put({ key: 'workspace-meta', value: legacyValue })
+      legacy.close()
 
-    const migrated = createDbForTests(name)
-    await migrated.open()
-    const upgradedValue = await migrated.workspaceFence.get('global')
-    expect(upgradedValue).toMatchObject({
-      id: 'global',
-      replacementEpoch: 0,
-    })
-    expect(upgradedValue?.workspaceId).toMatch(/^browser-idb:[0-9A-HJKMNP-TV-Z]{26}$/)
-    expect(await migrated.settings.get('workspace-meta')).toBeUndefined()
-    if (!upgradedValue) throw new Error('expected migrated workspace fence')
-    await migrated.workspaceFence.put({ ...upgradedValue, replacementEpoch: 9 })
-    migrated.close()
+      const migrated = createDbForTests(name)
+      await migrated.open()
+      const upgradedValue = await migrated.workspaceFence.get('global')
+      expect(upgradedValue).toMatchObject({
+        id: 'global',
+        replacementEpoch: 0,
+      })
+      expect(upgradedValue?.workspaceId).toMatch(/^browser-idb:[0-9A-HJKMNP-TV-Z]{26}$/)
+      expect(await migrated.settings.get('workspace-meta')).toBeUndefined()
+      if (!upgradedValue) throw new Error('expected migrated workspace fence')
+      await migrated.workspaceFence.put({ ...upgradedValue, replacementEpoch: 9 })
+      migrated.close()
 
-    const reopened = createDbForTests(name)
-    await reopened.open()
-    expect(await reopened.workspaceFence.get('global')).toEqual({
-      ...upgradedValue,
-      replacementEpoch: 9,
-    })
-    await reopened.delete()
-  })
+      const reopened = createDbForTests(name)
+      await reopened.open()
+      expect(await reopened.workspaceFence.get('global')).toEqual({
+        ...upgradedValue,
+        replacementEpoch: 9,
+      })
+      await reopened.delete()
+    },
+  )
 
   it('carries v21 attempt outcomes through orphan recovery and strips raw failure payloads', async () => {
     const name = `natter-test-attempt-outcomes-v22-${Math.random().toString(36).slice(2)}`

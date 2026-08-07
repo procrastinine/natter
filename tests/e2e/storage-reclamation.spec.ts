@@ -1,4 +1,5 @@
 import { truncate, unlink, writeFile } from 'node:fs/promises'
+import { discoverBrowserWorkspaceDatabaseNames } from '../../scripts/audit-storage-ownership-reclamation.mjs'
 import { createFakeStreamScenario, retargetOnlyProfileToFakeProvider } from './fake-stream-provider'
 import { createChatUiJourneyProfile, expect, type Page, test } from './fixtures'
 import {
@@ -60,6 +61,7 @@ interface WorkspaceCompactionSnapshot {
 
 const COMPACTION_DEBT_BYTES = 66 * 1024 * 1024
 const WORKSPACE_SELECTION_LOCK = 'natter:workspace-slot-selection:v1'
+const BROWSER_WORKSPACE_DATABASE_NAMES = discoverBrowserWorkspaceDatabaseNames()
 
 interface BrowserLockHandle {
   readonly id: string
@@ -626,6 +628,11 @@ test('durable replacement state recovers crashed owners and serializes competing
   let destinationBlocker: BrowserLockHandle | undefined
   let selectionBlocker: BrowserLockHandle | undefined
   try {
+    preactivationInitiator = await context.newPage()
+    await preactivationInitiator.goto('/#/storage')
+    await expect(
+      preactivationInitiator.locator('[data-ui="storage-workspace-import-input"]'),
+    ).toBeAttached()
     const preactivationSource = await readWorkspaceControlSnapshot(page)
     sourceBlocker = await queueBrowserLock(
       page,
@@ -638,8 +645,6 @@ test('durable replacement state recovers crashed owners and serializes competing
         acquired: true,
         failure: null,
       })
-    preactivationInitiator = await context.newPage()
-    await preactivationInitiator.goto('/#/storage')
     preactivationInitiator.once('dialog', (dialog) => dialog.accept())
     await preactivationInitiator
       .locator('[data-ui="storage-workspace-import-input"]')
@@ -682,10 +687,13 @@ test('durable replacement state recovers crashed owners and serializes competing
     await expectBranchControlsReady(page, branchId)
 
     const postactivationSource = await readWorkspaceControlSnapshot(page)
+    const sourceIndex = BROWSER_WORKSPACE_DATABASE_NAMES.indexOf(
+      postactivationSource.activeDatabaseName,
+    )
+    if (sourceIndex < 0) throw new Error('ReplacementCrashSourceDatabaseInvalid')
     const destinationDatabaseName =
-      postactivationSource.activeDatabaseName === 'natter-workspace-a'
-        ? 'natter-workspace-b'
-        : 'natter-workspace-a'
+      BROWSER_WORKSPACE_DATABASE_NAMES[(sourceIndex + 1) % BROWSER_WORKSPACE_DATABASE_NAMES.length]
+    if (!destinationDatabaseName) throw new Error('ReplacementCrashDestinationDatabaseMissing')
     destinationBlocker = await queueBrowserLock(
       page,
       workspaceSlotLock(destinationDatabaseName),

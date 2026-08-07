@@ -17,6 +17,7 @@ const FIXED_CHILD_ENV = Object.freeze({
   E2E_FAKE_PROVIDER_PORT: '4174',
   E2E_PORT: '4173',
   E2E_REUSE_EXISTING_SERVER: '0',
+  E2E_SERIALIZE_LARGE_WORKSPACE_CLOSURE: '1',
   TZ: 'UTC',
 })
 
@@ -210,7 +211,9 @@ export const VERIFICATION_STAGES = Object.freeze([
     'pnpm',
     'build',
   ]),
-  stage('vitest', 'Run unit and integration tests', 'blocking', ['pnpm', 'exec', 'vitest', 'run']),
+  stage('vitest', 'Run unit and integration tests', 'blocking', ['pnpm', 'exec', 'vitest', 'run'], {
+    stderr: 'empty',
+  }),
   stage('chromium-e2e', 'Test the built app against the loopback fake provider', 'blocking', [
     'pnpm',
     'exec',
@@ -219,6 +222,12 @@ export const VERIFICATION_STAGES = Object.freeze([
     '--project=chromium',
     '--project=chromium-large-workspace',
   ]),
+  stage(
+    'firefox-e2e',
+    'Test the built app in Firefox against the loopback fake provider',
+    'blocking',
+    ['pnpm', 'exec', 'playwright', 'test', '--project=firefox'],
+  ),
   stage(
     'headed-hidden-tab-visual-continuity',
     'Prove native hidden-tab first-frame continuity in headed Chromium',
@@ -558,7 +567,7 @@ export async function executeVerificationStage(item, metadata, options = {}) {
   const runId = options.runId ?? 'verification'
   const runDirectory =
     options.runDirectory ?? resolve(artifactRoot, 'test-results/verification-stages', runId)
-  return executeFileBackedVerificationProcess({
+  const execution = await executeFileBackedVerificationProcess({
     id: item.id,
     command: invocation.command,
     args: invocation.args,
@@ -576,6 +585,17 @@ export async function executeVerificationStage(item, metadata, options = {}) {
     forwardOutput: options.forwardOutput !== false,
     outputDestinations: options.outputDestinations,
   })
+  if (item.stderr !== 'empty' || execution.stderrPath === null) return execution
+  const stderr = await readFile(resolve(artifactRoot, execution.stderrPath), 'utf8')
+  if (stderr.length === 0) return execution
+  return Object.freeze({
+    ...execution,
+    exitCode: execution.exitCode === 0 ? 1 : execution.exitCode,
+    diagnostics: Object.freeze([
+      ...execution.diagnostics,
+      `VerificationStageUnexpectedStderr:${item.id}:${Buffer.byteLength(stderr)}`,
+    ]),
+  })
 }
 
 export function verificationStageEnvironment(item, options = {}) {
@@ -587,9 +607,22 @@ export function verificationStageEnvironment(item, options = {}) {
     runId: options.runId ?? String(process.pid),
     baseEnv: { ...FIXED_CHILD_ENV, ...baseEnv },
   })
+  if (
+    item.id === 'vitest' &&
+    !/(?:^|\s)--trace-warnings(?:\s|$)/u.test(environment.NODE_OPTIONS ?? '')
+  ) {
+    environment.NODE_OPTIONS = [environment.NODE_OPTIONS, '--trace-warnings']
+      .filter(Boolean)
+      .join(' ')
+  }
   environment.VERIFICATION_RUN_ID = options.runId ?? String(process.pid)
   if (
-    ['chromium-e2e', 'headed-hidden-tab-visual-continuity', 'dev-preview-parity'].includes(item.id)
+    [
+      'chromium-e2e',
+      'firefox-e2e',
+      'headed-hidden-tab-visual-continuity',
+      'dev-preview-parity',
+    ].includes(item.id)
   ) {
     environment.E2E_SKIP_BUILD = '1'
     environment.E2E_PLAYWRIGHT_OUTPUT_DIR = resolve(
@@ -710,8 +743,8 @@ function errorMessage(error) {
   return error instanceof Error ? error.message : String(error)
 }
 
-function stage(id, label, policy, argv) {
-  return Object.freeze({ id, label, policy, argv: Object.freeze(argv) })
+function stage(id, label, policy, argv, options = {}) {
+  return Object.freeze({ id, label, policy, argv: Object.freeze(argv), ...options })
 }
 
 function plannedStageResult(item) {
@@ -778,6 +811,7 @@ function assuranceKind(item) {
       'production-build',
       'vitest',
       'chromium-e2e',
+      'firefox-e2e',
       'headed-hidden-tab-visual-continuity',
       'dev-preview-parity',
       'stream-profile-single',

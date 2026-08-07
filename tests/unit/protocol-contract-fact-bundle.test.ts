@@ -422,7 +422,7 @@ describe('production protocol fact bundle', () => {
       ok: true,
       surfaces: 20,
       records: 343,
-      constructorSites: 758,
+      constructorSites: 759,
       architectureGaps: 3,
       recordGaps: 149,
       siteGaps: 4,

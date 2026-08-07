@@ -281,6 +281,31 @@ describe('opaque tab route intents', () => {
 })
 
 describe('route snapshots and conversation navigation port', () => {
+  it('reconciles a fragment navigation completed before a route subscriber attaches', () => {
+    navigate('#/chat/opener')
+    const beforeId = browserConversationNavigationPort.getArrival().id
+    window.history.replaceState(null, '', '#/new')
+
+    const unsubscribe = subscribeRouteArrival(() => undefined)
+    unsubscribe()
+
+    expect(activeRouteChatId()).toBeNull()
+    expect(browserConversationNavigationPort.getArrival().id).not.toBe(beforeId)
+    expect(browserConversationNavigationPort.getArrival().route).toBeNull()
+  })
+
+  it('reconciles a missed fragment navigation when the page resumes', () => {
+    const unsubscribe = subscribeRouteArrival(() => undefined)
+    navigate('#/chat/background')
+    window.history.replaceState(null, '', '#/new')
+
+    window.dispatchEvent(new Event('pageshow'))
+    unsubscribe()
+
+    expect(activeRouteChatId()).toBeNull()
+    expect(browserConversationNavigationPort.getArrival().route).toBeNull()
+  })
+
   it('keeps an unadmitted browser address out of the committed render frame', () => {
     navigate('#/chat/admitted')
     window.history.replaceState(null, '', '#/chat/not-yet-admitted')

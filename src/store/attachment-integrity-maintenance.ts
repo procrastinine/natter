@@ -1,4 +1,4 @@
-import type { Collection, IndexableType, Table, Transaction } from 'dexie'
+import Dexie, { type Collection, type IndexableType, type Table, type Transaction } from 'dexie'
 import type { AttachmentId, AttachmentReferenceEdge, DraftRow, MessageId } from '../core/types'
 import {
   type AttachmentCatalogAggregateRow,
@@ -159,12 +159,12 @@ export function completedAttachmentIntegrityState(): AttachmentIntegrityStateRow
 export async function markAttachmentIntegrityRepairPending(tx: Transaction): Promise<void> {
   const aggregates = tx.table<AttachmentCatalogAggregateRow, string>('attachmentCatalogAggregate')
   const states = tx.table<AttachmentIntegrityStateRow, string>('attachmentIntegrityState')
-  const [previousAggregate, previousState] = await Promise.all([
+  const [previousAggregate, previousState] = await Dexie.Promise.all([
     aggregates.get(ATTACHMENT_INTEGRITY_STATE_ID),
     states.get(ATTACHMENT_INTEGRITY_STATE_ID),
   ])
   const aggregate = previousAggregate ?? emptyAttachmentCatalogAggregateRow()
-  await Promise.all([
+  await Dexie.Promise.all([
     putPhysicalStorageRow(
       tx,
       'attachmentCatalogAggregate',
@@ -183,12 +183,12 @@ export async function markAttachmentIntegrityRepairPending(tx: Transaction): Pro
 export async function markAttachmentIntegrityRepairComplete(tx: Transaction): Promise<void> {
   const aggregates = tx.table<AttachmentCatalogAggregateRow, string>('attachmentCatalogAggregate')
   const states = tx.table<AttachmentIntegrityStateRow, string>('attachmentIntegrityState')
-  const [previousAggregate, previousState] = await Promise.all([
+  const [previousAggregate, previousState] = await Dexie.Promise.all([
     aggregates.get(ATTACHMENT_INTEGRITY_STATE_ID),
     states.get(ATTACHMENT_INTEGRITY_STATE_ID),
   ])
   const aggregate = previousAggregate ?? emptyAttachmentCatalogAggregateRow()
-  await Promise.all([
+  await Dexie.Promise.all([
     putPhysicalStorageRow(
       tx,
       'attachmentCatalogAggregate',
@@ -352,7 +352,7 @@ async function reconcileEdgePage(
   const owners = [...ownerKeys.values()]
   const messageOwners = owners.filter((owner) => owner.ownerKind === 'message')
   const draftOwners = owners.filter((owner) => owner.ownerKind === 'draft')
-  const [messages, drafts] = await Promise.all([
+  const [messages, drafts] = await Dexie.Promise.all([
     tx
       .table<MessageHeaderRow, MessageId>('messages')
       .bulkGet(messageOwners.map((owner) => owner.ownerId)),
@@ -523,7 +523,7 @@ async function reconcileAggregatePage(
   const aggregate = structuredClone(requiredAggregate(continuing))
   for (const row of page) accumulateAttachmentCatalogProjection(aggregate, row)
   if (page.length < limit) {
-    await Promise.all([
+    await Dexie.Promise.all([
       putPhysicalStorageRow(
         tx,
         'attachmentCatalogAggregate',

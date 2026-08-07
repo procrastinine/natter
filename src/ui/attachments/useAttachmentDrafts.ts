@@ -21,6 +21,8 @@ export function useAttachmentDrafts(initialRefs?: readonly AttachmentRef[]) {
   const [attachmentRefs, setAttachmentRefs] = useState<MessageAttachmentRef[]>(
     initialRefsRef.current,
   )
+  const attachmentRefsRef = useRef(attachmentRefs)
+  const scopeVersionRef = useRef(0)
   const [optimisticRows, setOptimisticRows] = useState<Map<string, AttachmentDisplayRow>>(
     () => new Map(),
   )
@@ -58,7 +60,9 @@ export function useAttachmentDrafts(initialRefs?: readonly AttachmentRef[]) {
       next.set(attachment.id, attachment)
       return next
     })
-    setAttachmentRefs((current) => [...current, createAttachmentRef(attachment.id)])
+    const next = [...attachmentRefsRef.current, createAttachmentRef(attachment.id)]
+    attachmentRefsRef.current = next
+    setAttachmentRefs(next)
   }, [])
 
   const replaceAttachment = useCallback((refId: string, attachment: Attachment) => {
@@ -67,31 +71,34 @@ export function useAttachmentDrafts(initialRefs?: readonly AttachmentRef[]) {
       next.set(attachment.id, attachment)
       return next
     })
-    setAttachmentRefs((current) =>
-      current.map((ref) =>
-        ref.refId === refId ? { ...ref, attachmentId: attachment.id, updatedAt: Date.now() } : ref,
-      ),
+    const updatedAt = Date.now()
+    const next = attachmentRefsRef.current.map((ref) =>
+      ref.refId === refId ? { ...ref, attachmentId: attachment.id, updatedAt } : ref,
     )
+    attachmentRefsRef.current = next
+    setAttachmentRefs(next)
   }, [])
 
   const toggleAttachment = useCallback((refId: string) => {
-    setAttachmentRefs((current) =>
-      current.map((ref) =>
-        ref.refId === refId
-          ? { ...ref, includeInContext: !ref.includeInContext, updatedAt: Date.now() }
-          : ref,
-      ),
+    const updatedAt = Date.now()
+    const next = attachmentRefsRef.current.map((ref) =>
+      ref.refId === refId ? { ...ref, includeInContext: !ref.includeInContext, updatedAt } : ref,
     )
+    attachmentRefsRef.current = next
+    setAttachmentRefs(next)
   }, [])
 
   const removeAttachment = useCallback((refId: string) => {
-    setAttachmentRefs((current) => current.filter((ref) => ref.refId !== refId))
+    const next = attachmentRefsRef.current.filter((ref) => ref.refId !== refId)
+    attachmentRefsRef.current = next
+    setAttachmentRefs(next)
   }, [])
 
   const ingestFiles = useCallback(
     async (rawFiles: FileList | File[]) => {
       const files = Array.from(rawFiles)
       if (files.length === 0) return
+      const scopeVersion = scopeVersionRef.current
       for (const file of files) {
         const uploadId = newId()
         setUploads((current) => [
@@ -105,7 +112,7 @@ export function useAttachmentDrafts(initialRefs?: readonly AttachmentRef[]) {
             origin: 'user-upload',
             ...(file.type ? { declaredMime: file.type } : {}),
           })
-          addAttachment(bundle.attachment)
+          if (scopeVersion === scopeVersionRef.current) addAttachment(bundle.attachment)
           setUploads((current) => current.filter((upload) => upload.id !== uploadId))
         } catch (err) {
           setUploads((current) =>
@@ -130,28 +137,37 @@ export function useAttachmentDrafts(initialRefs?: readonly AttachmentRef[]) {
   }, [])
 
   const clear = useCallback(() => {
-    setAttachmentRefs([])
+    scopeVersionRef.current += 1
+    attachmentRefsRef.current = []
+    setAttachmentRefs(attachmentRefsRef.current)
     setOptimisticRows(new Map())
     setUploads([])
   }, [])
 
   const consume = useCallback((refs: readonly MessageAttachmentRef[]) => {
     const submitted = new Set(refs)
-    setAttachmentRefs((current) => current.filter((ref) => !submitted.has(ref)))
+    const next = attachmentRefsRef.current.filter((ref) => !submitted.has(ref))
+    attachmentRefsRef.current = next
+    setAttachmentRefs(next)
   }, [])
 
   const restore = useCallback(
     (refs: readonly MessageAttachmentRef[], rows?: Map<string, AttachmentDisplayRow>) => {
-      setAttachmentRefs([...refs])
+      scopeVersionRef.current += 1
+      attachmentRefsRef.current = [...refs]
+      setAttachmentRefs(attachmentRefsRef.current)
       setOptimisticRows(rows ? new Map(rows) : new Map())
       setUploads([])
     },
     [],
   )
 
+  const currentAttachmentRefs = useCallback(() => attachmentRefsRef.current, [])
+
   return {
     initialAttachmentRefs: initialRefsRef.current,
     attachmentRefs,
+    currentAttachmentRefs,
     attachmentRows,
     uploads,
     addAttachment,

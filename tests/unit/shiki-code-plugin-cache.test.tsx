@@ -3,7 +3,7 @@ import { useEffect, useState } from 'react'
 import type { TokensResult } from 'shiki/core'
 import type { BundledLanguage } from 'shiki/langs'
 import type { CodeHighlighterPlugin, ThemeInput } from 'streamdown'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type {
   createShikiCodePlugin as CreateShikiCodePlugin,
   SHIKI_CODE_CACHE_LIMITS as ShikiCodeCacheLimits,
@@ -43,6 +43,10 @@ describe('Shiki code plugin cache', () => {
     cacheLimits = module.SHIKI_CODE_CACHE_LIMITS
   })
 
+  afterEach(() => {
+    window.dispatchEvent(new Event('pageshow'))
+  })
+
   it('retries the exact request after tokenization fails', async () => {
     const error = new Error('synthetic tokenizer failure')
     shiki.codeToTokens.mockRejectedValueOnce(error)
@@ -80,6 +84,31 @@ describe('Shiki code plugin cache', () => {
 
     expect(result).toEqual(fakeResult(code))
     expect(shiki.createHighlighter).toHaveBeenCalledTimes(2)
+    errorLog.mockRestore()
+  })
+
+  it('drops a highlight failure after page teardown begins without reporting a runtime fault', async () => {
+    let rejectTokenization!: (error: unknown) => void
+    shiki.codeToTokens.mockImplementationOnce(
+      () =>
+        new Promise<TokensResult>((_resolve, reject) => {
+          rejectTokenization = reject
+        }),
+    )
+    const errorLog = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    const plugin = createShikiCodePlugin()
+    const error = new TypeError('error loading dynamically imported module')
+
+    expect(
+      plugin.highlight({ code: 'teardown-highlight-94812', language: 'typescript', themes }),
+    ).toBeNull()
+    await waitFor(() => expect(shiki.codeToTokens).toHaveBeenCalledTimes(1))
+    window.dispatchEvent(new Event('beforeunload'))
+    rejectTokenization(error)
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(errorLog).not.toHaveBeenCalled()
     errorLog.mockRestore()
   })
 

@@ -427,7 +427,7 @@ function validateOutcomeContractsAndGraph({ root, inventory, siteById, problems 
   }
 
   const graph = inventory?.outcomeGraph
-  if (!graph || graph.schemaVersion !== 2) {
+  if (graph?.schemaVersion !== 2) {
     problems.push(`callback-graph: schema=${graph?.schemaVersion ?? '<missing>'}; expected=2`)
     return
   }

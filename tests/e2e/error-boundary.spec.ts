@@ -12,13 +12,21 @@ import {
 } from './helpers'
 
 test.use({
-  runtimeDiagnosticAllowances: [
-    {
-      category: ['page-error', 'console-other'],
-      message:
-        "^(?:(?:TypeError: )?Cannot read properties of null \\(reading 'toLocaleString'\\)(?:\\n|$)|The above error occurred in the <MessageInner> component\\.)",
-    },
-  ],
+  runtimeDiagnosticPolicy: {
+    allowances: [
+      {
+        category: ['page-error', 'console-other'],
+        message:
+          "^(?:(?:TypeError: )?Cannot read properties of null \\(reading 'toLocaleString'\\)(?:\\n|$)|The above error occurred in the <MessageInner> component\\.)",
+      },
+      {
+        category: 'console-other',
+        message: '^JSHandle@object$',
+        detail:
+          '^argument 1: TypeError: can\'t access property "toLocaleString", s is null(?:\\n|$)',
+      },
+    ],
+  },
 })
 
 // Phase 7 required spec: a deliberate React render crash inside a single

@@ -479,6 +479,22 @@ describe('attempt controller', () => {
     stop()
   })
 
+  it('retains an exact in-process projection requester across durable lease observations', async () => {
+    const controller = createAttemptController()
+    const row = lease('stream', 'target')
+    const request = vi.fn(async () => {})
+    observe(controller, row, { local: true, workspaceId: FENCE.workspaceId })
+    controller.setLiveProjectionRequester(row.streamId, request)
+
+    observe(controller, row, { local: false, workspaceId: FENCE.workspaceId })
+    const observed = controller.getExecution(row.streamId)
+    expect(observed?.requestLiveProjection).toBe(request)
+
+    const release = controller.subscribeTarget(row.chatId, row.messageId, () => {})
+    await vi.waitFor(() => expect(request).toHaveBeenCalledOnce())
+    release()
+  })
+
   it('publishes stable target and chat snapshots only to relevant subscribers', () => {
     const controller = createAttemptController()
     controller.replaceWorkspace(FENCE)

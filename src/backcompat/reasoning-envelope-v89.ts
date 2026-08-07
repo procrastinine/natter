@@ -383,7 +383,7 @@ function tolerantCarrier(
         ? undefined
         : context.visibleIdByLegacyId.get(nonEmptyString(candidate.bindsVisiblePartId) as string)
     let bound = boundId ? context.visibleById.get(boundId) : undefined
-    if (!bound || bound.kind !== 'text' || bound.format !== 'anthropic-claude-v1') {
+    if (bound?.kind !== 'text' || bound.format !== 'anthropic-claude-v1') {
       boundId = context.visibleIds.claim(`legacy-visible-for-signature:${context.index}`)
       bound = {
         id: boundId,

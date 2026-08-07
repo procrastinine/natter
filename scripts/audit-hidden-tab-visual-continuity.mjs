@@ -20,7 +20,6 @@ const REQUIRED_TRANSITION_IDS = Object.freeze([
   'live-stream-projection-foreground-refresh',
   'scroll-foreground-geometry-reconciliation',
   'composer-draft-hide-flush',
-  'message-content-visibility',
 ])
 const REQUIRED_PROOF_IDS = Object.freeze([
   'visibility-live-workspace-and-first-gesture',
@@ -51,12 +50,7 @@ const VALID_IMPLEMENTATIONS = new Set([
   'conditional-body',
   'local-ui-state',
 ])
-const VALID_OWNERS = new Set([
-  'stream-projection',
-  'viewport-continuity',
-  'draft-persistence',
-  'compositor-retention',
-])
+const VALID_OWNERS = new Set(['stream-projection', 'viewport-continuity', 'draft-persistence'])
 const VALID_PROOF_KINDS = new Set([
   'browser',
   'component',

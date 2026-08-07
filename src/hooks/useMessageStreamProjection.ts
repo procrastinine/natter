@@ -20,24 +20,25 @@ export function useMessageStreamProjection(
   const liveProjection = liveProjectionMatchesFence(target.liveProjection, fence)
     ? target.liveProjection
     : undefined
-  useEffect(() => {
-    if (!enabled || !execution || !execution.requestLiveProjection) {
-      return
-    }
-    const requestIfVisible = () => {
-      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return
-      void execution.requestLiveProjection?.().catch(() => {})
-    }
-    if (typeof document === 'undefined') return
-    document.addEventListener('visibilitychange', requestIfVisible)
-    return () => document.removeEventListener('visibilitychange', requestIfVisible)
-  }, [enabled, execution])
   const currentLiveSnapshot =
     liveProjection &&
     (liveProjection.streamId === execution?.streamId ||
       liveProjection.streamId === presentation?.streamId)
       ? liveProjection
       : undefined
+  useEffect(() => {
+    if (!enabled || !execution?.requestLiveProjection) {
+      return
+    }
+    const requestIfVisible = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return
+      if (currentLiveSnapshot) return
+      void execution.requestLiveProjection?.().catch(() => {})
+    }
+    if (typeof document === 'undefined') return
+    document.addEventListener('visibilitychange', requestIfVisible)
+    return () => document.removeEventListener('visibilitychange', requestIfVisible)
+  }, [currentLiveSnapshot, enabled, execution])
   return {
     execution,
     presentation,

@@ -28,6 +28,8 @@ const VALIDATED_DEPENDENCY_IMAGES = new WeakSet()
 const IMAGE_SCHEMA_VERSION = 2
 const READY_SCHEMA_VERSION = 1
 const MAX_INSTALL_OUTPUT_BYTES = 64 * 1024 * 1024
+const MAX_COMMAND_SHIM_BYTES = 64 * 1024
+const MAX_COMMAND_SHIM_DEPTH = 8
 export const VERIFICATION_DEPENDENCY_RECIPE_FILES = Object.freeze([
   '.node-version',
   '.npmrc',
@@ -478,18 +480,28 @@ function dependencyInstallInvocation(workspaceRoot, storeRoot, buildRoot, runtim
   })
 }
 
-function currentRuntimeCapability(sourceRoot) {
+export function currentRuntimeCapability(sourceRoot) {
   const packageJson = JSON.parse(readFileSync(resolve(sourceRoot, 'package.json'), 'utf8'))
   const expectedPnpmVersion = /^pnpm@(.+)$/u.exec(packageJson.packageManager)?.[1]
   if (!expectedPnpmVersion) throw new Error('VerificationDependencyPnpmVersionMissing')
-  const pnpmLauncherPath = resolvePnpmExecutable()
-  const pnpmPackageJsonPath = findPnpmPackageJson(pnpmLauncherPath)
+  const pnpmExecutablePath = resolvePnpmExecutable()
+  const pnpmPackageJsonPath = findPnpmPackageJson(pnpmExecutablePath)
   const pnpmPackageJsonBytes = readFileSync(pnpmPackageJsonPath)
   const pnpmPackageJson = JSON.parse(pnpmPackageJsonBytes.toString('utf8'))
   if (pnpmPackageJson.name !== 'pnpm' || pnpmPackageJson.version !== expectedPnpmVersion) {
-    throw new Error('VerificationDependencyPnpmRuntimeMismatch')
+    throw new Error(
+      `VerificationDependencyPnpmRuntimeMismatch:expected=${expectedPnpmVersion}:actual=${String(pnpmPackageJson.version)}:executable=${pnpmExecutablePath}:package=${pnpmPackageJsonPath}`,
+    )
   }
-  const pnpmExecutablePath = resolvePnpmPackageExecutable(pnpmPackageJsonPath, pnpmPackageJson)
+  const declaredPnpmExecutablePath = resolvePnpmPackageExecutable(
+    pnpmPackageJsonPath,
+    pnpmPackageJson,
+  )
+  if (declaredPnpmExecutablePath !== pnpmExecutablePath) {
+    throw new Error(
+      `VerificationDependencyPnpmExecutionTargetMismatch:actual=${pnpmExecutablePath}:declared=${declaredPnpmExecutablePath}`,
+    )
+  }
   const pnpmExecutableBytes = readFileSync(pnpmExecutablePath)
   const declaredNodeVersion = readFileSync(resolve(sourceRoot, '.node-version'), 'utf8').trim()
   if (
@@ -561,10 +573,39 @@ function resolvePnpmExecutable() {
     for (const name of names) {
       const candidate = resolve(directory, name)
       const metadata = lstatSync(candidate, { throwIfNoEntry: false })
-      if (metadata?.isFile() || metadata?.isSymbolicLink()) return realpathSync(candidate)
+      if (metadata?.isFile() || metadata?.isSymbolicLink()) {
+        return resolvePnpmLauncherTarget(candidate)
+      }
     }
   }
   throw new Error('VerificationDependencyPnpmExecutableMissing')
+}
+
+export function resolvePnpmLauncherTarget(launcherPath) {
+  let current = realpathSync(launcherPath)
+  const visited = new Set()
+  for (let depth = 0; depth < MAX_COMMAND_SHIM_DEPTH; depth += 1) {
+    if (visited.has(current)) throw new Error('VerificationDependencyPnpmLauncherCycle')
+    visited.add(current)
+    const metadata = lstatSync(current, { throwIfNoEntry: false })
+    if (!metadata?.isFile()) throw new Error('VerificationDependencyPnpmLauncherMissing')
+    if (metadata.size > MAX_COMMAND_SHIM_BYTES) return current
+    const source = readFileSync(current)
+    if (source.includes(0)) return current
+    const marker = /^(?:#|@REM\s+)\s*cmd-shim-target=(.+)$/imu.exec(source.toString('utf8'))?.[1]
+    if (!marker) return current
+    const unquoted = marker.trim().replace(/^(?:"([^"]+)"|'([^']+)')$/u, '$1$2')
+    if (!unquoted || /[\0\r\n]/u.test(unquoted)) {
+      throw new Error('VerificationDependencyPnpmLauncherTargetInvalid')
+    }
+    const target = isAbsolute(unquoted) ? unquoted : resolve(dirname(current), unquoted)
+    const targetMetadata = lstatSync(target, { throwIfNoEntry: false })
+    if (!targetMetadata?.isFile() && !targetMetadata?.isSymbolicLink()) {
+      throw new Error('VerificationDependencyPnpmLauncherTargetMissing')
+    }
+    current = realpathSync(target)
+  }
+  throw new Error('VerificationDependencyPnpmLauncherDepthExceeded')
 }
 
 export function findPnpmPackageJson(executablePath) {
@@ -573,7 +614,7 @@ export function findPnpmPackageJson(executablePath) {
     const requireFromExecutable = createRequire(
       resolve(dirname(executablePath), 'verification-runtime.cjs'),
     )
-    roots.unshift(dirname(requireFromExecutable.resolve('pnpm')))
+    roots.push(dirname(requireFromExecutable.resolve('pnpm')))
   } catch {}
   const visited = new Set()
   for (const root of roots) {

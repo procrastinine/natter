@@ -203,7 +203,7 @@ export async function requestGenerationStop(
 ): Promise<AttemptStopRequest> {
   await handle.prepared
   const capability = attemptStopCapability(attemptController.getExecution(handle.streamId))
-  if (!capability || capability.kind !== 'requestable') {
+  if (capability?.kind !== 'requestable') {
     throw new Error(
       `GenerationTestStopUnavailable:${handle.streamId}:${capability?.kind ?? 'missing'}`,
     )

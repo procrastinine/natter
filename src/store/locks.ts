@@ -88,6 +88,11 @@ interface IndexedDbLockBackendOptions {
   recordName?: string
   deleteRecordOnRelease?: boolean
   trackTransactionActivity?: boolean
+  waitForWakeOrDeadline?: (
+    wake: Promise<void>,
+    delay: number,
+    signal: AbortSignal | undefined,
+  ) => Promise<void>
 }
 
 interface FenceIdentity {
@@ -440,6 +445,9 @@ class IndexedDbLockBackend implements LockBackend {
   private readonly recordName: string
   private readonly deleteRecordOnRelease: boolean
   private readonly trackTransactionActivity: boolean
+  private readonly waitForWakeOrDeadlinePort:
+    | IndexedDbLockBackendOptions['waitForWakeOrDeadline']
+    | undefined
   private queue: Promise<void> = Promise.resolve()
   private readonly timers = new Set<ReturnType<typeof setTimeout>>()
   private readonly delayRejectors = new Map<ReturnType<typeof setTimeout>, (error: Error) => void>()
@@ -470,6 +478,7 @@ class IndexedDbLockBackend implements LockBackend {
     this.recordName = options.recordName ?? BROWSER_WRITER_LOCK_NAME
     this.deleteRecordOnRelease = options.deleteRecordOnRelease ?? false
     this.trackTransactionActivity = options.trackTransactionActivity ?? true
+    this.waitForWakeOrDeadlinePort = options.waitForWakeOrDeadline
     if (
       this.leaseMs <= 0 ||
       this.renewMs <= 0 ||
@@ -789,6 +798,9 @@ class IndexedDbLockBackend implements LockBackend {
     delay: number,
     signal: AbortSignal | undefined,
   ): Promise<void> {
+    if (this.waitForWakeOrDeadlinePort) {
+      return this.waitForWakeOrDeadlinePort(wake, delay, signal)
+    }
     if (this.disposed) return Promise.reject(new Error('LockBackendDisposed'))
     if (signal?.aborted) return Promise.reject(abortError(signal))
     return new Promise((resolve, reject) => {

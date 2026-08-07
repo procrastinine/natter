@@ -10,8 +10,8 @@ import { resetLoadedWorkspaceSessionOwnersForTests } from '../src/store/workspac
 installWorkspaceRepositoryFactory(getBrowserRepository)
 
 afterEach(() => {
-  vi.useRealTimers()
   cleanup()
+  vi.useRealTimers()
   resetLoadedWorkspaceSessionOwnersForTests()
   resetMountedRepositoryProjectionsForTests()
 })

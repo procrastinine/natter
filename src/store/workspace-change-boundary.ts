@@ -32,6 +32,7 @@ const PRESET_FACETS = new Set([
 const KEY_FACETS = new Set(['request-material', 'selected-detail', 'membership', 'usage'])
 const ORGANIZATION_FACETS = new Set(['definition', 'membership'])
 const STORAGE_MAINTENANCE_TASKS = new Set([
+  'clean-replacement-database',
   'reap-attachments',
   'prune-terminal-streams',
   'prune-empty-drafts',

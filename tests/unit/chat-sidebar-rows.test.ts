@@ -13,6 +13,7 @@ import {
   readSidebarCreatedAtGroupCount,
   readSidebarPresentationPage,
 } from '../../src/store/browser-catalog-queries'
+import { __resetBrowserRepositoryForTests } from '../../src/store/browser-repo'
 import {
   openBrowserWorkspace,
   shutdownBrowserWorkspace,
@@ -31,7 +32,10 @@ import type {
   SidebarPresentationRequest,
 } from '../../src/store/repository'
 import { createSidebarSessionController } from '../../src/store/sidebar-session'
-import { getWorkspaceRepository } from '../../src/store/workspace-repository'
+import {
+  __resetWorkspaceRepositoryForTests,
+  getWorkspaceRepository,
+} from '../../src/store/workspace-repository'
 import { runWorkspaceRead } from '../../src/store/workspace-runtime'
 import { workspaceUsableSurfaceSettlementPort } from '../../src/store/workspace-runtime-control'
 import { createChat, putTestChats } from '../helpers/chats'
@@ -64,6 +68,8 @@ async function readPresentationPage(
 }
 
 async function resetAll() {
+  __resetWorkspaceRepositoryForTests()
+  __resetBrowserRepositoryForTests()
   __resetBroadcastForTests()
   __resetDbForTests()
   vi.restoreAllMocks()

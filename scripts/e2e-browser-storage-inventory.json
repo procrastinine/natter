@@ -75,27 +75,27 @@
       "cleanupRestoreObligation": "Close both raw database handles and let afterEach delete the isolated physical workspace after the upgrade assertions.",
       "publicUiCannotExpress": "The browser journey must construct an exact observed intermediate physical schema and sentinel row before current code opens and upgrades it.",
       "siteIds": [
-        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20and%20opens%20in%20Chromium%3Ecallback%3Aonupgradeneeded::operation=indexeddb.createIndex::mode=versionchange::store=%3Cdynamic%3E%40index%3A%3Cdynamic%3E::occurrence=1",
-        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20and%20opens%20in%20Chromium%3Ecallback%3Aonupgradeneeded::operation=indexeddb.database.create-object-store::mode=versionchange::store=%3Cdynamic%3E::occurrence=1",
-        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20and%20opens%20in%20Chromium::operation=indexeddb.database.close::mode=-::store=-::occurrence=1",
-        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20and%20opens%20in%20Chromium::operation=indexeddb.database.close::mode=-::store=-::occurrence=2",
-        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20and%20opens%20in%20Chromium::operation=indexeddb.database.transaction::mode=readonly::store=settings::occurrence=1",
-        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20and%20opens%20in%20Chromium::operation=indexeddb.database.transaction::mode=readwrite::store=settings::occurrence=1",
-        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20and%20opens%20in%20Chromium::operation=indexeddb.factory.delete-database::mode=-::store=-::occurrence=1",
-        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20and%20opens%20in%20Chromium::operation=indexeddb.factory.enumerate-databases::mode=-::store=-::occurrence=1",
-        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20and%20opens%20in%20Chromium::operation=indexeddb.factory.open::mode=-::store=-::occurrence=1",
-        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20and%20opens%20in%20Chromium::operation=indexeddb.factory.open::mode=-::store=-::occurrence=2",
-        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20and%20opens%20in%20Chromium::operation=indexeddb.get::mode=readonly::store=settings::occurrence=1",
-        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20and%20opens%20in%20Chromium::operation=indexeddb.put::mode=readwrite::store=settings::occurrence=1",
-        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20and%20opens%20in%20Chromium::operation=indexeddb.transaction.object-store::mode=readonly::store=settings::occurrence=1",
-        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20and%20opens%20in%20Chromium::operation=indexeddb.transaction.object-store::mode=readwrite::store=settings::occurrence=1"
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines%3Ecallback%3Aonupgradeneeded::operation=indexeddb.createIndex::mode=versionchange::store=%3Cdynamic%3E%40index%3A%3Cdynamic%3E::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines%3Ecallback%3Aonupgradeneeded::operation=indexeddb.database.create-object-store::mode=versionchange::store=%3Cdynamic%3E::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=indexeddb.database.close::mode=-::store=-::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=indexeddb.database.close::mode=-::store=-::occurrence=2",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=indexeddb.database.transaction::mode=readonly::store=settings::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=indexeddb.database.transaction::mode=readwrite::store=settings::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=indexeddb.factory.delete-database::mode=-::store=-::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=indexeddb.factory.enumerate-databases::mode=-::store=-::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=indexeddb.factory.open::mode=-::store=-::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=indexeddb.factory.open::mode=-::store=-::occurrence=2",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=indexeddb.get::mode=readonly::store=settings::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=indexeddb.put::mode=readwrite::store=settings::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=indexeddb.transaction.object-store::mode=readonly::store=settings::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=indexeddb.transaction.object-store::mode=readwrite::store=settings::occurrence=1"
       ],
       "cleanupEvidence": {
         "siteIds": [
           "tests/e2e/startup-recovery.spec.ts::owner=hook%3AafterEach::operation=fixture.clear-indexeddb::mode=-::store=-::occurrence=1",
-          "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20and%20opens%20in%20Chromium::operation=fixture.playwright-context-teardown::mode=-::store=-::occurrence=1",
-          "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20and%20opens%20in%20Chromium::operation=indexeddb.database.close::mode=-::store=-::occurrence=1",
-          "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20and%20opens%20in%20Chromium::operation=indexeddb.database.close::mode=-::store=-::occurrence=2"
+          "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=fixture.playwright-context-teardown::mode=-::store=-::occurrence=1",
+          "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=indexeddb.database.close::mode=-::store=-::occurrence=1",
+          "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=indexeddb.database.close::mode=-::store=-::occurrence=2"
         ],
         "fixtureOwners": [],
         "processOwned": false
@@ -158,6 +158,33 @@
         "siteIds": [
           "tests/e2e/helpers.ts::owner=function%3AholdIndexedDbStoreGate%3Ecallback%3Aoncomplete::operation=indexeddb.database.close::mode=-::store=-::occurrence=1",
           "tests/e2e/helpers.ts::owner=function%3AholdIndexedDbStoreGate%3Efunction%3Afail::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+        ],
+        "fixtureOwners": [],
+        "processOwned": false
+      }
+    },
+    {
+      "purpose": "read-only-assertion",
+      "mutationScope": {
+        "kind": "none",
+        "targets": []
+      },
+      "cleanupRestoreObligation": "Read only the generated workspace control manifest, compaction state, and recovery-intent keys, close the control database handle, and leave all durable browser state unchanged.",
+      "publicUiCannotExpress": "A reusable large-workspace profile is safe only after its replacement journal and durable compaction debt are both quiescent; those control-plane revisions are intentionally absent from the public UI.",
+      "siteIds": [
+        "tests/e2e/large-workspace.setup.ts::owner=function%3AwaitForGeneratedWorkspaceStorageQuiescence%3Ecallback%3Aonsuccess::operation=indexeddb.get::mode=readonly::store=compactionStates::occurrence=1",
+        "tests/e2e/large-workspace.setup.ts::owner=function%3AwaitForGeneratedWorkspaceStorageQuiescence%3Ecallback%3Aonsuccess::operation=indexeddb.transaction.object-store::mode=readonly::store=compactionStates::occurrence=1",
+        "tests/e2e/large-workspace.setup.ts::owner=function%3AwaitForGeneratedWorkspaceStorageQuiescence::operation=indexeddb.database.close::mode=-::store=-::occurrence=1",
+        "tests/e2e/large-workspace.setup.ts::owner=function%3AwaitForGeneratedWorkspaceStorageQuiescence::operation=indexeddb.database.transaction::mode=readonly::store=compactionStates%2Bmanifests::occurrence=1",
+        "tests/e2e/large-workspace.setup.ts::owner=function%3AwaitForGeneratedWorkspaceStorageQuiescence::operation=indexeddb.factory.open::mode=-::store=-::occurrence=1",
+        "tests/e2e/large-workspace.setup.ts::owner=function%3AwaitForGeneratedWorkspaceStorageQuiescence::operation=indexeddb.get::mode=readonly::store=manifests::occurrence=1",
+        "tests/e2e/large-workspace.setup.ts::owner=function%3AwaitForGeneratedWorkspaceStorageQuiescence::operation=indexeddb.transaction.object-store::mode=readonly::store=manifests::occurrence=1",
+        "tests/e2e/large-workspace.setup.ts::owner=function%3AwaitForGeneratedWorkspaceStorageQuiescence::operation=web-storage.key::mode=-::store=localStorage::occurrence=1",
+        "tests/e2e/large-workspace.setup.ts::owner=function%3AwaitForGeneratedWorkspaceStorageQuiescence::operation=web-storage.length::mode=-::store=localStorage::occurrence=1"
+      ],
+      "cleanupEvidence": {
+        "siteIds": [
+          "tests/e2e/large-workspace.setup.ts::owner=function%3AwaitForGeneratedWorkspaceStorageQuiescence::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
         ],
         "fixtureOwners": [],
         "processOwned": false

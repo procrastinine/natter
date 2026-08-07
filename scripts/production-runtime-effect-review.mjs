@@ -29,6 +29,20 @@ export const productionRuntimeEffectReviews = Object.freeze([
     'The router is a page singleton, and the listener must survive every React mount and workspace replacement.',
   ),
   lifetime(
+    'src/app/router.ts#ensureHashListener|event-listener|acquire|addEventListener|fnv1a32:f6e84b16|1',
+    "window.addEventListener('pageshow', reconcileRouteSnapshotWithAddress)",
+    'browser-page',
+    'one pageshow listener guarded by hashListenerInstalled for the lifetime of the page module',
+    'The URL owner revalidates its committed snapshot when a browser-restored or background-created page becomes active.',
+  ),
+  lifetime(
+    'src/app/router.ts#ensureHashListener|event-listener|acquire|addEventListener|fnv1a32:e87298b3|1',
+    "document.addEventListener('visibilitychange', () => {",
+    'browser-page',
+    'one visibilitychange listener guarded by hashListenerInstalled for the lifetime of the page module',
+    'The URL owner revalidates its committed snapshot before a resumed tab can present a stale route.',
+  ),
+  lifetime(
     'src/lib/page-lifecycle.ts#<module>|event-listener|acquire|addEventListener|fnv1a32:05101a9a|1',
     "window.addEventListener('beforeunload', () => {",
     'browser-page',

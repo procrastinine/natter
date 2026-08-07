@@ -153,6 +153,7 @@ import {
 import { installWorkspaceEffectFatalFailureHandler } from './workspace-effect-hub'
 import { suspendWorkspacePresentation } from './workspace-presentation-lifecycle'
 import type { WorkspaceChange } from './workspace-protocol'
+import { publishLocalWorkspaceInvalidation } from './workspace-repository'
 import {
   claimWorkspaceRuntimeDemandBoundary,
   isWorkspaceMaintenancePreemptedError,
@@ -1149,6 +1150,13 @@ async function performBrowserWorkspaceOpen(
     assertBrowserWorkspaceBootstrapAuthority(attempt.authority)
     options.onProgress?.({ kind: 'runtime-resources', operation: 'settle' })
     await finishWorkspaceRuntimeReconciliation(workspace)
+    if ((await readBrowserWorkspaceDatabaseManifest()).pending) {
+      publishLocalWorkspaceInvalidation({
+        kind: 'invalidate',
+        ...workspace,
+        dependencies: [{ kind: 'storage-maintenance', tasks: ['clean-replacement-database'] }],
+      })
+    }
     opened = true
   } catch (error) {
     if (getWorkspaceRuntimeControlSnapshot().state === 'RECONCILING') {

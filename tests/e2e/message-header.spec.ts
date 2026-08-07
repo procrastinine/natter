@@ -43,6 +43,9 @@ test('assistant header shows the role label only; model + tokens + cost live in 
   })
   await createChatAndOpen(page)
   await sendMessage(page, 'hello')
+  const chatId = new URL(page.url()).hash.match(/^#\/chat\/([^/?#]+)/u)?.[1]
+  if (!chatId) throw new Error('MessageHeaderChatRouteMissing')
+  await waitForAssistantGenerationFinished(page, chatId)
   const assistant = page.locator('[data-ui="message"][data-role="assistant"]').first()
   await expect(assistant.locator('[data-ui="message-role"]')).toHaveText('Assistant')
   // The factual chips are NOT in the header anymore.

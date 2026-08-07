@@ -127,6 +127,32 @@ describe('generation prompt material lease', () => {
     expect(afterReleaseLoader).toHaveBeenCalledOnce()
   })
 
+  it('keeps an admitted prompt lease alive when its presentation coordinator is released', async () => {
+    const current = presentation('message-a')
+    const coordinator = createWorkspaceMessageMaterialCoordinator(WORKSPACE_FENCE)
+    const lease = coordinator.acquirePrompt(CHAT_ID, [current.header])
+
+    coordinator.release()
+    lease.seal(WORKSPACE_FENCE, prompt([current.header]))
+    const loader = vi.fn<GenerationPromptMaterialLoader>(async () => observation([current]))
+
+    await expect(lease.read(WORKSPACE_FENCE, [current.header], loader)).resolves.toMatchObject([
+      { header: { id: 'message-a' } },
+    ])
+    expect(loader).toHaveBeenCalledOnce()
+    expect(() => coordinator.acquirePrompt(CHAT_ID, [])).toThrow(
+      'WorkspaceMessageMaterialCoordinatorReleased',
+    )
+    await expect(coordinator.read(WORKSPACE_FENCE, [current.header], loader)).rejects.toThrow(
+      'WorkspaceMessageMaterialCoordinatorReleased',
+    )
+
+    lease.release()
+    await expect(lease.read(WORKSPACE_FENCE, [current.header], loader)).rejects.toThrow(
+      'GenerationPromptMaterialLeaseMismatch',
+    )
+  })
+
   it('lets a generation-first material read and transcript join one physical load', async () => {
     const current = presentation('message-a')
     const { coordinator, lease } = sealedCoordinatorLease([current.header])
@@ -315,6 +341,39 @@ describe('generation prompt material lease', () => {
     expect(loader).toHaveBeenCalledOnce()
   })
 
+  it('never admits a new reader to an abandoned physical material load', async () => {
+    const current = presentation('message-a')
+    const { coordinator, lease } = sealedCoordinatorLease([current.header])
+    const abandoned = deferred<GenerationPromptMaterialObservation>()
+    let physicalSignal: AbortSignal | undefined
+    const transcriptLoader = vi.fn<GenerationPromptMaterialLoader>((_headers, signal) => {
+      physicalSignal = signal
+      return abandoned.promise
+    })
+    const transcriptAbort = new AbortController()
+    const transcript = coordinator.read(
+      WORKSPACE_FENCE,
+      [current.header],
+      transcriptLoader,
+      transcriptAbort.signal,
+    )
+    await Promise.resolve()
+
+    transcriptAbort.abort(new Error('transcript-superseded'))
+    await expect(transcript).rejects.toThrow('transcript-superseded')
+    expect(physicalSignal?.aborted).toBe(true)
+
+    const generationLoader = vi.fn<GenerationPromptMaterialLoader>(async () =>
+      observation([current]),
+    )
+    const generation = lease.read(WORKSPACE_FENCE, [current.header], generationLoader)
+    abandoned.reject(new DOMException('Physical read cancelled.', 'AbortError'))
+
+    await expect(generation).resolves.toMatchObject([{ header: { id: 'message-a' } }])
+    expect(transcriptLoader).toHaveBeenCalledOnce()
+    expect(generationLoader).toHaveBeenCalledOnce()
+  })
+
   it('bounds loader pages by 16 rows and 256k text characters without splitting an oversized row', async () => {
     const headers = [
       ...Array.from({ length: 17 }, (_, index) => headerWithTextChars(`small-${index}`, 1)),
@@ -357,23 +416,24 @@ describe('generation prompt material lease', () => {
       mismatch: 'tree structure',
       canonical: { parentId: 'different-parent' },
     },
-  ])('does not reuse seeded material with a mismatched $mismatch after seal', async ({
-    canonical,
-  }) => {
-    const stale = presentation('message-a')
-    const current = presentation('message-a', canonical)
-    const lease = createGenerationPromptMaterialLease(WORKSPACE_FENCE, CHAT_ID, [stale.header])
-    lease.seed(WORKSPACE_FENCE, [stale])
-    lease.seal(WORKSPACE_FENCE, prompt([current.header]))
-    const loader = vi.fn<GenerationPromptMaterialLoader>(async (headers) =>
-      observation(headers.map(presentationForHeader)),
-    )
+  ])(
+    'does not reuse seeded material with a mismatched $mismatch after seal',
+    async ({ canonical }) => {
+      const stale = presentation('message-a')
+      const current = presentation('message-a', canonical)
+      const lease = createGenerationPromptMaterialLease(WORKSPACE_FENCE, CHAT_ID, [stale.header])
+      lease.seed(WORKSPACE_FENCE, [stale])
+      lease.seal(WORKSPACE_FENCE, prompt([current.header]))
+      const loader = vi.fn<GenerationPromptMaterialLoader>(async (headers) =>
+        observation(headers.map(presentationForHeader)),
+      )
 
-    const result = await lease.read(WORKSPACE_FENCE, [current.header], loader)
+      const result = await lease.read(WORKSPACE_FENCE, [current.header], loader)
 
-    expect(loader).toHaveBeenCalledTimes(1)
-    expect(result[0]?.header).toEqual(current.header)
-  })
+      expect(loader).toHaveBeenCalledTimes(1)
+      expect(result[0]?.header).toEqual(current.header)
+    },
+  )
 
   it('lets an active reader finish after lease release and drops its retained material', async () => {
     const current = presentation('message-a')
@@ -558,12 +618,15 @@ function messageIds(headers: readonly MessageHeaderRow[]): string[] {
 interface Deferred<T> {
   readonly promise: Promise<T>
   resolve(value: T): void
+  reject(error: unknown): void
 }
 
 function deferred<T>(): Deferred<T> {
   let resolve!: (value: T) => void
-  const promise = new Promise<T>((next) => {
+  let reject!: (error: unknown) => void
+  const promise = new Promise<T>((next, fail) => {
     resolve = next
+    reject = fail
   })
-  return { promise, resolve }
+  return { promise, resolve, reject }
 }

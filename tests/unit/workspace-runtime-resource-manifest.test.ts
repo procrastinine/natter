@@ -525,6 +525,132 @@ describe('workspace runtime resource manifest', () => {
     expect(runtime.WORKSPACE_ROOT_REPLACEMENT_DISPOSITIONS['cache-refresh']).toBe('cancel')
   })
 
+  it('drains cleanup started by graceful resource abort before proving closure', async () => {
+    const { control } = createRuntimeHarness()
+    let producerAttached = false
+    let producerAborted = false
+    let releaseAbortCleanup!: () => void
+    const abortCleanup = new Promise<void>((resolve) => {
+      releaseAbortCleanup = resolve
+    })
+    const manifest = Object.fromEntries(
+      control.WORKSPACE_RUNTIME_RESOURCE_IDS.map((id) => {
+        const phase = resourcePhase(id)
+        return [
+          id,
+          {
+            id,
+            phase,
+            closeAdmissions: () => undefined,
+            abort: () => {
+              if (id === 'storage-maintenance') producerAborted = true
+            },
+            awaitIdle: () =>
+              id === 'storage-maintenance' && producerAborted
+                ? abortCleanup.then(() => {
+                    producerAttached = false
+                  })
+                : Promise.resolve(),
+            assertClosed: () => {
+              if (id === 'storage-maintenance' && producerAttached) {
+                throw new Error('abort cleanup remained active')
+              }
+            },
+            ...(isCoreResourcePhase(phase)
+              ? { resume: () => undefined }
+              : isBackgroundResourceId(id)
+                ? {
+                    attach: (): void => {
+                      if (id === 'storage-maintenance') producerAttached = true
+                    },
+                    prerequisites: [],
+                    activate: () => undefined,
+                  }
+                : { attach: (): void => undefined }),
+          },
+        ]
+      }),
+    ) as unknown as Parameters<typeof control.installWorkspaceRuntimeResources>[0]
+    control.installWorkspaceRuntimeResources(manifest, reconciliationManifest())
+    const fence = { workspaceId: 'workspace-abort-cleanup', replacementEpoch: 0 }
+    const opening = control.beginWorkspaceRuntimeReconciliation(fence)
+    await control.resumeWorkspaceRuntimeResources(opening)
+    await control.finishWorkspaceRuntimeReconciliation(fence)
+
+    const replacement = control.launchWorkspaceRuntimeReplacementNow('import-export', {
+      requireIdle: false,
+    })
+    expect(replacement).not.toBeNull()
+    const quiescing = control.awaitWorkspaceRuntimeQuiesced()
+    await vi.waitFor(() => expect(producerAborted).toBe(true))
+    expect(control.getWorkspaceRuntimeControlSnapshot().state).toBe('QUIESCING')
+
+    releaseAbortCleanup()
+    await quiescing
+    expect(control.getWorkspaceRuntimeControlSnapshot()).toMatchObject({
+      state: 'QUIESCED',
+      resourcesQuiesced: true,
+    })
+  })
+
+  it('attributes a failed closure invariant to its exact resource without losing the cause', async () => {
+    const { control, runtime } = createRuntimeHarness()
+    const root = new Error('resource stayed open')
+    let attached = false
+    const manifest = Object.fromEntries(
+      control.WORKSPACE_RUNTIME_RESOURCE_IDS.map((id) => {
+        const phase = resourcePhase(id)
+        return [
+          id,
+          {
+            id,
+            phase,
+            closeAdmissions: () => undefined,
+            abort: () => undefined,
+            awaitIdle: async () => undefined,
+            assertClosed: () => {
+              if (id === 'storage-maintenance' && attached) throw root
+            },
+            ...(isCoreResourcePhase(phase)
+              ? { resume: () => undefined }
+              : isBackgroundResourceId(id)
+                ? {
+                    attach: (): void => {
+                      if (id === 'storage-maintenance') attached = true
+                    },
+                    prerequisites: [],
+                    activate: () => undefined,
+                  }
+                : { attach: (): void => undefined }),
+          },
+        ]
+      }),
+    ) as unknown as Parameters<typeof control.installWorkspaceRuntimeResources>[0]
+    control.installWorkspaceRuntimeResources(manifest, reconciliationManifest())
+    const fence = { workspaceId: 'workspace-closure-attribution', replacementEpoch: 0 }
+    const opening = control.beginWorkspaceRuntimeReconciliation(fence)
+    await control.resumeWorkspaceRuntimeResources(opening)
+    await control.finishWorkspaceRuntimeReconciliation(fence)
+    control.beginWorkspaceRuntimeQuiesce()
+
+    const failure = await control.awaitWorkspaceRuntimeQuiesced().catch((error: unknown) => error)
+    expect(failure).toBeInstanceOf(AggregateError)
+    const failureErrors: unknown = (failure as AggregateError).errors
+    const failureConstituents: readonly unknown[] = Array.isArray(failureErrors)
+      ? failureErrors
+      : []
+    const closure = failureConstituents.find(
+      (error: unknown) =>
+        error instanceof AggregateError &&
+        error.message === 'WorkspaceRuntimeResourceClosureFailed:storage-maintenance',
+    )
+    expect(closure).toBeInstanceOf(AggregateError)
+    const closureErrors: unknown = (closure as AggregateError).errors
+    expect(closureErrors).toEqual([root])
+    expect((closure as Error).cause).toBe(root)
+    expect(runtime.getWorkspaceRuntimeState()).toBe('SEALED')
+  })
+
   it('publishes exact generation-blocker release to a cancellable foreground replacement wait', async () => {
     const { runtime } = createRuntimeHarness()
     const fence = { workspaceId: 'workspace-replacement-blocker-wait', replacementEpoch: 0 }

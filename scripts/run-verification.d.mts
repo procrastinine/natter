@@ -15,6 +15,7 @@ export interface VerificationStage {
   readonly label: string
   readonly policy: VerificationPolicy
   readonly argv: readonly string[]
+  readonly stderr?: 'allow' | 'empty'
 }
 
 export interface VerificationExecution {

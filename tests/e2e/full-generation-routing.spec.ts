@@ -226,9 +226,18 @@ test('GUI OpenAI-compatible send uses Responses and never carries OpenRouter pro
 })
 
 test('GUI OpenRouter video model uses parent /endpoints architecture for UI and send routing', async ({
+  browserName,
   page,
+  runtimeDiagnosticAllowances,
   uiJourney,
 }) => {
+  if (browserName === 'firefox') {
+    runtimeDiagnosticAllowances.push({
+      category: 'console-other',
+      message:
+        '^\\[JavaScript Warning: "Media resource blob:http://127\\.0\\.0\\.1:\\d+/[^"]+ could not be decoded\\." \\{file: "http://127\\.0\\.0\\.1:\\d+/#/[^"]+" line: 0\\}\\]$',
+    })
+  }
   const consoleLines = captureConsole(page)
   const videoRequests: CapturedRequest[] = []
   const videoDownloads: string[] = []

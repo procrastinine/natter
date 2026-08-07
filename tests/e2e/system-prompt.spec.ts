@@ -131,6 +131,56 @@ test('the one-off toast appears after the first edit and disappears on subsequen
   await expect(page.locator('[data-ui="settings-toast"]')).toBeHidden()
 })
 
+test('model discovery cannot move settings tabs under an in-progress gesture', async ({ page }) => {
+  let releaseCatalog: () => void = () => undefined
+  const catalogGate = new Promise<void>((resolve) => {
+    releaseCatalog = resolve
+  })
+  await page.route('https://openrouter.ai/api/v1/models*', async (route) => {
+    await catalogGate
+    await route.fulfill({
+      contentType: 'application/json',
+      headers: { 'access-control-allow-origin': '*' },
+      body: JSON.stringify({
+        data: [
+          {
+            id: 'anthropic/claude-opus-4.8',
+            name: 'Claude Opus 4.8',
+            supported_parameters: ['tools'],
+          },
+        ],
+      }),
+    })
+  })
+  try {
+    await mockChatCompletions(page, {
+      body: buildSseBody([{ id: 'gen-1', content: 'ok', finish: 'stop' }]),
+    })
+    await createChatAndOpen(page)
+    await sendMessage(page, 'initial')
+    await expect(page.locator('[data-ui="message"][data-role="assistant"]')).toBeVisible()
+    await page.locator('[data-role="settings-cog"]').click()
+    const promptsTab = page.locator('[data-ui="settings-tab"][data-tab="prompts"]')
+    const before = await promptsTab.boundingBox()
+    if (!before) throw new Error('SettingsPromptsTabMissingBeforeCatalog')
+
+    releaseCatalog()
+    await expect(page.locator('[data-ui="notice-banner"]')).toBeVisible()
+    const after = await promptsTab.boundingBox()
+    if (!after) throw new Error('SettingsPromptsTabMissingAfterCatalog')
+    expect(Math.abs(after.y - before.y)).toBeLessThanOrEqual(1)
+
+    await promptsTab.click()
+    await expect(page.locator('[data-ui="settings-panel"]')).toHaveAttribute(
+      'data-active-tab',
+      'prompts',
+    )
+    await expect(page.locator('[data-ui="system-prompt-textarea"]')).toBeVisible()
+  } finally {
+    releaseCatalog()
+  }
+})
+
 async function expectChatSetting(page: Page, chatId: string, key: string, value: unknown) {
   await expect
     .poll(async () => {

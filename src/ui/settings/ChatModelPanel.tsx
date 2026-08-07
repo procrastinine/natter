@@ -454,21 +454,6 @@ export function ChatModelPanel({
     <aside data-ui="chat-model-panel" aria-label="Chat settings">
       <PanelHeader onClose={onClose} title="Chat settings" />
       <PresetBreadcrumb chat={chat} preset={preset} />
-      {unavailableModel ? (
-        <div data-ui="notice-banner" role="status" data-tone="warning">
-          <span>
-            <strong>{unavailableModel}</strong> isn't served on{' '}
-            <em>{modelPresentationProfile?.name ?? 'this connection'}</em>. Pick a different model
-            below.
-          </span>
-        </div>
-      ) : noModel ? (
-        <div data-ui="notice-banner" role="status" data-tone="info">
-          <span>
-            Pick a model for <em>{modelPresentationProfile?.name ?? 'this connection'}</em>.
-          </span>
-        </div>
-      ) : null}
       <div role="tablist" data-ui="settings-tabs" data-ui-panel-tabs>
         {(
           [
@@ -491,6 +476,21 @@ export function ChatModelPanel({
           </Button>
         ))}
       </div>
+      {unavailableModel ? (
+        <div data-ui="notice-banner" role="status" data-tone="warning">
+          <span>
+            <strong>{unavailableModel}</strong> isn't served on{' '}
+            <em>{modelPresentationProfile?.name ?? 'this connection'}</em>. Pick a different model
+            below.
+          </span>
+        </div>
+      ) : noModel ? (
+        <div data-ui="notice-banner" role="status" data-tone="info">
+          <span>
+            Pick a model for <em>{modelPresentationProfile?.name ?? 'this connection'}</em>.
+          </span>
+        </div>
+      ) : null}
       <div role="tabpanel" data-ui="settings-panel" data-active-tab={tab}>
         {tab === 'model' ? (
           <>

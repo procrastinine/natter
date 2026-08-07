@@ -15,6 +15,8 @@ import {
 
 // Scroll-follow versus pinned-scroll behavior.
 
+const BOTTOM_SETTLED_DISTANCE_PX = 4
+
 function chunkFrame(content: string, finish?: string): string {
   return buildSseBody([{ id: 'scroll-stream', content, ...(finish ? { finish } : {}) }], {
     noDone: finish === undefined,
@@ -61,6 +63,40 @@ async function mockIncrementalChatCompletions(
 
 async function scrollDistanceFromBottom(region: Locator): Promise<number> {
   return region.evaluate((node) => node.scrollHeight - node.scrollTop - node.clientHeight)
+}
+
+async function sampleBottomControlFrames(
+  page: Page,
+  count: number,
+): Promise<readonly { readonly state: string | null; readonly jumpVisible: boolean }[]> {
+  return page.evaluate(async (frameCount) => {
+    const samples: Array<{ state: string | null; jumpVisible: boolean }> = []
+    for (let index = 0; index < frameCount; index += 1) {
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+      const region = document.querySelector<HTMLElement>('[data-ui="scroll-region"]')
+      const jump = document.querySelector<HTMLElement>('[data-ui="jump-to-latest"]')
+      samples.push({
+        state: region?.getAttribute('data-scroll-state') ?? null,
+        jumpVisible: jump !== null && jump.getClientRects().length > 0,
+      })
+    }
+    return samples
+  }, count)
+}
+
+async function firstFullyVisibleMessageId(page: Page, selector: string): Promise<string> {
+  return page.locator(selector).evaluateAll((messages) => {
+    const region = document.querySelector<HTMLElement>('[data-ui="scroll-region"]')
+    if (!region) return ''
+    const regionRect = region.getBoundingClientRect()
+    for (const message of messages) {
+      const rect = message.getBoundingClientRect()
+      if (rect.top >= regionRect.top + 1 && rect.bottom <= regionRect.bottom - 1) {
+        return message.getAttribute('data-message-id') ?? ''
+      }
+    }
+    return ''
+  })
 }
 
 const HEIGHT_PRODUCER_MECHANISMS = [
@@ -167,6 +203,51 @@ test('streaming text keeps the scroll region in follow state; scrolling up flips
     .poll(() => scrollDistanceFromBottom(region), { timeout: 3000 })
     .toBeLessThanOrEqual(4)
   await uiJourney.checkpoint(page, 'jump-to-latest-finished')
+})
+
+test('near-bottom scrolling has one stable Jump state and exact bottom clears it', async ({
+  page,
+}) => {
+  const huge = Array.from({ length: 200 }, (_, i) => `boundary line ${i}`).join('\n\n')
+  await mockChatCompletions(page, {
+    body: buildSseBody([{ id: 'bottom-boundary-1', content: huge, finish: 'stop' }]),
+  })
+  await createChatAndOpen(page)
+  await sendMessage(page, 'exercise the bottom boundary')
+  await expect(
+    page
+      .locator('[data-ui="message"][data-role="assistant"]')
+      .first()
+      .locator('[data-ui="message-body"]'),
+  ).toContainText('boundary line 199')
+  const region = page.locator('[data-ui="scroll-region"]')
+  const jumpChip = page.locator('[data-ui="jump-to-latest"]')
+  await expect.poll(() => scrollDistanceFromBottom(region)).toBeLessThanOrEqual(4)
+  await expect(region).toHaveAttribute('data-scroll-state', 'follow')
+  await expect(jumpChip).toHaveCount(0)
+
+  await region.hover()
+  await page.mouse.wheel(0, -24)
+  await expect
+    .poll(() => scrollDistanceFromBottom(region))
+    .toBeGreaterThan(BOTTOM_SETTLED_DISTANCE_PX)
+  await expect.poll(() => scrollDistanceFromBottom(region)).toBeLessThan(48)
+  await expect(region).toHaveAttribute('data-scroll-state', 'pinned')
+  await expect(jumpChip).toBeVisible()
+
+  await page.mouse.wheel(0, 8)
+  await page.mouse.wheel(0, -8)
+  const nearBottomFrames = await sampleBottomControlFrames(page, 12)
+  expect(nearBottomFrames.every((frame) => frame.state === 'pinned' && frame.jumpVisible)).toBe(
+    true,
+  )
+
+  await page.mouse.wheel(0, 200)
+  await expect.poll(() => scrollDistanceFromBottom(region)).toBeLessThanOrEqual(4)
+  await expect(region).toHaveAttribute('data-scroll-state', 'follow')
+  await expect(jumpChip).toHaveCount(0)
+  const bottomFrames = await sampleBottomControlFrames(page, 12)
+  expect(bottomFrames.every((frame) => frame.state === 'follow' && !frame.jumpVisible)).toBe(true)
 })
 
 test('reopening an overflowing chat snaps to the branch leaf instead of preserving the prior scroll offset', async ({
@@ -407,7 +488,10 @@ test('an active message edit does not trap transcript scrolling in either direct
   await tailInput.press('Escape')
   await expect(tailMessage.locator('[data-ui="inline-editor"]')).toHaveCount(0)
   await region.hover()
-  await page.mouse.wheel(0, -10_000)
+  for (let step = 0; step < 16; step += 1) {
+    await page.mouse.wheel(0, -10_000)
+    if ((await region.evaluate((node) => node.scrollTop)) <= 1) break
+  }
   await expect.poll(() => region.evaluate((node) => node.scrollTop)).toBeLessThanOrEqual(1)
 
   const rootMessage = page
@@ -655,11 +739,19 @@ test("Save & Send from a pinned earlier message follows this tab's new streaming
     await page.mouse.wheel(0, -5000)
     await expect(region).toHaveAttribute('data-scroll-state', 'pinned')
 
-    const earlierUser = page.locator('[data-ui="message"][data-role="user"]').first()
+    let earlierMessageId = ''
+    await expect
+      .poll(async () => {
+        earlierMessageId = await firstFullyVisibleMessageId(
+          page,
+          '[data-ui="message"][data-role="user"]',
+        )
+        return earlierMessageId
+      })
+      .not.toBe('')
+    const earlierUser = page.locator(`[data-ui="message"][data-message-id="${earlierMessageId}"]`)
     await earlierUser.locator('[data-action="edit"]').click()
     await earlierUser.locator('[data-ui="inline-editor-input"]').fill('edited earlier prompt')
-    const earlierMessageId = await earlierUser.getAttribute('data-message-id')
-    if (!earlierMessageId) throw new Error('SaveSendEditedMessageIdMissing')
     await uiJourney.start(page, createChatUiJourneyProfile(), 'save-send-bottom-handoff')
     await uiJourney.intent(page, {
       kind: 'gesture',
@@ -697,13 +789,20 @@ test("Save & Send from a pinned earlier message follows this tab's new streaming
     await uiJourney.checkpoint(page, 'save-send-bottom-acquired')
 
     await region.hover()
-    await page.mouse.wheel(0, -1000)
-    await expect(region).toHaveAttribute('data-scroll-state', 'pinned')
-    const pinnedDistance = await scrollDistanceFromBottom(region)
+    const followDistance = await scrollDistanceFromBottom(region)
+    await page.mouse.wheel(0, -400)
+    await page.mouse.wheel(0, -400)
+    await page.mouse.wheel(0, -400)
     await expect
       .poll(() => scrollDistanceFromBottom(region), { timeout: 3000 })
-      .toBeGreaterThanOrEqual(pinnedDistance)
+      .toBeGreaterThan(followDistance + 200)
+    await expect(region).toHaveAttribute('data-scroll-state', 'pinned')
+    const pinnedDistance = await scrollDistanceFromBottom(region)
     await expect.poll(() => scenario.snapshot().then((state) => state.activeStreams)).toBe(0)
+    await expect(region).toHaveAttribute('data-scroll-state', 'pinned')
+    await expect
+      .poll(() => scrollDistanceFromBottom(region), { timeout: 3000 })
+      .toBeGreaterThanOrEqual(pinnedDistance - 4)
     await uiJourney.finish(page, 'save-send-user-owned')
   } finally {
     await scenario.dispose()

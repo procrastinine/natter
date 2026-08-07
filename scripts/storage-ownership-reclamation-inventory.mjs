@@ -979,7 +979,7 @@ export const STORAGE_COORDINATION_MECHANISMS = Object.freeze([
   coordination(
     'retention-owner-lock',
     'src/store/storage-maintenance-runtime.ts',
-    '`storage-maintenance-owner:v1:${this.#fence.workspaceId}`',
+    '`storage-maintenance-owner:v1:$' + '{this.#fence.workspaceId}`',
     'Exactly one tab owns normal retention and compaction checks at a time.',
   ),
 ])

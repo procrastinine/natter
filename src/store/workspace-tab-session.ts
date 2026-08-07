@@ -24,6 +24,36 @@ let reconciledWorkspaceFence: string | null = null
 let revision = 0
 let snapshot: WorkspaceTabSessionSnapshot = Object.freeze({ revision, fence: null })
 
+export function initializeWorkspaceTabSessionContext(
+  target: Window | undefined = typeof window === 'undefined' ? undefined : window,
+  navigationType = currentNavigationType(target),
+): void {
+  if (!target || navigationType === 'reload' || navigationType === 'back_forward') return
+  try {
+    const storage = browserSessionStorage(target)
+    if (!storage) return
+    const storedFence = storage.getItem(WORKSPACE_FENCE_KEY)
+    const inheritedKeys: string[] = []
+    for (let index = 0; index < storage.length; index += 1) {
+      const key = storage.key(index)
+      if (key?.startsWith('natter:')) inheritedKeys.push(key)
+    }
+    for (const key of inheritedKeys) storage.removeItem(key)
+    if (storedFence !== null) storage.setItem(WORKSPACE_FENCE_KEY, storedFence)
+  } catch {
+    // URL routing remains authoritative when browser tab-local storage is unavailable.
+  }
+}
+
+function currentNavigationType(target: Window | undefined): PerformanceNavigationTiming['type'] {
+  const type = (
+    target?.performance.getEntriesByType('navigation')[0] as
+      | Partial<PerformanceNavigationTiming>
+      | undefined
+  )?.type
+  return type === 'reload' || type === 'back_forward' ? type : 'navigate'
+}
+
 export function getWorkspaceTabSessionSnapshot(): WorkspaceTabSessionSnapshot {
   return snapshot
 }
@@ -111,3 +141,5 @@ function readStoredWorkspaceFence(): string | null {
     return null
   }
 }
+
+initializeWorkspaceTabSessionContext()

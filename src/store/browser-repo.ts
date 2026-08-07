@@ -207,6 +207,7 @@ import {
   type ConfigurationProfileUsageProjectionRow,
   emptyConfigurationProfileUsageProjectionRow,
 } from './configuration-profile-usage-projection'
+import { proveConversationSelectionInTransaction } from './conversation-destination-seal'
 import {
   type BrowserWorkspaceSession,
   childListKey,
@@ -1878,7 +1879,7 @@ async function readStoredMessage<T>(
   return db.transaction('r', db.messages, db.messageBodies, async (tx: Transaction) => {
     const unbind = bindReadonlyTransactionAbort(tx, signal, 'Message read aborted')
     try {
-      const [header, body] = await Promise.all([
+      const [header, body] = await Dexie.Promise.all([
         db.messages.get(messageId),
         db.messageBodies.get(messageId),
       ])
@@ -1917,7 +1918,7 @@ async function readMessageTextPreviewWindow(
           'Message preview read aborted',
         )
         try {
-          const [headers, previews] = await Promise.all([
+          const [headers, previews] = await Dexie.Promise.all([
             tx.table<MessageHeaderRow, MessageId>('messages').bulkGet(messageIds),
             tx.table<MessageTextPreviewRow, MessageId>('messagePreviews').bulkGet(messageIds),
           ])
@@ -2310,7 +2311,7 @@ class BrowserCommandCommit implements BrowserCommandSessionPort {
       false,
       executableReceipt,
     )
-    return Promise.resolve(value)
+    return Dexie.Promise.resolve(value)
   }
 
   async readSemanticOperationPreflight<Tables extends PhysicalStorageTableName, T>(
@@ -2777,18 +2778,13 @@ class BrowserCommandCommit implements BrowserCommandSessionPort {
       if (finalChat === null) {
         if (!initialExists) continue
         facts.push({ kind: 'chat-deleted', chatId })
-        if (sidebarChatIds.has(chatId)) {
-          facts.push({ kind: 'sidebar-row-deleted', chatId })
-        }
+        facts.push({ kind: 'sidebar-row-deleted', chatId })
         deletedChatIds.add(chatId)
         ordinaryChatIds.push(chatId)
         continue
       }
       if (finalChat === undefined) {
         if (!initialExists) throw new Error(`BrowserCommandChatConstructionMissing:${chatId}`)
-        if (sidebarChatIds.has(chatId)) {
-          facts.push({ kind: 'sidebar-row-changed', chatId })
-        }
         ordinaryChatIds.push(chatId)
         continue
       }
@@ -3282,7 +3278,7 @@ async function readConfigurationPresetOrderPage(
       offset = 0
     }
   } else if (anchorIds.length > 0) {
-    const [memberships, projectionsByAnchor] = await Promise.all([
+    const [memberships, projectionsByAnchor] = await Dexie.Promise.all([
       tx.table<PresetOrderMembershipRow, PresetId>('presetOrderMembership').bulkGet(anchorIds),
       projections.bulkGet(anchorIds),
     ])
@@ -6395,15 +6391,11 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     input: ForkChatFromMessageInput,
     commit: BrowserCommandCommit,
   ): Promise<ForkChatFromMessageResult> {
-    const [
-      { buildChildSlotProjection },
-      { applyAttachmentReferenceOwnerTransitions },
-      { proveConversationSelectionInTransaction },
-    ] = await Promise.all([
-      import('../core/child-list-state'),
-      import('./attachment-reference-edges'),
-      import('./conversation-destination-seal'),
-    ])
+    const [{ buildChildSlotProjection }, { applyAttachmentReferenceOwnerTransitions }] =
+      await Dexie.Promise.all([
+        import('../core/child-list-state'),
+        import('./attachment-reference-edges'),
+      ])
     const destinationChatId = input.destinationChatId ?? newId()
     const now = input.now ?? Date.now()
     return commit.executeSemanticOperation(
@@ -6465,7 +6457,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
           const storageRows = destinationMessages.map((message) =>
             splitMessageForStorage(message, { updatedAt: now }),
           )
-          await Promise.all([
+          await Dexie.Promise.all([
             addPhysicalStorageRows(
               tx,
               'messages',
@@ -6739,7 +6731,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
           SIDEBAR_SORT_SETTING_KEY,
           SIDEBAR_COLLAPSED_FOLDERS_SETTING_KEY,
         ]
-        const [rows, aggregate] = await Promise.all([
+        const [rows, aggregate] = await Dexie.Promise.all([
           tx.table<SettingsRow, string>('settings').bulkGet(keys),
           tx
             .table<{ id: string; totalProfileCount: number }, string>(
@@ -6931,7 +6923,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
         }
         const revisionKey = connectionDiscoveryRevisionKey(revision)
         const modelsQueryKey = modelsCacheKey(modelCatalogQueryForConnectionKind(profile.kind))
-        const [models, endpoints, privacy] = await Promise.all([
+        const [models, endpoints, privacy] = await Dexie.Promise.all([
           includeModels
             ? readConfigurationModelsPayload(
                 tx,
@@ -6939,7 +6931,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
                 revisionKey,
                 knownPayloads?.models,
               )
-            : Promise.resolve({ kind: 'not-requested' } as const),
+            : Dexie.Promise.resolve({ kind: 'not-requested' } as const),
           modelId
             ? readConfigurationEndpointsPayload(
                 tx,
@@ -6947,7 +6939,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
                 revisionKey,
                 knownPayloads?.endpoints,
               )
-            : Promise.resolve({ kind: 'not-requested' } as const),
+            : Dexie.Promise.resolve({ kind: 'not-requested' } as const),
           modelId
             ? readConfigurationPrivacyPayload(
                 tx,
@@ -6955,7 +6947,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
                 revisionKey,
                 knownPayloads?.privacy,
               )
-            : Promise.resolve({ kind: 'not-requested' } as const),
+            : Dexie.Promise.resolve({ kind: 'not-requested' } as const),
         ])
         signal?.throwIfAborted()
         return {
@@ -6997,7 +6989,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
         db.models,
       ],
       async (tx: Transaction) => {
-        const [chat, profile] = await Promise.all([
+        const [chat, profile] = await Dexie.Promise.all([
           tx.table<Chat, ChatId>('chats').get(chatId),
           tx.table<ConnectionProfile, ProfileId>('profiles').get(profileId),
         ])
@@ -7056,7 +7048,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
           : undefined
         const target = configurationRequestRevisionFor(profile, key)
         const queryKey = modelsCacheKey(modelCatalogQueryForConnectionKind(profile.kind))
-        const [models, links] = await Promise.all([
+        const [models, links] = await Dexie.Promise.all([
           readConfigurationModelsPayload(
             tx,
             [profileId, queryKey],
@@ -8384,7 +8376,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     return db.transaction('r', [db.workspaceFence, db.chats], async (tx: Transaction) => {
       const unbind = bindReadonlyTransactionAbort(tx, signal, 'Conversation frame read aborted')
       try {
-        const [workspace, chat] = await Promise.all([
+        const [workspace, chat] = await Dexie.Promise.all([
           readBrowserWorkspaceMetaFromTransaction(tx),
           tx.table<Chat, ChatId>('chats').get(chatId),
         ])
@@ -8455,7 +8447,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     const db = await this.openDb()
     const initial = await this.readConversationStructuralFrame(db, permit, chatId, signal)
     const [headers, childSlots] = initial.chat
-      ? await Promise.all([
+      ? await Dexie.Promise.all([
           readChatMessageHeaderPages(db, chatId, signal ? { signal } : {}),
           db.childLists.where('chatId').equals(chatId).toArray(),
         ])
@@ -8509,7 +8501,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
           'Branch page structure read aborted',
         )
         try {
-          const [workspace, chat, storedHeaders] = await Promise.all([
+          const [workspace, chat, storedHeaders] = await Dexie.Promise.all([
             readBrowserWorkspaceMetaFromTransaction(tx),
             tx.table<Chat, ChatId>('chats').get(chatId),
             tx.table<MessageHeaderRow, MessageId>('messages').bulkGet(pageMessageIds),
@@ -8715,7 +8707,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
       async (tx: Transaction) => {
         const unbind = bindReadonlyTransactionAbort(tx, signal, 'Active branch fork read aborted')
         try {
-          const [workspace, chat] = await Promise.all([
+          const [workspace, chat] = await Dexie.Promise.all([
             readBrowserWorkspaceMetaFromTransaction(tx),
             tx.table<Chat, ChatId>('chats').get(chatId),
           ])
@@ -9224,7 +9216,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
         commit: (tx, value) =>
           value
             ? this.generatedOutputLocalizationProfileIds(tx, attachmentId)
-            : Promise.resolve([]),
+            : Dexie.Promise.resolve([]),
       },
     )
     if (!mutation.value) return undefined
@@ -9541,7 +9533,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     const uniqueIds = [...new Set(attachmentIds)]
     const db = await this.openDb()
     return db.transaction('r', db.attachments, db.attachmentArtifacts, async () => {
-      const [headers, artifacts] = await Promise.all([
+      const [headers, artifacts] = await Dexie.Promise.all([
         db.attachments.bulkGet(uniqueIds),
         db.attachmentArtifacts.where('attachmentId').anyOf(uniqueIds).toArray(),
       ])
@@ -9669,7 +9661,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
               .limit(remaining)
               .toArray()
           : []
-      const [nextPending, nextLease] = await Promise.all([
+      const [nextPending, nextLease] = await Dexie.Promise.all([
         db.attachmentJobs
           .where(pendingIndex)
           .between(
@@ -9714,7 +9706,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
       async () => {
         const header = await db.attachments.get(attachmentId)
         if (!header) return undefined
-        const [blobs, artifacts, jobs] = await Promise.all([
+        const [blobs, artifacts, jobs] = await Dexie.Promise.all([
           db.attachmentBlobs.where('attachmentId').equals(attachmentId).toArray(),
           db.attachmentArtifacts.where('attachmentId').equals(attachmentId).toArray(),
           db.attachmentJobs.where('attachmentId').equals(attachmentId).toArray(),
@@ -9738,7 +9730,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
       async () => {
         const header = await db.attachments.get(attachmentId)
         if (!header) return undefined
-        const [blobs, artifacts, jobs] = await Promise.all([
+        const [blobs, artifacts, jobs] = await Dexie.Promise.all([
           db.attachmentBlobs.where('attachmentId').equals(attachmentId).toArray(),
           db.attachmentArtifacts.where('attachmentId').equals(attachmentId).toArray(),
           db.attachmentJobs.where('attachmentId').equals(attachmentId).toArray(),
@@ -9810,7 +9802,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
           ),
         ]
         const chatIds = [...new Set(edges.map((edge) => edge.chatId))]
-        const [messages, drafts, chats] = await Promise.all([
+        const [messages, drafts, chats] = await Dexie.Promise.all([
           db.messages.bulkGet(messageIds),
           db.drafts.bulkGet(draftChatIds),
           db.chats.bulkGet(chatIds),
@@ -10285,7 +10277,7 @@ export function executeBrowserCommandInDatabase<C extends WorkspaceCommand>(
       throw new Error('ProvidedCommandWorkspaceFenceImmutable')
     },
     getWorkspaceFence: () => workspace,
-    open: () => Promise.resolve(database),
+    open: () => Dexie.Promise.resolve(database),
     runOperation: (operation) => operation(database),
   }
   return new BrowserWorkspaceRepository(session).executeInProvidedDatabase(

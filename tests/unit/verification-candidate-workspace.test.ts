@@ -137,6 +137,38 @@ describe('materialized verification candidate', () => {
     )
   })
 
+  it('uses only tracked paths for the default candidate inventory', async () => {
+    const fixture = await candidateFixture()
+    write(fixture.root, 'unrelated-local-file.html', '<!doctype html>local only\n')
+    const calls: string[][] = []
+    const candidate = await materializeVerificationCandidate({
+      sourceRoot: fixture.root,
+      dependencyImage: fixture.image,
+      manifest,
+      runProcess: async (command, args) => {
+        expect(command).toBe('git')
+        calls.push([...args])
+        return {
+          ...successfulProcess(),
+          stdout: Buffer.from(`${fixture.paths.join('\0')}\0`),
+        }
+      },
+      captureCompiler: resolvedCompilerCapture,
+    })
+    candidates.push(candidate)
+
+    expect(calls).toEqual([
+      ['-C', fixture.root, 'ls-files', '--cached', '-z'],
+      ['-C', fixture.root, 'ls-files', '--cached', '-z'],
+    ])
+    expect(candidate.sourceManifest.entries.map(({ path }) => path)).toEqual(fixture.paths)
+    expect(
+      lstatSync(resolve(candidate.runtimeRoot, 'unrelated-local-file.html'), {
+        throwIfNoEntry: false,
+      }),
+    ).toBeUndefined()
+  })
+
   it('persists a pending compiler cohort for adaptation but refuses to execute it', async () => {
     const fixture = await candidateFixture()
     const candidate = await materializeVerificationCandidate({

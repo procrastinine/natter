@@ -196,19 +196,19 @@ export function useModelCatalog(
           }
         : null
       : null
-  const routingProjection: ConfigurationModelRoutingProjection | null =
-    frameModelMatches && frameModelMatches.target.modelId
-      ? {
-          profileId: frameModelMatches.target.profileId,
-          revision: frameModelMatches.target.requestRevision,
-          modelId: frameModelMatches.target.modelId,
-          ...(frameModelMatches.value.endpoints
-            ? { endpoints: frameModelMatches.value.endpoints }
-            : {}),
-          ...(frameModelMatches.value.privacy ? { privacy: frameModelMatches.value.privacy } : {}),
-          proxy: frameModelMatches.value.proxy,
-        }
-      : null
+  const routingProjection: ConfigurationModelRoutingProjection | null = frameModelMatches?.target
+    .modelId
+    ? {
+        profileId: frameModelMatches.target.profileId,
+        revision: frameModelMatches.target.requestRevision,
+        modelId: frameModelMatches.target.modelId,
+        ...(frameModelMatches.value.endpoints
+          ? { endpoints: frameModelMatches.value.endpoints }
+          : {}),
+        ...(frameModelMatches.value.privacy ? { privacy: frameModelMatches.value.privacy } : {}),
+        proxy: frameModelMatches.value.proxy,
+      }
+    : null
   const retainedRoutingProjection: ConfigurationModelRoutingProjection | null =
     retainedFrameModel?.target.modelId && retainedModelProfile && retainedModelSettings
       ? {

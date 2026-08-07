@@ -104,6 +104,7 @@ export type StorageMaintenanceTaskKind =
 
 export type StorageMaintenanceRequestTaskKind = Extract<
   StorageMaintenanceTaskKind,
+  | 'clean-replacement-database'
   | 'reconcile-attachment-integrity'
   | 'reap-attachments'
   | 'prune-terminal-streams'

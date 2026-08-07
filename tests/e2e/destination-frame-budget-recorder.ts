@@ -425,6 +425,9 @@ export async function installDestinationFrameBudgetRecorder(
       ],
     })
     try {
+      if (!PerformanceObserver.supportedEntryTypes.includes('longtask')) {
+        throw new Error('LongTaskTimingUnsupported')
+      }
       new PerformanceObserver((entries) => {
         if (!state.target || frozen) return
         for (const entry of entries.getEntries()) {

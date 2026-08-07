@@ -63,6 +63,7 @@ const report = {
     ? {
         vitest: stageTiming(verification.evidence.stages, 'vitest'),
         chromium: stageTiming(verification.evidence.stages, 'chromium-e2e'),
+        firefox: stageTiming(verification.evidence.stages, 'firefox-e2e'),
       }
     : { available: false },
   profiles,

@@ -1,4 +1,4 @@
-import type { Transaction } from 'dexie'
+import Dexie, { type Transaction } from 'dexie'
 import {
   type ActiveBranchChildSlot,
   type ActiveBranchForkSlot,
@@ -55,7 +55,7 @@ export async function readActiveBranchForkSlotsForHeadersInTransaction(
     ...(signal ? { signal } : {}),
     maxRows: BROWSER_COMMAND_DIRECT_FANOUT_BUDGET.maxReadRequestRows,
   }
-  const [members, states] = await Promise.all([
+  const [members, states] = await Dexie.Promise.all([
     readBulkGetPages(
       tx.table<ChildSlotMember, MessageId>('childSlotMembers'),
       headers.map((header) => header.id),
@@ -88,9 +88,9 @@ export async function readActiveBranchPathSlotFrameInTransaction(
     maxRows: BROWSER_COMMAND_DIRECT_FANOUT_BUDGET.maxReadRequestRows,
   }
   throwIfAborted(signal)
-  const [members, states] = await Promise.all([
+  const [members, states] = await Dexie.Promise.all([
     headers.length === 0
-      ? Promise.resolve([])
+      ? Dexie.Promise.resolve([])
       : readBulkGetPages(
           tx.table<ChildSlotMember, MessageId>('childSlotMembers'),
           headers.map((header) => header.id),

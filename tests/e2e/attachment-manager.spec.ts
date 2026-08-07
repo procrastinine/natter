@@ -129,14 +129,30 @@ test('attachment manager searches, filters, bulk deletes, and relinks through bu
   for (const filename of ['source-reference.txt', 'relink-target.txt', 'delete-orphan.txt']) {
     await expect(draftTray.getByText(filename)).toBeVisible()
   }
+  await expect(
+    draftTray.locator('[data-ui="attachment-file-card"][data-state="uploading"]'),
+  ).toHaveCount(0)
+  for (const filename of ['source-reference.txt', 'relink-target.txt', 'delete-orphan.txt']) {
+    await expect(
+      draftTray
+        .locator('[data-ui="attachment-file-card"]', { hasText: filename })
+        .getByLabel('Remove attachment'),
+    ).toBeVisible()
+  }
   await draftTray
     .locator('[data-ui="attachment-file-card"]', { hasText: 'relink-target.txt' })
     .getByLabel('Remove attachment')
     .click()
+  await expect(
+    draftTray.locator('[data-ui="attachment-file-card"]', { hasText: 'relink-target.txt' }),
+  ).toHaveCount(0)
   await draftTray
     .locator('[data-ui="attachment-file-card"]', { hasText: 'delete-orphan.txt' })
     .getByLabel('Remove attachment')
     .click()
+  await expect(
+    draftTray.locator('[data-ui="attachment-file-card"]', { hasText: 'delete-orphan.txt' }),
+  ).toHaveCount(0)
 
   await sendMessage(page, 'Keep the source attachment referenced.')
   await expect(

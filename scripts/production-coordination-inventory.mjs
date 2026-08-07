@@ -119,6 +119,7 @@ const MODULE_MUTABLE_IDS = Object.freeze([
   'src/store/storage-compaction-state.ts#activePhysicalMutationLedgers',
   'src/store/storage-compaction-state.ts#pendingCompletedPhysicalMutationLedgers',
   'src/store/storage-compaction-state.ts#physicalMutationDebtClosing',
+  'src/store/storage-compaction-state.ts#physicalMutationDebtDrainRequested',
   'src/store/storage-compaction-state.ts#physicalMutationDebtFailure',
   'src/store/storage-compaction-state.ts#physicalMutationDebtIdle',
   'src/store/storage-compaction-state.ts#physicalMutationDebtRecoveryHandoff',
@@ -129,6 +130,7 @@ const MODULE_MUTABLE_IDS = Object.freeze([
   'src/store/storage-compaction-state.ts#physicalMutationIntentOwnerStart',
   'src/store/storage-compaction-state.ts#physicalMutationIntentOwnerTask',
   'src/store/storage-compaction-state.ts#physicalMutationLedgers',
+  'src/store/storage-compaction-state.ts#physicalMutationMarkerValue',
   'src/store/storage-compaction-state.ts#physicalMutationTransactionDatabaseNames',
   'src/store/storage-compaction-state.ts#resolvePhysicalMutationDebtIdle',
   'src/store/storage-compaction-state.ts#storageCompactionWriteAdmission',
@@ -672,6 +674,12 @@ export const MODULE_COLLECTION_CONTRACTS = Object.freeze({
     bound: 'post-commit compaction debt awaiting durable flush',
     cleanup:
       'completion, cancellation, unsubscribe, or workspace quiesce removes each active entry',
+    scope: 'module-registry',
+  },
+  'src/store/storage-compaction-state.ts#physicalMutationRecoveryDebtByDatabase': {
+    bound: 'exact committed compaction debt for physical databases awaiting durable handoff',
+    cleanup:
+      'successful queue handoff subtracts exact debt; recovery-intent removal and runtime reset clear the remaining entries',
     scope: 'module-registry',
   },
   'src/store/storage-compaction-state.ts#physicalMutationLedgers': {
@@ -1650,6 +1658,17 @@ const LIFECYCLE_EXTERNAL_INGRESS_CONTRACTS = exactSiteContracts([
   },
   {
     ids: [
+      'src/app/router.ts|ensureHashListener|pageshow|reconcileRouteSnapshotWithAddress|1',
+      'src/app/router.ts|ensureHashListener|visibilitychange|<inline>|1',
+    ],
+    scope: 'page-lifetime-route-address-owner',
+    bound: 'one pageshow and one visibility listener guarded by hashListenerInstalled',
+    installation: 'the router installs both with its singleton native hash listener',
+    removalOwner: 'browser page teardown; there is no in-page uninstall API',
+    cleanup: 'listeners retain only the router singleton and disappear with the page realm',
+  },
+  {
+    ids: [
       'src/lib/page-lifecycle.ts|<module>|beforeunload|<inline>|1',
       'src/lib/page-lifecycle.ts|<module>|pagehide|<inline>|1',
       'src/lib/page-lifecycle.ts|<module>|pageshow|<inline>|1',
@@ -2520,7 +2539,7 @@ export const MUTABLE_MODULE_CONTRACTS = Object.freeze({
     bound:
       'one current route intent, committed route snapshot, route-arrival snapshot/revision, and listener-install flag',
     cleanup:
-      'hash listener is page-lifetime; accepted addresses and arrivals replace their current snapshot, and invalidated intents release their abort owner',
+      'route and resume listeners are page-lifetime; accepted addresses and arrivals replace their current snapshot, and invalidated intents release their abort owner',
   },
   'src/core/branch-session.ts': {
     scope: 'module-memo',
@@ -2671,7 +2690,7 @@ export const MUTABLE_MODULE_CONTRACTS = Object.freeze({
   'src/store/storage-compaction-state.ts': {
     scope: 'workspace-compaction-runtime',
     bound:
-      'one intent-owner start/task/controller, one debt idle/failure/closing/recovery-handoff state, scalar ledger counts, and weak transaction registries',
+      'one intent-owner start/task/controller, one debt idle/failure/closing/recovery-handoff state, bounded marker payload, exact per-database recovery debt, scalar ledger counts, and weak transaction registries',
     cleanup:
       'owner stop aborts acquisition and ownership; closure flushes debt, awaits work, replaces weak registries, and resets failure/handoff only after idle',
   },

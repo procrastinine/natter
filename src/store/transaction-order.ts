@@ -1,4 +1,4 @@
-import type { Transaction } from 'dexie'
+import Dexie, { type Transaction } from 'dexie'
 import type { Chat, ChatId, MessageId } from '../core/types'
 import { exactCompoundPrefixBetween } from './indexeddb-key-ranges'
 import type { MessageHeaderRow } from './message-storage'
@@ -87,13 +87,13 @@ class TransactionMonotonicAllocator<Key> {
   ): Promise<number> {
     const transactionIdentity = tx.idbtrans as unknown as object
     if (this.transactionIdentity && this.transactionIdentity !== transactionIdentity) {
-      return Promise.reject(new Error(this.transactionMismatch))
+      return Dexie.Promise.reject(new Error(this.transactionMismatch))
     }
     this.transactionIdentity = transactionIdentity
     const lane = this.lanes.get(key) ?? {
       highWatermark: undefined,
       initialized: false,
-      tail: Promise.resolve(),
+      tail: Dexie.Promise.resolve(),
     }
     this.lanes.set(key, lane)
     const allocation = lane.tail.then(async () => {

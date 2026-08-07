@@ -685,48 +685,43 @@ describe('explicit auth-header overrides', () => {
     },
   ]
 
-  it.each(
-    cases,
-  )('$name sends exactly one POST when $authHeader is explicitly overridden by $source headers', async ({
-    kind,
-    baseUrl,
-    authHeader,
-    source,
-    invoke,
-  }) => {
-    const explicitHeaderName = authHeader.toUpperCase()
-    const explicitHeaders = { [explicitHeaderName]: 'fixed-custom-auth' }
-    const connection = {
-      ...profile(kind, baseUrl),
-      defaultHeaders: source === 'profile' ? explicitHeaders : {},
-    }
-    const primary = candidate('primary-key')
-    const fallback = candidate('fallback-key')
-    const selected = vi.fn()
-    const seen: SeenRequest[] = []
-    vi.stubGlobal(
-      'fetch',
-      vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
-        recordRequest(seen, url, init)
-        return jsonResponse({ error: { message: 'fixed credential rejected' } }, 401)
-      }),
-    )
-    const ctx: AdapterContext = {
-      profile: connection,
-      apiKey: '',
-      apiKeyCandidates: [primary, fallback],
-      onKeyCandidateSelected: selected,
-    }
+  it.each(cases)(
+    '$name sends exactly one POST when $authHeader is explicitly overridden by $source headers',
+    async ({ kind, baseUrl, authHeader, source, invoke }) => {
+      const explicitHeaderName = authHeader.toUpperCase()
+      const explicitHeaders = { [explicitHeaderName]: 'fixed-custom-auth' }
+      const connection = {
+        ...profile(kind, baseUrl),
+        defaultHeaders: source === 'profile' ? explicitHeaders : {},
+      }
+      const primary = candidate('primary-key')
+      const fallback = candidate('fallback-key')
+      const selected = vi.fn()
+      const seen: SeenRequest[] = []
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+          recordRequest(seen, url, init)
+          return jsonResponse({ error: { message: 'fixed credential rejected' } }, 401)
+        }),
+      )
+      const ctx: AdapterContext = {
+        profile: connection,
+        apiKey: '',
+        apiKeyCandidates: [primary, fallback],
+        onKeyCandidateSelected: selected,
+      }
 
-    await expect(invoke(ctx, source === 'call' ? explicitHeaders : {})).rejects.toThrow(
-      /fixed credential rejected/i,
-    )
+      await expect(invoke(ctx, source === 'call' ? explicitHeaders : {})).rejects.toThrow(
+        /fixed credential rejected/i,
+      )
 
-    expect(seen).toHaveLength(1)
-    expect(seen[0]?.init.method).toBe('POST')
-    expect(headerValue(seen[0] as SeenRequest, authHeader)).toBe('fixed-custom-auth')
-    expect(primary.resolve).not.toHaveBeenCalled()
-    expect(fallback.resolve).not.toHaveBeenCalled()
-    expect(selected).not.toHaveBeenCalled()
-  })
+      expect(seen).toHaveLength(1)
+      expect(seen[0]?.init.method).toBe('POST')
+      expect(headerValue(seen[0] as SeenRequest, authHeader)).toBe('fixed-custom-auth')
+      expect(primary.resolve).not.toHaveBeenCalled()
+      expect(fallback.resolve).not.toHaveBeenCalled()
+      expect(selected).not.toHaveBeenCalled()
+    },
+  )
 })

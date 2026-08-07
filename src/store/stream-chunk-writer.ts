@@ -357,7 +357,8 @@ class BufferedStreamJournalWriter implements StreamJournalWriter {
     ) {
       return
     }
-    const dueIn = Math.max(0, STREAM_JOURNAL_FLUSH_INTERVAL_MS - (now - this.lastFlushAt))
+    const elapsed = Math.max(0, now - this.lastFlushAt)
+    const dueIn = Math.max(0, STREAM_JOURNAL_FLUSH_INTERVAL_MS - elapsed)
     const dueNow =
       this.bufferedLogicalRows >= STREAM_JOURNAL_FLUSH_MAX_ROWS ||
       this.bufferedTextLength >= STREAM_JOURNAL_FLUSH_MAX_TEXT_CHARS ||

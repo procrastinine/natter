@@ -47,39 +47,39 @@ afterEach(async () => {
 })
 
 describe('chat row transition', () => {
-  it.each([
-    'missing',
-    'mismatched',
-  ] as const)('rolls back canonical, link, usage, and aggregate writes when the prior projection is %s', async (poison) => {
-    const db = await openDatabase()
-    const previous = chat('strict-prior')
-    await executeTransitions(db, LINKED_PLAN, [{ kind: 'add-linked', next: previous }])
-    if (poison === 'missing') {
-      await db.chatSidebarRows.delete(previous.id)
-    } else {
-      await db.chatSidebarRows.put(
-        chatSidebarProjectionRow({ ...previous, title: 'valid but not the declared prior row' }),
-      )
-    }
-    const before = await transitionState(db, previous.id)
-    const tablePrototype = Object.getPrototypeOf(db.chats) as typeof db.chats
-    const bulkPut = vi.spyOn(tablePrototype, 'bulkPut')
-    const next: Chat = {
-      ...previous,
-      title: 'next title',
-      settings: { ...previous.settings, profileId: 'profile-b' },
-      configurationVersion: (previous.configurationVersion ?? 0) + 1,
-    }
+  it.each(['missing', 'mismatched'] as const)(
+    'rolls back canonical, link, usage, and aggregate writes when the prior projection is %s',
+    async (poison) => {
+      const db = await openDatabase()
+      const previous = chat('strict-prior')
+      await executeTransitions(db, LINKED_PLAN, [{ kind: 'add-linked', next: previous }])
+      if (poison === 'missing') {
+        await db.chatSidebarRows.delete(previous.id)
+      } else {
+        await db.chatSidebarRows.put(
+          chatSidebarProjectionRow({ ...previous, title: 'valid but not the declared prior row' }),
+        )
+      }
+      const before = await transitionState(db, previous.id)
+      const tablePrototype = Object.getPrototypeOf(db.chats) as typeof db.chats
+      const bulkPut = vi.spyOn(tablePrototype, 'bulkPut')
+      const next: Chat = {
+        ...previous,
+        title: 'next title',
+        settings: { ...previous.settings, profileId: 'profile-b' },
+        configurationVersion: (previous.configurationVersion ?? 0) + 1,
+      }
 
-    await expect(
-      executeTransitions(db, LINKED_PLAN, async (tx) => [
-        { kind: 'replace-linked', previous: await currentChat(tx, previous.id), next },
-      ]),
-    ).rejects.toThrow(`ChatSidebarProjectionPreviousMismatch:${previous.id}`)
+      await expect(
+        executeTransitions(db, LINKED_PLAN, async (tx) => [
+          { kind: 'replace-linked', previous: await currentChat(tx, previous.id), next },
+        ]),
+      ).rejects.toThrow(`ChatSidebarProjectionPreviousMismatch:${previous.id}`)
 
-    expect(tableCallCount(bulkPut, 'configurationLinks')).toBeGreaterThan(0)
-    expect(await transitionState(db, previous.id)).toEqual(before)
-  })
+      expect(tableCallCount(bulkPut, 'configurationLinks')).toBeGreaterThan(0)
+      expect(await transitionState(db, previous.id)).toEqual(before)
+    },
+  )
 
   it('writes a cold-field replacement without reading or writing sidebar or configuration rows', async () => {
     const db = await openDatabase()

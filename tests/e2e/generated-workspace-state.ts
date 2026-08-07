@@ -29,6 +29,7 @@ const CACHE_INPUT_FILES = Object.freeze([
   'pnpm-lock.yaml',
   'scripts/generated-workspace-fixture.mjs',
   'scripts/workspace-provider-fixture.mjs',
+  'tests/e2e/large-workspace.setup.ts',
   'tests/e2e/generated-workspace-state.ts',
 ])
 const CACHE_INPUT_DIRECTORIES = Object.freeze(['src/core/import-export', 'src/store'])

@@ -172,10 +172,10 @@ describe('ScrollRegion continuity lease', () => {
     expect(fixture.region.dataset.scrollState).toBe('follow')
   })
 
-  it('does not mistake a geometry-coupled native clamp for user navigation', () => {
+  it('does not mistake a geometry-coupled native clamp for user navigation', async () => {
     const fixture = setup()
     acquireOpen(fixture)
-    act(() => fireEvent.scroll(fixture.region))
+    await act(() => fireEvent.scroll(fixture.region))
 
     act(() => {
       fixture.setHeight(900)
@@ -186,6 +186,21 @@ describe('ScrollRegion continuity lease', () => {
     expect(fixture.ref.current?.getState()).toBe('follow')
     act(() => deliverResize())
     expect(fixture.region.scrollTop).toBe(800)
+    expect(fixture.ref.current?.getState()).toBe('follow')
+  })
+
+  it('does not let a stationary native scroll notification erase bottom ownership', () => {
+    const fixture = setup()
+    acquireOpen(fixture)
+
+    act(() => {
+      fireEvent.scroll(fixture.region)
+      fireEvent.scroll(fixture.region)
+      fixture.setHeight(1_400)
+      deliverResize()
+    })
+
+    expect(fixture.region.scrollTop).toBe(1_300)
     expect(fixture.ref.current?.getState()).toBe('follow')
   })
 
@@ -340,6 +355,97 @@ describe('ScrollRegion continuity lease', () => {
     expect(fixture.ref.current?.getState()).toBe('follow')
   })
 
+  it('restores an unchanged stream claim when a retained viewport becomes active again', () => {
+    const fixture = setup()
+    acquireOpen(fixture)
+
+    act(() => {
+      fixture.rerender({
+        streamActive: true,
+        autoScrollOnStream: true,
+        streamFollowKey: 'stream-a',
+        streamFollowTargetMessageId: 'tail-a',
+      })
+    })
+    act(() => {
+      fixture.rerender({ viewportActive: false })
+    })
+    act(() => {
+      fixture.setHeight(1_500)
+      fixture.region.scrollTop = 0
+    })
+    act(() => {
+      fixture.rerender({ viewportActive: true })
+    })
+
+    expect(fixture.region.scrollTop).toBe(1_400)
+    expect(fixture.ref.current?.getState()).toBe('follow')
+    expect(fixture.region.dataset.scrollState).toBe('follow')
+  })
+
+  it('lands at the completed tail when a followed stream ends in a retained hidden viewport', () => {
+    const fixture = setup()
+    acquireOpen(fixture)
+
+    act(() => {
+      fixture.rerender({
+        streamActive: true,
+        autoScrollOnStream: true,
+        streamFollowKey: 'stream-a',
+        streamFollowTargetMessageId: 'tail-a',
+      })
+    })
+    act(() => {
+      fixture.rerender({ viewportActive: false })
+    })
+    act(() => {
+      fixture.setHeight(1_500)
+      fixture.region.scrollTop = 0
+      fixture.rerender({
+        streamActive: false,
+        streamFollowKey: null,
+      })
+    })
+    act(() => {
+      fixture.rerender({ viewportActive: true })
+    })
+
+    expect(fixture.region.scrollTop).toBe(1_400)
+    expect(fixture.ref.current?.getState()).toBe('follow')
+  })
+
+  it('restores a pinned text position when a retained viewport becomes active again', async () => {
+    const fixture = setup()
+    acquireOpen(fixture)
+    const target = fixture.region.querySelector<HTMLElement>('[data-message-id="command-target"]')
+    if (!target) throw new Error('Retained viewport target did not mount')
+    let documentBottom = 280
+    target.getBoundingClientRect = () =>
+      rect({
+        top: documentBottom - 120 - fixture.region.scrollTop,
+        bottom: documentBottom - fixture.region.scrollTop,
+      })
+    await pinByWheel(fixture)
+    const targetBottom = target.getBoundingClientRect().bottom
+
+    act(() => {
+      fixture.rerender({ viewportActive: false })
+    })
+    act(() => {
+      documentBottom += 300
+      fixture.setHeight(1_400)
+      fixture.region.scrollTop = 0
+    })
+    act(() => {
+      fixture.rerender({ viewportActive: true })
+    })
+
+    expect(fixture.region.scrollTop).toBe(500)
+    expect(target.getBoundingClientRect().bottom).toBe(targetBottom)
+    expect(fixture.ref.current?.getState()).toBe('pinned')
+    expect(fixture.region.dataset.scrollState).toBe('pinned')
+  })
+
   it('hands simultaneous stream completion and leaf publication to one preserve lease', () => {
     const fixture = setup()
     acquireOpen(fixture, 2_000)
@@ -429,6 +535,21 @@ describe('ScrollRegion continuity lease', () => {
     expect(fixture.ref.current?.getState()).toBe('follow')
   })
 
+  it('canonicalizes an exact-bottom viewport when the native gesture settles', async () => {
+    const fixture = setup()
+    acquireOpen(fixture)
+    await pinByWheel(fixture)
+
+    act(() => {
+      fixture.region.scrollTop = 1_000
+      fixture.region.dispatchEvent(new Event('scrollend'))
+    })
+
+    expect(fixture.ref.current?.getState()).toBe('follow')
+    await act(nextTask)
+    expect(fixture.region.dataset.scrollState).toBe('follow')
+  })
+
   it.each([
     ['wheel', (region: HTMLElement) => fireEvent.wheel(region)],
     ['touch', (region: HTMLElement) => fireEvent.touchMove(region)],
@@ -458,7 +579,7 @@ describe('ScrollRegion continuity lease', () => {
     expect(fixture.region.dataset.scrollState).toBe('pinned')
   })
 
-  it('publishes upward wheel ownership before the native scroll event arrives', async () => {
+  it('cancels upward wheel ownership before publishing an unmeasured position', async () => {
     const fixture = setup({
       streamActive: true,
       autoScrollOnStream: true,
@@ -466,10 +587,124 @@ describe('ScrollRegion continuity lease', () => {
     })
     acquireOpen(fixture)
 
-    act(() => fireEvent.wheel(fixture.region, { deltaY: -320 }))
+    act(() => {
+      fireEvent.wheel(fixture.region, { deltaY: -320 })
+    })
+
+    expect(fixture.ref.current?.getState()).toBe('follow')
+    act(() => {
+      fixture.setHeight(1_400)
+      deliverResize()
+    })
+    expect(fixture.region.scrollTop).toBe(1_000)
+    await act(nextTask)
+    expect(fixture.ref.current?.getState()).toBe('pinned')
+  })
+
+  it('holds a pinned near-bottom state until exact bottom is reacquired', async () => {
+    const fixture = setup()
+    acquireOpen(fixture)
+
+    act(() => {
+      fireEvent.wheel(fixture.region, { deltaY: -80 })
+      fixture.region.scrollTop = 975
+      fireEvent.scroll(fixture.region)
+      fixture.region.scrollTop = 990
+      fireEvent.scroll(fixture.region)
+    })
+
+    await act(nextTask)
+    expect(fixture.ref.current?.getState()).toBe('pinned')
+    expect(fixture.region.dataset.scrollState).toBe('pinned')
+
+    act(() => {
+      fixture.region.scrollTop = 997
+      fireEvent.scroll(fixture.region)
+    })
+
+    expect(fixture.ref.current?.getState()).toBe('follow')
+    await act(nextTask)
+    expect(fixture.region.dataset.scrollState).toBe('follow')
+
+    act(() => {
+      fixture.setHeight(1_400)
+      deliverResize()
+    })
+
+    expect(fixture.region.scrollTop).toBe(997)
+    await act(nextTask)
+    expect(fixture.ref.current?.getState()).toBe('pinned')
+  })
+
+  it('reacquires stream ownership at exact bottom and follows later growth', async () => {
+    const fixture = setup({
+      streamActive: true,
+      autoScrollOnStream: true,
+      streamFollowKey: 'stream-a',
+    })
+    acquireOpen(fixture)
+
+    await pinByWheel(fixture, 900)
+    act(() => {
+      fixture.region.scrollTop = 1_000
+      fireEvent.scroll(fixture.region)
+    })
+    expect(fixture.ref.current?.getState()).toBe('follow')
+
+    act(() => {
+      fixture.setHeight(1_400)
+      deliverResize()
+    })
+
+    expect(fixture.region.scrollTop).toBe(1_300)
+    expect(fixture.ref.current?.getState()).toBe('follow')
+    await act(nextTask)
+    expect(fixture.region.dataset.scrollState).toBe('follow')
+  })
+
+  it('does not let an observer relabel a pinned continuity lease as follow', async () => {
+    const fixture = setup()
+    acquireOpen(fixture)
+    await pinByWheel(fixture, 900)
+
+    act(() => deliverResize())
 
     expect(fixture.ref.current?.getState()).toBe('pinned')
     await act(nextTask)
+    expect(fixture.region.dataset.scrollState).toBe('pinned')
+  })
+
+  it('clears a stale pinned control when layout places the viewport at bottom', async () => {
+    const fixture = setup()
+    acquireOpen(fixture)
+    await pinByWheel(fixture, 900)
+
+    act(() => {
+      fixture.setHeight(1_000)
+      deliverResize()
+    })
+
+    expect(fixture.ref.current?.getState()).toBe('follow')
+    await act(nextTask)
+    expect(fixture.region.dataset.scrollState).toBe('follow')
+  })
+
+  it('does not let delayed open acquisition reclaim a stream cancelled by the user', async () => {
+    const fixture = setup({
+      streamActive: true,
+      autoScrollOnStream: true,
+      streamFollowKey: 'stream-a',
+    })
+
+    act(() => {
+      fireEvent.wheel(fixture.region, { deltaY: -320 })
+      fixture.setHeight(1_500)
+      deliverResize()
+    })
+
+    expect(fixture.region.scrollTop).toBe(0)
+    await act(nextTask)
+    expect(fixture.ref.current?.getState()).toBe('pinned')
     expect(fixture.region.dataset.scrollState).toBe('pinned')
   })
 
@@ -508,6 +743,21 @@ describe('ScrollRegion continuity lease', () => {
       fixture.rerender({}, <div>layout observed the moved viewport</div>)
       fireEvent.scroll(fixture.region)
     })
+    expect(fixture.region.scrollTop).toBe(125)
+    expect(fixture.ref.current?.getState()).toBe('pinned')
+    await act(nextTask)
+    expect(fixture.region.dataset.scrollState).toBe('pinned')
+  })
+
+  it('adopts native movement before a pending resize correction can restore follow', async () => {
+    const fixture = setup()
+    acquireOpen(fixture)
+
+    act(() => {
+      fixture.region.scrollTop = 125
+      deliverResize()
+    })
+
     expect(fixture.region.scrollTop).toBe(125)
     expect(fixture.ref.current?.getState()).toBe('pinned')
     await act(nextTask)

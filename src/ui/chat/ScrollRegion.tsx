@@ -101,6 +101,7 @@ export function useScrollRegionState(): ScrollState | undefined {
 
 const DEFAULT_THRESHOLD_PX = 48
 const PROGRAMMATIC_SCROLL_TOLERANCE_PX = 4
+const BOTTOM_REACQUIRE_TOLERANCE_PX = PROGRAMMATIC_SCROLL_TOLERANCE_PX
 
 interface SmoothScrollIntent {
   target: number
@@ -182,6 +183,15 @@ interface RevealClaimLifecycle {
   status: 'active' | 'cancelled' | 'consumed'
 }
 
+interface RetainedViewportDisposition {
+  readonly state: ScrollState
+  readonly lease: ViewportContinuityLease | null
+  readonly distanceFromBottom: number | null
+  readonly workspaceEpoch: number
+  readonly chatKey: string | number | null
+  readonly selectionKey: string | number | null
+}
+
 const CONTINUITY_BLOCK_SELECTOR =
   'p, li, pre, blockquote, table, figcaption, [data-ui="reasoning-summary"], [data-ui="message-body"]'
 
@@ -231,7 +241,7 @@ function captureTextContinuity(
     (x) => Number.isFinite(x) && x >= left && x <= right,
   )
   for (const x of xs) {
-    const caret = container.ownerDocument.caretRangeFromPoint?.(x, targetY) ?? null
+    const caret = container.ownerDocument.caretRangeFromPoint(x, targetY)
     if (!caret || !markdown.contains(caret.startContainer)) continue
     const coordinate = rangeLineTop(caret)
     if (coordinate === null) continue
@@ -251,7 +261,7 @@ function captureTextContinuity(
         markdownOrdinal,
         edge: progressiveStatic ? 'end' : 'start',
         characterOffset: progressiveStatic
-          ? Math.max(0, (markdown.textContent?.length ?? 0) - prefixLength)
+          ? Math.max(0, markdown.textContent.length - prefixLength)
           : prefixLength,
       },
       coordinate,
@@ -264,14 +274,14 @@ function resolveTextContinuity(
   message: HTMLElement,
   identity: TextContinuityIdentity,
 ): { readonly element: HTMLElement; readonly coordinate: number } | null {
-  const markdown = message
-    .querySelectorAll<HTMLElement>('[data-ui="markdown"]')
-    .item(identity.markdownOrdinal)
+  const markdown = Array.from(message.querySelectorAll<HTMLElement>('[data-ui="markdown"]')).at(
+    identity.markdownOrdinal,
+  )
   if (!markdown) return null
   const walker = message.ownerDocument.createTreeWalker(markdown, NodeFilter.SHOW_TEXT)
   let remaining =
     identity.edge === 'end'
-      ? Math.max(0, (markdown.textContent?.length ?? 0) - identity.characterOffset)
+      ? Math.max(0, markdown.textContent.length - identity.characterOffset)
       : identity.characterOffset
   for (let node = walker.nextNode(); node; node = walker.nextNode()) {
     const text = node as Text
@@ -339,11 +349,19 @@ type ScrollDebugEvent =
   | 'wheel'
   | 'touchmove'
   | 'native-scroll'
+  | 'native-scroll-adopted'
   | 'stream-start'
   | 'user-follow-cancel'
 
-function scrollStateFromPosition(container: HTMLDivElement, threshold: number): ScrollState {
+function scrollStateFromPosition(
+  container: HTMLDivElement,
+  threshold: number,
+  current: ScrollState,
+): ScrollState {
   const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight
+  if (current === 'pinned') {
+    return distanceFromBottom <= BOTTOM_REACQUIRE_TOLERANCE_PX ? 'follow' : 'pinned'
+  }
   return distanceFromBottom <= threshold ? 'follow' : 'pinned'
 }
 
@@ -470,6 +488,12 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
   const streamFollowTargetMessageIdRef = useRef(streamFollowTargetMessageId)
   const previousStreamActiveRef = useRef(false)
   const revealClaimLifecycleRef = useRef<RevealClaimLifecycle | null>(null)
+  const retainedViewportLifecycleRef = useRef<'active' | 'inactive'>(
+    viewportActive ? 'active' : 'inactive',
+  )
+  const retainedViewportReactivationPendingRef = useRef(false)
+  const retainedViewportDispositionRef = useRef<RetainedViewportDisposition | null>(null)
+  const captureRetainedViewportDispositionRef = useRef<() => void>(() => undefined)
   thresholdRef.current = pinThresholdPx ?? DEFAULT_THRESHOLD_PX
   autoScrollOnStreamRef.current = autoScrollOnStream
   streamActiveRef.current = streamActive
@@ -520,11 +544,16 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
   }, [])
 
   const setScrollStateNow = useCallback(
-    (next: ScrollState, reason = 'unknown') => {
+    (next: ScrollState, reason = 'unknown', publishSynchronously = false) => {
       const previous = stateRef.current
       stateRef.current = next
       if (hasScrollDebugSink() && previous !== next) {
         debugScroll('state', { from: previous, to: next, reason })
+      }
+      if (publishSynchronously) {
+        pendingStateRef.current = null
+        setState((current) => (current === next ? current : next))
+        return
       }
       pendingStateRef.current = next
       if (statePublicationScheduledRef.current) return
@@ -710,10 +739,55 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
     [capturePinnedLayoutAnchor, installContinuityLease, releaseSemanticClaim],
   )
 
+  const adoptUnclaimedNativeViewportMovement = useCallback((): boolean => {
+    const container = containerRef.current
+    const previousTop = lastNativeScrollTopRef.current
+    const previousGeometry = lastObservedScrollGeometryRef.current
+    if (!container || previousTop === null || previousGeometry === null) return false
+    if (Math.abs(container.scrollTop - previousTop) <= 0.5) return false
+    if (
+      Math.abs(container.scrollHeight - previousGeometry.scrollHeight) > 0.5 ||
+      Math.abs(container.clientHeight - previousGeometry.clientHeight) > 0.5
+    ) {
+      return false
+    }
+    if (scrollStateFromPosition(container, thresholdRef.current, stateRef.current) !== 'pinned') {
+      return false
+    }
+    if (matchesInstantScrollIntent(instantScrollIntentRef.current, container.scrollTop))
+      return false
+    if (smoothScrollIntentRef.current) {
+      const smooth = advanceSmoothScrollIntent(smoothScrollIntentRef.current, container.scrollTop)
+      smoothScrollIntentRef.current = smooth.next
+      if (smooth.programmatic) return false
+    }
+    didOpenRef.current = true
+    clearProgrammaticScrollIntents()
+    cancelViewportOwnership()
+    lastNativeScrollTopRef.current = container.scrollTop
+    lastObservedScrollGeometryRef.current = {
+      scrollHeight: container.scrollHeight,
+      clientHeight: container.clientHeight,
+    }
+    setScrollStateNow('pinned', 'native-displacement', true)
+    capturePinnedLayoutAnchor()
+    if (hasScrollDebugSink()) {
+      debugScroll('native-scroll-adopted', { previousTop })
+    }
+    return true
+  }, [
+    cancelViewportOwnership,
+    capturePinnedLayoutAnchor,
+    clearProgrammaticScrollIntents,
+    debugScroll,
+    setScrollStateNow,
+  ])
+
   const correctContinuityLease = useCallback((): boolean => {
     const container = containerRef.current
     const lease = continuityLeaseRef.current
     if (!container || !lease) return false
+    if (adoptUnclaimedNativeViewportMovement()) return false
     if (
       !Object.is(lease.selectionKey, selectionKeyRef.current) ||
       lease.workspaceEpoch !== workspaceEpochRef.current ||
@@ -759,9 +833,9 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
       element =
         anchor.elementOrdinal === null
           ? message
-          : (message
-              .querySelectorAll<HTMLElement>(CONTINUITY_BLOCK_SELECTOR)
-              .item(anchor.elementOrdinal) ?? element)
+          : (Array.from(message.querySelectorAll<HTMLElement>(CONTINUITY_BLOCK_SELECTOR)).at(
+              anchor.elementOrdinal,
+            ) ?? element)
       if (!element.isConnected || !contentRef.current?.contains(element)) return false
       const rect = element.getBoundingClientRect()
       current = anchor.edge === 'bottom' ? rect.bottom : rect.top
@@ -788,7 +862,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
       }
     }
     return true
-  }, [writeScrollTopNow])
+  }, [adoptUnclaimedNativeViewportMovement, writeScrollTopNow])
 
   const resolveFollowTargetElement = useCallback(
     (target: MessageFollowTarget): HTMLElement | null => {
@@ -1113,7 +1187,15 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
       if (!container) return
       const previousNativeScrollTop = lastNativeScrollTopRef.current
       const previousGeometry = lastObservedScrollGeometryRef.current
-      const next = scrollStateFromPosition(container, thresholdRef.current)
+      const distanceFromBottom =
+        container.scrollHeight - container.scrollTop - container.clientHeight
+      const nativeViewportMoved =
+        source === 'scroll' &&
+        previousNativeScrollTop !== null &&
+        previousGeometry !== null &&
+        Math.abs(container.scrollTop - previousNativeScrollTop) > 0.5 &&
+        Math.abs(previousGeometry.scrollHeight - container.scrollHeight) <= 0.5 &&
+        Math.abs(previousGeometry.clientHeight - container.clientHeight) <= 0.5
       const stationaryNativeScroll =
         source === 'scroll' &&
         previousNativeScrollTop !== null &&
@@ -1140,16 +1222,6 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
         scrollHeight: container.scrollHeight,
         clientHeight: container.clientHeight,
       }
-      if (hasScrollDebugSink()) {
-        debugScroll('position', {
-          source,
-          next,
-          stationaryNativeScroll,
-          continuityGeometryChanged,
-          scrollGeometryChanged,
-          userScrollIntent: userScrollIntentRef.current,
-        })
-      }
       let programmaticScroll = false
       if (source === 'scroll') {
         const instantIntent = instantScrollIntentRef.current
@@ -1160,7 +1232,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
         if (
           instantMatched ||
           instantGeometryChanged ||
-          continuityGeometryChanged ||
+          (continuityGeometryChanged && !userScrollIntentRef.current) ||
           (scrollGeometryChanged &&
             !userScrollIntentRef.current &&
             continuityLeaseRef.current !== null)
@@ -1185,6 +1257,28 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
           instantScrollIntentRef.current = null
         }
       }
+      const userMovedAwayFromBottom =
+        source === 'scroll' &&
+        !programmaticScroll &&
+        previousNativeScrollTop !== null &&
+        container.scrollTop < previousNativeScrollTop - 0.5 &&
+        distanceFromBottom > BOTTOM_REACQUIRE_TOLERANCE_PX &&
+        (userScrollIntentRef.current || nativeViewportMoved)
+      const next = userMovedAwayFromBottom
+        ? 'pinned'
+        : scrollStateFromPosition(container, thresholdRef.current, stateRef.current)
+      if (hasScrollDebugSink()) {
+        debugScroll('position', {
+          source,
+          next,
+          stationaryNativeScroll,
+          nativeViewportMoved,
+          continuityGeometryChanged,
+          scrollGeometryChanged,
+          programmaticScroll,
+          userScrollIntent: userScrollIntentRef.current,
+        })
+      }
       const preparedTransition =
         source === 'scroll' && !programmaticScroll ? pendingPreparedTransitionRef.current : null
       if (preparedTransition) rebasePreparedTransitionToUser(preparedTransition)
@@ -1196,25 +1290,42 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
         return
       }
       if (next === 'follow') {
-        if (source === 'scroll' || continuityLeaseRef.current?.mode === 'follow') {
-          setScrollStateNow('follow', source)
+        if (source === 'scroll' && (userScrollIntentRef.current || nativeViewportMoved)) {
+          cancelViewportOwnership()
+          clearProgrammaticScrollIntents()
+          if (streamActiveRef.current && autoScrollOnStreamRef.current) {
+            acquireFollowLease(
+              semanticFollowClaimForTarget(
+                'stream',
+                streamFollowTargetMessageIdRef.current,
+                selectionKeyRef.current,
+              ),
+            )
+          }
         }
+        setScrollStateNow('follow', source, source === 'scroll' && userScrollIntentRef.current)
         return
       }
       if (source === 'scroll') {
         if (!preparedTransition) cancelViewportOwnership()
         clearProgrammaticScrollIntents()
-        setScrollStateNow('pinned', source)
+        setScrollStateNow('pinned', source, userMovedAwayFromBottom)
         if (!preparedTransition) capturePinnedLayoutAnchor()
         return
       }
-      if (stateRef.current === 'follow' || continuityLeaseRef.current?.mode === 'follow') {
+      if (
+        continuityLeaseRef.current?.mode === 'follow' ||
+        (continuityLeaseRef.current !== null &&
+          stateRef.current === 'follow' &&
+          !userScrollIntentRef.current)
+      ) {
         setScrollStateNow('follow', source)
         return
       }
       setScrollStateNow('pinned', source)
     },
     [
+      acquireFollowLease,
       cancelViewportOwnership,
       capturePinnedLayoutAnchor,
       clearProgrammaticScrollIntents,
@@ -1270,6 +1381,10 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
       ) {
         return
       }
+      if (adoptUnclaimedNativeViewportMovement()) {
+        layoutCorrectionPendingRef.current = false
+        return
+      }
       if (hasScrollDebugSink()) debugScroll('follow.schedule')
       if (source && hasScrollDebugSink()) debugScroll('resize')
       if (completeOpenScrollIfReady()) {
@@ -1296,6 +1411,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
       layoutCorrectionPendingRef.current = false
     },
     [
+      adoptUnclaimedNativeViewportMovement,
       completeOpenScrollIfReady,
       correctContinuityLease,
       debugScroll,
@@ -1328,7 +1444,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
             'reveal-nearest',
           )
         }
-        const next = scrollStateFromPosition(container, thresholdRef.current)
+        const next = scrollStateFromPosition(container, thresholdRef.current, stateRef.current)
         setScrollStateNow(next, 'reveal-nearest')
         if (next === 'pinned') {
           capturePinnedLayoutAnchor()
@@ -1373,6 +1489,83 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
       writeScrollTopNow,
     ],
   )
+
+  captureRetainedViewportDispositionRef.current = () => {
+    const container = containerRef.current
+    if (stateRef.current === 'pinned' && continuityLeaseRef.current === null) {
+      capturePinnedLayoutAnchor()
+    }
+    retainedViewportDispositionRef.current = {
+      state: stateRef.current,
+      lease: continuityLeaseRef.current,
+      distanceFromBottom: container
+        ? container.scrollHeight - container.scrollTop - container.clientHeight
+        : null,
+      workspaceEpoch: workspaceEpochRef.current,
+      chatKey: resetKeyRef.current,
+      selectionKey: selectionKeyRef.current,
+    }
+  }
+
+  useLayoutEffect(() => {
+    if (!viewportActive) return
+    const reactivating = retainedViewportLifecycleRef.current === 'inactive'
+    retainedViewportLifecycleRef.current = 'active'
+    retainedViewportReactivationPendingRef.current = reactivating
+    return () => {
+      captureRetainedViewportDispositionRef.current()
+      retainedViewportLifecycleRef.current = 'inactive'
+    }
+  }, [viewportActive])
+
+  useLayoutEffect(() => {
+    if (!viewportActive || !retainedViewportReactivationPendingRef.current) return
+    retainedViewportReactivationPendingRef.current = false
+    const disposition = retainedViewportDispositionRef.current
+    retainedViewportDispositionRef.current = null
+    if (
+      !disposition ||
+      disposition.workspaceEpoch !== workspaceEpoch ||
+      !Object.is(disposition.chatKey, resetKey) ||
+      !Object.is(disposition.selectionKey, selectionKey)
+    ) {
+      return
+    }
+
+    clearProgrammaticScrollIntents()
+    userScrollIntentRef.current = false
+    lastNativeScrollTopRef.current = null
+    lastObservedScrollGeometryRef.current = null
+    continuityLeaseRef.current = disposition.lease
+
+    if (disposition.lease?.mode === 'follow') {
+      setScrollStateNow('follow', 'viewport-reactivate', true)
+      scrollToFollowPositionNow('viewport-reactivate')
+      layoutCorrectionPendingRef.current = true
+      return
+    }
+
+    if (!disposition.lease && disposition.distanceFromBottom !== null) {
+      installContinuityLease('manual', {
+        kind: 'bottom',
+        distance: disposition.distanceFromBottom,
+      })
+    }
+    correctContinuityLease()
+    setScrollStateNow(disposition.state, 'viewport-reactivate', true)
+    updateFromScrollPosition('layout')
+  }, [
+    viewportActive,
+    workspaceEpoch,
+    resetKey,
+    selectionKey,
+    clearProgrammaticScrollIntents,
+    correctContinuityLease,
+    installContinuityLease,
+    scrollToFollowPositionNow,
+    setScrollStateNow,
+    updateFromScrollPosition,
+  ])
 
   useLayoutEffect(() => {
     if (!viewportActive) return
@@ -1503,21 +1696,16 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
     return () => document.removeEventListener('visibilitychange', onVisibilityChange)
   }, [scheduleFollowReconciliation])
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const container = containerRef.current
     if (!container) return
-    const markUserScrollIntent = (
-      event: 'wheel' | 'touchmove' | 'scrollbar' | 'keyboard',
-      pinSynchronously = false,
-    ) => {
+    const markUserScrollIntent = (event: 'wheel' | 'touchmove' | 'scrollbar' | 'keyboard') => {
       userScrollIntentRef.current = true
+      didOpenRef.current = true
+      finiteAcquisitionRef.current = null
       clearProgrammaticScrollIntents()
       const lease = continuityLeaseRef.current
       if (lease?.mode === 'follow') {
-        if (lease.claim.source === 'open') {
-          didOpenRef.current = true
-          finiteAcquisitionRef.current = null
-        }
         const lifecycle = revealClaimLifecycleRef.current
         if (lease.claim.source === 'reveal' && lifecycle?.status === 'active') {
           lifecycle.status = 'cancelled'
@@ -1528,16 +1716,12 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
       if (preparedTransition) {
         rebasePreparedTransitionToUser(preparedTransition)
       } else {
-        if (continuityLeaseRef.current?.mode === 'follow') {
-          captureFollowDisplacement()
-          releaseSemanticClaim()
-        }
+        cancelViewportOwnership()
         capturePinnedLayoutAnchor()
       }
       if (owned && hasScrollDebugSink()) {
         debugScroll('user-follow-cancel', { event })
       }
-      if (pinSynchronously) setScrollStateNow('pinned', `${event}-intent`)
       if (hasScrollDebugSink() && (event === 'wheel' || event === 'touchmove')) {
         debugScroll(event)
       }
@@ -1563,8 +1747,9 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
       }
       smoothScrollIntentRef.current = null
       settleAcquiredFiniteFollowClaim()
+      updateFromScrollPosition('layout')
     }
-    const onWheel = (event: WheelEvent) => markUserScrollIntent('wheel', event.deltaY < 0)
+    const onWheel = () => markUserScrollIntent('wheel')
     const onTouchMove = () => markUserScrollIntent('touchmove')
     const onPointerDown = (event: PointerEvent) => {
       if (event.target === container) markUserScrollIntent('scrollbar')
@@ -1579,7 +1764,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
       ) {
         return
       }
-      markUserScrollIntent('keyboard', ['ArrowUp', 'PageUp', 'Home'].includes(event.key))
+      markUserScrollIntent('keyboard')
     }
     container.addEventListener('wheel', onWheel, { passive: true })
     container.addEventListener('touchmove', onTouchMove, { passive: true })
@@ -1596,14 +1781,12 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
       container.removeEventListener('scrollend', onScrollEnd)
     }
   }, [
-    captureFollowDisplacement,
+    cancelViewportOwnership,
     capturePinnedLayoutAnchor,
     clearProgrammaticScrollIntents,
     debugScroll,
     rebasePreparedTransitionToUser,
-    releaseSemanticClaim,
     scheduleFollowReconciliation,
-    setScrollStateNow,
     settleAcquiredFiniteFollowClaim,
     updateFromScrollPosition,
   ])
@@ -1620,7 +1803,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
       releaseSemanticClaim()
     }
     if (!container) return
-    const next = scrollStateFromPosition(container, thresholdRef.current)
+    const next = scrollStateFromPosition(container, thresholdRef.current, stateRef.current)
     setScrollStateNow(next, 'auto-scroll-mode')
     if (next === 'pinned') capturePinnedLayoutAnchor()
   }, [

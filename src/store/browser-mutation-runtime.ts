@@ -1,4 +1,4 @@
-import type { Transaction } from 'dexie'
+import Dexie, { type Transaction } from 'dexie'
 import { normalizeModelsResponse } from '../api/providers'
 import { modelCatalogQueryForConnectionKind, modelsCacheKey } from '../core/cache-keys'
 import { connectionDispatchKeyRefs } from '../core/connection-dispatch-proof'
@@ -200,19 +200,19 @@ async function captureGenerationPlanningSnapshot(
     profile.apiKeyRef ? keyRecords.find((record) => record?.id === profile.apiKeyRef) : undefined,
   )
   const discoveryRevisionKey = connectionDiscoveryRevisionKey(discoveryRevision)
-  const [modelsRow, endpointsRow, privacyRow] = await Promise.all([
+  const [modelsRow, endpointsRow, privacyRow] = await Dexie.Promise.all([
     profile.kind === 'openrouter'
-      ? Promise.resolve(undefined)
+      ? Dexie.Promise.resolve(undefined)
       : readDiscoveryCacheRow(tx, 'models', [
           profile.id,
           modelsCacheKey(modelCatalogQueryForConnectionKind(profile.kind)),
         ]),
     profile.kind === 'openrouter'
       ? readDiscoveryCacheRow(tx, 'endpoints', [profile.id, modelId])
-      : Promise.resolve(undefined),
+      : Dexie.Promise.resolve(undefined),
     profile.kind === 'openrouter'
       ? readDiscoveryCacheRow(tx, 'privacyPolicies', [profile.id, modelId])
-      : Promise.resolve(undefined),
+      : Dexie.Promise.resolve(undefined),
   ])
   const modelsQueryKey = modelsCacheKey(modelCatalogQueryForConnectionKind(profile.kind))
   const modelRows =
@@ -870,7 +870,7 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
         deletionNow: number,
         catalogRow?: AttachmentCatalogProjectionRow,
       ): Promise<Attachment> => {
-        const [artifacts, jobs] = await Promise.all([
+        const [artifacts, jobs] = await Dexie.Promise.all([
           tx
             .table<AttachmentArtifact, string>('attachmentArtifacts')
             .where('attachmentId')
@@ -1130,7 +1130,7 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
         },
 
         getMessage: async (messageId) => {
-          const [header, body] = await Promise.all([
+          const [header, body] = await Dexie.Promise.all([
             readMessageHeader(messageId),
             readMessageBody(messageId),
           ])
@@ -2549,7 +2549,7 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
       const finalizationContext: MutationFinalizationContext = Object.freeze({
         getFinalChat: (chatId: ChatId) => {
           const chat = finalizedChats.get(chatId)
-          return Promise.resolve(chat ? structuredClone(chat) : undefined)
+          return Dexie.Promise.resolve(chat ? structuredClone(chat) : undefined)
         },
         getAttachmentCatalogRevision: ctx.getAttachmentCatalogRevision,
         readFinalActiveBranchPathSlotFrame: (

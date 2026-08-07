@@ -897,11 +897,9 @@ const ActiveBranchTreeView = memo(function ActiveBranchTreeView({
     setActivePreview((current) => (current?.messageId === messageId ? null : current))
   }, [])
 
-  const automaticRevealId =
-    binding.currency === 'current' && binding.reveal?.chatId === chatId ? binding.reveal.id : null
   const cancelAutomaticReveal = useCallback(() => {
-    if (automaticRevealId) controller.consumePresentationReveal(automaticRevealId, 'tree')
-  }, [automaticRevealId, controller])
+    controller.supersedePresentationReveal('tree')
+  }, [controller])
 
   const selectMessage = useCallback(
     (messageId: MessageId) => {
@@ -1209,10 +1207,6 @@ const ActiveBranchTreeView = memo(function ActiveBranchTreeView({
 
   const handleCanvasClick = useCallback(
     (event: ReactMouseEvent<HTMLDivElement>) => {
-      if (suppressCanvasClickRef.current) {
-        suppressCanvasClickRef.current = false
-        return
-      }
       const target = event.target
       if (
         target instanceof Element &&
@@ -1224,6 +1218,13 @@ const ActiveBranchTreeView = memo(function ActiveBranchTreeView({
     },
     [clearSelection],
   )
+
+  const handleCanvasClickCapture = useCallback((event: ReactMouseEvent<HTMLDivElement>) => {
+    if (!suppressCanvasClickRef.current) return
+    suppressCanvasClickRef.current = false
+    event.preventDefault()
+    event.stopPropagation()
+  }, [])
 
   const handleCanvasPointerDown = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
     suppressCanvasClickRef.current = false
@@ -1358,7 +1359,7 @@ const ActiveBranchTreeView = memo(function ActiveBranchTreeView({
       aria-label="Chat tree"
     >
       <div data-ui="branch-tree-toolbar">
-        <search data-ui="branch-tree-search">
+        <div data-ui="branch-tree-search">
           <span aria-hidden="true" data-ui="branch-tree-search-icon">
             <SearchIcon size={14} />
           </span>
@@ -1436,7 +1437,7 @@ const ActiveBranchTreeView = memo(function ActiveBranchTreeView({
           >
             <ChevronIcon size={15} />
           </Button>
-        </search>
+        </div>
         {toolbarStopCapability ? (
           <Button
             type="button"
@@ -1489,6 +1490,7 @@ const ActiveBranchTreeView = memo(function ActiveBranchTreeView({
             data-ui="branch-tree-scroll"
             data-panning={panningCanvas || undefined}
             onScroll={scheduleViewportRead}
+            onClickCapture={handleCanvasClickCapture}
             onClick={handleCanvasClick}
             onPointerDown={handleCanvasPointerDown}
             onPointerMove={handleCanvasPointerMove}
@@ -1736,6 +1738,11 @@ const ActiveBranchTreeView = memo(function ActiveBranchTreeView({
                             }
                             event.preventDefault()
                             inspectMessage(node.id)
+                          }}
+                          onAuxClick={(event) => {
+                            if (event.defaultPrevented || event.button !== 1) return
+                            event.preventDefault()
+                            window.open(chatHref(chatId, node.newestLeafId), '_blank', 'noopener')
                           }}
                           onDoubleClick={(event) => {
                             event.preventDefault()

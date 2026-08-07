@@ -125,6 +125,10 @@ export function verificationDependencyRecipeInputPaths(sourceRoot: string): read
 export function resolveVerificationDependencyRuntime(
   value: VerificationDependencyImage,
 ): VerificationDependencyRuntimeCapability
+export function currentRuntimeCapability(
+  sourceRoot: string,
+): VerificationDependencyRuntimeCapability
+export function resolvePnpmLauncherTarget(launcherPath: string): string
 export function findPnpmPackageJson(executablePath: string): string
 export function discardVerificationDependencyImage(value: VerificationDependencyImage): void
 export function verificationDependencyImageDirectory(evidenceRoot: string, id: string): string

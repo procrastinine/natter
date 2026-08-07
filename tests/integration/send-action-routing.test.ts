@@ -326,7 +326,7 @@ describe('almost-live request shape matrix', () => {
     ])
 
     let wire: Record<string, unknown> | undefined
-    await executeSend({
+    const completed = await executeSend({
       chatId: chat.id,
       connection: makeProfile(),
       apiKey: 'sk-test',
@@ -337,6 +337,7 @@ describe('almost-live request shape matrix', () => {
       }),
     })
 
+    expect(completed, completed.error?.message).toMatchObject({ outcome: 'done' })
     const messages = (wire as { messages?: Array<{ role: string; content: unknown }> }).messages
     expect(messages).toEqual([
       { role: 'system', content: SYSTEM_PROMPT },

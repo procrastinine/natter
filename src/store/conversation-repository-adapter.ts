@@ -451,13 +451,15 @@ function conversationCommittedEffectsForDelta(
 
   for (const fact of delta.facts) {
     switch (fact.kind) {
-      case 'chat-deleted':
-        if (demanded.has(fact.chatId)) demanded.get(fact.chatId)!.deleted = true
+      case 'chat-deleted': {
+        const accumulator = demanded.get(fact.chatId)
+        if (accumulator) accumulator.deleted = true
         break
-      case 'message-revision':
-        if (!demanded.has(fact.chatId)) break
+      }
+      case 'message-revision': {
+        const accumulator = demanded.get(fact.chatId)
+        if (!accumulator) break
         if (source !== 'local') {
-          const accumulator = demanded.get(fact.chatId) as ConversationEffectAccumulator
           accumulator.observations.set(fact.header.id, {
             header: fact.header,
             structuralVersion: fact.structuralVersion,
@@ -465,13 +467,16 @@ function conversationCommittedEffectsForDelta(
           if (fact.changed.structure) accumulator.structurallyChangedIds.add(fact.header.id)
         }
         if (fact.changed.body && source === 'remote') {
-          demanded.get(fact.chatId)!.bodies.add([fact.header.id])
-          demanded.get(fact.chatId)!.previews.add([fact.header.id])
+          accumulator.bodies.add([fact.header.id])
+          accumulator.previews.add([fact.header.id])
         }
         break
-      case 'conversation-created':
-        if (demanded.has(fact.chatId)) demanded.get(fact.chatId)!.construction = true
+      }
+      case 'conversation-created': {
+        const accumulator = demanded.get(fact.chatId)
+        if (accumulator) accumulator.construction = true
         break
+      }
       case 'attempt-target-committed':
       case 'attempt-stop-requested':
       case 'sidebar-row-changed':

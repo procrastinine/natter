@@ -256,13 +256,10 @@ describe('message stream projection', () => {
     act(() => {
       setActiveStream('generation')
     })
-
-    render(<ProjectionProbe />)
+    attemptController.setLiveProjectionRequester('projection-stream', requestLiveSnapshot)
     expect(requestLiveSnapshot).not.toHaveBeenCalled()
 
-    act(() => {
-      attemptController.setLiveProjectionRequester('projection-stream', requestLiveSnapshot)
-    })
+    render(<ProjectionProbe />)
     await waitFor(() => expect(requestLiveSnapshot).toHaveBeenCalledTimes(1))
 
     visibility = 'hidden'
@@ -276,5 +273,26 @@ describe('message stream projection', () => {
       document.dispatchEvent(new Event('visibilitychange'))
     })
     await waitFor(() => expect(requestLiveSnapshot).toHaveBeenCalledTimes(2))
+  })
+
+  it('does not request a retained current snapshot when visibility returns', async () => {
+    let visibility: DocumentVisibilityState = 'visible'
+    vi.spyOn(document, 'visibilityState', 'get').mockImplementation(() => visibility)
+    const requestLiveSnapshot = vi.fn(async () => {})
+    act(() => {
+      setActiveStream('generation')
+      attemptController.setLiveProjectionRequester('projection-stream', requestLiveSnapshot)
+    })
+
+    render(<ProjectionProbe />)
+    await waitFor(() => expect(requestLiveSnapshot).toHaveBeenCalledTimes(1))
+    act(() => setLiveSnapshot('Retained current output.'))
+    requestLiveSnapshot.mockClear()
+
+    visibility = 'hidden'
+    await act(async () => document.dispatchEvent(new Event('visibilitychange')))
+    visibility = 'visible'
+    await act(async () => document.dispatchEvent(new Event('visibilitychange')))
+    expect(requestLiveSnapshot).not.toHaveBeenCalled()
   })
 })

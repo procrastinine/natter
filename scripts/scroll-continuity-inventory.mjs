@@ -250,17 +250,17 @@ export const SCROLL_HEIGHT_PRODUCER_PROOF_MATRIX = Object.freeze([
 export const SCROLL_SEMANTIC_TRANSITIONS = Object.freeze([
   transition(
     'destination-first-demand',
-    'src/hooks/useActiveBranchFrame.ts',
-    'initialTranscriptWorkBudget(normalizedInitialRowTarget, viewportHeight)',
+    'src/store/conversation-controller.ts',
+    'transcriptRowFloorBudget(1)',
     'transcript-demand',
-    'A new selection first requests only the destination-sized suffix.',
+    'A fresh selection settles only its exact terminal row before viewport-owned expansion.',
   ),
   transition(
     'destination-settled-floor-demand',
     'src/store/conversation-controller.ts',
-    'maxTranscriptWorkBudget(this.settledTranscriptBudget, explicit.budget)',
+    'maxTranscriptWorkBudget(settledBudget, explicit.budget)',
     'transcript-demand',
-    'The controller preserves the settled initial work floor while merging later explicit demand.',
+    'A mounted viewport merges its configured floor into the selection plan and keeps that floor resident afterward.',
   ),
   transition(
     'prepend-publication-handshake',

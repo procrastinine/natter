@@ -579,16 +579,14 @@ function isBrowserWorkspaceDatabaseName(value: unknown): value is BrowserWorkspa
   )
 }
 
-async function withControlDb<T>(
-  operation: (db: BrowserWorkspaceControlDb) => Promise<T>,
-): Promise<T> {
-  const db = new BrowserWorkspaceControlDb()
-  try {
-    await db.open()
-    return await operation(db)
-  } finally {
-    db.close()
-  }
+function withControlDb<T>(operation: (db: BrowserWorkspaceControlDb) => Promise<T>): Promise<T> {
+  return Dexie.ignoreTransaction(() => {
+    const db = new BrowserWorkspaceControlDb()
+    return db
+      .open()
+      .then(() => operation(db))
+      .finally(() => db.close())
+  })
 }
 
 function initialManifest(): BrowserWorkspaceDatabaseManifest {

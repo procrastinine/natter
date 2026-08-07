@@ -41,17 +41,20 @@ export async function proveConversationSelectionInTransaction(
     pathHeaders = result.rows
   }
   const exactPathHeaders = pathHeaders ?? Object.freeze([])
-  const slotFrame =
-    input.forks && input.terminalChildSlot
-      ? null
-      : await readActiveBranchPathSlotFrameInTransaction(tx, chat.id, exactPathHeaders)
-  const forks = input.forks ?? slotFrame!.forks
-  const terminalChildSlot = input.terminalChildSlot ?? slotFrame!.terminalChildSlot
+  if (input.forks && input.terminalChildSlot) {
+    return proveConversationSelectionFromExactPath({
+      ...input,
+      exactPathHeaders,
+      forks: input.forks,
+      terminalChildSlot: input.terminalChildSlot,
+    })
+  }
+  const slotFrame = await readActiveBranchPathSlotFrameInTransaction(tx, chat.id, exactPathHeaders)
   return proveConversationSelectionFromExactPath({
     ...input,
     exactPathHeaders,
-    forks,
-    terminalChildSlot,
+    forks: input.forks ?? slotFrame.forks,
+    terminalChildSlot: input.terminalChildSlot ?? slotFrame.terminalChildSlot,
   })
 }
 

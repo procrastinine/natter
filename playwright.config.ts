@@ -1,5 +1,7 @@
 import { defineConfig, devices } from '@playwright/test'
 
+delete process.env.NO_COLOR
+
 const host = '127.0.0.1'
 const port = parseE2ePort(process.env.E2E_PORT ?? '4173', 'E2E_PORT')
 const baseURL = `http://${host}:${port}`
@@ -14,6 +16,7 @@ const fakeProviderURL = `http://${host}:${fakeProviderPort}`
 process.env.E2E_FAKE_PROVIDER_ORIGIN = fakeProviderURL
 const devPreviewParity = process.env.E2E_DEV_PREVIEW_PARITY === '1'
 const headedVisibility = process.env.E2E_HEADED_VISIBILITY === '1'
+const serializedLargeWorkspaceClosure = process.env.E2E_SERIALIZE_LARGE_WORKSPACE_CLOSURE === '1'
 const devPort = parseE2ePort(process.env.E2E_DEV_PORT ?? '4175', 'E2E_DEV_PORT')
 if (new Set([port, fakeProviderPort, devPort]).size !== 3) {
   throw new Error('E2E_PORT, E2E_FAKE_PROVIDER_PORT, and E2E_DEV_PORT must differ')
@@ -106,6 +109,7 @@ export default defineConfig({
     },
     {
       name: 'chromium',
+      ...(serializedLargeWorkspaceClosure ? { dependencies: ['large-workspace-setup'] } : {}),
       testIgnore: [
         /large-workspace\.setup\.ts$/u,
         /large-workspace-startup\.spec\.ts$/u,
@@ -116,7 +120,7 @@ export default defineConfig({
     {
       name: 'chromium-large-workspace',
       testMatch: /large-workspace-startup\.spec\.ts$/u,
-      dependencies: ['large-workspace-setup'],
+      dependencies: serializedLargeWorkspaceClosure ? ['chromium'] : ['large-workspace-setup'],
       use: { ...devices['Desktop Chrome'] },
     },
     {

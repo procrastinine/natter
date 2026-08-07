@@ -383,37 +383,37 @@ describe('fetchWithKeyFallback', () => {
     expect(authHeaders).toEqual(['Bearer secret-1', 'Bearer secret-2', 'Bearer secret-3'])
   })
 
-  it.each([
-    400, 408, 418, 429, 500, 502, 503,
-  ])('does not rotate on non-triggering HTTP %i', async (status) => {
-    const fetchMock = vi.fn().mockResolvedValue(response(status))
-    vi.stubGlobal('fetch', fetchMock)
-    const result = await fetchWithKeyFallback(['ref-1', 'ref-2'], (candidate) => ({
-      url: 'https://x',
-      init: { headers: { Authorization: `Bearer ${candidate}` } },
-    }))
-    expect(result.response.status).toBe(status)
-    expect(result.candidate).toBe('ref-1')
-    expect(result.candidateIndex).toBe(0)
-    expect(fetchMock).toHaveBeenCalledTimes(1)
-  })
+  it.each([400, 408, 418, 429, 500, 502, 503])(
+    'does not rotate on non-triggering HTTP %i',
+    async (status) => {
+      const fetchMock = vi.fn().mockResolvedValue(response(status))
+      vi.stubGlobal('fetch', fetchMock)
+      const result = await fetchWithKeyFallback(['ref-1', 'ref-2'], (candidate) => ({
+        url: 'https://x',
+        init: { headers: { Authorization: `Bearer ${candidate}` } },
+      }))
+      expect(result.response.status).toBe(status)
+      expect(result.candidate).toBe('ref-1')
+      expect(result.candidateIndex).toBe(0)
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+    },
+  )
 
-  it.each([
-    undefined,
-    '1',
-    'not-a-number',
-  ])('makes exactly one request for an ordinary 429 with limit %s', async (limit) => {
-    const headers = limit === undefined ? {} : { 'x-ratelimit-limit': limit }
-    const fetchMock = vi.fn().mockResolvedValue(response(429, headers))
-    vi.stubGlobal('fetch', fetchMock)
-    const result = await fetchWithKeyFallback(['ref-1', 'ref-2'], (candidate) => ({
-      url: 'https://x',
-      init: { headers: { Authorization: `Bearer ${candidate}` } },
-    }))
-    expect(result.response.status).toBe(429)
-    expect(result.candidateIndex).toBe(0)
-    expect(fetchMock).toHaveBeenCalledTimes(1)
-  })
+  it.each([undefined, '1', 'not-a-number'])(
+    'makes exactly one request for an ordinary 429 with limit %s',
+    async (limit) => {
+      const headers = limit === undefined ? {} : { 'x-ratelimit-limit': limit }
+      const fetchMock = vi.fn().mockResolvedValue(response(429, headers))
+      vi.stubGlobal('fetch', fetchMock)
+      const result = await fetchWithKeyFallback(['ref-1', 'ref-2'], (candidate) => ({
+        url: 'https://x',
+        init: { headers: { Authorization: `Bearer ${candidate}` } },
+      }))
+      expect(result.response.status).toBe(429)
+      expect(result.candidateIndex).toBe(0)
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+    },
+  )
 
   it('rotates on a 429 whose x-ratelimit-limit parses to numeric zero', async () => {
     const fetchMock = vi
@@ -728,32 +728,26 @@ describe('isKeyFallbackTrigger', () => {
     expect(isKeyFallbackTrigger(new Response('', { status: 401 }))).toBe(true)
     expect(isKeyFallbackTrigger(new Response('', { status: 403 }))).toBe(true)
   })
-  it.each([
-    '0',
-    '0.0',
-    '0e0',
-    '-0',
-  ])('true for 429 when x-ratelimit-limit %s parses to numeric zero', (limit) => {
-    expect(
-      isKeyFallbackTrigger(
-        new Response('', {
-          status: 429,
-          headers: { 'x-ratelimit-limit': limit },
-        }),
-      ),
-    ).toBe(true)
-  })
-  it.each([
-    undefined,
-    '',
-    '1',
-    '-1',
-    'NaN',
-    '0, 1',
-  ])('false for 429 with nonzero, missing, or malformed limit %s', (limit) => {
-    const headers = limit === undefined ? {} : { 'x-ratelimit-limit': limit }
-    expect(isKeyFallbackTrigger(new Response('', { status: 429, headers }))).toBe(false)
-  })
+  it.each(['0', '0.0', '0e0', '-0'])(
+    'true for 429 when x-ratelimit-limit %s parses to numeric zero',
+    (limit) => {
+      expect(
+        isKeyFallbackTrigger(
+          new Response('', {
+            status: 429,
+            headers: { 'x-ratelimit-limit': limit },
+          }),
+        ),
+      ).toBe(true)
+    },
+  )
+  it.each([undefined, '', '1', '-1', 'NaN', '0, 1'])(
+    'false for 429 with nonzero, missing, or malformed limit %s',
+    (limit) => {
+      const headers = limit === undefined ? {} : { 'x-ratelimit-limit': limit }
+      expect(isKeyFallbackTrigger(new Response('', { status: 429, headers }))).toBe(false)
+    },
+  )
   it('does not treat a missing limit as account exhaustion', () => {
     expect(isKeyFallbackTrigger(new Response('', { status: 429 }))).toBe(false)
   })

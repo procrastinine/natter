@@ -299,6 +299,7 @@ describe('Wave A v94 stream storage normalization', () => {
         },
       ],
     })
+    const lastFrame = frames.at(-1)
     const lease = testRecoveryPendingLease({
       streamId: 'current-stream',
       chatId: 'chat-1',
@@ -307,7 +308,7 @@ describe('Wave A v94 stream storage normalization', () => {
       admissionSequence: 4,
       handedOffAt: 100,
       handoffReason: 'owner-unavailable',
-      ...(frames.at(-1) ? { journalMaxSeq: frames.at(-1)!.seq } : {}),
+      ...(lastFrame ? { journalMaxSeq: lastFrame.seq } : {}),
       journalStorageBytes: 1,
     })
     await legacy.table('streamLeases').put(lease)

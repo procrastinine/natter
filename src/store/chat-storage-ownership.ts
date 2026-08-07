@@ -1,3 +1,4 @@
+import Dexie from 'dexie'
 import { childListKey } from '../core/child-list-state'
 import {
   aggregateCalibrationSamples,
@@ -87,7 +88,7 @@ export async function deleteEligibleEmptyDraftChatClosure(
   )
   if (candidates.length === 0) return emptyDeleteChatClosureResult()
   const candidateIds = candidates.map((chat) => chat.id)
-  const [messageChatIds, drafts, edgeChatIds] = await Promise.all([
+  const [messageChatIds, drafts, edgeChatIds] = await Dexie.Promise.all([
     tx
       .table<MessageHeaderRow, MessageId>('messages')
       .where('chatId')
@@ -226,7 +227,7 @@ async function deleteKnownChatClosure(
     )
     messageHeaderBytes = saturatingAdd(messageHeaderBytes, estimateStoredValueBytes(header))
   })
-  await Promise.all([
+  await Dexie.Promise.all([
     deleteChatOwnedPhysicalStorageCollectionWithKnownBytes<MessageHeaderRow, string>(
       tx,
       'messages',
@@ -242,7 +243,7 @@ async function deleteKnownChatClosure(
   await deleteLinkedSemanticByteOwnerBatchRepairingLinks(tx, 'chats', deletedChatIds, chats)
   await deleteChatAuxiliaryByteOwners(tx, { chatIds: deletedChatIds, messageBodyProjectionBytes })
   for (const chatId of deletedChatIds) {
-    await Promise.all([
+    await Dexie.Promise.all([
       deletePhysicalStorageCollection(
         tx,
         'childLists',

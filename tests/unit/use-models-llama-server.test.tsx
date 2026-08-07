@@ -94,28 +94,27 @@ afterEach(async () => {
 })
 
 describe('model discovery through the canonical configuration projection', () => {
-  it.each([
-    'openrouter',
-    'openai-compatible',
-    'custom',
-  ] as const)('uses the canonical %s catalog query without starting unsupported routing discovery', async (kind) => {
-    const profile = profileFixture(kind, {
-      supportsEndpointsApi: false,
-      supportsPrivacyScrape: false,
-    })
-    const settings = cloneDefaultChatSettings()
-    settings.profileId = profile.id
-    const harness = await installModelCatalog(profile, settings, modelsRow(profile, 0, []))
+  it.each(['openrouter', 'openai-compatible', 'custom'] as const)(
+    'uses the canonical %s catalog query without starting unsupported routing discovery',
+    async (kind) => {
+      const profile = profileFixture(kind, {
+        supportsEndpointsApi: false,
+        supportsPrivacyScrape: false,
+      })
+      const settings = cloneDefaultChatSettings()
+      settings.profileId = profile.id
+      const harness = await installModelCatalog(profile, settings, modelsRow(profile, 0, []))
 
-    renderHook(() => useModelCatalog(harness.target, profile, { modelsDemanded: true }))
+      renderHook(() => useModelCatalog(harness.target, profile, { modelsDemanded: true }))
 
-    await waitFor(() => expect(discoveryMocks.refreshModels).toHaveBeenCalledTimes(1))
-    expect(discoveryMocks.refreshModels.mock.calls[0]?.[1]).toEqual(
-      modelCatalogQueryForConnectionKind(kind),
-    )
-    expect(discoveryMocks.refreshEndpoints).not.toHaveBeenCalled()
-    expect(discoveryMocks.refreshPrivacy).not.toHaveBeenCalled()
-  })
+      await waitFor(() => expect(discoveryMocks.refreshModels).toHaveBeenCalledTimes(1))
+      expect(discoveryMocks.refreshModels.mock.calls[0]?.[1]).toEqual(
+        modelCatalogQueryForConnectionKind(kind),
+      )
+      expect(discoveryMocks.refreshEndpoints).not.toHaveBeenCalled()
+      expect(discoveryMocks.refreshPrivacy).not.toHaveBeenCalled()
+    },
+  )
 
   it('does not let a superseded active-model read overwrite a newer projection', async () => {
     const profile = profileFixture('openrouter', {
@@ -437,11 +436,15 @@ describe('model discovery through the canonical configuration projection', () =>
     first.unmount()
 
     const renderSequence: string[][] = []
+    let modelsDemanded = false
     const second = renderHook(() => {
-      const catalog = useModelCatalog(harness.target, profile, { modelsDemanded: true })
+      const catalog = useModelCatalog(harness.target, profile, { modelsDemanded })
       renderSequence.push(catalog.models.models.map((model) => model.id))
       return catalog
     })
+    await act(async () => Promise.resolve())
+    modelsDemanded = true
+    second.rerender()
     await act(async () => Promise.resolve())
     expect(discoveryMocks.refreshModels).toHaveBeenCalledTimes(1)
     expect(second.result.current.models.models.map((model) => model.id)).toEqual(['offline/model'])

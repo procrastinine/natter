@@ -379,13 +379,16 @@ function evaluatePreRelease(report, state, problems) {
   const requiredRows =
     state.initialRenderWork * STREAM_PROFILE_EVIDENCE_CONTRACT.minimumBranchDemandMultiples
   minimum(problems, 'profile.demand.branch-depth', state.totalMessages, requiredRows)
-  exact(problems, 'profile.demand.expanded-transcript', state.renderedMessages, state.totalMessages)
-  exact(
+  exact(problems, 'profile.demand.expanded-transcript', state.loadedMessages, state.totalMessages)
+  minimum(problems, 'profile.demand.mounted-transcript-floor', state.mountedMessages, 1)
+  maximum(
     problems,
-    'profile.demand.visible-assistant-count',
-    state.assistantTextLengths.length,
-    report.scenario.turnCount,
+    'profile.demand.mounted-transcript-window',
+    state.mountedMessages,
+    state.initialRenderWork,
   )
+  minimum(problems, 'profile.demand.visible-assistant-floor', state.assistantTextLengths.length, 1)
+  if (!state.virtualized) problems.push('profile.demand.expanded-transcript-not-virtualized')
   const minimumRenderedText = Math.floor(report.scenario.targetChars * 0.99)
   if (state.assistantTextLengths.some((length) => length < minimumRenderedText)) {
     problems.push('profile.demand.visible-assistant-content')
@@ -422,12 +425,9 @@ function evaluateTranscriptState(label, state, problems) {
 }
 
 function evaluateResidentTranscriptWindow(label, state, problems) {
-  exact(
-    problems,
-    `profile.dom.${label}-transcript-window`,
-    state.renderedMessages,
-    Math.min(state.totalMessages, state.initialRenderWork),
-  )
+  const expected = Math.min(state.totalMessages, state.initialRenderWork)
+  exact(problems, `profile.dom.${label}-loaded-transcript-window`, state.loadedMessages, expected)
+  exact(problems, `profile.dom.${label}-mounted-transcript-window`, state.mountedMessages, expected)
 }
 
 function evaluateSeries(label, samples, metrics, problems) {

@@ -1,4 +1,4 @@
-import type { Table, Transaction } from 'dexie'
+import Dexie, { type Table, type Transaction } from 'dexie'
 import type {
   ActiveBranchSelection,
   ActiveBranchTargetUnavailable,
@@ -639,7 +639,7 @@ export async function resolveConversationOpenReceipt(
     const slotFramePromise = access.runFrame(
       selectedForkHeader ? ['childLists', 'childSlotMembers'] : ['childLists'],
       async (tx) => {
-        const [terminalChildSlot, forks] = await Promise.all([
+        const [terminalChildSlot, forks] = await Dexie.Promise.all([
           readActiveBranchTerminalChildSlotInTransaction(
             tx,
             receipt.chat.id,
@@ -652,7 +652,7 @@ export async function resolveConversationOpenReceipt(
                 [selectedForkHeader],
                 owned.signal,
               )
-            : Promise.resolve(Object.freeze([])),
+            : Dexie.Promise.resolve(Object.freeze([])),
         ])
         return Object.freeze({ terminalChildSlot, forks })
       },
@@ -699,7 +699,7 @@ async function classifyLiveLeafInTransaction(
 ): Promise<'leaf' | 'internal'> {
   const parentKey = childListKey(header.chatId, header.id)
   throwIfAborted(signal)
-  const [state, firstMember] = await Promise.all([
+  const [state, firstMember] = await Dexie.Promise.all([
     tx.table<ChildListState, string>('childLists').get(parentKey),
     tx
       .table<ChildSlotMember, MessageId>('childSlotMembers')
@@ -754,7 +754,7 @@ async function readLiveChildAtPosition(
   if (!Number.isSafeInteger(position) || position < 0) return null
   const parentKey = childListKey(chatId, parentId)
   throwIfAborted(signal)
-  const [state, member] = await Promise.all([
+  const [state, member] = await Dexie.Promise.all([
     tables.childLists.get(parentKey),
     tables.childSlotMembers
       .where(CHILD_MEMBER_POSITION_INDEX)

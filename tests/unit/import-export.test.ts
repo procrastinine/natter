@@ -1496,34 +1496,34 @@ describe('chat export/import', () => {
     expect(await authoritativeSnapshot()).toEqual(before)
   })
 
-  it.each([
-    'missing',
-    'tombstoned',
-  ] as const)('repairs content whose only owner ref is $situation', async (situation) => {
-    const seeded = await seedPortableChat()
-    const exported = await exportChat(seeded.chat.id)
-    const source = must(
-      exported.payload.messages.find((candidate) =>
-        candidate.content.some((item) => item.type === 'file'),
-      ),
-      'message with file',
-    )
-    const ref = must(source.attachmentRefs?.[0], 'attachment ref')
-    source.attachmentRefs = situation === 'missing' ? [] : [{ ...ref, deletedAt: 123 }]
+  it.each(['missing', 'tombstoned'] as const)(
+    'repairs content whose only owner ref is $situation',
+    async (situation) => {
+      const seeded = await seedPortableChat()
+      const exported = await exportChat(seeded.chat.id)
+      const source = must(
+        exported.payload.messages.find((candidate) =>
+          candidate.content.some((item) => item.type === 'file'),
+        ),
+        'message with file',
+      )
+      const ref = must(source.attachmentRefs?.[0], 'attachment ref')
+      source.attachmentRefs = situation === 'missing' ? [] : [{ ...ref, deletedAt: 123 }]
 
-    const result = await importChat(exported, { now: 1_000 })
-    const restored = must(
-      (await messagesForChat(result.chatId)).find((message) => message.role === 'user'),
-      'restored user message',
-    )
-    const attachmentId = fileItem(restored.content).attachmentId
-    const liveRefs = (restored.attachmentRefs ?? []).filter(
-      (candidate) => candidate.attachmentId === attachmentId && candidate.deletedAt === undefined,
-    )
+      const result = await importChat(exported, { now: 1_000 })
+      const restored = must(
+        (await messagesForChat(result.chatId)).find((message) => message.role === 'user'),
+        'restored user message',
+      )
+      const attachmentId = fileItem(restored.content).attachmentId
+      const liveRefs = (restored.attachmentRefs ?? []).filter(
+        (candidate) => candidate.attachmentId === attachmentId && candidate.deletedAt === undefined,
+      )
 
-    expect(liveRefs).toHaveLength(1)
-    await expectAttachmentReferenceInvariants(getDb())
-  })
+      expect(liveRefs).toHaveLength(1)
+      await expectAttachmentReferenceInvariants(getDb())
+    },
+  )
 
   it('rejects an imported chat when a live attachment ref has no target before writing', async () => {
     const seeded = await seedPortableChat()
@@ -3098,35 +3098,35 @@ describe('workspace backup restore', () => {
     expectFailedReplacementPreserved(before, await failedReplacementSnapshot())
   })
 
-  it.each([
-    'normal send',
-    'Continue',
-  ] as const)('sees pre-mutation %s admission with neither BroadcastChannel nor Web Locks', async (kind) => {
-    const seeded = await seedPortableChat()
-    const exported = await exportWorkspaceBackup()
-    vi.stubGlobal('BroadcastChannel', undefined)
-    vi.stubGlobal('navigator', { locks: undefined })
-    __resetBroadcastForTests()
-    __setStreamLockManagerForTests(null)
-    const streamId = kind === 'Continue' ? 'admitted-continue' : 'admitted-send'
-    const now = Date.now()
-    await prepareBlockingAttempt(seeded, kind, streamId, now)
-    expect(await getDb().streamLeases.get(streamId)).toMatchObject({
-      streamId,
-      chatId: seeded.chat.id,
-    })
-    expect(await getDb().streamLeases.get(streamId)).toMatchObject({
-      messageId: kind === 'Continue' ? seeded.assistantMessage.id : 'reserved-send-target',
-    })
-    __resetBroadcastForTests()
-    const before = await failedReplacementSnapshot()
+  it.each(['normal send', 'Continue'] as const)(
+    'sees pre-mutation %s admission with neither BroadcastChannel nor Web Locks',
+    async (kind) => {
+      const seeded = await seedPortableChat()
+      const exported = await exportWorkspaceBackup()
+      vi.stubGlobal('BroadcastChannel', undefined)
+      vi.stubGlobal('navigator', { locks: undefined })
+      __resetBroadcastForTests()
+      __setStreamLockManagerForTests(null)
+      const streamId = kind === 'Continue' ? 'admitted-continue' : 'admitted-send'
+      const now = Date.now()
+      await prepareBlockingAttempt(seeded, kind, streamId, now)
+      expect(await getDb().streamLeases.get(streamId)).toMatchObject({
+        streamId,
+        chatId: seeded.chat.id,
+      })
+      expect(await getDb().streamLeases.get(streamId)).toMatchObject({
+        messageId: kind === 'Continue' ? seeded.assistantMessage.id : 'reserved-send-target',
+      })
+      __resetBroadcastForTests()
+      const before = await failedReplacementSnapshot()
 
-    await expect(restoreWorkspaceBackup(exported, { now })).rejects.toMatchObject({
-      name: 'WorkspaceReplacementInProgressError',
-      blockerIds: [streamId],
-    })
-    expectFailedReplacementPreserved(before, await failedReplacementSnapshot())
-  })
+      await expect(restoreWorkspaceBackup(exported, { now })).rejects.toMatchObject({
+        name: 'WorkspaceReplacementInProgressError',
+        blockerIds: [streamId],
+      })
+      expectFailedReplacementPreserved(before, await failedReplacementSnapshot())
+    },
+  )
 
   it('invalidates pre-replacement discovery and privacy fetches before they can repopulate caches', async () => {
     const seeded = await seedPortableChat()
