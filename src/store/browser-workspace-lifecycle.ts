@@ -1,5 +1,6 @@
 import { isWorkspaceReplacementRecoveryRequiredError } from '../core/import-export/errors'
 import { raceWithAbortSignal } from '../lib/abort'
+import { errorHasName } from '../lib/error'
 import {
   assertAttachmentCatalogWorkspaceClosed,
   attachAttachmentCatalogWorkspace,
@@ -1129,12 +1130,17 @@ async function performBrowserWorkspaceOpen(
     }
     shutdownTransition = null
     assertBrowserWorkspaceBootstrapAuthority(attempt.authority)
-    attempt.selection = await prepareBrowserWorkspaceDatabaseSelection(
-      attempt.authority,
-      options.onProgress,
+    attempt.selection = await runBrowserWorkspaceOpenStage('database-selection', () =>
+      prepareBrowserWorkspaceDatabaseSelection(
+        attempt.authority,
+        options.onProgress,
+        options.onBlocked,
+      ),
     )
     assertBrowserWorkspaceBootstrapAuthority(attempt.authority)
-    const workspace = await bootstrapBrowserWorkspace(attempt.authority, options)
+    const workspace = await runBrowserWorkspaceOpenStage('database-bootstrap', () =>
+      bootstrapBrowserWorkspace(attempt.authority, options),
+    )
     assertBrowserWorkspaceBootstrapAuthority(attempt.authority)
     options.onProgress?.({ kind: 'runtime-resources', operation: 'reconcile' })
     const authority = beginWorkspaceRuntimeReconciliation(workspace, {
@@ -1146,11 +1152,18 @@ async function performBrowserWorkspaceOpen(
     )
     attempt.selection = null
     options.onProgress?.({ kind: 'runtime-resources', operation: 'activate' })
-    await resumeWorkspaceRuntimeResources(authority)
+    await runBrowserWorkspaceOpenStage('runtime-resources-resume', () =>
+      resumeWorkspaceRuntimeResources(authority),
+    )
     assertBrowserWorkspaceBootstrapAuthority(attempt.authority)
     options.onProgress?.({ kind: 'runtime-resources', operation: 'settle' })
-    await finishWorkspaceRuntimeReconciliation(workspace)
-    if ((await readBrowserWorkspaceDatabaseManifest()).pending) {
+    await runBrowserWorkspaceOpenStage('runtime-reconciliation-finish', () =>
+      finishWorkspaceRuntimeReconciliation(workspace),
+    )
+    const settledManifest = await runBrowserWorkspaceOpenStage('read-settled-manifest', () =>
+      readBrowserWorkspaceDatabaseManifest(),
+    )
+    if (settledManifest.pending) {
       publishLocalWorkspaceInvalidation({
         kind: 'invalidate',
         ...workspace,
@@ -1200,6 +1213,24 @@ async function performBrowserWorkspaceOpen(
         await finishTerminalBrowserWorkspaceShutdownBeforeOpen()
       }
     }
+  }
+}
+
+async function runBrowserWorkspaceOpenStage<Result>(
+  operation: string,
+  run: () => Promise<Result>,
+): Promise<Result> {
+  try {
+    return await run()
+  } catch (error) {
+    if (errorHasName(error, 'TransactionInactiveError')) {
+      const diagnostic = new Error(`BrowserWorkspaceOpenTransactionInactive:${operation}`, {
+        cause: error,
+      })
+      diagnostic.name = `BrowserWorkspaceOpenTransactionInactiveError_${operation}`
+      throw diagnostic
+    }
+    throw error
   }
 }
 

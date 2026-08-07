@@ -3,7 +3,7 @@ import { aggregateCalibrationSamples } from '../../core/token-calibration'
 import type { Chat, MessageId, TokenCalibrationSample } from '../../core/types'
 import type { UsePrivacyRoutingResult } from '../../hooks/useModelCatalog'
 import { catalogApplication } from '../../store/catalog-application'
-import { listTags, setChatTagsFromNames } from '../../store/chat-metadata-application'
+import { getTags, setChatTagsFromNames } from '../../store/chat-metadata-application'
 import { interchangeApplication } from '../../store/interchange-application'
 import { useToastStore } from '../../store/zustand/toastStore'
 import {
@@ -144,7 +144,7 @@ export function ChatHeader({
   }, [chat, pushToast])
   const handleEditTags = useCallback(async () => {
     if (!chat) return
-    const tags = await listTags()
+    const tags = await getTags(chat.tags)
     const byId = new Map(tags.map((tag) => [tag.id, tag]))
     const currentNames = chat.tags
       .map((tagId) => byId.get(tagId)?.name)

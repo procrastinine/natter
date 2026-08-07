@@ -18,6 +18,7 @@ import {
   sidebarSortDirection,
   sidebarSortField,
   sidebarSortOption,
+  sidebarTitleSortKey,
 } from '../../core/sidebar-sort'
 import { aggregateCalibrationSamples } from '../../core/token-calibration'
 import type {
@@ -36,6 +37,7 @@ import {
   type SearchFilters,
   useCatalogTab,
   useChatCatalogSearch,
+  useOrganizationCatalogApplication,
 } from '../../hooks/useCatalogApplication'
 import { useConfigurationPreferences } from '../../hooks/useConfigurationPreferences'
 import { useStorageChatCatalogApplication } from '../../hooks/useStorageCatalogApplication'
@@ -83,6 +85,10 @@ import {
 } from './storage-surface-shared'
 
 const EMPTY_CHAT_ROWS: readonly ChatSidebarRow[] = Object.freeze([])
+
+function compareCatalogText(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0
+}
 const EMPTY_CHAT_FOLDERS: readonly ChatFolder[] = Object.freeze([])
 const EMPTY_CHAT_TAGS: readonly ChatTag[] = Object.freeze([])
 const EMPTY_CHAT_CALIBRATIONS: ReadonlyMap<
@@ -146,8 +152,42 @@ export default function ChatsStorageSurface() {
     resolveRows,
   } = useStorageChatCatalogApplication(catalogRequest)
   const catalogRows = chatCatalogSession?.page.rows ?? EMPTY_CHAT_ROWS
-  const folders = chatCatalogSession?.folders ?? EMPTY_CHAT_FOLDERS
-  const tags = chatCatalogSession?.tags ?? EMPTY_CHAT_TAGS
+  const organizationCatalog = useOrganizationCatalogApplication({
+    foldersDemanded: true,
+    tagsDemanded: true,
+  })
+  const folders = useMemo(
+    () =>
+      [
+        ...new Map(
+          [
+            ...(chatCatalogSession?.folders ?? EMPTY_CHAT_FOLDERS),
+            ...organizationCatalog.folders.rows,
+          ].map((folder) => [folder.id, folder]),
+        ).values(),
+      ].sort(
+        (left, right) =>
+          left.sortIndex - right.sortIndex ||
+          compareCatalogText(sidebarTitleSortKey(left.name), sidebarTitleSortKey(right.name)) ||
+          compareCatalogText(left.id, right.id),
+      ),
+    [chatCatalogSession?.folders, organizationCatalog.folders.rows],
+  )
+  const tags = useMemo(
+    () =>
+      [
+        ...new Map(
+          [...(chatCatalogSession?.tags ?? EMPTY_CHAT_TAGS), ...organizationCatalog.tags.rows].map(
+            (tag) => [tag.id, tag],
+          ),
+        ).values(),
+      ].sort(
+        (left, right) =>
+          compareCatalogText(left.nameLower, right.nameLower) ||
+          compareCatalogText(left.id, right.id),
+      ),
+    [chatCatalogSession?.tags, organizationCatalog.tags.rows],
+  )
   const calibrations = chatCatalogSession?.calibrations ?? EMPTY_CHAT_CALIBRATIONS
   const folderById = useMemo(() => new Map(folders.map((folder) => [folder.id, folder])), [folders])
   const tagById = useMemo(() => new Map(tags.map((tag) => [tag.id, tag])), [tags])
@@ -728,6 +768,15 @@ export default function ChatsStorageSurface() {
                 {folder.name}
               </Button>
             ))}
+            {organizationCatalog.folders.nextCursor ? (
+              <Button
+                type="button"
+                disabled={organizationCatalog.folders.loading}
+                onClick={organizationCatalog.folders.loadMore}
+              >
+                Load more folders
+              </Button>
+            ) : null}
           </div>
         </section>
       ) : null}
@@ -749,6 +798,15 @@ export default function ChatsStorageSurface() {
                 {tag.name}
               </Button>
             ))}
+            {organizationCatalog.tags.nextCursor ? (
+              <Button
+                type="button"
+                disabled={organizationCatalog.tags.loading}
+                onClick={organizationCatalog.tags.loadMore}
+              >
+                Load more tags
+              </Button>
+            ) : null}
           </div>
         </section>
       ) : null}

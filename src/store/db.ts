@@ -31,6 +31,7 @@ import { migrateProviderApiModeTables } from '../backcompat/provider-api-modes'
 import { migrateProviderSettingsTables } from '../backcompat/provider-settings-migration'
 import { migrateProviderToolSettings } from '../backcompat/provider-tools'
 import { runOnceBackfillInTransaction } from '../backcompat/run-once'
+import type * as SidebarFolderPresentationV98 from '../backcompat/sidebar-folder-presentation-v98'
 import { migrateStreamLeaseAttempts } from '../backcompat/stream-lease-attempts'
 import { migrateWorkspaceReplacementEpoch } from '../backcompat/workspace-meta'
 import {
@@ -98,17 +99,31 @@ import {
   waveACompletionSettingsV94,
 } from './browser-workspace-schema-v94'
 import {
-  BROWSER_WORKSPACE_CURRENT_COMPLETION_KEY,
   browserWorkspaceCurrentCompletionSettingV97,
-  isBrowserWorkspaceCurrentCompletionValueV97,
   WAVE_B_STORAGE_VERSION,
   WAVE_B_V97_STORES,
 } from './browser-workspace-schema-v97'
 import {
+  BROWSER_WORKSPACE_CURRENT_COMPLETION_KEY,
+  BROWSER_WORKSPACE_PREVIOUS_COMPLETION_KEY,
+  browserWorkspaceCurrentCompletionSettingV98,
+  isBrowserWorkspaceCurrentCompletionValueV98,
+  WAVE_C_STORAGE_VERSION,
+  WAVE_C_V98_STORES,
+} from './browser-workspace-schema-v98'
+import {
+  type BrowserWorkspaceRegisteredUpgradeStrategy,
+  CURRENT_BROWSER_WORKSPACE_STORAGE_EPOCH,
+  registeredBrowserWorkspaceUpgradeRouteFrom,
+  registeredBrowserWorkspaceUpgradeStrategyFrom,
+} from './browser-workspace-upgrade-strategy'
+import {
   CHAT_SIDEBAR_AGGREGATE_ID,
   type ChatSidebarAggregateProjectionRow,
   type ChatSidebarProjectionRow,
+  chatSidebarProjectionBackfillMarker,
   emptyChatSidebarAggregateRow,
+  rebuildChatSidebarProjectionRowsInTransaction,
 } from './chat-sidebar-projection'
 import { installChatStorageCodec } from './chat-storage-codec'
 import {
@@ -170,7 +185,7 @@ import {
 
 export type { SettingsRow } from './db-rows'
 
-export const CURRENT_DB_VERSION = WAVE_B_STORAGE_VERSION
+export const CURRENT_DB_VERSION = CURRENT_BROWSER_WORKSPACE_STORAGE_EPOCH.storageVersion
 
 export class NatterDb extends Dexie {
   chats!: Table<Chat, string>
@@ -280,6 +295,7 @@ const waveAUpgradeProgressPorts = new WeakMap<
   Dexie,
   (progress: BrowserWorkspaceOpenProgress) => void
 >()
+let loadedSidebarFolderPresentationV98: typeof SidebarFolderPresentationV98 | null = null
 
 class BrowserWorkspaceSchemaIntegrityError extends Error {
   readonly detail: string
@@ -400,6 +416,18 @@ async function preflightBrowserWorkspaceSchema(
       repairStores: Object.freeze([]),
       compactionControlTransferPrepared: false,
     }
+  }
+  if (current.kind === 'upgrade-required') {
+    return {
+      physicalVersion: current.physicalVersion,
+      repairStores: Object.freeze([]),
+      compactionControlTransferPrepared: false,
+    }
+  }
+  if (current.kind === 'strategy-missing') {
+    throw new BrowserWorkspaceSchemaIntegrityError(
+      `upgrade-strategy-missing:${current.physicalVersion}:${CURRENT_BROWSER_WORKSPACE_NATIVE_VERSION}`,
+    )
   }
   const physical = await readPhysicalBrowserWorkspaceSchema(db.name)
   if (!physical) throw new BrowserWorkspaceSchemaIntegrityError('preflight-database-missing')
@@ -1596,12 +1624,49 @@ export function registerSchema(db: Dexie): void {
         .table<SettingsRow, string>('settings')
         .put(browserWorkspaceCurrentCompletionSettingV97())
     })
+
+  db.version(WAVE_C_STORAGE_VERSION)
+    .stores(WAVE_C_V98_STORES)
+    .upgrade(async (tx) => {
+      const migration =
+        loadedSidebarFolderPresentationV98 ??
+        (await Dexie.waitFor(import('../backcompat/sidebar-folder-presentation-v98')))
+      const preflight = waveAUpgradePreflights.get(db)
+      const report = waveAUpgradeProgressPorts.get(db)
+      const reportProgress = report
+        ? (progress: BrowserWorkspaceMigrationProgress) =>
+            report({
+              kind: 'database-upgrade',
+              databaseName: db.name as BrowserWorkspaceDatabaseName,
+              ...(preflight?.physicalVersion === undefined
+                ? {}
+                : { fromVersion: preflight.physicalVersion / 10 }),
+              targetVersion: WAVE_C_STORAGE_VERSION,
+              ...progress,
+            })
+        : undefined
+      await migration.migrateSidebarFolderPresentationV98(
+        {
+          aggregates: tx.table<unknown, string>('chatSidebarAggregates'),
+          folders: tx.table<ChatFolder, string>('folders'),
+          settings: tx.table<SettingsRow, string>('settings'),
+        },
+        reportProgress,
+        {
+          ...(preflight?.physicalVersion !== undefined &&
+          preflight.physicalVersion < WAVE_B_STORAGE_VERSION * 10
+            ? { rebuildLegacyProjection: () => rebuildChatSidebarProjectionRowsInTransaction(tx) }
+            : {}),
+        },
+      )
+    })
 }
 
 function freshWorkspaceSettingsRows(): SettingsRow[] {
   return [
     ...waveACompletionSettingsV94(),
-    browserWorkspaceCurrentCompletionSettingV97(),
+    chatSidebarProjectionBackfillMarker(),
+    browserWorkspaceCurrentCompletionSettingV98(),
     { key: RECENT_MODELS_KEY, value: [] },
     { key: RECENT_MODEL_RECENCY_KEY, value: emptyRecentModelRecency() },
   ]
@@ -1681,6 +1746,99 @@ export async function recreateAndVerifyBrowserWorkspaceDatabase(name = 'natter')
   }
 }
 
+export async function upgradeRegisteredBrowserWorkspaceDatabase(
+  databaseName: BrowserWorkspaceDatabaseName,
+  options: {
+    readonly expectedPhysicalVersion: number
+    readonly signal: AbortSignal
+    readonly onProgress?: (progress: BrowserWorkspaceOpenProgress) => void
+    readonly onBlocked?: (event: IDBVersionChangeEvent) => void
+  },
+): Promise<void> {
+  const declared = registeredBrowserWorkspaceUpgradeStrategyFrom(options.expectedPhysicalVersion)
+  if (!declared) {
+    throw new BrowserWorkspaceSchemaIntegrityError(
+      `registered-upgrade-source:${options.expectedPhysicalVersion}`,
+    )
+  }
+  const before = await probeBrowserWorkspaceCurrent(databaseName)
+  if (before.kind === 'current') return
+  if (
+    before.kind !== 'upgrade-required' ||
+    before.physicalVersion !== options.expectedPhysicalVersion ||
+    before.strategyId !== declared.id
+  ) {
+    throw new BrowserWorkspaceSchemaIntegrityError(`registered-upgrade-proof:${before.kind}`)
+  }
+  await loadRegisteredBrowserWorkspaceUpgradeImplementations(
+    registeredBrowserWorkspaceUpgradeRouteFrom(before.physicalVersion),
+  )
+
+  const db = new NatterDb(databaseName)
+  const registeredSchema = registeredBrowserWorkspaceSchema(db)
+  const preflight: BrowserWorkspaceSchemaPreflight = {
+    physicalVersion: before.physicalVersion,
+    repairStores: Object.freeze([]),
+    compactionControlTransferPrepared: false,
+  }
+  registerPreflightBrowserWorkspaceSchema(db, preflight)
+  options.onProgress?.({
+    kind: 'database-open',
+    databaseName,
+    fromVersion: before.physicalVersion / 10,
+    targetVersion: CURRENT_BROWSER_WORKSPACE_STORAGE_EPOCH.storageVersion,
+  })
+  const receiveBlocked = (event: IDBVersionChangeEvent) => {
+    options.onProgress?.({
+      kind: 'database-selection',
+      operation: 'wait-for-open-connections',
+      databaseName,
+    })
+    options.onBlocked?.(event)
+  }
+  const cancelOpen = () => db.close()
+  db.on.blocked.subscribe(receiveBlocked)
+  options.signal.addEventListener('abort', cancelOpen, { once: true })
+  if (options.onProgress) waveAUpgradeProgressPorts.set(db, options.onProgress)
+  try {
+    options.signal.throwIfAborted()
+    try {
+      await db.open()
+    } catch (error) {
+      options.signal.throwIfAborted()
+      throw error
+    }
+    options.signal.throwIfAborted()
+    verifyBrowserWorkspaceSchema(db, registeredSchema)
+    const completion = await db.settings.get(CURRENT_BROWSER_WORKSPACE_STORAGE_EPOCH.completionKey)
+    if (!CURRENT_BROWSER_WORKSPACE_STORAGE_EPOCH.completionIsValid(completion?.value)) {
+      throw new BrowserWorkspaceSchemaIntegrityError('registered-upgrade-completion')
+    }
+  } finally {
+    waveAUpgradeProgressPorts.delete(db)
+    options.signal.removeEventListener('abort', cancelOpen)
+    db.on.blocked.unsubscribe(receiveBlocked)
+    db.close()
+  }
+}
+
+async function loadRegisteredBrowserWorkspaceUpgradeImplementations(
+  route: readonly BrowserWorkspaceRegisteredUpgradeStrategy[],
+): Promise<void> {
+  await Promise.all(
+    route.map((strategy) => {
+      if (strategy.implementationId === 'sidebar-folder-presentation-v98') {
+        return import('../backcompat/sidebar-folder-presentation-v98').then((migration) => {
+          loadedSidebarFolderPresentationV98 = migration
+        })
+      }
+      throw new BrowserWorkspaceSchemaIntegrityError(
+        `registered-upgrade-implementation:${strategy.implementationId}`,
+      )
+    }),
+  )
+}
+
 export async function normalizeInactiveBrowserWorkspaceDatabase(
   databaseName: BrowserWorkspaceDatabaseName,
   options: {
@@ -1690,25 +1848,31 @@ export async function normalizeInactiveBrowserWorkspaceDatabase(
 ): Promise<void> {
   const compactionControlTransferPrepared =
     await prepareWaveACompactionControlTransfer(databaseName)
+  const [migration, folderMigration] = await Promise.all([
+    import('../backcompat/wave-a-storage-epoch-v94'),
+    import('../backcompat/sidebar-folder-presentation-v98'),
+  ])
   const db = new NatterDb(databaseName)
   const registeredSchema = registeredBrowserWorkspaceSchema(db)
   try {
     await db.open()
     await db.transaction('rw', db.tables, async (tx) => {
-      const migration = await Dexie.waitFor(import('../backcompat/wave-a-storage-epoch-v94'))
       const reportProgress = options.onProgress
         ? (progress: BrowserWorkspaceMigrationProgress) =>
             options.onProgress?.({
               kind: 'database-upgrade',
               databaseName,
               fromVersion: options.fromVersion / 10,
-              targetVersion: WAVE_B_STORAGE_VERSION,
+              targetVersion: WAVE_C_STORAGE_VERSION,
               ...progress,
             })
         : undefined
       await tx
         .table<SettingsRow, string>('settings')
         .delete(BROWSER_WORKSPACE_CURRENT_COMPLETION_KEY)
+      await tx
+        .table<SettingsRow, string>('settings')
+        .delete(BROWSER_WORKSPACE_PREVIOUS_COMPLETION_KEY)
       const result = await migration.migrateWaveAStorageEpochRowsV94(tx, {
         observedAt: Date.now(),
         recordObsoleteBytes: (byteLength) => accumulateStorageCompactionDebt(tx, byteLength),
@@ -1716,13 +1880,18 @@ export async function normalizeInactiveBrowserWorkspaceDatabase(
         ...(reportProgress ? { reportProgress } : {}),
       })
       await migration.finalizeWaveAStorageEpochRowsV94(tx, result, reportProgress)
-      await tx
-        .table<SettingsRow, string>('settings')
-        .put(browserWorkspaceCurrentCompletionSettingV97())
+      await folderMigration.migrateSidebarFolderPresentationV98(
+        {
+          aggregates: tx.table<unknown, string>('chatSidebarAggregates'),
+          folders: tx.table<ChatFolder, string>('folders'),
+          settings: tx.table<SettingsRow, string>('settings'),
+        },
+        reportProgress,
+      )
     })
     verifyBrowserWorkspaceSchema(db, registeredSchema)
     const completion = await db.settings.get(BROWSER_WORKSPACE_CURRENT_COMPLETION_KEY)
-    if (!isBrowserWorkspaceCurrentCompletionValueV97(completion?.value)) {
+    if (!isBrowserWorkspaceCurrentCompletionValueV98(completion?.value)) {
       throw new BrowserWorkspaceSchemaIntegrityError('current-completion')
     }
   } finally {

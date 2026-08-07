@@ -131,7 +131,7 @@ export const PHYSICAL_STORAGE_POLICY = Object.freeze({
     'derived',
     'copy',
     'rebuild',
-    ['sidebar'],
+    ['sidebar', 'folder'],
     ['sidebar'],
   ),
   chatSidebarRows: policy('repairable', 'derived', 'copy', 'rebuild', ['sidebar']),

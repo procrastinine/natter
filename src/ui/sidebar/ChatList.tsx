@@ -34,6 +34,7 @@ import {
   SIDEBAR_SORT_OPTIONS,
   type SidebarSortMode,
   sidebarSortOption,
+  sidebarTitleSortKey,
 } from '../../core/sidebar-sort'
 import type { ChatFolder, ChatId, ChatSidebarRow, ChatTag, FolderId } from '../../core/types'
 import {
@@ -48,6 +49,7 @@ import {
   type SearchResult,
   useCatalogTab,
   useChatCatalogSearch,
+  useOrganizationCatalogApplication,
   useSidebarCatalogApplication,
 } from '../../hooks/useCatalogApplication'
 import { useConfigurationPreferences } from '../../hooks/useConfigurationPreferences'
@@ -97,6 +99,10 @@ interface ChatListProps {
 
 const SIDEBAR_VIRTUALIZE_THRESHOLD = 200
 const SIDEBAR_INITIAL_VIRTUAL_ROWS = 18
+
+function compareCatalogText(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0
+}
 
 type SidebarRowDepth = 'root' | 'folder'
 
@@ -334,6 +340,10 @@ export const ChatList = memo(function ChatList({
   const [excludeFolderIds, setExcludeFolderIds] = useState<FolderId[]>([])
   const [includeTagIds, setIncludeTagIds] = useState<string[]>([])
   const [excludeTagIds, setExcludeTagIds] = useState<string[]>([])
+  const organizationCatalog = useOrganizationCatalogApplication({
+    foldersDemanded: searchFoldersOpen,
+    tagsDemanded: searchTagsOpen,
+  })
   const recentMoveTimerRef = useRef<number | null>(null)
   const sortMenuRef = useRef<HTMLDivElement | null>(null)
   const sidebarOrganizerRef = useRef<HTMLDivElement | null>(null)
@@ -345,10 +355,40 @@ export const ChatList = memo(function ChatList({
   const archiveInteraction = usePresentationInteraction(sidebarArchiveInteraction)
   const runArchiveInteraction = archiveInteraction.run
   const activeSortOption = sidebarSortOption(sortMode)
-  const tagById = useMemo(() => new Map(model.tags.map((tag) => [tag.id, tag])), [model.tags])
+  const searchFolderOptions = useMemo(
+    () =>
+      [
+        ...new Map(
+          [...model.folders, ...organizationCatalog.folders.rows].map((row) => [row.id, row]),
+        ).values(),
+      ].sort(
+        (left, right) =>
+          left.sortIndex - right.sortIndex ||
+          compareCatalogText(sidebarTitleSortKey(left.name), sidebarTitleSortKey(right.name)) ||
+          compareCatalogText(left.id, right.id),
+      ),
+    [model.folders, organizationCatalog.folders.rows],
+  )
+  const searchTagOptions = useMemo(
+    () =>
+      [
+        ...new Map(
+          [...model.tags, ...organizationCatalog.tags.rows].map((row) => [row.id, row]),
+        ).values(),
+      ].sort(
+        (left, right) =>
+          compareCatalogText(left.nameLower, right.nameLower) ||
+          compareCatalogText(left.id, right.id),
+      ),
+    [model.tags, organizationCatalog.tags.rows],
+  )
+  const tagById = useMemo(
+    () => new Map(searchTagOptions.map((tag) => [tag.id, tag])),
+    [searchTagOptions],
+  )
   const folderById = useMemo(
-    () => new Map(model.folders.map((folder) => [folder.id, folder])),
-    [model.folders],
+    () => new Map(searchFolderOptions.map((folder) => [folder.id, folder])),
+    [searchFolderOptions],
   )
   const searchFilters = useMemo<SearchFilters>(
     () => ({
@@ -447,7 +487,8 @@ export const ChatList = memo(function ChatList({
       return assertNever(row)
     })
   }, [model.presentationRows, searchActive, searchSession?.status, sortedSearchResults, tab])
-  const exactSidebarRowCount = searchActive ? virtualRows.length : model.exactTotalRows
+  const loadedSidebarRowCount = searchActive ? virtualRows.length : model.loadedTotalRows
+  const knownSidebarChatCount = searchActive ? virtualRows.length : model.exactVisibleChats
   const visibleVirtualRows = virtualRows
   useLayoutEffect(() => {
     availableSidebarRowsRef.current = visibleVirtualRows
@@ -456,8 +497,9 @@ export const ChatList = memo(function ChatList({
       (searchSession?.status === 'debouncing' || searchSession?.status === 'scanning')
   }, [searchActive, searchSession?.status, visibleVirtualRows])
   const previousVirtualRowsRef = useRef(virtualRows)
-  const hiddenSidebarRowCount = Math.max(0, exactSidebarRowCount - visibleVirtualRows.length)
-  const shouldVirtualizeSidebar = exactSidebarRowCount > SIDEBAR_VIRTUALIZE_THRESHOLD
+  const sidebarHasMore = !searchActive && model.hasMore
+  const shouldVirtualizeSidebar =
+    Math.max(loadedSidebarRowCount, knownSidebarChatCount) > SIDEBAR_VIRTUALIZE_THRESHOLD
   const sidebarVirtualizer = useVirtualizer<HTMLUListElement, HTMLLIElement>({
     count: visibleVirtualRows.length,
     getScrollElement: () => sidebarListRef.current,
@@ -525,8 +567,9 @@ export const ChatList = memo(function ChatList({
     }
   })
   useEffect(() => {
+    void loadedSidebarRowCount
     if (!loadedPrefs || prefs.sidebarRenderWindowLoadMode !== 'auto') return
-    if (hiddenSidebarRowCount <= 0) return
+    if (!sidebarHasMore) return
     if (typeof IntersectionObserver === 'undefined') return
     const root = sidebarListRef.current
     const target = sidebarWindowLoadRef.current
@@ -539,7 +582,13 @@ export const ChatList = memo(function ChatList({
     )
     observer.observe(target)
     return () => observer.disconnect()
-  }, [hiddenSidebarRowCount, loadedPrefs, loadMoreSidebarRows, prefs.sidebarRenderWindowLoadMode])
+  }, [
+    loadedPrefs,
+    loadedSidebarRowCount,
+    loadMoreSidebarRows,
+    prefs.sidebarRenderWindowLoadMode,
+    sidebarHasMore,
+  ])
   useEffect(() => {
     if (!openActionChatId) return
     if (visibleVirtualRows.some((row) => row.kind === 'chat' && row.chat.id === openActionChatId))
@@ -1112,13 +1161,13 @@ export const ChatList = memo(function ChatList({
   }
 
   const renderSidebarWindowLoad = () => {
-    if (hiddenSidebarRowCount <= 0) return null
+    if (!sidebarHasMore) return null
     return (
       <li ref={sidebarWindowLoadRef} data-ui="sidebar-window-load">
         <Button type="button" data-ui="load-more-sidebar" onClick={loadMoreSidebarRows}>
           Load more
         </Button>
-        <span>{hiddenSidebarRowCount} more</span>
+        <span>More available</span>
       </li>
     )
   }
@@ -1259,7 +1308,8 @@ export const ChatList = memo(function ChatList({
         data-virtualized="true"
         data-render-window-size={prefs.sidebarRenderWindowSize}
         data-rendered-count={visibleVirtualRows.length}
-        data-total-count={exactSidebarRowCount}
+        data-total-count={knownSidebarChatCount}
+        data-has-more={sidebarHasMore ? 'true' : undefined}
       >
         <li
           data-ui="sidebar-virtual-spacer"
@@ -1347,77 +1397,100 @@ export const ChatList = memo(function ChatList({
               <span>Archive</span>
             </label>
           </div>
-          {model.folders.length > 0 ? (
-            <section
-              data-ui="sidebar-search-filter-group"
-              data-open={searchFoldersOpen ? 'true' : undefined}
+          <section
+            data-ui="sidebar-search-filter-group"
+            data-open={searchFoldersOpen ? 'true' : undefined}
+          >
+            <Button
+              type="button"
+              data-ui="sidebar-search-filter-heading"
+              aria-expanded={searchFoldersOpen}
+              onClick={() => setSearchFoldersOpen((open) => !open)}
             >
-              <Button
-                type="button"
-                data-ui="sidebar-search-filter-heading"
-                aria-expanded={searchFoldersOpen}
-                onClick={() => setSearchFoldersOpen((open) => !open)}
-              >
-                <ChevronIcon size={12} rotate={searchFoldersOpen ? 90 : 0} />
-                <FolderIcon size={12} />
-                <span>Folders</span>
-                <span data-ui="sidebar-search-filter-count">{model.folders.length}</span>
-              </Button>
-              {searchFoldersOpen ? (
-                <div data-ui="sidebar-search-chip-row">
-                  {model.folders.map((folder) => (
-                    <Button
-                      key={folder.id}
-                      type="button"
-                      data-filter-state={filterState(folder.id, includeFolderIds, excludeFolderIds)}
-                      title={filterTitle(
-                        folder.name,
-                        includeFolderIds,
-                        excludeFolderIds,
-                        folder.id,
-                      )}
-                      onClick={() => toggleFolderFilter(folder.id)}
-                    >
-                      {folder.name}
-                    </Button>
-                  ))}
-                </div>
-              ) : null}
-            </section>
-          ) : null}
-          {model.tags.length > 0 ? (
-            <section
-              data-ui="sidebar-search-filter-group"
-              data-open={searchTagsOpen ? 'true' : undefined}
+              <ChevronIcon size={12} rotate={searchFoldersOpen ? 90 : 0} />
+              <FolderIcon size={12} />
+              <span>Folders</span>
+              <span data-ui="sidebar-search-filter-count">
+                {searchFolderOptions.length}
+                {organizationCatalog.folders.nextCursor ? '+' : ''}
+              </span>
+            </Button>
+            {searchFoldersOpen ? (
+              <div data-ui="sidebar-search-chip-row">
+                {searchFolderOptions.map((folder) => (
+                  <Button
+                    key={folder.id}
+                    type="button"
+                    data-filter-state={filterState(folder.id, includeFolderIds, excludeFolderIds)}
+                    title={filterTitle(folder.name, includeFolderIds, excludeFolderIds, folder.id)}
+                    onClick={() => toggleFolderFilter(folder.id)}
+                  >
+                    {folder.name}
+                  </Button>
+                ))}
+                {organizationCatalog.folders.nextCursor ? (
+                  <Button
+                    type="button"
+                    disabled={organizationCatalog.folders.loading}
+                    onClick={organizationCatalog.folders.loadMore}
+                  >
+                    Load more folders
+                  </Button>
+                ) : null}
+                {organizationCatalog.folders.loading && searchFolderOptions.length === 0 ? (
+                  <span>Loading folders…</span>
+                ) : null}
+                {organizationCatalog.folders.error ? <span>Could not load folders.</span> : null}
+              </div>
+            ) : null}
+          </section>
+          <section
+            data-ui="sidebar-search-filter-group"
+            data-open={searchTagsOpen ? 'true' : undefined}
+          >
+            <Button
+              type="button"
+              data-ui="sidebar-search-filter-heading"
+              aria-expanded={searchTagsOpen}
+              onClick={() => setSearchTagsOpen((open) => !open)}
             >
-              <Button
-                type="button"
-                data-ui="sidebar-search-filter-heading"
-                aria-expanded={searchTagsOpen}
-                onClick={() => setSearchTagsOpen((open) => !open)}
-              >
-                <ChevronIcon size={12} rotate={searchTagsOpen ? 90 : 0} />
-                <TagIcon size={12} />
-                <span>Tags</span>
-                <span data-ui="sidebar-search-filter-count">{model.tags.length}</span>
-              </Button>
-              {searchTagsOpen ? (
-                <div data-ui="sidebar-search-chip-row">
-                  {model.tags.map((tag) => (
-                    <Button
-                      key={tag.id}
-                      type="button"
-                      data-filter-state={filterState(tag.id, includeTagIds, excludeTagIds)}
-                      title={filterTitle(tag.name, includeTagIds, excludeTagIds, tag.id)}
-                      onClick={() => toggleTagFilter(tag.id)}
-                    >
-                      {tag.name}
-                    </Button>
-                  ))}
-                </div>
-              ) : null}
-            </section>
-          ) : null}
+              <ChevronIcon size={12} rotate={searchTagsOpen ? 90 : 0} />
+              <TagIcon size={12} />
+              <span>Tags</span>
+              <span data-ui="sidebar-search-filter-count">
+                {searchTagOptions.length}
+                {organizationCatalog.tags.nextCursor ? '+' : ''}
+              </span>
+            </Button>
+            {searchTagsOpen ? (
+              <div data-ui="sidebar-search-chip-row">
+                {searchTagOptions.map((tag) => (
+                  <Button
+                    key={tag.id}
+                    type="button"
+                    data-filter-state={filterState(tag.id, includeTagIds, excludeTagIds)}
+                    title={filterTitle(tag.name, includeTagIds, excludeTagIds, tag.id)}
+                    onClick={() => toggleTagFilter(tag.id)}
+                  >
+                    {tag.name}
+                  </Button>
+                ))}
+                {organizationCatalog.tags.nextCursor ? (
+                  <Button
+                    type="button"
+                    disabled={organizationCatalog.tags.loading}
+                    onClick={organizationCatalog.tags.loadMore}
+                  >
+                    Load more tags
+                  </Button>
+                ) : null}
+                {organizationCatalog.tags.loading && searchTagOptions.length === 0 ? (
+                  <span>Loading tags…</span>
+                ) : null}
+                {organizationCatalog.tags.error ? <span>Could not load tags.</span> : null}
+              </div>
+            ) : null}
+          </section>
         </div>
       ) : null}
     </>
@@ -1433,7 +1506,8 @@ export const ChatList = memo(function ChatList({
         data-search-mode={searchActive ? 'true' : undefined}
         data-render-window-size={prefs.sidebarRenderWindowSize}
         data-rendered-count={visibleVirtualRows.length}
-        data-total-count={exactSidebarRowCount}
+        data-total-count={knownSidebarChatCount}
+        data-has-more={sidebarHasMore ? 'true' : undefined}
       >
         {visibleVirtualRows.map(renderStaticSidebarRow)}
         {renderSidebarWindowLoad()}

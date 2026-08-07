@@ -188,32 +188,44 @@ async function captureGenerationPlanningSnapshot(
     throw new Error(`GenerationPlanningProfileMissing:${planningChat.settings.profileId}`)
   }
   const keyRefs = connectionDispatchKeyRefs(profile)
-  const keyRecords = await tx.table<KeyRecord, KeyId>('keys').bulkGet(keyRefs)
+  const modelId = planningChat.settings.model
+  if (!modelId) throw new Error(`GenerationPlanningModelMissing:${chatId}`)
+  const settingKeys = [
+    GLOBAL_TOKEN_CALIBRATION_KEY,
+    TOKEN_CALIBRATION_MODE_KEY,
+    CORS_PROXY_URL_KEY,
+    CORS_PROXY_SECRET_KEY,
+  ]
+  const textTemplateId = planningChat.settings.textTemplate
+  const [keyRecords, modelsRow, endpointsRow, privacyRow, settingRows, savedTextTemplate] =
+    await Dexie.Promise.all([
+      tx.table<KeyRecord, KeyId>('keys').bulkGet(keyRefs),
+      profile.kind === 'openrouter'
+        ? Dexie.Promise.resolve(undefined)
+        : readDiscoveryCacheRow(tx, 'models', [
+            profile.id,
+            modelsCacheKey(modelCatalogQueryForConnectionKind(profile.kind)),
+          ]),
+      profile.kind === 'openrouter'
+        ? readDiscoveryCacheRow(tx, 'endpoints', [profile.id, modelId])
+        : Dexie.Promise.resolve(undefined),
+      profile.kind === 'openrouter'
+        ? readDiscoveryCacheRow(tx, 'privacyPolicies', [profile.id, modelId])
+        : Dexie.Promise.resolve(undefined),
+      tx.table<SettingsRow, string>('settings').bulkGet(settingKeys),
+      textTemplateId && !isStaticTextTemplateId(textTemplateId)
+        ? tx.table<SavedTextTemplate, string>('textTemplates').get(textTemplateId)
+        : Dexie.Promise.resolve(undefined),
+    ])
   const preferredDispatchKeyId =
     intent.preferredDispatchKeyId !== null && keyRefs.includes(intent.preferredDispatchKeyId)
       ? intent.preferredDispatchKeyId
       : null
-  const modelId = planningChat.settings.model
-  if (!modelId) throw new Error(`GenerationPlanningModelMissing:${chatId}`)
   const discoveryRevision = configurationRequestRevisionFor(
     profile,
     profile.apiKeyRef ? keyRecords.find((record) => record?.id === profile.apiKeyRef) : undefined,
   )
   const discoveryRevisionKey = connectionDiscoveryRevisionKey(discoveryRevision)
-  const [modelsRow, endpointsRow, privacyRow] = await Dexie.Promise.all([
-    profile.kind === 'openrouter'
-      ? Dexie.Promise.resolve(undefined)
-      : readDiscoveryCacheRow(tx, 'models', [
-          profile.id,
-          modelsCacheKey(modelCatalogQueryForConnectionKind(profile.kind)),
-        ]),
-    profile.kind === 'openrouter'
-      ? readDiscoveryCacheRow(tx, 'endpoints', [profile.id, modelId])
-      : Dexie.Promise.resolve(undefined),
-    profile.kind === 'openrouter'
-      ? readDiscoveryCacheRow(tx, 'privacyPolicies', [profile.id, modelId])
-      : Dexie.Promise.resolve(undefined),
-  ])
   const modelsQueryKey = modelsCacheKey(modelCatalogQueryForConnectionKind(profile.kind))
   const modelRows =
     modelsRow?.profileRevision === discoveryRevisionKey
@@ -237,13 +249,6 @@ async function captureGenerationPlanningSnapshot(
     privacy:
       privacyRow?.profileRevision === discoveryRevisionKey ? structuredClone(privacyRow) : null,
   }
-  const settingKeys = [
-    GLOBAL_TOKEN_CALIBRATION_KEY,
-    TOKEN_CALIBRATION_MODE_KEY,
-    CORS_PROXY_URL_KEY,
-    CORS_PROXY_SECRET_KEY,
-  ]
-  const settingRows = await tx.table<SettingsRow, string>('settings').bulkGet(settingKeys)
   const settingsByKey = new Map(
     settingKeys.map((key, index) => [key, settingRows[index]?.value] as const),
   )
@@ -265,11 +270,6 @@ async function captureGenerationPlanningSnapshot(
   if (admissionDecision === 'zero-eligible') {
     throw new NoEligibleProvidersError()
   }
-  const textTemplateId = planningChat.settings.textTemplate
-  const savedTextTemplate =
-    textTemplateId && !isStaticTextTemplateId(textTemplateId)
-      ? await tx.table<SavedTextTemplate, string>('textTemplates').get(textTemplateId)
-      : undefined
   if (textTemplateId && !isStaticTextTemplateId(textTemplateId) && !savedTextTemplate) {
     throw new Error(`GenerationPlanningTemplateMissing:${textTemplateId}`)
   }

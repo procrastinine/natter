@@ -588,6 +588,8 @@ export const TEMPORAL_SEMANTIC_GROUPS = Object.freeze([
     ),
     {
       schedulers: [
+        'src/hooks/useConversationFrame.ts|useConversationTranscriptDemand|requestAnimationFrame||1',
+        'src/hooks/useConversationFrame.ts|firstFrame|requestAnimationFrame||1',
         'src/ui/chat/BranchTreeInspector.tsx|scheduleRangeRefresh|requestAnimationFrame||1',
         'src/ui/chat/BranchTreeInspector.tsx|scheduleRangeRefresh|queueMicrotask||1',
         'src/ui/chat/BranchTreeView.tsx|scheduleViewportRead|requestAnimationFrame||1',
@@ -817,6 +819,7 @@ export const TEMPORAL_SEMANTIC_GROUPS = Object.freeze([
     ),
     {
       retryLoops: [
+        'src/backcompat/sidebar-folder-presentation-v98.ts|migrateSidebarFolderPresentationV98|ForStatement|unbounded|1',
         'src/store/browser-import-export.ts|tablePages|ForStatement|unbounded|1',
         'src/store/browser-catalog-command-runtime.ts|clearCalibrationEverywhereTransaction|ForStatement|unbounded|1',
         'src/store/browser-configuration-domain.ts|readConfigurationTargetFanoutLinks|ForStatement|unbounded|1',
@@ -829,6 +832,7 @@ export const TEMPORAL_SEMANTIC_GROUPS = Object.freeze([
         'src/store/browser-workspace-startup-repair.ts|copyCanonicalBrowserWorkspaceRows|ForStatement|unbounded|1',
         'src/store/chat-search.ts|iterateSearchSidebarPages|ForStatement|unbounded|1',
         'src/store/chat-sidebar-projection.ts|rebuildChatSidebarProjectionRowsInTransaction|ForStatement|unbounded|1',
+        'src/store/chat-sidebar-projection.ts|rebuildChatSidebarProjectionRowsInTransaction|ForStatement|unbounded|2',
         'src/store/chat-storage-ownership.ts|deleteKnownChatClosure|ForStatement|unbounded|1',
         'src/store/message-corpus-search.ts|search|ForStatement|unbounded|1',
         'src/store/preset-order.ts|rebuildPresetOrderMembership|ForStatement|unbounded|1',
@@ -929,19 +933,19 @@ export const TEMPORAL_READINESS_PROOFS = Object.freeze([
       ),
       evidence(
         'src/store/browser-workspace-lifecycle.ts',
-        'attempt.selection = await prepareBrowserWorkspaceDatabaseSelection(\n      attempt.authority,\n      options.onProgress,\n    )',
+        "attempt.selection = await runBrowserWorkspaceOpenStage('database-selection', () =>\n      prepareBrowserWorkspaceDatabaseSelection(\n        attempt.authority,\n        options.onProgress,\n        options.onBlocked,\n      ),\n    )",
       ),
       evidence(
         'src/store/browser-workspace-lifecycle.ts',
-        'const workspace = await bootstrapBrowserWorkspace(',
+        "const workspace = await runBrowserWorkspaceOpenStage('database-bootstrap', () =>\n      bootstrapBrowserWorkspace(attempt.authority, options),\n    )",
       ),
       evidence(
         'src/store/browser-workspace-lifecycle.ts',
-        'await resumeWorkspaceRuntimeResources(authority)',
+        "await runBrowserWorkspaceOpenStage('runtime-resources-resume', () =>\n      resumeWorkspaceRuntimeResources(authority),\n    )",
       ),
       evidence(
         'src/store/browser-workspace-lifecycle.ts',
-        'await finishWorkspaceRuntimeReconciliation(workspace)',
+        "await runBrowserWorkspaceOpenStage('runtime-reconciliation-finish', () =>\n      finishWorkspaceRuntimeReconciliation(workspace),\n    )",
       ),
       evidence(
         'src/store/workspace-runtime-control.ts',

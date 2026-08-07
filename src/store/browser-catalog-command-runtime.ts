@@ -7,7 +7,6 @@ import {
 } from '../core/chat-metadata'
 import { fixedConversationSelectionTarget } from '../core/messages'
 import { tokenCalibrationKeyForStoredRecordKey } from '../core/model-ids'
-import { compareChatFolders } from '../core/sidebar-sort'
 import {
   aggregateCalibrationSamples,
   clearAllCalibrationFromGlobalRecord,
@@ -52,7 +51,12 @@ import {
 } from './chat-row-transition'
 import {
   CHAT_SIDEBAR_FOLDER_EXTREMA_READ_REQUEST_LIMIT,
+  type ChatSidebarAggregateProjectionRow,
   type ChatSidebarProjectionRow,
+  chatSidebarFolderNameKey,
+  deleteChatSidebarFolderProjection,
+  isValidChatSidebarFolderAggregateRow,
+  putChatSidebarFolderProjection,
 } from './chat-sidebar-projection'
 import { readArchivedChatIdPage } from './chat-storage-codec'
 import {
@@ -415,7 +419,7 @@ const CHAT_EMPTY_ARCHIVE_OPERATION = semanticOperationDescriptor({
   replay: semanticOperationCallerSingleAttemptReplayContract('unfenced-relative-update'),
 })
 
-const FOLDER_TRANSACTION_CAPABILITY = physicalStorageTables('folders')
+const FOLDER_TRANSACTION_CAPABILITY = physicalStorageTables('folders', 'chatSidebarAggregates')
 
 interface FolderRowResourceInput {
   readonly folderId: FolderId
@@ -454,14 +458,14 @@ function folderRowExactPlan(
     replay: { kind: 'single-attempt', reason },
     bounds: {
       reads: {
-        maxRequests: 1,
-        maxRows: 1,
+        maxRequests: 2,
+        maxRows: 2,
         maxBatchRows: 1,
         maxBytes: Number.MAX_SAFE_INTEGER,
       },
       writes: {
-        maxRequests: 1,
-        maxRows: 1,
+        maxRequests: 2,
+        maxRows: 2,
         maxBatchRows: 1,
         maxBytes: Number.MAX_SAFE_INTEGER,
       },
@@ -478,7 +482,10 @@ const FOLDER_CREATE_OPERATION = semanticOperationDescriptor({
   resources: folderRowResourceNames,
   permittedWrites: FOLDER_TRANSACTION_CAPABILITY.tableNames,
   requiredWritesWhenMutated: ['folders'],
-  ...semanticOperationExactReceiptContracts<FolderRowResourceInput, 'folders'>(),
+  ...semanticOperationExactReceiptContracts<
+    FolderRowResourceInput,
+    'folders' | 'chatSidebarAggregates'
+  >(),
   replay: semanticOperationCallerSingleAttemptReplayContract('random-identity'),
 })
 
@@ -488,7 +495,10 @@ const FOLDER_UPDATE_OPERATION = semanticOperationDescriptor({
   resources: folderRowResourceNames,
   permittedWrites: FOLDER_TRANSACTION_CAPABILITY.tableNames,
   requiredWritesWhenMutated: ['folders'],
-  ...semanticOperationExactReceiptContracts<FolderRowResourceInput, 'folders'>(),
+  ...semanticOperationExactReceiptContracts<
+    FolderRowResourceInput,
+    'folders' | 'chatSidebarAggregates'
+  >(),
   replay: semanticOperationCallerSingleAttemptReplayContract('unfenced-relative-update'),
 })
 
@@ -560,7 +570,7 @@ function normalizeName(value: string, kind: 'Folder' | 'Tag'): string {
 }
 
 function organizationNameKey(value: string): string {
-  return value.trim().normalize('NFKC').toLowerCase()
+  return chatSidebarFolderNameKey(value)
 }
 
 function patchOptionalString<T extends object>(
@@ -1724,10 +1734,13 @@ export async function emptyArchivedChatRows(
 }
 
 function folderRowExactReceipt(
-  tx: FencedTransaction<'folders'>,
+  tx: FencedTransaction<'folders' | 'chatSidebarAggregates'>,
   plan: SemanticOperationExactPlan,
-): SemanticOperationExactReceipt<'folders'> {
-  const accumulator = boundSemanticOperationExactReceiptAccumulator<'folders'>(tx)
+  projectionRead: boolean,
+): SemanticOperationExactReceipt<'folders' | 'chatSidebarAggregates'> {
+  const accumulator = boundSemanticOperationExactReceiptAccumulator<
+    'folders' | 'chatSidebarAggregates'
+  >(tx)
   if (!accumulator) throw new Error('FolderRowExactReceiptAccumulatorMissing')
   const fragment = accumulator.snapshotFragment()
   return semanticOperationExactReceipt(plan, {
@@ -1742,6 +1755,17 @@ function folderRowExactReceipt(
         requestCount: 1,
         rowCount: 1,
       },
+      ...(projectionRead
+        ? [
+            {
+              tableName: 'chatSidebarAggregates' as const,
+              indexKind: 'primary' as const,
+              operation: 'get' as const,
+              requestCount: 1,
+              rowCount: 1,
+            },
+          ]
+        : []),
     ],
   })
 }
@@ -1765,8 +1789,13 @@ export async function createFolder(
     { folderId: folder.id },
     async (tx) => {
       const table = tx.table<ChatFolder, FolderId>('folders')
-      await putChatFolderByteOwner(tx, folder, await table.get(folder.id))
-      return semanticOperationExecution(folder, folderRowExactReceipt(tx, FOLDER_CREATE_EXACT_PLAN))
+      const previous = await table.get(folder.id)
+      await putChatFolderByteOwner(tx, folder, previous)
+      await putChatSidebarFolderProjection(tx, folder, previous)
+      return semanticOperationExecution(
+        folder,
+        folderRowExactReceipt(tx, FOLDER_CREATE_EXACT_PLAN, true),
+      )
     },
   )
 }
@@ -1783,7 +1812,7 @@ export async function updateFolder(
     if (!current) {
       return semanticOperationExecution(
         undefined,
-        folderRowExactReceipt(tx, FOLDER_UPDATE_EXACT_PLAN),
+        folderRowExactReceipt(tx, FOLDER_UPDATE_EXACT_PLAN, false),
       )
     }
     const next = { ...current }
@@ -1796,12 +1825,16 @@ export async function updateFolder(
     if (stableStringify(current) === stableStringify(next)) {
       return semanticOperationExecution(
         current,
-        folderRowExactReceipt(tx, FOLDER_UPDATE_EXACT_PLAN),
+        folderRowExactReceipt(tx, FOLDER_UPDATE_EXACT_PLAN, false),
       )
     }
     next.updatedAt = now
     await putChatFolderByteOwner(tx, next, current)
-    return semanticOperationExecution(next, folderRowExactReceipt(tx, FOLDER_UPDATE_EXACT_PLAN))
+    await putChatSidebarFolderProjection(tx, next, current)
+    return semanticOperationExecution(
+      next,
+      folderRowExactReceipt(tx, FOLDER_UPDATE_EXACT_PLAN, true),
+    )
   })
 }
 
@@ -1819,11 +1852,16 @@ export async function ensureFolderAndMoveChats(
     { folderId: createdFolderId, nameKey, chatIds: uniqueChatIds },
     async (tx) => {
       const folders = tx.table<ChatFolder, FolderId>('folders')
-      let matched: ChatFolder | undefined
-      await folders.each((candidate) => {
-        if (organizationNameKey(candidate.name) !== nameKey) return
-        if (!matched || compareChatFolders(candidate, matched) < 0) matched = candidate
-      })
+      const projected = await tx
+        .table<ChatSidebarAggregateProjectionRow, string>('chatSidebarAggregates')
+        .where('[folderNameKey+folderSortIndex+folderTitleSortKey+folderKey]')
+        .between([nameKey], [nameKey, []], true, false)
+        .first()
+      if (projected !== undefined && !isValidChatSidebarFolderAggregateRow(projected)) {
+        throw new Error('ChatSidebarFolderAggregateInvalid')
+      }
+      const matched = projected ? await folders.get(projected.folder.id) : undefined
+      if (projected && !matched) throw new Error('ChatSidebarFolderProjectionOrphaned')
       if (!matched && (await folders.get(createdFolderId))) {
         throw new Error(`FolderIdAlreadyExists:${createdFolderId}`)
       }
@@ -1833,9 +1871,14 @@ export async function ensureFolderAndMoveChats(
         sortIndex: input.sortIndex ?? now,
         createdAt: now,
         updatedAt: now,
+        lastUsedAt: now,
         ...(input.color ? { color: input.color } : {}),
       }
       const created = matched === undefined
+      if (created) {
+        await putChatFolderByteOwner(tx, folder, undefined)
+        await putChatSidebarFolderProjection(tx, folder)
+      }
       const chatMutation = openPreservingChatMutation(tx)
       const rows = await chatMutation.readMany(uniqueChatIds)
       const changes: EnsureFolderAndMoveChatsResult['changes'] = []
@@ -1867,7 +1910,10 @@ export async function ensureFolderAndMoveChats(
         updatedAt: Math.max(folder.updatedAt, now),
       }
       if (created || stableStringify(folder) !== stableStringify(touchedFolder)) {
-        await putChatFolderByteOwner(tx, touchedFolder, matched)
+        if (!created) {
+          await putChatFolderByteOwner(tx, touchedFolder, matched)
+          await putChatSidebarFolderProjection(tx, touchedFolder, matched)
+        }
         folder = touchedFolder
       }
       return semanticOperationExecution(
@@ -1905,7 +1951,6 @@ export async function deleteFolder(
     const chatMutation = openLinkedChatMutation(tx)
     const rows = [...(await chatMutation.readFolder(folderId))]
     rows.sort((left, right) => left.id.localeCompare(right.id))
-    await deleteChatFolderByteOwner(tx, folder)
     const changedChats: Chat[] = []
     const changes: DeleteFolderResult['changes'] = []
     const updatedAtClock = new TransactionChatUpdateClock()
@@ -1938,6 +1983,8 @@ export async function deleteFolder(
       }
     }
     await chatMutation.commit()
+    await deleteChatSidebarFolderProjection(tx, folder)
+    await deleteChatFolderByteOwner(tx, folder)
     return complete({
       deleted: true,
       affectedChatIds: changedChats.map((chat) => chat.id),

@@ -820,6 +820,7 @@ export function Shell() {
   }, [prefs.baseFontSize])
 
   useEffect(() => {
+    if (workspaceRuntimeState !== 'RUNNING') return
     let active = true
     let cleanup = () => {}
     const controller = new AbortController()
@@ -837,7 +838,7 @@ export function Shell() {
       controller.abort()
       cleanup()
     }
-  }, [])
+  }, [workspaceRuntimeState])
 
   // Persist the panel's open/closed state across route transitions —
   // in particular, navigating to /new or between chats shouldn't auto-
@@ -889,14 +890,31 @@ export function Shell() {
       })
       let admissionReported = false
       let claimReported = false
-      const reportClaimed = (claimId: number) => {
-        if (claimReported) return
-        claimReported = true
+      const diagnosticStartedAt = performance.now()
+      let diagnosticPreviousAt = diagnosticStartedAt
+      const reportPhase = (
+        claimId: number,
+        phase: Parameters<typeof reportGenerationSubmissionPhase>[0]['phase'],
+        detail: Pick<
+          Parameters<typeof reportGenerationSubmissionPhase>[0],
+          'owner' | 'outcome'
+        > = {},
+      ) => {
+        const now = performance.now()
         reportGenerationSubmissionPhase({
           claimId,
           target: diagnosticTarget,
-          phase: 'claimed',
+          phase,
+          ...detail,
+          elapsedMs: now - diagnosticStartedAt,
+          phaseElapsedMs: now - diagnosticPreviousAt,
         })
+        diagnosticPreviousAt = now
+      }
+      const reportClaimed = (claimId: number) => {
+        if (claimReported) return
+        claimReported = true
+        reportPhase(claimId, 'claimed')
       }
       const claim = runGenerationSubmit({
         target,
@@ -905,28 +923,13 @@ export function Shell() {
           await action({
             signal,
             observer: Object.freeze({
-              pending: (owner) =>
-                reportGenerationSubmissionPhase({
-                  claimId: id,
-                  target: diagnosticTarget,
-                  phase: 'waiting',
-                  owner,
-                }),
-              phase: (phase) =>
-                reportGenerationSubmissionPhase({
-                  claimId: id,
-                  target: diagnosticTarget,
-                  phase,
-                }),
+              pending: (owner) => reportPhase(id, 'waiting', { owner }),
+              phase: (phase) => reportPhase(id, phase),
             } satisfies GenerationPreparationObserver),
           })
           if (!admissionReported) {
             admissionReported = true
-            reportGenerationSubmissionPhase({
-              claimId: id,
-              target: diagnosticTarget,
-              phase: 'admitted',
-            })
+            reportPhase(id, 'admitted')
           }
           resolveAdmission()
         },
@@ -934,11 +937,7 @@ export function Shell() {
       reportClaimed(claim.id)
       const cancelClaim = () => {
         if (generationSubmissionClaimsRef.current.get(target)?.id !== claim.id) return
-        reportGenerationSubmissionPhase({
-          claimId: claim.id,
-          target: diagnosticTarget,
-          phase: 'cancelling',
-        })
+        reportPhase(claim.id, 'cancelling')
         claim.cancel()
       }
       generationSubmissionClaimsRef.current.set(
@@ -950,12 +949,7 @@ export function Shell() {
         if (generationSubmissionClaimsRef.current.get(target)?.id === claim.id) {
           generationSubmissionClaimsRef.current.delete(target)
         }
-        reportGenerationSubmissionPhase({
-          claimId: claim.id,
-          target: diagnosticTarget,
-          phase: 'settled',
-          outcome: outcome.kind,
-        })
+        reportPhase(claim.id, 'settled', { outcome: outcome.kind })
         switch (outcome.kind) {
           case 'succeeded':
             return Object.freeze({ kind: 'prepared' })
@@ -1590,12 +1584,18 @@ export function Shell() {
                   ? 'Expand sidebar'
                   : 'Collapse sidebar'
             }
-            onClick={() => {
+            onClick={(event) => {
               if (isNarrowScreen) {
                 setMobileSidebarOpen(false)
                 return
               }
-              updateSidebarCollapsed(!sidebarCollapsed)
+              const nextCollapsed = !sidebarCollapsed
+              const shell = event.currentTarget.closest<HTMLElement>('[data-ui="app-shell"]')
+              shell?.setAttribute('data-sidebar', nextCollapsed ? 'collapsed' : 'expanded')
+              shell
+                ?.querySelector<HTMLElement>('[data-ui="sidebar"]')
+                ?.setAttribute('data-collapsed', String(nextCollapsed))
+              updateSidebarCollapsed(nextCollapsed)
             }}
           >
             <ChevronIcon size={16} rotate={effectiveSidebarCollapsed ? 0 : 180} />

@@ -149,6 +149,8 @@ interface SearchChatsInput {
 interface SearchCatalog {
   foldersById: Map<FolderId, ChatFolder>
   tagsById: Map<TagId, ChatTag>
+  resolvedFolderIds: Set<FolderId>
+  resolvedTagIds: Set<TagId>
   folderIdsByName: Map<string, Set<FolderId>>
   tagIdsByName: Map<string, Set<TagId>>
 }
@@ -401,11 +403,7 @@ export async function searchChats(input: SearchChatsInput): Promise<ChatSearchOu
     filters.archived,
     signal,
   )[Symbol.asyncIterator]()
-  const [firstPage, folders, tags] = await Promise.all([
-    pageIterator.next(),
-    queryWorkspace(repo, authority, { kind: 'folder.list' }, signal),
-    queryWorkspace(repo, authority, { kind: 'tag.list' }, signal),
-  ]).catch((error: unknown) => {
+  const firstPage = await pageIterator.next().catch((error: unknown) => {
     linkedAbort.controller.abort()
     linkedAbort.dispose()
     throw error
@@ -416,7 +414,7 @@ export async function searchChats(input: SearchChatsInput): Promise<ChatSearchOu
     throw new ChatSearchAbortedError()
   }
 
-  const catalog = buildCatalog(folders, tags)
+  const catalog = buildCatalog([], [])
   const context: ScanContext = {
     queryId: input.queryId,
     parsed: parseResult.query,
@@ -486,6 +484,7 @@ export async function searchChats(input: SearchChatsInput): Promise<ChatSearchOu
       throwIfAborted(signal)
       const nextPage = observeSearchSidebarPageRead(pageIterator.next())
       const page = pageResult.value
+      await hydrateSearchCatalogForRows(context, page.rows)
       const candidates = page.rows.filter((chat) => chatPassesStaticFilters(chat, context))
       candidateCount += candidates.length
       const candidateChatIds = candidates.map((chat) => chat.id)
@@ -1031,6 +1030,59 @@ function queryWorkspace<Q extends WorkspaceQuery>(
     .then((envelope) => envelope.value)
 }
 
+async function hydrateSearchCatalogForRows(
+  context: ScanContext,
+  rows: readonly ChatSidebarRow[],
+): Promise<void> {
+  const folderIds = [
+    ...new Set(
+      rows.flatMap((chat) =>
+        chat.folderId && !context.catalog.resolvedFolderIds.has(chat.folderId)
+          ? [chat.folderId]
+          : [],
+      ),
+    ),
+  ]
+  const tagIds = [
+    ...new Set(
+      rows.flatMap((chat) =>
+        chat.tags.filter((tagId) => !context.catalog.resolvedTagIds.has(tagId)),
+      ),
+    ),
+  ]
+  if (folderIds.length === 0 && tagIds.length === 0) return
+  const [folders, tags] = await Promise.all([
+    folderIds.length > 0
+      ? queryWorkspace(
+          context.repo,
+          context.authority,
+          { kind: 'folder.get-many', folderIds },
+          context.signal,
+        )
+      : Promise.resolve([]),
+    tagIds.length > 0
+      ? queryWorkspace(
+          context.repo,
+          context.authority,
+          { kind: 'tag.get-many', tagIds },
+          context.signal,
+        )
+      : Promise.resolve([]),
+  ])
+  for (const folderId of folderIds) context.catalog.resolvedFolderIds.add(folderId)
+  for (const tagId of tagIds) context.catalog.resolvedTagIds.add(tagId)
+  for (const folder of folders) {
+    if (!folder) continue
+    context.catalog.foldersById.set(folder.id, folder)
+    addNameIndex(context.catalog.folderIdsByName, folder.name, folder.id)
+  }
+  for (const tag of tags) {
+    if (!tag) continue
+    context.catalog.tagsById.set(tag.id, tag)
+    addNameIndex(context.catalog.tagIdsByName, tag.name, tag.id)
+  }
+}
+
 function buildCatalog(folders: readonly ChatFolder[], tags: readonly ChatTag[]): SearchCatalog {
   const folderIdsByName = new Map<string, Set<FolderId>>()
   const tagIdsByName = new Map<string, Set<TagId>>()
@@ -1039,6 +1091,8 @@ function buildCatalog(folders: readonly ChatFolder[], tags: readonly ChatTag[]):
   return {
     foldersById: new Map(folders.map((folder) => [folder.id, folder])),
     tagsById: new Map(tags.map((tag) => [tag.id, tag])),
+    resolvedFolderIds: new Set(folders.map((folder) => folder.id)),
+    resolvedTagIds: new Set(tags.map((tag) => tag.id)),
     folderIdsByName,
     tagIdsByName,
   }

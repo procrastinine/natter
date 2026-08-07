@@ -28,7 +28,26 @@ export function useConversationTranscriptDemand(
 ): void {
   const owner = useRef({})
   useEffect(() => {
-    controller.setTranscriptDemand(owner.current, demand)
+    if (
+      demand === null ||
+      typeof requestAnimationFrame === 'undefined' ||
+      document.visibilityState !== 'visible'
+    ) {
+      controller.setTranscriptDemand(owner.current, demand)
+      return
+    }
+    let firstFrame: number | null = requestAnimationFrame(() => {
+      firstFrame = null
+      secondFrame = requestAnimationFrame(() => {
+        secondFrame = null
+        controller.setTranscriptDemand(owner.current, demand)
+      })
+    })
+    let secondFrame: number | null = null
+    return () => {
+      if (firstFrame !== null) cancelAnimationFrame(firstFrame)
+      if (secondFrame !== null) cancelAnimationFrame(secondFrame)
+    }
   }, [controller, demand])
   useEffect(() => () => controller.setTranscriptDemand(owner.current, null), [controller])
 }

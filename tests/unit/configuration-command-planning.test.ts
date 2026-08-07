@@ -738,7 +738,6 @@ describe('planned configuration commands', () => {
   it('changes a linked chat profile in one exact atom and makes replay a no-op', async () => {
     await putTestChats([
       chat({
-        folderId: 'folder-a',
         settings: {
           ...cloneDefaultChatSettings(),
           profileId: 'profile-a',
@@ -746,7 +745,6 @@ describe('planned configuration commands', () => {
       }),
       chat({
         id: 'chat-b',
-        folderId: 'folder-a',
         updatedAt: 5,
       }),
     ])

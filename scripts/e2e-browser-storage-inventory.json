@@ -26,6 +26,30 @@
       }
     },
     {
+      "purpose": "read-only-assertion",
+      "mutationScope": {
+        "kind": "none",
+        "targets": []
+      },
+      "cleanupRestoreObligation": "Read only the tiny fresh-workspace fixture, close the exact raw database handle, and leave its durable rows and schema unchanged.",
+      "publicUiCannotExpress": "The physical-version startup proof must reproduce the current populate rows before reopening the same isolated database at an older schema; the public UI does not expose those storage rows.",
+      "siteIds": [
+        "tests/e2e/startup-recovery.spec.ts::owner=function%3AreadDatabaseRows::operation=indexeddb.factory.open::mode=-::store=-::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=function%3AreadDatabaseRows::operation=indexeddb.database.enumerate-stores::mode=-::store=%3Cdatabase%3E::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=function%3AreadDatabaseRows::operation=indexeddb.database.transaction::mode=readonly::store=%3Cdynamic%3E::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=function%3AreadDatabaseRows::operation=indexeddb.getAll::mode=readonly::store=%3Cdynamic%3E::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=function%3AreadDatabaseRows::operation=indexeddb.transaction.object-store::mode=readonly::store=%3Cdynamic%3E::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=function%3AreadDatabaseRows::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+      ],
+      "cleanupEvidence": {
+        "siteIds": [
+          "tests/e2e/startup-recovery.spec.ts::owner=function%3AreadDatabaseRows::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+        ],
+        "fixtureOwners": [],
+        "processOwned": false
+      }
+    },
+    {
       "purpose": "fault-injection",
       "mutationScope": {
         "kind": "origin-storage",
@@ -68,27 +92,91 @@
       "mutationScope": {
         "kind": "database-schema",
         "targets": [
-          "one isolated active workspace database at the observed v94 schema",
-          "one settings sentinel row"
+          "one isolated active workspace database recreated at the valid v97 physical schema",
+          "fresh-workspace rows, the exact v97 completion proof, and 300 folder rows"
         ]
       },
-      "cleanupRestoreObligation": "Close both raw database handles and let afterEach delete the isolated physical workspace after the upgrade assertions.",
-      "publicUiCannotExpress": "The browser journey must construct an exact observed intermediate physical schema and sentinel row before current code opens and upgrades it.",
+      "cleanupRestoreObligation": "Close every raw database handle and auxiliary page, then let afterEach delete the isolated physical workspace after all six tabs converge.",
+      "publicUiCannotExpress": "Proving a valid predecessor takes only the registered in-place upgrade requires recreating its exact physical schema and completion proof before six real tabs start together.",
       "siteIds": [
-        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines%3Ecallback%3Aonupgradeneeded::operation=indexeddb.createIndex::mode=versionchange::store=%3Cdynamic%3E%40index%3A%3Cdynamic%3E::occurrence=1",
-        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines%3Ecallback%3Aonupgradeneeded::operation=indexeddb.database.create-object-store::mode=versionchange::store=%3Cdynamic%3E::occurrence=1",
-        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=indexeddb.database.close::mode=-::store=-::occurrence=1",
-        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=indexeddb.database.close::mode=-::store=-::occurrence=2",
-        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=indexeddb.database.transaction::mode=readonly::store=settings::occurrence=1",
-        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=indexeddb.database.transaction::mode=readwrite::store=settings::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Amany%20reloading%20tabs%20elect%20one%20bounded%20registered%20upgrade%20for%20a%20valid%20v97%20workspace::operation=indexeddb.factory.delete-database::mode=-::store=-::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Amany%20reloading%20tabs%20elect%20one%20bounded%20registered%20upgrade%20for%20a%20valid%20v97%20workspace::operation=indexeddb.factory.open::mode=-::store=-::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Amany%20reloading%20tabs%20elect%20one%20bounded%20registered%20upgrade%20for%20a%20valid%20v97%20workspace%3Ecallback%3Aonupgradeneeded::operation=indexeddb.database.create-object-store::mode=versionchange::store=%3Cdynamic%3E::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Amany%20reloading%20tabs%20elect%20one%20bounded%20registered%20upgrade%20for%20a%20valid%20v97%20workspace%3Ecallback%3Aonupgradeneeded::operation=indexeddb.createIndex::mode=versionchange::store=%3Cdynamic%3E%40index%3A%3Cdynamic%3E::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Amany%20reloading%20tabs%20elect%20one%20bounded%20registered%20upgrade%20for%20a%20valid%20v97%20workspace::operation=indexeddb.database.transaction::mode=readwrite::store=%3Cdynamic%3E::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Amany%20reloading%20tabs%20elect%20one%20bounded%20registered%20upgrade%20for%20a%20valid%20v97%20workspace::operation=indexeddb.transaction.object-store::mode=readwrite::store=%3Cdynamic%3E::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Amany%20reloading%20tabs%20elect%20one%20bounded%20registered%20upgrade%20for%20a%20valid%20v97%20workspace::operation=indexeddb.put::mode=readwrite::store=%3Cdynamic%3E::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Amany%20reloading%20tabs%20elect%20one%20bounded%20registered%20upgrade%20for%20a%20valid%20v97%20workspace::operation=indexeddb.put::mode=readwrite::store=settings::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Amany%20reloading%20tabs%20elect%20one%20bounded%20registered%20upgrade%20for%20a%20valid%20v97%20workspace::operation=indexeddb.transaction.object-store::mode=readwrite::store=settings::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Amany%20reloading%20tabs%20elect%20one%20bounded%20registered%20upgrade%20for%20a%20valid%20v97%20workspace::operation=indexeddb.put::mode=readwrite::store=settings::occurrence=2",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Amany%20reloading%20tabs%20elect%20one%20bounded%20registered%20upgrade%20for%20a%20valid%20v97%20workspace::operation=indexeddb.transaction.object-store::mode=readwrite::store=settings::occurrence=2",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Amany%20reloading%20tabs%20elect%20one%20bounded%20registered%20upgrade%20for%20a%20valid%20v97%20workspace::operation=indexeddb.put::mode=readwrite::store=chatSidebarAggregates::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Amany%20reloading%20tabs%20elect%20one%20bounded%20registered%20upgrade%20for%20a%20valid%20v97%20workspace::operation=indexeddb.transaction.object-store::mode=readwrite::store=chatSidebarAggregates::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Amany%20reloading%20tabs%20elect%20one%20bounded%20registered%20upgrade%20for%20a%20valid%20v97%20workspace::operation=indexeddb.transaction.object-store::mode=readwrite::store=folders::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Amany%20reloading%20tabs%20elect%20one%20bounded%20registered%20upgrade%20for%20a%20valid%20v97%20workspace::operation=indexeddb.put::mode=readwrite::store=folders::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Amany%20reloading%20tabs%20elect%20one%20bounded%20registered%20upgrade%20for%20a%20valid%20v97%20workspace::operation=indexeddb.database.close::mode=-::store=-::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Amany%20reloading%20tabs%20elect%20one%20bounded%20registered%20upgrade%20for%20a%20valid%20v97%20workspace::operation=indexeddb.factory.open::mode=-::store=-::occurrence=2",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Amany%20reloading%20tabs%20elect%20one%20bounded%20registered%20upgrade%20for%20a%20valid%20v97%20workspace::operation=indexeddb.database.transaction::mode=readonly::store=settings::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Amany%20reloading%20tabs%20elect%20one%20bounded%20registered%20upgrade%20for%20a%20valid%20v97%20workspace::operation=indexeddb.transaction.object-store::mode=readonly::store=settings::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Amany%20reloading%20tabs%20elect%20one%20bounded%20registered%20upgrade%20for%20a%20valid%20v97%20workspace::operation=indexeddb.get::mode=readonly::store=settings::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Amany%20reloading%20tabs%20elect%20one%20bounded%20registered%20upgrade%20for%20a%20valid%20v97%20workspace::operation=indexeddb.get::mode=readonly::store=settings::occurrence=2",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Amany%20reloading%20tabs%20elect%20one%20bounded%20registered%20upgrade%20for%20a%20valid%20v97%20workspace::operation=indexeddb.get::mode=readonly::store=settings::occurrence=3",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Amany%20reloading%20tabs%20elect%20one%20bounded%20registered%20upgrade%20for%20a%20valid%20v97%20workspace::operation=indexeddb.factory.enumerate-databases::mode=-::store=-::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Amany%20reloading%20tabs%20elect%20one%20bounded%20registered%20upgrade%20for%20a%20valid%20v97%20workspace::operation=indexeddb.database.close::mode=-::store=-::occurrence=2"
+      ],
+      "cleanupEvidence": {
+        "siteIds": [
+          "tests/e2e/startup-recovery.spec.ts::owner=hook%3AafterEach::operation=fixture.clear-indexeddb::mode=-::store=-::occurrence=1",
+          "tests/e2e/startup-recovery.spec.ts::owner=test%3Amany%20reloading%20tabs%20elect%20one%20bounded%20registered%20upgrade%20for%20a%20valid%20v97%20workspace::operation=fixture.playwright-context-teardown::mode=-::store=-::occurrence=1",
+          "tests/e2e/startup-recovery.spec.ts::owner=test%3Amany%20reloading%20tabs%20elect%20one%20bounded%20registered%20upgrade%20for%20a%20valid%20v97%20workspace::operation=indexeddb.database.close::mode=-::store=-::occurrence=1",
+          "tests/e2e/startup-recovery.spec.ts::owner=test%3Amany%20reloading%20tabs%20elect%20one%20bounded%20registered%20upgrade%20for%20a%20valid%20v97%20workspace::operation=indexeddb.database.close::mode=-::store=-::occurrence=2"
+        ],
+        "fixtureOwners": [],
+        "processOwned": false
+      }
+    },
+    {
+      "purpose": "legacy-fixture",
+      "mutationScope": {
+        "kind": "database-schema",
+        "targets": [
+          "one isolated active workspace database at the observed v94 schema",
+          "one folder, one chat, and a 300-message header/body/preview chain plus a settings sentinel"
+        ]
+      },
+      "cleanupRestoreObligation": "Close every raw database handle and auxiliary page, then let afterEach delete both isolated physical workspace slots after the repair assertions.",
+      "publicUiCannotExpress": "The browser journey must construct an exact observed intermediate physical schema with a deep canonical chat tree before current code can prove full repair progress, liveness, and preservation.",
+      "siteIds": [
         "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=indexeddb.factory.delete-database::mode=-::store=-::occurrence=1",
-        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=indexeddb.factory.enumerate-databases::mode=-::store=-::occurrence=1",
         "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=indexeddb.factory.open::mode=-::store=-::occurrence=1",
-        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=indexeddb.factory.open::mode=-::store=-::occurrence=2",
-        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=indexeddb.get::mode=readonly::store=settings::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines%3Ecallback%3Aonupgradeneeded::operation=indexeddb.database.create-object-store::mode=versionchange::store=%3Cdynamic%3E::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines%3Ecallback%3Aonupgradeneeded::operation=indexeddb.createIndex::mode=versionchange::store=%3Cdynamic%3E%40index%3A%3Cdynamic%3E::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=indexeddb.database.transaction::mode=readwrite::store=settings%2Bfolders%2Bchats%2Bmessages%2BmessageBodies%2BmessagePreviews::occurrence=1",
         "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=indexeddb.put::mode=readwrite::store=settings::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=indexeddb.transaction.object-store::mode=readwrite::store=settings::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=indexeddb.put::mode=readwrite::store=folders::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=indexeddb.transaction.object-store::mode=readwrite::store=folders::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=indexeddb.put::mode=readwrite::store=chats::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=indexeddb.transaction.object-store::mode=readwrite::store=chats::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=indexeddb.put::mode=readwrite::store=messages::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=indexeddb.transaction.object-store::mode=readwrite::store=messages::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=indexeddb.put::mode=readwrite::store=messageBodies::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=indexeddb.transaction.object-store::mode=readwrite::store=messageBodies::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=indexeddb.put::mode=readwrite::store=messagePreviews::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=indexeddb.transaction.object-store::mode=readwrite::store=messagePreviews::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=indexeddb.database.close::mode=-::store=-::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=indexeddb.factory.open::mode=-::store=-::occurrence=2",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=indexeddb.database.transaction::mode=readonly::store=settings%2Bchats%2BchatSidebarAggregates::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=indexeddb.get::mode=readonly::store=settings::occurrence=1",
         "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=indexeddb.transaction.object-store::mode=readonly::store=settings::occurrence=1",
-        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=indexeddb.transaction.object-store::mode=readwrite::store=settings::occurrence=1"
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=indexeddb.get::mode=readonly::store=chats::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=indexeddb.transaction.object-store::mode=readonly::store=chats::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=indexeddb.get::mode=readonly::store=chatSidebarAggregates::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=indexeddb.transaction.object-store::mode=readonly::store=chatSidebarAggregates::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=indexeddb.get::mode=readonly::store=chatSidebarAggregates::occurrence=2",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=indexeddb.transaction.object-store::mode=readonly::store=chatSidebarAggregates::occurrence=2",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=indexeddb.factory.enumerate-databases::mode=-::store=-::occurrence=1",
+        "tests/e2e/startup-recovery.spec.ts::owner=test%3Aan%20observed%20intermediate%20v94%20workspace%20repairs%20on%20an%20inactive%20slot%20across%20browser%20engines::operation=indexeddb.database.close::mode=-::store=-::occurrence=2"
       ],
       "cleanupEvidence": {
         "siteIds": [

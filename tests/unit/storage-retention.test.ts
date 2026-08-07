@@ -15,6 +15,7 @@ import { splitAttachmentForStorage } from '../../src/store/attachment-storage'
 import { ingestAttachmentBytes } from '../../src/store/attachments'
 import {
   createMutationScopeChecker,
+  resolveMutationResourceNames,
   resolveMutationTableNames,
 } from '../../src/store/browser-mutation-plan'
 import {
@@ -1701,5 +1702,38 @@ describe('storage retention', () => {
       'settings',
       'textTemplates',
     ])
+    expect(
+      resolveMutationResourceNames(
+        [
+          { kind: 'chat-meta', chatId: 'chat' },
+          { kind: 'chat-topology', chatId: 'chat' },
+          { kind: 'message', messageId: 'new-user', access: 'create' },
+          { kind: 'message', messageId: 'new-assistant', access: 'create' },
+        ],
+        {
+          captureGenerationPlanningSnapshot: true,
+          streamAdmission: testStreamLeaseAdmission({
+            streamId: 'fresh-stream',
+            chatId: 'chat',
+            messageId: 'new-assistant',
+            ownerClientId: 'owner',
+            fenceToken: 'fence',
+            replacementEpoch: 0,
+            startedAt: 1,
+            heartbeatAt: 1,
+            attemptKind: 'generation',
+          }),
+        },
+      ),
+    ).toEqual(['chat-meta:chat', 'message-topology:chat'])
+    expect(
+      resolveMutationResourceNames(
+        [
+          { kind: 'chat-meta', chatId: 'chat' },
+          { kind: 'message', messageId: 'existing-assistant' },
+        ],
+        { captureGenerationPlanningSnapshot: true },
+      ),
+    ).toEqual(['chat-meta:chat', 'message:existing-assistant'])
   })
 })

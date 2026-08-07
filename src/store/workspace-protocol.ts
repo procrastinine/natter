@@ -139,6 +139,7 @@ import type {
   DeleteFolderResult,
   EnsureFolderAndMoveChatsInput,
   EnsureFolderAndMoveChatsResult,
+  FolderCatalogPage,
   ForkChatFromMessageInput,
   ForkChatFromMessageResult,
   GenerationAttachmentTokenEvidence,
@@ -148,7 +149,7 @@ import type {
   KnownBranchPageStructuralResult,
   MessageTextPreviewSnapshot,
   MessageTextPreviewTarget,
-  SidebarCreatedAtGroupCountRequest,
+  OrganizationCatalogPageRequest,
   SidebarPresentationPage,
   SidebarPresentationRequest,
   StorageMaintenanceRequestTaskKind,
@@ -161,6 +162,7 @@ import type {
   StreamPostCommitCalibrationPlan,
   StreamPostCommitUsageEvidence,
   StreamWriteFence,
+  TagCatalogPage,
   TerminalDecidedStreamLeaseRow,
   UpdateFolderInput,
   WorkspaceMeta,
@@ -1866,8 +1868,10 @@ type ConfigQuery =
   | { kind: 'key.get'; keyId: KeyId }
   | { kind: 'setting.get'; key: string }
   | { kind: 'setting.get-many'; keys: readonly string[] }
-  | { kind: 'folder.list' }
-  | { kind: 'tag.list' }
+  | { kind: 'folder.catalog-page'; request: OrganizationCatalogPageRequest }
+  | { kind: 'folder.get-many'; folderIds: readonly FolderId[] }
+  | { kind: 'tag.catalog-page'; request: OrganizationCatalogPageRequest }
+  | { kind: 'tag.get-many'; tagIds: readonly TagId[] }
 
 type MessageQuery =
   | { kind: 'message.presentation'; messageId: MessageId }
@@ -2010,7 +2014,6 @@ export type WorkspaceQuery =
   | { kind: 'sidebar.catalog-page'; request: ChatSidebarCatalogRequest }
   | { kind: 'sidebar.presentation-page'; request: SidebarPresentationRequest }
   | { kind: 'sidebar.aggregate' }
-  | { kind: 'sidebar.created-at-group-count'; request: SidebarCreatedAtGroupCountRequest }
   | { kind: 'chat.next-fork-title'; baseTitle: string }
   | ConfigQuery
   | MessageQuery
@@ -2038,7 +2041,6 @@ export function workspaceQueryDependencies(query: WorkspaceQuery): readonly Work
     case 'sidebar.catalog-page':
     case 'sidebar.presentation-page':
     case 'sidebar.aggregate':
-    case 'sidebar.created-at-group-count':
       return [{ kind: 'sidebar' }]
     case 'configuration.discovery-snapshot':
       return [
@@ -2276,10 +2278,14 @@ export function workspaceQueryDependencies(query: WorkspaceQuery): readonly Work
       return [{ kind: 'setting', keys: [query.key] }]
     case 'setting.get-many':
       return [{ kind: 'setting', keys: query.keys }]
-    case 'folder.list':
+    case 'folder.catalog-page':
       return [{ kind: 'folder' }]
-    case 'tag.list':
+    case 'folder.get-many':
+      return [{ kind: 'folder', folderIds: query.folderIds }]
+    case 'tag.catalog-page':
       return [{ kind: 'tag' }]
+    case 'tag.get-many':
+      return [{ kind: 'tag', tagIds: query.tagIds }]
     case 'message.presentation':
       return [
         { kind: 'message-header', messageIds: [query.messageId] },
@@ -2444,244 +2450,252 @@ export type WorkspaceQueryResult<Q extends WorkspaceQuery> = Q extends { kind: '
                     ? SidebarPresentationPage
                     : Q extends { kind: 'sidebar.aggregate' }
                       ? ChatSidebarAggregate
-                      : Q extends { kind: 'sidebar.created-at-group-count' }
-                        ? number
-                        : Q extends { kind: 'chat.next-fork-title' }
-                          ? string
-                          : Q extends { kind: 'configuration.discovery-snapshot' }
-                            ? ConnectionDiscoverySnapshot | undefined
-                            : Q extends { kind: 'configuration.shell' }
-                              ? ConfigurationShellProjection
-                              : Q extends { kind: 'configuration.global-token-calibration' }
-                                ? GlobalTokenCalibration
-                                : Q extends { kind: 'configuration.text-template-catalog' }
-                                  ? readonly SavedTextTemplateCatalogRow[]
-                                  : Q extends { kind: 'configuration.active-selection' }
-                                    ? ConfigurationActiveSelectionProjection
-                                    : Q extends { kind: 'configuration.active-model' }
-                                      ? ConfigurationActiveModelRead
-                                      : Q extends { kind: 'configuration.profile-switch-plan' }
-                                        ? ConfigurationProfileSwitchPlan | undefined
-                                        : Q extends { kind: 'configuration.model-resolution-head' }
-                                          ? ConfigurationModelResolutionHead
+                      : Q extends { kind: 'chat.next-fork-title' }
+                        ? string
+                        : Q extends { kind: 'configuration.discovery-snapshot' }
+                          ? ConnectionDiscoverySnapshot | undefined
+                          : Q extends { kind: 'configuration.shell' }
+                            ? ConfigurationShellProjection
+                            : Q extends { kind: 'configuration.global-token-calibration' }
+                              ? GlobalTokenCalibration
+                              : Q extends { kind: 'configuration.text-template-catalog' }
+                                ? readonly SavedTextTemplateCatalogRow[]
+                                : Q extends { kind: 'configuration.active-selection' }
+                                  ? ConfigurationActiveSelectionProjection
+                                  : Q extends { kind: 'configuration.active-model' }
+                                    ? ConfigurationActiveModelRead
+                                    : Q extends { kind: 'configuration.profile-switch-plan' }
+                                      ? ConfigurationProfileSwitchPlan | undefined
+                                      : Q extends { kind: 'configuration.model-resolution-head' }
+                                        ? ConfigurationModelResolutionHead
+                                        : Q extends {
+                                              kind: 'configuration.model-resolution-page'
+                                            }
+                                          ? ConfigurationModelResolutionPage
                                           : Q extends {
-                                                kind: 'configuration.model-resolution-page'
+                                                kind: 'configuration.profile-catalog-page'
                                               }
-                                            ? ConfigurationModelResolutionPage
+                                            ? ConfigurationProfileCatalogPage
                                             : Q extends {
-                                                  kind: 'configuration.profile-catalog-page'
+                                                  kind: 'configuration.preset-catalog-page'
                                                 }
-                                              ? ConfigurationProfileCatalogPage
+                                              ? ConfigurationPresetCatalogPage
                                               : Q extends {
-                                                    kind: 'configuration.preset-catalog-page'
+                                                    kind: 'configuration.prompt-preset-catalog-page'
                                                   }
-                                                ? ConfigurationPresetCatalogPage
+                                                ? ConfigurationPromptPresetCatalogPage
                                                 : Q extends {
-                                                      kind: 'configuration.prompt-preset-catalog-page'
+                                                      kind: 'configuration.connection-manager-page'
                                                     }
-                                                  ? ConfigurationPromptPresetCatalogPage
+                                                  ? ConfigurationConnectionManagerPage
                                                   : Q extends {
-                                                        kind: 'configuration.connection-manager-page'
+                                                        kind: 'configuration.generated-output-network-access'
                                                       }
-                                                    ? ConfigurationConnectionManagerPage
-                                                    : Q extends {
-                                                          kind: 'configuration.generated-output-network-access'
-                                                        }
-                                                      ? GeneratedOutputNetworkAccess
-                                                      : Q extends { kind: 'key.get' }
-                                                        ? KeyRecord | undefined
-                                                        : Q extends { kind: 'setting.get' }
-                                                          ? unknown
+                                                    ? GeneratedOutputNetworkAccess
+                                                    : Q extends { kind: 'key.get' }
+                                                      ? KeyRecord | undefined
+                                                      : Q extends { kind: 'setting.get' }
+                                                        ? unknown
+                                                        : Q extends {
+                                                              kind: 'setting.get-many'
+                                                            }
+                                                          ? Record<string, unknown>
                                                           : Q extends {
-                                                                kind: 'setting.get-many'
+                                                                kind: 'folder.catalog-page'
                                                               }
-                                                            ? Record<string, unknown>
+                                                            ? FolderCatalogPage
                                                             : Q extends {
-                                                                  kind: 'folder.list'
+                                                                  kind: 'folder.get-many'
                                                                 }
-                                                              ? ChatFolder[]
+                                                              ? Array<ChatFolder | undefined>
                                                               : Q extends {
-                                                                    kind: 'tag.list'
+                                                                    kind: 'tag.catalog-page'
                                                                   }
-                                                                ? ChatTag[]
+                                                                ? TagCatalogPage
                                                                 : Q extends {
-                                                                      kind: 'message.presentation'
+                                                                      kind: 'tag.get-many'
                                                                     }
-                                                                  ? MessagePresentation | undefined
+                                                                  ? Array<ChatTag | undefined>
                                                                   : Q extends {
-                                                                        kind: 'message.presentations'
+                                                                        kind: 'message.presentation'
                                                                       }
-                                                                    ? Array<
+                                                                    ?
                                                                         | MessagePresentation
                                                                         | undefined
-                                                                      >
                                                                     : Q extends {
-                                                                          kind: 'message.preview-window'
+                                                                          kind: 'message.presentations'
                                                                         }
                                                                       ? Array<
-                                                                          | MessageTextPreviewSnapshot
+                                                                          | MessagePresentation
                                                                           | undefined
                                                                         >
                                                                       : Q extends {
-                                                                            kind: 'message.search-corpus'
+                                                                            kind: 'message.preview-window'
                                                                           }
-                                                                        ? MessageCorpusSearchResult
+                                                                        ? Array<
+                                                                            | MessageTextPreviewSnapshot
+                                                                            | undefined
+                                                                          >
                                                                         : Q extends {
-                                                                              kind: 'message.headers-by-chat'
+                                                                              kind: 'message.search-corpus'
                                                                             }
-                                                                          ? ConversationTopologyResult
+                                                                          ? MessageCorpusSearchResult
                                                                           : Q extends {
-                                                                                kind: 'branch.open'
+                                                                                kind: 'message.headers-by-chat'
                                                                               }
-                                                                            ? ConversationOpenResult
+                                                                            ? ConversationTopologyResult
                                                                             : Q extends {
-                                                                                  kind: 'branch.forks'
+                                                                                  kind: 'branch.open'
                                                                                 }
-                                                                              ? ConversationForksResult
+                                                                              ? ConversationOpenResult
                                                                               : Q extends {
-                                                                                    kind: 'branch.page-structure'
+                                                                                    kind: 'branch.forks'
                                                                                   }
-                                                                                ? KnownBranchPageStructuralResult
+                                                                                ? ConversationForksResult
                                                                                 : Q extends {
-                                                                                      kind: 'branch.child-at-position'
+                                                                                      kind: 'branch.page-structure'
                                                                                     }
-                                                                                  ? MessageId | null
+                                                                                  ? KnownBranchPageStructuralResult
                                                                                   : Q extends {
-                                                                                        kind: 'stream.lease'
+                                                                                        kind: 'branch.child-at-position'
                                                                                       }
-                                                                                    ?
-                                                                                        | StreamLeaseRow
-                                                                                        | undefined
+                                                                                    ? MessageId | null
                                                                                     : Q extends {
-                                                                                          kind: 'stream.leases-by-id'
+                                                                                          kind: 'stream.lease'
                                                                                         }
-                                                                                      ? Array<
+                                                                                      ?
                                                                                           | StreamLeaseRow
                                                                                           | undefined
-                                                                                        >
                                                                                       : Q extends {
-                                                                                            kind: 'stream.lease-head'
+                                                                                            kind: 'stream.leases-by-id'
                                                                                           }
-                                                                                        ?
+                                                                                        ? Array<
                                                                                             | StreamLeaseRow
                                                                                             | undefined
+                                                                                          >
                                                                                         : Q extends {
-                                                                                              kind: 'stream.leases'
+                                                                                              kind: 'stream.lease-head'
                                                                                             }
-                                                                                          ? StreamLeaseRow[]
+                                                                                          ?
+                                                                                              | StreamLeaseRow
+                                                                                              | undefined
                                                                                           : Q extends {
-                                                                                                kind: 'stream.journal-frame-page'
+                                                                                                kind: 'stream.leases'
                                                                                               }
-                                                                                            ? StreamJournalFramePage
+                                                                                            ? StreamLeaseRow[]
                                                                                             : Q extends {
-                                                                                                  kind: 'attachment.catalog-rows'
+                                                                                                  kind: 'stream.journal-frame-page'
                                                                                                 }
-                                                                                              ? Array<
-                                                                                                  | AttachmentCatalogRow
-                                                                                                  | undefined
-                                                                                                >
+                                                                                              ? StreamJournalFramePage
                                                                                               : Q extends {
-                                                                                                    kind: 'attachment.catalog-aggregate'
+                                                                                                    kind: 'attachment.catalog-rows'
                                                                                                   }
-                                                                                                ? AttachmentCatalogAggregate
+                                                                                                ? Array<
+                                                                                                    | AttachmentCatalogRow
+                                                                                                    | undefined
+                                                                                                  >
                                                                                                 : Q extends {
-                                                                                                      kind: 'attachment.manager-detail'
+                                                                                                      kind: 'attachment.catalog-aggregate'
                                                                                                     }
-                                                                                                  ?
-                                                                                                      | AttachmentManagerDetail
-                                                                                                      | undefined
+                                                                                                  ? AttachmentCatalogAggregate
                                                                                                   : Q extends {
-                                                                                                        kind: 'attachment.catalog-page'
+                                                                                                        kind: 'attachment.manager-detail'
                                                                                                       }
-                                                                                                    ? AttachmentCatalogPage
+                                                                                                    ?
+                                                                                                        | AttachmentManagerDetail
+                                                                                                        | undefined
                                                                                                     : Q extends {
-                                                                                                          kind: 'attachment.catalog-evaluate'
+                                                                                                          kind: 'attachment.catalog-page'
                                                                                                         }
-                                                                                                      ? Array<
-                                                                                                          | AttachmentCatalogRow
-                                                                                                          | undefined
-                                                                                                        >
+                                                                                                      ? AttachmentCatalogPage
                                                                                                       : Q extends {
-                                                                                                            kind: 'attachment.get'
+                                                                                                            kind: 'attachment.catalog-evaluate'
                                                                                                           }
-                                                                                                        ?
-                                                                                                            | Attachment
+                                                                                                        ? Array<
+                                                                                                            | AttachmentCatalogRow
                                                                                                             | undefined
+                                                                                                          >
                                                                                                         : Q extends {
-                                                                                                              kind: 'attachment.generation-token-evidence'
+                                                                                                              kind: 'attachment.get'
                                                                                                             }
                                                                                                           ?
-                                                                                                              | GenerationAttachmentTokenEvidence
+                                                                                                              | Attachment
                                                                                                               | undefined
                                                                                                           : Q extends {
-                                                                                                                kind: 'attachment.get-many'
+                                                                                                                kind: 'attachment.generation-token-evidence'
                                                                                                               }
-                                                                                                            ? Array<
-                                                                                                                | Attachment
+                                                                                                            ?
+                                                                                                                | GenerationAttachmentTokenEvidence
                                                                                                                 | undefined
-                                                                                                              >
                                                                                                             : Q extends {
-                                                                                                                  kind: 'attachment.media-many'
+                                                                                                                  kind: 'attachment.get-many'
                                                                                                                 }
                                                                                                               ? Array<
-                                                                                                                  | AttachmentMediaProjection
+                                                                                                                  | Attachment
                                                                                                                   | undefined
                                                                                                                 >
                                                                                                               : Q extends {
-                                                                                                                    kind: 'attachment.media'
+                                                                                                                    kind: 'attachment.media-many'
                                                                                                                   }
-                                                                                                                ?
+                                                                                                                ? Array<
                                                                                                                     | AttachmentMediaProjection
                                                                                                                     | undefined
+                                                                                                                  >
                                                                                                                 : Q extends {
-                                                                                                                      kind: 'attachment.bundle'
+                                                                                                                      kind: 'attachment.media'
                                                                                                                     }
                                                                                                                   ?
-                                                                                                                      | AttachmentBundle
+                                                                                                                      | AttachmentMediaProjection
                                                                                                                       | undefined
                                                                                                                   : Q extends {
-                                                                                                                        kind: 'attachment.dispatch-bundle'
+                                                                                                                        kind: 'attachment.bundle'
                                                                                                                       }
                                                                                                                     ?
-                                                                                                                        | AttachmentDispatchBundle
+                                                                                                                        | AttachmentBundle
                                                                                                                         | undefined
                                                                                                                     : Q extends {
-                                                                                                                          kind: 'attachment.find-hash'
+                                                                                                                          kind: 'attachment.dispatch-bundle'
                                                                                                                         }
                                                                                                                       ?
-                                                                                                                          | AttachmentId
+                                                                                                                          | AttachmentDispatchBundle
                                                                                                                           | undefined
                                                                                                                       : Q extends {
-                                                                                                                            kind: 'attachment.references'
+                                                                                                                            kind: 'attachment.find-hash'
                                                                                                                           }
-                                                                                                                        ? AttachmentReferenceEdge[]
+                                                                                                                        ?
+                                                                                                                            | AttachmentId
+                                                                                                                            | undefined
                                                                                                                         : Q extends {
-                                                                                                                              kind: 'attachment.reference-rows'
+                                                                                                                              kind: 'attachment.references'
                                                                                                                             }
-                                                                                                                          ? AttachmentReferenceRow[]
+                                                                                                                          ? AttachmentReferenceEdge[]
                                                                                                                           : Q extends {
-                                                                                                                                kind: 'generated-output.localization-queue'
+                                                                                                                                kind: 'attachment.reference-rows'
                                                                                                                               }
-                                                                                                                            ? GeneratedOutputLocalizationQueueSnapshot
+                                                                                                                            ? AttachmentReferenceRow[]
                                                                                                                             : Q extends {
-                                                                                                                                  kind: 'discovery.models'
+                                                                                                                                  kind: 'generated-output.localization-queue'
                                                                                                                                 }
-                                                                                                                              ?
-                                                                                                                                  | CachedModelsRow
-                                                                                                                                  | undefined
+                                                                                                                              ? GeneratedOutputLocalizationQueueSnapshot
                                                                                                                               : Q extends {
-                                                                                                                                    kind: 'discovery.endpoints'
+                                                                                                                                    kind: 'discovery.models'
                                                                                                                                   }
                                                                                                                                 ?
-                                                                                                                                    | CachedEndpointsRow
+                                                                                                                                    | CachedModelsRow
                                                                                                                                     | undefined
                                                                                                                                 : Q extends {
-                                                                                                                                      kind: 'discovery.privacy'
+                                                                                                                                      kind: 'discovery.endpoints'
                                                                                                                                     }
                                                                                                                                   ?
-                                                                                                                                      | CachedPrivacyPolicyRow
+                                                                                                                                      | CachedEndpointsRow
                                                                                                                                       | undefined
-                                                                                                                                  : never
+                                                                                                                                  : Q extends {
+                                                                                                                                        kind: 'discovery.privacy'
+                                                                                                                                      }
+                                                                                                                                    ?
+                                                                                                                                        | CachedPrivacyPolicyRow
+                                                                                                                                        | undefined
+                                                                                                                                    : never
 
 type OrganizationCommand =
   | { kind: 'folder.create'; input: CreateFolderInput }

@@ -4,7 +4,7 @@ import { compareLiveLeafRecency } from '../core/active-path'
 import { messageRenderableTextSemanticsEqual } from '../core/branch-flatten'
 import { type BranchPathWindow, readLiveBranchPath } from '../core/branch-session'
 import { modelCatalogQueryForConnectionKind, modelsCacheKey } from '../core/cache-keys'
-import { computeBranchTitle } from '../core/chat-fork'
+import { computeBranchTitleFromOrdinals } from '../core/chat-fork'
 import { chatSettingsPromptPresetReferences } from '../core/chat-metadata'
 import { connectionDispatchKeyRefs, connectionHttpProfile } from '../core/connection-dispatch-proof'
 import {
@@ -45,7 +45,6 @@ import {
   parseSidebarSortMode,
   SIDEBAR_COLLAPSED_FOLDERS_SETTING_KEY,
   SIDEBAR_SORT_SETTING_KEY,
-  sortChatFolders,
 } from '../core/sidebar-sort'
 import {
   isStaticTextTemplateId,
@@ -68,7 +67,6 @@ import type {
   ChatFolder,
   ChatId,
   ChatPreset,
-  ChatTag,
   ChatUsage,
   ChildListState,
   ConnectionProfile,
@@ -115,11 +113,12 @@ import {
   readAttachmentCatalogPage,
   readAttachmentCatalogRows,
   readAttachmentManagerCore,
+  readFolderCatalogPage,
   readSidebarAggregate,
   readSidebarCatalogPage,
-  readSidebarCreatedAtGroupCount,
   readSidebarPresentationPage,
   readSidebarRowsById,
+  readTagCatalogPage,
 } from './browser-catalog-queries'
 import {
   BROWSER_COMMAND_DIRECT_FANOUT_BUDGET,
@@ -169,7 +168,6 @@ import {
   readExactMessageRowsByIdPages,
   readStreamJournalFramePage,
   readStreamLeasePages,
-  readStringPrimaryKeyPages,
 } from './browser-query-pages'
 import {
   boundedMaintenanceLimit,
@@ -2896,13 +2894,6 @@ class BrowserCommandCommit implements BrowserCommandSessionPort {
   }
 }
 
-function sortTags(rows: ChatTag[]): ChatTag[] {
-  return rows.sort((left, right) => {
-    const byName = left.nameLower.localeCompare(right.nameLower)
-    return byName !== 0 ? byName : left.id.localeCompare(right.id)
-  })
-}
-
 function configurationPreferencesFromValues(
   values: ReadonlyMap<string, unknown>,
 ): ConfigurationPreferencesProjection {
@@ -5112,7 +5103,12 @@ function workspaceDependencyCoversPhysicalMutation(
     case 'folder':
       return (
         !dependency.folderIds ||
-        (mutation.rowId !== undefined && dependency.folderIds.includes(mutation.rowId))
+        (mutation.rowId !== undefined &&
+          dependency.folderIds.includes(
+            mutation.tableName === 'chatSidebarAggregates' && mutation.rowId.startsWith('folder:')
+              ? mutation.rowId.slice('folder:'.length)
+              : mutation.rowId,
+          ))
       )
     case 'tag':
       return (
@@ -5668,9 +5664,6 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
       case 'sidebar.aggregate': {
         return readSidebarAggregate(frame.db)
       }
-      case 'sidebar.created-at-group-count': {
-        return readSidebarCreatedAtGroupCount(frame.db, query.request, frame.signal)
-      }
       case 'chat.next-fork-title':
         return this.nextForkTitle(query.baseTitle)
       case 'configuration.discovery-snapshot':
@@ -5727,10 +5720,14 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
         return this.getSetting(query.key)
       case 'setting.get-many':
         return Object.fromEntries(await this.getSettings(query.keys, signalOptions))
-      case 'folder.list':
-        return this.listFolders()
-      case 'tag.list':
-        return this.listTags()
+      case 'folder.catalog-page':
+        return readFolderCatalogPage(frame.db, query.request, frame.signal)
+      case 'folder.get-many':
+        return frame.db.folders.bulkGet([...query.folderIds])
+      case 'tag.catalog-page':
+        return readTagCatalogPage(frame.db, query.request, frame.signal)
+      case 'tag.get-many':
+        return frame.db.tags.bulkGet([...query.tagIds])
       case 'message.presentation':
         return (await this.getExactMessagePresentations([query.messageId], frame.signal))[0]
       case 'message.presentations':
@@ -6597,14 +6594,19 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
 
   private async nextForkTitle(baseTitle: string): Promise<string> {
     const base = baseTitle.trim() || 'Untitled chat'
-    const rows = await (await this.openDb()).chatSidebarRows
+    const prefix = `${base} Branch `
+    const taken = new Set<number>()
+    await (await this.openDb()).chatSidebarRows
       .where('title')
-      .startsWith(`${base} Branch `)
-      .toArray()
-    return computeBranchTitle(
-      base,
-      rows.map((row) => row.title),
-    )
+      .startsWith(prefix)
+      .each((row) => {
+        const suffix = row.title.slice(prefix.length)
+        const ordinal = Number(suffix)
+        if (Number.isSafeInteger(ordinal) && ordinal > 0 && suffix === String(ordinal)) {
+          taken.add(ordinal)
+        }
+      })
+    return computeBranchTitleFromOrdinals(base, taken)
   }
 
   private async materializeTemporaryChat(
@@ -7860,7 +7862,7 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
 
   async getStreamLeaseHead(): Promise<StreamLeaseRow | undefined> {
     const db = await this.openDb()
-    const lease = await db.streamLeases.limit(1).first()
+    const lease = await db.streamLeases.where('streamId').above('').first()
     return isStreamLeaseRow(lease) ? { ...lease } : undefined
   }
 
@@ -8273,11 +8275,6 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
     return runtime.emptyArchivedChatRows(input, commit)
   }
 
-  async listFolders(): Promise<ChatFolder[]> {
-    const db = await this.openDb()
-    return sortChatFolders(await readStringPrimaryKeyPages(db.folders, (folder) => folder.id))
-  }
-
   async createFolder(input: CreateFolderInput, commit: BrowserCommandCommit): Promise<ChatFolder> {
     const runtime = await import('./browser-catalog-command-runtime')
     return runtime.createFolder(input, commit)
@@ -8308,11 +8305,6 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
   ): Promise<DeleteFolderResult> {
     const runtime = await import('./browser-catalog-command-runtime')
     return runtime.deleteFolder(folderId, chatDisposition, now, commit)
-  }
-
-  async listTags(): Promise<ChatTag[]> {
-    const db = await this.openDb()
-    return sortTags(await readStringPrimaryKeyPages(db.tags, (tag) => tag.id))
   }
 
   async getMessage(

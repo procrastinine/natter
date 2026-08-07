@@ -77,6 +77,7 @@ import { configurationApplication } from '../../src/store/configuration-applicat
 import { CONFIGURATION_PROFILE_MANAGER_STATE_ID } from '../../src/store/configuration-profile-usage-projection'
 import { __resetDbForTests, getDb, NatterDb, openDb } from '../../src/store/db'
 import { configurationDiscoveryApplication } from '../../src/store/discovery-service'
+import { createFolder as createChatFolder } from '../../src/store/folders'
 import {
   encodeWorkspaceBackupDocument,
   exportChat,
@@ -415,7 +416,13 @@ async function seedPortableChat(): Promise<{
     createdAt: 31,
     updatedAt: 31,
   }
-  await db.folders.put(folder)
+  await createChatFolder({
+    id: folder.id,
+    name: folder.name,
+    ...(folder.color ? { color: folder.color } : {}),
+    sortIndex: folder.sortIndex,
+    now: folder.createdAt,
+  })
   await db.tags.put(tag)
 
   const bundle = await ingestAttachmentBytes({
@@ -2834,7 +2841,7 @@ describe('workspace backup restore', () => {
       expect(await destination.presets.count()).toBe(257)
       await expect(probeBrowserWorkspaceCurrent(destination.name)).resolves.toEqual({
         kind: 'current',
-        physicalVersion: 970,
+        physicalVersion: 980,
       })
       const messageScope = JSON.stringify([
         'attachmentCatalogAggregate',

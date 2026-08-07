@@ -32,6 +32,7 @@ import {
 import {
   CHAT_SIDEBAR_AGGREGATE_ID,
   emptyChatSidebarAggregateRow,
+  rebuildChatSidebarProjectionRowsInTransaction,
 } from '../../src/store/chat-sidebar-projection'
 import { CHAT_CLOSURE_TRANSACTION_CAPABILITY } from '../../src/store/chat-storage-ownership'
 import { buildChat, deleteArchivedChatsPermanently } from '../../src/store/chats'
@@ -531,7 +532,7 @@ describe('organization repository contract', () => {
       delta: { facts: [], invalidations: [] },
     })
     expect(changes).toHaveLength(2)
-    expect(await query({ kind: 'folder.list' })).toEqual([
+    expect((await query({ kind: 'folder.catalog-page', request: { limit: 10 } })).rows).toEqual([
       expect.objectContaining({ id: created.value.id, name: 'Pinned', color: '#abcdef' }),
     ])
 
@@ -630,12 +631,12 @@ describe('organization repository contract', () => {
     expect(commit.delta).toEqual({
       facts: [{ kind: 'sidebar-row-changed', chatId: chat.id }],
       invalidations: [
-        { kind: 'folder', folderIds: [folder.id] },
         {
           kind: 'profile',
           profileIds: [PROFILE_ID],
           facets: ['dependent-counts'],
         },
+        { kind: 'folder', folderIds: [folder.id] },
         { kind: 'chat', chatIds: [chat.id] },
         { kind: 'sidebar', chatIds: [chat.id] },
       ],
@@ -821,6 +822,11 @@ describe('organization repository contract', () => {
       updatedAt: 1,
     }
     await getDb().folders.bulkPut([...folders, destination])
+    await getDb().transaction(
+      'rw',
+      [getDb().chats, getDb().folders, getDb().chatSidebarRows, getDb().chatSidebarAggregates],
+      (tx) => rebuildChatSidebarProjectionRowsInTransaction(tx),
+    )
     const targets = folders.map((folder, index) => ({
       ...buildChat({
         id: `move-scale-target-${String(index).padStart(3, '0')}`,
@@ -1072,7 +1078,9 @@ describe('organization repository contract', () => {
       'chat-metadata',
     )
 
-    const newTag = (await query({ kind: 'tag.list' })).find((row) => row.nameLower === 'new')
+    const newTag = (await query({ kind: 'tag.catalog-page', request: { limit: 10 } })).rows.find(
+      (row) => row.nameLower === 'new',
+    )
     if (!newTag) throw new Error('NewTagMissing')
     const stored = await query({ kind: 'chat.get', chatId: chat.id })
     expect(commit.value.value).toEqual([keep.id, newTag.id])
@@ -1497,7 +1505,6 @@ describe('organization repository contract', () => {
         },
         now: 100 + index,
       }),
-      folderId: `archive-folder-${index}`,
       modelResolution: {
         intentId: `archive-resolution-${index}`,
         target: {

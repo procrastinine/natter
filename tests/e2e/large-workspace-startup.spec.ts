@@ -39,6 +39,8 @@ const INITIAL_TRANSCRIPT_FLOOR = 10
 const HANG_BOUND_MS = 45_000
 const ROUTE_SWITCH_OBSERVATION_MS = 1_500
 const INSTRUMENTED_FOREGROUND_GESTURE_BOUND_MS = 75
+const ACTIVE_STREAM_COMPOSER_READY_BOUND_MS = 2_000
+const ACTIVE_STREAM_CORE_RUNNING_HEADROOM_MS = 250
 const LONG_TASK_THRESHOLD_MS = 50
 const CARDINALITY_BLOCKING_TIME_HEADROOM_MS = 50
 const GENERATED_WORKSPACE_FORK_TARGET_ID = 'generated-active-message-086'
@@ -100,6 +102,12 @@ test('startup work and first interaction stay cardinality-bounded in a 4k-chat w
   expect(
     manifest.states.large.stats.chatCount / manifest.states.control.stats.chatCount,
   ).toBeGreaterThanOrEqual(250)
+  expect(
+    manifest.states.large.stats.folderCount / manifest.states.control.stats.folderCount,
+  ).toBeGreaterThanOrEqual(1_000)
+  expect(
+    manifest.states.large.stats.tagCount / manifest.states.control.stats.tagCount,
+  ).toBeGreaterThanOrEqual(500)
 
   assertFreshStartup(fresh)
   assertInteractionAndMilestones(control)
@@ -120,6 +128,10 @@ test('startup work and first interaction stay cardinality-bounded in a 4k-chat w
   assertFixedConfigurationBudget(control.reload.probe, large.reload.probe)
   assertNoCanonicalWholeTableReadBeforeRunning('control reload', control.reload.probe)
   assertNoCanonicalWholeTableReadBeforeRunning('large reload', large.reload.probe)
+  assertNoCanonicalWholeTableReadThroughConvergence('control', control.probe)
+  assertNoCanonicalWholeTableReadThroughConvergence('control reload', control.reload.probe)
+  assertNoCanonicalWholeTableReadThroughConvergence('large', large.probe)
+  assertNoCanonicalWholeTableReadThroughConvergence('large reload', large.reload.probe)
 
   const controlRunningRequests = control.reload.probe.milestones.coreRunning.idb.total
   const largeRunningRequests = large.reload.probe.milestones.coreRunning.idb.total
@@ -215,13 +227,15 @@ test('active-stream reload keeps input and unrelated controls cardinality-indepe
     })
     expect(profile.gesture.sidebarTransitions).toEqual([profile.expectedSidebarState])
     expect(profile.gestureLatencyMs).toBeLessThanOrEqual(INSTRUMENTED_FOREGROUND_GESTURE_BOUND_MS)
-    expect(profile.composerReadyMs).toBeLessThanOrEqual(HANG_BOUND_MS)
+    expect(profile.composerReadyMs).toBeLessThanOrEqual(ACTIVE_STREAM_COMPOSER_READY_BOUND_MS)
     expect(profile.probe.milestones.coreRunning).toBeDefined()
     expect(profile.providerRequestCounts.endpointCatalog).toBeLessThanOrEqual(1)
     expect(profile.providerRequestCounts.generation).toBe(1)
     assertNoCanonicalWholeTableReadBeforeRunning(`${name} active-stream reload`, profile.probe)
   }
-  expect(large.composerReadyMs).toBeLessThanOrEqual(control.composerReadyMs + 100)
+  expect(large.probe.milestones.coreRunning.at).toBeLessThanOrEqual(
+    control.probe.milestones.coreRunning.at + ACTIVE_STREAM_CORE_RUNNING_HEADROOM_MS,
+  )
   expect(large.probe.milestones.coreRunning.idb.total).toBe(
     control.probe.milestones.coreRunning.idb.total,
   )
@@ -1195,15 +1209,21 @@ async function measureRouteSwitch(page: Page): Promise<RouteSwitchProfile> {
   if (!targetChatId || !targetHref) throw new Error('GeneratedWorkspaceRouteSwitchTargetInvalid')
   const before = await startupProbeSnapshot(page)
   const beforeHash = new URL(page.url()).hash
-  await target.evaluate((node) => {
-    node.addEventListener('click', () => {
-      ;(
-        window as typeof window & { __natterRouteSwitchClickEvents?: number }
-      ).__natterRouteSwitchClickEvents =
-        ((window as typeof window & { __natterRouteSwitchClickEvents?: number })
-          .__natterRouteSwitchClickEvents ?? 0) + 1
-    })
-  })
+  await page.evaluate((expectedHref) => {
+    document.addEventListener(
+      'click',
+      (event) => {
+        const link = event.target instanceof Element ? event.target.closest('a[href]') : null
+        if (link?.getAttribute('href') !== expectedHref) return
+        ;(
+          window as typeof window & { __natterRouteSwitchClickEvents?: number }
+        ).__natterRouteSwitchClickEvents =
+          ((window as typeof window & { __natterRouteSwitchClickEvents?: number })
+            .__natterRouteSwitchClickEvents ?? 0) + 1
+      },
+      { capture: true },
+    )
+  }, targetHref)
   const startedAt = performance.now()
   await target.click()
   await page
@@ -1575,8 +1595,16 @@ function assertNoCanonicalWholeTableReadBeforeRunning(
   expect(forbidden, `${name} canonical whole-table startup reads`).toEqual([])
 }
 
+function assertNoCanonicalWholeTableReadThroughConvergence(
+  name: string,
+  probe: StartupProbeSnapshot,
+): void {
+  const forbidden = canonicalWholeTableReads(probe.milestones.backgroundConverged.idb.calls)
+  expect(forbidden, `${name} canonical whole-table convergence reads`).toEqual([])
+}
+
 function assertNoCanonicalWholeTableRouteRead(name: string, routeSwitch: RouteSwitchProfile): void {
-  const forbidden = unrelatedCanonicalWholeTableReads(routeSwitch.idbCalls, ['folders', 'tags'])
+  const forbidden = canonicalWholeTableReads(routeSwitch.idbCalls)
   expect(forbidden, `${name} canonical whole-table reads`).toEqual([])
 }
 
@@ -1590,7 +1618,7 @@ function assertForegroundFork(name: string, profile: ForegroundForkProfile): voi
   expect(profile.heartbeatTicks, `${name} responsive event-loop heartbeat`).toBeGreaterThan(0)
   expect(profile.heartbeatMaxGapMs, `${name} maximum event-loop gap`).toBeLessThan(500)
   expect(
-    unrelatedCanonicalWholeTableReads(profile.idbCalls, ['folders', 'tags']),
+    canonicalWholeTableReads(profile.idbCalls),
     `${name} fork canonical whole-table reads`,
   ).toEqual([])
   const databaseOpens = Object.entries(profile.idbCalls).filter(
@@ -1648,17 +1676,6 @@ function canonicalWholeTableReads(
       /^objectStore\.([^.]+)\.(?:getAll|getAllKeys|openCursor|openKeyCursor)\.full$/u,
     )
     return match?.[1] !== undefined && canonical.has(match[1])
-  })
-}
-
-function unrelatedCanonicalWholeTableReads(
-  calls: Readonly<Record<string, number>>,
-  requiredCatalogs: readonly string[],
-): readonly [string, number][] {
-  const allowed = new Set(requiredCatalogs)
-  return canonicalWholeTableReads(calls).filter(([key]) => {
-    const tableName = key.match(/^objectStore\.([^.]+)\./u)?.[1]
-    return tableName === undefined || !allowed.has(tableName)
   })
 }
 

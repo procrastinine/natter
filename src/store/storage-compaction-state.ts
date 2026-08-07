@@ -1,6 +1,8 @@
 import Dexie, { type Transaction } from 'dexie'
 import { browserLocalStorage } from '../lib/browser-storage'
+import { errorFromUnknown } from '../lib/error'
 import { newId } from '../lib/ulid'
+import { yieldToEventLoop } from '../lib/yield-to-event-loop'
 import type { BrowserLockRow } from './browser-lock-record'
 import {
   BROWSER_WORKSPACE_COMPACTION_MIN_RECLAIMABLE_BYTES,
@@ -521,7 +523,7 @@ function schedulePhysicalMutationDebtQueue(
   }
   queue.phase = 'scheduled'
   let disposition: 'finish' | 'handoff' | number = 'finish'
-  const task = Dexie.ignoreTransaction(() => drainPhysicalMutationDebtQueueBatch(queue))
+  const task = runStorageBackgroundTask(() => drainPhysicalMutationDebtQueueBatch(queue))
     .then((succeeded) => {
       if (succeeded) {
         queue.failureCount = 0
@@ -546,6 +548,27 @@ function schedulePhysicalMutationDebtQueue(
       }
     })
   queue.task = task
+}
+
+export function runStorageBackgroundTask<T>(operation: () => Promise<T>): Promise<T> {
+  return Dexie.ignoreTransaction(
+    () =>
+      new Promise<T>((resolve, reject) => {
+        const rejectError = (reason: unknown) => reject(errorFromUnknown(reason))
+        void yieldToEventLoop().then(() => {
+          Dexie.ignoreTransaction(() => {
+            let task: Promise<T>
+            try {
+              task = operation()
+            } catch (error) {
+              rejectError(error)
+              return
+            }
+            void task.then(resolve, rejectError)
+          })
+        }, rejectError)
+      }),
+  )
 }
 
 async function drainPhysicalMutationDebtQueueBatch(

@@ -8,7 +8,7 @@ import {
 } from '../../scripts/local-module-graph.mjs'
 import type * as WaveAStorageEpochV94 from '../../src/backcompat/wave-a-storage-epoch-v94'
 import { waveACompletionSettingsV94 } from '../../src/store/browser-workspace-schema-v94'
-import { WAVE_B_STORAGE_VERSION } from '../../src/store/browser-workspace-schema-v97'
+import { WAVE_C_STORAGE_VERSION } from '../../src/store/browser-workspace-schema-v98'
 import type { NatterDb } from '../../src/store/db'
 
 const SRC_ROOT = join(process.cwd(), 'src')
@@ -69,6 +69,7 @@ describe('backcompat boundary', () => {
     const allowed = new Set([
       'store/browser-workspace-derived-repair.ts',
       'store/chat-sidebar-projection.ts',
+      'store/db.ts',
     ])
     const rebuildCallers = sourceFiles(SRC_ROOT)
       .map((file) => relative(SRC_ROOT, file).split(sep).join('/'))
@@ -229,7 +230,7 @@ describe('backcompat boundary', () => {
       fresh = createDbForTests(databaseName)
       await prepareBrowserWorkspaceSchema(fresh)
       await fresh.open()
-      expect(fresh.verno).toBe(WAVE_B_STORAGE_VERSION)
+      expect(fresh.verno).toBe(WAVE_C_STORAGE_VERSION)
       expect(
         await fresh.table('settings').bulkGet(waveACompletionSettingsV94().map((row) => row.key)),
       ).not.toContain(undefined)
@@ -243,8 +244,8 @@ describe('backcompat boundary', () => {
       ])
       await Promise.all([currentA.open(), currentB.open()])
       expect([currentA.verno, currentB.verno]).toEqual([
-        WAVE_B_STORAGE_VERSION,
-        WAVE_B_STORAGE_VERSION,
+        WAVE_C_STORAGE_VERSION,
+        WAVE_C_STORAGE_VERSION,
       ])
     } finally {
       fresh?.close()
@@ -300,7 +301,7 @@ describe('backcompat boundary', () => {
         prepareBrowserWorkspaceSchema(second),
       ])
       await Promise.all([first.open(), second.open()])
-      expect([first.verno, second.verno]).toEqual([WAVE_B_STORAGE_VERSION, WAVE_B_STORAGE_VERSION])
+      expect([first.verno, second.verno]).toEqual([WAVE_C_STORAGE_VERSION, WAVE_C_STORAGE_VERSION])
       expect({ moduleLoads, migrations, finalizations }).toEqual({
         moduleLoads: 1,
         migrations: 1,
@@ -312,7 +313,7 @@ describe('backcompat boundary', () => {
       current = createDbForTests(databaseName)
       await prepareBrowserWorkspaceSchema(current)
       await current.open()
-      expect(current.verno).toBe(WAVE_B_STORAGE_VERSION)
+      expect(current.verno).toBe(WAVE_C_STORAGE_VERSION)
       expect({ moduleLoads, migrations, finalizations }).toEqual({
         moduleLoads: 1,
         migrations: 1,

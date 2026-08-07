@@ -10,8 +10,9 @@ import {
 } from '../../src/core/sidebar-sort'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
 import {
-  readSidebarCreatedAtGroupCount,
+  readFolderCatalogPage,
   readSidebarPresentationPage,
+  readTagCatalogPage,
 } from '../../src/store/browser-catalog-queries'
 import { __resetBrowserRepositoryForTests } from '../../src/store/browser-repo'
 import {
@@ -44,8 +45,10 @@ const DB_NAME = 'natter'
 
 async function rebuildChatSidebarProjection(): Promise<void> {
   const db = getDb()
-  await db.transaction('rw', [db.chats, db.chatSidebarRows, db.chatSidebarAggregates], (tx) =>
-    rebuildChatSidebarProjectionRowsInTransaction(tx),
+  await db.transaction(
+    'rw',
+    [db.chats, db.folders, db.chatSidebarRows, db.chatSidebarAggregates],
+    (tx) => rebuildChatSidebarProjectionRowsInTransaction(tx),
   )
 }
 
@@ -87,7 +90,64 @@ afterEach(async () => {
 })
 
 describe('chat sidebar read model', () => {
+  it('demand-pages large folder and tag catalogs without reducing capability', async () => {
+    const cardinality = 1_000
+    const folders = Array.from({ length: cardinality }, (_, index) => ({
+      id: `folder-${String(index).padStart(4, '0')}`,
+      name: `Folder ${String(cardinality - index).padStart(4, '0')}`,
+      sortIndex: index % 17,
+      createdAt: index,
+      updatedAt: index,
+    }))
+    const tags = Array.from({ length: cardinality }, (_, index) => ({
+      id: `tag-${String(index).padStart(4, '0')}`,
+      name: `Tag ${String(cardinality - index).padStart(4, '0')}`,
+      nameLower: `tag ${String(cardinality - index).padStart(4, '0')}`,
+      createdAt: index,
+      updatedAt: index,
+    }))
+    const db = getDb()
+    await db.folders.bulkPut(folders)
+    await db.tags.bulkPut(tags)
+    await rebuildChatSidebarProjection()
+
+    const firstFolders = await readFolderCatalogPage(db, { limit: 17 })
+    const firstTags = await readTagCatalogPage(db, { limit: 17 })
+    expect(firstFolders.rows).toHaveLength(17)
+    expect(firstTags.rows).toHaveLength(17)
+    expect(firstFolders.nextCursor).toBeTypeOf('string')
+    expect(firstTags.nextCursor).toBeTypeOf('string')
+
+    const seenFolders = [...firstFolders.rows]
+    let folderCursor = firstFolders.nextCursor
+    while (folderCursor) {
+      const page = await readFolderCatalogPage(db, { cursor: folderCursor, limit: 17 })
+      seenFolders.push(...page.rows)
+      folderCursor = page.nextCursor
+    }
+    const seenTags = [...firstTags.rows]
+    let tagCursor = firstTags.nextCursor
+    while (tagCursor) {
+      const page = await readTagCatalogPage(db, { cursor: tagCursor, limit: 17 })
+      seenTags.push(...page.rows)
+      tagCursor = page.nextCursor
+    }
+
+    expect(new Set(seenFolders.map((folder) => folder.id)).size).toBe(cardinality)
+    expect(new Set(seenTags.map((tag) => tag.id)).size).toBe(cardinality)
+    expect(seenFolders).toEqual(
+      [...folders].sort(
+        (left, right) =>
+          left.sortIndex - right.sortIndex ||
+          sidebarTitleSortKey(left.name).localeCompare(sidebarTitleSortKey(right.name)) ||
+          left.id.localeCompare(right.id),
+      ),
+    )
+    expect(seenTags.map((tag) => tag.nameLower)).toEqual(tags.map((tag) => tag.nameLower).sort())
+  })
+
   it('projects only sidebar metadata and drops heavyweight chat fields', async () => {
+    await createFolder({ id: 'folder-1', name: 'Folder 1', now: 1 })
     const chat = await createChat({
       title: 'Projection',
       settings: cloneDefaultChatSettings(),
@@ -347,33 +407,6 @@ describe('chat sidebar read model', () => {
     expect(second.rows.map((row) => row.id)).toEqual(['unpinned-new'])
   })
 
-  it('counts created-time headers from compound keys without hydrating chat bodies', async () => {
-    const day = 86_400_000
-    const today = day * 100
-    const rows = [
-      await createChat({ id: 'today-pinned', title: 'Today pinned', now: today }),
-      await createChat({ id: 'today-unpinned', title: 'Today unpinned', now: today + 1 }),
-      await createChat({ id: 'week', title: 'Week', now: today - day * 3 }),
-      await createChat({ id: 'older', title: 'Older', now: today - day * 40 }),
-    ]
-    await getDb().chats.bulkPut(
-      rows.map((chat, index) => ({
-        ...chat,
-        folderId: 'folder',
-        pinned: index === 0,
-        previewText: chat.title,
-      })),
-    )
-    await rebuildChatSidebarProjection()
-
-    await expect(
-      readSidebarCreatedAtGroupCount(getDb(), {
-        folderIds: ['folder'],
-        boundaries: [today, today - day, today - day * 6, today - day * 29],
-      }),
-    ).resolves.toBe(4)
-  })
-
   it('pages one complete expanded folder before later root rows without retaining the catalog', async () => {
     await createFolder({ id: 'large-folder', name: 'Large folder', now: 2_000 })
     await createFolder({ id: 'empty-folder', name: 'Empty folder', now: 1 })
@@ -410,7 +443,6 @@ describe('chat sidebar read model', () => {
     const measurements: SidebarPresentationPage['measurement'][] = []
     const physicalPageSizes: number[] = []
     let cursor: string | undefined
-    let exactTotalRows: number | undefined
     do {
       const page = await readPresentationPage({
         ...request,
@@ -420,7 +452,6 @@ describe('chat sidebar read model', () => {
       rows.push(...page.rows)
       measurements.push(page.measurement)
       physicalPageSizes.push(page.rows.length)
-      exactTotalRows ??= page.exactTotalRows
       cursor = page.nextCursor
     } while (cursor)
 
@@ -443,7 +474,6 @@ describe('chat sidebar read model', () => {
     expect(keys).toContain('entry:folder:empty-folder')
     expect(keys).toContain('entry:folder:empty-folder:empty')
     expect(rows).toHaveLength(518)
-    expect(exactTotalRows).toBe(rows.length)
     expect(measurements.reduce((sum, value) => sum + value.folderChildRowsRead, 0)).toBe(513)
     expect(
       measurements.reduce((sum, value) => sum + value.rootChatRowsRead, 0),
@@ -544,7 +574,6 @@ describe('chat sidebar read model', () => {
     for (const { mode } of SIDEBAR_SORT_OPTIONS) {
       const rows: SidebarPresentationPage['rows'][number][] = []
       let cursor: string | undefined
-      let exactTotalRows: number | undefined
       do {
         const page = await readPresentationPage({
           mode: 'expanded',
@@ -556,7 +585,6 @@ describe('chat sidebar read model', () => {
           ...(cursor ? { cursor } : {}),
         })
         rows.push(...page.rows)
-        exactTotalRows ??= page.exactTotalRows
         cursor = page.nextCursor
       } while (cursor)
 
@@ -580,7 +608,6 @@ describe('chat sidebar read model', () => {
       const keys = rows.map((row) => row.key)
       expect(keys, mode).toEqual(expected)
       expect(new Set(keys).size, mode).toBe(chats.length)
-      expect(exactTotalRows, mode).toBe(chats.length)
     }
   })
 
@@ -619,7 +646,7 @@ describe('chat sidebar read model', () => {
       'Yesterday',
       'Older',
     ])
-    expect(page.exactTotalRows).toBe(page.rows.length)
+    expect(page.nextCursor).toBeUndefined()
   })
 
   it('pages created-time groups across pinned buckets without gaps or duplicate chats', async () => {
@@ -647,7 +674,6 @@ describe('chat sidebar read model', () => {
     const measurements: SidebarPresentationPage['measurement'][] = []
     const physicalPageSizes: number[] = []
     let cursor: string | undefined
-    let exactTotalRows: number | undefined
     do {
       const page = await readPresentationPage({
         mode: 'expanded',
@@ -661,7 +687,6 @@ describe('chat sidebar read model', () => {
       rows.push(...page.rows)
       measurements.push(page.measurement)
       physicalPageSizes.push(page.rows.length)
-      exactTotalRows ??= page.exactTotalRows
       cursor = page.nextCursor
     } while (cursor)
 
@@ -677,29 +702,26 @@ describe('chat sidebar read model', () => {
     )
     expect(new Set(rows.map((row) => row.key)).size).toBe(rows.length)
     expect(physicalPageSizes.every((size) => size > 0)).toBe(true)
-    expect(exactTotalRows).toBe(rows.length)
     expect(
       measurements.reduce((sum, measurement) => sum + measurement.folderChildRowsRead, 0),
     ).toBe(dated.length)
     expect(
       measurements.reduce((sum, measurement) => sum + measurement.createdAtGroupProbeQueries, 0),
-    ).toBe(10)
+    ).toBe(0)
     expect(
       measurements.reduce((sum, measurement) => sum + measurement.createdAtGroupProbeKeysRead, 0),
-    ).toBe(5)
+    ).toBe(0)
   })
 
   it('rejects a presentation read aborted while compact catalogs resolve', async () => {
     const db = getDb()
     const controller = new AbortController()
-    vi.spyOn(db.folders, 'toArray').mockImplementationOnce(() =>
-      db.folders
-        .toCollection()
-        .toArray()
-        .then((folders) => {
-          controller.abort()
-          return folders
-        }),
+    const readAggregate = db.chatSidebarAggregates.get.bind(db.chatSidebarAggregates)
+    vi.spyOn(db.chatSidebarAggregates, 'get').mockImplementationOnce((key) =>
+      readAggregate(key).then((aggregate) => {
+        controller.abort()
+        return aggregate
+      }),
     )
 
     await expect(

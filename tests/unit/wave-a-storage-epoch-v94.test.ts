@@ -27,11 +27,13 @@ import type {
 import { waveACompletionSettingsV94 } from '../../src/store/browser-workspace-schema-v94'
 import {
   BROWSER_WORKSPACE_CURRENT_COMPLETION_KEY,
-  WAVE_B_V97_STORES,
-} from '../../src/store/browser-workspace-schema-v97'
+  WAVE_C_V98_STORES,
+} from '../../src/store/browser-workspace-schema-v98'
 import {
   type ChatSidebarProjectionRow,
   chatSidebarFolderKey,
+  chatSidebarProjectionBackfillMarker,
+  isValidChatSidebarFolderAggregateRow,
   isValidChatSidebarProjectionRow,
   isValidChatSidebarWorkspaceAggregateRow,
 } from '../../src/store/chat-sidebar-projection'
@@ -95,7 +97,7 @@ describe('Wave A final storage epoch migration', () => {
   })
 
   it('opens every committed-wave physical manifest through the one production cutover', async () => {
-    const expectedTables = Object.keys(activeStoreSpec(WAVE_B_V97_STORES)).sort()
+    const expectedTables = Object.keys(activeStoreSpec(WAVE_C_V98_STORES)).sort()
     const completionKeys = [
       ...waveACompletionSettingsV94().map((row) => row.key),
       BROWSER_WORKSPACE_CURRENT_COMPLETION_KEY,
@@ -183,7 +185,7 @@ describe('Wave A final storage epoch migration', () => {
 
       expect(migrated.verno).toBe(CURRENT_DB_VERSION)
       expect(migrated.tables.map((table) => table.name).sort()).toEqual(
-        Object.keys(activeStoreSpec(WAVE_B_V97_STORES)).sort(),
+        Object.keys(activeStoreSpec(WAVE_C_V98_STORES)).sort(),
       )
       expect(await migrated.settings.get('manifest-proof:wave-b-sentinel')).toEqual({
         key: 'manifest-proof:wave-b-sentinel',
@@ -307,7 +309,13 @@ describe('Wave A final storage epoch migration', () => {
     expect(migrated.verno).toBe(CURRENT_DB_VERSION)
     expect(
       await migrated.settings.bulkGet(waveACompletionSettingsV94().map((row) => row.key)),
-    ).toEqual(waveACompletionSettingsV94())
+    ).toEqual(
+      waveACompletionSettingsV94().map((row) =>
+        row.key === chatSidebarProjectionBackfillMarker().key
+          ? chatSidebarProjectionBackfillMarker()
+          : row,
+      ),
+    )
     expect(await migrated.settings.get(LEGACY_SAVED_TEXT_TEMPLATES_KEY)).toBeUndefined()
     expect(await migrated.textTemplates.count()).toBe(4_097)
     expect(await migrated.textTemplates.get(currentNewer.id)).toEqual(currentNewer)
@@ -696,6 +704,91 @@ describe('Wave A final storage epoch migration', () => {
       totalCostUsd: 0,
     })
     expect(obsoleteBytes).toBeGreaterThan(0)
+    db.close()
+  })
+
+  it('keeps deep legacy repair progressive and rebuilds folder aggregates in bounded passes', async () => {
+    const name = databaseName()
+    const db = new Dexie(name)
+    db.version(1).stores(WAVE_A_V94_STORES)
+    await db.open()
+    const settings = cloneDefaultChatSettings()
+    settings.profileId = 'profile'
+    settings.model = 'test/model'
+    const messageRows = Array.from({ length: 300 }, (_, index) =>
+      message(
+        `message-${index.toString().padStart(3, '0')}`,
+        index === 0 ? null : `message-${(index - 1).toString().padStart(3, '0')}`,
+        0,
+        index % 2 === 0 ? 'user' : 'assistant',
+        false,
+      ),
+    )
+    const stored = messageRows.map((row) => splitMessageForStorage(row))
+    await Promise.all([
+      db.table('folders').put({
+        id: 'folder',
+        name: 'Folder',
+        sortIndex: 0,
+        createdAt: 1,
+        updatedAt: 1,
+        lastUsedAt: 1,
+      }),
+      db.table('chats').put({
+        id: 'chat',
+        title: 'Deep repair',
+        titleStatus: 'manual',
+        createdAt: 1,
+        updatedAt: 300,
+        lastViewedAt: 300,
+        wordCount: 0,
+        totalCostUsd: 0,
+        metaVersion: 0,
+        summaryVersion: 0,
+        structuralVersion: 0,
+        configurationVersion: 0,
+        settings,
+        lastUpdatedLeafId: null,
+        lastBranchUpdatedAt: 300,
+        archived: false,
+        pinned: false,
+        folderId: 'folder',
+        tags: [],
+      } satisfies Chat),
+      db.table('messages').bulkPut(stored.map(({ header }) => header)),
+      db.table('messageBodies').bulkPut(stored.map(({ body }) => body)),
+      db.table('messagePreviews').bulkPut(stored.map(({ preview }) => preview)),
+    ])
+
+    const progress: Array<{ operation: string; processedRows: number }> = []
+    await db.transaction('rw', db.tables, (tx) =>
+      migrateWaveADerivedRowsV94(tx, {
+        observedAt: 400,
+        recordObsoleteBytes: () => undefined,
+        reportProgress: ({ operation, processedRows }) => {
+          progress.push({ operation, processedRows })
+        },
+      }),
+    )
+
+    const branchProgress = progress.filter(
+      ({ operation }) => operation === 'rebuild-branch-word-count',
+    )
+    expect(branchProgress.length).toBeGreaterThanOrEqual(3)
+    expect(branchProgress.at(-1)?.processedRows).toBe(300)
+    expect(
+      progress.some(({ operation }) => operation === 'rebuild-sidebar-folder-aggregates'),
+    ).toBe(true)
+    expect(
+      isValidChatSidebarFolderAggregateRow(
+        await db.table('chatSidebarAggregates').get('folder:folder'),
+      ),
+    ).toBe(true)
+    expect(await db.table('chats').get('chat')).toMatchObject({
+      folderId: 'folder',
+      lastUpdatedLeafId: 'message-299',
+      wordCount: 600,
+    })
     db.close()
   })
 

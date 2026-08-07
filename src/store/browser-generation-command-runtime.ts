@@ -289,13 +289,19 @@ export async function prepareBrowserAttempt(
   for (const ref of userIntent?.attachmentRefs ?? []) attachmentIds.add(ref.attachmentId)
   const scopes: MutationScope[] = [
     { kind: 'chat-meta', chatId },
-    { kind: 'message', messageId: assistantId },
+    {
+      kind: 'message',
+      messageId: assistantId,
+      ...(input.strategy === 'continue' ? {} : { access: 'create' as const }),
+    },
     ...[...attachmentIds].map((attachmentId) => ({
       kind: 'attachment' as const,
       attachmentId,
     })),
   ]
-  if (userIntent) scopes.push({ kind: 'message', messageId: userIntent.messageId })
+  if (userIntent) {
+    scopes.push({ kind: 'message', messageId: userIntent.messageId, access: 'create' })
+  }
   if (input.strategy !== 'continue') scopes.push({ kind: 'chat-topology', chatId })
   if (targetMessageId) scopes.push({ kind: 'message', messageId: targetMessageId })
   const mutation = await repository.runMutation(

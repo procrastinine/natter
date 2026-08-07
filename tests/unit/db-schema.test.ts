@@ -50,6 +50,11 @@ import type {
 import { hydrateAttachment } from '../../src/store/attachment-storage'
 import { BROWSER_WRITER_LOCK_NAME, type BrowserLockRow } from '../../src/store/browser-lock-record'
 import {
+  BROWSER_WORKSPACE_REGISTERED_UPGRADE_STRATEGIES,
+  CURRENT_BROWSER_WORKSPACE_STORAGE_EPOCH,
+  validateRegisteredUpgradeStrategies,
+} from '../../src/store/browser-workspace-upgrade-strategy'
+import {
   CHAT_SIDEBAR_PROJECTION_BACKFILL_KEY,
   CHAT_SIDEBAR_PROJECTION_MARKER_VERSION,
   CHAT_SIDEBAR_PROJECTION_ROW_VERSION,
@@ -106,6 +111,27 @@ describe('Dexie schema', () => {
   beforeEach(async () => {
     __resetDbForTests({ admissionsOpen: true })
     await Dexie.delete('natter')
+  })
+
+  it('makes every current upgrade a contiguous declared route with explicit locality', () => {
+    expect(() => validateRegisteredUpgradeStrategies()).not.toThrow()
+    expect(CURRENT_DB_VERSION).toBe(CURRENT_BROWSER_WORKSPACE_STORAGE_EPOCH.storageVersion)
+    const db = createDbForTests('upgrade-strategy-schema-proof')
+    const tableNames = new Set(db.tables.map((table) => table.name))
+    expect(db.verno).toBe(CURRENT_BROWSER_WORKSPACE_STORAGE_EPOCH.storageVersion)
+    for (const strategy of BROWSER_WORKSPACE_REGISTERED_UPGRADE_STRATEGIES) {
+      expect(strategy.sourcePhysicalVersion).toBe(strategy.sourceStorageVersion * 10)
+      expect(strategy.targetStorageVersion).toBeGreaterThan(strategy.sourceStorageVersion)
+      expect(strategy.schemaTouchedStores.every((tableName) => tableNames.has(tableName))).toBe(
+        true,
+      )
+      expect(strategy.dataReadStores.every((tableName) => tableNames.has(tableName))).toBe(true)
+      expect(strategy.progressOwner).not.toHaveLength(0)
+    }
+    expect(BROWSER_WORKSPACE_REGISTERED_UPGRADE_STRATEGIES.at(-1)?.targetStorageVersion).toBe(
+      CURRENT_BROWSER_WORKSPACE_STORAGE_EPOCH.storageVersion,
+    )
+    db.close()
   })
 
   it('opens on a fresh IndexedDB with all declared tables', async () => {
@@ -249,6 +275,13 @@ describe('Dexie schema', () => {
     )
     expect(db.attachmentCatalogAggregate.schema.primKey.src).toBe('id')
     expect(db.chatSidebarAggregates.schema.primKey.src).toBe('id')
+    expect(db.chatSidebarAggregates.schema.indexes.map((index) => index.src)).toEqual(
+      expect.arrayContaining([
+        '[folderNameKey+folderSortIndex+folderTitleSortKey+folderKey]',
+        '[kind+presentationPinnedDesc+updatedAtDesc+folderTitleSortKey+folderKey]',
+      ]),
+    )
+    expect(db.presets.schema.indexes.map((index) => index.src)).toContain('name')
     expect(db.models.schema.indexes.map((index) => index.src)).toEqual([
       'profileId',
       'fetchedAt',

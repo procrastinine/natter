@@ -6,4 +6,4 @@ export {
   setManualTitle,
   touchLastViewed,
 } from './chats'
-export { listTags } from './tags'
+export { getTags } from './tags'

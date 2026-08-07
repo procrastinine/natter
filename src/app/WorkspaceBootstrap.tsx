@@ -164,6 +164,8 @@ function databaseSelectionOpeningCopy(
   switch (progress.operation) {
     case 'read-active-slot':
       return 'Reading the active workspace database slot.'
+    case 'wait-for-open-connections':
+      return `Waiting for older tabs to release the workspace database${databaseName}.`
     case 'acquire-active-slot':
       return `Opening the active workspace slot${databaseName}.`
     case 'confirm-active-slot':

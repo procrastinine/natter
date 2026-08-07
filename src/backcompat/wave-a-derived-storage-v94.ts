@@ -20,9 +20,11 @@ import {
 } from '../store/bounded-idb-cursor'
 import {
   accumulateChatSidebarAggregateRows,
+  accumulateChatSidebarFolderRows,
   type ChatSidebarAggregateProjectionRow,
   type ChatSidebarProjectionRow,
   type ChatSidebarWorkspaceAggregateRow,
+  chatSidebarFolderAggregateRow,
   chatSidebarFolderKey,
   chatSidebarProjectionRow,
   createChatSidebarAggregateAccumulator,
@@ -36,6 +38,7 @@ import {
   type MessageTextPreviewRow,
   previewTextFromStoredProjection,
 } from '../store/message-storage'
+import { estimateStoredValueBytes } from '../store/storage-size-estimate'
 import { migrateLegacySavedTextTemplateRows } from './saved-text-template-rows'
 import type { WaveAStorageEpochMigrationCapabilitiesV94 } from './wave-a-storage-capabilities-v94'
 
@@ -189,9 +192,7 @@ async function rebuildOrganizationAndChatSidebarV94(
     clearDerivedTableV94(tx, 'chatSidebarRows', capabilities),
     clearDerivedTableV94(tx, 'chatSidebarAggregates', capabilities),
   ])
-  const folderIds = new Set(
-    await tx.table<ChatFolder, FolderId>('folders').toCollection().primaryKeys(),
-  )
+  const folders = tx.table<ChatFolder, FolderId>('folders')
   const chatWriter = boundedWriter<StoredOrganizationChatV94, ChatId>(
     chats,
     'WaveAOrganizationChats',
@@ -200,16 +201,7 @@ async function rebuildOrganizationAndChatSidebarV94(
     sidebarRows,
     'WaveAChatSidebarRows',
   )
-  const sidebarAggregateWriter = boundedWriter<ChatSidebarAggregateProjectionRow, string>(
-    sidebarAggregates,
-    'WaveAChatSidebarAggregates',
-  )
-  const rootFolderKey = chatSidebarFolderKey(null)
   const workspaceAggregate = emptyChatSidebarAggregateRow()
-  const folderAggregates = new Map<
-    string,
-    ReturnType<typeof createChatSidebarAggregateAccumulator>
-  >()
   const chatReader = openBoundedIdbCursorReader<StoredOrganizationChatV94>(
     tx.idbtrans.objectStore('chats').openCursor(),
     'WaveAOrganizationChatInput',
@@ -222,6 +214,7 @@ async function rebuildOrganizationAndChatSidebarV94(
   let messageEntry = await messageReader.next()
   let processedRows = 0
   let processedBytes = 0
+  const branchProgress = { processedRows: 0, processedBytes: 0 }
   while (chatEntry) {
     const chat = chatEntry.value
     while (messageEntry && indexedDB.cmp(messageEntry.value.chatId, chat.id) < 0) {
@@ -282,11 +275,19 @@ async function rebuildOrganizationAndChatSidebarV94(
       preview.bodyVersion === summary.earliestUser?.bodyVersion
         ? previewTextFromStoredProjection(preview.text)
         : ''
-    const wordCount = await branchWordCountV94(messages, summary.latestLeaf)
+    const wordCount = await branchWordCountV94(
+      messages,
+      summary.latestLeaf,
+      capabilities,
+      branchProgress,
+    )
+    const folderId =
+      typeof chat.folderId === 'string' && (await folders.get(chat.folderId)) !== undefined
+        ? chat.folderId
+        : null
     const next: Chat = {
       ...chat,
-      folderId:
-        typeof chat.folderId === 'string' && folderIds.has(chat.folderId) ? chat.folderId : null,
+      folderId,
       tags:
         Array.isArray(chat.tags) && chat.tags.every((tag) => typeof tag === 'string')
           ? chat.tags
@@ -311,14 +312,16 @@ async function rebuildOrganizationAndChatSidebarV94(
     }
     const sidebarRow = chatSidebarProjectionRow(next)
     await sidebarRowWriter.add(sidebarRow)
-    addWorkspaceRow(workspaceAggregate, sidebarRow, rootFolderKey)
-    if (sidebarRow.folderKey !== rootFolderKey) {
-      let folderAggregate = folderAggregates.get(sidebarRow.folderKey)
-      if (!folderAggregate) {
-        folderAggregate = createChatSidebarAggregateAccumulator()
-        folderAggregates.set(sidebarRow.folderKey, folderAggregate)
-      }
-      accumulateChatSidebarAggregateRows(folderAggregate, [sidebarRow])
+    addWorkspaceRow(workspaceAggregate, sidebarRow)
+    processedRows += 1
+    processedBytes = addDerivedBytesV94(processedBytes, chatEntry.estimatedBytes)
+    if (processedRows % PAGE_MAX_ROWS === 0) {
+      capabilities.reportProgress?.({
+        phase: 'derived-state',
+        operation: 'rebuild-organization-and-sidebar',
+        processedRows,
+        processedBytes,
+      })
     }
     chatEntry = await chatReader.next()
   }
@@ -328,33 +331,128 @@ async function rebuildOrganizationAndChatSidebarV94(
     processedRows,
     processedBytes,
   })
+  capabilities.reportProgress?.({
+    phase: 'derived-state',
+    operation: 'rebuild-branch-word-count',
+    processedRows: branchProgress.processedRows,
+    processedBytes: branchProgress.processedBytes,
+  })
   await Promise.all([chatWriter.flush(), sidebarRowWriter.flush()])
-  for (const [folderKey, accumulator] of folderAggregates) {
-    const row = materializeChatSidebarAggregateRows(accumulator).find(
-      (candidate) => candidate.kind === 'folder',
-    )
-    if (!row) throw new Error(`WaveAChatSidebarFolderAggregateMissing:${folderKey}`)
-    await sidebarAggregateWriter.add(row)
-  }
-  await sidebarAggregateWriter.add(workspaceAggregate)
-  await sidebarAggregateWriter.flush()
+  await sidebarAggregates.put(workspaceAggregate)
+  await rebuildFolderSidebarAggregatesV94(tx, folders, sidebarAggregates, capabilities)
 }
 
 async function branchWordCountV94(
   messages: Table<MessageHeaderRow, MessageId>,
   leaf: MessageHeaderRow | null,
+  capabilities: WaveAStorageEpochMigrationCapabilitiesV94,
+  progress: { processedRows: number; processedBytes: number },
 ): Promise<number> {
   let current = leaf
   let wordCount = 0
-  const visited = new Set<MessageId>()
-  while (current && !current.deleted && !visited.has(current.id)) {
-    visited.add(current.id)
+  let cycleAnchor = current
+  let cyclePower = 1
+  let cycleLength = 0
+  while (current && !current.deleted) {
     if (Number.isFinite(current.bodyWordCount) && current.bodyWordCount > 0) {
       wordCount += current.bodyWordCount
     }
-    current = current.parentId === null ? null : ((await messages.get(current.parentId)) ?? null)
+    progress.processedRows += 1
+    progress.processedBytes = addDerivedBytesV94(
+      progress.processedBytes,
+      estimateStoredValueBytes(current),
+    )
+    if (progress.processedRows % PAGE_MAX_ROWS === 0) {
+      capabilities.reportProgress?.({
+        phase: 'derived-state',
+        operation: 'rebuild-branch-word-count',
+        processedRows: progress.processedRows,
+        processedBytes: progress.processedBytes,
+      })
+    }
+    const next = current.parentId === null ? null : ((await messages.get(current.parentId)) ?? null)
+    cycleLength += 1
+    if (next && cycleAnchor?.id === next.id) {
+      throw new Error(`WaveAMessageParentCycle:${next.id}`)
+    }
+    if (cycleLength === cyclePower) {
+      cycleAnchor = next
+      cyclePower = Math.min(Number.MAX_SAFE_INTEGER, cyclePower * 2)
+      cycleLength = 0
+    }
+    current = next
   }
   return wordCount
+}
+
+async function rebuildFolderSidebarAggregatesV94(
+  tx: Transaction,
+  folders: Table<ChatFolder, FolderId>,
+  aggregates: Table<ChatSidebarAggregateProjectionRow, string>,
+  capabilities: WaveAStorageEpochMigrationCapabilitiesV94,
+): Promise<void> {
+  await forEachBoundedIdbCursorPage<ChatFolder>(
+    tx.idbtrans.objectStore('folders'),
+    cursorOptions('rebuild-sidebar-folder-seeds', capabilities),
+    async (page) => {
+      await aggregates.bulkPut(
+        page.entries.map(({ value: folder }) => chatSidebarFolderAggregateRow(folder)),
+      )
+    },
+  )
+  const rootFolderKey = chatSidebarFolderKey(null)
+  const rowReader = openBoundedIdbCursorReader<ChatSidebarProjectionRow>(
+    tx.idbtrans.objectStore('chatSidebarRows').index('folderKey').openCursor(),
+    'WaveASidebarFolderChatInput',
+  )
+  let activeFolderKey: string | null = null
+  let accumulator: ReturnType<typeof createChatSidebarAggregateAccumulator> | null = null
+  let processedRows = 0
+  let processedBytes = 0
+  const flush = async (): Promise<void> => {
+    if (!accumulator || activeFolderKey === null) return
+    const aggregate = materializeChatSidebarAggregateRows(accumulator).find(
+      (candidate) => candidate.kind === 'folder',
+    )
+    if (!aggregate) {
+      throw new Error(`WaveAChatSidebarFolderAggregateMissing:${activeFolderKey}`)
+    }
+    await aggregates.put(aggregate)
+  }
+  for (let entry = await rowReader.next(); entry; entry = await rowReader.next()) {
+    const row = entry.value
+    if (row.folderKey === rootFolderKey) continue
+    if (row.folderKey !== activeFolderKey) {
+      await flush()
+      const folder = await folders.get(row.folderKey)
+      if (!folder) throw new Error(`WaveAChatSidebarFolderMissing:${row.folderKey}`)
+      activeFolderKey = row.folderKey
+      accumulator = createChatSidebarAggregateAccumulator()
+      accumulateChatSidebarFolderRows(accumulator, [folder])
+    }
+    if (!accumulator) throw new Error('WaveAChatSidebarFolderAccumulatorMissing')
+    accumulateChatSidebarAggregateRows(accumulator, [row])
+    processedRows += 1
+    processedBytes = addDerivedBytesV94(processedBytes, entry.estimatedBytes)
+    if (processedRows % PAGE_MAX_ROWS === 0) {
+      reportFolderAggregateProgress(capabilities, processedRows, processedBytes)
+    }
+  }
+  await flush()
+  reportFolderAggregateProgress(capabilities, processedRows, processedBytes)
+}
+
+function reportFolderAggregateProgress(
+  capabilities: WaveAStorageEpochMigrationCapabilitiesV94,
+  processedRows: number,
+  processedBytes: number,
+): void {
+  capabilities.reportProgress?.({
+    phase: 'derived-state',
+    operation: 'rebuild-sidebar-folder-aggregates',
+    processedRows,
+    processedBytes,
+  })
 }
 
 function validTitleStatusV94(value: unknown): value is ChatTitleStatus {
@@ -379,7 +477,6 @@ function finiteNumberV94(value: unknown): value is number {
 function addWorkspaceRow(
   workspace: ChatSidebarWorkspaceAggregateRow,
   row: ChatSidebarProjectionRow,
-  rootFolderKey: string,
 ): void {
   workspace.totalCount += 1
   workspace.activeCount += Number(!row.archived)
@@ -387,7 +484,7 @@ function addWorkspaceRow(
   workspace.pinnedCount += Number(row.pinned)
   workspace.visibleCount += Number(row.visibleKey === 1)
   workspace.visiblePinnedCount += Number(row.visibleKey === 1 && row.pinned)
-  if (row.folderKey !== rootFolderKey) return
+  if (row.folderKey !== chatSidebarFolderKey(null)) return
   workspace.rootCount += 1
   workspace.rootVisibleCount += Number(row.visibleKey === 1)
   workspace.rootVisiblePinnedCount += Number(row.visibleKey === 1 && row.pinned)
@@ -415,6 +512,12 @@ async function clearDerivedTableV94(
   tableName: string,
   capabilities: WaveAStorageEpochMigrationCapabilitiesV94,
 ): Promise<void> {
+  capabilities.reportProgress?.({
+    phase: 'derived-state',
+    operation: `WaveAClear:${tableName}`,
+    processedRows: 0,
+    processedBytes: 0,
+  })
   await forEachBoundedIdbCursorPage<unknown>(
     tx.idbtrans.objectStore(tableName),
     cursorOptions(`WaveAClear:${tableName}`, capabilities),

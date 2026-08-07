@@ -175,6 +175,276 @@ test('startup opens the committed source while a live replacement owns selection
   }
 })
 
+test('many reloading tabs elect one bounded registered upgrade for a valid v97 workspace', async ({
+  context,
+  page,
+}) => {
+  await waitForWorkspaceRunning(page)
+  const databaseName = await activeWorkspaceDatabaseName(page)
+  const schema = await readDatabaseSchema(page, databaseName)
+  const rows = await readDatabaseRows(page, databaseName)
+  const resetRoute = '**/__startup-v97-reset__'
+  await page.route(resetRoute, (route) =>
+    route.fulfill({ contentType: 'text/html', body: '<!doctype html><title>Reset</title>' }),
+  )
+  await page.goto('/__startup-v97-reset__')
+  await page.evaluate(
+    async ({ databaseName, rows, schema }) => {
+      await new Promise<void>((resolve, reject) => {
+        const request = indexedDB.deleteDatabase(databaseName)
+        request.onsuccess = () => resolve()
+        request.onerror = () => reject(request.error)
+        request.onblocked = () => reject(new Error('RegisteredV97DeleteBlocked'))
+      })
+      const database = await new Promise<IDBDatabase>((resolve, reject) => {
+        const request = indexedDB.open(databaseName, 970)
+        request.onupgradeneeded = () => {
+          for (const definition of schema) {
+            const store = request.result.createObjectStore(definition.name, {
+              keyPath: definition.keyPath,
+              autoIncrement: definition.autoIncrement,
+            })
+            const indexes =
+              definition.name === 'chatSidebarAggregates'
+                ? definition.indexes.filter((index) => index.name === 'kind')
+                : definition.name === 'presets'
+                  ? []
+                  : definition.indexes
+            for (const index of indexes) {
+              store.createIndex(index.name, index.keyPath, {
+                unique: index.unique,
+                multiEntry: index.multiEntry,
+              })
+            }
+          }
+        }
+        request.onsuccess = () => resolve(request.result)
+        request.onerror = () => reject(request.error)
+      })
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const transaction = database.transaction(
+            schema.map((definition) => definition.name),
+            'readwrite',
+          )
+          for (const table of rows) {
+            const store = transaction.objectStore(table.name)
+            for (const row of table.rows) {
+              if (
+                table.name === 'settings' &&
+                (row as { key?: unknown }).key === 'backfill:browser-workspace-current-v98'
+              ) {
+                continue
+              }
+              if (
+                table.name === 'chatSidebarAggregates' &&
+                (row as { id?: unknown }).id === 'workspace'
+              ) {
+                continue
+              }
+              store.put(row)
+            }
+          }
+          transaction.objectStore('settings').put({
+            key: 'backfill:browser-workspace-current-v97',
+            value: {
+              formatVersion: 3,
+              storageVersion: 97,
+              phase: 'canonical-and-derived-complete',
+            },
+          })
+          transaction.objectStore('settings').put({
+            key: 'registered-upgrade-browser-proof',
+            value: 'preserved',
+          })
+          transaction.objectStore('chatSidebarAggregates').put({
+            id: 'workspace',
+            kind: 'workspace',
+            projectionVersion: 2,
+            totalCount: 0,
+            activeCount: 0,
+            archivedCount: 0,
+            pinnedCount: 0,
+            visibleCount: 0,
+            visiblePinnedCount: 0,
+            rootCount: 0,
+            rootVisibleCount: 0,
+            rootVisiblePinnedCount: 0,
+          })
+          const folders = transaction.objectStore('folders')
+          for (let index = 0; index < 300; index += 1) {
+            folders.put({
+              id: `folder-${index}`,
+              name: `Folder ${index}`,
+              sortIndex: index,
+              createdAt: 1,
+              updatedAt: 1,
+              lastUsedAt: 1,
+            })
+          }
+          transaction.oncomplete = () => resolve()
+          transaction.onerror = () => reject(transaction.error)
+          transaction.onabort = () => reject(transaction.error)
+        })
+      } finally {
+        database.close()
+      }
+    },
+    { databaseName, rows, schema },
+  )
+  await page.unroute(resetRoute)
+
+  await context.addInitScript(() => {
+    const forbidden: string[] = []
+    const allowedUpgradeReadStores = new Set(['chatSidebarAggregates', 'folders', 'settings'])
+    const noteStoreRead = (store: IDBObjectStore, operation: string) => {
+      if (store.transaction.mode === 'versionchange' && !allowedUpgradeReadStores.has(store.name)) {
+        forbidden.push(`${store.name}.${operation}`)
+      }
+    }
+    const objectStoreGet = IDBObjectStore.prototype.get
+    IDBObjectStore.prototype.get = function (...args) {
+      noteStoreRead(this, 'get')
+      return objectStoreGet.apply(this, args)
+    }
+    const objectStoreGetAll = IDBObjectStore.prototype.getAll
+    IDBObjectStore.prototype.getAll = function (...args) {
+      noteStoreRead(this, 'getAll')
+      return objectStoreGetAll.apply(this, args)
+    }
+    const objectStoreCount = IDBObjectStore.prototype.count
+    IDBObjectStore.prototype.count = function (...args) {
+      noteStoreRead(this, 'count')
+      return objectStoreCount.apply(this, args)
+    }
+    const objectStoreGetAllKeys = IDBObjectStore.prototype.getAllKeys
+    IDBObjectStore.prototype.getAllKeys = function (...args) {
+      noteStoreRead(this, 'getAllKeys')
+      return objectStoreGetAllKeys.apply(this, args)
+    }
+    const objectStoreOpenCursor = IDBObjectStore.prototype.openCursor
+    IDBObjectStore.prototype.openCursor = function (...args) {
+      noteStoreRead(this, 'openCursor')
+      return objectStoreOpenCursor.apply(this, args)
+    }
+    const objectStoreOpenKeyCursor = IDBObjectStore.prototype.openKeyCursor
+    IDBObjectStore.prototype.openKeyCursor = function (...args) {
+      noteStoreRead(this, 'openKeyCursor')
+      return objectStoreOpenKeyCursor.apply(this, args)
+    }
+    const indexOpenCursor = IDBIndex.prototype.openCursor
+    const indexGet = IDBIndex.prototype.get
+    IDBIndex.prototype.get = function (...args) {
+      noteStoreRead(this.objectStore, `${this.name}.get`)
+      return indexGet.apply(this, args)
+    }
+    const indexGetAll = IDBIndex.prototype.getAll
+    IDBIndex.prototype.getAll = function (...args) {
+      noteStoreRead(this.objectStore, `${this.name}.getAll`)
+      return indexGetAll.apply(this, args)
+    }
+    const indexCount = IDBIndex.prototype.count
+    IDBIndex.prototype.count = function (...args) {
+      noteStoreRead(this.objectStore, `${this.name}.count`)
+      return indexCount.apply(this, args)
+    }
+    const indexGetAllKeys = IDBIndex.prototype.getAllKeys
+    IDBIndex.prototype.getAllKeys = function (...args) {
+      noteStoreRead(this.objectStore, `${this.name}.getAllKeys`)
+      return indexGetAllKeys.apply(this, args)
+    }
+    IDBIndex.prototype.openCursor = function (...args) {
+      noteStoreRead(this.objectStore, `${this.name}.openCursor`)
+      return indexOpenCursor.apply(this, args)
+    }
+    const indexOpenKeyCursor = IDBIndex.prototype.openKeyCursor
+    IDBIndex.prototype.openKeyCursor = function (...args) {
+      noteStoreRead(this.objectStore, `${this.name}.openKeyCursor`)
+      return indexOpenKeyCursor.apply(this, args)
+    }
+    ;(
+      globalThis as typeof globalThis & {
+        __registeredUpgradeForbiddenReads?: string[]
+      }
+    ).__registeredUpgradeForbiddenReads = forbidden
+  })
+
+  const pages = [page, ...(await Promise.all(Array.from({ length: 5 }, () => context.newPage())))]
+  try {
+    await Promise.all(pages.map((candidate) => candidate.goto('/')))
+    await Promise.all(
+      pages.map(async (candidate) => {
+        await expect(candidate.locator('[data-ui="app-shell"]')).toBeVisible()
+        await expect(candidate.locator('[data-ui="workspace-bootstrap"]')).toHaveCount(0)
+        await expect.poll(() => activeWorkspaceDatabaseName(candidate)).toBe(databaseName)
+      }),
+    )
+    const proof = await page.evaluate(
+      async ({ databaseName }) => {
+        const database = await new Promise<IDBDatabase>((resolve, reject) => {
+          const request = indexedDB.open(databaseName)
+          request.onsuccess = () => resolve(request.result)
+          request.onerror = () => reject(request.error)
+        })
+        try {
+          const values = await new Promise<unknown[]>((resolve, reject) => {
+            const transaction = database.transaction('settings', 'readonly')
+            const settings = transaction.objectStore('settings')
+            const requests: IDBRequest<unknown>[] = [
+              settings.get('backfill:browser-workspace-current-v97'),
+              settings.get('backfill:browser-workspace-current-v98'),
+              settings.get('registered-upgrade-browser-proof'),
+            ]
+            transaction.oncomplete = () => resolve(requests.map((request) => request.result))
+            transaction.onerror = () => reject(transaction.error)
+            transaction.onabort = () => reject(transaction.error)
+          })
+          return {
+            version: database.version,
+            values,
+            databases: (await indexedDB.databases()).flatMap((entry) =>
+              entry.name === undefined ? [] : [entry.name],
+            ),
+          }
+        } finally {
+          database.close()
+        }
+      },
+      { databaseName },
+    )
+    expect(proof).toMatchObject({
+      version: 980,
+      values: [
+        undefined,
+        {
+          key: 'backfill:browser-workspace-current-v98',
+          value: {
+            formatVersion: 4,
+            storageVersion: 98,
+            phase: 'canonical-and-derived-complete',
+          },
+        },
+        { key: 'registered-upgrade-browser-proof', value: 'preserved' },
+      ],
+      databases: expect.not.arrayContaining(['natter-workspace-a', 'natter-workspace-b']),
+    })
+    for (const candidate of pages) {
+      expect(
+        await candidate.evaluate(
+          () =>
+            (
+              globalThis as typeof globalThis & {
+                __registeredUpgradeForbiddenReads?: string[]
+              }
+            ).__registeredUpgradeForbiddenReads ?? [],
+        ),
+      ).toEqual([])
+    }
+  } finally {
+    await Promise.all(pages.slice(1).map((candidate) => candidate.close()))
+  }
+})
+
 test('an observed intermediate v94 workspace repairs on an inactive slot across browser engines', async ({
   context,
   page,
@@ -182,6 +452,7 @@ test('an observed intermediate v94 workspace repairs on an inactive slot across 
   await waitForWorkspaceRunning(page)
   const databaseName = await activeWorkspaceDatabaseName(page)
   const schema = await readDatabaseSchema(page, databaseName)
+  const legacyRows = legacyRepairFixtureRows({})
   expect(schema.length).toBeGreaterThan(0)
   const resetRoute = '**/__startup-v94-reset__'
   await page.route(resetRoute, (route) =>
@@ -189,7 +460,7 @@ test('an observed intermediate v94 workspace repairs on an inactive slot across 
   )
   await page.goto('/__startup-v94-reset__')
   await page.evaluate(
-    async ({ databaseName, schema }) => {
+    async ({ databaseName, legacyRows, schema }) => {
       await new Promise<void>((resolve, reject) => {
         const request = indexedDB.deleteDatabase(databaseName)
         request.onsuccess = () => resolve()
@@ -217,11 +488,25 @@ test('an observed intermediate v94 workspace repairs on an inactive slot across 
       })
       try {
         await new Promise<void>((resolve, reject) => {
-          const transaction = database.transaction('settings', 'readwrite')
+          const transaction = database.transaction(
+            ['settings', 'folders', 'chats', 'messages', 'messageBodies', 'messagePreviews'],
+            'readwrite',
+          )
           transaction.objectStore('settings').put({
             key: 'manifest-proof:chromium-v94',
             value: 'preserved',
           })
+          transaction.objectStore('folders').put(legacyRows.folder)
+          transaction.objectStore('chats').put(legacyRows.chat)
+          for (const header of legacyRows.headers) {
+            transaction.objectStore('messages').put(header)
+          }
+          for (const body of legacyRows.bodies) {
+            transaction.objectStore('messageBodies').put(body)
+          }
+          for (const preview of legacyRows.previews) {
+            transaction.objectStore('messagePreviews').put(preview)
+          }
           transaction.oncomplete = () => resolve()
           transaction.onerror = () => reject(transaction.error)
           transaction.onabort = () => reject(transaction.error)
@@ -230,13 +515,14 @@ test('an observed intermediate v94 workspace repairs on an inactive slot across 
         database.close()
       }
     },
-    { databaseName, schema },
+    { databaseName, legacyRows, schema },
   )
   await page.unroute(resetRoute)
 
   const competingPage = await context.newPage()
   try {
     await Promise.all([page.goto('/'), competingPage.goto('/')])
+    await Promise.all([waitForWorkspaceRunning(page), waitForWorkspaceRunning(competingPage)])
     await expect(page.locator('[data-ui="workspace-bootstrap"]')).toHaveCount(0)
     await expect(competingPage.locator('[data-ui="workspace-bootstrap"]')).toHaveCount(0)
     await expect(page.locator('[data-ui="app-shell"]')).toBeVisible()
@@ -254,17 +540,26 @@ test('an observed intermediate v94 workspace repairs on an inactive slot across 
               request.onerror = () => reject(request.error)
             })
             try {
-              const sentinel = await new Promise<unknown>((resolve, reject) => {
-                const request = database
-                  .transaction('settings', 'readonly')
-                  .objectStore('settings')
-                  .get('manifest-proof:chromium-v94')
-                request.onsuccess = () => resolve(request.result)
-                request.onerror = () => reject(request.error)
+              const repairedRows = await new Promise<unknown[]>((resolve, reject) => {
+                const transaction = database.transaction(
+                  ['settings', 'chats', 'chatSidebarAggregates'],
+                  'readonly',
+                )
+                const requests: IDBRequest<unknown>[] = [
+                  transaction.objectStore('settings').get('manifest-proof:chromium-v94'),
+                  transaction.objectStore('chats').get('legacy-repair-chat'),
+                  transaction.objectStore('chatSidebarAggregates').get('workspace'),
+                  transaction
+                    .objectStore('chatSidebarAggregates')
+                    .get('folder:legacy-repair-folder'),
+                ]
+                transaction.oncomplete = () => resolve(requests.map((request) => request.result))
+                transaction.onerror = () => reject(transaction.error)
+                transaction.onabort = () => reject(transaction.error)
               })
               return {
                 version: database.version,
-                sentinel,
+                repairedRows,
                 databases: (await indexedDB.databases()).flatMap((entry) =>
                   entry.name === undefined ? [] : [entry.name],
                 ),
@@ -278,11 +573,29 @@ test('an observed intermediate v94 workspace repairs on an inactive slot across 
         ),
       )
       .toMatchObject({
-        version: 970,
-        sentinel: {
-          key: 'manifest-proof:chromium-v94',
-          value: 'preserved',
-        },
+        version: 980,
+        repairedRows: [
+          {
+            key: 'manifest-proof:chromium-v94',
+            value: 'preserved',
+          },
+          expect.objectContaining({
+            id: 'legacy-repair-chat',
+            folderId: 'legacy-repair-folder',
+            lastUpdatedLeafId: 'legacy-message-299',
+            wordCount: 900,
+          }),
+          expect.objectContaining({
+            id: 'workspace',
+            kind: 'workspace',
+            totalCount: 1,
+          }),
+          expect.objectContaining({
+            id: 'folder:legacy-repair-folder',
+            kind: 'folder',
+            count: 1,
+          }),
+        ],
         databases: expect.not.arrayContaining([databaseName]),
       })
   } finally {
@@ -290,31 +603,92 @@ test('an observed intermediate v94 workspace repairs on an inactive slot across 
   }
 })
 
-test('a poisoned local database shows recovery instead of a blank root', async ({
-  browserName,
-  expectRuntimeDiagnostic,
-  page,
-}) => {
-  await waitForWorkspaceRunning(page)
-  expectRuntimeDiagnostic(
-    browserName === 'firefox'
-      ? {
-          category: 'console-other',
-          source: 'console',
-          level: 'error',
-          message: '^Failed to inspect workspace backend for persistence request Error$',
-          detail: '^argument 2: Error: WaveAMessageBodyMissing:message-poison(?:\\n|$)',
-          count: 1,
-        }
-      : {
-          category: 'console-other',
-          source: 'console',
-          level: 'error',
-          message:
-            '^Failed to inspect workspace backend for persistence request Error: WaveAMessageBodyMissing:message-poison',
-          count: 1,
+function legacyRepairFixtureRows(settings: unknown) {
+  const stored = Array.from({ length: 300 }, (_, index) => {
+    const id = `legacy-message-${index.toString().padStart(3, '0')}`
+    const parentId =
+      index === 0 ? null : `legacy-message-${(index - 1).toString().padStart(3, '0')}`
+    const text = `legacy message ${index.toString().padStart(3, '0')}`
+    return {
+      header: {
+        id,
+        chatId: 'legacy-repair-chat',
+        parentId,
+        siblingIndex: 0,
+        turnId: `legacy-turn-${index.toString().padStart(3, '0')}`,
+        turnIndex: index,
+        createdAt: index + 1,
+        role: index % 2 === 0 ? 'user' : 'assistant',
+        origin: index % 2 === 0 ? 'user' : 'generated',
+        nodeVersion: 0,
+        deleted: false,
+        attachmentRefs: [],
+        requestContextVersion: 0,
+        bodyVersion: 0,
+        bodyWordCount: 0,
+        bodyTextCharCount: 0,
+        bodyMediaCount: 0,
+        bodyRenderCost: 0,
+        contextRouteFacts: {
+          reasoningCarriers: [],
+          hasOpenAiResponsesProviderOutput: false,
         },
-  )
+        treeParentKey: parentId ?? '__root__',
+        treeLive: 1,
+      },
+      body: {
+        id,
+        chatId: 'legacy-repair-chat',
+        bodyVersion: 0,
+        updatedAt: index + 1,
+        content: [{ type: 'text', text }],
+      },
+      preview: {
+        id,
+        chatId: 'legacy-repair-chat',
+        bodyVersion: 0,
+        text,
+      },
+    }
+  })
+  return {
+    folder: {
+      id: 'legacy-repair-folder',
+      name: 'Legacy repair folder',
+      sortIndex: 0,
+      createdAt: 1,
+      updatedAt: 1,
+      lastUsedAt: 1,
+    },
+    chat: {
+      id: 'legacy-repair-chat',
+      title: 'Legacy repair chat',
+      titleStatus: 'manual',
+      createdAt: 1,
+      updatedAt: 300,
+      lastViewedAt: 300,
+      wordCount: 0,
+      totalCostUsd: 0,
+      metaVersion: 0,
+      summaryVersion: 0,
+      structuralVersion: 0,
+      configurationVersion: 0,
+      settings,
+      lastUpdatedLeafId: null,
+      lastBranchUpdatedAt: 300,
+      archived: false,
+      pinned: false,
+      folderId: 'legacy-repair-folder',
+      tags: [],
+    },
+    headers: stored.map(({ header }) => header),
+    bodies: stored.map(({ body }) => body),
+    previews: stored.map(({ preview }) => preview),
+  }
+}
+
+test('a poisoned local database shows recovery instead of a blank root', async ({ page }) => {
+  await waitForWorkspaceRunning(page)
   const databaseName = await activeWorkspaceDatabaseName(page)
   const schema = await page.evaluate(async (databaseName) => {
     const db = await new Promise<IDBDatabase>((resolve, reject) => {
@@ -445,6 +819,31 @@ function readDatabaseSchema(page: Page, databaseName: string) {
           }),
         }
       })
+    } finally {
+      database.close()
+    }
+  }, databaseName)
+}
+
+function readDatabaseRows(page: Page, databaseName: string) {
+  return page.evaluate(async (databaseName) => {
+    const database = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open(databaseName)
+      request.onsuccess = () => resolve(request.result)
+      request.onerror = () => reject(request.error)
+    })
+    try {
+      const names = Array.from(database.objectStoreNames)
+      const transaction = database.transaction(names, 'readonly')
+      const reads = names.map(
+        (name) =>
+          new Promise<{ name: string; rows: unknown[] }>((resolve, reject) => {
+            const request = transaction.objectStore(name).getAll()
+            request.onsuccess = () => resolve({ name, rows: request.result })
+            request.onerror = () => reject(request.error)
+          }),
+      )
+      return await Promise.all(reads)
     } finally {
       database.close()
     }

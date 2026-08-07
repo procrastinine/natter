@@ -170,48 +170,36 @@ function createWorkspaceSource(repository?: WorkspaceRepository): StorageChatCat
             value: { catalog: catalog.value },
           }
         }
-        const [catalog, aggregate, folders, tags] = await Promise.all([
+        const [catalog, aggregate] = await Promise.all([
           workspace.query(
             permit,
             { kind: 'sidebar.catalog-page', request },
             { signal: permit.signal },
           ),
           workspace.query(permit, { kind: 'sidebar.aggregate' }, { signal: permit.signal }),
-          workspace.query(permit, { kind: 'folder.list' }, { signal: permit.signal }),
-          workspace.query(permit, { kind: 'tag.list' }, { signal: permit.signal }),
         ])
-        const excludedFolders = new Set(request.excludeFolderIds ?? [])
-        const createdAtGroups = request.createdAtGroupBoundaries
-          ? await workspace.query(
-              permit,
-              {
-                kind: 'sidebar.created-at-group-count',
-                request: {
-                  folderIds: folders.value
-                    .map((folder) => folder.id)
-                    .filter((folderId) => !excludedFolders.has(folderId)),
-                  boundaries: request.createdAtGroupBoundaries,
-                },
-              },
-              { signal: permit.signal },
-            )
-          : null
-        assertSameFence(
-          catalog,
-          aggregate,
-          folders,
-          tags,
-          ...(createdAtGroups ? [createdAtGroups] : []),
-        )
+        const folderIds = [
+          ...new Set(catalog.value.rows.flatMap((chat) => (chat.folderId ? [chat.folderId] : []))),
+        ]
+        const tagIds = [...new Set(catalog.value.rows.flatMap((chat) => chat.tags))]
+        const [folders, tags] = await Promise.all([
+          workspace.query(
+            permit,
+            { kind: 'folder.get-many', folderIds },
+            { signal: permit.signal },
+          ),
+          workspace.query(permit, { kind: 'tag.get-many', tagIds }, { signal: permit.signal }),
+        ])
+        assertSameFence(catalog, aggregate, folders, tags)
         return {
           workspaceId: catalog.workspaceId,
           replacementEpoch: catalog.replacementEpoch,
           value: {
             catalog: catalog.value,
             aggregate: aggregate.value,
-            folders: folders.value,
-            tags: tags.value,
-            createdAtGroupCount: createdAtGroups?.value ?? 0,
+            folders: folders.value.filter((folder) => folder !== undefined),
+            tags: tags.value.filter((tag) => tag !== undefined),
+            createdAtGroupCount: 0,
           },
         }
       }),

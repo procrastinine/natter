@@ -1,5 +1,5 @@
 import Dexie from 'dexie'
-import { errorFromUnknown } from '../lib/error'
+import { errorFromUnknown, errorHasName } from '../lib/error'
 import type { BrowserWorkspaceDatabaseName } from '../lib/origin-storage-names'
 import { probeBrowserWorkspaceCurrent } from './browser-workspace-current-probe'
 import { cleanPendingBrowserWorkspaceDatabase } from './browser-workspace-database-cleanup'
@@ -12,16 +12,19 @@ import {
   tryBeginBrowserWorkspaceDatabaseReplacement,
 } from './browser-workspace-database-control'
 import type { BrowserWorkspaceOpenProgress } from './browser-workspace-open-contract'
-import { WAVE_B_STORAGE_VERSION } from './browser-workspace-schema-v97'
 import {
   browserWorkspaceSlotSwitchingSupported,
   postBrowserWorkspaceSlotQuiesce,
   withBrowserWorkspaceSelectionGate,
+  withBrowserWorkspaceSlotProbe,
+  withBrowserWorkspaceSlotVersionChange,
   withExclusiveBrowserWorkspaceSlots,
 } from './browser-workspace-slot-coordination'
+import { CURRENT_BROWSER_WORKSPACE_STORAGE_EPOCH } from './browser-workspace-upgrade-strategy'
 import {
   normalizeInactiveBrowserWorkspaceDatabase,
   recreateAndVerifyBrowserWorkspaceDatabase,
+  upgradeRegisteredBrowserWorkspaceDatabase,
 } from './db'
 import {
   CANONICAL_PHYSICAL_STORAGE_TABLE_NAMES,
@@ -52,10 +55,20 @@ export interface BrowserWorkspaceCurrentSelectionProof {
 export async function ensureBrowserWorkspaceCurrentForSelection(
   signal: AbortSignal,
   onProgress?: (progress: BrowserWorkspaceOpenProgress) => void,
+  onBlocked?: (event: IDBVersionChangeEvent) => void,
 ): Promise<BrowserWorkspaceCurrentSelectionProof> {
   if (signal.aborted) throw signal.reason
-  const committed = await readBrowserWorkspaceDatabaseManifest()
-  const committedProbe = await probeBrowserWorkspaceCurrent(committed.activeDatabaseName)
+  const committed = await runStartupRepairStage('read-committed-manifest', () =>
+    readBrowserWorkspaceDatabaseManifest(),
+  )
+  const committedProbe = await withBrowserWorkspaceSlotProbe(
+    committed.activeDatabaseName,
+    () =>
+      runStartupRepairStage('probe-committed-database', () =>
+        probeBrowserWorkspaceCurrent(committed.activeDatabaseName),
+      ),
+    signal,
+  )
   if (committedProbe.kind === 'current') {
     return {
       databaseName: committed.activeDatabaseName,
@@ -68,24 +81,53 @@ export async function ensureBrowserWorkspaceCurrentForSelection(
       `BrowserWorkspaceSchemaIntegrity:future-version:${committedProbe.physicalVersion}`,
     )
   }
+  if (committedProbe.kind === 'strategy-missing') {
+    throw new Error(
+      `BrowserWorkspaceSchemaIntegrity:upgrade-strategy-missing:${committedProbe.physicalVersion}:${CURRENT_BROWSER_WORKSPACE_STORAGE_EPOCH.physicalVersion}`,
+    )
+  }
   if (committedProbe.kind === 'absent' && !committed.pending) {
     return {
       databaseName: committed.activeDatabaseName,
       activationSequence: committed.activationSequence,
-      physicalVersion: WAVE_B_STORAGE_VERSION * 10,
+      physicalVersion: CURRENT_BROWSER_WORKSPACE_STORAGE_EPOCH.physicalVersion,
     }
   }
-  await settlePendingBrowserWorkspaceReplacement(signal)
+  await runStartupRepairStage('settle-pending-replacement', () =>
+    settlePendingBrowserWorkspaceReplacement(signal),
+  )
   return withBrowserWorkspaceSelectionGate(async () => {
     if (signal.aborted) throw signal.reason
-    const manifest = await readBrowserWorkspaceDatabaseManifest()
+    const manifest = await runStartupRepairStage('read-gated-manifest', () =>
+      readBrowserWorkspaceDatabaseManifest(),
+    )
     if (manifest.pending) throw new Error('BrowserWorkspaceStartupRepairJournalOccupied')
-    const probe = await probeBrowserWorkspaceCurrent(manifest.activeDatabaseName)
+    const probe = await withBrowserWorkspaceSlotVersionChange(
+      manifest.activeDatabaseName,
+      async () => {
+        const observed = await runStartupRepairStage('probe-gated-database', () =>
+          probeBrowserWorkspaceCurrent(manifest.activeDatabaseName),
+        )
+        if (observed.kind !== 'upgrade-required') return observed
+        await upgradeRegisteredBrowserWorkspaceDatabase(manifest.activeDatabaseName, {
+          expectedPhysicalVersion: observed.physicalVersion,
+          signal,
+          ...(onProgress ? { onProgress } : {}),
+          ...(onBlocked ? { onBlocked } : {}),
+        })
+        const upgraded = await probeBrowserWorkspaceCurrent(manifest.activeDatabaseName)
+        if (upgraded.kind !== 'current') {
+          throw new Error(`BrowserWorkspaceRegisteredUpgradeIncomplete:${upgraded.kind}`)
+        }
+        return upgraded
+      },
+      signal,
+    )
     if (probe.kind === 'absent') {
       return {
         databaseName: manifest.activeDatabaseName,
         activationSequence: manifest.activationSequence,
-        physicalVersion: WAVE_B_STORAGE_VERSION * 10,
+        physicalVersion: CURRENT_BROWSER_WORKSPACE_STORAGE_EPOCH.physicalVersion,
       }
     }
     if (probe.kind === 'current') {
@@ -98,45 +140,54 @@ export async function ensureBrowserWorkspaceCurrentForSelection(
     if (probe.kind === 'future') {
       throw new Error(`BrowserWorkspaceSchemaIntegrity:future-version:${probe.physicalVersion}`)
     }
+    if (probe.kind === 'strategy-missing') {
+      throw new Error(
+        `BrowserWorkspaceSchemaIntegrity:upgrade-strategy-missing:${probe.physicalVersion}:${CURRENT_BROWSER_WORKSPACE_STORAGE_EPOCH.physicalVersion}`,
+      )
+    }
     if (!browserWorkspaceSlotSwitchingSupported()) {
       throw new Error('BrowserWorkspaceStartupRepairRequiresSlotCoordination')
     }
 
-    const begin = await tryBeginBrowserWorkspaceDatabaseReplacement()
+    const begin = await runStartupRepairStage('begin-replacement', () =>
+      tryBeginBrowserWorkspaceDatabaseReplacement(),
+    )
     if (begin.kind === 'occupied') throw new Error('BrowserWorkspaceStartupRepairJournalOccupied')
     const journal = begin.journal
     postBrowserWorkspaceSlotQuiesce(journal)
     const activation = { completed: false }
     try {
-      await withExclusiveBrowserWorkspaceSlots(
-        [journal.sourceDatabaseName, journal.destinationDatabaseName],
-        async () => {
-          const copied = await prepareInactiveBrowserWorkspaceRepair(
-            journal,
-            probe.physicalVersion,
-            signal,
-            onProgress,
-          )
-          if (signal.aborted) throw signal.reason
-          onProgress?.({
-            kind: 'database-upgrade',
-            databaseName: journal.destinationDatabaseName,
-            fromVersion: probe.physicalVersion / 10,
-            targetVersion: WAVE_B_STORAGE_VERSION,
-            phase: 'inactive-activation',
-            operation: 'activate-repaired-destination',
-            processedRows: copied.copiedRows,
-            processedBytes: copied.estimatedLiveBytes,
-          })
-          await activatePreparedBrowserWorkspaceDatabase(journal, {
-            kind: 'carry-source',
-            liveBytes: copied.estimatedLiveBytes,
-          })
-          activation.completed = true
-          await Dexie.delete(journal.sourceDatabaseName)
-          await completeBrowserWorkspaceDatabaseCleanup({ ...journal, phase: 'cleanup' })
-        },
-        signal,
+      await runStartupRepairStage('exclusive-slot-repair', () =>
+        withExclusiveBrowserWorkspaceSlots(
+          [journal.sourceDatabaseName, journal.destinationDatabaseName],
+          async () => {
+            const copied = await prepareInactiveBrowserWorkspaceRepair(
+              journal,
+              probe.physicalVersion,
+              signal,
+              onProgress,
+            )
+            if (signal.aborted) throw signal.reason
+            onProgress?.({
+              kind: 'database-upgrade',
+              databaseName: journal.destinationDatabaseName,
+              fromVersion: probe.physicalVersion / 10,
+              targetVersion: CURRENT_BROWSER_WORKSPACE_STORAGE_EPOCH.storageVersion,
+              phase: 'inactive-activation',
+              operation: 'activate-repaired-destination',
+              processedRows: copied.copiedRows,
+              processedBytes: copied.estimatedLiveBytes,
+            })
+            await activatePreparedBrowserWorkspaceDatabase(journal, {
+              kind: 'carry-source',
+              liveBytes: copied.estimatedLiveBytes,
+            })
+            activation.completed = true
+            await Dexie.delete(journal.sourceDatabaseName)
+            await completeBrowserWorkspaceDatabaseCleanup({ ...journal, phase: 'cleanup' })
+          },
+          signal,
+        ),
       )
     } catch (error) {
       if (activation.completed) throw error
@@ -191,24 +242,55 @@ async function prepareInactiveBrowserWorkspaceRepair(
   signal: AbortSignal,
   onProgress?: (progress: BrowserWorkspaceOpenProgress) => void,
 ): Promise<{ readonly copiedRows: number; readonly estimatedLiveBytes: number }> {
-  await Dexie.delete(journal.destinationDatabaseName)
-  await recreateAndVerifyBrowserWorkspaceDatabase(journal.destinationDatabaseName)
-  const copied = await copyCanonicalBrowserWorkspaceRows(
-    journal.sourceDatabaseName,
-    journal.destinationDatabaseName,
-    sourcePhysicalVersion,
-    signal,
-    onProgress,
+  await runStartupRepairStage('recreate-destination-delete', () =>
+    Dexie.delete(journal.destinationDatabaseName),
   )
-  await normalizeInactiveBrowserWorkspaceDatabase(journal.destinationDatabaseName, {
-    fromVersion: sourcePhysicalVersion,
-    ...(onProgress ? { onProgress } : {}),
-  })
-  const repaired = await probeBrowserWorkspaceCurrent(journal.destinationDatabaseName)
+  await runStartupRepairStage('recreate-destination-open', () =>
+    recreateAndVerifyBrowserWorkspaceDatabase(journal.destinationDatabaseName),
+  )
+  const copied = await runStartupRepairStage('copy-canonical-rows', () =>
+    copyCanonicalBrowserWorkspaceRows(
+      journal.sourceDatabaseName,
+      journal.destinationDatabaseName,
+      sourcePhysicalVersion,
+      signal,
+      onProgress,
+    ),
+  )
+  await runStartupRepairStage('normalize-destination', () =>
+    normalizeInactiveBrowserWorkspaceDatabase(journal.destinationDatabaseName, {
+      fromVersion: sourcePhysicalVersion,
+      ...(onProgress ? { onProgress } : {}),
+    }),
+  )
+  const repaired = await runStartupRepairStage('verify-destination', () =>
+    probeBrowserWorkspaceCurrent(journal.destinationDatabaseName),
+  )
   if (repaired.kind !== 'current') {
     throw new Error(`BrowserWorkspaceStartupRepairIncomplete:${repaired.kind}`)
   }
   return copied
+}
+
+async function runStartupRepairStage<Result>(
+  operation: string,
+  run: () => Promise<Result>,
+): Promise<Result> {
+  try {
+    return await run()
+  } catch (error) {
+    if (errorHasName(error, 'TransactionInactiveError')) {
+      const diagnostic = new Error(
+        `BrowserWorkspaceStartupRepairTransactionInactive:${operation}`,
+        {
+          cause: error,
+        },
+      )
+      diagnostic.name = `BrowserWorkspaceStartupRepairTransactionInactiveError_${operation}`
+      throw diagnostic
+    }
+    throw error
+  }
 }
 
 async function copyCanonicalBrowserWorkspaceRows(
@@ -242,7 +324,7 @@ async function copyCanonicalBrowserWorkspaceRows(
             kind: 'database-upgrade',
             databaseName: destinationDatabaseName,
             fromVersion: sourcePhysicalVersion / 10,
-            targetVersion: WAVE_B_STORAGE_VERSION,
+            targetVersion: CURRENT_BROWSER_WORKSPACE_STORAGE_EPOCH.storageVersion,
             phase: 'inactive-copy',
             operation: `copy-${tableName}`,
             processedRows: copiedRows,

@@ -1,4 +1,5 @@
 import type { Table, Transaction } from 'dexie'
+import { errorHasName } from '../lib/error'
 import { migrateCurrentChatSettingsSnapshot } from './chat-settings'
 import {
   canonicalizeGlobalSettingsRows,
@@ -118,21 +119,22 @@ export async function migrateWaveAStorageEpochRowsV94(
     processedRows: 0,
     processedBytes: 0,
   })
-  await tx
-    .table<SettingsRow, string>('settings')
-    .bulkDelete([
-      CURRENT_SCHEMA_BACKFILL_MANIFEST_KEY,
-      ...waveACompletionSettingsV94().map((row) => row.key),
-    ])
+  await runWaveAStorageMigrationStage('delete-stale-completion-markers', () =>
+    tx
+      .table<SettingsRow, string>('settings')
+      .bulkDelete([
+        CURRENT_SCHEMA_BACKFILL_MANIFEST_KEY,
+        ...waveACompletionSettingsV94().map((row) => row.key),
+      ]),
+  )
   capabilities.reportProgress?.({
     phase: 'singletons',
     operation: 'normalize-singletons',
     processedRows: 0,
     processedBytes: 0,
   })
-  const singletons = await migrateWaveAStorageSingletonsV94(
-    tx,
-    capabilities.compactionControlTransferPrepared === true,
+  const singletons = await runWaveAStorageMigrationStage('normalize-singletons', () =>
+    migrateWaveAStorageSingletonsV94(tx, capabilities.compactionControlTransferPrepared === true),
   )
   capabilities.reportProgress?.({
     phase: 'configuration-and-chats',
@@ -140,31 +142,53 @@ export async function migrateWaveAStorageEpochRowsV94(
     processedRows: 0,
     processedBytes: 0,
   })
-  await migrateWaveAConfigurationAndChatRowsV94(tx, capabilities)
+  await runWaveAStorageMigrationStage('normalize-configuration-and-chats', () =>
+    migrateWaveAConfigurationAndChatRowsV94(tx, capabilities),
+  )
   capabilities.reportProgress?.({
     phase: 'messages-and-attachments',
     operation: 'normalize-messages-and-attachments',
     processedRows: 0,
     processedBytes: 0,
   })
-  await migrateWaveAMessageAndAttachmentRowsV94(tx, capabilities)
+  await runWaveAStorageMigrationStage('normalize-messages-and-attachments', () =>
+    migrateWaveAMessageAndAttachmentRowsV94(tx, capabilities),
+  )
   capabilities.reportProgress?.({
     phase: 'streams',
     operation: 'normalize-streams',
     processedRows: 0,
     processedBytes: 0,
   })
-  const streams = await migrateWaveAOperationalStreamRowsV94(tx, capabilities)
+  const streams = await runWaveAStorageMigrationStage('normalize-streams', () =>
+    migrateWaveAOperationalStreamRowsV94(tx, capabilities),
+  )
   capabilities.reportProgress?.({
     phase: 'derived-state',
     operation: 'rebuild-derived-state',
     processedRows: 0,
     processedBytes: 0,
   })
-  await migrateWaveADerivedRowsV94(tx, capabilities)
+  await runWaveAStorageMigrationStage('rebuild-derived-state', () =>
+    migrateWaveADerivedRowsV94(tx, capabilities),
+  )
   return {
     delayedMarkers: [...singletons.delayedMarkers, ...streams.delayedMarkers],
     requiresCompactionControlTransfer: singletons.requiresCompactionControlTransfer,
+  }
+}
+
+async function runWaveAStorageMigrationStage<Result>(
+  operation: string,
+  run: () => Promise<Result>,
+): Promise<Result> {
+  try {
+    return await run()
+  } catch (error) {
+    if (errorHasName(error, 'TransactionInactiveError')) {
+      throw new Error(`WaveAStorageMigrationTransactionInactive:${operation}`, { cause: error })
+    }
+    throw error
   }
 }
 
@@ -182,7 +206,9 @@ export async function finalizeWaveAStorageEpochRowsV94(
     processedRows: 0,
     processedBytes: 0,
   })
-  await tx.table<SettingsRow, string>('settings').bulkPut([...waveACompletionSettingsV94()])
+  await runWaveAStorageMigrationStage('write-completion-markers', () =>
+    tx.table<SettingsRow, string>('settings').bulkPut([...waveACompletionSettingsV94()]),
+  )
 }
 
 export async function migrateWaveAStorageSingletonsV94(

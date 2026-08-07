@@ -1,7 +1,7 @@
 import Dexie, { type Table, type Transaction } from 'dexie'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
-import type { Chat, ChatId } from '../../src/core/types'
+import type { Chat, ChatFolder, ChatId } from '../../src/core/types'
 import { runBrowserCommandTransaction } from '../../src/store/browser-command-mutation-journal'
 import { deleteBrowserWorkspaceCompactionState } from '../../src/store/browser-workspace-database-control'
 import {
@@ -11,6 +11,7 @@ import {
 } from '../../src/store/chat-row-transition'
 import {
   accumulateChatSidebarAggregateRows,
+  accumulateChatSidebarFolderRows,
   type ChatSidebarAggregateProjectionRow,
   type ChatSidebarProjectionRow,
   chatSidebarProjectionRow,
@@ -426,7 +427,15 @@ describe('chat row transition', () => {
         lastBranchUpdatedAt: index + 1,
       }),
     )
-    const recording = new RecordingChatTransitionTransaction(rows)
+    const recording = new RecordingChatTransitionTransaction(rows, [
+      {
+        id: 'folder-a',
+        name: 'Folder A',
+        sortIndex: 1,
+        createdAt: 1,
+        updatedAt: 1,
+      },
+    ])
     const nextRows = rows.map((previous, index) => ({
       previous,
       next: {
@@ -664,11 +673,12 @@ class RecordingChatTransitionTransaction {
   readonly transaction: Transaction
   private readonly abortListeners: Array<() => void> = []
 
-  constructor(chats: readonly Chat[]) {
+  constructor(chats: readonly Chat[], folders: readonly ChatFolder[] = []) {
     this.chatRows = new Map(chats.map((chat) => [chat.id, chat]))
     const projected = chats.map(chatSidebarProjectionRow)
     for (const row of projected) this.sidebarRows.set(row.id, row)
     const accumulator = createChatSidebarAggregateAccumulator()
+    accumulateChatSidebarFolderRows(accumulator, folders)
     accumulateChatSidebarAggregateRows(accumulator, projected)
     for (const row of materializeChatSidebarAggregateRows(accumulator)) {
       this.aggregateRows.set(row.id, row)

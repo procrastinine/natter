@@ -1,5 +1,5 @@
 import { DEFAULT_SIDEBAR_SORT_MODE, type SidebarSortMode } from '../core/sidebar-sort'
-import type { ChatId, ChatSidebarRow, FolderId } from '../core/types'
+import type { ChatFolder, ChatId, ChatSidebarRow, ChatTag, FolderId } from '../core/types'
 import { type ChatSearchSurface, catalogSessionWorkspace } from './catalog-session-workspace'
 import {
   archiveChat,
@@ -13,8 +13,12 @@ import {
   ensureFolderAndMoveChats,
   updateFolder,
 } from './folders'
+import type { OrganizationCatalogPageRequest } from './repository'
 import { setSidebarFolderCollapsed, writeSidebarSortMode } from './sidebar-preferences'
-import type { ConfigurationPreferencesProjection } from './workspace-protocol'
+import { subscribeWorkspaceEffects, WORKSPACE_EFFECT_RECOVERY_OWNED } from './workspace-effect-hub'
+import type { ConfigurationPreferencesProjection, ReadEnvelope } from './workspace-protocol'
+import { getWorkspaceRepository } from './workspace-repository'
+import { runWorkspaceRead, type WorkspaceReadPermit } from './workspace-runtime'
 import { registerWorkspaceTabSessionParticipant } from './workspace-tab-session'
 
 export interface CatalogTabSnapshot {
@@ -215,9 +219,59 @@ const folder = Object.freeze({
   ensureAndMoveChats: ensureFolderAndMoveChats,
 })
 
+type OrganizationCatalogPage<Row> = ReadEnvelope<{
+  readonly rows: readonly Row[]
+  readonly nextCursor?: string
+}>
+
+function readOrganizationCatalogPage<Row>(
+  query: (permit: WorkspaceReadPermit) => Promise<OrganizationCatalogPage<Row>>,
+  signal: AbortSignal,
+): Promise<OrganizationCatalogPage<Row>> {
+  return runWorkspaceRead('repository-query', query, { signal })
+}
+
+const organization = Object.freeze({
+  readFolderPage: (
+    request: OrganizationCatalogPageRequest,
+    signal: AbortSignal,
+  ): Promise<OrganizationCatalogPage<ChatFolder>> =>
+    readOrganizationCatalogPage(
+      (permit) =>
+        getWorkspaceRepository().query(
+          permit,
+          { kind: 'folder.catalog-page', request },
+          { signal: permit.signal },
+        ),
+      signal,
+    ),
+  readTagPage: (
+    request: OrganizationCatalogPageRequest,
+    signal: AbortSignal,
+  ): Promise<OrganizationCatalogPage<ChatTag>> =>
+    readOrganizationCatalogPage(
+      (permit) =>
+        getWorkspaceRepository().query(
+          permit,
+          { kind: 'tag.catalog-page', request },
+          { signal: permit.signal },
+        ),
+      signal,
+    ),
+  subscribe: (listener: () => void): (() => void) =>
+    subscribeWorkspaceEffects({
+      owner: 'sidebar-organization-catalog',
+      impactKinds: ['folder', 'tag'],
+      replacements: false,
+      apply: listener,
+      recover: () => WORKSPACE_EFFECT_RECOVERY_OWNED,
+    }),
+})
+
 export const catalogApplication = Object.freeze({
   tab: catalogTabController,
   sessions,
   chat,
   folder,
+  organization,
 })

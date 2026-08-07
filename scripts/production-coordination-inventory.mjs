@@ -79,6 +79,7 @@ const MODULE_MUTABLE_IDS = Object.freeze([
   'src/store/db.ts#configuredBrowserWorkspaceCurrentPhysicalVersion',
   'src/store/db.ts#currentSession',
   'src/store/db.ts#invalidatedSession',
+  'src/store/db.ts#loadedSidebarFolderPresentationV98',
   'src/store/db.ts#nextSessionGeneration',
   'src/store/db.ts#resolveBrowserWorkspaceRepositoryIdle',
   'src/store/db.ts#singleton',
@@ -253,6 +254,7 @@ export const MODULE_COLLECTION_CONTRACTS = Object.freeze({
         'src/core/reasoning-envelope.ts#REASONING_PRODUCER_BRIDGES',
         'src/core/reasoning.ts#EMPTY_MESSAGE_CONTEXT_ROUTE_FACTS',
         'src/core/reasoning.ts#REASONING_FORMATS',
+        'src/hooks/useCatalogApplication.ts#EMPTY_ORGANIZATION_ROWS',
         'src/store/attempt-controller.ts#EMPTY_EXECUTIONS',
         'src/store/branch-tree-search-session.ts#EMPTY_MATCHES',
         'src/store/browser-catalog-command-runtime.ts#FOLDER_ENSURE_AND_MOVE_CHATS_OPERATION',
@@ -2092,9 +2094,9 @@ const LIFECYCLE_DIRECT_CALL_CONTRACTS = exactSiteContracts([
   {
     ids: [
       'src/store/browser-workspace-lifecycle.ts|performBrowserWorkspaceOpen|awaitWorkspaceRuntimeQuiesced|1',
-      'src/store/browser-workspace-lifecycle.ts|performBrowserWorkspaceOpen|finishWorkspaceRuntimeReconciliation|1',
-      'src/store/browser-workspace-lifecycle.ts|performBrowserWorkspaceOpen|prepareBrowserWorkspaceDatabaseSelection|1',
-      'src/store/browser-workspace-lifecycle.ts|performBrowserWorkspaceOpen|resumeWorkspaceRuntimeResources|1',
+      'src/store/browser-workspace-lifecycle.ts|runBrowserWorkspaceOpenStage<callback>|finishWorkspaceRuntimeReconciliation|1',
+      'src/store/browser-workspace-lifecycle.ts|runBrowserWorkspaceOpenStage<callback>|prepareBrowserWorkspaceDatabaseSelection|1',
+      'src/store/browser-workspace-lifecycle.ts|runBrowserWorkspaceOpenStage<callback>|resumeWorkspaceRuntimeResources|1',
     ],
     scope: 'workspace-orchestrator-call-edge',
     stage: 'workspace-open-ordered-async-stages',
@@ -2646,9 +2648,9 @@ export const MUTABLE_MODULE_CONTRACTS = Object.freeze({
   'src/store/db.ts': {
     scope: 'physical-database-session-runtime',
     bound:
-      'one exact fatal-invalidation owner, configured database/current-version proof, database singleton, current/invalidated session pair, admissions, and idle barrier',
+      'one exact fatal-invalidation owner, configured database/current-version proof, database singleton, current/invalidated session pair, admissions, idle barrier, and lazy registered-migration implementation module',
     cleanup:
-      'session closure drains operations while exact lifecycle release prevents old queued invalidations from reaching a successor',
+      'session closure drains operations while exact lifecycle release prevents old queued invalidations from reaching a successor; the migration implementation follows the process-lifetime module cache after loading before its version transaction',
   },
   'src/store/generated-output-localization-runtime.ts': {
     scope: 'workspace-producer-runtime',

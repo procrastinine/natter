@@ -36,7 +36,6 @@ interface SidebarSessionRequest extends WorkspaceFence {
 type SidebarSessionQuery = Omit<SidebarPresentationRequest, 'cursor' | 'limit' | 'countMode'>
 
 interface SidebarSessionPageMeta {
-  readonly exactTotalRows: number
   readonly exactVisibleChats: number
   readonly aggregate: ChatSidebarAggregate
   readonly folders: readonly ChatFolder[]
@@ -189,7 +188,6 @@ function sidebarAdapter(
       Object.freeze({
         rows: Object.freeze([]),
         meta: Object.freeze({
-          exactTotalRows: 0,
           exactVisibleChats: 0,
           aggregate: EMPTY_AGGREGATE,
           folders: Object.freeze([]),
@@ -208,18 +206,11 @@ function sidebarAdapter(
         signal,
       )
       const value = envelope.value
-      const exactTotalRows = value.exactTotalRows ?? page.previousMeta?.exactTotalRows
       const exactVisibleChats = value.exactVisibleChats ?? page.previousMeta?.exactVisibleChats
       const aggregate = value.aggregate ?? page.previousMeta?.aggregate
-      const folders = value.folders ?? page.previousMeta?.folders
-      const tags = value.tags ?? page.previousMeta?.tags
-      if (
-        exactTotalRows === undefined ||
-        exactVisibleChats === undefined ||
-        !aggregate ||
-        !folders ||
-        !tags
-      ) {
+      const folders = mergeFolders(page.previousMeta?.folders, value.folders)
+      const tags = mergeTags(page.previousMeta?.tags, value.tags)
+      if (exactVisibleChats === undefined || !aggregate) {
         throw new Error('SidebarPresentationMetadataMissing')
       }
       return {
@@ -229,7 +220,6 @@ function sidebarAdapter(
           rows: Object.freeze(value.rows.map(cloneSidebarPresentationRow)),
           ...(value.nextCursor ? { nextCursor: value.nextCursor } : {}),
           meta: Object.freeze({
-            exactTotalRows,
             exactVisibleChats,
             aggregate,
             folders,
@@ -244,6 +234,24 @@ function sidebarAdapter(
     cloneRow: cloneSidebarPresentationRow,
     compareRows: () => 0,
   }
+}
+
+function mergeFolders(
+  previous: readonly ChatFolder[] | undefined,
+  current: readonly ChatFolder[] | undefined,
+): readonly ChatFolder[] {
+  const merged = new Map((previous ?? []).map((folder) => [folder.id, folder]))
+  for (const folder of current ?? []) merged.set(folder.id, folder)
+  return Object.freeze([...merged.values()])
+}
+
+function mergeTags(
+  previous: readonly ChatTag[] | undefined,
+  current: readonly ChatTag[] | undefined,
+): readonly ChatTag[] {
+  const merged = new Map((previous ?? []).map((tag) => [tag.id, tag]))
+  for (const tag of current ?? []) merged.set(tag.id, tag)
+  return Object.freeze([...merged.values()])
 }
 
 function normalizeSidebarRequest(

@@ -42,13 +42,14 @@ let currentSelection: BrowserWorkspaceDatabaseSelectionRecord | null = null
 export function prepareBrowserWorkspaceDatabaseSelection(
   authority: BrowserWorkspaceBootstrapAuthority,
   onProgress?: (progress: BrowserWorkspaceOpenProgress) => void,
+  onBlocked?: (event: IDBVersionChangeEvent) => void,
 ): Promise<OpeningBrowserWorkspaceDatabaseSelection> {
   assertBrowserWorkspaceBootstrapAuthority(authority)
   if (currentSelection?.phase === 'active') {
     return Promise.reject(new Error('BrowserWorkspaceDatabaseSelectionAlreadyActive'))
   }
   if (selectionPromise) return selectionPromise
-  const pending = performBrowserWorkspaceDatabaseSelection(authority, onProgress)
+  const pending = performBrowserWorkspaceDatabaseSelection(authority, onProgress, onBlocked)
   selectionPromise = pending
   void pending.catch(() => {
     if (selectionPromise === pending) selectionPromise = null
@@ -91,18 +92,24 @@ export function releaseActiveBrowserWorkspaceDatabaseSelection(
 async function performBrowserWorkspaceDatabaseSelection(
   authority: BrowserWorkspaceBootstrapAuthority,
   onProgress?: (progress: BrowserWorkspaceOpenProgress) => void,
+  onBlocked?: (event: IDBVersionChangeEvent) => void,
 ): Promise<OpeningBrowserWorkspaceDatabaseSelection> {
-  return selectBrowserWorkspaceDatabase(authority, onProgress)
+  return selectBrowserWorkspaceDatabase(authority, onProgress, onBlocked)
 }
 
 async function selectBrowserWorkspaceDatabase(
   authority: BrowserWorkspaceBootstrapAuthority,
   onProgress?: (progress: BrowserWorkspaceOpenProgress) => void,
+  onBlocked?: (event: IDBVersionChangeEvent) => void,
 ): Promise<OpeningBrowserWorkspaceDatabaseSelection> {
   for (;;) {
     assertBrowserWorkspaceBootstrapAuthority(authority)
     onProgress?.({ kind: 'database-selection', operation: 'read-active-slot' })
-    const current = await ensureBrowserWorkspaceCurrentForSelection(authority.signal, onProgress)
+    const current = await ensureBrowserWorkspaceCurrentForSelection(
+      authority.signal,
+      onProgress,
+      onBlocked,
+    )
     assertBrowserWorkspaceBootstrapAuthority(authority)
     onProgress?.({
       kind: 'database-selection',

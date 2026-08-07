@@ -18,6 +18,7 @@ import {
   flushStorageCompactionDebt,
   readStorageCompactionState,
   recoverStorageCompactionDebtIntents,
+  runStorageBackgroundTask,
   storageCompactionDebtRecoveryPending,
   subscribeStorageCompactionRequests,
 } from './storage-compaction-state'
@@ -261,13 +262,13 @@ class StorageMaintenanceController {
           readStorageRetentionState(database, 'attachment-reap'),
           readStorageRetentionState(database, 'terminal-stream-prune'),
           readStorageRetentionState(database, 'empty-draft-prune'),
-          database.attachments.orderBy(':id').firstKey(),
+          database.attachments.where('id').above('').firstKey(),
           database.chats
             .where('[temporaryKey+temporaryRetentionAt+id]')
             .between([1], [1, []], true, false)
             .firstKey(),
-          database.streamLeases.orderBy(':id').firstKey(),
-          database.streamChunks.orderBy(':id').firstKey(),
+          database.streamLeases.where('streamId').above('').firstKey(),
+          database.streamChunks.where('id').above('').firstKey(),
         ]),
     )
     for (const kind of [
@@ -890,7 +891,7 @@ export const __linkedStorageMaintenanceAbortControllerForTests = linkedAbortCont
 export const __runStorageMaintenancePumpForTests = runStorageMaintenancePump
 
 function runStorageMaintenancePump<T>(operation: () => Promise<T>): Promise<T> {
-  return Dexie.ignoreTransaction(operation)
+  return runStorageBackgroundTask(operation)
 }
 
 function waitForAbort(signal: AbortSignal): Promise<void> {

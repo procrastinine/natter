@@ -5,7 +5,7 @@ import type {
   SidebarSortField,
 } from '../core/sidebar-sort'
 import { sidebarTitleSortKey } from '../core/sidebar-sort'
-import type { Chat, ChatId, ChatSidebarRow, FolderId } from '../core/types'
+import type { Chat, ChatFolder, ChatId, ChatSidebarRow, FolderId } from '../core/types'
 import { sameValue } from '../lib/same-value'
 import { recordBrowserCommandInvalidation } from './browser-command-mutation-journal'
 import {
@@ -28,8 +28,8 @@ export const CHAT_SIDEBAR_PROJECTION_LEGACY_MANIFEST_KEY = 'projection:chat-side
 export const CHAT_SIDEBAR_AGGREGATE_ID = 'workspace'
 
 export const CHAT_SIDEBAR_PROJECTION_ROW_VERSION = 4
-const CHAT_SIDEBAR_AGGREGATE_VERSION = 2
-export const CHAT_SIDEBAR_PROJECTION_MARKER_VERSION = 5
+const CHAT_SIDEBAR_AGGREGATE_VERSION = 3
+export const CHAT_SIDEBAR_PROJECTION_MARKER_VERSION = 6
 export const CHAT_SIDEBAR_FOLDER_EXTREMA_READ_REQUEST_LIMIT = 24
 const REBUILD_BATCH_SIZE = 128
 const ROOT_FOLDER_KEY = '\u0000root'
@@ -74,6 +74,32 @@ export interface ChatSidebarFolderAggregateRow {
   visibleCount: number
   visiblePinnedCount: number
   sortExtrema: SidebarSortExtrema | null
+  folder: ChatFolder
+  folderNameKey: string
+  folderSortIndex: number
+  folderTitleSortKey: string
+  presentationPinnedAsc: 0 | 1
+  presentationPinnedDesc: 0 | 1
+  updatedAtAsc: number
+  updatedAtDesc: number
+  createdAtAsc: number
+  createdAtDesc: number
+  lastViewedAtAsc: number
+  lastViewedAtDesc: number
+  totalCostUsdAsc: number
+  totalCostUsdDesc: number
+  wordCountAsc: number
+  wordCountDesc: number
+  titleAsc: string
+  titleDesc: string
+}
+
+export interface ChatSidebarFolderAggregateSummary {
+  readonly count: number
+  readonly activeCount: number
+  readonly visibleCount: number
+  readonly visiblePinnedCount: number
+  readonly sortExtrema: SidebarSortExtrema | null
 }
 
 export type ChatSidebarAggregateProjectionRow =
@@ -182,10 +208,33 @@ export function emptyChatSidebarAggregateRow(): ChatSidebarWorkspaceAggregateRow
   }
 }
 
+export function currentChatSidebarWorkspaceAggregateRow(
+  row: Omit<ChatSidebarWorkspaceAggregateRow, 'projectionVersion'>,
+): ChatSidebarWorkspaceAggregateRow {
+  const current = { ...row, projectionVersion: CHAT_SIDEBAR_AGGREGATE_VERSION }
+  if (!isValidChatSidebarWorkspaceAggregateRow(current)) {
+    throw new Error('ChatSidebarAggregateInvalid')
+  }
+  return current
+}
+
 export function createChatSidebarAggregateAccumulator(): ChatSidebarAggregateAccumulator {
   return {
     workspace: emptyChatSidebarAggregateRow(),
     folders: new Map(),
+  }
+}
+
+export function accumulateChatSidebarFolderRows(
+  accumulator: ChatSidebarAggregateAccumulator,
+  folders: readonly ChatFolder[],
+): void {
+  for (const folder of folders) {
+    const folderKey = chatSidebarFolderKey(folder.id)
+    if (accumulator.folders.has(folderKey)) {
+      throw new Error(`ChatSidebarFolderProjectionDuplicate:${folder.id}`)
+    }
+    accumulator.folders.set(folderKey, emptyFolderAggregateRow(folder))
   }
 }
 
@@ -197,10 +246,11 @@ export function accumulateChatSidebarAggregateRows(
     if (!isValidChatSidebarProjectionRow(row)) throw new Error('ChatSidebarProjectionRowInvalid')
     addWorkspaceContribution(accumulator.workspace, row, 1)
     if (row.folderKey !== ROOT_FOLDER_KEY) {
-      const aggregate =
-        accumulator.folders.get(row.folderKey) ?? emptyFolderAggregateRow(row.folderKey)
+      const aggregate = accumulator.folders.get(row.folderKey)
+      if (!aggregate) throw new Error(`ChatSidebarFolderProjectionMissing:${row.folderKey}`)
       addFolderContribution(aggregate, row, 1)
       if (isVisibleSidebarRow(row)) includeRowInSortExtrema(aggregate, row)
+      refreshFolderPresentationFields(aggregate)
       accumulator.folders.set(row.folderKey, aggregate)
     }
   }
@@ -277,7 +327,7 @@ export function isValidChatSidebarFolderAggregateRow(
     row.folderKey !== ROOT_FOLDER_KEY &&
     row.id === chatSidebarFolderAggregateId(row.folderKey) &&
     Number.isSafeInteger(count) &&
-    count > 0 &&
+    count >= 0 &&
     Number.isSafeInteger(activeCount) &&
     activeCount >= 0 &&
     activeCount <= count &&
@@ -287,8 +337,105 @@ export function isValidChatSidebarFolderAggregateRow(
     Number.isSafeInteger(visiblePinnedCount) &&
     visiblePinnedCount >= 0 &&
     visiblePinnedCount <= visibleCount &&
-    (visibleCount === 0 ? row.sortExtrema === null : isValidChatSidebarSortExtrema(row.sortExtrema))
+    (visibleCount === 0
+      ? row.sortExtrema === null
+      : isValidChatSidebarSortExtrema(row.sortExtrema)) &&
+    isValidFolderPresentationFields(row)
   )
+}
+
+export function chatSidebarFolderNameKey(value: string): string {
+  return value.trim().normalize('NFKC').toLowerCase()
+}
+
+export function chatSidebarFolderAggregateRow(
+  folder: ChatFolder,
+  summary: ChatSidebarFolderAggregateSummary = {
+    count: 0,
+    activeCount: 0,
+    visibleCount: 0,
+    visiblePinnedCount: 0,
+    sortExtrema: null,
+  },
+): ChatSidebarFolderAggregateRow {
+  const row: ChatSidebarFolderAggregateRow = {
+    id: chatSidebarFolderAggregateId(chatSidebarFolderKey(folder.id)),
+    kind: 'folder',
+    projectionVersion: CHAT_SIDEBAR_AGGREGATE_VERSION,
+    folderKey: chatSidebarFolderKey(folder.id),
+    count: summary.count,
+    activeCount: summary.activeCount,
+    visibleCount: summary.visibleCount,
+    visiblePinnedCount: summary.visiblePinnedCount,
+    sortExtrema: summary.sortExtrema
+      ? {
+          updatedAt: { ...summary.sortExtrema.updatedAt },
+          createdAt: { ...summary.sortExtrema.createdAt },
+          lastViewedAt: { ...summary.sortExtrema.lastViewedAt },
+          totalCostUsd: { ...summary.sortExtrema.totalCostUsd },
+          wordCount: { ...summary.sortExtrema.wordCount },
+          title: { ...summary.sortExtrema.title },
+        }
+      : null,
+    folder: { ...folder },
+    folderNameKey: '',
+    folderSortIndex: 0,
+    folderTitleSortKey: '',
+    presentationPinnedAsc: 1,
+    presentationPinnedDesc: 0,
+    updatedAtAsc: 0,
+    updatedAtDesc: 0,
+    createdAtAsc: 0,
+    createdAtDesc: 0,
+    lastViewedAtAsc: 0,
+    lastViewedAtDesc: 0,
+    totalCostUsdAsc: 0,
+    totalCostUsdDesc: 0,
+    wordCountAsc: 0,
+    wordCountDesc: 0,
+    titleAsc: '',
+    titleDesc: '',
+  }
+  refreshFolderPresentationFields(row)
+  if (!isValidChatSidebarFolderAggregateRow(row)) {
+    throw new Error('ChatSidebarFolderAggregateInvalid')
+  }
+  return row
+}
+
+export async function putChatSidebarFolderProjection(
+  tx: Transaction,
+  next: ChatFolder,
+  previous?: ChatFolder,
+): Promise<void> {
+  const table = tx.table<ChatSidebarAggregateProjectionRow, string>('chatSidebarAggregates')
+  const id = chatSidebarFolderAggregateId(chatSidebarFolderKey(next.id))
+  const stored = await table.get(id)
+  if (stored !== undefined && !isValidChatSidebarFolderAggregateRow(stored)) {
+    throw new Error('ChatSidebarFolderAggregateInvalid')
+  }
+  if (previous && stored === undefined) throw new Error('ChatSidebarFolderAggregateMissing')
+  const row = stored ? cloneFolderAggregateRow(stored) : emptyFolderAggregateRow(next)
+  row.folder = { ...next }
+  refreshFolderPresentationFields(row)
+  if (!isValidChatSidebarFolderAggregateRow(row)) {
+    throw new Error('ChatSidebarFolderAggregateInvalid')
+  }
+  await putPhysicalStorageRow(tx, 'chatSidebarAggregates', row, stored)
+}
+
+export async function deleteChatSidebarFolderProjection(
+  tx: Transaction,
+  folder: ChatFolder,
+): Promise<void> {
+  const table = tx.table<ChatSidebarAggregateProjectionRow, string>('chatSidebarAggregates')
+  const id = chatSidebarFolderAggregateId(chatSidebarFolderKey(folder.id))
+  const stored = await table.get(id)
+  if (stored === undefined) throw new Error('ChatSidebarFolderAggregateMissing')
+  if (!isValidChatSidebarFolderAggregateRow(stored) || stored.count !== 0) {
+    throw new Error('ChatSidebarFolderAggregateDeleteInvalid')
+  }
+  await deletePhysicalStorageRows(tx, 'chatSidebarAggregates', [id], [stored])
 }
 
 export function publicChatSidebarRow(row: ChatSidebarProjectionRow): ChatSidebarRow {
@@ -479,6 +626,25 @@ export async function rebuildChatSidebarProjectionRowsInTransaction(
   const aggregates = tx.table<ChatSidebarAggregateProjectionRow, string>('chatSidebarAggregates')
   await Dexie.Promise.all([rows.clear(), aggregates.clear()])
   const accumulator = createChatSidebarAggregateAccumulator()
+  const folders = tx.table<ChatFolder, FolderId>('folders')
+  let afterFolderId: FolderId | undefined
+  for (;;) {
+    const batch: ChatFolder[] = []
+    let lastPrimaryKey: FolderId | undefined
+    const collection =
+      afterFolderId === undefined
+        ? folders.orderBy(':id')
+        : folders.where(':id').above(afterFolderId)
+    await collection.limit(REBUILD_BATCH_SIZE).each((folder, cursor) => {
+      batch.push(folder)
+      lastPrimaryKey = cursor.primaryKey
+    })
+    if (batch.length === 0) break
+    accumulateChatSidebarFolderRows(accumulator, batch)
+    if (batch.length < REBUILD_BATCH_SIZE) break
+    if (lastPrimaryKey === undefined) throw new Error('ChatSidebarFolderPrimaryKeyMissing')
+    afterFolderId = lastPrimaryKey
+  }
   let after: ChatId | undefined
   for (;;) {
     const batch: Chat[] = []
@@ -614,8 +780,6 @@ async function applyChatSidebarProjectionDeltas(
     : await table.bulkGet(ids)
   const puts: ChatSidebarFolderAggregateRow[] = []
   const replaced: ChatSidebarFolderAggregateRow[] = []
-  const deletes: string[] = []
-  const deleted: ChatSidebarFolderAggregateRow[] = []
   for (let index = 0; index < entries.length; index += 1) {
     const [folderKey, groupedChanges] = entries[index] as [
       string,
@@ -628,9 +792,8 @@ async function applyChatSidebarProjectionDeltas(
     if (stored !== undefined && !isValidChatSidebarFolderAggregateRow(stored)) {
       throw new Error('ChatSidebarFolderAggregateInvalid')
     }
-    const nextAggregate = stored
-      ? cloneFolderAggregateRow(stored)
-      : emptyFolderAggregateRow(folderKey)
+    if (!stored) throw new Error('ChatSidebarFolderAggregateMissing')
+    const nextAggregate = cloneFolderAggregateRow(stored)
     let removedExtremum = false
     for (const change of groupedChanges) {
       if (change.previous) {
@@ -645,8 +808,10 @@ async function applyChatSidebarProjectionDeltas(
       throw new Error('ChatSidebarFolderAggregateDeltaInvalid')
     }
     if (nextAggregate.count === 0) {
-      deletes.push(chatSidebarFolderAggregateId(folderKey))
-      if (stored) deleted.push(stored)
+      nextAggregate.sortExtrema = null
+      refreshFolderPresentationFields(nextAggregate)
+      puts.push(nextAggregate)
+      replaced.push(stored)
       continue
     }
     if (nextAggregate.visibleCount === 0) {
@@ -662,18 +827,15 @@ async function applyChatSidebarProjectionDeltas(
         }
       }
     }
+    refreshFolderPresentationFields(nextAggregate)
     if (!isValidChatSidebarFolderAggregateRow(nextAggregate)) {
       throw new Error('ChatSidebarFolderAggregateDeltaInvalid')
     }
     puts.push(nextAggregate)
-    if (stored) replaced.push(stored)
+    replaced.push(stored)
   }
   await putPhysicalStorageRows(tx, 'chatSidebarAggregates', puts, replaced)
-  await deletePhysicalStorageRows(tx, 'chatSidebarAggregates', deletes, deleted)
-  aggregateMutations.push(
-    ...puts.map((row) => ({ id: row.id, operation: 'write' as const })),
-    ...deletes.map((id) => ({ id, operation: 'delete' as const })),
-  )
+  aggregateMutations.push(...puts.map((row) => ({ id: row.id, operation: 'write' as const })))
   return {
     aggregateMutations: Object.freeze(
       aggregateMutations.sort((left, right) => left.id.localeCompare(right.id)),
@@ -700,18 +862,8 @@ function addWorkspaceContribution(
     row.folderKey === ROOT_FOLDER_KEY && isVisibleSidebarRow(row) && row.pinned ? direction : 0
 }
 
-function emptyFolderAggregateRow(folderKey: string): ChatSidebarFolderAggregateRow {
-  return {
-    id: chatSidebarFolderAggregateId(folderKey),
-    kind: 'folder',
-    projectionVersion: CHAT_SIDEBAR_AGGREGATE_VERSION,
-    folderKey,
-    count: 0,
-    activeCount: 0,
-    visibleCount: 0,
-    visiblePinnedCount: 0,
-    sortExtrema: null,
-  }
+function emptyFolderAggregateRow(folder: ChatFolder): ChatSidebarFolderAggregateRow {
+  return chatSidebarFolderAggregateRow(folder)
 }
 
 function cloneFolderAggregateRow(
@@ -719,6 +871,95 @@ function cloneFolderAggregateRow(
 ): ChatSidebarFolderAggregateRow {
   return {
     ...row,
+    folder: { ...row.folder },
+    sortExtrema: row.sortExtrema
+      ? {
+          updatedAt: { ...row.sortExtrema.updatedAt },
+          createdAt: { ...row.sortExtrema.createdAt },
+          lastViewedAt: { ...row.sortExtrema.lastViewedAt },
+          totalCostUsd: { ...row.sortExtrema.totalCostUsd },
+          wordCount: { ...row.sortExtrema.wordCount },
+          title: { ...row.sortExtrema.title },
+        }
+      : null,
+  }
+}
+
+function refreshFolderPresentationFields(row: ChatSidebarFolderAggregateRow): void {
+  const pinned = row.visiblePinnedCount > 0
+  row.folderNameKey = chatSidebarFolderNameKey(row.folder.name)
+  row.folderSortIndex = row.folder.sortIndex
+  row.folderTitleSortKey = sidebarTitleSortKey(row.folder.name)
+  row.presentationPinnedAsc = pinned ? 0 : 1
+  row.presentationPinnedDesc = pinned ? 1 : 0
+  row.updatedAtAsc = folderPresentationPrimary(row, 'updatedAt', 'asc') as number
+  row.updatedAtDesc = folderPresentationPrimary(row, 'updatedAt', 'desc') as number
+  row.createdAtAsc = folderPresentationPrimary(row, 'createdAt', 'asc') as number
+  row.createdAtDesc = folderPresentationPrimary(row, 'createdAt', 'desc') as number
+  row.lastViewedAtAsc = folderPresentationPrimary(row, 'lastViewedAt', 'asc') as number
+  row.lastViewedAtDesc = folderPresentationPrimary(row, 'lastViewedAt', 'desc') as number
+  row.totalCostUsdAsc = folderPresentationPrimary(row, 'totalCostUsd', 'asc') as number
+  row.totalCostUsdDesc = folderPresentationPrimary(row, 'totalCostUsd', 'desc') as number
+  row.wordCountAsc = folderPresentationPrimary(row, 'wordCount', 'asc') as number
+  row.wordCountDesc = folderPresentationPrimary(row, 'wordCount', 'desc') as number
+  row.titleAsc = folderPresentationPrimary(row, 'title', 'asc') as string
+  row.titleDesc = folderPresentationPrimary(row, 'title', 'desc') as string
+}
+
+function folderPresentationPrimary(
+  row: ChatSidebarFolderAggregateRow,
+  field: SidebarSortField,
+  direction: 'asc' | 'desc',
+): number | string {
+  const extrema = row.sortExtrema?.[field]
+  if (extrema) return extrema[direction === 'asc' ? 'min' : 'max']
+  switch (field) {
+    case 'updatedAt':
+      return finiteOrFallback(row.folder.updatedAt, row.folder.createdAt)
+    case 'createdAt':
+      return finiteOrFallback(row.folder.createdAt, row.folder.updatedAt)
+    case 'lastViewedAt':
+      return finiteOrFallback(row.folder.lastUsedAt, row.folder.updatedAt)
+    case 'totalCostUsd':
+    case 'wordCount':
+      return 0
+    case 'title':
+      return row.folderTitleSortKey
+  }
+}
+
+function isValidFolderPresentationFields(row: Partial<ChatSidebarFolderAggregateRow>): boolean {
+  if (!row.folder || typeof row.folder !== 'object') return false
+  if (row.folder.id !== row.folderKey) return false
+  const expected = cloneFolderAggregateRowUnchecked(row as ChatSidebarFolderAggregateRow)
+  refreshFolderPresentationFields(expected)
+  return (
+    row.folderNameKey === expected.folderNameKey &&
+    row.folderSortIndex === expected.folderSortIndex &&
+    row.folderTitleSortKey === expected.folderTitleSortKey &&
+    row.presentationPinnedAsc === expected.presentationPinnedAsc &&
+    row.presentationPinnedDesc === expected.presentationPinnedDesc &&
+    row.updatedAtAsc === expected.updatedAtAsc &&
+    row.updatedAtDesc === expected.updatedAtDesc &&
+    row.createdAtAsc === expected.createdAtAsc &&
+    row.createdAtDesc === expected.createdAtDesc &&
+    row.lastViewedAtAsc === expected.lastViewedAtAsc &&
+    row.lastViewedAtDesc === expected.lastViewedAtDesc &&
+    row.totalCostUsdAsc === expected.totalCostUsdAsc &&
+    row.totalCostUsdDesc === expected.totalCostUsdDesc &&
+    row.wordCountAsc === expected.wordCountAsc &&
+    row.wordCountDesc === expected.wordCountDesc &&
+    row.titleAsc === expected.titleAsc &&
+    row.titleDesc === expected.titleDesc
+  )
+}
+
+function cloneFolderAggregateRowUnchecked(
+  row: ChatSidebarFolderAggregateRow,
+): ChatSidebarFolderAggregateRow {
+  return {
+    ...row,
+    folder: { ...row.folder },
     sortExtrema: row.sortExtrema
       ? {
           updatedAt: { ...row.sortExtrema.updatedAt },

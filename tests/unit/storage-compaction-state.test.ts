@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
-import Dexie from 'dexie'
+import Dexie, { type Transaction as DexieTransaction } from 'dexie'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { BROWSER_WORKSPACE_CONTROL_DATABASE_NAME } from '../../src/lib/origin-storage-names'
 import { runBrowserCommandTransaction } from '../../src/store/browser-command-mutation-journal'
@@ -374,6 +374,8 @@ describe('storage compaction state', () => {
     await db.drafts.add(previous)
     const transaction = IDBDatabase.prototype.transaction
     const inheritedTransactionDatabases: Array<string | null> = []
+    const workspaceTransactionActiveDuringDebtWrite: boolean[] = []
+    let workspaceDexieTransaction: DexieTransaction | null = null
     const transactionSpy = vi
       .spyOn(IDBDatabase.prototype, 'transaction')
       .mockImplementation(function (this: IDBDatabase, storeNames, ...args) {
@@ -388,22 +390,25 @@ describe('storage compaction state', () => {
             | null
             | undefined
           inheritedTransactionDatabases.push(ambientTransaction?.db.name ?? null)
+          workspaceTransactionActiveDuringDebtWrite.push(workspaceDexieTransaction?.active ?? false)
         }
         return transaction.call(this, storeNames, ...args)
       })
 
-    await db.transaction('rw', db.drafts, (tx) =>
-      putPhysicalStorageRow(
+    await db.transaction('rw', db.drafts, (tx) => {
+      workspaceDexieTransaction = tx
+      return putPhysicalStorageRow(
         tx,
         'drafts',
         { ...previous, text: 'replacement', updatedAt: 2 },
         previous,
-      ),
-    )
+      )
+    })
     await awaitStorageCompactionDebtIdle()
 
     transactionSpy.mockRestore()
     expect(inheritedTransactionDatabases).toEqual([null])
+    expect(workspaceTransactionActiveDuringDebtWrite).toEqual([false])
     expect(await readStorageCompactionState(db)).toMatchObject({
       knownReclaimableBytes: estimateStoredValueBytes(previous),
     })

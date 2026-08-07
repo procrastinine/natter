@@ -20,8 +20,26 @@
 // empty title), use the constant placeholder "Untitled chat".
 export function computeBranchTitle(baseTitle: string, existingTitles: readonly string[]): string {
   const base = baseTitle.trim() || 'Untitled chat'
-  const taken = new Set(existingTitles.map((t) => t.trim()))
-  let n = 1
-  while (taken.has(`${base} Branch ${n}`)) n += 1
-  return `${base} Branch ${n}`
+  const prefix = `${base} Branch `
+  const ordinals = existingTitles.flatMap((title) => {
+    const normalized = title.trim()
+    if (!normalized.startsWith(prefix)) return []
+    const suffix = normalized.slice(prefix.length)
+    const ordinal = Number(suffix)
+    return Number.isSafeInteger(ordinal) && ordinal > 0 && suffix === String(ordinal)
+      ? [ordinal]
+      : []
+  })
+  return computeBranchTitleFromOrdinals(base, ordinals)
+}
+
+export function computeBranchTitleFromOrdinals(
+  baseTitle: string,
+  existingOrdinals: Iterable<number>,
+): string {
+  const base = baseTitle.trim() || 'Untitled chat'
+  const taken = new Set(existingOrdinals)
+  let ordinal = 1
+  while (taken.has(ordinal)) ordinal += 1
+  return `${base} Branch ${ordinal}`
 }

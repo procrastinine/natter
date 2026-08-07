@@ -105,6 +105,7 @@ export type {
   ChatSidebarAggregate,
   ChatSidebarCatalogRequest,
   CommittedConversationDestination,
+  OrganizationCatalogPageRequest,
   WorkspaceCommittedResult,
   WorkspaceFence,
   WorkspaceMeta,

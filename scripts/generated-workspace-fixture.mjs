@@ -50,8 +50,8 @@ export const GENERATED_WORKSPACE_SCALES = Object.freeze({
     profileCount: 256,
     presetCount: 768,
     promptPresetCount: 120,
-    folderCount: 64,
-    tagCount: 128,
+    folderCount: 4_096,
+    tagCount: 4_096,
   }),
 })
 

@@ -115,6 +115,7 @@
         "src/backcompat/reasoning-journal-persistence-v93.ts",
         "src/backcompat/run-once.ts",
         "src/backcompat/saved-text-template-rows.ts",
+        "src/backcompat/sidebar-folder-presentation-v98.ts",
         "src/backcompat/storage-compaction-control.ts",
         "src/backcompat/storage-compaction-state-v2.ts",
         "src/backcompat/stream-journal-frames.ts",
@@ -131,7 +132,8 @@
         "src/backcompat/workspace-meta.ts",
         "src/store/browser-workspace-current-probe.ts",
         "src/store/browser-workspace-derived-repair.ts",
-        "src/store/browser-workspace-startup-repair.ts"
+        "src/store/browser-workspace-startup-repair.ts",
+        "src/store/browser-workspace-upgrade-strategy.ts"
       ]
     },
     {
@@ -574,6 +576,7 @@
         "src/store/browser-workspace-catchup-journal.ts",
         "src/store/browser-workspace-schema-v94.ts",
         "src/store/browser-workspace-schema-v97.ts",
+        "src/store/browser-workspace-schema-v98.ts",
         "src/store/bounded-idb-cursor.ts",
         "src/store/chat-row-transition.ts",
         "src/store/db-rows.ts",

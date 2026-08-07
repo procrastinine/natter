@@ -42,7 +42,6 @@ import {
   exportWorkspaceBackup,
   restoreWorkspaceBackup,
 } from '../../src/store/import-export'
-import { listTags } from '../../src/store/tags'
 import { readTokenCalibrationGlobal } from '../../src/store/token-calibration'
 import type { WorkspaceRepository } from '../../src/store/workspace-protocol'
 import {
@@ -1052,7 +1051,7 @@ describe('StorageView', () => {
 
     await waitFor(async () => {
       expect(promptSpy).toHaveBeenCalledWith('Tags for 3 chats, comma-separated', '')
-      const tags = await listTags()
+      const tags = await getDb().tags.toArray()
       const tagById = new Map(tags.map((tag) => [tag.id, tag.name]))
       for (const id of [alpha.id, beta.id, gamma.id]) {
         const stored = await getDb().chats.get(id)

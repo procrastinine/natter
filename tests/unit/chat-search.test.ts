@@ -110,8 +110,8 @@ function repository(input: {
     if (
       request.kind !== 'sidebar.catalog-page' &&
       request.kind !== 'sidebar.rows-by-id' &&
-      request.kind !== 'folder.list' &&
-      request.kind !== 'tag.list' &&
+      request.kind !== 'folder.get-many' &&
+      request.kind !== 'tag.get-many' &&
       request.kind !== 'chat.get' &&
       request.kind !== 'branch.open' &&
       request.kind !== 'branch.page-structure' &&
@@ -128,12 +128,16 @@ function repository(input: {
       case 'sidebar.rows-by-id':
         value = request.chatIds.map((chatId) => chats.get(chatId))
         break
-      case 'folder.list':
-        value = input.folders ?? []
+      case 'folder.get-many': {
+        const folders = new Map((input.folders ?? []).map((folder) => [folder.id, folder]))
+        value = request.folderIds.map((folderId) => folders.get(folderId))
         break
-      case 'tag.list':
-        value = input.tags ?? []
+      }
+      case 'tag.get-many': {
+        const tags = new Map((input.tags ?? []).map((tag) => [tag.id, tag]))
+        value = request.tagIds.map((tagId) => tags.get(tagId))
         break
+      }
       case 'chat.get':
         value = chats.get(request.chatId)
         break

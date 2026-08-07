@@ -2,20 +2,29 @@ import 'fake-indexeddb/auto'
 import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createChatRow } from '../../src/core/chat-metadata'
-import { readBrowserWorkspaceDatabaseManifest } from '../../src/store/browser-workspace-database-control'
+import { probeBrowserWorkspaceCurrent } from '../../src/store/browser-workspace-current-probe'
+import {
+  readBrowserWorkspaceDatabaseManifest,
+  tryBeginBrowserWorkspaceDatabaseReplacement,
+} from '../../src/store/browser-workspace-database-control'
 import type { BrowserWorkspaceOpenProgress } from '../../src/store/browser-workspace-open-contract'
 import { WAVE_A_V94_STORES } from '../../src/store/browser-workspace-schema-v94'
 import {
-  BROWSER_WORKSPACE_CURRENT_COMPLETION_KEY,
-  isBrowserWorkspaceCurrentCompletionValueV97,
+  browserWorkspaceCurrentCompletionSettingV97,
+  BROWSER_WORKSPACE_CURRENT_COMPLETION_KEY as V97_COMPLETION_KEY,
   WAVE_B_V97_STORES,
 } from '../../src/store/browser-workspace-schema-v97'
+import {
+  BROWSER_WORKSPACE_CURRENT_COMPLETION_KEY,
+  isBrowserWorkspaceCurrentCompletionValueV98,
+} from '../../src/store/browser-workspace-schema-v98'
 import {
   __resetBrowserWorkspaceSlotCoordinatorForTests,
   disposeBrowserWorkspaceSlotCoordinator,
   installBrowserWorkspaceSlotCoordinator,
 } from '../../src/store/browser-workspace-slot-coordination'
 import { ensureBrowserWorkspaceCurrentForSelection } from '../../src/store/browser-workspace-startup-repair'
+import { isValidChatSidebarFolderAggregateRow } from '../../src/store/chat-sidebar-projection'
 import {
   __resetBrowserWorkspaceFatalInvalidationOwnerForTests,
   __resetDbForTests,
@@ -43,6 +52,32 @@ class ImmediateLockManager {
     callback: (lock: Lock) => Promise<T> | T,
   ): Promise<T> {
     return Promise.resolve(callback({ name, mode: options.mode }))
+  }
+}
+
+class SerializedLockManager extends ImmediateLockManager {
+  private readonly tails = new Map<string, Promise<void>>()
+
+  override async request<T>(
+    name: string,
+    options: { mode: 'shared' | 'exclusive'; ifAvailable?: boolean; signal?: AbortSignal },
+    callback: (lock: Lock) => Promise<T> | T,
+  ): Promise<T> {
+    const prior = this.tails.get(name) ?? Promise.resolve()
+    let release!: () => void
+    const current = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const tail = prior.then(() => current)
+    this.tails.set(name, tail)
+    await prior
+    try {
+      options.signal?.throwIfAborted()
+      return await callback({ name, mode: options.mode })
+    } finally {
+      release()
+      if (this.tails.get(name) === tail) this.tails.delete(name)
+    }
   }
 }
 
@@ -168,6 +203,232 @@ describe('openDb recovery events', () => {
     ).toBe(false)
   })
 
+  it('probes only the current proof and the exact physical predecessor proof', async () => {
+    const name = 'natter'
+    await createValidV97Workspace(name)
+    const settingsKeys: Array<IDBValidKey | IDBKeyRange> = []
+    const originalGet = IDBObjectStore.prototype.get
+    const get = vi.spyOn(IDBObjectStore.prototype, 'get').mockImplementation(function (
+      this: IDBObjectStore,
+      query,
+    ) {
+      if (this.name === 'settings') settingsKeys.push(query)
+      return originalGet.call(this, query)
+    })
+    try {
+      await expect(probeBrowserWorkspaceCurrent(name)).resolves.toMatchObject({
+        kind: 'upgrade-required',
+        physicalVersion: 970,
+        strategyId: 'v97-to-v98',
+      })
+      expect(settingsKeys).toEqual([BROWSER_WORKSPACE_CURRENT_COMPLETION_KEY, V97_COMPLETION_KEY])
+    } finally {
+      get.mockRestore()
+      await Dexie.delete(name)
+    }
+  })
+
+  it('takes the production startup route from valid v97 without reading or rebuilding chat rows', async () => {
+    const name = 'natter'
+    const legacy = new Dexie(name)
+    legacy.version(97).stores(WAVE_B_V97_STORES)
+    await legacy.open()
+    await legacy.transaction(
+      'rw',
+      [
+        legacy.table('chats'),
+        legacy.table('chatSidebarAggregates'),
+        legacy.table('folders'),
+        legacy.table('settings'),
+      ],
+      async () => {
+        await legacy
+          .table('chats')
+          .bulkPut(Array.from({ length: 4_096 }, (_, index) => ({ id: `unread-chat-${index}` })))
+        await legacy.table('chatSidebarAggregates').put({
+          id: 'workspace',
+          kind: 'workspace',
+          projectionVersion: 2,
+          totalCount: 4_096,
+          activeCount: 4_096,
+          archivedCount: 0,
+          pinnedCount: 0,
+          visibleCount: 0,
+          visiblePinnedCount: 0,
+          rootCount: 4_096,
+          rootVisibleCount: 0,
+          rootVisiblePinnedCount: 0,
+        })
+        await legacy.table('folders').bulkPut(
+          Array.from({ length: 300 }, (_, index) => ({
+            id: `folder-${index}`,
+            name: `Folder ${index}`,
+            sortIndex: index,
+            createdAt: 1,
+            updatedAt: 2,
+            lastUsedAt: 3,
+          })),
+        )
+        await legacy.table('settings').put(browserWorkspaceCurrentCompletionSettingV97())
+      },
+    )
+    legacy.close()
+
+    const originalOpenCursor = IDBObjectStore.prototype.openCursor
+    const forbiddenCursor = vi
+      .spyOn(IDBObjectStore.prototype, 'openCursor')
+      .mockImplementation(function (this: IDBObjectStore, query, direction) {
+        if (['chats', 'messages', 'messageBodies', 'chatSidebarRows'].includes(this.name)) {
+          throw new Error(`ForbiddenRegisteredUpgradeRead:${this.name}`)
+        }
+        return originalOpenCursor.call(this, query, direction)
+      })
+    const progress: BrowserWorkspaceOpenProgress[] = []
+    const proof = await runStartupRepair((event) => progress.push(event))
+    forbiddenCursor.mockRestore()
+
+    expect(proof).toEqual({
+      databaseName: 'natter',
+      activationSequence: 0,
+      physicalVersion: 980,
+    })
+    expect(await readBrowserWorkspaceDatabaseManifest()).toEqual({
+      id: 'workspace',
+      activeDatabaseName: 'natter',
+      activationSequence: 0,
+    })
+    expect(
+      progress.some(
+        (event) =>
+          event.kind === 'database-upgrade' &&
+          (event.operation.startsWith('copy-') || event.operation === 'rebuild-child-slots'),
+      ),
+    ).toBe(false)
+    expect(
+      progress.filter(
+        (event) =>
+          event.kind === 'database-upgrade' &&
+          event.operation === 'migrate-sidebar-folder-presentation',
+      ).length,
+    ).toBeGreaterThanOrEqual(3)
+    expect((await indexedDB.databases()).map((database) => database.name)).not.toContain(
+      'natter-workspace-a',
+    )
+
+    const upgraded = new NatterDb(name)
+    await upgraded.open()
+    expect(await upgraded.chats.get('unread-chat-4095')).toEqual({ id: 'unread-chat-4095' })
+    expect((await upgraded.chatSidebarAggregates.get('workspace'))?.projectionVersion).toBe(3)
+    expect(
+      isValidChatSidebarFolderAggregateRow(
+        await upgraded.chatSidebarAggregates.get('folder:folder-299'),
+      ),
+    ).toBe(true)
+    upgraded.close()
+    await Dexie.delete(name)
+  })
+
+  it('elects one registered upgrader when many startup tabs arrive together', async () => {
+    await createValidV97Workspace('natter')
+    const progress: BrowserWorkspaceOpenProgress[] = []
+    const coordinator = installStartupRepairRuntime(new SerializedLockManager())
+    try {
+      const proofs = await Promise.all(
+        Array.from({ length: 16 }, () =>
+          ensureBrowserWorkspaceCurrentForSelection(new AbortController().signal, (event) =>
+            progress.push(event),
+          ),
+        ),
+      )
+      expect(new Set(proofs.map((proof) => JSON.stringify(proof)))).toEqual(
+        new Set([
+          JSON.stringify({
+            databaseName: 'natter',
+            activationSequence: 0,
+            physicalVersion: 980,
+          }),
+        ]),
+      )
+    } finally {
+      disposeBrowserWorkspaceSlotCoordinator(coordinator)
+    }
+    expect(
+      progress.filter((event) => event.kind === 'database-open' && event.fromVersion === 97),
+    ).toHaveLength(1)
+    expect(
+      progress.filter(
+        (event) =>
+          event.kind === 'database-upgrade' &&
+          event.operation === 'write-sidebar-folder-completion',
+      ),
+    ).toHaveLength(1)
+  })
+
+  it('discards an interrupted inactive repair before upgrading the authoritative v97 slot', async () => {
+    await createValidV97Workspace('natter')
+    const begin = await tryBeginBrowserWorkspaceDatabaseReplacement()
+    if (begin.kind !== 'ready') throw new Error('ExpectedPreparedReplacement')
+    const abandoned = new NatterDb(begin.journal.destinationDatabaseName)
+    await abandoned.open()
+    await abandoned.settings.put({ key: 'abandoned-copy', value: true })
+    abandoned.close()
+
+    const proof = await runStartupRepair()
+    expect(proof).toEqual({
+      databaseName: 'natter',
+      activationSequence: 0,
+      physicalVersion: 980,
+    })
+    expect(await readBrowserWorkspaceDatabaseManifest()).toEqual({
+      id: 'workspace',
+      activeDatabaseName: 'natter',
+      activationSequence: 0,
+    })
+    expect((await indexedDB.databases()).map((database) => database.name)).not.toContain(
+      begin.journal.destinationDatabaseName,
+    )
+  })
+
+  it('waits for an old connection and resumes the registered upgrade when it closes', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    await createValidV97Workspace('natter')
+    const blocker = await openRawDatabase('natter')
+    blocker.onversionchange = () => undefined
+    let noteBlocked!: () => void
+    const blocked = new Promise<void>((resolve) => {
+      noteBlocked = resolve
+    })
+    let settled = false
+    const opening = runStartupRepair(undefined, () => noteBlocked()).finally(() => {
+      settled = true
+    })
+    try {
+      await blocked
+      expect(settled).toBe(false)
+    } finally {
+      blocker.close()
+    }
+    await expect(opening).resolves.toMatchObject({ physicalVersion: 980 })
+    expect(warn).toHaveBeenCalledOnce()
+    expect(warn).toHaveBeenCalledWith(
+      "Upgrade 'natter' blocked by other connection holding version 97",
+    )
+  })
+
+  it('rejects an undeclared intermediate epoch instead of defaulting to full repair', async () => {
+    await createValidV97Workspace('natter')
+    await upgradeRawDatabase('natter', 975, () => undefined)
+
+    await expect(runStartupRepair()).rejects.toThrow(
+      'BrowserWorkspaceSchemaIntegrity:upgrade-strategy-missing:975:980',
+    )
+    expect(await readBrowserWorkspaceDatabaseManifest()).toEqual({
+      id: 'workspace',
+      activeDatabaseName: 'natter',
+      activationSequence: 0,
+    })
+  })
+
   it('verifies the physical schema once per session instead of once per operation', async () => {
     const db = await openDb()
     const transactionSpy = vi.spyOn(db.backendDB(), 'transaction')
@@ -280,7 +541,7 @@ describe('openDb recovery events', () => {
     expect(proof).toMatchObject({
       databaseName: 'natter-workspace-a',
       activationSequence: 1,
-      physicalVersion: 970,
+      physicalVersion: 980,
     })
     expect(await readBrowserWorkspaceDatabaseManifest()).toEqual({
       id: 'workspace',
@@ -301,7 +562,7 @@ describe('openDb recovery events', () => {
       replacementEpoch: 4,
     })
     expect(
-      isBrowserWorkspaceCurrentCompletionValueV97(
+      isBrowserWorkspaceCurrentCompletionValueV98(
         (await repaired.settings.get(BROWSER_WORKSPACE_CURRENT_COMPLETION_KEY))?.value,
       ),
     ).toBe(true)
@@ -322,6 +583,20 @@ describe('openDb recovery events', () => {
       priorRows = page.processedRows
       priorBytes = page.processedBytes
     }
+    expect(
+      progress.some(
+        (event) =>
+          event.kind === 'database-upgrade' &&
+          event.operation === 'migrate-sidebar-folder-presentation',
+      ),
+    ).toBe(true)
+    expect(
+      progress.some(
+        (event) =>
+          event.kind === 'database-upgrade' &&
+          event.operation === 'write-sidebar-folder-completion',
+      ),
+    ).toBe(true)
     expect((await indexedDB.databases()).map((database) => database.name)).not.toContain('natter')
   })
 
@@ -336,7 +611,7 @@ describe('openDb recovery events', () => {
     const proof = await runStartupRepair()
     const repaired = new NatterDb(proof.databaseName)
     await repaired.open()
-    expect(repaired.verno).toBe(97)
+    expect(repaired.verno).toBe(98)
     expect((await repaired.settings.get('canonical-proof'))?.value).toBe('current-source')
     expect(await repaired.chatSidebarRows.get('poison')).toBeUndefined()
     repaired.close()
@@ -380,7 +655,7 @@ describe('openDb recovery events', () => {
           activeChatCount: 1,
         })
         await source.table('settings').put({
-          key: BROWSER_WORKSPACE_CURRENT_COMPLETION_KEY,
+          key: V97_COMPLETION_KEY,
           value: {
             formatVersion: 2,
             storageVersion: 97,
@@ -394,7 +669,7 @@ describe('openDb recovery events', () => {
     const proof = await runStartupRepair()
     const repaired = new NatterDb(proof.databaseName)
     await repaired.open()
-    expect(repaired.verno).toBe(97)
+    expect(repaired.verno).toBe(98)
     expect(await repaired.chats.get(chat.id)).toMatchObject({
       id: chat.id,
       settings: { profileId: '' },
@@ -405,7 +680,7 @@ describe('openDb recovery events', () => {
       '[attachmentId+ownerKind+ownerId+refId]',
     )
     expect(
-      isBrowserWorkspaceCurrentCompletionValueV97(
+      isBrowserWorkspaceCurrentCompletionValueV98(
         (await repaired.settings.get(BROWSER_WORKSPACE_CURRENT_COMPLETION_KEY))?.value,
       ),
     ).toBe(true)
@@ -530,24 +805,57 @@ describe('openDb recovery events', () => {
   })
 })
 
-async function runStartupRepair(onProgress?: (progress: BrowserWorkspaceOpenProgress) => void) {
+async function runStartupRepair(
+  onProgress?: (progress: BrowserWorkspaceOpenProgress) => void,
+  onBlocked?: (event: IDBVersionChangeEvent) => void,
+) {
+  const coordinator = installStartupRepairRuntime(new ImmediateLockManager())
+  try {
+    return await ensureBrowserWorkspaceCurrentForSelection(
+      new AbortController().signal,
+      onProgress,
+      onBlocked,
+    )
+  } finally {
+    disposeBrowserWorkspaceSlotCoordinator(coordinator)
+  }
+}
+
+function installStartupRepairRuntime(lockManager: ImmediateLockManager) {
   Object.defineProperty(globalThis, 'BroadcastChannel', {
     configurable: true,
     value: SilentBroadcastChannel,
   })
   Object.defineProperty(navigator, 'locks', {
     configurable: true,
-    value: new ImmediateLockManager(),
+    value: lockManager,
   })
-  const coordinator = installBrowserWorkspaceSlotCoordinator({
+  return installBrowserWorkspaceSlotCoordinator({
     validateQuiesce: async () => false,
     reconcile: async () => undefined,
   })
-  try {
-    return await ensureBrowserWorkspaceCurrentForSelection(new AbortController().signal, onProgress)
-  } finally {
-    disposeBrowserWorkspaceSlotCoordinator(coordinator)
-  }
+}
+
+async function createValidV97Workspace(name: string): Promise<void> {
+  const legacy = new Dexie(name)
+  legacy.version(97).stores(WAVE_B_V97_STORES)
+  await legacy.open()
+  await legacy.table('chatSidebarAggregates').put({
+    id: 'workspace',
+    kind: 'workspace',
+    projectionVersion: 2,
+    totalCount: 0,
+    activeCount: 0,
+    archivedCount: 0,
+    pinnedCount: 0,
+    visibleCount: 0,
+    visiblePinnedCount: 0,
+    rootCount: 0,
+    rootVisibleCount: 0,
+    rootVisiblePinnedCount: 0,
+  })
+  await legacy.table('settings').put(browserWorkspaceCurrentCompletionSettingV97())
+  legacy.close()
 }
 
 function requestValue<T>(request: IDBRequest<T>): Promise<T> {

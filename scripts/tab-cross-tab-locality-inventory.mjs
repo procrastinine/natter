@@ -77,7 +77,8 @@ const QUERY_VARIANTS = Object.freeze([
   'discovery.endpoints',
   'discovery.models',
   'discovery.privacy',
-  'folder.list',
+  'folder.catalog-page',
+  'folder.get-many',
   'generated-output.localization-queue',
   'interchange.export-chat',
   'interchange.export-chat-preset',
@@ -93,7 +94,6 @@ const QUERY_VARIANTS = Object.freeze([
   'setting.get-many',
   'sidebar.aggregate',
   'sidebar.catalog-page',
-  'sidebar.created-at-group-count',
   'sidebar.presentation-page',
   'sidebar.rows-by-id',
   'stream.journal-frame-page',
@@ -101,7 +101,8 @@ const QUERY_VARIANTS = Object.freeze([
   'stream.lease-head',
   'stream.leases',
   'stream.leases-by-id',
-  'tag.list',
+  'tag.catalog-page',
+  'tag.get-many',
   'workspace.meta',
 ])
 
@@ -868,6 +869,7 @@ export const OWNER_PATH_CLASSIFICATIONS = Object.freeze({
     'src/store/chat-search.ts',
     'src/store/chat-sidebar-projection.ts',
     'src/store/chats.ts',
+    'src/store/catalog-application.ts',
     'src/store/configuration-application.ts',
     'src/store/configuration-catalog-session.ts',
     'src/store/configuration-command-client.ts',
@@ -906,6 +908,7 @@ export const PUBLICATION_CONSUMER_FILES = Object.freeze({
   'src/store/attachment-detail-session.ts': 'attachment-detail-projection-refresh',
   'src/store/attachment-search-session.ts': 'attachment-search-projection-refresh',
   'src/store/attempt-workspace.ts': 'attempt-projection-refresh',
+  'src/store/catalog-application.ts': 'organization-catalog-refresh',
   'src/store/configuration-workspace.ts': 'configuration-projection-refresh',
   'src/store/configuration-model-resolution-capability.ts': 'configuration-model-resolution-demand',
   'src/store/conversation-repository-adapter.ts': 'conversation-projection-refresh',
@@ -936,6 +939,7 @@ export const REMOTE_LOCALITY_BROWSER_OUTCOME_MATRIX = Object.freeze([
   remoteBrowserOutcome(
     'catalogs',
     [
+      'src/store/catalog-application.ts',
       'src/store/search-session.ts',
       'src/store/sidebar-session.ts',
       'src/store/storage-chat-catalog-session.ts',

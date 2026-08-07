@@ -4,32 +4,64 @@ import { relative, resolve, sep } from 'node:path'
 import ts from 'typescript'
 
 const DEFAULT_ROOT = resolve(import.meta.dirname, '..')
+const PROGRAM_INPUTS_BY_ROOT = new Map()
 
 export function createProductionTypeScriptProgram(root = DEFAULT_ROOT, options = {}) {
+  const resolvedRoot = resolve(root)
+  const inputs = productionProgramInputs(resolvedRoot)
+  const overrides = new Map(
+    Object.entries(options.sourceTextOverrides ?? {}).map(([path, text]) => [
+      resolve(resolvedRoot, path),
+      text,
+    ]),
+  )
+  if (!inputs.baselineProgram) {
+    inputs.baselineProgram = ts.createProgram({
+      rootNames: inputs.parsed.fileNames,
+      options: inputs.parsed.options,
+      host: productionCompilerHost(inputs, new Map()),
+    })
+  }
+  if (overrides.size === 0) return inputs.baselineProgram
+  return ts.createProgram({
+    rootNames: inputs.parsed.fileNames,
+    options: inputs.parsed.options,
+    host: productionCompilerHost(inputs, overrides),
+    oldProgram: inputs.baselineProgram,
+  })
+}
+
+function productionCompilerHost(inputs, overrides) {
+  const host = ts.createCompilerHost(inputs.parsed.options)
+  const getSourceFile = host.getSourceFile.bind(host)
+  host.getSourceFile = (fileName, languageVersion, onError, shouldCreateNewSourceFile) => {
+    const resolvedFileName = resolve(fileName)
+    const text = overrides.get(resolvedFileName)
+    if (text !== undefined) return ts.createSourceFile(fileName, text, languageVersion, true)
+    const cached = inputs.sourceFiles.get(resolvedFileName)
+    if (cached) return cached
+    const source = getSourceFile(fileName, languageVersion, onError, shouldCreateNewSourceFile)
+    if (source) inputs.sourceFiles.set(resolvedFileName, source)
+    return source
+  }
+  return host
+}
+
+function productionProgramInputs(root) {
+  const cached = PROGRAM_INPUTS_BY_ROOT.get(root)
+  if (cached) return cached
   const configPath = resolve(root, 'tsconfig.app.json')
   const config = ts.readConfigFile(configPath, (path) => readFileSync(path, 'utf8'))
   if (config.error) {
     throw new Error(ts.flattenDiagnosticMessageText(config.error.messageText, '\n'))
   }
-  const parsed = ts.parseJsonConfigFileContent(config.config, ts.sys, root, undefined, configPath)
-  const overrides = new Map(
-    Object.entries(options.sourceTextOverrides ?? {}).map(([path, text]) => [
-      resolve(root, path),
-      text,
-    ]),
-  )
-  if (overrides.size === 0) {
-    return ts.createProgram({ rootNames: parsed.fileNames, options: parsed.options })
+  const inputs = {
+    baselineProgram: null,
+    parsed: ts.parseJsonConfigFileContent(config.config, ts.sys, root, undefined, configPath),
+    sourceFiles: new Map(),
   }
-  const host = ts.createCompilerHost(parsed.options)
-  const getSourceFile = host.getSourceFile.bind(host)
-  host.getSourceFile = (fileName, languageVersion, onError, shouldCreateNewSourceFile) => {
-    const text = overrides.get(resolve(fileName))
-    return text === undefined
-      ? getSourceFile(fileName, languageVersion, onError, shouldCreateNewSourceFile)
-      : ts.createSourceFile(fileName, text, languageVersion, true)
-  }
-  return ts.createProgram({ rootNames: parsed.fileNames, options: parsed.options, host })
+  PROGRAM_INPUTS_BY_ROOT.set(root, inputs)
+  return inputs
 }
 
 export function productionTypeScriptSources(program, root = DEFAULT_ROOT) {

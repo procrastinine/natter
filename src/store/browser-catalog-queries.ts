@@ -22,7 +22,9 @@ import {
 } from './attachment-catalog-projection'
 import {
   CHAT_SIDEBAR_AGGREGATE_ID,
+  type ChatSidebarFolderAggregateRow,
   type ChatSidebarProjectionRow,
+  type ChatSidebarWorkspaceAggregateRow,
   chatSidebarFolderKey,
   isValidChatSidebarFolderAggregateRow,
   isValidChatSidebarProjectionRow,
@@ -41,15 +43,19 @@ import type {
   ChatSidebarAggregate,
   ChatSidebarCatalogPage,
   ChatSidebarCatalogRequest,
-  SidebarCreatedAtGroupCountRequest,
+  FolderCatalogPage,
+  OrganizationCatalogPageRequest,
   SidebarPresentationPage,
   SidebarPresentationRequest,
   SidebarPresentationRow,
+  TagCatalogPage,
 } from './repository'
 
 const SIDEBAR_CURSOR_PREFIX = 'natter-sidebar-catalog:v1:'
-const SIDEBAR_PRESENTATION_CURSOR_PREFIX = 'natter-sidebar-presentation:v2:'
+const SIDEBAR_PRESENTATION_CURSOR_PREFIX = 'natter-sidebar-presentation:v3:'
 const ATTACHMENT_CURSOR_PREFIX = 'natter-attachment-catalog:v1:'
+const FOLDER_CATALOG_CURSOR_PREFIX = 'natter-folder-catalog:v1:'
+const TAG_CATALOG_CURSOR_PREFIX = 'natter-tag-catalog:v1:'
 const CATALOG_ABORT_CHECK_ROWS = 128
 
 interface CatalogCursor {
@@ -60,10 +66,16 @@ interface CatalogCursor {
   titleSortKey?: string
 }
 
+interface FolderCatalogCursor {
+  readonly sortIndex: number
+  readonly titleSortKey: string
+  readonly folderKey: string
+}
+
 interface SidebarPresentationCursor {
   readonly fingerprint: string
   readonly flatCursor?: string
-  readonly folderIndex: number
+  readonly folderCursor?: CatalogCursor
   readonly rootRowsEmitted: number
   readonly rootCursors: Readonly<Record<string, CatalogCursor>>
   readonly activeFolder?: {
@@ -116,6 +128,64 @@ export async function readSidebarRowsById(
     assertSidebarProjection(row)
     return publicChatSidebarRow(row)
   })
+}
+
+export async function readFolderCatalogPage(
+  db: NatterDb,
+  request: OrganizationCatalogPageRequest,
+  signal?: AbortSignal,
+): Promise<FolderCatalogPage> {
+  throwIfAborted(signal)
+  const limit = boundedLimit(request.limit, 100)
+  const cursor = request.cursor ? decodeFolderCatalogCursor(request.cursor) : undefined
+  const index = '[folderSortIndex+folderTitleSortKey+folderKey]'
+  const collection = cursor
+    ? db.chatSidebarAggregates
+        .where(index)
+        .above([cursor.sortIndex, cursor.titleSortKey, cursor.folderKey])
+    : db.chatSidebarAggregates.orderBy(index)
+  const rows = await collection.limit(limit + 1).toArray()
+  throwIfAborted(signal)
+  for (const row of rows) {
+    if (!isValidChatSidebarFolderAggregateRow(row)) {
+      throw new Error('ChatSidebarFolderAggregateInvalid')
+    }
+  }
+  const pageRows = rows.slice(0, limit) as ChatSidebarFolderAggregateRow[]
+  const last = pageRows.at(-1)
+  return {
+    rows: pageRows.map((row) => ({ ...row.folder })),
+    ...(rows.length > limit && last
+      ? {
+          nextCursor: encodeFolderCatalogCursor({
+            sortIndex: last.folderSortIndex,
+            titleSortKey: last.folderTitleSortKey,
+            folderKey: last.folderKey,
+          }),
+        }
+      : {}),
+  }
+}
+
+export async function readTagCatalogPage(
+  db: NatterDb,
+  request: OrganizationCatalogPageRequest,
+  signal?: AbortSignal,
+): Promise<TagCatalogPage> {
+  throwIfAborted(signal)
+  const limit = boundedLimit(request.limit, 100)
+  const cursor = request.cursor ? decodeTagCatalogCursor(request.cursor) : undefined
+  const collection = cursor
+    ? db.tags.where('nameLower').above(cursor)
+    : db.tags.orderBy('nameLower')
+  const rows = await collection.limit(limit + 1).toArray()
+  throwIfAborted(signal)
+  const pageRows = rows.slice(0, limit)
+  const last = pageRows.at(-1)
+  return {
+    rows: pageRows.map((row) => ({ ...row })),
+    ...(rows.length > limit && last ? { nextCursor: encodeTagCatalogCursor(last.nameLower) } : {}),
+  }
 }
 
 export async function readSidebarCatalogPage(
@@ -233,20 +303,23 @@ export async function readSidebarPresentationPage(
         resumedCompletionProbeQueries = activePage.completionProbeQueries
         resumedCompletionProbeKeysRead = activePage.completionProbeKeysRead
         if (resumedActiveFolder) {
+          const metadata = await readSidebarPresentationMetadata(db, resumedRows, signal)
           return {
             rows: resumedRows,
             nextCursor: encodeSidebarPresentationCursor({
               fingerprint,
-              folderIndex: decoded.folderIndex,
+              ...(decoded.folderCursor ? { folderCursor: decoded.folderCursor } : {}),
               rootRowsEmitted: decoded.rootRowsEmitted,
               rootCursors: decoded.rootCursors,
               activeFolder: resumedActiveFolder,
             }),
+            folders: metadata.folders,
+            tags: metadata.tags,
             measurement: {
               rootChatRowsRead: 0,
               folderChildRowsRead: resumedChildRowsRead,
               folderCatalogRowsRead: 0,
-              tagCatalogRowsRead: 0,
+              tagCatalogRowsRead: metadata.tags.length,
               completionProbeQueries: resumedCompletionProbeQueries,
               completionProbeKeysRead: resumedCompletionProbeKeysRead,
               createdAtGroupProbeQueries: 0,
@@ -255,14 +328,11 @@ export async function readSidebarPresentationPage(
           }
         }
       }
-      const [aggregate, folderCatalog, tagCatalog] = await Dexie.Promise.all([
-        readSidebarAggregate(db),
-        db.folders.toArray(),
-        request.countMode === 'omit' ? Dexie.Promise.resolve([]) : db.tags.toArray(),
-      ])
+      const aggregate = await db.chatSidebarAggregates.get(CHAT_SIDEBAR_AGGREGATE_ID)
+      if (!isValidChatSidebarWorkspaceAggregateRow(aggregate)) {
+        throw new Error('ChatSidebarAggregateInvalid')
+      }
       throwIfAborted(signal)
-      const folders = sortSidebarFolders(folderCatalog)
-      const tags = sortSidebarTags(tagCatalog)
       if (request.mode === 'collapsed') {
         const catalog = await readPinnedFirstSidebarCatalogPage(
           db,
@@ -288,28 +358,27 @@ export async function readSidebarPresentationPage(
           ? encodeSidebarPresentationCursor({
               fingerprint,
               flatCursor: catalog.nextCursor,
-              folderIndex: 0,
               rootRowsEmitted: 0,
               rootCursors: {},
             })
           : undefined
+        const metadata = await readSidebarPresentationMetadata(db, rows, signal)
         return {
           rows,
           ...(nextCursor ? { nextCursor } : {}),
+          folders: metadata.folders,
+          tags: metadata.tags,
           ...(request.countMode === 'omit'
             ? {}
             : {
-                exactTotalRows: aggregate.visibleCount,
                 exactVisibleChats: aggregate.visibleCount,
-                aggregate,
-                folders,
-                tags,
+                aggregate: publicWorkspaceSidebarAggregate(aggregate),
               }),
           measurement: {
             rootChatRowsRead: catalog.rows.length,
             folderChildRowsRead: 0,
-            folderCatalogRowsRead: folderCatalog.length,
-            tagCatalogRowsRead: tagCatalog.length,
+            folderCatalogRowsRead: metadata.folders.length,
+            tagCatalogRowsRead: metadata.tags.length,
             completionProbeQueries: 0,
             completionProbeKeysRead: 0,
             createdAtGroupProbeQueries: 0,
@@ -330,8 +399,14 @@ export async function readSidebarPresentationPage(
         index: 0,
         complete: false,
       }))
-      const entries = sidebarPresentationFolderEntries(folders, aggregate, request.sort)
-      let folderIndex = decoded?.folderIndex ?? 0
+      const folderBatch = await readSidebarFolderPresentationBatch(
+        db.chatSidebarAggregates,
+        request.sort,
+        decoded?.folderCursor,
+        limit + 1,
+      )
+      let folderIndex = 0
+      let folderCursor = decoded?.folderCursor
       let rootRowsEmitted = decoded?.rootRowsEmitted ?? 0
       let activeFolder = resumedActiveFolder ? { ...resumedActiveFolder } : undefined
       const rows: SidebarPresentationRow[] = [...resumedRows]
@@ -381,7 +456,10 @@ export async function readSidebarPresentationPage(
         }
 
         for (const source of sources) await fillSource(source)
-        const folderEntry = entries[folderIndex]
+        const folderRow = folderBatch[folderIndex]
+        const folderEntry = folderRow
+          ? sidebarPresentationFolderEntry(folderRow, request.sort)
+          : undefined
         const source = bestSidebarRootSource(sources, request.sort)
         const rootChat = source?.rows[source.index]
         if (!folderEntry && !rootChat) break
@@ -396,6 +474,10 @@ export async function readSidebarPresentationPage(
             exactChatCount: folderEntry.exactChatCount,
           })
           folderIndex += 1
+          folderCursor = folderCatalogCursor(
+            folderRow as ChatSidebarFolderAggregateRow,
+            request.sort,
+          )
           if (!collapsedFolders.has(folderEntry.folder.id)) {
             activeFolder = {
               folderId: folderEntry.folder.id,
@@ -419,78 +501,42 @@ export async function readSidebarPresentationPage(
         source.index += 1
       }
 
-      const exactRootRows = aggregate.rootVisibleCount
       const complete =
-        !activeFolder && folderIndex >= entries.length && rootRowsEmitted >= exactRootRows
+        !activeFolder &&
+        folderIndex >= folderBatch.length &&
+        folderBatch.length < limit + 1 &&
+        rootRowsEmitted >= aggregate.rootVisibleCount
       if (!complete && rows.length === 0) throw new Error('SidebarPresentationCursorDidNotAdvance')
       const nextCursor = complete
         ? undefined
         : encodeSidebarPresentationCursor({
             fingerprint,
-            folderIndex,
+            ...(folderCursor ? { folderCursor } : {}),
             rootRowsEmitted,
             rootCursors,
             ...(activeFolder ? { activeFolder } : {}),
           })
-      let exactTotalRows: number | undefined
-      let createdAtGroupProbeQueries = 0
-      let createdAtGroupProbeKeysRead = 0
-      if (request.countMode !== 'omit') {
-        if (!decoded && complete) {
-          exactTotalRows = rows.length
-        } else {
-          let expandedChatRows = 0
-          let expandedEmptyRows = 0
-          const expandedFolderIds: FolderId[] = []
-          for (const entry of entries) {
-            if (collapsedFolders.has(entry.folder.id)) continue
-            if (entry.exactChatCount === 0) expandedEmptyRows += 1
-            else {
-              expandedChatRows += entry.exactChatCount
-              expandedFolderIds.push(entry.folder.id)
-            }
-          }
-          const timeGroups =
-            sidebarSortField(request.sort) === 'createdAt'
-              ? await countSidebarCreatedAtGroupRuns(
-                  db,
-                  expandedFolderIds,
-                  request.createdAtGroupBoundaries,
-                  sidebarSortDirection(request.sort),
-                  signal,
-                )
-              : { count: 0, queries: 0, keysRead: 0 }
-          createdAtGroupProbeQueries = timeGroups.queries
-          createdAtGroupProbeKeysRead = timeGroups.keysRead
-          exactTotalRows =
-            aggregate.rootVisibleCount +
-            entries.length +
-            expandedChatRows +
-            expandedEmptyRows +
-            timeGroups.count
-        }
-      }
+      const metadata = await readSidebarPresentationMetadata(db, rows, signal)
       return {
         rows,
         ...(nextCursor ? { nextCursor } : {}),
-        ...(exactTotalRows === undefined
+        folders: metadata.folders,
+        tags: metadata.tags,
+        ...(request.countMode === 'omit'
           ? {}
           : {
-              exactTotalRows,
               exactVisibleChats: aggregate.visibleCount,
-              aggregate,
-              folders,
-              tags,
+              aggregate: publicWorkspaceSidebarAggregate(aggregate),
             }),
         measurement: {
           rootChatRowsRead,
           folderChildRowsRead,
-          folderCatalogRowsRead: folderCatalog.length,
-          tagCatalogRowsRead: tagCatalog.length,
+          folderCatalogRowsRead: folderBatch.length,
+          tagCatalogRowsRead: metadata.tags.length,
           completionProbeQueries,
           completionProbeKeysRead,
-          createdAtGroupProbeQueries,
-          createdAtGroupProbeKeysRead,
+          createdAtGroupProbeQueries: 0,
+          createdAtGroupProbeKeysRead: 0,
         },
       }
     },
@@ -580,43 +626,128 @@ function readActiveSidebarFolderPage(
   })
 }
 
-function sidebarPresentationFolderEntries(
-  folders: readonly ChatFolder[],
-  aggregate: ChatSidebarAggregate,
+function sidebarPresentationFolderEntry(
+  row: ChatSidebarFolderAggregateRow,
   sort: SidebarPresentationRequest['sort'],
-): SidebarPresentationFolderEntry[] {
+): SidebarPresentationFolderEntry {
   const direction = sidebarSortDirection(sort)
   const field = sidebarSortField(sort)
-  return folders
-    .map((folder) => {
-      const folderAggregate = aggregate.folderAggregates[folder.id]
-      const exactChatCount = folderAggregate?.visibleCount ?? 0
-      const primary = folderAggregate?.sortExtrema
-        ? folderAggregate.sortExtrema[field][direction === 'asc' ? 'min' : 'max']
-        : emptySidebarFolderPrimary(folder, field)
-      return {
-        folder,
-        exactChatCount,
-        pinned: (folderAggregate?.visiblePinnedCount ?? 0) > 0,
-        primary,
-        titleKey: sidebarTitleSortKey(folder.name),
-      }
-    })
-    .sort((left, right) => compareSidebarFolderEntries(left, right, sort))
+  const suffix = direction === 'asc' ? 'Asc' : 'Desc'
+  const primary = row[`${field}${suffix}` as keyof ChatSidebarFolderAggregateRow]
+  if (typeof primary !== 'number' && typeof primary !== 'string') {
+    throw new Error('ChatSidebarFolderPresentationPrimaryInvalid')
+  }
+  return {
+    folder: { ...row.folder },
+    exactChatCount: row.visibleCount,
+    pinned: row.visiblePinnedCount > 0,
+    primary,
+    titleKey: row.folderTitleSortKey,
+  }
 }
 
-function compareSidebarFolderEntries(
-  left: SidebarPresentationFolderEntry,
-  right: SidebarPresentationFolderEntry,
+function readSidebarFolderPresentationBatch(
+  table: Table<ChatSidebarWorkspaceAggregateRow | ChatSidebarFolderAggregateRow, string>,
   sort: SidebarPresentationRequest['sort'],
-): number {
-  const pinned = Number(right.pinned) - Number(left.pinned)
-  if (pinned !== 0) return pinned
-  const primary = compareSidebarPresentationValue(left.primary, right.primary, sort)
-  if (primary !== 0) return primary
-  const title = compareSidebarPresentationText(left.titleKey, right.titleKey, sort)
-  if (title !== 0) return title
-  return compareSidebarPresentationText(left.folder.id, right.folder.id, sort)
+  cursor: CatalogCursor | undefined,
+  limit: number,
+): Promise<ChatSidebarFolderAggregateRow[]> {
+  const direction = sidebarSortDirection(sort)
+  const field = sidebarSortField(sort)
+  const suffix = direction === 'asc' ? 'Asc' : 'Desc'
+  const pinnedField = `presentationPinned${suffix}`
+  const primaryField = `${field}${suffix}`
+  const index = `[kind+${pinnedField}+${primaryField}+folderTitleSortKey+folderKey]`
+  const lower: unknown[] = ['folder']
+  const upper: unknown[] = ['folder', []]
+  const cursorKey = cursor
+    ? ['folder', cursor.pinnedKey, cursor.value, cursor.titleSortKey ?? '', cursor.id]
+    : undefined
+  const collection = cursorKey
+    ? direction === 'asc'
+      ? table.where(index).between(cursorKey, upper, false, false)
+      : table.where(index).between(lower, cursorKey, true, false)
+    : table.where(index).between(lower, upper, true, false)
+  return (direction === 'asc' ? collection : collection.reverse())
+    .limit(limit)
+    .toArray()
+    .then((rows) => {
+      for (const row of rows) {
+        if (!isValidChatSidebarFolderAggregateRow(row)) {
+          throw new Error('ChatSidebarFolderAggregateInvalid')
+        }
+      }
+      return rows as ChatSidebarFolderAggregateRow[]
+    })
+}
+
+function folderCatalogCursor(
+  row: ChatSidebarFolderAggregateRow,
+  sort: SidebarPresentationRequest['sort'],
+): CatalogCursor {
+  const direction = sidebarSortDirection(sort)
+  const field = sidebarSortField(sort)
+  const suffix = direction === 'asc' ? 'Asc' : 'Desc'
+  const primary = row[`${field}${suffix}` as keyof ChatSidebarFolderAggregateRow]
+  if (typeof primary !== 'number' && typeof primary !== 'string') {
+    throw new Error('ChatSidebarFolderPresentationPrimaryInvalid')
+  }
+  return {
+    fingerprint: '',
+    value: primary,
+    id: row.folderKey,
+    pinnedKey: direction === 'asc' ? row.presentationPinnedAsc : row.presentationPinnedDesc,
+    titleSortKey: row.folderTitleSortKey,
+  }
+}
+
+async function readSidebarPresentationMetadata(
+  db: NatterDb,
+  rows: readonly SidebarPresentationRow[],
+  signal?: AbortSignal,
+): Promise<{ folders: ChatFolder[]; tags: ChatTag[] }> {
+  const folders = new Map<FolderId, ChatFolder>()
+  const folderIds = new Set<FolderId>()
+  const tagIds = new Set<string>()
+  for (const row of rows) {
+    if (row.kind === 'folder') folders.set(row.folder.id, { ...row.folder })
+    if (row.kind === 'chat') {
+      if (row.chat.folderId) folderIds.add(row.chat.folderId)
+      for (const tagId of row.chat.tags) tagIds.add(tagId)
+    }
+  }
+  for (const folderId of folders.keys()) folderIds.delete(folderId)
+  throwIfAborted(signal)
+  const [storedFolders, storedTags] = await Dexie.Promise.all([
+    folderIds.size > 0 ? db.folders.bulkGet([...folderIds]) : Dexie.Promise.resolve([]),
+    tagIds.size > 0 ? db.tags.bulkGet([...tagIds]) : Dexie.Promise.resolve([]),
+  ])
+  throwIfAborted(signal)
+  for (const folder of storedFolders) {
+    if (folder) folders.set(folder.id, { ...folder })
+  }
+  return {
+    folders: sortSidebarFolders([...folders.values()]),
+    tags: sortSidebarTags(storedTags.filter((tag): tag is ChatTag => tag !== undefined)),
+  }
+}
+
+function publicWorkspaceSidebarAggregate(
+  aggregate: ChatSidebarWorkspaceAggregateRow,
+): ChatSidebarAggregate {
+  return {
+    totalCount: aggregate.totalCount,
+    activeCount: aggregate.activeCount,
+    archivedCount: aggregate.archivedCount,
+    pinnedCount: aggregate.pinnedCount,
+    visibleCount: aggregate.visibleCount,
+    visiblePinnedCount: aggregate.visiblePinnedCount,
+    folderCounts: {},
+    folderAggregates: {},
+    rootCount: aggregate.rootCount,
+    rootVisibleCount: aggregate.rootVisibleCount,
+    rootVisiblePinnedCount: aggregate.rootVisiblePinnedCount,
+  }
 }
 
 function compareSidebarRootFolderToChat(
@@ -699,27 +830,6 @@ function sidebarPresentationChatPrimary(
 ): number | string {
   const field = sidebarSortField(sort)
   return field === 'title' ? row.titleSortKey : row[field]
-}
-
-function emptySidebarFolderPrimary(folder: ChatFolder, field: SidebarSortField): number | string {
-  switch (field) {
-    case 'updatedAt':
-      return finiteOr(folder.updatedAt, folder.createdAt)
-    case 'createdAt':
-      return finiteOr(folder.createdAt, folder.updatedAt)
-    case 'lastViewedAt':
-      return finiteOr(folder.lastUsedAt, folder.updatedAt)
-    case 'totalCostUsd':
-    case 'wordCount':
-      return 0
-    case 'title':
-      return sidebarTitleSortKey(folder.name)
-  }
-}
-
-function finiteOr(value: unknown, fallback: unknown): number {
-  if (typeof value === 'number' && Number.isFinite(value)) return value
-  return typeof fallback === 'number' && Number.isFinite(fallback) ? fallback : 0
 }
 
 function readVisibleFolderChatBatch(
@@ -877,55 +987,6 @@ function sidebarCreatedAtGroup(
   return { key: 'older', label: 'Older' }
 }
 
-function countSidebarCreatedAtGroupRuns(
-  db: NatterDb,
-  folderIds: readonly FolderId[],
-  boundaries: SidebarPresentationRequest['createdAtGroupBoundaries'],
-  direction: 'asc' | 'desc',
-  signal?: AbortSignal,
-): Promise<{ count: number; queries: number; keysRead: number }> {
-  const [today, yesterday, previous7Days, previous30Days] = boundaries
-  const groups = [
-    { key: 'older', lower: [] as unknown[], upper: [previous30Days] as unknown[] },
-    { key: 'previous-30-days', lower: [previous30Days], upper: [previous7Days] },
-    { key: 'previous-7-days', lower: [previous7Days], upper: [yesterday] },
-    { key: 'yesterday', lower: [yesterday], upper: [today] },
-    { key: 'today', lower: [today], upper: [[]] as unknown[] },
-  ]
-  if (direction === 'desc') groups.reverse()
-  let runs = 0
-  let queries = 0
-  let keysRead = 0
-  let chain = Dexie.Promise.resolve()
-  for (const folderId of folderIds) {
-    chain = chain.then(() => {
-      throwIfAborted(signal)
-      const probes = []
-      for (const pinnedKey of [1, 0] as const) {
-        for (const group of groups) {
-          const prefix = [chatSidebarFolderKey(folderId), 1, pinnedKey]
-          probes.push(
-            db.chatSidebarRows
-              .where('[folderKey+visibleKey+pinnedKey+createdAt+titleSortKey+id]')
-              .between([...prefix, ...group.lower], [...prefix, ...group.upper], true, false)
-              .limit(1)
-              .primaryKeys(),
-          )
-        }
-      }
-      return Dexie.Promise.all(probes).then((results) => {
-        throwIfAborted(signal)
-        queries += results.length
-        for (const keys of results) {
-          keysRead += keys.length
-          if (keys.length > 0) runs += 1
-        }
-      })
-    })
-  }
-  return chain.then(() => ({ count: runs, queries, keysRead }))
-}
-
 function sortSidebarFolders(folders: readonly ChatFolder[]): ChatFolder[] {
   return [...folders]
     .sort(
@@ -959,6 +1020,44 @@ function encodeSidebarPresentationCursor(cursor: SidebarPresentationCursor): str
   return `${SIDEBAR_PRESENTATION_CURSOR_PREFIX}${encodeURIComponent(JSON.stringify(cursor))}`
 }
 
+function encodeFolderCatalogCursor(cursor: FolderCatalogCursor): string {
+  return `${FOLDER_CATALOG_CURSOR_PREFIX}${encodeURIComponent(JSON.stringify(cursor))}`
+}
+
+function decodeFolderCatalogCursor(encoded: string): FolderCatalogCursor {
+  if (!encoded.startsWith(FOLDER_CATALOG_CURSOR_PREFIX)) {
+    throw new Error('FolderCatalogCursorVersionUnsupported')
+  }
+  try {
+    const value = JSON.parse(
+      decodeURIComponent(encoded.slice(FOLDER_CATALOG_CURSOR_PREFIX.length)),
+    ) as Partial<FolderCatalogCursor>
+    if (
+      !Number.isFinite(value.sortIndex) ||
+      typeof value.titleSortKey !== 'string' ||
+      typeof value.folderKey !== 'string'
+    ) {
+      throw new Error('shape')
+    }
+    return value as FolderCatalogCursor
+  } catch {
+    throw new Error('FolderCatalogCursorInvalid')
+  }
+}
+
+function encodeTagCatalogCursor(nameLower: string): string {
+  return `${TAG_CATALOG_CURSOR_PREFIX}${encodeURIComponent(nameLower)}`
+}
+
+function decodeTagCatalogCursor(encoded: string): string {
+  if (!encoded.startsWith(TAG_CATALOG_CURSOR_PREFIX)) {
+    throw new Error('TagCatalogCursorVersionUnsupported')
+  }
+  const value = decodeURIComponent(encoded.slice(TAG_CATALOG_CURSOR_PREFIX.length))
+  if (value.length === 0) throw new Error('TagCatalogCursorInvalid')
+  return value
+}
+
 function decodeSidebarPresentationCursor(
   encoded: string,
   fingerprint: string,
@@ -972,8 +1071,6 @@ function decodeSidebarPresentationCursor(
     ) as Partial<SidebarPresentationCursor>
     if (
       value.fingerprint !== fingerprint ||
-      !Number.isSafeInteger(value.folderIndex) ||
-      (value.folderIndex as number) < 0 ||
       !Number.isSafeInteger(value.rootRowsEmitted) ||
       (value.rootRowsEmitted as number) < 0 ||
       !value.rootCursors ||
@@ -983,6 +1080,7 @@ function decodeSidebarPresentationCursor(
       throw new Error('shape')
     }
     for (const cursor of Object.values(value.rootCursors)) assertPresentationCatalogCursor(cursor)
+    if (value.folderCursor) assertPresentationCatalogCursor(value.folderCursor)
     if (value.activeFolder) {
       if (
         typeof value.activeFolder.folderId !== 'string' ||
@@ -1102,95 +1200,12 @@ async function readPinnedFirstSidebarCatalogPage(
 }
 
 export function readSidebarAggregate(db: NatterDb): Promise<ChatSidebarAggregate> {
-  return Dexie.Promise.all([
-    db.chatSidebarAggregates.get(CHAT_SIDEBAR_AGGREGATE_ID),
-    db.chatSidebarAggregates.where('kind').equals('folder').toArray(),
-  ]).then(([aggregate, folderRows]) => {
+  return db.chatSidebarAggregates.get(CHAT_SIDEBAR_AGGREGATE_ID).then((aggregate) => {
     if (!isValidChatSidebarWorkspaceAggregateRow(aggregate)) {
       throw new Error('ChatSidebarAggregateInvalid')
     }
-    const folderCounts: Record<string, number> = {}
-    const folderAggregates: Record<string, ChatSidebarAggregate['folderAggregates'][string]> = {}
-    for (const value of folderRows) {
-      if (!isValidChatSidebarFolderAggregateRow(value)) {
-        throw new Error('ChatSidebarFolderAggregateInvalid')
-      }
-      const row = value
-      folderCounts[row.folderKey] = row.count
-      folderAggregates[row.folderKey] = {
-        count: row.count,
-        activeCount: row.activeCount,
-        visibleCount: row.visibleCount,
-        visiblePinnedCount: row.visiblePinnedCount,
-        sortExtrema: row.sortExtrema
-          ? {
-              updatedAt: { ...row.sortExtrema.updatedAt },
-              createdAt: { ...row.sortExtrema.createdAt },
-              lastViewedAt: { ...row.sortExtrema.lastViewedAt },
-              totalCostUsd: { ...row.sortExtrema.totalCostUsd },
-              wordCount: { ...row.sortExtrema.wordCount },
-              title: { ...row.sortExtrema.title },
-            }
-          : null,
-      }
-    }
-    return {
-      totalCount: aggregate.totalCount,
-      activeCount: aggregate.activeCount,
-      archivedCount: aggregate.archivedCount,
-      pinnedCount: aggregate.pinnedCount,
-      visibleCount: aggregate.visibleCount,
-      visiblePinnedCount: aggregate.visiblePinnedCount,
-      folderCounts,
-      folderAggregates,
-      rootCount: aggregate.rootCount,
-      rootVisibleCount: aggregate.rootVisibleCount,
-      rootVisiblePinnedCount: aggregate.rootVisiblePinnedCount,
-    }
+    return publicWorkspaceSidebarAggregate(aggregate)
   })
-}
-
-export async function readSidebarCreatedAtGroupCount(
-  db: NatterDb,
-  request: SidebarCreatedAtGroupCountRequest,
-  signal?: AbortSignal,
-): Promise<number> {
-  const [today, yesterday, previous7Days, previous30Days] = request.boundaries
-  if (
-    ![today, yesterday, previous7Days, previous30Days].every(Number.isFinite) ||
-    !(previous30Days < previous7Days && previous7Days < yesterday && yesterday < today)
-  ) {
-    throw new Error('SidebarCreatedAtGroupBoundariesInvalid')
-  }
-  const index = '[folderKey+visibleKey+pinnedKey+createdAt+titleSortKey+id]'
-  const ranges: ReadonlyArray<readonly [readonly unknown[], readonly unknown[]]> = [
-    [[previous30Days], [previous7Days]],
-    [[previous7Days], [yesterday]],
-    [[yesterday], [today]],
-    [[today], [[]]],
-    [[], [previous30Days]],
-  ]
-  let count = 0
-  for (const folderId of new Set(request.folderIds)) {
-    const prefix = [chatSidebarFolderKey(folderId), 1]
-    for (const pinnedKey of [1, 0] as const) {
-      for (const [lowerSuffix, upperSuffix] of ranges) {
-        throwIfAborted(signal)
-        const keys = await db.chatSidebarRows
-          .where(index)
-          .between(
-            [...prefix, pinnedKey, ...lowerSuffix],
-            [...prefix, pinnedKey, ...upperSuffix],
-            true,
-            false,
-          )
-          .limit(1)
-          .primaryKeys()
-        if (keys.length > 0) count += 1
-      }
-    }
-  }
-  return count
 }
 
 export async function readAttachmentCatalogRows(

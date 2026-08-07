@@ -539,7 +539,7 @@ describe('generation request path audit', () => {
     )
     expect(submissionOwner.indexOf('await action({')).toBeGreaterThanOrEqual(0)
     expect(submissionOwner.indexOf('await action({')).toBeLessThan(
-      submissionOwner.indexOf("phase: 'admitted'"),
+      submissionOwner.indexOf("reportPhase(id, 'admitted')"),
     )
     expect(shell).toContain('editAndResendWhenCapabilitySettles(')
     expect(shell).toContain('regenerateWhenCapabilitySettles(')

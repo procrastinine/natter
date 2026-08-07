@@ -76,7 +76,7 @@ import { recordBrowserCommandAttachmentReferenceState } from './browser-command-
 import type { BrowserCommandSessionPort } from './browser-domain-mutations'
 import type { BrowserWorkspaceReplacementMutationGrant } from './browser-workspace-contract'
 import { rebuildChildSlotDerivedState } from './browser-workspace-derived-repair'
-import { browserWorkspaceCurrentCompletionSettingV97 } from './browser-workspace-schema-v97'
+import { browserWorkspaceCurrentCompletionSettingV98 } from './browser-workspace-schema-v98'
 import {
   addAttachmentArtifactByteOwners,
   addAttachmentBlobByteOwners,
@@ -93,16 +93,20 @@ import {
 } from './chat-row-transition'
 import {
   accumulateChatSidebarAggregateRows,
+  accumulateChatSidebarFolderRows,
+  type ChatSidebarAggregateProjectionRow,
+  chatSidebarFolderNameKey,
   chatSidebarProjectionRow,
   chatSidebarProjectionSettings,
   createChatSidebarAggregateAccumulator,
   isChatSidebarProjectionSettingKey,
+  isValidChatSidebarFolderAggregateRow,
   materializeChatSidebarAggregateRows,
+  putChatSidebarFolderProjection,
 } from './chat-sidebar-projection'
 import {
   CONFIGURATION_PRESET_CATALOG_TRANSACTION_CAPABILITY,
   CONFIGURATION_PROFILE_CATALOG_TRANSACTION_CAPABILITY,
-  type ConfigurationPresetCatalogProjectionRow,
   configurationCatalogMetadataRowsFromCounts,
   configurationPresetCatalogProjectionRow,
   configurationProfileCatalogProjectionRow,
@@ -644,9 +648,7 @@ export class BrowserImportExportHandler {
           },
         )
         const importedName = await uniquePresetName(
-          tx.table<ConfigurationPresetCatalogProjectionRow, PresetId>(
-            'configurationPresetCatalogRows',
-          ),
+          tx.table<ChatPreset, PresetId>('presets'),
           payload.name,
         )
         const preset: ChatPreset = {
@@ -953,6 +955,7 @@ async function restorePreparedBrowserWorkspaceRows(
   }
   await restoreBulkPut(db.settings, [completedStreamJournalIntegritySetting()])
   const sidebarAggregates = createChatSidebarAggregateAccumulator()
+  accumulateChatSidebarFolderRows(sidebarAggregates, payload.folders)
   for (const page of pages(payload.chats)) {
     preactivationCheckpoint()
     const restored = page.map((chat) => ({
@@ -1035,7 +1038,7 @@ async function restorePreparedBrowserWorkspaceRows(
     [db.attachmentCatalogAggregate, db.attachmentIntegrityState, db.settings, db.workspaceFence],
     async (tx) => {
       await markAttachmentIntegrityRepairComplete(tx)
-      await tx.table('settings').put(browserWorkspaceCurrentCompletionSettingV97())
+      await tx.table('settings').put(browserWorkspaceCurrentCompletionSettingV98())
       await markBrowserWorkspaceReplaced(tx, beforeRestoreMeta)
       preactivationCheckpoint()
       discardStorageCompactionDebt(tx)
@@ -1080,17 +1083,21 @@ async function workspaceReplacementBlockersInTransaction(
 ): Promise<string[]> {
   const blockers = new Set<string>()
   const workspace = await readBrowserWorkspaceMetaFromTransaction(tx)
-  await tx.table<StreamLeaseRow, string>('streamLeases').each((lease) => {
-    const availability = reduceAttemptAvailability(undefined, {
-      workspace,
-      lease: { kind: 'present', lease },
-      localAuthority: { kind: 'none' },
-      ownershipLock: { kind: 'unsupported' },
-      wallNow: now,
-      schedulerNow: now,
+  await tx
+    .table<StreamLeaseRow, string>('streamLeases')
+    .where('targetOwnerKey')
+    .above('')
+    .each((lease) => {
+      const availability = reduceAttemptAvailability(undefined, {
+        workspace,
+        lease: { kind: 'present', lease },
+        localAuthority: { kind: 'none' },
+        ownershipLock: { kind: 'unsupported' },
+        wallNow: now,
+        schedulerNow: now,
+      })
+      if (availability.blocksReplacement) blockers.add(lease.streamId)
     })
-    if (availability.blocksReplacement) blockers.add(lease.streamId)
-  })
   return [...blockers].sort()
 }
 
@@ -1273,7 +1280,17 @@ async function ensurePortableFolder(
   const name = sketch.name.trim()
   if (!name) return { folderId: undefined, created: false }
   const folders = tx.table<ChatFolder, FolderId>('folders')
-  const existing = await folders.where('name').equalsIgnoreCase(name).first()
+  const nameKey = chatSidebarFolderNameKey(name)
+  const projected = await tx
+    .table<ChatSidebarAggregateProjectionRow, string>('chatSidebarAggregates')
+    .where('[folderNameKey+folderSortIndex+folderTitleSortKey+folderKey]')
+    .between([nameKey], [nameKey, []], true, false)
+    .first()
+  if (projected !== undefined && !isValidChatSidebarFolderAggregateRow(projected)) {
+    throw new Error('ChatSidebarFolderAggregateInvalid')
+  }
+  const existing = projected ? await folders.get(projected.folder.id) : undefined
+  if (projected && !existing) throw new Error('ChatSidebarFolderProjectionOrphaned')
   if (existing) return { folderId: existing.id, created: false }
   const lastFolder = await folders.orderBy('sortIndex').last()
   const sortIndex = (lastFolder?.sortIndex ?? 0) + 1
@@ -1287,6 +1304,7 @@ async function ensurePortableFolder(
     lastUsedAt: now,
   }
   await putChatFolderByteOwner(tx, folder, undefined)
+  await putChatSidebarFolderProjection(tx, folder)
   return { folderId: folder.id, created: true }
 }
 
@@ -1339,15 +1357,18 @@ async function ensurePortableTags(
 }
 
 async function uniquePresetName(
-  presets: Table<ConfigurationPresetCatalogProjectionRow, PresetId>,
+  presets: Table<ChatPreset, PresetId>,
   name: string,
 ): Promise<string> {
   const base = name.trim() || 'Imported preset'
   const existingOrdinals = new Set<number>()
-  await presets.each((preset) => {
-    const ordinal = importedNameOrdinal(preset.name, base)
-    if (ordinal !== undefined) existingOrdinals.add(ordinal)
-  })
+  await presets
+    .where('name')
+    .startsWith(base)
+    .each((preset) => {
+      const ordinal = importedNameOrdinal(preset.name, base)
+      if (ordinal !== undefined) existingOrdinals.add(ordinal)
+    })
   if (!existingOrdinals.has(1)) return base
   for (let i = 2; ; i += 1) {
     const candidate = `${base} (${i})`

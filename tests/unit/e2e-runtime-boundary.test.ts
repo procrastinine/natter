@@ -26,7 +26,7 @@ const EXPECTED_RAW_E2E_DATABASE_MUTATIONS = {
   'helpers.ts': 2,
   'large-workspace-startup.spec.ts': 1,
   'orphan-recovery.spec.ts': 2,
-  'startup-recovery.spec.ts': 3,
+  'startup-recovery.spec.ts': 13,
   'storage-reclamation.spec.ts': 2,
 } as const
 const EXPECTED_RAW_E2E_READWRITE_TRANSACTIONS = {
@@ -34,7 +34,7 @@ const EXPECTED_RAW_E2E_READWRITE_TRANSACTIONS = {
   'helpers.ts': 2,
   'large-workspace-startup.spec.ts': 1,
   'orphan-recovery.spec.ts': 1,
-  'startup-recovery.spec.ts': 3,
+  'startup-recovery.spec.ts': 4,
   'storage-reclamation.spec.ts': 2,
 } as const
 

@@ -426,8 +426,8 @@ class SearchProtocolRepository implements WorkspaceRepository {
     if (
       query.kind !== 'sidebar.catalog-page' &&
       query.kind !== 'sidebar.rows-by-id' &&
-      query.kind !== 'folder.list' &&
-      query.kind !== 'tag.list' &&
+      query.kind !== 'folder.get-many' &&
+      query.kind !== 'tag.get-many' &&
       query.kind !== 'chat.get' &&
       query.kind !== 'branch.open' &&
       query.kind !== 'branch.page-structure' &&
@@ -462,12 +462,16 @@ class SearchProtocolRepository implements WorkspaceRepository {
           ? await this.rowsByIdHook(query.chatIds)
           : query.chatIds.map((chatId) => this.row(chatId))
         break
-      case 'folder.list':
-        value = [...this.folders]
+      case 'folder.get-many': {
+        const folders = new Map(this.folders.map((folder) => [folder.id, folder]))
+        value = query.folderIds.map((folderId) => folders.get(folderId))
         break
-      case 'tag.list':
-        value = [...this.tags]
+      }
+      case 'tag.get-many': {
+        const tags = new Map(this.tags.map((tag) => [tag.id, tag]))
+        value = query.tagIds.map((tagId) => tags.get(tagId))
         break
+      }
       case 'chat.get':
         value = this.mutableChats.get(query.chatId)
         break

@@ -667,10 +667,9 @@ function foregroundStorageLocalityFacts(program, browserRepoSource, outputProble
     'src/backcompat/stream-lease-attempts.ts#migrateStreamLeaseAttempts:toCollection',
     'src/backcompat/token-calibration-global.ts#canonicalizeTokenCalibrationRows:toCollection',
     'src/backcompat/wave-a-derived-storage-v94.ts#rebuildChildSlotsV94:openCursor',
+    'src/backcompat/wave-a-derived-storage-v94.ts#rebuildFolderSidebarAggregatesV94:openCursor',
     'src/backcompat/wave-a-derived-storage-v94.ts#rebuildOrganizationAndChatSidebarV94:openCursor',
     'src/backcompat/wave-a-derived-storage-v94.ts#rebuildOrganizationAndChatSidebarV94:openCursor',
-    'src/backcompat/wave-a-derived-storage-v94.ts#rebuildOrganizationAndChatSidebarV94:primaryKeys',
-    'src/backcompat/wave-a-derived-storage-v94.ts#rebuildOrganizationAndChatSidebarV94:toCollection',
     'src/backcompat/wave-a-message-storage-v94.ts#migrateWaveAAttachmentRowsV94:openCursor',
     'src/backcompat/wave-a-message-storage-v94.ts#migrateWaveAAttachmentRowsV94:openCursor',
     'src/backcompat/wave-a-preset-order-v94.ts#hasPresetOrderStageAfterV94:openKeyCursor',
@@ -681,14 +680,9 @@ function foregroundStorageLocalityFacts(program, browserRepoSource, outputProble
     'src/store/bounded-idb-cursor.ts#forEachBoundedIdbCursorPage:openCursor',
     'src/store/bounded-idb-cursor.ts#forEachBoundedIdbKeyedPairPage:openCursor',
     'src/store/bounded-idb-cursor.ts#forEachBoundedIdbKeyedPairPage:openCursor',
-    'src/store/browser-catalog-command-runtime.ts#ensureFolderAndMoveChats:each',
-    'src/store/browser-catalog-queries.ts#readSidebarPresentationPage:toArray',
-    'src/store/browser-catalog-queries.ts#readSidebarPresentationPage:toArray',
     'src/store/browser-command-mutation-journal.ts#<module>:openCursor',
     'src/store/browser-import-export.ts#estimateBrowserWorkspaceLiveBytes:each',
     'src/store/browser-import-export.ts#readCollectionInPages:each',
-    'src/store/browser-import-export.ts#uniquePresetName:each',
-    'src/store/browser-import-export.ts#workspaceReplacementBlockersInTransaction:each',
     'src/store/browser-workspace-compaction.ts#readCopyPage:openCursor',
     'src/store/browser-workspace-database-control.ts#constructor:toCollection',
     'src/store/browser-workspace-startup-repair.ts#readRawPage:openCursor',
@@ -4053,14 +4047,20 @@ function interchangeImportCapabilityFacts(importSource, workspaceUnion, outputPr
       profileResolution.includes(".where('kind')") &&
       profileResolution.includes('.filter(') &&
       !profileResolution.includes('.toArray(') &&
-      folderResolution.includes(".where('name').equalsIgnoreCase(name).first()") &&
+      folderResolution.includes(
+        ".where('[folderNameKey+folderSortIndex+folderTitleSortKey+folderKey]')",
+      ) &&
+      folderResolution.includes('.between([nameKey], [nameKey, []], true, false)') &&
+      folderResolution.includes('.first()') &&
       folderResolution.includes(".orderBy('sortIndex').last()") &&
       !folderResolution.includes('.toArray(') &&
       tagResolution.includes(".where('nameLower')") &&
       tagResolution.includes('.anyOf(') &&
       profileNameResolution.includes(".where('name').equals(base).count()") &&
       profileNameResolution.includes(".where('name').equals(candidate).count()") &&
-      presetNameResolution.includes('ConfigurationPresetCatalogProjectionRow') &&
+      presetNameResolution.includes('Table<ChatPreset, PresetId>') &&
+      presetNameResolution.includes(".where('name')") &&
+      presetNameResolution.includes('.startsWith(base)') &&
       presetNameResolution.includes('.each(') &&
       !presetNameResolution.includes('.toArray('),
     singlePersistedClock:
@@ -4256,7 +4256,11 @@ function folderCapabilityFacts(program, catalogSource, workspaceUnion, outputPro
       ensureText.includes('FOLDER_ENSURE_AND_MOVE_CHATS_OPERATION') &&
       deleteText.includes('commit.executeSemanticOperation(descriptor'),
     transactionLocalFolderMembership:
-      ensureText.includes('await folders.each(') &&
+      ensureText.includes(
+        ".where('[folderNameKey+folderSortIndex+folderTitleSortKey+folderKey]')",
+      ) &&
+      ensureText.includes('.between([nameKey], [nameKey, []], true, false)') &&
+      ensureText.includes('.first()') &&
       ensureText.includes('const chatMutation = openPreservingChatMutation(tx)') &&
       ensureText.includes('const rows = await chatMutation.readMany(uniqueChatIds)') &&
       ensureText.includes('await chatMutation.commit()') &&
@@ -4281,8 +4285,8 @@ function folderCapabilityFacts(program, catalogSource, workspaceUnion, outputPro
     fixedRowExactReceipts:
       createDescriptor.includes('semanticOperationExactReceiptContracts') &&
       updateDescriptor.includes('semanticOperationExactReceiptContracts') &&
-      createText.includes('folderRowExactReceipt(tx, FOLDER_CREATE_EXACT_PLAN)') &&
-      updateText.includes('folderRowExactReceipt(tx, FOLDER_UPDATE_EXACT_PLAN)') &&
+      createText.includes('folderRowExactReceipt(tx, FOLDER_CREATE_EXACT_PLAN, true)') &&
+      updateText.includes('folderRowExactReceipt(tx, FOLDER_UPDATE_EXACT_PLAN, true)') &&
       folderRowExactReceiptText.includes('boundSemanticOperationExactReceiptAccumulator') &&
       folderRowExactReceiptText.includes("tableName: 'folders'") &&
       folderRowExactReceiptText.includes("operation: 'get'") &&
@@ -4297,8 +4301,8 @@ function folderCapabilityFacts(program, catalogSource, workspaceUnion, outputPro
       ) &&
       folderRowExactPlanText.includes("kind: 'single-attempt'"),
     fixedRowBounds:
-      folderRowExactPlanText.includes('maxRequests: 1') &&
-      folderRowExactPlanText.includes('maxRows: 1') &&
+      folderRowExactPlanText.includes('maxRequests: 2') &&
+      folderRowExactPlanText.includes('maxRows: 2') &&
       folderRowExactPlanText.includes('maxBatchRows: 1') &&
       !createText.includes('.where(') &&
       !updateText.includes('.where('),

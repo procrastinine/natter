@@ -62,21 +62,42 @@ it('transfers promoted replacement custody before ending the finalized maintenan
   )
 })
 
-it('starts the maintenance pump outside an ambient Dexie transaction', async () => {
+it('starts the maintenance pump outside an ambient Dexie transaction without waiting for it', async () => {
   const db = createDbForTests(`natter-maintenance-zone-${crypto.randomUUID()}`)
   await db.open()
   let pump: Promise<void> | undefined
-  let observed: unknown
+  const observed: unknown[] = []
+  let markPumpAssigned!: () => void
+  const pumpAssigned = new Promise<void>((resolve) => {
+    markPumpAssigned = resolve
+  })
+  let releaseTransaction!: () => void
+  const transactionGate = new Promise<void>((resolve) => {
+    releaseTransaction = resolve
+  })
   try {
-    await db.transaction('r', db.settings, () => {
+    const workspaceTransaction = db.transaction('r', db.settings, async () => {
       expect(Dexie.currentTransaction).not.toBeNull()
       pump = __runStorageMaintenancePumpForTests(async () => {
-        observed = Dexie.currentTransaction
+        observed.push(Dexie.currentTransaction)
+        await Dexie.Promise.resolve()
+        observed.push(Dexie.currentTransaction)
+        await new Promise<void>((resolve) => queueMicrotask(resolve))
+        observed.push(Dexie.currentTransaction)
+        await db.settings.get('detached-background-read')
+        observed.push(Dexie.currentTransaction)
       })
+      markPumpAssigned()
+      await Dexie.waitFor(transactionGate)
     })
+    await pumpAssigned
     await pump
-    expect(observed).toBeNull()
+    expect(observed).toEqual([null, null, null, null])
+    expect(await isSettled(workspaceTransaction)).toBe(false)
+    releaseTransaction()
+    await workspaceTransaction
   } finally {
+    releaseTransaction()
     db.close()
     await Dexie.delete(db.name)
   }
@@ -216,4 +237,13 @@ function deferred<Value>(): {
     resolve = settle
   })
   return { promise, resolve }
+}
+
+async function isSettled(promise: Promise<unknown>): Promise<boolean> {
+  let settled = false
+  void promise.finally(() => {
+    settled = true
+  })
+  await Promise.resolve()
+  return settled
 }

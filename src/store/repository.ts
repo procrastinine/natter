@@ -1356,21 +1356,26 @@ export interface ChatSidebarCatalogRequest {
   countMode?: 'exact' | 'omit'
 }
 
-export interface SidebarCreatedAtGroupCountRequest {
-  readonly folderIds: readonly FolderId[]
-  readonly boundaries: readonly [
-    today: number,
-    yesterday: number,
-    previous7Days: number,
-    previous30Days: number,
-  ]
-}
-
 export interface ChatSidebarCatalogPage {
   rows: ChatSidebarRow[]
   previousCursor?: string
   nextCursor?: string
   exactCount?: number
+}
+
+export interface OrganizationCatalogPageRequest {
+  readonly cursor?: string
+  readonly limit?: number
+}
+
+export interface FolderCatalogPage {
+  readonly rows: readonly ChatFolder[]
+  readonly nextCursor?: string
+}
+
+export interface TagCatalogPage {
+  readonly rows: readonly ChatTag[]
+  readonly nextCursor?: string
 }
 
 export type SidebarPresentationRow =
@@ -1422,7 +1427,6 @@ export interface SidebarPresentationMeasurement {
 export interface SidebarPresentationPage {
   readonly rows: readonly SidebarPresentationRow[]
   readonly nextCursor?: string
-  readonly exactTotalRows?: number
   readonly exactVisibleChats?: number
   readonly aggregate?: ChatSidebarAggregate
   readonly folders?: readonly ChatFolder[]

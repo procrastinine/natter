@@ -160,6 +160,44 @@ export function withBrowserWorkspaceSelectionGate<T>(
   )
 }
 
+export function withBrowserWorkspaceSlotProbe<T>(
+  databaseName: BrowserWorkspaceDatabaseName,
+  operation: () => Promise<T>,
+  signal?: AbortSignal,
+): Promise<T> {
+  if (signal?.aborted) return Promise.reject(workspaceSlotAbortError(signal.reason))
+  const manager = slotLockManager()
+  if (!manager) return operation()
+  return manager.request(
+    slotLockName(databaseName),
+    { mode: 'shared', ...(signal ? { signal } : {}) },
+    (lock) => {
+      if (!lock) throw new Error('BrowserWorkspaceSlotProbeUnavailable')
+      if (signal?.aborted) throw workspaceSlotAbortError(signal.reason)
+      return operation()
+    },
+  )
+}
+
+export function withBrowserWorkspaceSlotVersionChange<T>(
+  databaseName: BrowserWorkspaceDatabaseName,
+  operation: () => Promise<T>,
+  signal?: AbortSignal,
+): Promise<T> {
+  if (signal?.aborted) return Promise.reject(workspaceSlotAbortError(signal.reason))
+  const manager = slotLockManager()
+  if (!manager) return operation()
+  return manager.request(
+    slotLockName(databaseName),
+    { mode: 'exclusive', ...(signal ? { signal } : {}) },
+    (lock) => {
+      if (!lock) throw new Error('BrowserWorkspaceSlotVersionChangeUnavailable')
+      if (signal?.aborted) throw workspaceSlotAbortError(signal.reason)
+      return operation()
+    },
+  )
+}
+
 export async function tryWithBrowserWorkspaceSelectionGate<T>(
   operation: () => Promise<T>,
   signal?: AbortSignal,

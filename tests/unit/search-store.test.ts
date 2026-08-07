@@ -296,12 +296,7 @@ class SearchStateRepository implements WorkspaceRepository {
     query: Q,
   ): Promise<ReadEnvelope<WorkspaceQueryResult<Q>>> {
     this.calls.push(query.kind)
-    if (
-      query.kind !== 'sidebar.catalog-page' &&
-      query.kind !== 'sidebar.rows-by-id' &&
-      query.kind !== 'folder.list' &&
-      query.kind !== 'tag.list'
-    ) {
+    if (query.kind !== 'sidebar.catalog-page' && query.kind !== 'sidebar.rows-by-id') {
       throw new Error(`UnexpectedSearchStateQuery:${query.kind}`)
     }
     let value: unknown
@@ -319,10 +314,6 @@ class SearchStateRepository implements WorkspaceRepository {
         value = this.rowsByIdHook
           ? await this.rowsByIdHook(query.chatIds)
           : query.chatIds.map((chatId) => this.rows.get(chatId))
-        break
-      case 'folder.list':
-      case 'tag.list':
-        value = []
         break
     }
     return {

@@ -26,13 +26,13 @@ export const STARTUP_OPEN_SEQUENCE = Object.freeze([
   stage(
     'database-selection',
     'src/store/browser-workspace-lifecycle.ts',
-    'attempt.selection = await prepareBrowserWorkspaceDatabaseSelection(\n      attempt.authority,\n      options.onProgress,\n    )',
+    "attempt.selection = await runBrowserWorkspaceOpenStage('database-selection', () =>",
     'workspace-core-readiness',
   ),
   stage(
     'database-bootstrap',
     'src/store/browser-workspace-lifecycle.ts',
-    'const workspace = await bootstrapBrowserWorkspace(',
+    "const workspace = await runBrowserWorkspaceOpenStage('database-bootstrap', () =>",
     'workspace-core-readiness',
   ),
   stage(
@@ -50,7 +50,7 @@ export const STARTUP_OPEN_SEQUENCE = Object.freeze([
   stage(
     'core-resource-readiness',
     'src/store/browser-workspace-lifecycle.ts',
-    'await resumeWorkspaceRuntimeResources(authority)',
+    "await runBrowserWorkspaceOpenStage('runtime-resources-resume', () =>",
     'workspace-core-readiness',
   ),
   stage(
@@ -152,13 +152,13 @@ export const UNIFIED_REOPEN_SEQUENCE = Object.freeze([
   stage(
     'reopen-database-selection',
     'src/store/browser-workspace-lifecycle.ts',
-    'attempt.selection = await prepareBrowserWorkspaceDatabaseSelection(\n      attempt.authority,\n      options.onProgress,\n    )',
+    "attempt.selection = await runBrowserWorkspaceOpenStage('database-selection', () =>",
     'workspace-core-readiness',
   ),
   stage(
     'reopen-database-bootstrap',
     'src/store/browser-workspace-lifecycle.ts',
-    'const workspace = await bootstrapBrowserWorkspace(',
+    "const workspace = await runBrowserWorkspaceOpenStage('database-bootstrap', () =>",
     'workspace-core-readiness',
   ),
   stage(
@@ -176,13 +176,13 @@ export const UNIFIED_REOPEN_SEQUENCE = Object.freeze([
   stage(
     'reopen-core-resource-readiness',
     'src/store/browser-workspace-lifecycle.ts',
-    'await resumeWorkspaceRuntimeResources(authority)',
+    "await runBrowserWorkspaceOpenStage('runtime-resources-resume', () =>",
     'workspace-core-readiness',
   ),
   stage(
     'reopen-capability-commit',
     'src/store/browser-workspace-lifecycle.ts',
-    'await finishWorkspaceRuntimeReconciliation(workspace)',
+    "await runBrowserWorkspaceOpenStage('runtime-reconciliation-finish', () =>",
     'capability-readiness',
   ),
 ])

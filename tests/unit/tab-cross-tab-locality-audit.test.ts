@@ -142,26 +142,26 @@ describe('tab and cross-tab locality audit', () => {
       ok: true,
       structurallyValid: true,
       surfaces: 20,
-      records: 343,
-      constructorSites: 759,
+      records: 344,
+      constructorSites: 762,
       unconstructedOrUnadmittedSites: 4,
-      ownerClassifiedSites: 759,
+      ownerClassifiedSites: 762,
       ownerSiteGaps: 0,
-      rootAdmissionSites: 109,
+      rootAdmissionSites: 110,
       unadmittedRoots: 0,
       childReservationSites: 3,
       unreservedChildren: 4,
       configurationConstructorGaps: 0,
-      publicationConsumers: 18,
-      publicationConsumerSelectors: 18,
+      publicationConsumers: 19,
+      publicationConsumerSelectors: 19,
       publicationAddressingInputs: 32,
-      publicationAddressingPairs: 576,
-      publicationAddressedPairs: 110,
-      publicationUnaddressedPairs: 466,
+      publicationAddressingPairs: 608,
+      publicationAddressedPairs: 113,
+      publicationUnaddressedPairs: 495,
       publicationProducers: 4,
       rawPublicationSources: 1,
       remoteBrowserOutcomeFamilies: 6,
-      remoteBrowserOutcomeConsumers: 18,
+      remoteBrowserOutcomeConsumers: 19,
       architectureGaps: 3,
       recordGaps: 149,
       siteGaps: 4,
@@ -172,7 +172,7 @@ describe('tab and cross-tab locality audit', () => {
       problems: [],
     })
     expect(report.surfaceCounts).toMatchObject({
-      'workspace-query': 65,
+      'workspace-query': 66,
       'workspace-command': 65,
       'configuration-command': 44,
       'workspace-root': 15,
@@ -235,7 +235,7 @@ describe('tab and cross-tab locality audit', () => {
         deliveries += received.length
       }
       expect(inputs).toHaveLength(32)
-      expect(deliveries).toBe(110)
+      expect(deliveries).toBe(113)
 
       received.length = 0
       publishPreparedWorkspaceEffect(

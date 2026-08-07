@@ -396,6 +396,8 @@ function dexieVersionLabel(node: ts.Node): number | 'current' | undefined {
         version = 94
       } else if (value && ts.isIdentifier(value) && value.text === 'WAVE_B_STORAGE_VERSION') {
         version = 97
+      } else if (value && ts.isIdentifier(value) && value.text === 'WAVE_C_STORAGE_VERSION') {
+        version = 98
       }
       return
     }

@@ -1,4 +1,4 @@
-import type { ChatFolder, ChatSidebarRow, FolderId } from './types'
+import type { ChatSidebarRow, FolderId } from './types'
 
 export type SidebarSortDirection = 'asc' | 'desc'
 
@@ -45,16 +45,6 @@ export const SIDEBAR_SORT_OPTIONS: readonly SidebarSortOption[] = [
   { mode: 'title-asc', label: 'Title A-Z', shortLabel: 'Title' },
   { mode: 'title-desc', label: 'Title Z-A', shortLabel: 'Title' },
 ] as const
-
-export function compareChatFolders(left: ChatFolder, right: ChatFolder): number {
-  if (left.sortIndex !== right.sortIndex) return left.sortIndex - right.sortIndex
-  const byName = left.name.localeCompare(right.name)
-  return byName !== 0 ? byName : left.id.localeCompare(right.id)
-}
-
-export function sortChatFolders(rows: ChatFolder[]): ChatFolder[] {
-  return rows.sort(compareChatFolders)
-}
 
 const VALID_SIDEBAR_SORT_MODES = new Set<string>(SIDEBAR_SORT_OPTIONS.map((option) => option.mode))
 

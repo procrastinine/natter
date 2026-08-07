@@ -1,11 +1,5 @@
 import type { Transaction } from 'dexie'
-import {
-  CORS_PROXY_SECRET_KEY,
-  CORS_PROXY_URL_KEY,
-  TOKEN_CALIBRATION_MODE_KEY,
-} from '../core/global-settings'
 import { messageBodyMutationCapability } from '../core/messages'
-import { GLOBAL_TOKEN_CALIBRATION_KEY } from '../core/token-calibration'
 import type { AttachmentId, ChatId, MessageId, MutationScope } from '../core/types'
 import { assertNever } from '../lib/assert'
 import { stableStringify } from '../lib/same-value'
@@ -590,19 +584,10 @@ function mutationInfrastructurePlan(
   }
   const tableNames = MUTATION_TABLE_ORDER.filter((name) => builder.hasTable(name))
   const permittedWrites = MUTATION_TABLE_ORDER.filter((name) => builder.canWriteTable(name))
-  const captureSettingKeys = options?.captureGenerationPlanningSnapshot
-    ? [
-        GLOBAL_TOKEN_CALIBRATION_KEY,
-        TOKEN_CALIBRATION_MODE_KEY,
-        CORS_PROXY_URL_KEY,
-        CORS_PROXY_SECRET_KEY,
-      ]
-    : []
   const streamIds = [
     options?.streamFence?.streamId,
     options?.streamTargetCommit?.streamId,
     options?.streamCanonicalCommit?.streamId,
-    options?.streamAdmission?.streamId,
   ].filter((streamId): streamId is string => streamId !== undefined)
   const contentIdentity = options?.attachmentContentIdentity
   const initialChat = options?.initialChat
@@ -617,9 +602,7 @@ function mutationInfrastructurePlan(
       ...(options?.maintainConfigurationLinksForChatId
         ? [`configuration-owner:chat:${options.maintainConfigurationLinksForChatId}`]
         : []),
-      ...[...captureSettingKeys, ...(options?.settingReadKeys ?? [])].map(
-        (key) => `setting:${key}`,
-      ),
+      ...(options?.settingReadKeys ?? []).map((key) => `setting:${key}`),
       ...streamIds.map((streamId) => `stream-journal:${streamId}`),
       ...(contentIdentity
         ? [
@@ -692,7 +675,7 @@ function compileMutationScopes(
   for (const scope of scopes) {
     const scopeName = scopeResourceName(scope)
     allowed.add(scopeName)
-    resourceNames.add(scopeName)
+    if (scope.kind !== 'message' || scope.access !== 'create') resourceNames.add(scopeName)
     switch (scope.kind) {
       case 'attachment':
         builder.addMutationTables(
@@ -912,6 +895,13 @@ export function resolveMutationTableNames(
   options?: WorkspaceMutationOptions,
 ): readonly BrowserMutationTableName[] {
   return planMutationTransaction(scopes, options).transaction.tableNames
+}
+
+export function resolveMutationResourceNames(
+  scopes: readonly MutationScope[],
+  options?: WorkspaceMutationOptions,
+): readonly string[] {
+  return mutationInfrastructurePlan(scopes, options, undefined).resourceNames
 }
 
 export function createMutationScopeChecker(scopes: readonly MutationScope[]): {

@@ -26,6 +26,7 @@ export type BrowserWorkspaceOpenProgress =
       readonly kind: 'database-selection'
       readonly operation:
         | 'read-active-slot'
+        | 'wait-for-open-connections'
         | 'acquire-active-slot'
         | 'confirm-active-slot'
         | 'retry-changed-slot'

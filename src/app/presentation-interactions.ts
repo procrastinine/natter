@@ -145,6 +145,8 @@ export function reportGenerationSubmissionPhase(input: {
     | 'settled'
   readonly owner?: GenerationCapabilityOwner
   readonly outcome?: string
+  readonly elapsedMs?: number
+  readonly phaseElapsedMs?: number
 }): void {
   const diagnosticId = `generation-submit-${input.claimId}`
   console.info(
@@ -154,6 +156,8 @@ export function reportGenerationSubmissionPhase(input: {
       phase: input.phase,
       ...(input.owner ? { owner: input.owner } : {}),
       ...(input.outcome ? { outcome: input.outcome } : {}),
+      ...(input.elapsedMs === undefined ? {} : { elapsedMs: input.elapsedMs }),
+      ...(input.phaseElapsedMs === undefined ? {} : { phaseElapsedMs: input.phaseElapsedMs }),
     }),
   )
 }
