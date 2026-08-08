@@ -17,12 +17,12 @@ export const INTERACTION_EFFECT_KINDS = Object.freeze([
 
 export const INTERACTION_REVIEW_BASELINE = Object.freeze({
   schemaVersion: 5,
-  exactSiteCount: 844,
+  exactSiteCount: 845,
   sourceCount: 59,
-  exactSiteIdSha256: 'cca1c8d9dbe175d049c879bbe105038eaf214976740eeda7925913740c54bf8d',
-  sourceFactSha256: '54f0b969c7c1deb93fb3e703ec9ae16b2b02f3923c047e6d3e7a0d2a09ec07fa',
+  exactSiteIdSha256: '8ba87a7027512c0e0fcdf18850f88e8be7a8f9ed3bee30f7f0c4a4f130646de9',
+  sourceFactSha256: 'c5555f366a798c173cabe2a2950fd05a7a7c579cc3f8681cfc4508a883862b47',
   presentationDefinitionSha256: '149f270b61a932f0ff2c6459725df46c9abc50fc7b9e793436e6b388d0a3b767',
-  interactionOutcomeSha256: '2cb10104193698ba170531ade3950aa0c79b9a095eb2be721c8af1a1d2c7cc4a',
+  interactionOutcomeSha256: 'b638103c2140ad72628469c25fc7c756d891ae6e01a59465e78377e728709dc2',
   disposition:
     'Any source interaction or analyzed handler-fact drift reopens classification review before the baseline may be updated.',
 })

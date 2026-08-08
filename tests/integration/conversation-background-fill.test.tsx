@@ -250,6 +250,7 @@ describe('conversation destination-first background fill', () => {
     expect(returned).toMatchObject({
       visibleReady: true,
       painted: { binding: { surface: 'transcript', currency: 'current' } },
+      editorRetention: null,
       mounted: { transcript: true, tree: true },
     })
     expect(returned?.residents.transcript?.window).toBe(recycled.window)

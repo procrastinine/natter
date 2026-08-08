@@ -1593,6 +1593,11 @@ describe('conversation controller', () => {
     })
     const held = controller.getSnapshot().active?.presentation
     expect(held?.target).toMatchObject({ kind: 'pending', surface: 'transcript' })
+    expect(held?.editorRetention).toEqual({
+      editorCount: 1,
+      destinationDeferred: true,
+      returnTargetMessageId: oldLeaf.id,
+    })
     expect(held?.painted?.binding).toMatchObject({
       surface: 'transcript',
       currency: 'retained',
@@ -1634,10 +1639,9 @@ describe('conversation controller', () => {
 
     edit.release()
     await settle()
-    expect(
-      expectCoherentReadyPresentation(controller.getSnapshot().active?.presentation, 'transcript')
-        .seal.leafId,
-    ).toBe(newLeaf.id)
+    const released = controller.getSnapshot().active?.presentation
+    expect(expectCoherentReadyPresentation(released, 'transcript').seal.leafId).toBe(newLeaf.id)
+    expect(released?.editorRetention).toBeNull()
   })
 
   it('captures an off-spine generation claim from exact topology', async () => {

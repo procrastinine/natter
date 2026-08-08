@@ -494,6 +494,111 @@ test('branch swipe preserves common-prefix DOM identity without loading or blank
   await expect(messages).toHaveCount(3)
 })
 
+test('an edited variant reports deferred navigation and can restore its retained branch', async ({
+  page,
+}) => {
+  const fixture = await seedBranchedChat(page)
+  await page.goto(`/#/chat/${fixture.chatId}/message/${fixture.messageIdMap.A2}`)
+  await page.reload()
+
+  const edited = page.locator(`[data-ui="message"][data-message-id="${fixture.messageIdMap.A1}"]`)
+  await edited.getByRole('button', { name: 'Edit message' }).click()
+  await edited.locator('[data-ui="inline-editor-input"]').fill('retained branch A draft')
+  await edited.getByLabel('Next variant').click()
+
+  await expect(page).toHaveURL(new RegExp(`/message/${fixture.messageIdMap.B2}$`))
+  await expect(edited.locator('[data-ui="inline-editor-input"]')).toHaveValue(
+    'retained branch A draft',
+  )
+  const status = page.locator('[data-ui="retained-editor-navigation"]')
+  await expect(status).toContainText('keeping this branch visible')
+  await expect(status.getByRole('button', { name: 'Return to edited branch' })).toBeEnabled()
+
+  await status.getByRole('button', { name: 'Return to edited branch' }).click()
+  await expect(page).toHaveURL(new RegExp(`/message/${fixture.messageIdMap.A2}$`))
+  await expect(status).toHaveCount(0)
+  await expect(edited.locator('[data-ui="inline-editor-input"]')).toHaveValue(
+    'retained branch A draft',
+  )
+  await expect(page.locator('[data-ui="message-list"]')).not.toHaveAttribute(
+    'data-presentation-only',
+  )
+
+  await edited.getByLabel('Next variant').click()
+  await expect(status).toBeVisible()
+  await edited.locator('[data-role="cancel"]').click()
+  await expect(status).toHaveCount(0)
+  await expect(
+    page.locator(`[data-ui="message"][data-message-id="${fixture.messageIdMap.B1}"]`),
+  ).toContainText('branch B user')
+})
+
+test('a retained later editor does not retain settled Save & Send lifecycle controls', async ({
+  page,
+}) => {
+  let requestCount = 0
+  await page.route('**/api/v1/chat/completions', async (route) => {
+    requestCount += 1
+    await route.fulfill({
+      contentType: 'text/event-stream',
+      body: buildSseBody([
+        { id: 'multi-editor-current-lifecycle', content: 'current lifecycle answer' },
+        { finish: 'stop' },
+      ]),
+    })
+  })
+  const chatId = await seedLinearChat(page, {
+    chatId: 'retained-editor-current-lifecycle',
+    messageCount: 4,
+    textPrefix: 'retained lifecycle row',
+  })
+  await page.goto(`/#/chat/${chatId}`)
+  await page.reload()
+
+  const messages = page.locator('[data-ui="message"][data-message-id]')
+  await expect(messages).toHaveCount(4)
+  const firstUser = messages.nth(0)
+  const laterUser = messages.nth(2)
+  await laterUser.getByRole('button', { name: 'Edit message' }).click()
+  await laterUser.locator('[data-ui="inline-editor-input"]').fill('unsaved later draft')
+  await firstUser.getByRole('button', { name: 'Edit message' }).click()
+  await firstUser.locator('[data-ui="inline-editor-input"]').fill('earlier replacement')
+  await firstUser.locator('[data-role="save-send"]').click()
+
+  await expect.poll(() => requestCount).toBe(1)
+  await expect(laterUser.locator('[data-ui="inline-editor-input"]')).toHaveValue(
+    'unsaved later draft',
+  )
+  await expect(page.locator('[data-ui="retained-editor-navigation"]')).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Cancel preparing' })).toHaveCount(0)
+  await expect
+    .poll(async () => {
+      const rows = await readMessages(page, chatId)
+      return rows.some((row) =>
+        Array.isArray(row.content)
+          ? row.content.some(
+              (part) =>
+                typeof part === 'object' &&
+                part !== null &&
+                (part as { text?: unknown }).text === 'current lifecycle answer',
+            )
+          : false,
+      )
+    })
+    .toBe(true)
+
+  await laterUser.locator('[data-role="cancel"]').click()
+  await expect(page.locator('[data-ui="retained-editor-navigation"]')).toHaveCount(0)
+  await expect(messages).toHaveCount(2)
+  await expect(messages.nth(0).locator('[data-ui="message-body"]')).toHaveText(
+    'earlier replacement',
+  )
+  await expect(messages.nth(1).locator('[data-ui="message-body"]')).toHaveText(
+    'current lifecycle answer',
+  )
+  expect(requestCount).toBe(1)
+})
+
 test('retained imported rows repeatedly own Save & Send and delete across branch resolution', async ({
   page,
 }) => {

@@ -2,7 +2,7 @@
  * branching.css — swipe controls, variant ghost card, edit-tree toolbar.
  * Owns: [data-ui='branch-controls'|'variant-ghost'|'edit-tree-toolbar'|
  *              'branch-node'|'inline-editor'|'import-modal'|'toast-tray'|
- *              'banner-tray'].
+ *              'banner-tray'|'retained-editor-navigation'].
  */
 
 /* Conversation tree workspace ------------------------------------------------ */
@@ -1395,6 +1395,29 @@
   cursor: pointer;
   font-size: var(--font-size-md);
   color: var(--color-fg-muted);
+}
+
+[data-ui="retained-editor-navigation"] {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin: var(--space-3) var(--space-4) 0;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--color-border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--color-accent-subtle);
+  color: var(--color-fg-muted);
+  font-size: var(--font-size-xs);
+}
+
+[data-ui="retained-editor-navigation-text"] {
+  flex: 1 1 auto;
+}
+
+[data-ui="retained-editor-navigation-return"] {
+  flex: 0 0 auto;
+  padding: var(--space-1) var(--space-3);
+  font-size: var(--font-size-xs);
 }
 
 /* Import modal — plaintext-only in 8.1. */

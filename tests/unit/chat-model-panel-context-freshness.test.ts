@@ -127,6 +127,7 @@ function conversationFrame(
       visibleReady: false,
       painted: null,
       residents: { transcript: null, tree: null },
+      editorRetention: null,
       target: { kind: 'pending', surface: 'transcript', blocker: 'transcript' },
       mounted: { transcript: false, tree: false },
     },

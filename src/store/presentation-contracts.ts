@@ -44,6 +44,7 @@ export type { RegenerateMessageOptions } from './conversation-command-client'
 export type {
   ConversationChatSnapshot,
   ConversationController,
+  ConversationEditorRetentionPresentation,
   ConversationLocalResultReceipt,
   ConversationNavigationPort,
   ConversationPaintedFrame,

@@ -158,6 +158,9 @@ type MessageListModule = {
   point: typeof MessageListPointComponent
 }
 type BranchTreeViewModule = { default: typeof BranchTreeViewComponent }
+type ActiveComposerProps = ComposerProps & {
+  generationCapability: NonNullable<ComposerProps['generationCapability']>
+}
 
 function createSurfaceModuleResource<Module>(loader: () => Promise<Module>) {
   let loaded: Module | null = null
@@ -1471,11 +1474,7 @@ export function Shell() {
       <MobileNewChatControls connectionControl={newChatMobileConnectionControl} />
     </div>
   )
-  const activeComposerProps:
-    | (ComposerProps & {
-        generationCapability: NonNullable<ComposerProps['generationCapability']>
-      })
-    | null = activeChatId
+  const activeComposerProps: ActiveComposerProps | null = activeChatId
     ? {
         onSubmit: handleSubmit,
         ...(composerStopCapability ? { stopCapability: composerStopCapability } : {}),
@@ -1535,12 +1534,25 @@ export function Shell() {
     activeComposerProps,
     activeComposerPresentationReady,
   )
-  const displayedTranscriptComposer = composerPresentation.value ? (
+  const displayedComposerProps = rebaseRetainedComposerLifecycle(
+    composerPresentation.value,
+    activeComposerProps,
+  )
+  const editorRetentionPresentation = activePresentation?.editorRetention ?? null
+  const retainedEditorDestinationDeferred =
+    editorRetentionPresentation?.destinationDeferred === true
+  const retainedEditorReturnTargetId = retainedEditorDestinationDeferred
+    ? editorRetentionPresentation.returnTargetMessageId
+    : null
+  const displayedTranscriptComposer = displayedComposerProps ? (
     <Composer
-      key={composerPresentation.value.draftKey}
-      {...composerPresentation.value}
-      generationCapability={composerPresentation.value.generationCapability}
-      presentationOnly={composerPresentation.retained && !visibleBindingAddressesActiveConversation}
+      key={displayedComposerProps.draftKey}
+      {...displayedComposerProps}
+      generationCapability={displayedComposerProps.generationCapability}
+      presentationOnly={
+        retainedEditorDestinationDeferred ||
+        (composerPresentation.retained && !visibleBindingAddressesActiveConversation)
+      }
     />
   ) : null
   const activeSurfaceReady = activeChatId ? activePresentation?.visibleReady === true : true
@@ -1736,6 +1748,28 @@ export function Shell() {
                 </div>
                 {!treeViewActive ? <EditTreeToolbar /> : null}
                 <BannerTray />
+                {retainedEditorDestinationDeferred ? (
+                  <div data-ui="retained-editor-navigation" role="status" aria-live="polite">
+                    <span data-ui="retained-editor-navigation-text">
+                      {editorRetentionPresentation.editorCount === 1
+                        ? 'An open edit is keeping this branch visible.'
+                        : `${editorRetentionPresentation.editorCount} open edits are keeping this branch visible.`}{' '}
+                      Save or cancel {editorRetentionPresentation.editorCount === 1 ? 'it' : 'them'}
+                      {' to show the selected branch.'}
+                    </span>
+                    {retainedEditorReturnTargetId ? (
+                      <Button
+                        type="button"
+                        data-ui="retained-editor-navigation-return"
+                        onClick={() =>
+                          navigateConversationMessage(activeChatId, retainedEditorReturnTargetId)
+                        }
+                      >
+                        Return to edited branch
+                      </Button>
+                    ) : null}
+                  </div>
+                ) : null}
                 {treeMounted ? (
                   <Activity
                     name={`conversation-tree:${activeChatId}`}
@@ -2054,6 +2088,27 @@ function useSampleAndHoldPresentation<T>(
   return {
     value: presented,
     retained: !ready && presented !== null,
+  }
+}
+
+function rebaseRetainedComposerLifecycle(
+  presented: ActiveComposerProps | null,
+  current: ActiveComposerProps | null,
+): ActiveComposerProps | null {
+  if (presented === null) return null
+  const {
+    submissionPending: _submissionPending,
+    onCancelSubmission: _onCancelSubmission,
+    stopCapability: _stopCapability,
+    onRequestStop: _onRequestStop,
+    ...stablePresentation
+  } = presented
+  return {
+    ...stablePresentation,
+    submissionPending: current?.submissionPending === true,
+    ...(current?.onCancelSubmission ? { onCancelSubmission: current.onCancelSubmission } : {}),
+    ...(current?.stopCapability ? { stopCapability: current.stopCapability } : {}),
+    ...(current?.onRequestStop ? { onRequestStop: current.onRequestStop } : {}),
   }
 }
 
