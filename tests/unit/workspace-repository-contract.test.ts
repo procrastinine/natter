@@ -1,11 +1,22 @@
 import Dexie from 'dexie'
 import 'fake-indexeddb/auto'
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
+import { emptyActiveBranchChildSlot } from '../../src/core/active-branch-spine'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
+import type {
+  ConversationDestinationHeaderPoint,
+  ConversationProvedSelection,
+} from '../../src/core/messages'
 import { tokenCalibrationKey } from '../../src/core/model-ids'
 import { EMPTY_TEXT_TEMPLATE, type SavedTextTemplate } from '../../src/core/text-templates'
 import { GLOBAL_TOKEN_CALIBRATION_KEY } from '../../src/core/token-calibration'
-import type { Chat, ConnectionProfile, KeyRecord, PromptPreset } from '../../src/core/types'
+import type {
+  Chat,
+  ConnectionProfile,
+  KeyRecord,
+  Message,
+  PromptPreset,
+} from '../../src/core/types'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
 import {
   __getBrowserWorkspaceSessionRepositoryForTests,
@@ -33,6 +44,7 @@ import { createConversationRepositoryAdapter } from '../../src/store/conversatio
 import { __resetDbForTests, BrowserWorkspaceSessionClosedError, getDb } from '../../src/store/db'
 import { createWorkspaceMessageMaterialCoordinator } from '../../src/store/generation-prompt-material'
 import { exportWorkspaceBackup, restoreWorkspaceBackup } from '../../src/store/import-export'
+import { splitMessageForStorage } from '../../src/store/message-storage'
 import { readBrowserWorkspaceMeta } from '../../src/store/workspace-meta'
 import type {
   WorkspaceCommand,
@@ -1219,5 +1231,141 @@ describe('browser WorkspaceRepository protocol contract', () => {
       structuralVersion: 0,
       window,
     })
+  })
+
+  it('does not let a sealed selection overtake its staged terminal material', async () => {
+    const workspace = await readBrowserWorkspaceMeta(getDb())
+    const row: Message = {
+      id: 'staged-terminal-message',
+      chatId: 'staged-terminal-chat',
+      parentId: null,
+      siblingIndex: 0,
+      turnId: 'staged-terminal-turn',
+      turnIndex: 0,
+      createdAt: 1,
+      role: 'assistant',
+      origin: 'generated',
+      content: [{ type: 'output_text', text: 'destination' }],
+      nodeVersion: 0,
+      deleted: false,
+    }
+    const stored = splitMessageForStorage(row, { bodyVersion: 1 })
+    const presentation = Object.freeze({
+      header: stored.header,
+      message: row,
+      bodyVersion: stored.header.bodyVersion,
+    })
+    const chat = {
+      ...sessionChat(row.chatId),
+      structuralVersion: 1,
+      lastUpdatedLeafId: row.id,
+    }
+    const target = {
+      kind: 'fixed-tip' as const,
+      selection: { kind: 'tip' as const, messageId: row.id },
+      messageId: row.id,
+    }
+    const selection: ConversationProvedSelection = {
+      kind: 'ready',
+      chat,
+      target,
+      proof: {
+        chatId: row.chatId,
+        structuralVersion: chat.structuralVersion,
+        tipId: row.id,
+        pathHeaders: [stored.header],
+      },
+      presentations: [],
+      forks: [],
+      terminalChildSlot: emptyActiveBranchChildSlot(row.id),
+    }
+    const events: string[] = []
+    let releaseMaterial!: () => void
+    const materialGate = new Promise<void>((resolve) => {
+      releaseMaterial = resolve
+    })
+    let noteMaterialStarted!: () => void
+    const materialStarted = new Promise<void>((resolve) => {
+      noteMaterialStarted = resolve
+    })
+    const query = vi.fn(
+      async (
+        _permit: unknown,
+        request: WorkspaceQuery,
+        options?: {
+          onStage?: (stage: {
+            workspaceId: string
+            replacementEpoch: number
+            value: ConversationDestinationHeaderPoint
+          }) => void
+        },
+      ) => {
+        if (request.kind === 'branch.open') {
+          events.push('header')
+          options?.onStage?.({
+            workspaceId: workspace.workspaceId,
+            replacementEpoch: workspace.replacementEpoch,
+            value: {
+              kind: 'tip-header-point',
+              chat,
+              target,
+              structuralVersion: chat.structuralVersion,
+              header: stored.header,
+            },
+          })
+          return {
+            workspaceId: workspace.workspaceId,
+            replacementEpoch: workspace.replacementEpoch,
+            value: selection,
+          }
+        }
+        if (request.kind === 'message.presentations') {
+          events.push('body')
+          return {
+            workspaceId: workspace.workspaceId,
+            replacementEpoch: workspace.replacementEpoch,
+            value: [presentation],
+          }
+        }
+        throw new Error(`UnexpectedStagedSelectionQuery:${request.kind}`)
+      },
+    )
+    const controller = {
+      readSharedMessageMaterial: async (
+        _fence: unknown,
+        headers: Parameters<ConversationController['readSharedMessageMaterial']>[1],
+        loader: Parameters<ConversationController['readSharedMessageMaterial']>[2],
+        signal: AbortSignal | undefined,
+      ) => {
+        noteMaterialStarted()
+        await materialGate
+        return (await loader(headers, signal ?? new AbortController().signal)).material
+      },
+    } as unknown as ConversationController
+    const adapter = createConversationRepositoryAdapter({
+      repository: {
+        query,
+        execute: vi.fn(),
+        replace: vi.fn(),
+        subscribeChanges: vi.fn(() => () => undefined),
+      } as unknown as WorkspaceRepository,
+      controller,
+    })
+    let selectionSettled = false
+    const selectionRead = adapter.projectionSource
+      .openSelection(row.chatId, target, () => events.push('point'), new AbortController().signal)
+      .then((result) => {
+        selectionSettled = true
+        events.push('selection')
+        return result
+      })
+
+    await materialStarted
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    expect(selectionSettled).toBe(false)
+
+    releaseMaterial()
+    await expect(selectionRead).resolves.toMatchObject({ value: { kind: 'ready' } })
+    expect(events).toEqual(['header', 'body', 'point', 'selection'])
   })
 })

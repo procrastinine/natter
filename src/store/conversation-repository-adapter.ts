@@ -105,6 +105,9 @@ class RepositoryConversationAdapter implements ConversationRepositoryAdapter {
         return conversationEnvelope(envelope, envelope.value)
       },
       openSelection: async (chatId, target, onPoint, signal) => {
+        const stagedPoint = {
+          completion: null as Promise<void> | null,
+        }
         const publishPoint = (
           stage: ConversationReadEnvelope<ConversationDestinationHeaderPoint>,
         ) => {
@@ -120,7 +123,7 @@ class RepositoryConversationAdapter implements ConversationRepositoryAdapter {
             return
           }
           const header = stage.value.header
-          void this.controller
+          stagedPoint.completion = this.controller
             .readSharedMessageMaterial(
               stage,
               [header],
@@ -174,6 +177,7 @@ class RepositoryConversationAdapter implements ConversationRepositoryAdapter {
             ),
           { signal },
         )
+        await stagedPoint.completion
         const value = envelope.value
         return conversationEnvelope(
           envelope,
