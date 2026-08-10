@@ -597,32 +597,48 @@ async function acknowledgeBrowserWorkspaceCatchupPage(
 ): Promise<void> {
   if (entries.length === 0) return
   const journalName = browserWorkspaceCatchupJournalTableName(tableName)
-  await runSourceCompactionTransaction(
-    source,
-    'rw',
-    [source.table(journalName)],
-    `acknowledge-catchup:${tableName}`,
-    (tx) => {
-      const table = tx.table<BrowserWorkspaceCatchupJournalRow, string>(journalName)
-      return table.bulkGet(entries.map(({ journal }) => journal.id)).then((current) => {
-        const acknowledged = entries.flatMap(({ journal }, index) =>
-          current[index]?.revision === journal.revision ? [journal.id] : [],
-        )
-        return acknowledged.length > 0 ? table.bulkDelete(acknowledged) : undefined
-      })
-    },
-  )
-}
-
-function runSourceCompactionTransaction<T>(
-  database: NatterDb,
-  mode: 'r' | 'rw',
-  tables: readonly Table[],
-  stage: string,
-  operation: (transaction: Transaction) => PromiseExtended<T> | T,
-): Promise<T> {
-  return database.transaction(mode, tables, operation).catch((error: unknown) => {
-    throw compactionTransactionError(stage, error)
+  const backend = source.backendDB() as IDBDatabase | null
+  if (!backend) throw new Error('BrowserWorkspaceCompactionSourceClosed')
+  await new Promise<void>((resolve, reject) => {
+    const transaction = backend.transaction(journalName, 'readwrite')
+    const store = transaction.objectStore(journalName)
+    let settled = false
+    const fail = (error?: unknown) => {
+      if (settled) return
+      settled = true
+      reject(
+        compactionTransactionError(
+          `acknowledge-catchup:${tableName}`,
+          error ?? transaction.error ?? new Error('BrowserWorkspaceCompactionCatchupAckFailed'),
+        ),
+      )
+    }
+    transaction.onerror = () => fail()
+    transaction.onabort = () => fail()
+    transaction.oncomplete = () => {
+      if (settled) return
+      settled = true
+      resolve()
+    }
+    for (const { journal } of entries) {
+      const request = store.get(journal.id)
+      request.onerror = () => fail(request.error)
+      request.onsuccess = () => {
+        try {
+          const current = request.result as BrowserWorkspaceCatchupJournalRow | undefined
+          if (current?.revision !== journal.revision) return
+          const deletion = store.delete(journal.id)
+          deletion.onerror = () => fail(deletion.error)
+        } catch (error) {
+          fail(error)
+          try {
+            transaction.abort()
+          } catch {
+            return
+          }
+        }
+      }
+    }
   })
 }
 

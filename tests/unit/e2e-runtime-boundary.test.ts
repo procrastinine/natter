@@ -726,11 +726,19 @@ describe('built-app runtime boundary', () => {
     expect(config).not.toContain('E2E_LANE')
     expect(config).toContain("name: 'large-workspace-setup'")
     expect(config).toContain("name: 'chromium-large-workspace'")
+    expect(config).toContain("name: 'chromium-send-performance'")
+    expect(config).toContain("name: 'firefox-send-performance'")
+    expect(config).toContain('testMatch: sendPerformanceSpec')
+    expect(config).toContain("? ['chromium-large-workspace']")
+    expect(config).toContain("dependencies: ['firefox']")
+    expect(config).toContain('workers: 1')
     expect(config).toContain('large-workspace-startup')
     expect(config).toContain('large-workspace\\.setup')
 
-    expect(packageJson.scripts.e2e).toBe('playwright test --project=chromium')
-    expect(packageJson.scripts['e2e:production']).toBe('playwright test --project=chromium')
+    expect(packageJson.scripts.e2e).toBe('playwright test --project=chromium-send-performance')
+    expect(packageJson.scripts['e2e:production']).toBe(
+      'playwright test --project=chromium-send-performance',
+    )
     expect(packageJson.scripts['e2e:headed-visibility']).toContain('xvfb-run --auto-servernum')
     expect(packageJson.scripts['e2e:startup-scale']).toBe(
       'playwright test --project=chromium-large-workspace',
@@ -863,8 +871,7 @@ describe('built-app runtime boundary', () => {
       'exec',
       'playwright',
       'test',
-      '--project=chromium',
-      '--project=chromium-large-workspace',
+      '--project=chromium-send-performance',
     ])
     expect(readText('scripts/run-verification.mjs')).toContain("E2E_FAKE_PROVIDER_PORT: '4174'")
     expect(verifyE2eIndex).toBeGreaterThanOrEqual(0)
@@ -922,15 +929,14 @@ describe('built-app runtime boundary', () => {
       'exec',
       'playwright',
       'test',
-      '--project=chromium',
-      '--project=chromium-large-workspace',
+      '--project=chromium-send-performance',
     ])
     expect(VERIFICATION_STAGES.find((stage) => stage.id === 'firefox-e2e')?.argv).toEqual([
       'pnpm',
       'exec',
       'playwright',
       'test',
-      '--project=firefox',
+      '--project=firefox-send-performance',
     ])
     expect(
       VERIFICATION_STAGES.find((stage) => stage.id === 'headed-hidden-tab-visual-continuity')?.argv,
@@ -946,7 +952,7 @@ describe('built-app runtime boundary', () => {
     expect(packageJson.scripts['test:run']).toBe(
       'node scripts/audit-protocol-contracts.mjs --mode inventory --facts-output test-results/protocol-contract-facts.json --mutation-output test-results/protocol-contract-mutation-proof.json && vitest run',
     )
-    expect(packageJson.scripts.e2e).toBe('playwright test --project=chromium')
+    expect(packageJson.scripts.e2e).toBe('playwright test --project=chromium-send-performance')
   })
 
   it('limits build-mode behavior to the privacy proxy and keeps devtools outside the app entry', () => {

@@ -391,6 +391,109 @@ describe('message-list viewport transition contract', () => {
     expect(retained.getBoundingClientRect().top).toBe(40)
     expect(ref.current?.getState()).toBe('pinned')
   })
+
+  it('reconciles a user text anchor in the layout commit of an unannounced passive fill', async () => {
+    const fixture = branchFixture(8)
+    const initial = fixture.window(7, 1)
+    const filled = fixture.window(0, 8)
+    const ref = createRef<ScrollRegionHandle>()
+    let viewportRevision = 0
+    let snapshot = initial
+    const element = () => viewportElement(fixture, snapshot, viewportRevision, ref)
+    const view = render(element())
+    const region = requireRegion(view.container)
+    let scrollHeight = 1_000
+    installRegionGeometry(region, () => scrollHeight)
+    const retained = requireMessage(view.container, 'message-7')
+    let retainedDocumentTop = 920
+    retained.getBoundingClientRect = () =>
+      rect({
+        top: retainedDocumentTop - region.scrollTop,
+        bottom: retainedDocumentTop + 20 - region.scrollTop,
+      })
+
+    act(() => view.rerender(element()))
+    expect(region.scrollTop).toBe(900)
+    act(() => {
+      fireEvent.wheel(region, { deltaY: -20 })
+      region.scrollTop = 880
+      fireEvent.scroll(region)
+    })
+    expect(ref.current?.getState()).toBe('pinned')
+    expect(retained.getBoundingClientRect().top).toBe(40)
+
+    act(() => {
+      retainedDocumentTop += 300
+      scrollHeight += 300
+      snapshot = filled
+      viewportRevision = 1
+      view.rerender(element())
+    })
+
+    expect(region.scrollTop).toBe(1_180)
+    expect(retained.getBoundingClientRect().top).toBe(40)
+  })
+
+  it('measures newly materialized history before paint while user scrolling is active', async () => {
+    const measuredMessageIds = new Set<string>()
+    const rowHeight = vi
+      .spyOn(HTMLElement.prototype, 'offsetHeight', 'get')
+      .mockImplementation(function (this: HTMLElement) {
+        if (this.dataset.ui !== 'message-virtual-row') return 0
+        const messageId = this.querySelector<HTMLElement>('[data-message-id]')?.dataset.messageId
+        if (messageId) measuredMessageIds.add(messageId)
+        return 1_000
+      })
+    try {
+      const fixture = branchFixture(20)
+      const initial = fixture.window(10, 10)
+      const prepended = prependTranscriptBodyPage(initial, fixture.page(0, 10))
+      const ref = createRef<ScrollRegionHandle>()
+      let viewportRevision = 0
+      let snapshot = initial
+      const loadOlder = vi.fn()
+      const element = () => viewportElement(fixture, snapshot, viewportRevision, ref, loadOlder)
+      const view = render(element())
+      const region = requireRegion(view.container)
+      let scrollHeight = 10_000
+      installRegionGeometry(region, () => scrollHeight)
+      const retained = requireMessage(view.container, 'message-10')
+      retained.getBoundingClientRect = () => rect({ top: 20, bottom: 40 })
+
+      act(() => view.rerender(element()))
+      act(() => {
+        fireEvent.wheel(region, { deltaY: -180 })
+        region.scrollTop = 0
+        fireEvent.scroll(region)
+      })
+      await act(nextTask)
+      expect(ref.current?.getState()).toBe('pinned')
+
+      act(() => {
+        fireEvent.wheel(region, { deltaY: -180 })
+        fireEvent.click(view.getByRole('button', { name: 'Load more' }))
+      })
+      expect(loadOlder).toHaveBeenCalledTimes(1)
+      expect(view.container.querySelector('[data-ui="message-list"]')).toHaveAttribute(
+        'data-history-demand-anchor-id',
+        'message-10',
+      )
+
+      act(() => {
+        scrollHeight = 20_000
+        snapshot = prepended
+        viewportRevision = 1
+        fireEvent.scroll(region)
+        view.rerender(element())
+      })
+
+      expect(
+        [...measuredMessageIds].filter((messageId) => /^message-[0-9]$/u.test(messageId)),
+      ).toEqual(Array.from({ length: 10 }, (_, index) => `message-${index}`))
+    } finally {
+      rowHeight.mockRestore()
+    }
+  })
 })
 
 interface BranchFixture {

@@ -634,7 +634,6 @@ export function ConnectionHeader({
         aria-controls={detailId}
         title={`${KIND_LABEL[profile.kind]} · ${profile.name}`}
         onClick={() => setOpen((v) => !v)}
-        disabled={selectionPresentationOnly}
       >
         <ConnectionKindIcon kind={profile.kind} size={18} />
       </Button>

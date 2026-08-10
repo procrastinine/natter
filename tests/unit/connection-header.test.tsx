@@ -500,22 +500,32 @@ describe('ConnectionHeader', () => {
     await configurationController.setProjectionSource(source)
 
     render(<ConnectionHeader variant="title-icon" />)
-    await screen.findByRole('button', { name: connectionButtonMatcher('llama A') })
+    const current = await screen.findByRole('button', {
+      name: connectionButtonMatcher('llama A'),
+    })
+    fireEvent.pointerDown(current)
 
     blockB = true
     act(() => writeActiveProfileId(b.id))
     expect(screen.queryByText('No connection configured')).toBeNull()
     const retained = screen.getByRole('button', { name: connectionButtonMatcher('llama A') })
-    await waitFor(() => expect(retained).toBeDisabled())
+    await waitFor(() => expect(retained).toBeEnabled())
     expect(retained.closest('[data-ui="connection-title-entry"]')).toHaveAttribute(
       'data-presentation',
       'retained',
     )
+    fireEvent.click(retained)
+    const retainedRegion = screen.getByRole('region', { name: 'Connection: llama A' })
+    expect(retainedRegion).toHaveAttribute('data-presentation', 'retained')
+    expect(retainedRegion).toHaveAttribute('inert')
+    expect(retainedRegion.querySelector('[data-ui="connection-row"]')).toBeDisabled()
 
     releaseB()
 
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: connectionButtonMatcher('llama B') })).toBeTruthy()
+      expect(screen.getByRole('region', { name: 'Connection: llama B' })).not.toHaveAttribute(
+        'inert',
+      )
     })
   })
 })

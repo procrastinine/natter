@@ -32,6 +32,7 @@ const applicationServerCommand = [
 ].join(' && ')
 const devServerCommand = `${packageManagerCommand} dev --host ${host} --port ${devPort} --strictPort`
 const devPreviewParitySpec = /dev-preview-parity\.spec\.ts$/u
+const sendPerformanceSpec = /send-performance\.spec\.ts$/u
 
 export function parseE2ePort(raw: string, name: string): number {
   const parsed = Number(raw)
@@ -114,6 +115,7 @@ export default defineConfig({
         /large-workspace\.setup\.ts$/u,
         /large-workspace-startup\.spec\.ts$/u,
         devPreviewParitySpec,
+        sendPerformanceSpec,
       ],
       use: { ...devices['Desktop Chrome'] },
     },
@@ -124,12 +126,29 @@ export default defineConfig({
       use: { ...devices['Desktop Chrome'] },
     },
     {
+      name: 'chromium-send-performance',
+      testMatch: sendPerformanceSpec,
+      dependencies: serializedLargeWorkspaceClosure ? ['chromium-large-workspace'] : ['chromium'],
+      fullyParallel: false,
+      workers: 1,
+      use: { ...devices['Desktop Chrome'] },
+    },
+    {
       name: 'firefox',
       testIgnore: [
         /large-workspace\.setup\.ts$/u,
         /large-workspace-startup\.spec\.ts$/u,
         devPreviewParitySpec,
+        sendPerformanceSpec,
       ],
+      use: { ...devices['Desktop Firefox'] },
+    },
+    {
+      name: 'firefox-send-performance',
+      testMatch: sendPerformanceSpec,
+      dependencies: ['firefox'],
+      fullyParallel: false,
+      workers: 1,
       use: { ...devices['Desktop Firefox'] },
     },
     ...(devPreviewParity

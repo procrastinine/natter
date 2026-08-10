@@ -1,6 +1,6 @@
 import { resolve } from 'node:path'
-import { describe, expect, it } from 'vitest'
-import { auditProductionRuntimeEffects } from '../../scripts/audit-production-runtime-effects.mjs'
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { evaluateProductionRuntimeEffects } from '../../scripts/audit-production-runtime-effects.mjs'
 import {
   buildProductionRuntimeEffectInventory,
   inventoryRuntimeEffectsInSource,
@@ -8,10 +8,28 @@ import {
 import { validateReviewedCandidateDispositions } from '../../scripts/reviewed-candidate-dispositions.mjs'
 
 const repoRoot = resolve(__dirname, '../..')
+let currentInventory: ReturnType<typeof buildProductionRuntimeEffectInventory> | null = null
+let currentReports: {
+  readonly inventory: ReturnType<typeof evaluateProductionRuntimeEffects>
+  readonly enforce: ReturnType<typeof evaluateProductionRuntimeEffects>
+} | null = null
+
+beforeAll(() => {
+  currentInventory = buildProductionRuntimeEffectInventory(repoRoot)
+  currentReports = {
+    inventory: evaluateProductionRuntimeEffects(currentInventory, 'inventory'),
+    enforce: evaluateProductionRuntimeEffects(currentInventory, 'enforce'),
+  }
+})
+
+afterAll(() => {
+  currentInventory = null
+  currentReports = null
+})
 
 describe('production runtime effects audit', () => {
   it('classifies every discovered site and keeps unproved releases explicit', () => {
-    const inventory = buildProductionRuntimeEffectInventory(repoRoot)
+    const inventory = requiredInventory()
 
     expect(inventory.sites.length).toBeGreaterThan(0)
     expect(inventory.counts.sites).toBe(inventory.sites.length)
@@ -39,7 +57,7 @@ describe('production runtime effects audit', () => {
   })
 
   it('rejects stale evidence and candidate-line laundering in the reviewed dispositions', () => {
-    const inventory = buildProductionRuntimeEffectInventory(repoRoot)
+    const inventory = requiredInventory()
     const candidates = inventory.sites.filter(
       (site) => site.requiresRelease && site.releaseEvidence === 'missing',
     )
@@ -141,21 +159,22 @@ describe('production runtime effects audit', () => {
   })
 
   it('keeps inventory and enforce modes green when every ownership candidate is closed', () => {
-    const inventory = runAudit('inventory')
-    const enforce = runAudit('enforce')
+    const { enforce, inventory } = requiredReports()
 
-    expect(inventory.status).toBe(0)
-    expect(inventory.report.structurallyValid).toBe(true)
-    expect(inventory.report.gapCount).toBe(0)
-    expect(enforce.status).toBe(0)
-    expect(enforce.report.problems).toEqual([])
+    expect(inventory.ok).toBe(true)
+    expect(inventory.structurallyValid).toBe(true)
+    expect(inventory.gapCount).toBe(0)
+    expect(enforce.ok).toBe(true)
+    expect(enforce.problems).toEqual([])
   })
 })
 
-function runAudit(mode: 'enforce' | 'inventory') {
-  const report = auditProductionRuntimeEffects({ root: repoRoot, mode })
-  return {
-    status: report.ok ? 0 : 1,
-    report,
-  }
+function requiredInventory(): ReturnType<typeof buildProductionRuntimeEffectInventory> {
+  if (!currentInventory) throw new Error('ProductionRuntimeEffectsInventoryMissing')
+  return currentInventory
+}
+
+function requiredReports(): NonNullable<typeof currentReports> {
+  if (!currentReports) throw new Error('ProductionRuntimeEffectsReportsMissing')
+  return currentReports
 }

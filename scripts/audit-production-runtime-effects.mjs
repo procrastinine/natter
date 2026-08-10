@@ -7,6 +7,13 @@ import { buildProductionRuntimeEffectInventory } from './production-runtime-effe
 export function auditProductionRuntimeEffects(options = {}) {
   const mode = options.mode ?? 'inventory'
   const inventory = buildProductionRuntimeEffectInventory(options.root)
+  return evaluateProductionRuntimeEffects(inventory, mode)
+}
+
+export function evaluateProductionRuntimeEffects(inventory, mode = 'inventory') {
+  if (mode !== 'enforce' && mode !== 'inventory') {
+    throw new Error(`ProductionRuntimeEffectsAuditModeInvalid:${mode}`)
+  }
   const structuralProblems = validateInventory(inventory)
   const enforcementProblems = mode === 'enforce' ? inventory.gaps.map((gap) => gap.id) : []
   const problems = [...structuralProblems, ...enforcementProblems]

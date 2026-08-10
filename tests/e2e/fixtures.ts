@@ -8,6 +8,7 @@ import {
   type Page,
   type TestInfo,
 } from '@playwright/test'
+import { navigatePagesForLifecycleDrain } from './lifecycle-drain'
 import {
   armUiJourneyInvariantRecorder,
   formatUiJourneyViolations,
@@ -279,13 +280,6 @@ export const test = fixtureBase.extend<RuntimeDiagnosticFixtures>({
       const pendingConsoleDetails = new Set<Promise<void>>()
       let lifecycleDrainStarted = false
       if (!baseURL) throw new Error('RuntimeDiagnosticBaseUrlMissing')
-      const lifecycleDrainUrl = new URL('/__e2e-lifecycle-drain__', baseURL).href
-      await context.route('**/__e2e-lifecycle-drain__', (route) =>
-        route.fulfill({
-          contentType: 'text/html',
-          body: '<!doctype html><html data-e2e-lifecycle-drain><title>Closed</title></html>',
-        }),
-      )
       await context.route('https://debug.invalid/**', (route) =>
         route.fulfill({
           contentType: 'application/json',
@@ -395,7 +389,7 @@ export const test = fixtureBase.extend<RuntimeDiagnosticFixtures>({
         const pages = context.pages().filter((page) => page !== keeperPage)
         await drainRuntimeTasks(pages)
         lifecycleDrainStarted = true
-        await navigatePagesForLifecycleDrain(pages, lifecycleDrainUrl)
+        await navigatePagesForLifecycleDrain(pages)
         await nextHostTask()
         await Promise.allSettled(
           pages.filter((page) => !page.isClosed()).map((page) => page.close()),
@@ -658,25 +652,6 @@ async function drainRuntimeTasks(pages: readonly Page[]): Promise<void> {
       }
     }),
   )
-}
-
-async function navigatePagesForLifecycleDrain(
-  pages: readonly Page[],
-  lifecycleDrainUrl: string,
-): Promise<void> {
-  const results = await Promise.allSettled(
-    pages
-      .filter((page) => !page.isClosed())
-      .map(async (page) => {
-        await page.goto(lifecycleDrainUrl, { waitUntil: 'commit' })
-        await page.locator('[data-e2e-lifecycle-drain]').waitFor({ state: 'attached' })
-        if (page.url() !== lifecycleDrainUrl) throw new Error('RuntimeDiagnosticDrainUrlMismatch')
-      }),
-  )
-  const rejected = results.find(
-    (result): result is PromiseRejectedResult => result.status === 'rejected',
-  )
-  if (rejected) throw rejected.reason
 }
 
 async function nextHostTask(): Promise<void> {

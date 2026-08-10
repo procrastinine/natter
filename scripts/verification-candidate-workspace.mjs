@@ -482,17 +482,21 @@ async function captureTestCompiler({ runtimeRoot, candidateId, snapshot, executi
 
 async function readGitSourceInventory(root, injectedRunProcess) {
   const run = injectedRunProcess ?? runProcess
-  const listing = await run('git', ['-C', root, 'ls-files', '--cached', '-z'], {
-    cwd: root,
-    env: {
-      FORCE_COLOR: '0',
-      LANG: 'C',
-      LC_ALL: 'C',
-      NO_COLOR: '1',
-      PATH: process.env.PATH ?? '',
-      TZ: 'UTC',
+  const listing = await run(
+    'git',
+    ['-C', root, 'ls-files', '--cached', '--others', '--exclude-standard', '-z'],
+    {
+      cwd: root,
+      env: {
+        FORCE_COLOR: '0',
+        LANG: 'C',
+        LC_ALL: 'C',
+        NO_COLOR: '1',
+        PATH: process.env.PATH ?? '',
+        TZ: 'UTC',
+      },
     },
-  })
+  )
   if (listing.exitCode !== 0 || listing.signal !== null || listing.error !== null) {
     throw new Error('VerificationCandidateSourceInventoryFailed')
   }

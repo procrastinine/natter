@@ -1287,7 +1287,9 @@ async function installNativeScrollContinuityProbe(page: Page): Promise<void> {
     region.addEventListener(
       'scroll',
       () => {
-        if (renderedCount() === probe.currentCount) probe.beforeExpansion = readSample()
+        if (renderedCount() !== probe.currentCount) return
+        const sample = readSample()
+        if (sample) probe.beforeExpansion = sample
       },
       { capture: true, passive: true },
     )

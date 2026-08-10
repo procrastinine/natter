@@ -48,6 +48,7 @@ import {
   type LockBackend,
 } from '../../src/store/locks'
 import { splitMessageForStorage } from '../../src/store/message-storage'
+import { browserWorkspaceCatchupJournalTableName } from '../../src/store/physical-storage-tables'
 import { type StreamLeaseRow, streamLeaseHasWriteFence } from '../../src/store/repository'
 import {
   readStorageCompactionState,
@@ -691,6 +692,22 @@ describe('storage retention', () => {
           completedRevision: 0,
         })
       })
+      const catalogTable = getDb().configurationPresetCatalogRows
+      const tablePrototype = Object.getPrototypeOf(catalogTable) as typeof catalogTable
+      const originalBulkGet = tablePrototype.bulkGet
+      const journalName = browserWorkspaceCatchupJournalTableName('configurationPresetCatalogRows')
+      const bulkGet = vi.spyOn(tablePrototype, 'bulkGet').mockImplementation(function (
+        this: typeof tablePrototype,
+        keys,
+      ) {
+        if (this.name === journalName) {
+          throw new DOMException(
+            'Dexie journal acknowledgement forbidden',
+            'TransactionInactiveError',
+          )
+        }
+        return originalBulkGet.call(this, keys)
+      })
       const foreground = configurationApplication.execute({
         kind: 'chat-preset.update',
         presetId: preset.id,
@@ -725,6 +742,11 @@ describe('storage retention', () => {
         id: preset.id,
         name: 'Caught up preset',
       })
+      expect(
+        bulkGet.mock.contexts.filter(
+          (context) => (context as typeof tablePrototype | undefined)?.name === journalName,
+        ),
+      ).toHaveLength(0)
     } finally {
       releaseCopy()
       await holdSourceCopy.catch(() => undefined)

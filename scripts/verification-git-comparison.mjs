@@ -65,7 +65,9 @@ export function buildCommittedVerificationComparison(options) {
   const snapshot = buildVerificationSnapshot({
     source,
     globalInputs: verificationGlobalInputPaths({ allPaths }),
-    explicitEdges: VERIFICATION_EXPLICIT_MODULE_EDGES,
+    explicitEdges: VERIFICATION_EXPLICIT_MODULE_EDGES.filter(
+      ({ importer, dependency }) => allPaths.has(importer) && allPaths.has(dependency),
+    ),
   })
   const withoutDigest = {
     schemaVersion: 1,

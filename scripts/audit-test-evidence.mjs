@@ -31,6 +31,7 @@ const REQUIRED_INTERROGATED_IDS = new Set([
   'dev-and-built-artifact-exercise-equivalent-application-paths',
   'verification-hygiene-failures-affect-exit-code',
   'verification-performance-stage-measures-current-runtime',
+  'isolated-send-critical-path-latency',
   'every-presentation-interaction-site-has-outcome-proof',
 ])
 
@@ -170,6 +171,17 @@ function validateVerificationParity(root, problems) {
         runner.includes("'firefox-e2e',") &&
         runner.indexOf("'firefox-e2e',") > runner.indexOf("stage('chromium-e2e'"),
       'The sealed local and GitHub checkpoint executes both required browser engines against the same production artifact.',
+    ),
+    parityAssertion(
+      'isolated-send-latency',
+      playwright.includes("name: 'chromium-send-performance'") &&
+        playwright.includes("name: 'firefox-send-performance'") &&
+        playwright.includes('testMatch: sendPerformanceSpec') &&
+        playwright.includes("? ['chromium-large-workspace']") &&
+        playwright.includes("dependencies: ['firefox']") &&
+        runner.includes("'--project=chromium-send-performance'") &&
+        runner.includes("'--project=firefox-send-performance'"),
+      'Strict send latency runs alone after each complete engine suite, so unrelated parallel stress CPU cannot enter its wall clock.',
     ),
     parityAssertion(
       'pinned-node',

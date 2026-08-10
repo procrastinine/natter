@@ -219,14 +219,13 @@ export const VERIFICATION_STAGES = Object.freeze([
     'exec',
     'playwright',
     'test',
-    '--project=chromium',
-    '--project=chromium-large-workspace',
+    '--project=chromium-send-performance',
   ]),
   stage(
     'firefox-e2e',
     'Test the built app in Firefox against the loopback fake provider',
     'blocking',
-    ['pnpm', 'exec', 'playwright', 'test', '--project=firefox'],
+    ['pnpm', 'exec', 'playwright', 'test', '--project=firefox-send-performance'],
   ),
   stage(
     'headed-hidden-tab-visual-continuity',

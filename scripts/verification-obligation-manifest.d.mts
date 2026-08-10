@@ -12,7 +12,7 @@ export type VerificationProofExecution =
   | { readonly runner: 'vitest'; readonly files: readonly string[] }
   | {
       readonly runner: 'playwright'
-      readonly project: 'chromium' | 'chromium-large-workspace'
+      readonly project: 'chromium' | 'chromium-large-workspace' | 'chromium-send-performance'
       readonly files: readonly string[]
     }
 

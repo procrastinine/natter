@@ -402,12 +402,15 @@ function validateCompactionTransactionPromiseOwnership(root, problems) {
   const sourceFile = sourceFileFor(path)
   const required = [
     'operation: (transaction: Transaction) => PromiseExtended<T> | T',
-    'function runSourceCompactionTransaction<T>(',
     'function runDestinationCompactionTransaction<T>(',
     "const transaction = backend.transaction([journalName, tableName], 'readonly')",
     'const cursorRequest = journalStore.openCursor(',
     'rows.forEach((journal, index) => {',
     'const request = sourceStore.get(journal.sourceKey as IDBValidKey)',
+    "const transaction = backend.transaction(journalName, 'readwrite')",
+    'const request = store.get(journal.id)',
+    'if (current?.revision !== journal.revision) return',
+    'const deletion = store.delete(journal.id)',
     'transaction.oncomplete = () => {',
     '`observe-catchup:$' + '{tableName}`',
     '`apply-catchup:$' + '{tableName}`',
@@ -431,10 +434,18 @@ function validateCompactionTransactionPromiseOwnership(root, problems) {
       problems.push(`compaction-transaction-owned-promise: catch-up read retained ${forbidden}`)
     }
   }
-  const transactionRunners = new Set([
-    'runSourceCompactionTransaction',
-    'runDestinationCompactionTransaction',
-  ])
+  const catchupAcknowledgement = source.slice(
+    source.indexOf('async function acknowledgeBrowserWorkspaceCatchupPage('),
+    source.indexOf('function runDestinationCompactionTransaction<T>('),
+  )
+  for (const forbidden of ['runSourceCompactionTransaction(', '.bulkGet(', '.bulkDelete(']) {
+    if (catchupAcknowledgement.includes(forbidden)) {
+      problems.push(
+        `compaction-transaction-owned-promise: catch-up acknowledgement retained ${forbidden}`,
+      )
+    }
+  }
+  const transactionRunners = new Set(['runDestinationCompactionTransaction'])
   const destinationReadMethods = new Set(['get', 'bulkGet', 'toArray', 'first', 'last', 'count'])
   const destinationWriteMethods = new Set([
     'add',

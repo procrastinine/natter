@@ -137,9 +137,11 @@ describe('materialized verification candidate', () => {
     )
   })
 
-  it('uses only tracked paths for the default candidate inventory', async () => {
+  it('seals tracked and non-ignored untracked paths in the default candidate inventory', async () => {
     const fixture = await candidateFixture()
-    write(fixture.root, 'unrelated-local-file.html', '<!doctype html>local only\n')
+    const untrackedPath = 'tests/untracked.test.ts'
+    const untrackedSource = 'export const untrackedProof = true\n'
+    write(fixture.root, untrackedPath, untrackedSource)
     const calls: string[][] = []
     const candidate = await materializeVerificationCandidate({
       sourceRoot: fixture.root,
@@ -150,7 +152,7 @@ describe('materialized verification candidate', () => {
         calls.push([...args])
         return {
           ...successfulProcess(),
-          stdout: Buffer.from(`${fixture.paths.join('\0')}\0`),
+          stdout: Buffer.from(`${[...fixture.paths, untrackedPath].join('\0')}\0`),
         }
       },
       captureCompiler: resolvedCompilerCapture,
@@ -158,15 +160,18 @@ describe('materialized verification candidate', () => {
     candidates.push(candidate)
 
     expect(calls).toEqual([
-      ['-C', fixture.root, 'ls-files', '--cached', '-z'],
-      ['-C', fixture.root, 'ls-files', '--cached', '-z'],
+      ['-C', fixture.root, 'ls-files', '--cached', '--others', '--exclude-standard', '-z'],
+      ['-C', fixture.root, 'ls-files', '--cached', '--others', '--exclude-standard', '-z'],
     ])
-    expect(candidate.sourceManifest.entries.map(({ path }) => path)).toEqual(fixture.paths)
+    expect(candidate.sourceManifest.entries.map(({ path }) => path)).toEqual(
+      [...fixture.paths, untrackedPath].sort(),
+    )
+    expect(readFileSync(resolve(candidate.runtimeRoot, untrackedPath), 'utf8')).toBe(
+      untrackedSource,
+    )
     expect(
-      lstatSync(resolve(candidate.runtimeRoot, 'unrelated-local-file.html'), {
-        throwIfNoEntry: false,
-      }),
-    ).toBeUndefined()
+      candidate.sourceManifest.entries.find(({ path }) => path === untrackedPath)?.sha256,
+    ).toBe(createHash('sha256').update(untrackedSource).digest('hex'))
   })
 
   it('persists a pending compiler cohort for adaptation but refuses to execute it', async () => {
@@ -248,6 +253,24 @@ describe('materialized verification candidate', () => {
           if (call === 1) return fixture.paths
           write(fixture.root, 'src/added.ts', 'export const added = true\n')
           return [...fixture.paths, 'src/added.ts']
+        },
+        captureCompiler: resolvedCompilerCapture,
+      }),
+    ).rejects.toThrow('VerificationCandidateSourceChangedDuringMaterialization')
+
+    const byteFixture = await candidateFixture()
+    let byteCall = 0
+    await expect(
+      materializeVerificationCandidate({
+        sourceRoot: byteFixture.root,
+        dependencyImage: byteFixture.image,
+        manifest,
+        sourcePathInventory: () => {
+          byteCall += 1
+          if (byteCall === 2) {
+            write(byteFixture.root, 'src/value.ts', 'export const value = 2\n')
+          }
+          return byteFixture.paths
         },
         captureCompiler: resolvedCompilerCapture,
       }),

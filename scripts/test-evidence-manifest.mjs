@@ -63,6 +63,7 @@ export const DECLARED_TEST_DOMAINS = Object.freeze({
     'presentation-system',
     'workspace',
   ],
+  'tests/e2e/lifecycle-drain.ts': ['build-environment', 'diagnostics'],
   'tests/e2e/markdown.spec.ts': ['presentation-system'],
   'tests/e2e/message-header.spec.ts': ['conversation', 'presentation-system'],
   'tests/e2e/mobile-shell.spec.ts': ['application-shell', 'presentation-system'],
@@ -108,6 +109,7 @@ export const DECLARED_TEST_DOMAINS = Object.freeze({
     'presentation-state',
     'presentation-system',
   ],
+  'tests/e2e/send-performance.spec.ts': ['conversation', 'generation', 'provider-io'],
   'tests/e2e/send-flow.spec.ts': ['conversation', 'generation', 'provider-io'],
   'tests/e2e/sidebar.spec.ts': ['catalog', 'organization', 'presentation-system'],
   'tests/e2e/startup-recovery.spec.ts': ['application-shell', 'schema-evolution', 'workspace'],
@@ -147,6 +149,7 @@ export const DECLARED_TEST_DOMAINS = Object.freeze({
     'storage-administration',
     'workspace',
   ],
+  'tests/unit/e2e-lifecycle-drain.test.ts': ['build-environment', 'diagnostics'],
   'tests/unit/fake-stream-server.test.ts': ['build-environment', 'provider-io'],
   'tests/unit/generation-path-audit.test.ts': ['conversation', 'generation'],
   'tests/unit/generated-workspace-fixture.test.ts': [
@@ -589,6 +592,31 @@ export const TEST_GUARANTEE_CLAIMS = Object.freeze([
         path: 'tests/e2e/large-workspace-startup.spec.ts',
         locator:
           "test('startup work and first interaction stay cardinality-bounded in a 4k-chat workspace'",
+      },
+    ],
+  },
+  {
+    id: 'isolated-send-critical-path-latency',
+    status: 'covered',
+    requiredProofKinds: ['performance', 'browser'],
+    rationale:
+      'The strict warm-send phase, lock and provider-dispatch budgets run in one single-worker project after each complete engine suite, so the measured wall clock contains application work rather than unrelated stress-worker scheduling.',
+    evidence: [
+      {
+        path: 'tests/e2e/send-performance.spec.ts',
+        locator: "test('bounds every warm existing-chat preparation phase and provider dispatch'",
+      },
+      {
+        path: 'playwright.config.ts',
+        locator: "name: 'chromium-send-performance'",
+      },
+      {
+        path: 'playwright.config.ts',
+        locator: "name: 'firefox-send-performance'",
+      },
+      {
+        path: 'tests/unit/e2e-runtime-boundary.test.ts',
+        locator: "expect(config).toContain('testMatch: sendPerformanceSpec')",
       },
     ],
   },

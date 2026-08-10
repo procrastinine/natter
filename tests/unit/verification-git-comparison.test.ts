@@ -86,6 +86,20 @@ describe('committed verification comparison', () => {
     )
   })
 
+  it('does not apply current explicit edges to dependencies absent from a historical tree', () => {
+    const capture = comparisonCapture({
+      'scripts/audit-e2e-browser-storage.mjs': {
+        bytes: Buffer.from('export const audit = true\n'),
+        executable: false,
+      },
+    })
+
+    const comparison = buildCommittedVerificationComparison({ manifest, capture })
+
+    expect(comparison.snapshot.graphDiagnostics).toEqual([])
+    expect(comparison.snapshot.dependencies['scripts/audit-e2e-browser-storage.mjs']).toEqual([])
+  })
+
   it('reads the fixed comparison commit from Git objects in four bounded processes', async () => {
     const startedAt = performance.now()
     const comparison = await materializeCommittedVerificationComparison()

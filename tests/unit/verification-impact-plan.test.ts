@@ -420,7 +420,11 @@ describe('verification slice impact planner', () => {
     const plan = planSliceVerification({ base: current, current: candidate })
 
     expect(obligation.status).toBe('open')
-    expect(obligationProofs.map((proof) => proof.kind).sort()).toEqual(['browser', 'integration'])
+    expect(obligationProofs.map((proof) => proof.kind).sort()).toEqual([
+      'browser',
+      'integration',
+      'performance',
+    ])
     expect(plan.impactedObligations).toContain(obligationId)
     expect(plan.tasks.vitest).toEqual(
       expect.arrayContaining([
@@ -429,7 +433,7 @@ describe('verification slice impact planner', () => {
         'tests/unit/ui-journey-invariant-recorder.test.ts',
       ]),
     )
-    expect(plan.tasks.playwright).toHaveLength(2)
+    expect(plan.tasks.playwright).toHaveLength(3)
     expect(plan.tasks.playwright[0]?.project).toBe('chromium')
     expect(plan.tasks.playwright[0]?.files).toEqual(
       expect.arrayContaining([
@@ -440,6 +444,10 @@ describe('verification slice impact planner', () => {
     expect(plan.tasks.playwright[1]).toEqual({
       project: 'chromium-large-workspace',
       files: ['tests/e2e/large-workspace-startup.spec.ts'],
+    })
+    expect(plan.tasks.playwright[2]).toEqual({
+      project: 'chromium-send-performance',
+      files: ['tests/e2e/send-performance.spec.ts'],
     })
     expect(plan.openGuarantees).toContainEqual({ id: `obligation:${obligationId}`, status: 'open' })
     expect(validateVerificationManifest({ current })).toEqual([])

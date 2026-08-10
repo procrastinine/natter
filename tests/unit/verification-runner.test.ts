@@ -260,10 +260,15 @@ describe('verification runner', () => {
       'exec',
       'playwright',
       'test',
-      '--project=chromium',
-      '--project=chromium-large-workspace',
+      '--project=chromium-send-performance',
     ])
-    expect(firefox.argv).toEqual(['pnpm', 'exec', 'playwright', 'test', '--project=firefox'])
+    expect(firefox.argv).toEqual([
+      'pnpm',
+      'exec',
+      'playwright',
+      'test',
+      '--project=firefox-send-performance',
+    ])
     expect(headed.argv).toEqual(['pnpm', 'run', 'e2e:headed-visibility'])
     expect(parity.argv).toEqual([
       'pnpm',

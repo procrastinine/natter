@@ -147,6 +147,11 @@ export const VERIFICATION_PROOFS = Object.freeze([
       'tests/e2e/send-flow.spec.ts',
     ],
   }),
+  proof('send-critical-path-browser', 'performance', {
+    runner: 'playwright',
+    project: 'chromium-send-performance',
+    files: ['tests/e2e/send-performance.spec.ts'],
+  }),
   proof('production-coordination', 'static', {
     runner: 'node',
     argv: ['scripts/audit-production-coordination.mjs'],
@@ -342,7 +347,11 @@ export const VERIFICATION_OBLIGATIONS = Object.freeze([
       'src/ui/chat/Message.tsx',
       'src/ui/chat/MessageStreamOverflow.tsx',
     ],
-    ['terminal-presentation-handoff-contract', 'terminal-presentation-handoff-browser'],
+    [
+      'terminal-presentation-handoff-contract',
+      'terminal-presentation-handoff-browser',
+      'send-critical-path-browser',
+    ],
     'open',
   ),
   obligation(

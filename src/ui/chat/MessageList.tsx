@@ -217,6 +217,7 @@ const MessageListSurface = memo(function MessageListSurface(props: MessageListSu
   } | null>(null)
   const historyDemandRevisionRef = useRef(0)
   const measuredVirtualMessageIdsRef = useRef(new Set<MessageId>())
+  const measuringHistoryGeometryRef = useRef(false)
   const generationContinuityRevisionRef = useRef(0)
   const generationContinuityIntentRef = useRef<GenerationContinuityIntent | null>(null)
   const [generationContinuityIntent, setGenerationContinuityIntent] =
@@ -596,8 +597,26 @@ const MessageListSurface = memo(function MessageListSurface(props: MessageListSu
   )
   const ignorePreVirtualMeasurementAdjustment = useCallback(() => false, [])
   const reconcileVirtualMessageGeometry = useCallback(() => {
+    if (measuringHistoryGeometryRef.current) return
     scrollRegionCommands?.reconcileLayoutAnchor()
   }, [scrollRegionCommands])
+  const measureVirtualMessageSize = useCallback(
+    (
+      element: HTMLDivElement,
+      entry: ResizeObserverEntry | undefined,
+      instance: Virtualizer<HTMLDivElement, HTMLDivElement>,
+    ) => {
+      const index = instance.indexFromElement(element)
+      const key = instance.options.getItemKey(index)
+      const box = entry?.borderBoxSize[0]
+      const size = box
+        ? Math.round(box[instance.options.horizontal ? 'inlineSize' : 'blockSize'])
+        : (instance.itemSizeCache.get(key) ?? element.offsetHeight)
+      if (size > 0) measuredVirtualMessageIdsRef.current.add(String(key))
+      return size
+    },
+    [],
+  )
   const adjustOnlyRowsBeforeLayoutAnchor = useCallback(
     (item: VirtualItem, _delta: number, instance: Virtualizer<HTMLDivElement, HTMLDivElement>) => {
       const anchorMessageId = scrollRegionCommands?.getLayoutAnchorMessageId() ?? null
@@ -632,10 +651,14 @@ const MessageListSurface = memo(function MessageListSurface(props: MessageListSu
     scrollToFn: applyVirtualizerScroll,
     rangeExtractor: extractVirtualMessageRange,
     anchorTo: shouldVirtualize ? 'end' : 'start',
-    useFlushSync: scrollRegionState === 'pinned' && generationContinuityIntent === null,
+    useFlushSync:
+      scrollRegionState === 'pinned' &&
+      generationContinuityIntent === null &&
+      historyDemandAnchor === null,
     directDomUpdates: shouldVirtualize,
     directDomUpdatesMode: 'position',
     onChange: reconcileVirtualMessageGeometry,
+    measureElement: measureVirtualMessageSize,
     enabled: measureVirtualRows,
   })
   messageVirtualizer.shouldAdjustScrollPositionOnItemSizeChange = shouldVirtualize
@@ -655,7 +678,6 @@ const MessageListSurface = memo(function MessageListSurface(props: MessageListSu
         ?.querySelector<HTMLElement>('[data-ui="message"][data-message-id]')
         ?.getAttribute('data-message-id')
       if (node && messageId) {
-        measuredVirtualMessageIdsRef.current.add(messageId)
         generationContinuityIntentRef.current?.messageIds.add(messageId)
       }
       messageVirtualizer.measureElement(node)
@@ -696,9 +718,37 @@ const MessageListSurface = memo(function MessageListSurface(props: MessageListSu
         )
   const renderedMessageCount = renderableMessageRows.length
   useLayoutEffect(() => {
-    if (!historyDemandAnchor || renderedMessageCount === 0) return
+    if (renderedMessageCount === 0) return
+    const anchorIndex = historyDemandAnchor
+      ? (renderableMessageIndexById.get(historyDemandAnchor.messageId) ?? -1)
+      : -1
+    if (historyDemandAnchor && anchorIndex > 0) {
+      measuringHistoryGeometryRef.current = true
+      try {
+        for (const element of virtualWindowRef.current?.querySelectorAll<HTMLDivElement>(
+          '[data-ui="message-virtual-row"][data-index]',
+        ) ?? []) {
+          const index = Number(element.dataset.index)
+          if (!Number.isInteger(index) || index < 0 || index >= anchorIndex) continue
+          const key = messageVirtualizer.options.getItemKey(index)
+          if (messageVirtualizer.itemSizeCache.has(key)) continue
+          const size = element.offsetHeight
+          if (size <= 0) continue
+          measuredVirtualMessageIdsRef.current.add(String(key))
+          messageVirtualizer.resizeItem(index, size)
+        }
+      } finally {
+        measuringHistoryGeometryRef.current = false
+      }
+    }
     scrollRegionCommands?.reconcileLayoutAnchor()
-  }, [historyDemandAnchor, renderedMessageCount, scrollRegionCommands])
+  }, [
+    historyDemandAnchor,
+    messageVirtualizer,
+    renderableMessageIndexById,
+    renderedMessageCount,
+    scrollRegionCommands,
+  ])
   const branchCountsKnown =
     !point &&
     renderableMessageRows.every(({ message }) => Boolean(branchSpine?.forkFor(message.id)))

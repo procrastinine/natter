@@ -362,7 +362,11 @@ function validateProofExecution({ proof, root, problems, checkFiles = true }) {
     return
   }
   if (execution.runner === 'playwright') {
-    if (!['chromium', 'chromium-large-workspace'].includes(execution.project)) {
+    if (
+      !['chromium', 'chromium-large-workspace', 'chromium-send-performance'].includes(
+        execution.project,
+      )
+    ) {
       problems.push(`VerificationBrowserSelectorUnsafe:${proof.id}:project=${execution.project}`)
     }
     for (const path of execution.files) {

@@ -54,7 +54,11 @@ test('renders a streamed code fence with a copy/download toolbar once closed', a
   await createChatAndOpen(page)
   await sendMessage(page, 'show code')
   const assistant = page.locator('[data-ui="message"][data-role="assistant"]').first()
-  await expect(assistant.locator('pre')).toContainText('const x = 1')
+  const codeBlock = assistant.locator('[data-streamdown="code-block"]')
+  await expect(codeBlock.locator('pre')).toContainText('const x = 1')
+  await expect(codeBlock.locator('[data-streamdown="code-block-copy-button"]')).toBeVisible()
+  await expect(codeBlock.locator('[data-streamdown="code-block-download-button"]')).toBeVisible()
+  await expect(codeBlock.locator('pre code span[style*="--sdm-c: #"]').first()).toBeVisible()
 })
 
 test('keeps oversized code bounded until Highlight anyway is explicit', async ({ page }) => {
