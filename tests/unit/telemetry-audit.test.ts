@@ -136,6 +136,8 @@ describe('tooling telemetry audit', () => {
     expect(packageJson.scripts.build).toBe('tsc -b && vite build && node scripts/verify-dist.mjs')
     expect(packageJson.scripts['e2e:production-startup']).toMatch(/^playwright test /u)
     expect(deploy).not.toContain('uses: ./.github/workflows/verify.yml')
+    expect(deploy).not.toContain('needs: verify')
+    expect(deploy).not.toContain('pnpm verify:ci')
     expect(deploy).toContain('needs: build_pages')
     expect(deploy).toContain('run: pnpm e2e:production-startup')
     expect(deploy).not.toContain('E2E_SERVER_MODE')

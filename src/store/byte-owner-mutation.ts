@@ -1049,10 +1049,6 @@ export function recordObsoleteByteOwnerBytes(tx: Transaction, obsoleteBytes: num
   accumulateStorageCompactionDebt(tx, obsoleteBytes)
 }
 
-export async function insertMessageBody(tx: Transaction, body: MessageBodyRow): Promise<void> {
-  await addPhysicalStorageRow<MessageBodyRow, string>(tx, 'messageBodies', body)
-}
-
 export async function replaceMessageBody(
   tx: Transaction,
   body: MessageBodyRow,

@@ -45,6 +45,8 @@ export interface BrowserWorkspaceOnlineReplacementContext {
   readonly destinationDatabaseName: string
   readonly signal: AbortSignal
   readonly preactivationCheckpoint: () => void
+  readonly awaitForegroundIdle: () => Promise<void>
+  readonly foregroundInterruptionSignal: () => AbortSignal
   readonly withSourceDatabase: <T>(operation: (source: NatterDb) => Promise<T>) => Promise<T>
   readonly runDestinationTransaction: <T>(
     tableNames: readonly string[],

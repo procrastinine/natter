@@ -1,4 +1,4 @@
-import { fireEvent, render } from '@testing-library/react'
+import { act, fireEvent, render, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { conversationActions } from '../../src/app/conversation-actions'
 import type {
@@ -41,13 +41,25 @@ vi.mock('../../src/ui/attachments/AttachmentRefChips', () => ({ AttachmentRefChi
 vi.mock('../../src/ui/chat/ToolEvidenceBlock', () => ({ ToolEvidenceBlock: () => null }))
 
 const CHAT_ID = 'chat-message-list'
-const STARTED_GENERATION = (): GenerationSubmission =>
-  Object.freeze({
+const STARTED_GENERATION = (): GenerationSubmission => startedGeneration(Promise.resolve())
+
+function startedGeneration(generationSettled: Promise<void>): GenerationSubmission {
+  return Object.freeze({
     kind: 'started',
     admission: Promise.resolve(Object.freeze({ kind: 'admitted' })),
     completion: Promise.resolve(Object.freeze({ kind: 'prepared' })),
+    generationSettled,
     cancel: () => undefined,
   })
+}
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  const promise = new Promise<T>((next) => {
+    resolve = next
+  })
+  return { promise, resolve }
+}
 const BASE_SETTINGS = cloneDefaultChatSettings()
 const NOOP_LOAD = () => {}
 const mutationSettlements = createInteractionSettlementHarness()
@@ -215,6 +227,55 @@ describe('message-list current presentation contract', () => {
 
     expect(view.container.querySelector('[data-message-id="message-6"]')).toBe(retained)
     expect(renderedIds).toEqual(['message-4', 'message-5'])
+  })
+
+  it('retains the bounded mounted residency across a generation branch handoff', async () => {
+    const fixture = branchFixture(12)
+    const snapshot = fixture.window(0, 12)
+    const settlement = deferred<void>()
+    const view = renderList(fixture, snapshot, {
+      onRegenerateMessage: () => startedGeneration(settlement.promise),
+    })
+    const log = view.getByRole('log')
+    const mountedCount = Number(log.getAttribute('data-mounted-count'))
+
+    expect(mountedCount).toBeGreaterThan(0)
+    expect(log).toHaveAttribute('data-generation-continuity-count', '0')
+
+    const regenerate = view.getAllByRole('button', { name: 'Regenerate response' }).at(-1)
+    if (!regenerate) throw new Error('Generation continuity trigger missing')
+    fireEvent.click(regenerate)
+
+    expect(log).toHaveAttribute('data-generation-continuity-count', String(mountedCount))
+    await act(async () => {
+      settlement.resolve()
+      await settlement.promise
+    })
+    await waitFor(() => expect(log).toHaveAttribute('data-generation-continuity-count', '0'))
+  })
+
+  it('extends the bounded generation lease to rows first mounted during the handoff', async () => {
+    const fixture = branchFixture(14)
+    const initial = fixture.window(2, 12)
+    const next = fixture.window(0, 12)
+    const settlement = deferred<void>()
+    const view = renderList(fixture, initial, {
+      onRegenerateMessage: () => startedGeneration(settlement.promise),
+    })
+    const log = view.getByRole('log')
+    const regenerate = view.getAllByRole('button', { name: 'Regenerate response' }).at(-1)
+    if (!regenerate) throw new Error('Generation continuity trigger missing')
+    fireEvent.click(regenerate)
+
+    view.rerender(listElement(fixture, next))
+    view.rerender(listElement(fixture, fixture.window(0, 12)))
+
+    expect(log).toHaveAttribute('data-generation-continuity-count', '12')
+    await act(async () => {
+      settlement.resolve()
+      await settlement.promise
+    })
+    await waitFor(() => expect(log).toHaveAttribute('data-generation-continuity-count', '0'))
   })
 
   it('materializes the complete context path once across passive window publications', () => {

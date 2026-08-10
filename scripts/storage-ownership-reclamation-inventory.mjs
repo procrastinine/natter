@@ -912,7 +912,7 @@ export const STORAGE_LIFECYCLE_PATHS = Object.freeze([
     'paged-compaction-copy',
     'src/store/browser-workspace-compaction.ts',
     'async function copyBrowserWorkspace(',
-    'Applies the physical manifest online in 64-row or 1-MiB pages, catches up per-table changed-key journals, and bounds the final quiesced activation to 256 rows or 4 MiB.',
+    'Applies the physical manifest online in 64-row or 1-MiB pages, batches each catch-up page in one transaction-owned request wave, and bounds the final quiesced activation to 256 rows or 4 MiB.',
     ['logical-debt-does-not-measure-physical-amplification'],
   ),
   lifecycle(

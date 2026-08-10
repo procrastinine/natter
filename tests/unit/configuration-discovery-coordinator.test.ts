@@ -92,7 +92,7 @@ describe('ConfigurationDiscoveryCoordinator', () => {
     coordinator.reset()
   })
 
-  it('clears a failed status when a replacement row keeps the same timestamp', async () => {
+  it('keeps a failed durable baseline settled across equivalent row rematerialization', async () => {
     let input = modelCatalogInput()
     const coordinator = new ConfigurationDiscoveryCoordinator({
       onChange: () => coordinator.reconcile(input),
@@ -108,7 +108,37 @@ describe('ConfigurationDiscoveryCoordinator', () => {
       ...input,
       modelCatalog: {
         ...input.modelCatalog,
-        models: { ...current, payload: { data: [{ id: 'test/replacement-model' }] } },
+        models: { ...current, payload: structuredClone(current.payload) },
+      },
+    }
+    coordinator.reconcile(input)
+
+    expect(coordinator.getSnapshot().statuses.models.error).toBe('offline')
+    expect(discovery.refreshModels).toHaveBeenCalledOnce()
+    coordinator.reset()
+  })
+
+  it('clears a failed status when a newer durable row replaces its baseline', async () => {
+    let input = modelCatalogInput()
+    const coordinator = new ConfigurationDiscoveryCoordinator({
+      onChange: () => coordinator.reconcile(input),
+    })
+    discovery.refreshModels.mockRejectedValueOnce(new Error('offline'))
+    coordinator.reconcile(input)
+    coordinator.requestModels(input.surface.profileId)
+    await vi.waitFor(() => expect(coordinator.getSnapshot().statuses.models.error).toBe('offline'))
+
+    const current = input.modelCatalog.models
+    if (!current) throw new Error('ExpectedModelsProjection')
+    input = {
+      ...input,
+      modelCatalog: {
+        ...input.modelCatalog,
+        models: {
+          ...current,
+          fetchedAt: current.fetchedAt + 1,
+          payload: { data: [{ id: 'test/replacement-model' }] },
+        },
       },
     }
     coordinator.reconcile(input)

@@ -13,6 +13,7 @@ import type {
   ChatId,
   ChatTag,
   FolderId,
+  TagId,
 } from '../core/types'
 import {
   ATTACHMENT_CATALOG_AGGREGATE_ID,
@@ -52,7 +53,7 @@ import type {
 } from './repository'
 
 const SIDEBAR_CURSOR_PREFIX = 'natter-sidebar-catalog:v1:'
-const SIDEBAR_PRESENTATION_CURSOR_PREFIX = 'natter-sidebar-presentation:v3:'
+const SIDEBAR_PRESENTATION_CURSOR_PREFIX = 'natter-sidebar-presentation:v4:'
 const ATTACHMENT_CURSOR_PREFIX = 'natter-attachment-catalog:v1:'
 const FOLDER_CATALOG_CURSOR_PREFIX = 'natter-folder-catalog:v1:'
 const TAG_CATALOG_CURSOR_PREFIX = 'natter-tag-catalog:v1:'
@@ -81,6 +82,8 @@ interface SidebarPresentationCursor {
   readonly activeFolder?: {
     readonly folderId: FolderId
     readonly empty: boolean
+    readonly remainingChatCount: number
+    readonly remainingPinnedChatCount: number
     readonly childCursor?: CatalogCursor
     readonly lastTimeGroup?: string
     readonly timeGroupSequence: number
@@ -92,6 +95,7 @@ type SidebarActiveFolderCursor = NonNullable<SidebarPresentationCursor['activeFo
 interface SidebarPresentationFolderEntry {
   readonly folder: ChatFolder
   readonly exactChatCount: number
+  readonly exactPinnedChatCount: number
   readonly pinned: boolean
   readonly primary: number | string
   readonly titleKey: string
@@ -103,6 +107,8 @@ interface SidebarRootSource {
   rows: ChatSidebarProjectionRow[]
   index: number
   complete: boolean
+  remainingChatCount: number
+  remainingPinnedChatCount: number
 }
 
 interface SidebarFilterContext {
@@ -287,8 +293,6 @@ export async function readSidebarPresentationPage(
       let resumedRows: SidebarPresentationRow[] = []
       let resumedActiveFolder = decoded?.activeFolder
       let resumedChildRowsRead = 0
-      let resumedCompletionProbeQueries = 0
-      let resumedCompletionProbeKeysRead = 0
       if (request.mode === 'expanded' && request.countMode === 'omit' && decoded?.activeFolder) {
         const activePage = await readActiveSidebarFolderPage(
           db.chatSidebarRows,
@@ -300,10 +304,14 @@ export async function readSidebarPresentationPage(
         resumedRows = activePage.rows
         resumedActiveFolder = activePage.activeFolder
         resumedChildRowsRead = activePage.rowsRead
-        resumedCompletionProbeQueries = activePage.completionProbeQueries
-        resumedCompletionProbeKeysRead = activePage.completionProbeKeysRead
         if (resumedActiveFolder) {
-          const metadata = await readSidebarPresentationMetadata(db, resumedRows, signal)
+          const metadata = await readSidebarPresentationMetadata(
+            db,
+            resumedRows,
+            request.knownFolderIds,
+            request.knownTagIds,
+            signal,
+          )
           return {
             rows: resumedRows,
             nextCursor: encodeSidebarPresentationCursor({
@@ -320,8 +328,6 @@ export async function readSidebarPresentationPage(
               folderChildRowsRead: resumedChildRowsRead,
               folderCatalogRowsRead: 0,
               tagCatalogRowsRead: metadata.tags.length,
-              completionProbeQueries: resumedCompletionProbeQueries,
-              completionProbeKeysRead: resumedCompletionProbeKeysRead,
               createdAtGroupProbeQueries: 0,
               createdAtGroupProbeKeysRead: 0,
             },
@@ -362,7 +368,13 @@ export async function readSidebarPresentationPage(
               rootCursors: {},
             })
           : undefined
-        const metadata = await readSidebarPresentationMetadata(db, rows, signal)
+        const metadata = await readSidebarPresentationMetadata(
+          db,
+          rows,
+          request.knownFolderIds,
+          request.knownTagIds,
+          signal,
+        )
         return {
           rows,
           ...(nextCursor ? { nextCursor } : {}),
@@ -379,8 +391,6 @@ export async function readSidebarPresentationPage(
             folderChildRowsRead: 0,
             folderCatalogRowsRead: metadata.folders.length,
             tagCatalogRowsRead: metadata.tags.length,
-            completionProbeQueries: 0,
-            completionProbeKeysRead: 0,
             createdAtGroupProbeQueries: 0,
             createdAtGroupProbeKeysRead: 0,
           },
@@ -392,13 +402,21 @@ export async function readSidebarPresentationPage(
         ...(decoded?.rootCursors ?? {}),
       }
       const sourceBatchSize = Math.max(2, Math.ceil((limit + 1) / rootFolderKeys.length))
-      const sources: SidebarRootSource[] = rootFolderKeys.map((folderKey) => ({
-        folderKey,
-        ...(rootCursors[folderKey] ? { cursor: rootCursors[folderKey] } : {}),
-        rows: [],
-        index: 0,
-        complete: false,
-      }))
+      const sources: SidebarRootSource[] = rootFolderKeys.map((folderKey) => {
+        const cursor = rootCursors[folderKey]
+        return {
+          folderKey,
+          ...(cursor ? { cursor } : {}),
+          rows: [],
+          index: 0,
+          complete: false,
+          remainingChatCount: aggregate.rootVisibleCount - (decoded?.rootRowsEmitted ?? 0),
+          remainingPinnedChatCount:
+            cursor?.pinnedKey === 0
+              ? 0
+              : aggregate.rootVisiblePinnedCount - (decoded?.rootRowsEmitted ?? 0),
+        }
+      })
       const folderBatch = await readSidebarFolderPresentationBatch(
         db.chatSidebarAggregates,
         request.sort,
@@ -412,8 +430,6 @@ export async function readSidebarPresentationPage(
       const rows: SidebarPresentationRow[] = [...resumedRows]
       let rootChatRowsRead = 0
       let folderChildRowsRead = resumedChildRowsRead
-      let completionProbeQueries = resumedCompletionProbeQueries
-      let completionProbeKeysRead = resumedCompletionProbeKeysRead
       const collapsedFolders = new Set(request.collapsedFolderIds)
 
       const fillSource = (source: SidebarRootSource) => {
@@ -426,13 +442,15 @@ export async function readSidebarPresentationPage(
           request.sort,
           source.cursor,
           sourceBatchSize,
+          source.remainingChatCount,
+          source.remainingPinnedChatCount,
         ).then((page) => {
           source.rows = page.rows
           source.index = 0
           source.complete = page.complete
+          source.remainingChatCount -= page.rows.length
+          source.remainingPinnedChatCount -= page.rows.filter((row) => row.pinnedKey === 1).length
           rootChatRowsRead += page.rows.length
-          completionProbeQueries += page.completionProbeQueries
-          completionProbeKeysRead += page.completionProbeKeysRead
           throwIfAborted(signal)
         })
       }
@@ -448,8 +466,6 @@ export async function readSidebarPresentationPage(
           )
           rows.push(...childPage.rows)
           folderChildRowsRead += childPage.rowsRead
-          completionProbeQueries += childPage.completionProbeQueries
-          completionProbeKeysRead += childPage.completionProbeKeysRead
           activeFolder = childPage.activeFolder
           if (rows.length >= limit) break
           continue
@@ -482,6 +498,8 @@ export async function readSidebarPresentationPage(
             activeFolder = {
               folderId: folderEntry.folder.id,
               empty: folderEntry.exactChatCount === 0,
+              remainingChatCount: folderEntry.exactChatCount,
+              remainingPinnedChatCount: folderEntry.exactPinnedChatCount,
               timeGroupSequence: 0,
             }
           }
@@ -516,7 +534,13 @@ export async function readSidebarPresentationPage(
             rootCursors,
             ...(activeFolder ? { activeFolder } : {}),
           })
-      const metadata = await readSidebarPresentationMetadata(db, rows, signal)
+      const metadata = await readSidebarPresentationMetadata(
+        db,
+        rows,
+        request.knownFolderIds,
+        request.knownTagIds,
+        signal,
+      )
       return {
         rows,
         ...(nextCursor ? { nextCursor } : {}),
@@ -533,8 +557,6 @@ export async function readSidebarPresentationPage(
           folderChildRowsRead,
           folderCatalogRowsRead: folderBatch.length,
           tagCatalogRowsRead: metadata.tags.length,
-          completionProbeQueries,
-          completionProbeKeysRead,
           createdAtGroupProbeQueries: 0,
           createdAtGroupProbeKeysRead: 0,
         },
@@ -553,8 +575,6 @@ function readActiveSidebarFolderPage(
   rows: SidebarPresentationRow[]
   activeFolder?: SidebarActiveFolderCursor
   rowsRead: number
-  completionProbeQueries: number
-  completionProbeKeysRead: number
 }> {
   if (initial.empty) {
     return Dexie.Promise.resolve({
@@ -566,8 +586,6 @@ function readActiveSidebarFolderPage(
         },
       ],
       rowsRead: 0,
-      completionProbeQueries: 0,
-      completionProbeKeysRead: 0,
     })
   }
   let activeFolder = { ...initial }
@@ -577,6 +595,8 @@ function readActiveSidebarFolderPage(
     request.sort,
     activeFolder.childCursor,
     Math.max(1, limit),
+    activeFolder.remainingChatCount,
+    activeFolder.remainingPinnedChatCount,
   ).then((page) => {
     throwIfAborted(signal)
     const rows: SidebarPresentationRow[] = []
@@ -616,12 +636,16 @@ function readActiveSidebarFolderPage(
         childCursor: catalogCursorForPresentationRow(child, request.sort),
       }
     }
+    activeFolder = {
+      ...activeFolder,
+      remainingChatCount: initial.remainingChatCount - page.rows.length,
+      remainingPinnedChatCount:
+        initial.remainingPinnedChatCount - page.rows.filter((row) => row.pinnedKey === 1).length,
+    }
     return {
       rows,
       ...(page.complete ? {} : { activeFolder }),
       rowsRead: page.rows.length,
-      completionProbeQueries: page.completionProbeQueries,
-      completionProbeKeysRead: page.completionProbeKeysRead,
     }
   })
 }
@@ -640,6 +664,7 @@ function sidebarPresentationFolderEntry(
   return {
     folder: { ...row.folder },
     exactChatCount: row.visibleCount,
+    exactPinnedChatCount: row.visiblePinnedCount,
     pinned: row.visiblePinnedCount > 0,
     primary,
     titleKey: row.folderTitleSortKey,
@@ -704,16 +729,26 @@ function folderCatalogCursor(
 async function readSidebarPresentationMetadata(
   db: NatterDb,
   rows: readonly SidebarPresentationRow[],
+  knownFolderIds: readonly FolderId[] | undefined,
+  knownTagIds: readonly TagId[] | undefined,
   signal?: AbortSignal,
 ): Promise<{ folders: ChatFolder[]; tags: ChatTag[] }> {
+  const knownFolders = new Set(knownFolderIds)
+  const knownTags = new Set(knownTagIds)
   const folders = new Map<FolderId, ChatFolder>()
   const folderIds = new Set<FolderId>()
-  const tagIds = new Set<string>()
+  const tagIds = new Set<TagId>()
   for (const row of rows) {
-    if (row.kind === 'folder') folders.set(row.folder.id, { ...row.folder })
+    if (row.kind === 'folder' && !knownFolders.has(row.folder.id)) {
+      folders.set(row.folder.id, { ...row.folder })
+    }
     if (row.kind === 'chat') {
-      if (row.chat.folderId) folderIds.add(row.chat.folderId)
-      for (const tagId of row.chat.tags) tagIds.add(tagId)
+      if (row.chat.folderId && !knownFolders.has(row.chat.folderId)) {
+        folderIds.add(row.chat.folderId)
+      }
+      for (const tagId of row.chat.tags) {
+        if (!knownTags.has(tagId)) tagIds.add(tagId)
+      }
     }
   }
   for (const folderId of folders.keys()) folderIds.delete(folderId)
@@ -838,97 +873,71 @@ function readVisibleFolderChatBatch(
   sort: SidebarPresentationRequest['sort'],
   cursor: CatalogCursor | undefined,
   limit: number,
+  remainingChatCount: number,
+  remainingPinnedChatCount: number,
 ): Promise<{
   rows: ChatSidebarProjectionRow[]
   complete: boolean
-  completionProbeQueries: number
-  completionProbeKeysRead: number
 }> {
+  if (
+    !Number.isSafeInteger(remainingChatCount) ||
+    remainingChatCount < 0 ||
+    !Number.isSafeInteger(remainingPinnedChatCount) ||
+    remainingPinnedChatCount < 0 ||
+    remainingPinnedChatCount > remainingChatCount
+  ) {
+    throw new Error('ChatSidebarPresentationAggregateMismatch')
+  }
+  if (remainingChatCount === 0) {
+    return Dexie.Promise.resolve({
+      rows: [],
+      complete: true,
+    })
+  }
   const field = sidebarSortField(sort)
   const ascending = sidebarSortDirection(sort) === 'asc'
   const rows: ChatSidebarProjectionRow[] = []
-  const target = Math.max(1, Math.min(500, limit))
-  let bucket: 0 | 1 = cursor?.pinnedKey ?? 1
-  let bucketCursor = cursor
-  let exhausted = false
+  const target = Math.max(1, Math.min(500, limit, remainingChatCount))
+  let pinnedRemaining = remainingPinnedChatCount
+  let unpinnedRemaining = remainingChatCount - remainingPinnedChatCount
+  let bucket: 0 | 1 = pinnedRemaining > 0 ? 1 : 0
+  let bucketCursor = cursor?.pinnedKey === bucket ? cursor : undefined
   const readNext = (): Dexie.Promise<void> => {
-    if (rows.length >= target || exhausted) return Dexie.Promise.resolve()
-    const remaining = target - rows.length
+    if (rows.length >= target) return Dexie.Promise.resolve()
+    const bucketRemaining = bucket === 1 ? pinnedRemaining : unpinnedRemaining
+    if (bucketRemaining === 0) {
+      if (bucket === 0) return Dexie.Promise.resolve()
+      bucket = 0
+      bucketCursor = cursor?.pinnedKey === 0 ? cursor : undefined
+      return readNext()
+    }
+    const expected = Math.min(target - rows.length, bucketRemaining)
     return folderSidebarScanCollection(table, folderKey, field, ascending, bucket, bucketCursor)
-      .limit(remaining)
+      .limit(expected)
       .toArray()
       .then((batch) => {
         for (const row of batch) assertSidebarProjection(row)
+        if (batch.length !== expected) {
+          throw new Error('ChatSidebarPresentationAggregateMismatch')
+        }
         rows.push(...batch)
-        if (batch.length === remaining) return
         if (bucket === 1) {
-          bucket = 0
-          bucketCursor = undefined
+          pinnedRemaining -= batch.length
         } else {
-          exhausted = true
+          unpinnedRemaining -= batch.length
         }
         return readNext()
       })
   }
   return readNext().then(() => {
-    if (exhausted || rows.length === 0) {
-      return {
-        rows,
-        complete: exhausted,
-        completionProbeQueries: 0,
-        completionProbeKeysRead: 0,
-      }
+    if (rows.length !== target) {
+      throw new Error('ChatSidebarPresentationAggregateMismatch')
     }
-    return probeVisibleFolderChatAfter(
-      table,
-      folderKey,
-      sort,
-      catalogCursorForPresentationRow(rows.at(-1) as ChatSidebarProjectionRow, sort),
-    ).then((completion) => ({
+    return {
       rows,
-      complete: !completion.hasNext,
-      completionProbeQueries: completion.queries,
-      completionProbeKeysRead: completion.keysRead,
-    }))
-  })
-}
-
-function probeVisibleFolderChatAfter(
-  table: Table<ChatSidebarProjectionRow, ChatId>,
-  folderKey: string,
-  sort: SidebarPresentationRequest['sort'],
-  cursor: CatalogCursor,
-): Promise<{ hasNext: boolean; queries: number; keysRead: number }> {
-  const field = sidebarSortField(sort)
-  const ascending = sidebarSortDirection(sort) === 'asc'
-  let queries = 0
-  let keysRead = 0
-  const pinnedKeys = cursor.pinnedKey === 1 ? ([1, 0] as const) : ([0] as const)
-  const probe = (
-    index: number,
-  ): Dexie.Promise<{ hasNext: boolean; queries: number; keysRead: number }> => {
-    const pinnedKey = pinnedKeys[index]
-    if (pinnedKey === undefined) {
-      return Dexie.Promise.resolve({ hasNext: false, queries, keysRead })
+      complete: target === remainingChatCount,
     }
-    return folderSidebarScanCollection(
-      table,
-      folderKey,
-      field,
-      ascending,
-      pinnedKey,
-      pinnedKey === cursor.pinnedKey ? cursor : undefined,
-    )
-      .limit(1)
-      .primaryKeys()
-      .then((keys) => {
-        queries += 1
-        keysRead += keys.length
-        if (keys.length > 0) return { hasNext: true, queries, keysRead }
-        return probe(index + 1)
-      })
-  }
-  return probe(0)
+  })
 }
 
 function folderSidebarScanCollection(
@@ -1085,6 +1094,14 @@ function decodeSidebarPresentationCursor(
       if (
         typeof value.activeFolder.folderId !== 'string' ||
         typeof value.activeFolder.empty !== 'boolean' ||
+        !Number.isSafeInteger(value.activeFolder.remainingChatCount) ||
+        value.activeFolder.remainingChatCount < 0 ||
+        !Number.isSafeInteger(value.activeFolder.remainingPinnedChatCount) ||
+        value.activeFolder.remainingPinnedChatCount < 0 ||
+        value.activeFolder.remainingPinnedChatCount > value.activeFolder.remainingChatCount ||
+        (value.activeFolder.empty
+          ? value.activeFolder.remainingChatCount !== 0
+          : value.activeFolder.remainingChatCount === 0) ||
         !Number.isSafeInteger(value.activeFolder.timeGroupSequence) ||
         value.activeFolder.timeGroupSequence < 0 ||
         (value.activeFolder.lastTimeGroup !== undefined &&

@@ -59,6 +59,7 @@ import { __resetBrowserRepositoryForTests } from '../../src/store/browser-repo'
 import type { BrowserWorkspaceReplacementMutationGrant } from '../../src/store/browser-workspace-contract'
 import { probeBrowserWorkspaceCurrent } from '../../src/store/browser-workspace-current-probe'
 import {
+  __resetBrowserWorkspaceControlDatabaseForTests,
   migrateBrowserWorkspaceCompactionState,
   readBrowserWorkspaceDatabaseManifest,
 } from '../../src/store/browser-workspace-database-control'
@@ -161,6 +162,7 @@ async function resetAll() {
   __resetStreamLeasesForTests()
   __resetLockTrackerForTests()
   __resetDbForTests()
+  __resetBrowserWorkspaceControlDatabaseForTests()
   await deleteNatterIndexedDatabasesForTests()
 }
 

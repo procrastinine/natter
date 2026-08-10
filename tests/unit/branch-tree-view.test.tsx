@@ -290,6 +290,7 @@ function startedGenerationResult(_messageId = 'generated'): GenerationSubmission
     kind: 'started' as const,
     admission: Promise.resolve(Object.freeze({ kind: 'admitted' as const })),
     completion: Promise.resolve(Object.freeze({ kind: 'prepared' as const })),
+    generationSettled: Promise.resolve(),
     cancel: () => undefined,
   })
 }

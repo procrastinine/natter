@@ -7,6 +7,7 @@ import {
   createChatAndOpen,
   firstChatId,
   holdIndexedDbStoreGate,
+  interactiveComposer,
   mockChatCompletions,
   readChatRow,
   readMessages,
@@ -378,13 +379,17 @@ test.describe('same-leaf composer admission', () => {
       await expect(
         second.locator(`[data-ui="message"][data-message-id="${baselineId}"]`),
       ).toBeVisible()
+      const firstComposer = interactiveComposer(page)
+      const secondComposer = interactiveComposer(second)
+      await expect(firstComposer).toBeVisible()
+      await expect(secondComposer).toBeVisible()
       await page.route(completionRoute, routeCompletion('simultaneous-a', 'accepted answer from A'))
       await second.route(
         completionRoute,
         routeCompletion('simultaneous-b', 'accepted answer from B'),
       )
-      await page.locator('[data-ui="composer-input"]').fill('same-chat A')
-      await second.locator('[data-ui="composer-input"]').fill('same-chat B')
+      await firstComposer.locator('[data-ui="composer-input"]').fill('same-chat A')
+      await secondComposer.locator('[data-ui="composer-input"]').fill('same-chat B')
       const admissionLockName = `chat-meta:${chatId}`
       await page.evaluate(
         (lockName) =>
@@ -406,8 +411,8 @@ test.describe('same-leaf composer admission', () => {
       )
 
       await Promise.all([
-        page.locator('[data-ui="send"]').click(),
-        second.locator('[data-ui="send"]').click(),
+        firstComposer.locator('[data-ui="send"]').click(),
+        secondComposer.locator('[data-ui="send"]').click(),
       ])
       await expect
         .poll(() =>

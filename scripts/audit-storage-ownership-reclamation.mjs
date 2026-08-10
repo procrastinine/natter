@@ -186,6 +186,7 @@ export function auditStorageOwnershipReclamation(root, inventoryModule, initialP
   validateCompactionAttemptRelease(root, problems)
   validateSynchronousTransactionLocalDebtAccounting(root, problems)
   validateTransactionPromiseOwnership(root, problems)
+  validateCompactionTransactionPromiseOwnership(root, problems)
   validateControlDatabaseTransactionIsolation(root, problems)
   validateOrphanWorkspaceReclamation(root, problems)
   validateAcceptance(acceptance, problems)
@@ -391,6 +392,120 @@ function validateTransactionPromiseOwnership(root, problems) {
       node.forEachChild((child) => inspect(child, owned))
     }
     inspect(sourceFile)
+  }
+}
+
+function validateCompactionTransactionPromiseOwnership(root, problems) {
+  const relativePath = 'src/store/browser-workspace-compaction.ts'
+  const path = resolve(root, relativePath)
+  const source = readFileSync(path, 'utf8')
+  const sourceFile = sourceFileFor(path)
+  const required = [
+    'operation: (transaction: Transaction) => PromiseExtended<T> | T',
+    'function runSourceCompactionTransaction<T>(',
+    'function runDestinationCompactionTransaction<T>(',
+    "const transaction = backend.transaction([journalName, tableName], 'readonly')",
+    'const cursorRequest = journalStore.openCursor(',
+    'rows.forEach((journal, index) => {',
+    'const request = sourceStore.get(journal.sourceKey as IDBValidKey)',
+    'transaction.oncomplete = () => {',
+    '`observe-catchup:$' + '{tableName}`',
+    '`apply-catchup:$' + '{tableName}`',
+    "'observe-final-workspace-meta'",
+    "'finalize-workspace-meta'",
+  ]
+  for (const token of required) {
+    if (!source.includes(token)) {
+      problems.push(`compaction-transaction-owned-promise: missing ${token}`)
+    }
+  }
+  if (source.includes('journalTable.get(journal.id)')) {
+    problems.push('compaction-transaction-owned-promise: retained sequential journal reread')
+  }
+  const catchupRead = source.slice(
+    source.indexOf('async function readBrowserWorkspaceCatchupPage('),
+    source.indexOf('async function deactivateSourceCatchupJournals('),
+  )
+  for (const forbidden of ['runSourceCompactionTransaction(', '.toArray()', '.bulkGet(']) {
+    if (catchupRead.includes(forbidden)) {
+      problems.push(`compaction-transaction-owned-promise: catch-up read retained ${forbidden}`)
+    }
+  }
+  const transactionRunners = new Set([
+    'runSourceCompactionTransaction',
+    'runDestinationCompactionTransaction',
+  ])
+  const destinationReadMethods = new Set(['get', 'bulkGet', 'toArray', 'first', 'last', 'count'])
+  const destinationWriteMethods = new Set([
+    'add',
+    'bulkAdd',
+    'put',
+    'bulkPut',
+    'delete',
+    'bulkDelete',
+    'clear',
+    'modify',
+  ])
+  const visit = (node) => {
+    if (
+      ts.isCallExpression(node) &&
+      ts.isIdentifier(node.expression) &&
+      transactionRunners.has(node.expression.text)
+    ) {
+      const operation = node.arguments.at(-1)
+      if (
+        operation &&
+        (ts.isArrowFunction(operation) || ts.isFunctionExpression(operation)) &&
+        operation.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.AsyncKeyword)
+      ) {
+        const line =
+          sourceFile.getLineAndCharacterOfPosition(operation.getStart(sourceFile)).line + 1
+        problems.push(
+          `compaction-transaction-owned-promise: async transaction scope: ${relativePath}:${line}`,
+        )
+      }
+      if (
+        ts.isIdentifier(node.expression) &&
+        node.expression.text === 'runDestinationCompactionTransaction' &&
+        operation &&
+        (ts.isArrowFunction(operation) || ts.isFunctionExpression(operation))
+      ) {
+        const methods = new Set()
+        const collectMethods = (candidate) => {
+          if (
+            ts.isCallExpression(candidate) &&
+            ts.isPropertyAccessExpression(candidate.expression)
+          ) {
+            methods.add(candidate.expression.name.text)
+          }
+          candidate.forEachChild(collectMethods)
+        }
+        collectMethods(operation.body)
+        const reads = [...methods].filter((method) => destinationReadMethods.has(method))
+        const writes = [...methods].filter((method) => destinationWriteMethods.has(method))
+        if (reads.length > 0 && writes.length > 0) {
+          const line =
+            sourceFile.getLineAndCharacterOfPosition(operation.getStart(sourceFile)).line + 1
+          problems.push(
+            `compaction-transaction-owned-promise: destination read/write continuation: ${relativePath}:${line}: reads=${reads.join(',')}: writes=${writes.join(',')}`,
+          )
+        }
+      }
+    }
+    node.forEachChild(visit)
+  }
+  visit(sourceFile)
+
+  const workspaceMetaPath = resolve(root, 'src/store/workspace-meta.ts')
+  const workspaceMeta = readFileSync(workspaceMetaPath, 'utf8')
+  for (const signature of [
+    'export function readBrowserWorkspaceMetaFromTransaction(',
+    'export function markBrowserWorkspaceReplaced(',
+    '): PromiseExtended<',
+  ]) {
+    if (!workspaceMeta.includes(signature)) {
+      problems.push(`compaction-transaction-owned-promise: workspace meta missing ${signature}`)
+    }
   }
 }
 
@@ -622,7 +737,7 @@ function validateOrphanWorkspaceReclamation(root, problems) {
     'retries a peer-held inactive workspace only after a later retention invalidation',
     'does no slot work while a durable replacement journal is pending',
     'returns immediately without reading or deleting when selection is in progress',
-    'revalidates after the slot lock and never deletes a candidate that became active',
+    'holds selection continuously from candidate revalidation through physical deletion',
     'contains a delete failure to the failed slot without poisoning other reclamation',
   ]) {
     if (countOccurrences(proofs, proof) !== 1) {
@@ -652,6 +767,7 @@ function validateWorkspaceReplacementLifecycle(root, problems) {
   const proofs = [
     'tests/unit/browser-workspace-database-control.test.ts',
     'tests/unit/browser-workspace-replacement-transition.test.ts',
+    'tests/unit/db-open-recovery.test.ts',
     'tests/unit/storage-retention.test.ts',
   ]
     .map((path) => readFileSync(resolve(root, path), 'utf8'))
@@ -659,9 +775,14 @@ function validateWorkspaceReplacementLifecycle(root, problems) {
 
   for (const [source, token, expected, label] of [
     [control, "readonly phase: 'discard'", 1, 'durable discard journal variant'],
-    [cleanup, 'await abandonPreparedBrowserWorkspaceDatabase(journal)', 2, 'cleanup abandon'],
+    [
+      cleanup,
+      'await abandonPreparedBrowserWorkspaceDatabase(expected)',
+      1,
+      'selection-owned cleanup abandon',
+    ],
     [cleanup, 'withExclusiveBrowserWorkspaceSlots(', 1, 'obsolete-slot lock'],
-    [cleanup, 'withBrowserWorkspaceSelectionGate(', 1, 'peer recovery selection gate'],
+    [cleanup, 'withBrowserWorkspaceSelectionGate(', 2, 'peer recovery and cleanup selection gates'],
     [cleanup, 'await Dexie.delete(databaseName)', 1, 'physical obsolete-slot delete'],
     [
       cleanup,
@@ -691,6 +812,7 @@ function validateWorkspaceReplacementLifecycle(root, problems) {
     if (source.includes(token)) problems.push(`workspace-replacement: forbidden ${label}`)
   }
   for (const proof of [
+    'keeps a malformed authoritative source selected and cleans under one selection admission',
     'keeps active-slot selection ready while old-slot deletion waits on a peer',
     'cleans one journaled slot without enumerating or opening workspace stores',
     'waits on durable selection ownership then resumes before discarding an abandoned destination',

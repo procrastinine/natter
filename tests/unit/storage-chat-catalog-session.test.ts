@@ -1,7 +1,13 @@
 import { readdirSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { afterEach, beforeAll, beforeEach, describe, expect, expectTypeOf, it } from 'vitest'
-import type { ChatId, ChatSidebarRow, TokenCalibrationSample } from '../../src/core/types'
+import type {
+  ChatFolder,
+  ChatId,
+  ChatSidebarRow,
+  ChatTag,
+  TokenCalibrationSample,
+} from '../../src/core/types'
 import {
   openMountedRepositoryProjections,
   reconcileMountedRepositoryProjections,
@@ -407,6 +413,60 @@ describe('storage chat catalog session', () => {
       'omit',
     ])
   })
+
+  it('reuses mounted metadata for chat-only refreshes and invalidates exact affected buckets', async () => {
+    const source = new SyntheticSidebarPresentationSource(1, true)
+    const sidebar = createSidebarSessionController({
+      source,
+      firstPageSettlement: noSidebarFirstPageSettlement,
+    })
+    sidebarControllers.add(sidebar)
+    sidebar.request({
+      ...FENCE,
+      mode: 'expanded',
+      sort: 'updatedAt-desc',
+      collapsedFolderIds: [],
+      pageSize: 20,
+      createdAtGroupBoundaries: [100, 90, 40, -190],
+    })
+    await waitFor(() => sidebar.getSnapshot()?.status === 'ready')
+    expect(sidebar.getSnapshot()?.page.meta.tags.map((tag) => tag.id)).toEqual(['visible-tag'])
+    expect(sidebar.getSnapshot()?.page.meta.folders.map((folder) => folder.id)).toEqual([
+      'visible-folder',
+    ])
+
+    source.emit({
+      kind: 'invalidate',
+      ...FENCE,
+      dependencies: [{ kind: 'chat', chatIds: ['chat-000000'] }],
+    })
+    await waitFor(() => source.requests.length === 2 && sidebar.getSnapshot()?.status === 'ready')
+    expect(source.requests[1]?.knownTagIds).toEqual(['visible-tag'])
+    expect(source.requests[1]?.knownFolderIds).toEqual(['visible-folder'])
+    expect(sidebar.getSnapshot()?.page.meta.tags.map((tag) => tag.id)).toEqual(['visible-tag'])
+
+    source.emit({
+      kind: 'invalidate',
+      ...FENCE,
+      dependencies: [{ kind: 'tag', tagIds: ['visible-tag'] }],
+    })
+    await waitFor(() => source.requests.length === 3 && sidebar.getSnapshot()?.status === 'ready')
+    expect(source.requests[2]?.knownTagIds).toEqual([])
+    expect(source.requests[2]?.knownFolderIds).toEqual(['visible-folder'])
+    expect(sidebar.getSnapshot()?.page.meta.tags.map((tag) => tag.id)).toEqual(['visible-tag'])
+
+    source.emit({
+      kind: 'invalidate',
+      ...FENCE,
+      dependencies: [{ kind: 'folder', folderIds: ['visible-folder'] }],
+    })
+    await waitFor(() => source.requests.length === 4 && sidebar.getSnapshot()?.status === 'ready')
+    expect(source.requests[3]?.knownTagIds).toEqual(['visible-tag'])
+    expect(source.requests[3]?.knownFolderIds).toEqual([])
+    expect(sidebar.getSnapshot()?.page.meta.folders.map((folder) => folder.id)).toEqual([
+      'visible-folder',
+    ])
+  })
 })
 
 class SyntheticStorageCatalogSource implements StorageChatCatalogSessionSource {
@@ -577,9 +637,29 @@ class SyntheticSidebarPresentationSource implements SidebarPresentationSessionSo
   private nextPageReadGate: Promise<void> | null = null
   private nextPageFailure: Error | null = null
   private readonly count: number
+  private readonly withMetadata: boolean
+  private readonly listeners = new Set<{
+    apply: (effect: WorkspaceEffect) => void
+    recover: (effect: WorkspaceEffect) => void
+  }>()
+  private readonly folder: ChatFolder = {
+    id: 'visible-folder',
+    name: 'Visible folder',
+    sortIndex: 0,
+    createdAt: 1,
+    updatedAt: 1,
+  }
+  private readonly tag: ChatTag = {
+    id: 'visible-tag',
+    name: 'Visible tag',
+    nameLower: 'visible tag',
+    createdAt: 1,
+    updatedAt: 1,
+  }
 
-  constructor(count: number) {
+  constructor(count: number, withMetadata = false) {
     this.count = count
+    this.withMetadata = withMetadata
   }
 
   async readPage(
@@ -614,8 +694,12 @@ class SyntheticSidebarPresentationSource implements SidebarPresentationSessionSo
             exactTotalRows: this.count,
             exactVisibleChats: this.count,
             aggregate: aggregate(this.count),
-            folders: [],
-            tags: [],
+            folders:
+              this.withMetadata && !request.knownFolderIds?.includes(this.folder.id)
+                ? [this.folder]
+                : [],
+            tags:
+              this.withMetadata && !request.knownTagIds?.includes(this.tag.id) ? [this.tag] : [],
           }
         : {}),
       measurement: {
@@ -623,21 +707,25 @@ class SyntheticSidebarPresentationSource implements SidebarPresentationSessionSo
         folderChildRowsRead: 0,
         folderCatalogRowsRead: 0,
         tagCatalogRowsRead: 0,
-        completionProbeQueries: 0,
-        completionProbeKeysRead: 0,
         createdAtGroupProbeQueries: 0,
         createdAtGroupProbeKeysRead: 0,
       },
     })
   }
 
-  readonly subscribeEffects =
-    (
-      _apply: (effect: WorkspaceEffect) => void,
-      _recover: (effect: WorkspaceEffect) => void,
-    ): (() => void) =>
-    () =>
-      undefined
+  readonly subscribeEffects = (
+    apply: (effect: WorkspaceEffect) => void,
+    recover: (effect: WorkspaceEffect) => void,
+  ): (() => void) => {
+    const listener = { apply, recover }
+    this.listeners.add(listener)
+    return () => this.listeners.delete(listener)
+  }
+
+  emit(change: WorkspaceChange): void {
+    const effect = reduceWorkspaceChange(change, 'remote')
+    for (const listener of [...this.listeners]) listener.apply(effect)
+  }
 
   blockNextPageRead(): () => void {
     let release: () => void = () => undefined
@@ -665,8 +753,8 @@ class SyntheticSidebarPresentationSource implements SidebarPresentationSessionSo
       lastBranchUpdatedAt: index,
       archived: false,
       pinned: false,
-      folderId: null,
-      tags: [],
+      folderId: this.withMetadata ? this.folder.id : null,
+      tags: this.withMetadata ? [this.tag.id] : [],
       previewText: `Preview ${index}`,
     }
   }

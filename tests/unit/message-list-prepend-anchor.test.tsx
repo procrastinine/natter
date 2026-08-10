@@ -43,6 +43,7 @@ const STARTED_GENERATION = (): GenerationSubmission =>
     kind: 'started',
     admission: Promise.resolve(Object.freeze({ kind: 'admitted' })),
     completion: Promise.resolve(Object.freeze({ kind: 'prepared' })),
+    generationSettled: Promise.resolve(),
     cancel: () => undefined,
   })
 const mutationSettlements = createInteractionSettlementHarness()

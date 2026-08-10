@@ -7,7 +7,9 @@ import { BrowserWorkspaceBootstrapAuthorityRegistry } from '../../src/store/brow
 import {
   createWorkspaceRuntimeKernel,
   WORKSPACE_ROOT_REPLACEMENT_DISPOSITIONS,
+  WorkspaceForegroundDemandInterruptedError,
   WorkspaceMaintenancePreemptedError,
+  WorkspaceReplacementContenderPreemptedError,
   type WorkspaceWritePermit,
 } from '../../src/store/workspace-runtime'
 import {
@@ -383,6 +385,128 @@ describe('workspace runtime resource manifest', () => {
     expect(transitions).toEqual(['idle', 'idle'])
   })
 
+  it('holds maintenance checkpoints until every foreground demand owner releases', async () => {
+    const { runtime } = createRuntimeHarness()
+    const first = runtime.claimWorkspaceForegroundDemand()
+    const second = runtime.claimWorkspaceForegroundDemand()
+    let resumed = false
+    const checkpoint = runtime.awaitWorkspaceForegroundDemandIdle().then(() => {
+      resumed = true
+    })
+
+    await Promise.resolve()
+    expect(resumed).toBe(false)
+    runtime.releaseWorkspaceForegroundDemand(first)
+    await Promise.resolve()
+    expect(resumed).toBe(false)
+    runtime.releaseWorkspaceForegroundDemand(second)
+    await checkpoint
+    expect(resumed).toBe(true)
+  })
+
+  it('interrupts the current maintenance page once and opens a fresh interval after demand', () => {
+    const { runtime } = createRuntimeHarness()
+    const activeInterval = runtime.workspaceForegroundDemandInterruptionSignal()
+
+    const first = runtime.claimWorkspaceForegroundDemand()
+    const second = runtime.claimWorkspaceForegroundDemand()
+
+    expect(activeInterval.aborted).toBe(true)
+    expect(activeInterval.reason).toBeInstanceOf(WorkspaceForegroundDemandInterruptedError)
+    expect(runtime.workspaceForegroundDemandInterruptionSignal()).toBe(activeInterval)
+    runtime.releaseWorkspaceForegroundDemand(first)
+    expect(runtime.workspaceForegroundDemandInterruptionSignal()).toBe(activeInterval)
+    runtime.releaseWorkspaceForegroundDemand(second)
+    expect(runtime.workspaceForegroundDemandInterruptionSignal()).not.toBe(activeInterval)
+    expect(runtime.workspaceForegroundDemandInterruptionSignal().aborted).toBe(false)
+  })
+
+  it('lets an admitted replacement producer preempt active maintenance preparation', async () => {
+    const { runtime } = createRuntimeHarness()
+    const fence = { workspaceId: 'workspace-maintenance-preparation', replacementEpoch: 0 }
+    runtime.workspaceRuntimeInternal.beginReconciliation(fence)
+    runtime.workspaceRuntimeInternal.finishReconciliation(fence)
+    let maintenanceSignal: AbortSignal | undefined
+    const maintenance = runtime.tryRunWorkspaceActionIfIdle('maintenance', (permit) => {
+      maintenanceSignal = permit.signal
+      return new Promise<never>((_resolve, reject) => {
+        permit.signal.addEventListener('abort', () => reject(permit.signal.reason), {
+          once: true,
+        })
+      })
+    })
+    if (!maintenance) throw new Error('Expected maintenance preparation admission')
+
+    await runtime.runWorkspaceAction('workspace-replacement', (permit) => {
+      runtime.preemptWorkspaceMaintenancePreparation(permit)
+    })
+
+    expect(maintenanceSignal?.aborted).toBe(true)
+    expect(maintenanceSignal?.reason).toBeInstanceOf(WorkspaceMaintenancePreemptedError)
+    await expect(maintenance).rejects.toBeInstanceOf(WorkspaceMaintenancePreemptedError)
+  })
+
+  it('preempts only unpromoted replacement contenders for a durable peer transition', async () => {
+    const { runtime } = createRuntimeHarness()
+    const fence = { workspaceId: 'workspace-replacement-contender', replacementEpoch: 0 }
+    runtime.workspaceRuntimeInternal.beginReconciliation(fence)
+    runtime.workspaceRuntimeInternal.finishReconciliation(fence)
+    let contenderSignal: AbortSignal | undefined
+    const contender = runtime.runWorkspaceAction('workspace-replacement', (permit) => {
+      contenderSignal = permit.signal
+      return new Promise<never>((_resolve, reject) => {
+        permit.signal.addEventListener('abort', () => reject(permit.signal.reason), {
+          once: true,
+        })
+      })
+    })
+    const unrelated = runtime.runWorkspaceAction('import-export', () => Promise.resolve())
+
+    runtime.preemptWorkspaceReplacementContendersForRemoteTransition()
+
+    expect(contenderSignal?.aborted).toBe(true)
+    await expect(contender).rejects.toBeInstanceOf(WorkspaceReplacementContenderPreemptedError)
+    await expect(unrelated).resolves.toBeUndefined()
+  })
+
+  it('preempts sibling replacement contenders during atomic local promotion', async () => {
+    const { control, runtime } = createRuntimeHarness()
+    installNoopResourceManifest(control)
+    const fence = { workspaceId: 'workspace-local-replacement-contenders', replacementEpoch: 0 }
+    runtime.workspaceRuntimeInternal.beginReconciliation(fence)
+    runtime.workspaceRuntimeInternal.finishReconciliation(fence)
+    let ownerPermit: WorkspaceWritePermit | undefined
+    let contenderSignal: AbortSignal | undefined
+    let releaseOwner!: () => void
+    const ownerGate = new Promise<void>((resolve) => {
+      releaseOwner = resolve
+    })
+    const owner = runtime.runWorkspaceAction('workspace-replacement', async (permit) => {
+      ownerPermit = permit
+      await ownerGate
+    })
+    const contender = runtime.runWorkspaceAction('workspace-replacement', (permit) => {
+      contenderSignal = permit.signal
+      return new Promise<never>((_resolve, reject) => {
+        permit.signal.addEventListener('abort', () => reject(permit.signal.reason), {
+          once: true,
+        })
+      })
+    })
+    if (!ownerPermit) throw new Error('Expected replacement owner permit')
+
+    const authority = control.launchWorkspaceRuntimeReplacementNow('workspace-replacement', {
+      lineageId: ownerPermit.lineageId,
+      requireIdle: false,
+    })
+
+    expect(authority).not.toBeNull()
+    expect(contenderSignal?.aborted).toBe(true)
+    await expect(contender).rejects.toBeInstanceOf(WorkspaceReplacementContenderPreemptedError)
+    releaseOwner()
+    await owner
+  })
+
   it('refuses idle quiescence while a generation root is active and never aborts it', async () => {
     const { control, runtime } = createRuntimeHarness()
     const manifest = Object.fromEntries(
@@ -492,9 +616,10 @@ describe('workspace runtime resource manifest', () => {
       })
     })
 
-    const replacementAuthority = control.launchWorkspaceRuntimeReplacementNow('import-export', {
-      requireIdle: false,
-    })
+    const replacementAuthority = control.launchWorkspaceRuntimeReplacementNow(
+      'workspace-replacement',
+      { requireIdle: false },
+    )
     expect(replacementAuthority).not.toBeNull()
     const replacement = control.awaitWorkspaceRuntimeQuiesced()
 
@@ -577,7 +702,7 @@ describe('workspace runtime resource manifest', () => {
     await control.resumeWorkspaceRuntimeResources(opening)
     await control.finishWorkspaceRuntimeReconciliation(fence)
 
-    const replacement = control.launchWorkspaceRuntimeReplacementNow('import-export', {
+    const replacement = control.launchWorkspaceRuntimeReplacementNow('workspace-replacement', {
       requireIdle: false,
     })
     expect(replacement).not.toBeNull()
@@ -718,7 +843,7 @@ describe('workspace runtime resource manifest', () => {
     )
     let promoted = false
     const promotion = control
-      .launchWorkspaceRuntimeReplacementWhenUnblocked('import-export', {
+      .launchWorkspaceRuntimeReplacementWhenUnblocked('workspace-replacement', {
         lineageId: 'foreground-import',
         requireIdle: false,
       })
@@ -741,6 +866,48 @@ describe('workspace runtime resource manifest', () => {
     expect(() => runtime.runWorkspaceAction('conversation-generation', () => undefined)).toThrow(
       'WorkspaceRuntimeClosed:conversation-generation:QUIESCING',
     )
+    await control.awaitWorkspaceRuntimeQuiesced()
+  })
+
+  it('promotes maintenance from the settled release of one overlapping local root', async () => {
+    const { control, runtime } = createRuntimeHarness()
+    installNoopResourceManifest(control)
+    const fence = { workspaceId: 'workspace-maintenance-root-release', replacementEpoch: 0 }
+    runtime.workspaceRuntimeInternal.beginReconciliation(fence)
+    runtime.workspaceRuntimeInternal.finishReconciliation(fence)
+    let releaseLocalRoot!: () => void
+    const localRootGate = new Promise<void>((resolve) => {
+      releaseLocalRoot = resolve
+    })
+    let promoted = false
+
+    const maintenance = runtime.tryRunWorkspaceActionIfIdle('maintenance', async (permit) => {
+      const localRoot = runtime.runWorkspaceAction('chat-metadata', () => localRootGate)
+      const promotion = control
+        .launchWorkspaceRuntimeReplacementWhenUnblocked('maintenance', {
+          signal: permit.signal,
+          lineageId: permit.lineageId,
+          requireIdle: true,
+        })
+        .then((authority) => {
+          promoted = true
+          return authority
+        })
+
+      await Promise.resolve()
+      expect(promoted).toBe(false)
+      expect(runtime.getWorkspaceRuntimeState()).toBe('RUNNING')
+
+      releaseLocalRoot()
+      await localRoot
+      const authority = await promotion
+      expect(authority).not.toBeNull()
+    })
+    if (!maintenance) throw new Error('Expected maintenance admission')
+    await maintenance
+
+    expect(promoted).toBe(true)
+    expect(runtime.getWorkspaceRuntimeState()).toBe('QUIESCING')
     await control.awaitWorkspaceRuntimeQuiesced()
   })
 
@@ -783,7 +950,7 @@ describe('workspace runtime resource manifest', () => {
     const caller = new AbortController()
     const reason = new Error('replacement-caller-cancelled')
 
-    const authority = control.launchWorkspaceRuntimeReplacementNow('import-export', {
+    const authority = control.launchWorkspaceRuntimeReplacementNow('workspace-replacement', {
       signal: caller.signal,
       requireIdle: false,
     })
@@ -826,7 +993,7 @@ describe('workspace runtime resource manifest', () => {
     await control.awaitWorkspaceRuntimeQuiesced()
   })
 
-  it('promotes an admitted import lineage without a second active root', async () => {
+  it('promotes an admitted replacement lineage without a second active root', async () => {
     const { control, runtime } = createRuntimeHarness()
     installNoopResourceManifest(control)
     const fence = { workspaceId: 'workspace-import-replacement', replacementEpoch: 0 }
@@ -835,9 +1002,9 @@ describe('workspace runtime resource manifest', () => {
     let authoritySignal: AbortSignal | undefined
     let permitSignal: AbortSignal | undefined
 
-    await runtime.runWorkspaceAction('import-export', (permit) => {
+    await runtime.runWorkspaceAction('workspace-replacement', (permit) => {
       permitSignal = permit.signal
-      const authority = control.launchWorkspaceRuntimeReplacementNow('import-export', {
+      const authority = control.launchWorkspaceRuntimeReplacementNow('workspace-replacement', {
         lineageId: permit.lineageId,
         requireIdle: false,
       })

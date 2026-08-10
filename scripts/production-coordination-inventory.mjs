@@ -16,6 +16,7 @@ function exactSiteContracts(groups) {
 const MODULE_MUTABLE_IDS = Object.freeze([
   'src/app/conversation-actions-capability.ts#loaded',
   'src/app/router.ts#committedRouteSnapshot',
+  'src/app/router.ts#currentRouteForegroundDemand',
   'src/app/router.ts#currentRouteIntent',
   'src/app/router.ts#hashListenerInstalled',
   'src/app/router.ts#routeArrivalRevision',
@@ -52,6 +53,13 @@ const MODULE_MUTABLE_IDS = Object.freeze([
   'src/store/broadcast.ts#storageListenerInstalled',
   'src/store/browser-import-export.ts#materializationMetrics',
   'src/store/browser-repo.ts#singleton',
+  'src/store/browser-workspace-database-control.ts#browserWorkspaceControlDb',
+  'src/store/browser-workspace-database-control.ts#browserWorkspaceControlDbAccepting',
+  'src/store/browser-workspace-database-control.ts#browserWorkspaceControlDbActiveOperations',
+  'src/store/browser-workspace-database-control.ts#browserWorkspaceControlDbClose',
+  'src/store/browser-workspace-database-control.ts#browserWorkspaceControlDbIdle',
+  'src/store/browser-workspace-database-control.ts#browserWorkspaceControlDbOpening',
+  'src/store/browser-workspace-database-control.ts#browserWorkspaceControlDbResolveIdle',
   'src/store/browser-workspace-database-selection.ts#currentSelection',
   'src/store/browser-workspace-database-selection.ts#selectionPromise',
   'src/store/browser-workspace-lifecycle.ts#activeDatabaseSelection',
@@ -69,6 +77,7 @@ const MODULE_MUTABLE_IDS = Object.freeze([
   'src/store/browser-workspace-slot-coordination.ts#activeLease',
   'src/store/browser-workspace-slot-coordination.ts#coordinatorOwner',
   'src/store/configuration-workspace.ts#adapter',
+  'src/store/conversation-route-owner.ts#workspaceForegroundDemandPort',
   'src/store/conversation-workspace.ts#adapter',
   'src/store/db.ts#activeBrowserWorkspaceRepositoryOperations',
   'src/store/db.ts#browserWorkspaceAdmissionsOpen',
@@ -1149,15 +1158,18 @@ export const CONTROLLER_COLLECTION_CONTRACTS = Object.freeze({
     fields: [
       'activeChildren',
       'activeRoots',
+      'foregroundDemandIdleListeners',
+      'foregroundDemandOwners',
       'idleListeners',
       'listeners',
       'permitRecords',
       'rootReleaseListeners',
       'stateListeners',
     ],
-    bound: 'active permits and live subscribers for one exact runtime kernel',
+    bound:
+      'active permits, foreground demand leases, and live subscribers for one exact runtime kernel',
     cleanup:
-      'operation completion and paired unsubscribe remove entries; terminal kernel release drops the owner',
+      'operation completion, foreground intent settlement, and paired unsubscribe remove entries; terminal kernel release drops the owner',
     scope: 'workspace-authority-kernel',
   },
   'src/store/workspace-session-owner.ts#LoadedWorkspaceSessionOwnerRegistry': {
@@ -1777,18 +1789,6 @@ const LIFECYCLE_EXTERNAL_INGRESS_CONTRACTS = exactSiteContracts([
   },
   {
     ids: [
-      'src/store/browser-workspace-replacement-runner.ts|awaitOnlineReplacementAuthority|subscribeWorkspaceRuntimeIdle|1',
-      'src/store/browser-workspace-replacement-runner.ts|awaitOnlineReplacementAuthority|subscribeWorkspaceRuntimeState|1',
-    ],
-    scope: 'one-online-replacement-promotion-wait',
-    bound: 'two temporary event subscriptions for one exact staged replacement attempt',
-    installation:
-      'online preparation installs both only while it waits for the runtime to become promotable',
-    removalOwner: 'the request-local settlement or abort disposer',
-    cleanup: 'settlement removes both exact subscriptions and the optional abort listener',
-  },
-  {
-    ids: [
       'src/store/generation-admission-controller.ts|subscribeGenerationAdmissionPublication|subscribeWorkspaceRuntimeState|1',
     ],
     scope: 'one-generation-admission-capability-wait',
@@ -2293,29 +2293,27 @@ const LIFECYCLE_DIRECT_CALL_CONTRACTS = exactSiteContracts([
   },
   {
     ids: [
-      'src/store/browser-workspace-replacement-runner.ts|promote|launchImportExportWorkspaceRuntimeReplacementNow|1',
-      'src/store/browser-workspace-replacement-runner.ts|promote|tryLaunchMaintenanceWorkspaceRuntimeReplacementIfIdle|1',
-      'src/store/browser-workspace-replacement-runner.ts|promote|tryLaunchMaintenanceWorkspaceRuntimeReplacementIfIdle|2',
+      'src/store/browser-workspace-replacement-runner.ts|promote|launchRequiredWorkspaceRuntimeReplacementNow|1',
+      'src/store/browser-workspace-replacement-runner.ts|promoteWhenUnblocked|launchMaintenanceWorkspaceRuntimeReplacementWhenUnblocked|1',
     ],
     scope: 'workspace-replacement-call-edge',
     stage: 'replacement-root-atomic-promotion-and-quiesce',
-    ownership: 'synchronous-result-captured',
+    ownership: 'required-synchronous-or-maintenance-awaited',
     bound:
-      'one typed import-export or maintenance replacement-root promotion per admitted replacement selection',
+      'one typed required or event-driven maintenance replacement-root promotion per admitted replacement selection',
     cleanup:
       'the exact promoted authority supplies cancellation to every replacement admission boundary',
   },
   {
     ids: [
       'src/store/browser-workspace-replacement-runner.ts|performBrowserWorkspaceReplacementLaunch|getWorkspaceRuntimeControlSnapshot|1',
-      'src/store/browser-workspace-replacement-runner.ts|attempt|getWorkspaceRuntimeControlSnapshot|1',
       'src/store/browser-workspace-replacement-runner.ts|runGatedBrowserWorkspaceReplacementAttempt|getWorkspaceRuntimeControlSnapshot|1',
       'src/store/browser-workspace-replacement-runner.ts|runGatedBrowserWorkspaceReplacementAttempt|getWorkspaceRuntimeControlSnapshot|2',
     ],
     scope: 'workspace-replacement-call-edge',
     stage: 'replacement-admission-and-prepromotion-cleanup-state-read',
     ownership: 'synchronous',
-    bound: 'one admission read per launch loop plus two bounded reads around a gated attempt',
+    bound: 'one admission read per launch loop and two bounded reads around a gated attempt',
     cleanup: 'each immutable snapshot remains local to the active replacement attempt',
   },
   {
@@ -2609,6 +2607,13 @@ export const MUTABLE_MODULE_CONTRACTS = Object.freeze({
     cleanup:
       'workspace session invalidation and close replace the singleton before slot replacement',
   },
+  'src/store/browser-workspace-database-control.ts': {
+    scope: 'page-lifetime-control-database-owner',
+    bound:
+      'one control database instance, one coalesced open task, one admission flag, one active-operation count, and one idle/terminal-close transition',
+    cleanup:
+      'terminal workspace finalization stops admissions, awaits the idle barrier and closes the owner before origin deletion; ordinary versionchange closes only the physical connection so the next admitted operation can reopen it',
+  },
   'src/store/browser-workspace-database-selection.ts': {
     scope: 'workspace-selection-task',
     bound: 'one exact current selection and one shared in-flight physical selection promise',
@@ -2639,6 +2644,12 @@ export const MUTABLE_MODULE_CONTRACTS = Object.freeze({
     scope: 'workspace-adapter-slot',
     bound: 'one installed configuration repository adapter',
     cleanup: 'workspace dispose clears the adapter before repository replacement',
+  },
+  'src/store/conversation-route-owner.ts': {
+    scope: 'tab-route-foreground-demand-capability',
+    bound: 'one composition-installed claim port and one one-shot owner per active primary route',
+    cleanup:
+      'each route outcome or superseding primary route releases the exact owner; page teardown releases the composition slot',
   },
   'src/store/conversation-workspace.ts': {
     scope: 'workspace-adapter-slot',
@@ -2901,7 +2912,8 @@ export const LIFECYCLE_PRIMITIVE_MODULES = Object.freeze({
     'finishWorkspaceRuntimeReconciliation',
     'getWorkspaceRuntimeControlSnapshot',
     'installWorkspaceRuntimeResources',
-    'launchImportExportWorkspaceRuntimeReplacementNow',
+    'launchMaintenanceWorkspaceRuntimeReplacementWhenUnblocked',
+    'launchRequiredWorkspaceRuntimeReplacementNow',
     'noteWorkspaceRuntimeGatedChange',
     'resumeWorkspaceRuntimeResources',
     'sealWorkspaceRuntime',

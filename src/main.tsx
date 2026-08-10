@@ -10,6 +10,7 @@ import {
   openBrowserWorkspace,
 } from './store/browser-workspace-lifecycle'
 import { conversationController } from './store/conversation-controller'
+import { installWorkspacePresentationForegroundDemandPort } from './store/conversation-route-owner'
 import type { BrowserWorkspaceOpenOptions } from './store/presentation-contracts'
 import {
   awaitStorageAdministrationReady,
@@ -17,10 +18,27 @@ import {
   installStorageAdministrationResponder,
 } from './store/storage-administration'
 import { installWorkspaceRepositoryFactory } from './store/workspace-repository'
+import {
+  claimWorkspaceForegroundDemand,
+  releaseWorkspaceForegroundDemand,
+} from './store/workspace-runtime'
 import './app/theme.css'
 
 installPreloadErrorRecovery()
 installWorkspaceRepositoryFactory(getBrowserRepository)
+installWorkspacePresentationForegroundDemandPort({
+  claim: () => {
+    const owner = claimWorkspaceForegroundDemand()
+    let released = false
+    return Object.freeze({
+      release: () => {
+        if (released) return
+        released = true
+        releaseWorkspaceForegroundDemand(owner)
+      },
+    })
+  },
+})
 installBrowserWorkspaceLifecycle()
 installStorageAdministrationResponder()
 conversationController.setNavigationPort(browserConversationNavigationPort)

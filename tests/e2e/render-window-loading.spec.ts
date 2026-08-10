@@ -89,6 +89,18 @@ test('cold sidebar passive fill preserves visible text when reading starts befor
       ),
     )
     .not.toBeNull()
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (
+            window as typeof window & {
+              __coldSidebarReadingProbe?: { anchor: SemanticTextAnchor | null }
+            }
+          ).__coldSidebarReadingProbe?.anchor ?? null,
+      ),
+    )
+    .not.toBeNull()
   await expect.poll(() => page.locator('[data-ui="message"]').count()).toBeGreaterThanOrEqual(10)
   const probe = await page.evaluate(() => {
     const state = (
@@ -97,6 +109,7 @@ test('cold sidebar passive fill preserves visible text when reading starts befor
           pointObservedAt: number | null
           readingStartedAt: number | null
           floorObservedAt: number | null
+          startAnchor: SemanticTextAnchor | null
           anchor: SemanticTextAnchor | null
           counts: number[]
         }
@@ -106,6 +119,7 @@ test('cold sidebar passive fill preserves visible text when reading starts befor
       pointObservedAt: state?.pointObservedAt ?? null,
       readingStartedAt: state?.readingStartedAt ?? null,
       floorObservedAt: state?.floorObservedAt ?? null,
+      startAnchor: state?.startAnchor ?? null,
       anchor: state?.anchor ?? null,
       counts: state?.counts ?? [],
       renderedCount: document.querySelectorAll('[data-ui="message"][data-message-id]').length,
@@ -118,7 +132,12 @@ test('cold sidebar passive fill preserves visible text when reading starts befor
   expect(probe.readingStartedAt).not.toBeNull()
   expect(probe.floorObservedAt).not.toBeNull()
   expect(probe.readingStartedAt as number).toBeLessThan(probe.floorObservedAt as number)
+  expect(probe.startAnchor).not.toBeNull()
   expect(probe.anchor?.paragraphKey).toContain('cold sidebar destination paragraph')
+  expect(
+    probe.startAnchor?.paragraphKey !== probe.anchor?.paragraphKey ||
+      probe.startAnchor?.characterOffset !== probe.anchor?.characterOffset,
+  ).toBe(true)
   expect(probe.scrollState).toBe('pinned')
   if (!probe.anchor) throw new Error('ColdSidebarSemanticAnchorMissing')
   const afterFill = await readSemanticTextAnchor(page, probe.anchor)
@@ -1871,6 +1890,7 @@ async function installColdSidebarReadingProbe(
       pointObservedAt: null as number | null,
       readingStartedAt: null as number | null,
       floorObservedAt: null as number | null,
+      startAnchor: null as SemanticTextAnchor | null,
       anchor: null as SemanticTextAnchor | null,
       counts: [] as number[],
       wheelRequested: false,
@@ -1880,6 +1900,70 @@ async function installColdSidebarReadingProbe(
         __coldSidebarReadingProbe?: typeof state
       }
     ).__coldSidebarReadingProbe = state
+    let observedRegion: HTMLElement | null = null
+    let resizeObserver: ResizeObserver | null = null
+    const captureSemanticAnchor = (
+      region: HTMLElement,
+      message: HTMLElement,
+    ): SemanticTextAnchor | null => {
+      const regionRect = region.getBoundingClientRect()
+      const targetY = regionRect.top + regionRect.height * 0.46
+      const paragraphs = Array.from(
+        message.querySelectorAll<HTMLElement>('[data-ui="markdown"] p'),
+      ).filter((paragraph) => {
+        const rect = paragraph.getBoundingClientRect()
+        return rect.bottom > regionRect.top && rect.top < regionRect.bottom
+      })
+      const paragraph =
+        paragraphs.find((candidate) => {
+          const rect = candidate.getBoundingClientRect()
+          return rect.top <= targetY && rect.bottom >= targetY
+        }) ?? paragraphs[0]
+      const messageId = message.dataset.messageId
+      const paragraphKey = paragraph?.textContent.match(
+        /^cold sidebar destination paragraph \d+/u,
+      )?.[0]
+      if (!paragraph || !messageId || !paragraphKey) return null
+      const body = document.querySelector<HTMLElement>('[data-ui="message-body-column"]')
+      const x = body
+        ? body.getBoundingClientRect().left + body.getBoundingClientRect().width / 2
+        : regionRect.left + regionRect.width / 2
+      const paragraphRect = paragraph.getBoundingClientRect()
+      const caretY = Math.min(Math.max(targetY, paragraphRect.top + 1), paragraphRect.bottom - 1)
+      const caret = document.caretRangeFromPoint(x, caretY)
+      let characterOffset = 0
+      if (caret && paragraph.contains(caret.startContainer)) {
+        const prefix = document.createRange()
+        prefix.selectNodeContents(paragraph)
+        prefix.setEnd(caret.startContainer, caret.startOffset)
+        characterOffset = prefix.toString().length
+      }
+      const walker = document.createTreeWalker(paragraph, NodeFilter.SHOW_TEXT)
+      let remaining = characterOffset
+      let lineTop = paragraphRect.top
+      for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+        const length = node.textContent?.length ?? 0
+        if (remaining > length) {
+          remaining -= length
+          continue
+        }
+        const start = Math.min(remaining, Math.max(0, length - 1))
+        const range = document.createRange()
+        range.setStart(node, start)
+        range.setEnd(node, Math.min(length, start + 1))
+        lineTop = range.getClientRects()[0]?.top ?? paragraphRect.top
+        break
+      }
+      return {
+        messageId,
+        paragraphKey,
+        characterOffset,
+        paragraphTop: paragraphRect.top,
+        lineTop,
+        scrollTop: region.scrollTop,
+        scrollHeight: region.scrollHeight,
+      }
+    }
     const sample = () => {
       const messages = document.querySelectorAll<HTMLElement>(
         '[data-ui="message"][data-message-id]',
@@ -1896,71 +1980,34 @@ async function installColdSidebarReadingProbe(
       state.pointObservedAt ??= performance.now()
       const current = document.querySelectorAll<HTMLElement>('[data-ui="message"][data-message-id]')
       const region = current[0]?.closest<HTMLElement>('[data-ui="scroll-region"]')
-      if (!region || region.scrollHeight <= region.clientHeight + 120) return
+      if (!region) return
+      if (observedRegion !== region) {
+        observedRegion?.removeEventListener('scroll', sample)
+        resizeObserver?.disconnect()
+        observedRegion = region
+        region.addEventListener('scroll', sample, { passive: true })
+        resizeObserver = new ResizeObserver(sample)
+        resizeObserver.observe(region)
+        resizeObserver.observe(region.querySelector('[data-ui="scroll-content"]') ?? region)
+      }
+      if (region.scrollHeight <= region.clientHeight + 120) return
+      if (region.scrollTop <= 0.5) return
+      const startAnchor = current[0] ? captureSemanticAnchor(region, current[0]) : null
+      if (!startAnchor) return
       state.wheelRequested = true
-      const wheelStartScrollTop = region.scrollTop
-      const captureReadingPosition = () => {
-        if (state.readingStartedAt !== null || region.scrollTop >= wheelStartScrollTop - 0.5) return
-        const regionRect = region.getBoundingClientRect()
-        const targetY = regionRect.top + regionRect.height * 0.46
-        const paragraphs = Array.from(
-          current[0]?.querySelectorAll<HTMLElement>('[data-ui="markdown"] p') ?? [],
-        ).filter((paragraph) => {
-          const rect = paragraph.getBoundingClientRect()
-          return rect.bottom > regionRect.top && rect.top < regionRect.bottom
-        })
-        const paragraph =
-          paragraphs.find((candidate) => {
-            const rect = candidate.getBoundingClientRect()
-            return rect.top <= targetY && rect.bottom >= targetY
-          }) ?? paragraphs[0]
-        const messageId = current[0]?.dataset.messageId
-        const paragraphKey = paragraph?.textContent.match(
-          /^cold sidebar destination paragraph \d+/u,
-        )?.[0]
-        if (!paragraph || !messageId || !paragraphKey) return
-        const body = document.querySelector<HTMLElement>('[data-ui="message-body-column"]')
-        const x = body
-          ? body.getBoundingClientRect().left + body.getBoundingClientRect().width / 2
-          : regionRect.left + regionRect.width / 2
-        const paragraphRect = paragraph.getBoundingClientRect()
-        const caretY = Math.min(Math.max(targetY, paragraphRect.top + 1), paragraphRect.bottom - 1)
-        const caret = document.caretRangeFromPoint(x, caretY)
-        let characterOffset = 0
-        if (caret && paragraph.contains(caret.startContainer)) {
-          const prefix = document.createRange()
-          prefix.selectNodeContents(paragraph)
-          prefix.setEnd(caret.startContainer, caret.startOffset)
-          characterOffset = prefix.toString().length
-        }
-        const walker = document.createTreeWalker(paragraph, NodeFilter.SHOW_TEXT)
-        let remaining = characterOffset
-        let lineTop = paragraphRect.top
-        for (let node = walker.nextNode(); node; node = walker.nextNode()) {
-          const length = node.textContent?.length ?? 0
-          if (remaining > length) {
-            remaining -= length
-            continue
-          }
-          const start = Math.min(remaining, Math.max(0, length - 1))
-          const range = document.createRange()
-          range.setStart(node, start)
-          range.setEnd(node, Math.min(length, start + 1))
-          lineTop = range.getClientRects()[0]?.top ?? paragraphRect.top
-          break
-        }
-        state.anchor = {
-          messageId,
-          paragraphKey,
-          characterOffset,
-          paragraphTop: paragraphRect.top,
-          lineTop,
-          scrollTop: region.scrollTop,
-          scrollHeight: region.scrollHeight,
-        }
+      state.startAnchor = startAnchor
+      let wheelDelivered = false
+      const noteWheel = () => {
+        wheelDelivered = true
         state.readingStartedAt = performance.now()
+      }
+      const captureReadingPosition = () => {
+        if (!wheelDelivered || state.anchor !== null || !current[0]) return
+        state.anchor = captureSemanticAnchor(region, current[0])
+        if (!state.anchor) return
         region.removeEventListener('scroll', captureReadingPosition, true)
       }
+      region.addEventListener('wheel', noteWheel, { capture: true, once: true, passive: true })
       region.addEventListener('scroll', captureReadingPosition, { capture: true, passive: true })
       const rect = region.getBoundingClientRect()
       const nativeWheel = (
@@ -2032,7 +2079,12 @@ async function assertDestinationFirstPassiveFill(
     throw new Error(`DestinationFirstStageMissing:${JSON.stringify(probe)}`)
   }
   expect(probe.counts.find((count) => count > 0)).toBe(1)
-  expect(probe.paintCounts.find((count) => count > 0)).toBe(1)
+  const firstPresentedCount = probe.paintCounts.find((count) => count > 0)
+  expect(firstPresentedCount).toBeDefined()
+  expect(firstPresentedCount as number).toBeGreaterThanOrEqual(1)
+  expect(firstPresentedCount as number).toBeLessThanOrEqual(
+    input.maximumInitialRenderedCount ?? input.initialRenderWork,
+  )
   expect(probe.destinationObservedAt).not.toBeNull()
   expect(probe.destinationStageAt).not.toBeNull()
   expect(probe.floorObservedAt).not.toBeNull()

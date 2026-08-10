@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os'
 import { resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { afterEach, beforeAll, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it } from 'vitest'
 
 interface WorkMemoryReport {
   ok: boolean
@@ -78,35 +78,29 @@ const productionModuleInventory: unknown = JSON.parse(
   readFileSync(resolve(repoRoot, 'scripts/production-module-inventory.json'), 'utf8'),
 )
 const temporaryDirectories: string[] = []
-let cachedReport: WorkMemoryReport | undefined
-let defaultInventory: unknown
-let evaluateProductionWorkMemory: (
-  config: {
-    root: string
-    sourceRoot: string
-    inventory: unknown
-    moduleInventory: unknown
+const evaluateProductionWorkMemory = (
+  (await import(auditUrl)) as {
+    evaluateProductionWorkMemory: (
+      config: {
+        root: string
+        sourceRoot: string
+        inventory: unknown
+        moduleInventory: unknown
+      },
+      mode: 'inventory' | 'enforce',
+    ) => WorkMemoryReport
+  }
+).evaluateProductionWorkMemory
+const defaultInventory: unknown = await import(inventoryUrl)
+const cachedReport = evaluateProductionWorkMemory(
+  {
+    root: repoRoot,
+    sourceRoot: resolve(repoRoot, 'src'),
+    inventory: defaultInventory,
+    moduleInventory: productionModuleInventory,
   },
-  mode: 'inventory' | 'enforce',
-) => WorkMemoryReport
-
-beforeAll(async () => {
-  evaluateProductionWorkMemory = (
-    (await import(auditUrl)) as {
-      evaluateProductionWorkMemory: typeof evaluateProductionWorkMemory
-    }
-  ).evaluateProductionWorkMemory
-  defaultInventory = await import(inventoryUrl)
-  cachedReport = evaluateProductionWorkMemory(
-    {
-      root: repoRoot,
-      sourceRoot: resolve(repoRoot, 'src'),
-      inventory: defaultInventory,
-      moduleInventory: productionModuleInventory,
-    },
-    'inventory',
-  )
-}, 30_000)
+  'inventory',
+)
 
 afterEach(() => {
   for (const directory of temporaryDirectories.splice(0)) {
@@ -255,7 +249,6 @@ describe('production work and memory audit', () => {
 })
 
 function fullReport(): WorkMemoryReport {
-  if (!cachedReport) throw new Error('ProductionWorkMemoryReportUnavailable')
   return cachedReport
 }
 

@@ -4,7 +4,6 @@ import {
   WorkspaceReplacementOutcomeUnknownError,
   WorkspaceReplacementUncommittedRecoveryRequiredError,
 } from '../core/import-export/errors'
-import { errorFromUnknown } from '../lib/error'
 import { postWorkspaceChange } from './broadcast'
 import type {
   BrowserWorkspaceOnlineReplacementOperation,
@@ -37,6 +36,7 @@ import {
   createBrowserWorkspaceReplacementTransitionController,
 } from './browser-workspace-replacement-transition'
 import {
+  type BrowserWorkspaceSelectionGrant,
   browserWorkspaceSlotSwitchingSupported,
   postBrowserWorkspaceSlotQuiesce,
   tryWithBrowserWorkspaceSelectionGate,
@@ -57,19 +57,23 @@ import {
 } from './locks'
 import { readBrowserWorkspaceMeta, seedBrowserWorkspaceReplacementMeta } from './workspace-meta'
 import {
+  awaitWorkspaceForegroundDemandIdle,
   isWorkspaceMaintenancePreemptedError,
+  isWorkspaceReplacementContenderPreemptedError,
   isWorkspaceRuntimeClosedError,
+  preemptWorkspaceMaintenancePreparation,
+  runWorkspaceAction,
   runWorkspaceRead,
-  subscribeWorkspaceRuntimeIdle,
-  subscribeWorkspaceRuntimeState,
+  tryRunWorkspaceActionIfIdle,
   type WorkspaceReconcileAuthority,
   type WorkspaceRuntimeActionOptions,
+  workspaceForegroundDemandInterruptionSignal,
 } from './workspace-runtime'
 import {
   awaitWorkspaceRuntimeQuiesced,
   getWorkspaceRuntimeControlSnapshot,
-  launchImportExportWorkspaceRuntimeReplacementNow,
-  tryLaunchMaintenanceWorkspaceRuntimeReplacementIfIdle,
+  launchMaintenanceWorkspaceRuntimeReplacementWhenUnblocked,
+  launchRequiredWorkspaceRuntimeReplacementNow,
 } from './workspace-runtime-control'
 
 let reopenBrowserWorkspace: (() => Promise<void>) | null = null
@@ -82,11 +86,17 @@ type BrowserWorkspaceReplacementPreflight = (
   session: BrowserWorkspaceSession,
 ) => boolean | Promise<boolean>
 
-interface BrowserWorkspaceReplacementLaunchPolicy {
-  readonly admission: 'required' | 'if-idle'
-  readonly admissionOptions: WorkspaceRuntimeActionOptions
-  readonly promote: () => WorkspaceReconcileAuthority | null
-}
+type BrowserWorkspaceReplacementLaunchPolicy =
+  | {
+      readonly admission: 'required'
+      readonly admissionOptions: WorkspaceRuntimeActionOptions
+      readonly promote: () => WorkspaceReconcileAuthority | null
+    }
+  | {
+      readonly admission: 'if-idle'
+      readonly admissionOptions: WorkspaceRuntimeActionOptions
+      readonly promoteWhenUnblocked: () => Promise<WorkspaceReconcileAuthority | null>
+    }
 
 interface BrowserWorkspaceReplacementPromoted<T> {
   readonly kind: 'promoted'
@@ -129,39 +139,40 @@ export async function runBrowserWorkspaceReplacement<T>(
   operation: BrowserWorkspaceReplacementOperation<T>,
   options: WorkspaceRuntimeActionOptions = {},
 ): Promise<BrowserWorkspaceReplacementCommit<T>> {
-  const started = await launchBrowserWorkspaceReplacement(
-    {
-      admission: 'required',
-      admissionOptions: options,
-      promote: () => launchImportExportWorkspaceRuntimeReplacementNow(options),
-    },
-    preflight,
-    quiescedBrowserWorkspaceReplacementWork(operation),
-  )
-  if (started.kind === 'skipped') throw new Error('BrowserWorkspaceReplacementPreflightSkipped')
-  if (started.kind === 'blocked') throw new Error('BrowserWorkspaceReplacementAdmissionBlocked')
-  if (started.kind === 'cleanup-required') {
-    throw new Error('BrowserWorkspaceReplacementCleanupRequired')
+  for (;;) {
+    try {
+      const started = await runWorkspaceAction(
+        'workspace-replacement',
+        (permit) => {
+          preemptWorkspaceMaintenancePreparation(permit)
+          const authorityOptions = { signal: permit.signal, lineageId: permit.lineageId }
+          return launchBrowserWorkspaceReplacement(
+            {
+              admission: 'required',
+              admissionOptions: authorityOptions,
+              promote: () => launchRequiredWorkspaceRuntimeReplacementNow(authorityOptions),
+            },
+            preflight,
+            quiescedBrowserWorkspaceReplacementWork(operation),
+          )
+        },
+        options,
+      )
+      if (started.kind === 'skipped') {
+        throw new Error('BrowserWorkspaceReplacementPreflightSkipped')
+      }
+      if (started.kind === 'blocked') {
+        throw new Error('BrowserWorkspaceReplacementAdmissionBlocked')
+      }
+      if (started.kind === 'cleanup-required') {
+        throw new Error('BrowserWorkspaceReplacementCleanupRequired')
+      }
+      return started.handoff.completion
+    } catch (error) {
+      if (!isWorkspaceReplacementContenderPreemptedError(error)) throw error
+      await runWorkspaceRead('workspace-replacement', () => undefined, options)
+    }
   }
-  return started.handoff.completion
-}
-
-export function tryStartBrowserWorkspaceReplacementIfIdle<T>(
-  preflight: BrowserWorkspaceReplacementPreflight,
-  operation: BrowserWorkspaceReplacementOperation<T>,
-  options: WorkspaceRuntimeActionOptions = {},
-): Promise<BrowserWorkspaceReplacementStart<T>> {
-  const authorityOptions = options.lineageId ? { lineageId: options.lineageId } : {}
-  return launchBrowserWorkspaceReplacement(
-    {
-      admission: 'if-idle',
-      admissionOptions: options,
-      // Promotion closes the maintenance producer; the handoff authority owns execution.
-      promote: () => tryLaunchMaintenanceWorkspaceRuntimeReplacementIfIdle(authorityOptions),
-    },
-    preflight,
-    quiescedBrowserWorkspaceReplacementWork(operation),
-  )
 }
 
 export function tryStartBrowserWorkspaceOnlineReplacementIfIdle<Prepared, T>(
@@ -169,16 +180,27 @@ export function tryStartBrowserWorkspaceOnlineReplacementIfIdle<Prepared, T>(
   operation: BrowserWorkspaceOnlineReplacementOperation<Prepared, T>,
   options: WorkspaceRuntimeActionOptions = {},
 ): Promise<BrowserWorkspaceReplacementStart<T>> {
-  const authorityOptions = options.lineageId ? { lineageId: options.lineageId } : {}
-  return launchBrowserWorkspaceReplacement(
-    {
-      admission: 'if-idle',
-      admissionOptions: options,
-      promote: () => tryLaunchMaintenanceWorkspaceRuntimeReplacementIfIdle(authorityOptions),
+  const started = tryRunWorkspaceActionIfIdle(
+    'maintenance',
+    (permit) => {
+      const admissionOptions = { signal: permit.signal, lineageId: permit.lineageId }
+      return launchBrowserWorkspaceReplacement(
+        {
+          admission: 'if-idle',
+          admissionOptions,
+          promoteWhenUnblocked: () =>
+            launchMaintenanceWorkspaceRuntimeReplacementWhenUnblocked({
+              signal: permit.signal,
+              lineageId: permit.lineageId,
+            }),
+        },
+        preflight,
+        onlineBrowserWorkspaceReplacementWork(operation),
+      )
     },
-    preflight,
-    onlineBrowserWorkspaceReplacementWork(operation),
+    options,
   )
+  return started ?? Promise.resolve({ kind: 'blocked' })
 }
 
 function launchBrowserWorkspaceReplacement<T>(
@@ -272,18 +294,21 @@ async function runBrowserWorkspaceReplacementSelectionAttempt<T>(
 > {
   if (policy.admission === 'required') {
     return withBrowserWorkspaceSelectionGate(
-      () => runGatedBrowserWorkspaceReplacementAttempt(policy, preflight, work, onPromoted),
+      (selection) =>
+        runGatedBrowserWorkspaceReplacementAttempt(selection, policy, preflight, work, onPromoted),
       policy.admissionOptions.signal,
     )
   }
   const result = await tryWithBrowserWorkspaceSelectionGate(
-    () => runGatedBrowserWorkspaceReplacementAttempt(policy, preflight, work, onPromoted),
+    (selection) =>
+      runGatedBrowserWorkspaceReplacementAttempt(selection, policy, preflight, work, onPromoted),
     policy.admissionOptions.signal,
   )
   return result.acquired ? result.value : { kind: 'blocked' }
 }
 
 async function runGatedBrowserWorkspaceReplacementAttempt<T>(
+  selection: BrowserWorkspaceSelectionGrant,
   policy: BrowserWorkspaceReplacementLaunchPolicy,
   preflight: BrowserWorkspaceReplacementPreflight,
   work: BrowserWorkspaceReplacementWork<T>,
@@ -298,18 +323,21 @@ async function runGatedBrowserWorkspaceReplacementAttempt<T>(
   const snapshot = getWorkspaceRuntimeControlSnapshot()
   if (snapshot.state !== 'RUNNING' || snapshot.workspaceId === null) return { kind: 'blocked' }
   const session = getBrowserWorkspaceSession()
+  if (work.kind === 'online') {
+    await awaitWorkspaceForegroundDemandIdle(policy.admissionOptions.signal)
+  }
   if (!(await preflight(session))) return { kind: 'skipped' }
   if (policy.admissionOptions.signal?.aborted) throw policy.admissionOptions.signal.reason
+  if (work.kind === 'online') {
+    await awaitWorkspaceForegroundDemandIdle(policy.admissionOptions.signal)
+  }
   const databaseName = session.databaseName
   const originalWorkspace = workspaceSnapshot({
     workspaceId: snapshot.workspaceId,
     replacementEpoch: snapshot.replacementEpoch,
   })
   if (!browserWorkspaceSlotSwitchingSupported()) {
-    const authority =
-      work.kind === 'online' && policy.admission === 'if-idle'
-        ? await awaitOnlineReplacementAuthority(policy)
-        : launchReplacementAuthority(policy)
+    const authority = await awaitReplacementAuthority(policy)
     if (!authority) return { kind: 'blocked' }
     onPromoted()
     const transition = await runUnslottedBrowserWorkspaceReplacement(
@@ -330,45 +358,53 @@ async function runGatedBrowserWorkspaceReplacementAttempt<T>(
       : { kind: 'cleanup-required' }
   }
   const journal = begin.journal
-  let cleanupAttempted = false
   try {
     if (journal.sourceDatabaseName !== databaseName) {
       throw new Error(
         `BrowserWorkspaceControlSourceMismatch:${databaseName}:${journal.sourceDatabaseName}`,
       )
     }
-    await prepareSlottedDestination(journal, originalWorkspace)
+    if (work.kind === 'online') {
+      await awaitWorkspaceForegroundDemandIdle(policy.admissionOptions.signal)
+    }
+    await prepareSlottedDestination(selection, journal, originalWorkspace)
     const onlinePrepared =
       work.kind === 'online'
         ? await prepareOnlineSlottedReplacement(
+            selection,
             journal,
             work.operation,
             policy.admissionOptions.signal,
           )
         : undefined
-    const authority = launchReplacementAuthority(policy)
-    if (!authority) {
-      cleanupAttempted = true
-      await abandonUnpromotedSlottedReplacement(journal, work)
-      return { kind: 'cleanup-required' }
-    }
-    postBrowserWorkspaceSlotQuiesce(journal)
-    onPromoted()
-    const transition = await runSlottedBrowserWorkspaceReplacement(
-      authority,
-      journal,
-      originalWorkspace,
-      work,
-      onlinePrepared,
-    ).catch((error: unknown) => {
-      throw browserWorkspaceReplacementStageError('execution', error)
-    })
-    await transition.settleSelection().catch((error: unknown) => {
-      throw browserWorkspaceReplacementStageError('selection-settlement', error)
-    })
-    return { kind: 'promoted', transition }
+    return await withExclusiveGenerationLifetime(
+      async () => {
+        const authority = await awaitReplacementAuthority(policy)
+        if (!authority) {
+          await abandonUnpromotedSlottedReplacement(journal, work)
+          return { kind: 'cleanup-required' }
+        }
+        postBrowserWorkspaceSlotQuiesce(journal)
+        onPromoted()
+        const transition = await runSlottedBrowserWorkspaceReplacement(
+          selection,
+          authority,
+          journal,
+          originalWorkspace,
+          work,
+          onlinePrepared,
+        ).catch((error: unknown) => {
+          throw browserWorkspaceReplacementStageError('execution', error)
+        })
+        await transition.settleSelection().catch((error: unknown) => {
+          throw browserWorkspaceReplacementStageError('selection-settlement', error)
+        })
+        return { kind: 'promoted', transition }
+      },
+      policy.admissionOptions.signal ? { signal: policy.admissionOptions.signal } : {},
+    )
   } catch (error) {
-    if (!cleanupAttempted && getWorkspaceRuntimeControlSnapshot().state === 'RUNNING') {
+    if (getWorkspaceRuntimeControlSnapshot().state === 'RUNNING') {
       try {
         await abandonUnpromotedSlottedReplacement(journal, work)
       } catch (cleanupError) {
@@ -384,60 +420,17 @@ async function runGatedBrowserWorkspaceReplacementAttempt<T>(
 }
 
 function launchReplacementAuthority(
-  policy: BrowserWorkspaceReplacementLaunchPolicy,
+  policy: Extract<BrowserWorkspaceReplacementLaunchPolicy, { readonly admission: 'required' }>,
 ): WorkspaceReconcileAuthority | null {
   if (policy.admissionOptions.signal?.aborted) throw policy.admissionOptions.signal.reason
   return policy.promote()
 }
 
-function awaitOnlineReplacementAuthority(
+async function awaitReplacementAuthority(
   policy: BrowserWorkspaceReplacementLaunchPolicy,
 ): Promise<WorkspaceReconcileAuthority | null> {
-  return new Promise((resolve, reject) => {
-    const signal = policy.admissionOptions.signal
-    let settled = false
-    let unsubscribeIdle = () => {}
-    let unsubscribeState = () => {}
-    const dispose = () => {
-      unsubscribeIdle()
-      unsubscribeState()
-      signal?.removeEventListener('abort', onAbort)
-    }
-    const settle = (authority: WorkspaceReconcileAuthority | null) => {
-      if (settled) return
-      settled = true
-      dispose()
-      resolve(authority)
-    }
-    const fail = (error: unknown) => {
-      if (settled) return
-      settled = true
-      dispose()
-      reject(errorFromUnknown(error))
-    }
-    const attempt = () => {
-      if (settled) return
-      if (signal?.aborted) {
-        fail(signal.reason)
-        return
-      }
-      if (getWorkspaceRuntimeControlSnapshot().state !== 'RUNNING') {
-        settle(null)
-        return
-      }
-      try {
-        const authority = policy.promote()
-        if (authority) settle(authority)
-      } catch (error) {
-        fail(error)
-      }
-    }
-    const onAbort = () => fail(signal?.reason)
-    unsubscribeIdle = subscribeWorkspaceRuntimeIdle(attempt)
-    unsubscribeState = subscribeWorkspaceRuntimeState(attempt)
-    signal?.addEventListener('abort', onAbort, { once: true })
-    attempt()
-  })
+  if (policy.admission === 'if-idle') return policy.promoteWhenUnblocked()
+  return launchReplacementAuthority(policy)
 }
 
 async function runUnslottedBrowserWorkspaceReplacement<T>(
@@ -504,6 +497,7 @@ async function runUnslottedBrowserWorkspaceReplacement<T>(
 }
 
 async function runSlottedBrowserWorkspaceReplacement<T>(
+  selection: BrowserWorkspaceSelectionGrant,
   authority: WorkspaceReconcileAuthority,
   journal: BrowserWorkspaceReplacementPreparing,
   originalWorkspace: BrowserWorkspaceSnapshot,
@@ -517,6 +511,7 @@ async function runSlottedBrowserWorkspaceReplacement<T>(
     await awaitWorkspaceRuntimeQuiesced()
     transition.markQuiesced()
     await withExclusiveBrowserWorkspaceSlots(
+      selection,
       [journal.sourceDatabaseName, journal.destinationDatabaseName],
       () =>
         runSlottedReplacementCommit(transition, journal, work, onlinePrepared, authority.signal),
@@ -604,23 +599,29 @@ function replacementExecutionFailure(error: unknown, signal: AbortSignal): unkno
 }
 
 async function prepareSlottedDestination(
+  selection: BrowserWorkspaceSelectionGrant,
   journal: BrowserWorkspaceReplacementPreparing,
   originalWorkspace: BrowserWorkspaceSnapshot,
 ): Promise<void> {
-  await withExclusiveBrowserWorkspaceSlots([journal.destinationDatabaseName], async () => {
-    await Dexie.delete(journal.destinationDatabaseName)
-    await recreateAndVerifyBrowserWorkspaceDatabase(journal.destinationDatabaseName)
-    const replacementDb = new NatterDb(journal.destinationDatabaseName)
-    try {
-      await replacementDb.open()
-      await seedBrowserWorkspaceReplacementMeta(replacementDb, originalWorkspace)
-    } finally {
-      replacementDb.close()
-    }
-  })
+  await withExclusiveBrowserWorkspaceSlots(
+    selection,
+    [journal.destinationDatabaseName],
+    async () => {
+      await Dexie.delete(journal.destinationDatabaseName)
+      await recreateAndVerifyBrowserWorkspaceDatabase(journal.destinationDatabaseName)
+      const replacementDb = new NatterDb(journal.destinationDatabaseName)
+      try {
+        await replacementDb.open()
+        await seedBrowserWorkspaceReplacementMeta(replacementDb, originalWorkspace)
+      } finally {
+        replacementDb.close()
+      }
+    },
+  )
 }
 
 async function prepareOnlineSlottedReplacement<T>(
+  selection: BrowserWorkspaceSelectionGrant,
   journal: BrowserWorkspaceReplacementPreparing,
   operation: BrowserWorkspaceOnlineReplacementOperation<unknown, T>,
   requestedSignal: AbortSignal | undefined,
@@ -628,6 +629,7 @@ async function prepareOnlineSlottedReplacement<T>(
   const fallbackController = new AbortController()
   const signal = requestedSignal ?? fallbackController.signal
   return withExclusiveBrowserWorkspaceSlots(
+    selection,
     [journal.destinationDatabaseName],
     async () => {
       const destination = new NatterDb(journal.destinationDatabaseName)
@@ -640,6 +642,8 @@ async function prepareOnlineSlottedReplacement<T>(
           preactivationCheckpoint: () => {
             if (signal.aborted) throw signal.reason
           },
+          awaitForegroundIdle: () => awaitWorkspaceForegroundDemandIdle(signal),
+          foregroundInterruptionSignal: workspaceForegroundDemandInterruptionSignal,
           withSourceDatabase: (sourceOperation) =>
             withBrowserWorkspaceSourceDatabase(journal.sourceDatabaseName, sourceOperation),
           runDestinationTransaction: (tableNames, transactionOperation) =>
@@ -668,54 +672,50 @@ async function runSlottedReplacementCommit<T>(
   const replacementDb = new NatterDb(journal.destinationDatabaseName)
   try {
     await replacementDb.open()
-    await withExclusiveGenerationLifetime(
-      () =>
-        withQuiescedWorkspaceReplacementLock(
-          replacementDb,
-          async (grant) => {
-            const mutation = createReplacementMutationCapability(grant, {
-              atomicity: 'slotted-staging',
-              begin: () => transition.beginWriting(),
-              committed: () => undefined,
-            })
-            const context: BrowserWorkspaceReplacementContext = {
-              sourceDatabaseName: journal.sourceDatabaseName,
-              destinationDatabaseName: journal.destinationDatabaseName,
-              atomicity: 'slotted-staging',
-              signal,
-              preactivationCheckpoint: () => {
-                if (signal.aborted) throw signal.reason
-              },
-              withSourceDatabase: (sourceOperation) =>
-                withBrowserWorkspaceSourceDatabase(journal.sourceDatabaseName, sourceOperation),
-              mutate: mutation.run,
-            }
-            const prepared =
-              work.kind === 'online'
-                ? await work.operation.commit(replacementDb, context, onlinePrepared)
-                : await work.operation(replacementDb, context)
-            mutation.requireUsed()
-            const verified = workspaceSnapshot(await readBrowserWorkspaceMeta(replacementDb))
-            if (!sameWorkspaceSnapshot(verified, prepared.workspace)) {
-              throw new Error('BrowserWorkspaceReplacementVerificationFailed')
-            }
+    await withQuiescedWorkspaceReplacementLock(
+      replacementDb,
+      async (grant) => {
+        const mutation = createReplacementMutationCapability(grant, {
+          atomicity: 'slotted-staging',
+          begin: () => transition.beginWriting(),
+          committed: () => undefined,
+        })
+        const context: BrowserWorkspaceReplacementContext = {
+          sourceDatabaseName: journal.sourceDatabaseName,
+          destinationDatabaseName: journal.destinationDatabaseName,
+          atomicity: 'slotted-staging',
+          signal,
+          preactivationCheckpoint: () => {
             if (signal.aborted) throw signal.reason
-            transition.markPrepared()
-            transition.beginCommitting()
-            try {
-              await activatePreparedBrowserWorkspaceDatabase(journal, prepared.storageBaseline)
-            } catch (error) {
-              if (error instanceof BrowserWorkspaceActivationOutcomeUncertainError) {
-                transition.markOutcomeUnknown(error)
-              } else {
-                transition.markUncommitted(error)
-              }
-              return
-            }
-            transition.markCommitted(prepared)
           },
-          { signal },
-        ),
+          withSourceDatabase: (sourceOperation) =>
+            withBrowserWorkspaceSourceDatabase(journal.sourceDatabaseName, sourceOperation),
+          mutate: mutation.run,
+        }
+        const prepared =
+          work.kind === 'online'
+            ? await work.operation.commit(replacementDb, context, onlinePrepared)
+            : await work.operation(replacementDb, context)
+        mutation.requireUsed()
+        const verified = workspaceSnapshot(await readBrowserWorkspaceMeta(replacementDb))
+        if (!sameWorkspaceSnapshot(verified, prepared.workspace)) {
+          throw new Error('BrowserWorkspaceReplacementVerificationFailed')
+        }
+        if (signal.aborted) throw signal.reason
+        transition.markPrepared()
+        transition.beginCommitting()
+        try {
+          await activatePreparedBrowserWorkspaceDatabase(journal, prepared.storageBaseline)
+        } catch (error) {
+          if (error instanceof BrowserWorkspaceActivationOutcomeUncertainError) {
+            transition.markOutcomeUnknown(error)
+          } else {
+            transition.markUncommitted(error)
+          }
+          return
+        }
+        transition.markCommitted(prepared)
+      },
       { signal },
     )
   } finally {

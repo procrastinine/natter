@@ -395,29 +395,37 @@ describe('verification dependency image', () => {
     expect(image.recipe.runtime.pnpmPackageTreeByteLength).toBeGreaterThan(1_000_000)
   })
 
-  it('derives the store through the same typed process capability used for installation', async () => {
+  it("uses the source install's recorded store when a reduced environment would derive another path", async () => {
     const fixture = dependencyFixture()
+    const actionStoreLink = resolve(fixture.sourceRoot, 'action-store-link')
+    symlinkSync(fixture.storeRoot, actionStoreLink, 'dir')
+    write(
+      fixture.sourceRoot,
+      'node_modules/.modules.yaml',
+      `${JSON.stringify({ storeDir: actionStoreLink, virtualStoreDir: '.pnpm' })}\n`,
+    )
     const invocations: VerificationDependencyProcessInvocation[] = []
-    const install = fakeInstaller(fixture.storeRoot)
     const image = await prepareVerificationDependencyImage({
       sourceRoot: fixture.sourceRoot,
-      runProcess: async (invocation) => {
-        invocations.push(invocation)
-        if (invocation.args.includes('store')) {
-          return {
-            ...successfulProcess(),
-            stdout: Buffer.from(`${fixture.storeRoot}\n`),
-          }
-        }
-        return install(invocation)
-      },
+      runProcess: fakeInstaller(fixture.storeRoot, invocations),
     })
     images.push(image)
 
-    expect(invocations).toHaveLength(2)
+    expect(invocations).toHaveLength(1)
     expect(invocations[0]?.command).toBe(realpathSync(process.execPath))
-    expect(invocations[0]?.args.slice(-3)).toEqual(['store', 'path', '--silent'])
-    expect(invocations[1]?.args).toContain(fixture.storeRoot)
+    expect(invocations[0]?.args).toContain(realpathSync(fixture.storeRoot))
+    expect(invocations[0]?.args).not.toContain('store')
+  })
+
+  it('fails causally when verification starts without a successful source install', async () => {
+    const fixture = dependencyFixture()
+    await expect(
+      prepareVerificationDependencyImage({
+        sourceRoot: fixture.sourceRoot,
+        runtime,
+        runProcess: fakeInstaller(fixture.storeRoot),
+      }),
+    ).rejects.toThrow('VerificationDependencySourceInstallMetadataMissing:')
   })
 
   it('admits only one publisher for an incomplete dependency image', async () => {

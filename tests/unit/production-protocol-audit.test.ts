@@ -115,10 +115,10 @@ describe('production workspace protocol audit', () => {
       ok: true,
       sourceFiles: 485,
       roots: {
-        variants: 15,
+        variants: 16,
         exclusiveVariants: 2,
-        admissionFunctions: 6,
-        finiteAdmissions: 110,
+        admissionFunctions: 7,
+        finiteAdmissions: 112,
         unboundedAdmissions: 0,
         capabilityEscapes: 0,
       },
@@ -148,12 +148,17 @@ describe('production workspace protocol audit', () => {
     expect(report.roots.admissionDefinitions).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
-          name: 'launchImportExportWorkspaceRuntimeReplacementNow',
+          name: 'launchRequiredWorkspaceRuntimeReplacementNow',
           source: 'fixed',
-          allowedKinds: ['import-export'],
+          allowedKinds: ['workspace-replacement'],
         }),
         expect.objectContaining({
           name: 'tryLaunchMaintenanceWorkspaceRuntimeReplacementIfIdle',
+          source: 'fixed',
+          allowedKinds: ['maintenance'],
+        }),
+        expect.objectContaining({
+          name: 'launchMaintenanceWorkspaceRuntimeReplacementWhenUnblocked',
           source: 'fixed',
           allowedKinds: ['maintenance'],
         }),
@@ -163,12 +168,12 @@ describe('production workspace protocol audit', () => {
       expect.arrayContaining([
         expect.objectContaining({
           path: 'src/store/browser-workspace-replacement-runner.ts',
-          admission: 'launchImportExportWorkspaceRuntimeReplacementNow',
-          kinds: ['import-export'],
+          admission: 'launchRequiredWorkspaceRuntimeReplacementNow',
+          kinds: ['workspace-replacement'],
         }),
         expect.objectContaining({
           path: 'src/store/browser-workspace-replacement-runner.ts',
-          admission: 'tryLaunchMaintenanceWorkspaceRuntimeReplacementIfIdle',
+          admission: 'launchMaintenanceWorkspaceRuntimeReplacementWhenUnblocked',
           kinds: ['maintenance'],
         }),
       ]),

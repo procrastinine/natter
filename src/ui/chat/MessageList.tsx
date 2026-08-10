@@ -68,7 +68,8 @@ const ImportModal = lazy(() =>
   import('./ImportModal').then((module) => ({ default: module.ImportModal })),
 )
 
-const TRANSCRIPT_VIRTUAL_OVERSCAN = 8
+const TRANSCRIPT_VIRTUAL_ESTIMATED_ROW_HEIGHT = 240
+const TRANSCRIPT_VIRTUAL_INITIAL_VIEWPORT_HEIGHT = 720
 
 interface MessageListProps {
   readonly kind?: 'ready'
@@ -126,6 +127,13 @@ interface InsertTarget {
   messageId: MessageId
   slot: InsertSlot
   defaultRole: MessageRole
+}
+
+interface GenerationContinuityIntent {
+  readonly revision: number
+  readonly userScrollRevision: number
+  readonly messageIds: Set<MessageId>
+  readonly phase: 'retained' | 'releasing'
 }
 
 type RenderableMessageRow = Pick<
@@ -209,6 +217,10 @@ const MessageListSurface = memo(function MessageListSurface(props: MessageListSu
   } | null>(null)
   const historyDemandRevisionRef = useRef(0)
   const measuredVirtualMessageIdsRef = useRef(new Set<MessageId>())
+  const generationContinuityRevisionRef = useRef(0)
+  const generationContinuityIntentRef = useRef<GenerationContinuityIntent | null>(null)
+  const [generationContinuityIntent, setGenerationContinuityIntent] =
+    useState<GenerationContinuityIntent | null>(null)
   const loadOlderRef = useRef<HTMLDivElement | null>(null)
   const scrollRegionCommands = useScrollRegionCommands()
   const scrollRegionState = useScrollRegionState()
@@ -220,6 +232,64 @@ const MessageListSurface = memo(function MessageListSurface(props: MessageListSu
     const el = listRef.current?.querySelector<HTMLElement>('[data-ui="message"]:focus-within')
     return el?.getAttribute('data-message-id') ?? null
   }, [])
+
+  const claimGenerationContinuity = useCallback((): number | null => {
+    const messageIds = [
+      ...(listRef.current?.querySelectorAll<HTMLElement>('[data-ui="message"][data-message-id]') ??
+        []),
+    ].flatMap((element) => {
+      const messageId = element.dataset.messageId
+      return messageId ? [messageId] : []
+    })
+    if (messageIds.length === 0) return null
+    generationContinuityRevisionRef.current += 1
+    const revision = generationContinuityRevisionRef.current
+    const intent = {
+      revision,
+      userScrollRevision: scrollRegionCommands?.getUserScrollRevision() ?? 0,
+      messageIds: new Set(messageIds),
+      phase: 'retained' as const,
+    }
+    generationContinuityIntentRef.current = intent
+    setGenerationContinuityIntent(intent)
+    return revision
+  }, [scrollRegionCommands])
+  const releaseGenerationContinuity = useCallback((revision: number | null) => {
+    if (revision === null) return
+    if (generationContinuityIntentRef.current?.revision === revision) {
+      generationContinuityIntentRef.current = null
+    }
+    setGenerationContinuityIntent((current) =>
+      current?.revision === revision && current.phase === 'retained'
+        ? { ...current, messageIds: new Set(), phase: 'releasing' }
+        : current,
+    )
+  }, [])
+  const ownGenerationContinuity = useCallback(
+    (start: () => GenerationSubmission): GenerationSubmission => {
+      const revision = claimGenerationContinuity()
+      try {
+        const submission = start()
+        if (submission.kind === 'not-started') {
+          releaseGenerationContinuity(revision)
+        } else {
+          void submission.generationSettled
+            .then(
+              () => releaseGenerationContinuity(revision),
+              () => releaseGenerationContinuity(revision),
+            )
+            .catch((error: unknown) => {
+              console.error('Generation continuity release failed', error)
+            })
+        }
+        return submission
+      } catch (error) {
+        releaseGenerationContinuity(revision)
+        throw error
+      }
+    },
+    [claimGenerationContinuity, releaseGenerationContinuity],
+  )
 
   useEffect(() => {
     if (mutationsUnavailable) setInsertTarget(null)
@@ -312,23 +382,23 @@ const MessageListSurface = memo(function MessageListSurface(props: MessageListSu
       text: string,
       opts?: { prefillText?: string; attachmentRefs?: MessageAttachmentRef[] },
     ) => {
-      return onEditAndSendMessage(m, text, opts)
+      return ownGenerationContinuity(() => onEditAndSendMessage(m, text, opts))
     },
-    [onEditAndSendMessage],
+    [onEditAndSendMessage, ownGenerationContinuity],
   )
 
   const handleRegenerate = useCallback(
     (m: MessageRow, options?: { settingsPatch?: ChatSettingsPatch }) => {
-      return onRegenerateMessage(m, options)
+      return ownGenerationContinuity(() => onRegenerateMessage(m, options))
     },
-    [onRegenerateMessage],
+    [onRegenerateMessage, ownGenerationContinuity],
   )
 
   const handleContinue = useCallback(
     (m: MessageRow) => {
-      return onContinueMessage(m)
+      return ownGenerationContinuity(() => onContinueMessage(m))
     },
-    [onContinueMessage],
+    [onContinueMessage, ownGenerationContinuity],
   )
 
   const handleForkChat = useCallback(
@@ -444,16 +514,51 @@ const MessageListSurface = memo(function MessageListSurface(props: MessageListSu
     () => new Map(renderableMessageRows.map((row, index) => [row.message.id, index])),
     [renderableMessageRows],
   )
+  const currentUserScrollRevision = scrollRegionCommands?.getUserScrollRevision() ?? 0
+  const generationContinuityMessageIds = useMemo(() => {
+    if (
+      !generationContinuityIntent ||
+      currentUserScrollRevision > generationContinuityIntent.userScrollRevision
+    ) {
+      return []
+    }
+    return [...generationContinuityIntent.messageIds].filter((messageId) =>
+      renderableMessageIndexById.has(messageId),
+    )
+  }, [currentUserScrollRevision, generationContinuityIntent, renderableMessageIndexById])
+  useEffect(() => {
+    if (
+      !generationContinuityIntent ||
+      currentUserScrollRevision <= generationContinuityIntent.userScrollRevision
+    ) {
+      return
+    }
+    releaseGenerationContinuity(generationContinuityIntent.revision)
+  }, [currentUserScrollRevision, generationContinuityIntent, releaseGenerationContinuity])
+  useEffect(() => {
+    if (generationContinuityIntent?.phase !== 'releasing') return
+    const revision = generationContinuityIntent.revision
+    setGenerationContinuityIntent((current) =>
+      current?.revision === revision && current.phase === 'releasing' ? null : current,
+    )
+  }, [generationContinuityIntent])
   const extractVirtualMessageRange = useCallback(
     (range: Range): number[] => {
       const requiredIndices = new Set(defaultRangeExtractor(range))
       if (scrollRegionState === 'follow' && renderableMessageRows.length > 0) {
-        requiredIndices.add(renderableMessageRows.length - 1)
+        const tailFloorStart = Math.max(
+          0,
+          renderableMessageRows.length - Math.max(1, messageInitialRenderWork),
+        )
+        for (let index = tailFloorStart; index < renderableMessageRows.length; index += 1) {
+          requiredIndices.add(index)
+        }
       }
       const retainedMessageIds = new Set([
         scrollRegionCommands?.getLayoutAnchorMessageId() ?? null,
         historyDemandAnchor?.messageId ?? null,
         focusedMessageId(),
+        ...(generationContinuityIntent?.messageIds ?? []),
       ])
       for (const messageId of retainedMessageIds) {
         if (!messageId) continue
@@ -473,7 +578,9 @@ const MessageListSurface = memo(function MessageListSurface(props: MessageListSu
     },
     [
       focusedMessageId,
+      generationContinuityIntent,
       historyDemandAnchor,
+      messageInitialRenderWork,
       renderableMessageIndexById,
       renderableMessageRows,
       scrollRegionCommands,
@@ -509,16 +616,23 @@ const MessageListSurface = memo(function MessageListSurface(props: MessageListSu
     count: renderableMessageRows.length,
     getScrollElement: () =>
       listElement?.closest<HTMLDivElement>('[data-ui="scroll-region"]') ?? null,
-    estimateSize: () => 240,
+    estimateSize: () => TRANSCRIPT_VIRTUAL_ESTIMATED_ROW_HEIGHT,
     getItemKey: getVirtualMessageKey,
-    overscan: TRANSCRIPT_VIRTUAL_OVERSCAN,
-    initialRect: { width: 1280, height: 720 },
+    overscan: Math.max(
+      1,
+      messageInitialRenderWork -
+        Math.ceil(
+          TRANSCRIPT_VIRTUAL_INITIAL_VIEWPORT_HEIGHT / TRANSCRIPT_VIRTUAL_ESTIMATED_ROW_HEIGHT,
+        ),
+    ),
+    initialRect: { width: 1280, height: TRANSCRIPT_VIRTUAL_INITIAL_VIEWPORT_HEIGHT },
     initialOffset: () =>
       listElement?.closest<HTMLDivElement>('[data-ui="scroll-region"]')?.scrollTop ?? 0,
     scrollMargin: virtualScrollMargin,
     scrollToFn: applyVirtualizerScroll,
     rangeExtractor: extractVirtualMessageRange,
     anchorTo: shouldVirtualize ? 'end' : 'start',
+    useFlushSync: scrollRegionState === 'pinned' && generationContinuityIntent === null,
     directDomUpdates: shouldVirtualize,
     directDomUpdatesMode: 'position',
     onChange: reconcileVirtualMessageGeometry,
@@ -542,10 +656,7 @@ const MessageListSurface = memo(function MessageListSurface(props: MessageListSu
         ?.getAttribute('data-message-id')
       if (node && messageId) {
         measuredVirtualMessageIdsRef.current.add(messageId)
-        const index = Number(node.dataset.index)
-        if (Number.isSafeInteger(index)) {
-          messageVirtualizer.resizeItem(index, node.getBoundingClientRect().height)
-        }
+        generationContinuityIntentRef.current?.messageIds.add(messageId)
       }
       messageVirtualizer.measureElement(node)
     },
@@ -783,6 +894,9 @@ const MessageListSurface = memo(function MessageListSurface(props: MessageListSu
       data-initial-render-work={messageInitialRenderWork}
       data-rendered-count={effectiveRenderedMessageCount}
       data-mounted-count={mountedVirtualItems.length}
+      data-generation-continuity-count={generationContinuityMessageIds.length}
+      data-user-scroll-revision={currentUserScrollRevision}
+      data-generation-captured-user-scroll-revision={generationContinuityIntent?.userScrollRevision}
       data-virtualized={shouldVirtualize ? 'true' : 'false'}
       data-layout-anchor-id={layoutAnchorMessageId ?? undefined}
       data-history-demand-anchor-id={historyDemandAnchor?.messageId}

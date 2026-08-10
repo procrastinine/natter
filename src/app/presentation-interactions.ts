@@ -87,6 +87,7 @@ export type GenerationSubmission =
       readonly kind: 'started'
       readonly admission: Promise<GenerationSubmissionAdmission>
       readonly completion: Promise<GenerationSubmissionOutcome>
+      readonly generationSettled: Promise<void>
       cancel(): void
     }
   | { readonly kind: 'not-started'; readonly capability: NonReadyGenerationCapability }

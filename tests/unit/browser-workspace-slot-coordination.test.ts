@@ -10,6 +10,7 @@ import {
   releaseBrowserWorkspaceSlotLease,
   tryWithBrowserWorkspaceSelectionGate,
   withBrowserWorkspaceSelectionGate,
+  withBrowserWorkspaceSlotOperation,
   withExclusiveBrowserWorkspaceSlots,
 } from '../../src/store/browser-workspace-slot-coordination'
 
@@ -85,6 +86,81 @@ class SerialLockManager {
         this.gateBusy = false
         this.gateQueue.shift()?.()
       })
+  }
+}
+
+class FairSelectionLockManager {
+  readonly requested: Array<{ readonly name: string; readonly mode: 'shared' | 'exclusive' }> = []
+  private activeExclusive = false
+  private activeShared = 0
+  private readonly queue: Array<{
+    readonly mode: 'shared' | 'exclusive'
+    readonly enter: () => void
+  }> = []
+
+  request<T>(
+    name: string,
+    options: { mode: 'shared' | 'exclusive'; ifAvailable?: boolean; signal?: AbortSignal },
+    callback: (lock: Lock | null) => Promise<T> | T,
+  ): Promise<T> {
+    this.requested.push({ name, mode: options.mode })
+    if (name !== 'natter:workspace-slot-selection:v1') {
+      return Promise.resolve(callback({ name, mode: options.mode }))
+    }
+    if (options.ifAvailable) {
+      const available =
+        this.queue.length === 0 &&
+        !this.activeExclusive &&
+        (options.mode === 'shared' || this.activeShared === 0)
+      return Promise.resolve(callback(available ? { name, mode: options.mode } : null))
+    }
+    return new Promise<void>((resolve, reject) => {
+      const queued = {
+        mode: options.mode,
+        enter: () => {
+          if (options.signal?.aborted) {
+            reject(options.signal.reason)
+            return
+          }
+          options.signal?.removeEventListener('abort', abort)
+          if (options.mode === 'exclusive') this.activeExclusive = true
+          else this.activeShared += 1
+          resolve()
+        },
+      }
+      const abort = () => {
+        const index = this.queue.indexOf(queued)
+        if (index >= 0) this.queue.splice(index, 1)
+        reject(options.signal?.reason)
+      }
+      if (options.signal?.aborted) {
+        reject(options.signal.reason)
+        return
+      }
+      options.signal?.addEventListener('abort', abort, { once: true })
+      this.queue.push(queued)
+      this.drain()
+    })
+      .then(() => callback({ name, mode: options.mode }))
+      .finally(() => {
+        if (options.mode === 'exclusive') this.activeExclusive = false
+        else this.activeShared -= 1
+        this.drain()
+      })
+  }
+
+  private drain(): void {
+    if (this.activeExclusive || this.queue.length === 0) return
+    const first = this.queue[0]
+    if (!first) return
+    if (first.mode === 'exclusive') {
+      if (this.activeShared > 0) return
+      this.queue.shift()?.enter()
+      return
+    }
+    while (this.queue[0]?.mode === 'shared') {
+      this.queue.shift()?.enter()
+    }
   }
 }
 
@@ -386,9 +462,10 @@ describe('browser workspace slot coordination', () => {
       await firstHeld
       events.push('first:end')
     })
-    const second = withBrowserWorkspaceSelectionGate(async () => {
+    const second = withBrowserWorkspaceSelectionGate(async (selection) => {
       events.push('second:start')
       await withExclusiveBrowserWorkspaceSlots(
+        selection,
         ['natter-workspace-b', 'natter-workspace-a'],
         async () => {
           events.push('second:slots')
@@ -414,6 +491,77 @@ describe('browser workspace slot coordination', () => {
       'natter:workspace-slot-selection:v1',
       'natter:workspace-slot:natter-workspace-a',
       'natter:workspace-slot:natter-workspace-b',
+    ])
+  })
+
+  it('keeps the runtime live for admitted bounded slot work and fences later probes', async () => {
+    const manager = new FairSelectionLockManager()
+    Object.defineProperty(navigator, 'locks', {
+      configurable: true,
+      value: manager,
+    })
+    const events: string[] = []
+    let releaseProbe!: () => void
+    let releaseReplacement!: () => void
+    let markProbeStarted!: () => void
+    let markReplacementStarted!: () => void
+    const probeHeld = new Promise<void>((resolve) => {
+      releaseProbe = resolve
+    })
+    const replacementHeld = new Promise<void>((resolve) => {
+      releaseReplacement = resolve
+    })
+    const probeStarted = new Promise<void>((resolve) => {
+      markProbeStarted = resolve
+    })
+    const replacementStarted = new Promise<void>((resolve) => {
+      markReplacementStarted = resolve
+    })
+
+    const admittedProbe = withBrowserWorkspaceSlotOperation('natter', {
+      kind: 'retained',
+      run: async () => {
+        events.push('probe:start')
+        markProbeStarted()
+        await probeHeld
+        events.push('probe:end')
+      },
+    })
+    await probeStarted
+    const replacement = withBrowserWorkspaceSelectionGate(async () => {
+      events.push('replacement:start')
+      markReplacementStarted()
+      await replacementHeld
+      events.push('replacement:end')
+    })
+    const laterProbe = withBrowserWorkspaceSlotOperation('natter', {
+      kind: 'retained',
+      run: async () => {
+        events.push('later-probe')
+      },
+    })
+
+    await Promise.resolve()
+    expect(events).toEqual(['probe:start'])
+    releaseProbe()
+    await replacementStarted
+    expect(events).toEqual(['probe:start', 'probe:end', 'replacement:start'])
+    releaseReplacement()
+    await Promise.all([admittedProbe, replacement, laterProbe])
+
+    expect(events).toEqual([
+      'probe:start',
+      'probe:end',
+      'replacement:start',
+      'replacement:end',
+      'later-probe',
+    ])
+    expect(manager.requested).toEqual([
+      { name: 'natter:workspace-slot-selection:v1', mode: 'shared' },
+      { name: 'natter:workspace-slot:natter', mode: 'shared' },
+      { name: 'natter:workspace-slot-selection:v1', mode: 'exclusive' },
+      { name: 'natter:workspace-slot-selection:v1', mode: 'shared' },
+      { name: 'natter:workspace-slot:natter', mode: 'shared' },
     ])
   })
 

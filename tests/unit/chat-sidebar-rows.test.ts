@@ -481,7 +481,6 @@ describe('chat sidebar read model', () => {
     expect(
       measurements.reduce((sum, value) => sum + value.folderCatalogRowsRead, 0),
     ).toBeLessThanOrEqual(4)
-
     const collapsed = await readPresentationPage({
       ...request,
       collapsedFolderIds: ['large-folder', 'empty-folder'],
@@ -490,6 +489,29 @@ describe('chat sidebar read model', () => {
     expect(collapsed.rows.map((row) => row.key)).toContain('entry:folder:large-folder')
     expect(collapsed.rows.some((row) => row.key.includes(':folder-chat-'))).toBe(false)
     expect(collapsed.measurement.folderChildRowsRead).toBe(0)
+  })
+
+  it('rejects a folder aggregate that claims a missing projected child', async () => {
+    await createFolder({ id: 'mismatched-folder', name: 'Mismatched folder', now: 20 })
+    await putTestChats([
+      {
+        ...buildChat({ id: 'missing-projected-child', title: 'Missing projected child', now: 30 }),
+        folderId: 'mismatched-folder',
+        previewText: 'Missing projected child',
+      },
+    ])
+    await getDb().chatSidebarRows.delete('missing-projected-child')
+
+    await expect(
+      readPresentationPage({
+        mode: 'expanded',
+        sort: 'updatedAt-desc',
+        collapsedFolderIds: [],
+        createdAtGroupBoundaries: [100, 90, 40, -190],
+        limit: 10,
+        countMode: 'exact',
+      }),
+    ).rejects.toThrow('ChatSidebarPresentationAggregateMismatch')
   })
 
   it('orders folders from exact child extrema in both directions and keeps pinned entries first', async () => {

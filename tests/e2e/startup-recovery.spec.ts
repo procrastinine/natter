@@ -1,6 +1,8 @@
 import { expect, type Page, test } from './fixtures'
 import { activeWorkspaceDatabaseName, clearIndexedDb, waitForWorkspaceRunning } from './helpers'
 
+const REGISTERED_UPGRADE_WATCHDOG_MS = 15_000
+
 test.beforeEach(async ({ page }) => {
   await clearIndexedDb(page)
 })
@@ -372,6 +374,16 @@ test('many reloading tabs elect one bounded registered upgrade for a valid v97 w
   const pages = [page, ...(await Promise.all(Array.from({ length: 5 }, () => context.newPage())))]
   try {
     await Promise.all(pages.map((candidate) => candidate.goto('/')))
+    const readinessStartedAt = performance.now()
+    const readiness = await Promise.all(
+      pages.map((candidate, index) =>
+        observeWorkspaceRunning(candidate, index, readinessStartedAt),
+      ),
+    )
+    expect(readiness.filter((observation) => observation.outcome !== 'running')).toEqual([])
+    expect(Math.max(...readiness.map((observation) => observation.elapsedMs))).toBeLessThanOrEqual(
+      REGISTERED_UPGRADE_WATCHDOG_MS,
+    )
     await Promise.all(
       pages.map(async (candidate) => {
         await expect(candidate.locator('[data-ui="app-shell"]')).toBeVisible()
@@ -444,6 +456,62 @@ test('many reloading tabs elect one bounded registered upgrade for a valid v97 w
     await Promise.all(pages.slice(1).map((candidate) => candidate.close()))
   }
 })
+
+async function observeWorkspaceRunning(
+  page: Page,
+  index: number,
+  startedAt: number,
+): Promise<
+  | { index: number; outcome: 'running'; elapsedMs: number }
+  | {
+      index: number
+      outcome: 'not-running'
+      elapsedMs: number
+      state: {
+        runtime: string | null
+        bootstrap: {
+          state: string | null
+          stage: string | null
+          operation: string | null
+        } | null
+      }
+      error: string
+    }
+> {
+  try {
+    await page.waitForFunction(
+      () =>
+        document
+          .querySelector('[data-ui="app-shell"]')
+          ?.getAttribute('data-workspace-runtime-state') === 'RUNNING',
+      undefined,
+      { timeout: REGISTERED_UPGRADE_WATCHDOG_MS },
+    )
+    return { index, outcome: 'running', elapsedMs: performance.now() - startedAt }
+  } catch (error) {
+    const state = await page.evaluate(() => {
+      const shell = document.querySelector('[data-ui="app-shell"]')
+      const bootstrap = document.querySelector('[data-ui="workspace-bootstrap"]')
+      return {
+        runtime: shell?.getAttribute('data-workspace-runtime-state') ?? null,
+        bootstrap: bootstrap
+          ? {
+              state: bootstrap.getAttribute('data-state'),
+              stage: bootstrap.getAttribute('data-open-stage'),
+              operation: bootstrap.getAttribute('data-open-operation'),
+            }
+          : null,
+      }
+    })
+    return {
+      index,
+      outcome: 'not-running',
+      elapsedMs: performance.now() - startedAt,
+      state,
+      error: error instanceof Error ? error.message : String(error),
+    }
+  }
+}
 
 test('an observed intermediate v94 workspace repairs on an inactive slot across browser engines', async ({
   context,

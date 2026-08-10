@@ -395,11 +395,7 @@ export function useModelCatalog(
       ],
     ),
     selectionReadyForTarget &&
-      (!options.modelsDemanded ||
-        profile === undefined ||
-        catalogProjection?.models !== undefined ||
-        projectionError !== null ||
-        modelsStatus.error !== null),
+      (!options.modelsDemanded || profile === undefined || catalogProjection?.models !== undefined),
     useMemo<UseModelsPresentation | null>(
       () =>
         retainedPresentationTarget && retainedProjection
@@ -417,6 +413,33 @@ export function useModelCatalog(
         retainedProjection,
       ],
     ),
+  )
+  const currentModelsPresentation = useMemo<UseModelsPresentation>(
+    () =>
+      modelsPresentation.retained && modelsPresentation.profileId === profileId
+        ? modelsPresentation.profile?.kind === 'llama-server'
+          ? {
+              ...currentPresentationTarget,
+              models: projection.models,
+              modelAvailable: projection.modelAvailable,
+              fetchedAt: catalogProjection?.models?.fetchedAt ?? null,
+              retained: false,
+            }
+          : {
+              ...modelsPresentation,
+              ...currentPresentationTarget,
+              modelAvailable: projection.modelAvailable,
+              retained: false,
+            }
+        : modelsPresentation,
+    [
+      catalogProjection?.models?.fetchedAt,
+      currentPresentationTarget,
+      modelsPresentation,
+      profileId,
+      projection.modelAvailable,
+      projection.models,
+    ],
   )
   const endpointsRequired =
     profile?.kind === 'openrouter' && profile.supportsEndpointsApi === true && modelId !== null
@@ -467,14 +490,14 @@ export function useModelCatalog(
   }, [modelId, profileId])
   const models = useMemo<UseModelsResult>(
     () => ({
-      models: [...modelsPresentation.models],
+      models: [...currentModelsPresentation.models],
       loading: projectionLoading || (modelsStatus.inFlight && !cacheSnapshot.models),
-      retained: modelsPresentation.retained,
-      presentation: modelsPresentation,
-      fetchedAt: modelsPresentation.fetchedAt,
+      retained: currentModelsPresentation.retained,
+      presentation: currentModelsPresentation,
+      fetchedAt: currentModelsPresentation.fetchedAt,
       offline:
         (projectionError !== null || modelsStatus.error !== null) &&
-        modelsPresentation.fetchedAt !== null,
+        currentModelsPresentation.fetchedAt !== null,
       error: projectionError ?? modelsStatus.error,
       refresh: refreshModels,
     }),
@@ -484,7 +507,7 @@ export function useModelCatalog(
       projectionError,
       projectionLoading,
       refreshModels,
-      modelsPresentation,
+      currentModelsPresentation,
     ],
   )
   const endpointLoading =

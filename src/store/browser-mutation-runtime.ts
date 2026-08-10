@@ -48,7 +48,7 @@ import type {
   ProfileId,
 } from '../core/types'
 import { sameOrderedValues } from '../lib/same-value'
-import { readActiveBranchPathSlotFrameInTransaction } from './active-branch-fork-storage'
+import { materializeActiveBranchPathSlotFrame } from './active-branch-fork-storage'
 import {
   ATTACHMENT_CATALOG_AGGREGATE_ID,
   type AttachmentCatalogAggregateRow,
@@ -97,7 +97,6 @@ import {
   deleteAttachmentJobByteOwner,
   deleteAttachmentJobRows,
   deletePhysicalStorageRows,
-  insertMessageBody,
   putAttachmentArtifactByteOwner,
   putAttachmentBlobByteOwner,
   putAttachmentHeaderByteOwner,
@@ -423,6 +422,8 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
       }
       const now = Date.now()
       const tx = transaction
+      const messageHeaderReads = new Map<MessageId, MessageHeaderRow | undefined>()
+      const messageBodyReads = new Map<MessageId, MessageBodyRow | undefined>()
       if (options?.expectedAttachmentCatalogRevision !== undefined) {
         const expected = options.expectedAttachmentCatalogRevision
         if (!Number.isSafeInteger(expected) || expected < 0) {
@@ -481,13 +482,14 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
       if (options?.streamAdmission) {
         const incoming = options.streamAdmission
         const table = tx.table<StreamLeaseRow, string>('streamLeases')
-        const existing = await table.get(incoming.streamId)
+        const [existing, target] = await Dexie.Promise.all([
+          table.get(incoming.streamId),
+          chatMutation
+            .read(incoming.chatId)
+            .then((chat) => assertStreamLeaseWorkspaceTarget(tx, incoming, chat)),
+        ])
         commandCommit.assertReplacementEpoch(incoming.replacementEpoch)
-        await assertStreamLeaseWorkspaceTarget(
-          tx,
-          incoming,
-          await chatMutation.read(incoming.chatId),
-        )
+        messageHeaderReads.set(incoming.messageId, target)
         if (existing && existing.chatId !== incoming.chatId) {
           throw new Error(`StreamLeaseChatMismatch:${incoming.streamId}`)
         }
@@ -547,9 +549,57 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
       const draftReads = new Map<ChatId, DraftRow | undefined>()
       const messageCreationClock = new TransactionMessageCreationClock()
       const dirtyChildLists = new Map<string, ChildListState>()
+      const childListReads = new Map<string, Promise<ChildListState | undefined>>()
+      const childListPreviousStates = new Map<string, ChildListState | undefined>()
+      const childSlotMemberReads = new Map<MessageId, ChildSlotMember | undefined>()
       const affectedMessageIds = new Set<MessageId>()
       const messageHeadersBeforeWrites = new Map<MessageId, MessageHeaderRow | undefined>()
       const targetLeaseByMessage = new Map<MessageId, StreamLeaseRow | null>()
+
+      const readStoredChildLists = async (
+        chatId: ChatId,
+        parentIds: readonly (MessageId | null)[],
+      ): Promise<Array<ChildListState | undefined>> => {
+        const keys = parentIds.map((parentId) => childListKey(chatId, parentId))
+        const missingKeys = [
+          ...new Set(keys.filter((key) => !dirtyChildLists.has(key) && !childListReads.has(key))),
+        ]
+        if (missingKeys.length > 0) {
+          const rows = await tx.table<ChildListState, string>('childLists').bulkGet(missingKeys)
+          for (let index = 0; index < missingKeys.length; index += 1) {
+            const key = missingKeys[index] as string
+            const row = rows[index]
+            childListReads.set(key, Dexie.Promise.resolve(row))
+            childListPreviousStates.set(key, row)
+          }
+        }
+        return Dexie.Promise.all(
+          keys.map((key) => {
+            const pending = dirtyChildLists.get(key)
+            if (pending) return Dexie.Promise.resolve(pending)
+            const read = childListReads.get(key)
+            if (!read) throw new Error(`ChildListReadMissing:${key}`)
+            return read
+          }),
+        )
+      }
+
+      const readStoredChildSlotMembers = async (
+        messageIds: readonly MessageId[],
+      ): Promise<Array<ChildSlotMember | undefined>> => {
+        const missingIds = [
+          ...new Set(messageIds.filter((messageId) => !childSlotMemberReads.has(messageId))),
+        ]
+        if (missingIds.length > 0) {
+          const rows = await tx
+            .table<ChildSlotMember, MessageId>('childSlotMembers')
+            .bulkGet(missingIds)
+          for (let index = 0; index < missingIds.length; index += 1) {
+            childSlotMemberReads.set(missingIds[index] as MessageId, rows[index])
+          }
+        }
+        return messageIds.map((messageId) => childSlotMemberReads.get(messageId))
+      }
 
       const assertStreamTargetWriteAllowed = async (messageId: MessageId): Promise<void> => {
         let targetLease = targetLeaseByMessage.get(messageId)
@@ -719,7 +769,6 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
         bumpNow = now,
       ): Promise<ChildListState> => {
         assertScope({ kind: 'children', chatId, parentId })
-        const table = tx.table<ChildListState, string>('childLists')
         const id = childListKey(chatId, parentId)
         const pending = dirtyChildLists.get(id)
         if (pending) {
@@ -728,7 +777,7 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
           dirtyChildLists.set(id, refreshed)
           return refreshed
         }
-        const existing = await table.get(id)
+        const [existing] = await readStoredChildLists(chatId, [parentId])
         const next: ChildListState = {
           id,
           chatId,
@@ -767,8 +816,6 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
         return wireFields
       }
 
-      const messageHeaderReads = new Map<MessageId, MessageHeaderRow | undefined>()
-      const messageBodyReads = new Map<MessageId, MessageBodyRow | undefined>()
       const finalizedChats = new Map<ChatId, Chat>()
       const readMessageHeader = async (
         messageId: MessageId,
@@ -1182,7 +1229,6 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
         putMessage: async (message, options: PutMessageOptions = {}) => {
           const { touchChatSummary = true, semanticEffect, creationTimestamp } = options
           assertCanonicalGeneratedOutputMessage(message.content, message.attachmentRefs, message.id)
-          const headerTable = tx.table<MessageHeaderRow, MessageId>('messages')
           const previewTable = tx.table<MessageTextPreviewRow, MessageId>('messagePreviews')
           const existing = await readMessageHeader(message.id)
           const existingBody = existing ? await readMessageBody(message.id) : undefined
@@ -1282,19 +1328,20 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
             if (creationTimestamp !== 'preserve') {
               clone.createdAt = await messageCreationClock.next(tx, clone.chatId, now)
             }
-            const expectedLeafId =
+            const expectedParentId =
               summaryState.incrementalAppends.at(-1)?.id ??
               summaryState.beforeChat.lastUpdatedLeafId
             let incrementalAppend =
               !summaryState.structuralSummaryDirty &&
               !clone.deleted &&
-              clone.parentId === expectedLeafId
-            if (incrementalAppend && expectedLeafId !== null) {
-              const expectedLeaf = await headerTable.get(expectedLeafId)
+              clone.parentId === expectedParentId
+            const recencyFloorId = summaryState.beforeChat.lastUpdatedLeafId
+            if (incrementalAppend && recencyFloorId !== null) {
+              const recencyFloor = await readMessageHeader(recencyFloorId)
               incrementalAppend =
-                expectedLeaf !== undefined &&
-                !expectedLeaf.deleted &&
-                messageOutranksLeaf(clone, expectedLeaf)
+                recencyFloor !== undefined &&
+                !recencyFloor.deleted &&
+                messageOutranksLeaf(clone, recencyFloor)
             }
             if (!incrementalAppend) {
               await ensureStructuralSummaryContext(summaryState)
@@ -1316,12 +1363,22 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
             const { header, body, preview } = transition.storage
             recordHeaderBeforeWrite(summaryState, clone.id, undefined)
             await syncAttachmentReferenceOwner(transition.attachmentOwner)
-            await addPhysicalStorageRow(tx, 'messages', header)
-            await insertMessageBody(tx, body)
-            await addPhysicalStorageRow(tx, 'messagePreviews', preview)
+            await Dexie.Promise.all([
+              addPhysicalStorageRow(tx, 'messages', header),
+              addPhysicalStorageRow(tx, 'messageBodies', body),
+              addPhysicalStorageRow(tx, 'messagePreviews', preview),
+            ])
             messageHeaderReads.set(clone.id, header)
             messageBodyReads.set(clone.id, body)
-            if (transition.summary.previewCandidate !== undefined) {
+            const ownChildListId = childListKey(chatId, clone.id)
+            if (!dirtyChildLists.has(ownChildListId) && !childListReads.has(ownChildListId)) {
+              childListReads.set(ownChildListId, Dexie.Promise.resolve(undefined))
+              childListPreviousStates.set(ownChildListId, undefined)
+            }
+            if (
+              transition.summary.previewCandidate !== undefined &&
+              summaryState.beforeChat.previewText === ''
+            ) {
               summaryState.previewDirty = true
             }
             summaryState.wordCountDeltas.set(clone.id, transition.summary.wordCount)
@@ -1619,9 +1676,7 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
         },
 
         getChildList: async (chatId, parentId) => {
-          const row = await tx
-            .table<ChildListState, string>('childLists')
-            .get(childListKey(chatId, parentId))
+          const [row] = await readStoredChildLists(chatId, [parentId])
           return (
             row ?? {
               id: childListKey(chatId, parentId),
@@ -1638,9 +1693,7 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
         },
 
         getChildLists: async (chatId, parentIds) => {
-          const rows = await tx
-            .table<ChildListState, string>('childLists')
-            .bulkGet(parentIds.map((parentId) => childListKey(chatId, parentId)))
+          const rows = await readStoredChildLists(chatId, parentIds)
           return rows.map(
             (row, index): ChildListState =>
               row ?? {
@@ -1657,8 +1710,7 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
           )
         },
 
-        getChildSlotMembers: async (messageIds) =>
-          tx.table<ChildSlotMember, MessageId>('childSlotMembers').bulkGet([...messageIds]),
+        getChildSlotMembers: readStoredChildSlotMembers,
 
         getAttachment: async (attachmentId) => {
           const header = await tx
@@ -2077,8 +2129,11 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
           }
           return structuredClone(ownedStreamLease)
         },
-        resolveGenerationPromptPath: (chatId, proof) =>
-          resolveGenerationPromptPath(tx, chatId, proof),
+        resolveGenerationPromptPath: async (chatId, proof) => {
+          const path = await resolveGenerationPromptPath(tx, chatId, proof)
+          for (const header of path.headers) messageHeaderReads.set(header.id, header)
+          return path
+        },
         captureGenerationPlanningSnapshot: (chatId, intent, planningChat) =>
           captureGenerationPlanningSnapshot(tx, chatId, intent, planningChat),
         setStreamAdmissionPostCommit: (postCommit) => {
@@ -2165,8 +2220,17 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
           tx,
           structuralProjectionChanges,
           dirtyChildLists,
+          childListPreviousStates,
+          messageHeaderReads,
         )
         receiptAccumulator.absorb(childSlots.fragment)
+        for (const slot of childSlots.slots) {
+          dirtyChildLists.set(slot.state.id, slot.state)
+          for (const member of slot.upserts) childSlotMemberReads.set(member.id, member)
+          for (const messageId of slot.removedMessageIds) {
+            childSlotMemberReads.set(messageId, undefined)
+          }
+        }
       }
       if (options?.promoteChatId) {
         const state = await ensureChatState(options.promoteChatId)
@@ -2555,7 +2619,15 @@ export async function runBrowserMutation<T, U = T, ExtensionResult = undefined>(
         readFinalActiveBranchPathSlotFrame: (
           chatId: ChatId,
           headers: readonly MessageHeaderRow[],
-        ) => readActiveBranchPathSlotFrameInTransaction(tx, chatId, headers),
+        ) => {
+          const terminalId = headers.at(-1)?.id ?? null
+          return Dexie.Promise.all([
+            readStoredChildSlotMembers(headers.map((header) => header.id)),
+            readStoredChildLists(chatId, [...headers.map((header) => header.parentId), terminalId]),
+          ]).then(([members, states]) =>
+            materializeActiveBranchPathSlotFrame(chatId, headers, members, states),
+          )
+        },
         sealCommittedDestination: (
           input: Parameters<MutationFinalizationContext['sealCommittedDestination']>[0],
         ) =>

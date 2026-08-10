@@ -25,6 +25,7 @@ import {
 import { browserWorkspaceCatchupTransactionTableNames } from '../../src/store/browser-workspace-catchup-journal'
 import type * as BrowserWorkspaceCompaction from '../../src/store/browser-workspace-compaction'
 import {
+  __resetBrowserWorkspaceControlDatabaseForTests,
   abandonPreparedBrowserWorkspaceDatabase,
   beginBrowserWorkspaceDatabaseReplacement,
   readBrowserWorkspaceCompactionState,
@@ -38,7 +39,9 @@ import {
   shutdownBrowserWorkspace,
 } from '../../src/store/browser-workspace-lifecycle'
 import { buildChat } from '../../src/store/chats'
+import { configurationApplication } from '../../src/store/configuration-application'
 import { __resetDbForTests, getDb, NatterDb } from '../../src/store/db'
+import { exportWorkspaceBackup, restoreWorkspaceBackup } from '../../src/store/import-export'
 import {
   __setLockBackendForTests,
   type AuthoritativeCommandLockSession,
@@ -63,16 +66,30 @@ import {
   __resetWorkspaceRepositoryForTests,
   __setWorkspaceRepositoryForTests,
 } from '../../src/store/workspace-repository'
-import { runWorkspaceAction } from '../../src/store/workspace-runtime'
+import {
+  isWorkspaceMaintenancePreemptedError,
+  runWorkspaceAction,
+} from '../../src/store/workspace-runtime'
 import {
   getWorkspaceRuntimeControlSnapshot,
   getWorkspaceRuntimeResourceStatuses,
 } from '../../src/store/workspace-runtime-control'
 import { putTestChat } from '../helpers/chats'
+import { createConfigurationChatPreset, createConfigurationProfile } from '../helpers/configuration'
 import { encodeTestStreamJournalEntries } from '../helpers/stream-journal'
 import { testGenerationLease, testStreamLeaseAdmission } from '../helpers/stream-leases'
 
-const compactionProbe = vi.hoisted(() => ({ fail: false, calls: 0 }))
+const compactionProbe = vi.hoisted<{
+  fail: boolean
+  calls: number
+  error: unknown
+  result: unknown
+}>(() => ({
+  fail: false,
+  calls: 0,
+  error: null,
+  result: null,
+}))
 
 vi.mock('../../src/store/browser-workspace-compaction', async (importOriginal) => {
   const actual = await importOriginal<typeof BrowserWorkspaceCompaction>()
@@ -85,12 +102,20 @@ vi.mock('../../src/store/browser-workspace-compaction', async (importOriginal) =
       if (compactionProbe.fail) {
         throw new DOMException('destination quota exhausted', 'QuotaExceededError')
       }
-      return actual.tryStartBrowserWorkspaceCompaction(...args)
+      try {
+        const result = await actual.tryStartBrowserWorkspaceCompaction(...args)
+        compactionProbe.result = result
+        return result
+      } catch (error) {
+        compactionProbe.error = error
+        throw error
+      }
     },
   }
 })
 
 const DAY_MS = 24 * 60 * 60 * 1_000
+const BROWSER_WORKSPACE_SELECTION_LOCK = 'natter:workspace-slot-selection:v1'
 const originalLocks = Object.getOwnPropertyDescriptor(navigator, 'locks')
 let maintenanceReplacementDrain: BrowserWorkspacePromotedReplacementDrain
 
@@ -106,6 +131,37 @@ class ImmediateLockManager {
     if (!operation) return Promise.reject(new Error('ImmediateLockCallbackMissing'))
     const mode = typeof optionsOrCallback === 'function' ? 'exclusive' : optionsOrCallback.mode
     return Promise.resolve(operation({ name, mode: mode ?? 'exclusive' }))
+  }
+}
+
+class SerializedLockManager {
+  readonly #tails = new Map<string, Promise<void>>()
+  readonly attempts = new Map<string, number>()
+
+  async request<T>(
+    name: string,
+    optionsOrCallback: LockOptions | ((lock: Lock) => PromiseLike<T> | T),
+    maybeCallback?: (lock: Lock) => PromiseLike<T> | T,
+  ): Promise<T> {
+    const options = typeof optionsOrCallback === 'function' ? {} : optionsOrCallback
+    const callback = typeof optionsOrCallback === 'function' ? optionsOrCallback : maybeCallback
+    if (!callback) throw new Error('SerializedLockCallbackMissing')
+    this.attempts.set(name, (this.attempts.get(name) ?? 0) + 1)
+    const prior = this.#tails.get(name) ?? Promise.resolve()
+    let release!: () => void
+    const current = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const tail = prior.then(() => current)
+    this.#tails.set(name, tail)
+    await prior
+    try {
+      options.signal?.throwIfAborted()
+      return await callback({ name, mode: options.mode ?? 'exclusive' })
+    } finally {
+      release()
+      if (this.#tails.get(name) === tail) this.#tails.delete(name)
+    }
   }
 }
 
@@ -213,6 +269,7 @@ async function resetAll(): Promise<void> {
   __resetWorkspaceRepositoryForTests()
   __resetBrowserRepositoryForTests()
   __resetDbForTests()
+  __resetBrowserWorkspaceControlDatabaseForTests()
   for (const name of NATTER_INDEXED_DATABASE_NAMES) await Dexie.delete(name)
 }
 
@@ -309,6 +366,8 @@ beforeEach(async () => {
   maintenanceReplacementDrain = createBrowserWorkspacePromotedReplacementDrain()
   compactionProbe.fail = false
   compactionProbe.calls = 0
+  compactionProbe.error = null
+  compactionProbe.result = null
   await resetAll()
   await openBrowserWorkspace()
   expect(
@@ -422,11 +481,20 @@ describe('storage retention', () => {
     await vi.waitFor(
       async () => {
         const after = await readBrowserWorkspaceDatabaseManifest()
-        expect(after.activationSequence).toBe(before.activationSequence + 1)
+        const compaction = await readStorageCompactionState(getDb())
+        expect(
+          after.activationSequence,
+          JSON.stringify({
+            after,
+            compaction,
+            compactionCalls: compactionProbe.calls,
+            runtime: getWorkspaceRuntimeControlSnapshot(),
+            resources: getWorkspaceRuntimeResourceStatuses(),
+          }),
+        ).toBe(before.activationSequence + 1)
         expect(after.activeDatabaseName).not.toBe(before.activeDatabaseName)
         expect(getWorkspaceRuntimeControlSnapshot().state).toBe('RUNNING')
         expect(await getDb().chats.get(chat.id)).toMatchObject({ id: chat.id })
-        const compaction = await readStorageCompactionState(getDb())
         expect(compaction).toMatchObject({
           requestRevision: 1,
           completedRevision: 1,
@@ -582,6 +650,19 @@ describe('storage retention', () => {
       now: 1,
     })
     await putTestChat(chat)
+    const profile = await createConfigurationProfile({
+      name: 'Compaction profile',
+      kind: 'openrouter',
+      baseUrl: 'https://openrouter.ai/api/v1',
+      now: 1,
+    })
+    const preset = await createConfigurationChatPreset({
+      id: 'compaction-catchup-preset',
+      name: 'Before catch-up',
+      connectionProfileId: profile.id,
+      settings: { ...cloneDefaultChatSettings(), profileId: profile.id },
+      now: 1,
+    })
     await requestCompaction()
     const before = await readBrowserWorkspaceDatabaseManifest()
     let releaseCopy!: () => void
@@ -610,14 +691,18 @@ describe('storage retention', () => {
           completedRevision: 0,
         })
       })
-      let foregroundCalls = 0
-      const foreground = runWorkspaceAction('attachment', () => {
-        foregroundCalls += 1
+      const foreground = configurationApplication.execute({
+        kind: 'chat-preset.update',
+        presetId: preset.id,
+        patch: { name: 'Caught up preset' },
+        now: 2,
       })
       releaseCopy()
       await holdSourceCopy
-      await foreground
-      expect(foregroundCalls).toBe(1)
+      await expect(foreground).resolves.toMatchObject({
+        kind: 'chat-preset-saved',
+        preset: { id: preset.id, name: 'Caught up preset' },
+      })
 
       await vi.waitFor(
         async () => {
@@ -636,9 +721,110 @@ describe('storage retention', () => {
         { timeout: 5_000 },
       )
       await expect(getDb().chats.get(chat.id)).resolves.toMatchObject({ id: chat.id })
+      await expect(getDb().presets.get(preset.id)).resolves.toMatchObject({
+        id: preset.id,
+        name: 'Caught up preset',
+      })
     } finally {
       releaseCopy()
       await holdSourceCopy.catch(() => undefined)
+      blocker.close()
+    }
+    await vi.waitFor(async () => {
+      expect((await readBrowserWorkspaceDatabaseManifest()).pending).toBeUndefined()
+    })
+    closeStorageMaintenanceRuntime()
+    await awaitStorageMaintenanceRuntimeIdle()
+  }, 15_000)
+
+  it('abandons online maintenance preparation before a required workspace restore', async () => {
+    const locks = new SerializedLockManager()
+    Object.defineProperty(navigator, 'locks', {
+      configurable: true,
+      value: locks,
+    })
+    const chat = buildChat({
+      id: 'preempted-compaction-restore-chat',
+      title: 'Required restore survives maintenance',
+      settings: cloneDefaultChatSettings(),
+      now: 1,
+    })
+    await putTestChat(chat)
+    const backup = await exportWorkspaceBackup()
+    await requestCompaction()
+    const before = await readBrowserWorkspaceDatabaseManifest()
+    let releaseCopy!: () => void
+    let markCopyHeld!: () => void
+    const copyHeld = new Promise<void>((resolve) => {
+      markCopyHeld = resolve
+    })
+    const copyGate = new Promise<void>((resolve) => {
+      releaseCopy = resolve
+    })
+    const sourceDatabaseName = getDb().name
+    const blocker = new NatterDb(sourceDatabaseName)
+    await blocker.open()
+    let restoring: ReturnType<typeof restoreWorkspaceBackup> | undefined
+    const holdSourceCopy = blocker
+      .transaction('rw', blocker.textTemplates, async () => {
+        markCopyHeld()
+        await Dexie.waitFor(copyGate)
+      })
+      .finally(() => blocker.close())
+    try {
+      await copyHeld
+      startMaintenance()
+      await vi.waitFor(async () => {
+        expect(await readBrowserWorkspaceCompactionState(sourceDatabaseName)).toMatchObject({
+          requestRevision: 1,
+          attemptedRevision: 1,
+          completedRevision: 0,
+        })
+      })
+      let maintenanceNonce: string | undefined
+      await vi.waitFor(async () => {
+        const pending = (await readBrowserWorkspaceDatabaseManifest()).pending
+        expect(pending).toMatchObject({
+          phase: 'preparing',
+          sourceDatabaseName,
+        })
+        maintenanceNonce = pending?.nonce
+      })
+      if (!maintenanceNonce) throw new Error('Maintenance preparation nonce missing')
+
+      const selectionAttemptsBeforeRestore =
+        locks.attempts.get(BROWSER_WORKSPACE_SELECTION_LOCK) ?? 0
+      restoring = restoreWorkspaceBackup(backup, { now: 2 })
+      await vi.waitFor(() => {
+        expect(locks.attempts.get(BROWSER_WORKSPACE_SELECTION_LOCK) ?? 0).toBeGreaterThan(
+          selectionAttemptsBeforeRestore,
+        )
+      })
+      releaseCopy()
+      await holdSourceCopy
+      await expect(restoring).resolves.toMatchObject({
+        chatCount: 1,
+      })
+      expect(
+        isWorkspaceMaintenancePreemptedError(compactionProbe.error) ||
+          (compactionProbe.result as { readonly kind?: unknown } | null)?.kind ===
+            'cleanup-required',
+      ).toBe(true)
+
+      const after = await readBrowserWorkspaceDatabaseManifest()
+      expect(after.activationSequence).toBe(before.activationSequence + 1)
+      expect(after.activeDatabaseName).not.toBe(before.activeDatabaseName)
+      expect(compactionProbe.calls).toBeGreaterThanOrEqual(1)
+      await expect(getDb().chats.get(chat.id)).resolves.toMatchObject({ id: chat.id })
+      expect(await readStorageCompactionState(getDb())).toMatchObject({
+        requestRevision: 0,
+        attemptedRevision: 0,
+        completedRevision: 0,
+      })
+    } finally {
+      releaseCopy()
+      await holdSourceCopy.catch(() => undefined)
+      await restoring?.catch(() => undefined)
       blocker.close()
     }
     await vi.waitFor(async () => {
@@ -1430,6 +1616,53 @@ describe('storage retention', () => {
         ]),
       )
     }
+  })
+
+  it('checkpoints the first deferred terminal journal from one ordered-index read', async () => {
+    const now = 100 * DAY_MS
+    const terminalRetentionAt = now - 1_000
+    const deferred = testGenerationLease({
+      streamId: 'deferred-terminal-stream',
+      chatId: 'chat',
+      messageId: 'deferred-terminal-message',
+      custody: 'recovery',
+      ownerClientId: 'recovery-owner',
+      fenceToken: 'deferred-terminal-fence',
+      replacementEpoch: 0,
+      admissionSequence: 1,
+      revision: 1,
+      startedAt: terminalRetentionAt - 10,
+      heartbeatAt: terminalRetentionAt,
+      phase: 'metadata-committed',
+      canonicalAt: terminalRetentionAt,
+      metadataCommittedAt: terminalRetentionAt + 1,
+      postCommit: { usedAt: terminalRetentionAt, profileId: 'profile' },
+    })
+    await getDb().streamLeases.put(deferred)
+
+    const commit = await runWorkspaceAction('maintenance', (permit) =>
+      getBrowserRepository().execute(permit, {
+        kind: 'maintenance.prune-terminal-stream-journals',
+        now,
+        maxAgeMs: DAY_MS,
+        limit: 32,
+      }),
+    )
+
+    expect(commit.value).toEqual({
+      scanned: 0,
+      deletedStreamIds: [],
+      deletedFrames: 0,
+      earliestDeferredAt: terminalRetentionAt,
+      done: true,
+    })
+    expect(await getDb().streamLeases.get(deferred.streamId)).toEqual(deferred)
+    expect(await getDb().storageRetentionState.get('terminal-stream-prune')).toMatchObject({
+      task: 'terminal-stream-prune',
+      phase: 'idle',
+      earliestDeferredAt: terminalRetentionAt,
+      revision: 1,
+    })
   })
 
   it('reaps old zero-owner attachment bundles in bounded batches', async () => {

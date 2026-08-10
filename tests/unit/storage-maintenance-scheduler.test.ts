@@ -54,12 +54,77 @@ it('transfers promoted replacement custody before ending the finalized maintenan
   )
   expect(runPump).toContain("if (outcome.kind === 'handoff') return")
   expect(runCompaction).not.toContain('#observeTransitionHandoff')
-  expect(runCompaction.indexOf('readStorageCompactionState')).toBeLessThan(
+  expect(runCompaction.indexOf('awaitStorageCompactionDebtIdle()')).toBeLessThan(
     runCompaction.indexOf("import('./browser-workspace-compaction')"),
+  )
+  expect(runCompaction.indexOf('storageCompactionDemandPending')).toBeLessThan(
+    runCompaction.indexOf("import('./browser-workspace-compaction')"),
+  )
+  expect(runCompaction).toContain(
+    "if (!(await storageCompactionDemandPending(this.#requiredDatabase()))) return { kind: 'done' }",
+  )
+  expect(runCompaction).toMatch(
+    /throwIfPageHiding\(\)[\s\S]*import\('\.\/browser-workspace-compaction'\)[\s\S]*throwIfPageHiding\(\)/u,
   )
   expect(runCompaction).toMatch(
     /this\.#replacementHandoffs\.transfer\(started\.handoff\)[\s\S]*return \{ kind: 'handoff' \}/u,
   )
+})
+
+it('owns online replacement preparation before preflight and pauses it for foreground demand', () => {
+  const source = readFileSync(
+    resolve(__dirname, '../../src/store/browser-workspace-replacement-runner.ts'),
+    'utf8',
+  )
+  const onlineStart = source.indexOf(
+    'export function tryStartBrowserWorkspaceOnlineReplacementIfIdle',
+  )
+  const launchStart = source.indexOf('function launchBrowserWorkspaceReplacement', onlineStart)
+  const onlineAdmission = source.slice(onlineStart, launchStart)
+  const requiredStart = source.indexOf('export async function runBrowserWorkspaceReplacement')
+  const requiredEnd = source.indexOf(
+    'export function tryStartBrowserWorkspaceOnlineReplacementIfIdle',
+    requiredStart,
+  )
+  const requiredAdmission = source.slice(requiredStart, requiredEnd)
+  const gatedStart = source.indexOf('async function runGatedBrowserWorkspaceReplacementAttempt')
+  const authorityStart = source.indexOf('function launchReplacementAuthority', gatedStart)
+  const gatedAttempt = source.slice(gatedStart, authorityStart)
+  const slottedPrepared = gatedAttempt.slice(gatedAttempt.indexOf('const onlinePrepared'))
+  const commitStart = source.indexOf('async function runSlottedReplacementCommit')
+  const commitEnd = source.indexOf('function createReplacementMutationCapability', commitStart)
+  const slottedCommit = source.slice(commitStart, commitEnd)
+
+  expect(onlineAdmission.indexOf("tryRunWorkspaceActionIfIdle(\n    'maintenance'")).toBeLessThan(
+    onlineAdmission.indexOf('launchBrowserWorkspaceReplacement('),
+  )
+  expect(
+    requiredAdmission.indexOf("runWorkspaceAction(\n        'workspace-replacement'"),
+  ).toBeLessThan(requiredAdmission.indexOf('preemptWorkspaceMaintenancePreparation(permit)'))
+  expect(requiredAdmission.indexOf('preemptWorkspaceMaintenancePreparation(permit)')).toBeLessThan(
+    requiredAdmission.indexOf('launchBrowserWorkspaceReplacement('),
+  )
+  expect(gatedAttempt.indexOf('awaitWorkspaceForegroundDemandIdle')).toBeLessThan(
+    gatedAttempt.indexOf('await preflight(session)'),
+  )
+  expect(
+    gatedAttempt.indexOf(
+      'awaitWorkspaceForegroundDemandIdle',
+      gatedAttempt.indexOf('await preflight(session)') + 1,
+    ),
+  ).toBeLessThan(gatedAttempt.indexOf('tryBeginBrowserWorkspaceDatabaseReplacement()'))
+  expect(gatedAttempt).toMatch(/const authority = await awaitReplacementAuthority\(policy\)/u)
+  expect(slottedPrepared.indexOf('withExclusiveGenerationLifetime(')).toBeLessThan(
+    slottedPrepared.indexOf('await awaitReplacementAuthority(policy)'),
+  )
+  expect(slottedPrepared.indexOf('withExclusiveGenerationLifetime(')).toBeLessThan(
+    slottedPrepared.indexOf('postBrowserWorkspaceSlotQuiesce(journal)'),
+  )
+  expect(slottedPrepared.indexOf('withExclusiveGenerationLifetime(')).toBeLessThan(
+    slottedPrepared.indexOf('runSlottedBrowserWorkspaceReplacement('),
+  )
+  expect(slottedCommit).not.toContain('withExclusiveGenerationLifetime(')
+  expect(source).not.toContain('awaitOnlineReplacementAuthority')
 })
 
 it('starts the maintenance pump outside an ambient Dexie transaction without waiting for it', async () => {

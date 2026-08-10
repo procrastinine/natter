@@ -55,26 +55,31 @@ export async function reclaimInactiveBrowserWorkspaceDatabases(): Promise<Browse
   const skipped: BrowserWorkspaceDatabaseName[] = []
   const failed: Array<{ databaseName: BrowserWorkspaceDatabaseName; reason: string }> = []
   for (const databaseName of snapshot.value.databaseNames) {
-    const result = await tryWithExclusiveBrowserWorkspaceSlot(databaseName, async () => {
-      const validation = await tryWithBrowserWorkspaceSelectionGate(async () => {
+    const admitted = await tryWithBrowserWorkspaceSelectionGate(async (selection) => {
+      return tryWithExclusiveBrowserWorkspaceSlot(selection, databaseName, async () => {
         const manifest = await readBrowserWorkspaceDatabaseManifest()
-        return manifest.pending === undefined && manifest.activeDatabaseName !== databaseName
+        if (manifest.pending || manifest.activeDatabaseName === databaseName) {
+          return { status: 'skipped' as const }
+        }
+        try {
+          await Dexie.delete(databaseName)
+          await deleteBrowserWorkspaceCompactionState(databaseName)
+          return { status: 'deleted' as const }
+        } catch (error) {
+          return { status: 'failed' as const, reason: errorText(error) }
+        }
       })
-      if (!validation.acquired || !validation.value) return { status: 'skipped' as const }
-      try {
-        await Dexie.delete(databaseName)
-        await deleteBrowserWorkspaceCompactionState(databaseName)
-        return { status: 'deleted' as const }
-      } catch (error) {
-        return { status: 'failed' as const, reason: errorText(error) }
-      }
     })
-    if (!result.acquired || result.value.status === 'skipped') {
+    if (
+      !admitted.acquired ||
+      !admitted.value.acquired ||
+      admitted.value.value.status === 'skipped'
+    ) {
       skipped.push(databaseName)
-    } else if (result.value.status === 'deleted') {
+    } else if (admitted.value.value.status === 'deleted') {
       deleted.push(databaseName)
     } else {
-      failed.push({ databaseName, reason: result.value.reason })
+      failed.push({ databaseName, reason: admitted.value.value.reason })
     }
   }
   return {

@@ -421,18 +421,18 @@ describe('production protocol fact bundle', () => {
     expect(report.reports['tab-cross-tab-locality']).toMatchObject({
       ok: true,
       surfaces: 20,
-      records: 344,
-      constructorSites: 762,
+      records: 345,
+      constructorSites: 764,
       architectureGaps: 3,
-      recordGaps: 149,
+      recordGaps: 150,
       siteGaps: 4,
       problems: [],
     })
     expect(report.reports['production-discriminated-unions']).toMatchObject({
       ok: true,
-      discoveredCount: 470,
-      controlProtocolCount: 220,
-      gapCount: 178,
+      discoveredCount: 472,
+      controlProtocolCount: 221,
+      gapCount: 179,
       constructionGapCount: 10,
       violations: [],
     })

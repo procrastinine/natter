@@ -1,5 +1,5 @@
 import type Dexie from 'dexie'
-import type { Transaction } from 'dexie'
+import type { PromiseExtended, Transaction } from 'dexie'
 import { newId } from '../lib/ulid'
 import type { WorkspaceMeta } from './repository'
 
@@ -44,38 +44,40 @@ export async function seedBrowserWorkspaceReplacementMeta(
   })
 }
 
-export async function readBrowserWorkspaceMetaFromTransaction(
+export function readBrowserWorkspaceMetaFromTransaction(
   tx: Transaction,
-): Promise<StoredWorkspaceMeta> {
-  return storedWorkspaceMeta(
-    await tx
-      .table<BrowserWorkspaceFenceRow, string>('workspaceFence')
-      .get(BROWSER_WORKSPACE_FENCE_ID),
-  )
+): PromiseExtended<StoredWorkspaceMeta> {
+  return tx
+    .table<BrowserWorkspaceFenceRow, string>('workspaceFence')
+    .get(BROWSER_WORKSPACE_FENCE_ID)
+    .then(storedWorkspaceMeta)
 }
 
-export async function markBrowserWorkspaceReplaced(
+export function markBrowserWorkspaceReplaced(
   tx: Transaction,
   previous: WorkspaceMeta,
-): Promise<number> {
+): PromiseExtended<number> {
   if (previous.replacementEpoch >= Number.MAX_SAFE_INTEGER) {
     throw new Error('WorkspaceReplacementEpochExhausted')
   }
   const table = tx.table<BrowserWorkspaceFenceRow, string>('workspaceFence')
-  const current = storedWorkspaceMeta(await table.get(BROWSER_WORKSPACE_FENCE_ID))
-  if (
-    current.workspaceId !== previous.workspaceId ||
-    current.replacementEpoch !== previous.replacementEpoch
-  ) {
-    throw new Error('BrowserWorkspaceFenceChanged')
-  }
-  const replacementEpoch = previous.replacementEpoch + 1
-  await table.put({
-    id: BROWSER_WORKSPACE_FENCE_ID,
-    workspaceId: previous.workspaceId,
-    replacementEpoch,
+  return table.get(BROWSER_WORKSPACE_FENCE_ID).then((row) => {
+    const current = storedWorkspaceMeta(row)
+    if (
+      current.workspaceId !== previous.workspaceId ||
+      current.replacementEpoch !== previous.replacementEpoch
+    ) {
+      throw new Error('BrowserWorkspaceFenceChanged')
+    }
+    const replacementEpoch = previous.replacementEpoch + 1
+    return table
+      .put({
+        id: BROWSER_WORKSPACE_FENCE_ID,
+        workspaceId: previous.workspaceId,
+        replacementEpoch,
+      })
+      .then(() => replacementEpoch)
   })
-  return replacementEpoch
 }
 
 function storedWorkspaceMeta(row: unknown): StoredWorkspaceMeta {

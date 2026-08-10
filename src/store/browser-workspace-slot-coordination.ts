@@ -62,6 +62,17 @@ interface WorkspaceSlotLockManager {
   ): Promise<T>
 }
 
+declare const browserWorkspaceSelectionGrantBrand: unique symbol
+
+export interface BrowserWorkspaceSelectionGrant {
+  readonly mode: 'exclusive'
+  readonly [browserWorkspaceSelectionGrantBrand]: true
+}
+
+export type BrowserWorkspaceSlotOperation<T> =
+  | { readonly kind: 'transient-probe'; readonly run: () => Promise<T> }
+  | { readonly kind: 'retained'; readonly run: () => Promise<T> }
+
 declare const browserWorkspaceSlotLeaseBrand: unique symbol
 
 export interface BrowserWorkspaceSlotLeaseHandle {
@@ -143,24 +154,46 @@ export function browserWorkspaceSlotSwitchingSupported(): boolean {
 }
 
 export function withBrowserWorkspaceSelectionGate<T>(
-  operation: () => Promise<T>,
+  operation: (grant: BrowserWorkspaceSelectionGrant) => Promise<T>,
   signal?: AbortSignal,
 ): Promise<T> {
   if (signal?.aborted) return Promise.reject(workspaceSlotAbortError(signal.reason))
   const manager = slotLockManager()
-  if (!manager) return operation()
+  if (!manager) return operation({ mode: 'exclusive' } as BrowserWorkspaceSelectionGrant)
   return manager.request(
     SLOT_SELECTION_GATE_LOCK,
     { mode: 'exclusive', ...(signal ? { signal } : {}) },
     (lock) => {
       if (!lock) throw new Error('BrowserWorkspaceSelectionGateUnavailable')
       if (signal?.aborted) throw workspaceSlotAbortError(signal.reason)
-      return operation()
+      return operation({ mode: 'exclusive' } as BrowserWorkspaceSelectionGrant)
     },
   )
 }
 
-export function withBrowserWorkspaceSlotProbe<T>(
+export function withBrowserWorkspaceSlotOperation<T>(
+  databaseName: BrowserWorkspaceDatabaseName,
+  operation: BrowserWorkspaceSlotOperation<T>,
+  signal?: AbortSignal,
+): Promise<T> {
+  if (signal?.aborted) return Promise.reject(workspaceSlotAbortError(signal.reason))
+  if (operation.kind === 'transient-probe') {
+    return withBrowserWorkspacePhysicalSlotProbe(databaseName, operation.run, signal)
+  }
+  const manager = slotLockManager()
+  if (!manager) return operation.run()
+  return manager.request(
+    SLOT_SELECTION_GATE_LOCK,
+    { mode: 'shared', ...(signal ? { signal } : {}) },
+    (lock) => {
+      if (!lock) throw new Error('BrowserWorkspaceSlotProbeAdmissionUnavailable')
+      if (signal?.aborted) throw workspaceSlotAbortError(signal.reason)
+      return withBrowserWorkspacePhysicalSlotProbe(databaseName, operation.run, signal)
+    },
+  )
+}
+
+function withBrowserWorkspacePhysicalSlotProbe<T>(
   databaseName: BrowserWorkspaceDatabaseName,
   operation: () => Promise<T>,
   signal?: AbortSignal,
@@ -179,27 +212,8 @@ export function withBrowserWorkspaceSlotProbe<T>(
   )
 }
 
-export function withBrowserWorkspaceSlotVersionChange<T>(
-  databaseName: BrowserWorkspaceDatabaseName,
-  operation: () => Promise<T>,
-  signal?: AbortSignal,
-): Promise<T> {
-  if (signal?.aborted) return Promise.reject(workspaceSlotAbortError(signal.reason))
-  const manager = slotLockManager()
-  if (!manager) return operation()
-  return manager.request(
-    slotLockName(databaseName),
-    { mode: 'exclusive', ...(signal ? { signal } : {}) },
-    (lock) => {
-      if (!lock) throw new Error('BrowserWorkspaceSlotVersionChangeUnavailable')
-      if (signal?.aborted) throw workspaceSlotAbortError(signal.reason)
-      return operation()
-    },
-  )
-}
-
 export async function tryWithBrowserWorkspaceSelectionGate<T>(
-  operation: () => Promise<T>,
+  operation: (grant: BrowserWorkspaceSelectionGrant) => Promise<T>,
   signal?: AbortSignal,
 ): Promise<{ acquired: false } | { acquired: true; value: T }> {
   if (signal?.aborted) throw workspaceSlotAbortError(signal.reason)
@@ -229,7 +243,10 @@ export async function tryWithBrowserWorkspaceSelectionGate<T>(
           signal?.removeEventListener('abort', abort)
           if (!lock) return { acquired: false }
           if (signal?.aborted) throw workspaceSlotAbortError(signal.reason)
-          return { acquired: true, value: await operation() }
+          return {
+            acquired: true,
+            value: await operation({ mode: 'exclusive' } as BrowserWorkspaceSelectionGrant),
+          }
         },
       )
     } catch (error) {
@@ -322,6 +339,7 @@ export function postBrowserWorkspaceSlotQuiesce(message: {
 }
 
 export async function withExclusiveBrowserWorkspaceSlots<T>(
+  _selection: BrowserWorkspaceSelectionGrant,
   databaseNames: readonly BrowserWorkspaceDatabaseName[],
   operation: () => Promise<T>,
   signal?: AbortSignal,
@@ -347,6 +365,7 @@ export async function withExclusiveBrowserWorkspaceSlots<T>(
 }
 
 export async function tryWithExclusiveBrowserWorkspaceSlot<T>(
+  _selection: BrowserWorkspaceSelectionGrant,
   databaseName: BrowserWorkspaceDatabaseName,
   operation: () => Promise<T>,
 ): Promise<{ acquired: false } | { acquired: true; value: T }> {

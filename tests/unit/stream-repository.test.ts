@@ -19,7 +19,7 @@ import {
 } from '../../src/store/browser-workspace-lifecycle'
 import { configurationApplication } from '../../src/store/configuration-application'
 import { importMessagesOp } from '../../src/store/conversation-command-client'
-import { __resetDbForTests, getDb } from '../../src/store/db'
+import { __resetDbForTests, childListKey, getDb } from '../../src/store/db'
 import type { MessageHeaderRow } from '../../src/store/message-storage'
 import type {
   CanonicalStreamJournalFrameRow,
@@ -519,6 +519,113 @@ describe('browser stream repository protocol', () => {
     expect(prepared.prompt.headers).toHaveLength(4_096)
     expect(new Set(prepared.prompt.headers.map((header) => header.id))).toEqual(hintedIds)
   }, 30_000)
+
+  it('reuses transaction-owned header and child-slot evidence across a warm send', async () => {
+    const seeded = await seedTargets(1)
+    const target = requiredTarget(seeded, 0)
+    const preparedInput = await warmSendPrepareInput(seeded.chatId, target)
+    const db = getDb()
+    expect(preparedInput.assistantMessageId < preparedInput.userMessageId).toBe(true)
+    expect((await db.chats.get(seeded.chatId))?.lastUpdatedLeafId).toBe(target.id)
+    expect(preparedInput.input.placement.createdAt).toBeGreaterThan(target.createdAt)
+    expect(preparedInput.input.placement.createdAt).toBeGreaterThan(
+      required(await db.messages.get(target.id), 'warm send target header').createdAt,
+    )
+    const tablePrototype = Object.getPrototypeOf(db.messages) as typeof db.messages
+    const requestEvents: Array<{
+      readonly operation: 'get' | 'bulk-get'
+      readonly tableName: string
+      readonly values: readonly unknown[]
+      readonly transaction: Transaction | null
+    }> = []
+    const originalGet = tablePrototype.get
+    const originalBulkGet = tablePrototype.bulkGet
+    vi.spyOn(tablePrototype, 'get').mockImplementation(function (
+      this: typeof tablePrototype,
+      key,
+      thenShortcut,
+    ) {
+      requestEvents.push({
+        operation: 'get',
+        tableName: this.name,
+        values: [key],
+        transaction:
+          (this as typeof tablePrototype & { readonly _tx?: Transaction })._tx ??
+          Dexie.currentTransaction,
+      })
+      return originalGet.call(this, key, thenShortcut)
+    })
+    vi.spyOn(tablePrototype, 'bulkGet').mockImplementation(function (
+      this: typeof tablePrototype,
+      keys,
+    ) {
+      requestEvents.push({
+        operation: 'bulk-get',
+        tableName: this.name,
+        values: [...keys],
+        transaction:
+          (this as typeof tablePrototype & { readonly _tx?: Transaction })._tx ??
+          Dexie.currentTransaction,
+      })
+      return originalBulkGet.call(this, keys)
+    })
+    const transaction = vi.spyOn(db, 'transaction')
+    const prepared = await execute({ kind: 'attempt.prepare', input: preparedInput.input })
+
+    expect(prepared.strategy).toBe('send')
+    expect(prepared.user?.parentId).toBe(target.id)
+    expect(prepared.assistant?.parentId).toBe(preparedInput.userMessageId)
+    expect(
+      transaction.mock.calls.filter((call) => transactionCallIncludesTable(call, 'messages')),
+    ).toHaveLength(1)
+    const authoritativeTransaction = requestEvents.find(
+      (event) =>
+        event.operation === 'get' &&
+        event.tableName === 'messages' &&
+        event.values[0] === preparedInput.assistantMessageId &&
+        event.transaction !== null,
+    )?.transaction
+    expect(authoritativeTransaction).not.toBeNull()
+    expect(authoritativeTransaction).not.toBeUndefined()
+    const authoritativeEvents = requestEvents.filter(
+      (event) => event.transaction === authoritativeTransaction,
+    )
+    const messageGets = authoritativeEvents
+      .filter((event) => event.operation === 'get' && event.tableName === 'messages')
+      .map((event) => event.values[0])
+    expect(messageGets.filter((messageId) => messageId === target.id)).toEqual([])
+    expect(messageGets.filter((messageId) => messageId === preparedInput.userMessageId)).toEqual([
+      preparedInput.userMessageId,
+    ])
+    expect(
+      messageGets.filter((messageId) => messageId === preparedInput.assistantMessageId),
+    ).toEqual([preparedInput.assistantMessageId])
+    const messageBulkGets = authoritativeEvents
+      .filter((event) => event.operation === 'bulk-get' && event.tableName === 'messages')
+      .map((event) => event.values)
+    expect(messageBulkGets).toContainEqual(preparedInput.promptMessageIds)
+    expect(messageBulkGets).not.toContainEqual([
+      preparedInput.userMessageId,
+      preparedInput.assistantMessageId,
+    ])
+    const childListBulkGets = authoritativeEvents
+      .filter((event) => event.operation === 'bulk-get' && event.tableName === 'childLists')
+      .map((event) => event.values as readonly string[])
+    const targetChildListId = childListKey(seeded.chatId, target.id)
+    const userChildListId = childListKey(seeded.chatId, preparedInput.userMessageId)
+    const assistantChildListId = childListKey(seeded.chatId, preparedInput.assistantMessageId)
+    expect(childListBulkGets.filter((ids) => ids.includes(targetChildListId))).toHaveLength(1)
+    expect(childListBulkGets.filter((ids) => ids.includes(userChildListId))).toHaveLength(0)
+    expect(childListBulkGets.filter((ids) => ids.includes(assistantChildListId))).toHaveLength(0)
+    expect(
+      authoritativeEvents.filter(
+        (event) => event.operation === 'bulk-get' && event.tableName === 'childSlotMembers',
+      ),
+    ).toHaveLength(0)
+    const committedChat = await getDb().chats.get(seeded.chatId)
+    expect(committedChat?.lastUpdatedLeafId).toBe(preparedInput.assistantMessageId)
+    expect(committedChat?.previewText).toBe('question-0')
+  })
 
   it('falls back to the current persisted path when the read hint is cyclic', async () => {
     const seeded = await seedTargets(1)
@@ -1340,6 +1447,86 @@ async function continuationPrepareInput(input: {
   }
 }
 
+async function warmSendPrepareInput(chatId: string, target: Message) {
+  const chat = required(await getDb().chats.get(chatId), 'warm send chat')
+  const slot = await getDb().childLists.get(childListKey(chatId, target.id))
+  const promptHeaders = await promptPathHeaderClaims(target.id)
+  const startedAt = Date.now() + 100
+  const userMessageId = `warm-send-user-${startedAt}`
+  const assistantMessageId = `warm-send-assistant-${startedAt}`
+  const workspace = await workspaceMeta()
+  return {
+    userMessageId,
+    assistantMessageId,
+    promptMessageIds: promptHeaders.map((header) => header.messageId),
+    input: {
+      strategy: 'send' as const,
+      lease: testStreamLeaseAdmission({
+        streamId: `warm-send-stream-${startedAt}`,
+        chatId,
+        messageId: assistantMessageId,
+        ownerClientId: getStreamClientId(),
+        fenceToken: `warm-send-fence-${startedAt}`,
+        replacementEpoch: workspace.replacementEpoch,
+        startedAt,
+        heartbeatAt: startedAt,
+        attemptKind: 'generation',
+      }),
+      promptPath: {
+        requirement: {
+          kind: 'send' as const,
+          surface: 'chat' as const,
+          chatId,
+          target: { kind: 'fixed' as const, messageId: target.id },
+          childSlot: 'append' as const,
+        },
+        pathHint: {
+          chatId,
+          structuralVersion: chat.structuralVersion,
+          leafId: target.id,
+          headers: promptHeaders,
+          placementSlot: {
+            parentId: target.id,
+            slotVersion: slot?.version ?? 0,
+            liveCount: slot?.liveCount ?? 0,
+            nextSiblingIndex: slot?.nextSiblingIndex ?? 0,
+          },
+          targetTurn: {
+            turnId: target.turnId,
+            turnIndex: target.turnIndex,
+          },
+        },
+      },
+      configurationIntent: {
+        preferredDispatchKeyId: null,
+      },
+      placement: {
+        chatId,
+        createdAt: startedAt,
+        assistantMessageId,
+        user: {
+          messageId: userMessageId,
+          content: [{ type: 'text' as const, text: 'warm send' }],
+          attachmentRefs: [],
+        },
+        prefillContent: [],
+      },
+    },
+  }
+}
+
+function transactionCallIncludesTable(call: readonly unknown[], tableName: string): boolean {
+  return call.some((argument) => {
+    if (Array.isArray(argument)) {
+      return (argument as unknown[]).some((table) => namedTableMatches(table, tableName))
+    }
+    return namedTableMatches(argument, tableName)
+  })
+}
+
+function namedTableMatches(value: unknown, tableName: string): boolean {
+  return value !== null && typeof value === 'object' && 'name' in value && value.name === tableName
+}
 async function promptPathHeaderClaims(messageId: MessageId) {
   const reversed: Array<{
     messageId: MessageId

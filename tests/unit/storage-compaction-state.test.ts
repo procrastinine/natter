@@ -42,6 +42,7 @@ import {
   startStorageCompactionIntentOwner,
   stopStorageCompactionIntentOwner,
   storageCompactionDebtThreshold,
+  storageCompactionDemandPending,
   storageCompactionRecoveryIntentKey,
   subscribeStorageCompactionRequests,
 } from '../../src/store/storage-compaction-state'
@@ -97,6 +98,26 @@ async function overwriteStoredCompactionState(value: Record<string, unknown>): P
   }
 }
 
+async function readStoredCompactionState(databaseName: string): Promise<unknown> {
+  const controlDb = await new Promise<IDBDatabase>((resolve, reject) => {
+    const request = indexedDB.open(BROWSER_WORKSPACE_CONTROL_DATABASE_NAME)
+    request.onerror = () => reject(request.error)
+    request.onsuccess = () => resolve(request.result)
+  })
+  try {
+    return await new Promise<unknown>((resolve, reject) => {
+      const request = controlDb
+        .transaction('compactionStates', 'readonly')
+        .objectStore('compactionStates')
+        .get(databaseName)
+      request.onerror = () => reject(request.error)
+      request.onsuccess = () => resolve(request.result)
+    })
+  } finally {
+    controlDb.close()
+  }
+}
+
 beforeEach(async () => {
   vi.stubGlobal('localStorage', new TestStorage())
   localStorage.clear()
@@ -120,6 +141,27 @@ afterEach(async () => {
 })
 
 describe('storage compaction state', () => {
+  it('observes durable demand without creating or repairing control state', async () => {
+    const source = { name: `compaction-demand-${crypto.randomUUID()}` }
+
+    await expect(storageCompactionDemandPending(source)).resolves.toBe(false)
+    await expect(readStoredCompactionState(source.name)).resolves.toBeUndefined()
+
+    const malformed = { databaseName: source.name, formatVersion: 99, requestRevision: 0 }
+    await overwriteStoredCompactionState(malformed)
+    await expect(storageCompactionDemandPending(source)).resolves.toBe(true)
+    await expect(readStoredCompactionState(source.name)).resolves.toEqual(malformed)
+
+    await deleteBrowserWorkspaceCompactionState(source.name)
+    await recordBrowserWorkspaceCompactionDebt(source.name, 0)
+    await expect(storageCompactionDemandPending(source)).resolves.toBe(false)
+    await recordBrowserWorkspaceCompactionDebt(
+      source.name,
+      STORAGE_COMPACTION_MIN_RECLAIMABLE_BYTES,
+    )
+    await expect(storageCompactionDemandPending(source)).resolves.toBe(true)
+  })
+
   it('caps small-workspace deferred garbage at 64 MiB', () => {
     expect(STORAGE_COMPACTION_MIN_RECLAIMABLE_BYTES).toBe(64 * 1024 * 1024)
   })
@@ -205,6 +247,28 @@ describe('storage compaction state', () => {
     expect(crossing).toMatchObject({ requested: true, state: { requestRevision: 1 } })
     expect(withinBucket).toMatchObject({ requested: false, state: { requestRevision: 1 } })
     expect(secondCrossing).toMatchObject({ requested: true, state: { requestRevision: 2 } })
+  })
+
+  it('serializes concurrent post-commit debt into one exact control-row history', async () => {
+    db = createDbForTests(`natter-compaction-concurrent-debt-${crypto.randomUUID()}`)
+    await db.open()
+    const writes = 128
+    const bytesPerWrite = STORAGE_COMPACTION_MIN_RECLAIMABLE_BYTES / writes
+    const databaseName = db.name
+
+    const results = await Promise.all(
+      Array.from({ length: writes }, () =>
+        recordBrowserWorkspaceCompactionDebt(databaseName, bytesPerWrite),
+      ),
+    )
+
+    expect(results.filter((result) => result.requested)).toHaveLength(1)
+    await expect(readStorageCompactionState(db)).resolves.toMatchObject({
+      knownReclaimableBytes: STORAGE_COMPACTION_MIN_RECLAIMABLE_BYTES,
+      requestRevision: 1,
+      attemptedRevision: 0,
+      completedRevision: 0,
+    })
   })
 
   it('atomically requeues only the exact uncommitted attempt without new debt', async () => {

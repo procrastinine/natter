@@ -36,6 +36,8 @@ interface TabCatalogPageRead<Meta> {
   readonly cursor?: string
   readonly direction: 'forward' | 'backward'
   readonly limit: number
+  readonly mode: 'initial' | 'navigate' | 'refresh' | 'load-more'
+  readonly first: boolean
   readonly previousMeta?: Meta
 }
 
@@ -62,6 +64,8 @@ export interface TabCatalogSessionAdapter<Input, Query, Row, Id, Meta> {
     signal: AbortSignal,
   ) => Promise<ReadEnvelope<readonly (Row | undefined)[]>>
   readonly changeImpact: (effect: WorkspaceEffect) => TabCatalogChangeImpact<Id>
+  readonly reuseMetaOnRefresh?: boolean
+  readonly invalidateMeta?: (meta: Meta, effect: WorkspaceEffect) => Meta
   readonly rowId: (row: Row) => Id
   readonly cloneRow: (row: Row) => Row
   readonly compareRows: (left: Row, right: Row, query: Query) => number
@@ -463,6 +467,17 @@ class TabCatalogSession<Input, Query, Row, Id, Meta>
     if (effect.kind === 'replace' || !sameFence(effect, active)) return
     const impact = this.adapter.changeImpact(effect)
     if (!impact.relevant) return
+    const current = this.snapshot
+    if (current && this.adapter.invalidateMeta) {
+      const meta = this.adapter.invalidateMeta(current.page.meta, effect)
+      if (meta !== current.page.meta) {
+        this.publish({
+          ...current,
+          revision: ++this.revision,
+          page: Object.freeze({ ...current.page, meta }),
+        })
+      }
+    }
     if (this.pageRead) this.pageRead.invalidated = true
     if (impact.broad) {
       this.refreshQueued = true
@@ -755,7 +770,9 @@ class TabCatalogSession<Input, Query, Row, Id, Meta>
     let previousCursor = base?.previousCursor
     let nextCursor = base?.nextCursor
     const reusableMeta =
-      read.mode === 'load-more' || read.mode === 'navigate'
+      read.mode === 'load-more' ||
+      read.mode === 'navigate' ||
+      (read.mode === 'refresh' && this.adapter.reuseMetaOnRefresh)
         ? (base?.meta ?? read.acceptedMeta)
         : undefined
     let meta = reusableMeta ?? this.adapter.emptyPage().meta
@@ -764,6 +781,7 @@ class TabCatalogSession<Input, Query, Row, Id, Meta>
     let firstRead = true
 
     while (firstRead || (rows.length < read.targetRowCount && cursor)) {
+      const first = firstRead
       firstRead = false
       const remaining = Math.max(1, read.targetRowCount - rows.length)
       const envelope = await this.adapter.readPage(
@@ -772,6 +790,8 @@ class TabCatalogSession<Input, Query, Row, Id, Meta>
           ...(cursor ? { cursor } : {}),
           direction,
           limit: Math.min(read.active.pageSize, remaining),
+          mode: read.mode,
+          first,
           ...(hasAcceptedMeta ? { previousMeta: meta } : {}),
         },
         read.controller.signal,

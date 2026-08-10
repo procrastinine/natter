@@ -31,6 +31,29 @@
         "kind": "none",
         "targets": []
       },
+      "cleanupRestoreObligation": "Use one readonly preset transaction, close the exact raw database handle, and leave the staged destination workspace unchanged.",
+      "publicUiCannotExpress": "The catch-up proof requires the exact preset value in the inactive destination database before activation, which the public UI cannot address.",
+      "siteIds": [
+        "tests/e2e/storage-reclamation.spec.ts::owner=function%3AreadFirstPresetFromDatabase::operation=indexeddb.database.close::mode=-::store=-::occurrence=1",
+        "tests/e2e/storage-reclamation.spec.ts::owner=function%3AreadFirstPresetFromDatabase::operation=indexeddb.database.transaction::mode=readonly::store=presets::occurrence=1",
+        "tests/e2e/storage-reclamation.spec.ts::owner=function%3AreadFirstPresetFromDatabase::operation=indexeddb.factory.open::mode=-::store=-::occurrence=1",
+        "tests/e2e/storage-reclamation.spec.ts::owner=function%3AreadFirstPresetFromDatabase::operation=indexeddb.openCursor::mode=readonly::store=presets::occurrence=1",
+        "tests/e2e/storage-reclamation.spec.ts::owner=function%3AreadFirstPresetFromDatabase::operation=indexeddb.transaction.object-store::mode=readonly::store=presets::occurrence=1"
+      ],
+      "cleanupEvidence": {
+        "siteIds": [
+          "tests/e2e/storage-reclamation.spec.ts::owner=function%3AreadFirstPresetFromDatabase::operation=indexeddb.database.close::mode=-::store=-::occurrence=1"
+        ],
+        "fixtureOwners": [],
+        "processOwned": false
+      }
+    },
+    {
+      "purpose": "read-only-assertion",
+      "mutationScope": {
+        "kind": "none",
+        "targets": []
+      },
       "cleanupRestoreObligation": "Read only the tiny fresh-workspace fixture, close the exact raw database handle, and leave its durable rows and schema unchanged.",
       "publicUiCannotExpress": "The physical-version startup proof must reproduce the current populate rows before reopening the same isolated database at an older schema; the public UI does not expose those storage rows.",
       "siteIds": [

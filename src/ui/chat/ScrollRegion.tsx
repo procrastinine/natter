@@ -76,6 +76,7 @@ export interface ScrollRegionCommands {
     edge?: 'top' | 'bottom'
     replaceExisting?: boolean
   }): boolean
+  getUserScrollRevision(): number
   revealNearest(element: HTMLElement): boolean
   getLayoutAnchorMessageId(): string | null
   getLayoutAnchorSnapshot(): {
@@ -477,6 +478,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
   const lastNativeScrollTopRef = useRef<number | null>(null)
   const lastObservedScrollGeometryRef = useRef<ObservedScrollGeometry | null>(null)
   const userScrollIntentRef = useRef(false)
+  const userScrollRevisionRef = useRef(0)
   const instantScrollIntentRef = useRef<InstantScrollIntent | null>(null)
   const layoutCorrectionPendingRef = useRef(false)
   const smoothScrollIntentRef = useRef<SmoothScrollIntent | null>(null)
@@ -1257,13 +1259,15 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
           instantScrollIntentRef.current = null
         }
       }
-      const userMovedAwayFromBottom =
+      const viewportMovedUp =
         source === 'scroll' &&
         !programmaticScroll &&
         previousNativeScrollTop !== null &&
-        container.scrollTop < previousNativeScrollTop - 0.5 &&
-        distanceFromBottom > BOTTOM_REACQUIRE_TOLERANCE_PX &&
-        (userScrollIntentRef.current || nativeViewportMoved)
+        container.scrollTop < previousNativeScrollTop - 0.5
+      const userMovedAwayFromBottom =
+        viewportMovedUp &&
+        (userScrollIntentRef.current ||
+          (nativeViewportMoved && distanceFromBottom > BOTTOM_REACQUIRE_TOLERANCE_PX))
       const next = userMovedAwayFromBottom
         ? 'pinned'
         : scrollStateFromPosition(container, thresholdRef.current, stateRef.current)
@@ -1371,7 +1375,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
   ])
 
   const scheduleFollowReconciliation = useCallback(
-    (source?: 'resize') => {
+    (source?: 'resize' | 'mutation') => {
       if (source) layoutCorrectionPendingRef.current = true
       if (!viewportActive || !documentVisibleRef.current) return
       const pendingTransition = pendingPreparedTransitionRef.current
@@ -1386,7 +1390,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
         return
       }
       if (hasScrollDebugSink()) debugScroll('follow.schedule')
-      if (source && hasScrollDebugSink()) debugScroll('resize')
+      if (source && hasScrollDebugSink()) debugScroll(source)
       if (completeOpenScrollIfReady()) {
         layoutCorrectionPendingRef.current = false
         return
@@ -1426,6 +1430,9 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
   const commands = useMemo<ScrollRegionCommands>(
     () => ({
       captureLayoutAnchor: capturePinnedLayoutAnchor,
+      getUserScrollRevision() {
+        return userScrollRevisionRef.current
+      },
       revealNearest(element) {
         const container = containerRef.current
         if (!container?.contains(element)) return false
@@ -1666,9 +1673,9 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
   ])
 
   // Live stream snapshots rerender individual Message rows through Zustand;
-  // the ScrollRegion parent does not necessarily rerender per token. The
-  // One ResizeObserver owns delayed content and viewport geometry and corrects
-  // in its delivery rather than deferring ownership to another frame.
+  // the ScrollRegion parent does not necessarily rerender per token. DOM
+  // commits reconcile before paint, while ResizeObserver owns geometry changes
+  // that occur without a DOM mutation.
   useLayoutEffect(() => {
     if (!viewportActive) return
     const container = containerRef.current
@@ -1678,12 +1685,22 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
       typeof ResizeObserver === 'undefined'
         ? undefined
         : new ResizeObserver(() => scheduleFollowReconciliation('resize'))
+    const mutationObserver =
+      typeof MutationObserver === 'undefined'
+        ? undefined
+        : new MutationObserver(() => scheduleFollowReconciliation('mutation'))
     resizeObserver?.observe(content)
     resizeObserver?.observe(container)
+    mutationObserver?.observe(content, {
+      childList: true,
+      characterData: true,
+      subtree: true,
+    })
     scheduleFollowReconciliation('resize')
 
     return () => {
       resizeObserver?.disconnect()
+      mutationObserver?.disconnect()
     }
   }, [viewportActive, scheduleFollowReconciliation])
 
@@ -1701,6 +1718,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
     if (!container) return
     const markUserScrollIntent = (event: 'wheel' | 'touchmove' | 'scrollbar' | 'keyboard') => {
       userScrollIntentRef.current = true
+      userScrollRevisionRef.current += 1
       didOpenRef.current = true
       finiteAcquisitionRef.current = null
       clearProgrammaticScrollIntents()

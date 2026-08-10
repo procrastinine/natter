@@ -102,6 +102,7 @@ interface QueryEvidence {
   queryKinds: string[]
   branchPageStructureRows: number[]
   branchPageStructureBodyIds: MessageId[]
+  beforeAttemptDispatch?: () => Promise<void>
 }
 
 interface QueryEvidenceMark {
@@ -511,15 +512,17 @@ describe('generation intent outbound-path and body-I/O contract', () => {
       targetAssistantId: target.id,
     }
     let releaseProvider: () => void = () => undefined
-    const providerGate = new Promise<void>((resolve) => {
+    const dispatchGate = new Promise<void>((resolve) => {
       releaseProvider = resolve
     })
+    queryEvidence.beforeAttemptDispatch = () => dispatchGate
     let committed: Message | undefined
+    let terminal: Message | undefined
     let preparedAssistantId: MessageId | undefined
     try {
       const handle = await startControlledGeneration(intent, {
         profile: profile(),
-        openStream: () => gatedCompletedStream(providerGate, 'replacement answer'),
+        openStream: () => completedStream('replacement answer'),
       })
       const prepared = await handle.prepared
       preparedAssistantId = prepared.assistantMessageId
@@ -531,7 +534,14 @@ describe('generation intent outbound-path and body-I/O contract', () => {
       )
       releaseProvider()
       await expect(handle.completed).resolves.toMatchObject({ outcome: 'done' })
+      terminal = required(
+        (await readTestMessages(chat.id)).find(
+          (message) => message.id === prepared.assistantMessageId,
+        ),
+        'terminal placement',
+      )
     } finally {
+      delete queryEvidence.beforeAttemptDispatch
       releaseProvider()
     }
     const exactCommitted = required(committed, 'captured committed placement')
@@ -543,8 +553,14 @@ describe('generation intent outbound-path and body-I/O contract', () => {
       origin: 'generated',
       generation: {
         model: chat.settings.model,
-        status: 'streaming',
+        status: 'preparing',
       },
+    })
+    expect(terminal).toMatchObject({
+      id: preparedAssistantId,
+      parentId: target.parentId,
+      siblingIndex: 2,
+      generation: { status: 'done' },
     })
   })
 
@@ -1438,6 +1454,15 @@ function repositoryWithQueryEvidence(
   return new Proxy({} as WorkspaceRepository, {
     get(_current, property) {
       const target = currentRepository()
+      if (property === 'execute') {
+        return async (...args: Parameters<WorkspaceRepository['execute']>) => {
+          const command = args[1]
+          if (command.kind === 'attempt.dispatch') {
+            await evidence.beforeAttemptDispatch?.()
+          }
+          return Reflect.apply(target.execute, target, args) as unknown
+        }
+      }
       if (property !== 'query') {
         const member = Reflect.get(target, property) as unknown
         return typeof member === 'function'

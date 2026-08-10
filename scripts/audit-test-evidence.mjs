@@ -152,6 +152,8 @@ function validateVerificationParity(root, problems) {
         packageJson.scripts?.['verify:slice'] === 'node scripts/launch-slice-verification.mjs' &&
         typeof packageJson.scripts?.['verify:migration-cut'] === 'string' &&
         occurrences(workflow, 'run: pnpm verify:ci') === 1 &&
+        workflow.indexOf('run: pnpm install --frozen-lockfile') <
+          workflow.indexOf('run: pnpm verify:ci') &&
         ciRunner.includes("currentWaveManifest.mode === 'breaking-migration'") &&
         ciRunner.includes("import('./plan-slice-verification.mjs')") &&
         ciRunner.includes("import('./verification-candidate-preparation.mjs')") &&
@@ -180,8 +182,10 @@ function validateVerificationParity(root, problems) {
       /^pnpm@\d+\.\d+\.\d+$/u.test(packageJson.packageManager ?? '') &&
         workflow.includes(`pnpm/action-setup@${PNPM_ACTION_SETUP_REVISION}`) &&
         dependencyImage.includes('resolvePnpmLauncherTarget') &&
+        dependencyImage.includes('node_modules/.modules.yaml') &&
+        dependencyImageTest.includes("uses the source install's recorded store") &&
         dependencyImageTest.includes(PNPM_ACTION_SETUP_REVISION),
-      'The immutable pnpm action, its self-update shim layout, and the exact packageManager execution target are locally coupled.',
+      'The immutable pnpm action, its self-update shim layout, exact packageManager target and source-install store authority are locally coupled.',
     ),
     parityAssertion(
       'ci-time-budget',

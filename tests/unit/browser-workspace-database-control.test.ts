@@ -12,12 +12,15 @@ import {
   recoverQuiescedBrowserWorkspaceReplacement,
 } from '../../src/store/browser-workspace-database-cleanup'
 import {
+  __resetBrowserWorkspaceControlDatabaseForTests,
   abandonPreparedBrowserWorkspaceDatabase,
   activatePreparedBrowserWorkspaceDatabase,
   beginBrowserWorkspaceDatabaseReplacement,
   classifyBrowserWorkspacePreparedActivationOutcome,
+  closeBrowserWorkspaceControlDatabase,
   completeBrowserWorkspaceDatabaseCleanup,
   readBrowserWorkspaceDatabaseManifest,
+  readExistingIndexedDb,
 } from '../../src/store/browser-workspace-database-control'
 import {
   __resetBrowserWorkspaceDatabaseSelectionForTests,
@@ -115,6 +118,7 @@ class HeldSelectionGateLockManager {
 
 describe('browser workspace database control', () => {
   beforeEach(async () => {
+    __resetBrowserWorkspaceControlDatabaseForTests()
     for (const name of NATTER_INDEXED_DATABASE_NAMES) await Dexie.delete(name)
     Object.defineProperty(navigator, 'locks', {
       configurable: true,
@@ -180,6 +184,72 @@ describe('browser workspace database control', () => {
         { ...prepared, nonce: 'different' },
       ),
     ).toBe('changed')
+  })
+
+  it('owns every replacement control transition with native IndexedDB transactions', async () => {
+    const dexieTransaction = vi.spyOn(Dexie.prototype, 'transaction')
+
+    await readBrowserWorkspaceDatabaseManifest()
+    const activated = await beginBrowserWorkspaceDatabaseReplacement()
+    await activatePreparedBrowserWorkspaceDatabase(activated, storageBaseline)
+    await completeBrowserWorkspaceDatabaseCleanup({ ...activated, phase: 'cleanup' })
+    const abandoned = await beginBrowserWorkspaceDatabaseReplacement()
+    await abandonPreparedBrowserWorkspaceDatabase(abandoned)
+    await completeBrowserWorkspaceDatabaseCleanup({ ...abandoned, phase: 'discard' })
+
+    expect(dexieTransaction).not.toHaveBeenCalled()
+    expect(await readBrowserWorkspaceDatabaseManifest()).toEqual({
+      id: 'workspace',
+      activeDatabaseName: activated.destinationDatabaseName,
+      activationSequence: 1,
+    })
+  })
+
+  it('shares one page-lifetime control database owner across concurrent operations', async () => {
+    const dexiePrototype = Dexie.prototype as Dexie
+    const open: Dexie['open'] = dexiePrototype.open
+    const controlOwners = new Set<Dexie>()
+    const openSpy = vi.spyOn(dexiePrototype, 'open').mockImplementation(function (this: Dexie) {
+      if (this.name === 'natter-control') controlOwners.add(this)
+      return open.call(this)
+    })
+
+    try {
+      await Promise.all(Array.from({ length: 128 }, () => readBrowserWorkspaceDatabaseManifest()))
+    } finally {
+      openSpy.mockRestore()
+    }
+
+    expect(controlOwners.size).toBe(1)
+    expect([...controlOwners][0]?.isOpen()).toBe(true)
+  })
+
+  it('closes a bounded existing-database probe before publishing its result', async () => {
+    const database = await openRawDatabase('natter-workspace-b')
+    database.close()
+    const order: string[] = []
+    const close = IDBDatabase.prototype.close
+    const closeSpy = vi.spyOn(IDBDatabase.prototype, 'close').mockImplementation(function (
+      this: IDBDatabase,
+    ) {
+      if (this.name === 'natter-workspace-b') order.push('closed')
+      close.call(this)
+    })
+
+    try {
+      await readExistingIndexedDb('natter-workspace-b', () => ({
+        kind: 'transaction',
+        storeNames: ['rows'],
+        read: () => 'inspected',
+      })).then((value) => {
+        expect(value).toBe('inspected')
+        order.push('settled')
+      })
+    } finally {
+      closeSpy.mockRestore()
+    }
+
+    expect(order).toEqual(['closed', 'settled'])
   })
 
   it('reuses only the three fixed workspace slots across repeated replacements', async () => {
@@ -260,32 +330,29 @@ describe('browser workspace database control', () => {
   it('selects from the current proof and confirms the manifest once after acquiring its lease', async () => {
     await recreateAndVerifyBrowserWorkspaceDatabase('natter')
     await readBrowserWorkspaceDatabaseManifest()
-    const transaction = IDBDatabase.prototype.transaction
-    let manifestReadTransactions = 0
-    const transactionSpy = vi
-      .spyOn(IDBDatabase.prototype, 'transaction')
-      .mockImplementation(function (this: IDBDatabase, storeNames, mode, options) {
-        const names = typeof storeNames === 'string' ? [storeNames] : Array.from(storeNames).sort()
-        if (
-          this.name === 'natter-control' &&
-          names.length === 1 &&
-          names[0] === 'manifests' &&
-          (mode ?? 'readonly') === 'readonly'
-        ) {
-          manifestReadTransactions += 1
-        }
-        return options === undefined
-          ? transaction.call(this, storeNames, mode)
-          : transaction.call(this, storeNames, mode, options)
-      })
+    const objectStoreGet = IDBObjectStore.prototype.get
+    let manifestReads = 0
+    const getSpy = vi.spyOn(IDBObjectStore.prototype, 'get').mockImplementation(function (
+      this: IDBObjectStore,
+      query,
+    ) {
+      if (
+        this.transaction.db.name === 'natter-control' &&
+        this.name === 'manifests' &&
+        query === 'workspace'
+      ) {
+        manifestReads += 1
+      }
+      return objectStoreGet.call(this, query)
+    })
 
     try {
       await prepareSelection()
     } finally {
-      transactionSpy.mockRestore()
+      getSpy.mockRestore()
     }
 
-    expect(manifestReadTransactions).toBe(2)
+    expect(manifestReads).toBe(2)
   })
 
   it('reopens the activated destination before asynchronously cleaning the old source', async () => {
@@ -435,6 +502,26 @@ describe('browser workspace database control', () => {
         phase: 'cleanup',
       }),
     ).rejects.toThrow('BrowserWorkspaceReplacementJournalChanged')
+  })
+
+  it('terminally drains admitted control operations before closing the owner', async () => {
+    const closeSpy = vi.spyOn(Dexie.prototype as Dexie, 'close')
+    const admitted = Array.from({ length: 128 }, () => readBrowserWorkspaceDatabaseManifest())
+    const terminal = closeBrowserWorkspaceControlDatabase()
+
+    try {
+      await expect(Promise.all(admitted)).resolves.toHaveLength(128)
+      await expect(terminal).resolves.toBeUndefined()
+      const closedDatabases = closeSpy.mock.instances as unknown as Dexie[]
+      expect(closedDatabases.filter((database) => database.name === 'natter-control')).toHaveLength(
+        1,
+      )
+      await expect(readBrowserWorkspaceDatabaseManifest()).rejects.toThrow(
+        'BrowserWorkspaceControlDatabaseClosed',
+      )
+    } finally {
+      closeSpy.mockRestore()
+    }
   })
 })
 

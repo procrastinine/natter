@@ -72,11 +72,6 @@ export async function holdIndexedDbStoreGate(
       }
       const gates = scope.__e2eIndexedDbStoreGates ?? new Map<string, Gate>()
       scope.__e2eIndexedDbStoreGates = gates
-      const database = await new Promise<IDBDatabase>((resolve, reject) => {
-        const request = indexedDB.open(databaseName)
-        request.onsuccess = () => resolve(request.result)
-        request.onerror = () => reject(request.error)
-      })
       let released = false
       let readySettled = false
       let resolveReady: () => void = () => undefined
@@ -85,46 +80,71 @@ export async function holdIndexedDbStoreGate(
         resolveReady = resolve
         rejectReady = reject
       })
-      let resolveComplete: () => void = () => undefined
-      let rejectComplete: (error: unknown) => void = () => undefined
-      const complete = new Promise<void>((resolve, reject) => {
-        resolveComplete = resolve
-        rejectComplete = reject
+      const complete = navigator.locks.request(
+        'natter:workspace-slot-selection:v1',
+        { mode: 'shared' },
+        () =>
+          navigator.locks.request(
+            `natter:workspace-slot:${databaseName}`,
+            { mode: 'shared' },
+            async () => {
+              const database = await new Promise<IDBDatabase>((resolve, reject) => {
+                const request = indexedDB.open(databaseName)
+                request.onsuccess = () => resolve(request.result)
+                request.onerror = () => reject(request.error)
+              })
+              let resolveTransaction: () => void = () => undefined
+              let rejectTransaction: (error: unknown) => void = () => undefined
+              const transactionComplete = new Promise<void>((resolve, reject) => {
+                resolveTransaction = resolve
+                rejectTransaction = reject
+              })
+              const transaction = database.transaction(storeNames, 'readwrite')
+              const fail = (error: unknown) => {
+                if (!readySettled) {
+                  readySettled = true
+                  rejectReady(error)
+                }
+                rejectTransaction(error)
+                database.close()
+              }
+              transaction.oncomplete = () => {
+                resolveTransaction()
+                database.close()
+              }
+              transaction.onerror = () =>
+                fail(transaction.error ?? new Error('IndexedDbStoreGateError'))
+              transaction.onabort = () =>
+                fail(transaction.error ?? new Error('IndexedDbStoreGateAbort'))
+              const store = transaction.objectStore(storeNames[0] as string)
+              const keepAlive = () => {
+                const request = store.get('__e2e_gate__')
+                request.onsuccess = () => {
+                  if (!readySettled) {
+                    readySettled = true
+                    resolveReady()
+                  }
+                  if (!released) keepAlive()
+                }
+                request.onerror = () =>
+                  fail(request.error ?? new Error('IndexedDbStoreGateReadError'))
+              }
+              keepAlive()
+              await transactionComplete
+            },
+          ),
+      )
+      void complete.catch((error: unknown) => {
+        if (readySettled) return
+        readySettled = true
+        rejectReady(error)
       })
-      const transaction = database.transaction(storeNames, 'readwrite')
-      const fail = (error: unknown) => {
-        if (!readySettled) {
-          readySettled = true
-          rejectReady(error)
-        }
-        rejectComplete(error)
-        database.close()
-      }
-      transaction.oncomplete = () => {
-        resolveComplete()
-        database.close()
-      }
-      transaction.onerror = () => fail(transaction.error ?? new Error('IndexedDbStoreGateError'))
-      transaction.onabort = () => fail(transaction.error ?? new Error('IndexedDbStoreGateAbort'))
-      const store = transaction.objectStore(storeNames[0] as string)
-      const keepAlive = () => {
-        const request = store.get('__e2e_gate__')
-        request.onsuccess = () => {
-          if (!readySettled) {
-            readySettled = true
-            resolveReady()
-          }
-          if (!released) keepAlive()
-        }
-        request.onerror = () => fail(request.error ?? new Error('IndexedDbStoreGateReadError'))
-      }
       gates.set(gateId, {
         release: () => {
           released = true
         },
         complete,
       })
-      keepAlive()
       await ready
     },
     { databaseName, gateId, storeNames: [...storeNames] },

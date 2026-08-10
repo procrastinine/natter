@@ -144,7 +144,7 @@ export interface BrowserMutationSharedInternals {
     tx: Transaction,
     lease: Pick<StreamLeaseRow, 'streamId' | 'chatId' | 'messageId' | 'attemptKind'>,
     chat: Chat | undefined,
-  ): Promise<void>
+  ): Promise<MessageHeaderRow | undefined>
   branchHeaderWordCount(this: void, headers: readonly MessageHeaderRow[]): number
   calibrationUsageFromPostCommit(this: void, usage: StreamPostCommitUsageEvidence): ChatUsage
   canApplyIncrementalBranchAppend(this: void, state: ChatMutationState): boolean

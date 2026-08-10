@@ -27,7 +27,10 @@ import {
   finishBrowserWorkspaceBootstrap,
 } from './browser-workspace-bootstrap-authority'
 import { recoverQuiescedBrowserWorkspaceReplacement } from './browser-workspace-database-cleanup'
-import { readBrowserWorkspaceDatabaseManifest } from './browser-workspace-database-control'
+import {
+  closeBrowserWorkspaceControlDatabase,
+  readBrowserWorkspaceDatabaseManifest,
+} from './browser-workspace-database-control'
 import {
   type ActiveBrowserWorkspaceDatabaseSelection,
   activateBrowserWorkspaceDatabaseSelection,
@@ -160,6 +163,7 @@ import {
   isWorkspaceMaintenancePreemptedError,
   isWorkspaceRuntimeClosedError,
   isWorkspaceRuntimeReplacementTransitionOwned,
+  preemptWorkspaceReplacementContendersForRemoteTransition,
   releaseWorkspaceRuntimeDemandBoundary,
   subscribeWorkspaceRuntime,
   subscribeWorkspaceRuntimeIdle,
@@ -553,6 +557,7 @@ async function reconcileBrowserWorkspaceSlotTransition(
   transition: BrowserWorkspaceSlotTransition,
   signal: AbortSignal,
 ): Promise<void> {
+  preemptWorkspaceReplacementContendersForRemoteTransition()
   await shutdownBrowserWorkspaceWhenIdle({ signal })
   await recoverQuiescedBrowserWorkspaceReplacement(transition, signal)
   await raceWithAbortSignal(() => resumeBrowserWorkspace(), signal)
@@ -946,6 +951,11 @@ async function performTerminalBrowserWorkspaceLifecycleFinalization(): Promise<v
     releaseLifecycleInstallationStep(failures, () =>
       disposal.owner.promotedReplacementDrain.assertClosed(),
     )
+  }
+  try {
+    await closeBrowserWorkspaceControlDatabase()
+  } catch (error) {
+    failures.push(error)
   }
   if (failures.length > 0) {
     throw new AggregateError(failures, 'BrowserWorkspaceTerminalFinalizationFailed')

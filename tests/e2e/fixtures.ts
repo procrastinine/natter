@@ -668,9 +668,8 @@ async function navigatePagesForLifecycleDrain(
     pages
       .filter((page) => !page.isClosed())
       .map(async (page) => {
-        const arrived = page.locator('[data-e2e-lifecycle-drain]').waitFor({ state: 'attached' })
-        await page.evaluate((url) => window.location.replace(url), lifecycleDrainUrl)
-        await arrived
+        await page.goto(lifecycleDrainUrl, { waitUntil: 'commit' })
+        await page.locator('[data-e2e-lifecycle-drain]').waitFor({ state: 'attached' })
         if (page.url() !== lifecycleDrainUrl) throw new Error('RuntimeDiagnosticDrainUrlMismatch')
       }),
   )

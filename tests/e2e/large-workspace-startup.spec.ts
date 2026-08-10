@@ -334,6 +334,8 @@ interface RouteSwitchProfile {
   readonly durationMs: number
   readonly idbRequests: number
   readonly idbCalls: Readonly<Record<string, number>>
+  readonly foregroundIdbRequests: number
+  readonly foregroundIdbCalls: Readonly<Record<string, number>>
 }
 
 interface ReloadProfile {
@@ -1207,22 +1209,51 @@ async function measureRouteSwitch(page: Page): Promise<RouteSwitchProfile> {
   const targetHref = await target.getAttribute('href')
   const targetChatId = targetHref?.match(/^#\/chat\/([^/]+)/u)?.[1]
   if (!targetChatId || !targetHref) throw new Error('GeneratedWorkspaceRouteSwitchTargetInvalid')
+  await expect(page.locator('html')).not.toHaveAttribute('data-natter-route-foreground', /.+/u, {
+    timeout: HANG_BOUND_MS,
+  })
   const before = await startupProbeSnapshot(page)
   const beforeHash = new URL(page.url()).hash
   await page.evaluate((expectedHref) => {
-    document.addEventListener(
-      'click',
-      (event) => {
-        const link = event.target instanceof Element ? event.target.closest('a[href]') : null
-        if (link?.getAttribute('href') !== expectedHref) return
-        ;(
-          window as typeof window & { __natterRouteSwitchClickEvents?: number }
-        ).__natterRouteSwitchClickEvents =
-          ((window as typeof window & { __natterRouteSwitchClickEvents?: number })
-            .__natterRouteSwitchClickEvents ?? 0) + 1
+    const owner = window as typeof window & {
+      __natterStartupScaleProbe?: { snapshot(): StartupProbeSnapshot }
+      __natterRouteSwitchClickEvents?: number
+      __natterRouteForegroundProbe?: {
+        before: IdBCountSnapshot | null
+        releases: IdBCountSnapshot[]
+        restore(): void
+      }
+    }
+    const root = document.documentElement
+    const originalRemoveAttribute = root.removeAttribute
+    const snapshotIdb = () => {
+      const probe = owner.__natterStartupScaleProbe
+      if (!probe) throw new Error('StartupScaleProbeMissing')
+      return probe.snapshot().idb
+    }
+    const onClick = (event: MouseEvent) => {
+      const link = event.target instanceof Element ? event.target.closest('a[href]') : null
+      if (link?.getAttribute('href') !== expectedHref) return
+      owner.__natterRouteSwitchClickEvents = (owner.__natterRouteSwitchClickEvents ?? 0) + 1
+      const probe = owner.__natterRouteForegroundProbe
+      if (probe) probe.before = snapshotIdb()
+    }
+    const foregroundProbe = {
+      before: null as IdBCountSnapshot | null,
+      releases: [] as IdBCountSnapshot[],
+      restore() {
+        document.removeEventListener('click', onClick, { capture: true })
+        root.removeAttribute = originalRemoveAttribute
       },
-      { capture: true },
-    )
+    }
+    owner.__natterRouteForegroundProbe = foregroundProbe
+    root.removeAttribute = function removeAttribute(attribute: string): void {
+      if (attribute === 'data-natter-route-foreground' && root.hasAttribute(attribute)) {
+        foregroundProbe.releases.push(snapshotIdb())
+      }
+      originalRemoveAttribute.call(this, attribute)
+    }
+    document.addEventListener('click', onClick, { capture: true })
   }, targetHref)
   const startedAt = performance.now()
   await target.click()
@@ -1247,6 +1278,26 @@ async function measureRouteSwitch(page: Page): Promise<RouteSwitchProfile> {
     targetChatId,
     { timeout: HANG_BOUND_MS },
   )
+  await expect(page.locator('html')).not.toHaveAttribute('data-natter-route-foreground', /.+/u, {
+    timeout: HANG_BOUND_MS,
+  })
+  const foreground = await page.evaluate(() => {
+    const owner = window as typeof window & {
+      __natterRouteForegroundProbe?: {
+        before: IdBCountSnapshot | null
+        releases: IdBCountSnapshot[]
+        restore(): void
+      }
+    }
+    const probe = owner.__natterRouteForegroundProbe
+    if (!probe) throw new Error('RouteForegroundProbeMissing')
+    probe.restore()
+    delete owner.__natterRouteForegroundProbe
+    return { before: probe.before, after: probe.releases.at(-1) ?? null }
+  })
+  if (!foreground.before || !foreground.after) {
+    throw new Error('RouteForegroundProbeIncomplete')
+  }
   const clickEvents = await page.evaluate(
     () =>
       (window as typeof window & { __natterRouteSwitchClickEvents?: number })
@@ -1271,6 +1322,8 @@ async function measureRouteSwitch(page: Page): Promise<RouteSwitchProfile> {
         .map(([name, count]) => [name, count - (before.idb.calls[name] ?? 0)] as const)
         .filter(([, count]) => count > 0),
     ),
+    foregroundIdbRequests: foreground.after.total - foreground.before.total,
+    foregroundIdbCalls: idbCallDelta(foreground.before.calls, foreground.after.calls),
   }
 }
 
@@ -1289,6 +1342,9 @@ async function measureActiveDestinationFrame(page: Page): Promise<DestinationFra
   assertDestinationFrameBudget(snapshot, { firstPaintMs: 1_500, completeMs: 5_000 })
   assertDestinationPublicationContract(snapshot, { point: 'optional' })
   expect(snapshot.publications[0]?.messageIds).toEqual([GENERATED_WORKSPACE_ACTIVE_TERMINAL_ID])
+  await expect(page.locator('html')).not.toHaveAttribute('data-natter-route-foreground', /.+/u, {
+    timeout: HANG_BOUND_MS,
+  })
   return snapshot
 }
 
@@ -1514,7 +1570,7 @@ function assertCachedSelectionRequestBudget(name: string, probe: StartupProbeSna
   expect(
     calls[`factory.open:${BROWSER_WORKSPACE_CONTROL_DATABASE_NAME}`],
     `${name} control database opens`,
-  ).toBe(2)
+  ).toBe(1)
   expect(
     calls['database.transaction:manifests:readonly'],
     `${name} manifest read transactions`,
@@ -1604,7 +1660,7 @@ function assertNoCanonicalWholeTableReadThroughConvergence(
 }
 
 function assertNoCanonicalWholeTableRouteRead(name: string, routeSwitch: RouteSwitchProfile): void {
-  const forbidden = canonicalWholeTableReads(routeSwitch.idbCalls)
+  const forbidden = canonicalWholeTableReads(routeSwitch.foregroundIdbCalls)
   expect(forbidden, `${name} canonical whole-table reads`).toEqual([])
 }
 

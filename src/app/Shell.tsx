@@ -149,6 +149,9 @@ import {
   navigateToChatForIntent,
   newChatHref,
   routeIntentOwner,
+  routeToHref,
+  settleRouteForegroundDemandForPresentation,
+  startRouteForegroundMetadata,
   storageHref,
   useRoute,
 } from './router'
@@ -310,7 +313,9 @@ function ConfigurationLoadFailure({ loads }: { loads: ConfigurationProjectionLoa
 const MOBILE_SHELL_QUERY = '(max-width: 700px)'
 
 interface TreeInsertTarget {
+  workspaceId: WorkspaceFence['workspaceId']
   chatId: ChatId
+  pinnedMessageId: MessageId | undefined
   slot: PasteImportSlot
   defaultRole: MessageRole
 }
@@ -368,6 +373,7 @@ export function Shell() {
   const MessageListPoint = messageListModule?.point
   const BranchTreeView = branchTreeViewModule?.default
   const activeChatId = route.kind === 'chat' ? route.chatId : null
+  const activePinnedMessageId = route.kind === 'chat' ? route.pinnedMessageId : undefined
   const onNewChatSurface = route.kind === 'new'
   if (activeChatId || onNewChatSurface) preloadMessageList()
   const activeStorageRoute = route.kind === 'storage' ? route.storage : null
@@ -594,13 +600,26 @@ export function Shell() {
     conversationWorkspaceFence,
   )
   useEffect(() => {
-    if (!treeViewActive) return
-    setTreeInsertTarget(null)
-  }, [treeViewActive])
+    if (!treeInsertTarget) return
+    const currentWorkspaceId = conversationSnapshot.workspaceId
+    if (
+      activeChatId !== treeInsertTarget.chatId ||
+      activePinnedMessageId !== treeInsertTarget.pinnedMessageId ||
+      (currentWorkspaceId !== null && currentWorkspaceId !== treeInsertTarget.workspaceId)
+    ) {
+      setTreeInsertTarget(null)
+    }
+  }, [activeChatId, activePinnedMessageId, conversationSnapshot.workspaceId, treeInsertTarget])
+  const activeTreeInsertTarget =
+    treeInsertTarget?.chatId === activeChatId &&
+    treeInsertTarget.pinnedMessageId === activePinnedMessageId &&
+    (conversationSnapshot.workspaceId === null ||
+      treeInsertTarget.workspaceId === conversationSnapshot.workspaceId)
+      ? treeInsertTarget
+      : null
   useEffect(() => {
     if (urlPinnedTargetPending) {
       setImportAtEndOpen(false)
-      setTreeInsertTarget(null)
       return
     }
     if (!treeViewActive && transcriptPresentationOnly) setImportAtEndOpen(false)
@@ -753,17 +772,18 @@ export function Shell() {
     return () => controller.abort()
   }, [activeChatId])
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!activeChatId) return
-    const controller = new AbortController()
-    void touchLastViewed(activeChatId, Date.now(), { signal: controller.signal }).catch(
-      (error: unknown) => {
-        if (controller.signal.aborted || isPageHidingAbortError(error)) return
+    const task = startRouteForegroundMetadata(routeToHref(route), activeChatId, async (signal) => {
+      try {
+        await touchLastViewed(activeChatId, Date.now(), { signal })
+      } catch (error) {
+        if (signal.aborted || isPageHidingAbortError(error)) return
         console.error('Failed to update chat viewed timestamp', error)
-      },
-    )
-    return () => controller.abort()
-  }, [activeChatId])
+      }
+    })
+    void task
+  }, [activeChatId, route])
 
   const openingNewChatSettingsRef = useRef<{
     readonly intent: ReturnType<typeof beginRouteIntent>
@@ -883,7 +903,7 @@ export function Shell() {
       action: (control: {
         readonly signal: AbortSignal
         readonly observer: GenerationPreparationObserver
-      }) => Promise<void>,
+      }) => Promise<{ readonly generationSettled: Promise<unknown> }>,
     ): ComposerSubmission => {
       const target = generationSubmitTarget(intent)
       const diagnosticTarget = generationSubmitDiagnosticTarget(intent)
@@ -893,6 +913,15 @@ export function Shell() {
       })
       let admissionReported = false
       let claimReported = false
+      let settleGeneration!: () => void
+      let generationSettled = false
+      const generationSettlement = new Promise<void>((resolve) => {
+        settleGeneration = () => {
+          if (generationSettled) return
+          generationSettled = true
+          resolve()
+        }
+      })
       const diagnosticStartedAt = performance.now()
       let diagnosticPreviousAt = diagnosticStartedAt
       const reportPhase = (
@@ -923,13 +952,14 @@ export function Shell() {
         target,
         action: async ({ id, signal }) => {
           reportClaimed(id)
-          await action({
+          const lifecycle = await action({
             signal,
             observer: Object.freeze({
               pending: (owner) => reportPhase(id, 'waiting', { owner }),
               phase: (phase) => reportPhase(id, phase),
             } satisfies GenerationPreparationObserver),
           })
+          void lifecycle.generationSettled.then(settleGeneration, settleGeneration)
           if (!admissionReported) {
             admissionReported = true
             reportPhase(id, 'admitted')
@@ -949,6 +979,7 @@ export function Shell() {
       )
       const completion = (async (): Promise<ComposerSubmissionOutcome> => {
         const outcome = await claim.settled
+        if (outcome.kind !== 'succeeded') settleGeneration()
         if (generationSubmissionClaimsRef.current.get(target)?.id === claim.id) {
           generationSubmissionClaimsRef.current.delete(target)
         }
@@ -985,6 +1016,7 @@ export function Shell() {
         kind: 'started',
         admission,
         completion,
+        generationSettled: generationSettlement,
         cancel: cancelClaim,
       })
     },
@@ -1034,6 +1066,7 @@ export function Shell() {
           )
           preloadMessageList()
           await handle.prepared
+          return { generationSettled: handle.completed }
         },
       )
     },
@@ -1068,6 +1101,7 @@ export function Shell() {
             if (prepared.kind === 'handoff') {
               navigateToChatForIntent(routeIntent, prepared.chatId, prepared.handoff)
             }
+            return { generationSettled: handle.completed }
           } finally {
             cancelRouteIntent(routeIntent)
           }
@@ -1095,6 +1129,7 @@ export function Shell() {
           observer,
         )
         await handle.prepared
+        return { generationSettled: handle.completed }
       },
     )
   }, [ownGenerationSubmission, trailingUserMessage])
@@ -1195,7 +1230,8 @@ export function Shell() {
   )
   const insertAtSharedTreeTrunk = useCallback(
     (parentId: MessageId | null) => {
-      if (!activeChatId || !treeHeaderById || !treeProjection) return
+      const workspaceId = treeBinding?.seal.workspaceId
+      if (!activeChatId || !workspaceId || !treeHeaderById || !treeProjection) return
       const childStreaming = (treeProjection.liveByParent.get(parentId) ?? []).some((header) => {
         return treeStreamTargetIds.has(header.id)
       })
@@ -1205,16 +1241,27 @@ export function Shell() {
       }
       const parent = parentId ? treeHeaderById.get(parentId) : undefined
       setTreeInsertTarget({
+        workspaceId,
         chatId: activeChatId,
+        pinnedMessageId: activePinnedMessageId,
         slot: { kind: 'after-all', parentId },
         defaultRole: parent ? oppositeRole(parent.role) : 'user',
       })
     },
-    [activeChatId, pushToast, treeHeaderById, treeProjection, treeStreamTargetIds],
+    [
+      activeChatId,
+      activePinnedMessageId,
+      pushToast,
+      treeBinding,
+      treeHeaderById,
+      treeProjection,
+      treeStreamTargetIds,
+    ],
   )
   const insertAtTreeChildLeg = useCallback(
     (childId: MessageId) => {
-      if (!activeChatId || !treeHeaderById) return
+      const workspaceId = treeBinding?.seal.workspaceId
+      if (!activeChatId || !workspaceId || !treeHeaderById) return
       const child = treeHeaderById.get(childId)
       if (!child || child.deleted) return
       if (treeStreamTargetIds.has(childId)) {
@@ -1222,16 +1269,26 @@ export function Shell() {
         return
       }
       setTreeInsertTarget({
+        workspaceId,
         chatId: activeChatId,
+        pinnedMessageId: activePinnedMessageId,
         slot: { kind: 'before', messageId: childId },
         defaultRole: oppositeRole(child.role),
       })
     },
-    [activeChatId, pushToast, treeHeaderById, treeStreamTargetIds],
+    [
+      activeChatId,
+      activePinnedMessageId,
+      pushToast,
+      treeBinding,
+      treeHeaderById,
+      treeStreamTargetIds,
+    ],
   )
   const insertAfterTreeLeaf = useCallback(
     (messageId: MessageId) => {
-      if (!activeChatId || !treeHeaderById || !treeProjection) return
+      const workspaceId = treeBinding?.seal.workspaceId
+      if (!activeChatId || !workspaceId || !treeHeaderById || !treeProjection) return
       const leaf = treeHeaderById.get(messageId)
       if (!leaf || leaf.deleted) return
       const hasLiveChild = (treeProjection.liveByParent.get(messageId)?.length ?? 0) > 0
@@ -1241,12 +1298,22 @@ export function Shell() {
         return
       }
       setTreeInsertTarget({
+        workspaceId,
         chatId: activeChatId,
+        pinnedMessageId: activePinnedMessageId,
         slot: { kind: 'after', messageId },
         defaultRole: oppositeRole(leaf.role),
       })
     },
-    [activeChatId, pushToast, treeHeaderById, treeProjection, treeStreamTargetIds],
+    [
+      activeChatId,
+      activePinnedMessageId,
+      pushToast,
+      treeBinding,
+      treeHeaderById,
+      treeProjection,
+      treeStreamTargetIds,
+    ],
   )
   const editTreeMessage = useCallback(
     (
@@ -1297,6 +1364,7 @@ export function Shell() {
           )
           preloadMessageList()
           await handle.prepared
+          return { generationSettled: handle.completed }
         },
       )
     },
@@ -1335,6 +1403,7 @@ export function Shell() {
           )
           preloadMessageList()
           await handle.prepared
+          return { generationSettled: handle.completed }
         },
       )
     },
@@ -1358,6 +1427,7 @@ export function Shell() {
           )
           preloadMessageList()
           await handle.prepared
+          return { generationSettled: handle.completed }
         },
       )
     },
@@ -1556,6 +1626,25 @@ export function Shell() {
     />
   ) : null
   const activeSurfaceReady = activeChatId ? activePresentation?.visibleReady === true : true
+  const routePresentationTargetKind = activePresentation?.target.kind ?? null
+  const routePresentationRevealPending =
+    activePresentation?.target.kind === 'ready' && activePresentation.target.binding.reveal !== null
+  const routePresentationDestinationDeferred =
+    activePresentation?.editorRetention?.destinationDeferred === true
+  useLayoutEffect(() => {
+    settleRouteForegroundDemandForPresentation(routeToHref(route), {
+      hasActiveChat: activeChatId !== null,
+      targetKind: routePresentationTargetKind,
+      revealPending: routePresentationRevealPending,
+      destinationDeferred: routePresentationDestinationDeferred,
+    })
+  }, [
+    activeChatId,
+    route,
+    routePresentationDestinationDeferred,
+    routePresentationRevealPending,
+    routePresentationTargetKind,
+  ])
 
   return (
     <div
@@ -1735,6 +1824,7 @@ export function Shell() {
                           ? 'transcript'
                           : 'tree'
                       if (surface === 'tree') setEditTreeMode(false)
+                      if (surface === 'transcript') setTreeInsertTarget(null)
                       conversationController.requestPresentation({
                         chatId: activeChatId,
                         surface,
@@ -1990,12 +2080,12 @@ export function Shell() {
           />
         </Suspense>
       ) : null}
-      {treeViewActive && treeInsertTarget?.chatId === activeChatId ? (
+      {activeTreeInsertTarget ? (
         <Suspense fallback={<SurfaceLoading label="Loading import…" overlay />}>
           <ImportModal
-            chatId={activeChatId}
-            slot={treeInsertTarget.slot}
-            defaultRole={treeInsertTarget.defaultRole}
+            chatId={activeTreeInsertTarget.chatId}
+            slot={activeTreeInsertTarget.slot}
+            defaultRole={activeTreeInsertTarget.defaultRole}
             onClose={() => setTreeInsertTarget(null)}
             onDone={() => {
               setTreeInsertTarget(null)

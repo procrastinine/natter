@@ -457,7 +457,6 @@ describe('ScrollRegion continuity lease', () => {
         top: documentBottom - 120 - fixture.region.scrollTop,
         bottom: documentBottom - fixture.region.scrollTop,
       })
-
     act(() => {
       fixture.rerender({
         streamActive: true,
@@ -634,6 +633,43 @@ describe('ScrollRegion continuity lease', () => {
     expect(fixture.region.scrollTop).toBe(997)
     await act(nextTask)
     expect(fixture.ref.current?.getState()).toBe('pinned')
+  })
+
+  it('retains a one-pixel upward reading position before delayed layout grows', async () => {
+    const fixture = setup()
+    acquireOpen(fixture)
+    const target = fixture.region.querySelector<HTMLElement>('[data-message-id="command-target"]')
+    if (!target) throw new Error('Near-bottom anchor target did not mount')
+    let documentBottom = 1_070
+    target.getBoundingClientRect = () =>
+      rect({
+        top: documentBottom - 120 - fixture.region.scrollTop,
+        bottom: documentBottom - fixture.region.scrollTop,
+      })
+
+    act(() => {
+      fireEvent.wheel(fixture.region, { deltaY: -1 })
+      fixture.region.scrollTop = 999
+      fireEvent.scroll(fixture.region)
+    })
+    const anchorBottom = target.getBoundingClientRect().bottom
+    expect(fixture.commands().getLayoutAnchorMessageId()).toBe('command-target')
+    expect(fixture.ref.current?.getState()).toBe('follow')
+    act(() => {
+      fixture.region.dispatchEvent(new Event('scrollend'))
+    })
+
+    act(() => {
+      documentBottom += 137
+      fixture.setHeight(1_237)
+      deliverResize()
+    })
+
+    expect(fixture.region.scrollTop).toBe(1_136)
+    expect(target.getBoundingClientRect().bottom).toBe(anchorBottom)
+    expect(fixture.ref.current?.getState()).toBe('follow')
+    await act(nextTask)
+    expect(fixture.region.dataset.scrollState).toBe('follow')
   })
 
   it('reacquires stream ownership at exact bottom and follows later growth', async () => {
@@ -826,6 +862,25 @@ describe('ScrollRegion continuity lease', () => {
     expect(observed).toHaveLength(1)
   })
 
+  it('advances the scroll-ownership revision only for user input', () => {
+    const fixture = setup()
+    acquireOpen(fixture)
+    const commands = fixture.commands()
+    const initialRevision = commands.getUserScrollRevision()
+
+    act(() => {
+      fixture.setHeight(700)
+      fixture.ref.current?.scrollToBottom({ smooth: false })
+      deliverResize()
+    })
+
+    expect(commands.getUserScrollRevision()).toBe(initialRevision)
+
+    fireEvent.wheel(fixture.region, { deltaY: -100 })
+
+    expect(commands.getUserScrollRevision()).toBe(initialRevision + 1)
+  })
+
   it('uses a prepared viewport revision to preserve a pinned message edge pre-paint', async () => {
     const fixture = setup()
     acquireOpen(fixture)
@@ -979,6 +1034,25 @@ describe('ScrollRegion continuity lease', () => {
     expect(fixture.region.scrollTop).toBe(500)
     expect(target.getBoundingClientRect().bottom).toBe(520)
     expect(fixture.ref.current?.getState()).toBe('pinned')
+  })
+
+  it('reconciles descendant content commits before delayed geometry delivery', async () => {
+    const fixture = setup(
+      {},
+      <div data-ui="message-list" data-virtualized="false">
+        <span data-ui="live-text">live output</span>
+      </div>,
+    )
+    acquireOpen(fixture)
+    const liveText = fixture.region.querySelector<HTMLElement>('[data-ui="live-text"]')
+    if (!liveText) throw new Error('Live text did not mount')
+
+    fixture.setHeight(1_190)
+    liveText.textContent = 'expanded live output'
+    await act(nextTask)
+
+    expect(fixture.region.scrollTop).toBe(1_090)
+    expect(fixture.region.dataset.scrollState).toBe('follow')
   })
 
   it('reconciles an estimate-based virtualizer offset against the exact text lease synchronously', async () => {

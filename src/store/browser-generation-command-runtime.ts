@@ -365,16 +365,23 @@ export async function prepareBrowserAttempt(
           ? { recentModelId: attemptSettings.model }
           : {}),
       })
+      const planningSnapshot = mutation.captureGenerationPlanningSnapshot(
+        chatId,
+        input.configurationIntent,
+        planningChat,
+      )
+      const planningOutcomePromise = planningSnapshot.then(
+        (planning) => ({ kind: 'planned' as const, planning }),
+        (error: unknown) => ({ kind: 'rejected' as const, error }),
+      )
       if (input.strategy === 'continue') {
         const header = requiredPromptPathTarget(promptPath, chatId)
         if (header.deleted || header.role !== 'assistant') {
           throw new Error(`GenerationContinuationTargetUnavailable:${header.id}`)
         }
-        const planning = await mutation.captureGenerationPlanningSnapshot(
-          chatId,
-          input.configurationIntent,
-          planningChat,
-        )
+        const planningOutcome = await planningOutcomePromise
+        if (planningOutcome.kind === 'rejected') throw planningOutcome.error
+        const planning = planningOutcome.planning
         const prompt = preparedGenerationPrompt(
           header.id,
           promptPath.headers,
@@ -507,11 +514,9 @@ export async function prepareBrowserAttempt(
             ]
           : [],
       )
-      const planning = await mutation.captureGenerationPlanningSnapshot(
-        chatId,
-        input.configurationIntent,
-        planningChat,
-      )
+      const planningOutcome = await planningOutcomePromise
+      if (planningOutcome.kind === 'rejected') throw planningOutcome.error
+      const planning = planningOutcome.planning
       return {
         strategy: input.strategy,
         ...(committedUser ? { user: committedUser } : {}),

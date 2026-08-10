@@ -106,6 +106,19 @@ export async function readActiveBranchPathSlotFrameInTransaction(
     ),
   ])
   throwIfAborted(signal)
+  return materializeActiveBranchPathSlotFrame(chatId, headers, members, states)
+}
+
+export function materializeActiveBranchPathSlotFrame(
+  chatId: ChatId,
+  headers: readonly MessageHeaderRow[],
+  members: readonly (ChildSlotMember | undefined)[],
+  states: readonly (ChildListState | undefined)[],
+): ActiveBranchPathSlotFrame {
+  if (members.length !== headers.length || states.length !== headers.length + 1) {
+    throw new Error(`ActiveBranchPathSlotFrameRowsInvalid:${chatId}`)
+  }
+  const terminalId = headers.at(-1)?.id ?? null
   const forkStates = states.slice(0, headers.length)
   const terminalState = states.at(-1)
   return Object.freeze({

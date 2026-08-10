@@ -432,6 +432,7 @@ describe('model discovery through the canonical configuration projection', () =>
     )
     await waitFor(() => expect(first.result.current.models.error).toBe('offline'))
     expect(first.result.current.models.offline).toBe(true)
+    expect(first.result.current.models.retained).toBe(false)
     expect(first.result.current.models.models.map((model) => model.id)).toEqual(['offline/model'])
     first.unmount()
 

@@ -40,6 +40,7 @@ function started(completion: Promise<void> = Promise.resolve()): ComposerSubmiss
     completion: completion.then(
       (): ComposerSubmissionOutcome => Object.freeze({ kind: 'prepared' }),
     ),
+    generationSettled: Promise.resolve(),
     cancel: () => undefined,
   })
 }
@@ -222,6 +223,7 @@ describe('Composer', () => {
                 : Object.freeze({ kind: 'not-admitted' as const, reason: outcome.reason }),
             ),
             completion,
+            generationSettled: Promise.resolve(),
             cancel: () => undefined,
           })
         }
@@ -254,6 +256,7 @@ describe('Composer', () => {
           kind: 'started',
           admission: admission.then(() => Object.freeze({ kind: 'admitted' })),
           completion: completion.then(() => Object.freeze({ kind: 'prepared' })),
+          generationSettled: Promise.resolve(),
           cancel: () => undefined,
         }),
     )
@@ -772,12 +775,14 @@ describe('Composer', () => {
         kind: 'started',
         admission: Promise.resolve({ kind: 'admitted' }),
         completion: firstCompletion,
+        generationSettled: Promise.resolve(),
         cancel: cancelFirst,
       })
       .mockReturnValueOnce({
         kind: 'started',
         admission: Promise.resolve({ kind: 'admitted' }),
         completion: secondCompletion,
+        generationSettled: Promise.resolve(),
         cancel: () => undefined,
       })
     const onCancel = vi.fn()
@@ -823,6 +828,7 @@ describe('Composer', () => {
           kind: 'started',
           admission: Promise.resolve({ kind: 'not-admitted', reason: 'cancelled' }),
           completion,
+          generationSettled: Promise.resolve(),
           cancel: cancelPreparation,
         })}
       />,
@@ -1143,6 +1149,7 @@ describe('Composer', () => {
             kind: 'started',
             admission: Promise.resolve({ kind: 'admitted' }),
             completion: oldPrepared.then(() => ({ kind: 'prepared' })),
+            generationSettled: Promise.resolve(),
             cancel: () => undefined,
           })}
         />

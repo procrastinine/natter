@@ -13,6 +13,32 @@ export interface ConversationRouteOwnerController {
   cancel(reason?: unknown): void
 }
 
+export interface WorkspacePresentationForegroundDemand {
+  release(): void
+}
+
+export interface WorkspacePresentationForegroundDemandPort {
+  claim(): WorkspacePresentationForegroundDemand
+}
+
+let workspaceForegroundDemandPort: WorkspacePresentationForegroundDemandPort | null = null
+
+export function installWorkspacePresentationForegroundDemandPort(
+  port: WorkspacePresentationForegroundDemandPort,
+): void {
+  if (workspaceForegroundDemandPort) {
+    throw new Error('WorkspacePresentationForegroundDemandPortAlreadyInstalled')
+  }
+  workspaceForegroundDemandPort = port
+}
+
+export function claimWorkspacePresentationForegroundDemand(): WorkspacePresentationForegroundDemand {
+  if (!workspaceForegroundDemandPort) {
+    throw new Error('WorkspacePresentationForegroundDemandPortMissing')
+  }
+  return workspaceForegroundDemandPort.claim()
+}
+
 export function createConversationRouteOwnerController(): ConversationRouteOwnerController {
   const controller = new AbortController()
   const owner = Object.freeze({

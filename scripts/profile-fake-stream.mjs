@@ -512,8 +512,27 @@ async function collectStoreState(chatId) {
       if (!idb) throw new Error('profile IndexedDB activity probe is unavailable')
       const list = document.querySelector('[data-ui="message-list"]')
       const tree = document.querySelector('[data-ui="branch-tree-view"]')
+      const scrollRegion = document.querySelector('[data-ui="scroll-region"]')
       const isVisible = (node) => Boolean(node && node.getClientRects().length > 0)
-      const mountedMessages = document.querySelectorAll('[data-ui="message"]').length
+      const mountedMessageNodes = [...document.querySelectorAll('[data-ui="message"]')]
+      const mountedMessages = mountedMessageNodes.length
+      const scrollRegionRect = scrollRegion?.getBoundingClientRect()
+      const mountedRows = [...document.querySelectorAll('[data-ui="message-virtual-row"]')].map(
+        (node) => {
+          const rect = node.getBoundingClientRect()
+          return {
+            index: Number(node.getAttribute('data-index') ?? -1),
+            top: rect.top,
+            bottom: rect.bottom,
+            height: rect.height,
+            intersectsViewport: Boolean(
+              scrollRegionRect &&
+                rect.bottom > scrollRegionRect.top &&
+                rect.top < scrollRegionRect.bottom,
+            ),
+          }
+        },
+      )
       const assistantTextLengths = [
         ...document.querySelectorAll(
           '[data-ui="message"][data-role="assistant"] [data-ui="message-body"]',
@@ -563,7 +582,32 @@ async function collectStoreState(chatId) {
           chatId: id,
           url: location.href,
           mountedMessages,
+          mountedMessageIds: mountedMessageNodes.map((node) =>
+            node.getAttribute('data-message-id'),
+          ),
+          mountedIndices: [...document.querySelectorAll('[data-ui="message-virtual-row"]')].map(
+            (node) => Number(node.getAttribute('data-index') ?? -1),
+          ),
+          mountedRows,
+          scrollRegion: scrollRegionRect
+            ? {
+                top: scrollRegionRect.top,
+                bottom: scrollRegionRect.bottom,
+                height: scrollRegionRect.height,
+                scrollTop: scrollRegion?.scrollTop ?? 0,
+                scrollHeight: scrollRegion?.scrollHeight ?? 0,
+              }
+            : null,
           loadedMessages: Number(list?.getAttribute('data-rendered-count') ?? 0),
+          generationContinuityCount: Number(
+            list?.getAttribute('data-generation-continuity-count') ?? 0,
+          ),
+          userScrollRevision: Number(list?.getAttribute('data-user-scroll-revision') ?? 0),
+          capturedUserScrollRevision: Number(
+            list?.getAttribute('data-generation-captured-user-scroll-revision') ?? -1,
+          ),
+          layoutAnchorId: list?.getAttribute('data-layout-anchor-id') ?? null,
+          historyDemandAnchorId: list?.getAttribute('data-history-demand-anchor-id') ?? null,
           virtualized: list?.getAttribute('data-virtualized') === 'true',
           initialRenderWork: Number(list?.getAttribute('data-initial-render-work') ?? 0),
           totalMessages: Number(list?.getAttribute('data-total-count') ?? 0),

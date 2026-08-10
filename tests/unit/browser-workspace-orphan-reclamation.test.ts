@@ -2,19 +2,17 @@ import Dexie from 'dexie'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { NATTER_INDEXED_DATABASE_NAMES } from '../../src/lib/origin-storage-names'
 import {
-  activatePreparedBrowserWorkspaceDatabase,
+  __resetBrowserWorkspaceControlDatabaseForTests,
   beginBrowserWorkspaceDatabaseReplacement,
-  completeBrowserWorkspaceDatabaseCleanup,
   readBrowserWorkspaceDatabaseManifest,
 } from '../../src/store/browser-workspace-database-control'
 import { reclaimInactiveBrowserWorkspaceDatabases } from '../../src/store/browser-workspace-orphan-reclamation'
 import { __resetBrowserWorkspaceSlotCoordinatorForTests } from '../../src/store/browser-workspace-slot-coordination'
 
 const originalLocks = Object.getOwnPropertyDescriptor(navigator, 'locks')
-const storageBaseline = { kind: 'reset', liveBytes: 0 } as const
-
 class ControllableLockManager {
   selectionBusy = false
+  selectionHolds = 0
   readonly busySlots = new Set<string>()
   beforeSlotAcquired: ((name: string) => Promise<void>) | null = null
 
@@ -25,13 +23,21 @@ class ControllableLockManager {
   ): Promise<T> {
     const unavailable =
       options.ifAvailable === true && (this.selectionBusy || this.busySlots.has(name))
+    const selected = name === 'natter:workspace-slot-selection:v1' && !unavailable
     return Promise.resolve()
       .then(async () => {
         if (!unavailable && name.startsWith('natter:workspace-slot:')) {
           await this.beforeSlotAcquired?.(name)
         }
       })
-      .then(() => callback(unavailable ? null : { name, mode: options.mode }))
+      .then(async () => {
+        if (selected) this.selectionHolds += 1
+        try {
+          return await callback(unavailable ? null : { name, mode: options.mode })
+        } finally {
+          if (selected) this.selectionHolds -= 1
+        }
+      })
   }
 }
 
@@ -46,6 +52,7 @@ async function createDatabase(name: string): Promise<void> {
 }
 
 async function deleteAllDatabases(): Promise<void> {
+  __resetBrowserWorkspaceControlDatabaseForTests()
   for (const name of NATTER_INDEXED_DATABASE_NAMES) await Dexie.delete(name)
 }
 
@@ -142,33 +149,36 @@ describe('inactive browser workspace database reclamation', () => {
     expect(await Dexie.exists('natter-workspace-b')).toBe(true)
   })
 
-  it('revalidates after the slot lock and never deletes a candidate that became active', async () => {
+  it('holds selection continuously from candidate revalidation through physical deletion', async () => {
     await Promise.all([
       createDatabase('natter'),
       createDatabase('natter-workspace-a'),
       createDatabase('natter-workspace-b'),
     ])
+    const slotAdmissions: Array<{ readonly name: string; readonly selectionHolds: number }> = []
     locks.beforeSlotAcquired = async (name) => {
-      if (name !== 'natter:workspace-slot:natter-workspace-a') return
-      locks.beforeSlotAcquired = null
-      const preparing = await beginBrowserWorkspaceDatabaseReplacement()
-      const activated = await activatePreparedBrowserWorkspaceDatabase(preparing, storageBaseline)
-      if (activated.pending?.phase !== 'cleanup') {
-        throw new Error('CleanupJournalMissing')
-      }
-      await completeBrowserWorkspaceDatabaseCleanup(activated.pending)
+      slotAdmissions.push({ name, selectionHolds: locks.selectionHolds })
     }
+    const selectionAtDelete: number[] = []
+    const deleteDatabase = Dexie.delete.bind(Dexie)
+    vi.spyOn(Dexie, 'delete').mockImplementation(async (name) => {
+      selectionAtDelete.push(locks.selectionHolds)
+      await deleteDatabase(name)
+    })
 
     await expect(reclaimInactiveBrowserWorkspaceDatabases()).resolves.toMatchObject({
       status: 'swept',
-      deleted: ['natter-workspace-b'],
-      skipped: ['natter-workspace-a'],
+      deleted: ['natter-workspace-a', 'natter-workspace-b'],
+      skipped: [],
       failed: [],
     })
-    expect((await readBrowserWorkspaceDatabaseManifest()).activeDatabaseName).toBe(
-      'natter-workspace-a',
-    )
-    expect(await Dexie.exists('natter-workspace-a')).toBe(true)
+    expect(slotAdmissions).toEqual([
+      { name: 'natter:workspace-slot:natter-workspace-a', selectionHolds: 1 },
+      { name: 'natter:workspace-slot:natter-workspace-b', selectionHolds: 1 },
+    ])
+    expect(selectionAtDelete).toEqual([1, 1])
+    expect((await readBrowserWorkspaceDatabaseManifest()).activeDatabaseName).toBe('natter')
+    expect(await Dexie.exists('natter-workspace-a')).toBe(false)
     expect(await Dexie.exists('natter-workspace-b')).toBe(false)
   })
 

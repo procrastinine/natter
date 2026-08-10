@@ -15,7 +15,6 @@ import {
 } from 'node:fs'
 import { cp } from 'node:fs/promises'
 import { createRequire } from 'node:module'
-import { homedir } from 'node:os'
 import { delimiter, dirname, isAbsolute, relative, resolve } from 'node:path'
 import { executeFileBackedVerificationProcess } from './verification-process-execution.mjs'
 import {
@@ -102,12 +101,9 @@ export async function prepareVerificationDependencyImage(options) {
     mkdirSync(resolve(buildRoot, 'home'), { recursive: true })
     mkdirSync(resolve(buildRoot, 'tmp'), { recursive: true })
     mkdirSync(resolve(buildRoot, 'cache'), { recursive: true })
-    const storeRoot = resolve(
-      options.storeRoot ?? (await resolvePnpmStoreRoot(sourceRoot, runtimeCapability, runProcess)),
+    const storeRoot = canonicalPnpmStoreRoot(
+      options.storeRoot ?? installedPnpmStoreRoot(sourceRoot),
     )
-    if (!lstatSync(storeRoot, { throwIfNoEntry: false })?.isDirectory()) {
-      throw new Error('VerificationDependencyImageStoreMissing')
-    }
     const install = dependencyInstallInvocation(
       workspaceRoot,
       storeRoot,
@@ -382,42 +378,47 @@ function buildDependencyRecipe(sourceRoot, runtime) {
   return deepFreeze({ ...withoutDigest, digest: digestJson(withoutDigest) })
 }
 
-async function resolvePnpmStoreRoot(sourceRoot, runtimeCapability, runProcess) {
-  if (!runtimeCapability.nodeExecutablePath || !runtimeCapability.pnpmExecutablePath) {
-    throw new Error('VerificationDependencyStoreCapabilityRequired')
+function installedPnpmStoreRoot(sourceRoot) {
+  const manifestPath = resolve(sourceRoot, 'node_modules/.modules.yaml')
+  const metadata = lstatSync(manifestPath, { throwIfNoEntry: false })
+  if (!metadata) {
+    throw new Error(`VerificationDependencySourceInstallMetadataMissing:${manifestPath}`)
   }
-  const result = await runProcess({
-    command: runtimeCapability.nodeExecutablePath,
-    args: [
-      runtimeCapability.pnpmExecutablePath,
-      '--config.manage-package-manager-versions=false',
-      `--config.userconfig=${resolve(sourceRoot, '.npmrc')}`,
-      '--dir',
-      sourceRoot,
-      'store',
-      'path',
-      '--silent',
-    ],
-    cwd: sourceRoot,
-    env: {
-      FORCE_COLOR: '0',
-      HOME: homedir(),
-      LANG: 'C',
-      LC_ALL: 'C',
-      NO_COLOR: '1',
-      PATH: process.env.PATH ?? '',
-      TZ: 'UTC',
-      ...(process.env.XDG_DATA_HOME ? { XDG_DATA_HOME: process.env.XDG_DATA_HOME } : {}),
-    },
-  })
-  if (result.exitCode !== 0 || result.signal !== null || result.error !== null) {
-    throw new Error('VerificationDependencyStoreResolutionFailed')
+  if (!metadata.isFile() || metadata.isSymbolicLink()) {
+    throw new Error(`VerificationDependencySourceInstallMetadataInvalid:${manifestPath}`)
   }
-  const output = result.stdout.toString('utf8').trim()
-  if (!isAbsolute(output) || output.includes('\n') || output.includes('\r')) {
-    throw new Error('VerificationDependencyStoreResolutionInvalid')
+  let manifest
+  try {
+    manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+  } catch {
+    throw new Error(`VerificationDependencySourceInstallMetadataInvalid:${manifestPath}`)
   }
-  return output
+  if (
+    typeof manifest?.storeDir !== 'string' ||
+    !isAbsolute(manifest.storeDir) ||
+    manifest.storeDir.includes('\0')
+  ) {
+    throw new Error(`VerificationDependencySourceInstallStoreInvalid:${manifestPath}`)
+  }
+  return manifest.storeDir
+}
+
+function canonicalPnpmStoreRoot(declaredRoot) {
+  const absolute = resolve(declaredRoot)
+  const metadata = lstatSync(absolute, { throwIfNoEntry: false })
+  if (!metadata || (!metadata.isDirectory() && !metadata.isSymbolicLink())) {
+    throw new Error(`VerificationDependencyImageStoreMissing:${absolute}`)
+  }
+  let canonical
+  try {
+    canonical = realpathSync(absolute)
+  } catch {
+    throw new Error(`VerificationDependencyImageStoreMissing:${absolute}`)
+  }
+  if (!lstatSync(canonical, { throwIfNoEntry: false })?.isDirectory()) {
+    throw new Error(`VerificationDependencyImageStoreInvalid:${absolute}`)
+  }
+  return canonical
 }
 
 function recipeEntry(sourceRoot, path) {

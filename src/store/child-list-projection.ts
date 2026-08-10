@@ -34,6 +34,8 @@ export async function maintainChildSlotProjections(
   tx: Transaction,
   changes: readonly MessageChildSlotChange[],
   pendingStates: ReadonlyMap<string, ChildListState>,
+  previousStates: ReadonlyMap<string, ChildListState | undefined>,
+  knownCurrentRows: ReadonlyMap<MessageId, MessageHeaderRow | undefined>,
 ): Promise<ChildSlotProjectionReceipt> {
   if (pendingStates.size === 0) {
     return Object.freeze({
@@ -46,8 +48,12 @@ export async function maintainChildSlotProjections(
   const messages = tx.table<MessageHeaderRow, MessageId>('messages')
   const members = tx.table<ChildSlotMember, MessageId>('childSlotMembers')
   const states = tx.table<ChildListState, string>('childLists')
-  const currentRows = await messages.bulkGet(changes.map((change) => change.messageId))
-  const currentById = new Map<MessageId, MessageHeaderRow | undefined>()
+  const currentById = new Map<MessageId, MessageHeaderRow | undefined>(knownCurrentRows)
+  const missingCurrentIds = changes
+    .map((change) => change.messageId)
+    .filter((messageId) => !currentById.has(messageId))
+  const currentRows =
+    missingCurrentIds.length === 0 ? [] : await messages.bulkGet(missingCurrentIds)
   const slots: WorkspaceLocalChildSlotEvidence[] = []
   const physicalMutations: Array<{
     readonly tableName: 'childLists' | 'childSlotMembers'
@@ -61,17 +67,19 @@ export async function maintainChildSlotProjections(
     readonly operation: 'get' | 'get-many' | 'query'
     readonly requestCount: number
     readonly rowCount: number
-  }> = [
-    {
-      tableName: 'messages',
-      indexKind: 'primary',
-      operation: 'get-many',
-      requestCount: 1,
-      rowCount: changes.length,
-    },
-  ]
-  for (const [index, change] of changes.entries()) {
-    currentById.set(change.messageId, currentRows[index])
+  }> = missingCurrentIds.length
+    ? [
+        {
+          tableName: 'messages',
+          indexKind: 'primary',
+          operation: 'get-many',
+          requestCount: 1,
+          rowCount: missingCurrentIds.length,
+        },
+      ]
+    : []
+  for (const [index, messageId] of missingCurrentIds.entries()) {
+    currentById.set(messageId, currentRows[index])
   }
   const changesBySlot = new Map<string, MessageChildSlotChange[]>()
   for (const change of changes) {
@@ -101,7 +109,9 @@ export async function maintainChildSlotProjections(
         : []
     })
     appended.sort(compareSiblingOrder)
-    const previous = await states.get(pending.id)
+    const previous = previousStates.has(pending.id)
+      ? previousStates.get(pending.id)
+      : await states.get(pending.id)
     reads.push({
       tableName: 'childLists',
       indexKind: 'primary',

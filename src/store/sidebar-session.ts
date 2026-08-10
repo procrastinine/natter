@@ -33,7 +33,10 @@ interface SidebarSessionRequest extends WorkspaceFence {
   readonly createdAtGroupBoundaries: readonly [number, number, number, number]
 }
 
-type SidebarSessionQuery = Omit<SidebarPresentationRequest, 'cursor' | 'limit' | 'countMode'>
+type SidebarSessionQuery = Omit<
+  SidebarPresentationRequest,
+  'cursor' | 'limit' | 'countMode' | 'knownFolderIds' | 'knownTagIds'
+>
 
 interface SidebarSessionPageMeta {
   readonly exactVisibleChats: number
@@ -92,8 +95,6 @@ const EMPTY_MEASUREMENT: SidebarPresentationMeasurement = Object.freeze({
   folderChildRowsRead: 0,
   folderCatalogRowsRead: 0,
   tagCatalogRowsRead: 0,
-  completionProbeQueries: 0,
-  completionProbeKeysRead: 0,
   createdAtGroupProbeQueries: 0,
   createdAtGroupProbeKeysRead: 0,
 })
@@ -201,7 +202,14 @@ function sidebarAdapter(
           ...query,
           limit: page.limit,
           ...(page.cursor ? { cursor: page.cursor } : {}),
-          countMode: page.previousMeta ? 'omit' : 'exact',
+          ...(page.previousMeta
+            ? {
+                knownFolderIds: page.previousMeta.folders.map((folder) => folder.id),
+                knownTagIds: page.previousMeta.tags.map((tag) => tag.id),
+              }
+            : {}),
+          countMode:
+            (page.mode === 'refresh' && page.first) || !page.previousMeta ? 'exact' : 'omit',
         },
         signal,
       )
@@ -230,10 +238,34 @@ function sidebarAdapter(
       }
     },
     changeImpact: sidebarChangeImpact,
+    reuseMetaOnRefresh: true,
+    invalidateMeta: invalidateSidebarMetadata,
     rowId: (row) => row.key,
     cloneRow: cloneSidebarPresentationRow,
     compareRows: () => 0,
   }
+}
+
+function invalidateSidebarMetadata(
+  meta: SidebarSessionPageMeta,
+  effect: WorkspaceEffect,
+): SidebarSessionPageMeta {
+  if (effect.kind === 'replace' || effect.impactByKind === 'all') {
+    return Object.freeze({
+      ...meta,
+      folders: Object.freeze([]),
+      tags: Object.freeze([]),
+    })
+  }
+  const invalidateAll = Object.hasOwn(effect.impactByKind, 'workspace')
+  const invalidateFolders = invalidateAll || Object.hasOwn(effect.impactByKind, 'folder')
+  const invalidateTags = invalidateAll || Object.hasOwn(effect.impactByKind, 'tag')
+  if (!invalidateFolders && !invalidateTags) return meta
+  return Object.freeze({
+    ...meta,
+    ...(invalidateFolders ? { folders: Object.freeze([]) } : {}),
+    ...(invalidateTags ? { tags: Object.freeze([]) } : {}),
+  })
 }
 
 function mergeFolders(

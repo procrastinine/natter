@@ -773,8 +773,8 @@ const STREAM_JOURNAL_INTEGRITY_OPERATION = semanticOperationDescriptor({
 
 const TERMINAL_STREAM_RETENTION_OPERATION_BOUNDS = {
   reads: {
-    maxRequests: 5,
-    maxRows: STREAM_JOURNAL_RETIREMENT_MAX_ROWS + 5,
+    maxRequests: 4,
+    maxRows: STREAM_JOURNAL_RETIREMENT_MAX_ROWS + 4,
     maxBatchRows: STREAM_JOURNAL_RETIREMENT_MAX_ROWS + 1,
     maxBytes: Number.MAX_SAFE_INTEGER,
   },
@@ -1692,24 +1692,12 @@ async function commitStorageRetentionPage<Task extends StorageRetentionTask>(
     | { readonly done: true; readonly earliestDeferredAt?: number },
 ): Promise<SemanticOperationReceiptFragment<'storageRetentionState'>> {
   const previous = await readStorageRetentionState(tx, cycle.task)
-  assertStorageRetentionCycleCurrent(previous, cycle)
-  const next = advanceStorageRetentionState(cycle, outcome)
-  await putPhysicalStorageRow<StorageRetentionStateRowFor<Task>, StorageRetentionTask>(
-    tx,
-    'storageRetentionState',
-    next,
-    previous,
-  )
-  recordBrowserCommandStorageRetentionMutation(tx, cycle.task)
+  const written = await writeStorageRetentionPage(tx, previous, cycle, outcome)
   return semanticOperationReceiptFragment({
-    physicalMutations: [
-      {
-        tableName: 'storageRetentionState',
-        operation: 'write',
-        key: cycle.task,
-      },
-    ],
+    dependencies: written.dependencies,
+    physicalMutations: written.physicalMutations,
     physicalReads: [
+      ...written.physicalReads,
       {
         tableName: 'storageRetentionState',
         indexKind: 'primary',
@@ -1718,6 +1706,36 @@ async function commitStorageRetentionPage<Task extends StorageRetentionTask>(
         rowCount: 1,
       },
     ],
+    physicalWrites: written.physicalWrites,
+  })
+}
+
+function writeStorageRetentionPage<Task extends StorageRetentionTask>(
+  tx: Transaction,
+  previous: StorageRetentionStateRowFor<Task>,
+  cycle: StorageRetentionCycle<Task>,
+  outcome:
+    | { readonly done: false; readonly cursor?: StorageRetentionCursor<Task> }
+    | { readonly done: true; readonly earliestDeferredAt?: number },
+): Promise<SemanticOperationReceiptFragment<'storageRetentionState'>> {
+  assertStorageRetentionCycleCurrent(previous, cycle)
+  const next = advanceStorageRetentionState(cycle, outcome)
+  return putPhysicalStorageRow<StorageRetentionStateRowFor<Task>, StorageRetentionTask>(
+    tx,
+    'storageRetentionState',
+    next,
+    previous,
+  ).then(() => {
+    recordBrowserCommandStorageRetentionMutation(tx, cycle.task)
+    return semanticOperationReceiptFragment({
+      physicalMutations: [
+        {
+          tableName: 'storageRetentionState',
+          operation: 'write',
+          key: cycle.task,
+        },
+      ],
+    })
   })
 }
 
@@ -4100,7 +4118,11 @@ async function reserveStreamLeaseTarget(
   incoming: StreamLeaseAdmission,
 ): Promise<number> {
   const settings = tx.table<{ key: string; value: unknown }, string>('settings')
-  const sequenceRow = await settings.get('stream-admission-sequence')
+  const leaseTable = tx.table<StreamLeaseRow, string>('streamLeases')
+  const [sequenceRow, competing] = await Dexie.Promise.all([
+    settings.get('stream-admission-sequence'),
+    leaseTable.where('targetOwnerKey').equals(incoming.messageId).first(),
+  ])
   const currentSequence =
     typeof sequenceRow?.value === 'number' &&
     Number.isSafeInteger(sequenceRow.value) &&
@@ -4110,8 +4132,6 @@ async function reserveStreamLeaseTarget(
   if (currentSequence >= Number.MAX_SAFE_INTEGER)
     throw new Error('StreamAdmissionSequenceExhausted')
   const admissionSequence = currentSequence + 1
-  const leaseTable = tx.table<StreamLeaseRow, string>('streamLeases')
-  const competing = await leaseTable.where('targetOwnerKey').equals(incoming.messageId).first()
   if (competing) throw new StreamTargetBusyError(incoming.messageId)
   await putPhysicalStorageRow(
     tx,
@@ -4130,7 +4150,7 @@ async function assertStreamLeaseWorkspaceTarget(
   tx: Transaction,
   lease: Pick<StreamLeaseRow, 'streamId' | 'chatId' | 'messageId' | 'attemptKind'>,
   chat: Chat | undefined,
-): Promise<void> {
+): Promise<MessageHeaderRow | undefined> {
   if (!chat) throw new ChatMissingError(lease.chatId)
   const target = await tx.table<MessageHeaderRow, MessageId>('messages').get(lease.messageId)
   if (lease.attemptKind === 'generation' && target) {
@@ -4142,6 +4162,7 @@ async function assertStreamLeaseWorkspaceTarget(
   ) {
     throw new Error(`ContinuationStreamTargetInvalid:${lease.streamId}:${lease.messageId}`)
   }
+  return target
 }
 
 function valuesEqual(left: unknown, right: unknown): boolean {
@@ -8017,14 +8038,11 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
       boundedMaintenanceLimit(requestedLimit),
       STREAM_JOURNAL_RETIREMENT_MAX_ROWS,
     )
-    return commit.executeSemanticOperation(
-      TERMINAL_STREAM_RETENTION_OPERATION,
-      { limit },
-      async (tx) => {
-        const receipt = createSemanticOperationExactReceiptAccumulator<
-          'storageRetentionState' | 'streamLeases' | 'streamChunks'
-        >()
-        const state = await readStorageRetentionState(tx, 'terminal-stream-prune')
+    return commit.executeSemanticOperation(TERMINAL_STREAM_RETENTION_OPERATION, { limit }, (tx) => {
+      const receipt = createSemanticOperationExactReceiptAccumulator<
+        'storageRetentionState' | 'streamLeases' | 'streamChunks'
+      >()
+      return readStorageRetentionState(tx, 'terminal-stream-prune').then((state) => {
         receipt.physicalRead({
           tableName: 'storageRetentionState',
           indexKind: 'primary',
@@ -8035,102 +8053,95 @@ class BrowserWorkspaceRepository implements WorkspaceRepository {
         const cycle = storageRetentionCycle(state, now, maxAgeMs)
         const leases = tx.table<StreamLeaseRow, string>('streamLeases')
         const lower = cycle.cursor ? [cycle.cursor.terminalRetentionAt, cycle.cursor.streamId] : []
-        const current = await leases
+        return leases
           .where('[terminalRetentionAt+streamId]')
-          .between(lower, [cycle.cutoff], false, false)
+          .above(lower)
           .first()
-        receipt.physicalRead({
-          tableName: 'streamLeases',
-          indexKind: 'secondary',
-          indexName: '[terminalRetentionAt+streamId]',
-          operation: 'query',
-          requestCount: 1,
-          rowCount: current ? 1 : 0,
-        })
-        if (!current) {
-          const deferred = await leases
-            .where('[terminalRetentionAt+streamId]')
-            .aboveOrEqual([cycle.cutoff])
-            .first()
-          receipt.physicalRead({
-            tableName: 'streamLeases',
-            indexKind: 'secondary',
-            indexName: '[terminalRetentionAt+streamId]',
-            operation: 'query',
-            requestCount: 1,
-            rowCount: deferred ? 1 : 0,
+          .then((current) => {
+            receipt.physicalRead({
+              tableName: 'streamLeases',
+              indexKind: 'secondary',
+              indexName: '[terminalRetentionAt+streamId]',
+              operation: 'query',
+              requestCount: 1,
+              rowCount: current ? 1 : 0,
+            })
+            if (current?.terminalRetentionAt === undefined && current) {
+              throw new Error(`TerminalStreamRetentionTimestampMissing:${current.streamId}`)
+            }
+            if (!current || current.terminalRetentionAt >= cycle.cutoff) {
+              const earliestDeferredAt = current?.terminalRetentionAt
+              const result: TerminalStreamRetentionResult = {
+                scanned: 0,
+                deletedStreamIds: [],
+                deletedFrames: 0,
+                ...(earliestDeferredAt === undefined ? {} : { earliestDeferredAt }),
+                done: true,
+              }
+              return writeStorageRetentionPage(tx, state, cycle, {
+                done: true,
+                ...(earliestDeferredAt === undefined ? {} : { earliestDeferredAt }),
+              }).then((fragment) => {
+                receipt.absorb(fragment)
+                return semanticOperationExecution(
+                  result,
+                  receipt.seal(
+                    semanticOperationExactPlan({
+                      replay: terminalStreamRetentionReplayPlan(cycle, limit),
+                      bounds: TERMINAL_STREAM_RETENTION_OPERATION_BOUNDS,
+                    }),
+                  ),
+                )
+              })
+            }
+            return retireStreamJournalOwnershipPage(tx, {
+              kind: 'retention-candidate',
+              streamId: current.streamId,
+              expectedRevision: current.revision,
+              expectedTerminalRetentionAt: current.terminalRetentionAt,
+              cutoff: cycle.cutoff,
+              maxFrameRows: limit,
+            }).then((transition) => {
+              if (transition.kind !== 'single-stream') {
+                throw new Error(`TerminalStreamRetentionReceiptMissing:${current.streamId}`)
+              }
+              receipt.absorb(transition.receipt)
+              const page = transition.result
+              if (page.outcome === 'ineligible') {
+                throw new Error(`TerminalStreamRetentionCandidateInvalid:${current.streamId}`)
+              }
+              const finish = () => {
+                const result: TerminalStreamRetentionResult = {
+                  scanned: 1,
+                  deletedStreamIds: page.deletedLeases > 0 ? [current.streamId] : [],
+                  deletedFrames: page.deletedFrames,
+                  done: false,
+                }
+                return semanticOperationExecution(
+                  result,
+                  receipt.seal(
+                    semanticOperationExactPlan({
+                      replay: terminalStreamRetentionReplayPlan(cycle, limit),
+                      bounds: TERMINAL_STREAM_RETENTION_OPERATION_BOUNDS,
+                    }),
+                  ),
+                )
+              }
+              if (page.outcome !== 'complete') return finish()
+              return writeStorageRetentionPage(tx, state, cycle, {
+                done: false,
+                cursor: {
+                  terminalRetentionAt: current.terminalRetentionAt,
+                  streamId: current.streamId,
+                },
+              }).then((fragment) => {
+                receipt.absorb(fragment)
+                return finish()
+              })
+            })
           })
-          const earliestDeferredAt = deferred?.terminalRetentionAt
-          receipt.absorb(
-            await commitStorageRetentionPage(tx, cycle, {
-              done: true,
-              ...(earliestDeferredAt === undefined ? {} : { earliestDeferredAt }),
-            }),
-          )
-          const result: TerminalStreamRetentionResult = {
-            scanned: 0,
-            deletedStreamIds: [],
-            deletedFrames: 0,
-            ...(earliestDeferredAt === undefined ? {} : { earliestDeferredAt }),
-            done: true,
-          }
-          return semanticOperationExecution(
-            result,
-            receipt.seal(
-              semanticOperationExactPlan({
-                replay: terminalStreamRetentionReplayPlan(cycle, limit),
-                bounds: TERMINAL_STREAM_RETENTION_OPERATION_BOUNDS,
-              }),
-            ),
-          )
-        }
-        if (current.terminalRetentionAt === undefined) {
-          throw new Error(`TerminalStreamRetentionTimestampMissing:${current.streamId}`)
-        }
-        const transition = await retireStreamJournalOwnershipPage(tx, {
-          kind: 'retention-candidate',
-          streamId: current.streamId,
-          expectedRevision: current.revision,
-          expectedTerminalRetentionAt: current.terminalRetentionAt,
-          cutoff: cycle.cutoff,
-          maxFrameRows: limit,
-        })
-        if (transition.kind !== 'single-stream') {
-          throw new Error(`TerminalStreamRetentionReceiptMissing:${current.streamId}`)
-        }
-        receipt.absorb(transition.receipt)
-        const page = transition.result
-        if (page.outcome === 'ineligible') {
-          throw new Error(`TerminalStreamRetentionCandidateInvalid:${current.streamId}`)
-        }
-        if (page.outcome === 'complete') {
-          receipt.absorb(
-            await commitStorageRetentionPage(tx, cycle, {
-              done: false,
-              cursor: {
-                terminalRetentionAt: current.terminalRetentionAt,
-                streamId: current.streamId,
-              },
-            }),
-          )
-        }
-        const result: TerminalStreamRetentionResult = {
-          scanned: 1,
-          deletedStreamIds: page.deletedLeases > 0 ? [current.streamId] : [],
-          deletedFrames: page.deletedFrames,
-          done: false,
-        }
-        return semanticOperationExecution(
-          result,
-          receipt.seal(
-            semanticOperationExactPlan({
-              replay: terminalStreamRetentionReplayPlan(cycle, limit),
-              bounds: TERMINAL_STREAM_RETENTION_OPERATION_BOUNDS,
-            }),
-          ),
-        )
-      },
-    )
+      })
+    })
   }
 
   private async pruneDiscoveryCache(

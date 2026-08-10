@@ -218,6 +218,7 @@ export const TEMPORAL_SEMANTIC_GROUPS = Object.freeze([
       retryLoops: [
         'src/store/browser-workspace-lifecycle.ts|fulfillBrowserWorkspaceRuntimeDemand|ForStatement|unbounded|1',
         'src/store/browser-workspace-replacement-runner.ts|performBrowserWorkspaceReplacementLaunch|ForStatement|unbounded|1',
+        'src/store/browser-workspace-replacement-runner.ts|runBrowserWorkspaceReplacement|ForStatement|unbounded|1',
       ],
     },
   ),

@@ -51,7 +51,6 @@ interface RefreshOptions {
 interface RefreshPlan {
   readonly logicalTargetKey: string
   readonly targetKey: string
-  readonly observedRow: object | null
   readonly fetchedAt: number | undefined
   readonly ttlMs: number
   run(options: RefreshOptions): Promise<void>
@@ -59,14 +58,12 @@ interface RefreshPlan {
 
 interface ActiveRefresh {
   readonly targetKey: string
-  readonly observedRow: object | null
   readonly baselineFetchedAt: number | null
   readonly controller: AbortController
 }
 
 interface SettledRefresh {
   readonly targetKey: string
-  readonly observedRow: object | null
   readonly baselineFetchedAt: number | null
 }
 
@@ -250,7 +247,6 @@ export class ConfigurationDiscoveryCoordinator {
       const controller = new AbortController()
       const refresh: ActiveRefresh = {
         targetKey: plan.targetKey,
-        observedRow: plan.observedRow,
         baselineFetchedAt: plan.fetchedAt ?? null,
         controller,
       }
@@ -287,7 +283,6 @@ export class ConfigurationDiscoveryCoordinator {
       ? {
           logicalTargetKey: modelsLogicalTargetKey(profile.id),
           targetKey: JSON.stringify(['models', profile.id, revisionKey, queryKey]),
-          observedRow: modelCatalog.models ?? null,
           fetchedAt: modelCatalog.models?.fetchedAt,
           ttlMs: MODELS_TTL_MS,
           run: async (options) => {
@@ -318,7 +313,6 @@ export class ConfigurationDiscoveryCoordinator {
         ? {
             logicalTargetKey,
             targetKey: JSON.stringify(['endpoints', profile.id, revisionKey, modelId]),
-            observedRow: modelRouting.endpoints ?? null,
             fetchedAt: modelRouting.endpoints?.fetchedAt,
             ttlMs: ENDPOINTS_TTL_MS,
             run: (options: RefreshOptions) =>
@@ -339,7 +333,6 @@ export class ConfigurationDiscoveryCoordinator {
       privacy = {
         logicalTargetKey,
         targetKey: JSON.stringify(['privacy', profile.id, revisionKey, modelId, proxyRevision]),
-        observedRow: modelRouting.privacy ?? null,
         fetchedAt: modelRouting.privacy?.fetchedAt,
         ttlMs: hasPolicies ? PRIVACY_POLICY_TTL_MS : EMPTY_PRIVACY_POLICY_RETRY_MS,
         run: (options) =>
@@ -401,9 +394,7 @@ export class ConfigurationDiscoveryCoordinator {
     const failed = this.failed[channel]
     if (
       failed &&
-      (failed.targetKey !== plan.targetKey ||
-        failed.observedRow !== plan.observedRow ||
-        (plan.fetchedAt !== undefined && failed.baselineFetchedAt !== plan.fetchedAt))
+      (failed.targetKey !== plan.targetKey || failed.baselineFetchedAt !== (plan.fetchedAt ?? null))
     ) {
       this.failed[channel] = null
       changed = true
@@ -411,7 +402,8 @@ export class ConfigurationDiscoveryCoordinator {
     const completed = this.completed[channel]
     if (
       completed &&
-      (completed.targetKey !== plan.targetKey || completed.observedRow !== plan.observedRow)
+      (completed.targetKey !== plan.targetKey ||
+        completed.baselineFetchedAt !== (plan.fetchedAt ?? null))
     ) {
       this.completed[channel] = null
       changed = true
@@ -455,8 +447,6 @@ export class ConfigurationDiscoveryCoordinator {
     this.failed[channel] = error
       ? {
           targetKey: refresh.targetKey,
-          observedRow:
-            plan?.targetKey === refresh.targetKey ? plan.observedRow : refresh.observedRow,
           baselineFetchedAt: refresh.baselineFetchedAt,
           error,
         }
@@ -465,7 +455,6 @@ export class ConfigurationDiscoveryCoordinator {
       ? null
       : {
           targetKey: refresh.targetKey,
-          observedRow: refresh.observedRow,
           baselineFetchedAt: refresh.baselineFetchedAt,
         }
     if (plan && plan.targetKey === refresh.targetKey) {

@@ -200,6 +200,7 @@ function startedGeneration(preparationError?: Error): GenerationSubmission {
           }
         : { kind: 'prepared' },
     ),
+    generationSettled: Promise.resolve(),
     cancel: () => undefined,
   }
 }

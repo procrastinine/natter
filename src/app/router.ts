@@ -24,13 +24,17 @@
 import { type MouseEvent, useSyncExternalStore } from 'react'
 import type { AttachmentId, ChatId, MessageId } from '../core/types'
 import { newId } from '../lib/ulid'
-import { createConversationRouteOwnerController } from '../store/conversation-route-owner'
+import {
+  claimWorkspacePresentationForegroundDemand,
+  createConversationRouteOwnerController,
+} from '../store/conversation-route-owner'
 import type {
   ConversationNavigationPort,
   ConversationRouteArrival,
   ConversationRouteHandoff,
   ConversationRouteOwner,
   ConversationRouteOwnerController,
+  WorkspacePresentationForegroundDemand,
 } from '../store/presentation-contracts'
 
 const routeIntentBrand: unique symbol = Symbol('RouteIntent')
@@ -47,6 +51,129 @@ export interface RouteIntent {
 }
 
 let currentRouteIntent: RouteIntent | null = null
+interface RouteForegroundDemandRecord {
+  expectedHash: string
+  readonly owner: WorkspacePresentationForegroundDemand
+  presentationSettled: boolean
+  readonly metadata:
+    | { readonly kind: 'not-required' }
+    | {
+        readonly kind: 'chat-last-viewed'
+        readonly chatId: ChatId
+        readonly controller: AbortController
+        phase: 'pending' | 'started' | 'settled'
+      }
+}
+
+let currentRouteForegroundDemand: RouteForegroundDemandRecord | null = null
+
+function publishRouteForegroundDemandDiagnostic(demand: RouteForegroundDemandRecord | null): void {
+  if (typeof document === 'undefined') return
+  if (demand) {
+    document.documentElement.setAttribute('data-natter-route-foreground', demand.expectedHash)
+  } else {
+    document.documentElement.removeAttribute('data-natter-route-foreground')
+  }
+}
+
+function claimRouteForegroundDemand(expectedHash: string): void {
+  releaseRouteForegroundDemand()
+  const route = parseRoute(expectedHash)
+  currentRouteForegroundDemand = {
+    expectedHash,
+    owner: claimWorkspacePresentationForegroundDemand(),
+    presentationSettled: false,
+    metadata:
+      route.kind === 'chat'
+        ? {
+            kind: 'chat-last-viewed',
+            chatId: route.chatId,
+            controller: new AbortController(),
+            phase: 'pending',
+          }
+        : { kind: 'not-required' },
+  }
+  publishRouteForegroundDemandDiagnostic(currentRouteForegroundDemand)
+}
+
+function releaseRouteForegroundDemand(): void {
+  const demand = currentRouteForegroundDemand
+  if (!demand) return
+  currentRouteForegroundDemand = null
+  if (demand.metadata.kind === 'chat-last-viewed' && demand.metadata.phase !== 'settled') {
+    demand.metadata.controller.abort()
+  }
+  publishRouteForegroundDemandDiagnostic(null)
+  demand.owner.release()
+}
+
+function releaseRouteForegroundDemandIfSettled(demand: RouteForegroundDemandRecord): void {
+  if (currentRouteForegroundDemand !== demand || !demand.presentationSettled) return
+  if (demand.metadata.kind === 'chat-last-viewed' && demand.metadata.phase !== 'settled') return
+  releaseRouteForegroundDemand()
+}
+
+export interface RouteForegroundPresentationOutcome {
+  readonly hasActiveChat: boolean
+  readonly targetKind: 'failed' | 'pending' | 'ready' | null
+  readonly revealPending: boolean
+  readonly destinationDeferred: boolean
+}
+
+export function routeForegroundPresentationSettled(
+  outcome: RouteForegroundPresentationOutcome,
+): boolean {
+  if (!outcome.hasActiveChat || outcome.destinationDeferred) return true
+  if (outcome.targetKind === 'failed') return true
+  return outcome.targetKind === 'ready' && !outcome.revealPending
+}
+
+export function settleRouteForegroundDemandForPresentation(
+  href: string,
+  outcome: RouteForegroundPresentationOutcome,
+): void {
+  if (!routeForegroundPresentationSettled(outcome)) return
+  if (typeof window === 'undefined') return
+  const demand = currentRouteForegroundDemand
+  if (!demand || demand.expectedHash !== href || window.location.hash !== href) {
+    return
+  }
+  demand.presentationSettled = true
+  releaseRouteForegroundDemandIfSettled(demand)
+}
+
+export function startRouteForegroundMetadata(
+  href: string,
+  chatId: ChatId,
+  operation: (signal: AbortSignal) => Promise<void>,
+): Promise<void> | null {
+  if (typeof window === 'undefined') return null
+  const demand = currentRouteForegroundDemand
+  if (!demand || demand.expectedHash !== href || window.location.hash !== href) return null
+  const metadata = demand.metadata
+  if (
+    metadata.kind !== 'chat-last-viewed' ||
+    metadata.chatId !== chatId ||
+    metadata.phase !== 'pending'
+  ) {
+    return null
+  }
+  metadata.phase = 'started'
+  const task = operation(metadata.controller.signal)
+  void task.then(
+    () => {
+      if (metadata.phase === 'settled') return
+      metadata.phase = 'settled'
+      releaseRouteForegroundDemandIfSettled(demand)
+    },
+    () => {
+      if (metadata.phase === 'settled') return
+      metadata.phase = 'settled'
+      releaseRouteForegroundDemandIfSettled(demand)
+    },
+  )
+  return task
+}
 
 function invalidateRouteIntent(): void {
   currentRouteIntent?.[routeIntentState].controller.abort()
@@ -271,6 +398,7 @@ export function navigate(href: string): void {
 }
 
 function commitHashNavigation(href: string, publish = true): boolean {
+  claimRouteForegroundDemand(href)
   if (window.location.hash === href) {
     if (publish) publishRouteChange()
     return false
@@ -299,6 +427,10 @@ export function replaceRoute(href: string): void {
   const before = window.location.hash
   if (currentRouteIntent && currentRouteIntent[routeIntentState].expectedHash === before) {
     currentRouteIntent[routeIntentState].expectedHash = href
+  }
+  if (currentRouteForegroundDemand?.expectedHash === before) {
+    currentRouteForegroundDemand.expectedHash = href
+    publishRouteForegroundDemandDiagnostic(currentRouteForegroundDemand)
   }
   if (window.location.hash === href) {
     const candidate = currentAddressRoute()
@@ -341,6 +473,7 @@ function ensureHashListener(): void {
     hashListenerInstalled = true
     window.addEventListener('hashchange', () => {
       invalidateRouteIntent()
+      claimRouteForegroundDemand(window.location.hash)
       publishRouteChange()
     })
     window.addEventListener('pageshow', reconcileRouteSnapshotWithAddress)
@@ -349,11 +482,13 @@ function ensureHashListener(): void {
     })
   }
   reconcileRouteSnapshotWithAddress()
+  if (!currentRouteForegroundDemand) claimRouteForegroundDemand(window.location.hash)
 }
 
 function reconcileRouteSnapshotWithAddress(): void {
   if (routeToHref(committedRouteSnapshot) !== routeToHref(currentAddressRoute())) {
     invalidateRouteIntent()
+    claimRouteForegroundDemand(window.location.hash)
     publishRouteChange()
   }
 }

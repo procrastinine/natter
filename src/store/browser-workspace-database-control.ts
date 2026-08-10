@@ -37,6 +37,7 @@ export function readExistingIndexedDb<Value>(
     }
     request.onsuccess = () => {
       const database = request.result
+      database.onversionchange = () => database.close()
       let plan: ExistingIndexedDbReadPlan<Value>
       try {
         plan = select(database)
@@ -76,25 +77,27 @@ export function readExistingIndexedDb<Value>(
       } catch (error) {
         read = Promise.reject(errorFromUnknown(error))
       }
-      void Promise.all([read, completion])
-        .then(([value]) => resolve(value))
-        .catch((error: unknown) => {
+      void Promise.all([read, completion]).then(
+        ([value]) => {
+          database.close()
+          resolve(value)
+        },
+        (error: unknown) => {
+          let failure: unknown = error
           try {
             transaction.abort()
           } catch (abortError) {
             if (!(abortError instanceof DOMException) || abortError.name !== 'InvalidStateError') {
-              reject(
-                new AggregateError(
-                  [error, abortError],
-                  'ExistingIndexedDbReadTransactionAbortFailed',
-                ),
+              failure = new AggregateError(
+                [error, abortError],
+                'ExistingIndexedDbReadTransactionAbortFailed',
               )
-              return
             }
           }
-          reject(errorFromUnknown(error))
-        })
-        .finally(() => database.close())
+          database.close()
+          reject(errorFromUnknown(failure))
+        },
+      )
     }
     request.onerror = () => {
       if (createdByRace && request.error?.name === 'AbortError') resolve(null)
@@ -209,6 +212,14 @@ class BrowserWorkspaceControlDb extends Dexie {
   }
 }
 
+let browserWorkspaceControlDb = new BrowserWorkspaceControlDb()
+let browserWorkspaceControlDbOpening: Promise<void> | undefined
+let browserWorkspaceControlDbAccepting = true
+let browserWorkspaceControlDbActiveOperations = 0
+let browserWorkspaceControlDbResolveIdle: (() => void) | undefined
+let browserWorkspaceControlDbIdle: Promise<void> = Promise.resolve()
+let browserWorkspaceControlDbClose: Promise<void> | undefined
+
 export class BrowserWorkspaceActivationOutcomeUncertainError extends AggregateError {
   constructor(errors: readonly unknown[]) {
     super(errors, 'BrowserWorkspaceActivationOutcomeUncertain')
@@ -217,39 +228,53 @@ export class BrowserWorkspaceActivationOutcomeUncertainError extends AggregateEr
 }
 
 export async function readBrowserWorkspaceDatabaseManifest(): Promise<BrowserWorkspaceDatabaseManifest> {
-  const stored = await withControlDb((db) => db.manifests.get(CONTROL_MANIFEST_ID))
-  if (stored !== undefined) return requireManifest(stored)
-  return withControlDb((db) =>
-    db.transaction('rw', db.manifests, async () => {
-      const current = await db.manifests.get(CONTROL_MANIFEST_ID)
-      if (current !== undefined) return requireManifest(current)
-      const initial = initialManifest()
-      await db.manifests.put(initial)
-      return initial
-    }),
-  )
+  return withControlDb(async (db) => {
+    const stored = await db.manifests.get(CONTROL_MANIFEST_ID)
+    if (stored !== undefined) return requireManifest(stored)
+    return mutateBrowserWorkspaceControl(
+      { readManifest: true },
+      ({ manifest: current }) => {
+        if (current !== undefined) return { result: requireManifest(current) }
+        const initial = initialManifest()
+        return { manifest: initial, result: initial }
+      },
+      db,
+    )
+  })
 }
 
 export function readBrowserWorkspaceCompactionState(
   databaseName: string,
 ): Promise<BrowserWorkspaceCompactionState> {
-  return withControlDb((db) =>
-    db.transaction('rw', db.compactionStates, async () => {
-      const stored = await db.compactionStates.get(databaseName)
+  return mutateBrowserWorkspaceCompactionState<BrowserWorkspaceCompactionState>(
+    databaseName,
+    (stored) => {
       if (stored) {
         try {
-          return requireCompactionState(stored, databaseName)
+          const state = requireCompactionState(stored, databaseName)
+          return { result: state }
         } catch {
           const recovered = conservativeCompactionState(databaseName)
-          await db.compactionStates.put(recovered)
-          return recovered
+          return { state: recovered, result: recovered }
         }
       }
       const initial = freshCompactionState(databaseName)
-      await db.compactionStates.put(initial)
-      return initial
-    }),
+      return { state: initial, result: initial }
+    },
   )
+}
+
+export function browserWorkspaceCompactionDemandPending(databaseName: string): Promise<boolean> {
+  return withControlDb(async (db) => {
+    const stored = await db.compactionStates.get(databaseName)
+    if (stored === undefined) return false
+    try {
+      const state = requireCompactionState(stored, databaseName)
+      return state.requestRevision > state.attemptedRevision
+    } catch {
+      return true
+    }
+  })
 }
 
 export function recordBrowserWorkspaceCompactionDebt(
@@ -259,54 +284,57 @@ export function recordBrowserWorkspaceCompactionDebt(
   if (!Number.isSafeInteger(obsoleteBytes) || obsoleteBytes < 0) {
     return Promise.reject(new Error('StorageCompactionDebtInvalid'))
   }
-  return withControlDb((db) =>
-    db.transaction('rw', db.compactionStates, async () => {
-      const previous = recoverableCompactionState(
-        (await db.compactionStates.get(databaseName)) ?? freshCompactionState(databaseName),
-        databaseName,
-      )
-      const threshold = browserWorkspaceCompactionDebtThreshold(previous.lastCompactedLiveBytes)
-      const knownReclaimableBytes = saturatingAdd(previous.knownReclaimableBytes, obsoleteBytes)
-      const crossed =
-        Math.floor(knownReclaimableBytes / threshold) >
-        Math.floor(previous.knownReclaimableBytes / threshold)
-      const requestRevision = crossed
-        ? saturatingAdd(previous.requestRevision, 1)
-        : previous.requestRevision
-      const state: BrowserWorkspaceCompactionState = {
-        ...previous,
-        knownReclaimableBytes,
-        requestRevision,
-      }
-      await db.compactionStates.put(state)
-      return { state, requested: crossed }
-    }),
-  )
+  return mutateBrowserWorkspaceCompactionState(databaseName, (stored) => {
+    const previous = recoverableCompactionState(
+      stored ?? freshCompactionState(databaseName),
+      databaseName,
+    )
+    const threshold = browserWorkspaceCompactionDebtThreshold(previous.lastCompactedLiveBytes)
+    const knownReclaimableBytes = saturatingAdd(previous.knownReclaimableBytes, obsoleteBytes)
+    const crossed =
+      Math.floor(knownReclaimableBytes / threshold) >
+      Math.floor(previous.knownReclaimableBytes / threshold)
+    const requestRevision = crossed
+      ? saturatingAdd(previous.requestRevision, 1)
+      : previous.requestRevision
+    const state: BrowserWorkspaceCompactionState = {
+      ...previous,
+      knownReclaimableBytes,
+      requestRevision,
+    }
+    return { state, result: { state, requested: crossed } }
+  })
 }
 
 export function claimBrowserWorkspaceCompactionAttempt(
   databaseName: string,
 ): Promise<BrowserWorkspaceCompactionAttempt> {
-  return withControlDb((db) =>
-    db.transaction('rw', db.compactionStates, async () => {
+  return mutateBrowserWorkspaceCompactionState<BrowserWorkspaceCompactionAttempt>(
+    databaseName,
+    (stored) => {
       const previous = recoverableCompactionState(
-        (await db.compactionStates.get(databaseName)) ?? freshCompactionState(databaseName),
+        stored ?? freshCompactionState(databaseName),
         databaseName,
       )
       if (previous.requestRevision <= previous.attemptedRevision) {
-        return { kind: 'idle', state: previous }
+        return { result: { kind: 'idle', state: previous } }
       }
       const state: BrowserWorkspaceCompactionState = {
         ...previous,
         attemptedRevision: previous.requestRevision,
       }
-      await db.compactionStates.put(state)
       return {
-        kind: 'claimed',
         state,
-        claim: createBrowserWorkspaceCompactionAttemptClaim(databaseName, state.attemptedRevision),
+        result: {
+          kind: 'claimed',
+          state,
+          claim: createBrowserWorkspaceCompactionAttemptClaim(
+            databaseName,
+            state.attemptedRevision,
+          ),
+        },
       }
-    }),
+    },
   )
 }
 
@@ -336,23 +364,23 @@ function releaseBrowserWorkspaceCompactionAttempt(
   databaseName: string,
   revision: number,
 ): Promise<BrowserWorkspaceCompactionAttemptRelease> {
-  return withControlDb((db) =>
-    db.transaction('rw', db.compactionStates, async () => {
+  return mutateBrowserWorkspaceCompactionState<BrowserWorkspaceCompactionAttemptRelease>(
+    databaseName,
+    (stored) => {
       const previous = recoverableCompactionState(
-        (await db.compactionStates.get(databaseName)) ?? freshCompactionState(databaseName),
+        stored ?? freshCompactionState(databaseName),
         databaseName,
       )
       if (previous.completedRevision >= revision || previous.attemptedRevision !== revision) {
-        return { released: false, state: previous }
+        return { result: { released: false, state: previous } }
       }
       const state: BrowserWorkspaceCompactionState = {
         ...previous,
         requestRevision: Math.max(previous.requestRevision, saturatingAdd(revision, 1)),
         attemptedRevision: previous.completedRevision,
       }
-      await db.compactionStates.put(state)
-      return { released: true, state }
-    }),
+      return { state, result: { released: true, state } }
+    },
   )
 }
 
@@ -360,10 +388,17 @@ export function applyUnslottedBrowserWorkspaceReplacementStorageBaseline(
   databaseName: string,
   baseline: BrowserWorkspaceReplacementStorageBaseline,
 ): Promise<BrowserWorkspaceCompactionState> {
-  return withControlDb((db) =>
-    db.transaction('rw', db.compactionStates, () =>
-      applyReplacementStorageBaseline(db, databaseName, databaseName, baseline),
-    ),
+  return mutateBrowserWorkspaceControl(
+    { compactionStateKeys: [databaseName] },
+    ({ compactionStates }) => {
+      const state = replacementStorageBaselineState(
+        compactionStates.get(databaseName),
+        databaseName,
+        databaseName,
+        baseline,
+      )
+      return { compactionStates: [state], result: state }
+    },
   )
 }
 
@@ -377,42 +412,38 @@ export function migrateBrowserWorkspaceCompactionState(
   },
 ): Promise<BrowserWorkspaceCompactionState> {
   requireCompactionCounters({ ...legacy, attemptedRevision: legacy.completedRevision })
-  return withControlDb((db) =>
-    db.transaction('rw', db.compactionStates, async () => {
-      const stored = await db.compactionStates.get(databaseName)
-      const previous = stored
-        ? recoverableCompactionState(stored, databaseName)
-        : freshCompactionState(databaseName)
-      const requestRevision = Math.max(previous.requestRevision, legacy.requestRevision)
-      const state: BrowserWorkspaceCompactionState = {
-        databaseName,
-        formatVersion: COMPACTION_STATE_FORMAT_VERSION,
-        knownReclaimableBytes: Math.max(
-          previous.knownReclaimableBytes,
-          legacy.knownReclaimableBytes,
-        ),
-        lastCompactedLiveBytes: Math.max(
-          previous.lastCompactedLiveBytes,
-          legacy.lastCompactedLiveBytes,
-        ),
+  return mutateBrowserWorkspaceCompactionState(databaseName, (stored) => {
+    const previous = stored
+      ? recoverableCompactionState(stored, databaseName)
+      : freshCompactionState(databaseName)
+    const requestRevision = Math.max(previous.requestRevision, legacy.requestRevision)
+    const state: BrowserWorkspaceCompactionState = {
+      databaseName,
+      formatVersion: COMPACTION_STATE_FORMAT_VERSION,
+      knownReclaimableBytes: Math.max(previous.knownReclaimableBytes, legacy.knownReclaimableBytes),
+      lastCompactedLiveBytes: Math.max(
+        previous.lastCompactedLiveBytes,
+        legacy.lastCompactedLiveBytes,
+      ),
+      requestRevision,
+      attemptedRevision: Math.min(
         requestRevision,
-        attemptedRevision: Math.min(
-          requestRevision,
-          Math.max(previous.attemptedRevision, legacy.completedRevision),
-        ),
-        completedRevision: Math.min(
-          requestRevision,
-          Math.max(previous.completedRevision, legacy.completedRevision),
-        ),
-      }
-      await db.compactionStates.put(state)
-      return state
-    }),
-  )
+        Math.max(previous.attemptedRevision, legacy.completedRevision),
+      ),
+      completedRevision: Math.min(
+        requestRevision,
+        Math.max(previous.completedRevision, legacy.completedRevision),
+      ),
+    }
+    return { state, result: state }
+  })
 }
 
 export function deleteBrowserWorkspaceCompactionState(databaseName: string): Promise<void> {
-  return withControlDb((db) => db.compactionStates.delete(databaseName))
+  return mutateBrowserWorkspaceControl({ useCompactionStateStore: true }, () => ({
+    deleteCompactionStateKeys: [databaseName],
+    result: undefined,
+  }))
 }
 
 export function browserWorkspaceCompactionDebtThreshold(lastCompactedLiveBytes: number): number {
@@ -432,12 +463,13 @@ export async function beginBrowserWorkspaceDatabaseReplacement(): Promise<Browse
 }
 
 export async function tryBeginBrowserWorkspaceDatabaseReplacement(): Promise<BrowserWorkspaceReplacementBegin> {
-  return withControlDb((db) =>
-    db.transaction('rw', [db.manifests, db.compactionStates], async () => {
-      const manifest = requireManifest(
-        (await db.manifests.get(CONTROL_MANIFEST_ID)) ?? initialManifest(),
-      )
-      if (manifest.pending) return { kind: 'occupied', journal: manifest.pending }
+  return mutateBrowserWorkspaceControl<BrowserWorkspaceReplacementBegin>(
+    { readManifest: true, useCompactionStateStore: true },
+    ({ manifest: stored }) => {
+      const manifest = requireManifest(stored ?? initialManifest())
+      if (manifest.pending) {
+        return { result: { kind: 'occupied', journal: manifest.pending } }
+      }
       const sourceDatabaseName = manifest.activeDatabaseName
       const sourceIndex = BROWSER_WORKSPACE_DATABASE_NAMES.indexOf(sourceDatabaseName)
       const destinationDatabaseName = BROWSER_WORKSPACE_DATABASE_NAMES[
@@ -449,10 +481,12 @@ export async function tryBeginBrowserWorkspaceDatabaseReplacement(): Promise<Bro
         sourceDatabaseName,
         destinationDatabaseName,
       }
-      await db.compactionStates.delete(destinationDatabaseName)
-      await db.manifests.put({ ...manifest, pending })
-      return { kind: 'ready', journal: pending }
-    }),
+      return {
+        manifest: { ...manifest, pending },
+        deleteCompactionStateKeys: [destinationDatabaseName],
+        result: { kind: 'ready', journal: pending },
+      }
+    },
   )
 }
 
@@ -461,9 +495,14 @@ export async function activatePreparedBrowserWorkspaceDatabase(
   storageBaseline: BrowserWorkspaceReplacementStorageBaseline,
 ): Promise<BrowserWorkspaceDatabaseManifest> {
   try {
-    return await withControlDb((db) =>
-      db.transaction('rw', [db.manifests, db.compactionStates], async () => {
-        const manifest = requireManifest(await db.manifests.get(CONTROL_MANIFEST_ID))
+    const baselineDatabaseName =
+      storageBaseline.kind === 'carry-source'
+        ? expected.sourceDatabaseName
+        : expected.destinationDatabaseName
+    return await mutateBrowserWorkspaceControl(
+      { readManifest: true, compactionStateKeys: [baselineDatabaseName] },
+      ({ manifest: stored, compactionStates }) => {
+        const manifest = requireManifest(stored)
         assertPendingReplacement(manifest, expected, 'preparing')
         if (manifest.activationSequence >= Number.MAX_SAFE_INTEGER) {
           throw new Error('BrowserWorkspaceActivationSequenceExhausted')
@@ -478,15 +517,14 @@ export async function activatePreparedBrowserWorkspaceDatabase(
           activationSequence: manifest.activationSequence + 1,
           pending,
         }
-        await applyReplacementStorageBaseline(
-          db,
+        const state = replacementStorageBaselineState(
+          compactionStates.get(baselineDatabaseName),
           expected.sourceDatabaseName,
           expected.destinationDatabaseName,
           storageBaseline,
         )
-        await db.manifests.put(activated)
-        return activated
-      }),
+        return { manifest: activated, compactionStates: [state], result: activated }
+      },
     )
   } catch (activationError) {
     let manifest: BrowserWorkspaceDatabaseManifest
@@ -502,23 +540,20 @@ export async function activatePreparedBrowserWorkspaceDatabase(
   }
 }
 
-async function applyReplacementStorageBaseline(
-  db: BrowserWorkspaceControlDb,
+function replacementStorageBaselineState(
+  stored: unknown,
   sourceDatabaseName: string,
   destinationDatabaseName: string,
   baseline: BrowserWorkspaceReplacementStorageBaseline,
-): Promise<BrowserWorkspaceCompactionState> {
+): BrowserWorkspaceCompactionState {
   assertCompactionLiveBytes(baseline.liveBytes)
+  const baselineDatabaseName =
+    baseline.kind === 'carry-source' ? sourceDatabaseName : destinationDatabaseName
   const previous = recoverableCompactionState(
-    (await db.compactionStates.get(
-      baseline.kind === 'carry-source' ? sourceDatabaseName : destinationDatabaseName,
-    )) ??
-      freshCompactionState(
-        baseline.kind === 'carry-source' ? sourceDatabaseName : destinationDatabaseName,
-      ),
-    baseline.kind === 'carry-source' ? sourceDatabaseName : destinationDatabaseName,
+    stored ?? freshCompactionState(baselineDatabaseName),
+    baselineDatabaseName,
   )
-  const state: BrowserWorkspaceCompactionState = {
+  return {
     databaseName: destinationDatabaseName,
     formatVersion: COMPACTION_STATE_FORMAT_VERSION,
     knownReclaimableBytes: 0,
@@ -529,46 +564,51 @@ async function applyReplacementStorageBaseline(
     completedRevision:
       baseline.kind === 'reset' ? previous.requestRevision : previous.attemptedRevision,
   }
-  await db.compactionStates.put(state)
-  return state
 }
 
 export async function abandonPreparedBrowserWorkspaceDatabase(
   expected: BrowserWorkspaceReplacementPreparing,
 ): Promise<void> {
-  await withControlDb((db) =>
-    db.transaction('rw', db.manifests, async () => {
-      const manifest = requireManifest(await db.manifests.get(CONTROL_MANIFEST_ID))
-      if (samePendingReplacement(manifest.pending, { ...expected, phase: 'discard' })) return
-      assertPendingReplacement(manifest, expected, 'preparing')
-      await db.manifests.put({
+  await mutateBrowserWorkspaceControl({ readManifest: true }, ({ manifest: stored }) => {
+    const manifest = requireManifest(stored)
+    if (samePendingReplacement(manifest.pending, { ...expected, phase: 'discard' })) {
+      return { result: undefined }
+    }
+    assertPendingReplacement(manifest, expected, 'preparing')
+    return {
+      manifest: {
         id: CONTROL_MANIFEST_ID,
         activeDatabaseName: manifest.activeDatabaseName,
         activationSequence: manifest.activationSequence,
         pending: { ...expected, phase: 'discard' },
-      })
-    }),
-  )
+      },
+      result: undefined,
+    }
+  })
 }
 
 export async function completeBrowserWorkspaceDatabaseCleanup(
   expected: BrowserWorkspaceReplacementDiscard | BrowserWorkspaceReplacementCleanup,
 ): Promise<void> {
-  await withControlDb((db) =>
-    db.transaction('rw', [db.manifests, db.compactionStates], async () => {
-      const manifest = requireManifest(await db.manifests.get(CONTROL_MANIFEST_ID))
+  await mutateBrowserWorkspaceControl(
+    { readManifest: true, useCompactionStateStore: true },
+    ({ manifest: stored }) => {
+      const manifest = requireManifest(stored)
       assertPendingReplacement(manifest, expected, expected.phase)
-      await db.compactionStates.delete(
+      const obsoleteDatabaseName =
         expected.phase === 'discard'
           ? expected.destinationDatabaseName
-          : expected.sourceDatabaseName,
-      )
-      await db.manifests.put({
-        id: CONTROL_MANIFEST_ID,
-        activeDatabaseName: manifest.activeDatabaseName,
-        activationSequence: manifest.activationSequence,
-      })
-    }),
+          : expected.sourceDatabaseName
+      return {
+        manifest: {
+          id: CONTROL_MANIFEST_ID,
+          activeDatabaseName: manifest.activeDatabaseName,
+          activationSequence: manifest.activationSequence,
+        },
+        deleteCompactionStateKeys: [obsoleteDatabaseName],
+        result: undefined,
+      }
+    },
   )
 }
 
@@ -580,13 +620,197 @@ function isBrowserWorkspaceDatabaseName(value: unknown): value is BrowserWorkspa
 }
 
 function withControlDb<T>(operation: (db: BrowserWorkspaceControlDb) => Promise<T>): Promise<T> {
-  return Dexie.ignoreTransaction(() => {
-    const db = new BrowserWorkspaceControlDb()
-    return db
-      .open()
-      .then(() => operation(db))
-      .finally(() => db.close())
+  if (!browserWorkspaceControlDbAccepting) {
+    return Promise.reject(new Error('BrowserWorkspaceControlDatabaseClosed'))
+  }
+  if (browserWorkspaceControlDbActiveOperations === 0) {
+    browserWorkspaceControlDbIdle = new Promise<void>((resolve) => {
+      browserWorkspaceControlDbResolveIdle = resolve
+    })
+  }
+  browserWorkspaceControlDbActiveOperations += 1
+  return Dexie.ignoreTransaction(async () => {
+    try {
+      if (!browserWorkspaceControlDb.isOpen()) {
+        browserWorkspaceControlDbOpening ??= browserWorkspaceControlDb.open().then(() => undefined)
+        try {
+          await browserWorkspaceControlDbOpening
+        } finally {
+          browserWorkspaceControlDbOpening = undefined
+        }
+      }
+      return await operation(browserWorkspaceControlDb)
+    } finally {
+      browserWorkspaceControlDbActiveOperations -= 1
+      if (browserWorkspaceControlDbActiveOperations === 0) {
+        const resolveIdle = browserWorkspaceControlDbResolveIdle
+        browserWorkspaceControlDbResolveIdle = undefined
+        resolveIdle?.()
+      }
+    }
   })
+}
+
+export function closeBrowserWorkspaceControlDatabase(): Promise<void> {
+  if (browserWorkspaceControlDbClose) return browserWorkspaceControlDbClose
+  browserWorkspaceControlDbAccepting = false
+  browserWorkspaceControlDbClose = browserWorkspaceControlDbIdle.then(() => {
+    browserWorkspaceControlDb.close()
+  })
+  return browserWorkspaceControlDbClose
+}
+
+export function __resetBrowserWorkspaceControlDatabaseForTests(): void {
+  if (browserWorkspaceControlDbActiveOperations !== 0) {
+    throw new Error('BrowserWorkspaceControlDatabaseResetWhileActive')
+  }
+  browserWorkspaceControlDb.close()
+  browserWorkspaceControlDb = new BrowserWorkspaceControlDb()
+  browserWorkspaceControlDbOpening = undefined
+  browserWorkspaceControlDbAccepting = true
+  browserWorkspaceControlDbResolveIdle = undefined
+  browserWorkspaceControlDbIdle = Promise.resolve()
+  browserWorkspaceControlDbClose = undefined
+}
+
+interface BrowserWorkspaceControlSnapshot {
+  readonly manifest: unknown
+  readonly compactionStates: ReadonlyMap<string, unknown>
+}
+
+interface BrowserWorkspaceControlMutation<Result> {
+  readonly manifest?: BrowserWorkspaceDatabaseManifest
+  readonly compactionStates?: readonly BrowserWorkspaceCompactionState[]
+  readonly deleteCompactionStateKeys?: readonly string[]
+  readonly result: Result
+}
+
+function mutateBrowserWorkspaceControl<Result>(
+  input: {
+    readonly readManifest?: boolean
+    readonly compactionStateKeys?: readonly string[]
+    readonly useCompactionStateStore?: boolean
+  },
+  mutate: (snapshot: BrowserWorkspaceControlSnapshot) => BrowserWorkspaceControlMutation<Result>,
+  existingDb?: BrowserWorkspaceControlDb,
+): Promise<Result> {
+  const compactionStateKeys = [...new Set(input.compactionStateKeys ?? [])]
+  const storeNames = [
+    ...(input.readManifest ? ['manifests'] : []),
+    ...(input.useCompactionStateStore || compactionStateKeys.length > 0
+      ? ['compactionStates']
+      : []),
+  ]
+  if (storeNames.length === 0) return Promise.reject(new Error('ControlMutationStoresMissing'))
+  const run = (db: BrowserWorkspaceControlDb) =>
+    new Promise<Result>((resolve, reject) => {
+      let transaction: IDBTransaction
+      try {
+        transaction = db.backendDB().transaction(storeNames, 'readwrite')
+      } catch (error) {
+        reject(errorFromUnknown(error))
+        return
+      }
+      let failure: Error | undefined
+      let result: Result | undefined
+      let resultReady = false
+      transaction.onabort = () =>
+        reject(failure ?? transaction.error ?? new Error('ControlMutationAborted'))
+      transaction.onerror = () => undefined
+      transaction.oncomplete = () => {
+        if (!resultReady) {
+          reject(new Error('ControlMutationResultMissing'))
+          return
+        }
+        resolve(result as Result)
+      }
+
+      let manifest: unknown
+      const compactionStates = new Map<string, unknown>()
+      let pendingReads = (input.readManifest ? 1 : 0) + compactionStateKeys.length
+      const recordWriteError = (request: IDBRequest, message: string) => {
+        request.onerror = () => {
+          failure = request.error ?? new Error(message)
+        }
+      }
+      const applyMutation = () => {
+        let mutation: BrowserWorkspaceControlMutation<Result>
+        try {
+          mutation = mutate({ manifest, compactionStates })
+          if (mutation.manifest) {
+            recordWriteError(
+              transaction.objectStore('manifests').put(mutation.manifest),
+              'ControlManifestWriteFailed',
+            )
+          }
+          if (mutation.compactionStates || mutation.deleteCompactionStateKeys) {
+            const compactionStore = transaction.objectStore('compactionStates')
+            for (const state of mutation.compactionStates ?? []) {
+              recordWriteError(compactionStore.put(state), 'ControlCompactionStateWriteFailed')
+            }
+            for (const databaseName of mutation.deleteCompactionStateKeys ?? []) {
+              recordWriteError(
+                compactionStore.delete(databaseName),
+                'ControlCompactionStateDeleteFailed',
+              )
+            }
+          }
+          result = mutation.result
+          resultReady = true
+        } catch (error) {
+          failure = errorFromUnknown(error)
+          transaction.abort()
+        }
+      }
+      const completeRead = () => {
+        pendingReads -= 1
+        if (pendingReads === 0) applyMutation()
+      }
+      if (input.readManifest) {
+        const read = transaction.objectStore('manifests').get(CONTROL_MANIFEST_ID)
+        read.onerror = () => {
+          failure = read.error ?? new Error('ControlManifestReadFailed')
+        }
+        read.onsuccess = () => {
+          manifest = read.result
+          completeRead()
+        }
+      }
+      if (compactionStateKeys.length > 0) {
+        const store = transaction.objectStore('compactionStates')
+        for (const databaseName of compactionStateKeys) {
+          const read = store.get(databaseName)
+          read.onerror = () => {
+            failure = read.error ?? new Error('ControlCompactionStateReadFailed')
+          }
+          read.onsuccess = () => {
+            compactionStates.set(databaseName, read.result)
+            completeRead()
+          }
+        }
+      }
+      if (pendingReads === 0) applyMutation()
+    })
+  return existingDb ? run(existingDb) : withControlDb(run)
+}
+
+function mutateBrowserWorkspaceCompactionState<Result>(
+  databaseName: string,
+  mutate: (stored: unknown) => {
+    readonly state?: BrowserWorkspaceCompactionState
+    readonly result: Result
+  },
+): Promise<Result> {
+  return mutateBrowserWorkspaceControl(
+    { compactionStateKeys: [databaseName] },
+    ({ compactionStates }) => {
+      const mutation = mutate(compactionStates.get(databaseName))
+      return {
+        ...(mutation.state ? { compactionStates: [mutation.state] } : {}),
+        result: mutation.result,
+      }
+    },
+  )
 }
 
 function initialManifest(): BrowserWorkspaceDatabaseManifest {

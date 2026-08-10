@@ -1,5 +1,6 @@
 import Dexie from 'dexie'
 import { isWorkspaceReplacementRecoveryRequiredError } from '../core/import-export/errors'
+import { isPageHiding } from '../lib/page-lifecycle'
 import { yieldToEventLoop } from '../lib/yield-to-event-loop'
 import { cleanPendingBrowserWorkspaceDatabase } from './browser-workspace-database-cleanup'
 import type {
@@ -16,10 +17,10 @@ import type { WorkspaceFence } from './repository'
 import {
   awaitStorageCompactionDebtIdle,
   flushStorageCompactionDebt,
-  readStorageCompactionState,
   recoverStorageCompactionDebtIntents,
   runStorageBackgroundTask,
   storageCompactionDebtRecoveryPending,
+  storageCompactionDemandPending,
   subscribeStorageCompactionRequests,
 } from './storage-compaction-state'
 import { readStorageRetentionState, type StorageRetentionStateRow } from './storage-retention-state'
@@ -32,6 +33,7 @@ import type {
 } from './workspace-protocol'
 import { getWorkspaceRepository, publishLocalWorkspaceInvalidation } from './workspace-repository'
 import {
+  isWorkspaceMaintenancePreemptedError,
   isWorkspaceRuntimeClosedError,
   subscribeWorkspaceRuntimeIdle,
   tryRunWorkspaceActionIfIdle,
@@ -406,7 +408,13 @@ class StorageMaintenanceController {
         outcome = await this.#runSlice(task)
       } catch (error) {
         task.runningRevision = undefined
-        if (!this.#ownerIsCurrent(generation) || isAbortError(error)) return
+        if (
+          !this.#ownerIsCurrent(generation) ||
+          isAbortError(error) ||
+          isWorkspaceMaintenancePreemptedError(error)
+        ) {
+          return
+        }
         this.#recordFailure(task, error)
         await yieldToEventLoop(this.#ownerSignal())
         continue
@@ -533,9 +541,10 @@ class StorageMaintenanceController {
 
   async #runCompactionSlice(): Promise<StorageMaintenanceSliceOutcome> {
     await awaitStorageCompactionDebtIdle()
-    const state = await readStorageCompactionState(this.#requiredDatabase())
-    if (state.requestRevision <= state.attemptedRevision) return { kind: 'done' }
+    if (!(await storageCompactionDemandPending(this.#requiredDatabase()))) return { kind: 'done' }
+    throwIfPageHiding()
     const compaction = await import('./browser-workspace-compaction')
+    throwIfPageHiding()
     if (!compaction.browserWorkspaceCompactionSupported()) return { kind: 'done' }
     let started: BrowserWorkspaceReplacementStart<BrowserWorkspaceCompactionResult>
     try {
@@ -923,4 +932,8 @@ function saturatingIncrement(value: number): number {
 
 function isAbortError(error: unknown): boolean {
   return error instanceof DOMException && error.name === 'AbortError'
+}
+
+function throwIfPageHiding(): void {
+  if (isPageHiding()) throw new DOMException('Page lifecycle ended', 'AbortError')
 }

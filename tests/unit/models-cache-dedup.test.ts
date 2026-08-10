@@ -76,15 +76,22 @@ describe('unified model discovery single-flight', () => {
 
   it('force refresh replaces a fresh row through the same service', async () => {
     const selected = await seedProfile()
+    const now = vi.spyOn(Date, 'now').mockReturnValue(10_000)
     fetchModelsMock
       .mockResolvedValueOnce(modelsPayload('model-a'))
       .mockResolvedValueOnce(modelsPayload('model-b'))
+    try {
+      await configurationDiscoveryApplication.refreshModels(selected, query)
+      const first = await getCachedModels(selected.id, query)
+      await configurationDiscoveryApplication.refreshModels(selected, query, { force: true })
+      const second = await getCachedModels(selected.id, query)
 
-    await configurationDiscoveryApplication.refreshModels(selected, query)
-    await configurationDiscoveryApplication.refreshModels(selected, query, { force: true })
-
-    expect(fetchModelsMock).toHaveBeenCalledTimes(2)
-    expect((await getCachedModels(selected.id, query))?.payload).toEqual(modelsPayload('model-b'))
+      expect(fetchModelsMock).toHaveBeenCalledTimes(2)
+      expect(second?.payload).toEqual(modelsPayload('model-b'))
+      expect(second?.fetchedAt).toBe((first?.fetchedAt ?? 0) + 1)
+    } finally {
+      now.mockRestore()
+    }
   })
 
   it('releases the coordination flight after a failed fetch', async () => {

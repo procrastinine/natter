@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createChatRow } from '../../src/core/chat-metadata'
 import { probeBrowserWorkspaceCurrent } from '../../src/store/browser-workspace-current-probe'
 import {
+  __resetBrowserWorkspaceControlDatabaseForTests,
   readBrowserWorkspaceDatabaseManifest,
   tryBeginBrowserWorkspaceDatabaseReplacement,
 } from '../../src/store/browser-workspace-database-control'
@@ -57,12 +58,14 @@ class ImmediateLockManager {
 
 class SerializedLockManager extends ImmediateLockManager {
   private readonly tails = new Map<string, Promise<void>>()
+  readonly requests: { readonly name: string; readonly mode: 'shared' | 'exclusive' }[] = []
 
   override async request<T>(
     name: string,
     options: { mode: 'shared' | 'exclusive'; ifAvailable?: boolean; signal?: AbortSignal },
     callback: (lock: Lock) => Promise<T> | T,
   ): Promise<T> {
+    this.requests.push({ name, mode: options.mode })
     const prior = this.tails.get(name) ?? Promise.resolve()
     let release!: () => void
     const current = new Promise<void>((resolve) => {
@@ -77,6 +80,26 @@ class SerializedLockManager extends ImmediateLockManager {
     } finally {
       release()
       if (this.tails.get(name) === tail) this.tails.delete(name)
+    }
+  }
+}
+
+class RejectingReentrantLockManager extends ImmediateLockManager {
+  readonly requests: { readonly name: string; readonly mode: 'shared' | 'exclusive' }[] = []
+  private readonly active = new Set<string>()
+
+  override async request<T>(
+    name: string,
+    options: { mode: 'shared' | 'exclusive'; ifAvailable?: boolean; signal?: AbortSignal },
+    callback: (lock: Lock) => Promise<T> | T,
+  ): Promise<T> {
+    this.requests.push({ name, mode: options.mode })
+    if (this.active.has(name)) throw new Error(`ReentrantLockRequest:${name}`)
+    this.active.add(name)
+    try {
+      return await super.request(name, options, callback)
+    } finally {
+      this.active.delete(name)
     }
   }
 }
@@ -98,6 +121,7 @@ beforeEach(() => {
   __resetBrowserWorkspaceFatalInvalidationOwnerForTests()
   __resetDbForTests({ admissionsOpen: true })
   installFreshFakeIndexedDbForTests()
+  __resetBrowserWorkspaceControlDatabaseForTests()
 })
 
 afterEach(() => {
@@ -331,7 +355,8 @@ describe('openDb recovery events', () => {
   it('elects one registered upgrader when many startup tabs arrive together', async () => {
     await createValidV97Workspace('natter')
     const progress: BrowserWorkspaceOpenProgress[] = []
-    const coordinator = installStartupRepairRuntime(new SerializedLockManager())
+    const lockManager = new SerializedLockManager()
+    const coordinator = installStartupRepairRuntime(lockManager)
     try {
       const proofs = await Promise.all(
         Array.from({ length: 16 }, () =>
@@ -360,6 +385,12 @@ describe('openDb recovery events', () => {
         (event) =>
           event.kind === 'database-upgrade' &&
           event.operation === 'write-sidebar-folder-completion',
+      ),
+    ).toHaveLength(1)
+    expect(
+      lockManager.requests.filter(
+        (request) =>
+          request.name === 'natter:workspace-slot:natter' && request.mode === 'exclusive',
       ),
     ).toHaveLength(1)
   })
@@ -687,7 +718,8 @@ describe('openDb recovery events', () => {
     repaired.close()
   })
 
-  it('keeps a malformed authoritative source selected when inactive normalization fails', async () => {
+  it('keeps a malformed authoritative source selected and cleans under one selection admission', async () => {
+    const locks = new RejectingReentrantLockManager()
     const legacy = new Dexie('natter')
     legacy.version(95.8).stores(WAVE_A_V94_STORES)
     await legacy.open()
@@ -701,7 +733,14 @@ describe('openDb recovery events', () => {
     })
     legacy.close()
 
-    await expect(runStartupRepair()).rejects.toThrow('WaveAMessageBodyMissing:message-poison')
+    await expect(runStartupRepair(undefined, undefined, locks)).rejects.toThrow(
+      'WaveAMessageBodyMissing:message-poison',
+    )
+    expect(
+      locks.requests.filter(
+        ({ name, mode }) => name === 'natter:workspace-slot-selection:v1' && mode === 'exclusive',
+      ),
+    ).toHaveLength(1)
     expect(await readBrowserWorkspaceDatabaseManifest()).toEqual({
       id: 'workspace',
       activeDatabaseName: 'natter',
@@ -808,8 +847,9 @@ describe('openDb recovery events', () => {
 async function runStartupRepair(
   onProgress?: (progress: BrowserWorkspaceOpenProgress) => void,
   onBlocked?: (event: IDBVersionChangeEvent) => void,
+  lockManager: ImmediateLockManager = new ImmediateLockManager(),
 ) {
-  const coordinator = installStartupRepairRuntime(new ImmediateLockManager())
+  const coordinator = installStartupRepairRuntime(lockManager)
   try {
     return await ensureBrowserWorkspaceCurrentForSelection(
       new AbortController().signal,

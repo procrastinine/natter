@@ -22,7 +22,7 @@ const lifetime = (siteId, siteText, boundary, bound, rationale) =>
 
 export const productionRuntimeEffectReviews = Object.freeze([
   lifetime(
-    'src/app/router.ts#ensureHashListener|event-listener|acquire|addEventListener|fnv1a32:c4e3db19|1',
+    'src/app/router.ts#ensureHashListener|event-listener|acquire|addEventListener|fnv1a32:952c39be|1',
     "window.addEventListener('hashchange', () => {",
     'browser-page',
     'one hashchange listener guarded by hashListenerInstalled for the lifetime of the page module',

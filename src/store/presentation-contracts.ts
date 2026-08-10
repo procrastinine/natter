@@ -69,6 +69,7 @@ export type { ConversationCommittedResult } from './conversation-repository-adap
 export type {
   ConversationRouteOwner,
   ConversationRouteOwnerController,
+  WorkspacePresentationForegroundDemand,
 } from './conversation-route-owner'
 export type { CachedEndpointsRow, CachedModelsRow, CachedPrivacyPolicyRow } from './db-rows'
 export type {

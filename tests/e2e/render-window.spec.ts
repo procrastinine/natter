@@ -1762,6 +1762,12 @@ async function finishFolderMoveRecorder(page: Page): Promise<{
   readonly longTaskSupported: boolean
   readonly maximumLongTaskMs: number
   readonly totalBlockingTimeMs: number
+  readonly longTasks: readonly {
+    readonly startTime: number
+    readonly duration: number
+    readonly overlapMs: number
+    readonly blockingOverlapMs: number
+  }[]
 }> {
   return page.evaluate(() => {
     const record = (
@@ -1787,17 +1793,27 @@ async function finishFolderMoveRecorder(page: Page): Promise<{
       record.longTasks.push({ startTime: entry.startTime, duration: entry.duration })
     }
     record.longTaskObserver?.disconnect()
-    const relevantLongTasks = record.longTasks.filter(
-      (task) => task.startTime < committedAt && task.startTime + task.duration > droppedAt,
-    )
+    const relevantLongTasks = record.longTasks.flatMap((task) => {
+      const taskEnd = task.startTime + task.duration
+      const overlapStart = Math.max(task.startTime, droppedAt)
+      const overlapEnd = Math.min(taskEnd, committedAt)
+      if (overlapEnd <= overlapStart) return []
+      return [
+        {
+          ...task,
+          overlapMs: overlapEnd - overlapStart,
+          blockingOverlapMs: Math.max(0, overlapEnd - Math.max(task.startTime + 50, droppedAt)),
+        },
+      ]
+    })
     return {
       elapsedMs: committedAt - droppedAt,
       longTaskSupported: record.longTaskObserver !== null,
-      maximumLongTaskMs: Math.max(0, ...relevantLongTasks.map((task) => task.duration)),
-      totalBlockingTimeMs: relevantLongTasks.reduce(
-        (total, task) => total + Math.max(0, task.duration - 50),
-        0,
-      ),
+      maximumLongTaskMs: Math.max(0, ...relevantLongTasks.map((task) => task.overlapMs)),
+      totalBlockingTimeMs: relevantLongTasks.reduce((total, task) => {
+        return total + task.blockingOverlapMs
+      }, 0),
+      longTasks: relevantLongTasks,
     }
   })
 }

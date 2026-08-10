@@ -848,6 +848,9 @@ describe('built-app runtime boundary', () => {
     const deployUploadIndex = deploy.indexOf('uses: actions/upload-pages-artifact')
 
     expect(verify).toContain('run: pnpm verify:ci')
+    expect(verify.indexOf('run: pnpm install --frozen-lockfile')).toBeLessThan(
+      verify.indexOf('run: pnpm verify:ci'),
+    )
     expect(readText('scripts/run-ci-verification.mjs')).toContain(
       "import('./launch-slice-verification.mjs')",
     )
@@ -873,6 +876,9 @@ describe('built-app runtime boundary', () => {
     ).toBe(false)
     expect(deployStartupIndex).toBeGreaterThanOrEqual(0)
     expect(deployUploadIndex).toBeGreaterThan(deployStartupIndex)
+    expect(deploy).not.toContain('uses: ./.github/workflows/verify.yml')
+    expect(deploy).not.toContain('needs: verify')
+    expect(deploy).not.toContain('pnpm verify:ci')
     expect(deploy.slice(deployStartupIndex, deployUploadIndex)).not.toContain('pnpm build')
   })
 

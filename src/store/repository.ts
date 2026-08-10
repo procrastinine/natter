@@ -1408,6 +1408,8 @@ export interface SidebarPresentationRequest {
   readonly sort: SidebarSortMode
   readonly collapsedFolderIds: readonly FolderId[]
   readonly createdAtGroupBoundaries: readonly [number, number, number, number]
+  readonly knownFolderIds?: readonly FolderId[]
+  readonly knownTagIds?: readonly TagId[]
   readonly limit?: number
   readonly cursor?: string
   readonly countMode?: 'exact' | 'omit'
@@ -1418,8 +1420,6 @@ export interface SidebarPresentationMeasurement {
   readonly folderChildRowsRead: number
   readonly folderCatalogRowsRead: number
   readonly tagCatalogRowsRead: number
-  readonly completionProbeQueries: number
-  readonly completionProbeKeysRead: number
   readonly createdAtGroupProbeQueries: number
   readonly createdAtGroupProbeKeysRead: number
 }

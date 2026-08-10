@@ -142,12 +142,12 @@ describe('tab and cross-tab locality audit', () => {
       ok: true,
       structurallyValid: true,
       surfaces: 20,
-      records: 344,
-      constructorSites: 762,
+      records: 345,
+      constructorSites: 764,
       unconstructedOrUnadmittedSites: 4,
-      ownerClassifiedSites: 762,
+      ownerClassifiedSites: 764,
       ownerSiteGaps: 0,
-      rootAdmissionSites: 110,
+      rootAdmissionSites: 112,
       unadmittedRoots: 0,
       childReservationSites: 3,
       unreservedChildren: 4,
@@ -163,7 +163,7 @@ describe('tab and cross-tab locality audit', () => {
       remoteBrowserOutcomeFamilies: 6,
       remoteBrowserOutcomeConsumers: 19,
       architectureGaps: 3,
-      recordGaps: 149,
+      recordGaps: 150,
       siteGaps: 4,
       scannerLimitations: 9,
       acceptanceCriteria: 13,
@@ -175,7 +175,7 @@ describe('tab and cross-tab locality audit', () => {
       'workspace-query': 66,
       'workspace-command': 65,
       'configuration-command': 44,
-      'workspace-root': 15,
+      'workspace-root': 16,
       'workspace-child': 7,
       'generation-intent': 6,
       'conversation-selection-delivery': 2,
@@ -271,7 +271,7 @@ describe('tab and cross-tab locality audit', () => {
     expect(report.structurallyValid).toBe(true)
     expect(report.ok).toBe(false)
     expect(report.architectureGaps).toBe(3)
-    expect(report.recordGaps).toBe(149)
+    expect(report.recordGaps).toBe(150)
     expect(report.siteGaps).toBe(4)
     expect(report.problems).toEqual([])
   })

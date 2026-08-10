@@ -18,6 +18,10 @@ export const PRODUCTION_DISCRIMINATED_UNION_SEMANTICS = Object.freeze({
       'command',
     ),
     role(
+      'src/store/browser-workspace-slot-coordination.ts#BrowserWorkspaceSlotOperation|kind',
+      'command',
+    ),
+    role(
       'src/store/semantic-operation-capability.ts#SemanticOperationExactPhysicalMutation|operation',
       'data',
     ),
@@ -66,6 +70,10 @@ export const PRODUCTION_DISCRIMINATED_UNION_SEMANTICS = Object.freeze({
     composition(
       'src/store/browser-workspace-replacement-runner.ts#BrowserWorkspaceReplacementWork|kind',
       'The private generic work envelope is constructed only by the two typed replacement-work factories; the durable command audit owns its exact variants and dispatch.',
+    ),
+    composition(
+      'src/store/browser-workspace-slot-coordination.ts#BrowserWorkspaceSlotOperation|kind',
+      'The operation lifetime discriminant selects transient close-on-version-change probing or retained selection admission before the physical slot; slot coordination tests own both orderings.',
     ),
     composition(
       'src/store/repository.ts#StreamLeaseProgress|phase',

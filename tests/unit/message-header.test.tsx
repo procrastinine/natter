@@ -432,6 +432,7 @@ describe('Message edit session ownership', () => {
         kind: 'started' as const,
         admission: Promise.resolve(Object.freeze({ kind: 'admitted' as const })),
         completion: Promise.resolve(Object.freeze({ kind: 'prepared' as const })),
+        generationSettled: Promise.resolve(),
         cancel: () => undefined,
       }),
     )
@@ -468,6 +469,7 @@ describe('Message edit session ownership', () => {
         kind: 'started' as const,
         admission: Promise.resolve(Object.freeze({ kind: 'admitted' as const })),
         completion: Promise.resolve(Object.freeze({ kind: 'prepared' as const })),
+        generationSettled: Promise.resolve(),
         cancel: () => undefined,
       }),
     )

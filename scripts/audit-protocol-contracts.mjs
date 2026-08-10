@@ -124,7 +124,7 @@ export function buildProtocolContractMutationProof(baselineBundle) {
         "  | ConfigurationPromptDeleteCommand\n  | { readonly kind: 'audit.injected-configuration-command' }\n\nexport type ConfigurationDomainCommandKind",
       ),
     'src/store/workspace-runtime-control.ts': (source) =>
-      source.replace("  'import-export',\n  false,", "  'maintenance',\n  false,").concat(`
+      source.replace("    'maintenance',\n    true,", "    'maintenance',\n    false,").concat(`
 export const forgedRootAdmission = (() => undefined) as WorkspaceRootAdmissionCapability<
   () => void,
   { readonly fixedKind: 'chat-fork' }

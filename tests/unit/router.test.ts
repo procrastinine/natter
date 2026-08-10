@@ -16,13 +16,17 @@ import {
   newChatHref,
   parseRoute,
   replaceRoute,
+  routeForegroundPresentationSettled,
   routeIntentOwner,
   routeToHref,
+  settleRouteForegroundDemandForPresentation,
+  startRouteForegroundMetadata,
   storageHref,
   subscribeRouteArrival,
   subscribeRouteChange,
 } from '../../src/app/router'
 import type { ConversationRouteHandoff } from '../../src/store/conversation-controller'
+import { awaitWorkspaceForegroundDemandIdle } from '../../src/store/workspace-runtime'
 
 function handoffFor(
   intent: ReturnType<typeof beginRouteIntent>,
@@ -413,6 +417,108 @@ describe('route snapshots and conversation navigation port', () => {
 })
 
 describe('anchor interception', () => {
+  it('holds background maintenance until the primary navigation is semantically ready', async () => {
+    const handler = makeAnchorClickHandler('#/chat/foreground-demand')
+    handler({
+      defaultPrevented: false,
+      button: 0,
+      metaKey: false,
+      ctrlKey: false,
+      shiftKey: false,
+      altKey: false,
+      preventDefault: vi.fn(),
+    } as never)
+    let resumed = false
+    const maintenance = awaitWorkspaceForegroundDemandIdle().then(() => {
+      resumed = true
+    })
+
+    await Promise.resolve()
+    expect(resumed).toBe(false)
+    settleRouteForegroundDemandForPresentation('#/chat/foreground-demand', {
+      hasActiveChat: true,
+      targetKind: 'pending',
+      revealPending: false,
+      destinationDeferred: false,
+    })
+    await Promise.resolve()
+    expect(resumed).toBe(false)
+    settleRouteForegroundDemandForPresentation('#/chat/foreground-demand', {
+      hasActiveChat: true,
+      targetKind: 'ready',
+      revealPending: true,
+      destinationDeferred: false,
+    })
+    await Promise.resolve()
+    expect(resumed).toBe(false)
+    settleRouteForegroundDemandForPresentation('#/chat/foreground-demand', {
+      hasActiveChat: true,
+      targetKind: 'ready',
+      revealPending: false,
+      destinationDeferred: false,
+    })
+    await Promise.resolve()
+    expect(resumed).toBe(false)
+    let finishMetadata = () => {}
+    const metadata = startRouteForegroundMetadata(
+      '#/chat/foreground-demand',
+      'foreground-demand',
+      () =>
+        new Promise<void>((resolve) => {
+          finishMetadata = resolve
+        }),
+    )
+    expect(metadata).not.toBeNull()
+    expect(
+      startRouteForegroundMetadata('#/chat/foreground-demand', 'foreground-demand', async () => {
+        throw new Error('duplicate route metadata')
+      }),
+    ).toBeNull()
+    finishMetadata()
+    await metadata
+    await maintenance
+    expect(resumed).toBe(true)
+  })
+
+  it('cancels the exact route metadata owner when a later route supersedes it', async () => {
+    navigate('#/chat/metadata-a')
+    const metadataState: { signal?: AbortSignal } = {}
+    const metadata = startRouteForegroundMetadata('#/chat/metadata-a', 'metadata-a', (signal) => {
+      metadataState.signal = signal
+      return new Promise<void>((resolve) => signal.addEventListener('abort', () => resolve()))
+    })
+
+    navigate('#/chat/metadata-b')
+
+    expect(metadataState.signal?.aborted).toBe(true)
+    await metadata
+  })
+
+  it('terminally settles failed, retained-editor, and no-chat route outcomes', () => {
+    expect(
+      [
+        {
+          hasActiveChat: true,
+          targetKind: 'failed' as const,
+          revealPending: false,
+          destinationDeferred: false,
+        },
+        {
+          hasActiveChat: true,
+          targetKind: 'pending' as const,
+          revealPending: false,
+          destinationDeferred: true,
+        },
+        {
+          hasActiveChat: false,
+          targetKind: null,
+          revealPending: false,
+          destinationDeferred: false,
+        },
+      ].map(routeForegroundPresentationSettled),
+    ).toEqual([true, true, true])
+  })
+
   it('intercepts only an unmodified primary click', () => {
     const handler = makeAnchorClickHandler('#/new')
     const preventDefault = vi.fn()

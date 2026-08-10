@@ -11,6 +11,7 @@ import {
   mockChatCompletions,
   seedFirstRun,
   sendMessage,
+  waitForWorkspaceRunning,
 } from './helpers'
 
 const RECOVERED_MODEL = 'test/storage-recovered:free'
@@ -48,6 +49,11 @@ interface WorkspaceControlSnapshot {
   activeCompaction: null | WorkspaceCompactionSnapshot
   sourceCompaction: null | WorkspaceCompactionSnapshot
   databaseNames: string[]
+  runtimeState: string | null
+  generationLifetimeLocks: {
+    held: string[]
+    pending: string[]
+  }
 }
 
 interface WorkspaceCompactionSnapshot {
@@ -61,11 +67,46 @@ interface WorkspaceCompactionSnapshot {
 
 const COMPACTION_DEBT_BYTES = 66 * 1024 * 1024
 const WORKSPACE_SELECTION_LOCK = 'natter:workspace-slot-selection:v1'
+const GENERATION_LIFETIME_LOCK = 'workspace:generation-lifetime'
 const BROWSER_WORKSPACE_DATABASE_NAMES = discoverBrowserWorkspaceDatabaseNames()
 
 interface BrowserLockHandle {
   readonly id: string
   readonly name: string
+}
+
+interface CompactionDemandProbeSnapshot {
+  readonly debtReads: number
+  readonly compactionResources: readonly string[]
+}
+
+async function installCompactionDemandProbe(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    const scope = window as typeof window & { __compactionDebtReads?: number }
+    scope.__compactionDebtReads = 0
+    const originalGet = IDBObjectStore.prototype.get
+    Object.defineProperty(IDBObjectStore.prototype, 'get', {
+      configurable: true,
+      writable: true,
+      value: function (this: IDBObjectStore, query: IDBValidKey | IDBKeyRange) {
+        if (this.name === 'compactionStates') {
+          scope.__compactionDebtReads = (scope.__compactionDebtReads ?? 0) + 1
+        }
+        return originalGet.call(this, query)
+      },
+    })
+  })
+}
+
+async function readCompactionDemandProbe(page: Page): Promise<CompactionDemandProbeSnapshot> {
+  return page.evaluate(() => ({
+    debtReads:
+      (window as typeof window & { __compactionDebtReads?: number }).__compactionDebtReads ?? 0,
+    compactionResources: performance
+      .getEntriesByType('resource')
+      .map((entry) => entry.name)
+      .filter((name) => name.includes('/browser-workspace-compaction-')),
+  }))
 }
 
 async function queueBrowserLock(
@@ -182,62 +223,82 @@ async function readWorkspaceControlSnapshot(
   page: Page,
   sourceDatabaseName?: string,
 ): Promise<WorkspaceControlSnapshot> {
-  return page.evaluate(async (sourceDatabaseName): Promise<WorkspaceControlSnapshot> => {
-    const database = await new Promise<IDBDatabase>((resolve, reject) => {
-      const request = indexedDB.open('natter-control')
-      request.onsuccess = () => resolve(request.result)
-      request.onerror = () => reject(request.error)
-    })
-    const requestValue = <T>(request: IDBRequest<T>): Promise<T> =>
-      new Promise((resolve, reject) => {
+  return page.evaluate(
+    async ({ sourceDatabaseName, generationLifetimeLock }): Promise<WorkspaceControlSnapshot> => {
+      const database = await new Promise<IDBDatabase>((resolve, reject) => {
+        const request = indexedDB.open('natter-control')
         request.onsuccess = () => resolve(request.result)
         request.onerror = () => reject(request.error)
       })
-    try {
-      const transaction = database.transaction(['manifests', 'compactionStates'], 'readonly')
-      const manifests = transaction.objectStore('manifests')
-      const compactionStates = transaction.objectStore('compactionStates')
-      type ManifestRow = {
-        activeDatabaseName: string
-        activationSequence: number
-        pending?: WorkspaceControlSnapshot['pending']
+      const requestValue = <T>(request: IDBRequest<T>): Promise<T> =>
+        new Promise((resolve, reject) => {
+          request.onsuccess = () => resolve(request.result)
+          request.onerror = () => reject(request.error)
+        })
+      try {
+        const transaction = database.transaction(['manifests', 'compactionStates'], 'readonly')
+        const manifests = transaction.objectStore('manifests')
+        const compactionStates = transaction.objectStore('compactionStates')
+        type ManifestRow = {
+          activeDatabaseName: string
+          activationSequence: number
+          pending?: WorkspaceControlSnapshot['pending']
+        }
+        const manifest = await requestValue(
+          manifests.get('workspace') as IDBRequest<ManifestRow | null>,
+        )
+        if (!manifest) throw new Error('StorageCompactionManifestMissing')
+        const [activeCompaction, sourceCompaction] = await Promise.all([
+          requestValue(
+            compactionStates.get(manifest.activeDatabaseName) as IDBRequest<
+              WorkspaceCompactionSnapshot | undefined
+            >,
+          ),
+          sourceDatabaseName
+            ? requestValue(
+                compactionStates.get(sourceDatabaseName) as IDBRequest<
+                  WorkspaceCompactionSnapshot | undefined
+                >,
+              )
+            : Promise.resolve(undefined),
+        ])
+        const databaseNames =
+          typeof indexedDB.databases === 'function'
+            ? (await indexedDB.databases()).flatMap((candidate) =>
+                candidate.name === undefined ? [] : [candidate.name],
+              )
+            : []
+        const locks = await navigator.locks.query()
+        return {
+          activeDatabaseName: manifest.activeDatabaseName,
+          activationSequence: manifest.activationSequence,
+          pending: manifest.pending ?? null,
+          activeCompaction: activeCompaction ?? null,
+          sourceCompaction: sourceCompaction ?? null,
+          databaseNames,
+          runtimeState:
+            document
+              .querySelector<HTMLElement>('[data-ui="app-shell"]')
+              ?.getAttribute('data-workspace-runtime-state') ?? null,
+          generationLifetimeLocks: {
+            held: (locks.held ?? [])
+              .flatMap((lock) =>
+                lock.name === generationLifetimeLock && lock.mode ? [lock.mode] : [],
+              )
+              .sort(),
+            pending: (locks.pending ?? [])
+              .flatMap((lock) =>
+                lock.name === generationLifetimeLock && lock.mode ? [lock.mode] : [],
+              )
+              .sort(),
+          },
+        }
+      } finally {
+        database.close()
       }
-      const manifest = await requestValue(
-        manifests.get('workspace') as IDBRequest<ManifestRow | null>,
-      )
-      if (!manifest) throw new Error('StorageCompactionManifestMissing')
-      const [activeCompaction, sourceCompaction] = await Promise.all([
-        requestValue(
-          compactionStates.get(manifest.activeDatabaseName) as IDBRequest<
-            WorkspaceCompactionSnapshot | undefined
-          >,
-        ),
-        sourceDatabaseName
-          ? requestValue(
-              compactionStates.get(sourceDatabaseName) as IDBRequest<
-                WorkspaceCompactionSnapshot | undefined
-              >,
-            )
-          : Promise.resolve(undefined),
-      ])
-      const databaseNames =
-        typeof indexedDB.databases === 'function'
-          ? (await indexedDB.databases()).flatMap((candidate) =>
-              candidate.name === undefined ? [] : [candidate.name],
-            )
-          : []
-      return {
-        activeDatabaseName: manifest.activeDatabaseName,
-        activationSequence: manifest.activationSequence,
-        pending: manifest.pending ?? null,
-        activeCompaction: activeCompaction ?? null,
-        sourceCompaction: sourceCompaction ?? null,
-        databaseNames,
-      }
-    } finally {
-      database.close()
-    }
-  }, sourceDatabaseName)
+    },
+    { sourceDatabaseName, generationLifetimeLock: GENERATION_LIFETIME_LOCK },
+  )
 }
 
 async function readChatTitleFromDatabase(
@@ -267,12 +328,49 @@ async function readChatTitleFromDatabase(
   )
 }
 
+async function readFirstPresetFromDatabase(
+  page: Page,
+  databaseName: string,
+): Promise<{ id: string; name: string } | null> {
+  return page.evaluate(async (databaseName) => {
+    const database = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open(databaseName)
+      request.onsuccess = () => resolve(request.result)
+      request.onerror = () => reject(request.error)
+    })
+    try {
+      const row = await new Promise<{ id?: unknown; name?: unknown } | undefined>(
+        (resolve, reject) => {
+          const request = database
+            .transaction('presets', 'readonly')
+            .objectStore('presets')
+            .openCursor()
+          request.onsuccess = () =>
+            resolve(request.result?.value as { id?: unknown; name?: unknown } | undefined)
+          request.onerror = () => reject(request.error)
+        },
+      )
+      return typeof row?.id === 'string' && typeof row.name === 'string'
+        ? { id: row.id, name: row.name }
+        : null
+    } finally {
+      database.close()
+    }
+  }, databaseName)
+}
+
 test('normal use catches up foreground work without repeating the physical copy and preserves two-tab state', async ({
   page,
   uiJourney,
 }, testInfo) => {
   testInfo.setTimeout(180_000)
+  await installCompactionDemandProbe(page)
   await clearIndexedDb(page)
+  await waitForWorkspaceRunning(page)
+  await expect
+    .poll(() => readCompactionDemandProbe(page).then((snapshot) => snapshot.debtReads))
+    .toBeGreaterThan(0)
+  expect((await readCompactionDemandProbe(page)).compactionResources).toEqual([])
   await seedFirstRun(page)
   const firstUploadPath = testInfo.outputPath('compaction-source.bin')
   const replacementUploadPath = testInfo.outputPath('compaction-replacement.bin')
@@ -293,6 +391,7 @@ test('normal use catches up foreground work without repeating the physical copy 
   })
   let peer: Page | undefined
   let manager: Page | undefined
+  let tree: Page | undefined
   try {
     await retargetOnlyProfileToFakeProvider(page, scenario.providerBaseUrl)
     await createChatAndOpen(page)
@@ -365,6 +464,24 @@ test('normal use catches up foreground work without repeating the physical copy 
     )
     await uiJourney.intent(page, { kind: 'follow-bottom', id: 'storage-compaction-scroll' })
 
+    const treePage = await page.context().newPage()
+    tree = treePage
+    await treePage.goto(`/#/chat/${chatId}/message/${secondBranchId}`)
+    await treePage.locator('[data-role="chat-branch-tree"]').click()
+    await expect(treePage.locator('[data-ui="branch-tree-view"]')).toBeVisible()
+    const sharedConnector = treePage.locator('[data-connector-hit="shared-trunk"]').first()
+    await expect(sharedConnector).toBeVisible()
+    await sharedConnector.click()
+    await expect(treePage.locator('[data-ui="import-modal-slot"]')).toContainText(
+      'before all of its children',
+    )
+    const treeInsertionDraft = 'tree insertion draft survives compaction'
+    const treeInsertionEditor = treePage.locator('[data-ui="import-modal-text"]')
+    await treeInsertionEditor.fill(treeInsertionDraft)
+    await treeInsertionEditor.evaluate((element) => {
+      element.dataset.compactionRetainedNode = 'true'
+    })
+
     const managerPage = await page.context().newPage()
     manager = managerPage
     await managerPage.goto('/#/storage/attachments')
@@ -399,6 +516,14 @@ test('normal use catches up foreground work without repeating the physical copy 
       COMPACTION_DEBT_BYTES,
     )
     expect(await scenario.snapshot()).toMatchObject({ activeStreams: 1, requestCount: 1 })
+    await expect
+      .poll(() => readWorkspaceControlSnapshot(page))
+      .toMatchObject({
+        runtimeState: 'RUNNING',
+        generationLifetimeLocks: {
+          held: expect.arrayContaining(['shared']),
+        },
+      })
     const afterDebtEstimate = await page.evaluate(() => navigator.storage.estimate())
 
     const titleBeforeCatchup = await readChatTitleFromDatabase(
@@ -407,6 +532,8 @@ test('normal use catches up foreground work without repeating the physical copy 
       chatId,
     )
     if (titleBeforeCatchup === null) throw new Error('StorageCompactionTitleMissing')
+    const presetBeforeCatchup = await readFirstPresetFromDatabase(page, before.activeDatabaseName)
+    if (presetBeforeCatchup === null) throw new Error('StorageCompactionPresetMissing')
     await page.locator('[data-role="chat-title-edit"]').click()
     const titleEditor = page.locator('[data-ui="chat-title-editor"]')
     await titleEditor.fill('Compaction catch-up stayed interactive')
@@ -427,6 +554,10 @@ test('normal use catches up foreground work without repeating the physical copy 
       })
     const preparing = await readWorkspaceControlSnapshot(page)
     if (!preparing.pending) throw new Error('StorageCompactionPreparingJournalMissing')
+    await expect(page.locator('[data-ui="app-shell"]')).toHaveAttribute(
+      'data-workspace-runtime-state',
+      'RUNNING',
+    )
     await expect
       .poll(
         () =>
@@ -434,6 +565,11 @@ test('normal use catches up foreground work without repeating the physical copy 
         { timeout: 60_000 },
       )
       .toBe(titleBeforeCatchup)
+    await expect
+      .poll(() =>
+        readFirstPresetFromDatabase(page, preparing.pending?.destinationDatabaseName ?? ''),
+      )
+      .toEqual(presetBeforeCatchup)
 
     await titleEditor.press('Enter')
     await expect(page.locator('[data-ui="chat-title-label"]')).toHaveText(
@@ -442,6 +578,21 @@ test('normal use catches up foreground work without repeating the physical copy 
     await expect
       .poll(() => readChatTitleFromDatabase(page, before.activeDatabaseName, chatId))
       .toBe('Compaction catch-up stayed interactive')
+
+    const caughtUpPresetName = 'Compaction catch-up preset'
+    await page.locator('[data-role="settings-cog"]').click()
+    await page.locator('[data-ui="preset-breadcrumb-button"]').click()
+    const currentPreset = page.locator('[data-ui="preset-menu-item"][data-current="true"]')
+    await expect(currentPreset).toHaveAttribute('data-preset-id', presetBeforeCatchup.id)
+    page.once('dialog', (dialog) => void dialog.accept(caughtUpPresetName))
+    await currentPreset.getByTitle('Rename').click()
+    await expect(page.locator('[data-ui="preset-breadcrumb-button"]')).toContainText(
+      caughtUpPresetName,
+    )
+    await expect
+      .poll(() => readFirstPresetFromDatabase(page, before.activeDatabaseName))
+      .toEqual({ id: presetBeforeCatchup.id, name: caughtUpPresetName })
+    await page.locator('[data-role="settings-cog"]').click()
 
     const editDraft = 'this inline edit must survive workspace replacement'
     const editedUser = page.locator('[data-ui="message"][data-role="user"]').last()
@@ -458,19 +609,30 @@ test('normal use catches up foreground work without repeating the physical copy 
       .toBe(0)
 
     await expect
-      .poll(() => readWorkspaceControlSnapshot(page, before.activeDatabaseName), {
-        timeout: 60_000,
+      .poll(
+        () =>
+          readWorkspaceControlSnapshot(page, before.activeDatabaseName).then((snapshot) => ({
+            activated:
+              snapshot.activationSequence === before.activationSequence + 1 &&
+              snapshot.pending === null,
+            runtimeState: snapshot.runtimeState,
+            generationLifetimeLocks: snapshot.generationLifetimeLocks,
+          })),
+        { timeout: 60_000 },
+      )
+      .toEqual({
+        activated: true,
+        runtimeState: 'RUNNING',
+        generationLifetimeLocks: { held: [], pending: [] },
       })
-      .toMatchObject({
-        activationSequence: before.activationSequence + 1,
-        pending: null,
-        activeCompaction: {
-          knownReclaimableBytes: expect.any(Number),
-          requestRevision: expect.any(Number),
-          attemptedRevision: expect.any(Number),
-          completedRevision: expect.any(Number),
-        },
-      })
+    expect(await readWorkspaceControlSnapshot(page, before.activeDatabaseName)).toMatchObject({
+      activeCompaction: {
+        knownReclaimableBytes: expect.any(Number),
+        requestRevision: expect.any(Number),
+        attemptedRevision: expect.any(Number),
+        completedRevision: expect.any(Number),
+      },
+    })
     await expect
       .poll(
         () =>
@@ -499,6 +661,18 @@ test('normal use catches up foreground work without repeating the physical copy 
     expect(committed.sourceCompaction).toBeNull()
     expect(committed.databaseNames).not.toContain(before.activeDatabaseName)
     expect(await activeWorkspaceDatabaseName(page)).toBe(committed.activeDatabaseName)
+    await expect
+      .poll(() => readFirstPresetFromDatabase(page, committed.activeDatabaseName))
+      .toEqual({ id: presetBeforeCatchup.id, name: caughtUpPresetName })
+    await expect
+      .poll(() => activeWorkspaceDatabaseName(treePage))
+      .toBe(committed.activeDatabaseName)
+    await expect(treePage.locator('[data-ui="import-modal-slot"]')).toContainText(
+      'before all of its children',
+    )
+    await expect(treeInsertionEditor).toBeVisible()
+    await expect(treeInsertionEditor).toHaveValue(treeInsertionDraft)
+    await expect(treeInsertionEditor).toHaveAttribute('data-compaction-retained-node', 'true')
 
     await expect.poll(() => page.evaluate(() => window.location.hash)).toBe(pinnedRoute)
     await expect(composer).toHaveValue(draft)
@@ -580,7 +754,7 @@ test('normal use catches up foreground work without repeating the physical copy 
       contentType: 'application/json',
     })
   } finally {
-    await Promise.allSettled([peer?.close(), manager?.close(), scenario.dispose()])
+    await Promise.allSettled([peer?.close(), manager?.close(), tree?.close(), scenario.dispose()])
     await Promise.allSettled([unlink(firstUploadPath), unlink(replacementUploadPath)])
   }
 })

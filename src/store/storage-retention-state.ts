@@ -76,23 +76,25 @@ export function freshStorageRetentionStateRow<Task extends StorageRetentionTask>
   return { task, formatVersion: 1, phase: 'idle', revision: 0 }
 }
 
-export async function readStorageRetentionState<Task extends StorageRetentionTask>(
+export function readStorageRetentionState<Task extends StorageRetentionTask>(
   source: {
     table<Row, Key>(name: string): { get(key: Key): Promise<Row | undefined> }
   },
   task: Task,
 ): Promise<StorageRetentionStateRowFor<Task>> {
-  const row: unknown = await source
+  return source
     .table<unknown, StorageRetentionTask>('storageRetentionState')
     .get(task)
-  if (!row || typeof row !== 'object' || Array.isArray(row)) {
-    throw new Error(`StorageRetentionStateMissing:${task}`)
-  }
-  const candidate = row as Record<string, unknown>
-  if (candidate.formatVersion !== 1 || candidate.task !== task) {
-    throw new Error(`StorageRetentionStateInvalid:${task}`)
-  }
-  return row as StorageRetentionStateRowFor<Task>
+    .then((row) => {
+      if (!row || typeof row !== 'object' || Array.isArray(row)) {
+        throw new Error(`StorageRetentionStateMissing:${task}`)
+      }
+      const candidate = row as Record<string, unknown>
+      if (candidate.formatVersion !== 1 || candidate.task !== task) {
+        throw new Error(`StorageRetentionStateInvalid:${task}`)
+      }
+      return row as StorageRetentionStateRowFor<Task>
+    })
 }
 
 export function storageRetentionCycle<Task extends StorageRetentionTask>(

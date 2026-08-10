@@ -7,6 +7,7 @@ import type { BrowserLockRow } from './browser-lock-record'
 import {
   BROWSER_WORKSPACE_COMPACTION_MIN_RECLAIMABLE_BYTES,
   browserWorkspaceCompactionDebtThreshold,
+  browserWorkspaceCompactionDemandPending,
   readBrowserWorkspaceCompactionState,
   recordBrowserWorkspaceCompactionDebt,
 } from './browser-workspace-database-control'
@@ -100,6 +101,10 @@ export function storageCompactionRecoveryIntentKey(tabId: string): string {
 
 export function readStorageCompactionState(source: { readonly name: string }) {
   return readBrowserWorkspaceCompactionState(source.name)
+}
+
+export function storageCompactionDemandPending(source: { readonly name: string }) {
+  return browserWorkspaceCompactionDemandPending(source.name)
 }
 
 export function accumulateStorageCompactionDebt(tx: Transaction, obsoleteBytes: number): void {

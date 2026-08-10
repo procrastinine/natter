@@ -1,6 +1,5 @@
 import Dexie from 'dexie'
 import 'fake-indexeddb/auto'
-import { IDBFactory } from 'fake-indexeddb'
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import { tokenCalibrationKey } from '../../src/core/model-ids'
@@ -16,6 +15,7 @@ import {
 } from '../../src/store/browser-repo'
 import { cleanPendingBrowserWorkspaceDatabase } from '../../src/store/browser-workspace-database-cleanup'
 import {
+  __resetBrowserWorkspaceControlDatabaseForTests,
   beginBrowserWorkspaceDatabaseReplacement,
   readBrowserWorkspaceDatabaseManifest,
 } from '../../src/store/browser-workspace-database-control'
@@ -26,10 +26,7 @@ import {
   shutdownBrowserWorkspace,
   shutdownBrowserWorkspaceWhenIdle,
 } from '../../src/store/browser-workspace-lifecycle'
-import {
-  runBrowserWorkspaceReplacement,
-  tryStartBrowserWorkspaceReplacementIfIdle,
-} from '../../src/store/browser-workspace-replacement-runner'
+import { runBrowserWorkspaceReplacement } from '../../src/store/browser-workspace-replacement-runner'
 import { configurationPromptPresetCatalogProjectionRow } from '../../src/store/configuration-catalog-projection'
 import type { ConversationController } from '../../src/store/conversation-controller'
 import { createConversationRepositoryAdapter } from '../../src/store/conversation-repository-adapter'
@@ -56,12 +53,42 @@ import {
 import {
   awaitWorkspaceRuntimeQuiesced,
   getWorkspaceRuntimeControlSnapshot,
-  launchImportExportWorkspaceRuntimeReplacementNow,
+  launchRequiredWorkspaceRuntimeReplacementNow,
 } from '../../src/store/workspace-runtime-control'
 import { putTestChat, putTestChats } from '../helpers/chats'
+import { installFreshFakeIndexedDbForTests } from '../helpers/fake-indexeddb'
 import { expectWorkspaceRepositoryCoreContract } from '../helpers/workspace-repository-contract'
 
 let emptyWorkspaceBackup: Awaited<ReturnType<typeof exportWorkspaceBackup>>
+
+class SerializedLockManager {
+  private readonly tails = new Map<string, Promise<void>>()
+
+  async request<T>(
+    name: string,
+    optionsOrCallback: LockOptions | ((lock: Lock) => PromiseLike<T> | T),
+    maybeCallback?: (lock: Lock) => PromiseLike<T> | T,
+  ): Promise<T> {
+    const options = typeof optionsOrCallback === 'function' ? {} : optionsOrCallback
+    const callback = typeof optionsOrCallback === 'function' ? optionsOrCallback : maybeCallback
+    if (!callback) throw new Error('SerializedLockCallbackMissing')
+    const prior = this.tails.get(name) ?? Promise.resolve()
+    let release!: () => void
+    const current = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const tail = prior.then(() => current)
+    this.tails.set(name, tail)
+    await prior
+    try {
+      options.signal?.throwIfAborted()
+      return await callback({ name, mode: options.mode ?? 'exclusive' })
+    } finally {
+      release()
+      if (this.tails.get(name) === tail) this.tails.delete(name)
+    }
+  }
+}
 
 function sessionChat(id: string): Chat {
   return {
@@ -95,7 +122,8 @@ function write(repository: WorkspaceRepository, command: WorkspaceCommand) {
 }
 
 beforeAll(async () => {
-  ;(globalThis as unknown as { indexedDB: IDBFactory }).indexedDB = new IDBFactory()
+  installFreshFakeIndexedDbForTests()
+  __resetBrowserWorkspaceControlDatabaseForTests()
   __resetWorkspaceRepositoryForTests()
   __resetBrowserRepositoryForTests()
   __resetBroadcastForTests()
@@ -895,7 +923,7 @@ describe('browser WorkspaceRepository protocol contract', () => {
       releaseReplacement = resolve
     })
     const replacement = (async () => {
-      const authority = launchImportExportWorkspaceRuntimeReplacementNow()
+      const authority = launchRequiredWorkspaceRuntimeReplacementNow()
       if (!authority) throw new Error('Expected replacement authority')
       await awaitWorkspaceRuntimeQuiesced()
       markQuiesced()
@@ -932,7 +960,7 @@ describe('browser WorkspaceRepository protocol contract', () => {
       releaseReplacement = resolve
     })
     const owner = (async () => {
-      const authority = launchImportExportWorkspaceRuntimeReplacementNow()
+      const authority = launchRequiredWorkspaceRuntimeReplacementNow()
       if (!authority) throw new Error('Expected replacement authority')
       await awaitWorkspaceRuntimeQuiesced()
       markQuiesced()
@@ -987,13 +1015,7 @@ describe('browser WorkspaceRepository protocol contract', () => {
     const originalLocks = Object.getOwnPropertyDescriptor(navigator, 'locks')
     Object.defineProperty(navigator, 'locks', {
       configurable: true,
-      value: {
-        request: async <T>(
-          _name: string,
-          options: { mode: 'shared' | 'exclusive'; ifAvailable?: boolean },
-          operation: (lock: Lock | null) => Promise<T> | T,
-        ) => operation({ mode: options.mode } as Lock),
-      },
+      value: new SerializedLockManager(),
     })
     try {
       await expect(restoreWorkspaceBackup(emptyWorkspaceBackup, { now: 5 })).resolves.toMatchObject(
@@ -1097,48 +1119,6 @@ describe('browser WorkspaceRepository protocol contract', () => {
 
     try {
       const replacement = runBrowserWorkspaceReplacement(preflight, operation, {
-        signal: controller.signal,
-      })
-      await queued
-      controller.abort(reason)
-
-      await expect(replacement).rejects.toBe(reason)
-      expect(preflight).not.toHaveBeenCalled()
-      expect(operation).not.toHaveBeenCalled()
-      expect(getWorkspaceRuntimeControlSnapshot().state).toBe('RUNNING')
-    } finally {
-      if (originalLocks) Object.defineProperty(navigator, 'locks', originalLocks)
-      else Reflect.deleteProperty(navigator, 'locks')
-    }
-  })
-
-  it('cancels an if-idle replacement while its producer owns the queued selection', async () => {
-    const originalLocks = Object.getOwnPropertyDescriptor(navigator, 'locks')
-    let markQueued!: () => void
-    const queued = new Promise<void>((resolve) => {
-      markQueued = resolve
-    })
-    const request = vi.fn(
-      (
-        _name: string,
-        _options: LockOptions,
-        _callback: (lock: Lock | null) => unknown,
-      ): Promise<never> => {
-        markQueued()
-        return new Promise<never>(() => undefined)
-      },
-    )
-    Object.defineProperty(navigator, 'locks', {
-      configurable: true,
-      value: { request },
-    })
-    const controller = new AbortController()
-    const reason = new Error('queued-if-idle-replacement-cancelled')
-    const preflight = vi.fn(() => true)
-    const operation = vi.fn()
-
-    try {
-      const replacement = tryStartBrowserWorkspaceReplacementIfIdle(preflight, operation, {
         signal: controller.signal,
       })
       await queued

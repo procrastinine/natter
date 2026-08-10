@@ -235,9 +235,7 @@ const CLOCK_INVENTORY = {
       'src/store/attempt-controller.ts|reduceExecutionRecord|Date.now|1',
       'src/store/browser-mutation-runtime.ts|putAttachment|Date.now|1',
       'src/store/discovery-cache-policy.ts|isFresh|Date.now|1',
-      'src/store/discovery-service.ts|resolveModelsDiscovery|Date.now|1',
-      'src/store/discovery-service.ts|resolveEndpointsDiscovery|Date.now|1',
-      'src/store/discovery-service.ts|resolvePrivacyDiscovery|Date.now|1',
+      'src/store/discovery-service.ts|nextDiscoveryFetchedAt|Date.now|1',
       'src/store/generated-output-localization-capability.ts|drainQueueProbes|Date.now|1',
       'src/store/generated-output-localization-runtime.ts|pump|Date.now|1',
       'src/store/generated-output-localization-runtime.ts|processJobWithPermit|Date.now|1',
@@ -288,7 +286,7 @@ const CLOCK_INVENTORY = {
       'src/store/attempt-control-application.ts|requestAttemptStop|Date.now|1',
       'src/store/configuration-model-resolution-capability.ts|drainTarget|Date.now|1',
       'src/core/token-calibration.ts|addSampleToChat|Date.now|1',
-      'src/app/Shell.tsx|Shell|Date.now|1',
+      'src/app/Shell.tsx|task|Date.now|1',
       'src/core/chat-metadata.ts|createChatRow|Date.now|1',
       'src/store/attachment-storage.ts|splitAttachmentForStorage|Date.now|1',
       'src/store/attachments.ts|buildAttachment|Date.now|1',
@@ -540,6 +538,13 @@ const RETRY_LOOP_INVENTORY = {
     ids: [
       'src/store/browser-workspace-database-selection.ts|selectBrowserWorkspaceDatabase|ForStatement|unbounded|1',
       'src/store/browser-workspace-startup-repair.ts|settlePendingBrowserWorkspaceReplacement|ForStatement|unbounded|1',
+    ],
+  },
+  'replacement-contender-readmission': {
+    rationale:
+      'A durable peer transition preempts only an unpromoted local contender. The caller preserves the required replacement intent and re-admits only after runtime reconciliation publishes a new stable state; no timer, budget, or hot spin controls progress.',
+    ids: [
+      'src/store/browser-workspace-replacement-runner.ts|runBrowserWorkspaceReplacement|ForStatement|unbounded|1',
     ],
   },
   'bounded-pagination-scan': {

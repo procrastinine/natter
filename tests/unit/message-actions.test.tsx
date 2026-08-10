@@ -31,6 +31,7 @@ function startedGeneration(): GenerationSubmission {
     kind: 'started',
     admission: Promise.resolve(Object.freeze({ kind: 'admitted' as const })),
     completion: Promise.resolve(Object.freeze({ kind: 'prepared' as const })),
+    generationSettled: Promise.resolve(),
     cancel: () => undefined,
   })
 }

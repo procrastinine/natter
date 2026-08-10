@@ -18,16 +18,64 @@ export class WorkspaceMaintenancePreemptedError extends DOMException {
   }
 }
 
+export class WorkspaceReplacementContenderPreemptedError extends DOMException {
+  constructor() {
+    super('A durable peer replacement owns the workspace transition', 'AbortError')
+  }
+}
+
+export class WorkspaceForegroundDemandInterruptedError extends DOMException {
+  constructor() {
+    super('Foreground demand interrupted a maintenance page', 'AbortError')
+  }
+}
+
+export function isWorkspaceReplacementContenderPreemptedError(
+  error: unknown,
+): error is WorkspaceReplacementContenderPreemptedError {
+  return error instanceof WorkspaceReplacementContenderPreemptedError
+}
+
 export function isWorkspaceMaintenancePreemptedError(
   error: unknown,
 ): error is WorkspaceMaintenancePreemptedError {
-  return (
-    error instanceof WorkspaceMaintenancePreemptedError ||
-    (!!error &&
-      typeof error === 'object' &&
-      'inner' in error &&
-      error.inner instanceof WorkspaceMaintenancePreemptedError)
-  )
+  const pending = [error]
+  const seen = new Set<unknown>()
+  while (pending.length > 0) {
+    const candidate = pending.pop()
+    if (candidate instanceof WorkspaceMaintenancePreemptedError) return true
+    if (!candidate || typeof candidate !== 'object' || seen.has(candidate)) continue
+    seen.add(candidate)
+    if (candidate instanceof AggregateError) {
+      candidate.errors.forEach((nested: unknown) => {
+        pending.push(nested)
+      })
+    }
+    if ('inner' in candidate) pending.push(candidate.inner)
+    if ('cause' in candidate) pending.push(candidate.cause)
+  }
+  return false
+}
+
+export function isWorkspaceForegroundDemandInterruptedError(
+  error: unknown,
+): error is WorkspaceForegroundDemandInterruptedError {
+  const pending = [error]
+  const seen = new Set<unknown>()
+  while (pending.length > 0) {
+    const candidate = pending.pop()
+    if (candidate instanceof WorkspaceForegroundDemandInterruptedError) return true
+    if (!candidate || typeof candidate !== 'object' || seen.has(candidate)) continue
+    seen.add(candidate)
+    if (candidate instanceof AggregateError) {
+      candidate.errors.forEach((nested: unknown) => {
+        pending.push(nested)
+      })
+    }
+    if ('inner' in candidate) pending.push(candidate.inner)
+    if ('cause' in candidate) pending.push(candidate.cause)
+  }
+  return false
 }
 
 export const WORKSPACE_ROOT_REPLACEMENT_DISPOSITIONS = Object.freeze({
@@ -41,6 +89,7 @@ export const WORKSPACE_ROOT_REPLACEMENT_DISPOSITIONS = Object.freeze({
   configuration: 'drain',
   attachment: 'drain',
   'import-export': 'drain',
+  'workspace-replacement': 'drain',
   'repository-query': 'cancel',
   'search-session': 'cancel',
   'cache-refresh': 'cancel',
@@ -52,7 +101,7 @@ export type WorkspaceRootKind = keyof typeof WORKSPACE_ROOT_REPLACEMENT_DISPOSIT
 
 export type WorkspaceReplacementRootKind = Extract<
   WorkspaceRootKind,
-  'import-export' | 'maintenance'
+  'workspace-replacement' | 'maintenance'
 >
 
 type WorkspaceRootSubset<Kind extends WorkspaceRootKind> = Kind
@@ -136,13 +185,22 @@ type WorkspaceRuntimeQuiesceMode = 'graceful' | 'abortive'
 type WorkspaceRuntimeDemandBoundary = () => Promise<void>
 
 declare const workspaceRuntimeDemandBoundaryOwnerBrand: unique symbol
+declare const workspaceForegroundDemandOwnerBrand: unique symbol
 
 export interface WorkspaceRuntimeDemandBoundaryOwner {
   readonly [workspaceRuntimeDemandBoundaryOwnerBrand]: true
 }
 
+export interface WorkspaceForegroundDemandOwner {
+  readonly [workspaceForegroundDemandOwnerBrand]: true
+}
+
 interface WorkspaceRuntimeDemandBoundaryOwnerRecord {
   readonly boundary: WorkspaceRuntimeDemandBoundary
+  released: boolean
+}
+
+interface WorkspaceForegroundDemandOwnerRecord {
   released: boolean
 }
 
@@ -273,6 +331,9 @@ export function createWorkspaceRuntimeKernel() {
   let runtimeFenceSnapshot: WorkspaceFence | null = null
   let quiesceMode: WorkspaceRuntimeQuiesceMode | null = null
   let runtimeDemandBoundaryOwner: WorkspaceRuntimeDemandBoundaryOwnerRecord | null = null
+  const foregroundDemandOwners = new Set<WorkspaceForegroundDemandOwnerRecord>()
+  const foregroundDemandIdleListeners = new Set<() => void>()
+  let foregroundDemandInterruptionController = new AbortController()
   let reconciliationOrigin: ReconciliationOrigin | null = null
 
   function runWorkspaceRead<T>(
@@ -340,6 +401,84 @@ export function createWorkspaceRuntimeKernel() {
     }
     owner.released = true
     runtimeDemandBoundaryOwner = null
+  }
+
+  function claimWorkspaceForegroundDemand(): WorkspaceForegroundDemandOwner {
+    if (foregroundDemandOwners.size === 0) {
+      foregroundDemandInterruptionController.abort(new WorkspaceForegroundDemandInterruptedError())
+    }
+    const owner: WorkspaceForegroundDemandOwnerRecord = { released: false }
+    foregroundDemandOwners.add(owner)
+    return owner as unknown as WorkspaceForegroundDemandOwner
+  }
+
+  function releaseWorkspaceForegroundDemand(handle: WorkspaceForegroundDemandOwner): void {
+    const owner = handle as unknown as WorkspaceForegroundDemandOwnerRecord
+    if (owner.released) return
+    if (!foregroundDemandOwners.delete(owner)) {
+      throw new Error('WorkspaceForegroundDemandOwnerMismatch')
+    }
+    owner.released = true
+    if (foregroundDemandOwners.size !== 0) return
+    foregroundDemandInterruptionController = new AbortController()
+    for (const listener of [...foregroundDemandIdleListeners]) listener()
+  }
+
+  function workspaceForegroundDemandInterruptionSignal(): AbortSignal {
+    return foregroundDemandInterruptionController.signal
+  }
+
+  function awaitWorkspaceForegroundDemandIdle(signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) return Promise.reject(workspaceRuntimeError(signal.reason))
+    if (foregroundDemandOwners.size === 0) return Promise.resolve()
+    return new Promise<void>((resolve, reject) => {
+      let settled = false
+      const settle = (operation: () => void) => {
+        if (settled) return
+        settled = true
+        foregroundDemandIdleListeners.delete(onIdle)
+        signal?.removeEventListener('abort', onAbort)
+        operation()
+      }
+      const onIdle = () => settle(resolve)
+      const onAbort = () => settle(() => reject(workspaceRuntimeError(signal?.reason)))
+      foregroundDemandIdleListeners.add(onIdle)
+      signal?.addEventListener('abort', onAbort, { once: true })
+      if (foregroundDemandOwners.size === 0) onIdle()
+    })
+  }
+
+  function preemptWorkspaceMaintenancePreparation(permit: WorkspaceWritePermit): void {
+    const owner = permitRecord(permit)
+    if (
+      owner.type !== 'write-root' ||
+      owner.kind !== 'workspace-replacement' ||
+      !owner.active ||
+      !owner.repositoryAdmissionOpen
+    ) {
+      throw new Error('WorkspaceReplacementProducerPermitInvalid')
+    }
+    for (const candidate of activeRoots) {
+      if (candidate === owner || candidate.kind !== 'maintenance' || !candidate.active) continue
+      candidate.repositoryAdmissionOpen = false
+      if (!candidate.controller.signal.aborted) {
+        candidate.controller.abort(new WorkspaceMaintenancePreemptedError())
+      }
+    }
+  }
+
+  function preemptWorkspaceReplacementContendersForRemoteTransition(): void {
+    for (const candidate of activeRoots) {
+      preemptWorkspaceReplacementContender(candidate)
+    }
+  }
+
+  function preemptWorkspaceReplacementContender(candidate: RootPermitRecord): void {
+    if (candidate.kind !== 'workspace-replacement' || !candidate.active) return
+    candidate.repositoryAdmissionOpen = false
+    if (!candidate.controller.signal.aborted) {
+      candidate.controller.abort(new WorkspaceReplacementContenderPreemptedError())
+    }
   }
 
   function tryRunWorkspaceActionIfIdle<T>(
@@ -718,8 +857,8 @@ export function createWorkspaceRuntimeKernel() {
     record.active = false
     record.unlink()
     activeRoots.delete(record)
-    for (const listener of [...rootReleaseListeners]) listener()
     endTrackedWork()
+    for (const listener of [...rootReleaseListeners]) listener()
   }
 
   function releaseReservedRecord(record: ReservedPermitRecord): void {
@@ -960,6 +1099,11 @@ export function createWorkspaceRuntimeKernel() {
     if (workspaceId === null) throw new Error('WorkspaceRuntimeIdentityMissing')
     gatedDirty ??= { workspaceId, replacementEpoch, broad: false }
     enterQuiescing()
+    if (kind === 'workspace-replacement') {
+      for (const candidate of activeRoots) {
+        if (candidate !== root) preemptWorkspaceReplacementContender(candidate)
+      }
+    }
     cancelDisposableReplacementPeers(root)
     root.active = false
     activeRoots.delete(root)
@@ -1165,6 +1309,12 @@ export function createWorkspaceRuntimeKernel() {
     runWorkspaceActionAtFence,
     claimWorkspaceRuntimeDemandBoundary,
     releaseWorkspaceRuntimeDemandBoundary,
+    claimWorkspaceForegroundDemand,
+    releaseWorkspaceForegroundDemand,
+    awaitWorkspaceForegroundDemandIdle,
+    workspaceForegroundDemandInterruptionSignal,
+    preemptWorkspaceMaintenancePreparation,
+    preemptWorkspaceReplacementContendersForRemoteTransition,
     tryRunWorkspaceActionIfIdle,
     reserveWorkspaceChild,
     runWorkspacePhase,
@@ -1193,6 +1343,10 @@ function exposeWorkspaceRootAdmission<Signature>(
 const productionWorkspaceRuntime: WorkspaceRuntimeKernel = createWorkspaceRuntimeKernel()
 const claimProductionWorkspaceRuntimeDemandBoundary =
   productionWorkspaceRuntime.claimWorkspaceRuntimeDemandBoundary
+const claimProductionWorkspaceForegroundDemand =
+  productionWorkspaceRuntime.claimWorkspaceForegroundDemand
+const productionWorkspaceForegroundDemandInterruptionSignal =
+  productionWorkspaceRuntime.workspaceForegroundDemandInterruptionSignal
 const subscribeProductionWorkspaceRuntime = productionWorkspaceRuntime.subscribeWorkspaceRuntime
 const subscribeProductionWorkspaceRuntimeIdle =
   productionWorkspaceRuntime.subscribeWorkspaceRuntimeIdle
@@ -1231,6 +1385,30 @@ export function releaseWorkspaceRuntimeDemandBoundary(
   handle: WorkspaceRuntimeDemandBoundaryOwner,
 ): void {
   productionWorkspaceRuntime.releaseWorkspaceRuntimeDemandBoundary(handle)
+}
+
+export function claimWorkspaceForegroundDemand(): WorkspaceForegroundDemandOwner {
+  return claimProductionWorkspaceForegroundDemand()
+}
+
+export function releaseWorkspaceForegroundDemand(handle: WorkspaceForegroundDemandOwner): void {
+  productionWorkspaceRuntime.releaseWorkspaceForegroundDemand(handle)
+}
+
+export function awaitWorkspaceForegroundDemandIdle(signal?: AbortSignal): Promise<void> {
+  return productionWorkspaceRuntime.awaitWorkspaceForegroundDemandIdle(signal)
+}
+
+export function workspaceForegroundDemandInterruptionSignal(): AbortSignal {
+  return productionWorkspaceForegroundDemandInterruptionSignal()
+}
+
+export function preemptWorkspaceMaintenancePreparation(permit: WorkspaceWritePermit): void {
+  productionWorkspaceRuntime.preemptWorkspaceMaintenancePreparation(permit)
+}
+
+export function preemptWorkspaceReplacementContendersForRemoteTransition(): void {
+  productionWorkspaceRuntime.preemptWorkspaceReplacementContendersForRemoteTransition()
 }
 
 export const tryRunWorkspaceActionIfIdle = exposeWorkspaceRootAdmission(

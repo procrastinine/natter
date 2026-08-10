@@ -989,8 +989,28 @@ function createWorkspaceReplacementAdmission<const Kind extends WorkspaceReplace
 ): WorkspaceRootAdmissionCapability<
   (options?: WorkspaceReplacementAuthorityOptions<Kind>) => WorkspaceReconcileAuthority | null,
   { readonly fixedKind: Kind }
+>
+function createWorkspaceReplacementAdmission<const Kind extends WorkspaceReplacementRootKind>(
+  kind: Kind,
+  requireIdle: WorkspaceReplacementAdmissionRequiresIdle<Kind>,
+  admission: WorkspaceRuntimeControlKernel['launchWorkspaceRuntimeReplacementWhenUnblocked'],
+): WorkspaceRootAdmissionCapability<
+  (options?: WorkspaceRuntimeActionOptions) => Promise<WorkspaceReconcileAuthority | null>,
+  { readonly fixedKind: Kind }
+>
+function createWorkspaceReplacementAdmission<const Kind extends WorkspaceReplacementRootKind>(
+  kind: Kind,
+  requireIdle: WorkspaceReplacementAdmissionRequiresIdle<Kind>,
+  admission:
+    | WorkspaceRuntimeControlKernel['launchWorkspaceRuntimeReplacementNow']
+    | WorkspaceRuntimeControlKernel['launchWorkspaceRuntimeReplacementWhenUnblocked'],
+): WorkspaceRootAdmissionCapability<
+  (
+    options?: WorkspaceRuntimeActionOptions,
+  ) => WorkspaceReconcileAuthority | null | Promise<WorkspaceReconcileAuthority | null>,
+  { readonly fixedKind: Kind }
 > {
-  const fixedAdmission = (options?: WorkspaceReplacementAuthorityOptions<Kind>) =>
+  const fixedAdmission = (options?: WorkspaceRuntimeActionOptions) =>
     admission(kind, { ...options, requireIdle })
   return fixedAdmission as WorkspaceRootAdmissionCapability<
     typeof fixedAdmission,
@@ -1044,8 +1064,8 @@ export function awaitWorkspaceRuntimeQuiesced(): Promise<void> {
   return productionWorkspaceRuntimeControl.awaitWorkspaceRuntimeQuiesced()
 }
 
-export const launchImportExportWorkspaceRuntimeReplacementNow = createWorkspaceReplacementAdmission(
-  'import-export',
+export const launchRequiredWorkspaceRuntimeReplacementNow = createWorkspaceReplacementAdmission(
+  'workspace-replacement',
   false,
   productionWorkspaceRuntimeControl.launchWorkspaceRuntimeReplacementNow,
 )
@@ -1055,6 +1075,13 @@ export const tryLaunchMaintenanceWorkspaceRuntimeReplacementIfIdle =
     'maintenance',
     true,
     productionWorkspaceRuntimeControl.launchWorkspaceRuntimeReplacementNow,
+  )
+
+export const launchMaintenanceWorkspaceRuntimeReplacementWhenUnblocked =
+  createWorkspaceReplacementAdmission(
+    'maintenance',
+    true,
+    productionWorkspaceRuntimeControl.launchWorkspaceRuntimeReplacementWhenUnblocked,
   )
 
 export function beginWorkspaceRuntimeReconciliation(

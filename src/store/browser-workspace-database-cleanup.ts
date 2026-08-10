@@ -9,6 +9,7 @@ import {
   sameBrowserWorkspaceReplacementJournal,
 } from './browser-workspace-database-control'
 import {
+  type BrowserWorkspaceSelectionGrant,
   type BrowserWorkspaceSlotTransition,
   tryWithBrowserWorkspaceSelectionGate,
   withBrowserWorkspaceSelectionGate,
@@ -47,15 +48,20 @@ export async function cleanPendingBrowserWorkspaceDatabase(
 ): Promise<BrowserWorkspaceDatabaseCleanupResult> {
   if (signal?.aborted) throw signal.reason
   const manifest = await readBrowserWorkspaceDatabaseManifest()
-  let journal = manifest.pending
+  const journal = manifest.pending
   if (!journal) return { status: 'none' }
   if (journal.phase === 'preparing') {
-    const claimed = await claimAbandonedPreparedDatabase(journal, signal)
-    if (claimed.kind === 'occupied') return { status: 'preparing' }
-    if (claimed.kind === 'changed') return { status: 'changed' }
-    journal = claimed.journal
+    const claimed = await tryWithBrowserWorkspaceSelectionGate(
+      (selection) =>
+        cleanPendingBrowserWorkspaceDatabaseWithinSelection(selection, journal, signal),
+      signal,
+    )
+    return claimed.acquired ? claimed.value : { status: 'preparing' }
   }
-  return cleanJournaledBrowserWorkspaceDatabase(journal, signal)
+  return withBrowserWorkspaceSelectionGate(
+    (selection) => cleanPendingBrowserWorkspaceDatabaseWithinSelection(selection, journal, signal),
+    signal,
+  )
 }
 
 export function recoverQuiescedBrowserWorkspaceReplacement(
@@ -112,40 +118,29 @@ function sameBrowserWorkspaceSlotTransition(
   )
 }
 
-async function claimAbandonedPreparedDatabase(
-  journal: BrowserWorkspaceReplacementPreparing,
-  signal?: AbortSignal,
-): Promise<
-  | { readonly kind: 'occupied' }
-  | { readonly kind: 'changed' }
-  | { readonly kind: 'claimed'; readonly journal: BrowserWorkspaceReplacementDiscard }
-> {
-  const claimed = await tryWithBrowserWorkspaceSelectionGate(async () => {
-    const confirmed = await readBrowserWorkspaceDatabaseManifest()
-    if (!sameBrowserWorkspaceReplacementJournal(confirmed.pending, journal)) {
-      return { kind: 'changed' as const }
-    }
-    await abandonPreparedBrowserWorkspaceDatabase(journal)
-    return {
-      kind: 'claimed' as const,
-      journal: { ...journal, phase: 'discard' as const },
-    }
-  }, signal)
-  return claimed.acquired ? claimed.value : { kind: 'occupied' }
-}
-
-function obsoleteDatabaseName(
-  journal: BrowserWorkspaceReplacementDiscard | BrowserWorkspaceReplacementCleanup,
-): BrowserWorkspaceReplacementDiscard['destinationDatabaseName'] {
-  return journal.phase === 'discard' ? journal.destinationDatabaseName : journal.sourceDatabaseName
-}
-
-function cleanJournaledBrowserWorkspaceDatabase(
-  journal: BrowserWorkspaceReplacementDiscard | BrowserWorkspaceReplacementCleanup,
+export async function cleanPendingBrowserWorkspaceDatabaseWithinSelection(
+  selection: BrowserWorkspaceSelectionGrant,
+  expected:
+    | BrowserWorkspaceReplacementPreparing
+    | BrowserWorkspaceReplacementDiscard
+    | BrowserWorkspaceReplacementCleanup,
   signal?: AbortSignal,
 ): Promise<BrowserWorkspaceDatabaseCleanupResult> {
+  if (signal?.aborted) throw signal.reason
+  const manifest = await readBrowserWorkspaceDatabaseManifest()
+  if (!sameBrowserWorkspaceReplacementJournal(manifest.pending, expected)) {
+    return { status: 'changed' }
+  }
+  let journal: BrowserWorkspaceReplacementDiscard | BrowserWorkspaceReplacementCleanup
+  if (expected.phase === 'preparing') {
+    await abandonPreparedBrowserWorkspaceDatabase(expected)
+    journal = { ...expected, phase: 'discard' }
+  } else {
+    journal = expected
+  }
   const databaseName = obsoleteDatabaseName(journal)
   return withExclusiveBrowserWorkspaceSlots(
+    selection,
     [databaseName],
     async () => {
       if (signal?.aborted) throw signal.reason
@@ -160,4 +155,10 @@ function cleanJournaledBrowserWorkspaceDatabase(
     },
     signal,
   )
+}
+
+function obsoleteDatabaseName(
+  journal: BrowserWorkspaceReplacementDiscard | BrowserWorkspaceReplacementCleanup,
+): BrowserWorkspaceReplacementDiscard['destinationDatabaseName'] {
+  return journal.phase === 'discard' ? journal.destinationDatabaseName : journal.sourceDatabaseName
 }

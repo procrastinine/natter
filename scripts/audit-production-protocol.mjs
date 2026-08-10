@@ -477,7 +477,10 @@ function rootAdmissionOriginProblem(checker, declaration, descriptor) {
     !ts.isPropertyAccessExpression(target) ||
     !ts.isIdentifier(target.expression) ||
     target.expression.text !== 'productionWorkspaceRuntimeControl' ||
-    target.name.text !== 'launchWorkspaceRuntimeReplacementNow'
+    ![
+      'launchWorkspaceRuntimeReplacementNow',
+      'launchWorkspaceRuntimeReplacementWhenUnblocked',
+    ].includes(target.name.text)
   ) {
     return 'fixed-root capability does not bind the production replacement admission'
   }

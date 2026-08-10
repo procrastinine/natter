@@ -370,6 +370,7 @@ export const WORKSPACE_ROOT_LOCALITY = mergeRecords(
       'configuration',
       'attachment',
       'import-export',
+      'workspace-replacement',
       'cache-refresh',
       'stream-recovery',
       'maintenance',

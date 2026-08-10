@@ -683,6 +683,7 @@ function foregroundStorageLocalityFacts(program, browserRepoSource, outputProble
     'src/store/browser-command-mutation-journal.ts#<module>:openCursor',
     'src/store/browser-import-export.ts#estimateBrowserWorkspaceLiveBytes:each',
     'src/store/browser-import-export.ts#readCollectionInPages:each',
+    'src/store/browser-workspace-compaction.ts#readBrowserWorkspaceCatchupPage:openCursor',
     'src/store/browser-workspace-compaction.ts#readCopyPage:openCursor',
     'src/store/browser-workspace-database-control.ts#constructor:toCollection',
     'src/store/browser-workspace-startup-repair.ts#readRawPage:openCursor',
@@ -3011,10 +3012,10 @@ function streamJournalRetirementCapabilityFacts(program, browserRepoSource, outp
         ?.includes('maxBatchRows: MAX_STORAGE_MAINTENANCE_BATCH') === true &&
       boundsTextByOwner
         .get('TERMINAL_STREAM_RETENTION_OPERATION_BOUNDS')
-        ?.includes('maxRequests: 5') === true &&
+        ?.includes('maxRequests: 4') === true &&
       boundsTextByOwner
         .get('TERMINAL_STREAM_RETENTION_OPERATION_BOUNDS')
-        ?.includes('maxRows: STREAM_JOURNAL_RETIREMENT_MAX_ROWS + 5') === true &&
+        ?.includes('maxRows: STREAM_JOURNAL_RETIREMENT_MAX_ROWS + 4') === true &&
       boundsTextByOwner
         .get('TERMINAL_STREAM_RETENTION_OPERATION_BOUNDS')
         ?.includes('maxBatchRows: STREAM_JOURNAL_RETIREMENT_MAX_ROWS + 1') === true &&
@@ -9681,6 +9682,7 @@ function scopeDerivedMutationCapabilityFacts(
   const attachmentReapPlanOwner = findFunction(browserRepoSource, 'readAttachmentReapPlan')
   const attachmentReapReplayOwner = findFunction(browserRepoSource, 'attachmentReapReplayPlan')
   const storageRetentionCommitOwner = findFunction(browserRepoSource, 'commitStorageRetentionPage')
+  const storageRetentionWriteOwner = findFunction(browserRepoSource, 'writeStorageRetentionPage')
   const repositoryReapAttachment = findInterfaceMethod(
     repositorySource,
     'MutationContext',
@@ -9714,6 +9716,7 @@ function scopeDerivedMutationCapabilityFacts(
   const runtimeAttachmentDispositionText =
     runtimeReadAttachmentDispositionState.getText(mutationRuntimeSource)
   const storageRetentionCommitText = storageRetentionCommitOwner.getText(browserRepoSource)
+  const storageRetentionWriteText = storageRetentionWriteOwner.getText(browserRepoSource)
   const attachmentReapConstructors = constructors.get('attachment.reap') ?? []
   const storageMaintenanceText = storageMaintenanceSource.getText()
   const attachmentReapCommon = Object.freeze({
@@ -9767,9 +9770,13 @@ function scopeDerivedMutationCapabilityFacts(
       attachmentReapExtensionText.includes(
         'receipt.absorb(await commitStorageRetentionPage(tx, cycle, outcome))',
       ) &&
+      storageRetentionCommitText.includes(
+        'const written = await writeStorageRetentionPage(tx, previous, cycle, outcome)',
+      ) &&
       storageRetentionCommitText.includes("tableName: 'storageRetentionState'") &&
       storageRetentionCommitText.includes("operation: 'get'") &&
-      storageRetentionCommitText.includes("operation: 'write'"),
+      storageRetentionWriteText.includes("tableName: 'storageRetentionState'") &&
+      storageRetentionWriteText.includes("operation: 'write'"),
     completeTransactionProfile:
       compileScopesText.includes("['attachmentCatalogAggregate', 'attachmentCatalogRows']") &&
       compileScopesText.includes(

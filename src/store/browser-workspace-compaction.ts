@@ -1,4 +1,9 @@
-import Dexie, { type IndexableType, type Table, type Transaction } from 'dexie'
+import Dexie, {
+  type IndexableType,
+  type PromiseExtended,
+  type Table,
+  type Transaction,
+} from 'dexie'
 import {
   type BrowserWorkspaceCompactionAttemptClaim,
   claimBrowserWorkspaceCompactionAttempt,
@@ -39,6 +44,7 @@ import {
 import { estimateStoredValueBytes } from './storage-size-estimate'
 import { readBrowserWorkspaceMeta, readBrowserWorkspaceMetaFromTransaction } from './workspace-meta'
 import {
+  isWorkspaceForegroundDemandInterruptedError,
   isWorkspaceMaintenancePreemptedError,
   type WorkspaceRuntimeActionOptions,
 } from './workspace-runtime'
@@ -65,7 +71,7 @@ class BrowserWorkspaceCompactionCatchupBudgetExceededError extends Error {
 
 type DestinationTransactionRunner = <T>(
   tableNames: readonly string[],
-  operation: (transaction: Transaction) => Promise<T> | T,
+  operation: (transaction: Transaction) => PromiseExtended<T> | T,
 ) => Promise<T>
 
 export function browserWorkspaceCompactionSupported(): boolean {
@@ -88,7 +94,11 @@ export async function tryStartBrowserWorkspaceCompaction(
     },
     {
       prepare: async (destination, context): Promise<BrowserWorkspaceCompactionPrepared> => {
-        context.preactivationCheckpoint()
+        const checkpoint = async () => {
+          await context.awaitForegroundIdle()
+          context.preactivationCheckpoint()
+        }
+        await checkpoint()
         if (context.sourceDatabaseName === context.destinationDatabaseName) {
           throw new Error('BrowserWorkspaceCompactionRequiresSlots')
         }
@@ -98,15 +108,18 @@ export async function tryStartBrowserWorkspaceCompaction(
         }
         attemptState.claim = attempt.claim
         return context.withSourceDatabase(async (source) => {
+          await checkpoint()
           await activateBrowserWorkspaceCatchupJournals(source)
+          await checkpoint()
           const sourceWorkspace = await readBrowserWorkspaceMeta(source)
-          context.preactivationCheckpoint()
+          await checkpoint()
           let copied = await copyBrowserWorkspace(
             source,
             destination,
             context.runDestinationTransaction,
             context.signal,
-            context.preactivationCheckpoint,
+            checkpoint,
+            context.foregroundInterruptionSignal,
           )
           copied = await drainBrowserWorkspaceCatchup(
             source,
@@ -115,7 +128,7 @@ export async function tryStartBrowserWorkspaceCompaction(
             {
               mode: 'online',
               signal: context.signal,
-              preactivationCheckpoint: context.preactivationCheckpoint,
+              preactivationCheckpoint: checkpoint,
             },
           )
           return { sourceWorkspace, copied }
@@ -149,28 +162,31 @@ export async function tryStartBrowserWorkspaceCompaction(
                 preactivationCheckpoint: context.preactivationCheckpoint,
               },
             )
-            let workspace = sourceWorkspace
             context.preactivationCheckpoint()
-            await grant.runTransaction(
-              destination,
-              [destination.workspaceFence, destination.settings],
-              async (tx) => {
-                const copiedWorkspace = await readBrowserWorkspaceMetaFromTransaction(tx)
-                if (
-                  copiedWorkspace.workspaceId !== sourceWorkspace.workspaceId ||
-                  copiedWorkspace.replacementEpoch !== sourceWorkspace.replacementEpoch
-                ) {
-                  throw new Error('BrowserWorkspaceCompactionCopyChanged')
-                }
-                await tx
+            const copiedWorkspace = await runDestinationCompactionTransaction(
+              (tableNames, operation) => grant.runTransaction(destination, tableNames, operation),
+              'observe-final-workspace-meta',
+              ['workspaceFence'],
+              readBrowserWorkspaceMetaFromTransaction,
+            )
+            if (
+              copiedWorkspace.workspaceId !== sourceWorkspace.workspaceId ||
+              copiedWorkspace.replacementEpoch !== sourceWorkspace.replacementEpoch
+            ) {
+              throw new Error('BrowserWorkspaceCompactionCopyChanged')
+            }
+            await runDestinationCompactionTransaction(
+              (tableNames, operation) => grant.runTransaction(destination, tableNames, operation),
+              'finalize-workspace-meta',
+              ['settings'],
+              (tx) =>
+                tx
                   .table<SettingsRow, string>('settings')
-                  .put(chatSidebarProjectionBackfillMarker())
-                workspace = await readBrowserWorkspaceMetaFromTransaction(tx)
-              },
+                  .put(chatSidebarProjectionBackfillMarker()),
             )
             copied = Object.freeze({ ...copied })
             return {
-              workspace,
+              workspace: copiedWorkspace,
               storageBaseline: { kind: 'carry-source', liveBytes: copied.estimatedLiveBytes },
               value: copied,
             }
@@ -207,7 +223,8 @@ async function copyBrowserWorkspace(
   destination: NatterDb,
   runDestinationTransaction: DestinationTransactionRunner,
   signal: AbortSignal,
-  preactivationCheckpoint: () => void,
+  preactivationCheckpoint: () => void | Promise<void>,
+  foregroundInterruptionSignal: () => AbortSignal,
 ): Promise<BrowserWorkspaceCompactionResult> {
   assertPhysicalStorageSchema(source)
   assertPhysicalStorageSchema(destination)
@@ -223,20 +240,27 @@ async function copyBrowserWorkspace(
   if (copyTableNames.some((name) => !destinationNames.has(name))) {
     throw new Error('BrowserWorkspaceCompactionSchemaMismatch')
   }
-  preactivationCheckpoint()
-  await runDestinationTransaction(clearTableNames, (tx) =>
-    Dexie.Promise.all(clearTableNames.map((name) => tx.table(name).clear())).then(() => undefined),
+  await preactivationCheckpoint()
+  await runDestinationCompactionTransaction(
+    runDestinationTransaction,
+    'clear-destination',
+    clearTableNames,
+    (tx) =>
+      Dexie.Promise.all(clearTableNames.map((name) => tx.table(name).clear())).then(
+        () => undefined,
+      ),
   )
   let copiedRows = 0
   let estimatedLiveBytes = 0
   for (const name of copyTableNames) {
-    preactivationCheckpoint()
+    await preactivationCheckpoint()
     const result = await copyTable(
       source,
       name,
       runDestinationTransaction,
       signal,
       preactivationCheckpoint,
+      foregroundInterruptionSignal,
     )
     copiedRows = saturatingAdd(copiedRows, result.copiedRows)
     estimatedLiveBytes = saturatingAdd(estimatedLiveBytes, result.estimatedLiveBytes)
@@ -249,16 +273,24 @@ async function copyTable(
   tableName: PhysicalStorageTableName,
   runDestinationTransaction: DestinationTransactionRunner,
   signal: AbortSignal,
-  preactivationCheckpoint: () => void,
+  preactivationCheckpoint: () => void | Promise<void>,
+  foregroundInterruptionSignal: () => AbortSignal,
 ): Promise<BrowserWorkspaceCompactionResult> {
   const source = sourceDb.table<unknown, IndexableType>(tableName)
   let after: IndexableType | undefined
   let copiedRows = 0
   let estimatedLiveBytes = 0
   for (;;) {
-    preactivationCheckpoint()
-    const page = await readCopyPage(source, after, signal)
+    await preactivationCheckpoint()
+    let page: Awaited<ReturnType<typeof readCopyPage>>
+    try {
+      page = await readCopyPage(source, after, signal, foregroundInterruptionSignal())
+    } catch (error) {
+      if (isWorkspaceForegroundDemandInterruptedError(error)) continue
+      throw error
+    }
     if (page.rows.length === 0) break
+    await preactivationCheckpoint()
     const rows = await filterCompactionRows(sourceDb, tableName, page.rows)
     const keyPath = (
       sourceDb.table(tableName).schema.primKey as unknown as {
@@ -269,9 +301,12 @@ async function copyTable(
       throw new Error(`BrowserWorkspaceCompactionOutboundPrimaryKey:${tableName}`)
     }
     if (rows.length > 0) {
-      preactivationCheckpoint()
-      await runDestinationTransaction([tableName], (tx) =>
-        tx.table<unknown, IndexableType>(tableName).bulkPut(rows),
+      await preactivationCheckpoint()
+      await runDestinationCompactionTransaction(
+        runDestinationTransaction,
+        `copy-table:${tableName}`,
+        [tableName],
+        (tx) => tx.table<unknown, IndexableType>(tableName).bulkPut(rows),
       )
       copiedRows = saturatingAdd(copiedRows, rows.length)
       for (const row of rows) {
@@ -293,7 +328,7 @@ async function drainBrowserWorkspaceCatchup(
   options: {
     readonly mode: 'online' | 'final'
     readonly signal: AbortSignal
-    readonly preactivationCheckpoint: () => void
+    readonly preactivationCheckpoint: () => void | Promise<void>
   },
 ): Promise<BrowserWorkspaceCompactionResult> {
   let copiedRows = initial.copiedRows
@@ -303,7 +338,7 @@ async function drainBrowserWorkspaceCatchup(
   for (const tableName of BROWSER_WORKSPACE_CATCHUP_SOURCE_TABLE_NAMES) {
     let after: string | undefined
     for (;;) {
-      options.preactivationCheckpoint()
+      await options.preactivationCheckpoint()
       const page = await readBrowserWorkspaceCatchupPage(source, tableName, after, options.signal)
       if (page.scannedRows === 0) break
       if (options.mode === 'final') {
@@ -321,10 +356,12 @@ async function drainBrowserWorkspaceCatchup(
         tableName,
         page.entries,
         runDestinationTransaction,
+        options.preactivationCheckpoint,
       )
       copiedRows = adjustCount(copiedRows, applied.rowDelta)
       estimatedLiveBytes = adjustCount(estimatedLiveBytes, applied.byteDelta)
       if (options.mode === 'online') {
+        await options.preactivationCheckpoint()
         await acknowledgeBrowserWorkspaceCatchupPage(source, tableName, page.entries)
       }
       after = page.lastId
@@ -369,49 +406,121 @@ async function readBrowserWorkspaceCatchupPage(
 }> {
   if (signal.aborted) throw compactionReadError(signal.reason)
   const journalName = browserWorkspaceCatchupJournalTableName(tableName)
-  return source.transaction(
-    'r',
-    [source.table(tableName), source.table(journalName)],
-    async (tx) => {
-      const journalTable = tx.table<BrowserWorkspaceCatchupJournalRow, string>(journalName)
-      const rows = await (after === undefined
-        ? journalTable.where(':id').above(BROWSER_WORKSPACE_CATCHUP_ACTIVE_ID)
-        : journalTable.where(':id').above(after)
+  const backend = source.backendDB() as IDBDatabase | null
+  if (!backend) throw new Error('BrowserWorkspaceCompactionSourceClosed')
+  return new Promise<{
+    readonly entries: readonly {
+      readonly journal: BrowserWorkspaceCatchupJournalRow
+      readonly sourceValue: unknown
+    }[]
+    readonly lastId?: string
+    readonly scannedRows: number
+    readonly estimatedBytes: number
+  }>((resolve, reject) => {
+    const transaction = backend.transaction([journalName, tableName], 'readonly')
+    const journalStore = transaction.objectStore(journalName)
+    const sourceStore = transaction.objectStore(tableName)
+    const cursorRequest = journalStore.openCursor(
+      after === undefined
+        ? IDBKeyRange.lowerBound(BROWSER_WORKSPACE_CATCHUP_ACTIVE_ID, true)
+        : IDBKeyRange.lowerBound(after, true),
+    )
+    const rows: BrowserWorkspaceCatchupJournalRow[] = []
+    const sourceValues: unknown[] = []
+    let sourceReadsScheduled = false
+    let settled = false
+    const cleanup = () => signal.removeEventListener('abort', abortForLifetime)
+    const fail = (error?: unknown) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      reject(
+        compactionTransactionError(
+          `read-catchup:${tableName}`,
+          error ??
+            cursorRequest.error ??
+            transaction.error ??
+            new Error('BrowserWorkspaceCompactionCatchupReadFailed'),
+        ),
       )
-        .limit(COMPACTION_COPY_MAX_PAGE_ROWS)
-        .toArray()
-      const entries: {
-        journal: BrowserWorkspaceCatchupJournalRow
-        sourceValue: unknown
-      }[] = []
-      let estimatedBytes = 0
-      let lastId: string | undefined
-      const sourceTable = tx.table<unknown, IndexableType>(tableName)
-      for (const journal of rows) {
-        if (signal.aborted) throw compactionReadError(signal.reason)
-        const current = await journalTable.get(journal.id)
-        if (current?.revision !== journal.revision) {
+    }
+    const abortForLifetime = () => {
+      try {
+        transaction.abort()
+      } catch {
+        fail(signal.reason)
+        return
+      }
+      fail(signal.reason)
+    }
+    const scheduleSourceReads = () => {
+      if (sourceReadsScheduled) return
+      sourceReadsScheduled = true
+      rows.forEach((journal, index) => {
+        const request = sourceStore.get(journal.sourceKey as IDBValidKey)
+        request.onerror = () => fail(request.error)
+        request.onsuccess = () => {
+          sourceValues[index] = request.result
+        }
+      })
+    }
+    signal.addEventListener('abort', abortForLifetime, { once: true })
+    transaction.onerror = () => fail()
+    transaction.onabort = () => fail()
+    transaction.oncomplete = () => {
+      if (settled) return
+      try {
+        const entries: {
+          journal: BrowserWorkspaceCatchupJournalRow
+          sourceValue: unknown
+        }[] = []
+        let estimatedBytes = 0
+        let lastId: string | undefined
+        for (let index = 0; index < rows.length; index += 1) {
+          const journal = rows[index] as BrowserWorkspaceCatchupJournalRow
+          const sourceValue = sourceValues[index]
+          const rowBytes = sourceValue === undefined ? 0 : estimateStoredValueBytes(sourceValue)
+          if (entries.length > 0 && estimatedBytes + rowBytes > COMPACTION_COPY_MAX_PAGE_BYTES) {
+            break
+          }
+          entries.push({ journal, sourceValue })
+          estimatedBytes = saturatingAdd(estimatedBytes, rowBytes)
           lastId = journal.id
-          continue
+          if (estimatedBytes >= COMPACTION_COPY_MAX_PAGE_BYTES) break
         }
-        const sourceValue = await sourceTable.get(journal.sourceKey as IndexableType)
-        const rowBytes = sourceValue === undefined ? 0 : estimateStoredValueBytes(sourceValue)
-        if (entries.length > 0 && estimatedBytes + rowBytes > COMPACTION_COPY_MAX_PAGE_BYTES) {
-          break
+        settled = true
+        cleanup()
+        resolve({
+          entries,
+          ...(lastId === undefined ? {} : { lastId }),
+          scannedRows: rows.length,
+          estimatedBytes,
+        })
+      } catch (error) {
+        fail(error)
+      }
+    }
+    cursorRequest.onerror = () => fail(cursorRequest.error)
+    cursorRequest.onsuccess = () => {
+      try {
+        const cursor = cursorRequest.result
+        if (!cursor || rows.length >= COMPACTION_COPY_MAX_PAGE_ROWS) {
+          scheduleSourceReads()
+          return
         }
-        entries.push({ journal, sourceValue })
-        estimatedBytes = saturatingAdd(estimatedBytes, rowBytes)
-        lastId = journal.id
-        if (estimatedBytes >= COMPACTION_COPY_MAX_PAGE_BYTES) break
+        rows.push(cursor.value as BrowserWorkspaceCatchupJournalRow)
+        if (rows.length >= COMPACTION_COPY_MAX_PAGE_ROWS) scheduleSourceReads()
+        else cursor.continue()
+      } catch (error) {
+        fail(error)
+        try {
+          transaction.abort()
+        } catch {
+          // The transaction may have already aborted because the callback threw.
+        }
       }
-      return {
-        entries,
-        ...(lastId === undefined ? {} : { lastId }),
-        scannedRows: rows.length,
-        estimatedBytes,
-      }
-    },
-  )
+    }
+  })
 }
 
 async function deactivateSourceCatchupJournals(sourceDatabaseName: string): Promise<void> {
@@ -432,36 +541,51 @@ async function applyBrowserWorkspaceCatchupPage(
     readonly sourceValue: unknown
   }[],
   runDestinationTransaction: DestinationTransactionRunner,
+  preactivationCheckpoint: () => void | Promise<void>,
 ): Promise<{ readonly rowDelta: number; readonly byteDelta: number }> {
   if (entries.length === 0) return { rowDelta: 0, byteDelta: 0 }
   const presentValues = entries.flatMap(({ sourceValue }) =>
     sourceValue === undefined ? [] : [sourceValue],
   )
+  await preactivationCheckpoint()
   const retainedValues = new Set(await filterCompactionRows(source, tableName, presentValues))
-  return runDestinationTransaction([tableName], async (tx) => {
-    const table = tx.table<unknown, IndexableType>(tableName)
-    const keys = entries.map(({ journal }) => journal.sourceKey as IndexableType)
-    const previous = await table.bulkGet(keys)
-    const puts: unknown[] = []
-    const deletes: IndexableType[] = []
-    let rowDelta = 0
-    let byteDelta = 0
-    entries.forEach(({ journal, sourceValue }, index) => {
-      const prior = previous[index]
-      const next =
-        sourceValue !== undefined && retainedValues.has(sourceValue) ? sourceValue : undefined
-      if (next === undefined) deletes.push(journal.sourceKey as IndexableType)
-      else puts.push(next)
-      if (prior === undefined && next !== undefined) rowDelta += 1
-      else if (prior !== undefined && next === undefined) rowDelta -= 1
-      byteDelta +=
-        (next === undefined ? 0 : estimateStoredValueBytes(next)) -
-        (prior === undefined ? 0 : estimateStoredValueBytes(prior))
-    })
-    if (puts.length > 0) await table.bulkPut(puts)
-    if (deletes.length > 0) await table.bulkDelete(deletes)
-    return { rowDelta, byteDelta }
+  const keys = entries.map(({ journal }) => journal.sourceKey as IndexableType)
+  await preactivationCheckpoint()
+  const previous = await runDestinationCompactionTransaction(
+    runDestinationTransaction,
+    `observe-catchup:${tableName}`,
+    [tableName],
+    (tx) => tx.table<unknown, IndexableType>(tableName).bulkGet(keys),
+  )
+  const puts: unknown[] = []
+  const deletes: IndexableType[] = []
+  let rowDelta = 0
+  let byteDelta = 0
+  entries.forEach(({ journal, sourceValue }, index) => {
+    const prior = previous[index]
+    const next =
+      sourceValue !== undefined && retainedValues.has(sourceValue) ? sourceValue : undefined
+    if (next === undefined) deletes.push(journal.sourceKey as IndexableType)
+    else puts.push(next)
+    if (prior === undefined && next !== undefined) rowDelta += 1
+    else if (prior !== undefined && next === undefined) rowDelta -= 1
+    byteDelta +=
+      (next === undefined ? 0 : estimateStoredValueBytes(next)) -
+      (prior === undefined ? 0 : estimateStoredValueBytes(prior))
   })
+  await preactivationCheckpoint()
+  return runDestinationCompactionTransaction(
+    runDestinationTransaction,
+    `apply-catchup:${tableName}`,
+    [tableName],
+    (tx) => {
+      const table = tx.table<unknown, IndexableType>(tableName)
+      const writes: PromiseExtended<unknown>[] = []
+      if (puts.length > 0) writes.push(table.bulkPut(puts))
+      if (deletes.length > 0) writes.push(table.bulkDelete(deletes))
+      return Dexie.Promise.all(writes).then(() => ({ rowDelta, byteDelta }))
+    },
+  )
 }
 
 async function acknowledgeBrowserWorkspaceCatchupPage(
@@ -473,14 +597,52 @@ async function acknowledgeBrowserWorkspaceCatchupPage(
 ): Promise<void> {
   if (entries.length === 0) return
   const journalName = browserWorkspaceCatchupJournalTableName(tableName)
-  await source.transaction('rw', source.table(journalName), async (tx) => {
-    const table = tx.table<BrowserWorkspaceCatchupJournalRow, string>(journalName)
-    const current = await table.bulkGet(entries.map(({ journal }) => journal.id))
-    const acknowledged = entries.flatMap(({ journal }, index) =>
-      current[index]?.revision === journal.revision ? [journal.id] : [],
-    )
-    if (acknowledged.length > 0) await table.bulkDelete(acknowledged)
+  await runSourceCompactionTransaction(
+    source,
+    'rw',
+    [source.table(journalName)],
+    `acknowledge-catchup:${tableName}`,
+    (tx) => {
+      const table = tx.table<BrowserWorkspaceCatchupJournalRow, string>(journalName)
+      return table.bulkGet(entries.map(({ journal }) => journal.id)).then((current) => {
+        const acknowledged = entries.flatMap(({ journal }, index) =>
+          current[index]?.revision === journal.revision ? [journal.id] : [],
+        )
+        return acknowledged.length > 0 ? table.bulkDelete(acknowledged) : undefined
+      })
+    },
+  )
+}
+
+function runSourceCompactionTransaction<T>(
+  database: NatterDb,
+  mode: 'r' | 'rw',
+  tables: readonly Table[],
+  stage: string,
+  operation: (transaction: Transaction) => PromiseExtended<T> | T,
+): Promise<T> {
+  return database.transaction(mode, tables, operation).catch((error: unknown) => {
+    throw compactionTransactionError(stage, error)
   })
+}
+
+function runDestinationCompactionTransaction<T>(
+  run: DestinationTransactionRunner,
+  stage: string,
+  tableNames: readonly string[],
+  operation: (transaction: Transaction) => PromiseExtended<T> | T,
+): Promise<T> {
+  return run(tableNames, operation).catch((error: unknown) => {
+    throw compactionTransactionError(stage, error)
+  })
+}
+
+function compactionTransactionError(stage: string, reason: unknown): Error {
+  const error = compactionReadError(reason)
+  return new Error(
+    `BrowserWorkspaceCompactionTransactionFailed:${stage}:${error.name}:${error.message}`,
+    { cause: error },
+  )
 }
 
 async function filterCompactionRows(
@@ -534,6 +696,7 @@ function readCopyPage(
   source: Table<unknown, IndexableType>,
   after: IndexableType | undefined,
   signal: AbortSignal,
+  foregroundInterruptionSignal: AbortSignal,
 ): Promise<{
   readonly rows: unknown[]
   readonly primaryKeys: IndexableType[]
@@ -541,6 +704,9 @@ function readCopyPage(
   readonly estimatedBytes: number
 }> {
   if (signal.aborted) return Promise.reject(compactionReadError(signal.reason))
+  if (foregroundInterruptionSignal.aborted) {
+    return Promise.reject(compactionReadError(foregroundInterruptionSignal.reason))
+  }
   const backend = source.db.backendDB() as IDBDatabase | null
   if (!backend) throw new Error('BrowserWorkspaceCompactionSourceClosed')
   return new Promise((resolve, reject) => {
@@ -553,7 +719,10 @@ function readCopyPage(
     const primaryKeys: IndexableType[] = []
     let estimatedBytes = 0
     let settled = false
-    const cleanup = () => signal.removeEventListener('abort', abort)
+    const cleanup = () => {
+      signal.removeEventListener('abort', abortForLifetime)
+      foregroundInterruptionSignal.removeEventListener('abort', abortForForegroundDemand)
+    }
     const finish = () => {
       if (settled) return
       settled = true
@@ -580,16 +749,21 @@ function readCopyPage(
         ),
       )
     }
-    const abort = () => {
+    const abort = (reason: unknown) => {
       try {
         transaction.abort()
       } catch {
-        fail(signal.reason)
+        fail(reason)
         return
       }
-      fail(signal.reason)
+      fail(reason)
     }
-    signal.addEventListener('abort', abort, { once: true })
+    const abortForLifetime = () => abort(signal.reason)
+    const abortForForegroundDemand = () => abort(foregroundInterruptionSignal.reason)
+    signal.addEventListener('abort', abortForLifetime, { once: true })
+    foregroundInterruptionSignal.addEventListener('abort', abortForForegroundDemand, {
+      once: true,
+    })
     transaction.onerror = () => fail()
     transaction.onabort = () => fail()
     transaction.oncomplete = finish

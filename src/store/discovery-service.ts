@@ -121,7 +121,7 @@ async function resolveModelsDiscovery(
         profileId: target.profile.id,
         profileRevision: revision,
         queryKey,
-        fetchedAt: Date.now(),
+        fetchedAt: nextDiscoveryFetchedAt(cached),
         payload,
       }
       const publication = await publishDiscoveryRow(authority, target.revision, {
@@ -182,7 +182,7 @@ export async function resolveEndpointsDiscovery(
         profileId: target.profile.id,
         profileRevision: revision,
         modelId,
-        fetchedAt: Date.now(),
+        fetchedAt: nextDiscoveryFetchedAt(cached),
         payload,
       }
       await publishDiscoveryRow(authority, target.revision, {
@@ -234,7 +234,7 @@ export async function resolvePrivacyDiscovery(
       } catch (error) {
         throw new DiscoveryResolutionError(error, cached)
       }
-      const fetchedAt = Date.now()
+      const fetchedAt = nextDiscoveryFetchedAt(cached)
       const policies =
         Object.keys(result.raw.policies).length === 0 && hasPolicies && cachedPayload
           ? cachedPayload.policies
@@ -258,6 +258,10 @@ export async function resolvePrivacyDiscovery(
       return row
     },
   )
+}
+
+function nextDiscoveryFetchedAt(cached: { readonly fetchedAt: number } | undefined): number {
+  return Math.max(Date.now(), (cached?.fetchedAt ?? -1) + 1)
 }
 
 async function refreshPrivacyDiscovery(
