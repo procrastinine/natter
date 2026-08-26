@@ -19,7 +19,6 @@ export interface WorkspaceTabSessionSnapshot {
 
 const workspaceParticipants = new Set<WorkspaceTabSessionParticipant>()
 const listeners = new Set<() => void>()
-const claimedOneShotNotices = new Set<string>()
 let reconciledWorkspaceFence: string | null = null
 let revision = 0
 let snapshot: WorkspaceTabSessionSnapshot = Object.freeze({ revision, fence: null })
@@ -72,24 +71,6 @@ export function registerWorkspaceTabSessionParticipant(
 
 export function deleteChatFromWorkspaceTabSession(chatId: ChatId): void {
   for (const participant of [...workspaceParticipants]) participant.deleteChat?.(chatId)
-}
-
-export function claimWorkspaceTabOneShotNotice(key: string): boolean {
-  if (claimedOneShotNotices.has(key)) return false
-  const storage = browserSessionStorage()
-  if (storage) {
-    try {
-      if (storage.getItem(key)) {
-        claimedOneShotNotices.add(key)
-        return false
-      }
-      storage.setItem(key, '1')
-    } catch {
-      // The in-memory claim still guarantees one delivery for this mounted tab.
-    }
-  }
-  claimedOneShotNotices.add(key)
-  return true
 }
 
 export function workspaceTabSessionMatches(fence: WorkspaceFence): boolean {

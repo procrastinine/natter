@@ -64,7 +64,7 @@ describe('nested configuration protocol audit', () => {
       constructorSites: 47,
       reachableCommands: 44,
       resultVariants: 13,
-      resultConstructorSites: 107,
+      resultConstructorSites: 108,
       resultMappings: 44,
       problems: [],
     })

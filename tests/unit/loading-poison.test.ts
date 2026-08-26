@@ -128,7 +128,7 @@ describe('cold message-body repository boundary', () => {
   })
 
   it('keeps organized sidebar reads on projected chat metadata', async () => {
-    const seeded = await seedLinearChat({ count: 12, bodyLength: 20_000 })
+    const seeded = await seedLinearChat({ count: 12, bodyLength: 1_000_000 })
     const headers = captureReads<MessageHeaderRow>('messages')
     const bodies = captureReads<MessageBodyRow>('messageBodies')
 

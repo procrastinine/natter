@@ -106,7 +106,7 @@ test('committing a system prompt bumps updatedAt + metaVersion and leaves branch
   expect(settings.systemPrompt).toBe('System edit v1')
 })
 
-test('the one-off toast appears after the first edit and disappears on subsequent edits', async ({
+test('debounced system-prompt saves never interrupt the active editor with a notice', async ({
   page,
 }) => {
   await mockChatCompletions(page, {
@@ -117,18 +117,16 @@ test('the one-off toast appears after the first edit and disappears on subsequen
   await expect(page.locator('[data-ui="message"][data-role="assistant"]').first()).toBeVisible()
   await page.locator('[data-role="settings-cog"]').click()
   await page.locator('[data-ui="settings-tab"][data-tab="prompts"]').click()
-  await page.locator('[data-ui="system-prompt-textarea"]').fill('First system prompt')
-  await expect(page.locator('[data-ui="settings-toast"]')).toBeVisible({
-    timeout: 2000,
-  })
-  await expect(page.locator('[data-ui="settings-toast"]')).toContainText(
-    /takes effect on the next send/i,
-  )
-  await expect(page.locator('[data-ui="settings-toast"]')).toBeHidden({ timeout: 5000 })
+  const textarea = page.locator('[data-ui="system-prompt-textarea"]')
+  await textarea.fill('First system prompt')
   const chatId = await firstChatId(page)
-  await page.locator('[data-ui="system-prompt-textarea"]').fill('First system prompt — appended')
+  await expectChatSetting(page, chatId, 'systemPrompt', 'First system prompt')
+  await expect(textarea).toBeFocused()
+  await expect(page.locator('[data-ui="settings-toast"]')).toHaveCount(0)
+  await textarea.pressSequentially(' — appended')
   await expectChatSetting(page, chatId, 'systemPrompt', 'First system prompt — appended')
-  await expect(page.locator('[data-ui="settings-toast"]')).toBeHidden()
+  await expect(textarea).toBeFocused()
+  await expect(page.locator('[data-ui="settings-toast"]')).toHaveCount(0)
 })
 
 test('model discovery cannot move settings tabs under an in-progress gesture', async ({ page }) => {

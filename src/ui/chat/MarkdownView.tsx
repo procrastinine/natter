@@ -179,6 +179,8 @@ export function MarkdownView({
   }::single-newline-breaks=${
     renderingPrefs.singleNewlineHardBreaks ? 'on' : 'off'
   }::revision=${renderRevision ?? 'stable'}`
+  const streamingRendererKeyRef = useRef(baseRendererKey)
+  if (streaming) streamingRendererKeyRef.current = baseRendererKey
   const remarkPlugins = useMemo(
     () =>
       renderingPrefs.singleNewlineHardBreaks
@@ -199,23 +201,38 @@ export function MarkdownView({
       streamingMarkdownCacheMatches(cache, contentSegments)
     if (!finalizedStreamMatches) prefixSegmentCacheRef.current = null
   }
-  const finalizedStreamingSegments = useMemo(() => {
-    if (streaming || !contentSegments || contentSegments.length === 0) return null
+  const [reparsedTerminalSource, setReparsedTerminalSource] = useState<readonly string[] | null>(
+    null,
+  )
+  const terminalStreamingSegments = useMemo(() => {
+    if (
+      streaming ||
+      !contentSegments ||
+      contentSegments.length === 0 ||
+      reparsedTerminalSource === contentSegments
+    ) {
+      return null
+    }
     const cache = prefixSegmentCacheRef.current
     if (!cache || !streamingMarkdownCacheMatches(cache, contentSegments)) return null
-    return finalizedMarkdownSegments(cache)
-  }, [contentSegments, streaming])
+    return segmentMarkdownSections(contentSegments, prefixSegmentCacheRef)
+  }, [contentSegments, reparsedTerminalSource, streaming])
+  useEffect(() => {
+    if (!terminalStreamingSegments || !contentSegments) return
+    captureProgressiveStaticAnchor()
+    setReparsedTerminalSource(contentSegments)
+  }, [captureProgressiveStaticAnchor, contentSegments, terminalStreamingSegments])
   const progressiveStatic = useProgressiveStaticMarkdown(
     content,
     contentSegments,
-    streaming || finalizedStreamingSegments !== null,
+    streaming || terminalStreamingSegments !== null,
     captureProgressiveStaticAnchor,
   )
   const progressivePrefixRef = useVirtualSpacerHeight<HTMLDivElement>(
     estimatedMarkdownPrefixHeight(progressiveStatic.prefixLength),
   )
   const segments = useMemo(() => {
-    if (finalizedStreamingSegments) return finalizedStreamingSegments
+    if (terminalStreamingSegments) return terminalStreamingSegments
     if (progressiveStatic.pending) return []
     if (streaming && contentSegments && contentSegments.length > 0) {
       return segmentMarkdownSections(contentSegments, prefixSegmentCacheRef)
@@ -224,7 +241,7 @@ export function MarkdownView({
     return segmentMarkdown(progressiveStatic.content, streaming)
   }, [
     contentSegments,
-    finalizedStreamingSegments,
+    terminalStreamingSegments,
     progressiveStatic.content,
     progressiveStatic.pending,
     streaming,
@@ -269,7 +286,9 @@ export function MarkdownView({
             components={components}
             remarkPlugins={remarkPlugins}
             shikiTheme={shikiTheme}
-            rendererKey={`${baseRendererKey}::mode=${segmentMode}`}
+            rendererKey={`${
+              terminalStreamingSegments ? streamingRendererKeyRef.current : baseRendererKey
+            }::mode=${segmentMode}`}
           />
         )
       })}
@@ -526,24 +545,6 @@ function segmentMarkdownSections(
       id: `${cache.tailStart}-live`,
       content: cache.tailContent,
       streaming: true,
-    },
-  ]
-}
-
-function finalizedMarkdownSegments(cache: StreamingMarkdownSegmentCache): MarkdownSegment[] {
-  if (cache.frozenBlocks.length === 0) {
-    return [{ id: '0-live', content: cache.tailContent, streaming: false }]
-  }
-  return [
-    ...cache.frozenBlocks.map((block) => ({
-      id: `${block.start}-${block.end}`,
-      content: block.content,
-      streaming: false,
-    })),
-    {
-      id: `${cache.tailStart}-live`,
-      content: cache.tailContent,
-      streaming: false,
     },
   ]
 }

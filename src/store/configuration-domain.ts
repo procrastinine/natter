@@ -25,6 +25,7 @@ import {
 } from '../core/text-templates'
 import type {
   ChatId,
+  ChatPreset,
   ChatSettings,
   ConnectionProfile,
   PresetId,
@@ -91,6 +92,7 @@ export interface ConfigurationApplicationDependencies {
     chatId: ChatId,
     profileId: ProfileId,
   ) => Promise<ConfigurationProfileSwitchPlan | undefined>
+  readonly loadChatPreset: (presetId: PresetId) => Promise<ChatPreset | undefined>
   readonly pendingConfiguration?: Pick<
     ConfigurationController,
     | 'stageChatSettingsFields'
@@ -192,7 +194,12 @@ export interface ConfigurationApplication {
     sourceId: PresetId,
     options?: { copyId?: PresetId; name?: string; now?: number },
   ): Promise<ConfigurationDomainResult<'chat-preset.duplicate'>>
-  applyChatPreset(chatId: ChatId, presetId: PresetId, now?: number): Promise<boolean>
+  applyChatPreset(
+    chatId: ChatId,
+    presetId: PresetId,
+    now?: number,
+    isCurrent?: () => boolean,
+  ): Promise<boolean>
   saveChatPreset(input: {
     presetId: PresetId
     settings: ChatSettings
@@ -542,9 +549,25 @@ export function createConfigurationApplication(
         now: options.now ?? Date.now(),
       })
     },
-    async applyChatPreset(chatId, presetId, now = Date.now()) {
-      const result = await execute({ kind: 'chat-preset.apply', chatId, presetId, now })
-      return result.kind === 'chat-preset-saved' && result.chatChanged === true
+    async applyChatPreset(chatId, presetId, now = Date.now(), isCurrent) {
+      if (isCurrent && !isCurrent()) return false
+      const preset = await dependencies.loadChatPreset(presetId)
+      if (isCurrent && !isCurrent()) return false
+      if (!preset) {
+        throw new ConfigurationDomainError({ kind: 'missing', entity: 'chat-preset', id: presetId })
+      }
+      const staged = stagePendingChatPresetApply(chatId, preset, dependencies.pendingConfiguration)
+      try {
+        const result = await execute({ kind: 'chat-preset.apply', chatId, presetId, now })
+        if (result.kind === 'missing' || result.kind === 'conflict' || result.kind === 'invalid') {
+          throw new ConfigurationDomainError(result)
+        }
+        acknowledgePendingConfigurationCommand(staged, result, dependencies.pendingConfiguration)
+        return result.kind === 'chat-preset-saved' && result.chatChanged === true
+      } catch (error) {
+        rejectPendingConfigurationCommand(staged, dependencies.pendingConfiguration)
+        throw error
+      }
     },
     saveChatPreset(input) {
       return execute({
@@ -903,6 +926,22 @@ function stagedChatFieldAcknowledgement(
   }
 }
 
+function stagePendingChatPresetApply(
+  chatId: ChatId,
+  preset: ChatPreset,
+  pending: PendingConfigurationPort | undefined,
+): StagedPendingConfigurationCommand | null {
+  if (!pending) return null
+  const staged = pending.stageChatSettingsReplacement(chatId, preset.settings, preset.id)
+  return {
+    chatId,
+    acknowledgement: {
+      promptFields: [],
+      chatSettingsReplacement: { revision: staged.revision },
+    },
+  }
+}
+
 function acknowledgePendingConfigurationCommand(
   staged: StagedPendingConfigurationCommand | null,
   result: ConfigurationDomainResult,
@@ -924,7 +963,9 @@ function acknowledgePendingConfigurationCommand(
       : staged.acknowledgement.workspaceSettings
   pending.acknowledgePendingConfiguration(staged.chatId, {
     ...staged.acknowledgement,
-    ...((result.kind === 'chat-updated' || result.kind === 'prompt-preset-saved') &&
+    ...((result.kind === 'chat-updated' ||
+      result.kind === 'chat-preset-saved' ||
+      result.kind === 'prompt-preset-saved') &&
     result.configurationVersion !== undefined
       ? { acceptedChatConfigurationVersion: result.configurationVersion }
       : {}),

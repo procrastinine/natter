@@ -118,14 +118,14 @@ describe('production workspace protocol audit', () => {
         variants: 16,
         exclusiveVariants: 2,
         admissionFunctions: 7,
-        finiteAdmissions: 112,
+        finiteAdmissions: 113,
         unboundedAdmissions: 0,
         capabilityEscapes: 0,
       },
       problems: [],
     })
     expect(report.protocols.WorkspaceQuery).toMatchObject({
-      ingressSites: 100,
+      ingressSites: 101,
       dependencyProbeSites: 5,
       unclassifiedSites: 0,
       missingIngress: [],
@@ -194,10 +194,13 @@ describe('production workspace protocol audit', () => {
     )
 
     const report = audit.evaluateProductionProtocol(changed)
+    const dependencyProbeCount = changed.protocols.WorkspaceQuery.constructorSites.filter(
+      (site) => site.variant === probeVariant && site.role === 'dependency-probe',
+    ).length
 
     expect(report.ok).toBe(false)
     expect(report.problems).toContain(
-      `WorkspaceQuery.${probeVariant}: no typed production ingress (2 dependency probes only)`,
+      `WorkspaceQuery.${probeVariant}: no typed production ingress (${dependencyProbeCount} dependency probes only)`,
     )
   })
 

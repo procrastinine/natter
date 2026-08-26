@@ -693,6 +693,9 @@ function applicationDependencies(
     async loadProfileSwitchPlan() {
       return undefined
     },
+    async loadChatPreset() {
+      return undefined
+    },
     pendingConfiguration: configurationController,
   }
 }

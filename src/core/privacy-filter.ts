@@ -16,7 +16,7 @@
 // and produces a decision. The scraper and hook layers feed it; the
 // request composer consumes `buildWireProviderPrivacy`.
 
-import { privacyPolicyTierRank, synthesizeDataPolicy } from './privacy'
+import { dominates, synthesizeDataPolicy } from './privacy'
 import { fallbackDataPolicyForEndpoint } from './privacy-fallbacks'
 import {
   ProviderEndpointIndex,
@@ -123,12 +123,11 @@ export function filterEndpointsByPrivacy(input: PrivacyFilterInput): PrivacyFilt
   // endpoint is dominated iff some OTHER scoped endpoint dominates it.
   let kept = afterDeny
   if (privacy.paretoFilter) {
-    let bestTier = Number.POSITIVE_INFINITY
-    for (const aug of afterDeny) {
-      if (aug.policy) bestTier = Math.min(bestTier, privacyPolicyTierRank(aug.policy))
-    }
     const undominated = afterDeny.filter(
-      (aug) => aug.policy && privacyPolicyTierRank(aug.policy) === bestTier,
+      (endpoint) =>
+        !afterDeny.some(
+          (candidate) => candidate !== endpoint && dominates(candidate.policy, endpoint.policy),
+        ),
     )
     const undominatedSet = new Set(undominated)
     for (const aug of afterDeny) {

@@ -74,7 +74,7 @@ test('large streamed turns do not recycle the transcript after completion', asyn
   }
 })
 
-test('ordinary composer send appends user and streaming assistant while keeping the terminal resident', async ({
+test('ordinary composer send keeps the terminal resident and reparses the final document', async ({
   page,
 }, testInfo) => {
   const scenario = await createFakeStreamScenario({
@@ -158,11 +158,6 @@ test('ordinary composer send appends user and streaming assistant while keeping 
       ;(node as HTMLElement & { retainedAcrossFinalization?: true }).retainedAcrossFinalization =
         true
     })
-    await retainedStreamingPrefix.evaluate((node) => {
-      ;(node as HTMLElement & { retainedAcrossFinalization?: true }).retainedAcrossFinalization =
-        true
-    })
-
     await waitForAssistantGenerationFinished(page, chatId, 4)
     await expect.poll(() => scenario.snapshot().then((state) => state.activeStreams)).toBe(0)
     const assistants = (await readMessages(page, chatId)).filter(
@@ -173,6 +168,10 @@ test('ordinary composer send appends user and streaming assistant while keeping 
     await expect(messageList).toHaveAttribute('data-rendered-count', '10')
     await expect(region).toHaveAttribute('data-scroll-state', 'follow')
     await expect.poll(() => scrollDistanceFromBottom(region)).toBeLessThanOrEqual(4)
+    await expect(streamingMarkdownRoot).toHaveAttribute('data-overflow', 'full')
+    const finalizedSegments = streamingMarkdownRoot.locator('[data-ui="markdown-segment"]')
+    await expect(finalizedSegments).toHaveCount(1)
+    await expect(finalizedSegments).toHaveAttribute('data-mode', 'static')
     expect(
       await streamedAssistant.evaluate((node) => {
         const retained = (element: Element | null) =>
@@ -183,20 +182,9 @@ test('ordinary composer send appends user and streaming assistant while keeping 
           message: retained(node),
           body: retained(node.querySelector('[data-ui="message-body"]')),
           markdown: retained(node.querySelector('[data-ui="markdown"]')),
-          frozenPrefix: retained(
-            node.querySelector('[data-ui="markdown-segment"][data-mode="static"]'),
-          ),
         }
       }),
-    ).toEqual({ message: true, body: true, markdown: true, frozenPrefix: true })
-    await expect(streamingMarkdownRoot).toHaveAttribute('data-overflow', 'streaming-segmented')
-    expect(
-      await streamingMarkdownRoot
-        .locator('[data-ui="markdown-segment"]')
-        .evaluateAll((segments) =>
-          segments.every((segment) => segment.getAttribute('data-mode') === 'static'),
-        ),
-    ).toBe(true)
+    ).toEqual({ message: true, body: true, markdown: true })
     const finalizedMetrics = await region.evaluate((node) => ({
       distanceFromBottom: node.scrollHeight - node.scrollTop - node.clientHeight,
       scrollTop: node.scrollTop,
@@ -241,8 +229,13 @@ test('ordinary composer send appends user and streaming assistant while keeping 
 })
 
 test('physical scrolling inside a growing streamed message preserves the visible text through completion', async ({
+  browserName,
   page,
 }) => {
+  if (browserName === 'chromium') {
+    const session = await page.context().newCDPSession(page)
+    await session.send('Emulation.setCPUThrottlingRate', { rate: 4 })
+  }
   const scenario = await createFakeStreamScenario({
     targetChars: 220_000,
     reasoningChars: 0,
@@ -438,7 +431,11 @@ async function installStreamViewportProbe(
             : caret.startContainer.parentElement
           )?.closest<HTMLElement>('[data-ui="markdown-segment"]') ?? null
         if (!segment || !markdown.contains(segment)) return null
-        let priorLength = 0
+        const progressivePrefixLength = Number(
+          markdown.querySelector<HTMLElement>('[data-ui="markdown-progressive-prefix"]')?.dataset
+            .length ?? '0',
+        )
+        let priorLength = progressivePrefixLength
         for (const candidate of markdown.querySelectorAll<HTMLElement>(
           '[data-ui="markdown-segment"]',
         )) {
@@ -448,9 +445,12 @@ async function installStreamViewportProbe(
         const prefix = document.createRange()
         prefix.selectNodeContents(segment)
         prefix.setEnd(caret.startContainer, caret.startOffset)
-        const textLength = Array.from(
-          markdown.querySelectorAll<HTMLElement>('[data-ui="markdown-segment"]'),
-        ).reduce((sum, candidate) => sum + Number(candidate.dataset.length ?? '0'), 0)
+        const textLength =
+          progressivePrefixLength +
+          Array.from(markdown.querySelectorAll<HTMLElement>('[data-ui="markdown-segment"]')).reduce(
+            (sum, candidate) => sum + Number(candidate.dataset.length ?? '0'),
+            0,
+          )
         return {
           characterOffset: priorLength + prefix.toString().length,
           messageTop: messageRect.top,

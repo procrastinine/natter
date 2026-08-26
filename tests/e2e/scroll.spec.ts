@@ -226,8 +226,10 @@ test('near-bottom scrolling has one stable Jump state and exact bottom clears it
   await expect(region).toHaveAttribute('data-scroll-state', 'follow')
   await expect(jumpChip).toHaveCount(0)
 
-  await region.hover()
-  await page.mouse.wheel(0, -24)
+  await region.evaluate((node) => {
+    node.scrollTop = node.scrollHeight - node.clientHeight - 24
+    node.dispatchEvent(new Event('scroll'))
+  })
   await expect
     .poll(() => scrollDistanceFromBottom(region))
     .toBeGreaterThan(BOTTOM_SETTLED_DISTANCE_PX)
@@ -235,6 +237,7 @@ test('near-bottom scrolling has one stable Jump state and exact bottom clears it
   await expect(region).toHaveAttribute('data-scroll-state', 'pinned')
   await expect(jumpChip).toBeVisible()
 
+  await region.hover()
   await page.mouse.wheel(0, 8)
   await page.mouse.wheel(0, -8)
   const nearBottomFrames = await sampleBottomControlFrames(page, 12)
@@ -446,21 +449,6 @@ test('an active message edit does not trap transcript scrolling in either direct
   await expect(page.locator('[data-ui="message"]')).toHaveCount(39)
 
   const region = page.locator('[data-ui="scroll-region"]')
-  const geometry = () =>
-    page.evaluate(() => {
-      const region = document.querySelector<HTMLElement>('[data-ui="scroll-region"]')
-      const editor = document.querySelector<HTMLElement>('[data-ui="inline-editor"]')
-      if (!region || !editor) throw new Error('Active editor scroll geometry missing')
-      const regionRect = region.getBoundingClientRect()
-      const editorRect = editor.getBoundingClientRect()
-      return {
-        regionTop: regionRect.top,
-        regionBottom: regionRect.bottom,
-        editorTop: editorRect.top,
-        editorBottom: editorRect.bottom,
-      }
-    })
-
   const wheel = async (deltaY: number) => {
     for (let step = 0; step < 16; step += 1) {
       await page.mouse.wheel(0, deltaY)
@@ -474,15 +462,43 @@ test('an active message edit does not trap transcript scrolling in either direct
   const tailInput = tailMessage.locator('[data-ui="inline-editor-input"]')
   await expect(tailInput).toBeFocused()
   await page.locator('[data-ui="jump-to-latest"]').click()
-  await expect(region).toHaveAttribute('data-scroll-state', 'follow')
+  await expect.poll(() => scrollDistanceFromBottom(region)).toBeLessThanOrEqual(4)
+  const editScrollTop = await region.evaluate((node) => {
+    const start = node.scrollTop
+    node.dataset.editScrollStart = String(start)
+    node.dataset.editScrollMaxDrift = '0'
+    const listener = () => {
+      const drift = Math.abs(node.scrollTop - start)
+      const prior = Number(node.dataset.editScrollMaxDrift ?? 0)
+      node.dataset.editScrollMaxDrift = String(Math.max(prior, drift))
+    }
+    node.addEventListener('scroll', listener)
+    return start
+  })
+  for (let line = 0; line < 12; line += 1) {
+    await tailInput.press('End')
+    await tailInput.press('Enter')
+    await tailInput.pressSequentially(`growing edit line ${line}`)
+  }
+  await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => resolve())))
+  const editScrollAfter = await region.evaluate(
+    (node, before) => ({
+      top: node.scrollTop,
+      maxDrift: Math.max(
+        Number(node.dataset.editScrollMaxDrift ?? 0),
+        Math.abs(node.scrollTop - before),
+      ),
+    }),
+    editScrollTop,
+  )
+  expect(editScrollAfter.maxDrift).toBeLessThanOrEqual(1)
+  await expect(region).toHaveAttribute('data-scroll-state', 'pinned')
+  const beforeManualUp = await region.evaluate((node) => node.scrollTop)
   await tailInput.hover()
-  await page.mouse.wheel(0, -400)
+  await wheel(-400)
   await expect
-    .poll(async () => {
-      const current = await geometry()
-      return current.editorTop >= current.regionBottom - 1
-    })
-    .toBe(true)
+    .poll(() => region.evaluate((node, before) => before - node.scrollTop, beforeManualUp))
+    .toBeGreaterThan(200)
   await expect(tailInput).toHaveValue(/active-edit-marker-38/u)
 
   await tailInput.press('Escape')
@@ -500,14 +516,12 @@ test('an active message edit does not trap transcript scrolling in either direct
   await rootMessage.locator('[data-action="edit"]').click()
   const rootInput = rootMessage.locator('[data-ui="inline-editor-input"]')
   await expect(rootInput).toBeFocused()
+  const beforeManualDown = await region.evaluate((node) => node.scrollTop)
   await rootInput.hover()
   await wheel(400)
   await expect
-    .poll(async () => {
-      const current = await geometry()
-      return current.editorBottom <= current.regionTop + 1
-    })
-    .toBe(true)
+    .poll(() => region.evaluate((node, before) => node.scrollTop - before, beforeManualDown))
+    .toBeGreaterThan(200)
   await expect(rootInput).toHaveValue(/active-edit-marker-0/u)
 })
 

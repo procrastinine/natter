@@ -16,6 +16,11 @@ interface ResizeObserverFixture {
   active: boolean
 }
 
+interface IntersectionObserverFixture {
+  callback: IntersectionObserverCallback
+  active: boolean
+}
+
 interface RegionFixture {
   region: HTMLElement
   ref: React.RefObject<ScrollRegionHandle | null>
@@ -43,9 +48,11 @@ function CommandProbe({
 
 describe('ScrollRegion continuity lease', () => {
   let resizeObservers: ResizeObserverFixture[]
+  let intersectionObservers: IntersectionObserverFixture[]
 
   beforeEach(() => {
     resizeObservers = []
+    intersectionObservers = []
     vi.stubGlobal(
       'ResizeObserver',
       class {
@@ -54,6 +61,25 @@ describe('ScrollRegion continuity lease', () => {
         constructor(callback: ResizeObserverCallback) {
           this.fixture = { callback, active: false }
           resizeObservers.push(this.fixture)
+        }
+
+        observe() {
+          this.fixture.active = true
+        }
+
+        disconnect() {
+          this.fixture.active = false
+        }
+      },
+    )
+    vi.stubGlobal(
+      'IntersectionObserver',
+      class {
+        private readonly fixture: IntersectionObserverFixture
+
+        constructor(callback: IntersectionObserverCallback) {
+          this.fixture = { callback, active: false }
+          intersectionObservers.push(this.fixture)
         }
 
         observe() {
@@ -74,6 +100,12 @@ describe('ScrollRegion continuity lease', () => {
   function deliverResize(): void {
     for (const observer of resizeObservers) {
       if (observer.active) observer.callback([], {} as ResizeObserver)
+    }
+  }
+
+  function deliverIntersection(): void {
+    for (const observer of intersectionObservers) {
+      if (observer.active) observer.callback([], {} as IntersectionObserver)
     }
   }
 
@@ -654,7 +686,7 @@ describe('ScrollRegion continuity lease', () => {
     })
     const anchorBottom = target.getBoundingClientRect().bottom
     expect(fixture.commands().getLayoutAnchorMessageId()).toBe('command-target')
-    expect(fixture.ref.current?.getState()).toBe('follow')
+    expect(fixture.ref.current?.getState()).toBe('pinned')
     act(() => {
       fixture.region.dispatchEvent(new Event('scrollend'))
     })
@@ -667,9 +699,9 @@ describe('ScrollRegion continuity lease', () => {
 
     expect(fixture.region.scrollTop).toBe(1_136)
     expect(target.getBoundingClientRect().bottom).toBe(anchorBottom)
-    expect(fixture.ref.current?.getState()).toBe('follow')
+    expect(fixture.ref.current?.getState()).toBe('pinned')
     await act(nextTask)
-    expect(fixture.region.dataset.scrollState).toBe('follow')
+    expect(fixture.region.dataset.scrollState).toBe('pinned')
   })
 
   it('reacquires stream ownership at exact bottom and follows later growth', async () => {
@@ -709,6 +741,45 @@ describe('ScrollRegion continuity lease', () => {
     await act(nextTask)
     expect(fixture.region.dataset.scrollState).toBe('pinned')
   })
+
+  it.each(['intersection', 'resize'] as const)(
+    'keeps pinned ownership when the %s observer records a terminal clamp before its native scroll',
+    async (firstObserver) => {
+      const fixture = setup({
+        streamActive: true,
+        autoScrollOnStream: true,
+        streamFollowKey: 'stream-a',
+      })
+      const target = fixture.region.querySelector<HTMLElement>('[data-message-id="command-target"]')
+      if (!target) throw new Error('Terminal collapse anchor target did not mount')
+      target.getBoundingClientRect = () =>
+        rect({
+          top: 2_420 - fixture.region.scrollTop,
+          bottom: 2_540 - fixture.region.scrollTop,
+        })
+      acquireOpen(fixture, 3_000)
+      await pinByWheel(fixture, 2_500)
+      act(() => {
+        fixture.region.dispatchEvent(new Event('scrollend'))
+      })
+
+      act(() => {
+        fixture.setHeight(1_181)
+        fixture.region.scrollTop = 1_081
+        fixture.rerender({ streamActive: false })
+        if (firstObserver === 'intersection') deliverIntersection()
+        else deliverResize()
+        fireEvent.scroll(fixture.region)
+        if (firstObserver === 'intersection') deliverResize()
+        else deliverIntersection()
+      })
+
+      expect(fixture.region.scrollTop).toBe(1_081)
+      expect(fixture.ref.current?.getState()).toBe('pinned')
+      await act(nextTask)
+      expect(fixture.region.dataset.scrollState).toBe('pinned')
+    },
+  )
 
   it('clears a stale pinned control when layout places the viewport at bottom', async () => {
     const fixture = setup()
@@ -1199,6 +1270,43 @@ describe('ScrollRegion continuity lease', () => {
     })
     expect(fixture.region.scrollTop).toBe(720)
     expect(target.getBoundingClientRect().bottom).toBe(100)
+  })
+
+  it('gives an active text editor exclusive ownership against automatic layout scrolling', () => {
+    const fixture = setup()
+    acquireOpen(fixture)
+    const release = fixture.commands().claimTextEditingViewport()
+    const before = fixture.region.scrollTop
+
+    act(() => {
+      fixture.commands().preserveTextEditingViewport(() => {
+        fixture.setHeight(1_500)
+        fixture.region.scrollTop = 1_400
+      })
+      deliverResize()
+    })
+
+    expect(fixture.region.scrollTop).toBe(before)
+    expect(fixture.ref.current?.getState()).toBe('pinned')
+
+    act(() => {
+      fixture.region.scrollTop = 640
+      fireEvent.scroll(fixture.region)
+    })
+    expect(fixture.region.scrollTop).toBe(before)
+
+    act(() => {
+      fireEvent.wheel(fixture.region, { deltaY: -400 })
+      fixture.region.scrollTop = 240
+      fireEvent.scroll(fixture.region)
+    })
+    expect(fixture.region.scrollTop).toBe(240)
+    expect(fixture.ref.current?.getState()).toBe('pinned')
+
+    act(() => fixture.commands().scrollTextEditingViewportBy(160))
+    expect(fixture.region.scrollTop).toBe(400)
+
+    act(release)
   })
 
   it('uses ResizeObserver as the sole delayed-layout observer', async () => {

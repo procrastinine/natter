@@ -178,7 +178,6 @@ const TEMPORAL_INVENTORY = {
       'src/ui/chat/MessageActions.tsx|markCopied|setTimeout|COPY_CONFIRM_MS|1',
       'src/ui/chat/ToastTray.tsx|timers|setTimeout|remaining|1',
       'src/ui/primitives/LiveRegions.tsx|revealFrame|setTimeout|ANNOUNCEMENT_DWELL_MS|1',
-      'src/ui/settings/PromptPresetEditor.tsx|showFirstEditToast|setTimeout|4000|1',
       'src/ui/sidebar/ChatList.tsx|markRecentMove|setTimeout|1400|1',
     ],
     durations: [

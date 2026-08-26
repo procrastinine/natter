@@ -760,18 +760,6 @@ export const ORIGIN_STORAGE_NAMESPACES = Object.freeze([
       accessPaths: ['src/lib/preload-recovery.ts'],
     },
   ),
-  namespace(
-    'session-system-prompt-notice',
-    'session-storage-key',
-    'natter:system-prompt-toast-shown',
-    'src/ui/settings/PromptPresetEditor.tsx',
-    {
-      ownership: 'One per-tab one-shot UI notice marker.',
-      normalReclamation: 'Bounded to one key and expires with the tab session.',
-      wipeCoverage: 'per-tab-session-clear',
-      accessPaths: ['src/store/workspace-tab-session.ts', 'src/ui/settings/PromptPresetEditor.tsx'],
-    },
-  ),
   namespace('cache-storage-all', 'cache-storage', '*', 'src/lib/storage-wipe.ts', {
     ownership:
       'No production Natter writer; Clear all treats every same-origin cache as owned cleanup scope.',

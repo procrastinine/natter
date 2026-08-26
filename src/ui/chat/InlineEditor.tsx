@@ -184,11 +184,31 @@ export function InlineEditor({
     el.setSelectionRange(end, end)
     const actions = actionsRef.current
     if (actions) scrollRegionCommands?.revealNearest(actions)
+    return scrollRegionCommands?.claimTextEditingViewport()
+  }, [scrollRegionCommands])
+  useEffect(() => {
+    const textarea = textareaRef.current
+    if (!textarea || !scrollRegionCommands) return
+    const onWheel = (event: WheelEvent) => {
+      const canScrollInternally =
+        event.deltaY < 0
+          ? textarea.scrollTop > 0
+          : textarea.scrollTop + textarea.clientHeight < textarea.scrollHeight - 1
+      if (canScrollInternally) return
+      event.preventDefault()
+      scrollRegionCommands.scrollTextEditingViewportBy(event.deltaY, event.deltaMode)
+    }
+    textarea.addEventListener('wheel', onWheel, { passive: false })
+    return () => textarea.removeEventListener('wheel', onWheel)
   }, [scrollRegionCommands])
   // biome-ignore lint/correctness/useExhaustiveDependencies: text changes alter textarea scrollHeight.
   useLayoutEffect(() => {
-    autosize(textareaRef.current)
-  }, [text])
+    if (scrollRegionCommands) {
+      scrollRegionCommands.preserveTextEditingViewport(() => autosize(textareaRef.current))
+    } else {
+      autosize(textareaRef.current)
+    }
+  }, [scrollRegionCommands, text])
   useLayoutEffect(() => {
     const el = textareaRef.current
     if (!el || typeof ResizeObserver === 'undefined') return
@@ -200,11 +220,15 @@ export function InlineEditor({
     const observer = new ResizeObserver(([entry]) => {
       if (!entry || Math.abs(entry.contentRect.width - measuredWidth) < 0.5) return
       measuredWidth = entry.contentRect.width
-      autosize(el)
+      if (scrollRegionCommands) {
+        scrollRegionCommands.preserveTextEditingViewport(() => autosize(el))
+      } else {
+        autosize(el)
+      }
     })
     observer.observe(el)
     return () => observer.disconnect()
-  }, [])
+  }, [scrollRegionCommands])
 
   const togglePrefill = useCallback(() => {
     if (prefillOpen) {

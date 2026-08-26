@@ -571,6 +571,45 @@ describe('ParamForm hosted tools', () => {
 })
 
 describe('ChatModelPanel context tab', () => {
+  it('closes the preset menu as soon as the selection is owned', async () => {
+    const profile = await createStoredProfile({
+      name: 'OpenRouter',
+      kind: 'openrouter',
+      baseUrl: 'https://openrouter.ai/api/v1',
+    })
+    const firstSettings = cloneDefaultChatSettings()
+    firstSettings.profileId = profile.id
+    firstSettings.model = 'openai/gpt-4o'
+    const secondSettings = structuredClone(firstSettings)
+    secondSettings.model = 'anthropic/claude-3.5-sonnet'
+    const first = await createConfigurationChatPreset({
+      name: 'First',
+      connectionProfileId: profile.id,
+      settings: firstSettings,
+    })
+    const second = await createConfigurationChatPreset({
+      name: 'Second',
+      connectionProfileId: profile.id,
+      settings: secondSettings,
+    })
+    const chat = await createChat({ settings: firstSettings, presetId: first.id })
+
+    render(
+      <ChatModelPanel
+        chatSnapshot={chat}
+        profileSnapshot={profile}
+        modelCatalog={modelCatalogFor(chat, profile)}
+        onClose={() => undefined}
+      />,
+    )
+
+    fireEvent.click(await screen.findByRole('button', { name: /Preset:/ }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Second' }))
+
+    expect(screen.queryByRole('menu')).toBeNull()
+    await waitFor(async () => expect((await getChat(chat.id))?.presetId).toBe(second.id))
+  })
+
   it('renders the OpenAI Responses store toggle on the Model tab and persists it', async () => {
     const profile = await createStoredProfile({
       name: 'OpenAI',

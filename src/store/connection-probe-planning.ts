@@ -45,13 +45,15 @@ export async function createConnectionProbePlanningResources(
           ? undefined
           : normalizeModelsResponse(input.modelsPayload),
       ),
-    resolveEndpoints: async (modelId, options = {}) =>
-      normalizeEndpointsResponse(
+    resolveEndpoints: async (modelId, options = {}) => {
+      if (options.refresh === false) return null
+      return normalizeEndpointsResponse(
         await fetchEndpoints({ profile: input.profile, apiKey: input.apiKey }, modelId, {
           timeoutMs: 15_000,
           ...(options.signal ? { signal: options.signal } : {}),
         }),
-      ),
+      )
+    },
     resolvePrivacy: async (modelId, options) => {
       if (!options.refresh) return { policies: {}, offlineFallback: false }
       try {

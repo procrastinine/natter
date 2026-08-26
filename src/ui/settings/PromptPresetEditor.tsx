@@ -8,7 +8,7 @@
 // chat only" is the default); the preset picker offers load / overwrite /
 // save-as-new / rename / delete.
 import type { ReactNode } from 'react'
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
+import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from 'react'
 import { estimateTokensByTokenizer } from '../../core/tokens'
 import type { Chat, ChatSettings, PromptPresetKind } from '../../core/types'
 import { usePromptPresetCatalog } from '../../hooks/useConfigurationCatalog'
@@ -19,7 +19,6 @@ import {
   currentActiveConfigurationSelection,
 } from '../../store/configuration-controller'
 import type { ConfigurationPromptPresetCatalogRow } from '../../store/presentation-contracts'
-import { claimWorkspaceTabOneShotNotice } from '../../store/workspace-tab-session'
 import { useToastStore } from '../../store/zustand/toastStore'
 import { Button, IconButton } from '../primitives/Button'
 import { InfoDisclosure } from './InfoDisclosure'
@@ -45,7 +44,6 @@ interface SlotState {
   loadPreviousPresets: () => void
   loadMorePresets: () => void
   tokens: number
-  toastVisible: boolean
   pickerOpen: boolean
   setPickerOpen: (v: boolean) => void
   flushDraft: () => Promise<void>
@@ -58,9 +56,6 @@ interface SlotState {
 
 interface UsePromptSlotOpts {
   showTokens: boolean
-  // When set, a one-off toast fires the first time the user commits a local
-  // edit in this browser session. Claimed by the tab-session owner.
-  firstEditToastKey?: string
 }
 
 function usePromptSlot(
@@ -72,11 +67,8 @@ function usePromptSlot(
   const storedText = (chat.settings[slot.textKey] as string | undefined) ?? ''
   const pinnedId = chat.settings[slot.pinKey] as string | undefined
 
-  const mountedRef = useRef(true)
   const [estimateText, setEstimateText] = useState(storedText)
   const [pickerOpen, setPickerOpen] = useState(false)
-  const [toastVisible, setToastVisible] = useState(false)
-  const toastTimerRef = useRef<number | null>(null)
 
   const configuration = useSyncExternalStore(
     configurationController.subscribe,
@@ -98,17 +90,6 @@ function usePromptSlot(
       : EMPTY_PROMPT_PRESET_ROWS
   const pushToast = useToastStore((s) => s.push)
 
-  const showFirstEditToast = useCallback(() => {
-    if (!opts.firstEditToastKey || !claimWorkspaceTabOneShotNotice(opts.firstEditToastKey)) return
-    if (!mountedRef.current) return
-    setToastVisible(true)
-    if (toastTimerRef.current !== null) window.clearTimeout(toastTimerRef.current)
-    toastTimerRef.current = window.setTimeout(() => {
-      toastTimerRef.current = null
-      if (mountedRef.current) setToastVisible(false)
-    }, 4000)
-  }, [opts.firstEditToastKey])
-
   const edit = useSettledConfigurationEdit({
     ownerChatId: chat.id,
     fieldKey: `prompt.${kind}`,
@@ -116,8 +97,7 @@ function usePromptSlot(
     settleMs: SAVE_DEBOUNCE_MS,
     stage: (text) => configurationController.stagePromptField(chat.id, kind, text),
     async commit(text) {
-      const result = await configurationApplication.commitPromptText(chat.id, kind, text)
-      if (result.kind === 'prompt-preset-saved') showFirstEditToast()
+      await configurationApplication.commitPromptText(chat.id, kind, text)
     },
   })
   const draft = edit.value
@@ -129,14 +109,6 @@ function usePromptSlot(
   }, [draft, opts.showTokens])
 
   const flushDraft = edit.flush
-
-  useEffect(() => {
-    mountedRef.current = true
-    return () => {
-      mountedRef.current = false
-      if (toastTimerRef.current !== null) window.clearTimeout(toastTimerRef.current)
-    }
-  }, [])
 
   const pinnedPreset = useMemo(
     () =>
@@ -258,7 +230,6 @@ function usePromptSlot(
     loadPreviousPresets: presetCatalogResult.demandBefore,
     loadMorePresets: presetCatalogResult.demandAfter,
     tokens,
-    toastVisible,
     pickerOpen,
     setPickerOpen,
     flushDraft,
@@ -274,8 +245,6 @@ function usePromptSlot(
 // System prompt — the per-chat instructions the model sees first.
 // ---------------------------------------------------------------------------
 
-const SYSTEM_PROMPT_TOAST_KEY = 'natter:system-prompt-toast-shown'
-
 export function SystemPromptEditor({
   chat,
   defaultCollapsed = false,
@@ -288,10 +257,7 @@ export function SystemPromptEditor({
     textKey: 'systemPrompt',
     pinKey: 'systemPromptPresetId',
   }
-  const s = usePromptSlot(chat, slot, {
-    showTokens: true,
-    firstEditToastKey: SYSTEM_PROMPT_TOAST_KEY,
-  })
+  const s = usePromptSlot(chat, slot, { showTokens: true })
   const [expanded, setExpanded] = useState(!defaultCollapsed)
   return (
     <section
@@ -334,31 +300,23 @@ export function SystemPromptEditor({
         ) : null}
       </div>
       {expanded ? (
-        <>
-          {s.toastVisible ? (
-            <div data-ui="settings-toast" role="status">
-              System prompt updated, it takes effect on the next send. Earlier responses used the
-              previous prompt.
-            </div>
-          ) : null}
-          <div data-ui="field-group">
-            <label htmlFor="system-prompt-textarea" data-ui="visually-hidden">
-              System prompt
-            </label>
-            <textarea
-              id="system-prompt-textarea"
-              data-ui="system-prompt-textarea"
-              value={s.draft}
-              onChange={(e) => s.setDraft(e.target.value)}
-              onBlur={() => void s.flushDraft().catch(() => undefined)}
-              rows={8}
-              spellCheck
-            />
-            <span data-ui="system-prompt-token-estimate" aria-live="polite">
-              ~{s.tokens.toLocaleString()} tokens
-            </span>
-          </div>
-        </>
+        <div data-ui="field-group">
+          <label htmlFor="system-prompt-textarea" data-ui="visually-hidden">
+            System prompt
+          </label>
+          <textarea
+            id="system-prompt-textarea"
+            data-ui="system-prompt-textarea"
+            value={s.draft}
+            onChange={(e) => s.setDraft(e.target.value)}
+            onBlur={() => void s.flushDraft().catch(() => undefined)}
+            rows={8}
+            spellCheck
+          />
+          <span data-ui="system-prompt-token-estimate" aria-live="polite">
+            ~{s.tokens.toLocaleString()} tokens
+          </span>
+        </div>
       ) : null}
     </section>
   )

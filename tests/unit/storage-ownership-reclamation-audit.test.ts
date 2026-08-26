@@ -72,7 +72,7 @@ describe('storage ownership and reclamation architecture audit', () => {
         seed: 39,
       },
       interchangeActionCounts: { omit: 44, portable: 18, rebuild: 15, seed: 4 },
-      namespaceCount: 20,
+      namespaceCount: 19,
       lifecycleCount: 19,
       coordinationCount: 6,
       gapCount: 4,

@@ -213,8 +213,8 @@ describe('MarkdownView', () => {
     expect(spacer.style.getPropertyValue('--virtual-spacer-height')).toBe(`${expectedHeight}px`)
   })
 
-  it('finalizes an unchanged long stream without replacing its frozen prefix', () => {
-    const content = `# Heading\n\n${'x'.repeat(160_000)}`
+  it('reparses the joined terminal document instead of retaining frozen stream seams', () => {
+    const content = `# Heading\n\n${'word '.repeat(8_000)}\n\nTerminal paragraph`
     const { container, rerender } = render(
       <MarkdownView content="" contentSegments={[content]} streaming renderRevision={1} />,
     )
@@ -222,23 +222,21 @@ describe('MarkdownView', () => {
       '[data-ui="markdown-segment"][data-mode="static"]',
     )
     if (!frozenPrefix) throw new Error('streaming prefix did not freeze')
-    const streamingSegmentCount = container.querySelectorAll('[data-ui="markdown-segment"]').length
     frozenPrefix.dataset.finalizationAnchor = 'retained'
 
     rerender(
       <MarkdownView content="" contentSegments={[content]} streaming={false} renderRevision={2} />,
     )
 
-    expect(container.querySelector('[data-finalization-anchor="retained"]')).toBe(frozenPrefix)
+    expect(container.querySelector('[data-finalization-anchor="retained"]')).toBeNull()
     expect(container.querySelector('[data-overflow="progressive-static"]')).toBeNull()
-    expect(container.querySelectorAll('[data-ui="markdown-segment"]')).toHaveLength(
-      streamingSegmentCount,
+    expect(container.querySelectorAll('[data-ui="markdown-segment"]')).toHaveLength(1)
+    expect(container.querySelector('[data-ui="markdown-segment"]')?.getAttribute('data-mode')).toBe(
+      'static',
     )
-    expect(
-      Array.from(container.querySelectorAll('[data-ui="markdown-segment"]')).every(
-        (segment) => segment.getAttribute('data-mode') === 'static',
-      ),
-    ).toBe(true)
+    expect(Array.from(container.querySelectorAll('p')).at(-1)?.textContent).toBe(
+      'Terminal paragraph',
+    )
   })
 
   it('blocks images from unlisted origins with a visible fallback', () => {

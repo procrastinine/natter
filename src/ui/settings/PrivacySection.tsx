@@ -1,6 +1,6 @@
 // Renders inline inside the Providers section on the Model tab. Exposes the
 // axes the picker itself can't surface:
-//   - `paretoFilter` — turn off the tier-based auto-exclusion
+//   - `paretoFilter` — turn off category-first, within-category Pareto exclusion
 //   - `zdrOnly` — route only through ZDR-tagged endpoints
 //   - `allowFallbacks` — provider-only retry within the current allowed set
 // These live in `chat.settings.privacy` / `chat.settings.allowFallbacks`.
@@ -89,7 +89,7 @@ export function PrivacySection({ chat }: PrivacySectionProps) {
             <span data-ui="privacy-toggle-copy">
               <span data-ui="privacy-toggle-title">
                 <strong>Pareto filter</strong>
-                <InfoDisclosure title="Auto-exclude providers dominated by a stricter sibling, such as Google Vertex when Google AI Studio is also available. Turn this off to offer every non-training provider and pick manually." />
+                <InfoDisclosure title="Keep the best privacy category, then auto-exclude providers dominated within it, such as 30-day retention when another provider in the same category requires the same user IDs but retains nothing. Turn this off to offer every non-training provider and pick manually." />
               </span>
             </span>
           </label>

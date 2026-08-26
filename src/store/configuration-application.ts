@@ -1,4 +1,4 @@
-import type { ChatId, ProfileId } from '../core/types'
+import type { ChatId, PresetId, ProfileId } from '../core/types'
 import { executeConfigurationCommand } from './configuration-command-client'
 import { configurationController } from './configuration-controller'
 import { createConfigurationApplication } from './configuration-domain'
@@ -11,6 +11,7 @@ const configurationDomainApplication = createConfigurationApplication({
   port: { execute: executeConfigurationCommand },
   prepareKey: prepareEncryptedKey,
   loadProfileSwitchPlan: readConfigurationProfileSwitchPlan,
+  loadChatPreset: readConfigurationChatPreset,
   pendingConfiguration: configurationController,
 })
 
@@ -24,5 +25,22 @@ async function readConfigurationProfileSwitchPlan(
     getWorkspaceRepository()
       .query(authority, { kind: 'configuration.profile-switch-plan', chatId, profileId })
       .then((envelope) => envelope.value),
+  )
+}
+
+async function readConfigurationChatPreset(presetId: PresetId) {
+  return runWorkspaceRead('repository-query', (authority) =>
+    getWorkspaceRepository()
+      .query(authority, {
+        kind: 'configuration.active-selection',
+        target: {
+          kind: 'chat',
+          profileId: null,
+          presetId,
+          promptPresets: [],
+          textTemplateId: null,
+        },
+      })
+      .then((envelope) => envelope.value.preset ?? undefined),
   )
 }

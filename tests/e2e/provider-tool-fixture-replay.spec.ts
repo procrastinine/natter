@@ -343,6 +343,7 @@ test('tool evidence supports per-item visibility and assistant Edit authors prov
     .first()
     .fill('{"editedFromProviderFixture":true}')
   await assistant.locator('[data-ui="inline-editor-input"]').fill('provider-output edit')
+  await toolAuthoring.locator('summary').click()
   await assistant.locator('[data-role="save"]').click()
 
   await expect(assistant.locator('[data-ui="message-body"]')).toContainText('provider-output edit')

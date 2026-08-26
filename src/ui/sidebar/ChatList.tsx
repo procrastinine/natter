@@ -135,6 +135,7 @@ type SidebarVirtualRow =
       kind: 'folder-empty'
       key: string
       depth: SidebarRowDepth
+      text?: string
     }
 
 interface VirtualRowOptions {
@@ -292,6 +293,41 @@ function estimateSidebarVirtualTotalSize(
   collapsed: boolean,
 ): number {
   return rows.reduce((sum, row) => sum + estimateSidebarVirtualRowSize(row, collapsed), 0)
+}
+
+function projectFolderIntentRows(
+  rows: readonly SidebarVirtualRow[],
+  collapsedFolderIds: ReadonlySet<FolderId>,
+  replacementPending: boolean,
+): SidebarVirtualRow[] {
+  const projected: SidebarVirtualRow[] = []
+  let activeFolderId: FolderId | null = null
+  for (let index = 0; index < rows.length; index += 1) {
+    const row = rows[index] as SidebarVirtualRow
+    if (row.kind === 'folder') {
+      activeFolderId = row.folder.id
+      projected.push(row)
+      const next = rows[index + 1]
+      const nextIsFolderChild =
+        next?.kind !== 'folder' && next?.kind !== 'status' && next?.depth === 'folder'
+      if (replacementPending && !collapsedFolderIds.has(activeFolderId) && !nextIsFolderChild) {
+        projected.push({
+          kind: 'folder-empty',
+          key: `entry:folder:${activeFolderId}:pending`,
+          depth: 'folder',
+          text: 'Loading…',
+        })
+      }
+      continue
+    }
+    if ('depth' in row && row.depth === 'folder') {
+      if (activeFolderId && !collapsedFolderIds.has(activeFolderId)) projected.push(row)
+      continue
+    }
+    activeFolderId = null
+    projected.push(row)
+  }
+  return projected
 }
 
 export const ChatList = memo(function ChatList({
@@ -473,7 +509,7 @@ export const ChatList = memo(function ChatList({
       }))
     }
 
-    return model.presentationRows.map((row): SidebarVirtualRow => {
+    const rows = model.presentationRows.map((row): SidebarVirtualRow => {
       switch (row.kind) {
         case 'chat':
           return { ...row, chat: catalogChatPresentation(tab, row.chat) }
@@ -486,7 +522,16 @@ export const ChatList = memo(function ChatList({
       }
       return assertNever(row)
     })
-  }, [model.presentationRows, searchActive, searchSession?.status, sortedSearchResults, tab])
+    return projectFolderIntentRows(rows, collapsedFolderIds, !model.interactive)
+  }, [
+    collapsedFolderIds,
+    model.interactive,
+    model.presentationRows,
+    searchActive,
+    searchSession?.status,
+    sortedSearchResults,
+    tab,
+  ])
   const loadedSidebarRowCount = searchActive ? virtualRows.length : model.loadedTotalRows
   const knownSidebarChatCount = searchActive ? virtualRows.length : model.exactVisibleChats
   const visibleVirtualRows = virtualRows
@@ -1210,7 +1255,7 @@ export const ChatList = memo(function ChatList({
             data-sidebar-row-key={row.key}
             data-sidebar-depth={row.depth === 'folder' ? 'folder' : undefined}
           >
-            Empty
+            {row.text ?? 'Empty'}
           </li>
         )
     }
@@ -1278,7 +1323,7 @@ export const ChatList = memo(function ChatList({
             data-index={virtual.index}
             ref={(node) => bindSidebarVirtualRow(node, virtual)}
           >
-            Empty
+            {row.text ?? 'Empty'}
           </li>
         )
     }

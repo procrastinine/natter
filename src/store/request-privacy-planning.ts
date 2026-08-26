@@ -5,9 +5,9 @@
 //
 // Unlike `usePrivacyRouting`, this is a plain async function suitable for
 // the send path -- no React dependency. It does not silently send through a
-// cold cache: OpenRouter sends either wait for live discovery, use an
-// already-cached fallback when refresh fails, or throw before the request is
-// fired if no provider list is available.
+// cold cache. Automatic routing may wait for live discovery; after the user
+// owns the checked-provider set, planning uses only the attempt's captured
+// discovery rows and known mandatory hard denies.
 //
 // OpenRouter-only by construction. Non-OpenRouter profiles get an early
 // null (the transform already gates on `gate('provider')`). Free models
@@ -90,10 +90,12 @@ export async function resolvePrivacyFactsForSend(
   if (profile.kind !== 'openrouter' || !chat.settings.model) {
     return { descriptor: null, policies: {}, offlineFallback: false }
   }
+  const manualSelection = chat.settings.providerPrefs?.ignoreOverridesFilter === true
   const descriptor = await ensureEndpointsDescriptor(
     input.resources,
     chat.settings.model,
     input.signal,
+    !manualSelection,
   )
   if (isFreeModel(chat.settings.model)) {
     return { descriptor, policies: {}, offlineFallback: false }
@@ -103,6 +105,7 @@ export async function resolvePrivacyFactsForSend(
     resources: input.resources,
     modelId: chat.settings.model,
     endpoints: descriptor?.endpoints ?? [],
+    refreshAllowed: !manualSelection,
     ...(input.signal ? { signal: input.signal } : {}),
   })
   return {
@@ -203,10 +206,11 @@ async function ensureEndpointsDescriptor(
   resources: AssistantPlanningResources,
   modelId: string,
   signal: AbortSignal | undefined,
+  refresh: boolean,
 ) {
   try {
     return await awaitSendDiscovery(signal, (operationSignal) =>
-      resources.resolveEndpoints(modelId, { signal: operationSignal }),
+      resources.resolveEndpoints(modelId, { refresh, signal: operationSignal }),
     )
   } catch (err) {
     throw new PrivacyDiscoveryUnavailableError(
@@ -221,15 +225,16 @@ async function ensurePrivacyPolicies(input: {
   resources: AssistantPlanningResources
   modelId: string
   endpoints: readonly { data_policy?: DataPolicy }[]
+  refreshAllowed: boolean
   signal?: AbortSignal
 }): Promise<{
   policies: Readonly<Record<string, DataPolicy>>
   offlineFallback: boolean
 }> {
-  const { profile, resources, modelId, endpoints, signal } = input
+  const { profile, resources, modelId, endpoints, refreshAllowed, signal } = input
   const needsScrape =
     profile.supportsPrivacyScrape !== false && endpoints.some((endpoint) => !endpoint.data_policy)
-  const refresh = needsScrape && !isCorsProxyDisabled(resources.proxy())
+  const refresh = refreshAllowed && needsScrape && !isCorsProxyDisabled(resources.proxy())
   return awaitSendDiscovery(signal, (operationSignal) =>
     resources.resolvePrivacy(modelId, {
       refresh,

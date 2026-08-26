@@ -841,8 +841,8 @@ describe('built-app runtime boundary', () => {
       'tools/debug-nuke.ts',
     ])
     expect(readText('src/lib/preload-recovery.ts')).toContain("'natter:preload-recovery-build'")
-    expect(readText('src/ui/settings/PromptPresetEditor.tsx')).toContain(
-      "'natter:system-prompt-toast-shown'",
+    expect(readText('src/ui/settings/PromptPresetEditor.tsx')).not.toContain(
+      'system-prompt-toast-shown',
     )
   })
 

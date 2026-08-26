@@ -87,6 +87,9 @@ export interface ScrollRegionCommands {
   } | null
   reconcileLayoutAnchor(): boolean
   applyVirtualizerOffset(offset: number, adjustment?: number): void
+  claimTextEditingViewport(): () => void
+  preserveTextEditingViewport(change: () => void): void
+  scrollTextEditingViewportBy(deltaY: number, deltaMode?: number): void
 }
 
 const ScrollRegionCommandsContext = createContext<ScrollRegionCommands | null>(null)
@@ -479,6 +482,8 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
   const lastObservedScrollGeometryRef = useRef<ObservedScrollGeometry | null>(null)
   const userScrollIntentRef = useRef(false)
   const userScrollRevisionRef = useRef(0)
+  const textEditingViewportClaimsRef = useRef(0)
+  const textEditingViewportTopRef = useRef<number | null>(null)
   const instantScrollIntentRef = useRef<InstantScrollIntent | null>(null)
   const layoutCorrectionPendingRef = useRef(false)
   const smoothScrollIntentRef = useRef<SmoothScrollIntent | null>(null)
@@ -651,14 +656,28 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
       smoothScrollIntentRef.current = null
       const boundedTop = Math.max(0, Math.min(bottomScrollTop(container), top))
       const before = container.scrollTop
+      const pendingNativeLayoutClamp =
+        reason === 'layout-anchor' &&
+        continuityLeaseRef.current?.mode === 'preserve' &&
+        !userScrollIntentRef.current &&
+        lastNativeScrollTopRef.current !== null &&
+        Math.abs(lastNativeScrollTopRef.current - before) > 0.5
       container.scrollTop = boundedTop
       const actual = container.scrollTop
+      if (textEditingViewportClaimsRef.current > 0) {
+        textEditingViewportTopRef.current = actual
+      }
       lastNativeScrollTopRef.current = actual
       lastObservedScrollGeometryRef.current = {
         scrollHeight: container.scrollHeight,
         clientHeight: container.clientHeight,
       }
-      if (Math.abs(actual - before) > 0.5) recordInstantScrollIntent(actual, reason)
+      if (
+        (Math.abs(actual - before) > 0.5 || pendingNativeLayoutClamp) &&
+        reason !== 'text-edit-restore'
+      ) {
+        recordInstantScrollIntent(actual, reason)
+      }
       if (hasScrollDebugSink()) {
         debugScroll('position', { source: reason, targetTop: boundedTop })
       }
@@ -1187,6 +1206,44 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
     (source: PositionSource) => {
       const container = containerRef.current
       if (!container) return
+      if (textEditingViewportClaimsRef.current > 0) {
+        const intendedTop = textEditingViewportTopRef.current
+        const instantIntent = instantScrollIntentRef.current
+        const instantMatched = matchesInstantScrollIntent(instantIntent, container.scrollTop)
+        let acceptsNativeMovement = userScrollIntentRef.current || instantMatched
+        if (instantMatched) {
+          instantScrollIntentRef.current = instantIntent?.preserveThroughScrollEnd
+            ? {
+                ...instantIntent,
+                top: container.scrollTop,
+                scrollHeight: container.scrollHeight,
+              }
+            : null
+        } else if (smoothScrollIntentRef.current) {
+          const smooth = advanceSmoothScrollIntent(
+            smoothScrollIntentRef.current,
+            container.scrollTop,
+          )
+          smoothScrollIntentRef.current = smooth.next
+          acceptsNativeMovement = acceptsNativeMovement || smooth.programmatic
+        }
+        if (
+          source === 'scroll' &&
+          !acceptsNativeMovement &&
+          intendedTop !== null &&
+          Math.abs(container.scrollTop - intendedTop) > 0.5
+        ) {
+          writeScrollTopNow(intendedTop, 'text-edit-restore')
+        }
+        textEditingViewportTopRef.current = container.scrollTop
+        lastNativeScrollTopRef.current = container.scrollTop
+        lastObservedScrollGeometryRef.current = {
+          scrollHeight: container.scrollHeight,
+          clientHeight: container.clientHeight,
+        }
+        setScrollStateNow('pinned', 'text-edit', source === 'scroll')
+        return
+      }
       const previousNativeScrollTop = lastNativeScrollTopRef.current
       const previousGeometry = lastObservedScrollGeometryRef.current
       const distanceFromBottom =
@@ -1219,6 +1276,16 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
         previousGeometry !== null &&
         (Math.abs(previousGeometry.scrollHeight - container.scrollHeight) > 0.5 ||
           Math.abs(previousGeometry.clientHeight - container.clientHeight) > 0.5)
+      const passivePinnedLayoutClamp =
+        source !== 'scroll' &&
+        stateRef.current === 'pinned' &&
+        continuityLeaseRef.current?.mode === 'preserve' &&
+        !userScrollIntentRef.current &&
+        previousNativeScrollTop !== null &&
+        Math.abs(container.scrollTop - previousNativeScrollTop) > 0.5
+      if (passivePinnedLayoutClamp) {
+        recordInstantScrollIntent(container.scrollTop, 'layout-anchor')
+      }
       if (source === 'scroll') lastNativeScrollTopRef.current = container.scrollTop
       lastObservedScrollGeometryRef.current = {
         scrollHeight: container.scrollHeight,
@@ -1268,9 +1335,14 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
         viewportMovedUp &&
         (userScrollIntentRef.current ||
           (nativeViewportMoved && distanceFromBottom > BOTTOM_REACQUIRE_TOLERANCE_PX))
-      const next = userMovedAwayFromBottom
-        ? 'pinned'
-        : scrollStateFromPosition(container, thresholdRef.current, stateRef.current)
+      const preservesPinnedLease =
+        source !== 'scroll' &&
+        stateRef.current === 'pinned' &&
+        continuityLeaseRef.current?.mode === 'preserve'
+      const next =
+        userMovedAwayFromBottom || preservesPinnedLease
+          ? 'pinned'
+          : scrollStateFromPosition(container, thresholdRef.current, stateRef.current)
       if (hasScrollDebugSink()) {
         debugScroll('position', {
           source,
@@ -1334,8 +1406,10 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
       capturePinnedLayoutAnchor,
       clearProgrammaticScrollIntents,
       debugScroll,
+      recordInstantScrollIntent,
       rebasePreparedTransitionToUser,
       setScrollStateNow,
+      writeScrollTopNow,
     ],
   )
 
@@ -1378,6 +1452,11 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
     (source?: 'resize' | 'mutation') => {
       if (source) layoutCorrectionPendingRef.current = true
       if (!viewportActive || !documentVisibleRef.current) return
+      if (textEditingViewportClaimsRef.current > 0) {
+        layoutCorrectionPendingRef.current = false
+        setScrollStateNow('pinned', 'text-edit-layout')
+        return
+      }
       const pendingTransition = pendingPreparedTransitionRef.current
       if (
         pendingTransition !== null &&
@@ -1422,6 +1501,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
       reconcileFiniteFollowClaim,
       scrollToFollowPositionNow,
       semanticClaimFollowsGrowth,
+      setScrollStateNow,
       updateFromScrollPosition,
       viewportActive,
     ],
@@ -1485,6 +1565,46 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
         writeScrollTopNow(offset + adjustment, 'virtualizer-layout')
         correctContinuityLease()
       },
+      claimTextEditingViewport() {
+        const container = containerRef.current
+        if (textEditingViewportClaimsRef.current === 0) {
+          textEditingViewportTopRef.current = container?.scrollTop ?? null
+        }
+        textEditingViewportClaimsRef.current += 1
+        clearProgrammaticScrollIntents()
+        cancelViewportOwnership()
+        setScrollStateNow('pinned', 'text-edit', true)
+        let released = false
+        return () => {
+          if (released) return
+          released = true
+          textEditingViewportClaimsRef.current = Math.max(
+            0,
+            textEditingViewportClaimsRef.current - 1,
+          )
+          if (textEditingViewportClaimsRef.current === 0) {
+            textEditingViewportTopRef.current = null
+            updateFromScrollPosition('layout')
+          }
+        }
+      },
+      preserveTextEditingViewport(change) {
+        const container = containerRef.current
+        if (!container || textEditingViewportClaimsRef.current === 0) {
+          change()
+          return
+        }
+        const top = textEditingViewportTopRef.current ?? container.scrollTop
+        change()
+        writeScrollTopNow(top, 'text-edit-layout')
+      },
+      scrollTextEditingViewportBy(deltaY, deltaMode = 0) {
+        const container = containerRef.current
+        if (!container || textEditingViewportClaimsRef.current === 0) return
+        const scale = deltaMode === 1 ? 16 : deltaMode === 2 ? container.clientHeight : 1
+        writeScrollTopNow(container.scrollTop + deltaY * scale, 'text-edit-wheel')
+        setScrollStateNow('pinned', 'text-edit-wheel', true)
+      },
     }),
     [
       cancelViewportOwnership,
@@ -1493,6 +1613,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
       correctContinuityLease,
       installContinuityLease,
       setScrollStateNow,
+      updateFromScrollPosition,
       writeScrollTopNow,
     ],
   )

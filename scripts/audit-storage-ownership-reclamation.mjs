@@ -22,7 +22,6 @@ const REQUIRED_NAMESPACE_IDS = Object.freeze([
   'session-composer-draft',
   'session-active-seed',
   'session-preload-recovery',
-  'session-system-prompt-notice',
   'cache-storage-all',
   'opfs-all',
   'storage-buckets-all',

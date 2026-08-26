@@ -750,11 +750,6 @@ export const MODULE_COLLECTION_CONTRACTS = Object.freeze({
       'completion, cancellation, unsubscribe, or workspace quiesce removes each active entry',
     scope: 'module-registry',
   },
-  'src/store/workspace-tab-session.ts#claimedOneShotNotices': {
-    bound: 'bounded tab notices',
-    cleanup: 'the stated finite cap, eviction policy, or explicit reset bounds retention',
-    scope: 'module-registry',
-  },
   'src/store/workspace-tab-session.ts#listeners': {
     bound: 'live tab-session subscribers',
     cleanup: 'paired unsubscribe removes each listener; owner teardown clears the registry',

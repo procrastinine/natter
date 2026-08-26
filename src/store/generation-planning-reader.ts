@@ -84,7 +84,7 @@ export class GenerationPlanningReader implements AssistantPlanningResources {
 
   async resolveEndpoints(
     modelId: string,
-    options: { signal?: AbortSignal } = {},
+    options: { refresh?: boolean; signal?: AbortSignal } = {},
   ): Promise<EndpointsDescriptor | null> {
     let pending = this.endpointReads.get(modelId)
     if (!pending) {
@@ -96,9 +96,12 @@ export class GenerationPlanningReader implements AssistantPlanningResources {
 
   private async resolveEndpointsOnce(
     modelId: string,
-    options: { signal?: AbortSignal },
+    options: { refresh?: boolean; signal?: AbortSignal },
   ): Promise<EndpointsDescriptor | null> {
     const captured = this.snapshot.discovery.endpoints
+    if (options.refresh === false) {
+      return captured ? normalizeEndpointsResponse(captured.payload) : null
+    }
     if (capturedEndpointsRowIsFresh(captured)) {
       return normalizeEndpointsResponse(captured.payload)
     }

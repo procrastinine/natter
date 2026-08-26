@@ -29,7 +29,7 @@ export interface AssistantPlanningResources {
   readModels(query: ModelsQuery): Promise<readonly ModelListEntry[] | undefined>
   resolveEndpoints(
     modelId: string,
-    options?: { signal?: AbortSignal },
+    options?: { refresh?: boolean; signal?: AbortSignal },
   ): Promise<EndpointsDescriptor | null>
   resolvePrivacy(
     modelId: string,

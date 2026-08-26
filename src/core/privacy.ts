@@ -10,28 +10,43 @@ export function synthesizeDataPolicy(raw: DataPolicy | null | undefined): DataPo
   return structuredClone(UNKNOWN_POLICY)
 }
 
-// Tier-based dominance (per user spec 2026-04-19). `a` dominates `b` iff
-// `a` sits in a strictly better tier than `b` (green < yellow < orange <
-// red). Same-tier pairs don't dominate; the visible provider sort/manual
-// order decides request order. This replaces the old 4-dimensional check;
-// the tier computation already folds
-// training/retention/user-IDs into a single axis, and the user wants the
-// filter to auto-exclude the worse tier by default (e.g. Google Vertex
-// orange drops out when Google AI Studio yellow is present).
 export function dominates(a: DataPolicy | undefined, b: DataPolicy | undefined): boolean {
   if (!a || !b) return false
-  return privacyPolicyTierRank(a) < privacyPolicyTierRank(b)
+  const leftTier = privacyPolicyTierRank(a)
+  const rightTier = privacyPolicyTierRank(b)
+  if (leftTier !== rightTier) return leftTier < rightTier
+  const left = [
+    Number(a.training),
+    Number(a.trainingOpenRouter),
+    retentionRank(a),
+    Number(a.requiresUserIDs === true),
+  ]
+  const right = [
+    Number(b.training),
+    Number(b.trainingOpenRouter),
+    retentionRank(b),
+    Number(b.requiresUserIDs === true),
+  ]
+  return (
+    left.every((value, index) => value <= (right[index] as number)) &&
+    left.some((value, index) => value < (right[index] as number))
+  )
 }
 
-// Mirrors `privacyTierForPolicy` in `privacy-filter.ts`. Lower rank =
-// more private; `dominates` returns true when the caller has a lower
-// rank than the comparison target.
-export function privacyPolicyTierRank(p: DataPolicy): number {
-  if (p.training || p.trainingOpenRouter) return 3
-  const userIds = p.requiresUserIDs === true
-  const retainsUnknownPeriod = p.retainsPrompts && p.retentionDays === undefined
-  if (retainsUnknownPeriod) return 2
-  if (userIds) return 2
-  if (p.retainsPrompts) return 1
-  return 0
+function privacyPolicyTierRank(policy: DataPolicy): number {
+  if (policy.training || policy.trainingOpenRouter) return 3
+  if (
+    policy.requiresUserIDs === true ||
+    (policy.retainsPrompts && policy.retentionDays === undefined)
+  ) {
+    return 2
+  }
+  return policy.retainsPrompts ? 1 : 0
+}
+
+function retentionRank(policy: DataPolicy): number {
+  if (!policy.retainsPrompts) return 0
+  return policy.retentionDays === undefined
+    ? Number.POSITIVE_INFINITY
+    : 1 + Math.max(0, policy.retentionDays)
 }

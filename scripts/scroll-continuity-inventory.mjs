@@ -123,7 +123,7 @@ export const TRANSCRIPT_HEIGHT_PRODUCERS = Object.freeze([
   heightProducer(
     'stream-terminal-renderer-handoff',
     'src/ui/chat/MarkdownView.tsx',
-    'if (finalizedStreamingSegments) return finalizedStreamingSegments',
+    'return segmentMarkdown(progressiveStatic.content, streaming)',
     'stream',
     'follow-or-anchor',
   ),
@@ -207,7 +207,7 @@ export const TRANSCRIPT_HEIGHT_PRODUCERS = Object.freeze([
   heightProducer(
     'inline-editor-autosize',
     'src/ui/chat/InlineEditor.tsx',
-    'autosize(textareaRef.current)',
+    'preserveTextEditingViewport(() => autosize(textareaRef.current))',
     'user-control',
     'explicit-intent',
   ),
@@ -396,7 +396,7 @@ export const SCROLL_EXISTING_PROOFS = Object.freeze([
     'tests/e2e/scroll.spec.ts',
     "test('an active message edit does not trap transcript scrolling in either direction'",
     'browser',
-    'Covers ordinary edit scrolling, not Save and Send handoff to a newly streaming reply.',
+    'Covers stationary typing/autosize after initial reveal plus manual scrolling in both directions; Save and Send has a separate handoff proof.',
   ),
   proof(
     'stream-growth-unit-transition',

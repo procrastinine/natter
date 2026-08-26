@@ -175,6 +175,36 @@ describe('request privacy planning', () => {
     expect(result.wire?.order).toEqual(['azure'])
   })
 
+  it('does not refresh provider discovery after the user owns the checked set', async () => {
+    const selected = chat()
+    selected.settings.providerPrefs = {
+      ignore: ['openai'],
+      order: ['azure'],
+      ignoreOverridesFilter: true,
+    }
+    const resources = planningResources(descriptor(), {
+      azure: policy(),
+      openai: policy({ retainsPrompts: true, retentionDays: 30, requiresUserIDs: true }),
+    })
+
+    const result = await resolvePrivacyForSend({
+      chat: selected,
+      profile: profile(),
+      resources,
+    })
+
+    const endpointCall = vi.mocked(resources.resolveEndpoints).mock.calls[0]
+    expect(endpointCall?.[0]).toBe('openai/gpt-5.4')
+    expect(endpointCall?.[1]?.refresh).toBe(false)
+    expect(endpointCall?.[1]?.signal).toBeInstanceOf(AbortSignal)
+    const privacyCall = vi.mocked(resources.resolvePrivacy).mock.calls[0]
+    expect(privacyCall?.[0]).toBe('openai/gpt-5.4')
+    expect(privacyCall?.[1]?.refresh).toBe(false)
+    expect(privacyCall?.[1]?.signal).toBeInstanceOf(AbortSignal)
+    expect(result.wire?.ignore).toEqual(['openai'])
+    expect(result.wire?.order).toEqual(['azure'])
+  })
+
   it('keeps duplicate display names independently addressable by provider slug', () => {
     const duplicateNames = descriptor([
       endpoint('DeepInfra', 'deepinfra/fp8'),

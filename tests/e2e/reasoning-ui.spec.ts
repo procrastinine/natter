@@ -126,18 +126,25 @@ test('canonicalized Claude reasoning renders once in the UI and shows reasoning 
   await authoring
     .getByRole('textbox', { name: 'Edit plaintext reasoning' })
     .fill('User-authored detail')
+  await authoring.locator('summary').click()
   const toolAuthoring = assistant.locator('[data-ui="inline-editor-tool-calls"]')
   await toolAuthoring.locator('summary').click()
   await toolAuthoring
     .getByRole('textbox', { name: 'Edit tool call JSON or text' })
     .first()
     .fill('{"id":"reasoning-provider-output","query":"after"}')
+  const region = page.locator('[data-ui="scroll-region"]')
+  await page.locator('[data-ui="jump-to-latest"]').click()
+  await expect
+    .poll(() => region.evaluate((node) => node.scrollHeight - node.scrollTop - node.clientHeight))
+    .toBeLessThanOrEqual(4)
   await toolAuthoring.getByRole('button', { name: 'Delete tool call' }).nth(1).click()
   await toolAuthoring.getByRole('button', { name: 'Add tool call' }).click()
   await toolAuthoring
     .getByRole('textbox', { name: 'Edit tool call JSON or text' })
     .nth(1)
     .fill('{"authored":true}')
+  await toolAuthoring.locator('summary').click()
   await assistant.locator('[data-ui="attachment-hidden-input"]').setInputFiles({
     name: 'assistant-evidence.txt',
     mimeType: 'text/plain',

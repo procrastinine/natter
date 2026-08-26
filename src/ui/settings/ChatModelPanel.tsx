@@ -703,8 +703,11 @@ function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | u
 
   const loadPreset = useCallback(
     async (targetId: string) => {
-      await configurationApplication.applyChatPreset(chat.id, targetId)
+      const intent = configurationController.claimIntent()
       closePicker()
+      await configurationApplication.applyChatPreset(chat.id, targetId, undefined, () =>
+        configurationController.intentIsCurrent(intent),
+      )
     },
     [chat.id, closePicker],
   )

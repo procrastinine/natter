@@ -140,11 +140,25 @@ describe('filterEndpointsByPrivacy — Claude Opus 4.7 fixture', () => {
   })
 })
 
+describe('filterEndpointsByPrivacy — Claude Opus 4.6 same-tier fixture', () => {
+  it('no retention dominates 30-day retention when both require user IDs', () => {
+    const noRetentionWithIds: DataPolicy = { ...POLICY_CLEAN, requiresUserIDs: true }
+    const result = filterEndpointsByPrivacy({
+      model: 'anthropic/claude-opus-4.6',
+      endpoints: [ep('No retention'), ep('30-day retention')],
+      policies: {
+        'No retention': noRetentionWithIds,
+        '30-day retention': POLICY_SHORT_RETENTION,
+      },
+      privacy: cloneDefaultPrivacyPrefs(),
+    })
+    expect(result.kept.map((row) => row.endpoint.provider_name)).toEqual(['No retention'])
+    expect(result.excluded[0]?.reasons).toContain('dominated')
+  })
+})
+
 describe('filterEndpointsByPrivacy — Gemini fixture', () => {
-  it('AI Studio dominates Vertex (yellow vs orange) — only AI Studio kept', () => {
-    // Per user spec 2026-04-19: AI Studio (yellow: 55d retention, no
-    // user IDs) is a strictly better tier than Google Vertex (orange:
-    // requires user IDs). Pareto drops Vertex by default.
+  it('AI Studio keeps its better category over Vertex', () => {
     const result = filterEndpointsByPrivacy({
       model: 'google/gemini-3.1-pro',
       endpoints: [ep('Google Vertex'), ep('Google AI Studio')],
@@ -401,10 +415,7 @@ describe('buildWireProviderPrivacy', () => {
   })
 
   it('does not synthesize provider order when multiple providers survive', () => {
-    // Disable Pareto so both Gemini providers survive — otherwise AI
-    // Studio dominates Vertex (yellow vs orange) and there's only one.
     const prefs = cloneDefaultPrivacyPrefs()
-    prefs.paretoFilter = false
     const result = filterEndpointsByPrivacy({
       model: 'google/gemini-3.1-pro',
       endpoints: [ep('Google Vertex'), ep('Google AI Studio')],

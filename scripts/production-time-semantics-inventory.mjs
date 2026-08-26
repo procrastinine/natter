@@ -652,7 +652,6 @@ export const TEMPORAL_SEMANTIC_GROUPS = Object.freeze([
         'src/ui/chat/ToastTray.tsx|timers|setTimeout|remaining|1',
         'src/ui/primitives/LiveRegions.tsx|LiveRegionLane|requestAnimationFrame||1',
         'src/ui/primitives/LiveRegions.tsx|revealFrame|setTimeout|ANNOUNCEMENT_DWELL_MS|1',
-        'src/ui/settings/PromptPresetEditor.tsx|showFirstEditToast|setTimeout|4000|1',
         'src/ui/sidebar/ChatList.tsx|markRecentMove|setTimeout|1400|1',
       ],
       durations: [
@@ -668,7 +667,7 @@ export const TEMPORAL_SEMANTIC_GROUPS = Object.freeze([
       'one prompt editor control',
       'tab-local edit session',
       'prompt preset editor hook',
-      'Effect cleanup clears estimate/toast timers and edit-session close flushes the latest draft.',
+      'Effect cleanup clears the estimate timer and edit-session close flushes the latest draft.',
       'One save debounce policy constant plus one estimate timer per mounted prompt slot.',
       'Current draft/source identity supersedes stale estimates and commits.',
       'coalescing-policy',

@@ -13,6 +13,7 @@ import {
 } from '../../src/core/sidebar-sort'
 import type {
   Chat,
+  ChatPreset,
   ChatSettings,
   ConfigurationRequestRevision,
   ConnectionProfile,
@@ -248,6 +249,9 @@ describe('configuration controller publication', () => {
       async loadProfileSwitchPlan() {
         return undefined
       },
+      async loadChatPreset() {
+        return undefined
+      },
       pendingConfiguration: configurationController,
     })
 
@@ -364,6 +368,9 @@ describe('configuration controller publication', () => {
       async loadProfileSwitchPlan() {
         return undefined
       },
+      async loadChatPreset() {
+        return undefined
+      },
       pendingConfiguration: configurationController,
     }
     const application = createConfigurationApplication(dependencies)
@@ -379,6 +386,57 @@ describe('configuration controller publication', () => {
     expect(configurationController.pendingWorkspaceSetting(proof.result.key)).toBeUndefined()
   })
 
+  it('projects a selected preset before its authoritative write settles', async () => {
+    const profile = profileFixture('preset-stage-profile')
+    const currentSettings = settingsFixture(profile)
+    currentSettings.model = 'current/model'
+    const targetSettings = structuredClone(currentSettings)
+    targetSettings.model = 'target/model'
+    const chat = chatFixture('preset-stage-chat', currentSettings)
+    const preset: ChatPreset = {
+      id: 'preset-stage-target',
+      name: 'Target preset',
+      connectionProfileId: profile.id,
+      settings: targetSettings,
+      createdAt: 1,
+      updatedAt: 1,
+    }
+    observeChat(chat)
+    const completion = deferred<never>()
+    const execute = vi.fn(() => completion.promise)
+    const loadChatPreset = vi.fn(async () => preset)
+    const application = createConfigurationApplication({
+      port: { execute },
+      async prepareKey() {
+        throw new Error('UnexpectedKeyPreparation')
+      },
+      async loadProfileSwitchPlan() {
+        return undefined
+      },
+      loadChatPreset,
+      pendingConfiguration: configurationController,
+    })
+
+    const operation = application.applyChatPreset(chat.id, preset.id)
+    await settle()
+
+    expect(loadChatPreset).toHaveBeenCalledWith(preset.id)
+    expect(execute).toHaveBeenCalledTimes(1)
+    expect(configurationController.projectChatConfiguration(chat)).toMatchObject({
+      presetId: preset.id,
+      settings: { model: targetSettings.model },
+    })
+
+    completion.resolve({
+      kind: 'chat-preset-saved',
+      preset,
+      chatId: chat.id,
+      chatChanged: true,
+      configurationVersion: 1,
+    } as never)
+    await expect(operation).resolves.toBe(true)
+  })
+
   it('submits a relative setting command exactly once while its result is pending', async () => {
     const completion = deferred<never>()
     const execute = vi.fn(() => completion.promise)
@@ -388,6 +446,9 @@ describe('configuration controller publication', () => {
         throw new Error('UnexpectedKeyPreparation')
       },
       async loadProfileSwitchPlan() {
+        return undefined
+      },
+      async loadChatPreset() {
         return undefined
       },
     })
@@ -453,6 +514,9 @@ describe('profile switch admission', () => {
         throw new Error('UnexpectedKeyPreparation')
       },
       loadProfileSwitchPlan,
+      async loadChatPreset() {
+        return undefined
+      },
     })
 
     await expect(
