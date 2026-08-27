@@ -49,7 +49,15 @@ export function createSliceTaskBatches(plan, runtime = null) {
   }
   for (const task of plan.tasks.playwright) {
     const invocation = createVerificationRuntimeInvocation(
-      ['pnpm', 'exec', 'playwright', 'test', `--project=${task.project}`, ...task.files],
+      [
+        'pnpm',
+        'exec',
+        'playwright',
+        'test',
+        `--project=${task.project}`,
+        '--no-deps',
+        ...task.files,
+      ],
       runtime,
     )
     batches.push(
@@ -192,11 +200,18 @@ export async function executePreparedSliceVerification(options) {
     printBatchHeader(index, batches.length, batch)
     let execution
     try {
+      const batchEnvironment =
+        batch.kind === 'playwright'
+          ? Object.freeze({
+              ...environment,
+              E2E_PLAYWRIGHT_OUTPUT_DIR: resolve(runDirectory, `${batch.id}.playwright`),
+            })
+          : environment
       execution = await executeBatch(batch, {
         artifactRoot: evidenceRoot,
         root: runtimeRoot,
         runDirectory,
-        environment,
+        environment: batchEnvironment,
         forwardOutput: options.forwardOutput !== false,
       })
     } catch (error) {

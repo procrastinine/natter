@@ -43,8 +43,8 @@ describe('scroll continuity architecture audit', () => {
     expect(result.report).toMatchObject({
       ok: true,
       structurallyValid: true,
-      discoveredWriterCount: 13,
-      writerCount: 13,
+      discoveredWriterCount: 14,
+      writerCount: 14,
       heightProducerCount: 17,
       heightProducerProofCount: 17,
       transitionCount: 15,

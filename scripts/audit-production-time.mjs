@@ -129,8 +129,6 @@ const TEMPORAL_INVENTORY = {
       'DOM measurement, focus, scroll anchoring, resize coalescing, or live-region reveal is intentionally synchronized to a browser paint boundary rather than guessed milliseconds.',
     schedulers: [
       'src/hooks/useActiveBranchFrame.ts|update|requestAnimationFrame||1',
-      'src/hooks/useConversationFrame.ts|useConversationTranscriptDemand|requestAnimationFrame||1',
-      'src/hooks/useConversationFrame.ts|firstFrame|requestAnimationFrame||1',
       'src/ui/chat/BranchTreeInspector.tsx|scheduleRangeRefresh|requestAnimationFrame||1',
       'src/ui/chat/BranchTreeView.tsx|scheduleViewportRead|requestAnimationFrame||1',
       'src/ui/chat/BranchTreeView.tsx|scheduleInspectorResize|requestAnimationFrame||1',
@@ -967,7 +965,10 @@ const TEMPORAL_INPUT_INVENTORY = {
   'ui-scroll-behavior': {
     rationale:
       'Programmatic scrolling explicitly chooses browser animation or immediate positioning; scroll ownership remains event/observer driven and never waits for a guessed duration.',
-    ids: ["src/ui/chat/ScrollRegion.tsx|scrollToBottomNow|behavior|'smooth'|1"],
+    ids: [
+      "src/ui/chat/ScrollRegion.tsx|scrollToBottomNow|behavior|'smooth'|1",
+      "src/ui/chat/ScrollRegion.tsx|preserveTextEditingViewport|behavior|'auto'|1",
+    ],
   },
   'migration-lease-timestamp': {
     rationale: 'Version-gated stream migration copies/synthesizes legacy heartbeat evidence once.',

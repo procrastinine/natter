@@ -47,6 +47,7 @@ export interface RouteIntent {
     expectedHash: string
     readonly controller: AbortController
     readonly routeOwnerController: ConversationRouteOwnerController
+    readonly foregroundDemand: WorkspacePresentationForegroundDemand
   }
 }
 
@@ -131,15 +132,35 @@ export function routeForegroundPresentationSettled(
 export function settleRouteForegroundDemandForPresentation(
   href: string,
   outcome: RouteForegroundPresentationOutcome,
+  chatId?: ChatId | null,
 ): void {
   if (!routeForegroundPresentationSettled(outcome)) return
   if (typeof window === 'undefined') return
   const demand = currentRouteForegroundDemand
-  if (!demand || demand.expectedHash !== href || window.location.hash !== href) {
+  if (!demand || !routeForegroundEffectMatches(demand, href, chatId)) {
     return
   }
   demand.presentationSettled = true
   releaseRouteForegroundDemandIfSettled(demand)
+}
+
+function routeForegroundEffectMatches(
+  demand: RouteForegroundDemandRecord,
+  renderedHref: string,
+  chatId: ChatId | null | undefined,
+): boolean {
+  if (window.location.hash !== demand.expectedHash) return false
+  if (demand.expectedHash === renderedHref) return true
+  if (!chatId) return false
+  const expected = parseRoute(demand.expectedHash)
+  const rendered = parseRoute(renderedHref)
+  return (
+    expected.kind === 'chat' &&
+    rendered.kind === 'chat' &&
+    expected.chatId === chatId &&
+    rendered.chatId === chatId &&
+    (expected.pinnedMessageId === undefined) !== (rendered.pinnedMessageId === undefined)
+  )
 }
 
 export function startRouteForegroundMetadata(
@@ -149,7 +170,7 @@ export function startRouteForegroundMetadata(
 ): Promise<void> | null {
   if (typeof window === 'undefined') return null
   const demand = currentRouteForegroundDemand
-  if (!demand || demand.expectedHash !== href || window.location.hash !== href) return null
+  if (!demand || !routeForegroundEffectMatches(demand, href, chatId)) return null
   const metadata = demand.metadata
   if (
     metadata.kind !== 'chat-last-viewed' ||
@@ -176,9 +197,12 @@ export function startRouteForegroundMetadata(
 }
 
 function invalidateRouteIntent(): void {
-  currentRouteIntent?.[routeIntentState].controller.abort()
-  currentRouteIntent?.[routeIntentState].routeOwnerController.cancel()
+  const intent = currentRouteIntent
   currentRouteIntent = null
+  if (!intent) return
+  intent[routeIntentState].controller.abort()
+  intent[routeIntentState].routeOwnerController.cancel()
+  intent[routeIntentState].foregroundDemand.release()
 }
 
 export function beginRouteIntent(): RouteIntent {
@@ -196,6 +220,7 @@ function claimRouteIntent(): RouteIntent {
       expectedHash: startedAtHash,
       controller: new AbortController(),
       routeOwnerController: createConversationRouteOwnerController(),
+      foregroundDemand: claimWorkspacePresentationForegroundDemand(),
     },
   })
   currentRouteIntent = intent
@@ -216,9 +241,16 @@ export function routeIntentOwner(intent: RouteIntent): ConversationRouteOwner {
 }
 
 export function navigateForIntent(intent: RouteIntent, href: string): boolean {
-  if (!consumeRouteIntent(intent)) return false
-  commitHashNavigation(href)
-  return true
+  if (!isRouteIntentCurrent(intent)) return false
+  currentRouteIntent = null
+  intent[routeIntentState].controller.abort()
+  intent[routeIntentState].routeOwnerController.cancel()
+  try {
+    commitHashNavigation(href)
+    return true
+  } finally {
+    intent[routeIntentState].foregroundDemand.release()
+  }
 }
 
 // End an abandoned delayed route action without disturbing a newer action.
@@ -230,14 +262,7 @@ export function cancelRouteIntent(intent: RouteIntent): boolean {
   currentRouteIntent = null
   intent[routeIntentState].controller.abort()
   intent[routeIntentState].routeOwnerController.cancel()
-  return true
-}
-
-function consumeRouteIntent(intent: RouteIntent): boolean {
-  if (!isRouteIntentCurrent(intent)) return false
-  currentRouteIntent = null
-  intent[routeIntentState].controller.abort()
-  intent[routeIntentState].routeOwnerController.cancel()
+  intent[routeIntentState].foregroundDemand.release()
   return true
 }
 
@@ -269,6 +294,8 @@ export function navigateToChatForIntent(
     intent[routeIntentState].routeOwnerController.cancel(error)
     handoff?.cancel()
     throw error
+  } finally {
+    intent[routeIntentState].foregroundDemand.release()
   }
 }
 
@@ -471,11 +498,7 @@ function ensureHashListener(): void {
   if (typeof window === 'undefined') return
   if (!hashListenerInstalled) {
     hashListenerInstalled = true
-    window.addEventListener('hashchange', () => {
-      invalidateRouteIntent()
-      claimRouteForegroundDemand(window.location.hash)
-      publishRouteChange()
-    })
+    window.addEventListener('hashchange', reconcileRouteSnapshotWithAddress)
     window.addEventListener('pageshow', reconcileRouteSnapshotWithAddress)
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'visible') reconcileRouteSnapshotWithAddress()

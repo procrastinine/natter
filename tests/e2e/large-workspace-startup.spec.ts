@@ -43,6 +43,8 @@ const ACTIVE_STREAM_COMPOSER_READY_BOUND_MS = 2_000
 const ACTIVE_STREAM_CORE_RUNNING_HEADROOM_MS = 250
 const LONG_TASK_THRESHOLD_MS = 50
 const CARDINALITY_BLOCKING_TIME_HEADROOM_MS = 50
+const FOREGROUND_FORK_REQUEST_BOUND = 1_600
+const FOREGROUND_INTERRUPTED_COPY_MAX_ROWS = 64
 const GENERATED_WORKSPACE_FORK_TARGET_ID = 'generated-active-message-086'
 const GENERATED_WORKSPACE_MODEL_ID = 'google/gemini-3.5-flash'
 const BROWSER_WORKSPACE_CONTROL_DATABASE_NAME = 'natter-control'
@@ -151,9 +153,6 @@ test('startup work and first interaction stay cardinality-bounded in a 4k-chat w
   assertNoCanonicalWholeTableRouteRead('large route switch', large.routeSwitch)
   assertForegroundFork('control', control.foregroundFork)
   assertForegroundFork('large', large.foregroundFork)
-  expect(large.foregroundFork.idbRequests).toBeLessThanOrEqual(
-    control.foregroundFork.idbRequests + 20,
-  )
   expect(large.foregroundFork.durationMs).toBeLessThanOrEqual(
     Math.max(control.foregroundFork.durationMs * 3, control.foregroundFork.durationMs + 1_000),
   )
@@ -1673,6 +1672,48 @@ function assertForegroundFork(name: string, profile: ForegroundForkProfile): voi
   expect(profile.durationMs, `${name} fork hang bound`).toBeLessThan(HANG_BOUND_MS)
   expect(profile.heartbeatTicks, `${name} responsive event-loop heartbeat`).toBeGreaterThan(0)
   expect(profile.heartbeatMaxGapMs, `${name} maximum event-loop gap`).toBeLessThan(500)
+  expect(profile.idbRequests, `${name} total bounded fork requests`).toBeLessThanOrEqual(
+    FOREGROUND_FORK_REQUEST_BOUND,
+  )
+  expect(
+    foregroundForkPrimaryCalls(profile.idbCalls),
+    `${name} primary fork request shape`,
+  ).toEqual({
+    'objectStore.messages.get.bounded': 106,
+    'objectStore.messageBodies.get.bounded': 96,
+    'objectStore.childLists.get.bounded': 89,
+    'objectStore.childSlotMembers.get.bounded': 88,
+    'objectStore.messages.add.bounded': 87,
+    'objectStore.messageBodies.add.bounded': 87,
+    'objectStore.messagePreviews.add.bounded': 87,
+    'objectStore.chats.add.bounded': 1,
+    'objectStore.configurationLinks.add.bounded': 2,
+    'objectStore.childLists.add.bounded': 87,
+    'objectStore.childSlotMembers.add.bounded': 87,
+    'objectStore.configurationProfileUsageRows.put.bounded': 1,
+  })
+  expect(
+    profile.idbCalls['objectStore.chatSidebarRows.put.bounded'] ?? 0,
+    `${name} fork plus last-viewed sidebar projections`,
+  ).toBeLessThanOrEqual(2)
+  expect(
+    profile.idbCalls['objectStore.chats.put.bounded'] ?? 0,
+    `${name} last-viewed chat projection`,
+  ).toBeLessThanOrEqual(1)
+  assertForegroundForkCatchupShape(name, profile.idbCalls)
+  const interruptedCopyCursorRows = Object.entries(profile.idbCalls)
+    .filter(([key]) => /^cursor\.[^.]+\.continue$/u.test(key))
+    .reduce((sum, [, count]) => sum + count, 0)
+  expect(
+    interruptedCopyCursorRows,
+    `${name} interrupted compaction cursor rows`,
+  ).toBeLessThanOrEqual(FOREGROUND_INTERRUPTED_COPY_MAX_ROWS)
+  expect(
+    Object.entries(profile.idbCalls)
+      .filter(([key]) => /^objectStore\.[^.]+\.openCursor\.bounded$/u.test(key))
+      .reduce((sum, [, count]) => sum + count, 0),
+    `${name} interrupted compaction cursor pages`,
+  ).toBeLessThanOrEqual(1)
   expect(
     canonicalWholeTableReads(profile.idbCalls),
     `${name} fork canonical whole-table reads`,
@@ -1709,6 +1750,58 @@ function assertForegroundFork(name: string, profile: ForegroundForkProfile): voi
     expect(profile.idbCalls[key] ?? 0, `${name} fork bounded ${key}`).toBeLessThanOrEqual(1)
   }
   expect(profile.settingMutations, `${name} fork workspace-slot writes`).toEqual([])
+}
+
+const FOREGROUND_FORK_PRIMARY_CALL_KEYS = [
+  'objectStore.messages.get.bounded',
+  'objectStore.messageBodies.get.bounded',
+  'objectStore.childLists.get.bounded',
+  'objectStore.childSlotMembers.get.bounded',
+  'objectStore.messages.add.bounded',
+  'objectStore.messageBodies.add.bounded',
+  'objectStore.messagePreviews.add.bounded',
+  'objectStore.chats.add.bounded',
+  'objectStore.configurationLinks.add.bounded',
+  'objectStore.childLists.add.bounded',
+  'objectStore.childSlotMembers.add.bounded',
+  'objectStore.configurationProfileUsageRows.put.bounded',
+] as const
+
+function foregroundForkPrimaryCalls(
+  calls: Readonly<Record<string, number>>,
+): Readonly<Record<(typeof FOREGROUND_FORK_PRIMARY_CALL_KEYS)[number], number>> {
+  return Object.fromEntries(
+    FOREGROUND_FORK_PRIMARY_CALL_KEYS.map((key) => [key, calls[key] ?? 0]),
+  ) as Readonly<Record<(typeof FOREGROUND_FORK_PRIMARY_CALL_KEYS)[number], number>>
+}
+
+const FOREGROUND_FORK_CATCHUP_CALLS = Object.freeze({
+  'objectStore.replacementCatchup__chatSidebarAggregates.put.bounded': 1,
+  'objectStore.replacementCatchup__chatSidebarRows.put.bounded': 1,
+  'objectStore.replacementCatchup__chats.put.bounded': 1,
+  'objectStore.replacementCatchup__childLists.put.bounded': 87,
+  'objectStore.replacementCatchup__childSlotMembers.put.bounded': 87,
+  'objectStore.replacementCatchup__configurationLinks.put.bounded': 2,
+  'objectStore.replacementCatchup__configurationCatalogAggregates.put.bounded': 1,
+  'objectStore.replacementCatchup__configurationProfileUsageRows.put.bounded': 1,
+  'objectStore.replacementCatchup__messageBodies.put.bounded': 87,
+  'objectStore.replacementCatchup__messagePreviews.put.bounded': 87,
+  'objectStore.replacementCatchup__messages.put.bounded': 87,
+})
+
+function assertForegroundForkCatchupShape(
+  name: string,
+  calls: Readonly<Record<string, number>>,
+): void {
+  const actual = Object.fromEntries(
+    Object.entries(calls).filter(
+      ([key, count]) =>
+        count > 0 && /^objectStore\.replacementCatchup__[^.]+\.put\.bounded$/u.test(key),
+    ),
+  )
+  expect(actual, `${name} fork catch-up request shape`).toEqual(
+    Object.keys(actual).length === 0 ? {} : FOREGROUND_FORK_CATCHUP_CALLS,
+  )
 }
 
 function idbCallDelta(

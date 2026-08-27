@@ -61,7 +61,7 @@ function deferred<T>() {
   return { promise, resolve }
 }
 const BASE_SETTINGS = cloneDefaultChatSettings()
-const NOOP_LOAD = () => {}
+const NOOP_LOAD = () => true
 const mutationSettlements = createInteractionSettlementHarness()
 const RUN_MUTATION: ConversationMutationRunner = (_intent, action, commit) =>
   mutationSettlements.run(async () => {

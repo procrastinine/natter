@@ -22,8 +22,8 @@ const lifetime = (siteId, siteText, boundary, bound, rationale) =>
 
 export const productionRuntimeEffectReviews = Object.freeze([
   lifetime(
-    'src/app/router.ts#ensureHashListener|event-listener|acquire|addEventListener|fnv1a32:952c39be|1',
-    "window.addEventListener('hashchange', () => {",
+    'src/app/router.ts#ensureHashListener|event-listener|acquire|addEventListener|fnv1a32:a65a9840|1',
+    "window.addEventListener('hashchange', reconcileRouteSnapshotWithAddress)",
     'browser-page',
     'one hashchange listener guarded by hashListenerInstalled for the lifetime of the page module',
     'The router is a page singleton, and the listener must survive every React mount and workspace replacement.',

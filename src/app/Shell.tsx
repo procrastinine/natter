@@ -567,6 +567,7 @@ export function Shell() {
       ? { pinnedMessageId: route.pinnedMessageId }
       : {}),
     initialTranscriptWorkScale: prefs.messageInitialRenderWork,
+    transcriptRendererAvailable: messageListModule !== null,
   })
   const catalogTab = useCatalogTab()
   const resolvedPaintedChatRow = paintedChat
@@ -1632,12 +1633,16 @@ export function Shell() {
   const routePresentationDestinationDeferred =
     activePresentation?.editorRetention?.destinationDeferred === true
   useLayoutEffect(() => {
-    settleRouteForegroundDemandForPresentation(routeToHref(route), {
-      hasActiveChat: activeChatId !== null,
-      targetKind: routePresentationTargetKind,
-      revealPending: routePresentationRevealPending,
-      destinationDeferred: routePresentationDestinationDeferred,
-    })
+    settleRouteForegroundDemandForPresentation(
+      routeToHref(route),
+      {
+        hasActiveChat: activeChatId !== null,
+        targetKind: routePresentationTargetKind,
+        revealPending: routePresentationRevealPending,
+        destinationDeferred: routePresentationDestinationDeferred,
+      },
+      activeChatId,
+    )
   }, [
     activeChatId,
     route,
@@ -1925,6 +1930,10 @@ export function Shell() {
                       streamFollowTargetMessageId={selectedPathFollowTargetMessageId}
                       revealClaimKey={selectedPathRevealClaimKey}
                       revealClaimTargetMessageId={activeRevealRequest?.targetMessageId ?? null}
+                      revealSurfaceAvailable={Boolean(
+                        (transcriptBinding && resolvedPaintedChatRow && MessageList) ||
+                          (transcriptPoint && resolvedActiveChatRow && MessageListPoint),
+                      )}
                       onRevealClaimConsumed={acknowledgeSelectedPathRevealClaim}
                       onStateChange={setScrollState}
                     >

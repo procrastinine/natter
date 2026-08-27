@@ -16,6 +16,14 @@ export const SCROLL_WRITER_CLASSIFICATIONS = Object.freeze([
     'explicit-target',
   ),
   writer(
+    'transcript-edit-animation-cancel',
+    'src/ui/chat/ScrollRegion.tsx',
+    "container.scrollTo({ top, behavior: 'auto' })",
+    'transcript',
+    'layout-reconciliation',
+    'preserve-anchor',
+  ),
+  writer(
     'branch-search-result-center',
     'src/ui/chat/BranchTreeInspectorSearch.ts',
     "range?.startContainer.parentElement?.scrollIntoView({ block: 'center', inline: 'nearest' })",
@@ -205,9 +213,9 @@ export const TRANSCRIPT_HEIGHT_PRODUCERS = Object.freeze([
     'explicit-intent',
   ),
   heightProducer(
-    'inline-editor-autosize',
+    'inline-editor-initial-size',
     'src/ui/chat/InlineEditor.tsx',
-    'preserveTextEditingViewport(() => autosize(textareaRef.current))',
+    'function sizeTextarea(',
     'user-control',
     'explicit-intent',
   ),
@@ -242,7 +250,7 @@ export const SCROLL_HEIGHT_PRODUCER_PROOF_MATRIX = Object.freeze([
   heightProducerProof('reasoning-disclosure', 'user-control'),
   heightProducerProof('tool-evidence-disclosure', 'user-control'),
   heightProducerProof('message-info-disclosure', 'user-control'),
-  heightProducerProof('inline-editor-autosize', 'user-control'),
+  heightProducerProof('inline-editor-initial-size', 'user-control'),
   heightProducerProof('message-collapse-mode', 'user-control'),
   heightProducerProof('generation-terminal-notices', 'stream'),
 ])

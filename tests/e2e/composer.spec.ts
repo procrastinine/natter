@@ -145,7 +145,7 @@ test('composer can be resized below its content and scrolls internally', async (
   expect(await input.evaluate((node) => node.clientHeight)).toBeGreaterThan(resetHeight)
 })
 
-test('inline editor autosize tracks wrapped content width without spare lines', async ({
+test('inline editor keeps its opened viewport while wrapped content scrolls internally', async ({
   page,
 }) => {
   await mockChatCompletions(page, {
@@ -185,22 +185,25 @@ test('inline editor autosize tracks wrapped content width without spare lines', 
 
   await input.fill('responsive wrapping '.repeat(50))
   const wide = await metrics()
+  expect(wide.renderedHeight).toBeCloseTo(short.renderedHeight, 1)
+  expect(wide.overflowY).toBe('auto')
+  expect(wide.scrollHeight).toBeGreaterThan(wide.clientHeight)
   await page.evaluate(() => {
     document.documentElement.style.setProperty('--message-max-width', '420px')
   })
   await expect
-    .poll(() => metrics().then((value) => value.renderedHeight))
-    .toBeGreaterThan(wide.renderedHeight)
+    .poll(() => metrics().then((value) => value.scrollHeight))
+    .toBeGreaterThan(wide.scrollHeight)
   const narrow = await metrics()
-  expect(narrow.overflowY).toBe('hidden')
-  expect(narrow.renderedHeight).toBeGreaterThan(wide.renderedHeight)
+  expect(narrow.overflowY).toBe('auto')
+  expect(narrow.renderedHeight).toBeCloseTo(wide.renderedHeight, 1)
 
   await page.evaluate(() => {
     document.documentElement.style.setProperty('--message-max-width', '920px')
   })
   await expect
-    .poll(() => metrics().then((value) => value.renderedHeight))
-    .toBeCloseTo(wide.renderedHeight, 1)
+    .poll(() => metrics().then((value) => value.scrollHeight))
+    .toBeCloseTo(wide.scrollHeight, 1)
 
   await input.fill(Array.from({ length: 80 }, (_, index) => `line ${index}`).join('\n'))
   await expect.poll(metrics).toMatchObject({

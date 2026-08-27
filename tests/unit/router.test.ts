@@ -152,6 +152,34 @@ describe('route parsing and rendering', () => {
 })
 
 describe('opaque tab route intents', () => {
+  it('owns foreground demand from command claim through route handoff', async () => {
+    settleRouteForegroundDemandForPresentation('#/', {
+      hasActiveChat: false,
+      targetKind: null,
+      revealPending: false,
+      destinationDeferred: false,
+    })
+    const intent = beginRouteIntent()
+    let resumed = false
+    const maintenance = awaitWorkspaceForegroundDemandIdle().then(() => {
+      resumed = true
+    })
+
+    await Promise.resolve()
+    expect(resumed).toBe(false)
+    expect(navigateForIntent(intent, '#/new')).toBe(true)
+    await Promise.resolve()
+    expect(resumed).toBe(false)
+    settleRouteForegroundDemandForPresentation('#/new', {
+      hasActiveChat: false,
+      targetKind: null,
+      revealPending: false,
+      destinationDeferred: false,
+    })
+    await maintenance
+    expect(resumed).toBe(true)
+  })
+
   it('accepts only the latest exact intent object', () => {
     const older = beginRouteIntent()
     const current = beginRouteIntent()
@@ -221,10 +249,26 @@ describe('opaque tab route intents', () => {
 
   it('invalidates delayed work when the browser publishes back/forward navigation', () => {
     const intent = beginRouteIntent()
+    window.history.replaceState(null, '', '#/storage')
     window.dispatchEvent(new HashChangeEvent('hashchange'))
 
     expect(isRouteIntentCurrent(intent)).toBe(false)
     expect(navigateForIntent(intent, '#/new')).toBe(false)
+  })
+
+  it('ignores a delayed native hashchange echo after the route is already committed', () => {
+    navigate('#/chat/committed/message/leaf')
+    let arrivals = 0
+    const unsubscribe = subscribeRouteArrival(() => {
+      arrivals += 1
+    })
+    const beforeId = browserConversationNavigationPort.getArrival().id
+
+    window.dispatchEvent(new HashChangeEvent('hashchange'))
+    unsubscribe()
+
+    expect(arrivals).toBe(0)
+    expect(browserConversationNavigationPort.getArrival().id).toBe(beforeId)
   })
 
   it('hands a successful delayed chat route directly to the route-arrival owner', () => {
@@ -492,6 +536,58 @@ describe('anchor interception', () => {
 
     expect(metadataState.signal?.aborted).toBe(true)
     await metadata
+  })
+
+  it('settles a same-chat route after a passive leaf mirror precedes layout effects', async () => {
+    navigate('#/chat/mirrored')
+    let resumed = false
+    const maintenance = awaitWorkspaceForegroundDemandIdle().then(() => {
+      resumed = true
+    })
+
+    replaceRoute('#/chat/mirrored/message/leaf')
+    expect(
+      startRouteForegroundMetadata('#/chat/mirrored', 'different-chat', async () => {}),
+    ).toBeNull()
+    settleRouteForegroundDemandForPresentation(
+      '#/chat/mirrored',
+      {
+        hasActiveChat: true,
+        targetKind: 'ready',
+        revealPending: false,
+        destinationDeferred: false,
+      },
+      'different-chat',
+    )
+    await Promise.resolve()
+    expect(resumed).toBe(false)
+    settleRouteForegroundDemandForPresentation(
+      '#/chat/mirrored/message/stale-leaf',
+      {
+        hasActiveChat: true,
+        targetKind: 'ready',
+        revealPending: false,
+        destinationDeferred: false,
+      },
+      'mirrored',
+    )
+    await Promise.resolve()
+    expect(resumed).toBe(false)
+    const metadata = startRouteForegroundMetadata('#/chat/mirrored', 'mirrored', async () => {})
+    expect(metadata).not.toBeNull()
+    settleRouteForegroundDemandForPresentation(
+      '#/chat/mirrored',
+      {
+        hasActiveChat: true,
+        targetKind: 'ready',
+        revealPending: false,
+        destinationDeferred: false,
+      },
+      'mirrored',
+    )
+    await metadata
+    await maintenance
+    expect(resumed).toBe(true)
   })
 
   it('terminally settles failed, retained-editor, and no-chat route outcomes', () => {

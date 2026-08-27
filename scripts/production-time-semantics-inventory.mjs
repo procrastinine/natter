@@ -589,8 +589,6 @@ export const TEMPORAL_SEMANTIC_GROUPS = Object.freeze([
     ),
     {
       schedulers: [
-        'src/hooks/useConversationFrame.ts|useConversationTranscriptDemand|requestAnimationFrame||1',
-        'src/hooks/useConversationFrame.ts|firstFrame|requestAnimationFrame||1',
         'src/ui/chat/BranchTreeInspector.tsx|scheduleRangeRefresh|requestAnimationFrame||1',
         'src/ui/chat/BranchTreeInspector.tsx|scheduleRangeRefresh|queueMicrotask||1',
         'src/ui/chat/BranchTreeView.tsx|scheduleViewportRead|requestAnimationFrame||1',

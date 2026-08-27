@@ -1077,12 +1077,12 @@ export interface ConversationController {
     selectionRevision: number
     selectionEpoch: number
     boundaryOffset: number
-  }): void
+  }): boolean
   retryTranscriptDemand(input: {
     chatId: ChatId
     selectionRevision: number
     selectionEpoch: number
-  }): void
+  }): boolean
   setInspectorDemand(owner: object, demand: InspectorDemand | null): void
   setTreePreviewDemand(owner: object, demand: TreePreviewDemand | null): void
   requestPresentation(input: {
@@ -1301,7 +1301,7 @@ class TabConversationController implements ConversationController {
     if (route.targetMessageId !== undefined) {
       route.handoff?.cancel()
       const alreadySelected =
-        !changedChat && this.activeSpine()?.resolvedLeafId === route.targetMessageId
+        !changedChat && this.routeTargetAlreadyOwned(session, route.targetMessageId)
       if (!alreadySelected) {
         const preservesTabTip =
           session.intent.selection.kind === 'tip' &&
@@ -2262,7 +2262,7 @@ class TabConversationController implements ConversationController {
     selectionRevision: number
     selectionEpoch: number
     boundaryOffset: number
-  }): void {
+  }): boolean {
     const active = this.active
     const session = this.activeSession()
     const path = this.activeSpine()?.path
@@ -2279,12 +2279,12 @@ class TabConversationController implements ConversationController {
       input.boundaryOffset < 0 ||
       input.boundaryOffset !== window.offset
     ) {
-      return
+      return false
     }
     const base = this.currentTranscriptDemand(active, session)
-    if (!base) return
+    if (!base) return false
     const accepted = this.acceptTranscriptPlan(active, base, path)
-    if (accepted.lastExpansionBoundaryOffset === input.boundaryOffset) return
+    if (accepted.lastExpansionBoundaryOffset === input.boundaryOffset) return false
     const budget = growTranscriptWorkBudget(accepted.budget)
     active.transcriptPlan = Object.freeze({
       ...accepted,
@@ -2298,13 +2298,14 @@ class TabConversationController implements ConversationController {
       lastExpansionBoundaryOffset: input.boundaryOffset,
     })
     this.requestTranscript()
+    return true
   }
 
   retryTranscriptDemand(input: {
     chatId: ChatId
     selectionRevision: number
     selectionEpoch: number
-  }): void {
+  }): boolean {
     const active = this.active
     const session = this.activeSession()
     const failure = active?.failure
@@ -2320,11 +2321,12 @@ class TabConversationController implements ConversationController {
       blocked?.key !== failure.key ||
       blocked.observationRevision !== failure.observationRevision
     ) {
-      return
+      return false
     }
     this.blockedReads.delete('transcript')
     active.failure = null
     this.requestTranscript()
+    return true
   }
 
   setInspectorDemand(owner: object, demand: InspectorDemand | null): void {
@@ -2409,6 +2411,21 @@ class TabConversationController implements ConversationController {
     return rememberedTipId
       ? { kind: 'message', messageId, observedTipId: rememberedTipId }
       : { kind: 'message', messageId }
+  }
+
+  private routeTargetAlreadyOwned(session: ChatSession, targetMessageId: MessageId): boolean {
+    const active = this.active
+    if (this.activeSpine()?.resolvedLeafId === targetMessageId) return true
+    const attempt = active?.selectionAttempt
+    if (active && attempt && this.selectionAttemptIsCurrent(attempt)) {
+      return (
+        session.intent.selection.kind === 'default' &&
+        active.transcript.kind === 'point' &&
+        active.transcript.attemptId === attempt.id &&
+        active.transcript.tipId === targetMessageId
+      )
+    }
+    return false
   }
 
   private getOrCreateSession(chatId: ChatId): ChatSession {

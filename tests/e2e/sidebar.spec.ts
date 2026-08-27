@@ -73,6 +73,7 @@ test('sidebar chat switching never exposes null connection, message actions, or 
   await expect(page.locator('[data-ui="connection-provider-button"] svg')).toHaveCount(1)
   await expect(page.locator('[data-ui="header-privacy-badge"]')).toHaveCount(1)
   await expect(page.locator('[data-action="edit"]')).not.toHaveCount(0)
+  await expect(page.locator('html')).not.toHaveAttribute('data-natter-route-foreground', /.+/u)
 
   await page.evaluate(() => {
     const selectors = {

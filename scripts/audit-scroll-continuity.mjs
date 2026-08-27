@@ -10,6 +10,7 @@ const DEFAULT_INVENTORY = resolve(ROOT, 'scripts/scroll-continuity-inventory.mjs
 const REQUIRED_WRITER_IDS = Object.freeze([
   'transcript-instant-position',
   'transcript-smooth-bottom',
+  'transcript-edit-animation-cancel',
   'branch-search-result-center',
   'branch-node-center-horizontal',
   'branch-node-center-vertical',
@@ -37,7 +38,7 @@ const REQUIRED_HEIGHT_PRODUCER_IDS = Object.freeze([
   'reasoning-disclosure',
   'tool-evidence-disclosure',
   'message-info-disclosure',
-  'inline-editor-autosize',
+  'inline-editor-initial-size',
   'message-collapse-mode',
   'generation-terminal-notices',
 ])

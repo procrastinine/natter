@@ -236,6 +236,21 @@ describe('ScrollRegion continuity lease', () => {
     expect(fixture.ref.current?.getState()).toBe('follow')
   })
 
+  it('does not let an unclaimed follow-range native scroll erase bottom ownership', () => {
+    const fixture = setup()
+    acquireOpen(fixture)
+
+    act(() => {
+      fixture.region.scrollTop = 997
+      fireEvent.scroll(fixture.region)
+      fixture.setHeight(1_400)
+      deliverResize()
+    })
+
+    expect(fixture.region.scrollTop).toBe(1_300)
+    expect(fixture.ref.current?.getState()).toBe('follow')
+  })
+
   it('does not let an intermediate layout snapshot revoke follow ownership', () => {
     const fixture = setup()
     acquireOpen(fixture)
@@ -327,6 +342,30 @@ describe('ScrollRegion continuity lease', () => {
       deliverResize()
     })
     expect(fixture.region.scrollTop).toBe(1_700)
+  })
+
+  it('settles a retained reveal when its lazy surface becomes available', () => {
+    const consumed = vi.fn()
+    const fixture = setup({ onRevealClaimConsumed: consumed, revealSurfaceAvailable: false })
+    acquireOpen(fixture)
+
+    act(() => {
+      fixture.rerender(
+        {
+          revealClaimKey: 'lazy-destination',
+          revealClaimTargetMessageId: 'lazy-tail',
+        },
+        <article data-ui="message" data-message-id="lazy-tail">
+          lazy destination
+        </article>,
+      )
+    })
+    expect(consumed).not.toHaveBeenCalled()
+
+    act(() => {
+      fixture.rerender({ revealSurfaceAvailable: true })
+    })
+    expect(consumed).toHaveBeenCalledTimes(1)
   })
 
   it('owns an old-to-new reveal transition before the replacement suffix publishes', () => {
@@ -1275,6 +1314,11 @@ describe('ScrollRegion continuity lease', () => {
   it('gives an active text editor exclusive ownership against automatic layout scrolling', () => {
     const fixture = setup()
     acquireOpen(fixture)
+    const scrollTo = vi.fn()
+    Object.defineProperty(fixture.region, 'scrollTo', {
+      configurable: true,
+      value: scrollTo,
+    })
     const release = fixture.commands().claimTextEditingViewport()
     const before = fixture.region.scrollTop
 
@@ -1287,6 +1331,7 @@ describe('ScrollRegion continuity lease', () => {
     })
 
     expect(fixture.region.scrollTop).toBe(before)
+    expect(scrollTo).toHaveBeenCalledWith({ top: before, behavior: 'auto' })
     expect(fixture.ref.current?.getState()).toBe('pinned')
 
     act(() => {

@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readdir, readFile, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { resolve } from 'node:path'
 import { Writable } from 'node:stream'
@@ -101,6 +101,7 @@ describe('verification slice runner', () => {
       'playwright',
       'test',
       '--project=chromium',
+      '--no-deps',
       'tests/e2e/a.spec.ts',
       'tests/e2e/b.spec.ts',
     ])
@@ -225,6 +226,52 @@ describe('verification slice runner', () => {
       'passed',
       'passed',
     ])
+  })
+
+  it('gives every Playwright batch a distinct run-owned artifact directory', async () => {
+    const root = await mkdtemp(resolve(tmpdir(), 'natter-slice-playwright-artifacts-'))
+    temporaryRoots.push(root)
+    const current = verificationSnapshot('current')
+    const outputDirectories: string[] = []
+    const result = await executePreparedSliceVerification({
+      baselineId: 'slice-test',
+      evidenceRoot: root,
+      runtimeRoot: root,
+      planBundle: {
+        baseline: verificationSnapshot('base'),
+        current,
+        plan: verificationPlan({
+          playwright: [
+            { project: 'chromium', files: ['tests/e2e/first.spec.ts'] },
+            { project: 'chromium-send-performance', files: ['tests/e2e/second.spec.ts'] },
+          ],
+        }),
+      },
+      executeBatch: async (_batch, options) => {
+        const outputDirectory = options.environment.E2E_PLAYWRIGHT_OUTPUT_DIR
+        if (!outputDirectory) throw new Error('SlicePlaywrightOutputDirectoryMissing')
+        outputDirectories.push(outputDirectory)
+        await mkdir(outputDirectory, { recursive: true })
+        await writeFile(resolve(outputDirectory, 'retained.txt'), outputDirectory)
+        return batchExecution(0)
+      },
+      buildCurrentSnapshot: () => current,
+      persistSummary: async () => undefined,
+      now: () => new Date('2026-07-17T00:00:00.000Z'),
+    })
+
+    expect(result.exitCode).toBe(0)
+    expect(outputDirectories).toHaveLength(2)
+    expect(new Set(outputDirectories).size).toBe(2)
+    const firstDirectory = outputDirectories[0]
+    const secondDirectory = outputDirectories[1]
+    if (!firstDirectory || !secondDirectory) throw new Error('SlicePlaywrightOutputMissing')
+    await expect(readFile(resolve(firstDirectory, 'retained.txt'), 'utf8')).resolves.toBe(
+      firstDirectory,
+    )
+    await expect(readFile(resolve(secondDirectory, 'retained.txt'), 'utf8')).resolves.toBe(
+      secondDirectory,
+    )
   })
 
   it('runs executable evidence but cannot close open guarantees', async () => {

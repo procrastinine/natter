@@ -85,7 +85,7 @@ interface MessageListProps {
   messageRenderWindowLoadMode: RenderWindowLoadMode
   contextPreviewFrozen?: boolean
   transcriptLoadFailed?: boolean
-  onLoadOlderMessages: () => void
+  onLoadOlderMessages: () => boolean
   onEditAndSendMessage: (
     message: MessageRow,
     text: string,
@@ -757,6 +757,7 @@ const MessageListSurface = memo(function MessageListSurface(props: MessageListSu
     if (presentationOnly) return
     if (!onLoadOlderMessages) return
     if (hiddenOlderCount <= 0 && !canRetryLoadedBodies) return
+    if (!onLoadOlderMessages()) return
     if (scrollRegionCommands) {
       if (scrollRegionCommands.captureLayoutAnchor()) {
         const anchor = scrollRegionCommands.getLayoutAnchorSnapshot()
@@ -776,7 +777,6 @@ const MessageListSurface = memo(function MessageListSurface(props: MessageListSu
         }
       }
     }
-    onLoadOlderMessages()
   }, [
     canRetryLoadedBodies,
     hiddenOlderCount,

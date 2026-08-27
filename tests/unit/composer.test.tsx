@@ -656,6 +656,41 @@ describe('Composer', () => {
     expect(onSave.mock.calls[0]?.[2]?.[0]).toMatchObject({ includeInContext: true })
   })
 
+  it('keeps the inline editor outer height fixed after it opens', () => {
+    const descriptor = Object.getOwnPropertyDescriptor(
+      HTMLTextAreaElement.prototype,
+      'scrollHeight',
+    )
+    Object.defineProperty(HTMLTextAreaElement.prototype, 'scrollHeight', {
+      configurable: true,
+      get(this: HTMLTextAreaElement) {
+        return this.value.includes('\n') ? 420 : 180
+      },
+    })
+    try {
+      render(
+        <InlineEditor
+          initial="short edit"
+          onSave={succeededInteractionSettlement}
+          onCancel={() => {}}
+        />,
+      )
+      const input = screen.getByRole('textbox', { name: 'Edit message' })
+      expect(input.style.height).toBe('180px')
+
+      fireEvent.change(input, { target: { value: 'short edit\nmore content' } })
+
+      expect(input.style.height).toBe('180px')
+      expect(input.style.overflowY).toBe('auto')
+    } finally {
+      if (descriptor) {
+        Object.defineProperty(HTMLTextAreaElement.prototype, 'scrollHeight', descriptor)
+      } else {
+        Reflect.deleteProperty(HTMLTextAreaElement.prototype, 'scrollHeight')
+      }
+    }
+  })
+
   it('passes inline attachments through Save & Send', async () => {
     const onSave = vi.fn((_text: string, _authoring?: MessageBodyAuthoringOperations) =>
       succeededInteractionSettlement(),

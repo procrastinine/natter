@@ -27,6 +27,7 @@ export interface UseActiveBranchFrameOptions {
   workspaceFence: WorkspaceFence
   pinnedMessageId?: MessageId
   initialTranscriptWorkScale: number
+  transcriptRendererAvailable: boolean
 }
 
 export function useActiveBranchFrame({
@@ -35,6 +36,7 @@ export function useActiveBranchFrame({
   workspaceFence,
   pinnedMessageId,
   initialTranscriptWorkScale,
+  transcriptRendererAvailable,
 }: UseActiveBranchFrameOptions) {
   const normalizedInitialRowTarget = Math.max(1, Math.floor(initialTranscriptWorkScale))
   const viewportHeight = useViewportHeight()
@@ -121,7 +123,11 @@ export function useActiveBranchFrame({
     transcriptDemandSurfaceAvailable,
     transcriptOwnsViewportWork,
   ])
-  useConversationTranscriptDemand(transcriptDemand)
+  useConversationTranscriptDemand(
+    transcriptDemand,
+    conversationController,
+    transcriptRendererAvailable,
+  )
   const transcriptBoundaryOffset = resolvedActiveBranchSnapshot?.offset ?? null
   const transcriptLoadFailed =
     frame?.failure?.kind === 'transcript' && frame.failure.code === 'read-failed'
@@ -134,18 +140,17 @@ export function useActiveBranchFrame({
       transcriptSelectionRevision === null ||
       transcriptSelectionEpoch === null
     ) {
-      return
+      return false
     }
     if (transcriptLoadFailed) {
-      conversationController.retryTranscriptDemand({
+      return conversationController.retryTranscriptDemand({
         chatId: activeChatId,
         selectionRevision: transcriptSelectionRevision,
         selectionEpoch: transcriptSelectionEpoch,
       })
-      return
     }
-    if (transcriptBoundaryOffset === null) return
-    conversationController.expandTranscriptDemand({
+    if (transcriptBoundaryOffset === null) return false
+    return conversationController.expandTranscriptDemand({
       chatId: activeChatId,
       selectionRevision: transcriptSelectionRevision,
       selectionEpoch: transcriptSelectionEpoch,

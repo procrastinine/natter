@@ -1197,6 +1197,52 @@ describe('conversation controller', () => {
     expect(exactTranscript(controller)?.rowCount).toBe(10)
   })
 
+  it('reports only newly admitted transcript boundary expansions', async () => {
+    const rows: Message[] = []
+    for (let index = 0; index < 40; index += 1) {
+      rows.push(message(`expand-${index}`, rows.at(-1)?.id ?? null, 0, `row ${index}`, index + 1))
+    }
+    const { controller, navigation } = harness(rows)
+    navigation.arrive('arrival-expand', { chatId: CHAT_ID })
+    await settle()
+
+    const active = controller.getSnapshot().active
+    if (!active) throw new Error('missing expansion conversation')
+    const demandOwner = {}
+    controller.setTranscriptDemand(demandOwner, {
+      chatId: CHAT_ID,
+      selectionRevision: active.selectionRevision,
+      selectionEpoch: active.transcript.selectionEpoch,
+      budget: { minimumRowCount: 10, textCharLimit: 0, renderCostLimit: 0 },
+    })
+    await settle()
+
+    const first = exactTranscript(controller)
+    if (!first) throw new Error('missing initial transcript window')
+    expect(first).toMatchObject({ offset: 30, rowCount: 10 })
+    const input = {
+      chatId: CHAT_ID,
+      selectionRevision: active.selectionRevision,
+      selectionEpoch: active.transcript.selectionEpoch,
+      boundaryOffset: first.offset,
+    }
+    expect(controller.expandTranscriptDemand(input)).toBe(true)
+    expect(controller.expandTranscriptDemand(input)).toBe(false)
+    await settle()
+
+    const second = exactTranscript(controller)
+    if (!second) throw new Error('missing expanded transcript window')
+    expect(second).toMatchObject({ offset: 20, rowCount: 20 })
+    expect(controller.expandTranscriptDemand({ ...input, boundaryOffset: second.offset })).toBe(
+      true,
+    )
+    expect(controller.expandTranscriptDemand({ ...input, boundaryOffset: second.offset })).toBe(
+      false,
+    )
+    await settle()
+    expect(exactTranscript(controller)).toMatchObject({ offset: 0, rowCount: 40 })
+  })
+
   it('does not republish an exact empty transcript for repeated equal viewport demand', async () => {
     const { controller, navigation, source } = harness([])
     navigation.arrive('arrival-empty', { chatId: CHAT_ID })
@@ -1428,6 +1474,114 @@ describe('conversation controller', () => {
       expectCoherentReadyPresentation(controller.getSnapshot().active?.presentation, 'transcript')
         .reveal,
     ).toBeNull()
+  })
+
+  it('keeps a provisional default-tip selection when its passive pinned route arrives', async () => {
+    const root = message('root', null, 0, 'root', 1)
+    const leaf = message('leaf', root.id, 0, 'leaf', 2)
+    const { controller, navigation, source } = harness([root, leaf])
+    let finishSelection = () => {}
+    source.selectionCompletionGate = new Promise<void>((resolve) => {
+      finishSelection = resolve
+    })
+
+    navigation.arrive('arrival-default', { chatId: CHAT_ID })
+    await settle()
+    const provisional = controller.getSnapshot().active
+    if (!provisional) throw new Error('missing provisional route selection')
+    expect(provisional.transcript).toMatchObject({
+      kind: 'point',
+      window: { leafId: leaf.id },
+    })
+    expect(source.openSelection).toHaveBeenCalledTimes(1)
+
+    navigation.arrive('arrival-passive-tip', { chatId: CHAT_ID, targetMessageId: leaf.id })
+    expect(controller.getSnapshot().active).toMatchObject({
+      selectionRevision: provisional.selectionRevision,
+      transcriptSelectionEpoch: provisional.transcriptSelectionEpoch,
+    })
+    expect(source.openSelection).toHaveBeenCalledTimes(1)
+
+    finishSelection()
+    await settle()
+    expect(presentedSpine(controller).resolvedLeafId).toBe(leaf.id)
+  })
+
+  it('restarts a provisional explicit selection when the same pinned route arrives again', async () => {
+    const root = message('root', null, 0, 'root', 1)
+    const leaf = message('leaf', root.id, 0, 'leaf', 2)
+    const { controller, navigation, source } = harness([root, leaf])
+    let finishSelection = () => {}
+    source.selectionCompletionGate = new Promise<void>((resolve) => {
+      finishSelection = resolve
+    })
+
+    navigation.arrive('arrival-explicit', { chatId: CHAT_ID, targetMessageId: leaf.id })
+    await settle()
+    const provisional = controller.getSnapshot().active
+    if (!provisional) throw new Error('missing provisional route selection')
+    expect(provisional.transcript).toMatchObject({
+      kind: 'point',
+      window: { leafId: leaf.id },
+    })
+
+    navigation.arrive('arrival-explicit-retry', { chatId: CHAT_ID, targetMessageId: leaf.id })
+    expect(controller.getSnapshot().active?.selectionRevision).toBe(
+      provisional.selectionRevision + 1,
+    )
+    expect(source.openSelection).toHaveBeenCalledTimes(2)
+
+    finishSelection()
+    await settle()
+    expect(presentedSpine(controller).resolvedLeafId).toBe(leaf.id)
+  })
+
+  it('keeps an exact explicit selection when the same pinned route arrives again', async () => {
+    const root = message('root', null, 0, 'root', 1)
+    const leaf = message('leaf', root.id, 0, 'leaf', 2)
+    const { controller, navigation, source } = harness([root, leaf])
+
+    navigation.arrive('arrival-explicit', { chatId: CHAT_ID, targetMessageId: leaf.id })
+    await settle()
+    const exact = controller.getSnapshot().active
+    if (!exact) throw new Error('missing exact route selection')
+    const calls = source.openSelection.mock.calls.length
+
+    navigation.arrive('arrival-explicit-echo', { chatId: CHAT_ID, targetMessageId: leaf.id })
+    await settle()
+
+    expect(controller.getSnapshot().active?.selectionRevision).toBe(exact.selectionRevision)
+    expect(source.openSelection).toHaveBeenCalledTimes(calls)
+  })
+
+  it('supersedes a provisional default tip when a different pinned route arrives', async () => {
+    const root = message('root', null, 0, 'root', 1)
+    const left = message('left', root.id, 0, 'left', 2)
+    const right = message('right', root.id, 1, 'right', 4)
+    const { controller, navigation, source } = harness([root, left, right])
+    let finishSelection = () => {}
+    source.selectionCompletionGate = new Promise<void>((resolve) => {
+      finishSelection = resolve
+    })
+
+    navigation.arrive('arrival-default', { chatId: CHAT_ID })
+    await settle()
+    const provisional = controller.getSnapshot().active
+    if (!provisional) throw new Error('missing provisional route selection')
+    expect(provisional.transcript).toMatchObject({
+      kind: 'point',
+      window: { leafId: right.id },
+    })
+
+    navigation.arrive('arrival-distinct-tip', { chatId: CHAT_ID, targetMessageId: left.id })
+    expect(controller.getSnapshot().active?.selectionRevision).toBe(
+      provisional.selectionRevision + 1,
+    )
+    expect(source.openSelection).toHaveBeenCalledTimes(2)
+
+    finishSelection()
+    await settle()
+    expect(presentedSpine(controller).resolvedLeafId).toBe(left.id)
   })
 
   it('resolves repeated message arrivals in the same mounted tab without reusing stale selection', async () => {

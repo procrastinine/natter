@@ -78,16 +78,23 @@ const MAX_TEXTAREA_PX = 600
 
 interface InlineEditorSession {
   active: boolean
+  textareaHeight: number | null
 }
 
-function autosize(el: HTMLTextAreaElement | null): void {
-  if (!el) return
+function sizeTextarea(el: HTMLTextAreaElement | null, fixedHeight: number | null): number | null {
+  if (!el) return fixedHeight
+  if (fixedHeight !== null) {
+    el.style.height = `${fixedHeight}px`
+    el.style.overflowY = el.scrollHeight > el.clientHeight ? 'auto' : 'hidden'
+    return fixedHeight
+  }
   el.style.height = 'auto'
   el.style.overflowY = 'hidden'
   const measuredHeight = el.scrollHeight
   const next = Math.min(measuredHeight, MAX_TEXTAREA_PX)
   el.style.height = `${next}px`
-  el.style.overflowY = measuredHeight > next ? 'auto' : 'hidden'
+  el.style.overflowY = measuredHeight > el.clientHeight ? 'auto' : 'hidden'
+  return el.getBoundingClientRect().height || el.clientHeight || next
 }
 
 export function InlineEditor({
@@ -142,7 +149,7 @@ export function InlineEditor({
   const actionsRef = useRef<HTMLDivElement | null>(null)
   const scrollRegionCommands = useScrollRegionCommands()
   const prefillTextareaRef = useRef<HTMLTextAreaElement | null>(null)
-  const sessionRef = useRef<InlineEditorSession>({ active: false })
+  const sessionRef = useRef<InlineEditorSession>({ active: false, textareaHeight: null })
   const pendingGenerationRef = useRef<Extract<GenerationSubmission, { kind: 'started' }> | null>(
     null,
   )
@@ -204,10 +211,14 @@ export function InlineEditor({
   }, [scrollRegionCommands])
   // biome-ignore lint/correctness/useExhaustiveDependencies: text changes alter textarea scrollHeight.
   useLayoutEffect(() => {
+    const resize = () => {
+      const session = sessionRef.current
+      session.textareaHeight = sizeTextarea(textareaRef.current, session.textareaHeight)
+    }
     if (scrollRegionCommands) {
-      scrollRegionCommands.preserveTextEditingViewport(() => autosize(textareaRef.current))
+      scrollRegionCommands.preserveTextEditingViewport(resize)
     } else {
-      autosize(textareaRef.current)
+      resize()
     }
   }, [scrollRegionCommands, text])
   useLayoutEffect(() => {
@@ -221,10 +232,14 @@ export function InlineEditor({
     const observer = new ResizeObserver(([entry]) => {
       if (!entry || Math.abs(entry.contentRect.width - measuredWidth) < 0.5) return
       measuredWidth = entry.contentRect.width
+      const resize = () => {
+        const session = sessionRef.current
+        session.textareaHeight = sizeTextarea(el, session.textareaHeight)
+      }
       if (scrollRegionCommands) {
-        scrollRegionCommands.preserveTextEditingViewport(() => autosize(el))
+        scrollRegionCommands.preserveTextEditingViewport(resize)
       } else {
-        autosize(el)
+        resize()
       }
     })
     observer.observe(el)

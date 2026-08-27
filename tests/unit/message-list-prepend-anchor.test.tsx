@@ -282,7 +282,7 @@ describe('message-list viewport transition contract', () => {
     const fixture = branchFixture(8)
     const initial = fixture.window(6, 2)
     const ref = createRef<ScrollRegionHandle>()
-    const loadOlder = vi.fn()
+    const loadOlder = vi.fn(() => true)
     const view = render(viewportElement(fixture, initial, 0, ref, loadOlder))
     const region = requireRegion(view.container)
     installRegionGeometry(region, () => 1_000)
@@ -308,7 +308,7 @@ describe('message-list viewport transition contract', () => {
     const fixture = branchFixture(8)
     const initial = fixture.window(6, 2)
     const ref = createRef<ScrollRegionHandle>()
-    const loadOlder = vi.fn()
+    const loadOlder = vi.fn(() => true)
     const view = render(viewportElement(fixture, initial, 0, ref, loadOlder))
     const region = requireRegion(view.container)
     installRegionGeometry(region, () => 1_000)
@@ -332,6 +332,39 @@ describe('message-list viewport transition contract', () => {
       'data-history-demand-anchor-id',
       'message-6',
     )
+  })
+
+  it('publishes history-demand evidence only for an accepted expansion', () => {
+    const fixture = branchFixture(8)
+    const initial = fixture.window(6, 2)
+    const ref = createRef<ScrollRegionHandle>()
+    const loadOlder = vi.fn().mockReturnValueOnce(false).mockReturnValueOnce(true)
+    const view = render(viewportElement(fixture, initial, 0, ref, loadOlder))
+    const region = requireRegion(view.container)
+    installRegionGeometry(region, () => 1_000)
+    const retained = requireMessage(view.container, 'message-6')
+    retained.getBoundingClientRect = () =>
+      rect({
+        top: 920 - region.scrollTop,
+        bottom: 940 - region.scrollTop,
+      })
+
+    act(() => view.rerender(viewportElement(fixture, initial, 0, ref, loadOlder)))
+    expect(region.scrollTop).toBe(900)
+
+    act(() => {
+      fireEvent.wheel(region, { deltaY: -320 })
+      fireEvent.click(view.getByRole('button', { name: 'Load more' }))
+    })
+    const list = view.container.querySelector('[data-ui="message-list"]')
+    expect(list).not.toHaveAttribute('data-history-demand-revision')
+    expect(list).not.toHaveAttribute('data-history-demand-anchor-id')
+
+    fireEvent.click(view.getByRole('button', { name: 'Load more' }))
+
+    expect(loadOlder).toHaveBeenCalledTimes(2)
+    expect(list).toHaveAttribute('data-history-demand-revision', '1')
+    expect(list).toHaveAttribute('data-history-demand-anchor-id', 'message-6')
   })
 
   it('preserves a physical prepend when controller preannouncement authority does not match', async () => {
@@ -451,7 +484,7 @@ describe('message-list viewport transition contract', () => {
       const ref = createRef<ScrollRegionHandle>()
       let viewportRevision = 0
       let snapshot = initial
-      const loadOlder = vi.fn()
+      const loadOlder = vi.fn(() => true)
       const element = () => viewportElement(fixture, snapshot, viewportRevision, ref, loadOlder)
       const view = render(element())
       const region = requireRegion(view.container)
@@ -548,7 +581,7 @@ function viewportElement(
   snapshot: TranscriptBodyWindow,
   viewportRevision: number,
   ref: React.RefObject<ScrollRegionHandle | null>,
-  onLoadOlderMessages: () => void = () => {},
+  onLoadOlderMessages: () => boolean = () => true,
 ) {
   return (
     <ScrollRegion

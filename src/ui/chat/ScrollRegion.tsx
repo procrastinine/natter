@@ -59,6 +59,7 @@ interface ScrollRegionProps {
   // independently of stream lifetime until its exact target is rendered.
   revealClaimKey?: string | number | null
   revealClaimTargetMessageId?: string | null
+  revealSurfaceAvailable?: boolean
   onRevealClaimConsumed?: () => void
 }
 
@@ -441,6 +442,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
     streamFollowTargetMessageId = null,
     revealClaimKey = null,
     revealClaimTargetMessageId = null,
+    revealSurfaceAvailable = true,
     onRevealClaimConsumed,
   },
   ref,
@@ -1366,7 +1368,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
         return
       }
       if (next === 'follow') {
-        if (source === 'scroll' && (userScrollIntentRef.current || nativeViewportMoved)) {
+        if (source === 'scroll' && userScrollIntentRef.current) {
           cancelViewportOwnership()
           clearProgrammaticScrollIntents()
           if (streamActiveRef.current && autoScrollOnStreamRef.current) {
@@ -1595,6 +1597,8 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
           return
         }
         const top = textEditingViewportTopRef.current ?? container.scrollTop
+        clearProgrammaticScrollIntents()
+        container.scrollTo({ top, behavior: 'auto' })
         change()
         writeScrollTopNow(top, 'text-edit-layout')
       },
@@ -2115,7 +2119,8 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
       revealClaimKey !== null &&
       readyLifecycle !== null &&
       readyLifecycle.status !== 'consumed' &&
-      Object.is(readyLifecycle.key, revealClaimKey)
+      Object.is(readyLifecycle.key, revealClaimKey) &&
+      revealSurfaceAvailable
     ) {
       const revealClaim = semanticFollowClaimForTarget(
         'reveal',
@@ -2160,6 +2165,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
     onRevealClaimConsumed,
     revealClaimKey,
     revealClaimTargetMessageId,
+    revealSurfaceAvailable,
     releaseSemanticClaim,
     resolveFollowTargetElement,
     scheduleFollowReconciliation,

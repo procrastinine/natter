@@ -25,30 +25,12 @@ export interface ConversationTranscriptDemand {
 export function useConversationTranscriptDemand(
   demand: ConversationTranscriptDemand | null,
   controller: ConversationController = conversationController,
+  rendererAvailable = true,
 ): void {
   const owner = useRef({})
   useEffect(() => {
-    if (
-      demand === null ||
-      typeof requestAnimationFrame === 'undefined' ||
-      document.visibilityState !== 'visible'
-    ) {
-      controller.setTranscriptDemand(owner.current, demand)
-      return
-    }
-    let firstFrame: number | null = requestAnimationFrame(() => {
-      firstFrame = null
-      secondFrame = requestAnimationFrame(() => {
-        secondFrame = null
-        controller.setTranscriptDemand(owner.current, demand)
-      })
-    })
-    let secondFrame: number | null = null
-    return () => {
-      if (firstFrame !== null) cancelAnimationFrame(firstFrame)
-      if (secondFrame !== null) cancelAnimationFrame(secondFrame)
-    }
-  }, [controller, demand])
+    controller.setTranscriptDemand(owner.current, rendererAvailable ? demand : null)
+  }, [controller, demand, rendererAvailable])
   useEffect(() => () => controller.setTranscriptDemand(owner.current, null), [controller])
 }
 
