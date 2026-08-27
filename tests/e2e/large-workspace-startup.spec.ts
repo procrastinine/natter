@@ -45,12 +45,61 @@ const LONG_TASK_THRESHOLD_MS = 50
 const CARDINALITY_BLOCKING_TIME_HEADROOM_MS = 50
 const FOREGROUND_FORK_REQUEST_BOUND = 1_600
 const FOREGROUND_INTERRUPTED_COPY_MAX_ROWS = 64
+const FOREGROUND_FORK_WORKSPACE_DATABASE_NAMES = new Set([
+  'natter',
+  'natter-workspace-a',
+  'natter-workspace-b',
+])
 const GENERATED_WORKSPACE_FORK_TARGET_ID = 'generated-active-message-086'
 const GENERATED_WORKSPACE_MODEL_ID = 'google/gemini-3.5-flash'
 const BROWSER_WORKSPACE_CONTROL_DATABASE_NAME = 'natter-control'
 const CANONICAL_PHYSICAL_STORAGE_TABLE_NAMES = discoverCanonicalPhysicalStorageTableNames()
 
 test.describe.configure({ mode: 'serial', timeout: 5 * 60_000 })
+
+test('foreground fork accounting distinguishes bounded replacement activation', () => {
+  const stable = foregroundForkProfileFixture()
+  expect(() => assertForegroundFork('stable', stable)).not.toThrow()
+
+  const activated = foregroundForkProfileFixture({
+    destinationDatabaseName: 'natter',
+    idbCalls: {
+      'objectStore.messages.get.bounded': 230,
+      'objectStore.messageBodies.get.bounded': 106,
+      'objectStore.childLists.get.bounded': 100,
+      'objectStore.childSlotMembers.get.bounded': 98,
+      'database.transaction:manifests:readonly': 3,
+      'database.transaction:compactionStates,manifests:readwrite': 1,
+      'objectStore.compactionStates.get.bounded': 1,
+      'objectStore.compactionStates.put.bounded': 1,
+      'objectStore.manifests.get.bounded': 4,
+      'objectStore.manifests.put.bounded': 1,
+      'factory.open:natter': 2,
+      'objectStore.replacementCatchup__messageBodies.openCursor.bounded': 1,
+      'objectStore.replacementCatchup__messages.openCursor.bounded': 1,
+    },
+    settingMutations: [
+      {
+        method: 'put',
+        key: 'backfill:chat-sidebar-aggregate-v1',
+        at: 1,
+      },
+    ],
+  })
+  expect(() => assertForegroundFork('activated', activated)).not.toThrow()
+  expect(() =>
+    assertForegroundForkStorageOverlap('unproven activation', {
+      ...stable,
+      destinationDatabaseName: 'natter',
+    }),
+  ).toThrow(/database change has replacement evidence/u)
+  expect(() =>
+    assertForegroundForkStorageOverlap('unknown database', {
+      ...activated,
+      destinationDatabaseName: 'natter-untracked',
+    }),
+  ).toThrow(/known destination database/u)
+})
 
 test('startup work and first interaction stay cardinality-bounded in a 4k-chat workspace', async ({
   baseURL,
@@ -1664,9 +1713,7 @@ function assertNoCanonicalWholeTableRouteRead(name: string, routeSwitch: RouteSw
 }
 
 function assertForegroundFork(name: string, profile: ForegroundForkProfile): void {
-  expect(profile.destinationDatabaseName, `${name} active database identity`).toBe(
-    profile.sourceDatabaseName,
-  )
+  const replacementActivity = assertForegroundForkStorageOverlap(name, profile)
   expect(profile.sourceMessageCount, `${name} source message count`).toBe(96)
   expect(profile.destinationMessageCount, `${name} destination message count`).toBe(87)
   expect(profile.durationMs, `${name} fork hang bound`).toBeLessThan(HANG_BOUND_MS)
@@ -1675,23 +1722,15 @@ function assertForegroundFork(name: string, profile: ForegroundForkProfile): voi
   expect(profile.idbRequests, `${name} total bounded fork requests`).toBeLessThanOrEqual(
     FOREGROUND_FORK_REQUEST_BOUND,
   )
-  expect(
-    foregroundForkPrimaryCalls(profile.idbCalls),
-    `${name} primary fork request shape`,
-  ).toEqual({
-    'objectStore.messages.get.bounded': 106,
-    'objectStore.messageBodies.get.bounded': 96,
-    'objectStore.childLists.get.bounded': 89,
-    'objectStore.childSlotMembers.get.bounded': 88,
-    'objectStore.messages.add.bounded': 87,
-    'objectStore.messageBodies.add.bounded': 87,
-    'objectStore.messagePreviews.add.bounded': 87,
-    'objectStore.chats.add.bounded': 1,
-    'objectStore.configurationLinks.add.bounded': 2,
-    'objectStore.childLists.add.bounded': 87,
-    'objectStore.childSlotMembers.add.bounded': 87,
-    'objectStore.configurationProfileUsageRows.put.bounded': 1,
-  })
+  for (const [key, expected] of Object.entries(FOREGROUND_FORK_PRIMARY_READ_CALLS)) {
+    const actual = profile.idbCalls[key] ?? 0
+    const assertion = expect(actual, `${name} bounded primary fork read ${key}`)
+    if (replacementActivity) assertion.toBeGreaterThanOrEqual(expected)
+    else assertion.toBe(expected)
+  }
+  expect(foregroundForkPrimaryWriteCalls(profile.idbCalls), `${name} primary fork writes`).toEqual(
+    FOREGROUND_FORK_PRIMARY_WRITE_CALLS,
+  )
   expect(
     profile.idbCalls['objectStore.chatSidebarRows.put.bounded'] ?? 0,
     `${name} fork plus last-viewed sidebar projections`,
@@ -1701,41 +1740,195 @@ function assertForegroundFork(name: string, profile: ForegroundForkProfile): voi
     `${name} last-viewed chat projection`,
   ).toBeLessThanOrEqual(1)
   assertForegroundForkCatchupShape(name, profile.idbCalls)
-  const interruptedCopyCursorRows = Object.entries(profile.idbCalls)
-    .filter(([key]) => /^cursor\.[^.]+\.continue$/u.test(key))
-    .reduce((sum, [, count]) => sum + count, 0)
+  const interruptedCopyCursorRows = Object.entries(profile.idbCalls).filter(([key]) =>
+    /^cursor\.[^.]+\.continue$/u.test(key),
+  )
   expect(
-    interruptedCopyCursorRows,
+    interruptedCopyCursorRows.filter(
+      ([key, count]) => count > 0 && !/^cursor\.replacementCatchup__[^.]+\.continue$/u.test(key),
+    ),
+    `${name} non-replacement cursor rows`,
+  ).toEqual([])
+  for (const [key] of interruptedCopyCursorRows) {
+    const tableName = key.match(/^cursor\.replacementCatchup__([^.]+)\.continue$/u)?.[1]
+    expect(
+      tableName !== undefined && CANONICAL_PHYSICAL_STORAGE_TABLE_NAMES.includes(tableName),
+      `${name} known copy-row table ${key}`,
+    ).toBe(true)
+  }
+  expect(
+    interruptedCopyCursorRows.reduce((sum, [, count]) => sum + count, 0),
     `${name} interrupted compaction cursor rows`,
   ).toBeLessThanOrEqual(FOREGROUND_INTERRUPTED_COPY_MAX_ROWS)
+  const interruptedCopyCursorPages = Object.entries(profile.idbCalls).filter(
+    ([key, count]) => count > 0 && /^objectStore\.[^.]+\.openCursor\.bounded$/u.test(key),
+  )
   expect(
-    Object.entries(profile.idbCalls)
-      .filter(([key]) => /^objectStore\.[^.]+\.openCursor\.bounded$/u.test(key))
-      .reduce((sum, [, count]) => sum + count, 0),
-    `${name} interrupted compaction cursor pages`,
-  ).toBeLessThanOrEqual(1)
+    interruptedCopyCursorPages.filter(
+      ([key]) => !/^objectStore\.replacementCatchup__[^.]+\.openCursor\.bounded$/u.test(key),
+    ),
+    `${name} non-replacement cursor pages`,
+  ).toEqual([])
+  for (const [key, count] of interruptedCopyCursorPages) {
+    const tableName = key.match(
+      /^objectStore\.replacementCatchup__([^.]+)\.openCursor\.bounded$/u,
+    )?.[1]
+    expect(
+      tableName !== undefined && CANONICAL_PHYSICAL_STORAGE_TABLE_NAMES.includes(tableName),
+      `${name} known copy-page table ${key}`,
+    ).toBe(true)
+    expect(count, `${name} single bounded copy page ${key}`).toBeLessThanOrEqual(1)
+  }
+  expect(
+    interruptedCopyCursorPages.length,
+    `${name} interrupted compaction table pages`,
+  ).toBeLessThanOrEqual(CANONICAL_PHYSICAL_STORAGE_TABLE_NAMES.length)
   expect(
     canonicalWholeTableReads(profile.idbCalls),
     `${name} fork canonical whole-table reads`,
   ).toEqual([])
+}
+
+const FOREGROUND_FORK_PRIMARY_READ_CALLS = Object.freeze({
+  'objectStore.messages.get.bounded': 106,
+  'objectStore.messageBodies.get.bounded': 96,
+  'objectStore.childLists.get.bounded': 89,
+  'objectStore.childSlotMembers.get.bounded': 88,
+})
+
+const FOREGROUND_FORK_PRIMARY_WRITE_CALLS = Object.freeze({
+  'objectStore.messages.add.bounded': 87,
+  'objectStore.messageBodies.add.bounded': 87,
+  'objectStore.messagePreviews.add.bounded': 87,
+  'objectStore.chats.add.bounded': 1,
+  'objectStore.configurationLinks.add.bounded': 2,
+  'objectStore.childLists.add.bounded': 87,
+  'objectStore.childSlotMembers.add.bounded': 87,
+  'objectStore.configurationProfileUsageRows.put.bounded': 1,
+})
+
+function foregroundForkPrimaryWriteCalls(
+  calls: Readonly<Record<string, number>>,
+): Readonly<Record<keyof typeof FOREGROUND_FORK_PRIMARY_WRITE_CALLS, number>> {
+  return Object.fromEntries(
+    Object.keys(FOREGROUND_FORK_PRIMARY_WRITE_CALLS).map((key) => [key, calls[key] ?? 0]),
+  ) as Readonly<Record<keyof typeof FOREGROUND_FORK_PRIMARY_WRITE_CALLS, number>>
+}
+
+type ForegroundForkStorageOverlap = Pick<
+  ForegroundForkProfile,
+  'sourceDatabaseName' | 'destinationDatabaseName' | 'idbCalls' | 'settingMutations'
+>
+
+function foregroundForkProfileFixture(
+  overrides: Partial<ForegroundForkProfile> = {},
+): ForegroundForkProfile {
+  const idbCalls = {
+    ...FOREGROUND_FORK_PRIMARY_READ_CALLS,
+    ...FOREGROUND_FORK_PRIMARY_WRITE_CALLS,
+    ...overrides.idbCalls,
+  }
+  return {
+    sourceDatabaseName: 'natter-workspace-b',
+    destinationDatabaseName: 'natter-workspace-b',
+    destinationChatId: 'synthetic-fork',
+    durationMs: 100,
+    heartbeatTicks: 1,
+    heartbeatMaxGapMs: 20,
+    sourceMessageCount: 96,
+    destinationMessageCount: 87,
+    idbRequests: Object.values(idbCalls).reduce((sum, count) => sum + count, 0),
+    settingMutations: [],
+    ...overrides,
+    idbCalls,
+  }
+}
+
+function assertForegroundForkStorageOverlap(
+  name: string,
+  profile: ForegroundForkStorageOverlap,
+): boolean {
+  expect(
+    FOREGROUND_FORK_WORKSPACE_DATABASE_NAMES.has(profile.sourceDatabaseName),
+    `${name} known source database`,
+  ).toBe(true)
+  expect(
+    FOREGROUND_FORK_WORKSPACE_DATABASE_NAMES.has(profile.destinationDatabaseName),
+    `${name} known destination database`,
+  ).toBe(true)
+
+  const workspaceDatabaseOpens = Object.entries(profile.idbCalls).filter(
+    ([key, count]) =>
+      count > 0 &&
+      key.startsWith('factory.open:') &&
+      FOREGROUND_FORK_WORKSPACE_DATABASE_NAMES.has(key.slice('factory.open:'.length)),
+  )
+  const replacementActivity =
+    (profile.idbCalls['objectStore.compactionStates.put.bounded'] ?? 0) > 0 ||
+    (profile.idbCalls['objectStore.manifests.put.bounded'] ?? 0) > 0 ||
+    Object.entries(profile.idbCalls).some(
+      ([key, count]) =>
+        count > 0 && /^objectStore\.replacementCatchup__[^.]+\.openCursor\.bounded$/u.test(key),
+    )
+
   const databaseOpens = Object.entries(profile.idbCalls).filter(
     ([key, count]) => count > 0 && key.startsWith('factory.open:'),
   )
   expect(
-    databaseOpens.filter(
-      ([key]) => key !== `factory.open:${BROWSER_WORKSPACE_CONTROL_DATABASE_NAME}`,
-    ),
-    `${name} fork workspace database opens`,
+    databaseOpens.filter(([key]) => {
+      const databaseName = key.slice('factory.open:'.length)
+      return (
+        databaseName !== BROWSER_WORKSPACE_CONTROL_DATABASE_NAME &&
+        !FOREGROUND_FORK_WORKSPACE_DATABASE_NAMES.has(databaseName)
+      )
+    }),
+    `${name} unknown database opens`,
   ).toEqual([])
   expect(
     profile.idbCalls[`factory.open:${BROWSER_WORKSPACE_CONTROL_DATABASE_NAME}`] ?? 0,
     `${name} fork control database opens`,
   ).toBeLessThanOrEqual(1)
+  expect(
+    workspaceDatabaseOpens.reduce((sum, [, count]) => sum + count, 0),
+    `${name} bounded workspace database opens`,
+  ).toBeLessThanOrEqual(2)
+  if (!replacementActivity) expect(workspaceDatabaseOpens, `${name} workspace opens`).toEqual([])
+
+  if (profile.destinationDatabaseName !== profile.sourceDatabaseName) {
+    expect(replacementActivity, `${name} database change has replacement evidence`).toBe(true)
+    expect(
+      workspaceDatabaseOpens.every(
+        ([key]) => key === `factory.open:${profile.destinationDatabaseName}`,
+      ),
+      `${name} database change only opens the activated slot`,
+    ).toBe(true)
+    expect(
+      profile.idbCalls[`factory.open:${profile.destinationDatabaseName}`] ?? 0,
+      `${name} activated database open`,
+    ).toBeGreaterThan(0)
+    expect(
+      profile.idbCalls['database.transaction:compactionStates,manifests:readwrite'] ?? 0,
+      `${name} atomic manifest activation`,
+    ).toBe(1)
+    expect(
+      profile.idbCalls['objectStore.compactionStates.put.bounded'] ?? 0,
+      `${name} compaction state publication`,
+    ).toBe(1)
+    expect(
+      profile.idbCalls['objectStore.manifests.put.bounded'] ?? 0,
+      `${name} active manifest publication`,
+    ).toBe(1)
+  }
+
   const allowedControlAccountingCalls = new Set([
     'database.transaction:compactionStates,manifests:readonly',
+    'database.transaction:compactionStates,manifests:readwrite',
     'database.transaction:compactionStates:readwrite',
+    'database.transaction:manifests:readonly',
     'objectStore.compactionStates.get.bounded',
     'objectStore.compactionStates.put.bounded',
+    'objectStore.manifests.get.bounded',
+    'objectStore.manifests.put.bounded',
   ])
   expect(
     Object.entries(profile.idbCalls).filter(
@@ -1746,33 +1939,18 @@ function assertForegroundFork(name: string, profile: ForegroundForkProfile): voi
     ),
     `${name} fork control database work`,
   ).toEqual([])
-  for (const key of allowedControlAccountingCalls) {
-    expect(profile.idbCalls[key] ?? 0, `${name} fork bounded ${key}`).toBeLessThanOrEqual(1)
-  }
-  expect(profile.settingMutations, `${name} fork workspace-slot writes`).toEqual([])
-}
 
-const FOREGROUND_FORK_PRIMARY_CALL_KEYS = [
-  'objectStore.messages.get.bounded',
-  'objectStore.messageBodies.get.bounded',
-  'objectStore.childLists.get.bounded',
-  'objectStore.childSlotMembers.get.bounded',
-  'objectStore.messages.add.bounded',
-  'objectStore.messageBodies.add.bounded',
-  'objectStore.messagePreviews.add.bounded',
-  'objectStore.chats.add.bounded',
-  'objectStore.configurationLinks.add.bounded',
-  'objectStore.childLists.add.bounded',
-  'objectStore.childSlotMembers.add.bounded',
-  'objectStore.configurationProfileUsageRows.put.bounded',
-] as const
-
-function foregroundForkPrimaryCalls(
-  calls: Readonly<Record<string, number>>,
-): Readonly<Record<(typeof FOREGROUND_FORK_PRIMARY_CALL_KEYS)[number], number>> {
-  return Object.fromEntries(
-    FOREGROUND_FORK_PRIMARY_CALL_KEYS.map((key) => [key, calls[key] ?? 0]),
-  ) as Readonly<Record<(typeof FOREGROUND_FORK_PRIMARY_CALL_KEYS)[number], number>>
+  const settingMutations = profile.settingMutations.map(({ method, key }) => ({ method, key }))
+  expect(
+    settingMutations.filter(
+      ({ method, key }) => method !== 'put' || key !== 'backfill:chat-sidebar-aggregate-v1',
+    ),
+    `${name} unknown workspace-slot writes`,
+  ).toEqual([])
+  expect(settingMutations.length, `${name} bounded workspace-slot writes`).toBeLessThanOrEqual(
+    replacementActivity ? 1 : 0,
+  )
+  return replacementActivity
 }
 
 const FOREGROUND_FORK_CATCHUP_CALLS = Object.freeze({
