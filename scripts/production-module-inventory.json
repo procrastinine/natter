@@ -665,7 +665,7 @@
       "domain": "presentation-state",
       "layer": "application",
       "responsibility": "Compose the single presentation interaction runtime and expose application-owned capabilities to presentation adapters.",
-      "paths": ["src/app/presentation-interactions.ts"]
+      "paths": ["src/app/presentation-dialog.ts", "src/app/presentation-interactions.ts"]
     },
     {
       "domain": "presentation-state",
@@ -766,6 +766,7 @@
         "src/ui/primitives/ConfirmDialog.tsx",
         "src/ui/primitives/Dialog.tsx",
         "src/ui/primitives/LiveRegions.tsx",
+        "src/ui/primitives/PresentationDialogHost.tsx",
         "src/ui/primitives/SvgAction.tsx",
         "src/ui/primitives/virtual-spacer.ts"
       ]

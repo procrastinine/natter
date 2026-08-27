@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { createChat } from '../helpers/chats'
 import 'fake-indexeddb/auto'
 import Dexie from 'dexie'
@@ -21,6 +21,7 @@ import {
 } from '../../src/store/browser-workspace-lifecycle'
 import { getChat } from '../../src/store/chats'
 import { __resetDbForTests } from '../../src/store/db'
+import { PresentationDialogHost } from '../../src/ui/primitives/PresentationDialogHost'
 import { ApiModeSection, ReasoningIncludeControls } from '../../src/ui/settings/ParamForm'
 import { reasoningEnvelopeFromDetailsForTest } from '../helpers/reasoning-events'
 
@@ -232,39 +233,30 @@ describe('ApiModeSection — two-button toggle', () => {
     })
   })
 
-  it('gates the Chat pin behind a confirm() dialog on phase-echo models', async () => {
-    // gpt-5.4-nano has requiresPhaseEcho — clicking Chat must trip the
-    // confirmation. window.confirm is stubbed to return true, then the
-    // pin is verified to persist.
+  it('gates the Chat pin behind a non-blocking dialog on phase-echo models', async () => {
     const settings = cloneDefaultChatSettings()
     settings.model = 'openai/gpt-5.4-nano'
     const chat = await createChat({ settings })
     const capability = effectiveCapabilityFromEndpoints(settings.model, [makeEndpoint()])
     const profile = makeProfile('openrouter')
-    const originalConfirm = window.confirm
-    let prompted = false
-    window.confirm = () => {
-      prompted = true
-      return true
-    }
-    try {
-      render(
+    render(
+      <>
         <ApiModeSection
           chat={chat}
           capability={capability}
           profile={profile}
           routing={routeFor(chat, capability, profile)}
-        />,
-      )
-      fireEvent.click(screen.getByRole('button', { name: 'Chat completions' }))
-      await waitFor(async () => {
-        const updated = await getChat(chat.id)
-        expect(updated?.settings.api).toBe('chat')
-      })
-    } finally {
-      window.confirm = originalConfirm
-    }
-    expect(prompted).toBe(true)
+        />
+        <PresentationDialogHost />
+      </>,
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'Chat completions' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Switch API mode?' })
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Switch anyway' }))
+    await waitFor(async () => {
+      const updated = await getChat(chat.id)
+      expect(updated?.settings.api).toBe('chat')
+    })
   })
 
   it('uses the active path when deciding the resolved route', async () => {

@@ -20,6 +20,21 @@ export async function waitForWorkspaceRunning(page: Page): Promise<void> {
   await waitForWorkspaceFixtureRunning(page)
 }
 
+export async function submitPresentationTextDialog(page: Page, value: string): Promise<void> {
+  const dialog = page
+    .getByRole('dialog')
+    .filter({ has: page.locator('[data-ui="presentation-dialog-input"]') })
+  await expect(dialog).toBeVisible()
+  await dialog.getByRole('textbox').fill(value)
+  await dialog.locator('[data-role="confirm"]').click()
+}
+
+export async function confirmPresentationDialog(page: Page): Promise<void> {
+  const dialog = page.getByRole('dialog')
+  await expect(dialog).toBeVisible()
+  await dialog.locator('[data-role="confirm"]').click()
+}
+
 export async function activeWorkspaceDatabaseName(page: Page): Promise<string> {
   return page.evaluate(async () => {
     const knownNames =
@@ -180,27 +195,29 @@ interface SeedOptions {
 }
 
 const DEFAULT_E2E_MODEL = 'google/gemini-3.5-flash'
+const DEFAULT_E2E_API_KEY = 'sk-or-v1-test-00000000000000000000000000000000000000000000'
 
-// Open the first-run Add connection action and submit a stub key. `apiKey`
-// defaults to a harmless placeholder because the route-mocked specs never hit
-// OpenRouter. Use `seedReal(page)` when the spec needs the real key from
-// `key.txt`.
-export async function seedFirstRun(page: Page, opts: SeedOptions = {}): Promise<void> {
-  const apiKey = opts.apiKey ?? 'sk-or-v1-test-00000000000000000000000000000000000000000000'
-  const model = opts.model ?? DEFAULT_E2E_MODEL
+async function addFirstRunConnection(page: Page, apiKey: string): Promise<void> {
   const currentUrl = new URL(page.url())
   if (currentUrl.pathname !== '/' || currentUrl.hash) await page.goto('/')
   await page.locator('[data-ui="connection-add"]').click()
   const input = page.locator('[data-ui="connection-setup-key"]')
   await input.fill(apiKey)
   await page.locator('[data-ui="connection-setup-submit"]').click()
-  // The modal closes automatically once the seed completes; wait for it.
   await page.locator('[data-ui="connection-setup-modal"]').waitFor({ state: 'detached' })
-  // Once configured, the first-run Add connection action disappears; active
-  // chats expose connection editing through the provider icon in the title row.
   await page.locator('[data-ui="connection-empty-action"]').waitFor({
     state: 'detached',
   })
+}
+
+// Open the first-run Add connection action and submit a stub key. `apiKey`
+// defaults to a harmless placeholder because the route-mocked specs never hit
+// OpenRouter. Use `seedReal(page)` when the spec needs the real key from
+// `key.txt`.
+export async function seedFirstRun(page: Page, opts: SeedOptions = {}): Promise<void> {
+  const apiKey = opts.apiKey ?? DEFAULT_E2E_API_KEY
+  const model = opts.model ?? DEFAULT_E2E_MODEL
+  await addFirstRunConnection(page, apiKey)
   await configureWorkspaceThroughUi(page, {
     model,
     ...(opts.disablePrivacyFilter === false ? {} : { paretoFilter: false }),
@@ -208,6 +225,11 @@ export async function seedFirstRun(page: Page, opts: SeedOptions = {}): Promise<
       ? {}
       : { workspaceSettings: { 'global:cors-proxy-url': opts.corsProxyUrl } }),
   })
+  await createChatAndOpen(page)
+}
+
+export async function seedFirstRunFromOnboarding(page: Page): Promise<void> {
+  await addFirstRunConnection(page, DEFAULT_E2E_API_KEY)
   await createChatAndOpen(page)
 }
 

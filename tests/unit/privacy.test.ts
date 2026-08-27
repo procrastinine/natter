@@ -59,6 +59,12 @@ describe('dominates', () => {
     expect(dominates(unknownRetention, shortRetention)).toBe(false)
   })
 
+  it('user IDs alone dominates user IDs plus prompt retention within the same tier', () => {
+    const userIdsOnly: DataPolicy = { ...clean, requiresUserIDs: true }
+    expect(dominates(userIdsOnly, shortRetention)).toBe(true)
+    expect(dominates(shortRetention, userIdsOnly)).toBe(false)
+  })
+
   it('the better category wins before within-category Pareto comparison', () => {
     const aiStudio: DataPolicy = {
       ...clean,

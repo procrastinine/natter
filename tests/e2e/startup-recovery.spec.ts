@@ -15,6 +15,7 @@ test('startup opens the committed source while a live replacement owns selection
   context,
   page,
 }) => {
+  await waitForWorkspaceRunning(page)
   const replacement = await page.evaluate(async () => {
     let releaseSelectionGate!: () => void
     const held = new Promise<void>((resolve) => {

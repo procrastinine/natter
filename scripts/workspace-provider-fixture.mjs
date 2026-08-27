@@ -248,13 +248,12 @@ async function restoreWorkspaceThroughUi(page, backup, options = {}) {
       page,
       /^Imported workspace backup \(\d+ chats\)\.$/u,
       async () => {
-        const dialogPromise = acceptNextDialog(page)
         releaseWorkspaceImportFile = await setWorkspaceImportFile(
           page,
           backup,
           options.filename ?? 'natter-workspace-fixture.json',
         )
-        await dialogPromise
+        await confirmWorkspaceReplacement(page)
       },
     )
   } finally {
@@ -602,12 +601,10 @@ function retargetBackup(backup, providerBaseUrl, target) {
   return backup
 }
 
-async function acceptNextDialog(page) {
-  return new Promise((resolve, reject) => {
-    page.once('dialog', (dialog) => {
-      dialog.accept().then(resolve, reject)
-    })
-  })
+async function confirmWorkspaceReplacement(page) {
+  const dialog = page.getByRole('dialog', { name: 'Replace local workspace?' })
+  await dialog.waitFor({ state: 'visible' })
+  await dialog.locator('[data-role="confirm"]').click()
 }
 
 export async function retargetWorkspaceThroughBackupImport(page, providerBaseUrl, options = {}) {

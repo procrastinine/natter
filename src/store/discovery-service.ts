@@ -25,6 +25,7 @@ import { getCachedPrivacyPolicy } from './privacy-cache'
 import {
   type ConnectionDiscoverySnapshot,
   connectionDiscoveryRevisionKey,
+  type DiscoveryCachePutResult,
   type DiscoveryModelsPutResult,
   type WorkspaceReadAuthority,
   type WorkspaceWriteAuthority,
@@ -79,6 +80,13 @@ export function staleDiscoveryRow<Row>(error: unknown): Row | undefined {
   return error instanceof DiscoveryResolutionError ? (error.stale as Row | undefined) : undefined
 }
 
+export class DiscoveryPublicationRejectedError extends Error {
+  constructor(kind: 'models' | 'endpoints' | 'privacy', profileId: ProfileId) {
+    super(`DiscoveryPublicationRejected:${kind}:${profileId}`)
+    this.name = 'DiscoveryPublicationRejectedError'
+  }
+}
+
 async function resolveModelsDiscovery(
   profile: ConnectionProfile,
   query: ModelsQuery,
@@ -128,7 +136,10 @@ async function resolveModelsDiscovery(
         kind: 'discovery.models.put',
         row,
       })
-      if (publication && !publication.cached) requestConfigurationModelResolution(row)
+      if (!publication.accepted) {
+        throw new DiscoveryPublicationRejectedError('models', target.profile.id)
+      }
+      if (!publication.cached) requestConfigurationModelResolution(row)
       return row
     },
   )
@@ -185,10 +196,13 @@ export async function resolveEndpointsDiscovery(
         fetchedAt: nextDiscoveryFetchedAt(cached),
         payload,
       }
-      await publishDiscoveryRow(authority, target.revision, {
+      const publication = await publishDiscoveryRow(authority, target.revision, {
         kind: 'discovery.endpoints.put',
         row,
       })
+      if (!publication.accepted) {
+        throw new DiscoveryPublicationRejectedError('endpoints', target.profile.id)
+      }
       return row
     },
   )
@@ -246,7 +260,7 @@ export async function resolvePrivacyDiscovery(
         fetchedAt,
         payload: { policies, fetchedAt },
       }
-      await publishDiscoveryRow(
+      const publication = await publishDiscoveryRow(
         authority,
         target.revision,
         {
@@ -255,6 +269,14 @@ export async function resolvePrivacyDiscovery(
         },
         cached ?? null,
       )
+      if (!publication.accepted) {
+        const winner = matchingRevision(
+          await getCachedPrivacyPolicy(target.profile.id, modelId, authority),
+          revision,
+        )
+        if (winner) return winner
+        throw new DiscoveryPublicationRejectedError('privacy', target.profile.id)
+      }
       return row
     },
   )
@@ -312,7 +334,7 @@ async function publishDiscoveryRow(
     | { kind: 'discovery.endpoints.put'; row: CachedEndpointsRow }
     | { kind: 'discovery.privacy.put'; row: CachedPrivacyPolicyRow },
   expectedCurrent?: CachedPrivacyPolicyRow | null,
-): Promise<DiscoveryModelsPutResult | undefined> {
+): Promise<DiscoveryModelsPutResult | DiscoveryCachePutResult> {
   switch (command.kind) {
     case 'discovery.models.put':
       return getWorkspaceRepository()
@@ -322,19 +344,22 @@ async function publishDiscoveryRow(
         })
         .then((envelope) => envelope.value)
     case 'discovery.endpoints.put':
-      await getWorkspaceRepository().execute(authority, {
-        ...command,
-        guard: { expectedProfileRevision: revision },
-      })
-      return
+      return getWorkspaceRepository()
+        .execute(authority, {
+          ...command,
+          guard: { expectedProfileRevision: revision },
+        })
+        .then((envelope) => envelope.value)
     case 'discovery.privacy.put':
-      await getWorkspaceRepository().execute(authority, {
-        ...command,
-        guard: {
-          expectedProfileRevision: revision,
-          ...(expectedCurrent !== undefined ? { expectedCurrent } : {}),
-        },
-      })
+      return getWorkspaceRepository()
+        .execute(authority, {
+          ...command,
+          guard: {
+            expectedProfileRevision: revision,
+            ...(expectedCurrent !== undefined ? { expectedCurrent } : {}),
+          },
+        })
+        .then((envelope) => envelope.value)
   }
 }
 

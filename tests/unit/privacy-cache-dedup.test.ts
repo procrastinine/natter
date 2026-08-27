@@ -10,8 +10,12 @@ import { DEV_CORS_PROXY_URL } from '../../src/core/cors-proxy'
 import type { ConnectionProfile, DataPolicy } from '../../src/core/types'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
 import { __resetBrowserRepositoryForTests } from '../../src/store/browser-repo'
+import { configurationRequestRevisionFor } from '../../src/store/configuration-domain-contract'
 import { __resetDbForTests, getDb } from '../../src/store/db'
-import { resolvePrivacyDiscovery } from '../../src/store/discovery-service'
+import {
+  DiscoveryPublicationRejectedError,
+  resolvePrivacyDiscovery,
+} from '../../src/store/discovery-service'
 import { withNamedLock } from '../../src/store/locks'
 import { getCachedPrivacyPolicy } from '../../src/store/privacy-cache'
 import { __resetWorkspaceRepositoryForTests } from '../../src/store/workspace-repository'
@@ -141,7 +145,7 @@ describe('unified privacy discovery single-flight', () => {
     expect(fetchPrivacyScrapeMock).toHaveBeenCalledTimes(3)
   })
 
-  it('does not commit a response captured for an obsolete profile revision', async () => {
+  it('rejects privacy discovery captured for an obsolete profile revision', async () => {
     const selected = await seedProfile()
     const gate = deferred<ReturnType<typeof scrapeResult>>()
     fetchPrivacyScrapeMock.mockReturnValueOnce(gate.promise)
@@ -150,7 +154,26 @@ describe('unified privacy discovery single-flight', () => {
 
     await getDb().profiles.put({ ...selected, requestRevision: 1, updatedAt: 2 })
     gate.resolve(scrapeResult('openai/gpt-5.4', { azure: policy() }))
-    await pending
+    await expect(pending).rejects.toBeInstanceOf(DiscoveryPublicationRejectedError)
+
+    expect(fetchPrivacyScrapeMock).toHaveBeenCalledOnce()
+    expect(await getCachedPrivacyPolicy(selected.id, 'openai/gpt-5.4')).toBeUndefined()
+  })
+
+  it('rejects an obsolete generation-captured privacy revision without publishing it', async () => {
+    const selected = await seedProfile()
+    const gate = deferred<ReturnType<typeof scrapeResult>>()
+    fetchPrivacyScrapeMock.mockReturnValueOnce(gate.promise)
+    const pending = resolvePrivacyDiscovery(selected, 'openai/gpt-5.4', {
+      proxy: { url: DEV_CORS_PROXY_URL, secret: '' },
+      expectedRevision: configurationRequestRevisionFor(selected, undefined),
+      apiKey: '',
+    })
+    await vi.waitFor(() => expect(fetchPrivacyScrapeMock).toHaveBeenCalledOnce())
+
+    await getDb().profiles.put({ ...selected, requestRevision: 1, updatedAt: 2 })
+    gate.resolve(scrapeResult('openai/gpt-5.4', { azure: policy() }))
+    await expect(pending).rejects.toBeInstanceOf(DiscoveryPublicationRejectedError)
 
     expect(await getCachedPrivacyPolicy(selected.id, 'openai/gpt-5.4')).toBeUndefined()
   })
@@ -165,7 +188,7 @@ describe('unified privacy discovery single-flight', () => {
     const winning = { policies: { openai: policy() }, fetchedAt: Date.now() + 1 }
     await putCachedPrivacyPolicy(selected.id, 'openai/gpt-5.4', winning, winning.fetchedAt)
     gate.resolve(scrapeResult('openai/gpt-5.4', { azure: policy() }))
-    await pending
+    await expect(pending).resolves.toMatchObject({ payload: winning })
 
     expect((await getCachedPrivacyPolicy(selected.id, 'openai/gpt-5.4'))?.payload).toEqual(winning)
   })

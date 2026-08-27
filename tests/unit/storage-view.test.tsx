@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { ownBrowserWorkspaceSuite } from '../helpers/browser-workspace-suite'
 import { createChat, putTestChats, updateChatForTest } from '../helpers/chats'
 import 'fake-indexeddb/auto'
@@ -50,6 +50,7 @@ import {
 } from '../../src/store/workspace-repository'
 import { useToastStore } from '../../src/store/zustand/toastStore'
 import { jsonEntriesZipBlob } from '../../src/ui/import-export/json-file'
+import { PresentationDialogHost } from '../../src/ui/primitives/PresentationDialogHost'
 import {
   deleteAttachmentForStorage,
   StorageView as ProductionStorageView,
@@ -59,6 +60,7 @@ function StorageView(props: Omit<ComponentProps<typeof ProductionStorageView>, '
   return (
     <ConfigurationPreferencesProvider>
       <ProductionStorageView {...props} onOpenSidebar={() => undefined} />
+      <PresentationDialogHost />
     </ConfigurationPreferencesProvider>
   )
 }
@@ -452,17 +454,16 @@ describe('StorageView', () => {
   })
 
   it('runs the local data wipe from the overview clear-all action', async () => {
-    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true)
     render(<StorageView route={{ section: 'overview' }} />)
 
     fireEvent.click(await screen.findByRole('button', { name: 'Clear all' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Clear all local data?' })
+    expect(dialog).toHaveTextContent('This removes chats, presets, connections, keys')
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Clear and reload' }))
 
     await waitFor(() => {
       expect(storageWipeMocks.clearLocalWorkspaceStorage).toHaveBeenCalledTimes(1)
     })
-    expect(confirmSpy).toHaveBeenCalledWith(
-      expect.stringContaining('Clear all local Natter data for this browser origin?'),
-    )
   })
 
   it('exports a full workspace backup from the overview', async () => {
@@ -505,8 +506,6 @@ describe('StorageView', () => {
     await createChat({ id: 'chat-alpha', title: 'Alpha' })
     const backup = await exportWorkspaceBackup()
     await createChat({ id: 'chat-beta', title: 'Beta' })
-    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true)
-
     const { container } = render(<StorageView route={{ section: 'overview' }} />)
     const input = await waitFor(() => {
       const candidate = container.querySelector<HTMLInputElement>(
@@ -521,6 +520,8 @@ describe('StorageView', () => {
         files: [new File([JSON.stringify(backup)], 'backup.json', { type: 'application/json' })],
       },
     })
+    const dialog = await screen.findByRole('dialog', { name: 'Replace local workspace?' })
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Import and replace' }))
 
     await waitFor(
       () => {
@@ -533,7 +534,6 @@ describe('StorageView', () => {
     )
     const chats = await getDb().chats.toArray()
     expect(chats.map((chat) => chat.id)).toEqual(['chat-alpha'])
-    expect(confirmSpy).toHaveBeenCalled()
   })
 
   it('clears global calibration families from per-chat samples', async () => {
@@ -875,8 +875,6 @@ describe('StorageView', () => {
       chatId: archived.id,
       messageId: 'reserved-assistant',
     })
-    vi.spyOn(window, 'confirm').mockReturnValue(true)
-
     const { container } = render(<StorageView route={{ section: 'chats' }} />)
     fireEvent.click(
       container.querySelector<HTMLInputElement>(
@@ -888,6 +886,8 @@ describe('StorageView', () => {
       container.querySelector<HTMLInputElement>('[data-ui="storage-chat-select"]') as HTMLElement,
     )
     fireEvent.click(await screen.findByRole('button', { name: 'Delete' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Delete selected chats?' })
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Delete' }))
 
     await waitFor(() => {
       expect(useToastStore.getState().toasts.at(-1)).toMatchObject({
@@ -1007,12 +1007,12 @@ describe('StorageView', () => {
       chatId: archived.id,
       messageId: 'reserved-assistant',
     })
-    vi.spyOn(window, 'confirm').mockReturnValue(true)
-
     render(<StorageView route={{ section: 'archive' }} />)
     fireEvent.click(
       await screen.findByRole('button', { name: 'Permanently delete Streaming archive' }),
     )
+    const dialog = await screen.findByRole('dialog', { name: 'Permanently delete chat?' })
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Delete' }))
 
     await waitFor(() => {
       expect(useToastStore.getState().toasts.at(-1)).toMatchObject({
@@ -1034,8 +1034,6 @@ describe('StorageView', () => {
     await updateChatForTest(alpha.id, { previewText: 'Alpha preview' })
     await updateChatForTest(beta.id, { previewText: 'Beta preview' })
     await updateChatForTest(gamma.id, { previewText: 'Gamma preview' })
-    const promptSpy = vi.spyOn(window, 'prompt').mockReturnValue('Shared, Later')
-
     const { container } = render(<StorageView route={{ section: 'chats' }} />)
 
     await waitFor(() => expect(container).toHaveTextContent('Gamma'))
@@ -1048,9 +1046,13 @@ describe('StorageView', () => {
     await waitFor(() => expect(container).toHaveTextContent('3 selected'))
     const tagsButton = screen.getByRole('button', { name: 'Tags' })
     fireEvent.click(tagsButton)
+    const tagsDialog = await screen.findByRole('dialog', { name: 'Set tags for 3 chats' })
+    const tagsInput = within(tagsDialog).getByRole('textbox')
+    expect(tagsInput).toHaveValue('')
+    fireEvent.change(tagsInput, { target: { value: 'Shared, Later' } })
+    fireEvent.click(within(tagsDialog).getByRole('button', { name: 'Save' }))
 
     await waitFor(async () => {
-      expect(promptSpy).toHaveBeenCalledWith('Tags for 3 chats, comma-separated', '')
       const tags = await getDb().tags.toArray()
       const tagById = new Map(tags.map((tag) => [tag.id, tag.name]))
       for (const id of [alpha.id, beta.id, gamma.id]) {
@@ -1070,8 +1072,6 @@ describe('StorageView', () => {
     await updateChatForTest(beta.id, { folderId: work.id })
     await updateChatForTest(alpha.id, { previewText: 'Alpha preview' })
     await updateChatForTest(beta.id, { previewText: 'Beta preview' })
-    const promptSpy = vi.spyOn(window, 'prompt').mockReturnValue('Done')
-
     const { container } = render(<StorageView route={{ section: 'chats' }} />)
 
     await waitFor(() => expect(container).toHaveTextContent('Beta'))
@@ -1082,12 +1082,13 @@ describe('StorageView', () => {
     fireEvent.click(checkboxes[1] as HTMLInputElement, { metaKey: true })
     const moveButton = screen.getByRole('button', { name: 'Move' })
     fireEvent.click(moveButton)
+    const moveDialog = await screen.findByRole('dialog', { name: 'Move 2 chats' })
+    const moveInput = within(moveDialog).getByRole('textbox')
+    expect(moveInput).toHaveValue('Work')
+    fireEvent.change(moveInput, { target: { value: 'Done' } })
+    fireEvent.click(within(moveDialog).getByRole('button', { name: 'Move' }))
 
     await waitFor(async () => {
-      expect(promptSpy).toHaveBeenCalledWith(
-        'Move 2 chats to folder (blank removes folder)',
-        'Work',
-      )
       const folders = await getDb().folders.toArray()
       const done = folders.find((folder) => folder.name === 'Done')
       expect(done).toBeTruthy()

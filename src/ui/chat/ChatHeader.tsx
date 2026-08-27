@@ -1,4 +1,5 @@
 import { type ReactNode, useCallback, useEffect, useRef, useState } from 'react'
+import { requestPresentationText } from '../../app/presentation-dialog'
 import { aggregateCalibrationSamples } from '../../core/token-calibration'
 import type { Chat, MessageId, TokenCalibrationSample } from '../../core/types'
 import type { UsePrivacyRoutingResult } from '../../hooks/useModelCatalog'
@@ -150,7 +151,12 @@ export function ChatHeader({
       .map((tagId) => byId.get(tagId)?.name)
       .filter((name): name is string => Boolean(name))
       .join(', ')
-    const value = window.prompt('Tags, comma-separated', currentNames)
+    const value = await requestPresentationText({
+      title: 'Set tags',
+      inputLabel: 'Tags, comma-separated',
+      initialValue: currentNames,
+      confirmLabel: 'Save',
+    })
     if (value === null) return
     await setChatTagsFromNames(chat.id, tagNamesFromPrompt(value))
   }, [chat])

@@ -42,6 +42,10 @@ import {
   __resetWorkspaceRepositoryForTests,
   __setWorkspaceRepositoryForTests,
 } from '../../src/store/workspace-repository'
+import {
+  awaitWorkspaceRuntimeQuiesced,
+  beginWorkspaceRuntimeQuiesce,
+} from '../../src/store/workspace-runtime-control'
 import { createChat } from '../helpers/chats'
 import { putCachedEndpoints, putCachedPrivacyPolicy } from '../helpers/discovery-cache'
 import {
@@ -897,6 +901,64 @@ describe('generation intent outbound-path and body-I/O contract', () => {
     await handle.prepared
     await expect(handle.completed).resolves.toMatchObject({ outcome: 'done' })
     expect(openStream).toHaveBeenCalledOnce()
+  })
+
+  it('reclaims an unchanged submit after replacement wins the generation lifetime gate', async () => {
+    const chat = await createChat({ settings: boundedSettings() })
+    const path = await seedLinear(chat.id, [
+      { role: 'user', text: 'replace before admission' },
+      { role: 'assistant', text: 'stable branch' },
+    ])
+    const leaf = required(path.at(-1), 'replacement race leaf')
+    const releaseSurface = await prepareControlledGenerationSurface(
+      {
+        kind: 'send',
+        chatId: chat.id,
+        target: { kind: 'fixed', messageId: leaf.id },
+        content: [{ type: 'text', text: 'surface only' }],
+      },
+      { profile: profile() },
+    )
+    releaseSurface()
+
+    const execute = generationAdmissionController.execute.bind(generationAdmissionController)
+    let reopen!: Promise<void>
+    const execution = vi
+      .spyOn(generationAdmissionController, 'execute')
+      .mockImplementationOnce((claim, operation, options) => {
+        beginWorkspaceRuntimeQuiesce()
+        reopen = awaitWorkspaceRuntimeQuiesced().then(() => openBrowserWorkspace())
+        return execute(claim, operation, options)
+      })
+    const openStream = vi.fn(() => completedStream('replacement-safe answer'))
+    const controller = new AbortController()
+    const handle = await createGenerationEngine({ openStream }).startWhenCapabilitySettles(
+      {
+        intent: {
+          kind: 'send',
+          chatId: chat.id,
+          target: { kind: 'fixed', messageId: leaf.id },
+          content: [{ type: 'text', text: 'submit exactly once' }],
+        },
+      },
+      { signal: controller.signal },
+    )
+
+    await reopen
+    await handle.prepared
+    await expect(handle.completed).resolves.toMatchObject({ outcome: 'done' })
+    expect(execution).toHaveBeenCalledTimes(2)
+    expect(openStream).toHaveBeenCalledOnce()
+    expect(
+      (await readTestMessages(chat.id)).filter((message) => {
+        const content = message.content[0]
+        return (
+          message.role === 'user' &&
+          content?.type === 'text' &&
+          content.text === 'submit exactly once'
+        )
+      }),
+    ).toHaveLength(1)
   })
 
   it('releases submit ownership after preparation without aborting the provider stream', async () => {

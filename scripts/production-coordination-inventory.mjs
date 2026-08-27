@@ -15,6 +15,8 @@ function exactSiteContracts(groups) {
 
 const MODULE_MUTABLE_IDS = Object.freeze([
   'src/app/conversation-actions-capability.ts#loaded',
+  'src/app/presentation-dialog.ts#activeDialog',
+  'src/app/presentation-dialog.ts#nextRequestId',
   'src/app/router.ts#committedRouteSnapshot',
   'src/app/router.ts#currentRouteForegroundDemand',
   'src/app/router.ts#currentRouteIntent',
@@ -302,6 +304,12 @@ export const MODULE_COLLECTION_CONTRACTS = Object.freeze({
     bound: 'static event lookup',
     cleanup: 'process-lifetime immutable value; no runtime entries',
     scope: 'module-static',
+  },
+  'src/app/presentation-dialog.ts#listeners': {
+    bound: 'one mounted presentation host subscriber per tab',
+    cleanup:
+      'paired unsubscribe removes the listener and settles any active request as cancellation when the final host leaves',
+    scope: 'tab-presentation-registry',
   },
   'src/app/router.ts#routeArrivalSubscribers': {
     bound: 'live route subscribers',
@@ -2528,6 +2536,12 @@ export const MUTABLE_MODULE_CONTRACTS = Object.freeze({
     bound: 'one loaded conversation action service reference',
     cleanup:
       'process-lifetime module capability; it retains no chat, message, request, or workspace payload',
+  },
+  'src/app/presentation-dialog.ts': {
+    scope: 'tab-presentation-dialog',
+    bound: 'one active request and one monotonic scalar identifier per tab',
+    cleanup:
+      'confirm or cancel clears the request before resolving it; final host teardown resolves any active request as cancellation',
   },
   'src/app/router.ts': {
     scope: 'tab-navigation-runtime',

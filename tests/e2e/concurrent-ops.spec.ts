@@ -15,6 +15,7 @@ import {
   sendMessage,
   startMessageCountRecorder,
   stopMessageCountRecorder,
+  submitPresentationTextDialog,
 } from './helpers'
 
 // Phase 7 scope of the §6.11.1 concurrent-ops-during-stream matrix.
@@ -593,8 +594,8 @@ test('one Enter keeps its claimed branch while destination and a remote publicat
 
     expect(requestCount).toBe(0)
     await expect(input).toHaveValue(draft)
-    peer.once('dialog', (dialog) => dialog.accept('Remote during destination settle'))
     await peer.getByLabel('New folder').click()
+    await submitPresentationTextDialog(peer, 'Remote during destination settle')
     await expect(input).toHaveValue(draft)
     await expect(page.getByLabel('View conversation tree')).toBeEnabled()
 

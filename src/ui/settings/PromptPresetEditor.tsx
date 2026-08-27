@@ -9,6 +9,10 @@
 // save-as-new / rename / delete.
 import type { ReactNode } from 'react'
 import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from 'react'
+import {
+  requestPresentationConfirmation,
+  requestPresentationText,
+} from '../../app/presentation-dialog'
 import { estimateTokensByTokenizer } from '../../core/tokens'
 import type { Chat, ChatSettings, PromptPresetKind } from '../../core/types'
 import { usePromptPresetCatalog } from '../../hooks/useConfigurationCatalog'
@@ -173,7 +177,11 @@ function usePromptSlot(
   const saveAsNew = useCallback(
     async (promptTitle: string) => {
       if (!(await flushDraftBeforeAction())) return
-      const name = window.prompt(`Name for new ${promptTitle.toLowerCase()} preset:`)
+      const name = await requestPresentationText({
+        title: `New ${promptTitle.toLowerCase()} preset`,
+        inputLabel: 'Preset name',
+        confirmLabel: 'Save',
+      })
       if (!name?.trim()) return
       try {
         const result = await configurationApplication.createAndPinPromptPreset({
@@ -199,7 +207,12 @@ function usePromptSlot(
   )
 
   const renamePreset = useCallback(async (targetId: string, currentName: string) => {
-    const name = window.prompt('Rename preset:', currentName)
+    const name = await requestPresentationText({
+      title: 'Rename preset',
+      inputLabel: 'Preset name',
+      initialValue: currentName,
+      confirmLabel: 'Rename',
+    })
     if (!name?.trim() || name === currentName) return
     try {
       await configurationApplication.renamePromptPreset(targetId, name.trim())
@@ -209,7 +222,14 @@ function usePromptSlot(
   }, [])
 
   const deletePresetWithConfirm = useCallback(async (targetId: string, name: string) => {
-    if (!window.confirm(`Delete preset "${name}"? Chats pinned to it keep their current text.`)) {
+    if (
+      !(await requestPresentationConfirmation({
+        title: 'Delete preset?',
+        message: `Delete preset "${name}"? Chats pinned to it keep their current text.`,
+        confirmLabel: 'Delete',
+        tone: 'danger',
+      }))
+    ) {
       return
     }
     try {

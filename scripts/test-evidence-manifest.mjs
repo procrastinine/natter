@@ -175,6 +175,7 @@ export const DECLARED_TEST_DOMAINS = Object.freeze({
     'application-shell',
     'presentation-system',
   ],
+  'tests/unit/presentation-dialog.test.ts': ['presentation-state', 'presentation-system'],
   'tests/unit/production-coordination-audit.test.ts': ['shared-runtime', 'workspace'],
   'tests/unit/production-async-ownership-audit.test.ts': ['build-environment', 'shared-runtime'],
   'tests/unit/production-module-inventory.test.ts': ['build-environment'],

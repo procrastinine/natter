@@ -7,9 +7,11 @@ import { fetchEndpoints, fetchModels } from '../../src/api/models'
 import type { ConnectionProfile, ModelsQuery } from '../../src/core/types'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
 import { __resetBrowserRepositoryForTests } from '../../src/store/browser-repo'
+import { configurationRequestRevisionFor } from '../../src/store/configuration-domain-contract'
 import { __resetDbForTests, getDb } from '../../src/store/db'
 import {
   configurationDiscoveryApplication,
+  DiscoveryPublicationRejectedError,
   resolveEndpointsDiscovery,
 } from '../../src/store/discovery-service'
 import { getCachedEndpoints, getCachedModels } from '../../src/store/models-cache'
@@ -146,7 +148,7 @@ describe('unified model discovery single-flight', () => {
     expect(await getCachedEndpoints(selected.id, 'openai/gpt-5.4')).toBeDefined()
   })
 
-  it('does not publish a models response captured for an obsolete profile revision', async () => {
+  it('rejects models discovery captured for an obsolete profile revision', async () => {
     const selected = await seedProfile()
     const gate = deferred<ReturnType<typeof modelsPayload>>()
     fetchModelsMock.mockReturnValueOnce(gate.promise)
@@ -155,12 +157,13 @@ describe('unified model discovery single-flight', () => {
 
     await getDb().profiles.put({ ...selected, requestRevision: 1, updatedAt: 2 })
     gate.resolve(modelsPayload('stale'))
-    await pending
+    await expect(pending).rejects.toBeInstanceOf(DiscoveryPublicationRejectedError)
 
+    expect(fetchModelsMock).toHaveBeenCalledOnce()
     expect(await getCachedModels(selected.id, query)).toBeUndefined()
   })
 
-  it('does not publish endpoints captured for an obsolete profile revision', async () => {
+  it('rejects endpoints discovery captured for an obsolete profile revision', async () => {
     const selected = await seedProfile()
     const gate = deferred<ReturnType<typeof endpointsPayload>>()
     fetchEndpointsMock.mockReturnValueOnce(gate.promise)
@@ -169,7 +172,25 @@ describe('unified model discovery single-flight', () => {
 
     await getDb().profiles.put({ ...selected, requestRevision: 1, updatedAt: 2 })
     gate.resolve(endpointsPayload('openai/gpt-5.4'))
-    await pending
+    await expect(pending).rejects.toBeInstanceOf(DiscoveryPublicationRejectedError)
+
+    expect(fetchEndpointsMock).toHaveBeenCalledOnce()
+    expect(await getCachedEndpoints(selected.id, 'openai/gpt-5.4')).toBeUndefined()
+  })
+
+  it('rejects an obsolete generation-captured endpoint revision without publishing it', async () => {
+    const selected = await seedProfile()
+    const gate = deferred<ReturnType<typeof endpointsPayload>>()
+    fetchEndpointsMock.mockReturnValueOnce(gate.promise)
+    const pending = resolveEndpointsDiscovery(selected, 'openai/gpt-5.4', {
+      expectedRevision: configurationRequestRevisionFor(selected, undefined),
+      apiKey: '',
+    })
+    await vi.waitFor(() => expect(fetchEndpointsMock).toHaveBeenCalledOnce())
+
+    await getDb().profiles.put({ ...selected, requestRevision: 1, updatedAt: 2 })
+    gate.resolve(endpointsPayload('openai/gpt-5.4'))
+    await expect(pending).rejects.toBeInstanceOf(DiscoveryPublicationRejectedError)
 
     expect(await getCachedEndpoints(selected.id, 'openai/gpt-5.4')).toBeUndefined()
   })

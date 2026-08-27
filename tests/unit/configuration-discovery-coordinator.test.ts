@@ -92,6 +92,35 @@ describe('ConfigurationDiscoveryCoordinator', () => {
     coordinator.reset()
   })
 
+  it('cancels an obsolete routing refresh and starts the published profile revision', async () => {
+    let input = modelRoutingInput(1)
+    const firstSignals: AbortSignal[] = []
+    discovery.refreshEndpoints
+      .mockImplementationOnce(
+        (...args: unknown[]) =>
+          new Promise<void>((_resolve, reject) => {
+            const options = args[2] as { signal: AbortSignal }
+            firstSignals.push(options.signal)
+            options.signal.addEventListener('abort', () => reject(options.signal.reason), {
+              once: true,
+            })
+          }),
+      )
+      .mockResolvedValueOnce(undefined)
+    const coordinator = new ConfigurationDiscoveryCoordinator({ onChange: () => undefined })
+    coordinator.reconcile(input)
+    await vi.waitFor(() => expect(discovery.refreshEndpoints).toHaveBeenCalledOnce())
+
+    input = modelRoutingInput(2)
+    coordinator.reconcile(input)
+
+    await vi.waitFor(() => expect(discovery.refreshEndpoints).toHaveBeenCalledTimes(2))
+    expect(firstSignals[0]?.aborted).toBe(true)
+    expect(discovery.refreshEndpoints.mock.calls[1]?.[0]).toMatchObject({ requestRevision: 2 })
+    expect(coordinator.getSnapshot().statuses.endpoints.error).toBeNull()
+    coordinator.reset()
+  })
+
   it('keeps a failed durable baseline settled across equivalent row rematerialization', async () => {
     let input = modelCatalogInput()
     const coordinator = new ConfigurationDiscoveryCoordinator({
@@ -205,5 +234,31 @@ function modelCatalogInput() {
     surface: { profileId: profile.id, modelId: null, modelsDemanded: true },
     modelCatalog,
     modelRouting: null,
+  } as const
+}
+
+function modelRoutingInput(requestRevision: number) {
+  const base = modelCatalogInput()
+  const profile = {
+    ...base.modelCatalog.profile,
+    requestRevision,
+    updatedAt: requestRevision,
+  }
+  const revision = {
+    profileId: profile.id,
+    requestRevision,
+    key: { kind: 'missing' } as const,
+  }
+  const modelId = 'openai/gpt-5.4'
+  return {
+    enabled: true,
+    surface: { profileId: profile.id, modelId, modelsDemanded: false },
+    modelCatalog: { profile, revision },
+    modelRouting: {
+      profileId: profile.id,
+      revision,
+      modelId,
+      proxy: { url: '', secret: '' },
+    },
   } as const
 }

@@ -62,6 +62,7 @@ import {
   type GenerationAdmissionRequest,
   type GenerationIntent,
   type GenerationPreparationObserver,
+  type GenerationWorkspaceAdmission,
   generationAdmissionController,
   type NewChatGenerationIntent,
 } from './generation-admission-controller'
@@ -306,18 +307,22 @@ export function createGenerationEngine(options: GenerationEngineOptions = {}): G
         readonly observer?: GenerationPreparationObserver
       },
     ): Promise<GenerationHandle<PreparedGenerationForSettlingIntent<Request['intent']>>> {
-      const claim = await generationAdmissionController.claimWhenCapabilitySettles(
+      return generationAdmissionController.startWhenCapabilitySettles(
         request,
         startOptions.signal,
+        (claim, workspaceAdmission) => {
+          const handle = startClaimedGeneration({
+            claim,
+            openStream,
+            now,
+            signal: startOptions.signal,
+            workspaceAdmission,
+            ...(startOptions.observer ? { observer: startOptions.observer } : {}),
+          }) as GenerationHandle<PreparedGenerationForSettlingIntent<Request['intent']>>
+          return { value: handle, completed: handle.completed }
+        },
         startOptions.observer,
       )
-      return startClaimedGeneration({
-        claim,
-        openStream,
-        now,
-        signal: startOptions.signal,
-        ...(startOptions.observer ? { observer: startOptions.observer } : {}),
-      }) as GenerationHandle<PreparedGenerationForSettlingIntent<Request['intent']>>
     },
   })
 }
@@ -330,12 +335,14 @@ function startClaimedGeneration(input: {
   readonly now: () => number
   readonly signal?: AbortSignal
   readonly observer?: GenerationPreparationObserver
+  readonly workspaceAdmission?: GenerationWorkspaceAdmission
 }): GenerationHandle {
   const { claim } = input
   const { streamId, chatId, assistantMessageId, userMessageId } = claim
   const controller = new AbortController()
   const abort = () => controller.abort(input.signal?.reason)
   let submitAbortLinked = false
+  let workspaceAdmitted = false
   const releaseSubmitAbort = () => {
     if (!submitAbortLinked) return
     submitAbortLinked = false
@@ -353,8 +360,10 @@ function startClaimedGeneration(input: {
   observeGenerationPreparationPhase(input.observer, 'workspace-requested')
   const execution = generationAdmissionController.execute(
     claim,
-    (permit) =>
-      runGeneration({
+    (permit) => {
+      workspaceAdmitted = true
+      input.workspaceAdmission?.admit()
+      return runGeneration({
         claim,
         chatId,
         streamId,
@@ -371,9 +380,13 @@ function startClaimedGeneration(input: {
           releaseSubmitAbort()
         },
         now: input.now,
-      }),
+      })
+    },
     { signal: controller.signal },
   )
+  if (input.workspaceAdmission) {
+    void execution.catch((error: unknown) => input.workspaceAdmission?.reject(error))
+  }
   const completed = execution
     .catch((error: unknown): CompletedGeneration => {
       if (!preparedSettled) prepared.reject(error)
@@ -393,7 +406,7 @@ function startClaimedGeneration(input: {
       }
     })
     .then((result) => {
-      announceGenerationOutcome(streamId, result.outcome)
+      if (workspaceAdmitted) announceGenerationOutcome(streamId, result.outcome)
       return result
     })
   if (input.signal) {

@@ -116,6 +116,7 @@ import {
 } from '../ui/icons/Icon'
 import { Button, IconButton } from '../ui/primitives/Button'
 import { LiveRegions } from '../ui/primitives/LiveRegions'
+import { PresentationDialogHost } from '../ui/primitives/PresentationDialogHost'
 import { ChatModelPanel } from '../ui/settings/ChatModelPanel'
 import { GlobalSettingsModal } from '../ui/settings/GlobalSettingsModal'
 import { ChatList } from '../ui/sidebar/ChatList'
@@ -2102,6 +2103,7 @@ export function Shell() {
           />
         </Suspense>
       ) : null}
+      <PresentationDialogHost />
       <ToastTray />
       {!treeViewActive && focusModeAvailable && !isNarrowScreen ? <FocusModeToggle /> : null}
     </div>

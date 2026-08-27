@@ -10,6 +10,7 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { LlamaServerProps } from '../../api/probe'
+import { requestPresentationConfirmation } from '../../app/presentation-dialog'
 import {
   configurationWriteInteraction,
   configurationWriteTarget,
@@ -1511,20 +1512,27 @@ export function ApiModeSection({
     route.kind === 'text-completions' ? 'text' : route.kind === 'responses' ? 'responses' : 'chat'
   const requiresPhaseEcho = capability.quirks.requiresPhaseEcho === true
   const pinTo = (target: 'chat' | 'responses' | 'text') => {
-    if (target === 'chat' && requiresPhaseEcho) {
-      if (
-        typeof window !== 'undefined' &&
-        !window.confirm(
-          'This model relies on the Responses API to preserve `phase` metadata across turns. Dropping it can cause the model to stop early mid-answer. Switch anyway?',
-        )
-      ) {
-        return
-      }
+    const apply = () => {
+      runConfigurationWrite({
+        target: configurationWriteTarget(chat.id, 'api'),
+        action: () => configurationApplication.patchChatSettings(chat.id, { api: target }),
+      })
     }
-    runConfigurationWrite({
-      target: configurationWriteTarget(chat.id, 'api'),
-      action: () => configurationApplication.patchChatSettings(chat.id, { api: target }),
+    if (target !== 'chat' || !requiresPhaseEcho) {
+      apply()
+      return
+    }
+    void requestPresentationConfirmation({
+      title: 'Switch API mode?',
+      message:
+        'This model relies on the Responses API to preserve `phase` metadata across turns. Dropping it can cause the model to stop early mid-answer.',
+      confirmLabel: 'Switch anyway',
+      tone: 'warning',
     })
+      .then((confirmed) => {
+        if (confirmed) apply()
+      })
+      .catch((error) => console.error('Failed to open API mode confirmation', error))
   }
   return (
     <section data-ui="settings-section" data-ui-section="api-mode">

@@ -11,6 +11,7 @@ import {
   readMessages,
   seedFirstRun,
   sendMessage,
+  submitPresentationTextDialog,
 } from './helpers'
 
 interface BranchTreeFixture {
@@ -43,8 +44,8 @@ test('branching from an intermediate transcript node settles one durable fork', 
     intermediate.getByRole('button', { name: 'Branch this chat from here' }),
   ).toBeEnabled()
 
-  page.once('dialog', (dialog) => void dialog.accept('Intermediate durable fork'))
   await intermediate.getByRole('button', { name: 'Branch this chat from here' }).click()
+  await submitPresentationTextDialog(page, 'Intermediate durable fork')
 
   await expect(page.locator('[data-ui="chat-title"]')).toContainText('Intermediate durable fork', {
     timeout: 15_000,
@@ -1045,8 +1046,8 @@ test('tree inspector exposes generation, fork, context, reasoning, and tool acti
     regeneratedLeafId,
   )
 
-  page.once('dialog', (dialog) => void dialog.accept('Tree action fork'))
   await page.getByRole('button', { name: 'Branch this chat from here' }).click()
+  await submitPresentationTextDialog(page, 'Tree action fork')
   await expect(page.locator('[data-ui="branch-tree-view"]')).not.toBeVisible()
   await expect(page.locator('[data-ui="message-list"]')).toContainText('continued from tree')
   await expect(page.locator('[data-ui="chat-title"]')).toContainText('Tree action fork')

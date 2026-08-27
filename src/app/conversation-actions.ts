@@ -63,6 +63,7 @@ import {
 } from '../store/workspace-runtime'
 import { useToastStore } from '../store/zustand/toastStore'
 import { useUiStore } from '../store/zustand/uiStore'
+import { requestPresentationText } from './presentation-dialog'
 import { ConversationActionUnavailableError } from './presentation-interactions'
 import {
   beginRouteIntent,
@@ -538,10 +539,11 @@ export const conversationActions = {
       if (!sourceChat) throw new Error('Chat not found.')
       const defaultTitle = await nextForkTitle(sourceChat.title)
       if (!isRouteIntentCurrent(routeIntent)) return
-      const chosen =
-        typeof window === 'undefined'
-          ? defaultTitle
-          : window.prompt('Name the new chat:', defaultTitle)
+      const chosen = await requestPresentationText({
+        title: 'Name the new chat',
+        initialValue: defaultTitle,
+        confirmLabel: 'Fork',
+      })
       if (chosen === null) return
       const title = chosen.trim() || defaultTitle
       const forkChatId = newId()

@@ -14,6 +14,7 @@ import {
   mockChatCompletions,
   readMessages,
   seedFirstRun,
+  submitPresentationTextDialog,
 } from './helpers'
 
 test.beforeEach(async ({ page }) => {
@@ -298,22 +299,22 @@ test('folder create, rename, move, and delete keep the chat visible through publ
   page,
 }) => {
   await createChatAndSend(page, 'folder lifecycle')
-  page.once('dialog', (dialog) => dialog.accept('Projects'))
   await page.getByLabel('New folder').click()
+  await submitPresentationTextDialog(page, 'Projects')
   let folder = page.locator('[data-ui="folder-section"]').filter({ hasText: 'Projects' })
   await expect(folder).toBeVisible()
   await expect(folder.locator('[data-ui="folder-count"]')).toHaveText('0')
 
-  page.once('dialog', (dialog) => dialog.accept('Renamed projects'))
   await folder.getByLabel('Rename folder Projects').click()
+  await submitPresentationTextDialog(page, 'Renamed projects')
   folder = page.locator('[data-ui="folder-section"]').filter({ hasText: 'Renamed projects' })
   await expect(folder).toBeVisible()
 
   const chat = page.locator('[data-ui="chat-row"]').filter({ hasText: 'folder lifecycle' })
   await chat.hover()
   await chat.locator('[data-ui="chat-row-menu-button"]').click()
-  page.once('dialog', (dialog) => dialog.accept('Renamed projects'))
   await page.locator('[data-ui="chat-row-folder"]').click()
+  await submitPresentationTextDialog(page, 'Renamed projects')
   await expect(folder.locator('[data-ui="folder-count"]')).toHaveText('1')
   await expect(chat).toHaveAttribute('data-sidebar-depth', 'folder')
 
@@ -586,8 +587,8 @@ async function setSidebarChatTags(page: Page, title: string, tags: string): Prom
   const row = await findSidebarChat(page, title)
   await row.hover()
   await row.locator('[data-ui="chat-row-menu-button"]').click()
-  page.once('dialog', (dialog) => dialog.accept(tags))
   await page.locator('[data-ui="chat-row-tags-button"]').click()
+  await submitPresentationTextDialog(page, tags)
   await expect(row.locator('[data-ui="chat-row-tag"]', { hasText: tags })).toBeVisible({
     timeout: 15_000,
   })

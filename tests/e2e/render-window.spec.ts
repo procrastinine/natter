@@ -15,6 +15,7 @@ import {
   sendMessage,
   startMessageCountRecorder,
   stopMessageCountRecorder,
+  submitPresentationTextDialog,
 } from './helpers'
 
 test.beforeEach(async ({ page }) => {
@@ -1121,10 +1122,10 @@ test('sidebar keeps a loaded row anchored when folders toggle and tag rows grow'
   await alignSidebarRowNearTop(tagTarget)
   const beforeTags = await sidebarRowMetrics(tagTarget)
 
-  page.once('dialog', (dialog) => dialog.accept('Alpha, Beta, Gamma'))
   await tagTarget.hover()
   await tagTarget.locator('[data-ui="chat-row-menu-button"]').click()
   await page.locator('[data-ui="chat-row-tags-button"]').click()
+  await submitPresentationTextDialog(page, 'Alpha, Beta, Gamma')
   await expect(tagTarget.locator('[data-ui="chat-row-tag"]')).toHaveCount(3)
   await page.waitForTimeout(80)
 

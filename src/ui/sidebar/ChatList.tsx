@@ -17,6 +17,7 @@ import {
   useState,
 } from 'react'
 import { loadConversationActions } from '../../app/conversation-actions-capability'
+import { requestPresentationText } from '../../app/presentation-dialog'
 import { definePresentationInteraction } from '../../app/presentation-interactions'
 import {
   beginRouteIntent,
@@ -766,7 +767,11 @@ export const ChatList = memo(function ChatList({
     [pushToast],
   )
   const handleCreateFolder = useCallback(async () => {
-    const name = window.prompt('Folder name')
+    const name = await requestPresentationText({
+      title: 'Create folder',
+      inputLabel: 'Folder name',
+      confirmLabel: 'Create',
+    })
     if (!name?.trim()) return
     await catalogApplication.folder.create({ name })
   }, [])
@@ -778,7 +783,12 @@ export const ChatList = memo(function ChatList({
     })
   }, [])
   const handleRenameFolder = useCallback(async (folder: ChatFolder) => {
-    const name = window.prompt('Rename folder', folder.name)
+    const name = await requestPresentationText({
+      title: 'Rename folder',
+      inputLabel: 'Folder name',
+      initialValue: folder.name,
+      confirmLabel: 'Rename',
+    })
     if (!name?.trim() || name.trim() === folder.name) return
     await catalogApplication.folder.update(folder.id, { name })
   }, [])
@@ -815,7 +825,12 @@ export const ChatList = memo(function ChatList({
   const handleMoveChat = useCallback(
     async (chat: ChatSidebarRow) => {
       const currentFolder = chat.folderId ? folderById.get(chat.folderId)?.name : ''
-      const name = window.prompt('Move to folder (blank removes folder)', currentFolder ?? '')
+      const name = await requestPresentationText({
+        title: 'Move to folder',
+        inputLabel: 'Folder name (blank removes folder)',
+        initialValue: currentFolder ?? '',
+        confirmLabel: 'Move',
+      })
       if (name === null) return
       const trimmed = name.trim()
       if (trimmed.length === 0) {
@@ -836,7 +851,12 @@ export const ChatList = memo(function ChatList({
         .map((tagId) => tagById.get(tagId)?.name)
         .filter((name): name is string => Boolean(name))
         .join(', ')
-      const value = window.prompt('Tags, comma-separated', currentNames)
+      const value = await requestPresentationText({
+        title: 'Set tags',
+        inputLabel: 'Tags, comma-separated',
+        initialValue: currentNames,
+        confirmLabel: 'Save',
+      })
       if (value === null) return
       await catalogApplication.chat.setTagsFromNames(chat.id, tagNamesFromPrompt(value))
     },

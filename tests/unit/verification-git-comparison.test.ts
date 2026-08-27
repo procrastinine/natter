@@ -22,6 +22,8 @@ const manifest: VerificationComparisonManifest = {
   comparison: { kind: 'git-commit', oid: '1'.repeat(40) },
 }
 const CURRENT_COMPARISON_OID = 'eb6d6600a91c818e5b15750cd9b9786820272049'
+const COMPARISON_MATERIALIZATION_BUDGET_MS = 15_000
+const TEST_SETTLEMENT_BUDGET_MS = 1_000
 
 describe('committed verification comparison', () => {
   it('accepts only the fixed comparison mode or a persisted baseline id', () => {
@@ -100,7 +102,9 @@ describe('committed verification comparison', () => {
     expect(comparison.snapshot.dependencies['scripts/audit-e2e-browser-storage.mjs']).toEqual([])
   })
 
-  it('reads the fixed comparison commit from Git objects in four bounded processes', async () => {
+  it('reads the fixed comparison commit from Git objects in four bounded processes', {
+    timeout: COMPARISON_MATERIALIZATION_BUDGET_MS + TEST_SETTLEMENT_BUDGET_MS,
+  }, async () => {
     const startedAt = performance.now()
     const comparison = await materializeCommittedVerificationComparison()
 
@@ -113,7 +117,7 @@ describe('committed verification comparison', () => {
         (diagnostic) => diagnostic.code === 'opaque-module-reference',
       ),
     ).toBe(true)
-    expect(performance.now() - startedAt).toBeLessThan(15_000)
+    expect(performance.now() - startedAt).toBeLessThan(COMPARISON_MATERIALIZATION_BUDGET_MS)
   })
 
   it('does not let the executable materializer accept a caller-forged manifest', async () => {

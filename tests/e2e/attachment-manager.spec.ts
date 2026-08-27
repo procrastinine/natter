@@ -2,6 +2,7 @@ import { createChatUiJourneyProfile, expect, test } from './fixtures'
 import {
   buildSseBody,
   clearIndexedDb,
+  confirmPresentationDialog,
   createChatAndOpen,
   firstChatId,
   mockChatCompletions,
@@ -169,11 +170,11 @@ test('attachment manager searches, filters, bulk deletes, and relinks through bu
     'source-reference.txt',
   )
 
-  page.once('dialog', async (dialog) => {
-    expect(dialog.message()).toContain('Delete 1 attachment')
-    await dialog.accept()
-  })
   await manager.getByRole('button', { name: 'Delete all (1)' }).click()
+  await expect(page.getByRole('dialog', { name: 'Delete attachments?' })).toContainText(
+    'Delete 1 attachment',
+  )
+  await confirmPresentationDialog(page)
   await expect(manager.locator('[data-ui="attachment-table"]')).not.toContainText(
     'delete-orphan.txt',
   )

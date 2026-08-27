@@ -11,6 +11,7 @@ import {
   useRef,
   useState,
 } from 'react'
+import { requestPresentationConfirmation } from '../../app/presentation-dialog'
 import {
   attachmentMutationTarget,
   definePresentationInteraction,
@@ -367,9 +368,13 @@ function StorageOverview() {
     input.value = ''
     if (!file) return
     if (
-      !window.confirm(
-        'Importing this backup replaces all local chats, presets, connections, keys, and attachments. Continue?',
-      )
+      !(await requestPresentationConfirmation({
+        title: 'Replace local workspace?',
+        message:
+          'Importing this backup replaces all local chats, presets, connections, keys, and attachments.',
+        confirmLabel: 'Import and replace',
+        tone: 'warning',
+      }))
     ) {
       return
     }
@@ -404,9 +409,13 @@ function StorageOverview() {
   }
   const handleClearWorkspace = async () => {
     if (
-      !window.confirm(
-        'Clear all local Natter data for this browser origin? This removes chats, presets, connections, keys, attachments, databases, storage buckets, origin-private files, local storage, caches, cookies, and service workers, then reloads.',
-      )
+      !(await requestPresentationConfirmation({
+        title: 'Clear all local data?',
+        message:
+          'This removes chats, presets, connections, keys, attachments, databases, storage buckets, origin-private files, local storage, caches, cookies, and service workers, then reloads.',
+        confirmLabel: 'Clear and reload',
+        tone: 'danger',
+      }))
     ) {
       return
     }
@@ -834,17 +843,35 @@ function ArchiveManager() {
       action: () => storageApplication.chat.unarchive(chat.id),
     })
   }
-  const handleDelete = (chat: ChatSidebarRow) => {
+  const handleDelete = async (chat: ChatSidebarRow) => {
     const title = displayChatTitle(chat)
-    if (!window.confirm(`Permanently delete "${title}"? This cannot be undone.`)) return
+    if (
+      !(await requestPresentationConfirmation({
+        title: 'Permanently delete chat?',
+        message: `Permanently delete "${title}"? This cannot be undone.`,
+        confirmLabel: 'Delete',
+        tone: 'danger',
+      }))
+    ) {
+      return
+    }
     archiveInteraction.run({
       target: 'archive',
       action: () => storageApplication.chat.deleteArchived(chat.id),
     })
   }
-  const handleEmpty = () => {
+  const handleEmpty = async () => {
     if (archivedCount === 0) return
-    if (!window.confirm(`Permanently delete ${archivedCount} archived chats?`)) return
+    if (
+      !(await requestPresentationConfirmation({
+        title: 'Empty trash?',
+        message: `Permanently delete ${archivedCount} archived chats?`,
+        confirmLabel: 'Delete all',
+        tone: 'danger',
+      }))
+    ) {
+      return
+    }
     archiveInteraction.run({
       target: 'archive',
       action: () => storageApplication.chat.emptyArchive(),
@@ -862,7 +889,11 @@ function ArchiveManager() {
           aria-label="Empty trash"
           title="Empty trash"
           disabled={archivedCount === 0 || archiveBusy || !catalogSession?.interactive}
-          onClick={handleEmpty}
+          onClick={() =>
+            void handleEmpty().catch((error) =>
+              console.error('Failed to confirm empty trash', error),
+            )
+          }
         >
           <TrashIcon size={14} />
         </IconButton>
@@ -922,7 +953,11 @@ function ArchiveManager() {
                       aria-label={`Permanently delete ${title}`}
                       title="Delete permanently"
                       disabled={archiveBusy || !catalogSession?.interactive}
-                      onClick={() => handleDelete(chat)}
+                      onClick={() =>
+                        void handleDelete(chat).catch((error) =>
+                          console.error('Failed to confirm permanent chat deletion', error),
+                        )
+                      }
                     >
                       <TrashIcon size={14} />
                     </Button>
@@ -939,7 +974,7 @@ function ArchiveManager() {
               <Button
                 type="button"
                 disabled={!catalogSession.interactive || catalogSession.status === 'refreshing'}
-                onClick={loadMore}
+                onClick={() => void loadMore()}
               >
                 {catalogSession.status === 'refreshing' ? 'Loading…' : 'Load more'}
               </Button>
@@ -1013,7 +1048,7 @@ function AttachmentManager({
   if (detailSession?.status === 'error' && !displaySelected) throw detailSession.error
 
   const handleDeleteAttachment = async (attachment: AttachmentDisplayRow) => {
-    if (!confirmDeleteAttachment(attachment)) return
+    if (!(await confirmDeleteAttachment(attachment))) return
     const routeIntent = selectedId === attachment.id ? beginRouteIntent() : null
     try {
       const removed = await deleteAttachmentForStorage(attachment)
@@ -1073,7 +1108,7 @@ function AttachmentManager({
                   )
                   if (plan.matchedCount === 0) return
                   if (!isRouteIntentCurrent(routeIntent)) return
-                  if (!confirmDeleteAll(filter, query, plan.matchedCount)) return
+                  if (!(await confirmDeleteAll(filter, query, plan.matchedCount))) return
                   setBulkDeleteProgress({
                     phase: 'deleting',
                     processed: 0,
@@ -1713,23 +1748,29 @@ export async function deleteAttachmentForStorage(
   return false
 }
 
-function confirmDeleteAttachment(attachment: AttachmentDisplayRow): boolean {
-  if (attachment.refCount === 0) {
-    return window.confirm(`Delete "${attachment.filename}"?`)
-  }
-  return window.confirm(
-    `Delete "${attachment.filename}"? ${attachment.refCount} message/draft refs will keep stubs.`,
-  )
+function confirmDeleteAttachment(attachment: AttachmentDisplayRow): Promise<boolean> {
+  return requestPresentationConfirmation({
+    title: 'Delete attachment?',
+    message:
+      attachment.refCount === 0
+        ? `Delete "${attachment.filename}"?`
+        : `Delete "${attachment.filename}"? ${attachment.refCount} message/draft refs will keep stubs.`,
+    confirmLabel: 'Delete',
+    tone: 'danger',
+  })
 }
 
-function confirmDeleteAll(filter: ManagerFilter, query: string, count: number): boolean {
+function confirmDeleteAll(filter: ManagerFilter, query: string, count: number): Promise<boolean> {
   const scope = query.trim()
     ? `${filterLabel(filter)} matching "${query.trim()}"`
     : filterLabel(filter)
   const noun = count === 1 ? 'attachment' : 'attachments'
-  return window.confirm(
-    `Delete ${count} ${noun} in ${scope}? Referenced message/draft refs will keep stubs.`,
-  )
+  return requestPresentationConfirmation({
+    title: 'Delete attachments?',
+    message: `Delete ${count} ${noun} in ${scope}? Referenced message/draft refs will keep stubs.`,
+    confirmLabel: 'Delete',
+    tone: 'danger',
+  })
 }
 
 function attachmentListHrefForFilter(filter: ManagerFilter): string {

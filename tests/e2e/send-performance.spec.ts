@@ -4,14 +4,14 @@ import {
   clearIndexedDb,
   createChatAndOpen,
   firstChatId,
-  seedFirstRun,
+  seedFirstRunFromOnboarding,
   sendMessage,
   waitForAssistantGenerationFinished,
 } from './helpers'
 
 test.beforeEach(async ({ page }) => {
   await clearIndexedDb(page)
-  await seedFirstRun(page)
+  await seedFirstRunFromOnboarding(page)
 })
 
 test('bounds every warm existing-chat preparation phase and provider dispatch', async ({
@@ -42,6 +42,7 @@ test('bounds every warm existing-chat preparation phase and provider dispatch', 
     }
     interface TraceScope extends Window {
       __sendCriticalPathEvents?: TraceEvent[]
+      __sendCriticalPathRuntimeObserver?: MutationObserver
     }
     const scope = window as TraceScope
     const events: TraceEvent[] = []
@@ -71,6 +72,17 @@ test('bounds every warm existing-chat preparation phase and provider dispatch', 
       | undefined
     let lockRequestSequence = 0
     record('trace-ready', { webLocks: lockManager !== undefined })
+    const workspaceShell = document.querySelector('[data-ui="app-shell"]')
+    const recordWorkspaceRuntime = () =>
+      record('workspace-runtime', workspaceShell?.getAttribute('data-workspace-runtime-state'))
+    recordWorkspaceRuntime()
+    if (workspaceShell) {
+      const runtimeObserver = new MutationObserver(recordWorkspaceRuntime)
+      runtimeObserver.observe(workspaceShell, {
+        attributeFilter: ['data-workspace-runtime-state'],
+      })
+      scope.__sendCriticalPathRuntimeObserver = runtimeObserver
+    }
     if (lockManager) {
       const originalLockRequest = lockManager.request.bind(lockManager)
       lockManager.request = (...args: unknown[]) => {
@@ -113,10 +125,12 @@ test('bounds every warm existing-chat preparation phase and provider dispatch', 
       readonly kind: string
       readonly detail?: unknown
     }
-    return (
-      (window as Window & { __sendCriticalPathEvents?: readonly TraceEvent[] })
-        .__sendCriticalPathEvents ?? []
-    )
+    const scope = window as Window & {
+      __sendCriticalPathEvents?: readonly TraceEvent[]
+      __sendCriticalPathRuntimeObserver?: MutationObserver
+    }
+    scope.__sendCriticalPathRuntimeObserver?.disconnect()
+    return scope.__sendCriticalPathEvents ?? []
   })
   await testInfo.attach('send-critical-path-events.json', {
     body: Buffer.from(JSON.stringify(events, null, 2)),
@@ -126,6 +140,9 @@ test('bounds every warm existing-chat preparation phase and provider dispatch', 
   if (!click) throw new Error('SendCriticalPathClickMissing')
   const providerFetches = events.filter((event) => event.kind === 'provider-fetch')
   expect(providerFetches).toHaveLength(1)
+  expect(
+    events.filter((event) => event.kind === 'workspace-runtime').map((event) => event.detail),
+  ).toEqual(['RUNNING'])
   expect((providerFetches[0]?.at ?? Number.POSITIVE_INFINITY) - click.at).toBeLessThan(750)
 
   const phaseEvents = events.filter((event) => event.kind === 'generation-phase')

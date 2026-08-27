@@ -280,6 +280,9 @@ export const test = fixtureBase.extend<RuntimeDiagnosticFixtures>({
       const pendingConsoleDetails = new Set<Promise<void>>()
       let lifecycleDrainStarted = false
       if (!baseURL) throw new Error('RuntimeDiagnosticBaseUrlMissing')
+      await context.route('https://openrouter.ai/api/v1/**', (route) =>
+        route.abort('blockedbyclient'),
+      )
       await context.route('https://debug.invalid/**', (route) =>
         route.fulfill({
           contentType: 'application/json',
@@ -326,6 +329,46 @@ export const test = fixtureBase.extend<RuntimeDiagnosticFixtures>({
           }),
         }),
       )
+      await context.route('https://openrouter.ai/api/v1/models/**/endpoints', (route) => {
+        const pathname = new URL(route.request().url()).pathname
+        const modelId = decodeURIComponent(
+          pathname.slice('/api/v1/models/'.length, -'/endpoints'.length),
+        )
+        return route.fulfill({
+          contentType: 'application/json',
+          headers: { 'access-control-allow-origin': '*' },
+          body: JSON.stringify({
+            data: {
+              id: modelId,
+              name: modelId,
+              context_length: 131_072,
+              architecture: {
+                input_modalities: ['text'],
+                output_modalities: ['text'],
+                tokenizer: 'Other',
+              },
+              endpoints: [
+                {
+                  provider_name: 'Natter',
+                  provider_slug: 'natter',
+                  supported_parameters: ['max_completion_tokens'],
+                  context_length: 131_072,
+                  max_prompt_tokens: 131_072,
+                  max_completion_tokens: 4_096,
+                  pricing: { prompt: '0', completion: '0' },
+                  data_policy: {
+                    training: false,
+                    trainingOpenRouter: false,
+                    retainsPrompts: false,
+                    canPublish: false,
+                    requiresUserIDs: false,
+                  },
+                },
+              ],
+            },
+          }),
+        })
+      })
       const onConsole = (message: ConsoleMessage) => {
         if (message.type() !== 'warning' && message.type() !== 'error') return
         const category = classifyConsoleDiagnostic(message.text())

@@ -1,7 +1,7 @@
 import type { BrowserContext } from '@playwright/test'
 import { strToU8, zipSync } from 'fflate'
 import { expect, test } from './fixtures'
-import { clearIndexedDb } from './helpers'
+import { clearIndexedDb, confirmPresentationDialog } from './helpers'
 
 const LEGACY_CREATED_AT = 1_720_000_000_000
 const LEGACY_PROFILE_ID = 'legacy-dangling-key-profile'
@@ -34,12 +34,12 @@ test('legacy storage-v25 workspace and portable chat recover through public impo
   await expect(secondPage.locator('[data-ui="storage-overview"]')).toBeVisible()
   await retainObsoleteWorkspaceDatabase(page)
 
-  page.once('dialog', (dialog) => dialog.accept())
   await page.locator('[data-ui="storage-workspace-import-input"]').setInputFiles({
     name: 'natter-workspace-storage-v25-sanitized.json',
     mimeType: 'application/json',
     buffer: Buffer.from(JSON.stringify(legacyWorkspaceBackup())),
   })
+  await confirmPresentationDialog(page)
   await expect(
     page.locator('[data-ui="toast-text"]').filter({
       hasText: 'Imported workspace backup (0 chats).',

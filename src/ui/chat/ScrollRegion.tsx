@@ -1847,12 +1847,9 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
       didOpenRef.current = true
       finiteAcquisitionRef.current = null
       clearProgrammaticScrollIntents()
-      const lease = continuityLeaseRef.current
-      if (lease?.mode === 'follow') {
-        const lifecycle = revealClaimLifecycleRef.current
-        if (lease.claim.source === 'reveal' && lifecycle?.status === 'active') {
-          lifecycle.status = 'cancelled'
-        }
+      const lifecycle = revealClaimLifecycleRef.current
+      if (lifecycle?.status === 'active') {
+        lifecycle.status = 'cancelled'
       }
       const owned = continuityLeaseRef.current !== null
       const preparedTransition = pendingPreparedTransitionRef.current

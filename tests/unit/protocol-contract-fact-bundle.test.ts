@@ -417,7 +417,7 @@ describe('production protocol fact bundle', () => {
     expect(siteIds(bundle.locality.configurationUnion.constructorSites)).toEqual(
       siteIds(bundle.configuration.commandUnion.constructorSites),
     )
-    expect(bundle.snapshot.sourceFiles).toBe(485)
+    expect(bundle.snapshot.sourceFiles).toBe(487)
     expect(report.reports['tab-cross-tab-locality']).toMatchObject({
       ok: true,
       surfaces: 20,
@@ -430,9 +430,9 @@ describe('production protocol fact bundle', () => {
     })
     expect(report.reports['production-discriminated-unions']).toMatchObject({
       ok: true,
-      discoveredCount: 472,
-      controlProtocolCount: 221,
-      gapCount: 179,
+      discoveredCount: 473,
+      controlProtocolCount: 222,
+      gapCount: 180,
       constructionGapCount: 10,
       violations: [],
     })

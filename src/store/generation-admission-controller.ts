@@ -53,6 +53,7 @@ import type {
 import {
   getWorkspaceRuntimeFence,
   getWorkspaceRuntimeState,
+  isWorkspaceRuntimeClosedError,
   runWorkspaceActionAtFence,
   subscribeWorkspaceRuntimeState,
   type WorkspaceWritePermit,
@@ -113,6 +114,15 @@ export type GenerationAdmissionRequest =
     }
 
 export type SettlingGenerationAdmissionRequest = GenerationAdmissionRequest
+
+function captureGenerationAdmissionRequest<Request extends GenerationAdmissionRequest>(
+  request: Request,
+): Request {
+  return Object.freeze({
+    ...request,
+    intent: snapshotGenerationIntent(request.intent),
+  }) as Request
+}
 
 interface GenerationAdmissionClaimBase {
   readonly id: string
@@ -189,11 +199,15 @@ interface GenerationAdmissionState {
 
 export interface GenerationAdmissionController {
   claim(request: GenerationAdmissionRequest): GenerationAdmissionClaim
-  claimWhenCapabilitySettles(
+  startWhenCapabilitySettles<T>(
     request: SettlingGenerationAdmissionRequest,
     signal: AbortSignal,
+    start: (
+      claim: GenerationAdmissionClaim,
+      workspaceAdmission: GenerationWorkspaceAdmission,
+    ) => GenerationAdmissionStart<T>,
     observer?: GenerationPreparationObserver,
-  ): Promise<GenerationAdmissionClaim>
+  ): Promise<T>
   captureCapabilityFrame(
     attemptAdmission?: AttemptTargetAdmissionFrame | null,
   ): GenerationCapabilityFrame
@@ -215,6 +229,16 @@ export interface GenerationAdmissionController {
   cancel(claim: GenerationAdmissionClaim): void
 }
 
+export interface GenerationWorkspaceAdmission {
+  admit(): void
+  reject(error: unknown): void
+}
+
+export interface GenerationAdmissionStart<T> {
+  readonly value: T
+  readonly completed: Promise<unknown>
+}
+
 export type GenerationPreparationPhase =
   | 'workspace-requested'
   | 'workspace-admitted'
@@ -227,6 +251,23 @@ export interface GenerationPreparationObserver {
   phase(phase: GenerationPreparationPhase): void
 }
 
+function createGenerationWorkspaceAdmission(): {
+  readonly port: GenerationWorkspaceAdmission
+  readonly settled: Promise<void>
+} {
+  let admit: () => void = () => undefined
+  let reject: (error: unknown) => void = () => undefined
+  const settled = new Promise<void>((resolve, rejectPromise) => {
+    admit = resolve
+    reject = rejectPromise
+  })
+  void settled.catch(() => undefined)
+  return Object.freeze({
+    port: Object.freeze({ admit, reject }),
+    settled,
+  })
+}
+
 class TabGenerationAdmissionController implements GenerationAdmissionController {
   private readonly states = new WeakMap<GenerationAdmissionClaim, GenerationAdmissionState>()
 
@@ -234,13 +275,17 @@ class TabGenerationAdmissionController implements GenerationAdmissionController 
     return this.claimCaptured(request, snapshotGenerationIntent(request.intent))
   }
 
-  claimWhenCapabilitySettles(
+  startWhenCapabilitySettles<T>(
     request: SettlingGenerationAdmissionRequest,
     signal: AbortSignal,
+    start: (
+      claim: GenerationAdmissionClaim,
+      workspaceAdmission: GenerationWorkspaceAdmission,
+    ) => GenerationAdmissionStart<T>,
     observer?: GenerationPreparationObserver,
-  ): Promise<GenerationAdmissionClaim> {
+  ): Promise<T> {
     const captured = captureSettlingAdmissionRequest(request)
-    return this.settleCapturedAdmission(captured, signal, observer)
+    return this.settleCapturedAdmission(captured, signal, start, observer)
   }
 
   private claimCaptured(
@@ -368,11 +413,15 @@ class TabGenerationAdmissionController implements GenerationAdmissionController 
     }
   }
 
-  private async settleCapturedAdmission(
+  private async settleCapturedAdmission<T>(
     captured: CapturedSettlingAdmissionRequest,
     signal: AbortSignal,
+    start: (
+      claim: GenerationAdmissionClaim,
+      workspaceAdmission: GenerationWorkspaceAdmission,
+    ) => GenerationAdmissionStart<T>,
     observer?: GenerationPreparationObserver,
-  ): Promise<GenerationAdmissionClaim> {
+  ): Promise<T> {
     let releasePublication: () => void = () => undefined
     const releaseCurrentPublication = () => {
       const release = releasePublication
@@ -394,9 +443,25 @@ class TabGenerationAdmissionController implements GenerationAdmissionController 
               captured.request.intent,
               configurationResolution,
             )
+            const workspaceAdmission = createGenerationWorkspaceAdmission()
+            let started: GenerationAdmissionStart<T>
+            try {
+              started = start(claim, workspaceAdmission.port)
+            } catch (error) {
+              this.fail(claim)
+              throw error
+            }
+            try {
+              await workspaceAdmission.settled
+            } catch (error) {
+              await started.completed
+              this.fail(claim)
+              if (isWorkspaceRuntimeClosedError(error) && !signal.aborted) continue
+              throw error
+            }
             cancelSettlingConfiguration(captured)
             releaseCurrentPublication()
-            return claim
+            return started.value
           } catch (error) {
             if (error instanceof GenerationAdmissionError && error.capability.state === 'pending') {
               const pendingOwner = error.capability.owner
@@ -834,10 +899,7 @@ interface CapturedSettlingAdmissionRequest {
 function captureSettlingAdmissionRequest(
   request: SettlingGenerationAdmissionRequest,
 ): CapturedSettlingAdmissionRequest {
-  const capturedRequest = Object.freeze({
-    ...request,
-    intent: snapshotGenerationIntent(request.intent),
-  }) as GenerationAdmissionRequest
+  const capturedRequest = captureGenerationAdmissionRequest(request)
   return Object.freeze({
     request: capturedRequest,
     configuration:

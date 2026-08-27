@@ -23,6 +23,10 @@ import {
 } from 'react'
 import { type LlamaServerProps, probeLlamaServer } from '../../api/probe'
 import {
+  requestPresentationConfirmation,
+  requestPresentationText,
+} from '../../app/presentation-dialog'
+import {
   configurationWriteInteraction,
   configurationWriteTarget,
   definePresentationInteraction,
@@ -734,7 +738,11 @@ function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | u
     runCreatePreset({
       target: chat.id,
       action: async () => {
-        const name = window.prompt('Name for new preset:')
+        const name = await requestPresentationText({
+          title: 'New preset',
+          inputLabel: 'Preset name',
+          confirmLabel: 'Save',
+        })
         if (!name?.trim()) return null
         return configurationApplication.createAndLinkChatPreset({
           chatId: chat.id,
@@ -792,13 +800,25 @@ function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | u
   )
 
   const renamePreset = useCallback(async (targetId: string, currentName: string) => {
-    const name = window.prompt('Rename preset:', currentName)
+    const name = await requestPresentationText({
+      title: 'Rename preset',
+      inputLabel: 'Preset name',
+      initialValue: currentName,
+      confirmLabel: 'Rename',
+    })
     if (!name?.trim() || name === currentName) return
     await configurationApplication.renameChatPreset(targetId, name.trim())
   }, [])
 
   const deletePresetWithConfirm = useCallback(async (targetId: string, name: string) => {
-    if (!window.confirm(`Delete preset "${name}"? Chats stay; their preset link will clear.`)) {
+    if (
+      !(await requestPresentationConfirmation({
+        title: 'Delete preset?',
+        message: `Delete preset "${name}"? Chats stay; their preset link will clear.`,
+        confirmLabel: 'Delete',
+        tone: 'danger',
+      }))
+    ) {
       return
     }
     await configurationApplication.deleteChatPreset(targetId)

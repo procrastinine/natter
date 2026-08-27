@@ -368,6 +368,33 @@ describe('ScrollRegion continuity lease', () => {
     expect(consumed).toHaveBeenCalledTimes(1)
   })
 
+  it('does not reacquire a pending reveal after explicit reading begins', async () => {
+    const consumed = vi.fn()
+    const fixture = setup({ onRevealClaimConsumed: consumed, revealSurfaceAvailable: false })
+    acquireOpen(fixture)
+
+    act(() => {
+      fixture.rerender({
+        revealClaimKey: 'lazy-destination',
+        revealClaimTargetMessageId: 'lazy-tail',
+      })
+    })
+    expect(consumed).not.toHaveBeenCalled()
+    await pinByWheel(fixture, 700)
+
+    act(() => {
+      fixture.rerender(
+        { revealSurfaceAvailable: true },
+        <article data-ui="message" data-message-id="lazy-tail">
+          lazy destination
+        </article>,
+      )
+    })
+
+    expect(consumed).toHaveBeenCalledTimes(1)
+    expect(fixture.ref.current?.getState()).toBe('pinned')
+  })
+
   it('owns an old-to-new reveal transition before the replacement suffix publishes', () => {
     const fixture = setup()
     acquireOpen(fixture)

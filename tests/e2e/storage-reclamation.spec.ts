@@ -6,11 +6,13 @@ import {
   activeWorkspaceDatabaseName,
   buildSseBody,
   clearIndexedDb,
+  confirmPresentationDialog,
   createChatAndOpen,
   firstChatId,
   mockChatCompletions,
   seedFirstRun,
   sendMessage,
+  submitPresentationTextDialog,
   waitForWorkspaceRunning,
 } from './helpers'
 
@@ -584,8 +586,8 @@ test('normal use catches up foreground work without repeating the physical copy 
     await page.locator('[data-ui="preset-breadcrumb-button"]').click()
     const currentPreset = page.locator('[data-ui="preset-menu-item"][data-current="true"]')
     await expect(currentPreset).toHaveAttribute('data-preset-id', presetBeforeCatchup.id)
-    page.once('dialog', (dialog) => void dialog.accept(caughtUpPresetName))
     await currentPreset.getByTitle('Rename').click()
+    await submitPresentationTextDialog(page, caughtUpPresetName)
     await expect(page.locator('[data-ui="preset-breadcrumb-button"]')).toContainText(
       caughtUpPresetName,
     )
@@ -819,10 +821,10 @@ test('durable replacement state recovers crashed owners and serializes competing
         acquired: true,
         failure: null,
       })
-    preactivationInitiator.once('dialog', (dialog) => dialog.accept())
     await preactivationInitiator
       .locator('[data-ui="storage-workspace-import-input"]')
       .setInputFiles(backupPath)
+    await confirmPresentationDialog(preactivationInitiator)
     await expect
       .poll(() => readWorkspaceControlSnapshot(page))
       .toMatchObject({
@@ -878,10 +880,10 @@ test('durable replacement state recovers crashed owners and serializes competing
       .toMatchObject({ acquired: true, failure: null })
     postactivationInitiator = await context.newPage()
     await postactivationInitiator.goto('/#/storage')
-    postactivationInitiator.once('dialog', (dialog) => dialog.accept())
     await postactivationInitiator
       .locator('[data-ui="storage-workspace-import-input"]')
       .setInputFiles(backupPath)
+    await confirmPresentationDialog(postactivationInitiator)
     await expect
       .poll(() => readWorkspaceControlSnapshot(page))
       .toMatchObject({
@@ -956,8 +958,6 @@ test('durable replacement state recovers crashed owners and serializes competing
     firstCompetitor = await context.newPage()
     secondCompetitor = await context.newPage()
     await Promise.all([firstCompetitor.goto('/#/storage'), secondCompetitor.goto('/#/storage')])
-    firstCompetitor.once('dialog', (dialog) => dialog.accept())
-    secondCompetitor.once('dialog', (dialog) => dialog.accept())
     await Promise.all([
       firstCompetitor
         .locator('[data-ui="storage-workspace-import-input"]')
@@ -965,6 +965,10 @@ test('durable replacement state recovers crashed owners and serializes competing
       secondCompetitor
         .locator('[data-ui="storage-workspace-import-input"]')
         .setInputFiles(backupPath),
+    ])
+    await Promise.all([
+      confirmPresentationDialog(firstCompetitor),
+      confirmPresentationDialog(secondCompetitor),
     ])
     await expect
       .poll(() => readWorkspaceControlSnapshot(page), { timeout: 60_000 })
@@ -1221,10 +1225,10 @@ test('clear all reloads into a fresh workspace that can fetch and select models 
 
   await page.goto('/#/storage')
   await expect(page.locator('[data-ui="storage-overview"]')).toBeVisible()
-  page.once('dialog', (dialog) => dialog.accept())
   const reloaded = page.waitForEvent('load')
   const secondReloaded = secondPage.waitForEvent('load')
   await page.getByRole('button', { name: 'Clear all', exact: true }).click()
+  await confirmPresentationDialog(page)
   await Promise.all([reloaded, secondReloaded])
   await expect(page).toHaveURL(/#\/storage$/u)
   await expect(secondPage).toHaveURL(/#\/new$/u)

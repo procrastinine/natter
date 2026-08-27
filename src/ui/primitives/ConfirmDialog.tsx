@@ -1,4 +1,4 @@
-import { type ReactNode, useId, useRef } from 'react'
+import { type ReactNode, type RefObject, useId, useRef } from 'react'
 import { CloseIcon } from '../icons/Icon'
 import { Button, type ButtonTone, IconButton } from './Button'
 import { Dialog } from './Dialog'
@@ -13,6 +13,7 @@ interface ConfirmDialogProps {
   confirmDisabled?: boolean
   confirmTone?: ButtonTone
   initialFocus?: 'confirm' | 'cancel'
+  initialFocusRef?: RefObject<HTMLElement | null>
   onCancel: () => void
   onConfirm: () => void | Promise<void>
   closeLabel?: string
@@ -28,6 +29,7 @@ export function ConfirmDialog({
   confirmDisabled = false,
   confirmTone = 'danger',
   initialFocus = 'confirm',
+  initialFocusRef,
   onCancel,
   onConfirm,
   closeLabel = 'Cancel delete',
@@ -43,7 +45,7 @@ export function ConfirmDialog({
       surfaceUi="confirm-delete"
       labelledBy={titleId}
       scrimLabel={closeLabel}
-      initialFocusRef={initialFocus === 'cancel' ? cancelRef : confirmRef}
+      initialFocusRef={initialFocusRef ?? (initialFocus === 'cancel' ? cancelRef : confirmRef)}
       closeOnEscape={!busy}
       closeOnScrim={!busy}
       onClose={onCancel}

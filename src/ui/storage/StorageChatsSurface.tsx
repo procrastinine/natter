@@ -10,6 +10,10 @@ import {
   useRef,
   useState,
 } from 'react'
+import {
+  requestPresentationConfirmation,
+  requestPresentationText,
+} from '../../app/presentation-dialog'
 import { chatHref, makeAnchorClickHandler } from '../../app/router'
 import {
   compareSidebarChatRows,
@@ -567,10 +571,12 @@ export default function ChatsStorageSurface() {
     const chats = await resolveCurrentSelection()
     if (chats.length === 0) return
     const defaultName = sharedFolderName(chats, folderById)
-    const name = window.prompt(
-      `Move ${chats.length} ${pluralize('chat', chats.length)} to folder (blank removes folder)`,
-      defaultName,
-    )
+    const name = await requestPresentationText({
+      title: `Move ${chats.length} ${pluralize('chat', chats.length)}`,
+      inputLabel: 'Folder name (blank removes folder)',
+      initialValue: defaultName,
+      confirmLabel: 'Move',
+    })
     if (name === null) return
     await withBusyChatAction('bulk:move', async () => {
       const trimmed = name.trim()
@@ -592,10 +598,12 @@ export default function ChatsStorageSurface() {
     const chats = await resolveCurrentSelection()
     if (chats.length === 0) return
     const defaultNames = sharedTagNames(chats, tagById)
-    const value = window.prompt(
-      `Tags for ${chats.length} ${pluralize('chat', chats.length)}, comma-separated`,
-      defaultNames,
-    )
+    const value = await requestPresentationText({
+      title: `Set tags for ${chats.length} ${pluralize('chat', chats.length)}`,
+      inputLabel: 'Tags, comma-separated',
+      initialValue: defaultNames,
+      confirmLabel: 'Save',
+    })
     if (value === null) return
     await withBusyChatAction('bulk:tags', async () => {
       await storageApplication.chat.setManyTagsFromNames(
@@ -616,7 +624,16 @@ export default function ChatsStorageSurface() {
         : archivedCount > 0
           ? `Permanently delete ${archivedCount} archived ${pluralize('chat', archivedCount)}? This cannot be undone.`
           : `Delete ${liveCount} ${pluralize('chat', liveCount)}? They will move to the archive.`
-    if (!window.confirm(message)) return
+    if (
+      !(await requestPresentationConfirmation({
+        title: 'Delete selected chats?',
+        message,
+        confirmLabel: archivedCount > 0 ? 'Delete' : 'Archive',
+        tone: 'danger',
+      }))
+    ) {
+      return
+    }
     await withBusyChatAction('bulk:delete', async () => {
       const archivedIds = chats.filter((chat) => chat.archived).map((chat) => chat.id)
       const liveIds = chats.filter((chat) => !chat.archived).map((chat) => chat.id)

@@ -32,7 +32,7 @@ import {
   type GeneratedWorkspaceStateName,
   readReusableGeneratedWorkspaceStateManifest,
 } from './generated-workspace-state'
-import { activeWorkspaceDatabaseName, readMessages } from './helpers'
+import { activeWorkspaceDatabaseName, readMessages, submitPresentationTextDialog } from './helpers'
 
 const ACTIVE_ROUTE = `/#/chat/${GENERATED_WORKSPACE_ACTIVE_CHAT_ID}/message/${GENERATED_WORKSPACE_ACTIVE_TERMINAL_ID}`
 const INITIAL_TRANSCRIPT_FLOOR = 10
@@ -1379,8 +1379,8 @@ async function measureForegroundFork(
       }
     ).__natterForegroundForkHeartbeat = state
   })
-  page.once('dialog', (dialog) => void dialog.accept(`Generated ${name} fork`))
   await fork.click()
+  await submitPresentationTextDialog(page, `Generated ${name} fork`)
   await expect(page.locator('[data-ui="chat-title"]')).toContainText(`Generated ${name} fork`, {
     timeout: HANG_BOUND_MS,
   })
