@@ -31,7 +31,7 @@ const REQUIRED_INTERROGATED_IDS = new Set([
   'dev-and-built-artifact-exercise-equivalent-application-paths',
   'verification-hygiene-failures-affect-exit-code',
   'verification-performance-stage-measures-current-runtime',
-  'isolated-send-critical-path-latency',
+  'isolated-interaction-critical-path-latency',
   'every-presentation-interaction-site-has-outcome-proof',
 ])
 
@@ -176,12 +176,13 @@ function validateVerificationParity(root, problems) {
       'isolated-send-latency',
       playwright.includes("name: 'chromium-send-performance'") &&
         playwright.includes("name: 'firefox-send-performance'") &&
-        playwright.includes('testMatch: sendPerformanceSpec') &&
+        playwright.includes('testMatch: [sendPerformanceSpec, renderWindowPerformanceSpec]') &&
+        playwright.includes('renderWindowPerformanceSpec') &&
         playwright.includes("? ['chromium-large-workspace']") &&
         playwright.includes("dependencies: ['firefox']") &&
         runner.includes("'--project=chromium-send-performance'") &&
         runner.includes("'--project=firefox-send-performance'"),
-      'Strict send latency runs alone after each complete engine suite, so unrelated parallel stress CPU cannot enter its wall clock.',
+      'Strict Chromium interaction and send latency run serially after the complete engine suite, so unrelated parallel stress CPU cannot enter their wall clock; Firefox send latency remains isolated after its complete engine suite.',
     ),
     parityAssertion(
       'pinned-node',

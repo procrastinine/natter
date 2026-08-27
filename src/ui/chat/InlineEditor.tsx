@@ -191,9 +191,10 @@ export function InlineEditor({
     if (!textarea || !scrollRegionCommands) return
     const onWheel = (event: WheelEvent) => {
       const canScrollInternally =
-        event.deltaY < 0
+        textarea.style.overflowY === 'auto' &&
+        (event.deltaY < 0
           ? textarea.scrollTop > 0
-          : textarea.scrollTop + textarea.clientHeight < textarea.scrollHeight - 1
+          : textarea.scrollTop + textarea.clientHeight < textarea.scrollHeight - 1)
       if (canScrollInternally) return
       event.preventDefault()
       scrollRegionCommands.scrollTextEditingViewportBy(event.deltaY, event.deltaMode)

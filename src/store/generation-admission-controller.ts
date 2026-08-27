@@ -23,6 +23,7 @@ import {
 import {
   type ActiveGenerationConfigurationResolution,
   configurationController,
+  type SelectedGenerationConfigurationClaim,
 } from './configuration-controller'
 import { captureConnectionRuntimeKeyPreferenceFromProof } from './connection-runtime'
 import {
@@ -245,11 +246,14 @@ class TabGenerationAdmissionController implements GenerationAdmissionController 
   private claimCaptured(
     request: GenerationAdmissionRequest,
     capturedIntent: GenerationIntent,
+    configurationOverride?: ActiveGenerationConfigurationResolution,
   ): GenerationAdmissionClaim {
     const intent = capturedIntent
     const routeOwner = 'routeOwner' in request ? request.routeOwner : null
     const context = generationCapabilityController.captureContext(
       attemptAdmissionForIntent(capturedIntent),
+      undefined,
+      configurationOverride,
     )
     if (!context.workspace) {
       throw generationAdmissionErrorFor(context.frame.capability(intent))
@@ -257,7 +261,8 @@ class TabGenerationAdmissionController implements GenerationAdmissionController 
     const workspace = context.workspace
     const chatId = capturedIntent.kind === 'new-chat-send' ? newId() : capturedIntent.chatId
     const configuration = captureGenerationConfiguration(
-      context.configuration?.resolve(generationConfigurationRequirement(capturedIntent)),
+      configurationOverride ??
+        context.configuration?.resolve(generationConfigurationRequirement(capturedIntent)),
       capturedIntent,
       chatId,
     )
@@ -364,7 +369,7 @@ class TabGenerationAdmissionController implements GenerationAdmissionController 
   }
 
   private async settleCapturedAdmission(
-    captured: GenerationAdmissionRequest,
+    captured: CapturedSettlingAdmissionRequest,
     signal: AbortSignal,
     observer?: GenerationPreparationObserver,
   ): Promise<GenerationAdmissionClaim> {
@@ -377,10 +382,19 @@ class TabGenerationAdmissionController implements GenerationAdmissionController 
     try {
       for (;;) {
         throwIfGenerationAdmissionAborted(signal)
-        const capability = generationCapabilityForSettlingRequest(captured)
+        const configurationResolution = resolveSettlingConfiguration(captured)
+        const capability = generationCapabilityForSettlingRequest(
+          captured.request,
+          configurationResolution,
+        )
         if (capability.state === 'ready') {
           try {
-            const claim = this.claimCaptured(captured, captured.intent)
+            const claim = this.claimCaptured(
+              captured.request,
+              captured.request.intent,
+              configurationResolution,
+            )
+            cancelSettlingConfiguration(captured)
             releaseCurrentPublication()
             return claim
           } catch (error) {
@@ -390,9 +404,13 @@ class TabGenerationAdmissionController implements GenerationAdmissionController 
               releaseCurrentPublication()
               releasePublication = await waitForGenerationAdmissionPublication(
                 pendingOwner,
-                captured.intent,
+                captured.request.intent,
                 signal,
-                () => generationCapabilityForSettlingRequest(captured).state === 'pending',
+                () =>
+                  generationCapabilityForSettlingRequest(
+                    captured.request,
+                    resolveSettlingConfiguration(captured),
+                  ).state === 'pending',
               )
               continue
             }
@@ -404,10 +422,13 @@ class TabGenerationAdmissionController implements GenerationAdmissionController 
         releaseCurrentPublication()
         releasePublication = await waitForGenerationAdmissionPublication(
           capability.owner,
-          captured.intent,
+          captured.request.intent,
           signal,
           () => {
-            const currentCapability = generationCapabilityForSettlingRequest(captured)
+            const currentCapability = generationCapabilityForSettlingRequest(
+              captured.request,
+              resolveSettlingConfiguration(captured),
+            )
             return (
               currentCapability.state === 'pending' && currentCapability.owner === capability.owner
             )
@@ -416,6 +437,7 @@ class TabGenerationAdmissionController implements GenerationAdmissionController 
       }
     } finally {
       releaseCurrentPublication()
+      cancelSettlingConfiguration(captured)
     }
   }
 
@@ -804,21 +826,50 @@ function snapshotGenerationIntent(intent: GenerationIntent): GenerationIntent {
   }
 }
 
+interface CapturedSettlingAdmissionRequest {
+  readonly request: GenerationAdmissionRequest
+  readonly configuration: SelectedGenerationConfigurationClaim | null
+}
+
 function captureSettlingAdmissionRequest(
   request: SettlingGenerationAdmissionRequest,
-): GenerationAdmissionRequest {
-  return Object.freeze({
+): CapturedSettlingAdmissionRequest {
+  const capturedRequest = Object.freeze({
     ...request,
     intent: snapshotGenerationIntent(request.intent),
   }) as GenerationAdmissionRequest
+  return Object.freeze({
+    request: capturedRequest,
+    configuration:
+      capturedRequest.intent.kind === 'new-chat-send'
+        ? null
+        : configurationController.claimPendingGenerationConfiguration(
+            capturedRequest.intent.chatId,
+          ),
+  })
 }
 
 function generationCapabilityForSettlingRequest(
   request: GenerationAdmissionRequest,
+  configurationOverride?: ActiveGenerationConfigurationResolution,
 ): GenerationCapability {
   return generationCapabilityController
-    .captureContext(attemptAdmissionForIntent(request.intent))
+    .captureContext(attemptAdmissionForIntent(request.intent), undefined, configurationOverride)
     .frame.capability(request.intent)
+}
+
+function resolveSettlingConfiguration(
+  captured: CapturedSettlingAdmissionRequest,
+): ActiveGenerationConfigurationResolution | undefined {
+  return captured.configuration
+    ? configurationController.resolveSelectedGenerationConfiguration(captured.configuration)
+    : undefined
+}
+
+function cancelSettlingConfiguration(captured: CapturedSettlingAdmissionRequest): void {
+  if (captured.configuration) {
+    configurationController.cancelSelectedGenerationConfiguration(captured.configuration)
+  }
 }
 
 function attemptAdmissionForIntent(

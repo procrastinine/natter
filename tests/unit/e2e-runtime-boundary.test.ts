@@ -728,7 +728,8 @@ describe('built-app runtime boundary', () => {
     expect(config).toContain("name: 'chromium-large-workspace'")
     expect(config).toContain("name: 'chromium-send-performance'")
     expect(config).toContain("name: 'firefox-send-performance'")
-    expect(config).toContain('testMatch: sendPerformanceSpec')
+    expect(config).toContain('testMatch: [sendPerformanceSpec, renderWindowPerformanceSpec]')
+    expect(config).toContain('renderWindowPerformanceSpec')
     expect(config).toContain("? ['chromium-large-workspace']")
     expect(config).toContain("dependencies: ['firefox']")
     expect(config).toContain('workers: 1')
@@ -848,6 +849,7 @@ describe('built-app runtime boundary', () => {
 
   it('starts the fake API explicitly in CI and tests before performance reporting', () => {
     const verify = readText('.github/workflows/verify.yml')
+    const firefox = readText('.github/workflows/firefox.yml')
     const deploy = readText('.github/workflows/deploy.yml')
     const verifyE2eIndex = VERIFICATION_STAGES.findIndex((stage) => stage.id === 'chromium-e2e')
     const verifyPerfIndex = VERIFICATION_STAGES.findIndex((stage) => stage.id === 'performance')
@@ -856,6 +858,11 @@ describe('built-app runtime boundary', () => {
     const deployUploadIndex = deploy.indexOf('uses: actions/upload-pages-artifact')
 
     expect(verify).toContain('run: pnpm verify:ci')
+    expect(verify).toContain('runs-on: ubuntu-24.04')
+    expect(firefox).toContain('runs-on: ubuntu-24.04')
+    expect(deploy.slice(deploy.indexOf('build_pages:'), deploy.indexOf('\n  deploy:'))).toContain(
+      'runs-on: ubuntu-24.04',
+    )
     expect(verify.indexOf('run: pnpm install --frozen-lockfile')).toBeLessThan(
       verify.indexOf('run: pnpm verify:ci'),
     )

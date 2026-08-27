@@ -432,7 +432,7 @@ describe('generation request path audit', () => {
     expect(admission).toContain(
       'material: conversationController.acquirePromptMaterial(workspace, chatId, [])',
     )
-    expect(capability).toContain('return existingGenerationCapability(')
+    expect(capability).toContain('existingGenerationCapability(workspace, attemptAdmission, probe)')
     expect(capability).toContain(
       "attemptAdmission.admission(probe.targetAssistantId) === 'occupied'",
     )
@@ -455,6 +455,10 @@ describe('generation request path audit', () => {
     expect(admission).toMatch(/case 'send':[\s\S]*?childSlot: 'append'/u)
     expect(admission).toMatch(/case 'reply':[\s\S]*?childSlot: 'append'/u)
     expect(command).toContain('const currentChat = await ctx.getChat(chatId)')
+    expect(admission).toContain('claimPendingGenerationConfiguration(')
+    expect(admission).toContain('resolveSettlingConfiguration(captured)')
+    expect(admission).toContain('cancelSettlingConfiguration(captured)')
+    expect(admission).not.toContain('claimSelectedGenerationConfiguration(')
     expect(command).toContain('const slot = promptPath.slot')
     expect(placementStart).toBeGreaterThanOrEqual(0)
     expect(placementEnd).toBeGreaterThan(placementStart)

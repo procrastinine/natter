@@ -22,14 +22,23 @@ function lifecycleDrainError(reason: unknown): Error {
 }
 
 async function navigatePageForLifecycleDrain(page: LifecycleDrainPage): Promise<void> {
-  let navigationError: unknown
-  try {
-    await page.goto(LIFECYCLE_DRAIN_URL, { waitUntil: 'commit' })
-  } catch (error) {
-    navigationError = error
+  const navigationErrors: unknown[] = []
+  for (let attempt = 0; attempt < 2 && !page.isClosed(); attempt += 1) {
+    try {
+      await page.goto(LIFECYCLE_DRAIN_URL, { waitUntil: 'commit' })
+    } catch (error) {
+      navigationErrors.push(error)
+    }
+    if (page.url() === LIFECYCLE_DRAIN_URL) break
   }
   if (page.isClosed() || page.url() !== LIFECYCLE_DRAIN_URL) {
-    if (navigationError !== undefined) throw lifecycleDrainError(navigationError)
+    if (navigationErrors.length === 1) throw lifecycleDrainError(navigationErrors[0])
+    if (navigationErrors.length > 1) {
+      throw new AggregateError(
+        navigationErrors.map(lifecycleDrainError),
+        'RuntimeDiagnosticLifecycleDrainRejected',
+      )
+    }
     throw new Error('RuntimeDiagnosticDrainUrlMismatch')
   }
   await page.setContent(LIFECYCLE_DRAIN_DOCUMENT)

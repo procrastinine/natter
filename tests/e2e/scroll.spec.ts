@@ -449,11 +449,7 @@ test('an active message edit does not trap transcript scrolling in either direct
   await expect(page.locator('[data-ui="message"]')).toHaveCount(39)
 
   const region = page.locator('[data-ui="scroll-region"]')
-  const wheel = async (deltaY: number) => {
-    for (let step = 0; step < 16; step += 1) {
-      await page.mouse.wheel(0, deltaY)
-    }
-  }
+  const wheel = (deltaY: number) => page.mouse.wheel(0, deltaY)
 
   const tailMessage = page
     .locator('[data-ui="message"][data-role="user"]')
@@ -495,6 +491,19 @@ test('an active message edit does not trap transcript scrolling in either direct
   await expect(region).toHaveAttribute('data-scroll-state', 'pinned')
   const beforeManualUp = await region.evaluate((node) => node.scrollTop)
   await tailInput.hover()
+  const hiddenOverflow = await tailInput.evaluate((node) => {
+    node.style.height = `${node.clientHeight - 1}px`
+    node.style.overflowY = 'hidden'
+    node.scrollTop = 1
+    return {
+      overflowY: node.style.overflowY,
+      scrollRange: node.scrollHeight - node.clientHeight,
+      scrollTop: node.scrollTop,
+    }
+  })
+  expect(hiddenOverflow.overflowY).toBe('hidden')
+  expect(hiddenOverflow.scrollRange).toBeGreaterThanOrEqual(1)
+  expect(hiddenOverflow.scrollTop).toBe(1)
   await wheel(-400)
   await expect
     .poll(() => region.evaluate((node, before) => before - node.scrollTop, beforeManualUp))

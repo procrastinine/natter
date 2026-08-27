@@ -596,15 +596,20 @@ export const TEST_GUARANTEE_CLAIMS = Object.freeze([
     ],
   },
   {
-    id: 'isolated-send-critical-path-latency',
+    id: 'isolated-interaction-critical-path-latency',
     status: 'covered',
     requiredProofKinds: ['performance', 'browser'],
     rationale:
-      'The strict warm-send phase, lock and provider-dispatch budgets run in one single-worker project after each complete engine suite, so the measured wall clock contains application work rather than unrelated stress-worker scheduling.',
+      'The strict Chromium folder/render-window and warm-send budgets run serially in one single-worker project after the complete engine suite, while Firefox warm-send remains isolated after its engine suite, so unrelated stress-worker scheduling cannot enter their wall clock.',
     evidence: [
       {
         path: 'tests/e2e/send-performance.spec.ts',
         locator: "test('bounds every warm existing-chat preparation phase and provider dispatch'",
+      },
+      {
+        path: 'tests/e2e/render-window.spec.ts',
+        locator:
+          "test('a folder larger than one page expands gap-free without stealing the top-first viewport'",
       },
       {
         path: 'playwright.config.ts',
@@ -616,7 +621,8 @@ export const TEST_GUARANTEE_CLAIMS = Object.freeze([
       },
       {
         path: 'tests/unit/e2e-runtime-boundary.test.ts',
-        locator: "expect(config).toContain('testMatch: sendPerformanceSpec')",
+        locator:
+          "expect(config).toContain('testMatch: [sendPerformanceSpec, renderWindowPerformanceSpec]')",
       },
     ],
   },

@@ -5,24 +5,38 @@ import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import type { ChatSettings, ConnectionProfile, Message, MessageRole } from '../../src/core/types'
 import { attemptController } from '../../src/store/attempt-controller'
 import { __resetBroadcastForTests } from '../../src/store/broadcast'
-import { __resetBrowserRepositoryForTests } from '../../src/store/browser-repo'
+import {
+  __resetBrowserRepositoryForTests,
+  getBrowserRepository,
+} from '../../src/store/browser-repo'
 import {
   openBrowserWorkspace,
   shutdownBrowserWorkspace,
 } from '../../src/store/browser-workspace-lifecycle'
 import { getChat } from '../../src/store/chats'
+import { configurationApplication } from '../../src/store/configuration-application'
+import { configurationController } from '../../src/store/configuration-controller'
 import { importMessagesOp } from '../../src/store/conversation-command-client'
 import { __resetDbForTests } from '../../src/store/db'
-import type { GenerationTransportInput } from '../../src/store/generation-engine'
+import {
+  createGenerationEngine,
+  type GenerationTransportInput,
+} from '../../src/store/generation-engine'
 import { getCachedEndpoints } from '../../src/store/models-cache'
 import { getCachedPrivacyPolicy } from '../../src/store/privacy-cache'
-import { getWorkspaceRepository } from '../../src/store/workspace-repository'
+import type { WorkspaceRepository } from '../../src/store/workspace-protocol'
+import {
+  __resetWorkspaceRepositoryForTests,
+  __setWorkspaceRepositoryForTests,
+  getWorkspaceRepository,
+} from '../../src/store/workspace-repository'
 import { runWorkspaceRead } from '../../src/store/workspace-runtime'
 import { useUiStore } from '../../src/store/zustand/uiStore'
 import { createChat } from '../helpers/chats'
 import { putCachedEndpoints, putCachedPrivacyPolicy } from '../helpers/discovery-cache'
 import {
   installGenerationProfile,
+  prepareControlledGenerationSurface,
   runControlledGeneration,
   startControlledGeneration,
 } from '../helpers/generation-engine'
@@ -104,6 +118,7 @@ function chatSettings(overrides: Partial<ChatSettings> = {}): ChatSettings {
 }
 
 async function reset() {
+  __resetWorkspaceRepositoryForTests()
   __resetBrowserRepositoryForTests()
   __resetDbForTests()
   __resetBroadcastForTests()
@@ -310,6 +325,91 @@ afterEach(async () => {
 })
 
 describe('almost-live request shape matrix', () => {
+  it('does not let Send overtake the exact pending manual-provider command', async () => {
+    const modelId = 'google/gemini-3.1-flash-lite-preview'
+    await warmOpenRouterPrivacy(modelId)
+    const chat = await createChat({ settings: chatSettings({ model: modelId }) })
+    const intent = {
+      kind: 'send' as const,
+      chatId: chat.id,
+      target: { kind: 'fixed' as const, messageId: null },
+      content: [{ type: 'text' as const, text: LOREM_FOLLOWUP }],
+    }
+    const releaseSurface = await prepareControlledGenerationSurface(intent, {
+      profile: makeProfile(),
+    })
+    await waitForConfigurationChat(chat.id)
+    const enteredConfiguration = deferred<void>()
+    const releaseConfiguration = deferred<void>()
+    const controller = new AbortController()
+    let configurationWrite: Promise<boolean> | undefined
+    const target = getBrowserRepository()
+    const execute = target.execute.bind(target)
+    __setWorkspaceRepositoryForTests(
+      repositoryProxy(target, async (permit, command, options) => {
+        if (
+          command.kind === 'configuration.execute' &&
+          command.input.kind === 'chat.settings-fields-patch'
+        ) {
+          enteredConfiguration.resolve()
+          await releaseConfiguration.promise
+        }
+        return execute(permit, command, options)
+      }),
+    )
+
+    try {
+      configurationWrite = configurationApplication.patchChatSettingsFields(chat.id, [
+        { path: ['providerPrefs', 'ignore'], value: ['Trusted Host'] },
+        { path: ['providerPrefs', 'ignoreOverridesFilter'], value: true },
+        { path: ['providerPrefs', 'only'], value: undefined },
+      ])
+      await enteredConfiguration.promise
+      expect(
+        configurationController.projectChatConfiguration(chat).settings.providerPrefs,
+      ).toMatchObject({
+        ignore: ['Trusted Host'],
+        ignoreOverridesFilter: true,
+      })
+
+      let wire: Record<string, unknown> | undefined
+      let admitted = false
+      const engine = createGenerationEngine({
+        openStream: captureChatDelta((captured) => {
+          wire = captured
+        }),
+      })
+      const handlePromise = engine
+        .startWhenCapabilitySettles({ intent }, { signal: controller.signal })
+        .then((handle) => {
+          admitted = true
+          return handle
+        })
+      await Promise.resolve()
+      await Promise.resolve()
+      expect(admitted).toBe(false)
+      expect(wire).toBeUndefined()
+
+      releaseConfiguration.resolve()
+      await expect(configurationWrite).resolves.toBe(true)
+      const handle = await handlePromise
+      await expect(handle.completed).resolves.toMatchObject({ outcome: 'done' })
+      const providerWire = requireDefined(wire?.provider, 'manual provider wire') as {
+        ignore?: string[]
+      }
+      expect(providerWire).toMatchObject({
+        ignore: ['Trusted Host'],
+      })
+      expect(providerWire.ignore).not.toContain('Filtered Host')
+    } finally {
+      releaseConfiguration.resolve()
+      controller.abort()
+      await configurationWrite?.catch(() => undefined)
+      releaseSurface()
+      __resetWorkspaceRepositoryForTests()
+    }
+  })
+
   it('normal send captures seeded history, system prompt, append prompt, and assistant prefill', async () => {
     const modelId = 'google/gemini-3.1-flash-lite-preview'
     await warmOpenRouterPrivacy(modelId)
@@ -882,6 +982,42 @@ function requireAt<T>(items: readonly T[], index: number): T {
   const item = items[index]
   if (item === undefined) throw new Error(`missing item at index ${index}`)
   return item
+}
+
+function repositoryProxy(
+  target: WorkspaceRepository,
+  execute: WorkspaceRepository['execute'],
+): WorkspaceRepository {
+  return {
+    query: target.query.bind(target),
+    execute,
+    replace: target.replace.bind(target),
+    subscribeChanges: target.subscribeChanges.bind(target),
+  }
+}
+
+function waitForConfigurationChat(chatId: string): Promise<void> {
+  return new Promise<void>((resolve) => {
+    let unsubscribe: () => void = () => undefined
+    const inspect = () => {
+      const target = configurationController.getSnapshot().frame.target
+      if (target.kind !== 'chat' || target.chatId !== chatId) return
+      unsubscribe()
+      resolve()
+    }
+    unsubscribe = configurationController.subscribe(inspect)
+    inspect()
+  })
+}
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+  return { promise, resolve, reject }
 }
 
 describe('send action routing', () => {

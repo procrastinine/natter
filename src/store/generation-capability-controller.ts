@@ -89,12 +89,18 @@ class TabGenerationCapabilityController implements GenerationCapabilityControlle
         promptPath,
         attemptAdmission,
         frame: Object.freeze({
-          capability: (probe: GenerationAdmissionCapabilityProbe | null) =>
-            probe?.kind === 'new-chat-send'
-              ? pendingGenerationCapability('configuration')
-              : probe
-                ? existingGenerationCapability(workspace, attemptAdmission, probe)
-                : pendingGenerationCapability('prompt-path'),
+          capability: (probe: GenerationAdmissionCapabilityProbe | null) => {
+            if (!probe) return pendingGenerationCapability('prompt-path')
+            const configurationCapability = configurationOverride
+              ? generationConfigurationCapability(configurationOverride)
+              : probe.kind === 'new-chat-send'
+                ? pendingGenerationCapability('configuration')
+                : AVAILABLE_GENERATION_CAPABILITY
+            if (configurationCapability.state !== 'ready') return configurationCapability
+            return probe.kind === 'new-chat-send'
+              ? AVAILABLE_GENERATION_CAPABILITY
+              : existingGenerationCapability(workspace, attemptAdmission, probe)
+          },
         }),
       })
     }
@@ -112,14 +118,18 @@ class TabGenerationCapabilityController implements GenerationCapabilityControlle
     const frame = Object.freeze({
       capability: (probe: GenerationAdmissionCapabilityProbe | null): GenerationCapability => {
         if (!probe) return pendingGenerationCapability('prompt-path')
-        if (probe.kind !== 'new-chat-send') {
-          return existingGenerationCapability(workspace, attemptAdmission, probe)
-        }
-        const configurationCapability = generationConfigurationCapability(
-          configurationOverride ?? configuration.resolve(generationConfigurationRequirement(probe)),
-        )
+        const configurationResolution =
+          configurationOverride ??
+          (probe.kind === 'new-chat-send'
+            ? configuration.resolve(generationConfigurationRequirement(probe))
+            : undefined)
+        const configurationCapability = configurationResolution
+          ? generationConfigurationCapability(configurationResolution)
+          : AVAILABLE_GENERATION_CAPABILITY
         if (configurationCapability.state !== 'ready') return configurationCapability
-        return AVAILABLE_GENERATION_CAPABILITY
+        return probe.kind === 'new-chat-send'
+          ? AVAILABLE_GENERATION_CAPABILITY
+          : existingGenerationCapability(workspace, attemptAdmission, probe)
       },
     }) satisfies GenerationCapabilityFrame
     const context = Object.freeze({

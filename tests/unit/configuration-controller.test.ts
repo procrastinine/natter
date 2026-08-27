@@ -670,6 +670,44 @@ describe('sealed target-qualified generation configuration', () => {
     configurationController.cancelSelectedGenerationConfiguration(claim)
   })
 
+  it('claims a settling generation dependency only for exact pending configuration work', async () => {
+    const profile = profileFixture('profile-selected-only-when-pending')
+    const settings = settingsFixture(profile)
+    configurationController.rememberSeed({ profileId: profile.id, presetId: null, settings })
+    await installSource(selectionFixture(profile))
+    observeChat(chatFixture('chat-A', settings))
+    await waitForExactChatSelection('chat-A')
+
+    expect(configurationController.claimPendingGenerationConfiguration('chat-A')).toBeNull()
+
+    const [intent] = configurationController.stageChatSettingsFields('chat-A', [
+      { path: ['providerPrefs', 'ignore'], value: ['Slow Retain'] },
+    ])
+    if (!intent) throw new Error('SelectedConfigurationIntentMissing')
+    const claim = configurationController.claimPendingGenerationConfiguration('chat-A')
+    if (!claim) throw new Error('PendingGenerationConfigurationClaimMissing')
+    expect(configurationController.resolveSelectedGenerationConfiguration(claim)).toEqual({
+      capability: 'pending',
+    })
+
+    configurationController.acknowledgePendingConfiguration('chat-A', {
+      promptFields: [],
+      chatSettingsFields: [{ fieldKey: intent.fieldKey, revision: intent.revision }],
+      acceptedChatConfigurationVersion: 1,
+    })
+
+    await vi.waitFor(() => {
+      expect(configurationController.resolveSelectedGenerationConfiguration(claim)).toMatchObject({
+        capability: 'ready',
+        kind: 'chat',
+        chatId: 'chat-A',
+        configurationVersion: 1,
+        claim: { settings: { providerPrefs: { ignore: ['Slow Retain'] } } },
+      })
+    })
+    configurationController.cancelSelectedGenerationConfiguration(claim)
+  })
+
   it('keeps optimistic chat settings generation-pending until their durable version is known', async () => {
     const profile = profileFixture('profile-selected-pending')
     const settings = settingsFixture(profile)

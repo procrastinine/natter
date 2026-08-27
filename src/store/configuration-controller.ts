@@ -521,6 +521,7 @@ export interface ConfigurationController {
   pendingWorkspaceSetting(key: string): PendingWorkspaceSettingIntent | undefined
   pendingTextTemplateConfig(templateId: TextTemplateId): PendingTextTemplateConfigIntent | undefined
   projectChatConfiguration(chat: Chat): Chat
+  claimPendingGenerationConfiguration(chatId: ChatId): SelectedGenerationConfigurationClaim | null
   claimSelectedGenerationConfiguration(chatId: ChatId): SelectedGenerationConfigurationClaim
   resolveSelectedGenerationConfiguration(
     claim: SelectedGenerationConfigurationClaim,
@@ -1363,6 +1364,18 @@ class TabConfigurationController implements ConfigurationController {
     if (presetId === null || presetId === undefined) delete projected.presetId
     else projected.presetId = presetId
     return projected
+  }
+
+  claimPendingGenerationConfiguration(chatId: ChatId): SelectedGenerationConfigurationClaim | null {
+    const target = this.frameTarget
+    if (
+      target.kind !== 'chat' ||
+      target.chatId !== chatId ||
+      this.selectedGenerationPendingKeys(target).length === 0
+    ) {
+      return null
+    }
+    return this.claimSelectedGenerationConfiguration(chatId)
   }
 
   claimSelectedGenerationConfiguration(chatId: ChatId): SelectedGenerationConfigurationClaim {

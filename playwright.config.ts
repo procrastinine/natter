@@ -33,6 +33,7 @@ const applicationServerCommand = [
 const devServerCommand = `${packageManagerCommand} dev --host ${host} --port ${devPort} --strictPort`
 const devPreviewParitySpec = /dev-preview-parity\.spec\.ts$/u
 const sendPerformanceSpec = /send-performance\.spec\.ts$/u
+const renderWindowPerformanceSpec = /render-window\.spec\.ts$/u
 
 export function parseE2ePort(raw: string, name: string): number {
   const parsed = Number(raw)
@@ -116,6 +117,7 @@ export default defineConfig({
         /large-workspace-startup\.spec\.ts$/u,
         devPreviewParitySpec,
         sendPerformanceSpec,
+        renderWindowPerformanceSpec,
       ],
       use: { ...devices['Desktop Chrome'] },
     },
@@ -127,7 +129,7 @@ export default defineConfig({
     },
     {
       name: 'chromium-send-performance',
-      testMatch: sendPerformanceSpec,
+      testMatch: [sendPerformanceSpec, renderWindowPerformanceSpec],
       dependencies: serializedLargeWorkspaceClosure ? ['chromium-large-workspace'] : ['chromium'],
       fullyParallel: false,
       workers: 1,
