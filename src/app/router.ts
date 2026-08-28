@@ -68,6 +68,10 @@ interface RouteForegroundDemandRecord {
 
 let currentRouteForegroundDemand: RouteForegroundDemandRecord | null = null
 
+export function claimPresentationForegroundDemand(): WorkspacePresentationForegroundDemand {
+  return claimWorkspacePresentationForegroundDemand()
+}
+
 function publishRouteForegroundDemandDiagnostic(demand: RouteForegroundDemandRecord | null): void {
   if (typeof document === 'undefined') return
   if (demand) {

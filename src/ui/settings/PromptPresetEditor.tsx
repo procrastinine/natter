@@ -8,11 +8,12 @@
 // chat only" is the default); the preset picker offers load / overwrite /
 // save-as-new / rename / delete.
 import type { ReactNode } from 'react'
-import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import {
   requestPresentationConfirmation,
   requestPresentationText,
 } from '../../app/presentation-dialog'
+import { claimPresentationForegroundDemand } from '../../app/router'
 import { estimateTokensByTokenizer } from '../../core/tokens'
 import type { Chat, ChatSettings, PromptPresetKind } from '../../core/types'
 import { usePromptPresetCatalog } from '../../hooks/useConfigurationCatalog'
@@ -22,7 +23,10 @@ import {
   configurationController,
   currentActiveConfigurationSelection,
 } from '../../store/configuration-controller'
-import type { ConfigurationPromptPresetCatalogRow } from '../../store/presentation-contracts'
+import type {
+  ConfigurationPromptPresetCatalogRow,
+  WorkspacePresentationForegroundDemand,
+} from '../../store/presentation-contracts'
 import { useToastStore } from '../../store/zustand/toastStore'
 import { Button, IconButton } from '../primitives/Button'
 import { InfoDisclosure } from './InfoDisclosure'
@@ -50,6 +54,8 @@ interface SlotState {
   tokens: number
   pickerOpen: boolean
   setPickerOpen: (v: boolean) => void
+  beginDraftEdit: () => void
+  finishDraftEdit: () => void
   flushDraft: () => Promise<void>
   loadPreset: (id: string) => Promise<void>
   saveToExisting: (id: string, presetName: string) => Promise<void>
@@ -113,6 +119,27 @@ function usePromptSlot(
   }, [draft, opts.showTokens])
 
   const flushDraft = edit.flush
+  const foregroundDemandRef = useRef<WorkspacePresentationForegroundDemand | null>(null)
+
+  const beginDraftEdit = useCallback(() => {
+    foregroundDemandRef.current ??= claimPresentationForegroundDemand()
+  }, [])
+
+  const releaseDraftEdit = useCallback(() => {
+    const foregroundDemand = foregroundDemandRef.current
+    foregroundDemandRef.current = null
+    foregroundDemand?.release()
+  }, [])
+
+  useEffect(() => releaseDraftEdit, [releaseDraftEdit])
+
+  const finishDraftEdit = useCallback(() => {
+    const foregroundDemand = foregroundDemandRef.current
+    foregroundDemandRef.current = null
+    void flushDraft()
+      .finally(() => foregroundDemand?.release())
+      .catch(() => undefined)
+  }, [flushDraft])
 
   const pinnedPreset = useMemo(
     () =>
@@ -252,6 +279,8 @@ function usePromptSlot(
     tokens,
     pickerOpen,
     setPickerOpen,
+    beginDraftEdit,
+    finishDraftEdit,
     flushDraft,
     loadPreset,
     saveToExisting,
@@ -329,7 +358,8 @@ export function SystemPromptEditor({
             data-ui="system-prompt-textarea"
             value={s.draft}
             onChange={(e) => s.setDraft(e.target.value)}
-            onBlur={() => void s.flushDraft().catch(() => undefined)}
+            onFocus={s.beginDraftEdit}
+            onBlur={s.finishDraftEdit}
             rows={8}
             spellCheck
           />
@@ -414,7 +444,8 @@ export function AppendPromptEditor({
             data-ui="append-prompt-textarea"
             value={s.draft}
             onChange={(e) => s.setDraft(e.target.value)}
-            onBlur={() => void s.flushDraft().catch(() => undefined)}
+            onFocus={s.beginDraftEdit}
+            onBlur={s.finishDraftEdit}
             rows={4}
             spellCheck
           />
@@ -503,7 +534,8 @@ export function PrefillPromptEditor({
               data-ui="default-prefill-textarea"
               value={s.draft}
               onChange={(e) => s.setDraft(e.target.value)}
-              onBlur={() => void s.flushDraft().catch(() => undefined)}
+              onFocus={s.beginDraftEdit}
+              onBlur={s.finishDraftEdit}
               placeholder='Default text seeded into the prefill box. Example: "Chapter 1: The"'
               rows={3}
               spellCheck
@@ -587,7 +619,8 @@ export function ContinueSystemPromptEditor({
             data-ui="continue-system-prompt-textarea"
             value={s.draft}
             onChange={(e) => s.setDraft(e.target.value)}
-            onBlur={() => void s.flushDraft().catch(() => undefined)}
+            onFocus={s.beginDraftEdit}
+            onBlur={s.finishDraftEdit}
             rows={4}
             spellCheck
           />
@@ -667,7 +700,8 @@ export function ContinueUserPromptEditor({
             data-ui="continue-user-prompt-textarea"
             value={s.draft}
             onChange={(e) => s.setDraft(e.target.value)}
-            onBlur={() => void s.flushDraft().catch(() => undefined)}
+            onFocus={s.beginDraftEdit}
+            onBlur={s.finishDraftEdit}
             rows={3}
             spellCheck
           />

@@ -244,7 +244,10 @@ const SOURCE_BEHAVIOR_TESTS = {
   'ui/settings/ParamForm.tsx': ['unit/param-form.test.tsx', 'unit/param-form-api-mode.test.tsx'],
   'ui/settings/PerformanceSettings.tsx': ['unit/interaction-surfaces.test.tsx'],
   'ui/settings/PrivacySection.tsx': ['unit/interaction-surfaces.test.tsx'],
-  'ui/settings/PromptPresetEditor.tsx': ['unit/prompt-preset-editor.test.tsx'],
+  'ui/settings/PromptPresetEditor.tsx': [
+    'unit/prompt-preset-editor.test.tsx',
+    'e2e/system-prompt.spec.ts',
+  ],
   'ui/settings/PromptsTab.tsx': ['unit/interaction-surfaces.test.tsx'],
   'ui/settings/ProviderPicker.tsx': [
     'unit/privacy-policies.test.tsx',

@@ -571,6 +571,40 @@ describe('ParamForm hosted tools', () => {
 })
 
 describe('ChatModelPanel context tab', () => {
+  it('keeps same-target prompt editing current and interactive while routing is retained', async () => {
+    const profile = await createStoredProfile({
+      name: 'OpenRouter',
+      kind: 'openrouter',
+      baseUrl: 'https://openrouter.ai/api/v1',
+    })
+    const settings = cloneDefaultChatSettings()
+    settings.profileId = profile.id
+    settings.model = 'openai/gpt-4o'
+    settings.systemPrompt = 'current prompt'
+    const chat = await createChat({ settings })
+    const modelCatalog = modelCatalogFor(chat, profile)
+    modelCatalog.routing.capabilityPresentation = {
+      ...modelCatalog.routing.capabilityPresentation,
+      settings: { ...settings, systemPrompt: 'retained prompt' },
+      retained: true,
+    }
+
+    const view = render(
+      <ChatModelPanel
+        chatSnapshot={chat}
+        profileSnapshot={profile}
+        modelCatalog={modelCatalog}
+        onClose={() => undefined}
+      />,
+    )
+    fireEvent.click(await screen.findByRole('tab', { name: 'Prompts' }))
+
+    expect(screen.getByRole('textbox', { name: 'System prompt' })).toHaveValue('current prompt')
+    expect(
+      view.container.querySelector('[data-routing-presentation="retained"]'),
+    ).not.toHaveAttribute('inert')
+  })
+
   it('closes the preset menu as soon as the selection is owned', async () => {
     const profile = await createStoredProfile({
       name: 'OpenRouter',

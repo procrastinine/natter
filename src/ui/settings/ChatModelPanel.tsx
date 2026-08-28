@@ -200,6 +200,10 @@ export function ChatModelPanel({
   const capabilityPresentation = routing.capabilityPresentation
   const { capability, descriptor } = capabilityPresentation
   const presentationProfile = capabilityPresentation.profile
+  const promptPresentationOnly =
+    capabilityPresentation.retained &&
+    (capabilityPresentation.profileId !== chat.settings.profileId ||
+      capabilityPresentation.modelId !== (chat.settings.model || null))
   const presentationChat = useMemo(
     () =>
       capabilityPresentation.settings && capabilityPresentation.settings !== chat.settings
@@ -556,10 +560,10 @@ export function ChatModelPanel({
         {tab === 'prompts' ? (
           <div
             data-routing-presentation={capabilityPresentation.retained ? 'retained' : 'current'}
-            inert={capabilityPresentation.retained ? true : undefined}
+            inert={promptPresentationOnly ? true : undefined}
           >
             <PromptsTab
-              chat={presentationChat}
+              chat={chat}
               {...(presentationProfile ? { profile: presentationProfile } : {})}
               prefillPlan={prefillPlan}
             />

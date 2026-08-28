@@ -15,6 +15,7 @@ import { getChat } from '../../src/store/chats'
 import { configurationController } from '../../src/store/configuration-controller'
 import { __resetDbForTests, getDb } from '../../src/store/db'
 import { __resetWorkspaceRepositoryForTests } from '../../src/store/workspace-repository'
+import { awaitWorkspaceForegroundDemandIdle } from '../../src/store/workspace-runtime'
 import { useToastStore } from '../../src/store/zustand/toastStore'
 import { SystemPromptEditor } from '../../src/ui/settings/PromptPresetEditor'
 
@@ -44,6 +45,30 @@ afterEach(async () => {
 })
 
 describe('PromptPresetEditor persistence', () => {
+  it('holds background replacement demand only while the prompt field is focused', async () => {
+    const chat = await createChat({ settings: cloneDefaultChatSettings() })
+    const view = render(<SystemPromptEditor chat={chat} />)
+    const textarea = view.getByRole('textbox', { name: 'System prompt' })
+
+    fireEvent.focus(textarea)
+    let maintenanceAdmitted = false
+    const maintenance = awaitWorkspaceForegroundDemandIdle().then(() => {
+      maintenanceAdmitted = true
+    })
+    await Promise.resolve()
+    expect(maintenanceAdmitted).toBe(false)
+
+    fireEvent.blur(textarea)
+    fireEvent.focus(textarea)
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(maintenanceAdmitted).toBe(false)
+
+    fireEvent.blur(textarea)
+    await maintenance
+    expect(maintenanceAdmitted).toBe(true)
+  })
+
   it('accepts a remote stored value when the mounted editor is clean', async () => {
     const chat = await createChat({ settings: cloneDefaultChatSettings() })
     const view = render(<SystemPromptEditor chat={chat} />)

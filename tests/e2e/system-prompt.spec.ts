@@ -109,24 +109,52 @@ test('committing a system prompt bumps updatedAt + metaVersion and leaves branch
 test('debounced system-prompt saves never interrupt the active editor with a notice', async ({
   page,
 }) => {
+  let releaseCatalog: () => void = () => undefined
+  const catalogGate = new Promise<void>((resolve) => {
+    releaseCatalog = resolve
+  })
+  await page.route('https://openrouter.ai/api/v1/models*', async (route) => {
+    await catalogGate
+    await route.fulfill({
+      contentType: 'application/json',
+      headers: { 'access-control-allow-origin': '*' },
+      body: JSON.stringify({
+        data: [
+          {
+            id: 'anthropic/claude-opus-4.8',
+            name: 'Claude Opus 4.8',
+            supported_parameters: ['tools'],
+          },
+        ],
+      }),
+    })
+  })
   await mockChatCompletions(page, {
     body: buildSseBody([{ id: 'gen-1', content: 'ok', finish: 'stop' }]),
   })
-  await createChatAndOpen(page)
-  await sendMessage(page, 'initial')
-  await expect(page.locator('[data-ui="message"][data-role="assistant"]').first()).toBeVisible()
-  await page.locator('[data-role="settings-cog"]').click()
-  await page.locator('[data-ui="settings-tab"][data-tab="prompts"]').click()
-  const textarea = page.locator('[data-ui="system-prompt-textarea"]')
-  await textarea.fill('First system prompt')
-  const chatId = await firstChatId(page)
-  await expectChatSetting(page, chatId, 'systemPrompt', 'First system prompt')
-  await expect(textarea).toBeFocused()
-  await expect(page.locator('[data-ui="settings-toast"]')).toHaveCount(0)
-  await textarea.pressSequentially(' — appended')
-  await expectChatSetting(page, chatId, 'systemPrompt', 'First system prompt — appended')
-  await expect(textarea).toBeFocused()
-  await expect(page.locator('[data-ui="settings-toast"]')).toHaveCount(0)
+  try {
+    await createChatAndOpen(page)
+    await sendMessage(page, 'initial')
+    await expect(page.locator('[data-ui="message"][data-role="assistant"]').first()).toBeVisible()
+    await page.locator('[data-role="settings-cog"]').click()
+    await page.locator('[data-ui="settings-tab"][data-tab="prompts"]').click()
+    const textarea = page.locator('[data-ui="system-prompt-textarea"]')
+    await textarea.fill('First system prompt')
+    const chatId = await firstChatId(page)
+    await expectChatSetting(page, chatId, 'systemPrompt', 'First system prompt')
+    await expect(textarea).toBeFocused()
+    await expect(page.locator('[data-ui="settings-toast"]')).toHaveCount(0)
+
+    releaseCatalog()
+    await expect(page.locator('[data-ui="notice-banner"]')).toBeVisible()
+    await expect(textarea).toBeFocused()
+    await textarea.pressSequentially(' — appended')
+    await expectChatSetting(page, chatId, 'systemPrompt', 'First system prompt — appended')
+    await expect(textarea).toBeFocused()
+    await expect(page.locator('[data-ui="settings-toast"]')).toHaveCount(0)
+  } finally {
+    releaseCatalog()
+  }
 })
 
 test('model discovery cannot move settings tabs under an in-progress gesture', async ({ page }) => {
