@@ -34,6 +34,7 @@ export interface VerificationCandidatePlanResult {
 export function beginVerificationSlice(options?: {
   readonly root?: string
   readonly now?: () => Date
+  readonly comparisonMode?: 'canonical' | 'head'
 }): Promise<VerificationComparisonBaselineResult>
 export function prepareVerificationSliceCandidate(options: {
   readonly baselineId: string
@@ -45,5 +46,6 @@ export function parseVerificationSlicePlanArgs(argv: readonly string[]): Readonl
   begin: boolean
   baseline: string | null
   explain: boolean
+  head: boolean
   json: boolean
 }>

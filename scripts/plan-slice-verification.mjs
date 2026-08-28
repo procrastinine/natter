@@ -12,7 +12,10 @@ const ROOT = resolve(import.meta.dirname, '..')
 
 export async function beginVerificationSlice(options = {}) {
   const root = resolve(options.root ?? ROOT)
-  const comparison = await materializeCommittedVerificationComparison({ root })
+  const comparison = await materializeCommittedVerificationComparison({
+    root,
+    comparisonMode: options.comparisonMode ?? 'canonical',
+  })
   const created = createVerificationSliceBaseline({
     root,
     comparison,
@@ -64,11 +67,12 @@ export async function prepareVerificationSliceCandidate(options) {
 }
 
 export function parseVerificationSlicePlanArgs(argv) {
-  const parsed = { begin: false, baseline: null, explain: false, json: false }
+  const parsed = { begin: false, baseline: null, explain: false, head: false, json: false }
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index]
     if (arg === '--') continue
     if (arg === '--begin') parsed.begin = true
+    else if (arg === '--head') parsed.head = true
     else if (arg === '--explain') parsed.explain = true
     else if (arg === '--json') parsed.json = true
     else if (arg === '--baseline') {
@@ -83,13 +87,14 @@ export function parseVerificationSlicePlanArgs(argv) {
   if (parsed.begin && parsed.baseline) throw new Error('VerificationSliceBaselineModeConflict')
   if (!parsed.begin && !parsed.baseline)
     throw new Error('VerificationBaselineRequiredDirtyWorktree')
+  if (parsed.head && !parsed.begin) throw new Error('VerificationHeadComparisonRequiresBegin')
   return Object.freeze(parsed)
 }
 
 async function main() {
   const args = parseVerificationSlicePlanArgs(process.argv.slice(2))
   const result = args.begin
-    ? await beginVerificationSlice()
+    ? await beginVerificationSlice({ comparisonMode: args.head ? 'head' : 'canonical' })
     : await prepareVerificationSliceCandidate({ baselineId: args.baseline })
   if (args.json) {
     console.log(JSON.stringify(result))

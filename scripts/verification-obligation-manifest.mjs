@@ -102,6 +102,25 @@ export const VERIFICATION_PROOFS = Object.freeze([
       'tests/e2e/stream-ownership-admission.spec.ts',
     ],
   }),
+  proof('configuration-edit-continuity-unit', 'unit', {
+    runner: 'vitest',
+    files: [
+      'tests/unit/param-form.test.tsx',
+      'tests/unit/prompt-preset-editor.test.tsx',
+      'tests/unit/router.test.ts',
+      'tests/unit/workspace-runtime-resource-manifest.test.ts',
+    ],
+  }),
+  proof('configuration-edit-continuity-chromium', 'browser', {
+    runner: 'playwright',
+    project: 'chromium',
+    files: ['tests/e2e/system-prompt.spec.ts'],
+  }),
+  proof('configuration-edit-continuity-firefox', 'browser', {
+    runner: 'playwright',
+    project: 'firefox',
+    files: ['tests/e2e/system-prompt.spec.ts'],
+  }),
   proof('destination-frame-budget-contract', 'integration', {
     runner: 'vitest',
     files: [
@@ -232,6 +251,21 @@ export const VERIFICATION_PROOFS = Object.freeze([
 ])
 
 export const VERIFICATION_OBLIGATIONS = Object.freeze([
+  obligation(
+    'configuration-edit-continuity',
+    [
+      'src/app/router.ts',
+      'src/store/conversation-route-owner.ts',
+      'src/store/workspace-runtime.ts',
+      'src/ui/settings/ChatModelPanel.tsx',
+      'src/ui/settings/PromptPresetEditor.tsx',
+    ],
+    [
+      'configuration-edit-continuity-unit',
+      'configuration-edit-continuity-chromium',
+      'configuration-edit-continuity-firefox',
+    ],
+  ),
   obligation(
     'workspace-capability-activation-lifecycle',
     [

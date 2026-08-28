@@ -309,12 +309,14 @@ function playwrightProjectOrder(project) {
   switch (project) {
     case 'chromium':
       return 0
-    case 'large-workspace-setup':
+    case 'firefox':
       return 1
-    case 'chromium-large-workspace':
+    case 'large-workspace-setup':
       return 2
-    case 'chromium-send-performance':
+    case 'chromium-large-workspace':
       return 3
+    case 'chromium-send-performance':
+      return 4
     default:
       return Number.MAX_SAFE_INTEGER
   }
@@ -388,7 +390,7 @@ function validateProofExecution({ proof, root, problems, checkFiles = true }) {
   }
   if (execution.runner === 'playwright') {
     if (
-      !['chromium', 'chromium-large-workspace', 'chromium-send-performance'].includes(
+      !['chromium', 'firefox', 'chromium-large-workspace', 'chromium-send-performance'].includes(
         execution.project,
       )
     ) {

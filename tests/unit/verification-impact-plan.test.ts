@@ -437,7 +437,7 @@ describe('verification slice impact planner', () => {
         'tests/unit/ui-journey-invariant-recorder.test.ts',
       ]),
     )
-    expect(plan.tasks.playwright).toHaveLength(4)
+    expect(plan.tasks.playwright).toHaveLength(5)
     expect(plan.tasks.playwright[0]?.project).toBe('chromium')
     expect(plan.tasks.playwright[0]?.files).toEqual(
       expect.arrayContaining([
@@ -446,19 +446,49 @@ describe('verification slice impact planner', () => {
       ]),
     )
     expect(plan.tasks.playwright[1]).toEqual({
+      project: 'firefox',
+      files: ['tests/e2e/system-prompt.spec.ts'],
+    })
+    expect(plan.tasks.playwright[2]).toEqual({
       project: 'large-workspace-setup',
       files: ['tests/e2e/large-workspace.setup.ts'],
     })
-    expect(plan.tasks.playwright[2]).toEqual({
+    expect(plan.tasks.playwright[3]).toEqual({
       project: 'chromium-large-workspace',
       files: ['tests/e2e/large-workspace-startup.spec.ts'],
     })
-    expect(plan.tasks.playwright[3]).toEqual({
+    expect(plan.tasks.playwright[4]).toEqual({
       project: 'chromium-send-performance',
       files: ['tests/e2e/send-performance.spec.ts'],
     })
     expect(plan.openGuarantees).toContainEqual({ id: `obligation:${obligationId}`, status: 'open' })
     expect(validateVerificationManifest({ current })).toEqual([])
+  }, 15_000)
+
+  it('derives both browser engines for focused configuration continuity', () => {
+    const current = buildVerificationSnapshot()
+    const candidate = mutateFile(
+      current,
+      'src/ui/settings/PromptPresetEditor.tsx',
+      'configuration-focus-change',
+    )
+    const plan = planSliceVerification({ base: current, current: candidate })
+
+    expect(plan.impactedObligations).toContain('configuration-edit-continuity')
+    expect(plan.tasks.vitest).toEqual(
+      expect.arrayContaining([
+        'tests/unit/param-form.test.tsx',
+        'tests/unit/prompt-preset-editor.test.tsx',
+      ]),
+    )
+    expect(plan.tasks.playwright.find(({ project }) => project === 'chromium')?.files).toContain(
+      'tests/e2e/system-prompt.spec.ts',
+    )
+    expect(plan.tasks.playwright.find(({ project }) => project === 'firefox')).toEqual({
+      project: 'firefox',
+      files: ['tests/e2e/system-prompt.spec.ts'],
+    })
+    expect(plan.structuralBlockers).toEqual([])
   }, 15_000)
 })
 

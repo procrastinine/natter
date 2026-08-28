@@ -5,7 +5,7 @@ export const currentWaveManifest = Object.freeze({
   mode: 'coherence/gate',
   comparison: Object.freeze({
     kind: 'git-commit',
-    oid: 'eb6d6600a91c818e5b15750cd9b9786820272049',
+    oid: '0c688c8f1855380118c20bae7e38f6ab8a640048',
   }),
   roots: Object.freeze(['src']),
   requiredFiles: Object.freeze([

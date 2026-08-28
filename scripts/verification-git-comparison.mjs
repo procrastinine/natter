@@ -20,7 +20,24 @@ export async function materializeCommittedVerificationComparison(options = {}) {
   }
   const expected = expectedComparisonCommit(manifest)
   const runGit = options.runGit ?? runGitProcess
-  const capture = await captureGitTree(root, expected.oid, runGit)
+  const comparisonMode = options.comparisonMode ?? 'canonical'
+  if (comparisonMode !== 'canonical' && comparisonMode !== 'head') {
+    throw new Error(`VerificationComparisonModeInvalid:${comparisonMode}`)
+  }
+  let commitOid = expected.oid
+  let comparisonBaseOid
+  if (comparisonMode === 'head') {
+    const head = await checkedGit(runGit, root, ['rev-parse', '--verify', 'HEAD^{commit}'], null)
+    commitOid = head.stdout.toString('ascii').trim()
+    assertObjectId(commitOid)
+    try {
+      await checkedGit(runGit, root, ['merge-base', '--is-ancestor', expected.oid, commitOid], null)
+    } catch {
+      throw new Error('VerificationComparisonHeadNotDescendant')
+    }
+    comparisonBaseOid = expected.oid
+  }
+  const capture = await captureGitTree(root, commitOid, runGit, comparisonBaseOid)
   return buildCommittedVerificationComparison({ manifest, capture })
 }
 
@@ -73,6 +90,12 @@ export function buildCommittedVerificationComparison(options) {
     schemaVersion: 1,
     kind: 'git-object-comparison',
     waveId: manifest.id,
+    ...(capture.comparisonKind === 'descendant'
+      ? {
+          comparisonKind: capture.comparisonKind,
+          comparisonBaseOid: capture.comparisonBaseOid,
+        }
+      : {}),
     commitOid: capture.commitOid,
     treeOid: capture.treeOid,
     snapshotSchemaVersion: snapshot.schemaVersion,
@@ -103,7 +126,7 @@ export function assertCommittedVerificationComparison(value) {
   return value
 }
 
-async function captureGitTree(root, commitOid, runGit) {
+async function captureGitTree(root, commitOid, runGit, comparisonBaseOid) {
   const type = await checkedGit(runGit, root, ['cat-file', '-t', commitOid], null)
   if (type.stdout.toString('utf8') !== 'commit\n') {
     throw new Error('VerificationComparisonObjectNotCommit')
@@ -125,12 +148,13 @@ async function captureGitTree(root, commitOid, runGit) {
   )
   return deepFreeze({
     schemaVersion: 1,
+    ...(comparisonBaseOid ? { comparisonKind: 'descendant', comparisonBaseOid } : {}),
     commitOid,
     treeOid,
     treeListing: encodedBytes(listing.stdout),
     blobBatch: encodedBytes(batch.stdout),
     requestedObjectIds,
-    gitProcessCount: 4,
+    gitProcessCount: comparisonBaseOid ? 6 : 4,
   })
 }
 
@@ -162,11 +186,20 @@ function selectTreeEntries(entries) {
 }
 
 function validateGitTreeCapture(value, expectedCommitOid) {
+  const canonical =
+    value?.commitOid === expectedCommitOid &&
+    value?.comparisonKind === undefined &&
+    value?.comparisonBaseOid === undefined &&
+    value?.gitProcessCount === 4
+  const descendant =
+    /^[0-9a-f]{40}$/u.test(value?.commitOid ?? '') &&
+    value?.comparisonKind === 'descendant' &&
+    value?.comparisonBaseOid === expectedCommitOid &&
+    value?.gitProcessCount === 6
   if (
     value?.schemaVersion !== 1 ||
-    value?.commitOid !== expectedCommitOid ||
+    (!canonical && !descendant) ||
     !/^[0-9a-f]{40}$/u.test(value?.treeOid ?? '') ||
-    value?.gitProcessCount !== 4 ||
     !Array.isArray(value?.requestedObjectIds)
   ) {
     throw new Error('VerificationComparisonCaptureInvalid')
@@ -265,11 +298,21 @@ function parseBlobBatch(bytes, requestedObjectIds) {
 
 function validateComparisonEnvelope(value, manifest) {
   const expected = expectedComparisonCommit(manifest)
+  const canonical =
+    value?.commitOid === expected.oid &&
+    value?.comparisonKind === undefined &&
+    value?.comparisonBaseOid === undefined &&
+    value?.sourceStats?.gitProcessCount === 4
+  const descendant =
+    /^[0-9a-f]{40}$/u.test(value?.commitOid ?? '') &&
+    value?.comparisonKind === 'descendant' &&
+    value?.comparisonBaseOid === expected.oid &&
+    value?.sourceStats?.gitProcessCount === 6
   if (
     value?.schemaVersion !== 1 ||
     value?.kind !== 'git-object-comparison' ||
     value?.waveId !== manifest.id ||
-    value?.commitOid !== expected.oid ||
+    (!canonical && !descendant) ||
     !/^[0-9a-f]{40}$/u.test(value?.treeOid ?? '') ||
     value?.snapshotSchemaVersion !== value?.snapshot?.schemaVersion
   ) {

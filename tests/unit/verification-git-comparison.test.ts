@@ -21,7 +21,7 @@ const manifest: VerificationComparisonManifest = {
   id: 'wave-test',
   comparison: { kind: 'git-commit', oid: '1'.repeat(40) },
 }
-const CURRENT_COMPARISON_OID = 'eb6d6600a91c818e5b15750cd9b9786820272049'
+const CURRENT_COMPARISON_OID = '0c688c8f1855380118c20bae7e38f6ab8a640048'
 const COMPARISON_MATERIALIZATION_BUDGET_MS = 15_000
 const TEST_SETTLEMENT_BUDGET_MS = 1_000
 
@@ -31,16 +31,28 @@ describe('committed verification comparison', () => {
       begin: true,
       baseline: null,
       explain: false,
+      head: false,
       json: true,
+    })
+    expect(parseVerificationSlicePlanArgs(['--begin', '--head'])).toEqual({
+      begin: true,
+      baseline: null,
+      explain: false,
+      head: true,
+      json: false,
     })
     expect(parseVerificationSlicePlanArgs(['--baseline', 'slice-fixed'])).toEqual({
       begin: false,
       baseline: 'slice-fixed',
       explain: false,
+      head: false,
       json: false,
     })
     expect(() => parseVerificationSlicePlanArgs(['--begin', '--oid', 'deadbeef'])).toThrow(
       'VerificationSliceArgumentForbidden:--oid',
+    )
+    expect(() => parseVerificationSlicePlanArgs(['--baseline', 'slice-fixed', '--head'])).toThrow(
+      'VerificationHeadComparisonRequiresBegin',
     )
   })
   it('derives one deterministic, branded snapshot from exact tree and batch bytes', () => {
@@ -117,6 +129,25 @@ describe('committed verification comparison', () => {
         (diagnostic) => diagnostic.code === 'opaque-module-reference',
       ),
     ).toBe(true)
+    expect(performance.now() - startedAt).toBeLessThan(COMPARISON_MATERIALIZATION_BUDGET_MS)
+  })
+
+  it('materializes the current committed descendant for an incremental slice', {
+    timeout: COMPARISON_MATERIALIZATION_BUDGET_MS + TEST_SETTLEMENT_BUDGET_MS,
+  }, async () => {
+    const startedAt = performance.now()
+    const comparison = await materializeCommittedVerificationComparison({
+      comparisonMode: 'head',
+    })
+
+    expect(comparison.comparisonKind).toBe('descendant')
+    expect(comparison.comparisonBaseOid).toBe(CURRENT_COMPARISON_OID)
+    expect(comparison.commitOid).toMatch(/^[0-9a-f]{40}$/u)
+    expect(comparison.commitOid).not.toBe(CURRENT_COMPARISON_OID)
+    expect(comparison.sourceStats.gitProcessCount).toBe(6)
+    expect(restoreCommittedVerificationComparison(JSON.parse(JSON.stringify(comparison)))).toEqual(
+      comparison,
+    )
     expect(performance.now() - startedAt).toBeLessThan(COMPARISON_MATERIALIZATION_BUDGET_MS)
   })
 

@@ -10,6 +10,8 @@ export interface CommittedVerificationComparison {
   readonly schemaVersion: 1
   readonly kind: 'git-object-comparison'
   readonly waveId: string
+  readonly comparisonKind?: 'descendant'
+  readonly comparisonBaseOid?: string
   readonly commitOid: string
   readonly treeOid: string
   readonly snapshotSchemaVersion: 2
@@ -18,7 +20,7 @@ export interface CommittedVerificationComparison {
     readonly selectedFileCount: number
     readonly uniqueBlobCount: number
     readonly selectedBytes: number
-    readonly gitProcessCount: 4
+    readonly gitProcessCount: 4 | 6
   }
   readonly snapshot: VerificationSnapshot
   readonly digest: string
@@ -26,12 +28,14 @@ export interface CommittedVerificationComparison {
 
 export interface GitComparisonCapture {
   readonly schemaVersion: 1
+  readonly comparisonKind?: 'descendant'
+  readonly comparisonBaseOid?: string
   readonly commitOid: string
   readonly treeOid: string
   readonly treeListing: EncodedBytes
   readonly blobBatch: EncodedBytes
   readonly requestedObjectIds: readonly string[]
-  readonly gitProcessCount: 4
+  readonly gitProcessCount: 4 | 6
 }
 
 interface EncodedBytes {
@@ -52,6 +56,7 @@ interface GitProcessResult {
 export function materializeCommittedVerificationComparison(options?: {
   readonly root?: string
   readonly manifest?: VerificationComparisonManifest
+  readonly comparisonMode?: 'canonical' | 'head'
   readonly runGit?: (
     root: string,
     args: readonly string[],
