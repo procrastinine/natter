@@ -266,6 +266,34 @@ describe('storage chat catalog session', () => {
     expect(sidebar.getSnapshot()?.page.rows).toHaveLength(80)
   })
 
+  it('ignores last-viewed effects unless the mounted sidebar sorts by last viewed', async () => {
+    const source = new SyntheticSidebarPresentationSource(20)
+    const sidebar = createSidebarSessionController({
+      source,
+      firstPageSettlement: noSidebarFirstPageSettlement,
+    })
+    sidebarControllers.add(sidebar)
+    const request = {
+      ...FENCE,
+      mode: 'expanded' as const,
+      collapsedFolderIds: [],
+      pageSize: 20,
+      createdAtGroupBoundaries: [100, 90, 40, -190] as const,
+    }
+
+    sidebar.request({ ...request, sort: 'updatedAt-desc' })
+    await waitFor(() => sidebar.getSnapshot()?.status === 'ready')
+    source.emit(lastViewedChange('viewed-while-sorted-by-update'))
+    expect(source.requests).toHaveLength(1)
+
+    sidebar.request({ ...request, sort: 'lastViewedAt-desc' })
+    await waitFor(() => sidebar.getSnapshot()?.status === 'ready')
+    expect(source.requests).toHaveLength(2)
+    source.emit(lastViewedChange('viewed-while-sorted-by-view'))
+    expect(source.requests).toHaveLength(3)
+    await waitFor(() => sidebar.getSnapshot()?.status === 'ready')
+  })
+
   it('settles only terminal first-page publications with their exact outcome', async () => {
     for (const scenario of [
       { count: 1, expected: 'ready' as const },
@@ -802,6 +830,26 @@ function cursorOffset(value: string | undefined): number {
 
 function envelope<T>(value: T): ReadEnvelope<T> {
   return { ...FENCE, value }
+}
+
+function lastViewedChange(commitId: string): WorkspaceChange {
+  return {
+    kind: 'commit',
+    stamp: { ...FENCE, commitId },
+    delta: {
+      facts: [
+        {
+          kind: 'sidebar-row-changed',
+          chatId: 'chat-000000',
+          facets: ['last-viewed'],
+        },
+      ],
+      invalidations: [
+        { kind: 'chat', chatIds: ['chat-000000'] },
+        { kind: 'sidebar', chatIds: ['chat-000000'] },
+      ],
+    },
+  }
 }
 
 async function waitFor(assertion: () => boolean, timeoutMs = 1_000): Promise<void> {

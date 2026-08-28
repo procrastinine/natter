@@ -168,7 +168,7 @@ describe('browser WorkspaceRepository protocol contract', () => {
       now: 2,
     })
     expect(viewed.delta).toMatchObject({
-      facts: [{ kind: 'sidebar-row-changed', chatId: 'semantic-chat' }],
+      facts: [{ kind: 'sidebar-row-changed', chatId: 'semantic-chat', facets: ['last-viewed'] }],
       invalidations: expect.arrayContaining([
         { kind: 'chat', chatIds: ['semantic-chat'] },
         { kind: 'sidebar', chatIds: ['semantic-chat'] },

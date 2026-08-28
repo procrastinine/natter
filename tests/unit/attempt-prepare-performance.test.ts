@@ -400,7 +400,10 @@ async function continuationPrepareInput(
       },
     },
     configurationIntent: {
+      kind: 'captured',
       preferredDispatchKeyId: null,
+      settings: structuredClone(deepPath.chat.settings),
+      expectedConfigurationVersion: deepPath.chat.configurationVersion ?? 0,
     },
   }
 }

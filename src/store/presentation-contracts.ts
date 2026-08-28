@@ -76,7 +76,10 @@ export type {
   GenerationPreparationObserver,
   GenerationPreparationPhase,
 } from './generation-admission-controller'
-export type { GenerationCapabilityFrame } from './generation-capability-controller'
+export type {
+  ActiveTargetGenerationConfigurationCaptureState,
+  GenerationCapabilityFrame,
+} from './generation-capability-controller'
 export type { GenerationStartResult } from './generation-engine'
 export type { ImportChatOptions, ImportChatResult } from './import-export-contract'
 export type { MessageHeaderRow, StructuralMessageHeader } from './message-storage'

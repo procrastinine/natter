@@ -232,10 +232,8 @@ test('physical scrolling inside a growing streamed message preserves the visible
   browserName,
   page,
 }) => {
-  if (browserName === 'chromium') {
-    const session = await page.context().newCDPSession(page)
-    await session.send('Emulation.setCPUThrottlingRate', { rate: 4 })
-  }
+  const chromiumSession =
+    browserName === 'chromium' ? await page.context().newCDPSession(page) : undefined
   const scenario = await createFakeStreamScenario({
     targetChars: 220_000,
     reasoningChars: 0,
@@ -260,6 +258,7 @@ test('physical scrolling inside a growing streamed message preserves the visible
     await page.goto(`/#/chat/${chatId}`)
     await page.reload()
 
+    await chromiumSession?.send('Emulation.setCPUThrottlingRate', { rate: 4 })
     await sendMessage(page, 'stream viewport continuity prompt')
     await expect(page.locator('[data-ui="message-list"]')).toHaveAttribute(
       'data-rendered-count',
@@ -309,6 +308,7 @@ test('physical scrolling inside a growing streamed message preserves the visible
     expect(viewportContinuity.violations).toEqual([])
     expect(viewportContinuity.maximumCharacterDrift).toBeLessThanOrEqual(256)
   } finally {
+    await chromiumSession?.send('Emulation.setCPUThrottlingRate', { rate: 1 })
     await scenario.dispose()
   }
 })

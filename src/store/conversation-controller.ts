@@ -6436,15 +6436,22 @@ function replacementTranscriptOwesPaintedWindow(
     previous.currency !== 'retained' ||
     previous.seal.workspaceId !== nextSeal.workspaceId ||
     previous.seal.chatId !== nextSeal.chatId ||
-    !transcriptWindowIsStrictSubwindow(previous.window, nextWindow) ||
     promisedSpan === null ||
-    promisedSpan.branchLength !== previous.window.branchLength ||
-    promisedSpan.offset > previous.window.offset ||
-    promisedSpan.offset + promisedSpan.limit < previous.window.offset + previous.window.rowCount
+    promisedSpan.branchLength !== nextWindow.branchLength ||
+    (nextWindow.offset <= promisedSpan.offset &&
+      nextWindow.offset + nextWindow.rowCount >= promisedSpan.offset + promisedSpan.limit)
   ) {
     return false
   }
-  return true
+  if (previous.window.leafId !== nextWindow.leafId) {
+    return previous.window.rowCount > nextWindow.rowCount
+  }
+  return (
+    transcriptWindowIsStrictSubwindow(previous.window, nextWindow) &&
+    promisedSpan.branchLength === previous.window.branchLength &&
+    promisedSpan.offset <= previous.window.offset &&
+    promisedSpan.offset + promisedSpan.limit >= previous.window.offset + previous.window.rowCount
+  )
 }
 
 function transcriptWindowIsStrictSubwindow(

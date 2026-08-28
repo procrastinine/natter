@@ -627,6 +627,46 @@ describe('browser stream repository protocol', () => {
     expect(committedChat?.previewText).toBe('question-0')
   })
 
+  it('plans from the admitted settings when the durable chat changes before prepare', async () => {
+    const seeded = await seedTargets(1)
+    const target = requiredTarget(seeded, 0)
+    const preparedInput = await warmSendPrepareInput(seeded.chatId, target)
+    const selectedSettings = structuredClone(preparedInput.input.configurationIntent.settings)
+    selectedSettings.providerPrefs = {
+      ignore: ['Training Host'],
+      ignoreOverridesFilter: true,
+    }
+    const current = required(await getDb().chats.get(seeded.chatId), 'selected settings chat')
+    const laterSettings = structuredClone(current.settings)
+    laterSettings.providerPrefs = {
+      ignore: ['Alpha ZDR', 'Budget Clean'],
+      ignoreOverridesFilter: true,
+    }
+    await updateChatForTest(seeded.chatId, {
+      settings: laterSettings,
+      configurationVersion: (current.configurationVersion ?? 0) + 1,
+    })
+
+    const prepared = await execute({
+      kind: 'attempt.prepare',
+      input: {
+        ...preparedInput.input,
+        configurationIntent: {
+          ...preparedInput.input.configurationIntent,
+          settings: selectedSettings,
+        },
+      },
+    })
+
+    expect(prepared.planning.chat.settings.providerPrefs).toEqual(selectedSettings.providerPrefs)
+    expect(prepared.planning.chat.configurationVersion).toBe(
+      preparedInput.input.configurationIntent.expectedConfigurationVersion,
+    )
+    expect((await getDb().chats.get(seeded.chatId))?.settings.providerPrefs).toEqual(
+      laterSettings.providerPrefs,
+    )
+  })
+
   it('falls back to the current persisted path when the read hint is cyclic', async () => {
     const seeded = await seedTargets(1)
     const target = requiredTarget(seeded, 0)
@@ -1442,7 +1482,10 @@ async function continuationPrepareInput(input: {
       },
     },
     configurationIntent: {
+      kind: 'captured' as const,
       preferredDispatchKeyId: null,
+      settings: structuredClone(chat.settings),
+      expectedConfigurationVersion: chat.configurationVersion ?? 0,
     },
   }
 }
@@ -1498,7 +1541,10 @@ async function warmSendPrepareInput(chatId: string, target: Message) {
         },
       },
       configurationIntent: {
+        kind: 'captured' as const,
         preferredDispatchKeyId: null,
+        settings: structuredClone(chat.settings),
+        expectedConfigurationVersion: chat.configurationVersion ?? 0,
       },
       placement: {
         chatId,

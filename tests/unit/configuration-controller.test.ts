@@ -721,7 +721,9 @@ describe('sealed target-qualified generation configuration', () => {
     if (!intent) throw new Error('SelectedConfigurationIntentMissing')
 
     expect(resolveChat('chat-A')).toEqual({ capability: 'pending' })
-    const claim = configurationController.claimSelectedGenerationConfiguration('chat-A')
+    const claim = configurationController.claimSelectedGenerationConfiguration('chat-A', {
+      systemPrompt: 'regenerate override',
+    })
     expect(configurationController.resolveSelectedGenerationConfiguration(claim)).toEqual({
       capability: 'pending',
     })
@@ -738,7 +740,9 @@ describe('sealed target-qualified generation configuration', () => {
         kind: 'chat',
         chatId: 'chat-A',
         configurationVersion: 1,
-        claim: { settings: { textTemplate: 'raw' } },
+        claim: {
+          settings: { textTemplate: 'raw', systemPrompt: 'regenerate override' },
+        },
       })
     })
     configurationController.cancelSelectedGenerationConfiguration(claim)

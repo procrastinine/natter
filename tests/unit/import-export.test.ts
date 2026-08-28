@@ -540,7 +540,10 @@ async function prepareBlockingAttempt(
     })
     const promptHeaders = await generationPromptPathClaims(seeded.assistantMessage.id)
     const configurationIntent = {
+      kind: 'captured' as const,
       preferredDispatchKeyId: null,
+      settings: structuredClone(seeded.chat.settings),
+      expectedConfigurationVersion: seeded.chat.configurationVersion ?? 0,
     }
     const sendTurnId = newId()
     const reservedUser = message({

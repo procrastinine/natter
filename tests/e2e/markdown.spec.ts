@@ -62,8 +62,9 @@ test('renders a streamed code fence with a copy/download toolbar once closed', a
 })
 
 test('keeps oversized code bounded until Highlight anyway is explicit', async ({ page }) => {
+  const warmupLine = 'const shikiReady = true'
   const finalLine = 'oversized-code-final-line'
-  const code = `\`\`\`ts\n${'x\n'.repeat(10_001)}${finalLine}\n\`\`\``
+  const code = `\`\`\`ts\n${warmupLine}\n\`\`\`\n\n\`\`\`ts\n${'\n'.repeat(10_001)}const ${finalLine} = true\n\`\`\``
   await mockChatCompletions(page, {
     body: buildSseBody([{ id: 'oversized-code', content: code, finish: 'stop' }]),
   })
@@ -71,11 +72,15 @@ test('keeps oversized code bounded until Highlight anyway is explicit', async ({
   await sendMessage(page, 'show a very large code block')
 
   const assistant = page.locator('[data-ui="message"][data-role="assistant"]').first()
+  const warmup = assistant.locator('[data-streamdown="code-block"]').first()
+  await expect(warmup.locator('pre code span[style*="--sdm-c: #"]').first()).toBeVisible()
   const bounded = assistant.locator('[data-ui="code-block"][data-overflow="truncated"]')
   await expect(bounded).toBeVisible()
   await expect(bounded).not.toContainText(finalLine)
   await bounded.getByRole('button', { name: 'Highlight anyway' }).click()
-  await expect(assistant.locator('[data-streamdown="code-block"]')).toContainText(finalLine)
+  const highlighted = assistant.locator('[data-streamdown="code-block"]').last()
+  await expect(highlighted).toContainText(finalLine)
+  await expect(highlighted.locator('pre code span[style*="--sdm-c: #"]').first()).toBeVisible()
 })
 
 test('blocked images from unlisted origins render a blocked-image stub', async ({ page }) => {

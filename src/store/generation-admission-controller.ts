@@ -23,7 +23,6 @@ import {
 import {
   type ActiveGenerationConfigurationResolution,
   configurationController,
-  type SelectedGenerationConfigurationClaim,
 } from './configuration-controller'
 import { captureConnectionRuntimeKeyPreferenceFromProof } from './connection-runtime'
 import {
@@ -37,10 +36,15 @@ import {
 } from './conversation-controller'
 import type { ConversationRouteOwner } from './conversation-route-owner'
 import {
+  type ActiveTargetGenerationConfigurationCaptureState,
+  captureActiveTargetGenerationConfiguration,
   type GenerationAdmissionCapabilityProbe,
   type GenerationCapabilityFrame,
   generationCapabilityController,
+  generationConfigurationCapability,
   generationConfigurationRequirement,
+  releaseActiveTargetGenerationConfiguration,
+  resolveActiveTargetGenerationConfiguration,
 } from './generation-capability-controller'
 import type { GenerationPromptMaterialLease } from './generation-prompt-material'
 import { withSharedGenerationLifetime } from './locks'
@@ -103,6 +107,10 @@ export type GenerationIntent =
 
 export type NewChatGenerationIntent = Extract<GenerationIntent, { readonly kind: 'new-chat-send' }>
 export type ExistingChatGenerationIntent = Exclude<GenerationIntent, NewChatGenerationIntent>
+export type ExistingGenerationConfigurationAuthority =
+  | 'active-target'
+  | 'transaction-current'
+  | ActiveTargetGenerationConfigurationCaptureState
 
 export type GenerationAdmissionRequest =
   | {
@@ -111,6 +119,7 @@ export type GenerationAdmissionRequest =
     }
   | {
       readonly intent: ExistingChatGenerationIntent
+      readonly configurationAuthority: ExistingGenerationConfigurationAuthority
     }
 
 export type SettlingGenerationAdmissionRequest = GenerationAdmissionRequest
@@ -158,6 +167,13 @@ export interface GenerationAdmissionPayload {
     | {
         readonly kind: 'chat'
         readonly chatId: ChatId
+        readonly requestSettings:
+          | {
+              readonly kind: 'captured'
+              readonly settings: ChatSettings
+              readonly configurationVersion: number
+            }
+          | { readonly kind: 'transaction-current' }
         readonly preferredDispatchKeyId: string | null
         readonly settingsPatch?: ChatSettingsPatch
       }
@@ -272,7 +288,20 @@ class TabGenerationAdmissionController implements GenerationAdmissionController 
   private readonly states = new WeakMap<GenerationAdmissionClaim, GenerationAdmissionState>()
 
   claim(request: GenerationAdmissionRequest): GenerationAdmissionClaim {
-    return this.claimCaptured(request, snapshotGenerationIntent(request.intent))
+    try {
+      return this.claimCaptured(
+        request,
+        snapshotGenerationIntent(request.intent),
+        activeTargetConfigurationOverride(request),
+      )
+    } finally {
+      if (
+        'configurationAuthority' in request &&
+        typeof request.configurationAuthority !== 'string'
+      ) {
+        releaseActiveTargetGenerationConfiguration(request.configurationAuthority)
+      }
+    }
   }
 
   startWhenCapabilitySettles<T>(
@@ -310,6 +339,7 @@ class TabGenerationAdmissionController implements GenerationAdmissionController 
         context.configuration?.resolve(generationConfigurationRequirement(capturedIntent)),
       capturedIntent,
       chatId,
+      configurationUsesTransactionCurrent(request),
     )
     const capturedPrompt = captureGenerationPromptPath(
       capturedIntent,
@@ -643,6 +673,7 @@ function captureGenerationConfiguration(
   resolution: ActiveGenerationConfigurationResolution | undefined,
   intent: GenerationIntent,
   chatId: ChatId,
+  transactionCurrent: boolean,
 ): GenerationAdmissionPayload['configuration'] {
   if (intent.kind === 'new-chat-send') {
     if (resolution?.capability !== 'ready' || resolution.kind !== 'new-chat') {
@@ -659,13 +690,47 @@ function captureGenerationConfiguration(
       preferredDispatchKeyId,
     })
   }
-  const preferredDispatchKeyId =
-    resolution?.capability === 'ready' && resolution.kind === 'chat' && resolution.chatId === chatId
-      ? captureConnectionRuntimeKeyPreferenceFromProof(resolution.claim.profile, chatId).ref
-      : null
+  if (transactionCurrent) {
+    const preferredDispatchKeyId =
+      resolution?.capability === 'ready' &&
+      resolution.kind === 'chat' &&
+      resolution.chatId === chatId
+        ? captureConnectionRuntimeKeyPreferenceFromProof(resolution.claim.profile, chatId).ref
+        : null
+    return Object.freeze({
+      kind: 'chat' as const,
+      chatId,
+      requestSettings: Object.freeze({ kind: 'transaction-current' as const }),
+      preferredDispatchKeyId,
+      ...(intent.kind === 'regenerate' && intent.settingsPatch
+        ? { settingsPatch: intent.settingsPatch }
+        : {}),
+    })
+  }
+  if (resolution?.capability !== 'ready') {
+    throw generationAdmissionErrorFor(
+      resolution
+        ? generationConfigurationCapability(resolution)
+        : pendingGenerationCapability('configuration'),
+    )
+  }
+  if (resolution.kind !== 'chat' || resolution.chatId !== chatId) {
+    throw new Error(`GenerationAdmissionConfigurationMismatch:${chatId}`)
+  }
+  const settings = resolution.claim.settings
+  const configurationVersion = resolution.configurationVersion
+  const preferredDispatchKeyId = captureConnectionRuntimeKeyPreferenceFromProof(
+    resolution.claim.profile,
+    chatId,
+  ).ref
   return Object.freeze({
     kind: 'chat' as const,
     chatId,
+    requestSettings: Object.freeze({
+      kind: 'captured' as const,
+      settings: cloneFrozenGenerationPayload(settings),
+      configurationVersion,
+    }),
     preferredDispatchKeyId,
     ...(intent.kind === 'regenerate' && intent.settingsPatch
       ? { settingsPatch: intent.settingsPatch }
@@ -893,45 +958,93 @@ function snapshotGenerationIntent(intent: GenerationIntent): GenerationIntent {
 
 interface CapturedSettlingAdmissionRequest {
   readonly request: GenerationAdmissionRequest
-  readonly configuration: SelectedGenerationConfigurationClaim | null
+  readonly configuration: ActiveTargetGenerationConfigurationCaptureState | null
 }
 
 function captureSettlingAdmissionRequest(
   request: SettlingGenerationAdmissionRequest,
 ): CapturedSettlingAdmissionRequest {
   const capturedRequest = captureGenerationAdmissionRequest(request)
+  const configuration = captureSettlingConfiguration(capturedRequest)
   return Object.freeze({
     request: capturedRequest,
-    configuration:
-      capturedRequest.intent.kind === 'new-chat-send'
-        ? null
-        : configurationController.claimPendingGenerationConfiguration(
-            capturedRequest.intent.chatId,
-          ),
+    configuration,
   })
+}
+
+function captureSettlingConfiguration(
+  request: GenerationAdmissionRequest,
+): CapturedSettlingAdmissionRequest['configuration'] {
+  if (request.intent.kind === 'new-chat-send') return null
+  if (!('configurationAuthority' in request)) return null
+  if (request.configurationAuthority === 'transaction-current') return null
+  return request.configurationAuthority === 'active-target'
+    ? captureActiveTargetGenerationConfiguration(
+        request.intent.chatId,
+        request.intent.kind === 'regenerate' ? request.intent.settingsPatch : undefined,
+      )
+    : request.configurationAuthority
 }
 
 function generationCapabilityForSettlingRequest(
   request: GenerationAdmissionRequest,
   configurationOverride?: ActiveGenerationConfigurationResolution,
 ): GenerationCapability {
-  return generationCapabilityController
-    .captureContext(attemptAdmissionForIntent(request.intent), undefined, configurationOverride)
-    .frame.capability(request.intent)
+  const context = generationCapabilityController.captureContext(
+    attemptAdmissionForIntent(request.intent),
+    undefined,
+    configurationOverride,
+  )
+  const capability = context.frame.capability(request.intent)
+  if (capability.state !== 'ready' || !('configurationAuthority' in request)) return capability
+  if (request.configurationAuthority === 'transaction-current') return capability
+  if (configurationOverride?.capability === 'ready') {
+    return configurationOverride.kind === 'chat' &&
+      configurationOverride.chatId === request.intent.chatId
+      ? capability
+      : pendingGenerationCapability('configuration')
+  }
+  const target = context.configurationTarget
+  return target?.kind === 'chat' && target.chatId === request.intent.chatId
+    ? capability
+    : pendingGenerationCapability('configuration')
 }
 
 function resolveSettlingConfiguration(
   captured: CapturedSettlingAdmissionRequest,
 ): ActiveGenerationConfigurationResolution | undefined {
-  return captured.configuration
-    ? configurationController.resolveSelectedGenerationConfiguration(captured.configuration)
-    : undefined
+  if (!captured.configuration) return undefined
+  return resolveActiveTargetGenerationConfiguration(captured.configuration)
 }
 
 function cancelSettlingConfiguration(captured: CapturedSettlingAdmissionRequest): void {
-  if (captured.configuration) {
-    configurationController.cancelSelectedGenerationConfiguration(captured.configuration)
+  if (captured.configuration) releaseActiveTargetGenerationConfiguration(captured.configuration)
+}
+
+function activeTargetConfigurationOverride(
+  request: GenerationAdmissionRequest,
+): ActiveGenerationConfigurationResolution | undefined {
+  if (!('configurationAuthority' in request)) return undefined
+  const authority = request.configurationAuthority
+  if (authority === 'transaction-current') return undefined
+  const capture =
+    authority === 'active-target'
+      ? captureActiveTargetGenerationConfiguration(
+          request.intent.chatId,
+          request.intent.kind === 'regenerate' ? request.intent.settingsPatch : undefined,
+        )
+      : authority
+  try {
+    return resolveActiveTargetGenerationConfiguration(capture)
+  } finally {
+    if (authority === 'active-target') releaseActiveTargetGenerationConfiguration(capture)
   }
+}
+
+function configurationUsesTransactionCurrent(request: GenerationAdmissionRequest): boolean {
+  return (
+    'configurationAuthority' in request && request.configurationAuthority === 'transaction-current'
+  )
 }
 
 function attemptAdmissionForIntent(

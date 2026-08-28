@@ -7,18 +7,37 @@ import {
   pendingGenerationCapability,
   unavailableGenerationCapability,
 } from '../core/interaction-capability'
+import type { ChatId } from '../core/types'
 import type { AttemptTargetAdmissionFrame } from './attempt-controller'
 import {
+  type ActiveConfigurationTarget,
   type ActiveGenerationConfigurationFrame,
   type ActiveGenerationConfigurationRequirement,
   type ActiveGenerationConfigurationResolution,
   configurationController,
+  type SelectedGenerationConfigurationClaim,
 } from './configuration-controller'
 import { type ConversationPromptPathFrame, conversationController } from './conversation-controller'
 import type { WorkspaceFence } from './repository'
 import { getWorkspaceRuntimeFence, getWorkspaceRuntimeState } from './workspace-runtime'
 
 export type GenerationAdmissionCapabilityProbe = GenerationCapabilityTarget
+
+export type ActiveTargetGenerationConfigurationCaptureState =
+  | {
+      readonly kind: 'resolved-active-target'
+      readonly chatId: ChatId
+      readonly resolution: ActiveGenerationConfigurationResolution
+    }
+  | {
+      readonly kind: 'selected-active-target'
+      readonly chatId: ChatId
+      readonly claim: SelectedGenerationConfigurationClaim
+    }
+  | {
+      readonly kind: 'pending-active-target'
+      readonly chatId: ChatId
+    }
 
 type GenerationCapabilityRequirementProbe = GenerationAdmissionCapabilityProbe & {
   readonly settingsPatch?: ChatSettingsPatch
@@ -31,6 +50,7 @@ export interface GenerationCapabilityFrame {
 export interface GenerationCapabilityContext {
   readonly workspace: WorkspaceFence | null
   readonly configuration: ActiveGenerationConfigurationFrame | null
+  readonly configurationTarget: ActiveConfigurationTarget | null
   readonly promptPath: ConversationPromptPathFrame | null
   readonly attemptAdmission: AttemptTargetAdmissionFrame | null
   readonly frame: GenerationCapabilityFrame
@@ -54,6 +74,7 @@ class TabGenerationCapabilityController implements GenerationCapabilityControlle
     readonly workspaceId: string
     readonly replacementEpoch: number
     readonly configuration: ActiveGenerationConfigurationFrame
+    readonly configurationTarget: ActiveConfigurationTarget
     readonly promptPath: ConversationPromptPathFrame
     readonly attemptAdmission: AttemptTargetAdmissionFrame | null
     readonly configurationOverride: ActiveGenerationConfigurationResolution | undefined
@@ -72,7 +93,9 @@ class TabGenerationCapabilityController implements GenerationCapabilityControlle
     if (workspaceState !== 'RUNNING') return PENDING_WORKSPACE_CAPABILITY_CONTEXT
     const workspace = getWorkspaceRuntimeFence()
     if (!workspace) return PENDING_WORKSPACE_CAPABILITY_CONTEXT
-    const configuration = configurationController.getSnapshot().frame.generation
+    const configurationFrame = configurationController.getSnapshot().frame
+    const configuration = configurationFrame.generation
+    const configurationTarget = configurationFrame.target
     const promptPath =
       promptPathOverride &&
       promptPathOverride.workspaceId === workspace.workspaceId &&
@@ -86,6 +109,7 @@ class TabGenerationCapabilityController implements GenerationCapabilityControlle
       return Object.freeze({
         workspace,
         configuration: null,
+        configurationTarget: null,
         promptPath,
         attemptAdmission,
         frame: Object.freeze({
@@ -109,6 +133,7 @@ class TabGenerationCapabilityController implements GenerationCapabilityControlle
       cached?.workspaceId === workspace.workspaceId &&
       cached.replacementEpoch === workspace.replacementEpoch &&
       cached.configuration === configuration &&
+      cached.configurationTarget === configurationTarget &&
       cached.promptPath === promptPath &&
       cached.attemptAdmission === attemptAdmission &&
       cached.configurationOverride === configurationOverride
@@ -135,6 +160,7 @@ class TabGenerationCapabilityController implements GenerationCapabilityControlle
     const context = Object.freeze({
       workspace,
       configuration,
+      configurationTarget,
       promptPath,
       attemptAdmission,
       frame,
@@ -143,6 +169,7 @@ class TabGenerationCapabilityController implements GenerationCapabilityControlle
       workspaceId: workspace.workspaceId,
       replacementEpoch: workspace.replacementEpoch,
       configuration,
+      configurationTarget,
       promptPath,
       attemptAdmission,
       configurationOverride,
@@ -209,6 +236,51 @@ export function generationConfigurationCapability(
   }
 }
 
+export function captureActiveTargetGenerationConfiguration(
+  chatId: ChatId,
+  settingsPatch?: ChatSettingsPatch,
+): ActiveTargetGenerationConfigurationCaptureState {
+  const snapshot = configurationController.getSnapshot().frame
+  const target = snapshot.target
+  if (target.kind !== 'chat' || target.chatId !== chatId) {
+    return Object.freeze({ kind: 'pending-active-target' as const, chatId })
+  }
+  const resolution = snapshot.generation.resolve({
+    kind: 'chat',
+    chatId,
+    ...(settingsPatch ? { settingsPatch } : {}),
+  })
+  if (resolution.capability !== 'pending') {
+    return Object.freeze({ kind: 'resolved-active-target' as const, chatId, resolution })
+  }
+  return Object.freeze({
+    kind: 'selected-active-target' as const,
+    chatId,
+    claim: configurationController.claimSelectedGenerationConfiguration(chatId, settingsPatch),
+  })
+}
+
+export function resolveActiveTargetGenerationConfiguration(
+  capture: ActiveTargetGenerationConfigurationCaptureState,
+): ActiveGenerationConfigurationResolution | undefined {
+  switch (capture.kind) {
+    case 'resolved-active-target':
+      return capture.resolution
+    case 'selected-active-target':
+      return configurationController.resolveSelectedGenerationConfiguration(capture.claim)
+    case 'pending-active-target':
+      return undefined
+  }
+}
+
+export function releaseActiveTargetGenerationConfiguration(
+  capture: ActiveTargetGenerationConfigurationCaptureState,
+): void {
+  if (capture.kind === 'selected-active-target') {
+    configurationController.cancelSelectedGenerationConfiguration(capture.claim)
+  }
+}
+
 export const generationCapabilityController: GenerationCapabilityController =
   new TabGenerationCapabilityController()
 
@@ -223,6 +295,7 @@ const FAILED_WORKSPACE_CAPABILITY_FRAME: GenerationCapabilityFrame = Object.free
 const PENDING_WORKSPACE_CAPABILITY_CONTEXT: GenerationCapabilityContext = Object.freeze({
   workspace: null,
   configuration: null,
+  configurationTarget: null,
   promptPath: null,
   attemptAdmission: null,
   frame: PENDING_WORKSPACE_CAPABILITY_FRAME,
@@ -231,6 +304,7 @@ const PENDING_WORKSPACE_CAPABILITY_CONTEXT: GenerationCapabilityContext = Object
 const FAILED_WORKSPACE_CAPABILITY_CONTEXT: GenerationCapabilityContext = Object.freeze({
   workspace: null,
   configuration: null,
+  configurationTarget: null,
   promptPath: null,
   attemptAdmission: null,
   frame: FAILED_WORKSPACE_CAPABILITY_FRAME,

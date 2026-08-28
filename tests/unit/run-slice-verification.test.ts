@@ -75,6 +75,10 @@ describe('verification slice runner', () => {
         vitest: ['tests/unit/a.test.ts', 'tests/unit/b.test.ts'],
         playwright: [
           { project: 'chromium', files: ['tests/e2e/a.spec.ts', 'tests/e2e/b.spec.ts'] },
+          {
+            project: 'large-workspace-setup',
+            files: ['tests/e2e/large-workspace.setup.ts'],
+          },
           { project: 'chromium-large-workspace', files: ['tests/e2e/large.spec.ts'] },
         ],
       }),
@@ -85,6 +89,7 @@ describe('verification slice runner', () => {
       'node-second',
       'vitest',
       'playwright-chromium',
+      'playwright-large-workspace-setup',
       'playwright-chromium-large-workspace',
     ])
     expect(batches.find((batch) => batch.id === 'vitest')?.args).toEqual([

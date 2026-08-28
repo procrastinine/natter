@@ -118,7 +118,7 @@ describe('chat configuration reasoning normalization', () => {
       kind: 'changed',
       source: 'local',
       cause: 'commit',
-      facts: [{ kind: 'sidebar-row-changed', chatId: chat.id }],
+      facts: [{ kind: 'sidebar-row-changed', chatId: chat.id, facets: ['last-viewed'] }],
     })
     expect((await getChat(chat.id))?.lastViewedAt).toBe(50)
     unsubscribe()

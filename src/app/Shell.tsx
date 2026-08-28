@@ -60,10 +60,15 @@ import {
   readyActiveConfigurationSelection,
 } from '../store/configuration-controller'
 import { conversationController } from '../store/conversation-controller'
-import { generationCapabilityController } from '../store/generation-capability-controller'
+import {
+  captureActiveTargetGenerationConfiguration,
+  generationCapabilityController,
+  releaseActiveTargetGenerationConfiguration,
+} from '../store/generation-capability-controller'
 import { materializeTemporaryNewChat } from '../store/new-chat-seed'
 import { writeSidebarCollapsed } from '../store/preferences-application'
 import type {
+  ActiveTargetGenerationConfigurationCaptureState,
   ConfigurationProjectionLoadStates,
   ConversationPresentationResourcePort,
   ConversationPresentationResourceState,
@@ -1024,6 +1029,35 @@ export function Shell() {
     },
     [runGenerationSubmit],
   )
+  const ownActiveGenerationSubmission = useCallback(
+    (
+      intent: GenerationSubmitIntent & { readonly chatId: ChatId },
+      settingsPatch: ChatSettingsPatch | undefined,
+      action: (control: {
+        readonly signal: AbortSignal
+        readonly observer: GenerationPreparationObserver
+        readonly configurationCapture: ActiveTargetGenerationConfigurationCaptureState
+      }) => Promise<{ readonly generationSettled: Promise<unknown> }>,
+    ): ComposerSubmission => {
+      const configurationCapture = captureActiveTargetGenerationConfiguration(
+        intent.chatId,
+        settingsPatch,
+      )
+      const submission = ownGenerationSubmission(intent, (control) =>
+        action({ ...control, configurationCapture }),
+      )
+      if (submission.kind === 'not-started') {
+        releaseActiveTargetGenerationConfiguration(configurationCapture)
+      } else {
+        void submission.completion.then(
+          () => releaseActiveTargetGenerationConfiguration(configurationCapture),
+          () => releaseActiveTargetGenerationConfiguration(configurationCapture),
+        )
+      }
+      return submission
+    },
+    [ownGenerationSubmission],
+  )
   const cancelGenerationSubmission = useCallback((chatId: ChatId | null) => {
     generationSubmissionClaimsRef.current
       .get(generationSubmitTarget({ chatId, action: 'composer' }))
@@ -1049,9 +1083,10 @@ export function Shell() {
       if (!activeChatId) throw new Error('SendActiveChatMissing')
       const target = conversationController.captureGenerationTarget(activeChatId)
       const prefillText = opts?.prefillText ?? ''
-      return ownGenerationSubmission(
+      return ownActiveGenerationSubmission(
         { chatId: activeChatId, action: 'composer' },
-        async ({ signal, observer }) => {
+        undefined,
+        async ({ signal, observer, configurationCapture }) => {
           const conversationActions = await loadConversationActions()
           const handle = await conversationActions.sendMessageWhenCapabilitySettles(
             activeChatId,
@@ -1065,6 +1100,7 @@ export function Shell() {
                 : {}),
             },
             observer,
+            configurationCapture,
           )
           preloadMessageList()
           await handle.prepared
@@ -1072,7 +1108,7 @@ export function Shell() {
         },
       )
     },
-    [activeChatId, ownGenerationSubmission],
+    [activeChatId, ownActiveGenerationSubmission],
   )
 
   const handleNewChatSubmit = useCallback(
@@ -1116,25 +1152,27 @@ export function Shell() {
   const handleReplyToTrailingUser = useCallback((): ComposerSubmission => {
     if (!trailingUserMessage) throw new Error('ReplyTargetMissing')
     const chatId = trailingUserMessage.chatId
-    return ownGenerationSubmission(
+    return ownActiveGenerationSubmission(
       {
         chatId,
         action: 'reply',
         messageId: trailingUserMessage.id,
       },
-      async ({ signal, observer }) => {
+      undefined,
+      async ({ signal, observer, configurationCapture }) => {
         const conversationActions = await loadConversationActions()
         const handle = await conversationActions.replyToMessageWhenCapabilitySettles(
           chatId,
           trailingUserMessage.id,
           signal,
           observer,
+          configurationCapture,
         )
         await handle.prepared
         return { generationSettled: handle.completed }
       },
     )
-  }, [ownGenerationSubmission, trailingUserMessage])
+  }, [ownActiveGenerationSubmission, trailingUserMessage])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -1345,13 +1383,14 @@ export function Shell() {
       options?: { prefillText?: string; attachmentRefs?: MessageAttachmentRef[] },
     ): ComposerSubmission => {
       const attachmentRefs = options?.attachmentRefs ?? message.attachmentRefs
-      return ownGenerationSubmission(
+      return ownActiveGenerationSubmission(
         {
           chatId: message.chatId,
           action: 'edit-resend',
           messageId: message.id,
         },
-        async ({ signal, observer }) => {
+        undefined,
+        async ({ signal, observer, configurationCapture }) => {
           const conversationActions = await loadConversationActions()
           const handle = await conversationActions.editAndResendWhenCapabilitySettles(
             message.chatId,
@@ -1363,6 +1402,7 @@ export function Shell() {
               ...(attachmentRefs ? { attachmentRefs } : {}),
             },
             observer,
+            configurationCapture,
           )
           preloadMessageList()
           await handle.prepared
@@ -1370,7 +1410,7 @@ export function Shell() {
         },
       )
     },
-    [ownGenerationSubmission],
+    [ownActiveGenerationSubmission],
   )
   const deleteTreeNode = useCallback(
     (message: Message) =>
@@ -1388,13 +1428,14 @@ export function Shell() {
   )
   const regenerateMessage = useCallback(
     (message: Message, options?: { settingsPatch?: ChatSettingsPatch }): ComposerSubmission => {
-      return ownGenerationSubmission(
+      return ownActiveGenerationSubmission(
         {
           chatId: message.chatId,
           action: 'regenerate',
           messageId: message.id,
         },
-        async ({ signal, observer }) => {
+        options?.settingsPatch,
+        async ({ signal, observer, configurationCapture }) => {
           const conversationActions = await loadConversationActions()
           const handle = await conversationActions.regenerateWhenCapabilitySettles(
             message.chatId,
@@ -1402,6 +1443,7 @@ export function Shell() {
             signal,
             options,
             observer,
+            configurationCapture,
           )
           preloadMessageList()
           await handle.prepared
@@ -1409,23 +1451,25 @@ export function Shell() {
         },
       )
     },
-    [ownGenerationSubmission],
+    [ownActiveGenerationSubmission],
   )
   const continueMessage = useCallback(
     (message: Message): ComposerSubmission => {
-      return ownGenerationSubmission(
+      return ownActiveGenerationSubmission(
         {
           chatId: message.chatId,
           action: 'continue',
           messageId: message.id,
         },
-        async ({ signal, observer }) => {
+        undefined,
+        async ({ signal, observer, configurationCapture }) => {
           const conversationActions = await loadConversationActions()
           const handle = await conversationActions.continueMessageWhenCapabilitySettles(
             message.chatId,
             message,
             signal,
             observer,
+            configurationCapture,
           )
           preloadMessageList()
           await handle.prepared
@@ -1433,7 +1477,7 @@ export function Shell() {
         },
       )
     },
-    [ownGenerationSubmission],
+    [ownActiveGenerationSubmission],
   )
   const forkTreeMessage = useCallback(
     (message: Message) =>
@@ -1587,7 +1631,7 @@ export function Shell() {
                 <Button
                   type="button"
                   data-ui="jump-to-latest"
-                  onClick={() => scrollRef.current?.scrollToBottom({ smooth: true })}
+                  onClick={() => scrollRef.current?.scrollToBottom({ smooth: false })}
                 >
                   ↓ Jump to latest
                 </Button>

@@ -407,7 +407,10 @@ async function prepareGeneration(
             },
           },
           configurationIntent: {
+            kind: 'captured',
             preferredDispatchKeyId: null,
+            settings: structuredClone(claimedChat.settings),
+            expectedConfigurationVersion: claimedChat.configurationVersion ?? 0,
           },
           placement: {
             chatId,

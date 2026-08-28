@@ -422,7 +422,7 @@ describe('production protocol fact bundle', () => {
       ok: true,
       surfaces: 20,
       records: 345,
-      constructorSites: 767,
+      constructorSites: 770,
       architectureGaps: 3,
       recordGaps: 150,
       siteGaps: 4,
@@ -430,9 +430,9 @@ describe('production protocol fact bundle', () => {
     })
     expect(report.reports['production-discriminated-unions']).toMatchObject({
       ok: true,
-      discoveredCount: 473,
-      controlProtocolCount: 222,
-      gapCount: 180,
+      discoveredCount: 475,
+      controlProtocolCount: 224,
+      gapCount: 182,
       constructionGapCount: 10,
       violations: [],
     })

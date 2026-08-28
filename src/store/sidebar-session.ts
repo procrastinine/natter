@@ -1,4 +1,4 @@
-import type { ChatFolder, ChatTag, FolderId } from '../core/types'
+import type { ChatFolder, ChatId, ChatTag, FolderId } from '../core/types'
 import type {
   ChatSidebarAggregate,
   SidebarPresentationMeasurement,
@@ -318,31 +318,48 @@ function sidebarRequestKey(
   return JSON.stringify([fence.workspaceId, fence.replacementEpoch, query, pageSize])
 }
 
-function sidebarChangeImpact(effect: WorkspaceEffect): TabCatalogChangeImpact<string> {
+function sidebarChangeImpact(
+  effect: WorkspaceEffect,
+  query: SidebarSessionQuery,
+): TabCatalogChangeImpact<string> {
   const changedIds = new Set<string>()
   const deletedIds = new Set<string>()
   if (effect.kind === 'replace') {
     return { relevant: false, broad: false, changedIds, deletedIds }
   }
+  const preciseChatIds = new Set(
+    (effect.factsByKind['sidebar-row-changed'] ?? []).map((fact) => fact.chatId),
+  )
+  const lastViewedRelevant = query.sort.startsWith('lastViewedAt-')
+  const rowChangeRelevant = (effect.factsByKind['sidebar-row-changed'] ?? []).some(
+    (fact) =>
+      fact.facets === undefined || !fact.facets.includes('last-viewed') || lastViewedRelevant,
+  )
   const relevant =
-    (effect.factsByKind['sidebar-row-changed']?.length ?? 0) > 0 ||
+    rowChangeRelevant ||
     (effect.factsByKind['sidebar-row-deleted']?.length ?? 0) > 0 ||
     (effect.factsByKind['chat-deleted']?.length ?? 0) > 0 ||
     (effect.factsByKind['conversation-created']?.length ?? 0) > 0 ||
-    sidebarImpactRelevant(effect.impactByKind)
+    sidebarResidualImpactRelevant(effect.residualByKind, preciseChatIds)
   return { relevant, broad: relevant, changedIds, deletedIds }
 }
 
-function sidebarImpactRelevant(
-  impact: Extract<WorkspaceEffect, { kind: 'changed' }>['impactByKind'],
+function sidebarResidualImpactRelevant(
+  impact: Extract<WorkspaceEffect, { kind: 'changed' }>['residualByKind'],
+  preciseChatIds: ReadonlySet<ChatId>,
 ): boolean {
   if (impact === 'all') return true
-  return (
-    (impact.sidebar?.length ?? 0) > 0 ||
-    (impact.chat?.length ?? 0) > 0 ||
+  if (
     (impact.folder?.length ?? 0) > 0 ||
     (impact.tag?.length ?? 0) > 0 ||
     (impact.workspace?.length ?? 0) > 0
+  ) {
+    return true
+  }
+  return [...(impact.sidebar ?? []), ...(impact.chat ?? [])].some(
+    (dependency) =>
+      dependency.chatIds === undefined ||
+      dependency.chatIds.some((chatId) => !preciseChatIds.has(chatId)),
   )
 }
 

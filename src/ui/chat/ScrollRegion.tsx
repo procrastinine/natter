@@ -2018,21 +2018,28 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
     const revealArrived =
       revealClaimKey !== null && (!lifecycle || !Object.is(lifecycle.key, revealClaimKey))
     if (revealArrived) {
-      revealClaimLifecycleRef.current = { key: revealClaimKey, status: 'active' }
-      didOpenRef.current = true
-      clearProgrammaticScrollIntents()
-      cancelViewportOwnership()
-      acquireFollowLease(
-        semanticFollowClaimForTarget(
-          'reveal',
-          revealClaimTargetMessageId ?? streamFollowTargetMessageId,
-          selectionKeyRef.current,
-        ),
-      )
-      setScrollStateNow('follow', 'reveal-acquire')
-      scrollToFollowPositionNow('reveal-acquire')
-      layoutCorrectionPendingRef.current = true
-      scheduleFollowReconciliation()
+      const revealWasPrepared = pendingPreparedTransitionRef.current?.kind === 'reveal'
+      const cancelledBeforeArrival = stateRef.current === 'pinned' && !revealWasPrepared
+      revealClaimLifecycleRef.current = {
+        key: revealClaimKey,
+        status: cancelledBeforeArrival ? 'cancelled' : 'active',
+      }
+      if (!cancelledBeforeArrival) {
+        didOpenRef.current = true
+        clearProgrammaticScrollIntents()
+        cancelViewportOwnership()
+        acquireFollowLease(
+          semanticFollowClaimForTarget(
+            'reveal',
+            revealClaimTargetMessageId ?? streamFollowTargetMessageId,
+            selectionKeyRef.current,
+          ),
+        )
+        setScrollStateNow('follow', 'reveal-acquire')
+        scrollToFollowPositionNow('reveal-acquire')
+        layoutCorrectionPendingRef.current = true
+        scheduleFollowReconciliation()
+      }
     }
 
     if (selectionIdentityChanged && terminalStreamLease) {
@@ -2125,7 +2132,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
         selectionKeyRef.current,
       )
       const acquired =
-        revealClaim.kind === 'bottom'
+        readyLifecycle.status === 'cancelled' || revealClaim.kind === 'bottom'
           ? container !== null
           : resolveFollowTargetElement(revealClaim.target) !== null
       if (!acquired) return

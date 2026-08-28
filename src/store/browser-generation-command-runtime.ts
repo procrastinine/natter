@@ -321,12 +321,19 @@ export async function prepareBrowserAttempt(
       )
       const settingsPatch =
         input.strategy === 'regenerate' ? input.configurationIntent.settingsPatch : undefined
-      const attemptSettings = settingsPatch
-        ? applyChatSettingsPatch(currentChat.settings, settingsPatch)
-        : currentChat.settings
+      const attemptSettings =
+        input.configurationIntent.kind === 'captured'
+          ? input.configurationIntent.settings
+          : settingsPatch
+            ? applyChatSettingsPatch(currentChat.settings, settingsPatch)
+            : currentChat.settings
       const planningChat: Chat = {
         ...currentChat,
         settings: structuredClone(attemptSettings),
+        configurationVersion:
+          input.configurationIntent.kind === 'captured'
+            ? input.configurationIntent.expectedConfigurationVersion
+            : (currentChat.configurationVersion ?? 0),
       }
       const selectionBase = Object.freeze({
         chatId,
@@ -335,7 +342,7 @@ export async function prepareBrowserAttempt(
       })
       if (settingsPatch) {
         delete planningChat.modelResolution
-        const nextSettings = attemptSettings
+        const nextSettings = applyChatSettingsPatch(currentChat.settings, settingsPatch)
         if (
           !sameChatSettings(currentChat.settings, nextSettings) ||
           currentChat.modelResolution !== undefined

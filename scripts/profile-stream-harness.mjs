@@ -486,27 +486,46 @@ async function waitForMessageHeader(page, messageId) {
 export async function waitForWorkspaceStreamQuiescence(page, assistantIds, timeoutMs) {
   if (assistantIds.length === 0) return []
   let snapshot
-  await waitUntil(
-    async () => {
-      snapshot = await readWorkspaceStreamState(page, assistantIds)
-      return (
-        snapshot.leaseCount === 0 &&
-        snapshot.chunkCount === 0 &&
-        snapshot.states.every(
-          (state) => state.status !== 'streaming' && typeof state.finishedAt === 'number',
+  try {
+    await waitUntil(
+      async () => {
+        snapshot = await readWorkspaceStreamState(page, assistantIds)
+        return (
+          snapshot.leaseCount === 0 &&
+          snapshot.chunkCount === 0 &&
+          snapshot.states.every(
+            (state) => state.status !== 'streaming' && typeof state.finishedAt === 'number',
+          )
         )
-      )
-    },
-    timeoutMs,
-    'workspace streams to quiesce',
-  )
+      },
+      timeoutMs,
+      'workspace streams to quiesce',
+    )
+  } catch (error) {
+    const finalSnapshot = await readWorkspaceStreamState(page, assistantIds, true).catch(
+      () => snapshot,
+    )
+    const diagnostics = finalSnapshot
+      ? {
+          leaseCount: finalSnapshot.leaseCount,
+          chunkCount: finalSnapshot.chunkCount,
+          leases: finalSnapshot.leases,
+          unsettled: finalSnapshot.states.filter(
+            (state) => state.status === 'streaming' || typeof state.finishedAt !== 'number',
+          ),
+        }
+      : null
+    throw new Error(`${error.message}; final snapshot=${JSON.stringify(diagnostics)}`, {
+      cause: error,
+    })
+  }
   return snapshot.states
 }
 
-async function readWorkspaceStreamState(page, assistantIds) {
+async function readWorkspaceStreamState(page, assistantIds, includeLeaseRows = false) {
   const databaseName = await activeWorkspaceDatabaseName(page)
   return page.evaluate(
-    async ({ databaseName, ids }) => {
+    async ({ databaseName, ids, includeLeaseRows }) => {
       const db = await new Promise((resolve, reject) => {
         const request = indexedDB.open(databaseName)
         request.onsuccess = () => resolve(request.result)
@@ -520,11 +539,25 @@ async function readWorkspaceStreamState(page, assistantIds) {
             request.onerror = () => reject(request.error)
           })
         const messageStore = transaction.objectStore('messages')
-        const [rows, leaseCount, chunkCount] = await Promise.all([
+        const [rows, leaseRowsOrCount, chunkCount] = await Promise.all([
           Promise.all(ids.map((id) => requestResult(messageStore.get(id)))),
-          requestResult(transaction.objectStore('streamLeases').count()),
+          requestResult(
+            includeLeaseRows
+              ? transaction.objectStore('streamLeases').getAll()
+              : transaction.objectStore('streamLeases').count(),
+          ),
           requestResult(transaction.objectStore('streamChunks').count()),
         ])
+        const leases = Array.isArray(leaseRowsOrCount)
+          ? leaseRowsOrCount.map((lease) => ({
+              streamId: lease.streamId,
+              chatId: lease.chatId,
+              messageId: lease.messageId,
+              phase: lease.phase,
+              custody: lease.custody,
+              revision: lease.revision,
+            }))
+          : undefined
         return {
           states: rows.map((row, index) => ({
             id: ids[index],
@@ -532,14 +565,15 @@ async function readWorkspaceStreamState(page, assistantIds) {
             integrity: row?.generation?.integrity ?? null,
             finishedAt: row?.generation?.finishedAt ?? null,
           })),
-          leaseCount,
+          leaseCount: leases?.length ?? leaseRowsOrCount,
           chunkCount,
+          ...(leases ? { leases } : {}),
         }
       } finally {
         db.close()
       }
     },
-    { databaseName, ids: assistantIds },
+    { databaseName, ids: assistantIds, includeLeaseRows },
   )
 }
 

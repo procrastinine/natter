@@ -56,6 +56,7 @@ import { conversationCommittedEffectForCommit } from './conversation-repository-
 import type { ConversationRouteOwner } from './conversation-route-owner'
 import {
   type ExistingChatGenerationIntent,
+  type ExistingGenerationConfigurationAuthority,
   type GenerationAdmissionClaim,
   GenerationAdmissionError,
   type GenerationAdmissionPayload,
@@ -178,6 +179,7 @@ export type GenerationStartRequest =
     }
   | {
       readonly intent: ExistingChatGenerationIntent
+      readonly configurationAuthority?: ExistingGenerationConfigurationAuthority
     }
 
 export type SettlingGenerationStartRequest = GenerationStartRequest
@@ -283,11 +285,7 @@ export function createGenerationEngine(options: GenerationEngineOptions = {}): G
     ): GenerationStartResult<Request['intent']> {
       let claim: GenerationAdmissionClaim
       try {
-        const admissionRequest: GenerationAdmissionRequest =
-          'routeOwner' in request
-            ? { intent: request.intent, routeOwner: request.routeOwner }
-            : { intent: request.intent }
-        claim = generationAdmissionController.claim(admissionRequest)
+        claim = generationAdmissionController.claim(generationAdmissionRequest(request))
       } catch (error) {
         if (error instanceof GenerationAdmissionError && error.capability.state !== 'ready') {
           return generationNotStarted(error.capability)
@@ -308,7 +306,7 @@ export function createGenerationEngine(options: GenerationEngineOptions = {}): G
       },
     ): Promise<GenerationHandle<PreparedGenerationForSettlingIntent<Request['intent']>>> {
       return generationAdmissionController.startWhenCapabilitySettles(
-        request,
+        generationAdmissionRequest(request),
         startOptions.signal,
         (claim, workspaceAdmission) => {
           const handle = startClaimedGeneration({
@@ -328,6 +326,15 @@ export function createGenerationEngine(options: GenerationEngineOptions = {}): G
 }
 
 export const generationEngine = createGenerationEngine()
+
+function generationAdmissionRequest(request: GenerationStartRequest): GenerationAdmissionRequest {
+  return 'routeOwner' in request
+    ? { intent: request.intent, routeOwner: request.routeOwner }
+    : {
+        intent: request.intent,
+        configurationAuthority: request.configurationAuthority ?? 'transaction-current',
+      }
+}
 
 function startClaimedGeneration(input: {
   readonly claim: GenerationAdmissionClaim
@@ -936,6 +943,13 @@ function prepareCommandInput(
       ? {
           configurationIntent: {
             preferredDispatchKeyId: configuration.preferredDispatchKeyId,
+            ...(configuration.requestSettings.kind === 'captured'
+              ? {
+                  kind: 'captured' as const,
+                  settings: configuration.requestSettings.settings,
+                  expectedConfigurationVersion: configuration.requestSettings.configurationVersion,
+                }
+              : { kind: 'transaction-current' as const }),
             ...(configuration.settingsPatch ? { settingsPatch: configuration.settingsPatch } : {}),
           },
         }
@@ -950,7 +964,9 @@ function prepareCommandInput(
         promptPath,
         chat: required(chat),
         configurationIntent: {
+          kind: 'captured',
           settings: configuration.settings,
+          expectedConfigurationVersion: 0,
           presetId: configuration.presetId,
           preferredDispatchKeyId: configuration.preferredDispatchKeyId,
         },

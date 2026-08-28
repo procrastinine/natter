@@ -58,7 +58,7 @@ import {
 } from '../../src/store/workspace-repository'
 import { runWorkspaceAction, runWorkspaceRead } from '../../src/store/workspace-runtime'
 import { useAnnouncementStore } from '../../src/store/zustand/announcementStore'
-import { createChat } from '../helpers/chats'
+import { createChat, updateChatForTest } from '../helpers/chats'
 import { putCachedEndpoints, putCachedPrivacyPolicy } from '../helpers/discovery-cache'
 import {
   installGenerationProfile,
@@ -289,6 +289,54 @@ describe('generation lifecycle contract', () => {
     expect(openStream).not.toHaveBeenCalled()
     expect(await messages(chat.id)).toEqual([])
     expect(await streamLeases(chat.id)).toEqual([])
+  })
+
+  it('keeps the admitted provider selection when durable settings advance before prepare', async () => {
+    const selectedProviderPrefs = {
+      ignore: [],
+      ignoreOverridesFilter: true,
+    }
+    const chat = await createChat({
+      settings: settings({ providerPrefs: selectedProviderPrefs }),
+    })
+    const laterProviderPrefs = {
+      ignore: ['Lifecycle provider'],
+      ignoreOverridesFilter: true,
+    }
+    let admittedProviderPrefs: ChatSettings['providerPrefs'] | undefined
+    executeInterceptor = async (permit, command, next) => {
+      if (command.kind === 'attempt.prepare') {
+        if (command.input.configurationIntent.kind !== 'captured') {
+          throw new Error('ExpectedCapturedGenerationConfiguration')
+        }
+        admittedProviderPrefs = structuredClone(
+          command.input.configurationIntent.settings.providerPrefs,
+        )
+        const current = await getDb().chats.get(chat.id)
+        if (!current) throw new Error(`MissingTestChat:${chat.id}`)
+        await updateChatForTest(chat.id, {
+          settings: settings({ providerPrefs: laterProviderPrefs }),
+          configurationVersion: (current.configurationVersion ?? 0) + 1,
+        })
+      }
+      return next(permit, command)
+    }
+    const openStream = vi.fn(() => finiteStream(completionChunk('admitted provider answer')))
+    const handle = await start(
+      {
+        kind: 'send',
+        chatId: chat.id,
+        target: { kind: 'fixed', messageId: null },
+        content: [{ type: 'text', text: 'use my checked providers' }],
+      },
+      openStream,
+      'active-target',
+    )
+
+    await expect(handle.completed).resolves.toMatchObject({ outcome: 'done' })
+    expect(admittedProviderPrefs).toEqual(selectedProviderPrefs)
+    expect(openStream).toHaveBeenCalledTimes(1)
+    expect((await getDb().chats.get(chat.id))?.settings.providerPrefs).toEqual(laterProviderPrefs)
   })
 
   it('publishes one exact send target before provider open and settles lease and journal', async () => {
@@ -1485,11 +1533,13 @@ describe('generation lifecycle contract', () => {
 async function start(
   intent: GenerationIntent,
   openStream: (input: GenerationTransportInput) => AsyncIterable<AssistantStreamChunk>,
+  configurationAuthority: 'active-target' | 'transaction-current' = 'transaction-current',
 ): Promise<GenerationHandle> {
   return startControlledGeneration(intent, {
     profile: profile(),
     keyMaterial: { 'lifecycle-key': 'sk-test' },
     openStream,
+    configurationAuthority,
   })
 }
 

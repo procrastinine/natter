@@ -63,7 +63,7 @@ export interface TabCatalogSessionAdapter<Input, Query, Row, Id, Meta> {
     ids: readonly Id[],
     signal: AbortSignal,
   ) => Promise<ReadEnvelope<readonly (Row | undefined)[]>>
-  readonly changeImpact: (effect: WorkspaceEffect) => TabCatalogChangeImpact<Id>
+  readonly changeImpact: (effect: WorkspaceEffect, query: Query) => TabCatalogChangeImpact<Id>
   readonly reuseMetaOnRefresh?: boolean
   readonly invalidateMeta?: (meta: Meta, effect: WorkspaceEffect) => Meta
   readonly rowId: (row: Row) => Id
@@ -465,7 +465,7 @@ class TabCatalogSession<Input, Query, Row, Id, Meta>
     const active = this.active
     if (!active) return
     if (effect.kind === 'replace' || !sameFence(effect, active)) return
-    const impact = this.adapter.changeImpact(effect)
+    const impact = this.adapter.changeImpact(effect, active.query)
     if (!impact.relevant) return
     const current = this.snapshot
     if (current && this.adapter.invalidateMeta) {

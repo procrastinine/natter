@@ -468,7 +468,10 @@ async function captureGenerationPlanningSnapshot(
           },
         },
         configurationIntent: {
+          kind: 'captured',
           preferredDispatchKeyId: null,
+          settings: structuredClone(chat.settings),
+          expectedConfigurationVersion: chat.configurationVersion ?? 0,
         },
         placement: {
           chatId,

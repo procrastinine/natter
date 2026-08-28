@@ -646,7 +646,11 @@ function keyRequestMaterial(key: KeyRecord): unknown {
 export type WorkspaceDeltaFact =
   | { kind: 'chat-deleted'; chatId: ChatId }
   | { kind: 'conversation-created'; chatId: ChatId }
-  | { kind: 'sidebar-row-changed'; chatId: ChatId }
+  | {
+      kind: 'sidebar-row-changed'
+      chatId: ChatId
+      facets?: readonly 'last-viewed'[]
+    }
   | { kind: 'sidebar-row-deleted'; chatId: ChatId }
   | { kind: 'attachment-row-changed'; attachmentId: AttachmentId }
   | { kind: 'attachment-row-deleted'; attachmentId: AttachmentId }
@@ -1021,9 +1025,17 @@ export interface PendingConfigurationAcknowledgement
   >[]
 }
 
-export interface PrepareAttemptConfigurationIntent {
-  readonly preferredDispatchKeyId: KeyId | null
-}
+export type PrepareAttemptConfigurationIntent =
+  | {
+      readonly kind: 'captured'
+      readonly preferredDispatchKeyId: KeyId | null
+      readonly settings: ChatSettings
+      readonly expectedConfigurationVersion: number
+    }
+  | {
+      readonly kind: 'transaction-current'
+      readonly preferredDispatchKeyId: KeyId | null
+    }
 
 export interface PrepareAttemptPlacementIntent {
   readonly chatId: ChatId
@@ -1127,8 +1139,10 @@ export type PrepareAttemptInput = (
       chat: Chat
       lease: StreamLeaseAdmission
       placement: PrepareAttemptPlacementIntent
-      configurationIntent: PrepareAttemptConfigurationIntent & {
-        readonly settings: ChatSettings
+      configurationIntent: Extract<
+        PrepareAttemptConfigurationIntent,
+        { readonly kind: 'captured' }
+      > & {
         readonly presetId: PresetId | null
       }
     }

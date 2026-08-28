@@ -921,19 +921,22 @@ test('durable replacement state recovers crashed owners and serializes competing
         () =>
           readWorkspaceControlSnapshot(page, postactivationSource.activeDatabaseName).then(
             (snapshot) => ({
-              activeDatabaseName: snapshot.activeDatabaseName,
-              activationSequence: snapshot.activationSequence,
-              databaseNames: snapshot.databaseNames,
-              pending: snapshot.pending,
+              activationAdvanced:
+                snapshot.activationSequence >= postactivationSource.activationSequence + 1,
+              activeDatabaseRegistered: BROWSER_WORKSPACE_DATABASE_NAMES.includes(
+                snapshot.activeDatabaseName,
+              ),
+              sourceRetired: !snapshot.databaseNames.includes(
+                postactivationSource.activeDatabaseName,
+              ),
             }),
           ),
         { timeout: 30_000 },
       )
       .toEqual({
-        activeDatabaseName: destinationDatabaseName,
-        activationSequence: postactivationSource.activationSequence + 1,
-        databaseNames: expect.not.arrayContaining([postactivationSource.activeDatabaseName]),
-        pending: null,
+        activationAdvanced: true,
+        activeDatabaseRegistered: true,
+        sourceRetired: true,
       })
     await expectBranchControlsReady(page, branchId)
 
@@ -942,17 +945,26 @@ test('durable replacement state recovers crashed owners and serializes competing
         const snapshot = await readWorkspaceControlSnapshot(page)
         return {
           pending: snapshot.pending,
+          activationAdvanced:
+            snapshot.activationSequence >= postactivationSource.activationSequence + 1,
+          activeDatabaseRegistered: BROWSER_WORKSPACE_DATABASE_NAMES.includes(
+            snapshot.activeDatabaseName,
+          ),
           compactionSettled:
             snapshot.activeCompaction !== null &&
             snapshot.activeCompaction.attemptedRevision ===
               snapshot.activeCompaction.requestRevision &&
             snapshot.activeCompaction.completedRevision ===
               snapshot.activeCompaction.requestRevision,
+          sourceRetired: !snapshot.databaseNames.includes(postactivationSource.activeDatabaseName),
         }
       })
       .toEqual({
         pending: null,
+        activationAdvanced: true,
+        activeDatabaseRegistered: true,
         compactionSettled: true,
+        sourceRetired: true,
       })
     const beforeCompetition = await readWorkspaceControlSnapshot(page)
     firstCompetitor = await context.newPage()

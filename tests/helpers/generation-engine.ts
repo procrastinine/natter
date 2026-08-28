@@ -15,10 +15,12 @@ import { attemptController, attemptStopCapability } from '../../src/store/attemp
 import { configurationController } from '../../src/store/configuration-controller'
 import { conversationController } from '../../src/store/conversation-controller'
 import { createConversationRouteOwnerController } from '../../src/store/conversation-route-owner'
+import { generationAdmissionController } from '../../src/store/generation-admission-controller'
 import {
+  captureActiveTargetGenerationConfiguration,
   type GenerationAdmissionCapabilityProbe,
-  generationAdmissionController,
-} from '../../src/store/generation-admission-controller'
+  generationConfigurationRequirement,
+} from '../../src/store/generation-capability-controller'
 import {
   type CompletedGeneration,
   createGenerationEngine,
@@ -39,6 +41,7 @@ export interface ControlledGenerationOptions {
   readonly keyMaterial?: Readonly<Record<KeyId, string>>
   readonly openStream: (input: GenerationTransportInput) => AsyncIterable<AssistantStreamChunk>
   readonly now?: () => number
+  readonly configurationAuthority?: 'active-target' | 'transaction-current'
 }
 
 export function requireStartedGeneration<Intent extends GenerationIntent>(
@@ -61,7 +64,9 @@ export async function startControlledGeneration<Intent extends GenerationIntent>
     ...(options.now ? { now: options.now } : {}),
   })
   try {
-    return requireStartedGeneration(startGenerationForIntent(engine, intent))
+    return requireStartedGeneration(
+      startGenerationForIntent(engine, intent, options.configurationAuthority),
+    )
   } finally {
     releaseSurface()
   }
@@ -70,6 +75,7 @@ export async function startControlledGeneration<Intent extends GenerationIntent>
 export function startGenerationForIntent<Intent extends GenerationIntent>(
   engine: GenerationEngine,
   intent: Intent,
+  configurationAuthority: 'active-target' | 'transaction-current' = 'transaction-current',
 ): GenerationStartResult<Intent> {
   if (intent.kind === 'new-chat-send') {
     const request = {
@@ -80,13 +86,23 @@ export function startGenerationForIntent<Intent extends GenerationIntent>(
   }
   const request = {
     intent,
+    configurationAuthority:
+      configurationAuthority === 'active-target'
+        ? captureActiveTargetGenerationConfiguration(
+            intent.chatId,
+            intent.kind === 'regenerate' ? intent.settingsPatch : undefined,
+          )
+        : configurationAuthority,
   } satisfies GenerationStartRequest
   return engine.start(request) as GenerationStartResult<Intent>
 }
 
 export async function prepareControlledGenerationSurface(
   intent: GenerationIntent,
-  options: Pick<ControlledGenerationOptions, 'profile' | 'newChatSettings'>,
+  options: Pick<
+    ControlledGenerationOptions,
+    'profile' | 'newChatSettings' | 'configurationAuthority'
+  >,
 ): Promise<() => void> {
   conversationController.setNavigationPort(browserConversationNavigationPort)
   if (intent.kind === 'new-chat-send') {
@@ -106,7 +122,10 @@ export async function prepareControlledGenerationSurface(
   if (current.activeChatId !== intent.chatId) {
     navigate(chatHref(intent.chatId, initialSurfaceTargetId(intent)))
   }
-  return waitForControlledGenerationAvailability(intent)
+  return waitForControlledGenerationAvailability(
+    intent,
+    options.configurationAuthority === 'active-target',
+  )
 }
 
 function initialSurfaceTargetId(
@@ -139,6 +158,7 @@ function initialSurfaceTargetId(
 
 function waitForControlledGenerationAvailability(
   probe: GenerationAdmissionCapabilityProbe,
+  requireActiveConfigurationTarget = false,
 ): Promise<() => void> {
   return new Promise<() => void>((resolve, reject) => {
     let settled = false
@@ -159,6 +179,21 @@ function waitForControlledGenerationAvailability(
     const inspect = () => {
       const capability = generationAdmissionController.capability(probe)
       if (capability.state === 'ready') {
+        if (requireActiveConfigurationTarget && probe.kind !== 'new-chat-send') {
+          const configuration = configurationController.getSnapshot().frame
+          const target = configuration.target
+          if (target.kind !== 'chat' || target.chatId !== probe.chatId) return
+          const resolution = configuration.generation.resolve(
+            generationConfigurationRequirement(probe),
+          )
+          if (resolution.capability === 'pending') return
+          if (resolution.capability !== 'ready') {
+            finish(
+              new Error(`ControlledGenerationConfigurationUnavailable:${resolution.capability}`),
+            )
+            return
+          }
+        }
         finish()
         return
       }

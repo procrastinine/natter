@@ -395,6 +395,24 @@ describe('ScrollRegion continuity lease', () => {
     expect(fixture.ref.current?.getState()).toBe('pinned')
   })
 
+  it('does not acquire a reveal that first arrives after explicit reading begins', async () => {
+    const consumed = vi.fn()
+    const fixture = setup({ onRevealClaimConsumed: consumed })
+    acquireOpen(fixture)
+    await pinByWheel(fixture, 700)
+
+    act(() => {
+      fixture.rerender({
+        revealClaimKey: 'late-reveal',
+        revealClaimTargetMessageId: 'late-tail',
+      })
+    })
+
+    expect(consumed).toHaveBeenCalledTimes(1)
+    expect(fixture.region.scrollTop).toBe(700)
+    expect(fixture.ref.current?.getState()).toBe('pinned')
+  })
+
   it('owns an old-to-new reveal transition before the replacement suffix publishes', () => {
     const fixture = setup()
     acquireOpen(fixture)

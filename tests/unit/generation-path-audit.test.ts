@@ -417,6 +417,12 @@ describe('generation request path audit', () => {
     const command = withoutComments(
       readFileSync(resolve(SRC_ROOT, 'store/browser-generation-command-runtime.ts'), 'utf8'),
     )
+    const client = withoutComments(
+      readFileSync(resolve(SRC_ROOT, 'store/conversation-command-client.ts'), 'utf8'),
+    )
+    const engine = withoutComments(
+      readFileSync(resolve(SRC_ROOT, 'store/generation-engine.ts'), 'utf8'),
+    )
     const production = sourceFiles()
       .map((file) => withoutComments(readFileSync(file, 'utf8')))
       .join('\n')
@@ -455,10 +461,26 @@ describe('generation request path audit', () => {
     expect(admission).toMatch(/case 'send':[\s\S]*?childSlot: 'append'/u)
     expect(admission).toMatch(/case 'reply':[\s\S]*?childSlot: 'append'/u)
     expect(command).toContain('const currentChat = await ctx.getChat(chatId)')
-    expect(admission).toContain('claimPendingGenerationConfiguration(')
+    expect(capability).toContain('captureActiveTargetGenerationConfiguration(')
+    expect(capability).toContain('claimSelectedGenerationConfiguration(chatId, settingsPatch)')
+    expect(
+      client.match(/configurationAuthority: (?:configurationCapture \?\? )?'active-target'/gu),
+    ).toHaveLength(10)
+    expect(engine).toContain(
+      "configurationAuthority: request.configurationAuthority ?? 'transaction-current'",
+    )
+    expect(admission).toContain("request.configurationAuthority === 'transaction-current'")
+    expect(admission).toContain(
+      "target?.kind === 'chat' && target.chatId === request.intent.chatId",
+    )
+    expect(command).toContain("input.configurationIntent.kind === 'captured'")
+    expect(command).toContain('applyChatSettingsPatch(currentChat.settings, settingsPatch)')
     expect(admission).toContain('resolveSettlingConfiguration(captured)')
     expect(admission).toContain('cancelSettlingConfiguration(captured)')
-    expect(admission).not.toContain('claimSelectedGenerationConfiguration(')
+    expect(admission).toContain('resolveActiveTargetGenerationConfiguration(')
+    expect(admission).toContain('releaseActiveTargetGenerationConfiguration(')
+    expect(admission).toContain('generationConfigurationCapability(resolution)')
+    expect(admission).not.toContain('target.settings')
     expect(command).toContain('const slot = promptPath.slot')
     expect(placementStart).toBeGreaterThanOrEqual(0)
     expect(placementEnd).toBeGreaterThan(placementStart)
@@ -526,7 +548,8 @@ describe('generation request path audit', () => {
     expect(inlineEditor).toContain('disabled={uploadingAttachments}')
     expect(messageList).not.toMatch(/\bgenerationCapabilityFrame\b|\.capability\s*\(/u)
     expect(branchTree).not.toMatch(/\bgenerationCapabilityFrame\b|\.capability\s*\(/u)
-    expect(shell.match(/\bownGenerationSubmission\s*\(/gu)).toHaveLength(6)
+    expect(shell.match(/\bownGenerationSubmission\s*\(/gu)).toHaveLength(2)
+    expect(shell.match(/\bownActiveGenerationSubmission\s*\(/gu)).toHaveLength(5)
     expect(shell.match(/\bgenerationSubmitTarget\s*\(/gu)).toHaveLength(4)
     expect(shell).not.toMatch(/\bownGenerationSubmission\s*\(\s*generationSubmitTarget\s*\(/u)
     expect(shell).not.toMatch(/\b(?:readonly\s+)?admit\b|\badmit\s*\(\s*\)/u)
@@ -541,6 +564,10 @@ describe('generation request path audit', () => {
       shell.indexOf('const ownGenerationSubmission'),
       shell.indexOf('const cancelGenerationSubmission'),
     )
+    expect(submissionOwner.indexOf('captureActiveTargetGenerationConfiguration(')).toBeLessThan(
+      submissionOwner.indexOf('ownGenerationSubmission(intent,'),
+    )
+    expect(submissionOwner).toContain('releaseActiveTargetGenerationConfiguration(')
     expect(submissionOwner.indexOf('await action({')).toBeGreaterThanOrEqual(0)
     expect(submissionOwner.indexOf('await action({')).toBeLessThan(
       submissionOwner.indexOf("reportPhase(id, 'admitted')"),

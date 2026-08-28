@@ -45,6 +45,7 @@ import {
 } from './conversation-repository-adapter'
 import type { ConversationRouteOwner } from './conversation-route-owner'
 import type { GenerationPreparationObserver } from './generation-admission-controller'
+import type { ActiveTargetGenerationConfigurationCaptureState } from './generation-capability-controller'
 import {
   type GenerationHandle,
   type GenerationIntent,
@@ -282,6 +283,7 @@ export function sendMessage(
       ...(options.attachmentRefs ? { attachmentRefs: options.attachmentRefs } : {}),
       ...(options.prefillContent?.length ? { prefillContent: options.prefillContent } : {}),
     },
+    configurationAuthority: 'active-target',
   })
 }
 
@@ -292,6 +294,7 @@ export function sendMessageWhenCapabilitySettles(
   signal: AbortSignal,
   options: SendContentOptions = {},
   observer?: GenerationPreparationObserver,
+  configurationCapture?: ActiveTargetGenerationConfigurationCaptureState,
 ): Promise<GenerationHandle<PreparedGeneration>> {
   return generationEngine.startWhenCapabilitySettles(
     {
@@ -303,6 +306,7 @@ export function sendMessageWhenCapabilitySettles(
         ...(options.attachmentRefs ? { attachmentRefs: options.attachmentRefs } : {}),
         ...(options.prefillContent?.length ? { prefillContent: options.prefillContent } : {}),
       },
+      configurationAuthority: configurationCapture ?? 'active-target',
     },
     { signal, ...(observer ? { observer } : {}) },
   )
@@ -349,7 +353,10 @@ export function replyToMessage(
   chatId: ChatId,
   parentUserId: MessageId,
 ): GenerationStartResult<Extract<GenerationIntent, { readonly kind: 'reply' }>> {
-  return generationEngine.start({ intent: { kind: 'reply', chatId, parentUserId } })
+  return generationEngine.start({
+    intent: { kind: 'reply', chatId, parentUserId },
+    configurationAuthority: 'active-target',
+  })
 }
 
 export function replyToMessageWhenCapabilitySettles(
@@ -357,9 +364,13 @@ export function replyToMessageWhenCapabilitySettles(
   parentUserId: MessageId,
   signal: AbortSignal,
   observer?: GenerationPreparationObserver,
+  configurationCapture?: ActiveTargetGenerationConfigurationCaptureState,
 ): Promise<GenerationHandle<PreparedGeneration>> {
   return generationEngine.startWhenCapabilitySettles(
-    { intent: { kind: 'reply', chatId, parentUserId } },
+    {
+      intent: { kind: 'reply', chatId, parentUserId },
+      configurationAuthority: configurationCapture ?? 'active-target',
+    },
     { signal, ...(observer ? { observer } : {}) },
   )
 }
@@ -379,6 +390,7 @@ export function editAndResend(
       ...(options.attachmentRefs ? { attachmentRefs: options.attachmentRefs } : {}),
       ...(options.prefillContent?.length ? { prefillContent: options.prefillContent } : {}),
     },
+    configurationAuthority: 'active-target',
   })
 }
 
@@ -389,6 +401,7 @@ export function editAndResendWhenCapabilitySettles(
   signal: AbortSignal,
   options: { prefillContent?: ContentItem[]; attachmentRefs?: AttachmentRef[] } = {},
   observer?: GenerationPreparationObserver,
+  configurationCapture?: ActiveTargetGenerationConfigurationCaptureState,
 ): Promise<GenerationHandle<PreparedGeneration>> {
   return generationEngine.startWhenCapabilitySettles(
     {
@@ -400,6 +413,7 @@ export function editAndResendWhenCapabilitySettles(
         ...(options.attachmentRefs ? { attachmentRefs: options.attachmentRefs } : {}),
         ...(options.prefillContent?.length ? { prefillContent: options.prefillContent } : {}),
       },
+      configurationAuthority: configurationCapture ?? 'active-target',
     },
     { signal, ...(observer ? { observer } : {}) },
   )
@@ -417,6 +431,7 @@ export function regenerateFromMessage(
       targetAssistantId: assistantMessage.id,
       ...(options.settingsPatch ? { settingsPatch: options.settingsPatch } : {}),
     },
+    configurationAuthority: 'active-target',
   })
 }
 
@@ -426,6 +441,7 @@ export function regenerateFromMessageWhenCapabilitySettles(
   signal: AbortSignal,
   options: RegenerateMessageOptions = {},
   observer?: GenerationPreparationObserver,
+  configurationCapture?: ActiveTargetGenerationConfigurationCaptureState,
 ): Promise<GenerationHandle<PreparedGeneration>> {
   return generationEngine.startWhenCapabilitySettles(
     {
@@ -435,6 +451,7 @@ export function regenerateFromMessageWhenCapabilitySettles(
         targetAssistantId: assistantMessage.id,
         ...(options.settingsPatch ? { settingsPatch: options.settingsPatch } : {}),
       },
+      configurationAuthority: configurationCapture ?? 'active-target',
     },
     { signal, ...(observer ? { observer } : {}) },
   )
@@ -472,6 +489,7 @@ export function continueFromMessage(
       chatId: ctx.chatId,
       targetAssistantId: assistantMessage.id,
     },
+    configurationAuthority: 'active-target',
   })
 }
 
@@ -480,6 +498,7 @@ export function continueFromMessageWhenCapabilitySettles(
   assistantMessage: Message,
   signal: AbortSignal,
   observer?: GenerationPreparationObserver,
+  configurationCapture?: ActiveTargetGenerationConfigurationCaptureState,
 ): Promise<GenerationHandle<PreparedGeneration>> {
   return generationEngine.startWhenCapabilitySettles(
     {
@@ -488,6 +507,7 @@ export function continueFromMessageWhenCapabilitySettles(
         chatId: ctx.chatId,
         targetAssistantId: assistantMessage.id,
       },
+      configurationAuthority: configurationCapture ?? 'active-target',
     },
     { signal, ...(observer ? { observer } : {}) },
   )

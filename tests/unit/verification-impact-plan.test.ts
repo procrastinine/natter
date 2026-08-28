@@ -392,10 +392,14 @@ describe('verification slice impact planner', () => {
     ])
     expect(plan.impactedObligations).toContain(obligationId)
     expect(plan.tasks.vitest.length).toBeGreaterThan(0)
-    expect(plan.tasks.playwright).toHaveLength(2)
+    expect(plan.tasks.playwright).toHaveLength(3)
     expect(plan.tasks.playwright[0]?.project).toBe('chromium')
     expect(Array.isArray(plan.tasks.playwright[0]?.files)).toBe(true)
     expect(plan.tasks.playwright[1]).toEqual({
+      project: 'large-workspace-setup',
+      files: ['tests/e2e/large-workspace.setup.ts'],
+    })
+    expect(plan.tasks.playwright[2]).toEqual({
       project: 'chromium-large-workspace',
       files: ['tests/e2e/large-workspace-startup.spec.ts'],
     })
@@ -433,7 +437,7 @@ describe('verification slice impact planner', () => {
         'tests/unit/ui-journey-invariant-recorder.test.ts',
       ]),
     )
-    expect(plan.tasks.playwright).toHaveLength(3)
+    expect(plan.tasks.playwright).toHaveLength(4)
     expect(plan.tasks.playwright[0]?.project).toBe('chromium')
     expect(plan.tasks.playwright[0]?.files).toEqual(
       expect.arrayContaining([
@@ -442,10 +446,14 @@ describe('verification slice impact planner', () => {
       ]),
     )
     expect(plan.tasks.playwright[1]).toEqual({
+      project: 'large-workspace-setup',
+      files: ['tests/e2e/large-workspace.setup.ts'],
+    })
+    expect(plan.tasks.playwright[2]).toEqual({
       project: 'chromium-large-workspace',
       files: ['tests/e2e/large-workspace-startup.spec.ts'],
     })
-    expect(plan.tasks.playwright[2]).toEqual({
+    expect(plan.tasks.playwright[3]).toEqual({
       project: 'chromium-send-performance',
       files: ['tests/e2e/send-performance.spec.ts'],
     })

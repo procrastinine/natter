@@ -47,6 +47,7 @@ import {
 } from '../store/conversation-controller'
 import { interchangeApplication } from '../store/interchange-application'
 import type {
+  ActiveTargetGenerationConfigurationCaptureState,
   ConversationCommittedResult,
   ConversationRouteDelivery,
   ConversationRouteOwner,
@@ -306,6 +307,7 @@ export const conversationActions = {
     signal: AbortSignal,
     options: EditAndResendOptions = {},
     observer?: GenerationPreparationObserver,
+    configurationCapture?: ActiveTargetGenerationConfigurationCaptureState,
   ) {
     const prefillText = options.prefillText ?? ''
     return startEditAndResendWhenCapabilitySettles(
@@ -320,6 +322,7 @@ export const conversationActions = {
         ...(options.attachmentRefs ? { attachmentRefs: options.attachmentRefs } : {}),
       },
       observer,
+      configurationCapture,
     )
   },
 
@@ -333,6 +336,7 @@ export const conversationActions = {
     signal: AbortSignal,
     options: RegenerateMessageOptions = {},
     observer?: GenerationPreparationObserver,
+    configurationCapture?: ActiveTargetGenerationConfigurationCaptureState,
   ) {
     return startRegenerateFromMessageWhenCapabilitySettles(
       { chatId },
@@ -340,6 +344,7 @@ export const conversationActions = {
       signal,
       options,
       observer,
+      configurationCapture,
     )
   },
 
@@ -352,8 +357,15 @@ export const conversationActions = {
     message: Message,
     signal: AbortSignal,
     observer?: GenerationPreparationObserver,
+    configurationCapture?: ActiveTargetGenerationConfigurationCaptureState,
   ) {
-    return continueFromMessageWhenCapabilitySettles({ chatId }, message, signal, observer)
+    return continueFromMessageWhenCapabilitySettles(
+      { chatId },
+      message,
+      signal,
+      observer,
+      configurationCapture,
+    )
   },
 
   async importMessages(input: ConversationImportInput): Promise<void> {

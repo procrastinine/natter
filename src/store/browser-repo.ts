@@ -2811,7 +2811,13 @@ class BrowserCommandCommit implements BrowserCommandSessionPort {
         continue
       }
       if (sidebarChatIds.has(chatId)) {
-        facts.push({ kind: 'sidebar-row-changed', chatId })
+        facts.push({
+          kind: 'sidebar-row-changed',
+          chatId,
+          ...(this.operationKind === 'chat.touch-viewed'
+            ? { facets: ['last-viewed' as const] }
+            : {}),
+        })
       }
       ordinaryChatIds.push(chatId)
       receiptChats.push(structuredClone(finalChat))

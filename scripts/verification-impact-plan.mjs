@@ -186,6 +186,7 @@ export function planSliceVerification(options) {
     files.push(...affectedBrowserFiles)
     selectedBrowserByProject.set('chromium', files)
   }
+  addPlaywrightProjectPrerequisites(selectedBrowserByProject)
   const selectedNodeProofs = selectedProofs
     .filter((proof) => proof.execution.runner === 'node')
     .map((proof) => Object.freeze({ id: proof.id, argv: proof.execution.argv }))
@@ -264,7 +265,7 @@ export function planSliceVerification(options) {
     vitest: Object.freeze(selectedVitestFiles),
     playwright: Object.freeze(
       [...selectedBrowserByProject]
-        .sort(([left], [right]) => compareText(left, right))
+        .sort(([left], [right]) => comparePlaywrightProjects(left, right))
         .map(([project, files]) =>
           Object.freeze({ project, files: Object.freeze(uniqueSorted(files)) }),
         ),
@@ -293,6 +294,30 @@ export function planSliceVerification(options) {
       reportWithoutDigest.unregisteredAffectedTests.length === 0,
     planDigest: digestJson(reportWithoutDigest),
   })
+}
+
+function addPlaywrightProjectPrerequisites(selectedBrowserByProject) {
+  if (!selectedBrowserByProject.has('chromium-large-workspace')) return
+  selectedBrowserByProject.set('large-workspace-setup', ['tests/e2e/large-workspace.setup.ts'])
+}
+
+function comparePlaywrightProjects(left, right) {
+  return playwrightProjectOrder(left) - playwrightProjectOrder(right) || compareText(left, right)
+}
+
+function playwrightProjectOrder(project) {
+  switch (project) {
+    case 'chromium':
+      return 0
+    case 'large-workspace-setup':
+      return 1
+    case 'chromium-large-workspace':
+      return 2
+    case 'chromium-send-performance':
+      return 3
+    default:
+      return Number.MAX_SAFE_INTEGER
+  }
 }
 
 export function validateVerificationManifest(options = {}) {

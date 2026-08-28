@@ -101,6 +101,7 @@ describe('conversation command generation intents', () => {
         targetAssistantId: 'assistant-1',
         settingsPatch: { model: 'model-2' },
       },
+      configurationAuthority: 'active-target',
     })
   })
 
@@ -146,6 +147,7 @@ describe('conversation command generation intents', () => {
           },
         ],
       },
+      configurationAuthority: 'active-target',
     })
   })
 
@@ -158,6 +160,7 @@ describe('conversation command generation intents', () => {
         chatId: 'chat-1',
         targetAssistantId: 'assistant-1',
       },
+      configurationAuthority: 'active-target',
     })
   })
 
@@ -190,6 +193,7 @@ describe('conversation command generation intents', () => {
             content: [{ type: 'text', text: 'after' }],
             prefillContent: [{ type: 'text', text: 'prefill' }],
           },
+          configurationAuthority: 'active-target',
         },
         { signal },
       ],
@@ -201,6 +205,7 @@ describe('conversation command generation intents', () => {
             targetAssistantId: 'assistant-1',
             settingsPatch: { model: 'model-2' },
           },
+          configurationAuthority: 'active-target',
         },
         { signal },
       ],
@@ -211,6 +216,7 @@ describe('conversation command generation intents', () => {
             chatId: 'chat-1',
             targetAssistantId: 'assistant-1',
           },
+          configurationAuthority: 'active-target',
         },
         { signal },
       ],
@@ -236,9 +242,15 @@ describe('conversation command generation intents', () => {
             target: { kind: 'fixed', messageId: 'expected-leaf' },
             content: [{ type: 'text', text: 'send' }],
           },
+          configurationAuthority: 'active-target',
         },
       ],
-      [{ intent: { kind: 'reply', chatId: 'chat-1', parentUserId: 'user-1' } }],
+      [
+        {
+          intent: { kind: 'reply', chatId: 'chat-1', parentUserId: 'user-1' },
+          configurationAuthority: 'active-target',
+        },
+      ],
       [
         {
           intent: {

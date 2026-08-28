@@ -1635,9 +1635,14 @@ describe('conversation controller', () => {
 
     source.loadTranscriptPage.mockClear()
     const publications: MessageId[][] = []
+    const paintedPublications: MessageId[][] = []
     const unsubscribe = controller.subscribe(() => {
       const frame = projectedTranscript(controller)
       if (frame) publications.push(transcriptMessages(frame).map((row) => row.id))
+      const painted = controller.getSnapshot().active?.presentation.painted?.binding
+      if (painted?.surface === 'transcript') {
+        paintedPublications.push(transcriptMessages(painted.window).map((row) => row.id))
+      }
     })
 
     controller.navigate({
@@ -1670,6 +1675,8 @@ describe('conversation controller', () => {
     ])
     expect(publications.length).toBeGreaterThan(0)
     expect(publications.every((messageIds) => messageIds.includes(root.id))).toBe(true)
+    expect(paintedPublications.length).toBeGreaterThan(0)
+    expect(paintedPublications.every((messageIds) => messageIds.length === 3)).toBe(true)
 
     unsubscribe()
     controller.setTranscriptDemand(demandOwner, null)
@@ -3364,6 +3371,49 @@ describe('conversation controller', () => {
     expect(paintedRowCounts.length).toBeGreaterThan(0)
     expect(paintedRowCounts).not.toContain(1)
     expect(paintedRowCounts.at(-1)).toBe(2)
+  })
+
+  it('keeps the painted branch whole when a same-workspace replacement overlaps a swipe', async () => {
+    const root = message('root', null, 0, 'root', 1)
+    const left = message('left', root.id, 0, 'left', 2)
+    const leftTip = message('left-tip', left.id, 0, 'left tip', 3)
+    const right = message('right', root.id, 1, 'right', 4)
+    const rightTip = message('right-tip', right.id, 0, 'right tip', 5)
+    const { controller, navigation, source } = harness([root, left, leftTip, right, rightTip])
+    navigation.arrive('arrival-left', { chatId: CHAT_ID, targetMessageId: leftTip.id })
+    await settle()
+    setTranscriptRowDemand(controller, {}, 3)
+    await settle()
+
+    let releaseSelection = () => {}
+    source.selectionCompletionGate = new Promise<void>((resolve) => {
+      releaseSelection = resolve
+    })
+    const paintedRowCounts: number[] = []
+    const unsubscribe = controller.subscribe(() => {
+      const binding = controller.getSnapshot().active?.presentation.painted?.binding
+      if (binding?.surface === 'transcript' && binding.seal.chatId === CHAT_ID) {
+        paintedRowCounts.push([...transcriptBodyWindowRows(binding.window)].length)
+      }
+    })
+
+    navigation.arrive('arrival-right', { chatId: CHAT_ID, targetMessageId: rightTip.id })
+    source.workspaceFence = { workspaceId: FENCE.workspaceId, replacementEpoch: 1 }
+    controller.reconcileWorkspace(source.workspaceFence)
+    releaseSelection()
+    source.selectionCompletionGate = null
+    await settle()
+    unsubscribe()
+
+    expect(paintedRowCounts.length).toBeGreaterThan(0)
+    expect(paintedRowCounts).not.toContain(1)
+    expect(paintedRowCounts.at(-1)).toBe(3)
+    expect(
+      transcriptMessages(
+        expectCoherentReadyPresentation(controller.getSnapshot().active?.presentation, 'transcript')
+          .window,
+      ).map((row) => row.id),
+    ).toEqual([root.id, right.id, rightTip.id])
   })
 
   it('surfaces repository selection failures once without a timer retry loop', async () => {

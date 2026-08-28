@@ -7448,6 +7448,10 @@ function scopeDerivedMutationCapabilityFacts(
   const messagesSource = exactSource(program, 'src/core/messages.ts')
   const generationEngineSource = exactSource(program, GENERATION_ENGINE_PATH)
   const generationRuntimeSource = exactSource(program, BROWSER_GENERATION_COMMAND_RUNTIME_PATH)
+  const conversationCommandClientSource = exactSource(
+    program,
+    'src/store/conversation-command-client.ts',
+  )
   const terminalizationSource = exactSource(program, ATTEMPT_TERMINALIZATION_PATH)
   const catalogRuntimeSource = exactSource(program, BROWSER_CATALOG_COMMAND_RUNTIME_PATH)
   const workspaceProtocolSource = exactSource(program, 'src/store/workspace-protocol.ts')
@@ -9987,6 +9991,11 @@ function scopeDerivedMutationCapabilityFacts(
     program,
     'src/store/generation-admission-controller.ts',
   )
+  const generationCapabilitySource = exactSource(
+    program,
+    'src/store/generation-capability-controller.ts',
+  )
+  const shellSource = exactSource(program, 'src/app/Shell.tsx')
   const captureGenerationConfigurationText = findFunction(
     generationAdmissionSource,
     'captureGenerationConfiguration',
@@ -9994,6 +10003,10 @@ function scopeDerivedMutationCapabilityFacts(
   const captureGenerationPromptPathText = findFunction(
     generationAdmissionSource,
     'captureGenerationPromptPath',
+  ).getText(generationAdmissionSource)
+  const generationCapabilityForSettlingRequestText = findFunction(
+    generationAdmissionSource,
+    'generationCapabilityForSettlingRequest',
   ).getText(generationAdmissionSource)
   const prepareGenerationMessagePlacementIntentText = findFunction(
     generationAdmissionSource,
@@ -10013,9 +10026,40 @@ function scopeDerivedMutationCapabilityFacts(
         .getText()
         .includes('readonly pathHint: GenerationPromptPathReadHint') &&
       !workspaceProtocolSource.getText().includes('PrepareAttemptConfigurationClaim'),
-    admissionCapturesHintsOnly:
+    admissionCapturesRequestSnapshot:
       captureGenerationConfigurationText.includes('preferredDispatchKeyId') &&
+      captureGenerationConfigurationText.includes('if (transactionCurrent)') &&
+      captureGenerationConfigurationText.includes("kind: 'transaction-current' as const") &&
+      captureGenerationConfigurationText.includes(
+        'settings: cloneFrozenGenerationPayload(settings)',
+      ) &&
+      captureGenerationConfigurationText.includes('configurationVersion,') &&
       captureGenerationConfigurationText.includes('settingsPatch: intent.settingsPatch') &&
+      captureGenerationConfigurationText.includes(
+        'generationConfigurationCapability(resolution)',
+      ) &&
+      !captureGenerationConfigurationText.includes('target.settings') &&
+      countOccurrences(conversationCommandClientSource.getText(), "'active-target'") === 10 &&
+      generationCapabilitySource
+        .getText()
+        .includes('claimSelectedGenerationConfiguration(chatId, settingsPatch)') &&
+      shellSource.getText().includes('const ownActiveGenerationSubmission = useCallback(') &&
+      shellSource
+        .getText()
+        .includes('const configurationCapture = captureActiveTargetGenerationConfiguration(') &&
+      shellSource
+        .getText()
+        .indexOf('const configurationCapture = captureActiveTargetGenerationConfiguration(') <
+        shellSource.getText().indexOf('const submission = ownGenerationSubmission(intent,') &&
+      generationCapabilityForSettlingRequestText.includes(
+        "request.configurationAuthority === 'transaction-current'",
+      ) &&
+      generationCapabilityForSettlingRequestText.includes(
+        "target?.kind === 'chat' && target.chatId === request.intent.chatId",
+      ) &&
+      generationCapabilityForSettlingRequestText.includes(
+        "pendingGenerationCapability('configuration')",
+      ) &&
       captureGenerationPromptPathText.includes(
         'proof: Object.freeze({ requirement, pathHint: capture.pathHint })',
       ) &&
@@ -10032,12 +10076,25 @@ function scopeDerivedMutationCapabilityFacts(
       prepareBrowserAttemptText.includes('const currentChat = await ctx.getChat(chatId)') &&
       prepareBrowserAttemptText.includes('await mutation.resolveGenerationPromptPath(') &&
       prepareBrowserAttemptText.includes('input.configurationIntent.settingsPatch') &&
-      prepareBrowserAttemptText.includes('const attemptSettings = settingsPatch') &&
+      prepareBrowserAttemptText.includes("input.configurationIntent.kind === 'captured'") &&
+      prepareBrowserAttemptText.includes('? input.configurationIntent.settings') &&
+      prepareBrowserAttemptText.includes(': currentChat.settings') &&
+      prepareBrowserAttemptText.includes(
+        '? input.configurationIntent.expectedConfigurationVersion',
+      ) &&
+      prepareBrowserAttemptText.includes(
+        'const nextSettings = applyChatSettingsPatch(currentChat.settings, settingsPatch)',
+      ) &&
       prepareBrowserAttemptText.includes('const slot = promptPath.slot') &&
       prepareBrowserAttemptText.includes('mutation.captureGenerationPlanningSnapshot(') &&
       prepareCommandInputText.includes(
         'preferredDispatchKeyId: configuration.preferredDispatchKeyId',
-      ),
+      ) &&
+      prepareCommandInputText.includes("configuration.requestSettings.kind === 'captured'") &&
+      prepareCommandInputText.includes('settings: configuration.requestSettings.settings') &&
+      prepareCommandInputText.includes('configuration.requestSettings.configurationVersion') &&
+      prepareCommandInputText.includes("{ kind: 'transaction-current' as const }") &&
+      prepareCommandInputText.includes("kind: 'captured'"),
     exactTableCompilation:
       prepareBrowserAttemptText.includes('captureGenerationPlanningSnapshot: true') &&
       prepareBrowserAttemptText.includes('promoteChatId: chatId') &&

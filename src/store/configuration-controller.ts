@@ -522,7 +522,10 @@ export interface ConfigurationController {
   pendingTextTemplateConfig(templateId: TextTemplateId): PendingTextTemplateConfigIntent | undefined
   projectChatConfiguration(chat: Chat): Chat
   claimPendingGenerationConfiguration(chatId: ChatId): SelectedGenerationConfigurationClaim | null
-  claimSelectedGenerationConfiguration(chatId: ChatId): SelectedGenerationConfigurationClaim
+  claimSelectedGenerationConfiguration(
+    chatId: ChatId,
+    settingsPatch?: ChatSettingsPatch,
+  ): SelectedGenerationConfigurationClaim
   resolveSelectedGenerationConfiguration(
     claim: SelectedGenerationConfigurationClaim,
   ): ActiveGenerationConfigurationResolution
@@ -603,6 +606,7 @@ const PENDING_ACTIVE_GENERATION_CONFIGURATION_FRAME: ActiveGenerationConfigurati
 interface SelectedGenerationConfigurationClaimState {
   readonly claim: SelectedGenerationConfigurationClaim
   readonly workspace: WorkspaceFence
+  readonly settingsPatch?: ChatSettingsPatch
   target: Extract<ActiveConfigurationTarget, { readonly kind: 'chat' }> | null
   promptFields: readonly PendingPromptFieldIntent[]
   workspaceSettingOverrides: ActiveGenerationConfigurationClaim['workspaceSettingOverrides']
@@ -1378,7 +1382,10 @@ class TabConfigurationController implements ConfigurationController {
     return this.claimSelectedGenerationConfiguration(chatId)
   }
 
-  claimSelectedGenerationConfiguration(chatId: ChatId): SelectedGenerationConfigurationClaim {
+  claimSelectedGenerationConfiguration(
+    chatId: ChatId,
+    settingsPatch?: ChatSettingsPatch,
+  ): SelectedGenerationConfigurationClaim {
     const workspace = this.workspaceFence
     if (!workspace) throw new Error('SelectedGenerationConfigurationWorkspaceUnavailable')
     const claim = Object.freeze({
@@ -1390,6 +1397,7 @@ class TabConfigurationController implements ConfigurationController {
     const state: SelectedGenerationConfigurationClaimState = {
       claim,
       workspace,
+      ...(settingsPatch ? { settingsPatch: structuredClone(settingsPatch) } : {}),
       target: null,
       promptFields: Object.freeze([]),
       workspaceSettingOverrides: Object.freeze([]),
@@ -1468,6 +1476,7 @@ class TabConfigurationController implements ConfigurationController {
     state.baseResolution = this.activeGenerationConfigurationFrame().resolve({
       kind: 'chat',
       chatId: target.chatId,
+      ...(state.settingsPatch ? { settingsPatch: state.settingsPatch } : {}),
     })
     if (
       this.frameSelection.status === 'ready' &&
@@ -1532,7 +1541,11 @@ class TabConfigurationController implements ConfigurationController {
       promptFields: state.promptFields,
       workspaceSettingOverrides: state.workspaceSettingOverrides,
       pendingTextTemplates: state.pendingTextTemplates,
-    }).resolve({ kind: 'chat', chatId: target.chatId })
+    }).resolve({
+      kind: 'chat',
+      chatId: target.chatId,
+      ...(state.settingsPatch ? { settingsPatch: state.settingsPatch } : {}),
+    })
   }
 
   private loadSelectedGenerationConfigurationSelection(

@@ -290,9 +290,12 @@ function validateFact(value: unknown): asserts value is WorkspaceDeltaFact {
     throw new Error('WorkspaceChangeFactInvalid')
   }
   switch (value.kind) {
+    case 'sidebar-row-changed':
+      validateOptionalEnumValues(value.facets, new Set(['last-viewed']))
+      requireId(value.chatId, 'WorkspaceChangeChatFactInvalid')
+      return
     case 'chat-deleted':
     case 'conversation-created':
-    case 'sidebar-row-changed':
     case 'sidebar-row-deleted':
       requireId(value.chatId, 'WorkspaceChangeChatFactInvalid')
       return
