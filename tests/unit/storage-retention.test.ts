@@ -121,6 +121,10 @@ const originalLocks = Object.getOwnPropertyDescriptor(navigator, 'locks')
 let maintenanceReplacementDrain: BrowserWorkspacePromotedReplacementDrain
 
 class ImmediateLockManager {
+  async query(): Promise<LockManagerSnapshot> {
+    return { held: [], pending: [] }
+  }
+
   request<T>(
     name: string,
     optionsOrCallback:
@@ -138,6 +142,13 @@ class ImmediateLockManager {
 class SerializedLockManager {
   readonly #tails = new Map<string, Promise<void>>()
   readonly attempts = new Map<string, number>()
+
+  async query(): Promise<LockManagerSnapshot> {
+    return {
+      held: [...this.#tails.keys()].map((name) => ({ name, mode: 'exclusive' as const })),
+      pending: [],
+    }
+  }
 
   async request<T>(
     name: string,
@@ -167,6 +178,10 @@ class SerializedLockManager {
 }
 
 class SelectiveSlotLockManager {
+  async query(): Promise<LockManagerSnapshot> {
+    return { held: [], pending: [] }
+  }
+
   readonly busySlots = new Set<string>()
   readonly slotAttempts = new Map<string, number>()
 

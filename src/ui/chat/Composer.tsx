@@ -363,8 +363,8 @@ export function Composer({
   //
   // Auto-size semantics: null auto-grows from the profile minimum to its cap;
   // a manual value is an exact viewport height and overflows internally.
-  // Constrain the `height: auto` measurement so its forced layout cannot
-  // transiently resize the sibling transcript and clamp its bottom scroll.
+  // Hold the input shell during measurement so its temporary one-line height
+  // cannot expand the sibling transcript and clamp its bottom scroll.
   // biome-ignore lint/correctness/useExhaustiveDependencies: text changes alter textarea scrollHeight.
   useLayoutEffect(() => {
     const el = textareaRef.current
@@ -387,6 +387,8 @@ export function Composer({
         return
       }
       const autoMinHeight = Math.max(oneLineHeight, profile.autoMinHeight)
+      const shell = el.parentElement as HTMLDivElement
+      shell.style.height = `${shell.getBoundingClientRect().height}px`
       el.style.minHeight = `${autoMinHeight}px`
       el.style.maxHeight = `${Math.max(autoMinHeight, profile.autoGrowMax)}px`
       el.style.height = 'auto'
@@ -400,6 +402,7 @@ export function Composer({
       const contentHeight = Math.min(normalizedContentHeight, profile.autoGrowMax)
       const effectiveHeight = Math.max(autoMinHeight, contentHeight)
       setComposerTextareaHeight(el, effectiveHeight, normalizedContentHeight)
+      shell.style.height = ''
       setRenderedHeight((current) =>
         current === effectiveHeight ? current : Math.ceil(effectiveHeight),
       )
@@ -853,7 +856,14 @@ export function Composer({
               appearance="solid"
               geometry="flush"
               data-mode={emptyWithTrailingUser ? 'reply' : 'send'}
-              onClick={submissionPending ? onCancelSubmission : undefined}
+              onClick={
+                submissionPending
+                  ? (event) => {
+                      event.preventDefault()
+                      onCancelSubmission?.()
+                    }
+                  : undefined
+              }
               disabled={
                 submissionPending
                   ? !onCancelSubmission

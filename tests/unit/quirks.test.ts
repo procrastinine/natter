@@ -1,4 +1,5 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
+import * as modelIds from '../../src/core/model-ids'
 import {
   allowedEffortFor,
   allowedVerbosityFor,
@@ -12,6 +13,18 @@ import {
 } from '../../src/core/quirks'
 
 describe('quirks registry', () => {
+  it('normalizes only the requested model during a lookup', () => {
+    const normalize = vi.spyOn(modelIds, 'canonicalCompatModelId')
+    try {
+      expect(quirksFor('google/gemini-3.5-flash').reasoningPreservationFormat).toBe(
+        'google-gemini-v1',
+      )
+      expect(normalize).toHaveBeenCalledExactlyOnceWith('google/gemini-3.5-flash')
+    } finally {
+      normalize.mockRestore()
+    }
+  })
+
   it('returns empty entry for an unknown model', () => {
     expect(quirksFor('mistral/large')).toEqual({})
     expect(allowedEffortFor('mistral/large')).toEqual(FULL_EFFORT)

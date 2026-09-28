@@ -47,6 +47,33 @@ const POLICY_UNKNOWN_RETENTION: DataPolicy = {
 }
 
 describe('buildPickerRows', () => {
+  it('keeps newly discovered providers outside an empty or nonempty manual set', () => {
+    const original = ep('Original')
+    const added = ep('New Provider')
+    const filter: PrivacyFilterResult = {
+      model: 'test/model',
+      kept: [original, added].map((endpoint) => ({
+        endpoint,
+        policy: POLICY_CLEAN,
+        policySynthesized: false,
+      })),
+      excluded: [],
+      zeroEligible: false,
+    }
+    for (const only of [[], ['Original']]) {
+      const rows = buildPickerRows([original, added], filter, {
+        providerPrefs: { ignoreOverridesFilter: true, only, ignore: [] },
+      })
+      expect(
+        rows.filter((row) => row.state === 'kept').map((row) => row.endpoint.provider_name),
+      ).toEqual(only)
+      expect(rows[1]?.reasons).toEqual(['not-in-only-list'])
+    }
+    expect(buildPickerRows([original, added], filter).every((row) => row.state === 'kept')).toBe(
+      true,
+    )
+  })
+
   it('tags every endpoint as no-filter when filter is null', () => {
     const endpoints = [ep('Azure'), ep('OpenAI')]
     const rows = buildPickerRows(endpoints, null)

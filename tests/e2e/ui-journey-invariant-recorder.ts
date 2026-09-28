@@ -1093,8 +1093,8 @@ export function installUiJourneyInvariantRecorderInPage(
       boundedPrefixEviction,
     }
   }
-  const inspectScrollIntents = (seen: Set<string>) => {
-    if (followIntent) {
+  const inspectScrollIntents = (seen: Set<string>, geometrySettled: boolean) => {
+    if (geometrySettled && followIntent) {
       if (!followIntent.node.isConnected) {
         recordViolation(
           seen,
@@ -1117,7 +1117,7 @@ export function installUiJourneyInvariantRecorderInPage(
         }
       }
     }
-    if (prependIntent) {
+    if (geometrySettled && prependIntent) {
       if (!prependIntent.anchor.isConnected) {
         recordViolation(
           seen,
@@ -1155,11 +1155,24 @@ export function installUiJourneyInvariantRecorderInPage(
       }
       if (!intent.node) return
       if (!intent.node.isConnected) {
-        recordViolation(seen, 'acquire-bottom-discontinuity', intent.id, 'scroll node was replaced')
+        if (geometrySettled) {
+          recordViolation(
+            seen,
+            'acquire-bottom-discontinuity',
+            intent.id,
+            'scroll node was replaced',
+          )
+        }
         return
       }
       const top = intent.node.scrollTop
       const distance = intent.node.scrollHeight - top - intent.node.clientHeight
+      if (!geometrySettled) {
+        // Mutation and completed scrolling can share a frame. Record positive
+        // acquisition while displacement checks wait for post-mutation layout.
+        if (distance <= intent.tolerance) intent.acquired = true
+        return
+      }
       const started =
         intent.started ||
         Math.abs(top - intent.initialTop) > intent.tolerance ||
@@ -1453,9 +1466,7 @@ export function installUiJourneyInvariantRecorderInPage(
     const counts = inspectCounts(seen, boundedPrefixEviction)
     const geometrySettled =
       !routeChanged && !reasons.includes('mutation') && reasons.some((reason) => reason !== 'route')
-    if (geometrySettled) {
-      inspectScrollIntents(seen)
-    }
+    inspectScrollIntents(seen, geometrySettled)
     inspectFocusIntent(seen)
     inspectVisibilityResume(seen)
     const waiterLabel = sampleWaiters.find((waiter) => waiter.label)?.label

@@ -3,7 +3,7 @@ import { createChat } from '../helpers/chats'
 import 'fake-indexeddb/auto'
 import Dexie from 'dexie'
 import { IDBFactory } from 'fake-indexeddb'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useState, useSyncExternalStore } from 'react'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { effectiveCapabilityFromEndpoints } from '../../src/core/capabilities'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
@@ -16,6 +16,7 @@ import {
   shutdownBrowserWorkspace,
 } from '../../src/store/browser-workspace-lifecycle'
 import { getChat } from '../../src/store/chats'
+import { configurationController } from '../../src/store/configuration-controller'
 import { __resetDbForTests, getDb } from '../../src/store/db'
 import { __resetLockTrackerForTests, withMutationLocks } from '../../src/store/locks'
 import { ContextPanel } from '../../src/ui/settings/ContextPanel'
@@ -126,6 +127,18 @@ function LiveContextPanel({
   return <ContextPanel chat={chat} capability={capability} estimateOverride={estimate} />
 }
 
+function ProjectedContextPanel({ chat }: { chat: Awaited<ReturnType<typeof createChat>> }) {
+  useSyncExternalStore(configurationController.subscribe, configurationController.getSnapshot)
+  const projected = configurationController.projectChatConfiguration(chat)
+  return (
+    <ContextPanel
+      chat={projected}
+      capability={effectiveCapabilityFromEndpoints(chat.settings.model, [makeEndpoint()])}
+      estimateOverride={estimateSettingsPromptSize(projected.settings, [], '', null)}
+    />
+  )
+}
+
 async function resetAll() {
   __resetBroadcastForTests()
   __resetLockTrackerForTests()
@@ -146,6 +159,36 @@ afterEach(async () => {
 })
 
 describe('ContextPanel slider persistence', () => {
+  it('persists a slider value even after optimistic projection echoes it back as storedValue', async () => {
+    const settings = cloneDefaultChatSettings()
+    settings.model = 'openai/gpt-4o-mini'
+    const chat = await createChat({ settings })
+    const { container } = render(<ProjectedContextPanel chat={chat} />)
+    const slider = container.querySelector<HTMLInputElement>('[data-ui="slider"]')
+    if (!slider) throw new Error('ContextSliderMissing')
+    fireEvent.change(slider, { target: { value: '8192' } })
+    expect(configurationController.projectChatConfiguration(chat).settings.customMaxContext).toBe(
+      8192,
+    )
+    await waitFor(async () =>
+      expect((await getChat(chat.id))?.settings.customMaxContext).toBe(8192),
+    )
+  })
+
+  it('flushes the exact staged context edit before generation without waiting for debounce', async () => {
+    const settings = cloneDefaultChatSettings()
+    settings.model = 'openai/gpt-4o-mini'
+    const chat = await createChat({ settings })
+    const { container } = render(<ProjectedContextPanel chat={chat} />)
+    const slider = container.querySelector<HTMLInputElement>('[data-ui="slider"]')
+    if (!slider) throw new Error('ContextSliderMissing')
+    fireEvent.change(slider, { target: { value: '4096' } })
+    fireEvent.change(slider, { target: { value: '8192' } })
+    await configurationController.flushChatEdits(chat.id)
+    expect((await getChat(chat.id))?.settings.customMaxContext).toBe(8192)
+    expect(configurationController.projectChatConfiguration(chat)).toBe(chat)
+  })
+
   it('labels the gauge as a persisted-branch estimate and never presents volatile draft work', async () => {
     const settings = cloneDefaultChatSettings()
     settings.model = 'openai/gpt-4o-mini'

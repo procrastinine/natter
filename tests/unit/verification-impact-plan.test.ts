@@ -387,21 +387,30 @@ describe('verification slice impact planner', () => {
       'browser',
       'browser',
       'browser',
+      'browser',
       'integration',
       'integration',
     ])
     expect(plan.impactedObligations).toContain(obligationId)
     expect(plan.tasks.vitest.length).toBeGreaterThan(0)
-    expect(plan.tasks.playwright).toHaveLength(3)
+    expect(plan.tasks.playwright).toHaveLength(5)
     expect(plan.tasks.playwright[0]?.project).toBe('chromium')
     expect(Array.isArray(plan.tasks.playwright[0]?.files)).toBe(true)
     expect(plan.tasks.playwright[1]).toEqual({
+      project: 'firefox',
+      files: ['tests/e2e/scroll.spec.ts', 'tests/e2e/storage-reclamation.spec.ts'],
+    })
+    expect(plan.tasks.playwright[2]).toEqual({
       project: 'large-workspace-setup',
       files: ['tests/e2e/large-workspace.setup.ts'],
     })
-    expect(plan.tasks.playwright[2]).toEqual({
+    expect(plan.tasks.playwright[3]).toEqual({
       project: 'chromium-large-workspace',
       files: ['tests/e2e/large-workspace-startup.spec.ts'],
+    })
+    expect(plan.tasks.playwright[4]).toEqual({
+      project: 'chromium-send-performance',
+      files: ['tests/e2e/render-window.spec.ts'],
     })
     expect(plan.openGuarantees).toContainEqual({ id: `obligation:${obligationId}`, status: 'open' })
     expect(validateVerificationManifest({ current })).toEqual([])
@@ -447,7 +456,13 @@ describe('verification slice impact planner', () => {
     )
     expect(plan.tasks.playwright[1]).toEqual({
       project: 'firefox',
-      files: ['tests/e2e/system-prompt.spec.ts'],
+      files: [
+        'tests/e2e/advanced-generation-routing.spec.ts',
+        'tests/e2e/composer.spec.ts',
+        'tests/e2e/scroll.spec.ts',
+        'tests/e2e/storage-reclamation.spec.ts',
+        'tests/e2e/system-prompt.spec.ts',
+      ],
     })
     expect(plan.tasks.playwright[2]).toEqual({
       project: 'large-workspace-setup',
@@ -459,10 +474,46 @@ describe('verification slice impact planner', () => {
     })
     expect(plan.tasks.playwright[4]).toEqual({
       project: 'chromium-send-performance',
-      files: ['tests/e2e/send-performance.spec.ts'],
+      files: ['tests/e2e/render-window.spec.ts', 'tests/e2e/send-performance.spec.ts'],
     })
     expect(plan.openGuarantees).toContainEqual({ id: `obligation:${obligationId}`, status: 'open' })
     expect(validateVerificationManifest({ current })).toEqual([])
+  }, 15_000)
+
+  it('derives Firefox native-find proof from either transcript viewport owner', () => {
+    const current = buildVerificationSnapshot()
+    for (const path of ['src/ui/chat/ScrollRegion.tsx', 'src/ui/chat/MessageList.tsx']) {
+      const candidate = mutateFile(current, path, 'native-find-coordinate-change')
+      const plan = planSliceVerification({ base: current, current: candidate })
+      expect(plan.impactedObligations).toContain('native-find-viewport')
+      expect(plan.tasks.vitest).toContain('tests/unit/scroll-region.test.tsx')
+      expect(plan.tasks.playwright.find(({ project }) => project === 'firefox')?.files).toContain(
+        'tests/e2e/scroll.spec.ts',
+      )
+      expect(
+        plan.tasks.playwright.find(({ project }) => project === 'chromium')?.files,
+      ).not.toContain('tests/e2e/render-window.spec.ts')
+      expect(
+        plan.tasks.playwright.find(({ project }) => project === 'chromium-send-performance')?.files,
+      ).toContain('tests/e2e/render-window.spec.ts')
+      expect(plan.structuralBlockers).toEqual([])
+    }
+  }, 15_000)
+
+  it('derives sidebar continuity and target-local privacy proof from the catalog owner', () => {
+    const current = buildVerificationSnapshot()
+    const candidate = mutateFile(current, 'src/hooks/useModelCatalog.ts', 'privacy-target-change')
+    const plan = planSliceVerification({ base: current, current: candidate })
+
+    expect(plan.impactedObligations).toContain('configuration-target-presentation')
+    expect(plan.tasks.vitest).toContain('tests/unit/privacy-policies.test.tsx')
+    expect(plan.tasks.playwright.find(({ project }) => project === 'chromium')?.files).toEqual(
+      expect.arrayContaining([
+        'tests/e2e/sidebar.spec.ts',
+        'tests/e2e/provider-crosswalk-switching.spec.ts',
+      ]),
+    )
+    expect(plan.structuralBlockers).toEqual([])
   }, 15_000)
 
   it('derives both browser engines for focused configuration continuity', () => {
@@ -486,7 +537,11 @@ describe('verification slice impact planner', () => {
     )
     expect(plan.tasks.playwright.find(({ project }) => project === 'firefox')).toEqual({
       project: 'firefox',
-      files: ['tests/e2e/system-prompt.spec.ts'],
+      files: [
+        'tests/e2e/advanced-generation-routing.spec.ts',
+        'tests/e2e/storage-reclamation.spec.ts',
+        'tests/e2e/system-prompt.spec.ts',
+      ],
     })
     expect(plan.structuralBlockers).toEqual([])
   }, 15_000)

@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cloneDefaultChatSettings } from '../../src/core/defaults'
 import {
+  CORS_PROXY_URL_KEY,
   DEFAULT_GLOBAL_PREFERENCES,
   PINNED_MODELS_KEY,
   SIDEBAR_COLLAPSED_KEY,
@@ -62,6 +63,40 @@ afterEach(async () => {
 })
 
 describe('configuration controller publication', () => {
+  it.each([null, 'chat-A'])(
+    'flushes only the generation-dependent edit owners for %s',
+    async (chatId) => {
+      const globalFlush = vi.fn(async () => undefined)
+      const chatFlush = vi.fn(async () => undefined)
+      const unrelatedFlush = vi.fn(async () => undefined)
+      const sessions = [
+        configurationController.openEditSession({
+          ownerKey: CORS_PROXY_URL_KEY,
+          fieldKey: 'proxy',
+          flush: globalFlush,
+        }),
+        configurationController.openEditSession({
+          chatId: 'chat-A',
+          fieldKey: 'context',
+          flush: chatFlush,
+        }),
+        configurationController.openEditSession({
+          ownerKey: 'appearance',
+          fieldKey: 'width',
+          flush: unrelatedFlush,
+        }),
+      ]
+      try {
+        await configurationController.flushGenerationEdits(chatId)
+        expect(globalFlush).toHaveBeenCalledTimes(1)
+        expect(chatFlush).toHaveBeenCalledTimes(chatId === null ? 0 : 1)
+        expect(unrelatedFlush).not.toHaveBeenCalled()
+      } finally {
+        await Promise.all(sessions.map((session) => session.close('discard')))
+      }
+    },
+  )
+
   it('keeps an owned configuration intent current across a late same-chat projection', () => {
     const firstProfile = profileFixture('intent-profile-a')
     const secondProfile = profileFixture('intent-profile-b')
@@ -747,6 +782,72 @@ describe('sealed target-qualified generation configuration', () => {
     })
     configurationController.cancelSelectedGenerationConfiguration(claim)
   })
+
+  it.each(['commit', 'discard', 'failure'] as const)(
+    'settles the exact prepared edit once on %s',
+    async (outcome) => {
+      const profile = profileFixture('profile-prepared-edit')
+      const settings = settingsFixture(profile)
+      configurationController.rememberSeed({ profileId: profile.id, presetId: null, settings })
+      await installSource(selectionFixture(profile))
+      observeChat(chatFixture('chat-A', settings))
+      await waitForExactChatSelection('chat-A')
+      const execute = vi.fn(async () => {
+        if (outcome === 'failure') throw new Error('FixtureConfigurationWriteFailure')
+        return {
+          kind: 'chat-updated',
+          changed: true,
+          chatId: 'chat-A',
+          configurationVersion: 1,
+        }
+      })
+      const application = createConfigurationApplication({
+        port: { execute: execute as ConfigurationDomainPort['execute'] },
+        async prepareKey() {
+          throw new Error('UnexpectedKeyPreparation')
+        },
+        async loadProfileSwitchPlan() {
+          return undefined
+        },
+        async loadChatPreset() {
+          return undefined
+        },
+        pendingConfiguration: configurationController,
+      })
+      const edit = application.prepareChatSettingsFields('chat-A', [
+        { path: ['customMaxContext'], value: 8192 },
+      ])
+      const claim = configurationController.claimPendingGenerationConfiguration('chat-A')
+      if (!claim) throw new Error('MissingPreparedEditClaim')
+      expect(execute).not.toHaveBeenCalled()
+      if (outcome === 'commit') {
+        await Promise.all([edit.commit(), edit.commit()])
+        expect(execute).toHaveBeenCalledTimes(1)
+        expect(configurationController.resolveSelectedGenerationConfiguration(claim)).toMatchObject(
+          {
+            capability: 'ready',
+            configurationVersion: 1,
+            claim: { settings: { customMaxContext: 8192 } },
+          },
+        )
+      } else if (outcome === 'discard') {
+        edit.discard()
+        expect(configurationController.resolveSelectedGenerationConfiguration(claim)).toEqual({
+          capability: 'failed',
+        })
+        await expect(edit.commit()).rejects.toMatchObject({ name: 'AbortError' })
+        expect(execute).not.toHaveBeenCalled()
+      } else {
+        await expect(edit.commit()).rejects.toThrow('FixtureConfigurationWriteFailure')
+        expect(configurationController.resolveSelectedGenerationConfiguration(claim)).toEqual({
+          capability: 'failed',
+        })
+        await expect(edit.commit()).rejects.toThrow('FixtureConfigurationWriteFailure')
+        expect(execute).toHaveBeenCalledTimes(1)
+      }
+      configurationController.cancelSelectedGenerationConfiguration(claim)
+    },
+  )
 
   it('fails a selected configuration claim when its exact optimistic command is rejected', async () => {
     const profile = profileFixture('profile-selected-rejected')

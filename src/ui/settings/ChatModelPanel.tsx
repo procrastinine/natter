@@ -724,6 +724,7 @@ function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | u
     async (targetId: string) => {
       const target = presets.find((candidate) => candidate.id === targetId)
       if (!target) return
+      await configurationController.flushChatEdits(chat.id)
       await configurationApplication.saveChatPreset({
         presetId: target.id,
         settings: { ...chat.settings, profileId: target.connectionProfileId },
@@ -735,7 +736,7 @@ function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | u
       })
       closePicker()
     },
-    [chat.settings, presets, pushToast, closePicker],
+    [chat.id, chat.settings, presets, pushToast, closePicker],
   )
 
   const saveAsNew = useCallback(() => {
@@ -748,6 +749,7 @@ function PresetBreadcrumb({ chat, preset }: { chat: Chat; preset: ChatPreset | u
           confirmLabel: 'Save',
         })
         if (!name?.trim()) return null
+        await configurationController.flushChatEdits(chat.id)
         return configurationApplication.createAndLinkChatPreset({
           chatId: chat.id,
           name: name.trim(),

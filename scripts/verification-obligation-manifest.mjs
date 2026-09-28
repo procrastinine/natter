@@ -61,6 +61,11 @@ export const VERIFICATION_PROOFS = Object.freeze([
     project: 'chromium',
     files: ['tests/e2e/storage-reclamation.spec.ts'],
   }),
+  proof('physical-storage-compaction-firefox', 'browser', {
+    runner: 'playwright',
+    project: 'firefox',
+    files: ['tests/e2e/storage-reclamation.spec.ts'],
+  }),
   proof('conversation-viewport-presentation-contract', 'integration', {
     runner: 'vitest',
     files: [
@@ -85,10 +90,19 @@ export const VERIFICATION_PROOFS = Object.freeze([
       'tests/e2e/reactive-storage-stress.spec.ts',
       'tests/e2e/render-window-loading.spec.ts',
       'tests/e2e/render-window-streaming.spec.ts',
-      'tests/e2e/render-window.spec.ts',
       'tests/e2e/scroll.spec.ts',
       'tests/e2e/stream-retention.spec.ts',
     ],
+  }),
+  proof('conversation-viewport-serial-browser', 'browser', {
+    runner: 'playwright',
+    project: 'chromium-send-performance',
+    files: ['tests/e2e/render-window.spec.ts'],
+  }),
+  proof('native-find-viewport-firefox', 'browser', {
+    runner: 'playwright',
+    project: 'firefox',
+    files: ['tests/e2e/scroll.spec.ts'],
   }),
   proof('remote-locality-browser', 'browser', {
     runner: 'playwright',
@@ -105,6 +119,9 @@ export const VERIFICATION_PROOFS = Object.freeze([
   proof('configuration-edit-continuity-unit', 'unit', {
     runner: 'vitest',
     files: [
+      'tests/unit/composer.test.tsx',
+      'tests/unit/configuration-controller.test.ts',
+      'tests/unit/context-panel.test.tsx',
       'tests/unit/param-form.test.tsx',
       'tests/unit/prompt-preset-editor.test.tsx',
       'tests/unit/router.test.ts',
@@ -114,12 +131,31 @@ export const VERIFICATION_PROOFS = Object.freeze([
   proof('configuration-edit-continuity-chromium', 'browser', {
     runner: 'playwright',
     project: 'chromium',
-    files: ['tests/e2e/system-prompt.spec.ts'],
+    files: ['tests/e2e/system-prompt.spec.ts', 'tests/e2e/advanced-generation-routing.spec.ts'],
   }),
   proof('configuration-edit-continuity-firefox', 'browser', {
     runner: 'playwright',
     project: 'firefox',
-    files: ['tests/e2e/system-prompt.spec.ts'],
+    files: ['tests/e2e/system-prompt.spec.ts', 'tests/e2e/advanced-generation-routing.spec.ts'],
+  }),
+  proof('configuration-target-presentation-unit', 'unit', {
+    runner: 'vitest',
+    files: ['tests/unit/privacy-policies.test.tsx'],
+  }),
+  proof('configuration-target-presentation-browser', 'browser', {
+    runner: 'playwright',
+    project: 'chromium',
+    files: ['tests/e2e/sidebar.spec.ts', 'tests/e2e/provider-crosswalk-switching.spec.ts'],
+  }),
+  proof('composer-paste-growth-chromium', 'browser', {
+    runner: 'playwright',
+    project: 'chromium',
+    files: ['tests/e2e/composer.spec.ts'],
+  }),
+  proof('composer-paste-growth-firefox', 'browser', {
+    runner: 'playwright',
+    project: 'firefox',
+    files: ['tests/e2e/composer.spec.ts'],
   }),
   proof('destination-frame-budget-contract', 'integration', {
     runner: 'vitest',
@@ -252,11 +288,35 @@ export const VERIFICATION_PROOFS = Object.freeze([
 
 export const VERIFICATION_OBLIGATIONS = Object.freeze([
   obligation(
+    'configuration-target-presentation',
+    [
+      'src/hooks/useModelCatalog.ts',
+      'src/ui/chat/HeaderPrivacyBadge.tsx',
+      'src/ui/settings/ProviderPicker.tsx',
+    ],
+    ['configuration-target-presentation-unit', 'configuration-target-presentation-browser'],
+  ),
+  obligation(
+    'native-find-viewport',
+    ['src/ui/chat/ScrollRegion.tsx', 'src/ui/chat/MessageList.tsx'],
+    ['conversation-viewport-presentation-contract', 'native-find-viewport-firefox'],
+  ),
+  obligation(
+    'composer-paste-growth',
+    ['src/ui/chat/Composer.tsx', 'src/ui/chat/InlineEditor.tsx'],
+    ['composer-paste-growth-chromium', 'composer-paste-growth-firefox'],
+  ),
+  obligation(
     'configuration-edit-continuity',
     [
       'src/app/router.ts',
+      'src/hooks/useSettledConfigurationEdit.ts',
+      'src/store/configuration-controller.ts',
+      'src/store/configuration-domain.ts',
+      'src/store/generation-admission-controller.ts',
       'src/store/conversation-route-owner.ts',
       'src/store/workspace-runtime.ts',
+      'src/ui/chat/Composer.tsx',
       'src/ui/settings/ChatModelPanel.tsx',
       'src/ui/settings/PromptPresetEditor.tsx',
     ],
@@ -319,6 +379,7 @@ export const VERIFICATION_OBLIGATIONS = Object.freeze([
       'browser-workspace-lifecycle-contract',
       'browser-workspace-production-startup',
       'physical-storage-compaction-browser',
+      'physical-storage-compaction-firefox',
       'production-coordination',
       'protocol-contracts',
       'protocol-contracts-contract',
@@ -342,6 +403,7 @@ export const VERIFICATION_OBLIGATIONS = Object.freeze([
     [
       'conversation-viewport-presentation-contract',
       'conversation-viewport-presentation-browser',
+      'conversation-viewport-serial-browser',
       'destination-frame-budget-contract',
       'destination-frame-budget-browser',
       'destination-frame-budget-scale-browser',

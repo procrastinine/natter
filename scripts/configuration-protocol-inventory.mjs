@@ -39,7 +39,7 @@ export const CONFIGURATION_COMMANDS = Object.freeze({
     'src/store/configuration-model-resolution-capability.ts#drainTarget',
   ]),
   'chat.settings-fields-patch': command([
-    'src/store/configuration-domain.ts#createConfigurationApplication.patchChatSettingsFields',
+    'src/store/configuration-domain.ts#createConfigurationApplication.prepareChatSettingsFields',
   ]),
   'chat.settings-patch': command([
     'src/store/configuration-domain.ts#createConfigurationApplication.patchChatSettings',
@@ -65,7 +65,10 @@ export const CONFIGURATION_COMMANDS = Object.freeze({
     'src/store/configuration-domain.ts#createConfigurationApplication.unarchiveConnection',
   ]),
   'connection.touch': command(['src/ui/header/ConnectionHeader.tsx#ConnectionHeader']),
-  'global-preference.set': command(['src/store/global-settings.ts#writeGlobalPreference']),
+  'global-preference.set': command([
+    'src/store/global-settings.ts#writeGlobalPreference',
+    'src/store/configuration-domain.ts#createConfigurationApplication.prepareGlobalPreference',
+  ]),
   'image-allowlist.add': command([
     'src/store/configuration-domain.ts#createConfigurationApplication.addImageOrigin',
   ]),
@@ -90,6 +93,7 @@ export const CONFIGURATION_COMMANDS = Object.freeze({
   ]),
   'prompt-preset.local-commit': command([
     'src/store/configuration-domain.ts#createConfigurationApplication.commitPromptText',
+    'src/store/configuration-domain.ts#createConfigurationApplication.preparePromptText',
   ]),
   'prompt-preset.overwrite-and-pin': command([
     'src/store/configuration-domain.ts#createConfigurationApplication.overwriteAndPinPromptPreset',
@@ -119,6 +123,7 @@ export const CONFIGURATION_COMMANDS = Object.freeze({
   ]),
   'text-template.update': command([
     'src/store/configuration-domain.ts#createConfigurationApplication.updateTextTemplate',
+    'src/store/configuration-domain.ts#createConfigurationApplication.prepareTextTemplateConfig',
   ]),
 })
 

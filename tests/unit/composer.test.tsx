@@ -1,6 +1,7 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import Dexie from 'dexie'
 import { StrictMode } from 'react'
+import { flushSync } from 'react-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   AVAILABLE_GENERATION_CAPABILITY,
@@ -99,13 +100,12 @@ describe('Composer', () => {
   })
 
   it('cancels request preparation without discarding the composer draft', () => {
-    const onCancelSubmission = vi.fn()
-    render(
-      <Composer
-        submissionPending
-        onCancelSubmission={onCancelSubmission}
-        onSubmit={() => started()}
-      />,
+    const onSubmit = vi.fn(() => started())
+    const onCancelSubmission = vi.fn(() => {
+      flushSync(() => view.rerender(<Composer onSubmit={onSubmit} />))
+    })
+    const view = render(
+      <Composer submissionPending onCancelSubmission={onCancelSubmission} onSubmit={onSubmit} />,
     )
     const input = screen.getByPlaceholderText('Ask anything…')
     fireEvent.change(input, { target: { value: 'keep this draft' } })
@@ -113,6 +113,7 @@ describe('Composer', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Cancel preparing' }))
 
     expect(onCancelSubmission).toHaveBeenCalledOnce()
+    expect(onSubmit).not.toHaveBeenCalled()
     expect(input).toHaveValue('keep this draft')
   })
 
@@ -505,6 +506,29 @@ describe('Composer', () => {
     }
   })
 
+  it('holds the input shell at its previous height while measuring automatic content', () => {
+    const measurements: string[] = []
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue({
+      height: 159,
+    } as DOMRect)
+    vi.spyOn(HTMLTextAreaElement.prototype, 'scrollHeight', 'get').mockImplementation(function (
+      this: HTMLTextAreaElement,
+    ) {
+      measurements.push(this.parentElement?.style.height ?? '')
+      return this.value.includes('\n') ? 182 : 47
+    })
+    render(<Composer autoSize onSubmit={() => started()} />)
+    const input = screen.getByRole('textbox')
+    const oneLineHeight = input.style.height
+    fireEvent.change(input, { target: { value: 'one\ntwo' } })
+    expect(input.style.height).toBe('182px')
+    fireEvent.change(input, { target: { value: 'one' } })
+    expect(input.style.height).toBe(oneLineHeight)
+    expect(measurements.length).toBeGreaterThanOrEqual(3)
+    expect(measurements.every((height) => height === '159px')).toBe(true)
+    expect(input.parentElement?.style.height).toBe('')
+  })
+
   it('uploads selected files, shows a file tile, and sends attachment refs', async () => {
     const onSubmit = vi.fn(
       (_text: string, _opts?: { prefillText?: string; attachmentRefs?: MessageAttachmentRef[] }) =>
@@ -656,7 +680,7 @@ describe('Composer', () => {
     expect(onSave.mock.calls[0]?.[2]?.[0]).toMatchObject({ includeInContext: true })
   })
 
-  it('keeps the inline editor outer height fixed after it opens', () => {
+  it('grows and shrinks the inline editor up to its height limit', () => {
     const descriptor = Object.getOwnPropertyDescriptor(
       HTMLTextAreaElement.prototype,
       'scrollHeight',
@@ -664,6 +688,7 @@ describe('Composer', () => {
     Object.defineProperty(HTMLTextAreaElement.prototype, 'scrollHeight', {
       configurable: true,
       get(this: HTMLTextAreaElement) {
+        if (this.value.split('\n').length > 30) return 900
         return this.value.includes('\n') ? 420 : 180
       },
     })
@@ -680,8 +705,12 @@ describe('Composer', () => {
 
       fireEvent.change(input, { target: { value: 'short edit\nmore content' } })
 
-      expect(input.style.height).toBe('180px')
+      expect(input.style.height).toBe('420px')
+      fireEvent.change(input, { target: { value: 'line\n'.repeat(50) } })
+      expect(input.style.height).toBe('600px')
       expect(input.style.overflowY).toBe('auto')
+      fireEvent.change(input, { target: { value: 'short again' } })
+      expect(input.style.height).toBe('180px')
     } finally {
       if (descriptor) {
         Object.defineProperty(HTMLTextAreaElement.prototype, 'scrollHeight', descriptor)

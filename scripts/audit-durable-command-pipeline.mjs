@@ -10573,6 +10573,34 @@ function configurationCallerSingleAttemptFacts(program) {
     createConfigurationApplication,
     'execute',
   )
+  const configurationApplicationExecutePrepared = findNestedVariableFunction(
+    createConfigurationApplication,
+    'executePrepared',
+  )
+  const prepare = findNestedVariableFunction(createConfigurationApplication, 'prepare')
+  const commit = findNestedMethod(prepare, 'commit')
+  const discard = findNestedMethod(prepare, 'discard')
+  const prepareText = prepare.getText(configurationDomainSource).replace(/\s+/gu, '')
+  const commitText = commit.getText(configurationDomainSource).replace(/\s+/gu, '')
+  const discardText = discard.getText(configurationDomainSource).replace(/\s+/gu, '')
+  const commitSubmitCalls = executableCalls(commit).filter(
+    (call) => call.expression.getText(configurationDomainSource) === 'executePrepared',
+  )
+  const preparedEditSingleSubmit =
+    prepareText.includes('constcommand=structuredClone(input)') &&
+    countOccurrences(prepareText, 'stagePendingConfigurationCommand(') === 1 &&
+    commitText.includes("if(state.kind==='committed')returnstate.result") &&
+    commitText.includes("if(state.kind==='discarded'){returnPromise.reject(") &&
+    commitText.includes(
+      "constresult=executePrepared(command,pending)state={kind:'committed',result}",
+    ) &&
+    commitSubmitCalls.length === 1 &&
+    !callHasIterationAncestor(commitSubmitCalls[0], commit) &&
+    discardText.includes("if(state.kind!=='pending')return") &&
+    discardText.includes("state={kind:'discarded'}") &&
+    executableCalls(discard).every(
+      (call) => call.expression.getText(configurationDomainSource) !== 'executePrepared',
+    )
   const executeConfigurationCommand = findFunction(
     configurationCommandClientSource,
     'executeConfigurationCommand',
@@ -10581,7 +10609,7 @@ function configurationCallerSingleAttemptFacts(program) {
     executeConfigurationCommand,
     'execute',
   )
-  const applicationSubmitCalls = executableCalls(configurationApplicationExecute).filter(
+  const applicationSubmitCalls = executableCalls(configurationApplicationExecutePrepared).filter(
     (call) =>
       call.expression.getText(configurationDomainSource) === 'dependencies.port.execute' &&
       call.arguments[0]?.getText(configurationDomainSource) === 'command',
@@ -10597,11 +10625,21 @@ function configurationCallerSingleAttemptFacts(program) {
       .getText()
       .includes('port: { execute: executeConfigurationCommand }'),
     genericApplicationSingleSubmit:
+      preparedEditSingleSubmit &&
+      configurationApplicationExecute.body.getText(configurationDomainSource) ===
+        'prepare(command).commit()' &&
       applicationSubmitCalls.length === 1 &&
-      !callHasIterationAncestor(applicationSubmitCalls[0], configurationApplicationExecute) &&
-      executableCalls(configurationApplicationExecute).every(
-        (call) => call.expression.getText(configurationDomainSource) !== 'execute',
+      !callHasIterationAncestor(
+        applicationSubmitCalls[0],
+        configurationApplicationExecutePrepared,
+      ) &&
+      executableCalls(configurationApplicationExecutePrepared).every(
+        (call) =>
+          !['execute', 'executePrepared'].includes(
+            call.expression.getText(configurationDomainSource),
+          ),
       ),
+    preparedEditSingleSubmit,
     commandClientSingleSubmit:
       commandClientSubmitCalls.length === 1 &&
       !callHasIterationAncestor(commandClientSubmitCalls[0], configurationCommandExecute) &&
@@ -10748,8 +10786,8 @@ function configurationReplayOwnershipFacts(
             site.offset === undefined
               ? undefined
               : findObjectLiteralAtOffset(configurationDomainSource, site.offset)
-          const executeCalls = calls.filter(
-            (call) => call.expression.getText(configurationDomainSource) === 'execute',
+          const executeCalls = calls.filter((call) =>
+            ['execute', 'prepare'].includes(call.expression.getText(configurationDomainSource)),
           )
           const matchingCalls = executeCalls.filter((call) => {
             const command = call.arguments[0] ? unwrap(call.arguments[0]) : undefined

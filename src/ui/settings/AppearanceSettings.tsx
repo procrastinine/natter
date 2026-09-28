@@ -126,7 +126,6 @@ export function AppearanceSettings() {
   const chatMaxWidthEdit = useSettledConfigurationEdit({
     fieldKey: 'global.chatMaxWidth',
     storedValue: prefs.chatMaxWidth,
-    stage: applyChatMaxWidthToDocument,
     commit: writeChatMaxWidth,
   })
   useEffect(() => {

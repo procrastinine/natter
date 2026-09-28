@@ -19,7 +19,6 @@ import { usePresentationInteraction } from '../../hooks/usePresentationInteracti
 import { useSettledConfigurationEdit } from '../../hooks/useSettledConfigurationEdit'
 import { useTextTemplateLibrary } from '../../hooks/useTextTemplateLibrary'
 import { configurationApplication } from '../../store/configuration-application'
-import { configurationController } from '../../store/configuration-controller'
 import { Button } from '../primitives/Button'
 import { InfoDisclosure } from './InfoDisclosure'
 
@@ -284,23 +283,13 @@ function TemplateConfigEditor({
     fieldKey: templateId ? `text-template.${templateId}.config` : 'customTextTemplate',
     storedValue: config,
     equal: sameTextTemplateConfig,
-    stage(next) {
+    prepare(next) {
       if (templateId) {
-        configurationController.stageTextTemplateConfig(templateId, next)
-      } else if (!readOnly) {
-        configurationController.stageChatSettingsFields(chatId, [
-          { path: ['customTextTemplate'], value: next },
-        ])
+        return configurationApplication.prepareTextTemplateConfig(templateId, next)
       }
-    },
-    async commit(next) {
-      if (templateId) {
-        await configurationApplication.updateTextTemplate(templateId, { config: next })
-      } else if (!readOnly) {
-        await configurationApplication.patchChatSettingsFields(chatId, [
-          { path: ['customTextTemplate'], value: next },
-        ])
-      }
+      return configurationApplication.prepareChatSettingsFields(chatId, [
+        { path: ['customTextTemplate'], value: next },
+      ])
     },
   })
   const patch = (next: Partial<TextTemplateConfig>) => {

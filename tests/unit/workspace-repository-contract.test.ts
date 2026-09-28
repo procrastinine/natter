@@ -76,6 +76,13 @@ let emptyWorkspaceBackup: Awaited<ReturnType<typeof exportWorkspaceBackup>>
 class SerializedLockManager {
   private readonly tails = new Map<string, Promise<void>>()
 
+  async query(): Promise<LockManagerSnapshot> {
+    return {
+      held: [...this.tails.keys()].map((name) => ({ name, mode: 'exclusive' as const })),
+      pending: [],
+    }
+  }
+
   async request<T>(
     name: string,
     optionsOrCallback: LockOptions | ((lock: Lock) => PromiseLike<T> | T),

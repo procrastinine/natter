@@ -558,6 +558,48 @@ describe('UI journey invariant recorder', () => {
     )
   })
 
+  it.each(['present', 'late', 'replaced', 'missing', 'short'] as const)(
+    'checks bottom acquisition at a mutation-only checkpoint with a %s scroll node',
+    async (placement) => {
+      const { recorder, scroll, content } = await acquireBottomFixture(
+        placement !== 'late' && placement !== 'missing',
+      )
+      scroll.scrollTop = placement === 'short' ? 850 : 900
+      if (placement === 'late') content.append(scroll)
+      if (placement === 'replaced') scroll.replaceWith(scroll.cloneNode())
+      content.setAttribute('data-checkpoint', 'mutation')
+
+      const checkpoint = recorder.snapshot('mutation-only-bottom')
+      await flushMutationFrame()
+      const report = await checkpoint
+      expect(report.samples.at(-1)?.reasons).toContain('mutation')
+      if (placement === 'present' || placement === 'late') {
+        expect(report.violations).toEqual([])
+      } else {
+        expect(report.violations.map((violation) => violation.code)).toContain(
+          'acquire-bottom-unfulfilled',
+        )
+      }
+    },
+  )
+
+  it('retains mutation-frame acquisition so a later loss of bottom still fails', async () => {
+    const { recorder, scroll, content } = await acquireBottomFixture()
+    scroll.scrollTop = 900
+    content.setAttribute('data-checkpoint', 'acquired')
+    await flushMutationFrame()
+    expect(recorder.report().violations).toEqual([])
+
+    scroll.scrollTop = 850
+    scroll.dispatchEvent(new Event('scroll', { bubbles: true }))
+    await flushMutationFrame()
+    const checkpoint = recorder.snapshot('lost-bottom')
+    flushFrame()
+    expect((await checkpoint).violations.map((violation) => violation.code)).toEqual(
+      expect.arrayContaining(['acquire-bottom-discontinuity', 'acquire-bottom-unfulfilled']),
+    )
+  })
+
   it('waits for post-mutation layout before checking an acquired bottom', async () => {
     document.body.innerHTML = `
       <div data-ui="shell"><main data-ui="content">
@@ -809,6 +851,33 @@ describe('UI journey invariant recorder', () => {
     )
   })
 })
+
+async function acquireBottomFixture(nodeInitiallyPresent = true) {
+  document.body.innerHTML = '<div data-ui="shell"><main data-ui="content"></main></div>'
+  const content = requiredElement('[data-ui="content"]')
+  const scroll = document.createElement('div')
+  scroll.dataset.ui = 'scroll'
+  Object.defineProperties(scroll, {
+    clientHeight: { configurable: true, value: 100 },
+    scrollHeight: { configurable: true, value: 1_000 },
+  })
+  scroll.scrollTop = 100
+  if (nodeInitiallyPresent) content.append(scroll)
+  topElement = content
+  installUiJourneyInvariantRecorderInPage({
+    shell: { selector: '[data-ui="shell"]', contentSelector: '[data-ui="content"]' },
+  })
+  const recorder = installedRecorder()
+  const armed = recorder.arm()
+  await flushMutationFrame()
+  await armed
+  recorder.markIntent({
+    kind: 'acquire-bottom',
+    id: 'jump-latest',
+    scrollSelector: '[data-ui="scroll"]',
+  })
+  return { recorder, scroll, content }
+}
 
 function installedRecorder(): TestRecorderApi {
   const recorder = (window as TestWindow).__uiJourneyInvariantRecorder

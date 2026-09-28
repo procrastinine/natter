@@ -348,6 +348,24 @@ describe('filterEndpointsByPrivacy — zeroEligible signal', () => {
 })
 
 describe('buildWireProviderPrivacy', () => {
+  it('preserves an explicitly empty manual set when new eligible providers appear', () => {
+    const privacy = cloneDefaultPrivacyPrefs()
+    const result = filterEndpointsByPrivacy({
+      model: 'example/x',
+      endpoints: [ep('New Provider')],
+      policies: { 'New Provider': POLICY_CLEAN },
+      privacy,
+    })
+    expect(
+      buildWireProviderPrivacy(result, privacy, {
+        userTouchedPicker: true,
+        existingOnly: [],
+        existingIgnore: [],
+      }),
+    ).toMatchObject({ only: [], zeroEligible: true })
+    expect(buildWireProviderPrivacy(result, privacy)).toMatchObject({ zeroEligible: false })
+  })
+
   it('emits auto-ignore when the user has not touched the picker', () => {
     // `existingIgnore` empty → wire falls back to the filter's exclusion
     // set. Per the unified allow/disallow model, an empty caller list

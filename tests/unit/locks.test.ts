@@ -18,9 +18,11 @@ import {
   ScopeOrderError,
   scopeResourceName,
   withCoordinationLock,
+  withExclusiveGenerationLifetime,
   withMutationLocks,
   withNamedLock,
   withQuiescedWorkspaceReplacementLock,
+  withSharedGenerationLifetime,
   withTrackedScopes,
 } from '../../src/store/locks'
 import { resumeLocalTransactionAdmissions } from '../../src/store/transaction-activity'
@@ -826,12 +828,17 @@ describe('IndexedDB fallback fencing', () => {
 })
 
 class WorkspaceGateLockManager {
-  private shared = 0
-  private exclusive = false
-  private readonly queue: Array<{
-    mode: LockMode
-    run: () => void
-  }> = []
+  private readonly held = new Map<string, Set<Lock>>()
+  private readonly queues = new Map<string, Array<{ mode: LockMode; run(): void }>>()
+
+  async query(): Promise<LockManagerSnapshot> {
+    return {
+      held: [...this.held.values()].flatMap((locks) => [...locks]),
+      pending: [...this.queues].flatMap(([name, requests]) =>
+        requests.map(({ mode }) => ({ name, mode })),
+      ),
+    }
+  }
 
   request<T>(
     name: string,
@@ -839,41 +846,63 @@ class WorkspaceGateLockManager {
     maybeCallback?: (lock: Lock | null) => T | PromiseLike<T>,
   ): Promise<T> {
     const options = typeof optionsOrCallback === 'function' ? {} : optionsOrCallback
-    const callback =
-      typeof optionsOrCallback === 'function'
-        ? optionsOrCallback
-        : (maybeCallback as NonNullable<typeof maybeCallback>)
-    if (name !== 'workspace:authoritative') return Promise.resolve(callback(null))
+    const callback = typeof optionsOrCallback === 'function' ? optionsOrCallback : maybeCallback
+    if (!callback) throw new Error('LockCallbackMissing')
+    if (options.signal?.aborted) return Promise.reject(options.signal.reason)
     return new Promise<T>((resolve, reject) => {
-      this.queue.push({
+      const queue = this.queues.get(name) ?? []
+      this.queues.set(name, queue)
+      const request = {
         mode: options.mode ?? 'exclusive',
         run: () => {
-          const mode = options.mode ?? 'exclusive'
-          if (mode === 'shared') this.shared += 1
-          else this.exclusive = true
-          void Promise.resolve(callback(null))
-            .then(resolve, reject)
-            .finally(() => {
-              if (mode === 'shared') this.shared -= 1
-              else this.exclusive = false
-              this.drain()
-            })
+          options.signal?.removeEventListener('abort', abort)
+          const lock = { name, mode: request.mode } as Lock
+          const held = this.held.get(name) ?? new Set<Lock>()
+          this.held.set(name, held)
+          held.add(lock)
+          const release = () => {
+            held.delete(lock)
+            if (held.size === 0) this.held.delete(name)
+            this.drain(name)
+          }
+          void Promise.resolve()
+            .then(() => callback(lock))
+            .then(
+              (value) => {
+                release()
+                resolve(value)
+              },
+              (error) => {
+                release()
+                reject(error)
+              },
+            )
         },
-      })
-      this.drain()
+      }
+      const abort = () => {
+        const index = queue.indexOf(request)
+        if (index >= 0) queue.splice(index, 1)
+        reject(options.signal?.reason)
+        this.drain(name)
+      }
+      options.signal?.addEventListener('abort', abort, { once: true })
+      queue.push(request)
+      this.drain(name)
     })
   }
 
-  private drain(): void {
-    if (this.exclusive || this.queue.length === 0) return
-    const next = this.queue[0]
-    if (!next) return
-    if (next.mode === 'exclusive') {
-      if (this.shared !== 0) return
-      this.queue.shift()?.run()
-      return
+  private drain(name: string): void {
+    const queue = this.queues.get(name)
+    const held = this.held.get(name)
+    if ([...(held ?? [])].some((lock) => lock.mode === 'exclusive')) return
+    while (queue?.length) {
+      if (queue[0]?.mode === 'exclusive') {
+        if ((this.held.get(name)?.size ?? 0) === 0) queue.shift()?.run()
+        break
+      }
+      queue.shift()?.run()
     }
-    while (this.queue[0]?.mode === 'shared') this.queue.shift()?.run()
+    if (queue?.length === 0) this.queues.delete(name)
   }
 }
 
@@ -908,5 +937,116 @@ describe('Web Locks workspace gate', () => {
     if (original) Object.defineProperty(navigator, 'locks', original)
     else Reflect.deleteProperty(navigator, 'locks')
     __resetLockTrackerForTests({ admissionsOpen: true })
+  })
+})
+
+describe('generation lifetime admission', () => {
+  async function withManager(run: (manager: WorkspaceGateLockManager) => Promise<void>) {
+    const original = Object.getOwnPropertyDescriptor(navigator, 'locks')
+    const manager = new WorkspaceGateLockManager()
+    Object.defineProperty(navigator, 'locks', { configurable: true, value: manager })
+    try {
+      await run(manager)
+      expect(await manager.query()).toEqual({ held: [], pending: [] })
+    } finally {
+      if (original) Object.defineProperty(navigator, 'locks', original)
+      else Reflect.deleteProperty(navigator, 'locks')
+    }
+  }
+
+  it('lets later generations pass a replacement waiting for an earlier generation', async () => {
+    await withManager(async (manager) => {
+      const entered = deferred()
+      const release = deferred()
+      const first = withSharedGenerationLifetime(async () => {
+        entered.resolve()
+        await release.promise
+      })
+      await entered.promise
+      const replace = vi.fn(() => 'replaced')
+      const replacement = withExclusiveGenerationLifetime(replace)
+      await vi.waitFor(async () => expect((await manager.query()).pending?.length).toBe(1))
+      try {
+        for (let index = 0; index < 3; index += 1) {
+          await expect(withSharedGenerationLifetime(() => index)).resolves.toBe(index)
+          expect(replace).not.toHaveBeenCalled()
+        }
+      } finally {
+        release.resolve()
+        await first
+      }
+      await expect(replacement).resolves.toBe('replaced')
+      expect(replace).toHaveBeenCalledTimes(1)
+    })
+  })
+
+  it('keeps actual replacement exclusive against newly admitted generations', async () => {
+    await withManager(async () => {
+      const entered = deferred()
+      const release = deferred()
+      const replacement = withExclusiveGenerationLifetime(async () => {
+        entered.resolve()
+        await release.promise
+      })
+      await entered.promise
+      const generate = vi.fn(() => 'generated')
+      const generation = withSharedGenerationLifetime(generate)
+      await Promise.resolve()
+      expect(generate).not.toHaveBeenCalled()
+      release.resolve()
+      await replacement
+      await expect(generation).resolves.toBe('generated')
+    })
+  })
+
+  it('cancels a waiting replacement without cancelling any generation or retaining observers', async () => {
+    await withManager(async (manager) => {
+      const entered = deferred()
+      const release = deferred()
+      const generation = withSharedGenerationLifetime(async () => {
+        entered.resolve()
+        await release.promise
+      })
+      await entered.promise
+      const controller = new AbortController()
+      const replace = vi.fn()
+      const replacement = withExclusiveGenerationLifetime(replace, { signal: controller.signal })
+      const rejected = expect(replacement).rejects.toThrow('cancel maintenance')
+      await vi.waitFor(async () => expect((await manager.query()).pending?.length).toBe(1))
+      controller.abort(new Error('cancel maintenance'))
+      await rejected
+      expect((await manager.query()).pending).toEqual([])
+      expect(replace).not.toHaveBeenCalled()
+      await expect(withSharedGenerationLifetime(() => 'next')).resolves.toBe('next')
+      release.resolve()
+      await generation
+    })
+  })
+
+  it('cancels a generation queued behind actual replacement and releases a failed owner', async () => {
+    await withManager(async () => {
+      const entered = deferred()
+      const release = deferred()
+      const replacement = withExclusiveGenerationLifetime(async () => {
+        entered.resolve()
+        await release.promise
+      })
+      await entered.promise
+      const controller = new AbortController()
+      const generate = vi.fn()
+      const generation = withSharedGenerationLifetime(generate, { signal: controller.signal })
+      const rejected = expect(generation).rejects.toThrow('cancel preparation')
+      controller.abort(new Error('cancel preparation'))
+      await rejected
+      expect(generate).not.toHaveBeenCalled()
+      release.resolve()
+      await replacement
+      await expect(
+        withSharedGenerationLifetime(() => {
+          throw new Error('generation failed')
+        }),
+      ).rejects.toThrow('generation failed')
+      await expect(withExclusiveGenerationLifetime(() => 'replaced')).resolves.toBe('replaced')
+    })
   })
 })

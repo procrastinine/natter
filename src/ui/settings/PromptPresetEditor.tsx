@@ -105,10 +105,7 @@ function usePromptSlot(
     fieldKey: `prompt.${kind}`,
     storedValue: storedText,
     settleMs: SAVE_DEBOUNCE_MS,
-    stage: (text) => configurationController.stagePromptField(chat.id, kind, text),
-    async commit(text) {
-      await configurationApplication.commitPromptText(chat.id, kind, text)
-    },
+    prepare: (text) => configurationApplication.preparePromptText(chat.id, kind, text),
   })
   const draft = edit.value
 

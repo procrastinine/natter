@@ -506,7 +506,8 @@ export interface ProviderPreferences {
   only?: string[]
   ignore?: string[]
   // True once the user clicks any provider checkbox. Signals that
-  // `ignore` is the authoritative disallowed list; the wire builder
+  // `only` pins the allowed set (including an explicit empty set) and
+  // `ignore` excludes providers; the wire builder
   // and picker both skip the filter's auto-exclusion when this is set.
   // Stays set even when `ignore` happens to be empty (e.g. user
   // re-enabled every filter-excluded row), so "touched" is distinct

@@ -328,55 +328,84 @@ test('reopening an overflowing chat snaps to the branch leaf instead of preservi
     .toBeGreaterThanOrEqual(pinnedDistance + 800)
 })
 
-test('typing in an expanded composer keeps an overflowing transcript at the bottom', async ({
-  page,
-}) => {
-  const chatId = await seedLinearChat(page, {
-    messageCount: 24,
-    chatId: 'expanded-composer-scroll-chat',
-    title: 'Expanded composer scroll chat',
-    textPrefix: 'expanded composer message',
-    assistantContentType: 'output_text',
-    settings: {
-      'global:message-initial-render-work': 10,
-      'global:message-render-window-load-mode': 'manual',
-    },
-  })
-  await page.goto(`/#/chat/${chatId}`)
-  await page.reload()
-  await expect.poll(() => page.locator('[data-ui="message"]').count()).toBeGreaterThanOrEqual(10)
+for (const sizing of ['manual', 'automatic'] as const) {
+  test(`typing in an expanded ${sizing} composer keeps an overflowing transcript at the bottom`, async ({
+    page,
+  }) => {
+    const chatId = await seedLinearChat(page, {
+      messageCount: 24,
+      chatId: 'expanded-composer-scroll-chat',
+      title: 'Expanded composer scroll chat',
+      textPrefix: 'expanded composer message',
+      assistantContentType: 'output_text',
+      settings: {
+        'global:message-initial-render-work': 10,
+        'global:message-render-window-load-mode': 'manual',
+      },
+    })
+    await page.goto(`/#/chat/${chatId}`)
+    await page.reload()
+    await expect.poll(() => page.locator('[data-ui="message"]').count()).toBeGreaterThanOrEqual(10)
 
-  const region = page.locator('[data-ui="scroll-region"]')
-  const input = page.locator('[data-ui="composer-input"]')
-  const resizeHandle = page.locator('[data-ui="composer-resize-handle"]')
-  await resizeHandle.focus()
-  for (let i = 0; i < 8; i += 1) await resizeHandle.press('Shift+ArrowUp')
-  const expandedHeight = await input.evaluate((node) => node.clientHeight)
-  expect(expandedHeight).toBeGreaterThan(300)
+    const region = page.locator('[data-ui="scroll-region"]')
+    const input = page.locator('[data-ui="composer-input"]')
+    const resizeHandle = page.locator('[data-ui="composer-resize-handle"]')
+    if (sizing === 'manual') {
+      await resizeHandle.focus()
+      for (let i = 0; i < 8; i += 1) await resizeHandle.press('Shift+ArrowUp')
+    } else {
+      await input.fill(`${'draft line\n'.repeat(5)}last line`)
+    }
+    const expandedHeight = await input.evaluate((node) => node.clientHeight)
+    expect(expandedHeight).toBeGreaterThan(sizing === 'manual' ? 300 : 100)
 
-  await input.click()
-  await region.evaluate((node) => {
-    node.scrollTop = node.scrollHeight
-  })
-  await expect
-    .poll(() => region.evaluate((node) => node.scrollHeight > node.clientHeight + 20))
-    .toBe(true)
-  await expect.poll(() => scrollDistanceFromBottom(region)).toBeLessThanOrEqual(4)
-  await expect(region).toHaveAttribute('data-scroll-state', 'follow')
-
-  for (const key of ['x', 'Backspace']) {
-    await input.press(key)
-    await page.evaluate(
-      () =>
-        new Promise<void>((resolve) =>
-          requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
-        ),
-    )
-    expect(await scrollDistanceFromBottom(region), `after ${key}`).toBeLessThanOrEqual(4)
-    expect(await input.evaluate((node) => node.clientHeight)).toBe(expandedHeight)
+    await region.hover()
+    await page.mouse.wheel(0, 100_000)
+    await input.click()
+    await expect
+      .poll(() => region.evaluate((node) => node.scrollHeight > node.clientHeight + 20))
+      .toBe(true)
+    await expect.poll(() => scrollDistanceFromBottom(region)).toBeLessThanOrEqual(4)
     await expect(region).toHaveAttribute('data-scroll-state', 'follow')
-  }
-})
+
+    for (const key of ['x', 'Backspace']) {
+      await input.press(key)
+      await page.evaluate(
+        () =>
+          new Promise<void>((resolve) =>
+            requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+          ),
+      )
+      expect(await scrollDistanceFromBottom(region), `after ${key}`).toBeLessThanOrEqual(4)
+      expect(await input.evaluate((node) => node.clientHeight)).toBe(expandedHeight)
+      await expect(region).toHaveAttribute('data-scroll-state', 'follow')
+    }
+    if (sizing === 'automatic') {
+      for (const action of ['newline', 'delete-line', 'wrap', 'cap'] as const) {
+        if (action === 'newline') await input.press('Shift+Enter')
+        else if (action === 'delete-line') await input.press('Backspace')
+        else await input.fill('wrapped draft '.repeat(action === 'wrap' ? 65 : 200))
+        const frames = await sampleBottomControlFrames(page, 6)
+        expect(frames.every((frame) => frame.state === 'follow' && !frame.jumpVisible)).toBe(true)
+        expect(await scrollDistanceFromBottom(region), action).toBeLessThanOrEqual(4)
+      }
+      await region.hover()
+      await page.mouse.wheel(0, -300)
+      await expect(region).toHaveAttribute('data-scroll-state', 'pinned')
+      await input.click()
+      const pinnedTop = await region.evaluate((node) => node.scrollTop)
+      await input.press('x')
+      await sampleBottomControlFrames(page, 6)
+      expect(await region.evaluate((node) => node.scrollTop)).toBe(pinnedTop)
+      const jump = page.getByRole('button', { name: 'Jump to latest' })
+      await expect(jump).toBeVisible()
+      await expect(jump).toHaveText('')
+      await expect(jump.locator('svg')).toBeVisible()
+      await jump.click()
+      await expect.poll(() => scrollDistanceFromBottom(region)).toBeLessThanOrEqual(4)
+    }
+  })
+}
 
 test('browser find-style native scroll can move upward from the open bottom state', async ({
   page,
@@ -428,6 +457,94 @@ test('browser find-style native scroll can move upward from the open bottom stat
   await page.waitForTimeout(400)
   await expect(region).toHaveAttribute('data-scroll-state', 'pinned', { timeout: 3000 })
   await expect.poll(() => scrollDistanceFromBottom(region), { timeout: 3000 }).toBeGreaterThan(200)
+})
+
+test('native find moves between text matches across virtualized transcript boundaries', async ({
+  page,
+  browserName,
+}) => {
+  test.skip(
+    browserName !== 'firefox',
+    'Firefox exposes its native find selection and nested scrolling through window.find',
+  )
+  const chatId = await seedLinearChat(page, {
+    messageCount: 40,
+    title: 'Native find navigation',
+    textForIndex: (index) =>
+      Array.from(
+        { length: 24 },
+        (_, line) =>
+          `Findprobe message ${index} paragraph ${line}: Lorem ipsum dolor sit amet, consectetur adipiscing elit.`,
+      ).join('\n\n'),
+  })
+  await page.goto(`/#/chat/${chatId}`)
+  const region = page.locator('[data-ui="scroll-region"]')
+  await expect.poll(() => scrollDistanceFromBottom(region)).toBeLessThanOrEqual(4)
+  await expect(page.locator('[data-ui="message-body"]').last()).toContainText(
+    'message 39 paragraph 23',
+  )
+  const find = (query: string, backwards = false) =>
+    page.evaluate(
+      ({ query, backwards }) =>
+        (
+          window as unknown as {
+            find: (query: string, caseSensitive: boolean, backwards: boolean) => boolean
+          }
+        ).find(query, false, backwards),
+      { query, backwards },
+    )
+  const visibleSelection = () =>
+    page.evaluate(() => {
+      const selection = getSelection()
+      const region = document.querySelector('[data-ui="scroll-region"]')
+      if (!selection?.rangeCount || !region) return false
+      const target = selection.getRangeAt(0).getBoundingClientRect()
+      const viewport = region.getBoundingClientRect()
+      return (
+        selection.toString().length > 0 &&
+        target.top >= viewport.top &&
+        target.bottom <= viewport.bottom
+      )
+    })
+  expect(await find('message 30 paragraph 0')).toBe(true)
+  await expect.poll(visibleSelection).toBe(true)
+  await expect(page.locator('[data-ui="message-list"]')).toHaveAttribute('data-virtualized', 'true')
+  const traversal = await page.evaluate(async () => {
+    const nativeFind = window as unknown as {
+      find(query: string, caseSensitive: boolean, backwards: boolean): boolean
+    }
+    const results = []
+    for (const backwards of [false, true]) {
+      for (let match = 0; match < 55; match += 1) {
+        const found = nativeFind.find('Findprobe', false, backwards)
+        const visible: boolean[] = []
+        for (let frame = 0; frame < 6; frame += 1) {
+          await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+          const selection = getSelection()
+          const region = document.querySelector('[data-ui="scroll-region"]')
+          const target = selection?.rangeCount
+            ? selection.getRangeAt(0).getBoundingClientRect()
+            : null
+          const viewport = region?.getBoundingClientRect()
+          visible.push(
+            !!target &&
+              !!viewport &&
+              target.top >= viewport.top &&
+              target.bottom <= viewport.bottom,
+          )
+        }
+        results.push({ backwards, match, found, visible })
+      }
+    }
+    return results
+  })
+  expect(traversal).toHaveLength(110)
+  for (const result of traversal) {
+    expect(result.found, JSON.stringify(result)).toBe(true)
+    expect(result.visible.every(Boolean), JSON.stringify(result)).toBe(true)
+  }
+  expect(await find('message 30 paragraph 0')).toBe(true)
+  await expect.poll(visibleSelection).toBe(true)
 })
 
 test('an active message edit does not trap transcript scrolling in either direction', async ({

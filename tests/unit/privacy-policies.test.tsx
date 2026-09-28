@@ -205,7 +205,7 @@ describe('privacy discovery through the canonical configuration projection', () 
     expect(view.queryByText('Loading…')).toBeNull()
   })
 
-  it('retains one inert provider presentation while a new model target loads', async () => {
+  it('keeps privacy presentation target-local while capability presentation is retained', async () => {
     const oldModelId = 'openai/gpt-5.4'
     const newModelId = 'anthropic/claude-opus-4.7'
     const profile = buildConnectionProfile({
@@ -273,9 +273,12 @@ describe('privacy discovery through the canonical configuration projection', () 
     await waitFor(() => {
       expect(configurationController.getSnapshot().frame.model.status).toBe('ready')
     })
+    const initialProps: { target: ActiveConfigurationSelectionTarget | null } = {
+      target: activeConfigurationTarget(),
+    }
     const { result, rerender } = renderHook(
-      ({ target }) => useModelCatalog(target, profile, { modelsDemanded: true }),
-      { initialProps: { target: activeConfigurationTarget() } },
+      ({ target }) => useModelCatalog(target, target ? profile : null, { modelsDemanded: true }),
+      { initialProps },
     )
     await waitFor(() => expect(result.current.models.models).toHaveLength(2))
     expect(result.current.routing.capabilityPresentation).toMatchObject({
@@ -283,6 +286,15 @@ describe('privacy discovery through the canonical configuration projection', () 
       retained: false,
       endpoints: [{ provider_name: 'Old Provider' }],
     })
+
+    rerender({ target: null })
+    expect(result.current.routing.privacyPresentation).toMatchObject({
+      modelId: oldModelId,
+      retained: true,
+      scrapeApplicable: true,
+      endpoints: [{ provider_name: 'Old Provider' }],
+    })
+    rerender({ target: activeConfigurationTarget() })
 
     const synchronousPublications: ReturnType<typeof configurationController.getSnapshot>[] = []
     act(() => {
@@ -312,6 +324,12 @@ describe('privacy discovery through the canonical configuration projection', () 
     await waitFor(() => expect(result.current.routing.loading).toBe(true))
     expect(result.current.routing.endpoints).toEqual([])
     expect(result.current.routing.capability).toBeNull()
+    expect(result.current.routing.privacyPresentation).toMatchObject({
+      modelId: newModelId,
+      retained: false,
+      endpoints: [],
+      filter: null,
+    })
     expect(result.current.routing.capabilityPresentation).toMatchObject({
       modelId: oldModelId,
       retained: true,
@@ -331,7 +349,7 @@ describe('privacy discovery through the canonical configuration projection', () 
     })
   })
 
-  it('lets routing retain its prior exact profile while another profile stays offline', async () => {
+  it('discards prior privacy providers when the new profile has no cache and stays offline', async () => {
     const oldModelId = 'openai/gpt-5.4'
     const newModelId = 'anthropic/claude-opus-4.7'
     const oldProfile = buildConnectionProfile({
@@ -483,10 +501,10 @@ describe('privacy discovery through the canonical configuration projection', () 
     })
     await waitFor(() => expect(result.current.routing.offline).toBe(true))
     expect(result.current.routing.privacyPresentation).toMatchObject({
-      profileId: oldProfile.id,
-      modelId: oldModelId,
-      retained: true,
-      endpoints: [{ provider_name: 'Old Provider' }],
+      profileId: newProfile.id,
+      modelId: newModelId,
+      retained: false,
+      endpoints: [{ provider_name: 'New Provider' }],
     })
   })
 

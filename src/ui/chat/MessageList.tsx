@@ -187,11 +187,6 @@ const MessageListSurface = memo(function MessageListSurface(props: MessageListSu
   const windowLoadVisible = hiddenOlderCount > 0 || canRetryLoadedBodies
   const branchLength = activePath?.length ?? 0
   const [insertTarget, setInsertTarget] = useState<InsertTarget | null>(null)
-  // Track the set of user-message ids whose content was edited in THIS
-  // tab session; used to surface the "stale reply?" hint under their
-  // next assistant on the active path. The stale-session lives only in
-  // memory — reloads wipe it per §10.6 "Edit action" session-local hint.
-  const [staleHintFor, setStaleHintFor] = useState<Set<MessageId>>(() => new Set())
   const contextPreviewPath = useStreamStableBranchPath(activePath, contextPreviewFrozen)
   // Prefill UI gating for the inline editor's "Save & Send" path. The
   // button hides on `unsupported` models (Claude ≥ 4.6 / OpenAI / gpt-oss);
@@ -309,20 +304,8 @@ const MessageListSurface = memo(function MessageListSurface(props: MessageListSu
       authoring?: MessageBodyAuthoringOperations,
       attachmentRefs?: MessageAttachmentRef[],
     ) => {
-      return runConversationMutation(
-        { kind: 'edit', chatId, messageId: m.id },
-        (signal) =>
-          conversationActions.editMessage(chatId, m, text, signal, authoring, attachmentRefs),
-        m.role === 'user'
-          ? () => {
-              setStaleHintFor((prev) => {
-                if (prev.has(m.id)) return prev
-                const next = new Set(prev)
-                next.add(m.id)
-                return next
-              })
-            }
-          : undefined,
+      return runConversationMutation({ kind: 'edit', chatId, messageId: m.id }, (signal) =>
+        conversationActions.editMessage(chatId, m, text, signal, authoring, attachmentRefs),
       )
     },
     [chatId, runConversationMutation],
@@ -829,8 +812,12 @@ const MessageListSurface = memo(function MessageListSurface(props: MessageListSu
       fork,
     }: RenderableMessageRow): ReactNode => {
       const rowMutationsUnavailable = mutationsUnavailable || intentOnly
+      const parent = m.parentId ? activePath?.get(m.parentId) : undefined
       const showStaleHint =
-        m.role === 'assistant' && m.parentId !== null && staleHintFor.has(m.parentId)
+        m.role === 'assistant' &&
+        parent?.role === 'user' &&
+        parent.editedAt !== undefined &&
+        parent.editedAt > (m.generation?.startedAt ?? m.createdAt)
       const branchContext = fork ?? branchSpine?.forkFor(m.id)
       const hasSiblingVariants = (branchContext?.liveCount ?? 0) > 1
       return (
@@ -907,7 +894,7 @@ const MessageListSurface = memo(function MessageListSurface(props: MessageListSu
       prefillSupported,
       mutationsUnavailable,
       roleMismatchIdsOnPath,
-      staleHintFor,
+      activePath,
       structuralMutationPending,
       onCancelStructuralMutation,
       presentationFence,

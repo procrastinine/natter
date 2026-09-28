@@ -496,6 +496,7 @@ export interface ConfigurationController {
   openEditSession(input: ConfigurationEditSessionInput): ConfigurationEditSession
   trackDetachedEdit<T>(chatId: ChatId, operation: Promise<T>): Promise<T>
   flushChatEdits(chatId: ChatId): Promise<void>
+  flushGenerationEdits(chatId: ChatId | null): Promise<void>
   flushWorkspaceEdits(ownerKey: string): Promise<void>
   stageChatSettingsIntent(
     chatId: ChatId,
@@ -1177,6 +1178,24 @@ class TabConfigurationController implements ConfigurationController {
     const sessions = [...(this.editSessions.get(chatId)?.values() ?? [])]
     if (sessions.length === 0) return
     const results = await Promise.allSettled(sessions.map((session) => session.flush()))
+    const failed = results.find(
+      (result): result is PromiseRejectedResult => result.status === 'rejected',
+    )
+    if (failed) throw failed.reason
+  }
+
+  async flushGenerationEdits(chatId: ChatId | null): Promise<void> {
+    const target = this.frameTarget
+    const templateId =
+      (target.kind === 'chat' && target.chatId === chatId) ||
+      (target.kind === 'new-chat' && chatId === null)
+        ? target.settings.textTemplate
+        : undefined
+    const results = await Promise.allSettled([
+      ...(chatId === null ? [] : [this.flushChatEdits(chatId)]),
+      ...GENERATION_GLOBAL_PREFERENCE_KEYS.map((key) => this.flushWorkspaceEdits(key)),
+      ...(templateId ? [this.flushWorkspaceEdits(`text-template:${templateId}`)] : []),
+    ])
     const failed = results.find(
       (result): result is PromiseRejectedResult => result.status === 'rejected',
     )

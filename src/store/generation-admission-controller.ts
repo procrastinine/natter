@@ -14,6 +14,7 @@ import type {
   MessageId,
   PresetId,
 } from '../core/types'
+import { raceWithAbortSignal } from '../lib/abort'
 import { newId } from '../lib/ulid'
 import {
   type AttemptTargetAdmissionClaim,
@@ -459,6 +460,9 @@ class TabGenerationAdmissionController implements GenerationAdmissionController 
       release()
     }
     try {
+      const chatId =
+        captured.request.intent.kind === 'new-chat-send' ? null : captured.request.intent.chatId
+      await raceWithAbortSignal(() => configurationController.flushGenerationEdits(chatId), signal)
       for (;;) {
         throwIfGenerationAdmissionAborted(signal)
         const configurationResolution = resolveSettlingConfiguration(captured)

@@ -9,7 +9,7 @@ import type { PrivacyTier } from '../../core/privacy-filter'
 import { ProviderEndpointIndex, providerEndpointKey } from '../../core/provider-identity'
 import type { Chat } from '../../core/types'
 import type { UsePrivacyRoutingResult } from '../../hooks/useModelCatalog'
-import { CloseIcon, LockIcon, LockOpenIcon } from '../icons/Icon'
+import { CheckIcon, CloseIcon, LockIcon, LockOpenIcon } from '../icons/Icon'
 import { IconButton } from '../primitives/Button'
 import {
   buildPickerRows,
@@ -177,7 +177,14 @@ function PopoverRow({
         <LockIcon size={12} />
       </span>
       <span data-ui="header-privacy-row-name">{endpointIndex.displayLabel(row.endpoint)}</span>
-      <span data-ui="header-privacy-row-state">{isKept ? 'in use' : 'excluded'}</span>
+      <span
+        data-ui="header-privacy-row-state"
+        role="img"
+        aria-label={isKept ? 'In use' : 'Excluded'}
+        title={isKept ? 'In use' : 'Excluded'}
+      >
+        {isKept ? <CheckIcon size={14} /> : <CloseIcon size={14} />}
+      </span>
     </li>
   )
 }

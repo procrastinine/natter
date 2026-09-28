@@ -23,6 +23,7 @@ const DEFAULT_FALLBACK_LOCK_RENEW_MS = 3_000
 const DEFAULT_FALLBACK_LOCK_RETRY_MS = 100
 const WORKSPACE_AUTHORITATIVE_GATE = 'workspace:authoritative'
 const GENERATION_LIFETIME_GATE = 'workspace:generation-lifetime'
+const GENERATION_OWNER_PREFIX = 'workspace:generation-owner:'
 const COORDINATION_LOCK_PREFIX = 'natter:coordination:'
 const LOCK_WAKE_CHANNEL_NAME = 'natter:lock-wake:v1'
 
@@ -966,32 +967,65 @@ export function withSharedAuthoritativeCommandSession<T>(
   )
 }
 
-export function withSharedGenerationLifetime<T>(
+export async function withSharedGenerationLifetime<T>(
   operation: () => Promise<T> | T,
   options: { signal?: AbortSignal } = {},
 ): Promise<T> {
   const signal = options.signal
   if (signal?.aborted) return Promise.reject(abortError(signal))
   if (!hasWebLocks()) return Promise.resolve().then(operation)
-  return navigator.locks.request(
+  const manager = navigator.locks
+  const ownerName = `${GENERATION_OWNER_PREFIX}${newId()}`
+  let entered!: () => void
+  let failed!: (error: unknown) => void
+  const acquired = new Promise<void>((resolve, reject) => {
+    entered = resolve
+    failed = reject
+  })
+  let completed!: Promise<T>
+  await manager.request(
     GENERATION_LIFETIME_GATE,
     { mode: 'shared', ...(signal ? { signal } : {}) },
-    operation,
+    () => {
+      completed = manager.request(ownerName, { ...(signal ? { signal } : {}) }, () => {
+        entered()
+        return operation()
+      })
+      void completed.catch(failed)
+      return acquired
+    },
   )
+  return completed
 }
 
-export function withExclusiveGenerationLifetime<T>(
+export async function withExclusiveGenerationLifetime<T>(
   operation: () => Promise<T> | T,
   options: { signal?: AbortSignal } = {},
 ): Promise<T> {
   const signal = options.signal
   if (signal?.aborted) return Promise.reject(abortError(signal))
   if (!hasWebLocks()) return Promise.reject(new Error('GenerationLifetimeGateUnavailable'))
-  return navigator.locks.request(
-    GENERATION_LIFETIME_GATE,
-    { mode: 'exclusive', ...(signal ? { signal } : {}) },
-    operation,
-  )
+  const manager = navigator.locks
+  for (;;) {
+    const result = await manager.request(
+      GENERATION_LIFETIME_GATE,
+      { mode: 'exclusive', ...(signal ? { signal } : {}) },
+      async () => {
+        const snapshot = await manager.query()
+        const owners = (snapshot.held ?? []).flatMap((lock) =>
+          lock.name?.startsWith(GENERATION_OWNER_PREFIX) ? [lock.name] : [],
+        )
+        if (owners.length > 0) return { kind: 'pending' as const, owners }
+        return { kind: 'completed' as const, value: await operation() }
+      },
+    )
+    if (result.kind === 'completed') return result.value
+    await Promise.all(
+      result.owners.map((name) =>
+        manager.request(name, { mode: 'shared', ...(signal ? { signal } : {}) }, () => undefined),
+      ),
+    )
+  }
 }
 
 async function runWithLockRuntime<T>(

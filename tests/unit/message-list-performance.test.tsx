@@ -84,6 +84,28 @@ afterEach(() => {
 })
 
 describe('message-list current presentation contract', () => {
+  it.each([
+    { editAt: 200, replyAt: 100, stale: true },
+    { editAt: 200, replyAt: 300, stale: false },
+    { editAt: 400, replyAt: 300, stale: true },
+  ])(
+    'derives reply staleness from this reply, including after remount: $editAt/$replyAt',
+    ({ editAt, replyAt, stale }) => {
+      const fixture = branchFixture(2, { editAt, replyAt })
+      const view = renderList(fixture, fixture.window(0, 2))
+      const info = view.getAllByRole('button', { name: 'Show message info' })[1]
+      if (!info) throw new Error('ReplyInfoMissing')
+      fireEvent.click(info)
+      const warning = 'Previous user message was edited after this reply — text may be stale.'
+      expect(view.queryByText(warning) !== null).toBe(stale)
+      view.unmount()
+      const reloaded = renderList(fixture, fixture.window(0, 2))
+      const reloadedInfo = reloaded.getAllByRole('button', { name: 'Show message info' })[1]
+      if (!reloadedInfo) throw new Error('ReloadedReplyInfoMissing')
+      fireEvent.click(reloadedInfo)
+      expect(reloaded.queryByText(warning) !== null).toBe(stale)
+    },
+  )
   it('exposes the hydrated transcript window through an additions-only log', () => {
     const fixture = branchFixture(5)
     const view = renderList(fixture, fixture.window(2, 3))
@@ -414,7 +436,12 @@ interface BranchFixture {
 
 function branchFixture(
   count: number,
-  options: { bodyPrefix?: string; cachedTokenEstimate?: number } = {},
+  options: {
+    bodyPrefix?: string
+    cachedTokenEstimate?: number
+    editAt?: number
+    replyAt?: number
+  } = {},
 ): BranchFixture {
   const messages: Message[] = []
   for (let index = 0; index < count; index += 1) {
@@ -426,6 +453,14 @@ function branchFixture(
         options.cachedTokenEstimate,
       ),
     )
+  }
+  if (options.editAt !== undefined && messages[0]) messages[0].editedAt = options.editAt
+  if (options.replyAt !== undefined && messages[1]) {
+    messages[1].generation = {
+      startedAt: options.replyAt,
+      reasoningCarryForward: 'none',
+      reasoningVisibility: { disclosure: 'unknown' },
+    }
   }
   const headers = messages.map((message) => splitMessageForStorage(message).header)
   const path = createBranchPath(headers)

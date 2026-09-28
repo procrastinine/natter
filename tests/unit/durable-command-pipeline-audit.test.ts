@@ -128,7 +128,7 @@ describe('durable command commit pipeline audit', () => {
       workspaceCommands: 65,
       workspaceConstructorSites: 75,
       configurationCommands: 44,
-      configurationConstructorSites: 47,
+      configurationConstructorSites: 50,
       configurationConstructorGaps: 0,
       pipelineRecords: 109,
       requiredStages: 15,
@@ -3035,6 +3035,31 @@ describe('durable command commit pipeline audit', () => {
       ),
     ).toBe(true)
   })
+
+  it('rejects prepared edits that can submit again after their first commit', async () => {
+    const path = 'src/store/configuration-domain.ts'
+    const source = readFileSync(resolve(ROOT, path), 'utf8')
+    const guard = "if (state.kind === 'committed') return state.result"
+    expect(source).toContain(guard)
+    const { createProductionTypeScriptProgram } = (await import(TYPESCRIPT_SOURCE_URL)) as {
+      createProductionTypeScriptProgram(
+        root: string,
+        options: { sourceTextOverrides: Readonly<Record<string, string>> },
+      ): unknown
+    }
+    const mutated = buildDurableCommandPipelineSourceFacts({
+      program: createProductionTypeScriptProgram(ROOT, {
+        sourceTextOverrides: { [path]: source.replace(guard, '') },
+      }),
+    }) as {
+      readonly configurationReplayOwnership: {
+        readonly caller: { readonly preparedEditSingleSubmit: boolean }
+        readonly commonKernel: { readonly ordinaryOwned: boolean }
+      }
+    }
+    expect(mutated.configurationReplayOwnership.caller.preparedEditSingleSubmit).toBe(false)
+    expect(mutated.configurationReplayOwnership.commonKernel.ordinaryOwned).toBe(false)
+  }, 30_000)
 
   it('withholds all 33 configuration replay cells without their typed ingress proof', () => {
     const facts = sourceFacts as {

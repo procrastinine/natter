@@ -414,8 +414,13 @@
 }
 
 [data-ui="header-privacy-row-state"] {
-  color: var(--color-fg-muted);
-  font-variant-numeric: tabular-nums;
+  display: inline-flex;
+  align-items: center;
+  color: var(--color-success);
+}
+
+[data-ui="header-privacy-row"][data-allowed="false"] [data-ui="header-privacy-row-state"] {
+  color: var(--color-danger);
 }
 
 [data-ui="header-privacy-row"][data-allowed="false"] [data-ui="header-privacy-row-name"] {

@@ -447,7 +447,9 @@ const REGISTRY: Record<string, QuirksEntry> = {
   'gpt-3.5-turbo-instruct': { responsesSupport: 'chat-only' },
 }
 
-const REGISTRY_KEYS_BY_LENGTH = Object.keys(REGISTRY).sort((a, b) => b.length - a.length)
+const REGISTRY_ENTRIES_BY_LENGTH = Object.entries(REGISTRY)
+  .sort(([a], [b]) => b.length - a.length)
+  .map(([key, entry]) => ({ normalizedKey: canonicalCompatModelId(key), entry }))
 
 // OSS / Chinese-lab thinking-model FAMILIES — match by family root only so
 // future versions (`gemma-5`, `kimi-k3`, `qwen-4`, `deepseek-v5`, …) get the
@@ -605,11 +607,9 @@ function claudeFamilyQuirks(normalized: string): QuirksEntry | null {
 
 export function quirksFor(modelId: string): QuirksEntry {
   const normalized = canonicalCompatModelId(modelId)
-  for (const key of REGISTRY_KEYS_BY_LENGTH) {
-    const normalizedKey = canonicalCompatModelId(key)
+  for (const { normalizedKey, entry } of REGISTRY_ENTRIES_BY_LENGTH) {
     if (normalized === normalizedKey || normalized.startsWith(`${normalizedKey}-`)) {
-      const entry = REGISTRY[key]
-      if (entry) return entry
+      return entry
     }
   }
   const openAiGpt54Plus = openAiGpt54PlusFamilyQuirks(normalized)

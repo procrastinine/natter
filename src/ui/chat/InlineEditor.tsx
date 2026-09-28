@@ -78,23 +78,16 @@ const MAX_TEXTAREA_PX = 600
 
 interface InlineEditorSession {
   active: boolean
-  textareaHeight: number | null
 }
 
-function sizeTextarea(el: HTMLTextAreaElement | null, fixedHeight: number | null): number | null {
-  if (!el) return fixedHeight
-  if (fixedHeight !== null) {
-    el.style.height = `${fixedHeight}px`
-    el.style.overflowY = el.scrollHeight > el.clientHeight ? 'auto' : 'hidden'
-    return fixedHeight
-  }
+function sizeTextarea(el: HTMLTextAreaElement | null): void {
+  if (!el) return
   el.style.height = 'auto'
   el.style.overflowY = 'hidden'
   const measuredHeight = el.scrollHeight
   const next = Math.min(measuredHeight, MAX_TEXTAREA_PX)
   el.style.height = `${next}px`
   el.style.overflowY = measuredHeight > el.clientHeight ? 'auto' : 'hidden'
-  return el.getBoundingClientRect().height || el.clientHeight || next
 }
 
 export function InlineEditor({
@@ -149,7 +142,7 @@ export function InlineEditor({
   const actionsRef = useRef<HTMLDivElement | null>(null)
   const scrollRegionCommands = useScrollRegionCommands()
   const prefillTextareaRef = useRef<HTMLTextAreaElement | null>(null)
-  const sessionRef = useRef<InlineEditorSession>({ active: false, textareaHeight: null })
+  const sessionRef = useRef<InlineEditorSession>({ active: false })
   const pendingGenerationRef = useRef<Extract<GenerationSubmission, { kind: 'started' }> | null>(
     null,
   )
@@ -212,8 +205,7 @@ export function InlineEditor({
   // biome-ignore lint/correctness/useExhaustiveDependencies: text changes alter textarea scrollHeight.
   useLayoutEffect(() => {
     const resize = () => {
-      const session = sessionRef.current
-      session.textareaHeight = sizeTextarea(textareaRef.current, session.textareaHeight)
+      sizeTextarea(textareaRef.current)
     }
     if (scrollRegionCommands) {
       scrollRegionCommands.preserveTextEditingViewport(resize)
@@ -233,8 +225,7 @@ export function InlineEditor({
       if (!entry || Math.abs(entry.contentRect.width - measuredWidth) < 0.5) return
       measuredWidth = entry.contentRect.width
       const resize = () => {
-        const session = sessionRef.current
-        session.textareaHeight = sizeTextarea(el, session.textareaHeight)
+        sizeTextarea(el)
       }
       if (scrollRegionCommands) {
         scrollRegionCommands.preserveTextEditingViewport(resize)

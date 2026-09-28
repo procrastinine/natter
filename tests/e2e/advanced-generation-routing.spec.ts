@@ -6,8 +6,11 @@ import {
   clearIndexedDb,
   createChatAndOpen,
   firstChatId,
+  holdIndexedDbStoreGate,
+  readChatRow,
   readMessages,
   seedFirstRun,
+  seedLinearChat,
   waitForAssistantGenerationFinished,
 } from './helpers'
 
@@ -26,6 +29,165 @@ type CapturedRequest = {
 
 test.beforeEach(async ({ page }) => {
   await clearIndexedDb(page)
+})
+
+test('consecutive regenerations finish with nineteen idle tabs on other chats', async ({
+  page,
+}) => {
+  test.setTimeout(120_000)
+  const requests: CapturedRequest[] = []
+  const replies = [
+    'Original reply.',
+    'First regeneration.',
+    'Second regeneration.',
+    'Third regeneration.',
+  ] as const
+  await mockOpenRouterDiscovery(page, OR_CHAT_MODEL)
+  await mockChatCompletionsCapture(page, requests, replies)
+  await seedFirstRun(page, {
+    model: OR_CHAT_MODEL,
+    disablePrivacyFilter: false,
+    corsProxyUrl: '/_or_scrape',
+  })
+  await sendAndExpectAssistant(page, 'Regenerate this prompt repeatedly.', replies[0])
+  const peers: Page[] = []
+  for (let index = 0; index < 19; index += 1) {
+    const peer = await page.context().newPage()
+    peers.push(peer)
+    await mockOpenRouterDiscovery(peer, OR_CHAT_MODEL)
+    await peer.goto('/')
+    await seedLinearChat(peer, {
+      messageCount: 2,
+      chatId: `idle-peer-${index}`,
+      title: `Idle peer ${index}`,
+    })
+  }
+  const assistant = page.locator('[data-ui="message"][data-role="assistant"]').last()
+  for (const reply of replies.slice(1)) {
+    await assistant.getByRole('button', { name: 'Regenerate response', exact: true }).click()
+    await expect(assistant.locator('[data-ui="message-body"]')).toContainText(reply)
+    await expect(page.locator('[data-ui="abort"]')).toHaveCount(0)
+    await expect(page.getByRole('button', { name: 'Cancel preparing', exact: true })).toHaveCount(0)
+  }
+  expect(requests).toHaveLength(replies.length)
+  await Promise.all(peers.map((peer) => peer.close()))
+})
+
+test('context edits persist through regeneration, preset save, continuation and reload without stranded preparation', async ({
+  page,
+}) => {
+  const requests: CapturedRequest[] = []
+  await mockOpenRouterDiscovery(page, OR_CHAT_MODEL)
+  await mockChatCompletionsCapture(page, requests, [
+    'Original reply.',
+    'Fresh reply.',
+    'Next reply.',
+    ' Continued.',
+  ])
+  await seedFirstRun(page, {
+    model: OR_CHAT_MODEL,
+    disablePrivacyFilter: false,
+    corsProxyUrl: '/_or_scrape',
+  })
+  await createChatAndOpen(page)
+  await sendAndExpectAssistant(page, 'Original prompt.', 'Original reply.')
+  const user = page.locator('[data-ui="message"][data-role="user"]').first()
+  await user.getByRole('button', { name: 'Edit message', exact: true }).click()
+  await user.locator('[data-ui="inline-editor-input"]').fill('Edited prompt.')
+  await user.getByRole('button', { name: 'Save', exact: true }).click()
+  await expect(user.locator('[data-ui="inline-editor-input"]')).toHaveCount(0)
+  await expect(user.locator('[data-ui="message-body"]')).toHaveText('Edited prompt.')
+  const assistant = page.locator('[data-ui="message"][data-role="assistant"]').last()
+  await assistant.getByRole('button', { name: 'Show message info', exact: true }).click()
+  const warning = 'Previous user message was edited after this reply — text may be stale.'
+  await expect(assistant).toContainText(warning)
+
+  await openSettingsPanel(page)
+  await page.getByRole('tab', { name: 'Context', exact: true }).click()
+  const contextNumber = page.locator('[data-ui="slider-number"]').first()
+  await contextNumber.fill('8192')
+  await contextNumber.press('Enter')
+  const contextSlider = page.locator('[data-ui="slider"]').first()
+  await contextSlider.focus()
+  await contextSlider.press('ArrowRight')
+  await assistant.getByRole('button', { name: 'Regenerate response', exact: true }).click()
+  await expect(assistant).toContainText('Fresh reply.')
+  await assistant.getByRole('button', { name: 'Show message info', exact: true }).click()
+  await expect(assistant).not.toContainText(warning)
+  expect(JSON.stringify(requests[1]?.body)).toContain('Edited prompt.')
+  const chatId = await firstChatId(page)
+  await expect
+    .poll(async () => (await readChatRow(page, chatId)).settings)
+    .toMatchObject({ customMaxContext: 8193 })
+
+  const completionNumber = page.locator('[data-ui="slider-number"]').nth(1)
+  await completionNumber.fill('256')
+  await completionNumber.press('Enter')
+  await contextSlider.focus()
+  await contextSlider.press('ArrowRight')
+  await page.locator('[data-ui="preset-breadcrumb-button"]').click()
+  await page.getByTitle('Save current settings to this preset', { exact: true }).click()
+  await expect(page.locator('[data-ui="preset-diverged"]')).toHaveCount(0)
+  await page.reload()
+  await openSettingsPanel(page)
+  await page.getByRole('tab', { name: 'Context', exact: true }).click()
+  await expect(contextNumber).toHaveValue('8194')
+  await expect(completionNumber).toHaveValue('256')
+  await expect(page.locator('[data-ui="preset-diverged"]')).toHaveCount(0)
+  await sendAndExpectAssistant(page, 'Next prompt.', 'Next reply.')
+  expect(requests[2]?.body.max_tokens ?? requests[2]?.body.max_completion_tokens).toBe(256)
+  await contextSlider.focus()
+  await contextSlider.press('ArrowRight')
+  await assistant.getByRole('button', { name: 'Continue from here', exact: true }).click()
+  await expect(assistant).toContainText('Continued.')
+  await expect
+    .poll(async () => (await readChatRow(page, chatId)).settings)
+    .toMatchObject({ customMaxContext: 8195 })
+  await expect(page.getByRole('button', { name: 'Cancel preparing', exact: true })).toHaveCount(0)
+})
+
+test('cancel preparing releases a settings-blocked send and a later send uses the saved edit', async ({
+  page,
+}) => {
+  const requests: CapturedRequest[] = []
+  await mockOpenRouterDiscovery(page, OR_CHAT_MODEL)
+  await mockChatCompletionsCapture(page, requests, ['Original reply.', 'Retry reply.'])
+  await seedFirstRun(page, {
+    model: OR_CHAT_MODEL,
+    disablePrivacyFilter: false,
+    corsProxyUrl: '/_or_scrape',
+  })
+  await sendAndExpectAssistant(page, 'Original prompt.', 'Original reply.')
+  const chatId = await firstChatId(page)
+  await openSettingsPanel(page)
+  await page.getByRole('tab', { name: 'Context', exact: true }).click()
+  const input = page.locator('[data-ui="composer-input"]')
+  await input.fill('Keep this pending draft.')
+  const releaseSettings = await holdIndexedDbStoreGate(page, ['chats'])
+  try {
+    const contextNumber = page.locator('[data-ui="slider-number"]').first()
+    await contextNumber.fill('8192')
+    await contextNumber.press('Enter')
+    await input.press('Enter')
+    const cancel = page.getByRole('button', { name: 'Cancel preparing', exact: true })
+    await expect(cancel).toBeVisible()
+    await cancel.click()
+    await expect(cancel).toHaveCount(0)
+    await expect(input).toHaveValue('Keep this pending draft.')
+    expect(requests).toHaveLength(1)
+  } finally {
+    await releaseSettings()
+  }
+  await expect
+    .poll(async () => (await readChatRow(page, chatId)).settings)
+    .toMatchObject({ customMaxContext: 8192 })
+  expect(requests).toHaveLength(1)
+  await input.press('Enter')
+  await expect(page.locator('[data-ui="message"][data-role="assistant"]').last()).toContainText(
+    'Retry reply.',
+  )
+  expect(requests).toHaveLength(2)
+  expect(JSON.stringify(requests[1]?.body)).toContain('Keep this pending draft.')
 })
 
 test('GUI OpenRouter Responses GPT-5.4 xhigh reasoning and Continue stay on the unified planner', async ({
@@ -388,7 +550,11 @@ test('GUI OpenAI direct hosted tools serialize only as Responses tools', async (
   await expect(tools.locator('h3')).toContainText('OpenAI tools')
   const webSearch = tools.getByRole('checkbox', { name: 'Web search' })
   const imageGeneration = tools.getByRole('checkbox', { name: 'Image generation' })
+  const chatId = await firstChatId(page)
   await webSearch.click()
+  await expect
+    .poll(async () => (await readChatRow(page, chatId)).settings)
+    .toHaveProperty('tools.openai.enabledServerToolIds', ['web-search'])
   await imageGeneration.click()
   await expect(webSearch).toBeChecked()
   await expect(imageGeneration).toBeChecked()
@@ -510,7 +676,13 @@ test('GUI manual provider allow updates privacy badge and overrides red tiers', 
     .locator('[data-ui="header-privacy-row"]')
     .filter({ hasText: 'Fast Retain' })
   await expect(popoverFastRetain).toHaveAttribute('data-allowed', 'true')
-  await expect(popoverFastRetain).toContainText('in use')
+  await expect(popoverFastRetain.getByRole('img', { name: 'In use' })).toBeVisible()
+  await expect(popoverFastRetain.locator('[data-ui="header-privacy-row-state"]')).toHaveText('')
+  const popoverTraining = page
+    .locator('[data-ui="header-privacy-row"]')
+    .filter({ hasText: 'Training Host' })
+  await expect(popoverTraining.getByRole('img', { name: 'Excluded' })).toBeVisible()
+  await expect(popoverTraining.locator('[data-ui="header-privacy-row-state"]')).toHaveText('')
   await page.keyboard.press('Escape')
 
   const trainingRow = page
@@ -536,6 +708,166 @@ test('GUI manual provider allow updates privacy badge and overrides red tiers', 
 
   expectNoConsoleProblems(consoleLines)
 })
+
+test('GUI manual selections pin new providers across reload, preset restore, bulk selection and reset', async ({
+  page,
+}) => {
+  const requests: CapturedRequest[] = []
+  const discovered = [endpoint('Original', 131_072, ['provider'], { data_policy: policy({}) })]
+  await mockOpenRouterDiscovery(page, OR_CHAT_MODEL)
+  await page.route('https://openrouter.ai/api/v1/models/**/endpoints', async (route) => {
+    await route.fulfill({ json: { data: { id: OR_CHAT_MODEL, endpoints: discovered } } })
+  })
+  await mockChatCompletionsCapture(page, requests, ['pinned provider ok'])
+  await seedFirstRun(page, {
+    model: OR_CHAT_MODEL,
+    disablePrivacyFilter: false,
+    corsProxyUrl: '/_or_scrape',
+  })
+  await createChatAndOpen(page)
+  await openSettingsPanel(page)
+  await expect(page.getByLabel('Use Original', { exact: true })).toBeChecked()
+  await page.getByRole('radio', { name: 'Throughput' }).click()
+  discovered.push(
+    endpoint('Automatic newcomer', 131_072, ['provider'], { data_policy: policy({}) }),
+  )
+  await page.getByRole('button', { name: 'Reload providers' }).click()
+  await expect(page.getByLabel('Use Automatic newcomer', { exact: true })).toBeChecked()
+  await page.getByLabel('Use Original', { exact: true }).uncheck()
+  const chatId = await firstChatId(page)
+  await expect
+    .poll(async () => (await readChatRow(page, chatId)).settings)
+    .toMatchObject({ providerPrefs: { only: ['Automatic newcomer'] } })
+  await saveProviderPreset(page, 'Pinned providers')
+
+  discovered.push(endpoint('Manual newcomer', 131_072, ['provider'], { data_policy: policy({}) }))
+  await page.reload()
+  await openSettingsPanel(page)
+  await page.getByRole('button', { name: 'Reload providers' }).click()
+  await expect(page.getByLabel('Use Manual newcomer', { exact: true })).not.toBeChecked()
+  await expect(page.getByLabel('Use Automatic newcomer', { exact: true })).toBeChecked()
+  await sendAndExpectAssistant(page, 'use the saved selection', 'pinned provider ok')
+  expect(requests).toHaveLength(1)
+  expect(requests[0]?.body.provider).toMatchObject({
+    only: ['Automatic newcomer'],
+    sort: 'throughput',
+  })
+
+  await page.getByRole('button', { name: 'Select all', exact: true }).click()
+  await expect(page.getByLabel('Use Manual newcomer', { exact: true })).toBeChecked()
+  await loadProviderPreset(page, 'Pinned providers')
+  await expect(page.getByLabel('Use Manual newcomer', { exact: true })).not.toBeChecked()
+  await expect(page.getByLabel('Use Original', { exact: true })).not.toBeChecked()
+  await page.getByRole('button', { name: 'Deselect all', exact: true }).click()
+  await expect
+    .poll(async () => (await readChatRow(page, chatId)).settings)
+    .toMatchObject({ providerPrefs: { only: [] } })
+  discovered.push(
+    endpoint('Empty-set newcomer', 131_072, ['provider'], { data_policy: policy({}) }),
+  )
+  await page.getByRole('button', { name: 'Reload providers' }).click()
+  await expect(page.getByLabel('Use Empty-set newcomer', { exact: true })).not.toBeChecked()
+  await expect(page.locator('[data-ui="provider-picker-toggle"] input:checked')).toHaveCount(0)
+  await page.getByRole('button', { name: 'Reset to default', exact: true }).click()
+  await expect(page.locator('[data-ui="provider-picker-toggle"] input:checked')).toHaveCount(4)
+  await expect
+    .poll(async () => (await readChatRow(page, chatId)).settings)
+    .not.toHaveProperty('providerPrefs.only')
+})
+
+test('GUI switching saved GLM and GPT presets replaces providers, sort, privacy badge and outbound selection', async ({
+  page,
+}) => {
+  const glm = 'z-ai/glm-5.2'
+  const gpt = OR_BOTH_CHAT_ROUTES_MODEL
+  const requests: CapturedRequest[] = []
+  await mockOpenRouterDiscovery(page, glm)
+  await page.route('https://openrouter.ai/api/v1/models**', async (route) => {
+    await route.fulfill({
+      json: {
+        data: [
+          ...(openRouterModelsPayload(glm).data as unknown[]),
+          ...(openRouterModelsPayload(gpt).data as unknown[]),
+        ],
+      },
+    })
+  })
+  await page.route('https://openrouter.ai/api/v1/models/**/endpoints', async (route) => {
+    const isGlm = route.request().url().includes(glm)
+    await route.fulfill({
+      json: {
+        data: {
+          id: isGlm ? glm : gpt,
+          endpoints: [
+            endpoint(isGlm ? 'Baseten' : 'OpenAI', 131_072, ['provider'], {
+              data_policy: policy(isGlm ? {} : { retainsPrompts: true, retentionDays: 30 }),
+            }),
+          ],
+        },
+      },
+    })
+  })
+  await mockChatCompletionsCapture(page, requests, ['GPT preset request'])
+  await seedFirstRun(page, { model: glm, disablePrivacyFilter: false, corsProxyUrl: '/_or_scrape' })
+  await createChatAndOpen(page)
+  await openSettingsPanel(page)
+  const chatId = await firstChatId(page)
+  await expect(page.getByLabel('Use Baseten', { exact: true })).toBeChecked()
+  await expect(page.locator('[data-ui="picker-row-pick"]').filter({ hasText: glm })).toBeVisible()
+  await page.getByRole('radio', { name: 'Throughput' }).click()
+  await expect
+    .poll(async () => (await readChatRow(page, chatId)).settings)
+    .toHaveProperty('providerPrefs.sort', 'throughput')
+  await page.getByRole('button', { name: 'Select all', exact: true }).click()
+  await expect
+    .poll(async () => (await readChatRow(page, chatId)).settings)
+    .toHaveProperty('providerPrefs.only', ['Baseten'])
+  await saveProviderPreset(page, 'GLM throughput')
+  await page.locator('[data-ui="model-picker-search-input"]').fill(gpt)
+  await page.locator('[data-ui="picker-row-pick"]').filter({ hasText: gpt }).first().click()
+  await expect(page.getByLabel('Use OpenAI', { exact: true })).toBeVisible()
+  await page.getByRole('button', { name: 'Reset to default', exact: true }).click()
+  await expect
+    .poll(async () => (await readChatRow(page, chatId)).settings)
+    .toHaveProperty('providerPrefs', { sort: 'price' })
+  await page.getByRole('button', { name: 'Select all', exact: true }).click()
+  await expect
+    .poll(async () => (await readChatRow(page, chatId)).settings)
+    .toHaveProperty('providerPrefs.only', ['OpenAI'])
+  await saveProviderPreset(page, 'GPT price')
+  await loadProviderPreset(page, 'GLM throughput')
+  await expect(page.getByLabel('Use Baseten', { exact: true })).toBeChecked()
+  await expect(page.getByRole('radio', { name: 'Throughput' })).toBeChecked()
+  await loadProviderPreset(page, 'GPT price')
+  await expect(page.getByLabel('Use Baseten', { exact: true })).toHaveCount(0)
+  await expect(page.getByLabel('Use OpenAI', { exact: true })).toBeChecked()
+  await expect(page.getByRole('radio', { name: 'Price', exact: true })).toBeChecked()
+  await expect(
+    page.locator('[data-ui="header-privacy-badge"] [data-ui="icon-button"]'),
+  ).toHaveAttribute('data-privacy-tier', 'yellow')
+  await sendAndExpectAssistant(page, 'send using GPT preset', 'GPT preset request')
+  expect(requests).toHaveLength(1)
+  expect(requests[0]?.body).toMatchObject({
+    model: gpt,
+    provider: { only: ['OpenAI'], sort: 'price' },
+  })
+  expect(JSON.stringify(requests[0]?.body.provider)).not.toContain('Baseten')
+})
+
+async function saveProviderPreset(page: Page, name: string): Promise<void> {
+  await page.locator('[data-ui="preset-breadcrumb-button"]').click()
+  await page.getByRole('button', { name: '+ Save as new…', exact: true }).click()
+  const dialog = page.getByRole('dialog', { name: 'New preset' })
+  await dialog.getByRole('textbox', { name: 'Preset name' }).fill(name)
+  await dialog.getByRole('button', { name: 'Save', exact: true }).click()
+  await expect(page.locator('[data-ui="preset-breadcrumb-button"]')).toContainText(name)
+}
+
+async function loadProviderPreset(page: Page, name: string): Promise<void> {
+  await page.locator('[data-ui="preset-breadcrumb-button"]').click()
+  await page.locator('[data-ui="preset-menu-load"]').filter({ hasText: name }).click()
+  await expect(page.locator('[data-ui="preset-breadcrumb-button"]')).toContainText(name)
+}
 
 test('GUI duplicate provider display names stay independently selectable by slug', async ({
   page,

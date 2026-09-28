@@ -462,23 +462,13 @@ export function useModelCatalog(
       [retainedPresentationTarget, retainedProjection],
     ),
   )
-  const privacyRequired =
-    projection.scrapeApplicable && liveScrapeEnabled && !projection.isFreeModel
-  const privacyPresentationReady =
-    capabilityPresentationReady && (!privacyRequired || routingProjection?.privacy !== undefined)
   const privacyPresentation = useIndependentPresentation(
     useMemo<UsePrivacyRoutingPresentation>(
       () => privacyRoutingPresentation(projection, currentPresentationTarget, false),
       [currentPresentationTarget, projection],
     ),
-    privacyPresentationReady,
-    useMemo<UsePrivacyRoutingPresentation | null>(
-      () =>
-        retainedPresentationTarget && retainedProjection
-          ? privacyRoutingPresentation(retainedProjection, retainedPresentationTarget, true)
-          : null,
-      [retainedPresentationTarget, retainedProjection],
-    ),
+    target !== null,
+    null,
   )
   const refreshModels = useCallback(() => {
     if (profileId) configurationController.refreshModelCatalogDiscovery(profileId)

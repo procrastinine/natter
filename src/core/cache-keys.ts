@@ -1,7 +1,7 @@
 import type { ConnectionKind, ModelsQuery } from './types'
 
 const OPENROUTER_CATALOG_QUERY: ModelsQuery = Object.freeze({
-  outputModalities: Object.freeze(['text', 'image', 'audio', 'file', 'video']),
+  outputModalities: Object.freeze(['text', 'image', 'audio', 'video']),
 })
 const DIRECT_CATALOG_QUERY: ModelsQuery = Object.freeze({})
 

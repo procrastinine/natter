@@ -118,7 +118,9 @@ function applyManualPickerState(
 ): PickerRow {
   const providerPrefs = opts.providerPrefs
   const userTouchedPicker = providerPrefs?.ignoreOverridesFilter === true
-  const hasOnly = (providerPrefs?.only?.length ?? 0) > 0
+  const hasOnly =
+    (providerPrefs?.only?.length ?? 0) > 0 ||
+    (userTouchedPicker && providerPrefs.only !== undefined)
   if (pickerRowIsHardDenied(row)) return row
   if (!userTouchedPicker && !hasOnly) return row
 

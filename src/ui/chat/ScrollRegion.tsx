@@ -146,6 +146,7 @@ type ViewportDisplacement =
       readonly edge: 'top' | 'bottom'
       readonly coordinate: number
       readonly documentCoordinate: number
+      readonly elementDocumentCoordinate: number
     }
   | {
       readonly kind: 'bottom'
@@ -191,6 +192,7 @@ interface RevealClaimLifecycle {
 interface RetainedViewportDisposition {
   readonly state: ScrollState
   readonly lease: ViewportContinuityLease | null
+  readonly userScrollRevision: number
   readonly distanceFromBottom: number | null
   readonly workspaceEpoch: number
   readonly chatKey: string | number | null
@@ -735,6 +737,8 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
           edge,
           coordinate,
           documentCoordinate: coordinate + container.scrollTop,
+          elementDocumentCoordinate:
+            (edge === 'bottom' ? rect.bottom : rect.top) + container.scrollTop,
         },
         prepared,
       )
@@ -809,7 +813,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
   const correctContinuityLease = useCallback((): boolean => {
     const container = containerRef.current
     const lease = continuityLeaseRef.current
-    if (!container || !lease) return false
+    if (!container || !lease || textEditingViewportClaimsRef.current > 0) return false
     if (adoptUnclaimedNativeViewportMovement()) return false
     if (
       !Object.is(lease.selectionKey, selectionKeyRef.current) ||
@@ -831,6 +835,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
     }
     let element = anchor.element
     let current: number
+    let elementCoordinate: number
     if (anchor.textIdentity) {
       if (!anchor.messageId) {
         continuityLeaseRef.current = null
@@ -844,6 +849,8 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
       if (!resolved) return false
       element = resolved.element
       current = resolved.coordinate
+      const rect = element.getBoundingClientRect()
+      elementCoordinate = anchor.edge === 'bottom' ? rect.bottom : rect.top
     } else if (!element.isConnected || !contentRef.current?.contains(element)) {
       if (!anchor.messageId) {
         continuityLeaseRef.current = null
@@ -862,17 +869,24 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
       if (!element.isConnected || !contentRef.current?.contains(element)) return false
       const rect = element.getBoundingClientRect()
       current = anchor.edge === 'bottom' ? rect.bottom : rect.top
+      elementCoordinate = current
     } else {
       const rect = element.getBoundingClientRect()
       current = anchor.edge === 'bottom' ? rect.bottom : rect.top
+      elementCoordinate = current
     }
     const documentCoordinate = current + container.scrollTop
+    const elementDocumentCoordinate = elementCoordinate + container.scrollTop
     const delta = current - anchor.coordinate
     if (Math.abs(delta) <= LAYOUT_ANCHOR_TOLERANCE_PX) {
-      if (Math.abs(documentCoordinate - anchor.documentCoordinate) > LAYOUT_ANCHOR_TOLERANCE_PX) {
+      if (
+        Math.abs(documentCoordinate - anchor.documentCoordinate) > LAYOUT_ANCHOR_TOLERANCE_PX ||
+        Math.abs(elementDocumentCoordinate - anchor.elementDocumentCoordinate) >
+          LAYOUT_ANCHOR_TOLERANCE_PX
+      ) {
         continuityLeaseRef.current = {
           ...lease,
-          displacement: { ...anchor, element, documentCoordinate },
+          displacement: { ...anchor, element, documentCoordinate, elementDocumentCoordinate },
         }
       }
       return false
@@ -881,7 +895,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
     if (continuityLeaseRef.current === lease) {
       continuityLeaseRef.current = {
         ...lease,
-        displacement: { ...anchor, element, documentCoordinate },
+        displacement: { ...anchor, element, documentCoordinate, elementDocumentCoordinate },
       }
     }
     return true
@@ -963,6 +977,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
         }
         return
       }
+      const coordinate = element.getBoundingClientRect().bottom
       continuityLeaseRef.current = {
         ...lease,
         viewportRevision: prepared?.revision ?? lease.viewportRevision,
@@ -973,8 +988,9 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
           elementOrdinal: null,
           textIdentity: null,
           edge: 'bottom',
-          coordinate: element.getBoundingClientRect().bottom,
-          documentCoordinate: element.getBoundingClientRect().bottom + container.scrollTop,
+          coordinate,
+          documentCoordinate: coordinate + container.scrollTop,
+          elementDocumentCoordinate: coordinate + container.scrollTop,
         },
       }
     },
@@ -1133,6 +1149,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
       }
       const element = resolveFollowTargetElement(claim.target)
       if (!element) return false
+      const coordinate = element.getBoundingClientRect().bottom
       installContinuityLease(claim.source, {
         kind: 'element',
         element,
@@ -1140,8 +1157,9 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
         elementOrdinal: null,
         textIdentity: null,
         edge: 'bottom',
-        coordinate: element.getBoundingClientRect().bottom,
-        documentCoordinate: element.getBoundingClientRect().bottom + container.scrollTop,
+        coordinate,
+        documentCoordinate: coordinate + container.scrollTop,
+        elementDocumentCoordinate: coordinate + container.scrollTop,
       })
       return true
     },
@@ -1248,6 +1266,28 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
       }
       const previousNativeScrollTop = lastNativeScrollTopRef.current
       const previousGeometry = lastObservedScrollGeometryRef.current
+      if (
+        stateRef.current === 'follow' &&
+        previousNativeScrollTop !== null &&
+        previousGeometry !== null &&
+        Math.abs(previousGeometry.clientHeight - container.clientHeight) > 0.5 &&
+        Math.abs(previousGeometry.scrollHeight - container.scrollHeight) <= 0.5 &&
+        Math.abs(
+          previousGeometry.scrollHeight - previousNativeScrollTop - previousGeometry.clientHeight,
+        ) <= BOTTOM_REACQUIRE_TOLERANCE_PX &&
+        Math.abs(
+          container.scrollTop - Math.min(previousNativeScrollTop, bottomScrollTop(container)),
+        ) <= 0.5
+      ) {
+        const lease = continuityLeaseRef.current
+        if (lease?.mode === 'preserve') {
+          continuityLeaseRef.current = {
+            ...lease,
+            displacement: { kind: 'bottom', distance: 0 },
+          }
+        }
+        writeScrollTopNow(bottomScrollTop(container), 'resize')
+      }
       const distanceFromBottom =
         container.scrollHeight - container.scrollTop - container.clientHeight
       const nativeViewportMoved =
@@ -1271,7 +1311,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
             ? displacement.element.getBoundingClientRect().bottom
             : displacement.element.getBoundingClientRect().top) +
             container.scrollTop -
-            displacement.documentCoordinate,
+            displacement.elementDocumentCoordinate,
         ) > LAYOUT_ANCHOR_TOLERANCE_PX
       const scrollGeometryChanged =
         source === 'scroll' &&
@@ -1630,6 +1670,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
     retainedViewportDispositionRef.current = {
       state: stateRef.current,
       lease: continuityLeaseRef.current,
+      userScrollRevision: userScrollRevisionRef.current,
       distanceFromBottom: container
         ? container.scrollHeight - container.scrollTop - container.clientHeight
         : null,
@@ -1657,6 +1698,7 @@ export const ScrollRegion = forwardRef<ScrollRegionHandle, ScrollRegionProps>(fu
     retainedViewportDispositionRef.current = null
     if (
       !disposition ||
+      disposition.userScrollRevision !== userScrollRevisionRef.current ||
       disposition.workspaceEpoch !== workspaceEpoch ||
       !Object.is(disposition.chatKey, resetKey) ||
       !Object.is(disposition.selectionKey, selectionKey)

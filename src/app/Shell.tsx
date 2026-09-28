@@ -112,6 +112,7 @@ import { ToastTray } from '../ui/chat/ToastTray'
 import { ZeroEligibleModal } from '../ui/chat/ZeroEligibleModal'
 import { ConnectionHeader } from '../ui/header/ConnectionHeader'
 import {
+  ArrowDownIcon,
   ChevronIcon,
   CogIcon,
   DatabaseIcon,
@@ -1628,13 +1629,15 @@ export function Shell() {
         ...(!transcriptFocusMode && scrollState === 'pinned'
           ? {
               floatingAccessory: (
-                <Button
+                <IconButton
                   type="button"
                   data-ui="jump-to-latest"
+                  aria-label="Jump to latest"
+                  title="Jump to latest"
                   onClick={() => scrollRef.current?.scrollToBottom({ smooth: false })}
                 >
-                  ↓ Jump to latest
-                </Button>
+                  <ArrowDownIcon size={18} />
+                </IconButton>
               ),
             }
           : {}),

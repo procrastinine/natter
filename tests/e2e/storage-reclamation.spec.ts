@@ -11,6 +11,7 @@ import {
   firstChatId,
   mockChatCompletions,
   seedFirstRun,
+  seedLinearChat,
   sendMessage,
   submitPresentationTextDialog,
   waitForWorkspaceRunning,
@@ -285,12 +286,20 @@ async function readWorkspaceControlSnapshot(
           generationLifetimeLocks: {
             held: (locks.held ?? [])
               .flatMap((lock) =>
-                lock.name === generationLifetimeLock && lock.mode ? [lock.mode] : [],
+                (lock.name === generationLifetimeLock ||
+                  lock.name?.startsWith('workspace:generation-owner:')) &&
+                lock.mode
+                  ? [lock.mode]
+                  : [],
               )
               .sort(),
             pending: (locks.pending ?? [])
               .flatMap((lock) =>
-                lock.name === generationLifetimeLock && lock.mode ? [lock.mode] : [],
+                (lock.name === generationLifetimeLock ||
+                  lock.name?.startsWith('workspace:generation-owner:')) &&
+                lock.mode
+                  ? [lock.mode]
+                  : [],
               )
               .sort(),
           },
@@ -394,6 +403,7 @@ test('normal use catches up foreground work without repeating the physical copy 
   let peer: Page | undefined
   let manager: Page | undefined
   let tree: Page | undefined
+  let generator: Page | undefined
   try {
     await retargetOnlyProfileToFakeProvider(page, scenario.providerBaseUrl)
     await createChatAndOpen(page)
@@ -403,6 +413,14 @@ test('normal use catches up foreground work without repeating the physical copy 
     const firstBranchId = await firstBranch.getAttribute('data-message-id')
     if (!firstBranchId) throw new Error('StorageCompactionFirstBranchMissing')
     const chatId = await firstChatId(page)
+    generator = await page.context().newPage()
+    await generator.goto('/')
+    const otherChatId = await seedLinearChat(generator, {
+      chatId: 'independent-regeneration-chat',
+      messageCount: 2,
+      title: 'Independent regeneration',
+    })
+    expect(otherChatId).not.toBe(chatId)
 
     await firstBranch.locator('[data-action="regenerate"]').click()
     const secondBranch = page.locator('[data-ui="message"][data-role="assistant"]').last()
@@ -523,10 +541,21 @@ test('normal use catches up foreground work without repeating the physical copy 
       .toMatchObject({
         runtimeState: 'RUNNING',
         generationLifetimeLocks: {
-          held: expect.arrayContaining(['shared']),
+          held: expect.arrayContaining(['exclusive']),
         },
       })
     const afterDebtEstimate = await page.evaluate(() => navigator.storage.estimate())
+
+    await expect
+      .poll(() => readWorkspaceControlSnapshot(page))
+      .toMatchObject({
+        generationLifetimeLocks: { pending: expect.arrayContaining(['shared']) },
+      })
+    await generator
+      .locator('[data-ui="message"][data-role="assistant"] [data-action="regenerate"]')
+      .last()
+      .click()
+    await expect.poll(() => scenario.snapshot().then((snapshot) => snapshot.activeStreams)).toBe(2)
 
     const titleBeforeCatchup = await readChatTitleFromDatabase(
       page,
@@ -704,7 +733,7 @@ test('normal use catches up foreground work without repeating the physical copy 
       },
     })
     await editedUser.getByRole('button', { name: 'Save & Send' }).click()
-    await expect.poll(() => scenario.snapshot().then((snapshot) => snapshot.requestCount)).toBe(2)
+    await expect.poll(() => scenario.snapshot().then((snapshot) => snapshot.requestCount)).toBe(3)
     await expect(
       page
         .locator('[data-ui="message"][data-role="user"] [data-ui="message-body"]')
@@ -756,7 +785,13 @@ test('normal use catches up foreground work without repeating the physical copy 
       contentType: 'application/json',
     })
   } finally {
-    await Promise.allSettled([peer?.close(), manager?.close(), tree?.close(), scenario.dispose()])
+    await Promise.allSettled([
+      peer?.close(),
+      manager?.close(),
+      tree?.close(),
+      generator?.close(),
+      scenario.dispose(),
+    ])
     await Promise.allSettled([unlink(firstUploadPath), unlink(replacementUploadPath)])
   }
 })

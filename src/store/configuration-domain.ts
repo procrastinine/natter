@@ -108,6 +108,11 @@ export interface ConfigurationApplicationDependencies {
   >
 }
 
+export interface PreparedConfigurationEdit<Result = unknown> {
+  commit(): Promise<Result>
+  discard(): void
+}
+
 export interface ConfigurationApplication {
   createConnection(
     intent: CreateConnectionIntent,
@@ -160,6 +165,17 @@ export interface ConfigurationApplication {
     patches: readonly ChatSettingsFieldPatch[],
     options?: { now?: number; cancelModelResolution?: boolean },
   ): Promise<boolean>
+  prepareChatSettingsFields(
+    chatId: ChatId,
+    patches: readonly ChatSettingsFieldPatch[],
+    options?: { now?: number; cancelModelResolution?: boolean },
+  ): PreparedConfigurationEdit<ConfigurationDomainResult<'chat.settings-fields-patch'>>
+  preparePromptText(chatId: ChatId, slot: PromptPresetKind, text: string): PreparedConfigurationEdit
+  prepareTextTemplateConfig(
+    templateId: string,
+    config: SavedTextTemplate['config'],
+  ): PreparedConfigurationEdit
+  prepareGlobalPreference(key: string, value: unknown): PreparedConfigurationEdit
   replaceChatSettings(
     chatId: ChatId,
     settings: ChatSettings,
@@ -284,10 +300,10 @@ export interface ConfigurationApplication {
 export function createConfigurationApplication(
   dependencies: ConfigurationApplicationDependencies,
 ): ConfigurationApplication {
-  const execute = async <Command extends ConfigurationDomainCommand>(
+  const executePrepared = async <Command extends ConfigurationDomainCommand>(
     command: Command,
+    pending: StagedPendingConfigurationCommand | null,
   ): Promise<ConfigurationDomainResult<Command['kind']>> => {
-    const pending = stagePendingConfigurationCommand(command, dependencies.pendingConfiguration)
     try {
       const localApplication = pendingConfigurationOwnsCompleteLocalWorkspaceSetting(pending)
         ? {
@@ -319,6 +335,37 @@ export function createConfigurationApplication(
       throw error
     }
   }
+
+  const prepare = <Command extends ConfigurationDomainCommand>(
+    input: Command,
+  ): PreparedConfigurationEdit<ConfigurationDomainResult<Command['kind']>> => {
+    const command = structuredClone(input)
+    const pending = stagePendingConfigurationCommand(command, dependencies.pendingConfiguration)
+    let state:
+      | { kind: 'pending' }
+      | { kind: 'discarded' }
+      | { kind: 'committed'; result: Promise<ConfigurationDomainResult<Command['kind']>> } = {
+      kind: 'pending',
+    }
+    return {
+      commit() {
+        if (state.kind === 'committed') return state.result
+        if (state.kind === 'discarded') {
+          return Promise.reject(new DOMException('Configuration edit superseded.', 'AbortError'))
+        }
+        const result = executePrepared(command, pending)
+        state = { kind: 'committed', result }
+        return result
+      },
+      discard() {
+        if (state.kind !== 'pending') return
+        state = { kind: 'discarded' }
+        rejectPendingConfigurationCommand(pending, dependencies.pendingConfiguration)
+      },
+    }
+  }
+  const execute = <Command extends ConfigurationDomainCommand>(command: Command) =>
+    prepare(command).commit()
 
   const application: ConfigurationApplication = {
     execute,
@@ -435,8 +482,12 @@ export function createConfigurationApplication(
     },
     async patchChatSettingsFields(chatId, patches, options = {}) {
       if (patches.length === 0) return false
+      const result = await application.prepareChatSettingsFields(chatId, patches, options).commit()
+      return result.kind === 'chat-updated' && result.changed
+    },
+    prepareChatSettingsFields(chatId, patches, options = {}) {
       const commandPatches = cloneFieldPatches(patches)
-      const result = await execute({
+      return prepare({
         kind: 'chat.settings-fields-patch',
         chatId,
         patches: commandPatches,
@@ -445,7 +496,20 @@ export function createConfigurationApplication(
           : { cancelModelResolution: options.cancelModelResolution }),
         now: options.now ?? Date.now(),
       })
-      return result.kind === 'chat-updated' && result.changed
+    },
+    preparePromptText(chatId, slot, text) {
+      return prepare({ kind: 'prompt-preset.local-commit', chatId, slot, text, now: Date.now() })
+    },
+    prepareTextTemplateConfig(templateId, config) {
+      return prepare({
+        kind: 'text-template.update',
+        templateId,
+        patch: { config: normalizeTextTemplateConfig(config) },
+        now: Date.now(),
+      })
+    },
+    prepareGlobalPreference(key, value) {
+      return prepare({ kind: 'global-preference.set', key, value, now: Date.now() })
     },
     async replaceChatSettings(chatId, settings, options = {}) {
       const result = await execute({

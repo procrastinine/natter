@@ -1,85 +1,23 @@
-# natter
+# Some motivation
 
-A browser-only chat UI for LLM APIs. OpenRouter-first; also talks to OpenAI direct, Gemini native, Anthropic's native Messages API, generic OpenAI-compatible endpoints, and `llama-server`. Anthropic and Gemini can use an OpenAI-compatible shim only when a chat explicitly selects that route.
+There are some relatively specific features that I could not get from other frontends, so I decided to build my own because it's easy with agents now anyways. Some gripes:
+- Privacy: yes, API LLMs are not the most private things in the world, but some things are more not-private than others. I use OpenRouter because it's about as private as you can get for large or frontier models: there is a large user base that your prompts are mixed with, you can see what data retention different providers have and control it granularly, you can pay for it with crypto that needs no real name or address, and there is also just the convenience that you can access pretty much any current LLM you want with a single key. The specific thing I wanted to solve in this regard is that I couldn't find a frontend that scraped live data from OpenRouter to show exactly what providers had what amount of privacy, and then easily choose a custom list.
+- API parameters: similarly, many frontends expose some blanket list of parameters, which may or may not be complete, and also may or may not apply for any specific model and provider. For example: for caching Claude models, I could find _no_ frontend that had an easy GUI option for the breakpoint and TTL option; and for many frontends, what specific sampling parameters are supported on what specific model are just "haha, pass it in". For natter on OpenRouter specifically, there is a per-provider discovery of exactly what parameters (or context lengths, or whatever) are supported, and the UI dynamically updates to show only those. It also supports prefill which I have really not seen other UIs do...
+- The interface itself (browser): browsers are so nice in terms of navigation. You can use different tabs, URLs, the back button, clicking on links in new tabs, etc etc etc, but I have not seen _any_ frontend, even browser ones, really take advantage of this. So natter has a full URL for every chat, branch, attachment, etc, you can use the back button or middle click on basically anything, you can view the same chat on different tabs to copy and paste and whatever, you basically have the full freedom of the browser. Furthermore, needing a server to host literal javascript calls is completely unnecessary, so natter needs no server at all and can just be run through e.g. GitHub pages or any static file, with everything saved in IndexedDB. For any remote users, this means that no data is sent other than for required LLM API calls.
+- Context and editability: okay I actually never super liked the "chat" model. In an ideal world, I would have liked to build a frontend for text completions as just a canvas of text with breakpoints you can edit context in, but I have found very few base models hosted anywhere (e.g. DeepSeek v4 Pro base exists, but no one hosts it because it's not economically viable and now it's just AGENTS AGENTS AGENTS RL'd to hell with responses). But regardless, the purpose of natter is to play with raw context and responses, so you can edit absolutely anything, you can edit messages and responses in place, you can edit reasoning, you can edit the message tree, you can pretend you sent a message and an LLM responded, you just get full editability and context control. I see it almost as a "context control IDE" except that the chat format is what every API uses so I am forced into adopting it.
+- Maybe as a futile last resistance against the chat format, at the very least, I am not going to use stupid chat bubbles. Text is properly displayed with a proper centering and a proper width so you can actually read it, and you can collapse it from any point by clicking the icon that follows you from the left; you can also hide all UI elements by clicking a focus mode button. I wanted it so that it would be a pleasant experience even if you were reading a novel on this.
 
-The whole app is a static bundle, served from any file server or opened directly from `file://`. Keys, chats, attachments, and settings live in IndexedDB in the browser. Multiple tabs against the same workspace are coordinated via Web Locks and BroadcastChannel, so concurrent writes don't conflict.
+# Therefore, what I implemented
 
-## Why this exists
+- SPA with IndexedDB
+- Browser-native navigation
+- Full control of both API parameters and context, with presets you can save
+- Lots of edit tools for messages, reasoning, and a tree view
+- Compatibility with most things (arbitrary OpenAI-compatible chat completions API, OpenAI Responses API, Anthropic Messages API, Gemini native API), including switching between them, including preserving reasoning between them
+- Standard features like attachments, folders, tags, search, export, context estimation, etc
+- **It is a playground! Do not expect agentic stuff (even though it supports provider tools), this is for testing and having fun with raw model inputs/outputs**
 
-The goal is an easy way to use a variety of models on OpenRouter while keeping things at least reasonably private (anonymized/no user ID retention, no prompt retention in policy). Additional gaps in other frontends were reasoning support (including encrypted reasoning), proper caching for different models, and various testing/copy-pasting mechanisms that benefit a lot from having a fully-featured chat tree, in-place editing, prefill, etc etc.
-
-## OpenRouter privacy
-
-Different providers behind the same OpenRouter model have different data-retention terms, and the JSON `/endpoints` API doesn't expose them; they have to be scraped from the per-model providers page. natter does that scrape (cached 24h) and uses the labels to filter and rank endpoints. Endpoints that are strictly less private than another option for the same model are removed entirely (Pareto-dominance, not just deprioritized). Models that allow training on prompts are blocked. Free models opt out, since otherwise nothing would be eligible. The provider picker also has manual pin/block controls and a preferred-order list, and the chat header shows the resulting tier.
-
-## Browser key-storage boundary
-
-API keys are encrypted before they are written to IndexedDB. By default, the wrapping secret is stored in the same browser database, which protects against casual at-rest inspection but not against script execution in the page origin. Passphrase-protected keys avoid persisting that wrapping secret, although a decrypted key still exists briefly in the active tab when used. Treat full-workspace exports as sensitive: the current full backup includes both encrypted key rows and the install secret.
-
-For hardened hosted deployments, start with a response-header policy like this and extend `connect-src` and `img-src` only for configured custom endpoints and image origins:
-
-```text
-Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; media-src 'self' data: blob: https:; connect-src 'self' https://openrouter.ai https://api.openai.com https://api.anthropic.com https://generativelanguage.googleapis.com; worker-src 'self' blob:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'
-```
-
-This is a deployment template, not a runtime default: arbitrary compatible endpoints, user-approved image origins, workers, and `file://` use need environment-specific treatment.
-
-## Model controls
-
-natter discovers which parameters a given model+endpoint actually supports and only surfaces those. Per-model quirks the wire APIs don't advertise are also handled: sampling gates on the GPT-5.4 family, cache-token thresholds on Anthropic, models that require the Responses API, models with adaptive-only reasoning, OSS models that emit `<think>` tags inline.
-
-## Reasoning
-
-Different providers return reasoning in different shapes, and dropping the shape-specific metadata silently breaks multi-turn reasoning on most current models. natter preserves the `phase` markers OpenAI's Responses API needs (without them, gpt-5.3-codex / 5.4 / 5.4-pro stop generating early), the encrypted reasoning blocks that only round-trip through `/v1/responses`, Gemini's `thoughtSignature` (which only survives via the native Gemini API, not the OpenAI shim), and the inline `<think>` tags from OSS models like DeepSeek-R1, Qwen3, and Gemma. Reasoning content is editable per-detail, and per-carrier toggles (text/summary/encrypted) control what gets carried forward.
-
-## Context, cost, caching
-
-A token estimator calibrates from observed usage, with fallbacks from per-chat to workspace-wide, then to a model-family anchor, then to a generic ratio. The current estimate is shown per message, per turn, and per attachment. Context cutoff is explicit, with a prompt-size readout (no silent truncation).
-
-Cache breakpoint controls cover Anthropic (TTL plus off/auto/manual), Gemini (manual), and OpenAI (implicit), and each provider's minimum-tokens threshold is enforced (so e.g. the Anthropic cache UI doesn't pretend to do anything below the relevant 1024/2048/4096 boundary). Per-message cost is broken out by prompt, completion, reasoning, cache-read, cache-write, audio, and video.
-
-## Message tree, editing, prefill
-
-Any message can be edited in place, keeping the same id, with no new sibling and no API call. Regenerate and insert-sibling create branch variants, while continuing an assistant response appends the returned text to that same stored row. Any message can also be used as the fork point for a whole new chat. Messages can be inserted between existing ones, and the four delete variants cover single-message, message-pair, whole-turn, and just-this-variant cases. The assistant can be prefilled with arbitrary opening text before sending. Branch arrows expose sibling variants directly; switching between them moves a cursor and never duplicates rows. The alternate branch-tree navigator adds in-chat search, connector insertion controls, compact/expanded layouts, and a resizable message inspector without materializing another graph.
-
-## Browser-native navigation
-
-Every chat, branch, attachment, and storage view has its own URL. Reload restores the chat and the active branch. Sidebar entries, branch arrows, branch-tree nodes, storage rows, and attachment chips use real anchors where implemented, so browser-native middle-click and Cmd-click work, including on branch arrows and tree nodes.
-
-## Other things
-
-Image, PDF, audio, and video attachments with per-modality token estimation. Folders, tags, and full-text search in the sidebar. Flatten-export of a chat to text. JSON-schema response format. Provider-hosted tool configuration and persisted tool evidence. General client-side/manual tool execution remains planned. Workspace-global prompt presets for system/continue-system/continue-user slots. 5-second undo window on structural ops. Focus mode.
-
-## Shipped, partial, and planned
-
-| Status | Surface | Evidence |
-|---|---|---|
-| Shipped | Message-tree swipes, deep links, and in-place editing | `src/ui/chat/BranchControls.tsx`, `src/core/active-path.ts`, `src/core/messages.ts`, `tests/e2e/render-window.spec.ts`, `tests/unit/active-path.test.ts`, `tests/unit/messages.test.ts` |
-| Shipped | Native Anthropic Messages and Gemini transports | `src/core/api-choice.ts`, `src/api/anthropic-messages.ts`, `src/api/gemini-native.ts`, `tests/unit/api-choice.test.ts`, `tests/unit/api-anthropic-messages.test.ts`, `tests/unit/api-gemini-native.test.ts` |
-| Shipped | Explicit provider-hosted tools and returned tool evidence | `src/store/request-planning.ts`, `src/api/request-transforms.ts`, `tests/e2e/provider-tool-fixture-replay.spec.ts` |
-| Partial | Auto-title status schema and persistence | `src/core/types.ts`, `src/store/chats.ts`, `src/store/db.ts`, `tests/unit/db-schema.test.ts`; background title generation is not complete |
-| Shipped | Alternate branch-tree navigator | `src/ui/chat/BranchTreeView.tsx`, `src/ui/chat/BranchTreeInspector.tsx`, `src/core/branch-tree-layout.ts`, `tests/e2e/branch-tree.spec.ts`, `tests/unit/branch-tree-view.test.tsx` |
-| Planned | Client-side/manual tool execution and approvals | No client-side executor or approval flow is shipped yet |
-| Planned | Daemon/SQLite workspace backend | No daemon workspace engine is shipped yet |
-
-## Quickstart
-
-```sh
-pnpm install
-pnpm dev
-```
-
-## Verification
-
-Run `pnpm check:ci` for the clean, non-writing Biome check. The broader source checks are `pnpm typecheck`, `pnpm lint:semantic`, `pnpm test:run`, and `pnpm build`. The checked build rejects unexpected distribution paths and unsafe artifacts, including invalid module-entry topology. `pnpm perf:report` reports delivery ratchets without treating historical byte counts as product laws; topology, dependency cycles, and supplied stream-run failures remain blocking. Wall time and heap measurements remain informational.
-
-GitHub Pages publication is intentionally independent from the quality workflow. Only dependency installation, the production-artifact startup smoke (which invokes the same checked `pnpm build` as every other browser run), artifact upload, and the Pages deployment itself can block publication. Verification still runs on pull requests and `main`; unit tests plus the exhaustive built-artifact browser suite are correctness gates, while peer, formatting/lint, dead-code, and performance findings are advisory so findings remain visible without holding the published site stale. Playwright starts a standalone loopback fake-provider process for deterministic HTTP/SSE cases; the application contains no fake transport or test stream entry point.
-
-Application behavior uses the same code paths under `pnpm dev` and the built artifact. The one deliberate runtime-default exception is the OpenRouter provider-privacy scrape: Vite development can use its same-origin `/_or_scrape` proxy, while a static production deployment performs no live scrape unless a CORS proxy is configured in Settings. This exception does not affect chat, branch, storage, navigation, or streaming state.
-
-`pnpm dev` is the normal unbundled Vite/HMR environment, so its request count and decoded source are intentionally much larger than the minified application. Use `pnpm preview` when testing production-like delivery weight. With either server running, `pnpm perf:delivery dev <url>` or `pnpm perf:delivery preview <url>` records a fresh Chromium context. Preview compares production request/byte measurements with recorded ratchets; dev reports request/byte/time/heap measurements without rewarding bundled modules or disabled development tooling. Ratchet overruns are review findings, while both modes fail on runtime/network diagnostics or cold-loading a forbidden lazy feature. The frequently used per-chat settings pane, small global-settings modal, and fixed configuration-preferences projection stay eager; Markdown/message rendering, branch tree, storage, message import, and the heavy interchange validation/backend handlers stay out of a cold load until their surface or explicit action needs them. The shared ratchets live in `scripts/performance-baseline.json` so the build, report, and browser measurement do not drift.
-
-## Scripts
+# Local development
 
 | script | purpose |
 |---|---|
@@ -107,6 +45,6 @@ Application behavior uses the same code paths under `pnpm dev` and the built art
 | `pnpm format` | Biome format (write) |
 | `pnpm check` | Biome lint + format + organize imports |
 
-## Stack
+# Technologies, which I am sure are going to suffer from supply chain attacks. Therefore I do all my development on a VPS and publish to GitHub pages so this crap doesn't touch my computer
 
 Node 24+ · React 19 · Vite 8 · TypeScript 7 native compiler (TypeScript 6 compatibility API for semantic tooling) · Tailwind v4 · Dexie (IndexedDB) · Zustand · TanStack Virtual · hand-rolled `fetch` + SSE · Biome · Vitest · Playwright

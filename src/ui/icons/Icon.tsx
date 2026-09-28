@@ -137,6 +137,14 @@ export function CheckIcon({ size = 18, ariaLabel }: IconProps) {
   )
 }
 
+export function ArrowDownIcon({ size = 18, ariaLabel }: IconProps) {
+  return (
+    <BaseSvg size={size} {...(ariaLabel ? { 'aria-label': ariaLabel } : {})}>
+      <path d="M12 4v16m-7-7 7 7 7-7" />
+    </BaseSvg>
+  )
+}
+
 // Reload / regenerate (single semicircular arrow with a chevron tip).
 export function ReloadIcon({ size = 18, ariaLabel }: IconProps) {
   return (

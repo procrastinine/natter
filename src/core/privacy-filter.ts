@@ -219,7 +219,7 @@ export function buildWireProviderPrivacy(
     userTouchedPicker?: boolean
   } = {},
 ): WireProviderPrivacy {
-  // Once the user touches the picker, its ignore list owns reversible
+  // Once the user touches the picker, its allowed set owns reversible
   // exclusions. Training denial remains mandatory and is projected into
   // the same visible/wire selection instead of being reapplied by a hidden
   // request-only path.
@@ -262,7 +262,7 @@ export function buildWireProviderPrivacy(
       ),
   )
   const onlyEndpoints = endpointIndex.endpointsForRefs(filteredOnly)
-  const hasOnly = existingOnly.length > 0
+  const hasOnly = existingOnly.length > 0 || (userTookOver && opts.existingOnly !== undefined)
   const eligibleEndpoints = userTookOver
     ? allEndpoints.filter((endpoint) => !hardDeniedEndpoints.has(endpoint))
     : result.kept.map((row) => row.endpoint)
@@ -274,7 +274,7 @@ export function buildWireProviderPrivacy(
     zeroEligible: allEndpoints.length > 0 && !allowedAfterSelection,
   }
   if (mergedIgnore.length > 0) wire.ignore = mergedIgnore
-  if (filteredOnly.length > 0) {
+  if (hasOnly) {
     wire.only = filteredOnly
   }
   if (filteredOrder.length > 0) {

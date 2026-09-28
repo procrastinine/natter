@@ -1,5 +1,15 @@
 import { describe, expect, it } from 'vitest'
-import { modelsCacheKey } from '../../src/core/cache-keys'
+import { modelCatalogQueryForConnectionKind, modelsCacheKey } from '../../src/core/cache-keys'
+
+it('uses supported OpenRouter output filters without filtering direct connections', () => {
+  expect(modelCatalogQueryForConnectionKind('openrouter').outputModalities).toEqual([
+    'text',
+    'image',
+    'audio',
+    'video',
+  ])
+  expect(modelCatalogQueryForConnectionKind('openai-compatible')).toEqual({})
+})
 
 describe('modelsCacheKey', () => {
   it('differs when supportedParameters differs', () => {

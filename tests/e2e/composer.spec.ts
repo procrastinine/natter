@@ -34,6 +34,40 @@ test('empty composer input does not show a vertical scrollbar', async ({ page })
   expect(metrics.scrollHeight).toBeLessThanOrEqual(metrics.clientHeight + 1)
 })
 
+test('native multiline and wrapped paste autosize the composer just like typing', async ({
+  page,
+}) => {
+  const input = page.locator('[data-ui="composer-input"]')
+  for (const text of [
+    'First line\nSecond line',
+    'First paragraph\n\nSecond paragraph',
+    Array.from({ length: 20 }, (_, i) => `Clipboard line ${i}`).join('\n'),
+    'Wrapped clipboard text '.repeat(100),
+  ]) {
+    await page.evaluate((value) => {
+      const source = document.createElement('textarea')
+      source.id = 'clipboard-source'
+      source.value = value
+      document.body.append(source)
+    }, text)
+    await page.locator('#clipboard-source').focus()
+    await page.keyboard.press('ControlOrMeta+A')
+    await page.keyboard.press('ControlOrMeta+C')
+    await page.locator('#clipboard-source').evaluate((node) => node.remove())
+    await input.fill('')
+    const before = await input.evaluate((node) => node.clientHeight)
+    await input.focus()
+    await page.keyboard.press('ControlOrMeta+V')
+    await expect(input).toHaveValue(text)
+    const pasted = await input.evaluate((node) => node.clientHeight)
+    expect(pasted).toBeGreaterThan(before)
+    expect(pasted).toBeLessThanOrEqual(240)
+    await input.fill('')
+    await input.fill(text)
+    await expect.poll(() => input.evaluate((node) => node.clientHeight)).toBe(pasted)
+  }
+})
+
 test.describe('retina composer sizing', () => {
   test.use({ deviceScaleFactor: 2 })
 
@@ -145,7 +179,7 @@ test('composer can be resized below its content and scrolls internally', async (
   expect(await input.evaluate((node) => node.clientHeight)).toBeGreaterThan(resetHeight)
 })
 
-test('inline editor keeps its opened viewport while wrapped content scrolls internally', async ({
+test('inline editor grows and shrinks with wrapping up to its internal-scroll limit', async ({
   page,
 }) => {
   await mockChatCompletions(page, {
@@ -185,9 +219,8 @@ test('inline editor keeps its opened viewport while wrapped content scrolls inte
 
   await input.fill('responsive wrapping '.repeat(50))
   const wide = await metrics()
-  expect(wide.renderedHeight).toBeCloseTo(short.renderedHeight, 1)
-  expect(wide.overflowY).toBe('auto')
-  expect(wide.scrollHeight).toBeGreaterThan(wide.clientHeight)
+  expect(wide.renderedHeight).toBeGreaterThan(short.renderedHeight)
+  expect(wide.overflowY).toBe('hidden')
   await page.evaluate(() => {
     document.documentElement.style.setProperty('--message-max-width', '420px')
   })
@@ -195,8 +228,8 @@ test('inline editor keeps its opened viewport while wrapped content scrolls inte
     .poll(() => metrics().then((value) => value.scrollHeight))
     .toBeGreaterThan(wide.scrollHeight)
   const narrow = await metrics()
-  expect(narrow.overflowY).toBe('auto')
-  expect(narrow.renderedHeight).toBeCloseTo(wide.renderedHeight, 1)
+  expect(narrow.renderedHeight).toBeGreaterThan(wide.renderedHeight)
+  expect(narrow.renderedHeight).toBeLessThanOrEqual(narrow.maxHeight)
 
   await page.evaluate(() => {
     document.documentElement.style.setProperty('--message-max-width', '920px')
@@ -214,6 +247,10 @@ test('inline editor keeps its opened viewport while wrapped content scrolls inte
   expect(capped.renderedHeight).toBeLessThanOrEqual(capped.maxHeight + 0.5)
   expect(capped.renderedHeight).toBeCloseTo(capped.cssHeight, 1)
   expect(capped.scrollHeight).toBeGreaterThan(capped.clientHeight)
+  expect(capped.renderedHeight).toBeCloseTo(capped.maxHeight, 1)
+  await input.fill('short again')
+  expect((await metrics()).renderedHeight).toBeCloseTo(short.renderedHeight, 1)
+  await expect(input).toHaveCSS('overflow-y', 'hidden')
 })
 
 test('composer input overscroll backing matches the input surface', async ({ page }) => {

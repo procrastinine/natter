@@ -88,7 +88,7 @@ test('UI does not flash an unavailable warning while clearing a non-equivalent m
   await expectNoRecordedUnavailableWarnings(page)
 })
 
-test('OpenRouter model switches retain routing and model-row geometry until the new target is ready', async ({
+test('OpenRouter model switches show target-local privacy through pending and failed discovery', async ({
   browserName,
   expectRuntimeDiagnostic,
   page,
@@ -129,13 +129,16 @@ test('OpenRouter model switches retain routing and model-row geometry until the 
       'current',
     )
     const providerSection = page.locator('[data-ui-section="provider-picker"]')
-    await expect(providerSection).toHaveAttribute('data-routing-presentation', 'retained')
-    await expect(providerSection).toHaveAttribute('inert', '')
-    await expect(page.getByText('Old Model Provider', { exact: true })).toHaveCount(1)
-    await expect(privacyBadge).toHaveAttribute('data-routing-presentation', 'retained')
-    await expect(privacyBadge.locator('[data-ui="icon-button"]')).toBeDisabled()
+    await expect(providerSection).toHaveAttribute('data-routing-presentation', 'current')
+    await expect(providerSection).not.toHaveAttribute('inert', '')
+    await expect(page.getByText('Old Model Provider', { exact: true })).toHaveCount(0)
+    await expect(privacyBadge).toHaveAttribute('data-routing-presentation', 'current')
+    await expect(privacyBadge.locator('[data-ui="icon-button"]')).toHaveAttribute(
+      'data-privacy-tier',
+      'unavailable',
+    )
     expect(await readModelSwitchRecorder(page)).toMatchObject({
-      blankRoutingPublications: 0,
+      staleProviderPublications: 0,
       modelOrderChanges: [],
       providerSectionDisconnected: false,
       providerListDisconnected: false,
@@ -144,12 +147,17 @@ test('OpenRouter model switches retain routing and model-row geometry until the 
 
     await privacyGate.fail()
     await expect(providerSection).toHaveAttribute('aria-busy', 'false')
-    await expect(providerSection).toHaveAttribute('data-routing-presentation', 'retained')
-    await expect(page.getByText('Old Model Provider', { exact: true })).toHaveCount(1)
+    await expect(providerSection).toHaveAttribute('data-routing-presentation', 'current')
+    await expect(page.getByText('Old Model Provider', { exact: true })).toHaveCount(0)
+    await expect(page.getByText('New Model Provider', { exact: true })).toBeVisible()
+    await privacyBadge.locator('[data-ui="icon-button"]').click()
+    await expect(page.locator('[data-ui="header-privacy-popover"]')).not.toContainText(
+      'Old Model Provider',
+    )
     const record = await stopModelSwitchRecorder(page)
     recorderStarted = false
     expect(record).toMatchObject({
-      blankRoutingPublications: 0,
+      staleProviderPublications: 0,
       modelOrderChanges: [],
       providerSectionDisconnected: false,
       providerListDisconnected: false,
@@ -455,6 +463,7 @@ async function pickModel(page: Page, modelId: string): Promise<void> {
 
 type ModelSwitchRecord = {
   blankRoutingPublications: number
+  staleProviderPublications: number
   modelOrderChanges: string[]
   providerSectionDisconnected: boolean
   providerListDisconnected: boolean
@@ -501,6 +510,7 @@ async function startModelSwitchRecorder(page: Page, modelId: string): Promise<vo
     }
     const record = {
       blankRoutingPublications: 0,
+      staleProviderPublications: 0,
       modelOrderChanges: [] as string[],
       providerSectionDisconnected: false,
       providerListDisconnected: false,
@@ -522,6 +532,13 @@ async function startModelSwitchRecorder(page: Page, modelId: string): Promise<vo
     const sample = () => {
       const providerSection = document.querySelector('[data-ui-section="provider-picker"]')
       const providerList = providerSection?.querySelector('[data-ui="provider-picker-list"]')
+      const currentModel = document.querySelector('[data-ui="picker-row"][data-current="true"]')
+      if (
+        currentModel?.textContent.includes(nextModelId) &&
+        providerList?.textContent.includes('Old Model Provider')
+      ) {
+        record.staleProviderPublications += 1
+      }
       const order = modelRows()
       if (order !== record.initialModelOrder && !record.modelOrderChanges.includes(order)) {
         record.modelOrderChanges.push(order)
@@ -557,6 +574,7 @@ async function startModelSwitchRecorder(page: Page, modelId: string): Promise<vo
       const currentPrivacyBadge = document.querySelector('[data-ui="header-privacy-badge"]')
       return {
         blankRoutingPublications: record.blankRoutingPublications,
+        staleProviderPublications: record.staleProviderPublications,
         modelOrderChanges: [...record.modelOrderChanges],
         providerSectionDisconnected: record.providerSectionDisconnected,
         providerListDisconnected: record.providerListDisconnected,

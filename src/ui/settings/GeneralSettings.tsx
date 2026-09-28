@@ -20,11 +20,9 @@ import {
 import { useConfigurationPreferences } from '../../hooks/useConfigurationPreferences'
 import { usePresentationInteraction } from '../../hooks/usePresentationInteraction'
 import { useSettledConfigurationEdit } from '../../hooks/useSettledConfigurationEdit'
-import { configurationController } from '../../store/configuration-controller'
+import { configurationApplication } from '../../store/configuration-application'
 import {
   writeAutoScrollOnStream,
-  writeCorsProxySecret,
-  writeCorsProxyUrl,
   writeSendShortcut,
   writeTokenCalibrationMode,
 } from '../../store/preferences-application'
@@ -88,16 +86,17 @@ export function GeneralSettings() {
     [runWorkspaceConfigurationWrite],
   )
   const corsProxyUrl = useSettledConfigurationEdit({
+    ownerKey: CORS_PROXY_URL_KEY,
     fieldKey: CORS_PROXY_URL_KEY,
     storedValue: prefs.corsProxyUrl,
-    stage: (value) => configurationController.stageWorkspaceSetting(CORS_PROXY_URL_KEY, value),
-    commit: writeCorsProxyUrl,
+    prepare: (value) => configurationApplication.prepareGlobalPreference(CORS_PROXY_URL_KEY, value),
   })
   const corsProxySecret = useSettledConfigurationEdit({
+    ownerKey: CORS_PROXY_SECRET_KEY,
     fieldKey: CORS_PROXY_SECRET_KEY,
     storedValue: prefs.corsProxySecret,
-    stage: (value) => configurationController.stageWorkspaceSetting(CORS_PROXY_SECRET_KEY, value),
-    commit: writeCorsProxySecret,
+    prepare: (value) =>
+      configurationApplication.prepareGlobalPreference(CORS_PROXY_SECRET_KEY, value),
   })
 
   // `/_or_scrape` is a Vite dev-server rewrite — the compiled bundle

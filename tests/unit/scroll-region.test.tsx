@@ -530,6 +530,28 @@ describe('ScrollRegion continuity lease', () => {
     expect(fixture.ref.current?.getState()).toBe('follow')
   })
 
+  it('keeps wheel ownership acquired while a viewport is retained when it reactivates', async () => {
+    const fixture = setup()
+    acquireOpen(fixture)
+    const target = fixture.region.querySelector<HTMLElement>('[data-message-id="command-target"]')
+    if (!target) throw new Error('Retained viewport target did not mount')
+    target.getBoundingClientRect = () =>
+      rect({ top: 160 - fixture.region.scrollTop, bottom: 280 - fixture.region.scrollTop })
+
+    act(() => fixture.rerender({ viewportActive: false }))
+    await pinByWheel(fixture)
+    act(() => fixture.rerender({ viewportActive: true }))
+
+    expect(fixture.region.scrollTop).toBe(200)
+    expect(fixture.ref.current?.getState()).toBe('pinned')
+    act(() => {
+      fixture.setHeight(2_000)
+      deliverResize()
+    })
+    expect(fixture.region.scrollTop).toBe(200)
+    expect(fixture.region.dataset.scrollState).toBe('pinned')
+  })
+
   it('restores a pinned text position when a retained viewport becomes active again', async () => {
     const fixture = setup()
     acquireOpen(fixture)
@@ -955,6 +977,144 @@ describe('ScrollRegion continuity lease', () => {
     expect(fixture.region.dataset.scrollState).toBe('pinned')
   })
 
+  it.each([125, 350])(
+    'keeps native navigation to %i when the text line differs from its paragraph edge',
+    async (destination) => {
+      const fixture = setup(
+        {},
+        <article data-ui="message" data-message-id="text-anchor">
+          <div data-ui="markdown">
+            <p>searchable text</p>
+          </div>
+        </article>,
+      )
+      acquireOpen(fixture)
+      await pinByWheel(fixture)
+      const paragraph = fixture.region.querySelector('p')
+      const markdown = paragraph?.parentElement
+      const text = paragraph?.firstChild
+      if (!paragraph || !markdown || !text) throw new Error('Text anchor fixture did not mount')
+      let paragraphTop = 220
+      const paragraphRect = () => ({
+        ...rect({
+          top: paragraphTop - fixture.region.scrollTop,
+          bottom: paragraphTop + 50 - fixture.region.scrollTop,
+        }),
+        left: 10,
+        right: 100,
+        width: 90,
+      })
+      paragraph.getBoundingClientRect = paragraphRect
+      markdown.getBoundingClientRect = paragraphRect
+      fixture.region.getBoundingClientRect = () => ({
+        ...rect({ top: 0, bottom: 100 }),
+        right: 120,
+        width: 120,
+      })
+      const previousCaret = Object.getOwnPropertyDescriptor(document, 'caretRangeFromPoint')
+      const previousRects = Object.getOwnPropertyDescriptor(Range.prototype, 'getClientRects')
+      Object.defineProperty(document, 'caretRangeFromPoint', {
+        configurable: true,
+        value: () => {
+          const range = document.createRange()
+          range.setStart(text, 0)
+          range.collapse(true)
+          return range
+        },
+      })
+      Object.defineProperty(Range.prototype, 'getClientRects', {
+        configurable: true,
+        value: () => {
+          const glyph = rect({
+            top: paragraphTop + 6 - fixture.region.scrollTop,
+            bottom: paragraphTop + 24 - fixture.region.scrollTop,
+          })
+          return Object.assign([glyph], { item: (index: number) => (index === 0 ? glyph : null) })
+        },
+      })
+      try {
+        expect(fixture.commands().captureLayoutAnchor({ element: paragraph })).toBe(true)
+        expect(fixture.commands().getLayoutAnchorSnapshot()?.coordinate).toBe(26)
+        act(() => {
+          fireEvent(fixture.region, new Event('scrollend'))
+          fixture.region.scrollTop = destination
+          fireEvent.scroll(fixture.region)
+          fixture.commands().reconcileLayoutAnchor()
+          deliverResize()
+        })
+        expect(fixture.region.scrollTop).toBe(destination)
+        expect(fixture.ref.current?.getState()).toBe('pinned')
+        expect(fixture.commands().captureLayoutAnchor({ element: paragraph })).toBe(true)
+        act(() => {
+          paragraphTop += 100
+          fixture.setHeight(1_200)
+          deliverResize()
+        })
+        expect(fixture.region.scrollTop).toBe(destination + 100)
+      } finally {
+        if (previousCaret) Object.defineProperty(document, 'caretRangeFromPoint', previousCaret)
+        else Reflect.deleteProperty(document, 'caretRangeFromPoint')
+        if (previousRects) Object.defineProperty(Range.prototype, 'getClientRects', previousRects)
+        else Reflect.deleteProperty(Range.prototype, 'getClientRects')
+      }
+    },
+  )
+
+  it.each([50, 200])(
+    'keeps the manually reached bottom when viewport height changes to %i',
+    async (height) => {
+      const fixture = setup()
+      acquireOpen(fixture)
+      await pinByWheel(fixture)
+      act(() => {
+        fireEvent.wheel(fixture.region)
+        fixture.region.scrollTop = 1_000
+        fireEvent.scroll(fixture.region)
+        fireEvent(fixture.region, new Event('scrollend'))
+      })
+      expect(fixture.ref.current?.getState()).toBe('follow')
+      act(() => {
+        fixture.setClientHeight(height)
+        fixture.region.scrollTop = Math.min(1_000, 1_100 - height)
+        deliverResize()
+      })
+      expect(fixture.region.scrollTop).toBe(1_100 - height)
+      expect(fixture.ref.current?.getState()).toBe('follow')
+    },
+  )
+
+  it('does not pull a user upward scroll back to bottom during a viewport resize', async () => {
+    const fixture = setup()
+    acquireOpen(fixture)
+    await pinByWheel(fixture)
+    act(() => {
+      fixture.setClientHeight(50)
+      deliverResize()
+    })
+    expect(fixture.region.scrollTop).toBe(200)
+    expect(fixture.ref.current?.getState()).toBe('pinned')
+  })
+
+  it('rebases the anchor from a wheel at bottom before a viewport resize can be undone', () => {
+    const fixture = setup()
+    acquireOpen(fixture)
+    const target = fixture.region.querySelector<HTMLElement>('[data-message-id="command-target"]')
+    if (!target) throw new Error('Layout anchor target did not mount')
+    target.getBoundingClientRect = () =>
+      rect({ top: 1_020 - fixture.region.scrollTop, bottom: 1_080 - fixture.region.scrollTop })
+    act(() => {
+      fireEvent.wheel(fixture.region)
+      fixture.setClientHeight(50)
+      deliverResize()
+      fireEvent.scroll(fixture.region)
+      fireEvent(fixture.region, new Event('scrollend'))
+      fixture.commands().reconcileLayoutAnchor()
+      fixture.rerender()
+    })
+    expect(fixture.region.scrollTop).toBe(1_050)
+    expect(fixture.ref.current?.getState()).toBe('follow')
+  })
+
   it('does not treat a stationary Firefox content-growth scroll event as user intent', async () => {
     const fixture = setup({ streamActive: true, autoScrollOnStream: true })
 
@@ -1365,6 +1525,7 @@ describe('ScrollRegion continuity lease', () => {
       value: scrollTo,
     })
     const release = fixture.commands().claimTextEditingViewport()
+    act(() => fixture.ref.current?.scrollToBottom({ smooth: false }))
     const before = fixture.region.scrollTop
 
     act(() => {
@@ -1372,6 +1533,7 @@ describe('ScrollRegion continuity lease', () => {
         fixture.setHeight(1_500)
         fixture.region.scrollTop = 1_400
       })
+      expect(fixture.commands().reconcileLayoutAnchor()).toBe(false)
       deliverResize()
     })
 

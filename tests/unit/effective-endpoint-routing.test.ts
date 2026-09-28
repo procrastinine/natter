@@ -91,6 +91,17 @@ function resolveOpenRouter(input: {
 }
 
 describe('effective endpoint routing', () => {
+  it('does not route an explicitly empty manual selection through a newly discovered endpoint', () => {
+    const routing = resolveOpenRouter({
+      endpoints: [endpoint('new-provider')],
+      settings: settings({ providerPrefs: { ignoreOverridesFilter: true, only: [], ignore: [] } }),
+      wire: { only: [], zeroEligible: true },
+    })
+    expect(routing.selectedEndpoints).toEqual([])
+    expect(routing.endpointAvailability).toBe('filtered-empty')
+    expect(routing.providerWire?.zeroEligible).toBe(true)
+  })
+
   it('gives an exact provider slug precedence over a colliding display candidate', () => {
     const exact = endpoint('foo', ['temperature'], { provider_name: 'Exact' })
     const collision = endpoint('bar', ['top_p'], { provider_name: 'foo' })

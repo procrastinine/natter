@@ -201,8 +201,10 @@ function resolveOpenRouterEndpoints(input: ResolveEffectiveEndpointRoutingInput)
   })
   const only = endpointIndex.endpointsForRefs(resolvedOnly)
   const ignore = endpointIndex.endpointsForRefs(resolvedIgnore)
-  const hasOnly = (input.providerWire?.only?.length ?? 0) > 0
   const userOwnsSelection = input.settings.providerPrefs?.ignoreOverridesFilter === true
+  const hasOnly =
+    (input.providerWire?.only?.length ?? 0) > 0 ||
+    (userOwnsSelection && input.providerWire?.only !== undefined)
   const filterMatchesTarget =
     input.filter === null ||
     input.filter === undefined ||

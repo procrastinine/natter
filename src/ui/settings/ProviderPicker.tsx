@@ -11,10 +11,9 @@
 // request's allowed providers by this axis — auto-excluded entries don't
 // appear on the wire. The visible picker sorts every row by the same metric,
 // including blocked rows, so toggling a provider doesn't move it around.
-// Bulk select/deselect writes the same manual ignore override as row clicks,
-// leaving sort/order intact. Quantization bulk actions are just selection
-// filters over that same ignore list, not provider.quantizations writes. Reset
-// clears provider order/ignore overrides while restoring the default Price sort.
+// Manual selections pin the current allowed set so discovery cannot expand it.
+// Quantization bulk actions filter that set, not provider.quantizations. Reset
+// restores automatic selection and the default Price sort.
 
 import { useCallback, useMemo, useState } from 'react'
 import {
@@ -131,9 +130,6 @@ export function ProviderPicker({
               path: ['providerPrefs', key] as const,
               value,
             })),
-            ...(patch.ignore === undefined
-              ? []
-              : [{ path: ['providerPrefs', 'only'] as const, value: undefined }]),
           ]),
       })
     },
@@ -142,22 +138,17 @@ export function ProviderPicker({
 
   const toggleProvider = useCallback(
     (providerRef: string, enabled: boolean) => {
-      // Unified allowed/disallowed model:
-      //   - `prefs.ignoreOverridesFilter=true` means "user touched the
-      //     picker; trust their `ignore` list for reversible exclusions."
-      //   - Training denial remains visible and cannot be toggled.
-      //   - When false/undefined, the wire falls back to the filter's
-      //     auto-exclusion.
-      // On first click `ignore` is seeded from the filter's current
-      // excluded set, then mutated, so that clicking Allow on the
-      // only auto-excluded row yields `ignore=[]` but the Override flag
-      // still pins the chat into user-authoritative mode.
       const alreadyTouched = prefs.ignoreOverridesFilter === true
       const base = alreadyTouched
         ? new Set(endpointIndex.resolveRoutingRefs(prefs.ignore, { preserveUnknown: true }))
         : new Set((filter?.excluded ?? []).map((e) => providerRoutingRef(e.endpoint)))
       if (enabled) base.delete(providerRef)
       else base.add(providerRef)
+      const allowed = new Set(
+        rows.filter((row) => row.state === 'kept').map((row) => providerRoutingRef(row.endpoint)),
+      )
+      if (enabled) allowed.add(providerRef)
+      else allowed.delete(providerRef)
       runConfigurationWrite({
         target: providerRoutingTarget,
         action: () =>
@@ -171,7 +162,12 @@ export function ProviderPicker({
                 ]
               : [{ path: ['providerPrefs', 'ignore'] as const, value: [...base] }]),
             { path: ['providerPrefs', 'ignoreOverridesFilter'], value: true },
-            { path: ['providerPrefs', 'only'], value: undefined },
+            alreadyTouched && prefs.only !== undefined
+              ? {
+                  path: ['providerPrefs', 'only'],
+                  membership: { member: providerRef, present: enabled },
+                }
+              : { path: ['providerPrefs', 'only'], value: [...allowed] },
           ]),
       })
     },
@@ -180,7 +176,9 @@ export function ProviderPicker({
       endpointIndex,
       prefs.ignore,
       prefs.ignoreOverridesFilter,
+      prefs.only,
       filter,
+      rows,
       providerRoutingTarget,
       runConfigurationWrite,
     ],
@@ -255,7 +253,14 @@ export function ProviderPicker({
                 : displayOrdered.map((endpoint) => providerRoutingRef(endpoint)),
             },
             { path: ['providerPrefs', 'ignoreOverridesFilter'], value: true },
-            { path: ['providerPrefs', 'only'], value: undefined },
+            {
+              path: ['providerPrefs', 'only'],
+              value: enabled
+                ? rows
+                    .filter((row) => !pickerRowIsHardDenied(row))
+                    .map((row) => providerRoutingRef(row.endpoint))
+                : [],
+            },
           ]),
       })
     },
@@ -289,7 +294,12 @@ export function ProviderPicker({
               ),
             },
             { path: ['providerPrefs', 'ignoreOverridesFilter'], value: true },
-            { path: ['providerPrefs', 'only'], value: undefined },
+            {
+              path: ['providerPrefs', 'only'],
+              value: rows
+                .filter((row) => row.state === 'kept' && !shouldDeselect(row.endpoint))
+                .map((row) => providerRoutingRef(row.endpoint)),
+            },
           ]),
       })
     },
@@ -387,32 +397,31 @@ export function ProviderPicker({
       </div>
       {rows.length === 0 ? (
         <p data-ui="helper">{loading ? 'Loading…' : 'No providers available for this model.'}</p>
-      ) : (
-        <ul data-ui="provider-picker-list">
-          {rows.map((row) => {
-            const endpointLimits = endpointBoundaryFields(row.endpoint)
-            const epCap = endpointLimits.max_prompt_tokens ?? endpointLimits.context_length
-            const insufficient =
-              neededTokens !== undefined && epCap !== undefined && epCap > 0 && neededTokens > epCap
-            const ref = providerRoutingRef(row.endpoint)
-            const key = providerEndpointKey(row.endpoint)
-            const label = endpointIndex.displayLabel(row.endpoint)
-            const allowed = row.state === 'kept'
-            return (
-              <ProviderRow
-                key={`${key}:${ref}`}
-                row={row}
-                label={label}
-                allowed={allowed}
-                insufficientContext={insufficient}
-                onToggle={(on) => toggleProvider(ref, on)}
-                onMoveUp={() => moveBy(ref, -1)}
-                onMoveDown={() => moveBy(ref, 1)}
-              />
-            )
-          })}
-        </ul>
-      )}
+      ) : null}
+      <ul data-ui="provider-picker-list">
+        {rows.map((row) => {
+          const endpointLimits = endpointBoundaryFields(row.endpoint)
+          const epCap = endpointLimits.max_prompt_tokens ?? endpointLimits.context_length
+          const insufficient =
+            neededTokens !== undefined && epCap !== undefined && epCap > 0 && neededTokens > epCap
+          const ref = providerRoutingRef(row.endpoint)
+          const key = providerEndpointKey(row.endpoint)
+          const label = endpointIndex.displayLabel(row.endpoint)
+          const allowed = row.state === 'kept'
+          return (
+            <ProviderRow
+              key={`${key}:${ref}`}
+              row={row}
+              label={label}
+              allowed={allowed}
+              insufficientContext={insufficient}
+              onToggle={(on) => toggleProvider(ref, on)}
+              onMoveUp={() => moveBy(ref, -1)}
+              onMoveDown={() => moveBy(ref, 1)}
+            />
+          )
+        })}
+      </ul>
       {isFreeModel ? (
         <p data-ui="helper" data-tone="muted">
           Privacy routing is ignored on <code>:free</code> models — OpenRouter picks a free
