@@ -221,6 +221,23 @@ function rangeLineTop(range: Range): number | null {
   return probe.getClientRects().item(0)?.top ?? null
 }
 
+function continuityTextWalker(markdown: HTMLElement): TreeWalker {
+  return markdown.ownerDocument.createTreeWalker(markdown, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      const text = node as Text
+      if (/\S/u.test(text.data) || text.parentElement?.closest('pre, code')) {
+        return NodeFilter.FILTER_ACCEPT
+      }
+      const blockSelector =
+        'p, pre, blockquote, ul, ol, li, table, thead, tbody, tfoot, tr, td, th, h1, h2, h3, h4, h5, h6, hr, div, figure, figcaption'
+      const bordersBlock = [text.previousSibling, text.nextSibling].some(
+        (sibling) => sibling instanceof Element && sibling.matches(blockSelector),
+      )
+      return bordersBlock ? NodeFilter.FILTER_SKIP : NodeFilter.FILTER_ACCEPT
+    },
+  })
+}
+
 function captureTextContinuity(
   container: HTMLDivElement,
   message: HTMLElement,
@@ -249,14 +266,27 @@ function captureTextContinuity(
   )
   for (const x of xs) {
     const caret = container.ownerDocument.caretRangeFromPoint(x, targetY)
-    if (!caret || !markdown.contains(caret.startContainer)) continue
+    if (
+      !caret ||
+      !(caret.startContainer instanceof Text) ||
+      caret.startContainer.length === 0 ||
+      !markdown.contains(caret.startContainer)
+    )
+      continue
     const coordinate = rangeLineTop(caret)
     if (coordinate === null) continue
-    const prefix = container.ownerDocument.createRange()
-    prefix.selectNodeContents(markdown)
-    prefix.setEnd(caret.startContainer, caret.startOffset)
-    const prefixLength = prefix.toString().length
     const progressiveStatic = markdown.dataset.overflow === 'progressive-static'
+    const walker = continuityTextWalker(markdown)
+    let length = 0
+    let offset: number | null = null
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      if (node === caret.startContainer) {
+        offset = length + Math.min(caret.startOffset, (node as Text).length - 1)
+      }
+      length += (node as Text).length
+      if (offset !== null && !progressiveStatic) break
+    }
+    if (offset === null) continue
     const caretElement =
       (caret.startContainer instanceof Element
         ? caret.startContainer
@@ -267,9 +297,7 @@ function captureTextContinuity(
       identity: {
         markdownOrdinal,
         edge: progressiveStatic ? 'end' : 'start',
-        characterOffset: progressiveStatic
-          ? Math.max(0, markdown.textContent.length - prefixLength)
-          : prefixLength,
+        characterOffset: progressiveStatic ? Math.max(0, length - offset) : offset,
       },
       coordinate,
     }
@@ -285,14 +313,19 @@ function resolveTextContinuity(
     identity.markdownOrdinal,
   )
   if (!markdown) return null
-  const walker = message.ownerDocument.createTreeWalker(markdown, NodeFilter.SHOW_TEXT)
-  let remaining =
-    identity.edge === 'end'
-      ? Math.max(0, markdown.textContent.length - identity.characterOffset)
-      : identity.characterOffset
+  const walker = continuityTextWalker(markdown)
+  let remaining = identity.characterOffset
+  if (identity.edge === 'end') {
+    let length = 0
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      length += (node as Text).length
+    }
+    remaining = Math.max(0, length - remaining)
+    walker.currentNode = markdown
+  }
   for (let node = walker.nextNode(); node; node = walker.nextNode()) {
     const text = node as Text
-    if (remaining > text.length) {
+    if (remaining >= text.length) {
       remaining -= text.length
       continue
     }
@@ -405,6 +438,7 @@ function visibleContentAnchor(
   const hitTestDocument = container.ownerDocument as unknown as {
     elementFromPoint?: (x: number, y: number) => Element | null
   }
+  let fallback: HTMLElement | undefined
   for (const y of yCandidates) {
     const hit = hitTestDocument.elementFromPoint?.call(container.ownerDocument, x, y)
     const message = hit?.closest<HTMLElement>('[data-ui="message"][data-message-id]')
@@ -413,8 +447,14 @@ function visibleContentAnchor(
     const textBlock = element?.closest<HTMLElement>(
       'p, li, pre, blockquote, table, figcaption, [data-ui="reasoning-summary"], [data-ui="message-body"]',
     )
-    return textBlock && message.contains(textBlock) ? textBlock : message
+    if (textBlock && message.contains(textBlock)) {
+      if (textBlock.dataset.ui !== 'message-body') return textBlock
+      fallback ??= textBlock
+    } else {
+      fallback ??= message
+    }
   }
+  if (fallback) return fallback
   for (const message of content.querySelectorAll<HTMLElement>(
     '[data-ui="message"][data-message-id]',
   )) {

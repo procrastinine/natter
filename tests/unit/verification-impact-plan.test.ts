@@ -412,6 +412,7 @@ describe('verification slice impact planner', () => {
       'browser',
       'browser',
       'browser',
+      'browser',
       'integration',
       'integration',
     ])
@@ -422,7 +423,17 @@ describe('verification slice impact planner', () => {
     expect(Array.isArray(plan.tasks.playwright[0]?.files)).toBe(true)
     expect(plan.tasks.playwright[1]).toEqual({
       project: 'firefox',
-      files: ['tests/e2e/scroll.spec.ts', 'tests/e2e/storage-reclamation.spec.ts'],
+      files: [
+        'tests/e2e/branch-tree-streaming.spec.ts',
+        'tests/e2e/branch-tree.spec.ts',
+        'tests/e2e/reactive-storage-stress.spec.ts',
+        'tests/e2e/render-window-loading.spec.ts',
+        'tests/e2e/render-window-streaming.spec.ts',
+        'tests/e2e/render-window.spec.ts',
+        'tests/e2e/scroll.spec.ts',
+        'tests/e2e/storage-reclamation.spec.ts',
+        'tests/e2e/stream-retention.spec.ts',
+      ],
     })
     expect(plan.tasks.playwright[2]).toEqual({
       project: 'large-workspace-setup',
@@ -482,9 +493,16 @@ describe('verification slice impact planner', () => {
       project: 'firefox',
       files: [
         'tests/e2e/advanced-generation-routing.spec.ts',
+        'tests/e2e/branch-tree-streaming.spec.ts',
+        'tests/e2e/branch-tree.spec.ts',
         'tests/e2e/composer.spec.ts',
+        'tests/e2e/reactive-storage-stress.spec.ts',
+        'tests/e2e/render-window-loading.spec.ts',
+        'tests/e2e/render-window-streaming.spec.ts',
+        'tests/e2e/render-window.spec.ts',
         'tests/e2e/scroll.spec.ts',
         'tests/e2e/storage-reclamation.spec.ts',
+        'tests/e2e/stream-retention.spec.ts',
         'tests/e2e/system-prompt.spec.ts',
       ],
     })
@@ -504,16 +522,32 @@ describe('verification slice impact planner', () => {
     expect(validateVerificationManifest({ current })).toEqual([])
   }, 15_000)
 
-  it('derives Firefox native-find proof from either transcript viewport owner', () => {
+  it('derives the complete Firefox viewport proof from either transcript viewport owner', () => {
     const current = buildVerificationSnapshot()
     for (const path of ['src/ui/chat/ScrollRegion.tsx', 'src/ui/chat/MessageList.tsx']) {
       const candidate = mutateFile(current, path, 'native-find-coordinate-change')
       const plan = planSliceVerification({ base: current, current: candidate })
       expect(plan.impactedObligations).toContain('native-find-viewport')
       expect(plan.tasks.vitest).toContain('tests/unit/scroll-region.test.tsx')
-      expect(plan.tasks.playwright.find(({ project }) => project === 'firefox')?.files).toContain(
-        'tests/e2e/scroll.spec.ts',
+      const firefoxFiles = plan.tasks.playwright.find(({ project }) => project === 'firefox')?.files
+      expect(firefoxFiles).toEqual(
+        expect.arrayContaining([
+          'tests/e2e/render-window-loading.spec.ts',
+          'tests/e2e/render-window-streaming.spec.ts',
+          'tests/e2e/render-window.spec.ts',
+          'tests/e2e/scroll.spec.ts',
+        ]),
       )
+      const viewportBrowserFiles = VERIFICATION_PROOFS.flatMap((proof) =>
+        proof.execution.runner === 'playwright' &&
+        [
+          'conversation-viewport-presentation-browser',
+          'conversation-viewport-serial-browser',
+        ].includes(proof.id)
+          ? proof.execution.files
+          : [],
+      )
+      expect(firefoxFiles).toEqual(expect.arrayContaining(viewportBrowserFiles))
       expect(
         plan.tasks.playwright.find(({ project }) => project === 'chromium')?.files,
       ).not.toContain('tests/e2e/render-window.spec.ts')
@@ -563,7 +597,15 @@ describe('verification slice impact planner', () => {
       project: 'firefox',
       files: [
         'tests/e2e/advanced-generation-routing.spec.ts',
+        'tests/e2e/branch-tree-streaming.spec.ts',
+        'tests/e2e/branch-tree.spec.ts',
+        'tests/e2e/reactive-storage-stress.spec.ts',
+        'tests/e2e/render-window-loading.spec.ts',
+        'tests/e2e/render-window-streaming.spec.ts',
+        'tests/e2e/render-window.spec.ts',
+        'tests/e2e/scroll.spec.ts',
         'tests/e2e/storage-reclamation.spec.ts',
+        'tests/e2e/stream-retention.spec.ts',
         'tests/e2e/system-prompt.spec.ts',
       ],
     })

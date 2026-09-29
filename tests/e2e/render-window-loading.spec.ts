@@ -152,9 +152,56 @@ test('cold sidebar passive fill preserves visible text when reading starts befor
 
   const region = page.locator('[data-ui="scroll-region"]')
   await region.hover()
+  const marginScroll = await page.evaluate(() => {
+    const region = document.querySelector<HTMLElement>('[data-ui="scroll-region"]')
+    if (!region) throw new Error('ColdSidebarMarginRegionMissing')
+    const rect = region.getBoundingClientRect()
+    const paragraph = Array.from(region.querySelectorAll('[data-ui="markdown"] p')).find(
+      (candidate) => {
+        const top = candidate.getBoundingClientRect().top
+        return top > rect.top + 20 && top < rect.top + rect.height / 2
+      },
+    )
+    if (!paragraph) throw new Error('ColdSidebarMarginParagraphMissing')
+    return Math.round(paragraph.getBoundingClientRect().top - rect.top - 2)
+  })
+  await page.mouse.wheel(0, marginScroll)
+  await waitForNativeScrollSettle(page)
   await page.mouse.wheel(0, -1)
   await waitForNativeScrollSettle(page)
+  const marginHit = await page.evaluate(() => {
+    const region = document.querySelector<HTMLElement>('[data-ui="scroll-region"]')
+    if (!region) throw new Error('ColdSidebarMarginRegionMissing')
+    const rect = region.getBoundingClientRect()
+    const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + 1)
+    return {
+      messageId: hit?.closest<HTMLElement>('[data-ui="message"]')?.dataset.messageId,
+      paragraph: hit?.closest('p') !== null,
+    }
+  })
+  expect(marginHit.messageId).toBe(probe.anchor.messageId)
+  expect(marginHit.paragraph).toBe(false)
   const delayedAnchor = await captureVisibleSemanticTextAnchor(page)
+  const separatorLayout = await page
+    .locator(
+      `[data-ui="message"][data-message-id="${delayedAnchor.messageId}"] [data-ui="markdown"]`,
+    )
+    .evaluate((markdown) => {
+      const beforeHeight = markdown.getBoundingClientRect().height
+      const paragraphs = Array.from(markdown.querySelectorAll('p'))
+      for (const paragraph of paragraphs) paragraph.before(document.createTextNode('\n'))
+      return {
+        count: paragraphs.length,
+        heightChange: markdown.getBoundingClientRect().height - beforeHeight,
+      }
+    })
+  expect(separatorLayout.count).toBeGreaterThan(0)
+  expect(separatorLayout.heightChange).toBe(0)
+  await expect
+    .poll(async () =>
+      Math.abs((await readSemanticTextAnchor(page, delayedAnchor)).lineTop - delayedAnchor.lineTop),
+    )
+    .toBeLessThanOrEqual(2)
   const delayedTextLayout = await page.evaluate((anchor) => {
     const message = document.querySelector<HTMLElement>(
       `[data-ui="message"][data-message-id="${anchor.messageId}"]`,
@@ -178,7 +225,14 @@ test('cold sidebar passive fill preserves visible text when reading starts befor
   const afterDelayedLayout = await readSemanticTextAnchor(page, delayedAnchor)
   await testInfo.attach('cold-sidebar-passive-fill-continuity.json', {
     body: JSON.stringify(
-      { ...probe, afterFill, delayedAnchor, delayedTextLayout, afterDelayedLayout },
+      {
+        ...probe,
+        afterFill,
+        delayedAnchor,
+        separatorLayout,
+        delayedTextLayout,
+        afterDelayedLayout,
+      },
       null,
       2,
     ),

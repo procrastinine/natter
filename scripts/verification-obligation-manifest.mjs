@@ -9,6 +9,16 @@ import {
 
 export const VERIFICATION_OBLIGATION_SCHEMA_VERSION = 2
 
+const CONVERSATION_VIEWPORT_BROWSER_FILES = Object.freeze([
+  'tests/e2e/branch-tree-streaming.spec.ts',
+  'tests/e2e/branch-tree.spec.ts',
+  'tests/e2e/reactive-storage-stress.spec.ts',
+  'tests/e2e/render-window-loading.spec.ts',
+  'tests/e2e/render-window-streaming.spec.ts',
+  'tests/e2e/scroll.spec.ts',
+  'tests/e2e/stream-retention.spec.ts',
+])
+
 const EXPLICIT_VERIFICATION_PROOFS = Object.freeze([
   proof('workspace-runtime-resources', 'unit', {
     runner: 'vitest',
@@ -85,25 +95,17 @@ const EXPLICIT_VERIFICATION_PROOFS = Object.freeze([
   proof('conversation-viewport-presentation-browser', 'browser', {
     runner: 'playwright',
     project: 'chromium',
-    files: [
-      'tests/e2e/branch-tree-streaming.spec.ts',
-      'tests/e2e/branch-tree.spec.ts',
-      'tests/e2e/reactive-storage-stress.spec.ts',
-      'tests/e2e/render-window-loading.spec.ts',
-      'tests/e2e/render-window-streaming.spec.ts',
-      'tests/e2e/scroll.spec.ts',
-      'tests/e2e/stream-retention.spec.ts',
-    ],
+    files: CONVERSATION_VIEWPORT_BROWSER_FILES,
   }),
   proof('conversation-viewport-serial-browser', 'browser', {
     runner: 'playwright',
     project: 'chromium-send-performance',
     files: ['tests/e2e/render-window.spec.ts'],
   }),
-  proof('native-find-viewport-firefox', 'browser', {
+  proof('conversation-viewport-presentation-firefox', 'browser', {
     runner: 'playwright',
     project: 'firefox',
-    files: ['tests/e2e/scroll.spec.ts'],
+    files: [...CONVERSATION_VIEWPORT_BROWSER_FILES, 'tests/e2e/render-window.spec.ts'],
   }),
   proof('remote-locality-browser', 'browser', {
     runner: 'playwright',
@@ -329,7 +331,7 @@ export const VERIFICATION_OBLIGATIONS = Object.freeze([
   obligation(
     'native-find-viewport',
     ['src/ui/chat/ScrollRegion.tsx', 'src/ui/chat/MessageList.tsx'],
-    ['conversation-viewport-presentation-contract', 'native-find-viewport-firefox'],
+    ['conversation-viewport-presentation-contract', 'conversation-viewport-presentation-firefox'],
   ),
   obligation(
     'composer-paste-growth',
@@ -433,6 +435,7 @@ export const VERIFICATION_OBLIGATIONS = Object.freeze([
     [
       'conversation-viewport-presentation-contract',
       'conversation-viewport-presentation-browser',
+      'conversation-viewport-presentation-firefox',
       'conversation-viewport-serial-browser',
       'destination-frame-budget-contract',
       'destination-frame-budget-browser',

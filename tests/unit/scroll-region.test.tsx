@@ -977,6 +977,232 @@ describe('ScrollRegion continuity lease', () => {
     expect(fixture.region.dataset.scrollState).toBe('pinned')
   })
 
+  it.each(['body', 'message'])(
+    'preserves visible text when the first hit is the %s margin',
+    async (firstHit) => {
+      const fixture = setup(
+        {},
+        <article data-ui="message" data-message-id="margin-anchor">
+          <div data-ui="message-body">
+            <div data-ui="markdown">
+              <p>visible reading position</p>
+            </div>
+          </div>
+        </article>,
+      )
+      acquireOpen(fixture)
+      const message = fixture.region.querySelector<HTMLElement>('[data-message-id="margin-anchor"]')
+      const body = message?.querySelector<HTMLElement>('[data-ui="message-body"]')
+      const markdown = body?.querySelector<HTMLElement>('[data-ui="markdown"]')
+      const paragraph = markdown?.querySelector('p')
+      if (!message || !body || !markdown || !paragraph) throw new Error('MarginAnchorMissing')
+      let paragraphTop = 230
+      const bodyRect = () => rect({ top: -fixture.region.scrollTop, bottom: 1_100 })
+      message.getBoundingClientRect = bodyRect
+      body.getBoundingClientRect = bodyRect
+      markdown.getBoundingClientRect = bodyRect
+      paragraph.getBoundingClientRect = () =>
+        rect({
+          top: paragraphTop - fixture.region.scrollTop,
+          bottom: paragraphTop + 45 - fixture.region.scrollTop,
+        })
+      const previousHitTest = Object.getOwnPropertyDescriptor(document, 'elementFromPoint')
+      const previousCaret = Object.getOwnPropertyDescriptor(document, 'caretRangeFromPoint')
+      Object.defineProperty(document, 'elementFromPoint', {
+        configurable: true,
+        value: (_x: number, y: number) =>
+          y === 1 ? (firstHit === 'body' ? body : message) : paragraph,
+      })
+      Object.defineProperty(document, 'caretRangeFromPoint', {
+        configurable: true,
+        value: () => null,
+      })
+      try {
+        await pinByWheel(fixture)
+        const before = paragraph.getBoundingClientRect().top
+        act(() => {
+          fireEvent(fixture.region, new Event('scrollend'))
+          paragraphTop += 137
+          fixture.setHeight(1_237)
+          deliverResize()
+        })
+        expect(paragraph.getBoundingClientRect().top).toBe(before)
+        expect(fixture.region.scrollTop).toBe(337)
+        expect(fixture.ref.current?.getState()).toBe('pinned')
+      } finally {
+        if (previousHitTest) Object.defineProperty(document, 'elementFromPoint', previousHitTest)
+        else Reflect.deleteProperty(document, 'elementFromPoint')
+        if (previousCaret) Object.defineProperty(document, 'caretRangeFromPoint', previousCaret)
+        else Reflect.deleteProperty(document, 'caretRangeFromPoint')
+      }
+    },
+  )
+
+  it.each(
+    [
+      ['full', 'insert'],
+      ['full', 'remove'],
+      ['progressive-static', 'insert'],
+      ['progressive-static', 'remove'],
+    ].flatMap(([overflow, operation]) =>
+      [0, 3].map((offset) => [overflow, operation, offset] as const),
+    ),
+  )(
+    'keeps %s text identity when block separators %s at offset %i',
+    async (overflow, operation, offset) => {
+      const fixture = setup(
+        {},
+        <article data-ui="message" data-message-id="separator-anchor">
+          <div data-ui="markdown" data-overflow={overflow}>
+            {['aaaaaaaaaa', 'bbbbbbbbbb', 'cccccccccc', 'dddddddddd'].map((text) => (
+              <p key={text}>{text}</p>
+            ))}
+          </div>
+        </article>,
+      )
+      acquireOpen(fixture)
+      await pinByWheel(fixture)
+      const paragraphs = Array.from(fixture.region.querySelectorAll('p'))
+      const paragraph = paragraphs[2]
+      const markdown = paragraph?.parentElement
+      const text = paragraph?.firstChild
+      if (!paragraph || !markdown || !text) throw new Error('SeparatorAnchorMissing')
+      for (const [index, block] of paragraphs.entries()) {
+        block.getBoundingClientRect = () => ({
+          ...rect({ top: 90 + index * 70 - fixture.region.scrollTop, bottom: 400 }),
+          left: 10,
+          right: 100,
+          width: 90,
+        })
+      }
+      markdown.getBoundingClientRect = paragraph.getBoundingClientRect
+      fixture.region.getBoundingClientRect = () => ({
+        ...rect({ top: 0, bottom: 100 }),
+        right: 120,
+        width: 120,
+      })
+      const separators = paragraphs.slice(1).map(() => document.createTextNode('\n'))
+      const insertSeparators = () => {
+        for (const [index, separator] of separators.entries()) {
+          markdown.insertBefore(separator, paragraphs[index + 1] ?? null)
+        }
+      }
+      if (operation === 'remove') insertSeparators()
+      const previousCaret = Object.getOwnPropertyDescriptor(document, 'caretRangeFromPoint')
+      const previousRects = Object.getOwnPropertyDescriptor(Range.prototype, 'getClientRects')
+      Object.defineProperty(document, 'caretRangeFromPoint', {
+        configurable: true,
+        value: () => {
+          const range = document.createRange()
+          range.setStart(text, offset)
+          range.collapse(true)
+          return range
+        },
+      })
+      Object.defineProperty(Range.prototype, 'getClientRects', {
+        configurable: true,
+        value: function (this: Range) {
+          const block = this.startContainer.parentElement?.closest('p')
+          const index = block ? paragraphs.indexOf(block) : -1
+          if (index < 0) return Object.assign([], { item: () => null })
+          const top = 90 + index * 70 + this.startOffset * 6
+          const glyph = rect({ top: top - fixture.region.scrollTop, bottom: top + 6 })
+          return Object.assign([glyph], { item: (index: number) => (index === 0 ? glyph : null) })
+        },
+      })
+      try {
+        expect(fixture.commands().captureLayoutAnchor({ element: paragraph })).toBe(true)
+        expect(fixture.commands().getLayoutAnchorSnapshot()?.coordinate).toBe(30 + offset * 6)
+        await act(async () => {
+          fireEvent(fixture.region, new Event('scrollend'))
+          if (operation === 'insert') insertSeparators()
+          else for (const separator of separators) separator.remove()
+          fixture.commands().reconcileLayoutAnchor()
+        })
+        expect(fixture.region.scrollTop).toBe(200)
+        expect(fixture.ref.current?.getState()).toBe('pinned')
+      } finally {
+        if (previousCaret) Object.defineProperty(document, 'caretRangeFromPoint', previousCaret)
+        else Reflect.deleteProperty(document, 'caretRangeFromPoint')
+        if (previousRects) Object.defineProperty(Range.prototype, 'getClientRects', previousRects)
+        else Reflect.deleteProperty(Range.prototype, 'getClientRects')
+      }
+    },
+  )
+
+  it.each(['inline', 'preformatted', 'empty'])(
+    'captures %s whitespace with a valid text coordinate',
+    async (kind) => {
+      const fixture = setup(
+        {},
+        <article data-ui="message" data-message-id="whitespace-anchor">
+          <div data-ui="markdown">
+            {kind === 'inline' ? (
+              <p>
+                <em>before</em> <em>after</em>
+              </p>
+            ) : (
+              <pre>
+                <code>{' \n '}</code>
+              </pre>
+            )}
+          </div>
+        </article>,
+      )
+      acquireOpen(fixture)
+      await pinByWheel(fixture)
+      const block = fixture.region.querySelector<HTMLElement>('p, pre')
+      const markdown = block?.parentElement
+      const parent = kind === 'inline' ? block : block?.querySelector('code')
+      const whitespace = Array.from(parent?.childNodes ?? []).find(
+        (node) => node instanceof Text && /^\s+$/u.test(node.data),
+      )
+      if (!block || !markdown || !whitespace) throw new Error('WhitespaceAnchorMissing')
+      if (kind === 'empty') whitespace.textContent = ''
+      block.getBoundingClientRect = () => ({
+        ...rect({ top: 20, bottom: 70 }),
+        left: 10,
+        right: 100,
+        width: 90,
+      })
+      markdown.getBoundingClientRect = block.getBoundingClientRect
+      fixture.region.getBoundingClientRect = () => ({
+        ...rect({ top: 0, bottom: 100 }),
+        right: 120,
+        width: 120,
+      })
+      const previousCaret = Object.getOwnPropertyDescriptor(document, 'caretRangeFromPoint')
+      const previousRects = Object.getOwnPropertyDescriptor(Range.prototype, 'getClientRects')
+      Object.defineProperty(document, 'caretRangeFromPoint', {
+        configurable: true,
+        value: () => {
+          const range = document.createRange()
+          range.setStart(whitespace, kind === 'empty' ? 0 : 1)
+          range.collapse(true)
+          return range
+        },
+      })
+      Object.defineProperty(Range.prototype, 'getClientRects', {
+        configurable: true,
+        value: () => {
+          const glyph = rect({ top: 26, bottom: 44 })
+          return Object.assign([glyph], { item: (index: number) => (index === 0 ? glyph : null) })
+        },
+      })
+      try {
+        expect(fixture.commands().captureLayoutAnchor({ element: block })).toBe(true)
+        expect(fixture.commands().getLayoutAnchorSnapshot()?.coordinate).toBe(
+          kind === 'empty' ? 20 : 26,
+        )
+      } finally {
+        if (previousCaret) Object.defineProperty(document, 'caretRangeFromPoint', previousCaret)
+        else Reflect.deleteProperty(document, 'caretRangeFromPoint')
+        if (previousRects) Object.defineProperty(Range.prototype, 'getClientRects', previousRects)
+        else Reflect.deleteProperty(Range.prototype, 'getClientRects')
+      }
+    },
+  )
+
   it.each([125, 350])(
     'keeps native navigation to %i when the text line differs from its paragraph edge',
     async (destination) => {
