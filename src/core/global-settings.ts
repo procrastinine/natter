@@ -382,7 +382,7 @@ export const FONT_FAMILY_OPTIONS: ReadonlyArray<{
   {
     value: 'system',
     label: 'System',
-    stack: 'system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif',
+    stack: 'system-ui, sans-serif',
   },
   {
     value: 'sans-serif',

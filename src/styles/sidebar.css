@@ -28,7 +28,7 @@
  * a serif stack with tight tracking and slightly larger size to give it
  * weight without shouting. */
 [data-ui="brand"] {
-  font-family: "Georgia", "Iowan Old Style", "Palatino", "Times New Roman", serif;
+  font-family: Georgia, "Times New Roman", serif;
   font-size: 22px;
   font-weight: 700;
   color: var(--color-fg-primary);
